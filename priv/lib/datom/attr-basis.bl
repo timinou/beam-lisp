@@ -29,7 +29,7 @@
 ; cache discriminator.
 
 (ns datom.attr-basis
-  (:require [datom.store]))
+  (:require [datom.store] [datom.derived]))
 
 (def ^:private TABLE :datom_attr_basis)
 
@@ -58,16 +58,88 @@
   [store]
   (datom.store/identity-of store))
 
-(defn record!
-  "Record that transaction `tx` wrote `attrs` in `store`. Called once per
-   commit, from the connection — the same place subscriptions are notified."
+;; ── the durable tier ─────────────────────────────────────────────────
+;;
+;; The marks above live in ETS, which dies with the process. That is survivable
+;; for the LIVE question ("has this column changed since I built it?") but fatal
+;; for the one a restart asks: a fresh VM has no marks at all, so `basis-t-for`
+;; answers unknown, and unknown means rebuild — the 8.8 s corpus rebuild that a
+;; durable artifact exists to avoid is forced by a missing number, not by any
+;; change to the data.
+;;
+;; So the marks are kept in the store too, as ONE small record: `{attr → tx}`.
+;; One key, rewritten per commit, INSIDE the transaction it describes (see
+;; `record-ops`): a mark written after its data would leave a window where a
+;; stale column looks valid, and the whole point of a mark is that it cannot lie.
+
+(def MARK-IDENT
+  "The small derived record holding every attribute's last-write transaction."
+  [:datom.attr-basis])
+
+(defn- durable-marks
+  [store]
+  (or (datom.derived/get-record store MARK-IDENT) {}))
+
+(defn- hydrated?
+  "Whether this store's marks have already been read from the store in THIS
+   process. An EMPTY mark map counts as hydrated: the question is whether we
+   have asked, not whether the answer was non-empty — otherwise every cold read
+   would re-read the record forever."
+  [store]
+  (not (empty? (ets/lookup TABLE (t2 store :__marks_hydrated__)))))
+
+(defn- mark-hydrated! [store]
+  (ets/insert TABLE (t2 (t2 store :__marks_hydrated__) true)))
+
+(defn hydrate!
+  "Install this store's DURABLE marks into the ETS table, once per process.
+
+   Called lazily from `basis-t-for`: a cold VM asks the store what it knows
+   before concluding that it knows nothing. Idempotent and cheap after the first
+   call (one ETS lookup). Returns the mark map."
+  [store]
+  (table)
+  (let [store (key-of store)]
+    (if (hydrated? store)
+      (let [hit (ets/lookup TABLE store)]
+        (if (empty? hit) {} (erlang/element 2 (first (to-list hit)))))
+      (let [durable (try (durable-marks store) (catch _ {}))
+            cur (let [hit (ets/lookup TABLE store)]
+                  (if (empty? hit) {} (erlang/element 2 (first (to-list hit)))))
+            ; A live mark is never LOWERED by a durable one: the ETS map is the
+            ; same information with more recent writes in it.
+            merged (reduce (fn [m e]
+                             (let [a (get e 0) tx (get e 1)]
+                               (if (and (some? (get m a)) (>= (get m a) tx)) m (assoc m a tx))))
+                           cur
+                           (into [] durable))]
+        (ets/insert TABLE (t2 store merged))
+        (mark-hydrated! store)
+        merged))))
+
+(defn record-ops
+  "Record the attributes `tx` wrote, and return the store ops that make the
+   record DURABLE — to be committed WITH the transaction's own ops.
+
+   Both halves in one call on purpose. The ETS map is what the live process
+   reads; the ops are what a later process reads. A caller that did only the
+   first would work perfectly until a restart, and a caller that did only the
+   second would rebuild on every write — so they are not two options, they are
+   one write expressed twice, and the API does not offer them separately."
   [store attrs tx]
   (table)
-  (let [store (key-of store)
-        cur (let [hit (ets/lookup TABLE store)]
-              (if (empty? hit) {} (erlang/element 2 (first (to-list hit)))))]
-    (ets/insert TABLE (t2 store (reduce (fn [m a] (assoc m a tx)) cur attrs)))
-    tx))
+  (let [key (key-of store)
+        cur (let [hit (ets/lookup TABLE key)]
+              (if (empty? hit) {} (erlang/element 2 (first (to-list hit)))))
+        merged (reduce (fn [m a] (assoc m a tx)) cur attrs)]
+    (ets/insert TABLE (t2 key merged))
+    ; The durable half merges against what the STORE holds, not against ETS: on
+    ; a cold process ETS starts empty, and writing only this transaction's attrs
+    ; would erase every other attribute's mark.
+    (datom.derived/put-ops MARK-IDENT
+                           (reduce (fn [m a] (assoc m a tx))
+                                   (durable-marks key)
+                                   attrs))))
 
 (defn note!
   "Raise the mark for `attr` to at least `tx`. Called when a cache BUILDS from
@@ -91,15 +163,25 @@
   [store attr fallback]
   (if (= :undefined (ets/info TABLE))
     fallback
-    (let [store (key-of store)
-          hit (ets/lookup TABLE store)]
-      (if (empty? hit)
-        fallback
-        (or (get (erlang/element 2 (first (to-list hit))) attr) fallback)))))
+    (let [store (key-of store)]
+      ; A cold process has no marks; ask the STORE before concluding it knows
+      ; nothing, or every restart rebuilds every derived column.
+      (hydrate! store)
+      (let [hit (ets/lookup TABLE store)]
+        (if (empty? hit)
+          fallback
+          (or (get (erlang/element 2 (first (to-list hit))) attr) fallback))))))
 
 (defn forget!
-  "Drop every recorded attribute basis. For tests and for a store that was
-   replaced under a reused handle."
+  "Drop every ETS mark — including the hydrated flags, so the next read asks the
+   store again. For tests and for a store replaced under a reused handle. The
+   DURABLE record is untouched: this drops the cache, not the truth."
   []
   (if (not= :undefined (ets/info TABLE)) (ets/delete_all_objects TABLE) nil)
   :ok)
+
+(defn durable-marks-of
+  "The marks the STORE holds for `store`, read directly — the durable half, for
+   tests and for a caller that wants to see what a fresh process would see."
+  [store]
+  (durable-marks (key-of store)))

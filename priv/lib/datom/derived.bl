@@ -1,0 +1,197 @@
+; datom/derived.bl — a derived artifact that OUTLIVES the process.
+;
+; ── The bill this pays ────────────────────────────────────────────────
+;
+; A derived column is expensive to build and cheap to keep. On the live corpus
+; (filali sources-legales, 62 396 chunks × 768 dims) assembling the embedding
+; column and quantising it into a resident index is 8.8 s; the text column's
+; rows are another 2.8 s. Every one of those seconds is recomputed from
+; scratch after a restart, a deploy, or a crash — to arrive at a value that is
+; bit-for-bit the same as the one that existed a moment before. The caches
+; (`datom.query.corpus`, `datom.attr-basis`) are ETS: process-lifetime only.
+;
+; ── The shape: a POINTER in the database, BYTES in the blob tier ──────
+;
+; Two ports already exist and each does half the job:
+;
+;   · `datom.store` is an ordered key/value space, transactional and durable —
+;     the right home for a small record, the wrong home for 197 MB (it would
+;     be copied into indexes and every scan would step over it).
+;   · `datom.blob` is a content-addressed byte store with a durable tier
+;     (`blob-fs` beside a fjall store) — the right home for the bytes, and
+;     useless alone, because content addressing cannot be LOOKED UP without
+;     already knowing the content.
+;
+; So: the bytes go to the blob tier keyed by their own sha256, and a POINTER
+; (the sha, plus what the artifact is and the basis it was built at) goes into
+; the store under the internal key namespace. That namespace is the one
+; `datom.conn`'s id counters already use — key byte `0x00`, below every index
+; tag — so a pointer is invisible to every query, transactional with the data
+; it describes, and travels wherever the store goes.
+;
+; ── What is NOT here: validity ───────────────────────────────────────
+;
+; This namespace stores and retrieves; it does not decide whether an artifact
+; is still TRUE. That question belongs to whoever knows what the artifact is
+; derived FROM — for a column cache, `datom.attr-basis` answers it per
+; attribute. A generic store that guessed would either rebuild everything (a
+; cache that never hits) or serve something stale (a cache that lies). So the
+; pointer records the basis it was built at and `load` hands it back; the
+; caller compares.
+
+(ns datom.derived
+  (:require [datom.db] [datom.store] [datom.blob] [datom.file]))
+
+;; ── the internal key namespace ───────────────────────────────────────
+;;
+;; `[0 100]` is 'd', next to the connection's `[0 101]` 'e' and `[0 116]` 't'
+;; counters. Every index key starts with an index TAG of 1..4, so nothing under
+;; `0x00` is ever produced by an index scan and nothing here is ever seen by a
+;; query — the same argument the id counters rest on.
+
+(def KEY-PREFIX (erlang/list_to_binary (to-list [0 100])))
+
+(defn- key-for
+  "The store key for artifact `ident` (a vector, e.g. `[:corpus attr :resident]`).
+   ETF-encoded because the identity is structured and only ever read back whole:
+   no ordering is required of it, so no ordering is imposed."
+  [ident]
+  (erlang/iolist_to_binary (to-list [KEY-PREFIX (erlang/term_to_binary ident)])))
+
+;; ── the pointer ──────────────────────────────────────────────────────
+
+(defn- blobs-of
+  "The blob tier of `db`, or nil when the database value carries none (a value
+   built without a connection). nil means NO durable tier: `save!` is a no-op
+   and `load` misses, which is the honest degradation — an artifact cache is
+   never the reason a query fails."
+  [db]
+  (datom.db/blobs-of db))
+
+(defn save!
+  "Store `parts` (a map of `name → binary`) as the durable payload of artifact
+   `ident`, and point at them from `db`'s store. Returns the pointer record, or
+   nil when no blob tier is configured.
+
+   Several parts rather than one blob, because an artifact is not always one
+   buffer: a corpus carries its ENTITY IDS beside its vectors, and the ids are
+   needed to interpret them. Framing two buffers into one blob by hand would
+   invent a format with an off-by-one waiting in it; the blob tier already
+   keys bytes, so each part is keyed by its own sha256.
+
+   `opts` may carry `:meta` (anything the caller wants back with the pointer —
+   a row count, a dimension, an attribute list) and `:basis` (the basis the
+   artifact was derived at, which `load` hands back untouched).
+
+   The pointer is written LAST: a crash between the two leaves an orphan blob,
+   never a pointer to bytes that do not exist. Content addressing makes the
+   blobs idempotent, so two artifacts with identical bytes share one blob and a
+   re-save writes nothing new."
+  [db ident parts & opts]
+  (let [bs (blobs-of db)
+        opts (or (first opts) {})]
+    (when (some? bs)
+      (let [shas (reduce (fn [m entry]
+                           (let [name (get entry 0) bytes (get entry 1)
+                                 sha (datom.file/sha256 bytes)]
+                             (datom.blob/-blob-put bs sha bytes)
+                             (assoc m name sha)))
+                         {}
+                         (into [] parts))
+            store (datom.db/store-of db)
+            pointer {:parts shas
+                     :bytes (reduce (fn [acc e] (+ acc (erlang/byte_size (get e 1)))) 0 (into [] parts))
+                     :meta (get opts :meta)
+                     :basis-t (get opts :basis)
+                     :ident ident}]
+        (datom.store/-put store (key-for ident) pointer)
+        pointer))))
+
+(defn load
+  "The bytes of artifact `ident` as stored by `save!`, plus its pointer:
+   `{:parts {name binary} :pointer pointer}`, or nil when there is no pointer,
+   no blob tier, or a payload has gone (a store whose blobs were swept).
+
+   Never throws for a missing artifact: a cache miss is the normal case, and
+   the caller — which knows how to rebuild — treats it as one."
+  [db ident]
+  (let [bs (blobs-of db)]
+    (when (some? bs)
+      (let [p (datom.store/-get (datom.db/store-of db) (key-for ident))]
+        (when (some? p)
+          (let [parts (reduce (fn [m entry]
+                                (let [name (get entry 0)
+                                      b (datom.blob/-blob-get bs (get entry 1))]
+                                  (if (nil? b) m (assoc m name b))))
+                              {}
+                              (into [] (get p :parts))) ]
+            (when (= (count parts) (count (get p :parts)))
+              {:parts parts :pointer p})))))))
+
+(defn pointer
+  "The pointer record for `ident`, without fetching the payload — cheap when the
+   question is only 'is there one, and from which basis?'. nil when absent."
+  [db ident]
+  (datom.store/-get (datom.db/store-of db) (key-for ident)))
+
+(defn forget!
+  "Drop the artifact's POINTER (the payload blob stays until a blob GC sweeps
+   it — bytes are content-addressed and may be shared). Correctness never needs
+   this: a stale pointer to an invalid basis is rejected by the caller's
+   validity check, and a caller that has none must not use this namespace."
+  [db ident]
+  (datom.store/-delete (datom.db/store-of db) (key-for ident))
+  :ok)
+
+(defn stats
+  "What this store holds under the derived namespace: the artifact count and
+   their total payload size, read from the pointers alone (no blob reads)."
+  [db]
+  (let [store (datom.db/store-of db)
+        hi (erlang/iolist_to_binary (to-list [KEY-PREFIX 255]))
+        rows (datom.store/range-keys store KEY-PREFIX hi)
+        pointers (mapv (fn [k] (datom.store/-get store k)) rows)]
+    {:artifacts (count pointers)
+     :bytes (reduce (fn [acc p] (+ acc (or (get p :bytes) 0))) 0 pointers)
+     :identities (mapv (fn [p] (get p :ident)) pointers)}))
+
+;; ── small records: a durable value with no payload ───────────────────
+;;
+;; Not every derived value is a buffer. A MARK — 'the highest transaction that
+;; wrote attribute X' — is a number, and the thing that needs it is the cache
+;; above the port deciding whether what it holds is still true
+;; (`datom.attr-basis`). Such a record goes in the store directly, under the
+;; same internal namespace and with the same key discipline, but with no blob
+;; behind it: the value IS the record.
+;;
+;; The ops form exists so a caller can commit the record WITH the transaction it
+;; describes (`datom.index/write-datoms` takes extra ops). That ordering is not a
+;; nicety: a mark written after the data it describes leaves a window where a
+;; derived column looks valid and is not, while a mark written with it cannot
+;; disagree. A crash between them is then not a state the system can reach.
+
+(defn record-key
+  "The store key for the small record `ident` — the SAME namespace and encoding
+   as an artifact pointer, so there is one internal keyspace and one way to
+   leave it to an index scan."
+  [ident]
+  (key-for ident))
+
+(defn put-ops
+  "`[[:put key value]]` for the record `ident` — to pass as a transaction's
+   extra ops, or to `datom.store/-commit` directly."
+  [ident value]
+  [[:put (key-for ident) value]])
+
+(defn get-record
+  "The small record at `ident`, or nil."
+  [store ident]
+  (datom.store/-get store (key-for ident)))
+
+(defn put-record!
+  "Write the small record `ident` directly. For a caller that is not inside a
+   transaction; a caller that IS should pass `put-ops` into its commit instead,
+   so the record and the data it describes cannot disagree."
+  [store ident value]
+  (datom.store/-put store (key-for ident) value)
+  value)

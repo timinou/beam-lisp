@@ -1,0 +1,167 @@
+; test/bl/datom/corpus_durable_test.bl — a derived column that OUTLIVES the VM.
+; Run: bl test test/bl/datom/corpus_durable_test.bl
+;
+; ── What is being asserted, and why it is the interesting part ───────
+;
+; Everything in `datom.query.corpus` is ETS, and ETS dies with the process. So
+; the question a restart asks is not "is the cache fast?" but "does the cache
+; still have anything in it?" — and before this tier the answer was no: a fresh
+; VM assembled the whole column again (measured on filari's sources-legales:
+; 2.8 s for the text column's rows, 8.8 s to assemble the embedding column and
+; quantise it into a resident index), to arrive at a value bit-for-bit identical
+; to the one that existed a moment before the restart.
+;
+; The tests below simulate a restart the only honest way available in one VM:
+; `forget!` on BOTH caches drops the process-lifetime state and the hydrated
+; marks with it, so what remains is exactly what a new process would find —
+; the store, its blobs, and the durable marks written inside its transactions.
+;
+; The assertions are COUNTS of store operations, never timings (see
+; cost_test.bl). The count is the whole claim: "a restart reads NO rows of the
+; column it is restoring" is decidable, whereas "a restart is fast" is not.
+
+(ns datom.corpus.durable.test
+  (:require [datom :as d] [datom.conn] [datom.db] [datom.index] [datom.store]
+            [datom.store-fjall] [datom.attr-basis] [datom.query.corpus :as corpus]
+            [datom.profile :as profile] [datom.vector :as v] [datom.derived :as derived]))
+
+;; ── a store that counts, over a durable backend ──────────────────────
+
+(defn- counting-fjall
+  "A fjall store behind the library's own profiler, so every store operation a
+   restore makes is counted. Using `datom.profile` here rather than a test-local
+   decorator is deliberate: the instrument under test is the same one the
+   library ships, and it is asserted (profile_test.bl) to report what the
+   SUBSTRATE did rather than what the caller asked for.
+
+   NB: read these counters with `profile/counters`, on THIS value — not a local
+   atom. A test-local counter that nothing writes makes every zero-rows
+   assertion pass vacuously, which is how a staleness bug hides."
+  []
+  (let [probe (datom.store-fjall/open "/tmp/x")]
+    (profile/watch (datom.store-fjall/open
+                     (datom.store/fresh-path (datom.store/-path-suffix probe))))))
+
+(defn- reset-ops! [store] (profile/reset! store))
+(defn- ops [store] (profile/counters store))
+
+(defn- new-vec-conn []
+  (let [store (counting-fjall)]
+    [(d/connect-with store [{:db/ident :vec :db/valueType :db.type/vector}
+                            {:db/ident :tag :db/valueType :db.type/string}])
+     store]))
+
+(defn- with-embeddings [c n]
+  (d/transact! c (mapv (fn [i]
+                         {:db/id (- (+ i 1))
+                          :vec (v/embedding [(* 0.1 i) (* 0.01 i) (- 1.0 (* 0.02 i))])})
+                       (vec (range n))))
+  (d/db c))
+
+(defn- restart!
+  "What a new process starts with: no process-lifetime cache, no hydrated marks."
+  []
+  (corpus/forget!)
+  (datom.attr-basis/forget!))
+
+;; ── 0. the durable pointer tier itself ───────────────────────────────
+
+(deftest a-record-round-trips-and-prices-its-payload
+  (let [[c store] (new-vec-conn)
+        db (with-embeddings c 5)]
+    (is (nil? (derived/load db [:test :missing])) "an absent artifact is a miss, not an error")
+    (let [p (derived/save! db [:test :thing] {:bytes (erlang/list_to_binary (to-list [1 2 3]))}
+                           {:basis (datom.db/basis-t db) :meta {:n 1}})]
+      (is (some? p) "a save returns its pointer")
+      (let [hit (derived/load db [:test :thing])]
+        (is (= (erlang/list_to_binary (to-list [1 2 3])) (get (get hit :parts) :bytes))
+            "the payload round-trips byte for byte")
+        (is (= (datom.db/basis-t db) (get (get hit :pointer) :basis-t))
+            "and the basis it was derived at")
+        (is (= {:n 1} (get (get hit :pointer) :meta)) "and its meta")))
+    ; The pointer lives in the internal namespace: no index scan can see it, and
+    ; no datom query can return it.
+    (is (= 5 (count (datom.db/attr-datoms db :vec)))
+        "the pointer never appears as a datom")))
+
+(deftest without-a-blob-tier-the-cache-degrades-to-memory
+  ; A database value built without a connection carries no blob store. The
+  ; durable tier must then be a no-op rather than a crash: an artifact cache is
+  ; never a reason a query fails.
+  (let [[c _] (new-vec-conn)
+        db (datom.db/db-value (datom.db/store-of (d/db c))
+                              (datom.db/schema-of (d/db c))
+                              (datom.db/basis-t (d/db c))
+                              nil)]
+    (is (nil? (derived/save! db [:test :thing] {:bytes (erlang/list_to_binary (to-list [1]))}))
+        "a save without a blob tier is a no-op")
+    (is (nil? (derived/load db [:test :thing])) "and a load is a miss")))
+
+;; ── 1. the marks survive the restart ─────────────────────────────────
+
+(deftest the-per-attribute-marks-are-durable
+  (let [[c _] (new-vec-conn)
+        db (with-embeddings c 5)
+        tx (datom.db/basis-t db)]
+    (restart!)
+    (is (= tx (datom.attr-basis/basis-t-for (datom.db/store-of db) :vec 0))
+        "after a restart the mark is READ BACK from the store, not guessed")
+    (is (contains? (datom.attr-basis/durable-marks-of (datom.db/store-of db)) :vec)
+        "and it is really in the store")))
+
+;; ── 2. a restart restores the column WITHOUT reading it ──────────────
+
+(deftest a-restart-restores-the-packed-corpus-without-reading-the-column
+  (let [[c store] (new-vec-conn)
+        db (with-embeddings c 40)
+        before (corpus/packed db :vec)]
+    (is (= 40 (v/packed-count before)))
+    (restart!)
+    (reset-ops! store)
+    (let [after (corpus/packed db :vec)]
+      (is (= (v/packed-count before) (v/packed-count after)) "the same rows")
+      (is (= (into [] (get before :ids)) (into [] (get after :ids))) "and the same ids")
+      (is (= 0 (get (ops store) :rows))
+          "NO rows of the column were read: the payload came from the blob tier")
+      (is (= 0 (get (ops store) :scan)) "and no column scan happened at all"))))
+
+(deftest a-restart-restores-the-resident-index-without-reading-the-column
+  (let [[c store] (new-vec-conn)
+        db (with-embeddings c 40)
+        q (v/embedding [0.5 0.1 0.2])
+        before (v/search-resident q (corpus/resident db :vec) 5 0)]
+    (restart!)
+    (reset-ops! store)
+    (let [after (v/search-resident q (corpus/resident db :vec) 5 0)]
+      (is (= before after) "the restored index ranks EXACTLY as the built one")
+      (is (= 0 (get (ops store) :rows))
+          "and restoring it read no rows of the column"))))
+
+;; ── 3. and it is still invalidated by a real write ───────────────────
+
+(deftest a-write-after-the-restart-still-invalidates
+  ; The danger of a durable cache is staleness. A write to THIS attribute after
+  ; the artifact was built must force a rebuild even across the restart — the
+  ; durable mark is what makes that answerable without reading the column.
+  (let [[c store] (new-vec-conn)
+        db (with-embeddings c 10)]
+    (corpus/resident db :vec)
+    (restart!)
+    (d/transact! c [{:db/id -99 :vec (v/embedding [0.0 0.0 1.0])}])
+    (let [db2 (d/db c)]
+      (reset-ops! store)
+      (is (= 11 (v/resident-count (corpus/resident db2 :vec)))
+          "the new embedding is in the restored-and-rebuilt index")
+      (is (> (get (ops store) :rows) 0) "and this time the column WAS read, because it changed"))))
+
+(deftest an-unrelated-write-after-a-restart-does-not-rebuild
+  (let [[c store] (new-vec-conn)
+        db (with-embeddings c 10)]
+    (corpus/packed db :vec)
+    (restart!)
+    (d/transact! c [{:db/id -98 :tag "unrelated"}])
+    (let [db2 (d/db c)]
+      (reset-ops! store)
+      (is (= 10 (v/packed-count (corpus/packed db2 :vec))))
+      (is (= 0 (get (ops store) :rows))
+          "a write to another attribute leaves the column's artifact valid"))))

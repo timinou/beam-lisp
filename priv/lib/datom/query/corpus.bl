@@ -71,7 +71,8 @@
 ;; {:__evictions__ N}, {:__budget_bytes__ N}.
 
 (ns datom.query.corpus
-  (:require [datom.db] [datom.index] [datom.vector] [datom.attr-basis] [datom.store]))
+  (:require [datom.db] [datom.index] [datom.vector] [datom.attr-basis]
+            [datom.store] [datom.derived]))
 
 ;; ── the table ────────────────────────────────────────────────────────
 
@@ -234,9 +235,17 @@
   [db]
   (datom.store/identity-of (datom.db/store-of db)))
 
+(defn- has-blobs?
+  "Whether this database value has a blob tier — the same question
+   `datom.derived` asks before it can persist anything. Absent (a value built
+   without a connection) means memory-only, which is a correct degradation: the
+   cache still works inside the process."
+  [db]
+  (some? (datom.db/blobs-of db)))
+
 (defn- assemble
   "The corpus of `[entity dvec]` for embedding column `attr`, current-basis.
-   The one place the assembly lives now — every caller routes here.
+   The one place the assembly lives — every caller routes here.
    A datom whose value is not a DVec (a mis-typed column) is skipped, matching
    the previous inline behaviour in analytic.bl / relations.bl."
   [db attr]
@@ -246,104 +255,211 @@
                      (if (datom.vector/vec? v) [e v] nil)))
                  (datom.db/attr-datoms db attr))))
 
-;; ── the public read ──────────────────────────────────────────────────
+;; ── the durable tier: an artifact that outlives the process ─────────
+;;
+;; Everything above is ETS, and ETS dies with the VM. So every restart re-pays
+;; the assembly — measured on filali's sources-legales: 2.8 s for the text
+;; column's rows, 8.8 s to assemble the embedding column AND quantise it into a
+;; resident index — to arrive at a value that is bit-for-bit the one that
+;; existed a moment before the restart.
+;;
+;; `datom.derived` carries those artifacts across the gap: bytes in the store's
+;; blob tier, a pointer in the store's internal keyspace. Nothing here decides
+;; whether a loaded artifact is still TRUE — that is `attr-changed?`'s question,
+;; asked against the pointer's recorded basis, and it is why a loaded column can
+;; never be served from a basis the caller is not reading.
+;;
+;; `:rows` is deliberately NOT durable. It is ~196 MB of BEAM heap (a `DVec`
+;; record per row), and loading it would rebuild that heap object by object. The
+;; two artifacts worth persisting are the ones a query actually strides — the
+;; packed bytes and the quantised index — and both are built from the packed
+;; form without going near `:rows`.
 
-(defn- ensure-entry
-  "The entry row for `(store, attr)` usable for `db`, with `:rows` built.
+(defn- artifact-ident [attr kind] [:datom.corpus attr kind])
 
-   VALIDITY, not equality. The slot is stamped with the basis its rows were
-   built at; a reader at a LATER basis reuses them when this attribute did
-   not change in between (`attr-changed?` — a WAL-tail question, O(delta)),
-   and rebuilds only when it did. A reader at an EARLIER basis (an `as-of`
-   view) cannot reuse rows from the future and rebuilds.
+(defn- durable-usable?
+  "Whether a pointer describes a state `db` can read: it recorded a basis, and
+   this attribute has not changed since. The one place a durable artifact is
+   judged, so a rehydrated column cannot be served from the wrong basis."
+  [db attr pointer]
+  (let [basis (get pointer :basis-t)]
+    (and (some? basis) (not (attr-changed? db attr basis)))))
 
-   The consequence, measured on the deployment that motivated it: a write to
-   a title, a label or an audit row no longer re-decodes and re-quantises a
-   64 708-row embedding column (5.3 s + 2.1 s), and a screen that searches
-   after every write stops paying for the corpus on each one."
+(defn- load-packed-artifact
+  "The durable `PackedCorpus` for `attr`, or nil. Never throws: an absent or
+   unreadable artifact is a MISS, and a miss is rebuilt — a cache is not a
+   reason a query fails."
+  [db attr]
+  (let [hit (datom.derived/load db (artifact-ident attr :packed))]
+    (when (and (some? hit) (durable-usable? db attr (get hit :pointer)))
+      (try
+        (let [meta (get (get hit :pointer) :meta)
+              parts (get hit :parts)
+              pc (datom.vector/pack-from (erlang/binary_to_term (get parts :ids))
+                                         (get parts :corpus)
+                                         (get meta :dim))]
+          (datom.attr-basis/note! (datom.db/store-of db) attr (get (get hit :pointer) :basis-t))
+          pc)
+        (catch _ nil)))))
+
+(defn- save-packed-artifact! [db attr pc]
+  (datom.derived/save! db (artifact-ident attr :packed)
+    {:ids (erlang/term_to_binary (get pc :ids))
+     :corpus (get pc :corpus)}
+    {:basis (datom.db/basis-t db)
+     :meta {:dim (get pc :dim) :n (get pc :n)}}))
+
+(defn- load-resident-artifact
+  "The durable `Resident` index for `attr`, or nil."
+  [db attr]
+  (let [hit (datom.derived/load db (artifact-ident attr :resident))]
+    (when (and (some? hit) (durable-usable? db attr (get hit :pointer)))
+      (try
+        (let [meta (get (get hit :pointer) :meta)
+              parts (get hit :parts)
+              r (datom.vector/resident-load (get parts :index)
+                                            (erlang/binary_to_term (get parts :ids))
+                                            (get meta :dim))]
+          (datom.attr-basis/note! (datom.db/store-of db) attr (get (get hit :pointer) :basis-t))
+          r)
+        (catch _ nil)))))
+
+(defn- save-resident-artifact! [db attr r]
+  (datom.derived/save! db (artifact-ident attr :resident)
+    {:index (datom.vector/resident-dump r)
+     :ids (erlang/term_to_binary (get r :ids))}
+    {:basis (datom.db/basis-t db)
+     :meta {:dim (get r :dim) :n (get r :n)}}))
+
+;; ── the slot ─────────────────────────────────────────────────────────
+
+(defn- slot
+  "The row for `(store, attr)` when it is still usable for `db`, else nil.
+
+   VALIDITY, not equality — and checked FIRST, building nothing. That is what
+   lets a durable artifact answer without the assembly it would otherwise force:
+   a cold process has no row and no marks, and the old `ensure-entry` assembled
+   all 64 708 rows before a durable copy was ever consulted."
   [db attr]
   (table)
   (let [k (t2 (store-key db) attr)
-        axis (discriminator db)
         hit (ets/lookup TABLE k)
-        row (if (empty? hit) nil (first (to-list hit)))
-        built (if (some? row) (get (r-disc row) 1) nil)
-        usable? (and (some? row)
-                     (= axis (get (r-disc row) 0))
-                     ; the reader is at or ahead of the build: reuse unless
-                     ; this attribute changed in between. A reader BEHIND the
-                     ; build (an `as-of` view) cannot reuse rows from its
-                     ; future and rebuilds.
-                     (>= (datom.db/basis-t db) built)
-                     (not (attr-changed? db attr built)))]
-    (if usable?
-      (let [; Stamp the basis the rows are now KNOWN valid for — the reader
-            ; reads at most this basis, so the next one asks a smaller delta.
-            stamped [axis (datom.db/basis-t db)]]
-        (if (= stamped (r-disc row))
-          (do (ets/update_element TABLE k (t2 2 (now-tick)))
-              ; the row is unchanged; only its access time moved
-              row)
-          (let [stamped-row (r-with-disc row stamped)]
-            (ets/insert TABLE stamped-row)
-            stamped-row)))
+        row (if (empty? hit) nil (first (to-list hit)))]
+    (when (some? row)
+      (let [axis (discriminator db)
+            built (get (r-disc row) 1)]
+        (when (and (= axis (get (r-disc row) 0))
+                   (>= (datom.db/basis-t db) built)
+                   (not (attr-changed? db attr built)))
+          (let [stamped [axis (datom.db/basis-t db)]]
+            (if (= stamped (r-disc row))
+              (do (ets/update_element TABLE k (t2 2 (now-tick)))
+                  row)
+              (let [stamped-row (r-with-disc row stamped)]
+                (ets/insert TABLE stamped-row)
+                stamped-row))))))))
+
+(defn- blank-row
+  "A valid slot for `(store, attr)` with no artifact in it yet, stamped with the
+   reader's basis — which is what a build at this moment proves."
+  [db attr]
+  (table)
+  (->row (t2 (store-key db) attr) (now-tick) 0
+         [(discriminator db) (datom.db/basis-t db)]
+         nil nil nil 0 0))
+
+(defn- attach!
+  "Store `newrow` in `row`'s slot, priced by WHAT IT ACTUALLY HOLDS.
+
+   The byte figure is computed from the new row, never from the old one: pricing
+   an entry by the artifacts it had BEFORE this attach is how a cache with a
+   byte budget silently stops being bounded (measured: a 25-row column priced at
+   0 bytes, so `:evictions` stayed 0 forever and the budget never bit)."
+  [row newrow]
+  (let [n (r-n newrow)
+        dim (r-dim newrow)
+        priced (->row (r-key newrow) (r-atime newrow)
+                      (est-bytes n dim (some? (r-rows newrow))
+                                 (some? (r-packed newrow)) (some? (r-resident newrow)))
+                      (r-disc newrow) (r-rows newrow) (r-packed newrow)
+                      (r-resident newrow) n dim)]
+    (store-entry! (r-key priced) priced (r-bytes row))
+    priced))
+
+(defn- with-rows
+  "The row for `(store, attr)` with `:rows` built — the ONE place assembly
+   happens, and the fallback for every artifact that is not cached at all."
+  [db attr]
+  (let [row (or (slot db attr) (blank-row db attr))]
+    (if (some? (r-rows row))
+      row
       (let [rows (assemble db attr)
             n (count rows)
             dim (corpus-dim rows)
-            old-bytes (if (some? row) (r-bytes row) 0)
-            ; leave the mark that this build proves: from here on, readers
-            ; start their window at this basis rather than the store's start
-            _ (datom.attr-basis/note! (datom.db/store-of db) attr (datom.db/basis-t db))
-            newrow (->row k (now-tick) (est-bytes n dim true false false)
-                          [axis (datom.db/basis-t db)] rows nil nil n dim)]
-        (store-entry! k newrow old-bytes)
-        newrow))))
+            _ (datom.attr-basis/note! (datom.db/store-of db) attr (datom.db/basis-t db))]
+        (attach! row (->row (r-key row) (now-tick) 0 (r-disc row)
+                            rows (r-packed row) (r-resident row) n dim))))))
+
+;; ── the public read ──────────────────────────────────────────────────
 
 (defn column
   "The `[[entity dvec] …]` corpus of embedding column `attr` in `db`, memoised
    by `(store, attr)` and validated against `db`'s basis/filter/since.
 
-   First call at a given state builds it (≈ the old per-eval cost); every later
-   call returns the cached vector in O(1) as long as this column has not
+   First call at a given state assembles it (≈ the old per-eval cost); every
+   later call returns the cached vector in O(1) as long as this column has not
    changed in between — a write to an UNRELATED attribute advances the store's
-   basis and costs nothing here. A change to this column rebuilds, and a
-   reader behind the built basis never sees rows from its future."
+   basis and costs nothing here. A change to this column rebuilds, and a reader
+   behind the built basis never sees rows from its future."
   [db attr]
-  (r-rows (ensure-entry db attr)))
+  (r-rows (with-rows db attr)))
 
 (defn packed
   "The `datom.vector/PackedCorpus` of embedding column `attr` in `db` — the ids
    plus one contiguous corpus binary, ready for `datom.vector/search-packed`.
-   Memoised beside `column` under the same (store, attr, basis) discipline, so
-   the search hot path pays the concat ONCE per basis, not once per query."
+
+   Three tiers, cheapest first: this process's ETS slot, the DURABLE artifact
+   (bytes an earlier process already concatenated), and the assembly. A durable
+   hit is stamped into the slot, so every later caller pays an ETS lookup."
   [db attr]
-  (let [row (ensure-entry db attr)
-        k (r-key row)]
-    (or (r-packed row)
-        (let [pc (datom.vector/pack-corpus (r-rows row))
-              b (est-bytes (r-n row) (r-dim row) true true (some? (r-resident row)))
-              newrow (->row k (now-tick) b (r-disc row) (r-rows row)
-                            pc (r-resident row) (r-n row) (r-dim row))]
-          (store-entry! k newrow (r-bytes row))
-          pc))))
+  (let [row (slot db attr)]
+    (if (and (some? row) (some? (r-packed row)))
+      (r-packed row)
+      (let [base (or row (blank-row db attr))
+            pc (or (load-packed-artifact db attr)
+                   (let [r (with-rows db attr)
+                         p (datom.vector/pack-corpus (r-rows r))]
+                     (when (has-blobs? db) (save-packed-artifact! db attr p))
+                     p))]
+        (attach! base (->row (r-key base) (now-tick) 0 (r-disc base)
+                             (r-rows base) pc (r-resident base)
+                             (get pc :n) (get pc :dim)))
+        pc))))
 
 (defn resident
   "The `datom.vector/Resident` index of embedding column `attr` in `db` — a
-   native decoded+quantised index ready for `datom.vector/search-resident`.
-   Memoised beside `column` under the same (store, attr, basis) discipline, so
-   the decode+quantise is paid ONCE per basis and a query only quantises itself.
-   This is the hot search path; `packed` remains for callers that want the raw
-   corpus binary."
+   native decoded+quantised index ready for `datom.vector/search-resident`. This
+   is the hot search path; `packed` remains for callers that want the raw corpus
+   binary, and `resident-from-packed` makes that a real intermediate rather than
+   a rewrite.
+
+   The most expensive artifact to build (191 MB of f32 decoded, every row
+   quantised) and the cheapest to load: the durable tier makes a restart pay a
+   READ instead of the arithmetic."
   [db attr]
-  (let [row (ensure-entry db attr)
-        k (r-key row)]
-    (or (r-resident row)
-        (let [r (datom.vector/build-resident (r-rows row))
-              b (est-bytes (r-n row) (r-dim row) true (some? (r-packed row)) true)
-              newrow (->row k (now-tick) b (r-disc row) (r-rows row)
-                            (r-packed row) r (r-n row) (r-dim row))]
-          (store-entry! k newrow (r-bytes row))
-          r))))
+  (let [row (slot db attr)]
+    (if (and (some? row) (some? (r-resident row)))
+      (r-resident row)
+      (let [base (or row (blank-row db attr))
+            r (or (load-resident-artifact db attr)
+                  (let [p (packed db attr)
+                        built (datom.vector/resident-from-packed p)]
+                    (when (has-blobs? db) (save-resident-artifact! db attr built))
+                    built))]
+        (attach! base (->row (r-key base) (now-tick) 0 (r-disc base)
+                             (r-rows base) (r-packed base) r
+                             (get r :n) (get r :dim)))
+        r))))
 
 ;; ── configuration + introspection (probes, a future `bl cache status`) ─
 
