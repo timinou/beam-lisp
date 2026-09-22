@@ -213,3 +213,54 @@ BL_NO_LOCK=1 bin/bl -p research/rt-cutover run research/rt-cutover/oracle.bl   #
 BL_NO_LOCK=1 bin/bl -p research/rt-cutover run research/rt-cutover/bench.bl    # cost
 BL_NO_LOCK=1 bin/bl -p research/rt-cutover run research/rt-cutover/surface.bl  # the 123-name contract
 ```
+## Cutovers applied, and what they bought
+
+Each row is one cutover, measured with the harness in this directory against the
+Elixir runtime on the same run. This host drifts 1.6–5× between runs, so the
+columns are ranges and the ratio is the honest summary.
+
+| operation | before | after | vs Elixir |
+|---|---:|---:|---:|
+| `compare`, 1000-vector, differ at the last element | 1 392 310 ns | 50 000–97 000 ns | 38.5× → **1.1–1.5×** |
+| `compare`, 1000-list, differ at the last element | 405 ns/element | 22 ns/element | parity |
+| `compare`, the same 1000-vector twice | 1 515 906 ns | 31–55 ns | 137 810× → **0.79×** |
+| `compare`, 1000-vector, equal terms | — | 628–3809 ns | 0.93× (parity or better) |
+| `compare` two integers | 150–181 ns | 15–24 ns | 3.2–8.4× → **0.26–0.51×** |
+| `eqv` two 10-vectors | 16 848 ns | 943–1183 ns | 20.3× → **1.07–1.65×** |
+| `kind` (the classifier) | 489 ns | 26–136 ns | 10.7× → **1.3×** |
+| `vector?` | 598 ns | 29–71 ns | 20.7× → **1.9–3.4×** |
+| `count` on a vector | 979 ns | 27–53 ns | 12.5× → **1.0–1.5×** |
+| `nth 3` on a vector | 961 ns | 80–95 ns | 10.7× → **1.3–1.9×** |
+| `first` on a vector | 791 ns | 42 ns | 5.4× → **0.84×** |
+| `empty?` | 918 ns | 67–127 ns | 9.4× → **1.2–2.6×** |
+
+The order these were found in is the interesting part, because only the first was
+visible in the code:
+
+1. **A wasted pass.** `seq-cmp` realised both sides into lists, checked `proper?`
+   on both, then walked the copies — three to four O(n) passes to answer a
+   question usually settled by the first element (a difference at index 0 cost 70%
+   of a difference at index 999).
+2. **The cost of naming a variable.** The profiler counted calls: `atomics:get/2`
+   plus `persistent_term:get/2`, i.e. `BeamLisp.Env` — namespace variable
+   resolution. A namespace `def` VALUE has no link row (it has no arity), so every
+   reference resolves twice. `EMPTY` was 37 such references, most of them inside
+   per-element loops; `()` is a reader literal that resolves nothing.
+3. **A table scanned per call.** `family` fell through to a LOOP over the
+   representation descriptors — and the registered kinds are the common ones, so
+   the fallback was the normal path.
+4. **Test order in the classifier.** A vector paid 13 type tests; it now pays 7.
+   And the struct lookup named a table; it now compares literal atoms, with a
+   load-time gate that fails the load if the literals and the descriptor table
+   ever disagree.
+5. **One conversion that pays for itself.** `finite-list` was removed for lists,
+   and then added back for vectors only, through the HOST representation: the seq
+   step (`k-first` + `k-next`, two calls and a classification each) cost 90 ns per
+   element and dominated the comparison, while `BeamLisp.Vector/to_list` costs a
+   fraction of the element it feeds.
+6. **`not` is not free.** It is a core function, not a linked prim, so it resolved
+   a variable twice per call — inside `nth-list`, `reduce-list` and `k-nth`.
+
+The instrument that found 2–6 was `rt/census.bl`: the compiler's own IR says which
+source forms cost a resolution, so the question is answerable statically, over
+every definition at once, without running anything. See OPTIMISE.md §7.
