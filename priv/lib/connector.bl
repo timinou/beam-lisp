@@ -1,0 +1,158 @@
+(ns connector
+  (:require [credential :as cred]
+            [credential.store :as store]
+            [connector.http :as http]))
+
+(def ^:private URI (erlang/binary_to_atom "Elixir.URI"))
+
+;; ── the provisioned set, process-wide ────────────────────────────────
+
+(def PROVISIONED :connector-provisioned)
+
+(defn- provisioned
+  "The process-wide registry of which connections can serve which aspect.
+   Registered BY NAME, so two processes racing to create it reach the same one
+   — the same pattern the relation registry uses."
+  []
+  (let [existing (erlang/whereis PROVISIONED)]
+    (if (= :undefined existing)
+      (let [started (Agent/start (fn [] {})
+                                 (to-list [(erlang/list_to_tuple (to-list [:name PROVISIONED]))]))]
+        (if (= :ok (erlang/element 1 started))
+          (erlang/element 2 started)
+          (erlang/element 2 (erlang/element 2 started))))
+      existing)))
+
+;; ── opening ──────────────────────────────────────────────────────────
+
+(defn open
+  "A connection. `cfg` names the account, the client, and where the grant lives:
+
+     {:service :google
+      :account-id \"1123…\"
+      :client {:client-id … :client-secret …}
+      :store (store/store-file …)}
+
+   `spec` is what the service IS; this function does not read it, and that is
+   the point — opening a connection is the same act for Gmail, Drive, and a
+   service that does not exist yet."
+  [spec cfg]
+  {:spec spec
+   :service (get cfg :service (get spec :service))
+   :account-id (:account-id cfg)
+   :client (:client cfg)
+   :store (:store cfg)})
+
+;; ── the grant, renewed where it lives ────────────────────────────────
+
+(defn access!
+  "The grant for `c` with a token good now — renewed and WRITTEN BACK if it had
+   expired. → {:ok grant} | {:error reason :disposition …}.
+
+   The write-back is why this returns a grant and not just a token: a long
+   backfill renews once an hour, and a renewal held only in the caller's binding
+   is a renewal the NEXT caller does not get. Persisting where the grant already
+   lives keeps exactly one access token in the world, and it is the current one."
+  [c]
+  (let [st (:store c)
+        g (store/-get st (:service c) (:account-id c))]
+    (if (nil? g)
+      {:error :not-connected
+       :detail (str "no grant for " (name (:service c)) "/" (:account-id c))}
+      (let [r (cred/fresh! g (:client c))]
+        (when (cred/good? r)
+          (when (not= (:access g) (:access (cred/ok r)))
+            (store/-put st (:service c) (:account-id c) (cred/ok r))))
+        r))))
+
+;; ── requests ─────────────────────────────────────────────────────────
+
+(defn- enc [s] (erlang/apply URI :encode_www_form (list (str s))))
+
+(defn with-query
+  "`url` with `params` appended as a query string. Params whose value is nil
+   are OMITTED, so a caller can pass every parameter a method knows about and
+   let absence mean absence — which is what a query string already means."
+  [url params]
+  (let [pairs (filter (fn [p] (some? (get p 1))) (to-list params))]
+    (if (empty? pairs)
+      url
+      (str url "?"
+           (join "&" (map (fn [p] (str (enc (get p 0)) "=" (enc (get p 1)))) pairs))))))
+
+(defn get!
+  "An authenticated GET through `c` → {:ok decoded} | {:error …}.
+
+   On a 401 the grant is renewed ONCE and the request retried, because a 401 is
+   most often a token that expired between `access!` and the wire — a race that
+   costs one request to close and, unclosed, fails a batch that was nearly done."
+  [c url]
+  (let [a (access! c)]
+    (if (not (cred/good? a))
+      a
+      (let [r (http/get-json url (cred/bearer (cred/ok a)))]
+        (if (and (= :error (first (keys r)))
+                 (= 401 (get-in r [:error :status])))
+          (let [again (http/get-json url (cred/bearer (cred/ok (access! c))))]
+            again)
+          r)))))
+
+(defn walk
+  "Every page of a cursor walk, folded into one sequence of items.
+
+   `items-key` and `next-key` are the service's own NAMES for the array and the
+   next token — which is the only thing the three cursor algebras have to say
+   about paging, because they differ in their vocabulary rather than in their
+   fold. A walk that needed a different FUNCTION per service would not be a
+   fold, and adding a third service would be the place that showed it.
+
+   `:limit` caps the ITEMS, not the pages: a caller asking for 10 wants 10, and
+   stopping at a page boundary would hand back whatever the page happened to
+   hold."
+  [c url params items-key next-key opts]
+  (loop [token nil items [] pages 0]
+    (let [limit (get opts :limit)
+          want (if (nil? limit) nil (- limit (count items)))]
+      (if (and (some? want) (<= want 0))
+        {:ok items}
+        (let [u (with-query url
+                  (concat (to-list params)
+                          (if (nil? token) [] [[next-key nil]]
+                              [["pageToken" token]])))
+              r (get! c u)]
+          (if (not (cred/good? r))
+            {:error (get r :error) :got (count items)}
+            (let [page (cred/ok r)
+                  got (to-list (get page items-key))
+                  more (get page next-key)
+                  all (into items (if (nil? want) got (vec (take want got))))]
+              (if (or (nil? more) (= 0 (count got)))
+                {:ok all}
+                (if (> pages 500)
+                  {:error :too-many-pages :got (count all)}
+                  (recur more all (inc pages)))))))))))
+
+;; ── have! · the promise a relation can answer ────────────────────────
+
+(defn have!
+  "Make `aspect` answerable from `c`, NOW.
+
+   Registers the connection under the relation ident, which is the only handle
+   a provider has. A provider does not know which account it serves — it knows
+   which aspect it implements and looks up who can serve it. That is what lets
+   ONE relation answer for one account or for five with nothing above it
+   changing, and it is why `have!` lives here rather than in a service module."
+  [c aspect]
+  (Agent/update (provisioned)
+                (fn [m] (update m aspect (fnil conj []) c)))
+  c)
+
+(defn connections-for
+  "Every connection that can serve `aspect` — what a provider reads."
+  [aspect]
+  (Agent/get (provisioned) (fn [m] (get m aspect []))))
+
+(defn connected?
+  "Whether anything can serve `aspect` yet."
+  [aspect]
+  (pos? (count (connections-for aspect))))
