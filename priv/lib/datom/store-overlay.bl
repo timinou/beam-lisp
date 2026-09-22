@@ -40,6 +40,30 @@
 ; reads. That is the right shape for "plan THIS migration" against a large
 ; remote store — measured against the clone alternative in
 ; examples/datom/10-with-efficiency.bl.
+;
+; A wrapper must not downgrade a CAPABILITY
+; ─────────────────────────────────────────────────────────────────────
+;
+; The port is deliberately tiny, and the fast reads are OPTIONAL protocols
+; beside it (`Scan`, `MultiScan`, `PageScan`). That design has one trap, and
+; this wrapper fell into it: an optional protocol is dispatched with
+; `satisfies?` on the store VALUE, so a wrapper that implements only `Store`
+; silently removes every fast path beneath it. An overlay over fjall lost all
+; three — so the engine's semi-join read a 64 708-row column instead of
+; 3 520 datoms (4.1–6.4 s instead of 0.73 s), a datom scan paid a per-row key
+; decode it did not need, and a bounded page materialized the whole range.
+; None of it raised: a dry-run is just quiet and slow.
+;
+; So this wrapper forwards each capability, and forwards it only when the
+; speculative buffer cannot change the answer. Buffered writes are NEW keys,
+; so a read whose bounds the buffer does not touch gets the BASE's answer
+; unchanged — one native request, not a merge. When the buffer IS inside the
+; bounds the merge is mandatory (a speculation's datoms must be visible), so
+; that bound falls back to `-range` plus a key-ordered merge: correct, and
+; the only case that is not a single request.
+;
+; `Underlying` is the same lesson for the caches ABOVE the port: they key by
+; store value, so a wrapper declares what it wraps (`datom.store/identity-of`).
 
 (ns datom.store-overlay
   (:require [datom.store]))
@@ -122,3 +146,75 @@
                      m
                      ops)))
     store))
+
+;; ── the wrapper's identity for cache keys ───────────────────────────
+;;
+;; A dry-run IS the base for the purpose of "has this attribute changed?":
+;; the speculation is invisible to the base, and the base's marks are the
+;; truth for what the base holds. Keyed by the overlay's own record value,
+;; the derived-column caches (`datom.attr-basis`, `datom.query.corpus`) grow
+;; a second copy of a column the base had already built.
+
+(extend-protocol datom.store/Underlying
+  OverlayStore
+  (-underlying [store] (:base store)))
+
+;; ── the optional read capabilities, forwarded ───────────────────────
+(defn- in-bounds?
+  [k lo hi]
+  (and (or (nil? lo) (not (erlang/< k lo)))
+       (or (nil? hi) (not (erlang/> k hi)))))
+
+(defn- buffered-keys
+  "The buffer's keys within `[lo, hi]`, ascending. A read of that window must
+   see these on top of the base's answer; an EMPTY result is the proof that it
+   need not, which is what lets every forward below be one request."
+  [store lo hi]
+  (filterv (fn [k] (in-bounds? k lo hi)) (keys (deref (:buffer store)))))
+
+(defn- overlay-entries
+  "The base's `[k v]` entries in `[lo, hi]` with the buffer's merged in, in key
+   order, the buffer winning on a collision (only the id counters collide)."
+  [store lo hi]
+  (let [base (datom.store/-range (:base store) lo hi)
+        buf (filterv (fn [e] (in-bounds? (get e 0) lo hi))
+                     (into [] (seq (deref (:buffer store)))))]
+    (into [] (seq (reduce (fn [m e] (assoc m (get e 0) (get e 1)))
+                          (reduce (fn [m e] (assoc m (get e 0) (get e 1)))
+                                  (sorted-map) base)
+                          buf)))))
+
+(defn- datoms-of [entries] (mapv (fn [e] (get e 1)) entries))
+
+(extend-protocol datom.store/Scan
+  OverlayStore
+  (-scan-datoms [store lo hi]
+    (if (empty? (buffered-keys store lo hi))
+      (datom.store/scan-datoms (:base store) lo hi)
+      (datoms-of (overlay-entries store lo hi)))))
+
+(extend-protocol datom.store/MultiScan
+  OverlayStore
+  (-scan-prefixes [store bounds]
+    (if (every? (fn [b] (empty? (buffered-keys store (get b 0) (get b 1)))) bounds)
+      (datom.store/scan-prefixes (:base store) bounds)
+      (into [] (mapcat (fn [b]
+                         (datoms-of (overlay-entries store (get b 0) (get b 1))))
+                       bounds)))))
+
+(extend-protocol datom.store/PageScan
+  OverlayStore
+  (-scan-datoms-page [store start after hi limit]
+    (if (empty? (buffered-keys store (or start after) hi))
+      (datom.store/page-datoms (:base store) start after hi limit)
+      (datom.store/scan-via-range-page store start after hi limit))))
+
+;; `Alive?` forwards: an overlay over a handle that died with its owner is not
+;; usable, and `alive?` exists for the caller that MEMOIZED the handle. Not
+;; forwarded, deliberately: `Closeable` (closing a speculation must never close
+;; its base) and `FileBacked` (an overlay is never opened at a path, so it has
+;; no naming convention to declare). Both defaults are the truthful answer.
+
+(extend-protocol datom.store/Alive?
+  OverlayStore
+  (-alive? [store] (datom.store/alive? (:base store))))
