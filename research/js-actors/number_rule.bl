@@ -1,0 +1,767 @@
+; number_rule.bl — JS-Number integer safety as a RULE, with a verdict, not a habit.
+;
+; ── The question ────────────────────────────────────────────────────────────
+;
+; The Js actor slice carries BL integers as IEEE-754 doubles. The host's
+; `arith` (research/js-actors/host.mjs) raises on an unsafe operand or an
+; overflowing + - * rem, and does NO check at all once a float is involved.
+; That is a policy with no proof: nothing tells the emitter — or a reviewer —
+; WHICH numeric expressions are safe to hand to the host.
+;
+; This module is that proof. Given a numeric expression (or a process form's
+; state arithmetic) it answers ONE of three things, each with its warrant:
+;
+;   :yes      proven safe — every operator result is an integer in ±(2^53-1)
+;             for EVERY assignment of the declared operand ranges. Evidence:
+;             the operand ranges, the operators bounded, and the engine.
+;   :no       refuted — a DEFINITE violation, with a counterexample: the
+;             offending operand assignment and the operator it breaks
+;             (overflow, divide-by-zero) or the literal that cannot be carried
+;             (a float, a bignum, a decimal).
+;   :unknown  not decided — the rule refuses to guess. Unknown carries the
+;             runtime guard/fallback the caller must apply instead. This is
+;             the honest rung: a sampled "looks fine" is NOT a proof.
+;
+; ── The contract (the LAWS below), one clause each ──────────────────────────
+;
+;   1 :int-literals        every numeric literal is a BL INTEGER literal.
+;                          The host cannot enforce this: `Number.isInteger(1.0)`
+;                          is TRUE, so a BL float 1.0 arrives indistinguish-
+;                          able from the integer 1. The distinction the
+;                          runtime lost is restored here, statically.
+;   2 :known-integer-ops   only + - * rem. `/`/`div` leave the integer domain
+;                          (host `div` is `a/b`), and any other head is
+;                          higher-order or unknown arithmetic — refused.
+;   3 :declared-ranges     every variable carries a finite integer range. An
+;                          unbounded operand makes the range question unaskable.
+;   4 :safe-range          every operator result is in ±(2^53-1) for all
+;                          operand assignments — the z3/exhaustive proof.
+;   5 :divisor-nonzero     rem's divisor is provably nonzero (host raises on 0).
+;   6 :host-exact          every frozen literal is exactly a JS Number, so the
+;                          BL→JS conversion is the identity.
+;
+; ── Where this sits (exact exposure — what is and is not integrated) ────────
+;
+; The RULE is self-contained research. It is NOT wired into the emitter or the
+; host: `compiler.bl` does not call it, and a certified expression is not
+; annotated on the ANF. What it IS: a real proof procedure over the repo's own
+; reasoning stack, so the integration is a caller, not a rewrite.
+;
+;   · system.smt  translates each operator subterm to SMT — the SAME
+;                 source→SMT translator system.verify-process and veritas use,
+;                 so this rule can never disagree with the verifier about what
+;                 an expression MEANS.
+;   · oracle      answers the violation query (∃ operands · ¬safe) symbolically
+;                 and returns the model that IS the counterexample.
+;   · system.decide classifies the query's fragment (:arith/:general) and the
+;                 oracle records the answer in the z3 ledger — the rule reports
+;                 which rung answered rather than asserting one.
+;   · veritas     is the EXHAUSTIVE engine: over a finite small domain the rule
+;                 materializes the whole product with veritas's generator algebra
+;                 (tuple-of/int-of/gen-enumerate) and evaluates the safety
+;                 predicate with veritas/holds? — a proof with no solver, over BL
+;                 semantics. NB: veritas does not project a WITNESS for a TupleGen
+;                 (its model key is the bare var; z3 names the coordinates
+;                 <var>_i), so refutation witnesses are read from the oracle model
+;                 here — a gap this rule works around rather than a claim that
+;                 veritas is complete.
+;   · typed       gives the type DISTINCTION: `lit-type` puts 1 in #{:int} and
+;                 1.0 in #{:float}. The rule's literal law is that lattice.
+;   · system.model extracts the transitions of a defn/defserver/receive form, so
+;                 the rule also certifies the state arithmetic of a process
+;                 (`certify-defn`), which is what a Js actor really emits.
+;
+; ── What it deliberately does NOT do ────────────────────────────────────────
+;
+; No interval arithmetic is the proof. An interval is reported as EVIDENCE, but
+; the VERDICT comes from the engines; a hand-rolled bound is exactly the kind of
+; locally-coherent/systemically-wrong answer this rule exists to replace.
+; A `:unknown` is never upgraded by sampling.
+
+(ns number-rule
+  (:require [veritas :as v]
+            [oracle]
+            [smt :as smtlib]
+            [system.smt :as smt]
+            [system.decide :as decide]
+            [system.model :as model]
+            [codebase :as codebase]
+            [typed]))
+
+; ── the frozen range of exact JS integers ───────────────────────────────────
+
+(def SAFE-MAX 9007199254740991)          ; 2^53 - 1
+(def SAFE-MIN -9007199254740991)
+
+(def EXHAUSTIVE-LIMIT 4096)              ; domain size at which veritas enumerates
+
+; ── the operator vocabulary ─────────────────────────────────────────────────
+;
+; INT-OPS are closed over the integers and are the ONLY operators the rule will
+; certify. FLOAT-OPS are not unsafe by themselves — they are arithmetic the rule
+; refuses to call an INTEGER, because the host's `div` is IEEE-754 `a/b`.
+
+(def INT-OPS   {"+" :add "-" :sub "*" :mul "rem" :rem})
+(def FLOAT-OPS {"/" :div "div" :div "quot" :quot "mod" :mod})
+
+(defn op-arity-ok?
+  "Certify only binary +/*, unary/binary -, and binary rem. N-ary +/*
+   reductions can overflow at an intermediate even when their final BL result
+   is safe; until every intermediate is modeled, refuse them as unknown."
+  [nm n]
+  (cond
+    (= nm "+")   (= n 2)
+    (= nm "*")   (= n 2)
+    (= nm "-")   (or (= n 1) (= n 2))
+    (= nm "rem") (= n 2)
+    :else false))
+
+(def LAWS
+  "The contract, as data. `name` is what a verdict reports; `doc` is why the
+   clause exists. A caller can print this to a human — the rule is not buried in
+   an if-chain."
+  [{:name :int-literals
+    :doc  "every numeric literal is a BL integer — Number.isInteger(1.0) is true, so the host cannot tell 1.0 from 1"}
+   {:name :known-integer-ops
+    :doc  "only + - * rem; / div leave the integer domain, other heads are higher-order/unknown"}
+   {:name :declared-ranges
+    :doc  "every variable has a finite integer range; an unbounded operand makes the range question unaskable"}
+   {:name :safe-range
+    :doc  "every operator result is in ±(2^53-1) for all operand assignments"}
+   {:name :divisor-nonzero
+    :doc  "rem's divisor is provably nonzero — the host raises on 0"}
+   {:name :host-exact
+    :doc  "every frozen literal is exactly a JS Number, so BL→JS is the identity"}])
+
+; ═════════════════════════════════════════════════════════════════════════
+; reader → data: the same code-as-data bridge codebase uses
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn node->data
+  "A reader NODE as plain BL data: symbols stay symbols, numbers stay numbers.
+   The rule reasons about DATA, so it composes with the reader, system.model and
+   system.smt without a second parser."
+  [n]
+  (let [f (typed/node-form n)
+        tg (typed/node-tag f)]
+    (cond
+      (= tg :scalar)  f
+      (= tg :symbol)  (symbol (typed/node-name f))
+      (= tg :keyword) (keyword (typed/node-name f))
+      (= tg :list)    (apply list (map node->data (typed/node-items f)))
+      (= tg :vector)  (into [] (map node->data (typed/node-items f)))
+      (= tg :set)     (into #{} (map node->data (typed/node-items f)))
+      (= tg :map)     (reduce (fn [m p]
+                                (let [t (erlang/tuple_to_list p)]
+                                  (assoc m (node->data (first t)) (node->data (second t)))))
+                              {} (typed/node-items f))
+      (= tg :meta)    (node->data (second (erlang/tuple_to_list n)))
+      :else           f)))
+
+(defn read-one
+  "The ONE top-level form of `src` as data, or nil when that is not exactly one."
+  [src]
+  (let [forms (BeamLisp.Reader/read_string src)]
+    (if (= 1 (count forms)) (node->data (first forms)) nil)))
+
+(defn- head-str
+  "The head symbol name of a list, or nil when the head is not a symbol."
+  [l]
+  (let [h (first l)]
+    (if (symbol? h) (str h) nil)))
+
+; ═════════════════════════════════════════════════════════════════════════
+; the TERM — a numeric expression as a small tree
+; ═════════════════════════════════════════════════════════════════════════
+;
+;   {:k :int   :value 3}
+;   {:k :float :value 1.0}                     the host cannot see the difference
+;   {:k :var   :name "a"}
+;   {:k :op    :op :add :name "+" :args [...]} certified, range-proved
+;   {:k :unsupported :op :div :name "/"}       refused: leaves the integer domain
+;   {:k :call  :name "apply"}                  refused: higher-order / unknown
+;   {:k :other :value x}                       refused: not a number
+
+(defn term [f]
+  (cond
+    (int? f)    {:k :int   :value f :form f}
+    (float? f)  {:k :float :value f :form f}
+    (symbol? f) {:k :var   :name (str f) :form f}
+    (list? f)
+      (let [h (head-str f)
+            n (count (rest f))]
+        (cond
+          (nil? h)                     {:k :call :name (pr-str (first f)) :form f}
+          (contains? INT-OPS h)
+            (if (op-arity-ok? h n)
+              {:k :op :op (get INT-OPS h) :name h :args (map term (rest f)) :form f}
+              {:k :call :name h :form f})
+          (contains? FLOAT-OPS h)      {:k :unsupported :op (get FLOAT-OPS h) :name h :form f}
+          :else                        {:k :call :name h :form f}))
+    :else {:k :other :value f :form f}))
+
+(defn- term-nodes
+  "Every term node, children before parents (post-order)."
+  [t]
+  (if (= :op (:k t))
+    (conj (vec (mapcat term-nodes (:args t))) t)
+    [t]))
+
+(defn- op-nodes [t] (filter (fn [n] (= :op (:k n))) (term-nodes t)))
+
+(defn- literal-violation
+  "The law-1/6 violation of a single literal value, or nil."
+  [f]
+  (cond
+    (int? f)   (if (and (<= f SAFE-MAX) (>= f SAFE-MIN)) nil
+                 {:violation :bignum-literal :value f})
+    (float? f) {:violation :float-literal :value f}
+    :else nil))
+
+; ═════════════════════════════════════════════════════════════════════════
+; the ENV — variable → finite integer range
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn- env-range
+  "The declared [lo hi] of `nm` in `env`, or nil. String, keyword and symbol
+   keys are accepted so a caller writes whichever reads best."
+  [env nm]
+  (let [x (or (get env nm) (get env (keyword nm)) (get env (symbol nm)))]
+    (cond
+      (nil? x) nil
+      (and (vector? x) (int? (first x)) (int? (second x)))     [(first x) (second x)]
+      (and (sequential? x) (int? (first x)) (int? (second x))) [(first x) (second x)]
+      :else nil)))
+
+(defn- range-sane? [[lo hi]]
+  (and (int? lo) (int? hi) (<= lo hi) (>= lo SAFE-MIN) (<= hi SAFE-MAX)))
+
+; ═════════════════════════════════════════════════════════════════════════
+; verdicts
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn- base [src] {:rule :js-number-safe :term src})
+
+(defn- yes
+  ([src ev] (merge (base src) {:verdict :yes :modality :proven} ev)))
+(defn- no
+  ([src ce] (merge (base src) {:verdict :no :modality :refuted} ce)))
+(defn- unknown
+  ([src gd] (merge (base src) {:verdict :unknown :modality :unknown} gd)))
+
+(defn- laws [m] (merge {:int-literals :pass :known-integer-ops :pass
+                        :declared-ranges :pass :safe-range :pass
+                        :divisor-nonzero :pass :host-exact :pass} m))
+
+(defn- guard
+  "The runtime check a caller must apply when the rule cannot prove an
+   expression — a real BL FORM (`(and (int? a) (int? b))`) plus the bound the
+   RESULT must satisfy, so the fallback is runnable, not a sentence."
+  [reason names]
+  {:reason reason
+   :operands (into [] names)
+   :check (if (empty? names) true
+              (to-list (into ['and] (map (fn [n] (list 'int? (symbol n))) names))))
+   :result-bound [SAFE-MIN SAFE-MAX]
+   :fallback :keep-bl-integer})
+
+; ═════════════════════════════════════════════════════════════════════════
+; literal safety — the host-conversion question (laws 1, 6)
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn host-safe?
+  "Whether a BL value can be carried by a JS Number WITHOUT loss. `1` yes; any
+   float — including 1.0, whose floatness the host has already forgotten — no;
+   a bignum no; a decimal or anything else no."
+  [v]
+  (cond
+    (int? v)
+      (if (and (<= v SAFE-MAX) (>= v SAFE-MIN))
+        {:ok true :value v}
+        {:ok false :reason :bignum-out-of-safe-range :value v})
+    (float? v)
+      (cond
+        (not (= v v))                        {:ok false :reason :nan :value v}
+        (> (abs v) 1.7976931348623157e308)   {:ok false :reason :infinity :value v}
+        :else                                {:ok false :reason :float-not-int :value v})
+    :else
+      (let [m (try (get v :__struct__) (catch _ nil))]
+        (if (= m :Elixir.BeamLisp.Decimal)
+          {:ok false :reason :exact-decimal :value v}
+          {:ok false :reason :not-a-number :value v}))))
+
+(defn certify-literal
+  "Certify ONE value for host conversion. → verdict. `:yes` is the identity
+   conversion; `:no` names the reason (`:float-not-int` for 1.0, `:bignum-…`, …)."
+  [v]
+  (let [s (host-safe? v)]
+    (if (:ok s)
+      (yes (pr-str v) {:engine :static
+                       :evidence {:host-exact true :range [v v]}
+                       :laws (laws {})})
+      (no (pr-str v) {:engine :static
+                      :counterexample {:value v :reason (:reason s)}
+                      :laws (laws (cond
+                                    (= :float-not-int (:reason s)) {:int-literals :violated :host-exact :violated}
+                                    (contains? #{:nan :infinity :exact-decimal} (:reason s)) {:int-literals :violated}
+                                    (= :bignum-out-of-safe-range (:reason s)) {:host-exact :violated}
+                                    :else {:int-literals :violated}))}))))
+
+; ═════════════════════════════════════════════════════════════════════════
+; SMT obligation: ∃ operands · ¬safe
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn- smt-of-form
+  "A data form → its SMT term, or :untranslatable."
+  [var-set f]
+  (let [s (smt/of-source var-set (pr-str f))]
+    (if (or (nil? s) (= s :untranslatable)) :untranslatable s)))
+
+(defn- smt-safe-conj
+  "The SMT term `safe` — a conjunction over every operator subterm of its range
+   bound, plus the nonzero-divisor condition for `rem`. nil when a subterm does
+   not translate (the caller then refuses rather than guesses). Each subterm is
+   translated by system.smt, never rebuilt by hand: the divisor is translated
+   too, so `(rem a (rem b 2))` bounds the RIGHT condition."
+  [var-set ops]
+  (let [parts (mapcat
+                (fn [n]
+                  (let [s (smt-of-form var-set (:form n))]
+                    (if (= s :untranslatable)
+                      [:untranslatable]
+                      (concat
+                        (if (= :rem (:op n))
+                          (let [d (smt-of-form var-set (nth (:form n) 2))]
+                            (if (= d :untranslatable)
+                              [:untranslatable]
+                              [(list 'not (list '= d 0))]))
+                          [])
+                        [(list '<= s SAFE-MAX) (list '>= s SAFE-MIN)]))))
+                ops)]
+    (if (some (fn [p] (= p :untranslatable)) parts)
+      nil
+      (to-list (into ['and] parts)))))
+
+(defn- obligation-cmds
+  "The commands for (∃ operands · ¬safe), or nil when untranslatable."
+  [t ranges]
+  (let [var-set (set (map first ranges))
+        decls (mapcat (fn [[n [lo hi]]]
+                        [(smtlib/declare-const (symbol n) 'Int)
+                         (smtlib/assert (list '>= (symbol n) lo))
+                         (smtlib/assert (list '<= (symbol n) hi))])
+                      ranges)
+        safe (smt-safe-conj var-set (op-nodes t))]
+    (if (nil? safe)
+      nil
+      (concat [(smtlib/set-option :timeout 5000)]
+              decls
+              [(smtlib/assert (list 'not safe))]))))
+
+; ── counterexample: evaluate the term in BL on the model's assignment ────────
+
+(defn- eval-term [t m]
+  (cond
+    (= :int (:k t)) (:value t)
+    (= :var (:k t)) (let [v (get m (:name t))] (if (nil? v) :unbound v))
+    (= :op  (:k t))
+      (let [vs (map (fn [a] (eval-term a m)) (:args t))]
+        (if (some (fn [v] (not (int? v))) vs)
+          (if (some (fn [v] (= v :unbound)) vs) :unbound :raised)
+          (cond
+            (= :add (:op t)) (apply + vs)
+            (= :sub (:op t)) (if (= 1 (count vs)) (- (first vs)) (- (first vs) (second vs)))
+            (= :mul (:op t)) (apply * vs)
+            (= :rem (:op t)) (if (= 0 (second vs)) :divide-by-zero (rem (first vs) (second vs)))
+            :else :raised)))
+    :else :raised))
+
+(defn- violations
+  "Every operator subterm that violates the contract under assignment `m`:
+   overflow / divide-by-zero. → [{:op src :value v :violation kw} …]"
+  [t m]
+  (into []
+    (keep (fn [n]
+            (let [v (eval-term n m)]
+              (cond
+                (= v :unbound)      nil
+                (= v :divide-by-zero) {:op (pr-str (:form n)) :violation :divide-by-zero}
+                (= v :raised)       {:op (pr-str (:form n)) :violation :unclassified}
+                (and (int? v) (or (> v SAFE-MAX) (< v SAFE-MIN)))
+                  {:op (pr-str (:form n)) :value v :violation :overflow}
+                :else nil)))
+          (op-nodes t))))
+
+(defn- complete-model
+  "z3 defines every constrained const it uses; a var it omits is a don't-care,
+   filled with 0 so the BL evaluation of the model terminates."
+  [model names]
+  (reduce (fn [m n] (if (nil? (get m n)) (assoc m n 0) m))
+          (or model {}) names))
+
+; ── the two engines ─────────────────────────────────────────────────────────
+
+(defn- zmap
+  "names × values → {name value}, without trusting zipmap to be present."
+  [names vals]
+  (reduce (fn [m i] (assoc m (nth names i) (nth vals i))) {} (range (count names))))
+
+(defn- positional-sym [i] (symbol (str "p_" i)))
+
+(defn- positionalize
+  "Rewrite a form's variable symbols to p_0 … p_n by `idx` ({name → index}) — the
+   positional names veritas's tuple binding (holds?) and z3's TupleGen both use,
+   so the SAME predicate evaluates on the enumeration rung and the SMT rung."
+  [f idx]
+  (cond
+    (symbol? f) (let [i (get idx (str f))]
+                  (if (nil? i) f (positional-sym i)))
+    (list? f)   (apply list (map (fn [x] (positionalize x idx)) f))
+    (vector? f) (into [] (map (fn [x] (positionalize x idx)) f))
+    :else f))
+
+(defn- safe-pred
+  "The safety condition as a BL DATA form over the positional names p_0 … — what
+   veritas evaluates (holds?) and what the rule replays. Mirrors smt-safe-conj."
+  [ops names]
+  (let [idx (reduce (fn [m i] (assoc m (nth names i) i)) {} (range (count names)))
+        parts (mapcat (fn [n]
+                        (let [f (positionalize (:form n) idx)]
+                          (concat
+                            (if (= :rem (:op n)) [(list 'not (list '= (nth f 2) 0))] [])
+                            [(list '<= f SAFE-MAX) (list '>= f SAFE-MIN)])))
+                      ops)]
+    (to-list (into ['and] parts))))
+
+(defn- exhaustive-proof
+  "Decide a bounded domain by EXHAUSTION over veritas's generator algebra: every
+   point of the product is materialized (gen-enumerate) and the safety predicate
+   evaluated by veritas/holds?, so the answer rests on BL semantics, not on a
+   solver. A finite domain makes exhaustion a PROOF. nil when the domain is not
+   small enough to enumerate — the caller then asks z3."
+  [port t ranges names ops]
+  (let [widths (map (fn [[_ [lo hi]]] (+ 1 (- hi lo))) ranges)
+        total (reduce * 1 widths)]
+    (if (> total EXHAUSTIVE-LIMIT)
+      nil
+      (let [gen (apply v/tuple-of (map (fn [[_ [lo hi]]] (v/int-of lo hi)) ranges))
+            enum (v/gen-enumerate gen)
+            pred (safe-pred ops names)]
+        (if (= enum :infinite)
+          nil
+          (let [bad (some (fn [v] (if (v/holds? "p" pred v) nil v)) enum)]
+            (if (nil? bad)
+              (yes (pr-str (:form t))
+                   {:modality :proven :engine :enumerate
+                    :evidence {:engine :enumerate :tried total
+                               :ops (into [] (map (fn [n] (pr-str (:form n))) ops))
+                               :vars (into {} ranges)}
+                    :laws (laws {})})
+              (let [m (zmap names bad)
+                    vs (violations t m)]
+                (no (pr-str (:form t))
+                    {:modality :refuted :engine :enumerate
+                     :counterexample {:assignment m :violations vs}
+                     :laws (laws (if (some (fn [x] (= :divide-by-zero (:violation x))) vs)
+                                   {:divisor-nonzero :violated}
+                                   {:safe-range :violated}))})))))))))
+
+(defn- oracle-proof
+  "z3 decides the violation query symbolically. Returns a verdict."
+  [t ranges names ops]
+  (let [cmds (obligation-cmds t ranges)]
+    (if (nil? cmds)
+      (unknown (pr-str (:form t))
+               {:reason :untranslatable :engine :static
+                :guard (guard :untranslatable names)
+                :laws (laws {})})
+      (let [obl (oracle/obligation :js-number-safe cmds)
+            r (oracle/ask obl true)
+            frag (:frag obl)
+            ranks (into {} ranges)
+            ev {:engine :oracle :fragment frag :tier (:tier r)
+                :ops (into [] (map (fn [n] (pr-str (:form n))) ops))
+                :vars ranks}]
+        (cond
+          (oracle/proven? r)
+            (yes (pr-str (:form t))
+                 {:modality :proven :engine :oracle :evidence ev :laws (laws {})})
+          (oracle/refuted? r)
+            (let [m (complete-model (v/parse-model (:raw-model r)) names)
+                  vs (violations t m)
+                  law (if (some (fn [x] (= :divide-by-zero (:violation x))) vs)
+                        {:divisor-nonzero :violated}
+                        {:safe-range :violated})]
+              (no (pr-str (:form t))
+                  {:modality :refuted :engine :oracle
+                   :counterexample {:assignment m :violations vs}
+                   :laws (laws law)}))
+          :else
+            (unknown (pr-str (:form t))
+                     {:reason :solver-unknown :engine :oracle :fragment frag
+                      :tier (:tier r) :guard (guard :solver-unknown names)
+                      :laws (laws {})}))))))
+
+(defn- prove-safe
+  "Run the strongest engine the domain supports: enumerate when bounded and
+   small, otherwise ask z3."
+  [port t env]
+  (let [nodes (term-nodes t)
+        names (distinct (map :name (filter (fn [n] (= :var (:k n))) nodes)))
+        ranges (map (fn [n] [n (env-range env n)]) names)
+        ops (op-nodes t)]
+    (or (exhaustive-proof port t ranges names ops)
+        (oracle-proof t ranges names ops))))
+
+; ═════════════════════════════════════════════════════════════════════════
+; the static gate (laws 1–3) — what must hold BEFORE any solver runs
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn- static-gate
+  "The literal/op/range violations of `t` under `env`, or nil. Order matters:
+   a literal that cannot be carried outranks everything (no solver can repair a
+   float), then a refused operator, then an unbounded variable."
+  [t env]
+  (let [nodes (term-nodes t)
+        bad-lit (some (fn [n] (and (contains? #{:int :float} (:k n))
+                                   (literal-violation (:value n))))
+                      nodes)
+        unsupported (some (fn [n] (if (= :unsupported (:k n)) n nil)) nodes)
+        call (some (fn [n] (if (= :call (:k n)) n nil)) nodes)
+        unbound (some (fn [n] (if (and (= :var (:k n)) (nil? (env-range env (:name n)))) n nil)) nodes)
+        bad-range (some (fn [n] (if (= :var (:k n))
+                                   (let [r (env-range env (:name n))]
+                                     (if (and (some? r) (not (range-sane? r))) [n r] nil))
+                                   nil))
+                        nodes)]
+    (cond
+      (some? bad-lit) {:kind :literal :detail bad-lit}
+      (some? unsupported) {:kind :unsupported :detail unsupported}
+      (some? call) {:kind :call :detail call}
+      (some? unbound) {:kind :unbound :detail unbound}
+      (some? bad-range) {:kind :bad-range :detail bad-range}
+      :else nil)))
+
+; ═════════════════════════════════════════════════════════════════════════
+; certify — the public verbs
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn- certify-form
+  "Certify ONE data form as a numeric expression."
+  [port f env]
+  (let [t (term f)
+        src (pr-str f)
+        names (distinct (map :name (filter (fn [n] (= :var (:k n))) (term-nodes t))))]
+    (cond
+      (= :int (:k t))
+        (certify-literal (:value t))
+
+      (= :float (:k t))
+        (no src {:engine :static
+                 :counterexample {:value (:value t) :reason :float-not-int}
+                 :laws (laws {:int-literals :violated :host-exact :violated})})
+
+      (= :var (:k t))
+        (let [r (env-range env (:name t))]
+          (cond
+            (nil? r) (unknown src {:reason :unbounded-variable :engine :static
+                                   :guard (guard :unbounded-variable names)
+                                   :laws (laws {:declared-ranges :violated})})
+            (not (range-sane? r)) (no src {:engine :static
+                                           :counterexample {:variable (:name t) :range r
+                                                            :reason :operand-out-of-safe-range}
+                                           :laws (laws {:host-exact :violated})})
+            :else (yes src {:engine :static :evidence {:operand-range r :range r}
+                            :laws (laws {})})))
+
+      (= :unsupported (:k t))
+        (unknown src {:reason :unproven-op :op (:name t) :engine :static
+                      :guard (guard :unproven-op names)
+                      :laws (laws {:known-integer-ops :violated})})
+
+      (= :call (:k t))
+        (unknown src {:reason :higher-order-or-unknown-call :op (:name t) :engine :static
+                      :guard (guard :higher-order names)
+                      :laws (laws {:known-integer-ops :violated})})
+
+      (= :other (:k t))
+        (unknown src {:reason :non-numeric :engine :static
+                      :guard (guard :non-numeric names)
+                      :laws (laws {:known-integer-ops :violated})})
+
+      :else                                                  ; :op
+        (let [g (static-gate t env)]
+          (cond
+            (nil? g) (prove-safe port t env)
+            (= :literal (:kind g))
+              (no src {:engine :static :counterexample (:detail g)
+                       :laws (laws {:int-literals :violated :host-exact :violated})})
+            (= :unsupported (:kind g))
+              (unknown src {:reason :unproven-op :op (:name (:detail g)) :engine :static
+                            :guard (guard :unproven-op names)
+                            :laws (laws {:known-integer-ops :violated})})
+            (= :call (:kind g))
+              (unknown src {:reason :higher-order-or-unknown-call :op (:name (:detail g))
+                            :engine :static :guard (guard :higher-order names)
+                            :laws (laws {:known-integer-ops :violated})})
+            (= :unbound (:kind g))
+              (unknown src {:reason :unbounded-variable :variable (:name (:detail g))
+                            :engine :static :guard (guard :unbounded-variable names)
+                            :laws (laws {:declared-ranges :violated})})
+            :else
+              (no src {:engine :static
+                       :counterexample {:variable (:name (first (:detail g))) :range (second (:detail g))
+                                        :reason :operand-out-of-safe-range}
+                       :laws (laws {:host-exact :violated})}))))))
+
+(defn certify-expr
+  "Certify a numeric expression. `src` is BL source (one form); `env` maps each
+   variable to its finite integer range, e.g. {\"a\" [0 1000] \"b\" [-5 5]}.
+   `port` is used only by the exhaustive engine and may be nil.
+
+   → verdict: :yes with evidence · :no with a counterexample · :unknown with the
+   runtime guard/fallback that must be applied instead."
+  ([src env] (certify-expr nil src env))
+  ([port src env]
+   (try
+     (let [f (read-one src)]
+       (if (nil? f)
+         (unknown src {:reason :unreadable :engine :static :guard (guard :unreadable [])})
+         (certify-form port f env)))
+     (catch e
+       (unknown src {:reason :read-error :detail (str e) :engine :static
+                     :guard (guard :read-error [])})))))
+
+; ── the process form: certify the state arithmetic a Js actor emits ─────────
+
+(defn- maximal-op-forms
+  "The OUTERMOST integer-op list forms under any data structure — nested ops are
+   covered by their outer form."
+  [f]
+  (cond
+    (list? f)
+      (let [h (head-str f)]
+        (if (contains? INT-OPS h) [f] (mapcat maximal-op-forms f)))
+    (vector? f) (mapcat maximal-op-forms f)
+    (set? f)    (mapcat maximal-op-forms f)
+    (map? f)    (mapcat maximal-op-forms (concat (keys f) (vals f)))
+    :else []))
+
+(defn- unknown-state-call
+  "A state value containing a call this rule cannot model is not a Number
+   certificate, even if a sibling field contains proven arithmetic."
+  [f]
+  (cond
+    (list? f)
+      (let [h (head-str f)]
+        (if (contains? INT-OPS h)
+          (some unknown-state-call (rest f))
+          (or h :dynamic-call)))
+    (vector? f) (some unknown-state-call f)
+    (set? f) (some unknown-state-call f)
+    (map? f) (some unknown-state-call (concat (keys f) (vals f)))
+    :else nil))
+
+(def OPAQUE-CONTROL
+  ; system.model.next-state keeps the FIRST reply/noreply/recur wrapper.
+  ; Branches and local shadowing can hide other arithmetic, so one :next-node
+  ; cannot certify these source forms.
+  #{"if" "if-not" "cond" "case" "when" "when-not" "let" "loop"
+    "do" "reply" "try" "receive" "->" "->>" "as->" "some->" "some->>"})
+
+(defn- opaque-control-in [f]
+  (cond
+    (list? f)
+      (let [h (head-str f)]
+        (if (contains? OPAQUE-CONTROL h) h (some opaque-control-in f)))
+    (vector? f) (some opaque-control-in f)
+    (set? f) (some opaque-control-in f)
+    (map? f) (some opaque-control-in (concat (keys f) (vals f)))
+    :else nil))
+
+(defn- all-literals [f]
+  (cond
+    (or (int? f) (float? f)) [f]
+    (list? f)   (mapcat all-literals f)
+    (vector? f) (mapcat all-literals f)
+    (set? f)    (mapcat all-literals f)
+    (map? f)    (mapcat all-literals (concat (keys f) (vals f)))
+    :else []))
+
+(defn- certify-data
+  "Certify the arithmetic and literals inside a (possibly compound) next-state."
+  [port f env ctx]
+  (let [bad (some literal-violation (all-literals f))
+        call (unknown-state-call f)
+        ops (maximal-op-forms f)]
+    (cond
+      (some? call)
+        (unknown (pr-str f) {:reason :higher-order-or-unknown-call :op call
+                             :engine :static :guard (guard :higher-order [])
+                             :laws (laws {:known-integer-ops :violated})})
+      (some? bad)
+        (no (pr-str f) {:engine :static :counterexample bad
+                        :laws (laws {:int-literals :violated :host-exact :violated})})
+      (empty? ops)
+        (yes (pr-str f) {:engine :static :evidence {:ops [] :note "no arithmetic in this state"}
+                         :laws (laws {})})
+      (= 1 (count ops))
+        (certify-form port (first ops) env)
+      :else
+        (let [vs (map (fn [o] (certify-form port o env)) ops)
+              verdicts (map :verdict vs)]
+          {:verdict (if (some (fn [x] (= :no x)) verdicts) :no
+                       (if (every? (fn [x] (= :yes x)) verdicts) :yes :unknown))
+           :rule :js-number-safe
+           :term (pr-str f)
+           :ops vs
+           :laws (apply merge (map :laws vs))}))))
+
+(defn certify-defn
+  "Certify the state arithmetic of a process form — `defn`, `receive`, `loop`,
+   `defserver` or `defmethod`. Extraction is `system.model`'s (the ONE reader of
+   a process's transitions), so this rule is a CONSUMER of the process model, not
+   a second one. → verdict with a per-clause report.
+
+   Exact exposure: this certifies the arithmetic it can SEE. An unknown head at
+   the ROOT of a state is refused (`certify-expr` is the entry point for a whole
+   expression); an arithmetic subterm nested inside an unrecognized call's
+   arguments is not searched for, so a caller who needs that uses `certify-expr`
+   on the subterm. The rule never upgrades an unseen expression to :yes."
+  ([src env] (certify-defn nil src env))
+  ([port src env]
+   (try
+     (let [node (first (BeamLisp.Reader/read_string src))
+           opaque (opaque-control-in (node->data node))
+           m (if (some? opaque) nil (model/system-model node))
+           facts (codebase/index-source {} "number-rule" src)
+           call-sites (map (fn [c] {:caller (:call/caller c)
+                                    :callee (:call/callee c)
+                                    :line (:call/line c)}) (:calls facts))
+           clauses (:transitions m)
+           guarded (some (fn [c] (some? (:guard-node c))) clauses)]
+       (if (some? opaque)
+         (unknown src {:reason :control-flow-not-modeled :control opaque
+                       :engine :static :guard (guard :control-flow-not-modeled [])
+                       :codebase-call-sites call-sites})
+         (if guarded
+           (unknown src {:reason :guard-not-modeled :engine :static
+                         :guard (guard :guard-not-modeled [])
+                         :codebase-call-sites call-sites})
+         (if (empty? clauses)
+           (unknown src {:reason :no-clauses :engine :static :guard (guard :no-clauses [])})
+         (let [rs (map (fn [c]
+                         (assoc (certify-data port (node->data (:next-node c)) env {})
+                                :label (:label c)))
+                       clauses)
+               vs (map :verdict rs)]
+           {:verdict (if (some (fn [x] (= :no x)) vs) :no
+                       (if (every? (fn [x] (= :yes x)) vs) :yes :unknown))
+            :rule :js-number-safe
+            :term src
+            :machine (:name m)
+            :codebase-call-sites call-sites
+            :clauses rs})))))
+     (catch e
+       (unknown src {:reason :parse-or-model-error :detail (str e) :engine :static
+                     :guard (guard :parse-or-model-error [])})))))

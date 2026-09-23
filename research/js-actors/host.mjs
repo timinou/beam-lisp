@@ -474,7 +474,7 @@ export function runTurn(rt, frames, budget) {
     while (true) {
       if (!isStep(step)) { pending = { t: "value", v: step }; break; }
       if (step.k === "park") return finish(mkResult("park", frames, {}));
-      if (step.k === "host-wait") return finish(mkResult("host-wait", frames, { ms: step.ms }));
+      if (step.k === "host-wait") return finish(mkResult("host-wait", frames, { ms: step.ms, inputEnabled: step.inputEnabled }));
       if (step.k === "call" || step.k === "tail") {
         // A failure in resolution or in a native leaf is a THROW TO THE CALLER,
         // not an instant process death: the frame above this step is the one
@@ -518,18 +518,55 @@ function mkResult(status, frames, extra) {
     [kw("frames"), frames],
     [kw("value"), extra.value === undefined ? null : extra.value],
     [kw("ms"), extra.ms === undefined ? null : extra.ms],
+    [kw("input-enabled"), extra.inputEnabled === true],
     [kw("message"), extra.message === undefined ? null : extra.message],
   ]);
 }
 export function resultStatus(r) { return kwName(mapGet(r, kw("status"))); }
 export function resultValue(r) { return mapGet(r, kw("value")); }
 export function resultMs(r) { return mapGet(r, kw("ms")); }
+export function resultInputEnabled(r) { return mapGet(r, kw("input-enabled")) === true; }
 export function resultMessage(r) { return mapGet(r, kw("message")); }
 
 // ── runtime + registry ───────────────────────────────────────────────────────
 
+// The browser adapter may receive a message before the generated module has
+// created its runtime. Keep it ordered; only the BL scheduler chooses its sink.
+let activeRuntime = null;
+const earlyInputs = [];
+
+export function enqueueInput(topic, payload) {
+  if (typeof topic !== "string" || !/^[a-z][a-z0-9-]{0,31}$/.test(topic) ||
+      typeof payload !== "string" || payload.length > 4096)
+    throw new Error("browser input requires an allowed topic and a string of at most 4096 characters");
+  const queue = activeRuntime ? activeRuntime.inbox : earlyInputs;
+  if (queue.length >= 1024) throw new Error("browser input queue is full");
+  queue.push(vec([kw("browser"), kw(topic), payload]));
+  if (activeRuntime && activeRuntime.inputWake) activeRuntime.inputWake();
+}
+
+export function waitForInput(rt, ms, inputEnabled = true) {
+  // Early input is only actionable after BL has selected a living sink. When
+  // no sink exists, a timed receive must sleep until its deadline, not spin on
+  // an undrainable host queue and starve browser tasks.
+  if (inputEnabled && rt.inbox.length > 0) return Promise.resolve();
+  return new Promise(resolve => {
+    let timer = null;
+    const wake = () => {
+      if (rt.inputWake === wake) rt.inputWake = null;
+      if (timer !== null) clearTimeout(timer);
+      resolve();
+    };
+    if (inputEnabled) rt.inputWake = wake;
+    if (ms !== null) timer = setTimeout(wake, Math.max(0, ms));
+    // Recheck only when BL has enabled ingress: no event is lost between the
+    // pump and waiter registration, while pre-registration input remains queued.
+    if (inputEnabled && rt.inbox.length > 0) wake();
+  });
+}
+
 export function newRuntime() {
-  return {
+  const rt = {
     globals: new Map(),
     state: bmap([]),
     self: null,
@@ -549,8 +586,12 @@ export function newRuntime() {
     errors: 0,
     // High-water mark of the generator frame stack, for a stack-safety test.
     maxFrames: 0,
+    inbox: earlyInputs.splice(0),
+    inputWake: null,
     out: (s) => { console.log(s); },
   };
+  activeRuntime = rt;
+  return rt;
 }
 
 export function def(rt, key, v) { rt.globals.set(key, v); return v; }
@@ -666,7 +707,10 @@ export const RT_HOST = {
     rt.criticalDepth = 0;
     return new Step("park");
   },
-  "wait-until": (rt, ms) => new Step("host-wait", { ms: ms < 0 ? 0 : ms }),
+  "wait-until": (rt, ms, inputEnabled = false) => new Step("host-wait", { ms: ms < 0 ? 0 : ms, inputEnabled }),
+  "wait-input": () => new Step("host-wait", { ms: null, inputEnabled: true }),
+  "input-size": (rt) => rt.inbox.length,
+  "take-input": (rt) => vecFromArray(rt.inbox.splice(0)),
   now: () => (globalThis.performance && globalThis.performance.now ? globalThis.performance.now() : Date.now()),
   state: (rt) => rt.state,
   "set-state": (rt, s) => { rt.state = s; return s; },
@@ -836,7 +880,7 @@ export async function boot(rt) {
     }
     if (st === "host-wait") {
       const ms = resultMs(r);
-      await new Promise((resolve) => setTimeout(resolve, ms === null ? 0 : ms));
+      await waitForInput(rt, ms, resultInputEnabled(r));
       continue;
     }
     // A `park` at the scheduler root means the scheduler itself suspended with

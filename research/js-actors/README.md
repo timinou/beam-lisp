@@ -10,14 +10,19 @@ BEAM. This is not a production backend or an OTP compatibility implementation.
 From the worktree root, with the normal Beam Lisp development image available:
 
 ```sh
-./bin/bl run research/js-actors/compiler.bl
+BEAM_LISP_Z3=/usr/bin/z3 ./bin/bl run research/js-actors/compiler.bl
 node research/js-actors/out/bundle.mjs
 node research/js-actors/verify.mjs
 ```
 
-The following minimal language boot was used for the verified clean source rebuild.
-It avoids the launcher's full application/native-builder startup; `build/` must
-already contain the development image and its required native bootstrap artifacts.
+Use your installed Z3 path if different from `/usr/bin/z3`; the CLI's full
+application startup expects a bundled or explicitly configured solver on this
+worktree.
+
+The following minimal language boot was used for the verified clean source
+rebuild. It avoids the launcher's full application/native-builder startup;
+`build/` must already contain the development image and its required native
+bootstrap artifacts.
 
 ```sh
 elixir -pa build -e 'BeamLisp.AOT.boot(); IO.inspect(BeamLisp.Compiler.eval_string(File.read!("research/js-actors/compiler.bl")))'
@@ -28,9 +33,10 @@ On this workstation the build was given `ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2
 +SDio 8 +sbwt none +sbwtdcpu none +sbwtdio none'` to avoid its default single
 dirty-I/O scheduler. That is a host tuning choice, not a language requirement.
 
-The compiler builds `runtime.bl` and `test.bl` into `out/bundle.mjs`. The bundle
-imports its sibling `host.mjs`; deploy both, preserving that relative layout.
-No BEAM process is involved when Node or the browser executes the bundle.
+The compiler builds `runtime.bl` with `test.bl` into `out/bundle.mjs`, and the
+same runtime with `demo.bl` into `out/demo.mjs`. Both generated bundles import
+`../host.mjs`; deploy them with that relative layout. No BEAM process is
+involved when Node or the browser executes either bundle.
 
 ### Browser module Worker
 
@@ -47,15 +53,75 @@ failure or missing success marker fails the page. The structured result is also
 available as `window.actorVerification`. No shared memory or isolation headers
 are required for this harness.
 
+### See an actor receive browser events
+
+Open <http://127.0.0.1:8765/demo.html> using the same HTTP server. The page
+shows a status badge, a visible browser/BL event log, a text field and **Send to
+BL actor** / **Stop actor** buttons. It first sends one input before runtime
+creation. After BL reports ready, it sends one while another BL actor has a
+pending timer. After BL reports timer completion, it sends one while the input
+actor waits without a deadline. These stages are triggered by BL output, not
+assumed machine startup timings. You will see separate `[browser]` and `[bl]`
+rows, and can send more text at any time. The Worker stays alive between clicks;
+Stop sends a BL message that ends the actor. `window.actorDemo` exposes
+`state`, `events` and `output` for browser-tool verification.
+
+The actor and timer are in **`demo.bl`**. `demo-worker.mjs` only validates and
+transports strings through the host adapter; it does not pick a pid, inspect a
+mailbox or generate a reply. The BL scheduler picks its registered input sink,
+forwards FIFO events into its mailbox and applies ordinary source `receive`.
+`host.mjs` can retain events before startup and wake a sleeping scheduler,
+including one with a deadline. Input is bounded to 1,024 queued frames,
+string payloads of at most 4,096 characters and validated topic names.
+
+The Node verifier exercises all three delivery stages, direct host wake, early
+Stop, pre-registration timed sleep and normal/crashing sink cleanup;
+`browser.html` continues to exercise the original 104-check batch suite.
+
+### Safe `Number` proof rule (research, not yet emitted)
+
+`number_rule.bl` implements an opt-in BL rule for **integer** expressions:
+`:yes` with proof evidence, `:no` with a counterexample, or `:unknown` with a
+runtime-guard/exact-fallback obligation. It preserves the source tag that says
+`1.0` is a float even though JS `Number.isInteger(1.0)` is true. It uses
+`system.smt`/`system.model`/`system.decide` and Z3 for symbolic obligations,
+Veritas for bounded exhaustive checks, `typed` for literal categories and
+`codebase/index-source` for source call-site provenance. Unknown sibling calls
+in a process state never inherit a `:yes` from unrelated safe arithmetic.
+N-ary reductions and branching/guarded process states return `:unknown` until
+intermediate results and every control-flow path are modeled; checking only the
+final value or first state wrapper would have produced false certificates.
+
+```sh
+BEAM_LISP_Z3=/usr/bin/z3 ./bin/bl test research/js-actors/number_rule_test.bl -p research/js-actors
+# 29 tests / 80 assertions passed in this worktree
+```
+
+**Critical assumption:** caller-provided input ranges must be *true*. This
+research rule neither infers nor enforces those bounds, and `compiler.bl` does
+not consume its verdict. Existing safe-integer runtime guards therefore stay.
+[FEAT-055](../../!tasks/features/FEAT-055-gate-anf-number-lowering-with-trusted-ra.org)
+is the trusted-bound/compiler-integration gate;
+[FUP-124](../../!tasks/follow-ups/FUP-124-research-full-exact-numeric-semantics-fo.org)
+spikes exact bignums/decimals. A `:yes` here is conditional, **not** full BL
+numeric compatibility or permission to remove guards.
+
+The comprehensive [remaining feature list](../js-actors-future/FEATURES.md)
+links all FEATs and their dependency order.
+
 ## Files and ownership
 
 | File | Responsibility |
 |---|---|
 | `compiler.bl` | Existing reader/compiler integration, ANF→JS emission, shared pattern lowering, target-reference audit and compiler rejection tests |
-| `runtime.bl` | Portable prelude, process registry, FIFO runnable queue, mailbox scan/removal, timeout policy, wait registration and scheduling |
+| `runtime.bl` | Portable prelude, process registry, FIFO runnable queue, mailbox scan/removal, timeout policy, input sink and scheduling |
 | `host.mjs` | Value representations and leaves, generator-frame machine, generic critical sections, retained state root, clock/task adapter |
 | `test.bl` | Application-level BL acceptance tests running on the compiled runtime |
-| `verify.mjs` | Node-only external verifier: adverse scheduling budgets, host boundaries and injected actor failure |
+| `demo.bl` | Browser actor, timer peer and visible replies, all in BL |
+| `number_rule.bl`, `number_rule_test.bl` | Opt-in conditional integer proof rule and 29 focused tests |
+| `demo-worker.mjs`, `demo.html` | Minimal transport adapter and observable browser UI |
+| `out/demo.mjs` | Generated BL browser app; rebuild rather than edit |
+| `verify.mjs`, `verify-inbox-edges.mjs` | Node-only verifiers: adverse budgets, host boundaries, failure propagation, pre-sink timed sleep and sink-retirement races |
 | `browser.html` | Browser module-Worker verifier |
 | `out/bundle.mjs` | Generated output; rebuild rather than edit |
 
@@ -91,6 +157,21 @@ a long loop alone would not prove bounded space.
 Calls through closure parameters use the same managed ABI, including callbacks
 that receive. The prototype does not yet optimize proven synchronous functions
 into direct JS calls.
+
+### Persistent browser input
+
+The host queue accepts typed browser strings before or after `newRuntime`, and
+`waitForInput` sleeps on either a timer or the next event. It never assigns a
+process or scans a mailbox. BL `rt-register-input!` sets the recipient in BL
+scheduler state; `rt-pump-input` drains the FIFO into that actor with `rt-send`.
+When every actor is parked, a registered sink makes an indefinite wait valid.
+An external event wakes the scheduler, which then runs the actor normally.
+Without a registered input sink, pre-registration events remain queued: a timed
+receive sleeps to its deadline instead of spinning on undrainable input, and
+the original no-sink deadlock diagnostic stays in place. Actor completion or
+failure clears its matching registration; a stale sink cannot swallow events
+or mask another actor's deadlock. This is one runtime per Worker, not
+distributed actor transport.
 
 ### Suspended exception scopes
 
@@ -209,10 +290,11 @@ literal comparison macro, so most pattern tests intentionally use `receive`.
   Native Erlang actor calls are not generally portable aliases.
 - **No links, monitors, registered names, exit signals, supervision, ETS, ports,
   NIFs or distribution.** Actor errors currently fail the batch run.
-- **Batch host, not a long-lived browser service.** If every remaining actor waits
-  indefinitely with no deadline or runnable sender, the harness reports blocked
-  execution as an error. External-event delivery and a persistent host inbox are
-  not implemented.
+- **Single-Worker inbox, not a general browser effect runtime.** A registered BL
+  input actor can remain blocked indefinitely and receive future browser strings.
+  If no sink is registered and all actors block without a deadline, the batch
+  still reports blocked execution as an error. There is no persisted event log,
+  general fetch/WebSocket adapter or cross-Worker actor transport.
 - **One runtime per bundle.** No cross-worker transport, transferable BL codec,
   closure serialization or mutable foreign-value ownership protocol.
 - **Trusted code, not a sandbox.** Host intrinsics are available to the prototype.
