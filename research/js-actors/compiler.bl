@@ -14,9 +14,6 @@
 ;
 ; WHAT THIS FILE REFUSES, AND WHY IT REFUSES IT AT BUILD TIME
 ;
-;   * `:try`. The machine has no exception frames, so a `try` that spanned a
-;     park would lose its `finally`. Emitting it "approximately" would silently
-;     change semantics, so it is a hard compile error instead.
 ;   * any `:remote` outside the checked ABI allowlist (`host/…`, `erlang/…`,
 ;     and a closed map of core names onto the BL prelude).
 ;   * any `:global` that neither the sources define nor the prelude provides.
@@ -165,14 +162,18 @@
     "is-bool" "is-fn" "to-str" "describe" "arith" "str-cat" "str-size" "truthy"
     "park" "wait-until" "now" "state" "set-state" "self" "set-self" "run-turn"
     "make-frames" "ref" "write" "raise" "max-frames"
-    "critical-enter" "critical-leave" "park-release" "record-error"})
+    "critical-enter" "critical-leave" "park-release" "record-error"
+    "ex-kind" "ex-reason" "ex-trace"})
 
 (def erlang-names
   "Every `:erlang` bif a guard (or a raw bif call) may reach."
   #{"==" "/=" "=:=" "=/=" "<" ">" "=<" ">=" "+" "-" "*" "rem" "is_integer"
     "is_float" "is_number" "is_binary" "is_tuple" "is_list" "is_pid"
     "is_reference" "is_port" "is_atom" "is_map" "tuple_size" "map_size" "abs"
-    "length" "self"})
+    "length" "self"
+    ; the exception bifs: the class/reason/reraise triple, the element/2 read a
+    ; `__STACKTRACE__` binding compiles to, and the two halves of a struct test
+    "raise" "throw" "exit" "element" "is_map_key" "map_get"})
 
 (def remote-map
   "Remote references the existing compiler emits for core names, each mapped
@@ -202,7 +203,17 @@
    "Elixir.BeamLisp.Ns.Core/dec" "core-dec"
    "Elixir.BeamLisp.Ns.Core/keyword" "core-keyword"
    "Elixir.BeamLisp.Ns.Core/name" "core-name"
-   "Elixir.BeamLisp.Transient/hash_map" "core-hash-map"})
+   "Elixir.BeamLisp.Ns.Core/ex-info" "core-ex-info"
+   "Elixir.BeamLisp.Ns.Core/ex-data" "core-ex-data"
+   "Elixir.BeamLisp.Ns.Core/ex-message" "core-ex-message"
+   "Elixir.BeamLisp.Ns.Core/ex-original" "core-ex-original"
+   "Elixir.BeamLisp.Transient/hash_map" "core-hash-map"
+   ; exceptions: `throw` compiles through raise_payload, the compiler's catch
+   ; normalizes through Exception.normalize, and a typed catch reads ex_data
+   "Elixir.BeamLisp.ExInfo/raise_payload" "exinfo-raise-payload"
+   "Elixir.BeamLisp.ExInfo/ex_data" "exinfo-data"
+   "Elixir.BeamLisp.ExInfo/ex_message" "exinfo-message"
+   "Elixir.Exception/normalize" "exception-normalize"})
 
 (def core-map
   "Core names the compiler leaves as a namespace-global fetch. The emitter
@@ -210,7 +221,9 @@
   {"str" "core-str" "not" "core-not" "list" "core-list" "vector" "core-vector"
    "print" "core-print" "println" "core-println" "hash-map" "core-hash-map"
    "nil?" "core-nil?" "some?" "core-some?" "not=" "core-not=" "inc" "core-inc"
-   "dec" "core-dec" "keyword" "core-keyword" "name" "core-name"})
+   "dec" "core-dec" "keyword" "core-keyword" "name" "core-name"
+   "ex-info" "core-ex-info" "ex-data" "core-ex-data"
+   "ex-message" "core-ex-message" "ex-original" "core-ex-original"})
 
 (defn remote-key [m f] (str (str m) "/" (str f)))
 
@@ -598,6 +611,100 @@
     {:lines (concat (:lines to) sel-lines dispatch)
      :val (if (:tail ctx) nil t)}))
 
+; ── try / catch / finally ─────────────────────────────────────────────────
+;
+; `:try` is emitted as a REAL JavaScript `try`/`catch`/`finally` INSIDE the
+; generator, not as a wrapper around one. That is the whole trick, and it is
+; what makes the scope survive suspension: the machine hands a thrown value to
+; a suspended generator with `gen.throw`, so a JavaScript catch clause in the
+; generated function text intercepts it exactly where the language says — after
+; any number of calls, receives, parks or bounded scheduler slices. A `try`
+; that merely wrapped a generator returning a control step would lose its
+; `finally` the moment the step suspended, which is the reason the earlier
+; prototype refused `:try` outright.
+;
+; Two consequences the emitter must honour:
+;
+;   * the protected body, every catch-clause body and the finalizer are emitted
+;     NON-TAIL. A tail call in one of them would REPLACE this generator's frame,
+;     and a frame no longer on the stack cannot be thrown into: the scope would
+;     be erased silently. Callees still tail-call normally among themselves, so
+;     a loop inside a protected body stays bounded.
+;
+;   * everything else is the engine's job. A finalizer that suspends is safe
+;     because JavaScript holds the pending completion in the generator's own
+;     frame: resuming the finalizer either re-throws what was unwinding or ends
+;     a normal completion, its value is discarded either way, and a raise
+;     inside it supersedes whatever was pending. The emitter tracks none of it.
+
+(defn emit-try-clauses
+  "Emit the statements of a `:try`'s JavaScript catch block.
+
+   The frontend has already lowered EVERY source clause into ONE ANF catch
+   clause whose pattern is `(kind value)` — the class and the reason — and whose
+   body binds `__STACKTRACE__`, normalizes through the target's
+   `Exception.normalize`, dispatches over the clauses and RERAISES with
+   `:erlang/raise` when nothing matched. None of that is re-invented here: this
+   binds the three fields of the thrown envelope to the names that body already
+   reads, and lets its value become the `try`'s."
+  [catches res ctx]
+  (if (empty? catches)
+    (list)
+    (let [stack-name (jsname "__STACKTRACE__")
+          matched (fresh-tmp)
+          clines (mapcat
+                   (fn [c]
+                     (let [label (fresh-tmp)
+                           gl (emit-guard (:guard c) ctx)
+                           bl (emit (:body c) (assoc ctx :tail false))]
+                       (concat
+                         (list (str "if (!" matched ") { " label ": {"))
+                         (emit-pats-lines (:pats c)
+                                          (list "H.exKind(TRY_EX)" "H.exReason(TRY_EX)")
+                                          label ctx)
+                         (:lines gl)
+                         (list (str "if (" (:val gl) " === true) {"))
+                         (:lines bl)
+                         (if (nil? (:val bl)) (list) (list (str res " = " (:val bl) ";")))
+                         (list (str matched " = true;"))
+                         (list "} } }"))))
+                   catches)]
+      (concat
+        (list (str "const " stack-name " = H.exTrace(TRY_EX);"))
+        (list (str "let " matched " = false;"))
+        clines
+        (list (str "if (!" matched ") throw new Error('try: no catch clause matched');"))))))
+
+(defn emit-try
+  "A `:try` in value position. See the section comment above for why the
+   protected regions are non-tail and why nothing is tracked across a
+   suspension. A `try` with neither a catch nor a finalizer protects nothing,
+   so it passes its body through with the surrounding tail context intact."
+  [node ctx]
+  (let [catches (:catch node)
+        aft (:after node)]
+    (if (and (empty? catches) (nil? aft))
+      (emit (:body node) ctx)
+      (let [res (fresh-tmp)
+            body-lines (let [b (emit (:body node) (assoc ctx :tail false))]
+                         (concat (:lines b)
+                                 (if (nil? (:val b))
+                                   (list)
+                                   (list (str res " = " (:val b) ";")))))
+            after-lines (if (nil? aft)
+                          (list)
+                          (:lines (emit aft (assoc ctx :tail false))))]
+        {:lines (concat
+                  (list (str "let " res ";"))
+                  (list "try {")
+                  body-lines
+                  (if (empty? catches) (list) (list "} catch (TRY_EX) {"))
+                  (emit-try-clauses catches res ctx)
+                  (if (nil? aft) (list) (list "} finally {"))
+                  after-lines
+                  (list "}"))
+         :val res}))))
+
 ; ── the dispatcher ───────────────────────────────────────────────────────────
 
 (defn emit
@@ -628,12 +735,7 @@
       (= op :fn) {:lines (list) :val (emit-fn node ctx)}
       (= op :case) (emit-case node ctx)
       (= op :recv) (emit-recv node ctx)
-      (= op :try)
-        (throw (ex-info (str "js-actors: `:try` is not supported by the JS backend."
-                             " The machine has no exception frames, so a try spanning a"
-                             " park would lose its `finally` — refusing is the only"
-                             " semantics-preserving answer.")
-                        {:op :try}))
+      (= op :try) (emit-try node ctx)
       :else (throw (ex-info (str "js-actors: unknown ANF op " (pr-str op)) {:op op})))))
 
 ; ─────────────────────────────────────────────────────────────────────────────
@@ -770,13 +872,47 @@
       (do (println (str "DIAGNOSTIC OK " text)) 0)
       (throw (ex-info (str "expected diagnostic " text ", got " message) {})))))
 
+(defn expect-accept [label src]
+  (let [r (try (do (compile-and-audit src) :ok) (catch e (ex-message e)))]
+    (if (= r :ok)
+      (do (println (str "POSITIVE OK   " label)) 0)
+      (do (println (str "POSITIVE FAIL " label " — " r)) 1))))
+
+(defn positive-tests
+  "The `:try` shapes this backend must LOWER. Refusing `:try` used to be the
+   only semantics-preserving answer; now that the scope is a real JavaScript
+   try/catch/finally inside the generator, the audit that used to guard the
+   whole form guards its INSIDE instead (see negative-tests), and these check
+   that the accepted surface really lowers."
+  []
+  (loop [thunks (list
+                  (fn [] (expect-accept "try with a catch lowers"
+                                        "(fn [] (try 1 (catch e e)))"))
+                  (fn [] (expect-accept "try with a finalizer lowers"
+                                        "(fn [] (try 1 (finally 2)))"))
+                  (fn [] (expect-accept "try/catch/finally lowers"
+                                        "(fn [] (try (throw {:a 1}) (catch e (:a (ex-data e))) (finally nil)))"))
+                  (fn [] (expect-accept "a receive in the body and the finalizer lowers"
+                                        "(fn [] (try (receive x x) (finally (receive y y))))"))
+                  (fn [] (expect-accept "a typed catch lowers"
+                                        "(fn [] (try 1 (catch BeamLisp.ExInfo e (ex-data e))))")))
+         fails 0]
+    (if (empty? thunks)
+      fails
+      (recur (rest thunks) (+ fails ((first thunks)))))))
+
 (defn negative-tests
   "The other half of the ABI contract: things the backend must REFUSE, checked
-   at build time so a regression is a failed build, not a silent widening."
+   at build time so a regression is a failed build, not a silent widening. The
+   `:try` cases here are ABI violations INSIDE a try — the audit walks the
+   protected body, the handler and the finalizer like any other node, so a try
+   is not a hole in the allowlist."
   []
   (loop [thunks (list
                   (fn [] (compile-and-audit "(fn [] 9007199254740992)"))
-                  (fn [] (compile-and-audit "(fn [] (try 1 (catch e 2)))"))
+                  (fn [] (compile-and-audit "(fn [] (try (File/read! \"/tmp/x\") (catch e 2)))"))
+                  (fn [] (compile-and-audit "(fn [] (try 1 (catch e (erlang/no_such_bif 1 2))))"))
+                  (fn [] (compile-and-audit "(fn [] (try 1 (finally (totally-unknown-name 1))))"))
                   (fn [] (compile-and-audit "(fn [] (File/read! \"/tmp/x\"))"))
                   (fn [] (compile-and-audit "(fn [] (totally-unknown-name 1))"))
                   (fn [] (audit! [[:global "js" "not-defined"]] {}))
@@ -785,7 +921,9 @@
                   (fn [] (compile-and-audit "(fn [] (case [1 2] [a b] (+ a b) :no))")))
          labels (list
                   "unsafe integer literals are refused"
-                  "`:try` is refused (no exception frames across a park)"
+                  "an unknown remote inside a try body is refused"
+                  "an unknown erlang bif inside a catch handler is refused"
+                  "an unresolved global inside a finalizer is refused"
                   "an unknown remote module is refused"
                   "an unresolved global is refused"
                   "a hand-built unresolved global ref is refused"
@@ -843,9 +981,10 @@
                   (count sources) " sources -> " out-dir "/bundle.mjs"))
     (println (str "js-actors: " (count refs) " host references audited ("
                   nrem " remote, " nglob " global) against the allowlist")))
-  (expect-diagnostic "(fn [] (try 1 (catch e 2)))" "`:try` is not supported")
+  (expect-diagnostic "(fn [] (try (File/read! \"/tmp/x\") (catch e 2)))"
+                     "not in the checked ABI")
   (expect-diagnostic "(fn [] 9007199254740992)" "integer literal exceeds")
-  (let [fails (negative-tests)]
+  (let [fails (+ (negative-tests) (positive-tests))]
     (if (zero? fails)
       0
       (throw (ex-info "js-actors: negative compiler tests failed" {:failures fails})))))

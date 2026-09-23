@@ -11,7 +11,9 @@
 ;   1. THE PRELUDE. Beam-lisp semantics above the host's leaves: list and
 ;      vector walking, map access, equality, string building, keyword/name.
 ;      Every `rt-*`/`core-*` name below is defined over `host/…` leaves only,
-;      so the prelude is the bottom of the bootstrap. compiler.bl maps the
+;      so the prelude is the bottom of the bootstrap. It also holds the TARGET
+;      EXCEPTION POLICY — what a raise's class and reason mean — so that
+;      compiler.bl maps the
 ;      core names the compiler links (Elixir.BeamLisp.RT/first,
 ;      Elixir.BeamLisp.Ns.Core/inc, …) onto these functions.
 ;
@@ -77,11 +79,17 @@
     (host/is-cons coll) (host/cons x coll)
     :else (host/raise "conj: unsupported collection")))
 
-(defn rt-get [m k]
+(defn rt-get-impl [m k default]
   (cond
-    (host/is-nil m) nil
-    (host/is-vec m) (host/vec-el m k)
-    :else (host/map-get m k)))
+    (host/is-nil m) default
+    (host/is-vec m) (if (and (not (host/lt k 0)) (host/lt k (host/vec-size m)))
+                      (host/vec-el m k)
+                      default)
+    :else (host/map-get m k default)))
+
+(defn rt-get
+  ([m k] (rt-get-impl m k nil))
+  ([m k default] (rt-get-impl m k default)))
 
 (defn rt-assoc [m k v] (host/map-put m k v))
 
@@ -140,6 +148,121 @@
     m
     (rt-hash-map-more (host/cons-tail (host/cons-tail more))
                       (host/map-put m (host/cons-head more) (rt-first (host/cons-tail more))))))
+
+; ── target exceptions ───────────────────────────────────────────────────────
+;
+; WHAT A RAISE IS HERE. A JavaScript `throw` carries a HOST ENVELOPE (host.mjs
+; `BLRaise`): a class keyword, a BL reason and a raw stacktrace. The host hands
+; those three fields over (`host/ex-kind`, `host/ex-reason`, `host/ex-trace`)
+; and decides nothing else. Everything below is the target's exception POLICY —
+; what a class means, what `throw` of a value builds, and what an `:error`
+; reason normalizes into. A catch clause compiled by compiler.bl reads exactly
+; these functions: `raise_payload` for `throw`, `Exception.normalize` for the
+; class dispatch, and `ex_data` for a typed catch.
+;
+; THE REPRESENTATION. An exception value is a MAP whose `:__struct__` is a
+; keyword naming its module — the shape a BEAM struct actually has, which is
+; what lets the compiler's own typed-catch test (`is_map ∧ is_map_key(
+; :__struct__) ∧ map_get(:__struct__) =:= Mod`) run unchanged. `BeamLisp.ExInfo`
+; carries `:message` and `:data`; `Elixir.ErlangError` carries `:message` and
+; `:original`.
+;
+; LIMITS, stated rather than papered over:
+;   * There are exactly two exception modules here, `BeamLisp.ExInfo` and
+;     `ErlangError`. There is no Elixir exception catalogue: an arithmetic or
+;     host failure normalizes to `ErlangError` carrying the host's message as
+;     `:original`, NOT to `%ArithmeticError{}` or `%ArgumentError{}`. A typed
+;     `(catch ArithmeticException …)` therefore matches nothing and reraises,
+;     which is what the compiler's fallthrough already says.
+;   * The stacktrace is EMPTY. `:erlang/element(2, __STACKTRACE__)` answers an
+;     empty frame list: there are no BEAM frames on this target and none are
+;     invented. `frames` below is accepted and ignored for that reason.
+;   * `:erlang/exit` is catchable like any other class and, uncaught, fails the
+;     process that raised it. There are no links, monitors or exit signals, so
+;     it kills nothing else — OTP shutdown semantics are out of scope.
+;   * `host/struct` builds a JavaScript object, not a map, so a struct built
+;     that way is opaque data to `throw`, not an exception.
+
+(defn rt-exception?
+  "Is `x` a target exception — a map whose `:__struct__` names a module?"
+  [x]
+  (and (host/is-map x) (host/is-kw (host/map-get x :__struct__))))
+
+(defn rt-exception-mod [x] (host/map-get x :__struct__))
+
+(defn rt-exception-of? [x mod]
+  (and (rt-exception? x) (host/eq (rt-exception-mod x) (host/kw mod))))
+
+(defn rt-exinfo? [x] (rt-exception-of? x "Elixir.BeamLisp.ExInfo"))
+
+(defn rt-struct-map
+  "The struct-shaped map that every target exception is."
+  [mod msg key val]
+  (host/map-put (host/map-put (host/map-put (host/empty-map) :__struct__ (host/kw mod))
+                              :message msg)
+                key val))
+
+(defn rt-exinfo [msg data]
+  (rt-struct-map "Elixir.BeamLisp.ExInfo" msg :data data))
+
+(defn rt-erlang-error
+  "The `:error` reason for anything that is not already an exception: the
+   original is preserved, BEAM's prose supplies the message."
+  [reason]
+  (rt-struct-map "Elixir.ErlangError"
+                 (host/str-cat "Erlang error: " (host/describe reason))
+                 :original reason))
+
+(defn exception-normalize
+  "`Exception.normalize/3`, for the classes and reasons this target has.
+
+   `kind` is `:error` in every use the compiler emits — a THROWN payload stays
+   itself and an EXIT becomes `{:exit, reason}` in the ANF's own `case`, before
+   this is ever reached — but the other two arms are implemented so a direct
+   call means the same thing here as there."
+  [kind value frames]
+  (cond
+    (host/eq kind :error)
+      (if (rt-exception? value) value (rt-erlang-error value))
+    (host/eq kind :throw) value
+    :else (host/tup (host/list->array (host/cons (host/kw "exit")
+                                                 (host/cons value (host/empty-list)))))))
+
+(defn exinfo-raise-payload
+  "`throw`: raise a value so a `try` can catch it. An existing exception is
+   raised as-is; a map becomes an ExInfo carrying it as `:data`; anything else
+   becomes an ExInfo with a printed message and no data. The class is `:error`
+   (BEAM's `raise` is), so the payload travels as an exception value and the
+   compiled catch's normalizer passes it through unchanged."
+  [x]
+  (erlang/raise :error
+                (cond
+                  (rt-exception? x) x
+                  (host/is-map x) (rt-exinfo (host/to-str x) x)
+                  :else (rt-exinfo (host/describe x) nil))
+                nil))
+
+(defn exinfo-data [e] (if (rt-exinfo? e) (host/map-get e :data) nil))
+
+(defn exinfo-message
+  "A readable message for any value: a target exception's own `:message`, else
+   the printed form."
+  [e]
+  (if (rt-exception? e)
+    (let [m (host/map-get e :message)]
+      (if (host/is-nil m) (host/describe e) m))
+    (host/describe e)))
+
+(defn exinfo-original
+  "The Erlang original behind an `ErlangError`, nil for anything else — the one
+   answer prose cannot give, since a message renders that original into words."
+  [e]
+  (if (rt-exception-of? e "Elixir.ErlangError") (host/map-get e :original) nil))
+
+(defn core-ex-info [msg data] (rt-exinfo msg data))
+(defn core-ex-data [e] (exinfo-data e))
+(defn core-ex-message [e] (exinfo-message e))
+(defn core-ex-original [e] (exinfo-original e))
 
 ; ─────────────────────────────────────────────────────────────────────────────
 ; 2. Actor runtime

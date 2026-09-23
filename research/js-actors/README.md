@@ -26,7 +26,7 @@ node research/js-actors/verify.mjs
 
 On this workstation the build was given `ELIXIR_ERL_OPTIONS='+S 4:4 +SDcpu 2:2
 +SDio 8 +sbwt none +sbwtdcpu none +sbwtdio none'` to avoid its default single
- dirty-I/O scheduler. That is a host tuning choice, not a language requirement.
+dirty-I/O scheduler. That is a host tuning choice, not a language requirement.
 
 The compiler builds `runtime.bl` and `test.bl` into `out/bundle.mjs`. The bundle
 imports its sibling `host.mjs`; deploy both, preserving that relative layout.
@@ -92,6 +92,28 @@ Calls through closure parameters use the same managed ABI, including callbacks
 that receive. The prototype does not yet optimize proven synchronous functions
 into direct JS calls.
 
+### Suspended exception scopes
+
+Canonical `:try` emits a real `try/catch/finally` **inside the generated
+function's JS generator**. The machine carries either a returned value or a
+thrown envelope across generator frames and budget yields; it resumes a caller
+with `generator.throw` on failure. Protected bodies, catch handlers and
+finalizers cannot tail-replace their own generator frame: that would erase the
+dynamic scope. Their callees may still run tail loops without growing frames.
+
+This keeps pending normal/exceptional completion alive while a receive parks in
+the body, handler **or finalizer**. Cleanup runs once, its normal value is ignored,
+and a cleanup error replaces the pending result/error. Catch handlers do not
+catch errors from themselves. The emitter reuses the frontend's existing
+normalized exception dispatch and typed catch tests; it does not invent a second
+source-level exception parser.
+
+The target exception policy is in **BL** (`runtime.bl`). A thin host envelope
+carries kind, reason and a raw-trace-shaped tuple. `ExInfo` map/data/message and
+ErlangError normalization are implemented for this slice, but the frame list is
+empty, not a fabricated BEAM stacktrace. Unsupported BEAM exception classes,
+exact host error prose and OTP exit signaling are not claimed.
+
 ### Atomic runtime updates
 
 The runtime itself is managed BL, so an ordinary read/modify/write sequence could
@@ -138,22 +160,28 @@ root turns. This is cooperative scheduling, not preemption of arbitrary native J
 
 Verified against a freshly regenerated bundle:
 
-- **83 BL acceptance checks passed in Node.**
-- The same **83 checks passed with 17-step and 41-step actor budgets**, in addition
+- **104 BL acceptance checks passed in Node.**
+- The same **104 checks passed with 17-step and 41-step actor budgets**, in addition
   to the default 200-step budget.
 - Injected actor failure caused a nonzero process exit; failed checks raise instead
   of printing a misleading success exit.
-- **83 checks passed in an actual browser module Worker**, with timer callbacks
+- **104 checks passed in an actual browser module Worker**, with timer callbacks
   observed while the suite ran.
-- Eight negative compiler cases passed, with separately asserted diagnostic text
-  for unsupported `:try` and unsafe integer literals.
+- Ten negative compiler cases plus five positive `:try` lowering cases passed;
+  the closed ABI and unsafe integer rejection remain checked.
+- Five selected exception results were evaluated independently on native BEAM:
+  normal cleanup, caught message/data, cleanup error precedence, typed catch,
+  and typed catch fallthrough. These examples agreed with their JS assertions.
 
 Coverage includes primitive arithmetic/truthiness, distinct keyword/string keys,
 compound structural keys without delimiter collisions, closures, multi-arity and
 variadic calls, pattern guards and guard errors, map patterns, repeated wildcards,
 nonfinal `do` effects, receive-body effects, selective/message-major receive,
 retained skipped messages, zero/timed receives, higher-order suspension, CPU-peer
-fairness, deadlines under runnable peers, concurrent sends and bounded frames.
+fairness, deadlines under runnable peers, concurrent sends, caught throws,
+typed catches, higher-order errors, nested cleanup order, error precedence,
+parked bodies/handlers/finalizers, protected
+tail loops and bounded frames.
 
 `verify.mjs` also checks safe-integer overflow and atomic-park invariants directly.
 These are prototype regressions, not a comprehensive differential conformance suite
@@ -162,12 +190,14 @@ against native BEAM. Exact timeout/message race equivalence is not established.
 ## Supported surface and limits
 
 Emission exists for `:lit :var :global :remote :arith :apply :let :if :do :fn
-:tuple :map :cons :enil :struct :case :recv`. This is a **subset implementation of
+:tuple :map :cons :enil :struct :case :recv :try`. This is a **subset implementation of
 their semantics**, not full language support. Source `case` currently expands as a
 literal comparison macro, so most pattern tests intentionally use `receive`.
 
-- **No `:try`.** Rejected at compilation. Catch/finalizer frames spanning suspension
-  are not implemented; generator parking must not accidentally execute cleanup.
+- **Exception subset.** `:try`, caught `throw`, ExInfo data/message and typed
+  catch dispatch survive suspension, but raw BEAM stacktrace frames are not
+  available and arbitrary BEAM/Elixir exception types are not reconstructed.
+  `:erlang/exit` does not propagate links or monitor messages.
 - **Safe integers and an IEEE-754 float subset only.** Unsafe integer literals and
   integer arithmetic overflow are rejected. Full bignums/decimals and preserving
   the BEAM distinction between `1` and `1.0` remain unimplemented.
@@ -192,7 +222,7 @@ literal comparison macro, so most pattern tests intentionally use `receive`.
   build. Generated module initialization checks the allowlists against actual host
   exports, preventing missing leaves from being silently deferred to use time.
 
-Next architectural step: explicit handler/finalizer frames and a managed/direct
-kernel contract, followed by a host-event inbox and differential semantic tests.
+Next architectural step: a managed/direct kernel contract, persistent host-event
+inbox, then broader differential semantic tests (including timeout/raise races).
 Do not grow the JavaScript adapter into an actor implementation: receive and
 scheduler policy belong in BL.

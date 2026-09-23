@@ -209,7 +209,9 @@ export function describe(x) {
   if (x instanceof T) return "{" + x.items.map(describe).join(", ") + "}";
   if (isVec(x)) return "[" + vecItems(x).map(describe).join(" ") + "]";
   if (isStruct(x)) return "#" + x.__struct + "{}";
-  if (x instanceof BMap) return "{" + mapKeys(x).map(k => describe(k) + " " + describe(mapGet(x, k))).join(", ") + "}";
+  // `mapKeys` answers a BL LIST (it is the language's own `keys`), so it has to
+  // be walked with `listToArray` before JavaScript's `.map` sees an array.
+  if (x instanceof BMap) return "{" + listToArray(mapKeys(x)).map(k => describe(k) + " " + describe(mapGet(x, k))).join(", ") + "}";
   if (typeof x === "string") return JSON.stringify(x);
   if (typeof x === "function") return "#<fn>";
   if (isFn(x)) return "#<fn " + x.name + ">";
@@ -292,6 +294,66 @@ export class Step {
   constructor(k, extra) { this.__step = true; this.k = k; if (extra) Object.assign(this, extra); }
 }
 export function isStep(x) { return !!x && x.__step === true; }
+// ── raised values ────────────────────────────────────────────────────────────
+//
+// A JavaScript `throw` carries an ENVELOPE, never a bare BL value. A BL value
+// has no class, and the compiler-generated catch handler has to read the class
+// (`:error` | `:throw` | `:exit`), the reason and the raw stacktrace apart
+// without guessing. Like a Step, an envelope is a HOST object, so no BL program
+// can forge one, and a BL value that merely looks like one stays data.
+//
+// `trace` is the raw stacktrace in its SHAPE, not its content: the compiler
+// emits `:erlang/element(2, __STACKTRACE__)` to reach the frame list, so the
+// envelope carries a 2-tuple and `element/2` on it answers a list. The frame
+// list here is EMPTY — this target has no BEAM stack, and inventing frames would
+// be a worse lie than reporting none.
+
+export class BLRaise {
+  constructor(kind, reason, trace) {
+    this.__blraise = true;
+    this.kind = kind;                        // a KW: :error | :throw | :exit
+    this.reason = reason;                    // a BL value
+    this.trace = isTup(trace) ? trace : emptyTrace();
+  }
+}
+export function isRaise(x) { return !!x && x.__blraise === true; }
+export function emptyTrace() { return new T([ENIL, ENIL]); }
+/** The three fields of a raise, as NAMED exports: the emitter emits
+ *  `H.exKind(...)` / `H.exReason(...)` / `H.exTrace(...)` directly into a
+ *  generated catch block, and the `host/…` leaves below are the same functions
+ *  under their registry names. A raw JavaScript throw has no class, so it reads
+ *  as `:error` with its message as the reason. */
+export function exKind(x) { return isRaise(x) ? x.kind : kw("error"); }
+export function exReason(x) { return isRaise(x) ? x.reason : rawReason(x); }
+export function exTrace(x) { return isRaise(x) ? x.trace : emptyTrace(); }
+
+/** The reason of a NON-envelope throw (a raw JS `Error` from a host leaf or an
+ *  internal check) as the plain string a BL program can carry. */
+function rawReason(x) {
+  if (typeof x === "string") return x;
+  if (x && typeof x.message === "string") return x.message;
+  return String(x);
+}
+
+/** The message an uncaught raise contributes to a process error. A JS error
+ *  keeps its stack (the prototype's one real diagnostic); an envelope prefers
+ *  the reason's own `:message` over its printed form. */
+export function exceptionText(e) {
+  if (!isRaise(e)) return String((e && e.stack) || e);
+  const kind = isKw(e.kind) ? e.kind.n : String(e.kind);
+  return "(" + kind + ") " + describeReason(e.reason);
+}
+function describeReason(reason) {
+  try {
+    if (reason instanceof BMap) {
+      const m = mapGet(reason, kw("message"));
+      if (typeof m === "string") return m;
+    }
+    return describe(reason);
+  } catch (_) {
+    return "<unprintable reason>";
+  }
+}
 
 // ── the machine ──────────────────────────────────────────────────────────────
 
@@ -352,64 +414,101 @@ export function invokeNative(rt, f, args) {
  *  process is a value the BL scheduler can store in its registry. */
 export function runTurn(rt, frames, budget) {
   let steps = 0;
-  // The critical depth this turn entered with. A failed turn is unwound to it,
-  // so a BL function that raised between critical-enter and critical-leave does
-  // not leave the depth positive and defer every future slice forever.
+  // The critical depth this turn entered with. A turn that dies restores it, so
+  // a raise that unwinds past a `critical-enter` cannot strand the depth.
   const cd0 = rt.criticalDepth || 0;
-  // The pending resume value is MACHINE STATE, not a local: a slice can end
-  // exactly between "a callee finished" and "its caller is resumed", and a
-  // value dropped there would silently become nil. It rides on the frame
-  // stack (the one object a suspended process already is).
-  let sent = frames.__sent === undefined ? null : frames.__sent;
-  const finish = (r) => { frames.__sent = sent; return r; };
-  const fail = (message) => { rt.criticalDepth = cd0; return finish(mkResult("error", frames, { message })); };
+  // The pending completion is MACHINE STATE, not a local: a slice can end
+  // exactly between "a callee finished" and "its caller is resumed" — or while
+  // a thrown value is still climbing the stack — and a completion dropped there
+  // would silently become nil. It rides on the frame stack (the one object a
+  // suspended process already is).
+  let pending = frames.__pending === undefined ? { t: "value", v: null } : frames.__pending;
+  // Per-frame critical depth at entry. A frame that unwinds — normally OR by a
+  // throw — restores the depth it started with, so an unpaired
+  // `critical-enter` inside the frame cannot defer every future slice forever.
+  // Kept in step with `frames` at every push, pop and tail replacement.
+  let cds = frames.__cds;
+  if (!Array.isArray(cds)) { cds = []; frames.__cds = cds; }
+  const finish = (r) => { frames.__pending = pending; frames.__cds = cds; return r; };
+  const die = (message) => {
+    rt.criticalDepth = cd0;
+    pending = { t: "value", v: null };
+    return finish(mkResult("error", frames, { message }));
+  };
   while (true) {
+    while (cds.length < frames.length) cds.push(cd0);
     if (frames.length > (rt.maxFrames || 0)) rt.maxFrames = frames.length;
     // A bounded slice normally ends here. While a critical section is open the
     // boundary is DEFERRED: splitting a read-modify-write of `rt.state` across
     // a slice would let another process mutate the same root underneath it.
     if (steps >= budget && (rt.criticalDepth || 0) === 0) return finish(mkResult("yield", frames, {}));
+    if (frames.length === 0) {
+      if (pending.t === "throw") return die(exceptionText(pending.v));
+      return finish(mkResult("done", frames, { value: pending.v }));
+    }
     const g = frames[frames.length - 1];
     let res;
-    try { res = g.next(sent); }
-    catch (e) { steps = 0; return fail(String((e && e.stack) || e)); }
-    sent = null;
+    try {
+      // A pending THROW is delivered at the frame's suspension point, so a
+      // compiled `try` — a real JavaScript try/catch inside the generator —
+      // catches it exactly where the language says it should.
+      res = pending.t === "throw" ? g.throw(pending.v) : g.next(pending.v);
+    } catch (e) {
+      // The frame did not catch it, so its generator is closed: pop it and hand
+      // the SAME value to its caller, where an enclosing `try` may yet catch it.
+      pending = { t: "throw", v: e };
+      frames.pop();
+      rt.criticalDepth = cds.length > 0 ? cds.pop() : cd0;
+      steps++;
+      continue;
+    }
+    pending = { t: "value", v: null };
     steps++;
     if (res.done) {
       frames.pop();
-      if (frames.length === 0) return finish(mkResult("done", frames, { value: res.value }));
-      sent = res.value;
+      rt.criticalDepth = cds.length > 0 ? cds.pop() : cd0;
+      pending = { t: "value", v: res.value };
       continue;
     }
     let step = res.value;
     while (true) {
-      if (!isStep(step)) { sent = step; break; }
+      if (!isStep(step)) { pending = { t: "value", v: step }; break; }
       if (step.k === "park") return finish(mkResult("park", frames, {}));
       if (step.k === "host-wait") return finish(mkResult("host-wait", frames, { ms: step.ms }));
       if (step.k === "call" || step.k === "tail") {
+        // A failure in resolution or in a native leaf is a THROW TO THE CALLER,
+        // not an instant process death: the frame above this step is the one
+        // that asked for the call, and its `try` may be waiting for it.
         let factory = null;
         try { factory = resolveCallee(step.f, step.args); }
-        catch (e) { return fail(String((e && e.stack) || e)); }
+        catch (e) { pending = { t: "throw", v: e }; break; }
         if (factory) {
           let ng;
           try { ng = factory(rt, step.args); }
-          catch (e) { return fail(String((e && e.stack) || e)); }
-          if (step.k === "tail") frames[frames.length - 1] = ng; else frames.push(ng);
+          catch (e) { pending = { t: "throw", v: e }; break; }
+          if (step.k === "tail") {
+            frames[frames.length - 1] = ng;
+            cds[cds.length - 1] = rt.criticalDepth || 0;
+          } else {
+            frames.push(ng);
+            cds.push(rt.criticalDepth || 0);
+          }
           break;
         }
         let v;
         try { v = invokeNative(rt, step.f, step.args); }
-        catch (e) { return fail(String((e && e.stack) || e)); }
+        catch (e) { pending = { t: "throw", v: e }; break; }
         steps++;
-        if (step.k === "tail") frames.pop();
-        if (frames.length === 0) return finish(mkResult("done", frames, { value: isStep(v) ? null : v }));
+        if (step.k === "tail") {
+          frames.pop();
+          rt.criticalDepth = cds.length > 0 ? cds.pop() : cd0;
+        }
+        if (frames.length === 0) { pending = { t: "value", v: isStep(v) ? null : v }; break; }
         if (isStep(v)) { step = v; continue; }
-        sent = v;
-        break;
+        pending = { t: "value", v }; break;
       }
-      return fail("unknown control step " + step.k);
+      pending = { t: "throw", v: new Error("unknown control step " + step.k) }; break;
     }
-    if (frames.length === 0) return finish(mkResult("done", frames, { value: sent }));
   }
 }
 
@@ -537,6 +636,17 @@ export const PURE = {
   "str-cat": (...xs) => xs.map(toStr).join(""),
   "str-size": (s) => s.length,
   truthy,
+  // ── reading a raised value ─────────────────────────────────────────────────
+  //
+  // The THREE fields of a throw, and nothing else: the class, the reason and
+  // the raw stacktrace. What a class MEANS — that `:error` normalizes into an
+  // exception struct and `:throw` stays itself — is BL policy (runtime.bl
+  // `exception-normalize`), not host policy. A raw JavaScript throw (a host
+  // leaf's `raise`, an internal check) has no class, so it reads as
+  // `:error` with its message as the reason.
+  "ex-kind": exKind,
+  "ex-reason": exReason,
+  "ex-trace": exTrace,
 };
 
 /** Intrinsics that need the runtime: the retained mutable root and the
@@ -645,6 +755,34 @@ export const ERLANG = {
   "abs": Math.abs,
   "length": (l) => listToArray(l).length,
   "self": () => null,
+  // ── raising, and the two halves of an exception's shape ────────────────────
+  //
+  // `:erlang.raise/3` is what the compiler's catch fallthrough re-raises with,
+  // and what `BeamLisp.ExInfo.raise_payload/1` is built on: class, reason and
+  // the RAW stacktrace, passed through untouched. `:erlang.throw/1` and
+  // `:erlang.exit/1` differ only in the class they carry — this target has no
+  // links, monitors or exit signals, so an UNCAUGHT exit fails the process like
+  // any other raise; it kills nothing else, and no actor observes it.
+  "raise": (kind, reason, trace) => { throw new BLRaise(kind, reason, trace); },
+  "throw": (reason) => { throw new BLRaise(kw("throw"), reason, emptyTrace()); },
+  "exit": (reason) => { throw new BLRaise(kw("exit"), reason, emptyTrace()); },
+  // `element/2` is emitted for a `__STACKTRACE__` read (raw trace → frame list);
+  // `is_map_key/2` and `map_get/2` are the halves of the struct test the
+  // compiler builds for a typed catch. All three are BEAM bifs, so they fail
+  // for BEAM's reasons rather than quietly answering nil.
+  "element": (i, t) => {
+    if (!isTup(t)) throw new Error(":erlang.element/2 needs a tuple, got " + describe(t));
+    if (!Number.isInteger(i) || i < 1 || i > t.items.length)
+      throw new Error(":erlang.element/2 index " + i + " is outside a " + t.items.length + "-tuple");
+    return t.items[i - 1];
+  },
+  "is_map_key": (k, m) => m instanceof BMap && m.m.has(hashKey(k)),
+  "map_get": (k, m) => {
+    if (!(m instanceof BMap)) throw new Error(":erlang.map_get/2 needs a map, got " + describe(m));
+    const e = m.m.get(hashKey(k));
+    if (e === undefined) throw new Error(":erlang.map_get/2: no key " + describe(k));
+    return e[1];
+  },
 };
 
 // ── the driver: hand turns to the host task queue between scheduler slices ───
