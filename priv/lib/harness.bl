@@ -1,0 +1,434 @@
+; harness.bl — a beam-lisp session a model (or you) drives: eval, turns, steers.
+;
+; ══ THE SHAPE ═══════════════════════════════════════════════════════════════
+;
+;   evaluate    code in  →  cells evaluated now  →  blocks appended  →  blocks out
+;   start-turn  task in  →  blocks appended      →  a turn runs async (the model)
+;   steer-turn  task in  →  blocks appended      →  the running turn reads them
+;
+; Input is `.bl` (one cell) or `.bl.md` (prose + ```beam-lisp cells). Output is
+; the same thing: every cell is appended to the session document followed by
+; the ```bl-result its evaluation produced (see harness.doc). The document at
+; `.local/harness/<session>.bl.md` is the whole state — the transcript you
+; read, the context the model reads, a livebook `bl.doc` can slice.
+;
+; ══ ONE VM PER PROJECT ══════════════════════════════════════════════════════
+;
+; The harness lives inside the project's warm VM (vm.manager): cells evaluate
+; in that VM's env, turn workers are registered MEMBERS of it (vm.owner), and
+; `vm.manager/drain` takes the whole harness down with the VM. Nothing here
+; starts a VM of its own. Cold (no daemon), the same code runs in the one VM
+; the command booted.
+;
+; ══ ONE WRITER ══════════════════════════════════════════════════════════════
+;
+; `keeper` is the only process that writes a session document, so an eval and
+; a turn appending at once interleave by whole blocks, never by bytes. It also
+; owns each session's turn: it spawns the worker, monitors it, and records how
+; it ended. Evaluation itself never runs in the keeper — a cell can take as
+; long as it likes without stalling anyone else's append.
+
+(ns harness
+  (:require [harness.doc :as hd]
+            [harness.model :as model]
+            [vm.core :as vmc]
+            [vm.owner :as owner]
+            [vm.scope :as scope]))
+
+(def KEEPER :harness-keeper)
+
+(def EVAL-TIMEOUT-MS
+  "How long one cell may run before it is killed. Under an MCP client's own
+   request timeout (30 s is common), so a runaway cell answers as an error
+   instead of a dropped connection."
+  20000)
+
+(def MAX-STEPS
+  "Model replies per turn. A turn ends earlier when a reply runs no code."
+  24)
+
+(defn- now-ms [] (erlang/system_time :millisecond))
+
+(defn- describe
+  "Any caught value as a message: an exception's own message, else its print."
+  [e]
+  (try (ex-message e) (catch _ (pr-str e))))
+
+(defn- valid-sid? [sid]
+  (and (string? sid)
+       (Regex/match? (Regex/compile! "^[a-z0-9][a-z0-9_-]{0,40}$") sid)))
+
+;; ── the keeper ──────────────────────────────────────────────────────────────
+
+(defn- doc-path [root sid] (str root "/.local/harness/" sid ".bl.md"))
+
+(defn- cells-in
+  "How many cells a session document already holds, so ids keep counting
+   across a daemon restart instead of starting over at c1."
+  [path]
+  (dec (count (String/split (File/read! path) "```beam-lisp id=c"))))
+
+(defn- ensure-session [st sid]
+  (if (contains? (:sessions st) sid)
+    st
+    (let [path (doc-path (:root st) sid)
+          ns (str "harness.session." sid)]
+      (when-not (File/exists? path)
+        (File/mkdir_p! (Path/dirname path))
+        (File/write! path (hd/preamble sid ns)))
+      (assoc-in st [:sessions sid]
+                {:id sid :path path :ns ns :root (:root st)
+                 :next (cells-in path) :turns 0 :turn nil :last nil}))))
+
+(defn- session-view
+  "A session as data a caller can hold: no pids, no refs."
+  [s]
+  {:id (:id s) :doc (:path s) :ns (:ns s) :turns (:turns s)
+   :turn (when-let [t (:turn s)] (select-keys t [:id :steers :started-ms]))
+   :last (:last s)})
+
+(defn- spawn-member
+  "Start `thunk` as a member of the harness's VM, or plainly when cold."
+  [vm thunk]
+  (if (nil? vm)
+    (spawn thunk)
+    (owner/spawn-in (:id vm) :harness-turn (:env vm) thunk)))
+
+(defn- close-turn [st sid outcome]
+  (let [t (get-in st [:sessions sid :turn])]
+    (when (some? (:ref t)) (erlang/demonitor (:ref t) (list :flush)))
+    (-> st
+        (assoc-in [:sessions sid :turn] nil)
+        (assoc-in [:sessions sid :last] {:id (:id t) :outcome outcome
+                                         :ms (- (now-ms) (:started-ms t))}))))
+
+(defn- append-to [st sid text]
+  (File/write (get-in st [:sessions sid :path]) text (list :append)))
+
+(defn- render-section
+  "A titled section's text, numbering its cells from `n`: [md ids next-n].
+   `blocks` are {:kind :prose :text} and {:kind :cell :src :result}."
+  [title blocks n]
+  (reduce
+   (fn [[md ids n] b]
+     (if (= :prose (:kind b))
+       [(str md "\n" (hd/safe-prose (:text b)) "\n") ids n]
+       (let [id (str "c" (inc n))]
+         [(str md "\n" (hd/cell-block id (:src b)) "\n" (hd/result-block id (:result b)))
+          (conj ids id) (inc n)])))
+   [(hd/heading title) [] n]
+   blocks))
+
+(defserver keeper
+  (init [opts] (ok {:root (:root opts) :vm (:vm opts) :sessions {}
+                    ;; (fn [root ns document] → {:ok text} | {:error …}): the
+                    ;; model. DeepSeek unless the starter supplies another.
+                    :step (or (:step opts) model/reply)}))
+
+  (handle-call [:open sid] [_from st]
+    (let [st (ensure-session st sid)]
+      (reply (session-view (get-in st [:sessions sid])) st)))
+
+  (handle-call [:session sid] [_from st]
+    (let [st (ensure-session st sid)]
+      (reply (dissoc (get-in st [:sessions sid]) :turn) st)))
+
+  ;; A whole section in ONE write, cell ids assigned here, at append time. A
+  ;; turn's cell and an operator's eval can evaluate at the same moment; since
+  ;; neither touches the document until it is done, their sections never
+  ;; interleave and ids always count up in document order.
+  (handle-call [:post sid title blocks] [_from st]
+    (let [st (ensure-session st sid)
+          [md ids n] (render-section title blocks (get-in st [:sessions sid :next]))]
+      (append-to st sid md)
+      (reply {:md md :ids ids} (assoc-in st [:sessions sid :next] n))))
+
+  ;; Check-and-spawn is ONE step, so two start-turns cannot both begin.
+  (handle-call [:begin sid thunk] [_from st]
+    (let [st (ensure-session st sid)
+          s (get-in st [:sessions sid])]
+      (if (some? (:turn s))
+        (reply {:busy (:id (:turn s))} st)
+        (let [tid (str "t" (inc (:turns s)))
+              pid (spawn-member (:vm st) (fn [] (thunk tid)))
+              ref (erlang/monitor :process pid)]
+          (reply {:ok tid}
+                 (-> st
+                     (assoc-in [:sessions sid :turns] (inc (:turns s)))
+                     (assoc-in [:sessions sid :turn]
+                               {:id tid :pid pid :ref ref :steers 0
+                                :started-ms (now-ms)})))))))
+
+  (handle-call [:steer sid] [_from st]
+    (let [st (ensure-session st sid)]
+      (if (some? (get-in st [:sessions sid :turn]))
+        (reply :running (assoc-in st [:sessions sid :turn :steers]
+                                  (inc (get-in st [:sessions sid :turn :steers]))))
+        (reply :idle st))))
+
+  (handle-call [:steers sid] [_from st]
+    (reply (or (get-in st [:sessions sid :turn :steers]) 0) st))
+
+  (handle-call [:root] [_from st] (reply (:root st) st))
+  (handle-call [:step] [_from st] (reply (:step st) st))
+
+  ;; `seen` is how many steers the ending step had read. A steer that arrived
+  ;; after it keeps the turn open (:steered) — the check and the close are one
+  ;; step here, so a steer can never land between them and be lost.
+  (handle-call [:end sid outcome seen] [_from st]
+    (let [t (get-in st [:sessions sid :turn])]
+      (cond
+        (nil? t) (reply :closed st)
+        (and (some? seen) (> (:steers t) seen)) (reply :steered st)
+        :else (reply :closed (close-turn st sid outcome)))))
+
+  (handle-call [:stop sid] [_from st]
+    (let [t (get-in st [:sessions sid :turn])]
+      (if (nil? t)
+        (reply :idle st)
+        (do (erlang/exit (:pid t) :kill)
+            (append-to st sid (str (hd/heading (str "turn " (:id t) " stopped")) "\nStopped by the operator.\n"))
+            (reply :stopped (close-turn st sid :stopped))))))
+
+  ;; A worker that dies without saying so (a crash, a kill from outside) still
+  ;; ends its turn, and the document says how — otherwise the session would be
+  ;; busy forever and the reader would never learn why.
+  (handle-info [:DOWN ref :process _pid reason] [st]
+    (let [sid (some (fn [s] (when (= ref (get-in s [:turn :ref])) (:id s)))
+                    (vals (:sessions st)))]
+      (if (nil? sid)
+        (noreply st)
+        (let [tid (get-in st [:sessions sid :turn :id])]
+          (append-to st sid (str (hd/heading (str "turn " tid " crashed"))
+                                 "\n```\n" (pr-str reason) "\n```\n"))
+          (noreply (close-turn st sid :crashed)))))))
+
+(defn running? [] (some? (Process/whereis KEEPER)))
+
+(defn start-keeper
+  "Start the keeper for project `root` (idempotent). `vm` is the project VM
+   turn workers join, or nil when cold. `opts` may carry `:step`, the model
+   (see the keeper's init). Returns its pid."
+  ([root vm] (start-keeper root vm {}))
+  ([root vm opts]
+   (if (running?)
+     (Process/whereis KEEPER)
+     (let [pid (core/start keeper (merge opts {:root root :vm vm}) {:name KEEPER})]
+       (when (some? vm) (owner/adopt (:id vm) :harness pid))
+       pid))))
+
+(defn stop-keeper
+  "Stop the keeper and every turn it runs. Session documents stay on disk."
+  []
+  (when (running?) (core/stop KEEPER))
+  :ok)
+
+(defn- keep! [msg] (call KEEPER msg :infinity))
+
+;; ── evaluation ──────────────────────────────────────────────────────────────
+
+(defn- run-cell
+  "The body of a cell's process: evaluate `src` in session `s`, answer
+   `[tag result]` to `parent`."
+  [s src parent tag]
+  (erlang/send parent
+               [tag (try {:value (BeamLisp.RT/print_str
+                                  (BeamLisp/with_cwd (:root s)
+                                    (fn [] (BeamLisp.Compiler/eval_string
+                                            src (BeamLisp.Compiler/new_env (:ns s)) (:path s)))))}
+                         (catch e {:error (describe e)}))]))
+
+(defn eval-cell
+  "Evaluate `src` in session `s`'s namespace, in its own process, with stdout
+   captured and a deadline. {:value :stdout :error :ms} — a failure is a
+   value, never a raise: the document shows it where the result would be."
+  [s src timeout-ms]
+  (let [parent (erlang/self)
+        tag (erlang/make_ref)
+        io (elem (StringIO/open "") 1)
+        vm-id (scope/current)
+        t0 (now-ms)
+        [pid mref]
+        (spawn-monitor
+         (fn []
+           ;; `spawn` conveys the env; the VM scope is this process's own
+           ;; binding, so it is handed over explicitly.
+           (when (some? vm-id) (scope/bind! vm-id))
+           (erlang/group_leader io (erlang/self))
+           (BeamLisp.Env/in_ns (:ns s))
+           (run-cell s src parent tag)))
+        r (receive
+            [got v] :when (= got tag) v
+
+            [:DOWN m :process _p reason] :when (= m mref)
+            {:error (str "the evaluating process exited: " (pr-str reason))}
+
+            (after timeout-ms
+              (do (erlang/exit pid :kill)
+                  {:error (str "timed out after " timeout-ms " ms; the cell was killed")})))
+        out (elem (elem (StringIO/close io) 1) 1)]
+    ;; one cleanup for every way out: no :DOWN is left in the caller's mailbox
+    (erlang/demonitor mref (list :flush))
+    (assoc r :stdout out :ms (- (now-ms) t0))))
+
+(defn- post!
+  "Evaluate `ps` in order in session `sid`, then append them as one titled
+   section: prose as it is, each cell followed by its result. The shared step
+   of every verb. {:md <the appended text> :cells [{:id :src :value …}] :session}."
+  [sid title ps timeout-ms]
+  (let [s (keep! [:session sid])
+        ;; each cell carries its run, so blocks and results never need zipping
+        blocks (mapv (fn [p]
+                       (if (= :cell (:kind p))
+                         (let [r (eval-cell s (:src p) timeout-ms)]
+                           (assoc p :run r :result (hd/result-text r)))
+                         p))
+                     ps)
+        out (keep! [:post sid title (mapv (fn [b] (dissoc b :run)) blocks)])
+        runs (filter (fn [b] (= :cell (:kind b))) blocks)
+        cells (loop [ids (:ids out) bs runs acc []]
+                (if (empty? ids)
+                  acc
+                  (recur (rest ids) (rest bs)
+                         (conj acc (assoc (:run (first bs)) :id (first ids) :src (:src (first bs)))))))]
+    {:md (:md out) :cells cells :session s}))
+
+;; ── the turn ────────────────────────────────────────────────────────────────
+
+(defn- run-turn
+  "The model loop for one turn. Each step the model reads the whole document
+   and replies; its reply is appended and its cells evaluated. The turn goes on
+   while replies run code or the operator has steered since the step began,
+   and ends at the first reply that does neither (or at MAX-STEPS)."
+  [sid tid]
+  (let [s (keep! [:session sid])
+        step-fn (keep! [:step])]
+    (loop [step 1]
+      (if (> step MAX-STEPS)
+        (do (keep! [:post sid (str "turn " tid " paused")
+                    [{:kind :prose :text (str "Reached " MAX-STEPS " steps. `steer_turn` to go on.")}]])
+            (keep! [:end sid :step-limit nil]))
+        (let [seen (keep! [:steers sid])
+              reply (step-fn (:root s) (:ns s) (File/read! (:path s)))]
+          (if (contains? reply :error)
+            (do (keep! [:post sid (str "model · " tid " failed")
+                        [{:kind :prose :text (str "```\n" (pr-str (:error reply)) "\n```")}]])
+                (keep! [:end sid :failed nil]))
+            (let [ps (hd/parts (:ok reply) :md)]
+              (post! sid (str "model · " tid " · " step) ps EVAL-TIMEOUT-MS)
+              (if (or (hd/cells? ps) (= :steered (keep! [:end sid :done seen])))
+                (recur (inc step))
+                :done))))))))
+
+;; ── the verbs ───────────────────────────────────────────────────────────────
+;;
+;; Each takes an input map — {:session :code | :path :format :timeout-ms} — and
+;; answers {:session :doc :md :cells …}. `:md` is exactly the text appended to
+;; the document, which is what a caller shows.
+
+(defn- input
+  "An input map → [sid parts] or {:error why}. `default` is the format a bare
+   text takes: :bl for eval, :md for a task."
+  [in default]
+  (let [sid (or (:session in) "main")
+        path (:path in)
+        root (keep! [:root])
+        text (cond
+               (some? (:code in)) (:code in)
+               (some? path) (let [p (Path/expand path root)]
+                              (when (File/regular? p) (File/read! p)))
+               :else nil)]
+    (cond
+      (not (valid-sid? sid)) {:error (str "session must match [a-z0-9][a-z0-9_-]*, got " (pr-str sid))}
+      (and (some? path) (nil? text)) {:error (str "no such file: " path)}
+      (or (nil? text) (blank? text)) {:error "give :code (text) or :path (a .bl or .bl.md file)"}
+      :else [sid (hd/parts text (hd/format-of text path (:format in) default))])))
+
+(defn evaluate
+  "Evaluate `.bl` / `.bl.md` input now, in the session's namespace. Prose is
+   appended as-is; each cell is evaluated and appended with its result."
+  [in]
+  (let [r (input in :bl)]
+    (if (map? r)
+      r
+      (let [[sid ps] r]
+        (if-not (hd/cells? ps)
+          {:error "nothing to evaluate: the input holds no beam-lisp"}
+          (let [out (post! sid "eval" ps (or (:timeout-ms in) EVAL-TIMEOUT-MS))]
+            {:session sid :doc (:path (:session out)) :md (:md out) :cells (:cells out)}))))))
+
+(defn- begin-turn [sid]
+  (keep! [:begin sid (fn [tid] (run-turn sid tid))]))
+
+(defn start-turn
+  "Append a task and start the model on it. Returns at once; the turn's blocks
+   append to the session document as it works."
+  [in]
+  (let [r (input in :md)]
+    (if (map? r)
+      r
+      (let [[sid ps] r
+            busy (:turn (keep! [:open sid]))]
+        (if (some? busy)
+          {:error (str "turn " (:id busy) " is running in session " sid "; steer it (steer-turn) or stop it (harness/stop!)")}
+          (let [out (post! sid "task" ps EVAL-TIMEOUT-MS)
+                b (begin-turn sid)]
+            (if (contains? b :busy)
+              {:error (str "turn " (:busy b) " started first; steer it instead")}
+              {:session sid :doc (:path (:session out)) :turn (:ok b) :status :running
+               :md (:md out) :cells (:cells out)})))))))
+
+(defn steer-turn
+  "Append a steer. A running turn reads it on its next step (and does not end
+   before it has); with no turn running, the steer starts one."
+  [in]
+  (let [r (input in :md)]
+    (if (map? r)
+      r
+      (let [[sid ps] r
+            out (post! sid "steer" ps EVAL-TIMEOUT-MS)
+            st (keep! [:steer sid])
+            turn (if (= st :running)
+                   {:turn (:id (:turn (keep! [:open sid]))) :status :steered}
+                   (let [b (begin-turn sid)]
+                     (if (contains? b :ok)
+                       {:turn (:ok b) :status :started}
+                       {:turn (:busy b) :status :steered})))]
+        (merge {:session sid :doc (:path (:session out)) :md (:md out) :cells (:cells out)}
+               turn)))))
+
+;; ── reading a session (callable from any cell) ──────────────────────────────
+
+(defn status
+  "A session as data: its document, namespace, running turn, last outcome."
+  ([] (status "main"))
+  ([sid] (keep! [:open sid])))
+
+(defn await-turn
+  "Block until session `sid` has no running turn, or `ms` pass. The session."
+  ([sid] (await-turn sid 15000))
+  ([sid ms]
+   (let [deadline (+ (now-ms) ms)]
+     (loop []
+       (let [s (status sid)]
+         (if (or (nil? (:turn s)) (>= (now-ms) deadline))
+           s
+           (do (Process/sleep 250) (recur))))))))
+
+(defn stop!
+  "Kill session `sid`'s running turn. :stopped | :idle."
+  ([] (stop! "main"))
+  ([sid] (keep! [:stop sid])))
+
+(defn tail
+  "The last `n` chars of session `sid`'s document — what the model just did."
+  ([sid] (tail sid 4000))
+  ([sid n]
+   (let [t (File/read! (:doc (status sid)))
+         c (count t)]
+     (if (> c n) (subs t (- c n) c) t))))
+
+(defn in-vm
+  "Run `thunk` in VM `vm`'s env and scope, or as-is when `vm` is nil (cold)."
+  [vm thunk]
+  (if (nil? vm) (thunk) (vmc/run vm thunk)))

@@ -1,0 +1,206 @@
+; harness/mcp.bl — the harness as an MCP server, served from the project's VM.
+;
+; Three tools, each taking `.bl` / `.bl.md` and answering with the blocks it
+; appended — the same text the session document now ends with:
+;
+;   eval        run code now; the result blocks come back
+;   start_turn  give the model a task; returns at once, the turn runs async
+;   steer_turn  add a steer; a running turn reads it, an idle session starts one
+;
+; ══ WHERE IT RUNS ═══════════════════════════════════════════════════════════
+;
+; Inside the project's warm VM (the daemon's `vm.manager` VM for this tree), on
+; loopback, over MCP's HTTP transport — `mcp.server` + `mcp.transport-http`,
+; the same protocol core `bl mcp` speaks. Cells evaluate in that VM, turns are
+; its members, and every agent that connects shares the one VM. `bl harness`
+; (an env.bl task) arms it; arming twice is a no-op.
+;
+; ══ HOW A CLIENT CONNECTS ═══════════════════════════════════════════════════
+;
+; `.local/harness/mcp.json` is written on start: the URL and a bearer token
+; minted once per project (`.local/harness/token`, mode 0600). Loopback plus a
+; token is the boundary — `eval` is arbitrary code, so the port refuses anyone
+; who cannot read the project's `.local/`.
+
+(ns harness.mcp
+  (:require [harness :as h]
+            [mcp.server :as server]
+            [mcp.transport-http :as transport]
+            [vm.manager :as mgr]
+            [vm.scope :as scope]
+            [vm.ports :as ports]
+            [vm.owner :as owner]
+            [web]))
+
+(def PORT
+  "The loopback port the harness prefers. `:ports {:harness N}` in env.bl (or
+   .env.local.bl) overrides; if it is taken the OS picks one, and mcp.json
+   says which."
+  7717)
+
+(def INPUT-SCHEMA
+  {"type" "object"
+   "properties"
+   {"code" {"type" "string"
+            "description" "beam-lisp source: .bl (plain code) or .bl.md (prose + ```beam-lisp cells)"}
+    "path" {"type" "string"
+            "description" "a .bl or .bl.md file to read instead of `code`, relative to the project root"}
+    "format" {"type" "string" "enum" ["bl" "bl.md"]
+              "description" "override the format guess (extension, then ```beam-lisp fences)"}
+    "session" {"type" "string"
+               "description" "session id (default \"main\"): one document, one namespace, one turn at a time"}
+    "timeout_ms" {"type" "integer"
+                   "description" "how long each cell may run before it is killed (default 20000, at most 55000)"}}})
+
+;; ── tools ───────────────────────────────────────────────────────────────────
+
+(defn- args->input [args]
+  (let [t (get args "timeout_ms")]
+    {:code (get args "code") :path (get args "path")
+     :format (get args "format") :session (get args "session")
+     ;; under the 60 s the written client config allows a request
+     :timeout-ms (when (erlang/is_integer t) (max 1 (min t 55000)))}))
+
+(defn- footer [r]
+  (str "\n\n— session `" (:session r) "` · " (:doc r)
+       (when (some? (:turn r)) (str " · turn " (:turn r) " " (name (:status r))))))
+
+(defn- answer
+  "A harness result as a CallToolResult: the appended blocks as text, the rest
+   as structuredContent. A refusal is an error result, never a raise."
+  [r]
+  (if (contains? r :error)
+    {:resultType "complete" :isError true
+     :content [{"type" "text" "text" (:error r)}]}
+    {:resultType "complete"
+     :content [{"type" "text" "text" (str (trim (:md r)) (footer r))}]
+     :structuredContent (dissoc r :md :cells)}))
+
+(defn- tool [vm f]
+  (fn [args]
+    (answer (h/in-vm vm (fn [] (try (f (args->input args))
+                                    (catch e {:error (str "harness: " (ex-message e))})))))))
+
+(defn tools
+  "The registry rows for VM `vm` (nil when cold)."
+  [vm]
+  [["eval"
+    "Evaluate beam-lisp (.bl or .bl.md) now, in the session's namespace inside the project's warm VM. Each cell and its result are appended to the session document and returned as blocks."
+    INPUT-SCHEMA (tool vm h/evaluate)]
+   ["start_turn"
+    "Give the model (DeepSeek V4.1 Flash) a task as .bl or .bl.md. Returns at once; the model works in the session asynchronously, appending its cells and their results. Read progress with eval: (harness/tail \"main\") or (harness/status \"main\")."
+    INPUT-SCHEMA (tool vm h/start-turn)]
+   ["steer_turn"
+    "Steer the session's model with more .bl or .bl.md: cells run now, the running turn reads the steer on its next step. With no turn running, the steer starts one."
+    INPUT-SCHEMA (tool vm h/steer-turn)]])
+
+(def INSTRUCTIONS
+  (str "A beam-lisp harness in this project's warm VM. Everything is .bl / .bl.md in, blocks out: "
+       "`eval` runs cells now; `start_turn` hands a task to the model and returns; `steer_turn` redirects it. "
+       "All three append to one session document (.local/harness/<session>.bl.md). "
+       "Watch a turn with eval: (harness/tail \"main\"), (harness/await-turn \"main\"), (harness/stop! \"main\")."))
+
+(defn registry [vm]
+  (server/registry-state
+   {:tools (tools vm)
+    :instructions INSTRUCTIONS
+    :server-info {"name" "beam-lisp-harness" "version" "0.1.0"}
+    :capabilities {"tools" {}}}))
+
+;; ── HTTP ────────────────────────────────────────────────────────────────────
+
+(defn- token-for
+  "This project's bearer token, minted on first use."
+  [root]
+  (let [path (str root "/.local/harness/token")]
+    (when-not (File/exists? path)
+      (File/mkdir_p! (Path/dirname path))
+      (File/write! path (String/downcase (Base/encode16 (crypto/strong_rand_bytes 24))))
+      (File/chmod path 384))
+    (trim (File/read! path))))
+
+(defn- headers-of [conn]
+  (into {} (map (fn [t] [(elem t 0) (elem t 1)]) (erlang/map_get :req_headers conn))))
+
+(defn- router [vm token]
+  (fn [conn]
+    (let [[body conn] (web/read-body* conn)
+          r (transport/handle
+             {:method (web/method conn) :uri (web/path conn)
+              :headers (headers-of conn) :body body}
+             {:authenticate (fn [req]
+                              (let [given (or (transport/bearer req) "")]
+                                (when (and (= (count given) (count token))
+                                           (crypto/hash_equals given token))
+                                  :operator)))
+              :state (fn [_principal] (registry vm))})
+          conn (reduce (fn [c k] (web/resp-header c k (get (:headers r) k)))
+                       conn (keys (:headers r)))]
+      (erlang/apply (erlang/binary_to_atom "Elixir.Plug.Conn") :send_resp
+                    (list conn (:status r) (:body r))))))
+
+(defn- wanted-port [vm]
+  (let [p (get-in (bl.env/project (:root vm)) [:ports "harness" :port])]
+    (if (erlang/is_integer p) p PORT)))
+
+(defn- claim
+  "The preferred port, waited for briefly — a daemon restarting releases it a
+   moment after the new one boots, and a URL that moves on every restart breaks
+   every client config holding it. Only a port that stays taken falls back to
+   one the OS picks."
+  [vm]
+  (let [want (wanted-port vm)]
+    (loop [tries 20]
+      (let [r (ports/claim "harness" want {:root (:root vm)})]
+        (cond
+          (contains? r :ok) r
+          (pos? tries) (do (Process/sleep 250) (recur (dec tries)))
+          :else (ports/claim "harness" 0 {:root (:root vm)}))))))
+
+(defn- write-config [root port token]
+  (let [url (str "http://127.0.0.1:" port "/mcp")
+        cfg {"mcpServers"
+             {"beam-lisp-harness"
+              {"type" "http" "url" url "timeout" 60000
+               "headers" {"Authorization" (str "Bearer " token)}}}}]
+    (File/write! (str root "/.local/harness/mcp.json") (bl.json/encode cfg))
+    url))
+
+(defonce served (atom nil))
+
+(defn serve!
+  "Arm the harness in this project's VM: the keeper, then the MCP endpoint.
+   Idempotent — a second call answers where the first one is serving."
+  []
+  (if (some? @served)
+    (assoc @served :already true)
+    (let [vm (when-let [id (scope/current)] (mgr/get-vm id))
+          root (if (some? vm) (:root vm) (BeamLisp/cwd))
+          vm (when (some? vm) (assoc vm :root root))
+          token (token-for root)]
+      (h/start-keeper root vm)
+      (let [c (claim {:root root})]
+        (if (contains? c :error)
+          {:error (str "harness: no port: " (pr-str (:error c)))}
+          (let [port (:ok c)
+                started (web/serve {:port port :ip (tuple 127 0 0 1) :log :off
+                                    :plug (router vm token)})
+                pid (elem started 1)]
+            (erlang/unlink pid)
+            (when (some? vm) (owner/adopt (:id vm) :harness-http pid))
+            (reset! served {:url (write-config root port token)
+                            :config (str root "/.local/harness/mcp.json")
+                            :vm (:id vm)})))))))
+
+(defn run
+  "`bl harness` — arm the harness and say how to reach it. In the warm daemon it
+   keeps serving after this returns; cold, it serves until interrupted."
+  []
+  (let [r (serve!)]
+    (if (contains? r :error)
+      (do (IO/puts :stderr (:error r)) 1)
+      (do (println (str "harness  " (:url r) (when (:already r) "  (already serving)")))
+          (println (str "config   " (:config r) "  (url + bearer token for an MCP client)"))
+          (println (str "vm       " (or (:vm r) "none — cold; serving until interrupted")))
+          (when (nil? (:vm r)) (Process/sleep :infinity))
+          0))))
