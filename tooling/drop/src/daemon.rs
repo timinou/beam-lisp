@@ -310,12 +310,53 @@ pub struct Endpoints {
     pub token: PathBuf,
 }
 
+/// Which build this process is: `BL_BUILD_ID`, cleaned exactly as
+/// `vm.paths/build-id` cleans it (lowercase, `[a-z0-9]` only, at most 16),
+/// and `src` when unset or empty. The launcher sets it to its payload's sha8
+/// before anything else runs (see `main`), so the daemon it starts and every
+/// child inherits the same answer.
+pub fn build_id() -> String {
+    clean_build_id(&std::env::var("BL_BUILD_ID").unwrap_or_default())
+}
+
+fn clean_build_id(raw: &str) -> String {
+    let clean: String = raw
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        .take(16)
+        .collect();
+    if clean.is_empty() {
+        "src".to_string()
+    } else {
+        clean
+    }
+}
+
+/// The endpoints of the daemon for `root` run by THIS build. A daemon runs one
+/// build's code, so the build is part of its name: `<tree-id>-<build>.sock`.
+/// Must match `vm.paths/endpoints` byte for byte.
+///
+/// A payload built before daemons were named by build binds `<tree-id>.sock`,
+/// and the launcher running it leaves `BL_BUILD_ID` unset (`names_its_build`),
+/// so it looks there instead.
 pub fn endpoints(root: &Path) -> Option<Endpoints> {
+    match std::env::var("BL_BUILD_ID") {
+        Ok(_) => endpoints_for(root, &build_id()),
+        Err(_) => {
+            let dir = runtime_dir()?;
+            let id = tree_id(root);
+            Some(Endpoints { sock: dir.join(format!("{id}.sock")), token: dir.join(format!("{id}.token")) })
+        }
+    }
+}
+
+pub fn endpoints_for(root: &Path, build: &str) -> Option<Endpoints> {
     let dir = runtime_dir()?;
-    let id = tree_id(root);
+    let base = format!("{}-{build}", tree_id(root));
     Some(Endpoints {
-        sock: dir.join(format!("{id}.sock")),
-        token: dir.join(format!("{id}.token")),
+        sock: dir.join(format!("{base}.sock")),
+        token: dir.join(format!("{base}.token")),
     })
 }
 
@@ -408,7 +449,8 @@ fn hello(root: &Path) -> Hello {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
 
     let fp = tree_fingerprint(root);
-    if send_frame(&mut stream, &encode_hello(&fp, &token)).is_err() {
+    let build = std::env::var("BL_BUILD_ID").map(|_| build_id()).unwrap_or_default();
+    if send_frame(&mut stream, &encode_hello(&fp, &token, &build)).is_err() {
         return Hello::No;
     }
 
@@ -633,17 +675,25 @@ fn read_exact_classified(stream: &mut UnixStream, buf: &mut [u8]) -> Result<(), 
 
 // ── frame builders ───────────────────────────────────────────────────────────
 
-fn encode_hello(tree: &[u8], token: &[u8]) -> Vec<u8> {
+/// `{:bl 1 :hello %{tree token build}}`: `build` names the build this client
+/// expects to reach; a daemon running another one answers `:restart_required`.
+fn encode_hello(tree: &[u8], token: &[u8], build: &str) -> Vec<u8> {
     let mut e = Enc::new();
     e.tuple_header(4);
     e.atom("bl");
     e.small_int(1);
     e.atom("hello");
-    e.map_header(2);
+    // An empty build is a payload that predates build-named daemons: its
+    // hello is the two-key one it understands.
+    e.map_header(if build.is_empty() { 2 } else { 3 });
     e.atom("tree");
     e.binary(tree);
     e.atom("token");
     e.binary(token);
+    if !build.is_empty() {
+        e.atom("build");
+        e.binary(build.as_bytes());
+    }
     e.finish()
 }
 
@@ -887,13 +937,52 @@ mod tests {
     fn hello_roundtrips() {
         let tree = [1u8; 32];
         let token = [2u8; 32];
-        let enc = encode_hello(&tree, &token);
+        let enc = encode_hello(&tree, &token, "3ffa4c3a");
         if let Term::Tuple(v) = decode(&enc).unwrap() {
             assert_eq!(v[0].as_atom(), Some("bl"));
             assert_eq!(v[2].as_atom(), Some("hello"));
+            let Term::Map(pairs) = &v[3] else { panic!("hello payload is not a map") };
+            let build = pairs
+                .iter()
+                .find(|(k, _)| k.as_atom() == Some("build"))
+                .and_then(|(_, v)| v.as_bytes())
+                .expect("the hello must name the build it expects");
+            assert_eq!(build, &b"3ffa4c3a"[..]);
         } else {
             panic!("not a tuple");
         }
+    }
+
+    /// The build id is cleaned the way `vm.paths/build-id` cleans it, so the two
+    /// sides name the same file.
+    #[test]
+    fn build_id_is_cleaned_like_vm_paths() {
+        assert_eq!(clean_build_id(""), "src");
+        assert_eq!(clean_build_id("3FFA4C3A"), "3ffa4c3a");
+        assert_eq!(clean_build_id("../x y"), "xy");
+        assert_eq!(clean_build_id("!!!"), "src");
+        assert_eq!(clean_build_id("0123456789abcdef0123"), "0123456789abcdef");
+    }
+
+    /// A payload that predates build-named daemons gets the two-key hello.
+    #[test]
+    fn a_legacy_hello_has_no_build() {
+        let enc = encode_hello(&[1u8; 32], &[2u8; 32], "");
+        let Term::Tuple(v) = decode(&enc).unwrap() else { panic!("not a tuple") };
+        let Term::Map(pairs) = &v[3] else { panic!("not a map") };
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().all(|(k, _)| k.as_atom() != Some("build")));
+    }
+
+    /// Two builds in one tree are two daemons: different endpoint names.
+    #[test]
+    fn endpoints_carry_the_build() {
+        let root = Path::new("/home/user/code/undefine/beam-lisp");
+        let a = endpoints_for(root, "3ffa4c3a").unwrap();
+        let b = endpoints_for(root, "5e0dd11f").unwrap();
+        assert_ne!(a.sock, b.sock);
+        assert!(a.sock.to_string_lossy().ends_with("57461829a20cc2af-3ffa4c3a.sock"));
+        assert!(a.token.to_string_lossy().ends_with("57461829a20cc2af-3ffa4c3a.token"));
     }
 
     // our request encoder produces a 5-tuple whose map carries argv, cwd and env

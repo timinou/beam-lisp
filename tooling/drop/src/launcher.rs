@@ -8,6 +8,9 @@ use std::process::Command;
 
 include!("common.rs");
 include!("daemon.rs");
+include!("store.rs");
+include!("builder.rs");
+include!("hooks.rs");
 
 const EXIT_LAUNCHER_FAILURE: i32 = 126;
 
@@ -122,35 +125,13 @@ fn fail(msg: &str) -> ! {
     std::process::exit(EXIT_LAUNCHER_FAILURE)
 }
 
-/// Read ONLY the trailer (56 bytes at EOF) — cheap, O(1), on every invocation.
-/// The payload sha8 (the version-dir name) comes from the trailer's stored
-/// digest; the payload itself is verified once, at extraction time
-/// (`verify_and_extract`), NOT re-hashed on every warm run. Re-hashing 100 MB
-/// per invocation was the launcher's real latency floor (~0.3s); a warm daemon
-/// attach must not pay it.
-fn read_trailer_only() -> (Trailer, String) {
-    use std::io::{Read, Seek, SeekFrom};
-    let self_path = std::env::current_exe().unwrap_or_else(|_| fail("cannot locate myself"));
-    let mut f = std::fs::File::open(&self_path)
-        .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", self_path.display())));
-    let flen = f.metadata().map(|m| m.len()).unwrap_or(0);
-    if flen < TRAILER_LEN as u64 {
-        fail("file smaller than a trailer — not a bundled bl?");
-    }
-    f.seek(SeekFrom::End(-(TRAILER_LEN as i64))).expect("seek trailer");
-    let mut tbuf = vec![0u8; TRAILER_LEN];
-    f.read_exact(&mut tbuf).expect("read trailer");
-    let t = parse_trailer(&tbuf).unwrap_or_else(|| fail("no DRP1 trailer — not a bundled bl?"));
-    let sha8 = hex(&t.sha256)[..8].to_string();
-    (t, sha8)
-}
 
 /// Read the payload slice, VERIFY its sha256 against the trailer, and extract.
 /// Only called on first run for a given sha8 (the version dir is missing).
-fn verify_and_extract(t: &Trailer, dest: &std::path::Path, install: &std::path::Path) {
+fn verify_and_extract_from(file: &std::path::Path, t: &Trailer, dest: &std::path::Path, install: &std::path::Path) {
     use std::io::{Read, Seek, SeekFrom};
-    let self_path = std::env::current_exe().expect("exe");
-    let mut f = std::fs::File::open(&self_path).expect("reopen self");
+    let mut f = std::fs::File::open(file)
+        .unwrap_or_else(|e| fail(&format!("cannot read {}: {e}", file.display())));
     f.seek(SeekFrom::Start(t.offset)).expect("seek");
     let mut payload = vec![0u8; t.len as usize];
     f.read_exact(&mut payload).expect("read payload");
@@ -167,82 +148,269 @@ fn verify_and_extract(t: &Trailer, dest: &std::path::Path, install: &std::path::
         .unwrap_or_else(|e| fail(&format!("first-run extraction failed: {e}")));
 }
 
-/// Days an unused `<install>/<sha8>/` tree is kept before it is swept.
-/// Override with `BL_DROP_KEEP_DAYS`.
+/// Hours an unreferenced, unused build is kept before it is swept. Override
+/// with `BL_DROP_GRACE_HOURS`.
 ///
-/// The rule this replaces — remove every version dir except the one in use,
-/// immediately — is not safe, and it fails as a CRASH, not a warning. A VM
-/// execs helper binaries (`inet_gethost`, `erl_child_setup`) out of its OWN
-/// erts dir, lazily, and a `bl daemon` runs from its tree for its whole life.
-/// So a second `bl` with a different payload — a dev build beside a release,
-/// or two releases — deleted the first one's tree from under it and the
-/// running VM died with
+/// Why a grace at all: a VM execs helper binaries (`inet_gethost`,
+/// `erl_child_setup`) out of its OWN erts dir, lazily, and a daemon runs from
+/// its tree for its whole life. Deleting a tree some process still runs from
+/// kills it with
 ///
 ///     Can not execute .../drop/<sha8>/erts-<v>/bin/inet_gethost : enoent
 ///
-/// plus an erl_crash.dump. Re-running appeared to fix it, because the tree is
-/// re-extracted: a transient-looking symptom with a permanent cause.
-///
-/// Age is a heuristic, not a guarantee: a tree older than the window that is
-/// still in use can still be swept. 30 days makes that a deliberate,
-/// documented trade instead of something any second binary can trigger.
-const DEFAULT_KEEP_DAYS: u64 = 30;
+/// so a tree is only ever swept when nothing points at it, no daemon runs it,
+/// no process runs from it (`/proc/*/exe` and `maps`), and it has not been
+/// used for the grace period.
+const DEFAULT_GRACE_HOURS: u64 = 24;
 
-fn keep_days() -> u64 {
-    std::env::var("BL_DROP_KEEP_DAYS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(DEFAULT_KEEP_DAYS)
+/// Days a build that nothing points at is kept after its last use: a build run
+/// by an explicit path (`./bl`, a tool's pinned runtime) has no pointer, and
+/// is kept while it keeps being used. Override with `BL_DROP_KEEP_DAYS`.
+const DEFAULT_RECENT_DAYS: u64 = 14;
+
+/// A whole-number setting from the environment (hours or days, by name).
+fn hours_env(name: &str, default: u64) -> u64 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
 }
 
-/// May this version dir be swept? Never the one in use, and never one we
-/// cannot date — an undatable dir is kept, not deleted.
-fn sweepable(
-    name: &str,
-    keep: &str,
-    modified: Option<std::time::SystemTime>,
-    cutoff: std::time::SystemTime,
-) -> bool {
-    name != keep && matches!(modified, Some(t) if t < cutoff)
-}
-
-/// Sweep version dirs past the retention window (docs §6, step 3), and staging
-/// dirs on a much shorter one.
-///
 /// `<sha8>.tmp-<pid>` is what an extraction unpacks into before it publishes.
 /// One that outlives its extractor means the process died mid-unpack (a reboot,
 /// a `kill -9`), and it is ~100 MB of nothing. An extraction takes seconds, so a
-/// day-old staging dir is debris by any measure while a live one — seconds or
-/// minutes old — is never in reach.
+/// day-old staging dir is debris by any measure while a live one is never in
+/// reach.
 const TMP_KEEP_HOURS: u64 = 24;
 
-fn gc_old_versions(install: &std::path::Path, keep: &str) {
-    let Some(cutoff) = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(keep_days().saturating_mul(86_400)))
-    else {
-        return;
-    };
+/// Why a build is kept.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Keep {
+    InUse,
+    Pointed(String),
+    Daemon,
+    Running,
+    Recent,
+    Undated,
+}
 
-    let tmp_cutoff = std::time::SystemTime::now()
-        .checked_sub(std::time::Duration::from_secs(TMP_KEEP_HOURS * 3_600))
-        .unwrap_or(cutoff);
-
-    if let Ok(rd) = std::fs::read_dir(install) {
-        for d in rd.flatten() {
-            let name = d.file_name().to_string_lossy().into_owned();
-
-            if !d.path().is_dir() {
-                continue;
-            }
-
-            let modified = d.metadata().and_then(|m| m.modified()).ok();
-            let window = if name.contains(".tmp-") { tmp_cutoff } else { cutoff };
-
-            if sweepable(&name, keep, modified, window) {
-                let _ = std::fs::remove_dir_all(d.path());
+/// What the store refers to: build id → the first pointer naming it. A
+/// bleeding-edge or source pointer whose worktree no longer exists holds
+/// nothing (that is how a deleted worktree's builds become collectable).
+pub fn referenced(store: &Store) -> std::collections::HashMap<String, String> {
+    let mut refs = std::collections::HashMap::new();
+    for dir in ["channels", "tags", "bleeding-edge", "sources"] {
+        for (name, p) in list(store, dir) {
+            let alive = match p.get("root") {
+                Some(root) if dir == "bleeding-edge" || dir == "sources" => Path::new(root).exists(),
+                _ => true,
+            };
+            if alive {
+                refs.entry(p.build.clone()).or_insert(format!("{dir}/{name}"));
             }
         }
     }
+    refs
+}
+
+/// Build ids a live daemon serves, from the runtime dir's `<tree>-<build>.sock`.
+fn daemon_builds() -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let Some(dir) = runtime_dir() else { return out };
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if let Some((_, b)) = n.strip_suffix(".sock").and_then(|s| s.rsplit_once('-')) {
+                out.insert(b.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Build ids some process runs from: an executable or a mapped file under
+/// `<install>/<id>/`. Linux only; elsewhere nothing is known to run.
+fn running_builds(install: &Path) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::new();
+    let prefix = format!("{}/", install.display());
+    let Ok(rd) = std::fs::read_dir("/proc") else { return out };
+    let mut note = |s: &str| {
+        if let Some(id) = s.strip_prefix(&prefix).and_then(|r| r.split('/').next()) {
+            if is_build_id(id) {
+                out.insert(id.to_string());
+            }
+        }
+    };
+    for e in rd.flatten() {
+        if !e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let p = e.path();
+        if let Ok(exe) = std::fs::read_link(p.join("exe")) {
+            note(&exe.to_string_lossy());
+        }
+        if let Ok(maps) = std::fs::read_to_string(p.join("maps")) {
+            for line in maps.lines() {
+                if let Some(i) = line.find(&prefix) {
+                    note(&line[i..]);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// When build `dir` was last used: its `.last-used` stamp, else the dir's mtime.
+fn last_used(dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(dir.join(".last-used"))
+        .or_else(|_| std::fs::metadata(dir))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+/// Record that build `dir` is used now, at most once an hour (one stat per
+/// run; the write is rare).
+fn touch_used(dir: &Path) {
+    let stamp = dir.join(".last-used");
+    let fresh = std::fs::metadata(&stamp)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < std::time::Duration::from_secs(3_600));
+    if !fresh {
+        let _ = std::fs::write(&stamp, b"");
+    }
+}
+
+/// The facts one GC pass decides from.
+pub struct GcFacts {
+    pub in_use: String,
+    pub refs: std::collections::HashMap<String, String>,
+    pub daemons: std::collections::HashSet<String>,
+    pub running: std::collections::HashSet<String>,
+    pub now: std::time::SystemTime,
+    pub grace: std::time::Duration,
+    pub recent: std::time::Duration,
+}
+
+/// Why build `id` stays, or None when it may go. Pure in its facts.
+pub fn keep_reason(id: &str, used: Option<std::time::SystemTime>, f: &GcFacts) -> Option<Keep> {
+    if id == f.in_use {
+        return Some(Keep::InUse);
+    }
+    if let Some(why) = f.refs.get(id) {
+        return Some(Keep::Pointed(why.clone()));
+    }
+    if f.daemons.contains(id) {
+        return Some(Keep::Daemon);
+    }
+    if f.running.contains(id) {
+        return Some(Keep::Running);
+    }
+    let Some(t) = used else { return Some(Keep::Undated) };
+    let age = f.now.duration_since(t).unwrap_or_default();
+    (age < f.recent.max(f.grace)).then_some(Keep::Recent)
+}
+
+/// One entry of a GC pass: the dir, and why it stays (None = it goes).
+pub struct GcRow {
+    pub name: String,
+    pub keep: Option<Keep>,
+}
+
+/// Sweep the install dir by reference. Only `<sha8>` build dirs and stale
+/// `<sha8>.tmp-<pid>` staging dirs are ever candidates; anything else there
+/// (the `store/` itself) is never touched. With `dry_run`, nothing is removed.
+pub fn gc_by_reference(install: &Path, in_use: &str, dry_run: bool) -> Vec<GcRow> {
+    let store = Store { root: install.to_path_buf() };
+    let facts = GcFacts {
+        in_use: in_use.to_string(),
+        refs: referenced(&store),
+        daemons: daemon_builds(),
+        running: running_builds(install),
+        now: std::time::SystemTime::now(),
+        grace: std::time::Duration::from_secs(hours_env("BL_DROP_GRACE_HOURS", DEFAULT_GRACE_HOURS) * 3_600),
+        recent: std::time::Duration::from_secs(hours_env("BL_DROP_KEEP_DAYS", DEFAULT_RECENT_DAYS) * 86_400),
+    };
+    let tmp_window = std::time::Duration::from_secs(TMP_KEEP_HOURS * 3_600);
+
+    let mut rows = vec![];
+    let Ok(rd) = std::fs::read_dir(install) else { return rows };
+    for d in rd.flatten() {
+        let name = d.file_name().to_string_lossy().into_owned();
+        let path = d.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let keep = if let Some((id, _)) = name.split_once(".tmp-") {
+            if !is_build_id(id) {
+                continue;
+            }
+            match last_used(&path).and_then(|t| facts.now.duration_since(t).ok()) {
+                Some(a) if a >= tmp_window => None,
+                _ => Some(Keep::Recent),
+            }
+        } else if is_build_id(&name) {
+            keep_reason(&name, last_used(&path), &facts)
+        } else {
+            continue;
+        };
+        if keep.is_none() && !dry_run {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+        rows.push(GcRow { name, keep });
+    }
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    rows
+}
+
+/// The launcher's own GC after a first extraction: quiet, and never removes the
+/// build it is about to run.
+fn gc_old_versions(install: &std::path::Path, keep: &str) {
+    let _ = gc_by_reference(install, keep, false);
+}
+
+/// `bl self-gc [--dry-run]`: what the store holds, and why each build stays.
+fn self_gc(args: &[String]) -> Result<String, String> {
+    fn du(p: &Path) -> u64 {
+        match std::fs::symlink_metadata(p) {
+            Ok(m) if m.is_dir() => std::fs::read_dir(p).map(|rd| rd.flatten().map(|e| du(&e.path())).sum()).unwrap_or(0),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        }
+    }
+    let dry = args.iter().any(|a| a == "--dry-run");
+    let install = install_dir();
+    let sizes: std::collections::HashMap<String, u64> = std::fs::read_dir(&install)
+        .map(|rd| rd.flatten().map(|e| (e.file_name().to_string_lossy().into_owned(), du(&e.path()))).collect())
+        .unwrap_or_default();
+    let rows = gc_by_reference(&install, "", dry);
+    let (mut out, mut freed, mut kept) = (vec![], 0u64, 0u64);
+    for r in &rows {
+        let size = sizes.get(&r.name).copied().unwrap_or(0);
+        let why = match &r.keep {
+            None => {
+                freed += size;
+                (if dry { "would remove" } else { "removed" }).to_string()
+            }
+            Some(k) => {
+                kept += size;
+                match k {
+                    Keep::Pointed(p) => format!("kept: {p}"),
+                    Keep::InUse => "kept: in use".to_string(),
+                    Keep::Daemon => "kept: a daemon runs it".to_string(),
+                    Keep::Running => "kept: a process runs from it".to_string(),
+                    Keep::Recent => "kept: used recently".to_string(),
+                    Keep::Undated => "kept: cannot tell when it was used".to_string(),
+                }
+            }
+        };
+        out.push(format!("{:<24} {:>6} MB  {why}", r.name, size / 1_048_576));
+    }
+    out.push(format!(
+        "{} {} MB, keeping {} MB",
+        if dry { "would free" } else { "freed" },
+        freed / 1_048_576,
+        kept / 1_048_576
+    ));
+    Ok(out.join("\n"))
 }
 
 fn maintenance(argv: &[String], t: &Trailer, sha8: &str) -> ! {
@@ -254,7 +422,7 @@ fn maintenance(argv: &[String], t: &Trailer, sha8: &str) -> ! {
         Some("meta") => {
             println!("format: DRP{FORMAT_VERSION}");
             println!("payload-sha256: {sha8}…");
-            println!("target: os={} arch={}", t.os, t.arch);
+            println!("target: {}", target_name(t.os, t.arch));
             println!("install: {}", install_dir().display());
             std::process::exit(0)
         }
@@ -400,22 +568,195 @@ fn wait_ready(root: &std::path::Path) -> bool {
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    let me = std::env::current_exe().unwrap_or_else(|_| fail("cannot locate myself"));
 
-    // O(1) trailer read on every invocation; the 100 MB payload is hashed only
-    // when we actually extract (first run for this version).
-    let (t, sha8) = read_trailer_only();
+    // TWO MODES, told apart by the file itself. A DROP carries a payload and a
+    // DRP1 trailer and runs that payload, as it always has. The PATH `bl`
+    // carries none: it is the resolving launcher, and it picks a build first.
+    match try_read_trailer(&me) {
+        Some(t) => {
+            let sha8 = sha8_of(&t);
+            if argv.first().map(String::as_str) == Some("maintenance") {
+                maintenance(&argv[1..], &t, &sha8);
+            }
+            run_build(&me, &t, &argv)
+        }
+        None => resolving_main(&me, &argv),
+    }
+}
 
-    if argv.first().map(String::as_str) == Some("maintenance") {
-        maintenance(&argv[1..], &t, &sha8);
+/// The PATH launcher: resolve which build runs here, then run it.
+fn resolving_main(me: &std::path::Path, argv: &[String]) -> ! {
+    let store = Store::open();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+
+    // The launcher's own verbs: they are about WHICH build runs, which only
+    // the launcher knows, so no build is started to answer them.
+    let verb = verb_of(argv);
+    let rest: Vec<String> = verb_index(argv).map(|i| argv[i + 1..].to_vec()).unwrap_or_default();
+    match verb.as_deref() {
+        Some("which") => which(&store, &cwd, me),
+        Some("self-update") => finish(self_update(&store, rest.first().map(String::as_str), me, &cwd).map_err(bl_err)),
+        Some("self-install") => finish(self_install(me, &rest, &cwd).map_err(bl_err)),
+        Some("self-gc") => finish(self_gc(&rest).map_err(bl_err)),
+        Some("hooks") if rest.first().map(String::as_str) == Some("drain") => finish(drain(&store, me).map_err(bl_err)),
+        Some("hooks") => finish(hooks_verb(&store, &rest, me, &cwd).map_err(bl_err)),
+        _ => {}
     }
 
+    let mut r = resolve(&store, &cwd);
+
+    // A missing build that CAN be made is made, now: a project that pins
+    // `:bl "commit:…"` must run that commit, not fail on a fresh machine.
+    // `BL_BUILD=never` refuses and says what would have built it.
+    if let Target::Missing { spec, .. } = &r.target {
+        let buildable = matches!(parse_spec(spec), Ok(Spec::Commit(_) | Spec::BleedingEdge(_) | Spec::Channel(_) | Spec::Tag(_)));
+        if buildable && std::env::var("BL_BUILD").as_deref() != Ok("never") {
+            match self_update(&store, Some(spec), me, &cwd) {
+                Ok(_) => r = resolve(&store, &cwd),
+                Err(e) => fail(&format!("`{spec}` is not stored and could not be obtained: {e}")),
+            }
+        }
+    }
+
+    match r.target {
+        Target::Build(id) => {
+            let blob = store.blob(&id);
+            let payload = store.payload(&id);
+            if payload.join("bin").exists() {
+                exec_payload(&payload, &id, argv)
+            } else {
+                // Stored sealed, not yet extracted: the blob is a drop; its own
+                // trailer extracts it on first run.
+                let t = try_read_trailer(&blob).unwrap_or_else(|| fail(&format!("{} is not a drop", blob.display())));
+                run_build(&blob, &t, argv)
+            }
+        }
+        Target::Drop(path) => {
+            let t = try_read_trailer(&path).unwrap_or_else(|| fail(&format!("{} is not a drop", path.display())));
+            run_build(&path, &t, argv)
+        }
+        Target::SourceMode(root) => {
+            let bin = root.join("bin/bl");
+            let mut cmd = Command::new(&bin);
+            cmd.args(argv).env("BL_BIN", me).env_remove("BL_BUILD_ID");
+            exec_or_fail(cmd, &bin)
+        }
+        Target::Missing { spec, hint } => {
+            eprintln!("bl: no build answers `{spec}` here: {hint}");
+            eprintln!("bl: `bl which` shows how this was decided");
+            std::process::exit(EXIT_LAUNCHER_FAILURE)
+        }
+        Target::Invalid(why) => fail(&why),
+    }
+}
+
+/// End a launcher verb: its message on stdout (nothing when it has none), or
+/// its refusal on stderr with exit 1. A refusal is already a sentence for the
+/// user, so it is printed as-is — not as a launcher failure.
+fn finish(r: Result<String, String>) -> ! {
+    match r {
+        Ok(msg) => {
+            if !msg.is_empty() {
+                println!("{msg}");
+            }
+            std::process::exit(0)
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1)
+        }
+    }
+}
+
+/// `bl which`: every rule the resolver consulted, and what it chose.
+fn which(store: &Store, cwd: &std::path::Path, me: &std::path::Path) -> ! {
+    let r = resolve(store, cwd);
+    println!("launcher  {}", tildify(me));
+    println!("store     {}", tildify(&store.root));
+    for s in &r.steps {
+        println!("  {s}");
+    }
+    match &r.target {
+        Target::Build(id) => {
+            let p = store.payload(id);
+            let from = ["commit", "branch", "worktree", "built-at"]
+                .iter()
+                .filter_map(|k| build_info_field(&p, k).map(|v| format!("{k} {v}")))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            println!("runs      build {id}{}", if from.is_empty() { String::new() } else { format!("  ({from})") });
+        }
+        Target::SourceMode(root) => println!("runs      {}/bin/bl (source mode)", tildify(root)),
+        Target::Drop(p) => println!("runs      the drop {}", tildify(p)),
+        Target::Missing { spec, hint } => println!("runs      nothing: `{spec}`: {hint}"),
+        Target::Invalid(why) => println!("runs      nothing: {why}"),
+    }
+    std::process::exit(0)
+}
+
+/// Run the drop `file` (whose trailer is `t`): extract its payload on first
+/// use, then run it.
+fn run_build(file: &std::path::Path, t: &Trailer, argv: &[String]) -> ! {
+    let sha8 = sha8_of(t);
     let install = install_dir();
     let dest = install.join(&sha8);
 
     if !dest.join("bin").exists() {
-        verify_and_extract(&t, &dest, &install);
+        verify_and_extract_from(file, t, &dest, &install);
         gc_old_versions(&install, &sha8);
     }
+    exec_payload(&dest, &sha8, argv)
+}
+
+/// Whether the payload at `dest` names its daemon by build. Every payload that
+/// carries `BUILD_INFO.bl` does (one stat); an older one is asked by reading
+/// its `vm.paths` source for `build-id`.
+fn names_its_build(dest: &std::path::Path) -> bool {
+    if dest.join("BUILD_INFO.bl").is_file() {
+        return true;
+    }
+    std::fs::read_dir(dest.join("lib"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("beam_lisp-"))
+        .any(|e| {
+            std::fs::read_to_string(e.path().join("priv/std/vm/paths.bl"))
+                .is_ok_and(|t| t.contains("(defn build-id"))
+        })
+}
+
+fn exec_or_fail(mut cmd: Command, bin: &std::path::Path) -> ! {
+    #[cfg(unix)]
+    {
+        let err = cmd.exec(); // same pid — signals pass straight through (§6.6)
+        fail(&format!("exec {}: {err}", bin.display()));
+    }
+    #[cfg(windows)]
+    {
+        let status = cmd
+            .status()
+            .unwrap_or_else(|e| fail(&format!("spawn {}: {e}", bin.display())));
+        std::process::exit(status.code().unwrap_or(EXIT_LAUNCHER_FAILURE));
+    }
+}
+
+/// Run the extracted payload at `dest`, which is build `sha8`: attach to its
+/// warm daemon when one serves this tree, else exec its release.
+fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
+    // THIS PROCESS IS BUILD `sha8`, and everything it starts is too: the daemon
+    // names its socket after it, the hello asks for it, and a VM that re-runs
+    // `bl` through `BL_BIN` gets it again. Set before any thread exists. A
+    // payload that predates build-named daemons gets no id, so the launcher
+    // and that payload's daemon agree on the older `<tree>.sock`.
+    if names_its_build(dest) {
+        std::env::set_var("BL_BUILD_ID", sha8);
+    } else {
+        std::env::remove_var("BL_BUILD_ID");
+    }
+    touch_used(dest);
+    let argv = argv.to_vec();
 
     let bin = dest.join(if cfg!(windows) { r"bin\bl.bat" } else { "bin/bl" });
 
@@ -482,19 +823,7 @@ fn main() {
     // (verified: bin/bl eval passes "$@" through as erl -extra). A `--`
     // would leak into argv, so it is NOT added here.
     cmd.arg("eval").arg(CLI_ENTRY).args(&argv);
-
-    #[cfg(unix)]
-    {
-        let err = cmd.exec(); // same pid — signals pass straight through (§6.6)
-        fail(&format!("exec {}: {err}", bin.display()));
-    }
-    #[cfg(windows)]
-    {
-        let status = cmd
-            .status()
-            .unwrap_or_else(|e| fail(&format!("spawn {}: {e}", bin.display())));
-        std::process::exit(status.code().unwrap_or(EXIT_LAUNCHER_FAILURE));
-    }
+    exec_or_fail(cmd, &bin)
 }
 
 // Named `gc_tests`, not `tests`: daemon.rs is `include!`d into this module and
@@ -502,6 +831,16 @@ fn main() {
 #[cfg(test)]
 mod gc_tests {
     use super::*;
+
+    /// `maintenance meta` names the target; every name parses back to its tags.
+    #[test]
+    fn target_name_is_the_inverse_of_parse_target() {
+        for t in ["linux/x86_64", "linux/aarch64", "macos/x86_64", "macos/aarch64", "macos/universal", "windows/x86_64"] {
+            let (o, a) = parse_target(t).unwrap();
+            assert_eq!(target_name(o, a), t);
+        }
+        assert_eq!(target_name(9, 9), "os9/arch9");
+    }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("drop-gc-{tag}-{}", std::process::id()));
@@ -528,20 +867,55 @@ mod gc_tests {
         let _ = std::fs::remove_dir_all(&install);
     }
 
-    /// ...and once past the window it IS swept, so the install dir cannot grow
-    /// without bound.
-    #[test]
-    fn sweeps_only_past_the_window() {
-        let now = std::time::SystemTime::now();
-        let cutoff = now - std::time::Duration::from_secs(30 * 86_400);
-        let ago = |days: u64| Some(now - std::time::Duration::from_secs(days * 86_400));
+    fn facts() -> GcFacts {
+        let mut refs = std::collections::HashMap::new();
+        refs.insert("pppppppp".to_string(), "channels/stable".to_string());
+        GcFacts {
+            in_use: "cccccccc".into(),
+            refs,
+            daemons: ["dddddddd".to_string()].into(),
+            running: ["rrrrrrrr".to_string()].into(),
+            now: std::time::SystemTime::now(),
+            grace: std::time::Duration::from_secs(24 * 3_600),
+            recent: std::time::Duration::from_secs(14 * 86_400),
+        }
+    }
 
-        assert!(sweepable("stale", "current", ago(40), cutoff));
-        assert!(!sweepable("recent", "current", ago(1), cutoff));
-        // the version in use is never swept, however old
-        assert!(!sweepable("current", "current", ago(400), cutoff));
-        // undatable → kept, never deleted
-        assert!(!sweepable("undated", "current", None, cutoff));
+    /// A build goes only when NOTHING holds it: not in use, not pointed at, no
+    /// daemon, no process, and unused for longer than both windows.
+    #[test]
+    fn only_an_unheld_unused_build_goes() {
+        let f = facts();
+        let ago = |days: u64| Some(f.now - std::time::Duration::from_secs(days * 86_400));
+        assert_eq!(keep_reason("cccccccc", ago(400), &f), Some(Keep::InUse));
+        assert_eq!(keep_reason("pppppppp", ago(400), &f), Some(Keep::Pointed("channels/stable".into())));
+        assert_eq!(keep_reason("dddddddd", ago(400), &f), Some(Keep::Daemon));
+        assert_eq!(keep_reason("rrrrrrrr", ago(400), &f), Some(Keep::Running));
+        assert_eq!(keep_reason("eeeeeeee", ago(3), &f), Some(Keep::Recent), "run by path, recently: kept");
+        assert_eq!(keep_reason("ffffffff", None, &f), Some(Keep::Undated), "undatable: kept, never deleted");
+        assert_eq!(keep_reason("aaaaaaaa", ago(20), &f), None, "nothing holds it and it is unused: it goes");
+    }
+
+    /// A deleted worktree's bleeding-edge no longer holds its build; a channel
+    /// always does; the store dir itself is never a candidate.
+    #[test]
+    fn references_follow_live_worktrees_and_the_store_is_never_swept() {
+        let install = scratch("refs");
+        let store = Store { root: install.clone() };
+        let live = install.join("live-wt");
+        std::fs::create_dir_all(&live).unwrap();
+        store.write("channels/stable", &Pointer::new("11111111")).unwrap();
+        store.write("bleeding-edge/a", &Pointer::new("22222222").with("root", &live.to_string_lossy())).unwrap();
+        store.write("bleeding-edge/b", &Pointer::new("33333333").with("root", "/no/such/worktree")).unwrap();
+        let refs = referenced(&store);
+        assert!(refs.contains_key("11111111"));
+        assert!(refs.contains_key("22222222"));
+        assert!(!refs.contains_key("33333333"), "a gone worktree holds nothing");
+
+        let rows = gc_by_reference(&install, "", true);
+        assert!(rows.iter().all(|r| r.name != "store"));
+        assert!(install.join("store/channels/stable").exists(), "a dry run removes nothing");
+        let _ = std::fs::remove_dir_all(&install);
     }
 
     // ── the other half of the same failure ──────────────────────────────

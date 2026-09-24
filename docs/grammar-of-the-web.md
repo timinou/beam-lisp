@@ -99,6 +99,17 @@ is one box:
 (box {:dir :col :at {:md {:dir :row}}} a b c)
 ```
 
+Motion is a style too. `keyframes` turns a map of stops into a hashed name,
+exactly as `sx` turns a map into a class, and the rule ships with the page and
+with the first live patch that reaches it. A change needs no script: the view
+puts the new state in a style, the patch swaps the class, and a `transition`
+eases the browser from the old state to the new one.
+
+```clojure
+(sx {:animation (str (keyframes {:from {:opacity 0}}) " 400ms backwards")
+     :transition "stroke-dasharray 900ms"})
+```
+
 And hover or focus styles ride along in `:on`. Layout stays one value you can
 read, pass around, and transform — never a scatter of stylesheet rules.
 
@@ -182,6 +193,109 @@ bigger framework bundles is a *combination* of these, not a new part:
 A grammar is judged by what it can say without adding a new word. This one says
 all of the above with the seven parts it already has. That is the test, and it
 passes.
+
+It passes for *what can be said*. It says nothing yet about *how much to say at
+once* — and that is where real screens go wrong. See the next section.
+
+---
+
+## Hierarchy — how much of the world one screen shows
+
+The seven parts guarantee a screen is *correct*: every fact in the world can
+reach the page. They do not stop a screen from showing every fact at once. A
+view function that is pure, typed, and tested can still render nine cards on
+4 000 pixels — and that is not a bug any checker finds. It is a failure of
+**hierarchy**.
+
+This section comes from a real redesign (a French banking-QA console, 2026-09).
+Its detail page for one test run stacked a verdict, a causal chain, a summary,
+a conversation, an expected/observed table, guardrails, a trace, a review
+block, a context block and a scorer panel: 1 235 words, 4 082 px. Rebuilt with
+the moves below, the same page opens at 347 words, one screen high, with
+nothing deleted — every fact is still one click away.
+
+### The rule
+
+> **A screen answers one question. Every other question gets a link.**
+
+The first view answers "what happened, and should I worry?". "Why?", "what
+was said?", "what proves it?" are *different questions*: each deserves its own
+view, reached by one gesture, never pre-rendered below the fold.
+
+### Five moves, all composed from the seven parts
+
+None of these is a new part. Each is a `Mark` plus a `:navigate` (or the
+platform's own state), which is why they cost no session state and no script.
+
+| move | when | how | part |
+| --- | --- | --- | --- |
+| **tabs** | one object, several questions | `(tabs {:active id :tabs [{:id :href :label :count}]})` — links, `?onglet=` in the URL | Mark + Navigate |
+| **filter pills** | one list, several subsets | same, `:variant :pills`, a `:count` per pill | Mark + Navigate |
+| **disclosure** | detail that *some* readers need | `(disclosure {:summary … :hint … :open bool} body)` — native `<details>` | Mark (browser-owned state) |
+| **facts** | 3–8 attributes of one thing | `(facts {:cols 4} [[label value] …])` — a `<dl>` grid | Mark |
+| **table** | many things of one kind | `(table {:columns … :rows …})` — the row's name is the link | Mark + Navigate |
+
+**Selection belongs in the URL.** A tab or a filter is a `:navigate`, not an
+`:assign`. That one choice makes the view shareable, bookmarkable, undone by
+the browser's Back button, testable with a plain GET, and free of session
+state. The live client already turns an in-app `<a href>` into a keyed patch,
+so a tab switch repaints only what changed. Reach for `:assign` only for state
+that must *not* survive a reload (a demo counter, a draft).
+
+**Unknown selection falls back.** `?onglet=bogus` renders the first tab, never
+an empty page: the parser is `(if (contains? known v) v default)`.
+
+**Disclosure opens what the reader came for.** A fold is not a hiding place.
+In a list of criteria, the *failed* and *unmeasured* ones render `:open true`;
+the met ones fold. The question the screen answers decides the default.
+
+### Subtractions — the copy a better layout deletes
+
+Most of the words removed in that redesign were not content. They were layout
+compensating for itself:
+
+- **Section eyebrows that repeat the navigation.** "Concevoir · édition" above
+  a title, when the sidebar already highlights *Concevoir*. A breadcrumb
+  (`Scénarios / SCN-003`) replaces it and is also a link back.
+- **Provenance on every card.** A "simulated data" badge on a page banner, the
+  sidebar, each card header *and* each value. Say it once where the eye rests
+  (the rail) and keep it only on the atomic values that could be mistaken for
+  measurements.
+- **Paragraphs that explain the mechanism.** "The position lives in the URL:
+  each step is a link, therefore live navigation…" — a reader sees this by
+  using it. Move such prose into a disclosure or delete it.
+- **Cards inside cards.** A card of rows, each row itself a bordered, filled
+  box. One surface per group; rows are separated by a hairline (`border-bottom`
+  on all but `:last-child`).
+- **Read-only inputs posing as forms.** A disabled field per attribute costs
+  an outline, padding and a label each. A `facts` grid says the same in a
+  quarter of the space and does not pretend to be editable.
+- **Two buttons to the same place.** A header "Open review" *and* a card
+  "See review". Keep one primary action per screen.
+
+### What this asked of the parts
+
+The redesign found three gaps, now closed in `loom.parts`, and one idiom worth
+knowing in `loom.token`:
+
+- `tabs` rendered only `<button role=tab>` with an `:on-select` event — state
+  in the session. It now renders a `<nav>` of links (`aria-current="page"` on
+  the active one) whenever an item has `:href`, with `:count` and a `:pills`
+  variant. Button tabs are unchanged.
+- `disclosure` and `facts` did not exist; every app re-improvised them as
+  cards.
+- **`sx*` can express parent state without a new selector feature.** `:on`
+  emits `.cls:<pseudo>{…}`, and `:is(…)` is a pseudo-class that takes a full
+  selector. So "this chevron when its `<details>` is open" is
+  `{:on {"is(details[open]>summary>*)" {:transform "rotate(90deg)"}}}`, and
+  "this cell unless it is in the last row" is
+  `{:on {"is(tr:last-child>*)" {:border-bottom "none"}}}`. State the platform
+  already tracks stays in the platform.
+
+One more trap surfaced: a `nil` child in a hiccup vector renders fine on the
+server but becomes an empty text node when the client applies a patch, which
+shifts every later child index. Build optional children with `conj`/`cond->`
+or filter them out; never leave a `(when …)` placeholder in a patched subtree.
 
 ---
 
