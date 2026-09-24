@@ -116,6 +116,7 @@ defmodule BeamLisp.AOT do
     file = Keyword.get(opts, :file)
 
     forms = Reader.read_string(source, file)
+    defined = unit_defns(forms)
 
     # PRE-LINK every top-level defn in the unit before compiling any form.
     # A call to a defn defined LATER in the same file would otherwise compile
@@ -155,9 +156,50 @@ defmodule BeamLisp.AOT do
     |> Enum.filter(fn ns -> Map.has_key?(value_defs, ns) or Env.ns_defs(ns) != %{} end)
     |> Enum.sort()
     |> Enum.flat_map(fn ns ->
-      emit_module(ns, Map.get(value_defs, ns, []), Map.get(ns_meta, ns, %{}), output_dir, file)
+      emit_module(ns, Map.get(value_defs, ns, []), Map.get(ns_meta, ns, %{}), output_dir, file,
+        Map.get(defined, ns))
     end)
   end
+
+  # The fn definitions THIS UNIT made, per namespace: the names a top-level
+  # `defn`/`defn-` form in the source binds. Emission is restricted to these.
+  #
+  # `Env.ns_defs/1` is the VM's registry, not the unit's: it also holds every
+  # defn an EARLIER generation of the namespace interned in this VM. The boot
+  # tier is rebuilt inside a VM running the previous generation (the floor), so
+  # a defn deleted from `core.bl` stayed in `ns_defs("core")` and was emitted
+  # into the new beam anyway — measured: `core`'s rt.ex doc scraper, deleted
+  # from source, survived three rebuilds, still calling `BeamLisp.RT`.
+  # nil for a namespace whose fns this unit does not enumerate (a defn produced
+  # by a macro): that namespace keeps the registry, as before.
+  defp unit_defns(forms) do
+    Enum.reduce(forms, {"user", %{}}, fn form, {ns, acc} ->
+      case ns_decl(form) do
+        nil ->
+          case defn_name(form) do
+            nil -> {ns, acc}
+            name -> {ns, Map.update(acc, ns, MapSet.new([name]), &MapSet.put(&1, name))}
+          end
+
+        declared ->
+          {declared, acc}
+      end
+    end)
+    |> elem(1)
+  end
+
+  defp defn_name({:meta, inner, _}), do: defn_name(inner)
+
+  defp defn_name({:list, [{:meta, head, _} | rest]}), do: defn_name({:list, [head | rest]})
+
+  defp defn_name({:list, [{:symbol, head}, name_form | _]}) when head in ["defn", "defn-"] do
+    case unmeta(name_form) do
+      {:symbol, name} -> name
+      _ -> nil
+    end
+  end
+
+  defp defn_name(_), do: nil
 
   # `reader-node`, `build-plan`, `source-graph` and `ns-interface` are the
   # namespaces the drift gate itself runs on (`ns_closure_hash/1` →
@@ -552,10 +594,10 @@ defmodule BeamLisp.AOT do
   # `ns_defs` forwards each existing fn to its own on-disk body module rather
   # than a phantom one. Returns every emitted `{mod, path}` so the Mix task can
   # track and clean all of them.
-  defp emit_module(ns, value_defs, ns_meta, output_dir, file) do
+  defp emit_module(ns, value_defs, ns_meta, output_dir, file, unit_names) do
     mod = Emit.module_for(ns)
     filename = file || "beam_lisp_aot/#{ns}.bl"
-    ns_defs = stabilise_body_modules(ns, Env.ns_defs(ns))
+    ns_defs = stabilise_body_modules(ns, unit_defs(ns, unit_names))
     source_hash = if file, do: ns_closure_hash(ns, file), else: nil
 
     # The stamp key is the namespace's TIER key: the codegen key for `boot/`
@@ -840,6 +882,28 @@ defmodule BeamLisp.AOT do
   # and that new var gets its own fresh `Ns.Fn.M<n>` from `Link.defvar` while
   # the AOT-loaded fns keep forwarding to the stable `Ns.Body.<Ns>`. Neither
   # the shared body module nor any runtime per-var module is ever purged.
+  # This unit's defs. `Env.ns_defs/1` is the VM's registry, so it also holds
+  # every defn an EARLIER generation of the namespace interned in this VM — and
+  # the boot tier is rebuilt inside a VM running the previous generation. The
+  # two are told apart by their body module, not by guessing from names: a
+  # defn this unit evaluated was installed by `Link.defvar` into a FRESH
+  # `BeamLisp.Ns.Fn.M<n>`; one inherited from a loaded beam still names that
+  # beam's shared `BeamLisp.Ns.Body.<Ns>`. Measured before this: core.bl's rt.ex
+  # doc scraper, deleted from the source, survived three rebuilds of `core`,
+  # still calling `BeamLisp.RT`. A name the source spells as a top-level defn is
+  # always kept, so this can only drop what the unit did not define.
+  defp unit_defs(ns, names) do
+    shared = ns_body_module(ns)
+
+    ns
+    |> Env.ns_defs()
+    |> Enum.filter(fn {name, defs} ->
+      (names != nil and MapSet.member?(names, name)) or
+        Enum.any?(defs, fn d -> elem(d, 4) != shared end)
+    end)
+    |> Map.new()
+  end
+
   defp stabilise_body_modules(ns, ns_defs) do
     body_mod = ns_body_module(ns)
     Map.new(ns_defs, fn {name, defs} ->
