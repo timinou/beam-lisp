@@ -8,7 +8,9 @@
 //     1. the value representation (keyword / list / tuple / vector / map /
 //        record) and leaf operations over it,
 //     2. the machine that drives compiled BL generators — the control ABI
-//        (call / tail / park / host-wait) and its frame stack,
+//        (call / tail / park / host-wait) and its frame stack. A turn that died
+//        REPORTS the thrown value's class and reason; what a reason then means
+//        to a process is BL's business (see `runtime.bl` `rt-terminate!`),
 //     3. the registry of compiled BL globals (`ref` / `def` / `alias`),
 //     4. the bridge to host tasks: a monotonic clock and `setTimeout`.
 //
@@ -141,6 +143,115 @@ export function mapRemove(m, k) {
 export function emptyMap() { return new BMap(new Map()); }
 export function mapSize(m) { return m instanceof BMap ? m.m.size : 0; }
 
+// ── mutable tables (host storage primitive) ─────────────────────────────────
+//
+// A TABLE is SHARED MUTABLE state: the host keeps ONE native `Map` and updates
+// it IN PLACE, so a row write is amortized O(1) in the table's size — unlike
+// `mapPut`, which copies the whole map and answers a NEW value. That difference
+// is the reason this primitive exists, and the reason a table is NOT a BL map
+// and has no alias to one: `is-map` is false for a handle, and `mapPut` never
+// sees one.
+//
+// The handle is a HOST object. A BL program can only obtain one from
+// `table-new`, so BL data cannot forge one, and it records the runtime that
+// minted it, so a leaf called on ANOTHER runtime refuses it. That is the whole
+// of the host's policy. Ownership, heir, access mode, naming, lifecycle and
+// atomic counters are NOT decided here — the host does not know what a process
+// is. A BL table service owns all of that and calls these leaves.
+//
+// A row is `[key, value]` filed under the canonical `hashKey(key)` — exactly
+// how `BMap` files an entry — so structural equality and distinctness are the
+// target's existing ones. Key and value are held BY REFERENCE: typed BL values
+// round-trip without being copied.
+//
+// Memory is bounded the way the prototype bounds its browser inbox: loud
+// refusal, never silent growth.
+
+const TABLE_MAX_ENTRIES = 1 << 20;      // rows in one table
+const TABLE_MAX_KEY = 1 << 16;          // characters in one canonical key
+const TABLE_MAX_PER_RUNTIME = 1 << 16;  // live tables in one runtime
+let tableHandleCounter = 0;
+
+/** The host's table bounds, as data — a BL service reports them instead of
+ *  hard-coding a second copy. */
+export const TABLE_LIMITS = Object.freeze({
+  entries: TABLE_MAX_ENTRIES, key: TABLE_MAX_KEY, tables: TABLE_MAX_PER_RUNTIME,
+});
+
+/** An opaque, non-forgeable handle to one live table, bound to the runtime that
+ *  minted it. It is a host object, so no BL value can pretend to be one. */
+export class TableHandle {
+  constructor(runtimeId, m) {
+    this.__table = true;   // a marker for diagnostics, never a validity check
+    this.rt = runtimeId;   // the runtime identity this handle belongs to
+    this.id = (tableHandleCounter += 1);
+    this.m = m;
+    this.dead = false;
+  }
+}
+export function isTable(x) { return x instanceof TableHandle; }
+
+/** Validate a handle for a leaf called on `rt`: right kind, right runtime,
+ *  still alive. The errors name the reason so a BL caller can report it. */
+function tableCheck(rt, h) {
+  if (!(h instanceof TableHandle)) throw new Error("not a table handle: " + describe(h));
+  if (h.rt !== rt.runtimeId) throw new Error("table handle belongs to another runtime");
+  if (h.dead) throw new Error("table has been destroyed");
+  return h;
+}
+
+/** Canonical key, with the one key-size bound. */
+function tableKey(k) {
+  const kk = hashKey(k);
+  if (kk.length > TABLE_MAX_KEY) throw new Error("table key is too large");
+  return kk;
+}
+
+export function tableNew(rt) {
+  const live = (rt.tables ||= new Set());
+  if (live.size >= TABLE_MAX_PER_RUNTIME) throw new Error("too many live tables in this runtime");
+  const h = new TableHandle(rt.runtimeId, new Map());
+  live.add(h);
+  return h;
+}
+/** The stored `[key, value]` row as a BL tuple, or nil when absent. The key in
+ *  the answer is the STORED key, not the probe — BEAM `:ets.lookup/2` does the
+ *  same, and nil stays distinguishable from a row holding nil. */
+export function tableLookup(rt, h, k) {
+  tableCheck(rt, h);
+  const row = h.m.get(tableKey(k));
+  return row === undefined ? null : tup([row[0], row[1]]);
+}
+export function tableInsert(rt, h, k, v) {
+  tableCheck(rt, h);
+  const kk = tableKey(k);
+  if (!h.m.has(kk) && h.m.size >= TABLE_MAX_ENTRIES) throw new Error("table is full");
+  h.m.set(kk, [k, v]);
+  return true;
+}
+/** Answer whether a row was removed. Deleting an absent key is a no-op. */
+export function tableDelete(rt, h, k) {
+  tableCheck(rt, h);
+  return h.m.delete(tableKey(k));
+}
+export function tableSize(rt, h) { tableCheck(rt, h); return h.m.size; }
+export function tableDestroy(rt, h) {
+  tableCheck(rt, h);
+  h.dead = true;
+  h.m.clear();
+  h.m = null;
+  if (rt.tables) rt.tables.delete(h);
+  return true;
+}
+/** A stable COPY of the rows (insertion order), for BL iteration: a later write
+ *  does not change it, and the table is not held after the call returns. */
+export function tableSnapshot(rt, h) {
+  tableCheck(rt, h);
+  const rows = [];
+  for (const row of h.m.values()) rows.push(tup([row[0], row[1]]));
+  return listFromArray(rows);
+}
+
 // ── leaf predicates / conversions ────────────────────────────────────────────
 
 export function isNil(x) { return x === null || x === undefined; }
@@ -189,6 +300,11 @@ export function hashKey(x) {
   return "o:" + (x.__id ||= ++idCounter);
 }
 let idCounter = 0;
+// Runtime identities are ALLOCATED, never read from a clock: two runtimes in the
+// same process get disjoint ids even if they are created in the same instant,
+// so `[:pid runtime serial]` can never name a process in another runtime. Thin
+// identity allocation only — no actor policy.
+let runtimeIdCounter = 0;
 
 export function eq(a, b) {
   if (a === b) return true;
@@ -215,6 +331,7 @@ export function describe(x) {
   if (typeof x === "string") return JSON.stringify(x);
   if (typeof x === "function") return "#<fn>";
   if (isFn(x)) return "#<fn " + x.name + ">";
+  if (x instanceof TableHandle) return "#<table " + x.id + ">";
   return String(x);
 }
 
@@ -308,12 +425,70 @@ export function isStep(x) { return !!x && x.__step === true; }
 // list here is EMPTY — this target has no BEAM stack, and inventing frames would
 // be a worse lie than reporting none.
 
+// ── logical source frames ────────────────────────────────────────────────────
+//
+// The target's STACKTRACE SHAPE. `runTurn` keeps one entry per live generator
+// frame — the CALL-SITE metadata of the call that created it, emitted from the
+// ANF's own source span — so every frame names the BL source it was entered
+// from. A frame is a BL map with EXPLICIT keys, so an unknown position is a
+// null field, never a missing one: {:file :line :col :fn :arity :call}.
+// `:fn`/`:arity` are the function the call was written IN (the caller) and
+// `:call` is :direct | :dynamic | :tail. Nothing here is scraped out of a
+// JavaScript Error, and no BEAM frame is ever fabricated. The list is capped at
+// MAX_TRACE innermost frames, and a tail call REPLACES its frame's entry, so a
+// tail loop stores O(depth), not O(iterations).
+const MAX_TRACE = 64;
+let liveFrames = null;         // the generator stack of the turn in progress
+
+function frameValue(src) {
+  return bmap([
+    [kw("file"), src && typeof src.file === "string" ? src.file : null],
+    [kw("line"), src && Number.isInteger(src.line) ? src.line : null],
+    [kw("col"), src && Number.isInteger(src.col) ? src.col : null],
+    [kw("fn"), src && typeof src.fn === "string" ? src.fn : null],
+    [kw("arity"), src && Number.isInteger(src.arity) ? src.arity : null],
+    [kw("call"), src && typeof src.call === "string" ? kw(src.call) : null],
+  ]);
+}
+
+/** The logical stack of `frames`, INNERMOST first, capped at MAX_TRACE.
+ *  Shared by `runTurn` and the `host/logical-stack` leaf so the two agree. */
+export function frameValues(frames) {
+  if (!frames) return ENIL;
+  const srcs = frames.__srcs || [];
+  const out = [];
+  for (let i = frames.length - 1; i >= 0 && out.length < MAX_TRACE; i--) out.push(frameValue(srcs[i]));
+  return listFromArray(out);
+}
+
+/** The raw stacktrace a NEW raise carries: a 2-tuple shaped so the compiler's
+ *  `:erlang/element(2, __STACKTRACE__)` read answers the frame list. */
+function capturedTrace() {
+  return new T([ENIL, liveFrames ? frameValues(liveFrames) : ENIL]);
+}
+
+/** The frame list an envelope already carries, or null when it carries none. */
+function raisedFrameList(x) {
+  if (!isRaise(x) || !isTup(x.trace)) return null;
+  const fl = x.trace.items[1];
+  return isCons(fl) ? fl : null;
+}
+
+/** The logical stack of the running BL code, as a BL list (innermost first).
+ *  Read-only introspection: it is the same list a new raise captures. */
+export function logicalStack() { return liveFrames ? frameValues(liveFrames) : ENIL; }
+
 export class BLRaise {
   constructor(kind, reason, trace) {
     this.__blraise = true;
     this.kind = kind;                        // a KW: :error | :throw | :exit
     this.reason = reason;                    // a BL value
-    this.trace = isTup(trace) ? trace : emptyTrace();
+    // An EXPLICIT trace is a re-raise carrying its ORIGINAL __STACKTRACE__, and
+    // is preserved verbatim. A raise with NO trace captures the machine's
+    // logical stack ONCE, here, at the moment of the throw: a catch in the SAME
+    // frame can then read it, and a later finalizer throw — a NEW envelope —
+    // captures its own stack and supersedes whatever was pending.
+    this.trace = isTup(trace) ? trace : capturedTrace();
   }
 }
 export function isRaise(x) { return !!x && x.__blraise === true; }
@@ -429,36 +604,75 @@ export function runTurn(rt, frames, budget) {
   // Kept in step with `frames` at every push, pop and tail replacement.
   let cds = frames.__cds;
   if (!Array.isArray(cds)) { cds = []; frames.__cds = cds; }
-  const finish = (r) => { frames.__pending = pending; frames.__cds = cds; return r; };
-  const die = (message) => {
+  // Call-site metadata, one entry per frame, in step with `frames`. It rides on
+  // the frame stack for the same reason `cds` does: a slice can end with the
+  // stack suspended, and the metadata must survive with it.
+  let srcs = frames.__srcs;
+  if (!Array.isArray(srcs)) { srcs = []; frames.__srcs = srcs; }
+  // `liveFrames` is the module-level pointer a NEW raise reads to capture its
+  // own trace. It is saved so a nested turn restores its caller's stack, and it
+  // is refreshed at every resume below.
+  const prevLive = liveFrames;
+  let capturedFrames = null;
+  const capture = () => { if (capturedFrames === null) capturedFrames = frameValues(frames); };
+  const finish = (r) => { frames.__pending = pending; frames.__cds = cds; frames.__srcs = srcs; liveFrames = prevLive; return r; };
+  // A turn that dies reports the WHOLE thrown value, not only its text: the
+  // class and the reason are what `runtime.bl` turns into a process's exit
+  // reason, and it is the only exit-signal input the host supplies. What that
+  // reason then means — links, monitors, propagation, trap_exit — is BL policy
+  // and is not even visible from here.
+  const die = (thrown) => {
     rt.criticalDepth = cd0;
     pending = { t: "value", v: null };
-    return finish(mkResult("error", frames, { message }));
+    // A raise that already carries a raw trace (a re-raise, a finalizer throw)
+    // keeps IT — that is the preserved location. A raw JavaScript error has
+    // none, so the stack captured at the first escaping throw is used.
+    const framesOut = raisedFrameList(thrown) || capturedFrames || frameValues(frames);
+    return finish(mkResult("error", frames, {
+      message: exceptionText(thrown),
+      kind: exKind(thrown),
+      reason: exReason(thrown),
+      frames: framesOut,
+    }));
   };
   while (true) {
     while (cds.length < frames.length) cds.push(cd0);
+    while (srcs.length < frames.length) srcs.push(null);
     if (frames.length > (rt.maxFrames || 0)) rt.maxFrames = frames.length;
     // A bounded slice normally ends here. While a critical section is open the
     // boundary is DEFERRED: splitting a read-modify-write of `rt.state` across
     // a slice would let another process mutate the same root underneath it.
     if (steps >= budget && (rt.criticalDepth || 0) === 0) return finish(mkResult("yield", frames, {}));
     if (frames.length === 0) {
-      if (pending.t === "throw") return die(exceptionText(pending.v));
+      if (pending.t === "throw") return die(pending.v);
       return finish(mkResult("done", frames, { value: pending.v }));
     }
     const g = frames[frames.length - 1];
     let res;
     try {
+      // The logical stack must be current at every resume: a new raise reads it
+      // to capture its trace, and `host/logical-stack` reads it to answer the
+      // stack of the running BL code.
+      liveFrames = frames;
       // A pending THROW is delivered at the frame's suspension point, so a
       // compiled `try` — a real JavaScript try/catch inside the generator —
       // catches it exactly where the language says it should.
-      res = pending.t === "throw" ? g.throw(pending.v) : g.next(pending.v);
+      const deliveringThrow = pending.t === "throw";
+      res = deliveringThrow ? g.throw(pending.v) : g.next(pending.v);
+      // A handled error is no longer the active exception. A later raw host
+      // failure must capture its own site, not reuse that earlier snapshot.
+      if (deliveringThrow) capturedFrames = null;
     } catch (e) {
-      // The frame did not catch it, so its generator is closed: pop it and hand
-      // the SAME value to its caller, where an enclosing `try` may yet catch it.
+      // The frame did not catch it, so its generator is closed: capture the
+      // logical stack the FIRST time a throw ESCAPES a generator, pop the
+      // frame, and hand the SAME value to its caller, where an enclosing `try`
+      // may yet catch it.
+      if (pending.t === "throw" && e !== pending.v) capturedFrames = null;
+      capture();
       pending = { t: "throw", v: e };
       frames.pop();
       rt.criticalDepth = cds.length > 0 ? cds.pop() : cd0;
+      srcs.pop();
       steps++;
       continue;
     }
@@ -467,6 +681,7 @@ export function runTurn(rt, frames, budget) {
     if (res.done) {
       frames.pop();
       rt.criticalDepth = cds.length > 0 ? cds.pop() : cd0;
+      srcs.pop();
       pending = { t: "value", v: res.value };
       continue;
     }
@@ -479,29 +694,45 @@ export function runTurn(rt, frames, budget) {
         // A failure in resolution or in a native leaf is a THROW TO THE CALLER,
         // not an instant process death: the frame above this step is the one
         // that asked for the call, and its `try` may be waiting for it.
+        const callerSrc = srcs[srcs.length - 1];
+        // A generated runtime helper is infrastructure, not the user's raise
+        // site. Preserve the caller's BL source through its tail calls; the
+        // compiler marks those sites explicitly rather than teaching this
+        // machine any module or path names.
+        const callSrc = step.src && step.src.internal && callerSrc ? callerSrc : (step.src || null);
+        // A native leaf (or resolution) can throw without pushing a callee.
+        // Point the live frame at THIS call during invocation, then restore
+        // the caller's entry site on successful non-tail completion.
+        if (callSrc) srcs[srcs.length - 1] = callSrc;
         let factory = null;
         try { factory = resolveCallee(step.f, step.args); }
-        catch (e) { pending = { t: "throw", v: e }; break; }
+        catch (e) { capture(); pending = { t: "throw", v: e }; break; }
         if (factory) {
           let ng;
           try { ng = factory(rt, step.args); }
-          catch (e) { pending = { t: "throw", v: e }; break; }
+          catch (e) { capture(); pending = { t: "throw", v: e }; break; }
           if (step.k === "tail") {
             frames[frames.length - 1] = ng;
             cds[cds.length - 1] = rt.criticalDepth || 0;
+            srcs[srcs.length - 1] = callSrc;
           } else {
+            srcs[srcs.length - 1] = callerSrc;
             frames.push(ng);
             cds.push(rt.criticalDepth || 0);
+            srcs.push(callSrc);
           }
           break;
         }
         let v;
         try { v = invokeNative(rt, step.f, step.args); }
-        catch (e) { pending = { t: "throw", v: e }; break; }
+        catch (e) { capture(); pending = { t: "throw", v: e }; break; }
         steps++;
         if (step.k === "tail") {
           frames.pop();
           rt.criticalDepth = cds.length > 0 ? cds.pop() : cd0;
+          srcs.pop();
+        } else {
+          srcs[srcs.length - 1] = callerSrc;
         }
         if (frames.length === 0) { pending = { t: "value", v: isStep(v) ? null : v }; break; }
         if (isStep(v)) { step = v; continue; }
@@ -520,6 +751,14 @@ function mkResult(status, frames, extra) {
     [kw("ms"), extra.ms === undefined ? null : extra.ms],
     [kw("input-enabled"), extra.inputEnabled === true],
     [kw("message"), extra.message === undefined ? null : extra.message],
+    // The uncaught value that ended the turn, as its class and its reason. nil
+    // for every status a raise did not produce.
+    [kw("kind"), extra.kind === undefined ? null : extra.kind],
+    [kw("reason"), extra.reason === undefined ? null : extra.reason],
+    // The logical source frames of an uncaught raise (innermost first), nil for
+    // every status a raise did not produce. BL policy renders them; the host
+    // only reports what it saw.
+    [kw("frames"), extra.frames === undefined ? null : extra.frames],
   ]);
 }
 export function resultStatus(r) { return kwName(mapGet(r, kw("status"))); }
@@ -558,7 +797,10 @@ export function waitForInput(rt, ms, inputEnabled = true) {
       resolve();
     };
     if (inputEnabled) rt.inputWake = wake;
-    if (ms !== null) timer = setTimeout(wake, Math.max(0, ms));
+    // Timer APIs truncate fractional milliseconds. Round UP so a timed BL
+    // receive cannot wake before its monotonic deadline and immediately sleep
+    // again for the missing fraction (the scheduler still owns the deadline).
+    if (ms !== null) timer = setTimeout(wake, Math.ceil(Math.max(0, ms)));
     // Recheck only when BL has enabled ingress: no event is lost between the
     // pump and waiter registration, while pre-registration input remains queued.
     if (inputEnabled && rt.inbox.length > 0) wake();
@@ -566,9 +808,20 @@ export function waitForInput(rt, ms, inputEnabled = true) {
 }
 
 export function newRuntime() {
+  const runtimeId = (runtimeIdCounter += 1);
   const rt = {
     globals: new Map(),
-    state: bmap([]),
+    // The tables this runtime minted. A handle is valid only in the runtime
+    // that made it, so this set is PER RUNTIME; the host owns no table identity
+    // beyond it.
+    tables: new Set(),
+    // The runtime's own identity, ALLOCATED here (never a clock reading): two
+    // runtimes in one process get disjoint ids even when created in the same
+    // instant, so a pid/ref can never name a process in another runtime. It is
+    // handed to the BL runtime as the one field of the initial retained state
+    // it starts from; thin identity allocation only, no actor policy.
+    runtimeId,
+    state: bmap([[kw("runtime"), runtimeId]]),
     self: null,
     // The scheduler's own slice. It is deliberately large: every real yield to
     // the host goes through `host-wait` (a deadline), never through the slice.
@@ -661,6 +914,9 @@ export const PURE = {
   "map-remove": mapRemove,
   "map-keys": mapKeys,
   "map-size": mapSize,
+  // A table handle is a value predicate: it reads no runtime state and says
+  // only "this is a table handle" — never whether it is alive or owned.
+  "is-table": isTable,
   eq,
   identical,
   lt,
@@ -724,7 +980,24 @@ export const RT_HOST = {
   write: (rt, s) => { rt.out(toStr(s)); return null; },
   raise: (rt, msg) => { throw new Error(toStr(msg)); },
   "record-error": (rt, msg) => { rt.errors = (rt.errors || 0) + 1; rt.lastError = toStr(msg); return rt.errors; },
+  // ── mutable tables ─────────────────────────────────────────────────────────
+  //
+  // The low-level storage operations. The host validates the handle and the
+  // bounds and nothing more; which process OWNS a table, who inherits it, what
+  // access mode it has and when it dies are BL decisions taken ABOVE these
+  // leaves (a BL table service), not here. `table-new` takes no owner, heir or
+  // mode — there is no argument for one.
+  "table-new": (rt) => tableNew(rt),
+  "table-lookup": (rt, h, k) => tableLookup(rt, h, k),
+  "table-insert": (rt, h, k, v) => tableInsert(rt, h, k, v),
+  "table-delete": (rt, h, k) => tableDelete(rt, h, k),
+  "table-size": (rt, h) => tableSize(rt, h),
+  "table-destroy": (rt, h) => tableDestroy(rt, h),
+  "table-snapshot": (rt, h) => tableSnapshot(rt, h),
   "max-frames": (rt) => rt.maxFrames || 0,
+  // The logical source stack of the RUNNING BL code, innermost first: the same
+  // bounded list a new raise captures. Read-only, no actor policy.
+  "logical-stack": () => logicalStack(),
 };
 
 /** The callee a compiled call site uses for a `host/…` intrinsic. Cached per
@@ -790,6 +1063,10 @@ export const ERLANG = {
   "is_tuple": isTup,
   "is_list": isList,
   "is_pid": (x) => typeof x === "number" && x >= 0 && Number.isInteger(x) && false,
+  // There are no BEAM pid VALUES on this target (a BL pid is a BL vector; BL
+  // asks `rt-pid?`), so this stays false rather than encoding one shape of
+  // actor state here. Kept as a bif so a guard does not fail for the wrong
+  // reason.
   "is_reference": () => false,
   "is_port": () => false,
   "is_atom": (x) => isKw(x) || x === null || x === true || x === false,
@@ -804,12 +1081,15 @@ export const ERLANG = {
   // `:erlang.raise/3` is what the compiler's catch fallthrough re-raises with,
   // and what `BeamLisp.ExInfo.raise_payload/1` is built on: class, reason and
   // the RAW stacktrace, passed through untouched. `:erlang.throw/1` and
-  // `:erlang.exit/1` differ only in the class they carry — this target has no
-  // links, monitors or exit signals, so an UNCAUGHT exit fails the process like
-  // any other raise; it kills nothing else, and no actor observes it.
+  // `:erlang.exit/1` differ only in the class they carry. An UNCAUGHT raise of
+  // either class ends the process's turn, and the class and reason ride back on
+  // that turn's result — which is ALL the host does with them. `runtime.bl`
+  // reads them back and owns every consequence: a process's exit reason, links,
+  // monitors, exit signals, propagation and trap_exit. There is still no host
+  // actor policy here, and no BEAM exit-signal semantics are claimed.
   "raise": (kind, reason, trace) => { throw new BLRaise(kind, reason, trace); },
-  "throw": (reason) => { throw new BLRaise(kw("throw"), reason, emptyTrace()); },
-  "exit": (reason) => { throw new BLRaise(kw("exit"), reason, emptyTrace()); },
+  "throw": (reason) => { throw new BLRaise(kw("throw"), reason, null); },
+  "exit": (reason) => { throw new BLRaise(kw("exit"), reason, null); },
   // `element/2` is emitted for a `__STACKTRACE__` read (raw trace → frame list);
   // `is_map_key/2` and `map_get/2` are the halves of the struct test the
   // compiler builds for a typed catch. All three are BEAM bifs, so they fail

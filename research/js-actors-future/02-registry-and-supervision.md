@@ -1,9 +1,14 @@
 # 02 — Naming, GenServer conventions and supervision
 
-> **Status: analysis only. Nothing here is implemented.**
-> Depends on [`01-process-lifecycle.md`](01-process-lifecycle.md): every
-> mechanism in this document is built on monitors/links and exit reasons.
-> Legend and gates: [`README.md`](README.md).
+> **Current status: local subsets implemented, not OTP parity.**
+> `runtime.bl` now owns a local name table, correlated call protocol and a
+> one-level supervisor actor. `compiler.bl` lowers `proc/defserver` and
+> `proc.super/defsupervisor` via the shared pure native declaration plans.
+> `verify-names.mjs` and `verify-supervision.mjs` pass at default/17/41-step
+> budgets and compare selected BEAM rules. The "prototype today" inventories
+> below are historical design baselines; see [FEATURES.md](FEATURES.md) and
+> [the actor README](../js-actors/README.md) for exact missing clauses, pools,
+> dynamic children, reason shapes and browser sink restriction.
 
 ---
 

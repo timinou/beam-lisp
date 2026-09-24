@@ -1,12 +1,15 @@
 # 03 — Boundaries: ETS, ports and distribution
 
-> **Status: analysis only. Nothing here is implemented unless marked.**
-> Legend and gates: [`README.md`](README.md). Depends on
-> [`01`](01-process-lifecycle.md) (ownership transfer is triggered by death) and
-> [`02`](02-registry-and-supervision.md) (names, restart).
+> **Current status: local `:set` tables implemented; ports/distribution remain research.**
+> BL `runtime.bl` owns table identity, permission modes and owner/heir transfer;
+> opaque host storage provides bounded mutable rows. `verify-tables.mjs`
+> compares 25 selected BEAM rules, not full ETS compatibility. The ETS
+> "prototype today" table below is a historical pre-cutover baseline. Access
+> modes govern trusted BL verbs, **not hostile BL source** (raw leaves and
+> `host/state` remain callable). Consult [FEATURES.md](FEATURES.md) and the
+> [actor README](../js-actors/README.md) for current subset and caveats.
 >
-> Three topics, and each repeats the README's 10-point template internally. §5
-> consolidates the wave order.
+> Three topics repeat the research template; §5 records their original wave order.
 
 ---
 
@@ -30,14 +33,13 @@ This doc covers the three places where the actor world meets something that is
 
 ### State of the worktree at time of writing
 
-The committed exception slice at `dbdead74` passed 104 checks. FEAT-046 has a
-freshly verified typed browser inbox: `host.mjs` queues
-and wakes, `runtime.bl` registers and routes events, and `demo.bl` receives
-source messages in a persistent Worker. Node tests cover early, timed and
-indefinite waits; the browser tool observed three staged replies, a manually
-typed fourth, and Stop. This is **not** BEAM `open_port` or a generalized port
-capability. §3.4 distinguishes the implemented transport from missing identity,
-owner death, close, fetch/WebSocket and backpressure. Do not build a second inbox.
+At this document's first writing, `dbdead74` passed 104 checks and FEAT-046
+provided the browser inbox. The current suite passes 457 checks in Node and a
+Worker; local `:set` table owner/heir behavior, names and supervision now exist.
+The browser inbox remains a narrow validated string transport, **not** BEAM
+`open_port` or a generalized capability. §3.4 still distinguishes it from
+missing per-source identity, close, fetch/WebSocket and backpressure; do not
+build a second inbox.
 
 ---
 

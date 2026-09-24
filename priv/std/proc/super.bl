@@ -2,9 +2,10 @@
 ;
 ; The supervisor is the only bundle that is a PROCESS, not a library: it owns
 ; children, it must never block, it must never crash. Its state is the child
-; set and the restart ledger — both of which OTP keeps for us. What this file
-; adds is the DEFINITION: a tree written as data, and the verbs to look into
-; a running one.
+; set and the restart ledger — OTP keeps both privately, and `children` hands
+; back the shape it exposes. What this file adds is the DEFINITION: a tree
+; written as data and EXPANDED as data (see `supervisor-plan`), and the verbs to
+; look into a running one.
 ;
 ;   (proc.super/defsupervisor billing
 ;     (strategy :one-for-one)
@@ -90,7 +91,336 @@
                             target
                             n))
 
-;; ── the form ───────────────────────────────────────────────────────────
+;; ── the pure plan: the contract a backend consumes ──────────────────────
+;;
+;; The expansion is split in two, exactly as `proc.server` splits a server's.
+;; `supervisor-plan` is PURE: it reads the clause forms and returns a plan —
+;; the strategy, the intensity, the children IN DECLARATION ORDER, and every
+;; reason a declaration is invalid — as DATA. It reads no VM and calls neither
+;; `Supervisor/*` nor `BeamLisp.Supervisor/*`: those names appear only in the
+;; NATIVE ADAPTER below. `defsupervisor` is that adapter — it renders the plan
+;; as this VM's spec map (`BeamLisp.Supervisor/server` / `proc.super/pool-spec`)
+;; and throws the plan's diagnostics before anything reaches the codegen.
+;;
+;; The split exists so a SECOND backend expands the SAME declaration without
+;; re-deriving the DSL. The JS actor compiler hands `supervisor-plan` the source
+;; clause data and renders a plan IT understands; it has no `BeamLisp.Supervisor`
+;; to call, which is why the plan names none.
+;;
+;;     (supervisor-plan
+;;       {:name 'billing
+;;        :clauses '((strategy :one-for-one)
+;;                   (intensity 3 5000)
+;;                   (child :acct account 100)
+;;                   (child :ledger ledger {:restart :transient :shutdown 5000})
+;;                   (child :hands (pool worker 4)))})
+;;     → {:name 'billing
+;;        :strategy :one-for-one
+;;        :intensity [3 5000]              ; nil when undeclared
+;;        :children [<child> …]            ; declaration order
+;;        :unknown []                      ; clause heads no backend claims
+;;        :errors []                       ; invalid declarations, as data
+;;        :valid? true}
+;;
+;; A `<child>` is a SERVER or a POOL, and the pool boundary is explicit:
+;;
+;;     {:id :acct  :kind :server :target 'account :args [100] :options {} :order 0}
+;;     {:id :hands :kind :pool   :target 'worker  :size 4   :options {} :order 1}
+;;
+;; `:args` are the positional init args — this VM's child is a defserver, so the
+;; native adapter uses the FIRST (pass a vector for several); `:options` is the
+;; trailing map (`:restart` `:shutdown` `:type` `:name`) and `:has-options`
+;; records whether one was written, so the native arity is unchanged. `:order` is
+;; the child's declaration index, and it is part of the POLICY: `:rest-for-one`
+;; restarts "the dead child and every child after it", so the order is not a
+;; detail.
+;;
+;; A POOL is ONE child: its workers are not in `:children`, because the sub-tree
+;; restarts and dies as a unit (see `pool-spec`). `:size` is its whole boundary.
+;;
+;; THE TARGET CONTRACT, in full. A backend calls
+;;
+;;     (supervisor-plan {:name <tree-name symbol> :clauses <source clause data>})
+;;
+;; and renders `:children` IN ORDER to its own child specs, mapping `:kind`
+;; (`:server` / `:pool`), `:target`, `:args` and `:options`; `:strategy` and
+;; `:intensity` are the tree's restart policy and `:order` is the restart set.
+;; It checks `:valid?` first — or renders `:unknown` / `:errors` in its own
+;; diagnostic shape — and starts nothing if false. It calls no native method to
+;; do any of this: the plan is data, and the backend's own supervisor form is
+;; what renders it.
+;;
+;; A PLAN IS A DECLARATION, NOT RUNTIME STATE — it carries no restart ledger.
+;; OTP keeps the ledger privately and does not expose per-child restart counts
+;; (see `children`), so a plan has no such field to report; a reportable ledger
+;; is a separate design, not a plan slot. Do not read one into `:children`.
+
+(def strategies
+  "The restart strategies a tree may declare: the OTP set, spelled the way the
+   reader spells keywords. Anything else is a declaration error — never a silent
+   fall-through to `:one-for-one`."
+  #{:one-for-one :rest-for-one :one-for-all})
+
+(def restart-types #{:permanent :transient :temporary})
+(def supervisor-option-keys #{:restart :shutdown :type :name})
+
+(defn- clause-error [kind msg clause]
+  {:kind kind :msg msg :clause clause})
+
+(defn- options-errors
+  "Every reason `opts` is not a valid child option map, in a fixed order so a
+   plan reads the same list twice. Pure."
+  [clause id opts]
+  (vec
+    (concat
+      (map (fn [k]
+             (clause-error :unknown-option
+                           (str "child " (pr-str id) ": unknown option " (pr-str k)
+                                " — the options are :restart :shutdown :type :name")
+                           clause))
+           (remove (fn [k] (contains? supervisor-option-keys k)) (keys opts)))
+      (let [r (:restart opts)]
+        (when (and (some? r) (not (contains? restart-types r)))
+          [(clause-error :bad-restart
+                         (str "child " (pr-str id) ": :restart is :permanent,"
+                              " :transient or :temporary — got " (pr-str r))
+                         clause)]))
+      (let [s (:shutdown opts)]
+        (when (and (some? s) (not (or (= :infinity s) (= :brutal_kill s)
+                                      (and (int? s) (>= s 0)))))
+          [(clause-error :bad-shutdown
+                         (str "child " (pr-str id) ": :shutdown is a millisecond"
+                              " count ≥ 0, :infinity or :brutal_kill — got " (pr-str s))
+                         clause)]))
+      (let [t (:type opts)]
+        (when (and (some? t) (not (contains? #{:worker :supervisor} t)))
+          [(clause-error :bad-type
+                         (str "child " (pr-str id) ": :type is :worker or :supervisor"
+                              " — got " (pr-str t))
+                         clause)])))))
+
+(defn- parse-server-child
+  "A `(child id target arg… [opts])` clause as child DATA. The trailing map,
+   when present, is the options; the positionals before it are the init args."
+  [clause id target more order]
+  (let [lastf (nth more (dec (count more)))
+        has-options (map? lastf)
+        args (if has-options (vec (take (dec (count more)) more)) more)
+        opts (if has-options lastf {})]
+    {:child {:id id :kind :server :target target :args args
+             :options opts :has-options has-options :order order}
+     :errors (options-errors clause id opts)}))
+
+(defn- parse-pool-child
+  "A `(child id (pool target n))` clause as child DATA. `more` must be empty: a
+   pool is one sub-tree, not a defserver with init args."
+  [clause id target more order]
+  (let [size (nth target 2)
+        errs (vec
+               (concat
+                 (when (not= 3 (count target))
+                   [(clause-error :bad-pool
+                                  (str "child " (pr-str id) ": a pool is (pool target n)"
+                                       " — got " (pr-str target))
+                                  clause)])
+                 (when (not (and (int? size) (>= size 1)))
+                   [(clause-error :bad-pool-size
+                                  (str "child " (pr-str id) ": a pool needs a positive"
+                                       " worker count — got " (pr-str size))
+                                  clause)])
+                 (when (not (empty? more))
+                   [(clause-error :pool-options
+                                  (str "child " (pr-str id) ": a pool takes no init arg"
+                                       " or options — its sub-tree is one child")
+                                  clause)])))]
+    {:child {:id id :kind :pool :target (nth target 1) :size size
+             :options {} :has-options false :order order}
+     :errors errs}))
+
+(defn- parse-child
+  "One `(child id target …)` clause as child DATA plus every reason it is
+   invalid. A malformed clause yields NO child: a plan never invents a child it
+   cannot describe."
+  [clause order]
+  (let [parts (vec (rest clause))
+        id (nth parts 0)
+        target (nth parts 1)
+        more (vec (drop 2 parts))]
+    (cond
+      (nil? id)
+      {:errors [(clause-error :child-missing-id
+                              "a child needs an id: (child id target arg…)"
+                              clause)]}
+      (nil? target)
+      {:errors [(clause-error :child-missing-target
+                              (str "child " (pr-str id) " names no target —"
+                                   " (child id target arg…) names the defserver to start")
+                              clause)]}
+      (and (erlang/is_list target) (= 'pool (first target)))
+      (parse-pool-child clause id target more order)
+      :else
+      (parse-server-child clause id target more order))))
+
+(defn supervisor-plan
+  "Expand a supervision tree's clauses into DATA — THE STABLE CONTRACT a backend
+   consumes. This VM's `defsupervisor` macro below and the JS actor compiler both
+   run it, so the whole DSL (strategy validation, the intensity window, unique
+   child ids, the pool boundary, the declaration order) is decided ONCE.
+
+   Input — source DATA, no VM:
+     {:name    <tree-name symbol>
+      :clauses [<clause form> …]}         ; (strategy …) (intensity …) (child …)
+
+   Output — a plan map; every slot is always present:
+     :name       the tree's name
+     :strategy   one of :one-for-one :rest-for-one :one-for-all (default
+                   :one-for-one when undeclared)
+     :intensity  [max-restarts window-ms] | nil
+     :children   [<child> …] IN DECLARATION ORDER (each carries :order)
+     :unknown    [{:head <name> :where <tree>} …] ; clause heads not claimed
+     :errors     [{:kind <kw> :msg <str> :clause <form>} …] ; invalid, as data
+     :valid?     true iff both :unknown and :errors are empty
+
+   A `<child>` is `{:id :kind :target … :order}`; `:kind` is `:server` or
+   `:pool`, and it is the pool boundary — a pool's workers are NOT top-level
+   children. A backend renders `:children` to its own child specs; it never sees
+   a native supervisor name from here."
+  [{:keys [clauses] sname :name}]
+  (let [clause-list (vec clauses)
+        clause-head (fn [c] (when (erlang/is_list c) (first c)))
+        has-head? (fn [h c] (= h (clause-head c)))
+        strategies* (vec (filter (fn [c] (has-head? 'strategy c)) clause-list))
+        intensities (vec (filter (fn [c] (has-head? 'intensity c)) clause-list))
+        child-clauses (vec (filter (fn [c] (has-head? 'child c)) clause-list))
+        known (set ['strategy 'intensity 'child])
+        unknown (vec (keep (fn [c]
+                             (let [h (clause-head c)]
+                               (if (contains? known h)
+                                 nil
+                                 {:head (if (nil? h) (pr-str c) (name h)) :where sname})))
+                           clause-list))
+        duplicate-errors
+        (vec (concat
+               (when (> (count strategies*) 1)
+                 [(clause-error :duplicate-clause
+                                "a tree declares one :strategy clause"
+                                (nth strategies* 1))])
+               (when (> (count intensities) 1)
+                 [(clause-error :duplicate-clause
+                                "a tree declares one :intensity clause"
+                                (nth intensities 1))])))
+        strategy-clause (nth strategies* 0)
+        strategy (if (nil? strategy-clause) :one-for-one (nth strategy-clause 1))
+        strategy-errors
+        (cond
+          (nil? strategy-clause) []
+          (not= 2 (count strategy-clause))
+          [(clause-error :bad-strategy
+                         (str "a strategy clause is (strategy :one-for-one) — got "
+                              (pr-str strategy-clause))
+                         strategy-clause)]
+          (contains? strategies strategy) []
+          :else
+          [(clause-error :bad-strategy
+                         (str "unknown strategy " (pr-str strategy) " — the strategies"
+                              " are :one-for-one, :rest-for-one, :one-for-all")
+                         strategy-clause)])
+        intensity-clause (nth intensities 0)
+        intensity (if (nil? intensity-clause) nil (vec (rest intensity-clause)))
+        intensity-errors
+        (if (nil? intensity-clause)
+          []
+          (let [r (nth intensity 0)
+                w (nth intensity 1)]
+            (cond
+              (not= 2 (count intensity))
+              [(clause-error :bad-intensity
+                             (str "intensity is (intensity max-restarts window-ms) — got "
+                                  (pr-str intensity-clause))
+                             intensity-clause)]
+              (not (and (int? r) (>= r 0)))
+              [(clause-error :bad-intensity
+                             (str "max-restarts is a count ≥ 0 — got " (pr-str r))
+                             intensity-clause)]
+              (not (and (int? w) (> w 0)))
+              [(clause-error :bad-intensity
+                             (str "window-ms is a positive count — got " (pr-str w))
+                             intensity-clause)]
+              :else [])))
+        parsed (vec (map-indexed (fn [i c] (parse-child c i)) child-clauses))
+        children (vec (keep :child parsed))
+        child-errors (vec (mapcat :errors parsed))
+        id-scan (reduce (fn [acc c]
+                          (if (contains? (:seen acc) (:id c))
+                            (assoc acc :dups
+                                   (conj (:dups acc)
+                                         (clause-error :duplicate-child-id
+                                                       (str "child id " (pr-str (:id c))
+                                                            " is declared twice — ids are"
+                                                            " unique within a tree")
+                                                       nil)))
+                            (assoc acc :seen (conj (:seen acc) (:id c)))))
+                        {:seen #{} :dups []}
+                        children)
+        errors (vec (concat duplicate-errors strategy-errors intensity-errors
+                             child-errors (:dups id-scan)))]
+    {:name sname
+     :strategy strategy
+     :intensity intensity
+     :children children
+     :unknown unknown
+     :errors errors
+     :valid? (and (empty? unknown) (empty? errors))}))
+
+;; ── the native adapter ──────────────────────────────────────────────────
+;;
+;; The macro supplies this VM's rendering and nothing else. The plan is
+;; `supervisor-plan`'s, the diagnostics are the plan's, and these functions are
+;; the ONE place a native supervisor name appears. A second backend supplies its
+;; own rendering instead and calls none of them.
+
+(defn native-child-spec
+  "One child of a PLAN as the native child-spec form `start-link` reads:
+   `BeamLisp.Supervisor/server` for a server child, `proc.super/pool-spec` for a
+   pool. Pure — a plan child in, a form out."
+  [c]
+  (if (= :pool (:kind c))
+    `(proc.super/pool-spec ~(:id c) ~(:target c) ~(:size c))
+    (let [arg (nth (:args c) 0)]
+      (if (:has-options c)
+        `(BeamLisp.Supervisor/server ~(:id c) ~(:target c) ~arg ~(:options c))
+        `(BeamLisp.Supervisor/server ~(:id c) ~(:target c) ~arg)))))
+
+(defn native-spec
+  "A PLAN as the spec map `BeamLisp.Supervisor/start_link` dispatches on — the
+   native half of a `defsupervisor`. Pure: a plan in, a FORM out. `:children`
+   is emitted as the form `(list <child> …)`, not a pre-built list of forms, so
+   the compiler CALLS `list` rather than reading a child spec as the head."
+  [p]
+  {:__supervisor__ true
+   :strategy (:strategy p)
+   :intensity (:intensity p)
+   :children (apply list 'list (map native-child-spec (:children p)))})
+
+(defn unknown-supervisor-clause-error
+  "The diagnostic for a clause head a tree does not know: the head, and the whole
+   accepted set. Built, not thrown, so a caller decides and the message is
+   testable without expanding a broken form."
+  [sname unknown]
+  (ex-info (str "defsupervisor " sname ": unknown clause `" (:head unknown)
+                "` — accepted here: strategy intensity child. A tree is declared"
+                " with those three clauses, and a clause a backend cannot describe"
+                " is reported instead of silently ignored.")
+           {:clause (:head unknown) :tree sname}))
+
+(defn invalid-supervisor-error
+  "The diagnostic for a malformed tree: one plan error, with the tree's name.
+   Built, not thrown, so a test reads the same shape the adapter throws."
+  [sname err]
+  (ex-info (str "defsupervisor " sname ": " (:msg err)
+                " — the tree is a DECLARATION, so an invalid one is reported"
+                " before any child reaches the native supervisor.")
+           {:kind (:kind err) :clause (:clause err) :tree sname}))
 
 (defmacro defsupervisor
   "Define a supervision tree as data. The name binds a spec map; start it with
@@ -101,34 +431,16 @@
      (intensity 3 5000)                 ; max restarts / window ms
      (child :acct account 100)          ; id, defserver name, init args…
      (child :ledger ledger {:restart :transient :shutdown 5000})
-     (child :workers (pool worker 4)))"
+     (child :workers (pool worker 4)))
+
+   The clauses are expanded by `supervisor-plan` into DATA, then rendered to
+   this VM's supervisor specs. An invalid declaration — an unknown strategy or
+   clause, a non-positive intensity, a duplicate child id, a bad option — is
+   reported by name instead of reaching the codegen."
   [name & clauses]
-  (let [of (fn [hd] (first (filter (fn [c] (= hd (first c))) clauses)))
-        strategy-clause (of (quote strategy))
-        strategy (if (nil? strategy-clause) :one-for-one (second strategy-clause))
-        intensity-clause (of (quote intensity))
-        intensity (if (nil? intensity-clause) nil (vec (rest intensity-clause)))
-        child-form (fn [c]
-                     (let [id (second c)
-                           target (nth c 2)
-                           more (drop 3 c)]
-                       (if (and (erlang/is_list target)
-                                (= (quote pool) (first target)))
-                         `(proc.super/pool-spec ~id ~(second target) ~(nth target 2))
-                         (let [n-more (count more)
-                               lastf (if (> n-more 0) (nth more (dec n-more)) nil)
-                               has-opts (and (not (nil? lastf)) (map? lastf))
-                               init-args (if has-opts (take (dec n-more) more) more)
-                               arg (if (empty? init-args) nil (first init-args))]
-                           ;; The child IS the gen_server (an MFA child spec),
-                           ;; never a wrapper task that would exit :normal and
-                           ;; restart forever. One init arg; for several, pass
-                           ;; a vector.
-                           (if has-opts
-                             `(BeamLisp.Supervisor/server ~id ~target ~arg ~lastf)
-                             `(BeamLisp.Supervisor/server ~id ~target ~arg))))))]
-    `(def ~name
-       {:__supervisor__ true
-        :strategy ~strategy
-        :intensity ~intensity
-        :children (list ~@(map child-form (filter (fn [c] (= (quote child) (first c))) clauses)))})))
+  (let [p (supervisor-plan {:name name :clauses (vec clauses)})]
+    (when (seq (:unknown p))
+      (throw (unknown-supervisor-clause-error name (first (:unknown p)))))
+    (when (seq (:errors p))
+      (throw (invalid-supervisor-error name (first (:errors p)))))
+    `(def ~name ~(native-spec p))))

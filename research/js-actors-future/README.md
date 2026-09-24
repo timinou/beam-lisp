@@ -1,23 +1,19 @@
 # JS actor target — OTP behaviour: research backlog and roadmap
 
-This folder records the **OTP behaviour** gap for the BL-written JavaScript actor
-runtime in `research/js-actors/`, organised so each area can later get its own
-deep architecture design. **Start with [FEATURES.md](FEATURES.md)** for the
-full FEAT/FUP list, statuses, dependencies, and links to executable briefs.
+This folder records the gap between the BL-written JavaScript actor target and
+BEAM/OTP, with research sheets written before the local lifecycle, server,
+supervisor and table slices landed. **Start with [FEATURES.md](FEATURES.md)**
+for current FEAT/FUP status and [the executable README](../js-actors/README.md)
+for behavior actually verified now. Sections titled “prototype today” in the
+older research sheets are **dated baselines**, not current-state inventories.
 
-It exists because of one measured sentence in `research/js-actors/README.md`:
-
-> **No links, monitors, registered names, exit signals, supervision, ETS, ports,
-> NIFs or distribution.** Actor errors currently fail the batch run.
-
-and one request: *record OTP behaviour in a new folder, organised so we can come
-back later with a deeper architecture design for each one.*
-
-**This folder is analysis, not implementation.** Nothing here is built. Nothing
-here claims OTP equivalence. Each document separates four things that are easy to
-confuse: what the **BEAM/OTP contract** actually is, what the **prototype
-supports today**, what is **missing**, and what the **BL/BEAM side of this repo
-already has** that the target can reuse or must diverge from.
+The original gap included no links, monitors, registered names, exit signals,
+supervision or ETS. Local BL implementations of subsets now exist, with 457
+acceptance checks at three scheduler budgets and a visible browser supervisor
+recovery demo. Ports, NIFs, distribution, full ETS/OTP contracts and exact
+numeric parity remain absent. The sheets continue to separate native OTP
+semantics, target subsets and deferred decisions; they do **not** claim OTP
+equivalence.
 
 ---
 
@@ -53,16 +49,25 @@ design agent can be handed one section:
 
 ### State of the worktree (read before trusting §3 of any doc)
 
-The committed exception slice at `dbdead74` passed 104 BL checks in Node and a
-browser Worker. FEAT-046 has a freshly tested BL sink,
-FIFO input pump, persistent host event wait, `demo.bl` and `demo.html`. The Node
-verifier passes 104 checks at 200/17/41-step actor budgets plus the early/timed/
-indefinite input demo. In the browser tool, the BL actor replied to three staged
-events, a manually typed fourth, then exited on Stop; the original browser Worker
-suite still passed 104 checks. This observation does not make FEAT-046 a general
-port interface or OTP layer. Consult `research/js-actors/README.md` and `03` §3.4
-for current scope; no second inbox is needed. This status records the verified
-feature scope, not a promise of generalized port semantics.
+The previous `dbdead74` exception baseline had 104 checks. The current target
+passes **457 BL checks** at default/17/41-step budgets in Node; the browser
+Worker passed 457 with timer ticks. FEAT-048/049/050/051/052 have verified
+local slices, including a BL-written supervisor and `:set` table owner/heir
+policy. `super-demo.html` visibly showed a child restart twice, a message
+between them and graceful Stop. `proc.server/clause-plan` and
+`proc.super/supervisor-plan` now share declarations with native adapters.
+This is not BEAM parity: consult [FEATURES.md](FEATURES.md) and the actor README
+for precise unsupported operations, trusted-code boundary and remaining gaps.
+
+### Numeric research alongside the actor roadmap
+
+[The exact numeric spike](04-exact-numeric-spike.md) and its reproducible
+`numeric-spike.mjs` compare 17 native BEAM observations with a tagged BigInt /
+scaled-decimal JS candidate. It identifies a necessary host BigInt primitive;
+[FEAT-056](../../!tasks/features/FEAT-056-implement-exact-tagged-numeric-runtime-f.org)
+is the unimplemented exact-numeric cutover, separate from the conditional
+safe-Number proof in FEAT-055. Do not infer full numeric compatibility from
+the spike.
 
 ### The one design rule
 
@@ -70,10 +75,12 @@ feature scope, not a promise of generalized port semantics.
 > scheduler policy belong in BL.*
 > — `research/js-actors/README.md`, last line
 
-This extends to every layer in this folder. The host may only supply **atoms the
-BEAM gives for free and JS cannot synthesise** — a monotonic clock, a task queue,
-`park`/`resume`. Links, monitors, names, supervisors, tables and the event inbox
-are **policy over BL state** and belong in `runtime.bl` (or a BL module compiled
+This extends to every layer in this folder. The host supplies only
+**mechanisms BL cannot synthesize cheaply** — a monotonic clock, task queue,
+`park`/`resume`, runtime identity allocation and opaque bounded mutable table
+storage. Links, monitors, names, supervisor restarts, table
+owners/permissions and the event inbox recipient are
+**policy over BL state** and belong in `runtime.bl` (or a BL module compiled
 next to it). A decision to push any of them into `host.mjs` is a decision to
 abandon the target's central claim.
 
@@ -84,26 +91,27 @@ abandon the target's central claim.
 These hold across every workstream. They are listed once here and referenced by
 number.
 
-- **C1 — Death is one atomic scheduling transaction.** Today a process is
-  removed from `:procs` inside `rt-run-pid` (`runtime.bl::rt-run-pid`). Any OTP
-  layer must extend that moment to also: deliver every link exit and every
-  monitor `:DOWN`, wake the affected processes, and do it under a single
-  critical section so no `send` can observe a half-dead process. The existing
-  `rt-proc-wait!` / `rt-proc-resume!` pair and the `host/critical-enter` /
-  `host/critical-leave` discipline are the model, not an analogy.
+- **C1 — Death is one atomic scheduling transaction.** `runtime.bl::rt-terminate!`
+  now removes a local actor, retracts names/sink/timers, settles owned tables,
+  sends each monitor `:down`, and propagates local link exits under one critical
+  section. Preserve that chokepoint for new capabilities; no `send` should
+  observe a half-dead process. `rt-proc-wait!` / `rt-proc-resume!` use the same
+  `host/critical-enter` / `host/critical-leave` discipline.
 - **C2 — Signals are ordered with messages between a pair.** BEAM guarantees
   that if A sends B a message then A dies, B sees the message before the exit
   signal (and vice versa). Any emulated signal must be appended to the mailbox
   through the same critical section as `rt-send`, never a separate channel.
-- **C3 — Protocol shapes are target-independent vocabulary.** The repo's BL
-  bundles already speak `[:DOWN ref :process pid reason]` (`proc/server.bl`,
-  `proc/reg.bl`, `proc/bus.bl`, `proc/fence.bl`). The JS target should adopt the
-  same shapes so that a program's *protocol* is portable even where the runtime
-  is not. New message kinds (`[:EXIT pid reason]`, `[:ETS-TRANSFER …]`) must be
-  chosen once, in BL, and shared.
-- **C4 — A name is a value where a pid goes.** `docs/the-five-bundles.md` §0:
-  resolution happens once, inside `start`/`call`/`cast`/`stop`/`monitor`. The JS
-  target must not grow per-form name lookup.
+- **C3 — Protocol shape deviations are explicit.** Native BL bundles use
+  `[:DOWN ...]`/`[:EXIT ...]`, while this target emits `[:down ...]`/`[:exit ...]`
+  and `[:ets-transfer ...]` as BL vectors. The shared `proc.server/clause-plan`
+  declaration is lowered at ONE target seam that maps native `:DOWN` patterns
+  to target `:down`. These are not BEAM tuples; expand a portable protocol only
+  with explicit data-shape decisions and differential tests.
+- **C4 — A name is a value where a pid goes.** `runtime.bl::rt-resolve` now
+  handles local pid/name resolution for send/call/cast/stop. Native
+  `docs/the-five-bundles.md` §0 also allows a name for `monitor`; this target's
+  current `rt-monitor` still takes a pid, so name-as-value is a documented
+  subset rather than a universal API claim.
 - **C5 — Verification is over the source graph, not the target.** `system/model`
   and `system/verify` read the reader's tree; they do not run the program. A
   future architecture can therefore verify a BL program once and emit it to
@@ -136,10 +144,11 @@ then consolidates the wave order in its §5.)
 
 ## Wave order and dependencies
 
-The substrate — selective receive, mailbox retention, timeout policy, the FIFO
-scheduler, atomic park — is **already built and verified** (`runtime.bl`; 104
-checks at three actor budgets, Node and a browser Worker). Everything below is
-work *on top of* that substrate, not a prerequisite of it.
+The historical DAG below guided the cutover. W0/W1/W2/W3 and the local ETS
+part of W4 now have tested target subsets; the actor suite has **457 checks**
+under default/17/41-step budgets. The boxes describe dependency order, **not**
+a claim that complete OTP contracts landed. Ports and distribution remain
+research; consult [FEATURES.md](FEATURES.md) for current status.
 
 ```
 W0  shared vocabulary + trace harness        (C2, C3; needs no OTP layer)
@@ -169,7 +178,9 @@ W1  lifecycle: exit reasons, exit signals, links, monitors, trap_exit
 | W4 port protocol | W0, W1 | owner death, per-port identity, close/backpressure/capabilities remain future design — see `03` §3.3 |
 | W4 distribution | W1–W3 | a remote pid, a remote monitor and a remote restart all need the local versions first |
 
-**W1 is the critical path for OTP-style lifecycle.** The narrow W0 inbox is already verified independently; ETS owner transfer, port owner death and remote monitoring cannot be certified before W1.
+**W1's local lifecycle is now built** in BL. The narrow W0 inbox and local ETS
+owner/heir transfer are verified; port owner death and remote monitoring remain
+unimplemented and cannot inherit those local proofs by analogy.
 
 ---
 
@@ -182,8 +193,9 @@ adding a parallel one (`research/js-actors/test.bl`, `verify.mjs`,
 ### G-unit — a BL acceptance check
 
 A check in `test.bl` with an exact observable: a mailbox contents, an exit
-reason string, a `:DOWN` payload, a restart count. This is what the current 104
-checks are. *Proposed additions per doc.*
+reason string, a `:DOWN` payload, a restart count. The current suite has 457
+checks, including lifecycle, names, table and supervisor subsets. Remaining
+native behaviors in each doc still need their own checks.
 
 ### G-adversarial — the same check under hostile scheduling
 
@@ -216,7 +228,9 @@ This is what makes "the race is not equivalent" (README: "Exact timeout/message
 race equivalence is not established") an explicit, bounded gap instead of an
 unstated one.
 
-**No workstream may claim ✅ on a contract it has not passed at G-diff.**
+**A passed selected-rule differential proves only those rules.** Full-contract
+✅ requires a much broader same-source trace corpus than this prototype has;
+[FEATURES.md](FEATURES.md) labels the shipped slices as local subsets.
 
 ---
 

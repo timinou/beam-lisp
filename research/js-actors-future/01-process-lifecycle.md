@@ -1,13 +1,16 @@
 # 01 — Process lifecycle: identity, exit reasons, links, monitors, `trap_exit`
 
-> **Status: analysis only. Nothing here is implemented.**
-> Read [`README.md`](README.md) first for the legend (`✅ ◐ ✗ ⚙ ○`), the
-> cross-cutting invariants (C1–C7) and the gate classes (G-unit / G-adversarial /
-> G-diff).
+> **Current status: a local target subset is implemented.**
+> `research/js-actors/runtime.bl::rt-terminate!` now owns atomic typed-pid/ref
+> death, links/monitors, trap_exit and local signals. `verify-lifecycle.mjs`
+> tests adverse budgets, boundary invariants and 11 selected BEAM exit rules.
+> The "prototype today" and missing-feature inventories below are historical
+> pre-implementation research; use [FEATURES.md](FEATURES.md) and the
+> [actor README](../js-actors/README.md) for current limits. No full OTP parity.
 
-This is the **critical-path workstream**: names, supervision, ETS ownership,
-ports and distribution all reduce to "one process learned that another process
-died." Nothing in `02` or `03` can be verified before this lands.
+This was the critical-path workstream: names, supervision and local table
+ownership now build on that BL death transition. Ports and distribution still
+need their own contracts and tests.
 
 ---
 

@@ -222,4 +222,54 @@ defmodule BeamLisp.Wave22OTPTest do
              """) == 3
     end
   end
+
+  describe "declarative supervision trees" do
+    test "defsupervisor still builds and heals a tree" do
+      eval("w22super", """
+      (ns w22super (:require [proc.super :as super]))
+      (defserver w22worker
+        (init [id] (ok {:id id}))
+        (handle-call :id [_from s] (reply (:id s) s)))
+      (proc.super/defsupervisor shop
+        (strategy :one-for-one)
+        (intensity 3 5000)
+        (child :boss w22worker :boss)
+        (child :hands (pool w22worker 2)))
+      """)
+
+      eval("w22super", "(def tree (start-link shop))")
+      sup = eval("w22super", "tree")
+      assert is_pid(sup)
+
+      boss = child_pid(sup, :boss)
+      assert is_pid(boss)
+      assert is_pid(child_pid(sup, :hands))
+
+      assert eval("w22super", "(call (proc.super/child-of tree :boss) :id)") == :boss
+
+      Process.exit(boss, :kill)
+      healed = until(fn -> with p when is_pid(p) <- child_pid(sup, :boss), do: p != boss && p end)
+      assert is_pid(healed)
+
+      Supervisor.stop(sup)
+    end
+
+    test "an invalid declaration is reported, not built" do
+      error =
+        try do
+          eval("w22badsup", """
+          (ns w22badsup (:require [proc.super :as super]))
+          (proc.super/defsupervisor bad
+            (strategy :everyone-for-one)
+            (child :a w22worker 0))
+          """)
+          nil
+        rescue
+          e -> e
+        end
+
+      refute is_nil(error)
+      assert Exception.message(error) =~ "everyone-for-one"
+    end
+  end
 end

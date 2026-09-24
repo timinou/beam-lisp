@@ -57,6 +57,21 @@ if (mode) {
   // The stale-sink case intentionally takes the scheduler's error branch.
   if (mode === 'stale' || mode === 'crash') process.exitCode = 0;
 } else {
+  // A fractional monotonic deadline must never be truncated by setTimeout:
+  // that would wake the BL scheduler before expiry and make it sleep twice.
+  const originalTimer = globalThis.setTimeout;
+  let requestedDelay;
+  try {
+    globalThis.setTimeout = (fn, ms) => {
+      requestedDelay = ms;
+      return originalTimer(fn, 0);
+    };
+    await H.waitForInput(H.newRuntime(), 70.25, false);
+    assert.equal(requestedDelay, 71);
+  } finally {
+    globalThis.setTimeout = originalTimer;
+  }
+  console.log('PASS fractional host deadline rounds upward');
   const script = fileURLToPath(import.meta.url);
   const run = (name) => {
     const result = spawnSync(process.execPath, [script, name], {
