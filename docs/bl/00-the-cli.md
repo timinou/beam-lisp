@@ -823,13 +823,31 @@ Exit `0` when the required probes pass, `1` otherwise.
 `--json` is one object: `ok`, and `probes` — each `name`, `ok`, `detail`,
 `required`.
 
-#### `bl version`
+#### `bl version [--short] [--json]`
 
-Print the version this build reports.
+The version, and where this build came from: commit (`+dirty` when its inputs
+had uncommitted changes), branch, worktree, build time, build id. `--short` is
+the version alone; `--json` is the whole `BUILD_INFO.bl` record.
 
 ```sh
 $ bl version
-beam-lisp 2026.0.0
+beam-lisp 0.1.0 · 1cf72d26+dirty (main) · ~/code/undefine/beam-lisp · built 2026-09-24T08:58:37Z · build 6da863d2
+$ bl version --short
+beam-lisp 0.1.0
+```
+
+#### `bl which` · `bl self-update [NAME]` · `bl self-install` · `bl hooks install` · `bl self-gc`
+
+The PATH launcher's own verbs: which build runs here and why, getting builds
+(`stable`, `latest`, `v2026.4`, `commit:SHA`, `bleeding-edge[:DIR]`),
+installing the launcher, automatic builds and the `latest` push guard, and
+the store's cleanup. See [native-bundler §15](../native-bundler.md).
+
+A project picks its build in `env.bl`:
+
+```clojure
+{:name "my-app"
+ :bl "latest"}          ; or "stable", "v2026.4", "commit:1cf72d26"
 ```
 
 #### `bl help [COMMAND]`
@@ -880,6 +898,12 @@ Flags may appear anywhere before `--`.
 | `BL_CACHE_MAX_MB` | the store cap in MB, default `512` |
 | `BLANALYSIS_DIR` | one explicit store directory for a single run; `BL_CACHE_DIR` wins over it |
 | `BL_VERSION` | stamps a release build; `bl version` reports it |
+| `BL_USE` | the build to run here, overriding every other rule (`stable`, `latest`, `commit:SHA`, …) |
+| `BL_BUILD=never` | a missing build fails instead of being fetched or built |
+| `BL_AUTOBUILD=off` | git hooks queue no builds |
+| `BL_ALLOW_UNPUSHED_LATEST=1` | the `latest` pre-push guard lets the push through |
+| `BL_DROP_KEEP_DAYS` / `BL_DROP_GRACE_HOURS` | how long an unreferenced build is kept (14 days since last use / 24 h) |
+| `BL_BUILD_TIMEOUT_MIN` | a build step is stopped after this many minutes (45) |
 
 ## Where a namespace is found
 

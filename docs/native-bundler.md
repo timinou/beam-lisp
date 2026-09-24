@@ -122,21 +122,15 @@ magic check) and fails loudly on a host-only payload — the classic
 
 1. **Validate**: read trailer, hash payload, compare.
 2. **Install dir** (first-run extraction target):
-   * Linux: `$XDG_DATA_HOME/bl` else `~/.local/share/bl`
-   * macOS: `~/Library/Application Support/bl`
-   * Windows: `%LOCALAPPDATA%\bl`
+   * Linux: `$XDG_DATA_HOME/drop` else `~/.local/share/drop`
+   * macOS: `~/Library/Application Support/drop`
+   * Windows: `%LOCALAPPDATA%\drop`
 3. **Versioned payload dir**: `<install>/<sha8>/` — extraction is atomic
-   (`.tmp` + rename). GC is by **age**, not exclusivity: after a successful
-   extract, version dirs older than `BL_DROP_KEEP_DAYS` (default 30) are
-   removed, and the dir in use is never removed.
-
-   It used to be Burrito-parity "keep only this one". That is unsafe: a VM
-   execs helper binaries (`inet_gethost`, `erl_child_setup`) out of its own
-   erts dir, lazily, and a `bl daemon` runs from its tree for its whole life —
-   so a second `bl` with a different payload (a dev build beside a release)
-   deleted the first one's tree from under it, and the running VM died with
-   `Can not execute …/erts-*/bin/inet_gethost : enoent` plus an erl_crash.dump.
-   Re-running re-extracts, so it read as transient.
+   (`.tmp` + rename). A payload dir is removed only when nothing holds it
+   (see §15, *Cleaning up*): a VM execs helper binaries (`inet_gethost`,
+   `erl_child_setup`) out of its own erts dir, lazily, and a daemon runs from
+   its tree for its whole life, so deleting a tree some process runs from kills
+   it with `Can not execute …/erts-*/bin/inet_gethost : enoent`.
 4. **Exec**:
    * unix: `execve("<install>/<sha8>/bin/bl", ["bl", "eval", ENTRY, "--", …argv])`
      where `ENTRY = BeamLisp.Ns.Bl.Cli.main(System.argv())`
@@ -190,8 +184,7 @@ drops (cross-target runs green once NIFs are built for the target libc — §5).
 5. `./bl run examples/hello.bl` → expected output, exit 0.
 6. Second run hits the extracted cache (no re-extraction; mtimes prove it).
 7. GC: two payloads side by side — running the second leaves the first's tree
-   intact (`launcher.rs::gc_tests`); a version dir past `BL_DROP_KEEP_DAYS` is
-   swept on the next successful run.
+   intact; a tree nothing holds is swept (`launcher.rs::gc_tests`, §15).
 8. (cross-target, CI-gated) same for darwin-universal + windows packs; z3 smoke
    `bl eval '(z3/…)'`; explorer smoke `datom.frame/q-df`.
 
@@ -243,7 +236,7 @@ Acceptance results (full tier: lang + datom crates + z3 + explorer):
 | `bl-bundle run examples/hello.bl` | full output + `:ok`, exit 0 (×3 stable) |
 | corrupted payload byte | clean sha error, exit 126 |
 | cache-hit second run | 566 ms (vs multi-second first run) |
-| GC of stale version dir | by age, default 30 d (`BL_DROP_KEEP_DAYS`); a concurrent version's tree is left alone |
+| GC of stale version dir | by reference (§15); a concurrent version's tree is left alone |
 | reproducibility | two packs byte-identical |
 | bundle size | launcher 0.7 MB + payload 97.1 MB (unstripped beams, §3) ≈ 98 MB |
 
@@ -268,22 +261,27 @@ forwards the command to it over a Unix socket. A served command returns in
 its whole archive every time) and cannot load NIFs at all — the daemon+drop
 pair is strictly better, so the escript is deprecated.
 
-### One daemon per tree
+### One daemon per tree and build
 
-A daemon is keyed by the real path of its tree root (a checkout, or an extracted
-drop payload). The key is the first 16 hex of `sha256(realpath(root))`. Its
-endpoints live under `$XDG_RUNTIME_DIR/beam_lisp/` (a `0700` dir): `<id>.sock`
-(the `AF_UNIX` stream socket, `0600`), `<id>.token` (a 256-bit secret), plus a
-pidfile and meta. The socket's existence is discovery; an **authenticated
-hello** (constant-time token compare + matching tree fingerprint) is authority.
+A daemon runs ONE build's code for ONE tree, so it is named by both. The tree
+key is the first 16 hex of `sha256(realpath(root))`; the build is `BL_BUILD_ID`
+— the payload's sha8, which the launcher sets, or `src` for a checkout run
+through `bin/bl`. Its endpoints live under `$XDG_RUNTIME_DIR/beam_lisp/` (a
+`0700` dir): `<tree>-<build>.sock` (the `AF_UNIX` stream socket, `0600`),
+`<tree>-<build>.token` (a 256-bit secret), and `<tree>-<build>.meta` (pid, root,
+build, start time). Two builds used in one tree are two daemons, side by side;
+`daemon stop` removes all three files. The socket's existence is discovery; an
+**authenticated hello** (constant-time token compare + matching tree
+fingerprint + the build the client expects) is authority.
 
 ### The wire
 
 Frames are length-prefixed (`{packet, 4}`) Erlang terms (ETF). The daemon
 decodes with `binary_to_term(bin, [:safe])` and then a total, allowlisted schema
 check — a malformed or oversized frame is refused, never executed. A client
-`hello` gets `ready` or a `reject` (`unauthorized` · `wrong_tree` ·
-`restart_required` · `shutting_down`). Then one `request` (`argv`, `cwd`,
+`hello` (`tree`, `token`, `build`) gets `ready` or a `reject` (`unauthorized` ·
+`wrong_tree` · `restart_required` when it names another build ·
+`shutting_down`). Then one `request` (`argv`, `cwd`,
 `env_paths`) streams back `stdout`/`stderr`/`stdin`/`exit` frames.
 
 ### A VM per project, a process per request
@@ -310,7 +308,7 @@ the one thing a warm VM must not do.
 
 ```
 bl daemon start     # become the daemon (blocks; the launcher runs it detached)
-bl daemon status    # a live daemon's pid, tree, compiler key, build id, uptime, queue depth
+bl daemon status    # a live daemon's pid, tree, build, compiler key, uptime
 bl daemon stop      # drain and exit; the socket is removed
 
 BL_DAEMON=off       # every command cold-boots, no daemon
@@ -385,4 +383,128 @@ silently lost its native tier fails in CI, not on a user's machine.
 **Deliberately not in CI:** code signing / notarization (§8 — org policy, not
 bundler policy), and single-host cross-target packs (`--target`) until
 per-target NIF staging lands (§5).
+
+The same workflow runs on every push to `main`: the drops are stamped
+`0.1.0-latest.<sha8>`, and the `publish-latest` job moves the tag `latest` to
+that commit and replaces the assets of the `latest` pre-release. That release
+is what `bl self-update latest` fetches on a machine with no beam-lisp checkout.
+
+## 15. One `bl` on PATH, many builds behind it
+
+`~/.local/bin/bl` is the launcher with NO payload. On every call it decides
+which build runs here, then runs it exactly as that drop would (daemon
+fast-path included). The decision is `bl which`:
+
+```
+$ bl which
+launcher  ~/.local/bin/bl
+store     ~/.local/share/drop
+  1 BL_USE unset
+  2 beam-lisp source tree ~/code/undefine/beam-lisp--names
+    its last build 868977b2 matches this state
+runs      build 868977b2  (commit d1d1cd18… · worktree … · built-at …)
+```
+
+### Which build runs (first match wins)
+
+1. `BL_USE=<name>` in the environment.
+2. Inside a beam-lisp **source tree** (`priv/boot/core.bl` + `bin/bl` + `.git`):
+   that tree's last build, if it was built from exactly this state; otherwise
+   the tree runs **from source** (`<tree>/bin/bl`), which is always current.
+3. The nearest `env.bl` declares `:bl "<name>"`. A build that is not in the
+   store yet is fetched or built right then (`BL_BUILD=never` refuses instead).
+4. `:default` in `~/.config/bl/config.bl`, else `stable`.
+
+A drop run by its path (`./bl`, a tool's pinned runtime) is not resolved: an
+explicit path is an explicit choice.
+
+### Build names
+
+| name | the build |
+|---|---|
+| `stable` | the newest tagged release (`vX.Y`), downloaded and checksum-verified |
+| `latest` | `main`: built locally from `:source` when the machine has it, else CI's rolling `latest` release |
+| `bleeding-edge` | the newest build of the `:source` checkout |
+| `bleeding-edge:DIR` / `bleeding-edge:BRANCH` | the newest build of one worktree |
+| `v2026.4` | that release |
+| `commit:1cf72d26` | that commit, built clean in a detached worktree under `~/.cache/bl/build-trees/` |
+| `build:7154e76a` | one stored build, by id |
+| `path:/abs/drop` | a drop file, as-is |
+
+### Knowing a tree's build without asking git
+
+The launcher never runs git: spawning any process costs more than the whole
+decision. A worktree's build is recognised by its **stamp** — a hash over the
+path, size and mtime of every build input (`lib priv native tooling/drop/{src,
+Cargo.toml,Cargo.lock} bin env.bl bl.lock`, build outputs excluded) plus the
+commit `HEAD` names, read from the git files directly. A build records the
+stamp it was built from; any edit to an input changes it, and the tree runs
+from source until it is built again. Editing a note or a doc changes nothing.
+The same input list decides whether a build is `+dirty` (`provenance/INPUTS`;
+a test keeps the two equal).
+
+### The store
+
+```
+~/.local/share/drop/<sha8>/                 an extracted payload
+~/.local/share/drop/store/channels/stable   pointer files: "build <sha8>" + where it came from
+~/.local/share/drop/store/channels/latest
+~/.local/share/drop/store/tags/<vX.Y>
+~/.local/share/drop/store/bleeding-edge/<tree-id>
+~/.local/share/drop/store/sources/<commit>[+<diff12>]
+~/.local/share/drop/store/logs/<tree-id>.log      the last build of each tree
+```
+
+Every write is temp + rename. At most one build runs on the machine at a time
+(`store/locks/build`); each build step is stopped after `BL_BUILD_TIMEOUT_MIN`
+(45).
+
+### Getting builds, and keeping them current
+
+```
+bl self-install [--source DIR]   put the launcher at ~/.local/bin/bl; record where beam-lisp lives
+bl self-update [NAME]            fetch or build NAME (default: stable, then latest)
+bl hooks install [DIR]           automatic builds / the latest guard, for the repo at DIR
+bl self-gc [--dry-run]           what the store holds, and why each build stays
+```
+
+`bl hooks install` in a beam-lisp checkout adds `post-commit`, `post-merge`,
+`post-checkout` and `post-rewrite` to the hooks every worktree shares. Each
+queues the worktree that fired and starts one detached builder, which builds
+queued trees one at a time; a build of the `:source` checkout on `main` also
+moves `latest`. Uncommitted work never waits for a build: it runs from source.
+`BL_AUTOBUILD=off` stops the builds.
+
+In a project whose `env.bl` says `:bl "latest"`, `bl hooks install` adds a
+`pre-push` guard. When the local beam-lisp `main` has commits `origin/main` does
+not, the push is refused: the project may depend on them, and every other
+machine's `latest` (and CI's) lacks them. Push beam-lisp first, or pin
+`:bl "commit:<sha>"`. `BL_ALLOW_UNPUSHED_LATEST=1` pushes anyway.
+
+Hooks already in the repository keep running: each is renamed `<hook>.pre-bl`
+and called first. `bl hooks remove` puts them back.
+
+### Cleaning up
+
+A payload dir stays while anything holds it: it is the build being run, a
+pointer names it (a channel, a tag, or a worktree that still exists), a daemon
+serves it, a process runs from it, or it was used in the last
+`BL_DROP_KEEP_DAYS` (14) days. Anything else is removed after
+`BL_DROP_GRACE_HOURS` (24). The launcher sweeps after each first extraction;
+`bl self-gc --dry-run` shows every build and the reason it stays.
+
+### Where a build came from
+
+Every drop carries `BUILD_INFO.bl` at the root of its payload: repository,
+worktree, branch, commit, whether its inputs were dirty (and a hash of the
+diff), when, where, and with which compiler.
+
+```
+$ bl version
+beam-lisp 0.1.0 · 1cf72d26+dirty (main) · ~/code/undefine/beam-lisp · built 2026-09-24T08:58:37Z · build 6da863d2
+$ bl version --short
+beam-lisp 0.1.0
+```
+
+`bl version --json` prints the whole record.
 

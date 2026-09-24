@@ -48,6 +48,25 @@ pub fn parse_target(s: &str) -> Option<(u8, u8)> {
     Some((o, a))
 }
 
+/// (os tag, arch tag) → "linux/x86_64" etc., the inverse of `parse_target`.
+/// An unknown tag is shown as its number, never guessed.
+#[allow(dead_code)]
+pub fn target_name(os: u8, arch: u8) -> String {
+    let o = match os {
+        OS_LINUX => "linux".to_string(),
+        OS_DARWIN => "macos".to_string(),
+        OS_WINDOWS => "windows".to_string(),
+        n => format!("os{n}"),
+    };
+    let a = match arch {
+        ARCH_X86_64 => "x86_64".to_string(),
+        ARCH_AARCH64 => "aarch64".to_string(),
+        ARCH_UNIVERSAL => "universal".to_string(),
+        n => format!("arch{n}"),
+    };
+    format!("{o}/{a}")
+}
+
 pub fn parse_trailer(data: &[u8]) -> Option<Trailer> {
     if data.len() < TRAILER_LEN {
         return None;

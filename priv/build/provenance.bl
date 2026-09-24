@@ -1,0 +1,205 @@
+; build/provenance.bl — where a build came from, as data.
+;
+; Every drop carries `BUILD_INFO.bl` at the root of its payload: one map that
+; says which repository, worktree, branch and commit it was built from, whether
+; the tree had uncommitted changes (and a hash of them), when, on which host,
+; and with which compiler. `bl version` and `bl which` read it; `self-build`
+; writes it.
+;
+;   (provenance/collect root)     → the map for a source tree (runs git)
+;   (provenance/source-key info)  → "1cf72d26…" | "1cf72d26…+<diff12>"
+;   (provenance/write! dir info)  → writes <dir>/BUILD_INFO.bl
+;   (provenance/read dir)         → the map, or nil
+;   (provenance/running)          → the running build's map, or nil
+;   (provenance/summary info)     → the one line `bl version` prints
+;
+; The file is DATA: read with the data reader, never evaluated.
+
+(ns provenance)
+
+(def FILE "BUILD_INFO.bl")
+
+(def INPUTS
+  "The paths a build is made FROM. Only a change under one of them makes a tree
+   'dirty' for a build: an edited note or doc builds the same drop, and keying
+   on it would rebuild ~6 minutes of identical output. The drop launcher walks
+   the same list to notice a change without running git
+   (tooling/drop/src/store.rs `BUILD_INPUTS`; a Rust test holds the two equal)."
+  ["lib" "priv" "native" "tooling/drop/src" "tooling/drop/Cargo.toml" "tooling/drop/Cargo.lock"
+   "bin" "env.bl" "bl.lock"])
+
+;; ── git, as facts ───────────────────────────────────────────────────────────
+
+(defn- git
+  "`git ARGS` in `dir`: the trimmed stdout, or nil when git is absent, the
+   directory is not a work tree, or the command fails."
+  [dir args]
+  (try
+    (let [r (System/cmd "git" (to-list args) (to-list [(tuple :cd dir) (tuple :stderr_to_stdout false)]))]
+      (if (= 0 (elem r 1)) (String/trim (elem r 0)) nil))
+    (catch e nil)))
+
+(defn- git-raw
+  "Like `git`, but the stdout untrimmed (a diff's bytes matter)."
+  [dir args]
+  (try
+    (let [r (System/cmd "git" (to-list args) (to-list [(tuple :cd dir) (tuple :stderr_to_stdout false)]))]
+      (if (= 0 (elem r 1)) (elem r 0) nil))
+    (catch e nil)))
+
+(defn- sha256-hex [bin]
+  (erlang/apply :string :lowercase
+    (list (erlang/apply :binary :encode_hex (list (erlang/apply :crypto :hash (list :sha256 bin)))))))
+
+(defn- untracked
+  "Every untracked, non-ignored file under `dir`, sorted, as relative paths."
+  [dir]
+  (let [out (git-raw dir (concat ["ls-files" "--others" "--exclude-standard" "-z" "--"] INPUTS))]
+    (if (nil? out)
+      []
+      (vec (sort (filter (fn [p] (not= p "")) (String/split out "\u0000")))))))
+
+(defn diff-hash
+  "A hash of everything that makes `dir`'s build INPUTS differ from its HEAD:
+   the binary diff of tracked files under `INPUTS`, then each untracked file's
+   path and bytes there. nil when they match HEAD. Two runs over the same edits
+   answer the same hash; any edit, and any new file, under an input moves it."
+  [dir]
+  (let [diff (or (git-raw dir (concat ["diff" "HEAD" "--binary" "--"] INPUTS)) "")
+        extra (untracked dir)]
+    (if (and (= diff "") (empty? extra))
+      nil
+      (sha256-hex
+        (str diff
+             (apply str (map (fn [rel]
+                               (let [p (Path/join dir rel)
+                                     body (if (File/regular? p) (File/read! p) "")]
+                                 (str "\u0000untracked\u0000" rel "\u0000" (erlang/byte_size body) "\u0000" body)))
+                             extra)))))))
+
+(defn source-key
+  "What a build was built FROM: the commit, plus `+` and the first 12 hex of the
+   diff hash when the tree was dirty. nil when there is no commit."
+  [info]
+  (let [c (:commit info)]
+    (cond
+      (nil? c) nil
+      (:dirty info) (str c "+" (subs (:diffhash info) 0 12))
+      :else c)))
+
+(defn- host []
+  (let [r (erlang/apply :inet :gethostname (list))]
+    (if (= :ok (elem r 0)) (erlang/list_to_binary (elem r 1)) nil)))
+
+(defn- now-iso []
+  (DateTime/to_iso8601 (DateTime/from_unix! (erlang/system_time :second))))
+
+(defn- app-vsn []
+  (try
+    (let [_ (application/load :beam_lisp)
+          r (application/get_key :beam_lisp :vsn)]
+      (if (and (tuple? r) (= :ok (elem r 0))) (erlang/list_to_binary (elem r 1)) nil))
+    (catch e nil)))
+
+(defn- compiler-key []
+  (try (BeamLisp.AOTCache/compiler_key) (catch e nil)))
+
+(defn collect
+  "The provenance of the source tree at `root`. Every git fact is nil when
+   `root` is not a git work tree; the map is still complete in shape."
+  [root]
+  (let [top (or (git root ["rev-parse" "--show-toplevel"]) root)
+        commit (git top ["rev-parse" "HEAD"])
+        branch (git top ["symbolic-ref" "--quiet" "--short" "HEAD"])
+        common (git top ["rev-parse" "--path-format=absolute" "--git-common-dir"])
+        repo (if (and common (String/ends_with? common "/.git")) (Path/dirname common) top)
+        dh (if commit (diff-hash top) nil)
+        info {:version (app-vsn)
+              :source-repo repo
+              ;; `config --get` exits 1 silently when unset; `remote get-url`
+              ;; would print an error on the caller's terminal.
+              :remote (git top ["config" "--get" "remote.origin.url"])
+              :worktree top
+              :branch branch
+              :commit commit
+              :dirty (some? dh)
+              :diffhash dh
+              :built-at (now-iso)
+              :built-by (host)
+              :compiler-key (compiler-key)
+              :otp (erlang/list_to_binary (erlang/system_info :otp_release))
+              :elixir (System/version)}]
+    (assoc info :source-key (source-key info))))
+
+;; ── the file ────────────────────────────────────────────────────────────────
+
+(defn write!
+  "Write `info` to `<dir>/BUILD_INFO.bl`, temp + rename. Returns the path."
+  [dir info]
+  (let [path (Path/join dir FILE)
+        tmp (str path ".tmp." (erlang/apply :os :getpid (list)))]
+    (File/write! tmp (str ";; BUILD_INFO.bl — where this build came from (provenance). Data, never evaluated.\n"
+                          (pr-str info) "\n"))
+    (File/rename! tmp path)
+    path))
+
+(defn read
+  "The provenance map in `<dir>/BUILD_INFO.bl`, or nil when there is none or it
+   is not a map."
+  [dir]
+  (let [path (Path/join dir FILE)]
+    (if (File/regular? path)
+      (try
+        (let [forms (BeamLisp.Compiler/read_all_data (File/read! path))]
+          (if (and (not (empty? forms)) (map? (last forms))) (last forms) nil))
+        (catch e nil))
+      nil)))
+
+(defn running-root
+  "The root of the image this VM runs from: `<root>/lib/beam_lisp-<vsn>`, two up."
+  []
+  (let [d (erlang/apply :code :lib_dir (list :beam_lisp))]
+    (if (erlang/is_list d)
+      (Path/dirname (Path/dirname (erlang/list_to_binary d)))
+      nil)))
+
+(defn running
+  "The provenance of the running build: its payload's `BUILD_INFO.bl`, or — for a
+   source checkout run through `bin/bl` — the checkout itself, collected live.
+   nil when neither answers."
+  []
+  (let [root (running-root)
+        stamped (if root (read root) nil)
+        checkout (System/get_env "BL_ROOT")]
+    (cond
+      (some? stamped) (assoc stamped :build (System/get_env "BL_BUILD_ID"))
+      (and (some? checkout) (File/exists? (Path/join checkout "priv/boot/core.bl")))
+        (assoc (collect checkout) :build "src" :source-mode true)
+      :else nil)))
+
+;; ── the one line ────────────────────────────────────────────────────────────
+
+(defn- tildify [p]
+  (let [home (System/get_env "HOME")]
+    (if (and p home (String/starts_with? p (str home "/")))
+      (str "~" (subs p (count home)))
+      p)))
+
+(defn- short [c] (if c (subs c 0 (min 8 (count c))) nil))
+
+(defn summary
+  "`bl version`'s line: `beam-lisp VSN · COMMIT[+dirty] (BRANCH) · WORKTREE ·
+   built WHEN · build ID`. Unknown parts are left out, never invented."
+  [vsn info]
+  (if (nil? info)
+    (str "beam-lisp " vsn)
+    (let [parts [(str "beam-lisp " vsn)
+                 (when (:commit info)
+                   (str (short (:commit info)) (if (:dirty info) "+dirty" "")
+                        (if (:branch info) (str " (" (:branch info) ")") "")))
+                 (tildify (:worktree info))
+                 (cond (:source-mode info) "running from source"
+                       (:built-at info) (str "built " (:built-at info))
+                       :else nil)
+                 (when (and (:build info) (not (:source-mode info))) (str "build " (:build info)))]]
+      (join " · " (filter some? parts)))))
