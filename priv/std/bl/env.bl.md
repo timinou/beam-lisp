@@ -116,6 +116,11 @@ worst kind of configuration bug.
   tree's git branch when that is not a default branch, else nothing. See
   [names](names.bl.md).
 - `:paths` — library roots, relative to the file's directory.
+- `:bl` — which beam-lisp build runs this project, a string: `"stable"`,
+  `"latest"`, `"v2026.4"`, `"commit:<sha>"`, `"bleeding-edge[:DIR]"`. The `bl`
+  launcher on PATH reads it (by scanning this file, never by running it) and
+  runs that build here; see [native-bundler §15](../../../docs/native-bundler.md).
+  The language itself only checks that it is a string.
 - `:tasks` — name → a file to run, or `{:run FILE :doc STRING :paths […]
   :watch BOOL}`.
 - `:ports` — name → a port number, or `{:port N}` (`0` = the OS chooses).
@@ -151,7 +156,7 @@ per thing it could not. `normalize` collects them, so a file with three
 problems reports all three in one pass.
 
 ```beam-lisp silent
-(def known-keys [:name :instance :paths :tasks :ports :schedules :env :doc
+(def known-keys [:name :instance :bl :paths :tasks :ports :schedules :env :doc
                  :app :build :release :deps :browser :catalog])
 
 (defn- unknown-keys
@@ -609,6 +614,8 @@ shape, whatever the file said.
         nerr           (if (or (nil? nm) (string? nm)) [] [":name must be a string"])
         inst           (:instance m)
         ierr           (if (or (nil? inst) (string? inst)) [] [":instance must be a string"])
+        blspec         (:bl m)
+        blerr          (if (or (nil? blspec) (string? blspec)) [] [":bl must be a string, e.g. \"latest\""])
         [tasks terr]   (norm-tasks (:tasks m) root)
         [ports porerr] (norm-ports (:ports m))
         [sched serr]   (norm-schedules (:schedules m))
@@ -623,6 +630,7 @@ shape, whatever the file said.
      :root root
      :name (if (string? nm) nm nil)
      :instance (if (string? inst) inst nil)
+     :bl (if (string? blspec) blspec nil)
      :paths paths
      :tasks tasks
      :ports ports
@@ -634,7 +642,7 @@ shape, whatever the file said.
      :deps deps
      :browser brw
      :catalog cat
-     :errors (concat perr nerr ierr terr porerr serr eerr aerr berr rerr derr
+     :errors (concat perr nerr ierr blerr terr porerr serr eerr aerr berr rerr derr
                      brerr cerr
                      (map (fn [k] (str "unknown key " k)) (unknown-keys m known-keys)))}))
 
@@ -642,7 +650,7 @@ shape, whatever the file said.
   "A tree with no env.bl: a project value with nothing declared. Not a special
    case — every accessor reads it the same way it reads a declared one."
   [root]
-  {:path nil :root root :name nil :instance nil :paths [] :tasks {} :ports {}
+  {:path nil :root root :name nil :instance nil :bl nil :paths [] :tasks {} :ports {}
    :schedules []
    :env {} :app nil :build nil :release nil :deps [] :browser nil :catalog nil
    :errors []})
