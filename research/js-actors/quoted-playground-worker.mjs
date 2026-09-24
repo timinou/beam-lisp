@@ -40,6 +40,17 @@ globalThis.onmessage = ({ data }) => {
   try {
     if (!data || typeof data !== 'object') return;
     if (data.kind === 'stop') { H.enqueueInput('stop', ''); return; }
+    if (data.kind === 'server-version') {
+      if (!ready || pending || typeof data.version !== 'string' ||
+          !/^(0|[1-9][0-9]{0,15})$/.test(data.version) ||
+          !Number.isSafeInteger(Number(data.version))) {
+        postMessage({ kind: 'error', text: 'invalid or busy server version event' });
+        return;
+      }
+      pending = true;
+      H.enqueueInput('version', data.version);
+      return;
+    }
     if (data.kind !== 'run') return;
     if (!ready || pending) {
       postMessage({ kind: 'refused', reason: ready ? 'busy' : 'not-ready', line: 1, column: 1, path: '$' });
