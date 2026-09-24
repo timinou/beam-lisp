@@ -42,11 +42,13 @@ mount differs.
 
 ### Window shape is a point in an option space
 
-`d/app` is a decorated, resizable window. `d/bar` is the *same loop* at a
-different point: a **wlr-layer-shell** surface — frameless, docked to a screen
-edge, above tiled windows, spanning the edge. Nothing about the view or the
-reducer changes. (Layer-shell is what a wlroots/tiling compositor — niri, sway,
-hyprland — actually obeys; X11 `always-on-top` is ignored there.)
+`d/app` is a resizable window with the window manager's frame on X11; a
+Wayland surface is content-only, so there the view fills the window. `d/bar` is
+the *same loop* at a different point: a **wlr-layer-shell** surface — frameless,
+docked to a screen edge, above tiled windows, spanning the edge. Nothing about
+the view or the reducer changes. (Layer-shell is what a wlroots/tiling
+compositor — niri, sway, hyprland — actually obeys; X11 `always-on-top` is
+ignored there.)
 
 ### Dropdowns that preserve spacing
 
@@ -113,7 +115,9 @@ above, in the flesh.
 
 - **Wayland**: wry uses WebKitGTK via GTK, which works on Wayland and X11
   alike; no `QT_QPA_PLATFORM` dance is needed (that is only for the Android
-  emulator on this host).
+  emulator on this host). A Wayland window is content-only: the compositor
+  draws no frame and GTK's client-side header is removed, so the view fills
+  the surface. `:decorations` governs the window manager's frame on X11.
 - **Availability**: both programs check `(d/available?)` and exit cleanly if the
   native backend or a display is absent, rather than crashing.
 - **Lifetime**: each program `(Process/sleep …)`s to keep the node alive while

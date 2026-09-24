@@ -65,7 +65,7 @@ next one.
         here (second (File/cwd))
         live (filter (fn [c] (= n (:name c))) (list-ports))]
     (or (some (fn [c] (when (= here (:root c)) c)) live)
-        (first live))))
+        (some (fn [c] (when (:pinned c) c)) live))))
 
 (defn live
   "The two facts every printed address depends on, resolved ONCE: the gateway's
@@ -76,17 +76,16 @@ next one.
   (let [p (vm.gateway/port)]
     {:port p :fronted (vm.gateway/fronted-on? p)}))
 
+(defn- claim-url [c facts]
+  (if (or (nil? c) (empty? (:hosts c)))
+    nil
+    (vm.gateway/url (first (:hosts c)) (:port facts) (:fronted facts))))
+
 (defn url-for*
   "`url-for` with the live facts already in hand — the same rule, for a caller
    printing many addresses."
   [name facts]
-  (let [c (claim-for name)]
-    (if (nil? c)
-      nil
-      (let [hs (:hosts c)]
-        (if (empty? hs)
-          nil
-          (vm.gateway/url (first hs) (:port facts) (:fronted facts)))))))
+  (claim-url (claim-for name) facts))
 
 (defn url-for
   "The address `name` answers at — its first host, through the gateway, so a
@@ -154,7 +153,7 @@ address a human keeps; the number is the implementation detail beside it.
         (u/each
           (fn [p]
             (println (str "  " (pad (:name p))
-                          (or (url-for* (:name p) facts) (loopback-url p))
+                          (or (claim-url p facts) (loopback-url p))
                           "  → " (:port p)
                           "  " (Path/basename (:root p)) " (pid " (:pid p) ")")))
           (sort-by (fn [p] (:name p)) ps))
