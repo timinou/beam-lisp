@@ -27,7 +27,7 @@ node research/js-actors/verify-names.mjs       # names, correlated calls, defser
 node research/js-actors/verify-tables.mjs      # BL-owned table subset and ETS diff
 node research/js-actors/verify-table-leaves.mjs # opaque host storage and scaling
 node research/js-actors/verify-supervision.mjs # restart policy, ledger, OTP diff
-node research/js-actors-future/numeric-spike.mjs # 17-case exact-number research
+node research/js-actors-future/numeric-spike.mjs # 34-case exact-number research
 ```
 
 Use your installed Z3 path if different from `/usr/bin/z3`; the CLI's full
@@ -130,6 +130,58 @@ and then ends with the *expected* failure. The browser tool observed
 `research/js-actors/trace-demo.bl:5:3 in trace-demo-leaf/0` and marked the
 source frame proved. This page does not parse `Error.stack`, synthesize frames
 in JavaScript, or pretend the actor continued after its fatal error.
+
+### One quoted-data Loom-like view and one server-owned Live intent
+
+This is the first **explicit** frontend/backend placement fixture, not automatic
+fencing. From this worktree, rebuild both bundles and run the focused gates:
+
+```sh
+BEAM_LISP_Z3=/usr/bin/z3 ./bin/bl run research/js-actors/compiler.bl
+node research/js-actors/verify-quoted-view.mjs
+node research/js-actors/verify-quoted-frontend.mjs
+node research/js-actors/verify-quoted-backend.mjs
+node research/js-actors/verify-quoted-browser.mjs
+node research/js-actors/quoted-server.mjs --port 8765
+```
+
+Open <http://127.0.0.1:8765/quoted-view.html>. A persistent module Worker
+runs the BL-authored closed data-form evaluator and shows an accessible card:
+heading, `unread: 7`, button and text. **Mark all read** sends the data request
+`{op:"increment",version:"7"}` to the same-origin loopback Node transport.
+The separate BL backend actor holds version and a fixed server-local `:viewer`
+principal/grant; it checks the intent against the *same* pure
+`qv-intent-apply` contract and returns its typed outcome. Only success causes
+the Worker to re-evaluate the view, now showing `unread: 8`. A stale version,
+unknown operation or malformed request is refused without changing the view.
+The Stop button retires the frontend actor. `window.quotedDemo` exposes
+`state`, `view`, `version`, `events`, `errors`, `request(op,version)` and `stop`
+for browser-tool inspection.
+
+`quoted-view-core.bl` is built into both bundles—no duplicate evaluator or
+intent policy. It accepts only vector **data** headed by `:card`, `:heading`,
+`:button`, `:text` or `:field`, with closed attributes, fields and an
+`[:intent :increment]` action. Unknown forms/attributes, excessive depth,
+node count or text return typed refusals. A composite `(quote …)` literal is
+not supported by this target; the vector form is self-evaluating data, not a
+general Lisp interpreter. The frontend emits one fixed, described frame;
+`quoted-view-frame.mjs` decodes only that exact shape, and the page assigns
+values to `textContent`, never to HTML. Browser inputs and HTTP bodies are
+bounded; the page's CSP disallows inline scripts. The backend bundle is not
+served as a static asset.
+
+**Trust boundary:** this loopback, single-user fixture does not provide login,
+sessions, TLS, CSRF tokens, durable state, multi-tab convergence, a general
+lossless BL wire codec or automatic `loom`/`live` partitioning. The Node HTTP
+process validates *transport shape* and serializes requests; the BL backend
+owns the allow/deny and version transition. The fixed `:viewer` principal is
+server-local but is **not authenticated** to a human user. Do not expose this
+service publicly. The browser runtime still executes trusted BL only; a
+closed grammar is not an untrusted-code sandbox. A second page loading after
+a first page increments the version starts at the demo's fixed `7` and receives
+a stale refusal rather than an automatic resync. The research
+[frontend-fence assessment](../js-actors-future/05-frontend-fence.md) names the
+proof/codec/call-graph work required before auto-fencing can be honest.
 
 ### Safe `Number` proof and emission gate (distinct contracts)
 
