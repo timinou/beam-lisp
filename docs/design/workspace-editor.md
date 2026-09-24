@@ -1,93 +1,90 @@
 # The workspace editor
 
-The workspace is one place to write, ask for a change, inspect its consequences, and evaluate a form. Its central object is a **working context**: a file or experience, the source revision it sees, and the proposal (if any) derived from it. Buffer, Generate, and Proposal are not separate destinations. They are views of that context.
+The workspace has two first-class perspectives: **Source** and **Stream**. Source opens a file's code at full size. Stream opens its literate `.bl.md` document at full size, with a spec, comments, executable cells and history. Either view has an Activity lens; Activity projects work that belongs to the current file or Stream, not a third place where work lives. A Stream may start without a file and later explore several. The editor stays the destination; supporting material opens around it only when requested.
 
-This document specifies the intended product, not the current prototype implementation. The illustrated [page-by-page proposal](../../research/workspace-spike/editor-design-proposals.html) pairs real prototype screenshots with schematic future states. [Form-first interaction](form-first-interaction.md) specifies selection and evaluation precisely.
+This is a design contract for future implementation. The [illustrated proposal](../../research/workspace-spike/editor-design-proposals.html) shows existing screenshots alongside schematic future states. [Stream documents](stream-workspace.md) specifies persistence and harness integration. [Form-first interaction](form-first-interaction.md) specifies source selection and evaluation.
 
-## One work surface
+## The source-first frame
 
 ```
-Project / file breadcrumb                Session and provider status · Actions
-Files + Work rail   │ Source / selected form                 │ Context inspector
-                    │─────────────────────────────────────────│
-                    │ Generation timeline ↔ review diff       │
-                    │─────────────────────────────────────────│
-                    │ Console / result shelf (collapsible)    │
+Current Source or Stream · short breadcrumb                       Actions / command palette
+┌──────────────────────────────────────────────────┬─────────────────────────────┐
+│ full-height, full-width-priority source editor   │ selected-form inspector     │
+│ (code or literate Stream document)                 │ info · docs · results       │
+│                                                  │ comments · related work     │
+└──────────────────────────────────────────────────┴─────────────────────────────┘
+Optional: Activity lens for this Source or Stream · source/diff panes on demand
 ```
 
-The center is a **single scrollable story**, not three mandatory columns of full content and not four mutually exclusive tabs. Source is the anchor. A generation attaches a timeline to the source revision it read. A proposal attaches its diff to the timeline version that produced it. Selecting a changed hunk takes the reader back to its source form; returning to the timeline preserves the same proposal, scroll position, and selection. When no generation is selected, the source owns the space. Focus mode may collapse the rail, inspector, timeline, or console independently; it does not discard their state. A narrow niri tile shows one main region and a contextual drawer, with the same relationships and commands.
+No permanent three-column dashboard, always-visible timeline, shortcut legend, duplicate open-buffer list, or fake OS title bar. The source takes remaining viewport height and most horizontal space. The contextual sidebar follows the selected form in a file, or the selected heading/cell/comment in a Stream. It shows exact syntax kind and range, namespace and binding, signature/docs/proof where available, last evaluation and its source revision, comments, and proposal hunks referring to that form. A hover may preview these facts; a selected form remains pinned until an intentional pointer move or keyboard selection changes it. An asynchronous lookup keyed to an old selection cannot overwrite the new sidebar. Empty/error states say what is known rather than inventing analysis.
 
-The rail groups **Files** and **Work**; each row has a clear active state and relevant draft/running count. The header uses a short project/file name, with the full path available on focus or in details. The inspector follows the selected form/file/experience; it never changes a REPL binding merely because the mouse moved. Technical BL forms belong in a searchable API disclosure. Nothing in the shell imitates an OS title bar.
+The command palette is the one searchable action catalogue. It offers context-aware actions by name: **Go to first child**, **Go to parent**, **Go to previous form**, **Go to next form**, **Evaluate selected form**, **Save file**, **New Stream**, **Attach source**, **Open Activity**, **Open diff**, **Show API form**, and **Switch perspective**. Search by action or shortcut. Existing `Ctrl+J/K/H/L` and `Ctrl+Enter` bindings retain their form-first semantics; the editor surface does **not** print a four-direction shortcut map. A small mode cue may say Edit or Explore; a first-use hint may point to “Search actions” without displaying chords. Browser-reserved keys get a web-safe mapping and the same palette actions. The palette keeps focus and selection stable on close. The precise motion rules live in [form-first interaction](form-first-interaction.md).
 
-### Source → intent → consequence
+### Source and Stream
 
-1. **Write.** Open a buffer, type in Insert mode, and see an explicit draft indicator. The editor takes the available height. A draft is not a disk save; switching work preserves it. `Save file` is a file operation, not a proposal approval.
-2. **Choose scope.** Select a form or a file, type an intent, and review the chosen source revision and provider before starting. Demo is offline. A network provider discloses the file content sent and potential cost. The current prototype's `gen/ns` receives a path; consuming an unsaved draft or form-specific scope requires a new backend contract. Until then the UI must say **Saved source only** rather than suggest draft scope works.
-3. **Follow a timeline.** Each run owns its own sequence: request, source basis, provider phase, completed response, validation, candidate version, review, and any later decision. The timeline is a record of observed events, not a simulated token stream. An entry links to its source and proposal version. Follow-ups add versions in the same experience; they do not overwrite prior candidates.
-4. **Review in context.** The selected candidate expands a file list and navigable diff directly under its timeline entry. Source and diff share path/form breadcrumbs. A review mode may widen the diff without losing the story. Verification explicitly names the checks performed; namespace load is not a project test run.
-5. **Decide deliberately.** Verify, Try, Save source, and Make Live are distinct. A generated candidate's acceptance may also move an accepted-history pointer; the confirmation names both effects. Inverse proposals are new candidates requiring verification and a guarded save, not an instant undo.
-6. **Explore.** A selected form can be evaluated in the workspace runtime; a compact inline result sits next to it and a durable receipt goes to the console. The form is not saved, generated, accepted, or made live by evaluation. The runtime may nevertheless change because evaluation is real execution; this distinction remains visible.
+A Source view owns a disk basis, an in-memory draft, editor selection and file-scoped activity. A source revision/digest travels with selected forms, evaluations, comments and proposal hunks. Save file writes with a basis guard. Switching to a Stream does not save the file or lose its draft. A source file may be referenced by many Streams; no arbitrary “current Stream” is inferred from the file.
 
-### Timeline event contract
+A Stream owns a durable project document, spec draft, comments, cells/results, turn history and links to zero or more source files. Its stable ID survives a title or path rename. The project may choose `streams/<slug>.bl.md`; harness integration extends its one-writer session mechanism to adopt that path rather than duplicating history in `.local/harness`. The first dialect is `.bl.md`, because the harness currently writes it. `.bl.org` requires an explicit adapter for Org headings and result blocks before offering identical behavior. See [Stream documents](stream-workspace.md).
 
-A timeline entry has a stable `event-id`, `experience-id`, monotonically ordered sequence, event kind, status, source basis, optional proposal version, and optional artifact/result reference. Useful kinds are `request`, `scope`, `provider`, `candidate`, `verification`, `review`, `save`, `publish`, `cancel`, and `failure`. Backend facts produce entries; the client does not infer a successful save or publication from a button click. A provider response is a **completed response**, not streaming unless the transport actually supplies incremental chunks. Late responses after cancellation remain attached to the cancelled run as rejected/ignored, never to the active candidate.
+The project switcher in the header/palette lists recent source files and Streams and can open a file tree drawer. This is navigation, not a sidebar occupying source width. A user may keep two source panes open while reading a Stream; each pane names its path, revision and read-only/current state. Opening a reference from a Stream uses a side pane without replacing the Stream document. On a narrow niri tile, the pane becomes a foreground sheet with an unambiguous breadcrumb back. Pane layout and scroll position are view state; source links and decisions remain in the document.
 
-Selecting an older timeline event opens a **history lens**: its frozen source and diff are read-only, labeled with the event time and basis, while the present draft remains intact behind a visible “Return to current draft” action. A hunk may locate a corresponding form in the current source only when a validated mapping exists; otherwise the historical location remains in the lens. Selection never rewinds or edits today's buffer. This avoids making a past candidate look like the current editable source.
+## Activity is a lens, not a bare timeline
 
-A candidate is immutable as a reviewed version. Refining creates a new candidate with a link to its predecessor and the prompt that changed it. A diff compares a named candidate to its captured source basis, never to whichever file happens to be on disk when the viewer opens it. Review of a stale basis presents a compare/rebase path; saving cannot silently overwrite external edits. The timeline may be reconstructed from authoritative state after reload; its ordering and receipts must not depend on transient DOM state. The current prototype exposes `turns`, `versions`, and snapshots, not this event model. Persisted event identities and phase transitions are prerequisites, not present features.
+A Source file's Activity lens projects only receipts and Stream references that explicitly cite that file, optionally narrowed to the selected form. A Stream's Activity lens reads its own literate document in order: editable Spec, source references, operator comments and questions, model turns, evaluated cells with inline results, checks, candidates and decisions. It should feel like a specification annotated through time—subtle reply indents and author labels, compact history markers and collapsible long runs—not a chat app or a list of timestamped verbs. The default Stream reading view retains the whole document; Activity can focus on its history without hiding the Spec.
 
-## Revision and runtime language
+An activity item carries a stable owner (Stream ID or direct file operation), block/event ID, source path and basis when applicable, and candidate version when applicable. The Stream document and authoritative source/proposal receipts own those facts; the file view is a rebuildable index/projection. A file mentioned by two Streams shows two attributed threads. A Stream with no files still has its spec and comments. File saves performed outside a Stream appear only if instrumented; no activity is invented from a modification timestamp.
 
-| Word | Means | Does not mean |
+Selecting an older event opens a labeled read-only **history lens** for its frozen source and diff. “Return to current draft” returns without changing a byte. A hunk locates a form in today's source only when its mapping is validated; otherwise it opens the historical basis. A comment on a moved/deleted form stays anchored to its old revision until explicitly re-anchored. The Activity view must not silently rewind the editor or change the active REPL binding.
+
+### From exploration to changes
+
+1. Open Source to write code, or create a Stream to state an intent without choosing a file. The source editor occupies the surface. The sidebar explains the selected form/document block.
+2. In a Stream, attach source files as needed; explore them in optional panes. Comments may target the spec, a turn/cell, a candidate or a file/form at a captured revision. Source Activity links back to the owning Stream block.
+3. Ask for a change with explicit scope: which source files/bases and which provider. The current prototype generator accepts one path. Multi-file/frozen-draft scope needs a backend contract; until available, label the supported scope **Saved source only** and never silently use stale disk in place of a visible draft.
+4. The Stream document appends task, model, cell and real result blocks through the harness keeper. A generation adds a completed provider response, verification receipt and immutable candidate version as evidence, never a fake token stream. Follow-up adds a new candidate without replacing the previous one.
+5. Open the candidate diff in a side pane or focused review. It names its frozen basis and offers source references. Verify, Try, Save source and Make Live are distinct actions with distinct receipts. An inverse proposal is a new candidate requiring guards and verification.
+6. Evaluate a highlighted source form explicitly. The inline receipt and Stream or Source Activity history point to that form, draft revision and runtime image. Hover does not execute. Session eval can mutate the runtime without saving source or advancing a proposal's Live pointer.
+
+A user can close a Stream after discovering that no source change is needed; the spec, comments, tests and conclusions still form useful work. A Stream can also touch multiple files over multiple turns. Neither requires a fake “primary file.”
+
+## Revision vocabulary
+
+| Term | Meaning |
+| --- | --- |
+| Draft | In-memory file or Stream spec differs from its saved basis |
+| Made | A candidate exists for an explicit set of captured source bases |
+| Verified | Named checks passed for that candidate; namespace load does not imply project tests |
+| Saved | A basis-guarded source/Stream write was acknowledged; a generated acceptance may also move its accepted-history pointer |
+| Live | A proposal revision was installed in the workspace runtime image, not deployed globally |
+| Evaluated | A source form or Stream cell ran in a named workspace/harness session; the result has its own receipt |
+
+Made, Saved and Live remain independent pointers. Save without Live and Live without Save are legitimate. A form evaluation may modify the runtime image independently of a proposal's Live pointer, so an exact “running code equals Live revision” claim needs a separate session-mutation signal. An expression inside a function may refer to lexical locals unavailable to session eval; show that error and an explicit enclosing-form alternative. The standalone `bl repl`, the playground workspace image and a Stream harness namespace are distinct execution contexts: the UI must label which one an action targets. Do not silently treat all three as one REPL.
+
+## Ownership and integration seams
+
+The prototype's `play/ui.bl` renders commands and fragments; `play/ui-client.js` owns CodeMirror and polling; `dev/workspace.bl` owns buffers, proposals and the workspace image. `harness.bl` on main adds a project-VM session with a keeper, turn worker and `.local/harness/<session>.bl.md` append-only document. `harness.doc` slices `.bl.md` through `bl.doc`; `harness.model/messages` reconstructs operator/model/result roles from generated sections. The current harness does not accept arbitrary Stream paths, update an earlier Spec, or write `.bl.org`. [Stream documents](stream-workspace.md) defines the required single-writer extension. It must coexist with ordinary harness sessions rather than creating a second transcript implementation.
+
+One typed view context tracks `Source | Stream`, active document ID/revision, selected form/block, inspector request, Activity filter/history lens, open source panes, candidate and console binding. IDs and bases—not labels, line numbers alone, or DOM order—connect events. Background updates preserve focus and local drafts; a stale async response stays with its original request. The browser syntax highlighter is not a parser. Client structural selection needs parity with the BL reader; CodeMirror UTF-16 offsets and reader Unicode codepoint offsets require tested conversion. The server validates exact source/revision before eval. See [form-first interaction](form-first-interaction.md).
+
+## Recovery and acceptance
+
+| Condition | Visible behavior | Invariant |
 | --- | --- | --- |
-| Draft | In-memory buffer source differs from its saved basis | Saved to disk |
-| Made | Candidate materialized from an intent | Valid or saved |
-| Verified | Stated checks passed for this candidate and basis | Project tests ran, or arbitrary execution is safe |
-| Saved | Source written with basis guards; for a generation, accepted history updated as specified | Running code replaced |
-| Live | Proposal revision installed in the workspace runtime image | Global process deployed or source saved |
-| Evaluated | A particular source form ran in the workspace session | Its buffer was saved or a proposal became Live |
+| Dirty Source or Stream Spec; change perspective | Retain draft, selection and return location | No implicit disk write |
+| Keeper appends while operator edits Spec | Serialize both operations; stale basis opens a conflict | Generated history is never overwritten |
+| Attached source changes externally | Historical anchor remains readable, compare/re-anchor offered | No silent relocation or write |
+| Model turn fails, stops or times out | Keep blocks and explicit outcome; retry remains available | No forged result or hanging “running” state |
+| Generation cancelled after response begins | Preserve prior versions and cancellation receipt | Late response cannot become current |
+| Proposal Verified, Saved or Live | Show each pointer and checks by name | No conflated “applied” state |
+| Form eval returns after editor change | Show receipt on original revision and mark stale | No result attached to another form |
+| Source Activity has no indexed work | Explain that no tracked events exist | No inferred history from timestamps |
+| Narrow tile / screen reader / parser unavailable | Main editor remains readable and writable; pane/palette actions reachable | No keyboard-only invisible capability or whole-page overflow |
 
-Made, Saved, and Live are **independent revision pointers**. Save without Live and Live without Save remain first-class states. Form evaluation can mutate the runtime independently of these pointers. A separate “Session evaluated since Live” signal is needed if the interface claims what code is currently executing; never infer that the Live revision exactly describes all session mutations. A source form inside a function may depend on lexical locals that are not available in the REPL; show the runtime error rather than suggesting the editor captured those locals.
+Implement in coherent slices: (1) Source/Stream identity and single-writer document contract; (2) source-first shell, drafts, contextual inspector and command palette; (3) form parser/eval and request-owned receipts; (4) Stream spec/comments/history and Source Activity projection; (5) multi-source generation/review and recovery. Test one journey spanning an empty Stream, a two-file exploration, a comment on a form, a turn with a real result, a candidate with a read-only historical basis, separate Save/Live decisions and a restart. Verify native reserved-key delivery and browser fallback before claiming the shortcuts work everywhere.
 
-The console in this workspace and the standalone `bl repl` are separate sessions. Visual conventions can be shared; source bindings and result histories cannot be silently shared. Evaluation remains an explicit side-effecting action, never a hover side effect or a generation step.
+## References
 
-## States and recovery
-
-| Situation | Interface response | Invariant |
-| --- | --- | --- |
-| Buffer is dirty; user switches file or enters review | Preserve draft and return location; label it as a draft | No implicit disk write |
-| Generation starts with a dirty buffer | Present supported scope honestly; either implement a frozen draft snapshot end-to-end or require saved source | No accidental generation against a stale disk revision |
-| Verification fails | Keep prompt, draft, candidate and error location; offer refine or inspect | No Save/Live success claim |
-| Network fails or run is cancelled | Keep prior version and show retry or cancellation receipt | Late reply cannot become current |
-| Save encounters a changed basis | Keep source and show a conflict comparison | No silent overwrite |
-| Version is Saved but not Live, or Live but not Saved | Show all three pointers and explicit next actions | Neither state is automatically “fixed” |
-| Runtime reconnects or restarts | Reconcile authoritative snapshots, retain local drafts, mark uncertain receipts as such | Do not invent a Live state from a saved file |
-| Eval response arrives after an edit | Attach result to its request and original source revision; label stale next to current source | No result reassigned to a different form |
-| Browser tile is narrow | Collapse context into a drawer, allow code-local horizontal scroll | No whole-page horizontal overflow or hidden primary action |
-
-Keyboard focus survives background state updates. Announcements distinguish connection, running, success and failure without stealing the caret. All actions are reachable by keyboard and have text labels; status is never color-only. The reference image palette is a direction, not a contrast guarantee; test both themes at normal text and code sizes. Reduced motion removes nonessential animations. A fallback text editor remains fully writable if structural parsing or CodeMirror is unavailable; form-specific actions then explain why they are unavailable.
-
-## Implementation seams
-
-The prototype's `play/ui.bl` owns commands and rendered fragments, `play/ui-client.js` owns CodeMirror and poll reconciliation, and `dev/workspace.bl` owns buffers, proposals and the runtime. The current editor uses CodeMirror **StreamLanguage** for highlighting; it does not have a browser syntax tree. `editors/tree-sitter-beamlisp/grammar.js` is a possible structural source, but parser coverage must be compared against the authoritative BL reader before shipping form actions. The reader reports **Unicode codepoint** offsets; CodeMirror uses UTF-16 offsets. Conversion and stale-revision validation are mandatory. Form parsing and request semantics are specified in [form-first interaction](form-first-interaction.md).
-
-Integrate by replacing duplicated view state with one explicit `WorkspaceContext` (active buffer and draft revision, selected experience and candidate version, selected form, timeline position, inspector target, console binding). IDs, not labels or DOM order, own relationships. The console owns eval receipts keyed by request ID. The server validates source and ranges; the browser may preview structure but is not the authority for execution. Existing allowlisted commands remain explicit; a future `eval-form` command is a distinct path from `eval` typed in the console.
-
-## Build in coherent slices
-
-1. State and provenance: typed context, version/basis identity, timeline event contract and fixture tests. Do not make a timeline out of transient turns if it cannot survive reload.
-2. Unified shell + buffer: one source-focused surface, persistent drafts, focus-safe polling, responsive inspector and conflict feedback.
-3. Form-first navigation + eval: parser parity and offset mapping tests, keyboard/pointer selection, server-side validation, request-owned receipts and accessibility.
-4. Generation + inline review: source scope contract, ordered events, candidate-version diff, review decisions and cancellation/conflict tests.
-5. Polish: screenshots of Carbon/Snow, wide/narrow niri tiles, keyboard-only journey, screen-reader names, reduced motion and failure recovery.
-
-Acceptance is a complete journey: create an unsaved draft; navigate to a form; evaluate it without saving; start a generation against an explicit basis; inspect a timeline version and its diff; verify; save without publishing; publish separately; switch away and back without losing form selection or history; reconnect and see the same authoritative state. Every action needs a corresponding test at the ownership boundary.
-
-## Design references
-
-- [CIDER keybindings](https://docs.cider.mx/cider/keybindings.html#evaluating-code) distinguishes sexp-at-point, defun-at-point, region and load-buffer. Our default is explicitly the highlighted form, not an inferred whole file.
-- [CIDER code evaluation](https://docs.cider.mx/cider/usage/code_evaluation.html#overlays) uses local result overlays and load-state indicators; a durable receipt supplements a transient overlay.
-- [Helix selections](https://docs.helix-editor.com/usage.html#selection-first-editing) and [syntax-aware motions](https://docs.helix-editor.com/syntax-aware-motions.html) inspire selection-before-action and structural traversal.
-- [Primer saving](https://primer.style/product/ui-patterns/saving/) supports explicit persistence and recovery from errors.
-- [Primer progressive disclosure](https://primer.style/product/ui-patterns/progressive-disclosure/) supports hiding raw details without disorienting the reader.
-- [Fluent 2 layout](https://fluent2.microsoft.design/layout) informs spacing and responsive grouping; it does not dictate the editor's identity.
+- [Harness implementation](../../priv/lib/harness.bl), [document blocks](../../priv/lib/harness/doc.bl) and [editor/agent guide](../bl/04-editors-and-agents.md#the-harness--a-live-session-an-agent-drives) ground the Stream format and writer contract.
+- [bl.doc](../../priv/std/bl/doc.bl) defines `.bl.md` and `.bl.org` cell/result spans.
+- [CIDER evaluation](https://docs.cider.mx/cider/keybindings.html#evaluating-code) distinguishes selected sexp, top-level form, region and buffer.
+- [Primer saving](https://primer.style/product/ui-patterns/saving/) informs explicit persistence and recovery; [Fluent 2 layout](https://fluent2.microsoft.design/layout) informs responsive grouping.
