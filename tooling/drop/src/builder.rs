@@ -170,15 +170,20 @@ pub fn main_worktree(tree: &Path) -> Option<PathBuf> {
     (p.file_name()? == ".git").then(|| p.parent().map(Path::to_path_buf)).flatten()
 }
 
-/// Copy the gitignored assets a build needs (`priv/native`, `priv/z3`,
-/// `priv/embed`) from `from` into `tree` when `tree` has none. They are
-/// pinned artefacts, not sources: a fresh worktree has none, and the boot
-/// itself needs `lazy_memo.so`. Reflinked where the filesystem can.
+/// Copy the gitignored PINNED assets a build needs (`priv/z3`, `priv/embed`)
+/// from `from` into `tree` when `tree` has none: downloaded artefacts, the same
+/// bytes for every commit. Reflinked where the filesystem can.
+///
+/// `priv/native` is NOT one of them: those `.so` files are built from
+/// `native/*` of the commit being built, and a copy is the checkout's crate
+/// source, not this commit's (measured: a `latest` seeded from a checkout with
+/// an edited `datom_fjall` crate shipped that crate's NIF and died at load with
+/// `:nif_not_loaded`). `build_natives` compiles them from the tree instead.
 fn seed_assets(from: &Path, tree: &Path, log: &Path) -> Result<(), String> {
     if from == tree {
         return Ok(());
     }
-    for rel in ["priv/native", "priv/z3", "priv/embed"] {
+    for rel in ["priv/z3", "priv/embed"] {
         let (src, dst) = (from.join(rel), tree.join(rel));
         let empty = std::fs::read_dir(&dst).map(|mut d| d.next().is_none()).unwrap_or(true);
         if src.is_dir() && empty {
@@ -189,6 +194,50 @@ fn seed_assets(from: &Path, tree: &Path, log: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Build every `native/<crate>` of `tree` with cargo and install its cdylib as
+/// `priv/native/<crate>.so` (`.dylib` on macOS is loaded under the same `.so`
+/// name, as `vm.native` installs it). The boot itself loads `lazy_memo`, so
+/// this runs before the tree's own `bin/bl` does anything. Cargo's shared
+/// target directory makes a crate that did not change a no-op.
+fn build_natives(tree: &Path, log: &Path) -> Result<(), String> {
+    let native = tree.join("native");
+    let dest = tree.join("priv/native");
+    std::fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
+    let Ok(rd) = std::fs::read_dir(&native) else { return Ok(()) };
+    let mut crates: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.join("Cargo.toml").is_file()).collect();
+    crates.sort();
+    for dir in crates {
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        let mut cmd = Command::new("cargo");
+        cmd.args(["build", "--release", "--message-format=short", "--manifest-path"]).arg(dir.join("Cargo.toml"));
+        run_logged(cmd, log, &format!("cargo build native/{name}"))?;
+        let out = cargo_target_dir(&dir).join("release");
+        let lib = [format!("lib{name}.so"), format!("lib{name}.dylib")]
+            .into_iter()
+            .map(|f| out.join(f))
+            .find(|p| p.is_file())
+            .ok_or_else(|| format!("native/{name}: cargo produced no cdylib in {}", out.display()))?;
+        let tmp = dest.join(format!("{name}.so.tmp-{}", std::process::id()));
+        std::fs::copy(&lib, &tmp).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, dest.join(format!("{name}.so"))).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Where cargo writes for the crate at `dir`: `cargo metadata`'s answer, which
+/// honours `CARGO_TARGET_DIR` and any `build.target-dir` config.
+fn cargo_target_dir(dir: &Path) -> PathBuf {
+    Command::new("cargo")
+        .args(["metadata", "--format-version", "1", "--no-deps", "--manifest-path"])
+        .arg(dir.join("Cargo.toml"))
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|o| json_string(&String::from_utf8_lossy(&o.stdout), "target_directory"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dir.join("target"))
 }
 
 fn tree_bl(tree: &Path, args: &[&str]) -> Command {
@@ -243,6 +292,7 @@ pub fn build_tree(store: &Store, tree: &Path, launcher: &Path, extra: &[&str]) -
     let out = incoming.join(format!("build-{}.drop", std::process::id()));
     let scratch = cache_dir().join("scratch");
 
+    build_natives(tree, &log)?;
     run_logged(tree_bl(tree, &["deps", "fetch"]), &log, "bl deps fetch")?;
     run_logged(tree_bl(tree, &["deps", "compile"]), &log, "bl deps compile")?;
     let seal = tree_bl(
