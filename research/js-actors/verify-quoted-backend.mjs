@@ -26,6 +26,7 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { createIntentCodec, parseContractLine } from './quoted-intent-codec.mjs';
 
 const cwd = fileURLToPath(new URL('../../', import.meta.url)); // repository root
 const serverPath = fileURLToPath(new URL('./quoted-server.mjs', import.meta.url));
@@ -112,6 +113,21 @@ function expect(res, status, reason) {
   return parsed;
 }
 
+// The descriptor is emitted by the COMPILED BL actor, not copied from a
+// client fixture. Both transports use the same strict codec instance.
+const advertised = await request('GET', '/api/contract');
+assert.equal(advertised.status, 200);
+const declaredLine = outLines.find(line => line.startsWith('QV-BACKEND CONTRACT '));
+assert.ok(declaredLine, 'BL actor did not announce its contract');
+const fromBL = parseContractLine(declaredLine);
+assert.deepEqual(json(advertised), fromBL);
+const codec = createIntentCodec(fromBL);
+assert.equal(codec.contract.op, 'increment');
+assert.equal(codec.contract.field, 'unread');
+expect(await request('POST', '/api/contract'), 405, 'method-not-allowed');
+expect(await request('GET', '/api/contract', { headers: { host: 'evil.example' } }), 403, 'host-refused');
+console.log('PASS quoted-backend: compiled BL contract advertised and served read-only');
+
 // ── 1. one accepted request advances the version ─────────────────────────────
 
 const accepted = expect(await post({ op: 'increment', version: '7' }), 200);
@@ -186,7 +202,8 @@ assert.ok(results.length >= 5, `expected one result line per dispatched request,
 const seqs = results.map(line => Number(/^QV-BACKEND RESULT ([0-9]+) /.exec(line)[1]));
 assert.deepEqual(seqs, seqs.map((_, i) => i + 1), `result sequence is not 1..n: ${seqs.join(',')}`);
 assert.equal(outLines.filter(line => line === 'QV-BACKEND READY').length, 1);
-assert.equal(outLines[0], 'QV-BACKEND READY', 'the first actor line must be READY');
+assert.equal(outLines[0], declaredLine, 'the first actor line must be its BL contract');
+assert.equal(outLines[1], 'QV-BACKEND READY', 'READY must follow a validated contract');
 assert.ok(
   results.some(line => line.includes('[:ok {:intent :increment, :version 8}]')),
   'the accepted result line is missing',

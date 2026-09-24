@@ -35,14 +35,13 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import * as H from './host.mjs';
+import { createIntentCodec, parseContractLine } from './quoted-intent-codec.mjs';
 
 const nativeLog = console.log.bind(console);
 
 // The frame bounds. The JSON body is small by design; the version is a canonical
 // decimal that fits `Number.MAX_SAFE_INTEGER` in at most 16 digits.
 const MAX_BODY = 4096;
-const OP_RE = /^[a-z][a-z0-9-]{0,31}$/;
-const VERSION_RE = /^(0|[1-9][0-9]{0,15})$/;
 const ACTOR_TIMEOUT_MS = 4000;
 
 // The page loads its module externally; inline scripts are refused. The
@@ -78,6 +77,7 @@ const STATIC = new Map([
   ['/quoted-playground-page.mjs', ['quoted-playground-page.mjs', 'text/javascript; charset=utf-8']],
   ['/quoted-playground-worker.mjs', ['quoted-playground-worker.mjs', 'text/javascript; charset=utf-8']],
   ['/quoted-form.mjs', ['quoted-form.mjs', 'text/javascript; charset=utf-8']],
+  ['/quoted-intent-codec.mjs', ['quoted-intent-codec.mjs', 'text/javascript; charset=utf-8']],
   ['/out/quoted-playground.mjs', ['out/quoted-playground.mjs', 'text/javascript; charset=utf-8']],
 ]);
 
@@ -112,6 +112,7 @@ function createBridge() {
   const waiters = [];
   let expectedSeq = 0;
   let failure = null;
+  let contract = null;
   let resolveReady;
   let rejectReady;
   const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
@@ -123,7 +124,17 @@ function createBridge() {
   }
 
   function onLine(line) {
-    if (line === 'QV-BACKEND READY') { resolveReady(); return; }
+    if (line.startsWith('QV-BACKEND CONTRACT ')) {
+      const declared = parseContractLine(line);
+      if (!declared || contract) fail('BL actor advertised an invalid or duplicate contract');
+      else contract = declared;
+      return;
+    }
+    if (line === 'QV-BACKEND READY') {
+      if (!contract) fail('BL actor omitted its wire contract');
+      else resolveReady();
+      return;
+    }
     const m = /^QV-BACKEND RESULT ([0-9]+) (.+)$/.exec(line);
     if (!m) return;
     const waiter = waiters.shift();
@@ -178,7 +189,7 @@ function createBridge() {
     return answer.body;
   }
 
-  return { ready, serialize, dispatch, fail };
+  return { ready, serialize, dispatch, fail, get contract() { return contract; } };
 }
 
 // The typed result the actor wrote, split into the fields the HTTP body needs.
@@ -213,6 +224,7 @@ function readBody(req, limit) {
 export async function startBackend({ port = 0 } = {}) {
   const bridge = createBridge();
   await bridge.ready;
+  const codec = createIntentCodec(bridge.contract);
 
   let boundPort = 0;
   const allowedHosts = () => [`127.0.0.1:${boundPort}`, `localhost:${boundPort}`];
@@ -243,16 +255,8 @@ export async function startBackend({ port = 0 } = {}) {
     if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return send(res, 400, { ok: false, reason: 'malformed-request' });
     }
-    const keys = Object.keys(parsed);
-    if (!(keys.length === 2 && keys.includes('op') && keys.includes('version'))) {
-      return send(res, 400, { ok: false, reason: 'malformed-request' });
-    }
-    if (typeof parsed.op !== 'string' || !OP_RE.test(parsed.op)) {
-      return send(res, 400, { ok: false, reason: 'malformed-op' });
-    }
-    if (typeof parsed.version !== 'string' || !VERSION_RE.test(parsed.version)) {
-      return send(res, 400, { ok: false, reason: 'malformed-version' });
-    }
+    const decoded = codec.decodeRequest(parsed);
+    if (!decoded.ok) return send(res, 400, decoded);
 
     let answer;
     try {
@@ -262,12 +266,22 @@ export async function startBackend({ port = 0 } = {}) {
     }
     const outcome = classify(answer);
     if (outcome.reason === 'unparsed-response' ||
-        (outcome.ok && (!Number.isSafeInteger(outcome.version) || outcome.intent !== 'increment'))) {
+        (outcome.ok && (!Number.isSafeInteger(outcome.version) || outcome.intent !== codec.contract.op))) {
       bridge.fail('BL actor returned an unrecognized or inexact response');
       return send(res, 503, { ok: false, reason: 'backend-unavailable' });
     }
     if (outcome.ok) return send(res, 200, outcome);
     return send(res, STATUS.get(outcome.reason) || 400, outcome);
+  }
+
+  function handleContract(req, res) {
+    if (req.method !== 'GET')
+      return send(res, 405, { ok: false, reason: 'method-not-allowed' }, { allow: 'GET' });
+    if (!allowedHosts().includes(req.headers.host))
+      return send(res, 403, { ok: false, reason: 'host-refused' });
+    if (req.headers.origin !== undefined && !allowedOrigins().includes(req.headers.origin))
+      return send(res, 403, { ok: false, reason: 'origin-refused' });
+    return send(res, 200, codec.contract);
   }
 
   async function handleStatic(req, res, pathname) {
@@ -302,7 +316,8 @@ export async function startBackend({ port = 0 } = {}) {
     } catch {
       return send(res, 400, { ok: false, reason: 'malformed-url' });
     }
-    const task = pathname === '/api/intent' ? handleIntent(req, res) : handleStatic(req, res, pathname);
+    const task = pathname === '/api/intent' ? handleIntent(req, res) :
+      pathname === '/api/contract' ? handleContract(req, res) : handleStatic(req, res, pathname);
     Promise.resolve(task).catch(() => send(res, 500, { ok: false, reason: 'internal-error' }));
   });
 
