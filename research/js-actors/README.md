@@ -190,12 +190,20 @@ edit the actual view form and click **Run in JS Worker** (Ctrl/⌘+Enter). Start
 with the same `quoted-server.mjs --port 8765` command above; after assets load,
 you can stop the server and keep editing/running the view. Source and rendered
 view never go to `/api/intent`. The page shows the placement verdict, a preview,
-and the inferred *narrow* bridge contract. Its button is disabled: it describes
-an intent the backend would have to authorize, not a local state mutation.
+and the inferred *narrow* bridge contract. Its button becomes live only when
+the compiled BL backend advertises a compatible contract. A click sends exactly
+`{op:"increment",version:"7"}` to `/api/intent`; only BL authorization and a
+server-confirmed successor cause the Worker to render `unread: 8`. A stale,
+malformed, offline or inconsistent response leaves the last confirmed view
+unchanged. The first `7` is a local fixture: opening another tab after a commit
+requires reloading/resync, not an optimistic increment.
 
 ```sh
 node research/js-actors/verify-quoted-form.mjs
 node research/js-actors/verify-quoted-playground.mjs
+node research/js-actors/verify-quoted-intent-codec.mjs
+node research/js-actors/verify-quoted-playground-page.mjs
+node research/js-actors/verify-portable-helper.mjs
 ```
 
 **Automatic within one closed grammar, not automatic BL partitioning:**
@@ -210,22 +218,46 @@ view, `:unread` input and server-owned `:increment`/version contract. The
 Worker's typed input mechanism bounds finite data, then the **compiled BL**
 `quoted-view-core.bl` evaluator makes the final grammar decision and emits the
 existing strict frame. Neither the reader nor the Worker uses `eval` or a JS
-compiler. The sample environment provides local `"7"`: the preview is not
-connected to live server state and grants no authority to commit an intent.
+compiler. The sample environment starts at local `"7"`; only successful BL backend
+responses may advance it. The preview itself grants no commit authority.
+`qv-wire-contract` in `quoted-view-core.bl` is the single declaration for
+schema, intent, dynamic field and wire bounds. The compiled BL backend announces
+it at boot; the Node host validates that descriptor, exposes read-only
+`/api/contract`, and uses `quoted-intent-codec.mjs` for transport shape. The
+browser uses the **same codec** to match the view manifest, encode a canonical
+request and refuse inconsistent responses. The backend independently keeps the
+server-local principal/grant/version policy; a codec cannot authorize an intent.
+Focused checks include 4,097 finite wire round-trips and refusal fixtures, not
+a universal proof of every BL value or authenticated users.
 
 | What runs where | Current verdict | Why |
 |---|---|---|
 | Fixed bounded quoted data view | Browser Worker | Closed grammar, known dynamic field, compiled BL evaluator and bounded frame decoder |
-| `[:intent :increment]` declaration | Browser as data only | The button is disabled here; the separate quoted-view demo forwards requests |
-| Authentication, authorization, version check, state commit | Backend | Client claims and pure rendering cannot grant authority |
+| `[:intent :increment]` declaration | Browser as data, then server request on click | A matching BL-advertised codec permits transport; backend decides and commits |
+| Authentication, authorization, version check, state commit | Backend responsibility | BL demo checks grants/version and commits; human authentication is **not implemented** |
 | BL calls, closures, captures, effects, arbitrary Loom/Live modules | Refuse placement | No complete transitive call/effect/provenance/codec proof or target ABI witness |
 
-This is a **preview gate**, not a security sandbox. Its per-form manifest is a
-contract *candidate*, not an automatically generated network endpoint or proof
-of wire round-trip equivalence. The earlier explicit `quoted-view.html` demo
-remains the separate, server-authoritative intent round-trip. The source-backed
-[frontend-fence assessment](../js-actors-future/05-frontend-fence.md) details
-what must be established before generating general bridges.
+This is a **closed-form gate**, not a security sandbox. The bridge is now
+contract-checked but still explicit, not a generated endpoint or a universal
+codec proof. The earlier `quoted-view.html` remains a separate fixed-view demo.
+The source-backed [frontend-fence assessment](../js-actors-future/05-frontend-fence.md)
+details what must be established before general bridges.
+
+**First automatic function verdict (separate from the interactive view):**
+`compiler.bl/portable-helper-verdict` admits the source-built `view-label/0 →
+label/0` string chain in `portable-helper.bl`. It requires a complete qualified
+`codebase/dependency-cone`, all-clause `system.analyze` footprints/termination/
+string sort, and successful lowering plus the emitter's real checked ABI. Its
+additional syntactic fence permits *only* a nullary printable-ASCII literal or
+nullary direct local call, source ≤4 KiB and literal ≤64 bytes: no parameters,
+closures, captured data, dynamic dispatch, effects, numeric inference or wire
+values. The effectful unrelated `main` lies outside the selected cone; unknown
+functions, second-clause effects, closures and non-ASCII literals are refused.
+`verify-portable-helper.mjs` checks the emitted JS result. This verdict proves
+one narrow portable helper, **not** automatic Loom/Live partitioning; the bundle
+still has an explicit entry and the helper is not wired to the playground.
+Alias-qualified graph reachability and later-clause effect union now provide
+necessary evidence but are not by themselves sufficient to move a view.
 
 ### Safe `Number` proof and emission gate (distinct contracts)
 

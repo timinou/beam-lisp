@@ -28,7 +28,10 @@
   ; of its arguments, and it is what turns a `proc/defserver` declaration into
   ; the clause list this backend renders. See the compiler's own notes below.
   (:require [proc.server :as pserver]
-            [proc.super :as psuper]))
+            [proc.super :as psuper]
+            [codebase :as cb]
+            [system.analyze :as an]
+            [datom]))
 
 ; ─────────────────────────────────────────────────────────────────────────────
 ; Reader-node accessors. Self-contained on purpose (no `:require`): a node is
@@ -2136,6 +2139,96 @@
     (println (str "js-actors: numeric gate — " raw " raw-Number site(s) with witness, "
                   checked " checked H.arith site(s) -> " out-dir "/numeric-gate." output ".json")))))
 
+; The FIRST build-time auto-placement candidate is deliberately smaller than
+; "pure BL": a closed chain of nullary defns whose bodies are a literal string
+; or a direct local nullary call. It cannot capture a secret, perform dynamic
+; dispatch or consume unproved numeric input. Three existing oracles must agree:
+; codebase's qualified dependency cone, system.analyze's all-clause summary,
+; and THIS emitter's own lowering + ABI audit. No parallel JS allowlist.
+(defn portable-nullary-form? [form reached]
+  (let [items (n-items form)]
+    (and (= 4 (count items))
+         (let [params (nth items 2)
+               body (nth items 3)]
+           (and (= :vector (n-tag params)) (empty? (n-items params))
+                (or (and (erlang/is_binary (n-unwrap body))
+                         (<= (erlang/byte_size (n-unwrap body)) 64)
+                         (every? (fn [byte] (and (<= 32 byte) (<= byte 126)))
+                                 (erlang/binary_to_list (n-unwrap body))))
+                    (and (= :list (n-tag body))
+                         (= 1 (count (n-items body)))
+                         (let [callee (first (n-items body))]
+                           (and (= :symbol (n-tag callee))
+                                (contains? reached (str "js/" (n-name callee))))))))))))
+
+(defn portable-helper-verdict [path root]
+  (try
+    (let [src (File/read! path)
+          facts (cb/index-source {} "js" src)
+          conn (cb/connect-codebase)
+          _ (datom/transact! conn (concat (:fn facts) (:calls facts) (:instr facts) (:requires facts)))
+          cone (cb/dependency-cone (datom/db conn) (str "js/" root))
+          reached (set (:reached cone))
+          summaries (an/analyze src)
+          forms (read-file-forms path)
+          members (filter (fn [f] (and (defn-form? f)
+                                        (contains? reached (str "js/" (defn-name f))))) forms)
+          defs (compile-source path "js")
+          emitted (filter (fn [d] (contains? reached (str "js/" (:name d)))) defs)
+          defined (reduce (fn [m d] (assoc m (:name d) true)) {} emitted)]
+      (cond
+        (> (erlang/byte_size src) 4096)
+          {:eligible false :reason :oversized-source}
+        (not (contains? reached (str "js/" root)))
+          {:eligible false :reason :missing-root}
+        (not (:complete cone))
+          {:eligible false :reason :unresolved-dependency :calls (:calls cone)}
+        (not (= (count reached) (count members)))
+          {:eligible false :reason :missing-definition :reached (:reached cone)}
+        (not (every? (fn [f] (portable-nullary-form? f reached)) members))
+          {:eligible false :reason :unsupported-form :reached (:reached cone)}
+        (not (every? (fn [f]
+                       (let [s (get summaries (defn-name f))]
+                         (and (= {} (:footprint s)) (= true (:terminates s))
+                              (= #{:string} (:returns s))))) members))
+          {:eligible false :reason :unproved-purity-or-sort :reached (:reached cone)}
+        :else
+          (try
+            (do
+              (doseq [d emitted] (emit (:node d) {:tail false}))
+              (audit! (refs-of (map :node emitted)) defined)
+              {:eligible true :root root :reached (:reached cone)
+               :sort :string :input :none :wire :none :evidence [:qualified-cone :all-clauses :js-abi]})
+            (catch e {:eligible false :reason :abi-refused :detail (ex-message e)}))))
+    (catch e {:eligible false :reason :analysis-failed :detail (ex-message e)})))
+
+(defn portable-helper-tests [dir]
+  (let [path (str dir "/portable-helper.bl")
+        admitted (portable-helper-verdict path "view-label")
+        effect (portable-helper-verdict path "main")
+        missing (portable-helper-verdict path "does-not-exist")
+        negative (str dir "/portable-helper-refusals.bl")
+        secret (portable-helper-verdict negative "secret")
+        dynamic (portable-helper-verdict negative "runtime-call")
+        later (portable-helper-verdict negative "later")
+        unknown (portable-helper-verdict negative "unknown")
+        nonascii (portable-helper-verdict negative "nonascii")]
+    (when-not (and (= true (:eligible admitted))
+                   (= #{"js/view-label" "js/label"} (set (:reached admitted)))
+                   (= :string (:sort admitted))
+                   (= :none (:input admitted))
+                   (= false (:eligible effect))
+                   (= false (:eligible missing))
+                   (every? (fn [r] (= false (:eligible r)))
+                           [secret dynamic later unknown nonascii])
+                   (= :unsupported-form (:reason nonascii)))
+      (throw (ex-info "portable-helper gate did not fail closed"
+                      {:admitted admitted :effect effect :missing missing
+                       :secret secret :dynamic dynamic :later later
+                       :unknown unknown :nonascii nonascii})))
+    (println (str "PORTABLE HELPER PASS " (pr-str admitted)
+                  " | effect " (:reason effect) " | missing " (:reason missing)))))
+
 (defn build [dir]
   (build-one dir "test.bl" "bundle.mjs")
   (build-one dir "demo.bl" "demo.mjs")
@@ -2145,6 +2238,8 @@
   (build-one dir "quoted-backend.bl" "quoted-backend.mjs" ["quoted-view-core.bl"])
   (build-one dir "quoted-frontend.bl" "quoted-frontend.mjs" ["quoted-view-core.bl"])
   (build-one dir "quoted-playground.bl" "quoted-playground.mjs" ["quoted-view-core.bl"])
+  (build-one dir "portable-helper.bl" "portable-helper.mjs")
+  (portable-helper-tests dir)
   (expect-diagnostic "(fn [] (try (File/read! \"/tmp/x\") (catch e 2)))"
                      "not in the checked ABI")
   (expect-diagnostic "(fn [] 9007199254740992)" "integer literal exceeds")
@@ -2157,8 +2252,10 @@
       (throw (ex-info "js-actors: negative compiler tests failed" {:failures fails})))))
 
 (defn main [argv]
-  (let [dir (if (empty? argv) "research/js-actors" (first argv))]
-    (let [code (build (resolve-dir dir))]
-      (if (zero? code) code 1))))
+  (let [dir (resolve-dir (if (empty? argv) "research/js-actors" (first argv)))]
+    (if (= "1" (System/get_env "JS_ACTORS_HELPER_ONLY"))
+      (portable-helper-tests dir)
+      (let [code (build dir)]
+        (if (zero? code) code 1)))))
 
 (main (BeamLisp/argv))
