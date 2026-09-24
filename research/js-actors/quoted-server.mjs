@@ -45,8 +45,20 @@ const OP_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const VERSION_RE = /^(0|[1-9][0-9]{0,15})$/;
 const ACTOR_TIMEOUT_MS = 4000;
 
+// The page loads its module externally; inline scripts are refused. The
+// stylesheet remains inline, while worker, fetch and module imports are
+// restricted to this origin.
+const CSP_PAGE =
+  "default-src 'none'; script-src 'self'; worker-src 'self'; " +
+  "child-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; " +
+  "img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; " +
+  "frame-ancestors 'none'";
+
 // A fixed allowlist. `pathname` is never joined to a directory: an unknown path
-// has no entry and is refused, so no request can reach outside this table.
+// has no entry and is refused, so no request can reach outside this table. Each
+// entry is `[file, content-type, optional CSP]`. The compiled BACKEND bundle is
+// deliberately absent: the browser demo reaches it only through `/api/intent`,
+// never as a downloadable file.
 const STATIC = new Map([
   ['/', ['browser.html', 'text/html; charset=utf-8']],
   ['/browser.html', ['browser.html', 'text/html; charset=utf-8']],
@@ -57,6 +69,11 @@ const STATIC = new Map([
   ['/demo-worker.mjs', ['demo-worker.mjs', 'text/javascript; charset=utf-8']],
   ['/super-demo-worker.mjs', ['super-demo-worker.mjs', 'text/javascript; charset=utf-8']],
   ['/trace-demo-worker.mjs', ['trace-demo-worker.mjs', 'text/javascript; charset=utf-8']],
+  ['/quoted-view.html', ['quoted-view.html', 'text/html; charset=utf-8', CSP_PAGE]],
+  ['/quoted-view-page.mjs', ['quoted-view-page.mjs', 'text/javascript; charset=utf-8']],
+  ['/quoted-view-worker.mjs', ['quoted-view-worker.mjs', 'text/javascript; charset=utf-8']],
+  ['/quoted-view-frame.mjs', ['quoted-view-frame.mjs', 'text/javascript; charset=utf-8']],
+  ['/out/quoted-frontend.mjs', ['out/quoted-frontend.mjs', 'text/javascript; charset=utf-8']],
 ]);
 
 // The BL reasons this transport knows how to place on the HTTP status line.
@@ -254,7 +271,7 @@ export async function startBackend({ port = 0 } = {}) {
     }
     const entry = STATIC.get(pathname);
     if (!entry) return send(res, 404, { ok: false, reason: 'not-found' });
-    const [file, type] = entry;
+    const [file, type, csp] = entry;
     try {
       const data = await readFile(new URL(file, import.meta.url));
       res.writeHead(200, {
@@ -262,6 +279,7 @@ export async function startBackend({ port = 0 } = {}) {
         'content-length': data.length,
         'cache-control': 'no-store',
         'x-content-type-options': 'nosniff',
+        ...(csp === undefined ? {} : { 'content-security-policy': csp }),
       });
       res.end(req.method === 'HEAD' ? undefined : data);
     } catch {
