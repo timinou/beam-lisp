@@ -784,6 +784,43 @@ export function enqueueInput(topic, payload) {
   if (activeRuntime && activeRuntime.inputWake) activeRuntime.inputWake();
 }
 
+// Dedicated typed transport for the editable quoted-view Worker. Unlike
+// enqueueInput, this admits only finite data, not executable BL values; the BL
+// evaluator still makes the final grammar decision. It cannot grant authority.
+export function enqueueQuotedForm(form) {
+  let remaining = 96;
+  const seen = new WeakSet();
+  function check(value, depth) {
+    if (--remaining < 0 || depth > 8) throw new Error("quoted form exceeds transport bounds");
+    if (isKw(value)) return;
+    if (typeof value === "string" && value.length <= 96) return;
+    if (Number.isSafeInteger(value) && value >= 0) return;
+    if (value && typeof value === "object") {
+      if (seen.has(value)) throw new Error("cyclic or reused quoted form");
+      seen.add(value);
+      if (isVec(value)) {
+        for (const item of vecItems(value)) check(item, depth + 1);
+        return;
+      }
+      if (isBMap(value)) {
+        for (const key of listToArray(mapKeys(value))) {
+          if (!isKw(key)) throw new Error("quoted map requires keyword keys");
+          check(key, depth + 1);
+          check(mapGet(value, key), depth + 1);
+        }
+        return;
+      }
+    }
+    throw new Error("quoted form requires closed data values");
+  }
+  if (!isVec(form)) throw new Error("quoted form requires a vector root");
+  check(form, 0);
+  const queue = activeRuntime ? activeRuntime.inbox : earlyInputs;
+  if (queue.length >= 1024) throw new Error("browser input queue is full");
+  queue.push(vec([kw("browser"), kw("preview"), form]));
+  if (activeRuntime && activeRuntime.inputWake) activeRuntime.inputWake();
+}
+
 export function waitForInput(rt, ms, inputEnabled = true) {
   // Early input is only actionable after BL has selected a living sink. When
   // no sink exists, a timed receive must sleep until its deadline, not spin on

@@ -74,6 +74,11 @@ const STATIC = new Map([
   ['/quoted-view-worker.mjs', ['quoted-view-worker.mjs', 'text/javascript; charset=utf-8']],
   ['/quoted-view-frame.mjs', ['quoted-view-frame.mjs', 'text/javascript; charset=utf-8']],
   ['/out/quoted-frontend.mjs', ['out/quoted-frontend.mjs', 'text/javascript; charset=utf-8']],
+  ['/quoted-playground.html', ['quoted-playground.html', 'text/html; charset=utf-8', CSP_PAGE]],
+  ['/quoted-playground-page.mjs', ['quoted-playground-page.mjs', 'text/javascript; charset=utf-8']],
+  ['/quoted-playground-worker.mjs', ['quoted-playground-worker.mjs', 'text/javascript; charset=utf-8']],
+  ['/quoted-form.mjs', ['quoted-form.mjs', 'text/javascript; charset=utf-8']],
+  ['/out/quoted-playground.mjs', ['out/quoted-playground.mjs', 'text/javascript; charset=utf-8']],
 ]);
 
 // The BL reasons this transport knows how to place on the HTTP status line.
