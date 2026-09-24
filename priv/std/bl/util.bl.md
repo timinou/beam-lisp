@@ -345,7 +345,11 @@ is what makes it stick.
   "A code-path entry as a binary. `code.get_path` answers charlists and the
    library store answers binaries; comparing the two needs one shape."
   [p]
-  (if (erlang/is_binary p) p (erlang/list_to_binary p)))
+  ; `unicode:characters_to_binary`, not `list_to_binary`: a code-path entry is
+  ; a CHARLIST, and a directory named with a non-Latin-1 character (a test's
+  ; tmp dir titled "compile → load") is not a valid iolist — measured: every
+  ; `bl test` run in a VM that had such a path died in `list_to_binary`.
+  (if (erlang/is_binary p) p (unicode/characters_to_binary p)))
 
 (defn register-store-paths!
   "Put the library STORE's compiled ebins on the VM code path. Idempotent: a
