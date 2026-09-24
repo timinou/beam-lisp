@@ -62,7 +62,7 @@ for precise unsupported operations, trusted-code boundary and remaining gaps.
 ### Numeric research alongside the actor roadmap
 
 [The exact numeric spike](04-exact-numeric-spike.md) and its reproducible
-`numeric-spike.mjs` compare 17 native BEAM observations with a tagged BigInt /
+`numeric-spike.mjs` compare 34 native BEAM observations with a tagged BigInt /
 scaled-decimal JS candidate. It identifies a necessary host BigInt primitive;
 [FEAT-056](../../!tasks/features/FEAT-056-implement-exact-tagged-numeric-runtime-f.org)
 is the unimplemented exact-numeric cutover, separate from the conditional

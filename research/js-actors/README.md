@@ -161,7 +161,7 @@ annotations stay on checked `H.arith`. That is the implemented portion of
 [FEAT-055](../../!tasks/features/FEAT-055-gate-anf-number-lowering-with-trusted-ra.org),
 not a trusted variable-range inference system or full numeric compatibility.
 [FUP-124](../../!tasks/follow-ups/FUP-124-research-full-exact-numeric-semantics-fo.org)
-has a [17-case tagged BigInt/decimal research spike](../js-actors-future/04-exact-numeric-spike.md);
+has a [34-case tagged BigInt/decimal research spike](../js-actors-future/04-exact-numeric-spike.md);
 [FEAT-056](../../!tasks/features/FEAT-056-implement-exact-tagged-numeric-runtime-f.org)
 tracks the unimplemented exact numeric tower. Checked guards remain for every
 unproven operation.
@@ -470,9 +470,9 @@ Freshly rebuilt from BL source on 2026-09-23:
 - Selected independent native BEAM differentials passed: **11 exit-signal
   reasons, 4 name/call rules, 25 table rules, and 10 supervisor rules plus a
   two-step rest-for-one trace**. These compare specified observations, not
-  universal OTP equivalence. The exact-number research spike compares 17
-  native results with a tagged BigInt/decimal candidate; the exact runtime is
-  not implemented.
+  universal OTP equivalence. The exact-number research spike compares 34
+  native observations with a tagged BigInt/decimal candidate; the exact
+  runtime is not implemented.
 - The browser tool observed `super-demo.html` crash/restart twice with fresh
   pids, a message accepted between restarts, and graceful Stop. The BL ledger
   and restart policy—not page JavaScript—produced the reported state.
