@@ -99,6 +99,17 @@ is one box:
 (box {:dir :col :at {:md {:dir :row}}} a b c)
 ```
 
+Motion is a style too. `keyframes` turns a map of stops into a hashed name,
+exactly as `sx` turns a map into a class, and the rule ships with the page and
+with the first live patch that reaches it. A change needs no script: the view
+puts the new state in a style, the patch swaps the class, and a `transition`
+eases the browser from the old state to the new one.
+
+```clojure
+(sx {:animation (str (keyframes {:from {:opacity 0}}) " 400ms backwards")
+     :transition "stroke-dasharray 900ms"})
+```
+
 And hover or focus styles ride along in `:on`. Layout stays one value you can
 read, pass around, and transform — never a scatter of stylesheet rules.
 

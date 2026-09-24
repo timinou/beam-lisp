@@ -68,6 +68,21 @@ mod atoms {
         // own stdlib atoms use: `false_ = "false"`).
         true_ = "true",
         false_ = "false",
+        // `fjall_stats` keys. The engine's own reporting surface: compaction,
+        // flushing, journal and disk accounting, plus the block cache's
+        // capacity. NONE of it was readable before this NIF, which is why
+        // "the cache is too small" and "compaction has never been observed"
+        // were inferences rather than measurements.
+        cache_capacity,
+        write_buffer,
+        flushes_completed,
+        active_compactions,
+        compactions_completed,
+        time_compacting_us,
+        journal_count,
+        journal_bytes,
+        disk_bytes,
+        partitions,
     }
 }
 
@@ -772,6 +787,35 @@ fn fjall_delete(handle: ResourceArc<DbHandle>, key: Binary) -> NifResult<Atom> {
 /// once at the end of a transaction (or a bulk load), turning N per-group
 /// fsyncs into one. This is the durability boundary a caller can rely on: after
 /// it returns, every prior put/delete/commit is on disk.
+/// Engine statistics, for the questions only the engine can answer: how full the
+/// block cache is, whether compaction runs at all, how much of the disk is the
+/// journal.
+///
+/// WHY THIS EXISTS. `lsm-tree`'s block cache exposes `size`/`capacity`/`len` and
+/// NO hit/miss counters, so the "block cache hit rate" cannot be measured — ever,
+/// on this stack. What CAN be measured is what a hit rate is a proxy for: how
+/// much the read path pulls from the OS (see the `rchar` deltas in
+/// knowledger's `semantica/benches/bench-s93.bl`) and how full the cache is.
+/// This NIF is the second half; without it, cache sizing was an inference.
+///
+/// Cheap and side-effect free: it reads atomics the engine already maintains.
+#[rustler::nif]
+fn fjall_stats<'a>(env: Env<'a>, handle: ResourceArc<DbHandle>) -> NifResult<Term<'a>> {
+    let ks = &handle.keyspace;
+    let m = map_new(env)
+        .map_put(atoms::cache_capacity(), ks.cache_capacity())?
+        .map_put(atoms::write_buffer(), ks.write_buffer_size())?
+        .map_put(atoms::flushes_completed(), ks.flushes_completed())?
+        .map_put(atoms::active_compactions(), ks.active_compactions())?
+        .map_put(atoms::compactions_completed(), ks.compactions_completed())?
+        .map_put(atoms::time_compacting_us(), ks.time_compacting().as_micros() as u64)?
+        .map_put(atoms::journal_count(), ks.journal_count())?
+        .map_put(atoms::journal_bytes(), ks.journal_disk_space())?
+        .map_put(atoms::disk_bytes(), ks.disk_space())?
+        .map_put(atoms::partitions(), ks.partition_count())?;
+    Ok(m)
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_sync(handle: ResourceArc<DbHandle>) -> NifResult<Atom> {
     let _g = handle.lock.lock().map_err(|e| err(e))?;

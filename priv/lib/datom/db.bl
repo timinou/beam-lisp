@@ -71,20 +71,6 @@
   [db d]
   (<= (datom.index/-tx d) (basis-t db)))
 
-(defn- after-since?
-  "Whether a datom was recorded after this value's `since` bound.
-
-   Only `:since` values set one. It selects facts added in a WINDOW,
-   which is how you answer 'what changed lately?' without diffing two
-   snapshots by hand."
-  [db d]
-  (let [s (:since-t db)]
-    (or (nil? s) (> (datom.index/-tx d) s))))
-
-(defn- visible?
-  [db d]
-  (and (within-basis? db d) (after-since? db d)))
-
 (defn- retraction-key
   "The identity of the FACT a datom is about: `[e a v]`.
 
@@ -98,51 +84,6 @@
    diagnostic for cost_test, not a metric anyone should read in production —
    it exists so the fast path is PROVEN taken rather than assumed."
   (atom {}))
-
-(defn- retraction-index
-  "A map from fact key to the LATEST tx at which that fact was retracted,
-   built from `candidates` in one pass.
-
-   Replaces a per-datom store scan. `retracted-later?` used to ask the
-   store `is this fact retracted?` for EVERY datom it filtered, so
-   reading N datoms cost N scans — quadratic, and measurably so: 300
-   entities took 57ms to filter against 5ms to scan raw, and a reviewer
-   measured 45 SECONDS at 1000 values.
-
-   Wave 3's join engine calls `datoms` in a loop, so a quadratic read
-   path would have made every join quadratic too."
-  [db candidates]
-  (reduce (fn [acc d]
-            (if (and (not (datom.index/assertion? d)) (within-basis? db d))
-              (let [k (retraction-key d)
-                    tx (datom.index/-tx d)
-                    known (get acc k)]
-                (if (and (some? known) (>= known tx)) acc (assoc acc k tx)))
-              acc))
-          {}
-          candidates))
-
-(defn- current-in?
-  "Whether `d` is a fact that HOLDS at the basis, given a prebuilt
-   retraction index.
-
-   A retraction at the SAME tx as the assertion WINS — hence `<` rather
-   than `<=`. Within one transaction a value can be asserted and then
-   superseded (`[[:db/add e :age 37] [:db/add e :age 38]]` retracts 37 at
-   the very tx that asserted it), and the retraction is the later word on
-   it. Reading `<=` left both 37 and 38 current, giving a
-   cardinality-one attribute two values.
-
-   This was invisible until datom keys included `op`: before that, the
-   assertion and the retraction of 37 collided at one key and the store
-   silently kept one. Fixing the key exposed a reader bug the corrupted
-   writer had been masking — two defects that cancelled to a passing
-   test."
-  [db retractions d]
-  (and (visible? db d)
-       (datom.index/assertion? d)
-       (let [r (get retractions (retraction-key d))]
-         (or (nil? r) (< r (datom.index/-tx d))))))
 
 (def ^:private VALID-FOREVER 253402300799999)  ; #inst "9999-12-31T23:59:59.999" ms
 
@@ -158,74 +99,123 @@
         to (reduce (fn [acc d] (if (= :db.valid/to (datom.index/-a d)) (datom.index/-v d) acc)) nil ds)]
     [(or from 0) (or to VALID-FOREVER)]))
 
-(defn- valid-keep?
-  "Whether datom `d` survives this value's valid-time filter. `window-of` is a
-   memoised tx→window lookup. `:valid-at t` keeps a datom whose tx window
-   contains `t` (`from <= t < to`); `:valid-between [a b]` keeps one whose window
-   overlaps `[a b]`. No valid-time bound keeps everything."
-  [db window-of d]
-  (let [va (:valid-at db) vb (:valid-between db)]
-    (cond
-      (some? va)
-        (let [w (window-of (datom.index/-tx d))]
-          (and (<= (get w 0) va) (< va (get w 1))))
-      (some? vb)
-        (let [w (window-of (datom.index/-tx d)) a (get vb 0) b (get vb 1)]
-          (and (< (get w 0) b) (> (get w 1) a)))    ; [from,to) overlaps [a,b]
-      :else true)))
+(defn- index-retractions
+  "The retractions in `ds` as a `[e a v] → tx` map, for pairing against
+   assertions. Only ever called with retractions (the caller splits first), so
+   nothing here asks each row what it is."
+  [db retracts]
+  (reduce (fn [acc d]
+            (if (within-basis? db d)
+              (let [k (retraction-key d)
+                    tx (datom.index/-tx d)
+                    known (get acc k)]
+                (if (and (some? known) (>= known tx)) acc (assoc acc k tx)))
+              acc))
+          {}
+          retracts))
+
+(defn- later-retraction?
+  "Whether a `[e a v]` fact was retracted at or after `tx` — the check that
+   pairs an assertion with the retraction that un-asserted it."
+  [retractions d tx]
+  (let [r (get retractions (retraction-key d))]
+    (or (nil? r) (< r tx))))
 
 (defn filter-datoms
-  "Apply this value's filter to a scan result, in ONE pass.
+  "Apply this value's filter to a scan result, in ONE pass over the candidates
+   (and a second only when a retraction actually has to be paired).
 
    `:history` keeps every visible datom — including retractions, which
    are the record of what STOPPED being true and when. `:current` keeps
    only what holds at the basis. A `:valid-at`/`:valid-between` bound then
    filters by VALID time — when each fact's transaction says it is true in the
-   world — the second bitemporal axis, applied here so every reader honours it."
+   world — the second bitemporal axis, applied here so every reader honours it.
+
+   The basis, the since bound, the filter mode and the valid-time window are
+   read from `db` ONCE and closed over, never re-read inside the loop. That is
+   not tidiness: reading a field out of a large structure costs reductions in
+   proportion to the structure's size (S1 measured `(:basis-t db)` at ~700
+   reductions a row over 64 708 rows, and a padded db at 14x that), so the
+   per-row shape here is two field reads and two comparisons.
+
+   The retraction pairing is skipped entirely when the scan holds no
+   retraction — decided by one short-circuiting pass that does not
+   materialise anything, not by a pass per row that then has to."
   [db candidates]
-  (if (and (nil? (:valid-at db)) (nil? (:valid-between db)))
-    ; no valid-time bound: transaction-time filtering only, as before.
-    (if (= (:filter-mode db) :history)
-      (filterv (fn [d] (visible? db d)) candidates)
-      ; THE common case: a scan that holds no retraction at all. Then every
-      ; visible datom is an assertion that nothing has un-asserted, and the
-      ; `[e a v] → tx` pairing map — 5 µs a row, 727 ms over a 64 708-row
-      ; column with ZERO retractions, measured — is never built. One pass
-      ; to know, one pass for basis visibility (a scan can hold datoms
-      ; NEWER than this value's basis); the pairing pass only when owed.
-      (if (every? datom.index/assertion? candidates)
-        (do (swap! FILTER-STATS (fn [m] (assoc m :fast (+ 1 (get m :fast 0)))))
-            (filterv (fn [d] (visible? db d)) candidates))
-        (do (swap! FILTER-STATS (fn [m] (assoc m :indexed (+ 1 (get m :indexed 0)))))
-            (let [retractions (retraction-index db candidates)]
-              (filterv (fn [d] (current-in? db retractions d)) candidates)))))
-    ; A valid-time bound changes the ORDER: valid-time is filtered FIRST, then
-    ; transaction-time supersession is computed AMONG the surviving datoms.
-    ; This is the essence of bitemporality — a fact superseded by a later
-    ; transaction whose VALID window does not cover `t` is still current AT `t`.
-    ; (A newer price valid from Jan 15 does not un-current the Jan 1 price when
-    ; asking "what was true on Jan 10?".) Retraction/basis still apply within
-    ; the valid-time slice.
-    (let [cache (atom {})
-          window-of (fn [tx]
-                      (let [hit (get (deref cache) tx)]
-                        (if (some? hit) hit
-                          (let [w (tx-valid-window db tx)]
-                            (swap! cache assoc tx w) w))))
-          in-valid (filterv (fn [d] (valid-keep? db window-of d)) candidates)]
-      (cond
-        ; a RANGE (valid-between) is history-like: a fact valid anywhere in the
-        ; range belongs in the answer, so cardinality-one supersession must NOT
-        ; collapse two values that were each true at different points. Keep every
-        ; visible assertion in the range (basis/since still apply).
-        (some? (:valid-between db))
-          (filterv (fn [d] (and (visible? db d) (datom.index/assertion? d))) in-valid)
-        (= (:filter-mode db) :history)
-          (filterv (fn [d] (visible? db d)) in-valid)
-        ; a POINT (valid-at) is a single world-state: supersede within the slice.
-        :else
-          (let [retractions (retraction-index db in-valid)]
-            (filterv (fn [d] (current-in? db retractions d)) in-valid))))))
+  (let [bt (basis-t db)
+        st (:since-t db)
+        va (:valid-at db)
+        vb (:valid-between db)]
+    (if (and (nil? va) (nil? vb))
+      ; no valid-time bound: transaction-time filtering only, as before.
+      (if (= (:filter-mode db) :history)
+        (do (swap! FILTER-STATS (fn [m] (assoc m :history (inc (get m :history 0)))))
+            (filterv (fn [d] (let [tx (datom.index/-tx d)]
+                               (and (<= tx bt) (or (nil? st) (> tx st)))))
+                     candidates))
+        ; THE common case: a scan that holds no retraction at all. Then every
+        ; visible datom is an assertion that nothing has un-asserted, and the
+        ; `[e a v] → tx` pairing map is never built — one pass to know, one pass
+        ; for basis visibility. The pairing pass runs only when owed, and then
+        ; only over the retractions (a 64 708-row column with one retraction in
+        ; it pays for that one).
+        (if (every? datom.index/assertion? candidates)
+          (do (swap! FILTER-STATS (fn [m] (assoc m :fast (inc (get m :fast 0)))))
+              (filterv (fn [d] (let [tx (datom.index/-tx d)]
+                                 (and (<= tx bt) (or (nil? st) (> tx st)))))
+                       candidates))
+          (do (swap! FILTER-STATS (fn [m] (assoc m :indexed (inc (get m :indexed 0)))))
+              (let [retractions (index-retractions
+                                  db (filterv datom.index/retraction? candidates))]
+                (filterv (fn [d] (let [tx (datom.index/-tx d)]
+                                   (and (<= tx bt)
+                                        (or (nil? st) (> tx st))
+                                        (datom.index/assertion? d)
+                                        (later-retraction? retractions d tx))))
+                         candidates)))))
+      ; A valid-time bound changes the ORDER: valid-time is filtered FIRST, then
+      ; transaction-time supersession is computed AMONG the surviving datoms.
+      ; This is the essence of bitemporality — a fact superseded by a later
+      ; transaction whose VALID window does not cover `t` is still current AT `t`.
+      ; (A newer price valid from Jan 15 does not un-current the Jan 1 price when
+      ; asking "what was true on Jan 10?".) Retraction/basis still apply within
+      ; the valid-time slice.
+      (let [cache (atom {})
+            window-of (fn [tx]
+                        (let [hit (get (deref cache) tx)]
+                          (if (some? hit) hit
+                            (let [w (tx-valid-window db tx)]
+                              (swap! cache assoc tx w) w))))
+            keep-window (fn [d]
+                          (let [w (window-of (datom.index/-tx d))]
+                            (if (some? va)
+                              (and (<= (get w 0) va) (< va (get w 1)))
+                              (let [a (get vb 0) b (get vb 1)]
+                                (and (< (get w 0) b) (> (get w 1) a))))))
+            visible-tx (fn [tx] (and (<= tx bt) (or (nil? st) (> tx st))))
+            in-valid (filterv keep-window candidates)]
+        (cond
+          ; a RANGE (valid-between) is history-like: a fact valid anywhere in the
+          ; range belongs in the answer, so cardinality-one supersession must NOT
+          ; collapse two values that were each true at different points. Keep every
+          ; visible assertion in the range (basis/since still apply).
+          (some? vb)
+            (filterv (fn [d] (and (visible-tx (datom.index/-tx d))
+                                  (datom.index/assertion? d)))
+                     in-valid)
+          (= (:filter-mode db) :history)
+            (filterv (fn [d] (visible-tx (datom.index/-tx d))) in-valid)
+          ; a POINT (valid-at) is a single world-state: supersede within the slice.
+          :else
+            (if (every? datom.index/assertion? in-valid)
+              (filterv (fn [d] (visible-tx (datom.index/-tx d))) in-valid)
+              (let [retractions (index-retractions
+                                  db (filterv datom.index/retraction? in-valid))]
+                (filterv (fn [d] (let [tx (datom.index/-tx d)]
+                                   (and (visible-tx tx)
+                                        (datom.index/assertion? d)
+                                        (later-retraction? retractions d tx))))
+                         in-valid))))))))
 
 ;; ── reading ─────────────────────────────────────────────────────────
 

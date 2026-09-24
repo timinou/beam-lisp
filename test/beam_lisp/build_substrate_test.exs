@@ -17,7 +17,7 @@ defmodule BeamLisp.BuildSubstrateTest do
   """
   use ExUnit.Case, async: false
 
-  @mix_excludes ["dev", "mix"]
+  @mix_excludes ["mix"]
   @src Path.join(System.tmp_dir!(), "beam_lisp_substrate_src")
   @out Path.join(System.tmp_dir!(), "beam_lisp_substrate_out")
 
@@ -32,9 +32,8 @@ defmodule BeamLisp.BuildSubstrateTest do
 
   test "the project's own substrate compiles with no Mix beam in the output" do
     # The stage's root is the SOURCE root (`lib`), with exclusions relative to
-    # it: `dev/` is the Tidewave server (dev-only deps) and `mix/` is the
-    # Mix-task shells, which `use Mix.Task` and so cannot compile without Mix —
-    # the two roots `elixirc_paths/1` and the cutover care about.
+    # it: `mix/` is the Mix-task shells, which `use Mix.Task` and so cannot
+    # compile without Mix.
     root = Path.join(File.cwd!(), "lib")
     sources = BeamLisp.Substrate.sources(root, @mix_excludes)
     count = Enum.count(sources)

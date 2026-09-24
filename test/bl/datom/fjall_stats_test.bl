@@ -1,0 +1,99 @@
+; test/bl/datom/fjall_stats_test.bl — the engine's own reporting surface.
+;
+; S9.3 of the datom spike asked for "the live fjall block-cache hit rate". The
+; answer is that a hit RATE cannot be measured on this stack at all:
+; `lsm-tree`'s BlockCache exposes `size`/`capacity`/`len` and no hit or miss
+; counters (read in the crate source, 2.10.4). So the fact had to be replaced by
+; two measurable ones — read volume per operation (`rchar` deltas) and how full
+; the cache is — and the second of those needed this NIF, because nothing could
+; see it. The same NIF is what makes compaction observable, which is the whole of
+; write amplification.
+;
+; These assertions are what make it an instrument rather than a decoration: a
+; counter that never moves would pass a "returns a map" test and still tell you
+; nothing.
+
+(ns datom.fjall.stats.test
+  (:require [datom :as d] [datom.db] [datom.store] [datom.store-fjall :as fjall]
+            [datom.profile :as profile]))
+
+(defn- fresh []
+  (fjall/open (datom.store/fresh-path "/tmp/bl-stats")))
+
+(deftest the-engine-reports-its-geometry
+  (let [store (fresh)
+        s (fjall/stats store)]
+    (is (> (get s :cache_capacity) 0) "the block cache has a capacity, in bytes")
+    ; `write_buffer_size` is the memtable's CURRENT occupancy, not its limit — so
+    ; a fresh store reports 0, and an assertion of "> 0" here would be asserting
+    ; the wrong quantity (learned by failing it once).
+    (is (= 0 (get s :write_buffer)) "a fresh memtable holds nothing")
+    (is (= 1 (get s :partitions))
+        "one partition holds every index tag (the shape S7 is asked to re-examine)")
+    (is (= 0 (get s :compactions_completed))
+        "a fresh store has compacted nothing — the counter starts where it should")
+    (is (number? (get s :disk_bytes)) "disk accounting is a number, not nil")))
+
+(deftest the-untuned-geometry-is-what-the-sizing-arguments-had-to-assume
+  ; The spike's audit said "32 MiB block cache, 4 KiB blocks, one partition for
+  ; all four index tags" as its reading of the defaults. Two of those three are
+  ; now measured rather than read, and pinning them here means S7's re-sizing is
+  ; a deliberate act with a failing test to update, not a silent drift.
+  (let [store (fresh)
+        s (fjall/stats store)]
+    (is (= 33554432 (get s :cache_capacity))
+        "the block cache defaults to 32 MiB — and it is SHARED by every open
+         keyspace, so the whole deployment divides it")
+    (is (= 1 (get s :partitions))
+        "every index tag lives in ONE partition (S7 asks whether that is right)")
+    (is (= 0 (get s :compactions_completed)) "a fresh store has compacted nothing")))
+
+(deftest the-counters-that-move-are-the-ones-worth-reading
+  ; Each assertion here was chosen AFTER measuring which counters move: the first
+  ; version asserted `disk_bytes` grows with a write and that is false, because
+  ; `disk_bytes`/`journal_bytes` report PREALLOCATED file sizes (a 32 MiB journal
+  ; exists before a row is written). A counter that cannot move, quoted as
+  ; evidence, is how a metric becomes a lie — so the preallocation is asserted
+  ; too, and the write-volume counter that DOES move is the memtable's.
+  (let [conn (d/connect-with (fresh) [{:db/ident :note :db/valueType :db.type/string}])
+        store (datom.db/store-of (d/db conn))
+        before (fjall/stats store)]
+    (is (> (get before :journal_bytes) 0)
+        "the journal is a preallocated file — it exists before any write")
+    (d/transact! conn (mapv (fn [i] {:db/id (- (+ i 1)) :note (str "row " i)})
+                            (vec (range 200))))
+    (let [after (fjall/stats store)]
+      (is (> (get after :write_buffer) (get before :write_buffer))
+          "the memtable's occupancy is the live write-volume counter")
+      (is (= (get before :disk_bytes) (get after :disk_bytes))
+          "and the preallocated on-disk numbers do NOT move — so they are not a
+           write-volume signal, however tempting")
+      (is (>= (get after :journal_count) (get before :journal_count))
+          "the journal count is a live number, never nil")
+      (is (number? (get after :time_compacting_us))
+          "compaction time is readable, so S7 can watch it"))))
+
+(deftest the-read-volume-is-what-the-cache-cannot-hide
+  ; The half of the answer that cache capacity is judged AGAINST. `rchar` counts
+  ; bytes read through syscalls in THIS process, so a block-cache hit (no syscall)
+  ; is excluded and a re-read is not — which is why this number, and not a hit
+  ; rate, is the honest one to quote.
+  (let [conn (d/connect-with (fresh) [{:db/ident :note :db/valueType :db.type/string}])
+        store (datom.db/store-of (d/db conn))]
+    (d/transact! conn (mapv (fn [i] {:db/id (- (+ i 1)) :note (str "x" i)})
+                            (vec (range 3000))))
+    (let [read-it (fn [] (profile/os-reads-delta (fn [] (count (datom.db/attr-datoms (d/db conn) :note)))))
+          first-pass (read-it)
+          second-pass (read-it)
+          s (fjall/stats store)]
+      (is (some? first-pass) "this platform reports OS reads (no /proc is nil, never 0)")
+      (is (> (get first-pass :value) 0) "the rows are there to be read")
+      (is (> (get first-pass :rchar) 0) "the first pass read bytes from the OS")
+      (is (> (get second-pass :rchar) 0)
+          "and SO DID THE SECOND: a scan re-reads instead of being retained")
+      ; The sharp form of the cache claim, and the one an assertion can carry:
+      ; this column is far smaller than the cache's capacity, and the second pass
+      ; still went to the OS for it. So "the cache is too small" is NOT the whole
+      ; story — these read paths are not served from it at all.
+      (is (< (get first-pass :rchar) (get s :cache_capacity))
+          "the column fits the cache comfortably, and the second pass read it again"))))
