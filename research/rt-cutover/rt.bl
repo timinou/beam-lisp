@@ -32,7 +32,8 @@
             [rt.reduce :as rd]
             [rt.print :as pr]
             [rt.read :as rdr]
-            [rt.sorted :as so]))
+            [rt.sorted :as so]
+            [rt.raw :as raw]))
 
 ;; ── classification ─────────────────────────────────────────────────────────
 ; One classifier answers every "what kind of thing is this". Predicates read it
@@ -337,366 +338,270 @@
 
 
 
-;; ── `seed_core` — the `core` link table ────────────────────────────────────
+;; ── `seed_core` — the `core` table ───────────────────────────────────────
 ;
-; Every name the prelude, the interop layer and the `cpp/*` slices resolve,
-; bound in the namespace they are called from. Two mechanisms, and they are not
-; the same thing:
+; Every name the prelude, the interop layer and the `cpp/*` slices resolve
+; before any `.bl` has loaded. Two mechanisms, one table:
 ;
-;   BEAM_LISP.ENV/INTERN    binds a var whose value is a CALLABLE. The call site
-;     goes through `invoke`.
-;   BEAM_LISP.ENV/PUT-LINK  binds a DIRECT call link: the compiler emits a
-;     remote call and `invoke` is skipped.
+;   VALUE  `Env/intern` binds a var whose value is a CALLABLE; a call site that
+;          is not linked goes through `invoke`, which reads the arity out of it.
+;   LINK   `Env/put_link` writes `{module, %{arity => fun}, {min, fun} | nil}`;
+;          the compiler turns a BARE call at a linked arity into a direct remote
+;          call and never consults `invoke`.
 ;
-; THE LINK ROWS ARE THE FLIP. A row whose module is the runtime names THIS
-; namespace (`Elixir.BeamLisp.Ns.Rt`); a row whose module is a HOST module
-; (`BeamLisp.Num`, `BeamLisp.Refs`, `:erlang`) is unchanged, because those
-; modules are not going anywhere. Nothing else in this function moves at the
-; cutover — which is why the cutover is a table edit and not a rewrite.
+; A row is `(name module fixed variadic how)`: `module` is `:rt` for this
+; namespace or a host module atom, `fixed` maps arity → exported function,
+; `variadic` is `(min fun)` or nil, and `how` says whether the row seeds the
+; value, the link, or both. VALUE and LINK are derived from the same row, so
+; they cannot drift; where they genuinely differ (`assoc` links only its fixed
+; arity, `map`'s link has no transducer arity) the name has two rows.
 ;
-; TWO RULES THAT ARE NOT OBVIOUS, both learned from the module being replaced:
-;
-;   A MULTI-ARITY NAME IS INTERNED AS A VALUE, NOT ASSEMBLED FROM ARITIES. A
-;   multi-arity `defn`'s var value is already a multi-fn, because the language's
-;   own cross-namespace call path is `invoke` and `invoke` reads the clause out
-;   of that value. So most names below are just the facade's own function,
-;   looked up once.
-;
-;   A NAME LINKED AT ONE ARITY MUST NOT BE MULTI-ARITY. The link makes the other
-;   arities UNREACHABLE — `invoke` is never consulted. RT records this rule at
-;   `filter` and `take`, which is why neither appears in the fixed-arity link
-;   table below even though both appear in the intern table above it.
-;
-; A dash is not an underscore. The link table names its targets with `_`
-; (`:print_readably`, `:drop_clj`, `:sorted_map_of`) because that is how the
-; module being replaced spells them. This module exports both, so the rows are
-; correct either way — and the reason both exist is written up under "the two
-; spellings of one member".
+; RULES THE TABLE ENCODES, each paid for once:
+;   * A link at ONE arity makes the other arities unreachable — `invoke` is not
+;     consulted. So `filter` has no link row; `take` links BOTH its arities.
+;   * A value is a plain capture exactly when it has one fixed arity and no
+;     variadic clause, otherwise the `{:"$blfn", fixed, {min, f}}` tag —
+;     `Emit.fn_value/3`'s rule, so a seeded value and a compiled `defn` value
+;     are the same shape.
+;   * Every module is an ATOM. A link row is compiled into every namespace that
+;     calls the name; a binary module there is an ANF validation failure in
+;     code that never mentions the runtime.
+;   * Nothing here runs at load. Loading `rt` must never touch `core`.
 
-(def ^private RT-MOD :"Elixir.BeamLisp.Ns.Rt")
-(def ^private NUM-MOD :"Elixir.BeamLisp.Num")
-
-(defn- core-intern [name v] (BeamLisp.Env/intern "core" name v))
-(defn- cpp-intern [name v] (BeamLisp.Env/intern "cpp" name v))
-(defn- unwrap-fetched [v]
-  (if (erlang/is_tuple v)
-      (if (erlang/== (erlang/element 1 v) :ok) (erlang/element 2 v) v)
-      v))
-
-; `Env.fetch/2` answers `{:ok, value}`, so the value is one unwrap away. Reading
-; the tuple AS the function was a real defect, and it presented as a COMPILER
-; crash: a call site resolving `core/assoc` got a 2-tuple and died inside
-; `invoke`, while compiling a file that had nothing to do with the runtime.
-(defn- own [name] (unwrap-fetched (BeamLisp.Env/fetch "rt" name)))
-
-(defn- core-link [name mod arities variadic]
-  (BeamLisp.Env/put_link "core" name
-    (erlang/list_to_tuple (list mod arities variadic))))
-
-(defn- link1 [name mod fname] (core-link name mod {1 fname} nil))
-
-; A variadic spec is a 2-TUPLE `{arity, handler}`, not a list: the handler takes
-; the fixed leading args and then ONE rest list, so its own arity is (fixed+1).
-(defn- variadic [n f] (erlang/list_to_tuple (list n f)))
-
-; `(< 1 2 3)` is a chain: 1 < 2 AND 2 < 3. Bounded by arity, never by a value.
-(defn- chain-of [op]
-  (multi-fn {} (list 1 (fn [x rest]
-    (erlang/apply :lists :all
-      (list (fn [pair] (op (nth pair 0) (nth pair 1)))
-            (erlang/apply :lists :zip (list (cons x rest) rest))))))))
-
-; Every arity folds through `BeamLisp.Num`, the tower's seam: int/float take
-; the BIF on its first clause, a decimal operand promotes.
-(defn- fold-add [args] (erlang/apply :lists :foldl (list (fn [a b] (BeamLisp.Num/add a b)) 0 args)))
-(defn- fold-mul [args] (erlang/apply :lists :foldl (list (fn [a b] (BeamLisp.Num/mul a b)) 1 args)))
-
-(def ^private CORE-OWN
-  "core names whose value is the facade's OWN function, in the contract's
-   spelling. Single-arity only: see CORE-ARITIES for the rest."
-  (list "first" "rest" "seq" "next" "count" "empty?" "cons" "identical?"
-        "find" "contains?" "print-str" "iterate" "cycle" "take-while"
-        "drop-while" "doall" "dorun" "even?" "odd?" "zero?" "pos?" "neg?"
-        "rem" "transientable?" "fn?" "seq?" "boolean" "keyword?" "symbol?"
-        "string?" "number?" "int?" "map?" "struct?" "associative?"
-        "vector?" "list?" "coll?" "ident?" "sequential?" "set" "set?"
-        "disj" "sorted?" "sorted-map?" "sorted-set?" "sorted-map-of"
-        "sorted-set-of" "last-key" "last-entry" "sorted-dissoc" "subseq"
-        "rsubseq" "tree-seq" "compare" "drop"))
-
-; A NAME THAT DISPATCHES ON ARITY IS INTERNED AS A MULTI-FN BUILT FROM
-; EXPLICIT CLAUSES — the facade's single-arity defn is not that value, and
-; `invoke` reads the clause out of the tag tuple. `assoc` is the sharp case:
-; its variadic form lives under a DIFFERENT name in the facade, so looking the
-; name up gives a 3-arity function and a 5-argument call site dies with
-; `BadArityError` from inside the compiler, compiling an unrelated file.
-(def ^private CORE-ARITIES
-  (list
-    (list "get" {2 (fn [m k] (get m k)) 3 (fn [m k d] (get m k d))} nil)
-    (list "nth" {2 (fn [x i] (nth x i)) 3 (fn [x i d] (nth x i d))} nil)
-    (list "conj" {1 (fn [c] (conj c)) 2 (fn [c x] (conj c x))} nil)
-    (list "sort" {1 (fn [c] (sort c)) 2 (fn [c o] (sort c o))} nil)
-    (list "filter" {1 (fn [p] (filter p)) 2 (fn [p c] (filter p c))} nil)
-    (list "take" {1 (fn [n] (take n)) 2 (fn [n c] (take n c))} nil)
-    (list "range" {0 (fn [] (range)) 1 (fn [e] (range e))
-                    2 (fn [s e] (range s e))} nil)
-    (list "repeat" {1 (fn [x] (repeat x)) 2 (fn [n x] (repeat n x))} nil)
-    (list "gensym" {0 (fn [] (gensym)) 1 (fn [p] (gensym p))} nil)
-    (list "assoc" {3 (fn [m k v] (assoc m k v))}
-                  (variadic 3 (fn [m k v rest] (assoc-variadic m k v rest))))))
-
-(defn- seed-core-arities []
-  (erlang/apply :lists :foreach
-    (list (fn [row] (core-intern (nth row 0) (multi-fn (nth row 1) (nth row 2))))
-          CORE-ARITIES)))
-
-(defn- seed-core-own []
-  (erlang/apply :lists :foreach
-    (list (fn [n] (core-intern n (own n))) CORE-OWN)))
-
-; The names whose `core` spelling is not the facade's own spelling, and the
-; arithmetic and chain prims, which are not names in this namespace at all.
-(defn- seed-core-special []
-  (core-intern "+" (multi-fn {} (list 0 fold-add)))
-  (core-intern "*" (multi-fn {} (list 0 fold-mul)))
-  (core-intern "-" (multi-fn {} (list 1 (fn [x rest]
-    (if (erlang/== rest ())
-        (BeamLisp.Num/neg x)
-        (erlang/apply :lists :foldl
-          (list (fn [e acc] (BeamLisp.Num/sub acc e)) x rest)))))))
-  (core-intern "/" (multi-fn {} (list 1 (fn [x rest]
-    (if (erlang/== rest ())
-        (BeamLisp.Num/div 1 x)
-        (erlang/apply :lists :foldl
-          (list (fn [e acc] (BeamLisp.Num/div acc e)) x rest)))))))
-  (core-intern "<" (chain-of (fn [a b] (BeamLisp.Num/lt a b))))
-  (core-intern ">" (chain-of (fn [a b] (BeamLisp.Num/gt a b))))
-  (core-intern "<=" (chain-of (fn [a b] (BeamLisp.Num/le a b))))
-  (core-intern ">=" (chain-of (fn [a b] (BeamLisp.Num/ge a b))))
-  (core-intern "==" (chain-of (fn [a b] (BeamLisp.Num/num_eq a b))))
-  (core-intern "=" (chain-of eqv))
-  (core-intern "not" (fn [x] (not- x)))
-  (core-intern "float?" (fn [x] (k/float? x)))
-  ; `str` is a VALUE in the module being replaced: the call site's argument
-  ; count selects the variadic clause INSIDE the multi-fn. So the fn is called.
-  (core-intern "str" (str))
-  (core-intern "pr-str" (fn [x] (print-readably x)))
-  (core-intern "apply" (multi-fn {2 (fn [f args] (apply-to f args))}
-                                (variadic 2 (fn [a b rest] (apply-variadic a b rest)))))
-  (core-intern "list*" (multi-fn {0 (fn [] (list-star-0))}
-                                 (variadic 1 list-star)))
-  (core-intern "map" (multi-fn {1 (fn [f] (map-xform f)) 2 (fn [f coll] (map f coll))}
-                                (variadic 2 (fn [f c1 rest] (map-multi f c1 rest)))))
-  (core-intern "println" (multi-fn {0 (fn [] (println)) 1 (fn [x] (println x))}
-                                   (variadic 1 (fn [x rest] (println-multi x rest)))))
-  (core-intern "concat" (multi-fn {} (variadic 0 (fn [seqs] (concat seqs))))))
-
-; Reference types: atoms, futures, promises. All plain host fns, so the link
-; rows below turn call sites into direct remote calls.
-(defn- seed-core-refs []
-  (core-intern "atom" (fn [x] (BeamLisp.Refs/atom x)))
-  (core-intern "deref" (multi-fn {1 (fn [x] (BeamLisp.Refs/deref x))
-                                 3 (fn [r k d] (BeamLisp.Refs/deref r k d))}))
-  (core-intern "swap!" (multi-fn {2 (fn [r f] (BeamLisp.Refs/swap! r f))}
-                                 (variadic 2 (fn [r f rest] (BeamLisp.Refs/swap! r f rest)))))
-  (core-intern "reset!" (fn [r v] (BeamLisp.Refs/reset! r v)))
-  (core-intern "compare-and-set!" (fn [r o n] (BeamLisp.Refs/compare_and_set! r o n)))
-  (core-intern "add-watch" (fn [r k f] (BeamLisp.Refs/add_watch! r k f)))
-  (core-intern "remove-watch" (fn [r k] (BeamLisp.Refs/remove_watch! r k)))
-  (core-intern "promise" (fn [] (BeamLisp.Refs/promise)))
-  (core-intern "deliver" (fn [p v] (BeamLisp.Refs/deliver p v)))
-  (core-intern "force" (fn [x] (BeamLisp.Deferred/force x)))
-  (core-intern "realized?" (fn [x] (BeamLisp.Deferred/realized? x)))
-  (core-intern "delay?" (fn [x] (BeamLisp.Deferred/delay? x)))
-  (core-intern "derived?" (fn [x] (BeamLisp.Reactive/derived? x)))
-  (core-intern "future?" (fn [x] (BeamLisp.Refs/future? x)))
-  (core-intern "future-cancel" (fn [x] (BeamLisp.Refs/future_cancel x)))
-  (core-intern "volatile!" (fn [x] (BeamLisp.Refs/volatile x)))
-  (core-intern "vreset!" (fn [v x] (BeamLisp.Refs/vreset! v x)))
-  (core-intern "vswap!" (multi-fn {2 (fn [v f] (BeamLisp.Refs/vswap! v f))}
-                                  (variadic 2 (fn [v f rest] (BeamLisp.Refs/vswap! v f rest)))))
-  (core-intern "volatile?" (fn [x] (BeamLisp.Refs/volatile? x))))
-
-; Transients: mutable-until-persisted views of vectors and maps.
-(defn- seed-core-transients []
-  (core-intern "transient" (fn [x] (BeamLisp.Transient/transient x)))
-  (core-intern "persistent!" (fn [x] (BeamLisp.Transient/persistent! x)))
-  (core-intern "conj!" (multi-fn {1 (fn [t] (BeamLisp.Transient/conj! t))
-                                  2 (fn [t x] (BeamLisp.Transient/conj! t x))}))
-  (core-intern "assoc!" (fn [t k v] (BeamLisp.Transient/assoc! t k v)))
-  (core-intern "dissoc!" (fn [t k] (BeamLisp.Transient/dissoc! t k)))
-  (core-intern "hash-map" (multi-fn {0 (fn [] (BeamLisp.Transient/hash_map_empty))}
-                                    (variadic 2 (fn [k v rest] (BeamLisp.Transient/hash_map k v rest))))))
-
-; The BEAM-native band: supervision trees, `:dbg` as data, and the generic
-; process verbs (`gen_server:call` works on any gen_server, so beam-lisp claims
-; the bare names at top level).
-(defn- seed-core-otp []
-  (core-intern "supervise" (multi-fn {2 (fn [a b] (BeamLisp.Supervisor/supervise a b))
-                                      3 (fn [a b c] (BeamLisp.Supervisor/supervise a b c))}))
-  (core-intern "worker" (multi-fn {2 (fn [a b] (BeamLisp.Supervisor/worker a b))
-                                   3 (fn [a b c] (BeamLisp.Supervisor/worker a b c))}))
-  (core-intern "trace" (multi-fn {2 (fn [a b] (BeamLisp.Trace/trace_2 a b))
-                                   3 (fn [a b c] (BeamLisp.Trace/trace_3 a b c))}))
-  (core-intern "untrace" (fn [x] (BeamLisp.Trace/untrace_1 x)))
-  (core-intern "start" (multi-fn {1 (fn [a] (BeamLisp.Server/start a))
-                                   2 (fn [a b] (BeamLisp.Server/start a b))
-                                   3 (fn [a b c] (BeamLisp.Server/start a b c))}))
-  (core-intern "start-link" (multi-fn {1 (fn [a] (BeamLisp.Server/start_link a))
-                                        2 (fn [a b] (BeamLisp.Server/start_link a b))
-                                        3 (fn [a b c] (BeamLisp.Server/start_link a b c))}))
-  (core-intern "call" (multi-fn {2 (fn [a b] (BeamLisp.Server/call a b))
-                                  3 (fn [a b c] (BeamLisp.Server/call a b c))}))
-  (core-intern "cast" (fn [p m] (BeamLisp.Server/cast p m)))
-  (core-intern "stop" (multi-fn {1 (fn [a] (BeamLisp.Server/stop a))
-                                  2 (fn [a b] (BeamLisp.Server/stop a b))}))
-  (core-intern "monitor" (fn [p] (erlang/monitor :process p)))
-  (core-intern "link" (fn [p] (erlang/link p)))
-  (core-intern "kill" (fn [p] (erlang/exit p :kill))))
+(def ^private SEED
+  '(("identical?" :rt {2 :identical?} nil :both)
+    ("first" :rt {1 :first} nil :both)
+    ("rest" :rt {1 :rest} nil :both)
+    ("seq" :rt {1 :seq} nil :both)
+    ("next" :rt {1 :next} nil :both)
+    ("count" :rt {1 :count} nil :both)
+    ("empty?" :rt {1 :empty?} nil :both)
+    ("cons" :rt {2 :cons} nil :both)
+    ("conj" :rt {1 :conj 2 :conj} nil :both)
+    ("nth" :rt {2 :nth 3 :nth} nil :both)
+    ("get" :rt {2 :get 3 :get} nil :both)
+    ("assoc" :rt {3 :assoc} (3 :assoc_variadic) :value)
+    ("assoc" :rt {3 :assoc} nil :link)
+    ("apply" :rt {2 :apply_to} (2 :apply_variadic) :both)
+    ("list*" :rt {0 :list_star_0} (1 :list_star) :both)
+    ("println" :rt {0 :println 1 :println} (1 :println_multi) :value)
+    ("pr-str" :rt {1 :print_readably} nil :both)
+    ("print-str" :rt {1 :print_str} nil :both)
+    ("gensym" :rt {0 :gensym 1 :gensym} nil :both)
+    ("map" :rt {1 :map_xform 2 :map} (2 :map_multi) :value)
+    ("map" :rt {2 :map} (2 :map_multi) :link)
+    ("filter" :rt {1 :filter_xform 2 :filter} nil :value)
+    ("range" :rt {0 :range 1 :range 2 :range} nil :both)
+    ("iterate" :rt {2 :iterate} nil :both)
+    ("repeat" :rt {1 :repeat 2 :repeat} nil :both)
+    ("cycle" :rt {1 :cycle} nil :both)
+    ("concat" :rt {} (0 :concat) :value)
+    ("take" :rt {1 :take_xform 2 :take} nil :both)
+    ("drop" :rt {2 :drop_clj} nil :both)
+    ("take-while" :rt {2 :take_while} nil :both)
+    ("drop-while" :rt {2 :drop_while} nil :both)
+    ("doall" :rt {1 :doall} nil :both)
+    ("dorun" :rt {1 :dorun} nil :both)
+    ("not" :rt {1 :not_} nil :value)
+    ("even?" :rt {1 :even?} nil :both)
+    ("odd?" :rt {1 :odd?} nil :both)
+    ("zero?" :rt {1 :zero?} nil :both)
+    ("pos?" :rt {1 :pos?} nil :both)
+    ("neg?" :rt {1 :neg?} nil :both)
+    ("rem" :rt {2 :rem} nil :value)
+    ("rem" :erlang {2 :rem} nil :link)
+    ("float?" :rt {1 :float?} nil :both)
+    ("transientable?" :rt {1 :transientable?} nil :both)
+    ("fn?" :rt {1 :fn?} nil :both)
+    ("seq?" :rt {1 :seq?} nil :both)
+    ("boolean" :rt {1 :boolean} nil :both)
+    ("find" :rt {2 :find} nil :both)
+    ("contains?" :rt {2 :contains?} nil :both)
+    ("keyword?" :rt {1 :keyword?} nil :both)
+    ("symbol?" :rt {1 :symbol?} nil :both)
+    ("string?" :rt {1 :string?} nil :both)
+    ("number?" :rt {1 :number?} nil :both)
+    ("int?" :rt {1 :int?} nil :both)
+    ("map?" :rt {1 :map?} nil :both)
+    ("struct?" :rt {1 :struct?} nil :both)
+    ("associative?" :rt {1 :associative?} nil :both)
+    ("vector?" :rt {1 :vector?} nil :both)
+    ("list?" :rt {1 :list?} nil :both)
+    ("coll?" :rt {1 :coll?} nil :both)
+    ("ident?" :rt {1 :ident?} nil :both)
+    ("set" :rt {1 :set} nil :both)
+    ("set?" :rt {1 :set?} nil :both)
+    ("disj" :rt {2 :disj} nil :both)
+    ("sequential?" :rt {1 :sequential?} nil :both)
+    ("sorted-map-of" :rt {1 :sorted_map_of} nil :both)
+    ("sorted-set-of" :rt {1 :sorted_set_of} nil :both)
+    ("sorted?" :rt {1 :sorted?} nil :both)
+    ("last-key" :rt {1 :last_key} nil :both)
+    ("last-entry" :rt {1 :last_entry} nil :both)
+    ("subseq" :rt {3 :subseq} nil :both)
+    ("rsubseq" :rt {3 :rsubseq} nil :both)
+    ("sorted-map?" :rt {1 :sorted_map?} nil :both)
+    ("sorted-set?" :rt {1 :sorted_set?} nil :both)
+    ("sorted-dissoc" :rt {2 :sorted_dissoc} nil :both)
+    ("tree-seq" :rt {3 :tree_seq} nil :both)
+    ("compare" :rt {2 :compare} nil :both)
+    ("sort" :rt {1 :sort 2 :sort} nil :both)
+    ("reduced" :rt {1 :reduced} nil :value)
+    ("reduced?" :rt {1 :reduced?} nil :value)
+    ("reader-macro!" :rt {2 :reader_macro!} nil :both)
+    ("data-reader!" :rt {2 :data_reader!} nil :both)
+    ("read-data" :rt {1 :read_data} nil :both)
+    ;; the numeric tower: values are the variadic closures below; the 2-arity
+    ;; call sites link straight into BeamLisp.Num (Erlang spells `<=` as `=<`,
+    ;; so no row names an :erlang comparison)
+    ("+" :Elixir.BeamLisp.Num {2 :add} nil :link)
+    ("-" :Elixir.BeamLisp.Num {1 :neg 2 :sub} nil :link)
+    ("*" :Elixir.BeamLisp.Num {2 :mul} nil :link)
+    ("/" :Elixir.BeamLisp.Num {2 :div} nil :link)
+    ("<" :Elixir.BeamLisp.Num {2 :lt} nil :link)
+    (">" :Elixir.BeamLisp.Num {2 :gt} nil :link)
+    ("<=" :Elixir.BeamLisp.Num {2 :le} nil :link)
+    (">=" :Elixir.BeamLisp.Num {2 :ge} nil :link)
+    ("==" :Elixir.BeamLisp.Num {2 :num_eq} nil :link)
+    ("=" :rt {2 :eqv} nil :link)
+    ;; reference types
+    ("atom" :Elixir.BeamLisp.Refs {1 :atom} nil :both)
+    ("deref" :Elixir.BeamLisp.Refs {1 :deref 3 :deref} nil :both)
+    ("swap!" :Elixir.BeamLisp.Refs {2 :swap!} (2 :swap!) :both)
+    ("reset!" :Elixir.BeamLisp.Refs {2 :reset!} nil :both)
+    ("compare-and-set!" :Elixir.BeamLisp.Refs {3 :compare_and_set!} nil :both)
+    ("add-watch" :Elixir.BeamLisp.Refs {3 :add_watch!} nil :both)
+    ("remove-watch" :Elixir.BeamLisp.Refs {2 :remove_watch!} nil :both)
+    ("promise" :Elixir.BeamLisp.Refs {0 :promise} nil :both)
+    ("deliver" :Elixir.BeamLisp.Refs {2 :deliver} nil :both)
+    ("force" :Elixir.BeamLisp.Deferred {1 :force} nil :both)
+    ("realized?" :Elixir.BeamLisp.Deferred {1 :realized?} nil :both)
+    ("delay?" :Elixir.BeamLisp.Deferred {1 :delay?} nil :both)
+    ("derived?" :Elixir.BeamLisp.Reactive {1 :derived?} nil :both)
+    ("future?" :Elixir.BeamLisp.Refs {1 :future?} nil :both)
+    ("future-cancel" :Elixir.BeamLisp.Refs {1 :future_cancel} nil :both)
+    ("volatile!" :Elixir.BeamLisp.Refs {1 :volatile} nil :value)
+    ("vreset!" :Elixir.BeamLisp.Refs {2 :vreset!} nil :value)
+    ("vswap!" :Elixir.BeamLisp.Refs {2 :vswap!} (2 :vswap!) :value)
+    ("volatile?" :Elixir.BeamLisp.Refs {1 :volatile?} nil :value)
+    ;; transients
+    ("transient" :Elixir.BeamLisp.Transient {1 :transient} nil :both)
+    ("persistent!" :Elixir.BeamLisp.Transient {1 :persistent!} nil :both)
+    ("conj!" :Elixir.BeamLisp.Transient {1 :conj! 2 :conj!} nil :both)
+    ("assoc!" :Elixir.BeamLisp.Transient {3 :assoc!} nil :both)
+    ("dissoc!" :Elixir.BeamLisp.Transient {2 :dissoc!} nil :both)
+    ("hash-map" :Elixir.BeamLisp.Transient {0 :hash_map_empty} (2 :hash_map) :both)
+    ;; the BEAM-native band: supervision and the generic process verbs
+    ;; (`gen_server:call` works on any gen_server, so the bare names are ours)
+    ("supervise" :Elixir.BeamLisp.Supervisor {2 :supervise 3 :supervise} nil :value)
+    ("worker" :Elixir.BeamLisp.Supervisor {2 :worker 3 :worker} nil :value)
+    ("start" :Elixir.BeamLisp.Server {1 :start 2 :start 3 :start} nil :value)
+    ("start-link" :Elixir.BeamLisp.Server {1 :start_link 2 :start_link 3 :start_link} nil :value)
+    ("call" :Elixir.BeamLisp.Server {2 :call 3 :call} nil :value)
+    ("cast" :Elixir.BeamLisp.Server {2 :cast} nil :value)
+    ("stop" :Elixir.BeamLisp.Server {1 :stop 2 :stop} nil :value)
+    ("link" :erlang {1 :link} nil :value)))
 
 ; `cpp/*` interop: jank calls its C++ primitives under the `cpp` namespace, so
-; beam-lisp maps that qualified name onto a BEAM function with the same
-; semantics and upstream core.jank slices load unchanged.
-(defn- seed-core-cpp []
-  (cpp-intern "jank.runtime.name" (fn [x] (name-of x)))
-  (cpp-intern "jank.runtime.namespace_" (fn [x] (namespace-of x)))
-  (cpp-intern "jank.runtime.keyword" (fn [ns name] (keyword-of ns name)))
-  (cpp-intern "jank.runtime.reduce" (fn [f init coll] (reduce f init coll)))
-  (cpp-intern "jank.runtime.reduced" (fn [x] (reduced x)))
-  (cpp-intern "jank.runtime.is_reduced" (fn [x] (reduced? x)))
-  (cpp-intern "jank.runtime.peek" (fn [c] (peek c)))
-  (cpp-intern "jank.runtime.pop" (fn [c] (pop c)))
-  (cpp-intern "jank.runtime.promoting_inc" (fn [x] (promoting-inc x)))
-  (cpp-intern "jank.runtime.is_integer" (fn [x] (int? x)))
-  (cpp-intern "jank.runtime.is_ratio" (fn [x] (ratio? x)))
-  (cpp-intern "jank.runtime.is_big_decimal" (fn [x] (decimal? x)))
-  (cpp-intern "jank.runtime.is_sorted" (fn [x] (sorted? x)))
-  (cpp-intern "jank.runtime.is_nan" (fn [x] (nan? x)))
-  (cpp-intern "jank.runtime.is_list" (fn [x] (list? x)))
-  (cpp-intern "jank.runtime.volatile_" (fn [x] (BeamLisp.Refs/volatile x)))
-  (cpp-intern "jank.runtime.vreset" (fn [v x] (BeamLisp.Refs/vreset! v x)))
-  (cpp-intern "jank.runtime.vswap" (multi-fn {2 (fn [v f] (BeamLisp.Refs/vswap! v f))}
-                                             (variadic 2 (fn [v f rest] (BeamLisp.Refs/vswap! v f rest)))))
-  (cpp-intern "jank.runtime.is_volatile" (fn [x] (BeamLisp.Refs/volatile? x)))
-  ; bit-not's inline expands to a call to this; the reader gate was clear and
-  ; only the table row was missing.
-  (cpp-intern "jank.runtime.bit_not" (fn [x] (bit-not x))))
+; the qualified name maps onto a BEAM function with the same semantics and
+; upstream core.jank slices load unchanged. Values only.
+(def ^private SEED-CPP
+  '(("jank.runtime.name" :rt {1 :name_of} nil)
+    ("jank.runtime.namespace_" :rt {1 :namespace_of} nil)
+    ("jank.runtime.keyword" :rt {2 :keyword_of} nil)
+    ("jank.runtime.reduce" :rt {3 :reduce} nil)
+    ("jank.runtime.reduced" :rt {1 :reduced} nil)
+    ("jank.runtime.is_reduced" :rt {1 :reduced?} nil)
+    ("jank.runtime.peek" :rt {1 :peek} nil)
+    ("jank.runtime.pop" :rt {1 :pop} nil)
+    ("jank.runtime.promoting_inc" :rt {1 :promoting_inc} nil)
+    ("jank.runtime.is_integer" :rt {1 :int?} nil)
+    ("jank.runtime.is_ratio" :rt {1 :ratio?} nil)
+    ("jank.runtime.is_big_decimal" :rt {1 :decimal?} nil)
+    ("jank.runtime.is_sorted" :rt {1 :sorted?} nil)
+    ("jank.runtime.is_nan" :rt {1 :nan?} nil)
+    ("jank.runtime.is_list" :rt {1 :list?} nil)
+    ("jank.runtime.volatile_" :Elixir.BeamLisp.Refs {1 :volatile} nil)
+    ("jank.runtime.vreset" :Elixir.BeamLisp.Refs {2 :vreset!} nil)
+    ("jank.runtime.vswap" :Elixir.BeamLisp.Refs {2 :vswap! 3 :vswap!} nil)
+    ("jank.runtime.is_volatile" :Elixir.BeamLisp.Refs {1 :volatile?} nil)
+    ("jank.runtime.bit_not" :rt {1 :bit_not} nil)))
 
-(defn- seed-links []
-  (erlang/apply :lists :foreach
-    (list (fn [pair]
-            (core-link (nth pair 0) NUM-MOD {2 (nth pair 1)} nil))
-          (list (list "+" :add) (list "-" :sub) (list "*" :mul) (list "/" :div)
-                (list "<" :lt) (list ">" :gt) (list "<=" :le) (list ">=" :ge)
-                (list "==" :num_eq))))
-  (link1 "rem" :erlang :rem)
-  ; Unary `-` negates through the tower (the only unary that does work);
-  ; `(+ x)` and `(= x)` stay on invoke.
-  (core-link "-" NUM-MOD {1 :neg 2 :sub} nil)
-  ; `=` links to lazy-aware equality, which realizes lazy operands, so
-  ; comparing a lazy seq stays Clojure-shaped.
-  (core-link "=" RT-MOD {2 :eqv} nil)
+(defn- row-module [m] (if (erlang/== m :rt) :"Elixir.BeamLisp.Ns.Rt" m))
 
-  ; Fixed-arity links. `filter` and `take` are DELIBERATELY ABSENT: both grew a
-  ; 1-arity transducer form, and a link names one fixed arity — it would make
-  ; the other unreachable, because a link means `invoke` is never consulted.
-  (erlang/apply :lists :foreach
-    (list (fn [pair] (link1 (nth pair 0) RT-MOD (nth pair 1)))
-          (list (list "first" :first) (list "rest" :rest) (list "seq" :seq)
-                (list "next" :next) (list "count" :count) (list "empty?" :empty?)
-                (list "cons" :cons) (list "identical?" :identical?)
-                (list "pr-str" :print_readably) (list "print-str" :print_str)
-                (list "reader-macro!" :reader_macro!)
-                (list "data-reader!" :data_reader!) (list "read-data" :read_data)
-                (list "take-while" :take_while) (list "drop-while" :drop_while)
-                (list "iterate" :iterate) (list "cycle" :cycle)
-                (list "doall" :doall) (list "dorun" :dorun)
-                (list "even?" :even?) (list "odd?" :odd?) (list "zero?" :zero?)
-                (list "pos?" :pos?) (list "neg?" :neg?) (list "float?" :float?)
-                (list "transientable?" :transientable?) (list "fn?" :fn?)
-                (list "seq?" :seq?) (list "boolean" :boolean) (list "find" :find)
-                (list "contains?" :contains?) (list "keyword?" :keyword?)
-                (list "symbol?" :symbol?) (list "string?" :string?)
-                (list "number?" :number?) (list "int?" :int?)
-                (list "map?" :map?) (list "struct?" :struct?)
-                (list "associative?" :associative?) (list "vector?" :vector?)
-                (list "list?" :list?) (list "coll?" :coll?)
-                (list "ident?" :ident?) (list "set" :set) (list "set?" :set?)
-                (list "disj" :disj) (list "sorted?" :sorted?)
-                (list "sequential?" :sequential?) (list "compare" :compare)
-                (list "gensym" :gensym) (list "drop" :drop_clj)
-                (list "subseq" :subseq) (list "rsubseq" :rsubseq)
-                (list "last-key" :last_key) (list "last-entry" :last_entry)
-                (list "sorted-map-of" :sorted_map_of)
-                (list "sorted-set-of" :sorted_set_of)
-                (list "sorted-map?" :sorted_map?) (list "sorted-set?" :sorted_set?)
-                (list "sorted-dissoc" :sorted_dissoc)
-                (list "tree-seq" :tree_seq)))))
+(defn- row-variadic [v] (if (erlang/is_list v) (erlang/list_to_tuple v) nil))
 
-  ; `sort` is multi-arity AND both arities link: the arity splits the call.
-  (core-link "sort" RT-MOD {1 :sort 2 :sort} nil)
-  ; `gensym` and `get` link both arities for the same reason.
-  (core-link "gensym" RT-MOD {0 :gensym 1 :gensym} nil)
-  (core-link "get" RT-MOD {2 :get 3 :get} nil)
-  (core-link "nth" RT-MOD {2 :nth 3 :nth} nil)
-  ; `conj` links its completion arity (1) beside the value arity (2).
-  (core-link "conj" RT-MOD {1 :conj 2 :conj} nil)
-  (core-link "take" RT-MOD {1 :take_xform 2 :take} nil)
-  (core-link "range" RT-MOD {0 :range 1 :range 2 :range} nil)
-  (core-link "repeat" RT-MOD {1 :repeat 2 :repeat} nil)
-  ; `assoc`, `map`, `apply` and `list*` gain a VARIADIC handler: fixed leading
-  ; args, then one rest list. The handler's arity is (fixed + 1).
-  (core-link "assoc" RT-MOD {3 :assoc} (list 3 :assoc_variadic))
-  (core-link "map" RT-MOD {2 :map} (list 2 :map_multi))
-  (core-link "apply" RT-MOD {2 :apply_to} (list 2 :apply_variadic))
-  (core-link "list*" RT-MOD {0 :list_star_0} (list 1 :list_star))
-  ; `println` links its 0/1 arities and its variadic multi form.
-  (core-link "println" RT-MOD {0 :println 1 :println} (list 1 :println_multi))
+(defn- fn-value
+  "The callable a row names — `Emit.fn_value/3`'s rule, over external funs, so
+   a seeded value and a compiled `defn` value have one shape."
+  [mod fixed variadic]
+  (let [capture (fn [a f] (erlang/make_fun mod f a))]
+    (if (and (erlang/== 1 (erlang/map_size fixed)) (erlang/== nil variadic))
+      (let [pair (erlang/hd (maps/to_list fixed))]
+        (capture (erlang/element 1 pair) (erlang/element 2 pair)))
+      (multi-fn (maps/map (fn [a f] (capture a f)) fixed)
+                (if (erlang/== nil variadic)
+                  nil
+                  (let [mn (erlang/element 1 variadic)]
+                    (raw/tuple2 mn (capture (erlang/+ mn 1) (erlang/element 2 variadic)))))))))
 
-  ; Reference types link to direct calls too.
-  (erlang/apply :lists :foreach
-    (list (fn [row] (core-link (nth row 0) (nth row 1) (nth row 2) (nth row 3)))
-          (list
-            (list "atom" "Elixir.BeamLisp.Refs" {1 :atom} nil)
-            (list "deref" "Elixir.BeamLisp.Refs" {1 :deref 3 :deref} nil)
-            (list "swap!" "Elixir.BeamLisp.Refs" {2 :swap!} (list 2 :swap!))
-            (list "reset!" "Elixir.BeamLisp.Refs" {2 :reset!} nil)
-            (list "compare-and-set!" "Elixir.BeamLisp.Refs" {3 :compare_and_set!} nil)
-            (list "add-watch" "Elixir.BeamLisp.Refs" {3 :add_watch!} nil)
-            (list "remove-watch" "Elixir.BeamLisp.Refs" {2 :remove_watch!} nil)
-            (list "promise" "Elixir.BeamLisp.Refs" {0 :promise} nil)
-            (list "deliver" "Elixir.BeamLisp.Refs" {2 :deliver} nil)
-            (list "force" "Elixir.BeamLisp.Deferred" {1 :force} nil)
-            (list "realized?" "Elixir.BeamLisp.Deferred" {1 :realized?} nil)
-            (list "delay?" "Elixir.BeamLisp.Deferred" {1 :delay?} nil)
-            (list "derived?" "Elixir.BeamLisp.Reactive" {1 :derived?} nil)
-            (list "future?" "Elixir.BeamLisp.Refs" {1 :future?} nil)
-            (list "future-cancel" "Elixir.BeamLisp.Refs" {1 :future_cancel} nil)
-            (list "transient" "Elixir.BeamLisp.Transient" {1 :transient} nil)
-            (list "persistent!" "Elixir.BeamLisp.Transient" {1 :persistent!} nil)
-            (list "conj!" "Elixir.BeamLisp.Transient" {1 :conj! 2 :conj!} nil)
-            (list "assoc!" "Elixir.BeamLisp.Transient" {3 :assoc!} nil)
-            (list "dissoc!" "Elixir.BeamLisp.Transient" {2 :dissoc!} nil)
-            (list "hash-map" "Elixir.BeamLisp.Transient" {0 :hash_map_empty} (list 2 :hash_map)))))
+(defn- seed-row [ns row how]
+  (let [name (lists/nth 1 row)
+        mod (row-module (lists/nth 2 row))
+        fixed (lists/nth 3 row)
+        variadic (row-variadic (lists/nth 4 row))]
+    (when (erlang/=/= how :link)
+      (BeamLisp.Env/intern ns name (fn-value mod fixed variadic)))
+    (when (erlang/=/= how :value)
+      (BeamLisp.Env/put_link ns name (raw/tuple3 mod fixed variadic)))))
 
-(defn seed-core []
-  (seed-core-own)
-  (seed-core-arities)
-  (seed-core-special)
-  (seed-core-refs)
-  (seed-core-transients)
-  (seed-core-otp)
-  (seed-core-cpp)
-  (seed-links)
-  ; (seed-core-hash-keys) — see the note above `hash-key`'s literal lower.
+; `(< 1 2 3)` is a chain: 1 < 2 AND 2 < 3.
+(defn- chain-of [op]
+  (multi-fn {} (raw/tuple2 1 (fn [x rest]
+    (lists/all (fn [pair] (op (erlang/element 1 pair) (erlang/element 2 pair)))
+               (lists/zip (raw/cons x (lists/droplast (raw/cons x rest))) rest))))))
+
+(defn- fold-left [op x rest]
+  (lists/foldl (fn [e acc] (op acc e)) x rest))
+
+(defn- seed-closures
+  "The `core` values that are closures over a host operation rather than an
+   export: the variadic arithmetic and comparison chains, `str`, and the process
+   verbs that thread the calling namespace or a fixed argument."
+  []
+  (let [put (fn [name v] (BeamLisp.Env/intern "core" name v))]
+    (put "+" (multi-fn {} (raw/tuple2 0 (fn [args] (fold-left (fn [a b] (BeamLisp.Num/add a b)) 0 args)))))
+    (put "*" (multi-fn {} (raw/tuple2 0 (fn [args] (fold-left (fn [a b] (BeamLisp.Num/mul a b)) 1 args)))))
+    (put "-" (multi-fn {} (raw/tuple2 1 (fn [x rest]
+      (if (erlang/== rest ()) (BeamLisp.Num/neg x) (fold-left (fn [a b] (BeamLisp.Num/sub a b)) x rest))))))
+    (put "/" (multi-fn {} (raw/tuple2 1 (fn [x rest]
+      (if (erlang/== rest ()) (BeamLisp.Num/div 1 x) (fold-left (fn [a b] (BeamLisp.Num/div a b)) x rest))))))
+    (put "<" (chain-of (fn [a b] (BeamLisp.Num/lt a b))))
+    (put ">" (chain-of (fn [a b] (BeamLisp.Num/gt a b))))
+    (put "<=" (chain-of (fn [a b] (BeamLisp.Num/le a b))))
+    (put ">=" (chain-of (fn [a b] (BeamLisp.Num/ge a b))))
+    (put "==" (chain-of (fn [a b] (BeamLisp.Num/num_eq a b))))
+    (put "=" (chain-of (fn [a b] (eqv a b))))
+    ; `str` is a VALUE: the call site's argument count selects the variadic
+    ; clause inside the multi-fn, so the constructor is called once, here.
+    (put "str" (str))
+    (put "trace" (multi-fn {2 (fn [sym h] (BeamLisp.Trace/trace (BeamLisp.Env/current_ns) sym h))
+                            3 (fn [sym h opts] (BeamLisp.Trace/trace (BeamLisp.Env/current_ns) sym h opts))}))
+    (put "untrace" (fn [sym] (BeamLisp.Trace/untrace (BeamLisp.Env/current_ns) sym)))
+    (put "monitor" (fn [p] (erlang/monitor :process p)))
+    (put "kill" (fn [p] (erlang/exit p :kill)))))
+
+(defn seed-core
+  "Seed `core` (and `cpp`) with the primitives, BEFORE the prelude loads — the
+   prelude's own init calls them. Writes into the CURRENT env, so a forked env
+   can hold a whole second table (that is how `seed-diff.bl` checks this one)."
+  []
+  (lists/foreach (fn [row] (seed-row "core" row (lists/last row))) SEED)
+  (lists/foreach (fn [row] (seed-row "cpp" row :value)) SEED-CPP)
+  (seed-closures)
   :ok)
 
-
-
 ;; ── the contract's spelling ───────────────────────────────────────────────
-; The runtime contract, and `lib/beam_lisp.ex`, name this `seed_core`, with the
-; underscore. A member of a beam-lisp namespace is an Erlang atom spelled AS
-; WRITTEN, so `seed-core` and `seed_core` are two distinct exports; the facade
-; serves both, exactly as it does for the other underscore-spelled names.
+; `lib/beam_lisp.ex` calls `seed_core/0`: an underscore, like the rest of the
+; contract. Both spellings are exports of this module.
 (defn seed_core [] (seed-core))
-
