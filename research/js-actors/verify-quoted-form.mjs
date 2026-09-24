@@ -109,7 +109,7 @@ assert.equal(edited.manifest.captured.button.label, 'Refresh');
 assert.equal(edited.manifest.captured.text, '3 items');
 assert.equal(edited.manifest.captured.card.id, 'inbox');
 // the accepted variants materialise to exactly the same data shape
-assert.deepEqual(edited.form[2][1].get(keyword('text')), 'Inbox'.replace('Inbox', 'Today'));
+assert.equal(edited.form[2][1].get(keyword('text')), 'Today');
 
 // a form with no `:id` defaults to the core's `_`, and stays eligible
 const noId = fenceQuotedForm(`[:card {} ${H} ${F} ${B} ${T}]`);
@@ -194,6 +194,11 @@ const REFUSALS = [
       `[:button {:label "${'B'.repeat(30)}" :intent [:intent :increment]}] [:text "${'C'.repeat(20)}"]`),
     'too-much-text'],
   ['control character', card(`${H} ${F} ${B} [:text "a\\nb"]`), 'control-char'],
+  ['outer frame escape expansion',
+    `[:card {:id "${String.fromCharCode(0xd800).repeat(64)}"} ` +
+      `[:heading {:level 2 :text "${String.fromCharCode(0xd800).repeat(30)}"}] ${F} ` +
+      `[:button {:label "${String.fromCharCode(0xd800).repeat(30)}" :intent [:intent :increment]}] ` +
+      `[:text "${String.fromCharCode(0xd800).repeat(20)}"]]`, 'oversized-frame'],
 ];
 
 let refusalCount = 0;
@@ -211,7 +216,7 @@ for (const [label, source, reason] of REFUSALS) {
 }
 pass(`refusals: ${refusalCount} typed, positioned, no partial form or manifest`);
 
-// ── 4. the vocabulary is closed and every declared reason is reachable ───────
+// ── 4. the vocabulary is closed and observed reasons are declared ────────────
 
 const observed = new Set(REFUSALS.map(([, , reason]) => reason));
 assert.ok(observed.size >= 25, 'the refusal table must exercise a broad vocabulary');
@@ -249,7 +254,8 @@ for (const version of ['0', '7', '9999999999999999']) {
   assert.equal(decoded.view.field.value, version);
 }
 const worst = '9'.repeat(MAX_FIELD_VALUE);
-assert.equal(manifest.worstCase.frameChars, frameFor(manifest.captured, worst).length,
+assert.equal(manifest.worstCase.frameChars,
+  ('QV-FRONT VIEW [:ok ' + JSON.stringify(frameFor(manifest.captured, worst)) + ']').length,
   'manifest worst-case frame length must match the reconstructed frame');
 assert.ok(manifest.worstCase.frameChars <= MAX_FRAME, 'worst-case frame must fit one line');
 assert.equal(manifest.worstCase.totalVisibleChars,

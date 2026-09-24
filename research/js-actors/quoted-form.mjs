@@ -444,7 +444,8 @@ function checkText(node) {
 /** The worst-case rendered frame for the accepted form: the fixed template with
  *  the longest dynamic field value the version wire can carry. `describe` is
  *  `JSON.stringify` for strings, so this is exactly the bytes the frame decoder
- *  will see. */
+ *  will see INSIDE the outer printable BL result. `encodedFrameLength` includes
+ *  the second escaping layer and the entire transport prefix/suffix. */
 function worstCaseFrame(captured) {
   const field = '9'.repeat(MAX_FIELD_VALUE);
   return (
@@ -453,6 +454,10 @@ function worstCaseFrame(captured) {
     ') button(' + JSON.stringify(captured.buttonLabel) + ',' + captured.intent +
     ') text(' + JSON.stringify(captured.text) + ')}}'
   );
+}
+
+function encodedFrameLength(captured) {
+  return ('QV-FRONT VIEW [:ok ' + JSON.stringify(worstCaseFrame(captured)) + ']').length;
 }
 
 /** Gate the annotated root and return the captured fixed view, or throw. */
@@ -496,7 +501,10 @@ function gate(root) {
     intent: button.intent,
     text,
   };
-  if (worstCaseFrame(captured).length > MAX_FRAME) gfail('oversized-frame', root);
+  // The decoder bounds the *whole* line, not just the inner view text. The
+  // outer readable BL string escapes quotes/backslashes a second time; lone
+  // surrogates can expand to \\uXXXX in each layer.
+  if (encodedFrameLength(captured) > MAX_FRAME) gfail('oversized-frame', root);
 
   return { captured, totalVisible };
 }
@@ -508,7 +516,6 @@ function gate(root) {
 /** A deterministic eligibility manifest. No timestamps, no randomness, no
  *  object identity — the same source always serialises to the same bytes. */
 function buildManifest(captured, totalVisible) {
-  const frame = worstCaseFrame(captured);
   return {
     fenceVersion: FENCE_VERSION,
     verdict: 'client-view-only',
@@ -547,7 +554,7 @@ function buildManifest(captured, totalVisible) {
     },
     worstCase: {
       totalVisibleChars: totalVisible,
-      frameChars: frame.length,
+      frameChars: encodedFrameLength(captured),
     },
     claim: 'one fixed closed data form may be evaluated on the client',
     notClaimed: [

@@ -183,6 +183,50 @@ a stale refusal rather than an automatic resync. The research
 [frontend-fence assessment](../js-actors-future/05-frontend-fence.md) names the
 proof/codec/call-graph work required before auto-fencing can be honest.
 
+### Edit BL data and run it entirely in the JS Worker
+
+The [frontend fence lab](http://127.0.0.1:8765/quoted-playground.html) lets you
+edit the actual view form and click **Run in JS Worker** (Ctrl/⌘+Enter). Start it
+with the same `quoted-server.mjs --port 8765` command above; after assets load,
+you can stop the server and keep editing/running the view. Source and rendered
+view never go to `/api/intent`. The page shows the placement verdict, a preview,
+and the inferred *narrow* bridge contract. Its button is disabled: it describes
+an intent the backend would have to authorize, not a local state mutation.
+
+```sh
+node research/js-actors/verify-quoted-form.mjs
+node research/js-actors/verify-quoted-playground.mjs
+```
+
+**Automatic within one closed grammar, not automatic BL partitioning:**
+`quoted-form.mjs` reads bounded BL **data** vectors, keyword-keyed maps,
+keywords, strings and nonnegative safe integers. It refuses calls, lists,
+symbols/captures, quotes, effects, duplicate keys, unknown operators and
+unsupported numeric forms before conversion to host BL values. Only the exact
+`card → heading(level 2) → field(:unread) → button([:intent :increment]) → text`
+shape is frontend-eligible; free strings can change but the topology, field,
+intent and resource limits cannot. A deterministic manifest names the client
+view, `:unread` input and server-owned `:increment`/version contract. The
+Worker's typed input mechanism bounds finite data, then the **compiled BL**
+`quoted-view-core.bl` evaluator makes the final grammar decision and emits the
+existing strict frame. Neither the reader nor the Worker uses `eval` or a JS
+compiler. The sample environment provides local `"7"`: the preview is not
+connected to live server state and grants no authority to commit an intent.
+
+| What runs where | Current verdict | Why |
+|---|---|---|
+| Fixed bounded quoted data view | Browser Worker | Closed grammar, known dynamic field, compiled BL evaluator and bounded frame decoder |
+| `[:intent :increment]` declaration | Browser as data only | The button is disabled here; the separate quoted-view demo forwards requests |
+| Authentication, authorization, version check, state commit | Backend | Client claims and pure rendering cannot grant authority |
+| BL calls, closures, captures, effects, arbitrary Loom/Live modules | Refuse placement | No complete transitive call/effect/provenance/codec proof or target ABI witness |
+
+This is a **preview gate**, not a security sandbox. Its per-form manifest is a
+contract *candidate*, not an automatically generated network endpoint or proof
+of wire round-trip equivalence. The earlier explicit `quoted-view.html` demo
+remains the separate, server-authoritative intent round-trip. The source-backed
+[frontend-fence assessment](../js-actors-future/05-frontend-fence.md) details
+what must be established before generating general bridges.
+
 ### Safe `Number` proof and emission gate (distinct contracts)
 
 `number_rule.bl` implements an opt-in BL rule for **integer** expressions:
