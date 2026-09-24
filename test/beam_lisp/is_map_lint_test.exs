@@ -11,7 +11,7 @@ defmodule BeamLisp.IsMapLintTest do
   because a struct is a map carrying a `:__struct__` key. beam-lisp has 11
   struct kinds (Vector, Set, LazySeq, the references Atom/Ref/Volatile/
   Agent/Task, Transient, and user records) that must never take a
-  "beam-lisp map" collection path. Collection fns in `BeamLisp.RT` guard
+  "beam-lisp map" collection path. Collection fns in `BeamLisp.Ns.Rt` guard
   their plain-map clauses with `BeamLisp.Guards.is_bl_map/1`; the genuine
   exceptions are annotated `# is_map-ok: <reason>`.
 

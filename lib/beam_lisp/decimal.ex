@@ -52,7 +52,7 @@ defmodule BeamLisp.Decimal do
 
   def new(x) do
     raise BeamLisp.ExInfo,
-      message: "cannot make a decimal from #{BeamLisp.RT.print_str(x)}",
+      message: "cannot make a decimal from #{BeamLisp.Ns.Rt.print_str(x)}",
       data: %{type: :"decimal/coerce", value: x}
   end
 

@@ -1,7 +1,8 @@
 defmodule BeamLisp.Wave14MetaTest do
   use ExUnit.Case, async: false
 
-  alias BeamLisp.{Env, LazySeq, Meta, RT, Vector}
+  alias BeamLisp.{Env, LazySeq, Meta, Vector}
+  alias BeamLisp.Ns.Rt, as: RT
 
   setup do
     BeamLisp.init()

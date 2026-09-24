@@ -33,7 +33,7 @@ defmodule BeamLisp.BuildPlan do
     node_from = BeamLisp.Env.fetch!(@ns, "node-from")
 
     paths
-    |> Enum.map(fn path -> BeamLisp.RT.invoke(node_from, [path, BeamLisp.Loader.read_source(path)]) end)
+    |> Enum.map(fn path -> BeamLisp.Ns.Rt.invoke(node_from, [path, BeamLisp.Loader.read_source(path)]) end)
     |> plan()
   end
 
@@ -57,9 +57,9 @@ defmodule BeamLisp.BuildPlan do
     # re-emits the boot tier runs THROUGH that seed, so this call must work
     # against both generations: memoized when the language offers it, plain
     # otherwise. Once the seed is re-blessed the fallback is never taken.
-    if BeamLisp.RT.invocable?(key_for, 4),
-      do: BeamLisp.RT.invoke(key_for, [ns, resolve, seed_arg, &memo_node/2]),
-      else: BeamLisp.RT.invoke(key_for, [ns, resolve, seed_arg])
+    if BeamLisp.Ns.Rt.invocable?(key_for, 4),
+      do: BeamLisp.Ns.Rt.invoke(key_for, [ns, resolve, seed_arg, &memo_node/2]),
+      else: BeamLisp.Ns.Rt.invoke(key_for, [ns, resolve, seed_arg])
   end
 
   # ── the node memo ──────────────────────────────────────────────────────────
@@ -96,7 +96,7 @@ defmodule BeamLisp.BuildPlan do
 
         [] ->
           node =
-            BeamLisp.RT.invoke(BeamLisp.Env.fetch!(@ns, "node-from"), [ns, content])
+            BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!(@ns, "node-from"), [ns, content])
 
           :ets.insert(memo_table(), {hash, node})
           node
@@ -138,7 +138,7 @@ defmodule BeamLisp.BuildPlan do
   @spec plan([node_]) :: plan
   def plan(nodes) do
     BeamLisp.Loader.ensure_loaded(@ns)
-    raw = BeamLisp.RT.invoke(BeamLisp.Env.fetch!(@ns, "plan"), [nodes])
+    raw = BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!(@ns, "plan"), [nodes])
 
     %{
       order: raw[:order],

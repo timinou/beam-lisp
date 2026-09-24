@@ -13,7 +13,7 @@ defmodule BeamLisp.BootBuildBarrierTest do
     :ok
   end
 
-  defp call(name, args), do: BeamLisp.RT.invoke(BeamLisp.Env.fetch!("build", name), args)
+  defp call(name, args), do: BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("build", name), args)
 
   defp node(path, ns), do: %{path: path, ns: ns, hash: ns}
 

@@ -364,7 +364,7 @@ is what makes it stick.
     (each (fn [d]
             (when-not (contains? have (path->binary d))
               (Code/prepend_path d)))
-          (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "deps-compile" "search-paths") (list)))))
+          (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "deps-compile" "search-paths") (list)))))
 
 (defn register-paths
   "Apply the parsed command's library roots and code paths. Library roots go to

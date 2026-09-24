@@ -119,7 +119,7 @@ defmodule BeamLisp.AOT do
 
     # PRE-LINK every top-level defn in the unit before compiling any form.
     # A call to a defn defined LATER in the same file would otherwise compile
-    # to a slow `RT.invoke(fetch …)` in a fresh VM but a direct call in a VM
+    # to a slow `rt/invoke(fetch …)` in a fresh VM but a direct call in a VM
     # that had compiled the file before (the link survives): same source, two
     # beams, and the first build the slower. The ns of a form is the ns the
     # preceding `(ns …)` declared, tracked here exactly as the compile pass

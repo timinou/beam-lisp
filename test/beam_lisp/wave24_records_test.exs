@@ -9,7 +9,8 @@ defmodule BeamLisp.Wave24RecordsTest do
   use ExUnit.Case, async: false
 
   alias BeamLisp.Compiler
-  alias BeamLisp.{Env, RT, Test}
+  alias BeamLisp.{Env, Test}
+  alias BeamLisp.Ns.Rt, as: RT
 
   setup do
     BeamLisp.init()

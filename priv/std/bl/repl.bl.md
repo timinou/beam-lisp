@@ -85,7 +85,7 @@ interned in `user`, the namespace a prompt reads and writes by default.
     (try
       (let [v (BeamLisp/eval src)]
         (record! v)
-        (println (BeamLisp.RT/print_str v)))
+        (println (BeamLisp.Ns.Rt/print_str v)))
       (catch e
         (BeamLisp.Env/intern "user" "*e" e)
         (println (str "error: " (ex-message e)))))))

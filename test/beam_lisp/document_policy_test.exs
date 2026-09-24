@@ -14,12 +14,12 @@ defmodule BeamLisp.DocumentPolicyTest do
     runner = BeamLisp.Env.fetch!("bl.doc", "run-and-write!")
     for policy <- [:read_only, :changes_only, :unknown] do
       assert_raise BeamLisp.ExInfo, ~r/denied by policy/, fn ->
-        BeamLisp.RT.invoke(runner, [path, %{policy: policy}])
+        BeamLisp.Ns.Rt.invoke(runner, [path, %{policy: policy}])
       end
       refute File.exists?(marker)
       assert File.read!(path) == source
     end
-    BeamLisp.RT.invoke(runner, [path, %{policy: :trusted}])
+    BeamLisp.Ns.Rt.invoke(runner, [path, %{policy: :trusted}])
     assert File.read!(marker) == "ran"
   end
 end

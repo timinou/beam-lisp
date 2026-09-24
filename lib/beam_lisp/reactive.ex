@@ -57,7 +57,7 @@ defmodule BeamLisp.Reactive do
         v
 
       other ->
-        nv = BeamLisp.RT.invoke(thunk, [])
+        nv = BeamLisp.Ns.Rt.invoke(thunk, [])
 
         case LazyMemo.exchange_ref(cell, other, {:fresh, nv, current}) do
           :ok -> nv

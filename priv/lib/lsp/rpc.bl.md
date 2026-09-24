@@ -400,7 +400,7 @@ the one request every editor already sends.
 carries are corrections rather than features, and both were visible in what the
 server used to answer. A call names its CALLEE: every user call compiles to an
 `RT/invoke` trampoline, and reading the IR back is how hovering `(greet …)` came
-to say `Elixir.BeamLisp.RT/invoke`. And a type that is the compiler's universal
+to say `Elixir.BeamLisp.Ns.Rt/invoke`. And a type that is the compiler's universal
 tagset reads `any`, rather than listing fourteen tags nobody reads.
 
 A docstring is read through `typed/defn-clauses` — the compiler's own reading of

@@ -336,7 +336,7 @@ defmodule BeamLisp.ClojureSourceTest do
   ]
 
   test "reader-conditional answers match the JVM reader" do
-    pr = fn v -> BeamLisp.RT.invoke(BeamLisp.Env.fetch!("core", "pr-str"), [v]) end
+    pr = fn v -> BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("core", "pr-str"), [v]) end
 
     for {src, expected} <- @conditional_cases do
       got =

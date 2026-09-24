@@ -48,7 +48,7 @@ defmodule BeamLisp.Sorted do
   ## The struct-is-a-map hazard
 
   Same rule as `BeamLisp.Set` and `BeamLisp.Vector`: a struct IS a map on
-  the BEAM, so every `SortedMap`/`SortedSet` clause in `BeamLisp.RT` MUST
+  the BEAM, so every `SortedMap`/`SortedSet` clause in `BeamLisp.Ns.Rt` MUST
   precede that function's `is_bl_map` clause, or `count`/`seq`/`first`
   read the struct's two fields instead of the collection's contents. The
   clauses are guarded with `is_bl_map` on the plain-map side, so the
@@ -80,34 +80,34 @@ defmodule BeamLisp.Sorted do
 
   # ── key encoding ─────────────────────────────────────────────────────
   #
-  # `BeamLisp.RT.compare/2` is the language's AUTHORITATIVE total order —
+  # `BeamLisp.Ns.Rt.compare/2` is the language's AUTHORITATIVE total order —
   # what `sort`, `compare` and every Clojure-facing comparison already mean.
   # This encoder's only job is to project that order into a term whose
   # NATIVE Erlang comparison agrees, so `:gb_trees` (which compares with
   # `<`/`>`) sorts the way the language says.
   #
-  # It therefore MIRRORS RT.compare's rank table rather than inventing one.
+  # It therefore MIRRORS `rt/compare`'s rank table (`family-rank` in priv/boot/rt.bl) rather than inventing one.
   # An earlier version invented its own ranks and disagreed with the
   # language in three places — `false` sorted after `0`, keywords before
   # strings, `true` after `1`. That is a second, competing definition of a
   # total order, and the two drifting apart is precisely how an index
-  # silently returns the wrong rows. Keep this in lockstep with `RT.rank/1`:
+  # silently returns the wrong rows. Keep this in lockstep with `family-rank` in priv/boot/rt.bl:
   #
   #   nil=0  false=1  true=2  number=3  binary=4  symbol=5  keyword=6
   #   collection=7  other=8
 
   @doc """
-  Encode `key` so its native Erlang order matches `BeamLisp.RT.compare/2`.
+  Encode `key` so its native Erlang order matches `BeamLisp.Ns.Rt.compare/2`.
 
-  Ranks mirror `RT.rank/1` exactly. Within a rank the payload is chosen so
-  Erlang's own comparison gives the answer `RT.compare/2` would: numbers
+  Ranks mirror `family-rank` (priv/boot/rt.bl) exactly. Within a rank the payload is chosen so
+  Erlang's own comparison gives the answer `rt/compare` would: numbers
   compare numerically (ints and floats share rank 3, so `1 < 1.5 < 2` holds
   across kinds), strings and atom NAMES compare by text, and sequences
   compare element-wise on ENCODED elements — which is what makes a proper
   prefix sort before its extensions.
 
   Collections share rank 7 and encode to a list, so a vector and a list
-  with equal contents encode identically — matching `RT.compare/2`, which
+  with equal contents encode identically — matching `rt/compare`, which
   normalises both through `seq` before walking them.
   """
   def encode_key(nil), do: {0, nil}
@@ -116,7 +116,7 @@ defmodule BeamLisp.Sorted do
   def encode_key(x) when is_number(x), do: {3, x}
   def encode_key(x) when is_binary(x), do: {4, x}
   def encode_key({:symbol, n}), do: {5, n}
-  # Keywords are atoms, compared by NAME (as `RT.cmp_same(6, …)` does).
+  # Keywords are atoms, compared by NAME (as `rt/compare` does for two atoms).
   # `is_atom` also matches nil/booleans, so those clauses must precede this.
   def encode_key(x) when is_atom(x), do: {6, Atom.to_string(x)}
   def encode_key(%BeamLisp.Vector{} = v), do: {7, encode_seq(BeamLisp.Vector.to_list(v))}
@@ -125,7 +125,7 @@ defmodule BeamLisp.Sorted do
   def encode_key(%SortedMap{} = m), do: {7, encode_seq(map_to_list(m))}
   def encode_key(x) when is_list(x), do: {7, encode_seq(x)}
   def encode_key(x) when is_tuple(x), do: {7, x |> Tuple.to_list() |> encode_seq()}
-  # Rank 8 is RT.compare's catch-all (fns, pids, refs, plain maps, lazy
+  # Rank 8 is `rt/compare`'s catch-all (fns, pids, refs, plain maps, lazy
   # seqs). No meaningful Clojure order, but the tree still needs a total
   # one, so the raw term breaks ties via Erlang's native order.
   def encode_key(x), do: {8, x}

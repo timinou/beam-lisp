@@ -1101,7 +1101,7 @@ defmodule BeamLisp.DecimalOracleTest do
 
   defp run(src, env) do
     v = BeamLisp.Compiler.eval_string(src, env)
-    BeamLisp.RT.print_str(v) |> String.trim("\"")
+    BeamLisp.Ns.Rt.print_str(v) |> String.trim("\"")
   rescue
     _ -> "ERROR"
   catch

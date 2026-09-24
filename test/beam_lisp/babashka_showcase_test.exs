@@ -85,7 +85,7 @@ defmodule BeamLisp.BabashkaShowcaseTest do
     BeamLisp.Loader.ensure_loaded("clojure.set")
     original = BeamLisp.Env.fetch!("core", "conj")
     try do
-      BeamLisp.Env.intern("core", "conj", BeamLisp.RT.multi_fn(%{1 => &BeamLisp.RT.conj/1, 2 => &BeamLisp.RT.conj/2}))
+      BeamLisp.Env.intern("core", "conj", BeamLisp.Ns.Rt.multi_fn(%{1 => &BeamLisp.Ns.Rt.conj/1, 2 => &BeamLisp.Ns.Rt.conj/2}))
       value = BeamLisp.eval(~S|(clojure.set/union #{1} #{2} #{3})|)
       assert BeamLisp.Set.to_list(value) |> Enum.sort() == [1, 2, 3]
     after

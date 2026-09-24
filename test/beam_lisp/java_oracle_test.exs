@@ -105,7 +105,7 @@ defmodule BeamLisp.JavaOracleTest do
 
   defp run(src, env) do
     v = BeamLisp.Compiler.eval_string(src, env)
-    BeamLisp.RT.print_readably(v)
+    BeamLisp.Ns.Rt.print_readably(v)
   rescue
     _ -> "ERROR"
   catch

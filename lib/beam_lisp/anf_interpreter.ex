@@ -4,7 +4,7 @@ defmodule BeamLisp.AnfInterpreter do
   # The reference interpreter models Core's raw trace binding with a tagged
   # frame list. It must never pass this model to the BEAM raw_raise primop.
   def capture(fun) do
-    {:ok, BeamLisp.RT.invoke(fun, [])}
+    {:ok, BeamLisp.Ns.Rt.invoke(fun, [])}
   catch
     kind, reason -> {:raised, kind, reason, {:interpreted_trace, __STACKTRACE__}}
   end

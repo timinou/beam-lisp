@@ -36,7 +36,7 @@ defmodule BeamLisp.DepsCompileTest do
 
   defp call(ns, f, args) do
     BeamLisp.Loader.ensure_loaded(ns)
-    BeamLisp.RT.invoke(BeamLisp.Env.fetch!(ns, f), args)
+    BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!(ns, f), args)
   end
 
   defp list(v), do: BeamLisp.Vector.to_list(v)

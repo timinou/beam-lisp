@@ -329,9 +329,9 @@ defmodule BeamLisp.Env do
 
   # bl fns are tagged structs, not Elixir fns — normalize any invocable
   # thunk to a zero-arity Elixir fn so `env/with-env` works from bl source
-  # without the caller hand-wrapping through RT.invoke.
+  # without the caller hand-wrapping through `rt/invoke`.
   defp as_thunk(fun) when is_function(fun, 0), do: fun
-  defp as_thunk(fun), do: fn -> BeamLisp.RT.invoke(fun, []) end
+  defp as_thunk(fun), do: fn -> BeamLisp.Ns.Rt.invoke(fun, []) end
 
   @doc """
   Wrap a one-argument invocable (bl fn or Elixir fn) as an ELIXIR
@@ -347,7 +347,7 @@ defmodule BeamLisp.Env do
   """
   def convey(fun) do
     token = capture()
-    inner = fn arg -> BeamLisp.RT.invoke(fun, [arg]) end
+    inner = fn arg -> BeamLisp.Ns.Rt.invoke(fun, [arg]) end
     fn arg -> bind(token); inner.(arg) end
   end
 

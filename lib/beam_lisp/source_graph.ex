@@ -80,6 +80,6 @@ defmodule BeamLisp.SourceGraph do
     # first pass, before any `.bl` beam exists) `ensure_loaded/1` evaluates the
     # source and the var is the interned closure. Same answer either way, and
     # it is what lets the build's own graph be compiled by the build.
-    BeamLisp.RT.invoke(BeamLisp.Env.fetch!(@ns, Atom.to_string(fun)), args)
+    BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!(@ns, Atom.to_string(fun)), args)
   end
 end
