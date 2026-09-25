@@ -109,7 +109,11 @@ results =
     # badarg surfacing as ArgumentError from deep inside Enum — is how RT
     # happened to fail, and nothing can rescue it meaningfully; those compare as
     # "raised".
-    contract = [BeamLisp.CompileError, BeamLisp.ExInfo]
+    # FunctionClauseError vs ArgumentError is contract too, for the collection
+    # fns test/beam_lisp/dispatch_table_test.exs pins per (fn, value) — and only
+    # for those: elsewhere RT's clause errors are incidental.
+    pinned = [:count, :seq, :first, :rest, :next, :get, :assoc, :conj, :contains?, :find, :empty?]
+    contract = [BeamLisp.CompileError, BeamLisp.ExInfo] ++ if(f in pinned, do: [FunctionClauseError, ArgumentError], else: [])
     norm = fn
       {:raised, t} -> if t in contract, do: {:raised, t}, else: :raised
       x -> x
