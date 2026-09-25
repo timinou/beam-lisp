@@ -9,7 +9,9 @@
 ;
 ; The honest contract — the same one `rewrite` makes — is that every
 ; correction is a RULE you can read below: `{:name :tier :pattern
-; :replacement :when?}`. There is no model guessing at a fix: the after
+; :replacement :when?}` — or, for a rule that reads source TEXT rather than
+; forms, `{:name :tier :text}` (see TEXT smells, below). There is no model
+; guessing at a fix: the after
 ; is exactly the sum of the registered rules, and a reviewer checks each
 ; by eye.
 ;
@@ -109,6 +111,48 @@
                                            :pattern (list 'quote pattern)
                                            :replacement (list 'quote replacement))
                                      opts)))))))
+
+; --- TEXT smells: a rule over SOURCE, not over forms -----------------------
+;
+; A form rewrite cannot reach a string literal. The reader wraps only LIST nodes
+; with a position (priv/boot/reader.bl), so a literal has no span to slice, and
+; bl's `pr-str` of a binary drops its quotes — which is why span-rewrite's
+; `capture-ok?` refuses a capture of one. A rule that rewrites literals therefore
+; answers in SOURCE OFFSETS instead — the {:offset :remove :insert} vocabulary
+; `repair` uses — and still reads its tier, its `bl lint` line and its `bl fix`
+; pass from the same registry.
+;
+; One consequence, stated rather than hidden: the form-level API
+; (`smell-match`/`scan`/`report-source`/`deodorize`) has no source text, so it
+; CANNOT judge a text smell and never reports one. `bl lint`, `bl fix` and
+; lint/smell-count do, because all three hold the source.
+
+(defmacro deftextsmell
+  "Declare a TEXT smell — a rule that reads source rather than forms:
+   (deftextsmell name :tier (fn [src] → [{:offset :remove :insert} …])).
+   Offsets are CODEPOINTS from the start of `src` (the reader's unit); no edits
+   means the rule found nothing. Registered like any other smell, so the tiers
+   select it and `all-smells` shows it."
+  [name tier edits-form]
+  (list 'def name
+        (list 'deodorant/register-smell!
+              (list 'hash-map :name (list 'quote name) :tier tier :text edits-form))))
+
+(defn text-smell?
+  "True when `s` is a TEXT smell — a rule over source offsets (deftextsmell),
+   not over forms."
+  [s]
+  (some? (:text s)))
+
+(defn text-smells
+  "The TEXT smells in `rules`, in order — the half that needs source text."
+  [rules]
+  (filter text-smell? rules))
+
+(defn form-smells
+  "The FORM smells in `rules`, in order — every rule a node walk can judge."
+  [rules]
+  (remove text-smell? rules))
 
 ; --- SAFE: value-identical, apply blind ----------------------------------
 ;
@@ -470,7 +514,11 @@
    accepts the bindings, else nil. Bindings are keyed by the pattern
    VARIABLE — a guard reads `(get b '?k)`."
   [smell form]
-  (when (available? smell)
+  (when (and (available? smell)
+             ; a TEXT smell has no pattern to match a form against — it needs the
+             ; source bytes (see deftextsmell). Nil is the honest answer here: a
+             ; node walk does not get to guess at what the text says.
+             (not (text-smell? smell)))
     (let [binds (rewrite/match? (:pattern smell) form)]
       (if (and (some? binds)
                (let [g (get smell :when nil)]
@@ -559,36 +607,153 @@
 ; codemod would normalize formatting and drop comments; that is inherent
 ; to form-level work and why the fixer stays at the text level.)
 
-(defn all-spans
-  "The `[start end)` codepoint spans of EVERY list form in `src`, nested
-   included, ordered by closing paren (inner before outer, left before
-   right); `fix-source` reverses them so splicing runs rightmost-first
-   and earlier offsets stay valid. A scanner, not a parse: parens inside
-   string literals and comments do not count. Codepoint offsets compose
-   with String/slice (grapheme-safe for source text, ASCII in practice)."
+(def ^:private tag-delims
+  "Chars that END a `#`-dispatch tag run: whitespace and commas plus the
+   structural delimiters — the same stop-set the reader's `take-token` uses
+   (priv/boot/reader.bl). A tag runs from `#` to the first of these, and a pipe
+   run directly after it opens a RAW body. Strings, not codepoints: this scanner
+   walks `String/codepoints`, whose elements are one-character STRINGS — a set of
+   integers would answer `contains?` false for every one of them."
+  (set (String/codepoints " \t\n\r,()[]{};\"")))
+
+(defn- scan-source
+  "One left-to-right pass over `src` that decides, at every character, whether it
+   is CODE. Three states swallow what only LOOKS structural: a comment to end of
+   line, a `\"…\"` literal (escapes included), and a pipe-delimited RAW body
+   (`#|…|`, `#tag|…|`, `#||…||`), whose parens, quotes and semicolons are all
+   content until a run of EXACTLY the opener's pipe count closes it (a run of
+   another length is content too — see priv/boot/reader.bl).
+
+   Returns `{:spans [[start end) …] :strings [{:start :end :tagged} …]}`: every
+   list form's span, ordered by closing paren (inner before outer, left before
+   right — `fix-source` reverses them so splicing runs rightmost-first), and
+   every `\"…\"` literal in source order. Offsets are CODEPOINT indices, the
+   reader's own unit, which compose with String/slice (grapheme-safe for source
+   text, ASCII in practice)."
   [src]
   (let [chars (into [] (String/codepoints src))
         n (count chars)]
-    (loop [i 0 stack (list) in-str false in-comment false spans []]
+    (loop [i 0 stack (list) in-str false str-start 0 open-tagged false tagged false
+           in-comment false raw 0 run 0 hash false spans [] strings []]
       (if (>= i n)
-        spans
+        {:spans spans :strings strings}
         (let [c (get chars i)]
           (cond
             in-comment
-              (recur (inc i) stack in-str (not (= c "\n")) spans)
+              (recur (inc i) stack in-str str-start open-tagged false
+                     (not= c "\n") 0 0 false spans strings)
+
+            ; inside a raw body: its quotes, parens and semicolons are content,
+            ; and only a run of EXACTLY `raw` pipes closes it (a run of another
+            ; length is content too — see priv/boot/reader.bl).
+            (pos? raw)
+              (if (= c "|")
+                (let [ridx (inc run)]
+                  (if (= ridx raw)
+                    (recur (inc i) stack in-str str-start open-tagged false false 0 0 false spans strings)
+                    (recur (inc i) stack in-str str-start open-tagged false false raw ridx false spans strings)))
+                (recur (inc i) stack in-str str-start open-tagged false false raw 0 false spans strings))
+
+            ; a `#`, with its tag run, is directly behind us; pipes may open a body
+            hash
+              (cond
+                (= c "|")  (recur (inc i) stack in-str str-start open-tagged false false raw (inc run) true spans strings)
+                ; the opener just ended: this character is already body content
+                (pos? run)  (recur (inc i) stack in-str str-start open-tagged false false run 0 false spans strings)
+                ; anything else is NOT a pipe run, so drop `hash` and re-read this
+                ; character as ordinary code — `#(inc 1)` still opens a form.
+                ; `tagged` rides along for THIS character only: a `\"` right after
+                ; a tag run is the tag's PAYLOAD (`#file\"LICENSE\"`), not ours.
+                (contains? tag-delims c) (recur i stack in-str str-start open-tagged true false 0 0 false spans strings)
+                :else      (recur (inc i) stack in-str str-start open-tagged true false 0 0 true spans strings))
 
             in-str
               (cond
-                (= c "\\") (recur (+ i 2) stack true false spans)
-                (= c "\"") (recur (inc i) stack false false spans)
-                :else      (recur (inc i) stack true false spans))
+                (= c "\\") (recur (+ i 2) stack true str-start open-tagged false false 0 0 false spans strings)
+                (= c "\"") (recur (inc i) stack false 0 false false false 0 0 false spans
+                                   (conj strings {:start str-start :end (inc i) :tagged open-tagged}))
+                :else      (recur (inc i) stack true str-start open-tagged false false 0 0 false spans strings))
 
-            (= c ";")  (recur (inc i) stack false true spans)
-            (= c "\"") (recur (inc i) stack true false spans)
-            (= c "(")  (recur (inc i) (cons i stack) false false spans)
-            (= c ")")  (recur (inc i) (rest stack) false false
-                               (conj spans [(first stack) (inc i)]))
-            :else      (recur (inc i) stack false false spans)))))))
+            (= c ";")  (recur (inc i) stack false 0 false false true 0 0 false spans strings)
+            (= c "\"") (recur (inc i) stack true i tagged false false 0 0 false spans strings)
+            (= c "#")  (recur (inc i) stack false 0 false false false 0 0 true spans strings)
+            (= c "(")  (recur (inc i) (cons i stack) false 0 false false false 0 0 false spans strings)
+            (= c ")")  (recur (inc i) (rest stack) false 0 false false false 0 0 false
+                               (conj spans [(first stack) (inc i)]) strings)
+            :else      (recur (inc i) stack false 0 false false false 0 0 false spans strings)))))))
+
+(defn all-spans
+  "The `[start end)` codepoint spans of EVERY list form in `src`, nested
+   included, ordered by closing paren (inner before outer, left before right);
+   `fix-source` reverses them so splicing runs rightmost-first and earlier
+   offsets stay valid. A scanner, not a parse — `scan-source` is what says which
+   characters are code."
+  [src]
+  (:spans (scan-source src)))
+
+(defn string-literals
+  "Every `\"…\"` literal in `src`, as `{:start :end :tagged}` in source order —
+   the literals `all-spans` steps over but does not report. `:tagged` marks a
+   literal that is a `#`-dispatch PAYLOAD (`#file\"…\"`, `#\"…\"`): there the
+   quote is the TAG's syntax, not this file's, so a rewrite must leave it be. A
+   RAW body (`#|…|`) is not a `\"…\"` literal at all and never appears here."
+  [src]
+  (:strings (scan-source src)))
+
+; --- TEXT SMELL: an escaped quote is a raw string ----------------------------
+;
+; `"…\"…"` is a string that fights its own quotes: every inner `"` needs a
+; backslash, and `#|…|` needs none. The rule fires on a literal whose VALUE holds
+; a quote, holds no `|` (the raw closer would end the body early), and whose
+; source uses `\"` and `\\` only — a shape-changing escape (`\n`, `\t`, `\u…`)
+; stays put, because the raw spelling would have to write the CHARACTER it stands
+; for and re-flow the file: a layout decision, not an escape removal.
+;
+; The replacement is built from the VALUE, never by editing the source text:
+; removing escapes by hand would be a second implementation of the reader.
+;
+; MIGRATION, and opt-in like the other migrations, for a reason measured on this
+; tree (2026-09-22): 611 literals in 113 files carry an escaped quote, so as a
+; default rule it would drown `bl lint`'s signal and rewrite the codebase at
+; once. `bl lint --tier every` reports them; `bl fix --tier every` rewrites them.
+
+(defn- escapes-only-quotes?
+  "True when every `\` in the source BODY of a string literal escapes a quote or
+   a backslash — i.e. no escape that stands for a character, which a raw body
+   would have to write out literally."
+  [body]
+  (loop [cs (String/codepoints body)]
+    (if (empty? cs)
+      true
+      (if (= "\\" (first cs))
+        (let [nxt (second cs)]
+          (if (or (= "\"" nxt) (= "\\" nxt))
+            (recur (drop 2 cs))
+            false))
+        (recur (rest cs))))))
+
+(defn- raw-string-edit
+  "The edit that rewrites the `\"…\"` literal `lit` as a raw string, or nil when
+   it is not a candidate — the four conditions are the section note above. `cps`
+   is `src`'s codepoint vector, hoisted so a whole file indexes once."
+  [cps lit]
+  (when-not (:tagged lit)
+    (let [start (:start lit)
+          end (:end lit)
+          body (apply str (subvec cps (inc start) (dec end)))]
+      (when (and (includes? body "\\\"")
+                 (escapes-only-quotes? body))
+        (let [value (try (first (read-forms (apply str (subvec cps start end))))
+                         (catch _ nil))]
+          (when (and (string? value) (not (includes? value "|")))
+            {:offset start :remove (- end start)
+             :insert (str "#|" value "|")}))))))
+
+(deftextsmell escaped-quotes→raw-string :migration
+  (fn [src]
+    (let [cps (into [] (String/codepoints src))]
+      (into [] (keep (fn [lit] (raw-string-edit cps lit))
+                     (string-literals src))))))
 
 (defn overlaps?
   "Do [a b) and [x y) intersect? Spans are properly nested or disjoint,
@@ -611,7 +776,11 @@
    non-smell siblings — survives byte-for-byte. Passes run to a fixed
    point (a rewrite can expose a new smell one level up), and the result
    is re-parsed before returning: the fixer never produces broken
-   source."
+   source.
+
+   A TEXT smell (deftextsmell) is the one thing this fixer cannot apply — it
+   reads source, and this one re-renders FORMS; `fix-source-preserving` runs
+   both kinds."
   [rules src]
   (loop [out src changed 0 passes 0]
     (let [spans (reverse (all-spans out))
@@ -765,6 +934,27 @@
                       :else
                         (recur new (conj added entry) (rest es)))))))))))))
 
+(defn- apply-text-edits
+  "Apply every TEXT smell's edits to `src`, returning `{:source :changed}`.
+   Edits run rightmost-first, so the offsets still to come stay valid; an edit
+   that OVERLAPS one already applied is dropped rather than guessed at (both were
+   measured against the text as it was) — the next pass sees the rewritten text
+   and offers the survivor again."
+  [rules src]
+  (let [edits (into [] (mapcat (fn [r] ((:text r) src)) (text-smells rules)))
+        rightmost-first (sort-by (fn [e] (- 0 (:offset e))) edits)
+        cs (into [] (String/codepoints src))]
+    (loop [out (list) cursor (count cs) changed 0 es rightmost-first]
+      (if (empty? es)
+        {:source (apply str (concat (subvec cs 0 cursor) out)) :changed changed}
+        (let [e (first es)
+              start (:offset e)
+              end (+ start (:remove e))]
+          (if (> end cursor)
+            (recur out cursor changed (rest es))
+            (recur (concat (list (:insert e)) (subvec cs end cursor) out)
+                   start (inc changed) (rest es))))))))
+
 ; --- TRIVIA-PRESERVING fixer (the default going forward) -------------------
 ;
 ; fix-source splices (pr-str fixed), which re-renders a matched subtree on one
@@ -785,14 +975,19 @@
    before returning — never emits broken source."
   [rules src]
   (let [rv (into [] (filter available? rules))
-        srules (mapv span-rewrite/smell->rule rv)]
+        ; TEXT smells run FIRST, on the text as written: their offsets index
+        ; `src`, and the passes below must see what they produce (a literal they
+        ; rewrote is what `scan-source` steps over next).
+        t (apply-text-edits rv src)
+        frules (into [] (form-smells rv))
+        srules (mapv span-rewrite/smell->rule frules)]
     ; `seen` guards against a NON-CONVERGING ruleset (a rare rule pair that
     ; undoes itself): if a pass reproduces source already emitted, or we hit the
     ; pass cap, stop and return the current text rather than throwing — a
     ; stubborn file yields its best-effort fixes instead of aborting a sweep.
-    (loop [out src changed 0 passes 0 seen #{} fired []]
+    (loop [out (:source t) changed (:changed t) passes 0 seen #{} fired []]
       (let [res (span-rewrite/rewrite-source srules out)
-            fired (into fired (map (fn [i] (get rv i)) (:fired res)))]
+            fired (into fired (map (fn [i] (get frules i)) (:fired res)))]
         (if (or (= (:changed res) 0) (contains? seen (:source res)) (>= passes 50))
           (let [entries (distinct (mapcat ensure-require-entries fired))
                 r (if (empty? entries)

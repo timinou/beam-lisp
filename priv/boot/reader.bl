@@ -343,6 +343,85 @@
             :else (recur (rest tail) (cons (escaped-codepoint (first tail)) acc))))
       :else (recur (rest remaining) (cons (first remaining) acc)))))
 
+; ── raw strings: #|…| and #tag|…| ─────────────────────────────────────────
+;
+; A raw body is delimited by PIPES and by nothing else. The opener's pipe count
+; is the closer's: `#|` ends at the first `|`, `#||` at the first `||`, `#|||` at
+; the first `|||`. A run of a DIFFERENT length is body text, so a `#||` body may
+; carry a lone `|` (and a `#|` body may carry none): one more pipe buys one more
+; pipe of freedom, and the spelling at the call site says which run ends the
+; text.
+;
+; Why the reader and not an escape: the only string literal beam-lisp had was
+; `"…"`, so text holding a quote (CSS, JS, SQL, prose, another language) had to
+; escape every occurrence — and an escaped quote is exactly what a tool that
+; re-escapes content mangles twice. A raw body is verbatim: no escape sequences
+; at all, newlines and indentation preserved byte-for-byte.
+
+(defn- pipe-chars
+  "A proper Erlang list of `n` pipes (codepoint 124)."
+  [n]
+  (loop [i 0 acc (list)]
+    (if (= i n) acc (recur (inc i) (cons 124 acc)))))
+
+(defn- pipe-run
+  "Length of the run of pipes (codepoint 124) at the head of `chars`, with the
+   source after that run: `[run remaining]`."
+  [chars]
+  (loop [rem chars n 0]
+    (if (and (not (empty? rem)) (= 124 (first rem)))
+      (recur (rest rem) (inc n))
+      [n rem])))
+
+(defn- read-raw-string-body
+  "Read a raw string body to its closing pipe run and return
+   `[binary-value remaining-source pos']`.
+
+   `pipes` is the opener's pipe count and the closer must match it EXACTLY — a
+   run of any other length is content, pipes and all. `pos` is the position of
+   `chars`'s first character (just past the opening pipes); `opener-pos` is the
+   position of the `#`, which is what an unterminated body must name. Nothing is
+   interpreted on the way through: a backslash is a backslash and a quote is a
+   quote."
+  [chars pipes pos opener-pos]
+  (loop [remaining chars acc (list)]
+    (cond
+      (empty? remaining)
+        (let [closer (chars->string (pipe-chars pipes))]
+          (syntax-fail :unterminated-raw-string
+                       (str "unterminated raw string — " pipes " pipe"
+                            (if (= 1 pipes) "" "s") " opened it and " closer " never closed it")
+                       opener-pos
+                       (merge {:closer closer} (diag/caret (diag/from-pos opener-pos)))))
+      (= 124 (first remaining))
+        (let [[run after] (pipe-run remaining)]
+          (if (= run pipes)
+            [(chars->string (reverse acc)) after (advance-to pos chars after)]
+            (recur after (lists/append (pipe-chars run) acc))))
+      :else (recur (rest remaining) (cons (first remaining) acc)))))
+
+(defn- split-tag-at-pipes
+  "Split `chars` into `[tag-chars pipe-count pipe-start after-pipes]` when a run
+   of pipes follows a tag immediately, else nil.
+
+   The tag is scanned with `take-token`'s delimiter set PLUS the pipe itself, so
+   `#html|…|` ends the tag at the pipe instead of swallowing it (`|` is an
+   ordinary token character everywhere else). The delimiter list is INLINE for
+   the same bootstrap reason it is inline in `take-token`: this runs on the READ
+   path, where a var newer than the installed floor cannot be fetched.
+
+   A nil answer means this is not a raw literal at all, and the caller reads the
+   tag exactly as it always did — so an UNREGISTERED `#a|b` still reads as the
+   single symbol `#a|b`."
+  [chars]
+  (let [delims (list 32 9 10 13 44 40 41 91 93 123 125 34 59 124)
+        parts (lists/split (string/cspan chars delims) chars)
+        tag (erlang/element 1 parts)
+        pipe-start (erlang/element 2 parts)]
+    (when (and (not (empty? tag)) (not (empty? pipe-start)) (= 124 (first pipe-start)))
+      (let [[run after-pipes] (pipe-run pipe-start)]
+        [tag run pipe-start after-pipes]))))
+
 (defn- whole-number
   "Parse token charlist `chars` as a whole integer or float and return nil when any characters remain or parsing fails."
   [chars]
@@ -837,6 +916,33 @@
           [(rn/->tuple [:record tag kvs]) rest2 fpos])
       :else [(classify (cons 35 token)) after (advance-to pos-after-hash chars after)])))
 
+(defn- read-raw-tag
+  "Read `#tag|…|` when `tag` is REGISTERED, else nil so the caller reads the form
+   exactly as it always did.
+
+   The payload is a RAW body: the opener's pipe count is the closer's and nothing
+   inside it is interpreted (see read-raw-string-body). Only a registered tag can
+   reach a body, so an UNREGISTERED `#a|b` still reads as the single symbol
+   `#a|b` — nothing that reads today reads differently."
+  [chars pos0 pos-after-hash]
+  (let [raw (split-tag-at-pipes chars)
+        ; `when`, not `if … nil`: the linter's own spelling, and it keeps this
+        ; body to ONE runtime call (a second `some?`/`nil?` guard here makes the
+        ; emitter repeat the RT module node — system.linear's tier-3 check).
+        fn-sym (when raw (data-reader-fn (chars->string (first raw))))]
+    (when fn-sym
+      (let [[_ pipes _pipe-start after-pipes] raw
+            ; ONE walk: `after-pipes` is a suffix chain of `chars`, so advancing
+            ; from the first pipe to just past the pipe run IS the body's first
+            ; character. Two calls (`… pipe-start`, then `… after-pipes`) cost a
+            ; second walk and emit the same invoke node twice — system.linear's
+            ; tier-3 duplication, measured.
+            content-pos (advance-to pos-after-hash chars after-pipes)
+            [body rest2 fpos] (read-raw-string-body after-pipes pipes content-pos pos0)]
+        ; A data-reader call is a list; it is positioned at the `#`, like the
+        ; collection and string payloads of a registered tag.
+        [(wrap-list-pos (node :list (list fn-sym body)) pos0) rest2 fpos]))))
+
 (defn- read-dispatch
   "Read a hash-prefixed reader form and return `[form remaining-source pos']`,
    including sets, discards, and anonymous functions. `pos0` is the position of
@@ -886,7 +992,17 @@
         ; (possibly aliased, possibly bare) symbol to its var handle so
         ; `alter-var-root`, `with-bindings` and friends can name a var by value.
         (wrap-prefix (rest chars) "var" in-fn? (advance-pos after-hash 39))
-      :else (read-tag chars in-fn? pos0 after-hash))))
+      (= 124 (first chars))
+        ; `#|…|` — a RAW string, no tag: the opening pipe run sets both the body's
+        ; extent and the closer's width. See read-raw-string-body.
+        (let [[pipes after-pipes] (pipe-run chars)]
+          (read-raw-string-body after-pipes pipes (advance-to after-hash chars after-pipes) pos0))
+      :else
+        ; Not a dispatch character: a data-reader tag, a record literal, or a bare
+        ; hash-symbol. A registered tag followed immediately by pipes is the raw
+        ; form `#tag|…|`; anything else falls through to read-tag untouched.
+        (let [raw (read-raw-tag chars pos0 after-hash)]
+          (if (some? raw) raw (read-tag chars in-fn? pos0 after-hash))))))
 
 (defn- read-atom
   "Read one delimiter-bounded atom from `chars` and return `[value remaining pos']`.
