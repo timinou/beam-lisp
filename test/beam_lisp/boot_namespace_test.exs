@@ -37,7 +37,7 @@ defmodule BeamLisp.BootNamespaceTest do
     File.write!(Path.join(root, "different-file.bl"), "(ns sample-boot)\n(def value 1)\n")
     File.write!(Path.join(root, "data-readers.bl"), "(println :action-only)\n")
     BeamLisp.Loader.ensure_loaded("seed")
-    names = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("seed", "namespaces"), [root]) |> Enum.to_list()
+    names = BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("seed", "namespaces"), [root]) |> Enum.to_list()
     assert Enum.sort(names) == Enum.sort(["Sample-boot", "Multi"])
   end
 end

@@ -1,0 +1,648 @@
+; vm/repl.bl — the daemon's REPL: sessions over WebSocket, into the project VM.
+;
+; ══ WHAT THIS IS ════════════════════════════════════════════════════════════
+;
+; The wire protocol IS the product (PLAN-135 §2): every language question a
+; REPL frontend can ask — eval, complete, doc, interrupt, form-completeness —
+; is one JSON op behind ONE WebSocket route on the daemon's HTTP face
+; (vm.http mounts /repl + /repl/ws). Frontends stay dumb: the CodeMirror page
+; shipped in priv/std/vm/repl/ is the reference client, not the only one.
+;
+; ══ THE MODEL (measured in the Phase-0 spike, research/repl-spike/) ═════════
+;
+; A SESSION is {:env fork :ns "user" :root … :eval nil|{:worker :mref}} held
+; by the `sessions` defserver, keyed "sN". The env forks the PROJECT VM's env
+; (vm.manager/ensure × vm.spec/read): the session sees everything the warm VM
+; has interned through the env chain, while its own defs stay isolated — two
+; REPL sessions cannot see each other's vars, and a session cannot pollute the
+; project VM (spike U1 proved fork-per-session semantics; the final impl only
+; changes the fork's PARENT).
+;
+; An EVAL runs in its own monitored worker process under the session env
+; (pdict `*ns*` rebound from the session row, cwd = the project root), with a
+; group-leader proxy that turns stdout into {:push …} messages to the socket.
+; The runner (a second process) owns the monitor, so INTERRUPT IS ONE KILL:
+; `:erlang.exit(worker, :kill)` is untrappable and the runner's DOWN clause
+; does ALL cleanup — one cleanup path, no race between "interrupted" and
+; "finished" (spike U3: kill → error frame in 6 ms, session survives).
+;
+; ══ WHY A DEFSERVER, NOT ETS ════════════════════════════════════════════════
+;
+; The spike kept sessions in a named ETS table owned by `main`. In the daemon
+; there is no `main` that outlives the mount point — an ETS table dies with
+; its owner, and HTTP connection processes die per request. A defserver is the
+; codebase's canonical long-lived state owner (vm.manager's shape): the table
+; survives every connection, and session rows are one `call` away from any
+; process. Writes are human-paced; serialisation is invisible.
+;
+; ══ COMPLETION READS A MATERIALISED INDEX (Phase 2) ═════════════════════════
+;
+; Spike U2 measured the direct Env scan at ~100–500 ms/query; the daemon
+; measures 516–938 ms (1842 vars) — broken at keystroke latency. The index
+; (see INDEX below) is one ETS row per session: built once synchronously on
+; the first query, invalidated by every eval-end with a background rebuild,
+; TTL-backstopped for vars other commands intern. Warm queries are a memory
+; filter (spike: 1.5–2.6 ms).
+
+(ns vm.repl
+  (:require [env] [vm.manager :as mgr] [vm.spec :as spec]))
+
+(def SERVER :vm-repl)
+
+;; ══ COMPLETION: THE MATERIALISED INDEX (Phase 2) ════════════════════════════
+;;
+;; The spike measured the direct Env scan at ~100–500 ms/query; the daemon
+;; measures 516–938 ms (1842 vars, deeper chain). At keystroke latency that
+;; is broken, so completion reads a MATERIALISED index: one ETS row per
+;; session, the table owned by the defserver (long-lived; a table created by
+;; a connection process would die with it).
+;;
+;; Row states: absent (cold) · :building (first build in flight — nothing to
+;; serve yet) · {:ready entries built-at rebuilding?}. Last-good entries keep
+;; serving through every rebuild: the swap is the builder's single write.
+;; Invalidation is eval-triggered — evals are what intern into a session's
+;; chain, so the eval-end path marks the row stale and kicks a BACKGROUND
+;; rebuild: by the time the user presses Tab after defining something, the
+;; index is warm. A 30 s TTL backstop catches vars other commands intern
+;; into the shared project VM. A cold query builds synchronously ONCE (the
+;; honest first answer); every later query is a memory filter.
+;;
+;; Entries carry {label ns arglists} — arglists from ns_defs, fetched ONCE
+;; per namespace and shared across that ns's vars. Docs are NOT in the
+;; index: the frontend fetches the SELECTED item's doc through the doc op,
+;; so the build never pays 1842 doc_string calls.
+
+(def INDEX :vm_repl_index)
+(def INDEX-TTL-MS 30000)
+
+(defn- index-read [sid]
+  (let [r (erlang/apply :ets :lookup (list INDEX sid))]
+    (if (empty? r) :cold (elem (first r) 1))))
+
+(defn- index-write [sid v]
+  (erlang/apply :ets :insert (list INDEX (tuple sid v))))
+
+(defn- index-build
+  "Scan the corpus visible from THIS process's env (call under the session
+   env) into index entries."
+  []
+  (mapcat (fn [ns]
+            (try
+              (let [defs (try (BeamLisp.Env/ns_defs ns) (catch _ex nil))]
+                (map (fn [n] {"label" (str n) "ns" (str ns)
+                              "arglists" (arglists-str* ns (str n) defs)})
+                     (BeamLisp.Env/public_names ns)))
+              (catch _ex (list))))
+          (BeamLisp.Env/namespaces)))
+
+(defn- index-builder [sid row]
+  ;; the ONE build body: under the session env, swap the row atomically when
+  ;; done. Then the dirty check: an invalidation that arrived WHILE building
+  ;; was not lost — it rides the session row ([:index-dirty]), and the swap
+  ;; we just wrote is already stale, so kick the next build immediately.
+  (spawn (fn []
+           (env/with-env (:env row)
+             (fn []
+               (BeamLisp.Env/in_ns (:ns row))
+               (let [entries (vec (index-build))]
+                 (index-write sid (tuple :ready entries
+                                         (System/monotonic_time :millisecond) false))
+                 (when (call SERVER [:take-dirty sid])
+                   (index-rebuild-async sid (get-session sid)))))))))
+
+(defn- index-rebuild-async
+  "Kick a background rebuild. NEVER deletes last-good entries: the row keeps
+   serving them while the builder runs and the swap is atomic (an eval-end →
+   ~1s rebuild window must not empty completion — the probe caught exactly
+   that). The rebuilding flag is the one-builder lock. Cold (never built)
+   gets the :building marker — there is nothing to serve yet."
+  [sid row]
+  (let [r (index-read sid)]
+    (cond
+      (= r :cold)
+      (do (index-write sid :building) (index-builder sid row))
+      (and (erlang/is_tuple r) (= false (elem r 3)))
+      (do (index-write sid (tuple :ready (elem r 1) (elem r 2) true))
+          (index-builder sid row))
+      :else :already-building)))
+
+(defn- index-invalidate [sid row]
+  ;; the eval that just ended is the thing that interns: the corpus changed
+  ;; exactly now. Mark dirty FIRST (rides the session row, survives the
+  ;; in-flight builder's swap), then kick a rebuild; if one is already
+  ;; running, the dirty flag makes its completion re-kick (see index-builder).
+  (call SERVER [:index-dirty sid])
+  (index-rebuild-async sid row))
+
+(defn- index-entries
+  "{:entries entries} | :building. Cold builds synchronously ONCE; a stale
+   (TTL'd) row answers from itself and refreshes in the background."
+  [sid row]
+  (let [r (index-read sid)]
+    (cond
+      (= r :cold)
+      (do (env/with-env (:env row)
+            (fn []
+              (BeamLisp.Env/in_ns (:ns row))
+              (index-write sid (tuple :ready (vec (index-build))
+                                      (System/monotonic_time :millisecond) false))))
+          (let [r2 (index-read sid)]
+            {:entries (elem r2 1)}))
+
+      (= r :building)
+      :building
+
+      :else
+      (let [entries (elem r 1)
+            built-at (elem r 2)]
+        (when (> (- (System/monotonic_time :millisecond) built-at) INDEX-TTL-MS)
+          (index-rebuild-async sid row))
+        {:entries entries}))))
+
+;; ── the session table (vm.manager's shape) ──────────────────────────────────
+
+(defserver sessions
+  (init [_]
+    ;; the completion index lives here: this process is long-lived, so a
+    ;; table it owns survives every connection (see the header's Phase-2 note)
+    (try
+      (erlang/apply :ets :new (list INDEX (list :named_table :public :set)))
+      (catch _ex :already-exists))
+    (ok {:sessions {} :n 0}))
+
+  ;; mint a session: a fork of `base-env` (the project VM's env). Forking here
+  ;; — inside the server process — is fine: an env is ETS data, not a process
+  ;; binding.
+  (handle-call [:new base-env root] [_from st]
+    (let [sid (str "s" (:n st))
+          row {:env (env/fork base-env) :ns "user" :root root :eval nil}]
+      (reply sid (assoc st
+                   :sessions (assoc (:sessions st) sid row)
+                   :n (inc (:n st))))))
+
+  (handle-call [:get sid] [_from st]
+    (reply (get (:sessions st) sid) st))
+
+  (handle-call [:put sid row] [_from st]
+    (reply :ok (assoc st :sessions (assoc (:sessions st) sid row))))
+
+  (handle-call [:index-dirty sid] [_from st]
+    (let [row (get (:sessions st) sid)]
+      (if (map? row)
+        (reply :ok (assoc st :sessions (assoc (:sessions st) sid (assoc row :index-dirty true))))
+        (reply :ok st))))
+
+  ;; the builder's end-of-swap check: TRUE (and cleared) when an invalidation
+  ;; arrived while it was building — its swap is already stale, rebuild now
+  (handle-call [:take-dirty sid] [_from st]
+    (let [row (get (:sessions st) sid)]
+      (if (map? row)
+        (reply (= true (:index-dirty row))
+               (assoc st :sessions (assoc (:sessions st) sid (assoc row :index-dirty false))))
+        (reply false st))))
+
+  ;; an ended eval (finished OR killed) clears its row and lands the ns the
+  ;; worker last saw — one write site for both outcomes, so the runner's DOWN
+  ;; path and its value path cannot disagree about the session's state.
+  (handle-call [:eval-ended sid ns'] [_from st]
+    (let [row (get (:sessions st) sid)]
+      (if (map? row)
+        (reply :ok (assoc st :sessions
+                          (assoc (:sessions st) sid
+                                 (assoc row :eval nil :ns (or ns' (:ns row))))))
+        (reply :ok st)))))
+
+(defn start
+  "Boot the session server (idempotent by name)."
+  []
+  (if (nil? (Process/whereis SERVER))
+    (core/start sessions nil {:name SERVER})
+    (Process/whereis SERVER)))
+
+(defn- get-session [sid] (call SERVER [:get sid]))
+(defn- put-session [sid row] (call SERVER [:put sid row]))
+
+(defn- busy?
+  "An eval row counts only while its worker is alive — a crashed runner that
+   left a stale row does not wedge the session."
+  [row]
+  (let [ev (:eval row)]
+    (and (map? ev) (contains? ev :worker)
+         (= true (erlang/apply :erlang :is_process_alive (list (:worker ev)))))))
+
+;; ── stdout: a text group-leader proxy (vm.io's protocol, JSON not ETF) ──────
+
+(defn- normalize [chars]
+  (cond
+    (erlang/is_binary chars) chars
+    (erlang/is_list chars) (erlang/apply :erlang :iolist_to_binary (list chars))
+    :else (erlang/apply :erlang :iolist_to_binary
+            (list (erlang/apply :io_lib :format (list "~p" (list chars)))))))
+
+(defn- handle-text-io [ws id from reply-as req]
+  (cond
+    (and (erlang/is_tuple req) (= :put_chars (elem req 0)))
+    (do (erlang/send ws (tuple :push {"kind" "out" "id" id
+                                      "text" (normalize (elem req (- (erlang/tuple_size req) 1)))}))
+        (erlang/send from (tuple :io_reply reply-as :ok)))
+
+    (and (erlang/is_tuple req) (= :setopts (elem req 0)))
+    (erlang/send from (tuple :io_reply reply-as :ok))
+
+    (= req :getopts)
+    (erlang/send from (tuple :io_reply reply-as (list (tuple :binary true) (tuple :encoding :unicode))))
+
+    (and (erlang/is_tuple req) (= :get_geometry (elem req 0)))
+    (erlang/send from (tuple :io_reply reply-as (if (= :columns (elem req 1)) 80 24)))
+
+    (and (erlang/is_tuple req) (contains? #{:get_line :get_chars :get_until} (elem req 0)))
+    (erlang/send from (tuple :io_reply reply-as :eof))
+
+    :else (erlang/send from (tuple :io_reply reply-as (tuple :error :request)))))
+
+(defn- proxy-loop [ws id]
+  (receive
+    [:io_request from reply-as req]
+    (do (handle-text-io ws id from reply-as req)
+        (proxy-loop ws id))
+    [:stop] :ok
+    (after 600000 :ok)))
+
+(defn- io-text-proxy [ws id]
+  (spawn (fn [] (proxy-loop ws id))))
+
+;; ── eval (spike's model, verbatim: worker + runner-owned monitor) ───────────
+
+(def PRINT-CAP 16384)
+
+(defn- truncate-print
+  "Cap a printed value for the wire. Lazy seqs are already bounded by the
+   printer's sample path (20 + …); this caps REALIZED collections — a
+   1M-element vector must not flood the socket. Presentation policy lives
+   here (the REPL), not in the runtime printer."
+  [s]
+  (let [n (erlang/byte_size s)]
+    (if (> n PRINT-CAP)
+      (str (String/slice s 0 PRINT-CAP) "\n… [truncated — " n " chars total]")
+      s)))
+
+(defn- eval-worker [runner e ns0 root src proxy]
+  (erlang/group_leader proxy (erlang/self))
+  (env/with-env e
+    (fn []
+      (BeamLisp/with_cwd root
+        (fn []
+          (BeamLisp.Env/in_ns ns0)
+          (try
+            (let [v (BeamLisp/eval src)
+                  ns' (BeamLisp.Env/current_ns)]
+              (BeamLisp.Env/intern ns' "*2" (try (BeamLisp.Env/fetch! ns' "*1") (catch _ nil)))
+              (BeamLisp.Env/intern ns' "*1" v)
+              (erlang/send runner (tuple :eval-finished :value (truncate-print (BeamLisp.Ns.Rt/print_str v)) ns')))
+            (catch ex
+              (let [ns' (BeamLisp.Env/current_ns)]
+                (BeamLisp.Env/intern ns' "*e" ex)
+                (erlang/send runner (tuple :eval-finished :error (str (ex-message ex)) ns'))))))))))
+
+(defn- eval-wait [ws sid id proxy mref t0]
+  (receive
+    [:eval-finished kind payload ns']
+    (do (erlang/apply :erlang :demonitor (list mref (list :flush)))
+        (erlang/send proxy (tuple :stop))
+        (call SERVER [:eval-ended sid ns'])
+        (eval-ended sid)
+        (erlang/send ws (tuple :push {"kind" (if (= kind :value) "value" "error")
+                                      "id" id "text" payload "ns" ns'
+                                      "ms" (- (System/monotonic_time :millisecond) t0)})))
+    [:DOWN down-ref :process _wpid reason]
+      :when (= down-ref mref)
+    (do (erlang/send proxy (tuple :stop))
+        (call SERVER [:eval-ended sid nil])
+        (eval-ended sid)
+        (erlang/send ws (tuple :push {"kind" "error" "id" id "interrupted" true
+                                      "text" (str "eval ended: " (BeamLisp.Ns.Rt/print_str reason))
+                                      "ms" (- (System/monotonic_time :millisecond) t0)})))
+    (after 3600000
+      (do (erlang/send proxy (tuple :stop))
+          (call SERVER [:eval-ended sid nil])
+          (eval-ended sid)))))
+
+(defn- eval-ended [sid]
+  ;; every eval outcome lands here (eval-wait already did [:eval-ended]):
+  ;; the corpus may have changed → invalidate + background rebuild.
+  (let [row (get-session sid)]
+    (when (map? row) (index-invalidate sid row))))
+
+(defn- run-eval [ws sid id src]
+  ;; runs in its own process: the socket must stay responsive for `interrupt`
+  (let [row (get-session sid)
+        proxy (io-text-proxy ws id)
+        runner (erlang/self)
+        t0 (System/monotonic_time :millisecond)
+        sm (erlang/apply :erlang :spawn_monitor
+             (list (fn [] (eval-worker runner (:env row) (:ns row) (:root row) src proxy))))
+        worker (elem sm 0)
+        mref (elem sm 1)]
+    (put-session sid (assoc row :eval {:worker worker :mref mref}))
+    (eval-wait ws sid id proxy mref t0)))
+
+;; ── completion: queries read the index (see the Phase-2 note at INDEX) ──────
+
+(defn- direct-candidates
+  "The un-indexed corpus scan (label+ns only). NOT a query path — it answers
+   for the cold window while the FIRST index build is still in flight
+   (measured: 0.5–1s vs the build's 3.5–5s), so a session's first Tabs are
+   slow-but-correct instead of empty."
+  []
+  (mapcat (fn [ns]
+            (try
+              (map (fn [n] {"label" (str n) "ns" (str ns) "arglists" ""}) (BeamLisp.Env/public_names ns))
+              (catch _ex (list))))
+          (BeamLisp.Env/namespaces)))
+
+(defn- complete-prefix [prefix cur-ns entries]
+  ;; the warm path: a memory filter over the materialised index
+  (let [t0 (System/monotonic_time :millisecond)
+        hits (filter (fn [c] (String/starts_with? (get c "label") prefix)) entries)
+        sorted (sort-by (fn [c] (str (if (= (get c "ns") cur-ns) "0" "1") (get c "label"))) hits)
+        t1 (System/monotonic_time :millisecond)]
+    {"items" (to-list (take 100 sorted)) "total" (count hits)
+     "scanned" (count entries) "ms" (- t1 t0)}))
+
+;; ── arglists ───────────────────────────────────────────────────────────────
+;;
+;; Two sources, one string. A bl `defn`'s clauses live in ns_defs
+;; {kind, arity, fname, clause-node, module}, and the clause node carries the
+;; compiled parameter names — so the real arglist `(foo a b)` is recoverable.
+;; Those names are fresh-var mangled (`base_N`); a DESTRUCTURING parameter was
+;; bound as `whole_N` (a composite rest as `rest_N`) and its source form is
+;; gone from the AST, so it renders as `_` rather than inventing text.
+;;
+;; A core primitive — or any fn value with no bl clause — carries arities in
+;; its VALUE: a multi-arity fn (bl's or a seeded prim's) is
+;; {:\"$blfn\", fixed-map, {min, _} | nil}, a plain Elixir fn answers
+;; :erlang.fun_info. BEAM funs have no parameter names, so those degrade to
+;; `arities: 1, 2, 2+` — honest about what the runtime actually knows.
+
+(defn- param-label
+  "The source name behind a compiled parameter, or `_` for one whose source
+   form was a pattern. Only `whole` is treated as an internal base: a
+   destructuring parameter is bound as `whole_N` and its source form is gone
+   from the AST. `rest_N` is NOT treated that way — a plain `[a & rest]`
+   compiles to exactly that name, so it is far more often the user's own."
+  [pname]
+  (let [parts (String/split pname "_")]
+    (if (= 1 (count parts))
+      pname
+      (let [r (try (Integer/parse (last parts)) (catch _e nil))
+            numeric? (and (erlang/is_tuple r) (= "" (erlang/element 2 r)))]
+        (if (not numeric?)
+          pname
+          (let [base (join "_" (butlast parts))]
+            (if (= base "whole") "_" base)))))))
+
+(defn- clause-arglist
+  "One `defn` clause as `(name a b & rest)`."
+  [name kind params]
+  (let [labels (map (fn [p] (param-label (str (:name p)))) params)
+        labels (if (and (= kind :variadic) (not (empty? labels)))
+                 (concat (butlast labels) (list (str "& " (last labels))))
+                 labels)]
+    (str "(" name (if (empty? labels) "" (str " " (join " " labels))) ")")))
+
+(defn- clause-arglists
+  "Every clause arglist a def's entries spell out, or () when the entries are
+   not compiled fn clauses (a plain `def` value, a macro, an opaque fn node)."
+  [name entries]
+  (try
+    (keep (fn [e]
+            (let [node (elem e 3)]
+              (if (and (map? node) (= :defn-clause (:op node)))
+                (clause-arglist name (elem e 0) (:params node))
+                nil)))
+          entries)
+    (catch _e nil)))
+
+(defn- macro-value? [v]
+  (and (erlang/is_tuple v) (= 2 (erlang/tuple_size v)) (= "$macro" (str (elem v 0)))))
+
+(defn- value-arities
+  "Arities a fn VALUE knows: a bl/prim multi-fn's fixed arities plus its
+   variadic minimum, or a plain fun's arity."
+  [v]
+  (cond
+    (and (erlang/is_tuple v) (= 3 (erlang/tuple_size v)) (= "$blfn" (str (elem v 0))))
+      (let [fixed (elem v 1)
+            variadic (elem v 2)
+            ks (sort (vec (maps/keys fixed)))]
+        (if (nil? variadic)
+          ks
+          (concat ks (list (str (erlang/element 1 variadic) "+")))))
+    (erlang/is_function v)
+      ;; :erlang.fun_info/2 answers a PAIR ({:arity, N}), not a bare N
+      (let [fi (erlang/fun_info v :arity)]
+        (list (if (and (erlang/is_tuple fi) (= 2 (erlang/tuple_size fi)))
+                (erlang/element 2 fi) fi)))
+    :else (list)))
+
+(defn- arglists-str*
+  "Arglist text for `nsname/name`, with `defs` the ns's pre-fetched ns_defs
+   map (nil when the caller has none). The single source of this string for
+   both the completion index and the doc op."
+  [nsname name defs]
+  (let [entries (if (map? defs) (get defs name) nil)
+        als (if (empty? entries) (list) (clause-arglists name entries))]
+    (if (not (empty? als))
+      (join " " (distinct als))
+      ;; no compiled clause — ask the VALUE (a core prim, a macro, a `def`
+      ;; holding a fn). peek does not materialize a per-env def.
+      (let [r (try (BeamLisp.Env/peek nsname name) (catch _e :error))
+            v (if (and (erlang/is_tuple r) (= :ok (elem r 0))) (elem r 1) nil)
+            ars (sort (value-arities v))]
+        (cond
+          ;; a macro's fn takes the call FORM and the call-site env ahead of
+          ;; the declared parameters, so its BEAM arity is NOT the arity the
+          ;; user calls — name it rather than print a misleading number.
+          (macro-value? v) "macro"
+          (empty? ars) ""
+          :else (str "arities: " (join ", " (map (fn [a] (str a)) ars))))))))
+
+(defn- arglists-str [nsname name]
+  (arglists-str* nsname name (try (BeamLisp.Env/ns_defs nsname) (catch _ex nil))))
+
+(defn- doc-for [nsname name]
+  ;; doc_string returns the INFO MAP {:name :doc :ns} directly (spike), not
+  ;; {:ok doc} — and not every var has one (core fns carry none: the stdlib's
+  ;; doc truth lives in its SOURCE files; Phase 2's index merges both).
+  (let [d (try (BeamLisp.Env/doc_string nsname name) (catch _ex nil))
+        doc (cond
+              (map? d) (or (:doc d) "")
+              (and (erlang/is_tuple d) (= :ok (elem d 0))) (elem d 1)
+              (erlang/is_binary d) d
+              :else "")]
+    {"doc" doc "arglists" (arglists-str nsname name)}))
+
+(defn- run-complete [ws sid id prefix]
+  (let [row (get-session sid)]
+    (spawn (fn []
+             (let [r (index-entries sid row)]
+               (if (= r :building)
+                 ;; the FIRST build is still in flight: fall back to the
+                 ;; direct scan — slow-but-correct beats empty (the index
+                 ;; swap makes every LATER rebuild invisible)
+                 (env/with-env (:env row)
+                   (fn []
+                     (BeamLisp.Env/in_ns (:ns row))
+                     (let [r2 (assoc (complete-prefix prefix (:ns row) (vec (direct-candidates)))
+                                     "building" true)]
+                       (erlang/send ws (tuple :push (assoc r2 "kind" "completions" "id" id))))))
+                 (let [r2 (complete-prefix prefix (:ns row) (:entries r))]
+                   (erlang/send ws (tuple :push (assoc r2 "kind" "completions" "id" id))))))))))
+
+(defn- has-var?
+  "Var EXISTENCE, not doc presence: a var with no meta row (core/map has none)
+   is still a var. member? walks this process's env chain, so a session-env
+   def shadows :global exactly the way eval would resolve it."
+  [ns name]
+  (= true (try (BeamLisp.Env/member? (tuple ns name)) (catch _ex false))))
+
+(defn- resolve-doc-target
+  "Where a symbol's docs live: explicit ns wins; ns/name splits; a bare name
+   tries the session ns, then core, then a full scan."
+  [row nsname name]
+  (cond
+    (not= nsname "auto") [nsname name]
+    (some? (index-of name "/"))
+    (let [parts (String/split name "/")] [(first parts) (join "/" (rest parts))])
+    (has-var? (:ns row) name) [(:ns row) name]
+    (has-var? "core" name) ["core" name]
+    :else
+    (let [hit (some (fn [ns] (if (has-var? (str ns) name) (str ns) nil))
+                    (BeamLisp.Env/namespaces))]
+      [(or hit (:ns row)) name])))
+
+(defn- run-doc [ws sid id nsname name]
+  (let [row (get-session sid)]
+    (spawn (fn []
+             (env/with-env (:env row)
+               (fn []
+                 (BeamLisp.Env/in_ns (:ns row))
+                 (let [[tns tname] (resolve-doc-target row nsname name)
+                       r (doc-for tns tname)]
+                   (erlang/send ws (tuple :push (assoc r "kind" "doc" "id" id
+                                                       "ns" tns "name" tname))))))))))
+
+;; ── balanced? — server truth for a frontend's parity self-check ─────────────
+;;
+;; A frontend ports the scanner for keystroke-latency gating; this op lets it
+;; prove the port agrees with bl.repl on a fixture set (the spike's harness
+;; caught BUG-087 this way).
+
+(defn- run-balanced [ws id srcs]
+  (spawn (fn []
+           (BeamLisp.Loader/ensure_loaded "bl.repl")
+           (let [bal (BeamLisp.Env/fetch! "bl.repl" "balanced?")
+                 results (to-list (map (fn [s] (= true (BeamLisp.Ns.Rt/invoke bal (to-list [s])))) srcs))]
+             (erlang/send ws (tuple :push {"kind" "balanced" "id" id "results" results}))))))
+
+;; ── the socket ──────────────────────────────────────────────────────────────
+
+(defn- handle-op [ws sid msg]
+  (let [op (get msg "op")
+        id (get msg "id" 0)]
+    (cond
+      (= op "eval")
+      (let [row (get-session sid)]
+        (if (busy? row)
+          (erlang/send ws (tuple :push {"kind" "busy" "id" id}))
+          (spawn (fn [] (run-eval ws sid id (get msg "src" ""))))))
+
+      (= op "complete") (run-complete ws sid id (get msg "prefix" ""))
+
+      (= op "doc") (run-doc ws sid id (get msg "ns" "user") (get msg "name" ""))
+
+      (= op "interrupt")
+      (let [row (get-session sid)]
+        (if (busy? row)
+          (do (erlang/apply :erlang :exit (list (:worker (:eval row)) :kill))
+              (erlang/send ws (tuple :push {"kind" "interrupt-sent" "id" id})))
+          (erlang/send ws (tuple :push {"kind" "not-busy" "id" id}))))
+
+      (= op "balanced") (run-balanced ws id (to-list (get msg "srcs" (to-list []))))
+
+      (= op "index-state")
+      ;; debug: the raw index row + entries matching a substring
+      (let [r (index-read sid)
+            want (get msg "label" "")
+            shape (cond
+                    (= r :cold) "cold"
+                    (= r :building) "building"
+                    :else
+                    (let [entries (elem r 1)
+                          hits (take 30 (filter (fn [c] (some? (index-of (get c "label") want))) entries))
+                          user-n (count (filter (fn [c] (= "user" (get c "ns"))) entries))]
+                      (str "ready n=" (count entries)
+                           " user-ns=" user-n
+                           " age-ms=" (- (System/monotonic_time :millisecond) (elem r 2))
+                           " rebuilding=" (elem r 3)
+                           " hits=[" (join ", " (map (fn [c] (str (get c "ns") "/" (get c "label"))) hits)) "]")))]
+        (erlang/send ws (tuple :push {"kind" "index-state" "id" id "state" shape})))
+
+      :else (erlang/send ws (tuple :push {"kind" "error" "id" id "text" (str "unknown op: " op)})))))
+
+(defn ws-handlers
+  "The WebSocket handler map for one REPL connection. `opts` carries :root —
+   the project tree whose VM the session forks — and optionally :session: a
+   live session id REUSES its row (reattach after a page reload; defs and ns
+   survive). A stale/unknown id mints fresh. An in-flight eval's stdout still
+   targets the dead connection and is dropped; new evals target this socket."
+  [opts]
+  (start)
+  (let [root (get opts :root (BeamLisp/cwd))]
+    {:init (fn [_state]
+             (let [sp (spec/read root)
+                   vm (mgr/ensure sp)
+                   want (get opts :session)
+                   row (if (and (not (nil? want)) (not (= "" want))) (get-session want) nil)
+                   reattached (map? row)
+                   sid (if reattached want (call SERVER [:new (:env vm) root]))]
+               ;; prime the completion index on mint only: a reattached row's
+               ;; index is as fresh as its last eval left it
+               (if (not reattached) (index-rebuild-async sid (get-session sid)))
+               [:push [[:text (bl.json/encode {"kind" "hello" "session" sid
+                                               "ns" (if reattached (:ns row) "user")
+                                               "reattached" reattached})]] sid]))
+     :handle-in (fn [frame sid]
+                  ;; inbound frames are bl VECTORS [:text payload] (the
+                  ;; adapter's frame_vector), NOT Erlang tuples (spike trap #1).
+                  (if (and (vector? frame) (= :text (first frame)))
+                    (let [msg (try (bl.json/decode (nth frame 1)) (catch _ex nil))]
+                      (if (map? msg)
+                        (do (handle-op (erlang/self) sid msg) [:ok sid])
+                        [:ok sid]))
+                    [:ok sid]))
+     :handle-info (fn [msg sid]
+                    (if (and (erlang/is_tuple msg) (= :push (elem msg 0)))
+                      [:push [[:text (bl.json/encode (elem msg 1))]] sid]
+                      [:ok sid]))}))
+
+;; ── the page assets (served by vm.http) ─────────────────────────────────────
+
+(defn page
+  "The reference client's HTML. Read per request: it is small, and a developer
+   iterating the page must not restart the daemon to see a change."
+  []
+  (File/read! (str (BeamLisp.Tiers/priv_root) "/std/vm/repl/page.html")))
+
+(defn bundle
+  "The vendored CodeMirror bundle, memoised for the daemon's lifetime: 405 KB
+   a read is real money on the ONE dirty-IO scheduler this host runs, and the
+   bundle changes only with a rebundle — which ships with a daemon restart."
+  []
+  (let [key (tuple :vm-repl :bundle)
+        cached (erlang/apply :persistent_term :get (list key nil))]
+    (if (nil? cached)
+      (let [b (File/read! (str (BeamLisp.Tiers/priv_root) "/std/vm/repl/editor.bundle.js"))]
+        (erlang/apply :persistent_term :put (list key b))
+        b)
+      cached)))

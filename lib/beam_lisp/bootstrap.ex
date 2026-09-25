@@ -31,6 +31,33 @@ defmodule BeamLisp.Bootstrap do
   @seed_dir_rel "bootstrap/seed"
   @manifest_name "manifest.exs"
 
+  # A beam's toolchain key, read WITHOUT loading it: the `bl_compiler_key`
+  # attribute `AOT.emit_module` stamps into every namespace beam, beside the
+  # `__bl_provenance__/0` function. Loading the beam to call that function
+  # replaced the live module under a running VM just to ask about a file.
+  defp stamped_key(path) do
+    with {:ok, {_mod, [attributes: attrs]}} <-
+           :beam_lib.chunks(String.to_charlist(path), [:attributes]) do
+      case Keyword.get(attrs, :bl_compiler_key) do
+        [key] when is_binary(key) -> key
+        key when is_binary(key) -> key
+        _ -> nil
+      end
+    else
+      _ -> nil
+    end
+  end
+
+  # Whether `mod`'s CURRENT code is exactly `bytes` — compared by the beam's
+  # md5, which is what the loader itself records.
+  defp loaded_is?(mod, bytes) do
+    :erlang.module_loaded(mod) and
+      (case :beam_lib.md5(bytes) do
+         {:ok, {_, md5}} -> mod.module_info(:md5) == md5
+         _ -> false
+       end)
+  end
+
   @doc """
   Ensure the compiler seed is present and valid in `compile_path`'s ebin.
 
@@ -135,11 +162,24 @@ defmodule BeamLisp.Bootstrap do
     # beam absent and fall to the SOURCE path — which, with genesis gone, cannot
     # compile it. Purge + load each installed module so the freshly written
     # bytes are the live code before the first `ensure_loaded`.
+    #
+    # A module whose loaded code IS these bytes is left alone. Reloading it is
+    # not free: a second load makes the running version "old", and the next
+    # purge kills every closure it created. The runtime (`rt`) seeds `core`
+    # with closures built by its body module — `+`, `str`, the comparison
+    # chains — so purging `Ns.Body.Rt` under a live VM stranded all of them:
+    # measured, a second `install!` in one VM turned `(str "a" 1)` into
+    # "function … in BeamLisp.Ns.Body.Rt is invalid, likely because it points
+    # to an old version of the code" (76 suite failures).
     Enum.each(manifest["modules"], fn {name, _sha} ->
       mod = name |> Path.basename(".beam") |> String.to_atom()
       beam_path = Path.join(ebin, name)
-      :code.purge(mod)
-      :code.load_binary(mod, String.to_charlist(beam_path), File.read!(beam_path))
+      bytes = File.read!(beam_path)
+
+      unless loaded_is?(mod, bytes) do
+        :code.purge(mod)
+        :code.load_binary(mod, String.to_charlist(beam_path), bytes)
+      end
     end)
 
     if matches? do
@@ -317,18 +357,12 @@ defmodule BeamLisp.Bootstrap do
         (File.exists?(dst) and File.exists?(provenance_beam) and
            File.stat!(dst).mtime >= File.stat!(provenance_beam).mtime)
 
+    # The stamp is read from the beam's ATTRIBUTES chunk, not by loading it.
+    # Loading it here (purge + delete + load) replaced the LIVE module under a
+    # running VM just to ask a question about a file — and a purge kills every
+    # closure the old code made (the runtime's seeded `core` values among them).
     if unit_consistent? do
-      with {:ok, bytes} <- File.read(provenance_beam),
-           mod <- provenance_beam |> Path.basename(".beam") |> String.to_atom(),
-           :code.purge(mod),
-           :code.delete(mod),
-           {:module, _} <- :code.load_binary(mod, String.to_charlist(provenance_beam), bytes),
-           true <- function_exported?(mod, :__bl_provenance__, 0),
-           {_src_hash, key} <- mod.__bl_provenance__() do
-        key == current_key
-      else
-        _ -> false
-      end
+      stamped_key(provenance_beam) == current_key
     else
       false
     end

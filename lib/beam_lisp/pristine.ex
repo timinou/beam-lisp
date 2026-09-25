@@ -71,6 +71,6 @@ defmodule BeamLisp.Pristine do
 
   defp call(name, args) do
     BeamLisp.Loader.ensure_loaded(@ns)
-    BeamLisp.RT.invoke(BeamLisp.Env.fetch!(@ns, name), args)
+    BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!(@ns, name), args)
   end
 end

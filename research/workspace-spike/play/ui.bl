@@ -1,0 +1,1136 @@
+; play/ui.bl — BL-rendered API playground UI over exact dev.workspace / play.gen APIs.
+;
+; Prototype scope: pure BL view/render + allowlisted command dispatch.
+; No provider calls, no global env mutations, no arbitrary eval of user text.
+;
+; ── Routes ───────────────────────────────────────────────────────────────────
+;
+;   GET  /play                → Carbon/Snow playground page (full server render)
+;   GET  /play/state          → sanitized workspace JSON for JS polling
+;   GET  /play/ui.css         → Carbon + Snow palette + layout CSS
+;   GET  /play/ui-client.js   → thin JS adapter (forms, polling, editor, theme)
+;   POST /play/command        → allowlisted dispatch to ws/gen APIs; token-gated
+;
+; ── Token auth ────────────────────────────────────────────────────────────────
+;
+; handler may take opts {:token raw-bytes}. Mutations require x-bl-token header
+; matching the hex-encoded token, following vm.http's pattern.
+; No token in opts → loopback-only trust (orchestrator binds 127.0.0.1).
+;
+; ── State authority ───────────────────────────────────────────────────────────
+;
+; All workspace state lives in dev.workspace / play.gen actors. The handler
+; holds ONLY per-handler view state (active tab, selected ids, theme) in an
+; atom. JS is a thin display adapter; it never owns domain state.
+;
+; ── play.gen dependency ───────────────────────────────────────────────────────
+;
+; play.gen is implemented by the orchestrator. This handler requires it
+; dynamically via BeamLisp.Loader; gen commands return an honest error if gen
+; is not yet loaded. The UI advertises gen as optional, not broken.
+;
+; ── Naming distinction ────────────────────────────────────────────────────────
+;
+; play.change / play.gen are CANDIDATE APIs for this prototype spike.
+; dev.change is the existing production executor; it is not replaced here.
+; Cutover of play.change into dev.change requires characterization tests and
+; a deliberate integration step, not automatic inheritance from this prototype.
+
+(ns play.ui
+  (:require [dev.workspace :as ws]
+             [live.hiccup :as h]
+             [web]
+             [bl.json]))
+
+;; ── HTML escape ────────────────────────────────────────────────────────────────
+
+(defn- esc [v]
+  "HTML-escape a value for attribute or text use. Hiccup escapes text nodes
+   automatically; call esc explicitly for attribute values containing user data."
+  (if (nil? v) ""
+    (-> (str v)
+        (String/replace "&" "&amp;")
+        (String/replace "<" "&lt;")
+        (String/replace ">" "&gt;")
+        (String/replace "\"" "&quot;")
+        (String/replace "'" "&#39;"))))
+
+;; ── Asset defs (read once at module load) ──────────────────────────────────────
+
+(def ^:private CSS
+  (try (File/read! "research/workspace-spike/play/ui.css")
+       (catch _ "/* ui.css missing — rebuild the spike */")))
+
+(def ^:private CLIENT-JS
+  (try (File/read! "research/workspace-spike/play/ui-client.js")
+       (catch _ "/* ui-client.js missing — rebuild the spike */")))
+
+;; ── Token auth ────────────────────────────────────────────────────────────────
+
+(defn- session-token [opts]
+  "Hex-encode the raw-bytes token from opts, or nil if no token configured."
+  (let [t (get opts :token)]
+    (if (erlang/is_binary t)
+      (String/downcase (Base/encode16 t))
+      nil)))
+
+(defn- token-ok? [conn opts]
+  "True when: no token configured (loopback trust), OR presented header matches."
+  (let [want (session-token opts)]
+    (if (nil? want)
+      true
+      (let [given (or (web/req-header conn "x-bl-token") "")]
+        (and (erlang/is_binary given)
+             (= (erlang/byte_size want) (erlang/byte_size given))
+             (erlang/apply :crypto :hash_equals (list want given)))))))
+
+;; ── Workspace safe-call helpers ────────────────────────────────────────────────
+
+(defn- ws-safe
+  "Call f; return result or {:error message} on exception."
+  [f & args]
+  (try (apply f args)
+       (catch e {:error (or (ex-message e) (str e))})))
+
+(defn- snap-safe [w]
+  (ws-safe ws/snapshot w))
+
+(defn- find-in-snap
+  "Find a handle snapshot by :id in a workspace snapshot collection."
+  [snap coll-key id]
+  (some (fn [item] (if (= id (:id item)) item nil))
+        (or (get snap coll-key) (list))))
+
+(defn- resolve-handle
+  "Reconstruct a proper handle {kind root id} from the workspace snapshot.
+   Returns {:ok handle} or {:error msg}.
+   `kind` is :buffer, :proposal, or :experience; used to tag the reconstructed handle."
+  [w snap coll-key kind id]
+  (if (nil? id)
+    {:error "id required"}
+    (if (and (map? snap) (:error snap))
+      {:error (str "workspace unavailable: " (:error snap))}
+      (let [found (find-in-snap snap coll-key id)]
+        (if (nil? found)
+          {:error (str (name coll-key) " not found: " id)}
+          {:ok {:kind kind :root (:root w) :id id}})))))
+
+;; ── play.gen dynamic dispatch ─────────────────────────────────────────────────
+
+(defn- call-gen
+  "Invoke a play.gen function by name. Returns {:ok v} or {:error msg}.
+   play.gen is orchestrator-owned; this fails honestly when not yet loaded."
+  [fn-name args]
+  (try
+    (BeamLisp.Loader/ensure_loaded "play.gen")
+    (let [f (BeamLisp.Env/fetch! "play.gen" fn-name)]
+      {:ok (BeamLisp.RT/invoke f (to-list args))})
+    (catch e
+      {:error (str "Generation: " (ex-message e))})))
+
+;; ── Sanitize snapshots for JSON ───────────────────────────────────────────────
+
+(defn- sanitize-buffer [b]
+  (if (nil? b) nil
+    {"id"    (str (:id b))
+     "path"  (str (or (:path b) ""))
+     "ns"    (if (:ns b) (str (:ns b)) nil)
+     "dirty" (= true (:dirty? b))
+     "basis" (if (:basis b) (str (:basis b)) nil)}))
+
+(defn- sanitize-proposal [p]
+  (if (nil? p) nil
+    {"id"     (str (:id p))
+     "title"  (str (or (:title p) ""))
+     "status" (name (or (:status p) :made))
+     "made"   (str (or (:made p) "\u2014"))
+     "saved"  (str (or (:saved p) "\u2014"))
+     "live"   (str (or (:live p) "\u2014"))
+     "error"  (if (:error p) (str (:error p)) nil)}))
+
+(defn- sanitize-experience [x]
+  (if (nil? x) nil
+    {"id"          (str (:id x))
+     "status"      (name (or (:status x) :queued))
+     "prompt"      (str (or (:prompt x) ""))
+     "source_path" (str (or (:source-path x) ""))
+     "turns"       (to-list (map (fn [t] {"role" (str (or (:role t) ""))
+                                           "text" (str (or (:text t) ""))})
+                                 (or (:turns x) (list))))
+     "error"       (if (:error x) (str (:error x)) nil)}))
+
+;; ── Hiccup rendering helpers ──────────────────────────────────────────────────
+
+(defn- bl-form
+  "A copyable BL form row: inline code + copy button."
+  [form-str]
+  [:div.bl-form
+   [:code form-str]
+   [:button.copy-btn {:onclick (str "copyForm(" (bl.json/encode form-str) ")")} "copy"]])
+
+(defn- status-dot [status]
+  (let [s (name (or status :queued))
+        cls (str "dot dot-" s)]
+    [:span {:class cls :aria-hidden "true"}]))
+
+(defn- badge [cls data-badge text]
+  [:span {:class (str "badge " cls) :data-badge data-badge} text])
+
+;; ── Left rail: file tree ──────────────────────────────────────────────────────
+
+(defn- render-file-tree [w view-state]
+  (let [files    (ws-safe ws/files w)
+        file-vec (cond
+                   (vector? files) files
+                   (list? files)   (vec files)
+                   :else           (to-list []))
+        active   (:active-buffer @view-state)]
+    [:div.rail-section
+     [:div.rail-heading "Files"
+      [:button.copy-btn {:onclick "newFileDialog()"
+                         :title "Draft a new file (prompts for path)"}
+       "+"]]
+     (if (empty? file-vec)
+       [:div.empty "No .bl source files"]
+       [:ul.file-list
+        (for [path file-vec]
+          [:li.file-item
+           {:key   path
+            :class (if (= path active) "active" "")
+            :data-path path
+            :onclick   "openFile(this)"
+            :tabindex  "0"
+            :title path}
+           [:span {:class (if (= path active) "file-dot" "file-dot")}]
+           path])])
+     (bl-form "(ws/files w)")]))
+
+;; ── Left rail: experience list ────────────────────────────────────────────────
+
+(defn- render-experience-item [exp active-id]
+  (let [id      (str (or (:id exp) ""))
+        status  (or (:status exp) :queued)
+        active? (= id active-id)]
+    [:div.exp-item
+     {:key     id
+      :class   (if active? "active" "")
+      :data-id id
+      :onclick "focusExp(this)"}
+     [:div.exp-item-label (or (:prompt exp) (str "exp " id))]
+     [:div.exp-item-meta
+      (status-dot status)
+      [:span {:class (str "badge badge-" (name status)) :data-exp-status ""}
+       (name status)]]]))
+
+(defn- render-experience-rail [w view-state]
+  (let [snap   (snap-safe w)
+        exps   (if (map? snap) (or (:experiences snap) (list)) (list))
+        active (:active-experience @view-state)]
+    [:div.rail-section
+     [:div.rail-heading "Experiences"]
+     (if (empty? exps)
+       [:div.empty "No generations yet"]
+       (for [exp exps] (render-experience-item exp active)))]))
+
+;; ── Buffer panel (tab) ────────────────────────────────────────────────────────
+
+(defn- render-buffer-editor [buf]
+  (let [path   (or (:path buf) "untitled")
+        source (or (:source buf) "")
+        buf-id (str (or (:id buf) ""))
+        dirty? (= true (:dirty? buf))]
+    [:div
+     [:div.buffer-header
+      [:span.buffer-path (str path (if dirty? " \u2022" ""))]
+      (if (:ns buf)
+        [:span.buffer-ns (str "ns " (:ns buf))])
+      [:span {:id "save-indicator"}]
+      [:button.btn.btn-primary
+       {:data-buf-id buf-id
+        :onclick "saveBuffer(this)"
+        :title "Write source to disk (basis-guarded)"}
+       "Save"]]
+     [:p {:id "editor-fallback-note" :class "prototype-note"}
+      "CodeMirror editor loads from /repl/editor.bundle.js if available; "
+      "textarea is the prototype fallback."]
+     [:div.editor-wrap
+      [:textarea.editor-plain
+       {:id         "buffer-source" :spellcheck "false"
+        :rows       "20"
+        :aria-label (str "Source editor: " path)}
+       source]]
+     [:div.action-bar
+      [:button.btn {:data-kind "buffer" :data-id buf-id :data-binding "buffer"
+                    :onclick "openInRepl(this)" :title "Bind this buffer as buffer in the REPL"} "Open in REPL"]
+      [:button.btn
+       {:data-buf-id buf-id :onclick "closeBuffer(this)"
+        :title "Close buffer (refuses dirty data loss)"}
+       "Close"]
+      [:button.copy-btn
+       {:onclick (str "copyForm(" (bl.json/encode
+                       (str "(ws/definitions w (quote " (or (:ns buf) "user") "))")) ")")}
+       "copy definitions form"]]
+     (bl-form (str "(ws/save! buffer)  ; buffer = (ws/open! w " (bl.json/encode path) ")"))]))
+
+(defn- render-new-file-card []
+  [:div.card
+   [:div.card-title "New file draft"]
+   [:p.prototype-note "Creates a dirty in-memory buffer; Save writes to disk."]
+   [:form {:id "new-file-form" :onsubmit "submitNewFile(event)"}
+    [:div.form-row
+     [:label {:for "new-file-path"} "Path"]
+     [:input {:type "text" :id "new-file-path" :name "path"
+              :placeholder "src/notes.bl" :required true}]]
+    [:div.form-row {:style "margin-top:0.5rem"}
+     [:label {:for "new-file-source"} "Initial source"]
+     [:textarea {:id "new-file-source" :spellcheck "false" :name "source" :rows "4" :aria-label "Initial source"}
+      "(ns notes)\n(def answer 42)\n"]]
+    [:div.form-row {:style "margin-top:0.4rem"}
+     [:button.btn.btn-primary {:type "submit"} "Create draft"]]]
+   (bl-form "(ws/new-file! w \"src/notes.bl\" \"(ns notes)\\n(def answer 42)\\n\")")])
+
+(defn- render-buffer-panel [w view-state]
+  (let [snap       (snap-safe w)
+        buffers    (if (map? snap) (or (:buffers snap) (list)) (list))
+        active-id  (:active-buffer @view-state)
+        active-buf (if active-id
+                     (find-in-snap snap :buffers active-id)
+                     (first buffers))]
+    [:div
+     (if (and active-buf (not (:new-file? @view-state)))
+       (render-buffer-editor active-buf)
+       (render-new-file-card))
+     (if (> (count buffers) 1)
+       [:div
+        [:div.section-title "Open buffers"]
+        (for [buf buffers]
+          [:div.file-item
+           {:key     (:id buf)
+            :data-id (str (:id buf))
+            :class   (if (= (:id buf) active-id) "active" "")
+            :onclick "switchBuffer(this)"}
+           [:span {:class (if (:dirty? buf) "file-dot dirty" "file-dot")}]
+           (or (:path buf) "untitled")])])]))
+
+;; ── Proposal panel (tab) ──────────────────────────────────────────────────────
+
+(defn- render-diff-change [change]
+  (let [path   (or (:path change) "?")
+        before (:before change)
+        after  (:after change)
+        reason (:reason change)]
+    [:div.diff-file {:key path}
+     [:div.diff-path path]
+     (if reason [:div.diff-reason reason])
+     [:div.diff-cols
+      [:div.diff-before
+       [:div.diff-side-label "before"]
+       (if before
+         [:pre.source-block before]
+         [:div.diff-new "(new file)"])]
+      [:div.diff-after
+       [:div.diff-side-label "after"]
+       (if after
+         [:pre.source-block after]
+         [:div.diff-new "(deleted)"])]]]))
+
+(defn- selected-proposal [snap view]
+  (let [experience (or (find-in-snap snap :experiences (:active-experience view))
+                       (last (:experiences snap)))]
+    (or (find-in-snap snap :proposals (:active-proposal view))
+        (find-in-snap snap :proposals (get-in experience [:proposal :id]))
+        (last (:proposals snap)))))
+
+(defn- short-revision [value]
+  (if (nil? value) "—" (subs (str value) 0 (min 8 (count (str value))))))
+
+(defn- render-proposal-panel [w view-state]
+  (let [snap       (snap-safe w)
+        proposals  (if (map? snap) (or (:proposals snap) (list)) (list))
+        active-id  (:active-proposal @view-state)
+        prop       (selected-proposal snap @view-state)]
+    (if (nil? prop)
+      [:div
+       [:div.empty "No proposals yet. Use Generate or the REPL to propose changes."]
+       (bl-form
+        (str "(ws/propose! w\n"
+             "  (change/bundle \"Extract billing arithmetic\"\n"
+             "    (change/create-namespace 'billing.rules\n"
+             "      '(defn total [subtotal fee] (+ subtotal fee)))\n"
+             "    (change/in-namespace 'app.invoices\n"
+             "      (change/require '[billing.rules :as rules])\n"
+             "      (change/replace-definition 'total\n"
+             "        '(defn total [invoice]\n"
+             "           (rules/total (:subtotal-cents invoice)\n"
+             "                        (:late-fee-cents invoice))))))))"))]
+      (let [prop-id (str (or (:id prop) ""))
+            status  (name (or (:status prop) :made))
+            made    (short-revision (:made prop))
+            saved   (short-revision (:saved prop))
+            live    (short-revision (:live prop))
+            changes (or (:changes prop) (list))]
+        [:div
+         ;; Made · Saved · Live independent revision badges
+         [:div.badge-row
+          (badge "badge-made"   "made"   (str "Made "  made))
+          (badge "badge-saved"  "saved"  (str "Saved " saved))
+          (badge "badge-live"   "live"   (str "Live "  live))
+          (badge "badge-status" "status" status)]
+
+         [:div.card-title (or (:title prop) "Proposal")]
+
+         ;; Per-file diffs
+         (if (empty? changes)
+           [:div.empty "No changes in this proposal."]
+           (for [c changes] (render-diff-change c)))
+
+         ;; Verification summary
+         (if (:verification prop)
+           [:div.card
+            [:div.card-title "Verification"]
+            [:pre.source-block
+             (if (:load-ok (:verification prop))
+               "Parsing and namespace load passed. Project tests were not run."
+               (pr-str (:verification prop)))]])
+
+         ;; Error
+         (if (:error prop)
+           [:p {:style "color:var(--danger);font-size:0.82rem;margin-bottom:0.5rem"}
+            (:error prop)])
+
+         ;; Actions with titles explaining each operation
+         [:div.action-bar
+          [:button.btn {:data-kind "proposal" :data-id prop-id :data-binding "p"
+                        :onclick "openInRepl(this)" :title "Bind this proposal as p in the REPL"} "Open in REPL"]
+          [:button.btn
+           {:data-prop-id prop-id :onclick "verifyProposal(this)"
+            :title "Syntax + namespace load in isolated env; no source writes"}
+           "Verify"]
+          [:button.btn
+           {:data-prop-id prop-id :onclick "tryProposal(this)"
+            :title "Verification + session evaluation; does NOT set Live"}
+           "Try in session"]
+          [:button.btn.btn-success
+           {:data-prop-id prop-id :onclick "saveProposal(this)"
+            :title "Write source edits and accepted-pointer to disk (requires verified; basis-guarded)"}
+           "Save"]
+          [:button.btn.btn-primary
+           {:data-prop-id prop-id :onclick "makeLive(this)"
+            :title "Evaluate staged namespace bundle into workspace runtime env (not global VM)"}
+           "Make Live"]
+          [:button.btn.btn-danger
+           {:data-prop-id prop-id :onclick "undoProposal(this)"
+            :title "Create inverse guarded proposal (prototype: supported for verified proposals)"}
+           "Undo"]]
+
+         ;; Copyable REPL forms
+         [:div.section-title "REPL forms"]
+         (bl-form "(ws/verify! p)  ; parses + compiles in isolated env, no writes")
+         (bl-form "(ws/try! p)     ; loads into session only, does not set Live")
+         (bl-form "(ws/save! p)    ; guarded source save; (gen/accept! x) also selects its history entry")
+         (bl-form "(ws/make-live! p)  ; staged bundle → workspace runtime env")
+         (bl-form "(ws/status p)   ; {:made :saved :live :status :verification :error}")
+         (bl-form "(ws/undo! p)    ; inverse proposal handle")]))))
+
+;; ── Generation / experience panel (tab) ───────────────────────────────────────
+
+(defn- render-turn [turn]
+  (let [role (str (or (:role turn) "system"))
+        text (str (or (:text turn) ""))]
+    [:div.turn {:key (str role (count text)) :class (str "turn turn-" role)}
+     [:div.turn-role role]
+     [:div text]]))
+
+(defn- render-experience-panel [w view-state]
+  (let [snap      (snap-safe w)
+        exps      (if (map? snap) (or (:experiences snap) (list)) (list))
+        active-id (:active-experience @view-state)
+        exp       (if active-id
+                    (find-in-snap snap :experiences active-id)
+                    (first exps))
+        src-path  (or (:path (find-in-snap snap :buffers (:active-buffer @view-state)))
+                      "src/playground.bl")]
+    [:div
+     ;; Generate prompt form
+     [:div.card
+      [:div.card-title "Generate"]
+      [:div.gen-form
+       [:textarea.gen-prompt
+        {:id          "gen-prompt"
+         :rows        "3"
+         :placeholder "Describe what to generate…"}]
+       [:div.gen-controls
+        [:select.gen-provider {:id "gen-provider" :aria-label "Provider"}
+         [:option {:value "fake"} "Demo · no network"]
+         [:option {:value "deepseek"} "DeepSeek (requires DEEPSEEK_API_KEY)"]]
+        [:button.btn.btn-primary
+         {:data-source-path (or src-path "")
+          :onclick "startGen(this)"}
+         "Generate"]]]
+      (bl-form (str "(gen/ns w " (pr-str src-path) " \"Include late fees in invoice totals\" {:provider :fake})"))
+      [:p {:style "font-size:0.74rem;color:var(--faint);margin-top:0.3rem"}
+       "Demo is deterministic and makes no network request. "
+       "DeepSeek: 1 initial + 1 repair request max per run. "
+       "Token streaming is not implemented in this prototype."]]
+
+     ;; Active experience detail
+     (if exp
+       (let [exp-id  (str (or (:id exp) ""))
+             status  (name (or (:status exp) :queued))
+             turns   (or (:turns exp) (list))
+             versions (or (:versions exp) (list))]
+         [:div.card
+          [:div.badge-row
+           (status-dot (:status exp))
+           [:span {:class (str "badge badge-" status) :data-exp-status "1"} status]
+           (if (:proposal exp) (badge "badge-ready" "proposal" "has proposal"))
+           [:button.btn {:data-kind "experience" :data-id exp-id :data-binding "experience"
+                         :onclick "openInRepl(this)" :title "Bind this experience in the REPL"} "Open in REPL"]
+           [:button.btn
+            {:data-exp-id exp-id :onclick "cancelExp(this)"
+             :title "Cancel with epoch guard (late response cannot publish)"}
+            "Cancel"]
+           [:button.btn.btn-success
+            {:data-exp-id exp-id :onclick "acceptGen(this)"
+             :title "Accept: save verified proposal + update sidecar accepted pointer"}
+            "Accept"]]
+
+          [:div.card-title (str "Experience: " (or (:prompt exp) exp-id))]
+          [:p {:style "font-size:0.75rem;color:var(--muted);margin-bottom:0.65rem"}
+           (str "source: " (or (:source-path exp) "\u2014"))]
+
+          ;; Turn list (JS appends new turns via applyStatePatch)
+          [:div.turns-list
+           {:id         "turns-list"
+            :data-count (str (count turns))}
+           (for [t turns] (render-turn t))]
+
+          ;; Error
+          (if (:error exp)
+            [:p {:style "color:var(--danger);font-size:0.82rem;margin-bottom:0.5rem"}
+             (:error exp)])
+
+          ;; Refine prompt
+          [:div.form-row {:style "margin-top:0.6rem"}
+           [:textarea
+            {:id          (str "refine-prompt-" exp-id)
+             :rows        "2"
+             :placeholder "Follow-up to refine…"
+             :style       (str "flex:1;font-size:0.81rem;"
+                               "background:var(--surface-2);"
+                               "border:1px solid var(--border);"
+                               "border-radius:var(--r-sm);"
+                               "color:var(--text);"
+                               "padding:0.3rem 0.55rem;"
+                               "outline:none;resize:none")}]
+           [:button.btn
+            {:data-exp-id exp-id :onclick "refineExp(this)"
+             :title "Start a new version with this follow-up prompt"}
+            "Refine"]]
+
+          ;; Versions
+          (if (seq versions)
+            [:div
+             [:div.section-title "Versions"]
+             (for [v versions]
+               [:button.file-item {:key (str (:id v)) :data-prop-id (:id v)
+                                   :onclick "inspectVersion(this)"}
+                [:span.file-dot]
+                (str "Review version · " (or (:id v) "?"))])])
+
+          ;; REPL forms
+          [:div.section-title "REPL forms"]
+          (bl-form (str "(gen/turns experience)"))
+          (bl-form (str "(gen/versions experience)"))
+          (bl-form (str "(gen/proposal experience)"))
+          (bl-form (str "(gen/refine! experience \"follow-up\")"))
+          (bl-form (str "(gen/cancel! experience)"))
+          (bl-form (str "(gen/accept! experience)"))
+          (bl-form (str "(gen/await! experience 30000)"))])
+       [:div.empty "Select an experience from the rail or start a generation."])]))
+
+;; ── REPL panel (tab) ──────────────────────────────────────────────────────────
+
+(def ^:private REPL-EXAMPLES
+  [{:label "Inspect this workspace"
+    :form  "(ws/snapshot w)"}
+   {:label "List .bl files"
+    :form  "(ws/files w)"}
+   {:label "Open a file"
+    :form  "(ws/open! w \"src/app/invoices.bl\")"}
+   {:label "New file draft"
+    :form  "(ws/new-file! w \"src/notes.bl\" \"(ns notes)\\n(def answer 42)\\n\")"}
+   {:label "Save buffer"
+    :form  "(ws/save! buffer)"}
+   {:label "Eval in workspace env"
+    :form  "(ws/eval! w \"(+ 1 2)\")"}
+   {:label "Definitions in namespace"
+    :form  "(ws/definitions w 'app.invoices)"}
+   {:label "Propose a change"
+    :form  (str "(ws/propose! w\n"
+                "  (change/bundle \"Extract billing rules\"\n"
+                "    (change/create-namespace 'billing.rules\n"
+                "      '(defn total [subtotal fee] (+ subtotal fee)))\n"
+                "    (change/in-namespace 'app.invoices\n"
+                "      (change/require '[billing.rules :as rules]))))")}
+   {:label "Preview proposal"
+    :form  "(ws/preview proposal)  ; {:changes [{:path :before :after :basis :reason}]}"}
+   {:label "Verify proposal"
+    :form  "(ws/verify! proposal)"}
+   {:label "Save proposal"
+    :form  "(ws/save! proposal)"}
+   {:label "Make live"
+    :form  "(ws/make-live! proposal)"}
+   {:label "Proposal status"
+    :form  "(ws/status proposal)  ; {:made :saved :live :status :verification}"}
+   {:label "Generate namespace"
+    :form  "(gen/ns w \"src/app.bl\" \"Create billing.rules with total/2\" {:provider :fake})"}
+   {:label "ns require setup"
+    :form  (str "(ns user\n"
+                "  (:require [dev.workspace :as ws]\n"
+                "            [play.change :as change]\n"
+                "            [play.gen :as gen]))")}])
+
+(defn- render-repl-panel [w view-state]
+  (let [snap (snap-safe w)
+        root (if (map? snap) (str (or (:root snap) ".")) ".")]
+    [:div
+     [:div.repl-header
+      "ns:" [:span.repl-ns (or (:repl-ns snap) "user")]
+      "\u00b7"
+      "workspace:"
+      [:code.mono root]]
+     [:pre.repl-output {:id "repl-output" :aria-live "polite"}]
+     [:form {:id "repl-form" :onsubmit "return window.replEval(event)"}
+      [:div.repl-form-wrap
+       [:textarea.repl-input
+        {:id          "repl-input" :spellcheck "false"
+         :rows        "3"
+         :placeholder "(ws/files w)  \u2014 Ctrl+Enter to eval"
+         :aria-label  "REPL input"}]
+       [:button.btn.btn-primary {:type "submit"} "Eval"]]]
+     [:div.section-title "Examples"]
+     (for [ex REPL-EXAMPLES]
+       [:div {:key (:label ex) :style "margin-bottom:0.45rem"}
+        [:div {:style "font-size:0.73rem;color:var(--muted);margin-bottom:0.15rem"}
+         (:label ex)]
+        (bl-form (:form ex))])]))
+
+;; ── Help panel (tab) ──────────────────────────────────────────────────────────
+
+(defn- render-help-panel []
+  [:div
+   [:h2.help-h2 "BL API Playground \u2014 prototype"]
+   [:div.help-section
+    [:h3.help-h3 "Scope"]
+    [:p.help-p
+     "Prototype implementation of the workspace API spike. "
+     "Supported: file open/new/edit/save, buffer close, "
+     "propose/verify/try/save/make-live, eval in workspace env, "
+     "generation with fake provider (deterministic), per-file before/after diffs, "
+     "Made/Saved/Live badges, experience turns and version list, "
+     "Carbon/Snow themes, copyable REPL forms for every action."]
+    [:p {:style "color:var(--warning);font-size:0.82rem;margin-bottom:0.25rem"}
+     "Explicitly not in prototype scope (honest, not faked): "
+     "cross-file atomic rename, token-level streaming, durable coordinator crash recovery, "
+     "automatic refactor. Commands return honest errors, not silent successes."]]
+   [:div.help-section
+    [:h3.help-h3 "dev.workspace public API"]
+    [:table.api-table
+     (for [[fn doc] [["(ws/attach! root)" "Stable handle; reuse existing owner"]
+                     ["(ws/shutdown! w)" "Stop prototype runtime (restart test)"]
+                     ["(ws/files w)" "Sorted relative .bl source paths"]
+                     ["(ws/open! w path)" "Buffer handle (reuse or create)"]
+                     ["(ws/new-file! w path source)" "Dirty draft; refuses overwrite"]
+                     ["(ws/snapshot handle)" "Immutable snapshot: workspace/buffer/proposal/experience"]
+                     ["(ws/edit! buffer src)" "Updated buffer handle"]
+                     ["(ws/close! buffer)" "Refuses dirty data loss without force"]
+                     ["(ws/save! buf-or-prop)" "Basis-guarded write; proposals need current verification"]
+                     ["(ws/definitions w ns)" "Definition records {:name :ns :kind}"]
+                     ["(ws/propose! w bundle)" "Proposal handle via play.change"]
+                     ["(ws/preview p)" "Proposal snapshot including before/after per file"]
+                     ["(ws/verify! p)" "Syntax + ns load in isolated env; no writes"]
+                     ["(ws/try! p)" "Verification + session eval; does NOT set Live"]
+                     ["(ws/make-live! p)" "Staged bundle into workspace-owned runtime env fork"]
+                     ["(ws/eval! w src)" "Eval in workspace active runtime env; returns print str"]
+                     ["(ws/status p)" "{:made :saved :live :status :verification :error}"]
+                     ["(ws/undo! p)" "Guarded inverse proposal handle"]
+                     ["(ws/remember! w exp)" "Store/replace experience by id"]
+                     ["(ws/experience w id)" "Experience handle by id"]
+                     ["(ws/record! w k v)" "Serializable state seam for gen persistence"]]]
+       [:tr {:key fn} [:td fn] [:td doc]])]]
+   [:div.help-section
+    [:h3.help-h3 "play.change constructors"]
+    [:table.api-table
+     (for [[fn doc] [["(change/bundle title & ops)" "Returns {:title :operations}"]
+                     ["(change/create-namespace ns & defs)" "Creates src/<path>.bl; refuses existing"]
+                     ["(change/in-namespace ns & ops)" "Scoped operation group"]
+                     ["(change/require '[ns :as a])" "Add/merge require in ns declaration"]
+                     ["(change/replace-definition name form)" "Replace exact existing defn; refuses missing"]
+                     ["(change/add-definition form)" "Append named definition; refuses duplicates"]
+                     ["(change/create-file path src)" "File create; path-guarded at materialize"]
+                     ["(change/move-file from to)" "File move; path-guarded"]
+                     ["(change/delete-file path)" "File delete; path-guarded"]
+                     ["(change/materialize root bundle)" "Produces [{:path :before :after :basis :reason}]"]
+                     ["(change/decode text)" "Decode model response (restricted constructor subset only)"]
+                     ["(change/digest src)" "SHA-256 hex; nil-safe; used for basis checks"]]]
+       [:tr {:key fn} [:td fn] [:td doc]])]]
+   [:div.help-section
+    [:h3.help-h3 "play.gen API (orchestrator implements)"]
+    [:table.api-table
+     (for [[fn doc] [["(gen/ns w path prompt opts)" "Start generation; opts: :provider :fake|:deepseek"]
+                     ["(gen/await! x ms)" "Terminal snapshot (ready/failed/cancelled)"]
+                     ["(gen/refine! x prompt)" "New version with follow-up"]
+                     ["(gen/cancel! x)" "Cancel with epoch guard; late response ignored"]
+                     ["(gen/turns x)" "Turn sequence [{:role :text}]"]
+                     ["(gen/versions x)" "Version proposal handles"]
+                     ["(gen/proposal x)" "Latest proposal handle or nil"]
+                     ["(gen/accept! x)" "Save verified proposal + update sidecar accepted pointer"]
+                     ["(gen/restore! w path)" "Read sidecar as data; no model call"]]]
+       [:tr {:key fn} [:td fn] [:td doc]])]]
+   [:div.help-section
+    [:h3.help-h3 "Made \u00b7 Saved \u00b7 Live"]
+    [:p.help-p "Three independent revision pointers on each proposal:"]
+    [:ul.help-list
+     [:li [:strong "Made"] " \u2014 materialized candidate. Not saved to disk."]
+     [:li [:strong "Saved"] " \u2014 source edits + accepted-pointer committed to disk (basis-guarded)."]
+     [:li [:strong "Live"] " \u2014 staged bundle evaluated into workspace runtime env (not global VM)."]]
+    [:p {:style "font-size:0.8rem;color:var(--muted);margin-top:0.4rem"}
+     "Save without Live and Live without Save are both valid. "
+     "Fabricating Live state after restart is explicitly refused."]]
+   [:div.help-section
+    [:h3.help-h3 "Prototype limitations"]
+    [:ul.help-list
+     [:li "play.gen fake provider returns a fixed fixture proposal (app.invoices/total companion)."]
+     [:li "DeepSeek requires DEEPSEEK_API_KEY in .env; budget: 1 initial + 1 repair request."]
+     [:li "make-live! uses env fork + eval-all + swap; does NOT migrate live application processes."]
+     [:li "Multi-file save is not crash-atomic; prototype caveat is surfaced on save."]
+     [:li "Cross-namespace rename, full undo history, token streaming: not implemented."]
+     [:li "x-bl-token required for mutations when opts has :token; without :token, loopback trust only."]]]])
+
+;; ── Full page render ───────────────────────────────────────────────────────────
+
+(defn- render-page [w view-state opts]
+  (let [snap       (snap-safe w)
+        root       (if (map? snap) (str (or (:root snap) ".")) ".")
+        token      (session-token opts)
+        js-token   (bl.json/encode (or token ""))
+        active-tab (name (or (:active-tab @view-state) :buffer))
+        tab-active (fn [t] (if (= t active-tab) "active" ""))
+
+        body-hiccup
+        [:body.theme-carbon
+
+         ;; Error notification (aria-live for screen reader announcements)
+         [:div.play-error {:id "play-error" :role "alert" :aria-live "assertive"}]
+
+         ;; Top bar
+         [:header.topbar
+          [:span.topbar-title "BL Playground"]
+          [:span.topbar-sep "\u00b7"]
+          [:span.topbar-root (esc root)]
+          [:span.prototype-label "prototype"]
+          [:div.topbar-actions
+           [:button {:onclick "toggleTheme()"
+                     :title "Toggle Carbon (dark) / Snow (light) theme"
+                     :aria-label "Toggle theme"} "\u25d1"]
+           [:button {:onclick "switchTab('help')" :title "API reference"} "Help"]]]
+
+         ;; Two-column playground layout
+         [:div.playground
+
+          ;; Left rail: files + experiences
+          [:aside.rail {:aria-label "Files and experiences"}
+           (render-file-tree w view-state)
+           (render-experience-rail w view-state)]
+
+          ;; Main content: tabs
+          [:main.main {:aria-label "Playground"}
+           [:div.tabs {:role "tablist"}
+            (for [[tab label] [["buffer" "Buffer"] ["proposal" "Proposal"]
+                               ["experience" "Generate"] ["repl" "REPL"]]]
+              [:button.tab-btn
+               {:key           tab
+                :data-tab      tab
+                :class         (tab-active tab)
+                :onclick       (str "switchTab('" tab "')")
+                :role          "tab"
+                :aria-selected (if (= tab active-tab) "true" "false")}
+               label])]
+           [:div.tab-panels
+            [:div.tab-panel {:data-tab "buffer" :class (tab-active "buffer") :role "tabpanel" :aria-label "Buffer editor"}
+             (render-buffer-panel w view-state)]
+            [:div.tab-panel {:data-tab "proposal" :class (tab-active "proposal") :role "tabpanel" :aria-label "Proposal review"}
+             (render-proposal-panel w view-state)]
+            [:div.tab-panel {:data-tab "experience" :class (tab-active "experience") :role "tabpanel" :aria-label "Generation experience"}
+             (render-experience-panel w view-state)]
+            [:div.tab-panel {:data-tab "repl" :class (tab-active "repl") :role "tabpanel" :aria-label "REPL"}
+             (render-repl-panel w view-state)]
+            [:div.tab-panel {:data-tab "help" :role "tabpanel" :aria-label "API help"}
+             (render-help-panel)]]]]]
+
+        html-body (h/hiccup->html body-hiccup)]
+
+    (str "<!doctype html><html lang=\"en\"><head>"
+         "<meta charset=\"utf-8\">"
+         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+         "<title>BL Playground \u00b7 " (esc root) "</title>"
+         "<link rel=\"stylesheet\" href=\"/play/ui.css\">"
+         "</head>"
+         html-body
+         "<script src=\"/play/ui-client.js\"></script>"
+         "<script>window.playInit(" js-token ");</script>"
+         "</html>")))
+
+;; ── /play/state JSON ──────────────────────────────────────────────────────────
+
+(defn theme!
+  "Set the playground workspace's appearance from either the REPL or the UI."
+  [w theme]
+  (when-not (contains? #{:carbon :snow} theme)
+    (throw (ex-info "Choose :carbon or :snow." {})))
+  (ws/record! w :play-ui-theme theme)
+  theme)
+
+(defn- build-state-json [w view-state]
+  (let [snap      (snap-safe w)
+        vs        @view-state
+        buffers   (if (map? snap) (or (:buffers snap) (list)) (list))
+        proposals (if (map? snap) (or (:proposals snap) (list)) (list))
+        exps      (if (map? snap) (or (:experiences snap) (list)) (list))
+        a-buf     (:active-buffer vs)
+        a-prop    (:active-proposal vs)
+        a-exp     (:active-experience vs)]
+    {"repl_ns"            (or (:repl-ns snap) "user")
+     "rev"                (str (erlang/system_time :millisecond))
+     "root"               (if (map? snap) (str (or (:root snap) ".")) ".")
+     "files"              (let [fs (ws-safe ws/files w)]
+                           (cond (vector? fs) (to-list fs)
+                                 (list? fs)   (to-list fs)
+                                 :else        (to-list [])))
+     "buffers"            (to-list (map sanitize-buffer buffers))
+     "proposals"          (to-list (map sanitize-proposal proposals))
+     "experiences"        (to-list (map sanitize-experience exps))
+     "fragments"          {"rail" (str (h/hiccup->html (render-file-tree w view-state))
+                                         (h/hiccup->html (render-experience-rail w view-state)))
+                            "buffer" (h/hiccup->html (render-buffer-panel w view-state))
+                            "proposal" (h/hiccup->html (render-proposal-panel w view-state))
+                            "experience" (h/hiccup->html (render-experience-panel w view-state))}
+     "active_buffer"      (sanitize-buffer   (if a-buf  (find-in-snap snap :buffers   a-buf)  (first buffers)))
+     "active_proposal"    (sanitize-proposal (selected-proposal snap vs))
+     "active_experience"  (sanitize-experience (if a-exp (find-in-snap snap :experiences a-exp) (first exps)))
+     "view"               {"theme"     (name (ws/record w :play-ui-theme (or (:theme vs) :carbon)))
+                           "active_tab" (name (or (:active-tab vs) :buffer))
+                           "active_buffer"   (if a-buf  (str a-buf)  nil)
+                           "active_proposal" (if a-prop (str a-prop) nil)}}))
+
+;; ── Command dispatch allowlist ─────────────────────────────────────────────────
+;;
+;; Every command is explicit and named. Unknown commands are rejected with 400.
+;; View commands (focus, set-tab) mutate only the handler-local view-state atom.
+;; All ws/gen calls are explicit; user source never interpolated into eval strings.
+
+(defn- dispatch [w view-state cmd args]
+  "Returns {:ok result} or {:error message}."
+  (let [snap (snap-safe w)]
+    (try
+      (cond
+        (= cmd "theme")
+        {:ok (name (theme! w (case (:theme args) "snow" :snow "carbon" :carbon :invalid)))}
+
+        ;; ── View-only (no workspace mutation) ──────────────────────────────
+        (= cmd "focus")
+        (do (swap! view-state assoc :active-experience (str (or (:id args) "")))
+            {:ok nil})
+
+        (= cmd "set-tab")
+        (do (swap! view-state assoc :active-tab (case (:tab args) "proposal" :proposal "experience" :experience "repl" :repl "help" :help :buffer))
+            {:ok nil})
+
+        (= cmd "switch-buffer")
+        (do (swap! view-state assoc :active-buffer (str (or (:id args) "")) :active-tab :buffer :new-file? false)
+            {:ok nil})
+
+        (= cmd "switch-proposal")
+        (do (swap! view-state assoc :active-proposal (str (or (:id args) "")) :active-tab :proposal)
+            {:ok nil})
+
+        (= cmd "new-file-dialog")
+        (do (swap! view-state assoc :new-file? true :active-tab :buffer)
+            {:ok nil :needs-dialog true})
+
+        (= cmd "collapse")
+        {:ok nil}  ; JS-side animation only; no ws mutation
+
+        (= cmd "inspect")
+        (let [[kind collection binding] (case (:kind args)
+                                          "buffer" [:buffer :buffers "buffer"]
+                                          "proposal" [:proposal :proposals "p"]
+                                          "experience" [:experience :experiences "experience"]
+                                          [nil nil nil])
+              r (when kind (resolve-handle w snap collection kind (:id args)))]
+          (cond
+            (nil? kind) {:error "Choose a buffer, proposal, or experience."}
+            (:error r) r
+            :else (do (ws/bind! w binding (:ok r))
+                      {:result (str "Bound " binding " in the workspace REPL.")})))
+
+        ;; ── Buffer commands ─────────────────────────────────────────────────
+        (= cmd "open-file")
+        (let [path (str (or (:path args) ""))]
+          (if (empty? path)
+            {:error "open-file: path required"}
+            (let [buf (ws/open! w path)]
+              (swap! view-state assoc :active-buffer (:id buf) :active-tab :buffer :new-file? false)
+              {:ok (sanitize-buffer (ws/snapshot buf))})))
+
+        (= cmd "new-file")
+        (let [path   (str (or (:path args) ""))
+              source (str (or (:source args) ""))]
+          (if (empty? path)
+            {:error "new-file: path required"}
+            (let [buf (ws/new-file! w path source)]
+              (swap! view-state assoc :active-buffer (:id buf) :active-tab :buffer :new-file? false)
+              {:ok (sanitize-buffer (ws/snapshot buf))})))
+
+        (= cmd "edit-buffer")
+        (let [id  (str (or (:id args) ""))
+              src (str (or (:source args) ""))
+              r   (resolve-handle w snap :buffers :buffer id)]
+          (if (:error r) r
+            (let [b (ws/edit! (:ok r) src)]
+              {:ok (sanitize-buffer (ws/snapshot b))})))
+
+        (= cmd "save-buffer")
+        (let [id (str (or (:id args) ""))
+              r  (resolve-handle w snap :buffers :buffer id)]
+          (if (:error r) r
+            {:ok (sanitize-buffer (ws/save! (:ok r)))}))
+
+        (= cmd "close-buffer")
+        (let [id (str (or (:id args) ""))
+              r  (resolve-handle w snap :buffers :buffer id)]
+          (if (:error r) r
+            (do (ws/close! (:ok r))
+                (swap! view-state assoc :active-buffer nil)
+                {:ok nil})))
+
+        ;; ── Proposal commands ───────────────────────────────────────────────
+        (= cmd "verify-proposal")
+        (let [id (str (or (:id args) ""))
+              r  (resolve-handle w snap :proposals :proposal id)]
+          (if (:error r) r
+            {:ok (sanitize-proposal (ws/verify! (:ok r)))}))
+
+        (= cmd "try-proposal")
+        ;; ws/try! returns a string result, not a snapshot
+        (let [id (str (or (:id args) ""))
+              r  (resolve-handle w snap :proposals :proposal id)]
+          (if (:error r) r
+            (let [result (ws/try! (:ok r))]
+              {:ok result :result (str result)})))
+
+        (= cmd "save-proposal")
+        (let [id (str (or (:id args) ""))
+              r (resolve-handle w snap :proposals :proposal id)
+              x (some (fn [exp] (when (and (= id (get-in exp [:proposal :id]))
+                                           (= :ready (:status exp))) exp)) (:experiences snap))]
+          (if (:error r) r
+            (if x
+              (let [accepted (call-gen "accept!" [{:kind :experience :root (:root w) :id (:id x)}])]
+                (if (:error accepted) accepted {:ok (sanitize-proposal (ws/snapshot (:ok r)))}))
+              {:ok (sanitize-proposal (ws/save! (:ok r)))})))
+
+        (= cmd "make-live")
+        (let [id (str (or (:id args) ""))
+              r  (resolve-handle w snap :proposals :proposal id)]
+          (if (:error r) r
+            {:ok (sanitize-proposal (ws/make-live! (:ok r)))}))
+
+        (= cmd "undo-proposal")
+        (let [id (str (or (:id args) ""))
+              r  (resolve-handle w snap :proposals :proposal id)]
+          (if (:error r) r
+            (let [inverse (ws/undo! (:ok r))]
+              (swap! view-state assoc :active-proposal (:id inverse))
+              {:ok (sanitize-proposal (ws/snapshot inverse))})))
+
+        ;; ── REPL eval ────────────────────────────────────────────────────────
+        ;; Only the REPL input invokes ws/eval!; button clicks NEVER interpolate
+        ;; user text into eval strings.
+        (= cmd "eval")
+        (let [source (str (or (:source args) ""))]
+          (if (empty? source)
+            {:error "eval: source required"}
+            (let [result (ws/eval! w source)]
+              {:ok result :result result})))
+
+        ;; ── Generation commands (play.gen, orchestrator-owned) ───────────────
+        (= cmd "gen-ns")
+        (let [source-path (str (or (:source_path args) (:source-path args) ""))
+              prompt      (str (or (:prompt args) ""))
+              provider    (case (or (:provider args) "fake") "fake" :fake "deepseek" :deepseek :invalid)]
+          (if (empty? prompt)
+            {:error "gen-ns: prompt required"}
+            (let [r (call-gen "ns" [w source-path prompt {:provider provider}])]
+              (if (:error r) r
+                (let [exp     (:ok r)
+                      exp-id  (:id exp)]
+                  (swap! view-state assoc :active-experience (str exp-id) :active-proposal nil :active-tab :experience)
+                  {:ok (sanitize-experience (ws/snapshot exp))})))))
+
+        (= cmd "refine")
+        (let [id     (str (or (:id args) ""))
+              prompt (str (or (:prompt args) ""))
+              r      (resolve-handle w snap :experiences :experience id)]
+          (if (:error r) r
+            (let [gr (call-gen "refine!" [(:ok r) prompt])]
+              (if (:error gr) gr {:ok nil}))))
+
+        (= cmd "cancel-gen")
+        (let [id (str (or (:id args) ""))
+              r  (resolve-handle w snap :experiences :experience id)]
+          (if (:error r) r
+            (let [gr (call-gen "cancel!" [(:ok r)])]
+              (if (:error gr) gr {:ok nil}))))
+
+        (= cmd "accept-gen")
+        (let [id (str (or (:id args) ""))
+              r  (resolve-handle w snap :experiences :experience id)]
+          (if (:error r) r
+            (let [gr (call-gen "accept!" [(:ok r)])]
+              (if (:error gr) gr {:ok nil}))))
+
+        :else
+        {:error (str "unknown command: " (esc cmd)
+                     ". Allowed: open-file, new-file, edit-buffer, save-buffer, close-buffer, "
+                     "verify-proposal, try-proposal, save-proposal, make-live, undo-proposal, "
+                     "eval, gen-ns, refine, cancel-gen, accept-gen, "
+                     "focus, set-tab, switch-buffer, switch-proposal.")})
+      (catch e {:error (str "command error (" (esc cmd) "): " (ex-message e))}))))
+
+;; ── Route handlers ────────────────────────────────────────────────────────────
+
+(defn- serve-page [conn w view-state opts]
+  (try (web/html conn 200 (render-page w view-state opts))
+       (catch e
+         (web/html conn 500
+           (str "<!doctype html><html lang=\"en\"><body style=\"background:#0b0a10;color:#ff6b6b;"
+                "font-family:monospace;padding:2rem\"><pre>play.ui render error:\n"
+                (esc (ex-message e)) "</pre></body></html>")))))
+
+(defn- serve-state [conn w view-state]
+  (web/json conn 200 (build-state-json w view-state)))
+
+(defn- serve-css [conn]
+  (web/bytes conn "text/css" CSS))
+
+(defn- serve-client-js [conn]
+  (web/bytes conn "application/javascript" CLIENT-JS))
+
+(defn- handle-command [conn w view-state opts]
+  (if (not (token-ok? conn opts))
+    (web/json conn 403 {"ok" false "error" "missing or wrong x-bl-token"})
+    (let [[body conn] (web/read-body* conn)
+          parsed      (try (bl.json/decode body) (catch _e nil))]
+      (if (not (map? parsed))
+        (web/json conn 400 {"ok"    false
+                             "error" "expected JSON {\"cmd\":\"...\",\"args\":{...}}"})
+        (let [cmd    (str (get parsed "cmd" ""))
+              raw-a  (get parsed "args" {})
+              args   (if (map? raw-a)
+                       (into {} (for [k ["id" "kind" "path" "source" "prompt" "source_path" "provider" "tab" "theme"]
+                                      :when (contains? raw-a k)]
+                                  [(keyword k) (get raw-a k)]))
+                       {})
+              result (dispatch w view-state cmd args)]
+          (if (:error result)
+            (web/json conn 200 {"ok"    false
+                                 "cmd"   cmd
+                                 "error" (:error result)})
+            (web/json conn 200 (merge {"ok"    true
+                                        "cmd"   cmd}
+                                      (if (some? (:result result))
+                                        {"result" (:result result)} {})
+                                      (if (some? (:ok result))
+                                        {"data" (:ok result)} {})
+                                      (if (:needs-dialog result)
+                                        {"needs_dialog" true} {})
+                                      {"state" (build-state-json w view-state)}))))))))
+
+;; ── Public: handler ──────────────────────────────────────────────────────────
+;;
+;; Orchestrator mounts this at the same loopback server as vm.repl routes
+;; (same process/port). The routes all begin /play so they do not clash with
+;; existing /repl/* routes.
+;;
+;; Usage:
+;;   (def h (play.ui/handler w))                  ; no token
+;;   (def h (play.ui/handler w {:token my-token})) ; with token
+;;
+;; The orchestrator supplies `w` from (ws/attach! workspace-root) and mounts h:
+;;   in vm.http/router's cond: (String/starts_with? p "/play") → (h conn)
+
+(defn- local-request? [conn]
+  (let [host (or (web/req-header conn "host") "")
+        origin (web/req-header conn "origin")]
+    (and (or (= host "127.0.0.1") (= host "localhost")
+             (String/starts_with? host "127.0.0.1:")
+             (String/starts_with? host "localhost:"))
+         (or (nil? origin) (= origin (str "http://" host))))))
+
+(defn- browser-session [conn]
+  (let [cookies (String/split (or (web/req-header conn "cookie") "") ";")
+        entry (first (filter (fn [s] (String/starts_with? (String/trim s) "bl-play-session=")) cookies))
+        id (when entry (subs (String/trim entry) 16))]
+    (if (and id (= 32 (count id))
+             (every? (fn [ch] (String/contains? "0123456789ABCDEF" ch)) (String/codepoints id)))
+      [id conn]
+      (let [id (Base/encode16 (crypto/strong_rand_bytes 16))]
+        [id (Plug.Conn/put_resp_header conn "set-cookie"
+               (str "bl-play-session=" id "; Path=/play; HttpOnly; SameSite=Strict"))]))))
+
+(defn handler
+  "Ring/Plug-style handler for the BL API playground.
+
+   `w`    — workspace handle, from (dev.workspace/attach! root).
+   `opts` — map; :token (raw bytes) gates mutations via x-bl-token header.
+
+   The handler owns a separate view-state per browser session. Project state
+   lives in workspace actors; focus and tabs are never shared between browsers."
+  ([w] (handler w {}))
+  ([w opts]
+   (let [views (atom {})]
+     (fn [conn]
+       (let [[id conn] (browser-session conn)
+             _ (when-not (get @views id)
+                 (swap! views (fn [all]
+                                (if (get all id) all
+                                  (assoc all id (atom {:theme :carbon :active-tab :buffer
+                                                     :active-buffer nil :active-proposal nil
+                                                     :active-experience nil :pinned #{} :collapsed #{}}))))))
+             view-state (get @views id)
+             m (web/method conn)
+             p (web/path conn)]
+         (cond
+           (not (local-request? conn))
+           (web/json conn 403 {"error" "The playground accepts only same-origin loopback requests."})
+           (and (= m "get") (or (= p "/play") (= p "/play/")))
+           (serve-page conn w view-state opts)
+
+           (and (= m "get") (= p "/play/state"))
+           (serve-state conn w view-state)
+
+           (and (= m "get") (= p "/play/ui.css"))
+           (serve-css conn)
+
+           (and (= m "get") (= p "/play/ui-client.js"))
+           (serve-client-js conn)
+
+           (and (= m "post") (= p "/play/command"))
+           (handle-command conn w view-state opts)
+
+           :else
+           (web/json conn 404 {"error" "not found"
+                                "path"  p
+                                "hint"  "routes: /play /play/state /play/ui.css /play/ui-client.js /play/command"})))))))

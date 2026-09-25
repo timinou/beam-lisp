@@ -49,8 +49,8 @@ defmodule BeamLisp.SelfBuildGateTest do
       BeamLisp.Loader.ensure_loaded("release")
 
       # ── gen-1: the last artefact the Rust tooling makes ──────────────────
-      value = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("release", "value"), [:beam_lisp])
-      a = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("release", "assemble"), [value, @tree])
+      value = BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("release", "value"), [:beam_lisp])
+      a = BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("release", "assemble"), [value, @tree])
       assert a[:ok?], "assemble failed: #{inspect(a[:errors])}"
 
       p = BeamLisp.Drop.pack(@tree, @stock_launcher, @gen1)

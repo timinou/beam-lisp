@@ -329,9 +329,9 @@ defmodule BeamLisp.Env do
 
   # bl fns are tagged structs, not Elixir fns — normalize any invocable
   # thunk to a zero-arity Elixir fn so `env/with-env` works from bl source
-  # without the caller hand-wrapping through RT.invoke.
+  # without the caller hand-wrapping through `rt/invoke`.
   defp as_thunk(fun) when is_function(fun, 0), do: fun
-  defp as_thunk(fun), do: fn -> BeamLisp.RT.invoke(fun, []) end
+  defp as_thunk(fun), do: fn -> BeamLisp.Ns.Rt.invoke(fun, []) end
 
   @doc """
   Wrap a one-argument invocable (bl fn or Elixir fn) as an ELIXIR
@@ -347,7 +347,7 @@ defmodule BeamLisp.Env do
   """
   def convey(fun) do
     token = capture()
-    inner = fn arg -> BeamLisp.RT.invoke(fun, [arg]) end
+    inner = fn arg -> BeamLisp.Ns.Rt.invoke(fun, [arg]) end
     fn arg -> bind(token); inner.(arg) end
   end
 
@@ -599,6 +599,12 @@ defmodule BeamLisp.Env do
 
   def in_ns(ns) when is_binary(ns) do
     Process.put(@pdict_ns, ns)
+
+    # Declare what entering means: a REPL/session brings a namespace into
+    # being by in_ns + def, never by an (ns …) form — and enumeration
+    # (namespaces/0) only sees marker rows, so without this the ns's vars
+    # were invisible to completion/index/doc-scan (BUG-089). Idempotent.
+    declare_ns(ns)
 
     # Mirror to the Agent at :global so unbound observers (REPL display,
     # live panel) see the ambient namespace. Compilation never reads the

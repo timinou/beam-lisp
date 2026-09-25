@@ -1,0 +1,490 @@
+; semantic_test.bl — asserting law tests for the repaired krt semantics.
+;
+; Run (needs the planned generated `Krt.Intrinsics` loaded; locally a stub works):
+;
+;   ELIXIR_ERL_OPTIONS="-pa /tmp/krtstub" \
+;     BL_NO_LOCK=1 bin/bl -p research/rt-selfhost run research/rt-selfhost/semantic_test.bl
+;
+; The file both exports `run` and calls it at the top level, so `bl run` gates
+; on it: a failed check prints its label and the process exits NONZERO.
+;
+; ── BEFORE-FIX OBSERVATIONS (captured 2026-09-21 against the first prototype,
+;    before kind/eq were repaired; every one is now asserted false/true as
+;    indicated below). These are the exact defect assertions:
+;
+;   (k/vector? {:items 1})           => true    ; a plain map satisfied vector?
+;   (k/set? {:members 1})            => true
+;   (k/lazy? {:resource 1})          => true
+;   (k/sorted-map? {:tree 1})        => true
+;   (k/kind (tuple :meta 1 2))       => :tuple  ; reserved tags leaked as data
+;   (k/kind (tuple :bl_deftype :m {})) => :tuple
+;   (k/kind (tuple :bl_reify :r {})) => :tuple
+;   (k/kind (tuple :"$macro" f))     => :tuple
+;   (k/kind :kw)                     => :other   ; atoms had no kind
+;   (k-compare f1 f2) => 1  and (k-compare f2 f1) => 1   ; NOT antisymmetric
+;   (k-compare 1 1.0) => 1   ; cross-kind numeric fell to a name tie-break
+;   (k-eqv 1 1.0)     => false
+;   (k-compare 1 1M)  => 1   (k-eqv 1 1M) => false
+;   (k-compare 1.5 1.50M) => 1
+;   (k-compare [1 2] (list 1 2)) => 1   ; shared rank did not mean shared compare
+;   (k-eqv [1 2] (list 1 2))     => false
+;   (k-eqv [1 2] (map identity [1 2])) => false
+;   (k-eqv #{1 2} (sorted-set 1 2)) => false
+;   (k-eqv {:a 1} (sorted-map :a 1)) => false
+;   (k-compare (tuple 9) (tuple 1 1)) => 1   ; element-wise, not arity-first
+
+(ns semantic.test
+  (:require [krt.kind :as k]
+            [krt.seq :as s]
+            [krt.eq :as e]
+            [krt.key :as key]))
+
+;; ── fixtures ───────────────────────────────────────────────────────────────
+(def f1 (fn [x] x))
+(def f2 (fn [x] (+ x 1)))
+(def ref1 (erlang/make_ref))
+(def ref2 (erlang/make_ref))
+(def lazy12 (map identity [1 2]))
+
+; Two registered records of the SAME shape but different types, plus instances;
+; `r12x` is `r12` with a key assoc'd AFTER construction. The registry is global
+; (Record.define), so these are built once at load.
+(def Point (BeamLisp.Record/define "krt.semantic" "Point" (list "x" "y")))
+(def Point2 (BeamLisp.Record/define "krt.semantic" "Point2" (list "x" "y")))
+(def r12 (BeamLisp.Record/construct_list Point (list 1 2)))
+(def r12b (BeamLisp.Record/construct_list Point (list 1 2)))
+(def r12x (maps/put :extra 9 r12))
+(def r13 (BeamLisp.Record/construct_list Point (list 1 3)))
+(def r12-other (BeamLisp.Record/construct_list Point2 (list 1 2)))
+
+; The antisymmetry/transitivity matrix. It deliberately mixes families,
+; identities (fns, refs), metadata carriers and the sibling representations.
+(def vals
+  [nil true false 0 1 -1 0.5 1.0 0.5M 1M "a" "b" :a :b
+   (list 1 2) [1 2] lazy12 (list 2 1) [2 1]
+   {:a 1} {:a 2} (sorted-map :a 1)
+   #{1 2} (sorted-set 1 2) #{2 1}
+   (tuple 1 2) (tuple 2)
+   f1 f2 ref1 ref2])
+
+; Values that have a portable semantic key (no lazy, no identities, no opaque).
+(def portable-vals
+  [nil true false 0 1 -1 0.5 1.0 0.5M 1M "a" "b" :a :b
+   (list 1 2) [1 2] (list 2 1) [2 1]
+   {:a 1} {:a 2} (sorted-map :a 1)
+   #{1 2} (sorted-set 1 2) #{2 1}
+   (tuple 1 2) (tuple 2) (tuple :meta 1 {:m 1})])
+
+(defn- upto [n]
+  (loop [i n acc (list)]
+    (cond (<= i 0) acc
+          :else (recur (- i 1) (cons i acc)))))
+
+(defn- osign [n] (cond (neg? n) -1 (pos? n) 1 :else 0))
+
+(defn- all-pairs? [f]
+  (let [n (count vals) total (* n n)]
+    (loop [k 0]
+      (cond
+        (>= k total) true
+        :else (cond
+                (f (nth vals (quot k n)) (nth vals (rem k n))) (recur (inc k))
+                :else false)))))
+
+(defn- all-triples? [f]
+  (let [n (count vals) total (* n n n)]
+    (loop [k 0]
+      (cond
+        (>= k total) true
+        :else (let [a (nth vals (quot k (* n n)))
+                    b (nth vals (rem (quot k n) n))
+                    c (nth vals (rem k n))]
+                (cond
+                  (f a b c) (recur (inc k))
+                  :else false))))))
+
+(defn- all-portable-pairs? [f]
+  (let [n (count portable-vals) total (* n n)]
+    (loop [k 0]
+      (cond
+        (>= k total) true
+        :else (cond
+                (f (nth portable-vals (quot k n)) (nth portable-vals (rem k n)))
+                (recur (inc k))
+                :else false)))))
+
+(defn- raises? [thunk]
+  (try (do (thunk) false) (catch _e true)))
+
+;; ── the checks ─────────────────────────────────────────────────────────────
+(defn base-checks []
+  (list
+    ;; 1. kind predicates derive from kind (no field sniffing)
+    (tuple "predicate: vector? rejects a plain map with :items"
+           (fn [] (cond (k/vector? {:items 1}) false :else true)))
+    (tuple "predicate: set? rejects a plain map with :members"
+           (fn [] (cond (k/set? {:members 1}) false :else true)))
+    (tuple "predicate: lazy? rejects a plain map with :resource"
+           (fn [] (cond (k/lazy? {:resource 1}) false :else true)))
+    (tuple "predicate: sorted-map? rejects a plain map with :tree"
+           (fn [] (cond (k/sorted-map? {:tree 1}) false :else true)))
+    (tuple "predicate: map? accepts a plain map with :items"
+           (fn [] (k/map? {:items 1})))
+    (tuple "kind: plain map with :items is :map"
+           (fn [] (erlang/== (k/kind {:items 1}) :map)))
+    (tuple "predicate: real representations still classify"
+           (fn [] (cond (k/vector? [1]) (cond (k/set? #{1}) (cond (k/lazy? lazy12)
+                     (cond (k/sorted-map? (sorted-map :a 1)) (k/sorted-set? (sorted-set 1))
+                           :else false)) :else false) :else false)))
+
+    (tuple "internal trie payload is opaque, not a public vector"
+           (fn [] (let [payload (tuple :bl_vec 99 5 nil nil)]
+                    (and (= :opaque (k/kind payload))
+                         (not (k/vector? payload))
+                         (not (key/portable? payload))))))
+
+    ;; 2. reserved tags
+    (tuple "reserved: {:meta f m} is :meta"
+           (fn [] (erlang/== (k/kind (tuple :meta 1 2)) :meta)))
+    (tuple "reserved: {:bl_deftype …} is :deftype"
+           (fn [] (erlang/== (k/kind (tuple :bl_deftype :m (tuple))) :deftype)))
+    (tuple "reserved: {:bl_reify …} is :reify"
+           (fn [] (erlang/== (k/kind (tuple :bl_reify ref1 (tuple))) :reify)))
+    (tuple "reserved: {:\"$macro\" f} is :macro"
+           (fn [] (erlang/== (k/kind (tuple (erlang/binary_to_atom "$macro" :utf8) f1)) :macro)))
+    (tuple "reserved: {:\"$transient\" k} is :transient"
+           (fn [] (erlang/== (k/kind (tuple (erlang/binary_to_atom "$transient" :utf8) :map)) :transient)))
+    (tuple "reserved: reserved tuples are never sequential"
+           (fn [] (cond (k/sequential? (tuple :meta 1 2)) false
+                        (k/sequential? (tuple :bl_deftype :m (tuple))) false
+                        (k/sequential? (tuple :symbol "s")) false
+                        :else true)))
+    (tuple "reserved: reserved-tags == BeamLisp.Guards.internal_tuple_tags"
+           (fn [] (erlang/== k/reserved-tags (BeamLisp.Guards/internal_tuple_tags))))
+    (tuple "reserved: {:\"$blfn\" …} is :blfn"
+           (fn [] (erlang/== (k/kind (tuple (erlang/binary_to_atom "$blfn" :utf8) (maps/new) nil)) :blfn)))
+
+    ;; 3. kind has an atom class
+    (tuple "kind: :kw is :atom" (fn [] (erlang/== (k/kind :kw) :atom)))
+    (tuple "kind: symbol tuple is :symbol"
+           (fn [] (erlang/== (k/kind (tuple :symbol "s")) :symbol)))
+
+    ;; 4. representation descriptors + struct-kind derivation
+    (tuple "descriptors: representations has 7 entries"
+           (fn [] (erlang/== 7 (count (s/k-to-list k/representations)))))
+    (tuple "descriptors: every entry's :family matches k/family of its :kind"
+           (fn []
+             (loop [ds (s/k-to-list k/representations)]
+               (cond
+                 (empty? ds) true
+                 :else (cond
+                         (erlang/== (get (first ds) :family) (k/family (get (first ds) :kind)))
+                         (recur (rest ds))
+                         :else false)))))
+    (tuple "descriptors: vector entry names Elixir.BeamLisp.Vector"
+           (fn [] (erlang/== (get (first (s/k-to-list k/representations)) :module) k/VEC-MOD)))
+    (tuple "descriptors: struct-kind derives from the descriptor vector"
+           (fn [] (erlang/== (k/kind (maps/put :__struct__ k/VEC-MOD (maps/new))) :vector)))
+    (tuple "descriptors: an unregistered struct is :opaque"
+           (fn [] (erlang/== (k/kind (maps/put :__struct__ :Unknown.Thing (maps/new))) :opaque)))
+    (tuple "descriptors: an opaque struct is not a collection"
+           (fn [] (cond (k/coll? (maps/put :__struct__ :Unknown.Thing (maps/new))) false :else true)))
+
+    ;; 5. antisymmetry and reflexivity over the whole matrix
+    (tuple "order: compare is antisymmetric over the matrix (incl. fns/refs)"
+           (fn [] (all-pairs? (fn [a b]
+                                (erlang/== (e/k-compare a b) (erlang/- 0 (e/k-compare b a)))))))
+    (tuple "order: compare is reflexive (compare a a == 0)"
+           (fn [] (all-pairs? (fn [a _b] (erlang/== 0 (e/k-compare a a))))))
+    (tuple "order: distinct functions compare non-zero and antisymmetric"
+           (fn [] (cond (zero? (e/k-compare f1 f2)) false
+                        (erlang/== (e/k-compare f1 f2) (erlang/- 0 (e/k-compare f2 f1))) true
+                        :else false)))
+    (tuple "order: distinct refs compare non-zero and antisymmetric"
+           (fn [] (cond (zero? (e/k-compare ref1 ref2)) false
+                        (erlang/== (e/k-compare ref1 ref2) (erlang/- 0 (e/k-compare ref2 ref1))) true
+                        :else false)))
+
+    ;; 6. transitivity (order, which subsumes equality)
+    (tuple "order: compare is transitive over the matrix"
+           (fn [] (all-triples? (fn [a b c]
+                                  (cond (<= (e/k-compare a b) 0)
+                                        (cond (<= (e/k-compare b c) 0)
+                                              (<= (e/k-compare a c) 0)
+                                              :else true)
+                                        :else true)))))
+    (tuple "equality: k-eqv is transitive over the matrix"
+           (fn [] (all-triples? (fn [a b c]
+                                  (cond (e/k-eqv a b)
+                                        (cond (e/k-eqv b c) (e/k-eqv a c) :else true)
+                                        :else true)))))
+
+    ;; 7. numeric cross-kind
+    (tuple "numeric: (= 1 1.0)" (fn [] (e/k-eqv 1 1.0)))
+    (tuple "numeric: (= 1 1M)" (fn [] (e/k-eqv 1 1M)))
+    (tuple "numeric: (= 1.0 1M)" (fn [] (e/k-eqv 1.0 1M)))
+    (tuple "numeric: (= 0 0.0)" (fn [] (e/k-eqv 0 0.0)))
+    (tuple "numeric: (= 1.5 1.50M)" (fn [] (e/k-eqv 1.5 1.50M)))
+    (tuple "numeric: (not= 1 2)" (fn [] (cond (e/k-eqv 1 2) false :else true)))
+    (tuple "numeric: (= 9007199254740992 9007199254740992.0)"
+           (fn [] (e/k-eqv 9007199254740992 9007199254740992.0)))
+    (tuple "numeric: (not= 9007199254740993 9007199254740993.0) (float rounds)"
+           (fn [] (cond (e/k-eqv 9007199254740993 9007199254740993.0) false :else true)))
+
+    ;; 8. sequential family across representations and sizes
+    (tuple "sequential: [1 2] = (list 1 2)" (fn [] (e/k-eqv [1 2] (list 1 2))))
+    (tuple "sequential: [1 2] = (map identity [1 2])" (fn [] (e/k-eqv [1 2] lazy12)))
+    (tuple "sequential: (list 1 2) = lazy" (fn [] (e/k-eqv (list 1 2) (map identity [1 2]))))
+    (tuple "sequential: (not= [1 2] [1 3])" (fn [] (cond (e/k-eqv [1 2] [1 3]) false :else true)))
+    (tuple "sequential: compare [1 2] (list 1 2) == 0" (fn [] (erlang/== 0 (e/k-compare [1 2] (list 1 2)))))
+    (tuple "sequential: size 0 [] = ()" (fn [] (e/k-eqv [] (list))))
+    (tuple "sequential: size 1 [1] = (1)" (fn [] (e/k-eqv (into [] (upto 1)) (upto 1))))
+    (tuple "sequential: size 31 [..] = list" (fn [] (e/k-eqv (into [] (upto 31)) (upto 31))))
+    (tuple "sequential: size 32 [..] = list" (fn [] (e/k-eqv (into [] (upto 32)) (upto 32))))
+    (tuple "sequential: size 33 [..] = list" (fn [] (e/k-eqv (into [] (upto 33)) (upto 33))))
+    (tuple "sequential: size 1024 [..] = list" (fn [] (e/k-eqv (into [] (upto 1024)) (upto 1024))))
+    (tuple "sequential: size 1024 vector = lazy" (fn [] (e/k-eqv (into [] (upto 1024)) (map identity (upto 1024)))))
+    (tuple "sequential: (not= vector-of-1024 (list 1..1023))" (fn [] (cond (e/k-eqv (into [] (upto 1024)) (upto 1023)) false :else true)))
+
+    ;; 9. sorted/hashed siblings
+    (tuple "siblings: #{1 2} = (sorted-set 1 2)" (fn [] (e/k-eqv #{1 2} (sorted-set 1 2))))
+    (tuple "siblings: #{3 1 2} = (sorted-set 1 2 3)" (fn [] (e/k-eqv #{3 1 2} (sorted-set 1 2 3))))
+    (tuple "siblings: {:a 1} = (sorted-map :a 1)" (fn [] (e/k-eqv {:a 1} (sorted-map :a 1))))
+    (tuple "siblings: {:a 1 :b 2} = (sorted-map :b 2 :a 1)" (fn [] (e/k-eqv {:a 1 :b 2} (sorted-map :b 2 :a 1))))
+    (tuple "siblings: (not= #{1 2} #{1 3})" (fn [] (cond (e/k-eqv #{1 2} #{1 3}) false :else true)))
+    (tuple "siblings: (not= #{1 2} (sorted-set 1 2 3))" (fn [] (cond (e/k-eqv #{1 2} (sorted-set 1 2 3)) false :else true)))
+    (tuple "siblings: set ordering compares full elements"
+           (fn [] (e/k-eqv #{10 2 33} (sorted-set 33 10 2))))
+    (tuple "siblings: (not= {:a 1} {:a 2})" (fn [] (cond (e/k-eqv {:a 1} {:a 2}) false :else true)))
+    (tuple "siblings: map is not a set" (fn [] (cond (e/k-eqv {:a 1} #{:a 1}) false :else true)))
+
+    ;; 10. tuple arity policy
+    (tuple "tuple: arity-first (tuple 9) < (tuple 1 1)"
+           (fn [] (erlang/== -1 (e/k-compare (tuple 9) (tuple 1 1)))))
+    (tuple "tuple: arity-first reverse (tuple 1 1) > (tuple 9)"
+           (fn [] (erlang/== 1 (e/k-compare (tuple 1 1) (tuple 9)))))
+    (tuple "tuple: equal tuples compare 0" (fn [] (erlang/== 0 (e/k-compare (tuple 1 2) (tuple 1 2)))))
+    (tuple "tuple: a tuple is not a vector" (fn [] (cond (e/k-eqv (tuple 1 2) [1 2]) false :else true)))
+    (tuple "tuple: empty tuple is a data tuple" (fn [] (erlang/== (k/kind (tuple)) :tuple)))
+
+    ;; 11. metadata is ignored
+    (tuple "metadata: vector meta is invisible to ="
+           (fn [] (e/k-eqv [1 2] (maps/put :meta {:m 1} [1 2]))))
+    (tuple "metadata: nested vector meta is invisible"
+           (fn [] (e/k-eqv [1 [2 3]] [1 (maps/put :meta {:m 1} [2 3])])))
+    (tuple "metadata: {:meta f m} compares f and ignores m"
+           (fn [] (e/k-eqv (tuple :meta 1 {:a 1}) (tuple :meta 1 {:b 2}))))
+    (tuple "metadata: nested meta is invisible to the key"
+           (fn [] (erlang/== (key/semantic-key [1 [2 3]])
+                             (key/semantic-key [1 (maps/put :meta {:m 1} [2 3])]))))
+
+    ;; 12. equality ⇒ same key/hash (congruence) over all portable pairs
+    (tuple "key: equal portable values have equal keys"
+           (fn [] (all-portable-pairs? (fn [a b]
+                                         (cond (e/k-eqv a b)
+                                               (erlang/== (key/semantic-key a) (key/semantic-key b))
+                                               :else true)))))
+    (tuple "key: equal portable values have equal hashes"
+           (fn [] (all-portable-pairs? (fn [a b]
+                                         (cond (e/k-eqv a b)
+                                               (erlang/== (key/semantic-hash a) (key/semantic-hash b))
+                                               :else true)))))
+    (tuple "key: numbers canonicalise across int/float/decimal"
+           (fn [] (and (erlang/== (key/semantic-key 1) (key/semantic-key 1.0))
+                       (and (erlang/== (key/semantic-key 1) (key/semantic-key 1M))
+                            (erlang/== (key/semantic-key 1.5) (key/semantic-key 1.50M))))))
+    (tuple "key: list and vector share a sequential key"
+           (fn [] (erlang/== (key/semantic-key (list 1 2)) (key/semantic-key [1 2]))))
+    (tuple "key: set and sorted-set share a key"
+           (fn [] (erlang/== (key/semantic-key #{1 2}) (key/semantic-key (sorted-set 1 2)))))
+    (tuple "key: map and sorted-map share a key"
+           (fn [] (erlang/== (key/semantic-key {:a 1}) (key/semantic-key (sorted-map :a 1)))))
+    (tuple "key: tuple arity is part of the key"
+           (fn [] (cond (erlang/== (key/semantic-key (tuple 9)) (key/semantic-key (tuple 1 1))) false :else true)))
+
+    ;; 13. key lookup: equal values find each other through the projected key
+    (tuple "key lookup: 1 finds an entry stored under 1.0"
+           (fn [] (let [m (maps/put (key/semantic-key 1.0) :found (maps/new))]
+                    (erlang/== (erlang/map_get (key/semantic-key 1) m) :found))))
+    (tuple "key lookup: 1M finds an entry stored under 1"
+           (fn [] (let [m (maps/put (key/semantic-key 1) :found (maps/new))]
+                    (erlang/== (erlang/map_get (key/semantic-key 1M) m) :found))))
+    (tuple "key lookup: a vector finds an entry stored under a list"
+           (fn [] (let [m (maps/put (key/semantic-key (list 1 2)) :found (maps/new))]
+                    (erlang/== (erlang/map_get (key/semantic-key [1 2]) m) :found))))
+    (tuple "key lookup: a set finds an entry stored under its sorted sibling"
+           (fn [] (let [m (maps/put (key/semantic-key (sorted-set 1 2)) :found (maps/new))]
+                    (erlang/== (erlang/map_get (key/semantic-key #{1 2}) m) :found))))
+    (tuple "key lookup: a map finds an entry stored under its sorted sibling"
+           (fn [] (let [m (maps/put (key/semantic-key (sorted-map :a 1)) :found (maps/new))]
+                    (erlang/== (erlang/map_get (key/semantic-key {:a 1}) m) :found))))
+
+    ;; 14. key domain: refusal of non-portable values, nested too
+    (tuple "key domain: lazy is not portable" (fn [] (cond (key/portable? lazy12) false :else true)))
+    (tuple "key domain: a function is not portable" (fn [] (cond (key/portable? f1) false :else true)))
+    (tuple "key domain: a ref is not portable" (fn [] (cond (key/portable? ref1) false :else true)))
+    (tuple "key domain: an opaque struct is not portable"
+           (fn [] (cond (key/portable? (maps/put :__struct__ :Unknown.Thing (maps/new))) false :else true)))
+    (tuple "key domain: a nested function refuses the whole key"
+           (fn [] (cond (key/portable? [1 f1]) false :else true)))
+    (tuple "key domain: a nested function refuses a map key"
+           (fn [] (cond (key/portable? {:a f1}) false :else true)))
+    (tuple "key domain: a nested lazy refuses the whole key"
+           (fn [] (cond (key/portable? [1 (map identity [1 2])]) false :else true)))
+    (tuple "key domain: (semantic-key f) raises"
+           (fn [] (raises? (fn [] (key/semantic-key f1)))))
+    (tuple "key domain: (semantic-key [1 f]) raises"
+           (fn [] (raises? (fn [] (key/semantic-key [1 f1])))))
+    (tuple "key domain: plain data is portable"
+           (fn [] (cond (key/portable? {:a 1}) (cond (key/portable? [1 2]) (key/portable? #{1 2}) :else false) :else false)))))
+
+;; ── exact-number / record / metadata / canonical-key regressions ───────────
+; Every check here FAILS on the first prototype: the mixed `Num.cmp` +
+; `Decimal.from_float` comparator (0.1 vs 0.1M, the 2^53 boundary), the
+; `Record.fields_of` record walk that dropped assoc'd keys, the `{:meta …}`
+; wrapper that only compared wrapper-to-wrapper, and the unproven claim that key
+; order means something.
+(defn extra-checks []
+  (list
+    ;; exact rationals: int / float / decimal are ONE order, no approximation
+    (tuple "numeric exact: (= 1 1.0 1M)"
+           (fn [] (and (e/k-eqv 1 1.0) (and (e/k-eqv 1 1M) (e/k-eqv 1.0 1M)))))
+    (tuple "numeric exact: (= 1.5 1.50M)" (fn [] (e/k-eqv 1.5 1.50M)))
+    (tuple "numeric exact: (= 0.5 0.5M)" (fn [] (e/k-eqv 0.5 0.5M)))
+    (tuple "numeric exact: (= 100 100.0M)" (fn [] (e/k-eqv 100 100.0M)))
+    (tuple "numeric exact: (not= 0.1 0.1M) (the float is not 1/10)"
+           (fn [] (cond (e/k-eqv 0.1 0.1M) false :else true)))
+    (tuple "numeric exact: (not= 1.5M 1.6M)" (fn [] (cond (e/k-eqv 1.5M 1.6M) false :else true)))
+
+    ;; the 2^53 boundary: an int and the float it rounds from are not equal
+    (tuple "numeric exact: (= 9007199254740992 9007199254740992.0) (2^53 exact)"
+           (fn [] (e/k-eqv 9007199254740992 9007199254740992.0)))
+    (tuple "numeric exact: (= 9007199254740992 9007199254740992M)"
+           (fn [] (e/k-eqv 9007199254740992 9007199254740992M)))
+    (tuple "numeric exact: (= 9007199254740993 9007199254740993M)"
+           (fn [] (e/k-eqv 9007199254740993 9007199254740993M)))
+    (tuple "numeric exact: (not= 9007199254740993 9007199254740993.0)"
+           (fn [] (cond (e/k-eqv 9007199254740993 9007199254740993.0) false :else true)))
+    (tuple "numeric exact: float 9007199254740993.0 orders BELOW the int"
+           (fn [] (erlang/== -1 (e/k-compare 9007199254740993.0 9007199254740993))))
+    (tuple "numeric exact: (= 9007199254740992.0 9007199254740992M)"
+           (fn [] (e/k-eqv 9007199254740992.0 9007199254740992M)))
+
+    ;; tiny values: the smallest float is its exact dyadic ratio, not zero
+    (tuple "numeric exact: smallest subnormal is above zero"
+           (fn [] (erlang/== 1 (e/k-compare 5.0e-324 0.0))))
+    (tuple "numeric exact: smallest subnormal is not zero"
+           (fn [] (cond (e/k-eqv 5.0e-324 0.0) false :else true)))
+    (tuple "numeric exact: subnormal orders below 1.0e-300"
+           (fn [] (erlang/== -1 (e/k-compare 5.0e-324 1.0e-300))))
+
+    ;; keys read the SAME projection: a regression to shortest-decimal fails
+    (tuple "numeric key: 0.1 float keys as its IEEE ratio, not a short decimal"
+           (fn [] (let [r (Float/ratio 0.1)]
+                    (erlang/== (key/semantic-key 0.1)
+                               (Krt.Intrinsics/tuple3 :num (erlang/element 1 r) (erlang/element 2 r))))))
+    (tuple "numeric key: subnormal float keys as its IEEE ratio"
+           (fn [] (let [r (Float/ratio 5.0e-324)]
+                    (erlang/== (key/semantic-key 5.0e-324)
+                               (Krt.Intrinsics/tuple3 :num (erlang/element 1 r) (erlang/element 2 r))))))
+    (tuple "numeric key: 0.1 and 0.1M do NOT collide"
+           (fn [] (cond (erlang/== (key/semantic-key 0.1) (key/semantic-key 0.1M)) false :else true)))
+    (tuple "numeric key: 1.5 and 1.50M collide (equal numbers)"
+           (fn [] (erlang/== (key/semantic-key 1.5) (key/semantic-key 1.50M))))
+    (tuple "numeric key: 9007199254740992 and its float collide"
+           (fn [] (erlang/== (key/semantic-key 9007199254740992)
+                             (key/semantic-key 9007199254740992.0))))
+    (tuple "numeric key: 9007199254740993 and its float do NOT collide"
+           (fn [] (cond (erlang/== (key/semantic-key 9007199254740993)
+                                   (key/semantic-key 9007199254740993.0)) false :else true)))
+
+    ;; records: ALL map keys except __struct__; type stays in the identity
+    (tuple "record: is classified :record" (fn [] (erlang/== (k/kind r12) :record)))
+    (tuple "record: same type and fields are equal" (fn [] (e/k-eqv r12 r12b)))
+    (tuple "record: assoc'd extra key is part of equality"
+           (fn [] (cond (e/k-eqv r12 r12x) false :else true)))
+    (tuple "record: assoc'd extra key orders non-zero"
+           (fn [] (cond (erlang/== 0 (e/k-compare r12 r12x)) false :else true)))
+    (tuple "record: a different field value is not equal"
+           (fn [] (cond (e/k-eqv r12 r13) false :else true)))
+    (tuple "record: type is part of identity"
+           (fn [] (cond (e/k-eqv r12 r12-other) false :else true)))
+    (tuple "record: a record is not a plain map"
+           (fn [] (cond (e/k-eqv r12 {:x 1 :y 2}) false :else true)))
+    (tuple "record key: equal records share a key"
+           (fn [] (erlang/== (key/semantic-key r12) (key/semantic-key r12b))))
+    (tuple "record key: assoc'd extra key changes the key"
+           (fn [] (cond (erlang/== (key/semantic-key r12) (key/semantic-key r12x)) false :else true)))
+    (tuple "record key: type is part of the key"
+           (fn [] (cond (erlang/== (key/semantic-key r12) (key/semantic-key r12-other)) false :else true)))
+
+    ;; metadata wrapper: transparent to BOTH = and the key, bare value too
+    (tuple "metadata: wrapper equals its bare value"
+           (fn [] (e/k-eqv 1 (tuple :meta 1 {:a 1}))))
+    (tuple "metadata: wrapper equals a bare vector"
+           (fn [] (e/k-eqv [1 2] (tuple :meta [1 2] {:m 1}))))
+    (tuple "metadata: wrapper compares 0 against the bare value"
+           (fn [] (erlang/== 0 (e/k-compare (tuple :meta 1 {:a 1}) 1))))
+    (tuple "metadata: wrapper keys as its bare value"
+           (fn [] (erlang/== (key/semantic-key 1) (key/semantic-key (tuple :meta 1 {:a 1})))))
+    (tuple "metadata: nested wrapper keys through to the bare value"
+           (fn [] (erlang/== (key/semantic-key [1 2])
+                             (key/semantic-key (tuple :meta (tuple :meta [1 2] {:a 1}) {:b 2})))))
+
+    ;; canonical keys preserve cardinality: equal keys are NOT merged
+    (tuple "canonical: equal-key set elements are not merged (BEAM 1 ≠ 1.0)"
+           (fn [] (cond (erlang/== (key/semantic-key #{1 1.0}) (key/semantic-key #{1})) false :else true)))
+    (tuple "canonical: two-element set is not its one-element sibling"
+           (fn [] (cond (e/k-eqv #{1 1.0} #{1}) false :else true)))
+    (tuple "canonical: equal-key map entries are not merged"
+           (fn [] (cond (erlang/== (key/semantic-key {1 :a 1.0 :b}) (key/semantic-key {1 :a})) false :else true)))
+    (tuple "canonical: two-entry map is not its one-entry sibling"
+           (fn [] (cond (e/k-eqv {1 :a 1.0 :b} {1 :a}) false :else true)))))
+
+(defn checks [] (concat (base-checks) (extra-checks)))
+
+;; ── the runner ─────────────────────────────────────────────────────────────
+; A check PASSES only by returning `true`. The old body was `(do (thunk) true)`,
+; which discarded the result and reported a check that returned `false` as a
+; PASS — exactly the defect this harness exists to catch. A raise is a failure
+; too: a check that cannot run has not passed.
+(defn- ok? [thunk]
+  (try
+    (let [v (thunk)]
+      (erlang/== true v))
+    (catch _e false)))
+
+; CANARY. `ok?` cannot be self-tested from inside the check list: a check that
+; returned `false` to expose the bug would itself be read by the buggy `ok?` as
+; a pass. So the harness proves, OUTSIDE the loop, that a false check fails and
+; a true check passes; if `ok?` regresses, `run` raises before any check runs.
+(defn- canary []
+  (cond
+    (ok? (fn [] false))
+    (throw (ex-info "semantic_test canary: ok? accepted a FALSE check" {}))
+    (not (ok? (fn [] true)))
+    (throw (ex-info "semantic_test canary: ok? rejected a TRUE check" {}))
+    (ok? (fn [] (throw (ex-info "canary raise" {}))))
+    (throw (ex-info "semantic_test canary: ok? accepted a RAISING check" {}))
+    :else true))
+
+(defn run []
+  (canary)
+  (loop [cs (checks) n 0 p 0 bad (list)]
+    (cond
+      (empty? cs)
+      (let [fails (count bad)]
+        (println (str "semantic_test: " p "/" n " checks passed"))
+        (doseq [b (reverse bad)] (println (str "  FAIL " b)))
+        (cond
+          (zero? fails) (do (println "semantic_test: OK") :ok)
+          :else (throw (ex-info "semantic_test failures" {:fails fails}))))
+      :else
+      (let [c (first cs)
+            good (ok? (nth c 1))]
+        (recur (rest cs)
+               (inc n)
+               (if good (inc p) p)
+               (if good bad (cons (nth c 0) bad)))))))
+
+(run)

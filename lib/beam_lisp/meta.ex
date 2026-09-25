@@ -106,6 +106,6 @@ defmodule BeamLisp.Meta do
   end
 
   def vary_meta(x, f) do
-    with_meta(x, BeamLisp.RT.invoke(f, [meta(x)]))
+    with_meta(x, BeamLisp.Ns.Rt.invoke(f, [meta(x)]))
   end
 end

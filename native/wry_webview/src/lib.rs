@@ -49,6 +49,15 @@
 //! `:on-message` callback. An init script aliases `bl.send(x)` to
 //! `window.ipc.postMessage`, so the page-side call is short too.
 //!
+//! # Platform chrome
+//!
+//! Wayland has no server-side decorations: a compositor cannot draw a title
+//! bar for a client, so GTK would fall back to a client-side header. This
+//! crate removes that header on every Wayland window, so the app's content is
+//! the whole surface — what a scrollable-tiling compositor (niri, sway) wants.
+//! On X11 the frame belongs to the window manager and `decorations` is honored
+//! as written.
+//!
 //! # Scope (prototype #1)
 //!
 //! ONE window per `open`, driven robustly: open, eval, close, and IPC both
@@ -112,6 +121,25 @@ fn err(msg: impl std::fmt::Display) -> Error {
     Error::Term(Box::new(format!("{}", msg)))
 }
 
+/// The GDK display type of a Wayland client. Named once so the platform rule
+/// and its test cannot drift.
+const WAYLAND_DISPLAY_TYPE: &str = "GdkWaylandDisplay";
+
+/// Whether a GDK display type names the Wayland backend.
+fn is_wayland_display_type(name: &str) -> bool {
+    name == WAYLAND_DISPLAY_TYPE
+}
+
+/// Whether GTK is drawing this window through the Wayland backend.
+///
+/// The GDK display type is the ground truth, never an environment variable:
+/// a session can export `WAYLAND_DISPLAY` while GDK runs on X11 (XWayland, or
+/// `GDK_BACKEND=x11`), and the backend GTK actually chose is the one whose
+/// window behaviour this crate must match.
+fn is_wayland(window: &gtk::ApplicationWindow) -> bool {
+    is_wayland_display_type(window.display().type_().name())
+}
+
 /// The page-side convenience: `bl.send(x)` posts `x` (stringified) back to
 /// beam-lisp. Injected before any page script runs, so a page can rely on it.
 const INIT_SCRIPT: &str = r#"
@@ -128,7 +156,11 @@ window.bl.send = function (msg) {
 /// string. `pid` is the beam-lisp process that receives IPC messages as
 /// `{:wry-ipc, body}`. The trailing options shape the window itself:
 ///
-/// - `decorations`   : false → a frameless window (a statusbar wants this)
+/// - `decorations`   : whether the window manager draws a frame/title bar. On
+///                     Wayland there is no window-manager frame, and the GTK
+///                     client-side header is never drawn: the window is always
+///                     content-only there. On X11 the flag is honored — false
+///                     gives a frameless window (a statusbar wants this).
 /// - `always_on_top`  : true  → floats above other windows (a bar, an overlay)
 /// - `resizable`      : whether the user may resize it
 /// - `x`, `y`         : initial top-left position; `i64::MIN` means "unset",
@@ -285,6 +317,25 @@ fn run_window(
     // strip. All of this MUST be set before the window maps, which is why it
     // happens here, right after build and before the webview/first paint.
     let gtk_win = window.gtk_window();
+
+    // ── chrome: on Wayland the app is the whole window ────────────────────
+    //
+    // A Wayland compositor cannot draw a title bar for a client, so tao
+    // installs a client-side GtkHeaderBar on EVERY Wayland window
+    // (`WlHeader::setup`, gated only on the backend — never on `decorations`).
+    // That header is the extra strip a scrollable-tiling compositor (niri,
+    // sway) shows above the app, and it is pure GTK chrome: on Wayland there
+    // is no window-manager frame for it to stand in for. The product is
+    // content-only there, so drop the injected titlebar and mark the window
+    // undecorated — GDK then allocates no title strip and no client shadow,
+    // and the webview is the whole surface.
+    //
+    // On X11 the frame belongs to the window manager and `decorations` is
+    // honored unchanged, so a decorated window keeps its normal chrome.
+    if is_wayland(gtk_win) {
+        gtk_win.set_titlebar(None::<&gtk::Widget>);
+        gtk_win.set_decorated(false);
+    }
 
     if win.transparent {
         // Give the gtk window an rgba visual and let it paint its own (empty)
@@ -487,3 +538,23 @@ fn load(env: Env, _info: Term) -> bool {
 }
 
 rustler::init!("Elixir.BeamLisp.Native.Wry", load = load);
+
+#[cfg(test)]
+mod platform_chrome {
+    use super::is_wayland_display_type;
+
+    // The platform rule the window chrome rests on: only the Wayland backend
+    // gets a content-only window. A GDK backend that has a real window manager
+    // behind it (X11, macOS) keeps its frame, so the predicate must say so.
+    #[test]
+    fn wayland_gets_content_only() {
+        assert!(is_wayland_display_type("GdkWaylandDisplay"));
+    }
+
+    #[test]
+    fn backends_with_a_window_manager_keep_their_frame() {
+        assert!(!is_wayland_display_type("GdkX11Display"));
+        assert!(!is_wayland_display_type("GdkQuartzDisplay"));
+        assert!(!is_wayland_display_type(""));
+    }
+}

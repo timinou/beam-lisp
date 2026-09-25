@@ -1,6 +1,7 @@
 # Run after building: mix run --no-compile --no-start scripts/bench_lazy_ownership.exs
 # Samples measure map/count in fresh workers, not application startup.
-alias BeamLisp.{LazyMemo, LazySeq, RT}
+alias BeamLisp.{LazyMemo, LazySeq}
+alias BeamLisp.Ns.Rt, as: RT
 
 LazyMemo.ensure_loaded!()
 for size <- [1_000, 2_000, 4_000, 8_000, 32_000] do

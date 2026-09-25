@@ -4,7 +4,8 @@ defmodule BeamLisp.CompilerData do
   or change the collection operations emitted into user programs.
   """
 
-  alias BeamLisp.{RT, Vector}
+  alias BeamLisp.Vector
+  alias BeamLisp.Ns.Rt, as: RT
 
   def eager_map(f, coll), do: Enum.map(eager_to_list(coll), &RT.invoke(f, [&1]))
 

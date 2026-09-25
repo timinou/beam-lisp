@@ -9,7 +9,7 @@ defmodule BeamLisp.Wave15MacroTest do
   # 18/21 are byte-for-byte jank core.jank text, loaded verbatim and
   # called with their own shapes. slice_17 (doseq) loads but does not yet
   # behave: its expansion calls `(steppair 0)` — a vector-as-function, an
-  # RT.invoke gap owned by the runtime (BeamLisp.RT), not this wave.
+  # RT.invoke gap owned by the runtime (BeamLisp.Ns.Rt), not this wave.
   use ExUnit.Case, async: false
 
   alias BeamLisp.{Compiler, Env, Test}
@@ -208,7 +208,7 @@ defmodule BeamLisp.Wave15MacroTest do
       # The doseq macro itself loads: its definition compiles against the
       # macro surface (assert-macro-args, when-let, gensym, cond, nnext…).
       # Behavior is blocked on `(steppair 0)` — a vector used as a function
-      # of its index, an RT.invoke gap (BeamLisp.RT, not this wave).
+      # of its index, an RT.invoke gap (BeamLisp.Ns.Rt, not this wave).
       assert match?({:"$macro", _}, load_slice("slice_17_doseq.bl", "w15.doseq"))
     end
   end

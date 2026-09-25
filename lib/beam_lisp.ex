@@ -19,7 +19,8 @@ defmodule BeamLisp do
       "BEAM-NATIVE"
   """
 
-  alias BeamLisp.{Compiler, Env, RT}
+  alias BeamLisp.{Compiler, Env}
+  alias BeamLisp.Ns.Rt, as: RT
 
   # The prelude ships inside the compiled module, not as a runtime
   # priv file: embedded runtimes (Mob device apps deploy flat .beam
@@ -126,7 +127,17 @@ defmodule BeamLisp do
     ensure_env()
 
     unless Env.seeded?() do
-      RT.seed_core()
+      # 0. The runtime, from its beam, BEFORE it seeds anything. `seed_core/0`
+      #    runs fine off a merely-loaded module, but `rt` must also be a LOADED
+      #    NAMESPACE: its `__bl_init__` records `ns_defs("rt")`. Without that
+      #    record, compiling any `rt` definition in this VM (the boot tier's
+      #    unit rebuild compiles priv/boot/rt.bl) rebuilds the `BeamLisp.Ns.Rt`
+      #    shim from an EMPTY table — measured: 459 exports became 3 mid-build,
+      #    and the compiler's next call into the runtime (`not_/1`) was gone.
+      #    `rt` requires nothing and calls nothing in `core`, so it is the one
+      #    namespace that can intern before `core` exists.
+      BeamLisp.AOT.ensure_loaded("rt")
+      BeamLisp.Ns.Rt.seed_core()
 
       # Prefer the AOT-compiled prelude, exactly as `Loader.ensure_loaded/1`
       # prefers a compiled namespace over its source. `mix compile.beam_lisp`

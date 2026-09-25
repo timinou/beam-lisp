@@ -56,8 +56,8 @@ defmodule BeamLisp.RunCodePathTest do
       BeamLisp.init()
       BeamLisp.Loader.ensure_loaded("bl.cli")
       BeamLisp.Loader.ensure_loaded("bl.util")
-      st = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("bl.cli", "parse-argv"), [argv])
-      BeamLisp.RT.invoke(BeamLisp.Env.fetch!("bl.util", "register-paths"), [st])
+      st = BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("bl.cli", "parse-argv"), [argv])
+      BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("bl.util", "register-paths"), [st])
       BeamLisp.run_file(path)
     end)
   end

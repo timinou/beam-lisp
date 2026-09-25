@@ -1,0 +1,602 @@
+; bench.bl — one kernel, eight entry paths, measured from beam-lisp.
+;
+; WHAT THIS IS. `invm.bench/run` is handed the resident port executable and the
+; text IR the generated kernel was compiled from, and answers one question: for
+; the SAME compiled kernel and the SAME fixtures, what does an entry cost
+; through each supported door —
+;
+;   :rt          fusion.pipeline/rt-run        — the shipped runtime, written as
+;                                                a user would (binary->list
+;                                                inside the timed body).
+;   :beam        fusion.pipeline/fused-run     — the generated Core loop,
+;                                                Elixir.Krt.FusedPipeline.run/2.
+;   :port        fusion.driver/native-request! — the resident j1_probe sidecar,
+;                                                one framed roundtrip per call.
+;   :nif         fusion.invm/kernel-call       — the in-VM regular-scheduler NIF
+;                                                entry. ADMITTED ONLY <= 4096
+;                                                bytes (see THE MATRIX below).
+;   :nif-dirty   fusion.invm/kernel-call-dirty — the same resource through the
+;                                                dirty-CPU entry, 0..1 MiB.
+;   :noop        fusion.invm/kernel-noop       — regular entry that validates
+;                                                and returns `init` untouched:
+;                                                the entry's own overhead.
+;   :noop-dirty  fusion.invm/kernel-noop-dirty — the same on the dirty entry.
+;   :bl-noop     this file's `bl-noop`         — a pure BL function returning
+;                                                `init`: the harness floor. A
+;                                                door that is not cheaper than
+;                                                this is measuring the wrapper.
+;
+; Every variant is handed the SAME binary and the SAME initial accumulator, and
+; every returned value is asserted against fusion.fixtures' oracle — except the
+; three no-op variants, whose kernel output is different BY CONSTRUCTION: their
+; expected value is the INITIAL accumulator, not the fold's result. A run that
+; compares a no-op against the fold would fail; that is the point of recording
+; the two expectations separately.
+;
+; THE MATRIX — regular NIF > 4096 bytes is a POLICY REFUSAL, NOT A TIMING.
+; The regular entry admits at most REGULAR-CAP bytes (the NIF's own contract).
+; For the four ladder sizes above it the matrix records
+;   {:policy :refused-regular-cap-4096 :timing nil}
+; and there is NO sample — a zero there would be a fabricated measurement of a
+; call the entry is not allowed to make. `refusal-rows` then proves the refusal
+; is real by calling the regular entry with 4097 bytes and requiring it to throw.
+;
+; REUSE, NOT A SECOND FRAMEWORK. The port protocol (spawn/READY/one framed
+; roundtrip) and the input contract come from fusion.driver — `spawn-fold!`,
+; `await-ready!`, `native-request!` — which is loaded before this file. Its
+; measure loop is not reused because it is closed over its own three-variant
+; dispatch (`call-adapter`); widening it would mean editing driver.bl, which the
+; task forbids, and would give two code paths for one sample shape.
+;
+; NO CONVERSION ON THE NATIVE PATH. The binary is handed to kernel-call /
+; kernel-call-dirty / the no-ops exactly as it is: Rustler's Binary borrows the
+; existing BEAM binary, so there is no per-call descriptor lookup (the resource
+; is compiled ONCE for the whole warm matrix) and no binary->list conversion.
+; The `:rt` variant is the one that converts, and its adapter cost is inside its
+; own number, as published.
+;
+; WHAT THIS DOES NOT CLAIM. It does not claim scheduling isolation, hard
+; cancellation, or that an entry is safe under all inputs: it measures entries
+; and asserts the refusals it can observe. Cold compile is a dirty-CPU NIF call
+; and the three cold samples are reported separately from the warm matrix; the
+; port's handshake (spawn + IR parse + JIT) is likewise one separate sample. A
+; fast wrong answer fails here rather than later: every measured batch's value
+; is asserted, and the correctness matrix runs all 22 fixtures through every
+; variant (the regular entry skipping the sizes it may not accept).
+;
+; ── RETURNED EVIDENCE (the exact schema) ────────────────────────────────────
+;
+;   {:passed        true            ; reached only if every assertion held
+;    :checks        <int>           ; total assertions, all kinds
+;    :check-counts  {kind <int> :total <int>}   ; :bench/:correctness/:refusal
+;                                               ; /:cold/:warm/:stats
+;    :api           {...}           ; the door names + the policy constants
+;    :ir            {:path <str> :bytes <int>}
+;    :rounds        <int>           ; 5
+;    :variants      [<kw>…]         ; the measured doors, in declared order
+;    :cold          [{:round :ns :probe-value :closed :ir-bytes}]
+;    :cold-ns       [<int>]         ; the same, bare
+;    :port-startup  {:exe <str> :ir <str> :ns <int>}   ; spawn → READY
+;    :stats         {:before {…} :retained {…} :after {…}}   ; invm.host/stats
+;    :stats-checks  {…}             ; the counter invariants actually asserted
+;    :samples       [<sample>]      ; the timing matrix
+;    :correctness   [<row>]         ; every (fixture, variant) value check
+;    :refusals      [<row>]         ; every (input/handle, variant) refusal check
+;    :matrix-refusals [<row>]       ; regular-NIF-large policy rows (no timing)
+;    :summary       [<size-row>]    ; per size: 5 per-call samples + min/max/median
+;    :counts        {…}             ; the matrix shape actually measured
+;                                   ; (:correctness-rows includes the policy rows;
+;                                   ;  :correctness-policy counts those)
+;    :ns            {:bench <int>}  ; wall nanoseconds of the timing matrix
+;    :limits        [<str>…]}       ; what was NOT shown, said plainly
+;
+;   <sample> {:variant :size :round :repeats :ns :inner-ns :value :expected
+;             :reductions :memory-before :memory-after}
+;   <row>    {:variant :tag :mode :size :value :expected :policy}
+;            | {:variant :tag :mode :size :policy :cap}      ; matrix refusal
+;   <size-row> {:size <int>
+;               :variants {<kw> {:samples-ns [<int>] :per-call-ns [<int>]
+;                                 :min-ns :max-ns :median-ns}
+;                          | {:policy :refused-regular-cap-4096 :cap 4096
+;                             :samples-ns [] :timing nil}}
+;               :native-inner-median-ns <int>}   ; the port's own JIT scalar
+
+(ns invm.bench)
+
+;; ── constants ───────────────────────────────────────────────────────────────
+
+(def REGULAR-CAP 4096)     ; the regular NIF entry's documented input cap
+(def COLD-SAMPLES 3)       ; independent compile+close measurements
+(def ROUNDS 5)             ; interleaved timing rounds per (fixture, variant)
+(def MAX-REPEATS 200)      ; a call is repeated at most this many times
+(def REPEAT-BUDGET 65536)  ; bytes·repeats budget: small inputs repeat more
+(def VARIANTS [:rt :beam :port :nif :nif-dirty :noop :noop-dirty :bl-noop])
+(def TALLY-KEY :invm-bench-checks)
+
+;; ── assertions and the check tally ──────────────────────────────────────────
+;;
+;; Same shape as fusion.driver's tally: counted under a kind, and thrown on
+;; every mismatch, with a non-boolean truthy value failing too.
+
+(defn- reset-tally! []
+  (erlang/put TALLY-KEY {})
+  0)
+
+(defn- tally! [kind]
+  (let [counts (erlang/get TALLY-KEY)
+        n (erlang/+ 1 (get counts kind 0))]
+    (erlang/put TALLY-KEY (assoc counts kind n))
+    n))
+
+(defn- tally-count []
+  (let [counts (erlang/get TALLY-KEY)]
+    (assoc counts :total
+           (reduce (fn [a k] (erlang/+ a (get counts k))) 0 (keys counts)))))
+
+(defn- check!
+  "A contract assertion — a value, a refusal, a counter invariant — counted
+   under `kind` and thrown on every mismatch."
+  [kind label ok]
+  (tally! kind)
+  (when (not (erlang/== true ok))
+    (throw (ex-info (str "invm.bench: assertion failed: " label)
+                    {:label label :kind kind :actual ok})))
+  true)
+
+;; ── clocks and process counters ─────────────────────────────────────────────
+
+(defn- now [] (erlang/monotonic_time :nanosecond))
+(defn- reductions [] (elem (erlang/process_info (erlang/self) :reductions) 1))
+(defn- memory [] (elem (erlang/process_info (erlang/self) :memory) 1))
+
+;; ── the doors ───────────────────────────────────────────────────────────────
+
+(defn bl-noop
+  "The pure-BL wrapper control: return `init` without touching `bin`. This is
+   the harness floor, measured so the native entries are read against something
+   that does no work at all."
+  [bin init] init)
+
+(defn- noop-variant?
+  "True for the three entries that return the INITIAL accumulator, not the
+   fold's result — their kernel output is different by construction."
+  [v]
+  (or (erlang/== v :noop) (erlang/== v :noop-dirty) (erlang/== v :bl-noop)))
+
+(defn- runs?
+  "Whether `variant` is admitted at `size`. The regular NIF entry caps at
+   REGULAR-CAP bytes; every other door (and both no-ops, which never touch the
+   buffer) admit the measured ladder."
+  [variant size]
+  (not (and (erlang/== variant :nif) (erlang/> size REGULAR-CAP))))
+
+(defn- expected-for [variant f]
+  (if (noop-variant? variant) (:initial f) (:expected f)))
+
+(defn- call-variant
+  "One call through one door, as {:value v :inner-ns n}. `inner-ns` is non-zero
+   only for :port (the sidecar's own JIT scalar); the in-VM doors report 0 rather
+   than inventing a timer. The binary is passed as-is on the native path — no
+   conversion, and the resource is already compiled."
+  [ctx variant f]
+  (let [bin (:binary f) init (:initial f)]
+    (cond
+      (erlang/== variant :rt) {:value (fusion.pipeline/rt-run bin init) :inner-ns 0}
+      (erlang/== variant :beam) {:value (fusion.pipeline/fused-run bin init) :inner-ns 0}
+      (erlang/== variant :port)
+        (let [r (fusion.driver/native-request! (:port ctx) init bin)]
+          {:value (:value r) :inner-ns (:inner-ns r)})
+      (erlang/== variant :nif)
+        {:value (fusion.invm/kernel-call (:resource ctx) bin init) :inner-ns 0}
+      (erlang/== variant :nif-dirty)
+        {:value (fusion.invm/kernel-call-dirty (:resource ctx) bin init) :inner-ns 0}
+      (erlang/== variant :noop)
+        {:value (fusion.invm/kernel-noop bin init) :inner-ns 0}
+      (erlang/== variant :noop-dirty)
+        {:value (fusion.invm/kernel-noop-dirty bin init) :inner-ns 0}
+      (erlang/== variant :bl-noop) {:value (bl-noop bin init) :inner-ns 0}
+      :else (throw (ex-info (str "invm.bench: unknown variant " (pr-str variant)) {:variant variant})))))
+
+;; ── cold compile: three independent compiles, each closed ───────────────────
+
+(defn- cold-compile-samples
+  "`COLD-SAMPLES` independent compiles of the SAME IR text, each timed alone,
+   each used for exactly one empty-buffer call (proving the freshly compiled
+   kernel answers and that this is the right fragment), then closed. The probe
+   call is OUTSIDE the compile timer."
+  [ir]
+  (into []
+    (map (fn [i]
+           (let [t0 (now)
+                 resource (fusion.invm/kernel-compile ir)
+                 t1 (now)
+                 probe (fusion.invm/kernel-call resource "" 0)
+                 closed (fusion.invm/kernel-close resource)]
+             (check! :cold (str "cold compile " i " answers an empty buffer with initial 0")
+                     (erlang/== 0 probe))
+             (check! :cold (str "cold compile " i " close returns true") (erlang/== true closed))
+             {:round i :ns (erlang/- t1 t0) :ir-bytes (erlang/byte_size ir)
+              :probe-value probe :closed closed}))
+         (range COLD-SAMPLES))))
+
+;; ── the timing matrix ───────────────────────────────────────────────────────
+
+(defn- repeat-count
+  "Repeats for a `size`-byte input: the byte budget divided by the size, floored
+   at 1 (large inputs measured once) and capped at MAX-REPEATS (small inputs
+   measured enough times to leave the clock's floor)."
+  [size]
+  (max 1 (min MAX-REPEATS (quot REPEAT-BUDGET (max 1 size)))))
+
+(defn- rotate [v n]
+  (let [k (erlang/rem n (count v))]
+    (into [] (concat (drop k v) (take k v)))))
+
+(defn- variant-order
+  "Round `round`'s measurement order: rotate so each variant moves through every
+   position across the five rounds, and reverse on odd rounds so no variant is
+   always measured first OR always last. A warm/cold bias therefore lands on a
+   different door each round."
+  [round]
+  (let [rot (rotate VARIANTS round)]
+    (if (erlang/== 1 (erlang/rem round 2)) (into [] (reverse rot)) rot)))
+
+(defn- measure-batch
+  "Time `repeats` calls of one door over one fixture. Records the batch wall
+   time, the summed native inner time (the port's own scalar), the reductions
+   this process consumed, and its memory on both sides. The last call's value is
+   kept; the caller asserts it against the oracle AFTER the timer stops, so the
+   assertion never perturbs the measurement."
+  [ctx variant f repeats]
+  (erlang/garbage_collect)
+  (let [m0 (memory)
+        r0 (reductions)
+        t0 (now)
+        acc (loop [i 0 value nil inner 0]
+              (if (erlang/== i repeats)
+                {:value value :inner-ns inner}
+                (let [r (call-variant ctx variant f)]
+                  (recur (erlang/+ i 1) (:value r) (erlang/+ inner (:inner-ns r))))))
+        t1 (now)]
+    {:ns (erlang/- t1 t0)
+     :value (:value acc)
+     :inner-ns (:inner-ns acc)
+     :reductions (erlang/- (reductions) r0)
+     :memory-before m0
+     :memory-after (memory)}))
+
+(defn- bench-rows
+  "The timing matrix: for every :bench fixture, one warm call per admitted
+   variant, then ROUNDS interleaved batches per variant in the rotated order.
+   Every batch's value is asserted against the fixture's expectation — a fast
+   wrong answer fails here, not in a later pass."
+  [ctx bench]
+  (into []
+    (mapcat
+      (fn [f]
+        (let [size (erlang/byte_size (:binary f))
+              repeats (repeat-count size)]
+          (doseq [v VARIANTS] (when (runs? v size) (call-variant ctx v f)))
+          (into []
+            (mapcat
+              (fn [round]
+                (into []
+                  (mapcat
+                    (fn [v]
+                      (if (runs? v size)
+                        (let [s (measure-batch ctx v f repeats)]
+                          (check! :bench (str "bench value " (pr-str v) " size " size
+                                              " round " round)
+                                  (erlang/== (expected-for v f) (:value s)))
+                          [(assoc s :variant v :size size :round round :repeats repeats
+                                     :expected (expected-for v f))])
+                        []))
+                    (variant-order round))))
+              (range ROUNDS)))))
+      bench)))
+
+;; ── correctness over every fixture, every admitted door ─────────────────────
+
+(defn- correctness-rows
+  "All 22 fixtures through every door, asserted against the oracle (the no-ops
+   against the initial accumulator). The regular entry records a POLICY row for
+   the sizes it may not accept instead of being silently absent."
+  [ctx fixtures]
+  (into []
+    (mapcat
+      (fn [f]
+        (let [size (erlang/byte_size (:binary f))]
+          (into []
+            (mapcat
+              (fn [v]
+                (if (runs? v size)
+                  (let [r (call-variant ctx v f)
+                        want (expected-for v f)]
+                    (check! :correctness (str "value " (pr-str v) " fixture " (:tag f))
+                            (erlang/== want (:value r)))
+                    [{:variant v :tag (:tag f) :mode (:mode f) :size size
+                      :value (:value r) :expected want :policy :measured}])
+                  [{:variant v :tag (:tag f) :mode (:mode f) :size size
+                    :policy :refused-regular-cap-4096 :cap REGULAR-CAP}]))
+              VARIANTS))))
+      fixtures)))
+
+;; ── the matrix's explicit policy refusals ───────────────────────────────────
+
+(defn- policy-refusals
+  "Regular-NIF rows for bench sizes above REGULAR-CAP: a refusal, never a zero."
+  [bench]
+  (into []
+    (mapcat
+      (fn [f]
+        (let [size (erlang/byte_size (:binary f))]
+          (if (erlang/> size REGULAR-CAP)
+            [{:variant :nif :size size :cap REGULAR-CAP :policy :refused-regular-cap-4096
+              :timing nil
+              :reason (str "the regular NIF entry admits at most " REGULAR-CAP
+                           " bytes; " size " bytes is a POLICY REFUSAL, not a zero-time sample")}]
+            [])))
+      bench)))
+
+;; ── the refusals that are real calls ────────────────────────────────────────
+
+(defn- refuses? [thunk]
+  (try (do (thunk) false) (catch e true)))
+
+(defn- refusal-rows
+  "Invalid handles, invalid initial accumulators, oversized inputs, and the
+   regular entry above its cap — each must THROW. A door that answers here is
+   the failure. Every case is recorded with whether it refused."
+  [ctx ir]
+  (let [resource (:resource ctx)
+        port (:port ctx)
+        big (binary/copy (erlang/list_to_binary (list 0)) (erlang/+ fusion.fixtures/MAX-BYTES 1))
+        over-regular (binary/copy (erlang/list_to_binary (list 0)) (erlang/+ REGULAR-CAP 1))
+        closed (let [r (fusion.invm/kernel-compile ir)]
+                 (fusion.invm/kernel-close r)
+                 r)
+        cases
+        [{:case "handle-closed" :variant :nif
+          :call (fn [] (fusion.invm/kernel-call closed "" 0))}
+         {:case "handle-forged-binary" :variant :nif
+          :call (fn [] (fusion.invm/kernel-call "not-a-resource" "" 0))}
+         {:case "handle-forged-integer" :variant :nif-dirty
+          :call (fn [] (fusion.invm/kernel-call-dirty 42 "" 0))}
+         {:case "buffer-nonbinary" :variant :nif
+          :call (fn [] (fusion.invm/kernel-call resource :not-a-binary 0))}
+         {:case "init-float" :variant :nif
+          :call (fn [] (fusion.invm/kernel-call resource "" 1.5))}
+         {:case "init-negative" :variant :nif
+          :call (fn [] (fusion.invm/kernel-call resource "" -1))}
+         {:case "init>u64" :variant :nif
+          :call (fn [] (fusion.invm/kernel-call resource "" (erlang/+ fusion.fixtures/U64 1)))}
+         {:case "init-noninteger" :variant :nif
+          :call (fn [] (fusion.invm/kernel-call resource "" "0"))}
+         {:case "buffer>regular-cap" :variant :nif
+          :call (fn [] (fusion.invm/kernel-call resource over-regular 0))}
+         {:case "buffer>1MiB" :variant :nif-dirty
+          :call (fn [] (fusion.invm/kernel-call-dirty resource big 0))}
+         {:case "noop-buffer>1MiB" :variant :noop
+          :call (fn [] (fusion.invm/kernel-noop big 0))}
+         {:case "noop-dirty-init-negative" :variant :noop-dirty
+          :call (fn [] (fusion.invm/kernel-noop-dirty "" -1))}
+         {:case "port-buffer>1MiB" :variant :port
+          :call (fn [] (fusion.driver/native-request! port 0 big))}
+         {:case "port-init-negative" :variant :port
+          :call (fn [] (fusion.driver/native-request! port -1 ""))}
+         {:case "rt-buffer>1MiB" :variant :rt
+          :call (fn [] (fusion.pipeline/rt-run big 0))}
+         {:case "beam-buffer>1MiB" :variant :beam
+          :call (fn [] (fusion.pipeline/fused-run big 0))}]
+        rows
+        (mapv (fn [c]
+                (let [threw (refuses? (:call c))]
+                  (check! :refusal (str "refusal " (:variant c) " " (:case c)) threw)
+                  {:variant (:variant c) :case (:case c) :refused threw}))
+              cases)]
+    {:rows rows
+     :refused (count (filterv (fn [r] (erlang/== true (:refused r))) rows))
+     :total (count rows)}))
+
+;; ── aggregation ─────────────────────────────────────────────────────────────
+
+(defn- median [xs]
+  (let [ordered (into [] (sort xs))]
+    (nth ordered (quot (count ordered) 2))))
+
+(defn- per-call-ns [samples size variant]
+  (into []
+    (map (fn [s] (quot (:ns s) (:repeats s)))
+         (filterv (fn [s] (and (erlang/== size (:size s))
+                               (erlang/== variant (:variant s))))
+                  samples))))
+
+(defn- per-call-inner [samples size]
+  (into []
+    (map (fn [s] (quot (:inner-ns s) (:repeats s)))
+         (filterv (fn [s] (and (erlang/== size (:size s))
+                               (erlang/== :port (:variant s))))
+                  samples))))
+
+(defn- stats-for [acc]
+  (if (empty? acc)
+    {:samples-ns [] :per-call-ns [] :timing nil :policy :not-measured
+     :min-ns nil :max-ns nil :median-ns nil}
+    {:samples-ns acc :per-call-ns acc :timing :measured :policy :measured
+     :min-ns (reduce min acc) :max-ns (reduce max acc) :median-ns (median acc)}))
+
+(defn- summarize
+  "Per bench size: the five per-call samples and their min/max/median for each
+   door, or the explicit POLICY row when the regular entry may not be called.
+   Exposed as data so a caller can re-derive anything the printed table drops."
+  [samples bench]
+  (mapv
+    (fn [f]
+      (let [size (erlang/byte_size (:binary f))]
+        {:size size
+         :variants
+           (into {}
+             (map (fn [v]
+                    [v (if (runs? v size)
+                         (stats-for (per-call-ns samples size v))
+                         {:policy :refused-regular-cap-4096 :cap REGULAR-CAP
+                          :samples-ns [] :per-call-ns [] :timing nil
+                          :min-ns nil :max-ns nil :median-ns nil})])
+                  VARIANTS))
+         :native-inner-median-ns (let [xs (per-call-inner samples size)]
+                                   (if (empty? xs) nil (median xs)))}))
+    bench))
+
+;; ── the human table (from captured data — no rerun) ─────────────────────────
+
+(defn- us [v] (if (nil? v) "refused" (/ v 1000.0)))
+
+(defn- print-table [summary cold port-startup refusals]
+  (println "bytes | rt us | beam us | port us | nif us | nif-dirty us | noop us | noop-dirty us | bl-noop us | regular")
+  (doseq [row summary]
+    (let [vs (:variants row)
+          m (fn [v] (:median-ns (get vs v)))]
+      (println (str (:size row)
+                    " | " (us (m :rt))
+                    " | " (us (m :beam))
+                    " | " (us (m :port))
+                    " | " (us (m :nif))
+                    " | " (us (m :nif-dirty))
+                    " | " (us (m :noop))
+                    " | " (us (m :noop-dirty))
+                    " | " (us (m :bl-noop))
+                    " | " (let [entry (get vs :nif)]
+                            (if (erlang/== :refused-regular-cap-4096 (:policy entry))
+                              "refused"
+                              "measured"))))))
+  (println (str "cold-compile-ns=" (pr-str (mapv (fn [c] (:ns c)) cold))))
+  (println (str "port-startup-ns=" (:ns port-startup)))
+  (println (str "input-refusals=" (:refused refusals) "/" (:total refusals))))
+
+;; ── the diagnostics shape ───────────────────────────────────────────────────
+
+(defn- stats-shape!
+  "The ONE shape this file accepts from invm.host/stats — the normalized map
+   {:created :live :freed :inflight}. Asserted, not pattern-matched, so an
+   unnormalized counter tuple fails by name instead of turning into arithmetic
+   on nil."
+  [s]
+  (check! :stats "invm.host/stats returns the normalized {:created :live :freed :inflight} map"
+          (and (erlang/is_map s)
+               (contains? s :created) (contains? s :live)
+               (contains? s :freed) (contains? s :inflight)))
+  s)
+
+;; ── the entry point ─────────────────────────────────────────────────────────
+
+(defn run
+  "Measure every door over the shared fixtures and return the evidence map
+   described at the top of this file. Reads the IR text ONCE; the port is
+   spawned once and closed in a `finally`; the retained NIF resource is closed
+   in a `finally` even when the port half fails. No exception is swallowed."
+  [port-exe ir-path]
+  (reset-tally!)
+  (let [ir (File/read! ir-path)
+        stats-before (stats-shape! (invm.host/stats))
+        cold (cold-compile-samples ir)
+        resource (fusion.invm/kernel-compile ir)
+        stats-retained (stats-shape! (invm.host/stats))
+        body
+          (try
+            (let [t0 (now)
+                  port (fusion.driver/spawn-fold! port-exe ir-path)
+                  measured
+                    (try
+                      (fusion.driver/await-ready! port)
+                      (let [port-ns (erlang/- (now) t0)
+                            ctx {:resource resource :port port}
+                            warm (fusion.invm/kernel-call resource "" 0)
+                            fixtures (fusion.fixtures/make)
+                            bench (fusion.fixtures/bench-fixtures)
+                            correctness (correctness-rows ctx fixtures)
+                            samples (bench-rows ctx bench)
+                            refusals (refusal-rows ctx ir)
+                            policy (policy-refusals bench)
+                            summary (summarize samples bench)]
+                        (check! :warm "the retained kernel answers an empty buffer with initial 0"
+                                (erlang/== 0 warm))
+                        {:port-ns port-ns :warm warm :fixtures fixtures :bench bench
+                         :correctness correctness :samples samples :refusals refusals
+                         :policy policy :summary summary})
+                      (finally (Port/close port)))]
+              measured)
+            (finally (fusion.invm/kernel-close resource)))
+        stats-after (stats-shape! (invm.host/stats))
+        stats-checks
+          {:before-inflight-zero (erlang/== 0 (:inflight stats-before))
+           :retained-inflight-zero (erlang/== 0 (:inflight stats-retained))
+           :after-inflight-zero (erlang/== 0 (:inflight stats-after))
+           :live-restored (erlang/== (:live stats-before) (:live stats-after))
+           :created-delta (erlang/- (:created stats-after) (:created stats-before))
+           :freed-delta (erlang/- (:freed stats-after) (:freed stats-before))}
+        _ (check! :stats "no call is in flight before the run" (:before-inflight-zero stats-checks))
+        _ (check! :stats "no call is in flight while the resource is retained"
+                  (:retained-inflight-zero stats-checks))
+        _ (check! :stats "no call is in flight after every resource is closed"
+                  (:after-inflight-zero stats-checks))
+        _ (check! :stats "the live count returns to its starting value"
+                  (:live-restored stats-checks))
+        _ (check! :stats "every created kernel is actually freed"
+                  (and (>= (:created-delta stats-checks) (erlang/+ COLD-SAMPLES 1))
+                       (erlang/== (:freed-delta stats-checks) (:created-delta stats-checks))))
+        samples (:samples body)
+        tally (tally-count)
+        bench-ns (reduce (fn [a s] (erlang/+ a (:ns s))) 0 samples)
+        result
+          {:passed true
+           :checks (:total tally)
+           :check-counts tally
+           :api {:variants VARIANTS
+                 :regular-cap REGULAR-CAP
+                 :max-bytes fusion.fixtures/MAX-BYTES
+                 :entries {:rt "fusion.pipeline/rt-run"
+                           :beam "fusion.pipeline/fused-run"
+                           :port "fusion.driver/native-request!"
+                           :nif "fusion.invm/kernel-call"
+                           :nif-dirty "fusion.invm/kernel-call-dirty"
+                           :noop "fusion.invm/kernel-noop"
+                           :noop-dirty "fusion.invm/kernel-noop-dirty"
+                           :bl-noop "invm.bench/bl-noop"}}
+           :ir {:path ir-path :bytes (erlang/byte_size ir)}
+           :rounds ROUNDS
+           :variants VARIANTS
+           :cold cold
+           :cold-ns (into [] (map (fn [c] (:ns c)) cold))
+           :port-startup {:exe port-exe :ir ir-path :ns (:port-ns body)}
+           :stats {:before stats-before :retained stats-retained :after stats-after}
+           :stats-checks stats-checks
+           :samples samples
+           :correctness (:correctness body)
+           :refusals (:refusals body)
+           :matrix-refusals (:policy body)
+           :summary (:summary body)
+           :counts {:fixtures (count (:fixtures body))
+                    :bench-fixtures (count (:bench body))
+                    :variants (count VARIANTS)
+                    :rounds ROUNDS
+                    :cold-samples COLD-SAMPLES
+                    :samples (count samples)
+                    :correctness-rows (count (:correctness body))
+                    :correctness-policy (count (filterv (fn [r] (erlang/== :refused-regular-cap-4096 (:policy r)))
+                                                        (:correctness body)))
+                    :refusal-cases (:total (:refusals body))
+                    :matrix-refusals (count (:policy body))
+                    :regular-cap REGULAR-CAP}
+           :ns {:bench bench-ns}
+           :limits ["Cold compile and the port handshake are measured separately from the warm matrix."
+                    "The regular NIF entry above 4096 bytes is a POLICY REFUSAL with no timing — never a zero."
+                    "Scheduling isolation, hard cancellation and crash isolation are NOT measured here."
+                    "The pure-BL :bl-noop row is the harness floor, not a kernel."]}
+        _ (print-table (:summary body) cold (:port-startup result) (:refusals body))]
+    (println (str "PASS invm bench: checks=" (:checks result)
+                  " samples=" (count samples)
+                  " cold-ns=" (pr-str (:cold-ns result))
+                  " port-startup-ns=" (:ns (:port-startup result))
+                  " refusals=" (:refused (:refusals body)) "/" (:total (:refusals body))
+                  " matrix-refusals=" (count (:policy body))))
+    result))

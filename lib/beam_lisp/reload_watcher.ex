@@ -246,7 +246,7 @@ defmodule BeamLisp.ReloadWatcher do
   # implementations of one debounce is the thing this seam exists to abolish.
   defp start_debounce(quiet_ms) do
     BeamLisp.Loader.ensure_loaded("reload")
-    {:ok, BeamLisp.RT.invoke(BeamLisp.Env.fetch!("reload", "watch-debounce-start"), [quiet_ms])}
+    {:ok, BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("reload", "watch-debounce-start"), [quiet_ms])}
   rescue
     e -> {:error, Exception.message(e)}
   end

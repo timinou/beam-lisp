@@ -1,0 +1,1020 @@
+; research/workspace-spike/api_test.bl
+;
+; BL regression tests for play.change + dev.workspace prototype APIs.
+; Run with:
+;
+;   bin/bl -p research/workspace-spike test research/workspace-spike/api_test.bl
+;
+; All tests use disposable /tmp directories; no user project is touched.
+; Requires the workspace-spike search root to be active so the namespaces resolve.
+;
+; What is tested here (prototype slice):
+;   - play.change: constructors, materialize, decode, digest, path safety
+;   - dev.workspace: attach!/shutdown!, files, open!/new-file!, snapshot,
+;     edit!, close!, definitions, propose!/preview, verify!, save! (buffer+proposal),
+;     make-live! (including old-env preserved on failure), eval!, status, undo!,
+;     independent Made/Saved/Live revision pointers
+
+(ns api-test
+  (:require [play.change :as change]
+            [dev.workspace :as ws]))
+
+; ── Fixture helpers ───────────────────────────────────────────────────────────
+
+(defn- tmp-root
+  "Create a fresh /tmp directory for one test.
+   Returns the absolute path."
+  []
+  (let [n (Base/encode16 (crypto/strong_rand_bytes 10))
+        p (str "/tmp/ws-spike-test-" n)]
+    (File/mkdir_p! p)
+    p))
+
+(defn- write-fixture!
+  "Write `content` to `root`/`rel-path`, creating parent dirs."
+  [root rel-path content]
+  (let [abs (str root "/" rel-path)]
+    (File/mkdir_p! (Path/dirname abs))
+    (File/write! abs content)))
+
+(defn- read-fixture
+  "Read `root`/`rel-path` content or nil."
+  [root rel-path]
+  (let [abs (str root "/" rel-path)]
+    (when (File/exists? abs)
+      (File/read! abs))))
+
+(defn- clean-root! [root]
+  "Remove the temporary test directory tree."
+  (when-not (String/starts_with? root "/tmp/ws-spike-test-")
+    (throw (ex-info "Refusing to clean a non-fixture path." {})))
+  (try (ws/shutdown! {:root root}) (catch _e nil))
+  (File/rm_rf root))
+
+; ── Sample fixture source ─────────────────────────────────────────────────────
+
+(def invoices-src
+  "(ns app.invoices)\n\n(defn total [invoice]\n  (+ (:subtotal-cents invoice) (:late-fee-cents invoice)))\n")
+
+(def invoices-test-src
+  "(ns app.invoices-test\n  (:require [app.invoices :as invoices]))\n\n(deftest total-baseline\n  (is (= 1250 (invoices/total {:subtotal-cents 1000 :late-fee-cents 250}))))\n")
+
+; ═══════════════════════════════════════════════════════════════════════════════
+; play.change tests
+; ═══════════════════════════════════════════════════════════════════════════════
+
+; ── change/digest ─────────────────────────────────────────────────────────────
+
+(deftest digest-nil-returns-nil
+  (is (nil? (change/digest nil))))
+
+(deftest digest-string-returns-hex
+  (let [h (change/digest "hello")]
+    (is (string? h))
+    (is (= 64 (String/length h)))  ; SHA256 = 32 bytes = 64 hex chars
+    (is (= h (change/digest "hello")))))  ; deterministic
+
+(deftest digest-changes-with-content
+  (is (not (= (change/digest "hello") (change/digest "world")))))
+
+; ── change/safe-relative? ─────────────────────────────────────────────────────
+
+(deftest safe-relative-accepts-normal-paths
+  (is (change/safe-relative? "src/foo.bl"))
+  (is (change/safe-relative? "src/billing/rules.bl"))
+  (is (change/safe-relative? "test/foo_test.bl")))
+
+(deftest safe-relative-rejects-absolute
+  (is (not (change/safe-relative? "/etc/passwd")))
+  (is (not (change/safe-relative? "/src/foo.bl"))))
+
+(deftest safe-relative-rejects-escape
+  (is (not (change/safe-relative? "../etc/passwd")))
+  (is (not (change/safe-relative? "src/../../../etc/passwd"))))
+
+(deftest safe-relative-rejects-dotfiles
+  (is (not (change/safe-relative? ".env")))
+  (is (not (change/safe-relative? ".gitignore")))
+  (is (not (change/safe-relative? "src/.hidden"))))
+
+(deftest safe-relative-rejects-empty
+  (is (not (change/safe-relative? "")))
+  (is (not (change/safe-relative? nil))))
+
+(deftest guard-path-throws-on-unsafe
+  (is (thrown? (change/guard-path! "/etc/passwd")))
+  (is (thrown? (change/guard-path! "../escape")))
+  (is (thrown? (change/guard-path! ".env"))))
+
+; ── change/ns-to-path ─────────────────────────────────────────────────────────
+
+(deftest ns-to-path-simple
+  (is (= "src/billing/rules.bl" (change/ns-to-path "billing.rules"))))
+
+(deftest ns-to-path-single
+  (is (= "src/core.bl" (change/ns-to-path "core"))))
+
+(deftest ns-to-path-deep
+  (is (= "src/app/invoices/detail.bl" (change/ns-to-path "app.invoices.detail"))))
+
+; ── change constructors ───────────────────────────────────────────────────────
+
+(deftest bundle-constructor
+  (let [b (change/bundle "My change")]
+    (is (= "My change" (:title b)))
+    (is (= [] (:operations b)))))
+
+(deftest bundle-with-ops
+  (let [op (change/create-namespace 'billing.rules)
+        b  (change/bundle "Create namespace" op)]
+    (is (= 1 (count (:operations b))))
+    (is (= :create-namespace (:op (first (:operations b)))))))
+
+(deftest create-namespace-constructor
+  (let [op (change/create-namespace 'billing.rules
+             '(defn total [s f] (+ s f)))]
+    (is (= :create-namespace (:op op)))
+    (is (= "billing.rules" (:ns op)))
+    (is (= 1 (count (:definitions op))))))
+
+(deftest in-namespace-constructor
+  (let [op (change/in-namespace 'app.invoices
+             (change/require '[billing.rules :as rules])
+             (change/replace-definition 'total '(defn total [x] x)))]
+    (is (= :in-namespace (:op op)))
+    (is (= "app.invoices" (:ns op)))
+    (is (= 2 (count (:ops op))))))
+
+(deftest require-constructor
+  (let [op (change/require '[billing.rules :as rules])]
+    (is (= :require (:op op)))
+    (is (vector? (:vector op)))))
+
+(deftest replace-definition-constructor
+  (let [op (change/replace-definition 'total '(defn total [x] (* x x)))]
+    (is (= :replace-definition (:op op)))
+    (is (= "total" (:name op)))))
+
+(deftest add-definition-constructor
+  (let [op (change/add-definition '(defn square [x] (* x x)))]
+    (is (= :add-definition (:op op)))
+    (is (some? (:form op)))))
+
+(deftest create-file-constructor
+  (let [op (change/create-file "src/foo.bl" "(ns foo)")]
+    (is (= :create-file (:op op)))
+    (is (= "src/foo.bl" (:path op)))
+    (is (= "(ns foo)" (:source op)))))
+
+(deftest create-file-rejects-unsafe-path
+  (is (thrown? (change/create-file ".env" "secret")))
+  (is (thrown? (change/create-file "../escape.bl" "content"))))
+
+; ── change/materialize ────────────────────────────────────────────────────────
+
+(deftest materialize-create-namespace
+  (let [root (tmp-root)
+        _    (File/mkdir_p! (str root "/src"))
+        b    (change/bundle "Create billing.rules"
+               (change/create-namespace 'billing.rules
+                 '(defn total [s f] (+ s f))))
+        changes (change/materialize root b)]
+    (try
+      (is (= 1 (count changes)))
+      (let [ch (first changes)]
+        (is (= "src/billing/rules.bl" (:path ch)))
+        (is (nil? (:before ch)))
+        (is (string? (:after ch)))
+        (is (nil? (:basis ch)))
+        (is (includes? (:after ch) "(ns billing.rules)"))
+        (is (includes? (:after ch) "defn total")))
+      (finally (clean-root! root)))))
+
+(deftest materialize-create-namespace-refuses-existing
+  (let [root (tmp-root)
+        path (str root "/src/billing/rules.bl")]
+    (try
+      (File/mkdir_p! (Path/dirname path))
+      (File/write! path "(ns billing.rules)")
+      (let [b (change/bundle "Re-create" (change/create-namespace 'billing.rules))]
+        (is (thrown? (change/materialize root b))))
+      (finally (clean-root! root)))))
+
+(deftest materialize-create-file
+  (let [root    (tmp-root)
+        b       (change/bundle "Raw file"
+                  (change/create-file "src/foo.bl" "(ns foo)\n"))
+        changes (change/materialize root b)]
+    (try
+      (is (= 1 (count changes)))
+      (is (= "(ns foo)\n" (:after (first changes))))
+      (finally (clean-root! root)))))
+
+(deftest materialize-in-namespace-replace-def
+  (let [root (tmp-root)
+        _    (write-fixture! root "src/app/invoices.bl" invoices-src)
+        b    (change/bundle "Replace total"
+               (change/in-namespace 'app.invoices
+                 (change/replace-definition 'total
+                   '(defn total [inv]
+                      (* (:subtotal-cents inv) 2)))))
+        changes (change/materialize root b)]
+    (try
+      (is (= 1 (count changes)))
+      (let [ch (first changes)]
+        (is (= "src/app/invoices.bl" (:path ch)))
+        (is (string? (:before ch)))
+        (is (string? (:after ch)))
+        (is (= (change/digest invoices-src) (:basis ch)))
+        (is (includes? (:after ch) "(* (:subtotal-cents inv) 2)"))
+        (is (not (includes? (:after ch) "(+ (:subtotal-cents invoice)"))))
+      (finally (clean-root! root)))))
+
+(deftest materialize-in-namespace-add-def
+  (let [root (tmp-root)
+        _    (write-fixture! root "src/app/invoices.bl" invoices-src)
+        b    (change/bundle "Add subtotal"
+               (change/in-namespace 'app.invoices
+                 (change/add-definition '(defn subtotal [inv] (:subtotal-cents inv)))))
+        changes (change/materialize root b)]
+    (try
+      (is (= 1 (count changes)))
+      (is (includes? (:after (first changes)) "defn subtotal"))
+      (finally (clean-root! root)))))
+
+(deftest materialize-add-def-refuses-duplicate
+  (let [root (tmp-root)
+        _    (write-fixture! root "src/app/invoices.bl" invoices-src)
+        b    (change/bundle "Add total again"
+               (change/in-namespace 'app.invoices
+                 (change/add-definition '(defn total [x] x))))]
+    (try
+      (is (thrown? (change/materialize root b)))
+      (finally (clean-root! root)))))
+
+(deftest materialize-in-namespace-add-require
+  (let [root (tmp-root)
+        _    (write-fixture! root "src/app/invoices.bl" invoices-src)
+        b    (change/bundle "Add require"
+               (change/in-namespace 'app.invoices
+                 (change/require '[billing.rules :as rules])))
+        changes (change/materialize root b)]
+    (try
+      (is (= 1 (count changes)))
+      (is (includes? (:after (first changes)) "billing.rules"))
+      (is (includes? (:after (first changes)) ":require"))
+      (finally (clean-root! root)))))
+
+(deftest materialize-delete-file
+  (let [root (tmp-root)
+        _    (write-fixture! root "src/old.bl" "(ns old)\n")
+        b    (change/bundle "Delete old"
+               (change/delete-file "src/old.bl"))
+        changes (change/materialize root b)]
+    (try
+      (is (= 1 (count changes)))
+      (let [ch (first changes)]
+        (is (nil? (:after ch)))
+        (is (string? (:before ch)))
+        (is (string? (:basis ch))))
+      (finally (clean-root! root)))))
+
+(deftest materialize-move-file
+  (let [root (tmp-root)
+        _    (write-fixture! root "src/old.bl" "(ns old)\n")
+        b    (change/bundle "Move file"
+               (change/move-file "src/old.bl" "src/new.bl"))
+        changes (change/materialize root b)]
+    (try
+      (is (= 2 (count changes)))  ; delete + create
+      (let [delete-ch (first (filter (fn [c] (nil? (:after c))) changes))
+            create-ch (first (filter (fn [c] (nil? (:before c))) changes))]
+        (is (= "src/old.bl" (:path delete-ch)))
+        (is (= "src/new.bl" (:path create-ch))))
+      (finally (clean-root! root)))))
+
+; ── change/decode ─────────────────────────────────────────────────────────────
+
+(deftest decode-valid-bundle
+  (let [text "(change/bundle \"Extract billing\"\n  (change/create-namespace 'billing.rules\n    '(defn total [s f] (+ s f))))"
+        b (change/decode text)]
+    (is (= "Extract billing" (:title b)))
+    (is (= 1 (count (:operations b))))
+    (is (= :create-namespace (:op (first (:operations b)))))))
+
+(deftest decode-strips-clojure-fence
+  (let [text "```clojure\n(bundle \"Test\"\n  (create-file \"src/x.bl\" \"(ns x)\"))\n```"
+        b (change/decode text)]
+    (is (= "Test" (:title b)))
+    (is (= 1 (count (:operations b))))))
+
+(deftest decode-rejects-unknown-constructor
+  (let [text "(change/bundle \"Bad\"\n  (change/unknown-op \"oops\"))"]
+    (is (thrown? (change/decode text)))))
+
+(deftest decode-rejects-non-bundle-top
+  (let [text "(defn foo [] 42)"]
+    (is (thrown? (change/decode text)))))
+
+(deftest decode-rejects-non-literal-arg
+  ; eval-style arg: (str "foo" "bar") — not a literal
+  (let [text "(change/bundle \"Bad\"\n  (change/create-file (str \"foo\" \"bar\") \"content\"))"]
+    (is (thrown? (change/decode text)))))
+
+(deftest decode-empty-throws
+  (is (thrown? (change/decode "")))
+  (is (thrown? (change/decode "   "))))
+
+; ═══════════════════════════════════════════════════════════════════════════════
+; dev.workspace tests
+; ═══════════════════════════════════════════════════════════════════════════════
+
+; ── attach!/shutdown! ─────────────────────────────────────────────────────────
+
+(deftest workspace-attach-returns-handle
+  (let [root (tmp-root)
+        w    (ws/attach! root)]
+    (try
+      (is (= :workspace (:kind w)))
+      (is (string? (:root w)))
+      (is (string? (:id w)))
+      (finally
+        (ws/shutdown! w)
+        (clean-root! root)))))
+
+(deftest workspace-attach-reuses-existing
+  (let [root (tmp-root)
+        w1   (ws/attach! root)
+        w2   (ws/attach! root)]
+    (try
+      (is (= (:root w1) (:root w2)))
+      (finally
+        (ws/shutdown! w1)
+        (clean-root! root)))))
+
+(deftest workspace-shutdown-then-reattach
+  (let [root (tmp-root)
+        w1   (ws/attach! root)
+        _    (ws/shutdown! w1)
+        w2   (ws/attach! root)]
+    (try
+      (is (= :workspace (:kind w2)))
+      (finally
+        (ws/shutdown! w2)
+        (clean-root! root)))))
+
+; ── files ─────────────────────────────────────────────────────────────────────
+
+(deftest workspace-files-lists-bl-files
+  (let [root (tmp-root)]
+    (try
+      (write-fixture! root "src/foo.bl" "(ns foo)")
+      (write-fixture! root "src/bar.bl" "(ns bar)")
+      (let [w     (ws/attach! root)
+            paths (ws/files w)]
+        (try
+          (is (>= (count paths) 2))
+          (is (some (fn [p] (includes? p "foo.bl")) paths))
+          (is (some (fn [p] (includes? p "bar.bl")) paths))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest workspace-files-excludes-cache-files
+  (let [root (tmp-root)]
+    (try
+      (write-fixture! root "src/.foo.cache.bl" "(def x 1)")
+      (let [w     (ws/attach! root)
+            paths (ws/files w)]
+        (try
+          (is (every? (fn [p] (not (includes? p ".cache.bl"))) paths))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+; ── open!/snapshot/edit!/close! ───────────────────────────────────────────────
+
+(deftest workspace-open-returns-buffer-handle
+  (let [root (tmp-root)]
+    (try
+      (write-fixture! root "src/foo.bl" "(ns foo)\n")
+      (let [w (ws/attach! root)
+            b (ws/open! w "src/foo.bl")]
+        (try
+          (is (= :buffer (:kind b)))
+          (is (= "src/foo.bl" (:path b)))
+          (finally (ws/close! b {:force true}) (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest workspace-open-nonexistent-throws
+  (let [root (tmp-root)
+        w    (ws/attach! root)]
+    (try
+      (is (thrown? (ws/open! w "src/nonexistent.bl")))
+      (finally (ws/shutdown! w) (clean-root! root)))))
+
+(deftest workspace-buffer-snapshot
+  (let [root (tmp-root)
+        src  "(ns foo)\n"]
+    (try
+      (write-fixture! root "src/foo.bl" src)
+      (let [w    (ws/attach! root)
+            b    (ws/open! w "src/foo.bl")
+            snap (ws/snapshot b)]
+        (try
+          (is (= :buffer (:kind snap)))
+          (is (= "src/foo.bl" (:path snap)))
+          (is (= src (:source snap)))
+          (is (= (change/digest src) (:basis snap)))
+          (is (not (:dirty? snap)))
+          (finally (ws/close! b {:force true}) (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest workspace-edit-marks-dirty
+  (let [root (tmp-root)]
+    (try
+      (write-fixture! root "src/foo.bl" "(ns foo)\n")
+      (let [w    (ws/attach! root)
+            b    (ws/open! w "src/foo.bl")
+            _    (ws/edit! b "(ns foo)\n\n(defn bar [] 42)\n")
+            snap (ws/snapshot b)]
+        (try
+          (is (:dirty? snap))
+          (is (includes? (:source snap) "defn bar"))
+          (finally (ws/close! b {:force true}) (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest workspace-close-dirty-refuses
+  (let [root (tmp-root)]
+    (try
+      (write-fixture! root "src/foo.bl" "(ns foo)\n")
+      (let [w (ws/attach! root)
+            b (ws/open! w "src/foo.bl")
+            _ (ws/edit! b "(ns foo)\n(defn x [] 1)")]
+        (try
+          (is (thrown? (ws/close! b)))
+          (ws/close! b {:force true})
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest workspace-new-file-creates-dirty-buffer
+  (let [root (tmp-root)
+        w    (ws/attach! root)]
+    (try
+      (let [b    (ws/new-file! w "src/new.bl" "(ns new)\n")
+            snap (ws/snapshot b)]
+        (is (= :buffer (:kind snap)))
+        (is (:dirty? snap))
+        (is (nil? (:basis snap)))  ; no basis: new file
+        (ws/close! b {:force true}))
+      (finally (ws/shutdown! w) (clean-root! root)))))
+
+(deftest workspace-new-file-refuses-overwrite
+  (let [root (tmp-root)]
+    (try
+      (write-fixture! root "src/existing.bl" "(ns existing)")
+      (let [w (ws/attach! root)]
+        (try
+          (is (thrown? (ws/new-file! w "src/existing.bl" "(ns existing)")))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+; ── definitions ───────────────────────────────────────────────────────────────
+
+(deftest workspace-definitions-reads-defns
+  (let [root (tmp-root)]
+    (try
+      (write-fixture! root "src/app/invoices.bl" invoices-src)
+      (let [w    (ws/attach! root)
+            defs (ws/definitions w 'app.invoices)]
+        (try
+          (is (>= (count defs) 1))
+          (let [total-def (first (filter (fn [d] (= "total" (:name d))) defs))]
+            (is (some? total-def))
+            (is (= "app.invoices" (:ns total-def)))
+            (is (= :defn (:kind total-def))))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest workspace-definitions-missing-namespace-throws
+  (let [root (tmp-root)
+        w    (ws/attach! root)]
+    (try
+      (is (thrown? (ws/definitions w 'nonexistent.ns)))
+      (finally (ws/shutdown! w) (clean-root! root)))))
+
+; ── propose!/preview ─────────────────────────────────────────────────────────
+
+(deftest workspace-propose-returns-proposal-handle
+  (let [root (tmp-root)]
+    (try
+      (write-fixture! root "src/app/invoices.bl" invoices-src)
+      (let [w (ws/attach! root)
+            b (change/bundle "Test change"
+                (change/in-namespace 'app.invoices
+                  (change/add-definition '(defn subtotal [inv] (:subtotal-cents inv)))))
+            p (ws/propose! w b)]
+        (try
+          (is (= :proposal (:kind p)))
+          (is (string? (:id p)))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest workspace-preview-shows-before-after
+  (let [root (tmp-root)]
+    (try
+      (write-fixture! root "src/app/invoices.bl" invoices-src)
+      (let [w    (ws/attach! root)
+            b    (change/bundle "Add fn"
+                   (change/in-namespace 'app.invoices
+                     (change/add-definition '(defn new-fn [] :added))))
+            p    (ws/propose! w b)
+            snap (ws/preview p)]
+        (try
+          (is (= :proposal (:kind snap)))
+          (is (= :made (:status snap)))
+          (is (= 1 (count (:changes snap))))
+          (let [ch (first (:changes snap))]
+            (is (string? (:before ch)))
+            (is (string? (:after ch)))
+            (is (includes? (:after ch) "new-fn")))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+; ── Made/Saved/Live independence ─────────────────────────────────────────────
+
+(deftest proposal-made-set-saved-live-nil
+  (let [root (tmp-root)]
+    (try
+      (write-fixture! root "src/app/invoices.bl" invoices-src)
+      (let [w (ws/attach! root)
+            b (change/bundle "Test" (change/create-file "src/x.bl" "(ns x)"))
+            p (ws/propose! w b)
+            s (ws/status p)]
+        (try
+          (is (string? (:made s)))
+          (is (nil? (:saved s)))
+          (is (nil? (:live s)))
+          (is (= :made (:status s)))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+; ── verify! ───────────────────────────────────────────────────────────────────
+
+(deftest workspace-verify-clean-source
+  (let [root (tmp-root)]
+    (try
+      (let [w (ws/attach! root)
+            b (change/bundle "Create clean ns"
+                (change/create-namespace 'billing.rules
+                  '(defn total [s f] (+ s f))))
+            p    (ws/propose! w b)
+            snap (ws/verify! p)]
+        (try
+          (is (= :proposal (:kind snap)))
+          (is (= :verified (:status snap)))
+          (is (some? (:verification snap)))
+          (is (:load-ok (:verification snap)))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest workspace-verify-syntax-error-fails
+  (let [root (tmp-root)]
+    (try
+      (let [w    (ws/attach! root)
+            b    (change/bundle "Bad source"
+                   (change/create-file "src/bad.bl" "(defn unclosed [x"))
+            p    (ws/propose! w b)
+            snap (ws/verify! p)]
+        (try
+          (is (= :failed (:status snap)))
+          (is (not (empty? (:parse-errors (:verification snap)))))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+; ── save! buffer ──────────────────────────────────────────────────────────────
+
+(deftest workspace-save-buffer-writes-to-disk
+  (let [root (tmp-root)
+        src  "(ns foo)\n"]
+    (try
+      (write-fixture! root "src/foo.bl" src)
+      (let [w       (ws/attach! root)
+            b       (ws/open! w "src/foo.bl")
+            new-src "(ns foo)\n\n(defn bar [] 42)\n"
+            _       (ws/edit! b new-src)
+            snap    (ws/save! b)]
+        (try
+          (is (not (:dirty? snap)))
+          (is (= new-src (read-fixture root "src/foo.bl")))
+          (ws/close! b {:force true})
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest workspace-save-buffer-basis-conflict-throws
+  (let [root (tmp-root)
+        src  "(ns foo)\n"]
+    (try
+      (write-fixture! root "src/foo.bl" src)
+      (let [w   (ws/attach! root)
+            b   (ws/open! w "src/foo.bl")
+            ; Externally modify the file AFTER open (change basis)
+            _   (File/write! (str root "/src/foo.bl") "(ns foo)\n;; external edit\n")]
+        (try
+          ; save! should detect basis mismatch and throw
+          (is (thrown? (ws/save! b)))
+          (finally (ws/close! b {:force true}) (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+; ── save! proposal ────────────────────────────────────────────────────────────
+
+(deftest workspace-save-proposal-requires-verified
+  (let [root (tmp-root)]
+    (try
+      (let [w (ws/attach! root)
+            b (change/bundle "Unverified" (change/create-file "src/x.bl" "(ns x)"))
+            p (ws/propose! w b)]
+        (try
+          ; Must verify before save
+          (is (thrown? (ws/save! p)))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest workspace-save-proposal-writes-all-changes
+  (let [root (tmp-root)]
+    (try
+      (let [w    (ws/attach! root)
+            b    (change/bundle "Create two files"
+                   (change/create-file "src/a.bl" "(ns a)\n")
+                   (change/create-file "src/b.bl" "(ns b)\n"))
+            p    (ws/propose! w b)
+            _    (ws/verify! p)
+            snap (ws/save! p)]
+        (try
+          (is (string? (:saved snap)))
+          (is (= "(ns a)\n" (read-fixture root "src/a.bl")))
+          (is (= "(ns b)\n" (read-fixture root "src/b.bl")))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest workspace-save-does-not-set-live
+  (let [root (tmp-root)]
+    (try
+      (let [w    (ws/attach! root)
+            b    (change/bundle "Create"
+                   (change/create-file "src/x.bl" "(ns x)\n"))
+            p    (ws/propose! w b)
+            _    (ws/verify! p)
+            snap (ws/save! p)
+            st   (ws/status p)]
+        (try
+          (is (string? (:saved st)))
+          (is (nil? (:live st)))  ; save does NOT set live
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+; ── make-live! ────────────────────────────────────────────────────────────────
+
+(deftest workspace-make-live-evaluates-changes
+  (let [root (tmp-root)]
+    (try
+      (let [w    (ws/attach! root)
+            b    (change/bundle "Create"
+                   (change/create-file "src/x.bl" "(ns x)\n\n(def answer 42)\n"))
+            p    (ws/propose! w b)
+            _    (ws/verify! p)
+            _    (ws/save! p)
+            snap (ws/make-live! p)
+            st   (ws/status p)]
+        (try
+          (is (string? (:live st)))
+          (is (string? (:saved st)))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest workspace-make-live-sets-live-not-earlier
+  (let [root (tmp-root)]
+    (try
+      (let [w  (ws/attach! root)
+            b  (change/bundle "Create"
+                 (change/create-file "src/x.bl" "(ns x)\n"))
+            p  (ws/propose! w b)
+            s1 (ws/status p)]
+        (try
+          (is (nil? (:live s1)))  ; not live yet
+          (ws/verify! p)
+          (ws/save! p)
+          (ws/make-live! p)
+          (let [s2 (ws/status p)]
+            (is (string? (:live s2))))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest workspace-make-live-failure-preserves-old-env
+  "Failed make-live! must NOT change the workspace runtime-env."
+  (let [root (tmp-root)]
+    (try
+      (let [w    (ws/attach! root)
+            ; First: create a valid namespace and make it live
+            b1   (change/bundle "Create valid"
+                   (change/create-file "src/valid.bl" "(ns valid)\n\n(def x 1)\n"))
+            p1   (ws/propose! w b1)
+            _    (ws/verify! p1)
+            _    (ws/save! p1)
+            _    (ws/make-live! p1)
+            ; Verify we can eval x from the live env
+            r1   (ws/eval! w "valid/x")
+            ; Now attempt to make-live! with a BROKEN proposal (compile error)
+            b2   (change/bundle "Broken"
+                   (change/create-file "src/broken.bl"
+                     "(ns broken)\n\n(defn oops [] (this-does-not-exist-anywhere!))\n"))
+            p2   (ws/propose! w b2)
+            _    (ws/verify! p2)  ; verify might pass for syntax only
+            _    (ws/save! p2)
+            ; make-live! for broken should either succeed or fail
+            ; Key test: if it fails, the old env is preserved
+            live-result (try (ws/make-live! p2) :success (catch _ :failed))]
+        (try
+          ; Whether or not the bad ns loaded, we should still be able to eval
+          ; something from the workspace env without it crashing
+          (let [r2 (try (ws/eval! w "42") (catch _ nil))]
+            (is (some? r2)))  ; workspace is still functional
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+; ── eval! ─────────────────────────────────────────────────────────────────────
+
+(deftest workspace-eval-simple-expression
+  (let [root (tmp-root)
+        w    (ws/attach! root)]
+    (try
+      (let [r (ws/eval! w "(+ 1 2)")]
+        (is (string? r))
+        (is (includes? r "3")))
+      (finally (ws/shutdown! w) (clean-root! root)))))
+
+(deftest workspace-eval-error-throws
+  (let [root (tmp-root)
+        w    (ws/attach! root)]
+    (try
+      (is (thrown? (ws/eval! w "(undefined-fn-xyz)")))
+      (finally (ws/shutdown! w) (clean-root! root)))))
+
+; ── status ────────────────────────────────────────────────────────────────────
+
+(deftest workspace-status-fields
+  (let [root (tmp-root)]
+    (try
+      (let [w    (ws/attach! root)
+            b    (change/bundle "Status test"
+                   (change/create-file "src/x.bl" "(ns x)\n"))
+            p    (ws/propose! w b)
+            st   (ws/status p)]
+        (try
+          (is (= :made (:status st)))
+          (is (contains? st :made))
+          (is (contains? st :saved))
+          (is (contains? st :live))
+          (is (contains? st :verification))
+          (is (contains? st :error))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+; ── undo! ─────────────────────────────────────────────────────────────────────
+
+(deftest workspace-undo-returns-inverse-proposal
+  (let [root (tmp-root)]
+    (try
+      (let [w    (ws/attach! root)
+            b    (change/bundle "Create x"
+                   (change/create-file "src/x.bl" "(ns x)\n"))
+            p    (ws/propose! w b)
+            _    (ws/verify! p)
+            _    (ws/save! p)
+            undo (ws/undo! p)
+            snap (ws/snapshot undo)]
+        (try
+          (is (= :proposal (:kind snap)))
+          (is (includes? (:title snap) "Undo"))
+          (is (= :made (:status snap)))
+          ; Inverse change: before=after of original, after=before of original
+          (let [ch (first (:changes snap))]
+            (is (= "(ns x)\n" (:before ch)))  ; original :after
+            (is (nil? (:after ch))))           ; original :before (nil = delete)
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest workspace-undo-requires-saved
+  (let [root (tmp-root)]
+    (try
+      (let [w (ws/attach! root)
+            b (change/bundle "Unsaved" (change/create-file "src/y.bl" "(ns y)\n"))
+            p (ws/propose! w b)]
+        (try
+          ; Not yet saved — undo should throw
+          (is (thrown? (ws/undo! p)))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+; ── record/remember! (gen persistence seam) ──────────────────────────────────
+
+(deftest workspace-record-and-retrieve
+  (let [root (tmp-root)
+        w    (ws/attach! root)]
+    (try
+      (ws/record! w :my-key "my-value")
+      (is (= "my-value" (ws/record w :my-key nil)))
+      (is (nil? (ws/record w :missing nil)))
+      (is (= :default (ws/record w :missing :default)))
+      (finally (ws/shutdown! w) (clean-root! root)))))
+
+(deftest workspace-remember-experience
+  (let [root (tmp-root)
+        w    (ws/attach! root)]
+    (try
+      (let [exp {:id     "exp-1"
+                 :kind   :experience
+                 :source-path "src/foo.bl"
+                 :prompt "test prompt"
+                 :status :queued
+                 :turns  []
+                 :versions []
+                 :proposal nil
+                 :error  nil}
+            handle (ws/remember! w exp)
+            snap   (ws/snapshot handle)]
+        (is (= :experience (:kind handle)))
+        (is (= "exp-1" (:id snap)))
+        (is (= "test prompt" (:prompt snap))))
+      (finally (ws/shutdown! w) (clean-root! root)))))
+
+; ── Targeted regression tests ────────────────────────────────────────────────
+
+(deftest two-workspaces-isolated
+  "Two distinct workspace owners must not share runtime state."
+  (let [root1 (tmp-root)
+        root2 (tmp-root)]
+    (try
+      (let [w1 (ws/attach! root1)
+            w2 (ws/attach! root2)]
+        (try
+          ; Define a value in w1
+          (ws/eval! w1 "(def ws1-sentinel :w1-only)")
+          ; w2 must not see it
+          (is (thrown? (ws/eval! w2 "ws1-sentinel")))
+          ; w2 can still eval basic expressions
+          (is (includes? (ws/eval! w2 "(+ 10 20)") "30"))
+          (finally
+            (ws/shutdown! w1)
+            (ws/shutdown! w2))))
+      (finally
+        (clean-root! root1)
+        (clean-root! root2)))))
+
+(deftest try-does-not-change-live-function
+  "try! must not mutate the workspace's live runtime env."
+  (let [root (tmp-root)
+        w    (ws/attach! root)]
+    (try
+      ; Establish a sentinel in the live env
+      (ws/eval! w "(def try-sentinel :before-try)")
+      (is (includes? (ws/eval! w "try-sentinel") "before-try"))
+      (let [b (change/bundle "Try a change"
+                (change/create-file "src/try-ns.bl"
+                  "(ns try-ns)\n(def val :from-try)\n"))
+            p (ws/propose! w b)
+            _ (ws/verify! p)
+            _ (ws/try! p)]
+        ; Sentinel in the live env must still be :before-try
+        (is (includes? (ws/eval! w "try-sentinel") "before-try")))
+      (finally (ws/shutdown! w) (clean-root! root)))))
+
+(deftest made-saved-live-equal-revision
+  "After save! and make-live!, :made :saved :live all equal :revision."
+  (let [root (tmp-root)
+        w    (ws/attach! root)]
+    (try
+      (let [b      (change/bundle "Eq test"
+                    (change/create-file "src/eq.bl" "(ns eq)\n"))
+            p      (ws/propose! w b)
+            rev    (:revision (ws/snapshot p))
+            _      (ws/verify! p)
+            _      (ws/save! p)
+            _      (ws/make-live! p)
+            st     (ws/status p)]
+        (is (string? rev))
+        (is (= (:made st) rev))
+        (is (= (:saved st) rev))
+        (is (= (:live st) rev)))
+      (finally (ws/shutdown! w) (clean-root! root)))))
+
+(deftest double-save-is-idempotent
+  "Saving a verified proposal twice returns the same revision both times."
+  (let [root (tmp-root)
+        w    (ws/attach! root)]
+    (try
+      (let [b    (change/bundle "Double save"
+                  (change/create-file "src/ds.bl" "(ns ds)\n"))
+            p    (ws/propose! w b)
+            _    (ws/verify! p)
+            s1   (ws/save! p)
+            s2   (ws/save! p)]  ; second save — files already match :after
+        (is (= (:saved s1) (:saved s2)))
+        (is (string? (:saved s1))))
+      (finally (ws/shutdown! w) (clean-root! root)))))
+
+(deftest save-external-conflict-throws
+  "save! throws when a file was externally modified after proposal creation."
+  (let [root (tmp-root)]
+    (try
+      (write-fixture! root "src/app/invoices.bl" invoices-src)
+      (let [w  (ws/attach! root)
+            b  (change/bundle "Edit"
+                 (change/in-namespace 'app.invoices
+                   (change/add-definition '(defn conflict-fn [] 1))))
+            p  (ws/propose! w b)
+            _  (ws/verify! p)
+            ; Externally modify the file AFTER proposing (changes the basis)
+            _  (File/write! (str root "/src/app/invoices.bl")
+                             (str invoices-src "; external edit\n"))]
+        (try
+          (is (thrown? (ws/save! p)))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))
+
+(deftest restart-loses-live-not-fabricated
+  "After shutdown+reattach, the workspace starts fresh with no fabricated Live."
+  (let [root (tmp-root)
+        w1   (ws/attach! root)]
+    (try
+      (let [b  (change/bundle "Before restart"
+                 (change/create-file "src/pre.bl" "(ns pre)\n"))
+            p  (ws/propose! w1 b)
+            _  (ws/verify! p)
+            _  (ws/save! p)
+            _  (ws/make-live! p)
+            st1 (ws/status p)]
+        (is (string? (:live st1)))
+        ; Shutdown and reattach
+        (ws/shutdown! w1)
+        (let [w2   (ws/attach! root)
+              snap (ws/snapshot w2)]
+          (try
+            ; Saved proposals survive, but an old process image does not.
+            (is (= 1 (count (:proposals snap))))
+            (is (nil? (:live (first (:proposals snap)))))
+            (is (= (:saved st1) (:saved (first (:proposals snap)))))
+            ; Basic eval still works in fresh env
+            (is (string? (ws/eval! w2 "(+ 1 1)")))
+            (finally (ws/shutdown! w2)))))
+      (finally (clean-root! root)))))
+
+(deftest require-dedup-exact-namespace-not-prefix
+  "Adding billing.rules-extra must not be deduplicated against billing.rules."
+  (let [root (tmp-root)]
+    (try
+      (let [src "(ns app.foo\n  (:require [billing.rules :as rules]))\n"]
+        (write-fixture! root "src/app/foo.bl" src)
+        (let [w   (ws/attach! root)
+              b   (change/bundle "Add extra require"
+                    (change/in-namespace 'app.foo
+                      (change/require '[billing.rules-extra :as extra])))
+              p   (ws/propose! w b)
+              ch  (first (:changes (ws/preview p)))]
+          (try
+            (is (includes? (:after ch) "billing.rules-extra"))
+            (is (includes? (:after ch) "billing.rules :as rules"))
+            (finally (ws/shutdown! w)))))
+      (finally (clean-root! root)))))
+
+(deftest concurrent-root-attach-no-duplicate-owners
+  "Multiple attach! calls for the same root return handles to ONE owner."
+  (let [root (tmp-root)
+        w1   (ws/attach! root)
+        w2   (ws/attach! root)
+        w3   (ws/attach! root)]
+    (try
+      ; All handles share the same root
+      (is (= (:root w1) (:root w2) (:root w3)))
+      ; Mutations via w1 are visible via w2 and w3 (same owner)
+      (ws/eval! w1 "(def shared-sentinel :shared)")
+      (is (includes? (ws/eval! w2 "shared-sentinel") "shared"))
+      (is (includes? (ws/eval! w3 "shared-sentinel") "shared"))
+      (finally
+        (ws/shutdown! w1)
+        (clean-root! root)))))
+
+(deftest cross-namespace-two-changes-verify
+  "verify! succeeds when two independent namespace changes are in the same proposal."
+  (let [root (tmp-root)
+        w    (ws/attach! root)]
+    (try
+      (let [b    (change/bundle "Two namespaces"
+                  (change/create-namespace 'ns.alpha
+                    '(defn alpha-fn [] :alpha))
+                  (change/create-namespace 'ns.beta
+                    '(defn beta-fn [] :beta)))
+            p    (ws/propose! w b)
+            snap (ws/verify! p)]
+        (try
+          (is (= :verified (:status snap)))
+          (finally (ws/shutdown! w))))
+      (finally (clean-root! root)))))

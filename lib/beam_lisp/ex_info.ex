@@ -46,7 +46,7 @@ defmodule BeamLisp.ExInfo do
       # be preserved by the error round-trip — this is the throw/error path,
       # not a collection op, so struct-as-map is intended.
       is_map(x) ->
-        raise %__MODULE__{message: BeamLisp.RT.print_str(x), data: x}
+        raise %__MODULE__{message: BeamLisp.Ns.Rt.print_str(x), data: x}
 
       true ->
         raise %__MODULE__{message: inspect(x), data: nil}

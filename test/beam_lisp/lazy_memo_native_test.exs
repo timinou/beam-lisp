@@ -238,17 +238,17 @@ defmodule BeamLisp.LazyMemoNativeTest do
     source = LazyMemo.nif_dependency_resource(input.tail)
     assert_raise ArgumentError, fn -> LazyMemo.compare_exchange(source, values, [], [], 0) end
     assert Enum.to_list(input) == values
-    assert BeamLisp.RT.map(&(&1 + 1), values) |> Enum.to_list() == Enum.to_list(2..1001)
+    assert BeamLisp.Ns.Rt.map(&(&1 + 1), values) |> Enum.to_list() == Enum.to_list(2..1001)
 
-    assert BeamLisp.RT.filter(&(rem(&1, 2) == 0), values) |> Enum.to_list() ==
+    assert BeamLisp.Ns.Rt.filter(&(rem(&1, 2) == 0), values) |> Enum.to_list() ==
              Enum.filter(values, &(rem(&1, 2) == 0))
 
-    assert BeamLisp.RT.map_multi(&+/2, values, [values]) |> Enum.to_list() ==
+    assert BeamLisp.Ns.Rt.map_multi(&+/2, values, [values]) |> Enum.to_list() ==
              Enum.map(values, &(&1 * 2))
 
-    assert BeamLisp.RT.concat([values, values]) |> Enum.to_list() == values ++ values
-    assert BeamLisp.RT.take_while(&(&1 < 500), values) |> Enum.to_list() == Enum.to_list(1..499)
-    assert BeamLisp.RT.cycle(values) |> Enum.take(2001) == values ++ values ++ [1]
+    assert BeamLisp.Ns.Rt.concat([values, values]) |> Enum.to_list() == values ++ values
+    assert BeamLisp.Ns.Rt.take_while(&(&1 < 500), values) |> Enum.to_list() == Enum.to_list(1..499)
+    assert BeamLisp.Ns.Rt.cycle(values) |> Enum.take(2001) == values ++ values ++ [1]
   end
 
   test "lazy and improper inputs are not prematurely forced by cursor conversion" do
@@ -260,7 +260,7 @@ defmodule BeamLisp.LazyMemoNativeTest do
         Enum.to_list(2..1000)
       end)
 
-    mapped = BeamLisp.RT.map(&(&1 + 1), [1 | tail])
+    mapped = BeamLisp.Ns.Rt.map(&(&1 + 1), [1 | tail])
     assert :atomics.get(calls, 1) == 0
     assert Enum.to_list(mapped) == Enum.to_list(2..1001)
     assert :atomics.get(calls, 1) == 1

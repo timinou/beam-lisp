@@ -24,7 +24,7 @@ defmodule BeamLisp.Guards do
       (coll? (atom 1))            ; true
       (get (atom 1) :value)       ; nil, indistinguishable from a miss
 
-  The collection fns in `BeamLisp.RT` guard their plain-map clauses with
+  The collection fns in `BeamLisp.Ns.Rt` guard their plain-map clauses with
   `is_bl_map`, route records through `%{__struct__}` clauses (records are
   user-facing maps and keep working), and RAISE for the reference structs
   — they are not collections.

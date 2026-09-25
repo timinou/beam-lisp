@@ -123,7 +123,7 @@ defmodule BeamLisp.BuildSubstrateTest do
   defp state_after(result) do
     BeamLisp.Loader.ensure_loaded("build-log")
     apply = BeamLisp.Env.fetch!("build-log", "apply-facts")
-    BeamLisp.RT.invoke(apply, [%{sources: %{}, ex: %{}, runs: [], errors: []}, result.facts])
+    BeamLisp.Ns.Rt.invoke(apply, [%{sources: %{}, ex: %{}, runs: [], errors: []}, result.facts])
   end
 
   # The language's collections cross back as host structs (a `Vector` is not an

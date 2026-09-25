@@ -14,7 +14,8 @@ defmodule BeamLisp.TestRT do
   interleave.
   """
 
-  alias BeamLisp.{Compiler, Env, RT, Vector}
+  alias BeamLisp.{Compiler, Env, Vector}
+  alias BeamLisp.Ns.Rt, as: RT
 
   # registry: {:test_registry, ns} -> [{name, fn}]   (per env — exact-env
   # reads: a forked suite runs only ITS registered tests, never the base's)

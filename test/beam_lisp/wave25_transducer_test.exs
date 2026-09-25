@@ -242,7 +242,7 @@ defmodule BeamLisp.Wave25TransducerTest do
 
     test "interpose finite result equals the expected seq and prints" do
       assert in_slice("(= (interpose :x [1 2 3]) '(1 :x 2 :x 3))") == true
-      assert BeamLisp.RT.print_str(in_slice("(interpose :x [1 2 3])")) == "(1 :x 2 :x 3)"
+      assert BeamLisp.Ns.Rt.print_str(in_slice("(interpose :x [1 2 3])")) == "(1 :x 2 :x 3)"
     end
 
     test "doall of a lazy interleave realizes to a proper list" do

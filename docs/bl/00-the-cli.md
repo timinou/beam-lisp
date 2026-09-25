@@ -95,8 +95,28 @@ may span lines — the prompt continues while a form is open. The last three
 results stay reachable: `*1` is the last value, `*2` the one before it, `*e` the
 last error.
 
+The session is one thing shown three ways:
+
 ```sh
-$ bl repl
+$ bl repl            # a native window on the session's /repl page (default)
+$ bl repl --web      # that page in your browser
+$ bl repl --terminal # the read-eval-print loop in this terminal
+```
+
+The default window needs the native WebView backend —
+`priv/native/wry_webview.so`, built from `native/wry_webview` against GTK3,
+WebKitGTK, and libgtk-layer-shell — and a display server (`WAYLAND_DISPLAY` or
+`DISPLAY`). A host that lacks either falls back to the terminal loop. On
+Wayland the window is content-only: the app fills the surface and no GTK
+title/header bar is drawn. On X11 the window manager frames it as usual. The
+window and `--web` alike attach to the tree's running session when one exists,
+and boot one when none does. After updating the REPL on disk, restart an older
+running daemon (`bl daemon stop`, then `bl daemon start`) before reopening the
+page: its HTTP router remains the version loaded at boot. `bl doctor` reports
+the native backends this host can build.
+
+```sh
+$ bl repl --terminal
 beam-lisp on the BEAM — Ctrl+D to exit
 user=> (+ 1 2)
 3

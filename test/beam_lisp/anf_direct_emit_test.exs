@@ -32,7 +32,7 @@ defmodule BeamLisp.AnfDirectEmitTest do
   end
 
   defp bl(ns, name, args) do
-    BeamLisp.RT.invoke(BeamLisp.Env.fetch!(ns, name), args)
+    BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!(ns, name), args)
   end
 
   defp snapshot_path(path), do: "test/fixtures/anf_canonical_corpus/#{String.replace(path, "/", "_")}.etf"
@@ -212,9 +212,9 @@ defmodule BeamLisp.AnfDirectEmitTest do
       end
     end)
   end
-  defp groundify(%{op: :remote, mod: BeamLisp.RT, fun: :hash_key, args: [arg]}) do
+  defp groundify(%{op: :remote, mod: BeamLisp.Ns.Rt, fun: :hash_key, args: [arg]}) do
     case groundify(arg) do
-      {:ground, value} -> {:ground, BeamLisp.RT.hash_key(value)}
+      {:ground, value} -> {:ground, BeamLisp.Ns.Rt.hash_key(value)}
       _ -> :no
     end
   end

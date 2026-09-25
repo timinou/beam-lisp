@@ -82,7 +82,7 @@ defmodule BeamLisp.FormMeta do
   current metadata map (or `nil` when absent).
   """
   def vary_meta(form, f) when is_function(f), do: with_meta(form, f.(meta(form)))
-  def vary_meta(form, f), do: with_meta(form, BeamLisp.RT.invoke(f, [meta(form)]))
+  def vary_meta(form, f), do: with_meta(form, BeamLisp.Ns.Rt.invoke(f, [meta(form)]))
 
   # A map `m` wraps only form-shaped data; other values stay a no-op
   # (the documented value-metadata behavior, matching BeamLisp.Meta).

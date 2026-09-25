@@ -1,0 +1,195 @@
+; pipeline_test.bl — the admission gate, the input gate, and cross-path
+; agreement for the frozen packed-byte fragment.
+;
+; Run:  BL_NO_LOCK=1 bin/bl test research/rt-selfhost/fusion/pipeline_test.bl
+;
+; Every assertion compares against a REFERENCE written here in the test (a
+; plain BL loop), not against another one of the paths under test: agreement
+; between fused-run and rt-run is a statement about two implementations, not
+; about the contract.
+
+(ns fusion.pipeline-test)
+
+(BeamLisp/run_file "research/rt-selfhost/fusion/pipeline.bl")
+
+; run_file leaves fusion.pipeline current; restore ours so bare names below
+; (and every later form's namespace) belong to this test file.
+(BeamLisp.Env/in_ns "fusion.pipeline-test")
+
+(def out (or (System/get_env "FUSION_OUT") "/tmp/bl-fusion-test"))
+(def installed (fusion.pipeline/install! out))
+
+; ── helpers ─────────────────────────────────────────────────────────────────
+
+(defn- mk
+  "A binary from a BL vector of byte integers."
+  [xs]
+  (erlang/list_to_binary (to-list xs)))
+
+(defn- ref-run
+  "Independent reference for the frozen pipeline: y=(3b+7) mod 256, keep y<128,
+   acc=(acc+y) mod 2^64, supplied initial acc."
+  [bin init]
+  (loop [i 0 acc init]
+    (if (erlang/< i (erlang/byte_size bin))
+      (let [b (binary/at bin i)
+            y (erlang/rem (erlang/+ (erlang/* 3 b) 7) 256)]
+        (recur (erlang/+ i 1)
+               (if (erlang/< y 128)
+                 (erlang/band (erlang/+ acc y) 18446744073709551615)
+                 acc)))
+      acc)))
+
+(defn- all-byte-binary
+  "One binary containing every byte value 0..255 exactly once."
+  []
+  (loop [i 0 acc (list)]
+    (if (erlang/< i 256)
+      (recur (erlang/+ i 1) (cons i acc))
+      (erlang/list_to_binary (reverse acc)))))
+
+(defn- pattern-binary
+  "A deterministic spread of byte values — a stand-in for a random sample that
+   does not need an RNG in the test."
+  [n]
+  (loop [i 0 acc (list)]
+    (if (erlang/< i n)
+      (recur (erlang/+ i 1) (cons (erlang/rem (erlang/* i 37) 256) acc))
+      (erlang/list_to_binary (reverse acc)))))
+
+(defn- agrees? [bin init]
+  (let [want (ref-run bin init)]
+    (and (erlang/== (fusion.pipeline/fused-run bin init) want)
+         (erlang/== (fusion.pipeline/rt-run bin init) want))))
+
+(def ^:private MAX-U64 18446744073709551615)
+
+; ── the descriptor gate ─────────────────────────────────────────────────────
+
+(deftest descriptor-admission
+  (testing "the canonical descriptor is the admitted fragment"
+    (is (erlang/== true (fusion.pipeline/admitted? fusion.pipeline/descriptor)))
+    (is (erlang/== 0 (count (fusion.pipeline/descriptor-problems fusion.pipeline/descriptor)))))
+  (testing "a changed constant is refused"
+    (is (erlang/== false
+                (fusion.pipeline/admitted?
+                  (assoc fusion.pipeline/descriptor
+                         :map {:op :byte-affine :scale 5 :offset 7 :modulus 256}))))
+    (is (erlang/== false
+                (fusion.pipeline/admitted?
+                  (assoc fusion.pipeline/descriptor :version 2))))
+    (is (erlang/== false
+                (fusion.pipeline/admitted?
+                  (assoc fusion.pipeline/descriptor
+                         :filter {:op :signed-le :bound 128})))))
+  (testing "unknown and missing keys are refused, and the reason is named"
+    (is (erlang/== false
+                (fusion.pipeline/admitted?
+                  (assoc fusion.pipeline/descriptor :autotune :please))))
+    (is (erlang/== false
+                (fusion.pipeline/admitted?
+                  (dissoc fusion.pipeline/descriptor :reduce))))
+    (let [problems (fusion.pipeline/descriptor-problems
+                     (assoc fusion.pipeline/descriptor :version 9))]
+      (is (erlang/== 1 (count problems)))
+      (is (includes? (first problems) "version"))))
+  (testing "non-map descriptors are refused"
+    (is (erlang/== false (fusion.pipeline/admitted? nil)))
+    (is (erlang/== false (fusion.pipeline/admitted? {})))
+    (is (erlang/== false (fusion.pipeline/admitted? [1 2]))))
+  (testing "install! refuses a non-admitted descriptor instead of generating"
+    (is (thrown? (fusion.pipeline/install! out (assoc fusion.pipeline/descriptor :version 2))))
+    (is (thrown? (fusion.pipeline/install! out nil)))))
+
+; ── the input gate ──────────────────────────────────────────────────────────
+
+(deftest input-refusal
+  (testing "the input must be a binary"
+    (is (thrown? (fusion.pipeline/fused-run 42 0)))
+    (is (thrown? (fusion.pipeline/fused-run nil 0)))
+    (is (thrown? (fusion.pipeline/fused-run [1 2 3] 0)))
+    (is (thrown? (fusion.pipeline/rt-run 42 0)))
+    (is (thrown? (fusion.pipeline/rt-run [1 2 3] 0))))
+  (testing "the initial accumulator must be a u64"
+    (is (thrown? (fusion.pipeline/fused-run (mk [1]) -1)))
+    (is (thrown? (fusion.pipeline/fused-run (mk [1]) 1.0)))
+    (is (thrown? (fusion.pipeline/fused-run (mk [1]) (erlang/+ MAX-U64 1))))
+    (is (thrown? (fusion.pipeline/rt-run (mk [1]) -1)))
+    (is (thrown? (fusion.pipeline/rt-run (mk [1]) (erlang/+ MAX-U64 1)))))
+  (testing "1 MiB is the cap; one byte more is refused"
+    (is (erlang/== 7340032 (fusion.pipeline/fused-run (binary/copy (mk [0]) 1048576) 0)))
+    (is (thrown? (fusion.pipeline/fused-run (binary/copy (mk [0]) 1048577) 0)))
+    (is (thrown? (fusion.pipeline/rt-run (binary/copy (mk [0]) 1048577) 0)))))
+
+; ── generated results vs the reference, and vs the RT path ──────────────────
+
+(deftest generated-results-and-rt-agreement
+  (doseq [xs [[] [0] [1] [255] [40] [41] [0 255 100 200] [127 128 64 200]
+              [255 255 255 255 255]]]
+    (let [bin (mk xs)]
+      (is (agrees? bin 0))
+      (is (agrees? bin 7))
+      (is (agrees? bin MAX-U64)))))
+
+(deftest sample-all-byte-values
+  (let [bin (all-byte-binary)]
+    (is (erlang/== 256 (erlang/byte_size bin)))
+    (is (agrees? bin 0))
+    (is (agrees? bin 123456789))
+    ;; every byte appears once, so the retained fraction is the contract's own.
+    (is (erlang/== (ref-run bin 0) (fusion.pipeline/fused-run bin 0)))))
+
+(deftest predicate-edge-and-u64-wrap
+  (testing "y(boundary)=127 keeps, 130 rejects; the map wraps at b=83"
+    (is (erlang/== 127 (erlang/rem (erlang/+ (erlang/* 3 40) 7) 256)))
+    (is (erlang/== 130 (erlang/rem (erlang/+ (erlang/* 3 41) 7) 256)))
+    (is (erlang/== 0 (erlang/rem (erlang/+ (erlang/* 3 83) 7) 256)))
+    (is (agrees? (mk [40 41 82 83]) 0)))
+  (testing "all pass / all reject"
+    (let [pass (mk (range 0 41))]                     ; y = 7 .. 127, all kept
+      (is (erlang/> (fusion.pipeline/fused-run pass 0) 0))
+      (is (agrees? pass 0))
+      (is (agrees? pass MAX-U64)))
+    (let [reject (mk [50 50 50 50])]                   ; y = 157 everywhere
+      (is (erlang/== 0 (fusion.pipeline/fused-run reject 0)))
+      (is (erlang/== 99 (fusion.pipeline/fused-run reject 99)))
+      (is (erlang/== 99 (fusion.pipeline/rt-run reject 99)))))
+  (testing "u64 wrap"
+    (let [bin (mk [255 255 255 255 255 255 255 255 255 255])]  ; each y = 4, ten of them
+      (is (erlang/== 40 (fusion.pipeline/fused-run bin 0)))
+      (is (erlang/== 39 (fusion.pipeline/fused-run bin MAX-U64)))
+      (is (erlang/== 39 (fusion.pipeline/rt-run bin MAX-U64)))
+      (is (agrees? bin MAX-U64)))))
+
+(deftest larger-sample-covers-crossing-regions
+  (let [bin (pattern-binary 4096)]
+    (is (erlang/== 4096 (erlang/byte_size bin)))
+    (is (agrees? bin 0))
+    (is (agrees? bin 4294967296))))
+
+; ── generated artifacts ─────────────────────────────────────────────────────
+
+(deftest generated-artifacts
+  (testing "the generated module loads and answers the public API"
+    (is (erlang/== :Elixir.Krt.FusedPipeline (get installed :module)))
+    (is (erlang/== true (erlang/function_exported :Elixir.Krt.FusedPipeline :run 2)))
+    (is (erlang/== true (erlang/function_exported :Elixir.Krt.FusedPipeline :go 4))))
+  (testing "the native IR is the admitted read-only u64 loop"
+    (let [text (File/read! (str out "/pipeline.ir"))]
+      (is (includes? text "kernel fused 3"))
+      (is (includes? text "init 3 0"))
+      (is (includes? text "load 4 0 3"))
+      (is (includes? text "loop 3 1 1"))
+      (is (includes? text "ret 2"))
+      (is (not (includes? text "store")))
+      (is (not (includes? text "le ")))
+      (is (not (includes? text "eq ")))
+      (is (erlang/== text (fusion.pipeline/native-ir fusion.pipeline/descriptor)))
+      (is (erlang/> (erlang/byte_size text) 0))))
+  (testing "the Core artifact names the same module and the same loop"
+    (let [text (File/read! (get installed :core))]
+      (is (includes? text "Elixir.Krt.FusedPipeline"))
+      (is (includes? text "'run'/2"))
+      (is (includes? text "'go'/4")))))
+
+(run-tests)

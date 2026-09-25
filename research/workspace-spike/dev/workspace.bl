@@ -1,0 +1,747 @@
+; dev/workspace.bl — stateful workspace API: proc-owned source/buffer/proposal
+; lifecycle, guarded persistence, isolated evaluation, and independent
+; Made/Saved/Live revision pointers.
+;
+; PROTOTYPE SCOPE (research/workspace-spike/):
+;   - One workspace actor per root, backed by a proc/defserver.
+;   - A supervised proc registry serializes attachment and monitors local owners.
+;   - make-live! evaluates sources into an env fork and swaps the pointer on success.
+;     Scope: workspace-owned runtime env, NOT the global VM image.
+;   - verify! checks syntax + namespace load in an isolated env; does NOT run tests.
+;   - save! basis guards prevent overwriting concurrent external edits.
+;   - undo! returns an inverse proposal handle; it does NOT immediately roll back.
+;   - Proposal metadata is durable; restart clears Live rather than inventing an image.
+;     Unsaved buffer text and full crash recovery are not persisted by this spike.
+;   - Multi-file transaction atomicity: best-effort; partial-write rollback on
+;     exception is implemented but not crash-safe (filesystem is not journaled).
+;
+; Naming distinction:
+;   play.change   — pure constructors, prototype candidate API
+;   dev.workspace — stateful process + lifecycle, prototype candidate API
+;   dev.change    — the PRODUCTION thin BL wrapper over BeamLisp.DevChange
+;                   (priv/std/dev/change.bl); NOT modified by this prototype
+
+(ns dev.workspace
+  (:require [proc :as proc]
+            [env]
+            [play.change :as change]
+            [play.image :as image]
+            [reader-node :as rn]
+            [proc.reg :as reg]
+            [proc.super :as super]
+            [clojure.edn :as edn]))
+
+; ── Unique ID generation ──────────────────────────────────────────────────────
+
+(defn- new-id
+  "Generate a short unique ID string."
+  []
+  (str "id-" (Base/encode16 (crypto/strong_rand_bytes 10))))
+
+; ── Module-level workspace directory ─────────────────────────────────────────
+;
+; The monitored relation maps root paths to current owners. Attachment is
+; serialized by the registry; a dead owner is rebuilt from metadata on demand.
+
+(defn- registry! []
+  (or (Process/whereis :play-workspaces)
+      (do (try (start workspace-tree) (catch _e nil))
+          (or (Process/whereis :play-workspaces)
+              (throw (ex-info "Cannot start the workspace registry." {}))))))
+
+(defn- pid-alive? [pid]
+  (erlang/is_process_alive pid))
+
+(defn- owner-pid-for [root]
+  "Return the live owner pid for `root`, or nil."
+  (let [p (reg/whereis (registry!) {:root root})]
+    (when (and (some? p) (pid-alive? p)) p)))
+
+; ── Workspace owner defserver ─────────────────────────────────────────────────
+;
+; State shape:
+;   {:root         string           — canonical abs workspace root
+;    :buffers      {id → buffer}    — open buffers by id
+;    :proposals    {id → proposal}  — proposals by id
+;    :experiences  {id → experience}— gen experiences by id
+;    :records      {key → value}    — arbitrary serializable state for gen
+;    :runtime-env  env-id           — active evaluation env (initially :global)}
+;
+; Handles are ordinary maps that do NOT embed a pid (stable across restarts).
+
+(defn- confined-path! [root relative]
+  (change/resolve-path! root relative))
+
+(defn- atomic-write! [path source]
+  (File/mkdir_p! (Path/dirname path))
+  (let [temp (str path ".play-" (new-id))]
+    (try
+      (File/write! temp source)
+      (let [result (File/rename temp path)]
+        (when-not (= :ok result) (throw (ex-info "Could not replace workspace file." {:path path}))))
+      (finally (when (File/exists? temp) (File/rm temp))))))
+
+(defn- persist-state! [st]
+  (let [path (Path/join (:root st) ".play-workspace.bl")
+        _ (when (= :ok (elem (File/read_link path) 0))
+            (throw (ex-info "Workspace metadata cannot be a symlink." {})))
+        proposals (into {} (for [[id p] (:proposals st)] [id (assoc p :live nil)]))]
+    (atomic-write! path (str (pr-str {:schema 1 :proposals proposals}) "\n"))
+    st))
+
+(defn- initial-state [root]
+  (let [path (Path/join root ".play-workspace.bl")
+        _ (when (= :ok (elem (File/read_link path) 0))
+            (throw (ex-info "Workspace metadata cannot be a symlink." {})))
+        stored (when (File/regular? path) (edn/read-string (File/read! path)))
+        _ (when (and stored (not= 1 (:schema stored)))
+            (throw (ex-info "Unsupported workspace metadata." {})))
+        runtime (image/build! root [] nil)]
+    {:root root :buffers {}
+     :proposals (into {} (for [[id proposal] (or (:proposals stored) {})]
+                          [id (assoc proposal :root root :live nil)]))
+     :experiences {} :records {} :runtime-env (:env runtime) :runtime-image runtime
+     :runtime-ns (:session runtime) :owned-images [runtime]}))
+
+(proc/defserver workspace-owner
+  (init [opts]
+    (ok (initial-state (:root opts))))
+
+  ; ── State reads ─────────────────────────────────────────────────────
+
+  (handle-call [:snapshot] [_from st]
+    (reply (state->workspace-snapshot st) st))
+
+  (handle-call [:get-buffer id] [_from st]
+    (reply (get (:buffers st) id) st))
+
+  (handle-call [:get-proposal id] [_from st]
+    (reply (get (:proposals st) id) st))
+
+  (handle-call [:get-experience id] [_from st]
+    (reply (get (:experiences st) id) st))
+
+  (handle-call [:get-record key default] [_from st]
+    (reply (get (:records st) key default) st))
+
+  (handle-call [:get-runtime-env] [_from st]
+    (reply (:runtime-env st) st))
+
+  (handle-call [:bind-repl name value] [_from st]
+    (env/with-env (:runtime-env st)
+      (fn [] (BeamLisp.Env/intern (:runtime-ns st) name value)))
+    (reply value st))
+
+  (handle-call [:runtime-context] [_from st]
+    (reply [(:runtime-image st) (:runtime-ns st)] st))
+
+  (handle-call [:get-image] [_from st]
+    (reply (:runtime-image st) st))
+
+  (handle-call [:runtime-ns expected ns-name] [_from st]
+    (reply :ok (if (= expected (:runtime-env st)) (assoc st :runtime-ns ns-name) st)))
+
+  (handle-call [:save kind id] [_from st]
+    (try
+      (let [[value next] (save-state! st kind id)] (reply {:ok value} next))
+      (catch e (reply {:error (ex-message e)} st))))
+
+  ; ── Buffer writes ────────────────────────────────────────────────────
+
+  (handle-call [:store-buffer buf] [_from st]
+    (if-let [existing (some (fn [[_ b]] (when (= (:path b) (:path buf)) b)) (:buffers st))]
+      (reply (if (:new? buf) {:error "A buffer already owns that path."} (:id existing)) st)
+      (let [new-st (assoc-in st [:buffers (:id buf)] buf)]
+        (reply (:id buf) new-st))))
+
+  (handle-call [:update-buffer id updates] [_from st]
+    (let [old (get (:buffers st) id)]
+      (if (nil? old)
+        (reply {:error "buffer not found"} st)
+        (let [new-buf (merge old updates)
+              new-st  (assoc-in st [:buffers id] new-buf)]
+          (reply new-buf new-st)))))
+
+  (handle-call [:remove-buffer id] [_from st]
+    (reply :ok (update st :buffers (fn [bs] (dissoc bs id)))))
+
+  ; ── Proposal writes ──────────────────────────────────────────────────
+
+  (handle-call [:store-proposal prop] [_from st]
+    (let [new-st (persist-state! (assoc-in st [:proposals (:id prop)] prop))]
+      (reply (:id prop) new-st)))
+
+  (handle-call [:update-proposal id updates] [_from st]
+    (let [old (get (:proposals st) id)]
+      (if (nil? old)
+        (reply {:error "proposal not found"} st)
+        (let [new-prop (merge old updates)
+              new-st   (persist-state! (assoc-in st [:proposals id] new-prop))]
+          (reply new-prop new-st)))))
+
+  ; ── Runtime-env swap (make-live!) ────────────────────────────────────
+
+  (handle-call [:swap-runtime-env expected new-image id] [_from st]
+    (if (not= expected (:runtime-env st))
+      (reply {:error "The live image changed while this proposal was staging."} st)
+      (let [p (get-in st [:proposals id])
+            ps (into {} (for [[pid prop] (:proposals st)] [pid (assoc prop :live nil)]))
+            p (assoc p :live (:revision p))
+            next (-> st (assoc :runtime-env (:env new-image) :runtime-image new-image
+                               :proposals (assoc ps id p))
+                        (update :owned-images conj new-image))]
+        (reply {:ok (proposal->snapshot p)} next))))
+
+  ; ── Experience writes ────────────────────────────────────────────────
+
+  (handle-call [:store-experience exp] [_from st]
+    (let [new-st (assoc-in st [:experiences (:id exp)] exp)]
+      (reply (:id exp) new-st)))
+
+  ; ── Record writes ────────────────────────────────────────────────────
+
+  (handle-call [:put-record key value] [_from st]
+    (reply :ok (assoc-in st [:records key] value)))
+
+  (terminate [_reason st]
+    (doseq [runtime (reverse (:owned-images st))]
+      (try (image/destroy! runtime) (catch _e nil)))))
+
+; Clause registrations are env-local; a ward fork can inherit loaded modules
+; without replaying their registration side effects.
+(proc.server/extend-clause! :registry reg/registry-clause)
+
+(proc/defserver workspace-directory
+  (registry (keys :root))
+  (handle-call [:attach root] [_from st]
+    (try
+      (let [existing (reg/find-one st {:root root})]
+        (if (and existing (pid-alive? existing))
+          (reply {:ok existing} st)
+          (let [pid (start workspace-owner {:root root} {})
+                [_ next] (reg/register-entry st pid {:root root})]
+            (reply {:ok pid} next))))
+      (catch e (reply {:error (ex-message e)} st))))
+  (handle-call [:detach root] [_from st]
+    (let [pid (reg/find-one st {:root root})]
+      (when (and pid (pid-alive? pid)) (stop pid))
+      (reply :ok (reg/remove-entry st pid)))))
+
+(super/defsupervisor workspace-tree
+  (strategy :one-for-one)
+  (intensity 3 5000)
+  (child :directory workspace-directory nil {:name :play-workspaces}))
+
+; ── Snapshot builders ─────────────────────────────────────────────────────────
+
+(defn- state->workspace-snapshot [st]
+  {:kind        :workspace
+   :root        (:root st)
+   :repl-ns     (or (get-in st [:runtime-image :history (:runtime-ns st)]) (:runtime-ns st))
+   :files       []   ; populated lazily via files fn
+   :buffers     (vec (vals (:buffers st)))
+   :proposals   (vec (vals (:proposals st)))
+   :experiences (vec (vals (:experiences st)))})
+
+(defn- buffer->snapshot [buf]
+  {:kind    :buffer
+   :root    (:root buf)
+   :id      (:id buf)
+   :path    (:path buf)
+   :source  (:source buf)
+   :basis   (:basis buf)
+   :dirty?  (boolean (:dirty? buf))
+   :ns      (:ns buf)})
+
+(defn- proposal->snapshot [prop]
+  {:kind         :proposal
+   :root         (:root prop)
+   :id           (:id prop)
+   :title        (:title prop)
+   :revision     (:revision prop)
+   :status       (:status prop)
+   :changes      (:changes prop)
+   :made         (:made prop)
+   :saved        (:saved prop)
+   :live         (:live prop)
+   :verification (:verification prop)
+   :error        (:error prop)})
+
+; ── Handle helpers ────────────────────────────────────────────────────────────
+
+(defn- ws-owner [handle]
+  "Return the workspace-owner pid for `handle` (any handle kind).
+   Throws if workspace is not attached."
+  (let [root (:root handle)
+        pid  (owner-pid-for root)]
+    (when (nil? pid)
+      (throw (ex-info (str "dev.workspace: no active workspace for root: " root)
+                      {:root root})))
+    pid))
+
+(defn- ws-call [handle msg]
+  "Synchronous call to the workspace owner."
+  (call (ws-owner handle) msg))
+
+; ── Lifecycle ────────────────────────────────────────────────────────────────
+
+(defn attach!
+  "Return a stable workspace handle for `root`, starting an owner if needed.
+   Existing owner is reused; dead owner is replaced.
+   `root` is resolved to an absolute canonical path."
+  [root]
+  (let [abs-root (Path/expand root)]
+    (when-not (File/dir? abs-root)
+      (throw (ex-info "The workspace directory must already exist." {:root abs-root})))
+    (when (= :ok (elem (File/read_link abs-root) 0))
+      (throw (ex-info "The workspace root cannot be a symlink." {})))
+    (let [result (call (registry!) [:attach abs-root])]
+      (when (:error result) (throw (ex-info (:error result) {}))))
+    {:kind :workspace :root abs-root :id (str "ws-" abs-root)}))
+
+(defn shutdown!
+  "Stop this prototype workspace and release its runtime environments."
+  [w]
+  (call (registry!) [:detach (:root w)]))
+
+; ── File inventory ────────────────────────────────────────────────────────────
+
+(defn files
+  "Sorted relative .bl source paths in workspace `w`.
+   Excludes: cache files (.*.cache.bl), internal/dotfiles."
+  [w]
+  (let [root (:root w)
+        all-paths (try
+                    (vec (Path/wildcard (str root "/**/*.bl")))
+                    (catch _ []))]
+    (sort
+      (keep (fn [abs]
+              (let [rel (subs abs (inc (count root)))]
+                (when (and (not (starts-with? rel "."))
+                           (not (includes? rel "/."))
+                           (not (includes? rel ".cache.bl")))
+                  rel)))
+            all-paths))))
+
+; ── Buffer operations ─────────────────────────────────────────────────────────
+
+(defn open!
+  "Open `relative` as a buffer, reading its current content from disk.
+   Returns a buffer handle. Reuses an existing buffer for the same path."
+  [w relative]
+  (change/guard-path! relative)
+  (let [abs-path (change/resolve-path! (:root w) relative)
+        _ (when (not (File/exists? abs-path))
+            (throw (ex-info (str "dev.workspace/open!: file not found: " relative)
+                            {:path relative})))
+        source (File/read! abs-path)
+        ; Parse ns declaration
+        ns-name (try
+                  (let [forms (BeamLisp.Reader/read_string source)
+                        ns-f (first (filter change/ns-form? forms))]
+                    (when (some? ns-f)
+                      (rn/node-name (rn/node-form (second (rn/node-items (rn/node-form ns-f)))))))
+                  (catch _ nil))
+        buf {:id      (new-id)
+             :root    (:root w)
+             :path    relative
+             :source  source
+             :basis   (change/digest source)
+             :dirty?  false
+             :ns      ns-name}]
+    (let [id (ws-call w [:store-buffer buf])]
+      {:kind :buffer :root (:root w) :id id :path relative})))
+
+(defn new-file!
+  "Create a new draft buffer for `relative` with `source` content.
+   Does NOT write to disk (dirty draft until save!).
+   Refuses if a file already exists at that path."
+  [w relative source]
+  (change/guard-path! relative)
+  (let [abs-path (change/resolve-path! (:root w) relative)]
+    (when (File/exists? abs-path)
+      (throw (ex-info (str "dev.workspace/new-file!: file already exists: " relative)
+                      {:path relative})))
+    (let [buf {:id     (new-id)
+               :root   (:root w)
+               :path   relative
+               :source source
+               :basis  nil     ; new file, no basis
+               :dirty? true
+               :new? true
+               :ns     nil}
+          id (ws-call w [:store-buffer buf])]
+      (when (map? id) (throw (ex-info (:error id) {:path relative})))
+      {:kind :buffer :root (:root w) :id id :path relative})))
+
+(defn snapshot
+  "Return an immutable snapshot of `handle` (workspace, buffer, proposal,
+   or experience). Reads from the owner without blocking on IO."
+  [handle]
+  (case (:kind handle)
+    :workspace
+      (ws-call handle [:snapshot])
+    :buffer
+      (let [buf (ws-call handle [:get-buffer (:id handle)])]
+        (when (nil? buf)
+          (throw (ex-info "dev.workspace/snapshot: buffer not found" {:id (:id handle)})))
+        (buffer->snapshot buf))
+    :proposal
+      (let [prop (ws-call handle [:get-proposal (:id handle)])]
+        (when (nil? prop)
+          (throw (ex-info "dev.workspace/snapshot: proposal not found" {:id (:id handle)})))
+        (proposal->snapshot prop))
+    :experience
+      (let [exp (ws-call handle [:get-experience (:id handle)])]
+        (when (nil? exp)
+          (throw (ex-info "dev.workspace/snapshot: experience not found" {:id (:id handle)})))
+        exp)
+    (throw (ex-info (str "dev.workspace/snapshot: unknown handle kind: " (:kind handle))
+                    {:kind (:kind handle)}))))
+
+(defn edit!
+  "Return an updated buffer handle with `source` as its new content.
+   Marks the buffer dirty. Does NOT write to disk."
+  [buffer source]
+  (let [updated (ws-call buffer [:update-buffer (:id buffer)
+                                  {:source source :dirty? true}])]
+    (when (map? updated)
+      (when (:error updated)
+        (throw (ex-info (str "dev.workspace/edit!: " (:error updated)) {}))))
+    buffer))
+
+(defn close!
+  "Close buffer `b`. Refuses if dirty (unsaved data would be lost).
+   Pass `{:force true}` to discard a dirty buffer."
+  ([b] (close! b {}))
+  ([b opts]
+   (let [buf (ws-call b [:get-buffer (:id b)])]
+     (when (and (:dirty? buf) (not (:force opts)))
+       (throw (ex-info "dev.workspace/close!: buffer is dirty; save or pass {:force true}"
+                       {:path (:path buf)})))
+     (ws-call b [:remove-buffer (:id b)])
+     :closed)))
+
+; ── Definitions reader ────────────────────────────────────────────────────────
+
+(defn- kind-of-def
+  "The kind of a top-level defining form: :defn, :def, :defmacro, :defprotocol,
+   :defmulti, :defserver, or :unknown."
+  [node]
+  (let [f (rn/node-form node)]
+    (when (= :list (rn/node-tag f))
+      (let [head (rn/node-form (first (rn/node-items f)))]
+        (when (= :symbol (rn/node-tag head))
+          (case (rn/node-name head)
+            "defn"         :defn
+            "defn-"        :defn
+            "def"          :def
+            "defmacro"     :defmacro
+            "defmulti"     :defmulti
+            "defprotocol"  :defprotocol
+            "defserver"    :defserver
+            nil))))))
+
+(defn definitions
+  "Definition records for namespace `ns-symbol` in workspace `w`.
+   Returns [{:name :ns :kind}] using source reader; no regex.
+   Reads the source file from disk (not necessarily an open buffer)."
+  [w ns-symbol]
+  (let [ns-str   (str ns-symbol)
+        ns-path  (change/ns-to-path ns-str)
+        abs-path (str (:root w) "/" ns-path)
+        source   (try (File/read! abs-path)
+                      (catch _ nil))]
+    (when (nil? source)
+      (throw (ex-info (str "dev.workspace/definitions: namespace file not found: " ns-path)
+                      {:ns ns-str :path ns-path})))
+    (let [forms (BeamLisp.Reader/read_string source)]
+      (vec (keep (fn [node]
+                   (let [name-str (change/defn-name-of node)
+                         kind     (kind-of-def node)]
+                     (when (and (some? name-str) (some? kind))
+                       {:name name-str :ns ns-str :kind kind})))
+                 forms)))))
+
+; ── Proposals ────────────────────────────────────────────────────────────────
+
+(defn propose!
+  "Materialise `bundle-map` against the workspace root and store it as a
+   proposal. Returns a proposal handle.
+   Revision is a content-hash of the changes (stable across VM restarts)."
+  [w bundle-map]
+  (let [changes  (change/materialize (:root w) bundle-map)
+        revision (change/digest (pr-str changes))
+        prop {:id       (new-id)
+              :root     (:root w)
+              :title    (:title bundle-map)
+              :revision revision
+              :status   :made
+              :changes  changes
+              :made     revision
+              :saved    nil
+              :live     nil
+              :verification nil
+              :error    nil}]
+    (ws-call w [:store-proposal prop])
+    {:kind :proposal :root (:root w) :id (:id prop)}))
+
+(defn preview
+  "Return the proposal snapshot including before/after for each change.
+   Does NOT modify any files."
+  [p]
+  (snapshot p))
+
+; ── Verification ──────────────────────────────────────────────────────────────
+
+(defn verify!
+  "Parse and load a proposal in a disposable private namespace image. No project tests are run."
+  [p]
+  (let [prop (snapshot p)
+        parse-errors (vec (keep (fn [ch]
+                                 (when (:after ch)
+                                   (try (BeamLisp.Reader/read_string (:after ch)) nil
+                                        (catch e {:path (:path ch) :message (ex-message e)})))) (:changes prop)))
+        result (if (seq parse-errors)
+                 {:load-ok false :load-error "Source did not parse." :parse-errors parse-errors}
+                 (try
+                   (let [candidate (image/build! (:root p) (:changes prop) (ws-call p [:get-image]))]
+                     (try
+                       (image/load-changes! candidate (:changes prop))
+                       {:load-ok true :parse-errors [] :checked-at (erlang/system_time :millisecond)}
+                       (finally (image/destroy! candidate))))
+                   (catch e {:load-ok false :parse-errors [] :load-error (ex-message e)})))]
+    (ws-call p [:update-proposal (:id p)
+                {:status (if (:load-ok result) :verified :failed)
+                 :verification result :error (:load-error result)}])
+    (snapshot p)))
+
+(defn try!
+  "Load candidate code in a disposable private image; live namespace shims are untouched."
+  [p]
+  (let [prop (snapshot p)
+        candidate (image/build! (:root p) (:changes prop) (ws-call p [:get-image]))]
+    (try
+      (image/load-changes! candidate (:changes prop))
+      "Candidate loaded in a disposable session. Live and Saved are unchanged."
+      (finally (image/destroy! candidate)))))
+
+; ── Save ─────────────────────────────────────────────────────────────────────
+;
+; save! for buffers: basis guard → write → update buffer state.
+; save! for proposals: require verified status + all basis guards → write all
+;   files as a unit → update proposal :saved revision.
+; Ordinary exceptions compensate writes only while their bases still match.
+; Process/VM death still requires a durable recovery journal before production.
+
+(defn- check-basis!
+  "Throw if the file at `abs-path` has changed since `basis` was recorded.
+   basis nil   = new file (must NOT exist, unless already matches after-content).
+   basis non-nil = must match current content (idempotent if current = after-content).
+   after-content nil means delete operation."
+  [abs-path basis after-content path-label]
+  (if (nil? basis)
+    ; New file expected
+    (when (File/exists? abs-path)
+      (let [current (File/read! abs-path)]
+        ; Idempotent: file already has the desired content
+        (when (not= current after-content)
+          (throw (ex-info (str "dev.workspace/save!: basis conflict \u2014 file now exists but was new: "
+                               path-label)
+                          {:path path-label})))))
+    ; Existing file expected
+    (let [current (try (File/read! abs-path) (catch _ nil))]
+      (cond
+        ; Idempotent delete: file was already removed
+        (and (nil? current) (nil? after-content))
+          nil
+        ; File missing unexpectedly
+        (nil? current)
+          (throw (ex-info (str "dev.workspace/save!: basis conflict \u2014 file no longer exists: "
+                               path-label)
+                          {:path path-label}))
+        ; Basis matches — normal proceed
+        (= basis (change/digest current))
+          nil
+        ; Idempotent: file content already equals the desired after content
+        (= current after-content)
+          nil
+        ; Real conflict
+        :else
+          (throw (ex-info (str "dev.workspace/save!: basis conflict \u2014 file was modified externally: "
+                               path-label)
+                          {:path path-label}))))))
+
+(defn- write-content! [path source]
+  (if (nil? source)
+    (when (File/exists? path)
+      (when-not (= :ok (File/rm path)) (throw (ex-info "Could not remove source file." {:path path}))))
+    (atomic-write! path source)))
+
+(defn- save-state! [st kind id]
+  (let [p (case kind :buffer (get-in st [:buffers id]) :proposal (get-in st [:proposals id]) nil)
+        _ (when-not p (throw (ex-info "Save target was not found." {:id id})))
+        _ (when (and (= kind :proposal) (not= :verified (:status p)))
+            (throw (ex-info "Verify this proposal before saving it." {})))
+        changes (if (= kind :buffer)
+                  [{:path (:path p) :basis (:basis p) :after (:source p)}]
+                  (:changes p))
+        prepared (vec (for [ch changes]
+                        (let [path (confined-path! (:root st) (:path ch))]
+                          (check-basis! path (:basis ch) (:after ch) (:path ch))
+                          (assoc ch :absolute path :old (when (File/regular? path) (File/read! path))))))
+        written (atom [])]
+    (try
+      (doseq [ch prepared]
+        (confined-path! (:root st) (:path ch))
+        (when (not= (:old ch) (:after ch))
+          (write-content! (:absolute ch) (:after ch))
+          (swap! written conj ch)))
+      (let [updated (if (= kind :buffer)
+                      (assoc p :basis (change/digest (:source p)) :dirty? false)
+                      (assoc p :saved (:revision p)))
+            next (assoc-in st [(if (= kind :buffer) :buffers :proposals) id] updated)
+            next (if (= kind :proposal)
+                   (update next :buffers
+                     (fn [buffers]
+                       (into {} (keep (fn [[bid b]]
+                         (let [ch (some (fn [c] (when (= (:path b) (:path c)) c)) changes)]
+                           (cond
+                             (or (nil? ch) (:dirty? b)) [bid b]
+                             (nil? (:after ch)) nil
+                             :else [bid (assoc b :source (:after ch) :basis (change/digest (:after ch)))]))) buffers))))
+                   next)]
+        (persist-state! next)
+        [(if (= kind :buffer) (buffer->snapshot updated) (proposal->snapshot updated)) next])
+      (catch e
+        (doseq [ch (reverse @written)]
+          (try
+            (let [path (confined-path! (:root st) (:path ch))
+                  current (when (File/regular? path) (File/read! path))]
+              (when (= current (:after ch)) (write-content! path (:old ch))))
+            (catch _rollback nil)))
+        (throw e)))))
+
+(defn save!
+  "Serialize basis-guarded source saves through the workspace owner. Ordinary
+   write failures are compensated where the written basis still matches.
+   This is not a crash-atomic multi-file filesystem transaction."
+  [handle]
+  (let [result (ws-call handle [:save (:kind handle) (:id handle)])]
+    (if (:error result) (throw (ex-info (:error result) {})) (:ok result))))
+
+; ── Make live ────────────────────────────────────────────────────────────────
+
+(defn make-live!
+  "Stage into a fork, then publish with a compare-and-swap of the live image."
+  [p]
+  (let [prop (snapshot p)
+        _ (when-not (= :verified (:status prop))
+            (throw (ex-info "Verify the candidate before making it live." {})))
+        _ (when (some (fn [ch] (nil? (:after ch))) (:changes prop))
+            (throw (ex-info "This prototype can save deletions/moves but cannot unload live namespaces." {})))
+        base (ws-call p [:get-image])
+        candidate (image/build! (:root p) (:changes prop) base)]
+    (try
+      (image/load-changes! candidate (:changes prop))
+      (let [result (ws-call p [:swap-runtime-env (:env base) candidate (:id p)])]
+        (when (:error result) (throw (ex-info (:error result) {})))
+        (:ok result))
+      (catch e (image/destroy! candidate) (throw e)))))
+
+(defn eval!
+  "Evaluate in this workspace image and retain its REPL namespace between calls."
+  [w source]
+  (let [[runtime namespace] (ws-call w [:runtime-context])
+        [result next-ns] (image/evaluate! runtime namespace source)]
+    (ws-call w [:runtime-ns (:env runtime) next-ns])
+    result))
+
+(defn bind!
+  "Bind an ordinary value in the workspace REPL's current namespace, without eval.
+   Used by the explicit Open in REPL action; returns the value for composition."
+  [w name value]
+  (ws-call w [:bind-repl (str name) value]))
+
+; ── Status ───────────────────────────────────────────────────────────────────
+
+(defn status
+  "Return {:made :saved :live :status :verification :error} for proposal `p`."
+  [p]
+  (let [prop (snapshot p)]
+    {:made         (:made prop)
+     :saved        (:saved prop)
+     :live         (:live prop)
+     :status       (:status prop)
+     :verification (:verification prop)
+     :error        (:error prop)}))
+
+; ── Undo ─────────────────────────────────────────────────────────────────────
+
+(defn undo!
+  "Return a NEW inverse proposal handle for `p`. The inverse proposal swaps
+   before/after for each change, re-derives bases from the :after content.
+   Does NOT immediately apply anything — the caller must verify! and save!
+   the returned proposal.
+
+   Requires the proposal to have been saved (non-nil :saved)."
+  [p]
+  (let [prop (snapshot p)]
+    (when (nil? (:saved prop))
+      (throw (ex-info "dev.workspace/undo!: cannot undo an unsaved proposal"
+                      {:id (:id prop)})))
+    (let [inverse-changes
+          (vec (map (fn [ch]
+                       {:path   (:path ch)
+                        :before (:after ch)
+                        :after  (:before ch)
+                        :basis  (change/digest (:after ch))
+                        :reason (str "Undo: " (or (:reason ch) (:path ch)))})
+                    (:changes prop)))
+          undo-rev (change/digest (pr-str inverse-changes))
+          inv {:id           (new-id)
+               :root         (:root p)
+               :title        (str "Undo: " (:title prop))
+               :revision     undo-rev
+               :status       :made
+               :changes      inverse-changes
+               :made         undo-rev
+               :saved        nil
+               :live         nil
+               :verification nil
+               :error        nil}]
+      (ws-call p [:store-proposal inv])
+      {:kind :proposal :root (:root p) :id (:id inv)})))
+
+; ── Experience (gen state ledger) ────────────────────────────────────────────
+
+(defn remember!
+  "Store or replace experience snapshot `exp-snap` by its :id.
+   Used by play.gen to persist experience state."
+  [w exp-snap]
+  (ws-call w [:store-experience exp-snap])
+  {:kind :experience :root (:root w) :id (:id exp-snap)})
+
+(defn experience
+  "Return the experience handle for `id`, or throw if not found."
+  [w id]
+  (let [exp (ws-call w [:get-experience id])]
+    (when (nil? exp)
+      (throw (ex-info (str "dev.workspace/experience: not found: " id) {:id id})))
+    {:kind :experience :root (:root w) :id id}))
+
+; ── Record store (gen persistence seam) ──────────────────────────────────────
+
+(defn record!
+  "Store serializable `value` under `key` in the workspace.
+   Used by play.gen for cache persistence; no global ambient atom."
+  [w key value]
+  (ws-call w [:put-record key value])
+  :ok)
+
+(defn record
+  "Retrieve the value stored under `key`, returning `default` if absent."
+  [w key default]
+  (ws-call w [:get-record key default]))
+
+; play.change/ns-form? is public and used above for ns-declaration parsing.

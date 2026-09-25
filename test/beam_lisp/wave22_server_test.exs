@@ -88,7 +88,7 @@ defmodule BeamLisp.Wave22ServerTest do
     assert %BeamLisp.Vector{} = :gen_server.call(pid, :get)
     pushed = :gen_server.call(pid, :push)
     assert %BeamLisp.Vector{} = pushed
-    assert BeamLisp.RT.count(pushed) == 3
+    assert BeamLisp.Ns.Rt.count(pushed) == 3
   end
 
   test "the client fns reach the server without raw interop" do
