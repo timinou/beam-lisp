@@ -72,12 +72,12 @@ binary and an initial integer in the u64 range.
         keep?  (fn [y] (erlang/< y 128))
         step   (fn ([acc] acc)
                    ([acc y] (erlang/band (+ acc y) MASK64)))
-        xf1    (BeamLisp.RT/map_xform mapper)
-        xf2    (BeamLisp.RT/filter_xform keep?)
-        rf     (BeamLisp.RT/invoke xf1
-                 (list (BeamLisp.RT/invoke xf2 (list step))))]
-    (BeamLisp.RT/invoke rf
-      (list (BeamLisp.RT/reduce rf init bytes)))))
+        xf1    (BeamLisp.Ns.Rt/map_xform mapper)
+        xf2    (BeamLisp.Ns.Rt/filter_xform keep?)
+        rf     (BeamLisp.Ns.Rt/invoke xf1
+                 (list (BeamLisp.Ns.Rt/invoke xf2 (list step))))]
+    (BeamLisp.Ns.Rt/invoke rf
+      (list (BeamLisp.Ns.Rt/reduce rf init bytes)))))
 ```
 
 Count what the machine does. `bin_to_list` allocates an input cons spine.
