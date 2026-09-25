@@ -37,16 +37,6 @@
 ; live in the shared substrate system.ir — footprint reads them too, so there
 ; is ONE recogniser, not one per engine.
 
-(defn- find-recurs
-  "Every recur (back-edge) to `self` under `n`, not descending into a NESTED
-   loop scaffold (its recurs are its own obligation). Returns list of NEW-VALS."
-  [self n]
-  (cond
-    (not (ir/node? n)) (list)
-    (ir/recur? n self) (list (ir/recur-vals n))
-    (ir/anf-loop? n) (list)               ; nested loop: its own obligation
-    :else (mapcat (fn [c] (find-recurs self c)) (ir/child-nodes n))))
-
 ; ── measure direction over ANF ──────────────────────────────────────
 
 (def core :Elixir.BeamLisp.Ns.Core)
@@ -83,64 +73,85 @@
   [node v]
   (= :down (measure-dir node v)))
 
-; ── upper-bound harvesting over ANF ──────────────────────────────────
-;
-; A count-UP var is well-founded iff a guard bounds it above. Over ANF a guard
-; is the :test of an :if; the comparison is a :remote to erlang </<=/>/>=.
-
-(defn- cmp-bounds-above
-  "The var name a comparison node bounds ABOVE, or nil: (< v E)/(<= v E) bound v;
-   (> E v)/(>= E v) bound v."
-  [node]
-  (let [node (ir/arith-bif node)]
-  (if (not (= :remote (:op node)))
-    nil
-    (let [k (:fun node) mod (:mod node) args (:args node)]
-      (if (or (not= mod :erlang) (not= 2 (count args)))
-        nil
-        (let [a (first args) b (second args)
-              a-nm (when (= :var (:op a)) (:name a))
-              b-nm (when (= :var (:op b)) (:name b))]
-          (cond
-            (contains? #{:< :=<} k) a-nm     ; erlang :< / :=< : v < E → v bounded above
-            (contains? #{:> :>=} k) b-nm     ; E > v → v bounded above
-            :else nil)))))))
-
-(defn- upper-bounded-vars
-  "Loop-var names bounded ABOVE by some guard in `node`. An :if :test is a
-   guard; an :erlang :andalso/:and conjunction bounds via any conjunct."
-  [node]
-  (cond
-    (not (ir/node? node)) #{}
-    (= :if (:op node))
-      (let [test (:test node)
-            here (if (and (= :remote (:op test)) (contains? #{:andalso :and} (:fun test)) (= :erlang (:mod test)))
-                   (reduce (fn [acc c] (let [v (cmp-bounds-above c)] (if (nil? v) acc (conj acc v))))
-                           #{} (:args test))
-                   (let [v (cmp-bounds-above test)] (if (nil? v) #{} #{v})))]
-        (reduce (fn [acc x] (into acc (upper-bounded-vars x))) here
-                (list (:then node) (:else node))))
-    (ir/anf-loop? node) #{}                   ; nested loop guards its own vars
-    :else (reduce (fn [acc x] (into acc (upper-bounded-vars x))) #{} (ir/child-nodes node))))
-
 ; ── the verdict ────────────────────────────────────────────────────
 
+; ── path guards: what is KNOWN where a recur happens ──────────────────────
+;
+; A measure is well-founded only if the recur that moves it is GUARDED on its
+; own path: a count-down var must be known bounded BELOW where it recurs (else
+; `(loop [i 0] (recur (dec i)))` runs forever), a count-up var bounded ABOVE.
+; Facts come from the tests of the `if`s enclosing the recur: the THEN branch
+; knows the test, the ELSE branch knows its negation.
+
+(defn- cmp-facts
+  "The facts comparison `node` establishes when it is `truth` (true/false):
+   a set of [:lower v] / [:upper v]. A bound counts only when it is
+   LOOP-INVARIANT — a literal, a global, or a local that is not one of
+   `loop-vars` — so `(> i x)` with `x` moving too proves nothing."
+  [node truth loop-vars]
+  (let [node (ir/arith-bif node)]
+    (if (not (= :remote (:op node)))
+      #{}
+      (let [k (:fun node) m (:mod node) args (:args node)
+            nm (fn [x] (when (= :var (:op x)) (:name x)))
+            fixed? (fn [x] (or (contains? #{:lit :global} (:op x))
+                               (and (= :var (:op x)) (not (contains? loop-vars (:name x))))))]
+        (cond
+          (and (= m :erlang) (contains? #{:andalso :and} k) truth)
+            (reduce (fn [acc c] (into acc (cmp-facts c true loop-vars))) #{} args)
+          (and (= m :erlang) (= 2 (count args)) (contains? #{:< :=< :> :>=} k))
+            (let [a (first args) b (second args)
+                  ; `a < b` true: a is bounded above by b, b below by a;
+                  ; false swaps the roles
+                  small-big (if (contains? #{:< :=<} k) [a b] [b a])
+                  [lo hi] (if truth small-big (vec (reverse small-big)))]
+              (set (keep identity [(when (and (some? (nm lo)) (fixed? hi)) [:upper (nm lo)])
+                                   (when (and (some? (nm hi)) (fixed? lo)) [:lower (nm hi)])])))
+          (and (= m rt) (= 1 (count args)) (contains? #{:pos? :neg?} k) (some? (nm (first args))))
+            (let [v (nm (first args))]
+              (if (= truth (= k :pos?)) #{[:lower v]} #{[:upper v]}))
+          :else #{})))))
+
+(defn- guarded-recurs
+  "Every recur to `self` under `n` as {:vals new-values :facts known-facts},
+   not descending into a nested loop (its recurs are its own obligation)."
+  [self loop-vars n facts]
+  (cond
+    (not (ir/node? n)) (list)
+    (ir/recur? n self) (list {:vals (ir/recur-vals n) :facts facts})
+    (ir/anf-loop? n) (list)
+    (= :if (:op n))
+      (concat (guarded-recurs self loop-vars (:test n) facts)
+              (guarded-recurs self loop-vars (:then n) (into facts (cmp-facts (:test n) true loop-vars)))
+              (guarded-recurs self loop-vars (:else n) (into facts (cmp-facts (:test n) false loop-vars))))
+    :else (mapcat (fn [c] (guarded-recurs self loop-vars c facts)) (ir/child-nodes n))))
+
 (defn check-anf-loop
-  "Termination verdict for a recognised ANF loop scaffold node."
+  "Termination verdict for a recognised ANF loop scaffold node. A loop var
+   RANKS the loop when, on EVERY recur, it moves toward a bound that the
+   recur's own path guarantees: down (dec, minus a positive literal) under a
+   lower bound, up under an upper bound, or down a finite sequence (rest/next)."
   [n]
   (let [{:keys [self vars body]} (ir/loop-parts n)
-        bounded (upper-bounded-vars body)
-        recurs (find-recurs self body)
+        recurs (guarded-recurs self (set vars) body #{})
         nvars (count vars)
         var-at (fn [i] (nth (apply list vars) i))
         wf-on-all? (fn [vi]
                      (let [v (var-at vi)]
-                       (every? (fn [newvals]
-                                 (if (< vi (count newvals))
-                                   (let [dir (measure-dir (nth newvals vi) v)]
-                                     (or (= dir :down)
-                                         (and (= dir :up) (contains? bounded v))))
-                                   false))
+                       (every? (fn [r]
+                                 (let [newvals (:vals r) facts (:facts r)]
+                                   (if (< vi (count newvals))
+                                     (let [nv (nth newvals vi)
+                                           dir (measure-dir nv v)
+                                           seq-step (let [x (ir/arith-bif nv)]
+                                                      (and (= :remote (:op x))
+                                                           (contains? #{[rt :rest] [rt :next]} [(:mod x) (:fun x)])))]
+                                       (cond
+                                         seq-step true
+                                         (= dir :down) (contains? facts [:lower v])
+                                         (= dir :up) (contains? facts [:upper v])
+                                         :else false))
+                                     false)))
                                recurs)))
         ranking (filter wf-on-all? (range nvars))]
     (if (empty? recurs)
@@ -151,7 +162,7 @@
                       " (well-founded on every recur)")}
         {:status :rejected
          :detail (str "no ranking variable — every loop var either fails to move "
-                      "toward a fixed endpoint or (counting up) lacks a bounding guard")}))))
+                      "toward a fixed endpoint or lacks a guard bounding it on the recur's path")}))))
 
 (defn check-loop
   "The termination verdict for one recognised ANF loop scaffold node. A
