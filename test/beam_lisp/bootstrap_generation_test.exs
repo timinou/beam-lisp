@@ -78,7 +78,10 @@ defmodule BeamLisp.BootstrapGenerationTest do
       []
     end
     exports = [{:value, 0}] ++ if(key, do: [{:__bl_provenance__, 0}], else: [])
-    forms = [{:attribute, 1, :module, mod}, {:attribute, 1, :export, exports}, value_fn] ++ provenance
+    # the stamp as emit writes it: the function AND the attribute, which is
+    # what Bootstrap reads (without loading the beam)
+    stamp = if key, do: [{:attribute, 1, :bl_compiler_key, key}], else: []
+    forms = [{:attribute, 1, :module, mod}, {:attribute, 1, :export, exports}] ++ stamp ++ [value_fn] ++ provenance
     {:ok, ^mod, bytes} = :compile.forms(forms, [:binary])
     bytes
   end

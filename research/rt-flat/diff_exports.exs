@@ -73,12 +73,16 @@ end
 outcome = fn m, f, args ->
   task =
     Task.async(fn ->
+      # The exception TYPE is part of the contract: a caller's `rescue
+      # BeamLisp.CompileError` or `(catch ArgumentError …)` depends on it. The
+      # first version compared only raise/no-raise, and a capability refusal
+      # raised as a bare tuple passed as "agree".
       try do
         {:ok, realize.(apply(m, f, args))}
       rescue
-        _ -> :raised
+        e -> {:raised, e.__struct__}
       catch
-        _, _ -> :raised
+        kind, _ -> {:raised, kind}
       end
     end)
 
@@ -99,10 +103,24 @@ results =
   for {f, a} <- shared, args <- arg_sets.(a) do
     o = outcome.(old, f, args)
     n = outcome.(new, f, args)
+    # A DELIBERATE refusal type is part of the contract (a caller rescues it by
+    # name): ArgumentError, BeamLisp.CompileError, BeamLisp.ExInfo. An
+    # incidental one — CaseClauseError, Protocol.UndefinedError, a BIF's
+    # badarg surfacing as ArgumentError from deep inside Enum — is how RT
+    # happened to fail, and nothing can rescue it meaningfully; those compare as
+    # "raised".
+    contract = [BeamLisp.CompileError, BeamLisp.ExInfo]
+    norm = fn
+      {:raised, t} -> if t in contract, do: {:raised, t}, else: :raised
+      x -> x
+    end
+    {o, n} = {norm.(o), norm.(n)}
     verdict =
       cond do
         o == n -> :agree
-        o == :raised -> :new_more_total
+        (o == :raised or match?({:raised, _}, o)) and not (n == :raised or match?({:raised, _}, n)) -> :new_more_total
+        # RT crashed incidentally where the BL runtime raises the CONTRACT error
+        o == :raised and match?({:raised, _}, n) -> :new_more_total
         true -> :differ
       end
     {f, a, args, o, n, verdict}

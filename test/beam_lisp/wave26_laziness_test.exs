@@ -107,7 +107,7 @@ defmodule BeamLisp.Wave26LazinessTest do
       assert eval("(= [] ())") == true
       assert eval("(= [1 2] '(1 2))") == true
       assert eval("(= [1 2] '(1 3))") == false
-      assert eval("(= #{} ())") == false
+      assert eval(~S"(= #{} ())") == false
       assert eval("(empty? (map inc []))") == true
     end
 

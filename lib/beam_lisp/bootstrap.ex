@@ -31,6 +31,23 @@ defmodule BeamLisp.Bootstrap do
   @seed_dir_rel "bootstrap/seed"
   @manifest_name "manifest.exs"
 
+  # A beam's toolchain key, read WITHOUT loading it: the `bl_compiler_key`
+  # attribute `AOT.emit_module` stamps into every namespace beam, beside the
+  # `__bl_provenance__/0` function. Loading the beam to call that function
+  # replaced the live module under a running VM just to ask about a file.
+  defp stamped_key(path) do
+    with {:ok, {_mod, [attributes: attrs]}} <-
+           :beam_lib.chunks(String.to_charlist(path), [:attributes]) do
+      case Keyword.get(attrs, :bl_compiler_key) do
+        [key] when is_binary(key) -> key
+        key when is_binary(key) -> key
+        _ -> nil
+      end
+    else
+      _ -> nil
+    end
+  end
+
   # Whether `mod`'s CURRENT code is exactly `bytes` — compared by the beam's
   # md5, which is what the loader itself records.
   defp loaded_is?(mod, bytes) do
@@ -345,17 +362,7 @@ defmodule BeamLisp.Bootstrap do
     # running VM just to ask a question about a file — and a purge kills every
     # closure the old code made (the runtime's seeded `core` values among them).
     if unit_consistent? do
-      case :beam_lib.chunks(String.to_charlist(provenance_beam), [:attributes]) do
-        {:ok, {_mod, [attributes: attrs]}} ->
-          case Keyword.get(attrs, :bl_compiler_key) do
-            [key] -> key == current_key
-            key when is_binary(key) -> key == current_key
-            _ -> false
-          end
-
-        _ ->
-          false
-      end
+      stamped_key(provenance_beam) == current_key
     else
       false
     end
