@@ -145,6 +145,7 @@ defmodule BeamLisp.BootBuildBarrierTest do
              "mix-shim",
              "ns-interface",
              "pristine",
+             "provenance",
              "release",
              "seed",
              "selfbuild",
