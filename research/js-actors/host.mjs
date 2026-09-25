@@ -312,9 +312,24 @@ export function eq(a, b) {
   return hashKey(a) === hashKey(b);
 }
 
+// Strings order by CODE POINT, which is the byte order of their UTF-8 form —
+// the order BEAM compares binaries in. JavaScript's own `<` compares UTF-16
+// code units, which puts U+1F600 before U+FF5E; this does not.
+export function strCmp(a, b) {
+  if (typeof a !== "string" || typeof b !== "string")
+    throw new Error("string order needs two strings, got " + describe(a) + " and " + describe(b));
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n;) {
+    const ca = a.codePointAt(i), cb = b.codePointAt(i);
+    if (ca !== cb) return ca < cb ? -1 : 1;
+    i += ca > 0xffff ? 2 : 1;
+  }
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+}
+
 export function lt(a, b) {
   if (typeof a === "number" && typeof b === "number") return a < b;
-  if (typeof a === "string" && typeof b === "string") return a < b;
+  if (typeof a === "string" && typeof b === "string") return strCmp(a, b) < 0;
   throw new Error("`<` needs two numbers or two strings, got " + describe(a) + " and " + describe(b));
 }
 
@@ -998,6 +1013,7 @@ export const PURE = {
   arith,
   "str-cat": (...xs) => xs.map(toStr).join(""),
   "str-size": (s) => s.length,
+  "str-cmp": strCmp,
   // A substring by UTF-16 index, bounds-checked: `subs` on this target.
   "str-slice": (s, from, to) => {
     if (typeof s !== "string" || !Number.isSafeInteger(from) || !Number.isSafeInteger(to) ||
