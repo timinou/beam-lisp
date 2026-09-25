@@ -17,7 +17,10 @@ const params = new URL(import.meta.url).searchParams;
 const app = /^[a-z][a-z0-9-]{0,31}$/.test(params.get('app') || '') ? params.get('app') : 'showcase';
 
 let codec = null;
-const EVENT_NAMES = new Set(['draft', 'submit', 'toggle', 'clear', 'filter']);
+// The UI events this tab may send are the handler names the BL view ITSELF
+// last offered (`:on-click [:order :title]` offers `order`). No app list lives
+// here: the view decides, and a stale or invented event name is refused.
+let offered = new Set();
 
 // A view tree is plain JSON EXCEPT its `:on-*` handler vectors, whose items
 // keep their BL kind exactly: `{k:"open"}` is the keyword `:open`, a bare
@@ -25,14 +28,23 @@ const EVENT_NAMES = new Set(['draft', 'submit', 'toggle', 'clear', 'filter']);
 // the BL view wrote, and text a user types can never become a keyword.
 const HANDLER = /^on-/;
 const tagItem = x => H.isKw(x) ? { k: H.kwName(x) } : encode(x);
+let offering = new Set();
 function encodeView(x) {
   if (H.isVec(x)) return H.vecItems(x).map(encodeView);
+  // a `sort`/`sort-by` result is a list: children, like a vector
+  if (H.isCons(x) || H.isEnil(x)) return H.listToArray(x).map(encodeView);
   if (H.isBMap(x)) {
     const out = {};
     for (const k of H.listToArray(H.mapKeys(x))) {
       const name = H.kwName(k);
       const v = H.mapGet(x, k);
-      out[name] = HANDLER.test(name) && H.isVec(v) ? H.vecItems(v).map(tagItem) : encodeView(v);
+      if (HANDLER.test(name) && H.isVec(v)) {
+        const items = H.vecItems(v);
+        if (items.length > 0 && H.isKw(items[0])) offering.add(H.kwName(items[0]));
+        out[name] = items.map(tagItem);
+      } else {
+        out[name] = encodeView(v);
+      }
     }
     return out;
   }
@@ -41,9 +53,14 @@ function encodeView(x) {
 
 H.setEmitter((topic, value) => {
   try {
-    const v = topic === 'view' ? { revision: encode(H.mapGet(value, H.kw('revision'))),
-                                   tree: encodeView(H.mapGet(value, H.kw('tree'))) }
-                               : encode(value);
+    let v;
+    if (topic === 'view') {
+      offering = new Set();
+      v = { revision: encode(H.mapGet(value, H.kw('revision'))), tree: encodeView(H.mapGet(value, H.kw('tree'))) };
+      offered = offering;
+    } else {
+      v = encode(value);
+    }
     postMessage({ kind: topic, value: v });
   } catch (error) { postMessage({ kind: 'error', text: String(error) }); }
 });
@@ -61,8 +78,8 @@ function itemToBL(v) {
 }
 function eventToBL(event) {
   if (!Array.isArray(event) || event.length < 1 || event.length > 3 ||
-      !(event[0] && EVENT_NAMES.has(event[0].k)))
-    throw new Error('unknown UI event');
+      !(event[0] && offered.has(event[0].k)))
+    throw new Error('the view offers no such event');
   return H.vec(event.map(itemToBL));
 }
 

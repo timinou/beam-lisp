@@ -46,6 +46,17 @@ for (const f of manifest.functions)
   if (f.placement === 'client' || f.placement === 'shared') assert.equal(f.portable, true, f.name);
 ok('every client/shared function carries a portable verdict');
 
+const fn = name => manifest.functions.find(f => f.name === name);
+assert.equal(fn('arrange').placement, 'client');
+assert.equal(fn('arrange').evidence['calls-values'], true);
+for (const v of ['open-first', 'by-title']) {
+  assert.equal(fn(v).placement, 'client', v);
+  assert.equal(fn(v).evidence['used-as-value'], true, v);
+  assert.equal(fn(v).evidence['calls-values'], false, v);
+}
+assert.ok(client.includes('"js/arrange"') && client.includes('"js/rt-sort-by"'));
+ok('a function that calls function values is admitted to the browser, with its evidence');
+
 for (const needle of ['api key', 'blocked-words', 'flagged-title', 'contains-word', 'initial-board',
                       'log-entry', ':audit', 'next-id', '"js/add-task"'])
   assert.equal(client.includes(needle), false, `client bundle leaks ${needle}`);
@@ -241,6 +252,63 @@ assert.equal(view.value.revision, helloNow.revision + 1);
 assert.ok(texts(view.value.tree).includes('Book the venue'));
 assert.equal(texts(view.value.tree).includes('sending'), false);
 ok('the confirmed result replaces the ghost with the server-assigned row');
+
+// Sorting is a COMPUTED call in the browser: local state only, no proposal.
+const rowTitles = tree => {
+  const out = [];
+  const walk = n => {
+    if (!Array.isArray(n)) return;
+    if (n[0] === 'li' && n[1] && typeof n[1].key === 'string' && n[1].key.startsWith('t')) {
+      const t = n.find(c => Array.isArray(c) && c[0] === 'span' && c[1].class === 'title');
+      out.push(t[2]);
+      return;
+    }
+    n.forEach(walk);
+  };
+  walk(tree);
+  return out;
+};
+const added = rowTitles(view.value.tree);
+const orderings = [
+  [':title', xs => [...xs].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))],
+  [':recent', xs => [...xs].reverse()],
+  [':added', xs => xs],
+];
+for (const [key, expect] of orderings) {
+  mark = frames.length;
+  tell({ kind: 'event', event: [':order', key] });
+  view = await next('view', mark);
+  assert.deepEqual(rowTitles(view.value.tree), expect(added), key);
+  assert.equal(frames.slice(mark).some(f => f.topic === 'propose'), false);
+  assert.equal(view.value.revision, helloNow.revision + 1);
+}
+// `open-first` is a NAMED comparator passed as a value: with every task open
+// it keeps the added order; a confirmed toggle then moves that task last.
+mark = frames.length;
+tell({ kind: 'event', event: [':order', ':open'] });
+view = await next('view', mark);
+assert.deepEqual(rowTitles(view.value.tree), added);
+const firstId = (() => {
+  let id = null;
+  const walk = n => { if (id === null && Array.isArray(n)) { if (n[0] === 'li' && n[1]?.key?.startsWith('t')) id = Number(n[1].key.slice(1)); else n.forEach(walk); } };
+  walk(view.value.tree);
+  return id;
+})();
+mark = frames.length;
+tell({ kind: 'event', event: [':toggle', firstId] });
+const doneIt = (await next('propose', mark)).value;
+r = await post(doneIt);
+assert.equal(r.body.ok, true);
+mark = frames.length;
+tell({ kind: 'result', frame: r.body });
+view = await next('view', mark);
+const open = rowTitles(view.value.tree);
+assert.equal(open[open.length - 1], added[0], 'the task just done sorts last');
+assert.deepEqual(open.slice(0, -1), added.slice(1));
+mark = frames.length;
+tell({ kind: 'event', event: [':order', ':added'] });
+await next('view', mark);
+ok('sort orders are function values called in the browser: every order right, no network');
 
 // Another tab wins: a toggle proposed against an old revision is rebased.
 mark = frames.length;

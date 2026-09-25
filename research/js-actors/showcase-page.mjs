@@ -15,6 +15,22 @@ const appRoot = $('app');
 
 const ATTRS = new Set(['class', 'type', 'value', 'placeholder', 'maxlength', 'disabled',
                        'aria-label', 'aria-pressed']);
+// A keyed row that MOVES (a re-sort) glides from where it was: FLIP.
+function rememberRows() {
+  const at = new Map();
+  for (const li of appRoot.querySelectorAll('li[data-k]')) at.set(li.dataset.k, li.getBoundingClientRect().top);
+  return at;
+}
+function glideRows(before) {
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  for (const li of appRoot.querySelectorAll('li[data-k]')) {
+    const was = before.get(li.dataset.k);
+    if (was === undefined) continue;
+    const dy = was - li.getBoundingClientRect().top;
+    if (Math.abs(dy) < 1) continue;
+    li.animate([{ transform: `translateY(${dy}px)` }, { transform: 'none' }], { duration: 220, easing: 'ease-out' });
+  }
+}
 const TAGS = new Set(['section', 'header', 'footer', 'nav', 'div', 'h1', 'h2', 'p', 'strong', 'small',
                       'span', 'ul', 'li', 'button', 'input']);
 const EVENTS = { 'on-click': 'click', 'on-input': 'input', 'on-enter': 'keydown' };
@@ -105,6 +121,7 @@ function patch(el, node) {
       dom = create(k);
     }
     dom.__key = key;
+    if (dom.nodeType === 1 && isElement(k) && typeof k[1].key === 'string') dom.dataset.k = k[1].key;
     return dom;
   });
   next.forEach((dom, i) => { if (el.childNodes[i] !== dom) el.insertBefore(dom, el.childNodes[i] || null); });
@@ -113,11 +130,13 @@ function patch(el, node) {
 
 function render(tree) {
   if (!isElement(tree)) throw new Error('view root is not an element');
+  const before = rememberRows();
   if (!appRoot.firstChild || appRoot.firstChild.tagName.toLowerCase() !== tree[0]) {
     appRoot.replaceChildren(create(tree));
   } else {
     patch(appRoot.firstChild, tree);
   }
+  glideRows(before);
   state.rendered++;
 }
 
@@ -260,6 +279,9 @@ function showEvidence(f, btn) {
     evidenceLine('graph', f.evidence.graph),
     evidenceLine('effects', f.evidence.effects),
     evidenceLine('abi', f.evidence.abi),
+    evidenceLine('values', f.evidence.values),
+    evidenceLine('role', [f.evidence['calls-values'] ? 'calls function values' : '',
+                          f.evidence['used-as-value'] ? 'used as a value' : ''].filter(Boolean).join(' · ') || 'first-order', 'plain'),
     evidenceLine('private', f.evidence.private ? 'declared :private' : 'no'),
     evidenceLine('portable', f.portable ? 'yes' : `no — ${f.why.reason}${f.why.detail ? ' ' + f.why.detail : ''}`),
     evidenceLine('calls', f.calls.length ? f.calls.join(', ') : '—', 'plain'));
@@ -279,6 +301,9 @@ async function explain() {
       b.className = 'fn';
       b.type = 'button';
       b.textContent = f.name;
+      const badge = (cls, text) => Object.assign(document.createElement('span'), { className: 'badge ' + cls, textContent: text });
+      if (f.evidence['calls-values']) b.append(badge('calls', 'calls values'));
+      if (f.evidence['used-as-value']) b.append(badge('value', 'a value'));
       if (!f.portable) {
         const why = document.createElement('div');
         why.className = 'why';

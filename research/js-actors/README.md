@@ -278,7 +278,8 @@ function runs** and emits three artifacts:
 ```sh
 BEAM_LISP_Z3=/usr/bin/z3 ELIXIR_ERL_OPTIONS='+S 8:8 +SDio 8' \
   JS_ACTORS_SPLIT_ONLY=1 ./bin/bl run research/js-actors/compiler.bl   # split only, ~3 min
-node research/js-actors/verify-split.mjs                                # 19 end-to-end checks
+node research/js-actors/verify-split.mjs                                # 21 end-to-end checks
+node research/js-actors/verify-order-parity.mjs                         # sort/compare = BEAM, 18 answers
 node research/js-actors/split-server.mjs --port 8791                    # then open http://127.0.0.1:8791/
 ```
 
@@ -301,30 +302,67 @@ reach it through the emitter's own ANF references (calls *and* function values).
 A client-half function must be **portable**, which needs three independent
 oracles to agree, per function, plus the app's own word:
 
-* **graph** — `codebase/dependency-cone`: indexed, no computed call head, no
-  host/interop edge;
-* **effects** — `system.analyze`: footprint `{}` and terminates, over every clause;
+* **graph** — `codebase/dependency-cone`: indexed, no unresolved host/interop edge;
+* **effects** — `system.analyze`: footprint `{}`, **latent** footprint `{}` (what
+  every function value it creates or names would do when called) and
+  terminates, over every clause;
 * **abi** — this emitter's ANF: no `host/…` leaf, no process/output verb, no
-  `receive`, no call of a computed function value, nothing outside the checked
-  ABI — inside every lambda too;
+  `receive`, nothing outside the checked ABI — inside every lambda too;
+* **values** — the value discipline below;
 * **not `:private`**, and every local callee portable.
+
+**Client code may call function values.** `arrange` (showcase.bl:177) looks
+up a key function and a comparator in `(orderings)` — a keyword, the named
+functions `by-title`/`open-first`, lambdas, `compare` — and calls them through
+`sort-by`. That is admitted without a general termination proof because:
+
+* **closed world** — every function value in the browser was created by the
+  program or is data (a keyword/collection call is a lookup); the wire and the
+  UI deliver data only, and the Worker accepts only event names the last
+  rendered view offered;
+* **no recursion** — a function that names itself, or sits on a cycle of the
+  app's reference graph (calls *and* values), is refused (`recursive`);
+* **rank one** — a function VALUE (a lambda, or a named function used as a
+  value) never calls a function it receives: not directly, not by handing it
+  to a runtime higher-order function (positions *derived* from `runtime.bl`),
+  not through a named function that does (`higher-order-value`). Anything not
+  provably a local lambda or a named function counts as received.
+
+So computed calls happen only in named functions called by name, down an
+acyclic graph, and each calls a value that makes no computed call of its own:
+the call tree is finite. Loops still need the analyzer's proof, which now
+requires each measure to be bounded **on the recur's own path**
+(`(loop [i 0] (recur (dec i)))` is refused). The manifest marks `arrange`
+*calls values* and `by-title`/`open-first` *a value*.
+
+`sort`, `sort-by` and `compare` on this target give **BEAM's answers**:
+`rt-sort` is a port of OTP `lists:sort/2` (the same comparator calls in the
+same order, so strict and non-order comparators agree too), `rt-compare` is BL's
+total order with strings by code point. `order-parity.bl` runs on both
+targets; the build writes BEAM's 18 answers and `verify-order-parity.mjs`
+requires the JS run to match them (a naive stable sort and a UTF-16 string
+order each fail it). Maps and sets have no order here: comparing one raises.
 
 Anything else **refuses the build**, naming the path. Each is a real fixture in
 `compiler.bl/split-tests` (the actual app, one edit away from a leak):
 
 ```
-split: board-view cannot run in the browser: board-view (showcase.bl:197)
-  → flagged-title? (showcase.bl:93) → blocked-words (showcase.bl:79)
+split: board-view cannot run in the browser: board-view (showcase.bl:236)
+  → flagged-title? (showcase.bl:95) → blocked-words (showcase.bl:81)
   — private declared :private in :server
-split: board-view cannot run in the browser: board-view → plural — host-call host/write at line 151
-split: board-view cannot run in the browser: board-view → plural — dynamic-call computed call head at line 151
-split: board-view cannot run in the browser: board-view → plural — effect send at line 151
+split: … board-view → plural — host-call host/write at line 190
+split: … board-view → plural — effect send at line 190
+split: … board-view → plural — higher-order-value a function value calls a function it receives at line 190
+split: … board-view → plural — recursive calls itself at line 190
+split: … board-view → plural → ping — recursive on a cycle of references
+split: … board-view → plural → walk-down — recursive calls itself at line 287
+split: … board-view — higher-order-value arrange is used as a value, but calls a function it receives at line 262
 ```
 
 plus malformed wire types, unknown or wrong-arity roots, and names that would
 shadow the runtime. Because each half is emitted as its **own** bundle from its
 own closure, server-only code and literals are absent from the client bundle by
-construction (`verify-split.mjs` greps for them). The browser gets 18 of the 26
+construction (`verify-split.mjs` greps for them). The browser gets 23 of the 31
 app functions.
 
 **The server stays the authority.** A proposal is
@@ -352,18 +390,25 @@ through a keyed reconciler (focus and caret survive per-keystroke renders;
 text only via `textContent`, attributes through an allowlist), links the Worker
 to `POST /api/intent` and the SSE stream, and shows the placement lanes with
 per-function evidence, the generated contract, and a timeline of where each
-step ran. Open a second tab: its commits arrive as server snapshots.
+step ran. Open a second tab: its commits arrive as server snapshots. Sort
+buttons re-order rows locally (rows glide to their new place).
 
 Verified in a real browser (two tabs, one authority): local filter with no
 revision change; in-browser duplicate refusal with the draft kept; server-only
 credential guard labelled as the server's; a forced two-tab race rebased and
 committed in both tabs; server killed → intent dropped, board unchanged, draft
-returned.
+returned. Every sort order right with no revision change; a snapshot from
+another tab arrives already in the chosen order; an event name the view did
+not offer is refused by the Worker.
 
 **Limits, stated.** No authentication (single-user loopback). One app per
-file; only `defn`s besides the declaration. Client code may not call a computed
-function value (so `(:k m)` lookups are fine, `(f x)` on a parameter is not)
-and uses the collection prelude in `runtime.bl`. The wire grammar is closed:
+file; only `defn`s besides the declaration. Client function values are rank
+one: a lambda that calls a function it receives (`(fn [g] (g x))`, `comp`,
+`partial`) is refused, and so is any recursion — a tree walk must be a loop
+over an explicit sequence. `(let [f inc] (mapv f xs))` inside a function used
+as a value is refused too (aliases of named functions are not tracked). Client
+code uses the collection prelude in `runtime.bl`; ordering of maps and sets is
+refused. The wire grammar is closed:
 `text`, `int`, `bool`, `list`, `record` and named references. This is a
 build-time partition of one app, not general Loom/Live placement, and a Worker
 is not a sandbox.

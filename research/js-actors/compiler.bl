@@ -2500,6 +2500,265 @@
     (erlang/is_tuple x) (reduce (fn [a y] (anf-facts y line a)) acc (erlang/tuple_to_list x))
     :else acc))
 
+; ── function values: the value discipline ──────────────────────────────────────────────────────
+;
+; Client code may call a COMPUTED function value — `(f x)`, `((:key o) t)`,
+; `(sort-by (:key o) (:cmp o) tasks)` — under a discipline that keeps every
+; client computation finite without a general termination proof:
+;
+;   closed world   every function value in the browser was created by the
+;                  program (a `fn`, a named function, a core value) or is data
+;                  (a keyword or collection, whose call is a lookup): the wire
+;                  and the UI deliver data only
+;   no recursion   no function calls itself, directly, through `recur`, or
+;                  around a cycle of references (`:recursive`)
+;   rank one       a function VALUE — a `fn` literal, or a named function
+;                  referenced as a value — never calls a function it RECEIVES,
+;                  directly, by handing it to a runtime higher-order function,
+;                  or through a named function that does (`:higher-order-value`)
+;
+; So computed calls happen only in named functions invoked BY NAME, along an
+; acyclic graph, and each one calls a value that makes no computed call of its
+; own: the call tree is finite. Loops still need the analyzer's termination
+; proof and effects its footprint AND latent footprint.
+
+(defn anf-map? [x] (and (erlang/is_map x) (maps/is_key :op x)))
+(defn anf-op [x] (if (anf-map? x) (maps/get :op x) nil))
+(defn anf-get [x k] (maps/get k x nil))
+
+(defn anf-cons-items [n]
+  (loop [n n acc []]
+    (if (= :cons (anf-op n)) (recur (anf-get n :tail) (conj acc (anf-get n :head))) acc)))
+
+(defn scaffold-kind
+  "`:fn` for the self-application scaffold every `fn` compiles to, `:loop` for a
+   loop's, nil for any other node. Its let BODY is the knot `(self self)`."
+  [x]
+  (if (and (= :let (anf-op x)) (= :fn (anf-op (anf-get x :init))))
+    (let [nm (str (anf-get x :name))]
+      (cond (String/starts_with? nm "fnself") :fn
+            (String/starts_with? nm "loop_") :loop
+            :else nil))
+    nil))
+
+(defn arg-var
+  "The local a call argument names, or nil (a literal, a global, …)."
+  [a]
+  (if (= :var (anf-op a)) (anf-get a :name) nil))
+
+(defn received-var
+  "What an argument may carry into a callee's function position: nil when it
+   is PROVABLY not a received function — a literal, a named function (checked
+   on its own), a `fn` written right here (itself a checked value), or a local
+   bound to one — else a marker (the local's name, or `:expr` for a computed
+   expression such as `(:by o)`). Fails closed: anything unproven counts."
+  [ctx a]
+  (let [op (anf-op a)]
+    (cond
+      (contains? #{:lit :global :enil} op) nil
+      (scaffold-kind a) nil
+      (= op :var) (if (contains? (:lambdas ctx) (anf-get a :name)) nil (anf-get a :name))
+      :else :expr)))
+
+(defn value-facts
+  "The call facts of one compiled definition, each tagged with `:value` (is it
+   inside a function VALUE, i.e. a nested `fn`?) and a source line:
+     {:kind :call     :name g :args [local|nil …]}  a call of a named function
+     {:kind :hof      :key k :args [local|nil …]}   a runtime/core call
+     {:kind :computed}                               a call of a computed value
+     {:kind :value-ref :name g}                     a named function as a value
+     {:kind :self}                                   the function names itself"
+  [x ctx acc]
+  (cond
+    (anf-map? x)
+      (let [l (or (anf-line x) (:line ctx))
+            ctx (assoc ctx :line l)
+            fact (fn [m] (assoc m :value (:value ctx) :line l))
+            op (anf-op x)
+            sk (scaffold-kind x)]
+        (cond
+          ; a fn: walk its body with its self name in scope, skip the knot
+          (= sk :fn)
+            (value-facts (anf-get x :init)
+                         (assoc ctx :selfs (conj (:selfs ctx) (anf-get x :name))
+                                    :value (not (:top ctx)) :top false)
+                         acc)
+          ; a loop body runs in place; its `recur` applies the loop's own var,
+          ; which is control (the analyzer proves the loop terminates)
+          (= sk :loop) (value-facts (anf-get x :init)
+                                    (assoc ctx :top false :lambdas (conj (:lambdas ctx) (anf-get x :name)))
+                                    acc)
+          ; a local bound to a fn literal: calling it is a lexical call
+          (and (= op :let) (= :fn (scaffold-kind (anf-get x :init))))
+            (value-facts (anf-get x :body) (assoc ctx :lambdas (conj (:lambdas ctx) (anf-get x :name)))
+                         (value-facts (anf-get x :init) ctx acc))
+          (= op :var)
+            (if (contains? (:selfs ctx) (anf-get x :name)) (conj acc (fact {:kind :self})) acc)
+          (= op :global) (conj acc (fact {:kind :value-ref :name (anf-get x :name)}))
+          (= op :remote)
+            (let [m (anf-get x :mod) f (anf-get x :fun) args (anf-get x :args)
+                  callee (first args)
+                  walk-rest (fn [a] (value-facts (vec (rest args)) ctx a))]
+              (cond
+                (and (= m mod-rt) (= f :invoke))
+                  (let [cop (anf-op callee)
+                        actuals (anf-cons-items (second args))]
+                    (cond
+                      (= cop :global)
+                        (walk-rest (conj acc (fact {:kind :call :name (anf-get callee :name)
+                                                    :args (mapv (fn [a] (received-var ctx a)) actuals)})))
+                      (= cop :lit) (walk-rest acc)      ; a keyword/data lookup
+                      ; a call through the function's own name: the knot
+                      ; `(self self)` or the self var — recorded as :self
+                      (or (and (= cop :var) (contains? (:selfs ctx) (anf-get callee :name)))
+                          (and (= cop :apply) (contains? (:selfs ctx) (arg-var (anf-get callee :fn)))))
+                        (value-facts args ctx acc)
+                      (and (= cop :var) (contains? (:lambdas ctx) (anf-get callee :name)))
+                        (walk-rest acc)                 ; a lexical lambda
+                      :else (value-facts args ctx (conj acc (fact {:kind :computed :callee (arg-var callee)})))))
+                (and (= m mod-rt) (contains? #{:apply_to :apply_variadic} f))
+                  (value-facts args ctx (conj acc (fact {:kind :computed :callee (arg-var callee)})))
+                :else
+                  (value-facts args ctx (conj acc (fact {:kind :hof :key (remote-key m f)
+                                                         :args (mapv (fn [a] (received-var ctx a)) args)})))))
+          (= op :apply)
+            ; a loop entry or a recur back-edge is control; anything else
+            ; applies a computed value
+            (let [g (anf-get x :fn)
+                  control (or (scaffold-kind g) (= :apply (anf-op g)))]
+              (value-facts (maps/values x) ctx
+                           (if (or control (contains? (:selfs ctx) (arg-var g))
+                                   (contains? (:lambdas ctx) (arg-var g)))
+                             acc
+                             (conj acc (fact {:kind :computed :callee (arg-var g)})))))
+          :else (reduce (fn [a k] (value-facts (maps/get k x) ctx a)) acc (maps/keys x))))
+    (erlang/is_list x) (reduce (fn [a y] (value-facts y ctx a)) acc x)
+    (erlang/is_tuple x) (reduce (fn [a y] (value-facts y ctx a)) acc (erlang/tuple_to_list x))
+    (erlang/is_map x) (reduce (fn [a k] (value-facts (maps/get k x) ctx a)) acc (maps/keys x))
+    :else acc))
+
+(defn def-value-facts [node]
+  (value-facts node {:selfs #{} :lambdas #{} :value false :top true :line nil} []))
+
+(defn top-scaffolds [x acc]
+  (cond
+    (= :fn (scaffold-kind x)) (conj acc x)
+    (anf-map? x) (reduce (fn [a k] (top-scaffolds (maps/get k x) a)) acc (maps/keys x))
+    (erlang/is_list x) (reduce (fn [a y] (top-scaffolds y a)) acc x)
+    (erlang/is_tuple x) (reduce (fn [a y] (top-scaffolds y a)) acc (erlang/tuple_to_list x))
+    (erlang/is_map x) (reduce (fn [a k] (top-scaffolds (maps/get k x) a)) acc (maps/keys x))
+    :else acc))
+
+(defn runtime-hof-positions
+  "{rt-name {arity #{argument positions it CALLS}}} for every runtime.bl
+   definition, DERIVED from its compiled body: a parameter is called when the
+   body (or a lambda inside it) calls it, or passes it to a position another
+   runtime function calls. A fixpoint; memoized per build."
+  [dir]
+  (let [memo (erlang/get :js-actors-hof-positions)]
+    (if (map? memo)
+      memo
+      (let [defs (compile-source (str dir "/runtime.bl") "js")
+            ; one entry per (name, arity): params, directly called params, pass-ons
+            entries (mapcat
+                      (fn [d]
+                        (map (fn [sc]
+                               (let [inner (anf-get sc :init)
+                                     body-fn (anf-get (first (anf-get inner :clauses)) :body)
+                                     cl (first (anf-get body-fn :clauses))
+                                     params (mapv (fn [p] (if (= :pvar (maps/get :pop p nil)) (maps/get :name p) nil))
+                                                  (anf-get cl :pats))
+                                     facts (value-facts (anf-get cl :body) {:selfs #{} :lambdas #{} :value false :top false :line nil} [])]
+                                 {:name (:name d) :arity (count params) :params params
+                                  :direct (set (keep :callee (filter (fn [f] (= :computed (:kind f))) facts)))
+                                  :pass (vec (concat
+                                               (mapcat (fn [f] (map-indexed (fn [i a] [(:name f) (count (:args f)) i a]) (:args f)))
+                                                       (filter (fn [f] (= :call (:kind f))) facts))
+                                               (mapcat (fn [f] (map-indexed (fn [i a] [(get remote-map (:key f)) (count (:args f)) i a]) (:args f)))
+                                                       (filter (fn [f] (= :hof (:kind f))) facts))))}))
+                             (top-scaffolds (:node d) [])))
+                      defs)
+            table (loop [t {} n 0]
+                    (let [calls? (fn [g ar i] (contains? (get-in t [g ar] #{}) i))
+                          next (reduce (fn [m e]
+                                         (let [called (into (:direct e)
+                                                            (keep (fn [[g ar i a]] (if (and (some? a) (calls? g ar i)) a nil))
+                                                                  (:pass e)))
+                                               pos (set (filter (fn [i] (contains? called (nth (:params e) i)))
+                                                                (range (count (:params e)))))]
+                                           (assoc-in m [(:name e) (:arity e)] pos)))
+                                       {} entries)]
+                      (if (or (= next t) (> n 32)) next (recur next (inc n)))))]
+        (erlang/put :js-actors-hof-positions table)
+        table))))
+
+(defn hof-called-args
+  "The received locals a runtime `:hof` fact hands to a position the runtime
+   function CALLS."
+  [f positions]
+  (let [pos (get-in positions [(get remote-map (:key f)) (count (:args f))] #{})]
+    (keep (fn [i] (nth (:args f) i)) (sort (vec pos)))))
+
+(defn cyclic-names
+  "Every name that reaches itself over `edges`."
+  [order edges]
+  (set (filter (fn [n]
+                 (loop [frontier (vec (get edges n [])) seen #{}]
+                   (cond
+                     (empty? frontier) false
+                     (= n (first frontier)) true
+                     (contains? seen (first frontier)) (recur (vec (rest frontier)) seen)
+                     :else (recur (into (vec (rest frontier)) (get edges (first frontier) []))
+                                  (conj seen (first frontier))))))
+               order)))
+
+(defn value-reasons
+  "The value discipline, for every local definition: {name → [reason …]} plus
+   the evidence the manifest shows. `facts` is {name → value-facts}, `edges`
+   the local reference graph (calls and values)."
+  [order facts edges positions]
+  (let [local (set order)
+        ; every site that calls a received function: a computed call, or a
+        ; received local handed to a position a runtime function calls
+        computed-sites (fn [n]
+                         (let [fs (get facts n)]
+                           (concat (filter (fn [f] (= :computed (:kind f))) fs)
+                                   (filter (fn [f] (and (= :hof (:kind f)) (not (empty? (hof-called-args f positions)))))
+                                           fs))))
+        own-computes (set (filter (fn [n] (not (empty? (computed-sites n)))) order))
+        ; C: computes directly, or calls BY NAME a local that does
+        computes (loop [c own-computes]
+                   (let [next (into c (filter (fn [n] (some (fn [f] (and (= :call (:kind f)) (contains? c (:name f))))
+                                                          (get facts n)))
+                                              order))]
+                     (if (= (count next) (count c)) c (recur next))))
+        used-as-value (set (mapcat (fn [n] (keep (fn [f] (if (and (= :value-ref (:kind f)) (contains? local (:name f)))
+                                                          (:name f) nil))
+                                                 (get facts n)))
+                                   order))
+        cyclic (cyclic-names order edges)
+        reasons (fn [n]
+                  (let [fs (get facts n)]
+                    (vec (concat
+                           (if (some (fn [f] (= :self (:kind f))) fs)
+                             [{:reason :recursive :line (:line (first (filter (fn [f] (= :self (:kind f))) fs)))
+                               :detail "calls itself"}]
+                             [])
+                           (if (contains? cyclic n)
+                             [{:reason :recursive :detail "on a cycle of references"}] [])
+                           (map (fn [f] {:reason :higher-order-value :line (:line f)
+                                         :detail "a function value calls a function it receives"})
+                                (take 1 (filter :value (computed-sites n))))
+                           (map (fn [f] {:reason :higher-order-value :line (:line f)
+                                         :detail (str "a function value calls " (:name f)
+                                                      ", which calls a function it receives")})
+                                (take 1 (filter (fn [f] (and (:value f) (= :call (:kind f)) (contains? computes (:name f)))) fs)))
+                           (map (fn [f] {:reason :higher-order-value :line (:line f)
+                                         :detail (str (:name f) " is used as a value, but calls a function it receives")})
+                                (take 1 (filter (fn [f] (and (= :value-ref (:kind f)) (contains? computes (:name f)))) fs)))))))]
+    {:reasons (reduce (fn [m n] (assoc m n (reasons n))) {} order)
+     :own-computes own-computes :used-as-value used-as-value}))
+
 (defn abi-reasons
   "Why the emitter would refuse to ship these ANF facts to a browser."
   [facts local]
@@ -2507,8 +2766,8 @@
     (fn [acc f]
       (let [k (:kind f) l (:line f)]
         (cond
-          (= k :dynamic-call) (conj acc {:reason :dynamic-call :line l
-                                         :detail "calls a computed function value"})
+          ; a computed call is judged by the value discipline, not refused here
+          (= k :dynamic-call) acc
           (= k :receive) (conj acc {:reason :receive :line l :detail "waits for a message"})
           (= k :remote)
             (let [m (:mod f) fun (:fun f)]
@@ -2539,8 +2798,8 @@
                 (let [callee (:callee c)]
                   (cond
                     (not (= q (:caller c))) acc
-                    (= "<dynamic>" callee)
-                      (conj acc {:reason :dynamic-call :line (:line c) :detail "computed call head"})
+                    ; a computed head is the value discipline's to judge
+                    (= "<dynamic>" callee) acc
                     (and (some? (index-of callee "/")) (not (= :defined (:status c))))
                       (conj acc {:reason (if (String/starts_with? callee "host/") :host-call :outside-abi)
                                  :line (:line c) :detail callee})
@@ -2553,14 +2812,16 @@
    impurity is inherited, and the callee carries the reason)."
   [summaries name callees]
   (let [pure? (fn [n] (let [s (get summaries n)]
-                        (and (some? s) (= {} (:footprint s)) (= true (:terminates s)))))
+                        (and (some? s) (= {} (:footprint s)) (= {} (:latent s)) (= true (:terminates s)))))
         s (get summaries name)]
     (cond
       (nil? s) [{:reason :not-analyzed :detail "the analyzer produced no summary"}]
       (pure? name) []
       (some (fn [g] (not (pure? g))) callees) []
       (not (= true (:terminates s))) [{:reason :may-not-terminate :detail "termination is not proven"}]
-      :else [{:reason :effect :detail (str "footprint " (pr-str (:footprint s)))}])))
+      (not (= {} (:footprint s))) [{:reason :effect :detail (str "footprint " (pr-str (:footprint s)))}]
+      :else [{:reason :effectful-value
+              :detail (str "a function value it creates or names has footprint " (pr-str (:latent s)))}])))
 
 ; ── closures and portability ──────────────────────────────────────────────────────────────
 
@@ -2706,10 +2967,15 @@
         graph (reduce (fn [m n] (assoc m n (graph-reasons (cb/dependency-cone db (str "js/" n)) n))) {} order)
         effects (reduce (fn [m n] (assoc m n (effect-reasons summaries n (get edges n)))) {} order)
         abi (reduce (fn [m n] (assoc m n (abi-reasons (get facts n) local))) {} order)
+        vfacts (reduce (fn [m n] (assoc m n (def-value-facts (:node (get compiled n))))) {} order)
+        vd (value-reasons order vfacts edges (runtime-hof-positions dir))
         own (reduce (fn [m n]
+                      ; the most specific reason first: the value discipline
+                      ; explains a recursion the effect analysis only sees as opaque
                       (assoc m n (vec (concat (if (contains? (:private app) n)
                                                 [{:reason :private :detail "declared :private in :server"}] [])
-                                              (get abi n) (get graph n) (get effects n)))))
+                                              (get abi n) (get (:reasons vd) n)
+                                              (get graph n) (get effects n)))))
                     {} order)
         ok (portable-names order own edges)
         ints (:intents app)
@@ -2750,6 +3016,9 @@
                              :calls (get edges n)
                              :evidence {:graph (verdict (get graph n)) :effects (verdict (get effects n))
                                         :abi (verdict (get abi n))
+                                        :values (verdict (get (:reasons vd) n))
+                                        :calls-values (contains? (:own-computes vd) n)
+                                        :used-as-value (contains? (:used-as-value vd) n)
                                         :private (contains? (:private app) n)}}))
                         order)]
     {:app app :contract contract :digest digest :label label
@@ -2818,6 +3087,9 @@
         placed (+ (expect "board-view" :client) (expect "on-event" :client)
                   (expect "add-problem" :shared) (expect "done-count" :shared)
                   (expect "find-task" :shared)
+                  ; the computed calls: admitted, and in the browser
+                  (expect "arrange" :client) (expect "open-first" :client)
+                  (expect "by-title" :client)
                   (expect "flagged-title?" :server) (expect "blocked-words" :server)
                   (expect "add-task" :server) (expect "initial-board" :server))
         view "(note-banner (:note sync))"
@@ -2827,9 +3099,44 @@
                  (expect-split-refusal dir "leak-effect"
                    (replace-once src "(defn plural [n word] (str n" "(defn plural [n word] (host/write \"x\") (str n")
                    :not-portable "host/write")
-                 (expect-split-refusal dir "leak-dynamic"
-                   (replace-once src "(defn plural [n word] (str n" "(defn plural [n word] ((:fmt word) n) (str n")
-                   :not-portable "dynamic-call")
+                 ; a function VALUE that calls a function it receives: rank two
+                 (expect-split-refusal dir "higher-order-value"
+                   (replace-once src "(defn plural [n word] (str n"
+                                 "(defn plural [n word] ((fn [g] (g n)) inc) (str n")
+                   :not-portable "a function value calls a function it receives at line")
+                 ; recursion is refused explicitly, not by accident
+                 (expect-split-refusal dir "recursive"
+                   (replace-once src "(defn plural [n word] (str n"
+                                 "(defn plural [n word] (if (= n 0) \"\" (plural (dec n) word)) (str n")
+                   :not-portable "— recursive calls itself")
+                 ; two functions that reach each other
+                 (expect-split-refusal dir "mutual"
+                   (str (replace-once src "(defn plural [n word] (str n"
+                                      "(defn plural [n word] (ping n) (str n")
+                        "\n(defn ping [n] (if (= n 0) 0 (pong n)))\n(defn pong [n] (ping (dec n)))\n")
+                   :not-portable "recursive on a cycle of references")
+                 ; mutual recursion through a function value handed to mapv
+                 (expect-split-refusal dir "recursive-through-value"
+                   (str (replace-once src "(defn plural [n word] (str n"
+                                      "(defn plural [n word] (walk-down [n]) (str n")
+                        "\n(defn walk-down [xs] (mapv (fn [x] (walk-down [x])) xs))\n")
+                   :not-portable "walk-down (recursive-through-value:287) — recursive calls itself")
+                 ; a named function that calls values, handed out as a value
+                 (expect-split-refusal dir "computing-value"
+                   (replace-once src "(mapv (fn [o] (order-tab (:order local) o)) (orderings))"
+                                 "(mapv (fn [o] (order-tab (:order local) o)) (orderings)) (mapv arrange [(:order local)])")
+                   :not-portable "arrange is used as a value, but calls a function it receives")
+                 ; a received function laundered through a let, then handed
+                 ; to a runtime higher-order function inside a function value
+                 (expect-split-refusal dir "laundered"
+                   (replace-once src "(defn plural [n word] (str n"
+                                 "(defn plural [n word] ((fn [g] (let [h g] (mapv h [n]))) inc) (str n")
+                   :not-portable "a function value calls a function it receives")
+                 ; an effect hidden in a lambda the client merely creates
+                 (expect-split-refusal dir "effectful-value"
+                   (replace-once src "(defn plural [n word] (str n"
+                                 "(defn plural [n word] (fn [x] (send x word)) (str n")
+                   :not-portable "send")
                  (expect-split-refusal dir "leak-process"
                    (replace-once src "(defn plural [n word] (str n" "(defn plural [n word] (send n word) (str n")
                    :not-portable "send")
@@ -2846,7 +3153,7 @@
                    (str src "\n(defn rt-mapv [f xs] xs)\n")
                    :reserved-name "rt-mapv"))]
     (if (zero? (+ placed leaks))
-      (do (println "SPLIT PASS placement derived, 8 refusals named") 0)
+      (do (println "SPLIT PASS placement derived, 14 refusals named") 0)
       (throw (ex-info "js-actors: split tests failed" {:failures (+ placed leaks)})))))
 
 (defn order-parity!
