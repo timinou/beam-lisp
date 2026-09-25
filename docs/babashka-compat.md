@@ -158,6 +158,20 @@ or with no args to see its bundled-sample demo. All three are gated by the
 `examples_test`/ward runner (loads-and-runs-clean) and by
 `babashka_showcase_test.exs` (asserts the computed output).
 
+## Raw strings — an additive extension
+
+beam-lisp reads one string form Clojure does not: `#|…|`, a **raw** body
+delimited by a run of pipes whose length the opener fixes (`#|` closes at `|`,
+`#||` at `||`), plus its tagged twin `#tag|…|`. Nothing inside is interpreted —
+no escapes, literal newlines, so text that must contain quotes (CSS, JS, SQL,
+another language) needs no escaping at all. Racket's `#<<EOS` here-string is the
+only other Lisp with a form of this shape.
+
+It is **additive**, which is why it costs the compat tier nothing: `#|…|` is a
+read error in Clojure, so no program that reads on the JVM can mean something
+different on the BEAM. A `.cljc` file that avoids the form is unaffected. See
+`docs/raw-strings.bl.md`.
+
 ## Honest status — what is NOT covered
 
 This is a real, useful subset, not "any Babashka app". Deliberately out of scope:

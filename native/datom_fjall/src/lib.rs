@@ -68,6 +68,12 @@ mod atoms {
         // own stdlib atoms use: `false_ = "false"`).
         true_ = "true",
         false_ = "false",
+        // `fjall_count_range` keys. KEYS ONLY: the count a semi-join gate asks
+        // for before choosing a multi-prefix read over one column scan, and
+        // `capped` says whether the walk stopped at the limit (more may
+        // follow) or ran the range out (the count is exact).
+        count,
+        capped,
         // `fjall_stats` keys. The engine's own reporting surface: compaction,
         // flushing, journal and disk accounting, plus the block cache's
         // capacity. NONE of it was readable before this NIF, which is why
@@ -227,6 +233,65 @@ fn fjall_range_chunk<'a>(
         ));
     }
     Ok(pairs.encode(env))
+}
+
+/// `fjall_count_range`: how many KEYS lie in `[start, stop]`, counting at most
+/// `limit` of them.
+///
+/// The counter the engine's semi-join gate asks before choosing between a
+/// multi-prefix read and one column scan. That gate needs the SIZE OF ITS
+/// TARGET COLUMN, and an earlier clause's scan cannot tell it: a query's first
+/// scan may be of a column two rows wide while the semi-join targets one two
+/// hundred rows wide. So the size is asked of the column ITSELF.
+///
+/// KEYS ONLY. The value of every entry is dropped unread, so no datom is
+/// decoded and no term is constructed — the answer is one integer pair, not
+/// rows — and the walk stops the moment `limit` keys have been seen. So the
+/// cost is `min(range, limit)`, and `limit` is chosen from the number of
+/// prefixes being judged: asking is never proportional to the column.
+///
+/// Returns `{count, capped}`. `capped` says the range holds AT LEAST `limit`
+/// keys, so `count` is `min(range, limit)` and is EXACT exactly when `capped`
+/// is false. The break happens ON the `limit`-th key — never one step past it —
+/// so a range holding exactly `limit` keys is not read past its end to find out.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_count_range<'a>(
+    env: Env<'a>,
+    handle: ResourceArc<DbHandle>,
+    start: Option<Binary>,
+    stop: Option<Binary>,
+    limit: usize,
+) -> NifResult<Term<'a>> {
+    use std::ops::Bound;
+    let lower = match &start {
+        Some(b) => Bound::Included(b.as_slice().to_vec()),
+        None => Bound::Unbounded,
+    };
+    let upper = match &stop {
+        Some(b) => Bound::Included(b.as_slice().to_vec()),
+        None => Bound::Unbounded,
+    };
+
+    let mut n: usize = 0;
+    // A zero limit counts nothing and settles nothing, so it reports `capped`
+    // (the range was NOT shown to be empty). A degenerate input, and it must
+    // not cost a key read.
+    if limit > 0 {
+        for entry in handle.datoms.range((lower, upper)) {
+            // The value is dropped UNREAD — counting a range must never pay a
+            // datom decode. `entry?` still surfaces an I/O error, which is a
+            // failed count and must not read as an empty range.
+            entry.map_err(|e| err(e))?;
+            n += 1;
+            if n >= limit {
+                break;
+            }
+        }
+    }
+    let out = map_new(env)
+        .map_put(atoms::count(), n as u64)?
+        .map_put(atoms::capped(), n >= limit)?;
+    Ok(out)
 }
 
 // ══ the datom read path: one crossing, decoded natively ═════════════
