@@ -255,9 +255,118 @@ values. The effectful unrelated `main` lies outside the selected cone; unknown
 functions, second-clause effects, closures and non-ASCII literals are refused.
 `verify-portable-helper.mjs` checks the emitted JS result. This verdict proves
 one narrow portable helper, **not** automatic Loom/Live partitioning; the bundle
-still has an explicit entry and the helper is not wired to the playground.
+still has an explicit entry and the helper is not wired to the playground. The
+[split showcase](#one-bl-file--client-server-and-contract-the-split-showcase)
+below generalizes the same three oracles to parameters, whole view closures and
+a generated contract.
 Alias-qualified graph reachability and later-clause effect union now provide
 necessary evidence but are not by themselves sufficient to move a view.
+
+### One BL file → client, server and contract (the split showcase)
+
+[`showcase.bl`](showcase.bl) is an ordinary BL program — a shared launch
+checklist — plus one `split/defapp` declaration. The build derives **where every
+function runs** and emits three artifacts:
+
+| Artifact | Holds |
+|---|---|
+| `out/showcase-client.mjs` | runtime + [`split-client.bl`](split-client.bl) + only the functions the view, the local reducer and the shared checks reach |
+| `out/showcase-server.mjs` | runtime + [`split-server.bl`](split-server.bl) + the authority's closure: init, checks, guards, apply, private data |
+| `out/showcase.contract.json` | snapshot type, each intent's parameter types, SHA-256 digest of the canonical body |
+| `out/showcase.split.json` | per-function placement and the evidence behind it |
+
+```sh
+BEAM_LISP_Z3=/usr/bin/z3 ELIXIR_ERL_OPTIONS='+S 8:8 +SDio 8' \
+  JS_ACTORS_SPLIT_ONLY=1 ./bin/bl run research/js-actors/compiler.bl   # split only, ~3 min
+node research/js-actors/verify-split.mjs                                # 19 end-to-end checks
+node research/js-actors/split-server.mjs --port 8791                    # then open http://127.0.0.1:8791/
+```
+
+**The declaration.** Roots only — nothing says "client" or "server" per function:
+
+```clojure
+(split/defapp launch-board
+  {:wire    {:task  [:record {:id [:int 1 9999] :title [:text 1 48] :done :bool}]
+             :board [:record {:tasks [:list 12 :task]}]}
+   :server  {:init initial-board :snapshot :board :private [blocked-words]}
+   :client  {:init initial-local :view board-view :on on-event}
+   :intents {:add-task {:params {:title [:text 1 48]}
+                        :check add-problem :guard flagged-title? :apply add-task} …}})
+```
+
+**Placement is derived and fail-closed.** Client roots are `:client` `:init`/
+`:view`/`:on` and every intent `:check`; server roots are `:server :init` and
+every `:check`/`:guard`/`:apply`. A function is in a half iff that half's roots
+reach it through the emitter's own ANF references (calls *and* function values).
+A client-half function must be **portable**, which needs three independent
+oracles to agree, per function, plus the app's own word:
+
+* **graph** — `codebase/dependency-cone`: indexed, no computed call head, no
+  host/interop edge;
+* **effects** — `system.analyze`: footprint `{}` and terminates, over every clause;
+* **abi** — this emitter's ANF: no `host/…` leaf, no process/output verb, no
+  `receive`, no call of a computed function value, nothing outside the checked
+  ABI — inside every lambda too;
+* **not `:private`**, and every local callee portable.
+
+Anything else **refuses the build**, naming the path. Each is a real fixture in
+`compiler.bl/split-tests` (the actual app, one edit away from a leak):
+
+```
+split: board-view cannot run in the browser: board-view (showcase.bl:197)
+  → flagged-title? (showcase.bl:93) → blocked-words (showcase.bl:79)
+  — private declared :private in :server
+split: board-view cannot run in the browser: board-view → plural — host-call host/write at line 151
+split: board-view cannot run in the browser: board-view → plural — dynamic-call computed call head at line 151
+split: board-view cannot run in the browser: board-view → plural — effect send at line 151
+```
+
+plus malformed wire types, unknown or wrong-arity roots, and names that would
+shadow the runtime. Because each half is emitted as its **own** bundle from its
+own closure, server-only code and literals are absent from the client bundle by
+construction (`verify-split.mjs` greps for them). The browser gets 18 of the 26
+app functions.
+
+**The server stays the authority.** A proposal is
+`{request, revision, digest, op, args}`. `split-codec.mjs` decodes it *by
+contract* (exact record keys, bounded text, safe-integer ranges) and grants
+nothing. The compiled BL `split-server.bl` then checks, in order: the build
+digest (`client-outdated`), the declared op and wire args, the revision
+(`stale-revision`, with the current board), the **shared** `:check` again on
+its own snapshot, the server-only `:guard`, and that the next state still
+projects onto the snapshot type (`handler-broke-contract`). Only then does the
+revision advance. The snapshot is a **projection**: `:next-id` and `:audit`
+exist in server state but have no field in the wire type, so they never leave.
+
+**The client is honest about what it knows.** `split-client.bl` runs the
+shared `:check` before sending (a duplicate title is refused *in the browser*,
+no request leaves), shows sent intents as pending ghost rows, adopts only a
+newer board that satisfies the snapshot type, and on `stale-revision` re-runs
+the **same** check against the newer board and re-proposes once — a rebase
+decided by app code, not by the transport. A refused or unanswered submit gives
+the draft back unless the user has typed since; an unanswered intent is never
+assumed committed. Typing and filtering are local-only: no network at all.
+
+**The page** (`showcase.html`, `showcase-page.mjs`) renders the BL view tree
+through a keyed reconciler (focus and caret survive per-keystroke renders;
+text only via `textContent`, attributes through an allowlist), links the Worker
+to `POST /api/intent` and the SSE stream, and shows the placement lanes with
+per-function evidence, the generated contract, and a timeline of where each
+step ran. Open a second tab: its commits arrive as server snapshots.
+
+Verified in a real browser (two tabs, one authority): local filter with no
+revision change; in-browser duplicate refusal with the draft kept; server-only
+credential guard labelled as the server's; a forced two-tab race rebased and
+committed in both tabs; server killed → intent dropped, board unchanged, draft
+returned.
+
+**Limits, stated.** No authentication (single-user loopback). One app per
+file; only `defn`s besides the declaration. Client code may not call a computed
+function value (so `(:k m)` lookups are fine, `(f x)` on a parameter is not)
+and uses the collection prelude in `runtime.bl`. The wire grammar is closed:
+`text`, `int`, `bool`, `list`, `record` and named references. This is a
+build-time partition of one app, not general Loom/Live placement, and a Worker
+is not a sandbox.
 
 ### Safe `Number` proof and emission gate (distinct contracts)
 

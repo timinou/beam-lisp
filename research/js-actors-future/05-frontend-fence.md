@@ -26,6 +26,20 @@ This is an architecture assessment, not an implemented automatic partitioner. Th
 
 The editable quoted-view demo now checks the BL-advertised contract before a live button intent and waits for a server-confirmed Worker frame; its view still bypasses general automatic placement. The first `compiler.bl/portable-helper-verdict` admits only a closed nullary printable-ASCII helper chain, after qualified dependency-cone, all-clause analyzer and actual emitter ABI checks; no inputs, captures or wire values. This is a first build-time verdict, not an automatic Loom/Live cutover. The view evaluator remains an explicit closed grammar and the intent bridge remains explicit. This is a test fixture for the future gate and codec, **not** evidence that arbitrary `loom.ui` modules are client-emittable or that the JS actor runtime isolates untrusted BL source. `proc.fence` bounds a BEAM child computation; it is unrelated to compile-time frontend placement.
 
+### Where the split showcase stands against this cutover
+
+`research/js-actors/showcase.bl` + `compiler.bl/split-plan` implement a first end-to-end cut of steps 1–3 **for one self-contained app file**:
+
+| Step | Implemented | Still open |
+|---|---|---|
+| 1. Call cone | Per-function closure over the emitter's own ANF references (calls and function values, incl. inside lambdas and vector literals); `codebase` cone for graph evidence; keyword lookups no longer count as dynamic calls | One file only: no cross-namespace app code, no macro-expanded user helpers beyond what the compiler expands |
+| 2. Eligibility | Per function: graph ∧ all-clause `system.analyze` footprint `{}`/termination ∧ emitter ABI scan ∧ not `:private`, closed under callees; a client-closure miss refuses the build with the root→offender path. Core value purity is program-aware (a `def`/`defn`/`declare` shadow voids it) | Value provenance of *arguments* (a secret passed into a pure view) is not tracked; the app's `:private` declaration and the snapshot projection are the only secrecy tools. No work budget beyond termination |
+| 3. Contract | One `split/defapp` declaration → canonical JSON contract + SHA-256 digest carried by both halves; closed wire grammar; strict codec; BL re-check of digest, op, args, revision, shared check, server guard and snapshot invariant; stale-revision rebase via the shared check; unanswered intents dropped | No reconnect replay/cancellation protocol beyond SSE hello resync; no authentication |
+| 4. Seam proof | 19 Node end-to-end checks, 8 build-refusal fixtures, real two-tab browser run | No `system.smt`/Veritas equivalence of client vs reference view; codec round-trips are example-based |
+| 5. Replace | — | Not wired into `loom`/`live` |
+
+It is still a build-time partition of one declared app, not automatic Loom/Live placement.
+
 ## Source inspection anchors
 
 - `priv/lib/oracle.bl`, `priv/lib/veritas.bl`, `priv/lib/system/{smt,footprint,analyze,prove,model,core}.bl`, `priv/lib/native/eligible.bl`
