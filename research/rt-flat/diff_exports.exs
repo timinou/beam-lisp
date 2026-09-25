@@ -8,13 +8,27 @@
 # modules export at an arity, over a corpus of vectors, lazy seqs, nested lists
 # and reader nodes, do they agree?
 #
-# Run against BUILT beams (both modules loaded):
+# BeamLisp.RT is gone from the tree, so the reference is a preserved beam of it
+# (built from any pre-cutover commit, e.g. f1f6bfdf): put its directory on -pa.
 #   elixir $(for d in build ~/.cache/beam_lisp/ebin/*/ebin; do echo -pa $d; done) \
-#     research/rt-flat/diff_exports.exs
+#     -pa DIR_WITH_OLD_RT_BEAM research/rt-flat/diff_exports.exs [--fresh]
 # Exit status 1 on any disagreement.
 
 BeamLisp.Bootstrap.install!("build")
 BeamLisp.AOT.boot()
+
+# `--fresh`: compile priv/boot/rt.bl into this VM first, so the diff is of the
+# SOURCE, not of the last build — seconds instead of a tier rebuild.
+if "--fresh" in System.argv() do
+  root = File.cwd!()
+  BeamLisp.Env.add_search_path(Path.join(root, "priv/boot"))
+  BeamLisp.Env.add_search_path(Path.join(root, "priv/std"))
+  BeamLisp.Loader.ensure_loaded("build")
+  out = Path.join(System.tmp_dir!(), "diff-exports-rt")
+  File.rm_rf!(out)
+  File.mkdir_p!(out)
+  BeamLisp.AOT.compile_file(Path.join(root, "priv/boot/rt.bl"), output_dir: out)
+end
 
 old = BeamLisp.RT
 new = BeamLisp.Ns.Rt
@@ -37,7 +51,11 @@ fns = [fn x -> x end, fn x -> is_integer(x) end, fn a, b -> {a, b} end]
 # Global state, processes, printing, nondeterminism: an answer says nothing.
 skip = MapSet.new([
   :seed_core, :println, :println_multi, :gensym, :reader_macro!, :data_reader!,
-  :module_info, :__info__, :__bl_init__, :__bl_provenance__, :trace_2, :untrace_1
+  :module_info, :__info__, :__bl_init__, :__bl_provenance__, :trace_2, :untrace_1,
+  # a message builder the compiler calls with an INTEGER arity only; the corpus
+  # passes it arbitrary values, and RT's answer there is Elixir interpolating a
+  # nil — not a contract
+  :call_shape_error
 ])
 
 shared =
@@ -90,9 +108,38 @@ results =
     {f, a, args, o, n, verdict}
   end
 
+# Departures the oracle DECLARES, each with its reason there
+# (research/rt-cutover/oracle.bl `declared`); a disagreement matching one is
+# accounted for, not a defect.
+seq_fam? = fn x -> is_list(x) or match?(%BeamLisp.Vector{}, x) or match?(%BeamLisp.LazySeq{}, x) end
+empty_res? = fn {:ok, %BeamLisp.Vector{items: {}}}, {:ok, []} -> true; _, _ -> false end
+declared? = fn
+  # sequential-family-is-one-value
+  {f, _, [a, b], _, _, _} when f in [:eqv, :compare] and is_list(a) and is_list(b) -> true
+  {f, _, [a, b], _, _, _} when f in [:eqv, :compare] ->
+    (seq_fam?.(a) and seq_fam?.(b)) or
+      # family-rank orders identities (fns, pids, refs) after data tuples;
+      # RT ranked a tuple (12) after a function (9). Order between families is
+      # the policy table's call, and neither is equal to the other either way.
+      ((is_function(a) and is_tuple(b)) or (is_tuple(a) and is_function(b))) or
+      # a {:meta form m} reader wrapper compares as its form (same policy, rt.bl `unwrap-meta`)
+      match?({:meta, _, _}, a) or match?({:meta, _, _}, b)
+  # rt-empty-result-is-a-VECTOR, and rt-yields-raw-tuple-entries: sort walks a
+  # map through RT's seqable
+  {f, _, args, o, n, _} when f in [:sort, :take] ->
+    empty_res?.(o, n) or Enum.any?(args, &(is_map(&1) and not is_struct(&1)))
+
+  # rt-yields-raw-tuple-entries
+  {:sorted_set_of, _, [m], _, _, _} -> is_map(m) and not is_struct(m)
+  # a transducer is a FRESH closure per call: two are never ==, in either runtime
+  {f, _, _, {:ok, o}, {:ok, n}, _} when f in [:map_xform, :filter_xform, :take_xform] -> is_function(o) and is_function(n)
+  _ -> false
+end
+results = Enum.map(results, fn {f, a, args, o, n, :differ} = r -> if declared?.(r), do: {f, a, args, o, n, :declared}, else: r; r -> r end)
+
 by = Enum.group_by(results, &elem(&1, 5))
 IO.puts("functions compared: #{length(shared)}   calls: #{length(results)}")
-for v <- [:agree, :new_more_total, :differ], do: IO.puts("  #{v}: #{length(Map.get(by, v, []))}")
+for v <- [:agree, :new_more_total, :declared, :differ], do: IO.puts("  #{v}: #{length(Map.get(by, v, []))}")
 
 differ = Map.get(by, :differ, [])
 
