@@ -134,7 +134,7 @@ export function encode(x) {
 export function frameToBL(codec, frame) {
   const board = codec.decodeSnapshot(frame.board);
   const pairs = [[H.kw('revision'), frame.revision], [H.kw('board'), board]];
-  if (frame.request !== undefined) pairs.push([H.kw('request'), frame.request]);
+  if (Number.isSafeInteger(frame.request)) pairs.push([H.kw('request'), frame.request]);
   if (frame.ok !== undefined) pairs.push([H.kw('ok'), frame.ok === true]);
   if (typeof frame.reason === 'string' && /^[a-z][a-z0-9?-]{0,47}$/.test(frame.reason))
     pairs.push([H.kw('reason'), H.kw(frame.reason)]);

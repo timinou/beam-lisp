@@ -148,6 +148,7 @@ export async function startSplitServer({ port = 0, app = 'showcase' } = {}) {
   await authority.ready;
   const STATIC = staticTable(app);
   const streams = new Set();
+  const pendingTabs = new Map();   // server request → proposing tab id
   let nextRequest = 0;
 
   let boundPort = 0;
@@ -156,7 +157,10 @@ export async function startSplitServer({ port = 0, app = 'showcase' } = {}) {
     [`http://127.0.0.1:${boundPort}`, `http://localhost:${boundPort}`].includes(req.headers.origin);
 
   authority.subscribe(frame => {
-    const line = `event: snapshot\ndata: ${JSON.stringify(frame)}\n\n`;
+    const by = pendingTabs.get(frame.request) ?? null;
+    pendingTabs.delete(frame.request);
+    const { request: _internal, ...pub } = frame;
+    const line = `event: snapshot\ndata: ${JSON.stringify({ ...pub, by })}\n\n`;
     for (const res of streams) res.write(line);
   });
 
@@ -180,9 +184,14 @@ export async function startSplitServer({ port = 0, app = 'showcase' } = {}) {
     // server-unique one so two tabs can never collide on a waiter.
     const serverRequest = ++nextRequest;
     const value = H.mapPut(decoded.value, H.kw('request'), serverRequest);
+    // Which tab proposed it: transport metadata for the timeline only (it
+    // never reaches the BL authority and authorizes nothing).
+    const tab = /^[a-z0-9]{8,32}$/.test(req.headers['x-split-tab'] || '') ? req.headers['x-split-tab'] : null;
+    pendingTabs.set(serverRequest, tab);
     let frame;
     try { frame = await authority.propose(serverRequest, value); }
-    catch { return send(res, 503, { ok: false, reason: 'authority-unavailable' }); }
+    catch { pendingTabs.delete(serverRequest); return send(res, 503, { ok: false, reason: 'authority-unavailable' }); }
+    if (!frame.ok) pendingTabs.delete(serverRequest);
     const out = { ...frame, request: json.request };
     return send(res, frame.ok ? 200 : (frame.reason === 'stale-revision' ? 409 : 422), out);
   }

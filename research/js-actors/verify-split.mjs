@@ -172,6 +172,7 @@ const child = spawn(process.execPath, ['--input-type=module', '-e', `
       const msg = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
       if (msg.kind === 'hello') H.enqueueData('hello', H.bmap([[H.kw('digest'), msg.digest], [H.kw('revision'), msg.revision], [H.kw('board'), codec.decodeSnapshot(msg.board)]]));
       else if (msg.kind === 'event') H.enqueueData('event', H.vec(msg.event.map(x => typeof x === 'string' && x.startsWith(':') ? H.kw(x.slice(1)) : x)));
+      else if (msg.kind === 'unreachable') H.enqueueData('unreachable', msg.request);
       else if (msg.kind === 'result' || msg.kind === 'snapshot') H.enqueueData(msg.kind, frameToBL(codec, msg.frame));
       else if (msg.kind === 'stop') H.enqueueData('stop', '');
     }
@@ -275,7 +276,51 @@ tell({ kind: 'result', frame: r.body });
 view = await next('view', mark);
 assert.ok(texts(view.value.tree).includes('Refused by the server: '));
 assert.ok(texts(view.value.tree).includes('looks-like-a-credential'));
+const inputOf = tree => {
+  let found = null;
+  const walk = n => { if (Array.isArray(n)) { if (n[0] === 'input') found = n[1]; n.forEach(walk); } };
+  walk(tree);
+  return found;
+};
+assert.equal(inputOf(view.value.tree).value, 'the secret plan', 'a refused submit gives the draft back');
 ok('the browser cannot pre-check a server-only guard; its refusal is labelled as the server\'s');
+
+// No answer at all: the pending intent is dropped, the board does not move.
+mark = frames.length;
+tell({ kind: 'event', event: [':draft', 'Offline idea'] });
+await next('view', mark);
+mark = frames.length;
+tell({ kind: 'event', event: [':submit'] });
+const lost = (await next('propose', mark)).value;
+const before = frames.filter(f => f.topic === 'view').at(-1).value.revision;
+mark = frames.length;
+tell({ kind: 'unreachable', request: lost.request });
+// the actor traces first, then renders: wait for the view AFTER the trace
+const afterTrace = () => {
+  const i = frames.findIndex((f, j) => j >= mark && f.topic === 'trace' && f.value.step === 'unreachable');
+  return i < 0 ? undefined : frames.slice(i).find(f => f.topic === 'view');
+};
+await until(() => afterTrace() !== undefined, 'view after the unreachable trace');
+view = afterTrace();
+assert.equal(view.value.revision, before);
+assert.ok(texts(view.value.tree).includes('server-unreachable'));
+assert.equal(inputOf(view.value.tree).value, 'Offline idea', 'the draft comes back for a retry');
+assert.equal(texts(view.value.tree).includes('sending'), false, 'no ghost row survives');
+assert.equal(texts(view.value.tree).filter(t => t === 'Offline idea').length, 0, 'the title is not a task row');
+ok('an unanswered intent is dropped, never assumed committed, and its draft returns');
+
+// Typing after submit wins: a later failure must not overwrite newer text.
+mark = frames.length;
+tell({ kind: 'event', event: [':submit'] });
+const lost2 = (await next('propose', mark)).value;
+mark = frames.length;
+tell({ kind: 'event', event: [':draft', 'something newer'] });
+await next('view', mark);
+mark = frames.length;
+tell({ kind: 'unreachable', request: lost2.request });
+await until(() => afterTrace() !== undefined, 'view after the second unreachable trace');
+assert.equal(inputOf(afterTrace().value.tree).value, 'something newer');
+ok('a failure never overwrites text typed after the submit');
 
 tell({ kind: 'stop' });
 child.stdin.end();
