@@ -784,41 +784,70 @@ export function enqueueInput(topic, payload) {
   if (activeRuntime && activeRuntime.inputWake) activeRuntime.inputWake();
 }
 
-// Dedicated typed transport for the editable quoted-view Worker. Unlike
-// enqueueInput, this admits only finite data, not executable BL values; the BL
-// evaluator still makes the final grammar decision. It cannot grant authority.
-export function enqueueQuotedForm(form) {
-  let remaining = 96;
+// Typed data transport: delivers `[:browser :<topic> value]` where `value` is
+// FINITE CLOSED DATA — keywords, bounded strings, safe integers, optionally
+// booleans and nil, vectors, and maps with keyword keys. No function, host
+// handle, cycle or shared node crosses. It cannot grant authority: the BL
+// receiver still decides what the value means. Bounds are the caller's:
+// `nodes` (total values), `depth`, `text` (max string length), `negative`
+// (admit negative integers), `scalars` (admit booleans and nil).
+export function enqueueData(topic, value, { nodes = 4096, depth: maxDepth = 16, text = 4096,
+                                            negative = true, scalars = true, root = null } = {}) {
+  if (typeof topic !== "string" || !/^[a-z][a-z0-9-]{0,31}$/.test(topic))
+    throw new Error("typed input requires an allowed topic");
+  let remaining = nodes;
   const seen = new WeakSet();
-  function check(value, depth) {
-    if (--remaining < 0 || depth > 8) throw new Error("quoted form exceeds transport bounds");
-    if (isKw(value)) return;
-    if (typeof value === "string" && value.length <= 96) return;
-    if (Number.isSafeInteger(value) && value >= 0) return;
-    if (value && typeof value === "object") {
-      if (seen.has(value)) throw new Error("cyclic or reused quoted form");
-      seen.add(value);
-      if (isVec(value)) {
-        for (const item of vecItems(value)) check(item, depth + 1);
+  function check(v, depth) {
+    if (--remaining < 0 || depth > maxDepth) throw new Error("typed input exceeds transport bounds");
+    if (isKw(v)) return;
+    if (typeof v === "string" && v.length <= text) return;
+    if (Number.isSafeInteger(v) && (negative || v >= 0)) return;
+    if (scalars && (v === true || v === false || v === null)) return;
+    if (v && typeof v === "object") {
+      if (seen.has(v)) throw new Error("cyclic or reused typed input");
+      seen.add(v);
+      if (isVec(v)) {
+        for (const item of vecItems(v)) check(item, depth + 1);
         return;
       }
-      if (isBMap(value)) {
-        for (const key of listToArray(mapKeys(value))) {
-          if (!isKw(key)) throw new Error("quoted map requires keyword keys");
+      if (isBMap(v)) {
+        for (const key of listToArray(mapKeys(v))) {
+          if (!isKw(key)) throw new Error("typed map requires keyword keys");
           check(key, depth + 1);
-          check(mapGet(value, key), depth + 1);
+          check(mapGet(v, key), depth + 1);
         }
         return;
       }
     }
-    throw new Error("quoted form requires closed data values");
+    throw new Error("typed input requires closed data values");
   }
-  if (!isVec(form)) throw new Error("quoted form requires a vector root");
-  check(form, 0);
+  if (root === "vector" && !isVec(value)) throw new Error("typed input requires a vector root");
+  check(value, 0);
   const queue = activeRuntime ? activeRuntime.inbox : earlyInputs;
   if (queue.length >= 1024) throw new Error("browser input queue is full");
-  queue.push(vec([kw("browser"), kw("preview"), form]));
+  queue.push(vec([kw("browser"), kw(topic), value]));
   if (activeRuntime && activeRuntime.inputWake) activeRuntime.inputWake();
+}
+
+// The editable quoted-view Worker's form: the tightest profile of the same
+// transport (96 nodes, depth 8, short strings, no negatives or scalars).
+export function enqueueQuotedForm(form) {
+  try {
+    enqueueData("preview", form, { nodes: 96, depth: 8, text: 96, negative: false,
+                                   scalars: false, root: "vector" });
+  } catch (error) {
+    throw new Error(error.message.replace("typed input", "quoted form").replace("typed map", "quoted map"));
+  }
+}
+
+// The structured output sink: `(host/emit :topic value)` hands a BL value to
+// the embedding transport (a Worker, an HTTP bridge). One sink per process;
+// the transport decides nothing about the value beyond encoding it, and a BL
+// program that emits with no sink installed fails loudly instead of dropping.
+let emitSink = null;
+export function setEmitter(fn) {
+  if (fn !== null && typeof fn !== "function") throw new Error("emitter must be a function or null");
+  emitSink = fn;
 }
 
 export function waitForInput(rt, ms, inputEnabled = true) {
@@ -969,6 +998,13 @@ export const PURE = {
   arith,
   "str-cat": (...xs) => xs.map(toStr).join(""),
   "str-size": (s) => s.length,
+  // A substring by UTF-16 index, bounds-checked: `subs` on this target.
+  "str-slice": (s, from, to) => {
+    if (typeof s !== "string" || !Number.isSafeInteger(from) || !Number.isSafeInteger(to) ||
+        from < 0 || to < from || to > s.length)
+      throw new Error("subs: index out of range");
+    return s.slice(from, to);
+  },
   truthy,
   // ── reading a raised value ─────────────────────────────────────────────────
   //
@@ -1015,6 +1051,12 @@ export const RT_HOST = {
   "make-frames": (rt, f, args) => { const as = argsArray(args); return [resolveCallee(f, as)(rt, as)]; },
   ref: (rt, ns, name) => ref(rt, ns, name),
   write: (rt, s) => { rt.out(toStr(s)); return null; },
+  emit: (rt, topic, value) => {
+    if (!isKw(topic)) throw new Error("host/emit: topic must be a keyword");
+    if (emitSink === null) throw new Error("host/emit: no transport installed for :" + topic.n);
+    emitSink(topic.n, value);
+    return null;
+  },
   raise: (rt, msg) => { throw new Error(toStr(msg)); },
   "record-error": (rt, msg) => { rt.errors = (rt.errors || 0) + 1; rt.lastError = toStr(msg); return rt.errors; },
   // ── mutable tables ─────────────────────────────────────────────────────────
