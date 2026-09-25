@@ -537,20 +537,44 @@
 (def SEMI-JOIN-MAX
   "The most distinct join values a semi-join reads by prefix before the
    engine prefers one column scan. Above this the prefix list itself is the
-   cost — and a column with fewer rows than bound entities is the cheaper
-   read. Deliberately a constant, not a statistic: predictable beats clever
-   here, exactly as `clause-cost` argues.
+   cost, so this is a hard ceiling — one input to the gate, not the gate.
 
-   KNOWN GAP (measured 2026-09-22, FUP-118 W2d): this cap alone decides the
-   shape, so a 692-row column joined by 685 entities is read as 685 prefixes
-   instead of one scan — the /activity screen, 23.7M reductions read the old
-   way and 67.3M read this way, same answer. A gate needs the SIZE OF THE
-   COLUMN, and a per-query estimate of it is not sound: a query's first scan
-   may be of a column two rows wide while the semi-join targets a column two
-   hundred rows wide. What is needed is a cheap count over the clause's own
-   index range (`datom.store/Count`, native `count-range` — no value decode and
-   no term construction), after which the rule is `prefixes x ratio < rows`."
+   It WAS the whole gate until 2026-09-23, and that was measured wrong: a
+   692-row column joined by 685 entities was read as 685 prefixes instead of
+   one scan — the /activity screen, 23.7M reductions read the old way and
+   67.3M read this way, SAME answer (FUP-118 W2d). The missing fact was the
+   size of the TARGET column, and it cannot be inferred from an earlier
+   clause's scan: a query's first scan may be of a column two rows wide while
+   the semi-join targets a column two hundred rows wide (that gate was
+   written, tested and reverted). So the size is now asked of the column
+   itself, through the substrate's bounded key count (`datom.store/Count`,
+   native `count-range` — keys only, no decode, stopped early)."
   4096)
+
+(def SEMI-JOIN-ALLOWANCE
+  "Prefix lists this short are taken as a semi-join WITHOUT probing the
+   column: below this the whole join is a handful of seeks, and the probe that
+   would judge them costs about what they do. An absolute allowance is the
+   honest shape for a decision this close to free — the same argument
+   `clause-cost` makes for a predictable constant over a clever estimate.
+
+   It also keeps the request count of a small join exactly what it was: an
+   unprobed semi-join is ONE store operation."
+  64)
+
+(def SEMI-JOIN-PREFIX-RATIO
+  "How many rows of a scanned column one bound prefix must be worth.
+
+   A prefix is a native seek plus its decode; a column row is one row of one
+   sequential scan. The measured exchange rate on the real corpus is ~16 000
+   reductions per prefix against ~1 000 per row, so the true break-even is
+   nearer 16 — and this is deliberately LOWER. The wins `cost_test` already
+   contracts are ROW-COUNT wins (a selective join whose answer grows with its
+   binding set), and at 16 a 200-binding join over a 400-row column would flip
+   to a full scan reading MORE rows than the join it replaced. 2 settles the
+   measured regression — 685 prefixes over 692 rows now scans the column —
+   and flips nothing that is already contracted."
+  2)
 
 (defn- semi-join-selection
   "How to read `clause` for a join variable at `position` that is bound in
@@ -585,6 +609,46 @@
           :else nil)
       :else nil)))
 
+(defn- semi-join-worth-it?
+  "Whether a semi-join over `prefix-count` bound values beats one scan of the
+   clause's OWN column.
+
+   The column's size is asked OF THE COLUMN, never inferred: bounding it by
+   what an earlier clause happened to scan was written, tested and reverted,
+   because the target may be two rows wide or two hundred thousand (FUP-118
+   W2d). So this asks the substrate for a bounded KEY count over exactly the
+   range the ordinary column scan would read — `datom.store/count-range`, which
+   decodes no value and builds no datom — with the limit set to the break-even.
+   The moment `prefixes x SEMI-JOIN-PREFIX-RATIO` keys have been seen the
+   answer is settled and the walk stops, so the probe is O(prefixes) rather
+   than O(column).
+
+   Three answers:
+     · few prefixes (≤ `SEMI-JOIN-ALLOWANCE`) → true, and nothing is asked
+     · no bounded counter on this substrate → true (the constant gate this
+       always had: an unanswerable question must not become a guess)
+     · otherwise → true only when the column is at least
+       `prefixes x SEMI-JOIN-PREFIX-RATIO` rows wide"
+  [db common clause prefix-count]
+  (if (<= prefix-count SEMI-JOIN-ALLOWANCE)
+    true
+    (let [schema (datom.db/schema-of db)
+          ; The very selection the column path would use, so the probe measures
+          ; the column that path would pay for — same index, same prefix.
+          selection (datom.query.plan/index-for schema common clause)
+          prefix (apply datom.index/key-prefix (get selection 0) (get selection 1))
+          limit (* prefix-count SEMI-JOIN-PREFIX-RATIO)
+          probe (datom.store/count-range (datom.db/store-of db)
+                                         prefix (datom.index/prefix-end prefix) limit)]
+      (if (nil? probe)
+        true
+        ; `:capped` is the whole answer: the range holds AT LEAST `limit`
+        ; keys, so the column is at least `prefixes x ratio` wide — one prefix
+        ; per row it would spend is worth it. A walk that ran the range out
+        ; (`:capped` false) measured the WHOLE column and found it narrower:
+        ; scan it.
+        (get probe :capped)))))
+
 (defn- pattern-scan-once
   "Every extension of EVERY binding in `bindings` under `clause`, using a
    SINGLE store scan.
@@ -614,7 +678,14 @@
    the join variable is bound first.
 
    Answers are identical either way; only the number of store operations
-   changes."
+   changes.
+
+   WHICH of the two is not decided by the prefix count alone. N prefixes are
+   N seeks, so they only win against a column WIDER than they are worth — and
+   the column's width is measured, not guessed (`semi-join-worth-it?`). A
+   column the size of its binding set is scanned: /activity joined a 692-row
+   audit column by 685 entities, and 685 seeks to avoid one scan cost 2.8x the
+   reductions (67.3M against 23.7M, same 53 rows; FUP-118 W2d)."
   [db bindings clause remaining]
   (let [; Bind only what every row agrees on: a term bound to the SAME
         ; value across all rows can narrow the scan, one that varies
@@ -648,13 +719,21 @@
                              (every? (fn [b] (contains? b join-var)) bindings))
                       (into [] (distinct (mapv (fn [b] (get b join-var)) bindings)))
                       nil)
-        semi (if (and (some? join-values)
-                      (<= (count join-values) SEMI-JOIN-MAX)
-                      ; only a store that answers N prefixes in ONE request:
-                      ; anything else would be the N+1 shape in disguise.
-                      (datom.store/multi-scan? (datom.db/store-of db)))
-               (semi-join-selection (datom.db/schema-of db) (or common {})
-                                    terms join-position join-values)
+        semi-selection (if (and (some? join-values)
+                               (<= (count join-values) SEMI-JOIN-MAX)
+                               ; only a store that answers N prefixes in ONE
+                               ; request: anything else is N+1 in disguise.
+                               (datom.store/multi-scan? (datom.db/store-of db)))
+                          (semi-join-selection (datom.db/schema-of db) (or common {})
+                                               terms join-position join-values)
+                          nil)
+        ; ... and only when N prefixes beat one scan of THIS column. The
+        ; column's own size decides (bounded key probe, `semi-join-worth-it?`),
+        ; never another clause's scan: a 692-row column joined by 685 entities
+        ; is one scan, and an earlier clause's width says nothing about it.
+        semi (if (and (some? semi-selection)
+                      (semi-join-worth-it? db (or common {}) clause (count join-values)))
+               semi-selection
                nil)
         ; The read this clause will make, named once so the trace can report
         ; the SHAPE rather than only the rows: a semi-join and a column scan
