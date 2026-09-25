@@ -35,6 +35,8 @@ new = BeamLisp.Ns.Rt
 Code.ensure_loaded!(old)
 
 vec = fn xs -> BeamLisp.Vector.new(xs) end
+BeamLisp.Compiler.eval_string("(ns diffx.rec) (defrecord DxR [a b])")
+record = BeamLisp.Compiler.eval_string("(diffx.rec/->DxR 1 2)")
 lazy = fn xs -> BeamLisp.LazySeq.new(fn -> xs end) end
 
 corpus = [
@@ -45,7 +47,10 @@ corpus = [
   {:list, [{:symbol, "f"}, 1]}, {:meta, {:symbol, "x"}, %{line: 1}},
   # reference types: every collection fn must REFUSE them (dispatch_table_test);
   # the first corpus had none, and `find` on an atom passed unnoticed
-  BeamLisp.Refs.atom(1), BeamLisp.Refs.volatile(1)
+  BeamLisp.Refs.atom(1), BeamLisp.Refs.volatile(1),
+  # a RECORD and a FOREIGN struct: both are maps with a __struct__ key, and the
+  # runtime must tell them apart (conj of a non-entry into a record was missed)
+  record, %URI{host: "h"}
 ]
 
 # Functions as arguments: invoke, apply_to, map, filter, reduce … take one first.
@@ -158,6 +163,8 @@ declared? = fn
 
   # rt-yields-raw-tuple-entries
   {:sorted_set_of, _, [m], _, _, _} -> is_map(m) and not is_struct(m)
+  # host-struct-leaks-as-a-collection: RT called any non-bl struct a collection
+  {:coll?, _, [x], _, _, _} -> is_struct(x) and not match?(%BeamLisp.Vector{}, x)
   # a transducer is a FRESH closure per call: two are never ==, in either runtime
   {f, _, _, {:ok, o}, {:ok, n}, _} when f in [:map_xform, :filter_xform, :take_xform] -> is_function(o) and is_function(n)
   _ -> false
