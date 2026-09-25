@@ -42,7 +42,10 @@ corpus = [
   [], [1, 2, 3], [[1, 2], [3]], [:a, [1, 2]],
   vec.([]), vec.([1, 2, 3]), vec.([vec.([:a, 1]), vec.([:b, 2])]), vec.([{:symbol, "s"}, {:list, []}]),
   lazy.([1, 2]), %{}, %{a: 1}, BeamLisp.Set.new([1, 2]),
-  {:list, [{:symbol, "f"}, 1]}, {:meta, {:symbol, "x"}, %{line: 1}}
+  {:list, [{:symbol, "f"}, 1]}, {:meta, {:symbol, "x"}, %{line: 1}},
+  # reference types: every collection fn must REFUSE them (dispatch_table_test);
+  # the first corpus had none, and `find` on an atom passed unnoticed
+  BeamLisp.Refs.atom(1), BeamLisp.Refs.volatile(1)
 ]
 
 # Functions as arguments: invoke, apply_to, map, filter, reduce … take one first.
@@ -144,6 +147,8 @@ declared? = fn
       # RT ranked a tuple (12) after a function (9). Order between families is
       # the policy table's call, and neither is equal to the other either way.
       ((is_function(a) and is_tuple(b)) or (is_tuple(a) and is_function(b))) or
+      # likewise a fn against a reference cell: both identities, no value order
+      ((is_function(a) and is_struct(b)) or (is_struct(a) and is_function(b))) or
       # a {:meta form m} reader wrapper compares as its form (same policy, rt.bl `unwrap-meta`)
       match?({:meta, _, _}, a) or match?({:meta, _, _}, b)
   # rt-empty-result-is-a-VECTOR, and rt-yields-raw-tuple-entries: sort walks a
