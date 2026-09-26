@@ -131,6 +131,53 @@ defmodule BeamLisp.DepsCompileTest do
     assert File.exists?(Path.join(app_dir, "priv/data.txt"))
   end
 
+  test "runtime deps join the .app's applications, as Mix writes them", %{cache: cache} do
+    # bandit's .app used to name only its extra_applications, so every release
+    # closure dropped thousand_island and `web/serve` could not start.
+    d = sha("c")
+
+    store_package!(cache, "server", "0.1.0", d, [
+      {"mix.exs",
+       """
+       defmodule DepsCompileServer.MixProject do
+         use Mix.Project
+
+         def project, do: [app: :server, version: "0.1.0", deps: deps()]
+         def application, do: [extra_applications: [:logger]]
+
+         defp deps do
+           [
+             {:thousand_island, "~> 1.5"},
+             {:plug, "~> 1.18", override: true},
+             {:req, "~> 0.3", only: [:dev, :test]},
+             {:ex_doc, "~> 0.24", runtime: false},
+             {:jason, "~> 1.0", optional: true}
+           ]
+         end
+       end
+       """},
+      {"lib/server.ex", "defmodule DepsCompileServer do\nend\n"}
+    ])
+
+    proj = Path.join(cache, "proj")
+    File.mkdir_p!(proj)
+    lock!(proj, [{"server", "0.1.0", d}])
+    r = compile!(proj)
+    assert r.by_name["server"][:state] == :compiled, inspect(r.results)
+
+    rt = call("deps-compile", "runtime-tag", [])
+    app = Path.join([cache, "beam_lisp", "ebin", "server-0.1.0-#{String.slice(d, 0, 8)}-#{rt}", "ebin/server.app"])
+    {:ok, [{:application, :server, props}]} = :file.consult(String.to_charlist(app))
+    apps = props[:applications]
+
+    assert :logger in apps
+    assert :thousand_island in apps
+    assert :plug in apps
+    refute :req in apps
+    refute :ex_doc in apps
+    refute :jason in apps
+  end
+
   test "a second run is :cached, and a broken package is reported without ending the run",
        %{cache: cache} do
     good = sha("b")
