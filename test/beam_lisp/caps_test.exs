@@ -57,11 +57,11 @@ defmodule BeamLisp.CapsTest do
   # -- path 3: dynamic invoke of a handle smuggled in from outside -----
 
   test "a $remote handle created at :global cannot fire inside a capped env" do
-    handle = BeamLisp.RT.remote_fun(String, :upcase)
+    handle = BeamLisp.Ns.Rt.remote_fun(String, :upcase)
 
     assert_raise BeamLisp.CompileError, ~r/module String is not granted/, fn ->
       Env.isolated(Env.fork(:global, caps: []), fn ->
-        BeamLisp.RT.invoke(handle, ["hi"])
+        BeamLisp.Ns.Rt.invoke(handle, ["hi"])
       end)
     end
   end
@@ -171,7 +171,7 @@ defmodule BeamLisp.CapsTest do
     # wrapper reachable from a sandbox lends the sandbox its authority.
     assert {:ok, "TOP-SECRET"} =
              Env.isolated(Env.fork(:global, caps: [String]), fn ->
-               BeamLisp.RT.invoke(leak, [secret])
+               BeamLisp.Ns.Rt.invoke(leak, [secret])
              end)
 
     # The mitigation is compile-time: writing that SAME call *inside* the
@@ -212,7 +212,7 @@ defmodule BeamLisp.CapsTest do
     # The fix: the deputy re-enters the CALLER's conveyed env before doing
     # the work, and reaches the resource through the gated interop path.
     # Now the caller's caps (String only) govern, and File is denied.
-    fileread = BeamLisp.RT.remote_fun(File, :read)
+    fileread = BeamLisp.Ns.Rt.remote_fun(File, :read)
 
     convey =
       spawn(fn ->
@@ -221,7 +221,7 @@ defmodule BeamLisp.CapsTest do
             result =
               try do
                 Env.bind(token)
-                {:served, BeamLisp.RT.invoke(fileread, [path])}
+                {:served, BeamLisp.Ns.Rt.invoke(fileread, [path])}
               rescue
                 e -> {:denied, e.__struct__}
               end

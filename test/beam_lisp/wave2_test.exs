@@ -4,7 +4,7 @@ defmodule BeamLisp.Wave2Test do
   use ExUnit.Case, async: false
 
   setup do
-    BeamLisp.RT.seed_core()
+    BeamLisp.Ns.Rt.seed_core()
     :ok
   end
 

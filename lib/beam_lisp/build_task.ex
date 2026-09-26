@@ -78,8 +78,8 @@ defmodule BeamLisp.BuildTask do
           ])
         end)
 
-      errors = result |> BeamLisp.RT.get(:errors) |> Enum.to_list()
-      built = BeamLisp.RT.get(result, :built)
+      errors = result |> BeamLisp.Ns.Rt.get(:errors) |> Enum.to_list()
+      built = BeamLisp.Ns.Rt.get(result, :built)
 
       cond do
         errors != [] ->
@@ -179,7 +179,7 @@ defmodule BeamLisp.BuildTask do
     end
 
     BeamLisp.Loader.ensure_loaded("build")
-    BeamLisp.RT.invoke(BeamLisp.Env.fetch!("build", name), args)
+    BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("build", name), args)
   end
 
   # Every source the loader would load: plain `.bl` plus literate `.bl.md` /

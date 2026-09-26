@@ -96,14 +96,18 @@ defmodule BeamLisp.Wave26LazinessTest do
       assert Test.realize(eval("(filter (fn [x] (> x 1)) [1 2 3])")) == [2, 3]
     end
 
-    test "empty lazy results are the empty seq (), and [] stays ≠ ()" do
-      # An empty lazy seq realizes to `()` (the Clojure-model empty seq),
-      # and beam-lisp's structural `=` still says an empty lazy seq equals
-      # both `()` and `[]` (both have no elements). But `[]` and `()` as
-      # concrete values stay distinct — wave 3's deliberate split.
+    test "empty lazy results are the empty seq (), and every empty sequence is one value" do
+      # An empty lazy seq realizes to `()` (the Clojure-model empty seq).
+      # List, vector and lazy seq are ONE sequential family (priv/boot/rt.bl,
+      # `k-compare`): equal when their elements are equal. So the three
+      # empties are one value — Clojure's rule. Wave 3 split `[]` from `()`;
+      # the runtime cutover (PLAN-148) retired that split by decision.
       assert eval("(= (map inc []) ())") == true
       assert eval("(= (map inc []) [])") == true
-      assert eval("(= [] ())") == false
+      assert eval("(= [] ())") == true
+      assert eval("(= [1 2] '(1 2))") == true
+      assert eval("(= [1 2] '(1 3))") == false
+      assert eval(~S"(= #{} ())") == false
       assert eval("(empty? (map inc []))") == true
     end
 

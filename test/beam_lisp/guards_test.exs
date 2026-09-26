@@ -397,7 +397,7 @@ defmodule BeamLisp.GuardsTest do
     end
 
     # And the guard really excludes them, while ordinary data passes.
-    refute BeamLisp.RT.count({:bl_deftype, Foo, {1, 2}}) == 3
+    refute BeamLisp.Ns.Rt.count({:bl_deftype, Foo, {1, 2}}) == 3
   rescue
     FunctionClauseError -> :ok
   end

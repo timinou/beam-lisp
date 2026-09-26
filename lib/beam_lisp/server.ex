@@ -32,7 +32,7 @@ defmodule BeamLisp.Server do
   @doc """
   The return constructors bound as locals in every server callback
   body. Each value is a beam-lisp `$blfn` dispatching on arity, so the
-  compiler's `RT.invoke/2` call path can invoke it with the callback's
+  compiler's `rt/invoke` call path can invoke it with the callback's
   arguments and get back the exact OTP return tuple:
 
       ok      → {:ok, s}            {:ok, s, t}          (init)

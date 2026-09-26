@@ -31,7 +31,8 @@ defmodule BeamLisp.Multi do
   fn) preserves its methods — mirroring CLJ-1351.
   """
 
-  alias BeamLisp.{Env, RT}
+  alias BeamLisp.Env
+  alias BeamLisp.Ns.Rt, as: RT
   import BeamLisp.Guards, only: [is_bl_map: 1]
 
 
@@ -94,9 +95,9 @@ defmodule BeamLisp.Multi do
       end
 
     Env.put_key({:multi, ns, name}, entry)
-    # RT.invoke spreads call args over the fn's parameters (apply/2),
+    # `rt/invoke` spreads call args over the fn's parameters (apply/2),
     # so a fixed-arity closure would only ever see one arg. A tagged
-    # variadic value ({min, f} with min 0) makes RT.invoke hand the fn
+    # variadic value ({min, f} with min 0) makes `rt/invoke` hand the fn
     # the whole args list instead, so any arity reaches dispatch/3.
     # The ns/name it closes over are stable per multi, so re-definition
     # simply re-interns a fresh value over the same key.

@@ -116,7 +116,7 @@ defmodule BeamLisp.WebSocket do
   defp atom(a) when is_atom(a), do: a
   defp atom(s) when is_binary(s), do: String.to_atom(s)
 
-  defp invoke(f, args), do: BeamLisp.RT.invoke(f, args)
+  defp invoke(f, args), do: BeamLisp.Ns.Rt.invoke(f, args)
 
   @doc """
   Build the adapter's initial state from a beam-lisp handler map and a

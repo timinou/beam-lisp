@@ -1,6 +1,6 @@
 defmodule BeamLisp.SortedTest do
   @moduledoc """
-  Substrate tests for `BeamLisp.Sorted` and its `BeamLisp.RT` integration.
+  Substrate tests for `BeamLisp.Sorted` and its `BeamLisp.Ns.Rt` integration.
 
   Two distinct concerns live here, and they fail for different reasons:
 
@@ -21,7 +21,8 @@ defmodule BeamLisp.SortedTest do
 
   use ExUnit.Case, async: true
 
-  alias BeamLisp.{RT, Sorted}
+  alias BeamLisp.Sorted
+  alias BeamLisp.Ns.Rt, as: RT
   alias BeamLisp.Sorted.{SortedMap, SortedSet}
 
   describe "key encoding reproduces Clojure's compare order" do
@@ -145,7 +146,7 @@ defmodule BeamLisp.SortedTest do
 
   describe "RT integration: the struct-is-a-map hazard" do
     # Every assertion below guards a clause that MUST precede the generic
-    # map/struct clauses in BeamLisp.RT. `find/2` is the one that actually
+    # map/struct clauses in BeamLisp.Ns.Rt. `find/2` is the one that actually
     # regressed during development, and it regressed silently.
 
     setup do

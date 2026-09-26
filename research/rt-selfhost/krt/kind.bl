@@ -1,0 +1,279 @@
+; krt/kind.bl — the ONE classifier every runtime protocol dispatches on.
+;
+; Why this file exists: the Elixir runtime decides "what kind of thing is this"
+; in at least five independent places — the clause heads of rt.ex's protocol
+; functions, the `rank/1` table behind `compare`, the `call_shape/1` table
+; behind `invoke`, the per-type `when is_bl_map(...)` exclusions, and the
+; `guard-bifs`/`num-bifs` tables in the compiler. Each is maintained by hand and
+; each can disagree with the others; Set's own moduledoc warns that rt's set
+; clauses MUST precede its `is_bl_map` clauses "or count/seq/first read the
+; struct's fields instead of the members" — an invariant enforced by comment.
+;
+; One classifier makes the ordering hazard structural instead of documentary: a
+; struct can never be mistaken for a map because `kind` asks the struct first.
+;
+; This file is written with raw Erlang BIFs only. Every `erlang/...` call below
+; lowers to a direct Core Erlang remote call; none of them routes through
+; BeamLisp.RT, so `krt` carries no dependency on the runtime it is replacing.
+; (Writing `(= a b)` here would emit a linked call to BeamLisp.RT.eqv/2 — the
+; compiler's call-lowering shortcut — so equality is spelled `erlang/==`.) The
+; one shared dependency is the planned `Krt.Intrinsics` module (raw cons/empty/
+; tuple constructors) — not the runtime.
+;
+; EQUALITY OF KINDS uses `(erlang/== x MOD)`, not a `case` on literal atoms,
+; because the module atoms are computed once at load time; a `case` would have
+; to repeat each literal everywhere.
+;
+; REPAIRS over the first prototype (NATIVE-PLAN §5):
+;   * predicates are now read off `kind` instead of sniffing field presence, so
+;     `(vector? {:items 1})` is false — a plain map with a `:items` key used to
+;     satisfy `vector?` while `kind` called it `:map`;
+;   * every reserved tuple tag from `BeamLisp.Guards/@internal_tuple_tags` is
+;     classified (not just symbol/blfn/remote/bl_vec), so `{:meta f m}`,
+;     `{:bl_deftype …}` and `{:bl_reify …}` are no longer mistaken for data
+;     tuples whose fields leak through `first`/`count`/`seq`;
+;   * kinds are one public descriptor vector `representations`, and `struct-kind`
+;     reads it — there is no second module→kind table to drift;
+;   * unknown structs are `:opaque`; only structs registered as beam-lisp records
+;     are `:record`.
+
+(ns krt.kind)
+
+;; ── registered representation modules ──────────────────────────────────────
+; Computed once at load: `case` patterns elsewhere would have to repeat each
+; literal atom in every clause.
+(def VEC-MOD     (erlang/binary_to_atom "Elixir.BeamLisp.Vector" :utf8))
+(def SET-MOD     (erlang/binary_to_atom "Elixir.BeamLisp.Set" :utf8))
+(def LAZY-MOD    (erlang/binary_to_atom "Elixir.BeamLisp.LazySeq" :utf8))
+(def SMAP-MOD    (erlang/binary_to_atom "Elixir.BeamLisp.Sorted.SortedMap" :utf8))
+(def SSET-MOD    (erlang/binary_to_atom "Elixir.BeamLisp.Sorted.SortedSet" :utf8))
+(def REDUCED-MOD (erlang/binary_to_atom "Elixir.BeamLisp.Reduced" :utf8))
+(def DECIMAL-MOD (erlang/binary_to_atom "Elixir.BeamLisp.Decimal" :utf8))
+
+;; ── reserved tuple tags (the guards.ex authority, mirrored) ─────────────────
+; `BeamLisp.Guards/@internal_tuple_tags` is the production single place that
+; decides what is data and what is machinery. A reserved tag means the tuple is
+; language machinery, not a positional data value: it must stay opaque to
+; `first`/`rest`/`count`/`seq`. `reserved-tags` is public and `semantic_test`
+; asserts it equals the host list, so the mirror cannot drift silently.
+(def BLFN-TAG      :"$blfn")
+(def REMOTE-TAG    :"$remote")
+(def MACRO-TAG     :"$macro")
+(def PROTOCOL-TAG  :"$protocol")
+(def TRANSIENT-TAG :"$transient")
+(def SYMBOL-TAG    :symbol)
+(def META-TAG      :meta)
+(def DEFTYPE-TAG   :bl_deftype)
+(def REIFY-TAG     :bl_reify)
+(def TRIE-TAG      :bl_vec)
+
+(def reserved-tags
+  (Krt.Intrinsics/cons BLFN-TAG
+    (Krt.Intrinsics/cons REMOTE-TAG
+      (Krt.Intrinsics/cons MACRO-TAG
+        (Krt.Intrinsics/cons PROTOCOL-TAG
+          (Krt.Intrinsics/cons TRANSIENT-TAG
+            (Krt.Intrinsics/cons SYMBOL-TAG
+              (Krt.Intrinsics/cons META-TAG
+                (Krt.Intrinsics/cons DEFTYPE-TAG
+                  (Krt.Intrinsics/cons REIFY-TAG
+                    (Krt.Intrinsics/cons TRIE-TAG
+                      (Krt.Intrinsics/empty))))))))))))
+
+;; ── representation descriptors ──────────────────────────────────────────────
+; The public description of every REGISTERED struct representation. The
+; orchestrator's generator reads this vector to emit specialized modules and
+; tag tables; `struct-kind` reads it too, so a registered module has exactly one
+; classification. Adding a representation is one entry here.
+;
+; Built with raw BIFs (`maps/put`, `list_to_tuple`) rather than `{…}` / `[…]`
+; literals: a map literal lowers through `BeamLisp.RT.hash_key` and a vector
+; literal through `BeamLisp.Vector.__struct__`, and this file must not import the
+; runtime it classifies. The vector is small enough to hold its elements as a
+; tuple (`Vector`'s tail layout), which is exactly how `struct-desc` walks it.
+(defn- desc [kd mod fam]
+  (maps/put :family fam
+    (maps/put :module mod
+      (maps/put :kind kd (maps/new)))))
+
+(defn- vec-of [items]
+  (maps/put :meta nil
+    (maps/put :items (erlang/list_to_tuple items)
+      (maps/put :__struct__ VEC-MOD (maps/new)))))
+
+(def representations
+  (vec-of
+    (Krt.Intrinsics/cons (desc :vector VEC-MOD :sequential)
+      (Krt.Intrinsics/cons (desc :lazy LAZY-MOD :sequential)
+        (Krt.Intrinsics/cons (desc :set SET-MOD :set)
+          (Krt.Intrinsics/cons (desc :sorted-set SSET-MOD :set)
+            (Krt.Intrinsics/cons (desc :sorted-map SMAP-MOD :map)
+              (Krt.Intrinsics/cons (desc :decimal DECIMAL-MOD :number)
+                (Krt.Intrinsics/cons (desc :reduced REDUCED-MOD :identity)
+                  (Krt.Intrinsics/empty))))))))))
+
+(defn- rep-count [] (erlang/tuple_size (erlang/map_get :items representations)))
+(defn- rep-at [i] (erlang/element (erlang/+ i 1) (erlang/map_get :items representations)))
+
+(defn- struct-desc
+  "The descriptor for a registered struct module, or nil. This is the ONLY
+   module→kind map; `struct-kind` reads it and nothing else maps modules."
+  [mod]
+  (loop [i 0]
+    (cond
+      (erlang/>= i (rep-count)) nil
+      :else (let [d (rep-at i)]
+              (cond (erlang/== mod (erlang/map_get :module d)) d
+                    :else (recur (erlang/+ i 1)))))))
+
+(defn struct-mod
+  "The `__struct__` module of `x`, or nil when `x` is not a struct. A struct IS
+   a map on the BEAM, so this is where 'map' and 'struct' are separated — once,
+   for every protocol in the runtime."
+  [x]
+  (cond
+    (erlang/is_map x) (cond (erlang/is_map_key :__struct__ x) (erlang/map_get :__struct__ x)
+                            :else nil)
+    :else nil))
+
+(defn- struct-kind [mod]
+  (let [d (struct-desc mod)]
+    (cond
+      (erlang/== d nil)
+      (cond (BeamLisp.Record/record_module? mod) :record
+            :else :opaque)
+      :else (erlang/map_get :kind d))))
+
+(defn- tuple-kind [x]
+  (cond
+    (erlang/== 0 (erlang/tuple_size x)) :tuple
+    :else (let [h (erlang/element 1 x)]
+            (cond
+              (erlang/== h BLFN-TAG) :blfn
+              (erlang/== h REMOTE-TAG) :remote
+              (erlang/== h MACRO-TAG) :macro
+              (erlang/== h PROTOCOL-TAG) :protocol
+              (erlang/== h TRANSIENT-TAG) :transient
+              (erlang/== h SYMBOL-TAG) :symbol
+              (erlang/== h META-TAG) :meta
+              (erlang/== h DEFTYPE-TAG) :deftype
+              (erlang/== h REIFY-TAG) :reify
+              (erlang/== h TRIE-TAG) :opaque
+              :else :tuple))))
+
+(defn kind
+  "The single classification of a beam-lisp value.
+
+   The order is load-bearing and belongs to exactly one place: nils, scalars,
+   then lists, then tuples, then maps. A struct is a map, so the struct check
+   runs before the plain-map answer and can never be forgotten."
+  [x]
+  (cond
+    (erlang/== x nil) :nil
+    (erlang/is_boolean x) :bool
+    (erlang/is_atom x) :atom
+    (erlang/is_integer x) :int
+    (erlang/is_float x) :float
+    (erlang/is_binary x) :text
+    (erlang/is_function x) :fn
+    (erlang/is_pid x) :pid
+    (erlang/is_port x) :port
+    (erlang/is_reference x) :ref
+    (erlang/is_list x) :list
+    (erlang/is_tuple x) (tuple-kind x)
+    (erlang/is_map x) (cond
+                        (erlang/is_map_key :__struct__ x)
+                        (struct-kind (erlang/map_get :__struct__ x))
+                        :else :map)
+    :else :other))
+
+;; ── kind predicates ────────────────────────────────────────────────────────
+; Each is a one-line read of the one table, so no predicate can drift from the
+; classifier. The first prototype sniffed field presence (`is_map_key :items`),
+; which let a plain map answer `vector?` while `kind` answered `:map`.
+
+(declare family)
+
+(defn- is-kind? [x kd] (erlang/== (kind x) kd))
+
+(defn nil? [x] (is-kind? x :nil))
+(defn bool? [x] (is-kind? x :bool))
+(defn keyword? [x] (is-kind? x :atom))
+(defn symbol? [x] (is-kind? x :symbol))
+(defn string? [x] (is-kind? x :text))
+(defn fn? [x]
+  (cond
+    (erlang/== (kind x) :fn) true
+    (erlang/== (kind x) :blfn) true
+    (erlang/== (kind x) :remote) true
+    :else false))
+(defn int? [x] (is-kind? x :int))
+(defn float? [x] (is-kind? x :float))
+(defn decimal? [x] (is-kind? x :decimal))
+(defn number? [x] (erlang/== (family (kind x)) :number))
+(defn vector? [x] (is-kind? x :vector))
+(defn set? [x] (is-kind? x :set))
+(defn sorted-set? [x] (is-kind? x :sorted-set))
+(defn lazy? [x] (is-kind? x :lazy))
+(defn sorted-map? [x] (is-kind? x :sorted-map))
+(defn record? [x] (is-kind? x :record))
+(defn map? [x] (is-kind? x :map))
+(defn sequential? [x] (erlang/== (family (kind x)) :sequential))
+(defn ident? [x]
+  (cond
+    (erlang/== (kind x) :atom) true
+    (erlang/== (kind x) :symbol) true
+    :else false))
+(defn ref-type? [x]
+  (cond
+    (erlang/== (kind x) :ref) true
+    (erlang/== (kind x) :port) true
+    (erlang/== (kind x) :pid) true
+    (erlang/== (kind x) :fn) true
+    (erlang/== (kind x) :blfn) true
+    (erlang/== (kind x) :remote) true
+    :else false))
+(defn coll? [x]
+  (cond
+    (erlang/== (kind x) :list) true
+    (erlang/== (kind x) :vector) true
+    (erlang/== (kind x) :lazy) true
+    (erlang/== (kind x) :set) true
+    (erlang/== (kind x) :sorted-set) true
+    (erlang/== (kind x) :map) true
+    (erlang/== (kind x) :sorted-map) true
+    (erlang/== (kind x) :record) true
+    :else false))
+
+;; ── semantic family ────────────────────────────────────────────────────────
+; The comparison/equality family a kind belongs to. `krt.eq` orders and compares
+; by family, not by kind, so a list, a vector and a lazy seq with the same
+; elements are one value, and a set equals its sorted sibling. The registered
+; struct families are read from the descriptors themselves. Primitive scalar
+; families below have no separate descriptor to keep in sync.
+(defn family [kd]
+  (cond
+    (erlang/== kd :nil) :nil
+    (erlang/== kd :bool) :bool
+    (erlang/== kd :int) :number
+    (erlang/== kd :float) :number
+    (erlang/== kd :text) :text
+    (erlang/== kd :symbol) :symbol
+    (erlang/== kd :atom) :atom
+    (erlang/== kd :list) :sequential
+    (erlang/== kd :map) :map
+    (erlang/== kd :record) :record
+    (erlang/== kd :tuple) :tuple
+    (erlang/== kd :meta) :meta
+    (erlang/== kd :fn) :identity
+    (erlang/== kd :blfn) :identity
+    (erlang/== kd :remote) :identity
+    (erlang/== kd :pid) :identity
+    (erlang/== kd :port) :identity
+    (erlang/== kd :ref) :identity
+    :else (loop [i 0]
+            (cond
+              (erlang/>= i (rep-count)) :opaque
+              :else (let [d (rep-at i)]
+                      (cond (erlang/== kd (erlang/map_get :kind d)) (erlang/map_get :family d)
+                            :else (recur (erlang/+ i 1))))))))

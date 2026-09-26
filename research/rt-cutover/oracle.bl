@@ -1,0 +1,388 @@
+; rt/oracle.bl — the differential oracle (PLAN-143 P1).
+;
+; THE CUTOVER'S SAFETY NET. A replacement runtime is only safe if it answers the
+; SAME QUESTIONS the same way, so every operation the facade exposes is run
+; twice over one value matrix — once through `rt` (the BL runtime) and once
+; through `BeamLisp.RT` (the Elixir runtime it replaces) — and the two answers
+; are compared as terms.
+;
+; THREE OUTCOMES, and only two are allowed:
+;
+;   agree            both answered the same term, or both refused
+;   bl-more-total    the Elixir runtime RAISED and the BL runtime answered.
+;                    A deliberate, documented policy (the Elixir runtime's own
+;                    `=` docstring promises totality; several primitives are not
+;                    total). Counted, never silent.
+;   FAIL             a different term, or the BL runtime raising where the
+;                    Elixir runtime answered.
+;
+; A FAIL is tolerated only when it is DECLARED: `declared` names a policy and
+; the condition under which that policy applies. This matters because the
+; cutover is not supposed to reproduce every quirk — the Elixir runtime has
+; defects the BL runtime removes by construction — but a behaviour change that
+; nobody wrote down is indistinguishable from a bug. Every declared entry names
+; the defect it is departing from, and is printed on every run.
+;
+; The oracle is only as good as its matrix, so the matrix is heterogeneous on
+; purpose: every kind, every reserved tag, empty/small/large sequences, lazy and
+; infinite producers, decimals at their boundaries, metadata-wrapped values.
+; `norm` realizes a lazy result so two answers about the same sequence compare as
+; sequences rather than as two opaque thunks.
+
+(ns rt.oracle
+  (:require [rt :as rt]))
+
+(def vals
+  (list nil true false 0 1 -1 2.5 1M :kw 'sym "str"
+        [1 2 3] [] [0 1 2 3 4 5 6 7 8 9]
+        #{} #{1 2} {} {:a 1}
+        (list) (list 1 2 3) (list 1 2)
+        (range 4) (map inc (list 1 2 3))
+        {:a 1 :b 2}
+        ;; The two values that separate RT's `map?`/`set?` from the classifier's:
+        ;; RT says a sorted map IS a map and a sorted set IS a set, and the
+        ;; classifier answers for the plain map and the hashed set alone. Every
+        ;; row about a map or a set was green until these were in the matrix —
+        ;; the corpus is the gate's coverage, so a predicate with nothing in the
+        ;; matrix that separates it is a predicate nobody checked.
+        (rt/sorted-set (list 1 2))
+        (rt/sorted-map (list :a 1))
+        ;; The values that separate the CLAUSES of `invocable?`. A plain fn and a
+        ;; multi-fn are the two callables whose arity the compiler asks about, and
+        ;; a corpus of data alone left every one of those clauses unexecuted —
+        ;; which is how `fun_info(f, :arity)` (a 2-TUPLE, compared to an integer)
+        ;; shipped: every plain fn answered "not invocable" and no row noticed.
+        inc
+        (rt/multi-fn {1 inc})))
+
+(defn- norm
+  "Realize a lazy result through the PRELUDE, not through either runtime under
+   test, so the comparison is about the answer and not the representation."
+  [v]
+  (if (rt/lazy? v) (to-list v) v))
+
+(defn- outcome [f v]
+  (try {:ok (norm (f v))} (catch _e {:raised true})))
+
+(defn- verdict [a b]
+  (cond
+    (and (:raised a) (:raised b)) :agree
+    (:raised b) :bl-more-total
+    (:raised a) :fail
+    :else (if (erlang/== (:ok a) (:ok b)) :agree :fail)))
+
+;; ── declared departures from the Elixir runtime ─────
+; Each entry: the operation, the condition on the input, and the defect being
+; departed from. Keep this list short and exact — it is the record of every
+; user-visible behaviour change in the cutover.
+
+(defn- map-like? [v] (or (rt/map? v) (rt/sorted-map? v)))
+(defn- nothing-in-it? [v] (or (erlang/== v nil) (rt/empty? v)))
+
+(def declared
+  (list
+    ;; ONE defect, several operations that route through it. `take` and `sort`
+    ;; both end by calling RT's `empty_contract`, which turns an empty result into
+    ;; an empty VECTOR; and both walk a map through `seqable`, which yields raw
+    ;; 2-TUPLES. The policy is named for the DEFECT, not for the operation that
+    ;; first exposed it, so the next operation to reach it is a new entry here
+    ;; and not a new policy.
+    {:op "take 2" :when nothing-in-it? :policy :rt-empty-result-is-a-VECTOR
+     :why (str "the Elixir runtime's `empty_contract` answers the empty VECTOR [] "
+               "for an empty result — measured: (take 2 ()) => [] with vector? "
+               "true, and (sort ()) => [] likewise — while a non-empty result is "
+               "a list. The BL runtime returns the empty list in both cases.")}
+    {:op "sort v" :when nothing-in-it? :policy :rt-empty-result-is-a-VECTOR
+     :why "same defect as take — sort ends in the same `empty_contract`"}
+    {:op "sort cmp v" :when nothing-in-it? :policy :rt-empty-result-is-a-VECTOR
+     :why "same defect as take — sort ends in the same `empty_contract`"}
+    {:op "take 2" :when map-like? :policy :rt-yields-raw-tuple-entries
+     :why (str "the Elixir runtime is inconsistent about map entries: "
+               "(first {:a 1}) => the entry VECTOR [:a 1], but "
+               "(first (take 2 {:a 1})) => the raw TUPLE {:a, 1} — and `sort` on "
+               "a map yields the raw tuples too, because both walk the map "
+               "through `seqable`. The BL runtime yields entry vectors from all "
+               "of them. (BUG filed.)")}
+    {:op "sort v" :when map-like? :policy :rt-yields-raw-tuple-entries
+     :why "same defect as take — sort walks the map through the same `seqable`"}
+    {:op "sort cmp v" :when map-like? :policy :rt-yields-raw-tuple-entries
+     :why "same defect as take — sort walks the map through the same `seqable`"}
+    ;; A THIRD caller of the same defect, and the reason the policy is named for
+    ;; the defect: `concat` reaches it through `LazySeq.input`/`seqable` rather
+    ;; than through `empty_contract`, and it is the only one of the three where
+    ;; an EMPTY map agrees (concat has no empty-result coercion) — so this entry
+    ;; is `map-like?` alone, and the empty case needs no entry at all.
+    {:op "sorted-set-of v" :when map-like? :policy :rt-yields-raw-tuple-entries
+     :why "same defect as take — sorted_set_of walks the map through the same `seqable`"}
+        {:op "concat v v" :when map-like? :policy :rt-yields-raw-tuple-entries
+     :why "same defect as take — concat walks the map through the same `seqable`"}
+    ;; THE SEQUENTIAL FAMILY (decision, PLAN-148): list, vector and lazy seq are
+    ;; one value family, equal element by element — Clojure's rule. The Elixir
+    ;; runtime answered false for a vector against a list, including `[]` vs `()`.
+    ;; No corpus value paired a vector with a list until the exhaustive
+    ;; differential (research/rt-flat/diff_exports.exs) did; the rows below are
+    ;; the oracle's copy of that decision.
+    {:op "eqv vec list" :when (fn [v] (rt/vector? v)) :policy :sequential-family-is-one-value
+     :why "(= [1 2] '(1 2)) — the BL runtime says true, the Elixir runtime false"}
+    {:op "compare vec list" :when (fn [v] (or (rt/vector? v) (rt/lazy? v))) :policy :sequential-family-is-one-value
+     :why (str "(compare [1 2] '(1 2)) — 0 in the BL runtime, 1 in the Elixir runtime; "
+               "a lazy seq against the list of its elements likewise (RT ranked lazy "
+               "after list even where its `=` said equal — `=` and `compare` disagreed)")}
+    ;; Part of the same comparison policy (rt.bl `unwrap-meta`): a `{:meta form
+    ;; m}` reader wrapper compares as its FORM, so metadata never changes an
+    ;; order. The Elixir runtime compared the raw 3-tuple.
+    {:op "compare v 0" :when (fn [v] (and (erlang/is_tuple v) (erlang/== :meta (erlang/element 1 v))))
+     :policy :sequential-family-is-one-value
+     :why "a metadata wrapper compares as the value it wraps"}
+        {:op "coll?" :when rt/decimal? :policy :host-struct-leaks-as-a-collection
+     :why (str "the Elixir runtime calls a Decimal a collection — (coll? 1M) => "
+               "true, (count 1M) => 2 (its struct fields!), and (seq 1M) RAISES "
+               "\"protocol Enumerable not implemented for BeamLisp.Decimal\". "
+               "The BL classifier calls it a number. (BUG filed.)")}
+    {:op "coll?" :when (fn [v] (and (rt/struct? v) (not (rt/decimal? v)))) :policy :host-struct-leaks-as-a-collection
+     :why "same defect for any foreign struct: RT answered (coll? %URI{}) true; the BL classifier calls it opaque"}
+        {:op "count" :when rt/decimal? :policy :host-struct-leaks-as-a-collection
+     :why "same defect as coll? — count reads the struct's two fields"}
+    {:op "empty?" :when rt/decimal? :policy :host-struct-leaks-as-a-collection
+     :why "same defect as coll? — empty? answers about the struct's fields"}))
+
+(defn- declaration [label v]
+  (first (filter (fn [d] (and (erlang/== label (:op d)) ((:when d) v))) declared)))
+
+(defn- add-num
+  "A step that is total on every value in the corpus, so the row measures the
+   FOLD and not an arithmetic refusal."
+  [a b]
+  (cond (erlang/is_number a) (cond (erlang/is_number b) (erlang/+ a b) :else a)
+        :else a))
+
+(def ops
+  ;; [label, BL runtime, Elixir runtime]
+  (list
+    ["vector?"     (fn [v] (rt/vector? v))     (fn [v] (BeamLisp.RT/vector? v))]
+    ["map?"        (fn [v] (rt/map? v))        (fn [v] (BeamLisp.RT/map? v))]
+    ["set?"        (fn [v] (rt/set? v))        (fn [v] (BeamLisp.RT/set? v))]
+    ["sorted-set?" (fn [v] (rt/sorted-set? v)) (fn [v] (BeamLisp.RT/sorted_set? v))]
+    ["sorted-map?" (fn [v] (rt/sorted-map? v)) (fn [v] (BeamLisp.RT/sorted_map? v))]
+    ["string?"     (fn [v] (rt/string? v))     (fn [v] (BeamLisp.RT/string? v))]
+    ["keyword?"    (fn [v] (rt/keyword? v))    (fn [v] (BeamLisp.RT/keyword? v))]
+    ["symbol?"     (fn [v] (rt/symbol? v))     (fn [v] (BeamLisp.RT/symbol? v))]
+    ["number?"     (fn [v] (rt/number? v))     (fn [v] (BeamLisp.RT/number? v))]
+    ["int?"        (fn [v] (rt/int? v))        (fn [v] (BeamLisp.RT/int? v))]
+    ["float?"      (fn [v] (rt/float? v))      (fn [v] (BeamLisp.RT/float? v))]
+    ["decimal?"    (fn [v] (rt/decimal? v))    (fn [v] (BeamLisp.RT/decimal? v))]
+    ["sequential?" (fn [v] (rt/sequential? v)) (fn [v] (BeamLisp.RT/sequential? v))]
+    ["coll?"       (fn [v] (rt/coll? v))       (fn [v] (BeamLisp.RT/coll? v))]
+    ["fn?"         (fn [v] (rt/fn? v))         (fn [v] (BeamLisp.RT/fn? v))]
+    ["nil?"        (fn [v] (rt/nil? v))        (fn [v] (erlang/== nil v))]
+
+    ["first"       (fn [v] (rt/first v))       (fn [v] (BeamLisp.RT/first v))]
+    ["rest"        (fn [v] (rt/rest v))        (fn [v] (BeamLisp.RT/rest v))]
+    ["next"        (fn [v] (rt/next v))        (fn [v] (BeamLisp.RT/next v))]
+    ["seq"         (fn [v] (rt/seq v))         (fn [v] (BeamLisp.RT/seq v))]
+    ["count"       (fn [v] (rt/count v))       (fn [v] (BeamLisp.RT/count v))]
+    ["nth 1"       (fn [v] (rt/nth v 1))       (fn [v] (BeamLisp.RT/nth v 1))]
+    ["empty?"      (fn [v] (rt/empty? v))      (fn [v] (BeamLisp.RT/empty? v))]
+    ["take 2"      (fn [v] (rt/take 2 v))      (fn [v] (BeamLisp.RT/take 2 v))]
+    ;; `drop` is RT's (coll, n) — the order the compiler's `[a & more]`
+    ;; destructuring emits — and `drop_clj` is Clojure's (n, coll). This row
+    ;; once called BOTH runtimes as (drop 2 v): the same wrong order on each
+    ;; side, so it compared two mistakes and agreed.
+    ["drop v 2"    (fn [v] (rt/drop v 2))      (fn [v] (BeamLisp.RT/drop v 2))]
+    ["sorted-set-of v" (fn [v] (rt/sorted-set? (rt/sorted-set-of (if (rt/coll? v) v []))))
+                       (fn [v] (BeamLisp.RT/sorted_set? (BeamLisp.RT/sorted_set_of (if (BeamLisp.RT/coll? v) v []))))]
+    ;; the sequential family, asked of every corpus value: v against the list
+    ;; of its own elements. Agrees for lists and lazy seqs; departs (declared)
+    ;; for vectors.
+    ["eqv vec list" (fn [v] (rt/eqv v (rt/doall (rt/seq v))))
+                    (fn [v] (BeamLisp.RT/eqv v (BeamLisp.RT/doall (BeamLisp.RT/seq v))))]
+    ["compare vec list" (fn [v] (rt/compare v (rt/doall (rt/seq v))))
+                        (fn [v] (BeamLisp.RT/compare v (BeamLisp.RT/doall (BeamLisp.RT/seq v))))]
+    ["drop-clj 2"  (fn [v] (rt/drop-clj 2 v))  (fn [v] (BeamLisp.RT/drop_clj 2 v))]
+    ["cons"        (fn [v] (rt/cons 0 v))      (fn [v] (BeamLisp.RT/cons 0 v))]
+
+    ["eqv v v"     (fn [v] (rt/eqv v v))       (fn [v] (BeamLisp.RT/eqv v v))]
+    ["eqv v nil"   (fn [v] (rt/eqv v nil))     (fn [v] (BeamLisp.RT/eqv v nil))]
+    ["compare v v" (fn [v] (rt/compare v v))   (fn [v] (BeamLisp.RT/compare v v))]
+    ["compare v 0" (fn [v] (rt/compare v 0))   (fn [v] (BeamLisp.RT/compare v 0))]
+
+    ;; `reduce` has a row because it did not have one, and the gap was not
+    ;; theoretical: the ported fold called `Krt.Specialized/reduced?`, a module
+    ;; that exists only inside the prototype, so EVERY reduce over a collection
+    ;; raised — and this gate, which is meant to be the reason a cutover is safe,
+    ;; passed anyway. A probe asking an unrelated question about growth found it.
+    ;; Coverage is a claim about the table, not about the code.
+
+    ;; ── the ported surface, second wave ────────────────────────────────────
+    ;; Every name added here is a name the cutover will re-point, and the gate
+    ;; only covers what its table names - which is how the whole reduce family
+    ;; shipped broken. A row that cannot be written as a function of ONE corpus
+    ;; value fixes its other argument, exactly as the `take 2` row does.
+
+    ;; calls
+    ["boolean"     (fn [v] (rt/boolean v))     (fn [v] (BeamLisp.RT/boolean v))]
+    ["seq?"        (fn [v] (rt/seq? v))        (fn [v] (BeamLisp.RT/seq? v))]
+    ["list?"       (fn [v] (rt/list? v))       (fn [v] (BeamLisp.RT/list? v))]
+    ["sorted?"     (fn [v] (rt/sorted? v))     (fn [v] (BeamLisp.RT/sorted? v))]
+    ["struct?"     (fn [v] (rt/struct? v))     (fn [v] (BeamLisp.RT/struct? v))]
+    ["associative?" (fn [v] (rt/associative? v)) (fn [v] (BeamLisp.RT/associative? v))]
+    ;; `invocable?` is the compiler's call-head test, so a wrong answer silently
+    ;; re-routes a call rather than raising. Two rows, because the arity is the
+    ;; question and a fn that answers the wrong arity is the whole defect.
+    ["invocable? 1" (fn [v] (rt/invocable? v 1)) (fn [v] (BeamLisp.RT/invocable? v 1))]
+    ["invocable? 2" (fn [v] (rt/invocable? v 2)) (fn [v] (BeamLisp.RT/invocable? v 2))]
+    ["identical? v v" (fn [v] (rt/identical? v v)) (fn [v] (BeamLisp.RT/identical? v v))]
+    ["not- v"      (fn [v] (rt/not- v))        (fn [v] (BeamLisp.RT/not_ v))]
+    ;; `apply` spreads its last argument, and EVERY collection shape is an
+    ;; argument list somewhere: `(apply list [tag value])` is how the reader
+    ;; builds its nodes. The port spread only a list, so a vector spread to `()`
+    ;; and the first boot-tier build through it read every node back as `{}` —
+    ;; no row here named a vector as apply's argument.
+    ["apply list v" (fn [v] (rt/apply-to (fn [& xs] xs) v)) (fn [v] (BeamLisp.RT/apply_to (fn [& xs] xs) v))]
+    ["apply count v" (fn [v] (rt/apply-to (fn [& xs] (erlang/length xs)) v)) (fn [v] (BeamLisp.RT/apply_to (fn [& xs] (erlang/length xs)) v))]
+
+    ;; collections
+    ["get v 0"     (fn [v] (rt/get v 0))       (fn [v] (BeamLisp.RT/get v 0))]
+    ["contains? v 0" (fn [v] (rt/contains? v 0)) (fn [v] (BeamLisp.RT/contains? v 0))]
+    ["conj v 0"    (fn [v] (rt/conj v 0))      (fn [v] (BeamLisp.RT/conj v 0))]
+    ["assoc v 0 1" (fn [v] (rt/assoc v 0 1))   (fn [v] (BeamLisp.RT/assoc v 0 1))]
+    ["disj v 0"    (fn [v] (rt/disj v 0))      (fn [v] (BeamLisp.RT/disj v 0))]
+    ["set v"       (fn [v] (rt/set v))         (fn [v] (BeamLisp.RT/set v))]
+    ["find v 0"    (fn [v] (rt/find v 0))      (fn [v] (BeamLisp.RT/find v 0))]
+    ["peek v"      (fn [v] (rt/peek v))        (fn [v] (BeamLisp.RT/peek v))]
+    ["pop v"       (fn [v] (rt/pop v))         (fn [v] (BeamLisp.RT/pop v))]
+    ["last-key v"  (fn [v] (rt/last-key v))    (fn [v] (BeamLisp.RT/last_key v))]
+    ["last-entry v" (fn [v] (rt/last-entry v)) (fn [v] (BeamLisp.RT/last_entry v))]
+    ["sort v"      (fn [v] (rt/sort v))        (fn [v] (BeamLisp.RT/sort v))]
+    ["sort cmp v"  (fn [v] (rt/sort (fn [a b] (rt/compare a b)) v))
+                   (fn [v] (BeamLisp.RT/sort (fn [a b] (BeamLisp.RT/compare a b)) v))]
+    ;; `concat` is a LAZY producer, and the corpus values are the two hardest
+    ;; shapes for it: a source that runs out mid-way (`()`), and a source that is
+    ;; not a seq at all (`nil`, a number). `norm` realizes the answer, so a
+    ;; finished-but-wrong concat and a lazily-stuck one are both visible.
+    ["concat v v"  (fn [v] (rt/concat (list v v))) (fn [v] (BeamLisp.RT/concat (list v v)))]
+
+    ;; ── the call protocol ──────────────────────────────────────────────────
+    ;; `invoke` is the single hottest function in the runtime — the compiler
+    ;; lowers EVERY call with a computed head through it — and it is the one
+    ;; function a shape-based differential row can exercise with the corpus
+    ;; alone, because the corpus holds a value of nearly every callable kind.
+    ["invoke kw"    (fn [v] (rt/invoke :a (list {:a v})))
+                    (fn [v] (BeamLisp.RT/invoke :a (list {:a v})))]
+    ["invoke fn"    (fn [v] (rt/invoke inc (list v)))
+                    (fn [v] (BeamLisp.RT/invoke inc (list v)))]
+    ["invoke multi" (fn [v] (rt/invoke (rt/multi-fn {1 inc}) (list v)))
+                    (fn [v] (BeamLisp.RT/invoke (BeamLisp.RT/multi_fn {1 inc}) (list v)))]
+    ["invoke vec"   (fn [v] (rt/invoke [10 20] (list 1)))
+                    (fn [v] (BeamLisp.RT/invoke [10 20] (list 1)))]
+    ["invoke set"   (fn [v] (rt/invoke #{1 2} (list 1)))
+                    (fn [v] (BeamLisp.RT/invoke #{1 2} (list 1)))]
+    ["invoke v"     (fn [v] (rt/invoke v (list 1)))
+                    (fn [v] (BeamLisp.RT/invoke v (list 1)))]
+
+    ;; numbers
+    ["even?"       (fn [v] (rt/even? v))       (fn [v] (BeamLisp.RT/even? v))]
+    ["odd?"        (fn [v] (rt/odd? v))        (fn [v] (BeamLisp.RT/odd? v))]
+    ["neg?"        (fn [v] (rt/neg? v))        (fn [v] (BeamLisp.RT/neg? v))]
+    ["pos?"        (fn [v] (rt/pos? v))        (fn [v] (BeamLisp.RT/pos? v))]
+    ["zero?"       (fn [v] (rt/zero? v))       (fn [v] (BeamLisp.RT/zero? v))]
+    ["nan?"        (fn [v] (rt/nan? v))        (fn [v] (BeamLisp.RT/nan? v))]
+    ["promoting-inc" (fn [v] (rt/promoting-inc v)) (fn [v] (BeamLisp.RT/promoting_inc v))]
+
+    ;; NOT COVERED YET: name-of, namespace-of, print-str, print-readably. Their
+    ;; owners exist but the gate disagrees with them, so they are not in the
+    ;; facade — and a row for a name nobody serves is a green light that means
+    ;; nothing. The printer is seed-critical and is the next thing to finish.
+
+    ["hash-key"    (fn [v] (rt/hash-key v))    (fn [v] (BeamLisp.RT/hash_key v))]
+
+    ;; ── printing, names, stringification ──────────────────────────────────
+    ;; The printer is seed-critical: the compiler calls `print_str` directly.
+    ;; It is also the group where a probe written by the same author as the
+    ;; code proved nothing at all — the ported version used six host idioms
+    ;; that raise, and its probe asked only the shapes its author had in mind.
+    ["print-str"      (fn [v] (rt/print-str v))      (fn [v] (BeamLisp.RT/print_str v))]
+    ["print-readably" (fn [v] (rt/print-readably v)) (fn [v] (BeamLisp.RT/print_readably v))]
+    ["name-of"        (fn [v] (rt/name-of v))        (fn [v] (BeamLisp.RT/name_of v))]
+    ["namespace-of"   (fn [v] (rt/namespace-of v))   (fn [v] (BeamLisp.RT/namespace_of v))]
+    ["drop-clj 2"     (fn [v] (rt/drop-clj 2 v))     (fn [v] (BeamLisp.RT/drop_clj 2 v))]
+
+    ;; ── the arities the contract names and the port did not have ──────────
+    ;; Each of these was a name whose OWNER already had the right shape; the
+    ;; facade had wired a different arity, so the contract's name was absent
+    ;; while a lookalike sat in its place. `subseq` was the worst of them: the
+    ;; facade's two-arity took a TEST and a KEY (Clojure's `subseq`), and RT's
+    ;; three-arity is a BINARY-SEARCH RANGE QUERY — same name, different
+    ;; function, and no gate could see it because nothing in the matrix was an
+    ;; ordered collection until this week.
+    ["nth 1 default"   (fn [v] (rt/nth v 1 99))       (fn [v] (BeamLisp.RT/nth v 1 99))]
+    ["range 0 take 5"  (fn [v] (rt/take 5 (rt/range)))
+                       (fn [v] (BeamLisp.RT/take 5 (BeamLisp.RT/range)))]
+    ["subseq nil nil" (fn [v] (rt/subseq v nil nil)) (fn [v] (BeamLisp.RT/subseq v nil nil))]
+    ["rsubseq nil nil" (fn [v] (rt/rsubseq v nil nil)) (fn [v] (BeamLisp.RT/rsubseq v nil nil))]
+    ["map-multi 3"    (fn [v] (rt/map-multi inc (list 1 2) (list (list 10 20))))
+                       (fn [v] (BeamLisp.RT/map_multi inc (list 1 2) (list (list 10 20))))]
+    ["list-star-0"    (fn [v] (rt/list-star-0))       (fn [v] (BeamLisp.RT/list_star_0))]
+
+    ;; ── the reader's two registries ────────────────────────────────────────
+    ;; These MUTATE the shared environment and then read it back, so the rows
+    ;; prove more than a shape: the BL runtime and the Elixir runtime consult
+    ;; the SAME registry, which is what makes the registries re-pointable
+    ;; rather than duplicated. Order matters — `reader_macro` runs before
+    ;; `reader_macro!` so the miss is exercised as well as the hit.
+    ["read-data"     (fn [v] (rt/read-data "(a b)"))       (fn [v] (BeamLisp.RT/read_data "(a b)"))]
+    ["reader-macro"  (fn [v] (rt/reader-macro "@"))         (fn [v] (BeamLisp.RT/reader_macro "@"))]
+    ["reader-macro!" (fn [v] (rt/reader-macro! "@" 'deref)) (fn [v] (BeamLisp.RT/reader_macro! "@" 'deref))]
+    ["data-reader!"  (fn [v] (rt/data-reader! "d" 'dd/rdr)) (fn [v] (BeamLisp.RT/data_reader! "d" 'dd/rdr))]
+    ["data-reader"   (fn [v] (rt/data-reader "d"))          (fn [v] (BeamLisp.RT/data_reader "d"))]
+
+    ;; the fold. `reduce` had no row for weeks and shipped raising on every
+    ;; collection; `reduce halt` is the row that actually exercises the reduced
+    ;; sentinel end to end, because a fold whose step never reduces never
+    ;; touches the halting path — and the halting path was the broken half.
+    ["reduce +"    (fn [v] (rt/reduce add-num 0 v))
+                   (fn [v] (BeamLisp.RT/reduce add-num 0 v))]
+    ["reduce halt" (fn [v] (rt/reduce (fn [a _b] (rt/reduced a)) 7 v))
+                   (fn [v] (BeamLisp.RT/reduce (fn [a _b] (BeamLisp.RT/reduced a)) 7 v))]
+    ["reduced? v"  (fn [v] (rt/reduced? v))   (fn [v] (BeamLisp.RT/reduced? v))]
+    ["reduced v"   (fn [v] (rt/reduced v))    (fn [v] (BeamLisp.RT/reduced v))]))
+
+(defn- run-op [[label bl rt-fn]]
+  (reduce
+    (fn [acc v]
+      (let [a (outcome bl v)
+            b (outcome rt-fn v)
+            d (verdict a b)]
+        (cond
+          (erlang/== d :agree) (update acc :agree inc)
+          (erlang/== d :bl-more-total) (update acc :total inc)
+          (some? (declaration label v)) (update acc :declared
+                                               (fn [ds] (cons (:policy (declaration label v)) ds)))
+          :else (update acc :fail
+                        (fn [fs] (cons (str label " on " (pr-str v)
+                                            "  bl=" (pr-str (if (:raised a) :RAISED (:ok a)))
+                                            "  rt=" (pr-str (if (:raised b) :RAISED (:ok b))))
+                                       fs))))))
+    {:agree 0 :total 0 :declared () :fail ()}
+    vals))
+
+(defn run []
+  (let [rows (map run-op ops)
+        agree (reduce (fn [n r] (erlang/+ n (:agree r))) 0 rows)
+        total (reduce (fn [n r] (erlang/+ n (:total r))) 0 rows)
+        decl (mapcat (fn [r] (:declared r)) rows)
+        fails (mapcat (fn [r] (:fail r)) rows)]
+    (println (str "oracle: " (count ops) " operations x " (count vals) " values = "
+                  (erlang/* (count ops) (count vals)) " comparisons"))
+    (println (str "  agree          " agree))
+    (println (str "  bl-more-total  " total "  (the BL runtime answers where the Elixir runtime raises)"))
+    (println (str "  declared       " (count decl) "  (behaviour changes named in `declared`)"))
+    (doseq [p (sort (distinct (map (fn [p] (str p)) decl)))]
+      (println (str "      " p)))
+    (println (str "  FAIL           " (count fails)))
+    (doseq [f fails] (println (str "    " f)))
+    (when (not (empty? fails))
+      (throw (ex-info (str "oracle: " (count fails) " UNDECLARED disagreements") {})))
+    (println "PASS rt.oracle: every ported operation answers as the Elixir runtime does,\n     except where a departure is declared above")))
+
+(run)

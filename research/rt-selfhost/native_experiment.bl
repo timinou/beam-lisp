@@ -1,0 +1,343 @@
+; native_experiment.bl — the P3 differential, orchestrated entirely in BL.
+;
+; WHAT THIS REPLACES. This is the all-BL port of the former
+; `native_experiment.py` harness. The old harness shelled out to Python AND to
+; an Elixir `.exs` driver that AOT-loaded a `bin/bl build`-emitted beam. Both
+; are gone: BL owns fixture generation, the independent oracle, process spawn,
+; output parsing, assertion, timing, reporting and the summary. The only
+; non-BL thing this file touches is the j1_probe PROCESS it spawns.
+;
+; WHAT IS COMPARED. One kernel (u64 byte fold: acc = (acc*31 + byte) mod 2^64),
+; on the SAME bytes, across THREE implementations:
+;
+;   native    — the standalone Cranelift probe `j1_probe --run-ir` over the
+;               committed `native_probe.ir`, compiled + run once per fixture.
+;   BLcompiled— `native_probe/checksum`, obtained by `BeamLisp/run_file` of
+;               `native_probe.bl` INTO THIS VM. `run_file` compiles the source
+;               through the self-hosted pipeline (compiler/eval_form ->
+;               lower/eval-anf), so this is compiled BEAM, not the tree
+;               interpreter and not an AOT beam behind an `.exs` wrapper.
+;   oracle    — an independent BL twin in THIS file: a `reduce` over the
+;               buffer's byte list, masking each step. Different code path from
+;               both of the above; it is the value the third column asserts.
+;
+; The probe ALSO checks itself: `rust-ref-match` is its JIT against its Rust
+; twin, `bl-match` is its Rust twin against the expected-value file this file
+; writes. We assert all three values equal AND both flags true, per fixture.
+;
+; WHAT IT DOES NOT CLAIM. Agreement on five fixtures is a differential test, not
+; a safety certificate and not a statement about integrated native execution.
+; There is no JIT NIF here, no in-VM dispatch, no ownership/bounds proof. The
+; u64 wrap is an explicit pinned contract for this experiment, not the runtime's
+; default numeric policy.
+;
+; PROBE BINARY. By default this builds `research/j1_probe` into a PRIVATE
+; `CARGO_TARGET_DIR` inside this run's scratch directory and uses exactly that
+; freshly built executable — it never trusts a cached executable at a
+; predictable path. Set `NATIVE_PROBE=/abs/path/to/j1_probe` to use an
+; already-built binary instead; the path is used only when it exists, and that
+; explicit opt-in is the only way a pre-existing executable is run.
+;
+; RUN (from the repository root):
+;   BL_NO_LOCK=1 bin/bl run research/rt-selfhost/native_experiment.bl
+; or, against an already-built probe:
+;   BL_NO_LOCK=1 NATIVE_PROBE=/abs/j1_probe \
+;     bin/bl run research/rt-selfhost/native_experiment.bl
+;
+; Everything is written under a fresh `mktemp -d` directory; the last line
+; prints `SUMMARY <dir>/summary.edn`.
+
+(ns native-experiment)
+
+; Compile the compiled-BEAM subject into THIS VM, through run_file (NOT AOT and
+; NOT an `.exs` wrapper). This form runs before the re-declared `(ns ...)` below
+; so every following def lands in `native-experiment`.
+(BeamLisp/run_file "research/rt-selfhost/native_probe.bl")
+(ns native-experiment)
+
+;; ── constants ───────────────────────────────────────────────────────────────
+
+(def U64 18446744073709551615)
+(def IR-PATH "research/rt-selfhost/native_probe.ir")
+(def BL-PATH "research/rt-selfhost/native_probe.bl")
+(def BEAM-SAMPLES 3)
+
+; name, kind, arg. The bounded set: zero-length, one byte, a 64-byte LCG tail,
+; the first length whose fold wraps u64 (13 x 0xFF), and 1 MiB of the SAME LCG
+; stream `j1_probe`'s own fill() produces.
+(def FIXTURES
+  [["empty" :zero 0]
+   ["one" :byte 170]
+   ["small" :lcg 64]
+   ["ff13" :ff 13]
+   ["large" :lcg 1048576]])
+
+;; ── assertions ──────────────────────────────────────────────────────────────
+
+(defn check! [label ok]
+  (when (not (erlang/== true ok))
+    (throw (ex-info (str "native_experiment: " label) {:label label :actual ok})))
+  true)
+
+;; ── fixtures and the independent oracle ─────────────────────────────────────
+
+(defn lcg-bytes
+  "The probe's own stream: x = x*6364136223846793005 + 1442695040888963407 (mod
+   2^64), byte = (x >> 33) & 0xFF. Both sides then see identical bytes."
+  [n]
+  (loop [i 0 x 11400714819323198485 out []]
+    (if (>= i n)
+      (erlang/list_to_binary (to-list out))
+      (let [x2 (erlang/band (erlang/+ (erlang/* x 6364136223846793005)
+                                      1442695040888963407) U64)]
+        (recur (+ i 1) x2 (conj out (erlang/band (erlang/bsr x2 33) 255)))))))
+
+(defn materialize [kind arg]
+  (cond
+    (= kind :zero) ""
+    (= kind :byte) (erlang/list_to_binary (list arg))
+    (= kind :ff) (binary/copy (erlang/list_to_binary (list 255)) arg)
+    (= kind :lcg) (lcg-bytes arg)
+    :else (throw (ex-info "unknown fixture kind" {:kind kind}))))
+
+(defn oracle
+  "Independent BL twin: u64 wrapping acc = acc*31 + byte, as a reduce over the
+   byte list (a different path from native_probe.bl's indexed loop)."
+  [bin]
+  (reduce (fn [acc b] (erlang/band (erlang/+ (erlang/* 31 acc) b) U64))
+          0 (binary/bin_to_list bin)))
+
+;; ── the compiled-BEAM side ──────────────────────────────────────────────────
+
+(defn bl-checksum [bin n] (native_probe/checksum bin n))
+
+(defn compiled-fn-info
+  "The compiled subject's identity: a BEAM external fun named checksum/2 in the
+   namespace module. `:type :external` and a real `:module` are the evidence
+   that run_file produced compiled code, not an interpreted closure."
+  []
+  (let [f (BeamLisp.Env/fetch! "native_probe" "checksum")]
+    (into {} (map (fn [p] [(elem p 0) (elem p 1)]) (erlang/fun_info f)))))
+
+(defn compiled-module
+  "The code server's answer for the compiled subject's namespace module. A
+   readable path (or any non-`non_existing` answer) is evidence run_file
+   emitted a real module rather than an inlined interpreter closure."
+  []
+  (let [w (code/which (erlang/list_to_atom
+                        (erlang/binary_to_list "Elixir.BeamLisp.Ns.NativeProbe")))]
+    (if (erlang/is_list w) (erlang/list_to_binary w) (pr-str w))))
+
+(defn beam-samples
+  "One warm pass, then BEAM-SAMPLES timed passes of the compiled checksum,
+   monotonic-nanosecond samples. Returns [{:ns :value} …]."
+  [bin n reps]
+  (bl-checksum bin n)
+  (loop [i 0 out []]
+    (if (>= i reps)
+      out
+      (let [t0 (erlang/monotonic_time :nanosecond)
+            v (bl-checksum bin n)
+            t1 (erlang/monotonic_time :nanosecond)]
+        (recur (+ i 1) (conj out {:ns (- t1 t0) :value v}))))))
+
+;; ── native probe process ────────────────────────────────────────────────────
+
+(defn run-probe!
+  "Spawn the probe once for one fixture and log command, rc, wall and output."
+  [exe args log]
+  (let [t0 (erlang/monotonic_time :nanosecond)
+        r (System/cmd exe (to-list args)
+              (list (tuple :cd root) (tuple :stderr_to_stdout true)))
+        t1 (erlang/monotonic_time :nanosecond)
+        out (elem r 0) rc (elem r 1)]
+    (File/write! log (str "$ " exe " " (pr-str args)
+                          "\n--- rc=" rc " wall_ns=" (- t1 t0) "\n" out))
+    {:rc rc :out out :wall-ns (- t1 t0) :log log}))
+
+(defn native-line [out]
+  (first (filterv (fn [l] (String/contains? l "lowered-IR kernel"))
+                  (String/split out "\n"))))
+
+(defn tokens [line] (String/split (String/trim line)))
+
+(defn token-after [ts label]
+  (loop [xs ts]
+    (cond
+      (empty? xs) nil
+      (= (first xs) label) (second xs)
+      :else (recur (rest xs)))))
+
+(defn field [ts prefix]
+  (let [t (first (filterv (fn [x] (String/starts_with? x prefix)) ts))]
+    (when (some? t) (subs t (count prefix)))))
+
+(defn num-of [s]
+  (let [p (Float/parse s)]
+    (if (erlang/== p :error) nil (first p))))
+
+(defn parse-duration-ms
+  "Rust Duration Debug token -> milliseconds, or nil when unparsable. Examples:
+   160ns, 1.5µs, 2.232443ms, 1.2s."
+  [tok]
+  (when (some? tok)
+    (cond
+      (String/ends_with? tok "ns") (/ (num-of (subs tok 0 (- (count tok) 2))) 1000000.0)
+      (String/ends_with? tok "µs") (/ (num-of (subs tok 0 (- (count tok) 2))) 1000.0)
+      (String/ends_with? tok "ms") (num-of (subs tok 0 (- (count tok) 2)))
+      (String/ends_with? tok "s") (* (num-of (subs tok 0 (- (count tok) 1))) 1000.0)
+      :else nil)))
+
+;; ── scratch directory and probe resolution ──────────────────────────────────
+
+(def root (BeamLisp/cwd))
+
+(def work
+  (let [r (System/cmd "mktemp" (list "-d" "/tmp/rt-native-experiment.XXXXXX"))]
+    (when (not= 0 (elem r 1))
+      (throw (ex-info "mktemp -d failed" {})))
+    (String/trim (elem r 0))))
+
+(def fixdir (str work "/fixtures"))
+(File/mkdir_p! fixdir)
+
+(defn build-probe!
+  "Build the crate into a private CARGO_TARGET_DIR under `work` and use the
+   executable THIS build produced. No pre-existing cache is consulted first."
+  []
+  (let [target (str work "/cargo-target")
+        log (str work "/cargo_build.log")
+        t0 (erlang/monotonic_time :nanosecond)
+        r (System/cmd "cargo"
+              (list "build" "--release" "--manifest-path" "research/j1_probe/Cargo.toml")
+              (list (tuple :cd root)
+                    (tuple :env (to-list (list (tuple "CARGO_TARGET_DIR" target))))
+                    (tuple :stderr_to_stdout true)))
+        t1 (erlang/monotonic_time :nanosecond)
+        rc (elem r 1) out (elem r 0)
+        exe (str target "/release/j1_probe")]
+    (File/write! log (str "$ cargo build --release --manifest-path research/j1_probe/Cargo.toml"
+                          "\n--- rc=" rc " wall_ns=" (- t1 t0) "\n" out))
+    (when (not= 0 rc) (throw (ex-info (str "cargo build failed rc=" rc) {:log log})))
+    (when (not (File/exists? exe))
+      (throw (ex-info "j1_probe missing after a successful build" {:path exe})))
+    {:path exe :source :built :target target :log log}))
+
+(defn resolve-probe! []
+  (let [explicit (System/get_env "NATIVE_PROBE")]
+    (if (some? explicit)
+      (let [exe (Path/expand explicit root)]
+        ; Explicit opt-in only; verified, never assumed from a predictable path.
+        (when (not (File/exists? exe))
+          (throw (ex-info "NATIVE_PROBE does not exist" {:path exe})))
+        {:path exe :source :env :explicit explicit :log nil})
+      (build-probe!))))
+
+(def probe (resolve-probe!))
+
+;; ── provenance ──────────────────────────────────────────────────────────────
+
+(defn sha16 [path]
+  (subs (String/downcase (Base/encode16 (crypto/hash :sha256 (File/read! path)))) 0 16))
+
+(defn git-head []
+  (let [r (System/cmd "git" (list "rev-parse" "--short" "HEAD") (list (tuple :cd root)))]
+    (if (not= 0 (elem r 1)) "unknown" (String/trim (elem r 0)))))
+
+(defn platform []
+  (str (erlang/list_to_binary (erlang/system_info :system_architecture))
+       " " (pr-str (erlang/system_info :os_type))))
+
+;; ── one fixture ─────────────────────────────────────────────────────────────
+
+(defn run-fixture [name kind arg]
+  (let [bin (materialize kind arg)
+        n (erlang/byte_size bin)
+        fix (str fixdir "/" name ".bin")
+        _ (File/write! fix bin)
+        expected (oracle bin)
+        beam-log (str work "/beam_" name ".log")
+        samples (beam-samples bin n BEAM-SAMPLES)
+        sample-ns (mapv (fn [s] (:ns s)) samples)
+        bl-value (:value (nth samples (- (count samples) 1)))
+        bl-best (reduce min sample-ns)
+        _ (File/write! beam-log
+              (str "$ compiled BEAM: native_probe/checksum via BeamLisp/run_file (in this VM)"
+                   "\npath=" fix " n=" n " value=" bl-value
+                   "\nsamples_ns=" (pr-str sample-ns) " best_ns=" bl-best "\n"))
+        ; the expected-value file the probe compares its Rust twin against
+        vfile (str work "/bl_value_" name ".txt")
+        _ (File/write! vfile (str bl-value))
+        nat (run-probe! (:path probe) (list "--run-ir" IR-PATH fix vfile)
+                        (str work "/native_" name ".log"))
+        line (native-line (:out nat))
+        _ (when (nil? line)
+            (throw (ex-info (str "native output unparsable: " name) {:raw (:out nat)})))
+        ts (tokens line)
+        nat-bytes (String/to_integer (token-after ts "over"))
+        dur-tok (token-after ts "bytes:")
+        jit (String/to_integer (field ts "jit="))
+        rust-ok (= "true" (field ts "rust-ref-match="))
+        bl-ok (= "true" (field ts "bl-match="))
+        agree (and (erlang/== jit bl-value) (erlang/== jit expected))]
+    ; every check throws on mismatch — no falsy-and-continue anywhere
+    (check! (str name ": probe rc=0") (erlang/== 0 (:rc nat)))
+    (check! (str name ": probe byte count") (erlang/== nat-bytes n))
+    (check! (str name ": oracle == BLcompiled") (erlang/== expected bl-value))
+    (check! (str name ": jit == BLcompiled == oracle") agree)
+    (check! (str name ": rust-ref-match") rust-ok)
+    (check! (str name ": bl-match") bl-ok)
+    {:name name :kind kind :bytes n :sha256 (sha16 fix) :expected expected
+     :oracle expected
+     :native {:rc (:rc nat) :bytes nat-bytes :inner-raw dur-tok
+              :inner-ms (parse-duration-ms dur-tok) :jit jit
+              :rust-ref-match rust-ok :bl-match bl-ok
+              :wall-ns (:wall-ns nat) :log (:log nat) :raw line}
+     :beam {:value bl-value :samples-ns sample-ns :best-ns bl-best :log beam-log}
+     :agree agree}))
+
+;; ── report ──────────────────────────────────────────────────────────────────
+
+(defn print-table [rows]
+  (println "fixture | bytes | expected | native-jit | BLcompiled | agree | rust-ref | bl-match | native-inner | native-wall-ns | BL-best-ns")
+  (doseq [r rows]
+    (let [nt (:native r) bm (:beam r)]
+      (println (str (:name r) " | " (:bytes r)
+                    " | " (:expected r)
+                    " | " (:jit nt)
+                    " | " (:value bm)
+                    " | " (if (:agree r) "true" "false")
+                    " | " (if (:rust-ref-match nt) "true" "false")
+                    " | " (if (:bl-match nt) "true" "false")
+                    " | " (or (:inner-raw nt) "?")
+                    " | " (:wall-ns nt)
+                    " | " (:best-ns bm))))))
+
+(defn main []
+  (let [t0 (erlang/monotonic_time :nanosecond)
+        fn-info (compiled-fn-info)
+        mod (compiled-module)
+        rows (mapv (fn [[name kind arg]] (run-fixture name kind arg)) FIXTURES)
+        all-agree (reduce (fn [a r] (and a (:agree r))) true rows)
+        total-ns (- (erlang/monotonic_time :nanosecond) t0)
+        summary {:provenance {:git-head (git-head) :platform (platform)
+                              :bl-src-sha16 (sha16 BL-PATH) :ir-sha16 (sha16 IR-PATH)}
+                 :ir IR-PATH :bl-source BL-PATH
+                 :probe {:path (:path probe) :source (:source probe) :log (:log probe)}
+                 :compiled-fn fn-info
+                 :compiled-module mod
+                 :beam-samples BEAM-SAMPLES
+                 :work work
+                 :fixtures rows
+                 :all-agree all-agree
+                 :total-ns total-ns}
+        out (str work "/summary.edn")]
+    (File/write! out (pr-str summary))
+    (print-table rows)
+    (println (str "compiled-fn=" (pr-str fn-info)))
+    (println (str "compiled-module=" mod))
+    (println (str "all-agree=" (if all-agree "true" "false") " total-ns=" total-ns))
+    (println (str "SUMMARY " out))
+    :ok))
+
+(main)

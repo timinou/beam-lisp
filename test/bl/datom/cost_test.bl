@@ -89,7 +89,39 @@
       (swap! ROWS (fn [n] (+ n (count result))))
       result)))
 
+;; The semi-join gate's PROBE, counted like every other store operation — it is
+;; one native key walk — and named separately, because a test has to be able to
+;; say "one probe, then one column scan". It reads NO rows (keys only, no datom
+;; decoded), so ROWS stays the column it decided about.
+(extend-protocol datom.store/Count
+  CountingStore
+  (-count-range [s lo hi limit]
+    (bump :range)
+    (bump :count)
+    (datom.store/count-range (:inner s) lo hi limit)))
+
 (defn- ranges [] (or (get (deref COUNTER) :range) 0))
+
+;; A decorator that forwards the reads but declares NO bounded counter — the
+;; shape of a substrate that would have to walk a whole column to count it (and
+;; of a wrapper that forgot to forward `datom.store/Count`). The gate must then
+;; keep the constant it always had: never a guess about the column.
+(defrecord UncountableStore [inner]
+  datom.store/Store
+  (-get [s k] (datom.store/-get (:inner s) k))
+  (-range [s lo hi] (datom.store/-range (:inner s) lo hi))
+  (-put [s k v] (datom.store/-put (:inner s) k v))
+  (-delete [s k] (datom.store/-delete (:inner s) k))
+  (-update [s k f] (datom.store/-update (:inner s) k f))
+  (-commit [s ops] (datom.store/-commit (:inner s) ops)))
+
+(extend-protocol datom.store/MultiScan
+  UncountableStore
+  (-scan-prefixes [s bounds] (datom.store/scan-prefixes (:inner s) bounds)))
+
+(defn- multiscans [] (or (get (deref COUNTER) :multiscan) 0))
+
+(defn- probes [] (or (get (deref COUNTER) :count) 0))
 
 (defn- nums
   [n]
@@ -552,20 +584,104 @@
     (is (>= (get (deref datom.db/FILTER-STATS) :indexed 0) 1)
         "through the indexed path, which is what makes the pairing observable")))
 
-;; A KNOWN GAP lives here, measured but not yet closed (FUP-118 W2d).
+;; ── the gate on the semi-join: the COLUMN decides, not the prefix count ─
 ;;
-;; `SEMI-JOIN-MAX` alone decides the semi-join's shape, so a 692-row column
-;; joined by 685 entities is read as 685 prefixes instead of one scan. That is
-;; the /activity screen: 23.7M reductions on the engine without the semi-join,
-;; 67.3M with it, same answer. The test that will close it is written when the
-;; evidence it needs exists — it has to assert NO multi-prefix read for a
-;; column the size of its binding set, and that assertion is only sound once
-;; the engine can COUNT that column's rows (`datom.store/Count`, native
-;; `count-range`) instead of estimating them from another clause's scan. The
-;; estimate is what makes it hard: a query's first scan can be of a column two
-;; rows wide while the semi-join targets one two hundred rows wide, and a gate
-;; built on that guess trades this regression for a worse one — measured, not
-;; feared (the W1 win is 32x on a column 3 000x the binding set).
+;; `SEMI-JOIN-MAX` alone used to decide the semi-join's shape, and that was
+;; measured wrong (FUP-118 W2d): a 692-row column joined by 685 entities was
+;; read as 685 prefixes instead of one scan — the /activity screen, 23.7M
+;; reductions on the engine without the semi-join and 67.3M with it, same 53
+;; rows. The missing fact was the SIZE OF THE TARGET COLUMN, and it cannot be
+;; inferred from an earlier clause's scan: a query's first scan can be of a
+;; column two rows wide while the semi-join targets one two hundred rows wide,
+;; and a gate built on that guess trades this regression for a worse one —
+;; measured, not feared (the W1 win is 32x on a column 3 000x the binding set).
+;;
+;; So the column is now ASKED, through the substrate's bounded key count
+;; (`datom.store/Count`, native `count-range` — keys only, no value decoded, no
+;; datom built, stopped the moment the answer is settled). The rule is
+;; `prefixes x SEMI-JOIN-PREFIX-RATIO < column-rows`, with an absolute
+;; allowance: a prefix list short enough to be cheap in any case is taken
+;; without a probe, and a store with no bounded counter keeps the constant
+;; gate. Both directions are asserted below — the activity-like column, and the
+;; 300x column the semi-join exists for.
+
+(deftest a-semi-join-declines-a-column-no-wider-than-its-bindings
+  ; /activity, as a contract, at the numbers it was measured at: a 692-row
+  ; audit column joined by 685 bound entities. 685 prefix seeks to avoid ONE
+  ; 692-row scan cost 2.8x the reductions on the real screen (67.3M against
+  ; 23.7M, same 53 rows) — and the column is only SEVEN rows wider than the
+  ; binding set, which is exactly the band a prefix count cannot judge.
+  ;
+  ; The gate asks the column's OWN bounded count first — keys only, stopped at
+  ; `685 x SEMI-JOIN-PREFIX-RATIO`, so it walks all 692 keys and learns the
+  ; column is narrower than the break-even. NO multi-prefix read is issued: the
+  ; clause is one column scan, and the request count is the probe plus that scan.
+  (let [c (fixture 692)
+        db (datom.conn/db c)
+        eids (vec (take 685 (mapv (fn [d] (datom.index/-e d))
+                                  (datom.db/datoms db :aevt :p/n))))]
+    (is (= 685 (count eids)) "685 of the 692 rows are bound")
+    (reset! COUNTER {}) (reset! ROWS 0)
+    (let [rows (datom.query.engine/q
+                 '[:find ?n :in $ [?e ...] :where [?e :p/n ?n]] db eids)]
+      (is (= 685 (count rows)) "every bound entity resolves")
+      (is (zero? (multiscans))
+          (str "a column the size of its binding set must NOT be read by prefix ("
+               (multiscans) " multi-prefix reads)"))
+      (is (= 1 (probes))
+          "exactly one bounded key probe decided it — the store was told how wide")
+      (is (= 2 (ranges))
+          "and the read is that probe plus ONE column scan, not 685 seeks")
+      (is (= 692 (deref ROWS))
+          (str "the column is read once (" (deref ROWS) " rows), no more")))))
+
+(deftest a-narrow-column-is-not-counted-past-its-end
+  ; The other side of the probe, at its own boundary: a column NARROWER than
+  ; the break-even is walked to its end, so the count is exact and `:capped` is
+  ; false. Exercised directly, because the engine only sees `:capped` — and a
+  ; probe that reported `:capped` for a range it had finished would pick the
+  ; prefix read for every small column.
+  (let [c (fixture 100)
+        store (datom.db/store-of (datom.conn/db c))
+        prefix (datom.index/key-prefix :aevt :p/n)
+        hi (datom.index/prefix-end prefix)]
+    (is (= {:count 100 :capped false}
+           (datom.store/count-range store prefix hi 250))
+        "the whole column, counted exactly")
+    (is (= {:count 50 :capped true}
+           (datom.store/count-range store prefix hi 50))
+        "stopped at the limit, and it says so")
+    ; The row count is NOT a datom decode: the probe hands back a number.
+    (reset! ROWS 0)
+    (datom.store/count-range store prefix hi 50)
+    (is (zero? (deref ROWS)) "a probe reads keys, never rows")))
+
+(deftest a-substrate-without-a-bounded-counter-keeps-the-constant-gate
+  ; The gate is OPT-IN per substrate: a store that cannot answer the column's
+  ; size without walking it is not asked, and the engine does NOT guess — it
+  ; keeps the constant it always had (`SEMI-JOIN-MAX`). So the /activity
+  ; regression is preserved exactly where the question cannot be answered, and
+  ; a wrapper that forgets to forward the capability degrades to the old shape
+  ; rather than to a wrong one.
+  (let [c (datom.conn/connect-with
+            (->UncountableStore (->CountingStore (datom.store-ets/open)))
+            [{:db/ident :p/n :db/valueType :db.type/string}])
+        _ (datom.conn/transact!
+            c (mapv (fn [i] {:db/id (- 0 (+ i 1)) :p/n (str "n" i)}) (nums 700)))
+        db (datom.conn/db c)
+        eids (vec (mapv datom.index/-e (datom.db/datoms db :aevt :p/n)))]
+    (is (= 700 (count eids)))
+    (is (nil? (datom.store/count-range (datom.db/store-of db) (datom.index/key-prefix :aevt)
+                                       (datom.index/prefix-end (datom.index/key-prefix :aevt)) 8))
+        "the dispatcher says UNKNOWN rather than walking the range")
+    (reset! COUNTER {}) (reset! ROWS 0)
+    (let [rows (datom.query.engine/q
+                 '[:find ?n :in $ [?e ...] :where [?e :p/n ?n]] db eids)]
+      (is (= 700 (count rows)) "the answer is the same either way")
+      (is (zero? (probes)) "no counter, so nothing was asked")
+      (is (= 1 (multiscans))
+          "and the CONSTANT decided it — one prefix read, as before")
+      (is (= 1 (ranges))))))
 
 (deftest a-semi-join-still-pays-when-the-column-is-large
   ; The other direction, or the fix would just delete the optimisation: a

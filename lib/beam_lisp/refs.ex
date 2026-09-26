@@ -103,7 +103,7 @@ defmodule BeamLisp.Refs do
   # commits, in the caller's process, exactly as before.
   def swap!(%BeamLisp.Atom{cell: cell} = atom, f, args_list) do
     old = BeamLisp.LazyMemo.read(cell)
-    new = BeamLisp.RT.invoke(f, [old | args_list])
+    new = BeamLisp.Ns.Rt.invoke(f, [old | args_list])
 
     case BeamLisp.LazyMemo.exchange_ref(cell, old, new) do
       :ok ->
@@ -189,7 +189,7 @@ defmodule BeamLisp.Refs do
 
       watches ->
         Enum.each(watches, fn {key, f} ->
-          BeamLisp.RT.invoke(f, [key, atom, old, new])
+          BeamLisp.Ns.Rt.invoke(f, [key, atom, old, new])
         end)
     end
   end
@@ -247,7 +247,7 @@ defmodule BeamLisp.Refs do
   # read-modify-write is atomic only against other ops in the same
   # process — which is exactly the volatile contract.
   def vswap!(%BeamLisp.Volatile{} = vol, f, args_list) do
-    new = BeamLisp.RT.invoke(f, [deref(vol) | args_list])
+    new = BeamLisp.Ns.Rt.invoke(f, [deref(vol) | args_list])
     Process.put({BeamLisp.Volatile, vol.key}, new)
     new
   end

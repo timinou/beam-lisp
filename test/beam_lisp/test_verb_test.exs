@@ -251,7 +251,7 @@ defmodule BeamLisp.TestVerbTest do
 
     code =
       try do
-        BeamLisp.RT.invoke(BeamLisp.Env.fetch!("bl.cli", "run-argv"), [argv])
+        BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("bl.cli", "run-argv"), [argv])
       after
         Process.group_leader(self(), prev)
         Process.delete(:bl_cwd)
@@ -269,16 +269,16 @@ defmodule BeamLisp.TestVerbTest do
     BeamLisp.Loader.ensure_loaded("vm.session")
     BeamLisp.Loader.ensure_loaded("vm.paths")
 
-    started = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("vm.session", "start"), [root])
+    started = BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("vm.session", "start"), [root])
     listener = Map.fetch!(started, :ok)
 
-    ep = Map.fetch!(BeamLisp.RT.invoke(BeamLisp.Env.fetch!("vm.paths", "endpoints"), [root]), :ok)
+    ep = Map.fetch!(BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("vm.paths", "endpoints"), [root]), :ok)
     sock_path = Map.fetch!(ep, :sock)
     token_path = Map.fetch!(ep, :token)
 
     wait_for(fn -> File.exists?(token_path) end)
     token = File.read!(token_path)
-    tree = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("vm.paths", "fingerprint"), [root])
+    tree = BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("vm.paths", "fingerprint"), [root])
 
     {:ok, sock} =
       :gen_tcp.connect({:local, String.to_charlist(sock_path)}, 0, [
@@ -296,7 +296,7 @@ defmodule BeamLisp.TestVerbTest do
     result = collect(sock, id, "")
     :gen_tcp.close(sock)
 
-    _ = BeamLisp.RT.invoke(BeamLisp.Env.fetch!("vm.session", "stop"), [listener])
+    _ = BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("vm.session", "stop"), [listener])
     _ = ctx
     result
   end

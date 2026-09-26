@@ -41,7 +41,11 @@ Nine internal tuple tags (`guards.ex @internal_tuple_tags`) exist so that
 
 Each line is a `./bl run` result on `main @ 698225c`.
 
-**Equality is not one relation.**
+**Equality is not one relation.** *(Items 1–3 are RESOLVED by the runtime
+cutover, PLAN-148: list, vector and lazy seq are one sequential family in
+`priv/boot/rt.bl`'s `k-compare`, so `(= [1 2] (list 1 2))`, `(= [] ())` and
+`(= (vec (range 40)) (apply list (range 40)))` are all `true`, and `compare`
+orders them as one family. Kept below as the record of what it replaced.)*
 1. `(= [1 2] (list 1 2))` → `false`, but `(= [1 2] (map identity [1 2]))` → `true`. A vector equals a *lazy* seq of the same elements but not a *list* of them. `eqv` checks laziness before vector-ness, so the walk path and the vector path disagree.
 2. `(= [] (map identity []))` → `true`, `(= #{} (map identity []))` → `false`, `(= [] ())` → `false`. Three empties, three answers.
 3. `(= (vec (range 40)) (range 40))` → `true` (lazy), `(= (vec (range 40)) (apply list (range 40)))` → `false`. Same as 1 for the trie representation — the two vector representations at least agree with each other.

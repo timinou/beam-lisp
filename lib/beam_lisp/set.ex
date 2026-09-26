@@ -5,7 +5,7 @@ defmodule BeamLisp.Set do
 
   **The struct-is-a-map hazard.** A struct IS a map on the BEAM, so every
   `when is_bl_map(...)` clause in the runtime excludes a set. The set
-  clauses in `BeamLisp.RT` MUST precede the `is_bl_map` clauses (same rule
+  clauses in `BeamLisp.Ns.Rt` MUST precede the `is_bl_map` clauses (same rule
   as vectors and lazy seqs), or `count`/`seq`/`first` read the struct's
   fields instead of the members. `map?/1` already excludes structs, so a
   set correctly reports false for `map?` while staying a first-class
@@ -29,14 +29,14 @@ defmodule BeamLisp.Set do
   # membership too — otherwise a value and its metadata-bearing twin
   # both live in the set while comparing equal.
   def add(%__MODULE__{members: m} = s, x),
-    do: %__MODULE__{s | members: MapSet.put(m, BeamLisp.RT.hash_key(x))}
+    do: %__MODULE__{s | members: MapSet.put(m, BeamLisp.Ns.Rt.hash_key(x))}
 
   @doc "Set with `x` removed (idempotent)."
   def del(%__MODULE__{members: m} = s, x),
-    do: %__MODULE__{s | members: MapSet.delete(m, BeamLisp.RT.hash_key(x))}
+    do: %__MODULE__{s | members: MapSet.delete(m, BeamLisp.Ns.Rt.hash_key(x))}
 
   @doc "Membership test."
-  def member?(%__MODULE__{members: m}, x), do: MapSet.member?(m, BeamLisp.RT.hash_key(x))
+  def member?(%__MODULE__{members: m}, x), do: MapSet.member?(m, BeamLisp.Ns.Rt.hash_key(x))
 
   @doc "Cardinality."
   def count(%__MODULE__{members: m}), do: MapSet.size(m)

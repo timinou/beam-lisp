@@ -23,6 +23,10 @@
   kicker: none,
   status: none,
   dateline: none,
+  sans-font: ("Inter", "New Computer Modern Sans"),
+  justify: true,
+  leading: 0.72em,
+  paragraph-spacing: 1.15em,
   body,
 ) = {
   set document(title: title, author: "beam-lisp design notes")
@@ -43,9 +47,9 @@
   )
 
   set text(font: ("New Computer Modern", "Libertinus Serif"), size: 10.5pt, fill: ink)
-  set par(justify: true, leading: 0.72em, spacing: 1.15em, first-line-indent: 0pt)
+  set par(justify: justify, leading: leading, spacing: paragraph-spacing, first-line-indent: 0pt)
 
-  show heading: set text(font: ("Inter", "New Computer Modern Sans"), weight: 600)
+  show heading: set text(font: sans-font, weight: 600)
   show heading.where(level: 1): it => {
     v(1.5em, weak: true)
     block(width: 100%)[
@@ -91,7 +95,7 @@
     text(8.5pt, fill: ink-faint, tracking: 1.6pt, upper(kicker))
     v(0.5em)
   }
-  text(24pt, weight: 600, font: ("Inter", "New Computer Modern Sans"), title)
+  text(24pt, weight: 600, font: sans-font, title)
   if subtitle != none {
     v(0.35em)
     block(width: 92%, text(12.5pt, fill: ink-soft, style: "italic", subtitle))

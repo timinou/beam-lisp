@@ -32,7 +32,7 @@ defmodule BeamLisp.BuildSessionTest do
 
   defp call(ns, f, args) do
     BeamLisp.Loader.ensure_loaded(ns)
-    BeamLisp.RT.invoke(BeamLisp.Env.fetch!(ns, f), args)
+    BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!(ns, f), args)
   end
 
   test "a live claim refuses a second builder and names the holder", %{cache: cache} do
@@ -121,7 +121,7 @@ defmodule BeamLisp.BuildSessionTest do
     # subprocess was replaced by an in-process call.
     code =
       BeamLisp.with_cwd(cache, fn ->
-        BeamLisp.RT.invoke(run, [["build", src, "--out", out]])
+        BeamLisp.Ns.Rt.invoke(run, [["build", src, "--out", out]])
       end)
     assert code == 0
 

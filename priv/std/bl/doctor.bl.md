@@ -257,7 +257,7 @@ verdict is `Bootstrap/key_matches?/1` rather than a second copy of the rule.
    report and not a reason to fail."
   []
   (do (BeamLisp.Loader/ensure_loaded "deps")
-      (let [r (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "deps" "verify")
+      (let [r (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "deps" "verify")
                                   (list (BeamLisp/cwd)))]
         (if (:ok? r)
           {:ok true :detail (str (:checked r) " locked, all present offline")}

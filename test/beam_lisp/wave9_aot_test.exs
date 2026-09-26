@@ -67,9 +67,9 @@ defmodule BeamLisp.Wave9AotTest do
 
     # fn *values* are interned as captures, so `map f` / RT.invoke work
     {:ok, sumv} = Env.fetch("math", "sum")
-    assert BeamLisp.RT.invoke(sumv, [1, 2, 3, 4]) == 10
+    assert BeamLisp.Ns.Rt.invoke(sumv, [1, 2, 3, 4]) == 10
     {:ok, addv} = Env.fetch("math", "add")
-    assert BeamLisp.RT.invoke(addv, [9, 10]) == 19
+    assert BeamLisp.Ns.Rt.invoke(addv, [9, 10]) == 19
   end
 
   test "fresh VM loads the beams with no runtime compilation" do

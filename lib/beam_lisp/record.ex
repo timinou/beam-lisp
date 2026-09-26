@@ -21,7 +21,7 @@ defmodule BeamLisp.Record do
   identity still lives in a module atom so protocols can dispatch on it.
 
   **The struct-is-a-map hazard, doubled.** A record struct satisfies
-  `is_map`, so every `when is_bl_map(...)` clause in `BeamLisp.RT` matches
+  `is_map`, so every `when is_bl_map(...)` clause in `BeamLisp.Ns.Rt` matches
   one. Records are different from the other structs (Vector/LazySeq/Set)
   in that they are *supposed* to behave as maps — but the `__struct__`
   key is internal and must never leak into `seq`/`keys`/`count`. The RT

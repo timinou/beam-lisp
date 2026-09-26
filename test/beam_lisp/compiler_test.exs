@@ -2,7 +2,7 @@ defmodule BeamLisp.CompilerTest do
   use ExUnit.Case, async: false
 
   setup do
-    BeamLisp.RT.seed_core()
+    BeamLisp.Ns.Rt.seed_core()
     :ok
   end
 
@@ -104,8 +104,8 @@ defmodule BeamLisp.CompilerTest do
 
   test "remote functions are first-class values" do
     handle = eval("String/upcase")
-    assert BeamLisp.RT.invoke(handle, ["beam"]) == "BEAM"
-    assert BeamLisp.RT.print_str(handle) == "#fn[Elixir.String/upcase]"
+    assert BeamLisp.Ns.Rt.invoke(handle, ["beam"]) == "BEAM"
+    assert BeamLisp.Ns.Rt.print_str(handle) == "#fn[Elixir.String/upcase]"
   end
 
   test "undefined vars raise" do

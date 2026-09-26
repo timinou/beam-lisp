@@ -61,6 +61,13 @@ driving a real Chromium with Playwright against the JS client.
    reopened socket receives the buffered navigate. Against the pre-fix client
    the reopened socket never receives it (the frame was dropped at click time).
 
+6. **`repl.spec.js` › shipped REPL workspace** — serves the actual
+   `priv/std/vm/repl/page.html` and vendored CodeMirror bundle to Chromium with
+   a protocol-shaped fake socket. It checks the starter prompt, balanced
+   evaluation via Run and Enter, busy/Stop/interrupted states, disconnect
+   without losing a draft, doc replies interleaved with eval results, and a
+   320px layout without horizontal overflow.
+
 ## Run it
 
 ```sh
@@ -75,7 +82,7 @@ npm install --no-save @playwright/test@1.62.0
 PLAYWRIGHT_BROWSERS_PATH=~/.cache/ms-playwright npx playwright test
 ```
 
-Expected: `12 passed` (3 differ + 9 lifecycle).
+Expected: `17 passed` (3 differ + 9 lifecycle + 5 REPL workspace).
 
 ## Why not Phoenix here
 

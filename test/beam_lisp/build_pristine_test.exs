@@ -186,7 +186,7 @@ defmodule BeamLisp.BuildPristineTest do
     run = BeamLisp.Env.fetch!("build", "run")
 
     for out <- [a, b] do
-      r = BeamLisp.RT.invoke(run, [%{sources: srcs, out: out, force?: true, jobs: 4, log: nil}])
+      r = BeamLisp.Ns.Rt.invoke(run, [%{sources: srcs, out: out, force?: true, jobs: 4, log: nil}])
       assert bl(r[:errors]) == []
       assert r[:built] == length(srcs)
     end

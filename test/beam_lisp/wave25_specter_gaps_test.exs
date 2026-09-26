@@ -26,7 +26,7 @@ defmodule BeamLisp.Wave25SpecterGapsTest do
   #   by identity for the terms that carry identity (funs, pids, ports,
   #   refs) and strict no-coercion structural equality for the
   #   immutable value types that have no reference identity. The
-  #   deviation is documented on `BeamLisp.RT.identical?/2`.
+  #   deviation is documented on `BeamLisp.Ns.Rt.identical?/2`.
   # * `defprotocol` docstring — an optional leading string between the
   #   protocol name and the first method, stored as the protocol's
   #   `:doc` var metadata, exactly as defn handles its docstring.
