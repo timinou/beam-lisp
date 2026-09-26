@@ -1,0 +1,294 @@
+; split/core.bl — the AUTHORITY of a split app, running natively on BEAM.
+;
+; A split app (`split/defapp`, see split.bl) is one file whose browser half is
+; compiled to JavaScript and whose server half is THIS loop plus the app's own
+; functions. The loop names no app function: every app-specific decision is a
+; role in the app value `a` (built by `split/defapp`), reached through the
+; dispatchers below.
+;
+; ONE PROPOSAL AT A TIME, IN ORDER. The transport (split.web) sends
+;
+;   [:intent from {:request n :revision r :digest d :nonce s :actor a :op o :args x}]
+;
+; — `:actor` is the signed-in person's id, STAMPED by the transport from a
+; session it verified; a browser cannot send one — and this loop answers every
+; proposal with exactly one `[:split/result v]` to `from`:
+;
+;   1. the digest must be the one the app's contract hashes to;
+;   2. the op must be declared and its args must satisfy the wire type;
+;   3. an app with a roster requires a person: `:actor` must name one;
+;   4. the revision must be the one the proposal was made against;
+;   5. the shared :check runs AGAIN, here, on the authoritative board;
+;   6. :allow asks whether THIS person may; the server-only :guard runs;
+;   7. :apply computes the next state (given the person), which must still
+;      project onto the declared snapshot type.
+;
+; Only then does the revision advance. A refusal is a value, never a raise, so
+; no proposal can kill the authority.
+;
+; DURABLE BEFORE ACKNOWLEDGED. An app with a log (`:commit!` in the options)
+; hands every commit to it BEFORE the result or the snapshot goes out. If the
+; log refuses (raises), the authority stops: nothing is acknowledged that is
+; not on disk, and every later proposal finds no authority (the transport
+; answers 503).
+;
+; AT MOST ONCE. A committed nonce is remembered (the last `nonce-memory`): the
+; same proposal again is answered `:ok` with `:duplicate true` and commits
+; nothing.
+;
+; HISTORY (an app with `:server {:history n}`). Every commit pushes the state
+; before it onto PAST and clears FUTURE; the built-in intents `:undo` and
+; `:redo` move one state between them — shared by everyone, recorded like any
+; other commit. The projected board of each recent revision is kept for "view
+; as of" (`:peek`). Every commit also yields an ENTRY — revision, person, op,
+; one line — kept in RECENT.
+;
+; WHAT ELSE IT ANSWERS (each a decision about app data):
+;   [:login from {:user id}]          → [:split/login person|nil]
+;   [:people from {:users [id …]}]    → [:split/people [person …]]   (presence)
+;   [:peek from {:revision k}]        → [:split/peek {:revision k :board b|nil}]
+;   [:current from]                   → [:split/current {:revision :board :people :recent :history}]
+; and it pushes `[:split/snapshot v]` to every subscriber after each commit:
+;   [:subscribe pid] / [:unsubscribe pid]   (a subscriber that dies is dropped)
+
+(ns split.core
+  (:require [split.wire :refer :all]))
+
+(defn nonce-memory [] 256)
+(defn recent-size [] 30)
+
+; ── the app's roles, reached through the app value ─────────────────────────────
+
+(defn role [a op k] (get-in a [:intents op k]))
+
+(defn check [a op board args]
+  (let [f (role a op :check)] (if (nil? f) :unknown-intent (f board args))))
+
+(defn guard [a op state args]
+  (let [f (role a op :guard)] (if (nil? f) nil (f state args))))
+
+(defn allow [a op who board args]
+  (let [f (role a op :allow)] (if (nil? f) nil (f who board args))))
+
+(defn says [a op board args]
+  (let [f (role a op :says)] (if (nil? f) nil (f board args))))
+
+(defn apply-intent [a op state args who]
+  (let [f (role a op :apply)]
+    (cond
+      (nil? f) nil
+      (= 3 (role a op :apply-arity)) (f state args who)
+      :else (f state args))))
+
+(defn roster [a] (let [f (get-in a [:server :people])] (if (nil? f) nil (f))))
+
+(defn history-size [a] (or (get-in a [:server :history]) 0))
+
+(defn undo-allow [a who board]
+  (let [f (get-in a [:server :undo-allow])] (if (nil? f) nil (f who board))))
+
+; ── people ─────────────────────────────────────────────────────────────────────
+
+(defn public-person [p] {:id (:id p) :name (:name p) :role (:role p)})
+
+(defn person
+  "The roster entry for `id`, projected to its public fields, or nil."
+  [a id]
+  (let [p (some (fn [p] (if (= id (:id p)) p nil)) (or (roster a) []))]
+    (if (nil? p) nil (public-person p))))
+
+(defn public-people [a] (mapv public-person (or (roster a) [])))
+
+; ── one decision ───────────────────────────────────────────────────────────────
+
+(defn seen? [seen nonce] (some? (some (fn [n] (if (= n nonce) n nil)) seen)))
+
+(defn drop-last-one [xs] (vec (take (dec (count xs)) xs)))
+
+(defn cap [xs n] (if (< n (count xs)) (vec (rest xs)) xs))
+
+(defn refused [req reason revision board]
+  {:request req :ok false :reason reason :revision revision :board board})
+
+(defn history-summary
+  "What undo and redo would do next, for the view: the entries on top."
+  [h]
+  {:undo (if (empty? (:past h)) nil (:entry (last (:past h))))
+   :redo (if (empty? (:future h)) nil (:entry (last (:future h))))})
+
+(defn decide
+  "The whole decision for one proposal: `[:commit state entry-line]` or
+   `[:refuse reason]`. `h` is the history record (past/future)."
+  [a state revision proposal who h]
+  (let [contract (:contract a)
+        op (:op proposal)
+        args (:args proposal)
+        board (wire-snapshot contract state)
+        history? (< 0 (history-size a))]
+    (cond
+      (not (= (:digest a) (:digest proposal))) [:refuse :client-outdated]
+      (and (some? (roster a)) (nil? who)) [:refuse :not-signed-in]
+      (and history? (= op :undo))
+        (cond
+          (not (= revision (:revision proposal))) [:refuse :stale-revision]
+          (empty? (:past h)) [:refuse :nothing-to-undo]
+          (some? (undo-allow a who board)) [:refuse (undo-allow a who board)]
+          :else [:commit (:state (last (:past h))) (str "undid " (:says (:entry (last (:past h)))))])
+      (and history? (= op :redo))
+        (cond
+          (not (= revision (:revision proposal))) [:refuse :stale-revision]
+          (empty? (:future h)) [:refuse :nothing-to-redo]
+          (some? (undo-allow a who board)) [:refuse (undo-allow a who board)]
+          :else [:commit (:state (last (:future h))) (str "redid " (:says (:entry (last (:future h)))))])
+      (nil? (wire-intent contract op)) [:refuse :unknown-intent]
+      (not (wire-args-ok? contract op args)) [:refuse :malformed-args]
+      (not (= revision (:revision proposal))) [:refuse :stale-revision]
+      :else
+        (let [problem (check a op board args)]
+          (if (some? problem)
+            [:refuse problem]
+            (let [denied (allow a op who board args)
+                  blocked (if (some? denied) nil (guard a op state args))]
+              (cond
+                (some? denied) [:refuse denied]
+                (some? blocked) [:refuse blocked]
+                :else
+                  (let [next (apply-intent a op state args who)]
+                    (if (and (map? next) (wire-snapshot-ok? contract (wire-snapshot contract next)))
+                      [:commit next (or (says a op board args) (name op))]
+                      [:refuse :handler-broke-contract])))))))))
+
+(defn next-history
+  "The history after committing `op` from `state` (the state before)."
+  [a h op state entry]
+  (let [size (history-size a)]
+    (cond
+      (= op :undo) {:past (drop-last-one (:past h))
+                    :future (cap (conj (:future h) {:state state :entry (:entry (last (:past h)))}) size)}
+      (= op :redo) {:past (cap (conj (:past h) {:state state :entry (:entry (last (:future h)))}) size)
+                    :future (drop-last-one (:future h))}
+      :else {:past (cap (conj (:past h) {:state state :entry entry}) size) :future []})))
+
+(defn proposal-shape-ok? [p]
+  (and (map? p) (int? (:request p)) (int? (:revision p))
+       (string? (:digest p)) (string? (:nonce p)) (<= 1 (count (:nonce p))) (<= (count (:nonce p)) 64)
+       (or (nil? (:actor p)) (and (string? (:actor p)) (<= (count (:actor p)) 32)))
+       (keyword? (:op p)) (map? (:args p))))
+
+(defn peek-board [boards k]
+  (some (fn [e] (if (= k (first e)) (nth e 1) nil)) boards))
+
+; ── the loop ───────────────────────────────────────────────────────────────────
+
+(defn initial
+  "The authority's first world, or a raise when the app's :init does not
+   satisfy its own snapshot type (a build that could never publish)."
+  [a]
+  (let [state ((get-in a [:server :init]))
+        board (wire-snapshot (:contract a) state)]
+    (if (wire-snapshot-ok? (:contract a) board)
+      {:state state :revision 0 :seen [] :h {:past [] :future []} :recent [] :boards [[0 board]]
+       :subs #{}}
+      (throw (ex-info (str "split: " (:name a) " :server :init does not satisfy the snapshot type")
+                      {:app (:name a)})))))
+
+(defn current-of [a w]
+  {:revision (:revision w) :board (wire-snapshot (:contract a) (:state w))
+   :people (if (some? (roster a)) (public-people a) nil)
+   :recent (:recent w) :history (history-summary (:h w))})
+
+(defn propose
+  "Decide one proposal in world `w`. Answers `[w' result snapshot-or-nil
+   commit-or-nil]` — pure: the loop does the effects, in the durable order."
+  [a w proposal]
+  (let [contract (:contract a)
+        board-now (fn [] (wire-snapshot contract (:state w)))]
+    (if (not (proposal-shape-ok? proposal))
+      [w (refused -1 :malformed-proposal (:revision w) (board-now)) nil nil]
+      (let [req (:request proposal)
+            who (person a (:actor proposal))]
+        (if (seen? (:seen w) (:nonce proposal))
+          [w {:request req :ok true :duplicate true :revision (:revision w) :board (board-now)
+              :recent (:recent w) :history (history-summary (:h w))} nil nil]
+          (let [verdict (decide a (:state w) (:revision w) proposal who (:h w))]
+            (if (= :refuse (first verdict))
+              [w (refused req (nth verdict 1) (:revision w) (board-now)) nil nil]
+              (let [next (nth verdict 1)
+                    rev (inc (:revision w))
+                    keep (history-size a)
+                    board (wire-snapshot contract next)
+                    entry {:revision rev :actor (:actor proposal) :name (if (nil? who) "" (:name who))
+                           :op (:op proposal) :says (nth verdict 2)}
+                    h2 (if (< 0 keep) (next-history a (:h w) (:op proposal) (:state w) entry) (:h w))
+                    recent2 (cap (conj (:recent w) entry) (recent-size))
+                    summary (history-summary h2)]
+                [(assoc w :state next :revision rev :h h2 :recent recent2
+                          :seen (cap (conj (:seen w) (:nonce proposal)) (nonce-memory))
+                          :boards (if (< 0 keep) (cap (conj (:boards w) [rev board]) (inc keep)) (:boards w)))
+                 {:request req :ok true :revision rev :board board :recent recent2 :history summary}
+                 {:revision rev :board board :op (:op proposal) :request req :recent recent2 :history summary}
+                 {:entry entry :nonce (:nonce proposal) :args (:args proposal) :actor (:actor proposal)}]))))))))
+
+(defn serve-loop [a opts w]
+  (receive
+    [:intent from proposal]
+      (let [[w2 result snapshot commit] (propose a w proposal)]
+        (if (some? commit)
+          (do
+            ; durable before acknowledged: a log that raises stops the authority
+            (when-let [f (:commit! opts)] (f commit))
+            (erlang/send from [:split/result result])
+            (doseq [s (:subs w2)] (erlang/send s [:split/snapshot snapshot]))
+            (serve-loop a opts w2))
+          (do
+            (erlang/send from [:split/result result])
+            (serve-loop a opts w2))))
+    [:login from q]
+      (do (erlang/send from [:split/login (person a (:user q))])
+          (serve-loop a opts w))
+    [:people from q]
+      (do (erlang/send from [:split/people (filterv some? (mapv (fn [id] (person a id)) (or (:users q) [])))])
+          (serve-loop a opts w))
+    [:peek from q]
+      (do (erlang/send from [:split/peek {:revision (:revision q) :board (peek-board (:boards w) (:revision q))}])
+          (serve-loop a opts w))
+    [:current from]
+      (do (erlang/send from [:split/current (current-of a w)])
+          (serve-loop a opts w))
+    [:subscribe pid]
+      (do (erlang/monitor :process pid)
+          (serve-loop a opts (update w :subs conj pid)))
+    [:unsubscribe pid]
+      (serve-loop a opts (update w :subs disj pid))
+    [:DOWN _ _ pid _]
+      (serve-loop a opts (update w :subs disj pid))
+    [:stop from]
+      (erlang/send from [:split/stopped (:revision w)])))
+
+(defn start
+  "Start the authority for app value `a`. `opts`: `:commit!` (fn [commit],
+   called before a commit is acknowledged; raise to refuse) and `:replay`
+   (a vector of proposals to decide first, silently — the durable log; any
+   refusal fails the start). Answers the authority's pid, or raises."
+  [a opts]
+  (let [w0 (initial a)
+        w (reduce (fn [w p]
+                    (let [[w2 result _ commit] (propose a w p)]
+                      (if (and (some? commit) (not (:duplicate result)))
+                        w2
+                        (throw (ex-info (str "split: " (:name a) " log revision " (:revision p)
+                                             " does not replay: " (pr-str (or (:reason result) :duplicate)))
+                                        {:app (:name a) :revision (:revision p) :reason (:reason result)})))))
+                  w0 (or (:replay opts) []))]
+    (spawn (fn [] (serve-loop a opts w)))))
+
+(defn call
+  "Ask the authority `pid` one question and wait for its answer (`tag`),
+   or answer `:timeout` after `ms`."
+  [pid msg tag ms]
+  (let [ref (erlang/monitor :process pid)]
+    (erlang/send pid msg)
+    (receive
+      [t v] :when (= t tag) (do (erlang/demonitor ref (list :flush)) v)
+      [:DOWN r _ _ _] :when (= r ref) :down
+      (after ms (do (erlang/demonitor ref (list :flush)) :timeout)))))

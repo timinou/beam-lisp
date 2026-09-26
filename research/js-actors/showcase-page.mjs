@@ -22,7 +22,7 @@ const ATTRS = new Set(['class', 'type', 'value', 'placeholder', 'maxlength', 'di
 
 async function fetchAppName() {
   try {
-    const info = await (await fetch('/api/app', { cache: 'no-store' })).json();
+    const info = await (await fetch('./api/app', { cache: 'no-store' })).json();
     if (info && /^[a-z][a-z0-9-]{0,31}$/.test(info.app)) return info.app;
   } catch { /* fall through */ }
   return 'showcase';
@@ -314,7 +314,7 @@ async function propose(proposal) {
   if (offline) { worker.postMessage({ kind: 'unreachable', request: proposal.request }); return; }
   let body;
   try {
-    const r = await fetch('/api/intent', { method: 'POST', headers: { 'content-type': 'application/json', 'x-split-tab': TAB },
+    const r = await fetch('./api/intent', { method: 'POST', headers: { 'content-type': 'application/json', 'x-split-tab': TAB },
                                            body: JSON.stringify(proposal) });
     body = await r.json();
   } catch {
@@ -335,7 +335,7 @@ async function propose(proposal) {
 
 let events = null;
 function connect() {
-  events = new EventSource('/api/events');
+  events = new EventSource('./api/events');
   events.addEventListener('hello', e => {
     const frame = JSON.parse(e.data);
     if (state.revision === null) { worker.postMessage({ kind: 'hello', frame, tab: TAB }); log('server', `hello rev ${frame.revision}`); }
@@ -549,7 +549,7 @@ explain().catch(error => { $('evidence').textContent = 'manifest unavailable: ' 
 
 async function setupPeople(contract) {
   if (!contract.people) return;
-  const me = await (await fetch('/api/me', { cache: 'no-store' })).json();
+  const me = await (await fetch('./api/me', { cache: 'no-store' })).json();
   const bar = $('who');
   bar.hidden = false;
   const label = Object.assign(document.createElement('span'), { textContent: me.person ? 'signed in as' : 'sign in as' });
@@ -558,14 +558,14 @@ async function setupPeople(contract) {
     const b = Object.assign(document.createElement('button'), { type: 'button', textContent: p.name,
       className: me.person && me.person.id === p.id ? 'on' : '', title: `${p.name} · ${p.role}` });
     b.addEventListener('click', async () => {
-      await fetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: p.id }) });
+      await fetch('./api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: p.id }) });
       location.reload();
     });
     bar.append(b);
   }
   if (me.person) {
     const out = Object.assign(document.createElement('button'), { type: 'button', textContent: 'Sign out' });
-    out.addEventListener('click', async () => { await fetch('/api/logout', { method: 'POST' }); location.reload(); });
+    out.addEventListener('click', async () => { await fetch('./api/logout', { method: 'POST' }); location.reload(); });
     bar.append(out);
   }
 }
@@ -596,7 +596,7 @@ function setupHistory(contract) {
   range.addEventListener('input', async () => {
     const k = Number(range.value);
     if (k >= Number(range.max)) { live(); return; }
-    const past = await (await fetch(`/api/peek?revision=${k}`, { cache: 'no-store' })).json();
+    const past = await (await fetch(`./api/peek?revision=${k}`, { cache: 'no-store' })).json();
     if (!past.board) { $('scrub-label').textContent = `rev ${k} · not kept`; return; }
     viewingPast = true;
     $('scrub').classList.add('past');

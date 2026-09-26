@@ -526,7 +526,7 @@ not offer is refused by the Worker.
 list on it (it has no finite value) and any type nested deeper than 24 lists
 and records (no value would pass the wire); the authority's `wire-ok?` and the
 codec refuse any VALUE nested deeper than 24 — one bound, in `compiler.bl`,
-`split-wire.bl` and `split-codec.mjs`, checked equal by `verify-outline.mjs`.
+`priv/lib/split/wire.bl` and `split-codec.mjs`, checked equal by `verify-outline.mjs`.
 Code over such data is ordinary recursion: `item-row` renders an item and,
 inside it, `item-row` of each child; `find-item` and `depth-of` run in both
 halves; the server rebuilds the path down to one item. Each is admitted by

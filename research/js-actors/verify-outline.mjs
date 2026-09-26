@@ -111,11 +111,12 @@ try {
   assert.throws(() => codec.decodeSnapshot({ items: [{ ...bare(1), extra: 1 }] }), /record keys/);
   ok('the codec accepts a legal five-level plan, refuses 25 containers and a widened record');
 
-  // one depth bound, three places: the build, the BL authority, the codec
+  // one depth bound, two places: the wire grammar (the build requires it, the
+  // BEAM authority runs it, the browser half is compiled from it) and the codec
   const bound = file => Number(/\(defn wire-max-depth[\s\S]*?\[\] (\d+)\)/.exec(readFileSync(new URL(file, import.meta.url), 'utf8'))[1]);
-  assert.equal(bound('./compiler.bl'), MAX_DEPTH);
-  assert.equal(bound('./split-wire.bl'), MAX_DEPTH);
-  ok(`the wire depth bound (${MAX_DEPTH}) is the same in compiler.bl, split-wire.bl and the codec`);
+  assert.equal(bound('../../priv/lib/split/wire.bl'), MAX_DEPTH);
+  assert.ok(!/\(defn wire-max-depth/.test(readFileSync(new URL('./compiler.bl', import.meta.url), 'utf8')), 'the build has no copy of the bound');
+  ok(`the wire depth bound (${MAX_DEPTH}) is the same in priv/lib/split/wire.bl and the codec`);
 
   // ── the authority over HTTP ───────────────────────────────────────────────
   app = await startApp('outline');

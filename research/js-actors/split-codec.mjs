@@ -13,15 +13,21 @@
 //                       over the closed data the BL shells emit.
 //
 // SHAPE, NOT AUTHORITY. A decoded value is only well-formed; the BL server
-// re-checks it with split-wire.bl and decides. The codec's job is to refuse
+// re-checks it with priv/lib/split/wire.bl and decides. The codec's job is to refuse
 // garbage early and to make the JS side unable to invent a shape the contract
 // does not name.
 
 import * as H from './host.mjs';
 
-// Lists and records nest at most this deep (split-wire.bl `wire-max-depth`):
+// Lists and records nest at most this deep (priv/lib/split/wire.bl `wire-max-depth`):
 // a recursive wire type admits trees of any depth, the wire does not.
 export const MAX_DEPTH = 24;
+
+// The length a [:text min max] bound measures: Unicode codepoints, exactly as
+// priv/lib/split/wire.bl `wire-text-length` counts them (a surrogate pair — an
+// emoji — is ONE; `s.length` would say two, and BEAM's `count` would count
+// graphemes), so the codec and the authority agree on every string.
+export const textLength = s => { let n = 0; for (const _ of s) n += 1; return n; };
 
 export const PROPOSAL_KEYS = ['args', 'digest', 'nonce', 'op', 'request', 'revision'];
 
@@ -61,7 +67,8 @@ export function createCodec(contract) {
     const [tag, a, b] = t;
     if (tag === 'text') {
       if (typeof v !== 'string') fail('expected text');
-      if (v.length < a || v.length > b) fail(`text length ${v.length} outside ${a}..${b}`);
+      const n = textLength(v);
+      if (n < a || n > b) fail(`text length ${n} outside ${a}..${b}`);
       return v;
     }
     if (tag === 'one-of') {

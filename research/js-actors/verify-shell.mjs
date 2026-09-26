@@ -79,7 +79,8 @@ try {
 
   const html = await get('/');
   assert.equal(html.status, 200);
-  assert.ok(html.body.includes('<link rel="stylesheet" href="/app.css">'), 'the page must link /app.css');
+  // relative, so the same page works mounted under /apps/<name>/ on one server
+  assert.ok(html.body.includes('<link rel="stylesheet" href="./app.css">'), 'the page must link ./app.css');
   assert.ok(!html.body.includes('#app .task'), 'the app rules must not be inlined in the page');
   ok('the page links /app.css and the app rules live only in the stylesheet');
 

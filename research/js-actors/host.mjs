@@ -1181,6 +1181,9 @@ export const PURE = {
   arith,
   "str-cat": (...xs) => xs.map(toStr).join(""),
   "str-size": (s) => s.length,
+  // the string's Unicode codepoints (a surrogate pair is ONE), as a BL list —
+  // what `unicode:characters_to_list/1` answers on BEAM
+  "str-codepoints": (s) => listFromArray(Array.from(s, (c) => c.codePointAt(0))),
   "str-cmp": strCmp,
   // A substring by UTF-16 index, bounds-checked: `subs` on this target.
   "str-slice": (s, from, to) => {
