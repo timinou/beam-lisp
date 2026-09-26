@@ -1,5 +1,10 @@
 # Proof log — the split showcase, track by track
 
+Start everything: `node research/js-actors/showcase-all.mjs --base 8801`, then
+open http://127.0.0.1:8801/ (gallery, `gallery.png`). Six apps, one per
+capability; each entry below says what was claimed, how it was checked, and
+what was observed — including what was found broken along the way.
+
 Each entry says what was claimed, how it was checked, and the observed result.
 Commands run from the repository root with
 `BEAM_LISP_Z3=/usr/bin/z3 ELIXIR_ERL_OPTIONS='+S 8:8 +SDio 8'`. Screenshots are

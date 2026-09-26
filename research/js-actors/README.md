@@ -293,6 +293,12 @@ node research/js-actors/split-server.mjs --port 8791                    # then o
 node research/js-actors/split-server.mjs --port 8792 --app outline      # any app under apps/
 ```
 
+**All of them at once:** `node research/js-actors/showcase-all.mjs --base 8801`
+starts every built app on its own port (8802–8807) and a gallery on 8801
+that says what each one shows ([proof/gallery.png](proof/gallery.png)). Every
+screenshot and measurement behind the table below is in
+[proof/PROOF.md](proof/PROOF.md).
+
 **One shell, many apps.** `showcase.bl` is the launch board; every other app
 lives in [`apps/`](apps/) as `<app>.bl` plus an optional `<app>.css` (its
 look) and `<app>.page.json` (title, lede and hints for the page). The page,
