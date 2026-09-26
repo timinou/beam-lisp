@@ -176,12 +176,16 @@ const TRACE = {
   local: v => ['browser', `local ${v.event} — no network`],
   proposed: v => ['browser', `${v.op} checked here, sent @rev ${v.revision}${v.retry ? ' (rebased)' : ''}`],
   'client-refused': v => ['browser', `${v.op} refused before sending: ${v.reason}`],
-  confirmed: v => ['server', `${v.op} committed → rev ${v.revision}`],
+  confirmed: v => ['server', v.duplicate ? `${v.op} was already committed — answered once, not applied twice`
+                                         : `${v.op} committed → rev ${v.revision}`],
+  diverged: v => ['browser', `${v.op}: the server's result differs from the prediction — showing the server's`],
+  queued: v => ['browser', `${v.op} queued offline (${v.count} waiting) — shown now, sent when back online`],
+  online: v => ['browser', `back online — sending ${v.count} queued intent${v.count === 1 ? '' : 's'} in order`],
   'server-refused': v => ['server', `${v.op} refused: ${v.reason}`],
   rebased: v => ['browser', `${v.op} lost a race — re-checked against rev ${v.revision}, resent`],
   'rebase-refused': v => ['browser', `${v.op} no longer valid after rebase: ${v.reason}`],
   snapshot: v => ['server', `snapshot rev ${v.revision}${v.op ? ` (${v.op} from another tab)` : ''}`],
-  unreachable: v => ['browser', `${v.op} dropped — no answer; board unchanged`],
+
 };
 
 // ── the link ─────────────────────────────────────────────────────────────────
@@ -193,7 +197,26 @@ function setLink(mode, text) {
   el.textContent = text;
 }
 
+// OFFLINE. The tab is offline when its event stream is down — or when the user
+// flips "Go offline", which closes this tab's stream and stops sending: the
+// same transport state a dropped connection produces, chosen on purpose for
+// a demo. The BL client is told either way; it queues, and sends in order when
+// it hears `online`.
+let offline = false;
+function goOffline(why) {
+  if (offline) return;
+  offline = true;
+  worker.postMessage({ kind: 'offline' });
+  setLink('down', why);
+}
+function goOnline() {
+  if (!offline) return;
+  offline = false;
+  worker.postMessage({ kind: 'online' });
+}
+
 async function propose(proposal) {
+  if (offline) { worker.postMessage({ kind: 'unreachable', request: proposal.request }); return; }
   let body;
   try {
     const r = await fetch('/api/intent', { method: 'POST', headers: { 'content-type': 'application/json', 'x-split-tab': TAB },
@@ -206,7 +229,7 @@ async function propose(proposal) {
     // No authoritative answer: tell the BL client the request failed without
     // inventing a board — it keeps the last confirmed one.
     log('wire', `${proposal.op}: server unreachable`);
-    setLink('down', 'offline');
+    goOffline('offline');
     worker.postMessage({ kind: 'unreachable', request: proposal.request });
     return;
   }
@@ -219,9 +242,10 @@ function connect() {
   events = new EventSource('/api/events');
   events.addEventListener('hello', e => {
     const frame = JSON.parse(e.data);
-    if (state.revision === null) { worker.postMessage({ kind: 'hello', frame }); log('server', `hello rev ${frame.revision}`); }
+    if (state.revision === null) { worker.postMessage({ kind: 'hello', frame, tab: TAB }); log('server', `hello rev ${frame.revision}`); }
     else worker.postMessage({ kind: 'snapshot', frame });
     setLink('live', 'live · rev ' + frame.revision);
+    goOnline();
   });
   events.addEventListener('snapshot', e => {
     const { by, ...frame } = JSON.parse(e.data);
@@ -230,8 +254,17 @@ function connect() {
     if (by !== TAB) worker.postMessage({ kind: 'snapshot', frame });
     setLink('live', 'live · rev ' + frame.revision);
   });
-  events.onerror = () => setLink('down', 'reconnecting…');
+  events.onerror = () => { if (!simulated) goOffline('reconnecting…'); };
 }
+
+let simulated = false;
+$('offline-toggle').addEventListener('click', () => {
+  simulated = !simulated;
+  $('offline-toggle').textContent = simulated ? 'Go online' : 'Go offline';
+  $('offline-toggle').setAttribute('aria-pressed', String(simulated));
+  if (simulated) { events.close(); goOffline('offline'); }
+  else connect();
+});
 
 // ── the Worker ───────────────────────────────────────────────────────────────
 

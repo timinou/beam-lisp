@@ -278,8 +278,9 @@ function runs** and emits three artifacts:
 ```sh
 BEAM_LISP_Z3=/usr/bin/z3 ELIXIR_ERL_OPTIONS='+S 8:8 +SDio 8' \
   JS_ACTORS_SPLIT_ONLY=1 ./bin/bl run research/js-actors/compiler.bl   # split only, ~3 min
-node research/js-actors/verify-split.mjs                                # 24 end-to-end checks
+node research/js-actors/verify-split.mjs                                # 28 end-to-end checks
 node research/js-actors/verify-outline.mjs                              # the nested-plan app, 22 checks
+node research/js-actors/verify-groceries.mjs                            # instant + offline, 22 checks
 node research/js-actors/verify-shell.mjs                                # the shared page/server shell
 node research/js-actors/verify-order-parity.mjs                         # sort/compare/combinators = BEAM, 30 answers
 node research/js-actors/split-server.mjs --port 8791                    # then open http://127.0.0.1:8791/
@@ -297,6 +298,7 @@ evidence, timeline, contract) collapses to give the app the whole width.
 | App | Shows | Proof |
 |---|---|---|
 | `showcase.bl` — launch board | placement, shared checks, rebase, function values, composed predicates | `verify-split.mjs`, [proof/track1-higher-order.png](proof/track1-higher-order.png) |
+| `apps/groceries.bl` — shared shopping list | **instant edits, confirmed by the server; works offline**: predictions, slide-back on refusal, server-adjusted results, an offline queue sent in order, at-most-once resends | `verify-groceries.mjs`, [proof/track3-groceries-offline.png](proof/track3-groceries-offline.png), [proof/track3-groceries-race.png](proof/track3-groceries-race.png) |
 | `apps/outline.bl` — nested project plan | **data of any shape**: a recursive wire type, a recursive view, recursive roll-ups, search that keeps ancestors, a whole subtree ticked at once | `verify-outline.mjs`, [proof/track2-outline.png](proof/track2-outline.png), [proof/track2-outline-search.png](proof/track2-outline-search.png) |
 
 **The declaration.** Roots only — nothing says "client" or "server" per function:
@@ -442,12 +444,35 @@ exist in server state but have no field in the wire type, so they never leave.
 
 **The client is honest about what it knows.** `split-client.bl` runs the
 shared `:check` before sending (a duplicate title is refused *in the browser*,
-no request leaves), shows sent intents as pending ghost rows, adopts only a
-newer board that satisfies the snapshot type, and on `stale-revision` re-runs
-the **same** check against the newer board and re-proposes once — a rebase
-decided by app code, not by the transport. A refused or unanswered submit gives
-the draft back unless the user has typed since; an unanswered intent is never
-assumed committed. Typing and filtering are local-only: no network at all.
+no request leaves), adopts only a newer board that satisfies the snapshot
+type, and never invents a confirmed board. Typing and filtering are local-only.
+
+**Instant, then confirmed.** An intent may declare `:predict` — `(fn [board
+args] board')`, the board it expects — and the client renders the confirmed
+board with every pending prediction applied, in order, in the same frame as
+the click. A prediction is a client root: the build places it in the browser
+only if it passes the same gate as the view. The view sees `sync` with
+`:confirmed`, `:pending` (each `:queued` or `:sent`), `:link` and `:note`, so it
+can mark what is not yet confirmed. When the server answers:
+
+* **ok** — the prediction is replaced by the server's board. If they differ
+  (the server merged a duplicate into an existing row), the step is reported
+  as *diverged* and the view gets `{:where :adjusted}`. `:agrees?` lets an app
+  say what "the same" means when the server chooses something the browser
+  cannot know (a new row's id).
+* **refused** — the intent leaves the queue, its prediction stops being
+  applied (the row slides back) and the reason shows; the draft comes back
+  unless the user has typed since.
+* **stale-revision** — another tab won: the same intent is checked against
+  the newer board and sent again (at most 3 times); if the check now refuses,
+  it is dropped with the reason.
+* **no answer** — the link is down. Intents keep queuing, shown at once;
+  when the link returns they go out one at a time, in order, each checked
+  against the board as it is then. Every proposal carries a **nonce** (tab id
+  and request number) that the authority commits at most once, so resending
+  an intent whose answer was lost can never apply it twice (`{:ok true
+  :duplicate true}`). "Go offline" in the page header cuts this tab's
+  transport on purpose, for a demo; a dropped connection does the same.
 
 **The page** (`showcase.html`, `showcase-page.mjs`) renders the BL view tree
 through a keyed reconciler (focus and caret survive per-keystroke renders;
@@ -483,7 +508,9 @@ item before recursing, recursing on a growing search string, an item type
 that must hold an item, and a type nested 25 deep.
 
 **Limits, stated.** No authentication (single-user loopback). One app per
-file; only `defn`s besides the declaration. The closure flow is a 0-CFA: one
+file; only `defn`s besides the declaration. The offline queue lives in the
+tab: closing the tab while offline loses it (nothing is written to storage),
+and the nonce memory is the last 256 commits of one server process. The closure flow is a 0-CFA: one
 heap set for all data, so a program that stores a function in data and reads a
 DIFFERENT one back may be refused for a cycle it cannot actually take
 (conservative, never unsound). Recursion is admitted by capture order or by

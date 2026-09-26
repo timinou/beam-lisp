@@ -90,13 +90,16 @@ globalThis.onmessage = ({ data }) => {
     if (data.kind === 'event') { H.enqueueData('event', eventToBL(data.event), { nodes: 4, depth: 1, text: 256 }); return; }
     if (!codec) throw new Error('contract not loaded');
     if (data.kind === 'hello') {
+      if (typeof data.tab !== 'string' || !/^[a-z0-9]{8,32}$/.test(data.tab)) throw new Error('hello needs a tab id');
       H.enqueueData('hello', H.bmap([[H.kw('digest'), String(data.frame.digest)],
+                                     [H.kw('tab'), data.tab],
                                      [H.kw('revision'), data.frame.revision],
                                      [H.kw('board'), codec.decodeSnapshot(data.frame.board)]]));
       return;
     }
     if (data.kind === 'result' || data.kind === 'snapshot') { H.enqueueData(data.kind, frameToBL(codec, data.frame)); return; }
     if (data.kind === 'unreachable' && Number.isSafeInteger(data.request)) { H.enqueueData('unreachable', data.request); return; }
+    if (data.kind === 'online' || data.kind === 'offline') { H.enqueueData(data.kind, ''); return; }
   } catch (error) {
     postMessage({ kind: 'error', text: String(error.message || error) });
   }

@@ -23,7 +23,7 @@ import * as H from './host.mjs';
 // a recursive wire type admits trees of any depth, the wire does not.
 export const MAX_DEPTH = 24;
 
-export const PROPOSAL_KEYS = ['args', 'digest', 'op', 'request', 'revision'];
+export const PROPOSAL_KEYS = ['args', 'digest', 'nonce', 'op', 'request', 'revision'];
 
 export function createCodec(contract) {
   if (!contract || contract.schema !== 1 || typeof contract.digest !== 'string' ||
@@ -53,6 +53,11 @@ export function createCodec(contract) {
       if (typeof v !== 'string') fail('expected text');
       if (v.length < a || v.length > b) fail(`text length ${v.length} outside ${a}..${b}`);
       return v;
+    }
+    if (tag === 'one-of') {
+      // a keyword from a closed list: JSON carries its name, BL gets the keyword
+      if (typeof v !== 'string' || !t.slice(1).includes(v)) fail(`expected one of ${t.slice(1).join(', ')}`);
+      return H.kw(v);
     }
     if (tag === 'int') {
       if (!Number.isSafeInteger(v)) fail('expected an exact integer');
@@ -92,9 +97,10 @@ export function createCodec(contract) {
       const keys = Object.keys(json).sort();
       if (keys.length !== PROPOSAL_KEYS.length || keys.some((k, i) => k !== PROPOSAL_KEYS[i]))
         return { ok: false, reason: 'malformed-proposal' };
-      const { request, revision, digest, op, args } = json;
+      const { request, revision, digest, nonce, op, args } = json;
       if (!Number.isSafeInteger(request) || request < 1 || !Number.isSafeInteger(revision) || revision < 0 ||
-          typeof digest !== 'string' || typeof op !== 'string')
+          typeof digest !== 'string' || typeof op !== 'string' ||
+          typeof nonce !== 'string' || !/^[a-z0-9]{8,32}:[0-9]{1,9}$/.test(nonce))
         return { ok: false, reason: 'malformed-proposal' };
       if (digest !== contract.digest) return { ok: false, reason: 'client-outdated' };
       const params = intentParams(op);
@@ -102,7 +108,7 @@ export function createCodec(contract) {
       try {
         const bl = decode(params, args, '$args');
         return { ok: true, value: H.bmap([[H.kw('request'), request], [H.kw('revision'), revision],
-          [H.kw('digest'), digest], [H.kw('op'), H.kw(op)], [H.kw('args'), bl]]) };
+          [H.kw('digest'), digest], [H.kw('nonce'), nonce], [H.kw('op'), H.kw(op)], [H.kw('args'), bl]]) };
       } catch (error) {
         return { ok: false, reason: 'malformed-args', detail: error.message };
       }
@@ -142,6 +148,7 @@ export function frameToBL(codec, frame) {
   const pairs = [[H.kw('revision'), frame.revision], [H.kw('board'), board]];
   if (Number.isSafeInteger(frame.request)) pairs.push([H.kw('request'), frame.request]);
   if (frame.ok !== undefined) pairs.push([H.kw('ok'), frame.ok === true]);
+  if (frame.duplicate === true) pairs.push([H.kw('duplicate'), true]);
   if (typeof frame.reason === 'string' && /^[a-z][a-z0-9?-]{0,47}$/.test(frame.reason))
     pairs.push([H.kw('reason'), H.kw(frame.reason)]);
   if (typeof frame.op === 'string' && Object.prototype.hasOwnProperty.call(codec.contract.intents, frame.op))

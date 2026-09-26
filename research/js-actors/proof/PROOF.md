@@ -73,3 +73,27 @@ server, which rebuilds the path to one item.
 | **found in the browser, fixed** | while searching, roll-ups counted only the matching branches ("Build 0/2"); they now count the whole branch (`Build 1/5`) |
 | independent red-team (a separate agent, ~60 programs: lookups of call results, map-as-fn, keyword in a local, `get-in`, defaults, mutual :part/:le cycles, arity mixes, loops in cycles, case patterns) | **no admitted non-terminating program**. Soundness of ":part counts as :le": every read `sub-rel` recognizes returns a subterm or nil; anything that can grow (`conj`/`assoc`/`cons`/`into`/literals/`str`) carries no relation and refuses the edge. Found and FIXED: a non-recursive type nested past the bound was admitted though no value could pass (now refused); `(nth coll i default)` was read as a lookup (only 1–2 argument reads count now). Reported and REJECTED on inspection: "a `case` symbol pattern is read as a binder". The compiled ANF shows `(case (conj it []) it (cand it) 0)` tests equality against the LOCAL `it` (`{:op :var :name "it_…"}`) — no binding happens, and `(cand it)` recurses on an element, which is genuinely structural |
 | full build + all Node suites | build exit 0, 53 OK, SPLIT PASS (showcase + outline), PORTABLE HELPER PASS, parity 30, 22/22 Node suites |
+
+## Track 3 — instant edits, confirmed by the server; offline (PLAN-149)
+
+**Claim.** An edit shows in the same frame as the click; the server's answer
+confirms or reverts it; a server that decides differently wins visibly; edits
+made offline are kept, shown, and sent in order when the link returns; a
+resend never applies twice.
+
+**Mechanism.** `split-client.bl` rewritten around a queue (one in flight,
+oldest first; re-checked against the confirmed board before sending);
+`:predict`/`:agrees?` per intent (client roots, gated like the view); a nonce
+per proposal, committed at most once by `split-server.bl` (last 256);
+`offline`/`online` inputs. App: `apps/groceries.bl`; the outline also predicts
+ticks and removals now (a whole branch ticks at once). New wire type
+`[:one-of k …]`.
+
+| Check | Result |
+|---|---|
+| split build | `SPLIT PASS groceries: 11 placements, 3 refusals named` (a prediction with an effect, a prediction of the wrong arity, a malformed enum) |
+| `verify-groceries.mjs` | `GROCERIES PASS (22 checks)`: enum codec; placement; tick committed once, same nonce → `duplicate`, revision unchanged; server merge of a duplicate name; instant tick before any answer; queue order with auto-drain; slide-back after another tab won (`already-so`, `no-such-item`); divergence reported on a merge; a new row predicted right is NOT reported; offline: 3 edits shown and queued, "Offline · 3 changes waiting", drained in order on online |
+| `verify-split.mjs` (migrated onto the shared kit) | `SPLIT PASS (28 checks)`: unanswered intent stays queued, resent with the same nonce on online, committed once, re-post answered `duplicate` |
+| `verify-outline.mjs` | `OUTLINE PASS (22 checks)`: a tick shows the whole branch done before any answer |
+| real browser, port 8794 | click → predicted render **42 ms**, confirmed **114 ms** (row marked saving between); offline: 3 edits shown with "waiting", header "Offline · 3 changes waiting"; online: all three committed in order in 383 ms; "Oat milk" added again → one row, qty 3, note "The server adjusted that…"; tick raced by another tab → "Not applied — someone already did that.", row shows the other tab's state. Screenshots `track3-groceries-offline.png`, `track3-groceries-race.png` |
+| **found in the browser, fixed** | adding a NEW item was reported as diverged (the prediction's provisional id 0 ≠ the server's id) → `:agrees?`; raw reason keywords in notes → words; `rest` of a vector raised on the JS target (the queue is a vector) → `rt-rest` takes vectors, parity case `rest-of-vectors` (31 answers) |

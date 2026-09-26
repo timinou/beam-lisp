@@ -17,7 +17,11 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createCodec, MAX_DEPTH } from './split-codec.mjs';
-import { startApp, spawnClient, texts, findAll, attr, canonical, contractDigest, readOut } from './split-test-kit.mjs';
+import { startApp, spawnClient, texts, findAll, attr, canonical, contractDigest, nonce, readOut } from './split-test-kit.mjs';
+
+// Hand-crafted proposals in this file come from a fixed "tab" distinct from
+// the BL client's, so no nonce can collide with one the child proposes.
+const HTTP_TAB = 'outlinehttp00001';
 
 let passed = 0;
 const ok = (label) => { passed += 1; console.log('PASS outline: ' + label); };
@@ -85,14 +89,15 @@ try {
   const fn = name => manifest.functions.find(f => f.name === name);
   for (const n of ['plan-view', 'item-row', 'tally', 'prune']) assert.equal(where[n], 'client', n + ' belongs in the browser');
   for (const n of ['find-item', 'depth-of', 'add-problem']) assert.equal(where[n], 'shared', n + ' is shared');
-  for (const n of ['toggle-in', 'add-in', 'remove-in', 'set-done']) assert.equal(where[n], 'server', n + ' belongs to the authority');
+  for (const n of ['toggle-in', 'remove-in', 'set-done']) assert.equal(where[n], 'shared', n + ' predicts in the browser and applies on the server');
+  assert.equal(where['add-in'], 'server', 'add-in belongs to the authority (the server numbers new items)');
   ok('the manifest places every tree walk in its half: view/roll-up browser, checks shared, rebuild authority');
 
   for (const n of ['item-row', 'tally', 'prune', 'find-item'])
     assert.equal(fn(n).evidence.recursion, 'structural', n + ' terminates by structural descent');
   ok('each recursive walk is admitted by a structural-descent proof');
 
-  for (const needle of ['"js/toggle-in"', '"js/add-in"', '"js/remove-in"', '"js/set-done"', 'initial-plan'])
+  for (const needle of ['"js/add-in"', '"js/add-item"', 'initial-plan'])
     assert.equal(clientBundle.includes(needle), false, 'client bundle leaks ' + needle);
   assert.ok(serverBundle.includes('"js/toggle-in"') && serverBundle.includes('initial-plan'));
   ok('the server-only rebuilders and the initial plan stay out of the client bundle');
@@ -127,7 +132,7 @@ try {
   let req = 0;
   const intent = async (op, args) => {
     req += 1;
-    const r = await app.post({ request: req, revision: rev, digest, op, args });
+    const r = await app.post({ request: req, revision: rev, digest, nonce: nonce(HTTP_TAB, req), op, args });
     if (r.body && r.body.ok) { rev = r.body.revision; board = r.body.board; }
     return r;
   };
@@ -246,7 +251,12 @@ try {
   const toggled = (await client.next('propose', mark)).value;
   assert.equal(toggled.op, 'toggle-item');
   assert.deepEqual(toggled.args, { id: 4 });
-  ok(':toggle proposes a server-authoritative toggle-item');
+  // the view rendered with the prediction BEFORE any answer: the branch and
+  // every step under it show ticked (class "done") at once
+  const predicted = (await client.next('view', mark)).value;
+  const doneOf = id => String(attr(rowNode(predicted.tree, id))?.class || '').includes('done');
+  assert.ok(doneOf(4) && doneOf(5) && doneOf(6), 'Competitor teardown and both its steps tick instantly');
+  ok(':toggle proposes toggle-item and the whole branch ticks at once, predicted in the browser');
 
   // ── the authority, destructive last (the client needed Build intact) ──────
   let parent = 17;                                   // Tell the beta list, depth 2

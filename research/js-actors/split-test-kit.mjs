@@ -41,9 +41,20 @@ export function canonical(v) {
 export const contractDigest = contract =>
   createHash('sha256').update(canonical((({ digest, ...body }) => body)(contract))).digest('hex');
 
+// A tab id is the client's identity on the wire: its proposals carry
+// `<tab>:<request>` as a nonce, and the hello declares it. It must match the
+// wire's /^[a-z0-9]{8,32}$/.
+export const DEFAULT_TAB = 'kitclient0000001';
+
+// A proposal's nonce: this tab's id and the request number, stable across
+// resends. The server commits a nonce at most once, so a resend is safe even
+// if the first answer was lost.
+export const nonce = (tab, request) => `${tab}:${request}`;
+
 // The child runs the generated client bundle with the same host bridge the
-// browser Worker uses; the app name picks the contract and the bundle.
-const clientSource = app => `
+// browser Worker uses; the app name picks the contract and the bundle, and the
+// tab id is the identity every hello declares.
+const clientSource = (app, tab) => `
   import * as H from './host.mjs';
   import { createCodec, encode, frameToBL } from './split-codec.mjs';
   import { readFileSync } from 'node:fs';
@@ -56,9 +67,10 @@ const clientSource = app => `
     let i;
     while ((i = buf.indexOf('\\n')) >= 0) {
       const msg = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
-      if (msg.kind === 'hello') H.enqueueData('hello', H.bmap([[H.kw('digest'), msg.digest], [H.kw('revision'), msg.revision], [H.kw('board'), codec.decodeSnapshot(msg.board)]]));
+      if (msg.kind === 'hello') H.enqueueData('hello', H.bmap([[H.kw('digest'), msg.digest], [H.kw('tab'), ${JSON.stringify(tab)}], [H.kw('revision'), msg.revision], [H.kw('board'), codec.decodeSnapshot(msg.board)]]));
       else if (msg.kind === 'event') H.enqueueData('event', H.vec(msg.event.map(x => typeof x === 'string' && x.startsWith(':') ? H.kw(x.slice(1)) : x)));
       else if (msg.kind === 'unreachable') H.enqueueData('unreachable', msg.request);
+      else if (msg.kind === 'offline' || msg.kind === 'online') H.enqueueData(msg.kind, '');
       else if (msg.kind === 'result' || msg.kind === 'snapshot') H.enqueueData(msg.kind, frameToBL(codec, msg.frame));
       else if (msg.kind === 'stop') H.enqueueData('stop', '');
     }
@@ -126,8 +138,10 @@ export async function startApp(app) {
   return { app, service, codec: service.codec, base, post, events, until, snapshotNow, close };
 }
 
-export function spawnClient(app) {
-  const child = spawn(process.execPath, ['--input-type=module', '-e', clientSource(app)],
+export function spawnClient(app, { tab = DEFAULT_TAB } = {}) {
+  if (typeof tab !== 'string' || !/^[a-z0-9]{8,32}$/.test(tab))
+    throw new Error('spawnClient: tab must match /^[a-z0-9]{8,32}$/');
+  const child = spawn(process.execPath, ['--input-type=module', '-e', clientSource(app, tab)],
                       { cwd: HERE.pathname, stdio: ['pipe', 'pipe', 'inherit'] });
   const frames = [];
   let buffer = '';
@@ -159,7 +173,7 @@ export function spawnClient(app) {
       child.once('exit', () => { clearTimeout(timer); resolve(); });
     });
   };
-  return { child, frames, tell, next, close };
+  return { child, frames, tell, next, close, tab };
 }
 
 // Every string anywhere in a view tree.
