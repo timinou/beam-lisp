@@ -378,6 +378,17 @@ defmodule BeamLisp.AOTCache do
     end
   end
 
+  # CompilerData is the first pinned host leaf: its exact-name beam is now
+  # compiled from priv/host/compiler_data.bl, not lib/beam_lisp/compiler_data.ex.
+  # The live key must follow THAT source; otherwise removing the .ex would force
+  # the baked-digest fallback in a checkout and make future codegen edits invisible.
+  defp codegen_source_path(BeamLisp.CompilerData) do
+    Enum.find_value(codegen_source_roots(), fn root ->
+      path = Path.expand("../priv/host/compiler_data.bl", root)
+      File.exists?(path) && path
+    end) || Path.expand("../priv/host/compiler_data.bl", hd(codegen_source_roots()))
+  end
+
   # `lib/beam_lisp/atom_guard.ex` for `BeamLisp.AtomGuard` — derived from the
   # module name rather than listed beside it, so a module added to
   # `@codegen_modules` cannot be silently uncovered. Nil when no candidate root

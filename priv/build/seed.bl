@@ -36,6 +36,7 @@
 
 (def default-boot "priv/boot")
 (def default-out "priv/bootstrap/seed")
+(def default-host "priv/host")
 
 (defn- as-text
   "An Erlang string (a charlist) as a binary."
@@ -155,6 +156,147 @@
           {:error (str "cannot load the beam: " (pr-str loaded))})))
     (catch e {:error (str "cannot load the beam: " (or (ex-message e) (pr-str e)))})))
 
+;; ── the pinned HOST floor ───────────────────────────────────────────────────
+;
+; The boot shims above are COPIED from a build's ebin: the compiler emits them
+; and the seed publishes them. A pinned HOST module is different — it is
+; COMPILED here, from checked-in source, by the very artefact the floor exists
+; to make replaceable (`BeamLisp.AOT/compile-host-file`). That is the whole
+; point of the migration: a host leaf stops needing an Elixir `.ex` to exist at
+; boot, while the compiler that compiles it still comes from the floor beneath.
+;
+; Three properties keep that safe, and each is why a function below exists:
+;   * the mapping is EXPLICIT — which module a source becomes is written down;
+;   * compilation is ISOLATED — into a scratch ebin, `load? false`, so a pinned
+;     leaf (CompilerData is live in this VM) is never substituted mid-run;
+;   * the bytes are JUDGED — the beam carries the digest of the source it was
+;     built from, and `run` refuses one whose stamp disagrees with the source.
+
+(defn host-sources
+  "The pinned HOST modules the floor carries: each a checked-in `.bl` source and
+   the EXACT `Elixir.BeamLisp.X` module it is compiled to. A table, not a
+   directory sweep: which module a source becomes is a decision, and a sweep
+   could not tell a pinned leaf from a stray file.
+
+   `:module` is an atom because the emitter takes an atom (a string is never
+   turned into one on that path); the beam filename is derived from it."
+  [host-dir]
+  [{:module :"Elixir.BeamLisp.CompilerData"
+    :source (Path/join host-dir "compiler_data.bl")}])
+
+(defn host-beam
+  "The seed beam filename a host mapping entry compiles to."
+  [entry]
+  (str (:module entry) ".beam"))
+
+(defn host-provenance
+  "The `bl_source_hash` a pinned host beam carries, read WITHOUT loading it —
+   the attribute chunk, exactly the read `Bootstrap.stamped_key/1` does for
+   `bl_compiler_key`. Returns `{:ok hash}` or `{:error why}`.
+
+   Loading is not an option: the beam's module is a LIVE host leaf in the VM
+   doing the check, and `code/load_binary` would replace it — the one thing the
+   pinned path exists to avoid. The attribute is the beam's own claim about the
+   source it was built from, so the reader judges the claim, never runs it."
+  [path]
+  (try
+    (let [r (erlang/apply :beam_lib :chunks
+                          (list (erlang/binary_to_list path) (list :attributes)))]
+      (if (and (tuple? r) (= :ok (erlang/element 1 r)))
+        (let [pair (erlang/element 2 r)
+              chunks (erlang/element 2 pair)
+              attrs (erlang/element 2 (erlang/hd chunks))]
+          (loop [as attrs]
+            (cond
+              (empty? as) {:error "the beam carries no source hash"}
+              (= :bl_source_hash (erlang/element 1 (first as)))
+              {:ok (as-text (erlang/element 2 (first as)))}
+              :else (recur (rest as)))))
+        {:error (str "cannot read the beam's attributes: " (pr-str r))}))
+    (catch e {:error (str "cannot read the beam's attributes: " (or (ex-message e) (pr-str e)))})))
+
+(defn- compile-host
+  "Compile ONE pinned host source into `dir` with `load? false`, then VERIFY its
+   byte provenance: the emitted beam's `bl_source_hash` must equal the digest of
+   the source just compiled. Returns
+   `{:ok {:name :path :source :source-hash :sha}}` or `{:error why}`."
+  [entry dir]
+  (let [source (:source entry)
+        name (host-beam entry)]
+    (cond
+      (not (File/exists? source))
+      {:error (str source ": no such pinned host source")}
+
+      :else
+      (let [source-hash (d/sha256-hex-of source 0 (d/file-size source))]
+        (try
+          (BeamLisp.AOT/compile_host_file source
+            (list (erlang/list_to_tuple (list :module (:module entry)))
+                  (erlang/list_to_tuple (list :output_dir dir))
+                  (erlang/list_to_tuple (list :file source))
+                  (erlang/list_to_tuple (list :source_hash source-hash))
+                  ;; NEVER load a host leaf into the generator: CompilerData is a
+                  ;; live module in this VM, and the pinned beam exists for the
+                  ;; NEXT boot, not this one.
+                  (erlang/list_to_tuple (list :load? false))))
+          (let [path (Path/join dir name)]
+            (cond
+              (not (File/exists? path))
+              {:error (str name ": the pinned compile wrote no beam")}
+
+              :else
+              (let [got (host-provenance path)]
+                (cond
+                  (:error got) {:error (str name ": " (:error got))}
+
+                  (not= source-hash (:ok got))
+                  {:error (str name ": stamped with source "
+                               (subs (as-text (:ok got)) 0 12) "… but built from "
+                               (subs source-hash 0 12) "…")}
+
+                  :else
+                  {:ok {:name name :path path :source source
+                        :source-hash source-hash
+                        :sha (d/sha256-hex-of path 0 (d/file-size path))}}))))
+          (catch e
+            {:error (str name ": pinned compile failed: " (or (ex-message e) (pr-str e)))}))))))
+
+(defn- compile-hosts
+  "Compile every pinned host source into `dir`. The WHOLE set is compiled (and
+   each beam's provenance verified) before any of it is used, so a failure here
+   leaves the floor exactly where it was — the same safety order the shim refusal
+   keeps. Returns `{:ok? true :beams [...]}` or `{:ok? false :errors [...]}`."
+  [entries dir]
+  (let [results (map (fn [e] (compile-host e dir)) entries)
+        errors (vec (keep (fn [r] (:error r)) results))]
+    (if (empty? errors)
+      {:ok? true :beams (vec (map (fn [r] (:ok r)) results))}
+      {:ok? false :errors errors})))
+
+(defn- host-rows
+  "The pinned host floor as JUDGEABLE rows, in the same shape `moved/2` gives
+   for shims so one refusal printer serves both: what the beam says it was built
+   from (`:stamped`) versus what the tree's source hashes now (`:live`). A beam
+   that is absent, or carries no hash, is reported and BLOCKS — there is no
+   action-only host source, so every missing or unjudged one is drift."
+  [out hosts]
+  (map (fn [entry]
+         (let [beam (Path/join out (host-beam entry))
+               name (str (:module entry))
+               live (try (d/sha256-hex-of (:source entry) 0 (d/file-size (:source entry)))
+                         (catch e (str "unresolved: " (or (ex-message e) (pr-str e)))))]
+           (if-not (File/exists? beam)
+             {:ns name :beam (Path/basename beam) :stamped nil :live live :verdict :moved}
+             (let [got (host-provenance beam)]
+               (cond
+                 (:error got)
+                 {:ns name :beam (Path/basename beam) :stamped nil :live live :verdict :unjudged}
+
+                 :else
+                 {:ns name :beam (Path/basename beam) :stamped (:ok got) :live live
+                  :verdict (if (= (:ok got) live) :current :moved)})))))
+       hosts))
+
 (defn- stale-why
   "Why `name` must not be seeded, or nil when it may: only a SHIM is stamped, and
    the key it carries must be the one this toolchain writes for its namespace."
@@ -235,6 +377,13 @@
    (`ns_closure_hash`), so `check` never builds anything in order to decide whether
    a build is needed.
 
+   The PINNED HOST floor is judged by the same idea, on its own evidence: a host
+   beam carries `bl_source_hash` — the digest of the source it was built from —
+   read from the attribute chunk WITHOUT loading the module, and the live
+   `priv/host/*.bl` is hashed to compare against it. A host source that changed is
+   `:moved` exactly like a boot shim that moved, and unlike `:absent` shims there
+   is no host case that may be skipped: a missing or unjudged host beam BLOCKS.
+
    Returns `{:ok? :current :moved :unjudged :absent :namespaces :compiler-key
      :build-key :errors}`. `:ok?` is true when every namespace that emits a stamped
      shim is `:current`; a beam that exists but cannot be judged (`:unjudged`) is
@@ -245,7 +394,9 @@
   (let [root (or (:root opts) (BeamLisp/cwd))
         boot (under root (or (:boot opts) default-boot))
         out (under root (or (:out opts) default-out))
-        nss (namespaces boot)]
+        host-dir (under root (or (:host opts) default-host))
+        nss (namespaces boot)
+        hosts (host-sources host-dir)]
     (cond
       (empty? nss)
       {:ok? false :errors [(str "no boot sources under " boot)]}
@@ -254,7 +405,7 @@
       {:ok? false :errors [(str "no floor at " out " — there is nothing to check")]}
 
       :else
-      (let [rows (vec (moved out nss))
+      (let [rows (vec (concat (moved out nss) (host-rows out hosts)))
             gone (vec (filter (fn [r] (= :moved (:verdict r))) rows))
             unjudged (vec (map (fn [r] (:ns r))
                                (filter (fn [r] (= :unjudged (:verdict r))) rows)))
@@ -266,7 +417,7 @@
          :moved gone
          :unjudged unjudged
          :absent absent
-         :namespaces (count nss)
+         :namespaces (+ (count nss) (count hosts))
          :compiler-key (BeamLisp.AOTCache/current_compiler_key)
          :build-key (BeamLisp.AOTCache/current_build_key)
          :errors []}))))
@@ -288,7 +439,15 @@
    provenance stamp BEFORE anything is written or deleted, because a generator
    that clears the floor and then discovers the new beams are foreign has
    destroyed the floor. Returns
-   `{:ok? :out :ebin :compiler-key :build-key :modules :namespaces :errors}`."
+   `{:ok? :out :ebin :compiler-key :build-key :modules :namespaces :errors}`.
+
+   The floor has TWO kinds of beam and they are produced differently: the boot
+   SHIMS are copied from the build's ebin (the compiler emitted them), while the
+   pinned HOST beams are COMPILED here from `priv/host/*.bl` by
+   `BeamLisp.AOT/compile-host-file` with `load? false` — into a scratch ebin, so
+   the live module in this VM is never substituted, and each beam is refused
+   unless its `bl_source_hash` proves it came from the source beside it. Both
+   sets are verified before the floor is cleared, and both enter the manifest."
   [opts]
   (let [root (or (:root opts) (BeamLisp/cwd))
         boot (under root (or (:boot opts) default-boot))
@@ -309,8 +468,12 @@
       (let [compiler-key (BeamLisp.AOTCache/current_compiler_key)
             build-key (BeamLisp.AOTCache/current_build_key)
             stale (keep (fn [name] (stale-why name ebin compiler-key build-key))
-                        wanted)]
-        (if (not (empty? stale))
+                        wanted)
+            host-dir (under root (or (:host opts) default-host))
+            hosts (host-sources host-dir)
+            scratch (Path/join (System/tmp_dir)
+                               (str "bl-seed-host-" (erlang/unique_integer (list :positive))))]
+        (if-not (empty? stale)
           {:ok? false :errors (concat [(str "refusing to seed a stale floor — " ebin
                                             " holds beams this toolchain did not build")]
                                       stale
@@ -322,15 +485,26 @@
                                       (moved-lines
                                         (filter (fn [r] (= :moved (:verdict r)))
                                                 (moved out nss))))}
-          (do
-            (File/mkdir_p! out)
-            (doseq [p (Path/wildcard (Path/join out "*.beam"))] (File/rm! p))
-            (doseq [name wanted]
-              (File/cp! (Path/join ebin name) (Path/join out name)))
-            (let [entries (reduce (fn [m name]
-                                    (let [p (Path/join out name)]
-                                      (assoc m name (d/sha256-hex-of p 0 (d/file-size p)))))
-                                  {} wanted)
+          (let [hc (compile-hosts hosts scratch)
+                beams (:beams hc)]
+            (try
+              (if-not (:ok? hc)
+                {:ok? false :errors (:errors hc)}
+                (do
+                  (File/mkdir_p! out)
+                  (doseq [p (Path/wildcard (Path/join out "*.beam"))] (File/rm! p))
+                  (doseq [name wanted]
+                    (File/cp! (Path/join ebin name) (Path/join out name)))
+                  ;; The pinned host beams were COMPILED, not copied, so they come
+                  ;; from the scratch ebin the provenance check just judged — never
+                  ;; from the build's ebin, which holds the Elixir host leaf this
+                  ;; floor replaces.
+                  (doseq [b beams]
+                    (File/cp! (:path b) (Path/join out (:name b))))
+                  (let [entries (reduce (fn [m name]
+                                          (let [p (Path/join out name)]
+                                            (assoc m name (d/sha256-hex-of p 0 (d/file-size p)))))
+                                        {} (concat wanted (map (fn [b] (:name b)) beams)))
                   ; THE APP RESOURCE IS PART OF THE FLOOR, for the same reason the
                   ; compiler beams are: the first command in a fresh clone must
                   ; START an application, and OTP reads what to start — and with
@@ -381,4 +555,5 @@
                     {:ok? true :out out :ebin ebin
                      :compiler-key compiler-key :build-key build-key
                      :app (if (some? aw) (Path/basename (:path aw)) nil)
-                     :modules (count entries) :namespaces (vec nss) :errors []}))))))))))
+                     :modules (count entries) :namespaces (vec nss) :errors []}))))))
+              (finally (File/rm_rf! scratch)))))))))

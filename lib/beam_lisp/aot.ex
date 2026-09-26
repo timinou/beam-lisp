@@ -136,6 +136,20 @@ defmodule BeamLisp.AOT do
       are refused.
     * `:output_dir` (required) — where `<module>.beam` is written.
     * `:behaviour` — a module atom recorded as `-behaviour(Mod)`.
+    * `:source_hash` — an optional digest of the source bytes, recorded as the
+      `bl_source_hash` attribute. A caller that commits the beam (the bootstrap
+      seed) stamps it so the artifact can be JUDGED: the beam then names the
+      source it was built from, and a reader can compare that claim against the
+      live file WITHOUT loading the module — the same attribute read
+      `Bootstrap.stamped_key/1` does for `bl_compiler_key`.
+    * `:load?` — whether to load the emitted beam into THIS VM (default `true`,
+      the behaviour every existing caller relies on). `false` compiles and
+      writes the beam WITHOUT publishing it, which is what a generator needs
+      when the pinned module's name is already a live module in the compiling
+      VM: loading it would replace the very `BeamLisp.CompilerData` (or other
+      host leaf) the generator is running on. A pinned beam exists to stand in
+      for that module in a FRESH VM, never to be substituted mid-flight in the
+      one that built it.
     * `:file` — the source path used for positions (defaults to `path`).
 
   Returns `{module, beam_path}`. Raises `ArgumentError` on an invalid module
@@ -149,6 +163,7 @@ defmodule BeamLisp.AOT do
     validate_host_module!(module)
     output_dir = Keyword.fetch!(opts, :output_dir)
     file = Keyword.get(opts, :file, path)
+    load? = Keyword.get(opts, :load?, true)
 
     BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
       source = BeamLisp.Loader.read_source(path)
@@ -184,7 +199,7 @@ defmodule BeamLisp.AOT do
 
       descriptor = Emit.descriptor_for(module, clauses, host_attrs(opts), %{file: file})
       {mod, beam} = Emit.compile_descriptor(descriptor)
-      Emit.load_binary!({mod, beam}, file || "beam_lisp_host")
+      if load?, do: Emit.load_binary!({mod, beam}, file || "beam_lisp_host")
       write_beam(mod, beam, output_dir)
     end)
   end
@@ -241,15 +256,37 @@ defmodule BeamLisp.AOT do
     end
   end
 
-  # The module attributes a pinned descriptor carries. Only `-behaviour` today —
-  # what an OTP callback module (a ported `use GenServer`-style host module)
-  # needs to be accepted by the runtime.
+  # The module attributes a pinned descriptor carries: `-behaviour` (what an OTP
+  # callback module needs) and, when the caller supplies it, the provenance pair
+  # `-bl_source_hash` / `-bl_compiler_key`. They are the pinned siblings of the
+  # attributes `emit_module/6` stamps into a namespace beam, and they exist for
+  # the same reason: a committed beam must be JUDGEABLE. A digest of its own
+  # source is the claim a reader can check WITHOUT running it, and the codegen
+  # key is the claim `Bootstrap.fresh_generation?/2` reads to keep a floor from
+  # overwriting a freshly built `.ex` artifact on every boot (a pinned host leaf
+  # IS codegen — the compiler calls it — so its generation key is the codegen
+  # key).
   defp host_attrs(opts) do
-    case Keyword.get(opts, :behaviour) do
-      nil -> []
-      mod when is_atom(mod) -> [[:behaviour, mod]]
-      other -> raise ArgumentError, ":behaviour must be a module atom, got: #{inspect(other)}"
-    end
+    behaviour =
+      case Keyword.get(opts, :behaviour) do
+        nil -> []
+        mod when is_atom(mod) -> [[:behaviour, mod]]
+        other -> raise ArgumentError, ":behaviour must be a module atom, got: #{inspect(other)}"
+      end
+
+    provenance =
+      case Keyword.get(opts, :source_hash) do
+        nil ->
+          []
+
+        hash when is_binary(hash) ->
+          [[:bl_source_hash, hash], [:bl_compiler_key, BeamLisp.AOTCache.compiler_key()]]
+
+        other ->
+          raise ArgumentError, ":source_hash must be a binary digest, got: #{inspect(other)}"
+      end
+
+    behaviour ++ provenance
   end
 
   # Re-point every direct call the compiler linked to the namespace's SHIM

@@ -214,6 +214,47 @@ defmodule BeamLisp.Bootstrap do
     end
   end
 
+  @doc """
+  Install the pinned host portion of the seed without starting the language.
+
+  A normal `bl build` recompiles the remaining Elixir substrate and may leave
+  an ebin with no pinned host beam. The boot-tier shims can be current, so the
+  full `install!/1` (run only in the rebuild child) is not called on this path.
+  Install the exact-name host leaves before application startup instead: the
+  compiler calls them while the compiler namespace is being interned.
+  """
+  def install_hosts!(compile_path, opts \\ []) do
+    seed_dir = Keyword.get(opts, :seed_dir, seed_dir())
+    manifest_path = Path.join(seed_dir, @manifest_name)
+    manifest = read_manifest!(manifest_path)
+    ebin = to_string(compile_path)
+    File.mkdir_p!(ebin)
+
+    manifest["modules"]
+    |> Enum.filter(fn {name, _} ->
+      String.starts_with?(name, "Elixir.BeamLisp.") and
+        not String.starts_with?(name, "Elixir.BeamLisp.Ns.")
+    end)
+    |> Enum.each(fn {name, want_sha} ->
+      src = Path.join(seed_dir, name)
+      dst = Path.join(ebin, name)
+      verify_seed_file!(src, name, want_sha)
+      maybe_install_one(src, dst, want_sha, expected_key(name))
+
+      mod = name |> Path.basename(".beam") |> String.to_atom()
+      bytes = File.read!(dst)
+      unless loaded_is?(mod, bytes) do
+        :code.purge(mod)
+        case :code.load_binary(mod, String.to_charlist(dst), bytes) do
+          {:module, ^mod} -> :ok
+          other -> raise "cannot load pinned host #{name}: #{inspect(other)}"
+        end
+      end
+    end)
+
+    :ok
+  end
+
   # Map a committed seed beam filename to the beam-lisp namespace it provides,
   # or nil for a companion module (Body.*/Init.*) that is not a namespace of
   # its own. `Elixir.BeamLisp.Ns.Compiler.beam` -> "compiler";
