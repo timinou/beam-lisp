@@ -313,10 +313,30 @@ let idCounter = 0;
 // identity allocation only — no actor policy.
 let runtimeIdCounter = 0;
 
+// `=` treats a proper list and a vector as ONE sequential family, as BEAM does
+// (:sequential-family-is-one-value: `(= [1 2] '(1 2))`). Map KEYS do not:
+// on BEAM `(get {[1 2] :v} '(1 2))` is nil, so `hashKey` keeps the two apart
+// and only equality normalizes (order-parity "sequential-family" pins both).
+function eqKey(x) {
+  if (x instanceof Cons || x === ENIL) {
+    const items = [];
+    let c = x;
+    while (c instanceof Cons) { items.push(eqKey(c.h)); c = c.t; }
+    if (c === ENIL) return enc("v", items);
+    return enc("l", items.concat([eqKey(c)]));
+  }
+  if (isVec(x)) return enc("v", vecItems(x).map(eqKey));
+  if (x instanceof T) return enc("t", x.items.map(eqKey));
+  if (x instanceof BMap) {
+    const keys = [...x.m.keys()].sort();
+    return enc("m", keys.flatMap(k => [k, eqKey(x.m.get(k)[1])]));
+  }
+  return hashKey(x);
+}
 export function eq(a, b) {
   if (a === b) return true;
   if (a === null || a === undefined || b === null || b === undefined) return a === b;
-  return hashKey(a) === hashKey(b);
+  return eqKey(a) === eqKey(b);
 }
 
 // Strings order by CODE POINT, which is the byte order of their UTF-8 form —

@@ -5,7 +5,7 @@ Commands run from the repository root with
 `BEAM_LISP_Z3=/usr/bin/z3 ELIXIR_ERL_OPTIONS='+S 8:8 +SDio 8'`. Screenshots are
 real browser captures of `node research/js-actors/split-server.mjs`.
 
-## Track 1 — higher-order client code (PLAN-148)
+## Track 1 — higher-order client code (PLAN-149)
 
 **Claim.** Client code may create, store, compose and call function values
 (`comp`, `partial`, `juxt`, `complement`, `constantly`, `apply`, lambdas that

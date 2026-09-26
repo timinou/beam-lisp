@@ -279,7 +279,7 @@ function runs** and emits three artifacts:
 BEAM_LISP_Z3=/usr/bin/z3 ELIXIR_ERL_OPTIONS='+S 8:8 +SDio 8' \
   JS_ACTORS_SPLIT_ONLY=1 ./bin/bl run research/js-actors/compiler.bl   # split only, ~3 min
 node research/js-actors/verify-split.mjs                                # 23 end-to-end checks
-node research/js-actors/verify-order-parity.mjs                         # sort/compare/combinators = BEAM, 29 answers
+node research/js-actors/verify-order-parity.mjs                         # sort/compare/combinators = BEAM, 30 answers
 node research/js-actors/split-server.mjs --port 8791                    # then open http://127.0.0.1:8791/
 ```
 
@@ -374,9 +374,14 @@ total order with strings by code point. The combinators (`comp`, `partial`,
 travel with (`every?`, `remove`, `keep`, `mapcat`, `group-by`, `frequencies`,
 `get-in`/`assoc-in`/`update-in`, `take`, `range`, …) are BL in `runtime.bl`,
 written clause for clause after core. `order-parity.bl` runs on both targets;
-the build writes BEAM's 29 answers and `verify-order-parity.mjs` requires the
+the build writes BEAM's 30 answers and `verify-order-parity.mjs` requires the
 JS run to match them (a naive stable sort and a UTF-16 string order each fail
-it). Maps and sets have no order here: comparing one raises. **Known
+it). Lists and vectors are ONE sequential family, as on BEAM since the
+runtime moved to `priv/boot/rt.bl` (`BeamLisp.Ns.Rt`): `(= [1 2] '(1 2))` and
+`(compare '(1) [1])` = 0, while a map still keys `[1 2]` and `'(1 2)` apart
+(`(get {[1 2] :v} '(1 2))` is nil) — `H.eq` normalizes, `hashKey` does not.
+Empty `sort`/`take` are `()`. Maps and sets have no order here: comparing one
+raises. **Known
 divergence:** an EMPTY lazy result (`(keep f [])`, `(range 0)`, `(remove f
 [])`) is on BEAM a lazy seq that is `=` to nil yet prints `()` and is truthy;
 here it is the empty list `()` (truthy, not `=` nil). Non-empty results agree.
