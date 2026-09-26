@@ -1,7 +1,8 @@
 // verify-team.mjs — the team board (apps/team.bl), end to end.
 //
-// One loopback authority (the compiled BL server half) plus child processes
-// running the BL client half exactly as the browser Worker runs it. Proves
+// The team app served by BEAM (bl serve research/split-beam/serve.bl -- team)
+// plus child processes running the BL client half exactly as the browser
+// Worker runs it. Proves
 //
 //   * the contract: identity and history are on, undo/redo take no params, and
 //     `col` is a closed one-of;
@@ -16,9 +17,9 @@
 //   * the activity feed, undo/redo summaries and the future being cleared;
 //   * presence: who has the app open, deduplicated, over real SSE cookies;
 //   * "view as of" any kept revision (and null past the kept window);
-//   * the durable log: one line per commit, replayed identically by a second
-//     boot, a duplicate nonce surviving replay, a partial last line tolerated
-//     (and truncated) and a bad line failing the boot closed;
+//   * the durable log (datom on fjall): one commit per revision, replayed
+//     identically by a second boot, a duplicate nonce surviving replay, and a
+//     commit the authority would refuse failing the boot closed;
 //   * the BL client's UX: guest read-only, Ben moves his own, Ana assigns,
 //     Undo disabled with no history, and `asof` rendering the past read-only.
 //
@@ -26,10 +27,10 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, appendFileSync, copyFileSync, statSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { startApp, spawnClient, texts, findAll, attr, contractDigest, nonce, sleep, readOut, HERE } from './split-test-kit.mjs';
+import { startApp, startBeam, spawnClient, texts, findAll, attr, contractDigest, nonce, sleep, readOut, HERE } from './split-test-kit.mjs';
 
 let passed = 0;
 const ok = label => { passed += 1; console.log('PASS team: ' + label); };
@@ -43,7 +44,7 @@ const digest = contract.digest;
 
 // ── cleanup: every process and file this run owns ───────────────────────────
 const tmpDir = mkdtempSync(join(tmpdir(), 'team-verify-'));
-const logFile = join(tmpDir, 'team.log.jsonl');
+const dataDir = join(tmpDir, 'data');
 const closers = [];
 const later = fn => { closers.push(fn); return fn; };
 const closeLater = obj => { closers.push(() => obj.close()); return obj; };
@@ -93,8 +94,27 @@ assert.equal(clientBundle.includes('"js/board-view"'), true, 'the client carries
 assert.equal(serverBundle.includes('"js/allow-move"'), true, 'the server carries the permission');
 ok('placement: checks shared; allow/lead/says/add-card server; the client bundle carries none of them');
 
+// The hello a fresh event stream opens with (with a session cookie, if any).
+const sseHello = async (url, cookie) => {
+  const res = await fetch(url + '/api/events', { headers: cookie ? { cookie } : {} });
+  if (res.status !== 200) throw new Error('events stream refused: ' + res.status + ' ' + await res.text());
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const m = /^event: hello\ndata: (.*)$/m.exec(buffer);
+      if (m) return JSON.parse(m[1]);
+    }
+  } finally { try { await reader.cancel(); } catch { /* gone */ } }
+  throw new Error('no hello on the events stream');
+};
+
 // ── the authority ───────────────────────────────────────────────────────────
-const app = closeLater(await startApp('team', { logFile }));
+const app = closeLater(await startApp('team', { data: dataDir }));
 const base = app.base;
 assert.equal(app.codec.digest, digest);
 
@@ -294,133 +314,6 @@ assert.equal((await fetch(base + '/api/peek?revision=abc')).status, 400);
 assert.equal((await fetch(base + '/api/peek')).status, 400);
 ok('peek outside the kept window is board null; a malformed revision is 400');
 
-// ── check 9: the durable log, replay and corruption ─────────────────────────
-const logText = readFileSync(logFile, 'utf8');
-const logEntries = logText.split('\n').filter(l => l !== '').map(l => JSON.parse(l));
-assert.equal(logEntries.length, rev, 'one log line per commit');
-logEntries.forEach((e, i) => {
-  assert.deepEqual(Object.keys(e).sort(), ['actor', 'args', 'at', 'nonce', 'op', 'revision', 'v'].sort());
-  assert.equal(e.v, 1);
-  assert.equal(e.revision, i + 1);
-  assert.ok(typeof e.at === 'string' && !Number.isNaN(Date.parse(e.at)), 'at is a timestamp');
-  assert.ok(e.actor === null || typeof e.actor === 'string');
-  assert.equal(typeof e.op, 'string');
-  assert.ok(e.args !== null && typeof e.args === 'object' && !Array.isArray(e.args));
-  assert.ok(/^[a-z0-9]{8,32}:[0-9]{1,9}$/.test(e.nonce));
-});
-ok(`the durable log holds one {v,revision,at,actor,op,args,nonce} line per commit (${rev})`);
-
-const before = await app.snapshotNow();
-assert.equal(before.revision, rev);
-
-// Boot a SECOND server on the same log, in its own process (one BL runtime per
-// process), and talk to it over HTTP.
-const serverSource = logPath => `
-import { startSplitServer } from ${JSON.stringify(new URL('./split-server.mjs', HERE).href)};
-try {
-  const s = await startSplitServer({ port: 0, app: 'team', logFile: ${JSON.stringify(logPath)} });
-  console.error('SPLIT LISTEN http://127.0.0.1:' + s.port + '/');
-  const stop = () => s.close().then(() => process.exit(0));
-  process.on('SIGTERM', stop); process.on('SIGINT', stop);
-} catch (e) { console.error('SPLIT FAILED ' + e.message); process.exit(1); }
-`;
-const spawnServer = logPath => {
-  const child = track(spawn(process.execPath, ['--input-type=module', '-e', serverSource(logPath)],
-                      { cwd: HERE.pathname, stdio: ['ignore', 'pipe', 'pipe'] }));
-  let stderr = '';
-  child.stderr.setEncoding('utf8'); child.stderr.on('data', d => { stderr += d; });
-  const exited = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
-  const api = {
-    child, exited, get stderr() { return stderr; },
-    async listen(timeoutMs = 30000) {
-      const start = Date.now();
-      while (!/SPLIT LISTEN/.test(stderr)) {
-        if (child.exitCode !== null) throw new Error('server exited early: ' + stderr);
-        if (Date.now() - start > timeoutMs) throw new Error('no SPLIT LISTEN: ' + stderr);
-        await sleep(25);
-      }
-      return Number(/SPLIT LISTEN http:\/\/127\.0\.0\.1:(\d+)\//.exec(stderr)[1]);
-    },
-    async close() {
-      if (child.exitCode !== null) return;
-      try { child.kill('SIGTERM'); } catch { /* gone */ }
-      await Promise.race([exited, sleep(3000).then(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } })]);
-    },
-  };
-  later(() => api.close());
-  return api;
-};
-
-const second = spawnServer(logFile);
-const secondPort = await second.listen();
-const secondBase = `http://127.0.0.1:${secondPort}`;
-assert.ok(second.stderr.includes(`SPLIT REPLAYED ${rev} commits`), 'the second boot replays the log: ' + second.stderr.trim());
-
-const sseHello = async (url, cookie) => {
-  const res = await fetch(url + '/api/events', { headers: cookie ? { cookie } : {} });
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const m = /^event: hello\ndata: (.*)$/m.exec(buffer);
-      if (m) return JSON.parse(m[1]);
-    }
-  } finally { try { await reader.cancel(); } catch { /* gone */ } }
-  throw new Error('no hello on the events stream');
-};
-const replayed = await sseHello(secondBase);
-assert.equal(replayed.digest, digest);
-assert.equal(replayed.revision, before.revision);
-assert.deepEqual(replayed.board, before.board);
-assert.deepEqual(replayed.recent, before.recent);
-assert.deepEqual(replayed.history, before.history);
-ok('a second boot replays to the identical revision, board, recent and history');
-
-const secondBen = await (async () => {
-  const res = await fetch(secondBase + '/api/login', { method: 'POST',
-    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: 'ben' }) });
-  return (res.headers.get('set-cookie') || '').split(';')[0];
-})();
-const firstEntry = logEntries[0];
-const dupRes = await fetch(secondBase + '/api/intent', { method: 'POST',
-  headers: { 'content-type': 'application/json', cookie: secondBen },
-  body: JSON.stringify({ request: 1, revision: 0, digest, nonce: firstEntry.nonce, op: firstEntry.op, args: firstEntry.args }) });
-const dup = await dupRes.json();
-assert.equal(dup.ok, true); assert.equal(dup.duplicate, true); assert.equal(dup.revision, rev);
-ok('a resend of an already-committed proposal to the replayed server is a duplicate');
-await second.close();
-
-// A partial last line (a crash mid-write) is ignored and the file truncated.
-const partialLog = join(tmpDir, 'partial.log.jsonl');
-copyFileSync(logFile, partialLog);
-appendFileSync(partialLog, '{"v":1,"revision":' + (rev + 1) + ',"at":"partial');
-const third = spawnServer(partialLog);
-await third.listen();
-assert.ok(third.stderr.includes('SPLIT LOG ignored a partial last line'), 'the partial line is ignored');
-assert.ok(third.stderr.includes(`SPLIT REPLAYED ${rev} commits`), 'the rest still replays');
-assert.equal(readFileSync(partialLog, 'utf8'), logText, 'the file is truncated back to its last newline');
-assert.equal(statSync(partialLog).size, Buffer.byteLength(logText));
-ok('a partial last line is tolerated, the rest replays, and the file is truncated');
-await third.close();
-
-// A bad middle line (a revision out of order) fails the boot closed, naming it.
-const badLog = join(tmpDir, 'bad.log.jsonl');
-const lines = logText.split('\n');
-const badLine = JSON.stringify({ v: 1, revision: 1, at: new Date().toISOString(), actor: 'ben',
-  op: 'add-card', args: { title: 'bad' }, nonce: 'teambadtab001:1' }) + '\n';
-writeFileSync(badLog, lines[0] + '\n' + badLine + lines.slice(1).join('\n'));
-const fourth = spawnServer(badLog);
-const fourthExit = await fourth.exited;
-assert.notEqual(fourthExit.code, 0, 'a bad line is a non-zero exit');
-assert.ok(fourth.stderr.includes('SPLIT FAILED'), 'the boot fails closed: ' + fourth.stderr.trim());
-assert.ok(fourth.stderr.includes('line 2'), 'the failing line is named');
-assert.ok(fourth.stderr.includes('revision-out-of-order'), 'the reason is named');
-ok('a bad middle line (wrong revision) fails the boot closed with its line number');
-
 // ── check 10: the BL client half, as the Worker runs it ─────────────────────
 const awaitFrame = async (client, from, pred, label) => {
   const start = Date.now();
@@ -498,6 +391,77 @@ assert.ok(texts(noteView.value.tree).some(t => typeof t === 'string' && t.includ
 assert.equal(asofClient.client.frames.slice(markA).filter(f => f.topic === 'propose').length, 0,
              'a proposal while viewing history emits nothing');
 ok('a proposal while viewing history shows the note and emits no propose');
+
+// ── check 9: the durable log, replay and corruption ─────────────────────────
+// The first server is stopped (a fjall keyspace has one owner), and its log is
+// read, replayed and tampered with from outside.
+const before = await app.snapshotNow();
+assert.equal(before.revision, rev);
+await app.close();
+
+const blRun = (args, env = {}) => new Promise(resolve => {
+  const child = track(spawn(new URL('../../bin/bl', HERE).pathname, ['run', ...args],
+                            { cwd: new URL('../../', HERE).pathname, env: { ...process.env, ...env }, stdio: ['ignore', 'pipe', 'pipe'] }));
+  let out = '', err = '';
+  child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+  child.stdout.on('data', d => { out += d; }); child.stderr.on('data', d => { err += d; });
+  child.once('exit', code => resolve({ code, out, err }));
+});
+const keyspace = dir => join(dir, 'team.fjall');
+const listed = await blRun(['research/split-beam/log.bl', '--', 'list', keyspace(dataDir), 'team']);
+assert.equal(listed.code, 0, listed.err.slice(-800));
+const logEntries = listed.out.split('\n').filter(l => l.startsWith('{')).map(l => JSON.parse(l));
+assert.equal(logEntries.length, rev, 'one recorded commit per revision');
+logEntries.forEach((e, i) => {
+  assert.deepEqual(Object.keys(e).sort(), ['actor', 'args', 'nonce', 'op', 'revision']);
+  assert.equal(e.revision, i + 1);
+  assert.ok(e.actor === null || typeof e.actor === 'string');
+  assert.equal(typeof e.op, 'string');
+  assert.ok(e.args !== null && typeof e.args === 'object' && !Array.isArray(e.args));
+  assert.ok(/^[a-z0-9]{8,32}:[0-9]{1,9}$/.test(e.nonce));
+});
+assert.ok(logEntries.some(e => e.actor === 'ana') && logEntries.some(e => e.actor === 'ben'), 'actors are recorded');
+ok(`the durable log (datom on fjall) holds one {revision,actor,op,args,nonce} commit per revision (${rev})`);
+
+// A SECOND boot on the same data directory replays through the authority.
+const second = closeLater(await startBeam(['team'], { data: dataDir }));
+const secondBase = second.base;
+assert.ok(second.log.includes(`SPLIT REPLAYED ${rev} commits for team`), 'the second boot replays the log: ' + second.log.slice(-600));
+const replayed = await sseHello(secondBase);
+assert.equal(replayed.digest, digest);
+assert.equal(replayed.revision, before.revision);
+assert.deepEqual(replayed.board, before.board);
+assert.deepEqual(replayed.recent, before.recent);
+assert.deepEqual(replayed.history, before.history);
+ok('a second boot replays to the identical revision, board, recent and history');
+
+const secondBen = await (async () => {
+  const res = await fetch(secondBase + '/api/login', { method: 'POST',
+    headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: 'ben' }) });
+  return (res.headers.get('set-cookie') || '').split(';')[0];
+})();
+const firstEntry = logEntries[0];
+const dupRes = await fetch(secondBase + '/api/intent', { method: 'POST',
+  headers: { 'content-type': 'application/json', cookie: secondBen },
+  body: JSON.stringify({ request: 1, revision: 0, digest, nonce: firstEntry.nonce, op: firstEntry.op, args: firstEntry.args }) });
+const dup = await dupRes.json();
+assert.equal(dup.ok, true); assert.equal(dup.duplicate, true); assert.equal(dup.revision, rev);
+ok('a resend of an already-committed proposal to the replayed server is a duplicate');
+await second.close();
+
+// A commit the authority would refuse (a revision out of order, written behind
+// its back) fails the boot closed, naming the revision and the reason.
+const forgery = await blRun(['research/split-beam/log.bl', '--', 'forge', keyspace(dataDir), 'team',
+  JSON.stringify({ revision: rev + 5, actor: 'ben', op: 'add-card', args: { title: 'forged' }, nonce: 'teambadtab001:1' })]);
+assert.equal(forgery.code, 0, forgery.err.slice(-800));
+let bootError = null;
+try { const third = await startBeam(['team'], { data: dataDir, timeoutMs: 600000 }); await third.close(); }
+catch (error) { bootError = String(error.message); }
+assert.ok(bootError !== null, 'a refused log line is a failed boot');
+assert.ok(bootError.includes('SPLIT FAILED'), 'the boot fails closed: ' + (bootError || '').slice(-600));
+assert.ok(bootError.includes(`revision ${rev + 4}`), 'the failing revision is named');
+assert.ok(bootError.includes('stale-revision'), 'the reason is named');
+ok('a log line the authority refuses fails the boot closed, naming the revision and the reason');
 
 // ── done ────────────────────────────────────────────────────────────────────
 await cleanUp();

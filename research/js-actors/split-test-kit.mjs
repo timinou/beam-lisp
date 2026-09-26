@@ -96,8 +96,8 @@ const clientSource = (app, tab) => `
 const REPO = new URL('../../', HERE);
 let nextPort = 18800 + (process.pid % 400) * 4;
 
-export async function startBeam(apps, { port = nextPort++, data = null, timeoutMs = 600000 } = {}) {
-  const env = { ...process.env, SPLIT_DATA: data === null ? 'none' : data };
+export async function startBeam(apps, { port = nextPort++, data = null, timeoutMs = 600000, env: extra = {} } = {}) {
+  const env = { ...process.env, SPLIT_DATA: data === null ? 'none' : data, ...extra };
   const child = spawn(new URL('bin/bl', REPO).pathname,
     ['serve', 'research/split-beam/serve.bl', '--port', String(port), '--', ...apps],
     { cwd: REPO.pathname, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });

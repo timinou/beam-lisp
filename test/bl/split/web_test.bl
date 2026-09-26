@@ -1,0 +1,107 @@
+; test/bl/split/web_test.bl — the transport's pure parts: sessions, the
+; codec, the validators and the JSON numbers.
+;
+; Run: bl test test/bl/split/web_test.bl
+;
+; The HTTP behaviour (routes, statuses, streams) is proven end to end by the
+; research verifiers against a running server (research/js-actors/verify-*.mjs);
+; this file pins the pieces those depend on, without a socket:
+;
+;   • a session cookie signs and verifies, and any tamper is refused — a
+;     flipped id, a flipped MAC, another server's secret, junk;
+;   • the codec decodes a proposal BY THE CONTRACT and refuses what the
+;     contract does not name: an `actor` key, an extra key, an unknown op,
+;     text over its bound in CODEPOINTS, an unsafe integer, a float, a list
+;     over its bound, nesting past 24;
+;   • an exact integer travels as digits both ways;
+;   • the durable log keeps commits as facts and gives them back in order.
+
+(ns split.web-test
+  (:require [split.web :as w] [split.log :as slog] [split]))
+
+(def secret (crypto/strong_rand_bytes 32))
+(def other (crypto/strong_rand_bytes 32))
+
+(defn signed [sid] (str sid "." (w/cookie-mac secret sid)))
+
+(deftest a-session-cookie-verifies-and-tamper-is-refused
+  (let [sid "abcdefghijklmnopqrstuvwxyzAB"
+        good (signed sid)]
+    (testing "a signed id round-trips"
+      (is (= sid (w/cookie-sid secret good))))
+    (testing "any change is a stranger"
+      (is (nil? (w/cookie-sid secret (str "b" (subs good 1)))))
+      (is (nil? (w/cookie-sid secret (str (subs good 0 (dec (count good))) (if (String/ends_with? good "A") "B" "A")))))
+      (is (nil? (w/cookie-sid other good))))
+    (testing "junk never throws"
+      (doseq [junk [nil "" "." "a.b.c" "short.mac" (str sid ".") (str "." (w/cookie-mac secret sid))]]
+        (is (nil? (w/cookie-sid secret junk)))))))
+
+(def app
+  (split/app "tiny"
+             '{:wire {:board [:record {:n [:int 0 99]}]
+                      :item [:record {:name [:text 1 3] :kids [:list 2 :item]}]}
+               :server {:snapshot :board}
+               :intents {:bump {:params {:by [:int 1 9]}}
+                         :name {:params {:it :item}}
+                         :pay {:params {:cents :exact}}}}
+             {:server {} :intents {}}
+             {}))
+
+(defn proposal [op args]
+  {"request" 1 "revision" 0 "digest" (:digest app) "nonce" "tabtabtab:1" "op" op "args" args})
+
+(deftest the-codec-decodes-by-the-contract
+  (testing "a declared op with well-typed args decodes to BL"
+    (let [[tag p] (w/decode-proposal app (proposal "bump" {"by" 4}))]
+      (is (= :ok tag))
+      (is (= {:by 4} (:args p)))
+      (is (= :bump (:op p)))
+      (is (nil? (:actor p)))))
+  (testing "a proposal that names its own actor has the wrong keys"
+    (is (= [:bad 400 :malformed-proposal] (w/decode-proposal app (assoc (proposal "bump" {"by" 4}) "actor" "ana")))))
+  (testing "an unknown op, a wrong digest, a malformed nonce"
+    (is (= [:bad 400 :unknown-intent] (w/decode-proposal app (proposal "drop-table" {}))))
+    (is (= [:bad 409 :client-outdated] (w/decode-proposal app (assoc (proposal "bump" {"by" 4}) "digest" "x"))))
+    (is (= [:bad 400 :malformed-proposal] (w/decode-proposal app (assoc (proposal "bump" {"by" 4}) "nonce" "short:1")))))
+  (testing "args outside their type"
+    (doseq [args [{"by" 0} {"by" 10} {"by" 4.0} {"by" "4"} {} {"by" 4 "extra" 1}]]
+      (is (= [:bad 400 :malformed-args] (w/decode-proposal app (proposal "bump" args))) (pr-str args)))))
+
+(deftest text-is-measured-in-codepoints
+  (let [ok? (fn [nm] (= :ok (first (w/decode-proposal app (proposal "name" {"it" {"name" nm "kids" []}})))))]
+    (is (ok? "🍌🍌🍌"))
+    (is (not (ok? "🍌🍌🍌🍌")))
+    (is (not (ok? "")))))
+
+(deftest nesting-and-lists-are-bounded
+  (let [node (fn node [d] {"name" "x" "kids" (if (zero? d) [] [(node (dec d))])})
+        ok? (fn [it] (= :ok (first (w/decode-proposal app (proposal "name" {"it" it})))))]
+    (is (ok? (node 5)))
+    (is (not (ok? (node 30))) "deeper than 24 containers")
+    (is (not (ok? {"name" "x" "kids" [(node 0) (node 0) (node 0)]})) "a list over its bound")))
+
+(deftest exact-integers-travel-as-digits
+  (testing "decode: a safe number or the digits of a big one"
+    (is (= {:cents 12} (:args (second (w/decode-proposal app (proposal "pay" {"cents" 12}))))))
+    (is (= {:cents 9007199254740993}
+           (:args (second (w/decode-proposal app (proposal "pay" {"cents" "9007199254740993"}))))))
+    (doseq [bad ["0009007199254740993" "12" "9007199254740993.5" 1.5 "-"]]
+      (is (= :bad (first (w/decode-proposal app (proposal "pay" {"cents" bad})))) (pr-str bad))))
+  (testing "encode: past 2^53 an integer leaves as its digits"
+    (is (= {:a 12 :b "9007199254740993" :c ["-9007199254740993"]}
+           (w/wire-json {:a 12 :b 9007199254740993 :c [-9007199254740993]})))))
+
+(deftest the-log-keeps-commits-in-order
+  (let [dir (str (System/tmp_dir!) "/split-log-test-" (erlang/unique_integer (list :positive)) ".fjall")
+        log (slog/open dir "tiny")]
+    (slog/append! log {:entry {:revision 1 :op :bump} :args {:by 2} :nonce "tabtabtab:1" :actor nil})
+    (slog/append! log {:entry {:revision 2 :op :bump} :args {:by 3} :nonce "tabtabtab:2" :actor "ana"})
+    (let [cs (slog/commits log)]
+      (is (= [1 2] (mapv :revision cs)))
+      (is (= [nil "ana"] (mapv :actor cs)))
+      (is (= {:by 3} (:args (second cs)))))
+    (testing "as proposals, each against the revision before it"
+      (is (= [0 1] (mapv :revision (slog/proposals log "d"))))
+      (is (= ["d" "d"] (mapv :digest (slog/proposals log "d")))))
+    (File/rm_rf! dir)))
