@@ -435,7 +435,7 @@ defmodule BeamLisp.AOT do
 
   # `reader-node`, `build-plan`, `source-graph` and `ns-interface` are the
   # namespaces the drift gate itself runs on (`ns_closure_hash/1` →
-  # `BuildPlan.key_for/3` → `build-plan` and its requires). Vetting one of them
+  # `build-plan/key-for` → `build-plan` and its requires). Vetting one of them
   # by closure hash would ask the gate to load what it is vetting, and the
   # loader's cycle guard turns that into `undefined var: build-plan/…`. They are
   # therefore TIER-keyed, never closure-keyed: `reader-node` is `boot/` (codegen),
@@ -948,8 +948,28 @@ defmodule BeamLisp.AOT do
 
     try do
       resolve = fn n -> source_content_cached(n) end
-      seed = if file && File.exists?(file), do: {ns, BeamLisp.Loader.read_source(file)}
-      BeamLisp.BuildPlan.key_for(ns, resolve, seed)
+      # The BL `key-for` wants `[ns, content]` (a language list), not an Elixir
+      # 2-tuple: the language walks it with `Enum/to_list`, which a tuple does
+      # not implement.
+      seed = if file && File.exists?(file), do: [ns, BeamLisp.Loader.read_source(file)]
+
+      # ONE definition of the key, in the language: `build-plan/key-for`. The
+      # build reads sources into nodes and plans them; the gate does the same,
+      # so a beam's stamp and the judgement of it cannot disagree.
+      BeamLisp.Loader.ensure_loaded("build-plan")
+      key_for = BeamLisp.Env.fetch!("build-plan", "key-for")
+
+      # The committed bootstrap seed may carry the PREVIOUS generation of
+      # `build-plan`, whose `key-for` is 3-ary (no `node-of`). The build that
+      # re-emits the boot tier runs THROUGH that seed, so this call must work
+      # against both generations: `memo-node` — the language's own content-
+      # keyed node memo — when it is offered, plain `node-from` otherwise.
+      if BeamLisp.Ns.Rt.invocable?(key_for, 4) do
+        memo = BeamLisp.Env.fetch!("build-plan", "memo-node")
+        BeamLisp.Ns.Rt.invoke(key_for, [ns, resolve, seed, memo])
+      else
+        BeamLisp.Ns.Rt.invoke(key_for, [ns, resolve, seed])
+      end
     after
       Process.delete(:bl_source_info_cache)
     end

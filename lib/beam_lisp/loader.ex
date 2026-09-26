@@ -62,7 +62,7 @@ defmodule BeamLisp.Loader do
   @doc """
   The source CONTENT of `ns` on the current search path, or `nil` when no
   source is findable (a prod release ships beams, not sources). The freshness
-  key (`BeamLisp.BuildPlan.key_for/3`) derives everything it needs — content
+  key (`build-plan/key-for`) derives everything it needs — content
   hash, requires, interface — from this one read, so the build and the
   runtime gate see the same bytes.
   """

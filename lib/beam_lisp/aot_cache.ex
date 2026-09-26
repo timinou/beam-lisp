@@ -91,7 +91,7 @@ defmodule BeamLisp.AOTCache do
   # The Elixir modules whose SOURCES affect emitted code, so a change to any of
   # them must rotate `compiler_key/0` (invalidate every AOT beam). These are the
   # genuine codegen host: AOT driver, atom guard, the emitter, linker, native
-  # bridge.
+  # bridge, and the tier authority (`Tiers`).
   #
   # SOURCES, NOT BEAMS — and that distinction is the whole of BUG-048. This list
   # used to be hashed as `:code.get_object_code/1` bytes, and those bytes are
@@ -112,7 +112,7 @@ defmodule BeamLisp.AOTCache do
   # always claimed to be. For an image that ships no `.ex` (a release drop) the
   # digest is read from `priv/codegen.sources`, baked by the checkout whenever it
   # computes the key — see `codegen_part/0`. The pinned host leaves
-  # (`CompilerData`, `Emit`, `Link`) are the exception: their source moved to
+  # (`CompilerData`, `Emit`, `Link`, `Tiers`) are the exception: their source moved to
   # `priv/host/<leaf>.bl`, and `@pinned_host_sources` below is the table that
   # says which module follows which leaf.
   #
@@ -129,7 +129,8 @@ defmodule BeamLisp.AOTCache do
     BeamLisp.CompilerData,
     BeamLisp.Record,
     BeamLisp.Emit,
-    BeamLisp.Link
+    BeamLisp.Link,
+    BeamLisp.Tiers
   ]
 
   @doc "Whether the cache participates in compilation. Default on."
@@ -388,11 +389,13 @@ defmodule BeamLisp.AOTCache do
   # that has deleted the `.ex` would read the missing source as `:error` and fall
   # back to the frozen `priv/codegen.sources`, making every future codegen edit
   # invisible. That is exactly the failure `CompilerData` recorded when it became
-  # the first pinned leaf, and `Emit`/`Link` are the pair seeded beside it.
+  # the first pinned leaf, and `Emit`/`Link` are the pair seeded beside it; `Tiers`
+  # is the tier authority they all route through.
   @pinned_host_sources %{
     BeamLisp.CompilerData => "compiler_data.bl",
     BeamLisp.Emit => "emit.bl",
-    BeamLisp.Link => "link.bl"
+    BeamLisp.Link => "link.bl",
+    BeamLisp.Tiers => "tiers.bl"
   }
 
   # The source path for a codegen module: the pinned `.bl` for a leaf in

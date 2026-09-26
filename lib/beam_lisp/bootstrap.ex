@@ -31,6 +31,14 @@ defmodule BeamLisp.Bootstrap do
   @seed_dir_rel "bootstrap/seed"
   @manifest_name "manifest.exs"
 
+  # The pinned host leaf that IS the tier authority. `AOTCache.compiler_key/0`
+  # asks it where the codegen sources live (`priv_root/0`) and which tier a
+  # namespace is in (`tier_of_ns/1`), so no key may be computed before it is
+  # loaded. It is a pinned leaf: once the Elixir `tiers.ex` is deleted the seed
+  # beam is the only copy a boot has, which is why `install!/1` and
+  # `install_hosts!/1` load it before the first `expected_key/1`.
+  @tier_authority "Elixir.BeamLisp.Tiers.beam"
+
   # A beam's toolchain key, read WITHOUT loading it: the `bl_compiler_key`
   # attribute `AOT.emit_module` stamps into every namespace beam, beside the
   # `__bl_provenance__/0` function. Loading the beam to call that function
@@ -56,6 +64,52 @@ defmodule BeamLisp.Bootstrap do
          {:ok, {_, md5}} -> mod.module_info(:md5) == md5
          _ -> false
        end)
+  end
+
+  # Put the pinned tier authority on the code path BEFORE any key is computed.
+  #
+  # `expected_key/1` and `key_matches?/1` both reach `AOTCache.compiler_key/0`,
+  # whose source-root lookup calls `BeamLisp.Tiers.priv_root/0` and whose tier
+  # routing calls `tier_of_ns/1`. Once the Elixir `tiers.ex` is deleted the SEED
+  # beam is the only copy of that module, so it must be LOADED here — waiting for
+  # the normal install loop would compute the very key that needs it first.
+  #
+  # The destination is preferred when it already holds a beam (a fresh gen-N+1
+  # rebuild supersedes the seed floor); otherwise the seed is sha-verified before
+  # it is trusted to answer a key question. A floor frozen before `Tiers` was
+  # pinned carries no such entry: leave whatever the code path already has.
+  defp ensure_tier_authority!(seed_dir, ebin, manifest) do
+    name = @tier_authority
+
+    case manifest["modules"][name] do
+      want_sha when is_binary(want_sha) ->
+        src = Path.join(seed_dir, name)
+        dst = Path.join(ebin, name)
+
+        # The seed's bytes are verified regardless: the authority must be a leaf
+        # this floor actually carries. The DESTINATION is preferred for LOADING
+        # when present — a fresh gen-N+1 rebuild supersedes the seed — and the
+        # install loop below judges and refreshes it properly.
+        verify_seed_file!(src, name, want_sha)
+        path = if File.exists?(dst), do: dst, else: src
+
+        mod = name |> Path.basename(".beam") |> String.to_atom()
+        bytes = File.read!(path)
+
+        unless loaded_is?(mod, bytes) do
+          :code.purge(mod)
+
+          case :code.load_binary(mod, String.to_charlist(path), bytes) do
+            {:module, ^mod} -> :ok
+            other -> raise "cannot load pinned tier authority #{name}: #{inspect(other)}"
+          end
+        end
+
+      _ ->
+        :ok
+    end
+
+    :ok
   end
 
   @doc """
@@ -128,6 +182,13 @@ defmodule BeamLisp.Bootstrap do
     # fix is to regenerate the seed on this toolchain. Returns `:ok` when the
     # seed matched (finished compiler), `{:staged, reason}` when it was installed
     # as a previous-generation bootstrap stage for the rebuild.
+    #
+    # The tier authority is loaded BEFORE the key is judged: `key_matches?/1`
+    # calls `compiler_key/0`, which needs `BeamLisp.Tiers` — the pinned leaf
+    # installed from THIS seed, and the only copy of the module once `tiers.ex`
+    # is gone.
+    ensure_tier_authority!(seed_dir, ebin, manifest)
+
     matches? = key_matches?(manifest)
 
     # ALWAYS install the committed seed beams — on a match AND on a mismatch.
@@ -230,10 +291,20 @@ defmodule BeamLisp.Bootstrap do
     ebin = to_string(compile_path)
     File.mkdir_p!(ebin)
 
+    # The tier authority must be on the code path before the first
+    # `expected_key/1`, which computes the compiler key THROUGH `BeamLisp.Tiers`
+    # (see `ensure_tier_authority!/3`).
+    ensure_tier_authority!(seed_dir, ebin, manifest)
+
     manifest["modules"]
     |> Enum.filter(fn {name, _} ->
       String.starts_with?(name, "Elixir.BeamLisp.") and
         not String.starts_with?(name, "Elixir.BeamLisp.Ns.")
+    end)
+    # Deterministic install order: the authority first, then by name. A map's
+    # own order is a property of its keys, not of the seed.
+    |> Enum.sort_by(fn {name, _} ->
+      {if(name == @tier_authority, do: 0, else: 1), name}
     end)
     |> Enum.each(fn {name, want_sha} ->
       src = Path.join(seed_dir, name)

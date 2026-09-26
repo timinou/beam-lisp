@@ -253,6 +253,72 @@
               (maps/put :inames (ns-interface/names-forms fs)
                 (maps/put :refs (sg/references-forms fs) (maps/new))))))))))
 
+; ── paths → plan (the build's own entry) ─────────────────────────────────────
+
+(defn plan-paths
+  "Read every source ONCE (through the loader's own reader) and plan the
+   build. `paths` are source files; each becomes a node via `node-from` — the
+   same node the runtime gate builds, so build and gate agree."
+  [paths]
+  (plan (map (fn [path] (node-from path (BeamLisp.Loader/read_source path))) paths)))
+
+; ── the node memo: parse once per content, VM-wide ───────────────────────────
+;
+; A plan node is a PURE function of a source's bytes: forms, header, interface
+; hash, interface names, references. The runtime drift gate asks `key-for`
+; once per namespace it vets, and each call walks that namespace's whole
+; require-closure — so the same ninety files were read and parsed ninety times
+; over. Measured on a ninety-namespace application: 71.7s of a 72.5s load was
+; this gate; the beams' own `__bl_init__` replay was under a second. Keying the
+; memo on the CONTENT HASH (never the path, never mtime) keeps the gate's
+; guarantee intact: an edited file has new bytes, a new key, and is parsed
+; afresh; the closure key is still folded from live bytes on every call. Only
+; the parse is shared.
+;
+; VM-wide, owned by the pinned `Loader.Server` (the same rule as native.bl's
+; declarations table): created lazily by the first caller, it must outlive that
+; caller — a parallel-build worker exits after its one file.
+
+(def MEMO-TABLE :beam_lisp_build_plan_nodes)
+
+(defn- memo-table
+  "The VM-wide node memo, created lazily inside the pinned `Loader.Server`.
+   A concurrent first caller loses the create race and takes the winner's
+   table."
+  []
+  (if (= :undefined (erlang/apply :ets :whereis (list MEMO-TABLE)))
+    (do
+      (BeamLisp.Loader.Server/run
+        (fn []
+          (try
+            (erlang/apply :ets :new
+              (list MEMO-TABLE (list :named_table :public :set (tuple :read_concurrency true))))
+            (catch _ :ok))))
+      MEMO-TABLE)
+    MEMO-TABLE))
+
+(defn memo-node
+  "`node-from` memoized by content hash. `ns` is what the node records as its
+   `:path` (the gate uses the namespace name); a hit for the same bytes under
+   another name is re-labelled, not re-parsed."
+  [ns content]
+  (let [hash (crypto/hash :sha256 content)
+        t (memo-table)
+        hit (erlang/apply :ets :lookup (list t hash))
+        node (if (= (list) hit)
+               (let [n (node-from ns content)]
+                 (erlang/apply :ets :insert (list t (tuple hash n)))
+                 n)
+               (erlang/element 2 (erlang/hd hit)))]
+    (maps/put :path ns node)))
+
+(defn clear-memo
+  "Forget every memoized node (tests; a toolchain change rotates the parse)."
+  []
+  (if (erlang/=/= :undefined (erlang/apply :ets :whereis (list MEMO-TABLE)))
+    (erlang/apply :ets :delete_all_objects (list MEMO-TABLE)))
+  :ok)
+
 (defn key-for
   "The freshness key of namespace `ns`, given `resolve`: ns → source content
    or nil. Walks the require-closure by name (each member resolved once),
@@ -263,11 +329,11 @@
 
    `node-of` (4-ary form) is `(fn [ns content] node)` — how a member becomes
    its plan node; the 3-ary form uses `node-from` directly. The runtime gate
-   passes a content-keyed memo of `node-from`: parsing a source into its node
-   is a pure function of its bytes, and the gate asks for the SAME closure
-   members once per namespace it vets — ninety namespaces re-parsing a
-   ninety-file closure each was 99% of an application's load. The key itself
-   is still recomputed from the live bytes every call."
+   passes `memo-node`, a content-keyed memo of `node-from`: parsing a source
+   into its node is a pure function of its bytes, and the gate asks for the
+   SAME closure members once per namespace it vets — ninety namespaces
+   re-parsing a ninety-file closure each was 99% of an application's load.
+   The key itself is still recomputed from the live bytes every call."
   ([ns resolve seed] (key-for ns resolve seed node-from))
   ([ns resolve seed node-of]
    (let [seed-ns (if (erlang/=:= seed nil) nil (erlang/hd (Enum/to_list seed)))
