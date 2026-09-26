@@ -1,7 +1,7 @@
 # Design: MCP · Libraries · GraphRAG ingest · Facts & Procedures
 
 Status: DRAFT for discussion — 2026-08-27
-Scope: beam-lisp ecosystem (`priv/datom`, `examples/semantic`, `examples/datom/live`) + spell harness.
+Scope: beam-lisp ecosystem (`priv/lib/datom`, `examples/semantic`, `examples/datom/live`) + spell harness.
 
 > North star: **a library is a datom space. Facts and procedures are both datoms.
 > MCP is the wire. Live queries are the nerve.** Nothing in this design invents a
@@ -14,7 +14,7 @@ Scope: beam-lisp ecosystem (`priv/datom`, `examples/semantic`, `examples/datom/l
 
 | piece | state |
 |---|---|
-| `priv/lib/datom/*.bl` | Immutable temporal EAV db. Facade: `connect/connect-with/transact!/with/q/pull/entity/as-of/since/history/install-schema!/register-tx-fn!`. Store protocol over redb (durable, CAS, atomic commit), ETS (dev), map (reference), overlay (speculative reads). Query engine: hash-joins, `:and/:or/:not/:or-join`, **rules w/ native fixpoint** (`datom_datalog` NIF, bl semi-naive fallback), aggregates, pull w/ recursion, migrations w/ tx-fns. |
+| `priv/lib/datom/*.bl` | Immutable temporal EAV db. Facade: `connect/connect-with/transact!/with/q/pull/entity/as-of/since/history/install-schema!/register-tx-fn!`. Store protocol over fjall (durable, CAS, atomic commit), ETS (dev), map (reference), overlay (speculative reads). Query engine: hash-joins, `:and/:or/:not/:or-join`, **rules w/ native fixpoint** (`datom_datalog` NIF, bl semi-naive fallback), aggregates, pull w/ recursion, migrations w/ tx-fns. |
 | `priv/lib/datom/vector.bl` | DVec normalized packed f32; `similar-to` as a **datalog clause**; k-means, PCA, knn-all, HNSW NIFs declared (flat search shipped; persistent HNSW lifecycle NOT wired). |
 | `priv/lib/datom/broadcast.bl` + `live/` | L2: commit reports `[:datom/tx basis tx-datoms]` / `[:datom/changed basis attrs]`, attr-filtered, Phoenix.PubSub optional. L3: `datom/watch` T1 pattern watches, T2a guarded (auth/rls) + semantic watches. T2b incremental maintenance is follow-up. |
 | `examples/semantic/` | Thesis: *embeddings are ordinary datoms*. 11–15 = working GraphRAG prototype: corpus split → Gemini `gemini-embedding-001` (768d, disk-cached) → entity/relationship extraction (schema-constrained JSON) → unique entity datoms + ref edges → label-propagation communities → summaries as facts → local (vector entry + graph expansion) / global (community summaries) search. |
@@ -96,13 +96,13 @@ per-client subscription scoping) that MCP itself doesn't specify.
 
 ### 2.1 Model
 
-A **library** = one datom connection (redb-backed) + a manifest entity + one or more
+A **library** = one datom connection (fjall-backed) + a manifest entity + one or more
 installed **schema packs**:
 
 ```
 {:library/name :moroccan-law
  :library/kind #{:facts :procedures}     ; most libraries are mixed
- :library/store {:redb "/path/law.redb"}
+ :library/store {:fjall "/path/law.fjall"}
  :library/schema-packs [:legal/core :legal/doc :proc/core]
  :library/embedding {:attr :chunk/embedding :dims 768 :index :hnsw}
  :library/version 3}
@@ -110,7 +110,7 @@ installed **schema packs**:
 
 - **Schema pack** = versioned, named set of `install-schema!` defs + migrations.
   Shipping a vocabulary = shipping a pack; upgrading = `datom.migrate/plan+apply`.
-- **Space isolation**: one redb file per library (single-writer discipline already
+- **Space isolation**: one fjall keyspace per library (single-writer discipline already
   holds per conn). No cross-library FKs; references are by name strings resolved at
   query time (`:ref` stays intra-space — matches Datomic).
 - **Session mounting**: a session mounts libraries read-only + gets a **scratch
@@ -356,4 +356,3 @@ bottom-up materialisation has no call-site bindings; magic.bl exists but is
 unwired. Until fixed, packs ship pattern-only rules (`window`, `open-deal`,
 `cites*`…) and date/cutoff predicates live at call sites. This is the #1
 engine ask for the "semantic datalog" promise.
-

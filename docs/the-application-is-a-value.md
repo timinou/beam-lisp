@@ -1,404 +1,255 @@
 # The application is a value
 
-What FEAT-016 actually opened, and why it is bigger than a live board.
+A live app in beam-lisp is one map, and a page is a function of the database.
 
-FEAT-016 is done. Its design — *broadcast the moment, never the projection* —
-looks like a modest choice about a PubSub payload. It is not. It is the last
-join in a set of five ideas that were each built separately in this repo and
-turn out to be one idea:
+```
+an app      a value     routes · screens · guarded worlds · intents
+the world   a value     a datom db, queried in the calling process
+a page      a function  (shared-db, session-db, locals) → hiccup
+an event    data        [:assign …] · [:intent …] · [:navigate …]
+```
+
+Each is ordinary alone. Composed, they say something none of them says:
+
+> **The interface is a value. The database stores values. A basis orders them
+> in time. ∴ the application is a value, a page is a projection of (data, who
+> is asking), and both are nameable at a point in time.**
+
+Everything below is in the tree, and the examples at the end run.
+
+---
+
+## 1. The writer never projects
+
+datom already keeps a durable, totally-ordered log of facts and lets any
+process hold a consistent value of it for free. The one thing it lacked was
+the ability to say *"it changed."* `priv/lib/datom/broadcast.bl` adds that:
+after a commit, the writer broadcasts a report, and any process can subscribe.
+
+The rule, from that file's own header:
+
+> The writer emits FACTS, never a projection (a projection is a function of
+> (data, who is asking), and the writer knows only its half).
+
+As a type, that is the whole idea:
+
+```
+page       :  (data, asker)  → DOM
+broadcast  :  the moment the data moved     ← facts, not a page
+```
+
+Two payload shapes cross the wire:
+
+| payload | is | the reader |
+|---|---|---|
+| `[:datom/tx basis tx-datoms]` | the delta: the commit's datoms, plus its basis | filters locally, **no store access** |
+| `[:datom/changed basis attrs]` | the basis only (`{:payload :basis}`) | re-derives `(as-of db basis)` |
+
+The delta is the default because it is subscriber-agnostic and query-free for
+the reader: the store already produced `:tx-datoms`, and the writer emits them
+without knowing who asks. Basis-only is the knob for a large write, or a
+subscriber that will re-derive a complex view from a coordinate anyway.
+
+Why it must be facts: the same task at the same instant offers `[doing dropped]`
+to a tech lead and `[dropped]` to a product lead. Broadcast a rendered board
+and one of them is looking at the other's answer. So the message is the delta,
+and each reader recomputes *its own* question — in its own process, where "who
+is asking" is known.
+
+A `datom/listen!` subscriber reads the delta off its mailbox:
+
+```clojure
+(datom/listen! conn {:attrs #{:order/status}})
+(receive
+  [:datom/tx _basis tx-datoms]
+    (doseq [d tx-datoms]
+      (when (= :order/status (datom/datom-a d))
+        (handle-status (datom/datom-e d) (datom/datom-v d))))
+  (after 5000 :idle))
+```
+
+---
+
+## 2. A page is a process that mirrors a value
+
+`live.socket` binds a view fn to a conn. The socket is a `defserver` — one
+process per viewer — holding a `:view`, a `:shared` world, an optional
+per-viewer `:session` world, some `:locals`, the last `:tree` it rendered, and
+a `:sink` to ship to.
+
+```
+mount        render once → push [:mount html], remember the tree
+on-commit    re-render → live.diff → push [:patch ops]
+handle-event :assign   → mutate locals, re-render THIS socket now
+             :intent   → authorize, transact the shared world (no render)
+             :navigate → mutate locals, re-render
+```
+
+The inversion is the concurrency model: **a local mutation renders here; a
+fact mutation renders everywhere.** A click does not render the clicker's
+screen — it requests a fact. The commit broadcasts; every listening socket
+re-projects from the new coordinate and ships only the difference. Two tabs
+cannot disagree, and a dropped patch is replayable from the basis.
+
+The pieces are each small and each a value:
 
 | idea | what it contributes |
 |---|---|
-| **EDN / homoiconicity** | a program is a value you can hold |
-| **datom** | a value you can hold can be *stored*, *ordered in time*, and *queried* |
-| **GenServer** | the one moving part, serialised, named, supervised |
-| **LiveView** | a process whose state a browser mirrors |
-| **Spacetime** | a browser whose DOM is a projection of state, not a template |
+| code as data | a program is a value you can hold |
+| datom | a value can be stored, ordered in time, and queried |
+| one writer per store | the one moving part, serialised; reads never touch it |
+| `live.socket` | a process per viewer whose projection a browser mirrors |
+| `live.diff` + `client.js` | the DOM is a projection, patched, never re-templated |
 
-Each is ordinary alone. Composed, they say something no one of them says:
+### One moving part
 
-> **The interface is a value. The database stores values. The basis orders
-> them in time. ∴ the application's own definition is queryable history, and
-> a page is a projection of (definition, data, who is asking) — all three of
-> which are values, at a point in time you can name.**
-
-Everything below is verified in-tree, and the two probes at the end are
-runnable.
-
----
-
-## 1. What FEAT-016 actually decided
-
-The shipped rule, from `spell.server/topic`'s own docstring:
-
-> What arrives on the topic is a BASIS, never a rendered board. At the
-> instant of a write the only thing that is true is that the database
-> advanced; which rows changed, and what any given page should now show, is
-> derived by the READER from its own question.
-
-Written as a type, this is the whole essay:
-
-```
-page   :   (definition, data, asker) → DOM
-broadcast :  the moment the data moved         ← a number
-```
-
-A projection is a function of **three** arguments, and a writer knows only
-one of them. Reel proves it concretely: `board-assigns` is `(db, role)`, and
-`task-rows db role` computes each row's legal moves from
-`reel.work/affordances`. The same task at the same instant offers
-`[doing dropped]` to a tech lead and `[dropped]` to a product lead. Broadcast
-a rendered board and one of those two people is looking at the other's
-answer.
-
-So the message shrinks to a number, and every subscriber recomputes *its own*
-question. That is the move. And once you see the payload is a **basis**, you
-notice the basis is not a notification — it is a **coordinate**.
-
----
-
-## 2. The five ideas, and the join
-
-### EDN: the definition is data
-
-A contract is not a class, a module, or a macro expansion. It is a map, made
-by `spell.contract/parse`, holding `:assigns :events :infos :opts`. Handler
-bodies are **quoted forms** — `(quote (on :create [title] …))` — stored, not
-compiled.
-
-Two runtimes are projected from it: `machine-module` emits the Elixir
-LiveView, `machine-page-edn` emits the Spacetime page. Neither is written by
-hand; they cannot disagree.
-
-### datom: values become storable, ordered, queryable
-
-`:db.type/term` is the hinge, and its docstring says so:
-
-> Every BEAM term inhabits `:db.type/term`. This is not a hole in the type
-> system, it is the point of one: codec.bl gives a total order to every term
-> the language has, so a tuple, a nested map, a set or a pid can be indexed
-> and range-scanned exactly like a string.
-
-A contract is a nested map of quoted forms. ∴ **a contract is a legal datom
-value.** Not by special-casing — by the codec already ordering every term the
-language has.
-
-### GenServer: exactly one moving part
-
-`datom.conn`'s writer is an Agent, and the comment is precise about why: it
-owns *nothing*. Every durable thing is in the store, the basis is in a shared
-atom, so the process exists purely to serialise. Reads never touch it —
-`(db conn)` is O(1), captures a basis, and ten thousand readers proceed in
+`datom.conn`'s writer is an Agent, and it owns *nothing*: every durable thing
+is in the store and the basis is in an atom shared through the registry, so
+the process exists purely to serialise. Reads never touch it — `(datom/db
+conn)` is O(1), captures a basis, and ten thousand readers proceed in
 parallel.
 
-`next-tx-id` is a store counter from `FIRST-TX`, allocated **inside** that
-writer and **recovered from the store on reopen**. So the basis is totally
-ordered across restarts, not merely within one VM. And `transact-in-writer`
-advances it with `max`, not `reset!` — a high-water mark, because a slower
-transaction with a lower id landing last would otherwise rewind it and hide
-every datom above the rewound mark (BUG-022: twenty writes, all committed,
-all durable, sixteen visible).
-
-**Everything downstream rests on that monotonicity.** It is why a basis can
-be a coordinate rather than just a ping.
-
-### LiveView + Spacetime: state mirrored, DOM projected
-
-The LiveView holds authoritative assigns; the page holds signals. Diffs
-cross, never templates. `on-info` clauses compile to real `handle_info/2`
-heads — so a BEAM message and a browser click are decoded by *the same
-contract*, through *the same walk*.
-
-### The join
-
-```
-   a write            → a basis         (a coordinate, not a notification)
-   a basis + a db     → a value         (as-of, O(1), shares the store)
-   a value + a query  → an answer       (datalog, in the reader's process)
-   an answer + a role → a projection    (the asker's own question)
-   a projection       → a DOM           (Spacetime, push-native)
-```
-
-Every arrow is a pure function of values. The only impure step is the first,
-and it happens in exactly one process.
+`next-tx-id` is a store counter, allocated **inside** that writer and
+recovered from the store on reopen, so the basis is totally ordered across
+restarts. Everything downstream rests on that monotonicity: it is why a basis
+can be a coordinate rather than just a ping.
 
 ---
 
-## 3. What this unlocks, in order of increasing wow
+## 3. The app is a value
 
-### (a) The board is already time-travellable — for free
-
-`datom/as-of` is O(1) and copies nothing: a historical value shares the same
-store and differs only in its basis. `reel.read`'s every function takes a db
-**value**, never a connection.
-
-∴ the read model *already works against the past*, and nothing exercises it.
-A read that accepts `{:as-of t}` gives:
-
-| mode | meaning |
-|---|---|
-| live | subscribed; `t := latest` |
-| paused | pinned to a `t` |
-| scrubbing | `t` from a slider |
-
-Same reader, same contract body, same walk, **no second set of historical
-queries**. Reel becomes an actual reel: scrub to Monday, watch the board play
-forward. Two tabs pin different moments and compare. The moment is
-*renderable* — "as of tx 1000432" — so "are we looking at the same thing?"
-becomes answerable instead of assumed.
-
-This exists *only* because the database is a value, and it costs one
-parameter on top of work already shipped.
-
-### (b) The definition can live in the database too
-
-Here is the turn. A contract is a value; `:db.type/term` stores any value;
-datom versions every value it stores.
-
-**∴ store the contract in the database.**
-
-Verified — this runs (`/tmp/term_probe.exs`, reproduced in §5):
-
-```
-assigns-then  ["n"]              ; pulled as-of t1
-assigns-now   ["label" "n"]      ; pulled at head
-versions      3
-```
-
-And the pulled-back term is still a working contract (`term_probe2`):
-
-```
-handled          "ok"
-assign-after     42
-reply            "bumped"
-module-compiles  true
-```
-
-A contract round-tripped through redb still drives `spell.server/handle` and
-still emits a compilable LiveView module.
-
-What that means:
-
-- **The UI has history.** `datom/changes` on `:ui/contract` answers *"what has
-  this page been, and when did it become so?"* — with a transaction id, a
-  timestamp, and `:tx/by` naming who changed it, because
-  `reel.store/transact-as!` already annotates `:db/current-tx`.
-- **Schema migration and UI migration are the same operation.** Both are
-  transactions.
-- **Rollback is `as-of`.** Not a deploy; a coordinate.
-
-### (c) The whole system becomes ONE query
-
-Data lives in datom. Definitions live in datom. So a datalog query can span
-both:
-
-> *Which pages read an attribute whose values changed in the last hour, and
-> who was looking at them?*
-
-That is one query over one store. In a conventional stack the data is in
-Postgres, the UI is in a git repo, the sessions are in ETS, and the question
-is a research project.
-
-This is where `spell.machine/report`'s static checks — `orphan-bindings`,
-`unrendered-assigns`, `undeclared-template-holes` — stop being a linter and
-become *queries over live facts*.
-
-### (d) `read!` closes the loop: dependence observed, not declared
-
-`walk` already records `:intents` from `do!`, `:pushes` from `push!`, `:ask`
-from `ask!`. `read!` alone evaluates without recording — correctly, because a
-body must compute with the answer. But the two are not exclusive:
+`live.app` turns routing, guarded multi-tenancy, liveness, and the web frame
+into one map:
 
 ```clojure
-(= hd "read!")
-(let [op (walk (second form) env st)
-      payload (walk (nth form 2 nil) env st)]
-  (swap! st (fn [s] (assoc s :reads (conj (get s :reads []) {:op (name op) :payload payload}))))
-  (perform-read (name op) payload))
+{:home      "/app"
+ :routes    [["/app" home] ["/lib/:lib" library] ["/e/:lib/:id" entity]]
+ :principal (fn [conn] me)                    ; who is asking (cookie/header)
+ :worlds    (fn [me params] {:control db …})  ; the GUARDED worlds me may read
+ :observe   (fn [me] [conn …])                ; conns to listen to for liveness
+ :intents   {:ingest/confirm confirm}}        ; the only writes
+
+(live.app/serve my-app {:port 4040})
 ```
 
-Five lines. **Zero new walker authority** — recording is exactly as pure as
-`:intents` already is; the walker still cannot name a performer, still writes
-only into its own state atom.
-
-Then `:topic :board` need not be written at all. The read name **is** the
-topic, and it is already registered via `register-reader!`. A page that reads
-something is subscribed to it *by construction* — which is precisely the
-"one need, one implementation" argument `:topic`'s own docstring makes
-against a second spelling of `:mount-event`.
-
-And the dataflow graph becomes a value:
-
-```
-intent :create-task → read :board → assigns @tasks @films … → 3 sockets
-```
-
-Both registries already exist (`spell.server/readers`,
-`Server.performers/0`). This adds the edges. Since `spell.run`'s four-rung
-ladder judges **model-proposed** contracts, "what does this proposal read,
-and what invalidates it" being *computable* is a safety rung — not a
-visualisation.
-
-It also subsumes FEAT-016's own leftover: `@components`/`@leads` computed and
-rendered by nothing is *an assign nothing depends on* — a derived fact, not a
-`check.exs` heuristic.
-
-### (e) The Smalltalk image, as diffable data
-
-`docs/spacetime-interface-as-value.typ` describes four levels of
-serialisability and calls L4 "a Smalltalk image — but diff-able, merge-able,
-versionable data instead of a binary blob." It is marked *vision,
-unimplemented*.
-
-Most of the substrate now exists:
-
-| level | status |
-|---|---|
-| L1 snapshot — signal values | assigns are values; `seed-assigns` reseeds |
-| L2 structure — skeleton | `machine-shell` emits it |
-| L3 behaviour — logic as data | handler bodies **are** quoted forms, walked |
-| L4 live process — continuation | ✗ the missing piece |
-
-L3 is the hard one and it is *done*: `spell.server/walk` is an interpreter
-over stored forms with a closed vocabulary. A page's behaviour already
-travels as data.
-
-What datom adds that the vision doc did not have: **the image is versioned,
-queryable, and time-indexed.** Not a blob you snapshot — a history you can
-ask questions of.
-
----
-
-## 4. Why the closed vocabulary is what makes this safe
-
-Every step above widens what data can do. The obvious fear: a contract from
-the database is data from the world, and interpreting data from the world is
-how systems get owned.
-
-The walker is the answer, and it was built for exactly this. Its vocabulary
-is closed — special forms plus a whitelist of pure functions — and an unknown
-head is **refused by name**, never resolved. `server.bl` states the
-alternative and rejects it: a fallback to `apply` would be *"an evaluator
-wearing a costume"*.
-
-Three properties compose:
-
-1. **The walker cannot act.** `do!` *records*; the host performs. A body
-   cannot name a performer, so it cannot discover what exists.
-2. **The host bounds the vocabulary structurally.** `declared_only/3` refuses
-   any assign a contract did not declare — because `assign_all` calls
-   `String.to_atom/1`, and an unbounded `to_atom` over wire data fills the
-   atom table and aborts the VM uncatchably. The bound is structural rather
-   than a rule performers are asked to follow.
-3. **The reader is bounded too.** An unregistered read fails by name.
-
-∴ storing contracts in a database does not widen the attack surface, because
-the interpreter never had ambient authority to begin with. *That* is why this
-design can be pushed as far as it can.
-
----
-
-## 5. Reproducing the proof
-
-```elixir
-# /tmp/term_probe.exs
-BeamLisp.init()
-BeamLisp.Env.add_search_path(Path.expand("spell/src"))
-BeamLisp.Loader.ensure_loaded("datom")
-BeamLisp.Loader.ensure_loaded("spell.app")
-```
+A screen is a pure function of a context map, and the frame guarantees the
+hard things so a screen cannot get them wrong:
 
 ```clojure
-(let [conn (datom/connect [{:db/ident :ui/name :db/valueType :db.type/keyword
-                            :db/cardinality :db.cardinality/one
-                            :db/unique :db.unique/identity}
-                           {:db/ident :ui/contract :db/valueType :db.type/term
-                            :db/cardinality :db.cardinality/one}])
-      term (spell.contract/parse :probe-live {}
-             (list (quote (assign @n :integer 0))
-                   (quote (on :bump [] (do (set! @n (inc @n)) (ok "bumped"))))))
-      r1 (datom/transact! conn [{:db/id -1 :ui/name :probe :ui/contract term}])
-      t1 (datom/basis-t (get r1 :db-after))
-      term2 (spell.contract/parse :probe-live {}
-              (list (quote (assign @n :integer 0))
-                    (quote (assign @label :string))
-                    (quote (on :bump [] (do (set! @n (inc @n)) (ok "bumped"))))))
-      _ (datom/transact! conn [{:db/id -1 :ui/name :probe :ui/contract term2}])
-      back-then (datom/pull (datom/as-of (datom/db conn) t1) [:ui/contract] [:ui/name :probe])
-      now       (datom/pull (datom/db conn) [:ui/contract] [:ui/name :probe])]
-  {:assigns-then (vec (sort (map name (keys (get (get back-then :ui/contract) :assigns)))))
-   :assigns-now  (vec (sort (map name (keys (get (get now :ui/contract) :assigns)))))})
+(app/defscreen entity [{:keys [me params db]}]
+  (let [lib (db :library)]          ; already guarded for `me`
+    (page (usage-history (pull lib (:id params))))))
 ```
 
-```
-%{"assigns-then" => ["n"], "assigns-now" => ["label", "n"], "versions" => 3}
-```
-
-And that the pulled term still works:
-
-```clojure
-(let [pulled (get (datom/pull (datom/db conn) [:ui/contract] [:ui/name :probe]) :ui/contract)
-      result (spell.server/handle pulled :bump {} {"n" 41})]
-  {:handled (get result :status)
-   :assign-after (get (get result :assigns) "n")
-   :module-compiles (string? (spell.contract/elixir-module pulled "Probe.Live" ""))})
-```
-
-```
-%{"handled" => "ok", "assign-after" => 42, "module-compiles" => true}
-```
+`:worlds` never hands a screen a world its principal may not read, so a
+cross-tenant read is *unrepresentable*, not merely forbidden. `:observe` is
+the liveness set. `:intents` is the only write path. The whole app is one
+value passed to one call.
 
 ---
 
-## 6. The ladder from here
+## 4. State has exactly three kinds
 
-Each rung is independently valuable and independently verifiable. None
-requires the next.
+The hardest question in any UI framework is "where does state live?" Here the
+answer is closed. Three kinds, each with one home:
 
-| # | rung | cost | unlocks |
-|---|---|---|---|
-| 1 | `read!` records into `:reads` | ~5 pure lines | dependence observed; testable with no socket/store/browser |
-| 2 | derive `:topic` from recorded reads | small | the contract clause disappears; one need, one impl |
-| 3 | per-socket `t_seen` watermark | small | reconnect-catchup and live-push become one path |
-| 4 | reads accept `{:as-of t}` | one param | pause, scrub, compare — **the demo** |
-| 5 | contracts stored as `:db.type/term` | medium | UI history, `:tx/by` authorship, rollback = `as-of` |
-| 6 | datalog across data + definitions | falls out of 5 | "which pages read what changed?" as one query |
-| 7 | L4 continuations | large | the diffable image |
+```
+kind      lives in                      lifetime
+────────  ───────────────────────────   ──────────────────────
+SHARED    the shared datom conn         durable, the log
+SESSION   a per-socket in-memory conn   the socket's lifetime
+LOCAL     the socket's :locals map      the socket's lifetime
+```
 
-Rung 3 fixes a real remaining gap: as shipped, `on-info` re-reads
-unconditionally and the basis is bound but unused, so a page that missed a
-broadcast while backgrounded stays stale until something else wakes it — the
-same class of gap FEAT-016 fixed, at a different cause.
-`reel.read/changed-since` already computes the delta.
+- **shared** is the truth everyone sees — a fact in the log, with `q`, `pull`,
+  `as-of`, and `watch` for free.
+- **session** is this viewer's private database. Same datom API, but the ETS
+  table is owned by the socket process, so it is reclaimed when the socket
+  ends — leak-free by process lifetime, no cleanup code.
+- **local** is a plain map for scalars (a draft, a toggle, `:me`).
+
+There is no fourth "component state" tier. Durable and shared → a fact.
+Ephemeral and private → a session datom or a local.
+
+### A guarded live feed
+
+A subscription's filter is the same datalog as a query. `auth/guard` injects a
+conjunctive `:where` clause — monotone, so it can only remove rows — and
+`datom/watch` runs it as a live feed in its own process:
+
+```clojure
+(def feed (auth/guard '[:find ?id :where [?e :doc/id ?id]]
+                      [(auth/owner-filter '?e :doc/owner principal)]))
+(datom/watch conn feed (fn [diff] (push! principal diff)))
+```
+
+A guard clause is conjunctive ⇒ monotone. The property that makes an
+incremental live view *sound* is the property that makes it *secure*: one
+idea, two guarantees. `datom/watch`'s docstring states the rule it keeps —
+the callback receives datoms or result rows, never a projection the writer
+computed.
+
+---
+
+## 5. What this unlocks
+
+**(a) The view is time-travellable for free.** `datom/as-of` is O(1) and
+copies nothing: a historical value shares the store and differs only in its
+basis. Because a view is `(db → hiccup)` and every read takes a db *value*,
+the same reader answers about the past. Pin a basis and the page shows
+Monday; "as of tx 1000432" is renderable, so "are we looking at the same
+thing?" becomes answerable instead of assumed.
+
+**(b) The application is one value.** An app is a map; `live.app/serve` starts
+it. The frame — routes, principal, guarded worlds, liveness, intents, the web
+shell — is provided once, so a screen is just a function and cannot get
+tenancy or liveness wrong.
+
+**(c) One commit, N viewers converge.** Two tabs do not exchange messages;
+they re-project from one log. A reconnect re-attaches the same session and
+ships the delta since the tree the client last saw — nothing missed ships
+nothing.
+
+---
+
+## 6. Reproducing it
+
+The examples run as they are:
+
+```sh
+bl run examples/live/05-two-tabs.bl       # convergence through the log
+bl run examples/live/06-session-cart.bl   # a per-viewer session datom
+bl run examples/live/07-guarded-live.bl   # a guarded view + a denied write
+bl run examples/live/08-optimistic.bl     # optimistic UI, rollback from the log
+bl run examples/datom/live/10-reactive-socket.bl   # the per-socket binding
+bl run examples/datom/live/13-presence.bl          # presence beside a feed
+bl serve examples/server/hearth.bl        # a full app, one file
+```
 
 ---
 
 ## The through-line
 
 Clojure's claim is that a program is data. Datomic's is that a database is a
-value. LiveView's is that a page is a process. Spacetime's is that a DOM is a
-projection.
-
-Each was built by different people for different reasons, and on the BEAM
-they turn out to be the same claim wearing four hats. This repo is where they
-meet — and FEAT-016's small decision, *broadcast the moment and let each
-reader ask its own question*, is the one that makes the meeting load-bearing
+value. LiveView's is that a page is a process. beam-lisp holds all of them in
+one shape — an app is a value, the world is a value, and a page is a function
+of it — and the small decision at the centre, *broadcast the moment and let
+each reader ask its own question*, is what makes the shape load-bearing
 instead of merely elegant.
 
-A basis is not a notification. It is a coordinate in the history of a value
-— and once the definition of the application is stored beside its data, that
-history includes the application itself.
+A basis is not a notification. It is a coordinate in the history of a value.
 
 ---
 
 ## See also
 
-- `!tasks/features/FEAT-016-*` — the feature, its evidence, and the
-  re-derivation appended to it
-- `docs/spacetime-interface-as-value.typ` — the four serialisability levels
-- `docs/spacetime-lisp-machine.typ` — owners as processes, the evolution loop
-- `docs/building-an-app.md` — the practical guide to building on this
-- `priv/lib/datom/schema.bl` — `:db.type/term`, and why it is declared
-- `priv/lib/datom/conn.bl` — the single writer, and why the basis is a high-water
-  mark
-- `spell/src/spell/server.bl` — the closed vocabulary, and `topic`'s rationale
+- `priv/lib/datom/broadcast.bl` — the report, delta by default, basis by knob
+- `priv/lib/datom/conn.bl` — the single writer, and why the basis is a
+  high-water mark
+- `priv/lib/datom/watch.bl` — T1 patterns and T2a guarded live queries
+- `priv/lib/live/socket.bl` — `deflive`, `mount`, `on-commit`, `handle-event`
+- `priv/lib/live/app.bl` — the app as a value: routes, worlds, intents, serve
+- `priv/lib/live/diff.bl` — the keyed structural diff
+- `docs/datom-as-a-broadcast-substrate.md` — the substrate, three layers deep
+- `docs/building-an-app.md` — the practical guide
+- `examples/live/` and `examples/datom/live/` — every claim above, runnable

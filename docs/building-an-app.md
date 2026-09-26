@@ -1,8 +1,9 @@
-# Building an app on beam-lisp: datom + spell, layer by layer
+# Building an app on beam-lisp: datom + live, layer by layer
 
-How to stand up a new application of the same shape as `projects/reel` — a
-durable graph, a read model, a page whose two halves are emitted from one
-term, and a verification ladder that catches the defects before a browser
+How to stand up a new application of the same shape as
+`examples/live/11-pulse-app.bl` and `examples/server/hearth.bl` — a durable
+graph, a pure read model, a live page whose view is a function of the
+database, and a verification ladder that catches the defects before a browser
 does.
 
 Everything below is drawn from the working system. Where a rule exists
@@ -14,48 +15,48 @@ gets deleted by the next person.
 ## 0. The shape, in one picture
 
 ```
-    browser                        BEAM
-    ───────                        ────
-
-    Spacetime page   ◀── emitted ──┐
-    (signals, DOM)                 │
-        │  fire :create "title"    │
-        ▼                          │
-    LiveView socket                │   ONE contract term
-        │                          │   (data, in beam-lisp)
-        ▼                          │
-    generated module ──────────────┘
-    (machine-module)
-        │  delegates, never decides
+    browser                                  BEAM
+    ───────                                  ────
+    live page      ◀── [:mount html] ───────  one process per viewer
+    (hiccup + client.js)   [:patch ops]       (a live.socket)
+        │
+        │  [:event [:intent :post {:text "hi"}]]
         ▼
-    spell.server/handle      ← closed-vocabulary walk of the handler body
-        │  records {:intents :reads :pushes :ask}, performs nothing
-        ▼
-    BeamLisp.Spell.Server    ← the authority: looks up a performer, calls it
+    WebSocket  web/upgrade → BeamLisp.WebSocket
         │
         ▼
-    <app>.intent/perform     ← YOUR beam-lisp: validate, write, read back
-        │
+    live.socket
+        │  :assign  → locals, re-render here
+        │  :intent  → authorize → transact!
         ▼
-    <app>.store  ──▶ datom ──▶ redb
+    datom conn ──▶ datom.store-fjall   (durable)
+                   datom.store-ets     (session)
+        │  commit → [:datom/tx basis tx-datoms]
+        ▼
+    every listening socket re-projects → live.diff → patch
 ```
 
-Two properties hold this together, and both are worth stating before any
-code:
+The chain is: **page ← `web.bl` + `live.socket` ← beam-lisp intents ← datom
+on fjall.** Two properties hold it together:
 
-1. **The page and the server half are two projections of one term.** They
-   cannot disagree about events, assigns, pushes, or reply tags, because
-   nobody writes them twice.
-2. **The handler body is data, walked by a closed interpreter.** It can
-   compute; it cannot act. It says what it *wants* (`do!`, `read!`, `ask!`)
-   and a layer with the authority does it. That is what lets a contract be
-   proposed by a model without handing it the runtime.
+1. **A view is a pure function** — `(fn [shared-db session-db locals] →
+   hiccup)`. It renders the world; it never mutates, fetches, or subscribes.
+   The same function answers a test and a browser.
+2. **An event is closed data**, from three heads — `[:assign …]`,
+   `[:intent …]`, `[:navigate …]` — never a closure. An `:intent` asks for a
+   FACT; the socket authorizes it, transacts it, and the browser receives only
+   a patch.
+
+`live.app` lifts the whole thing into one value: an app is a map of routes,
+screens, guarded worlds, and intents, served with `(live.app/serve app {:port
+…})`. A screen is `(fn [ctx] → hiccup)`. Write a real app as one `.bl` file and
+run it with `bl serve`.
 
 ---
 
 ## 1. The layers, and the rule that orders them
 
-Copy `reel/app.bl` — the manifest namespace. Loading it loads the
+Copy `examples/server/hearth.bl` — the manifest namespace. Loading it loads the
 application, because the loader computes order from the `(:require …)`
 forms.
 
@@ -67,7 +68,7 @@ forms.
             [myapp.read]       ; the datalog queries — the read model (schema)
             [myapp.intent]     ; an intent becomes a transaction  (store work read)
             [myapp.corpus]     ; seed data, as terms              (read store)
-            [myapp.ui.board])) ; contracts and views              (read)
+            [myapp.ui.board])) ; views + intents                   (read)
 ```
 
 **The rule: nothing reaches down past its layer; nothing below knows a layer
@@ -207,29 +208,23 @@ page to render whatever order a set iterates.
 and every component and subtract in the host — is the same answer computed
 somewhere it cannot be indexed.
 
-### The projection boundary is not optional
+### Project at the read model, not the view
 
-A page cannot walk a namespaced key. `@f.film/status` reads as a *namespaced
-symbol* (namespace `f.film`, name `status`), so the template checker reports
-an undeclared hole called `status` in a template whose parameter is `$f`.
-**A `/` cannot appear in a path a template walks.**
-
-So project, with the two vocabularies visibly separate:
+A row is an entity map with namespaced keys (`:myapp/title`,
+`:film/status`). A view that reads `(:film/status entity)` has learned how
+*this database spells it* — it would have to change if the schema renamed an
+attribute the page never cared about. Project rows to plain keys in the read
+model, so a view names what it shows, not how the store spells it:
 
 ```clojure
 (defn- row [entity pairs]
-  (reduce (fn [m pair]
-            (let [v (get entity (first pair))]
-              (assoc m (second pair) (if (nil? v) "" v))))
+  (reduce (fn [m [from to]]
+            (assoc m to (or (get entity from) "")))
           {} pairs))
 
 (row f [[:myapp/title :title] [:film/status :status] [:myapp/slug :slug]])
 ```
 
-Projecting is better anyway: a view saying `@f.title` knows a film has a
-title; one saying `@f.myapp/title` knows how *this database spells it*, and
-would have to change if the schema renamed an attribute the page never cared
-about.
 
 ### Two rules learned expensively
 
@@ -242,8 +237,8 @@ looks. Cost the other way: a demo that fails in front of a customer.
 
 **An empty list is an answer, not an absence.** "Every requirement is
 asserted" is the best result the tool can report and renders identically to
-a query that crashed. Compose the sentence server-side — a template walks
-values and cannot ask how many there are:
+a query that crashed if the view just prints the list. Compose the sentence
+in the read model, where the meaning of nothing is known:
 
 ```clojure
 (defn verdict [coll noun empty-says]
@@ -313,7 +308,7 @@ with a name under a supervisor.
 ```clojure
 (defserver store
   (init [path]
-    (ok {:conn (datom/connect-with (datom.store-redb/open path) myapp.schema/all)
+    (ok {:conn (datom/connect-with (datom.store-fjall/open path) myapp.schema/all)
          :path path}))
 
   (handle-call :db   [_from state] (reply (datom/db (get state :conn)) state))
@@ -336,11 +331,11 @@ one mailbox, and re-implements the query language it sits on.
 Four things that will bite:
 
 - **`terminate` must `datom/release!`.** `datom.conn` keeps a process-wide
-  registry mapping each store to its writer and basis. That is a live
-  reference, and redb's file handle is a Rustler resource freed by GC — so
-  an unreleased entry keeps the **database file locked** for the life of the
-  VM. A store whose process is provably dead still owns its file, and
-  reopening fails with a lock error naming it.
+  registry mapping each store to its writer and basis. That registry entry is
+  a live reference, and the durable store's handle is freed by GC — so an
+  unreleased entry keeps the **database locked against reopening** for the
+  life of the VM. A store whose process is provably dead still owns its
+  directory, and reopening it fails until the reference is dropped.
 - **`terminate` does not run on a brutal kill.** Nothing does. Hence
   `release!` is idempotent, and a caller reopening after a crash may still
   wait for collection.
@@ -371,8 +366,8 @@ cannot.
 
 ## 6. Intent — a pure half and a dull impure half
 
-`myapp/intent.bl`. This is the layer FEAT-016 is really about, so build it
-with the split intact.
+`myapp/intent.bl`. This is where the app's writes live, and the split is the
+point.
 
 ### `tx-for` — pure: intent + db → transaction data, or a refusal
 
@@ -398,480 +393,287 @@ Every rule lives here, and it needs no substrate to check — no store, no
 socket, no process.
 
 **A refusal is a value, not an exception**, because a refused intent is an
-ordinary outcome (someone typed an empty title) and the page must render the
-reason. Exceptions are for the impossible.
+ordinary outcome (someone typed an empty title). Exceptions are for the
+impossible.
 
 **A refusal is a sentence and it goes to a person.** Two rules: say what is
 wrong, not that something is; say what would be right, when that is knowable.
 
-### `perform` — impure: validate, write, read back
+### `perform` — impure: validate, write
+
+A performer is what an intent op is wired to. Its signature is fixed: it
+receives the conn, the payload, and the authenticated principal, and returns
+transaction data — or nil for "validated, but nothing to write".
 
 ```clojure
-(defn perform [op payload]
-  (let [op-kw (keyword (str op))
-        db (myapp.store/db)
-        result (tx-for db op-kw payload)]
+(defn perform
+  [conn payload _principal]
+  (let [result (tx-for (datom/db conn) :create-task payload)]
     (if (contains? result :refused)
-      (merge (board-assigns db) {"notice" (get result :refused)})
-      (let [outcome (if (empty? (get result :tx))
-                      (get result :note)
-                      (try (do (myapp.store/transact-as! (get result :tx)
-                                                         (get result :note) nil)
-                               (get result :note))
-                           (catch e (if (cas-failure? e)
-                                      (stale-notice payload)
-                                      (throw e)))))]
-        (merge (board-assigns (myapp.store/db)) {"notice" outcome})))))
+      nil                        ; nothing to write; the view renders the refusal
+      (get result :tx))))
 ```
 
-Five things in that shape are load-bearing:
+Three things in that shape are load-bearing:
 
-- **A fresh `(store/db)` after the write.** A database value is immutable, so
-  the one above answers forever with the world *before* this transaction —
-  exactly the property that makes it safe to hold, and exactly the trap if
-  you hold it too long.
-- **An empty transaction is skipped.** A write with no datoms appends a
-  moment in which nothing happened, and "what changed since Monday?" would
-  have to learn to ignore them.
-- **The catch is NARROW.** A bare `catch` turns a schema violation, a full
-  disk and a NIF crash alike into "somebody else changed this — refresh and
-  try again": not a degraded message but a **false** one. It sends a person
-  to reload a page over a database that is failing, and hides the failure
-  from whoever could fix it. Discriminate structurally —
+- **The principal comes from the socket, not the payload.** The client names
+  the *intent*; it cannot name the actor. The performer stamps the principal
+  on the fact, so a post cannot lie about who posted.
+- **A nil return is a legitimate no-op**, not an error: the performer
+  validated and chose not to write. The socket records the outcome in locals
+  (`:live/outcome`), so the view can say why, and nothing reaches the log.
+- **The write is only the transaction.** Do not read back and push a rendered
+  result. The commit broadcasts the moment; every listening socket
+  re-projects; the view shows the new fact because the database changed — one
+  path for the writer and every other viewer.
 
-  ```clojure
-  (defn- cas-failure? [e]
-    (let [data (ex-data e)]
-      (and (map? data) (contains? data :expected) (contains? data :actual))))
-  ```
+### Registration is the `:intents` map
 
-  `:expected` appears in no other error this path can produce, which is
-  better than matching a message string a reword would silently break.
-- **A refusal answers with the board too.** The user's state has not changed
-  and the page must say why.
-- **String keys.** That is what crosses the seam; the contract's declared
-  names are strings there.
-
-### One reader, not seven
+An op is wired to its performer by a map — no global registry, no lookup by
+name:
 
 ```clojure
-(defn register-reads! []
-  (spell.server/register-reader!
-    :board
-    (fn [params]
-      (let [raw (or (get params :role) (get params "role"))
-            role (if (or (nil? raw) (= (str raw) "")) nil (keyword (str raw)))]
-        (board-assigns (myapp.store/db) role)))))
+(sock/mount {:view board
+             :shared conn
+             :session (sock/open-session ui-schema)
+             :sink (erlang/self)
+             :intents {:create-task perform}})
 ```
 
-A reader *per assign* is a torn snapshot: each would call `(store/db)`
-itself, so a mount running seven of them gives a page whose lists came from
-different moments. One reader answering the whole page from one value is the
-fix, and it is the *same function* an action's reply uses — so a page's
-opening state and its state after a click are one moment each, computed by
-one function.
+`live.app` carries the same map on the app value (`:intents`), so the screens
+and the socket that serves them share one wiring. An unregistered op is a
+**dead button**: the socket answers `[:denied …]` by name and never writes — a
+view may name an op a narrower host does not serve.
 
-**Read both spellings of a param key.** A handler body writes
-`(read! :board {:role role})`, so the key arrives as the keyword `:role`; a
-caller passing a wire map sends the string. Reading only one answers nil
-silently.
+Reads need no registration. A view receives the database **values** it renders
+from (`shared`, `session`, `locals`), so the page's opening state and its state
+after a click are each computed by the same pure function from one basis.
 
 ---
 
-## 7. The contract — one term, two runtimes
+## 7. The socket — one process per viewer
 
-`myapp/ui/board.bl`. `@name` marks a binding that **crosses the seam**: on
-the BEAM it reads `socket.assigns.name`, in Spacetime it is the `$name`
-signal. A binding *not* declared here is page-local — that is the definition
-of "shared", not a separate annotation.
+`live.socket` binds a view to a conn. A live socket is a `defserver` — a real
+OTP process, one per viewer — that holds:
 
-```clojure
-(def contract-term
-  (parse :board-live
-         {:bundle (Elixir.BeamLisp.Spell.Build/bundle_url)
-          :root ".myapp"
-          :mount-event :refresh}
-         (list
-           (quote (assign @tasks :list))
-           (quote (assign @notice :string))
-           (quote (assign @board :map))
+| field | is |
+|---|---|
+| `:view` | a pure fn `(shared-db session-db locals) → hiccup` |
+| `:shared` | the durable conn everyone sees |
+| `:session` | this socket's own in-memory conn (opt) |
+| `:locals` | ephemeral per-viewer values (draft text, ui toggles, `:me`) |
+| `:tree` | the last hiccup tree, to diff against |
+| `:sink` | where `[:mount …]` / `[:patch …]` go (the WebSocket process) |
+| `:intents` | op → performer |
 
-           (quote (on :refresh [role]
-                    (do (set! @board (read! :board {:role role}))
-                        (set! @tasks (get @board "tasks"))
-                        (set! @notice "")
-                        (ok "refreshed"))))
+The loop, as plain functions you can call in a test:
 
-           (quote (on :create [title]
-                    (if (blank? title)
-                      (err "A task needs a title.")
-                      (do (do! :create-task {:title title})
-                          (ok "created"))))))))
+```
+mount        → render the view once → push [:mount html], remember the tree
+on-commit    → re-render → diff → push [:patch ops]
+handle-event → :assign   mutate locals, re-render NOW (this socket only)
+             | :intent  authorize, then transact the shared world
+             | :navigate mutate locals (route/params), re-render
 ```
 
-### The vocabulary a handler body may use
+The inversion that is the concurrency model: **a local mutation renders here; a
+fact mutation renders everywhere.** `:intent` does not render — it transacts,
+and the commit path (`on-commit`, driven by the datom broadcast) re-renders
+*every* watcher. So two tabs cannot disagree, and a dropped patch is replayable
+from the basis.
 
-Special forms: `if do and or quote set! push! ask! do! read! ok err
-live-vars`. Plus a whitelist of pure functions (`append str count get get-in
-nth name keyword empty? blank? not nil? string? first last rest reverse conj
-assoc merge take drop inc dec + - = not= < >`).
+### Writing one socket
 
-An unknown head is **refused by name**, never resolved. A walker that fell
-back to `apply` would be "an evaluator wearing a costume" — and a contract
-can be proposed by a model, at which point the four-rung safety ladder would
-be checking the page while the server half was unguarded.
+```clojure
+(sock/deflive board-socket
+  :view    board                 ; (shared-db session-db locals) → hiccup
+  :intents {:create-task perform}
+  :session ui-schema             ; opens an in-memory session conn (opt)
+  :listen  {:payload :basis})    ; datom listen opts (opt)
+```
 
-The cost is honest: when a contract needs more, the list grows deliberately,
-one reviewable line per capability.
+`deflive` expands to a `defserver`. Mount is the trap it closes by
+construction: `mount` renders and never fires an event, so a write at mount is
+unrepresentable.
 
-### `do!` vs `read!` — the asymmetry is the whole design
+### The whole app: `live.app`
 
-| | records | performed | may run at mount |
-|---|---|---|---|
-| `(do! :op payload)` | into `:intents` | after the walk, by the host | **no** |
-| `(read! :op payload)` | evaluates inline to the answer | wherever it appears | **yes** |
+`live.app` lifts routing, guarded multi-tenancy, and the web frame into one
+value, so a screen cannot get them wrong:
 
-`do!` is `ask!` with the operation named rather than assumed. The walker's
-authority is unchanged: it writes into its own state atom, calls nothing it
-was not handed, and cannot even *name* a performer — the registry lives in
-the host, so a body saying `(do! :whatever …)` has no way to discover whether
-anything answers. An unregistered op fails in the host, by name, which is
-where the authority to perform lives.
+```clojure
+{:home      "/app"
+ :routes    [["/app" home] ["/lib/:lib" library] ["/e/:lib/:id" entity]]
+ :principal (fn [conn] me)                    ; who is asking (cookie/header)
+ :worlds    (fn [me params] {:control db …})  ; the GUARDED worlds this me may read
+ :observe   (fn [me] [conn …])                ; conns to listen to for liveness
+ :intents   {:ingest/confirm confirm}}        ; the only writes
 
-`read!` evaluates rather than records because a body reads *in order to
-compute*: `(set! @tasks (read! :tasks {}))` is the shape every such handler
-wants, and a recorded read would force the host to merge results the body
-could not see.
+(live.app/serve my-app {:port 4040})
+```
 
-### The mount trap — it will cost you a boot
+A screen is then a pure function of its context map:
 
-**Phoenix mounts a LiveView twice per live navigation** (disconnected static
-render, then connected socket). An event handler runs once per click; a mount
-event runs once per *render pass*. So a `do!` in a mount event is a write per
-page load, performed twice, half of it in a request process that exits
-immediately afterwards — taking any async reply with it.
+```clojure
+(app/defscreen entity [{:keys [me params db]}]
+  (let [lib (db :library)]          ; already guarded for `me`
+    (page (usage-history (pull lib (:id params))))))
+```
 
-The host **refuses it, loudly**. A contract whose mount event says `do!` is
-expressing an intention that path cannot honour, and silence would make it
-look like it had.
-
-∴ `:mount-event` handlers **read**. Every mount of the reel board raised
-before rendering until this was understood.
-
-### Two more, both observed
-
-**One read, not seven, in the handler too.** The walker has no `let`, so a
-value that must survive from being read to being destructured has to be an
-*assign*. Hence `@board` — declared, holding the whole answer, with the
-rendered assigns as projections of it. Costs a little redundancy on the
-wire; buys the property the page needs.
-
-**A page-local crosses the seam by being PASSED, not read.** A handler body's
-env binds the handler's own params and nothing else. `@role` inside a body
-resolves a name the server cannot see. Declare the parameter — `(on :refresh
-[role] …)` — and have the page fire it.
+`:worlds` hands a screen only the worlds its principal may read, so a
+cross-tenant read is *unrepresentable*, not merely forbidden. `:observe` is the
+liveness set; `:principal` resolves the viewer from the request. `defscreen`
+and `defview` name a role and expand to `defn` — a view is just a function.
 
 ---
 
-## 8. The view — three planes
+## 8. The view — hiccup
 
-`(parse-view :myapp-view (list (quote (markup …)) (quote (style …)) (quote
-(binds …))))`. An unknown plane fails rather than being ignored: a silently
-dropped plane is a page missing its styles.
-
-### markup
+A view returns hiccup: nested vectors of `[tag attrs children…]`.
 
 ```clojure
-(template &shell []
-  [:main {:class "myapp"}
-   [:section {:class "panel"}
-    [:div {:class "tasks"}]]])          ; empty: a bind fills it
-
-(template &task [$t]
-  [:article {:class "task" :data-state @t.state :data-slug @t.slug}
-   [:h3 {:class "task__title"} @t.title]
-   [:div {:class "task__moves"}
-    [:button {:class "move move--1" :type "button"} @t.move1]]])
+[:main {:class "myapp"}
+ [:section {:class "panel"}
+  [:ul
+   (for [t tasks]
+     [:li {:key (:slug t) :data-slug (:slug t)}
+      [:h3 (:title t)]
+      [:button {:type "button" :on-click [:intent :move {:slug (:slug t)}]}
+       "move"]])]]]
 ```
 
-- **`&shell` holds NO holes.** It is rendered server-side once as static HTML
-  and never invoked as a template, so a `@x` written into it emits a hole
-  nothing binds and the browser paints the literal text. Observed: three
-  panels captioned `` `$unrealisedSays` ``. A subscribed value reaches the
-  DOM by being *mounted* — see `st/view` below.
-- **A bind attaches to rendered DOM**, so the container must exist and be
-  empty in the shell. An element no template renders cannot be bound.
-- **`data-slug` is what makes write controls possible.** A control must name
-  the entity it acts on, and the row is the only place that name exists in
-  the DOM. With `data-key`/`data-index` only — positions in a list that
-  re-sorts on every write — move buttons are not *missing*, they are
-  *unwireable*.
-- **A template body is an element, text, or a hole, and nothing else.** A
-  nested `(st/each …)` inside one throws "not markup". A row that renders its
-  own list must ask the read model for **fixed positional slots**
-  (`:move1 :move2 :move3`), filled from the same affordance map that
-  validates the write. `(get v i default)` does **not** answer the default
-  past the end of a beam-lisp vector — it answers nil, which reaches the
-  browser as the text `"nil"` — so bound-check in the projection.
-- **A boolean hole renders as the empty string in attribute position**, so it
-  carries no information while looking like it does. Say it in words.
-- **Render the row's field, not the row.** `@r` where `@r.slug` was meant
-  reaches the browser as `[object Object]`, once per row.
+- **Key every list item.** The diff matches children by `:key`; without one a
+  re-sorted list is rewritten instead of moved. Keys are the difference between
+  a minimal patch and a full re-render.
+- **An `:on-*` value is an event term, not a callback** — `[:intent :op {…}]`,
+  `[:assign [:draft] "text"]`, `[:navigate "/next"]`, or a vector of them. The
+  vector runs in order, and a denied or no-op intent stops it.
+- **A button is a component, not a string of HTML.** `loom.ui` and `loom.box`
+  build accessible controls (`(ui/button {:variant :primary :on-click …} "go")`)
+  and read their colors through `loom.token`, so a brand is one value.
 
-### style
-
-```clojure
-[".notice" {:margin "0.5rem 0 0" :color "#e8eaf2"}]
-[".notice:not(:empty)" {:padding "0.5rem 0.75rem" :border-radius "0.5rem"}]
-[".composer__input" {:value (inject @draft)}]
-```
-
-- **`(inject @x)` selects the `<-` reactive arrow; a bare `@x` is the `:` CSS
-  surface.** Carried as different data deliberately — collapsing them
-  reroutes a binding between `style.setProperty` and `setAttribute`
-  (verse BUG-091). A bare binding emits `value: (deref draft);`, which verse
-  refuses.
-- **An input's value must follow its signal.** Otherwise clearing `@draft`
-  after an add empties the *signal* while the `<input>` keeps its text, and
-  the next keystroke writes the still-visible text back: task two arrives
-  named `"firstsecond"`.
-- **`:empty` will not collapse an interpolated element.** It renders an empty
-  *string*, so it is not childless. Use `:not(:empty)` on the decoration.
-- **A background needs a colour beside it** or the machine warns — correctly:
-  an unreadable control is not a control.
-
-### binds
-
-```clojure
-(binds
-  [".tasks"  (st/each @tasks :as @t :template &task)]
-  [".notice" (st/view @notice ["_" &notice])]
-  [".move--1" (st/on :click (fire :move @t.slug @t.move1 @role))]
-  [".role"   (st/on :input [(st/value @role) (fire :refresh @role)])])
-```
-
-- **Without an `@each`, the page receives every assign diff and discards it.**
-  Subscription declared, template styled, nothing instantiating it — a defect
-  this codebase has recorded twice.
-- **`st/view` mounts a scalar.** One `_` arm when the page has no cases to
-  distinguish.
-- **Loop variables are in scope inside the `@each` that binds them** — which
-  is what lets one selector serve every row without inventing an id per
-  entity.
-- **Two actions on one input**: write the signal, then re-ask the server. The
-  board is re-read rather than re-filtered because the *rules* live on the
-  server; a browser that recomputed which moves are legal would be the second
-  copy the lifecycle-as-data design exists to prevent.
-- **A `<select>`'s first option must be the empty state, visibly.** Every
-  page-local is emitted as `""`, and a select is only written by `st/on
-  :input` — so until somebody *changes* it, the signal is empty while the
-  control displays whatever sits first. A select whose first option was
-  "tech" showed tech, fired `""`, and the first move of every session was
-  refused for a role the user could plainly see selected.
+`live.hiccup/hiccup->html` renders a tree to a string for the first paint
+(SSR); on updates the same tree is diffed by `live.diff`, and the browser half
+(`priv/lib/live/client.js`) applies the patch ops to the live DOM. `:mount` is
+full HTML, `:patch` is a list of ops, and nothing re-renders the page.
 
 ---
 
-## 9. Boot — registration, and nothing else
+## 9. Boot — one file that serves
 
-`lib/myapp/boot.ex`. A **supervised child**, not a function called from
-`Application.start/2`, because it *owns* the store: `server-start-link`
-links, so whichever process calls it must be the one supervision restarts.
-Calling it from `start/2` links the database to the application controller.
+An app boots from a `.bl` file: connect the worlds, load the corpus, define the
+app, serve.
 
-```elixir
-def init(opts) do
-  Myapp.init!()                                   # BeamLisp + spell.app + myapp.app
-  store = Myapp.bl("myapp.store", "start!", [path])
-  true = is_pid(store)                            # NB: a bare pid, not {:ok, pid}
+```clojure
+(ns myapp.main
+  (:require [live.app :as app] [datom] [web]))
 
-  load_corpus()
-  register_performers()
-  Myapp.bl("myapp.intent", "register-reads!", [])
+(def conn
+  (datom/connect-with (datom.store-fjall/open "data/myapp.fjall")
+                      myapp.schema/all))
 
-  machine = build_machine()
-  BeamLisp.Spell.Server.register("board-live", "myapp.ui.board/contract-term")
-  publish(machine)                                # emit EDN → spacetime serve
-  generate(machine)                               # emit + compile the server half
-  {:ok, %{path: path, machine: machine}}
-end
+(datom/transact! conn myapp.corpus/seed)   ; idempotent: unique-identity upserts
+
+(def my-app
+  {:home      "/"
+   :routes    [["/" home]]
+   :principal (fn [conn] (web/req-cookie conn "who"))
+   :observe   (fn [me] [conn])
+   :intents   {:create myapp.intent/perform}})
+
+(app/serve my-app {:port 4040})
 ```
 
-The machine, and the two emissions:
+Nothing here is Elixir. Run it with:
 
-```elixir
-machine =
-  Myapp.bl("spell.live", "seeded", [
-    Myapp.bl("spell.machine", "empty-machine", []),
-    BeamLisp.Vector.new([BeamLisp.Vector.new([
-      BeamLisp.Env.fetch!("myapp.ui.board", "contract-term"),
-      BeamLisp.Env.fetch!("myapp.ui.board", "view-term")])])])
-
-# browser half
-edn = Myapp.bl("spell.live", "machine-page-edn", [machine, "Myapp.Web"])
-BeamLisp.Spell.Build.write_and_await(BeamLisp.Spell.Build.entry(), edn, 60_000)
-
-# server half — generated OVER a placeholder module the router already names
-source = Myapp.bl("spell.contract", "machine-module", [
-  Myapp.bl("spell.machine", "contracts", [machine]),
-  BeamLisp.Env.fetch!("myapp.ui.board", "module"),
-  Myapp.bl("spell.live", "machine-shell", [machine])])
-Code.put_compiler_option(:ignore_module_conflict, true)
-Code.compile_string(source)
+```sh
+bl run myapp/main.bl        # run once and exit
+bl serve myapp/main.bl      # run, then park the VM so the server keeps answering
+bl serve myapp/main.bl --port 8080
 ```
 
-The generated module is **plumbing, deliberately**: the `use
-Spacetime.LiveView` head, the `events`/`assigns`/`pushes` declarations, one
-*literal* `handle_event/3` head per declared event (literal because that is
-what proves to `__before_compile__` that a declared event actually reaches
-the server — a catch-all only warns), one `handle_info/2` head per `on-info`
-pattern. Each head delegates straight to `spell.server`. **Generating Elixir
-that re-states the body would create a second copy of the logic that could
-rot; generating Elixir that CALLS the body keeps exactly one.**
+`bl serve` supplies the half a program cannot: a server that returns leaves
+nothing holding the BEAM open, so `bl serve` parks it until Ctrl+C. A
+handler-only server is the same story with `web/serve`:
 
-### Registration is a join, and boot must not learn what either side does
-
-```elixir
-for op <- BeamLisp.Env.fetch!("myapp.intent", "ops") |> Spell.Data.from_bl() do
-  Server.register_performer(to_string(op), "myapp.intent/perform")
-end
+```clojure
+(web/serve {:port 4000 :plug my-router})
 ```
 
-`ops` is a **var holding a vector**, so `Env.fetch!` — `Myapp.bl` would try
-to *call* it and fail with a case clause showing the vector itself.
-
-### Degrade, don't refuse to boot
-
-A failed page publish and a failed corpus load are both **logged, not
-fatal**: a node whose page will not compile still answers every check, every
-test and every script, and refusing to boot takes the working half down with
-the broken one. But the log must name the *consequence*, not only the cause —
-"the browser will get the bundle from the last successful compile, and
-nothing on the page will say so."
-
-### The one switch tests need
-
-Two opt-outs in the supervision tree, both false under test: `:serve` (don't
-bind a port) and **`:boot`** (don't start Boot at all). The second is subtle
-and was found the hard way: Boot owns the store, so a test that stops the
-store to reopen the database elsewhere kills Boot, the supervisor faithfully
-restarts it, and a *second* store appears on the default path — which then
-holds redb's exclusive file lock against the store the test is trying to
-start. Symptoms: `"Database already open. Cannot acquire lock."` in one test,
-`running?` answering true immediately after a confirmed kill in another. Two
-faces of a supervisor doing exactly its job.
+Organize the app as namespaces loaded in dependency order (schema → store →
+read → intent → ui → main); `bl serve`/`bl run` loads them from the `:require`
+graph. There is no `Application.start/2` and no supervision tree to edit — one
+file, one call.
 
 ---
 
 ## 10. Verification — four rungs, cheapest first
 
-### (a) Domain tests, against a real store
+### (a) Domain tests, over a real store
 
-`test/support/myapp_case.ex`. Each suite gets its **own** redb file, and
-`async: false` — the store is a single registered name, so two suites sharing
-one file interleave transactions and produce failures that depend on
-scheduling and therefore cannot be reproduced.
+Queries take a db **value**, so most of the app is testable with no process:
+`(datom/connect schema)` opens an in-memory store, and `(datom/db conn)` is a
+value.
 
-Do not mock. datom runs fine over redb in a test, the file costs
-milliseconds, and *a query that passes against a substitute proves something
-about the substitute*.
-
-The subtlest trap in the whole harness:
-
-```elixir
-# A FUNCTION, not `Myapp.bl("datom", "basis-t", [db()])` inline.
-# The db value carries the redb handle, and a temporary in a test body stays
-# reachable from that process's stack until the body returns — so a test that
-# reads the basis and then kills the store finds the file still locked,
-# however thoroughly it asks for a collection. Inside a function the
-# reference dies on return.
-def basis, do: Myapp.bl("datom", "basis-t", [db()])
+```clojure
+(def conn (datom/connect myapp.schema/all))
+(datom/transact! conn myapp.corpus/seed)
+(is (= [["Ada"]] (vec (myapp.read/unrealised-components (datom/db conn)))))
 ```
 
-And: a query answers a set of tuples, each tuple a beam-lisp `Vector`.
-`Data.from_bl/1` converts the outer set but leaves each row a Vector, so
-`assert [["Ada"]] = q(…)` fails against `%BeamLisp.Vector{items: {"Ada"}}` —
-the same answer wearing the runtime's clothes. Convert rows once, in the
-case template.
+Do not mock. A query that passes against a substitute proves something about
+the substitute.
 
-### (b) The machine report — static, before anything runs
+### (b) The socket loop, headless
 
-`spell.machine/report` answers **data**, split by whether it blocks:
+A socket's sink is a pid, so the whole loop runs in a test with no browser and
+no channel: `mount` pushes `[:mount html]` to you; `on-commit` pushes
+`[:patch ops]`; `handle-event` is a plain call.
 
-| errors (broken now) | warnings (incomplete — expected while growing) |
-|---|---|
-| `orphan-bindings` | `unrendered-assigns` |
-| `unhandled-fires` | `unfired-events` |
-| `undeclared-template-holes` | `dead-templates` |
-| | `background-without-color` |
-
-Warnings do not block: *a machine that refuses an incomplete definition
-cannot be grown one definition at a time.* The same report is what a model
-sees when its proposal is refused.
-
-### (c) `scripts/check.exs` — the seam, without a browser
-
-```
-mix run --no-start scripts/check.exs
+```clojure
+(def me (erlang/self))
+(def st (sock/mount {:view board :shared conn :sink me :intents {:create perform}}))
+(receive [:mount html] …)
+(def st2 (sock/handle-event st [:intent :create {:title "write tests"}] {}))
+(sock/on-commit st2)
+(receive [:patch ops] …)
 ```
 
-Drives the same path a browser drives — the generated LiveView callbacks,
-`spell.server`'s walk, your performer — and asserts what comes back. Exits
-non-zero on the first failure, so it is usable as a gate. It also
-**publishes** the page, which is the step that catches a page that parses and
-cannot run: a bind with no template, a template nothing renders, an assign
-the page subscribes to and never shows.
+`test/bl/live/socket_test.bl`, `session_test.bl`, and `resume_test.bl` are the
+reference. Reconnect is testable the same way: `detach` then `attach`, and
+assert the delta — and that a guessed session id is refused.
 
-Give it its own database, and detect the collision *by name*:
+### (c) The app boundary
 
-```elixir
-if Process.whereis(:"myapp-store") do
-  IO.puts("""
-  This check needs to own its database, but the application is already
-  running one. Re-run with the application stopped:
+`test/bl/live/app_test.bl` and `app_context_test.bl` drive `live.app/router`
+directly: server-rendered HTML for a route, `/client.js`, and the `/ws`
+upgrade. Assert the frames, not a browser.
 
-      mix run --no-start scripts/check.exs
-  """)
-  System.halt(1)
-end
-```
+### (d) The examples, and a browser
 
-Without that, the failure is `{:already_started, #PID<…>}` — a message that
-describes the mechanism and not the mistake. **The fix is a flag, and nobody
-should have to read a supervisor's error to find it.**
-
-The checks worth having, in order:
-
-1. the contract and view parse
-2. the machine holds both halves
-3. the page compiles through spacetime
-4. the contract generates a compilable server half
-5. **mount computes the state WITHOUT writing** (assert the basis is unmoved)
-6. an action through the seam reaches the database
-7. a blank input is refused, and nothing is written
-8. an illegal move is refused with a sentence
-
-### (d) A browser
-
-`scripts/shot.sh <page.st> <out.png>`. Rendering is the one thing the ladder
-above cannot assert.
+`bl examples examples/live` runs every example in isolation;
+`examples/live/11-pulse-app.bl` is the worked app. Rendering is the one thing
+the rungs above cannot assert, so one browser test exists:
+`test/browser/connect.spec.js` (the session id rides every socket URL).
 
 ---
 
-## 11. AOT, or your boot is 30 seconds
+## 11. Build and ship
 
-```elixir
-compilers: Mix.compilers() ++ [:beam_lisp],
-beam_lisp: [source_dir: "src"],
+`bl build` AOT-compiles namespaces to `.beam` modules, in dependency order,
+and writes a manifest; a second run is a no-op and a body edit rebuilds exactly
+one file.
+
+```sh
+bl build src --out build
+bl build src --out build --force
 ```
 
-Without it every boot reads and compiles the domain from source, and the
-domain requires `datom` — seventeen beam-lisp files. Measured at ~30s idle
-and over three minutes under load, which is not merely slow: it is the
-difference between a durability test that spawns two child VMs and one that
-times out.
-
-`:beam_lisp` goes **after** `:elixir` — the compiler task must itself be
-compiled before Mix can find it.
+Put the built beams on a program's code path with `--code-path DIR` or
+`BEAM_LISP_CODE_PATH`. To ship one file that runs with no Erlang installed,
+`./bin/bl self-build` assembles a self-extracting `bl` drop. `bl doctor` reports
+what a machine can do before you run anything (`datom_fjall loaded`, `z3 sat`,
+…). See `docs/bl/05-shipping.md` for the flags.
 
 ---
 
@@ -887,11 +689,11 @@ ordering.
 | 3 | `read.bl` — queries over a db value | `datom/connect` in memory |
 | 4 | `store.bl` — the `defserver` | start, write, read back, restart |
 | 5 | `intent.bl` — `tx-for` pure | table-driven tests, no substrate |
-| 6 | `intent.bl` — `perform` + `register-reads!` | via the case template |
-| 7 | `ui/board.bl` — contract only | `spell.server/handle` directly |
-| 8 | `ui/board.bl` — view: markup, style, binds | `spell.machine/report` |
-| 9 | `boot.ex` — registration + emission | `scripts/check.exs` |
-| 10 | endpoint, router, layout | a browser |
+| 6 | `intent.bl` — `perform` | a socket test with a bare pid sink |
+| 7 | `ui/board.bl` — the view, a pure fn | call it with `=` on a test db |
+| 8 | `ui/board.bl` — `deflive` + intents | the socket loop, headless |
+| 9 | `main.bl` — worlds, corpus, serve | `bl serve`, open a browser |
+| 10 | router, principal, shell, theme | `app_context_test` + a browser |
 
 **Steps 1–7 need no page. Steps 1–5 need no process.** That is the dividend
 of "every query takes a value" and "every rule is a map": most of an
@@ -903,40 +705,32 @@ application is testable before any of it is wired.
 
 | trap | symptom | rule |
 |---|---|---|
-| namespaced key in a template | "undeclared hole `status`" on a `$f` template | project rows to flat, simple keys |
-| a hole in `&shell` | browser paints `` `$x` `` | shell is static; mount scalars with `st/view` |
-| no `st/each` for a list assign | diffs arrive, nothing renders | every list assign needs a bind |
-| `do!` in a mount event | every mount raises before render | mount events `read!` |
-| a reader per assign | lists from different moments | one reader, one db value |
-| reusing `db` after a write | page shows the pre-write world | fresh `(store/db)` for the read-back |
+| unkeyed list in a view | a reorder rewrites every row instead of moving one | `:key` on every list item |
+| an `:intent` expected to render | nothing happens until the commit lands | `:intent` transacts; the commit re-renders everyone |
+| a live conn not in `:observe` | the view never learns the world moved | list every conn a socket should react to |
+| reusing `db` after a write | the page shows the pre-write world | take a fresh `(datom/db conn)` |
+| a refused intent reported as success | the view says "saved", nothing wrote | read `:live/outcome`; a nil tx is a no-op |
 | bare `catch` around a write | a failing disk reads as "somebody else changed this" | discriminate on `ex-data` keys |
-| missing `datom/release!` | "Database already open. Cannot acquire lock." | release in `terminate`; idempotent |
-| db value held on a test stack | same lock error, no obvious owner | read the basis inside a *function* |
+| missing `datom/release!` | the durable store stays locked against reopening | release in `terminate`; idempotent |
+| a db value held on a test stack | the store stays locked, no obvious owner | take the db inside a *function* |
 | `(not (nil? (erlang/whereis n)))` | `running?` true for a dead name | compare against `:undefined` |
-| `Myapp.bl` on a var | case clause showing the vector | `Env.fetch!` for values |
-| `{:ok, pid} = …start!` | "no match … #PID<…>" | it returns a bare pid |
-| absent attribute in a query | entity binds nothing, blocks nothing | query absence separately; absent = unsafe |
-| empty list rendered bare | best result looks like a crash | compose a verdict sentence server-side |
+| absent attribute in a query | the entity binds nothing, blocks nothing | query absence separately; absent = unsafe |
+| empty list rendered bare | the best result looks like a crash | compose a verdict sentence server-side |
 | `Enum/*` to build a consumed stream | no streaming; buffers, or hangs on an endless upstream | build produced streams with `Stream/*` (lazy) |
-| bare `@x` in a CSS value | verse refuses `value: (deref draft);` | `(inject @x)` for the reactive arrow |
-| input value not bound to signal | second entry is `"firstsecond"` | bind `:value (inject @sig)` |
-| `<select>` with no empty option | first action refused for a visibly-selected role | first option is `""`, and says so |
-| `data-index` instead of `data-slug` | controls unwireable after a re-sort | the row carries its own identity |
-| nested `st/each` in a template | "not markup" | fixed positional slots from the read model |
-| `(get v i default)` past the end | browser shows the text `nil` | bound-check in the projection |
 | corpus without unique-identity slug | duplicates on every boot | `:db.unique/identity`, upsert |
-| suites sharing a database file | irreproducible, scheduling-dependent | one file per suite, `async: false` |
-| Boot supervised while a test swaps the store | second store grabs the lock | `:boot` switch off under test |
+| two suites sharing a store path | irreproducible, scheduling-dependent | one fjall directory per suite |
 
 ---
 
 ## See also
 
-- `projects/reel/` — the worked example every rule here came from
-- `spell/src/spell/contract.bl` — the surface, and what each clause emits
-- `spell/src/spell/server.bl` — the closed vocabulary, in one file
-- `lib/beam_lisp/spell/server.ex` — where authority lives (performers,
-  readers, the atom-table boundary)
+- `examples/live/11-pulse-app.bl` — a worked live app, start to finish
+- `examples/server/hearth.bl` — HTTP + WebSocket + auth in one file
+- `examples/data/studio.bl` — a `live.app` with routes, screens, and intents
+- `priv/lib/live/socket.bl` — `deflive`, `mount`, `on-commit`, `handle-event`
+- `priv/lib/live/app.bl` — `defscreen`, routes, guarded worlds, `serve`
+- `priv/lib/live/diff.bl`, `priv/lib/live/client.js` — the patch, both halves
+- `priv/lib/web.bl` — `serve`, `route`, `upgrade`, `sse-open`, cookies
+- `priv/lib/datom/store-fjall.bl` — the durable datom store
 - `priv/lib/datom.bl` — `q`, `pull`, `as-of`, `since`, `history`, `changes`
-- `!tasks/features/FEAT-016-*` — why a write should broadcast the *moment*
-  rather than the board, and what that unlocks
+- `docs/live-architecture.md` — the whole loop, schematically
