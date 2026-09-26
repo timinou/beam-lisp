@@ -278,8 +278,8 @@ function runs** and emits three artifacts:
 ```sh
 BEAM_LISP_Z3=/usr/bin/z3 ELIXIR_ERL_OPTIONS='+S 8:8 +SDio 8' \
   JS_ACTORS_SPLIT_ONLY=1 ./bin/bl run research/js-actors/compiler.bl   # split only, ~3 min
-node research/js-actors/verify-split.mjs                                # 21 end-to-end checks
-node research/js-actors/verify-order-parity.mjs                         # sort/compare = BEAM, 18 answers
+node research/js-actors/verify-split.mjs                                # 23 end-to-end checks
+node research/js-actors/verify-order-parity.mjs                         # sort/compare/combinators = BEAM, 29 answers
 node research/js-actors/split-server.mjs --port 8791                    # then open http://127.0.0.1:8791/
 ```
 
@@ -308,61 +308,104 @@ oracles to agree, per function, plus the app's own word:
   terminates, over every clause;
 * **abi** — this emitter's ANF: no `host/…` leaf, no process/output verb, no
   `receive`, nothing outside the checked ABI — inside every lambda too;
-* **values** — the value discipline below;
+* **values** — the closure flow below: every call cycle provably finite;
 * **not `:private`**, and every local callee portable.
 
-**Client code may call function values.** `arrange` (showcase.bl:177) looks
-up a key function and a comparator in `(orderings)` — a keyword, the named
-functions `by-title`/`open-first`, lambdas, `compare` — and calls them through
-`sort-by`. That is admitted without a general termination proof because:
+**Client code is higher order.** Function values may be created, stored in
+data, composed and called: `arrange` (showcase.bl) calls a key function and a
+comparator it looks up in `(orderings)`; the refine chips are predicates built
+with `complement`, `partial`, `comp` and a function-returning function
+(`ends-with`), and `all-of` folds the chosen ones into ONE predicate —
+`(reduce (fn [p q] (fn [x] (and (p x) (q x)))) (constantly true) preds)` —
+that `filterv` calls. Recursion over data is allowed too (a tree walk is a
+recursive function). What the build must prove is that **every call chain is
+finite**, and it does so with a whole-app **closure-flow analysis**
+(`compiler.bl`, "function values: closure flow"):
 
-* **closed world** — every function value in the browser was created by the
-  program or is data (a keyword/collection call is a lookup); the wire and the
-  UI deliver data only, and the Worker accepts only event names the last
-  rendered view offered;
-* **no recursion** — a function that names itself, or sits on a cycle of the
-  app's reference graph (calls *and* values), is refused (`recursive`);
-* **rank one** — a function VALUE (a lambda, or a named function used as a
-  value) never calls a function it receives: not directly, not by handing it
-  to a runtime higher-order function (positions *derived* from `runtime.bl`),
-  not through a named function that does (`higher-order-value`). Anything not
-  provably a local lambda or a named function counts as received.
+* **which function can each call reach?** A 0-CFA over the app's ANF. Abstract
+  values are named functions, lambdas (per site), closures a combinator
+  returned (per call site, with what they captured) and runtime functions used
+  as values; a function value stored in data joins one heap set, and anything
+  read out of data may be any member. The shell calls every root with data.
+* **the runtime is modeled, not trusted blindly.** For every `runtime.bl`
+  function the build *derives* which argument positions it calls now, which a
+  returned closure calls later, whether it calls a function found in data,
+  and which argument positions it may return — least fixpoints over the
+  compiled runtime, failing closed when unconverged. Host leaves that call
+  what they are handed (`make-frames`, `run-turn`) count as calling anything.
+* **the call graph must have no unproven cycle.** Every call site adds edges
+  from the calling node (a function, a lambda, a combinator closure) to every
+  value it may call. A cycle is admitted only by one of two proofs:
+  * **capture order** — every call inside the cycle calls a value the calling
+    closure *captured* (a free local, or a part read from one). A captured
+    value existed before the closure that holds it, so each such call reaches
+    a strictly older value, and data is immutable and acyclic: no infinite
+    chain. This admits `all-of`, whose closures call closures of their own
+    kind (`(both (both p q) r)`).
+  * **structural descent** — some parameter of every function in the cycle
+    (its measure) never grows on a call inside the cycle and strictly shrinks
+    around every cycle: the call passes a field of it (`(:kids t)`), an
+    element (via `mapv`/`filterv`/`reduce`/`sort-by`/… — which runtime
+    function hands its function *elements* of which argument is a checked
+    table), or the rest of it under a non-empty guard (`(seq xs)`). A lookup
+    that may miss (`(:next t)` is nil at the end) counts only on a path where
+    it was tested truthy. Data is finite, so the measure cannot shrink forever.
 
-So computed calls happen only in named functions called by name, down an
-acyclic graph, and each calls a value that makes no computed call of its own:
-the call tree is finite. Loops still need the analyzer's proof, which now
-requires each measure to be bounded **on the recur's own path**
-(`(loop [i 0] (recur (dec i)))` is refused). The manifest marks `arrange`
-*calls values* and `by-title`/`open-first` *a value*.
+  Anything else is refused as `recursive`, naming the cycle:
+  `(fn [x] (x x))` applied to itself, a Y combinator, the same knot tied
+  through `comp`/`partial`/`juxt`/`apply`/maps/vectors/rest lists, mutual
+  recursion through named values, `(defn walk-down [xs] (mapv (fn [x]
+  (walk-down [x])) xs))` (rebuilding its input), unguarded `(rest xs)`.
+
+Effects are still checked separately (footprint **and** latent footprint:
+what every function value a function creates or names would do when called),
+and loops by the analyzer's own proof, which requires each measure bounded
+**on the recur's own path** by a **loop-invariant** bound, and a `rest`/`next`
+step only under a non-empty guard (`(loop [s [1]] (recur (rest s)))` and a
+bound recomputed from a growing collection are refused). The manifest marks
+each function *calls values*, *a value*, and — when it takes part in an
+admitted recursion — which proof admitted it.
 
 `sort`, `sort-by` and `compare` on this target give **BEAM's answers**:
 `rt-sort` is a port of OTP `lists:sort/2` (the same comparator calls in the
 same order, so strict and non-order comparators agree too), `rt-compare` is BL's
-total order with strings by code point. `order-parity.bl` runs on both
-targets; the build writes BEAM's 18 answers and `verify-order-parity.mjs`
-requires the JS run to match them (a naive stable sort and a UTF-16 string
-order each fail it). Maps and sets have no order here: comparing one raises.
+total order with strings by code point. The combinators (`comp`, `partial`,
+`juxt`, `complement`, `constantly`, `identity`, `apply`) and the prelude they
+travel with (`every?`, `remove`, `keep`, `mapcat`, `group-by`, `frequencies`,
+`get-in`/`assoc-in`/`update-in`, `take`, `range`, …) are BL in `runtime.bl`,
+written clause for clause after core. `order-parity.bl` runs on both targets;
+the build writes BEAM's 29 answers and `verify-order-parity.mjs` requires the
+JS run to match them (a naive stable sort and a UTF-16 string order each fail
+it). Maps and sets have no order here: comparing one raises. **Known
+divergence:** an EMPTY lazy result (`(keep f [])`, `(range 0)`, `(remove f
+[])`) is on BEAM a lazy seq that is `=` to nil yet prints `()` and is truthy;
+here it is the empty list `()` (truthy, not `=` nil). Non-empty results agree.
 
 Anything else **refuses the build**, naming the path. Each is a real fixture in
 `compiler.bl/split-tests` (the actual app, one edit away from a leak):
 
 ```
-split: board-view cannot run in the browser: board-view (showcase.bl:236)
-  → flagged-title? (showcase.bl:95) → blocked-words (showcase.bl:81)
+split: board-view cannot run in the browser: board-view (showcase.bl:279)
+  → flagged-title? (showcase.bl:96) → blocked-words (showcase.bl:82)
   — private declared :private in :server
-split: … board-view → plural — host-call host/write at line 190
-split: … board-view → plural — effect send at line 190
-split: … board-view → plural — higher-order-value a function value calls a function it receives at line 190
-split: … board-view → plural — recursive calls itself at line 190
-split: … board-view → plural → ping — recursive on a cycle of references
-split: … board-view → plural → walk-down — recursive calls itself at line 287
-split: … board-view — higher-order-value arrange is used as a value, but calls a function it receives at line 262
+split: … board-view → plural — host-call host/write at line 233
+split: … board-view → plural — effect send at line 233
+split: … board-view → plural — recursive on a call cycle plural → plural (no argument shrinks on every call around it)
+split: … board-view → plural → ping — recursive on a call cycle ping → pong → ping (…)
+split: … board-view → plural → walk-down — recursive on a call cycle walk-down → fn@334 → walk-down (…)
+split: … board-view → plural — recursive on a call cycle fn@233 → fn@233 (…)      # ((fn [x] (x x)) (fn [x] (x x)))
+split: … board-view → plural — recursive on a call cycle …                          # the same knot through comp
 ```
+
+and four higher-order fixtures that must be **admitted**: a lambda that calls
+the function it receives, a named function that calls values passed around as
+a value, `juxt`/`comp`/`partial`/`complement`/`apply` built and called, and a
+recursive tree walk `(defn depth [t] (inc (reduce … 0 (mapv depth (:kids t)))))`.
 
 plus malformed wire types, unknown or wrong-arity roots, and names that would
 shadow the runtime. Because each half is emitted as its **own** bundle from its
 own closure, server-only code and literals are absent from the client bundle by
-construction (`verify-split.mjs` greps for them). The browser gets 23 of the 31
+construction (`verify-split.mjs` greps for them). The browser gets 30 of the 38
 app functions.
 
 **The server stays the authority.** A proposal is
@@ -391,7 +434,8 @@ text only via `textContent`, attributes through an allowlist), links the Worker
 to `POST /api/intent` and the SSE stream, and shows the placement lanes with
 per-function evidence, the generated contract, and a timeline of where each
 step ran. Open a second tab: its commits arrive as server snapshots. Sort
-buttons re-order rows locally (rows glide to their new place).
+buttons re-order rows locally (rows glide to their new place); refine chips
+narrow the list through one composed predicate, locally.
 
 Verified in a real browser (two tabs, one authority): local filter with no
 revision change; in-browser duplicate refusal with the draft kept; server-only
@@ -402,13 +446,13 @@ another tab arrives already in the chosen order; an event name the view did
 not offer is refused by the Worker.
 
 **Limits, stated.** No authentication (single-user loopback). One app per
-file; only `defn`s besides the declaration. Client function values are rank
-one: a lambda that calls a function it receives (`(fn [g] (g x))`, `comp`,
-`partial`) is refused, and so is any recursion — a tree walk must be a loop
-over an explicit sequence. `(let [f inc] (mapv f xs))` inside a function used
-as a value is refused too (aliases of named functions are not tracked). Client
-code uses the collection prelude in `runtime.bl`; ordering of maps and sets is
-refused. The wire grammar is closed:
+file; only `defn`s besides the declaration. The closure flow is a 0-CFA: one
+heap set for all data, so a program that stores a function in data and reads a
+DIFFERENT one back may be refused for a cycle it cannot actually take
+(conservative, never unsound). Recursion is admitted by capture order or by
+structural descent over one parameter; lexicographic or size-sum measures are
+not tried. `lower-case`/`upper-case` are not offered (JS and BEAM case maps
+differ, e.g. final sigma). Ordering of maps and sets is refused. The wire grammar is closed:
 `text`, `int`, `bool`, `list`, `record` and named references. This is a
 build-time partition of one app, not general Loom/Live placement, and a Worker
 is not a sandbox.

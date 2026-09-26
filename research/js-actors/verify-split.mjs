@@ -57,6 +57,15 @@ for (const v of ['open-first', 'by-title']) {
 assert.ok(client.includes('"js/arrange"') && client.includes('"js/rt-sort-by"'));
 ok('a function that calls function values is admitted to the browser, with its evidence');
 
+// Higher order: predicates built by combinators and folded into one.
+for (const n of ['chips', 'all-of', 'chip-filter', 'ends-with', 'longer-than']) assert.equal(fn(n).placement, 'client', n);
+assert.equal(fn('all-of').evidence['calls-values'], true);
+assert.equal(fn('all-of').evidence.recursion, 'capture-order', 'the fold composes closures of its own kind');
+assert.equal(fn('longer-than').evidence['used-as-value'], true, 'handed to partial');
+for (const rt of ['core-comp', 'core-partial', 'core-complement', 'core-constantly'])
+  assert.ok(client.includes(`"js/${rt}"`), rt);
+ok('predicates composed with comp/partial/complement and a returned closure run in the browser');
+
 for (const needle of ['api key', 'blocked-words', 'flagged-title', 'contains-word', 'initial-board',
                       'log-entry', ':audit', 'next-id', '"js/add-task"'])
   assert.equal(client.includes(needle), false, `client bundle leaks ${needle}`);
@@ -309,6 +318,21 @@ mark = frames.length;
 tell({ kind: 'event', event: [':order', ':added'] });
 await next('view', mark);
 ok('sort orders are function values called in the browser: every order right, no network');
+
+// Refine chips: each is a composed predicate; active chips fold into one.
+const allRows = () => rowTitles(frames.filter(f => f.topic === 'view').at(-1).value.tree);
+const everyRow = allRows();
+const chipTo = async (k) => { mark = frames.length; tell({ kind: 'event', event: [':chip', k] }); return (await next('view', mark)).value; };
+view = await chipTo(':open');
+assert.deepEqual(rowTitles(view.tree), everyRow.filter(t => t !== added[0]), 'open: (complement :done)');
+view = await chipTo(':long');
+assert.deepEqual(rowTitles(view.tree), everyRow.filter(t => t !== added[0] && t.length > 20), 'open AND long: (partial longer-than 20)');
+view = await chipTo(':open');
+assert.deepEqual(rowTitles(view.tree), everyRow.filter(t => t.length > 20), 'long only, after toggling open off');
+view = await chipTo(':long');
+assert.deepEqual(rowTitles(view.tree), everyRow, 'no chip: (constantly true)');
+assert.equal(frames.slice(mark).some(f => f.topic === 'propose'), false);
+ok('refine chips fold composed predicates into one, in the browser, with no network');
 
 // Another tab wins: a toggle proposed against an old revision is rebased.
 mark = frames.length;

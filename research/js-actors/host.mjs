@@ -65,6 +65,13 @@ export function listFromArray(a) {
   for (let i = a.length - 1; i >= 0; i--) l = new Cons(a[i], l);
   return l;
 }
+/** `apply`'s final argument, as BEAM's seq_to_args reads it: nil, a list or
+ *  a vector. Anything else is not a sequence. */
+export function seqToArray(x) {
+  if (x === null || x === undefined) return [];
+  if (isVec(x)) return vecItems(x).slice();
+  return listToArray(x);
+}
 export function listToArray(l) {
   const out = [];
   let p = l;

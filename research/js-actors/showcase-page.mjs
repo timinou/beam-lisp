@@ -282,6 +282,7 @@ function showEvidence(f, btn) {
     evidenceLine('values', f.evidence.values),
     evidenceLine('role', [f.evidence['calls-values'] ? 'calls function values' : '',
                           f.evidence['used-as-value'] ? 'used as a value' : ''].filter(Boolean).join(' · ') || 'first-order', 'plain'),
+    evidenceLine('recurs', f.evidence.recursion ? `yes — finite by ${f.evidence.recursion}` : 'no', 'plain'),
     evidenceLine('private', f.evidence.private ? 'declared :private' : 'no'),
     evidenceLine('portable', f.portable ? 'yes' : `no — ${f.why.reason}${f.why.detail ? ' ' + f.why.detail : ''}`),
     evidenceLine('calls', f.calls.length ? f.calls.join(', ') : '—', 'plain'));
@@ -300,10 +301,11 @@ async function explain() {
       const b = document.createElement('button');
       b.className = 'fn';
       b.type = 'button';
-      b.textContent = f.name;
+      b.append(Object.assign(document.createElement('span'), { className: 'name', textContent: f.name }));
       const badge = (cls, text) => Object.assign(document.createElement('span'), { className: 'badge ' + cls, textContent: text });
       if (f.evidence['calls-values']) b.append(badge('calls', 'calls values'));
       if (f.evidence['used-as-value']) b.append(badge('value', 'a value'));
+      if (f.evidence.recursion) b.append(badge('rec', 'recursion: ' + f.evidence.recursion));
       if (!f.portable) {
         const why = document.createElement('div');
         why.className = 'why';
