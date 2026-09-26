@@ -36,7 +36,7 @@ defmodule BeamLisp.DevHotpatch do
     normalized = Enum.map(names, &to_string/1)
     Enum.each(normalized, fn name ->
       hotpatch_ns!(name, source_root)
-      BeamLisp.Generation.record_hotpatch([name])
+      record_hotpatch([name])
     end)
     :ok
   end
@@ -51,6 +51,17 @@ defmodule BeamLisp.DevHotpatch do
       "" -> :ok
       names -> hotpatch!(names)
     end
+  end
+
+  # The hotpatch set lives in `vm.generation` now — the one beam-lisp
+  # implementation. This Elixir caller is TRANSITIONAL: it loads the namespace
+  # and invokes the BL function directly, until DevHotpatch itself is ported
+  # (PLAN-150). The set is process-global (`:persistent_term`), keyed the same
+  # as the transitional `BeamLisp.Generation`, so its `receipt/0` still reports
+  # what this records.
+  defp record_hotpatch(names) do
+    BeamLisp.Loader.ensure_loaded("vm.generation")
+    apply(BeamLisp.Ns.Vm.Generation, :record_hotpatch, [names])
   end
 
   defp hotpatch_ns!(name, source_root) do
