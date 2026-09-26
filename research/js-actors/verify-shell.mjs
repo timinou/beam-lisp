@@ -89,6 +89,20 @@ try {
   assert.equal((await get('/apps/showcase.css')).status, 404);
   ok('path traversal and unlisted app paths are 404');
 
+  // the read APIs answer GET only: a POST to /api/events must not open a stream
+  for (const path of ['/api/events', '/api/app', '/api/me', '/api/peek'])
+    assert.equal((await fetch(base + path, { method: 'POST' })).status, 405, path);
+  // a body naming serde's private number key is refused, not reshaped into a number
+  const serde = await fetch(base + '/api/intent', { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: '{"request":{"$serde_json::private::Number":"1"},"revision":0,"digest":"x","nonce":"shelltab01:1","op":"add-task","args":{}}' });
+  assert.equal(serde.status, 400);
+  assert.equal((await serde.json()).reason, 'malformed-json');
+  // a refused write answers before its body is read, and the connection stays usable
+  const refused = await fetch(base + '/api/intent', { method: 'POST', headers: { 'content-type': 'application/json', origin: 'http://evil.test' }, body: '{}' });
+  assert.equal(refused.status, 403);
+  assert.equal((await get('/api/app')).status, 200);
+  ok('read APIs are GET-only; a serde number-token body and a foreign Origin are refused cleanly');
+
 } catch (error) {
   failure = error;
 } finally {
