@@ -11,7 +11,7 @@
 // worker → page:  {kind:'ready'|'view'|'propose'|'trace'|'fatal'|'error', …}
 
 import * as H from './host.mjs';
-import { createCodec, encode, frameToBL } from './split-codec.mjs';
+import { createCodec, encode, frameToBL, helloToBL, presenceToBL } from './split-codec.mjs';
 
 const params = new URL(import.meta.url).searchParams;
 const app = /^[a-z][a-z0-9-]{0,31}$/.test(params.get('app') || '') ? params.get('app') : 'showcase';
@@ -36,12 +36,22 @@ function encodeView(x) {
   if (H.isBMap(x)) {
     const out = {};
     for (const k of H.listToArray(H.mapKeys(x))) {
-      const name = H.kwName(k);
+      const name = H.isKw(k) ? H.kwName(k) : String(k);
       const v = H.mapGet(x, k);
-      if (HANDLER.test(name) && H.isVec(v)) {
-        const items = H.vecItems(v);
+      const handler = items => {
         if (items.length > 0 && H.isKw(items[0])) offering.add(H.kwName(items[0]));
-        out[name] = items.map(tagItem);
+        return items.map(tagItem);
+      };
+      if (HANDLER.test(name) && H.isVec(v)) {
+        out[name] = handler(H.vecItems(v));
+      } else if (name === 'keys' && H.isBMap(v)) {
+        // `:keys {"j" [:next] …}`: each value is a handler, offered like one
+        const keys = {};
+        for (const kk of H.listToArray(H.mapKeys(v))) {
+          const ev = H.mapGet(v, kk);
+          if (typeof kk === 'string' && H.isVec(ev)) keys[kk] = handler(H.vecItems(ev));
+        }
+        out[name] = keys;
       } else {
         out[name] = encodeView(v);
       }
@@ -77,7 +87,7 @@ function itemToBL(v) {
   throw new Error('UI event item is not a bounded scalar');
 }
 function eventToBL(event) {
-  if (!Array.isArray(event) || event.length < 1 || event.length > 3 ||
+  if (!Array.isArray(event) || event.length < 1 || event.length > 4 ||
       !(event[0] && offered.has(event[0].k)))
     throw new Error('the view offers no such event');
   return H.vec(event.map(itemToBL));
@@ -91,15 +101,28 @@ globalThis.onmessage = ({ data }) => {
     if (!codec) throw new Error('contract not loaded');
     if (data.kind === 'hello') {
       if (typeof data.tab !== 'string' || !/^[a-z0-9]{8,32}$/.test(data.tab)) throw new Error('hello needs a tab id');
-      H.enqueueData('hello', H.bmap([[H.kw('digest'), String(data.frame.digest)],
-                                     [H.kw('tab'), data.tab],
-                                     [H.kw('revision'), data.frame.revision],
-                                     [H.kw('board'), codec.decodeSnapshot(data.frame.board)]]));
+      // The identity/history fields ride along when the transport supplied them:
+      // the BL client reads :me, :people, :recent and :history from this map.
+      H.enqueueData('hello', helloToBL(codec, data.frame, data.tab));
+      return;
+    }
+    if (data.kind === 'presence') {
+      // Who has the app open right now, as the server last reported it. The BL
+      // client keeps it in `sync` and renders none of it by itself.
+      H.enqueueData('presence', presenceToBL(data));
       return;
     }
     if (data.kind === 'result' || data.kind === 'snapshot') { H.enqueueData(data.kind, frameToBL(codec, data.frame)); return; }
     if (data.kind === 'unreachable' && Number.isSafeInteger(data.request)) { H.enqueueData('unreachable', data.request); return; }
     if (data.kind === 'online' || data.kind === 'offline') { H.enqueueData(data.kind, ''); return; }
+    if (data.kind === 'asof') {
+      // a past board the server kept (GET /api/peek), decoded by contract; no
+      // board = back to live. The BL client decides what "read-only" means.
+      const past = data.board ? codec.decodeSnapshot(data.board) : null;
+      H.enqueueData('asof', past && Number.isSafeInteger(data.revision)
+        ? H.bmap([[H.kw('revision'), data.revision], [H.kw('board'), past]]) : H.bmap([]));
+      return;
+    }
   } catch (error) {
     postMessage({ kind: 'error', text: String(error.message || error) });
   }

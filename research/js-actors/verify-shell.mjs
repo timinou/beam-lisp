@@ -22,6 +22,17 @@ const here = new URL('./', import.meta.url);
 let passed = 0;
 const ok = label => { passed++; console.log('PASS shell: ' + label); };
 
+// The page and the Worker are loaded by a browser, never imported by the Node
+// suites: a syntax error in them would pass every other check. Parse them.
+{
+  const { spawnSync } = await import('node:child_process');
+  for (const f of ['showcase-page.mjs', 'split-worker.mjs', 'split-codec.mjs', 'split-session.mjs', 'host.mjs']) {
+    const r = spawnSync(process.execPath, ['--check', new URL(f, import.meta.url).pathname], { encoding: 'utf8' });
+    assert.equal(r.status, 0, `${f} does not parse: ${r.stderr}`);
+  }
+  ok('the page, Worker, codec, session and host modules parse');
+}
+
 const service = await startSplitServer({ port: 0 });
 const base = `http://127.0.0.1:${service.port}`;
 const get = async (path, headers) => {

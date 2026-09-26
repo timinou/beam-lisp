@@ -16,7 +16,7 @@ const appRoot = $('app');
 // contract are all keyed by this name, so it is resolved before anything else.
 const APP = await fetchAppName();
 
-const ATTRS = new Set(['class', 'type', 'value', 'placeholder', 'maxlength', 'disabled',
+const ATTRS = new Set(['class', 'type', 'value', 'placeholder', 'maxlength', 'disabled', 'tabindex',
                        'aria-label', 'aria-pressed',
                        'title', 'role', 'aria-expanded', 'aria-level', 'aria-current', 'data-depth']);
 
@@ -47,7 +47,41 @@ function glideRows(before) {
 const TAGS = new Set(['section', 'header', 'footer', 'nav', 'div', 'h1', 'h2', 'p', 'strong', 'small',
                       'span', 'ul', 'li', 'button', 'input',
                       'ol', 'h3', 'label', 'em', 'code', 'kbd', 'article', 'aside']);
-const EVENTS = { 'on-click': 'click', 'on-input': 'input', 'on-enter': 'keydown', 'on-escape': 'escape' };
+const EVENTS = { 'on-click': 'click', 'on-input': 'input', 'on-enter': 'keydown', 'on-escape': 'escape',
+                 'on-dblclick': 'dblclick', 'on-blur': 'blur', 'on-drop': 'drop' };
+
+// ── the interaction grammar ──────────────────────────────────────────────────
+//
+// A view declares interaction as DATA, never code:
+//   :keys {"j" [:next] "Enter" [:open]}   on any element: while it is in the
+//        page, pressing that key (outside a text field, no Ctrl/Alt/Meta)
+//        sends that event. Keys are one printable character or a named key.
+//   :on-dblclick [..]  :on-blur [..]       as they say
+//   :drag "k"  + :on-drop [:move]          a row with :drag can be dragged;
+//        dropping it on an element with :on-drop sends [:move dragged target]
+//        — the two :drag keys, as strings. A drop on the row itself is none.
+//   :focused true                          the element takes focus when the
+//        view marks it so (keyboard selection that follows the data)
+const KEYNAMES = new Set(['Enter', 'Escape', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Delete', 'Backspace', 'Home', 'End', '?', '/']);
+const keyOk = k => typeof k === 'string' && (KEYNAMES.has(k) || /^[a-z0-9]$/.test(k));
+let keymap = new Map();
+function collectKeys(node, into) {
+  if (!Array.isArray(node)) return;
+  if (isElement(node)) {
+    const ks = node[1].keys;
+    if (ks && typeof ks === 'object' && !Array.isArray(ks))
+      for (const [k, ev] of Object.entries(ks)) if (keyOk(k) && Array.isArray(ev)) into.set(k, ev);
+    node.slice(2).forEach(c => collectKeys(c, into));
+  } else node.forEach(c => collectKeys(c, into));
+}
+document.addEventListener('keydown', e => {
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+  const ev = keymap.get(e.key.length === 1 ? e.key.toLowerCase() === e.key ? e.key : null : e.key);
+  if (ev) { e.preventDefault(); send(ev); }
+});
+let dragging = null;
 
 const worker = new Worker(`./split-worker.mjs?app=${APP}`, { type: 'module' });
 // Names this tab to the transport so the timeline can tell "another tab" from
@@ -82,6 +116,10 @@ function keyOf(node, i) {
 }
 
 function create(node) {
+  // an element-shaped node whose tag is not allowed is a view bug: say so,
+  // rather than printing "[object Object]" into the page
+  if (!isElement(node) && Array.isArray(node) && typeof node[0] === 'string' && node[1] && typeof node[1] === 'object' && !Array.isArray(node[1]))
+    throw new Error(`view uses <${node[0]}>, which this page does not render`);
   if (!isElement(node)) return document.createTextNode(String(node));
   const el = document.createElement(node[0]);
   if (state.rendered > 0) el.dataset.fresh = '1';
@@ -102,20 +140,69 @@ function bind(el, attrs) {
     slot = { actions: {} };
     state.handlers.set(el, slot);
     el.addEventListener('click', () => { const a = slot.actions.click; if (a) send(a); });
-    el.addEventListener('input', () => { const a = slot.actions.input; if (a) send([...a, { s: el.value }]); });
+    el.addEventListener('input', () => {
+      const a = slot.actions.input;
+      if (!a) return;
+      // remember what this field told the view; renders that echo an OLDER
+      // one of these must not overwrite newer typing (see patch)
+      (slot.sent ||= []).push(el.value);
+      if (slot.sent.length > 64) slot.sent.shift();
+      send([...a, { s: el.value }]);
+    });
     el.addEventListener('keydown', e => {
       const a = e.key === 'Enter' ? slot.actions.keydown : e.key === 'Escape' ? slot.actions.escape : null;
-      if (a) { e.preventDefault(); send(a); }
+      if (a) { e.preventDefault(); e.stopPropagation(); send(a); }
+    });
+    el.addEventListener('dblclick', () => { const a = slot.actions.dblclick; if (a) send(a); });
+    // a blur the reconciler causes (it removed or re-parented the focused
+    // field) is not the user leaving it: only a blur outside a render counts
+    el.addEventListener('blur', () => { const a = slot.actions.blur; if (a && !rendering && el.isConnected) send(a); });
+    el.addEventListener('dragstart', e => {
+      if (!slot.drag) return;
+      dragging = slot.drag;
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', slot.drag);
+      el.classList.add('dragging');
+    });
+    el.addEventListener('dragend', () => { dragging = null; el.classList.remove('dragging'); });
+    el.addEventListener('dragover', e => {
+      if (slot.actions.drop && dragging && dragging !== slot.drag) { e.preventDefault(); el.classList.add('drop-over'); }
+    });
+    el.addEventListener('dragleave', () => el.classList.remove('drop-over'));
+    el.addEventListener('drop', e => {
+      el.classList.remove('drop-over');
+      const a = slot.actions.drop;
+      if (!a || !dragging || dragging === slot.drag) return;
+      e.preventDefault();
+      send([...a, { s: dragging }, { s: slot.drag || '' }]);
+      dragging = null;
     });
   }
   slot.actions = actions;
+  // a draggable element carries its key as a string; nothing else is sent
+  slot.drag = typeof attrs.drag === 'string' && attrs.drag.length <= 64 ? attrs.drag : null;
+  el.draggable = slot.drag !== null;
+  if (attrs.focused === true && document.activeElement !== el) queueMicrotask(() => { if (el.isConnected) el.focus({ preventScroll: false }); });
 }
 
 function patch(el, node) {
   const attrs = node[1];
   for (const name of ATTRS) {
     const v = attrs[name];
-    if (name === 'value') { if (el.value !== String(v ?? '')) el.value = String(v ?? ''); continue; }
+    if (name === 'value') {
+      const want = String(v ?? '');
+      const slot = state.handlers.get(el);
+      const sent = slot && slot.sent;
+      // The Worker answers keystrokes in order but behind them: while a field
+      // is focused, a view value that is one of the values this field already
+      // sent is an echo — drop it and every older one, keep what is typed.
+      // Any other value (cleared after submit, a new edit) is the view's.
+      const i = sent ? sent.lastIndexOf(want) : -1;
+      if (i >= 0 && document.activeElement === el) { sent.splice(0, i + 1); continue; }
+      if (sent) sent.length = 0;
+      if (el.value !== want) el.value = want;
+      continue;
+    }
     if (name === 'disabled') { el.disabled = v === true; continue; }
     if (v === undefined || v === null || v === false && !name.startsWith('aria-')) el.removeAttribute(name);
     else el.setAttribute(name, String(v));
@@ -145,9 +232,17 @@ function patch(el, node) {
   while (el.childNodes.length > next.length) el.removeChild(el.lastChild);
 }
 
+let rendering = false;
 function render(tree) {
+  rendering = true;
+  try { renderTree(tree); } finally { rendering = false; }
+}
+function renderTree(tree) {
   if (!isElement(tree)) throw new Error('view root is not an element');
   const before = rememberRows();
+  const keys = new Map();
+  collectKeys(tree, keys);
+  keymap = keys;
   if (!appRoot.firstChild || appRoot.firstChild.tagName.toLowerCase() !== tree[0]) {
     appRoot.replaceChildren(create(tree));
   } else {
@@ -234,6 +329,7 @@ async function propose(proposal) {
     return;
   }
   log('wire', `${proposal.op} ← ${body.ok ? 'ok' : body.reason}`);
+  if (body.ok) scrubTo(body.revision);
   worker.postMessage({ kind: 'result', frame: { ...body, request: proposal.request } });
 }
 
@@ -244,11 +340,17 @@ function connect() {
     const frame = JSON.parse(e.data);
     if (state.revision === null) { worker.postMessage({ kind: 'hello', frame, tab: TAB }); log('server', `hello rev ${frame.revision}`); }
     else worker.postMessage({ kind: 'snapshot', frame });
+    scrubTo(frame.revision);
     setLink('live', 'live · rev ' + frame.revision);
     goOnline();
   });
+  events.addEventListener('presence', e => {
+    const p = JSON.parse(e.data);
+    worker.postMessage({ kind: 'presence', people: p.people });
+  });
   events.addEventListener('snapshot', e => {
     const { by, ...frame } = JSON.parse(e.data);
+    scrubTo(frame.revision);
     // this tab's own commit reaches it through the POST result; the echo is
     // skipped so the timeline shows each commit once
     if (by !== TAB) worker.postMessage({ kind: 'snapshot', frame });
@@ -280,7 +382,7 @@ worker.onmessage = ({ data }) => {
     case 'view': {
       const prev = state.revision;
       state.revision = v.revision;
-      render(v.tree);
+      try { render(v.tree); } catch (error) { log('browser', 'render error: ' + error.message); return; }
       if (prev !== null && prev !== v.revision) {
         appRoot.classList.remove('flash'); void appRoot.offsetWidth; appRoot.classList.add('flash');
       }
@@ -436,6 +538,78 @@ explainButton.addEventListener('click', () => setExplained(mainEl.classList.cont
 describe().catch(() => {});
 
 explain().catch(error => { $('evidence').textContent = 'manifest unavailable: ' + error.message; });
+
+// ── who and when: sign-in and the history scrubber ───────────────────────────
+//
+// Shown only for an app whose contract says it has people / history. Signing
+// in is the transport's (an HttpOnly cookie the page never sees); the page
+// reloads so the Worker starts with the new identity from a fresh hello.
+// The scrubber asks the server for a past board (GET /api/peek) and hands it
+// to the BL client, which renders it read-only.
+
+async function setupPeople(contract) {
+  if (!contract.people) return;
+  const me = await (await fetch('/api/me', { cache: 'no-store' })).json();
+  const bar = $('who');
+  bar.hidden = false;
+  const label = Object.assign(document.createElement('span'), { textContent: me.person ? 'signed in as' : 'sign in as' });
+  bar.append(label);
+  for (const p of me.people) {
+    const b = Object.assign(document.createElement('button'), { type: 'button', textContent: p.name,
+      className: me.person && me.person.id === p.id ? 'on' : '', title: `${p.name} · ${p.role}` });
+    b.addEventListener('click', async () => {
+      await fetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ user: p.id }) });
+      location.reload();
+    });
+    bar.append(b);
+  }
+  if (me.person) {
+    const out = Object.assign(document.createElement('button'), { type: 'button', textContent: 'Sign out' });
+    out.addEventListener('click', async () => { await fetch('/api/logout', { method: 'POST' }); location.reload(); });
+    bar.append(out);
+  }
+}
+
+let historyApp = false;
+let viewingPast = false;
+function scrubTo(revision) {
+  if (!historyApp || typeof revision !== 'number') return;
+  const range = $('scrub-range');
+  const atEnd = !viewingPast;
+  range.max = String(revision);
+  range.min = String(Math.max(0, revision - 50));
+  if (atEnd) { range.value = String(revision); $('scrub-label').textContent = `live · rev ${revision}`; }
+}
+function setupHistory(contract) {
+  if (!contract.history) return;
+  historyApp = true;
+  $('scrub').hidden = false;
+  const range = $('scrub-range');
+  const live = () => {
+    viewingPast = false;
+    $('scrub').classList.remove('past');
+    $('scrub-live').hidden = true;
+    range.value = range.max;
+    $('scrub-label').textContent = `live · rev ${range.max}`;
+    worker.postMessage({ kind: 'asof' });
+  };
+  range.addEventListener('input', async () => {
+    const k = Number(range.value);
+    if (k >= Number(range.max)) { live(); return; }
+    const past = await (await fetch(`/api/peek?revision=${k}`, { cache: 'no-store' })).json();
+    if (!past.board) { $('scrub-label').textContent = `rev ${k} · not kept`; return; }
+    viewingPast = true;
+    $('scrub').classList.add('past');
+    $('scrub-live').hidden = false;
+    $('scrub-label').textContent = `viewing rev ${k} · read-only`;
+    worker.postMessage({ kind: 'asof', revision: k, board: past.board });
+  });
+  $('scrub-live').addEventListener('click', live);
+}
+
+fetch(`./out/${APP}.contract.json`, { cache: 'no-store' }).then(r => r.json())
+  .then(c => { setupPeople(c); setupHistory(c); })
+  .catch(error => log('browser', 'contract unavailable: ' + error.message));
 
 // A test hook, read-only: the page's own state, never a way to change the app.
 window.splitShowcase = Object.freeze({

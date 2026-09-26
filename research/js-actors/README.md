@@ -281,6 +281,9 @@ BEAM_LISP_Z3=/usr/bin/z3 ELIXIR_ERL_OPTIONS='+S 8:8 +SDio 8' \
 node research/js-actors/verify-split.mjs                                # 28 end-to-end checks
 node research/js-actors/verify-outline.mjs                              # the nested-plan app, 22 checks
 node research/js-actors/verify-groceries.mjs                            # instant + offline, 22 checks
+node research/js-actors/verify-team.mjs                                 # identity, permissions, history, replay
+node research/js-actors/verify-session.mjs                              # session cookies, log parsing
+node research/js-actors/verify-triage.mjs                               # keys, drag-and-drop, inline edit
 node research/js-actors/verify-shell.mjs                                # the shared page/server shell
 node research/js-actors/verify-order-parity.mjs                         # sort/compare/combinators = BEAM, 30 answers
 node research/js-actors/split-server.mjs --port 8791                    # then open http://127.0.0.1:8791/
@@ -299,6 +302,8 @@ evidence, timeline, contract) collapses to give the app the whole width.
 |---|---|---|
 | `showcase.bl` — launch board | placement, shared checks, rebase, function values, composed predicates | `verify-split.mjs`, [proof/track1-higher-order.png](proof/track1-higher-order.png) |
 | `apps/groceries.bl` — shared shopping list | **instant edits, confirmed by the server; works offline**: predictions, slide-back on refusal, server-adjusted results, an offline queue sent in order, at-most-once resends | `verify-groceries.mjs`, [proof/track3-groceries-offline.png](proof/track3-groceries-offline.png), [proof/track3-groceries-race.png](proof/track3-groceries-race.png) |
+| `apps/team.bl` — a team's task board | **who and when**: sign-in, sessions the transport stamps on every proposal, permissions in BL (`:allow`), presence, "assigned to me"; a durable log replayed at boot, an activity feed, shared undo/redo, "view as of" | `verify-team.mjs`, [proof/track4-team-lead.png](proof/track4-team-lead.png), [proof/track5-team-history.png](proof/track5-team-history.png) |
+| `apps/triage.bl` — a bug inbox cleared by keyboard | **interaction as data**: a keymap in the view (`j`/`k`/`x`/`e`/`p`/`?`), drag-and-drop reorder (a team-wide, predicted intent), inline rename (⏎/esc/blur), focus that follows the selection | `verify-triage.mjs`, [proof/track6-triage.png](proof/track6-triage.png) |
 | `apps/outline.bl` — nested project plan | **data of any shape**: a recursive wire type, a recursive view, recursive roll-ups, search that keeps ancestors, a whole subtree ticked at once | `verify-outline.mjs`, [proof/track2-outline.png](proof/track2-outline.png), [proof/track2-outline-search.png](proof/track2-outline-search.png) |
 
 **The declaration.** Roots only — nothing says "client" or "server" per function:
@@ -507,8 +512,48 @@ fixtures: recursing on the item itself instead of a child, re-wrapping the
 item before recursing, recursing on a growing search string, an item type
 that must hold an item, and a type nested 25 deep.
 
-**Limits, stated.** No authentication (single-user loopback). One app per
-file; only `defn`s besides the declaration. The offline queue lives in the
+**People and permissions.** `:server {:people team …}` names a roster
+(`[{:id :name :role} …]`). The transport then requires a session for every
+proposal: `POST /api/login {user}` asks the BL authority whether that person
+exists and sets an `HttpOnly; SameSite=Strict` cookie whose id is HMAC-signed
+with a per-process secret; the transport verifies it (constant time) and
+STAMPS the person on the proposal — a proposal that carries an `actor` of its
+own is malformed. Each intent may declare `:allow` — `(fn [who board args])` →
+nil or a reason — which the authority asks after the shared check; `:apply`
+may take `who` as a third argument (the team board records who added a
+card). A person-free app is unchanged. Presence is transport state (open
+event streams per person) that the authority turns into people. The team board
+runs one rule, `can?`, in both halves: the view offers only the buttons a
+person may use, and the server asks again.
+
+**History.** `:server {:history 50}` keeps the last 50 states: shared `:undo`
+and `:redo` (built-in intents, gated by `:undo-allow`), the board of each
+recent revision for "view as of" (`GET /api/peek`; the page's scrubber hands
+it to the BL client, which renders it read-only and refuses edits while
+there), and an activity feed in the server's own words (`:says`). Every commit
+is appended to `data/<app>.log.jsonl` before its answer is sent; at boot the
+transport replays the log through the same authority — each line re-checked,
+re-allowed and re-applied — so a restart loses nothing and a replayed line
+the authority now refuses stops the boot. A torn last line is dropped and the
+file truncated.
+
+**Interaction is data.** A view declares what input means; the page turns
+it into events and the Worker accepts only events the last view offered:
+`:keys {"j" [:sel 3] …}` on any element (the page rebuilds its keymap from
+each view; keys are ignored inside text fields and with modifiers),
+`:on-dblclick`, `:on-blur`, `:on-escape`, `:drag "k"` + `:on-drop [:move]`
+(the drop sends `[:move dragged target]` as strings), `:autofocus` (once, when
+created) and `:focused` (whenever the view marks it). Rows keyed by `:key`
+glide to their new place (FLIP) after a reorder. A view node with a tag the
+page does not render is reported, never printed. The page also keeps typed
+text safe from the Worker's own echoes: while a field is focused, a view
+value that is one this field already sent is not written back — found when
+fast typing in the triage rename lost characters.
+
+**Limits, stated.** Sign-in is a demo roster with no password (loopback
+only); sessions live in the server process, so a restart signs everyone out
+while the board survives. One app per file; only `defn`s besides the
+declaration. The offline queue lives in the
 tab: closing the tab while offline loses it (nothing is written to storage),
 and the nonce memory is the last 256 commits of one server process. The closure flow is a 0-CFA: one
 heap set for all data, so a program that stores a function in data and reads a

@@ -85,11 +85,25 @@ export function createCodec(contract) {
       ? ['record', contract.intents[op].params] : null;
   }
 
+  const hasOp = op => Object.prototype.hasOwnProperty.call(contract.intents, op);
+
   return {
     contract,
     digest: contract.digest,
+    // An app's declaration decides whether identity and history exist at all:
+    // a contract built before those keys is an app with neither.
+    people: contract.people === true,
+    history: contract.history === true,
+    hasOp,
     ops: Object.keys(contract.intents).sort(),
     decodeSnapshot: json => decode(contract.snapshot, json, '$board'),
+    // Args for one declared op (or the built-in undo/redo), decoded by the
+    // same wire type a browser proposal is. Used by the log replay path.
+    decodeIntentArgs(op, json) {
+      const params = intentParams(op);
+      if (params === null) throw new Error('unknown intent ' + op);
+      return decode(params, json, '$args');
+    },
     // A browser proposal: exact keys, a declared op, args of its declared type.
     decodeProposal(json) {
       if (json === null || typeof json !== 'object' || Array.isArray(json))
@@ -140,9 +154,77 @@ export function encode(x) {
   throw new Error('split-codec: value is not closed data: ' + H.describe(x));
 }
 
+// ── server frames → BL, for the client actor ─────────────────────────────────
+//
+// The activity feed, the undo/redo summary and the roster are the app's own
+// words, but they still cross a wire: every field is bounded and every keyword
+// position must name a known word. A malformed ENTRY is dropped rather than
+// failing the whole frame; a malformed LIST is dropped whole.
+
+export const MAX_FRAME_LIST = 64;
+export const MAX_FRAME_STR = 64;
+export const MAX_SAYS = 200;
+
+const shortStr = (v, n = MAX_FRAME_STR) => typeof v === 'string' && v.length <= n;
+
+/** One activity entry → BL, or null when its shape is not allowed. `op` must
+ *  be a declared intent (or undo/redo) so the client can never be handed a
+ *  word the contract does not name. */
+export function entryToBL(codec, e) {
+  if (e === null || typeof e !== 'object' || Array.isArray(e)) return null;
+  if (!Number.isSafeInteger(e.revision) || e.revision < 1) return null;
+  if (!(e.actor === null || shortStr(e.actor))) return null;
+  if (!shortStr(e.name) || !shortStr(e.op) || !shortStr(e.says, MAX_SAYS)) return null;
+  if (typeof codec.hasOp !== 'function' || !codec.hasOp(e.op)) return null;
+  return H.bmap([[H.kw('revision'), e.revision], [H.kw('actor'), e.actor],
+    [H.kw('name'), e.name], [H.kw('op'), H.kw(e.op)], [H.kw('says'), e.says]]);
+}
+
+/** `recent`: a bounded list of entries. A non-list answers null (the caller
+ *  then leaves the frame's `:recent` alone). */
+export function recentToBL(codec, xs) {
+  if (!Array.isArray(xs) || xs.length > MAX_FRAME_LIST) return null;
+  const out = [];
+  for (const e of xs) { const b = entryToBL(codec, e); if (b !== null) out.push(b); }
+  return H.vec(out);
+}
+
+/** `history`: `{:undo entry|nil :redo entry|nil}`, always both keys. */
+export function historyToBL(codec, h) {
+  const pick = k => (h !== null && typeof h === 'object' && !Array.isArray(h) && h[k] != null
+    ? entryToBL(codec, h[k]) : null);
+  return H.bmap([[H.kw('undo'), pick('undo')], [H.kw('redo'), pick('redo')]]);
+}
+
+/** A public roster entry `{id, name, role}` → BL, with `role` a keyword. */
+export function personToBL(p) {
+  if (p === null || typeof p !== 'object' || Array.isArray(p)) return null;
+  if (!shortStr(p.id) || !shortStr(p.name)) return null;
+  if (!(p.role === null || p.role === undefined || (shortStr(p.role, 32) && /^[a-z][a-z0-9-]*$/.test(p.role)))) return null;
+  return H.bmap([[H.kw('id'), p.id], [H.kw('name'), p.name],
+    [H.kw('role'), p.role === null || p.role === undefined ? null : H.kw(p.role)]]);
+}
+
+/** A bounded roster list → BL, dropping any malformed entry. */
+export function peopleToBL(list) {
+  if (!Array.isArray(list) || list.length > MAX_FRAME_LIST) return null;
+  const out = [];
+  for (const p of list) { const b = personToBL(p); if (b !== null) out.push(b); }
+  return H.vec(out);
+}
+
+/** A presence frame `{people: [...]}` → BL `{:people [...]}`, the value the
+ *  client actor receives as `[:browser :presence p]`. */
+export function presenceToBL(frame) {
+  const list = frame !== null && typeof frame === 'object' && !Array.isArray(frame)
+    ? peopleToBL(frame.people) : null;
+  return H.bmap([[H.kw('people'), list === null ? H.vec([]) : list]]);
+}
+
 // JSON produced by `encode` for a known-good server frame, back to BL for the
 // client actor: the snapshot is decoded BY CONTRACT; the envelope fields are
-// scalars the client re-validates.
+// scalars the client re-validates, and the identity/history fields are bounded
+// and dropped when they do not fit.
 export function frameToBL(codec, frame) {
   const board = codec.decodeSnapshot(frame.board);
   const pairs = [[H.kw('revision'), frame.revision], [H.kw('board'), board]];
@@ -151,8 +233,25 @@ export function frameToBL(codec, frame) {
   if (frame.duplicate === true) pairs.push([H.kw('duplicate'), true]);
   if (typeof frame.reason === 'string' && /^[a-z][a-z0-9?-]{0,47}$/.test(frame.reason))
     pairs.push([H.kw('reason'), H.kw(frame.reason)]);
-  if (typeof frame.op === 'string' && Object.prototype.hasOwnProperty.call(codec.contract.intents, frame.op))
+  if (typeof frame.op === 'string' && codec.hasOp(frame.op))
     pairs.push([H.kw('op'), H.kw(frame.op)]);
   if (typeof frame.digest === 'string') pairs.push([H.kw('digest'), frame.digest]);
+  if ('recent' in frame) { const r = recentToBL(codec, frame.recent); if (r !== null) pairs.push([H.kw('recent'), r]); }
+  if ('history' in frame) pairs.push([H.kw('history'), historyToBL(codec, frame.history)]);
+  if ('people' in frame) { const p = peopleToBL(frame.people); if (p !== null) pairs.push([H.kw('people'), p]); }
+  if ('me' in frame) pairs.push([H.kw('me'), frame.me === null ? null : personToBL(frame.me)]);
+  return H.bmap(pairs);
+}
+
+/** The SSE hello frame → BL for the client actor: the same snapshot/envelope
+ *  decode as any other frame, plus the read-only viewer's identity and the
+ *  app's roster/feed/history when the transport supplied them. */
+export function helloToBL(codec, frame, tab) {
+  const pairs = [[H.kw('digest'), String(frame.digest)], [H.kw('tab'), tab],
+    [H.kw('revision'), frame.revision], [H.kw('board'), codec.decodeSnapshot(frame.board)]];
+  if ('people' in frame) pairs.push([H.kw('people'), frame.people === null ? null : peopleToBL(frame.people)]);
+  if ('me' in frame) pairs.push([H.kw('me'), frame.me === null ? null : personToBL(frame.me)]);
+  if ('recent' in frame) { const r = recentToBL(codec, frame.recent); if (r !== null) pairs.push([H.kw('recent'), r]); }
+  if ('history' in frame) pairs.push([H.kw('history'), historyToBL(codec, frame.history)]);
   return H.bmap(pairs);
 }

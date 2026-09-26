@@ -97,3 +97,45 @@ ticks and removals now (a whole branch ticks at once). New wire type
 | `verify-outline.mjs` | `OUTLINE PASS (22 checks)`: a tick shows the whole branch done before any answer |
 | real browser, port 8794 | click → predicted render **42 ms**, confirmed **114 ms** (row marked saving between); offline: 3 edits shown with "waiting", header "Offline · 3 changes waiting"; online: all three committed in order in 383 ms; "Oat milk" added again → one row, qty 3, note "The server adjusted that…"; tick raced by another tab → "Not applied — someone already did that.", row shows the other tab's state. Screenshots `track3-groceries-offline.png`, `track3-groceries-race.png` |
 | **found in the browser, fixed** | adding a NEW item was reported as diverged (the prediction's provisional id 0 ≠ the server's id) → `:agrees?`; raw reason keywords in notes → words; `rest` of a vector raised on the JS target (the queue is a vector) → `rt-rest` takes vectors, parity case `rest-of-vectors` (31 answers) |
+
+## Tracks 4 and 5 — who and when: identity, permissions, durable history (PLAN-149)
+
+**Claim.** People sign in; the transport verifies a session and stamps the
+person on every proposal; permissions are BL decided on the server (and
+mirrored in the view); presence is live; every commit is written to a durable
+log replayed at boot; the activity feed, shared undo/redo and "view as of" come
+from the authority.
+
+**Mechanism.** `split-server.bl` rewritten (`:people`, `:allow`, `:apply` with
+the person, `:says`, `:history`, built-in `:undo`/`:redo` with `:undo-allow`,
+login/presence/peek topics, a `commit` emit per commit). Transport:
+`split-session.mjs` (HMAC-signed session ids, strict cookie parsing, log line
+validation), `split-server.mjs` (`/api/login|logout|me|peek`, stamping, SSE
+presence, append-before-answer log, fail-closed replay). Client shell: `sync`
+gains `:me :people :online :recent :history :asof`. App: `apps/team.bl`.
+
+| Check | Result |
+|---|---|
+| split build | `SPLIT PASS team: 15 placements, 3 refusals named` (declaring `:undo` in a history app, a roster made `:private` while the view needs names, `:allow` of the wrong arity) |
+| `verify-session.mjs` | `SESSION PASS (20 checks)`: sign/verify, tampered sid/MAC/secret refused (timingSafeEqual), exact cookie attributes, log parse incl. torn last line and bad middle line |
+| `verify-team.mjs` | `TEAM PASS (31 checks)`: contract; placement (permissions server-only in the bundle); cookie `HttpOnly; SameSite=Strict; Path=/; Max-Age=43200`; tampered cookie → signed out; logout; the full permission matrix (guest 401, viewer, member own/others', lead); a proposal carrying `actor` → 400; entry author = session user; feed in the server's words; undo/redo summaries, future cleared by a new commit; presence {Ana, Chloé} without duplicates, updated on close; peek = board at k; log has one line per commit; a second boot replays 8 commits to an identical board/feed/history and still refuses a resent nonce as duplicate; torn last line tolerated (file truncated byte-identical); bad middle line → boot fails naming line 2; BL client offers only permitted buttons per person, read-only past board refuses edits |
+| real browser, port 8795 | guest: no composer, no move buttons; Ben: moves only his cards, feed "Ben moved “Fix flaky login test” to In progress"; Ana (lead) with Chloé connected in another session: "here now" shows A and C; assign → undo ("Unassigned") → redo ("Chloé"); scrubber to rev 1: 6 cards, read-only banner, an edit refused "you're looking at the past"; **server killed with SIGKILL and restarted**: `SPLIT REPLAYED 5 commits`, page shows rev 5, same 7 cards, 5 feed entries, Chloé still assigned. Screenshots `track4-team-lead.png`, `track5-team-history.png` |
+| **found in the browser, fixed** | a view tag the page does not render printed "[object Object]" (`:b` in the feed) → the renderer reports it; the page module had a misplaced `else` that only a browser import would catch → `verify-shell` now parses every page/Worker module |
+
+**Limits.** Demo roster, no passwords; sessions are per server process (a
+restart signs people out, the board survives); the log is one file per app,
+appended synchronously.
+
+## Track 6 — interaction as data (PLAN-149)
+
+**Claim.** Keyboard-first use, drag-and-drop and inline editing work in a
+real browser, declared by the BL view as data; reorder is a predicted,
+server-confirmed intent.
+
+| Check | Result |
+|---|---|
+| split build | `SPLIT PASS triage: 9 placements, 2 refusals named` (a key bound to `:private` data, a key binding with an effect) |
+| `verify-triage.mjs` | `TRIAGE PASS (18 checks)`: move-before up and down over HTTP, `same-place`/`no-such-report`; the view's `:keys` map exactly j k ↑ ↓ ? h x e ⏎ p; selection moves with `focused`; editing empties the keymap; save proposes, cancel does not; drop proposes and the next view predicts the new order; a non-numeric drag key is refused locally; unoffered events do nothing; the echo guard |
+| real browser, port 8796 (real key presses) | `j` `j` `x` → third report selected, focused, fixed (rev 1); `e` → inline field focused with the title; typed + ⏎ → renamed (rev 2), focus back on the row; drag r7 onto r1 → predicted order in **49 ms**, confirmed; `?` → shortcut sheet. Screenshot `track6-triage.png` |
+| **found in the browser, fixed** | fast typing lost characters ("Anfications"): the Worker's renders echo older values into the focused field → echo guard in `patch()`; a render removing a focused field fired its `:on-blur` (a second save) → blurs during a render are not user blurs; the history bar showed on apps without history (`display:flex` beat `hidden`) |
+| full build + all Node suites | build exit 0, 53 OK, SPLIT PASS ×5, parity 32 (+ `drop`), **26/26** Node suites |

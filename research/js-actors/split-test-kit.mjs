@@ -56,7 +56,7 @@ export const nonce = (tab, request) => `${tab}:${request}`;
 // tab id is the identity every hello declares.
 const clientSource = (app, tab) => `
   import * as H from './host.mjs';
-  import { createCodec, encode, frameToBL } from './split-codec.mjs';
+  import { createCodec, encode, frameToBL, helloToBL, presenceToBL } from './split-codec.mjs';
   import { readFileSync } from 'node:fs';
   const codec = createCodec(JSON.parse(readFileSync('out/${app}.contract.json', 'utf8')));
   H.setEmitter((topic, value) => { process.stdout.write(JSON.stringify({ topic, value: encode(value) }) + '\\n'); });
@@ -67,8 +67,14 @@ const clientSource = (app, tab) => `
     let i;
     while ((i = buf.indexOf('\\n')) >= 0) {
       const msg = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
-      if (msg.kind === 'hello') H.enqueueData('hello', H.bmap([[H.kw('digest'), msg.digest], [H.kw('tab'), ${JSON.stringify(tab)}], [H.kw('revision'), msg.revision], [H.kw('board'), codec.decodeSnapshot(msg.board)]]));
+      if (msg.kind === 'hello') H.enqueueData('hello', helloToBL(codec, msg, ${JSON.stringify(tab)}));
+      else if (msg.kind === 'presence') H.enqueueData('presence', presenceToBL(msg));
       else if (msg.kind === 'event') H.enqueueData('event', H.vec(msg.event.map(x => typeof x === 'string' && x.startsWith(':') ? H.kw(x.slice(1)) : x)));
+      else if (msg.kind === 'asof') {
+        const past = msg.board ? codec.decodeSnapshot(msg.board) : null;
+        H.enqueueData('asof', past && Number.isSafeInteger(msg.revision)
+          ? H.bmap([[H.kw('revision'), msg.revision], [H.kw('board'), past]]) : H.bmap([]));
+      }
       else if (msg.kind === 'unreachable') H.enqueueData('unreachable', msg.request);
       else if (msg.kind === 'offline' || msg.kind === 'online') H.enqueueData(msg.kind, '');
       else if (msg.kind === 'result' || msg.kind === 'snapshot') H.enqueueData(msg.kind, frameToBL(codec, msg.frame));
@@ -78,8 +84,8 @@ const clientSource = (app, tab) => `
   await import('./out/${app}-client.mjs');
 `;
 
-export async function startApp(app) {
-  const service = await startSplitServer({ port: 0, app });
+export async function startApp(app, options = {}) {
+  const service = await startSplitServer({ port: 0, app, ...options });
   const base = `http://127.0.0.1:${service.port}`;
   const post = async (json) => {
     const r = await fetch(base + '/api/intent', { method: 'POST',
