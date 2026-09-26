@@ -48,3 +48,27 @@ web_test 44 (sessions, codec, codepoints, depth, exact digits, the log).
   panel (visible on the team board); grid items now shrink (`min-width: 0`).
 - Two verifier races the slower-to-answer BEAM server exposed (a view awaited
   before the settle trace; a fixed 60 ms sleep).
+
+## Independent security review of the BEAM transport
+
+A separate reviewer read `priv/lib/split/{web,core,log,wire}.bl` and `split.bl`
+(read-only, no server run) and reported nine defects; all are fixed in
+feeb0b6f and pinned by tests where a test can reach them.
+
+| Severity | Finding | Fix | Pinned by |
+|---|---|---|---|
+| high | an answer arriving after a 4 s timeout could satisfy the next request on the same keep-alive connection | every question carries a fresh reference; answers echo it | app_test `an-old-answer-never-answers-a-new-question` |
+| high | two servers could open one fjall keyspace and commit divergent histories | `<keyspace>.owner`, created exclusively, names the owning OS process; a live owner refuses, a dead one is taken over | web_test `a-log-has-one-owner` |
+| high | the hub's tab-per-request map grew on every non-committing intent | the tab rides on the proposal and returns in the snapshot; no map | (structural: the map is gone) |
+| medium | bl.json reads an object keyed by serde's private number token as a number | such a body is refused 400 | verify-shell |
+| medium | method/Origin checked after reading the body, answered on the stale conn | checked first (`write-refusal`) | verify-shell |
+| medium | one cookie path for all mounts: app B's login clobbered app A's | `Path=/<app>/` when mounted | browser: `Path=/team/` observed |
+| medium | read APIs answered any method; a POST opened a stream | GET only, else 405 | verify-shell |
+| medium | login with the authority gone said 403 unknown-person | 503 | code review |
+| medium | an event stream never noticed its hub dying | streams monitor the hub and end | code review |
+
+Verified as holding by the same review: session-based actor stamping (a
+proposal naming an actor is malformed), no attacker-controlled atoms, MAC
+verification in constant time, per-mount session tables, the body limit
+applied before parsing, wire bounds, loopback Host and path checks, append +
+fsync before acknowledgement, and fail-closed replay.
