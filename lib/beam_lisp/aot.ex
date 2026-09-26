@@ -717,7 +717,16 @@ defmodule BeamLisp.AOT do
     try do
       resolve = fn n -> source_content_cached(n) end
       seed = if file && File.exists?(file), do: {ns, BeamLisp.Loader.read_source(file)}
-      BeamLisp.BuildPlan.key_for(ns, resolve, seed)
+
+      # NO SOURCE, NO KEY — asked BEFORE the planner loads. A packaged runtime
+      # (a phone, a release away from its checkout) carries beams and no `.bl`,
+      # and the contract is `nil` there: trust the beam. Asking `key_for` first
+      # loads `build-plan`, which on such a runtime is itself a closure-vetted
+      # library beam, so the gate recursed into its own vetting and died as
+      # `undefined var: build-plan/key-for` inside `BeamLisp.init/0`.
+      if is_nil(seed) and is_nil(resolve.(ns)),
+        do: nil,
+        else: BeamLisp.BuildPlan.key_for(ns, resolve, seed)
     after
       Process.delete(:bl_source_info_cache)
     end

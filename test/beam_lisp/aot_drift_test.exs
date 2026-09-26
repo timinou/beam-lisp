@@ -117,6 +117,34 @@ defmodule BeamLisp.AotDriftTest do
     assert key == BeamLisp.AOTCache.compiler_key()
   end
 
+  # A packaged runtime — a phone, a release away from its checkout — carries the
+  # beams and none of the `.bl`. The gate must answer "no source, no key" WITHOUT
+  # asking the planner: loading `build-plan` there is itself a closure-vetted
+  # load, and it recursed into this very gate (`undefined var: build-plan/…` at
+  # `BeamLisp.init/0` on Android).
+  test "no resolvable source: the closure hash is nil and the planner is never asked" do
+    compile!(@v2)
+    reload_beam!()
+    empty = Path.join(@tmp, "no-sources")
+    File.mkdir_p!(empty)
+    ref = make_ref()
+    parent = self()
+
+    :erlang.trace_pattern({BeamLisp.BuildPlan, :key_for, :_}, true, [:global])
+    :erlang.trace(self(), true, [:call])
+
+    try do
+      assert nil == BeamLisp.Loader.with_search_dir(empty, fn -> BeamLisp.AOT.ns_closure_hash(@ns) end)
+      send(parent, ref)
+    after
+      :erlang.trace(self(), false, [:call])
+      :erlang.trace_pattern({BeamLisp.BuildPlan, :key_for, :_}, false, [:global])
+    end
+
+    assert_received ^ref
+    refute_received {:trace, _, :call, {BeamLisp.BuildPlan, :key_for, _}}
+  end
+
   test "dev: the drift gate routes a stale beam to the source path (:no_module)" do
     forge_stale!()
 
