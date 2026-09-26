@@ -15,6 +15,19 @@ defmodule BeamLisp.BootBuildBarrierTest do
 
   defp call(name, args), do: BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("build", name), args)
 
+  # `source-graph` is beam-lisp (`priv/build/source-graph.bl`) — the ONE parser
+  # the tiers law may read sources with. Called through the var table exactly as
+  # the deleted `BeamLisp.SourceGraph` façade did, so no Elixir seam remains.
+  defp header(content) do
+    BeamLisp.Loader.ensure_loaded("source-graph")
+
+    [ns, requires] =
+      BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("source-graph", "header"), [content])
+      |> Enum.to_list()
+
+    {ns, Enum.to_list(requires)}
+  end
+
   defp node(path, ns), do: %{path: path, ns: ns, hash: ns}
 
   test "toolchain nodes form a serial topological prefix and ordinary waves stay parallel" do
@@ -101,7 +114,7 @@ defmodule BeamLisp.BootBuildBarrierTest do
     offenders =
       for tier <- ~w(std lib compat),
           path <- Path.wildcard(Path.join([BeamLisp.Tiers.priv_root(), tier, "**", "*.bl"])),
-          {ns, requires} <- [BeamLisp.SourceGraph.header(File.read!(path))],
+          {ns, requires} <- [header(File.read!(path))],
           bad = Enum.sort(Enum.filter(requires, &(&1 in driver))),
           bad != [] do
         {path, ns, bad}

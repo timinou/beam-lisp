@@ -54,7 +54,8 @@ that mutates globals wants the default instead.
   ; Report the RESOLVED path: the run's cwd may not be the caller's by the time
   ; the message is read, and a relative name would point nowhere.
   (let [rs (map u/resolve args)]
-    (filter (fn [p] (empty? (u/expand-targets p))) rs)))
+    (filter (fn [p] (and (empty? (u/expand-targets p))
+                          (empty? (exs-under p)))) rs)))
 
 (defn- exs-under
   "The `*_test.exs` files under one path: a file contributes itself when that is
@@ -176,7 +177,7 @@ anything reading the number rather than the picture.
       (let [out "/tmp/bl-test-support"]
         (File/mkdir_p! out)
         (Kernel.ParallelCompiler/compile_to_path
-          (to-list support) out (list (erlang/list_to_tuple (list :return-diagnostics true))))
+          (to-list support) out (list (erlang/list_to_tuple (list :return_diagnostics true))))
         (erlang/apply :code :add_patha (list (String/to_charlist out)))))))
 
 (defn run-exunit
