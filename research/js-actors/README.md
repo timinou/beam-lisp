@@ -265,45 +265,55 @@ necessary evidence but are not by themselves sufficient to move a view.
 
 ### One BL file → client, server and contract (the split showcase)
 
-[`showcase.bl`](showcase.bl) is an ordinary BL program — a shared launch
-checklist — plus one `split/defapp` declaration. The build derives **where every
-function runs** and emits three artifacts:
+[`showcase.bl`](showcase.bl) is an ordinary BL namespace — a shared launch
+checklist — plus one `split/defapp` declaration. It is ONE file and TWO
+programs: its **server half** is that namespace running natively on BEAM
+(the authority [`priv/lib/split/core.bl`](../../priv/lib/split/core.bl) behind
+the transport [`priv/lib/split/web.bl`](../../priv/lib/split/web.bl)), and its
+**browser half** is compiled to JavaScript by this build, which also derives
+**where every function runs**:
 
 | Artifact | Holds |
 |---|---|
-| `out/showcase-client.mjs` | runtime + [`split-client.bl`](split-client.bl) + only the functions the view, the local reducer and the shared checks reach |
-| `out/showcase-server.mjs` | runtime + [`split-server.bl`](split-server.bl) + the authority's closure: init, checks, guards, apply, private data |
-| `out/showcase.contract.json` | snapshot type, each intent's parameter types, SHA-256 digest of the canonical body |
+| `out/showcase-client.mjs` | runtime + [`split-client.bl`](split-client.bl) + [`priv/lib/split/wire.bl`](../../priv/lib/split/wire.bl) + only the functions the view, the local reducer, the shared checks and the predictions reach |
+| `out/showcase.contract.json` | snapshot type, each intent's parameter types, SHA-256 digest of the canonical body (BEAM computes the same digest from the same declaration) |
 | `out/showcase.split.json` | per-function placement and the evidence behind it |
+
+How the declaration becomes both halves with no glue written by the app is
+[docs/split/01-how-one-file-becomes-two-programs.bl.org](../../docs/split/01-how-one-file-becomes-two-programs.bl.org).
 
 ```sh
 BEAM_LISP_Z3=/usr/bin/z3 ELIXIR_ERL_OPTIONS='+S 8:8 +SDio 8' \
-  JS_ACTORS_SPLIT_ONLY=1 ./bin/bl run research/js-actors/compiler.bl   # split only, ~3 min
-node research/js-actors/verify-split.mjs                                # 28 end-to-end checks
+  JS_ACTORS_SPLIT_ONLY=1 ./bin/bl run research/js-actors/compiler.bl   # browser halves only, ~3 min
+./bin/bl serve research/split-beam/serve.bl --port 4040                # all six + a gallery at http://127.0.0.1:4040/
+./bin/bl serve research/split-beam/serve.bl --port 4041 -- groceries   # one app, at /
+./bin/bl test test/bl/split/                                           # the BEAM half: app, authority, transport, log
+node research/js-actors/verify-split.mjs                                # 28 end-to-end checks (boots BEAM)
 node research/js-actors/verify-outline.mjs                              # the nested-plan app, 22 checks
 node research/js-actors/verify-groceries.mjs                            # instant + offline, 22 checks
-node research/js-actors/verify-team.mjs                                 # identity, permissions, history, replay
-node research/js-actors/verify-session.mjs                              # session cookies, log parsing
+node research/js-actors/verify-team.mjs                                 # identity, permissions, history, replay, 30 checks
+node research/js-actors/verify-durable-ack.mjs                          # a refused log append is never acknowledged
 node research/js-actors/verify-triage.mjs                               # keys, drag-and-drop, inline edit
 node research/js-actors/verify-ledger.mjs                               # exact money beyond 2^53
+node research/js-actors/verify-codec.mjs                                # the browser half's JSON boundary
 node research/js-actors/verify-numeric-exact.mjs                        # host exact-integer edge cases
-node research/js-actors/verify-shell.mjs                                # the shared page/server shell
+node research/js-actors/verify-shell.mjs                                # the shared page shell
 node research/js-actors/verify-order-parity.mjs                         # sort/compare/combinators/exact-int/map+set order = BEAM, 95 answers
-node research/js-actors/split-server.mjs --port 8791                    # then open http://127.0.0.1:8791/
-node research/js-actors/split-server.mjs --port 8792 --app outline      # any app under apps/
 ```
 
-**All of them at once:** `node research/js-actors/showcase-all.mjs --base 8801`
-starts every built app on its own port (8802–8807) and a gallery on 8801
-that says what each one shows ([proof/gallery.png](proof/gallery.png)). Every
-screenshot and measurement behind the table below is in
-[proof/PROOF.md](proof/PROOF.md).
+Apps with `:history` keep their log as datom facts on fjall under
+`data/split/<app>.fjall` (`SPLIT_DATA=<dir>` moves it, `SPLIT_DATA=none`
+keeps nothing); `bl run research/split-beam/log.bl -- list <keyspace> <app>`
+prints it. The proof that every app runs this way — verifiers, screenshots,
+a restart replay — is [research/split-beam/proof/PROOF.md](../split-beam/proof/PROOF.md);
+the earlier, Node-served track proofs are in [proof/PROOF.md](proof/PROOF.md).
 
 **One shell, many apps.** `showcase.bl` is the launch board; every other app
 lives in [`apps/`](apps/) as `<app>.bl` plus an optional `<app>.css` (its
 look) and `<app>.page.json` (title, lede and hints for the page). The page,
 the Worker and the transport are the same for all of them: the server says
-which app it serves (`GET /api/app`) and the page loads that app's bundle,
+which app it serves (`./api/app`, relative, so one server mounts every app
+under `/<app>/`) and the page loads that app's bundle,
 contract, manifest and stylesheet. "How it was built" (placement lanes,
 evidence, timeline, contract) collapses to give the app the whole width.
 
@@ -456,15 +466,16 @@ a value, `juxt`/`comp`/`partial`/`complement`/`apply` built and called, and a
 recursive tree walk `(defn depth [t] (inc (reduce … 0 (mapv depth (:kids t)))))`.
 
 plus malformed wire types, unknown or wrong-arity roots, and names that would
-shadow the runtime. Because each half is emitted as its **own** bundle from its
-own closure, server-only code and literals are absent from the client bundle by
-construction (`verify-split.mjs` greps for them). The browser gets 30 of the 38
-app functions.
+shadow the runtime. The browser bundle is emitted from the client closure
+alone, so server-only code and literals are absent from it by construction
+(`verify-split.mjs` greps for them); the server half never becomes JavaScript
+at all. The browser gets 30 of the 38 app functions.
 
 **The server stays the authority.** A proposal is
-`{request, revision, digest, op, args}`. `split-codec.mjs` decodes it *by
-contract* (exact record keys, bounded text, safe-integer ranges) and grants
-nothing. The compiled BL `split-server.bl` then checks, in order: the build
+`{request, revision, digest, nonce, op, args}`. The transport
+(`priv/lib/split/web.bl`) decodes it *by contract* (exact record keys, text
+bounded in codepoints, safe-integer ranges, depth 24) and grants nothing. The
+authority `priv/lib/split/core.bl`, on BEAM, then checks, in order: the build
 digest (`client-outdated`), the declared op and wire args, the revision
 (`stale-revision`, with the current board), the **shared** `:check` again on
 its own snapshot, the server-only `:guard`, and that the next state still
@@ -507,7 +518,7 @@ can mark what is not yet confirmed. When the server answers:
 **The page** (`showcase.html`, `showcase-page.mjs`) renders the BL view tree
 through a keyed reconciler (focus and caret survive per-keystroke renders;
 text only via `textContent`, attributes through an allowlist), links the Worker
-to `POST /api/intent` and the SSE stream, and shows the placement lanes with
+to `POST ./api/intent` and the SSE stream, and shows the placement lanes with
 per-function evidence, the generated contract, and a timeline of where each
 step ran. Open a second tab: its commits arrive as server snapshots. Sort
 buttons re-order rows locally (rows glide to their new place); refine chips
@@ -525,8 +536,9 @@ not offer is refused by the Worker.
 `:item [:record {… :kids [:list 16 :item]}]`. The build refuses a cycle with no
 list on it (it has no finite value) and any type nested deeper than 24 lists
 and records (no value would pass the wire); the authority's `wire-ok?` and the
-codec refuse any VALUE nested deeper than 24 — one bound, in `compiler.bl`,
-`priv/lib/split/wire.bl` and `split-codec.mjs`, checked equal by `verify-outline.mjs`.
+codec refuse any VALUE nested deeper than 24 — one bound, in
+`priv/lib/split/wire.bl` (the build requires it) and `split-codec.mjs`,
+checked equal by `verify-outline.mjs`.
 Code over such data is ordinary recursion: `item-row` renders an item and,
 inside it, `item-row` of each child; `find-item` and `depth-of` run in both
 halves; the server rebuilds the path down to one item. Each is admitted by
@@ -541,7 +553,7 @@ that must hold an item, and a type nested 25 deep.
 (`[{:id :name :role} …]`). The transport then requires a session for every
 proposal: `POST /api/login {user}` asks the BL authority whether that person
 exists and sets an `HttpOnly; SameSite=Strict` cookie whose id is HMAC-signed
-with a per-process secret; the transport verifies it (constant time) and
+with a per-server secret; the transport verifies it (constant time) and
 STAMPS the person on the proposal — a proposal that carries an `actor` of its
 own is malformed. Each intent may declare `:allow` — `(fn [who board args])` →
 nil or a reason — which the authority asks after the shared check; `:apply`
@@ -556,11 +568,11 @@ and `:redo` (built-in intents, gated by `:undo-allow`), the board of each
 recent revision for "view as of" (`GET /api/peek`; the page's scrubber hands
 it to the BL client, which renders it read-only and refuses edits while
 there), and an activity feed in the server's own words (`:says`). Every commit
-is appended to `data/<app>.log.jsonl` before its answer is sent; at boot the
-transport replays the log through the same authority — each line re-checked,
-re-allowed and re-applied — so a restart loses nothing and a replayed line
-the authority now refuses stops the boot. A torn last line is dropped and the
-file truncated.
+is recorded as datom facts on fjall (`priv/lib/split/log.bl`) and fsync'd
+before its answer is sent — a log that refuses stops the authority, so nothing
+is acknowledged that is not on disk. At boot every commit is decided again by
+the same authority — re-checked, re-allowed, re-applied — so a restart loses
+nothing and a commit the authority now refuses stops the boot, naming it.
 
 **Interaction is data.** A view declares what input means; the page turns
 it into events and the Worker accepts only events the last view offered:
@@ -577,8 +589,9 @@ fast typing in the triage rename lost characters.
 
 **Limits, stated.** Sign-in is a demo roster with no password (loopback
 only); sessions live in the server process, so a restart signs everyone out
-while the board survives. One app per file; only `defn`s besides the
-declaration. The offline queue lives in the
+while the board survives. One app per file: one `(ns …)`, `defn`s and the
+declaration. A closed tab leaves presence within about a second (the
+transport learns a client is gone only when a heartbeat write fails). The offline queue lives in the
 tab: closing the tab while offline loses it (nothing is written to storage),
 and the nonce memory is the last 256 commits of one server process. The closure flow is a 0-CFA: one
 heap set for all data, so a program that stores a function in data and reads a

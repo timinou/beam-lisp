@@ -472,7 +472,7 @@ async function explain() {
   const kb = n => (n / 1024).toFixed(0) + ' KB';
   $('bundle-stats').textContent =
     `browser gets ${manifest.bundles.client['app-functions']} of ${manifest.functions.length} fns · ` +
-    `${kb(manifest.bundles.client.bytes)} client / ${kb(manifest.bundles.server.bytes)} server`;
+    `${kb(manifest.bundles.client.bytes)} of JavaScript · the server half runs on BEAM`;
   const { digest, ...body } = contract;
   $('contract').textContent = JSON.stringify(body, null, 2);
   $('contract-file').textContent = `out/${APP}.contract.json · sha256 ${digest.slice(0, 12)}…`;

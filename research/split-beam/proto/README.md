@@ -1,13 +1,14 @@
 # Split on BEAM — prototype slices
 
-Throwaway slices that settle the questions deciding whether a `split/defapp`
-can run its authority natively on BEAM, behind `web.bl`, while the browser keeps
-the compiled JS half. Each one runs from the repository root. The research
-sources (`research/js-actors/split-server.bl`, `split-wire.bl`, `apps/*.bl`)
-are used **unchanged**: `assemble.sh` concatenates them with a head and a tail,
-and three one-line `sed` shims stand in for what a real namespace provides.
+Throwaway slices that settled whether a `split/defapp` can run its authority
+natively on BEAM, behind `web.bl`, while the browser keeps the compiled JS half.
+They ran the then-unchanged research sources (`split-server.bl`,
+`split-wire.bl`, `apps/*.bl`) with three one-line shims. Every answer below
+became part of `priv/lib/split` (commits e96e84d7 → S8), so the slice sources
+were deleted once the real implementation passed the same checks; this file
+keeps what each slice proved.
 
-| Slice | Question | Run | Answer (measured 2026-09-26) |
+| Slice | Question | Ran | Answer (measured 2026-09-26) |
 |---|---|---|---|
 | S0 | Does the authority loop, written for the JS target, decide the same on BEAM? | `assemble.sh s0 > /tmp/s0.bl; bl run /tmp/s0.bl` | Yes. A tick commits (rev 1), an add commits (rev 2), a stale proposal is refused `stale-revision`, a missing id gives `no-such-item`, a repeated nonce gives `duplicate`, and a wrong digest gives `client-outdated`. |
 | S0 | Can the glue be derived from the app *value* instead of generated source? | same | Yes. A `defapp` macro keeps the declaration twice: quoted (for the contract) and evaluated (symbols resolve to the functions). The dispatchers are ordinary functions that look up `[:intents op :check]`. |

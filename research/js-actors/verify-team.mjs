@@ -39,7 +39,6 @@ const ok = label => { passed += 1; console.log('PASS team: ' + label); };
 const contract = JSON.parse(readOut('team.contract.json'));
 const manifest = JSON.parse(readOut('team.split.json'));
 const clientBundle = readOut('team-client.mjs');
-const serverBundle = readOut('team-server.mjs');
 const digest = contract.digest;
 
 // ── cleanup: every process and file this run owns ───────────────────────────
@@ -91,7 +90,7 @@ for (const name of ['allow-move', 'lead-only', 'says-move', 'add-card'])
 for (const needle of ['"js/allow-move"', '"js/lead-only"', '"js/says-move"'])
   assert.equal(clientBundle.includes(needle), false, 'the client bundle must not contain ' + needle);
 assert.equal(clientBundle.includes('"js/board-view"'), true, 'the client carries its own view');
-assert.equal(serverBundle.includes('"js/allow-move"'), true, 'the server carries the permission');
+assert.equal(where['allow-move'], 'server', 'the server carries the permission');
 ok('placement: checks shared; allow/lead/says/add-card server; the client bundle carries none of them');
 
 // The hello a fresh event stream opens with (with a session cookie, if any).

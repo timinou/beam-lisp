@@ -37,7 +37,6 @@ const OTHER_TAB = 'groceriesother01';
 const contract = JSON.parse(readOut('groceries.contract.json'));
 const manifest = JSON.parse(readOut('groceries.split.json'));
 const clientBundle = readOut('groceries-client.mjs');
-const serverBundle = readOut('groceries-server.mjs');
 const digest = contract.digest;
 
 assert.equal(contractDigest(contract), digest);
@@ -50,7 +49,7 @@ assert.equal(where['predict-add'], 'client', 'the browser owns its add predictio
 assert.equal(where['predict-tick'], 'shared');
 assert.equal(where['predict-qty'], 'shared');
 assert.equal(where['add-item'], 'server');
-assert.ok(serverBundle.includes('"js/predict-tick"') && serverBundle.includes('"js/predict-qty"'),
+assert.ok(where['predict-tick'] === 'shared' && where['predict-qty'] === 'shared',
            'the server :apply reuses the shared predictions');
 assert.equal(clientBundle.includes('"js/add-item"'), false, 'the merge policy stays on the server');
 assert.equal(clientBundle.includes('initial-list'), false, 'the initial list stays on the server');

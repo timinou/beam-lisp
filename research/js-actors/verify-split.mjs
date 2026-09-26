@@ -16,6 +16,7 @@
 //     the server commits its nonce once and answers a repeat as `duplicate`.
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { startApp, spawnClient, texts, contractDigest, nonce, sleep, readOut } from './split-test-kit.mjs';
 import { createCodec } from './split-codec.mjs';
 
@@ -30,7 +31,6 @@ const HTTP_TAB = 'splithttp0000001';
 const contract = JSON.parse(readOut('showcase.contract.json'));
 const manifest = JSON.parse(readOut('showcase.split.json'));
 const clientBundle = readOut('showcase-client.mjs');
-const serverBundle = readOut('showcase-server.mjs');
 const digest = contract.digest;
 
 assert.equal(contractDigest(contract), digest);
@@ -68,7 +68,7 @@ ok('predicates composed with comp/partial/complement and a returned closure run 
 for (const needle of ['api key', 'blocked-words', 'flagged-title', 'contains-word', 'initial-board',
                       'log-entry', ':audit', 'next-id', '"js/add-task"'])
   assert.equal(clientBundle.includes(needle), false, `client bundle leaks ${needle}`);
-assert.ok(serverBundle.includes('api key'));
+assert.ok(readFileSync(new URL('./showcase.bl', import.meta.url), 'utf8').includes('api key'), 'the server half (showcase.bl on BEAM) keeps the rule');
 ok('server-only code and data are absent from the client bundle');
 
 // ── the codec ───────────────────────────────────────────────────────────────
@@ -166,7 +166,7 @@ assert.equal(r.status, 409);
 assert.equal(r.body.reason, 'client-outdated');
 ok('an outdated client build is told so, with the current board');
 
-for (const path of ['/out/showcase-server.mjs', '/showcase.bl', '/split-server.bl', '/../package.json'])
+for (const path of ['/showcase.bl', '/split-client.bl', '/../package.json', '/out/showcase-server.mjs'])
   assert.equal((await fetch(app.base + path)).status, 404, path);
 assert.equal((await fetch(app.base + '/out/showcase-client.mjs')).status, 200);
 ok('the server half and the app source are never served; the client half is');

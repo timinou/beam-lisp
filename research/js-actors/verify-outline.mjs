@@ -73,7 +73,7 @@ try {
   const contract = JSON.parse(readOut('outline.contract.json'));
   const manifest = JSON.parse(readOut('outline.split.json'));
   const clientBundle = readOut('outline-client.mjs');
-  const serverBundle = readOut('outline-server.mjs');
+  const placed = n => manifest.functions.find(f => f.name === n).placement;
 
   const digest = contract.digest;
   assert.equal(contractDigest(contract), digest, 'digest is the SHA-256 of the canonical contract body');
@@ -99,7 +99,7 @@ try {
 
   for (const needle of ['"js/add-in"', '"js/add-item"', 'initial-plan'])
     assert.equal(clientBundle.includes(needle), false, 'client bundle leaks ' + needle);
-  assert.ok(serverBundle.includes('"js/toggle-in"') && serverBundle.includes('initial-plan'));
+  assert.ok(['server', 'shared'].includes(placed('toggle-in')) && placed('initial-plan') === 'server');
   ok('the server-only rebuilders and the initial plan stay out of the client bundle');
 
   // ── the codec ─────────────────────────────────────────────────────────────

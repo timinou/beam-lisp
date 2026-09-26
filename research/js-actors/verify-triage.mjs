@@ -31,7 +31,6 @@ const HTTP_TAB = 'triagehttp000001';
 const contract = JSON.parse(readOut('triage.contract.json'));
 const manifest = JSON.parse(readOut('triage.split.json'));
 const clientBundle = readOut('triage-client.mjs');
-const serverBundle = readOut('triage-server.mjs');
 const digest = contract.digest;
 
 assert.equal(contractDigest(contract), digest);
@@ -49,8 +48,8 @@ assert.equal(where['initial-inbox'], 'server', 'the seed inbox is the authority\
 assert.ok(clientBundle.includes('"js/on-event"') && clientBundle.includes('"js/step-sel"') &&
           clientBundle.includes('"js/report-row"'), 'the client half carries the UX');
 assert.equal(clientBundle.includes('"js/initial-inbox"'), false, 'the seed stays on the server');
-assert.ok(serverBundle.includes('"js/initial-inbox"'), 'the server owns the seed');
-assert.ok(clientBundle.includes('"js/move-before"') && serverBundle.includes('"js/move-before"'),
+assert.equal(manifest.functions.find(f => f.name === 'initial-inbox').placement, 'server', 'the server owns the seed');
+assert.ok(clientBundle.includes('"js/move-before"') && manifest.functions.find(f => f.name === 'move-before').placement === 'shared',
           'move-before is shared, so the prediction and the :apply are one function');
 ok('placement: inbox-view/report-row/on-event/step-sel/parse-id client; move-before/index-of-id shared; initial-inbox server');
 

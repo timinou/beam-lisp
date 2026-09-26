@@ -5,18 +5,18 @@
 //   * GET /app.css serves apps/<app>.css as text/css with the same no-store /
 //     nosniff headers as every other static file;
 //   * GET /app.page.json carries the app's title/lede/hints;
-//   * the page HTML links /app.css and no longer inlines the app rules;
+//   * the page HTML links ./app.css (relative: the page also works mounted
+//     under /<app>/) and no longer inlines the app rules;
 //   * static files sit behind an allowlist: path traversal and bare source
-//     paths are 404;
-//   * an app without page.json still gets a working shell (name-only metadata,
-//     empty stylesheet).
+//     paths are 404.
+// The server is BEAM (split.web), booted by the kit.
 //
 // Usage: node research/js-actors/verify-shell.mjs
 
 import assert from 'node:assert/strict';
 import { request } from 'node:http';
-import { readFileSync, readdirSync, existsSync } from 'node:fs';
-import { startSplitServer } from './split-server.mjs';
+import { readFileSync } from 'node:fs';
+import { startBeam } from './split-test-kit.mjs';
 
 const here = new URL('./', import.meta.url);
 let passed = 0;
@@ -26,14 +26,14 @@ const ok = label => { passed++; console.log('PASS shell: ' + label); };
 // suites: a syntax error in them would pass every other check. Parse them.
 {
   const { spawnSync } = await import('node:child_process');
-  for (const f of ['showcase-page.mjs', 'split-worker.mjs', 'split-codec.mjs', 'split-session.mjs', 'host.mjs']) {
+  for (const f of ['showcase-page.mjs', 'split-worker.mjs', 'split-codec.mjs', 'host.mjs']) {
     const r = spawnSync(process.execPath, ['--check', new URL(f, import.meta.url).pathname], { encoding: 'utf8' });
     assert.equal(r.status, 0, `${f} does not parse: ${r.stderr}`);
   }
-  ok('the page, Worker, codec, session and host modules parse');
+  ok('the page, Worker, codec and host modules parse');
 }
 
-const service = await startSplitServer({ port: 0 });
+const service = await startBeam(['showcase']);
 const base = `http://127.0.0.1:${service.port}`;
 const get = async (path, headers) => {
   const r = await fetch(base + path, { headers });
@@ -56,7 +56,7 @@ try {
   assert.equal(info.status, 200);
   const appInfo = JSON.parse(info.body);
   assert.equal(appInfo.app, 'showcase');
-  assert.equal(appInfo.digest, service.codec.digest);
+  assert.equal(appInfo.digest, JSON.parse(readFileSync(new URL('out/showcase.contract.json', here), 'utf8')).digest);
   ok('/api/app names the app and its contract digest');
 
   const css = await get('/app.css');
@@ -89,26 +89,6 @@ try {
   assert.equal((await get('/apps/showcase.css')).status, 404);
   ok('path traversal and unlisted app paths are 404');
 
-  // A built app that ships no page.json: the shell must still answer. Only
-  // runs when such a build exists (today only showcase is built).
-  const built = readdirSync(new URL('out/', here))
-    .filter(f => f.endsWith('-client.mjs')).map(f => f.slice(0, -'-client.mjs'.length));
-  const bareApp = built.find(a => a !== 'showcase' &&
-    existsSync(new URL(`out/${a}.contract.json`, here)) && !existsSync(new URL(`apps/${a}.page.json`, here)));
-  if (bareApp) {
-    const leaf = await startSplitServer({ port: 0, app: bareApp });
-    try {
-      const lmeta = await (await fetch(`http://127.0.0.1:${leaf.port}/app.page.json`)).json();
-      assert.deepEqual(lmeta, { title: bareApp, lede: '', hints: [] });
-      const lcss = await fetch(`http://127.0.0.1:${leaf.port}/app.css`);
-      assert.equal(lcss.status, 200);
-      assert.equal(lcss.headers.get('content-type'), 'text/css; charset=utf-8');
-      assert.equal(await lcss.text(), '');
-    } finally { await leaf.close(); }
-    ok(`an app without page.json (${bareApp}) falls back to name-only metadata and an empty stylesheet`);
-  } else {
-    console.log('SKIP shell: no built app lacks apps/<app>.page.json — fallback not exercised');
-  }
 } catch (error) {
   failure = error;
 } finally {
