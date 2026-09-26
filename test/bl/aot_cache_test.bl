@@ -1,0 +1,250 @@
+; aot_cache_test.bl — the AOT artifact cache's contract, pinned at its callers.
+;
+; Ported from the ExUnit `test/beam_lisp/aot_cache_test.exs`. Those tests drove
+; the build through the Elixir shell `BeamLisp.BuildTask`; here the build goes
+; straight to `priv/build/build.bl` (`build/run`) — the driver the product boot
+; path uses — and every cache question is asked of the live `BeamLisp.AOTCache`.
+; No Elixir seam is left in the path.
+;
+; The cache is GLOBAL by default, so every test pins it to a per-test temp root
+; through BEAM_LISP_AOT_CACHE_DIR and restores the environment afterwards; runs
+; stay hermetic and never touch the developer's real cache.
+;
+; What is pinned, and why each one is worth a test:
+;
+;   · a second build of the same sources into a fresh dir is served from cache,
+;     and the linked beams are byte-identical to the first build's;
+;   · store/fetch round-trips the module list and the beam bytes;
+;   · recompiling a fetched beam cannot overwrite the cache entry — a re-fetch
+;     puts the stored bytes back;
+;   · a damaged or legacy entry is a miss and can be replaced;
+;   · entry keys cannot escape the cache root;
+;   · a missing entry degrades to a miss;
+;   · BEAM_LISP_AOT_CACHE=off disables participation;
+;   · `run_init_modules` invokes `__bl_init__/0` on shim modules and skips the
+;     companion shape that holds `__bl_init_values__` — silently;
+;   · a dependency's content change moves the closure key; an unrelated
+;     source's does not.
+;
+; Run: bl test test/bl/aot_cache_test.bl
+
+(ns aot-cache.test
+  (:require [build :as b]))
+
+(defn- restore-env
+  "Put an environment variable back the way it was found: unset stays unset."
+  [k v]
+  (if (nil? v) (System/delete_env k) (System/put_env k v)))
+
+(defn- with-hermetic
+  "Run `f` with a FRESH per-test cache root, out dirs and fixture source dir,
+   cache participation ON, and the environment and current namespace restored
+   afterwards.
+
+   Mirrors the ExUnit suite's `setup`/`on_exit`: a temp root in
+   BEAM_LISP_AOT_CACHE_DIR, the previous values restored, and everything this
+   test created removed — so a run cannot read or leave another test's state."
+  [f]
+  (let [tag (erlang/unique_integer (list :positive))
+        cache-dir (str (System/tmp_dir!) "/bl_aot_cache_test_" tag)
+        out-a (str (System/tmp_dir!) "/bl_aot_cache_out_a_" tag)
+        out-b (str (System/tmp_dir!) "/bl_aot_cache_out_b_" tag)
+        src-dir (str (System/tmp_dir!) "/bl_aot_cache_src_" tag)
+        prev-dir (System/get_env "BEAM_LISP_AOT_CACHE_DIR")
+        prev-off (System/get_env "BEAM_LISP_AOT_CACHE")
+        prev-ns (BeamLisp.Env/current_ns)]
+    (System/put_env "BEAM_LISP_AOT_CACHE_DIR" cache-dir)
+    (System/delete_env "BEAM_LISP_AOT_CACHE")
+    (try
+      (File/mkdir_p! src-dir)
+      (f {:cache-dir cache-dir :out-a out-a :out-b out-b :src-dir src-dir})
+      (finally
+        (restore-env "BEAM_LISP_AOT_CACHE_DIR" prev-dir)
+        (restore-env "BEAM_LISP_AOT_CACHE" prev-off)
+        (BeamLisp.Env/in_ns prev-ns)
+        (File/rm_rf! cache-dir)
+        (File/rm_rf! out-a)
+        (File/rm_rf! out-b)
+        (File/rm_rf! src-dir)))))
+
+(defn- aot-opts
+  "The `output_dir` keyword list `BeamLisp.AOT/compile_source` takes."
+  [out]
+  (list (erlang/list_to_tuple (list :output_dir out))))
+
+(defn- beam-name
+  "The beam file for a module atom, as the cache and the build name it."
+  [mod]
+  (str mod ".beam"))
+
+(defn- build-run
+  "Run the live build driver over `sources` into `out`."
+  [sources out]
+  (b/run {:sources sources
+          :out out
+          :manifest (Path/join out "compile.beam_lisp")
+          :jobs 2}))
+
+; ── a second build is served from the cache ──────────────────────────────────
+
+(deftest a-second-build-into-a-fresh-dir-is-served-from-cache
+  (with-hermetic
+    (fn [{:keys [cache-dir out-a out-b]}]
+      (let [fixture-dir (Path/join (BeamLisp/cwd) "test/fixtures/aot")
+            sources (Path/wildcard (Path/join fixture-dir "**/*.bl"))
+            r1 (build-run sources out-a)]
+        (is (= [] (:errors r1)))
+        (is (File/dir? cache-dir) "the build must populate the configured cache root")
+        (is (> (count (Path/wildcard (str cache-dir "/*/*/manifest.term"))) 0)
+            "the cache must hold at least one entry after a build")
+
+        ; A fresh output dir with no manifest of its own: without the cache this
+        ; run compiles; with it, every source is a fetch.
+        (let [r2 (build-run sources out-b)]
+          (is (= [] (:errors r2)))
+          (doseq [m ["Greeter" "Hello" "Math"]]
+            (let [beam (str "Elixir.BeamLisp.Ns." m ".beam")]
+              (is (File/exists? (Path/join out-b beam))
+                  (str "expected " beam " linked into out-b"))
+              (is (= (File/read! (Path/join out-a beam))
+                     (File/read! (Path/join out-b beam)))
+                  (str beam " must be byte-identical to the first build's")))))))))
+
+; ── store/fetch round-trip ───────────────────────────────────────────────────
+
+(deftest a-cache-hit-round-trips-modules-and-beam-bytes
+  (with-hermetic
+    (fn [{:keys [out-b src-dir]}]
+      (let [key (BeamLisp.AOTCache/compiler_key)]
+        (is (string? key))
+        (is (string? (BeamLisp.AOTCache/closure_key "/nonexistent/x.bl" {} {"/nonexistent/x.bl" "h"})))
+
+        ; store then fetch round-trips the module list and the beam bytes
+        ;
+        ; `crypto/strong_rand_bytes`, never `:crypto/strong_rand_bytes`: the
+        ; colon form reads as the namespaced KEYWORD `:crypto/strong_rand_bytes`,
+        ; so it is a keyword lookup that yields nil for a non-map argument — and
+        ; File.write! then dies :badarg on a non-iodata body. That reads as a
+        ; filesystem failure and is not one.
+        (let [fake-beam (crypto/strong_rand_bytes 64)
+              mod :Elixir.FakeMod]
+          (File/write! (Path/join src-dir (beam-name mod)) fake-beam)
+          (is (= :ok (BeamLisp.AOTCache/store key "closure" src-dir (list mod))))
+          (let [res (BeamLisp.AOTCache/fetch key "closure" out-b)]
+            (is (= :ok (elem res 0)))
+            (is (= (list mod) (elem res 1))))
+          (is (= fake-beam (File/read! (Path/join out-b (beam-name mod))))))))))
+
+; ── an entry is immutable once published ─────────────────────────────────────
+
+(deftest recompiling-a-fetched-beam-cannot-overwrite-its-entry
+  (with-hermetic
+    (fn [{:keys [out-a out-b]}]
+      (let [source "(ns cache_immutable_fixture) (defn answer [] 1)"
+            modules (to-list (map (fn [m] (elem m 0))
+                                  (BeamLisp.AOT/compile_source source (aot-opts out-a))))
+            key (BeamLisp.AOTCache/compiler_key)]
+        (is (= :ok (BeamLisp.AOTCache/store key "immutable" out-a modules)))
+        (let [res (BeamLisp.AOTCache/fetch key "immutable" out-b)]
+          (is (= :ok (elem res 0)))
+          (is (= modules (elem res 1))))
+
+        (let [original (to-list (map (fn [m] (list (beam-name m)
+                                                   (File/read! (Path/join out-b (beam-name m)))))
+                                     modules))]
+          ; Recompile a CHANGED source over the fetched beams.
+          (BeamLisp.AOT/compile_source (String/replace source "[] 1" "[] 2") (aot-opts out-b))
+          (BeamLisp.Env/in_ns "aot-cache.test")
+          (is (some (fn [p] (not= (File/read! (Path/join out-b (first p))) (second p))) original)
+              "the recompile must actually change the beam on disk")
+
+          ; A re-fetch restores the stored bytes — the entry was never touched.
+          (is (= :ok (elem (BeamLisp.AOTCache/fetch key "immutable" out-b) 0)))
+          (doseq [p original]
+            (is (= (second p) (File/read! (Path/join out-b (first p))))
+                (str (first p) " must be restored from the cache entry"))))))))
+
+; ── a damaged or legacy entry ────────────────────────────────────────────────
+
+(deftest a-damaged-or-legacy-entry-is-a-miss-and-can-be-replaced
+  (with-hermetic
+    (fn [{:keys [out-a out-b]}]
+      (let [mod :Elixir.BeamLisp.CacheIntegrityFixture
+            beam (beam-name mod)
+            entry (Path/join (Path/join (BeamLisp.AOTCache/dir) "integrity") "entry")]
+        (File/mkdir_p! out-a)
+        (File/write! (Path/join out-a beam) "original")
+        (is (= :ok (BeamLisp.AOTCache/store "integrity" "entry" out-a (list mod))))
+
+        (File/write! (Path/join entry beam) "corrupt")
+        (is (= :miss (BeamLisp.AOTCache/fetch "integrity" "entry" out-b)))
+        (is (= :ok (BeamLisp.AOTCache/store "integrity" "entry" out-a (list mod))))
+        (let [res (BeamLisp.AOTCache/fetch "integrity" "entry" out-b)]
+          (is (= :ok (elem res 0)))
+          (is (= (list mod) (elem res 1))))
+        (is (= "original" (File/read! (Path/join out-b beam))))
+
+        ; A legacy entry carries no version/digests: on-disk input, never trusted.
+        (File/write! (Path/join entry "manifest.term")
+                     (erlang/term_to_binary {:modules (list mod)}))
+        (is (= :miss (BeamLisp.AOTCache/fetch "integrity" "entry" out-b)))
+        (is (= :ok (BeamLisp.AOTCache/store "integrity" "entry" out-a (list mod))))
+        (is (= :ok (elem (BeamLisp.AOTCache/fetch "integrity" "entry" out-b) 0)))))))
+
+; ── keys and absence ─────────────────────────────────────────────────────────
+
+(deftest cache-entry-keys-cannot-escape-the-cache-root
+  (with-hermetic
+    (fn [{:keys [out-a]}]
+      (is (thrown-with-msg? "safe path components"
+            (BeamLisp.AOTCache/store ".." "entry" out-a (list)))))))
+
+(deftest missing-beams-degrade-to-a-miss
+  (with-hermetic
+    (fn [_]
+      (is (= :miss (BeamLisp.AOTCache/fetch (BeamLisp.AOTCache/compiler_key)
+                                            "never-stored"
+                                            (System/tmp_dir!)))))))
+
+(deftest beam-lisp-aot-cache-off-disables-participation
+  (with-hermetic
+    (fn [_]
+      (System/put_env "BEAM_LISP_AOT_CACHE" "off")
+      (is (not (BeamLisp.AOTCache/enabled?)))
+      (System/delete_env "BEAM_LISP_AOT_CACHE")
+      (is (BeamLisp.AOTCache/enabled?)))))
+
+; ── init shims ───────────────────────────────────────────────────────────────
+
+(deftest run-init-modules-invokes-bl-init-on-shims-only
+  (with-hermetic
+    (fn [_]
+      (let [n (erlang/unique_integer (list :positive))
+            shim (str "Elixir.BeamLisp.Ns.Spike" n)
+            companion (str "Elixir.BeamLisp.Ns.Init.Spike" n)
+            shim-mod (erlang/binary_to_atom shim :utf8)
+            companion-mod (erlang/binary_to_atom companion :utf8)]
+        (Code/compile_string
+          (str "defmodule " shim " do\n  def __bl_init__, do: send(self(), :init_ran)\nend\n"))
+        ; The companion shape: holds __bl_init_values__, NOT __bl_init__ —
+        ; must be skipped silently.
+        (Code/compile_string
+          (str "defmodule " companion " do\n  def __bl_init_values__, do: :ok\nend\n"))
+        (is (= :ok (BeamLisp.AOTCache/run_init_modules (list companion-mod shim-mod) (System/tmp_dir!))))
+        (is (receive :init_ran true (after 200 false))
+            "run_init_modules must call __bl_init__/0 on the shim")))))
+
+; ── the closure key ──────────────────────────────────────────────────────────
+
+(deftest changing-a-dependencys-content-changes-the-closure-key
+  (with-hermetic
+    (fn [_]
+      (let [hashes-a {"a.bl" "1" "b.bl" "2" "c.bl" "9"}
+            hashes-b {"a.bl" "1" "b.bl" "3" "c.bl" "9"}
+            deps {"a.bl" ["b.bl"] "b.bl" []}]
+        (is (not= (BeamLisp.AOTCache/closure_key "a.bl" deps hashes-a)
+                  (BeamLisp.AOTCache/closure_key "a.bl" deps hashes-b)))
+
+        ; a source that does not depend on b.bl is unaffected
+        (is (= (BeamLisp.AOTCache/closure_key "c.bl" deps hashes-a)
+               (BeamLisp.AOTCache/closure_key "c.bl" deps hashes-b)))))))
