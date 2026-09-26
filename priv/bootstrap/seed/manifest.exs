@@ -5,7 +5,7 @@
     "file" => "beam_lisp.app",
     "sha256" => "868221a5f42922ca01a126204ac0440406751eee3c0b7939abdcab9f60ff614d"
   },
-  "build_key" => "480fc23d750957bf4cd8c5e19513b766d2a7bc40c7f48482b1e8cc56c73395d1",
+  "build_key" => "d417e9d1787fd079fe5092fe01a08ccb17d20d039a71fc14d3cf05a3f5e3fb3b",
   "compiler_key" => "c3800767e7b2f321169478217d00749ba9b82eafde858d5616ed0d53066ace3e",
   "elixir" => "1.20.2",
   "modules" => %{

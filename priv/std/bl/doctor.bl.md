@@ -19,7 +19,7 @@ still exits 0.
 
 ```beam-lisp
 (ns bl.doctor
-  (:require [bl.util :as u] [vm.client] [model]))
+  (:require [bl.util :as u] [vm.client] [model] [vm.image :as image]))
 ```
 
 ## A probe never crashes
@@ -205,14 +205,14 @@ repository cannot pass would be a probe that lies about the tree it is reporting
 on. It says what is left and why, which is the fact a reader acts on.
 
 Nothing here infers an answer it could read. The image kind is asked
-(`BeamLisp.Image/kind`, the one implementation), the floor's provenance is read
+(`vm.image/kind`, the one implementation), the floor's provenance is read
 from the manifest the floor shipped with (`Bootstrap/manifest`), and the seed's
 verdict is `Bootstrap/key_matches?/1` rather than a second copy of the rule.
 
 ```beam-lisp
 (defn- mix-loaded?
   "Whether the Elixir build tool is RUNNING in this VM. Not a signal this
-   toolchain needs — `BeamLisp.Image/kind` answers the questions that used to be
+   toolchain needs — `vm.image/kind` answers the questions that used to be
    asked of Mix — but the honest answer to \"does this `bl` depend on Mix?\".
 
    RUNNING, not loadable, and the difference is the whole probe: `mix/ebin` ships
@@ -284,10 +284,10 @@ verdict is `Bootstrap/key_matches?/1` rather than a second copy of the rule.
                         "…) — reseed with `bl seed`"))}))))
 
 (defn- image-line []
-  (let [k (BeamLisp.Image/kind)]
+  (let [k (image/kind)]
     {:ok true
      :detail (str k
-                  (if (BeamLisp.Image/mutable?)
+                  (if (image/mutable?)
                     " (mutating reloads allowed)"
                     " (reloads refuse to mutate in place)"))}))
 
