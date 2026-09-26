@@ -1,0 +1,191 @@
+; self_build_gate_test.bl — THE FIXPOINT GATE (PLAN-108 W6), the whole chain,
+; run, and compared.
+;
+; Ported from the ExUnit `test/beam_lisp/self_build_gate_test.exs`, which was
+; the last live caller of `BeamLisp.Pristine`. The gate now needs no Elixir at
+; all: `release/assemble` + `drop/pack` build generation 1, that compound builds
+; generation 2 from inside itself, that one builds generation 3, and `pristine`
+; says the last two are the same file.
+;
+; ── OPT-IN, and why it HAS to be ───────────────────────────────────────────
+;
+; It packs a ~100 MB drop three times and rebuilds the whole tier source set
+; twice, so it takes minutes. The ExUnit spelling of "opt-in" was a `@moduletag
+; :selfbuild`, and it did NOT do the job: nothing excludes that tag — not
+; `test/test_helper.exs`, not `config/`, not `bl test` — so `bl test` (which is
+; what CI runs) discovered and ran the file by default, spending the whole cost
+; whenever a stock launcher happened to be on the machine.
+;
+; Here the opt-in is explicit and env-guarded:
+;
+;     BL_SELFBUILD_GATE=1 bin/bl test test/bl/self_build_gate_test.bl
+;
+; Without that variable the suite STATES that it skipped and passes. The stock
+; launcher's absence is a SEPARATE, equally visible skip: it says which path is
+; missing instead of silently passing.
+;
+; What it asserts, in the order the wave's gates were written:
+;
+;   G1  the new generation BOOTS: `version` answers, `eval` computes.
+;   G4  the FIXPOINT is exact: gen-2 and gen-3 are byte-identical.
+;
+; Why it runs the ARTIFACTS rather than the functions: a self-build's whole claim
+; is that a shipped drop can reproduce itself, so the thing invoked must be the
+; packed compound, launched the way a user launches it. `gen-1` is the last
+; artefact the Rust tooling makes; every generation after it comes from
+; `bl self-build` inside the previous one.
+;
+; Run: BL_SELFBUILD_GATE=1 bin/bl test test/bl/self_build_gate_test.bl
+;
+; FIXED since port time (the two pre-existing failures the ticket named):
+;
+;   1. foreign-checkout.  A compound launched with THIS CHECKOUT as its cwd
+;      finds its own payload as `priv_root` and stops with
+;      `selfbuild/foreign-checkout`. The gate wants the packed artifact, not
+;      that misdirection, so `run!` now moves every drop invocation to a
+;      neutral cwd (`neutral-cwd`) — absolute `--out`/`--scratch` make the cwd
+;      irrelevant to the work, and the inherited environment (`BL_ROOT`) is
+;      untouched.
+;   2. the BUILD_INFO.bl mismatch.  The recorded guess was a nil round-trip
+;      (`collect` has `:commit`/`:diffhash`/`:source-key` nil for a drop with no
+;      checkout) — MEASURED, that was wrong: `pr-str` prints a map in the BEAM's
+;      own map order, which is not a function of the map's value, so the two
+;      generations' images ordered the SAME 14 keys differently (`:source-key`
+;      and `:diffhash` adjacent in one file, apart in the other). `prov/write!`
+;      now prints key-SORTED (`canon`), so writing the map `read` just returned
+;      reproduces the same bytes. See `provenance_test`'s
+;      `nil-valued-keys-survive-and-the-file-bytes-are-canonical`.
+;
+; HOW TO RUN IT WHOLE. The `bl test` ward worker gives each file 300 s, and the
+; gate packs ~100 MB three times, so an ARMED run under `bl test` reports
+; INCOHERENT (worker timed out) however green the fixpoint is. Drive the same
+; steps directly (`bl run` a script that calls `release/assemble`, `drop/pack`,
+; the two `self-build`s and `pristine/compounds-identical?`) to see the full
+; gen-1→gen-2→gen-3 result.
+
+(ns self-build-gate.test
+  (:require [release :as rel] [drop :as d] [pristine :as p]))
+
+(def tree "/tmp/beam_lisp_gate_tree")
+(def gen1 "/tmp/bl-gate-gen1")
+(def gen2 "/tmp/bl-gate-gen2")
+(def gen3 "/tmp/bl-gate-gen3")
+(def scratch2 "/tmp/bl-gate-sb2")
+(def scratch3 "/tmp/bl-gate-sb3")
+(def staging "/tmp/bl-selfbuild-src")
+(def stock-launcher "/home/user/.cache/cargo-target/release/drop-launcher")
+
+(def neutral-cwd
+  "The cwd every drop invocation runs from. NOT the checkout.
+
+   A compound launched with a checkout as its cwd and its own payload as
+   `priv_root` is exactly the `selfbuild/foreign-checkout` case: `self-build`
+   would faithfully reproduce the payload it is running as and report the
+   payload's staleness as defects in the tree it is standing in. The gate means
+   to exercise the packed artifact, not that misdirection, so `run!` moves the
+   child to a directory with no `env.bl` and no source tree. Absolute `--out`
+   and `--scratch` make the cwd irrelevant to the work; only `foreign-checkout`
+   reads it."
+  "/")
+
+(defn- run!
+  "Run `bin ARGS` from `neutral-cwd`, answering `(output, exit)`.
+
+   `stderr_to_stdout` and `BL_DAEMON=off` are the two flags the ExUnit gate
+   passed and they are kept: a launcher's failure reason goes to stderr, and a
+   packaged image must not try to reach a warm daemon that is not there. `:env`
+   only OVERRIDES the variables it names (Elixir's `System.cmd` contract), so
+   the child still inherits the whole environment — `BL_ROOT` included. `:cd`
+   sets the child's cwd without touching either. The exit status is returned
+   rather than thrown so a boot failure is a REPORTED assertion, with the
+   launcher's own words."
+  [bin args]
+  (let [r (System/cmd bin
+                      (to-list args)
+                      (to-list [(tuple :cd neutral-cwd)
+                                (tuple :stderr_to_stdout true)
+                                (tuple :env (to-list [(tuple "BL_DAEMON" "off")]))]))]
+    (tuple (elem r 0) (elem r 1))))
+
+(defn- self-build!
+  "Build `to` from the compound at `from`, staging under `scratch`.
+
+   Both the scratch tree and the output are removed first: a self-build that
+   finds a half-written tree from an interrupted run must not read it as its
+   own, and an output file left behind must not pass for one this run produced.
+   A non-zero exit or a run that did not rebuild the tier sources fails LOUD
+   with the launcher's own output, because the interesting case here is a
+   generation that dies at boot — and its words are the only diagnosis."
+  [from to scratch]
+  (File/rm_rf! scratch)
+  (File/rm_rf! to)
+  (let [r (run! from ["self-build" "--out" to "--scratch" scratch])
+        out (elem r 0)
+        code (elem r 1)]
+    (is (= 0 code) (str "self-build " from " → " to " failed:\n" out))
+    (is (includes? out "tier sources rebuilt")
+        (str "self-build " from " → " to " did not report rebuilt tier sources:\n" out))
+    out))
+
+(deftest gen-1-builds-gen-2-gen-2-builds-gen-3-and-the-fixpoint-is-exact
+  (cond
+    (not= "1" (System/get_env "BL_SELFBUILD_GATE"))
+    (do
+      (println (str "self_build_gate_test: skipped — set BL_SELFBUILD_GATE=1 to run "
+                    "the gen-1→gen-2→gen-3 fixpoint gate (packs ~100 MB three times, "
+                    "rebuilds the tier sources twice; minutes)"))
+      (is true))
+
+    (not (File/exists? stock-launcher))
+    (do
+      (println (str "self_build_gate_test: skipped — no stock launcher at " stock-launcher))
+      (is true))
+
+    :else
+    (let [v (rel/value :beam_lisp)
+          a (rel/assemble v tree)]
+      (is (:ok? a) (str "assemble failed: " (pr-str (:errors a))))
+
+      ; ── gen-1: the last artefact the Rust tooling makes ──────────────────
+      (let [pk (d/pack tree stock-launcher gen1 0)]
+        (is (:ok? pk) (str "pack failed: " (pr-str (:errors pk))))
+        (File/chmod! gen1 493)
+
+        ; ── G1: each generation boots ──────────────────────────────────────
+        (self-build! gen1 gen2 scratch2)
+        (File/chmod! gen2 493)
+
+        (let [r (run! gen2 ["version"])]
+          (is (= 0 (elem r 1)) (str "gen-2 version exited " (elem r 1) ":\n" (elem r 0)))
+          (is (includes? (elem r 0) "beam-lisp")
+              (str "gen-2 version did not name the release:\n" (elem r 0))))
+        (let [r (run! gen2 ["eval" "(+ 40 2)"])]
+          (is (= 0 (elem r 1)) (str "gen-2 eval exited " (elem r 1) ":\n" (elem r 0)))
+          (is (includes? (elem r 0) "42")
+              (str "gen-2 eval did not compute 42:\n" (elem r 0))))
+
+        (self-build! gen2 gen3 scratch3)
+
+        ; ── G4: the fixpoint, byte for byte ────────────────────────────────
+        ; The report is built only on failure: `drops` decompresses both
+        ; payloads, and paying for the diagnosis when there is none would make
+        ; every green run as expensive as a red one.
+        (let [same? (p/compounds-identical? gen2 gen3)]
+          (is same?
+              (if same? "" (str "gen-2 and gen-3 differ:\n" (p/report (p/drops gen2 gen3))))))
+        (let [dd (p/drops gen2 gen3)]
+          (is (:same? dd))
+          (is (:same? (:compressed dd)))
+          (is (:same? (:sizes dd)))
+          (is (= "identical" (p/report dd))))
+
+        ; gen-3 runs too: a fixpoint that cannot boot is a coincidence.
+        (File/chmod! gen3 493)
+        (let [r (run! gen3 ["version"])]
+          (is (= 0 (elem r 1)) (str "gen-3 version exited " (elem r 1) ":\n" (elem r 0)))
+          (is (includes? (elem r 0) "beam-lisp")
+              (str "gen-3 version did not name the release:\n" (elem r 0))))
+
+        ; ── and the disk is given back: three compounds and three trees ────
+        (doseq [f [gen1 gen2 gen3]] (File/rm_rf! f))
+        (doseq [dir [tree scratch2 scratch3 staging]] (File/rm_rf! dir))))))
