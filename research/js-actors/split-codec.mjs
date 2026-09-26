@@ -19,6 +19,10 @@
 
 import * as H from './host.mjs';
 
+// Lists and records nest at most this deep (split-wire.bl `wire-max-depth`):
+// a recursive wire type admits trees of any depth, the wire does not.
+export const MAX_DEPTH = 24;
+
 export const PROPOSAL_KEYS = ['args', 'digest', 'op', 'request', 'revision'];
 
 export function createCodec(contract) {
@@ -37,9 +41,11 @@ export function createCodec(contract) {
     return spec;
   }
 
-  function decode(spec, v, path = '$') {
+  function decode(spec, v, path = '$', depth = 0) {
     const t = resolve(spec);
     const fail = why => { const e = new Error(path + ': ' + why); e.path = path; throw e; };
+    if (Array.isArray(t) && (t[0] === 'list' || t[0] === 'record') && depth >= MAX_DEPTH)
+      fail(`nested deeper than ${MAX_DEPTH}`);
     if (t === 'bool') return typeof v === 'boolean' ? v : fail('expected a boolean');
     if (!Array.isArray(t)) fail('malformed contract type');
     const [tag, a, b] = t;
@@ -56,7 +62,7 @@ export function createCodec(contract) {
     if (tag === 'list') {
       if (!Array.isArray(v)) fail('expected a list');
       if (v.length > a) fail(`list of ${v.length} exceeds ${a}`);
-      return H.vec(v.map((x, i) => decode(b, x, `${path}[${i}]`)));
+      return H.vec(v.map((x, i) => decode(b, x, `${path}[${i}]`, depth + 1)));
     }
     if (tag === 'record') {
       if (v === null || typeof v !== 'object' || Array.isArray(v)) fail('expected a record');
@@ -64,7 +70,7 @@ export function createCodec(contract) {
       const got = Object.keys(v).sort();
       if (want.length !== got.length || want.some((k, i) => k !== got[i]))
         fail(`record keys ${JSON.stringify(got)} are not exactly ${JSON.stringify(want)}`);
-      return H.bmap(want.map(k => [H.kw(k), decode(a[k], v[k], `${path}.${k}`)]));
+      return H.bmap(want.map(k => [H.kw(k), decode(a[k], v[k], `${path}.${k}`, depth + 1)]));
     }
     return fail('unknown wire tag ' + tag);
   }

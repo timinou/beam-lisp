@@ -278,10 +278,26 @@ function runs** and emits three artifacts:
 ```sh
 BEAM_LISP_Z3=/usr/bin/z3 ELIXIR_ERL_OPTIONS='+S 8:8 +SDio 8' \
   JS_ACTORS_SPLIT_ONLY=1 ./bin/bl run research/js-actors/compiler.bl   # split only, ~3 min
-node research/js-actors/verify-split.mjs                                # 23 end-to-end checks
+node research/js-actors/verify-split.mjs                                # 24 end-to-end checks
+node research/js-actors/verify-outline.mjs                              # the nested-plan app, 22 checks
+node research/js-actors/verify-shell.mjs                                # the shared page/server shell
 node research/js-actors/verify-order-parity.mjs                         # sort/compare/combinators = BEAM, 30 answers
 node research/js-actors/split-server.mjs --port 8791                    # then open http://127.0.0.1:8791/
+node research/js-actors/split-server.mjs --port 8792 --app outline      # any app under apps/
 ```
+
+**One shell, many apps.** `showcase.bl` is the launch board; every other app
+lives in [`apps/`](apps/) as `<app>.bl` plus an optional `<app>.css` (its
+look) and `<app>.page.json` (title, lede and hints for the page). The page,
+the Worker and the transport are the same for all of them: the server says
+which app it serves (`GET /api/app`) and the page loads that app's bundle,
+contract, manifest and stylesheet. "How it was built" (placement lanes,
+evidence, timeline, contract) collapses to give the app the whole width.
+
+| App | Shows | Proof |
+|---|---|---|
+| `showcase.bl` — launch board | placement, shared checks, rebase, function values, composed predicates | `verify-split.mjs`, [proof/track1-higher-order.png](proof/track1-higher-order.png) |
+| `apps/outline.bl` — nested project plan | **data of any shape**: a recursive wire type, a recursive view, recursive roll-ups, search that keeps ancestors, a whole subtree ticked at once | `verify-outline.mjs`, [proof/track2-outline.png](proof/track2-outline.png), [proof/track2-outline-search.png](proof/track2-outline-search.png) |
 
 **The declaration.** Roots only — nothing says "client" or "server" per function:
 
@@ -449,6 +465,22 @@ committed in both tabs; server killed → intent dropped, board unchanged, draft
 returned. Every sort order right with no revision change; a snapshot from
 another tab arrives already in the chosen order; an event name the view did
 not offer is refused by the Worker.
+
+**Recursive data.** A named wire type may refer to itself through a list:
+`:item [:record {… :kids [:list 16 :item]}]`. The build refuses a cycle with no
+list on it (it has no finite value) and any type nested deeper than 24 lists
+and records (no value would pass the wire); the authority's `wire-ok?` and the
+codec refuse any VALUE nested deeper than 24 — one bound, in `compiler.bl`,
+`split-wire.bl` and `split-codec.mjs`, checked equal by `verify-outline.mjs`.
+Code over such data is ordinary recursion: `item-row` renders an item and,
+inside it, `item-row` of each child; `find-item` and `depth-of` run in both
+halves; the server rebuilds the path down to one item. Each is admitted by
+**structural descent** — the call passes an element of a child list, a strict
+part of its argument — and a lookup result (`(:kids it)`, `(first xs)`, which
+may be nil) counts as no larger than its source. The outline's refusal
+fixtures: recursing on the item itself instead of a child, re-wrapping the
+item before recursing, recursing on a growing search string, an item type
+that must hold an item, and a type nested 25 deep.
 
 **Limits, stated.** No authentication (single-user loopback). One app per
 file; only `defn`s besides the declaration. The closure flow is a 0-CFA: one
