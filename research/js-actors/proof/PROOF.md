@@ -176,3 +176,31 @@ cases whose order is determined. Maps over 32 keys: BEAM uses hash order; the
 JS target keeps term order. `1` and `1.0` are one JS Number (`(/ 8 2)` prints
 `4`, BEAM `4.0`). Decimals are not implemented.
 | full build + all Node suites | build exit 0 (52 OK diagnostics: the "unsafe literal refused" diagnostic became a positive exact-emission test), SPLIT PASS ×6, parity 95, **28/28** Node suites |
+
+## Independent security review (after tracks 4–7)
+
+A separate reviewer red-teamed sessions, stamping, the log, the codec, the page
+and the Worker. **Verified to hold** (source-traced): HttpOnly/SameSite=Strict
+cookies; HMAC-SHA256 checked with timingSafeEqual; expiry and logout; the actor
+is the transport's even when sent through JSON keys, headers, nested args or
+prototype keys; permissions decided in BL; Host/Origin checks on login, logout
+and intents; codec bounds (depth, text, lists, `:exact` digits, `:one-of`);
+newline-safe JSONL; replay re-checks shape, revision and permission; text-only
+rendering through an attribute allowlist; page hints and drag keys are text;
+logs and BL sources are never served.
+
+**Two defects found, both fixed and pinned by tests:**
+
+| Finding | Fix | Test |
+|---|---|---|
+| a failed log append could still let the HTTP result through (result and snapshot were delivered before the append) | a durable app's ok result and snapshot are HELD until the commit is on disk; a failed append fails the service closed and the held answer is never sent | `verify-durable-ack.mjs`: the log path becomes a directory → 503, and every later intent 503 |
+| an intent named with `?` (admitted by the compiler) wrote log lines the replay refused, so the app could not restart | the log's op-name rule is exactly the compiler's `[a-z][a-z0-9?-]{0,31}` | `verify-session.mjs`: `ready?` replays; `under_score`, 33 characters, `?lead` refused |
+
+**Stated limits the review confirmed:** the Worker checks an event's handler
+NAME against the last view (not the whole vector); keys outside the page's
+allowlist are ignored by the page only; actors in the on-disk log are trusted
+at replay (the file is the server's own); any visitor may peek at kept
+revisions; a person stays "here" until their last stream closes; the 32-stream
+cap can be exhausted by one client (loopback demo).
+
+Node suites after the fixes: **29/29**.

@@ -99,7 +99,7 @@ export function logEntryShapeError(v) {
   if (v.v !== LOG_VERSION) return 'bad-version';
   if (!Number.isSafeInteger(v.revision) || v.revision < 1) return 'bad-revision';
   if (!(v.actor === null || (typeof v.actor === 'string' && v.actor.length <= MAX_USER))) return 'bad-actor';
-  if (typeof v.op !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(v.op)) return 'bad-op';
+  if (typeof v.op !== 'string' || !/^[a-z][a-z0-9?-]{0,31}$/.test(v.op)) return 'bad-op';
   if (typeof v.nonce !== 'string' || v.nonce.length < 1 || v.nonce.length > 64) return 'bad-nonce';
   if (v.args === null || typeof v.args !== 'object' || Array.isArray(v.args)) return 'bad-args';
   if (typeof v.at !== 'string' || v.at.length > 40) return 'bad-at';

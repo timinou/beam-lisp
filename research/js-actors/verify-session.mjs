@@ -115,6 +115,18 @@ for (const [mutate, reason] of [
 }
 ok('a line of the wrong shape fails closed with a named reason');
 
+// every intent name the compiler admits (wire-name-ok?: [a-z][a-z0-9?-]{0,31})
+// must be a name the log can replay — `ready?` included (review finding)
+for (const op of ['ready?', 'mark-done', 'a', 'x'.repeat(32)]) {
+  const one = { v: 1, revision: 1, at: '2026-09-26T00:00:00.000Z', actor: null, op, args: {}, nonce: 'tabtabtab:1' };
+  assert.equal(S.parseLogText(JSON.stringify(one) + '\n').error, null, op);
+}
+for (const op of ['under_score', 'x'.repeat(33), '?lead']) {
+  const one = { v: 1, revision: 1, at: '2026-09-26T00:00:00.000Z', actor: null, op, args: {}, nonce: 'tabtabtab:1' };
+  assert.equal(S.parseLogText(JSON.stringify(one) + '\n').error.reason, 'bad-op', op);
+}
+ok('the log accepts exactly the intent names the compiler admits');
+
 const entry = { v: 1, revision: 3, at: '2026-09-26T00:00:00.000Z', actor: 'alice', op: 'bump', args: { by: 1 }, nonce: 'tabtabtab:3' };
 assert.equal(S.logEntryError(entry, { isKnownOp: () => true, expectedRevision: 3 }), null);
 assert.equal(S.logEntryError(entry, { isKnownOp: () => true, expectedRevision: 4 }), 'revision-out-of-order');

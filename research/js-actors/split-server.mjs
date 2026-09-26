@@ -132,6 +132,16 @@ function createAuthority(codec, bundleUrl, { onCommit, watch } = {}) {
       current = { revision: frame.revision, board: frame.board };
       extra = { people: frame.people ?? null, recent: frame.recent ?? null, history: frame.history ?? null };
       resolveReady();
+    } else if (topic === 'result' && onCommit && frame.ok === true && frame.duplicate !== true) {
+      // A durable app's commit is only acknowledged once it is ON DISK: the
+      // authority emits result, snapshot, then commit; hold the first two
+      // until the append succeeds (below). A failed append fails the service
+      // closed and the held result is never delivered.
+      held = { result: frame, snapshot: null };
+      return;
+    } else if (topic === 'snapshot' && held) {
+      held.snapshot = frame;
+      return;
     } else if (topic === 'result') {
       current = { revision: frame.revision, board: frame.board };
       if (frame.recent !== undefined) extra.recent = frame.recent;
@@ -157,9 +167,24 @@ function createAuthority(codec, bundleUrl, { onCommit, watch } = {}) {
     // delivered — a commit is on disk before its result is written.
     if (watch) watch(topic, frame);
     if (topic === 'commit' && onCommit) {
-      try { onCommit(frame); } catch (error) { fail('could not append the commit log: ' + error.message); }
+      const h = held;
+      held = null;
+      try { onCommit(frame); } catch (error) { fail('could not append the commit log: ' + error.message); return; }
+      // durable now: deliver what was held, in the order it was emitted
+      if (h) {
+        deliver('result', h.result);
+        if (h.snapshot) deliver('snapshot', h.snapshot);
+      }
     }
   });
+  let held = null;
+  function deliver(topic, frame) {
+    current = { revision: frame.revision, board: frame.board };
+    if (frame.recent !== undefined) extra.recent = frame.recent;
+    if (frame.history !== undefined) extra.history = frame.history;
+    if (topic === 'result') settle('result:' + frame.request, frame);
+    else for (const fn of listeners) fn(frame);
+  }
 
   import(bundleUrl).catch(error => fail('authority failed: ' + error.message));
 
