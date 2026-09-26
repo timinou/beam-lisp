@@ -29,7 +29,8 @@ for {mod, forbidden} <- [{BeamLisp.Ns.Anf, [:normalise, :"quote-node", :"norm-pa
   unless Enum.all?(mod.module_info(:exports), fn {name, _} -> name not in forbidden end),
     do: raise("legacy exports remain in #{inspect(mod)}")
 end
-IO.inspect(BeamLisp.Generation.receipt(), label: "FRESH_CANDIDATE_RECEIPT", limit: :infinity)
+BeamLisp.Loader.ensure_loaded("vm.generation")
+IO.inspect(BeamLisp.Ns.Vm.Generation.receipt(), label: "FRESH_CANDIDATE_RECEIPT", limit: :infinity)
 IO.puts("FRESH_CANDIDATE_OK: #{seed}")
 File.rm_rf!(stage)
 System.halt(0)

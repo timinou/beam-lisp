@@ -78,7 +78,8 @@ defmodule CompilerRetentionProbe do
       end
       {name, expected}
     end)
-    IO.inspect(BeamLisp.Generation.receipt(), label: "RETENTION_GENERATION_#{label}", limit: :infinity)
+    BeamLisp.Loader.ensure_loaded("vm.generation")
+    IO.inspect(BeamLisp.Ns.Vm.Generation.receipt(), label: "RETENTION_GENERATION_#{label}", limit: :infinity)
     results
   end
 end

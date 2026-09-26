@@ -2,11 +2,11 @@
 # candidate floor without modifying the committed seed. No legacy host,
 # quoted importer, or permissive collection adapter is installed.
 Code.compiler_options(ignore_module_conflict: true, infer_signatures: false)
-for path <- ["lib/beam_lisp/compiler_data.ex", "lib/beam_lisp/emit.ex",
+for path <- ["lib/beam_lisp/emit.ex",
              "lib/beam_lisp/link.ex", "lib/beam_lisp/compiler.ex",
-             "lib/beam_lisp/record.ex", "lib/beam_lisp/native.ex",
+             "lib/beam_lisp/record.ex",
              "lib/beam_lisp/aot.ex", "lib/beam_lisp/aot_cache.ex",
-             "lib/beam_lisp/generation.ex", "lib/beam_lisp.ex",
+             "lib/beam_lisp.ex",
              "lib/beam_lisp/dev_hotpatch.ex", "lib/beam_lisp/anf_interpreter.ex",
              "lib/beam_lisp/dev_change.ex"] do
   Code.compile_file(path)
@@ -30,7 +30,8 @@ case System.get_env("CANONICAL_HOTPATCH") do
   "" -> :ok
   names -> BeamLisp.DevHotpatch.hotpatch!(names)
 end
-IO.inspect(BeamLisp.Generation.receipt(), label: "GENERATION_RECEIPT", limit: :infinity)
+BeamLisp.Loader.ensure_loaded("vm.generation")
+IO.inspect(BeamLisp.Ns.Vm.Generation.receipt(), label: "GENERATION_RECEIPT", limit: :infinity)
 
 if System.get_env("PROFILE_CANONICAL_COMPILER") == "1" do
   Code.require_file("!tasks/artifacts/compiler-retention-probe.exs")
