@@ -150,6 +150,27 @@ defmodule BeamLisp.AOT do
       host leaf) the generator is running on. A pinned beam exists to stand in
       for that module in a FRESH VM, never to be substituted mid-flight in the
       one that built it.
+    * `:struct_fields` — an optional `[{field, default}]` list. When given,
+      the pinned module becomes an Elixir struct module: the emitter synthesizes
+      the pair `__struct__/0` and `__struct__/1` that `defstruct` itself
+      generates, in bl-ANF, WITHOUT writing or compiling any Elixir source.
+      `__struct__/0` answers `%{__struct__: module, field: default, …}` and
+      `__struct__/1` folds a keyword list or map over those defaults with
+      `:maps.update/3` — so an unknown key is refused with `{:badkey, key}`
+      exactly as an Elixir-generated constructor refuses it (a `rescue`
+      normalises it to `KeyError`), and the `:__struct__` tag is a plain map key,
+      so `is_struct/1` and `Map.from_struct/1` answer as for any Elixir struct.
+      `[]` is a tag-only struct (Elixir's `defstruct []`); `nil` (the default)
+      keeps the module functions-only. Field names must be atoms supplied by the
+      caller (never minted from strings) and defaults must be literal data.
+
+      NOT emitted in this phase: protocol impls (`Enumerable`, `Inspect`,
+      `Exception`, …) and the `__info__(:struct)` field metadata that
+      `Inspect.Any` reads — so `inspect/1` still renders the value as a plain
+      map. Those are the NEXT extension, and the constructor pair here is the
+      primitive they hang off: a protocol impl is its own module (`Elixir.<Proto>.<Mod>`),
+      which a `.bl` namespace can already define, and the struct metadata is one
+      more generated export.
     * `:file` — the source path used for positions (defaults to `path`).
 
   Returns `{module, beam_path}`. Raises `ArgumentError` on an invalid module
@@ -164,6 +185,7 @@ defmodule BeamLisp.AOT do
     output_dir = Keyword.fetch!(opts, :output_dir)
     file = Keyword.get(opts, :file, path)
     load? = Keyword.get(opts, :load?, true)
+    struct_fields = opts |> Keyword.get(:struct_fields, nil) |> validate_struct_fields!()
 
     BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
       source = BeamLisp.Loader.read_source(path)
@@ -196,6 +218,20 @@ defmodule BeamLisp.AOT do
         raise ArgumentError,
               "pinned host module #{inspect(module)} would export no functions (#{path})"
       end
+
+      # `:struct_fields` widens the SAME module surface with the constructor pair
+      # Elixir's `defstruct` generates — appended, never substituted, so a file
+      # that also writes `__struct__` by hand is refused rather than silently
+      # shadowed. Nothing above changes when the option is absent: the clause
+      # list is the file's defns exactly, so a functions-only pinned beam is
+      # byte-for-byte what it was.
+      if struct_fields != nil and Enum.any?(clauses, &(&1.fname == :__struct__)) do
+        raise ArgumentError,
+              "pinned host module #{inspect(module)} defines __struct__ itself; " <>
+                ":struct_fields would duplicate it"
+      end
+
+      clauses = clauses ++ struct_clauses(module, struct_fields)
 
       descriptor = Emit.descriptor_for(module, clauses, host_attrs(opts), %{file: file})
       {mod, beam} = Emit.compile_descriptor(descriptor)
@@ -331,6 +367,148 @@ defmodule BeamLisp.AOT do
   end
 
   defp retarget_host(other, _from, _to), do: other
+
+  # ── struct surface (`:struct_fields`) ──────────────────────────────────────
+  #
+  # A pinned host module that carries data needs the constructor pair every
+  # Elixir struct has. `:struct_fields` synthesizes exactly the two functions
+  # `defstruct` generates — as bl-ANF data, never as Elixir source:
+  #
+  #     __struct__/0 →  %{__struct__: module, field: default, …}
+  #     __struct__/1 →  Enum.reduce(kv, __struct__(), fn {k, v}, m -> %{m | k => v} end)
+  #
+  # `%{m | k => v}` compiles to `:maps.update/3`, which refuses an unknown key
+  # with `:error {:badkey, k}` — the SAME refusal the reference Elixir beam
+  # raises (`rescue` normalizes it to `KeyError`). The `:__struct__` key is an
+  # ordinary map field, so `is_struct/1` / `Map.from_struct/1` answer unchanged.
+  # Every key and default is a Core literal (validated below), so no atom is
+  # minted from a string and the default is emitted as data, never a call.
+  defp struct_clauses(_module, nil), do: []
+
+  defp struct_clauses(module, fields) do
+    default = struct_default_node(module, fields)
+
+    [
+      %{op: :"defn-clause", fname: :__struct__, params: [], guard: nil, body: default, ann: %{}},
+      %{
+        op: :"defn-clause",
+        fname: :__struct__,
+        params: [anf_pvar("kv")],
+        guard: nil,
+        body: %{
+          op: :remote,
+          mod: Enum,
+          fun: :reduce,
+          args: [anf_var("kv"), default, struct_reducer_node()],
+          ann: %{}
+        },
+        ann: %{}
+      }
+    ]
+  end
+
+  # `%{__struct__: module, field: default, …}` — the map Elixir's generated
+  # `__struct__/0` returns, as an ANF `:map` whose keys and values are literals.
+  defp struct_default_node(module, fields) do
+    pairs =
+      [{:__struct__, module} | fields]
+      |> Enum.map(fn {key, value} -> [anf_lit(key), anf_lit(value)] end)
+
+    %{op: :map, pairs: pairs, ann: %{}}
+  end
+
+  # `fn {key, val}, map -> :maps.update(key, val, map); _, _ -> :erlang.error(:function_clause) end`
+  # — the reducer the generated `%{map | key => val}` compiles to, with the
+  # reference fun's single-clause refusal spelled out: a `{k, v}`-less element in
+  # the input is a `FunctionClauseError` for `defstruct`, while the bl-ANF `:fn`
+  # lowering compiles a pattern MISS to an empty case (an `if_clause`), so the
+  # refusal is explicit here.
+  defp struct_reducer_node do
+    %{
+      op: :fn,
+      clauses: [
+        %{
+          pats: [%{pop: :ptuple, elems: [anf_pvar("key"), anf_pvar("val")]}, anf_pvar("map")],
+          guard: nil,
+          body: %{
+            op: :remote,
+            mod: :maps,
+            fun: :update,
+            args: [anf_var("key"), anf_var("val"), anf_var("map")],
+            ann: %{}
+          }
+        },
+        %{
+          pats: [anf_pvar("_"), anf_pvar("_")],
+          guard: nil,
+          body: %{
+            op: :remote,
+            mod: :erlang,
+            fun: :error,
+            args: [anf_lit(:function_clause)],
+            ann: %{}
+          }
+        }
+      ],
+      ann: %{}
+    }
+  end
+
+  defp anf_lit(value), do: %{op: :lit, val: value, ann: %{}}
+  defp anf_var(name), do: %{op: :var, name: name, ann: %{}}
+  defp anf_pvar(name), do: %{pop: :pvar, name: name}
+
+  # The struct surface is METADATA from the caller, never text to interpret: a
+  # field is an atom the caller already holds (no `String.to_atom` anywhere on
+  # this path), its default must be data the Core backend can emit as a literal,
+  # and the two shapes Elixir itself refuses — a `:__struct__` field, a duplicate
+  # name — are refused here rather than left to a later boundary error.
+  defp validate_struct_fields!(nil), do: nil
+
+  defp validate_struct_fields!(fields) when is_list(fields) do
+    Enum.reduce(fields, [], fn
+      {:__struct__, _default}, _acc ->
+        raise ArgumentError, "cannot set :__struct__ in struct definition"
+
+      {key, default}, acc when is_atom(key) ->
+        if List.keymember?(acc, key, 0) do
+          raise ArgumentError, "duplicate struct field #{inspect(key)}"
+        end
+
+        if literal_data?(default) do
+          acc ++ [{key, default}]
+        else
+          raise ArgumentError,
+                "struct field #{inspect(key)} default must be literal data, got: " <>
+                  inspect(default, limit: 5)
+        end
+
+      {key, _default}, _acc ->
+        raise ArgumentError, "struct field names must be atoms, got: #{inspect(key)}"
+
+      other, _acc ->
+        raise ArgumentError,
+              ":struct_fields entries must be {name, default} pairs, got: #{inspect(other)}"
+    end)
+  end
+
+  defp validate_struct_fields!(other) do
+    raise ArgumentError,
+          ":struct_fields must be a list of {name, default} pairs, got: #{inspect(other)}"
+  end
+
+  # What `BeamLisp.Ns.Anf`'s `literal-data?` accepts, minus anything with a
+  # runtime identity: a default that cannot be a Core literal would otherwise fail
+  # at the descriptor boundary with a message naming the node, not the field.
+  defp literal_data?(value) do
+    cond do
+      is_function(value) -> false
+      is_tuple(value) -> value |> Tuple.to_list() |> Enum.all?(&literal_data?/1)
+      is_list(value) -> Enum.all?(value, &literal_data?/1)
+      is_map(value) -> Enum.all?(value, fn {k, v} -> literal_data?(k) and literal_data?(v) end)
+      true -> is_atom(value) or is_number(value) or is_bitstring(value)
+    end
+  end
 
   # Run one compilation unit through the ordinary reader/compiler pipeline and
   # return everything the emitters need. Shared by `compile_source/2` (the

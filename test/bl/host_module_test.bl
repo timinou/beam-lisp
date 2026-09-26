@@ -126,6 +126,150 @@
       (code/delete mod)
       (File/rm_rf! dir))))
 
+; ── the struct surface: `:struct_fields` ─────────────────────────────────
+;
+; A pinned host module that carries DATA needs the constructor pair every Elixir
+; struct has. `:struct_fields` synthesizes `__struct__/0` and `__struct__/1` in
+; bl-ANF — no Elixir source, no `defstruct` — so a ported host leaf (Vector, Set,
+; Delay, ExInfo, …) can BE a real struct before its `Enumerable`/`Exception`
+; protocol impls are ported (`defimpl` is a LATER phase; this is the constructor
+; primitive those impls hang off). The answers are pinned against what a
+; `defstruct` beam answers: the same tag, the same defaults, the same refusal.
+
+(defn- sf [k v] (erlang/list_to_tuple (list k v)))
+
+; NB: a MAP LITERAL whose VALUES are bare symbols is only compiled as a value
+; where the compiler sees source; inside a `deftest`/`is` body (macro-synthesized
+; code) it stays reader data. So the reference shape is built by CALLING this,
+; never written inline in an assertion.
+(defn- struct-of [mod fields]
+  (reduce (fn [m kv] (erlang/apply :maps :put (list (first kv) (second kv) m)))
+          {:__struct__ mod}
+          fields))
+
+(defn- tagged-with? [mod m]
+  (and (erlang/is_map m)
+       (erlang/is_map_key :__struct__ m)
+       (= mod (erlang/map_get :__struct__ m))))
+
+(defn- outcome [f]
+  (try (list :value (f))
+       (catch e (list :raise (:__struct__ e)))))
+
+(defn- struct-source []
+  (str "(ns host.struct)\n"
+       "(defn struct-probe-ping [] :pong)\n"))
+
+(deftest emits-an-elixir-struct-surface
+  (testing ":struct_fields adds __struct__/0 and __struct__/1 with Elixir semantics"
+    (let [dir (tmp-dir)
+          src (write-source! dir (struct-source))
+          out (str dir "/out")
+          mod :Elixir.BeamLisp.HostStructProbe
+          fields (list (sf :a nil) (sf :b nil) (sf :c 5))
+          result (BeamLisp.AOT/compile_host_file src
+                   (list (sf :module mod) (sf :output_dir out) (sf :struct_fields fields)))
+          path (elem result 1)]
+      (is (= mod (elem result 0)) "the pinned atom is the caller's")
+      (is (= (str out "/Elixir.BeamLisp.HostStructProbe.beam") path))
+      ; FRESH STATE: drop the beam the compile published AND the namespace shim
+      ; beside it, then load the PINNED beam alone. A constructor pair that still
+      ; leaned on the shim would be `undef` here.
+      (code/purge mod) (code/delete mod)
+      (code/purge :Elixir.BeamLisp.Ns.Host.Struct) (code/delete :Elixir.BeamLisp.Ns.Host.Struct)
+      (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+      (is (erlang/function_exported mod :__struct__ 0))
+      (is (erlang/function_exported mod :__struct__ 1))
+      ; __struct__/0 — the tag plus every default, key for key, as `defstruct`
+      ; builds it. `Map.from_struct/1` strips the tag and nothing else.
+      (let [expected (struct-of mod fields)
+            s0 (erlang/apply mod :__struct__ (list))]
+        (is (tagged-with? mod s0))
+        (is (= expected s0))
+        (is (= 4 (erlang/map_size s0)) "the tag and three fields, nothing else")
+        (is (= {:a nil :b nil :c 5} (erlang/apply :Elixir.Map :from_struct (list s0)))))
+      ; __struct__/1 — a keyword list (2-tuples) and a raw map both fold the
+      ; given values over the defaults, exactly as the reference beam does.
+      ; `Kernel.struct!/2` is the canonical caller path; it must land on the
+      ; same constructor.
+      (let [from-kw (struct-of mod (list (sf :a 1) (sf :b nil) (sf :c 5)))
+            from-map (struct-of mod (list (sf :a nil) (sf :b 2) (sf :c 5)))
+            from-struct! (struct-of mod (list (sf :a nil) (sf :b nil) (sf :c 9)))]
+        (is (= from-kw (erlang/apply mod :__struct__ (list (list (sf :a 1))))))
+        (is (= from-map (erlang/apply mod :__struct__ (list {:b 2}))))
+        (is (= from-struct! (erlang/apply :Elixir.Kernel :struct! (list mod (list (sf :c 9)))))))
+      ; an unknown key is refused as the reference beam refuses it: `:error
+      ; {:badkey, key}`, which a `rescue`/`catch` reads as KeyError.
+      (is (= (list :raise :Elixir.KeyError)
+             (outcome (fn [] (erlang/apply mod :__struct__
+                              (list (list (sf :zz 1))))))))
+      (is (= (list :raise :Elixir.KeyError)
+             (outcome (fn [] (erlang/apply :Elixir.Kernel :struct!
+                              (list mod (list (sf :zz 1))))))))
+      ; a non-`{key, value}` element and a non-enumerable are refused with the
+      ; reference fun's own classes.
+      (is (= (list :raise :Elixir.FunctionClauseError)
+             (outcome (fn [] (erlang/apply mod :__struct__ (list (list :bad)))))))
+      (is (= (list :raise :Elixir.Protocol.UndefinedError)
+             (outcome (fn [] (erlang/apply mod :__struct__ (list 42))))))
+      ; the file's own defn still answers beside the constructor pair.
+      (is (= :pong (erlang/apply mod :struct-probe-ping (list))))
+      (code/purge mod) (code/delete mod)
+      (File/rm_rf! dir))))
+
+(deftest refuses-a-malformed-struct-surface
+  (testing ":struct_fields is METADATA, never text: bad shapes are refused by name"
+    (let [dir (tmp-dir)
+          src (write-source! dir (struct-source))
+          out (str dir "/out")
+          mod :Elixir.BeamLisp.HostStructBad
+          with-fields (fn [fields] (list (sf :module mod) (sf :output_dir out) (sf :struct_fields fields)))]
+      ; a `:__struct__` field — the reference `defstruct` refuses it too
+      (is (thrown? (BeamLisp.AOT/compile_host_file src (with-fields (list (sf :__struct__ nil))))))
+      ; a field name that is not an atom the caller already holds — there is no
+      ; String.to_atom on this path
+      (is (thrown? (BeamLisp.AOT/compile_host_file src (with-fields (list (sf "a" nil))))))
+      ; a duplicate field
+      (is (thrown? (BeamLisp.AOT/compile_host_file src (with-fields (list (sf :a nil) (sf :a 1))))))
+      ; a default the Core backend cannot emit as a literal (a pid is not data)
+      (is (thrown? (BeamLisp.AOT/compile_host_file src (with-fields (list (sf :a (erlang/self)))))))
+      ; not a pair list at all
+      (is (thrown? (BeamLisp.AOT/compile_host_file src
+                     (list (sf :module mod) (sf :output_dir out) (sf :struct_fields "nope")))))
+      (is (thrown? (BeamLisp.AOT/compile_host_file src (with-fields (list 42)))))
+      ; and a file that writes `__struct__` itself cannot also have one synthesized
+      (let [own (write-source! (str dir "/own") "(ns host.struct)\n(defn __struct__ [] :nope)\n")]
+        (is (thrown? (BeamLisp.AOT/compile_host_file own (with-fields (list (sf :a nil)))))))
+      (File/rm_rf! dir))))
+
+(deftest struct-fields-are-opt-in
+  (testing "a functions-only pinned module keeps its exact ABI: no __struct__ export"
+    (let [dir (tmp-dir)
+          src (write-source! dir (three-defns))
+          out (str dir "/out")
+          plain :Elixir.BeamLisp.HostNoStruct
+          shaped :Elixir.BeamLisp.HostWithStruct
+          want-exports (Enum/sort (list (sf :module_info 0) (sf :module_info 1)
+                                        (sf :probe-add 2) (sf :probe-mul 2) (sf :probe-triple 1)))
+          _ (BeamLisp.AOT/compile_host_file src (list (sf :module plain) (sf :output_dir out)))
+          _ (BeamLisp.AOT/compile_host_file src
+              (list (sf :module shaped) (sf :output_dir out) (sf :struct_fields (list (sf :c 5)))))]
+      (is (not (erlang/function_exported plain :__struct__ 0))
+          "no `:struct_fields` ⇒ no struct surface, exactly as before")
+      (is (not (erlang/function_exported plain :__struct__ 1)))
+      (is (= want-exports (Enum/sort (erlang/apply plain :module_info (list :exports))))
+          "a functions-only pinned module exports its defns and nothing else")
+      (is (erlang/function_exported shaped :__struct__ 0) "the opt-in adds exactly the pair")
+      (is (erlang/function_exported shaped :__struct__ 1))
+      ; `[]` is a legal tag-only struct, Elixir's `defstruct []`
+      (let [bare :Elixir.BeamLisp.HostStructBare
+            _ (BeamLisp.AOT/compile_host_file src
+                (list (sf :module bare) (sf :output_dir out) (sf :struct_fields (list))))
+            s (erlang/apply bare :__struct__ (list))]
+        (is (= 1 (erlang/map_size s)))
+        (is (= bare (erlang/map_get :__struct__ s))))
+      (File/rm_rf! dir))))
+
 ; ── the first production host leaf: CompilerData ───────────────────────────
 ;
 ; `priv/host/compiler_data.bl` is compiled to the exact atom the compiler already
