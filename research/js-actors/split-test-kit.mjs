@@ -3,25 +3,27 @@
 //
 // Extracted from verify-split.mjs's patterns and parameterized by app name:
 //
-//   startApp(app)      a loopback server (a fresh BL authority) + base URL +
-//                      post(json) + an SSE collector (`events`) with
-//                      `until(pred, label)` and `snapshotNow()` (the current
-//                      hello, read from a throwaway stream)
+//   startBeam(apps)    `bl serve research/split-beam/serve.bl` for the named
+//                      apps: the BEAM authority + web transport, on a port
+//   startApp(app)      one app on BEAM + base URL + post(json) + an SSE
+//                      collector (`events`) with `until(pred, label)` and
+//                      `snapshotNow()` (the current hello, read from a
+//                      throwaway stream)
 //   spawnClient(app)   the BL client half in a child process exactly as the
 //                      browser Worker feeds it: JSON frames on stdout, stdin
 //                      fed with hello/event/result/unreachable/stop, returning
-//                      `{ frames, tell, next(topic, fromIndex), close }`
+//                      `{ frames, tell, next(topic, fromIndex), nextWhere(…), settle(frame), close }`
 //   texts(node)        every string in a view tree
 //   findAll(tree, p)   every view node (array) matching a predicate
 //   attr(node)         a view node's attribute map, or null
 //
-// One `startSplitServer` per process: host.mjs keeps ONE active BL runtime, so
-// every helper here is built for a single app process.
+// The client half is JavaScript (host.mjs keeps ONE active BL runtime per
+// process, so each client is its own child process); the server half is BEAM.
 
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
-import { startSplitServer } from './split-server.mjs';
+import { createCodec } from './split-codec.mjs';
 
 export const HERE = new URL('./', import.meta.url);
 
@@ -84,9 +86,47 @@ const clientSource = (app, tab) => `
   await import('./out/${app}-client.mjs');
 `;
 
+// ── the server: the app's authority, natively on BEAM ────────────────────────
+//
+// `startBeam(apps, {port, data})` boots `bl serve research/split-beam/serve.bl`
+// for the named apps (one app → served at `/`) and waits for it to answer.
+// `data` is the directory durable logs live in (null: none). A boot is slow
+// (the whole language comes up), so a verifier starts ONE and reuses it.
+
+const REPO = new URL('../../', HERE);
+let nextPort = 18800 + (process.pid % 400) * 4;
+
+export async function startBeam(apps, { port = nextPort++, data = null, timeoutMs = 600000 } = {}) {
+  const env = { ...process.env, SPLIT_DATA: data === null ? 'none' : data };
+  const child = spawn(new URL('bin/bl', REPO).pathname,
+    ['serve', 'research/split-beam/serve.bl', '--port', String(port), '--', ...apps],
+    { cwd: REPO.pathname, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+  let log = '';
+  child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+  child.stdout.on('data', d => { log += d; }); child.stderr.on('data', d => { log += d; });
+  const exited = new Promise(resolve => child.once('exit', code => resolve(code)));
+  const base = `http://127.0.0.1:${port}`;
+  const probe = apps.length === 1 ? '/api/app' : `/${apps[0]}/api/app`;
+  const start = Date.now();
+  for (;;) {
+    if (child.exitCode !== null) throw new Error('bl serve exited early:\n' + log.slice(-2000));
+    if (Date.now() - start > timeoutMs) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} throw new Error('bl serve never answered:\n' + log.slice(-2000)); }
+    try { const r = await fetch(base + probe); if (r.ok) break; } catch { /* not yet */ }
+    await sleep(250);
+  }
+  const close = async () => {
+    if (child.exitCode !== null) return;
+    try { process.kill(-child.pid, 'SIGTERM'); } catch { /* gone */ }
+    await Promise.race([exited, sleep(5000).then(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} })]);
+  };
+  process.once('exit', () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } });
+  return { port, base, get log() { return log; }, exited, close };
+}
+
 export async function startApp(app, options = {}) {
-  const service = await startSplitServer({ port: 0, app, ...options });
-  const base = `http://127.0.0.1:${service.port}`;
+  const service = await startBeam([app], options);
+  service.codec = createCodec(JSON.parse(readOut(`${app}.contract.json`)));
+  const base = service.base;
   const post = async (json) => {
     const r = await fetch(base + '/api/intent', { method: 'POST',
       headers: { 'content-type': 'application/json' }, body: JSON.stringify(json) });
@@ -162,10 +202,11 @@ export function spawnClient(app, { tab = DEFAULT_TAB } = {}) {
   });
 
   const tell = m => child.stdin.write(JSON.stringify(m) + '\n');
-  const next = async (topic, fromIndex = 0, timeoutMs = 15000) => {
+  const next = (topic, fromIndex = 0, timeoutMs = 15000) => nextWhere(topic, fromIndex, () => true, timeoutMs);
+  const nextWhere = async (topic, fromIndex, pred, timeoutMs = 15000) => {
     const start = Date.now();
     for (;;) {
-      const hit = frames.slice(fromIndex).find(f => f.topic === topic);
+      const hit = frames.slice(fromIndex).find(f => f.topic === topic && pred(f));
       if (hit) return hit;
       if (Date.now() - start >= timeoutMs) throw new Error('timed out waiting for client frame ' + topic);
       await sleep(10);
@@ -179,7 +220,18 @@ export function spawnClient(app, { tab = DEFAULT_TAB } = {}) {
       child.once('exit', () => { clearTimeout(timer); resolve(); });
     });
   };
-  return { child, frames, tell, next, close, tab };
+  // Hand the client the answer to its in-flight proposal and return the view
+  // it renders FROM that answer. Views emitted earlier (the one drawn when the
+  // proposal was sent) may still be arriving, so the wait is anchored on the
+  // settle step's trace, which the client emits before re-rendering.
+  const SETTLE_STEPS = new Set(['confirmed', 'rebased', 'server-refused']);
+  const settle = async (frame, timeoutMs = 15000) => {
+    const mark = frames.length;
+    tell({ kind: 'result', frame });
+    const trace = await nextWhere('trace', mark, f => SETTLE_STEPS.has(f.value.step), timeoutMs);
+    return nextWhere('view', frames.indexOf(trace) + 1, () => true, timeoutMs);
+  };
+  return { child, frames, tell, next, nextWhere, settle, close, tab };
 }
 
 // Every string anywhere in a view tree.

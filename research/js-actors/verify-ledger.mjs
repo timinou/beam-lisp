@@ -68,9 +68,7 @@ for (const [typed, cents] of [['-12.50', -1250], ['3', 300], ['0.5', 50], ['1 00
   const p = (await c.next('propose', mark)).value;
   assert.equal(String(p.args.cents), String(cents), typed);
   const res = await app.post(p);
-  mark = c.frames.length;
-  c.tell({ kind: 'result', frame: res.body });
-  await c.next('view', mark);
+  await c.settle(res.body);
 }
 ok('parse-cents turns typed text into exact cents, including an amount beyond 2^53');
 

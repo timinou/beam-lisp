@@ -189,7 +189,8 @@ ok(":drop 'abc' '1' parses to id 0, fails the wire's int 1..9999, and is refused
 const lastTree = JSON.stringify(client.frames.filter(f => f.topic === 'view').at(-1).value.tree);
 mark = client.frames.length;
 client.tell({ kind: 'event', event: [':bogus'] });
-await sleep(60);
+// the reducer answers with a view (its `:else` keeps the local state)
+await client.next('view', mark);
 assert.equal(client.frames.slice(mark).some(f => f.topic === 'propose'), false, 'an unhandled kind proposes nothing');
 const strayViews = client.frames.slice(mark).filter(f => f.topic === 'view');
 assert.ok(strayViews.length >= 1, 'the reducer still renders');

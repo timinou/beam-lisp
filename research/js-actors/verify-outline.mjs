@@ -239,9 +239,7 @@ try {
   board = res.body.board;
   const fresh = kidIds(res.body.board.items, 8).find(id => !kidIds(now.board.items, 8).includes(id));
   assert.ok(fresh, 'the server assigned a new child id under Sign-up flow');
-  mark = client.frames.length;
-  client.tell({ kind: 'result', frame: res.body });
-  view = await client.next('view', mark);
+  view = await client.settle(res.body);
   const freshRow = rowNode(view.value.tree, fresh);
   assert.ok(freshRow && texts(freshRow).includes('Rate limits'));
   assert.ok(rowKeys(rowNode(view.value.tree, 8)).includes('i' + fresh));
