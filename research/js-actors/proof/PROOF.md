@@ -139,3 +139,35 @@ server-confirmed intent.
 | real browser, port 8796 (real key presses) | `j` `j` `x` → third report selected, focused, fixed (rev 1); `e` → inline field focused with the title; typed + ⏎ → renamed (rev 2), focus back on the row; drag r7 onto r1 → predicted order in **49 ms**, confirmed; `?` → shortcut sheet. Screenshot `track6-triage.png` |
 | **found in the browser, fixed** | fast typing lost characters ("Anfications"): the Worker's renders echo older values into the focused field → echo guard in `patch()`; a render removing a focused field fired its `:on-blur` (a second save) → blurs during a render are not user blurs; the history bar showed on apps without history (`display:flex` beat `hidden`) |
 | full build + all Node suites | build exit 0, 53 OK, SPLIT PASS ×5, parity 32 (+ `drop`), **26/26** Node suites |
+
+## Track 7 — exact numbers and BEAM-ordered maps and sets (PLAN-149)
+
+**Claim.** Integers are exact at any size on the JS target; maps and sets
+enumerate in the BEAM's order wherever that order is determined; the ledger app
+computes money beyond 2^53 in the browser to the cent.
+
+**Mechanism.** `host.mjs`: one `arith` that promotes safe `Number` ↔ `BigInt`
+and normalizes back (add/sub/mul/quot/rem/mod; float contagion; `/` is float
+division); `hashKey`/`eq`/`compare`/printing handle BigInt; ONE key order
+(`keyOrder`) used by `mapKeys` and sets — derived from BEAM probes: number <
+atom < tuple < map (BL vectors) < () < list < string, integers before floats.
+A set value (`BSet`) with literal, conj/disj/contains?/count/seq/into/=/print.
+`compiler.bl`: unsafe literals emit as BigInt (`…n`); the `:exact` wire type;
+`entry` reserved (it is the bundle's start symbol — an app `entry` defn
+silently replaced it; found by the ledger, now refused by name).
+
+| Check | Result |
+|---|---|
+| `verify-order-parity.mjs` | `ORDER PARITY PASS (95 answers identical to BEAM)` — +59 exact-integer/map-order/set cases, + big literals |
+| `verify-numeric-exact.mjs` | `EXACT PASS (37 checks)` — Number↔BigInt normalization, hashKey equality, compare across the boundary |
+| split build | `SPLIT PASS ledger: 11 placements, 2 refusals named` (`entry` reserved, `:exact` as an app type name) |
+| `verify-ledger.mjs` | `LEDGER PASS (6 checks)`: `:exact` round-trips digit for digit and refuses unsafe JSON numbers/fractions/padded digits; an amount of 1 234 567 890 123 456 789 cents commits over HTTP exactly; the BL client shows balance **12 435 750 893 785 710.85** where a double sum gives 1243575089378571000; typed amounts parse to exact cents; three decimals refused locally |
+| real browser, port 8797 | same balance and treasury row (90 071 992 547 409.93) rendered; typing 12345678901234567.89 → "you typed 12 345 678 901 234 567.89", added (rev 1), balance exact; breakdown bars from exact integer ratios. Screenshot `track7-ledger.png` |
+
+**Divergences, stated.** Keyword-keyed maps: BEAM orders atoms by atom-table
+index (creation order: `{:b :a :c}` keys come out `(:c :a :b)`), which no
+browser can know; the JS target orders keywords by name, and parity pins only
+cases whose order is determined. Maps over 32 keys: BEAM uses hash order; the
+JS target keeps term order. `1` and `1.0` are one JS Number (`(/ 8 2)` prints
+`4`, BEAM `4.0`). Decimals are not implemented.
+| full build + all Node suites | build exit 0 (52 OK diagnostics: the "unsafe literal refused" diagnostic became a positive exact-emission test), SPLIT PASS ×6, parity 95, **28/28** Node suites |

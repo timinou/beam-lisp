@@ -24,7 +24,7 @@ function run(label, setup, expectedSuccess = true) {
   }
 }
 
-assert.throws(() => H.arith('add', Number.MAX_SAFE_INTEGER, 1), /overflow/);
+assert.equal(H.arith('add', Number.MAX_SAFE_INTEGER, 1), 9007199254740992n);
 assert.equal(H.eq(H.vec([H.kw('x,k:y')]), H.vec([H.kw('x'), H.kw('y')])), false);
 assert.notEqual(H.hashKey(H.kw('a')), H.hashKey('a'));
 const rt = H.newRuntime();

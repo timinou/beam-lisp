@@ -23,6 +23,7 @@ spike:
 node research/js-actors/verify-lifecycle.mjs   # links, monitors, exits, one death
 node research/js-actors/verify-trace.mjs       # logical BL source frames
 node research/js-actors/verify-numeric.mjs     # ANF integer emission gate
+node research/js-actors/verify-numeric-exact.mjs # host exact-integer/ordering edge cases
 node research/js-actors/verify-names.mjs       # names, correlated calls, defserver
 node research/js-actors/verify-tables.mjs      # BL-owned table subset and ETS diff
 node research/js-actors/verify-table-leaves.mjs # opaque host storage and scaling
@@ -284,8 +285,10 @@ node research/js-actors/verify-groceries.mjs                            # instan
 node research/js-actors/verify-team.mjs                                 # identity, permissions, history, replay
 node research/js-actors/verify-session.mjs                              # session cookies, log parsing
 node research/js-actors/verify-triage.mjs                               # keys, drag-and-drop, inline edit
+node research/js-actors/verify-ledger.mjs                               # exact money beyond 2^53
+node research/js-actors/verify-numeric-exact.mjs                        # host exact-integer edge cases
 node research/js-actors/verify-shell.mjs                                # the shared page/server shell
-node research/js-actors/verify-order-parity.mjs                         # sort/compare/combinators = BEAM, 30 answers
+node research/js-actors/verify-order-parity.mjs                         # sort/compare/combinators/exact-int/map+set order = BEAM, 95 answers
 node research/js-actors/split-server.mjs --port 8791                    # then open http://127.0.0.1:8791/
 node research/js-actors/split-server.mjs --port 8792 --app outline      # any app under apps/
 ```
@@ -304,6 +307,7 @@ evidence, timeline, contract) collapses to give the app the whole width.
 | `apps/groceries.bl` — shared shopping list | **instant edits, confirmed by the server; works offline**: predictions, slide-back on refusal, server-adjusted results, an offline queue sent in order, at-most-once resends | `verify-groceries.mjs`, [proof/track3-groceries-offline.png](proof/track3-groceries-offline.png), [proof/track3-groceries-race.png](proof/track3-groceries-race.png) |
 | `apps/team.bl` — a team's task board | **who and when**: sign-in, sessions the transport stamps on every proposal, permissions in BL (`:allow`), presence, "assigned to me"; a durable log replayed at boot, an activity feed, shared undo/redo, "view as of" | `verify-team.mjs`, [proof/track4-team-lead.png](proof/track4-team-lead.png), [proof/track5-team-history.png](proof/track5-team-history.png) |
 | `apps/triage.bl` — a bug inbox cleared by keyboard | **interaction as data**: a keymap in the view (`j`/`k`/`x`/`e`/`p`/`?`), drag-and-drop reorder (a team-wide, predicted intent), inline rename (⏎/esc/blur), focus that follows the selection | `verify-triage.mjs`, [proof/track6-triage.png](proof/track6-triage.png) |
+| `apps/ledger.bl` — household ledger | **numbers the browser gets right**: exact integer money beyond 2^53 (BigInt promotion, a `:exact` wire type carrying digits), formatting and a `group-by` breakdown in the browser identical to the BEAM | `verify-ledger.mjs`, `verify-numeric-exact.mjs`, [proof/track7-ledger.png](proof/track7-ledger.png) |
 | `apps/outline.bl` — nested project plan | **data of any shape**: a recursive wire type, a recursive view, recursive roll-ups, search that keeps ancestors, a whole subtree ticked at once | `verify-outline.mjs`, [proof/track2-outline.png](proof/track2-outline.png), [proof/track2-outline-search.png](proof/track2-outline-search.png) |
 
 **The declaration.** Roots only — nothing says "client" or "server" per function:
@@ -397,14 +401,29 @@ total order with strings by code point. The combinators (`comp`, `partial`,
 travel with (`every?`, `remove`, `keep`, `mapcat`, `group-by`, `frequencies`,
 `get-in`/`assoc-in`/`update-in`, `take`, `range`, …) are BL in `runtime.bl`,
 written clause for clause after core. `order-parity.bl` runs on both targets;
-the build writes BEAM's 30 answers and `verify-order-parity.mjs` requires the
+the build writes BEAM's 95 answers and `verify-order-parity.mjs` requires the
 JS run to match them (a naive stable sort and a UTF-16 string order each fail
 it). Lists and vectors are ONE sequential family, as on BEAM since the
 runtime moved to `priv/boot/rt.bl` (`BeamLisp.Ns.Rt`): `(= [1 2] '(1 2))` and
 `(compare '(1) [1])` = 0, while a map still keys `[1 2]` and `'(1 2)` apart
 (`(get {[1 2] :v} '(1 2))` is nil) — `H.eq` normalizes, `hashKey` does not.
 Empty `sort`/`take` are `()`. Maps and sets have no order here: comparing one
-raises. **Known
+raises. Integer arithmetic is EXACT across the whole range: a result inside
+±(2^53-1) is a JS `Number`, and anything larger PROMOTES to a `BigInt`
+(normalized back to a Number when it fits again), so `(* 9007199254740993 3)`
+is exactly `27021597764222979` and `str`/`=`/`hashKey` agree with BEAM.
+`quot`/`rem`/`mod` are integer-only; `/` answers a float; a float operand
+converts a BigInt to a Number, as BEAM's float contagion does. `keys`, `vals`,
+`seq`, printing and `reduce` over a map or a set enumerate in BEAM's
+**small-map key order** — number < atom < tuple < map < list < string, with
+every integer before every float, each ordered within its kind. The atom rank
+itself is a **documented divergence**: BEAM orders atoms by atom-table index
+(creation order), which no JavaScript target can reproduce, so this orders
+keywords by name; parity pins only cases whose order does not depend on it.
+A map with MORE than 32 keys uses BEAM's hash order, which is not reproduced
+either: the target keeps the same deterministic term order, and such maps are
+left out of parity. `order-parity.bl` pins the arithmetic, the reproducible key
+orders, `group-by`/`frequencies` and sets. **Known
 divergence:** an EMPTY lazy result (`(keep f [])`, `(range 0)`, `(remove f
 [])`) is on BEAM a lazy seq that is `=` to nil yet prints `()` and is truthy;
 here it is the empty list `()` (truthy, not `=` nil). Non-empty results agree.
@@ -561,7 +580,9 @@ DIFFERENT one back may be refused for a cycle it cannot actually take
 (conservative, never unsound). Recursion is admitted by capture order or by
 structural descent over one parameter; lexicographic or size-sum measures are
 not tried. `lower-case`/`upper-case` are not offered (JS and BEAM case maps
-differ, e.g. final sigma). Ordering of maps and sets is refused. The wire grammar is closed:
+differ, e.g. final sigma). Comparing a map or a set raises; enumerating one
+(`keys`/`vals`/`seq`/printing) follows BEAM's small-map key order for ≤32 keys,
+with atoms ordered by name rather than BEAM's atom-table index. The wire grammar is closed:
 `text`, `int`, `bool`, `list`, `record` and named references. This is a
 build-time partition of one app, not general Loom/Live placement, and a Worker
 is not a sandbox.
@@ -621,6 +642,7 @@ links all FEATs and their dependency order.
 | `verify-lifecycle.mjs` | Node-only verifier: typed pids/refs, links, monitors, exit signals and the one atomic death cleanup, with a native-BEAM differential |
 | `verify-trace.mjs` | Node-only verifier: logical source frames through suspension and their rendered failure locations |
 | `verify-numeric.mjs` | Node-only verifier: the ANF numeric gate — witnessed raw-`Number` sites and checked fallbacks |
+| `verify-numeric-exact.mjs` | Node-only verifier: `host.mjs` exact-integer arithmetic, canonical hashing and map/set key order |
 | `verify-names.mjs` | Node verifier: local names, correlated calls and lowered servers; 4-rule native-BEAM comparison |
 | `verify-tables.mjs`, `verify-table-leaves.mjs` | BL-owned table subset and 25-rule BEAM comparison; host storage ABI, bounds and scaling |
 | `verify-supervision.mjs` | BL restart strategies/ledger, 10-rule and two-step OTP comparison, and simulated browser input transcript |
@@ -933,9 +955,15 @@ literal comparison macro, so most pattern tests intentionally use `receive`.
   are not reconstructed. `:erlang/exit` participates in the local BL lifecycle:
   links and monitors receive target-defined signals/reasons, with selected
   BEAM differential cases pinned by `verify-lifecycle.mjs`.
-- **Safe integers and an IEEE-754 float subset only.** Unsafe integer literals and
-  integer arithmetic overflow are rejected. Full bignums/decimals and preserving
-  the BEAM distinction between `1` and `1.0` remain unimplemented.
+- **Exact integers and an IEEE-754 float subset.** Integer arithmetic is exact
+  across the whole range: a result inside ±(2^53-1) is a `Number`, a larger one
+  PROMOTES to a `BigInt` and normalizes back to a Number when it fits. An
+  unsafe integer LITERAL is emitted as an exact `BigInt` (`9007199254740993n`);
+  the numeric gate's literal fold refuses it, so it never enters a raw-Number
+  fast path. On the split wire, `:exact` carries such an integer as its
+  decimal digits. Floats are IEEE-754 doubles; `1` and `1.0` are one
+  JS Number, so the BEAM int/float distinction, decimals and float printing
+  (`(/ 8 2)` is `4.0` on BEAM, `4` here) remain unimplemented.
 - **A small prelude.** Collection operations cover the exercised forms, not every
   core arity, collection protocol, sequence type or printer behavior. Literal
   tuple/list values in `:lit` are rejected; their construction nodes are supported.

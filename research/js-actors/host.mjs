@@ -112,7 +112,34 @@ export function vecToList(v) { return listFromArray(vecItems(v)); }
 export function vecFromList(l) { return vecFromArray(listToArray(l)); }
 
 export const SET_MOD = "Elixir.BeamLisp.Set";
-export function isSet(x) { return isStruct(x) && x.__struct === SET_MOD; }
+/** A beam-lisp set: an element table filed under `hashKey`, exactly like a
+ *  `BMap`'s keys, so membership and equality are the target's existing
+ *  structural ones and two equal elements are one member. Enumeration order is
+ *  BEAM's small-map key order (`keyOrder`), the same order `mapKeys` uses. */
+export class BSet {
+  constructor(m) { this.m = m; }
+}
+export function bset(elems) {
+  const m = new Map();
+  for (const e of elems) m.set(hashKey(e), e);
+  return new BSet(m);
+}
+export function isSet(x) { return x instanceof BSet; }
+export function setFromList(l) { return bset(listToArray(l)); }
+export function setHas(s, x) { return s instanceof BSet && s.m.has(hashKey(x)); }
+export function setPut(s, x) {
+  const m = new Map(s instanceof BSet ? s.m : []);
+  m.set(hashKey(x), x);
+  return new BSet(m);
+}
+export function setRemove(s, x) {
+  const m = new Map(s instanceof BSet ? s.m : []);
+  m.delete(hashKey(x));
+  return new BSet(m);
+}
+export function setSize(s) { return s instanceof BSet ? s.m.size : 0; }
+export function setElements(s) { return s instanceof BSet ? [...s.m.values()].sort(keyOrder) : []; }
+export function setToList(s) { return listFromArray(setElements(s)); }
 
 /** A beam-lisp map. Keys are canonical strings so structural equality is a
  *  string compare, exactly as `RT.hash_key/1` makes BEAM map keys canonical. */
@@ -141,7 +168,11 @@ export function mapPut(m, k, v) {
   out.m.set(hashKey(k), [k, v]);
   return out;
 }
-export function mapKeys(m) { return listFromArray(m instanceof BMap ? [...m.m.values()].map(p => p[0]) : []); }
+export function mapKeys(m) {
+  // Enumerate in BEAM's small-map key order (`keyOrder`), the ONE ordering
+  // maps and sets share: `keys`, `vals`, map `seq`, printing and `reduce`.
+  return listFromArray(m instanceof BMap ? [...m.m.values()].map(p => p[0]).sort(keyOrder) : []);
+}
 export function mapRemove(m, k) {
   const out = m instanceof BMap ? new BMap(new Map(m.m)) : new BMap(new Map());
   out.m.delete(hashKey(k));
@@ -262,9 +293,9 @@ export function tableSnapshot(rt, h) {
 // ── leaf predicates / conversions ────────────────────────────────────────────
 
 export function isNil(x) { return x === null || x === undefined; }
-export function isInt(x) { return typeof x === "number" && Number.isInteger(x); }
+export function isInt(x) { return typeof x === "bigint" || (typeof x === "number" && Number.isInteger(x)); }
 export function isFloat(x) { return typeof x === "number" && !Number.isInteger(x); }
-export function isNum(x) { return typeof x === "number"; }
+export function isNum(x) { return typeof x === "number" || typeof x === "bigint"; }
 export function isStr(x) { return typeof x === "string"; }
 export function isBool(x) { return x === true || x === false; }
 export function isFn(x) { return !!x && x.__blfn === true; }
@@ -283,12 +314,99 @@ function enc(tag, kids) {
   for (const k of kids) out += k.length + ":" + k;
   return out + "]";
 }
+
+/** The order BEAM enumerates a small map's keys (and a set's elements) in:
+ *  Erlang's internal flatmap key order, derived from observation, not from
+ *  `rt-compare` (BL's total order, a different relation — `compare` is
+ *  numeric across int/float and alphabetical across atoms).
+ *
+ *  Kinds: number < atom < tuple < map < empty-list < list < string. Within
+ *  numbers, ALL integers sort before ALL floats, each numerically — a flatmap
+ *  orders by representation, so `-1` precedes `-2.5`. Within atoms, BEAM
+ *  orders by atom-table index (creation order), which a JavaScript target
+ *  cannot reproduce; this uses `false < true < nil < keywords by name`, a
+ *  documented divergence (parity avoids maps whose order depends on it). This
+ *  is the ONE ordering maps and sets enumerate in: `mapKeys` and `setToList`. */
+export function keyOrder(a, b) {
+  const ra = keyRank(a), rb = keyRank(b);
+  if (ra !== rb) return ra < rb ? -1 : 1;
+  switch (ra) {
+    case 0: {                                     // number: ints before floats
+      const ai = isInt(a), bi = isInt(b);
+      if (ai !== bi) return ai ? -1 : 1;
+      return a < b ? -1 : a > b ? 1 : 0;
+    }
+    case 1: {                                     // atom
+      const fa = atomRank(a), fb = atomRank(b);
+      if (fa !== fb) return fa < fb ? -1 : 1;
+      if (isKw(a) && isKw(b)) return strCmp(a.n, b.n);
+      return 0;
+    }
+    case 2: return cmpItems(a.items, b.items);    // tuple
+    case 3: return cmpMapish(a, b);               // map / vector / struct / set
+    case 5: return cmpCons(a, b);                 // non-empty list
+    case 6: return strCmp(a, b);                  // string
+    default: return 0;
+  }
+}
+function keyRank(x) {
+  if (typeof x === "number" || typeof x === "bigint") return 0;
+  if (isKw(x) || x === null || x === true || x === false) return 1;
+  if (x instanceof T) return 2;
+  if (x instanceof BMap || x instanceof BSet || isVec(x) || isStruct(x)) return 3;
+  if (x === ENIL) return 4;
+  if (x instanceof Cons) return 5;
+  if (typeof x === "string") return 6;
+  return 7;
+}
+function atomRank(x) {
+  if (x === false) return 0;
+  if (x === true) return 1;
+  if (x === null || x === undefined) return 2;
+  return 3;
+}
+function cmpItems(a, b) {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) { const c = keyOrder(a[i], b[i]); if (c !== 0) return c; }
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+}
+function cmpCons(a, b) {
+  for (;;) {
+    const c = keyOrder(a.h, b.h);
+    if (c !== 0) return c;
+    if (a.t === ENIL || b.t === ENIL) return a.t === b.t ? 0 : a.t === ENIL ? -1 : 1;
+    if (!(a.t instanceof Cons) || !(b.t instanceof Cons)) return 0;
+    a = a.t; b = b.t;
+  }
+}
+function cmpMapish(a, b) {
+  const ea = mapishEntries(a), eb = mapishEntries(b);
+  if (ea.length !== eb.length) return ea.length < eb.length ? -1 : 1;
+  for (let i = 0; i < ea.length; i++) {
+    const c = keyOrder(ea[i][0], eb[i][0]);
+    if (c !== 0) return c;
+    const c2 = keyOrder(ea[i][1], eb[i][1]);
+    if (c2 !== 0) return c2;
+  }
+  return 0;
+}
+function mapishEntries(x) {
+  if (x instanceof BSet) return setElements(x).map(e => [e, null]);
+  if (isVec(x)) return vecItems(x).map((e, i) => [i, e]);
+  if (x instanceof BMap) return [...x.m.values()].map(p => p).sort((p, q) => keyOrder(p[0], q[0]));
+  return Object.keys(x).filter(k => k !== "__struct").sort().map(k => [x[k], null]);
+}
 export function hashKey(x) {
   if (x === null || x === undefined) return "nil";
   if (x === true) return "b:1";
   if (x === false) return "b:0";
   const t = typeof x;
   if (t === "number") return "n:" + (Object.is(x, -0) ? 0 : x);
+  // A BigInt is an exact integer beyond the safe range. Its canonical form is
+  // its decimal digits, so a safe integer and the BigInt of equal value would
+  // share a key — they cannot both exist, because a result that fits the safe
+  // range normalizes back to a Number (see `arith`).
+  if (t === "bigint") return "n:" + x;
   if (t === "string") return "s" + x.length + ":" + x;
   if (x instanceof KW) return "k" + x.n.length + ":" + x.n;
   if (x === ENIL) return "l:()";
@@ -303,6 +421,7 @@ export function hashKey(x) {
     const keys = [...x.m.keys()].sort();
     return enc("m", keys.flatMap(k => [k, hashKey(x.m.get(k)[1])]));
   }
+  if (x instanceof BSet) return enc("s", [...x.m.keys()].sort());
   if (typeof x === "function" || x.__blfn) return "f:" + (x.__id ||= ++idCounter);
   return "o:" + (x.__id ||= ++idCounter);
 }
@@ -331,6 +450,7 @@ function eqKey(x) {
     const keys = [...x.m.keys()].sort();
     return enc("m", keys.flatMap(k => [k, eqKey(x.m.get(k)[1])]));
   }
+  if (x instanceof BSet) return enc("s", [...x.m.keys()].sort());
   return hashKey(x);
 }
 export function eq(a, b) {
@@ -355,7 +475,7 @@ export function strCmp(a, b) {
 }
 
 export function lt(a, b) {
-  if (typeof a === "number" && typeof b === "number") return a < b;
+  if (isNum(a) && isNum(b)) return a < b;
   if (typeof a === "string" && typeof b === "string") return strCmp(a, b) < 0;
   throw new Error("`<` needs two numbers or two strings, got " + describe(a) + " and " + describe(b));
 }
@@ -366,6 +486,7 @@ export function describe(x) {
   if (x instanceof Cons || x === ENIL) { try { return "(" + listToArray(x).map(describe).join(" ") + ")"; } catch (_) { return "(improper list)"; } }
   if (x instanceof T) return "{" + x.items.map(describe).join(", ") + "}";
   if (isVec(x)) return "[" + vecItems(x).map(describe).join(" ") + "]";
+  if (x instanceof BSet) return "#{" + setElements(x).map(describe).join(" ") + "}";
   if (isStruct(x)) return "#" + x.__struct + "{}";
   // `mapKeys` answers a BL LIST (it is the language's own `keys`), so it has to
   // be walked with `listToArray` before JavaScript's `.map` sees an array.
@@ -386,53 +507,65 @@ export function toStr(x) {
   if (x === true) return "true";
   if (x === false) return "false";
   if (x instanceof KW) return x.n;
-  if (typeof x === "number") return String(x);
+  if (typeof x === "number" || typeof x === "bigint") return String(x);
   return describe(x);
 }
 
 // ── arithmetic ───────────────────────────────────────────────────────────────
 
+// Integers are EXACT across the whole range: a value that fits the safe range
+// is a JS Number, anything larger is a BigInt, and a result that fits back is
+// normalized to a Number — ONE canonical form, so equality and hashing agree
+// (`hashKey`). A float operand makes the operation IEEE-754 double arithmetic
+// (the receive deadline clock is a float, so this path is load-bearing) and a
+// BigInt is converted to a Number at that boundary, as BEAM's float contagion
+// does. `quot`/`rem`/`mod` are integer-only, as on BEAM.
+function exactBig(x) { return typeof x === "bigint" ? x : BigInt(x); }
+function normInt(x) {
+  return (x >= -9007199254740991n && x <= 9007199254740991n) ? Number(x) : x;
+}
+function isExactInt(x) {
+  return typeof x === "bigint" || (typeof x === "number" && Number.isSafeInteger(x));
+}
+
 export function arith(op, a, b) {
   switch (op) {
-    // Integers are carried as EXACT SAFE INTEGERS: when both operands are
-    // integers, both inputs and the result must fit in ±(2^53-1), otherwise we
-    // raise instead of silently losing precision. Floats are a documented
-    // SUBSET: if either operand is a float the operation is IEEE-754 double
-    // arithmetic (the receive deadline clock is a float, so this path is
-    // load-bearing) and no overflow check is applied.
     case "add": case "sub": case "mul": {
-      if (typeof a !== "number" || typeof b !== "number")
+      if (!isNum(a) || !isNum(b))
         throw new Error("[" + op + "] needs two numbers, got " + describe(a) + " and " + describe(b));
-      if (Number.isInteger(a) && Number.isInteger(b)) {
-        if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b))
-          throw new Error("integer out of safe range in [" + op + "]");
-        const r = op === "add" ? a + b : op === "sub" ? a - b : a * b;
-        if (!Number.isSafeInteger(r)) throw new Error("integer overflow in [" + op + "]");
-        return r;
+      if (isExactInt(a) && isExactInt(b)) {
+        // The hot path stays in Number arithmetic while the result is safe;
+        // only a result that leaves the safe range promotes to BigInt.
+        if (typeof a === "number" && typeof b === "number") {
+          const r = op === "add" ? a + b : op === "sub" ? a - b : a * b;
+          if (Number.isSafeInteger(r)) return r === 0 ? 0 : r;   // -0 is just 0
+        }
+        const x = exactBig(a), y = exactBig(b);
+        return normInt(op === "add" ? x + y : op === "sub" ? x - y : x * y);
       }
-      return op === "add" ? a + b : op === "sub" ? a - b : a * b;
+      const x = Number(a), y = Number(b);
+      return op === "add" ? x + y : op === "sub" ? x - y : x * y;
+    }
+    case "quot": case "rem": case "mod": {
+      if (!isNum(a) || !isNum(b))
+        throw new Error("[" + op + "] needs two numbers, got " + describe(a) + " and " + describe(b));
+      if (!isExactInt(a) || !isExactInt(b))
+        throw new Error("[" + op + "] needs two integers, got " + describe(a) + " and " + describe(b));
+      const x = exactBig(a), y = exactBig(b);
+      if (y === 0n)
+        throw new Error(op === "rem" ? "rem by zero" : op === "mod" ? "mod by zero" : "divide by zero");
+      if (op === "quot") return normInt(x / y);          // truncates toward zero
+      if (op === "rem") return normInt(x % y);           // sign of the dividend
+      const m = x % y;
+      return normInt(((m % y) + y) % y);                  // mod: sign of the divisor
     }
     case "div": {
-      if (typeof a !== "number" || typeof b !== "number")
+      if (!isNum(a) || !isNum(b))
         throw new Error("[div] needs two numbers, got " + describe(a) + " and " + describe(b));
-      if (b === 0) throw new Error("divide by zero");
-      const q = a / b;
-      if (Number.isInteger(q) && Number.isInteger(a) && Number.isInteger(b) && !Number.isSafeInteger(q))
-        throw new Error("integer overflow in [div]");
-      return q;
-    }
-    case "rem": {
-      if (typeof a !== "number" || typeof b !== "number")
-        throw new Error("[rem] needs two numbers, got " + describe(a) + " and " + describe(b));
-      if (b === 0) throw new Error("rem by zero");
-      if (Number.isInteger(a) && Number.isInteger(b)) {
-        if (!Number.isSafeInteger(a) || !Number.isSafeInteger(b))
-          throw new Error("integer out of safe range in [rem]");
-        const r = a % b;
-        if (!Number.isSafeInteger(r)) throw new Error("integer overflow in [rem]");
-        return r;
-      }
-      return a % b;
+      if (b === 0 || b === 0n) throw new Error("divide by zero");
+      // BEAM `/` answers a FLOAT (`(/ 8 2)` is 4.0); this target has one Number
+      // type, so the answer is the double quotient of the operands.
+      return Number(a) / Number(b);
     }
     case "lt": return lt(a, b);
     case "gt": return lt(b, a);
@@ -617,7 +750,7 @@ export function invokeNative(rt, f, args) {
   }
   if (isVec(f)) return vecEl(f, args[0]);
   if (isBMap(f)) return mapGet(f, args[0], args[1]);
-  if (isSet(f)) return mapGet(f, args[0]);
+  if (isSet(f)) return setHas(f, args[0]) ? args[0] : null;
   if (typeof f === "function") return f.apply(null, args);
   throw new Error("cannot call " + describe(f));
 }
@@ -844,6 +977,8 @@ export function enqueueData(topic, value, { nodes = 4096, depth: maxDepth = 16, 
     if (isKw(v)) return;
     if (typeof v === "string" && v.length <= text) return;
     if (Number.isSafeInteger(v) && (negative || v >= 0)) return;
+    // an exact integer beyond 2^53 (a `:exact` wire value), bounded in size
+    if (typeof v === "bigint" && (negative || v >= 0n) && v.toString().length <= 101) return;
     if (scalars && (v === true || v === false || v === null)) return;
     if (v && typeof v === "object") {
       if (seen.has(v)) throw new Error("cyclic or reused typed input");
@@ -1014,6 +1149,12 @@ export const PURE = {
   "vec-to-list": vecToList,
   "vec-from-list": vecFromList,
   "is-set": isSet,
+  "set-from-list": setFromList,
+  "set-put": setPut,
+  "set-remove": setRemove,
+  "set-has": setHas,
+  "set-size": setSize,
+  "set-to-list": setToList,
   bmap,
   "empty-map": emptyMap,
   "is-map": isBMap,
@@ -1195,7 +1336,7 @@ export const ERLANG = {
   "is_map": isBMap,
   "tuple_size": tupSize,
   "map_size": mapSize,
-  "abs": Math.abs,
+  "abs": (x) => (typeof x === "bigint" ? (x < 0n ? -x : x) : Math.abs(x)),
   "length": (l) => listToArray(l).length,
   "self": () => null,
   // ── raising, and the two halves of an exception's shape ────────────────────

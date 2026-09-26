@@ -34,6 +34,7 @@ export function createCodec(contract) {
 
   function resolve(spec) {
     if (spec === 'bool') return 'bool';
+    if (spec === 'exact') return 'exact';
     if (typeof spec === 'string') {
       if (!Object.prototype.hasOwnProperty.call(wire, spec)) throw new Error('unknown wire type ' + spec);
       return wire[spec];
@@ -47,6 +48,15 @@ export function createCodec(contract) {
     if (Array.isArray(t) && (t[0] === 'list' || t[0] === 'record') && depth >= MAX_DEPTH)
       fail(`nested deeper than ${MAX_DEPTH}`);
     if (t === 'bool') return typeof v === 'boolean' ? v : fail('expected a boolean');
+    if (t === 'exact') {
+      // an integer of any size: a safe one travels as a JSON number, a larger
+      // one as its decimal digits (encode() does exactly this), so nothing is
+      // ever rounded; the BL side gets a safe Number or a BigInt
+      if (Number.isSafeInteger(v)) return v;
+      if (typeof v !== 'string' || !/^-?[1-9][0-9]{15,99}$/.test(v)) fail('expected an exact integer (a safe number or its decimal digits)');
+      const b = BigInt(v);
+      return b >= BigInt(Number.MIN_SAFE_INTEGER) && b <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(b) : b;
+    }
     if (!Array.isArray(t)) fail('malformed contract type');
     const [tag, a, b] = t;
     if (tag === 'text') {
@@ -139,6 +149,8 @@ export function encode(x) {
     if (!Number.isSafeInteger(x)) throw new Error('split-codec: inexact number on the wire');
     return x;
   }
+  // a big exact integer: its digits, never a rounded JSON number
+  if (typeof x === 'bigint') return x.toString();
   if (H.isKw(x)) return H.kwName(x);
   if (H.isVec(x)) return H.vecItems(x).map(encode);
   if (H.isCons(x) || H.isEnil(x)) return H.listToArray(x).map(encode);

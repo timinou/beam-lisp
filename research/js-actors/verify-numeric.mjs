@@ -7,8 +7,10 @@
 // It checks three things, none of which needs the BL toolchain:
 //
 //   1. the CONTRACT the raw operator must satisfy — for safe-integer operands
-//      `a OP b` is exactly `H.arith(op, a, b)`, and outside ±(2^53-1) the checked
-//      operator raises, which is precisely why the gate must refuse there;
+//      `a OP b` is exactly `H.arith(op, a, b)`, and outside ±(2^53-1) the
+//      checked operator PROMOTES to an exact BigInt where the raw JS operator
+//      would silently lose precision, which is precisely why the gate must
+//      refuse to widen there;
 //   2. the compile-time TRAP — `Number.isInteger(1.0)` is true, so the host
 //      cannot tell `1` from `1.0`; the int/float category has to be decided where
 //      the literal is still a BL value, never from the JS Number;
@@ -35,42 +37,35 @@ const RAW = {
 };
 // BL `rem` and JS `%` both truncate toward zero, so they agree on integers.
 
-assert.throws(() => H.arith('add', SAFE, 1), /overflow/);
-assert.throws(() => H.arith('sub', MIN_SAFE, 1), /overflow/);
-assert.throws(() => H.arith('mul', SAFE, 2), /overflow/);
+assert.equal(H.arith('add', SAFE, 1), 9007199254740992n);
+assert.equal(H.arith('sub', MIN_SAFE, 1), -9007199254740992n);
+assert.equal(H.arith('mul', SAFE, 2), BigInt(SAFE) * 2n);
 assert.throws(() => H.arith('rem', 1, 0), /rem by zero/);
 assert.throws(() => H.arith('div', 1, 0), /divide by zero/);
 assert.equal(H.arith('add', SAFE, 0), SAFE);
 assert.equal(H.arith('sub', MIN_SAFE, 0), MIN_SAFE);
-console.log('PASS checked arithmetic boundary: ±(2^53-1) exact, overflow and zero divisors raise');
+console.log('PASS checked arithmetic boundary: ±(2^53-1) exact in Number, promoted to BigInt outside, zero divisors raise');
 
 const samples = [0, 1, -1, 2, -2, 7, -7, 3, 1e6, -1e6, 12345, -54321, SAFE, MIN_SAFE];
-let equalities = 0, refusals = 0;
-for (const [op, raw] of Object.entries(RAW)) {
+// The exact result as a canonical value: a Number inside ±(2^53-1), else BigInt.
+const asExact = (a, b, op) => {
+  const x = BigInt(a), y = BigInt(b);
+  const r = op === 'add' ? x + y : op === 'sub' ? x - y : op === 'mul' ? x * y : x % y;
+  return (r >= -9007199254740991n && r <= 9007199254740991n) ? Number(r) : r;
+};
+let equalities = 0, promotions = 0;
+for (const op of Object.keys(RAW)) {
   for (const a of samples) {
     for (const b of samples) {
       if (op === 'rem' && b === 0) continue;
-      const value = raw(a, b);
-      let checked, threw = false;
-      try { checked = H.arith(op, a, b); } catch { threw = true; }
-      if (threw) {
-        // The checked operator refused; the raw operator would have produced a
-        // Number outside the exact safe range. That is exactly the set of sites
-        // the gate must keep on H.arith.
-        assert.ok(!Number.isSafeInteger(value) || !Number.isSafeInteger(a) || !Number.isSafeInteger(b),
-          `${op}(${a},${b}) raised but raw ${value} looks safe`);
-        refusals++;
-      } else {
-        assert.ok(Object.is(checked, value),
-          `${op}(${a},${b}): checked ${checked} !== raw ${value}`);
-        assert.ok(Number.isSafeInteger(checked));
-        equalities++;
-      }
+      const checked = H.arith(op, a, b);
+      assert.ok(Object.is(checked, asExact(a, b, op)), `${op}(${a},${b}): ${checked} !== exact`);
+      if (typeof checked === 'bigint') promotions++; else equalities++;
     }
   }
 }
-assert.ok(equalities > 100 && refusals > 0, 'sample set must exercise both sides');
-console.log(`PASS raw operator ≡ H.arith on ${equalities} safe assignments; ${refusals} refused outside the band`);
+assert.ok(equalities > 100 && promotions > 0, 'sample set must exercise both sides');
+console.log(`PASS raw operator ≡ H.arith on ${equalities} safe assignments; ${promotions} promoted beyond the band`);
 
 // ── 2. the int/float trap the gate has to decide statically ──────────────────
 
