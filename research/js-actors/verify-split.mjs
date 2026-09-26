@@ -101,6 +101,15 @@ const post = async (json) => {
   return { status: r.status, body: await r.json() };
 };
 
+// The shell: the page asks which app this process serves and loads its stylesheet.
+const appInfo = await (await fetch(base + '/api/app')).json();
+assert.equal(appInfo.app, 'showcase');
+assert.equal(typeof appInfo.digest, 'string');
+const shellCss = await fetch(base + '/app.css');
+assert.equal(shellCss.headers.get('content-type'), 'text/css; charset=utf-8');
+assert.ok((await shellCss.text()).includes('#app'));
+ok('/api/app names the app and /app.css serves its stylesheet as text/css');
+
 const events = [];
 const sse = await fetch(base + '/api/events');
 const reader = sse.body.getReader();

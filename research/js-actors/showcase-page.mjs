@@ -9,12 +9,25 @@
 //   3. EXPLAIN: the placement manifest, the contract and a live timeline of
 //      where each step ran — all read from the generated artifacts.
 
-const APP = 'showcase';
 const $ = id => document.getElementById(id);
 const appRoot = $('app');
 
+// One app per process: the shell says which. The Worker, the manifest and the
+// contract are all keyed by this name, so it is resolved before anything else.
+const APP = await fetchAppName();
+
 const ATTRS = new Set(['class', 'type', 'value', 'placeholder', 'maxlength', 'disabled',
-                       'aria-label', 'aria-pressed']);
+                       'aria-label', 'aria-pressed',
+                       'title', 'role', 'aria-expanded', 'aria-level', 'aria-current', 'data-depth']);
+
+async function fetchAppName() {
+  try {
+    const info = await (await fetch('/api/app', { cache: 'no-store' })).json();
+    if (info && /^[a-z][a-z0-9-]{0,31}$/.test(info.app)) return info.app;
+  } catch { /* fall through */ }
+  return 'showcase';
+}
+
 // A keyed row that MOVES (a re-sort) glides from where it was: FLIP.
 function rememberRows() {
   const at = new Map();
@@ -32,14 +45,15 @@ function glideRows(before) {
   }
 }
 const TAGS = new Set(['section', 'header', 'footer', 'nav', 'div', 'h1', 'h2', 'p', 'strong', 'small',
-                      'span', 'ul', 'li', 'button', 'input']);
-const EVENTS = { 'on-click': 'click', 'on-input': 'input', 'on-enter': 'keydown' };
+                      'span', 'ul', 'li', 'button', 'input',
+                      'ol', 'h3', 'label', 'em', 'code', 'kbd', 'article', 'aside']);
+const EVENTS = { 'on-click': 'click', 'on-input': 'input', 'on-enter': 'keydown', 'on-escape': 'escape' };
 
 const worker = new Worker(`./split-worker.mjs?app=${APP}`, { type: 'module' });
 // Names this tab to the transport so the timeline can tell "another tab" from
 // this tab's own echo. Metadata only: the authority never sees it.
 const TAB = [...crypto.getRandomValues(new Uint8Array(8))].map(b => b.toString(16).padStart(2, '0')).join('');
-const state = { handlers: new WeakMap(), rendered: 0, link: 'connecting', revision: null };
+const state = { handlers: new WeakMap(), rendered: 0, link: 'connecting', revision: null, source: APP + '.bl' };
 
 // ── rendering ────────────────────────────────────────────────────────────────
 
@@ -72,6 +86,9 @@ function create(node) {
   const el = document.createElement(node[0]);
   if (state.rendered > 0) el.dataset.fresh = '1';
   patch(el, node);
+  // `:autofocus true` focuses an element once, when the view first creates it
+  // (an inline editor that just opened) — never on later renders
+  if (node[1].autofocus === true) queueMicrotask(() => el.focus());
   return el;
 }
 
@@ -87,8 +104,8 @@ function bind(el, attrs) {
     el.addEventListener('click', () => { const a = slot.actions.click; if (a) send(a); });
     el.addEventListener('input', () => { const a = slot.actions.input; if (a) send([...a, { s: el.value }]); });
     el.addEventListener('keydown', e => {
-      const a = slot.actions.keydown;
-      if (a && e.key === 'Enter') { e.preventDefault(); send(a); }
+      const a = e.key === 'Enter' ? slot.actions.keydown : e.key === 'Escape' ? slot.actions.escape : null;
+      if (a) { e.preventDefault(); send(a); }
     });
   }
   slot.actions = actions;
@@ -274,7 +291,7 @@ function showEvidence(f, btn) {
   const box = $('evidence');
   box.replaceChildren();
   const title = document.createElement('div');
-  title.textContent = `${f.name}  (showcase.bl:${f.line}) → ${f.placement}`;
+  title.textContent = `${f.name}  (${state.source}:${f.line}) → ${f.placement}`;
   box.append(title,
     evidenceLine('graph', f.evidence.graph),
     evidenceLine('effects', f.evidence.effects),
@@ -293,6 +310,7 @@ async function explain() {
     fetch(`./out/${APP}.split.json`, { cache: 'no-store' }).then(r => r.json()),
     fetch(`./out/${APP}.contract.json`, { cache: 'no-store' }).then(r => r.json()),
   ]);
+  state.source = (typeof manifest.source === 'string' && manifest.source.split('/').pop()) || APP + '.bl';
   const lanes = { client: [], shared: [], server: [] };
   for (const f of manifest.functions) if (lanes[f.placement]) lanes[f.placement].push(f);
   for (const [lane, fns] of Object.entries(lanes)) {
@@ -324,6 +342,65 @@ async function explain() {
   $('contract').textContent = JSON.stringify(body, null, 2);
   $('contract-file').textContent = `out/${APP}.contract.json · sha256 ${digest.slice(0, 12)}…`;
 }
+
+// ── the page metadata ──────────────────────────────────────────────────────
+
+// Tiny markup for ledes and hints: `code` → <code>, **bold** → <b>. Nodes are
+// built from text, never parsed as HTML.
+function markup(text) {
+  const frag = document.createDocumentFragment();
+  const re = /`([^`]+)`|\*\*([^*]+)\*\*/g;
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) frag.append(text.slice(last, m.index));
+    const el = document.createElement(m[1] !== undefined ? 'code' : 'b');
+    el.textContent = m[1] ?? m[2];
+    frag.append(el);
+    last = re.lastIndex;
+  }
+  if (last < text.length) frag.append(text.slice(last));
+  return frag;
+}
+
+async function describe() {
+  let page = null;
+  try { page = await (await fetch('./app.page.json', { cache: 'no-store' })).json(); }
+  catch { /* an app may ship no metadata: the shell falls back to its name */ }
+  const title = page && typeof page.title === 'string' && page.title ? page.title : APP;
+  document.title = title;
+  const h1 = document.querySelector('.top h1');
+  if (h1) h1.textContent = title;
+  const lede = document.querySelector('.top .lede');
+  if (lede) lede.replaceChildren(markup(page && typeof page.lede === 'string' ? page.lede : ''));
+  const hints = $('hints');
+  if (hints) {
+    const list = page && Array.isArray(page.hints) ? page.hints.filter(h => typeof h === 'string') : [];
+    hints.replaceChildren(...list.map(h => {
+      const p = document.createElement('p');
+      p.className = 'hint';
+      p.append(markup(h));
+      return p;
+    }));
+  }
+}
+
+// ── the explainer toggle ───────────────────────────────────────────────────
+// The side column is shown by default; the choice survives a reload.
+const EXPLAIN_KEY = 'split-explain';
+const mainEl = document.querySelector('main');
+const explainButton = $('explain-toggle');
+function setExplained(shown) {
+  mainEl.classList.toggle('explain-hidden', !shown);
+  explainButton.textContent = shown ? 'Hide' : 'How it was built';
+  explainButton.setAttribute('aria-expanded', String(shown));
+  try { localStorage.setItem(EXPLAIN_KEY, shown ? 'shown' : 'hidden'); } catch { /* private mode */ }
+}
+let explainShown = true;
+try { explainShown = localStorage.getItem(EXPLAIN_KEY) !== 'hidden'; } catch { /* default shown */ }
+setExplained(explainShown);
+explainButton.addEventListener('click', () => setExplained(mainEl.classList.contains('explain-hidden')));
+
+describe().catch(() => {});
 
 explain().catch(error => { $('evidence').textContent = 'manifest unavailable: ' + error.message; });
 

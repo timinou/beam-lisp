@@ -41,9 +41,12 @@ const CSP_PAGE =
 function staticTable(app) {
   const js = 'text/javascript; charset=utf-8';
   const json = 'application/json; charset=utf-8';
+  const css = 'text/css; charset=utf-8';
   return new Map([
     ['/', ['showcase.html', 'text/html; charset=utf-8', CSP_PAGE]],
     ['/showcase.html', ['showcase.html', 'text/html; charset=utf-8', CSP_PAGE]],
+    ['/app.css', [`apps/${app}.css`, css]],
+    ['/app.page.json', [`apps/${app}.page.json`, json]],
     ['/showcase-page.mjs', ['showcase-page.mjs', js]],
     ['/split-worker.mjs', ['split-worker.mjs', js]],
     ['/split-codec.mjs', ['split-codec.mjs', js]],
@@ -196,6 +199,13 @@ export async function startSplitServer({ port = 0, app = 'showcase' } = {}) {
     return send(res, frame.ok ? 200 : (frame.reason === 'stale-revision' ? 409 : 422), out);
   }
 
+  // Which app this process serves, and the digest it must agree on.
+  function handleApp(req, res) {
+    if (req.method !== 'GET') return send(res, 405, { ok: false, reason: 'method-not-allowed' }, { allow: 'GET' });
+    if (!hostOK(req)) return send(res, 403, { ok: false, reason: 'host-refused' });
+    return send(res, 200, { app, digest: codec.digest });
+  }
+
   function handleEvents(req, res) {
     if (req.method !== 'GET') return send(res, 405, { ok: false, reason: 'method-not-allowed' });
     if (!hostOK(req)) return send(res, 403, { ok: false, reason: 'host-refused' });
@@ -219,16 +229,19 @@ export async function startSplitServer({ port = 0, app = 'showcase' } = {}) {
     const entry = STATIC.get(pathname);
     if (!entry) return send(res, 404, { ok: false, reason: 'not-found' });
     const [file, type, csp] = entry;
-    try {
-      const data = await readFile(new URL(file, dir));
-      res.writeHead(200, {
-        'content-type': type, 'content-length': data.length, 'cache-control': 'no-store',
-        'x-content-type-options': 'nosniff', ...(csp ? { 'content-security-policy': csp } : {}),
-      });
-      res.end(req.method === 'HEAD' ? undefined : data);
-    } catch {
-      send(res, 500, { ok: false, reason: 'static-unavailable' });
+    let data;
+    try { data = await readFile(new URL(file, dir)); }
+    catch {
+      // An app may ship no stylesheet and no page metadata: the shell still works.
+      if (pathname === '/app.css') data = Buffer.alloc(0);
+      else if (pathname === '/app.page.json') data = Buffer.from(JSON.stringify({ title: app, lede: '', hints: [] }));
+      else return send(res, 500, { ok: false, reason: 'static-unavailable' });
     }
+    res.writeHead(200, {
+      'content-type': type, 'content-length': data.length, 'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff', ...(csp ? { 'content-security-policy': csp } : {}),
+    });
+    res.end(req.method === 'HEAD' ? undefined : data);
   }
 
   const server = createServer((req, res) => {
@@ -236,7 +249,8 @@ export async function startSplitServer({ port = 0, app = 'showcase' } = {}) {
     let pathname;
     try { pathname = new URL(req.url, `http://127.0.0.1:${boundPort}`).pathname; }
     catch { return send(res, 400, { ok: false, reason: 'malformed-url' }); }
-    const task = pathname === '/api/intent' ? handleIntent(req, res)
+    const task = pathname === '/api/app' ? handleApp(req, res)
+      : pathname === '/api/intent' ? handleIntent(req, res)
       : pathname === '/api/events' ? handleEvents(req, res)
       : handleStatic(req, res, pathname);
     Promise.resolve(task).catch(() => send(res, 500, { ok: false, reason: 'internal-error' }));
