@@ -19,7 +19,7 @@ still exits 0.
 
 ```beam-lisp
 (ns bl.doctor
-  (:require [bl.util :as u] [vm.client]))
+  (:require [bl.util :as u] [vm.client] [model]))
 ```
 
 ## A probe never crashes
@@ -175,15 +175,15 @@ invocation, so it reports `not running` and changes nothing.
    (probe "embedding" false
      (fn []
        (let [m    (BeamLisp/eval "code.embed/MODEL")
-             tier (BeamLisp.Model/tier m)
-             dir  (BeamLisp.Model/dir m)]
+             tier (model/tier m)
+             dir  (model/dir m)]
          (case tier
            :bundled {:ok true :detail (str "present (bundled: " dir ")")}
            :env     {:ok true :detail (str "present (BEAM_LISP_MODEL_DIR: " dir ")")}
            :ambient {:ok true :detail (str "present (fetched into the cache: " dir ")")}
            {:ok false
             :detail (str "absent — `bl search` needs it; looked in "
-                         (join ", " (BeamLisp.Model/searched_dirs m)))}))))])
+                         (join ", " (model/searched-dirs m)))}))))])
 ```
 
 ## The deep probes
