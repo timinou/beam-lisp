@@ -6,7 +6,7 @@ for path <- ["lib/beam_lisp/compiler.ex",
              "lib/beam_lisp/record.ex",
              "lib/beam_lisp/aot.ex", "lib/beam_lisp/aot_cache.ex",
              "lib/beam_lisp.ex",
-             "lib/beam_lisp/dev_hotpatch.ex", "lib/beam_lisp/anf_interpreter.ex",
+             "lib/beam_lisp/anf_interpreter.ex",
              "lib/beam_lisp/dev_change.ex"] do
   Code.compile_file(path)
 end
@@ -27,7 +27,9 @@ IO.puts("CANONICAL_FLOOR: #{seed}")
 case System.get_env("CANONICAL_HOTPATCH") do
   nil -> :ok
   "" -> :ok
-  names -> BeamLisp.DevHotpatch.hotpatch!(names)
+  names ->
+    BeamLisp.Loader.ensure_loaded("vm.hotpatch")
+    apply(BeamLisp.Ns.Vm.Hotpatch, :hotpatch!, [names])
 end
 BeamLisp.Loader.ensure_loaded("vm.generation")
 IO.inspect(BeamLisp.Ns.Vm.Generation.receipt(), label: "GENERATION_RECEIPT", limit: :infinity)

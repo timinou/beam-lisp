@@ -5,5 +5,6 @@ ExUnit.start(autorun: false)
 
 # Boot-tier toolchain iteration without a seed regen: BL_HOTPATCH=anf,lower
 # recompiles those priv/boot/*.bl namespaces from current source and swaps
-# them into this test VM. See BeamLisp.DevHotpatch.
-BeamLisp.DevHotpatch.apply_env!()
+# them into this test VM. See priv/std/vm/hotpatch.bl.
+BeamLisp.Loader.ensure_loaded("vm.hotpatch")
+apply(BeamLisp.Ns.Vm.Hotpatch, :"apply-env!", [])
