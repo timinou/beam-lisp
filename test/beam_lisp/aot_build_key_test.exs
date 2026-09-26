@@ -113,11 +113,24 @@ defmodule BeamLisp.AotBuildKeyTest do
   end
 
   # ── the fact log ─────────────────────────────────────────────────────────
+  #
+  # `build-log` is beam-lisp (`priv/build/build-log.bl`) — the ONE definition of
+  # the build's memory, and the only place the log is read. Called through the
+  # var table exactly as the deleted `BeamLisp.BuildLog` façade did, so no
+  # Elixir seam remains.
 
-  defp log_path, do: BeamLisp.BuildLog.path_for(@manifest)
+  defp blog(name, args) do
+    BeamLisp.Loader.ensure_loaded("build-log")
+    BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!("build-log", name), args)
+  end
 
-  defp recorded_tier(path),
-    do: Map.fetch!(BeamLisp.BuildLog.state(log_path()).sources, path).tier
+  defp log_path, do: blog("path-for", [@manifest])
+
+  # `state(log) == replay(read-facts(log))` — the façade's own definition of the
+  # state, now spelled where it lives.
+  defp log_state, do: blog("replay", [blog("read-facts", [log_path()])])
+
+  defp recorded_tier(path), do: Map.fetch!(log_state().sources, path).tier
 
   # The log is TEXT — that is the point of it — so a forge is a string edit, not
   # a rebuild of the structures the reader uses. If the format moves out from
