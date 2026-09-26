@@ -1,0 +1,190 @@
+; aot_gate_cost_test.bl — AOT freshness at its source, and the gate's cost.
+;
+; Ported from the ExUnit `test/beam_lisp/aot_gate_cost_test.exs`, which drove
+; the Elixir `BeamLisp.BuildTask` shell. Here the build is called DIRECTLY —
+; `priv/build/build.bl`'s `build/run` — and the freshness key it stamps is the
+; same one the runtime gate recomputes through `priv/build/build-plan.bl`
+; (`AOT.ns_closure_hash/1` → `build-plan/key-for`), with no Elixir seam in the
+; path. Only the runtime's own reads are used on the gate side.
+;
+; Two defects that together made AOT a no-op for any application built from
+; the language's checkout, root-caused on a ninety-namespace app whose load
+; took 72s with every beam present and fresh:
+;
+;   1. a build of a source dir OUTSIDE cwd stamped every beam that requires a
+;      SIBLING with a closure key the runtime gate never matched: the emitter
+;      resolves siblings by name through the loader's search roots, which did
+;      not contain the source dir, so each sibling contributed `x:?` to the
+;      key. The gate, running with the dir on its path, folded the real
+;      hashes. Same bytes, different key → "stale" → silent source fallback on
+;      every boot. The source dir must be a search root for the build's
+;      duration — registered here exactly as the production shell did, and
+;      removed after it, because leaving it would shadow the app's own tree.
+;
+;   2. the gate's `ns_closure_hash/1` re-read and re-parsed a namespace's whole
+;      require-closure on EVERY call, and it is called once per namespace
+;      loaded — 90 × 90 parses (71.7s of the 72.5s). A plan node is a pure
+;      function of a file's bytes, so the memo table (`:beam_lisp_build_plan_nodes`,
+;      filled by `build-plan`'s `key-for` node-of) keys by content hash; the key
+;      is still folded from live bytes per call, so an edit is still seen.
+;
+; The fixture is a two-file closure (a leaf and a root that requires it) under
+; a tmp root OUTSIDE cwd — the one shape that exposed both.
+;
+; Run: bl test test/bl/aot_gate_cost_test.bl
+
+(ns aot-gate-cost.test
+  (:require [build :as b] [build-log :as blog]))
+
+(def tmp (Path/join (System/tmp_dir!) "beam_lisp_gate_cost"))
+(def src-dir (Path/join tmp "src"))
+(def out (Path/join tmp "out"))
+
+(def leaf-ns "gc.leaf")
+(def root-ns "gc.root")
+(def leaf (Path/join src-dir "gc/leaf.bl"))
+(def root (Path/join src-dir "gc/root.bl"))
+
+; The shared cache would let a prior run answer a build without compiling, and
+; the cost pinned here is the COMPILE path's — so every "built" is a real
+; compile and the memo is filled by this suite alone. `bl test` snapshots and
+; restores the OS environment per file, so this cannot leak to a neighbour.
+(System/put_env "BEAM_LISP_AOT_CACHE" "off")
+
+(defn- clear-memo!
+  "Forget every memoized plan node. The table is created lazily by the gate's
+   `build-plan/key-for`; absent means nothing is remembered yet."
+  []
+  (when (not= :undefined (ets/info :beam_lisp_build_plan_nodes))
+    (ets/delete_all_objects :beam_lisp_build_plan_nodes))
+  :ok)
+
+(defn- prepare!
+  "A fresh fixture: the leaf (no requires) and the root (requires the leaf)."
+  []
+  (File/rm_rf! tmp)
+  (File/mkdir_p! (Path/dirname leaf))
+  (File/write! leaf "(ns gc.leaf)\n(defn one [] 1)\n")
+  (File/write! root "(ns gc.root (:require [gc.leaf :as l]))\n(defn two [] (+ (l/one) (l/one)))\n")
+  (clear-memo!))
+
+(defn- build!
+  "Build the fixture through the production driver. The source root is a search
+   root for the run — the emitter resolves `gc.leaf` BY NAME when it folds
+   `gc.root`'s closure, and the gate folds it the same way — and it is removed
+   again afterwards, unconditionally: a build that leaves its root on the app's
+   search path is the defect, not the fix.
+
+   Registered on the CALLING ENV alone (`Env/add_search_path`), which is
+   enough: `pmap-ordered` conveys the caller's env into each wave worker
+   BEFORE it is spawned, so a worker resolves names through this fork's roots.
+   The ambient `BEAM_LISP_PATH` is deliberately NOT used — it would put the
+   root on every process's path and mask the very defect this fixture exists
+   to catch."
+  []
+  (b/clean out (b/manifest-path out))
+  (BeamLisp.Env/add_search_path src-dir)
+  (try
+    (let [r (b/run {:sources (list leaf root)
+                    :out out
+                    :manifest (b/manifest-path out)
+                    :jobs 2})]
+      (is (empty? (:errors r)) (str "build errors: " (pr-str (:errors r)))))
+    (finally
+      (BeamLisp.Env/remove_search_path src-dir))))
+
+(defn- provenance
+  "The source hash the on-disk beam carries, read after a fresh code-load — the
+   value the runtime gate compares against (`__bl_provenance__/0` returns
+   `{source-hash, stamp-key}`; the gate reads both)."
+  [ns]
+  (let [mod (BeamLisp.Link/module_for ns)
+        path (blog/beam-path out mod)]
+    (code/purge mod)
+    (code/delete mod)
+    (let [loaded (code/load_binary mod (erlang/binary_to_list path) (File/read! path))]
+      (is (= :module (elem loaded 0)) "the beam loads")
+      (is (= mod (elem loaded 1)) "and it is the module it claims to be")
+      (elem (erlang/apply mod :__bl_provenance__ (list)) 0))))
+
+(defn- live-key
+  "The gate's own key for `ns`, resolved against the fixture root alone — the
+   value `AOT.ensure_loaded/1` recomputes when it vets a beam."
+  [ns]
+  (BeamLisp.Loader/with_search_dir src-dir
+    (fn [] (BeamLisp.AOT/ns_closure_hash ns))))
+
+(defn- memo-size [] (ets/info :beam_lisp_build_plan_nodes :size))
+
+(deftest a-beam-that-requires-a-sibling-outside-cwd-is-fresh-to-the-gate
+  (is (not (starts-with? src-dir (File/cwd!))) "fixture must live outside cwd")
+  (prepare!)
+  (build!)
+
+  ; The leaf never failed (no requires); the root did — its stamp folded
+  ; `gc.leaf:?` where the gate folds the leaf's interface.
+  (is (= (provenance leaf-ns) (live-key leaf-ns)))
+  (is (= (provenance root-ns) (live-key root-ns)))
+
+  ; And the build must not leave its root on the app's search path.
+  (is (not (contains? (set (BeamLisp.Env/search_paths)) (Path/expand src-dir)))))
+
+(deftest the-memoized-gate-still-sees-an-edit-to-a-closure-member
+  (prepare!)
+  (build!)
+  (let [before (live-key root-ns)]
+    (is (= before (provenance root-ns)))
+
+    ; Repeated calls parse nothing new: the memo holds both files.
+    (is (= before (live-key root-ns)))
+    (is (= 2 (memo-size)))
+
+    ; Edit the LEAF only. The root's bytes are unchanged, yet its key must
+    ; move (its closure is keyed over live bytes), and the gate must now call
+    ; the root stale.
+    (File/write! leaf "(ns gc.leaf)\n(defn one [] 1)\n(defn zero [] 0)\n")
+    (let [after-edit (live-key root-ns)]
+      (is (not= after-edit before))
+      (is (= 3 (memo-size)) "the edited file is parsed afresh; the root is not")
+      (Process/put :bl_search_dirs (list src-dir))
+      (is (= :no_module (BeamLisp.AOT/ensure_loaded root-ns))))))
+
+; ── the conveyance regression, pinned in isolation ──────────────────────
+;
+; The measured production defect: `pmap-ordered` conveyed `f` INSIDE each
+; `spawn_link` worker. `convey` captures the CALLER's process dictionary, and a
+; freshly spawned worker's pdict is empty — so the token named `:global`, the
+; wave workers held none of the calling fork's search roots, and the emitter
+; folded `gc.leaf:?` into `gc.root`'s closure key. The build "succeeded" (no
+; errors) yet stamped a key the runtime gate never reproduced: every fresh beam
+; judged stale, every boot silently falling back to source — which is what the
+; `BEAM_LISP_PATH` workaround hid. The fix conveys ONCE in the PARENT, before
+; the spawn.
+;
+; Pinned from a FRESH ward fork whose ONLY search root is `src-dir`: nothing is
+; registered globally, `BEAM_LISP_PATH` is untouched, and the enclosing env
+; does not carry the root — so it can reach the wave workers only by riding the
+; conveyed env token. This is the assertion the workaround made pass by putting
+; the root on EVERY process's path instead.
+(deftest a-ward-forks-root-reaches-the-build-workers
+  (is (not (starts-with? src-dir (File/cwd!))) "fixture must live outside cwd")
+  (prepare!)
+  (is (not (contains? (set (BeamLisp.Env/search_paths)) (Path/expand src-dir)))
+      "the root must live in the ward fork alone, not the caller's env")
+  (let [r (BeamLisp.Env/isolated
+            (fn []
+              ; The root is registered on the WARD's env, and removed on the way
+              ; out — a build that leaves its root behind is the defect, not the fix.
+              (BeamLisp.Env/add_search_path src-dir)
+              (try
+                (b/clean out (b/manifest-path out))
+                (b/run {:sources (list leaf root)
+                        :out out
+                        :manifest (b/manifest-path out)
+                        :jobs 2})
+                (finally (BeamLisp.Env/remove_search_path src-dir)))))]
+    (is (empty? (:errors r)) (str "build errors: " (pr-str (:errors r))))
+    ; The stamp the wave worker left on the sibling-requiring source is the key
+    ; the gate recomputes with the same root — source dir outside cwd and all.
+    (is (= (provenance root-ns) (live-key root-ns))
+        "a ward fork's search root must reach the build's wave workers")))
