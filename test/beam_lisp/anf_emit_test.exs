@@ -37,7 +37,7 @@ defmodule BeamLisp.AnfEmitTest do
   end
 
   test "generated live and disk consumers contain no quoted reverse bridge" do
-    for path <- ["lib/beam_lisp/link.ex", "lib/beam_lisp/emit.ex", "lib/beam_lisp/aot.ex"] do
+    for path <- ["priv/host/link.bl", "priv/host/emit.bl", "lib/beam_lisp/aot.ex"] do
       source = File.read!(path)
       refute source =~ "quote do"
       refute source =~ "quote-node"

@@ -2,8 +2,7 @@
 # candidate floor without modifying the committed seed. No legacy host,
 # quoted importer, or permissive collection adapter is installed.
 Code.compiler_options(ignore_module_conflict: true, infer_signatures: false)
-for path <- ["lib/beam_lisp/emit.ex",
-             "lib/beam_lisp/link.ex", "lib/beam_lisp/compiler.ex",
+for path <- ["lib/beam_lisp/compiler.ex",
              "lib/beam_lisp/record.ex",
              "lib/beam_lisp/aot.ex", "lib/beam_lisp/aot_cache.ex",
              "lib/beam_lisp.ex",

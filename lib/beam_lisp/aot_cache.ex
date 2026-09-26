@@ -111,7 +111,10 @@ defmodule BeamLisp.AOTCache do
   # A source digest is compiler-independent, which is what a toolchain key has
   # always claimed to be. For an image that ships no `.ex` (a release drop) the
   # digest is read from `priv/codegen.sources`, baked by the checkout whenever it
-  # computes the key — see `codegen_part/0`.
+  # computes the key — see `codegen_part/0`. The pinned host leaves
+  # (`CompilerData`, `Emit`, `Link`) are the exception: their source moved to
+  # `priv/host/<leaf>.bl`, and `@pinned_host_sources` below is the table that
+  # says which module follows which leaf.
   #
   # `BeamLisp.Ns` used to be listed here and was DEAD: the module has no source
   # file anywhere in the tree (`lib/beam_lisp/ns.ex` does not exist) and no beam
@@ -378,28 +381,47 @@ defmodule BeamLisp.AOTCache do
     end
   end
 
-  # CompilerData is the first pinned host leaf: its exact-name beam is now
-  # compiled from priv/host/compiler_data.bl, not lib/beam_lisp/compiler_data.ex.
-  # The live key must follow THAT source; otherwise removing the .ex would force
-  # the baked-digest fallback in a checkout and make future codegen edits invisible.
-  defp codegen_source_path(BeamLisp.CompilerData) do
-    Enum.find_value(codegen_source_roots(), fn root ->
-      path = Path.expand("../priv/host/compiler_data.bl", root)
-      File.exists?(path) && path
-    end) || Path.expand("../priv/host/compiler_data.bl", hd(codegen_source_roots()))
-  end
+  # The pinned HOST leaves: codegen modules whose source moved to
+  # `priv/host/<leaf>.bl` from `lib/beam_lisp/<name>.ex`. The live key must
+  # follow THAT source — a pinned leaf's exact-name beam is compiled from it —
+  # and this table is the one place that names each one. Without it, a checkout
+  # that has deleted the `.ex` would read the missing source as `:error` and fall
+  # back to the frozen `priv/codegen.sources`, making every future codegen edit
+  # invisible. That is exactly the failure `CompilerData` recorded when it became
+  # the first pinned leaf, and `Emit`/`Link` are the pair seeded beside it.
+  @pinned_host_sources %{
+    BeamLisp.CompilerData => "compiler_data.bl",
+    BeamLisp.Emit => "emit.bl",
+    BeamLisp.Link => "link.bl"
+  }
 
-  # `lib/beam_lisp/atom_guard.ex` for `BeamLisp.AtomGuard` — derived from the
-  # module name rather than listed beside it, so a module added to
-  # `@codegen_modules` cannot be silently uncovered. Nil when no candidate root
-  # has it, which is what a release drop looks like (`:error` upstream).
+  # The source path for a codegen module: the pinned `.bl` for a leaf in
+  # `@pinned_host_sources`, else `lib/beam_lisp/atom_guard.ex` for
+  # `BeamLisp.AtomGuard` — derived from the module name rather than listed beside
+  # it, so a module added to `@codegen_modules` cannot be silently uncovered.
+  # Both branches name a path that may not exist (a release drop ships neither
+  # source); the read then fails upstream and `live_codegen_digest/0` answers
+  # `:error`, which is the distinct fact that routes `codegen_part/0` to the
+  # baked digest.
   defp codegen_source_path(mod) do
-    name = Enum.map_join(Module.split(mod), "/", &Macro.underscore/1) <> ".ex"
-    Enum.find_value(codegen_source_roots(), fn root -> File.exists?(Path.join(root, name)) && Path.join(root, name) end) ||
-      Path.join(hd(codegen_source_roots()), name)
+    case Map.fetch(@pinned_host_sources, mod) do
+      {:ok, leaf} ->
+        relative = "../priv/host/#{leaf}"
+
+        Enum.find_value(codegen_source_roots(), fn root ->
+          path = Path.expand(relative, root)
+          File.exists?(path) && path
+        end) || Path.expand(relative, hd(codegen_source_roots()))
+
+      :error ->
+        name = Enum.map_join(Module.split(mod), "/", &Macro.underscore/1) <> ".ex"
+        Enum.find_value(codegen_source_roots(), fn root -> File.exists?(Path.join(root, name)) && Path.join(root, name) end) ||
+          Path.join(hd(codegen_source_roots()), name)
+    end
   end
 
-  # Where the codegen `.ex` sources live, in order of authority:
+  # Where the codegen sources live — the `.ex` modules, and the pinned
+  # `priv/host/*.bl` leaves resolved beside them — in order of authority:
   #
   #   1. the source tree THIS MODULE WAS COMPILED FROM. Authoritative for a
   #      checkout, and the reason `Tiers.priv_root/0` cannot be used here: with
