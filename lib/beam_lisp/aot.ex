@@ -94,7 +94,212 @@ defmodule BeamLisp.AOT do
   """
   def compile_source(source, opts \\ []) do
     output_dir = Keyword.get(opts, :output_dir) || default_output_dir()
+    {defined, value_defs, touched, ns_meta, file} = load_unit(source, opts)
 
+    # A namespace gets a module if it defined functions or value vars. Each
+    # namespace now emits SEVERAL beams — the shim namespace module plus one
+    # per body module — so flat_map the per-namespace lists into one
+    # `[{mod, path}]` for the caller and the Mix manifest.
+    touched
+    |> Enum.filter(fn ns -> Map.has_key?(value_defs, ns) or Env.ns_defs(ns) != %{} end)
+    |> Enum.sort()
+    |> Enum.flat_map(fn ns ->
+      emit_module(ns, Map.get(value_defs, ns, []), Map.get(ns_meta, ns, %{}), output_dir, file,
+        Map.get(defined, ns))
+    end)
+  end
+
+  @doc """
+  Compile ONE `.bl` file into ONE BEAM module at an EXACT caller-given atom.
+
+  This is the PINNED-MODULE (host ABI) path, deliberately separate from
+  `compile_file/2`/`compile_source/2`: those emit the `BeamLisp.Ns.<Ns>`
+  shim/body pair a namespace compiles to. A pinned module instead carries the
+  file's top-level `defn`s as PLAIN exported functions — the caller's exact
+  name, no shim indirection, no companion/body modules, no `__bl_init__/0` — so
+  native host code can `:erlang.apply/3` them, and a `.bl` file can stand in for
+  an existing `Elixir.BeamLisp.X` host module without renaming every one of its
+  callers.
+
+  Nothing about the namespace path changes: the unit still runs through the
+  ordinary reader/compiler pipeline (macros expand, requires resolve, the
+  namespace's own shim/body beams are still built in this VM), and the pinned
+  beam is emitted IN ADDITION. Sibling calls, which the compiler links to the
+  namespace's shim module, are re-pointed at the pinned atom, so the emitted
+  beam is self-contained.
+
+  ## Options
+
+    * `:module` (required) — the exact atom to emit. Validated by
+      `validate_host_module!/1`: atoms are never minted from strings, so there
+      is no atom leak, and names that would collide with the namespace scheme
+      are refused.
+    * `:output_dir` (required) — where `<module>.beam` is written.
+    * `:behaviour` — a module atom recorded as `-behaviour(Mod)`.
+    * `:file` — the source path used for positions (defaults to `path`).
+
+  Returns `{module, beam_path}`. Raises `ArgumentError` on an invalid module
+  name, on a file that defines functions in anything but exactly one namespace,
+  on a file with no functions to export, and on a file that carries value
+  definitions (`def`/`defrecord`/`defprotocol`/…) the pinned surface has no
+  plain-function form for yet.
+  """
+  def compile_host_file(path, opts \\ []) do
+    module = Keyword.fetch!(opts, :module)
+    validate_host_module!(module)
+    output_dir = Keyword.fetch!(opts, :output_dir)
+    file = Keyword.get(opts, :file, path)
+
+    BeamLisp.Loader.with_load_path(Path.dirname(path), fn ->
+      source = BeamLisp.Loader.read_source(path)
+
+      {defined, value_defs, _touched, _ns_meta, _file} =
+        load_unit(source, Keyword.put(opts, :file, file))
+
+      ns = pinned_namespace!(defined)
+      shim = Emit.module_for(ns)
+
+      # A pinned module carries FUNCTIONS. A `def` value (or a define-by-interning
+      # form — `defrecord`/`defprotocol`/`defserver`/…) has no plain-function
+      # surface yet, and dropping it would leave the emitted module referencing a
+      # var nobody interns. Refuse by name rather than emit a broken beam.
+      if Map.get(value_defs, ns, []) != [] do
+        raise ArgumentError,
+              "pinned host module #{inspect(module)} cannot yet carry value definitions " <>
+                "(#{ns}); only top-level `defn`s are emitted"
+      end
+
+      clauses =
+        ns
+        |> Env.ns_defs()
+        |> Map.take(MapSet.to_list(Map.fetch!(defined, ns)))
+        |> Enum.flat_map(fn {_name, defs} -> defs end)
+        |> Enum.map(&elem(&1, 3))
+        |> Enum.map(&retarget_host(&1, shim, module))
+
+      if clauses == [] do
+        raise ArgumentError,
+              "pinned host module #{inspect(module)} would export no functions (#{path})"
+      end
+
+      descriptor = Emit.descriptor_for(module, clauses, host_attrs(opts), %{file: file})
+      {mod, beam} = Emit.compile_descriptor(descriptor)
+      Emit.load_binary!({mod, beam}, file || "beam_lisp_host")
+      write_beam(mod, beam, output_dir)
+    end)
+  end
+
+  # `nil`/`true`/`false` are atoms but not modules, and `module_info` is the
+  # introspection pair every module already carries.
+  @reserved_host_modules [nil, true, false, :undefined, :module_info]
+
+  # Refuse a module name the pinned emitter cannot honestly honour. There is no
+  # `String.to_atom` anywhere on this path — the caller supplies an atom — so
+  # the rejections are about SHAPE and COLLISION, not leakage.
+  defp validate_host_module!(module) do
+    cond do
+      not is_atom(module) ->
+        raise ArgumentError,
+              "pinned host module name must be an atom, got: #{inspect(module)}"
+
+      module in @reserved_host_modules ->
+        raise ArgumentError, "pinned host module name #{inspect(module)} is reserved"
+
+      module |> Atom.to_string() |> String.starts_with?("Elixir.BeamLisp.Ns.") ->
+        raise ArgumentError,
+              "pinned host module #{inspect(module)} collides with the namespace emitter's " <>
+                "BeamLisp.Ns.* scheme; name it outside that prefix"
+
+      true ->
+        module
+    end
+  end
+
+  # The single namespace a pinned file's functions belong to, from the defn
+  # names the UNIT itself spelled. A pinned module IS one module, so a file that
+  # defines functions in two namespaces has no single honest home: refuse rather
+  # than merge. Read from `defined` (this unit), never from the VM registry —
+  # the registry also holds defns an earlier compile of the same ns left behind.
+  defp pinned_namespace!(defined) do
+    namespaces =
+      defined
+      |> Enum.filter(fn {_ns, names} -> MapSet.size(names) > 0 end)
+      |> Enum.map(&elem(&1, 0))
+      |> Enum.sort()
+
+    case namespaces do
+      [ns] ->
+        ns
+
+      [] ->
+        raise ArgumentError, "pinned host module source defines no functions in any namespace"
+
+      many ->
+        raise ArgumentError,
+              "pinned host module source must define functions in exactly one namespace, " <>
+                "got: #{inspect(many)}"
+    end
+  end
+
+  # The module attributes a pinned descriptor carries. Only `-behaviour` today —
+  # what an OTP callback module (a ported `use GenServer`-style host module)
+  # needs to be accepted by the runtime.
+  defp host_attrs(opts) do
+    case Keyword.get(opts, :behaviour) do
+      nil -> []
+      mod when is_atom(mod) -> [[:behaviour, mod]]
+      other -> raise ArgumentError, ":behaviour must be a module atom, got: #{inspect(other)}"
+    end
+  end
+
+  # Re-point every direct call the compiler linked to the namespace's SHIM
+  # (`BeamLisp.Ns.<Ns>`) at the PINNED module atom. A pinned module carries its
+  # namespace's defns as its OWN functions, so a sibling or self call must land
+  # there — otherwise the emitted beam still leans on the Ns shim the pinned
+  # path exists to avoid.
+  #
+  # The walk is over the closed bl-ANF vocabulary and NEVER enters a literal
+  # (`:lit` / `:plit`): an atom literal that happens to equal the shim's name is
+  # data, not a call target. Structs (e.g. `BeamLisp.Vector`) are rebuilt rather
+  # than flattened to plain maps, so the descriptor the boundary validates is
+  # unchanged in shape.
+  defp retarget_host(%_{} = s, from, to) do
+    fields =
+      s
+      |> Map.from_struct()
+      |> Map.new(fn {k, v} -> {k, retarget_host(v, from, to)} end)
+
+    struct(s.__struct__, fields)
+  end
+
+  defp retarget_host(%{op: :lit} = node, _from, _to), do: node
+  defp retarget_host(%{pop: :plit} = pat, _from, _to), do: pat
+
+  defp retarget_host(%{op: :remote, mod: mod} = node, from, to) do
+    node = if mod == from, do: %{node | mod: to}, else: node
+    %{node | args: Enum.map(node.args, &retarget_host(&1, from, to))}
+  end
+
+  defp retarget_host(%{} = map, from, to),
+    do: Map.new(map, fn {k, v} -> {k, retarget_host(v, from, to)} end)
+
+  defp retarget_host(list, from, to) when is_list(list),
+    do: Enum.map(list, &retarget_host(&1, from, to))
+
+  defp retarget_host(tuple, from, to) when is_tuple(tuple) do
+    tuple
+    |> Tuple.to_list()
+    |> Enum.map(&retarget_host(&1, from, to))
+    |> List.to_tuple()
+  end
+
+  defp retarget_host(other, _from, _to), do: other
+
+  # Run one compilation unit through the ordinary reader/compiler pipeline and
+  # return everything the emitters need. Shared by `compile_source/2` (the
+  # namespace emitter) and `compile_host_file/2` (the pinned emitter) so the two
+  # can never disagree about how a file is read, prelinked or evaluated.
+  defp load_unit(source, opts) do
     boot()
 
     # Each file is an independent compilation unit defaulting to the
@@ -148,17 +353,7 @@ defmodule BeamLisp.AOT do
         {vdefs, MapSet.put(nss, ns), nsmeta}
       end)
 
-    # A namespace gets a module if it defined functions or value vars. Each
-    # namespace now emits SEVERAL beams — the shim namespace module plus one
-    # per body module — so flat_map the per-namespace lists into one
-    # `[{mod, path}]` for the caller and the Mix manifest.
-    touched
-    |> Enum.filter(fn ns -> Map.has_key?(value_defs, ns) or Env.ns_defs(ns) != %{} end)
-    |> Enum.sort()
-    |> Enum.flat_map(fn ns ->
-      emit_module(ns, Map.get(value_defs, ns, []), Map.get(ns_meta, ns, %{}), output_dir, file,
-        Map.get(defined, ns))
-    end)
+    {defined, value_defs, touched, ns_meta, file}
   end
 
   # The fn definitions THIS UNIT made, per namespace: the names a top-level
