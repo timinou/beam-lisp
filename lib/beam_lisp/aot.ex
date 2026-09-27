@@ -164,13 +164,22 @@ defmodule BeamLisp.AOT do
       keeps the module functions-only. Field names must be atoms supplied by the
       caller (never minted from strings) and defaults must be literal data.
 
-      NOT emitted in this phase: protocol impls (`Enumerable`, `Inspect`,
-      `Exception`, …) and the `__info__(:struct)` field metadata that
-      `Inspect.Any` reads — so `inspect/1` still renders the value as a plain
-      map. Those are the NEXT extension, and the constructor pair here is the
-      primitive they hang off: a protocol impl is its own module (`Elixir.<Proto>.<Mod>`),
-      which a `.bl` namespace can already define, and the struct metadata is one
-      more generated export.
+      The struct surface is completed by `__info__/1`, the introspection
+      `defstruct` also generates and `Inspect.Any` reads: `inspect/1` renders
+      the value as `%Module{field: value, …}`, and `__info__(:struct)` answers
+      the exact field metadata (`[%{field: f, default: d, required: false}, …]`,
+      declaration order) a live Elixir `defstruct` module answers. `:module`,
+      `:functions` (the file's defns plus `__struct__/0,1`), `:macros` and
+      `:deprecated` are answered from static data too; an unknown key raises
+      `FunctionClauseError`, as Elixir's generated `__info__/1` does.
+      `:attributes`/`:compile`/`:md5` are deliberately not synthesized. A file
+      that writes `__struct__` or `__info__` itself, beside `:struct_fields`, is
+      refused rather than shadowed.
+
+      NOT emitted: protocol impls (`Enumerable`, `Inspect`, `Exception`, …).
+      Those are the next extension, and the constructor/introspection pair here
+      is the primitive they hang off: a protocol impl is its own module
+      (`Elixir.<Proto>.<Mod>`), which a `.bl` namespace can already define.
     * `:file` — the source path used for positions (defaults to `path`).
 
   Returns `{module, beam_path}`. Raises `ArgumentError` on an invalid module
@@ -220,18 +229,26 @@ defmodule BeamLisp.AOT do
       end
 
       # `:struct_fields` widens the SAME module surface with the constructor pair
-      # Elixir's `defstruct` generates — appended, never substituted, so a file
-      # that also writes `__struct__` by hand is refused rather than silently
-      # shadowed. Nothing above changes when the option is absent: the clause
-      # list is the file's defns exactly, so a functions-only pinned beam is
-      # byte-for-byte what it was.
-      if struct_fields != nil and Enum.any?(clauses, &(&1.fname == :__struct__)) do
+      # AND the `__info__/1` introspection Elixir's `defstruct` generates —
+      # appended, never substituted, so a file that also writes `__struct__` or
+      # `__info__` by hand is refused rather than silently shadowed. Nothing
+      # above changes when the option is absent: the clause list is the file's
+      # defns exactly, so a functions-only pinned beam is byte-for-byte what it
+      # was.
+      collision =
+        if struct_fields == nil do
+          nil
+        else
+          Enum.find(clauses, &(&1.fname in [:__struct__, :__info__]))
+        end
+
+      if collision do
         raise ArgumentError,
-              "pinned host module #{inspect(module)} defines __struct__ itself; " <>
+              "pinned host module #{inspect(module)} defines #{collision.fname} itself; " <>
                 ":struct_fields would duplicate it"
       end
 
-      clauses = clauses ++ struct_clauses(module, struct_fields)
+      clauses = clauses ++ struct_clauses(module, struct_fields, clauses)
 
       descriptor = Emit.descriptor_for(module, clauses, host_attrs(opts), %{file: file})
       {mod, beam} = Emit.compile_descriptor(descriptor)
@@ -371,11 +388,13 @@ defmodule BeamLisp.AOT do
   # ── struct surface (`:struct_fields`) ──────────────────────────────────────
   #
   # A pinned host module that carries data needs the constructor pair every
-  # Elixir struct has. `:struct_fields` synthesizes exactly the two functions
-  # `defstruct` generates — as bl-ANF data, never as Elixir source:
+  # Elixir struct has, plus the `__info__/1` clause `Inspect.Any` reads to
+  # recognise it AS a struct. `:struct_fields` synthesizes both — as bl-ANF data,
+  # never as Elixir source:
   #
   #     __struct__/0 →  %{__struct__: module, field: default, …}
   #     __struct__/1 →  Enum.reduce(kv, __struct__(), fn {k, v}, m -> %{m | k => v} end)
+  #     __info__/1   →  :module / :functions / :macros / :deprecated / :struct
   #
   # `%{m | k => v}` compiles to `:maps.update/3`, which refuses an unknown key
   # with `:error {:badkey, k}` — the SAME refusal the reference Elixir beam
@@ -383,28 +402,82 @@ defmodule BeamLisp.AOT do
   # ordinary map field, so `is_struct/1` / `Map.from_struct/1` answer unchanged.
   # Every key and default is a Core literal (validated below), so no atom is
   # minted from a string and the default is emitted as data, never a call.
-  defp struct_clauses(_module, nil), do: []
+  defp struct_clauses(_module, nil, _clauses), do: []
 
-  defp struct_clauses(module, fields) do
+  defp struct_clauses(module, fields, clauses) do
     default = struct_default_node(module, fields)
 
-    [
-      %{op: :"defn-clause", fname: :__struct__, params: [], guard: nil, body: default, ann: %{}},
-      %{
-        op: :"defn-clause",
-        fname: :__struct__,
-        params: [anf_pvar("kv")],
-        guard: nil,
-        body: %{
-          op: :remote,
-          mod: Enum,
-          fun: :reduce,
-          args: [anf_var("kv"), default, struct_reducer_node()],
+    struct_info_clauses(module, fields, clauses) ++
+      [
+        %{op: :"defn-clause", fname: :__struct__, params: [], guard: nil, body: default, ann: %{}},
+        %{
+          op: :"defn-clause",
+          fname: :__struct__,
+          params: [anf_pvar("kv")],
+          guard: nil,
+          body: %{
+            op: :remote,
+            mod: Enum,
+            fun: :reduce,
+            args: [anf_var("kv"), default, struct_reducer_node()],
+            ann: %{}
+          },
           ann: %{}
-        },
-        ann: %{}
-      }
+        }
+      ]
+  end
+
+  # `__info__/1` — the introspection every `defstruct` module answers and
+  # `Inspect.Any` reads. `Inspect.Any.inspect/2` builds the `%Module{…}` form
+  # from `module.__info__(:struct)`; without this clause the call is `undef`, the
+  # protocol falls back to a raw map, and a pinned struct loses its identity in
+  # every log, `Map.from_struct/1` notwithstanding. It is emitted ONLY beside the
+  # constructor pair (never for a functions-only module), so a pinned beam with
+  # no `:struct_fields` keeps its exact export surface.
+  #
+  # The keys Elixir answers with static data are answered here with static data,
+  # never a runtime lookup — nothing on this path calls another namespace:
+  # `:module` (the pinned atom), `:functions` (the file's own defns plus the
+  # constructor pair, deduped across multi-clause defns), `:macros` (`[]`),
+  # `:deprecated` (`[]`), and `:struct`. An unknown key misses every clause and
+  # raises `FunctionClauseError`, exactly as Elixir's generated `__info__/1`
+  # does; `:attributes` / `:compile` / `:md5` — the `module_info` pass-throughs
+  # Elixir also serves — are deliberately NOT synthesized.
+  defp struct_info_clauses(module, fields, clauses) do
+    struct =
+      Enum.map(fields, fn {field, default} ->
+        %{field: field, default: default, required: false}
+      end)
+
+    functions =
+      clauses
+      |> Enum.map(&{&1.fname, length(&1.params)})
+      |> Kernel.++([__struct__: 0, __struct__: 1])
+      |> Enum.uniq()
+
+    [
+      info_clause(:module, module),
+      info_clause(:functions, functions),
+      info_clause(:macros, []),
+      info_clause(:deprecated, []),
+      info_clause(:struct, struct)
     ]
+  end
+
+  # A `__info__/1` clause for one literal key. The value is Core data, emitted
+  # as a literal (`:module` is the caller's atom; `:struct` is a list of
+  # `%{field:, default:, required:}` maps in declaration order) — the same shape
+  # `defstruct` builds, `required: false` because `:struct_fields` carries no
+  # `@enforce_keys` notion.
+  defp info_clause(key, value) do
+    %{
+      op: :"defn-clause",
+      fname: :__info__,
+      params: [%{pop: :plit, val: key}],
+      guard: nil,
+      body: anf_lit(value),
+      ann: %{}
+    }
   end
 
   # `%{__struct__: module, field: default, …}` — the map Elixir's generated
