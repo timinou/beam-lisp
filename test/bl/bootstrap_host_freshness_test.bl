@@ -1,0 +1,146 @@
+; test/bl/bootstrap_host_freshness_test.bl — pinned HOST leaves are sha-authoritative.
+;
+; Ported from the ExUnit `test/beam_lisp/bootstrap_host_freshness_test.exs`, which
+; reached `Bootstrap.install_hosts!/2` and `Bootstrap.install!/2` directly. Those
+; are the same call surfaces here, so the port is a transliteration; what changes
+; is the harness. Ward runs a file's deftests in ONE isolated fork with no
+; per-test `setup`/`on_exit` hook, so the ExUnit pair is reproduced explicitly by
+; `with-scratch`: a fresh `{seed, ebin}` tree per test, and a `finally` that
+; purges the probe module, restores `:bootstrap_staging` and removes the tree.
+;
+; The rule being pinned: a pinned HOST leaf (`Elixir.BeamLisp.*`, never
+; `Elixir.BeamLisp.Ns.*`) is SHA-AUTHORITATIVE — the committed seed's bytes win
+; whenever the destination differs, EVEN under a matching `bl_compiler_key`. A
+; host `.bl` source that is not a hashed input (a runtime-only namespace) changes
+; the beam bytes WITHOUT rotating the tier key, so the generation rule — which
+; reads only the stamp — would keep the stale beam forever. These tests pin the
+; sha rule on BOTH install paths and prove the generation rule is untouched for
+; the `Ns.*` unit (covered by `test/beam_lisp/bootstrap_generation_test.exs`).
+;
+; Run: bl test test/bl/bootstrap_host_freshness_test.bl
+
+(ns bootstrap-host-freshness.test)
+
+; A non-production probe module: `Elixir.BeamLisp.*` (so it is judged a HOST
+; leaf) but never shipped, so loading it in this VM is harmless.
+(def ^:private probe-beam "Elixir.BeamLisp.HostSeedProbe.beam")
+(def ^:private probe-mod (erlang/binary_to_atom "Elixir.BeamLisp.HostSeedProbe" :utf8))
+
+(defn- tmp-root []
+  (Path/join (System/tmp_dir!)
+             (str "bl_host_fresh_"
+                  (erlang/apply :erlang :unique_integer (list (list :positive))))))
+
+(defn- with-scratch
+  "The ExUnit `setup`/`on_exit` pair, made explicit.
+
+   The `:bootstrap_staging` restore is load-bearing rather than tidy: the
+   application env is VM-global, not env-forked, and `Bootstrap.install!/2` sets
+   it to `[]` on the mismatch path. A suite that left it behind would change the
+   drift gate's answer for every file that ran after it."
+  [f]
+  (let [root (tmp-root)
+        seed (Path/join root "seed")
+        ebin (Path/join root "ebin")
+        staging (erlang/apply :application :get_env (list :beam_lisp :bootstrap_staging))
+        key (BeamLisp.AOTCache/compiler_key)]
+    (File/mkdir_p! seed)
+    (File/mkdir_p! ebin)
+    (try
+      (f {:seed seed :ebin ebin :key key})
+      (finally
+        (code/purge probe-mod)
+        (code/delete probe-mod)
+        (if (= staging :undefined)
+          (erlang/apply :application :unset_env (list :beam_lisp :bootstrap_staging))
+          (erlang/apply :application :set_env
+                        (list :beam_lisp :bootstrap_staging (elem staging 1))))
+        (File/rm_rf! root)))))
+
+; A host-leaf beam: module + `value/0` + the `__bl_provenance__/0` stamp and the
+; `bl_compiler_key` attribute `AOT.emit_module` writes beside it. The attribute is
+; what Bootstrap reads WITHOUT loading the beam.
+(defn- beam [mod value key]
+  (let [value-fn (tuple :function 1 :value 0
+                        (list (tuple :clause 1 (list) (list)
+                                     (list (erl_parse/abstract value)))))
+        provenance (tuple :function 1 :__bl_provenance__ 0
+                          (list (tuple :clause 1 (list) (list)
+                                       (list (erl_parse/abstract (tuple nil key))))))
+        exports (list (tuple :value 0) (tuple :__bl_provenance__ 0))
+        stamp (list (tuple :attribute 1 :bl_compiler_key key))
+        forms (concat (list (tuple :attribute 1 :module mod)
+                            (tuple :attribute 1 :export exports))
+                      stamp
+                      (list value-fn provenance))]
+    (elem (erlang/apply :compile :forms (list (to-list forms) (list :binary))) 2)))
+
+(defn- write-seed! [seed bytes]
+  (File/write! (Path/join seed probe-beam) bytes)
+  (let [sha (String/downcase
+              (Base/encode16 (erlang/apply :crypto :hash (list :sha256 bytes))))]
+    (File/write! (Path/join seed "manifest.exs")
+                 (str "%{\"modules\" => %{\"" probe-beam "\" => \"" sha "\"}}"))))
+
+; The `bl_compiler_key` attribute of a beam, read without loading it — the read
+; `Bootstrap.stamped_key/1` makes.
+(defn- stamped-key [file]
+  (let [r (erlang/apply :beam_lib :chunks
+                        (list (erlang/binary_to_list file) (list :attributes)))
+        attrs (erlang/apply :proplists :get_value
+                            (list :attributes (elem (elem r 1) 1)))
+        v (erlang/apply :proplists :get_value (list :bl_compiler_key attrs))]
+    (if (erlang/is_list v) (first (to-list v)) v)))
+
+; ── install_hosts!/2 ────────────────────────────────────────────────────────
+
+(deftest install-hosts-replaces-a-same-key-host-beam-whose-bytes-drifted
+  (with-scratch
+    (fn [{:keys [seed ebin key]}]
+      (let [new (beam probe-mod :seed key)
+            old (beam probe-mod :old key)
+            dst (Path/join ebin probe-beam)]
+        (write-seed! seed new)
+
+        ; Stage an OLD beam stamped with the SAME compiler key.
+        ; `fresh_generation?` would have accepted it (the stamp matches); sha
+        ; says it is stale.
+        (File/write! dst old)
+        (is (= key (stamped-key dst)))
+
+        (is (= :ok (BeamLisp.Bootstrap/install_hosts! ebin (list (tuple :seed_dir seed)))))
+        (is (= new (File/read! dst)))
+        (is (= :seed (erlang/apply probe-mod :value (list))))))))
+
+; ── install!/2 ──────────────────────────────────────────────────────────────
+
+(deftest full-install-replaces-a-same-key-host-beam-whose-bytes-drifted
+  (with-scratch
+    (fn [{:keys [seed ebin key]}]
+      (let [new (beam probe-mod :seed key)
+            old (beam probe-mod :old key)
+            dst (Path/join ebin probe-beam)]
+        (write-seed! seed new)
+        (File/write! dst old)
+        (is (= key (stamped-key dst)))
+
+        ; No keys in the scratch manifest: a mismatched floor is staged, not fatal.
+        (is (= (tuple :staged :compiler_key_mismatch)
+               (BeamLisp.Bootstrap/install! ebin (list (tuple :seed_dir seed)))))
+
+        (is (= new (File/read! dst)))
+        (is (= :seed (erlang/apply probe-mod :value (list))))))))
+
+; ── the corrupt-seed refusal ────────────────────────────────────────────────
+
+(deftest a-corrupt-host-seed-refuses-installation-and-writes-nothing
+  (with-scratch
+    (fn [{:keys [seed ebin key]}]
+      (let [dst (Path/join ebin probe-beam)]
+        (write-seed! seed (beam probe-mod :seed key))
+        (File/write! (Path/join seed probe-beam) "not a beam")
+
+        (is (thrown-with-msg? "checksum mismatch"
+              (BeamLisp.Bootstrap/install_hosts! ebin (list (tuple :seed_dir seed)))))
+
+        (is (not (File/exists? dst)))))))

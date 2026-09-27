@@ -211,8 +211,21 @@ defmodule BeamLisp.Bootstrap do
     # merely-differently-keyed one is a valid bootstrap stage.
     Enum.each(manifest["modules"], fn {name, want_sha} ->
       src = Path.join(seed_dir, name)
+      dst = Path.join(ebin, name)
       verify_seed_file!(src, name, want_sha)
-      maybe_install_one(src, Path.join(ebin, name), want_sha, expected_key(name))
+
+      # Pinned HOST leaves are sha-authoritative, NOT generation-gated. A host
+      # beam whose bytes changed without rotating the tier key — a runtime-only
+      # host `.bl` edit that is not a hashed input — would otherwise be kept
+      # stale forever, because `fresh_generation?/2` reads only the stamp and
+      # the stamp is unchanged. Copy on `sha256(dst) != want_sha` alone. The
+      # fresh-genN+1 protection remains for the `Ns.*` shim/body/init unit,
+      # whose rebuild the generation rule exists to preserve.
+      if host_leaf?(name) do
+        install_one(src, dst, want_sha)
+      else
+        maybe_install_one(src, dst, want_sha, expected_key(name))
+      end
     end)
 
 
@@ -291,16 +304,13 @@ defmodule BeamLisp.Bootstrap do
     ebin = to_string(compile_path)
     File.mkdir_p!(ebin)
 
-    # The tier authority must be on the code path before the first
-    # `expected_key/1`, which computes the compiler key THROUGH `BeamLisp.Tiers`
-    # (see `ensure_tier_authority!/3`).
+    # The tier authority is loaded first so the pinned leaf is on the code path
+    # before anything asks a tier question of it (`ensure_tier_authority!/3`).
+    # Host install is sha-authoritative — no key is computed on this path.
     ensure_tier_authority!(seed_dir, ebin, manifest)
 
     manifest["modules"]
-    |> Enum.filter(fn {name, _} ->
-      String.starts_with?(name, "Elixir.BeamLisp.") and
-        not String.starts_with?(name, "Elixir.BeamLisp.Ns.")
-    end)
+    |> Enum.filter(fn {name, _} -> host_leaf?(name) end)
     # Deterministic install order: the authority first, then by name. A map's
     # own order is a property of its keys, not of the seed.
     |> Enum.sort_by(fn {name, _} ->
@@ -310,7 +320,12 @@ defmodule BeamLisp.Bootstrap do
       src = Path.join(seed_dir, name)
       dst = Path.join(ebin, name)
       verify_seed_file!(src, name, want_sha)
-      maybe_install_one(src, dst, want_sha, expected_key(name))
+      # Host leaves are sha-authoritative: the seed is the pinned artifact, so
+      # its bytes win whenever the destination differs — even when the
+      # destination carries a MATCHING `bl_compiler_key`. A runtime-only host
+      # `.bl` edited without rotating the key changes the seed sha but not the
+      # stamp, and the generation rule would keep the stale beam; sha does not.
+      install_one(src, dst, want_sha)
 
       mod = name |> Path.basename(".beam") |> String.to_atom()
       bytes = File.read!(dst)
@@ -423,6 +438,20 @@ defmodule BeamLisp.Bootstrap do
     end
   end
 
+  # A pinned HOST leaf: an `Elixir.BeamLisp.*` module that is NOT part of the
+  # namespace generation ladder (`Elixir.BeamLisp.Ns.*`). Host leaves are PINNED
+  # artifacts — their bytes ARE their identity, verified against the manifest
+  # sha256 — so the generation rule below does NOT apply to them. Editing a host
+  # `.bl` source that is not a hashed input changes the beam bytes WITHOUT
+  # rotating the tier key, and a destination carrying the (unchanged) current
+  # key would then be kept stale forever. `install_one/3` copies on sha drift
+  # and nothing else. The `Ns.*` shim/body/init unit keeps the generation rule,
+  # which protects a fresh gen-N+1 rebuild from being un-superseded.
+  defp host_leaf?(name) do
+    String.starts_with?(name, "Elixir.BeamLisp.") and
+      not String.starts_with?(name, "Elixir.BeamLisp.Ns.")
+  end
+
   # The seed is a FLOOR, never a ceiling: a destination beam stamped with the
   # CURRENT toolchain key is a fresh gen-N+1 rebuild (the staging ladder's own
   # output) and strictly supersedes the gen-N seed. Overwriting it would
@@ -431,6 +460,11 @@ defmodule BeamLisp.Bootstrap do
   # (a boot between build and `bl seed` would re-poison ebin). Skip the
   # copy; the purge+load below then loads the fresh beam, which is exactly
   # the code this VM should run.
+  #
+  # This rule is for the `Ns.*` GENERATION UNIT only. Pinned HOST leaves
+  # (`host_leaf?/1`) are sha-authoritative and never reach here: a host `.bl`
+  # edit that does not rotate the tier key changes the beam without moving the
+  # stamp, so the generation rule would keep a stale host beam forever.
   defp maybe_install_one(src, dst, want_sha, current_key) do
     if fresh_generation?(dst, current_key) do
       :ok

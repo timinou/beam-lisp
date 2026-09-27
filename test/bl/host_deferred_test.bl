@@ -1,0 +1,218 @@
+; host_deferred_test.bl — the pinned `Delay` struct and `Deferred` ABI.
+;
+; Two `.bl` sources under `priv/host/` replace the `lib/beam_lisp/deferred.ex`
+; halves at their exact module atoms:
+;
+;   * `priv/host/delay.bl` → `Elixir.BeamLisp.Delay`, a STRUCT whose
+;     `__struct__/0,1` pair is synthesized by `compile_host_file`'s
+;     `:struct_fields` option, plus a real public `new/1` constructor.
+;   * `priv/host/deferred.bl` → `Elixir.BeamLisp.Deferred`, FUNCTIONS-ONLY:
+;     `delay`/`force`/`realized?`/`delay?`.
+;
+; Nothing here replaces the live module. Each source is compiled at its OWN
+; probe atom, the namespace shim beside it is dropped, and the pinned beam is
+; loaded ALONE — so a leftover shim reference would be `undef` here. The
+; `Delay` probe is checked structurally (the tag is the probe atom, not a
+; hard-coded one); the `Deferred` probe is compared to the committed seed
+; module on once / error / concurrent force inputs.
+;
+; Run: bin/bl test test/bl/host_deferred_test.bl
+
+(ns host.deferred.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_deferred_" (erlang/unique_integer (list :positive))))
+
+(defn- delay-source [] (Path/join (BeamLisp/cwd) "priv/host/delay.bl"))
+(defn- deferred-source [] (Path/join (BeamLisp/cwd) "priv/host/deferred.bl"))
+
+(def ^:private delay-mod :Elixir.BeamLisp.HostDelayProbe)
+(def ^:private deferred-mod :Elixir.BeamLisp.HostDeferredProbe)
+(def ^:private delay-shim :Elixir.BeamLisp.Ns.Host.Delay)
+(def ^:private deferred-shim :Elixir.BeamLisp.Ns.Host.Deferred)
+(def ^:private live :Elixir.BeamLisp.Deferred)
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-pinned [mod path]
+  (do (drop! mod)
+      (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+      mod))
+
+; Compile `src` at `mod` and publish ONLY the pinned beam: the compile's own
+; load (and the namespace shim it built beside it) is dropped first.
+(defn- compile-pinned [mod src opts]
+  (let [res (BeamLisp.AOT/compile_host_file src opts)]
+    (load-pinned mod (elem res 1))))
+
+(defn- compile-delay [dir]
+  (let [m (compile-pinned delay-mod (delay-source)
+            (list (t2 :module delay-mod) (t2 :output_dir dir) (t2 :load? false)
+                  (t2 :struct_fields (list (t2 :seq nil)))))]
+    (drop! delay-shim)
+    m))
+
+(defn- compile-deferred [dir]
+  (let [m (compile-pinned deferred-mod (deferred-source)
+            (list (t2 :module deferred-mod) (t2 :output_dir dir) (t2 :load? false)))]
+    (drop! deferred-shim)
+    m))
+
+(defn- raise-shape [f]
+  (try (list :value (f))
+       (catch e (list :raise (:__struct__ e) (ex-message e)))))
+
+; ── the Delay struct surface ─────────────────────────────────────────────
+
+(deftest delay-pinned-struct-is-probe-tagged
+  (testing "`:struct_fields` synthesizes __struct__/0,1; `new/1` is module-exact"
+    (let [dir (tmp-dir)]
+      (compile-delay dir)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (= :non_existing (erlang/apply :code :which (list delay-shim))))
+      (is (erlang/function_exported delay-mod :__struct__ 0))
+      (is (erlang/function_exported delay-mod :__struct__ 1))
+      (is (erlang/function_exported delay-mod :new 1))
+      ; __struct__/0 — the tag is the PROBE atom, and the one field defaults nil.
+      (let [s0 (erlang/apply delay-mod :__struct__ (list))]
+        (is (erlang/is_map s0))
+        (is (= 2 (erlang/map_size s0)))
+        (is (= delay-mod (erlang/map_get :__struct__ s0)))
+        (is (nil? (erlang/map_get :seq s0))))
+      ; __struct__/1 folds the given values over the defaults.
+      (let [s1 (erlang/apply delay-mod :__struct__ (list (list (t2 :seq 9))))]
+        (is (= delay-mod (erlang/map_get :__struct__ s1)))
+        (is (= 9 (erlang/map_get :seq s1))))
+      ; new/1 returns EXACTLY __struct__/1's map — same tag, same field — at
+      ; whatever atom the file was compiled into. A hard-coded `BeamLisp.Delay`
+      ; tag would make these unequal here.
+      (is (= (erlang/apply delay-mod :__struct__ (list (list (t2 :seq 7))))
+             (erlang/apply delay-mod :new (list 7))))
+      (is (= delay-mod (erlang/map_get :__struct__ (erlang/apply delay-mod :new (list 7)))))
+      (is (= 7 (erlang/map_get :seq (erlang/apply delay-mod :new (list 7)))))
+      ; the map `new/1` builds carries a genuine Elixir struct tag ...
+      (let [d (erlang/apply delay-mod :new (list 1))]
+        (is (and (erlang/is_map d) (erlang/is_map_key :__struct__ d)))
+        (is (= delay-mod (erlang/map_get :__struct__ d)))
+        ; ... and a delay is NOT a sequence: no Enumerable impl hangs off it.
+        (is (nil? (erlang/apply :Elixir.Enumerable :impl_for (list d)))))
+      ; __info__(:struct) is the committed Delay beam's list, datum for datum:
+      ; `Elixir.BeamLisp.Delay` is `defstruct [:seq]`, and the pinned port must
+      ; answer the same metadata so `Inspect.Any` renders it identically. This is
+      ; the clause that turns a raw `%{__struct__: …}` back into `%Delay{}` in a
+      ; log. The probe's own atom is what it prints, of course.
+      (let [live-info (erlang/apply :Elixir.BeamLisp.Delay :__info__ (list :struct))
+            probe-info (erlang/apply delay-mod :__info__ (list :struct))]
+        (is (= live-info probe-info))
+        (is (= 1 (erlang/length probe-info)))
+        (is (= {:field :seq :default nil :required false} (Enum/at probe-info 0))))
+      (is (= "%BeamLisp.Delay{seq: 3}"
+             (Kernel/inspect (erlang/apply :Elixir.BeamLisp.Delay :__struct__
+                                (list (list (t2 :seq 3)))))))
+      (is (= "%BeamLisp.HostDelayProbe{seq: 3}"
+             (Kernel/inspect (erlang/apply delay-mod :new (list 3)))))
+      (File/rm_rf! dir))))
+
+; ── the Deferred ABI, diffed against the live module ─────────────────────
+
+; ONCE: run-once, value returned as-is (never normalized to a cons cell),
+; realized? state, force of a non-delay unchanged.
+(defn- once-obs [mod]
+  (let [runs (atom 0)
+        d (erlang/apply mod :delay (list (fn [] (swap! runs inc) 42)))
+        is-delay (erlang/apply mod :delay? (list d))
+        not-delay (erlang/apply mod :delay? (list 42))
+        realized0 (erlang/apply mod :realized? (list d))
+        v1 (erlang/apply mod :force (list d))
+        realized1 (erlang/apply mod :realized? (list d))
+        v2 (erlang/apply mod :force (list d))
+        n @runs]
+    ; Everything side-effecting is a `let` binding: the two `force`s must run in
+    ; THIS order, and beam-lisp evaluates a call's arguments right-to-left, so an
+    ; interleaved `list` of `force`/`realized?` would observe the wrong states.
+    (list is-delay not-delay realized0 v1 realized1 v2 n
+          (erlang/apply mod :force (list :plain))
+          (erlang/apply mod :force (list [1 2 3]))
+          (erlang/apply mod :force (list {:a 1}))
+          (erlang/apply mod :realized? (list 5))
+          (erlang/apply mod :delay? (list d)))))
+
+; ERROR: a failed attempt is retryable, stays unrealized, and re-raises the
+; phase's own class and message.
+(defn- error-obs [mod]
+  (let [runs (atom 0)
+        d (erlang/apply mod :delay
+            (list (fn [] (swap! runs inc)
+                        (erlang/error (Elixir.RuntimeError/exception "boom")))))
+        a (raise-shape (fn [] (erlang/apply mod :force (list d))))
+        mid (erlang/apply mod :realized? (list d))
+        b (raise-shape (fn [] (erlang/apply mod :force (list d))))]
+    (list a mid b @runs (erlang/apply mod :realized? (list d)))))
+
+; CONCURRENT: N processes force ONE delay; the body runs exactly once and every
+; process sees the same answer (the herd protection the LazySeq cell carries).
+(defn- concurrent-obs [mod]
+  (let [runs (atom 0)
+        d (erlang/apply mod :delay
+            (list (fn [] (swap! runs inc) (Process/sleep 25) :shared)))
+        tasks (vec (map (fn [_] (Task/async (fn [] (erlang/apply mod :force (list d)))))
+                        (range 50)))
+        results (map (fn [t] (Task/await t 5000)) tasks)]
+    (list (every? (fn [r] (= :shared r)) results) @runs)))
+
+(deftest deferred-pinned-refuses-bad-thunks
+  (testing "only zero-arity functions are accepted, exactly as the guard did"
+    (let [dir (tmp-dir)]
+      (compile-deferred dir)
+      (is (= :non_existing (erlang/apply :code :which (list deferred-shim))))
+      (is (= :Elixir.FunctionClauseError
+             (:__struct__ (try (erlang/apply deferred-mod :delay (list (fn [x] x)))
+                               (catch e e)))))
+      (is (= :Elixir.FunctionClauseError
+             (:__struct__ (try (erlang/apply deferred-mod :delay (list 7))
+                               (catch e e)))))
+      ; a zero-arity fun IS accepted
+      (is (erlang/apply deferred-mod :delay? (list (erlang/apply deferred-mod :delay (list (fn [] 1))))))
+      (File/rm_rf! dir))))
+
+(deftest deferred-pinned-matches-the-live-module
+  (testing "probe answers equal the live module's on once / error / concurrent force"
+    (let [dir (tmp-dir)]
+      (compile-deferred dir)
+      ; a literal map with the tag IS an Elixir struct of the delay's own type,
+      ; and carries no Enumerable impl.
+      (let [v (erlang/apply deferred-mod :delay (list (fn [] 1)))]
+        (is (and (erlang/is_map v) (erlang/is_map_key :__struct__ v)))
+        (is (= :"Elixir.BeamLisp.Delay" (erlang/map_get :__struct__ v)))
+        (is (nil? (erlang/apply :Elixir.Enumerable :impl_for (list v)))))
+      ; Deferred is FUNCTIONS-ONLY: the introspection rides with `:struct_fields`,
+      ; so this port gains no `__struct__`/`__info__` export — its surface is the
+      ; file's defns and `module_info` alone.
+      (is (not (erlang/function_exported deferred-mod :__struct__ 0)))
+      (is (not (erlang/function_exported deferred-mod :__info__ 1)))
+      ; PINNED ANSWERS first — the ABI itself, not merely probe == live.
+      (is (= (list true false false 42 true 42 1 :plain [1 2 3] {:a 1} true true)
+             (once-obs deferred-mod)))
+      (is (= (list (list :raise :Elixir.RuntimeError "boom")
+                   false
+                   (list :raise :Elixir.RuntimeError "boom")
+                   2
+                   false)
+             (error-obs deferred-mod)))
+      (is (= (list true 1) (concurrent-obs deferred-mod)))
+      ; And against the seed-installed module at the public ABI atom.
+      (is (= (once-obs live) (once-obs deferred-mod)))
+      (is (= (error-obs live) (error-obs deferred-mod)))
+      (is (= (concurrent-obs live) (concurrent-obs deferred-mod)))
+      (let [seed-root (Path/join (BeamLisp.Tiers/priv_root) "bootstrap/seed")]
+        (doseq [name ["Elixir.BeamLisp.Delay.beam" "Elixir.BeamLisp.Deferred.beam"]]
+          (let [installed (Path/join (Path/join (BeamLisp/cwd) "build") name)
+                committed (Path/join seed-root name)]
+            (is (File/exists? committed))
+            (is (= (crypto/hash :sha256 (File/read! committed))
+                   (crypto/hash :sha256 (File/read! installed)))
+                "the installed host module is the committed seed beam"))))
+      (File/rm_rf! dir))))

@@ -1,0 +1,315 @@
+#!/usr/bin/env escript
+%%! -noshell
+%% -*- erlang -*-
+%
+% bl-stage-hosts — put the bootstrap seed's pinned HOST beams on a build's code
+% path, VERIFIED, before the Elixir substrate is compiled.
+%
+% Why this exists
+% ---------------
+% `bin/bl`'s cold path turns `lib/**/*.ex` into beams with `elixirc`, and some
+% of those sources name a pinned HOST module at COMPILE time — `refs.ex` matches
+% `%BeamLisp.Delay{}`, which asks for `BeamLisp.Delay.__struct__/0` while
+% `refs.ex` is being compiled. `lib/beam_lisp/delay.ex` is already gone (the
+% module is seeded from `priv/host/delay.bl` instead), so a clean checkout has
+% nothing to answer that question and the cold bootstrap dies:
+%
+%     error: struct BeamLisp.Delay is undefined (module BeamLisp.Delay is not
+%     available or is yet to be defined)
+%     == Compilation error in file lib/beam_lisp/refs.ex ==
+%
+% The runtime installs those beams (`Bootstrap.install_hosts!/1`), but that runs
+% INSIDE the VM — after `elixirc`, too late for the compiler that needs them.
+% So the staging has to happen out here, in the launcher, and it has to happen
+% the same way every other consumer of the seed treats it: by SHA, never by
+% trust.
+%
+% What it does
+% ------------
+% Reads the seed MANIFEST, takes every pinned HOST leaf (`Elixir.BeamLisp.*`
+% that is NOT part of the `Elixir.BeamLisp.Ns.*` generation ladder — the same
+% rule `Bootstrap.host_leaf?/1` applies), SHA-verifies each beam against the
+% manifest, and copies it into DEST_EBIN only when the destination is absent or
+% drifted. Nothing is compiled; nothing is loaded; no build runs (so there is no
+% way for this to recurse into `bin/bl`). A corrupt seed is FATAL and writes
+% nothing.
+%
+% The manifest is Elixir data (`manifest.exs`, read by `Code.eval_file`), so it
+% is read THROUGH that same reader — one semantic reader for one file, not a
+% second, weaker parser that could disagree with `Bootstrap`. The evaluated term
+% is handed back as an Erlang term through a bounded temp file (stdout is not
+% byte-exact under a unicode group leader), which this script deletes.
+%
+% Usage
+% -----
+%   bin/bl-stage-hosts MANIFEST SEED_DIR DEST_EBIN
+%
+% Exit status: 0 when the stage is complete (including "already current"), 1
+% when the seed is missing, corrupt, or unreadable, 2 on a usage error.
+
+-mode(compile).
+
+-include_lib("kernel/include/file.hrl").
+
+main(Args) ->
+    {ok, _} = application:ensure_all_started(crypto),
+    case Args of
+        [Manifest, SeedDir, DestDir] ->
+            halt(stage_all(Manifest, SeedDir, DestDir));
+        _ ->
+            usage()
+    end.
+
+usage() ->
+    io:format(standard_error,
+              "usage: bl-stage-hosts MANIFEST SEED_DIR DEST_EBIN~n", []),
+    halt(2).
+
+% ── the stage ───────────────────────────────────────────────────────────────
+
+stage_all(Manifest, SeedDir, DestDir) ->
+    ManifestAbs = filename:absname(Manifest),
+    SeedAbs = filename:absname(SeedDir),
+    DestAbs = filename:absname(DestDir),
+    case read_manifest(ManifestAbs) of
+        {ok, Map} ->
+            Modules = manifest_modules(Map, ManifestAbs),
+            Hosts = lists:sort([{Name, Sha}
+                                || {Name, Sha} <- maps:to_list(Modules),
+                                   is_host_leaf(Name)]),
+            % VERIFY THE WHOLE SET BEFORE ANY OF IT IS USED, never the first
+            % beam at a time: a seed that is corrupt in its third entry must
+            % leave the destination exactly as it found it, the same
+            % verify-then-publish order the seed generator keeps for its own
+            % floor. So nothing is created or written until every pinned host
+            % beam has been read and matched against the manifest.
+            Verified = lists:map(fun({Name, Sha}) ->
+                                         verify_one(SeedAbs, Name, Sha)
+                                 end, Hosts),
+            ok = ensure_dir(DestAbs),
+            lists:foreach(fun(Beam) -> install_one(DestAbs, Beam) end, Verified),
+            report(length(Verified), DestAbs),
+            0;
+        {error, Message} ->
+            fail(Message)
+    end.
+
+% A pinned HOST leaf: an `Elixir.BeamLisp.*` module that is NOT part of the
+% namespace generation ladder. This is `Bootstrap.host_leaf?/1`'s rule, spelled
+% with prefix patterns rather than string surgery so no other name can slip in.
+is_host_leaf(<<"Elixir.BeamLisp.Ns.", _/binary>>) -> false;
+is_host_leaf(<<"Elixir.BeamLisp.", _/binary>>) -> true;
+is_host_leaf(_) -> false.
+
+verify_one(SeedDir, Name, Want) when is_binary(Want) ->
+    Source = filename:join(SeedDir, Name),
+    case file:read_file(Source) of
+        {error, Reason} ->
+            fail(io_lib:format("the seed does not carry ~ts (~p)", [Name, Reason]));
+        {ok, Bytes} ->
+            case sha256_hex(Bytes) of
+                Want -> {Name, Bytes, file_mode(Source), Want};
+                Got ->
+                    fail(io_lib:format(
+                           "the seed beam ~ts is CORRUPT~n  manifest: ~s~n  on disk:  ~s",
+                           [Name, Want, Got]))
+            end
+    end;
+verify_one(_SeedDir, Name, Want) ->
+    fail(io_lib:format(
+           "the seed manifest records ~ts with a non-string checksum: ~p",
+           [Name, Want])).
+
+% The destination is written only when it is absent or drifted, so a warm tree
+% does no writing at all. A file that already holds the pinned bytes is left
+% untouched (its mtime stays put, which keeps `find -newer` judgements honest).
+install_one(DestDir, {Name, Bytes, Mode, Want}) ->
+    Dest = filename:join(DestDir, Name),
+    case file:read_file(Dest) of
+        {ok, DestBytes} ->
+            case sha256_hex(DestBytes) of
+                Want -> ok;
+                _ -> write_atomic(Dest, Bytes, Mode)
+            end;
+        _ ->
+            write_atomic(Dest, Bytes, Mode)
+    end.
+
+% Write-then-rename: a reader sees the old beam or the new one, never a torn
+% file (the same publish discipline every other writer in this tree keeps). The
+% temp name is in the DESTINATION directory, so the rename is a same-filesystem
+% atomic replace, and the source's mode is carried over so a staged file keeps
+% the permissions the seed gave it.
+write_atomic(Dest, Bytes, Mode) ->
+    % `filename:join/2` promotes to a binary once any part is one, and the seed
+    % entry names are binaries — so build the temp name in binaries too, never
+    % `++` a list onto it. The OS pid is in the name beside the VM-local unique
+    % integer: two `bl` runs in separate VMs share neither counter, and this
+    % stage may run in both at once.
+    Tmp = <<Dest/binary, ".tmp.", (tmp_tag())/binary>>,
+    case file:write_file(Tmp, Bytes) of
+        ok ->
+            _ = set_mode(Tmp, Mode),
+            case file:rename(Tmp, Dest) of
+                ok ->
+                    ok;
+                {error, Reason} ->
+                    _ = file:delete(Tmp),
+                    fail(io_lib:format("cannot stage ~ts: ~p",
+                                       [filename:basename(Dest), Reason]))
+            end;
+        {error, Reason} ->
+            fail(io_lib:format("cannot write ~ts: ~p", [Tmp, Reason]))
+    end.
+
+set_mode(_Path, undefined) -> ok;
+set_mode(Path, Mode) -> file:change_mode(Path, Mode).
+
+file_mode(Path) ->
+    case file:read_file_info(Path) of
+        {ok, #file_info{mode = Mode}} -> Mode;
+        _ -> undefined
+    end.
+
+ensure_dir(Dir) ->
+    case filelib:ensure_dir(filename:join(Dir, "x")) of
+        ok -> ok;
+        {error, Reason} ->
+            fail(io_lib:format("cannot create ~ts: ~p", [Dir, Reason]))
+    end.
+
+report(0, _Dest) ->
+    io:format(standard_error,
+              "bl-stage-hosts: the seed carries no pinned host beams; "
+              "nothing staged~n", []);
+report(Count, Dest) ->
+    io:format(standard_error,
+              "bl-stage-hosts: ~p pinned host beams staged into ~ts~n",
+              [Count, Dest]).
+
+% ── reading the manifest ────────────────────────────────────────────────────
+
+% `manifest.exs` is Elixir data, and the runtime reads it with
+% `Code.eval_file/1`. Read it the same way here: a second parser for the same
+% file would be a second, weaker rule for one question, and it would be free to
+% disagree with the boot that acts on the same bytes.
+read_manifest(Manifest) ->
+    case filelib:is_regular(Manifest) of
+        false ->
+            {error, io_lib:format("the bootstrap seed manifest is missing: ~ts",
+                                  [Manifest])};
+        true ->
+            case os:find_executable("elixir") of
+                false ->
+                    {error, "no `elixir` executable on PATH; "
+                            "cannot read the seed manifest"};
+                Elixir ->
+                    read_manifest_via_elixir(Elixir, Manifest)
+            end
+    end.
+
+read_manifest_via_elixir(Elixir, Manifest) ->
+    Tmp = tmp_file(),
+    % stdout is NOT byte-exact here (a unicode group leader re-encodes bytes
+    % above 0x7f), so the term travels through a file. `File.write!/2` writes
+    % the bytes as they are. The file is bounded and removed below, on both
+    % paths.
+    % Lowercase variables: in Elixir a CAPITALISED name is an alias, and an
+    % alias in a pattern matches the atom it names — `[Manifest, Out] =` would
+    % be matching against `[:Elixir.Manifest, :Elixir.Out]` and fail.
+    Program = "[manifest, out] = System.argv(); "
+              "File.write!(out, :erlang.term_to_binary(Code.eval_file(manifest)))",
+    {Status, Output} = run(Elixir, ["-e", Program, "--", Manifest, Tmp]),
+    Result =
+        case Status of
+            0 ->
+                load_term(Tmp, Manifest);
+            Other ->
+                {error, io_lib:format(
+                          "reading the seed manifest failed (elixir exited ~p)~n~ts",
+                          [Other, Output])}
+        end,
+    _ = file:delete(Tmp),
+    Result.
+
+load_term(Tmp, Manifest) ->
+    case file:read_file(Tmp) of
+        {ok, Bin} ->
+            try binary_to_term(Bin) of
+                Term ->
+                    Map = element(1, Term),
+                    case is_map(Map) of
+                        true ->
+                            {ok, Map};
+                        false ->
+                            {error, io_lib:format(
+                                      "the seed manifest did not evaluate to a map: ~ts",
+                                      [Manifest])}
+                    end
+            catch
+                _:_ ->
+                    {error, io_lib:format("the seed manifest is not readable: ~ts",
+                                          [Manifest])}
+            end;
+        {error, Reason} ->
+            {error, io_lib:format(
+                      "reading the seed manifest produced no data (~p)", [Reason])}
+    end.
+
+manifest_modules(Map, Manifest) ->
+    case maps:find(<<"modules">>, Map) of
+        {ok, Modules} when is_map(Modules) ->
+            Modules;
+        _ ->
+            fail(io_lib:format(
+                   "the seed manifest has no \"modules\" map: ~ts", [Manifest]))
+    end.
+
+% The manifest path is passed as ARGV, never through a shell, so no quote in a
+% path can truncate anything. stderr is left INHERITED (not merged) so an Elixir
+% failure prints its own diagnosis beside ours, while stdout stays ours to
+% drain.
+run(Exe, Args) ->
+    Port = open_port({spawn_executable, Exe},
+                     [{args, Args}, binary, exit_status, use_stdio]),
+    drain(Port, <<>>).
+
+drain(Port, Acc) ->
+    receive
+        {Port, {data, Data}} -> drain(Port, <<Acc/binary, Data/binary>>);
+        {Port, {exit_status, Status}} -> {Status, Acc};
+        {Port, closed} -> {0, Acc};
+        {'EXIT', Port, _Reason} -> {1, Acc}
+    after 60000 ->
+            _ = port_close(Port),
+            {1, Acc}
+    end.
+
+tmp_file() ->
+    Dir = case os:getenv("TMPDIR") of
+              false -> "/tmp";
+              "" -> "/tmp";
+              Other -> Other
+          end,
+    filename:join(Dir, <<"bl-stage-hosts.", (tmp_tag())/binary, ".term">>).
+
+% A tag unique BOTH within this VM and across VMs: `unique_integer/1` is only
+% unique inside one VM, and two concurrent `bl` runs each have their own.
+tmp_tag() ->
+    <<(integer_to_binary(erlang:unique_integer([positive])))/binary, ".",
+      (unicode:characters_to_binary(os:getpid()))/binary>>.
+
+% ── bytes ───────────────────────────────────────────────────────────────────
+
+sha256_hex(Bin) ->
+    Digest = crypto:hash(sha256, Bin),
+    << <<(hex(Nibble))>> || <<Nibble:4>> <= Digest >>.
+
+hex(Nibble) when Nibble < 10 -> $0 + Nibble;
+hex(Nibble) -> $a + (Nibble - 10).
+
+% ── failure ─────────────────────────────────────────────────────────────────
+
+fail(Message) ->
+    io:format(standard_error, "bl-stage-hosts: ~ts~n", [Message]),
+    halt(1).
