@@ -1,0 +1,723 @@
+; host_atom_guard_test.bl — the pinned ABI for `BeamLisp.AtomGuard` and its
+; nested `BeamLisp.AtomGuard.LimitError`, diffed against the live modules.
+;
+; TWO pinned sources port `lib/beam_lisp/atom_guard.ex`:
+;
+;   * `priv/host/atom_guard.bl` — FUNCTIONS-ONLY, compiled at
+;     `Elixir.BeamLisp.AtomGuard` (no options);
+;   * `priv/host/atom_guard_limit_error.bl` — the nested `defexception
+;     [:message]`, compiled at `Elixir.BeamLisp.AtomGuard.LimitError` with the
+;     `:struct_fields [{:__exception__ true} {:message nil}]` / `:behaviour
+;     :"Elixir.Exception"` pair the seed's exception entries carry.
+;
+; The live Elixir modules are still the ground truth, so the suite is
+; DIFFERENTIAL: the same corpus runs through a probe compiled from each pinned
+; source and through the live module, and the two answer sets must be equal —
+; values, exception CLASSES and MESSAGES.
+;
+; Nothing here replaces the live module. The probes are compiled at their own
+; atoms with `:load? false`, the namespace shims beside them are dropped, and
+; the pinned beams are loaded ALONE — so a leftover shim reference would be
+; `undef` here.
+;
+; What each block pins:
+;   * the guard's whole ABI, scenario for scenario: `high_water_fraction/0` and
+;     `check_interval/0` over the default, the clamps (min/max/trunc preserve
+;     integer-vs-float), and non-number fallbacks; `reset/0`; the process
+;     counter and its sampling cadence; `check!/1` below and past the ceiling;
+;     `to_atom/1` for an already-interned name, a non-binary
+;     (`FunctionClauseError`) and the novel-name rescue path;
+;   * the application env is overridden UNDER A SCOPED RESTORE — `fetch_env`
+;     distinguishes "unset" from "set", and every override is undone in a
+;     `finally`, so a leaked 0.0 fraction can never make a later read ref-use;
+;   * the exact `LimitError` message, byte for byte;
+;   * the synthesized exception surface — `__struct__/0,1`, `__info__(:struct)`
+;     (keys, order, defaults), the module-exact self tag, and the `:behaviour`
+;     attribute (`:Elixir.Exception`, the BARE atom);
+;   * the explicit seed option contract for both entries;
+;   * the cutover — both pinned beams loaded OVER the production atoms, the
+;     guard exercised and its raised `LimitError` being the PINNED one, and the
+;     live beams restored afterwards;
+;   * the cold child — a fresh VM with NO application boot resolves the pinned
+;     beams and answers, proving neither needs a host-namespace Env.
+;
+; ATOM-TABLE DISCIPLINE. The guard exists because filling the atom table aborts
+; the VM, so the tests never approach it: the ceiling is moved (fraction 0.0) or
+; atoms are TWO fixed literals — `bl_atom_guard_novel_live` and
+; `bl_atom_guard_novel_probe`, one per module so each meets a fresh name once —
+; created once, under control, never in a loop. The per-process counter key is
+; erased at the end of every test that touches it.
+;
+; Run: bin/bl test test/bl/host_atom_guard_test.bl
+
+(ns host.atom-guard.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_atom_guard_" (erlang/unique_integer (list :positive))))
+
+(defn- guard-src [] (Path/join (BeamLisp/cwd) "priv/host/atom_guard.bl"))
+(defn- limit-src [] (Path/join (BeamLisp/cwd) "priv/host/atom_guard_limit_error.bl"))
+
+(def ^:private probe :Elixir.BeamLisp.AtomGuardProbe)
+(def ^:private shim :Elixir.BeamLisp.Ns.Host.AtomGuard)
+(def ^:private live :Elixir.BeamLisp.AtomGuard)
+
+(def ^:private limit-probe :Elixir.BeamLisp.AtomGuard.LimitErrorProbe)
+(def ^:private limit-shim :Elixir.BeamLisp.Ns.Host.AtomGuardLimitError)
+(def ^:private live-limit :Elixir.BeamLisp.AtomGuard.LimitError)
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+; ── compiling the pinned sources ──────────────────────────────────────────
+
+(defn- guard-seed-opts
+  "The EXACT option list the seed's `host-opts` builds for a functions-only
+   entry: `:module`/`:output_dir`/`:file`/`:source_hash`/`:load? false` and
+   nothing else — no `:struct_fields`, no `:behaviour`."
+  [mod dir]
+  (list (t2 :module mod)
+        (t2 :output_dir dir)
+        (t2 :file (guard-src))
+        (t2 :source_hash (crypto/hash :sha256 (File/read! (guard-src))))
+        (t2 :load? false)))
+
+(defn- compile-guard-at
+  "Compile `atom_guard.bl` at exact atom `mod`, then publish ONLY the pinned
+   beam: the compile's own load (and the namespace shim it built beside it) is
+   dropped first."
+  [mod dir]
+  (let [res (BeamLisp.AOT/compile_host_file (guard-src) (guard-seed-opts mod dir))
+        path (elem res 1)]
+    (drop! mod)
+    (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+    (drop! shim)
+    mod))
+
+(defn- compile-guard-file
+  "Compile `atom_guard.bl` at `mod` and return the beam PATH, never loading it."
+  [mod dir]
+  (elem (BeamLisp.AOT/compile_host_file (guard-src) (guard-seed-opts mod dir)) 1))
+
+(defn- limit-struct-fields
+  "The `:struct_fields` list, in order: the `defexception [:message]` shape."
+  []
+  (list (t2 :__exception__ true) (t2 :message nil)))
+
+(defn- limit-seed-opts
+  "The EXACT option list the seed's `host-opts` builds for the nested exception
+   entry: the isolated base followed by `:struct_fields` then `:behaviour`."
+  [mod dir]
+  (cons (t2 :module mod)
+        (list (t2 :output_dir dir)
+              (t2 :file (limit-src))
+              (t2 :source_hash (crypto/hash :sha256 (File/read! (limit-src))))
+              (t2 :load? false)
+              (t2 :struct_fields (limit-struct-fields))
+              (t2 :behaviour :"Elixir.Exception"))))
+
+(defn- compile-limit-at [mod dir]
+  (let [res (BeamLisp.AOT/compile_host_file (limit-src) (limit-seed-opts mod dir))
+        path (elem res 1)]
+    (drop! mod)
+    (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+    (drop! limit-shim)
+    mod))
+
+(defn- compile-limit-file [mod dir]
+  (elem (BeamLisp.AOT/compile_host_file (limit-src) (limit-seed-opts mod dir)) 1))
+
+; ── application env, overridden under a scoped restore ────────────────────
+
+(defn- with-app-env
+  "Run `f` with `:beam_lisp, key` set to `value` (nil DELETES the key), then
+   put the env back exactly as it was. `fetch_env` distinguishes \"unset\" from
+   \"set\": a key that was absent is deleted again, never left as nil."
+  [key value f]
+  (let [had (Application/fetch_env :beam_lisp key)
+        old (Application/get_env :beam_lisp key)]
+    (try
+      (if (nil? value)
+        (Application/delete_env :beam_lisp key)
+        (Application/put_env :beam_lisp key value))
+      (f)
+      (finally
+        (if (erlang/== :error had)
+          (Application/delete_env :beam_lisp key)
+          (Application/put_env :beam_lisp key old))))))
+
+(defn- with-envs [envs f]
+  (if (empty? envs)
+    (f)
+    (let [[k v] (first envs)]
+      (with-app-env k v (fn [] (with-envs (rest envs) f))))))
+
+; ── normalization: probe atom + volatile counts, by design ────────────────
+
+(defn- strip-count
+  "Elide the VOLATILE `holds N of M` digits from a LimitError message, so a
+   probe answer compares equal to a live one taken at a different table size.
+   Everything else in the message is compared byte for byte."
+  [m]
+  (let [segs (String/split m ": the VM atom table holds ")]
+    (if (erlang/== 2 (count segs))
+      (let [parts (String/split (second segs) " atoms,")]
+        (if (erlang/== 2 (count parts))
+          (str (first segs) ": the VM atom table holds <N> of <M> atoms," (second parts))
+          m))
+      m)))
+
+(defn- norm
+  "Map the probe's own atom out of a `FunctionClauseError` message and elide the
+   volatile atom count, so probe and live answers compare equal."
+  [x]
+  (if (erlang/is_binary x)
+    (-> x
+        (String/replace "BeamLisp.AtomGuardProbe" "BeamLisp.AtomGuard")
+        (strip-count))
+    x))
+
+; ── the observation: a call's whole answer, a raise included ──────────────
+
+(defn- ex-data-of [e]
+  (if (and (erlang/is_map e) (erlang/is_map_key :data e)) (erlang/map_get :data e) nil))
+
+(defn- value-shape
+  "A struct value drops its own tag (`Map.from_struct`), so a probe-built struct
+   and a live-built one compare equal despite different `__struct__` atoms."
+  [v]
+  (if (and (erlang/is_map v) (erlang/is_map_key :__struct__ v))
+    (list :struct (Map/from_struct v))
+    (list :value v)))
+
+(defn- observe
+  "`[:ok shape]` or `[:raise class message data]`, run through `normf` so the
+   probe's own atom and the table size fall out of the comparison."
+  [normf thunk]
+  (try (list :ok (value-shape (normf (thunk))))
+       (catch e (list :raise (:__struct__ e) (normf (ex-message e)) (ex-data-of e)))))
+
+(defn- counter-key [mod] (erlang/list_to_tuple (list mod :count)))
+(defn- counter [mod] (erlang/get (counter-key mod)))
+
+(defn- clear-counters! []
+  (erlang/erase (counter-key live))
+  (erlang/erase (counter-key probe))
+  :ok)
+
+; ── the differential corpus: scenarios over env + agent state ─────────────
+
+(defn- sc [envs thunk] (list envs thunk))
+(defn- call0 [fname] (fn [m] (observe norm (fn [] (erlang/apply m fname (list))))))
+(defn- call1 [fname arg] (fn [m] (observe norm (fn [] (erlang/apply m fname (list arg))))))
+
+(defn- scenarios
+  "Every observation the guard ABI owes, as `[envs (fn [module] answer)]`, so
+   probe and live compare scenario for scenario under identical env."
+  []
+  (let [hwf (fn [envs] (sc envs (call0 :high_water_fraction)))
+        iv (fn [envs] (sc envs (call0 :check_interval)))
+        frac (fn [v] (list (list :atom_high_water_fraction v)))
+        inter (fn [v] (list (list :atom_check_interval v)))]
+    (list
+      ; ── high_water_fraction/0: default, clamps, non-number fallback ──
+      (hwf (list))
+      (hwf (frac 0.5))
+      (hwf (frac 0))
+      (hwf (frac 0.0))
+      (hwf (frac 1))
+      (hwf (frac 1.0))
+      (hwf (frac 1.5))
+      (hwf (frac -0.5))
+      (hwf (frac 2))
+      (hwf (frac -3))
+      (hwf (frac "x"))
+      (hwf (frac :foo))
+      (hwf (frac true))
+      (hwf (frac (list 1)))
+      (hwf (frac nil))
+      ; ── check_interval/0: default, trunc floor, non-number fallback ──
+      (iv (list))
+      (iv (inter 1))
+      (iv (inter 0))
+      (iv (inter -5))
+      (iv (inter 2.9))
+      (iv (inter 256.9))
+      (iv (inter 1.0))
+      (iv (inter "x"))
+      (iv (inter :foo))
+      (iv (inter true))
+      (iv (inter (list 1)))
+      (iv (inter nil))
+      ; ── reset/0 and the process counter. `put/2` answers the OLD value
+      ; (`:undefined` on a virgin dictionary), so the observation resets once
+      ; first — probe and live then both answer `0`, deterministically.
+      (sc (list)
+          (fn [m]
+            (erlang/apply m :reset (list))
+            (list (observe norm (fn [] (erlang/apply m :reset (list))))
+                  (counter m))))
+      (sc (list (list :atom_check_interval 1000))
+          (fn [m]
+            (erlang/apply m :reset (list))
+            (list (observe norm (fn [] (erlang/apply m :account! (list "tok"))))
+                  (observe norm (fn [] (erlang/apply m :account! (list "tok"))))
+                  (counter m))))
+      ; ── account!/1 sampling cadence: interval 2 trips on the 2nd ────
+      (sc (list (list :atom_check_interval 2) (list :atom_high_water_fraction 0.0))
+          (fn [m]
+            (erlang/apply m :reset (list))
+            (list (observe norm (fn [] (erlang/apply m :account! (list "tok1"))))
+                  (observe norm (fn [] (erlang/apply m :account! (list "tok2"))))
+                  (counter m))))
+      ; ── check!/1 below the ceiling and past it ──────────────────────
+      (sc (list) (call1 :check! "tok"))
+      (sc (frac 1.0) (call1 :check! "tok"))
+      (sc (frac 0.0) (call1 :check! "tok"))
+      ; ── to_atom/1: already-interned names and non-binaries ──────────
+      (sc (list) (call1 :to_atom "Elixir"))
+      (sc (list) (call1 :to_atom "Elixir.BeamLisp.AtomGuard"))
+      (sc (list) (call1 :to_atom "Elixir.BeamLisp.AtomGuard.LimitError"))
+      (sc (list (list :atom_high_water_fraction 0.0)) (call1 :to_atom "Elixir"))
+      (sc (list) (call1 :to_atom 42))
+      (sc (list) (call1 :to_atom nil))
+      (sc (list) (call1 :to_atom :sym))
+      (sc (list) (call1 :to_atom (maps/new)))
+      (sc (list) (call1 :to_atom (list 1 2))))))
+
+(defn- run-scenarios
+  "Each scenario under its own env override, for one module. `call1`-built
+   thunks and the raw `(fn [m] …)` ones both take the module."
+  [ss mod]
+  (map (fn [s] (with-envs (first s) (fn [] ((second s) mod)))) ss))
+
+; ── the pinned guard ABI, scenario for scenario ───────────────────────────
+
+(deftest atom-guard-pinned-matches-the-live-module
+  (testing "the guard answers exactly as the live module does, env override for env override"
+    (let [dir (tmp-dir)]
+      (compile-guard-at probe dir)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (= :non_existing (erlang/apply :code :which (list shim))))
+      ; FUNCTIONS-ONLY: no synthesized struct surface.
+      (is (not (erlang/function_exported probe :__struct__ 0)))
+      (is (not (erlang/function_exported probe :__info__ 1)))
+      ; the live module's functional exports are all served by the probe.
+      (is (erlang/function_exported live :to_atom 1))
+      (is (every? (fn [e] (or (erlang/== :__info__ (elem e 0))
+                              (erlang/function_exported probe (elem e 0) (elem e 1))))
+                  (erlang/apply live :module_info (list :exports)))
+          "the pinned ABI covers every live export")
+      ; PINNED ANSWERS first — the ABI itself, not merely probe == live.
+      (is (= 0.9 (erlang/apply probe :high_water_fraction (list))))
+      (is (= 256 (erlang/apply probe :check_interval (list))))
+      ; `put/2` answers the OLD value, so reset once before observing.
+      (erlang/apply probe :reset (list))
+      (is (= 0 (erlang/apply probe :reset (list))))
+      (is (= :ok (erlang/apply probe :check! (list "tok"))))
+      (is (= :Elixir (erlang/apply probe :to_atom (list "Elixir"))))
+      ; THE DIFF. One scenario list, two modules, equal answers.
+      (let [ss (scenarios)]
+        (is (= (run-scenarios ss live) (run-scenarios ss probe)))
+        ; and per scenario, so a failure names the observation.
+        (let [ls (run-scenarios ss live)
+              ps (run-scenarios ss probe)]
+          (doseq [i (range (count ls))]
+            (is (= (nth ls i) (nth ps i)) (str "scenario " i)))))
+      (clear-counters!)
+      (File/rm_rf! dir))))
+
+; ── the config clamps, spelled out (so a failure is legible) ──────────────
+
+(deftest atom-guard-config-is-clamped-not-trusted
+  (testing "fraction and interval clamp / fall back exactly as the live module"
+    (let [dir (tmp-dir)]
+      (compile-guard-at probe dir)
+      (doseq [v (list 0.5 5.0 1.0 0.0 -1.0 0 -1 2 "nonsense" :nonsense true)]
+        (with-app-env :atom_high_water_fraction v
+          (fn []
+            (is (= (erlang/apply live :high_water_fraction (list))
+                   (erlang/apply probe :high_water_fraction (list)))
+                (str "fraction " (pr-str v))))))
+      (doseq [v (list 1 0 -5 2.9 256.9 1.0 "nonsense" :nonsense true)]
+        (with-app-env :atom_check_interval v
+          (fn []
+            (is (= (erlang/apply live :check_interval (list))
+                   (erlang/apply probe :check_interval (list)))
+                (str "interval " (pr-str v))))))
+      ; env is restored: no override leaked out of the scopes above.
+      (is (nil? (Application/get_env :beam_lisp :atom_high_water_fraction)))
+      (is (nil? (Application/get_env :beam_lisp :atom_check_interval)))
+      (is (= 0.9 (erlang/apply probe :high_water_fraction (list))))
+      (is (= 256 (erlang/apply probe :check_interval (list))))
+      (File/rm_rf! dir))))
+
+; ── the exact message ─────────────────────────────────────────────────────
+
+(defn- expected-limit-message
+  "The message the live `check!/1` builds for `token` at `fraction`, from the
+   CURRENT table size — the same numbers the guard reads a moment later."
+  [token fraction]
+  (let [count (erlang/system_info :atom_count)
+        limit (erlang/system_info :atom_limit)]
+    (str "refusing to intern " (Kernel/inspect token)
+         ": the VM atom table holds " count " of " limit
+         " atoms, at or past the configured high-water fraction " fraction
+         ". Atoms are never collected, the table only grows, and filling it aborts the whole VM rather than raising — so beam-lisp stops here instead. Adjust :beam_lisp, :atom_high_water_fraction to change the ceiling.")))
+
+(deftest atom-guard-limit-message-is-exact
+  (testing "the raised message is byte-for-byte the live module's"
+    (let [dir (tmp-dir)]
+      (compile-guard-at probe dir)
+      (with-app-env :atom_high_water_fraction 0.0
+        (fn []
+          (let [pe (try (erlang/apply probe :check! (list "tok")) nil (catch e e))
+                le (try (erlang/apply live :check! (list "tok")) nil (catch e e))]
+            (is (= live-limit (:__struct__ pe)))
+            (is (= live-limit (:__struct__ le)))
+            (is (Elixir.Exception/exception? pe))
+            (is (= "tok" (:message (erlang/apply live-limit :exception (list "tok"))))
+                "the exception module itself is the live one")
+            (is (= (expected-limit-message "tok" 0.0) (ex-message le))
+                "the live message reconstructs from the live table size")
+            (is (= (ex-message le) (ex-message pe))
+                "probe and live messages are identical")
+            (is (includes? (ex-message pe) "refusing to intern \"tok\":")
+                "the culprit token is named")
+            (is (includes? (ex-message pe) "aborts the whole VM")
+                "the hazard is explained"))))
+      (clear-counters!)
+      (File/rm_rf! dir))))
+
+; ── to_atom: the lazy path, the rescue path, the counter ──────────────────
+
+(deftest atom-guard-to-atom-branches
+  (testing "an interned name costs nothing; a novel name is accounted then interned"
+    (let [dir (tmp-dir)
+          ; `novel` is DIFFERENT per module so each module meets a genuinely
+          ; fresh name once — a shared name would be interned by the first
+          ; caller and cost the second nothing.
+          check-one (fn [m novel]
+                      ; an EXISTING name: no counter movement, whatever the ceiling.
+                      (with-app-env
+                        :atom_high_water_fraction 0.0
+                        (fn []
+                          (with-app-env
+                            :atom_check_interval 1
+                            (fn []
+                              (erlang/apply m :reset (list))
+                              (is (= :Elixir.BeamLisp.AtomGuard
+                                     (erlang/apply m :to_atom (list "Elixir.BeamLisp.AtomGuard"))))
+                              (is (= 0 (counter m)) "an existing name is never accounted")))))
+                      ; a NOVEL name under a tight guard: rescue → account! →
+                      ; check! → raise. The raise happens BEFORE `String.to_atom`,
+                      ; so no atom is created.
+                      (with-app-env
+                        :atom_high_water_fraction 0.0
+                        (fn []
+                          (with-app-env
+                            :atom_check_interval 1
+                            (fn []
+                              (let [c0 (do (erlang/apply m :reset (list)) (counter m))
+                                    e (try (erlang/apply m :to_atom (list novel)) nil (catch e e))
+                                    c1 (counter m)]
+                                (is (= (list 0 live-limit 1) (list c0 (:__struct__ e) c1))
+                                    (str "tight novel=" novel " mod=" (str m))))))))
+                      ; the SAME novel name under a loose guard: rescue → intern.
+                      (with-app-env
+                        :atom_high_water_fraction 1.0
+                        (fn []
+                          (with-app-env
+                            :atom_check_interval 1000
+                            (fn []
+                              (let [c0 (do (erlang/apply m :reset (list)) (counter m))
+                                    r (try (erlang/apply m :to_atom (list novel)) (catch e e))
+                                    c1 (counter m)]
+                                (is (= (list 0 (String/to_atom novel) 1) (list c0 r c1))
+                                    (str "loose novel=" novel " mod=" (str m))))))))
+                      (erlang/erase (counter-key m)))]
+      (compile-guard-at probe dir)
+      (check-one live "bl_atom_guard_novel_live")
+      (check-one probe "bl_atom_guard_novel_probe")
+      ; the environment is restored, and both modules agree on a shared name.
+      (is (nil? (Application/get_env :beam_lisp :atom_high_water_fraction)))
+      (is (= (erlang/apply live :to_atom (list "Elixir"))
+             (erlang/apply probe :to_atom (list "Elixir"))))
+      (clear-counters!)
+      (File/rm_rf! dir))))
+
+; ── the nested LimitError: differential + struct surface ──────────────────
+
+(defn- limit-norm [m]
+  (if (erlang/is_binary m)
+    (String/replace m "BeamLisp.AtomGuard.LimitErrorProbe" "BeamLisp.AtomGuard.LimitError")
+    m))
+
+(defn- limit-corpus
+  "Every observation the `defexception [:message]` ABI owes, as a LIST so probe
+   and live compare index for index."
+  [mod normf]
+  (let [E (fn [arg] (fn [] (erlang/apply mod :exception (list arg))))
+        M (fn [arg] (fn [] (erlang/apply mod :message (list arg))))
+        e0 (fn [] (erlang/apply mod :exception (list (list))))]
+    (list
+      (observe normf (E (list)))
+      (observe normf (E (list (t2 :message nil))))
+      (observe normf (E (list (t2 :message "refusing to intern \"x\""))))
+      (observe normf (E (list (t2 :message "a") (t2 :message "b"))))
+      (observe normf (E "bin"))
+      (observe normf (E ""))
+      ; an undeclared key is the live struct!'s KeyError
+      (observe normf (E (list (t2 :other 1))))
+      (observe normf (E (list (t2 :message "a") (t2 :other 1))))
+      ; a changed tag is the live validate_struct!'s ArgumentError
+      (observe normf (E (list (t2 :__struct__ :other))))
+      (observe normf (E (list (t2 :__struct__ "not-an-atom"))))
+      (observe normf (E (list (t2 :__struct__ mod))))
+      (observe normf (E (list (t2 :__struct__ mod) (t2 :message "m"))))
+      ; bad args are FunctionClauseError
+      (observe normf (E :nope))
+      (observe normf (E nil))
+      (observe normf (E 42))
+      (observe normf (E (maps/new)))
+      ; message/1: value, nil, and the live field-access refusals
+      (observe normf (M (maps/put :message "m" (maps/new))))
+      (observe normf (M (maps/put :message nil (maps/new))))
+      (observe normf (M (maps/new)))
+      (observe normf (M 1))
+      (observe normf (M nil))
+      (observe normf (M "str"))
+      (observe normf (M (e0)))
+      (observe normf (M (erlang/apply mod :exception (list "m"))))
+      ; the Exception protocol surface
+      (observe normf (fn [] (Elixir.Exception/exception? (erlang/apply mod :exception (list "x")))))
+      (observe normf (fn [] (Elixir.Exception/exception? (e0))))
+      (observe normf (fn [] (Elixir.Exception/message (erlang/apply mod :exception (list "x")))))
+      (observe normf (fn [] (Kernel/inspect (erlang/apply mod :exception (list "hi")))))
+      (observe normf (fn [] (Kernel/inspect (e0))))
+      ; the struct's own map, tag aside
+      (observe normf (fn [] (Map/from_struct (erlang/apply mod :exception (list "hi")))))
+      ; raise the struct, catch it by its own type
+      (observe normf (fn [] (try (do (erlang/error (erlang/apply mod :exception (list "boom")))
+                                     :no-raise)
+                                 (catch e (list :rescued (= mod (:__struct__ e)) (normf (ex-message e))))))))))
+
+(deftest limit-error-pinned-matches-the-live-module
+  (testing "the nested exception answers exactly as the live module does"
+    (let [dir (tmp-dir)]
+      (compile-limit-at limit-probe dir)
+      (is (= :non_existing (erlang/apply :code :which (list limit-shim))))
+      (is (= (limit-corpus live-limit (fn [m] m))
+             (limit-corpus limit-probe limit-norm)))
+      (let [ls (limit-corpus live-limit (fn [m] m))
+            ps (limit-corpus limit-probe limit-norm)]
+        (doseq [i (range (count ls))]
+          (is (= (nth ls i) (nth ps i)) (str "observation " i))))
+      (File/rm_rf! dir))))
+
+(defn- struct-info [mod] (erlang/apply mod :__info__ (list :struct)))
+(defn- attributes [mod] (erlang/apply mod :module_info (list :attributes)))
+(defn- has-behaviour? [mod modname]
+  (some (fn [pair] (and (= :behaviour (elem pair 0)) (= modname (elem pair 1))))
+        (attributes mod)))
+
+(deftest limit-error-pinned-struct-surface
+  (testing ":struct_fields + :behaviour synthesize the defexception [:message] surface"
+    (let [dir (tmp-dir)]
+      (compile-limit-at limit-probe dir)
+      (is (erlang/function_exported limit-probe :__struct__ 0))
+      (is (erlang/function_exported limit-probe :__struct__ 1))
+      (is (erlang/function_exported limit-probe :__info__ 1))
+      (is (erlang/function_exported limit-probe :exception 1))
+      (is (erlang/function_exported limit-probe :message 1))
+      ; __struct__/0 — the tag is MODULE-EXACT, defaults are the declared pair.
+      (let [s0 (erlang/apply limit-probe :__struct__ (list))]
+        (is (erlang/is_map s0))
+        (is (= 3 (erlang/map_size s0)))
+        (is (= limit-probe (erlang/map_get :__struct__ s0)))
+        (is (= true (erlang/map_get :__exception__ s0)))
+        (is (nil? (erlang/map_get :message s0))))
+      (let [s1 (erlang/apply limit-probe :__struct__ (list (list (t2 :message "hi"))))]
+        (is (= limit-probe (erlang/map_get :__struct__ s1)))
+        (is (= "hi" (erlang/map_get :message s1))))
+      ; __info__(:struct) is the live module's, datum for datum: keys, order
+      ; and defaults — what `Inspect.Any` reads to rebuild `%Mod{…}`.
+      (is (= (struct-info live-limit) (struct-info limit-probe)))
+      (is (= (list (maps/put :field :__exception__ (maps/put :required false (maps/put :default true (maps/new))))
+                   (maps/put :field :message (maps/put :required false (maps/put :default nil (maps/new)))))
+             (struct-info limit-probe)))
+      ; the pinned beam serves every live export, and — the family shape — its
+      ; own `defn-` helpers ride along (the pinned emitter has no private
+      ; surface).
+      (is (every? (fn [e] (erlang/function_exported limit-probe (elem e 0) (elem e 1)))
+                  (erlang/apply live-limit :__info__ (list :functions))))
+      (is (every? (fn [e] (erlang/function_exported limit-probe (elem e 0) (elem e 1)))
+                  (list (t2 :kv 2) (t2 :self_module 0) (t2 :struct_default 0) (t2 :build_struct! 2))))
+      ; -behaviour Exception, as the pinned emitter records it (BARE atom).
+      (is (has-behaviour? limit-probe :"Elixir.Exception"))
+      ; the pinned __info__/1 does NOT serve :attributes — the family shape.
+      (is (= :Elixir.FunctionClauseError
+             (:__struct__ (try (erlang/apply limit-probe :__info__ (list :attributes)) nil (catch e e)))))
+      ; the exception/1 return is a GENUINE struct of its own type.
+      (let [s (erlang/apply limit-probe :exception (list "hi"))]
+        (is (Elixir.Exception/exception? s))
+        (is (= limit-probe (:__struct__ s))))
+      (File/rm_rf! dir))))
+
+; ── the explicit seed option contract ─────────────────────────────────────
+
+(deftest atom-guard-seed-option-contract
+  (testing "the seed's host-opts shape, exactly, for both entries"
+    (let [dir (tmp-dir)]
+      ; the guard is FUNCTIONS-ONLY: base options and nothing more.
+      (let [opts (guard-seed-opts probe dir)]
+        (is (= probe (Keyword/fetch! opts :module)))
+        (is (= (guard-src) (Keyword/fetch! opts :file)))
+        (is (= false (Keyword/fetch! opts :load?)))
+        (is (erlang/is_binary (Keyword/fetch! opts :source_hash)))
+        (is (nil? (Keyword/get opts :struct_fields)))
+        (is (nil? (Keyword/get opts :behaviour)))
+        (is (= (list :module :output_dir :file :source_hash :load?)
+               (map (fn [p] (elem p 0)) opts))))
+      ; the exception carries the defexception [:message] pair, in order.
+      (let [opts (limit-seed-opts limit-probe dir)]
+        (is (= limit-probe (Keyword/fetch! opts :module)))
+        (is (= (limit-src) (Keyword/fetch! opts :file)))
+        (is (= false (Keyword/fetch! opts :load?)))
+        (is (erlang/is_binary (Keyword/fetch! opts :source_hash)))
+        (is (= (list (t2 :__exception__ true) (t2 :message nil))
+               (Keyword/fetch! opts :struct_fields)))
+        (is (= :"Elixir.Exception" (Keyword/fetch! opts :behaviour)))
+        (is (= (list :module :output_dir :file :source_hash :load? :struct_fields :behaviour)
+               (map (fn [p] (elem p 0)) opts))))
+      ; the SAME source compiles at its PRODUCTION atom — read, not loaded.
+      (is (= live (elem (BeamLisp.AOT/compile_host_file (guard-src)
+                            (guard-seed-opts live dir)) 0)))
+      (is (= 256 (erlang/apply live :check_interval (list))) "live module untouched")
+      (File/rm_rf! dir))))
+
+; ── the pinned beams AT the production atoms, saved and restored ──────────
+
+(deftest pinned-beams-stand-in-at-the-production-atoms
+  (testing "the production atoms serve on the pinned beams, then the live beams return"
+    (let [dir (tmp-dir)
+          out (str dir "/prod")
+          guard-beam (Path/join out "Elixir.BeamLisp.AtomGuard.beam")
+          limit-beam (Path/join out "Elixir.BeamLisp.AtomGuard.LimitError.beam")
+          g-path (erlang/apply :code :which (list live))
+          g-bin (File/read! (erlang/list_to_binary g-path))
+          l-path (erlang/apply :code :which (list live-limit))
+          l-bin (File/read! (erlang/list_to_binary l-path))]
+      (is (not= :non_existing g-path) "precondition: the live guard beam is a readable file")
+      (is (not= :non_existing l-path) "precondition: the live LimitError beam is a readable file")
+      (compile-guard-file live out)
+      (compile-limit-file live-limit out)
+      (is (File/exists? guard-beam))
+      (is (File/exists? limit-beam))
+      (try
+        (drop! live)
+        (drop! live-limit)
+        (code/load_binary live (erlang/binary_to_list guard-beam) (File/read! guard-beam))
+        (code/load_binary live-limit (erlang/binary_to_list limit-beam) (File/read! limit-beam))
+        (is (= 0.9 (erlang/apply live :high_water_fraction (list))))
+        (is (= 256 (erlang/apply live :check_interval (list))))
+        (is (= :ok (erlang/apply live :check! (list "tok"))))
+        (is (= :Elixir.BeamLisp.AtomGuard (erlang/apply live :to_atom (list "Elixir.BeamLisp.AtomGuard"))))
+        (with-app-env :atom_high_water_fraction 0.0
+          (fn []
+            (let [e (try (erlang/apply live :check! (list "tok")) nil (catch e e))]
+              (is (= live-limit (:__struct__ e)) "the raised LimitError is the PINNED one")
+              (is (= :Elixir.FunctionClauseError
+                     (:__struct__ (try (erlang/apply live-limit :__info__ (list :attributes)) nil
+                                       (catch e e))))
+                  "the pinned LimitError took the atom too")
+              (is (Elixir.Exception/exception? e))
+              (is (= "tok" (:message (erlang/apply live-limit :exception (list "tok")))))
+              (is (includes? (ex-message e) "refusing to intern \"tok\"")))))
+        (is (= "%BeamLisp.AtomGuard.LimitError{message: \"refusing\"}"
+               (Kernel/inspect (erlang/apply live-limit :exception (list "refusing")))))
+        (finally
+          (drop! live)
+          (drop! live-limit)
+          (code/load_binary live g-path g-bin)
+          (code/load_binary live-limit l-path l-bin)))
+      ; RESTORED: the live beams own the atoms and answer again.
+      (is (= g-path (erlang/apply :code :which (list live))))
+      (is (= l-path (erlang/apply :code :which (list live-limit))))
+      (is (= 0.9 (erlang/apply live :high_water_fraction (list))))
+      (clear-counters!)
+      (File/rm_rf! dir))))
+
+; ── the COLD CHILD: a fresh VM, no application boot, no host-ns Env ───────
+
+(defn- child-code-args
+  "This VM's whole code path as `-pa` args, with `pinned` LAST so it lands
+   FIRST: `-pa` PREPENDS, so the last one named wins."
+  [pinned]
+  (concat (mapcat (fn [p] (list "-pa" (erlang/list_to_binary p))) (code/get_path))
+          (list "-pa" pinned)))
+
+(defn- cold-script
+  "The child VM's program. It NEVER starts the application: it resolves the
+   pinned guard and exception off the path and exercises them, so a
+   host-namespace Env dependency would be a load-time `undef` here."
+  []
+  (str
+    "IO.puts(\"which-g=\" <> List.to_string(:code.which(BeamLisp.AtomGuard)))\n"
+    "IO.puts(\"which-e=\" <> List.to_string(:code.which(BeamLisp.AtomGuard.LimitError)))\n"
+    "IO.puts(\"hwf=\" <> inspect(BeamLisp.AtomGuard.high_water_fraction()))\n"
+    "IO.puts(\"iv=\" <> inspect(BeamLisp.AtomGuard.check_interval()))\n"
+    ; `reset` is `Process.put/2`, which answers the OLD value: `:undefined`
+    ; on a virgin dictionary, `0` once the key holds a number.
+    "IO.puts(\"reset=\" <> inspect(BeamLisp.AtomGuard.reset()))\n"
+    "IO.puts(\"reset2=\" <> inspect(BeamLisp.AtomGuard.reset()))\n"
+    "IO.puts(\"to-atom=\" <> inspect(BeamLisp.AtomGuard.to_atom(\"Elixir.BeamLisp.AtomGuard\")))\n"
+    "IO.puts(\"acct=\" <> inspect(BeamLisp.AtomGuard.account!(\"tok\")))\n"
+    "IO.puts(\"check-ok=\" <> inspect(BeamLisp.AtomGuard.check!(\"tok\")))\n"
+    "IO.puts(\"limit-inspect=\" <> inspect(BeamLisp.AtomGuard.LimitError.exception(message: \"m\")))\n"
+    "Application.put_env(:beam_lisp, :atom_high_water_fraction, 0.0)\n"
+    "r =\n"
+    "  try do\n"
+    "    BeamLisp.AtomGuard.check!(\"tok\")\n"
+    "  rescue\n"
+    "    e in BeamLisp.AtomGuard.LimitError -> {:raised, Exception.message(e)}\n"
+    "  end\n"
+    "IO.puts(\"check-raise=\" <> inspect(elem(r, 0)))\n"
+    "IO.puts(\"check-token=\" <> inspect(String.contains?(elem(r, 1), \"refusing to intern \\\"tok\\\"\")))\n"
+    "IO.puts(\"ok\")\n"))
+
+(deftest pinned-beams-answer-in-a-cold-child-vm
+  (testing "a fresh VM with no application boot resolves and exercises both pinned beams"
+    (let [dir (tmp-dir)
+          out (str dir "/cold")
+          script (Path/join dir "cold.exs")
+          g-beam (compile-guard-file live out)
+          e-beam (compile-limit-file live-limit out)]
+      (is (File/exists? g-beam))
+      (is (File/exists? e-beam))
+      (File/write! script (cold-script))
+      (let [r (System/cmd "elixir"
+                          (to-list (concat (child-code-args out) (list script)))
+                          (to-list [(tuple :stderr_to_stdout true)
+                                    (tuple :env (list (tuple "ERL_CRASH_DUMP" "/dev/null")))]))
+            text (elem r 0)]
+        (is (zero? (elem r 1)) (str "the child VM exited " (elem r 1) ":\n" text))
+        ; THE REPLACEMENT: the code server resolves both atoms to the pinned
+        ; beams, in a VM that never booted the language.
+        (is (includes? text (str "which-g=" g-beam)) text)
+        (is (includes? text (str "which-e=" e-beam)) text)
+        (is (includes? text "hwf=0.9") text)
+        (is (includes? text "iv=256") text)
+        ; `reset` answers the OLD value, exactly as the live module does.
+        (is (includes? text "reset=:undefined") text)
+        (is (includes? text "reset2=0") text)
+        (is (includes? text "to-atom=BeamLisp.AtomGuard") text)
+        (is (includes? text "acct=:ok") text)
+        (is (includes? text "check-ok=:ok") text)
+        (is (includes? text "limit-inspect=%BeamLisp.AtomGuard.LimitError{message: \"m\"}") text)
+        (is (includes? text "check-raise=:raised") text)
+        (is (includes? text "check-token=true") text)
+        (is (includes? text "ok") text))
+      (File/rm_rf! dir))))
