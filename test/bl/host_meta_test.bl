@@ -1,0 +1,375 @@
+; host_meta_test.bl — the pinned `Meta` / `FormMeta` runtime metadata pair.
+;
+; Two `.bl` sources under `priv/host/` replace `lib/beam_lisp/meta.ex` and
+; `lib/beam_lisp/form_meta.ex` at their exact module atoms:
+;
+;   * `priv/host/meta.bl`      → `Elixir.BeamLisp.Meta`      (`meta/1`
+;     `with_meta/2` `vary_meta/2`) — metadata on RUNTIME VALUES.
+;   * `priv/host/form_meta.bl` → `Elixir.BeamLisp.FormMeta` (the same API) —
+;     metadata on FORM DATA, delegated to the production `BeamLisp.Meta` for the
+;     one runtime value type that carries it.
+;
+; Nothing here replaces the live module. Each source is compiled at its OWN
+; probe atom, the namespace shim beside it is dropped, and the pinned beam is
+; loaded ALONE — so a leftover shim reference would be `undef` here. The
+; namespace the compile INTERNS is then deleted too, and the emitted beam is
+; checked to import NOTHING from `BeamLisp.Env`: a pinned module's functions are
+; not namespace vars, so a helper — or a sibling defn captured as a VALUE rather
+; than called — would resolve through `Env` in this VM and fail on a fresh boot.
+; The sources therefore use `erlang/iolist_to_binary` rather than the ambient
+; `core/str`, which is what would otherwise compile to an `Env.fetch!`.
+;
+; `FormMeta` is compared against the live module with the PRODUCTION `Meta`
+; loaded: its lazy-seq delegation is the exact runtime seam, so a probe atom for
+; `Meta` would be a different question than the one a real boot asks.
+;
+; Run: bin/bl test test/bl/host_meta_test.bl
+
+(ns host.meta.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_meta_" (erlang/unique_integer (list :positive))))
+
+(defn- meta-source [] (Path/join (BeamLisp/cwd) "priv/host/meta.bl"))
+(defn- form-meta-source [] (Path/join (BeamLisp/cwd) "priv/host/form_meta.bl"))
+
+(def ^:private meta-mod :Elixir.BeamLisp.HostMetaProbe)
+(def ^:private form-meta-mod :Elixir.BeamLisp.HostFormMetaProbe)
+(def ^:private live-meta :Elixir.BeamLisp.Meta)
+(def ^:private live-form-meta :Elixir.BeamLisp.FormMeta)
+
+; The shim each pinned source compiles beside it is named by the emitter's OWN
+; rule, so the name cannot drift from the compile that produced it.
+(defn- meta-shim [] (BeamLisp.Emit/module_for "host.meta"))
+(defn- form-meta-shim [] (BeamLisp.Emit/module_for "host.form-meta"))
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- ns-vars-gone! [ns]
+  (doseq [name (maps/keys (BeamLisp.Env/ns_defs ns))]
+    (BeamLisp.Env/undefine_var ns name))
+  ns)
+
+; Compile `src` at `mod` and publish ONLY the pinned beam: the compile's own
+; load (and the namespace shim it built beside it) is dropped first.
+(defn- compile-pinned [mod src opts]
+  (let [res (BeamLisp.AOT/compile_host_file src opts)
+        path (elem res 1)]
+    (drop! mod)
+    (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+    mod))
+
+(def ^:private pin-dir (atom nil))
+
+; Compile both pinned sources ONCE, into one scratch dir, then drop the shims
+; and the interned namespaces so every assertion below runs against a bare
+; image. Memoized: a re-compile per test would only re-intern what was dropped.
+(defn- pin! []
+  (or @pin-dir
+      (let [dir (tmp-dir)]
+        (compile-pinned meta-mod (meta-source)
+          (list (t2 :module meta-mod) (t2 :output_dir dir) (t2 :load? false)))
+        (compile-pinned form-meta-mod (form-meta-source)
+          (list (t2 :module form-meta-mod) (t2 :output_dir dir) (t2 :load? false)))
+        (drop! (meta-shim))
+        (drop! (form-meta-shim))
+        (ns-vars-gone! "host.meta")
+        (ns-vars-gone! "host.form-meta")
+        (reset! pin-dir dir))))
+
+; A call, normalized so a raise is a value: [:value v] | [:raise Class message].
+(defn- obs [run]
+  (try (list :value (run))
+       (catch e (list :raise (:__struct__ e) (ex-message e)))))
+
+; Run the SAME closure against two modules and compare the normalized outcomes.
+(defn- agree? [run a b]
+  (= (obs (fn [] (run a))) (obs (fn [] (run b)))))
+
+(defn- exports-of [mod]
+  (Enum/sort (erlang/apply mod :module_info (list :exports))))
+
+(defn- beam-path [dir mod] (Path/join dir (str mod ".beam")))
+
+; The functions a beam IMPORTS from `BeamLisp.Env`. A pinned module must import
+; none: its functions are not namespace vars, so ANY var lookup here — a helper,
+; or a sibling defn captured as a value rather than called — is a bug that only a
+; fresh boot would show. (A pinned file may legally use ambient `core` names;
+; reaching one would compile to an `Env.fetch!` import, which is why the
+; sources use `erlang/iolist_to_binary` instead of `str`.)
+(defn- env-imports [path]
+  (let [r (erlang/apply :beam_lib :chunks (list (erlang/binary_to_list path) (list :imports)))]
+    (if (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+      (let [pair (erlang/element 2 r)
+            chunks (erlang/element 2 pair)
+            imports (erlang/element 2 (first chunks))]
+        (Enum/filter imports (fn [i] (erlang/== :"Elixir.BeamLisp.Env" (erlang/element 1 i)))))
+      :unreadable)))
+
+(defn- new-seq [v] (BeamLisp.LazySeq/new (fn [] v)))
+
+; ── the pinned module surface ────────────────────────────────────────────
+
+(deftest host-meta-pinned-surface-and-stand-alone
+  (testing "exactly the recalled exports, no struct surface, no self-namespace lookup"
+    (let [dir (pin!)]
+      (is (= :non_existing (erlang/apply :code :which (list (meta-shim))))
+          "the namespace shim is gone; the pinned beam answers")
+      (is (= :non_existing (erlang/apply :code :which (list (form-meta-shim)))))
+      (is (erlang/function_exported meta-mod :meta 1))
+      (is (erlang/function_exported meta-mod :with_meta 2))
+      (is (erlang/function_exported meta-mod :vary_meta 2))
+      (is (erlang/function_exported form-meta-mod :meta 1))
+      (is (erlang/function_exported form-meta-mod :with_meta 2))
+      (is (erlang/function_exported form-meta-mod :vary_meta 2))
+      ; FUNCTIONS-ONLY: no synthesized constructor/introspection rides along,
+      ; and no helper leaked into the surface.
+      (let [expected (Enum/sort (list (t2 :meta 1) (t2 :with_meta 2) (t2 :vary_meta 2)
+                                      (t2 :module_info 0) (t2 :module_info 1)))]
+        (is (= expected (exports-of meta-mod)))
+        (is (= expected (exports-of form-meta-mod))))
+      (is (not (erlang/function_exported meta-mod :__struct__ 0)))
+      (is (not (erlang/function_exported meta-mod :__info__ 1)))
+      (is (not (erlang/function_exported form-meta-mod :__struct__ 0)))
+      (is (not (erlang/function_exported form-meta-mod :__info__ 1)))
+      ; the compile interned a namespace; it is GONE, and neither beam imports
+      ; ANYTHING from `Env` — every call is a MODULE call.
+      (is (= 0 (erlang/map_size (BeamLisp.Env/ns_defs "host.meta"))))
+      (is (= 0 (erlang/map_size (BeamLisp.Env/ns_defs "host.form-meta"))))
+      (is (= (list) (BeamLisp.Env/own_names "host.meta")))
+      (is (= (list) (BeamLisp.Env/own_names "host.form-meta")))
+      (is (= (list) (env-imports (beam-path dir meta-mod))))
+      (is (= (list) (env-imports (beam-path dir form-meta-mod))))
+      ; and the pinned source still answers, loaded at the CALLER's atom.
+      (is (= {:doc "d"}
+             (erlang/apply meta-mod :meta
+                           (list (erlang/apply meta-mod :with_meta (list (new-seq nil) {:doc "d"}))))))
+      (is (= {:doc "d"}
+             (erlang/apply form-meta-mod :meta
+                           (list (erlang/apply form-meta-mod :with_meta (list (new-seq nil) {:doc "d"})))))))))
+
+; ── BeamLisp.Meta: lazy-seq metadata ─────────────────────────────────────
+
+; Every projection is a plain value or a boolean, so probe == live is exact.
+(defn- meta-values [mod]
+  (let [lazy (new-seq (list 1 2 3))
+        tagged (erlang/apply mod :with_meta (list lazy {:doc "d"}))
+        struct-meta (BeamLisp.Vector/new (list 9))
+        tagged-struct (erlang/apply mod :with_meta (list lazy struct-meta))]
+    (list
+      ; absent metadata reads as nil, not an empty map
+      (erlang/apply mod :meta (list lazy))
+      ; attach and read back
+      (erlang/apply mod :meta (list tagged))
+      ; `m` may be ANY map, a struct included
+      (erlang/apply mod :meta (list tagged-struct))
+      (erlang/== struct-meta (erlang/apply mod :meta (list tagged-struct)))
+      ; nil clears without touching the source's own metadata
+      (erlang/apply mod :meta (list (erlang/apply mod :with_meta (list tagged nil))))
+      (erlang/apply mod :meta (list tagged))
+      (erlang/apply mod :meta (list lazy))
+      ; replacing prior metadata leaves the first node untouched
+      (erlang/apply mod :meta (list (erlang/apply mod :with_meta (list tagged {:b 2}))))
+      (erlang/apply mod :meta (list tagged))
+      ; value-typed values: meta nil and with_meta the IDENTICAL term
+      (erlang/apply mod :meta (list (list 1 2 3)))
+      (erlang/apply mod :meta (list {:a 1}))
+      (erlang/apply mod :meta (list (BeamLisp.Vector/new (list 1))))
+      (erlang/apply mod :meta (list 42))
+      (erlang/apply mod :meta (list "hello"))
+      (erlang/apply mod :meta (list :kw))
+      (erlang/apply mod :meta (list nil))
+      (erlang/apply mod :meta (list (erlang/list_to_tuple (list :symbol "x"))))
+      (erlang/== (list 1 2 3) (erlang/apply mod :with_meta (list (list 1 2 3) {:doc "d"})))
+      (erlang/== {:a 1} (erlang/apply mod :with_meta (list {:a 1} {:doc "d"})))
+      (erlang/== 42 (erlang/apply mod :with_meta (list 42 {:doc "d"})))
+      (erlang/== "hello" (erlang/apply mod :with_meta (list "hello" {:doc "d"})))
+      (erlang/== :kw (erlang/apply mod :with_meta (list :kw {:doc "d"})))
+      (erlang/== nil (erlang/apply mod :with_meta (list nil {:doc "d"})))
+      ; a vector is NOT special to Meta (it is to FormMeta)
+      (erlang/== (BeamLisp.Vector/new (list 1 2))
+                 (erlang/apply mod :with_meta (list (BeamLisp.Vector/new (list 1 2)) {:doc "d"}))))))
+
+; The native memo resource is SHARED across independently annotated values, so
+; realization runs exactly once and `=` never sees metadata.
+(defn- share-obs [mod]
+  (let [runs (atom 0)
+        orig (BeamLisp.LazySeq/new (fn [] (swap! runs inc) (list 1 2 3)))
+        tagged (erlang/apply mod :with_meta (list orig {:done true}))
+        shared (erlang/== (erlang/map_get :resource tagged) (erlang/map_get :resource orig))
+        v1 (BeamLisp.LazySeq/force tagged)
+        v2 (BeamLisp.LazySeq/force orig)
+        eqv (BeamLisp.Ns.Rt/eqv orig tagged)
+        realized (BeamLisp.LazySeq/to_list (erlang/apply mod :with_meta (list (new-seq (list 4 5 6)) {:a 1})))
+        printed-eq (erlang/== (Kernel/inspect tagged) (Kernel/inspect orig))]
+    (list shared v1 v2 @runs eqv realized printed-eq
+          (erlang/apply mod :meta (list tagged))
+          (erlang/apply mod :meta (list orig)))))
+
+; `f` may be a bare Elixir function, a beam-lisp fn value, or any other
+; invocable the runtime accepts; it always sees the current map (nil included).
+(defn- vary-obs [mod]
+  (let [lazy (new-seq (list 1 2))
+        tagged (erlang/apply mod :with_meta (list lazy {:a 1}))
+        elixir-fn (fn [m] (assoc (or m {}) :b 2))
+        bl-fn (fn [m] (assoc (or m {}) :c 3))
+        bumped-e (erlang/apply mod :vary_meta (list tagged elixir-fn))
+        bumped-b (erlang/apply mod :vary_meta (list tagged bl-fn))
+        nilly (erlang/apply mod :vary_meta (list lazy elixir-fn))
+        ; the runtime's non-function invocable path: a keyword looks itself up
+        kw-target (erlang/apply mod :with_meta (list lazy {:a {:deep 1}}))
+        via-kw (erlang/apply mod :vary_meta (list kw-target :a))]
+    (list (erlang/apply mod :meta (list bumped-e))
+          (erlang/apply mod :meta (list bumped-b))
+          (erlang/apply mod :meta (list nilly))
+          (erlang/apply mod :meta (list via-kw))
+          (erlang/apply mod :meta (list tagged)))))
+
+; Non-map metadata is refused with Clojure's message, for a lazy seq AND for a
+; value-typed value (form-shaped or not).
+(defn- raise-obs [mod]
+  (list
+    (obs (fn [] (erlang/apply mod :with_meta (list (new-seq nil) "not a map"))))
+    (obs (fn [] (erlang/apply mod :with_meta (list (new-seq nil) 7))))
+    (obs (fn [] (erlang/apply mod :with_meta (list (list 1 2) "not a map"))))
+    (obs (fn [] (erlang/apply mod :with_meta (list {:a 1} 7))))
+    (obs (fn [] (erlang/apply mod :with_meta (list (BeamLisp.Vector/new (list 1)) "not a map"))))
+    (obs (fn [] (erlang/apply mod :with_meta
+                    (list (erlang/list_to_tuple (list :meta (list 1) {:a 1})) 7))))))
+
+(deftest host-meta-pinned-values-and-parity
+  (testing "probe answers are the pinned answers, and equal the live module's"
+    (pin!)
+    (is (= (list nil {:doc "d"} (BeamLisp.Vector/new (list 9)) true nil {:doc "d"} nil
+                 {:b 2} {:doc "d"}
+                 nil nil nil nil nil nil nil nil
+                 true true true true true true true)
+           (meta-values meta-mod)))
+    (is (= (list true (list 1 2 3) (list 1 2 3) 1 true (list 4 5 6) true {:done true} nil)
+           (share-obs meta-mod)))
+    (is (= (list {:a 1 :b 2} {:a 1 :c 3} {:b 2} {:deep 1} {:a 1})
+           (vary-obs meta-mod)))
+    (is (= (list (list :raise :Elixir.ArgumentError "metadata must be a map or nil, got: \"not a map\"")
+                 (list :raise :Elixir.ArgumentError "metadata must be a map or nil, got: 7")
+                 (list :raise :Elixir.ArgumentError "metadata must be a map or nil, got: \"not a map\"")
+                 (list :raise :Elixir.ArgumentError "metadata must be a map or nil, got: 7")
+                 (list :raise :Elixir.ArgumentError "metadata must be a map or nil, got: \"not a map\"")
+                 (list :raise :Elixir.ArgumentError "metadata must be a map or nil, got: 7"))
+           (raise-obs meta-mod)))
+    ; and against the live module at the public ABI atom
+    (is (= (meta-values live-meta) (meta-values meta-mod)))
+    (is (= (share-obs live-meta) (share-obs meta-mod)))
+    (is (= (vary-obs live-meta) (vary-obs meta-mod)))
+    (is (= (raise-obs live-meta) (raise-obs meta-mod)))
+    (is (agree? (fn [M] (erlang/apply M :meta (list (list 1 2)))) live-meta meta-mod))
+    (is (agree? (fn [M] (erlang/apply M :with_meta (list (BeamLisp.Vector/new (list 1)) {:a 1})))
+                live-meta meta-mod))))
+
+; ── BeamLisp.FormMeta: form data, vectors, and the {:meta, form, m} wrapper ──
+
+(defn- form-values [mod]
+  (let [list-form (list 1 2)
+        sym-form (erlang/list_to_tuple (list :symbol "x"))
+        vec-form (erlang/list_to_tuple (list :vector (list 1 2)))
+        map-form (erlang/list_to_tuple (list :map (list)))
+        set-form (erlang/list_to_tuple (list :set (list)))
+        mapv (BeamLisp.Vector/new (list 1 2))
+        plain-map {:k 1}
+        wrapper (erlang/list_to_tuple (list :meta sym-form {:old 1}))
+        wrap (fn [f] (erlang/apply mod :with_meta (list f {:n 1})))]
+    (list
+      ; `{:meta, form, m}` reads m, whatever the inner form is
+      (erlang/apply mod :meta (list wrapper))
+      ; every FORM SHAPE wraps, in one uniform wrapper node
+      (wrap list-form)
+      (erlang/apply mod :meta (list (wrap sym-form)))
+      (wrap vec-form)
+      (wrap map-form)
+      (wrap set-form)
+      (erlang/apply mod :meta (list (wrap plain-map)))
+      ; a vector is NOT wrapped: it carries metadata in its own field
+      (erlang/map_get :meta (wrap mapv))
+      ; non-shapes come back the IDENTICAL term (a documented no-op)
+      (erlang/== 42 (wrap 42))
+      (erlang/== "s" (wrap "s"))
+      (erlang/== :kw (wrap :kw))
+      (erlang/== nil (wrap nil))
+      (erlang/== (erlang/list_to_tuple (list :nope 1)) (wrap (erlang/list_to_tuple (list :nope 1))))
+      (erlang/== (erlang/list_to_tuple (list :foo 1 2)) (wrap (erlang/list_to_tuple (list :foo 1 2))))
+      ; nil UNWRAPS a metadata-carrying form back to its bare form
+      (erlang/== sym-form (erlang/apply mod :with_meta (list wrapper nil)))
+      (erlang/apply mod :meta (list (erlang/apply mod :with_meta (list (wrap sym-form) nil))))
+      ; nil clears a vector's field and no-ops on a bare list
+      (erlang/apply mod :meta (list (erlang/apply mod :with_meta (list mapv nil))))
+      (erlang/== list-form (erlang/apply mod :with_meta (list list-form nil)))
+      ; a map attached to an ALREADY-wrapped form is a no-op — the wrapper is
+      ; not one of the form SHAPES, exactly as the reference has it
+      (erlang/== wrapper (erlang/apply mod :with_meta (list wrapper {:new 1})))
+      (erlang/apply mod :meta (list (erlang/apply mod :with_meta (list wrapper {:new 1})))))))
+
+; The `:meta` FIELD of a vector keeps it a working vector: no wrapper escapes
+; into user data (`count`/`nth`/`conj` still match it), `=` and printing are
+; unaffected, and `conj` carries the metadata forward.
+(defn- vector-obs [mod]
+  (let [v (BeamLisp.Vector/new (list 1 2 3))
+        tagged (erlang/apply mod :with_meta (list v {:k 1}))
+        grown (BeamLisp.Vector/conj tagged 4)]
+    (list (BeamLisp.Vector/count tagged)
+          (BeamLisp.Vector/nth tagged 1)
+          (erlang/map_get :items tagged)
+          (erlang/map_get :__struct__ tagged)
+          (BeamLisp.Ns.Rt/eqv tagged v)
+          (pr-str tagged)
+          (erlang/apply mod :meta (list tagged))
+          (erlang/apply mod :meta (list v))
+          (BeamLisp.Vector/count grown)
+          (erlang/apply mod :meta (list grown)))))
+
+(deftest form-meta-pinned-values-and-parity
+  (testing "wrapper / form shapes / vectors / nil unwrap, probe == live"
+    (pin!)
+    (is (= (list {:old 1}
+                 (erlang/list_to_tuple (list :meta (list 1 2) {:n 1}))
+                 {:n 1}
+                 (erlang/list_to_tuple (list :meta (erlang/list_to_tuple (list :vector (list 1 2))) {:n 1}))
+                 (erlang/list_to_tuple (list :meta (erlang/list_to_tuple (list :map (list))) {:n 1}))
+                 (erlang/list_to_tuple (list :meta (erlang/list_to_tuple (list :set (list))) {:n 1}))
+                 {:n 1}
+                 {:n 1}
+                 true true true true true true true
+                 nil nil
+                 true true
+                 {:old 1})
+           (form-values form-meta-mod)))
+    (is (= (list 3 2 (erlang/list_to_tuple (list 1 2 3)) :"Elixir.BeamLisp.Vector" true "[1 2 3]"
+                 {:k 1} nil 4 {:k 1})
+           (vector-obs form-meta-mod)))
+    (is (= (list {:a 1 :b 2} {:a 1 :c 3} {:b 2} {:deep 1} {:a 1})
+           (vary-obs form-meta-mod)))
+    (is (= (raise-obs live-form-meta) (raise-obs form-meta-mod)))
+    (is (= (form-values live-form-meta) (form-values form-meta-mod)))
+    (is (= (vector-obs live-form-meta) (vector-obs form-meta-mod)))
+    (is (= (vary-obs live-form-meta) (vary-obs form-meta-mod)))))
+
+; ── the production Meta seam ─────────────────────────────────────────────
+
+(deftest form-meta-delegates-to-the-production-meta
+  (testing "a lazy seq annotated through FormMeta carries REAL runtime metadata"
+    (pin!)
+    (let [lazy (new-seq (list 1 2 3))
+          tagged (erlang/apply form-meta-mod :with_meta (list lazy {:doc "form"}))]
+      ; the SAME struct shape the live `BeamLisp.Meta` produces, and the LIVE
+      ; module reads it back — the seam is a module atom, not a probe one.
+      (is (= :"Elixir.BeamLisp.LazySeq" (erlang/map_get :__struct__ tagged)))
+      (is (= {:doc "form"} (erlang/apply live-meta :meta (list tagged))))
+      (is (= {:doc "form"} (erlang/apply form-meta-mod :meta (list tagged))))
+      (is (erlang/== (erlang/map_get :resource tagged) (erlang/map_get :resource lazy)))
+      (is (= (list 1 2 3) (BeamLisp.LazySeq/to_list tagged)))
+      ; and non-map metadata is refused through the SAME delegation
+      (is (= (list :raise :Elixir.ArgumentError "metadata must be a map or nil, got: 5")
+             (obs (fn [] (erlang/apply form-meta-mod :with_meta (list lazy 5))))))
+      (is (= (obs (fn [] (erlang/apply live-meta :with_meta (list lazy 5))))
+             (obs (fn [] (erlang/apply form-meta-mod :with_meta (list lazy 5)))))))))
