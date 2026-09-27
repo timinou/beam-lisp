@@ -48,9 +48,7 @@ end
 
 ExUnit.start(autorun: false)
 extra_exunit = String.split(System.get_env("CANONICAL_EXTRA_EXUNIT", ""), ",", trim: true)
-for path <- extra_exunit ++ ["test/beam_lisp/generation_semantics_test.exs",
-                            "test/beam_lisp/anf_emit_test.exs",
-                            "test/beam_lisp/direct_forms_test.exs",
+for path <- extra_exunit ++ ["test/beam_lisp/direct_forms_test.exs",
                             "test/beam_lisp/wave24_records_test.exs",
                             "test/beam_lisp/native_test.exs"] do
   Code.require_file(path)
@@ -59,7 +57,10 @@ result = ExUnit.run()
 IO.inspect(result, label: "CANONICAL_TEST_RESULT")
 extra_bl = String.split(System.get_env("CANONICAL_EXTRA_BL", ""), ",", trim: true)
 BeamLisp.run_file("priv/self/anf.bl")
-module_result = BeamLisp.TestRT.run_suite(["test/bl/core_aot_test.bl" | extra_bl])
+module_result = BeamLisp.TestRT.run_suite(
+  ["test/bl/core_aot_test.bl", "test/bl/generation_semantics_test.bl",
+   "test/bl/anf_emit_test.bl", "test/bl/anf_direct_emit_test.bl" | extra_bl]
+)
 IO.inspect(module_result, label: "MODULE_CONTRACT_RESULT", limit: :infinity)
 Enum.each(Process.get(:canonical_upgrade_cleanup, []), &File.rm_rf!/1)
 System.halt(if result.failures == 0 and BeamLisp.TestRT.passed?(module_result), do: 0, else: 1)
