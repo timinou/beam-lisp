@@ -1,0 +1,272 @@
+; host_reactive_test.bl — the pinned `Derived` struct and `Reactive` ABI.
+;
+; Two `.bl` sources under `priv/host/` replace the two halves of
+; `lib/beam_lisp/reactive.ex` at their exact module atoms:
+;
+;   * `priv/host/derived.bl` → `Elixir.BeamLisp.Derived`, a STRUCT whose
+;     `__struct__/0,1` pair and `__info__/1` are synthesized by
+;     `compile_host_file`'s `:struct_fields` option, plus a real public `new/3`.
+;   * `priv/host/reactive.bl` → `Elixir.BeamLisp.Reactive`, FUNCTIONS-ONLY:
+;     `derive`/`deref`/`derived?` and NOTHING else.
+;
+; Nothing here replaces the live module. Each source is compiled at its OWN
+; probe atom, the namespace shim beside it is dropped, and the pinned beam is
+; loaded ALONE — so a leftover shim reference would be `undef` here. The
+; `Derived` probe is checked structurally (the tag is the probe atom, not a
+; hard-coded one); the `Reactive` probe is compared to the live module on
+; chains, atom changes, constant deps, vector-vs-list deps, wrong thunk arity,
+; concurrency, and the exchange retry path.
+;
+; Run: bin/bl test test/bl/host_reactive_test.bl
+
+(ns host.reactive.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_reactive_" (erlang/unique_integer (list :positive))))
+
+(defn- derived-source [] (Path/join (BeamLisp/cwd) "priv/host/derived.bl"))
+(defn- reactive-source [] (Path/join (BeamLisp/cwd) "priv/host/reactive.bl"))
+
+(def ^:private derived-mod :Elixir.BeamLisp.HostDerivedProbe)
+(def ^:private reactive-mod :Elixir.BeamLisp.HostReactiveProbe)
+(def ^:private derived-shim :Elixir.BeamLisp.Ns.Host.Derived)
+(def ^:private reactive-shim :Elixir.BeamLisp.Ns.Host.Reactive)
+(def ^:private live :Elixir.BeamLisp.Reactive)
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-pinned [mod path]
+  (do (drop! mod)
+      (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+      mod))
+
+; Compile `src` at `mod` and publish ONLY the pinned beam: the compile's own
+; load (and the namespace shim it built beside it) is dropped first.
+(defn- compile-pinned [mod src opts]
+  (let [res (BeamLisp.AOT/compile_host_file src opts)]
+    (load-pinned mod (elem res 1))))
+
+(defn- compile-derived [dir]
+  (let [m (compile-pinned derived-mod (derived-source)
+            (list (t2 :module derived-mod) (t2 :output_dir dir) (t2 :load? false)
+                  (t2 :struct_fields (list (t2 :cell nil) (t2 :deps nil) (t2 :thunk nil)))))]
+    (drop! derived-shim)
+    m))
+
+(defn- compile-reactive [dir]
+  (let [m (compile-pinned reactive-mod (reactive-source)
+            (list (t2 :module reactive-mod) (t2 :output_dir dir) (t2 :load? false)))]
+    (drop! reactive-shim)
+    m))
+
+(defn- derive-of [mod deps thunk] (erlang/apply mod :derive (list deps thunk)))
+(defn- deref-of [mod d] (erlang/apply mod :deref (list d)))
+(defn- derived-of? [mod x] (erlang/apply mod :derived? (list x)))
+
+(defn- raise-class [f]
+  (try (do (f) :no-raise)
+       (catch e (:__struct__ e))))
+
+; ── the Derived struct surface ────────────────────────────────────────────
+
+(deftest derived-pinned-struct-is-probe-tagged
+  (testing "`:struct_fields` synthesizes __struct__/0,1; `new/3` is module-exact"
+    (let [dir (tmp-dir)]
+      (compile-derived dir)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (= :non_existing (erlang/apply :code :which (list derived-shim))))
+      (is (erlang/function_exported derived-mod :__struct__ 0))
+      (is (erlang/function_exported derived-mod :__struct__ 1))
+      (is (erlang/function_exported derived-mod :new 3))
+      ; __struct__/0 — the tag is the PROBE atom, and all three fields default nil.
+      (let [s0 (erlang/apply derived-mod :__struct__ (list))]
+        (is (erlang/is_map s0))
+        (is (= 4 (erlang/map_size s0)))
+        (is (= derived-mod (erlang/map_get :__struct__ s0)))
+        (is (nil? (erlang/map_get :cell s0)))
+        (is (nil? (erlang/map_get :deps s0)))
+        (is (nil? (erlang/map_get :thunk s0))))
+      ; __struct__/1 folds the given values over the defaults.
+      (let [s1 (erlang/apply derived-mod :__struct__ (list (list (t2 :cell 9))))]
+        (is (= derived-mod (erlang/map_get :__struct__ s1)))
+        (is (= 9 (erlang/map_get :cell s1)))
+        (is (nil? (erlang/map_get :deps s1))))
+      ; new/3 returns EXACTLY __struct__/1's map — same tag, same fields — at
+      ; whatever atom the file was compiled into.
+      (is (= (erlang/apply derived-mod :__struct__
+               (list (list (t2 :cell 1) (t2 :deps 2) (t2 :thunk 3))))
+             (erlang/apply derived-mod :new (list 1 2 3))))
+      (let [d (erlang/apply derived-mod :new (list 1 2 3))]
+        (is (and (erlang/is_map d) (erlang/is_map_key :__struct__ d)))
+        (is (= derived-mod (erlang/map_get :__struct__ d)))
+        ; a derived is NOT a sequence: no Enumerable impl hangs off it.
+        (is (nil? (erlang/apply :Elixir.Enumerable :impl_for (list d)))))
+      ; __info__(:struct) is the committed Derived beam's list, datum for datum:
+      ; `BeamLisp.Derived` is `defstruct [:cell, :deps, :thunk]`, and the pinned
+      ; port must answer the same metadata so `Inspect.Any` renders it
+      ; identically. Declaration order is the contract.
+      (let [live-info (erlang/apply :Elixir.BeamLisp.Derived :__info__ (list :struct))
+            probe-info (erlang/apply derived-mod :__info__ (list :struct))]
+        (is (= live-info probe-info))
+        (is (= 3 (erlang/length probe-info)))
+        (is (= {:field :cell :default nil :required false} (Enum/at probe-info 0)))
+        (is (= {:field :deps :default nil :required false} (Enum/at probe-info 1)))
+        (is (= {:field :thunk :default nil :required false} (Enum/at probe-info 2))))
+      ; The pinned module's export surface is the file's defn plus the
+      ; synthesized pair and introspection — never more.
+      (is (= (Enum/sort (list (tuple :new 3) (tuple :__struct__ 0) (tuple :__struct__ 1)
+                              (tuple :__info__ 1) (tuple :module_info 0) (tuple :module_info 1)))
+             (Enum/sort (erlang/apply derived-mod :module_info (list :exports)))))
+      (is (= "%BeamLisp.HostDerivedProbe{cell: 1, deps: 2, thunk: 3}"
+             (Kernel/inspect (erlang/apply derived-mod :new (list 1 2 3)))))
+      (File/rm_rf! dir))))
+
+; ── the Reactive ABI, diffed against the live module ──────────────────────
+
+; CHAIN: c over a, d over c. Each recomputes exactly once after a change, and
+; staleness propagates on demand. The derived dep is read through the module
+; under test — the same local recursion `dep-value` performs.
+(defn- chain-obs [mod]
+  (let [a (atom 1)
+        c-runs (atom 0)
+        d-runs (atom 0)
+        c (derive-of mod [a] (fn [] (swap! c-runs inc) (* 2 (BeamLisp.Refs/deref a))))
+        d (derive-of mod [c] (fn [] (swap! d-runs inc) (+ 100 (deref-of mod c))))
+        v1 (deref-of mod d)
+        v2 (deref-of mod d)
+        r1 (list @c-runs @d-runs)
+        _ (swap! a inc)
+        v3 (deref-of mod d)
+        v4 (deref-of mod d)
+        r2 (list @c-runs @d-runs)]
+    (list v1 v2 r1 v3 v4 r2)))
+
+; PULL: swapping a dependency must NOT run the thunk; only deref does.
+(defn- pull-obs [mod]
+  (let [a (atom 1)
+        runs (atom 0)
+        c (derive-of mod [a] (fn [] (swap! runs inc) (BeamLisp.Refs/deref a)))
+        _ (swap! a inc)
+        _ (swap! a inc)
+        _ (swap! a inc)
+        before @runs
+        v (deref-of mod c)
+        after @runs]
+    (list before v after)))
+
+; CONSTANT deps: a non-ref dep is returned as-is, and never counts as changed.
+(defn- constant-obs [mod]
+  (let [runs (atom 0)
+        c (derive-of mod [5 :k] (fn [] (swap! runs inc) :const))
+        v1 (deref-of mod c)
+        v2 (deref-of mod c)]
+    (list v1 v2 @runs)))
+
+; NORMALIZATION: a bl vector and an Erlang list of the same dep behave alike.
+(defn- normalization-obs [mod]
+  (let [a (atom 10)
+        from-vector (derive-of mod [a] (fn [] (* 3 (BeamLisp.Refs/deref a))))
+        from-list (derive-of mod (list a) (fn [] (* 3 (BeamLisp.Refs/deref a))))
+        v1 (deref-of mod from-vector)
+        v2 (deref-of mod from-list)
+        _ (swap! a inc)
+        v3 (deref-of mod from-vector)
+        v4 (deref-of mod from-list)]
+    (list v1 v2 v3 v4)))
+
+; ARITY: only a zero-arity function is a thunk; the guard's refusal is a
+; FunctionClauseError, and `deref` of a non-derived is too.
+(defn- arity-obs [mod]
+  (let [bad1 (raise-class (fn [] (derive-of mod [] (fn [x] x))))
+        bad2 (raise-class (fn [] (derive-of mod [] 7)))
+        good (derive-of mod [] (fn [] 1))
+        d1 (derived-of? mod good)
+        d2 (derived-of? mod (atom 1))
+        d3 (derived-of? mod 5)
+        d4 (derived-of? mod {:a 1})
+        d5 (derived-of? mod nil)
+        ; the Derived tag is the PUBLIC atom, so the OTHER module recognizes
+        ; a derived the probe built (and vice versa).
+        d6 (derived-of? live good)
+        bad3 (raise-class (fn [] (deref-of mod 5)))]
+    (list bad1 bad2 d1 d2 d3 d4 d5 d6 bad3)))
+
+; CONCURRENCY: many processes deref one already-fresh derived; none re-runs the
+; thunk and all see the same value.
+(defn- concurrency-obs [mod]
+  (let [a (atom 1)
+        runs (atom 0)
+        c (derive-of mod [a] (fn [] (swap! runs inc) (BeamLisp.Refs/deref a)))
+        _ (deref-of mod c)
+        tasks (vec (map (fn [_] (Task/async (fn [] (deref-of mod c)))) (range 50)))
+        results (map (fn [t] (Task/await t 5000)) tasks)]
+    (list (every? (fn [r] (erlang/== 1 r)) results) @runs)))
+
+; RETRY: the thunk re-enters `deref` on its own derived, so the outer
+; compare-exchange is made against a stale expectation and must re-read rather
+; than publish. Deterministic: the inner call wins the publish, the outer
+; converges on it. `calls` pins that the thunk ran exactly twice, once per
+; entry, and never again once the cell is fresh.
+(defn- retry-obs [mod]
+  (let [holder (atom nil)
+        calls (atom 0)
+        thunk (fn []
+                (swap! calls inc)
+                (if (erlang/== 1 @calls)
+                  (do (deref-of mod @holder) 99)
+                  42))
+        d (derive-of mod [] thunk)
+        _ (reset! holder d)
+        v1 (deref-of mod d)
+        c1 @calls
+        v2 (deref-of mod d)
+        c2 @calls]
+    (list v1 c1 v2 c2)))
+
+(deftest reactive-pinned-is-functions-only-and-matches-the-live-module
+  (testing "exact export surface, and probe answers equal the live module's"
+    (let [dir (tmp-dir)]
+      (compile-reactive dir)
+      (is (= :non_existing (erlang/apply :code :which (list reactive-shim))))
+      ; EXACTLY derive/2, deref/1, derived?/1 — the local `value`/`dep-value`
+      ; closures are NOT exports, and a functions-only file gains no struct
+      ; surface.
+      (is (= (Enum/sort (list (tuple :derive 2) (tuple :deref 1) (tuple :derived? 1)
+                              (tuple :module_info 0) (tuple :module_info 1)))
+             (Enum/sort (erlang/apply reactive-mod :module_info (list :exports)))))
+      (is (erlang/function_exported reactive-mod :derive 2))
+      (is (erlang/function_exported reactive-mod :deref 1))
+      (is (erlang/function_exported reactive-mod :derived? 1))
+      (is (not (erlang/function_exported reactive-mod :value 1)))
+      (is (not (erlang/function_exported reactive-mod :dep-value 1)))
+      (is (not (erlang/function_exported reactive-mod :__struct__ 0)))
+      (is (not (erlang/function_exported reactive-mod :__info__ 1)))
+      ; PINNED ANSWERS first — the ABI itself, not merely probe == live.
+      (is (= (list 102 102 (list 1 1) 104 104 (list 2 2)) (chain-obs reactive-mod)))
+      (is (= (list 0 4 1) (pull-obs reactive-mod)))
+      (is (= (list :const :const 1) (constant-obs reactive-mod)))
+      (is (= (list 30 30 33 33) (normalization-obs reactive-mod)))
+      (is (= (list :Elixir.FunctionClauseError :Elixir.FunctionClauseError
+                   true false false false false true
+                   :Elixir.FunctionClauseError)
+             (arity-obs reactive-mod)))
+      (is (= (list true 1) (concurrency-obs reactive-mod)))
+      ; And against the live module at the public ABI atom.
+      (is (= (chain-obs live) (chain-obs reactive-mod)))
+      (is (= (pull-obs live) (pull-obs reactive-mod)))
+      (is (= (constant-obs live) (constant-obs reactive-mod)))
+      (is (= (normalization-obs live) (normalization-obs reactive-mod)))
+      (is (= (arity-obs live) (arity-obs reactive-mod)))
+      (is (= (concurrency-obs live) (concurrency-obs reactive-mod)))
+      (is (= (retry-obs live) (retry-obs reactive-mod)))
+      (File/rm_rf! dir))))
+
+(deftest reactive-pinned-retry-converges
+  (testing "a stale compare-exchange re-reads instead of publishing"
+    (let [dir (tmp-dir)]
+      (compile-reactive dir)
+      (is (= (list 42 2 42 2) (retry-obs reactive-mod)))
+      (File/rm_rf! dir))))

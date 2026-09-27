@@ -209,6 +209,12 @@ defmodule BeamLisp.Bootstrap do
     #
     # Integrity (sha256) is verified regardless: a corrupt seed is fatal, a
     # merely-differently-keyed one is a valid bootstrap stage.
+    # THE HOST INVENTORY, validated before anything is copied: a current floor
+    # names its pinned hosts in `hosts`, an older one falls back to the prefix
+    # rule. Every name here is therefore a key in `modules` and is about to be
+    # SHA-checked like any other beam.
+    hosts = MapSet.new(host_names(manifest))
+
     Enum.each(manifest["modules"], fn {name, want_sha} ->
       src = Path.join(seed_dir, name)
       dst = Path.join(ebin, name)
@@ -221,7 +227,7 @@ defmodule BeamLisp.Bootstrap do
       # the stamp is unchanged. Copy on `sha256(dst) != want_sha` alone. The
       # fresh-genN+1 protection remains for the `Ns.*` shim/body/init unit,
       # whose rebuild the generation rule exists to preserve.
-      if host_leaf?(name) do
+      if MapSet.member?(hosts, name) do
         install_one(src, dst, want_sha)
       else
         maybe_install_one(src, dst, want_sha, expected_key(name))
@@ -309,14 +315,22 @@ defmodule BeamLisp.Bootstrap do
     # Host install is sha-authoritative — no key is computed on this path.
     ensure_tier_authority!(seed_dir, ebin, manifest)
 
-    manifest["modules"]
-    |> Enum.filter(fn {name, _} -> host_leaf?(name) end)
-    # Deterministic install order: the authority first, then by name. A map's
-    # own order is a property of its keys, not of the seed.
-    |> Enum.sort_by(fn {name, _} ->
+    # The host inventory is the MANIFEST's list (`host_names/1`), not a name
+    # prefix: an explicit `hosts` list can name a pinned leaf outside
+    # `Elixir.BeamLisp.*`. Validation has already proved every name is a key in
+    # `modules` and so will be SHA-checked below.
+    modules = manifest["modules"]
+
+    host_names(manifest)
+    # Deterministic install order: the authority first, then by name. The list
+    # itself is explicit; this makes the authority-first rule hold regardless of
+    # how the floor ordered it, because the authority must be on the code path
+    # before anything asks it a tier question.
+    |> Enum.sort_by(fn name ->
       {if(name == @tier_authority, do: 0, else: 1), name}
     end)
-    |> Enum.each(fn {name, want_sha} ->
+    |> Enum.each(fn name ->
+      want_sha = Map.fetch!(modules, name)
       src = Path.join(seed_dir, name)
       dst = Path.join(ebin, name)
       verify_seed_file!(src, name, want_sha)
@@ -438,18 +452,85 @@ defmodule BeamLisp.Bootstrap do
     end
   end
 
-  # A pinned HOST leaf: an `Elixir.BeamLisp.*` module that is NOT part of the
-  # namespace generation ladder (`Elixir.BeamLisp.Ns.*`). Host leaves are PINNED
-  # artifacts — their bytes ARE their identity, verified against the manifest
-  # sha256 — so the generation rule below does NOT apply to them. Editing a host
-  # `.bl` source that is not a hashed input changes the beam bytes WITHOUT
-  # rotating the tier key, and a destination carrying the (unchanged) current
-  # key would then be kept stale forever. `install_one/3` copies on sha drift
-  # and nothing else. The `Ns.*` shim/body/init unit keeps the generation rule,
-  # which protects a fresh gen-N+1 rebuild from being un-superseded.
+  # A pinned HOST leaf as the LEGACY name rule spells it: an `Elixir.BeamLisp.*`
+  # module that is NOT part of the namespace generation ladder
+  # (`Elixir.BeamLisp.Ns.*`). This is the FALLBACK for a floor built before the
+  # manifest carried an explicit `hosts` list; a current floor names its host
+  # beams in `hosts` and `host_names/1` selects from THAT (see below). Host leaves
+  # are PINNED artifacts — their bytes ARE their identity, verified against the
+  # manifest sha256 — so the generation rule below does NOT apply to them. Editing
+  # a host `.bl` source that is not a hashed input changes the beam bytes WITHOUT
+  # rotating the tier key, and a destination carrying the (unchanged) current key
+  # would then be kept stale forever. `install_one/3` copies on sha drift and
+  # nothing else. The `Ns.*` shim/body/init unit keeps the generation rule, which
+  # protects a fresh gen-N+1 rebuild from being un-superseded.
   defp host_leaf?(name) do
     String.starts_with?(name, "Elixir.BeamLisp.") and
       not String.starts_with?(name, "Elixir.BeamLisp.Ns.")
+  end
+
+  # The pinned host beams a floor carries, AS NAMED BY ITS MANIFEST.
+  #
+  # A manifest with an explicit `hosts` list is the AUTHORITY: host selection is
+  # membership in that list, not a name prefix, so a pinned leaf OUTSIDE
+  # `Elixir.BeamLisp.*` — `Elixir.Enumerable.BeamLisp.Set`, the protocol-impl
+  # module compiled beside its host source — can be staged. The list is validated
+  # against the manifest's `modules` BEFORE any byte is read, so every host is a
+  # beam this floor actually carries (and is therefore SHA-checked by the caller),
+  # none is part of the `Elixir.BeamLisp.Ns.*` generation ladder, and none is
+  # malformed or duplicated. A malformed inventory is a floor nobody can trust: it
+  # is REFUSED, never guessed around.
+  #
+  # An OLDER floor (built before this field existed) carries no `hosts` key: fall
+  # back to the prefix rule those floors were built under, so a committed seed
+  # from before the change stages exactly the beams it did before.
+  defp host_names(manifest) do
+    case manifest do
+      %{"hosts" => hosts} when is_list(hosts) ->
+        validate_hosts!(hosts, manifest)
+
+      %{"hosts" => other} ->
+        raise "beam-lisp bootstrap seed manifest's \"hosts\" is not a list: #{inspect(other)}"
+
+      _ ->
+        legacy_host_names(manifest)
+    end
+  end
+
+  defp legacy_host_names(manifest) do
+    manifest
+    |> Map.get("modules", %{})
+    |> Map.keys()
+    |> Enum.filter(&host_leaf?/1)
+  end
+
+  defp validate_hosts!(hosts, manifest) do
+    modules = Map.get(manifest, "modules", %{})
+
+    Enum.each(hosts, fn name ->
+      cond do
+        not is_binary(name) ->
+          raise "beam-lisp bootstrap seed manifest lists a malformed pinned host: #{inspect(name)}"
+
+        String.starts_with?(name, "Elixir.BeamLisp.Ns.") ->
+          raise "beam-lisp bootstrap seed manifest lists a generation-ladder module as a pinned host: #{name}"
+
+        Path.basename(name) != name or not String.ends_with?(name, ".beam") ->
+          raise "beam-lisp bootstrap seed manifest lists a malformed pinned host name: #{inspect(name)}"
+
+        not Map.has_key?(modules, name) ->
+          raise "beam-lisp bootstrap seed manifest lists pinned host #{name} absent from its \"modules\" map"
+
+        true ->
+          :ok
+      end
+    end)
+
+    if Enum.uniq(hosts) != hosts do
+      raise "beam-lisp bootstrap seed manifest lists a pinned host more than once"
+    end
+
+    hosts
   end
 
   # The seed is a FLOOR, never a ceiling: a destination beam stamped with the
