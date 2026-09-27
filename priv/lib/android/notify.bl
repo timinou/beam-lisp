@@ -1,0 +1,282 @@
+(ns android.notify
+  "Notifications on Android, as beam-lisp data — both directions.
+
+   POSTING. A notification is a map; posting it is one call:
+
+     (notify/channel! {:id \"people\" :name \"People\" :importance :high})
+     (notify/post! {:id 7 :channel \"people\" :title \"Rita wrote\"
+                    :text \"are you coming tonight?\"
+                    :style {:messaging {:self \"me\" :conversation \"Rita\"
+                                        :messages [{:from \"Rita\" :text \"are you coming?\" :at 1727370000000}]}}
+                    :actions [{:title \"Open\" :id :open} {:title \"Later\" :id :later}]})
+     (notify/cancel! 7)
+
+   Tapping the notification or one of its actions sends the event
+   `[:android :notify/action {\"notification\" 7 \"action\" \"open\"}]`
+   (see `android.events`).
+
+   LISTENING. With the listener granted (`(notify/listener-granted?)`, grant
+   with `(notify/request-listener!)` or `bl android grant listener`), every
+   notification from EVERY app arrives as an event:
+
+     (events/subscribe! :notify)
+     (receive [:android :notify/posted n] …)   ; n: {\"package\" \"title\" \"text\" \"messages\" …}
+
+   and the shade can be read and acted on:
+
+     (notify/active)                      ; vector of maps, every app's notifications
+     (notify/act! key 0)                  ; fire action 0
+     (notify/reply! key \"on my way\")      ; inline reply (RemoteInput)
+     (notify/dismiss! key) (notify/open! key)
+
+   Everything here is built on `android.jvm`; nothing is special-cased in Kotlin
+   except the listener service and the action receiver the OS must instantiate."
+  (:require [android.jvm :as jvm]
+            [bl.json :as json]))
+
+(def ^:private listener-class "io.beamlisp.android.BlNotificationListener")
+
+(def importance
+  "Channel importance by name → NotificationManager.IMPORTANCE_*."
+  {:none 0 :min 1 :low 2 :default 3 :high 4 :max 5})
+
+(def priority
+  "Pre-O priority by name → Notification.PRIORITY_*."
+  {:min -2 :low -1 :default 0 :high 1 :max 2})
+
+(def categories
+  {:message "msg" :email "email" :call "call" :alarm "alarm" :reminder "reminder"
+   :event "event" :progress "progress" :social "social" :status "status"
+   :recommendation "recommendation" :service "service" :error "err" :navigation "navigation"})
+
+;; ── the manager ─────────────────────────────────────────────────────────
+
+(defn manager [] (jvm/service "notification"))
+
+(defn- pkg [] (jvm/call (jvm/ctx) :get-package-name))
+
+;; ── permission ──────────────────────────────────────────────────────────
+
+(defn permitted?
+  "May this app post notifications? (POST_NOTIFICATIONS on API 33+.)"
+  []
+  (jvm/call (manager) :are-notifications-enabled))
+
+(defn request-permission!
+  "Ask the user for POST_NOTIFICATIONS (API 33+). The answer arrives later;
+   poll `permitted?`. Returns false when there is no Activity to ask from."
+  []
+  (if-let [a (jvm/activity)]
+    (do (jvm/call-ui a :request-permissions ["android.permission.POST_NOTIFICATIONS"] 7401) true)
+    false))
+
+;; ── channels ────────────────────────────────────────────────────────────
+
+(defn channel!
+  "Create or update a channel. `{:id :name :importance :description :vibrate?
+   :lights? :badge? :group}`. Idempotent — Android keeps the user's edits."
+  [{:keys [id name description] :as c}]
+  (let [imp (get importance (or (:importance c) :default) 3)
+        ch (jvm/new "android.app.NotificationChannel" id (or name id) imp)]
+    (when description (jvm/call ch :set-description description))
+    (when (contains? c :vibrate?) (jvm/call ch :enable-vibration (boolean (:vibrate? c))))
+    (when (contains? c :lights?) (jvm/call ch :enable-lights (boolean (:lights? c))))
+    (when (contains? c :badge?) (jvm/call ch :set-show-badge (boolean (:badge? c))))
+    (when (:group c) (jvm/call ch :set-group (:group c)))
+    (jvm/call (manager) :create-notification-channel ch)
+    (jvm/release ch)
+    id))
+
+(defn channels
+  "The app's channels as data: `[{:id :name :importance :description}]`."
+  []
+  (let [chs (jvm/call (manager) :get-notification-channels)]
+    (mapv (fn [ch]
+            (let [out {:id (jvm/call ch :get-id)
+                       :name (jvm/call ch :get-name)
+                       :importance (jvm/call ch :get-importance)
+                       :description (jvm/call ch :get-description)}]
+              (jvm/release ch)
+              out))
+          chs)))
+
+(defn delete-channel! [id] (jvm/call (manager) :delete-notification-channel id))
+
+;; ── building a Notification from a map ──────────────────────────────────
+
+(defn- icon-id
+  "A small icon resource: the app's own launcher icon unless `:icon` names an
+   android drawable (\"ic_dialog_info\", \"star_on\", …)."
+  [icon]
+  (if icon
+    (jvm/field "android.R$drawable" icon)
+    (jvm/field (jvm/call (jvm/ctx) :get-application-info) "icon")))
+
+(defn- pending-broadcast
+  "A PendingIntent that, when fired, makes the BlNotifyReceiver emit
+   `notify/action` with the notification id and action id."
+  [nid action-id request-code]
+  (let [ctx (jvm/ctx)
+        intent (jvm/new "android.content.Intent" "io.beamlisp.android.NOTIFY_ACTION")]
+    (jvm/call intent :set-package (pkg))
+    (jvm/call intent :put-extra "notification" (str nid))
+    (jvm/call intent :put-extra "action" (str action-id))
+    (let [pi (jvm/static "android.app.PendingIntent" :get-broadcast ctx request-code intent
+                         ;; FLAG_UPDATE_CURRENT | FLAG_MUTABLE (needed for RemoteInput)
+                         (erlang/bor 134217728 33554432))]
+      (jvm/release intent)
+      pi)))
+
+(defn- person [n]
+  (let [b (jvm/new "android.app.Person$Builder")]
+    (jvm/call b :set-name n)
+    (jvm/call b :build)))
+
+(defn- apply-style! [builder style]
+  (cond
+    (:big-text style)
+    (let [s (jvm/new "android.app.Notification$BigTextStyle")]
+      (jvm/call s :big-text (:big-text style))
+      (jvm/call builder :set-style s))
+
+    (:inbox style)
+    (let [s (jvm/new "android.app.Notification$InboxStyle")]
+      (doseq [line (:inbox style)] (jvm/call s :add-line line))
+      (jvm/call builder :set-style s))
+
+    (:messaging style)
+    (let [m (:messaging style)
+          s (jvm/new "android.app.Notification$MessagingStyle" (person (or (:self m) "me")))]
+      (when (:conversation m)
+        (jvm/call s :set-conversation-title (:conversation m))
+        (jvm/call s :set-group-conversation (boolean (:group? m))))
+      (doseq [msg (:messages m)]
+        (jvm/call s :add-message (:text msg) (jvm/long (or (:at msg) (erlang/system_time :millisecond)))
+                  (person (:from msg))))
+      (jvm/call builder :set-style s))
+
+    :else nil))
+
+(defn build
+  "A `Notification` handle from a map. See `post!` for the keys."
+  [n]
+  (let [ctx (jvm/ctx)
+        nid (:id n)
+        b (jvm/new "android.app.Notification$Builder" ctx (or (:channel n) "default"))]
+    (jvm/call b :set-small-icon (icon-id (:icon n)))
+    (when (:title n) (jvm/call b :set-content-title (:title n)))
+    (when (:text n) (jvm/call b :set-content-text (:text n)))
+    (when (:sub-text n) (jvm/call b :set-sub-text (:sub-text n)))
+    (when (:category n) (jvm/call b :set-category (get categories (:category n) (name (:category n)))))
+    (when (:group n) (jvm/call b :set-group (:group n)))
+    (when (:group-summary? n) (jvm/call b :set-group-summary true))
+    (when (:ongoing? n) (jvm/call b :set-ongoing true))
+    (when (:silent? n) (jvm/call b :set-silent true))
+    (when (:only-once? n) (jvm/call b :set-only-alert-once true))
+    (when (:color n) (jvm/call b :set-color (:color n)))
+    (when (:when n) (jvm/call b :set-when (jvm/long (:when n))))
+    (when (:progress n)
+      (let [[cur mx] (:progress n)] (jvm/call b :set-progress (or mx 100) (or cur 0) (nil? cur))))
+    (jvm/call b :set-auto-cancel (not= false (:auto-cancel? n)))
+    (when (:style n) (apply-style! b (:style n)))
+    ;; tapping the body is the action \"tap\"
+    (jvm/call b :set-content-intent (pending-broadcast nid "tap" (erlang/phash2 [nid "tap"])))
+    (doseq [[i a] (map-indexed (fn [i a] [i a]) (:actions n))]
+      (let [pi (pending-broadcast nid (name (:id a)) (erlang/phash2 [nid (:id a) i]))
+            ab (jvm/new "android.app.Notification$Action$Builder" (icon-id nil) (:title a) pi)]
+        (when (:reply? a)
+          (let [rib (jvm/new "android.app.RemoteInput$Builder" "bl_reply")]
+            (when (:placeholder a) (jvm/call rib :set-label (:placeholder a)))
+            (jvm/call ab :add-remote-input (jvm/call rib :build))))
+        (jvm/call b :add-action (jvm/call ab :build))))
+    (let [notif (jvm/call b :build)]
+      (jvm/release b)
+      notif)))
+
+(defn post!
+  "Post notification map `n`. Keys:
+
+     :id        integer, required — the same id replaces
+     :channel   channel id (create it first with `channel!`)
+     :title :text :sub-text
+     :icon      android drawable name (default: the app icon)
+     :category  :message :reminder :alarm … (see `categories`)
+     :style     {:big-text s} | {:inbox [lines]} |
+                {:messaging {:self :conversation :group? :messages [{:from :text :at}]}}
+     :actions   [{:id :title :reply? :placeholder}] — events notify/action
+     :progress  [current max] (current nil = indeterminate)
+     :group :group-summary? :ongoing? :silent? :only-once? :auto-cancel? :color :when
+
+   Returns the id."
+  [n]
+  (let [notif (build n)]
+    (if (:tag n)
+      (jvm/call (manager) :notify (:tag n) (:id n) notif)
+      (jvm/call (manager) :notify (:id n) notif))
+    (jvm/release notif)
+    (:id n)))
+
+(defn cancel! ([id] (jvm/call (manager) :cancel id) :ok)
+  ([tag id] (jvm/call (manager) :cancel tag id) :ok))
+
+(defn cancel-all! [] (jvm/call (manager) :cancel-all) :ok)
+
+(defn posted
+  "This app's own notifications that are showing: `[{:id :tag :key}]`."
+  []
+  (mapv (fn [sbn]
+          (let [out {:id (jvm/call sbn :get-id) :tag (jvm/call sbn :get-tag) :key (jvm/call sbn :get-key)}]
+            (jvm/release sbn)
+            out))
+        (jvm/call (manager) :get-active-notifications)))
+
+;; ── listening to every app ──────────────────────────────────────────────
+
+(defn listener-granted?
+  "Has the user granted notification access to this app?"
+  []
+  (let [cn (jvm/new "android.content.ComponentName" (jvm/ctx) listener-class)
+        ok (jvm/call (manager) :is-notification-listener-access-granted cn)]
+    (jvm/release cn)
+    ok))
+
+(defn listener-connected?
+  "Is the listener bound right now (granted AND the OS has connected it)?"
+  []
+  (jvm/static listener-class :connected))
+
+(defn request-listener!
+  "Open the system screen where the user grants notification access."
+  []
+  (let [i (jvm/new "android.content.Intent" "android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS")]
+    (jvm/call i :add-flags 268435456) ; FLAG_ACTIVITY_NEW_TASK
+    (jvm/call (jvm/ctx) :start-activity i)
+    (jvm/release i)
+    :ok))
+
+(defn- listener []
+  (or (jvm/static listener-class :get-instance)
+      (throw (ex-info "android.notify: the notification listener is not connected — grant access with (android.notify/request-listener!)"
+                      {:android/error :listener-not-connected}))))
+
+(defn active
+  "Every notification on the shade, from every app, as maps with string keys:
+   \"key\" \"package\" \"title\" \"text\" \"big-text\" \"lines\" \"messages\"
+   \"conversation\" \"category\" \"channel\" \"posted-at\" \"actions\" …"
+  []
+  (json/decode (jvm/call (listener) :active) {:keys :string}))
+
+(defn act! "Fire action `index` of notification `key`." [key index]
+  (jvm/call (listener) :act key index nil))
+
+(defn reply!
+  "Answer notification `key` inline, through its first reply-capable action."
+  [key text]
+  (let [actions (get (first (filter (fn [n] (= key (get n "key"))) (active))) "actions")
+        idx (first (keep-indexed (fn [i a] (when (get a "reply") i)) actions))]
+    (if (nil? idx)
+      false
+      (jvm/call (listener) :act key idx text))))
+
+(defn open! "Fire the notification's own content intent." [key] (jvm/call (listener) :open key))
+(defn dismiss! "Remove another app's notification from the shade." [key] (jvm/call (listener) :dismiss key) :ok)

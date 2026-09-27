@@ -1,0 +1,128 @@
+(ns android.events
+  "Everything the phone says, as messages.
+
+   The JVM side (services, overlays, proxies) sends `{android, Tag, Json}` to the
+   process registered as `android_events`. This namespace IS that process: it
+   decodes each message once and forwards it to every subscriber whose topic
+   matches, as
+
+     [:android topic payload]        ; topic a keyword, payload a map (string keys)
+
+   Topics are the JVM tags as keywords: `:notify/posted`, `:notify/removed`,
+   `:reader/event`, `:overlay/tap`, `:proxy`, … A subscription names a topic, a
+   namespace (`:notify` matches every `:notify/*`), or `:all`.
+
+     (events/start!)                    ; idempotent; android.app does it at boot
+     (events/subscribe! :notify)        ; this process now receives notify events
+     (receive [:android :notify/posted n] (println (get n \"title\")))
+
+   A subscriber that dies is dropped. `recent` keeps the last 200 events for the
+   desk to inspect (`bl android eval '(android.events/recent 5)'`)."
+  (:require [bl.json :as json]))
+
+(def ^:private keep-last 200)
+
+(defn- topic-of [tag] (keyword tag))
+
+(defn- matches? [sub topic]
+  (or (= sub :all)
+      (= sub topic)
+      (and (nil? (namespace sub)) (= (name sub) (namespace topic)))))
+
+(defn- deliver [state tag payload]
+  (let [topic (topic-of tag)
+        msg [:android topic payload]]
+    (doseq [[pid subs] (:subs state)]
+      (when (some (fn [s] (matches? s topic)) subs)
+        (erlang/send pid msg)))
+    (let [ev {:topic topic :payload payload :at (erlang/system_time :millisecond)}
+          r (conj (:recent state) ev)]
+      (assoc state :recent (if (> (count r) keep-last) (vec (drop 1 r)) r)))))
+
+(defn- loop-state [state]
+  (receive
+    [:android tag json]
+    (loop-state (deliver state tag (try (json/decode json {:keys :string})
+                                        (catch e {"raw" json}))))
+
+    [:subscribe pid topics]
+    (do (erlang/monitor :process pid)
+        (loop-state (update-in state [:subs pid] (fn [old] (vec (distinct (concat (or old []) topics)))))))
+
+    [:unsubscribe pid]
+    (loop-state (update state :subs dissoc pid))
+
+    [:DOWN _ :process pid _]
+    (loop-state (update state :subs dissoc pid))
+
+    [:recent from n]
+    (do (erlang/send from [:recent (let [r (:recent state)] (vec (drop (max 0 (- (count r) n)) r)))])
+        (loop-state state))
+
+    [:emit tag payload]
+    (loop-state (deliver state tag payload))))
+
+(defn- router
+  "The router's pid, or nil. `erlang:whereis/1` answers the ATOM `undefined`
+   for an unregistered name — truthy in beam-lisp — so it is normalised here."
+  []
+  (let [p (erlang/whereis :android_events)]
+    (if (erlang/is_pid p) p nil)))
+
+(defn running? [] (some? (router)))
+
+(defn start!
+  "Start the router and register it as `android_events`. Idempotent."
+  []
+  (if-let [p (router)]
+    p
+    (let [p (spawn (fn [] (loop-state {:subs {} :recent []})))
+          registered (try (erlang/register :android_events p) p
+                          (catch _ (erlang/exit p :kill) (router)))]
+      ;; events the JVM held while nothing listened (services start first)
+      (when (= true (bl_android_nif/attached))
+        (try (bl_android_nif/call (json/encode {"op" "static" "class" "io.beamlisp.android.BlBridge"
+                                                "method" "flush" "args" []}))
+             (catch _ nil)))
+      registered)))
+
+(defn subscribe!
+  "Deliver events on `topics` (keywords; `:notify`, `:notify/posted`, `:all`)
+   to `pid` (default: the caller)."
+  ([topics] (subscribe! (erlang/self) topics))
+  ([pid topics]
+   (start!)
+   (erlang/send :android_events [:subscribe pid (if (keyword? topics) [topics] (vec topics))])
+   :ok))
+
+(defn unsubscribe! ([] (unsubscribe! (erlang/self)))
+  ([pid] (erlang/send :android_events [:unsubscribe pid]) :ok))
+
+(defn emit!
+  "Inject an event as if the JVM had sent it — how tests and the desk simulate
+   the phone. `payload` is a map with string keys."
+  [tag payload]
+  (start!)
+  (erlang/send :android_events [:emit (if (keyword? tag) (str tag) tag) payload])
+  :ok)
+
+(defn recent
+  "The last `n` events (default 20), oldest first: `{:topic :payload :at}`."
+  ([] (recent 20))
+  ([n]
+   (start!)
+   (erlang/send :android_events [:recent (erlang/self) n])
+   (receive [:recent evs] evs (after 2000 []))))
+
+(defn await-event
+  "Block until an event on `topic` whose payload satisfies `pred` arrives, or
+   `timeout-ms` passes (nil). Subscribes the caller for the duration."
+  ([topic timeout-ms] (await-event topic (fn [_] true) timeout-ms))
+  ([topic pred timeout-ms]
+   (subscribe! [topic])
+   (let [deadline (+ (erlang/monotonic_time :millisecond) timeout-ms)]
+     (loop []
+       (let [left (max 0 (- deadline (erlang/monotonic_time :millisecond)))]
+         (receive
+           [:android t p] (if (and (matches? topic t) (pred p)) p (recur))
+           (after left nil)))))))
