@@ -150,6 +150,12 @@ worst kind of configuration bug.
   measured from those two directories, never declared — coverage, the gap, the
   token escapes, the unlabelled inputs. See [tooling/catalog](../../priv/lib/tooling/catalog.bl)
   and the session dashboard's Catalog pane.
+- `:android` — `{:app :ns :id :label :abi}`: this tree is an Android app.
+  `:app` is its OTP application name (lowercase, underscores), `:ns` the
+  namespace whose `navigation`/`on-start` boot it (default `<app>.app`), `:id`
+  the Android application id (default `org.beamlisp.<app>`), `:label` the
+  launcher name, `:abi` the one ABI built (default `x86_64`, the emulator's).
+  See [android](android.bl.md).
 
 Every normalizer is total: it returns what it understood plus one error string
 per thing it could not. `normalize` collects them, so a file with three
@@ -157,7 +163,7 @@ problems reports all three in one pass.
 
 ```beam-lisp silent
 (def known-keys [:name :instance :bl :paths :tasks :ports :schedules :env :doc
-                 :app :build :release :deps :browser :catalog])
+                 :app :build :release :deps :browser :catalog :android])
 
 (defn- unknown-keys
   "The keys of `m` that nothing declares."
@@ -488,6 +494,30 @@ problems reports all three in one pass.
            nil)
          errs])))
 
+(defn- norm-android
+  "`:android` — an Android app. `:app` is required; everything else defaults
+   from it, so the smallest declaration is `{:app \"people\"}`."
+  [v]
+  (cond
+    (nil? v) [nil []]
+    (not (map? v)) [nil [":android must be a map"]]
+    :else
+      (let [app (:app v)
+            errs (concat
+                   (if (string? app) [] [":android needs :app, a string"])
+                   (keep (fn [k] (when (and (some? (get v k)) (not (string? (get v k))))
+                                   (str ":android " k " must be a string")))
+                         [:ns :id :label :abi])
+                   (unknown-errs v [:app :ns :id :label :abi] ":android"))]
+        (if (empty? errs)
+          [{:app app
+            :ns (or (:ns v) (str app ".app"))
+            :id (or (:id v) (str "org.beamlisp." app))
+            :label (:label v)
+            :abi (or (:abi v) "x86_64")}
+           []]
+          [nil errs]))))
+
 (defn- norm-deps
   "`:deps` — the libraries this tree requires, as a list of `{:name :vsn}`. A
    digest does not belong here: digests are what RESOLUTION produced, and they
@@ -625,7 +655,8 @@ shape, whatever the file said.
         [rel rerr]     (norm-release (:release m) root)
         [deps derr]    (norm-deps (:deps m))
         [brw brerr]    (norm-browser (:browser m))
-        [cat cerr]     (norm-catalog (:catalog m) root)]
+        [cat cerr]     (norm-catalog (:catalog m) root)
+        [andr anderr]  (norm-android (:android m))]
     {:path path
      :root root
      :name (if (string? nm) nm nil)
@@ -642,8 +673,9 @@ shape, whatever the file said.
      :deps deps
      :browser brw
      :catalog cat
+     :android andr
      :errors (concat perr nerr ierr blerr terr porerr serr eerr aerr berr rerr derr
-                     brerr cerr
+                     brerr cerr anderr
                      (map (fn [k] (str "unknown key " k)) (unknown-keys m known-keys)))}))
 
 (defn empty-project
@@ -652,7 +684,7 @@ shape, whatever the file said.
   [root]
   {:path nil :root root :name nil :instance nil :bl nil :paths [] :tasks {} :ports {}
    :schedules []
-   :env {} :app nil :build nil :release nil :deps [] :browser nil :catalog nil
+   :env {} :app nil :build nil :release nil :deps [] :browser nil :catalog nil :android nil
    :errors []})
 ```
 
