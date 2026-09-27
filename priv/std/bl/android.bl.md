@@ -641,16 +641,38 @@ messages the app sends itself, across a cable.
 (defn rpc [t m f args]
   (rpc/call (node-name t) m f (apply list args) 120000))
 
-(defn up [t _st]
+(defn grants [t]
+  (let [id (:id t) pkg "io.beamlisp.android."]
+    {"notify"   [["shell" "pm" "grant" id "android.permission.POST_NOTIFICATIONS"]]
+     "listener" [["shell" "cmd" "notification" "allow_listener" (str id "/" pkg "BlNotificationListener")]]
+     "reader"   [["shell" "settings" "put" "secure" "enabled_accessibility_services" (str id "/" pkg "BlReader")]
+                 ["shell" "settings" "put" "secure" "accessibility_enabled" "1"]]
+     "overlay"  [["shell" "appops" "set" id "SYSTEM_ALERT_WINDOW" "allow"]]}))
+
+(defn- up-launch! [t]
   (sh "epmd" ["-daemon"])
   (adb! "reverse" "tcp:4369" "tcp:4369")
   (adb! "forward" (str "tcp:" dist-port) (str "tcp:" dist-port))
   (adb! "shell" "am" "force-stop" (:id t))
   (step! "launch" (adb) ["shell" "am" "start" "-n" (str (:id t) "/.MainActivity")
-                         "--ei" "mob_dist_port" (str dist-port) "--es" "mob_node_suffix" "emu"] {})
+                         "--ei" "mob_dist_port" (str dist-port) "--es" "mob_node_suffix" "emu"] {}))
+
+(defn- granted-reader? [t]
+  (includes? (str (:out (adb! "shell" "settings" "get" "secure" "enabled_accessibility_services")))
+             (str (:id t) "/io.beamlisp.android.BlReader")))
+
+(defn up [t _st]
+  ; Force-stopping an app drops it from the enabled accessibility services
+  ; (measured: the setting reads `null` afterwards), so a reader granted
+  ; before the restart is granted again after it.
+  (let [reader? (granted-reader? t)]
+    (up-launch! t)
+    (when reader? (doseq [c (get (grants t) "reader")] (apply adb! c))))
   (if (connect! t)
     (do (println (str "  ✓ " (node-name t) " — bl android eval EXPR")) 0)
     (do (u/io-err (str "bl android: " (node-name t) " never came up — bl android logs")) 1)))
+
+
 
 (defn eval [t exprs st]
   (if (not (connect! t))
@@ -668,14 +690,6 @@ over apps — are grants a person makes in Settings. On a development device the
 shell can make them directly, so a test never taps through Settings.
 
 ```beam-lisp
-(defn grants [t]
-  (let [id (:id t) pkg "io.beamlisp.android."]
-    {"notify"   [["shell" "pm" "grant" id "android.permission.POST_NOTIFICATIONS"]]
-     "listener" [["shell" "cmd" "notification" "allow_listener" (str id "/" pkg "BlNotificationListener")]]
-     "reader"   [["shell" "settings" "put" "secure" "enabled_accessibility_services" (str id "/" pkg "BlReader")]
-                 ["shell" "settings" "put" "secure" "accessibility_enabled" "1"]]
-     "overlay"  [["shell" "appops" "set" id "SYSTEM_ALERT_WINDOW" "allow"]]}))
-
 (defn grant [t whats _st]
   (let [g (grants t)
         ws (if (or (empty? whats) (= ["all"] (vec whats))) (sort (keys g)) whats)]
