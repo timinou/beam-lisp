@@ -1,0 +1,272 @@
+; host/web_socket.bl — the pinned HOST MODULE for `Elixir.BeamLisp.WebSocket`.
+;
+; The runtime side of pure-beam-lisp WebSockets. OTP (and `WebSock`) require a
+; *module* implementing the `WebSock` behaviour; a websocket handler cannot be a
+; bare function. This ONE module implements the behaviour and delegates every
+; callback to plain beam-lisp functions carried in the socket state, so the app
+; stays 100% beam-lisp: it hands the adapter a map of bl functions
+; (`init` / `handle-in` / `handle-info` / `terminate`) and this module translates
+; between WebSock's frame tuples and the bl world.
+;
+; This is the `.bl` port of `lib/beam_lisp/web_socket.ex`'s
+; `BeamLisp.WebSocket`, compiled FUNCTIONS-ONLY by
+; `BeamLisp.AOT/compile_host_file` into `Elixir.BeamLisp.WebSocket.beam`. ABI
+; parity is the contract: the same answers, the same value shapes, and the same
+; exception class as the Elixir module it stands in for.
+;
+;   * `init/1`, `handle_in/2`, `handle_info/2` look up a handler by its
+;     NORMALIZED string key, invoke it through `BeamLisp.Ns.Rt/invoke`, and lower
+;     the bl result to a WebSock tuple. A missing handler is `{:ok, wrap}` — the
+;     connection stays open.
+;   * `terminate/2` runs the `terminate` handler if present; the WebSock contract
+;     ignores its value, so it is `:ok` unless the handler returned a falsy value
+;     (which `&&` passed through unchanged in the Elixir original).
+;   * `wrap/2` builds the socket state from a bl handler map (normalizing every
+;     key to a string, because a hyphenated keyword crosses the atom-table
+;     boundary as either an atom or a binary) plus the caller's init state.
+;
+; RESULT LOWERING. The bl callbacks return a beam-lisp vector shaped like a
+; defserver return; `to-result` lowers it:
+;   [:ok state]                     -> {:ok, %{wrap | state: state}}
+;   [:push messages state]          -> {:push, msgs, %{wrap | state: state}}
+;   [:reply _term messages state]   -> {:push, msgs, %{wrap | state: state}}
+;   [:stop reason state]            -> {:stop, reason, %{wrap | state: state}}
+; A bare value (not a tagged vector) is treated as the new state (`:ok`), and the
+; tag may be an atom or a string. A frame is a 2-tuple `{opcode, payload}` on the
+; bl side and is kept as a `BeamLisp.Vector`; an outbound message is a
+; 2-element vector `[:text s]` lowered to WebSock's `{:text, s}` tuple, with the
+; operator atomized.
+;
+; NO keyword lookup on the state: `wrap` is an ordinary map, but a map LITERAL
+; whose key is a struct tag would dispatch through the struct/keyword protocol, so
+; every read goes through `maps/get` — plain capability, no dispatch.
+;
+; PUBLIC SURFACE. A pinned module has NO private functions — the emitter exports
+; every top-level `defn`, `defn-` included (measured) — so the helpers below are
+; top-level and become exported beside the five WebSock entry points. The
+; CONTRACT is the five (`init/1` `handle_in/2` `handle_info/2` `terminate/2`
+; `wrap/2`); the helpers are internal and named to make that plain. They share one
+; definition rather than being re-opened as closures inside each callback, which
+; is what keeps the lowering in ONE place instead of three.
+;
+; SELF-CALLS ARE MODULE-EXACT. The emitter retargets every call a pinned file
+; makes to its own namespace module onto whichever atom the file is compiled
+; into (measured: the probe beam answers `WsProbe.as-list/1`, never a lookup in
+; `host.web-socket`), so the helpers below need no namespace var and the beam
+; stands alone. The ONE reference that is not a call — the `Enum/map` mapper in
+; `normalize-msgs` — is written as a closure for exactly that reason.
+;
+; Run: bin/bl test test/bl/host_web_socket_test.bl
+
+(ns host.web-socket)
+
+(defn- host-mod
+  "The module this file was compiled into, read from a fun literal's own frame.
+   A pinned source cannot name its target atom — the caller chooses it at compile
+   time — so the exception a wrong-type argument raises names whichever atom this
+   beam answers at (the probe atom under test, the live atom in the seed)."
+  []
+  (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+
+(defn- fc-error
+  "Raise the `FunctionClauseError` a guard mismatch would raise, for the cases
+   where the Elixir reference refused an argument by clause rather than by value."
+  [function arity]
+  (erlang/error
+    (Elixir.FunctionClauseError/exception
+      (list (tuple :module (host-mod))
+            (tuple :function function)
+            (tuple :arity arity)))))
+
+(defn- as-list
+  "The value as a list: a `BeamLisp.Vector` walks its items, an Erlang list is
+   itself, anything else is returned unchanged so the caller can test it."
+  [x]
+  (cond
+    (vector? x) (BeamLisp.Vector/to_list x)
+    (erlang/is_list x) x
+    :else x))
+
+(defn- to-atom
+  "A frame operator as an atom: an atom is itself, a binary is interned. Any
+   other type is a clause error, exactly as the Elixir `atom/1` refused it."
+  [a]
+  (cond
+    (erlang/is_atom a) a
+    (erlang/is_binary a) (String/to_atom a)
+    :else (fc-error :to-atom 1)))
+
+(defn- frame-op?
+  "Whether `op` names a WebSock frame operator — atom or string form. The
+   reference guard accepted `:text`/`:binary`/`:ping`/`:pong` and the same four
+   as binaries; a two-element message starting with one of them is ONE frame,
+   not a list of two."
+  [op]
+  (or (= op :text) (= op :binary) (= op :ping) (= op :pong)
+      (= op "text") (= op "binary") (= op "ping") (= op "pong")))
+
+(defn- normalize-msg
+  "One bl message vector `[:text s]` lowered to WebSock's `{:text, s}` tuple.
+   A 2-element list is a tagged frame (the operator atomized); anything else is
+   returned as the `as-list` produced it — the reference's `other` clause."
+  [msg]
+  (let [l (as-list msg)]
+    (if (and (erlang/is_list l) (= 2 (count l)))
+      (tuple (to-atom (first l)) (second l))
+      l)))
+
+(defn- normalize-msgs
+  "A push's messages as a list of WebSock frame tuples. A single 2-element frame
+   vector (`[:text s]`) is wrapped into a one-element list; anything else is
+   mapped message by message. `Enum/map` — the Elixir list builder — so the
+   result is an Erlang list, never a lazy seq.
+
+   THE MAPPER IS A CLOSURE, NEVER THE BARE SYMBOL, and that is load-bearing.
+   The emitter makes a pinned file's self-references module-exact by retargeting
+   the `:remote` calls that name the source's own namespace module; a bare
+   symbol in VALUE position is not a call, so it compiles to
+   `Env/fetch!(\"host.web-socket\", \"normalize-msg\")` — a var lookup in a
+   namespace the pinned beam does not carry. It answered only because the
+   compile itself interns that namespace beside the beam, so the pinned module
+   worked in the compiler's VM and nowhere else. Wrapped in a closure the
+   reference is a CALL again: it compiles to `:remote` on this file's own
+   module, which the emitter points at whichever atom the file was compiled
+   into — the probe atom under test, the live atom in the seed."
+  [msgs]
+  (let [l (as-list msgs)]
+    (if (and (erlang/is_list l) (= 2 (count l)) (frame-op? (first l)))
+      (list (normalize-msg (list (first l) (second l))))
+      (Enum/map l (fn [m] (normalize-msg m))))))
+
+(defn- put-state
+  "The wrap map with `state` replaced."
+  [w state]
+  (maps/put :state state w))
+
+(defn- tag?
+  "The result vector's operator equals `a` (atom tag) or `s` (string tag)."
+  [h a s]
+  (or (= h a) (= h s)))
+
+(defn- to-result
+  "Lower a bl handler result to the exact WebSock return tuple, replacing the
+   wrap's `:state` with the result's carried state. A shape that matches no tag
+   clause makes the WHOLE result the new state (`{:ok, wrap}`)."
+  [result w]
+  (let [l (as-list result)]
+    (if (erlang/is_list l)
+      (let [n (count l)
+            h (first l)]
+        (cond
+          (and (= 2 n) (tag? h :ok "ok"))
+          (tuple :ok (put-state w (second l)))
+
+          (and (= 3 n) (tag? h :push "push"))
+          (tuple :push (normalize-msgs (second l)) (put-state w (nth l 2)))
+
+          (and (= 4 n) (tag? h :reply "reply"))
+          (tuple :push (normalize-msgs (nth l 2)) (put-state w (nth l 3)))
+
+          (and (= 3 n) (tag? h :stop "stop"))
+          (tuple :stop (to-atom (second l)) (put-state w (nth l 2)))
+
+          :else
+          (tuple :ok (put-state w result))))
+      (tuple :ok (put-state w result)))))
+
+(defn- frame-opcode
+  "The opcode out of a WebSock inbound frame `{payload, [opcode: opcode]}`, or a
+   clause error when the frame is not that exact shape — the reference head
+   pattern matched it structurally."
+  [frame]
+  (if (and (erlang/is_tuple frame)
+           (= 2 (erlang/tuple_size frame))
+           (erlang/is_list (erlang/element 2 frame))
+           (= 1 (count (erlang/element 2 frame))))
+    (let [op (first (erlang/element 2 frame))]
+      (if (and (erlang/is_tuple op)
+               (= 2 (erlang/tuple_size op))
+               (= :opcode (erlang/element 1 op)))
+        (erlang/element 2 op)
+        (fc-error :handle_in 2)))
+    (fc-error :handle_in 2)))
+
+(defn- handlers-of
+  "The handler map out of a wrap state, or the clause error the reference's
+   `%{handlers: handlers} = wrap` head raised when the state was not that map.
+   The key must be PRESENT; a present `nil` value is passed through, so the
+   callback's own `maps/get` refuses it exactly as `Map.get(nil, …)` did."
+  [w function arity]
+  (if (and (erlang/is_map w) (erlang/is_map_key :handlers w))
+    (maps/get :handlers w)
+    (fc-error function arity)))
+
+(defn init
+  "WebSock `init/1`: run the `init` handler over the user state, or keep the
+   state unchanged when there is none."
+  [w]
+  (let [handlers (handlers-of w :init 1)
+        f (maps/get "init" handlers nil)]
+    (if (nil? f)
+      (tuple :ok w)
+      (to-result (BeamLisp.Ns.Rt/invoke f (list (maps/get :state w))) w))))
+
+(defn handle_in
+  "WebSock `handle_in/2`: hand the bl `handle-in` handler an inbound frame as a
+   `BeamLisp.Vector` `[opcode payload]` plus the current state."
+  [frame w]
+  (let [opcode (frame-opcode frame)
+        payload (erlang/element 1 frame)
+        fv (BeamLisp.Vector/new (list opcode payload))
+        handlers (handlers-of w :handle_in 2)
+        f (maps/get "handle-in" handlers nil)]
+    (if (nil? f)
+      (tuple :ok w)
+      (to-result (BeamLisp.Ns.Rt/invoke f (list fv (maps/get :state w))) w))))
+
+(defn handle_info
+  "WebSock `handle_info/2`: hand the bl `handle-info` handler an Erlang message
+   plus the current state."
+  [msg w]
+  (let [handlers (handlers-of w :handle_info 2)
+        f (maps/get "handle-info" handlers nil)]
+    (if (nil? f)
+      (tuple :ok w)
+      (to-result (BeamLisp.Ns.Rt/invoke f (list msg (maps/get :state w))) w))))
+
+(defn terminate
+  "WebSock `terminate/2`: run the `terminate` handler if present. Its value is
+   ignored — `:ok` — unless the handler returned a falsy value, which `&& :ok`
+   passed through unchanged in the Elixir original."
+  [reason w]
+  (let [handlers (handlers-of w :terminate 2)
+        f (maps/get "terminate" handlers nil)]
+    (if (nil? f)
+      :ok
+      (let [r (BeamLisp.Ns.Rt/invoke f (list reason (maps/get :state w)))]
+        (if r :ok r)))))
+
+(defn- struct?
+  "Elixir's `is_struct/1`: a map tagged with an atom `:__struct__`."
+  [m]
+  (and (erlang/is_map m)
+       (erlang/is_map_key :__struct__ m)
+       (erlang/is_atom (erlang/map_get :__struct__ m))))
+
+(defn wrap
+  "Build the adapter's initial state from a bl handler map and a user init
+   argument. Used by the `web` bl namespace at upgrade time.
+
+   Every key is normalized to a string: a single-word `:init` interns as the
+   atom `:init`, but a hyphenated `:handle-in` may cross as the string
+   \"handle-in\", so the callback lookups (`\"handle-in\"`) are uniform however
+   the key arrived. A non-map, or a struct, is refused with `FunctionClauseError`
+   as the reference guard refused it."
+  [handlers user-state]
+  (if (and (erlang/is_map handlers) (not (struct? handlers)))
+    (let [normalized (reduce (fn [acc k]
+                               (maps/put (str k) (maps/get k handlers) acc))
+                             {}
+                             (maps/keys handlers))]
+      (maps/put :state user-state (maps/put :handlers normalized {})))
+    (fc-error :wrap 2)))
