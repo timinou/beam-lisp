@@ -234,4 +234,52 @@ defmodule BeamLisp.DepsCompileTest do
     # the lock's version wins over the .app.src's, because the lock is the truth
     assert Enum.any?(props, fn {k, v} -> k == :vsn and to_string(v) == "0.2.0" end)
   end
+
+  # mob's shape: a mix project whose NIF stub lives in src/, which Mix compiles
+  # before lib/ for every project. The Elixir side reads it AT COMPILE TIME, so
+  # the order is observable, not just the presence.
+  @mixed_pkg [
+    {"mix.exs",
+     """
+     defmodule DepsCompileMixed.MixProject do
+       use Mix.Project
+       def project, do: [app: :mixed, version: "0.3.0"]
+     end
+     """},
+    {"src/mixed_nif.erl", "-module(mixed_nif).\n-export([platform/0]).\nplatform() -> desk.\n"},
+    {"lib/mixed.ex", "defmodule Mixed do\n  @p :mixed_nif.platform()\n  def platform, do: @p\nend\n"}
+  ]
+
+  test "a mix package's src/*.erl compiles too, before lib/", %{cache: cache} do
+    d = sha("e")
+    store_package!(cache, "mixed", "0.3.0", d, @mixed_pkg)
+
+    proj = Path.join(cache, "proj4")
+    File.mkdir_p!(proj)
+    lock!(proj, [{"mixed", "0.3.0", d}])
+
+    r = compile!(proj)
+    assert r.ok?, "mixed package refused: #{inspect(r.results)}"
+    assert r.by_name["mixed"][:modules] == 2
+
+    rt = call("deps-compile", "runtime-tag", [])
+    app_dir = Path.join([cache, "beam_lisp", "ebin", "mixed-0.3.0-#{String.slice(d, 0, 8)}-#{rt}"])
+    assert File.exists?(Path.join(app_dir, "ebin/mixed_nif.beam"))
+    assert File.exists?(Path.join(app_dir, "ebin/Elixir.Mixed.beam"))
+
+    assert {:ok, [{:application, :mixed, props}]} =
+             :file.consult(String.to_charlist(Path.join(app_dir, "ebin/mixed.app")))
+    assert Enum.sort(props[:modules]) == Enum.sort([Mixed, :mixed_nif])
+  end
+
+  test "test tooling in lib/ is skipped only where ExUnit is absent", %{cache: cache} do
+    kase = Path.join(cache, "case.ex")
+    plain = Path.join(cache, "plain.ex")
+    File.write!(kase, "defmodule C do\n  use ExUnit.CaseTemplate\nend\n")
+    File.write!(plain, "defmodule P do\n  def x, do: :ExUnit\nend\n")
+
+    assert call("deps-compile", "test-support?", [kase, false]) == true
+    assert call("deps-compile", "test-support?", [kase, true]) == false
+    assert call("deps-compile", "test-support?", [plain, false]) == false
+  end
 end
