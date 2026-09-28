@@ -1,6 +1,10 @@
 # Mirror and reconcile — keeping a remote tree, and turning it into work
 
-Status: design of record, 2026-09-22. Written for the first consumer — knowledger
+Status: design of record, 2026-09-22. **Amended 2026-09-28** by
+`entities-and-projections.md` (agreed cutover): identity is
+`[provider namespace remote-id]` (§1.2's `[:google account-id file-id]` is
+superseded), the cursor is per feed, and the reconcile clause of §4 takes a
+`:projection` — consumers no longer write `:sync/*` rows or OWED/STALE by hand. Written for the first consumer — knowledger
 libraries that auto-sync from a Google Drive folder — but everything here is
 generic: nothing below names knowledger, and only §2 names Google.
 
