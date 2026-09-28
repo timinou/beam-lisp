@@ -1,0 +1,134 @@
+; datom/reconcile.bl — the projection EXECUTOR: owed and stale in, targets and
+; records out, bounded concurrency, honest about what failed and why.
+;
+; Design: docs/connectors/entities-and-projections.md §3.5 (laws L4–L6).
+;
+; ── Why a function and not (yet) a defserver clause ─────────────────────────
+;
+; PLAN-151 P6 sketched `(reconcile {…})` as a `proc` clause. The work itself —
+; read owed, apply with bounded concurrency, record target-first — does not
+; need a process; what needs one is WHEN it runs (a tick, a watch, a button).
+; So the algorithm is this pure-ish function over a conn, testable without a
+; VM process, and the host decides the trigger: knowledger drives it from its
+; own server beside the keep (one tick does keep-step then drain), and a
+; `reconcile` clause can wrap it later without changing it. One algorithm, any
+; trigger.
+;
+; ── The contract with the consumer ──────────────────────────────────────────
+;
+;   :apply   (fn [row prev-target] → {:target t} | {:skip reason} ; or THROW)
+;            row = {:scope :src :rev :src-key :scope-key}. A THROW (or an
+;            {:error …} return) is TRANSIENT: nothing is recorded, the row stays
+;            owed and is retried on the next drain — an outage cannot suppress
+;            a revision. {:skip reason} is TERMINAL: recorded, answers this
+;            revision until it changes, keeps the previous target.
+;   :retire  (fn [row target] → any ; or THROW = retried next drain)
+;
+; L4: an INTENT record (:pending) is written before apply; the consumer's apply
+; writes the TARGET; this writes the ANSWER after it returns. A crash between
+; the two leaves the row owed (pending answers nothing) AND visible to stale if
+; the source leaves meanwhile; apply must therefore be idempotent on (src, rev)
+; — re-applying the same bytes is a no-op upsert — and retire must tolerate a
+; target it may never have written.
+;
+; ── Performance ─────────────────────────────────────────────────────────────
+;
+; Owed and stale are ONE query each per scope per drain. Applies run with
+; `:concurrency` (default 4) through Task.async_stream — network-bound work
+; (downloads) overlaps; records are written by the caller's process in one
+; transaction per BATCH of results, not one per row.
+
+(ns datom.reconcile
+  (:require [datom] [datom.projection :as pj]))
+
+(def ^:private T (erlang/binary_to_atom "Elixir.Task"))
+
+(defn- key-of [db e]
+  (let [ds (into [] (datom/datoms db :eavt e :conn/key))]
+    (if (empty? ds) nil (nth (first ds) 2))))
+
+(defn- run-concurrently
+  "Apply `f` to every x with at most `n` in flight; results in input order.
+   A crashed or timed-out task yields {:error …} for its row, never a crash
+   of the drain."
+  [n timeout-ms f xs]
+  (if (empty? xs) []
+    (let [st (erlang/apply T :async_stream
+                           (list (to-list xs)
+                                 (fn [x] (try (f x) (catch e {:error (str e)})))
+                                 (to-list [(tuple :max_concurrency n) (tuple :timeout timeout-ms)
+                                           (tuple :on_timeout :kill_task) (tuple :ordered true)])))]
+      (mapv (fn [r] (if (= :ok (erlang/element 1 r)) (erlang/element 2 r)
+                      {:error (str "task " (erlang/element 2 r))}))
+            (Enum/to_list st)))))
+
+(defn drain!
+  "One drain of projection `p` for `scope` over `conn`:
+     1. stale → :retire, then retire-tx (unless `:paused?` — a paused scope
+        retires NOTHING; its stale rows wait);
+     2. owed  → :apply with bounded concurrency, then record-tx per answer.
+   opts {:rules :scope-key :apply :retire :concurrency 4 :timeout-ms 300000
+         :paused? false :limit nil}. `:limit` bounds the owed rows applied in
+   one drain (the rest stay owed) so a first sync of 10 000 files progresses
+   in visible steps. → {:applied n :skipped n :failed n :retired n
+   :owed-left n :errors [{:src-key :error} …] :ms n}"
+  [conn p scope opts]
+  (let [t0 (erlang/monotonic_time :millisecond)
+        rules (get opts :rules [])
+        sk (:scope-key opts)
+        db (datom/db conn)
+        stale (if (:paused? opts) [] (into [] (pj/stale p db rules scope)))
+        retired (reduce (fn [n [rec src]]
+                          (let [target (:proj/target (datom/pull db [:proj/target] rec))
+                                row {:scope scope :src src :src-key (key-of db src) :scope-key sk}
+                                ok (try ((:retire opts) row target) true (catch e false))]
+                            (if ok (do (datom/transact! conn (pj/retire-tx rec)) (+ n 1)) n)))
+                        0 stale)
+        db (datom/db conn)
+        owed-all (into [] (sort-by (fn [r] (str (nth r 1))) (pj/owed p db rules scope)))
+        owed (if (some? (:limit opts)) (into [] (take (:limit opts) owed-all)) owed-all)
+        rows (mapv (fn [[sc src rev]]
+                     (let [k (key-of db src)
+                           prev (pj/record p db sk k)]
+                       {:scope sc :src src :rev rev :src-key k :scope-key sk
+                        :prev (:proj/target prev)}))
+                   owed)
+        ;; INTENT first (L4): a :pending record per row, so an apply that
+        ;; writes its target and then dies leaves something STALE can find
+        ;; if the source leaves before the retry. It keeps any previous
+        ;; target (record-tx without :target does not touch it).
+        _ (doseq [row rows]
+            (datom/transact! conn (pj/record-tx p row {:state :pending})))
+        results (run-concurrently (get opts :concurrency 4) (get opts :timeout-ms 300000)
+                                  (fn [row] ((:apply opts) (dissoc row :prev) (:prev row)))
+                                  rows)
+        pairs (map (fn [a b] [a b]) rows results)
+        answers (filter (fn [[_ r]] (or (contains? r :target) (contains? r :skip))) pairs)
+        errors (filter (fn [[_ r]] (not (or (contains? r :target) (contains? r :skip)))) pairs)]
+    ;; records AFTER targets (L4), batched: one transaction per answer keeps
+    ;; each record's tempid local; batching them would share -1.
+    (doseq [[row r] answers]
+      (datom/transact! conn
+        (pj/record-tx p row (if (contains? r :target)
+                              {:state :applied :target (:target r)}
+                              {:state :skipped :reason (str (:skip r))}))))
+    {:applied (count (filter (fn [[_ r]] (contains? r :target)) answers))
+     :skipped (count (filter (fn [[_ r]] (contains? r :skip)) answers))
+     :failed (count errors)
+     :retired retired
+     :owed-left (- (count owed-all) (count answers))
+     :errors (mapv (fn [[row r]] {:src-key (:src-key row) :error (get r :error r)}) errors)
+     :ms (- (erlang/monotonic_time :millisecond) t0)}))
+
+(defn status
+  "What a console shows for (projection, scope): owed and stale counts, records
+   by state, skip reasons with counts. Queries only."
+  [db p scope rules]
+  (let [skipped (into [] (datom/q '[:find ?r ?e :in $ ?of ?scope
+                                    :where [?e :proj/of ?of] [?e :proj/scope ?scope]
+                                           [?e :proj/state :skipped] [?e :proj/reason ?r]]
+                                  db (:ident p) scope))]
+    {:owed (count (pj/owed p db rules scope))
+     :stale (count (pj/stale p db rules scope))
+     :records (pj/counts p db scope)
+     :skipped-by-reason (frequencies (map first skipped))}))
