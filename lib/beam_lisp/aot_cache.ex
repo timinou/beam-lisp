@@ -112,9 +112,10 @@ defmodule BeamLisp.AOTCache do
   # always claimed to be. For an image that ships no `.ex` (a release drop) the
   # digest is read from `priv/codegen.sources`, baked by the checkout whenever it
   # computes the key — see `codegen_part/0`. The pinned host leaves
-  # (`CompilerData`, `AtomGuard`, `Emit`, `Link`, `Tiers`) are the exception: their
-  # source moved to `priv/host/<leaf>.bl`, and `@pinned_host_sources` below is the
-  # table that says which module follows which leaf.
+  # (`CompilerData`, `AtomGuard`, `Emit`, `Link`, `Tiers`, `Record`) are the
+  # exception: their source moved to `priv/host/<leaf>.bl`, and
+  # `@pinned_host_sources` below is the table that says which module follows
+  # which leaf.
   #
   # `BeamLisp.Ns` used to be listed here and was DEAD: the module has no source
   # file anywhere in the tree (`lib/beam_lisp/ns.ex` does not exist) and no beam
@@ -394,13 +395,17 @@ defmodule BeamLisp.AOTCache do
   # guard, and BUG-106 is the day it was omitted here after its `.ex` was deleted:
   # the live digest halted on the missing `lib/beam_lisp/atom_guard.ex`, so
   # `codegen_part/0` silently froze the key on the stale baked digest and a tree
-  # with an edited codegen computed the pre-edit key. Every migration of a codegen
-  # leaf INTO `priv/host/` must add its row below.
+  # with an edited codegen computed the pre-edit key. `Record` is the newest leaf
+  # and the same hazard's second near-miss: it is a `@codegen_modules` member
+  # whose `.ex` is deleted once its pinned beam lands, so its row must be here or
+  # the live digest would halt on the missing `lib/beam_lisp/record.ex`. Every
+  # migration of a codegen leaf INTO `priv/host/` must add its row below.
   @pinned_host_sources %{
     BeamLisp.AtomGuard => "atom_guard.bl",
     BeamLisp.CompilerData => "compiler_data.bl",
     BeamLisp.Emit => "emit.bl",
     BeamLisp.Link => "link.bl",
+    BeamLisp.Record => "record.bl",
     BeamLisp.Tiers => "tiers.bl"
   }
 
