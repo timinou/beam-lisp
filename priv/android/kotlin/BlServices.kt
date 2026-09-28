@@ -252,13 +252,45 @@ class BlReader : AccessibilityService() {
     /** Click the first node whose text or description equals `label`. */
     fun clickText(label: String): Boolean {
         val root = rootInActiveWindow ?: return false
-        val hits = root.findAccessibilityNodeInfosByText(label) ?: return false
-        for (h in hits) {
+        fun click(h: AccessibilityNodeInfo): Boolean {
             var n: AccessibilityNodeInfo? = h
             while (n != null && !n.isClickable) n = n.parent
-            if (n != null && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+            if (n == null) return false
+            // A WebView's DOM nodes answer ACTION_CLICK inconsistently
+            // (measured on Chromium: false, or true with no click event in
+            // the page), so a web node is TAPPED at the centre of its bounds,
+            // as a finger would; native views take the action.
+            if (!isWeb(n) && n.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return true
+            n.refresh()
+            val r = Rect(); n.getBoundsInScreen(r)
+            return !r.isEmpty && tapAt(r.exactCenterX(), r.exactCenterY())
         }
+        for (h in root.findAccessibilityNodeInfosByText(label) ?: emptyList()) if (click(h)) return true
+        // The platform search misses nodes a virtual provider exposes (a
+        // WebView's DOM): walk the tree the way `texts` reads it.
+        fun walk(n: AccessibilityNodeInfo): Boolean {
+            val t = n.text?.toString() ?: n.contentDescription?.toString()
+            if (t == label && click(n)) return true
+            for (i in 0 until n.childCount) { val c = n.getChild(i) ?: continue; if (walk(c)) return true }
+            return false
+        }
+        return walk(root)
+    }
+
+    /** Whether `n` sits inside a WebView (its DOM, exposed as virtual nodes). */
+    private fun isWeb(n: AccessibilityNodeInfo): Boolean {
+        var p: AccessibilityNodeInfo? = n
+        while (p != null) { if (p.className?.toString() == "android.webkit.WebView") return true; p = p.parent }
         return false
+    }
+
+    /** A single-finger tap at screen coordinates; true when the system took it. */
+    fun tapAt(x: Float, y: Float): Boolean {
+        val p = android.graphics.Path().apply { moveTo(x, y) }
+        val g = android.accessibilityservice.GestureDescription.Builder()
+            .addStroke(android.accessibilityservice.GestureDescription.StrokeDescription(p, 0, 60))
+            .build()
+        return dispatchGesture(g, null, null)
     }
 
     fun global(action: String): Boolean {
