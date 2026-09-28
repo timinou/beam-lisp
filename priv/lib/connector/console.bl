@@ -1,0 +1,174 @@
+; connector/console.bl — seeing background sync: what ran, when, how long, what
+; it found, what failed and why. Read in dev, read in production.
+;
+; ── Why facts ───────────────────────────────────────────────────────────────
+;
+; A sync runs in the background, usually while nobody is looking. The question a
+; developer asks later — "did it run? what did it do? why is this file not
+; there?" — must be answerable from the STORE, not from a log that rotated or a
+; process that restarted. So every keep step and every drain appends one
+; `:sync.event/*` fact (bounded: the newest `KEEP` per feed survive a prune),
+; and the console is QUERIES over them plus the keep's and projection's own
+; status. No process is asked; a stopped server answers the same.
+;
+; ── How to read it ──────────────────────────────────────────────────────────
+;
+;   (console/snapshot conn {:feed f :roots [...] :projection p :scopes [...]})
+;       → one map: feed status, per-scope projection status, recent events
+;   (console/render snap)  → the same as a plain-text table (CLI, logs)
+;
+; A running app mounts `snapshot` on an admin route (knowledger PLAN-036 K5);
+; `bl sync status --store PATH` renders a store from OUTSIDE the app. Measured
+; 2026-09-28: fjall does NOT lock a store against a second OS process — the CLI
+; opens a live store and reads it. That read is best-effort (it sees what was
+; flushed) and read-only; on a live system the in-app console is the
+; consistent view.
+
+(ns connector.console
+  (:require [datom] [connector.keep :as keep] [datom.reconcile :as rc]))
+
+(def schema
+  [{:db/ident :sync.event/id     :db/valueType :db.type/string :db/unique :db.unique/identity}
+   {:db/ident :sync.event/feed   :db/valueType :db.type/term :db/index true}
+   {:db/ident :sync.event/kind   :db/valueType :db.type/keyword}      ; :keep | :drain
+   {:db/ident :sync.event/at     :db/valueType :db.type/long :db/index true}
+   {:db/ident :sync.event/ms     :db/valueType :db.type/long}
+   {:db/ident :sync.event/scope  :db/valueType :db.type/string}
+   {:db/ident :sync.event/result :db/valueType :db.type/term}])      ; the step/drain report, errors included
+
+(def KEEP "Events kept per feed after a prune." 200)
+
+(defn- now [] (erlang/system_time :millisecond))
+
+(defn- compact
+  "The part of a report worth keeping: counts and errors, never bytes."
+  [r]
+  (let [base (select-keys r [:ok :items :dropped :pages :cursor :applied :skipped :failed
+                             :retired :owed-left :error :root])]
+    (if (seq (:errors r))
+      (assoc base :errors (into [] (take 20 (:errors r))))
+      base)))
+
+(defn prune!
+  "Drop all but the newest KEEP events of `feed`."
+  [conn feed-key]
+  (let [es (into [] (datom/q '[:find ?e ?at :in $ ?f :where [?e :sync.event/feed ?f] [?e :sync.event/at ?at]]
+                             (datom/db conn) feed-key))
+        old (drop KEEP (reverse (sort-by second es)))]
+    (when (seq old)
+      (datom/transact! conn (mapv (fn [[e _]] [:db/retractEntity e]) old)))))
+
+(defn record!
+  "Append one event: `kind` :keep or :drain, the report map it produced, the
+   elapsed ms, and for a drain the scope key. Prunes every 50th write."
+  [conn feed-key kind report ms scope-key]
+  (let [at (now)
+        id (str (erlang/phash2 feed-key 100000000) "-" at "-" (erlang/unique_integer (to-list [:positive])))]
+    (datom/transact! conn [(cond-> {:db/id -1 :sync.event/id id :sync.event/feed feed-key
+                                    :sync.event/kind kind :sync.event/at at :sync.event/ms ms
+                                    :sync.event/result (compact report)}
+                             (some? scope-key) (assoc :sync.event/scope (str scope-key)))])
+    (when (= 0 (rem (erlang/unique_integer (to-list [:positive])) 50)) (prune! conn feed-key))
+    id))
+
+(defn timed-step!
+  "`connector.keep/step!` that records its own event."
+  [conn k]
+  (let [t0 (erlang/monotonic_time :millisecond)
+        r (keep/step! k)]
+    (record! conn (keep/feed-key (:feed k)) :keep r (- (erlang/monotonic_time :millisecond) t0) nil)
+    r))
+
+(defn timed-drain!
+  "`datom.reconcile/drain!` that records its own event against `feed-key`."
+  [conn feed-key p scope opts]
+  (let [r (rc/drain! conn p scope opts)]
+    (record! conn feed-key :drain r (:ms r) (:scope-key opts))
+    r))
+
+(defn events
+  "The newest `n` events of a feed, newest first."
+  [db feed-key n]
+  (let [es (into [] (datom/q '[:find ?e ?at :in $ ?f :where [?e :sync.event/feed ?f] [?e :sync.event/at ?at]]
+                             db feed-key))]
+    (mapv (fn [[e _]] (datom/pull db [:sync.event/kind :sync.event/at :sync.event/ms
+                                      :sync.event/scope :sync.event/result] e))
+          (take n (reverse (sort-by second es))))))
+
+(defn snapshot
+  "Everything a console shows, as one value. `spec`:
+     {:feed feed :roots [root-key …] :projection p :rules r
+      :scopes [{:scope eid :key str :label str} …] :events 30}"
+  [conn spec]
+  (let [db (datom/db conn)
+        fk (keep/feed-key (:feed spec))]
+    {:at (now)
+     :feed (keep/status db (:feed spec) (:roots spec))
+     :scopes (mapv (fn [s] (merge s (rc/status db (:projection spec) (:scope s) (or (:rules spec) []))))
+                   (:scopes spec))
+     :events (events db fk (get spec :events 30))}))
+
+(defn- ago [now t]
+  (if (nil? t) "never"
+    (let [s (quot (- now t) 1000)]
+      (cond (< s 90) (str s "s ago") (< s 5400) (str (quot s 60)) "m ago" :else (str (quot s 3600) "h ago")))))
+
+(defn render
+  "A snapshot as text: one block for the feed, one line per scope, the recent
+   events. What `bl sync status` prints and what an app can log."
+  [snap]
+  (let [n (:at snap) f (:feed snap)]
+    (join "\n"
+      (concat
+        [(str "feed " (pr-str (:feed f)) "  cursor " (or (:cursor f) "—")
+              "  stepped " (ago n (:stepped-at f)))
+         (if (some? (:error f)) (str "  last error (" (ago n (:error-at f)) "): " (:error f)) "  no error recorded")]
+        (map (fn [r] (str "  root " (pr-str (:root r)) (if (:seeded r) "  seeded" "  NOT SEEDED") "  " (:items r) " items"))
+             (:roots f))
+        [""]
+        (map (fn [s] (str "scope " (or (:label s) (:key s)) "  owed " (:owed s) "  stale " (:stale s)
+                          "  " (pr-str (:records s))
+                          (if (seq (:skipped-by-reason s)) (str "  skipped " (pr-str (:skipped-by-reason s))) "")))
+             (:scopes snap))
+        [""]
+        (map (fn [e] (str (ago n (:sync.event/at e)) "  " (name (:sync.event/kind e))
+                          (if (:sync.event/scope e) (str " " (:sync.event/scope e)) "")
+                          "  " (:sync.event/ms e) "ms  " (pr-str (:sync.event/result e))))
+             (:events snap))))))
+
+;; ── reading a store with no app around it ───────────────────────────────────
+
+(defn store-summary
+  "What any sync store can say about itself without the app's code: every feed
+   (cursor, last step, last error), every seeded root with its item count,
+   projection records by projection × scope × state, skip reasons, recent
+   events. For `bl sync status --store PATH`."
+  [db]
+  (let [feeds (into [] (datom/q '[:find ?k :where [?e :feed/key ?k]] db))
+        roots (mapv first (into [] (datom/q '[:find ?r :where [?e :root/seeded ?r]] db)))
+        recs (into [] (datom/q '[:find ?of ?scope ?state (count ?e)
+                                :where [?e :proj/of ?of] [?e :proj/scope ?scope] [?e :proj/state ?state]] db))
+        skips (into [] (datom/q '[:find ?reason (count ?e) :where [?e :proj/state :skipped] [?e :proj/reason ?reason]] db))]
+    {:at (now)
+     :feeds (mapv (fn [[fk]] (let [st (keep/status db {:provider (first fk) :namespace (second fk)} roots)]
+                               (assoc st :events (events db fk 20))))
+                  feeds)
+     :records (into [] (sort-by str recs))
+     :skipped (into [] skips)}))
+
+(defn render-summary [s]
+  (let [n (:at s)]
+    (join "\n"
+      (concat
+        (mapcat (fn [f] (concat
+                          [(str "feed " (pr-str (:feed f)) "  cursor " (or (:cursor f) "—") "  stepped " (ago n (:stepped-at f)))
+                           (if (some? (:error f)) (str "  last error (" (ago n (:error-at f)) "): " (:error f)) "  no error recorded")]
+                          (map (fn [r] (str "  root " (pr-str (:root r)) "  " (:items r) " items")) (:roots f))
+                          (map (fn [e] (str "    " (ago n (:sync.event/at e)) "  " (name (:sync.event/kind e))
+                                            (if (:sync.event/scope e) (str " " (:sync.event/scope e)) "")
+                                            "  " (:sync.event/ms e) "ms  " (pr-str (:sync.event/result e))))
+                               (:events f))))
+                (:feeds s))
+        ["" "records (projection scope state n):"]
+        (map (fn [r] (str "  " (pr-str r))) (:records s))
+        (if (seq (:skipped s)) (concat ["skipped by reason:"] (map (fn [r] (str "  " (pr-str r))) (:skipped s))) [])))))
