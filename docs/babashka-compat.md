@@ -23,7 +23,7 @@ remains.
    (Elixir `String`/`Regex`, Erlang `:re`, OTP `File`/`Path`).
 2. **Grade with the real tests.** The oracle is **Clojure's own test suite**,
    vendored where portable. A test that needs a *host* adaptation (a
-   `StringBuffer.` receiver, a `#"…"` reader literal, a `NullPointerException`
+   `StringBuffer.` receiver, a `NullPointerException`
    class) is adapted with the reason recorded in the test header — the
    *expected value* is never changed.
 3. **A needed edit goes into beam-lisp, never the vendor.** Where running real
@@ -53,6 +53,12 @@ etc., `slurp`/`spit`, `char`, `conj` variadic, `integer?`, …) are **interned
 into `core` on load**, via a captured value-`def` that the AOT `__bl_init__`
 replays — so a bare `(re-find …)` resolves everywhere, exactly as on the JVM,
 **with zero edit to a boot seed**.
+
+The `#"…"` regex literal reads to `(clojure.re/re-pattern "…")` with the body
+verbatim (`\d` is the regex's escape, `\"` does not close it), compiled at
+evaluation — a compiled pattern cannot be an AOT module literal. The qualified
+call autoloads `clojure.re`, so the literal needs no require
+(`test/bl/reader_regex_literal_test.bl`).
 
 ## The scorecard — real upstream tests, green
 
@@ -183,10 +189,6 @@ This is a real, useful subset, not "any Babashka app". Deliberately out of scope
 - **`clojure.java.io` streams / URLs / resources.** The path-oriented subset
   (`file`, `make-parents`, `delete-file`, `copy`) is reproduced; the java.io
   stream/URL/`resource` surface is not (no java.io on the BEAM).
-- **The `#"…"` regex reader literal.** Regex is available as *functions*
-  (`re-pattern`, `re-find`, …); the reader literal is a boot/reader change,
-  gated separately. Upstream tests that use `#"…"` are adapted to
-  `(re-pattern "…")` — the compiled pattern is identical.
 - **Numeric tower edges.** No `Ratio`, `BigDecimal`, or `NaN`; chars are integer
   codepoints, not a distinct `Character` type.
 - **`clojure.string` bare-string `pr-str`.** A separate, recorded prelude quirk
