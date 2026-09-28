@@ -5,7 +5,7 @@
     "file" => "beam_lisp.app",
     "sha256" => "868221a5f42922ca01a126204ac0440406751eee3c0b7939abdcab9f60ff614d"
   },
-  "build_key" => "c946face48ba44b1cd562ad3442cb5b21d2df7afc1a8bc79a4415476d39e0204",
+  "build_key" => "6c8ed64d76e34dc9bb455ae3d33d37f5b2e3d927eb89e143d748cce9d77bee37",
   "compiler_key" => "ec5dab77e7b7dc1b259aef7e4968df21722121d13761a4df78c11bfe657b4d70",
   "elixir" => "1.20.2",
   "hosts" => ["Elixir.BeamLisp.CompilerData.beam", "Elixir.BeamLisp.Emit.beam",
@@ -33,7 +33,8 @@
    "Elixir.BeamLisp.Volatile.beam", "Elixir.BeamLisp.Reduced.beam",
    "Elixir.BeamLisp.Promise.beam", "Elixir.BeamLisp.Future.beam",
    "Elixir.BeamLisp.Refs.beam", "Elixir.BeamLisp.Loader.Server.beam",
-   "Elixir.BeamLisp.Supervisor.beam", "Elixir.BeamLisp.Z3Port.beam"],
+   "Elixir.BeamLisp.Supervisor.beam", "Elixir.BeamLisp.Z3Port.beam",
+   "Elixir.BeamLisp.Multi.beam", "Elixir.BeamLisp.Server.beam"],
   "modules" => %{
     "Elixir.BeamLisp.Ns.Init.Rt.beam" => "d38c1c133952ed9c01636474aad5d391183e45736ae5a7cd9c7f23d8870b905d",
     "Elixir.BeamLisp.Ns.Body.Lower.beam" => "096a078d908e91a0a74cec8820a898895b118bea738160e09cd57d4a27ab0aa5",
@@ -85,7 +86,9 @@
     "Elixir.BeamLisp.Ns.Reader.beam" => "a89c485df23df839889f2aa4a7d6f3017398000d3c8b84a003e1bd1789b593b2",
     "Elixir.BeamLisp.Ns.Init.Compiler.beam" => "a76e05342db573dae2bceaac950d980d37313225743785f2d351668ef8970b10",
     "Elixir.BeamLisp.Atom.beam" => "5ddbe2154a5b8e9ce391bae3f7d68dd42c5db151ee3b57fec2244af28e2d0f31",
+    "Elixir.BeamLisp.Multi.beam" => "699a772d59e2563d63459bd231f1d10500dc1b38beaea5b3da500becc731c37e",
     "Elixir.BeamLisp.Ns.Body.Reader-node.beam" => "8918febfab0e8426e548da9d9428fc74db9ad3f941bf28b738dbf313a3ec99ed",
+    "Elixir.BeamLisp.Server.beam" => "c9519da5fa554d638a1f46fc5275b0a875e2ee17bec216517b7188ea722feb61",
     "Elixir.BeamLisp.Ns.Init.Sugar.beam" => "9c432e79e91a7fd094ea447a850db6d27065df49b53757aff20e4f3a473866a9",
     "Elixir.BeamLisp.Sorted.SortedSet.beam" => "aa308a0cd8242104571591b387184b3549ebbdd7e9d86be5748e6377c4826fe7",
     "Elixir.BeamLisp.AtomGuard.beam" => "b900fb3193afb669a77cbb8d445bab1de741e263b785cdf5c13604d60ccddbc3",
