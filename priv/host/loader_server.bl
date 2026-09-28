@@ -1,0 +1,379 @@
+; host/loader_server.bl — the pinned HOST MODULE for `Elixir.BeamLisp.Loader.Server`.
+;
+; `lib/beam_lisp/loader_server.ex` is the pinned process that runs `:global`
+; library loads. Libraries load once, VM-wide, at `:global` (see
+; `BeamLisp.Loader`); a load's top-level forms may create process-owned state
+; such as ETS tables, so routing source evaluation and AOT `__bl_init__/0`
+; replay through this GenServer binds that state to the VM rather than to
+; whichever process required it first. Nested requires run INLINE (a self-call
+; would deadlock). Exceptions cross back to the caller with their ORIGINAL
+; stacktrace and a `:throw` stays a `:throw`; the server survives both.
+;
+; This file is the `.bl` port of that module, compiled by
+; `BeamLisp.AOT/compile_host_file` into ONE exact-named beam whose export
+; surface is the live module's: `use GenServer` contributes `child_spec/1` and
+; default implementations for the OPTIONAL callbacks (`handle_cast/2`,
+; `handle_info/2`, `terminate/2`, `code_change/3`) — none of which the live
+; module overrides, though it does override the generated `handle_call/3` — and
+; the file adds `start_link/1`, `init/1`, `in_server?/0`, `run/1` and its own
+; `handle_call/3`.
+;
+;   (This wave owns source and tests only; the seed entry that points a real
+;   atom at this file is written by the wave that deletes `loader_server.ex`.
+;   That entry needs `:behaviour :"Elixir.GenServer"` — the live beam carries
+;   `-behaviour(GenServer)` because `use GenServer` does — and nothing else:
+;   the module is functions-only, with no struct to synthesize and no macro to
+;   export.)
+;
+; WHAT THE MODULE OWES, and what each line preserves:
+;
+;   * THE PROCESS DICTIONARY FLAG is the one piece of state that makes `run/1`
+;     re-entrant. It is the literal key `:bl_in_loader_server` (the live
+;     `@flag`), written with the Elixir `Process` module — NOT `:erlang` — for
+;     two reasons: `Process.get/1` answers `nil` for an absent key where
+;     `:erlang.get/1` answers the atom `:undefined` (and `:undefined` is TRUTHY
+;     in this language, so the inline branch would always win), and
+;     `Process.put/2`/`Process.delete/1` are the very calls the live module
+;     makes. `run/1` tests it for TRUTH, exactly as `if Process.get(@flag)`
+;     does: only `nil` and `false` are falsy here and in Elixir alike.
+;
+;   * THE FLAG'S LIFETIME is `put` before the thunk runs and `delete` after it,
+;     whatever happened — the live `try … after Process.delete(@flag)`. The
+;     `finally` runs on every exit path, including the exit re-raise below, so
+;     a crash inside the thunk cannot leave the flag behind and strand the
+;     server's next call on the inline branch.
+;
+;   * THE KIND IS READ, NOT RECONSTRUCTED. A pinned `.bl` `try/catch` binds one
+;     NORMALIZED value `e`: the compiler emits a single Erlang
+;     `catch Kind:Value:Stack` and folds the kind in — a `:throw` keeps its raw
+;     value, an `:error` becomes `Exception.normalize(:error, …)` (so it is
+;     ALWAYS an exception struct, non-exception reasons wrapped in
+;     `%ErlangError{}`), and an `:exit` becomes the 2-tuple `{:exit, value}`.
+;     The fold alone cannot tell a raw `:erlang.throw/1` of an exception struct
+;     from a `raise` of that same struct — both normalize to that struct. So the
+;     compiler also injects `__EXCEPTION_KIND__`, the RAW catch class
+;     (`:throw`/`:error`/`:exit`), into every catch handler's lexical scope
+;     (see `priv/boot/compiler.bl::catch-handler-node`). The classification in
+;     `handle_call/3` switches on it: `:throw` answers `{:thrown, v}` with the
+;     raw value — so a thrown exception struct stays a THROW, and one of an
+;     `{:exit, v}` pair stays a throw, the two corners the old shape-guess
+;     folded wrongly; `:error` answers `{:raised, e, __STACKTRACE__}`; `:exit`
+;     is RE-RAISED as a true exit (the live `rescue`/`catch :throw` pair does
+;     not catch exits, so the server dies there and must die here) through the
+;     dynamic `:erlang.raise/3`, recovering the raw reason from the folded
+;     `{:exit, value}`. The language's own `(throw x)` lowers to `erlang/error`
+;     of a `BeamLisp.ExInfo` — an `:error` — so it never reaches the throw
+;     corners; they exist for raw `:erlang.throw/1` callers, exactly as the
+;     live module behaves.
+;
+;   * THE STACKTRACE IS THE FRAME LIST. Inside a catch handler the compiler
+;     binds `__STACKTRACE__` — the same `{Module, Function, Arity, Location}`
+;     list Elixir's own `__STACKTRACE__` holds — and it is carried out in the
+;     `:raised` reply untouched. `run/1` re-raises with it through
+;     `:erlang.raise/3`, so the caller sees the raise site, not this module.
+;     The LIVE `reraise/2` is the macro `:erlang.raise(:error,
+;     Kernel.Utils.raise(e), stacktrace)` — a VARIABLE argument takes the
+;     macro's general branch, not its literal-message one — so the port calls
+;     `Elixir.Kernel.Utils/raise/1` and then `:erlang.raise/3`, byte for byte
+;     the same two steps.
+;
+;   * A `:throw` STAYS A `:throw`. The live `run/1` answers `throw(v)`, i.e.
+;     `:erlang.throw/1`; the port calls the same BIF dynamically, never the
+;     language's `(throw …)` (which lowers to `erlang/error` of an `ExInfo` and
+;     would hand the caller an `:error` where the live module hands it a
+;     `:throw`).
+;
+;   * THE RAISE IS DYNAMIC ON PURPOSE. A direct 3-arity `erlang/raise` call is
+;     rewritten by the lowerer to the `raw_raise` primop, which SEGFAULTS the
+;     VM when handed the frame list `__STACKTRACE__` produces (MEASURED — see
+;     `priv/host/ex_info.bl` and `priv/boot/compiler.bl`). `erlang/apply
+;     :erlang :raise` reaches the real BIF, which is what the live module
+;     calls.
+;
+;   * THE BOOT EDGE. This module is an OTP APPLICATION CHILD: `BeamLisp.Env` +
+;     `BeamLisp.Loader.Server`, started by `BeamLisp.Application.start/2`
+;     BEFORE `BeamLisp.init/0` interns one var. So no function here may resolve
+;     a var in `BeamLisp.Env` or call `BeamLisp.Ns.Rt`: those reach the var
+;     table `init/0` is what fills. Every call below is a HOST call —
+;     `GenServer`, `Supervisor`, `Process`, `Kernel`, `String.Chars`, the
+;     `Elixir.FunctionClauseError`/`RuntimeError` exceptions, and raw `erlang`
+;     BIFs. `list`/`tuple` lower to direct calls on the `BeamLisp.Ns.Core`
+;     beam, which is on the code path before the application starts (the same
+;     shape `priv/host/application.bl` ships), never a var lookup.
+;
+;   * NO TOP-LEVEL HELPERS. A pinned module's export surface IS the file's
+;     top-level defns (`defn-` is not privatized on this path), and this
+;     module's surface must be the live module's and nothing more. Every helper
+;     is therefore a LOCAL closure, and `self_module` — the atom this source
+;     was compiled into, read from a fun literal compiled into this file — is
+;     inlined at each use so the same bytes serve production and probe without
+;     naming either.
+;
+;   * THE GENERATED DEFAULTS ARE PORTED, not dropped. `use GenServer` generates
+;     a default implementation for every OPTIONAL callback, so the live module
+;     exports all four even though it defines none of them, and a port missing
+;     them would have a smaller ABI than the module it stands in for. They are
+;     reproduced as the Elixir 1.20 macro writes them: `handle_cast/2`'s
+;     `:erlang.phash2(1, 1)` trick (whose `0` branch — the only reachable one —
+;     raises, and whose `1` branch is the `{:stop, {:bad_cast, msg}, state}`
+;     Dialyzer sees), `handle_info/2`'s `:logger.error` report (same label,
+;     same report map, same metadata, `GenServer.format_report/1` as the
+;     `report_cb`), `terminate/2`'s `:ok`, and `code_change/3`'s
+;     `{:ok, state}`.
+;
+;   * THE CLAUSE HEADS. The live `init(:ok)`, `run/1` (`when is_function(fun,
+;     0)`) and `handle_call({:run, fun}, …)` each have exactly one clause, so a
+;     non-matching argument is a `FunctionClauseError` raised BY THE BEAM. The
+;     port keeps the same heads as explicit `if` bodies and raises the same
+;     `FunctionClauseError` (module/function/arity) by hand, because a pinned
+;     `.bl` parameter pattern compiles to a body-level match (a `MatchError`),
+;     not to a clause head — the `priv/host/lazy_seq.bl` idiom.
+;
+;   * `child_spec/1` IS LOAD-BEARING. `BeamLisp.Application.start/2` passes the
+;     MODULE ATOM in the child list, so OTP asks THIS module for its own
+;     generated `child_spec/1`; its `id` is the module atom and its `start` is
+;     `{Module, :start_link, [[]]}`, which is what keeps the child's identity
+;     the live module's. It is the `use GenServer` body exactly:
+;     `Supervisor.child_spec(%{id: … , start: …}, [])`.
+;
+; Run: bin/bl test test/bl/host_loader_server_test.bl
+
+(ns host.loader-server)
+
+(defn start_link
+  "The OTP `start_link/1`: start THE server under this module's own atom. The
+   argument is ignored (the live module ignores it too); the child spec hands
+   it `[]`."
+  [_opts]
+  (let [own (erlang/element 2 (erlang/fun_info (fn [] nil) :module))]
+    (GenServer/start_link own :ok (list (tuple :name own)))))
+
+(defn child_spec
+  "The `child_spec/1` `use GenServer` generates, clause for clause: a map whose
+   `id` is this module and whose `start` is `{this module, :start_link,
+   [init_arg]}`, normalized by `Supervisor.child_spec/2` with the macro's empty
+   option list. `init_arg` is the atom OTP was handed — for the application
+   supervisor's child list that is `[]`, so `start_link/1` receives `[]`."
+  [init_arg]
+  (let [own (erlang/element 2 (erlang/fun_info (fn [] nil) :module))]
+    (Supervisor/child_spec
+      (maps/put :start (tuple own :start_link (list init_arg))
+        (maps/put :id own (maps/new)))
+      (list))))
+
+(defn init
+  "The OTP `init/1` callback: the server's state is an empty map. The live
+   clause head is `init(:ok)`; any other argument is the BEAM's
+   `FunctionClauseError`, raised here by hand."
+  [arg]
+  (if (erlang/== arg :ok)
+    (tuple :ok (maps/new))
+    (erlang/error
+      (Elixir.FunctionClauseError/exception
+        (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+              (tuple :function :init)
+              (tuple :arity 1))))))
+
+(defn in_server?
+  "True when the CALLING process is the one running a `run/1` thunk — the live
+   `Process.get(@flag) == true`. `Process.get/1` (not `:erlang.get/1`) is what
+   turns an absent key into `nil` instead of the truthy atom `:undefined`."
+  []
+  (erlang/== true (Process/get :bl_in_loader_server)))
+
+(defn run
+  "Run `fun` in the loader process, inline when the caller is already INSIDE it.
+
+   The inline branch is the whole point: a library load that requires another
+   library arrives here from the server's own process, and a `GenServer.call`
+   to oneself would deadlock. `ensure_started/0` is inlined — it is private in
+   the live module and, on this path, a top-level helper would become an export
+   the live module never had. It races `Process.whereis/1` against
+   `start_link/1` and treats OTP's `already_started` as success, because the
+   server is also a supervised application child and may be up already.
+
+   The reply is unwrapped exactly as the live `case` does: `{:ok, result}` is
+   the result, `{:raised, e, stacktrace}` is re-raised with the caller's own
+   `reraise/2` shape (with the ORIGINAL trace), `{:thrown, v}` is re-thrown as
+   a genuine `:throw`. A non-zero-arity argument is the live guard's
+   `FunctionClauseError`."
+  [fun]
+  (if (erlang/is_function fun 0)
+    (if (Process/get :bl_in_loader_server)
+      (erlang/apply fun (list))
+      (let [own (erlang/element 2 (erlang/fun_info (fn [] nil) :module))]
+        (if (erlang/== nil (Process/whereis own))
+          (let [started (start_link (list))]
+            (cond
+              (and (erlang/is_tuple started)
+                   (erlang/== :ok (erlang/element 1 started))) :ok
+
+              (and (erlang/is_tuple started)
+                   (erlang/== :error (erlang/element 1 started))
+                   (erlang/is_tuple (erlang/element 2 started))
+                   (erlang/== :already_started (erlang/element 1 (erlang/element 2 started)))) :ok
+
+              :else
+                (erlang/error
+                  (Elixir.CaseClauseError/exception (list (tuple :term started))))))
+          :ok)
+        (let [reply (GenServer/call own (tuple :run fun) :infinity)]
+          (cond
+            (and (erlang/is_tuple reply)
+                 (erlang/== 2 (erlang/tuple_size reply))
+                 (erlang/== :ok (erlang/element 1 reply)))
+              (erlang/element 2 reply)
+
+            (and (erlang/is_tuple reply)
+                 (erlang/== 3 (erlang/tuple_size reply))
+                 (erlang/== :raised (erlang/element 1 reply)))
+              (erlang/apply :erlang :raise
+                (list :error
+                      (Elixir.Kernel.Utils/raise (erlang/element 2 reply))
+                      (erlang/element 3 reply)))
+
+            (and (erlang/is_tuple reply)
+                 (erlang/== 2 (erlang/tuple_size reply))
+                 (erlang/== :thrown (erlang/element 1 reply)))
+              (erlang/apply :erlang :throw (list (erlang/element 2 reply)))
+
+            :else
+              (erlang/error
+                (Elixir.CaseClauseError/exception (list (tuple :term reply))))))))
+    (erlang/error
+      (Elixir.FunctionClauseError/exception
+        (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+              (tuple :function :run)
+              (tuple :arity 1))))))
+
+(defn handle_call
+  "The OTP `handle_call/3` callback for `{:run, fun}`: set the flag, run the
+   thunk, classify what came back, clear the flag.
+
+   The reply is the live module's three shapes — `{:ok, result}`,
+   `{:raised, e, stacktrace}`, `{:thrown, v}` — and the caller unwraps them.
+   Classification reads the RAW catch kind: `__EXCEPTION_KIND__` is the
+   compiler-injected class of the catch (`:throw`, `:error` or `:exit`), so a
+   raw `:erlang.throw/1` of an exception struct stays a throw, and one of an
+   `{:exit, v}` pair stays a throw — the two corners the old shape-guess folded
+   wrongly. `:error` answers `{:raised, e, __STACKTRACE__}`; `:exit` re-raises a
+   TRUE exit through the dynamic `:erlang.raise/3` with the raw reason `v`
+   recovered from the folded `{:exit, v}`.
+
+   The clause head is `{:run, fun}` and nothing else: any other message is the
+   BEAM's `FunctionClauseError`, raised here by hand. The `finally` deletes the
+   flag on every exit path — including the exit re-raise — exactly as the live
+   `after` does."
+  [msg _from state]
+  (if (and (erlang/is_tuple msg)
+           (erlang/== 2 (erlang/tuple_size msg))
+           (erlang/== :run (erlang/element 1 msg)))
+    (do
+      (Process/put :bl_in_loader_server true)
+      (let [fun (erlang/element 2 msg)
+            reply
+            (try
+              (tuple :ok (erlang/apply fun (list)))
+              (catch e
+                (cond
+                  (erlang/== :throw __EXCEPTION_KIND__)
+                    (tuple :thrown e)
+
+                  (erlang/== :error __EXCEPTION_KIND__)
+                    (tuple :raised e __STACKTRACE__)
+
+                  (erlang/== :exit __EXCEPTION_KIND__)
+                    (erlang/apply :erlang :raise
+                      (list :exit (erlang/element 2 e) __STACKTRACE__))
+
+                  :else
+                    (tuple :thrown e)))
+              (finally (Process/delete :bl_in_loader_server)))]
+        (tuple :reply reply state)))
+    (erlang/error
+      (Elixir.FunctionClauseError/exception
+        (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+              (tuple :function :handle_call)
+              (tuple :arity 3))))))
+
+(defn handle_cast
+  "The `handle_cast/2` default `use GenServer` generates. `:erlang.phash2(1, 1)`
+   is always `0`, so the reachable branch is the raise; the `{:stop, {:bad_cast,
+   msg}, state}` branch exists so Dialyzer sees a non-local return. The message
+   is the macro's, byte for byte, with the same registered-name-or-pid
+   `inspect`."
+  [msg state]
+  (let [info (Process/info (erlang/self) :registered_name)
+        proc (cond
+               (and (erlang/is_tuple info)
+                    (erlang/== 2 (erlang/tuple_size info))
+                    (erlang/== () (erlang/element 2 info)))
+                 (erlang/self)
+
+               (and (erlang/is_tuple info) (erlang/== 2 (erlang/tuple_size info)))
+                 (erlang/element 2 info)
+
+               ; The live `case` has NO catch-all, so a `Process.info/2` answer
+               ; that is neither shape is a CaseClauseError. A live `self()`
+               ; always answers a 2-tuple, so this branch is the SHAPE of the
+               ; live clause rather than a path either module can take.
+               :else
+                 (erlang/error
+                   (Elixir.CaseClauseError/exception (list (tuple :term info)))))]
+    (if (erlang/== 0 (erlang/phash2 1 1))
+      (erlang/error
+        (Elixir.RuntimeError/exception
+          (erlang/iolist_to_binary
+            (list "attempted to cast GenServer "
+                  (Kernel/inspect proc)
+                  " but no handle_cast/2 clause was provided"))))
+      (tuple :stop (tuple :bad_cast msg) state))))
+
+(defn handle_info
+  "The `handle_info/2` default `use GenServer` generates: log the unhandled
+   message through `:logger` with the macro's own label, report and metadata,
+   then answer `{:noreply, state}`.
+
+   The `report_cb` is `Elixir.Function/capture` rather than a closure on
+   purpose: `&GenServer.format_report/1` is a MODULE-LOCAL fun, and capturing
+   the remote function reproduces it exactly (`:erlang.fun_info` agrees on
+   module, name, arity and type `:external`), where a hand-written closure would
+   be a different, equally-callable fun that renders differently."
+  [msg state]
+  (let [info (Process/info (erlang/self) :registered_name)
+        proc (cond
+               (and (erlang/is_tuple info)
+                    (erlang/== 2 (erlang/tuple_size info))
+                    (erlang/== () (erlang/element 2 info)))
+                 (erlang/self)
+
+               (and (erlang/is_tuple info) (erlang/== 2 (erlang/tuple_size info)))
+                 (erlang/element 2 info)
+
+               ; as in `handle_cast/2`: the live `case` has no catch-all, and
+               ; this is its shape, not a reachable path.
+               :else
+                 (erlang/error
+                   (Elixir.CaseClauseError/exception (list (tuple :term info)))))
+        report (maps/put :label (tuple :Elixir.GenServer :no_handle_info)
+                 (maps/put :report
+                   (maps/put :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module))
+                     (maps/put :message msg
+                       (maps/put :name proc (maps/new))))
+                   (maps/new)))
+        metadata (maps/put :domain (list :otp :elixir)
+                   (maps/put :error_logger (maps/put :tag :error_msg (maps/new))
+                     (maps/put :report_cb (Elixir.Function/capture :Elixir.GenServer :format_report 1)
+                       (maps/new))))]
+    (erlang/apply :logger :error (list report metadata))
+    (tuple :noreply state)))
+
+(defn terminate
+  "The `terminate/2` default `use GenServer` generates."
+  [_reason _state]
+  :ok)
+
+(defn code_change
+  "The `code_change/3` default `use GenServer` generates."
+  [_old state _extra]
+  (tuple :ok state))
