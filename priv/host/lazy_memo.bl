@@ -1,0 +1,235 @@
+; The NIF facade is pinned to Elixir.BeamLisp.LazyMemo: the Rust crate registers
+; that exact module atom. Keep loading lazy so a missing/foreign native library
+; does not prevent `bl native build` from starting the VM that repairs it.
+(ns host.lazy-memo)
+
+(defn- self-module []
+  (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+
+(defn- foreign-module? [detail]
+  (cond
+    (erlang/is_list detail)
+      (String/contains? (erlang/list_to_binary detail) "does not match calling module")
+    (erlang/is_binary detail)
+      (String/contains? detail "does not match calling module")
+    :else false))
+
+(defn- load-advice [reason path]
+  (if (and (erlang/is_tuple reason)
+           (erlang/== :bad_lib (erlang/element 1 reason))
+           (foreign-module? (erlang/element 2 reason)))
+    (str "The artifact is NOT this crate's library — the loader reports:\n  "
+         (erlang/element 2 reason) "\nFix: rm " path ".so && bl native build\n")
+    (str "Fix: bl native build   (builds native/lazy_memo into " path ".so)\n")))
+
+(defn- load-nif! []
+  (when-not (nif_loaded?)
+    (let [path (Path/join (BeamLisp.Tiers/priv_root) "native/lazy_memo")
+          result (erlang/load_nif (erlang/binary_to_list path) 0)]
+      (when-not (erlang/== result :ok)
+        (let [reason (erlang/element 2 result)]
+          (erlang/error (Elixir.RuntimeError/exception
+            (str "the lazy_memo native runtime is not loadable, and nothing runs without it:\n"
+                 "  " path ".so\n  " (Elixir.Kernel/inspect reason) "\n\n"
+                 (load-advice reason path)
+                 "After changing a native runtime module, restart the VM; live NIF\n"
+                 "upgrades are intentionally unsupported.\n")))))))
+  :ok)
+
+(defn ensure_loaded! []
+  (if (nif_loaded?)
+    :ok
+    (let [lock (erlang/list_to_tuple (list (erlang/list_to_tuple (list (self-module) :load_nif))
+                                          (erlang/self)))
+          answer (erlang/apply :global :trans (list lock (fn [] (load-nif!))))]
+      (if (erlang/== answer :ok)
+        :ok
+        (erlang/error (Elixir.RuntimeError/exception
+          (str "lazy memo NIF load lock failed: " (Elixir.Kernel/inspect answer))))))))
+
+(defn estimate_bytes [term]
+  (erlang/* (erts_debug/flat_size term) (erlang/system_info :wordsize)))
+
+(defn- prepend-tuple [value index rest]
+  (if (erlang/< index 0)
+    rest
+    (prepend-tuple value (erlang/- index 1) (cons (erlang/element (erlang/+ index 1) value) rest))))
+
+(defn- include-resource [resource rest ids functions resources]
+  (let [identity (nif_id resource)]
+    (if (MapSet/member? ids identity)
+      (walk rest ids functions resources)
+      (walk rest (MapSet/put ids identity) functions (cons resource resources)))))
+
+(defn- walk [todo ids functions resources]
+  (if (empty? todo)
+    resources
+    (let [term (first todo)
+          rest (rest todo)]
+      (cond
+        (and (erlang/is_map term)
+             (erlang/== :Elixir.BeamLisp.LazySeq (maps/get :__struct__ term nil)))
+          (include-resource (maps/get :resource term)
+                            (cons (maps/get :metadata term nil) rest)
+                            ids functions resources)
+        (erlang/is_reference term)
+          (let [resource (nif_dependency_resource term)]
+            (if (nil? resource)
+              (walk rest ids functions resources)
+              (include-resource resource rest ids functions resources)))
+        (erlang/is_function term)
+          (if (MapSet/member? functions term)
+            (walk rest ids functions resources)
+            (let [values (erlang/element 2 (erlang/fun_info term :env))
+                  work (Enum/reduce values rest (fn [value acc] (cons value acc)))]
+              (walk work ids (MapSet/put functions term) resources)))
+        (erlang/is_tuple term)
+          (walk (prepend-tuple term (erlang/- (erlang/tuple_size term) 1) rest)
+                ids functions resources)
+        (erlang/is_map term)
+          (walk (maps/fold (fn [key value acc] (cons key (cons value acc))) rest term)
+                ids functions resources)
+        (and (erlang/is_list term) (not (empty? term)))
+          (walk (cons (first term) (cons (rest term) rest)) ids functions resources)
+        :else (walk rest ids functions resources)))))
+
+(defn dependencies [term]
+  (ensure_loaded!)
+  (walk (list term) (MapSet/new) (MapSet/new) (list)))
+
+(defn create [state]
+  (ensure_loaded!)
+  (let [deps (dependencies state)
+        bytes (estimate_bytes state)]
+    (if (erlang/=< bytes (nif_fast_lane_bytes))
+      (nif_new_fast state deps bytes)
+      (nif_new state deps bytes))))
+
+(defn create_ref [value]
+  (ensure_loaded!)
+  (let [bytes (estimate_bytes value)]
+    (if (erlang/=< bytes (nif_fast_lane_bytes))
+      (nif_new_fast value (list) bytes)
+      (nif_new value (list) bytes))))
+
+(defn exchange_ref
+  ([resource expected value]
+    (exchange_ref resource expected value (list)))
+  ([resource expected value notifications]
+    (ensure_loaded!)
+    (let [bytes (estimate_bytes value)]
+      (if (erlang/=< bytes (nif_fast_lane_bytes))
+        (let [answer (nif_compare_exchange_fast resource expected value (list) bytes notifications)]
+          (if (erlang/== answer :reroute)
+            (nif_compare_exchange resource expected value (list) bytes notifications)
+            answer))
+        (nif_compare_exchange resource expected value (list) bytes notifications)))))
+
+(defn exchange
+  ([resource expected state]
+    (exchange resource expected state (list)))
+  ([resource expected state notifications]
+    (ensure_loaded!)
+    (let [deps (dependencies state)
+          bytes (estimate_bytes state)]
+      (if (erlang/=< bytes (nif_fast_lane_bytes))
+        (let [answer (nif_compare_exchange_fast resource expected state deps bytes notifications)]
+          (if (erlang/== answer :reroute)
+            (nif_compare_exchange resource expected state deps bytes notifications)
+            answer))
+        (nif_compare_exchange resource expected state deps bytes notifications)))))
+
+(defn cursor [items]
+  (ensure_loaded!)
+  (nif_cursor items (dependencies items) (estimate_bytes items)))
+
+(defn cursor_dirty_chunks? [resource]
+  (nif_cursor_dirty_chunks resource))
+
+(defn cursor_chunk
+  ([resource] (nif_cursor_chunk_fast resource))
+  ([resource dirty?]
+    (cond
+      (erlang/== dirty? false) (nif_cursor_chunk_fast resource)
+      (erlang/== dirty? true) (nif_cursor_chunk resource)
+      :else (erlang/error (Elixir.FunctionClauseError/exception
+        (list (erlang/list_to_tuple (list :module (self-module)))
+              (erlang/list_to_tuple (list :function :cursor_chunk))
+              (erlang/list_to_tuple (list :arity 2))))))))
+
+(defn- await-budget [budget deadline]
+  (cond
+    (erlang/< (maps/get :retained_bytes (stats)) budget) :ok
+    (erlang/>= (System/monotonic_time :millisecond) deadline)
+      (erlang/error (BeamLisp.LazySeq.ForceError/exception
+        (erlang/list_to_tuple (list :lazy_cache_budget_exceeded budget))))
+    :else (do (Process/sleep 1) (await-budget budget deadline))))
+
+(defn admit! []
+  (let [budget (Application/get_env :beam_lisp :lazy_cache_budget_bytes 536870912)]
+    (when-not (and (erlang/is_integer budget) (erlang/>= budget 0))
+      (erlang/error (Elixir.ArgumentError/exception
+        "lazy_cache_budget_bytes must be a non-negative integer")))
+    (when (erlang/== budget 0)
+      (erlang/error (BeamLisp.LazySeq.ForceError/exception
+        (erlang/list_to_tuple (list :lazy_cache_budget_exceeded budget)))))
+    (when (erlang/>= (maps/get :retained_bytes (stats)) budget)
+      (erlang/garbage_collect)
+      (await-budget budget (erlang/+ (System/monotonic_time :millisecond) 25)))
+    :ok))
+
+(defn new [state deps bytes]
+  (ensure_loaded!)
+  (nif_new state deps bytes))
+
+(defn read [resource]
+  (ensure_loaded!)
+  (let [value (nif_read_fast resource)]
+    (if (erlang/== value :reroute) (nif_read resource) value)))
+
+(defn fast_lane_bytes []
+  (ensure_loaded!)
+  (nif_fast_lane_bytes))
+
+(defn set_fast_lane_bytes [bytes]
+  (when-not (and (erlang/is_integer bytes) (erlang/>= bytes 0))
+    (erlang/error (Elixir.FunctionClauseError/exception
+      (list (erlang/list_to_tuple (list :module (self-module)))
+            (erlang/list_to_tuple (list :function :set_fast_lane_bytes))
+            (erlang/list_to_tuple (list :arity 1))))))
+  (ensure_loaded!)
+  (nif_set_fast_lane_bytes bytes))
+
+(defn compare_exchange [resource expected replacement deps bytes]
+  (ensure_loaded!)
+  (nif_compare_exchange resource expected replacement deps bytes (list)))
+
+(defn id [resource]
+  (ensure_loaded!)
+  (nif_id resource))
+
+(defn stats []
+  (ensure_loaded!)
+  (nif_stats))
+
+; The NIF replaces these stubs at the exact registered module atom. The probe
+; lives IN the native library, not persistent_term: module reload cannot lie.
+(defn nif_loaded? [] false)
+(defn nif_new [state deps bytes] (erlang/nif_error :nif_not_loaded))
+(defn nif_read [resource] (erlang/nif_error :nif_not_loaded))
+(defn nif_read_fast [resource] (erlang/nif_error :nif_not_loaded))
+(defn nif_fast_lane_bytes [] (erlang/nif_error :nif_not_loaded))
+(defn nif_set_fast_lane_bytes [bytes] (erlang/nif_error :nif_not_loaded))
+(defn nif_compare_exchange_fast [resource expected replacement deps bytes notifications]
+  (erlang/nif_error :nif_not_loaded))
+(defn nif_compare_exchange [resource expected replacement deps bytes notifications]
+  (erlang/nif_error :nif_not_loaded))
+(defn nif_id [resource] (erlang/nif_error :nif_not_loaded))
+(defn nif_resource_id [term] (erlang/nif_error :nif_not_loaded))
+(defn nif_stats [] (erlang/nif_error :nif_not_loaded))
+(defn nif_new_fast [state deps bytes] (erlang/nif_error :nif_not_loaded))
+(defn nif_cursor [items deps bytes] (erlang/nif_error :nif_not_loaded))
+(defn nif_cursor_chunk [cursor] (erlang/nif_error :nif_not_loaded))
+(defn nif_cursor_chunk_fast [cursor] (erlang/nif_error :nif_not_loaded))
+(defn nif_cursor_dirty_chunks [cursor] (erlang/nif_error :nif_not_loaded))
+(defn nif_dependency_resource [term] (erlang/nif_error :nif_not_loaded))
