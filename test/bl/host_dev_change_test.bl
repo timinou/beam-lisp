@@ -1,0 +1,669 @@
+; host_dev_change_test.bl — the pinned `DevChange` ABI, diffed against the live
+; module.
+;
+; `priv/host/dev_change.bl` is the `.bl` port of `lib/beam_lisp/dev_change.ex`
+; at the exact module atom `Elixir.BeamLisp.DevChange`. Nothing here replaces
+; the live module: the port is compiled at its OWN probe atom, the namespace
+; shim beside it is dropped, and the pinned beam is loaded ALONE — so a leftover
+; shim reference would be `undef` here.
+;
+; Every observation is DIFFERENTIAL: the same spec is planned, previewed,
+; verified, applied, receipted and undone against the live module and the probe,
+; each in its OWN isolated temp tree, and the answers must be equal. A handful
+; of pinned answers (hashes, span bytes, refusal tags, recovery strings) are
+; asserted directly so the suite is not merely "two wrongs agreeing".
+;
+; NOTHING here touches a repository source: every fixture, journal, lock and
+; candidate copy lives under `System.tmp_dir!` and is removed at the end of its
+; case. There is no git rollback, stash or reset anywhere in this file.
+;
+; Run: bin/bl test test/bl/host_dev_change_test.bl
+
+(ns host.dev-change.test)
+
+(def ^:private probe :Elixir.BeamLisp.HostDevChangeProbe)
+(def ^:private shim :Elixir.BeamLisp.Ns.Host.DevChange)
+(def ^:private live :Elixir.BeamLisp.DevChange)
+(def ^:private ready (atom false))
+(def ^:private out (atom nil))
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+(defn- sha [s] (String/downcase (Base/encode16 (crypto/hash :sha256 s))))
+(defn- tmp-dir [tag] (str (System/tmp_dir!) "/bl_host_dev_change_" tag "_" (erlang/unique_integer (list :positive))))
+(defn- drop! [m] (do (code/purge m) (code/delete m) :ok))
+
+(defn- clean-stale-copies!
+  "Remove candidate-workspace copies a PREVIOUS VM left behind. `verify` names
+   them `beam-lisp-change-<unique>`, and a fresh VM's `unique_integer` counter
+   restarts low enough to collide with a leaked name — the SAME hazard the live
+   module carries, since the port is byte-faithful there. Cleaning the copy's
+   own namespace under `System.tmp_dir!` keeps this suite hermetic without
+   changing either implementation."
+  []
+  (Enum/each (Path/wildcard (Path/join (System/tmp_dir!) "beam-lisp-change-*"))
+             (fn [p] (File/rm_rf p))))
+
+(defn- compile-probe!
+  "Compile the port at the probe atom and publish ONLY the pinned beam: the
+   compile's own load (and the namespace shim it built beside it) is dropped
+   first. Idempotent — one compile for the whole file."
+  []
+  (when-not @ready
+    (clean-stale-copies!)
+    (let [dir (tmp-dir "out")
+          res (BeamLisp.AOT/compile_host_file (Path/join (BeamLisp/cwd) "priv/host/dev_change.bl")
+                (list (t2 :module probe) (t2 :output_dir dir) (t2 :load? false)))
+          path (elem res 1)]
+      (reset! out dir)
+      (drop! probe)
+      (code/load_binary probe (erlang/binary_to_list path) (File/read! path))
+      (drop! shim)
+      (reset! ready true)))
+  probe)
+
+(defn- fixture!
+  "Create `root/fixture.bl` with `source` and return `root`."
+  [root source]
+  (File/mkdir_p! root)
+  (File/write! (Path/join root "fixture.bl") source)
+  root)
+
+(defn- base-spec [root source id]
+  {:workspace root
+   :target "fixture.bl"
+   :selector "demo/target"
+   :replacement "(defn target [] \"changed\")"
+   :expected_hash (sha source)
+   :id id
+   :verification {:argv (list "true")}})
+
+(defn- spec
+  ([root source id] (spec root source id (maps/new)))
+  ([root source id extra] (Map/merge (base-spec root source id) extra)))
+
+; Two equal trees and the SAME spec evaluated by each module. `f` gets
+; (module, root); the caller compares the two answers. Roots differ, so a plan's
+; `:workspace` and an undo's timestamped `:id` are normalized away where they
+; are compared.
+(defn- dual [tag source f]
+  (let [base (tmp-dir tag)
+        rp (fixture! (str base "/probe") source)
+        rl (fixture! (str base "/live") source)]
+    (list (f probe rp) (f live rl))))
+
+(defn- sans [m ks] (Map/drop m ks))
+(defn- val-string [m k] (Map/get m k (Map/get m (String/to_atom k))))
+
+(defn- src [] "(ns demo)\n(defn target [] :old)\n")
+
+(defn- err [k] (tuple :error k))
+(defn- ok! [r] (if (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+                 (erlang/element 2 r)
+                 r))
+
+; ── the export surface ──────────────────────────────────────────────────────
+
+(deftest dev-change-pinned-is-functions-only-and-covers-the-live-abi
+  (testing "the probe is the file's defns; every live export is present"
+    (compile-probe!)
+    (is (erlang/== :non_existing (erlang/apply :code :which (list shim))))
+    (is (erlang/apply probe :module_info (list :exports)))
+    (is (not (erlang/function_exported probe :__struct__ 0))
+        "functions-only: no synthesized struct")
+    (is (not (erlang/function_exported probe :__info__ 1)))
+    (is (every? (fn [e]
+                  (or (erlang/== :__info__ (erlang/element 1 e))
+                      (erlang/function_exported probe (erlang/element 1 e) (erlang/element 2 e))))
+                (erlang/apply live :module_info (list :exports)))
+        "the pinned ABI covers every live export")
+    (is (erlang/function_exported probe :plan 1))
+    (is (erlang/function_exported probe :preview 1))
+    (is (erlang/function_exported probe :verify 1))
+    (is (erlang/function_exported probe :verify 2))
+    (is (erlang/function_exported probe :apply! 3))
+    (is (erlang/function_exported probe :receipt 2))
+    (is (erlang/function_exported probe :undo! 3))
+    (is (erlang/function_exported probe :canonical_workspace 1))))
+
+; ── plan / preview: parity, byte-exactness, purity ──────────────────────────
+
+(deftest plan-and-preview-match-the-live-module-byte-for-byte
+  (testing "span splice, hashes, toolchain, diff; source untouched"
+    (compile-probe!)
+    (let [source "(ns demo)\r\n; λ comment\r\n(defn sibling [] \"text ) (def fake [] )\")\r\n(defn target [] \"old value\")\r\n(defn tail [] :tail)\r\n"
+          [p l] (dual "plan" source
+                  (fn [m root]
+                    (let [plan (ok! (erlang/apply m :plan (list (spec root source "e1"))))
+                          prev (ok! (erlang/apply m :preview (list plan)))]
+                      (list (sans plan (list :workspace))
+                            (sans prev (list :workspace))
+                            (File/read! (Path/join root "fixture.bl"))))))]
+      (is (= (first p) (first l)) "plan maps equal")
+      (is (= (second p) (second l)) "preview maps equal")
+      (is (= source (Enum/at p 2)) "plan wrote nothing")
+      (is (= source (Enum/at l 2)) "live wrote nothing")
+      ; pinned: the plan really is the exact splice the spec asked for
+      (let [plan (first p)
+            s (get plan :span)
+            bytes (get plan :candidate_bytes)]
+        (is (= 2 (get plan :version)))
+        (is (= "demo" (get plan :namespace)))
+        (is (= "fixture.bl" (get plan :target)))
+        (is (= :planned (get plan :status)))
+        (is (= (sha source) (get plan :old_hash)))
+        (is (String/starts_with? (erlang/binary_part bytes 0 (get s :start)) "(ns demo)"))
+        (is (String/contains? bytes "sibling [] \"text ) (def fake [] )\""))
+        (is (String/contains? bytes "tail [] :tail"))
+        (is (String/contains? bytes "target [] \"changed\"")))
+      (is (String/contains? (get (second p) :diff) "@@ changed"))
+      (is (erlang/== (list) (get (second p) :diagnostics))))))
+
+(deftest plan-refusals-match-the-live-module
+  (testing "no namespace, malformed source, ambiguous target, and spec shape"
+    (compile-probe!)
+    (let [cases
+          [(fn [m root _source]
+             (erlang/apply m :plan (list (spec root "(defn target [] :ok)\n" "e1"))))
+           (fn [m root _source]
+             (erlang/apply m :plan (list (spec root "(ns demo)\n(defn target [] (if true :yes)\n" "e1"))))
+           (fn [m root _source]
+             (erlang/apply m :plan (list (spec root "(ns demo)\n(defn target [] :one)\n(defn target [] :two)\n" "e1"))))
+           (fn [m root _source]
+             (erlang/apply m :plan (list (spec root (src) "e1" {:selector "demo/absent"}))))
+           (fn [m root _source]
+             (erlang/apply m :plan (list (spec root (src) "e1" {:selector nil}))))
+           (fn [m root _source] (erlang/apply m :plan (list :not_a_map)))
+           (fn [m root _source] (erlang/apply m :plan (list (spec root (src) ""))))]
+          pairs (Enum/map cases (fn [c]
+                            (let [base (tmp-dir "refu")
+                                  rp (fixture! (str base "/p") (src))
+                                  rl (fixture! (str base "/l") (src))]
+                              (list (c probe rp (src)) (c live rl (src)))))
+                          )]
+      (is (Enum/all? pairs (fn [pair] (erlang/== (first pair) (second pair)))))
+      (is (= (err :invalid_spec) (second (Enum/at pairs 5))))
+      (is (= (err :invalid_plan) (erlang/apply probe :preview (list {:a 1}))))
+      (is (= (err :invalid_plan) (erlang/apply probe :preview (list :nope))))
+      (is (= (err :invalid_plan) (erlang/apply probe :verify (list {:a 1} (list))))))))
+
+(deftest plan-refuses-stale-basis-and-invalid-replacements
+  (testing "hash guard and replacement shape"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "basis" source
+                  (fn [m root]
+                    (list
+                      (erlang/apply m :plan (list (spec root source "e1" {:expected_hash (String/duplicate "0" 64)})))
+                      (erlang/apply m :plan (list (spec root source "e1" {:replacement "not a form"})))
+                      (erlang/apply m :plan (list (spec root source "e1" {:replacement "(defn target []"})))
+                      (erlang/apply m :plan (list (spec root source "e1" {:replacement "(defn renamed [] :bad)"})))
+                      (erlang/apply m :plan (list (spec root source "e1" {:replacement "(defn target [] :a) (defn target [] :b)"})))
+                      (erlang/apply m :plan (list (Map/drop (spec root source "e1") (list :expected_hash)))))))]
+      (is (= p l))
+      (is (= (list (err :stale_basis)
+                   (err :invalid_replacement)
+                   (err :invalid_replacement)
+                   (err :invalid_replacement)
+                   (err :invalid_replacement)
+                   (err :missing_basis_hash))
+             p))
+      (is (= (err :missing_basis_hash) (Enum/at p 5))))))
+
+(deftest plan-rejects-malformed-and-prefixed-targets
+  (testing "strict scanner and top-level prefix rules"
+    (compile-probe!)
+    (let [bad (list "(ns demo)\n(defn target [] [1 2})\n"
+                    "(ns demo)\n(defn target [] {1 2])\n"
+                    "(ns demo)\n'(defn target [] :quoted)\n"
+                    "(ns demo)\n#_(defn target [] :discarded)\n")
+          pairs (Enum/map bad (fn [source]
+                            (let [base (tmp-dir "scan")
+                                  rp (fixture! (str base "/p") source)
+                                  rl (fixture! (str base "/l") source)]
+                              (list (erlang/apply probe :plan (list (spec rp source "e1")))
+                                    (erlang/apply live :plan (list (spec rl source "e1"))))))
+                          )]
+      (is (Enum/all? pairs (fn [pair] (erlang/== (first pair) (second pair)))))
+      (is (Enum/all? pairs (fn [pair]
+                             (Enum/member? (list (err :invalid_source) (err :target_not_found))
+                                           (first pair)))))
+      ; the quoted/discarded forms are REFUSED as targets, not silently spliced
+      (is (= (err :target_not_found) (first (Enum/at pairs 2))))
+      (is (= (err :target_not_found) (first (Enum/at pairs 3)))))))
+
+; ── path safety ────────────────────────────────────────────────────────────
+
+(deftest plan-refuses-traversal-absolute-symlink-missing-and-unsupported-targets
+  (testing "target resolution refuses everything outside a relative regular .bl"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "paths" source
+                  (fn [m root]
+                    (do
+                      (File/write! (Path/join root "outside.txt") "not source")
+                      (File/ln_s! (Path/join root "outside.txt") (Path/join root "link.bl"))
+                      (list
+                        (erlang/apply m :plan (list (spec root source "e1" {:target "../outside.txt"})))
+                        (erlang/apply m :plan (list (spec root source "e1" {:target (Path/join root "fixture.bl")})))
+                        (erlang/apply m :plan (list (spec root source "e1" {:target "link.bl"})))
+                        (erlang/apply m :plan (list (spec root source "e1" {:target "missing.bl"})))
+                        (erlang/apply m :plan (list (spec root source "e1" {:target "outside.txt"})))
+                        (erlang/apply m :plan (list (spec root source "e1" {:target 42})))))))]
+      (is (= p l))
+      (is (= (list (err :invalid_target)
+                   (err :invalid_target)
+                   (err :symlink_target)
+                   (err :missing_target)
+                   (err :unsupported_target)
+                   (err :missing_target))
+             p)))))
+
+(deftest canonical-workspace-and-symlink-ancestors-are-refused
+  (testing "the workspace must exist and hold no symlink component"
+    (compile-probe!)
+    (let [base (tmp-dir "ws")
+          real (fixture! (str base "/real") (src))
+          link (str base "/linked")]
+      (File/ln_s! real link)
+      (is (= (erlang/apply probe :canonical_workspace (list (str base "/nope"))) (err :invalid_workspace)))
+      (is (= (erlang/apply probe :canonical_workspace (list :nope)) (err :missing_workspace)))
+      (let [p (erlang/apply probe :canonical_workspace (list real))
+            l (erlang/apply live :canonical_workspace (list real))]
+        (is (= p l))
+        (is (= :ok (erlang/element 1 p))))
+      (is (= (err :symlink_workspace) (erlang/apply probe :canonical_workspace (list link))))
+      (is (= (err :symlink_workspace) (erlang/apply live :canonical_workspace (list link))))
+      (is (= (err :symlink_workspace) (erlang/apply probe :plan (list (spec link (src) "e1"))))))))
+
+(deftest a-symlink-in-the-workspace-and-a-symlinked-journal-are-refused
+  (testing "candidate-copy and journal components refuse symlinks"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "symlink" source
+                  (fn [m root]
+                    (do
+                      (File/write! (Path/join root "real") "outside copy")
+                      (File/ln_s! (Path/join root "real") (Path/join root "copied-link"))
+                      (let [plan (ok! (erlang/apply m :plan (list (spec root source "e1"))))]
+                        (erlang/apply m :verify (list plan (list (t2 :runner (fn [_] :ok)))))))))]
+      (is (= p l))
+      (is (= (err :symlink_in_workspace) p)))
+    (let [source (src)
+          [p l] (dual "journallink" source
+                  (fn [m root]
+                    (do
+                      (File/mkdir_p! (Path/join root ".beam-lisp"))
+                      (File/ln_s! (str root "-outside") (Path/join root ".beam-lisp/change-journal"))
+                      (let [plan (ok! (erlang/apply m :plan (list (spec root source "e1"))))]
+                        (erlang/apply m :verify (list plan (list (t2 :runner (fn [_] :ok)))))))))]
+      (is (= p l))
+      (is (= (err :symlink_in_workspace) p)))))
+
+; ── verify ─────────────────────────────────────────────────────────────────
+
+(deftest verify-with-an-injected-runner-matches-the-live-module
+  (testing "success, refusal, and a contained runner crash"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "verify" source
+                  (fn [m root]
+                    (let [plan (ok! (erlang/apply m :plan (list (spec root source "e1"))))
+                          command (atom nil)
+                          ok-run (fn [c] (reset! command c) :ok)
+                          good (erlang/apply m :verify (list plan (list (t2 :runner ok-run))))
+                          bad (erlang/apply m :verify (list plan (list (t2 :runner (fn [_] (t2 :error :bad_fixture))))))
+                          gone (erlang/apply m :verify (list (Map/merge plan {:old_hash (String/duplicate "0" 64)})
+                                                             (list (t2 :runner (fn [_] :ok)))))
+                          no-command (ok! (erlang/apply m :plan (list (spec root source "e2" {:verification nil}))))
+                          absent (erlang/apply m :verify (list no-command (list (t2 :runner (fn [_] :ok)))))
+                          forbidden (ok! (erlang/apply m :plan (list (spec root source "e3" {:verification {:argv (list "forbidden") :allow (list "forbidden")}}))))
+                          refused (erlang/apply m :verify (list forbidden (list (t2 :runner (fn [_] :ok)))))]
+                      (list (sans (ok! good) (list))
+                            (erlang/element 2 (erlang/element 2 bad))
+                            (erlang/element 1 bad)
+                            (get (erlang/element 2 (erlang/element 2 bad)) :exit_status)
+                            (String/contains? (get (erlang/element 2 (erlang/element 2 bad)) :output) "bad_fixture")
+                            (get @command :argv)
+                            (get @command :cwd)
+                            gone
+                            absent
+                            refused
+                            (File/read! (Path/join root "fixture.bl"))))))]
+      (is (= (Enum/at p 0) (Enum/at l 0)))
+      (is (= (Enum/at p 1) (Enum/at l 1)))
+      (is (= :error (Enum/at p 2)) "verification_failed tag")
+      (is (= 1 (Enum/at p 3)))
+      (is (Enum/at p 4))
+      (is (= (list "true") (Enum/at p 5)))
+      (is (String/starts_with? (Enum/at p 6) (System/tmp_dir!)))
+      (is (= (Enum/at p 7) (Enum/at l 7)))
+      (is (= (err :invalid_plan) (Enum/at p 7)))
+      (is (= (err :missing_verification_command) (Enum/at p 8)))
+      (is (= (err :command_not_allowlisted) (Enum/at p 9)))
+      (is (= source (Enum/at p 10))))))
+
+(deftest verify-revalidates-the-plan-and-the-basis
+  (testing "a mutated plan is refused before the runner; drift is a conflict"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "revalidate" source
+                  (fn [m root]
+                    (let [plan (ok! (erlang/apply m :plan (list (spec root source "e1"))))
+                          boom (fn [_] :never)
+                          mutated (erlang/apply m :verify (list (Map/put plan :candidate_bytes
+                                                                               (str (get plan :candidate_bytes) "x"))
+                                                                (list (t2 :runner boom))))
+                          other (erlang/apply m :verify (list (Map/put plan :selector "demo/other")
+                                                              (list (t2 :runner boom))))]
+                      (File/write! (Path/join root "fixture.bl") "(ns demo)\n(defn target [] :drift)\n")
+                      (list mutated
+                            other
+                            (erlang/apply m :verify (list plan (list (t2 :runner boom))))))))]
+      (is (= p l))
+      (is (= (list (err :invalid_plan) (err :invalid_plan) (err :conflict)) p)))))
+
+(deftest a-runner-crash-is-contained-and-the-candidate-copy-is-removed
+  (testing "a crashing runner is `runner_failed` and leaves no temp tree"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "runner-crash" source
+                  (fn [m root]
+                    (let [plan (ok! (erlang/apply m :plan (list (spec root source "e1"))))
+                          seen (atom nil)
+                          crash (fn [c] (reset! seen (Path/dirname (get c :cwd))) (erlang/exit :runner_crash))
+                          r (erlang/apply m :verify (list plan (list (t2 :runner crash))))]
+                      (list (erlang/element 1 r)
+                            (erlang/element 1 (erlang/element 2 r))
+                            (not (nil? @seen))
+                            (File/exists? @seen)
+                            (File/read! (Path/join root "fixture.bl"))))))]
+      (is (= (Enum/at p 0) (Enum/at l 0)))
+      (is (= (Enum/at p 1) (Enum/at l 1)))
+      (is (= :error (Enum/at p 0)))
+      (is (= :runner_failed (Enum/at p 1)))
+      (is (Enum/at p 2))
+      (is (not (Enum/at p 3)) "the candidate copy was cleaned up")
+      (is (= source (Enum/at p 4))))))
+
+(deftest the-default-runner-reports-the-child-status-not-the-launcher-status
+  (testing "`true` verifies, `false` fails with the child's status, source intact"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "default" source
+                  (fn [m root]
+                    (let [passing (ok! (erlang/apply m :plan (list (spec root source "e1"
+                                                                     {:verification {:argv (list "true") :timeout 5000}}))))
+                          ev (erlang/apply m :verify (list passing))
+                          failing (ok! (erlang/apply m :plan (list (spec root source "e2"
+                                                                     {:verification {:argv (list "false") :timeout 5000}}))))
+                          bad (erlang/apply m :verify (list failing))]
+                      (list (ok! ev)
+                            (erlang/element 1 bad)
+                            (get (erlang/element 2 (erlang/element 2 bad)) :exit_status)
+                            (erlang/> (get (erlang/element 2 (erlang/element 2 bad)) :exit_status) 0)
+                            (File/read! (Path/join root "fixture.bl"))))))]
+      (is (= (Enum/at p 0) (Enum/at l 0)))
+      (is (= 0 (get (Enum/at p 0) :exit_status)))
+      (is (= :verified (get (Enum/at p 0) :status)))
+      (is (= :error (Enum/at p 1)))
+      (is (= (Enum/at p 2) (Enum/at l 2)))
+      (is (Enum/at p 3))
+      (is (= source (Enum/at p 4))))))
+
+(deftest the-default-runner-times-out-a-supervised-child-and-leaves-the-source-alone
+  (testing "a sleeping child is `verification_timeout`, not a launcher answer"
+    (compile-probe!)
+    (let [source (src)
+          verification {:argv (list "elixir" "-e" "spawn(fn -> Process.sleep(:infinity) end); Process.sleep(:infinity)")
+                        :timeout 25}
+          [p l] (dual "timeout" source
+                  (fn [m root]
+                    (let [plan (ok! (erlang/apply m :plan (list (spec root source "e1" {:verification verification}))))]
+                      (list (erlang/apply m :verify (list plan))
+                            (File/read! (Path/join root "fixture.bl"))))))]
+      (is (= (Enum/at p 0) (Enum/at l 0)))
+      (is (= (err :verification_timeout) (Enum/at p 0)))
+      (is (= source (Enum/at p 1))))))
+
+; ── apply! / receipt / undo! ───────────────────────────────────────────────
+
+(defn- verify! [m plan]
+  (ok! (erlang/apply m :verify (list plan (list (t2 :runner (fn [_] :ok)))))))
+(deftest apply-authorizes-the-edit-and-installs-the-exact-candidate
+  (testing "unauthorized first, then an absent receipt, then the exact candidate"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "apply" source
+                  (fn [m root]
+                    (let [path (Path/join root "fixture.bl")
+                          _ (File/chmod path 416)
+                          plan (ok! (erlang/apply m :plan (list (spec root source "e1"))))
+                          auth {:id (get plan :id) :candidate_hash (get plan :new_hash)}
+                          bad-auth {:id (get plan :id) :candidate_hash (String/duplicate "0" 64)}
+                          unauth (erlang/apply m :apply! (list plan {:id (get plan :id) :candidate_hash (get plan :new_hash) :status :ok} bad-auth))
+                          no-evidence (erlang/apply m :apply! (list plan {:edit_id (get plan :id) :basis_hash (get plan :old_hash)
+                                                                          :candidate_hash (get plan :new_hash) :status :verified}
+                                                            auth))
+                          ev (verify! m plan)
+                          applied (erlang/apply m :apply! (list plan ev auth))
+                          stat (ok! (File/stat path))
+                          mode stat
+                          again (erlang/apply m :apply! (list plan ev auth))]
+                      (list unauth
+                            no-evidence
+                            (sans (ok! applied) (list))
+                            (erlang/band (get mode :mode) 511)
+                            (File/read! path)
+                            (erlang/element 1 again)
+                            (val-string (erlang/element 2 again) "phase")))))]
+      (is (= (Enum/at p 0) (Enum/at l 0)))
+      (is (= (Enum/at p 1) (Enum/at l 1)))
+      (is (= (err :unauthorized) (Enum/at p 0)) "authorization is checked before the ledger")
+      (is (= (err :enoent) (Enum/at p 1)) "no verified receipt yet")
+      (is (= :applied (get (Enum/at p 2) :phase)))
+      (is (= (Enum/at p 3) (Enum/at l 3)))
+      (is (= 416 (Enum/at p 3)) "the source mode survives the replace")
+      (is (= "(ns demo)\n(defn target [] \"changed\")\n" (Enum/at p 4)))
+      (is (= :ok (Enum/at p 5)))
+      (is (= "applied" (Enum/at p 6)))
+      (is (= (Enum/at p 6) (Enum/at l 6))))))
+
+(deftest apply-rejects-a-plan-mutation-and-a-forged-committed-evidence-is-irrelevant
+  (testing "valid_plan gates apply!; the PERSISTED evidence is what is trusted"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "apply-trust" source
+                  (fn [m root]
+                    (let [plan (ok! (erlang/apply m :plan (list (spec root source "e1"))))
+                          ev (verify! m plan)
+                          auth {:id (get plan :id) :candidate_hash (get plan :new_hash)}
+                          forged (Map/put ev :candidate_hash (String/duplicate "0" 64))
+                          forged-apply (erlang/apply m :apply! (list plan forged auth))
+                          tampered (Map/put plan :old_hash (String/duplicate "f" 64))
+                          tampered-apply (erlang/apply m :apply! (list tampered {:a 1} auth))]
+                      (list (erlang/element 1 forged-apply)
+                            (erlang/element 1 tampered-apply)
+                            tampered-apply))))]
+      (is (= (Enum/at p 0) (Enum/at l 0)))
+      (is (= (Enum/at p 1) (Enum/at l 1)))
+      (is (= :ok (Enum/at p 0)) "forged in-memory evidence cannot undo the committed record")
+      (is (= (err :invalid_plan) (Enum/at p 2))))))
+
+(deftest receipt-and-undo-match-the-live-module
+  (testing "missing/invalid queries, applied receipt, guarded inverse, drift"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "receipt" source
+                  (fn [m root]
+                    (let [path (Path/join root "fixture.bl")
+                          plan (ok! (erlang/apply m :plan (list (spec root source "e1"))))
+                          ev (verify! m plan)
+                          auth {:id (get plan :id) :candidate_hash (get plan :new_hash)}
+                          _ (ok! (erlang/apply m :apply! (list plan ev auth)))
+                          stored (ok! (erlang/apply m :receipt (list "e1" root)))
+                          applied-rec (Map/drop stored (list "verification_evidence"))
+                          inverse (ok! (erlang/apply m :undo! (list "e1" auth root)))
+                          ; drift: rewrite the file, then undo must refuse
+                          _ (File/write! path (get inverse :candidate_bytes))
+                          drifted (erlang/apply m :undo! (list "e1" auth root))]
+                      (list (erlang/apply m :receipt (list "missing" root))
+                            (erlang/apply m :receipt (list :bad root))
+                            applied-rec
+                            (get stored "after_hash")
+                            (get stored "old_form")
+                            (sans (Map/put inverse :id "x") (list :workspace :toolchain :old_bytes :candidate_bytes :old_hash :new_hash))
+                            drifted))))]
+      (is (= (Enum/at p 0) (Enum/at l 0)))
+      (is (= (Enum/at p 1) (Enum/at l 1)))
+      (is (= (Enum/at p 2) (Enum/at l 2)))
+      (is (= (err :not_found) (Enum/at p 0)))
+      (is (= (err :invalid_receipt_query) (Enum/at p 1)))
+      (is (= "applied" (get (Enum/at p 2) "phase")))
+      (is (= (sha "(ns demo)\n(defn target [] \"changed\")\n") (Enum/at p 3)))
+      (is (= "(defn target [] :old)" (Enum/at p 4)))
+      (is (= (get (Enum/at p 5) :replacement) "(defn target [] :old)")
+          "undo proposes the INVERSE form, not a restore")
+      (is (= (err :conflict) (Enum/at p 6)) "drift blocks the inverse")
+      (is (= (Enum/at p 6) (Enum/at l 6))))))
+
+(deftest intent-recovery-reports-old-new-and-neither
+  (testing "a hand-written intent journal is classified by hash"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "recover" source
+                  (fn [m root]
+                    (let [path (Path/join root "fixture.bl")
+                          plan (ok! (erlang/apply m :plan (list (spec root source "recover"))))
+                          dir (Path/join root ".beam-lisp/change-journal")
+                          _ (File/mkdir_p! dir)
+                          name (str (sha "recover") ".json")
+                          body (JSON/encode! {:phase :intent :id "recover" :target "fixture.bl"
+                                              :selector "demo/target" :old_hash (get plan :old_hash)
+                                              :after_hash (get plan :new_hash)})
+                          _ (File/write! (Path/join dir name) body)
+                          a (get (ok! (erlang/apply m :receipt (list "recover" root))) "recovery")
+                          _ (File/write! path (get plan :candidate_bytes))
+                          b (get (ok! (erlang/apply m :receipt (list "recover" root))) "recovery")
+                          _ (File/write! path "(ns demo)\n(defn target [] :other)\n")
+                          c (get (ok! (erlang/apply m :receipt (list "recover" root))) "recovery")]
+                      (list a b c))))]
+      (is (= p l))
+      (is (= (list "old" "new" "neither") p)))))
+
+(deftest a-busy-lock-and-a-reused-edit-id-are-refused
+  (testing "the writer lock is a mkdir; a second edit under the same id is refused"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "lock" source
+                  (fn [m root]
+                    (let [path (Path/join root "fixture.bl")
+                          plan (ok! (erlang/apply m :plan (list (spec root source "stable"))))
+                          ev (verify! m plan)
+                          auth {:id "stable" :candidate_hash (get plan :new_hash)}
+                          _ (File/mkdir_p! (Path/join root ".beam-lisp/change.lock"))
+                          busy (erlang/apply m :apply! (list plan ev auth))
+                          _ (File/rmdir (Path/join root ".beam-lisp/change.lock"))
+                          applied (erlang/apply m :apply! (list plan ev auth))
+                          ; restore the basis and plan a DIFFERENT change under the same id
+                          _ (File/write! path source)
+                          other (ok! (erlang/apply m :plan (list (spec root source "stable"
+                                                                   {:replacement "(defn target [] :different)"}))))
+                          ev2 (verify! m other)
+                          reused (erlang/apply m :apply! (list other ev2 {:id "stable" :candidate_hash (get other :new_hash)}))]
+                      (list busy
+                            (erlang/element 1 applied)
+                            reused))))]
+      (is (= p l))
+      (is (= (list (err :busy) :ok (err :edit_id_reused)) p)))))
+
+(deftest undo-refuses-before-anything-was-applied
+  (testing "a missing receipt and a wrong candidate hash"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "undo-guard" source
+                  (fn [m root]
+                    (let [plan (ok! (erlang/apply m :plan (list (spec root source "e1"))))
+                          ev (verify! m plan)
+                          auth {:id (get plan :id) :candidate_hash (get plan :new_hash)}
+                          before (erlang/apply m :undo! (list "e1" auth root))
+                          _ (ok! (erlang/apply m :apply! (list plan ev auth)))
+                          wrong-auth (erlang/apply m :undo! (list "e1" {:id "e1" :candidate_hash (String/duplicate "0" 64)} root))]
+                      (list before wrong-auth))))]
+      (is (= p l))
+      (is (= (list (err :not_found) (err :unauthorized)) p)))))
+
+(deftest undo-reports-not-applied-for-a-receipt-that-never-landed
+  (testing "an intent journal is a receipt but not an applied one"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "undo-intent" source
+                  (fn [m root]
+                    (let [plan (ok! (erlang/apply m :plan (list (spec root source "e1"))))
+                          dir (Path/join root ".beam-lisp/change-journal")
+                          _ (File/mkdir_p! dir)
+                          _ (File/write! (Path/join dir (str (sha "e1") ".json"))
+                                         (JSON/encode! {:phase :intent :id "e1" :target "fixture.bl"
+                                                        :selector "demo/target" :old_hash (get plan :old_hash)
+                                                        :after_hash (get plan :new_hash)}))]
+                      (erlang/apply m :undo! (list "e1" {:id "e1" :candidate_hash (get plan :new_hash)} root)))))]
+      (is (= p l))
+      (is (= (err :not_applied) p)))))
+
+(deftest the-whole-cycle-replays-identically-and-is-idempotent
+  (testing "plan → verify → apply → receipt, then apply again -> the same receipt"
+    (compile-probe!)
+    (let [source "(ns demo)\n(defn target [] :old)\n"
+          [p l] (dual "cycle" source
+                  (fn [m root]
+                    (let [path (Path/join root "fixture.bl")
+                          plan (ok! (erlang/apply m :plan (list (spec root source "c1"))))
+                          ev (verify! m plan)
+                          auth {:id "c1" :candidate_hash (get plan :new_hash)}
+                          first-apply (ok! (erlang/apply m :apply! (list plan ev auth)))
+                          after-first (File/read! path)
+                          second-apply (erlang/apply m :apply! (list plan ev auth))
+                          after-second (File/read! path)]
+                      (list (:phase first-apply)
+                            (erlang/element 1 second-apply)
+                            (val-string (erlang/element 2 second-apply) "phase")
+                            (val-string (erlang/element 2 second-apply) "after_hash")
+                            after-first
+                            after-second))))]
+      (is (= (Enum/at p 0) (Enum/at l 0)))
+      (is (= (Enum/at p 1) (Enum/at l 1)))
+      (is (= (Enum/at p 2) (Enum/at l 2)))
+      (is (= (Enum/at p 3) (Enum/at l 3)))
+      (is (= :applied (Enum/at p 0)))
+      (is (= :ok (Enum/at p 1)))
+      (is (= "applied" (Enum/at p 2)))
+      (is (= "(ns demo)\n(defn target [] \"changed\")\n" (Enum/at p 4)))
+      (is (= (Enum/at p 4) (Enum/at p 5)) "a repeat apply is a receipt read, not a rewrite"))))
+
+(deftest verification-honours-the-descriptor-cwd-in-the-candidate-copy
+  (testing "a nested cwd resolves inside the copy, directories included"
+    (compile-probe!)
+    (let [source (src)
+          [p l] (dual "cwd" source
+                  (fn [m root]
+                    (File/mkdir_p! (Path/join root "nested"))
+                    (File/write! (Path/join root "nested/keep.txt") "kept")
+                    (let [plan (ok! (erlang/apply m :plan (list (spec root source "e1"
+                                                                     {:verification {:argv (list "true") :cwd "nested"}}))))
+                          seen (atom nil)
+                          observe (fn [c]
+                                    (reset! seen {:base (Path/basename (get c :cwd))
+                                                  :dir (File/dir? (get c :cwd))
+                                                  :inside (File/read! (Path/join (get c :cwd) "keep.txt"))})
+                                    :ok)
+                          r (erlang/apply m :verify (list plan (list (t2 :runner observe))))]
+                      (list (erlang/element 1 r)
+                            @seen
+                            (File/read! (Path/join root "fixture.bl"))))))]
+      (is (= (Enum/at p 0) (Enum/at l 0)))
+      (is (= (Enum/at p 1) (Enum/at l 1)))
+      (is (= (Enum/at p 2) (Enum/at l 2)))
+      (is (= :ok (Enum/at p 0)))
+      (is (= "nested" (get (Enum/at p 1) :base)))
+      (is (get (Enum/at p 1) :dir) "the nested directory exists in the copy")
+      (is (= "kept" (get (Enum/at p 1) :inside)) "and holds the copied file")
+      (is (= source (Enum/at p 2)) "the source workspace is untouched"))))

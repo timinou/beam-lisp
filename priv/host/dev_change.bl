@@ -1,0 +1,1008 @@
+; host/dev_change.bl — the pinned HOST MODULE for `Elixir.BeamLisp.DevChange`.
+;
+; Local, hash-guarded source changes for `.bl` files: `plan` / `preview` /
+; `verify` / `apply!` / `receipt` / `undo!`. This file is the `.bl` port of
+; `lib/beam_lisp/dev_change.ex`, compiled by `BeamLisp.AOT/compile_host_file`
+; into ONE exact-named beam whose PUBLIC surface — `plan/1`, `preview/1`,
+; `verify/1`, `verify/2`, `apply!/3`, `receipt/2`, `undo!/3` and
+; `canonical_workspace/1` — is the live module's. Candidate workspaces and
+; resource limits reduce accidental damage; they are not OS confinement and do
+; not make verification of hostile code safe.
+;
+;   (This wave owns source and tests only; the seed entry that points the real
+;   atom at this file is written by the wave that deletes `dev_change.ex`. That
+;   entry carries no `:struct_fields`, no `:behaviour` and no `:macro_exports`
+;   — the module is functions-only, its whole surface the file's top-level
+;   `defn`s plus the private helpers the pinned emitter does NOT privatize.
+;   That superset is the ONE deliberate divergence, the same one
+;   `priv/host/decimal.bl` and `priv/host/vector.bl` carry: the PUBLIC ABI is
+;   exact, the lowercase helpers are extra exports.)
+;
+; WHAT THE MODULE OWES, clause for clause:
+;
+;   * THE GUARDS BECOME BODY CHECKS. beam-lisp's guard vocabulary has no
+;     `is_map`/`is_binary`, so the live clause heads (`when is_map(spec)`,
+;     `when is_binary(id)`) are tested in the BODY with `erlang/is_map` /
+;     `erlang/is_binary` and the non-matching clause is answered directly —
+;     `{:error, :invalid_spec}` for a non-map spec, `{:error,
+;     :invalid_receipt_query}` for a non-binary receipt id. Nothing raises where
+;     the live module returned a tagged error.
+;
+;   * `with` IS HAND-BUILT. beam-lisp has no `with`; the port uses two helpers,
+;     `or-ok!` (unwrap an `{:ok, v}`, else ESCAPE with the error) and `or-ok0!`
+;     (continue on `:ok`, else escape), inside `guard-errors`. The escape is a
+;     real `:erlang.throw` of a `{:bl-dc-escape, v}` pair, caught ONLY when its
+;     tag matches, so a genuine `:throw` from a called library is re-raised
+;     through `:erlang.raise/3` with its own class, exactly as an uncaught
+;     `with` failure would have propagated. The escape value IS the live `else`
+;     result, so a stale basis, a refused command, a missing target and a
+;     symlink all surface unchanged.
+;
+;   * `case` IS NOT A PATTERN MATCH. beam-lisp's `case` expands to `cond` over
+;     `=` — it cannot bind. Every destructuring case in the live module is
+;     spelled here as an `if`/`cond` over `erlang/is_tuple` +
+;     `erlang/element`, and every `{:ok, x}` unwrap is `or-ok!`.
+;
+;   * THE STRICT LEXICAL SCANNER IS PORTED. `analyze`/`scan` walk the bytes
+;     without evaluating anything: comments, strings (with escapes), quoted and
+;     discarded top-level prefixes, and delimiter nesting. A malformed closer
+;     or an unterminated string is `:invalid_source`; the byte is read with
+;     `binary/at`-free one-byte slices and compared against literal bytes, so
+;     no character literal enters this source. Only an unprefixed top-level `ns`
+;     form names the namespace and only an unprefixed `def`/`defn` can be a
+;     target.
+;
+;   * PATH SAFETY IS PORTED. The workspace is canonicalised and every component
+;     is `lstat`-checked for symlinks (`symlink_workspace`); a target must be a
+;     relative, non-escaping `.bl` regular file (`invalid_target`,
+;     `symlink_target`, `missing_target`, `unsupported_target`); the journal and
+;     lock directories refuse symlinked components (`symlink_journal`); and a
+;     copied candidate workspace refuses a symlink entry
+;     (`symlink_in_workspace`).
+;
+;   * THE RECEIPT STATE IS PORTED. A plan carries the old and candidate bytes
+;     and their hashes and pins the toolchain; `verify` writes a
+;     `.verify.json` evidence record and `apply!` re-reads it and re-checks
+;     every field; `apply!` writes an `:intent` journal before the atomic,
+;     mode-preserving replace and an `:applied` record after it; a repeated
+;     `apply!` is a receipt read when the file already holds the candidate;
+;     `undo!` is a guarded INVERSE proposal, never a restore.
+;
+;   * THE DEFAULT VERIFIER USES A BOUNDED systemd USER SERVICE, as the live
+;     module does — `systemd-run --user --wait --pipe --collect`, a memory cap,
+;     a runtime cap and a cgroup stop afterwards. The CHILD's exit status is the
+;     answer, not the launcher's.
+;
+; Run: bin/bl test test/bl/host_dev_change_test.bl
+
+(ns host.dev-change)
+
+; ── fallible-step plumbing (the `with` the language does not have) ──────────
+
+(defn- dc-ok?
+  "Whether `v` is an `{:ok, x}` pair. A beam-lisp vector is a struct, never a
+   tuple, so this sees only the Erlang tuples the Elixir library returns and the
+   `tuple` pairs this file builds."
+  [v]
+  (and (erlang/is_tuple v)
+       (erlang/== 2 (erlang/tuple_size v))
+       (erlang/== :ok (erlang/element 1 v))))
+
+(defn- escape!
+  "Abandon the current fallible step, carrying the live `else` value."
+  [v]
+  (erlang/throw (tuple :bl-dc-escape v)))
+
+(defn- or-ok!
+  "Unwrap `{:ok, x}`; escape with `v` itself on anything else."
+  [v]
+  (if (dc-ok? v) (erlang/element 2 v) (escape! v)))
+
+(defn- or-ok0!
+  "Continue on `:ok`; escape with `v` itself on anything else."
+  [v]
+  (if (erlang/== :ok v) nil (escape! v)))
+
+(defn- guard-errors
+  "Run `f`, unwrapping THIS file's escapes and re-raising everything else with
+   its original class, reason and stacktrace. A real `:throw` from a called
+   library is not this file's control flow and must pass through. The class and
+   the stacktrace are read HERE, in the catch body, because that is the only
+   scope where the compiler binds them."
+  [f]
+  (try (f)
+    (catch e
+      (if (and (erlang/== :throw __EXCEPTION_KIND__)
+               (erlang/is_tuple e)
+               (erlang/== 2 (erlang/tuple_size e))
+               (erlang/== :bl-dc-escape (erlang/element 1 e)))
+        (erlang/element 2 e)
+        (erlang/apply :erlang :raise
+          (list __EXCEPTION_KIND__
+                (if (and (erlang/== :exit __EXCEPTION_KIND__)
+                         (erlang/is_tuple e)
+                         (erlang/== 2 (erlang/tuple_size e)))
+                  (erlang/element 2 e)
+                  e)
+                __STACKTRACE__))))))
+
+; ── map access, exactly as the live module reads it ─────────────────────────
+
+(defn- get-
+  "`Map.get/3` with the atom-or-string fallback the live `get/3` helper had:
+   the atom key first, then its string spelling."
+  ([m k] (get- m k nil))
+  ([m k d] (Map/get m k (Map/get m (Atom/to_string k) d))))
+
+(defn- val-
+  "The live `val/2`: the STRING key first (a JSON-decoded receipt), then its
+   atom spelling (a map this file built)."
+  [m k]
+  (Map/get m k (Map/get m (String/to_atom k))))
+
+(defn- t2 [a b] (tuple a b))
+
+(defn- default-allowlist
+  "The commands the default verifier will launch without a caller override."
+  [] (list "mix" "bl" "elixir" "true" "false"))
+
+; ── public API ──────────────────────────────────────────────────────────────
+
+(defn plan
+  "Build an immutable, hash-guarded change plan from a specification map. No
+   source write and no user-code execution: the scanner is lexical only."
+  [spec]
+  (if (erlang/is_map spec)
+    (guard-errors
+      (fn []
+        (let [root (or-ok! (root spec))
+              path (or-ok! (target root (get- spec :target)))
+              bytes (or-ok! (File/read path))]
+          (or-ok0! (basis bytes (get- spec :expected_hash (get- spec :basis_hash))))
+          (let [analysis (or-ok! (analyze bytes))
+                ns (or-ok! (namespace analysis))
+                span (or-ok! (definition analysis ns (get- spec :selector (get- spec :definition))))
+                replacement (or-ok! (replacement spec (get- span :name)))
+                id (or-ok! (edit-id spec))
+                candidate (erlang/iolist_to_binary
+                            (list (erlang/binary_part bytes 0 (get- span :start))
+                                  replacement
+                                  (erlang/binary_part bytes (get- span :stop)
+                                                      (erlang/- (erlang/byte_size bytes)
+                                                                (get- span :stop)))))]
+            (tuple :ok
+              {:version 2
+               :id id
+               :workspace root
+               :target (Path/relative_to path root)
+               :namespace ns
+               :selector (get- span :selector)
+               :span (Map/drop span (list :text))
+               :old_bytes bytes
+               :candidate_bytes candidate
+               :old_hash (hash bytes)
+               :new_hash (hash candidate)
+               :replacement replacement
+               :verification (get- spec :verification (get- spec :verify))
+               :toolchain (toolchain)
+               :status :planned})))))
+    (tuple :error :invalid_spec)))
+
+(defn preview
+  "The candidate diff and diagnostics for a plan. Reads only: no mutation, no
+   evaluation, no module loading."
+  [p]
+  (if (erlang/is_map p)
+    (let [v (valid-plan p)]
+      (if (erlang/== :ok v)
+        (tuple :ok
+          {:id (get- p :id)
+           :target (get- p :target)
+           :namespace (get- p :namespace)
+           :selector (get- p :selector)
+           :span (get- p :span)
+           :old_hash (get- p :old_hash)
+           :new_hash (get- p :new_hash)
+           :diff (diff (get- p :old_bytes) (get- p :candidate_bytes) (get- p :target))
+           :diagnostics (list)})
+        v))
+    (tuple :error :invalid_plan)))
+
+(defn verify
+  "Verify a plan in an ISOLATED COPY of its workspace. `opts` carries an
+   optional `:runner` (a one-argument function given the command map with its
+   resolved `cwd`) and an optional `:allowlist`. A failure leaves the source
+   workspace byte-identical."
+  ([p] (verify p (list)))
+  ([p opts]
+   (if (erlang/is_map p)
+     (guard-errors
+       (fn []
+         (let [runner (Keyword/get opts :runner)
+               allowlist (Keyword/get opts :allowlist (default-allowlist))]
+           (or-ok0! (valid-plan p))
+           (let [root (or-ok! (root p))
+                 path (or-ok! (target root (get- p :target)))
+                 current (or-ok! (File/read path))]
+             (or-ok0! (same current (get- p :old_hash)))
+             (let [command (or-ok! (descriptor (get- p :verification) allowlist))
+                   tmp (or-ok! (copy-workspace root))]
+               (try
+                 (let [candidate-path (Path/join tmp (get- p :target))
+                       wrote (atomic candidate-path (get- p :candidate_bytes))]
+                   (if (erlang/== :ok wrote)
+                     (let [run-result (or-ok! (run command tmp runner))
+                           ev (evidence p command run-result)]
+                       (if (erlang/== :ok (get- run-result :status))
+                         (do (or-ok0! (persist-evidence root ev))
+                             (tuple :ok ev))
+                         (tuple :error (tuple :verification_failed ev))))
+                     wrote))
+                 (finally (File/rm_rf tmp))))))))
+     (tuple :error :invalid_plan))))
+
+(defn apply!
+  "Install the exact verified candidate bytes: authorization names the edit id
+   and candidate hash, the persisted evidence is re-checked field for field,
+   the basis is re-read under the workspace writer lock, and the journal records
+   the intent before the atomic, mode-preserving replace."
+  [p _caller-receipt auth]
+  (if (and (erlang/is_map p) (erlang/is_map auth))
+    (guard-errors
+      (fn []
+        (or-ok0! (valid-plan p))
+        (or-ok0! (authorized auth (get- p :id) (get- p :new_hash)))
+        (let [root (or-ok! (root p))
+              path (or-ok! (target root (get- p :target)))
+              ev (or-ok! (read-evidence root (get- p :id)))]
+          (or-ok0! (verified ev p))
+          (lock root (fn [] (apply-locked p ev path))))))
+    (tuple :error :invalid_application)))
+
+(defn receipt
+  "The durable receipt for `id` in `workspace`, with its recovery status. A
+   missing journal is `{:error, :not_found}`."
+  [id workspace]
+  (if (erlang/is_binary id)
+    (let [root-res (canonical_workspace workspace)]
+      (if (dc-ok? root-res)
+        (receipt-in (erlang/element 2 root-res) id)
+        (receipt-else root-res)))
+    (tuple :error :invalid_receipt_query)))
+
+(defn undo!
+  "Propose the INVERSE of an applied receipt. Requires the current bytes to
+   equal the recorded after-hash, authorizes against that hash, and plans a new
+   edit under a fresh id — this is a proposal, not an unconditional restore."
+  [id auth workspace]
+  (guard-errors
+    (fn []
+      (let [old (or-ok! (receipt id workspace))]
+        (or-ok0! (applied-receipt old))
+        (or-ok0! (authorized auth id (val- old "after_hash")))
+        (let [root (or-ok! (canonical_workspace workspace))
+              path (or-ok! (target root (val- old "target")))
+              bytes (or-ok! (File/read path))]
+          (or-ok0! (same bytes (val- old "after_hash")))
+          (plan {:id (str id ":undo:" (Integer/to_string (System/system_time :microsecond)))
+                 :workspace root
+                 :target (val- old "target")
+                 :selector (val- old "selector")
+                 :replacement (val- old "old_form")
+                 :expected_hash (hash bytes)
+                 :verification (val- old "command_descriptor")}))))))
+
+(defn canonical_workspace
+  "Validate an existing workspace directory, refusing symlink components."
+  [root]
+  (if (erlang/is_binary root)
+    (let [expanded (Path/expand root)]
+      (cond
+        (not (File/dir? expanded)) (tuple :error :invalid_workspace)
+        (path-has-symlink? expanded) (tuple :error :symlink_workspace)
+        :else (tuple :ok expanded)))
+    (tuple :error :missing_workspace)))
+
+; ── the receipt read, split so the `:enoent` remap is explicit ───────────────
+
+(defn- receipt-in [root id]
+  (let [file-res (journal-file root id)]
+    (if (dc-ok? file-res)
+      (let [bytes-res (safe-read-journal root (erlang/element 2 file-res))]
+        (if (dc-ok? bytes-res)
+          (let [decoded (JSON/decode (erlang/element 2 bytes-res))]
+            (if (dc-ok? decoded)
+              (recover (erlang/element 2 decoded) root)
+              (receipt-else decoded)))
+          (receipt-else bytes-res)))
+      (receipt-else file-res))))
+
+(defn- receipt-else
+  "The live `with ... else` tail: a missing journal file is `:not_found`, any
+   other tag passes through."
+  [e]
+  (if (and (erlang/is_tuple e)
+           (erlang/== 2 (erlang/tuple_size e))
+           (erlang/== :error (erlang/element 1 e))
+           (erlang/== :enoent (erlang/element 2 e)))
+    (tuple :error :not_found)
+    e))
+
+; ── plan validation ─────────────────────────────────────────────────────────
+
+(defn- valid-plan
+  "Re-derive everything a plan claims: its hashes, its namespace and span, the
+   replacement, the exact spliced candidate, and the pinned toolchain."
+  [p]
+  (if (and (erlang/is_map p) (erlang/== 2 (get- p :version)))
+    (let [id (get- p :id)
+          old-bytes (get- p :old_bytes)
+          candidate-bytes (get- p :candidate_bytes)
+          expected-ns (get- p :namespace)
+          expected-span (get- p :span)
+          expected-replacement (get- p :replacement)
+          expected-toolchain (get- p :toolchain)]
+      (if (and (erlang/is_binary id)
+               (not (erlang/== "" id))
+               (erlang/== (hash old-bytes) (get- p :old_hash))
+               (erlang/== (hash candidate-bytes) (get- p :new_hash)))
+        (let [analysis-res (analyze old-bytes)]
+          (if (dc-ok? analysis-res)
+            (let [analysis (erlang/element 2 analysis-res)
+                  ns-res (namespace analysis)]
+              (if (dc-ok? ns-res)
+                (let [ns (erlang/element 2 ns-res)
+                      span-res (definition analysis ns (get- p :selector))]
+                  (if (dc-ok? span-res)
+                    (let [span (erlang/element 2 span-res)
+                          repl-res (validate-replacement expected-replacement (get- span :name))]
+                      (if (dc-ok? repl-res)
+                        (let [replacement (erlang/element 2 repl-res)
+                              expected (erlang/iolist_to_binary
+                                         (list (erlang/binary_part old-bytes 0 (get- span :start))
+                                               replacement
+                                               (erlang/binary_part old-bytes (get- span :stop)
+                                                                   (erlang/- (erlang/byte_size old-bytes)
+                                                                             (get- span :stop)))))]
+                          (if (and (erlang/== ns expected-ns)
+                                   (erlang/== (Map/drop span (list :text)) expected-span)
+                                   (erlang/== replacement expected-replacement)
+                                   (erlang/== expected candidate-bytes)
+                                   (erlang/== (toolchain) expected-toolchain))
+                            :ok
+                            (tuple :error :invalid_plan)))
+                        (tuple :error :invalid_plan)))
+                    (tuple :error :invalid_plan)))
+                (tuple :error :invalid_plan)))
+            (tuple :error :invalid_plan)))
+        (tuple :error :invalid_plan)))
+    (tuple :error :invalid_plan)))
+
+; ── workspace and target resolution ─────────────────────────────────────────
+
+(defn- root [spec]
+  (canonical_workspace (get- spec :workspace (get- spec :workspace_root))))
+
+(defn- target [root name]
+  (if (erlang/is_binary name)
+    (let [parts (Path/split name)
+          full (Path/join root name)
+          rel (Path/relative_to (Path/expand full) root)]
+      (cond
+        (or (erlang/== "" name) (erlang/== :absolute (Path/type name))) (tuple :error :invalid_target)
+        (or (Enum/member? parts "..") (erlang/== ".." rel) (String/starts_with? rel "../")) (tuple :error :invalid_target)
+        (symlink-component? root parts) (tuple :error :symlink_target)
+        (not (File/regular? full)) (tuple :error :missing_target)
+        (not (erlang/== ".bl" (Path/extname name))) (tuple :error :unsupported_target)
+        :else (tuple :ok full)))
+    (tuple :error :missing_target)))
+
+; ── the strict, non-evaluating lexical scan ─────────────────────────────────
+
+(defn- analyze [bytes]
+  (let [r (scan bytes 0 (list) nil nil (list) false)]
+    (if (dc-ok? r)
+      (tuple :ok (Enum/reverse (erlang/element 2 r)))
+      r)))
+
+; One byte at a time, without evaluating anything. `c` is the 1-byte slice at
+; `i`; comparisons are against literal 1-byte strings so no character literal
+; enters this source. Comments run to the newline, strings honour the backslash
+; escape, `'`/`` ` ``/`~` and a top-level `#_` mark a form as PREFIXED (invisible
+; to the namespace and definition selectors), and a closer that does not match
+; the open delimiter — or arrives with no delimiter open — is `:invalid_source`.
+(defn- scan [bytes i stack start state acc prefixed]
+  (if (erlang/>= i (erlang/byte_size bytes))
+    (cond
+      (erlang/== :string state) (tuple :error :invalid_source)
+      (not (erlang/== (list) stack)) (tuple :error :invalid_source)
+      :else (tuple :ok acc))
+    (let [c (erlang/binary_part bytes i 1)]
+      (cond
+        (and (erlang/== :comment state) (erlang/== c "\n"))
+          (scan bytes (erlang/+ i 1) stack start nil acc prefixed)
+
+        (erlang/== :comment state)
+          (scan bytes (erlang/+ i 1) stack start state acc prefixed)
+
+        (and (erlang/== :string state) (erlang/== c "\\")
+             (erlang/< (erlang/+ i 1) (erlang/byte_size bytes)))
+          (scan bytes (erlang/+ i 2) stack start state acc prefixed)
+
+        (and (erlang/== :string state) (erlang/== c "\""))
+          (scan bytes (erlang/+ i 1) stack start nil acc prefixed)
+
+        (erlang/== :string state)
+          (scan bytes (erlang/+ i 1) stack start state acc prefixed)
+
+        (erlang/== c ";")
+          (scan bytes (erlang/+ i 1) stack start :comment acc prefixed)
+
+        (erlang/== c "\"")
+          (scan bytes (erlang/+ i 1) stack start :string acc prefixed)
+
+        (and (erlang/== (list) stack)
+             (or (erlang/== c "'") (erlang/== c "`") (erlang/== c "~")))
+          (scan bytes (erlang/+ i 1) stack start state acc true)
+
+        (and (erlang/== (list) stack) (erlang/== c "#")
+             (erlang/< (erlang/+ i 1) (erlang/byte_size bytes))
+             (erlang/== "_" (erlang/binary_part bytes (erlang/+ i 1) 1)))
+          (scan bytes (erlang/+ i 2) stack start state acc true)
+
+        (or (erlang/== c "(") (erlang/== c "[") (erlang/== c "{"))
+          (scan bytes (erlang/+ i 1) (cons (matching c) stack)
+                (if (erlang/== (list) stack) i start) state acc prefixed)
+
+        (and (or (erlang/== c ")") (erlang/== c "]") (erlang/== c "}"))
+             (erlang/== (list) stack))
+          (tuple :error :invalid_source)
+
+        (and (or (erlang/== c ")") (erlang/== c "]") (erlang/== c "}"))
+             (not (erlang/== c (first stack))))
+          (tuple :error :invalid_source)
+
+        (and (or (erlang/== c ")") (erlang/== c "]") (erlang/== c "}"))
+             (erlang/== (list) (rest stack)))
+          (let [text (erlang/binary_part bytes start (erlang/+ 1 (erlang/- i start)))
+                form {:start start :stop (erlang/+ i 1) :text text :prefixed prefixed}]
+            (scan bytes (erlang/+ i 1) (list) nil state (cons form acc) false))
+
+        (or (erlang/== c ")") (erlang/== c "]") (erlang/== c "}"))
+          (scan bytes (erlang/+ i 1) (rest stack) start state acc prefixed)
+
+        :else
+          (scan bytes (erlang/+ i 1) stack start state acc prefixed)))))
+
+(defn- matching
+  "The closer a 1-byte opener requires."
+  [c]
+  (cond
+    (erlang/== c "(") ")"
+    (erlang/== c "[") "]"
+    :else "}"))
+
+(defn- namespace [forms]
+  (let [hits (Enum/filter forms
+               (fn [f]
+                 (and (not (get- f :prefixed))
+                      (Regex/match? (Regex/compile! "^\\(\\s*ns\\s+") (get- f :text)))))]
+    (cond
+      (erlang/== 1 (count hits))
+        (let [m (Regex/run (Regex/compile! "^\\(\\s*ns\\s+([^\\s()\\[\\]{}]+)") (get- (first hits) :text))]
+          (if (nil? m)
+            (tuple :error :malformed_namespace)
+            (tuple :ok (Enum/at m 1))))
+
+      (erlang/== 0 (count hits))
+        (tuple :error :missing_namespace)
+
+      :else
+        (tuple :error :ambiguous_namespace))))
+
+(defn- definition [forms ns selector]
+  (if (erlang/is_binary selector)
+    (let [hits (Enum/flat_map forms
+                 (fn [f]
+                   (let [h (definition-header f)]
+                     (if (dc-ok? h)
+                       (let [name (erlang/element 2 h)]
+                         (if (or (erlang/== selector name)
+                                 (erlang/== selector (str ns "/" name)))
+                           (list (Map/merge f {:selector selector :name name}))
+                           (list)))
+                       (list)))))]
+      (cond
+        (erlang/== 1 (count hits)) (tuple :ok (first hits))
+        (erlang/== 0 (count hits)) (tuple :error :target_not_found)
+        :else (tuple :error :ambiguous_target)))
+    (tuple :error :missing_selector)))
+
+(defn- definition-header [f]
+  (if (not (get- f :prefixed))
+    (let [m (Regex/run (Regex/compile! "^\\(\\s*(?:def|defn)\\s+([^\\s()\\[\\]{}]+)" "s")
+                       (get- f :text))]
+      (if (nil? m) :no (tuple :ok (Enum/at m 1))))
+    :no))
+
+(defn- replacement [spec expected-name]
+  (let [value (get- spec :replacement (get- spec :source))]
+    (if (erlang/is_binary value)
+      (validate-replacement value expected-name)
+      (tuple :error :invalid_replacement))))
+
+(defn- validate-replacement [value expected-name]
+  (let [a (analyze value)]
+    (if (dc-ok? a)
+      (let [forms (erlang/element 2 a)]
+        (if (erlang/== 1 (count forms))
+          (let [form (first forms)
+                h (definition-header form)]
+            (if (dc-ok? h)
+              (if (and (erlang/== (erlang/element 2 h) expected-name)
+                       (erlang/== (get- form :start) (leading-bytes value))
+                       (only-trailing-space? value (get- form :stop)))
+                (tuple :ok value)
+                (tuple :error :invalid_replacement))
+              (tuple :error :invalid_replacement)))
+          (tuple :error :invalid_replacement)))
+      (tuple :error :invalid_replacement))))
+
+(defn- leading-bytes [value]
+  (erlang/- (erlang/byte_size value) (erlang/byte_size (String/trim_leading value))))
+
+(defn- only-trailing-space? [value stop]
+  (erlang/== "" (String/trim (erlang/binary_part value stop (erlang/- (erlang/byte_size value) stop)))))
+
+(defn- basis [bytes expected]
+  (cond
+    (nil? expected) (tuple :error :missing_basis_hash)
+    (erlang/== (hash bytes) expected) :ok
+    :else (tuple :error :stale_basis)))
+
+(defn- edit-id [spec]
+  (let [id (get- spec :id (get- spec :edit_id))]
+    (if (and (erlang/is_binary id) (not (erlang/== "" id)))
+      (tuple :ok id)
+      (tuple :error :missing_edit_id))))
+
+; ── the candidate workspace copy ────────────────────────────────────────────
+
+(defn- copy-workspace [root]
+  (let [tmp (Path/join (System/tmp_dir!) (str "beam-lisp-change-" (erlang/unique_integer (list :positive))))
+        made (File/mkdir tmp)]
+    (if (erlang/== :ok made)
+      (let [copied (copy-tree root tmp)]
+        (if (erlang/== :ok copied) (tuple :ok tmp) copied))
+      made)))
+
+(defn- copy-tree [source dest]
+  (let [ls (File/ls source)]
+    (if (dc-ok? ls)
+      (Enum/reduce_while (erlang/element 2 ls) :ok
+        (fn [name _acc]
+          (let [src (Path/join source name)
+                dst (Path/join dest name)
+                st (File/lstat src)]
+            (if (dc-ok? st)
+              (let [stat (erlang/element 2 st)
+                    type (get- stat :type)
+                    mode (get- stat :mode)]
+                (cond
+                  (erlang/== :symlink type) (tuple :halt (tuple :error :symlink_in_workspace))
+                  (erlang/== :directory type)
+                    (let [m (File/mkdir dst)]
+                      (if (erlang/== :ok m)
+                        (let [c (copy-tree src dst)]
+                          (if (erlang/== :ok c)
+                            (tuple :cont (File/chmod dst mode))
+                            (tuple :halt c)))
+                        (tuple :halt m)))
+                  (erlang/== :regular type)
+                    (let [cp (File/cp src dst)]
+                      (if (erlang/== :ok cp)
+                        (tuple :cont (File/chmod dst mode))
+                        (tuple :halt cp)))
+                  :else (tuple :halt (tuple :error :unsupported_workspace_entry))))
+              (tuple :halt st)))))
+      ls)))
+
+; ── the verification command descriptor, runner and evidence ────────────────
+
+(defn- descriptor [d allowlist]
+  (if (and (erlang/is_map d) (erlang/is_list allowlist))
+    (let [argv (get- d :argv)
+          cwd (get- d :cwd ".")
+          env (get- d :env (list))
+          timeout (get- d :timeout 30000)
+          memory-kb (get- d :memory_kb 1048576)]
+      (if (and (erlang/is_list argv)
+               (not (erlang/== (list) argv))
+               (Enum/all? argv (fn [a] (erlang/is_binary a)))
+               (Enum/member? allowlist (first argv))
+               (safe-relative? cwd)
+               (erlang/is_list env)
+               (Enum/all? env (fn [kv]
+                                (and (erlang/is_tuple kv)
+                                     (erlang/== 2 (erlang/tuple_size kv))
+                                     (erlang/is_binary (erlang/element 1 kv))
+                                     (erlang/is_binary (erlang/element 2 kv)))))
+               (erlang/is_integer timeout)
+               (erlang/> timeout 0)
+               (erlang/is_integer memory-kb)
+               (erlang/> memory-kb 0))
+        (tuple :ok {:argv argv :cwd cwd :env env :timeout timeout :memory_kb memory-kb})
+        (tuple :error :command_not_allowlisted)))
+    (tuple :error :missing_verification_command)))
+
+(defn- run [command workspace runner]
+  (let [cwd (Path/join workspace (get- command :cwd))]
+    (cond
+      (erlang/is_function runner 1)
+        (if (and (inside? cwd workspace) (File/dir? cwd))
+          (safe-runner runner (Map/put command :cwd cwd))
+          (tuple :error :invalid_command_cwd))
+
+      (nil? runner) (default-run command workspace)
+
+      :else (tuple :error :invalid_runner))))
+
+(defn- safe-runner [runner command]
+  (try (normalize (runner command))
+    (catch e
+      (tuple :error
+        (tuple :runner_failed
+          (tuple __EXCEPTION_KIND__
+                 (if (and (erlang/== :exit __EXCEPTION_KIND__)
+                          (erlang/is_tuple e)
+                          (erlang/== 2 (erlang/tuple_size e)))
+                   (erlang/element 2 e)
+                   e)))))))
+
+(defn- normalize [r]
+  (cond
+    (erlang/== :ok r)
+      (tuple :ok {:status :ok :exit_status 0 :output ""})
+
+    (and (dc-ok? r) (erlang/is_binary (erlang/element 2 r)))
+      (tuple :ok {:status :ok :exit_status 0 :output (erlang/element 2 r)})
+
+    (and (erlang/is_tuple r)
+         (erlang/== 2 (erlang/tuple_size r))
+         (erlang/== :error (erlang/element 1 r)))
+      (tuple :ok {:status :error :exit_status 1 :output (Kernel/inspect (erlang/element 2 r))})
+
+    :else
+      (tuple :error :invalid_runner_result)))
+
+; The live default verifier: a bounded, collected systemd USER service. The
+; child's own exit status is the answer — the launcher's is not — and the whole
+; cgroup is stopped afterwards so descendants cannot outlive the check.
+(defn- default-run [c workspace]
+  (let [cwd (Path/join workspace (get- c :cwd))]
+    (if (and (inside? cwd workspace) (File/dir? cwd))
+      (let [executable (System/find_executable (first (get- c :argv)))
+            manager (System/find_executable "systemd-run")
+            control (System/find_executable "systemctl")]
+        (if (and (erlang/is_binary executable)
+                 (erlang/is_binary manager)
+                 (erlang/is_binary control))
+          (let [unit (str "bl-change-"
+                          (System/unique_integer (list :positive))
+                          "-"
+                          (String/downcase (Base/encode16 (crypto/strong_rand_bytes 6))))
+                args (erlang/++
+                       (list "--user" "--wait" "--pipe" "--collect" "--quiet"
+                             (str "--unit=" unit)
+                             (str "--property=MemoryMax=" (get- c :memory_kb) "K")
+                             "--property=MemorySwapMax=0"
+                             (str "--property=RuntimeMaxSec=" (get- c :timeout) "ms")
+                             (str "--working-directory=" cwd))
+                       (erlang/++
+                         (Enum/map (get- c :env)
+                                   (fn [kv] (str "--setenv=" (erlang/element 1 kv) "=" (erlang/element 2 kv))))
+                         (erlang/++ (list "--" executable) (rest (get- c :argv)))))
+                port (erlang/open_port
+                       (erlang/list_to_tuple (list :spawn_executable manager))
+                       (list :binary :exit_status :stderr_to_stdout :use_stdio
+                             (erlang/list_to_tuple (list :args args))))]
+            (try
+              (collect-port port (erlang/+ (System/monotonic_time :millisecond) (get- c :timeout)) "")
+              (finally
+                (System/cmd control (list "--user" "stop" (str unit ".service"))
+                            (list (t2 :stderr_to_stdout true)))
+                (when (Port/info port) (Port/close port)))))
+          (tuple :error :runner_unavailable)))
+      (tuple :error :runner_unavailable))))
+
+(defn- collect-port [port deadline output]
+  (let [remaining (max (erlang/- deadline (System/monotonic_time :millisecond)) 0)]
+    (receive
+      [p [:data data]] :when (== p port)
+        (if (erlang/=< (erlang/+ (erlang/byte_size output) (erlang/byte_size data)) 1048576)
+          (collect-port port deadline (erlang/iolist_to_binary (list output data)))
+          (tuple :error :verification_output_limit))
+
+      [p [:exit_status code]] :when (== p port)
+        (tuple :ok {:status (if (erlang/== code 0) :ok :error)
+                    :exit_status code
+                    :output output})
+
+      (after remaining
+        (tuple :error :verification_timeout)))))
+
+(defn- evidence [p command result]
+  {:version 1
+   :edit_id (get- p :id)
+   :basis_hash (get- p :old_hash)
+   :candidate_hash (get- p :new_hash)
+   :candidate_size (erlang/byte_size (get- p :candidate_bytes))
+   :command_descriptor command
+   :status (if (erlang/== :ok (get- result :status)) :verified :failed)
+   :exit_status (get- result :exit_status)
+   :output (get- result :output)
+   :toolchain (get- p :toolchain)})
+
+(defn- persist-evidence [root ev]
+  (let [j (ensure-journal root)]
+    (if (erlang/== :ok j)
+      (let [f (evidence-file root (get- ev :edit_id))]
+        (if (dc-ok? f)
+          (atomic (erlang/element 2 f) (JSON/encode! ev))
+          f))
+      j)))
+
+(defn- read-evidence [root id]
+  (let [f (evidence-file root id)]
+    (if (dc-ok? f)
+      (let [bytes-res (safe-read-journal root (erlang/element 2 f))]
+        (if (dc-ok? bytes-res)
+          (JSON/decode (erlang/element 2 bytes-res))
+          bytes-res))
+      f)))
+
+(defn- verified [r p]
+  (let [expect (descriptor (get- p :verification) (default-allowlist))]
+    (if (dc-ok? expect)
+      (let [expected-command (erlang/element 2 expect)
+            command (val- r "command_descriptor")]
+        (if (and (erlang/== (val- r "edit_id") (get- p :id))
+                 (erlang/== (val- r "basis_hash") (get- p :old_hash))
+                 (erlang/== (val- r "candidate_hash") (get- p :new_hash))
+                 (erlang/== (val- r "candidate_size") (erlang/byte_size (get- p :candidate_bytes)))
+                 (Enum/member? (list :verified "verified") (val- r "status"))
+                 (erlang/== 0 (val- r "exit_status"))
+                 (erlang/== (normalize-json command) (normalize-json expected-command))
+                 (erlang/== (normalize-json (val- r "toolchain")) (normalize-json (get- p :toolchain))))
+          :ok
+          (tuple :error :unverified_candidate)))
+      (tuple :error :unverified_candidate))))
+
+(defn- authorized [a id h]
+  (if (and (erlang/== (get- a :id (get- a :edit_id)) id)
+           (erlang/== (get- a :candidate_hash (get- a :new_hash)) h))
+    :ok
+    (tuple :error :unauthorized)))
+
+(defn- applied-receipt [r]
+  (if (Enum/member? (list :applied "applied") (val- r "phase"))
+    :ok
+    (tuple :error :not_applied)))
+
+(defn- same [bytes h]
+  (if (erlang/== (hash bytes) h) :ok (tuple :error :conflict)))
+
+(defn- hash [bytes]
+  (String/downcase (Base/encode16 (crypto/hash :sha256 bytes))))
+
+(defn- toolchain []
+  {:elixir (System/version)
+   :otp (List/to_string (erlang/system_info :otp_release))})
+
+(defn- normalize-json [value]
+  (JSON/decode! (JSON/encode! value)))
+
+; ── apply, under the writer lock ────────────────────────────────────────────
+
+(defn- apply-locked [p ev path]
+  (let [s (existing-state p)]
+    (if (dc-ok? s)
+      (let [state (erlang/element 2 s)
+            rd (File/read path)]
+        (if (dc-ok? rd)
+          (let [bytes (erlang/element 2 rd)
+                old (get- p :old_bytes)
+                cand (get- p :candidate_bytes)]
+            (cond
+              (and (erlang/== :none state) (erlang/== bytes old))
+                (let [j (ensure-journal (get- p :workspace))]
+                  (if (erlang/== :ok j)
+                    (let [a (journal p ev :intent)]
+                      (if (dc-ok? a)
+                        (let [w (atomic path cand)]
+                          (if (erlang/== :ok w)
+                            (journal p ev :applied)
+                            w))
+                        a))
+                    j))
+
+              (and (erlang/== :matching state) (erlang/== bytes cand))
+                (receipt (get- p :id) (get- p :workspace))
+
+              (and (erlang/== :matching state) (erlang/== bytes old))
+                (tuple :error :recovery_not_applied)
+
+              (erlang/== :matching state)
+                (tuple :error :recovery_conflict)
+
+              :else
+                (tuple :error :conflict)))
+          (tuple :error (tuple :read_failed (erlang/element 2 rd)))))
+      s)))
+
+(defn- existing-state [p]
+  (let [r (receipt (get- p :id) (get- p :workspace))]
+    (cond
+      (and (erlang/is_tuple r)
+           (erlang/== 2 (erlang/tuple_size r))
+           (erlang/== :error (erlang/element 1 r))
+           (erlang/== :not_found (erlang/element 2 r)))
+        (tuple :ok :none)
+
+      (dc-ok? r)
+        (let [prior (erlang/element 2 r)]
+          (if (and (erlang/== (val- prior "target") (get- p :target))
+                   (erlang/== (val- prior "old_hash") (get- p :old_hash))
+                   (erlang/== (val- prior "after_hash") (get- p :new_hash)))
+            (tuple :ok :matching)
+            (tuple :error :edit_id_reused)))
+
+      :else r)))
+
+(defn- journal [p ev phase]
+  (let [f (journal-file (get- p :workspace) (get- p :id))]
+    (if (dc-ok? f)
+      (let [span (get- p :span)
+            old-bytes (get- p :old_bytes)
+            data {:phase phase
+                  :recovery (if (erlang/== :applied phase) :new :pending)
+                  :id (get- p :id)
+                  :target (get- p :target)
+                  :selector (get- p :selector)
+                  :old_hash (get- p :old_hash)
+                  :after_hash (get- p :new_hash)
+                  :old_form (erlang/binary_part old-bytes
+                                                (get- span :start)
+                                                (erlang/- (get- span :stop) (get- span :start)))
+                  :verification_evidence ev
+                  :command_descriptor (val- ev "command_descriptor")
+                  :status phase}
+            w (atomic (erlang/element 2 f) (JSON/encode! data))]
+        (if (erlang/== :ok w) (tuple :ok data) w))
+      f)))
+
+(defn- recover [value root]
+  (if (Enum/member? (list :intent "intent") (val- value "phase"))
+    (let [p (target root (val- value "target"))]
+      (if (dc-ok? p)
+        (let [rd (File/read (erlang/element 2 p))]
+          (if (dc-ok? rd)
+            (let [bytes (erlang/element 2 rd)
+                  recovery (cond
+                             (erlang/== (hash bytes) (val- value "old_hash")) "old"
+                             (erlang/== (hash bytes) (val- value "after_hash")) "new"
+                             :else "neither")]
+              (tuple :ok (Map/put value "recovery" recovery)))
+            rd))
+        p))
+    (tuple :ok (Map/put value "recovery" "new"))))
+
+; Same-directory temporary write, fsync, rename, then fsync the parent so the
+; rename is durable. The mode of the replaced file is preserved.
+(defn- maybe-chmod [path mode]
+  (if (nil? mode) :ok (File/chmod path mode)))
+
+(defn- atomic [path bytes]
+  (let [tmp (str path ".tmp-" (Integer/to_string (erlang/unique_integer (list :positive))))
+        st (File/stat path)
+        mode (if (dc-ok? st) (get- (erlang/element 2 st) :mode) nil)
+        result (guard-errors
+                 (fn []
+                   (or-ok0! (File/write tmp bytes (list :binary)))
+                   (or-ok0! (maybe-chmod tmp mode))
+                   (let [fd (or-ok! (erlang/apply :file :open
+                                       (list (erlang/binary_to_list tmp)
+                                             (list :read :write :binary))))]
+                     (or-ok0! (erlang/apply :file :sync (list fd)))
+                     (or-ok0! (erlang/apply :file :close (list fd)))
+                     (or-ok0! (File/rename tmp path))
+                     (or-ok0! (sync-parent path))
+                     :ok)))]
+    (if (erlang/== :ok result) :ok (do (File/rm tmp) result))))
+
+(defn- sync-parent [path]
+  (let [opened (erlang/apply :file :open
+                  (list (erlang/binary_to_list (Path/dirname path))
+                        (list :read :raw :directory)))]
+    (if (dc-ok? opened)
+      (let [fd (erlang/element 2 opened)
+            r (erlang/apply :file :sync (list fd))
+            _ (erlang/apply :file :close (list fd))]
+        r)
+      opened)))
+
+; One writer lock for participating tools, a mkdir that either wins or reports
+; `:busy`. This protects cooperating writers, not hostile external processes.
+(defn- lock [root fun]
+  (let [ep (ensure-lock-parent root)]
+    (if (erlang/== :ok ep)
+      (let [path (Path/join root ".beam-lisp/change.lock")
+            m (File/mkdir path)]
+        (cond
+          (erlang/== :ok m) (try (fun) (finally (File/rmdir path)))
+          (and (erlang/is_tuple m)
+               (erlang/== 2 (erlang/tuple_size m))
+               (erlang/== :error (erlang/element 1 m))
+               (erlang/== :eexist (erlang/element 2 m))) (tuple :error :busy)
+          :else (tuple :error (tuple :lock_failed (erlang/element 2 m)))))
+      ep)))
+
+(defn- ensure-lock-parent [root]
+  (let [parent (Path/dirname (Path/join root ".beam-lisp/change.lock"))]
+    (if (symlink? parent)
+      (tuple :error :symlink_journal)
+      (File/mkdir_p parent))))
+
+; ── journal paths, all symlink-refusing ─────────────────────────────────────
+
+(defn- ensure-journal [root]
+  (let [beam (Path/join root ".beam-lisp")
+        journal (Path/join root ".beam-lisp/change-journal")]
+    (if (or (symlink? beam) (symlink? journal))
+      (tuple :error :symlink_journal)
+      (File/mkdir_p journal))))
+
+(defn- journal-file [root id]
+  (journal-path root (str (hash id) ".json")))
+
+(defn- evidence-file [root id]
+  (journal-path root (str (hash id) ".verify.json")))
+
+(defn- journal-path [root name]
+  (let [path (Path/join (list root ".beam-lisp/change-journal" name))]
+    (if (symlink-component? root (Path/split (Path/relative_to path root)))
+      (tuple :error :symlink_journal)
+      (tuple :ok path))))
+
+(defn- safe-read-journal [root file]
+  (if (symlink-component? root (Path/split (Path/relative_to file root)))
+    (tuple :error :symlink_journal)
+    (File/read file)))
+
+; ── path predicates ─────────────────────────────────────────────────────────
+
+(defn- path-has-symlink? [path]
+  (Enum/any? (Enum/scan (Path/split path) (fn [part acc] (Path/join acc part)))
+               (fn [p] (symlink? p))))
+
+(defn- symlink? [path]
+  (let [l (File/lstat path)]
+    (and (dc-ok? l) (erlang/== :symlink (get- (erlang/element 2 l) :type)))))
+
+(defn- symlink-component? [root parts]
+  (Enum/any? (Enum/scan parts root (fn [part acc] (Path/join acc part)))
+               (fn [p] (symlink? p))))
+
+(defn- safe-relative? [path]
+  (if (erlang/is_binary path)
+    (and (erlang/== :relative (Path/type path))
+         (not (Enum/member? (Path/split path) "..")))
+    false))
+
+(defn- inside? [path root]
+  (let [rel (Path/relative_to (Path/expand path) root)]
+    (and (not (erlang/== ".." rel)) (not (String/starts_with? rel "../")))))
+
+(defn- diff [old new target]
+  (str "--- " target "\n+++ " target "\n"
+       (if (erlang/== old new) "" (str "@@ changed " (hash new) " @@\n"))))
