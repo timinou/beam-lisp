@@ -1,0 +1,1052 @@
+; host_decimal_test.bl — the pinned `BeamLisp.Decimal` ABI and its `Inspect`
+; impl, diffed against the live ones and driven through the numeric tower.
+;
+; Two `.bl` sources under `priv/host/` replace the two halves of
+; `lib/beam_lisp/decimal.ex` at their exact module atoms:
+;
+;   * `priv/host/decimal.bl` → `Elixir.BeamLisp.Decimal`, a STRUCT whose
+;     `__struct__/0,1` pair and `__info__/1` are synthesized by
+;     `compile_host_file`'s `:struct_fields` option (`unscaled: 0`, `scale: 0`,
+;     declaration order), plus the public `new/1` `of/2` `from_float/1`
+;     `parse/1` `parse!/1` `zero/0` `one/0` `ten/0` `add/2` `sub/2` `mul/2`
+;     `neg/1` `abs/1` `signum/1` `div/2` `div/4` `rescale/2` `rescale/3`
+;     `strip_zeros/1` `move_point_left/2` `move_point_right/2` `compare/2`
+;     `eq?/2` `scale/1` `unscaled/1` `precision/1` `to_integer/1` `to_float/1`
+;     `to_plain_string/1` `to_literal/1` `codec_key_parts/1` `modes/0`.
+;   * `priv/host/decimal_inspect.bl` → `Elixir.Inspect.BeamLisp.Decimal`, the
+;     protocol impl, FUNCTIONS-ONLY.
+;
+; The live modules are never left replaced. Each source is compiled at its OWN
+; probe atom, the namespace shim beside it is dropped, and the pinned beam is
+; loaded ALONE — a leftover shim reference would be `undef` here.
+;
+; The suite is DIFFERENTIAL against the running `lib/beam_lisp/decimal.ex`
+; beams: one corpus of observations runs through each module and the answer sets
+; must be equal — values, exception CLASSES, MESSAGES and the `data` an `ExInfo`
+; carries. The observation is normalized on three axes, and only these:
+;
+;   * the probe atom in a message (`norm/1`), because the pinned file reads its
+;     own module from a fun literal and so names the atom it was built into —
+;     which is the PROPERTY being ported, and is asserted separately;
+;   * struct tags collapse to `:DECIMAL` (`canon/1`), because the probe tags the
+;     structs it builds with the probe atom and the live module tags its with
+;     the production one — a value difference, not a behaviour difference;
+;   * the `defimpl`-generated `"-inlined-__impl__/1-"` name in the impl's
+;     refusal, which the plain pinned `__impl__/1` names `__impl__`.
+;
+; What the corpus is FOR, beyond ABI coverage:
+;   * every rounding mode, on every scale direction, including `:unnecessary`;
+;   * division by zero, non-terminating division, and the exact scale it needs;
+;   * the two equalities — `=`/scale structural, `compare`/`==` numeric;
+;   * the coercion refusals: a float (`:decimal/inexact-operand`), a
+;     non-number (`:decimal/coerce`, message included), a bad mode/scale
+;     (`FunctionClauseError` naming the SAME function and arity as live —
+;     `add/2` reports `align/2`, because that is the head that failed);
+;   * `codec_key_parts/1`, the order-preserving index key, whose `rel` byte and
+;     exact suffix must agree with the live module byte for byte;
+;   * the pinned beam AT the production atom, with the language's decimal paths
+;     (`+ * - / < compare pos? str pr-str`, i.e. through `BeamLisp.Num` and
+;     `BeamLisp.Ns.Rt`) running on it, then the live beam restored;
+;   * `defguard is_decimal/1`, which is a MACRO and so not a function at all:
+;     the pinned beam carries its compile-time pair (`MACRO-is_decimal/2` plus
+;     the `__info__(:macros)` entry `:macro_exports` synthesizes), and ONE
+;     Elixir fixture — `require BeamLisp.Decimal` + `when
+;     BeamLisp.Decimal.is_decimal(x)` — is compiled twice, once here against
+;     the LIVE Elixir macro and once in a cold child whose only added code path
+;     entry is the pinned beam, and the two observations must be equal.
+;
+; ONE DELIBERATE DIVERGENCE, pinned in `decimal-pinned-refuses-the-live-loop`:
+; `move_point_left/2` / `move_point_right/2` MUTUALLY RECURSE in the live module
+; for a non-decimal with an integer count (two tail calls, no base case, so it
+; spins forever); the pinned module raises the `FunctionClauseError` the clause
+; heads promise. The corpus therefore crosses those two functions with DECIMALS
+; only, and the divergence itself is asserted with a bounded liveness check.
+;
+; Run: bin/bl test test/bl/host_decimal_test.bl
+
+(ns host.decimal.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_decimal_" (erlang/unique_integer (list :positive))))
+
+(defn- dec-source [] (Path/join (BeamLisp/cwd) "priv/host/decimal.bl"))
+(defn- inspect-source [] (Path/join (BeamLisp/cwd) "priv/host/decimal_inspect.bl"))
+
+(def ^:private probe :Elixir.BeamLisp.DecimalHostProbe)
+(def ^:private macro-probe :Elixir.BeamLisp.DecimalMacProbe)
+(def ^:private inspect-probe :Elixir.Inspect.BeamLisp.DecimalHostProbe)
+(def ^:private dec-shim :Elixir.BeamLisp.Ns.Host.Decimal)
+(def ^:private inspect-shim :Elixir.BeamLisp.Ns.Host.DecimalInspect)
+(def ^:private live :Elixir.BeamLisp.Decimal)
+(def ^:private live-inspect :Elixir.Inspect.BeamLisp.Decimal)
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-pinned [mod path]
+  (do (drop! mod)
+      (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+      mod))
+
+(defn- decimal-fields []
+  (list (t2 :unscaled 0) (t2 :scale 0)))
+
+; Compile the pinned type at the probe atom and publish ONLY the pinned beam:
+; the compile's own load (and the namespace shim it built beside it) is dropped.
+(defn- compile-probe [dir]
+  (let [res (BeamLisp.AOT/compile_host_file (dec-source)
+              (list (t2 :module probe) (t2 :output_dir dir) (t2 :load? false)
+                    (t2 :struct_fields (decimal-fields))))
+        m (load-pinned probe (erlang/element 2 res))]
+    (drop! dec-shim)
+    m))
+
+(defn- compile-inspect-probe [dir]
+  (let [res (BeamLisp.AOT/compile_host_file (inspect-source)
+              (list (t2 :module inspect-probe) (t2 :output_dir dir) (t2 :load? false)))
+        m (load-pinned inspect-probe (erlang/element 2 res))]
+    (drop! inspect-shim)
+    m))
+
+; ── the observation: one call's whole answer, a raise included ───────────
+
+(defn- ex-data-of
+  "The `:data` an exception carries, or nil — safe for any raised value."
+  [e]
+  (if (and (erlang/is_map e) (erlang/is_map_key :data e)) (erlang/map_get :data e) nil))
+
+(defn- struct-tag [x]
+  (if (and (erlang/is_map x) (erlang/is_map_key :__struct__ x))
+    (erlang/map_get :__struct__ x)
+    nil))
+
+(defn- canon
+  "Struct tags are a PROBE ARTEFACT, not a behaviour: the pinned module tags what
+   it builds with its own atom, so the two runs' decimal (and impl) structs are
+   made comparable here. Everything else — fields, tuples, binaries, nested maps
+   — compares raw."
+  [x]
+  (cond
+    (erlang/is_map x)
+    (let [t (struct-tag x)]
+      (cond
+        (or (erlang/== t probe) (erlang/== t live)) (maps/put :__struct__ :DECIMAL x)
+        (or (erlang/== t inspect-probe) (erlang/== t live-inspect)) (maps/put :__struct__ :INSPECT x)
+        :else (lists/foldl
+                (fn [kv acc] (maps/put (canon (erlang/element 1 kv))
+                                       (canon (erlang/element 2 kv)) acc))
+                (maps/new)
+                (maps/to_list x))))
+
+    (erlang/is_tuple x)
+    (erlang/list_to_tuple (lists/map canon (erlang/tuple_to_list x)))
+
+    (and (erlang/is_list x) (erlang/=/= x ())) (lists/map canon x)
+
+    :else x))
+
+(defn- norm
+  "Map the probe's own atom out of a message, so a `FunctionClauseError` name
+   compares equal to the live module's. The probe string is a SUPERSTRING of the
+   live one (`BeamLisp.DecimalHostProbe` → `BeamLisp.Decimal`), so one replace
+   covers both the type module and `Inspect.BeamLisp.Decimal`."
+  [m]
+  (if (erlang/is_binary m)
+    (String/replace
+      (String/replace m "BeamLisp.DecimalHostProbe" "BeamLisp.Decimal")
+      "\"-inlined-__impl__/1-\""
+      "__impl__")
+    m))
+
+(defn- answer
+  "`[:value v]` or `[:raise class message data]`. The class, the message and the
+   `data` are all part of the ABI a caller's `catch`/`ex-message`/`ex-data`
+   reads."
+  [mod fname args]
+  (try (list :value (canon (erlang/apply mod fname args)))
+       (catch e (list :raise (canon (struct-tag e)) (norm (ex-message e)) (canon (ex-data-of e))))))
+
+(defn- answers [mod qs]
+  ; EAGER, and deliberately so: the corpus is built from lazy seqs, and
+  ; `erlang/apply` takes an Erlang LIST, so every query and every answer is
+  ; realized here, where a failure names the group instead of surfacing as a
+  ; badarg from inside the harness's own forcing.
+  (to-list (map (fn [q] (list (first q) (answer mod (first q) (second q))))
+                (to-list qs))))
+
+(defn- live-q [qs] (answers live qs))
+(defn- probe-q [qs] (answers probe qs))
+
+; ── the corpus ───────────────────────────────────────────────────────────
+
+(def us-pairs
+  "The `(unscaled, scale)` pairs the corpus builds decimals from."
+  (list (list 1 0) (list 0 0) (list -1 0) (list 10 1) (list 15 1) (list 150 2)
+        (list -15 1) (list 100 0) (list 3 0) (list 7 0) (list -12 1)
+        (list 12345 2) (list 0 5) (list 5 3) (list -3 2) (list 1234 4)
+        (list 1 3) (list -1 3) (list 1500 3) (list -1500 3)))
+
+(def scales (list 0 1 2 4 6))
+(def n-counts (list -3 -1 0 1 2 4))
+(def non-integer-ns (list "1" nil 1.5))
+
+(def garbage
+  "Values no clause accepts as a decimal and none coerces: an atom, a string,
+   nil, booleans, a list, a tuple, a map and a vector."
+  (list :a nil true false (list 1 2) (list) (tuple 1 2) {:a 1} [1 2] "s"))
+
+(def strings
+  "Every textual shape `parse/1` must answer for: plain, signed, fractional,
+   exponent, whitespace, and the malformed bodies the reader refuses."
+  (list "1" "0" "-1" "+1" "1.5" "1.50" "-0.001" "  1e3  " "+.5e-2" ""
+        "." "1." ".5" "1e" "e1" "abc" "1.2.3" "1_000" "0x10" "\t1\n" "1E+2"
+        "-" "+" "  " "00123" "1e999" "0.000" "١٢" "1e-3" "  +0.0M  " "1e+0"))
+
+(defn- ds [mod]
+  (lists/map (fn [p] (erlang/apply mod :of p)) us-pairs))
+
+(defn- un-of [u s] (erlang/apply live :of (list u s)))
+(defn- un-new [x] (erlang/apply live :new (list x)))
+
+(defn- queries-base
+  "Constructors, conversions and the one-argument surface. Decimals are built
+   PER MODULE, so each run only ever sees values its own module accepts."
+  [mod]
+  (let [decimals (ds mod)
+        ints (list 0 1 -1 10 1000000)
+        floats (list 0.0 1.0 -1.5 0.1 2.5 -0.0 1.0e-3 123.456)]
+    (concat
+      (map (fn [x] (list :new (list x))) (concat ints floats strings decimals garbage))
+      (map (fn [p] (list :of p))
+           (concat us-pairs
+                   (list (list 1 -1) (list 1.5 0) (list 0 1.5) (list "1" 0)
+                         (list 1 "0") (list nil 0) (list 0 nil))))
+      (map (fn [x] (list :from_float (list x))) (concat floats ints strings decimals))
+      (map (fn [s] (list :parse (list s))) (concat strings (list 123 :a nil (list 1) [1 2])))
+      (map (fn [s] (list :parse! (list s))) (concat strings (list 123)))
+      (mapcat (fn [f] (map (fn [d] (list f (list d))) (concat decimals garbage)))
+              (list :signum :neg :abs :scale :unscaled :precision :to_integer
+                    :to_plain_string :to_literal :strip_zeros :codec_key_parts :to_float))
+      (list (list :zero (list)) (list :one (list)) (list :ten (list)) (list :modes (list))))))
+
+(defn- queries-arith [mod]
+  ; Integers and floats are in the mix on purpose: `compare/2` COERCES them
+  ; (`new/1`), so `(compare 1.5M 2)` is a supported call, while `add/2` reports
+  ; the `align/2` clause failure a raw integer earns. Both must agree with live.
+  (let [vals (concat (ds mod) (list 1 2.5 "s" :a nil [1 2]))]
+    (mapcat (fn [f] (map (fn [p] (list f p)) (for [a vals b vals] (list a b))))
+            (list :add :sub :mul :compare :eq?))))
+
+(defn- queries-div [mod]
+  (let [decimals (ds mod)
+        head (take 8 decimals)
+        mixed (concat decimals (list 0 1 1.5 "s" :a nil))]
+    (concat
+      (map (fn [p] (list :div p)) (for [a mixed b mixed] (list a b)))
+      (mapcat (fn [p]
+                (mapcat (fn [scale]
+                          (map (fn [mode] (list :div (erlang/++ p (list scale mode))))
+                               (concat (erlang/apply mod :modes (list))
+                                       (list :bogus "half-even" nil))))
+                        (list 0 1 3 5)))
+              (for [a head b head] (list a b))))))
+
+(defn- queries-rescale [mod]
+  (let [decimals (ds mod)
+        head (take 6 decimals)]
+    (concat
+      (mapcat (fn [d] (map (fn [s] (list :rescale (list d s)))
+                           (concat scales (list -1 "2" nil 2.0))))
+              (concat decimals garbage))
+      (mapcat (fn [d]
+                (mapcat (fn [s]
+                          (map (fn [mode] (list :rescale (list d s mode)))
+                               (concat (erlang/apply mod :modes (list)) (list :bogus nil))))
+                        scales))
+              head))))
+
+(defn- queries-move [mod]
+  (let [decimals (ds mod)
+        ns (concat n-counts (list "1" nil 1.5))]
+    ; TWO corpora, and the SPLIT is the point: a decimal takes any count, but a
+    ; NON-decimal takes only a non-integer one — an integer count there is the
+    ; live module's infinite mutual recursion (see the divergence test), so it
+    ; must not enter a differential corpus at all.
+    (concat (mapcat (fn [d] (map (fn [n] (list :move_point_left (list d n))) ns)) decimals)
+            (mapcat (fn [d] (map (fn [n] (list :move_point_right (list d n))) ns)) decimals)
+            (mapcat (fn [d] (map (fn [n] (list :move_point_left (list d n))) non-integer-ns)) garbage)
+            (mapcat (fn [d] (map (fn [n] (list :move_point_right (list d n))) non-integer-ns)) garbage))))
+
+(defn- short-strings
+  "EVERY string of length 0–4 over the characters a decimal literal is built
+   from — 4681 inputs, so the parser's accept/reject boundary is exhausted
+   rather than sampled. `parse/1` runs the live pattern through the same engine;
+   what this pins is the POST-PROCESSING (trailing-group padding, the sign, the
+   exponent fold), which is where a hand port could drift."
+  []
+  (let [alphabet (list "1" "0" "9" "." "e" "+" "-" " ")]
+    (concat (list "")
+            (for [a alphabet] a)
+            (for [a alphabet b alphabet] (str a b))
+            (for [a alphabet b alphabet c alphabet] (str a b c))
+            (for [a alphabet b alphabet c alphabet d alphabet] (str a b c d)))))
+
+(defn- queries-parse-exhaustive [_mod]
+  (map (fn [s] (list :parse (list s))) (short-strings)))
+
+(defn- corpus [mod]
+  (concat (queries-base mod) (queries-arith mod) (queries-div mod)
+          (queries-rescale mod) (queries-move mod) (queries-parse-exhaustive mod)))
+
+; ── the pinned ABI, answer for answer ────────────────────────────────────
+
+(deftest decimal-pinned-matches-the-live-module
+  (testing "the whole corpus: probe answers equal the live module's, question for question"
+    (let [dir (tmp-dir)]
+      (compile-probe dir)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (erlang/== :non_existing (erlang/apply :code :which (list dec-shim))))
+      ; STRUCT module: the synthesized constructor/introspection pair is here.
+      (is (erlang/function_exported probe :__struct__ 0))
+      (is (erlang/function_exported probe :__struct__ 1))
+      (is (erlang/function_exported probe :__info__ 1))
+      (is (= (erlang/apply live :__info__ (list :struct))
+             (erlang/apply probe :__info__ (list :struct)))
+          "__info__(:struct) — same fields, same defaults, same order")
+      (is (= (maps/put :__struct__ probe (maps/put :unscaled 0 (maps/put :scale 0 (maps/new))))
+             (erlang/apply probe :__struct__ (list)))
+          "__struct__/0 is the zero decimal, tagged for THIS beam")
+      ; The production module's ABI is present on the probe beam, and only ONE
+      ; export is excluded: `__info__/1`, which the pinned emitter synthesizes
+      ; with `:struct_fields` (asserted above) where live carries `defstruct`'s
+      ; generated introspection. The `defguard`'s compile-time artifact IS here —
+      ; this file writes `MACRO-is_decimal`, so the probe exports it as a plain
+      ; function too. What makes it a MACRO to a `require`ing Elixir caller is
+      ; the `__info__(:macros)` entry `:macro_exports` adds, asserted in
+      ; `decimal-is-decimal-is-a-require-able-macro` below.
+      (is (erlang/function_exported live :add 2) "the production decimal is loaded")
+      (is (every? (fn [e] (or (erlang/== :__info__ (erlang/element 1 e))
+                              (erlang/function_exported probe (erlang/element 1 e) (erlang/element 2 e))))
+                  (erlang/apply live :module_info (list :exports)))
+          "the pinned ABI covers every live export")
+      (is (erlang/function_exported probe :"MACRO-is_decimal" 2)
+          "the defguard's compile-time artifact is exported, as live's beam exports it")
+      (is (erlang/== :is_decimal (first (keys (erlang/apply live :__info__ (list :macros)))))
+          "the live module's only macro is is_decimal/1")
+      ; PINNED ANSWERS first — the ABI itself, not merely probe == live.
+      (is (= "1.50M" (erlang/apply probe :to_literal (list (erlang/apply probe :of (list 150 2))))))
+      (is (= "0.001" (erlang/apply probe :to_plain_string (list (erlang/apply probe :of (list 1 3))))))
+      (is (= 12345 (erlang/apply probe :unscaled (list (erlang/apply probe :of (list 12345 2))))))
+      (is (= 2 (erlang/apply probe :scale (list (erlang/apply probe :of (list 12345 2))))))
+      (is (= 5 (erlang/apply probe :precision (list (erlang/apply probe :of (list 12345 2))))))
+      (is (= 123 (erlang/apply probe :to_integer (list (erlang/apply probe :of (list 12345 2))))))
+      (is (= 1.5 (erlang/apply probe :to_float (list (erlang/apply probe :of (list 15 1))))))
+      (is (= -1 (erlang/apply probe :compare (list (erlang/apply probe :of (list -15 1))
+                                                   (erlang/apply probe :of (list 1 0))))))
+      (is (erlang/apply probe :eq? (list (erlang/apply probe :of (list 15 1))
+                                         (erlang/apply probe :of (list 150 2)))))
+      (is (= "1000" (erlang/apply probe :to_plain_string
+                                  (list (erlang/apply probe :parse! (list "1e3"))))))
+      (is (erlang/== :unnecessary (lists/nth 8 (erlang/apply probe :modes (list)))))
+      (is (= "1.5" (erlang/apply probe :to_plain_string
+                                 (list (erlang/apply probe :strip_zeros
+                                                     (list (erlang/apply probe :of (list 1500 3))))))))
+      ; THE DIFF. One question list, two modules, equal answers. The size is
+      ; asserted first: a corpus that silently emptied would pass the diff.
+      (is (< 10000 (count (corpus probe))) "the corpus is big enough to mean something")
+      (is (= 4681 (count (short-strings))) "the short-string space is exhausted, not sampled")
+      (is (= (live-q (corpus live)) (probe-q (corpus probe))))
+      ; per-group, so a failure names the operation instead of dumping it all.
+      (doseq [np (list (list "base" queries-base) (list "arith" queries-arith)
+                       (list "div" queries-div) (list "rescale" queries-rescale)
+                       (list "move" queries-move)
+                       (list "parse-exhaustive" queries-parse-exhaustive))]
+        (is (= (live-q ((second np) live)) (probe-q ((second np) probe)))
+            (str "group " (first np))))
+      ; REPRODUCIBLE: a rebuild of the same source is the same bytes, so the
+      ; beam can be committed into the seed and re-derived.
+      (let [dir2 (tmp-dir)
+            again (erlang/element 2 (BeamLisp.AOT/compile_host_file (dec-source)
+                                    (list (t2 :module probe) (t2 :output_dir dir2)
+                                          (t2 :load? false)
+                                          (t2 :struct_fields (decimal-fields)))))]
+        (is (= (File/read! (erlang/element 2 (BeamLisp.AOT/compile_host_file (dec-source)
+                              (list (t2 :module probe) (t2 :output_dir dir)
+                                    (t2 :load? false)
+                                    (t2 :struct_fields (decimal-fields))))))
+               (File/read! again))))
+      ; The SAME source compiles at its PRODUCTION atom — read, not loaded:
+      ; `:load? false` writes the beam without replacing the live module.
+      (let [res (BeamLisp.AOT/compile_host_file (dec-source)
+                  (list (t2 :module live) (t2 :output_dir dir) (t2 :load? false)
+                        (t2 :struct_fields (decimal-fields))))]
+        (is (erlang/== live (erlang/element 1 res)))
+        (is (File/exists? (erlang/element 2 res)))
+        (is (= "1.5M" (erlang/apply live :to_literal (list (erlang/apply live :of (list 15 1)))))
+            "the live module was never substituted mid-flight"))
+      (File/rm_rf! dir))))
+
+; ── `defguard is_decimal/1`: the macro, in a cold child ────────────────
+;
+; `decimal.ex` declares its tag test with `defguard`, so the module's artifacts
+; for it are the compile-time PAIR `MACRO-is_decimal/2` and the
+; `__info__(:macros)` entry `{is_decimal, 1}` — a `require`d caller expands the
+; one and finds it through the other. A pinned `.bl` file has neither surface of
+; its own, so the entry comes from `compile_host_file`'s `:macro_exports` and
+; the implementer is a top-level `defn` named `MACRO-is_decimal`.
+;
+; The proof is DIFFERENTIAL, the same way the corpus is: ONE piece of Elixir
+; source is compiled and run twice — here, where `BeamLisp.Decimal` is the live
+; Elixir module, and in a child VM whose ONLY added code path entry is the
+; pinned beam (no application boot, no `lib/` image at all) — and the two
+; observations must be the SAME TERM. Anything the pinned expander got wrong
+; about the guard shows up as a different verdict.
+
+(defn- guard-fixture
+  "The fixture, as source text, ending with `out = Base.encode64(...)` so a
+   caller reads the value here and the child prints it. The corpus it observes
+   holds no decimal — only the VERDICTS — so the two runs' terms must be equal
+   rather than merely comparable, and the `bump` counter pins the one shape
+   difference there is between a guard and an expression: an argument outside a
+   guard is read ONCE."
+  []
+  (str
+    "defmodule DecimalGuardFixture do\n"
+    "  require BeamLisp.Decimal\n"
+    "  def classify(x) when BeamLisp.Decimal.is_decimal(x), do: :decimal\n"
+    "  def classify(_), do: :other\n"
+    "  def via_if(x), do: if(BeamLisp.Decimal.is_decimal(x), do: :decimal, else: :other)\n"
+    "  def inline(x), do: BeamLisp.Decimal.is_decimal(x)\n"
+    "  def both(a, b), do: BeamLisp.Decimal.is_decimal(a) and BeamLisp.Decimal.is_decimal(b)\n"
+    "end\n"
+    "mixed = [BeamLisp.Decimal.of(15, 1), BeamLisp.Decimal.new(\"-1e3\"),\n"
+    "         %{__struct__: BeamLisp.Decimal}, %{__struct__: Enum}, %URI{},\n"
+    "         0, 1, -1, 1.5, nil, :a, \"1\", [], [1, 2], {}, %{}, self()]\n"
+    "counts = :counters.new(1, [])\n"
+    "bump = fn -> :counters.add(counts, 1, 1); BeamLisp.Decimal.of(15, 1) end\n"
+    "readings = for x <- mixed, do: [DecimalGuardFixture.classify(x),\n"
+    "                                DecimalGuardFixture.via_if(x),\n"
+    "                                DecimalGuardFixture.inline(x)]\n"
+    "once = [DecimalGuardFixture.inline(bump.()), :counters.get(counts, 1)]\n"
+    "twice = [DecimalGuardFixture.inline(bump.()) and DecimalGuardFixture.inline(bump.()),\n"
+    "         :counters.get(counts, 1)]\n"
+    "pairs = for a <- mixed, b <- mixed, do: DecimalGuardFixture.both(a, b)\n"
+    "out = Base.encode64(:erlang.term_to_binary({readings, once, twice, pairs}))\n"))
+
+(defn- guard-child-tail
+  "`fixture` plus what a CHILD prints: the observation, then the evidence that
+   the observation came from the pinned beam and from a module advertising the
+   macro. `:code.which/1` is the replacement proof — a legacy `decimal.ex` beam
+   would answer with its own path and a different `source`."
+  [fixture]
+  (str fixture
+    "IO.puts(\"observed=\" <> out)\n"
+    "IO.puts(\"which=\" <> List.to_string(:code.which(BeamLisp.Decimal)))\n"
+    "IO.puts(\"source=\" <> List.to_string(BeamLisp.Decimal.module_info(:compile)[:source]))\n"
+    "IO.puts(\"macros=\" <> inspect(BeamLisp.Decimal.__info__(:macros)))\n"
+    "IO.puts(\"macro_functions=\" <> inspect(Enum.filter(BeamLisp.Decimal.__info__(:functions), fn {n, _} -> String.starts_with?(Atom.to_string(n), \"MACRO-\") end)))\n"))
+
+(defn- ast_call_head
+  "`(mod fun)` when `ast` is the remote-call node `{{:., _, [mod, fun]}, _, _}`,
+   else nil. A macro's contract is a TERM, so the term is read as data."
+  [ast]
+  (if (and (erlang/is_tuple ast) (erlang/== 3 (erlang/tuple_size ast)))
+    (let [f (erlang/element 1 ast)]
+      (if (and (erlang/is_tuple f)
+               (erlang/== 3 (erlang/tuple_size f))
+               (erlang/== :"." (erlang/element 1 f)))
+        (let [t (erlang/element 3 f)]
+          (list (first t) (second t)))
+        nil))
+    nil))
+
+(deftest decimal-is-decimal-is-a-require-able-macro
+  (testing "`defguard is_decimal/1` survives as the Elixir macro it was"
+    (let [dir (tmp-dir)]
+      ; (1) THE ABI, on a probe beam: `:macro_exports` is the whole difference
+      ; between a function named `MACRO-…` and a macro `require` will expand,
+      ; and the implementer's two shapes are driven here by the caller
+      ; environment Elixir passes it.
+      (let [res (BeamLisp.AOT/compile_host_file (dec-source)
+                  (list (t2 :module probe) (t2 :output_dir dir) (t2 :load? false)
+                        (t2 :struct_fields (decimal-fields))
+                        (t2 :macro_exports (list (t2 :is_decimal 1)))))
+            m (load-pinned probe (erlang/element 2 res))]
+        (drop! dec-shim)
+        (is (= (erlang/apply live :__info__ (list :macros))
+               (erlang/apply m :__info__ (list :macros)))
+            "`__info__(:macros)` is live's — [{:is_decimal, 1}] — so `require` expands it")
+        (is (not (Enum/member? (erlang/apply m :__info__ (list :functions))
+                               (tuple :"MACRO-is_decimal" 2)))
+            "the MACRO- implementer is NOT in `:functions`, exactly as in Elixir")
+        (let [arg {:x (quote ())}
+              plain-caller (erlang/apply :Elixir.Macro.Env :__struct__ (list))
+              guard-caller (maps/put :context :guard plain-caller)
+              in-guard (erlang/apply m :"MACRO-is_decimal" (list guard-caller arg))
+              in-body (erlang/apply m :"MACRO-is_decimal" (list plain-caller arg))
+              stmts (erlang/element 3 in-body)]
+          (is (= (list :erlang :andalso) (ast_call_head in-guard))
+              "in a guard it answers the GUARD EXPRESSION — `:erlang.andalso` at the head")
+          (is (erlang/== :__block__ (erlang/element 1 in-body))
+              "outside a guard it binds the argument once first — defguard's own shape")
+          (is (= (list :erlang :andalso) (ast_call_head (nth stmts 1)))
+              "and the guard expression is that block's last statement")
+          (is (erlang/== arg (nth (erlang/element 3 (nth stmts 0)) 1))
+              "the binding's right-hand side is the caller's own argument AST")))
+      ; (1b) `:macro_exports` may stand ALONE — a macro-only pinned module, with
+      ; no struct surface at all. `__info__(:struct)` then answers `nil`, which
+      ; is what a live Elixir module without `defstruct` answers.
+      (let [res (BeamLisp.AOT/compile_host_file (dec-source)
+                  (list (t2 :module macro-probe) (t2 :output_dir dir) (t2 :load? false)
+                        (t2 :macro_exports (list (t2 :is_decimal 1)))))
+            m (load-pinned macro-probe (erlang/element 2 res))]
+        (drop! dec-shim)
+        (is (erlang/== (list (tuple :is_decimal 1)) (erlang/apply m :__info__ (list :macros))))
+        (is (erlang/== nil (erlang/apply m :__info__ (list :struct)))))
+      ; (1c) THE REFUSALS: a spec with no implementer, and a spec that is not a
+      ; `{name, arity}` pair. Advertising a macro whose `MACRO-` function does
+      ; not exist would be an `undef` at the caller's first expansion, so it is
+      ; refused here, by name.
+      (is (erlang/== :refused
+                     (try (do (BeamLisp.AOT/compile_host_file (dec-source)
+                                (list (t2 :module probe) (t2 :output_dir dir) (t2 :load? false)
+                                      (t2 :macro_exports (list (t2 :nope 1)))))
+                              :compiled)
+                          (catch e (if (and (erlang/== :Elixir.ArgumentError (struct-tag e))
+                                            (includes? (ex-message e) "MACRO-nope/2"))
+                                      :refused
+                                      (list :wrong (struct-tag e) (ex-message e))))))
+          ":macro_exports with no implementer is refused BY NAME, not advertised")
+      (is (erlang/== :refused
+                     (try (do (BeamLisp.AOT/compile_host_file (dec-source)
+                                (list (t2 :module probe) (t2 :output_dir dir) (t2 :load? false)
+                                      (t2 :macro_exports (list :is_decimal))))
+                              :compiled)
+                          (catch e (if (and (erlang/== :Elixir.ArgumentError (struct-tag e))
+                                            (includes? (ex-message e) "{name, arity} pairs"))
+                                      :refused
+                                      (list :wrong (struct-tag e) (ex-message e))))))
+          "a malformed :macro_exports entry is refused by shape")
+      ; (2) ONE FIXTURE, TWO VMs: the live macro here, the pinned beam in a cold
+      ; child whose only added code path entry is the beam's directory.
+      (let [out (str dir "/guard")
+            body (guard-fixture)
+            here (erlang/element 1 (Code/eval_string (str body "out")))]
+        (BeamLisp.AOT/compile_host_file (dec-source)
+          (list (t2 :module live) (t2 :output_dir out) (t2 :load? false)
+                (t2 :struct_fields (decimal-fields))
+                (t2 :macro_exports (list (t2 :is_decimal 1)))))
+        (is (File/exists? (Path/join out (str live ".beam"))))
+        (let [r (System/cmd "elixir"
+                            (to-list (list "-pa" out "-e" (guard-child-tail body)))
+                            (to-list [(tuple :cd (BeamLisp/cwd))
+                                      (tuple :stderr_to_stdout true)
+                                      (tuple :env (list (tuple "ERL_CRASH_DUMP" "/dev/null")))]))
+              text (erlang/element 1 r)]
+          (is (zero? (erlang/element 2 r)) (str "the cold child exited " (erlang/element 2 r) ":\n" text))
+          (is (< 100 (count here)) "the observation is a real term, not an empty one")
+          (is (includes? text (str "observed=" here))
+              "the PINNED macro's guard answers exactly as the LIVE one's, value for value")
+          (is (includes? text (str "which=" out "/Elixir.BeamLisp.Decimal.beam"))
+              "from the pinned beam: the child's ONLY added code path entry")
+          (is (includes? text (str "source=" (dec-source)))
+              "compiled from priv/host/decimal.bl, not from decimal.ex")
+          (is (includes? text "macros=[is_decimal: 1]")
+              "the child's module advertises the macro")
+          (is (includes? text "macro_functions=[]")
+              "and does not advertise the implementer as a function"))
+        (File/rm_rf! out))
+      (File/rm_rf! dir))))
+
+; ── the exception surface, pinned by class / message / data ──────────────
+(deftest decimal-pinned-errors-are-the-live-errors
+  (testing "coercion refusals, division refusals and clause names, class for class"
+    (let [dir (tmp-dir)]
+      (compile-probe dir)
+      (let [p1 (erlang/apply probe :of (list 1 0))
+            p3 (erlang/apply probe :of (list 3 0))
+            p0 (erlang/apply probe :of (list 0 0))]
+
+        ; a FLOAT is refused, from `new/1`, with the tuned message and the value.
+        (let [a (answer probe :new (list 1.0))]
+          (is (erlang/== :raise (first a)))
+          (is (erlang/== :Elixir.BeamLisp.ExInfo (nth a 1)))
+          (is (= "a float is not an exact decimal: 1.0 (use decimal/from-float to approximate on purpose)"
+                 (nth a 2)))
+          (is (erlang/== :"decimal/inexact-operand" (maps/get :type (nth a 3) nil)))
+          (is (= 1.0 (maps/get :value (nth a 3) nil)))
+          (is (= a (answer live :new (list 1.0)))))
+        (is (= (answer live :new (list :a)) (answer probe :new (list :a)))
+            "a non-number names itself in the message, printed by the runtime")
+        (is (= (answer live :new (list [1 2])) (answer probe :new (list [1 2]))))
+
+        ; DIVISION by zero, from both arities.
+        (let [a (answer probe :div (list p1 p0))]
+          (is (erlang/== :Elixir.BeamLisp.ExInfo (nth a 1)))
+          (is (= "decimal division by zero" (nth a 2)))
+          (is (erlang/== :"decimal/divide-by-zero" (maps/get :type (nth a 3) nil)))
+          (is (= a (answer live :div (list (un-of 1 0) (un-of 0 0))))))
+        (is (= (answer live :div (list (un-of 1 0) (un-of 0 0) 2 :half-even))
+               (answer probe :div (list p1 p0 2 :half-even))))
+
+        ; NON-TERMINATING exact division carries BOTH operands as data.
+        (let [a (answer probe :div (list p1 p3))]
+          (is (erlang/== :Elixir.BeamLisp.ExInfo (nth a 1)))
+          (is (= "non-terminating decimal expansion; no exact representable decimal result"
+                 (nth a 2)))
+          (is (erlang/== :"decimal/non-terminating" (maps/get :type (nth a 3) nil)))
+          (is (= a (answer live :div (list (un-of 1 0) (un-of 3 0))))))
+
+        ; `:unnecessary` refuses to round — on a value that WOULD lose a digit.
+        (let [a (answer probe :rescale (list (erlang/apply probe :of (list 15 1)) 0))]
+          (is (erlang/== :Elixir.BeamLisp.ExInfo (nth a 1)))
+          (is (= "rounding necessary" (nth a 2)))
+          (is (erlang/== :"decimal/rounding-necessary" (maps/get :type (nth a 3) nil)))
+          (is (= a (answer live :rescale (list (un-of 15 1) 0)))))
+
+        ; CLAUSE names: `add/2` reports `align/2`, `mul/2` reports `mul/2` — the
+        ; head that actually failed, in the module that was actually raising.
+        (is (= (list :raise :Elixir.FunctionClauseError
+                     "no function clause matching in BeamLisp.Decimal.align/2" nil)
+               (answer probe :add (list :a 1))))
+        (is (= (list :raise :Elixir.FunctionClauseError
+                     "no function clause matching in BeamLisp.Decimal.align/2" nil)
+               (answer probe :sub (list 1 :a))))
+        (is (= (list :raise :Elixir.FunctionClauseError
+                     "no function clause matching in BeamLisp.Decimal.mul/2" nil)
+               (answer probe :mul (list p1 2))))
+        (is (= (list :raise :Elixir.FunctionClauseError
+                     "no function clause matching in BeamLisp.Decimal.of/2" nil)
+               (answer probe :of (list 1 -1))))
+        (is (= (list :raise :Elixir.FunctionClauseError
+                     "no function clause matching in BeamLisp.Decimal.div/4" nil)
+               (answer probe :div (list p1 p3 2 :bogus))))
+        (is (= (list :raise :Elixir.FunctionClauseError
+                     "no function clause matching in BeamLisp.Decimal.rescale/2" nil)
+               (answer probe :rescale (list :x 1))))
+        (is (= (list :raise :Elixir.FunctionClauseError
+                     "no function clause matching in BeamLisp.Decimal.parse/1" nil)
+               (answer probe :parse (list 123))))
+        ; module-exactness itself: the raised `:module` is the PROBE atom, which
+        ; is what makes the same source raise `BeamLisp.Decimal` at production.
+        (is (erlang/== probe (maps/get :module (try (erlang/apply probe :add (list :a 1)) nil (catch e e)))))
+        (is (erlang/== live (maps/get :module (try (erlang/apply live :add (list :a 1)) nil (catch e e)))))
+
+        ; `to_float` past binary64 is the live `MatchError` on the destructure
+        ; (a plain string `Float.parse` cannot take). The SMALL side is not an
+        ; error at all — it underflows to `0.0` — and both agree either way.
+        (let [p (list (Integer/pow 10 400) 0)]
+          (is (erlang/== :Elixir.MatchError
+                         (nth (answer probe :to_float (list (erlang/apply probe :of p))) 1)))
+          (is (= (answer live :to_float (list (erlang/apply live :of p)))
+                 (answer probe :to_float (list (erlang/apply probe :of p))))))
+        (is (= 0.0 (erlang/apply probe :to_float (list (erlang/apply probe :of (list 1 400))))))
+        (is (= (answer live :to_float (list (un-of 1 0))) (answer probe :to_float (list p1)))))
+      (File/rm_rf! dir))))
+
+; ── the index key, pinned in absolute terms as well as differentially ────
+
+(def key-cases
+  "Values the index key is diffed over: the `us-pairs` set plus the magnitudes
+   that exercise the exact tie-break — integers past 2^53 (where several
+   distinct integers share one double), long fractional tails, and both signs."
+  (concat us-pairs
+          (list (list 9007199254740993 0) (list 9007199254740995 0)
+                (list -9007199254740993 0) (list 9007199254740993 3)
+                (list 12345678901234567890123 0) (list -12345678901234567890123 0)
+                (list 1 20) (list -1 20) (list 123456789 6) (list 5 0)
+                (list 50 1) (list 500 2) (list 2 64))))
+
+(deftest decimal-pinned-index-key-is-the-codec-key
+  (testing "codec_key_parts: the float prefix, the relation byte and the exact suffix"
+    (let [dir (tmp-dir)]
+      (compile-probe dir)
+      (let [k (fn [u s] (erlang/apply probe :codec_key_parts (list (erlang/apply probe :of (list u s)))))]
+        ; an INTEGRAL decimal takes the integer anchor and an empty suffix: it
+        ; must collide with the equal integer in datom's AVET index.
+        (is (= (tuple 1.0 1 "") (k 1 0)))
+        (is (= (tuple -1.0 1 "") (k -1 0)))
+        (is (= (tuple 0.0 1 "") (k 0 0)))
+        (is (= (tuple 100.0 1 "") (k 100 0)))
+        ; a value that survives the round trip exactly keeps `rel = 1`.
+        (is (= (tuple 1.5 1 "") (k 15 1)))
+        (is (= (tuple -1.5 1 "") (k -15 1)))
+        ; `1.0M` and `1.00M` key IDENTICALLY (strip_zeros runs first).
+        (is (= (k 10 1) (k 100 2)))
+        (is (= (k 150 2) (k 15 1)))
+        (is (= (k 0 5) (k 0 0)))
+        ; a value that does NOT survive binary64 keeps the relation byte its
+        ; exact value earns, and the canonical exact suffix after it. 1/1000 is
+        ; BELOW its nearest double (which is a hair ABOVE one thousandth).
+        (is (= (tuple 0.001 0 (erlang/list_to_binary (list 1 0 0 0 0 255 1 1 2 0))) (k 1 3)))
+        (is (= (tuple 123.45 0 (erlang/list_to_binary (list 1 0 0 0 1 123 255 5 6 0))) (k 12345 2)))
+        ; ... and the whole corpus agrees byte for byte — including the
+        ; magnitudes where the tie-break actually fires.
+        (doseq [p key-cases]
+          (is (= (erlang/apply live :codec_key_parts (list (erlang/apply live :of p)))
+                 (k (first p) (second p)))
+              (str "key " p)))
+
+        ; THE TIE-BREAK SUFFIX IS `codec.bl`'s OWN bignum encoding, byte for
+        ; byte, and the MARKER is the exact relation to the rounded float —
+        ; checked against the value rather than assumed from its sign.
+        ;
+        ; NB (found here, NOT this port's business): `codec.bl`'s INTEGER path
+        ; writes marker 2 for every positive integer past 2^53 (`(if (>= v 0) 2
+        ; 0)`), which is only right when the nearest double rounded DOWN.
+        ; `9007199254740995` (2^53+3) rounds UP to `9007199254740996.0`, so its
+        ; integer key sorts above that float and no longer equals the key of the
+        ; equal decimal, which carries the correct marker 0. That is a defect in
+        ; the integer path of `datom.codec`, reported with this change and left
+        ; untouched: it is production code with its own oracle, and this port's
+        ; ABI is byte-for-byte the live `BeamLisp.Decimal`'s either way.
+        (doseq [n (list 9007199254740993 9007199254740995 12345678901234567890123
+                        -9007199254740993 -12345678901234567890123)]
+          (let [p (k n 0)
+                q (erlang/element 1 p)]
+            (is (= (cond (erlang/< n q) 0 (erlang/> n q) 2 :else 1) (erlang/element 2 p))
+                (str "the marker is the exact relation to " q))
+            (is (= (BeamLisp.Ns.Datom.Codec/encode-bignum-magnitude n) (erlang/element 3 p))
+                (str "the exact suffix IS codec.bl's bignum encoding " n))))
+        ; ... while a value a double DOES represent exactly needs no tie-break:
+        ; marker 1 and an empty suffix, which is what `codec.bl` writes for the
+        ; equal integer and the equal float.
+        (doseq [n (list 0 1 -1 100 9007199254740992 -9007199254740992)]
+          (let [p (k n 0)]
+            (is (= 1 (erlang/element 2 p)) (str "exactly representable " n))
+            (is (= "" (erlang/element 3 p)) (str "no tie-break needed " n)))))
+      (File/rm_rf! dir))))
+
+; ── the Inspect impl ─────────────────────────────────────────────────────
+
+(deftest decimal-pinned-inspect-is-the-live-inspect
+  (testing "the impl renders the literal and answers __impl__ for :for/:protocol"
+    (let [dir (tmp-dir)
+          out (str dir "/prod")
+          bench (Path/join out "Elixir.Inspect.BeamLisp.Decimal.beam")
+          d (un-of 150 2)]
+      (compile-inspect-probe dir)
+      (is (erlang/== :non_existing (erlang/apply :code :which (list inspect-shim))))
+      (is (not (erlang/function_exported inspect-probe :__struct__ 0))
+          "the impl is FUNCTIONS-ONLY")
+      ; the surface: `inspect/2` and `__impl__/1`, nothing more, as live — the
+      ; live generated `__info__/1` is `module_info` pass-through metadata the
+      ; pinned emitter deliberately does not synthesize, so it is excluded by
+      ; name and asserted absent instead.
+      (is (not (erlang/function_exported inspect-probe :__info__ 1)))
+      (is (= (lists/filter (fn [e] (erlang/=/= :__info__ (erlang/element 1 e)))
+                           (lists/sort (erlang/apply live-inspect :module_info (list :exports))))
+             (lists/sort (erlang/apply inspect-probe :module_info (list :exports)))))
+      (is (= "1.50M" (erlang/apply inspect-probe :inspect (list d {}))))
+      (is (= (erlang/apply live-inspect :inspect (list d {}))
+             (erlang/apply inspect-probe :inspect (list d {}))))
+      (is (= "1.50M" (Kernel/inspect d)) "the LIVE impl is the one that answers by default")
+      (is (erlang/== live (erlang/apply inspect-probe :__impl__ (list :for))))
+      (is (erlang/== :Elixir.Inspect (erlang/apply inspect-probe :__impl__ (list :protocol))))
+      ; the refusal differs ONLY in the generated inline name, normalized away —
+      ; and the module inside it is the impl module that was actually raising.
+      (is (= (norm (ex-message (try (erlang/apply live-inspect :__impl__ (list :nope)) nil (catch e e))))
+             (norm (ex-message (try (erlang/apply inspect-probe :__impl__ (list :nope)) nil (catch e e))))))
+      (is (erlang/== inspect-probe
+                    (maps/get :module (try (erlang/apply inspect-probe :__impl__ (list :nope)) nil (catch e e)))))
+      ; a non-decimal is delegated, so it is refused by the TYPE module's own
+      ; clause — the same class and the same named function as live.
+      (is (= (norm (ex-message (try (erlang/apply live-inspect :inspect (list nil {})) nil (catch e e))))
+             (norm (ex-message (try (erlang/apply inspect-probe :inspect (list nil {})) nil (catch e e))))))
+      ; THE CUTOVER: the pinned impl at its production atom answers `Kernel.inspect`,
+      ; then the live beam is restored.
+      (let [orig-path (erlang/apply :code :which (list live-inspect))
+            orig-bin (File/read! (erlang/list_to_binary orig-path))]
+        (is (not= :non_existing orig-path) "precondition: the live impl beam is readable")
+        (BeamLisp.AOT/compile_host_file (inspect-source)
+          (list (t2 :module live-inspect) (t2 :output_dir out) (t2 :load? false)))
+        (try
+          (drop! live-inspect)
+          (code/load_binary live-inspect (erlang/binary_to_list bench) (File/read! bench))
+          (is (= "1.50M" (Kernel/inspect d)) "the pinned impl renders the literal")
+          (is (= "1.5M" (Kernel/inspect (un-of 15 1))))
+          (finally
+            (drop! live-inspect)
+            (code/load_binary live-inspect orig-path orig-bin)))
+        (is (= "1.50M" (Kernel/inspect d)) "the live impl is restored"))
+      (File/rm_rf! dir))))
+
+; ── the live infinite loop, and that the port does not carry it ──────────
+
+(deftest decimal-pinned-refuses-the-live-loop
+  (testing "a non-decimal with an integer count: the live mutual recursion never returns"
+    (let [dir (tmp-dir)]
+      (compile-probe dir)
+      ; LIVE: two tail calls with no base case — a spin, not a stack overflow,
+      ; so it must still be running when the bounded wait is over.
+      (let [pid (erlang/spawn (fn [] (erlang/apply live :move_point_left (list :x 1))))]
+        (is (erlang/is_process_alive pid) "the live clause 2 never returns")
+        (erlang/exit pid :kill))
+      (let [pid (erlang/spawn (fn [] (erlang/apply live :move_point_right (list :x 1))))]
+        (is (erlang/is_process_alive pid) "the live clause 2 never returns, either way")
+        (erlang/exit pid :kill))
+      ; PINNED: the error the clause heads promise.
+      (is (= (list :raise :Elixir.FunctionClauseError
+                   "no function clause matching in BeamLisp.Decimal.move_point_left/2" nil)
+             (answer probe :move_point_left (list :x 1))))
+      (is (= (list :raise :Elixir.FunctionClauseError
+                   "no function clause matching in BeamLisp.Decimal.move_point_right/2" nil)
+             (answer probe :move_point_right (list :x -1))))
+      ; ... and every REACHABLE path is identical, including the delegation a
+      ; negative count takes.
+      (let [p (erlang/apply probe :of (list 15 1))]
+        (is (= (answer live :move_point_left (list (un-of 15 1) -2))
+               (answer probe :move_point_left (list p -2))))
+        (is (= (answer live :move_point_right (list (un-of 15 1) -2))
+               (answer probe :move_point_right (list p -2))))
+        (is (= "150" (erlang/apply probe :to_plain_string
+                                     (list (erlang/apply probe :move_point_left (list p -2)))))))
+      (File/rm_rf! dir))))
+
+; ── the pinned beam AT the production atom, through the language ─────────
+;
+; The differential above proves the ABI at a probe atom. This one proves the
+; CUTOVER shape: the same source compiled to `Elixir.BeamLisp.Decimal` and
+; loaded OVER the live module answers the LANGUAGE — the reader parses `1.5M`
+; through it, `BeamLisp.Num` routes `+ * - / < compare pos?` into it, and
+; `BeamLisp.Ns.Rt` prints through it — and the live beam is restored afterwards.
+(deftest decimal-pinned-beam-stands-in-at-the-production-atom
+  (testing "the language's decimal paths run on the pinned module, then the live beam is restored"
+    (let [dir (tmp-dir)
+          out (str dir "/prod")
+          beam (Path/join out "Elixir.BeamLisp.Decimal.beam")
+          orig-path (erlang/apply :code :which (list live))
+          orig-bin (File/read! (erlang/list_to_binary orig-path))
+          exprs (list
+                  "(+ 1.5M 2.25M)"
+                  "(* 1.10M 2M)"
+                  "(- 1M 0.001M)"
+                  "(/ 1M 8M)"
+                  "(/ 1M 3M)"
+                  "(+ 1.0 1M)"
+                  "(+ 1 1)"
+                  "(== 1.0M 1.00M)"
+                  "(= 1.0M 1.00M)"
+                  "(< 1.5M 2)"
+                  "(> -1.5M -2)"
+                  "(compare 1.5M 2)"
+                  "(pos? 0.001M)"
+                  "(zero? 0M)"
+                  "(str 1.50M)"
+                  "(pr-str 1.50M)"
+                  "(BeamLisp.Decimal/precision 1.50M)"
+                  "(BeamLisp.Decimal/to_plain_string (BeamLisp.Decimal/div 100M 3M 3 :half-even))"
+                  "(BeamLisp.Decimal/to_plain_string (BeamLisp.Decimal/rescale 12.5M 0 :half-up))"
+                  "(BeamLisp.Decimal/codec_key_parts 1.5M)"
+                  "(BeamLisp.Decimal/parse \"1e3\")"
+                  "(BeamLisp.Num/add 1M 2M)"
+                  "(BeamLisp.Num/cmp 1.5M 2)")
+          run-all (fn [] (map (fn [src]
+                                (try (list :value (BeamLisp/eval src))
+                                     (catch e (list :raise (struct-tag e) (ex-message e) (ex-data-of e)))))
+                              exprs))]
+      (is (not= :non_existing orig-path) "precondition: the live beam is a readable file")
+      (BeamLisp.AOT/compile_host_file (dec-source)
+        (list (t2 :module live) (t2 :output_dir out) (t2 :load? false)
+              (t2 :struct_fields (decimal-fields))))
+      (let [pinned-answers
+            (try
+              (drop! live)
+              (code/load_binary live (erlang/binary_to_list beam) (File/read! beam))
+              ; The test beam now owns the production atom; the helper and
+              ; synthesized struct surface are available there.
+              (is (= (erlang/binary_to_list beam) (erlang/apply :code :which (list live))))
+              (is (erlang/function_exported live :align 2))
+              (is (erlang/function_exported live :__struct__ 1))
+              (run-all)
+              (finally
+                (drop! live)
+                (code/load_binary live orig-path orig-bin)))]
+        ; ABSOLUTE PINS on the pinned beam, so a shared bug cannot hide here.
+        (is (= (list :value (un-of 375 2)) (nth pinned-answers 0)))
+        (is (= (list :value true) (nth pinned-answers 7)))
+        (is (= (list :value false) (nth pinned-answers 8)))
+        (is (= (list :value -1) (nth pinned-answers 11)))
+        (is (= (list :value "1.50") (nth pinned-answers 14)))
+        (is (= (list :value "1.50M") (nth pinned-answers 15)))
+        (is (= (list :value "33.333") (nth pinned-answers 17)))
+        (is (= (list :value "13") (nth pinned-answers 18)))
+        (is (erlang/== :Elixir.BeamLisp.ExInfo (nth (nth pinned-answers 4) 1))
+            "exact division refuses a non-terminating quotient")
+        (is (erlang/== :"decimal/non-terminating"
+                      (maps/get :type (nth (nth pinned-answers 4) 3) nil)))
+        (is (erlang/== :Elixir.BeamLisp.ExInfo (nth (nth pinned-answers 5) 1))
+            "a float beside a decimal is refused through the operator path")
+        ; THE DIFF, through the language: the original production beam is
+        ; restored and answers identically, even though it is now pinned too.
+        (is (= orig-path (erlang/apply :code :which (list live)))
+            "the original production beam owns the atom again")
+        (is (= pinned-answers (run-all))
+            "the live module answers the same corpus identically")))))
+
+; ── boot safety: no namespace dependency but the inherited one ───────────
+;
+; `decimal.ex` is reached from the BOOT tier: `rt.bl` calls it at runtime,
+; `num.bl` calls it from the boot tier, and the READER calls `parse/1` while
+; reading any file. So the pinned beam's namespace dependencies are the port's
+; real contract, and they are read off the BEAM — not asserted in prose.
+
+(defn- ext-of
+  "The `{:extfunc, mod, fun, arity}` of a call instruction, or nil."
+  [ins]
+  (if (and (erlang/is_tuple ins) (erlang/> (erlang/tuple_size ins) 2))
+    (let [e (erlang/element 3 ins)]
+      (if (and (erlang/is_tuple e) (erlang/== :extfunc (erlang/element 1 e))) e nil))
+    nil))
+
+(defn- ns-deps
+  "Every remote target module in the beam that is a beam-lisp NAMESPACE
+   (`Elixir.BeamLisp.Ns.*`) — the modules interned DURING boot, so a call into
+   one from a boot-path leaf is the circularity `priv/host/vector.bl` documents."
+  [path]
+  (let [fns (erlang/element 6 (erlang/apply :beam_disasm :file (list (erlang/binary_to_list path))))
+        ins (Enum/flat_map (Enum/filter fns (fn [f] (erlang/== :function (erlang/element 1 f))))
+              (fn [f] (erlang/element 5 f)))]
+    (Enum/uniq
+      (Enum/filter
+        (Enum/map (Enum/filter (Enum/map ins ext-of) (fn [x] (not (nil? x))))
+          (fn [t] (erlang/element 2 t)))
+        (fn [m] (String/starts_with? (Atom/to_string m) "Elixir.BeamLisp.Ns."))))))
+
+(defn- env-fetch-ins?
+  "A call instruction into `BeamLisp.Env.fetch!/2` — the var lookup a name this
+   file does not define would compile to."
+  [ins]
+  (cond
+    (not (erlang/is_tuple ins)) false
+    (not (erlang/== :call_ext (erlang/element 1 ins))) false
+    (not (erlang/is_tuple (erlang/element 3 ins))) false
+    (not (erlang/== :extfunc (erlang/element 1 (erlang/element 3 ins)))) false
+    :else (and (erlang/== :Elixir.BeamLisp.Env (erlang/element 2 (erlang/element 3 ins)))
+               (erlang/== :fetch! (erlang/element 3 (erlang/element 3 ins))))))
+
+(defn- env-fetch-sites [path]
+  (let [fns (erlang/element 6 (erlang/apply :beam_disasm :file (list (erlang/binary_to_list path))))]
+    (reduce
+      (fn [acc f]
+        (if (erlang/== :function (erlang/element 1 f))
+          (let [nm (erlang/element 2 f)
+                ar (erlang/element 3 f)]
+            (reduce (fn [a ins] (if (env-fetch-ins? ins) (cons (tuple nm ar) a) a))
+                    acc (erlang/element 5 f)))
+          acc))
+      ()
+      fns)))
+
+(deftest decimal-pinned-is-boot-safe
+  (testing "the type beam's only namespace dep is Rt; the impl's are its siblings'"
+    (let [dir (tmp-dir)]
+      (compile-probe dir)
+      (compile-inspect-probe dir)
+      (let [dpath (Path/join dir (str probe ".beam"))
+            ipath (Path/join dir (str inspect-probe ".beam"))]
+        ; NO var lookup anywhere: every name this file calls is a direct call.
+        (is (= () (env-fetch-sites dpath)))
+        (is (= () (env-fetch-sites ipath)))
+        ; EXACTLY ONE namespace dependency, and it is the one the LIVE module has
+        ; too: `new/1`'s coerce message calls `BeamLisp.Ns.Rt/print_str`. No
+        ; Core — so nothing here is `(list …)`/`(tuple …)`/`str`, which would be
+        ; circular while `core` is itself being interned.
+        (is (= (list :Elixir.BeamLisp.Ns.Rt) (ns-deps dpath))
+            "the type beam names Rt, and only Rt")
+        ; The IMPL is not on the boot path — reached only through `Inspect` — so
+        ; it carries the ordinary surface (`(tuple …)`/`(list …)` and `=`), the
+        ; same two deps its Vector and LazySeq siblings carry. Anything MORE
+        ; would be an unintended coupling.
+        (is (= () (Enum/reject (ns-deps ipath)
+                     (fn [m] (Enum/member? (list :Elixir.BeamLisp.Ns.Core :Elixir.BeamLisp.Ns.Rt) m))))
+            "the impl beam's only namespace deps are Core and Rt"))
+      (File/rm_rf! dir))))
+
+; ── the cold child: a fresh VM, no application boot ──────────────────────
+
+(defn- child-code-args
+  "This VM's whole code path as `-pa` args, with `pinned` LAST so it lands
+   FIRST: `-pa` PREPENDS, so the last one named wins."
+  [pinned]
+  (concat (mapcat (fn [p] (list "-pa" (erlang/list_to_binary p))) (code/get_path))
+          (list "-pa" pinned)))
+
+(defn- cold-script []
+  (str
+    "d = BeamLisp.Decimal\n"
+    "IO.puts(\"which=\" <> List.to_string(:code.which(d)))\n"
+    "IO.puts(\"new=\" <> inspect(d.new(7)))\n"
+    "IO.puts(\"add=\" <> inspect(d.add(d.of(1, 0), d.of(2, 0))))\n"
+    "IO.puts(\"sub=\" <> inspect(d.sub(d.of(100, 0), d.of(25, 2))))\n"
+    "IO.puts(\"mul=\" <> inspect(d.mul(d.of(110, 2), d.of(2, 0))))\n"
+    "IO.puts(\"neg=\" <> inspect(d.neg(d.of(-15, 1))))\n"
+    "IO.puts(\"abs=\" <> inspect(d.abs(d.of(-15, 1))))\n"
+    "IO.puts(\"signum=\" <> inspect(d.signum(d.of(-15, 1))))\n"
+    "IO.puts(\"lit=\" <> d.to_literal(d.of(150, 2)))\n"
+    "IO.puts(\"plain=\" <> d.to_plain_string(d.of(150, 0)))\n"
+    "IO.puts(\"parse=\" <> inspect(d.parse(\"1.5e2\")))\n"
+    "IO.puts(\"parsebad=\" <> inspect(d.parse(\"1.2.3\")))\n"
+    "IO.puts(\"div=\" <> d.to_plain_string(apply(d, :div, [d.of(100, 0), d.of(3, 0), 3, :\"half-even\"])))\n"
+    "IO.puts(\"exactdiv=\" <> d.to_plain_string(d.div(d.of(1, 0), d.of(8, 0))))\n"
+    "IO.puts(\"cmp=\" <> inspect(d.compare(d.of(-15, 1), d.of(1, 0))))\n"
+    "IO.puts(\"eq=\" <> inspect(d.eq?(d.of(15, 1), d.of(150, 2))))\n"
+    "IO.puts(\"strip=\" <> d.to_plain_string(d.strip_zeros(d.of(1500, 3))))\n"
+    "IO.puts(\"mpl=\" <> d.to_plain_string(d.move_point_left(d.of(1, 0), 3)))\n"
+    "IO.puts(\"prec=\" <> inspect(d.precision(d.of(12345, 2))))\n"
+    "IO.puts(\"long=\" <> inspect(d.to_integer(d.of(-125, 1))))\n"
+    "IO.puts(\"float=\" <> inspect(d.to_float(d.of(15, 1))))\n"
+    "IO.puts(\"key=\" <> inspect(d.codec_key_parts(d.of(15, 1))))\n"
+    "IO.puts(\"key3=\" <> inspect(d.codec_key_parts(d.of(1, 3))))\n"
+    "IO.puts(\"keybig=\" <> inspect(d.codec_key_parts(d.of(12345678901234567890123, 0))))\n"
+    "IO.puts(\"modes=\" <> inspect(length(d.modes())))\n"
+    "IO.puts(\"inspect=\" <> inspect(d.of(150, 2)))\n"
+    "IO.puts(\"ok\")\n"))
+
+(deftest decimal-pinned-answers-in-a-cold-child-vm
+  (testing "a fresh VM with no application boot resolves and exercises the pinned atom"
+    (let [dir (tmp-dir)
+          out (str dir "/cold")
+          script (Path/join dir "cold.exs")]
+      (BeamLisp.AOT/compile_host_file (dec-source)
+        (list (t2 :module live) (t2 :output_dir out) (t2 :load? false)
+              (t2 :struct_fields (decimal-fields))))
+      (is (File/exists? (Path/join out (str live ".beam"))))
+      (File/write! script (cold-script))
+      (let [r (System/cmd "elixir"
+                          (to-list (concat (child-code-args out) (list script)))
+                          (to-list [(tuple :stderr_to_stdout true)
+                                    (tuple :env (list (tuple "ERL_CRASH_DUMP" "/dev/null")))]))
+            text (erlang/element 1 r)]
+        (is (zero? (erlang/element 2 r)) (str "the child VM exited " (erlang/element 2 r) ":\n" text))
+        ; THE REPLACEMENT: the code server resolves the atom to the pinned beam,
+        ; in a VM that never booted the language.
+        (is (includes? text (str "which=" (Path/join out (str live ".beam")))) text)
+        (is (includes? text "new=7M") text)
+        (is (includes? text "add=3M") text)
+        (is (includes? text "sub=99.75M") text)
+        (is (includes? text "mul=2.20M") text)
+        (is (includes? text "neg=1.5M") text)
+        (is (includes? text "abs=1.5M") text)
+        (is (includes? text "signum=-1") text)
+        (is (includes? text "lit=1.50M") text)
+        (is (includes? text "plain=150") text)
+        (is (includes? text "parse={:ok, 150M}") text)
+        (is (includes? text "parsebad=:error") text)
+        (is (includes? text "div=33.333") text)
+        (is (includes? text "exactdiv=0.125") text)
+        (is (includes? text "cmp=-1") text)
+        (is (includes? text "eq=true") text)
+        (is (includes? text "strip=1.5") text)
+        (is (includes? text "mpl=0.001") text)
+        (is (includes? text "prec=5") text)
+        (is (includes? text "long=-12") text)
+        (is (includes? text "float=1.5") text)
+        (is (includes? text "key={1.5, 1, \"\"}") text)
+        (is (includes? text "key3={0.001, 0, <<1, 0, 0, 0, 0, 255, 1, 1, 2, 0>>}") text)
+        (is (includes? text "modes=8") text)
+        (is (includes? text "inspect=1.50M") text)
+        (is (includes? text "ok") text))
+      (File/rm_rf! dir))))

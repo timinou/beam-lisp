@@ -173,13 +173,27 @@ defmodule BeamLisp.AOT do
       `:deprecated` are answered from static data too; an unknown key raises
       `FunctionClauseError`, as Elixir's generated `__info__/1` does.
       `:attributes`/`:compile`/`:md5` are deliberately not synthesized. A file
-      that writes `__struct__` or `__info__` itself, beside `:struct_fields`, is
-      refused rather than shadowed.
+      that writes `__struct__` or `__info__` itself, beside `:struct_fields` or
+      `:macro_exports`, is refused rather than shadowed.
 
       NOT emitted: protocol impls (`Enumerable`, `Inspect`, `Exception`, …).
       Those are the next extension, and the constructor/introspection pair here
       is the primitive they hang off: a protocol impl is its own module
       (`Elixir.<Proto>.<Mod>`), which a `.bl` namespace can already define.
+    * `:macro_exports` — an optional `[{name, arity}]` list: the macros this
+      pinned module OFFERS to an Elixir caller, advertised through the
+      synthesized `__info__(:macros)`. `require Mod` plus `Mod.name(…)` in a
+      guard is decided entirely by that list and by the `MACRO-name` beam
+      function, and neither is something a `.bl` file can supply on its own — a
+      macro's compile-time artifact is not a plain function surface. The
+      implementer must already be a top-level `defn` named `MACRO-<name>` of
+      arity `arity + 1` (the extra first argument is the caller environment
+      Elixir passes), and a spec with no such clause is refused by name rather
+      than advertised and then `undef` at expansion. Those clauses are EXCLUDED
+      from `__info__(:functions)`, exactly as Elixir excludes `MACRO-*` from it,
+      so the module's function surface stays truthful. Like `:struct_fields`
+      this may be given alone; the `__info__/1` it needs is synthesized either
+      way.
     * `:file` — the source path used for positions (defaults to `path`).
 
   Returns `{module, beam_path}`. Raises `ArgumentError` on an invalid module
@@ -229,14 +243,17 @@ defmodule BeamLisp.AOT do
       end
 
       # `:struct_fields` widens the SAME module surface with the constructor pair
-      # AND the `__info__/1` introspection Elixir's `defstruct` generates —
-      # appended, never substituted, so a file that also writes `__struct__` or
-      # `__info__` by hand is refused rather than silently shadowed. Nothing
-      # above changes when the option is absent: the clause list is the file's
-      # defns exactly, so a functions-only pinned beam is byte-for-byte what it
-      # was.
+      # AND the `__info__/1` introspection Elixir's `defstruct` generates;
+      # `:macro_exports` widens it with the `__info__(:macros)` entry a MACRO
+      # needs to be `require`-able. Either is APPENDED, never substituted, so a
+      # file that also writes `__struct__` or `__info__` by hand is refused
+      # rather than silently shadowed. Nothing above changes when both are
+      # absent: the clause list is the file's defns exactly, so a functions-only
+      # pinned beam is byte-for-byte what it was.
+      macro_exports = validate_macro_exports!(Keyword.get(opts, :macro_exports, []), clauses)
+
       collision =
-        if struct_fields == nil do
+        if struct_fields == nil and macro_exports == [] do
           nil
         else
           Enum.find(clauses, &(&1.fname in [:__struct__, :__info__]))
@@ -245,10 +262,10 @@ defmodule BeamLisp.AOT do
       if collision do
         raise ArgumentError,
               "pinned host module #{inspect(module)} defines #{collision.fname} itself; " <>
-                ":struct_fields would duplicate it"
+                ":struct_fields/:macro_exports would duplicate it"
       end
 
-      clauses = clauses ++ struct_clauses(module, struct_fields, clauses)
+      clauses = clauses ++ struct_clauses(module, struct_fields, clauses, macro_exports)
 
       descriptor = Emit.descriptor_for(module, clauses, host_attrs(opts), %{file: file})
       {mod, beam} = Emit.compile_descriptor(descriptor)
@@ -402,67 +419,94 @@ defmodule BeamLisp.AOT do
   # ordinary map field, so `is_struct/1` / `Map.from_struct/1` answer unchanged.
   # Every key and default is a Core literal (validated below), so no atom is
   # minted from a string and the default is emitted as data, never a call.
-  defp struct_clauses(_module, nil, _clauses), do: []
+  defp struct_clauses(module, fields, clauses, macro_exports) do
+    constructors =
+      case fields do
+        nil ->
+          []
 
-  defp struct_clauses(module, fields, clauses) do
-    default = struct_default_node(module, fields)
+        fields ->
+          default = struct_default_node(module, fields)
 
-    struct_info_clauses(module, fields, clauses) ++
-      [
-        %{op: :"defn-clause", fname: :__struct__, params: [], guard: nil, body: default, ann: %{}},
-        %{
-          op: :"defn-clause",
-          fname: :__struct__,
-          params: [anf_pvar("kv")],
-          guard: nil,
-          body: %{
-            op: :remote,
-            mod: Enum,
-            fun: :reduce,
-            args: [anf_var("kv"), default, struct_reducer_node()],
-            ann: %{}
-          },
-          ann: %{}
-        }
-      ]
+          [
+            %{op: :"defn-clause", fname: :__struct__, params: [], guard: nil, body: default, ann: %{}},
+            %{
+              op: :"defn-clause",
+              fname: :__struct__,
+              params: [anf_pvar("kv")],
+              guard: nil,
+              body: %{
+                op: :remote,
+                mod: Enum,
+                fun: :reduce,
+                args: [anf_var("kv"), default, struct_reducer_node()],
+                ann: %{}
+              },
+              ann: %{}
+            }
+          ]
+      end
+
+    host_info_clauses(module, fields, clauses, macro_exports) ++ constructors
   end
 
-  # `__info__/1` — the introspection every `defstruct` module answers and
+  # `__info__/1` — the introspection every Elixir module answers and
   # `Inspect.Any` reads. `Inspect.Any.inspect/2` builds the `%Module{…}` form
   # from `module.__info__(:struct)`; without this clause the call is `undef`, the
   # protocol falls back to a raw map, and a pinned struct loses its identity in
-  # every log, `Map.from_struct/1` notwithstanding. It is emitted ONLY beside the
-  # constructor pair (never for a functions-only module), so a pinned beam with
-  # no `:struct_fields` keeps its exact export surface.
+  # every log, `Map.from_struct/1` notwithstanding. It is synthesized when the
+  # caller asks for the struct surface (`:struct_fields`) OR for macros
+  # (`:macro_exports`) — `require Mod` reads `Mod.__info__(:macros)` before it
+  # will expand anything, so the introspection IS the macro ABI — and never for
+  # a functions-only module, so a pinned beam with neither option keeps its
+  # exact export surface.
   #
   # The keys Elixir answers with static data are answered here with static data,
   # never a runtime lookup — nothing on this path calls another namespace:
   # `:module` (the pinned atom), `:functions` (the file's own defns plus the
-  # constructor pair, deduped across multi-clause defns), `:macros` (`[]`),
-  # `:deprecated` (`[]`), and `:struct`. An unknown key misses every clause and
-  # raises `FunctionClauseError`, exactly as Elixir's generated `__info__/1`
-  # does; `:attributes` / `:compile` / `:md5` — the `module_info` pass-throughs
+  # constructor pair, deduped across multi-clause defns, and EXCLUDING
+  # `MACRO-*` exactly as Elixir excludes them), `:macros` (the `:macro_exports`
+  # list, sorted so two builds of the same options are byte-identical),
+  # `:deprecated` (`[]`), and `:struct` (the field metadata, or `nil` when the
+  # module is not a struct — what a live Elixir module without `defstruct`
+  # answers). An unknown key misses every clause and raises
+  # `FunctionClauseError`, exactly as Elixir's generated `__info__/1` does;
+  # `:attributes` / `:compile` / `:md5` — the `module_info` pass-throughs
   # Elixir also serves — are deliberately NOT synthesized.
-  defp struct_info_clauses(module, fields, clauses) do
+  defp host_info_clauses(_module, nil, _clauses, []), do: []
+
+  defp host_info_clauses(module, fields, clauses, macro_exports) do
     struct =
-      Enum.map(fields, fn {field, default} ->
-        %{field: field, default: default, required: false}
-      end)
+      case fields do
+        nil ->
+          nil
+
+        fields ->
+          Enum.map(fields, fn {field, default} ->
+            %{field: field, default: default, required: false}
+          end)
+      end
 
     functions =
       clauses
+      |> Enum.reject(&macro_clause?/1)
       |> Enum.map(&{&1.fname, length(&1.params)})
-      |> Kernel.++([__struct__: 0, __struct__: 1])
+      |> Kernel.++(if fields, do: [__struct__: 0, __struct__: 1], else: [])
       |> Enum.uniq()
 
     [
       info_clause(:module, module),
       info_clause(:functions, functions),
-      info_clause(:macros, []),
+      info_clause(:macros, Enum.uniq(Enum.sort(macro_exports))),
       info_clause(:deprecated, []),
       info_clause(:struct, struct)
     ]
   end
+
+  # A macro's beam artifact, and the one name shape `__info__(:functions)` must
+  # NOT report: Elixir's `MACRO-<name>` functions are the callable half of a
+  # macro, not part of the module's function surface.
+  defp macro_clause?(%{fname: fname}), do: String.starts_with?(Atom.to_string(fname), "MACRO-")
 
   # A `__info__/1` clause for one literal key. The value is Core data, emitted
   # as a literal (`:module` is the caller's atom; `:struct` is a list of
@@ -568,6 +612,42 @@ defmodule BeamLisp.AOT do
   defp validate_struct_fields!(other) do
     raise ArgumentError,
           ":struct_fields must be a list of {name, default} pairs, got: #{inspect(other)}"
+  end
+
+  # `:macro_exports` is METADATA from the caller, exactly like `:struct_fields`:
+  # `{name, arity}` pairs naming the macros this module OFFERS, `name` the
+  # Elixir macro's name and `arity` its DECLARED arity. The beam artifact behind
+  # each is `MACRO-<name>` of arity `arity + 1`, because Elixir prepends the
+  # caller environment to every macro argument list (and prepends it FIRST —
+  # `apply(Mod, MACRO-name, [Caller | Args])`, so the extra parameter leads).
+  # The implementer must exist in this file: a spec whose `MACRO-` clause is
+  # absent is refused by name here rather than advertised through
+  # `__info__(:macros)` and then `undef` at the caller's first expansion.
+  defp validate_macro_exports!([], _clauses), do: []
+
+  defp validate_macro_exports!(specs, clauses) when is_list(specs) do
+    Enum.map(specs, fn
+      {name, arity} when is_atom(name) and is_integer(arity) and arity >= 0 ->
+        impl = :"MACRO-#{name}"
+
+        unless Enum.any?(clauses, &(&1.fname == impl and length(&1.params) == arity + 1)) do
+          raise ArgumentError,
+                ":macro_exports names #{name}/#{arity}, but no #{impl}/#{arity + 1} " <>
+                  "clause is defined; a macro's artifact is its implementer with one extra " <>
+                  "(caller) argument"
+        end
+
+        {name, arity}
+
+      other ->
+        raise ArgumentError,
+              ":macro_exports entries must be {name, arity} pairs, got: #{inspect(other)}"
+    end)
+  end
+
+  defp validate_macro_exports!(other, _clauses) do
+    raise ArgumentError,
+          ":macro_exports must be a list of {name, arity} pairs, got: #{inspect(other)}"
   end
 
   # What `BeamLisp.Ns.Anf`'s `literal-data?` accepts, minus anything with a

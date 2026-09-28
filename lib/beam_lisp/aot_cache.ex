@@ -112,9 +112,9 @@ defmodule BeamLisp.AOTCache do
   # always claimed to be. For an image that ships no `.ex` (a release drop) the
   # digest is read from `priv/codegen.sources`, baked by the checkout whenever it
   # computes the key — see `codegen_part/0`. The pinned host leaves
-  # (`CompilerData`, `Emit`, `Link`, `Tiers`) are the exception: their source moved to
-  # `priv/host/<leaf>.bl`, and `@pinned_host_sources` below is the table that
-  # says which module follows which leaf.
+  # (`CompilerData`, `AtomGuard`, `Emit`, `Link`, `Tiers`) are the exception: their
+  # source moved to `priv/host/<leaf>.bl`, and `@pinned_host_sources` below is the
+  # table that says which module follows which leaf.
   #
   # `BeamLisp.Ns` used to be listed here and was DEAD: the module has no source
   # file anywhere in the tree (`lib/beam_lisp/ns.ex` does not exist) and no beam
@@ -390,8 +390,14 @@ defmodule BeamLisp.AOTCache do
   # back to the frozen `priv/codegen.sources`, making every future codegen edit
   # invisible. That is exactly the failure `CompilerData` recorded when it became
   # the first pinned leaf, and `Emit`/`Link` are the pair seeded beside it; `Tiers`
-  # is the tier authority they all route through.
+  # is the tier authority they all route through; `AtomGuard` is the atom-table
+  # guard, and BUG-106 is the day it was omitted here after its `.ex` was deleted:
+  # the live digest halted on the missing `lib/beam_lisp/atom_guard.ex`, so
+  # `codegen_part/0` silently froze the key on the stale baked digest and a tree
+  # with an edited codegen computed the pre-edit key. Every migration of a codegen
+  # leaf INTO `priv/host/` must add its row below.
   @pinned_host_sources %{
+    BeamLisp.AtomGuard => "atom_guard.bl",
     BeamLisp.CompilerData => "compiler_data.bl",
     BeamLisp.Emit => "emit.bl",
     BeamLisp.Link => "link.bl",
@@ -399,9 +405,10 @@ defmodule BeamLisp.AOTCache do
   }
 
   # The source path for a codegen module: the pinned `.bl` for a leaf in
-  # `@pinned_host_sources`, else `lib/beam_lisp/atom_guard.ex` for
-  # `BeamLisp.AtomGuard` — derived from the module name rather than listed beside
-  # it, so a module added to `@codegen_modules` cannot be silently uncovered.
+  # `@pinned_host_sources`, else `lib/beam_lisp/<name>.ex` for a module still
+  # authored under `lib/` (`BeamLisp.AOT` -> `aot.ex`, say) — derived from the
+  # module name rather than listed beside it, so a module added to
+  # `@codegen_modules` cannot be silently uncovered.
   # Both branches name a path that may not exist (a release drop ships neither
   # source); the read then fails upstream and `live_codegen_digest/0` answers
   # `:error`, which is the distinct fact that routes `codegen_part/0` to the
