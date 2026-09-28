@@ -5,7 +5,7 @@
     "file" => "beam_lisp.app",
     "sha256" => "868221a5f42922ca01a126204ac0440406751eee3c0b7939abdcab9f60ff614d"
   },
-  "build_key" => "f90857b1d788ccc1be34b1369a1e52d487ca99accaf05ae18935f98fd85f923d",
+  "build_key" => "652da998f88cec2e8910d7e70383c6f969ae6fff204ed8f8d3597cf41a8bbef4",
   "compiler_key" => "bdf953bc3d4fe56a76f713dbd8a4a10cadffea30988fd66265b23c7b7cdd9a71",
   "elixir" => "1.20.2",
   "hosts" => ["Elixir.BeamLisp.CompilerData.beam", "Elixir.BeamLisp.Emit.beam",
@@ -39,7 +39,7 @@
    "Elixir.BeamLisp.Trace.beam", "Elixir.BeamLisp.ReloadWatcher.beam",
    "Elixir.BeamLisp.AnfInterpreter.beam", "Elixir.BeamLisp.Sandbox.beam",
    "Elixir.BeamLisp.ExUnitCase.beam", "Elixir.BeamLisp.DevChange.beam",
-   "Elixir.BeamLisp.TestRT.beam"],
+   "Elixir.BeamLisp.TestRT.beam", "Elixir.BeamLisp.Test.beam"],
   "modules" => %{
     "Elixir.BeamLisp.AnfInterpreter.beam" => "53d530a95a63960803fcbdffbe0649bfa52ffc94f67e21dea592a82c3393acfc",
     "Elixir.BeamLisp.Ns.Init.Rt.beam" => "d38c1c133952ed9c01636474aad5d391183e45736ae5a7cd9c7f23d8870b905d",
@@ -62,6 +62,7 @@
     "Elixir.BeamLisp.Derived.beam" => "ed8b29c86c1e8c4be8399c92656f48b91874aa62568799713b515c29638813bb",
     "Elixir.BeamLisp.ExInfo.beam" => "49f2ff2dc3960b55c94c675794d8eca0fa7cb11da1544089b10af60c7ce1b8fb",
     "Elixir.BeamLisp.Ns.Body.Multi.beam" => "ad56c68b1f4104c5dfaecca21bc4e6388e2a8473cf8216b15876f8b0df3b7e49",
+    "Elixir.BeamLisp.Test.beam" => "7f8871d04c7849a3535be27397614f3d1bbf2dad8c92474b2cab71bf5a9123d8",
     "Elixir.BeamLisp.Application.beam" => "cb57c9958fdc72125ff0e2f96f63452babe30308a11a606d61e07909352775b6",
     "Elixir.BeamLisp.Tiers.beam" => "9808fdbe733e2d7b59d459e2903475542de30b48f4c811f864457cf8e3d88950",
     "Elixir.BeamLisp.Reactive.beam" => "066b3d11ec361674234456a335273c137f30f03aa3381f88ef06f5e65347d632",
