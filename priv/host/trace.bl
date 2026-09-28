@@ -1,0 +1,347 @@
+; host/trace.bl — the pinned HOST MODULE for `Elixir.BeamLisp.Trace`.
+;
+; Bounded tracing: the BEAM's `:dbg` exposed as data. Any function call in a
+; live system can be traced without instrumentation; beam-lisp lowers that to
+; `(trace 'my-fn handler)` / `(untrace 'my-fn)` (the `rt.bl` rows bind those
+; names to this module). Each `trace` starts a real `:dbg` tracer, installs a
+; match spec for the ONE named function, and delivers every `:call` event to
+; the handler as the Erlang tuple `{:trace pid :call {mod fun args}}`.
+;
+; This file is the `.bl` port of `lib/beam_lisp/trace.ex`, compiled by
+; `BeamLisp.AOT/compile_host_file` into `Elixir.BeamLisp.Trace.beam` at that
+; exact module atom. ABI parity is the contract, and it is narrow:
+;
+;   * EXPORTS ARE EXACTLY `trace/3`, `trace/4`, `untrace/2`. A pinned module's
+;     export surface IS the file's top-level `defn`s, and `defn-` is NOT
+;     privatized here (MEASURED on `priv/host/web_socket.bl`), so every helper
+;     the Elixir module kept private is a LOCAL closure below. That is the only
+;     reason this file is shaped the way it is.
+;   * THE RAILS ARE THE POINT, and each is ported as it stands: one function at
+;     a time (an exact name, never `:all`), one active trace per node, a bounded
+;     match spec (`[{:_, [], []}]`, enriched by `:dbg` itself), calling-process
+;     scope (`:dbg.p(me, [:c])` — the process that called `trace`, never every
+;     process), and a count cap (`:max-calls`, default 1000). The cap is
+;     enforced INSIDE the tracer process (OTP 29 threads
+;     `fun(Event, Data) -> NewData`), so there is no cross-process race on the
+;     counter, and reaching it clears the match spec so no further events are
+;     even generated.
+;   * SOURCE VAR RESOLUTION: `BeamLisp.Env.current_ns/0` is process-global and
+;     outlives an evaluation, so the namespace threaded in at CALL time is not
+;     always the one that holds the var. Resolve against the given namespace,
+;     then fall back to whichever loaded namespace actually links this name.
+;   * ERROR SEMANTICS unchanged: a second `trace` RAISES while one is active; an
+;     unresolvable name RAISES; a non-function handler RAISES; a name of the
+;     wrong shape is a `FunctionClauseError` (the live module had no clause);
+;     `untrace` when nothing is traced answers `:ok`, because an `untrace` on a
+;     cleanup path must not mask the failure that made cleanup necessary; and a
+;     RAISING handler is reported and swallowed so it cannot silently kill the
+;     tracer and leave a half-installed trace.
+;
+; There is deliberately no `:struct_fields`, no `:behaviour` and no macro
+; surface: the live module is functions-only, so the pinned beam is too.
+;
+; Run: bin/bl test test/bl/host_trace_test.bl
+
+(ns host.trace)
+
+(defn trace
+  "Trace calls to `name`, delivering each `:call` event to `handler`.
+
+   `name` is either the quoted-symbol datum `{:symbol name}` that `'my-fn`
+   hands over, or the bare name. `opts` is a map with optional `:max-calls`
+   (count cap, default 1000). Returns `:ok`."
+  ([ns sym handler]
+   (if (and (erlang/is_tuple sym)
+            (erlang/== 2 (erlang/tuple_size sym))
+            (erlang/== :symbol (erlang/element 1 sym)))
+     (trace ns (erlang/element 2 sym) handler {})
+     ; No clause matched in the live module either: a name that is neither the
+     ; quoted-symbol datum nor a binary was never accepted at arity 3.
+     (erlang/error
+       (Elixir.FunctionClauseError/exception
+         (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+               (tuple :function :trace)
+               (tuple :arity 3))))))
+  ([ns name handler opts]
+   (cond
+     ; the quoted-symbol clause comes FIRST, exactly as it did in Elixir; a
+     ; `{:symbol name}` whose name is not a binary then falls to the arity-4
+     ; refusal below rather than being silently accepted.
+     (and (erlang/is_tuple name)
+          (erlang/== 2 (erlang/tuple_size name))
+          (erlang/== :symbol (erlang/element 1 name)))
+     (trace ns (erlang/element 2 name) handler opts)
+
+     (erlang/is_binary name)
+     (if (erlang/is_function handler 1)
+       (let [; `str` is VARIADIC in the language, so a pinned file that called it
+             ; compiles to an `Env.fetch!("host.trace", "str")` var lookup — a
+             ; name this beam does not carry and can only resolve through the
+             ; caller's chain. Every message below is built from binaries, so one
+             ; local concatenator keeps every name a direct call.
+             cat (fn [parts] (erlang/apply :erlang :iolist_to_binary (list parts)))
+
+             ; `:dbg` lives in `runtime_tools`, not a beam-lisp application
+             ; dependency. Pull it in on demand, so the application never pays
+             ; for it unless tracing is actually used.
+             ensure-runtime-tools
+             (fn []
+               (let [started (Elixir.Application/ensure_all_started :runtime_tools)
+                     started? (fn [r]
+                                (and (erlang/is_tuple r)
+                                     (erlang/== 2 (erlang/tuple_size r))
+                                     (erlang/== :ok (erlang/element 1 r))))]
+                 (if (started? started)
+                   :ok
+                   (let [root (Elixir.Path/join
+                                (Elixir.List/to_string (erlang/apply :code :root_dir (list)))
+                                "lib")
+                         dir (first (Elixir.Path/wildcard
+                                      (Elixir.Path/join root "runtime_tools-*")))]
+                     (if (nil? dir)
+                       (erlang/error
+                         (Elixir.RuntimeError/exception
+                           (cat (list "trace: :dbg needs runtime_tools, not found under " root))))
+                       (do
+                         (erlang/apply :code :add_patha
+                           (list (Elixir.String/to_charlist (Elixir.Path/join dir "ebin"))))
+                         (let [again (Elixir.Application/ensure_all_started :runtime_tools)]
+                           (if (started? again)
+                             :ok
+                             (erlang/error
+                               (Elixir.RuntimeError/exception
+                                 (cat (list "trace: could not start runtime_tools: "
+                                                (Elixir.Kernel/inspect (erlang/element 2 again))))))))))))))
+
+             ; A second trace is refused outright — the state cell carries the
+             ; active trace, and `active: true` is its one guard.
+             ensure-inactive
+             (fn [nm]
+               (let [found (BeamLisp.Env/lookup :beam_lisp_trace_state)]
+                 (if (and (erlang/is_tuple found)
+                          (erlang/== 2 (erlang/tuple_size found))
+                          (erlang/== :ok (erlang/element 1 found))
+                          (erlang/is_map (erlang/element 2 found))
+                          (erlang/== true (erlang/apply :maps :get (list :active (erlang/element 2 found) false))))
+                   (erlang/error
+                     (Elixir.RuntimeError/exception
+                       (cat (list "trace: " nm " — a trace is already active (untrace first)"))))
+                   :ok)))
+
+             ; `Env.link/2` writes `{module, %{arity -> fname}, {min, vfname} | nil}`
+             ; for a fn var. Only the fixed arity map is interesting here, and
+             ; only when it is non-empty — a variadic-only or absent link is not
+             ; a set of `{mod, fn, arity}` triples to install.
+             link-in
+             (fn [in-ns nm]
+               (let [found (BeamLisp.Env/link in-ns nm)]
+                 (if (and (erlang/is_tuple found)
+                          (erlang/== 2 (erlang/tuple_size found))
+                          (erlang/== :ok (erlang/element 1 found))
+                          (erlang/is_tuple (erlang/element 2 found))
+                          (erlang/== 3 (erlang/tuple_size (erlang/element 2 found))))
+                   (let [fixed (erlang/element 2 (erlang/element 2 found))]
+                     (if (and (erlang/is_map fixed)
+                              (erlang/> (erlang/apply :maps :size (list fixed)) 0))
+                       (tuple (erlang/element 1 (erlang/element 2 found)) fixed)
+                       nil))
+                   nil)))
+
+             resolve
+             (fn [in-ns nm]
+               (let [here (link-in in-ns nm)]
+                 (if (some? here)
+                   here
+                   (let [found (some (fn [n] (link-in n nm)) (BeamLisp.Env/namespaces))]
+                     (if (some? found)
+                       found
+                       (erlang/error
+                         (Elixir.RuntimeError/exception
+                           (cat (list "trace: " nm " does not resolve to a defined function in "
+                                     (Elixir.String.Chars/to_string in-ns))))))))))
+
+             ; Clear the exact triples that were installed. `ctpl` deletes the
+             ; trace pattern for that `{mod, fn, arity}` and nothing else.
+             clear-patterns
+             (fn [installed]
+               (doseq [t installed]
+                 (erlang/apply :dbg :ctpl
+                   (list (erlang/element 1 t) (erlang/element 2 t) (erlang/element 3 t))))
+               :ok)
+
+             ; The cap flipping leaves the record in place but inactive, so
+             ; `untrace` still finds the installed triples to clear.
+             mark-inactive
+             (fn []
+               (let [found (BeamLisp.Env/lookup :beam_lisp_trace_state)]
+                 (if (and (erlang/is_tuple found)
+                          (erlang/== 2 (erlang/tuple_size found))
+                          (erlang/== :ok (erlang/element 1 found)))
+                   (BeamLisp.Env/put_key :beam_lisp_trace_state
+                     (erlang/apply :maps :put (list :active false (erlang/element 2 found))))
+                   :ok)))
+
+             ; A raising handler must not silently kill the tracer (which would
+             ; leave a half-installed trace and a dead node tracer); report and
+             ; continue. Elixir's `rescue` catches the `:error` class only, so a
+             ; `throw`/`exit` out of the handler propagates — and kills the
+             ; tracer — exactly as it did before. `__EXCEPTION_KIND__` is the RAW
+             ; class the catch clause is running under; `e` is the fold
+             ; (`Exception.normalize` for `:error`, the thrown value for
+             ; `:throw`, and `{:exit, value}` for `:exit`).
+             safe-call
+             (fn [h event]
+               (try
+                 (h event)
+                 (catch e
+                   (cond
+                     (erlang/== :error __EXCEPTION_KIND__)
+                     (IO/puts (cat (list "trace: handler raised " (Elixir.Exception/message e))))
+
+                     (erlang/== :throw __EXCEPTION_KIND__)
+                     (throw e)
+
+                     :else
+                     (erlang/exit (if (and (erlang/is_tuple e)
+                                           (erlang/== 2 (erlang/tuple_size e))
+                                           (erlang/== :exit (erlang/element 1 e)))
+                                    (erlang/element 2 e)
+                                    e))))))
+
+             ; Deliver one event and advance the cap. Reaching `max` clears the
+             ; match spec (so no further events are GENERATED) and marks the
+             ; trace done — any events already in flight are dropped, so the
+             ; handler is called exactly `max` times.
+             deliver
+             (fn [st pid mfa]
+               (safe-call (:handler st) (tuple :trace pid :call mfa))
+               (let [n (erlang/+ (:count st) 1)]
+                 (if (erlang/>= n (:max st))
+                   (do
+                     (clear-patterns (:installed st))
+                     (mark-inactive)
+                     (erlang/apply :maps :put (list :done true (erlang/apply :maps :put (list :count n st)))))
+                   (erlang/apply :maps :put (list :count n st)))))
+
+             ; OTP 29's tracer data function: `fun(Event, Data) -> NewData`. The
+             ; count cap therefore lives inside the tracer process itself.
+             dispatch
+             (fn dispatch-fn [event st]
+               (if (and (erlang/is_tuple event)
+                        (erlang/== 4 (erlang/tuple_size event))
+                        (erlang/== :trace (erlang/element 1 event))
+                        (erlang/== :call (erlang/element 3 event))
+                        ; the MFA payload is part of the PATTERN, exactly as it
+                        ; was in Elixir: anything else falls through unchanged.
+                        (erlang/is_tuple (erlang/element 4 event))
+                        (erlang/== 3 (erlang/tuple_size (erlang/element 4 event))))
+                 (let [pid (erlang/element 2 event)
+                       mfa (erlang/element 4 event)
+                       mod (erlang/element 1 mfa)
+                       fname (erlang/element 2 mfa)
+                       args (erlang/element 3 mfa)
+                       arity (erlang/length args)
+                       triple (tuple mod fname arity)
+                       installed? (fn [triples]
+                                    (some (fn [t] (erlang/== t triple)) triples))]
+                   (cond
+                     (:done st)
+                     st
+
+                     (and (installed? (:installed st)) (erlang/< (:count st) (:max st)))
+                     (deliver st pid (tuple mod fname args))
+
+                     (installed? (:installed st))
+                     (do
+                       (clear-patterns (:installed st))
+                       (mark-inactive)
+                       (erlang/apply :maps :put (list :done true st)))
+
+                     :else
+                     st))
+                 st))]
+
+         (do
+           (ensure-runtime-tools)
+           (ensure-inactive name)
+           (let [resolved (resolve ns name)
+                 mod (erlang/element 1 resolved)
+                 fixed (erlang/element 2 resolved)
+                 ; The fixed arity map's iteration order is not a promise, so
+                 ; sort the arities: the installed triples (and therefore the
+                 ; order patterns are installed and cleared in) then depend only
+                 ; on the link, never on map layout. Built as a REAL list (not
+                 ; the lazy `map`, whose cell outlives this process in the
+                 ; state cell): `installed` is part of the record `untrace`
+                 ; walks, so it must be a value.
+                 installed (loop [arities (sort (keys fixed)) acc (list)]
+                             (if (empty? arities)
+                               (reverse acc)
+                               (recur (rest arities)
+                                      (conj acc (tuple mod
+                                                      (erlang/apply :maps :get (list (first arities) fixed))
+                                                      (first arities))))))
+                 me (erlang/self)
+                 max-calls (if (and (erlang/is_map opts)
+                                    (erlang/is_map_key :"max-calls" opts))
+                             (erlang/map_get :"max-calls" opts)
+                             1000)
+                 initial {:handler handler
+                          :count 0
+                          :max max-calls
+                          :installed installed
+                          :done false}
+                 started (erlang/apply :dbg :tracer (list :process (tuple dispatch initial)))]
+             ; `{:ok, _tracer} = :dbg.tracer(…)` in Elixir: a tracer that could
+             ; not start is a match failure, and the match is the assertion.
+             (if (and (erlang/is_tuple started)
+                      (erlang/== 2 (erlang/tuple_size started))
+                      (erlang/== :ok (erlang/element 1 started)))
+               (do
+                 (doseq [t installed]
+                   (erlang/apply :dbg :tpl
+                     (list (erlang/element 1 t) (erlang/element 2 t) (erlang/element 3 t)
+                           (list (tuple :_ (list) (list))))))
+                 (erlang/apply :dbg :p (list me (list :c)))
+                 (BeamLisp.Env/put_key :beam_lisp_trace_state
+                   {:active true :name name :installed installed})
+                 :ok)
+               (erlang/error (Elixir.MatchError/exception started))))))
+       (erlang/error
+         (Elixir.RuntimeError/exception "trace: handler must be a function of one argument")))
+
+     :else
+     ; Not a name this function accepts at arity 4 — the live module had no
+     ; clause for it either.
+     (erlang/error
+       (Elixir.FunctionClauseError/exception
+         (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+               (tuple :function :trace)
+               (tuple :arity 4)))))))
+
+(defn untrace
+  "Stop tracing and clear the installed match spec. Returns `:ok` — including
+   when nothing was being traced, because NOT tracing is the desired end state
+   and an `untrace` in a cleanup path must never itself fail and mask the error
+   that made cleanup necessary.
+
+   The live module spelled two clauses, `untrace(ns, {:symbol, name})` and a
+   catch-all, and both ignored their arguments after unwrapping; one clause is
+   the same function at the same arity."
+  [_ns _name]
+  (let [found (BeamLisp.Env/lookup :beam_lisp_trace_state)]
+    (if (and (erlang/is_tuple found)
+             (erlang/== 2 (erlang/tuple_size found))
+             (erlang/== :ok (erlang/element 1 found))
+             (erlang/is_map (erlang/element 2 found))
+             (erlang/is_map_key :installed (erlang/element 2 found)))
+      (do
+        (doseq [t (erlang/apply :maps :get (list :installed (erlang/element 2 found)))]
+          (erlang/apply :dbg :ctpl
+            (list (erlang/element 1 t) (erlang/element 2 t) (erlang/element 3 t))))
+        ; `stop_clear` stops the node tracer AND clears every pattern and flag
+        ; it set, so a trace can never outlive its `untrace`.
+        (erlang/apply :dbg :stop_clear (list))
+        (BeamLisp.Env/delete_key :beam_lisp_trace_state)
+        :ok)
+      :ok)))

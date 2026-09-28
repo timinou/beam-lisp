@@ -1,0 +1,449 @@
+; host_trace_test.bl — the pinned `BeamLisp.Trace` ABI, and the `:dbg` rails it
+; carries, diffed against the live module in ISOLATED CHILD VMs.
+;
+; `priv/host/trace.bl` replaces `lib/beam_lisp/trace.ex` at its exact module
+; atom `Elixir.BeamLisp.Trace`. Nothing here substitutes the live module in THIS
+; vm: the source is compiled at its own probe atom, the namespace shim beside it
+; is dropped, and the probe beam is loaded ALONE — so a leftover shim reference
+; would be `undef` here.
+;
+; WHY THE OBSERVATION RUNS IN A CHILD. `:dbg` is NODE-GLOBAL: `:dbg.tracer/2`
+; installs one node tracer, `:dbg.tpl/4` installs a match spec on a module for
+; the whole node, and `:dbg.p/2` turns a flag on for a process. Arming any of
+; that in the test vm would leak a pattern, a tracer pid and a trace flag into
+; every other suite sharing the node — exactly the failure the rails exist to
+; prevent. So each observation runs in its own OS process, whose `:dbg` state
+; dies with it. This vm is snapshotted BEFORE and AFTER the children to show it
+; was never touched.
+;
+; THE DIFFERENTIAL IS ONE SCENARIO, TWO VMs: the same script runs against the
+; live `Elixir.BeamLisp.Trace` beam, and against a beam compiled from
+; `priv/host/trace.bl` at the production atom and loaded in the child only. The
+; two observations must be THE SAME STRINGS, mark for mark — with ONE deliberate
+; exception, `G.which`, which names the beam that answered and therefore HAS to
+; differ: that line is the proof the pinned bytes ran.
+;
+; Run: bin/bl test test/bl/host_trace_test.bl
+
+(ns host.trace.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_trace_" (erlang/unique_integer (list :positive))))
+
+(defn- trace-source [] (Path/join (BeamLisp/cwd) "priv/host/trace.bl"))
+
+(def ^:private probe :Elixir.BeamLisp.HostTraceProbe)
+(def ^:private shim :Elixir.BeamLisp.Ns.Host.Trace)
+(def ^:private live :Elixir.BeamLisp.Trace)
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-pinned [mod path]
+  (do (drop! mod)
+      (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+      mod))
+
+; Compile the pinned source at `mod` and publish ONLY the pinned beam: the
+; compile's own load (and the namespace shim it built beside it) is dropped
+; first.
+(defn- compile-pinned [mod dir]
+  (let [res (BeamLisp.AOT/compile_host_file
+              (trace-source)
+              (to-list (list (t2 :module mod) (t2 :output_dir dir) (t2 :load? false))))]
+    (load-pinned mod (elem res 1))))
+
+(defn- compile-probe [dir]
+  (let [m (compile-pinned probe dir)]
+    (drop! shim)
+    m))
+
+; ── reading the emitted beam as data ─────────────────────────────────────
+
+(defn- ext-of
+  "The `{:extfunc, mod, fun, arity}` of a call instruction, or nil."
+  [ins]
+  (if (and (erlang/is_tuple ins) (erlang/> (erlang/tuple_size ins) 2))
+    (let [e (erlang/element 3 ins)]
+      (if (and (erlang/is_tuple e) (erlang/== :extfunc (erlang/element 1 e))) e nil))
+    nil))
+
+(defn- remote-mods
+  "Every remote module the beam calls."
+  [path]
+  (Enum/uniq
+    (Enum/map
+      (Enum/filter
+        (Enum/map
+          (Enum/flat_map
+            (Enum/filter
+              (erlang/element 6 (erlang/apply :beam_disasm :file (list (erlang/binary_to_list path))))
+              (fn [f] (erlang/== :function (erlang/element 1 f))))
+            (fn [f] (erlang/element 5 f)))
+          ext-of)
+        (fn [x] (not (nil? x))))
+      (fn [t] (erlang/element 2 t)))))
+
+(defn- bl-deps
+  "Every `Elixir.BeamLisp.*` remote target, minus the beam's own atom (its
+   sibling calls are retargeted onto itself, which is a direct call, not a dep)."
+  [path mod]
+  (Enum/reject
+    (Enum/filter (remote-mods path)
+                 (fn [m] (String/starts_with? (Atom/to_string m) "Elixir.BeamLisp.")))
+    (fn [m] (erlang/== m mod))))
+
+(defn- env-fetch-ins?
+  "A call instruction into `BeamLisp.Env.fetch!/2` — the var lookup a name this
+   file does not define would compile to."
+  [ins]
+  (cond
+    (not (erlang/is_tuple ins)) false
+    (not (erlang/== :call_ext (erlang/element 1 ins))) false
+    (not (erlang/is_tuple (erlang/element 3 ins))) false
+    (not (erlang/== :extfunc (erlang/element 1 (erlang/element 3 ins)))) false
+    :else (and (erlang/== :Elixir.BeamLisp.Env (erlang/element 2 (erlang/element 3 ins)))
+               (erlang/== :fetch! (erlang/element 3 (erlang/element 3 ins))))))
+
+(defn- env-fetch-sites [path]
+  (let [fns (erlang/element 6 (erlang/apply :beam_disasm :file (list (erlang/binary_to_list path))))]
+    (reduce
+      (fn [acc f]
+        (if (erlang/== :function (erlang/element 1 f))
+          (reduce (fn [a ins] (if (env-fetch-ins? ins)
+                                (cons (tuple (erlang/element 2 f) (erlang/element 3 f)) a)
+                                a))
+                  acc (erlang/element 5 f))
+          acc))
+      ()
+      fns)))
+
+; ── the pinned ABI, on a probe beam ──────────────────────────────────────
+
+(deftest trace-pinned-exports-are-the-live-surface
+  (testing "trace/3, trace/4, untrace/2 and nothing the file did not define"
+    (let [dir (tmp-dir)]
+      (let [m (compile-probe dir)]
+        ; NO SHIM: the compile's namespace module is gone; the pinned beam answers.
+        (is (erlang/== :non_existing (erlang/apply :code :which (list shim))))
+        ; THE PUBLIC ABI, present at both arities.
+        (is (erlang/function_exported m :trace 3))
+        (is (erlang/function_exported m :trace 4))
+        (is (erlang/function_exported m :untrace 2))
+        ; FUNCTIONS-ONLY, exactly as the live module is: no `defstruct` surface
+        ; (`__struct__/0`) and no synthesized `__info__/1`.
+        (is (not (erlang/function_exported m :__struct__ 0)))
+        (is (not (erlang/function_exported m :__info__ 1)))
+        ; EVERY live export is present (`__info__/1` excluded by name: the live
+        ; Elixir module has it, a pinned functions-only beam does not) …
+        (is (every? (fn [e] (or (erlang/== :__info__ (erlang/element 1 e))
+                                (erlang/function_exported m (erlang/element 1 e) (erlang/element 2 e))))
+                    (erlang/apply live :module_info (list :exports)))
+            "the pinned ABI covers every live export")
+        ; … AND NOTHING ELSE: an `defn-` helper WOULD be exported here (a pinned
+        ; module's surface IS the file's top-level defns), so this is the clause
+        ; that says every helper is a local closure.
+        (is (erlang/== (list (tuple :module_info 0) (tuple :module_info 1)
+                             (tuple :trace 3) (tuple :trace 4) (tuple :untrace 2))
+                       (lists/sort (erlang/apply m :module_info (list :exports))))
+            "the pinned export list is exactly the live module's, minus __info__/1"))
+      ; REPRODUCIBLE: a rebuild of the same source is the same bytes.
+      (let [dir2 (tmp-dir)]
+        (is (erlang/== (File/read! (Path/join dir "Elixir.BeamLisp.HostTraceProbe.beam"))
+                       (File/read! (elem (BeamLisp.AOT/compile_host_file
+                                           (trace-source)
+                                           (to-list (list (t2 :module probe)
+                                                          (t2 :output_dir dir2)
+                                                          (t2 :load? false))))
+                                         1)))
+            "the pinned beam is a pure function of its source")
+        (File/rm_rf! dir2))
+      (File/rm_rf! dir))))
+
+(deftest trace-pinned-names-every-call-directly
+  (testing "every name is a direct call, and the beam-lisp dep set is exactly four modules"
+    (let [dir (tmp-dir)]
+      (compile-probe dir)
+      (let [path (Path/join dir "Elixir.BeamLisp.HostTraceProbe.beam")]
+        ; NO VAR LOOKUP. A name the beam does not carry would compile to
+        ; `BeamLisp.Env.fetch!/2` and resolve through the CALLER's chain at
+        ; runtime — the pinned host files' one forbidden dependency, and the
+        ; reason `(str …)` is not used anywhere above (it is variadic, so it
+        ; cannot be linked, so every call to it becomes such a site).
+        (is (erlang/== (list) (env-fetch-sites path))
+            "no `BeamLisp.Env.fetch!/2` call site: every name is a direct call")
+        ; THE WHOLE BEAM-LISP SET, pinned. `Env` is the shared vars table the
+        ; active-trace cell lives in; `Ns.Core`/`Ns.Rt` are the language runtime
+        ; the file's core functions (`some`, `doseq`, `keys`, `sort` …) compile
+        ; into; `ExInfo` is what `throw` normalizes a non-exception payload
+        ; through in `safe_call`. Nothing else may appear — a new dependency
+        ; here is a new coupling of a post-boot host leaf to the runtime.
+        (is (erlang/== (list :"Elixir.BeamLisp.Env" :"Elixir.BeamLisp.ExInfo"
+                             :"Elixir.BeamLisp.Ns.Core" :"Elixir.BeamLisp.Ns.Rt")
+                       (lists/sort (bl-deps path probe)))
+            (str "the beam-lisp dependency set is exactly Env/ExInfo/Ns.Core/Ns.Rt; got "
+                 (pr-str (lists/sort (bl-deps path probe)))))
+        (is (Enum/member? (bl-deps path probe) :"Elixir.BeamLisp.Env")
+            "and Env is among them: that is where the active-trace cell lives"))
+      (File/rm_rf! dir))))
+
+; ── the scenario: one script, two VMs ────────────────────────────────────
+
+(def ^:private scenario-lines
+  ["(ns trace.scenario)"
+   "(defn work [x] (* x 2))"
+   "(defn tick [x] x)"
+   "(def tm :\"Elixir.BeamLisp.Trace\")"
+   "(defn mark [k v] (println (str \"MARK \" k \"=\" (pr-str v))))"
+   "(defn mark-s [k s] (println (str \"MARK \" k \"=\" s)))"
+   "(defn flags [] (erlang/apply :erlang :trace_info (list (erlang/self) :flags)))"
+   "(defn tracer [] (erlang/apply :dbg :get_tracer (list)))"
+   "(defn state [] (BeamLisp.Env/lookup :beam_lisp_trace_state))"
+   "(defn caught [f] (try (f) :no-raise (catch e (list (:__struct__ e) (ex-message e)))))"
+   ""
+   "; -- A: capture, event shape, untrace stops, cleanup"
+   "(def seen (atom []))"
+   "(BeamLisp.Trace/trace \"trace.scenario\" (tuple :symbol \"work\") (fn [ev] (swap! seen conj ev)))"
+   "(work 1)"
+   "(work 2)"
+   "(Process/sleep 300)"
+   "(mark \"A.count\" (count @seen))"
+   "(mark \"A.shape\" (let [e (first @seen)] (list (erlang/element 1 e) (erlang/element 3 e) (pr-str (erlang/element 4 e)))))"
+   "(mark \"A.state\" (state))"
+   "(BeamLisp.Trace/untrace \"trace.scenario\" (tuple :symbol \"work\"))"
+   "(work 3)"
+   "(Process/sleep 300)"
+   "(mark \"A.after\" (count @seen))"
+   "(mark \"A.state2\" (state))"
+   "(mark \"A.flags2\" (flags))"
+   "(mark \"A.tracer2\" (not (erlang/is_pid (tracer))))"
+   "(mark \"A.untrace-again\" (BeamLisp.Trace/untrace \"x\" \"y\"))"
+   ""
+   "; -- B: a second trace is refused"
+   "(def seen2 (atom 0))"
+   "(BeamLisp.Trace/trace \"trace.scenario\" (tuple :symbol \"tick\") (fn [_] (swap! seen2 inc)))"
+   "(mark \"B.active\" (caught (fn [] (BeamLisp.Trace/trace \"trace.scenario\" (tuple :symbol \"tick\") (fn [_] nil)))))"
+   "(tick 1)"
+   "(tick 2)"
+   "(Process/sleep 300)"
+   "(mark \"B.count\" @seen2)"
+   "(BeamLisp.Trace/untrace nil nil)"
+   ""
+   "; -- C: an explicit cap"
+   "(def seen3 (atom 0))"
+   "(BeamLisp.Trace/trace \"trace.scenario\" (tuple :symbol \"tick\") (fn [_] (swap! seen3 inc)) {:\"max-calls\" 3})"
+   "(doseq [i (range 20)] (tick i))"
+   "(Process/sleep 500)"
+   "(mark \"C.cap3\" @seen3)"
+   "(mark \"C.state\" (state))"
+   "(BeamLisp.Trace/untrace nil nil)"
+   ""
+   "; -- D: high volume under the default cap (1000)"
+   "(def seen4 (atom 0))"
+   "(BeamLisp.Trace/trace \"trace.scenario\" (tuple :symbol \"tick\") (fn [_] (swap! seen4 inc)))"
+   "(doseq [i (range 1500)] (tick i))"
+   "(Process/sleep 1500)"
+   "(mark \"D.cap1000\" @seen4)"
+   "(mark \"D.active\" (:active (erlang/element 2 (state))))"
+   "(BeamLisp.Trace/untrace nil nil)"
+   "(tick 1)"
+   "(Process/sleep 200)"
+   "(mark \"D.after\" @seen4)"
+   ""
+   "; -- E: source var resolution falls back to the namespace that links the name"
+   "(def seen5 (atom 0))"
+   "(BeamLisp.Trace/trace \"trace.nowhere\" (tuple :symbol \"tick\") (fn [_] (swap! seen5 inc)))"
+   "(doseq [i (range 20)] (tick i))"
+   "(Process/sleep 500)"
+   "(mark \"E.fallback\" @seen5)"
+   "(BeamLisp.Trace/untrace nil nil)"
+   ""
+   "; -- F: a raising handler is reported, swallowed, and the trace keeps running"
+   "(def seen6 (atom 0))"
+   "(BeamLisp.Trace/trace \"trace.scenario\" (tuple :symbol \"tick\") (fn [_] (do (swap! seen6 inc) (erlang/error (Elixir.RuntimeError/exception \"boom\")))))"
+   "(doseq [i (range 4)] (tick i))"
+   "(Process/sleep 500)"
+   "(mark \"F.raised\" @seen6)"
+   "(BeamLisp.Trace/untrace nil nil)"
+   ""
+   "; -- G: refusals, and the module that answered"
+   "(mark \"G.noresolve\" (caught (fn [] (BeamLisp.Trace/trace \"trace.scenario\" (tuple :symbol \"nope\") (fn [_] nil)))))"
+   "(mark \"G.badhandler\" (caught (fn [] (BeamLisp.Trace/trace \"trace.scenario\" (tuple :symbol \"tick\") 7))))"
+   "(mark \"G.badname\" (caught (fn [] (BeamLisp.Trace/trace \"trace.scenario\" 42 (fn [_] nil)))))"
+   "(mark-s \"G.which\" (Elixir.List/to_string (code/which tm)))"
+   "(mark \"Z.flags\" (flags))"
+   "(mark \"Z.tracer\" (not (erlang/is_pid (tracer))))"
+   "(mark \"Z.state\" (state))"])
+
+(defn- scenario []
+  (reduce (fn [acc l] (str acc l "\n")) "" scenario-lines))
+
+; The ONLY difference between the two children: the pinned prelude swaps the
+; module atom onto the beam compiled from `priv/host/trace.bl` (families: the
+; beam is compiled at the production atom, so `load_binary` accepts it, and
+; ONLY the child is asked to do it).
+(defn- live-prelude [] "(println \"CHILD live\")\n")
+
+(defn- pinned-prelude [beam]
+  (str "(code/purge :\"Elixir.BeamLisp.Trace\")\n"
+       "(code/delete :\"Elixir.BeamLisp.Trace\")\n"
+       "(code/load_binary :\"Elixir.BeamLisp.Trace\" (erlang/binary_to_list \"" beam "\") (File/read! \"" beam "\"))\n"
+       "(println \"CHILD pinned\")\n"))
+
+(defn- cmd-opts []
+  (to-list (list (tuple :stderr_to_stdout true)
+                 (tuple :env (to-list (list (tuple "ERL_CRASH_DUMP" "/dev/null")))))))
+
+(defn- child-run [script]
+  (System/cmd (Path/join (BeamLisp/cwd) "bin/bl")
+              (to-list (list "eval" script))
+              (cmd-opts)))
+
+(defn- marks
+  "The child's `MARK key=value` lines, as a map, so two runs are compared as DATA
+   rather than as text that happens to be in the same order."
+  [text]
+  (reduce
+    (fn [acc line]
+      (if (String/starts_with? line "MARK ")
+        (let [parts (String/split (subs line 5) "=" (to-list (list (tuple :parts 2))))]
+          (assoc acc (first parts) (second parts)))
+        acc))
+    {}
+    (String/split text "\n")))
+
+(defn- boom-lines
+  "The lines the RAISING handler produced — `safe_call`'s report, which is the
+   only visible trace of a swallowed handler failure."
+  [text]
+  (count (filter (fn [l] (String/starts_with? l "trace: handler raised boom"))
+                 (String/split text "\n"))))
+
+(defn- parent-frame
+  "The three node-global things a trace could leak: this process's trace flags,
+   the node tracer, and the active-trace cell in the shared vars table."
+  []
+  (erlang/apply :code :ensure_loaded (list :dbg))
+  (tuple (erlang/apply :erlang :trace_info (list (erlang/self) :flags))
+         (erlang/apply :dbg :get_tracer (list))
+         (BeamLisp.Env/lookup :beam_lisp_trace_state)))
+
+; ── the differential, and the isolation that makes it safe ───────────────
+
+(deftest trace-pinned-answers-the-live-module-in-a-cold-child
+  (testing "one scenario, two VMs: identical marks, and only `which` may differ"
+    (let [dir (tmp-dir)
+          out-dir (str dir "/pinned")
+          before (parent-frame)]
+      (File/mkdir_p! out-dir)
+      ; (1) THE PARENT IS CLEAN BEFORE ANYTHING RUNS — the precondition that
+      ; makes the closing assertion mean something.
+      (let [flags (erlang/element 1 before)
+            tracer (erlang/element 2 before)
+            cell (erlang/element 3 before)]
+        (is (erlang/== (tuple :flags (list)) flags)
+            "this vm carries no trace flags before the children run")
+        (is (not (erlang/is_pid tracer)) "…and no node tracer")
+        (is (erlang/== :error cell) "…and no active-trace cell"))
+      (is (not (includes? (Elixir.List/to_string (code/which live)) out-dir))
+          "the live module is the one this vm booted with")
+
+      ; (2) THE PINNED BEAM at the PRODUCTION atom, written but NOT loaded here.
+      (let [res (BeamLisp.AOT/compile_host_file
+                  (trace-source)
+                  (to-list (list (t2 :module live) (t2 :output_dir out-dir) (t2 :load? false))))
+            beam (elem res 1)]
+        (is (File/exists? beam))
+        (is (erlang/function_exported live :trace 4)
+            "the live module was never substituted mid-flight")
+
+        ; (3) THE TWO CHILDREN.
+        (let [lc (child-run (str (live-prelude) (scenario)))
+              pc (child-run (str (pinned-prelude beam) (scenario)))
+              lt (elem lc 0)
+              pt (elem pc 0)
+              lstatus (elem lc 1)
+              pstatus (elem pc 1)]
+          (is (erlang/== 0 lstatus) (str "the live child exited " lstatus ":\n" lt))
+          (is (erlang/== 0 pstatus) (str "the pinned child exited " pstatus ":\n" pt))
+          (is (includes? lt "CHILD live"))
+          (is (includes? pt "CHILD pinned"))
+
+          (let [lm (marks lt)
+                pm (marks pt)]
+            ; (3a) THE SAME OBSERVATION, mark for mark — with `G.which` masked,
+            ; because naming the beam that answered is the one thing that MUST
+            ; differ (asserted, exactly, below).
+            (is (erlang/== (sort (keys lm)) (sort (keys pm)))
+                "both children produced the same set of marks")
+            (is (erlang/== (assoc lm "G.which" "masked") (assoc pm "G.which" "masked"))
+                (str "the PINNED module answers the LIVE module's observation, value for value.\n"
+                     "live:\n" (pr-str lm) "\npinned:\n" (pr-str pm)))
+
+            ; (3b) THE PROOF THAT THE PINNED BYTES RAN — and that the live child
+            ; ran the live module, so the differential is not a tautology.
+            (is (erlang/== beam (get pm "G.which"))
+                (str "the pinned child's Trace module IS the beam compiled from priv/host/trace.bl\n"
+                     "beam:  " (pr-str beam) "\npinned which: " (pr-str (get pm "G.which"))
+                     "\nlive which:   " (pr-str (get lm "G.which"))))
+            (is (not (erlang/== beam (get lm "G.which")))
+                "the live child answered from its own beam")
+
+            ; (3c) THE ABSOLUTE VALUES. Equality between the two runs is not
+            ; enough on its own: both could be wrong the same way. These pin the
+            ; rails the module exists for.
+            (is (erlang/== "2" (get lm "A.count")) "a trace delivers each matching call")
+            (is (erlang/== "2" (get lm "A.after")) "untrace stops the delivery")
+            (is (erlang/== (pr-str :error) (get lm "A.state2"))
+                "untrace clears the active-trace cell")
+            (is (erlang/== "{:flags, []}" (get lm "A.flags2"))
+                "untrace leaves this process with no trace flags")
+            (is (erlang/== "true" (get lm "A.tracer2"))
+                "untrace stops the node tracer")
+            (is (includes? (get lm "A.shape") ":work, [1]")
+                "the handler receives the `{:trace pid :call {mod fun args}}` event")
+            (is (includes? (get lm "A.state") "active: true")
+                "while armed, the state cell records the active trace")
+            (is (includes? (get lm "A.state") ":work, 1")
+                "…naming the exact {module, function, arity} triple installed")
+            (is (includes? (get lm "B.active") "a trace is already active (untrace first)")
+                "a second trace is refused")
+            (is (erlang/== "2" (get lm "B.count")) "the refused trace armed nothing")
+            (is (erlang/== "3" (get lm "C.cap3")) "`{:max-calls n}` caps the handler at n calls")
+            (is (includes? (get lm "C.state") "active: false")
+                "hitting the cap marks the trace inactive, not deleted")
+            (is (erlang/== "1000" (get lm "D.cap1000"))
+                "the DEFAULT cap holds under 1500 calls: bounded, exactly 1000 events")
+            (is (erlang/== "false" (get lm "D.active"))
+                "…and the cap cleared the pattern, so the state is inactive")
+            (is (erlang/== "1000" (get lm "D.after")) "no event arrives after untrace")
+            (is (erlang/== "20" (get lm "E.fallback"))
+                "a name not in the CALL-time namespace resolves in the namespace that links it")
+            (is (erlang/== "4" (get lm "F.raised"))
+                "a raising handler does not stop the trace")
+            (is (erlang/== 4 (boom-lines lt))
+                "…and each failure is REPORTED, once per call")
+            (is (includes? (get lm "G.noresolve") "does not resolve to a defined function in trace.scenario")
+                "an unresolvable name raises")
+            (is (includes? (get lm "G.badhandler") "handler must be a function of one argument")
+                "a non-function handler raises")
+            (is (includes? (get lm "G.badname") "no function clause matching in BeamLisp.Trace.trace/3")
+                "a name of the wrong shape is a FunctionClauseError naming trace/3")
+            (is (erlang/== "{:flags, []}" (get lm "Z.flags")) "the scenario ends with no trace flags")
+            (is (erlang/== "true" (get lm "Z.tracer")) "…and no node tracer")
+            (is (erlang/== (pr-str :error) (get lm "Z.state")) "…and no active-trace cell"))))
+
+      ; (4) NO LEAK INTO THIS VM. The children's `:dbg` state died with their
+      ; processes: this node's flags, tracer and trace cell are byte-identical
+      ; to the frame taken before either child started.
+      (let [after (parent-frame)]
+        (is (erlang/== before after)
+            (str "the children left this vm's :dbg state untouched.\nbefore: "
+                 (pr-str before) "\nafter:  " (pr-str after))))
+      (is (erlang/== :error (BeamLisp.Env/lookup :beam_lisp_trace_state))
+          "no active trace survives in this vm's vars table")
+      (is (not (includes? (Elixir.List/to_string (code/which live)) out-dir))
+          "and this vm still runs the live module, not the pinned beam")
+      (File/rm_rf! dir))))
