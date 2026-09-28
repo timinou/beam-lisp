@@ -1,0 +1,705 @@
+; host_refs_test.bl — the pinned `BeamLisp.Refs` ABI, diffed against the live
+; module and driven at the production atom.
+;
+; `priv/host/refs.bl` is the `.bl` port of `lib/beam_lisp/refs.ex`'s
+; `BeamLisp.Refs` half, compiled by `compile_host_file` into ONE exact-named
+; beam. Nothing here replaces the live module (except the explicit
+; production-atom stand-in, which restores it): the source is compiled at its
+; OWN probe atom, the namespace shim beside it is dropped, and the pinned beam
+; is loaded ALONE — so a leftover shim reference would be `undef` here.
+;
+; WHAT IS PINNED, and in this order:
+;
+;   * the export SURFACE — every export the live module serves, the pinned beam
+;     serves (a superset: the pinned emitter has no private surface, so
+;     `tag/1`, `update_watches/2`, `notify_watches/3`, `apply_heap_bound/0`,
+;     `promise_loop/2`, `rethrow/1` and `timeout-exit?/1` ride along);
+;   * the atom corpus — value shapes, `swap!`/`reset!`/`compare-and-set!`
+;     answers, the `1 = 1.0` VALUE-equality contract, the self-reference case
+;     (which the live module ACCEPTS — the `:cycle` branch is not reachable
+;     from the public ops), the watch table (when it fires, in whose process,
+;     with which arguments, and that a no-op change still notifies), and every
+;     non-atom refusal's class AND message;
+;   * the volatile corpus — process-dictionary semantics, `deref`/`vreset!`/
+;     `vswap!` answers, and the documented INVISIBILITY across processes;
+;   * the future corpus — `future_exec` runs the thunk in another process,
+;     `deref` blocks, `deref/3` times out to its default, `future_cancel` is
+;     true only for a running computation;
+;   * the promise corpus — single delivery (the promise back, then nil), a
+;     waiter answered on delivery, `deref/3` timing out before it;
+;   * `deref` of the ALREADY-SEEDED native `Delay` and `Derived` values — the
+;     pinned module reads them through their public tags, and `deref/3` refuses
+;     them exactly as the live module does (neither has a timeout clause);
+;   * CROSS-MODULE values: an atom/promise/volatile the probe built is readable
+;     and writable by the live module and vice versa, because both spell the
+;     same production tag and the same process-dictionary key;
+;   * the PRODUCTION-atom stand-in: the pinned beam loaded over
+;     `Elixir.BeamLisp.Refs` answers the whole corpus identically, then the live
+;     beam is restored.
+;
+; EVERY READ HERE IS `maps/get`/`maps/keys`/`erlang/map_get`, never `(:f x)`:
+; beam-lisp's keyword lookup is a COLLECTION read, and the runtime refuses one
+; on a reference-typed struct — `%BeamLisp.Atom{}` is a reference, not a
+; collection. The pinned source reads its own fields the same way.
+;
+; THE STRUCT TYPES ARE NOT HERE, on purpose. `refs.ex` also declares five bare
+; `defstruct` types (Atom, Volatile, Reduced, Promise, Future). A bare struct has
+; no functions, and `compile_host_file` refuses a functions-free source while
+; `:struct_fields` refuses a hand-written `__struct__`/`__info__` — so each type
+; needs its OWN source spelling its own generated surface by hand (the
+; `priv/host/sorted_map.bl` technique), and no two of the five share a field
+; list. Five sources, not one: the port of the TYPES is a separate wave. The
+; pinned `Refs` does not depend on them — a struct is a tagged map, so every tag
+; is spelled literally and every value is built with `maps/put` — which is what
+; lets this file diff the behaviour TODAY.
+;
+; Run: bin/bl test test/bl/host_refs_test.bl
+
+(ns host.refs.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_refs_" (erlang/unique_integer (list :positive))))
+
+(defn- refs-source [] (Path/join (BeamLisp/cwd) "priv/host/refs.bl"))
+
+(def ^:private probe :Elixir.BeamLisp.HostRefsProbe)
+(def ^:private shim :Elixir.BeamLisp.Ns.Host.Refs)
+(def ^:private live :Elixir.BeamLisp.Refs)
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-pinned [mod path]
+  (do (drop! mod)
+      (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+      mod))
+
+; Compile `src` at `mod` and publish ONLY the pinned beam: the compile's own
+; load (and the namespace shim it built beside it) is dropped first.
+(defn- compile-pinned [mod src opts]
+  (let [res (BeamLisp.AOT/compile_host_file src opts)]
+    (load-pinned mod (elem res 1))))
+
+(defn- compile-refs [dir]
+  (let [m (compile-pinned probe (refs-source)
+            (list (t2 :module probe) (t2 :output_dir dir) (t2 :load? false)))]
+    (drop! shim)
+    m))
+
+; ── observation helpers ───────────────────────────────────────────────────
+
+; A raise is a VALUE too: `[:value v]` or `[:raise Class message]`, so a corpus
+; can compare calls that may or may not raise, CLASS and MESSAGE included.
+(defn- answer [f]
+  (try (list :value (f))
+       (catch e (list :raise (:__struct__ e) (ex-message e)))))
+
+(defn- o [mod name args] (answer (fn [] (erlang/apply mod name args))))
+
+; The same answer, with a value reduced to `[:value]` — for observations whose
+; value holds run-unique cells (a self-referential atom does).
+(defn- flat [r]
+  (if (erlang/== :value (first r)) (list :value) r))
+
+; The KEY SET of a value — the structural half of a struct whose content (cells,
+; pids) cannot be compared run to run.
+(defn- keys-of [x]
+  (vec (sort (map (fn [k] (Atom/to_string k)) (maps/keys x)))))
+
+(defn- tag-of [x]
+  (if (erlang/is_map x) (maps/get :__struct__ x nil) nil))
+
+(defn- push [log entry]
+  (swap! log (fn [l] (erlang/++ l (list entry)))))
+
+; ── the export surface ────────────────────────────────────────────────────
+
+(deftest refs-pinned-export-surface-serves-every-live-export
+  (testing "the pinned beam is a superset of the live module, minus __info__/1"
+    (let [dir (tmp-dir)]
+      (compile-refs dir)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (= :non_existing (erlang/apply :code :which (list shim))))
+      ; Every export the live module serves, the pinned beam serves. The live
+      ; Elixir module also carries the compiler-generated `__info__/1`; a pinned
+      ; beam has no such clause (the documented family shape).
+      (is (every? (fn [e] (erlang/function_exported probe (elem e 0) (elem e 1)))
+                  (filter (fn [e] (not (erlang/== :__info__ (elem e 0))))
+                          (erlang/apply live :module_info (list :exports)))))
+      (is (not (erlang/function_exported probe :__info__ 1)))
+      ; the pinned emitter has no private surface: the shared internals ride
+      ; along as exports. Named individually so a helper added tomorrow must be
+      ; named tomorrow.
+      (doseq [e (list (t2 :tag 1) (t2 :update_watches 2) (t2 :notify_watches 3)
+                      (t2 :apply_heap_bound 0) (t2 :promise_loop 2)
+                      (t2 :rethrow 1) (t2 :timeout-exit? 1))]
+        (is (erlang/function_exported probe (elem e 0) (elem e 1))
+            (str "the pinned helper " (elem e 0) "/" (elem e 1) " is exported")))
+      (File/rm_rf! dir))))
+
+; ── atoms ─────────────────────────────────────────────────────────────────
+
+(defn- atom-corpus [mod other]
+  (let [a (erlang/apply mod :atom (list 0))
+        shape (list (tag-of a) (keys-of a))
+        swapped (erlang/apply mod :swap! (list a (fn [o] (+ o 1))))
+        d1 (erlang/apply mod :deref (list a))
+        ; swap!/3 passes the extra args after the old value
+        d2 (erlang/apply mod :swap! (list a (fn [o i] (+ o i)) (list 10)))
+        reset-ret (erlang/apply mod :reset! (list a 20))
+        d3 (erlang/apply mod :deref (list a))
+        cas-hit (erlang/apply mod :compare_and_set! (list a 20 21))
+        d4 (erlang/apply mod :deref (list a))
+        cas-miss (erlang/apply mod :compare_and_set! (list a 20 22))
+        d5 (erlang/apply mod :deref (list a))
+        ; Clojure `=` is beam-lisp `==`: 1 and 1.0 are the SAME value
+        b (erlang/apply mod :atom (list 1))
+        loose (erlang/apply mod :compare_and_set! (list b 1.0 5))
+        d6 (erlang/apply mod :deref (list b))
+        ; the OTHER module reads a value THIS one built — one tag, one shape
+        cross (erlang/apply other :deref (list a))
+        ; a value the OTHER module built, read back here
+        foreign (erlang/apply mod :deref
+                  (list (erlang/apply other :atom (list :foreign))))
+        ; the step fn runs IN THE CALLER's process (and this is the LAST
+        ; observation to touch `a`: it overwrites the value with a pid)
+        who (erlang/apply mod :swap! (list a (fn [o] (erlang/self))))
+        caller (erlang/== (erlang/self) who)
+        ; a SELF-REFERENTIAL value is accepted, not refused: the `:cycle` answer
+        ; is unreachable from the public ops, in both modules
+        cyc (let [c (erlang/apply mod :atom (list 1))]
+              (flat (o mod :swap! (list c (fn [old] c)))))
+        cyc2 (let [c (erlang/apply mod :atom (list 1))]
+               (flat (o mod :reset! (list c c))))]
+    (list shape swapped d1 d2 reset-ret d3 cas-hit d4 cas-miss d5 loose d6
+          cross foreign caller cyc cyc2)))
+
+(defn- atom-error-corpus [mod]
+  (list
+    (o mod :swap! (list 5 (fn [o] o)))
+    (o mod :swap! (list :k (fn [o] o) (list)))
+    (o mod :reset! (list 5 1))
+    (o mod :reset! (list {:a 1} 1))
+    (o mod :compare_and_set! (list 5 1 2))
+    (o mod :add_watch! (list 5 :k (fn [k r o n] k)))
+    (o mod :remove_watch! (list 5 :k))
+    (o mod :deref (list 5))
+    (o mod :deref (list {:a 1}))
+    (o mod :deref (list nil))))
+
+; WATCHES: when they fire (after the commit), in WHOSE process (the caller's),
+; with WHICH arguments (`key ref old new`), that a no-op change still notifies,
+; and that `remove_watch!` stops them.
+(defn- watch-corpus [mod]
+  (let [a (erlang/apply mod :atom (list :zero))
+        log (atom (list))
+        me (erlang/self)
+        w1 (fn [k r o n] (push log (list k (erlang/== r a) (erlang/== me (erlang/self)) o n)))
+        added (erlang/apply mod :add_watch! (list a :w1 w1))
+        ; the atom back, not a copy: same cells
+        same (and (erlang/== added a)
+                  (erlang/== (erlang/map_get :cell added) (erlang/map_get :cell a)))
+        _ (erlang/apply mod :swap! (list a (fn [o] :one)))
+        _ (erlang/apply mod :swap! (list a (fn [o] o)))
+        _ (erlang/apply mod :reset! (list a :two))
+        _ (erlang/apply mod :compare_and_set! (list a :two :three))
+        _ (erlang/apply mod :compare_and_set! (list a :nope :nope))
+        after-run @log
+        removed (erlang/apply mod :remove_watch! (list a :w1))
+        _ (erlang/apply mod :reset! (list a :four))
+        after-remove @log
+        ; two watches, both fire; registration order is not promised
+        a2 (erlang/apply mod :atom (list 0))
+        log2 (atom (list))
+        w2 (fn [k r o n] (push log2 (list k o n)))
+        w3 (fn [k r o n] (push log2 (list k o n)))
+        _ (erlang/apply mod :add_watch! (list a2 :b w2))
+        _ (erlang/apply mod :add_watch! (list a2 :a w3))
+        _ (erlang/apply mod :reset! (list a2 9))
+        both (vec (sort (map (fn [x] (Atom/to_string (first x))) @log2)))]
+    (list same after-run after-remove both
+          (and (erlang/== removed a)
+               (erlang/== (erlang/map_get :cell removed) (erlang/map_get :cell a))))))
+
+; ── volatiles ─────────────────────────────────────────────────────────────
+
+(defn- volatile-corpus [mod]
+  (let [v (erlang/apply mod :volatile (list 1))
+        me (erlang/self)
+        shape (list (tag-of v) (keys-of v))
+        d1 (erlang/apply mod :deref (list v))
+        r1 (erlang/apply mod :vreset! (list v 2))
+        d2 (erlang/apply mod :deref (list v))
+        r2 (erlang/apply mod :vswap! (list v (fn [o] (+ o 10))))
+        d3 (erlang/apply mod :deref (list v))
+        r3 (erlang/apply mod :vswap! (list v (fn [o i] (+ o i)) (list 5)))
+        d4 (erlang/apply mod :deref (list v))
+        p1 (erlang/apply mod :volatile? (list v))
+        p2 (erlang/apply mod :volatile? (list 5))
+        ; the box is INVISIBLE in another process: same key, empty dictionary
+        child (let [p (erlang/spawn
+                        (fn []
+                          (erlang/send me
+                            (tuple :v (erlang/apply mod :deref (list v))))))]
+                (receive [:v x] x (after 2000 :no-answer)))]
+    (list shape d1 r1 d2 r2 d3 r3 d4 p1 p2 child)))
+
+(defn- volatile-error-corpus [mod]
+  (list (o mod :vreset! (list 5 1))
+        (o mod :vreset! (list {:key :k} 1))
+        (o mod :vswap! (list 5 (fn [o] o)))
+        (o mod :vswap! (list :k (fn [o] o) (list)))))
+
+; ── futures ───────────────────────────────────────────────────────────────
+
+(defn- future-corpus [mod]
+  (let [me (erlang/self)
+        f (erlang/apply mod :future_exec (list (fn [] 42)))
+        shape (list (tag-of f) (keys-of f))
+        f? (erlang/apply mod :future? (list f))
+        not-f? (erlang/apply mod :future? (list 5))
+        d (erlang/apply mod :deref (list f))
+        ; the thunk runs in a DIFFERENT process than the caller
+        other-pid (erlang/apply mod :deref
+                    (list (erlang/apply mod :future_exec (list (fn [] (erlang/self))))))
+        elsewhere (not (erlang/== me other-pid))
+        ; deref/3 bounds a still-running future
+        slow (erlang/apply mod :future_exec
+               (list (fn [] (erlang/apply :timer :sleep (list 400)) :late)))
+        timed-out (erlang/apply mod :deref (list slow 10 :timed-out))
+        ; ... and a finished one answers, not the default
+        quick (erlang/apply mod :future_exec (list (fn [] :quick)))
+        finished (erlang/apply mod :deref (list quick 5000 :timed-out))
+        ; cancel: true only while it is still running
+        long (erlang/apply mod :future_exec
+               (list (fn [] (erlang/apply :timer :sleep (list 5000)) :never)))
+        cancel-running (erlang/apply mod :future_cancel (list long))
+        cancel-done (erlang/apply mod :future_cancel (list quick))]
+    (list shape f? not-f? d elsewhere timed-out finished cancel-running cancel-done)))
+
+(defn- future-error-corpus [mod]
+  (list (o mod :future_cancel (list 5))
+        (o mod :future_cancel (list {:task :t}))
+        (o mod :spawn_exec (list (fn [] 1) :bogus))))
+
+; ── promises ──────────────────────────────────────────────────────────────
+
+(defn- promise-corpus [mod]
+  (let [p (erlang/apply mod :promise (list))
+        me (erlang/self)
+        shape (list (tag-of p) (keys-of p))
+        ; before delivery: a timed deref answers the default
+        early (erlang/apply mod :deref (list p 10 :not-yet))
+        ; a waiter (another process) parks; the delivery answers it
+        p2 (erlang/apply mod :promise (list))
+        _ (erlang/spawn
+            (fn []
+              (erlang/send me
+                (tuple :waiter (erlang/apply mod :deref (list p2 2000 :no-answer))))))
+        _ (erlang/apply :timer :sleep (list 20))
+        first-ret (erlang/apply mod :deliver (list p2 :first))
+        waiter-answer (receive [:waiter x] x (after 3000 :missing))
+        ; single assignment: the promise back on the FIRST delivery, nil after
+        second-ret (erlang/apply mod :deliver (list p2 :second))
+        delivered (erlang/apply mod :deliver (list p 7))
+        d1 (erlang/apply mod :deref (list p))
+        d2 (erlang/apply mod :deref (list p2))
+        ; deref/3 after delivery answers the value, never the default
+        late (erlang/apply mod :deref (list p 10 :not-yet))]
+    (list shape early (erlang/== first-ret p2) waiter-answer
+          (nil? second-ret) (erlang/== delivered p) d1 d2 late)))
+
+(defn- promise-error-corpus [mod]
+  (list (o mod :deliver (list 5 1))
+        (o mod :deliver (list {:pid :p} 1))))
+
+; ── deref of the seeded native pair, and the refusals ─────────────────────
+
+; The Delay/Derived TYPES are already pinned in the committed floor
+; (`priv/host/delay.bl` / `derived.bl`), so the values are built ONCE and handed
+; to both runs — the refusal MESSAGE renders the value, and a freshly built
+; delay would render a different cell.
+(defn- native-corpus [mod d dr]
+  (list
+    (erlang/apply mod :deref (list d))
+    (erlang/apply mod :deref (list dr))
+    ; deref/3 has NO Delay/Derived clause in either module: it is refused
+    (o mod :deref (list d 10 :tv))
+    (o mod :deref (list dr 10 :tv))
+    ; a hand-built Reduced peels to its value through the public tag
+    (erlang/apply mod :deref
+      (list {:__struct__ :"Elixir.BeamLisp.Reduced" :value 99}))
+    (erlang/apply mod :deref
+      (list {:__struct__ :"Elixir.BeamLisp.Reduced" :value 99} 10 :tv))))
+
+(deftest deref-reads-the-seeded-native-pair-and-refuses-non-references
+  (testing "Delay/Derived through their public tags; every non-reference refused alike"
+    (let [dir (tmp-dir)]
+      (compile-refs dir)
+      (let [d (BeamLisp.Deferred/delay (fn [] 41))
+            dr (BeamLisp.Reactive/derive (list) (fn [] 7))]
+        (is (= (native-corpus live d dr) (native-corpus probe d dr)))
+        (is (= (list 41 7) (take 2 (native-corpus probe d dr))))
+        ; the deref/3 refusals carry the delay's OWN rendering, module for module
+        (is (= (o live :deref (list d 10 :tv)) (o probe :deref (list d 10 :tv)))))
+      (is (= (atom-error-corpus live) (atom-error-corpus probe)))
+      (is (= (volatile-error-corpus live) (volatile-error-corpus probe)))
+      (is (= (future-error-corpus live) (future-error-corpus probe)))
+      (is (= (promise-error-corpus live) (promise-error-corpus probe)))
+      (File/rm_rf! dir))))
+
+; ── the whole corpus, both modules ────────────────────────────────────────
+
+(deftest refs-pinned-matches-the-live-module
+  (testing "answers, value shapes, process semantics and refusals, module for module"
+    (let [dir (tmp-dir)]
+      (compile-refs dir)
+      ; PINNED ANSWERS first — the ABI itself, not merely probe == live.
+      (is (= (list [:"Elixir.BeamLisp.Atom" ["__struct__" "cell" "watches"]]
+                   1 1 11 20 20 true 21 false 21 true 5
+                   21 :foreign true (list :value) (list :value))
+             (atom-corpus probe live)))
+      (is (= (atom-error-corpus probe)
+             (list
+               (list :raise :Elixir.ArgumentError "swap!: not a reference: 5")
+               (list :raise :Elixir.ArgumentError "swap!: not a reference: :k")
+               (list :raise :Elixir.ArgumentError "reset!: not an atom: 5")
+               (list :raise :Elixir.ArgumentError "reset!: not an atom: %{a: 1}")
+               (list :raise :Elixir.ArgumentError
+                     "compare-and-set!: not an atom: 5")
+               (list :raise :Elixir.ArgumentError "add-watch!: not an atom: 5")
+               (list :raise :Elixir.ArgumentError "remove-watch!: not an atom: 5")
+               (list :raise :Elixir.ArgumentError "deref: not a derefable reference: 5")
+               (list :raise :Elixir.ArgumentError
+                     "deref: not a derefable reference: %{a: 1}")
+               (list :raise :Elixir.ArgumentError
+                     "deref: not a derefable reference: nil"))))
+      (is (= (volatile-corpus probe)
+             (list [:"Elixir.BeamLisp.Volatile" ["__struct__" "key"]]
+                   1 2 2 12 12 17 17 true false nil)))
+      (is (= (future-corpus probe)
+             (list [:"Elixir.BeamLisp.Future" ["__struct__" "task"]]
+                   true false 42 true :timed-out :quick true false)))
+      (is (= (promise-corpus probe)
+             (list [:"Elixir.BeamLisp.Promise" ["__struct__" "pid"]]
+                   :not-yet true :first true true 7 :first 7)))
+      ; ... and against the live module at the public ABI atom.
+      (is (= (atom-corpus live live) (atom-corpus probe live)))
+      (is (= (watch-corpus live) (watch-corpus probe)))
+      (is (= (volatile-corpus live) (volatile-corpus probe)))
+      (is (= (future-corpus live) (future-corpus probe)))
+      (is (= (promise-corpus live) (promise-corpus probe)))
+      (File/rm_rf! dir))))
+
+; `spawn_exec` is the raw-process half of the public API: the thunk runs in a
+; CHILD, and the three `kind`s are the three `:erlang.spawn*` shapes.
+(deftest spawn-exec-runs-the-thunk-in-a-child-of-the-asked-shape
+  (testing "plain/link/monitor, and the child is a real process"
+    (let [dir (tmp-dir)]
+      (compile-refs dir)
+      (let [me (erlang/self)
+            obs (fn [mod]
+                  (let [p (erlang/apply mod :spawn_exec
+                            (list (fn [] (erlang/send me (tuple :plain (erlang/self))))))
+                        got (receive [:plain child] child (after 2000 :missing))
+                        pm (erlang/apply mod :spawn_exec
+                             (list (fn [] (erlang/send me (tuple :mon (erlang/self)))) :monitor))
+                        mgot (receive [:mon child2] child2 (after 2000 :missing))
+                        pl (erlang/apply mod :spawn_exec
+                             (list (fn [] (erlang/send me (tuple :link (erlang/self)))) :link))
+                        lgot (receive [:link child3] child3 (after 2000 :missing))]
+                    (list (erlang/is_pid p) (erlang/== p got)
+                          (erlang/is_pid (first pm)) (erlang/is_reference (nth pm 1))
+                          (erlang/== (first pm) mgot)
+                          (erlang/is_pid pl) (erlang/== pl lgot)
+                          (not (erlang/== me p)) (not (erlang/== me pl)))))]
+        (is (= (obs live) (obs probe)))
+        (is (= (list true true true true true true true true true) (obs probe))))
+      (File/rm_rf! dir))))
+
+; The binding-conveyance both `future_exec` and `spawn_exec` document: the
+; child runs in the SAME world as its parent. The token `capture/0` hands back
+; carries the caller's namespace, and a RAW `:erlang.spawn` child has none —
+; which is exactly why the pinned sources bind the token first.
+(deftest futures-and-spawns-inherit-the-calling-env
+  (testing "the child's captured ns is the caller's; a raw spawn's is not"
+    (let [dir (tmp-dir)
+          ns (maps/get :ns (BeamLisp.Env/capture) nil)]
+      (compile-refs dir)
+      (let [me (erlang/self)
+            future-ns (maps/get :ns
+                        (erlang/apply probe :deref
+                          (list (erlang/apply probe :future_exec
+                                  (list (fn [] (BeamLisp.Env/capture)))))) nil)]
+        (erlang/apply probe :spawn_exec
+          (list (fn [] (erlang/send me (tuple :ns (maps/get :ns (BeamLisp.Env/capture) nil))))))
+        (let [spawn-ns (receive [:ns x] x (after 2000 :missing))]
+          ; a raw spawn: no token bound, so it resolves in NO namespace
+          (erlang/spawn
+            (fn [] (erlang/send me (tuple :raw (maps/get :ns (BeamLisp.Env/capture) nil)))))
+          (let [raw-ns (receive [:raw x] x (after 2000 :missing))]
+            (is (some? ns) "precondition: the test process runs in a namespace")
+            (is (= ns future-ns))
+            (is (= ns spawn-ns))
+            (is (nil? raw-ns))
+            (is (= (list future-ns spawn-ns raw-ns) (list ns ns nil))))))
+      (File/rm_rf! dir))))
+
+; The watch table is the sharpest of these: its ORDER, its PROCESS and its four
+; arguments are all observable, and the no-op swap must still notify.
+(deftest watches-fire-in-the-callers-process-after-the-commit
+  (testing "add/remove, notification order and arguments, and the no-op notify"
+    (let [dir (tmp-dir)]
+      (compile-refs dir)
+      (is (= (watch-corpus probe) (watch-corpus live)))
+      (let [w (watch-corpus probe)]
+        ; the same atom back from add and remove (same cells)
+        (is (= true (first w)))
+        (is (= true (last w)))
+        ; :w1 saw the :one swap, the NO-OP swap, the reset and the committing
+        ; CAS, in order — each `(key watcher-sees-this-atom? caller? old new)`.
+        ; The non-committing CAS notified nothing.
+        (is (= (list
+                 (list :w1 true true :zero :one)
+                 (list :w1 true true :one :one)
+                 (list :w1 true true :one :two)
+                 (list :w1 true true :two :three))
+               (nth w 1)))
+        ; remove-watch! silences it
+        (is (= (nth w 1) (nth w 2)))
+        ; two watches, both fired, one notification each
+        (is (= (list "a" "b") (nth w 3))))
+      (File/rm_rf! dir))))
+
+; ── the production-atom stand-in ──────────────────────────────────────────
+
+(deftest pinned-refs-stands-in-at-the-production-atom
+  (testing "the pinned beam loaded over Elixir.BeamLisp.Refs answers, then restores"
+    (let [dir (tmp-dir)
+          orig-path (erlang/apply :code :which (list live))
+          orig-bin (File/read! (erlang/list_to_binary orig-path))
+          beam (Path/join dir "Elixir.BeamLisp.Refs.beam")
+          d (BeamLisp.Deferred/delay (fn [] 41))
+          dr (BeamLisp.Reactive/derive (list) (fn [] 7))
+          corpus (fn [] (list (atom-corpus live live) (watch-corpus live)
+                              (volatile-corpus live) (future-corpus live)
+                              (promise-corpus live) (native-corpus live d dr)))
+          before (corpus)]
+      (is (not= :non_existing orig-path) "precondition: the live beam is a readable file")
+      (try
+        ; compile at the EXACT atom, then load it OVER the live module
+        (BeamLisp.AOT/compile_host_file (refs-source)
+          (list (t2 :module live) (t2 :output_dir dir) (t2 :load? false)))
+        (drop! live)
+        (code/load_binary live (erlang/binary_to_list beam) (File/read! beam))
+        ; the pinned module answers the whole corpus, answer for answer —
+        ; including the cross-module reads, now self-reads
+        (is (= before (corpus)))
+        (finally
+          (drop! live)
+          (code/load_binary live orig-path orig-bin)))
+      ; RESTORED: the live module answers again at the same atom
+      (let [a (BeamLisp.Refs/atom 2)]
+        (is (= 3 (BeamLisp.Refs/swap! a inc)))
+        (is (= 3 (BeamLisp.Refs/deref a))))
+      (File/rm_rf! dir))))
+
+; ── cold start: nothing but the pinned beam ───────────────────────────────
+
+(deftest pinned-refs-runs-with-its-namespace-vars-deleted
+  (testing "the pinned beam answers after every var the compile interned is gone"
+    (let [dir (tmp-dir)]
+      (compile-refs dir)
+      ; `update_watches` is not a `core` name, so `bound?`'s core fallback
+      ; cannot mask the deletion (it would for `atom`).
+      (is (BeamLisp.Env/bound? "host.refs" "update_watches"))
+      (doseq [e (erlang/apply probe :module_info (list :exports))]
+        (BeamLisp.Env/delete_key (tuple "host.refs" (Atom/to_string (elem e 0)))))
+      (is (not (BeamLisp.Env/bound? "host.refs" "update_watches")))
+      ; the beam is self-contained: every call is a remote call to another
+      ; module, never a namespace var
+      (let [a (erlang/apply probe :atom (list 0))]
+        (is (= 1 (erlang/apply probe :swap! (list a inc))))
+        (is (= 1 (erlang/apply probe :deref (list a)))))
+      (is (= true (erlang/apply probe :volatile?
+                     (list (erlang/apply probe :volatile (list 1))))))
+      (File/rm_rf! dir))))
+
+; ── the five bare struct TYPES: ONE shared source, FIVE exact atoms ───────
+;
+; `priv/host/refs_structs.bl` is compiled at each of the five atoms in turn,
+; carrying that type's `:struct_fields` — so ONE source, holding NO field name,
+; answers five correct struct surfaces. The probe is built into a fresh atom,
+; the compile's namespace shim is dropped, and the beam is loaded ALONE.
+;
+; The surface is a SUPERSET by exactly `new/1`: the live modules are bare
+; `defstruct`s (`__struct__/0,1` + `__info__/1` and nothing else), a pinned
+; source must spell ≥1 `defn`, and `:struct_fields` refuses a hand-written
+; `__struct__`/`__info__` — the same corner `priv/host/delay.bl` and
+; `priv/host/derived.bl` document for their own constructors. Everything a
+; caller can observe about the TYPE is unchanged.
+
+(def ^:private structs-source (Path/join (BeamLisp/cwd) "priv/host/refs_structs.bl"))
+(def ^:private structs-shim :Elixir.BeamLisp.Ns.Host.RefsStructs)
+
+(defn- types
+  "One row per bare type: the live module, the probe atom, its `:struct_fields`
+   in declaration order, and the `Inspect` rendering of `__struct__/0`."
+  []
+  (list
+    (list :Elixir.BeamLisp.Atom :Elixir.BeamLisp.HostAtomTypeProbe
+          (list (t2 :cell nil) (t2 :watches nil))
+          "%BeamLisp.HostAtomTypeProbe{cell: nil, watches: nil}")
+    (list :Elixir.BeamLisp.Volatile :Elixir.BeamLisp.HostVolatileTypeProbe
+          (list (t2 :key nil))
+          "%BeamLisp.HostVolatileTypeProbe{key: nil}")
+    (list :Elixir.BeamLisp.Reduced :Elixir.BeamLisp.HostReducedTypeProbe
+          (list (t2 :value nil))
+          "%BeamLisp.HostReducedTypeProbe{value: nil}")
+    (list :Elixir.BeamLisp.Promise :Elixir.BeamLisp.HostPromiseTypeProbe
+          (list (t2 :pid nil))
+          "%BeamLisp.HostPromiseTypeProbe{pid: nil}")
+    (list :Elixir.BeamLisp.Future :Elixir.BeamLisp.HostFutureTypeProbe
+          (list (t2 :task nil))
+          "%BeamLisp.HostFutureTypeProbe{task: nil}")))
+
+(defn- compile-type [probe-mod fields dir]
+  (let [r (compile-pinned probe-mod structs-source
+            (list (t2 :module probe-mod) (t2 :output_dir dir) (t2 :load? false)
+                  (t2 :struct_fields fields)))]
+    (drop! structs-shim)
+    r))
+
+(deftest the-shared-struct-source-answers-every-type-at-its-own-atom
+  (testing "one source, five shapes: tag, field order, defaults, inspect, new/1"
+    (let [dir (tmp-dir)]
+      (doseq [row (types)]
+        (let [live-mod (first row)
+              probe-mod (nth row 1)
+              fields (nth row 2)
+              rendered (nth row 3)
+              assigns (Enum/map fields (fn [f] (t2 (erlang/element 1 f) :v)))]
+          (compile-type probe-mod fields dir)
+          (is (= :non_existing (erlang/apply :code :which (list structs-shim))))
+          ; the synthesized surface, and NOTHING else but the one constructor
+          (is (erlang/function_exported probe-mod :__struct__ 0))
+          (is (erlang/function_exported probe-mod :__struct__ 1))
+          (is (erlang/function_exported probe-mod :__info__ 1))
+          (is (erlang/function_exported probe-mod :new 1))
+          (is (= (Enum/sort (list (t2 :new 1) (t2 :module_info 0) (t2 :module_info 1)))
+                 (Enum/sort
+                   (filter (fn [e] (and (not (erlang/== :__struct__ (elem e 0)))
+                                        (not (erlang/== :__info__ (elem e 0)))))
+                           (erlang/apply probe-mod :module_info (list :exports)))))
+              "the pinned extras are exactly new/1")
+          ; __info__(:struct) is the live module's, datum for datum — order AND
+          ; defaults — and that is what `Inspect.Any` reads to render a struct.
+          (is (= (erlang/apply live-mod :__info__ (list :struct))
+                 (erlang/apply probe-mod :__info__ (list :struct))))
+          ; the tag is THIS beam's atom, and the defaults are the live ones
+          (let [s0 (erlang/apply probe-mod :__struct__ (list))]
+            (is (= probe-mod (maps/get :__struct__ s0 nil)))
+            (is (= (maps/remove :__struct__ (erlang/apply live-mod :__struct__ (list)))
+                   (maps/remove :__struct__ s0))))
+          ; __struct__/1 folds a keyword list over the defaults
+          (is (= (erlang/apply probe-mod :__struct__ (list assigns))
+                 (erlang/apply probe-mod :new
+                   (list (Enum/map fields (fn [f] :v))))))
+          ; Kernel.struct!/2 lands on the same constructor
+          (is (= (erlang/apply :Elixir.Kernel :struct! (list probe-mod assigns))
+                 (erlang/apply probe-mod :__struct__ (list assigns))))
+          ; an unknown key is refused as the live module refuses it
+          (is (= :Elixir.KeyError
+                 (try (erlang/apply probe-mod :__struct__ (list (list (t2 :zz 1))))
+                      :no-raise
+                      (catch e (:__struct__ e)))))
+          ; the rendering names the pinned atom and the live field list
+          (is (= rendered (Kernel/inspect (erlang/apply probe-mod :__struct__ (list)))))))
+      (File/rm_rf! dir))))
+
+; A REFERENCE is recognized by its PUBLIC tag, never by which beam built the
+; value: a probe-compiled TYPE answers to its probe atom, exactly as
+; `priv/host/reactive.bl` documents for `Derived`. That is what makes the port
+; safe — and it is asserted here, so a later "helpful" widening of the tag test
+; is caught.
+(deftest a-probe-tagged-type-is-not-a-production-reference
+  (testing "tag identity is the public atom, not the beam"
+    (let [dir (tmp-dir)
+          rows (types)
+          reduced-mod (nth (nth rows 2) 1)
+          atom-mod (nth (nth rows 0) 1)]
+      (compile-refs dir)
+      (compile-type atom-mod (list (t2 :cell nil) (t2 :watches nil)) dir)
+      (compile-type reduced-mod (list (t2 :value nil)) dir)
+      (let [cell (BeamLisp.LazyMemo/create_ref :cell-value)
+            watches (BeamLisp.LazyMemo/create_ref (maps/new))
+            a (erlang/apply atom-mod :new (list (list cell watches)))
+            r (erlang/apply reduced-mod :new (list (list 99)))]
+        (is (= :Elixir.BeamLisp.HostAtomTypeProbe (maps/get :__struct__ a nil)))
+        (is (= :Elixir.BeamLisp.HostReducedTypeProbe (maps/get :__struct__ r nil)))
+        (is (= false (erlang/apply probe :future? (list r))))
+        (is (= true (includes?
+                      (ex-message (try (erlang/apply probe :deref (list r))
+                                       (catch e e)))
+                      "HostReducedTypeProbe"))
+            "a probe-tagged reduced is refused, and the refusal names it")
+        )
+      (File/rm_rf! dir))))
+
+; ── all five types, at their PRODUCTION atoms ──────────────────────────────
+
+(deftest the-five-types-stand-in-at-their-production-atoms
+  (testing "one shared source loaded over all five live type modules, then restored"
+    (let [dir (tmp-dir)
+          rows (types)
+          saved (vec (map (fn [row]
+                            (let [m (first row)
+                                  path (erlang/apply :code :which (list m))]
+                              (list m path (File/read! (erlang/list_to_binary path))
+                                    (erlang/apply m :__info__ (list :struct)))))
+                          rows))
+          live-inspects (vec (map (fn [row] (Kernel/inspect (erlang/apply (first row) :__struct__ (list)))) rows))]
+      ; every live beam is a readable file — the precondition for restoring
+      (is (every? (fn [s] (not= :non_existing (nth s 1))) saved))
+      (try
+        (doseq [row rows]
+          (let [live-mod (first row)
+                bp (Path/join dir (str (Atom/to_string live-mod) ".beam"))]
+            (compile-type live-mod (nth row 2) dir)
+            (drop! live-mod)
+            (code/load_binary live-mod (erlang/binary_to_list bp) (File/read! bp))))
+        ; the pinned modules answer the live metadata, and render EXACTLY as
+        ; the live ones did — the atom is the same one, so the `%BeamLisp.Atom{}`
+        ; form `Inspect.Any` builds must be unchanged too
+        (doseq [i (range (count rows))]
+          (let [live-mod (first (nth rows i))]
+            (is (= (nth (nth saved i) 3) (erlang/apply live-mod :__info__ (list :struct))))
+            (is (= (nth live-inspects i)
+                   (Kernel/inspect (erlang/apply live-mod :__struct__ (list)))))))
+        ; ... and the two halves now COMPOSE at production atoms: a value the
+        ; PINNED type built (its `new/1`) is read by the live `Refs`, because
+        ; the tag it carries is the one `Refs` dispatches on
+        (let [cell (BeamLisp.LazyMemo/create_ref :live-value)
+              watches (BeamLisp.LazyMemo/create_ref (maps/new))
+              a (erlang/apply :Elixir.BeamLisp.Atom :new (list (list cell watches)))
+              r (erlang/apply :Elixir.BeamLisp.Reduced :new (list (list 5)))]
+          (is (= :Elixir.BeamLisp.Atom (maps/get :__struct__ a nil)))
+          (is (= :live-value (BeamLisp.Refs/deref a)))
+          (is (= 5 (BeamLisp.Refs/deref r)))
+          (is (= 6 (BeamLisp.Refs/swap! a (fn [o] 6))))
+          (is (= 6 (BeamLisp.Refs/deref a))))
+        (finally
+          ; `:code.which/1` answers a charlist; `load_binary/3`'s filename IS
+          ; a string, so it is passed through, never converted
+          (doseq [s saved]
+            (drop! (first s))
+            (code/load_binary (first s) (nth s 1) (nth s 2)))))
+      ; RESTORED: the live type modules answer again, and render as before
+      (doseq [i (range (count rows))]
+        (is (= (nth (nth saved i) 3)
+               (erlang/apply (first (nth rows i)) :__info__ (list :struct))))
+        (is (= (nth live-inspects i)
+               (Kernel/inspect (erlang/apply (first (nth rows i)) :__struct__ (list))))))
+      (File/rm_rf! dir))))
