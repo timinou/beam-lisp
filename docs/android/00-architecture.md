@@ -53,6 +53,13 @@ The app is a namespace too: `navigation` says which screens exist, `on-start`
 mounts the first one. `android.app/start!` boots mob with that namespace as the
 app module.
 
+A screen draws in one of two ways. **Compose**: `render` returns an
+`android.ui` tree and mob paints it natively. **loom**: `(defloom {:view
+:on-event})` hands the screen to a loom view — the desk's design system, the
+same components and events a desktop window or a web page takes — painted in
+mob's WebView. The page half of every loom host is `loom.surface`; the phone
+and the desktop are two hosts of it.
+
 ## The boundary, in one sentence
 
 The BEAM never blocks the UI thread and the JVM never calls into BEAM code:
@@ -72,6 +79,10 @@ Four rules keep that seam honest:
 - **Classes resolve through the app's class loader**, never the
   Application's own class, which the boot loader owns.
 
+A loom page is a second seam with the same trap: mob's WebView bridge also
+crosses JNI as modified UTF-8, so everything a loom screen sends down, and
+everything its page sends up, travels as ASCII with `\uXXXX` escapes.
+
 ## Where things live
 
 | path | what |
@@ -82,6 +93,7 @@ Four rules keep that seam honest:
 | `priv/android/erl/bl_android_nif.erl` | its Erlang stubs (answer `not_on_android` on the desk) |
 | `priv/android/manifest.xml`, `res/` | the permissions, services and strings merged into the app |
 | `priv/std/bl/android.bl.md` | the `bl android` verbs |
+| `priv/lib/loom/surface.bl` | the page half of a loom app, shared with `loom.desktop` |
 
 Next: [01-getting-started](01-getting-started.md) builds an app;
 [02-namespaces](02-namespaces.md) is the reference.

@@ -11,7 +11,7 @@ full story; this page is the map.
 (defn on-start [] (app/start-root! 'people.home))
 ```
 
-`stack`, `start-root!`, `assign`, `assigns`, `platform` (`:android`, or
+`stack`, `start-root!`, `push`, `pop`, `assign`, `assigns`, `platform` (`:android`, or
 `:host` on the desk), `dist!`, `module` (a namespace → the BEAM module mob is
 given). `start!` is what the phone runs at boot.
 
@@ -100,6 +100,34 @@ Listening to every app (after `bl android grant listener`):
 (notify/open! key) (notify/dismiss! key)
 ```
 
+## android.loom — a loom page as a screen
+
+```clojure
+(ns people.board
+  (:require [android.loom :refer [defloom]] [android.events :as events] [loom.ui :as ui]))
+
+(defn view [n] (ui/button {:on-click [:inc]} (str "taps: " n)))
+(defn on-event [n ev] (if (= ev [:inc]) (+ n 1) n))
+(defn init [_params] (events/subscribe! [:notify]) 0)
+
+(defloom {:title "Board" :init init :view view :on-event on-event})
+```
+
+`defloom` goes after the fns it names. Every message the screen receives folds
+through `on-event`: a tap arrives as the term the view wrote (`[:inc]`), an
+`android.events` delivery as itself (`[:android :notify/posted n]`). An input
+with `:on-keydown.enter [:answer k]` sends `[[:answer k] "the text"]`.
+
+```clojure
+(android.loom/js "document.title")   ; the live page, as data; throws on a page error
+(android.loom/state)                  ; the state of the loom screen in front
+(android.loom/emit! [:inc])           ; fold an event from anywhere
+(android.app/push socket 'people.board)  ; open it from another screen
+```
+
+A link the page follows opens outside the app. A page recreated under the
+screen gets the current frame, not the first.
+
 ## android.reader — read any screen
 
 After `bl android grant reader`:
@@ -110,7 +138,8 @@ After `bl android grant reader`:
 (reader/tree 6)           ; the window's node tree, to depth 6
 (reader/foreground)       ; "com.android.settings"
 (reader/find "Wi")        ; nodes whose text contains it
-(reader/click! "Network & internet")
+(reader/click! "Network & internet")   ; web pages too: a DOM node is tapped
+(reader/tap! 540 1200)    ; a finger at x, y (pixels), over any app
 (reader/global! :back)    ; :home :recents :notifications
 (reader/stream! true)     ; window changes and clicks as :reader/event
 ```

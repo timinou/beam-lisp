@@ -101,7 +101,11 @@ bl android grant all        # or: listener · reader · overlay · notify
 bl android shot home.png    # what the screen shows now
 bl android logs             # the app's log (the BEAM's output is tagged BEAMout)
 bl android stop
+bl android devtools         # a loom page's DOM, over Chrome DevTools
 ```
+
+`devtools` forwards the WebView's debug socket to `localhost:9222`: open
+`chrome://inspect`, or point any CDP client at it.
 
 ## Testing
 
@@ -111,4 +115,10 @@ rest, a beam-lisp program can drive the phone: `bl.android/rpc` calls into it,
 `bl.android/adb!` drives the device, and `android.reader` reads back what a
 person would see. `phone/test/e2e.bl` in the `system` repository is a complete
 example: it posts stub notifications and checks the screen, the model and the
-overlay agree.
+overlay agree, then drives a loom page with a finger, a keyboard and a DevTools
+client.
+
+A loom screen's logic is `android.loom/react` — a message in, the new state and
+the JavaScript out — so it is tested on the desk too. On the phone,
+`(android.loom/js expr)` reads the live page from any process, the desk
+included.
