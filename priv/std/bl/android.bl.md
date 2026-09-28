@@ -18,6 +18,7 @@ bl android grant WHAT       listener | reader | overlay | notify | all
 bl android shot [FILE]      a screenshot, as PNG
 bl android logs             the app's log, filtered
 bl android stop             stop the app
+bl android devtools [PORT]  the WebView's pages over Chrome DevTools
 ```
 
 `build` then `install`, `push`, `up` is the whole loop the first time. After a
@@ -713,6 +714,41 @@ shell can make them directly, so a test never taps through Settings.
       (do (print (:out (adb! "logcat" "-d" "-t" "400" (str "--pid=" pid)))) 0))))
 
 (defn stop [t _st] (adb! "shell" "am" "force-stop" (:id t)) 0)
+```
+
+## devtools — the WebView's pages, from the desk
+
+A debug build's WebView serves Chrome's DevTools protocol on an abstract
+socket named for the app's pid. `devtools` forwards it to a desk port and
+lists the pages there: open `chrome://inspect`, or point any CDP client
+(puppeteer's `browserURL`) at `http://localhost:PORT`. A loom page's URL is its
+whole first frame as `data:`, so it is shown cut short.
+
+```beam-lisp
+(def devtools-port 9222)
+
+(defn devtools-pages
+  "Forward the running app's DevTools socket to `port`; its pages as maps with
+   string keys (id, title, url, webSocketDebuggerUrl)."
+  [t port]
+  (let [pid (String/trim (str (:out (adb! "shell" "pidof" (:id t)))))]
+    (when (= "" pid) (throw (ex-info (str (:id t) " is not running — bl android up") {})))
+    (step! "forward devtools" (adb) ["forward" (str "tcp:" port) (str "localabstract:webview_devtools_remote_" pid)] {})
+    (let [r (sh "curl" ["-s" "--max-time" "5" (str "http://localhost:" port "/json")])]
+      (if (:ok? r)
+        (bl.json/decode (:out r) {:keys :string})
+        (throw (ex-info (str "no DevTools answer on port " port " — is a WebView open in " (:id t) "?") {}))))))
+
+(defn devtools [t args st]
+  (let [port (if (seq args) (erlang/binary_to_integer (first args)) devtools-port)
+        pages (devtools-pages t port)
+        short (fn [u] (if (> (count u) 60) (str (subs u 0 60) "…") u))]
+    (u/emit st pages
+            (fn [ps] (str "http://localhost:" port "  (chrome://inspect, or a CDP client)\n"
+                          (join "\n" (vec (map (fn [p] (str "  " (get p "title") "  " (short (str (get p "url")))
+                                                           "\n    " (get p "webSocketDebuggerUrl")))
+                                               ps))))))
+    0))
 
 (defn install [t _st]
   (let [apk (Path/join (:android t) "app/build/outputs/apk/debug/app-debug.apk")]
@@ -725,7 +761,7 @@ shell can make them directly, so a test never taps through Settings.
 
 ```beam-lisp
 (def usage
-  "usage: bl android doctor|new NAME|build|install|push|up|eval EXPR|grant [WHAT…]|shot [FILE]|logs|stop")
+  "usage: bl android doctor|new NAME|build|install|push|up|eval EXPR|grant [WHAT…]|shot [FILE]|logs|stop|devtools [PORT]")
 
 (defn run [args st]
   (u/register-paths st)
@@ -753,6 +789,7 @@ shell can make them directly, so a test never taps through Settings.
               (= sub "shot") (shot t more st)
               (= sub "logs") (logs t st)
               (= sub "stop") (stop t st)
+              (= sub "devtools") (devtools t more st)
               :else (u/usage-error usage)))))
       (catch e
         (u/io-err (str "bl android: " (or (ex-message e) (pr-str e))))
