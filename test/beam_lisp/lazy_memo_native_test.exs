@@ -228,7 +228,9 @@ defmodule BeamLisp.LazyMemoNativeTest do
     before = LazyMemo.stats().retained_bytes
     Enum.reduce(1..1000, 0, fn i, v -> :ok = LazyMemo.exchange(r, v, i); i end)
     after_bytes = LazyMemo.stats().retained_bytes
-    assert abs(after_bytes - before) < 1024
+    # Other cells may be reclaimed while this process churns; only positive
+    # retained-byte drift would indicate that replacements leak.
+    assert after_bytes - before < 1024
   end
 
   test "finite inputs use immutable shared storage and preserve all values" do
@@ -314,7 +316,8 @@ defmodule BeamLisp.LazyMemoNativeTest do
     {output, status} =
       System.cmd(
         System.find_executable("elixir"),
-        ["-pa", BeamLisp.AOT.default_output_dir(), "-e", script], stderr_to_stdout: true)
+        ["-pa", LazyMemo |> :code.which() |> to_string() |> Path.dirname(), "-e", script],
+        stderr_to_stdout: true)
 
     assert status == 0, output
     assert output =~ "unload-ok"
