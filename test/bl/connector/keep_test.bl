@@ -1,0 +1,205 @@
+; test/bl/connector/keep_test.bl — the keep over a fake Drive: fixed scenarios
+; for each law, then a veritas.model over every generated order of edits.
+
+(ns connector.keep-test
+  (:require [datom] [files] [connector.keep :as keep]
+            [connector.google.gdrive :as gdrive]
+            [connector.google.fake-drive :as fd]
+            [veritas.model :as vm]))
+
+(files/register-under!)
+
+(def NS "sub-1")
+(defn k [id] [:gdrive NS id])
+
+(defn- keep-for [drive roots]
+  (let [c (datom/connect (keep/full-schema))]
+    {:conn c :feed (gdrive/feed NS) :get (fd/get-fn drive) :roots (fn [_] (mapv k roots))}))
+
+(defn- eid [kp id] (let [ds (into [] (datom/datoms (datom/db (:conn kp)) :avet :conn/key (k id)))]
+                     (if (empty? ds) nil (nth (first ds) 0))))
+
+(defn- mirrored
+  "The ids a READER of root `r` sees in the mirror: the live closure (nothing
+   trashed or gone, nothing under a trashed folder)."
+  [kp r]
+  (let [db (datom/db (:conn kp))
+        re (eid kp r)]
+    (if (nil? re) #{}
+      (into #{} (map (fn [e] (nth (:conn/key (datom/pull db [:conn/key] e)) 2))
+                     (files/descendants db re true))))))
+
+(defn- all-keys [kp]
+  (into #{} (map (fn [r] (nth (first r) 2))
+                 (into [] (datom/q '[:find ?k :where [?e :conn/key ?k]] (datom/db (:conn kp)))))))
+
+(defn- tree []
+  (let [d (fd/make)]
+    (fd/add! d "clients" {:name "Clients" :parent "root" :folder? true})
+    (fd/add! d "dupont" {:name "DUPONT-PRIV" :parent "clients" :folder? true})
+    (fd/add! d "a" {:name "a.md" :parent "dupont" :content "alpha"})
+    (fd/add! d "sub" {:name "Sub" :parent "dupont" :folder? true})
+    (fd/add! d "b" {:name "b.pdf" :parent "sub" :content "beta"})
+    (fd/add! d "hr" {:name "HR" :parent "root" :folder? true})
+    (fd/add! d "salaries" {:name "salaries.xlsx" :parent "hr" :content "secret"})
+    d))
+
+;; ── the laws, one scenario each ─────────────────────────────────────────────
+
+(deftest m2-first-step-takes-the-cursor-first-then-seeds
+  (let [d (tree) kp (keep-for d ["dupont"])
+        r (keep/step! kp)]
+    (is (= :seeded (:ok r)))
+    (is (= #{"a" "sub" "b"} (mirrored kp "dupont")))
+    (is (some? (keep/cursor (datom/db (:conn kp)) (:feed kp))))))
+
+(deftest m1-nothing-outside-the-roots-is-ever-written
+  (let [d (tree) kp (keep-for d ["dupont"])]
+    (keep/step! kp)
+    (fd/edit! d "salaries" "more secret")
+    (fd/add! d "bonus" {:name "bonus.xlsx" :parent "hr" :content "x"})
+    (keep/step! kp)
+    (is (empty? (clojure.set/intersection (all-keys kp) #{"hr" "salaries" "bonus" "clients" "root"})))))
+
+(deftest a-change-made-during-the-seed-is-replayed
+  ;; the start token was taken BEFORE the seed; an edit landing after it is
+  ;; in the next page walk even if the seed already saw the new state
+  (let [d (tree) kp (keep-for d ["dupont"])]
+    (keep/step! kp)
+    (fd/add! d "c" {:name "c.md" :parent "sub" :content "gamma"})
+    (let [r (keep/step! kp)]
+      (is (= :paged (:ok r)))
+      (is (contains? (mirrored kp "dupont") "c")))))
+
+(deftest m4-a-folder-moved-in-brings-its-subtree
+  (let [d (tree) kp (keep-for d ["dupont"])]
+    (keep/step! kp)
+    (fd/add! d "ext" {:name "External" :parent "clients" :folder? true})
+    (fd/add! d "e1" {:name "e1.md" :parent "ext" :content "e"})
+    (keep/step! kp)
+    (is (not (contains? (all-keys kp) "e1")) "not under the root yet")
+    (fd/move! d "ext" "dupont")
+    (keep/step! kp)
+    (is (contains? (mirrored kp "dupont") "e1") "arrived with its folder")))
+
+(deftest moving-out-detaches-and-trash-and-delete-are-facts
+  (let [d (tree) kp (keep-for d ["dupont"])]
+    (keep/step! kp)
+    (fd/move! d "a" "hr")
+    (fd/trash! d "b")
+    (keep/step! kp)
+    (is (= #{"sub"} (mirrored kp "dupont")))
+    (is (some? (eid kp "a")) "the entity stays; only its parent left")
+    (fd/untrash! d "b")
+    (keep/step! kp)
+    (is (contains? (mirrored kp "dupont") "b") "untrash clears the flag")
+    (fd/delete! d "b")
+    (keep/step! kp)
+    (is (true? (:file/gone (datom/pull (datom/db (:conn kp)) [:file/gone] (eid kp "b")))))))
+
+(deftest m3-a-failed-page-leaves-the-cursor-where-it-was
+  (let [d (fd/make {:page-size 1}) kp (keep-for d ["dupont"])]
+    (fd/add! d "dupont" {:name "D" :parent "root" :folder? true})
+    (keep/step! kp)
+    (let [before (keep/cursor (datom/db (:conn kp)) (:feed kp))]
+      (fd/add! d "x" {:name "x" :parent "dupont" :content "1"})
+      (fd/add! d "y" {:name "y" :parent "dupont" :content "2"})
+      ;; page 1 ok, page 2 fails
+      (swap! d assoc :fail 0)
+      (let [calls (:calls @d)
+            get0 (:get kp)
+            n (atom 0)
+            flaky (fn [url] (swap! n inc) (if (= @n 2) {:error {:status 500 :body "boom"}} (get0 url)))
+            r (keep/step! (assoc kp :get flaky))]
+        (is (contains? r :error))
+        (is (= before (keep/cursor (datom/db (:conn kp)) (:feed kp))) "cursor untouched")
+        (is (some? (:error (keep/status (datom/db (:conn kp)) (:feed kp) [(k "dupont")]))) "error recorded"))
+      (keep/step! kp)
+      (is (= #{"x" "y"} (mirrored kp "dupont")) "the retry converges"))))
+
+(deftest a-root-added-later-is-seeded-before-paging
+  (let [d (tree) roots (atom ["dupont"])
+        kp (assoc (keep-for d []) :roots (fn [_] (mapv k @roots)))]
+    (keep/step! kp)
+    (swap! roots conj "hr")
+    (is (= :seeded (:ok (keep/step! kp))))
+    (is (= #{"salaries"} (mirrored kp "hr")))))
+
+(deftest a-file-root-is-refused-by-name
+  (let [d (tree) kp (keep-for d ["a"])]
+    (is (= :root-not-a-folder (:error (keep/step! kp))))))
+
+;; ── the model: every order of edits ─────────────────────────────────────────
+;; The real system: a fake drive + a keep over root "r". The invariant after a
+;; :step is the whole contract: the mirror shows exactly what Drive shows under
+;; the root, and nothing from outside it was ever written.
+
+(def IDS ["f0" "f1" "f2" "f3" "f4" "d0" "d1"])
+(def PLACES ["r" "d0" "d1" "out"])
+
+(defn- world []
+  (let [d (fd/make {:page-size 2})]
+    (fd/add! d "r" {:name "R" :parent "root" :folder? true})
+    (fd/add! d "out" {:name "OUT" :parent "root" :folder? true})
+    {:drive d :kp (keep-for d ["r"]) :inside-ever (atom #{})}))
+
+(defn- structural-under
+  "Every id under `root` in the fake, trashed or not (deleted excluded)."
+  [d root]
+  (let [items (:items @d)]
+    (loop [frontier [root] out #{}]
+      (if (empty? frontier) out
+        (let [ks (mapcat (fn [p] (keep (fn [[id it]] (if (and (= p (:parent it)) (not (:deleted it))) id nil))
+                                       (into [] items)))
+                         frontier)]
+          (recur (into [] ks) (into out ks)))))))
+
+(defn- ids-of [s] (sort (keys (:made s))))
+
+(def keep-model
+  (vm/model "drive-keep"
+    {:state {:made {}}
+     :init world
+     :commands
+     {:add    {:args (vm/tuple (vm/one-of IDS) (vm/one-of PLACES))
+               :pre  (fn [s [id p]] (and (not (contains? (:made s) id)) (not= id p)
+                                         (or (contains? #{"r" "out"} p) (contains? (:made s) p))))
+               :next (fn [s [id p]] (assoc-in s [:made id] p))
+               :run  (fn [w [id p]] (fd/add! (:drive w) id {:name id :parent p :folder? (starts-with? id "d")
+                                                            :content (if (starts-with? id "d") nil id)}))}
+      :move   {:args (vm/tuple (vm/pick ids-of) (vm/one-of PLACES))
+               ;; no cycles: never move a folder under itself
+               :pre  (fn [s [id p]] (and (not= id p) (not (and (= id "d0") (= p "d1") (= "d0" (get (:made s) "d1"))))
+                                         (not (and (= id "d1") (= p "d0") (= "d1" (get (:made s) "d0"))))
+                                         (or (contains? #{"r" "out"} p) (contains? (:made s) p))))
+               :next (fn [s [id p]] (assoc-in s [:made id] p))
+               :run  (fn [w [id p]] (fd/move! (:drive w) id p))}
+      :edit   {:args (vm/pick (fn [s] (filter (fn [i] (starts-with? i "f")) (ids-of s))))
+               :run  (fn [w id] (fd/edit! (:drive w) id (str id (erlang/unique_integer))))}
+      :trash  {:args (vm/pick ids-of)
+               :run  (fn [w id] (fd/trash! (:drive w) id))}
+      :untrash {:args (vm/pick ids-of)
+                :run  (fn [w id] (fd/untrash! (:drive w) id))}
+      :step   {:run  (fn [w _] (keep/step! (:kp w)))}}
+     :settle :step
+     :invariants
+     {:outside-never-written
+      ;; M1: every key in the mirror was, at some point, structurally under r.
+      ;; `:inside-ever` accumulates that truth after every command (the
+      ;; structural closure — trashed folders included, since the keep keeps
+      ;; their children for untrash).
+      (fn [_ w] (let [d (:drive w)
+                      now-in (structural-under d "r")]
+                  (swap! (:inside-ever w) into now-in)
+                  (every? (fn [id] (or (= id "r") (contains? @(:inside-ever w) id)))
+                          (all-keys (:kp w)))))}
+     :eventually
+     {:mirror-equals-drive
+      ;; what Drive shows under r (the fake's live closure) = what the mirror shows
+      (fn [_ w] (= (mirrored (:kp w) "r") (fd/visible-under (:drive w) "r")))}}))
+
+(deftest the-keep-agrees-with-drive-over-every-generated-history
+  (let [r (vm/check keep-model {:seed 11 :histories 150 :max-len 18})]
+    (when (= :refuted (:modality r))
+      (println "  shrunk:" (pr-str (:shrunk r)) "broke:" (:broke r) (:kind r) (:error r)))
+    (is (= :witnessed (:modality r)))))

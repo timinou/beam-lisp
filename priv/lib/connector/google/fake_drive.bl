@@ -1,0 +1,134 @@
+; connector/google/fake_drive.bl — a Drive that lives in an atom and answers the
+; exact URLs connector.google.gdrive builds. For tests, models, and a local
+; knowledger run that must not touch Google.
+;
+; ── Fidelity (what it does the way Drive does, per the v3 reference) ────────
+;
+;   - ids are stable across rename and move; a file has ONE parent
+;   - changes.list pages at `page-size` (default 2, so every test crosses a
+;     page boundary); nextPageToken absent at the end; newStartPageToken
+;     present ONLY at the end; tokens never expire
+;   - a change is reported once per item per step window, with the item's
+;     CURRENT state (Drive coalesces); deleted/lost items report removed:true
+;   - children listing excludes trashed items (the `trashed = false` in q)
+;   - md5 for binary files; Google Docs (mime application/vnd.google-apps.*)
+;     have none, so their revision is modifiedTime
+;   - `fail-next!` injects transport errors ({:status 500}/{:status 0}) on the
+;     next n requests
+;
+; Not modelled: shared drives, multiple parents, permissions, push channels.
+
+(ns connector.google.fake-drive
+  (:require [connector.google.gdrive :as gdrive]))
+
+(def ^:private URI (erlang/binary_to_atom "Elixir.URI"))
+(def FOLDER "application/vnd.google-apps.folder")
+
+(defn make
+  "A fake drive: `{:items {id {:name :parent :mime :content :trashed}} :log
+   [id …] :t 0 :fail 0 :page-size 2 :calls 0}` in an atom. `root-id` is the My
+   Drive root (never listed as a change)."
+  ([] (make {}))
+  ([opts]
+   (atom {:items {"root" {:name "My Drive" :parent nil :mime FOLDER}}
+          :log [] :t 1000 :fail 0 :fail-status 500
+          :page-size (get opts :page-size 2) :calls 0})))
+
+(defn- touch [s id] (-> s (update :log conj id) (update :t inc)))
+
+(defn- modified [s] (str "2026-09-28T10:" (+ 10 (rem (quot (:t s) 60) 50)) ":" (+ 10 (rem (:t s) 50)) "Z"))
+
+(defn add! [fd id {:keys [name parent folder? content mime]}]
+  (swap! fd (fn [s]
+              (touch (assoc-in s [:items id]
+                               {:name name :parent parent
+                                :mime (or mime (if folder? FOLDER "text/plain"))
+                                :content content :modified (modified s)})
+                     id))))
+
+(defn move! [fd id parent] (swap! fd (fn [s] (touch (assoc-in s [:items id :parent] parent) id))))
+(defn rename! [fd id name] (swap! fd (fn [s] (touch (assoc-in s [:items id :name] name) id))))
+(defn edit! [fd id content]
+  (swap! fd (fn [s] (touch (-> s (assoc-in [:items id :content] content)
+                               (assoc-in [:items id :modified] (modified s))) id))))
+(defn trash! [fd id] (swap! fd (fn [s] (touch (assoc-in s [:items id :trashed] true) id))))
+(defn untrash! [fd id] (swap! fd (fn [s] (touch (assoc-in s [:items id :trashed] false) id))))
+(defn delete! [fd id] (swap! fd (fn [s] (touch (assoc-in s [:items id :deleted] true) id))))
+(defn fail-next! [fd n status] (swap! fd assoc :fail n :fail-status status))
+
+(defn- json-file [id it]
+  (let [g? (starts-with? (or (:mime it) "") "application/vnd.google-apps")]
+    (cond-> {"id" id "name" (:name it) "mimeType" (:mime it)
+             "modifiedTime" (:modified it) "trashed" (= true (:trashed it))
+             "parents" (if (nil? (:parent it)) [] [(:parent it)])}
+      (and (not g?) (some? (:content it)))
+        (assoc "md5Checksum" (str "md5-" (erlang/phash2 (:content it) 100000000))
+               "size" (str (count (:content it)))))))
+
+(defn- page [xs token size]
+  (let [start (if (nil? token) 0 (String/to_integer token))
+        chunk (into [] (take size (drop start xs)))
+        more (< (+ start size) (count xs))]
+    [chunk (if more (str (+ start size)) nil)]))
+
+(defn- answer [s path q]
+  (cond
+    (= path "/drive/v3/changes/startPageToken")
+      {:ok {"startPageToken" (str (count (:log s)))}}
+    (= path "/drive/v3/changes")
+      ;; the token is "<log-offset>" or "<log-offset>:<page-offset>"
+      (let [tok (get q "pageToken")
+            [from off] (let [ps (split tok #":")] [(String/to_integer (first ps)) (if (> (count ps) 1) (second ps) nil)])
+            ids (into [] (distinct (reverse (drop from (:log s)))))
+            ids (into [] (reverse ids))
+            [chunk nxt] (page ids off (:page-size s))]
+        {:ok (cond-> {"changes" (mapv (fn [id] (let [it (get-in s [:items id])]
+                                                 (if (:deleted it) {"fileId" id "removed" true}
+                                                   {"fileId" id "removed" false "file" (json-file id it)})))
+                                      chunk)}
+               (some? nxt) (assoc "nextPageToken" (str from ":" nxt))
+               (nil? nxt) (assoc "newStartPageToken" (str (count (:log s)))))})
+    (= path "/drive/v3/files")
+      (let [qq (get q "q")
+            pid (second (re-find #"'([^']+)' in parents" qq))
+            kids (into [] (sort (keep (fn [[id it]] (if (and (= pid (:parent it)) (not (:trashed it)) (not (:deleted it))) id nil))
+                                      (into [] (:items s)))))
+            [chunk nxt] (page kids (get q "pageToken") (:page-size s))]
+        {:ok (cond-> {"files" (mapv (fn [id] (json-file id (get-in s [:items id]))) chunk)}
+               (some? nxt) (assoc "nextPageToken" nxt))})
+    (starts-with? path "/drive/v3/files/")
+      (let [id (subs path (count "/drive/v3/files/"))
+            it (get-in s [:items id])]
+        (if (or (nil? it) (:deleted it)) {:error {:status 404 :body "notFound"}}
+          {:ok (json-file id it)}))
+    :else {:error {:status 400 :body (str "fake-drive: no route " path)}}))
+
+(defn get-fn
+  "The `get` a keep uses: `(fn [url] → {:ok json} | {:error …})`, answering
+   from the fake."
+  [fd]
+  (fn [url]
+    (let [s @fd]
+      (swap! fd update :calls inc)
+      (if (pos? (:fail s))
+        (do (swap! fd update :fail dec) {:error {:status (:fail-status s) :body "injected"}})
+        (let [u (erlang/apply URI :parse (list url))
+              q (if (nil? (get u :query)) {} (erlang/apply URI :decode_query (list (get u :query))))]
+          (answer s (get u :path) q))))))
+
+(defn content
+  "The bytes the fake holds for `id` — what a download returns."
+  [fd id] (get-in @fd [:items id :content]))
+
+(defn visible-under
+  "The ids the REAL drive would show under folder `root` (transitively): not
+   trashed, not deleted, and not under a trashed folder — the model's truth
+   for a keep's invariants."
+  [fd root]
+  (let [items (:items @fd)
+        kids (fn [p] (keep (fn [[id it]] (if (and (= p (:parent it)) (not (:deleted it)) (not (:trashed it))) id nil))
+                           (into [] items)))]
+    (loop [frontier [root] out #{}]
+      (if (empty? frontier) out
+        (let [ks (mapcat kids frontier)]
+          (recur (into [] ks) (into out ks)))))))
