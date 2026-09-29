@@ -13,6 +13,28 @@
 ; native range decode is deferred (FUP-022); the generic -range scan is correct
 ; and is what everything above uses today.
 
+;; ── EXCLUSIVE OWNERSHIP (one store, one OS process) ──────────────────
+;;
+;; fjall locks nothing of its own, so two OS processes opening one keyspace
+;; directory would write the same segment files: silent CORRUPTION, not a slow
+;; read. `open` therefore takes an exclusive OS lock — a `flock` on the store's
+;; real directory, taken by the native `fjall-open` — held for the lifetime of
+;; the store's native handle. The kernel releases it when that fd closes: at the
+;; resource's drop (a normal close) or at process death (a crash, a SIGKILL).
+;; There is no lock FILE and no PID to compare, so there is no stale lock to
+;; misread — a dead owner's store is simply free.
+;;
+;; Two consequences a caller can rely on:
+;;   * a store another PROCESS owns raises a TYPED error from `open`
+;;     (`{:reason :store-already-open}` in its `ex-data`) — an answer distinct
+;;     from an I/O failure (a plain message), and never a corruption report;
+;;   * a second open of the SAME store inside one process is ALLOWED and shares
+;;     the one lock, matching `datom.conn`'s semantics (its writer and basis are
+;;     keyed by the store VALUE, and two connections over one store are two
+;;     views of one database). A path alias — a symlink, a relative path, a
+;;     trailing separator — cannot evade the lock: the directory is
+;;     canonicalized before it is locked, so aliases meet on one inode.
+
 (ns datom.store-fjall
   (:require [datom.store] [datom.blob] [datom.blob-fs] [datom.value-codec]))
 
@@ -216,9 +238,41 @@
 
 (defn open
   "Open (or create) a fjall-backed store at `path`. The keyspace persists after
-   the process exits — which is the whole point: reopening recovers every datom."
+   the process exits — which is the whole point: reopening recovers every datom.
+
+   EXCLUSIVELY OWNED. A store is one OS process's at a time: `fjall-open` takes
+   an exclusive `flock` on the store's directory and holds it for as long as this
+   store's native handle lives (released when the last reference is dropped —
+   `datom.conn/release!` then collection, or `datom.conn/close!` — and by the
+   kernel if the process dies). Opening a store another PROCESS owns raises a
+   TYPED error:
+
+       (ex-info … {:reason :store-already-open, :path …, :locked-path …})
+
+   That `:reason` is the contract. It is deliberately NOT an I/O message and
+   never a corruption report — an owned store is not a damaged store, and a
+   caller can back off, retry, or tell the user, instead of treating a healthy
+   database as damaged. Reuse inside ONE process is allowed
+   and shares the one lock, matching `datom.conn`: two connections over the same
+   store are two views of one database.
+
+   Any other native failure keeps the pre-existing behaviour (the native
+   `{:error, reason}` is carried into the record, exactly as before), so this
+   change narrows nothing but the lock case."
   [path]
-  (->FjallStore (fjall-open path) path))
+  (let [handle (fjall-open path)]
+    (if (and (erlang/is_tuple handle)
+             (= :error (erlang/element 1 handle))
+             (erlang/is_tuple (erlang/element 2 handle))
+             (= :already_open (erlang/element 1 (erlang/element 2 handle))))
+      (let [locked (erlang/element 2 (erlang/element 2 handle))]
+        (throw (ex-info (str "store already open: " path
+                             " is exclusively owned by another OS process ("
+                             locked ")")
+                        {:reason :store-already-open
+                         :path path
+                         :locked-path locked})))
+      (->FjallStore handle path))))
 
 (defn available?
   "Whether the native fjall backend loaded. A persistent backend that fails to
@@ -324,8 +378,12 @@
   (-default-blobs [store] (datom.blob-fs/open (str (:path store) ".blobs"))))
 
 ;; Closing a durable store is a durability boundary, not a deletion: sync the
-;; journal, then let go. The Rustler handle (and its file lock) is freed by GC
-;; once `release!` has dropped the registry's reference — the last one.
+;; journal, then let go. The exclusive OS lock `open` took lives on the native
+;; handle's fd, so it goes with the handle: after `datom.conn/release!` has
+;; dropped the registry's last reference, collection frees the resource and
+;; closes that fd; a process that dies releases it without any of this. Nothing
+;; here has to remember to unlock, which is the point of holding it on an fd
+;; rather than in a file.
 (extend-protocol datom.store/Closeable
   FjallStore
   (-close [store] (fjall-sync (:handle store)) nil))

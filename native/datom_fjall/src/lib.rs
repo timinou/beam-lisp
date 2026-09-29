@@ -42,8 +42,11 @@
 
 use rustler::{Atom, Binary, Encoder, Env, Error, NifResult, OwnedBinary, Resource, ResourceArc, Term};
 use rustler::types::map::map_new;
+use std::collections::HashMap;
+use std::fs::{self, File, TryLockError};
 use std::io::Write;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 
@@ -89,6 +92,14 @@ mod atoms {
         journal_bytes,
         disk_bytes,
         partitions,
+        // The tag `fjall_open` refuses with when the store's directory is
+        // already held by an exclusive OS lock. It is what makes that refusal
+        // a TYPED answer — `{:error, {:already_open, path}}` — and therefore
+        // distinguishable from every `err()` reply, which is a binary
+        // describing an I/O or engine failure. "Another process owns this
+        // store" is not "this store is broken", and a caller has to be able
+        // to tell them apart.
+        already_open,
     }
 }
 
@@ -101,7 +112,125 @@ mod atoms {
 pub(crate) struct DbHandle {
     pub(crate) keyspace: Keyspace,
     pub(crate) datoms: PartitionHandle,
-    pub(crate) lock: Mutex<()>,
+    /// Serializes `-cas` and each write batch. SHARED, because two handles over
+    /// one store directory are two views of ONE engine: the lock that makes a
+    /// read-modify-write atomic belongs to the store, not to whichever handle
+    /// happened to open it.
+    pub(crate) lock: Arc<Mutex<()>>,
+    /// The exclusive ownership of this store's directory, held for exactly as
+    /// long as this handle is. Declared LAST so it drops last — the engine's
+    /// teardown (its final flush) happens while the store is still ours.
+    _claim: Arc<StoreClaim>,
+}
+
+/// The one open engine over a store directory, shared by every handle in this
+/// image that opens that directory.
+struct StoreEngine {
+    keyspace: Keyspace,
+    datoms: PartitionHandle,
+    lock: Arc<Mutex<()>>,
+}
+
+/// The process-wide claim on ONE canonical store directory.
+///
+/// WHY THIS EXISTS. fjall takes no lock of its own, so two OS processes
+/// opening one keyspace directory write the same segment files: a CORRUPTION,
+/// not a slower read. The datom layer already serialises writers WITHIN a
+/// process (`datom.conn`'s single-transactor registry), but nothing stopped a
+/// second process — a store root is a directory a user can point two `bl
+/// serve`s at, and a stale owner is indistinguishable from an absent one until
+/// the segment files are already interleaved.
+///
+/// WHAT IT IS. A directory-level `flock(2)` — the standard exclusive OS lock,
+/// taken through `std::fs::File::try_lock` — held for as long as the handle
+/// that took it. There is no lock FILE, so there is nothing to leave behind
+/// and no PID to compare: the kernel drops the lock when the fd closes, which
+/// is either the resource's drop (a normal close) or the process's death (a
+/// crash, a SIGKILL). No stale-lock heuristic exists to get wrong.
+///
+/// Because the lock is on the INODE, a symlink, a relative path or a `..`
+/// alias reaches the same lock. The path is `canonicalize`d before the claim
+/// so that the registry below agrees with the kernel about which directory is
+/// which — one identity for the map, the flock and the engine.
+///
+/// Reuse inside one PROCESS is not refused, and does not open a second engine.
+/// `datom.conn`'s own semantics let a store be opened more than once in one
+/// image (a probe handle, a reconnect), and the honest reading is that those
+/// are two VIEWS of one store — so a same-process open joins this claim and
+/// shares this engine. (A second `flock` on a fresh fd would be refused even
+/// here: the lock belongs to the open file description, not to the process, so
+/// the registry is what makes the distinction the kernel cannot make.)
+struct StoreClaim {
+    /// The fd whose `flock` IS the ownership. Dropping this claim — the LAST
+    /// `Arc` — closes it and releases the lock.
+    _lock: File,
+    engine: StoreEngine,
+}
+
+/// Canonical path → a WEAK claim. Weak, not strong, so the registry never
+/// keeps a store alive: an entry dies with its last handle, and THAT death is
+/// what releases the flock, while a dead `Weak` left behind is simply a miss
+/// on the next open.
+fn claims() -> &'static Mutex<HashMap<PathBuf, Weak<StoreClaim>>> {
+    static CLAIMS: OnceLock<Mutex<HashMap<PathBuf, Weak<StoreClaim>>>> = OnceLock::new();
+    CLAIMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Why a store could not be claimed.
+enum ClaimError {
+    /// The directory exists and someone else owns it — another process, or a
+    /// lock that outlived the handle that took it.
+    Held(PathBuf),
+    /// The path could not be created, canonicalized, or opened.
+    Io(std::io::Error),
+    /// The directory is ours, but the engine over it would not open.
+    Engine(fjall::Error),
+}
+
+/// Take (or join) the exclusive claim on `path`'s directory, opening the one
+/// engine if this is the first handle for it.
+///
+/// The claim and its engine are created under ONE lock, before any caller can
+/// see either: a same-process open of the same directory must join this claim
+/// rather than take a `flock` of its own, which the OS would refuse — the lock
+/// is on the open file description, so a second fd in the SAME process is a
+/// second owner as far as the kernel is concerned.
+///
+/// The claim is taken BEFORE the engine opens: two processes racing to create
+/// the same store must not both reach `Config::open`, or the loser has already
+/// begun writing segments it must not touch. A flock taken and then abandoned
+/// by a failed open is released when its `File` drops.
+fn claim_store(path: &Path) -> Result<Arc<StoreClaim>, ClaimError> {
+    // The directory must exist to be canonicalized and opened. fjall creates
+    // it too, later, when it is already ours.
+    fs::create_dir_all(path).map_err(ClaimError::Io)?;
+    // Collapse symlinks, relative paths and trailing separators to the one
+    // real directory, so the map keys the same way the kernel's flock does.
+    let canon = fs::canonicalize(path).map_err(ClaimError::Io)?;
+    let mut claims = claims().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(claim) = claims.get(&canon).and_then(Weak::upgrade) {
+        return Ok(claim);
+    }
+    let dir = File::open(&canon).map_err(ClaimError::Io)?;
+    match dir.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Err(ClaimError::Held(canon)),
+        Err(TryLockError::Error(e)) => return Err(ClaimError::Io(e)),
+    }
+    let keyspace = Config::new(&canon).open().map_err(ClaimError::Engine)?;
+    let datoms = keyspace
+        .open_partition("datoms", PartitionCreateOptions::default())
+        .map_err(ClaimError::Engine)?;
+    let claim = Arc::new(StoreClaim {
+        _lock: dir,
+        engine: StoreEngine {
+            keyspace,
+            datoms,
+            lock: Arc::new(Mutex::new(())),
+        },
+    });
+    claims.insert(canon, Arc::downgrade(&claim));
+    Ok(claim)
 }
 
 #[rustler::resource_impl]
@@ -123,16 +252,37 @@ fn to_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Binary<'a>> {
 /// An empty database and a missing partition are the same thing to every
 /// caller above, so the partition is created eagerly: a read against a
 /// brand-new database sees an empty partition, never a "no such partition".
+///
+/// EXCLUSIVE OWNERSHIP FIRST. The claim (`StoreClaim`) is taken before the
+/// engine is opened and is held until this handle drops, so a second OS process
+/// is refused a store that is already being written. The refusal is TYPED —
+/// `{:error, {:already_open, canonical-path}}` — and not the binary `err()` an
+/// I/O failure carries: "another process owns this store" is a different answer
+/// from "this store is broken", and the caller must be able to choose between
+/// them. A claim taken and then abandoned by a failed open is released when its
+/// `File` drops.
+///
+/// A SECOND handle for the same directory in the SAME process JOINS the claim
+/// and shares its engine and write lock, so it is a view of one store rather
+/// than a second LSM instance over the same segment files.
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_open<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
-    let keyspace = Config::new(&path).open().map_err(|e| err(e))?;
-    let datoms = keyspace
-        .open_partition("datoms", PartitionCreateOptions::default())
-        .map_err(|e| err(e))?;
+    let claim = match claim_store(Path::new(&path)) {
+        Ok(claim) => claim,
+        Err(ClaimError::Held(canon)) => {
+            return Err(Error::Term(Box::new((
+                atoms::already_open(),
+                canon.to_string_lossy().into_owned(),
+            ))))
+        }
+        Err(ClaimError::Io(e)) => return Err(err(e)),
+        Err(ClaimError::Engine(e)) => return Err(err(e)),
+    };
     let arc = ResourceArc::new(DbHandle {
-        keyspace,
-        datoms,
-        lock: Mutex::new(()),
+        keyspace: claim.engine.keyspace.clone(),
+        datoms: claim.engine.datoms.clone(),
+        lock: claim.engine.lock.clone(),
+        _claim: claim,
     });
     Ok(arc.encode(env))
 }
