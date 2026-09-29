@@ -1,0 +1,601 @@
+; proc/reconcile.bl — the deferred reconciliation clause, over proc.queue.
+;
+; ══ WHAT THIS IS ════════════════════════════════════════════════════════════
+;
+; `datom.reconcile/drain!` is the bulk executor: one pass over a projection's
+; owed and stale rows, bounded concurrency, honest about what failed. What it
+; does NOT have is WHEN to run, WHAT to do with a row that keeps failing, or a
+; durable place to keep the attempt. This clause supplies all three by wiring
+; the projection's own generated queries to `proc.queue`, which already owns
+; retry, backoff, leases, uniqueness and partitioning.
+;
+; Deliberately NOT a second framework:
+;
+;   · the WORK is `datom.reconcile`'s row primitives (`owed-row`, `stale-row`,
+;     `apply-row!`, `retire-row!`) — a job publishes a row exactly as a drain
+;     does;
+;   · the RETRY is `proc.queue`'s (`:retry {:max … :backoff … :base …}`) — this
+;     file has no attempt counter, no next-at arithmetic and no backoff loop;
+;   · the STORE is `proc.queue`'s (one public ETS table with a datom connection
+;     over it) — so `status` and `failures` are QUERIES, answerable with no
+;     process alive, exactly like `proc.queue/stats`.
+;
+; ══ THE CLAUSE ══════════════════════════════════════════════════════════════
+;
+;   (proc/defserver library-sync
+;     (reconcile
+;       {:projection lib-doc
+;        :conn-fn    (fn [server] (sync-store/conn …))
+;        :scope-fn   (fn [db conn] [[scope-eid :mount-key] …])
+;        :rules      under
+;        :apply      (fn [row prev] {:target t} | {:skip reason})
+;        :retire     (fn [row target] …)
+;        :paused-fn  (fn [db scope] …)
+;        :limit      50
+;        :level      [10 :minutes]
+;        :watch?     true}))
+;
+; ══ THE THREE TRIGGERS, AND WHY EACH IS NEEDED ══════════════════════════════
+;
+;   LEVEL (always). At init and every `:level`: re-run the projection's owed and
+;     stale queries and enqueue what they answer. This is the RECOVERY path —
+;     a crash, a missed notification, a watch that was down, a store reopened
+;     yesterday. Correctness never depends on the other two.
+;   EDGE (`:watch? true`, optional). A `datom/watch` on each scope's owed and
+;     stale queries enqueues the rows a commit ADDED. Latency only; the level
+;     pass converges without it.
+;   MANUAL. `(proc.reconcile/pump! :lib-sync)` and `(retry! :lib-sync id)` —
+;     the operator's two verbs.
+;
+; ══ LAW: A JOB RE-JUDGES BEFORE IT ACTS ═════════════════════════════════════
+;
+; A queued row is a SUGGESTION from the past. Between the enqueue and the run
+; the revision may have moved, the scope may have paused, the row may have been
+; answered, the source may have left. So `perform!` re-reads the projection's
+; CURRENT answer first and returns without acting when the row is no longer
+; owed (or no longer stale). Two consequences fall out for free, and they are
+; the two the design cared about:
+;
+;   · an OBSOLETE QUEUED REVISION cannot publish — the job for revision 1 finds
+;     that revision 2 is what is owed now, and skips;
+;   · PAUSE is honoured — a paused scope's `:active` clauses remove it from
+;     owed, so its queued jobs skip, and nothing is retired while it is paused.
+;
+; ══ LAW: EXHAUSTED IS PARKED, NOT SKIPPED ═══════════════════════════════════
+;
+; When `proc.queue`'s retry ceiling is reached it settles the job `:failed` and
+; KEEPS it. This file writes NO projection answer for that row — the row stays
+; owed, which is the truth (nothing was published), and the failure is a fact a
+; console reads (`failures`) rather than a green `:skipped` that hides it.
+;
+; The row is then PARKED: the level pass skips a row whose `(key, revision)` a
+; failed job already holds, so the timer cannot re-mint the same doomed job
+; every period. A NEWER REVISION is not parked (the revision is part of the
+; key) and becomes eligible immediately; `(retry! …)` re-enqueues by hand. The
+; three outcomes stay distinct — `unsupported`, `temporarily failed`,
+; `retries exhausted` — because they are three different states, not one
+; "skipped".
+;
+; ══ SEE ALSO ════════════════════════════════════════════════════════════════
+;
+; priv/lib/datom/reconcile.bl — the executor and the row primitives this drives
+; priv/std/proc/queue.bl      — the retry/lease/unique machinery underneath
+; priv/lib/datom/projection.bl — the generated owed/stale queries
+; docs/design/vps/the-reconciler.md — the loop this is a client of
+
+(ns proc.reconcile
+  (:require [datom :as datom]
+            [datom.projection :as pj]
+            [datom.reconcile :as rc]
+            [datom.watch :as watch]
+            [proc.queue :as q]
+            [proc.server :refer [extend-clause!]]
+            [proc.tick :as tick]))
+
+;; ── the registration: config, because a clause is compiled, not started ─────
+;;
+;; `perform` is handed a JOB and nothing else, so the body has to find its
+;; projection, its conn and its consumer fns somewhere. It cannot be the
+;; server's state (the prelude runs before the state exists) and it cannot be
+;; the payload (a job is data, and a fn is not). So it is a module atom filled
+;; by the clause's prelude — the same shape `proc.queue/perform-fns` uses, for
+;; the same reason.
+
+(def configs
+  "Server name (as a string) → the reconcile config its clause registered."
+  (atom {}))
+
+(def level-state
+  "Server name → the level pass's last run: `{:at ms}` or `{:error s :error-at ms}`.
+   Ephemeral on purpose: it is the PROCESS's own history, not a fact about the
+   work. The work's durable state is the queue's jobs and the projection's
+   records."
+  (atom {}))
+
+(def watches
+  "Server name → `{scope-eid [owed-watch stale-watch]}`."
+  (atom {}))
+
+(defn register!
+  "Called from the clause's prelude. Public because the generated form lives in
+   the CALLER's namespace and calls it there."
+  [srv cfg]
+  (swap! configs assoc (name srv) cfg)
+  cfg)
+
+(defn- config-of [srv] (get @configs (name srv)))
+
+(defn- config! [srv]
+  (let [c (config-of srv)]
+    (when (nil? c)
+      (throw (ex-info (str "proc.reconcile: no config for \"" (name srv) "\" — the"
+                           " clause registers it at start, so the server must have"
+                           " been started once in this VM")
+                      {:server srv})))
+    c))
+
+(defn- note-level! [srv m]
+  (swap! level-state assoc (name srv) m))
+
+(defn- note-error! [srv e]
+  (swap! level-state update (name srv)
+         (fn [m] (assoc (or m {}) :error (str e)
+                        :error-at (erlang/system_time :millisecond)))))
+
+;; ── reading the work: the projection's queries, filtered by PARKED and PAUSED ─
+
+(defn- paused?
+  "Whether a scope is paused. The projection's own `:active` clauses already
+   remove a paused scope from OWED; this gate is for STALE, because pausing must
+   never retire anything (the same rule `drain!`'s `:paused?` states one scope
+   at a time). Defaults to false — a consumer with no pause concept says so by
+   omitting `:paused-fn`."
+  [cfg db scope]
+  (let [f (get cfg :paused-fn)]
+    (if (nil? f) false (boolean (f db scope)))))
+
+(defn- parked-keys
+  "The `[record-key revision]` pairs a job for this server has already taken to a
+   TERMINAL failure. The level pass skips them: a row whose retries are
+   exhausted stays owed (no answer was written) but must not be re-minted every
+   level period — that hot loop is exactly what the queue's retry ceiling exists
+   to prevent, and re-arming it from outside would defeat it.
+
+   Read from the queue's store, so it survives a restart and needs no process."
+  [srv]
+  (let [d (datom/db (q/conn srv))]
+    (into #{} (keep (fn [row]
+                      (let [pl (:job/payload (datom/entity d (first row)))]
+                        (if (and (map? pl) (some? (:proj/key pl)))
+                          [(:proj/key pl) (:proj/rev pl)]
+                          nil)))
+                    (datom/q '[:find ?e :where [?e :job/state :failed]] d)))))
+
+(defn- row-ticket
+  "The identity a row is parked by: its record key (projection, scope, source)
+   and the revision it answers. The revision is part of it so a NEWER revision
+   is never blocked by an older failure."
+  [p row]
+  [(pj/record-key p (:scope-key row) (:src-key row)) (:rev row)])
+
+(defn enqueue!
+  "Put ONE row on the queue. → the job map (`:job/created` true when this call
+   made it). A row already queued or running is a NO-OP thanks to the queue's
+   `:unique` ticket on `[:proj/key :proj/rev]`, so a level pass may run as often
+   as it likes without making duplicates."
+  [srv p kind row]
+  (q/enqueue! srv
+    {:proj/kind kind
+     :proj/key (pj/record-key p (:scope-key row) (:src-key row))
+     :proj/rev (:rev row)
+     :proj/scope (:scope row)}))
+
+;; ── the watch: latency, never correctness ───────────────────────────────────
+
+(defn- watch-rows
+  "A watch fired: enqueue the rows the diff ADDED. The added set is exactly the
+   work one commit created, so a busy scope enqueues what changed and nothing
+   else.
+
+   `conn` is passed IN — the connection the watch was created against — rather
+   than resolved from the config here: the callback runs in the WATCH's own
+   process, so this body must touch only values carried by the closure and
+   namespaces the watch VM already has."
+  [srv conn p kind scope sk diff]
+  (let [db (datom/db conn)]
+    (doseq [t (into [] (:added diff))]
+      (let [row (if (= kind :owed)
+                  (rc/owed-row db p sk scope (nth t 1) (nth t 2))
+                  (rc/stale-row db p sk scope (nth t 0) (nth t 1)))]
+        (when (some? row) (enqueue! srv p kind row))))))
+
+(defn- ensure-watches!
+  "Start a watch for every scope that has none, and stop the watches of scopes
+   that went away. `:watch?` is a latency optimisation: `pump!` converges
+   without it, so a watch that fails to start is not an outage."
+  [srv cfg db pairs]
+  (when (get cfg :watch?)
+    (let [key (name srv)
+          have (get @watches key {})
+          conn ((:conn-fn cfg) srv)
+          rules (or (:rules cfg) [])
+          p (:projection cfg)
+          wanted (vec pairs)
+          fresh (reduce (fn [m pair]
+                          (let [scope (nth pair 0) sk (nth pair 1)]
+                            (if (contains? m scope)
+                              m
+                              (assoc m scope
+                                     [(watch/watch conn (pj/owed-query p) [rules scope]
+                                                   (fn [diff] (watch-rows srv conn p :owed scope sk diff)))
+                                      (watch/watch conn (pj/stale-query p) [rules scope]
+                                                   (fn [diff] (watch-rows srv conn p :stale scope sk diff)))]))))
+                        have wanted)
+          want-scopes (into #{} (map first wanted))
+          live (into {} (filter (fn [entry] (contains? want-scopes (nth entry 0))) (into [] fresh)))
+          dead (filter (fn [entry] (not (contains? want-scopes (nth entry 0)))) (into [] fresh))]
+      (doseq [entry dead]
+        (watch/unwatch (nth (nth entry 1) 0))
+        (watch/unwatch (nth (nth entry 1) 1)))
+      (swap! watches assoc key live))))
+
+(defn unwatch-all!
+  "Stop every watch this module started for `srv`. A clause cannot inject a
+   `terminate` (the injected one would shadow the server's own), so a process
+   that really stops the server calls this. Returns `:ok`."
+  [srv]
+  (let [key (name srv)]
+    (doseq [entry (into [] (get @watches key {}))]
+      (watch/unwatch (nth (nth entry 1) 0))
+      (watch/unwatch (nth (nth entry 1) 1)))
+    (swap! watches dissoc key)
+    :ok))
+
+;; ── the level pass: recovery, and the bounded first sync ────────────────────
+
+(defn- scope-rows
+  "The owed rows and stale rows the current db answers for one scope. Stale is
+   empty while the scope is paused."
+  [cfg db p rules scope sk]
+  (let [owed (keep (fn [t] (rc/owed-row db p sk scope (nth t 1) (nth t 2)))
+                   (into [] (pj/owed p db rules scope)))
+        stale (if (paused? cfg db scope)
+                []
+                (keep (fn [t] (rc/stale-row db p sk scope (nth t 0) (nth t 1)))
+                      (into [] (pj/stale p db rules scope))))]
+    {:owed (into [] owed) :stale (into [] stale)}))
+
+(defn pump!
+  "ONE level pass. For every `[scope scope-key]` the config's `:scope-fn`
+   reports, enqueue a job for each owed row and — unless the scope is paused —
+   each stale row, skipping rows parked by an exhausted failure.
+
+   `:limit` bounds the jobs ONE pass creates (the rest wait for the next), so a
+   first sync of ten thousand files progresses in visible steps rather than one
+   storm.
+
+   → {:scopes n :owed n :stale n :parked n :enqueued n :created n :at ms}"
+  [srv]
+  (let [cfg (config! srv)
+        p (:projection cfg)
+        conn ((:conn-fn cfg) srv)
+        db (datom/db conn)
+        rules (or (:rules cfg) [])
+        limit (:limit cfg)
+        parked (parked-keys srv)
+        pairs (vec ((:scope-fn cfg) db conn))
+        per (mapv (fn [pair]
+                    (scope-rows cfg db p rules (nth pair 0) (nth pair 1)))
+                  pairs)
+        owed-rows (vec (mapcat (fn [m] (:owed m)) per))
+        stale-rows (vec (mapcat (fn [m] (:stale m)) per))
+        parked? (fn [row] (contains? parked (row-ticket p row)))
+        owed-live (vec (remove parked? owed-rows))
+        stale-live (vec (remove parked? stale-rows))
+        cands (vec (concat (map (fn [r] [:stale r]) stale-live)
+                           (map (fn [r] [:owed r]) owed-live)))
+        sel (if (nil? limit) cands (vec (take limit cands)))
+        jobs (mapv (fn [c] (enqueue! srv p (nth c 0) (nth c 1))) sel)
+        at (erlang/system_time :millisecond)]
+    (note-level! srv {:at at})
+    (ensure-watches! srv cfg db pairs)
+    {:scopes (count pairs)
+     :owed (count owed-rows)
+     :stale (count stale-rows)
+     :parked (- (+ (count owed-rows) (count stale-rows))
+                (+ (count owed-live) (count stale-live)))
+     :enqueued (count sel)
+     :created (count (filter (fn [j] (= true (:job/created j))) jobs))
+     :at at}))
+
+;; ── the perform: re-judge, then publish through the executor's own primitive ─
+
+(defn- owed-match
+  "The `[src rev]` an owed job still owes, or nil when it no longer owes
+   anything: the revision moved, the scope paused, the row was answered, the
+   source left. Matched by the source's `:conn/key` — the identity the record
+   is keyed by, never an entity id that a reopened store may renumber."
+  [db p rules scope rev src-key]
+  (some (fn [t]
+          (if (and (= scope (nth t 0))
+                   (= rev (nth t 2))
+                   (= src-key (rc/source-key db (nth t 1))))
+            [(nth t 1) (nth t 2)]
+            nil))
+        (into [] (pj/owed p db rules scope))))
+
+(defn- stale-match
+  "The `[record src]` a stale job still must retire, or nil when the record is
+   no longer stale (the source came back, or the record was already retired)."
+  [db p rules scope key]
+  (some (fn [t]
+          (if (= key (:proj/key (datom/pull db [:proj/key] (nth t 0))))
+            [(nth t 0) (nth t 1)]
+            nil))
+        (into [] (pj/stale p db rules scope))))
+
+(defn perform!
+  "The queue's body — ONE job. Re-judges the row against the current db (see the
+   law above), then publishes it through `datom.reconcile`'s primitive.
+
+   A TRANSIENT failure is re-thrown, so the QUEUE retries it with backoff: this
+   file has no retry loop, and a row that fails writes no answer, so an outage
+   cannot suppress a revision."
+  [srv job]
+  (let [cfg (config! srv)
+        kind (:proj/kind job)
+        key (:proj/key job)
+        sk (nth key 1)
+        src-key (nth key 2)
+        rev (:proj/rev job)
+        scope (:proj/scope job)
+        conn ((:conn-fn cfg) srv)
+        db (datom/db conn)
+        p (:projection cfg)
+        rules (or (:rules cfg) [])]
+    (if (= kind :stale)
+      (let [m (stale-match db p rules scope key)]
+        (cond
+          (nil? m) {:state :obsolete :why :not-stale}
+          (paused? cfg db scope) {:state :obsolete :why :paused}
+          :else
+            (let [row (rc/stale-row db p sk scope (nth m 0) (nth m 1))
+                  r (rc/retire-row! conn p row (:retire cfg))]
+              (if (map? r)
+                (throw (ex-info (str "proc.reconcile: retire failed — " (:error r))
+                                {:key key :error (:error r)}))
+                r))))
+      (let [m (owed-match db p rules scope rev src-key)]
+        (if (nil? m)
+          {:state :obsolete :why :not-owed}
+          (let [row (dissoc (rc/owed-row db p sk scope (nth m 0) (nth m 1)) :prev)
+                r (rc/apply-row! conn p row (:apply cfg))]
+            (if (= :error (:state r))
+              (throw (ex-info (str "proc.reconcile: apply failed — " (:error r))
+                              {:key key :error (:error r)}))
+              r)))))))
+
+;; ── the verb: what a console shows ──────────────────────────────────────────
+
+(defn failures
+  "Every job parked at a terminal FAILURE, with the row it was for and the last
+   error — the needs-attention list. Read straight from the queue's store, so it
+   answers with no process alive."
+  [srv]
+  (let [d (datom/db (q/conn srv))]
+    (mapv (fn [row]
+            (let [e (first row)
+                  j (datom/entity d e)
+                  pl (:job/payload j)]
+              {:job/id e
+               :kind (:proj/kind pl)
+               :key (:proj/key pl)
+               :rev (:proj/rev pl)
+               :attempts (:job/attempts j)
+               :error (:job/last-error j)}))
+          (datom/q '[:find ?e :where [?e :job/state :failed]] d))))
+
+(defn- sum-field
+  "Sum one key of every per-scope entry of `by-scope`."
+  [by-scope field]
+  (reduce (fn [n entry] (+ n (get (nth entry 1) field)))
+          0 (into [] by-scope)))
+
+(defn- merge-counts
+  "Merge the per-scope `:records` count maps into one `{state n}`."
+  [by-scope]
+  (reduce (fn [m entry]
+            (reduce (fn [m2 kv]
+                      (update m2 (nth kv 0) (fn [n] (+ (or n 0) (nth kv 1)))))
+                    m
+                    (into [] (get (nth entry 1) :records))))
+          {} (into [] by-scope)))
+
+(defn status
+  "The console answer for `(projection, scopes)`, a QUERY: owed and stale counts
+   per scope, the projection's records by state, the queue's jobs by state, the
+   parked count and the level pass's last run. Nothing asks a process, so a
+   stopped server answers the same."
+  [srv]
+  (let [cfg (config! srv)
+        p (:projection cfg)
+        conn ((:conn-fn cfg) srv)
+        db (datom/db conn)
+        rules (or (:rules cfg) [])
+        pairs (vec ((:scope-fn cfg) db conn))
+        info (get @level-state (name srv) {})
+        qs (q/stats srv)
+        by-scope (into {}
+                       (map (fn [pair]
+                              (let [scope (nth pair 0) sk (nth pair 1)]
+                                [sk {:owed (count (pj/owed p db rules scope))
+                                     :stale (count (pj/stale p db rules scope))
+                                     :records (pj/counts p db scope)
+                                     :paused (paused? cfg db scope)}])))
+                       pairs)]
+    {:scopes (count pairs)
+     :owed (sum-field by-scope :owed)
+     :stale (sum-field by-scope :stale)
+     :records (merge-counts by-scope)
+     :queued (:queued qs) :running (:running qs) :done (:done qs)
+     :failed (:failed qs) :overdue (:overdue qs)
+     :parked (count (parked-keys srv))
+     :last-level-at (:at info)
+     :last-error (:error info)
+     :by-scope by-scope}))
+
+(defn retry!
+  "Retry a PARKED job by hand: re-enqueue its payload. The failed job retracted
+   its ticket when it settled, so this makes a NEW job — the queue's own
+   uniqueness rule, not a special case here. Returns the new job."
+  [srv id]
+  (let [d (datom/db (q/conn srv))
+        j (datom/entity d id)]
+    (when (nil? j)
+      (throw (ex-info (str "proc.reconcile: no job " id " in " (name srv))
+                      {:server srv :id id})))
+    (when-not (contains? #{:failed :done :cancelled} (:job/state j))
+      (throw (ex-info (str "proc.reconcile: job " id " is :" (name (:job/state j))
+                           " — only a settled job can be retried by hand")
+                      {:server srv :id id :state (:job/state j)})))
+    (q/enqueue! srv (:job/payload j))))
+
+;; ── the level timer: recovery that survives a process, not a store ──────────
+
+(def ^:private TIMER-KEY :bl-reconcile/timer)
+
+(defn- pd
+  "The process dictionary's value for `key`, or `default`. `:erlang.get/1`
+   answers the ATOM `:undefined` on a miss, and an atom is truthy here — so a
+   bare `(or (erlang/get k) d)` would hand `:undefined` on and die on the next
+   comparison."
+  [key default]
+  (let [v (erlang/get key)]
+    (if (= :undefined v) default v)))
+
+(defn- period-ms
+  [period]
+  (if (and (vector? period) (= 2 (count period)))
+    (tick/unit-ms (nth period 0) (nth period 1))
+    (throw (ex-info (str "proc.reconcile: :level takes [N UNIT] — as in"
+                         " {:level [10 :minutes]} — got " (str period))
+                    {:level period}))))
+
+(defn arm!
+  "Arm the ONE level wake, `:level` out. A stale wake is harmless (`pump!`
+   re-derives its work from the store), so this needs none of `proc.tick`'s
+   generation machinery — only its pure delay arithmetic. `:level nil` means the
+   level pass runs at init only."
+  [srv]
+  (let [cfg (config! srv)
+        level (:level cfg)
+        clock (get cfg :clock tick/wall-ms)
+        opts {:clock clock :jitter (get cfg :jitter 0)}
+        old (pd TIMER-KEY nil)]
+    (when (some? old) (erlang/cancel_timer old))
+    (when (some? level)
+      (let [ms (tick/tick-delay (period-ms level) opts (clock))]
+        (erlang/put TIMER-KEY
+                    (erlang/send_after (if (< ms 1) 1 ms) (erlang/self)
+                                       (tuple :bl-reconcile/level)))))))
+
+(defn level-tick!
+  "The timer's body: one level pass, then re-arm. A throwing pass is RECORDED
+   and the beat continues — a level pass that dies must not stop recovery."
+  [srv st]
+  (try (pump! srv) (catch e (note-error! srv e)))
+  (arm! srv)
+  st)
+
+(defn init-state
+  "The state slice the clause contributes, and the two effects a start must
+   have: one level pass NOW (a restart has to pick up work that was owed while
+   the process was down — including a deadline the timer missed) and the timer
+   armed for the next.
+
+   Runs AFTER `proc.queue/init-state`, which is what wrote the queue's
+   declaration into the store — so `enqueue!` inside `pump!` has a declaration
+   to apply."
+  [srv clock]
+  (try (pump! srv) (catch e (note-error! srv e)))
+  (arm! srv)
+  {:reconcile {:server srv :clock clock}})
+
+;; ── the clause ──────────────────────────────────────────────────────────────
+
+(def KNOWN-CLAUSE-OPTS
+  [:projection :conn-fn :scope-fn :rules :apply :retire :paused-fn :limit
+   :level :jitter :watch? :queue :clock])
+
+(def CONFIG-KEYS
+  [:projection :conn-fn :scope-fn :rules :apply :retire :paused-fn :limit
+   :level :jitter :watch? :clock])
+
+(def REQUIRED-OPTS [:projection :conn-fn :scope-fn :apply])
+
+(def DEFAULT-QUEUE-DECL
+  {:of :proj/job
+   :unique [:proj/key :proj/rev]
+   :partition [:proj/scope]
+   :retry {:max 5 :backoff :exponential :base 2000 :max-delay 300000 :jitter 0.2}})
+
+(def DEFAULT-LEVEL [10 :minutes])
+
+(defn- known? [k ks] (some (fn [x] (= x k)) ks))
+
+(defn reconcile-clause
+  "The `(reconcile {…})` transform. It EXPANDS to a `queue` clause (the retry,
+   lease, uniqueness and partitioning this needs), the `perform` registration,
+   its own level timer and three ops — one contribution, no new runtime."
+  [clause ctx]
+  (let [forms (vec (rest clause))
+        where (str "defserver " (:name ctx))]
+    (when (not= 1 (count forms))
+      (throw (ex-info (str where ": (reconcile {…}) — exactly one option map is"
+                           " required") {:clause clause})))
+    (let [opts (first forms)]
+      (when-not (map? opts)
+        (throw (ex-info (str where ": (reconcile {…}) — the options must be a"
+                             " LITERAL map, so the declaration is data")
+                        {:opts opts})))
+      (doseq [k (keys opts)]
+        (when-not (known? k KNOWN-CLAUSE-OPTS)
+          (throw (ex-info (str where ": unknown reconcile option " k " — known: "
+                               (join " " (map (fn [x] (str x)) KNOWN-CLAUSE-OPTS)))
+                          {:option k}))))
+      (doseq [k REQUIRED-OPTS]
+        (when (nil? (get opts k))
+          (throw (ex-info (str where ": (reconcile …) needs " k)
+                          {:option k :clause clause}))))
+      (let [srv (list 'quote (:name ctx))
+            clock (if (some? (get opts :clock)) (get opts :clock) 'proc.tick/wall-ms)
+            qdecl (merge DEFAULT-QUEUE-DECL (:queue opts))
+            qopts (if (some? (get opts :clock)) (assoc qdecl :clock (get opts :clock)) qdecl)
+            qc (q/queue-clause (list 'queue qopts) ctx)
+            cfg0 (select-keys opts CONFIG-KEYS)
+            cfg0 (if (contains? cfg0 :retire) cfg0 (assoc cfg0 :retire (fn [_row _target] nil)))
+            cfg (if (contains? cfg0 :level) cfg0 (assoc cfg0 :level DEFAULT-LEVEL))]
+        {:prelude (vec (concat (:prelude qc)
+                               [`(proc.reconcile/register! ~srv ~cfg)
+                                `(proc.queue/register-perform!
+                                  ~srv
+                                  (fn [job#] (proc.reconcile/perform! ~srv job#)))]))
+         ;; THE QUEUE'S INIT FIRST, in a `let` rather than left to `merge`'s
+         ;; argument order: `pump!` below enqueues, and `enqueue!` reads the
+         ;; queue's DECLARATION, which the queue's init is what writes. Ordering
+         ;; two effects by argument evaluation is a bug that only shows when the
+         ;; compiler decides differently from the interpreter (BUG-082's
+         ;; neighbourhood), so the order is written down instead.
+         :init `(let [q# (proc.queue/init-state ~srv ~qdecl ~clock)]
+                  (merge q# (proc.reconcile/init-state ~srv ~clock)))
+         :clauses (vec (concat (:clauses qc)
+                               [`(handle-info [:bl-reconcile/level] [st#]
+                                   (noreply (proc.reconcile/level-tick! ~srv st#)))
+                                `(handle-call [:reconcile-status] [_from# st#]
+                                    (reply (proc.reconcile/status ~srv) st#))
+                                `(handle-call [:reconcile-pump] [_from# st#]
+                                    (reply (proc.reconcile/pump! ~srv) st#))
+                                `(handle-call [:reconcile-retry id#] [_from# st#]
+                                    (reply (proc.reconcile/retry! ~srv id#) st#))]))}))))
+
+(extend-clause! :reconcile reconcile-clause)
