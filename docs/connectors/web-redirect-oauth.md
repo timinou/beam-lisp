@@ -145,15 +145,23 @@ at call time.
 
 ## 4 · The pending store
 
-`credential.pending/Pending` is a port: `-put`, `-take`, `-where`.
+`credential.pending/Pending` is a port: `-put`, `-take`, `-sweep!`, `-where`.
 
-- `pending/mem-pending [name]` is the reference tier — this VM's
-  `persistent_term`, no owner process (an ETS table would die with the request
-  that created it, and `begin-web` and the callback are different requests). It
-  is right for a single node.
+- `pending/mem-pending [name]` is the reference tier — this VM's ETS, held by a
+  `proc.table` owner so the table outlives the request that began the attempt
+  (the callback is a different request; a table owned by the first caller would
+  be gone by then). `:ets.take/2` makes `-take` a single atomic get-and-remove,
+  so two concurrent callbacks for one state cannot both receive it. Each `-put`
+  sweeps expired attempts, which bounds the store; `-sweep!` does it by hand.
+  It is right for a single node.
 - A multi-node/multi-tenant deployment supplies its own store. **`-take` must be
-  atomic** (two concurrent callbacks for one state must not both receive the
-  attempt); the reference store is single-VM best-effort and says so.
+  atomic** across nodes (two concurrent callbacks for one state must not both
+  receive the attempt); the reference store is atomic within one VM and says so.
+
+Sweeping is why an attempt for a state nobody ever presents is eventually
+answered `:unknown-state` rather than `:state-expired`: the row is gone before
+the callback arrives, and `:unknown-state` — the same answer a replay gets — is
+the safe side of the distinction.
 
 ## 5 · What is proved offline, and what still needs production
 
@@ -169,7 +177,14 @@ returned failure.
 - the provider accepts this redirect for this client. The redirect shape is
   config; only a live `redirect_uri_mismatch` (or its absence) settles it — the
   note at the top of `flow.bl` explains why a bogus-code probe cannot.
-- the sealed-at-rest grant store (`credential.store/store-datom` and the
-  no-key refusal) — separate work, unaffected here.
 - the app's route wiring, session resolution at the callback, and the
   `finish-web!` failure branches in the UI — app-side, deliberately not edited.
+
+The pending store's contract is proved by `test/bl/credential/pending_test.bl`:
+20 concurrent `-take`s of one state yield exactly one record, 20 concurrent
+puts of distinct states lose nothing, an attempt outlives the process that put
+it, and repeated puts cannot accumulate expired state.  The sealed-at-rest file
+store is `credential.store/store-sealed` (AES-256-GCM, key from config,
+refusals on a missing/wrong key, a tamper, or an account substitution); its
+contract and the one-time migration are §7 of `accounts-and-credentials.md`.
+The multi-tenant `store-datom` tier is still not built.

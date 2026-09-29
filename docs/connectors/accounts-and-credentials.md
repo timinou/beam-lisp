@@ -285,11 +285,12 @@ shape of `datom.blob`. So the store is a protocol, and the connector asks it:
   (-list   [s]))                     ; → [[service account-id] …]
 ```
 
-Four implementations cover the whole space:
+Four implementations cover the whole space, and a fifth adds encryption at rest:
 
 | store | for | note |
 |---|---|---|
-| `store-file` | the prototype, a personal install | `0600`, one file per account |
+| `store-file` | the prototype, a personal install | `0600`, one file per account, plaintext |
+| `store-sealed` | a deployment with a file-backed store | the same files, AES-256-GCM under a key the config supplies (§7) |
 | `store-env` | CI, a container | read-only; a grant cannot be written back |
 | `store-datom` | multi-tenant | **a refresh token in datom is plaintext unless the substrate encrypts it** — right where the store is encrypted at rest, wrong otherwise, and the port is what lets the deployment answer rather than the connector |
 | `store-command` | a real secret manager | shells out to `op`/`vault`/`aws secretsmanager` |
@@ -377,7 +378,60 @@ as a first-class disposition.
 
 ---
 
-## 7 · What the prototype builds
+## 7 · At rest: the sealed store, and moving to it
+
+`store-file` is a dev default: the bytes are `term_to_binary` and readable by
+anyone who can read the file. A deployment uses the sealed tier:
+
+```clojure
+;; the app's config supplies the key; the store never invents one
+(def grant-key
+  (store/key-decode
+    (credential.env/require! (credential.env/read-file ".env")
+                             "KNOWLEDGER_GRANT_KEY")))
+
+(conn/open gmail/spec
+  {:store (store/store-sealed "~/.local/share/knowledger/grants" grant-key)})
+```
+
+**The key.** 32 raw bytes for AES-256-GCM, from the deployment (an env var, a
+secret manager, a mounted file). `store/key-decode` accepts 64 hex characters
+or base64 (standard or url-safe, padded or not) and REFUSES anything that does
+not decode to exactly 32 bytes. `store/store-sealed` REFUSES a missing or
+wrong-length key by name — the one failure a sealed store must never have is
+`no key, so it stored in the clear`. The key is never logged, inspected, or
+written into a grant file.
+
+**What is bound.** Every grant is sealed with a fresh 12-byte GCM nonce, and
+the `(service, account-id)` pair is the AEAD's associated data, taken from the
+caller's arguments and never from the file. So a file moved to another
+account's name fails to open, a changed byte fails to open, and a wrong key
+fails to open — each is a `:credential.store/decrypt-failed` (or
+`:key-mismatch`) refusal, never a wrong grant and never garbage.
+
+**Files.** The same layout as `store-file`: one file per pair under
+`dir/<service>/`, mode 0600, written to a 0600 temp and renamed, so there is no
+window in which a readable file holds a grant. A write failure raises
+`:credential.store/write-failed`, not a bare filesystem error.
+
+**No silent migration, in either direction.** A sealed store refuses to read a
+plaintext grant (`:credential.store/plaintext-present`), and a plaintext store
+refuses to read a sealed one (`:credential.store/sealed-present`). Existing
+grants move only when a human says so, once:
+
+```clojure
+(store/migrate-to-sealed! "~/.local/share/knowledger/grants" grant-key)
+;; → the number of grants re-sealed; NOTHING calls this for you
+```
+
+Each grant is read through the plaintext store (legacy-named files included)
+and written through the sealed one, which lands on the same path and removes a
+superseded legacy twin. Run it deliberately: take a backup, run it once with
+the key you intend to keep, and KEEP that key — a lost key is a lost grant, and
+the recovery path is a fresh consent (revoke the old grant at the provider),
+not a backup.
+
+## 8 · What the prototype builds
 
 Small on purpose, and clean on purpose — the parts not built are stances, not
 omissions:
@@ -387,6 +441,7 @@ priv/lib/credential/oauth2.bl   flow-code-pkce: the loopback flow, as a state
                                 machine (start → redirect → exchange), with the
                                 verifier and the state stored together
 priv/lib/credential/store.bl    the Store protocol + store-file (0600)
+                                + store-sealed (AES-256-GCM, key from config)
 priv/lib/credential.bl          the credential value, refresh at a 5-minute skew,
                                 ONE refresh in flight per credential, authorize!
                                 idempotent (§6 law 2)
