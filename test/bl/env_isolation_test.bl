@@ -1,0 +1,312 @@
+; env_isolation_test.bl — PLAN-046 L1/L2: process-scoped envs, read-through
+; chains, spawn propagation. Ported from test/beam_lisp/env_isolation_test.exs.
+;
+; These tests exercise the isolation machinery ITSELF. The ExUnit original ran
+; `async: false` at the `:global` env and forked explicitly — an ExUnit test
+; process carries NO env binding, so its `Env.intern` landed at `:global` and
+; its chain root was the real `:global`. A ward file instead runs bound to its
+; own isolated fork (`BeamLisp.TestRT/run_file_isolated`/ward's `env/isolated
+; base`), whose chain root is that fork. So every body here is wedged in
+; `at-global` — `BeamLisp.Env/with_env :global` — for the "global" the
+; assertions NAME to be the one the ExUnit suite named.
+;
+; This matters for the chain walk (`explain/2`): its `:global` row must be
+; `found: true`, which is only true when the var was interned at `:global`.
+;
+; Run: bin/bl test test/bl/env_isolation_test.bl
+;
+; ── MAP: env_isolation_test.exs → here (13 tests, 36 assertions) ──────────
+;   a fork reads through to its parent and writes stay local
+;     → a-fork-reads-through-to-its-parent-and-writes-stay-local
+;   in_ns declares the namespace: enumeration sees its vars (BUG-089)
+;     → in-ns-declares-the-namespace-so-enumeration-sees-its-vars
+;   two concurrent forks of one base isolate the same var
+;     → two-concurrent-forks-of-one-base-isolate-the-same-var
+;   a forked fork chains two deep
+;     → a-forked-fork-chains-two-deep
+;   isolated/1 destroys its env afterwards
+;     → isolated-1-destroys-its-env-afterwards
+;   destroy sweeps every key shape of the env
+;     → destroy-sweeps-every-key-shape-of-the-env
+;   current_ns is process-local inside a fork
+;     → current-ns-is-process-local-inside-a-fork
+;   mark_loaded is per-env and chain-visible
+;     → mark-loaded-is-per-env-and-chain-visible
+;   put_meta in a fork merges onto the ancestor's copy, locally
+;     → put-meta-in-a-fork-merges-onto-the-ancestors-copy-locally
+;   L2: a future inherits the spawning env
+;     → l2-a-future-inherits-the-spawning-env
+;   L2: capture/bind carries the env across a bare spawn
+;     → l2-capture-bind-carries-the-env-across-a-bare-spawn
+;   a bare spawn WITHOUT bind lands in :global (documents the contract)
+;     → a-bare-spawn-without-bind-lands-in-global-documents-the-contract
+;   explain/2 walks the chain
+;     → explain-2-walks-the-chain
+
+(ns env-isolation.test)
+
+(defn- at-global
+  "Run `f` bound at the `:global` env — the binding an ExUnit test process
+   implicitly had. The fork the runner gave this file is restored after."
+  [f]
+  (BeamLisp.Env/with_env :global (fn [] (f))))
+
+; ── L1: forks, shadowing, declaration, destruction ─────────────────────────
+
+(deftest a-fork-reads-through-to-its-parent-and-writes-stay-local
+  (at-global
+    (fn []
+      (BeamLisp.Env/intern "iso.t" "base-var" :from_global)
+      (let [base (BeamLisp.Env/fork)]
+        (BeamLisp.Env/with_env base
+          (fn []
+            (is (= (tuple :ok :from_global)
+                   (BeamLisp.Env/fetch "iso.t" "base-var"))
+                "a fork reads through to its parent")
+            (BeamLisp.Env/intern "iso.t" "base-var" :shadowed)
+            (BeamLisp.Env/intern "iso.t" "own-var" :mine)
+            (is (= (tuple :ok :shadowed)
+                   (BeamLisp.Env/fetch "iso.t" "base-var"))
+                "the fork's write shadows the parent's copy")
+            (is (= (tuple :ok :mine)
+                   (BeamLisp.Env/fetch "iso.t" "own-var"))
+                "and a var the fork alone owns resolves there")))
+        (is (= (tuple :ok :from_global)
+               (BeamLisp.Env/fetch "iso.t" "base-var"))
+            "the parent's row is untouched")
+        (is (= :error (BeamLisp.Env/fetch "iso.t" "own-var"))
+            "…and the fork's own var never reached the parent")
+        (BeamLisp.Env/destroy base)))))
+
+(deftest in-ns-declares-the-namespace-so-enumeration-sees-its-vars
+  ; The REPL route: enter a ns and def — no (ns …) form ever runs.
+  ; `namespaces/0` enumerates only marker rows, so before `in_ns` declared,
+  ; the ns's vars were invisible to every corpus enumeration (BUG-089).
+  (at-global
+    (fn []
+      (let [e (BeamLisp.Env/fork)]
+        (BeamLisp.Env/with_env e
+          (fn []
+            (BeamLisp.Env/in_ns "replish.user")
+            (BeamLisp.Env/intern "replish.user" "widget" 1)
+            (is (Enum/member? (BeamLisp.Env/namespaces) "replish.user")
+                "the namespace enumerates after in_ns")
+            (is (Enum/member? (BeamLisp.Env/public_names "replish.user") "widget")
+                "…and its var is a public name of it")))
+        (is (not (Enum/member? (BeamLisp.Env/namespaces) "replish.user"))
+            "the marker stayed in the fork — :global was not polluted")
+        (BeamLisp.Env/destroy e)))))
+
+(deftest two-concurrent-forks-of-one-base-isolate-the-same-var
+  (at-global
+    (fn []
+      (let [a (BeamLisp.Env/fork)
+            b (BeamLisp.Env/fork)
+            parent (erlang/self)
+            ta (Task/async
+                 (fn []
+                   (BeamLisp.Env/with_env a
+                     (fn []
+                       (BeamLisp.Env/intern "iso.c" "v" :a)
+                       (Process/sleep 30)
+                       (erlang/send parent [:a (BeamLisp.Env/fetch "iso.c" "v")])))))
+            tb (Task/async
+                 (fn []
+                   (BeamLisp.Env/with_env b
+                     (fn []
+                       (BeamLisp.Env/intern "iso.c" "v" :b)
+                       (Process/sleep 30)
+                       (erlang/send parent [:b (BeamLisp.Env/fetch "iso.c" "v")])))))]
+        (Task/await ta 5000)
+        (Task/await tb 5000)
+        (is (= (tuple :ok :a) (receive [:a v] v (after 2000 :timeout)))
+            "fork a saw its own value")
+        (is (= (tuple :ok :b) (receive [:b v] v (after 2000 :timeout)))
+            "fork b saw its own value")
+        (is (= :error (BeamLisp.Env/fetch "iso.c" "v"))
+            "neither fork's write reached the base")
+        (BeamLisp.Env/destroy a)
+        (BeamLisp.Env/destroy b)))))
+
+(deftest a-forked-fork-chains-two-deep
+  (at-global
+    (fn []
+      (BeamLisp.Env/intern "iso.d" "deep" :global_value)
+      (let [mid (BeamLisp.Env/fork)]
+        (BeamLisp.Env/with_env mid
+          (fn [] (BeamLisp.Env/intern "iso.d" "mid-only" 1)))
+        (let [leaf (BeamLisp.Env/fork mid)]
+          (BeamLisp.Env/with_env leaf
+            (fn []
+              (is (= (tuple :ok 1)
+                     (BeamLisp.Env/fetch "iso.d" "mid-only"))
+                  "the leaf reads its parent")
+              (is (= (tuple :ok :global_value)
+                     (BeamLisp.Env/fetch "iso.d" "deep"))
+                  "…and through it, the grandparent")))
+          (BeamLisp.Env/destroy leaf)
+          (BeamLisp.Env/destroy mid))))))
+
+(deftest isolated-1-destroys-its-env-afterwards
+  (at-global
+    (fn []
+      (is (= :done
+             (BeamLisp.Env/isolated
+               (fn [] (do (BeamLisp.Env/intern "iso.gone" "z" 1) :done)))))
+      (is (= :error (BeamLisp.Env/fetch "iso.gone" "z"))
+          "the isolated env was destroyed on the way out"))))
+
+(deftest destroy-sweeps-every-key-shape-of-the-env
+  (at-global
+    (fn []
+      (let [env (BeamLisp.Env/fork)]
+        (BeamLisp.Env/with_env env
+          (fn []
+            (BeamLisp.Env/intern "iso.sweep" "v" 1)
+            (BeamLisp.Env/declare_ns "iso.sweep2")
+            (BeamLisp.Env/add_alias "iso.sweep" "a" "core")
+            (BeamLisp.Env/add_refer "iso.sweep" "map" "core")
+            (BeamLisp.Env/put_meta "iso.sweep" "v" (maps/put :doc "x" (maps/new)))
+            (BeamLisp.Env/put_link "iso.sweep" "v"
+              (tuple :"Elixir.Some.Mod" (maps/put 1 :f (maps/new)) nil))
+            (BeamLisp.Env/put_ns_defs "iso.sweep" (maps/put "v" (list) (maps/new)))))
+        (BeamLisp.Env/destroy env)
+        ; A fresh fork of the base must see NONE of it (a live env would still
+        ; hold the rows; a destroyed one must not).
+        (BeamLisp.Env/isolated
+          (fn []
+            (is (= :error (BeamLisp.Env/fetch "iso.sweep" "v")))
+            (is (not (BeamLisp.Env/ns_exists? "iso.sweep2")))
+            (is (= nil (BeamLisp.Env/alias_target "iso.sweep" "a")))
+            (is (= nil (BeamLisp.Env/refer_source "iso.sweep" "map")))
+            (is (= :error (BeamLisp.Env/meta "iso.sweep" "v")))
+            (is (= :error (BeamLisp.Env/link "iso.sweep" "v")))
+            (is (= (maps/new) (BeamLisp.Env/ns_defs "iso.sweep")))))))))
+
+(deftest current-ns-is-process-local-inside-a-fork
+  (at-global
+    (fn []
+      (let [env (BeamLisp.Env/fork)
+            parent (erlang/self)]
+        (BeamLisp.Env/with_env env
+          (fn []
+            (is (= "user" (BeamLisp.Env/current_ns))
+                "a fresh fork's current ns is `user`")
+            (BeamLisp.Env/in_ns "iso.ns")
+            (Task/await
+              (Task/async
+                (fn []
+                  (BeamLisp.Env/with_env env
+                    (fn []
+                      (erlang/send
+                        parent
+                        [:child_ns (BeamLisp.Env/current_ns)])))))
+              5000)
+            (is (= "user" (receive [:child_ns v] v (after 2000 :timeout)))
+                "a child process starts at `user`, not the parent's ns")
+            (is (= "iso.ns" (BeamLisp.Env/current_ns))
+                "…and the parent's ns is unchanged")))
+        (BeamLisp.Env/destroy env)))))
+
+(deftest mark-loaded-is-per-env-and-chain-visible
+  (at-global
+    (fn []
+      (let [env (BeamLisp.Env/fork)]
+        (BeamLisp.Env/with_env env
+          (fn []
+            (is (not (BeamLisp.Env/loaded_ns? "iso.loaded")))
+            (BeamLisp.Env/mark_loaded "iso.loaded")
+            (is (BeamLisp.Env/loaded_ns? "iso.loaded"))))
+        (is (not (BeamLisp.Env/loaded_ns? "iso.loaded"))
+            "the mark did not reach the base")
+        ; Chain: a fork OF env sees env's marks.
+        (let [child (BeamLisp.Env/fork env)]
+          (BeamLisp.Env/with_env child
+            (fn [] (is (BeamLisp.Env/loaded_ns? "iso.loaded"))))
+          (BeamLisp.Env/destroy child))
+        (BeamLisp.Env/destroy env)))))
+
+(deftest put-meta-in-a-fork-merges-onto-the-ancestors-copy-locally
+  (at-global
+    (fn []
+      (BeamLisp.Env/put_meta "iso.m" "v"
+        (maps/put :doc "base doc" (maps/put :private true (maps/new))))
+      (let [env (BeamLisp.Env/fork)]
+        (BeamLisp.Env/with_env env
+          (fn []
+            (BeamLisp.Env/put_meta "iso.m" "v" (maps/put :doc "fork doc" (maps/new)))
+            (is (= (tuple :ok (maps/put :doc "fork doc"
+                               (maps/put :private true (maps/new))))
+                   (BeamLisp.Env/meta "iso.m" "v"))
+                "the fork's write merges onto the ancestor's copy")))
+        (is (= (tuple :ok (maps/put :doc "base doc"
+                           (maps/put :private true (maps/new))))
+               (BeamLisp.Env/meta "iso.m" "v"))
+            "…and the base keeps its own")
+        (BeamLisp.Env/destroy env)))))
+
+; ── L2: env conveyance across a process spawn ──────────────────────────────
+
+(deftest l2-a-future-inherits-the-spawning-env
+  (at-global
+    (fn []
+      (let [env (BeamLisp.Env/fork)
+            result (BeamLisp.Env/with_env env
+                     (fn []
+                       (BeamLisp.Env/intern "iso.fut" "answer" 42)
+                       (let [f (BeamLisp.Refs/future_exec
+                                 (fn []
+                                   (BeamLisp.Env/fetch "iso.fut" "answer")))]
+                         (Task/await (erlang/map_get :task f) 5000))))]
+        (is (= (tuple :ok 42) result)
+            "a future inherits the spawning env")
+        (BeamLisp.Env/destroy env)))))
+
+(deftest l2-capture-bind-carries-the-env-across-a-bare-spawn
+  (at-global
+    (fn []
+      (let [env (BeamLisp.Env/fork)
+            parent (erlang/self)]
+        (BeamLisp.Env/with_env env
+          (fn []
+            (BeamLisp.Env/intern "iso.cap" "v" :carried)
+            (let [token (BeamLisp.Env/capture)]
+              (erlang/spawn
+                (fn []
+                  (BeamLisp.Env/bind token)
+                  (erlang/send
+                    parent
+                    [:spawned (BeamLisp.Env/fetch "iso.cap" "v")]))))))
+        (is (= (tuple :ok :carried)
+               (receive [:spawned v] v (after 2000 :timeout)))
+            "the token carried the env across the spawn")
+        (BeamLisp.Env/destroy env)))))
+
+(deftest a-bare-spawn-without-bind-lands-in-global-documents-the-contract
+  (at-global
+    (fn []
+      (let [env (BeamLisp.Env/fork)
+            parent (erlang/self)]
+        (BeamLisp.Env/with_env env
+          (fn []
+            (BeamLisp.Env/intern "iso.nobind" "v" 1)
+            (erlang/spawn
+              (fn []
+                (erlang/send
+                  parent
+                  [:bare (BeamLisp.Env/fetch "iso.nobind" "v")])))))
+        (is (= :error (receive [:bare v] v (after 2000 :timeout)))
+            "without bind, a bare spawn resolves at :global")
+        (BeamLisp.Env/destroy env)))))
+
+(deftest explain-2-walks-the-chain
+  (at-global
+    (fn []
+      (BeamLisp.Env/intern "iso.ex" "v" 1)
+      (let [env (BeamLisp.Env/fork)
+            rows (BeamLisp.Env/with_env env (fn [] (BeamLisp.Env/explain "iso.ex" "v")))]
+        (is (= false (:found (Enum/find rows (fn [r] (= env (:env r))))))
+            "the fork's own row says the var is not there")
+        (is (= true (:found (Enum/find rows (fn [r] (= :global (:env r))))))
+            "the chain's :global row says it is")
+        (BeamLisp.Env/destroy env)))))

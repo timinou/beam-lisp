@@ -1,0 +1,142 @@
+; test/bl/datom/store_lock_test.bl — a durable store has ONE owning OS process.
+; Run: bl test test/bl/datom/store_lock_test.bl
+;
+; ── The defect this pins ──────────────────────────────────────────────
+;
+; fjall takes no lock of its own. The datom layer serialises writers WITHIN a
+; process (`datom.conn`'s single-transactor registry), but nothing stopped a
+; SECOND OS PROCESS from opening the same keyspace directory — and two LSM
+; instances on one set of segment files interleave writes. That is corruption,
+; not a slow read, and it is reachable by pointing two `bl serve`s at one data
+; dir or by a stale owner nobody noticed was alive.
+;
+; The fix is OS ownership, not a convention: `fjall-open` takes an exclusive
+; `flock` on the store's real directory and holds it on the native handle for
+; as long as the handle lives. The kernel releases it when that fd closes —
+; the resource's drop (a normal close) or process death (a crash, a SIGKILL).
+; So there is no lock FILE, nothing to leave behind, and no PID to compare.
+;
+; What a caller can rely on, asserted here:
+;   * a second open of the SAME store inside one process SUCCEEDS and is a view
+;     of the same database (matching `datom.conn`, which keys its writer by the
+;     store value), NOT a second claim;
+;   * unrelated directories are independent;
+;   * a second OS PROCESS is REFUSED — with a TYPED reason
+;     (`{:reason :store-already-open}`), never a corruption report;
+;   * a path ALIAS (a symlink) cannot evade the lock;
+;   * a store whose owning process DIED is free again, with no cleanup.
+;
+; The `fjall` backend is optional everywhere else in this suite, so an absent
+; NIF reads as SKIP (the `migrate_durable_test` rule), not as a failure.
+
+(ns datom.store-lock.test
+  (:require [datom.store] [datom.store-fjall :as fj]))
+
+;; ── in-process: one directory, one claim, many views ────────────────
+
+(deftest a-second-open-in-one-process-shares-the-one-claim
+  (if (fj/available?)
+    (let [p (datom.store/fresh-path ".fjall")
+          a (fj/open p)
+          b (fj/open p)                       ; the SAME directory, same image
+          k (erlang/list_to_binary (to-list [107]))]
+      (is (some? (:handle a)) "the first handle is a real native handle")
+      (is (some? (:handle b)) "a same-process reopen is allowed, not refused")
+      ; ... and they are two views of ONE store, not two stores: the write
+      ; through `a` is what `b` reads.
+      (datom.store/-put a k "shared")
+      (is (= "shared" (datom.store/-get b k)))
+      (datom.store/close a)
+      (datom.store/close b))
+    (is true "fjall backend absent — skipped")))
+
+(deftest unrelated-directories-do-not-block-each-other
+  (if (fj/available?)
+    (let [a (fj/open (datom.store/fresh-path ".fjall"))
+          b (fj/open (datom.store/fresh-path ".fjall"))]
+      (is (some? (:handle a)))
+      (is (some? (:handle b)))
+      (datom.store/close a)
+      (datom.store/close b))
+    (is true "fjall backend absent — skipped")))
+
+;; ── a real second OS process ────────────────────────────────────────
+
+(defn- bl-executable
+  "The launcher this test is running UNDER. THE SAME build, never `bl` from
+   PATH: a different image would load a different `datom_fjall.so` and the
+   gate would be testing somebody else's binary."
+  []
+  (let [root (System/get_env "BL_ROOT")]
+    (if (nil? root) nil (str root "/bin/bl"))))
+
+(defn- child-source
+  "The second OS process's program. Its paths are BAKED IN rather than passed
+   as argv: a fixture that has to be quoted through a shell is a second place
+   for the paths to go wrong, and this one runs once and is read from disk by
+   `bl run`.
+
+   It probes, in order: the parent-held store at its canonical path, the same
+   store through a symlink alias, then opens a third store and lets the process
+   END — so the parent can prove that a dead owner frees what it held."
+  [held alias freed]
+  (str
+    "(ns lock-child (:require [datom.store-fjall :as fj]))\n"
+    "(defn probe [label p]\n"
+    "  (try (do (fj/open p) (println (str \"OPENED \" label)))\n"
+    "       (catch e (println (str \"REFUSED \" label \" \" (pr-str (ex-data e)))))))\n"
+    "(probe \"canonical\" " (pr-str held) ")\n"
+    "(probe \"alias\" " (pr-str alias) ")\n"
+    "(def held-alive (fj/open " (pr-str freed) "))\n"
+    "(println \"OPENED freed\")\n"
+    "(println \"CHILD-DONE\")\n"))
+
+(deftest a-second-os-process-is-refused-and-a-dead-owner-frees-the-store
+  (if (fj/available?)
+    (let [exe (bl-executable)]
+      (if (nil? exe)
+        (do (println "store-lock: BL_ROOT unset — need a launcher for the second process; SKIPPED")
+            (is true "no launcher — skipped"))
+        (let [root (System/get_env "BL_ROOT")
+              held (datom.store/fresh-path ".fjall")
+              alias (str held "-alias")
+              freed (datom.store/fresh-path ".fjall")
+              script (str (datom.store/fresh-path ".child") ".bl")
+              ; THE PARENT OWNS `held` for the whole of this test. `owner` is
+              ; referenced at the end, so it is live across the child's run —
+              ; a GC'd owner would release the lock and make this probe lie.
+              owner (fj/open held)]
+          (is (some? (:handle owner)) "the parent owns the store")
+          (erlang/apply :file :make_symlink (to-list [held alias]))
+          (File/write! script (child-source held alias freed))
+          (let [r (System/cmd exe (to-list ["run" script])
+                              (to-list [(tuple :cd root)
+                                        (tuple :stderr_to_stdout true)]))
+                out (str (erlang/element 1 r))
+                code (erlang/element 2 r)]
+            (println (str "store-lock: child exit " code))
+            (println (str "store-lock: child output >>>\n" out "<<<"))
+            (erlang/apply :file :delete (to-list [script]))
+            (erlang/apply :file :delete (to-list [alias]))
+            ; The child is a REAL second OS process and it was refused — both at
+            ; the canonical path and through a symlink alias to it.
+            (is (includes? out "REFUSED canonical")
+                (str "a second OS process must be refused; child said: " out))
+            (is (includes? out "REFUSED alias")
+                (str "a symlink alias must reach the same lock; child said: " out))
+            ; ... with the TYPED answer, not a data-corruption report.
+            (is (includes? out ":store-already-open")
+                (str "the refusal must be typed; child said: " out))
+            (is (not (includes? out "corrupt"))
+                "an owned store is not a damaged store")
+            ; ... and the third store, whose owner process has since ENDED, is
+            ; free again — no cleanup, no stale lock to clear.
+            (is (includes? out "OPENED freed")
+                (str "the child should have owned the third store; child said: " out))
+            (is (includes? out "CHILD-DONE") "the child ran to completion")
+            (let [after (fj/open freed)]
+              (is (some? (:handle after))
+                  "a store whose owner process died is free again")
+              (datom.store/close after))
+            (datom.store/close owner)))))
+    (is true "fjall backend absent — skipped")))

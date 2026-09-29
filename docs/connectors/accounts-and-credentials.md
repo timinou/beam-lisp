@@ -402,6 +402,8 @@ priv/lib/credential.bl          the credential value, refresh at a 5-minute skew
                         ; writes the grant, and does NOT mint a second one next time
 ```
 
-Not built, and deliberately: the web redirect stance, the device flow, and
-`store-datom` under `auth` RLS. Two of those are one flow each — the third needs the
-policy question answered first, which is `FUP-117`'s job.
+The web redirect halves ARE built, in `credential.flow` (`begin-web` /
+`finish-web!`) with a one-time expiring `state` in a `credential.pending` store;
+their contract and app cutover are `web-redirect-oauth.md`. Still not built, and
+deliberately: the device flow, and `store-datom` under `auth` RLS — the latter
+needs the policy question answered first, which is `FUP-117`'s job.

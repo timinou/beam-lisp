@@ -1,0 +1,436 @@
+; test/bl/proc/reconcile_test.bl — the reconciliation clause over proc.queue.
+; Run: bin/bl -p priv/std test --shared test/bl/proc/reconcile_test.bl
+;
+; `--shared` for the same reason `queue_test` needs it: the isolated runner
+; expands a file's `defserver` forms before its top-level calls run, so a clause
+; registered by a namespace the image has not loaded yet (BUG-082) is unknown at
+; expansion. `-p priv/std` puts the std tier on the load path.
+;
+; ONE source of truth is under test: a row's WORK and its PUBLICATION come from
+; `datom.reconcile` (`owed-row`/`stale-row`/`apply-row!`/`retire-row!`), and the
+; retry/lease/unique machinery comes from `proc.queue`. So these tests are about
+; the three things the clause ADDS:
+;
+;   · a job RE-JUDGES the row against the current db before it acts — an
+;     obsolete queued revision cannot publish, and a pause is honoured;
+;   · EXHAUSTED retries PARK the row (visible in `failures`) instead of writing
+;     a green `:skipped`, and the level pass does not re-mint a parked job;
+;   · the LEVEL pass is RECOVERY — it converges from the store at init and on a
+;     timer, which is what makes a watch optional.
+
+(ns proc.reconcile-test
+  (:require [proc :as proc]
+            [proc.reconcile :as rec]
+            [proc.queue :as queue]
+            [datom :as datom]
+            [datom.projection :as pj]
+            [datom.reconcile :as rc]))
+
+;; ── the shape: a mount, files under it, a projection over both ──────────────
+
+(def SCHEMA
+  (into [{:db/ident :conn/key   :db/valueType :db.type/term :db/unique :db.unique/identity}
+         {:db/ident :file/rev    :db/valueType :db.type/long}
+         {:db/ident :file/name   :db/valueType :db.type/string}
+         {:db/ident :file/parent :db/valueType :db.type/ref}
+         {:db/ident :mount/id    :db/valueType :db.type/string :db/unique :db.unique/identity}
+         {:db/ident :mount/root  :db/valueType :db.type/ref}
+         {:db/ident :mount/state :db/valueType :db.type/keyword}]
+        pj/schema))
+
+(def DOC
+  (pj/projection :test/clause-doc
+    {:active   '[[?scope :mount/state :active]]
+     :member   '[[?scope :mount/root ?r] [?src :file/parent ?r]]
+     :revision '[[?src :file/rev ?rev]]}))
+
+;; ── the world: a fresh store per test, one module atom the clause reads ─────
+
+(def world (atom nil))
+
+(defn- scopes-of
+  "The clause's `:scope-fn`: `[scope-eid scope-key]` pairs from the CURRENT db —
+   the eid is read from the db, not remembered, so a reopened store renumbers
+   it and the next level pass uses the new one."
+  [db _conn]
+  (let [m (first (first (into [] (datom/q '[:find ?m :in $ :where [?m :mount/id "m1"]] db))))]
+    (if (nil? m) [] [[m :m1]])))
+
+(defn- paused-scope?
+  "The clause's `:paused-fn`: the scope's mirror state, exactly the app's
+   `(= state :active)` test."
+  [db scope]
+  (not= :active (:mount/state (datom/entity db scope))))
+
+(defn- halt!
+  "Stop a queue if the previous test leaked one, so a store can be cleared
+   without a claimer racing the clear."
+  [nm]
+  (let [p (Process/whereis (queue/op-name nm))]
+    (when (some? p) (stop p) (Process/sleep 30))))
+
+(defn- clear-queue! [nm]
+  (let [c (queue/conn nm)
+        es (map first (datom/q '[:find ?e :where [?e :job/state _]] (datom/db c)))]
+    (when-not (empty? (vec es))
+      (datom/transact! c (vec (map (fn [e] [:db/retractEntity e]) (vec es)))))))
+
+(defn- reset-servers! []
+  (doseq [nm [:lib-sync :lib-watch]]
+    (halt! nm)
+    (rec/unwatch-all! nm)
+    (clear-queue! nm)))
+
+(defn- world!
+  "A fresh in-memory store with one ACTIVE mount whose root is an empty folder."
+  []
+  (reset-servers!)
+  (let [c (datom/connect SCHEMA)]
+    (datom/transact! c [{:db/id -2 :file/name "root" :file/rev 0}
+                        {:db/id -1 :mount/id "m1" :mount/state :active :mount/root -2}])
+    (datom/transact! c [{:db/id -1 :file/name "out" :file/rev 0}])
+    (let [m (first (first (into [] (datom/q '[:find ?m :in $ :where [?m :mount/id "m1"]] (datom/db c)))))
+          root (first (first (into [] (datom/q '[:find ?r :in $ :where [?m :mount/id "m1"]
+                                                                        [?m :mount/root ?r]] (datom/db c)))))
+          out (first (first (into [] (datom/q '[:find ?e :in $ :where [?e :file/name "out"]] (datom/db c)))))]
+      (reset! world {:conn c :scope m :root root :out out
+                     :docs {} :lib (atom {:sources {} :applies 0})
+                     :ctl (atom {:calls 0 :fail-left 0})})
+      @world)))
+
+(defn- doc-eid [id]
+  (first (first (into [] (datom/q '[:find ?e :in $ ?k :where [?e :conn/key ?k]]
+                                  (datom/db (:conn @world)) [:mem "ns" id])))))
+
+(defn- add-doc!
+  "A live member of the scope: revision 1."
+  [id content]
+  (let [w @world]
+    (swap! world assoc-in [:docs id] {:content content :kind :text})
+    (datom/transact! (:conn w) [{:db/id -1 :conn/key [:mem "ns" id]
+                                 :file/rev 1 :file/name (str id ".md")
+                                 :file/parent (:root w)}])
+    (doc-eid id)))
+
+(defn- edit-doc!
+  "Move a member to a NEW revision, the way an upstream edit does."
+  [id content]
+  (let [w @world]
+    (swap! world assoc-in [:docs id] {:content content :kind :text})
+    (datom/transact! (:conn w) [[:db/add (doc-eid id) :file/rev 2]])))
+
+(defn- move-out! [id]
+  (datom/transact! (:conn @world) [[:db/add (doc-eid id) :file/parent (:out @world)]]))
+
+(defn- pause! []
+  (datom/transact! (:conn @world) [[:db/add (:scope @world) :mount/state :paused]]))
+
+(defn- fail-next!
+  "Make the consumer's `:apply` throw for the next `n` calls."
+  [n]
+  (swap! (:ctl @world) assoc :fail-left n))
+
+(defn- src-id [src-key] (nth src-key 2))
+
+(defn- apply-fn
+  "A modelled ingest: content-addressed sources with origins, an unsupported
+   revision skipped by name, and a controllable transient failure."
+  [row prev]
+  (let [w @world
+        ctl (:ctl w)
+        id (src-id (:src-key row))
+        doc (get (:docs w) id)]
+    (swap! ctl update :calls inc)
+    (when (> (get @ctl :fail-left 0) 0)
+      (swap! ctl update :fail-left dec)
+      (throw "network down"))
+    (if (= :unsupported (:kind doc))
+      {:skip :unsupported-type}
+      (let [h (:content doc)]
+        (swap! (:lib w) (fn [l]
+                          (-> l
+                              (update-in [:sources h :origins] (fnil conj #{}) (:src-key row))
+                              (update :applies inc))))
+        (when (and (some? prev) (not= prev h))
+          (swap! (:lib w) update-in [:sources prev :origins] disj (:src-key row)))
+        {:target h}))))
+
+(defn- retire-fn
+  "Drop this origin from EVERY source that holds it — the retired record may
+   name a target the crashed apply never recorded."
+  [row _target]
+  (let [w @world]
+    (swap! (:lib w) update :sources
+           (fn [ss] (into {} (map (fn [e] [(nth e 0) (update (nth e 1) :origins disj (:src-key row))])
+                                  (vec ss)))))))
+
+(defn- live-contents []
+  (into #{} (keep (fn [e] (if (empty? (:origins (nth e 1))) nil (nth e 0)))
+                  (vec (:sources @(:lib @world))))))
+
+(defn- calls [] (:calls @(:ctl @world)))
+
+;; ── the two servers: one level-driven, one watch-only ──────────────────────
+;;
+; A short `:level` and a fast retry lattice, so a test measures behaviour
+; instead of waiting on a production cadence. The production defaults are the
+; clause's own (`[10 :minutes]`, `:base 2000 :max 5`). The declaration is
+; LITERAL DATA (a clause is expanded, not run), so the map is spelled out.
+
+(proc/defserver lib-sync
+  (reconcile {:projection DOC
+              :conn-fn (fn [_srv] (:conn @world))
+              :scope-fn scopes-of
+              :paused-fn paused-scope?
+              :apply apply-fn
+              :retire retire-fn
+              :level [1 :second]
+              :queue {:retry {:max 4 :backoff :exponential
+                              :base 20 :max-delay 60 :jitter 0}}}))
+
+(proc/defserver lib-watch
+  (reconcile {:projection DOC
+              :conn-fn (fn [_srv] (:conn @world))
+              :scope-fn scopes-of
+              :paused-fn paused-scope?
+              :apply apply-fn
+              :retire retire-fn
+              :level nil
+              :watch? true
+              :queue {:retry {:max 4 :backoff :exponential
+                              :base 20 :max-delay 60 :jitter 0}}}))
+
+(defn- wait-until
+  "Poll `pred` until it holds, or `ms` elapses. A queue is timers and processes,
+   so a test that asserts after a fixed sleep is a test that fails on a busy
+   machine."
+  [pred ms]
+  (loop [n 0]
+    (cond
+      (pred) true
+      (> n ms) false
+      :else (do (Process/sleep 10) (recur (+ n 10))))))
+
+;; ── level convergence, and the store as the only source of truth ────────────
+
+(deftest a-level-pass-converges-the-library-from-the-store
+  (let [w (world!)]
+    (add-doc! "a" "one")
+    (add-doc! "b" "two")
+    (let [s (start lib-sync nil {})]
+      (is (wait-until (fn [] (= 2 (get (:done (queue/stats :lib-sync))))) 6000)
+          "the init level pass enqueued both rows and the queue ran them")
+      (is (= #{"one" "two"} (live-contents)))
+      (is (= 2 (:applies @(:lib w))) "each row published exactly once")
+      (stop s))
+    ;; a second pass creates NOTHING: the answers already exist
+    (let [r (rec/pump! :lib-sync)]
+      (is (= 0 (:owed r))) (is (= 0 (:created r))))))
+
+(deftest a-restart-resumes-the-rows-that-were-owed
+  ;; the queue's own store is durable, so work owed while no process ran is
+  ;; still there — this is the crash-recovery path the level pass is for.
+  (let [w (world!)]
+    (add-doc! "a" "one")
+    (let [s (start lib-sync nil {})]
+      (stop s))
+    (let [s (start lib-sync nil {})]
+      (is (wait-until (fn [] (= #{"one"} (live-contents))) 6000))
+      (stop s))))
+
+;; ── the re-judge: an obsolete queued revision must not publish ──────────────
+
+(deftest an-obsolete-queued-revision-does-not-publish
+  (let [w (world!)]
+    ;; boot once so the declaration and the config exist, then stop: nothing
+    ;; claims, so the jobs below WAIT in the store
+    (let [s (start lib-sync nil {})] (Process/sleep 30) (stop s))
+    (let [src (add-doc! "a" "v1")
+          db (datom/db (:conn w))
+          scope (:scope w)
+          row (rc/owed-row db DOC :m1 scope src 1)]
+      (rec/enqueue! :lib-sync DOC :owed row)          ; the revision-1 job
+      (edit-doc! "a" "v2")                            ; …and now 2 is current
+      (let [r (rec/pump! :lib-sync)]
+        (is (= 1 (:owed r)) "only the current revision is owed")
+        (is (= 1 (:created r)) "a NEW revision is a new job (the revision is in the key)"))
+      (let [s (start lib-sync nil {})]
+        (is (wait-until (fn [] (= 2 (get (:done (queue/stats :lib-sync))))) 6000)
+            "both jobs settle — the stale one without acting")
+        (is (= #{"v2"} (live-contents)) "only the CURRENT revision published")
+        (is (= 1 (:applies @(:lib w))) "the consumer was called to publish exactly once")
+        (is (= 2 (calls)) "…but the apply ran twice: the obsolete revision was re-judged out")
+        (stop s)))))
+
+;; ── transient failure: the queue's backoff, this file's no answer ───────────
+
+(deftest a-transient-failure-retries-with-backoff-and-then-publishes
+  (let [w (world!)]
+    (fail-next! 2)
+    (add-doc! "a" "v1")
+    (let [s (start lib-sync nil {})]
+      (is (wait-until (fn [] (= #{"v1"} (live-contents))) 8000)
+          "the row published once the outage ended")
+      (is (= 3 (calls)) "two failures then success — one attempt per queue try")
+      (is (= 0 (get (:failed (queue/stats :lib-sync))))
+          "the job SETTLED; nothing is parked")
+      (is (= 1 (get (:records (rec/status :lib-sync)) :applied))
+          "and exactly one answer was recorded")
+      (stop s))))
+
+;; ── exhausted: parked needs-attention, never a green skip, never a hot loop ─
+
+(deftest exhausted-retries-park-the-row-with-needs-attention
+  (let [w (world!)]
+    (fail-next! 1000000)
+    (add-doc! "a" "v1")
+    (let [s (start lib-sync nil {})]
+      (is (wait-until (fn [] (= 1 (get (:failed (queue/stats :lib-sync))))) 8000)
+          "the retry ceiling is reached and the job is KEPT as :failed")
+      (stop s))
+    (let [st (rec/status :lib-sync)]
+      (is (= 1 (:owed st)) "the row is still owed — nothing was published")
+      (is (= 0 (get (:records st) :applied 0)) "…so no answer exists")
+      (is (= 1 (:parked st)) "…and the failure is a fact a console reads")
+      (is (= 1 (count (rec/failures :lib-sync))))
+      (is (includes? (str (:error (first (rec/failures :lib-sync)))) "network down")))
+    (let [before (get (:total (queue/stats :lib-sync)))
+          r (rec/pump! :lib-sync)]
+      (is (= 0 (:created r)) "a parked row is NOT enqueued again")
+      (is (= 1 (:parked r)))
+      (is (= before (get (:total (queue/stats :lib-sync)))) "no new job: no hot loop"))))
+
+(deftest a-newer-revision-is-eligible-after-an-older-one-is-parked
+  (let [w (world!)]
+    (fail-next! 1000000)
+    (add-doc! "a" "v1")
+    (let [s (start lib-sync nil {})]
+      (is (wait-until (fn [] (= 1 (get (:failed (queue/stats :lib-sync))))) 8000))
+      (stop s))
+    (fail-next! 0)
+    (edit-doc! "a" "v2")                        ; a NEW revision, a NEW key
+    (let [s (start lib-sync nil {})]
+      (is (wait-until (fn [] (= #{"v2"} (live-contents))) 6000)
+          "revision 1 being parked does not block revision 2")
+      (is (= 0 (:owed (rec/status :lib-sync))) "the current revision is answered")
+      (stop s))))
+
+(deftest a-parked-job-can-be-retried-by-hand
+  (let [w (world!)]
+    (fail-next! 1000000)
+    (add-doc! "a" "v1")
+    (let [s (start lib-sync nil {})]
+      (is (wait-until (fn [] (= 1 (get (:failed (queue/stats :lib-sync))))) 8000))
+      (stop s))
+    (fail-next! 0)
+    (let [f (first (rec/failures :lib-sync))
+          s (start lib-sync nil {})]
+      (is (= 0 (:created (rec/pump! :lib-sync))) "the level pass still parks it")
+      (rec/retry! :lib-sync (:job/id f))
+      (is (wait-until (fn [] (= #{"v1"} (live-contents))) 6000)
+          "the manual retry published what the automatic pass refused to re-mint")
+      (is (= 1 (get (:records (rec/status :lib-sync)) :applied)))
+      (stop s))))
+
+;; ── retire: a source that leaves, and a crashed intent that never answered ──
+
+(deftest a-source-that-leaves-the-scope-is-retired
+  (let [w (world!)]
+    (add-doc! "a" "v1")
+    (let [s (start lib-sync nil {})]
+      (is (wait-until (fn [] (= #{"v1"} (live-contents))) 6000))
+      (move-out! "a")
+      (rec/pump! :lib-sync)
+      (is (wait-until (fn [] (empty? (live-contents))) 6000)
+          "the origin was dropped when the source left")
+      (is (= 1 (get (:records (rec/status :lib-sync)) :retired)))
+      (stop s))))
+
+(deftest a-crashed-apply-leaves-a-pending-intent-stale-can-retire
+  (let [w (world!)]
+    (add-doc! "a" "v1")
+    (let [s (start lib-sync nil {})]
+      (is (wait-until (fn [] (= #{"v1"} (live-contents))) 6000))
+      (stop s))
+    ;; THE CRASH WINDOW (L4): apply wrote a target and then died before the
+    ;; answer was recorded, leaving a :pending INTENT. `apply-row!` writes that
+    ;; intent on every attempt, so this is the state a real crash leaves.
+    (let [src (doc-eid "a")]
+      (datom/transact! (:conn w)
+                       (pj/record-tx DOC {:scope (:scope w) :scope-key :m1 :src src :rev 2}
+                                     {:state :pending}))
+      ;; …and the source leaves before the retry
+      (move-out! "a")
+      (let [r (rec/pump! :lib-sync)]
+        (is (= 1 (:stale r)) "the pending intent is found stale"))
+      (let [s (start lib-sync nil {})]
+        (is (wait-until (fn [] (empty? (live-contents))) 6000)
+            "…and retired through the consumer, dropping the target the crash wrote")
+        (is (= 1 (get (:records (rec/status :lib-sync)) :retired)))
+        (stop s)))))
+
+;; ── pause: owed and stale both stand still ─────────────────────────────────
+
+(deftest a-paused-scope-owes-nothing-and-retires-nothing
+  (let [w (world!)]
+    (add-doc! "a" "v1")
+    (let [s (start lib-sync nil {})]
+      (is (wait-until (fn [] (= #{"v1"} (live-contents))) 6000))
+      (stop s))
+    (pause!)
+    (add-doc! "b" "v2")            ; new work appears while paused
+    (move-out! "a")                ; …and a source leaves
+    (let [r (rec/pump! :lib-sync)]
+      (is (= 0 (:owed r)) "the projection's :active clause gates owed")
+      (is (= 0 (:enqueued r)) "nothing is enqueued for a paused scope")
+      (is (= 0 (:created r))))
+    (is (= #{"v1"} (live-contents)) "a pause must never retire anything")))
+
+;; ── the timer is the recovery path; the watch is only latency ───────────────
+
+(deftest the-level-timer-recovers-work-that-appears-after-boot
+  (let [w (world!)]
+    (let [s (start lib-sync nil {})]
+      (add-doc! "a" "v1")          ; no pump, no watch — only the 1s timer
+      (is (wait-until (fn [] (= #{"v1"} (live-contents))) 8000)
+          "the level timer found the new row without being asked")
+      (is (some? (:last-level-at (rec/status :lib-sync))))
+      (stop s))))
+
+(deftest a-watch-enqueues-what-a-commit-added
+  ;; `lib-watch` has NO level timer (`:level nil`), so only the edge trigger can
+  ;; converge this — which is exactly what makes the assertion meaningful.
+  (let [w (world!)]
+    (let [s (start lib-watch nil {})]
+      (Process/sleep 50)
+      (add-doc! "a" "v1")
+      (is (wait-until (fn [] (= #{"v1"} (live-contents))) 8000)
+          "the owed-query watch saw the new row and enqueued it")
+      (stop s))
+    (rec/unwatch-all! :lib-watch)))
+
+;; ── the clause itself: refusals, and the ops it contributes ─────────────────
+
+(deftest a-malformed-declaration-is-refused-at-expansion
+  (is (thrown? (rec/reconcile-clause '(reconcile {:projection DOC}) {:name 'x}))
+      "no :conn-fn/:scope-fn/:apply")
+  (is (thrown? (rec/reconcile-clause '(reconcile {:projection DOC :conn-fn 1
+                                                  :scope-fn 1 :apply 1 :levl [1 :second]})
+                                     {:name 'x}))
+      "a typo'd option, not a silent default")
+  (is (thrown? (rec/reconcile-clause '(reconcile) {:name 'x})) "no option map")
+  (is (thrown? (rec/reconcile-clause '(reconcile {:projection DOC :conn-fn 1
+                                                  :scope-fn 1 :apply 1
+                                                  :queue {:retry {:backoff :fibonacci}}})
+                                     {:name 'x}))
+      "the queue's own declaration checks still apply"))
+
+(deftest the-clause-expands-to-a-queue-plus-its-own-slice
+  (let [c (rec/reconcile-clause '(reconcile {:projection DOC
+                                             :conn-fn (fn [_] nil)
+                                             :scope-fn (fn [_ _] [])
+                                             :apply (fn [_ _] nil)})
+                                {:name 'x})]
+    (is (= 3 (count (:prelude c))) "the queue's arm + the config + the perform")
+    (is (some? (:init c)))
+    (is (= 9 (count (:clauses c))) "the queue's 5 handlers + the level tick + 3 ops")))

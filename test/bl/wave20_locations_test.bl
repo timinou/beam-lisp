@@ -1,0 +1,126 @@
+; test/bl/wave20_locations_test.bl — source locations, asserted against REAL
+; stacktraces, ported from test/beam_lisp/wave20_locations_test.exs.
+;
+; These tests exist because the failure mode is silent: attribution can regress
+; to beam-lisp's own internals without a single other test noticing, since every
+; other test asserts on values rather than on where an error claims to come
+; from. Before this wave, a runtime error in a `.bl` file reported
+; `lib/beam_lisp/link.ex` as the user frame.
+;
+; ── coverage map (ExUnit test → BL deftest) ────────────────────────────────
+; All five ExUnit tests map one-to-one onto a same-named BL deftest:
+;   a runtime error names the .bl file and the failing line
+;   a compile error names file, line and the offending form
+;   a later form in a multi-form file reports its own line
+;   a form with no position metadata still compiles
+;   an AOT-compiled module carries .bl locations in its line table
+;
+; Run: bin/bl test test/bl/wave20_locations_test.bl
+
+(ns wave20-locations.test)
+
+(defn- in-tmp [name source fun]
+  (let [path (Path/join (System/tmp_dir!)
+                        (str "bl_loc_" (erlang/unique_integer (list :positive)) "_" name))]
+    (File/write! path source)
+    (try (fun path)
+         (finally (File/rm path)))))
+
+; The top frame of a BIF failure is the BIF itself (:erlang.+/2), which carries
+; no location. The frame that matters is the first one inside a generated
+; namespace module — that is the user's code.
+(defn- user-frame [stack]
+  (first (filter (fn [fr]
+                   (and (erlang/is_tuple fr)
+                        (= 4 (erlang/tuple_size fr))
+                        (let [mod (erlang/element 1 fr)]
+                          (and (erlang/is_atom mod)
+                               (starts-with? (Atom/to_string mod) "Elixir.BeamLisp.Ns.")
+                               (some? (Keyword/get (erlang/element 4 fr) :file nil))))))
+                 stack)))
+
+(defn- run-forms [path]
+  (let [env (BeamLisp.Compiler/new_env "user")]
+    (reduce (fn [_ form] (BeamLisp.Compiler/eval_form form env))
+            nil
+            (BeamLisp.Reader/read_string (File/read! path) path))))
+
+(deftest a-runtime-error-names-the-bl-file-and-the-failing-line
+  (let [source (str "(ns locdemo)\n"
+                    "(defn boom [x]\n"
+                    "  (let [y (* x 2)]\n"
+                    "    (+ y nil)))\n"
+                    "(boom 3)\n")]
+    (in-tmp "runtime.bl" source
+      (fn [path]
+        (let [stack (try (do (run-forms path) nil) (catch _e __STACKTRACE__))
+              frame (user-frame stack)]
+          (is (some? frame) (str "no generated-namespace frame in: " (pr-str stack)))
+          (let [loc (erlang/element 4 frame)]
+            (is (= path (String.Chars/to_string (Keyword/get loc :file nil))))
+            ; `(+ y nil)` is on line 4 — not line 2 where the defn opens, and
+            ; not line 1. Per-expression accuracy is the whole point.
+            (is (= 4 (Keyword/get loc :line nil)))))))))
+
+(deftest a-compile-error-names-file-line-and-the-offending-form
+  (let [source (str "(ns locbad)\n"
+                    "(defn f [x]\n"
+                    "  (let [y] y))\n")]
+    (in-tmp "compile.bl" source
+      (fn [path]
+        (let [e (try (do (run-forms path) nil) (catch BeamLisp.CompileError ex ex))]
+          (is (some? e) "a malformed let raises BeamLisp.CompileError")
+          (is (= path (get e :file)))
+          ; the malformed `let` is on line 3, not the file's first line.
+          (is (= 3 (get e :line)))
+          (is (includes? (ex-message e) path))
+          (is (includes? (ex-message e) "3"))
+          (is (includes? (ex-message e) "binding forms must be even")))))))
+
+(deftest a-later-form-in-a-multi-form-file-reports-its-own-line
+  (let [source (str "(ns locmulti)\n"
+                    "(def a 1)\n"
+                    "(def b 2)\n"
+                    "(defn late [] (+ nil 1))\n"
+                    "(late)\n")]
+    (in-tmp "multi.bl" source
+      (fn [path]
+        (let [stack (try (do (run-forms path) nil) (catch _e __STACKTRACE__))
+              frame (user-frame stack)]
+          (is (some? frame))
+          (is (= 4 (Keyword/get (erlang/element 4 frame) :line nil))))))))
+
+(deftest a-form-with-no-position-metadata-still-compiles
+  ; Forms built at runtime by a macro carry no wrapper. Position is
+  ; best-effort — never required — or macro-generated code could not run.
+  (is (= 3 (BeamLisp.Compiler/eval_form
+             (tuple :list [(tuple :symbol "+") 1 2])
+             (BeamLisp.Compiler/new_env "locbare")))))
+
+(deftest an-aot-compiled-module-carries-bl-locations-in-its-line-table
+  ; The case most likely to be missed, and the one that matters most: these
+  ; .beam files persist, so this is what a production stack trace hits long
+  ; after the compiler that made it has exited.
+  (let [source (str "(ns aotloc)\n"
+                    "(defn crash [x]\n"
+                    "  (+ x nil))\n")]
+    (in-tmp "aotloc.bl" source
+      (fn [path]
+        (let [out (Path/join (System/tmp_dir!)
+                             (str "bl_aot_" (erlang/unique_integer (list :positive))))]
+          (File/mkdir_p! out)
+          (try
+            (BeamLisp.AOT/compile_file path (list (tuple :output_dir out)))
+            (let [beam (Path/join out "Elixir.BeamLisp.Ns.Aotloc.beam")]
+              (is (File/exists? beam))
+              ; Read the source attribution straight out of the compiled
+              ; artifact rather than trusting the in-memory module. Release
+              ; beams carry no abstract code, so use the compile-info chunk,
+              ; which records the source path the compiler was given.
+              (let [r (erlang/apply :beam_lib :chunks
+                                    (list (erlang/binary_to_list beam) (list :compile_info)))
+                    info (Keyword/get (erlang/element 2 (erlang/element 2 r)) :compile_info)
+                    source-attr (String.Chars/to_string (Keyword/get info :source nil))]
+                (is (= path source-attr)
+                    (str "expected the .beam to name " path ", got: " source-attr))))
+            (finally (File/rm_rf! out))))))))

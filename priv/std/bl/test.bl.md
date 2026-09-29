@@ -184,8 +184,8 @@ anything reading the number rather than the picture.
   "The `.exs` half: ExUnit on whatever Elixir is running this VM — the same
    framework `mix test` used, with no Mix underneath it.
 
-   `test_helper.exs` runs first, because it is where ExUnit starts; it starts
-   ExUnit with `autorun: false` so the only report is this run's. With `--json`
+   The runner starts ExUnit itself with `autorun: false` and applies the
+   toolchain hotpatch before loading suites. With `--json`
    the whole run is silenced and one object is emitted: a caller reading a number
    must not have to skip past a report.
 
@@ -194,8 +194,8 @@ anything reading the number rather than the picture.
   [paths st]
   (compile-test-support!)
   (let [run! (fn []
-               (when (File/regular? "test/test_helper.exs")
-                 (Code/require_file "test/test_helper.exs"))
+               (BeamLisp.Loader/ensure_loaded "vm.hotpatch")
+               (erlang/apply :"Elixir.BeamLisp.Ns.Vm.Hotpatch" :apply-env! (list))
                (start-exunit st)
                (u/each (fn [f] (Code/require_file f)) paths)
                (ExUnit/run))

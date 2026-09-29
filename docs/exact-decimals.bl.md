@@ -133,6 +133,7 @@ Because it carries a process-global context (precision + rounding mode) that
 every operation consults, so a result depends on ambient state set somewhere
 else — the exact wart a port from the JVM must not inherit. The type above is
 three hundred lines, has no global anywhere, and is checked against
-`java.math.BigDecimal` row by row: `test/beam_lisp/decimal_oracle_test.exs`
+`java.math.BigDecimal` row by row: `test/bl/decimal_oracle_port_test.bl`
 pins 1051 JVM-captured answers (every rounding mode, every half-way case,
-terminating and non-terminating division).
+terminating and non-terminating division), and `scripts/decimal_oracle_gen.clj`
+re-derives every one of them on a real JVM.

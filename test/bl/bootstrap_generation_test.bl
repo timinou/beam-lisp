@@ -1,0 +1,162 @@
+; bootstrap_generation_test.bl — the generation rule for the `Ns.*` generation
+; UNIT, ported from the ExUnit `test/beam_lisp/bootstrap_generation_test.exs`.
+;
+; `Bootstrap.install!/2` treats the committed seed as a FLOOR, never a ceiling:
+; a destination beam stamped with the CURRENT toolchain key is a fresh gen-N+1
+; rebuild and is kept. The three cases here pin that rule:
+;
+;   1. a COMPLETE current generation (shim + body, both fresh) survives the
+;      install untouched — the seed does not overwrite newer code;
+;   2. an INCOMPLETE one does not protect its older companion — a fresh shim
+;      beside a stale body is a killed build, and the sibling verdict does not
+;      inherit when the body is older than the shim;
+;   3. corrupt seed bytes refuse installation and write nothing.
+;
+; Ward runs a file's deftests in ONE isolated fork with no per-test
+; `setup`/`on_exit`, so `with-scratch` reproduces the ExUnit pair explicitly:
+; a fresh `{seed, ebin}` tree per test, and a `finally` that purges the probe
+; modules, restores the VM-global `:bootstrap_staging` env and removes the tree.
+;
+; Run: bl test test/bl/bootstrap_generation_test.bl
+
+(ns bootstrap-generation.test)
+
+; Generation-ladder probe modules: `Elixir.BeamLisp.Ns.<Name>` is a namespace
+; shim and `Elixir.BeamLisp.Ns.Body.<Name>` its body beam — one generation unit.
+; No other suite loads these names.
+(def ^:private shim (erlang/binary_to_atom "Elixir.BeamLisp.Ns.GenerationProbe" :utf8))
+(def ^:private body (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Body.GenerationProbe" :utf8))
+
+(defn- t [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-root []
+  (Path/join (System/tmp_dir!)
+             (str "bl_seed_gate_" (erlang/unique_integer (list :positive)))))
+
+(defn- beam-path [root mod]
+  (Path/join root (str (erlang/atom_to_binary mod :utf8) ".beam")))
+
+(defn- sha-of [bytes]
+  (String/downcase (Base/encode16 (erlang/apply :crypto :hash (list :sha256 bytes)))))
+
+(defn- term-text
+  "Erlang CONSULT text for one term — the format the seed writer publishes and
+   `file:consult/1` reads back, BINARY keys included. An Erlang `\"string\"` is a
+   charlist, so a hand-written `#{\"k\" => …}` consults to charlist keys and the
+   reader's `(Map/get manifest \"modules\")` answers nil; the writer's `~p` of a
+   binary-keyed map is the shape a fixture must reproduce."
+  [term]
+  (str (erlang/list_to_binary (erlang/apply :io_lib :format (list "~p" (list term))))
+       ".\n"))
+
+(defn- with-scratch
+  "The ExUnit `setup`/`on_exit` pair, made explicit. `:bootstrap_staging` is
+   VM-global, and `install!/2` writes it on the mismatch path, so it is saved and
+   restored rather than left for the next file."
+  [f]
+  (let [root (tmp-root)
+        seed (Path/join root "seed")
+        ebin (Path/join root "ebin")
+        staging (erlang/apply :application :get_env (list :beam_lisp :bootstrap_staging))]
+    (File/mkdir_p! seed)
+    (File/mkdir_p! ebin)
+    (try
+      (f {:seed seed :ebin ebin})
+      (finally
+        (doseq [mod (list shim body)]
+          (code/purge mod)
+          (code/delete mod))
+        (if (= staging :undefined)
+          (erlang/apply :application :unset_env (list :beam_lisp :bootstrap_staging))
+          (erlang/apply :application :set_env
+                        (list :beam_lisp :bootstrap_staging (elem staging 1))))
+        (File/rm_rf! root)))))
+
+(defn- beam
+  "A beam: module + `value/0`, plus the `__bl_provenance__/0` function AND the
+   `bl_compiler_key` attribute `AOT.emit_module` writes beside it when `key` is
+   non-nil. A nil `key` is the body of a previous generation — no stamp at all,
+   which is what makes it stale."
+  [mod value key]
+  (let [value-fn (tuple :function 1 :value 0
+                        (list (tuple :clause 1 (list) (list)
+                                     (list (erl_parse/abstract value)))))
+        provenance (if (some? key)
+                     (list (tuple :function 1 :__bl_provenance__ 0
+                                  (list (tuple :clause 1 (list) (list)
+                                               (list (erl_parse/abstract (tuple nil key)))))))
+                     (list))
+        exports (if (some? key)
+                  (list (tuple :value 0) (tuple :__bl_provenance__ 0))
+                  (list (tuple :value 0)))
+        stamp (if (some? key) (list (tuple :attribute 1 :bl_compiler_key key)) (list))
+        forms (concat (list (tuple :attribute 1 :module mod)
+                            (tuple :attribute 1 :export exports))
+                      stamp
+                      (list value-fn)
+                      provenance)]
+    (elem (erlang/apply :compile :forms (list (to-list forms) (list :binary))) 2)))
+
+(defn- write-seed!
+  "The committed floor: a shim stamped `previous-generation` and a STAMPLESS
+   body. Its manifest carries `compiler_key` `previous-generation`, so the floor
+   is a key mismatch against this toolchain by construction."
+  [seed]
+  (let [shim-bytes (beam shim :seed "previous-generation")
+        body-bytes (beam body :seed nil)
+        shim-name (str (erlang/atom_to_binary shim :utf8) ".beam")
+        body-name (str (erlang/atom_to_binary body :utf8) ".beam")]
+    (File/write! (beam-path seed shim) shim-bytes)
+    (File/write! (beam-path seed body) body-bytes)
+    (File/write! (Path/join seed "manifest.term")
+                 (term-text {"compiler_key" "previous-generation"
+                             "modules" {shim-name (sha-of shim-bytes)
+                                        body-name (sha-of body-bytes)}}))))
+
+(deftest a-previous-seed-cannot-overwrite-a-complete-current-generation
+  (with-scratch
+    (fn [{:keys [seed ebin]}]
+      (write-seed! seed)
+      (let [key (BeamLisp.AOTCache/compiler_key)
+            fresh-shim (beam shim :fresh key)
+            fresh-body (beam body :fresh nil)
+            stamp (tuple (tuple 2026 1 1) (tuple 0 0 0))]
+        (File/write! (beam-path ebin shim) fresh-shim)
+        (File/write! (beam-path ebin body) fresh-body)
+        (File/touch! (beam-path ebin shim) stamp)
+        (File/touch! (beam-path ebin body) stamp)
+
+        (is (= (tuple :staged :compiler_key_mismatch)
+               (BeamLisp.Bootstrap/install! ebin (list (tuple :seed_dir seed)))))
+        (is (= fresh-shim (File/read! (beam-path ebin shim))))
+        (is (= fresh-body (File/read! (beam-path ebin body))))
+        (is (= :fresh (erlang/apply shim :value (list))))
+        (is (= :fresh (erlang/apply body :value (list))))))))
+
+(deftest an-incomplete-generation-cannot-protect-an-older-companion
+  (with-scratch
+    (fn [{:keys [seed ebin]}]
+      (write-seed! seed)
+      ; A fresh shim beside a body written EARLIER: a killed build. The shim's
+      ; stamp says current, but the unit is not consistent, so the seed body
+      ; wins.
+      (File/write! (beam-path ebin shim)
+                   (beam shim :fresh (BeamLisp.AOTCache/compiler_key)))
+      (File/write! (beam-path ebin body) (beam body :interrupted nil))
+      (File/touch! (beam-path ebin shim) (tuple (tuple 2026 1 2) (tuple 0 0 0)))
+      (File/touch! (beam-path ebin body) (tuple (tuple 2026 1 1) (tuple 0 0 0)))
+
+      (BeamLisp.Bootstrap/install! ebin (list (tuple :seed_dir seed)))
+      (is (= :seed (erlang/apply body :value (list))))
+      (is (= (File/read! (beam-path seed body))
+             (File/read! (beam-path ebin body)))))))
+
+(deftest corrupt-seed-bytes-refuse-installation
+  (with-scratch
+    (fn [{:keys [seed ebin]}]
+      (write-seed! seed)
+      ; Corrupt the shim AFTER the manifest recorded its sha.
+      (File/write! (beam-path seed shim) "not a beam")
+      (is (thrown-with-msg? "checksum mismatch"
+            (BeamLisp.Bootstrap/install! ebin (list (tuple :seed_dir seed)))))
+      (is (not (File/exists? (beam-path ebin shim)))))))

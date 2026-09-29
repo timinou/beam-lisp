@@ -1,0 +1,215 @@
+; aot_cache_gc_test.bl — AOT cache generation retention, measured on the LIVE
+; `BeamLisp.AOTCache`.
+;
+; Ported from the ExUnit `test/beam_lisp/aot_cache_gc_test.exs`. That suite
+; called the same module through Elixir; here there is no interop boundary at
+; all — the cache root is a per-test temp dir in `BEAM_LISP_AOT_CACHE_DIR`, the
+; generations are real directories with a real mtime, and every question goes
+; straight to the module the build itself calls.
+;
+; What is pinned, and why each one is worth a test:
+;
+;   * a retired backend is refused BY NAME before any compilation happens, so a
+;     config that cannot work fails loud instead of producing foreign beams;
+;   * the ACTIVE generation is never swept, and a sweep is bounded — a cold wave
+;     that raced cleanup must not be able to delete the generation it is writing
+;     into, nor delete the whole cache in one pass;
+;   * age is the second criterion: a generation past `:max_age_days` is a
+;     candidate even when it is inside the keep window, and the deletion cap
+;     still applies to it;
+;   * the sweep does not traverse a symlink and does not consider a directory
+;     whose name is not a sha256 key — the cache root is on-disk input and a
+;     link out of it must not become a delete out of it;
+;   * a `store/4` triggers a sweep, but only once per `:interval_ms`, so a burst
+;     of stores does not multiply the delete budget;
+;   * parallel stores SERIALIZE on that throttle and share ONE bounded sweep —
+;     the property a per-worker sweep cannot have.
+;
+; Run: bl test test/bl/aot_cache_gc_test.bl
+
+(ns aot-cache.gc.test)
+
+(defn- k
+  "A generation name: 64 hex-ish characters, the only shape cleanup considers."
+  [character] (String/duplicate character 64))
+
+(defn- restore-env
+  "Put an environment variable back the way it was found: unset stays unset."
+  [name value]
+  (if (nil? value) (System/delete_env name) (System/put_env name value)))
+
+(defn- with-gc-root
+  "Run `f` with a FRESH cache root in `BEAM_LISP_AOT_CACHE_DIR`, the cache
+   config cleared, and the cleanup throttle reset on both edges — the ExUnit
+   suite's `setup`/`on_exit`, in one place. The environment, the application
+   config and the temp root are all restored/removed afterwards, so a test
+   cannot read or leave another test's generations."
+  [f]
+  (let [root (str (System/tmp_dir!) "/bl_aot_cache_gc_"
+                  (erlang/unique_integer (list :positive)))
+        prev-dir (System/get_env "BEAM_LISP_AOT_CACHE_DIR")
+        prev-config (Application/get_env :beam_lisp :aot_cache_gc)]
+    (System/put_env "BEAM_LISP_AOT_CACHE_DIR" root)
+    (File/mkdir_p! root)
+    (BeamLisp.AOTCache/reset_cleanup_throttle)
+    (try
+      (f root)
+      (finally
+        (restore-env "BEAM_LISP_AOT_CACHE_DIR" prev-dir)
+        (if (nil? prev-config)
+          (Application/delete_env :beam_lisp :aot_cache_gc)
+          (Application/put_env :beam_lisp :aot_cache_gc prev-config))
+        (BeamLisp.AOTCache/reset_cleanup_throttle)
+        (File/rm_rf! root)))))
+
+(defn- generation!
+  "A generation directory named `name` whose mtime is `days-ago` in the past,
+   carrying a marker so its identity is observable. `File/touch` takes the same
+   `:calendar.datetime` the ExUnit helper built from `NaiveDateTime.to_erl`."
+  [root name days-ago]
+  (let [path (Path/join root name)]
+    (File/mkdir_p! path)
+    (File/write! (Path/join path "marker") name)
+    (let [seconds (- (System/os_time :second) (* days-ago 86400))]
+      (File/touch path
+        (erlang/apply :calendar :gregorian_seconds_to_datetime
+          (list (+ seconds 62167219200)))))
+    path))
+
+(defn- dir-count [paths]
+  (count (vec (filter (fn [p] (File/dir? p)) paths))))
+
+; ── the backend refusal ─────────────────────────────────────────────────────
+
+(deftest retired-backend-is-rejected-before-compilation
+  (let [prev (Application/get_env :beam_lisp :aot_backend)]
+    (try
+      (Application/put_env :beam_lisp :aot_backend :elixir)
+      (is (thrown-with-msg? "self-hosted compiler emits ANF; use :core"
+            (BeamLisp.AOTCache/aot_backend)))
+      (finally
+        (if (nil? prev)
+          (Application/delete_env :beam_lisp :aot_backend)
+          (Application/put_env :beam_lisp :aot_backend prev))))))
+
+; ── retention ───────────────────────────────────────────────────────────────
+
+(deftest protects-active-generation-and-bounds-retention-cleanup
+  (with-gc-root
+    (fn [root]
+      (let [active (k "a")
+            newest (generation! root (k "b") 1)
+            older (generation! root (k "c") 2)
+            oldest (generation! root (k "d") 3)]
+        (generation! root active 100)
+        (let [res (BeamLisp.AOTCache/cleanup_obsolete_generations active
+                    (list (tuple :keep_generations 2)
+                          (tuple :max_age_days 365)
+                          (tuple :max_delete 1)))]
+          (is (= :ok (elem res 0)))
+          (is (= [(Path/basename oldest)] (vec (elem res 1)))
+              "the oldest of three candidates is the one deleted")
+          (is (File/dir? (Path/join root active)) "the active generation is retained")
+          (is (File/dir? newest))
+          (is (File/dir? older))
+          (is (not (File/exists? oldest))))))))
+
+(deftest age-expiration-removes-old-generations-within-the-deletion-cap
+  (with-gc-root
+    (fn [root]
+      (let [active (k "a")
+            old-a (generation! root (k "b") 40)
+            old-b (generation! root (k "c") 35)]
+        (generation! root active 100)
+        (let [res (BeamLisp.AOTCache/cleanup_obsolete_generations active
+                    (list (tuple :keep_generations 10)
+                          (tuple :max_age_days 30)
+                          (tuple :max_delete 1)))]
+          (is (= :ok (elem res 0)))
+          (is (= 1 (count (vec (elem res 1)))) "the cap bound the sweep to one")
+          (is (= 1 (dir-count (list old-a old-b))) "exactly one old generation survives")
+          (is (File/dir? (Path/join root active))))))))
+
+; ── what the sweep refuses to touch ─────────────────────────────────────────
+
+(deftest ignores-invalid-names-and-symlinks-without-traversing-them
+  (with-gc-root
+    (fn [root]
+      (let [outside (str (System/tmp_dir!) "/bl_aot_cache_gc_outside_"
+                         (erlang/unique_integer (list :positive)))]
+        (File/mkdir_p! outside)
+        (try
+          (let [active (k "a")
+                invalid (generation! root "not-a-compiler-key" 100)
+                target-marker (Path/join outside "keep")
+                symlink (Path/join root (k "b"))]
+            (File/write! target-marker "outside")
+            (File/ln_s! outside symlink)
+            (generation! root active 100)
+            (let [res (BeamLisp.AOTCache/cleanup_obsolete_generations active
+                        (list (tuple :keep_generations 1)
+                              (tuple :max_age_days 1)
+                              (tuple :max_delete 10)))]
+              (is (= :ok (elem res 0)))
+              (is (= [] (vec (elem res 1))) "nothing is a candidate")
+              (is (File/dir? invalid) "a non-key name is left alone")
+              (is (= "outside" (File/read! target-marker))
+                  "the symlink's target is not descended into")
+              (is (= :symlink (:type (elem (File/lstat symlink) 1)))
+                  "the link itself is untouched")))
+          (finally (File/rm_rf! outside)))))))
+
+; ── the store-triggered sweep ───────────────────────────────────────────────
+
+(deftest store-triggered-cleanup-is-throttled
+  (with-gc-root
+    (fn [root]
+      (let [active (k "a")
+            first-old (generation! root (k "b") 2)
+            source (Path/join root "source")]
+        (File/mkdir_p! source)
+        (File/write! (Path/join source "Elixir.FakeGC.beam") "beam")
+        (Application/put_env :beam_lisp :aot_cache_gc
+          (list (tuple :keep_generations 1)
+                (tuple :max_age_days 365)
+                (tuple :max_delete 10)
+                (tuple :interval_ms 60000)))
+        (is (= :ok (BeamLisp.AOTCache/store active "first" source (list :Elixir.FakeGC))))
+        (is (not (File/exists? first-old))
+            "the first store swept the obsolete generation")
+        (let [second-old (generation! root (k "c") 2)]
+          (is (= :ok (BeamLisp.AOTCache/store active "second" source (list :Elixir.FakeGC))))
+          (is (File/dir? second-old)
+              "the second store is inside the throttle window, so it does not sweep"))))))
+
+(deftest parallel-stores-share-one-bounded-sweep
+  (with-gc-root
+    (fn [root]
+      (let [active (k "a")
+            ; `mapv`, not `map`: beam-lisp's `map` is LAZY, so the
+            ; generations would not exist until something forced the seq —
+            ; after the stores had already decided there was nothing to
+            ; sweep. The ExUnit `for` was eager; `mapv` is its spelling here.
+            old (mapv (fn [character] (generation! root (k character) 40))
+                      (list "b" "c" "d" "e"))
+            source (Path/join root "parallel-source")]
+        (File/mkdir_p! source)
+        (File/write! (Path/join source "Elixir.FakeGC.beam") "beam")
+        (Application/put_env :beam_lisp :aot_cache_gc
+          (list (tuple :keep_generations 1)
+                (tuple :max_age_days 30)
+                (tuple :max_delete 1)
+                (tuple :interval_ms 60000)))
+        ; `Task/async_stream` hands back a Stream, so `Enum/to_list` is what
+        ; runs the tasks; `to-list` then makes the results a language list.
+        (let [results (to-list
+                        (Enum/to_list
+                          (Task/async_stream (range 8)
+                            (fn [n]
+                              (BeamLisp.AOTCache/store active (str "entry-" n) source
+                                (list :Elixir.FakeGC)))
+                            (list (tuple :max_concurrency 8)))))]
+          (is (Enum/all? results (fn [r] (= (tuple :ok :ok) r)))
+              "every store succeeded")
+          (is (= 3 (dir-count old))
+              "eight stores share ONE max_delete-1 sweep: one of four is deleted"))))))

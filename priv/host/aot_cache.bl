@@ -1,0 +1,874 @@
+; host/aot_cache.bl — the pinned HOST MODULE for `Elixir.BeamLisp.AOTCache`.
+;
+; This file is not a namespace. It is a `.bl` SOURCE that the bootstrap seed
+; compiles with `BeamLisp.AOT/compile-host-file` into ONE exact-named beam
+; (`Elixir.BeamLisp.AOTCache.beam`) whose top-level `defn`s are plain exported
+; functions — the exact call surface every caller already names at
+; `Elixir.BeamLisp.AOTCache`, so no caller is renamed. The pinned beam is
+; committed into the floor (`priv/bootstrap/seed/`) and installed by
+; `Bootstrap.install!/1`; `lib/beam_lisp/aot_cache.ex` is retained until the
+; seed carries this beam, then recalled.
+;
+; WHY A PINNED MODULE AND NOT A NAMESPACE. `AOTCache` is asked for the
+; TOOLCHAIN KEY before the language exists. `bin/bl`'s boot program calls
+; `BeamLisp.AOTCache.current_compiler_key/0` to judge whether the boot tier in
+; `build/` is this tree's generation, and `Bootstrap.install!/1` (in the
+; rebuild child) calls `compiler_key/0` and `build_key/0` to judge the floor —
+; both BEFORE `ensure_all_started`/`BeamLisp.init`, so before a single
+; `BeamLisp.Ns.*` beam is interned. A module on that path can never itself be
+; an AOT-rebuilt `BeamLisp.Ns.*` namespace (the bootstrap circle again), so it
+; is a pinned host beam instead.
+;
+; ── THE PREBOOT CONSTRAINT: NO Rt, NO core ──────────────────────────────────
+;
+; The pinned beam must RUN with nothing on the code path but Elixir/OTP, the
+; pinned `Elixir.BeamLisp.Tiers` leaf it asks where the sources are, and itself.
+; That is stronger than "does not call the shim": every BL convenience that
+; compiles to a call into the runtime is forbidden, because `BeamLisp.Ns.Rt`
+; and `BeamLisp.Env` are not loaded at preboot and `core`'s vars are not
+; interned. The compiler lowers a bare `(list …)` to `BeamLisp.Ns.Core.list__bl_v`
+; and a keyword/`str`/`nil?`/`case`/map-literal to a `BeamLisp.Ns.Rt` or
+; `BeamLisp.Env` call — all of which are `undef` before the floor boots. So this
+; file is written in the surface the BEAM itself provides:
+;
+;   * `erlang/*` BIFs — `setelement`, `make_tuple`, `tuple_to_list`, `element`,
+;     `is_*`, `==`, `+`, `-`, `>`, `apply`, … — are remote calls to `:erlang`,
+;     free of any runtime;
+;   * `lst`/`tup`/`bcat` build a list, a tuple and a binary from BIFs alone
+;     (`xs` as a rest argument IS a list; `list_to_tuple`/`list_to_binary` do
+;     the rest), which is why they exist instead of `(list …)`, `{…}` and `str`;
+;   * `Enum`, `Map`, `MapSet`, `Keyword`, `Path`, `File`, `System`, `String`,
+;     `Regex`, `Base`, `IO`, `Code`, `Module`, `Macro` are host modules:
+;     Elixir/OTP, on the path in any `elixir` VM, and the same modules the
+;     Elixir twin called. `Enum` invokes the BL closures below as plain funs,
+;     exactly as it invoked the Elixir captures it replaces;
+;   * `cond`/`if`/`when`/`and`/`or`/`->`/`when-let`/`if-let` are MACROS — they
+;     expand at compile time into `if`/`let`, which emit nothing at runtime;
+;   * `case`, `(list …)`, `str`, `nil?`, `{}` map literals, vector literals,
+;    destructuring, `for`/`doseq` and calling a locally-bound fn are all
+;     AVOIDED: each emits a `BeamLisp.Ns.Core`/`Ns.Rt`/`Env`/`Vector` reference
+;     (measured per-construct against the emitted atom table), which is exactly
+;     the preboot dependency this file must not have. Matching is spelled with
+;     `cond` on `erlang/element`/`erlang/tuple_size`; a name a caller must have
+;     is spelled with `erlang/atom_to_binary` or `Atom/to_string`.
+;
+; `test/bl/aot_cache_host_test.bl` proves this twice: it diffs a fresh compile
+; of this source against the live Elixir module over a corpus AND over the
+; toolchain key, and it runs the emitted beam in a fresh `elixir` child whose
+; ONLY added code path entry is that beam (with the pinned `Tiers` beside it) —
+; asserting `BeamLisp.Ns.Rt` and `BeamLisp.Ns.Core` are not loaded before,
+; during, or after the calls.
+;
+; ── ABI PARITY IS THE CONTRACT ──────────────────────────────────────────────
+;
+; Every public function below reproduces its Elixir counterpart clause for
+; clause: the same traversal, the same evaluation order, the same return types
+; (`{:ok, modules} | :miss`, `{:ok, deleted} | {:error, reason}`), and the same
+; ARITY DEFAULTS (`root \\ priv_root()` and `opts \\ []` become explicit
+; zero/one-arity clauses that delegate). The compiler key is preserved to the
+; BYTE: the same `["elixir:…", "otp:…", "aot_backend:…"] ++ codegen ++
+; toolchain_sources` parts, the same NUL-joined sha256, the same source paths
+; (`@codegen_modules` order, `priv/host/<leaf>.bl` for the pinned leaves), the
+; same `priv/codegen.sources` baking, and the same cache layout
+; (`<dir>/<compiler-key>/<closure-key>/{manifest.term,*.beam}` with the v2
+; manifest). `AOTCache` is deliberately NOT a member of its own
+; `codegen_modules` list — the key cannot hash the module that computes it —
+; so this port changes no key.
+;
+; The exports are the recalled PUBLIC surface plus the private helpers, which
+; the pinned emitter also exports because it exports every top-level `defn` it
+; compiles (`defn-` included). That is the ONE divergence every pinned port in
+; `priv/host/` carries (`compiler_data.bl` ships `invoke1`,
+; `proper-listing`, `invalid-input!` the same way). The helper names are the
+; recalled private names, so the divergence is exactly "these are now call
+; surface too", nothing more. The test pins the export set so a future edit
+; cannot widen it silently.
+;
+; ── TWO DELIBERATE DIVERGENCES IN THE PLUMBING ──────────────────────────────
+;
+; 1. `codegen_source_roots/0` cannot use `__DIR__`: the recalled `aot_cache.ex`
+;    resolves its first root from a COMPILE-TIME absolute path baked into the
+;    Elixir beam, and a `.bl` file has no such macro. The first root here is the
+;    checkout's `lib/` anchored on `BL_ROOT` (the variable the launcher exports
+;    for exactly this class of question) with the process working directory as
+;    the fallback — the same rule the pinned `Tiers` leaf's `priv_root` fallback
+;    and `priv/build/*.bl` already carry, and the same ANSWER in every real
+;    caller: the launcher and the preboot bootstrap both run against the tree.
+;    When neither root resolves (a drop, or a run from an unrelated cwd) the live
+;    digest answers `:error` and `codegen_part/0` falls to the baked digest —
+;    which a checkout writes on every key computation, so the key is still the
+;    tree's. The second root (beside `Tiers.priv_root/0`) is identical to the
+;    recalled module's, and the code path a release or a running app takes is
+;    unchanged.
+; 2. A `rescue` becomes an UNTYPED `catch`: the recalled clauses degrade a cache
+;    error to `:miss`/`:ok`, and catching a `throw`/`exit` as well only widens
+;    the degrade, never changes an answer on a successful path. The pinned
+;    compiler's typed catches test `is_struct(e, Mod)`, so spelling every
+;    Elixir exception class would add coverage without adding soundness.
+
+(ns host.aot-cache)
+
+; ── the preboot constructors (BIFs alone; see the header) ───────────────────
+
+(defn- lst
+  "A plain list of the arguments. A rest argument IS a list, so this compiles to
+   argument collection and nothing else — no `BeamLisp.Ns.Core` reference, which
+   is what a bare `(list …)` would emit."
+  [& xs] xs)
+
+(defn- tup
+  "A tuple of the arguments, built the way Erlang builds one."
+  [& xs] (erlang/list_to_tuple xs))
+
+(defn- bcat
+  "A binary from the arguments (an iolist). Stands in for `str`/`Kernel.<>`,
+   both of which compile to a runtime call."
+  [& xs] (erlang/list_to_binary xs))
+
+(defn- self_mod
+  "The atom THIS source was compiled into, read from a fun literal compiled
+   into this file — module-exact, so the same source serves the production atom
+   in the seed and a probe atom under test without naming either. The memo keys
+   below ride on it."
+  [] (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+
+; ── the memo keys (the recalled `@toolchain_key_pt` / `@build_key_pt` /
+;    `@gc_last_sweep_pt`) ───────────────────────────────────────────────────
+
+(defn- toolchain_key_pt [] (tup (self_mod) :toolchain_key))
+(defn- build_key_pt [] (tup (self_mod) :build_key))
+(defn- gc_last_sweep_pt [] (tup (self_mod) :gc_last_sweep))
+
+; ── the hashed toolchain inventory (the recalled `@codegen_modules` /
+;    `@pinned_host_sources`) ─────────────────────────────────────────────────
+;
+; `@codegen_modules` in order. A pinned host leaf whose source moved to
+; `priv/host/<leaf>.bl` is named by `pinned_host_source/1`; every other member
+; is still authored under `lib/`. `AOTCache` is DELIBERATELY absent: the key
+; cannot hash the module that computes it.
+
+(defn- codegen_modules
+  "The host modules whose SOURCES can change EMITTED code, in hash order. A
+   change to any of them rotates `compiler_key/0` (invalidate every AOT beam).
+   `BeamLisp.Compiler` is deliberately absent — since the genesis cutover it is
+   a thin facade over the self-hosted `BeamLisp.Ns.Compiler`, whose source is a
+   tier-1 toolchain input (`priv/boot/compiler.bl`)."
+  []
+  '(:Elixir.BeamLisp.AOT
+    :Elixir.BeamLisp.AtomGuard
+    :Elixir.BeamLisp.CompilerData
+    :Elixir.BeamLisp.Record
+    :Elixir.BeamLisp.Emit
+    :Elixir.BeamLisp.Link
+    :Elixir.BeamLisp.Tiers))
+
+(defn- pinned_host_source
+  "The `priv/host/<leaf>.bl` a codegen module's exact-name beam is compiled
+   from, or nil for an unpinned module. This is the
+   one place that names each pinned leaf; without a row the live digest would
+   halt on the deleted `.ex` and `codegen_part/0` would silently freeze the key
+   on the baked digest (BUG-106). Every migration of a codegen leaf INTO
+   `priv/host/` must add its row here."
+  [mod]
+  (cond
+    (erlang/== mod :Elixir.BeamLisp.AOT) "aot.bl"
+    (erlang/== mod :Elixir.BeamLisp.AtomGuard) "atom_guard.bl"
+    (erlang/== mod :Elixir.BeamLisp.CompilerData) "compiler_data.bl"
+    (erlang/== mod :Elixir.BeamLisp.Emit) "emit.bl"
+    (erlang/== mod :Elixir.BeamLisp.Link) "link.bl"
+    (erlang/== mod :Elixir.BeamLisp.Record) "record.bl"
+    (erlang/== mod :Elixir.BeamLisp.Tiers) "tiers.bl"
+    :else nil))
+; AOTCache is NOT in `pinned_host_source/1` or `codegen_modules/0`, because it
+; is not a hashed input: the key it computes must not name the file that computes
+; it. (`test/bl/codegen_provenance_test.bl` pins that membership in the `.ex`.)
+
+; ── whether the cache participates ─────────────────────────────────────────
+
+(defn enabled?
+  "Whether the cache participates in compilation. Default on."
+  []
+  (let [v (System/get_env "BEAM_LISP_AOT_CACHE")]
+    (erlang/not (Enum/member? (lst "off" "0" "false") v))))
+
+(defn enabled_off_env
+  "The environment variable that turns the cache off."
+  []
+  "BEAM_LISP_AOT_CACHE")
+
+(defn dir
+  "Root of the cache: `$XDG_CACHE_HOME/beam_lisp/aot` or the override."
+  []
+  (let [d (System/get_env "BEAM_LISP_AOT_CACHE_DIR")]
+    (cond
+      (erlang/== d nil)
+      (Path/join
+        (erlang/apply :filename :basedir (lst :user_cache (erlang/binary_to_list "beam_lisp")))
+        "aot")
+      :else d)))
+
+(defn aot_backend
+  "The body-module backend is `:core`: bl-ANF → Core Erlang → BEAM through the
+   boot `lower` namespace. Other settings raise. It lives here, not in
+   `BeamLisp.AOT`, because `compiler_key/0` must fold it in — a Core-built beam
+   and an Elixir-built beam of the same source are different bytes — and this
+   module computes the key before `BeamLisp.AOT` is even a concern."
+  []
+  (let [b (Application/get_env :beam_lisp :aot_backend :core)]
+    (cond
+      (erlang/== b :core) :core
+      :else
+      (erlang/error
+        (Elixir.ArgumentError/exception
+          (bcat "unsupported AOT backend " (Kernel/inspect b)
+                ": the self-hosted compiler emits ANF; use :core"))))))
+
+; ── the tier keys ──────────────────────────────────────────────────────────
+
+(defn compiler_key
+  "Hash of the toolchain that produced a beam. Any change to codegen, the
+   toolchain sources, or the Elixir/OTP/backend it runs on yields a new key, so
+   stale artifacts compiled by a different toolchain are never linked. Memoized
+   in `:persistent_term` (a VM constant in normal use). The app's release
+   version is NOT an input: it is metadata, not codegen."
+  []
+  (let [cached (persistent_term/get (toolchain_key_pt) :undefined)]
+    (cond
+      (erlang/== cached :undefined)
+      (let [k (compute_compiler_key)]
+        (persistent_term/put (toolchain_key_pt) k)
+        k)
+      :else cached)))
+
+(defn current_compiler_key
+  "Compute the compiler key WITHOUT the persistent_term memo — the live value
+   for the CURRENT toolchain sources on disk. `compiler_key/0` caches its first
+   computation for the VM's life; the daemon uses THIS to detect that the
+   checkout it serves has drifted from the sources it booted with, which must
+   force a restart, not a stale reuse."
+  []
+  (compute_compiler_key))
+
+(defn current_build_key
+  "Like `current_compiler_key/0` for the build tier: the LIVE value, unmemoized."
+  []
+  (compute_build_key))
+
+(defn build_key
+  "Hash of the BUILD DRIVER tier (`priv/build/`). These namespaces decide WHAT
+   to build; they cannot change an emitted byte, so their edits must not
+   invalidate every beam. The driver's own beams are compiled BY the codegen,
+   so this key folds in `compiler_key/0`. Memoized."
+  []
+  (let [cached (persistent_term/get (build_key_pt) :undefined)]
+    (cond
+      (erlang/== cached :undefined)
+      (let [k (compute_build_key)]
+        (persistent_term/put (build_key_pt) k)
+        k)
+      :else cached)))
+
+(defn- compute_build_key []
+  (hash_parts (lists/append (lst (compiler_key)) (build_source_contents))))
+
+(defn- build_source_contents
+  "Content of every build-driver source, sorted by path. Read DIRECTLY (no
+   reader, no Env) for the same reason `toolchain_source_contents/0` is: this
+   runs before `BeamLisp.init/0`. An unreadable file contributes nothing rather
+   than crashing the key computation."
+  []
+  (Enum/flat_map
+    (Enum/sort (Path/wildcard (Path/join (BeamLisp.Tiers/build_dir) "**/*.bl")))
+    (fn [path]
+      (let [r (File/read path)]
+        (cond
+          (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+          (lst (erlang/element 2 r))
+          :else '())))))
+
+(defn key_for_source
+  "The key a SOURCE's beam is stamped with: the tier it belongs to. `boot/` and
+   every ordinary source use the codegen key; `build/` uses `build_key/0`. The
+   build manifest and the emitter both route through here, so a beam's stamp and
+   the gate that judges it cannot disagree."
+  ([path] (key_for_source path (BeamLisp.Tiers/priv_root)))
+  ([path root]
+   (cond
+     (BeamLisp.Tiers/build_source? path root) (build_key)
+     :else (compiler_key))))
+
+(defn key_for_ns
+  "The key a NAMESPACE's beam is stamped with: `BeamLisp.Tiers.tier_of_ns/1`."
+  [ns]
+  (key_for_tier (BeamLisp.Tiers/tier_of_ns ns)))
+
+(defn key_for_tier
+  "The key for a tier: `:build` → `build_key/0`, anything else → `compiler_key/0`."
+  [tier]
+  (cond
+    (erlang/== tier :build) (build_key)
+    :else (compiler_key)))
+
+(defn reset_compiler_key
+  "Drop the memoized toolchain key so the next `compiler_key/0` recomputes it.
+   The key is a VM-constant in normal use, so this exists only for tests that
+   mutate a hashed input in-process and must observe the new key."
+  []
+  (persistent_term/erase (toolchain_key_pt)))
+
+(defn reset_keys
+  "Drop BOTH memoized tier keys, so the next `compiler_key/0` and `build_key/0`
+   recompute. Tests that mutate a hashed input in-process use this."
+  []
+  (persistent_term/erase (toolchain_key_pt))
+  (persistent_term/erase (build_key_pt))
+  :ok)
+
+; ── the toolchain key computation ──────────────────────────────────────────
+
+(defn- compute_compiler_key
+  "The key: the runtime triple, the codegen contribution and the tier-1 sources,
+   NUL-joined and hashed. The app `:vsn` is DELIBERATELY NOT hashed — it is
+   release METADATA, not a codegen input, and keying the generation on it
+   manufactures a generation change out of a release stamp."
+  []
+  (let [parts (lst (bcat "elixir:" (System/version))
+                   (bcat "otp:" (erlang/list_to_binary (erlang/system_info :otp_release)))
+                   (bcat "aot_backend:" (erlang/atom_to_binary (aot_backend) :utf8)))
+        codegen (codegen_part)
+        toolchain_sources (toolchain_source_contents)]
+    (hash_parts (lists/append parts (lists/append codegen toolchain_sources)))))
+
+(defn- codegen_part
+  "The codegen host's contribution to the toolchain key, as a list of parts.
+
+   Three images, three answers: LIVE sources present → hash them and BAKE the
+   digest for images that ship none; a baked digest present → a release drop,
+   whose packing checkout wrote the only compiler-independent answer; neither →
+   beam BYTES, the pre-BUG-048 rule, kept so drops built before
+   `priv/codegen.sources` existed compute the key their beams were stamped
+   with."
+  []
+  (let [live (live_codegen_digest)]
+    (cond
+      (erlang/not (erlang/== live nil))
+      (do
+        (bake_codegen_digest live)
+        (lst (bcat "codegen-source:" live)))
+      :else
+      (let [baked (baked_codegen_digest)]
+        (cond
+          (erlang/not (erlang/== baked nil))
+          (lst (bcat "codegen-source:" baked))
+          :else (legacy_codegen_beam_bytes))))))
+
+(defn- live_codegen_digest
+  "sha256 over the codegen modules' SOURCE files, each named by its module so a
+   rename or a reordering cannot collide. nil when ANY source is missing: a
+   partial answer would describe a different toolchain than the one running.
+
+   SOURCES, NOT BEAMS (BUG-048): beam bytes are written by two compilers in the
+   same tree, so a key over them is a property of the compiler that LAST WROTE
+   the beams rather than of the toolchain. A source digest is
+   compiler-independent, which is what a toolchain key has always claimed."
+  []
+  (let [parts (Enum/reduce_while (codegen_modules) '()
+                (fn [mod acc]
+                  (let [r (File/read (codegen_source_path mod))]
+                    (cond
+                      (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+                      (tup :cont (lists/append (lst (erlang/atom_to_binary mod :utf8)
+                                                     (erlang/element 2 r))
+                                                acc))
+                      :else (tup :halt :missing)))))]
+    (cond
+      (erlang/== parts :missing) nil
+      :else (hash_parts (lists/append (lst "codegen") (Enum/reverse parts))))))
+
+(defn- codegen_source_path
+  "The source path for a codegen module: the pinned `.bl` for a leaf in
+   `pinned_host_source/1`, else `lib/beam_lisp/<name>.ex` — derived from the
+   module name rather than listed beside it, so a module added to
+   `codegen_modules/0` cannot be silently uncovered."
+  [mod]
+  (let [leaf (pinned_host_source mod)]
+    (cond
+      (erlang/not (erlang/== leaf nil))
+      (let [relative (bcat "../priv/host/" leaf)
+            found (Enum/find_value (codegen_source_roots)
+                    (fn [root]
+                      (let [path (Path/expand relative root)]
+                        (if (File/exists? path) path))))]
+        (cond
+          (erlang/== found nil) (Path/expand relative (erlang/hd (codegen_source_roots)))
+          :else found))
+      :else
+      (let [name (bcat (Enum/map_join (Module/split mod) "/" (fn [s] (Macro/underscore s))) ".ex")
+            found (Enum/find_value (codegen_source_roots)
+                    (fn [root]
+                      (let [path (Path/join root name)]
+                        (if (File/exists? path) path))))]
+        (cond
+          (erlang/== found nil) (Path/join (erlang/hd (codegen_source_roots)) name)
+          :else found)))))
+
+(defn- codegen_source_roots
+  "Where the codegen sources live, in order of authority: the checkout's `lib/`
+   (anchored on `BL_ROOT`, which the launcher exports, and falling back to the
+   process working directory — a `.bl` source has no `__DIR__`; see the header),
+   then `lib/` beside the app's `priv/`. The `.ex` modules and the pinned
+   `priv/host/*.bl` leaves are resolved beside these. A root that does not exist
+   simply loses the `File.exists?` race and the next is tried."
+  []
+  (let [anchor (let [r (System/get_env "BL_ROOT")]
+                 (cond (erlang/== r nil) (System/cwd) :else r))]
+    (lst (Path/expand (Path/join anchor "lib"))
+         (Path/join (Path/dirname (BeamLisp.Tiers/priv_root)) "lib"))))
+
+(defn- baked_codegen_sources_path
+  "Where the digest is baked, for images that ship no source. Beside the tiers in
+   `priv/` because assembling a drop copies `priv/` wholesale."
+  []
+  (Path/join (BeamLisp.Tiers/priv_root) "codegen.sources"))
+
+(defn- baked_codegen_digest
+  "The baked digest as a 64-hex binary, or nil when the file is absent,
+   malformed, or unreadable."
+  []
+  (try
+    (let [r (File/read (baked_codegen_sources_path))]
+      (cond
+        (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+        (let [d (List/first (String/split (erlang/element 2 r) "\n"))]
+          (cond
+            (erlang/is_binary d)
+            (cond
+              (Regex/match? (Regex/compile! "\\A[0-9a-f]{64}\\z") d) d
+              :else nil)
+            :else nil))
+        :else nil))
+    (catch _e nil)))
+
+(defn- bake_codegen_digest
+  "Best-effort and atomic: write the digest for images that ship no source. This
+   runs inside key computation, reached from boot paths that must never fail on
+   a cache, so a read-only image ignores the failure."
+  [digest]
+  (try
+    (let [path (baked_codegen_sources_path)
+          r (File/read path)
+          current (cond
+                    (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+                    (String/trim (erlang/element 2 r))
+                    :else nil)]
+      (cond
+        (erlang/not (erlang/== current digest))
+        (let [tmp (bcat path ".tmp-"
+                        (erlang/integer_to_list (System/unique_integer (lst :positive))))]
+          (File/write! tmp (bcat digest "\n"))
+          (File/rename! tmp path))
+        :else :ok))
+    :ok
+    (catch _e :ok)))
+
+(defn- legacy_codegen_beam_bytes
+  "The pre-BUG-048 rule, kept verbatim for images built under it.
+   `:code.get_object_code/1` answers the module's bytes wherever the code server
+   found them — a real ebin OR an escript archive, where reading `:code.which/1`
+   with `File.read` fails. Degrade (never crash) when a module is absent."
+  []
+  (Enum/flat_map (codegen_modules)
+    (fn [mod]
+      (let [r (code/get_object_code mod)]
+        (cond
+          (and (erlang/is_tuple r)
+               (erlang/== 3 (erlang/tuple_size r))
+               (erlang/== mod (erlang/element 1 r)))
+          (lst (erlang/element 2 r))
+          :else '())))))
+
+(defn- toolchain_source_contents
+  "Content of every tier-1 source: everything under `priv/boot/` — the
+   self-hosted compiler, the reader providers, the ambient prelude — plus the
+   `priv/self/` oracle while the `:core` backend still serves it, sorted by path
+   for determinism. The boot tier is closed under `:require`, so hashing the
+   DIRECTORY is the closure — no header parse, no reader, nothing this runs
+   before. Resolved by DIRECT file reads: this runs from `Bootstrap.install!/1`
+   BEFORE `BeamLisp.init/0`."
+  []
+  (let [boot (Path/wildcard (Path/join (BeamLisp.Tiers/boot_dir) "**/*.bl"))
+        oracles (cond
+                  (erlang/== (aot_backend) :core)
+                  (Path/wildcard (Path/join (BeamLisp.Tiers/priv_root) "self/**/*.bl"))
+                  :else '())]
+    (Enum/map (Enum/sort (lists/append boot oracles)) (fn [p] (File/read! p)))))
+
+; ── the closure key ────────────────────────────────────────────────────────
+
+(defn closure_key
+  "Hash of one source's closure: its absolute path + content hash and those of
+   every transitive `:require` target within the build's source set. `deps` maps
+   source path → required source paths; `hashes` maps source path → content
+   hash. Requires outside the source set (the core prelude) are covered by
+   `compiler_key/0`."
+  [path deps hashes]
+  (let [closure (Enum/sort (closure_walk path deps (MapSet/new)))
+        entries (Enum/map closure (fn [p] (bcat p ":" (Map/fetch! hashes p))))]
+    (hash_parts entries)))
+
+(defn- closure_walk
+  "Every source reachable from `path` through `deps`, `seen` a `MapSet` of
+   already-visited paths (so a cycle terminates)."
+  [path deps seen]
+  (cond
+    (MapSet/member? seen path) seen
+    :else
+    (Enum/reduce (Map/get deps path '()) (MapSet/put seen path)
+      (fn [dep acc] (closure_walk dep deps acc)))))
+
+; ── the cache entry: fetch, store, validate ────────────────────────────────
+
+(defn fetch
+  "Link a cached entry's beams into `compile_path`. Returns `{:ok, modules}`
+   when the entry existed and every beam materialised, `:miss` otherwise (absent
+   entry, or any link/copy failure — the caller compiles instead)."
+  [compiler_key closure_key compile_path]
+  (let [entry (entry_dir compiler_key closure_key)
+        modules (valid_entry entry)]
+    (cond
+      (erlang/== modules nil) :miss
+      :else
+      (cond
+        (erlang/== :ok (link_beams entry compile_path modules)) (tup :ok modules)
+        :else :miss))))
+
+(defn store
+  "Publish the beams for `modules` (already in `compile_path`) under the given
+   keys. Atomic via temp-dir + rename; failures are ignored. The manifest is
+   `%{version: 2, modules: modules, digests: digests}` — the SAME layout the
+   recalled module wrote, so entries are interchangeable in both directions."
+  [compiler_key closure_key compile_path modules]
+  (let [final (entry_dir compiler_key closure_key)
+        tmp (bcat final ".tmp-"
+                  (erlang/integer_to_list (System/unique_integer (lst :positive))))]
+    (try
+      (do
+        (File/mkdir_p! tmp)
+        (Enum/each modules
+          (fn [mod]
+            (File/cp! (Path/join compile_path (beam_file mod))
+                      (Path/join tmp (beam_file mod)))))
+        (let [digests (Map/new
+                        (Enum/map modules
+                          (fn [mod]
+                            (tup mod (crypto/hash :sha256
+                                       (File/read! (Path/join tmp (beam_file mod))))))))]
+          (File/write! (Path/join tmp "manifest.term")
+                       (erlang/term_to_binary
+                         (Map/put (Map/put (Map/put (Map/new) :version 2)
+                                           :modules modules)
+                                  :digests digests))))
+        (global/trans (tup (tup (toolchain_key_pt) :publish final) (erlang/self))
+          (fn []
+            (cond
+              (erlang/not (erlang/== nil (valid_entry final))) (File/rm_rf! tmp)
+              :else (do (File/rm_rf! final) (File/rename! tmp final))))
+          (lst (erlang/node)))
+        (maybe_cleanup_obsolete_generations compiler_key)
+        :ok)
+      (catch _e (do (File/rm_rf tmp) :ok)))))
+
+(defn- valid_entry
+  "The module list of a COMPLETE entry, or nil. A manifest is trusted only when
+   it is the v2 shape and every beam it names still hashes to its recorded
+   digest: the entry is on-disk input, never assumed."
+  [entry]
+  (try
+    (let [r (File/read (Path/join entry "manifest.term"))]
+      (cond
+        (erlang/not (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))) nil
+        :else
+        (let [term (safe_term (erlang/element 2 r))]
+          (cond
+            (erlang/not (erlang/is_map term)) nil
+            (erlang/not (erlang/== 2 (Map/get term :version))) nil
+            :else
+            (let [modules (Map/get term :modules)
+                  digests (Map/get term :digests)]
+              (cond
+                (erlang/not (erlang/is_list modules)) nil
+                (Enum/all? modules (fn [mod] (valid_beam? entry digests mod))) modules
+                :else nil))))))
+    (catch _e nil)))
+
+(defn- valid_beam?
+  "Whether `mod`'s beam in `entry` still hashes to the digest the manifest
+   records for it."
+  [entry digests mod]
+  (let [r (File/read (Path/join entry (beam_file mod)))]
+    (cond
+      (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+      (erlang/== (crypto/hash :sha256 (erlang/element 2 r)) (Map/get digests mod))
+      :else false)))
+
+(defn- safe_term
+  "The decoded manifest when it is a map carrying a list `:modules`, else nil. A
+   malformed entry degrades to a miss."
+  [bin]
+  (try
+    (let [t (erlang/binary_to_term bin)]
+      (cond
+        (and (erlang/is_map t) (erlang/is_list (Map/get t :modules))) t
+        :else nil))
+    (catch _e nil)))
+
+; ── generation cleanup ─────────────────────────────────────────────────────
+
+(defn cleanup_obsolete_generations
+  "Remove obsolete compiler-key generations from the configured cache root. The
+   active generation is always retained. Only real directories whose names are
+   lowercase sha256 keys are candidates; symlinks and all other entries are
+   ignored. Cleanup is bounded by `:max_delete` per call and is best-effort.
+   Retention defaults can be overridden with `config :beam_lisp,
+   :aot_cache_gc, keep_generations: 8, max_age_days: 30, max_delete: 4,
+   interval_ms: 3_600_000`; explicit options override config."
+  ([active_key] (cleanup_obsolete_generations active_key '()))
+  ([active_key opts] :when (string? active_key)
+   (try
+     (let [options (gc_options opts)
+           root (dir)
+           listed (File/ls root)]
+       (cond
+         (erlang/not (and (erlang/is_tuple listed) (erlang/== :ok (erlang/element 1 listed))))
+         (cond
+           (and (erlang/is_tuple listed)
+                (erlang/== 2 (erlang/tuple_size listed))
+                (erlang/== :enoent (erlang/element 2 listed)))
+           (tup :ok '())
+           :else (tup :error (erlang/element 2 listed)))
+         :else
+         (let [entries (erlang/element 2 listed)
+               generations (Enum/sort_by
+                             (Enum/flat_map
+                               (Enum/reject
+                                 (Enum/filter entries (fn [n] (valid_compiler_key? n)))
+                                 (fn [n] (erlang/== n active_key)))
+                               (fn [n] (generation_info root n)))
+                             (fn [g] (Map/get g :mtime))
+                             :desc)
+               now (System/os_time :second)
+               keep (erlang/max (erlang/- (Keyword/get options :keep_generations) 1) 0)
+               age_limit (erlang/* (Keyword/get options :max_age_days) 86400)
+               candidates (Enum/take
+                            (Enum/sort_by
+                              (Enum/map
+                                (Enum/filter (Enum/with_index generations)
+                                  (fn [gi]
+                                    (or (erlang/>= (erlang/element 2 gi) keep)
+                                        (erlang/> (erlang/- now (Map/get (erlang/element 1 gi) :mtime))
+                                                  age_limit))))
+                                (fn [gi] (erlang/element 1 gi)))
+                              (fn [g] (Map/get g :mtime)))
+                            (Keyword/get options :max_delete))
+               deleted (Enum/flat_map candidates
+                         (fn [g]
+                           (let [rr (File/rm_rf (Map/get g :path))]
+                             (cond
+                               (and (erlang/is_tuple rr) (erlang/== :ok (erlang/element 1 rr)))
+                               (lst (Map/get g :name))
+                               :else '()))))]
+           (tup :ok deleted))))
+     (catch _e (tup :ok '())))))
+
+(defn reset_cleanup_throttle
+  "Drop the throttle slot so the next `store/4` sweeps again."
+  []
+  (persistent_term/erase (gc_last_sweep_pt)))
+
+(defn- maybe_cleanup_obsolete_generations
+  "Sweep obsolete generations, at most once per `:interval_ms`, serialized on a
+   global lock so parallel build workers share one sweep budget — a cold wave
+   cannot multiply `max_delete` by its worker count."
+  [active_key]
+  (global/trans (tup (gc_last_sweep_pt) (erlang/self))
+    (fn []
+      (let [options (gc_options '())
+            now (System/monotonic_time :millisecond)
+            root (dir)
+            last (persistent_term/get (gc_last_sweep_pt) nil)
+            due (cond
+                  (and (erlang/is_tuple last)
+                       (erlang/== 2 (erlang/tuple_size last))
+                       (erlang/== root (erlang/element 1 last)))
+                  (erlang/>= (erlang/- now (erlang/element 2 last))
+                             (Keyword/get options :interval_ms))
+                  :else true)]
+        (cond
+          due (do
+                (persistent_term/put (gc_last_sweep_pt) (tup root now))
+                (cleanup_obsolete_generations active_key options))
+          :else :ok))))
+  :ok)
+
+(defn- gc_options
+  "The merge of `@gc_defaults`, the application's `:aot_cache_gc` config and the
+   explicit overrides, with every value coerced to its positive/non-negative
+   integer shape."
+  [overrides]
+  (let [configured (Application/get_env :beam_lisp :aot_cache_gc '())
+        defaults (gc_defaults)
+        merged (Keyword/merge
+                 (Keyword/merge defaults (cond (Keyword/keyword? configured) configured :else '()))
+                 overrides)]
+    (lst (tup :keep_generations
+              (positive_integer (Keyword/get merged :keep_generations)
+                                (Keyword/get defaults :keep_generations)))
+         (tup :max_age_days
+              (positive_integer (Keyword/get merged :max_age_days)
+                                (Keyword/get defaults :max_age_days)))
+         (tup :max_delete
+              (positive_integer (Keyword/get merged :max_delete)
+                                (Keyword/get defaults :max_delete)))
+         (tup :interval_ms
+              (non_negative_integer (Keyword/get merged :interval_ms)
+                                    (Keyword/get defaults :interval_ms))))))
+
+(defn- gc_defaults
+  "`keep_generations: 8, max_age_days: 30, max_delete: 4, interval_ms: 3_600_000`."
+  []
+  (lst (tup :keep_generations 8)
+       (tup :max_age_days 30)
+       (tup :max_delete 4)
+       (tup :interval_ms 3600000)))
+
+(defn- positive_integer
+  "`value` when it is an integer > 0, else `default`."
+  [value default]
+  (cond
+    (and (erlang/is_integer value) (erlang/> value 0)) value
+    :else default))
+
+(defn- non_negative_integer
+  "`value` when it is an integer >= 0, else `default`."
+  [value default]
+  (cond
+    (and (erlang/is_integer value) (erlang/>= value 0)) value
+    :else default))
+
+(defn- valid_compiler_key?
+  "Whether `name` is a lowercase sha256 key — the only directory names cleanup
+   will consider."
+  [name]
+  (Regex/match? (Regex/compile! "\\A[0-9a-f]{64}\\z") name))
+
+(defn- generation_info
+  "A `[%{name: …, path: …, mtime: …}]` for `name` under `root` when it is a real
+   directory (mtime in POSIX seconds), else `[]`. Symlinks are deliberately not
+   directories here: `File.stat`-free `lstat` reports the LINK's type."
+  [root name]
+  (let [path (Path/join root name)
+        r (File/lstat path (lst (tup :time :posix)))]
+    (cond
+      (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+      (let [st (erlang/element 2 r)]
+        (cond
+          (erlang/== :directory (Map/get st :type))
+          (lst (Map/put (Map/put (Map/put (Map/new) :name name) :path path)
+                        :mtime (Map/get st :mtime)))
+          :else '()))
+      :else '())))
+
+; ── internals ──────────────────────────────────────────────────────────────
+
+(defn run_init_modules
+  "Reproduce a fresh compile's runtime side effects for a cache hit. Compiling a
+   source evaluates its forms, which interns value defs into the live VM's
+   `BeamLisp.Env`; a fetch links beams without evaluating, so same-VM consumers
+   see `undefined var` unless the namespace's init runs. `__bl_init__/0` lives
+   on the namespace SHIM module; match on the export, not the name. Idempotent
+   per the AOT contract."
+  [modules compile_path]
+  (Enum/each modules (fn [mod] (ensure_module_loaded mod compile_path)))
+  (Enum/each
+    (Enum/filter modules (fn [mod] (erlang/function_exported mod :__bl_init__ 0)))
+    (fn [mod] (erlang/apply mod :__bl_init__ '())))
+  :ok)
+
+(defn- ensure_module_loaded
+  "Load `mod` from `compile_path` when the code server does not already have it,
+   so a fetched beam is the live code."
+  [mod compile_path]
+  (let [loaded (Code/ensure_loaded mod)]
+    (cond
+      (and (erlang/is_tuple loaded)
+           (erlang/== 2 (erlang/tuple_size loaded))
+           (erlang/== :module (erlang/element 1 loaded)))
+      (tup :module mod)
+      :else
+      (let [beam (Path/join compile_path (beam_file mod))
+            r (File/read beam)]
+        (cond
+          (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+          (code/load_binary mod (erlang/binary_to_list beam) (erlang/element 2 r))
+          :else nil)))))
+
+(defn- entry_dir
+  "The directory an entry lives in: `<dir>/<compiler-key>/<closure-key>`, with
+   both keys refused unless they are safe path components and the generation
+   refused if it is a symlink."
+  [compiler_key closure_key]
+  (let [keys (lst compiler_key closure_key)
+        safe? (Regex/compile! "\\A[A-Za-z0-9_-]+\\z")]
+    (cond
+      (erlang/not (and (Enum/all? keys (fn [k] (erlang/is_binary k)))
+                       (Enum/all? keys (fn [k] (and (erlang/is_binary k)
+                                                    (Regex/match? safe? k))))))
+      (erlang/error (Elixir.ArgumentError/exception "cache keys must be safe path components"))
+      :else
+      (let [generation (Path/join (dir) compiler_key)
+            r (File/lstat generation)]
+        (cond
+          (and (erlang/is_tuple r)
+               (erlang/== :ok (erlang/element 1 r))
+               (erlang/== :symlink (Map/get (erlang/element 2 r) :type)))
+          (erlang/error (Elixir.ArgumentError/exception "cache generation cannot be a symlink"))
+          :else (Path/join generation closure_key))))))
+
+(defn- beam_file
+  "The beam filename for a module atom."
+  [mod]
+  (bcat (erlang/atom_to_binary mod :utf8) ".beam"))
+
+(defn- link_beams
+  "Hardlink every beam from `entry` into `compile_path` (a real copy across
+   filesystems), or `:error` the moment one is missing or fails. `reduce_while`
+   makes the first failure terminal, as the recalled `Enum.reduce_while` did."
+  [entry compile_path modules]
+  (File/mkdir_p! compile_path)
+  (Enum/reduce_while modules :ok
+    (fn [mod acc]
+      (let [src (Path/join entry (beam_file mod))
+            dst (Path/join compile_path (beam_file mod))]
+        (cond
+          (erlang/not (File/exists? src)) (tup :halt :error)
+          :else
+          (do
+            (File/rm dst)
+            (cond
+              (erlang/== :ok (File/ln src dst)) (tup :cont :ok)
+              :else (tup :cont (copy src dst)))))))))
+
+(defn- copy
+  "A real copy of `src` to `dst`, `:ok` or `:error`."
+  [src dst]
+  (cond
+    (erlang/== :ok (File/cp src dst)) :ok
+    :else :error))
+
+(defn- hash_parts
+  "sha256 over the parts joined by a NUL byte, lowercase hex — the one hashing
+   rule every key here uses."
+  [parts]
+  (Base/encode16
+    (crypto/hash :sha256 (IO/iodata_to_binary (Enum/intersperse parts 0)))
+    (lst (tup :case :lower))))

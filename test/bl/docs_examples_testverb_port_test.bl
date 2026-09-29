@@ -1,0 +1,427 @@
+; test/bl/docs_examples_testverb_port_test.bl — the executable-doc and
+; `bl test` contracts, ported from three ExUnit suites:
+;
+;   test/beam_lisp/document_policy_test.exs  → the `doc-policy-*` tests
+;   test/beam_lisp/examples_test.exs         → the `examples-*` tests
+;   test/beam_lisp/test_verb_test.exs        → the `test-verb-*` tests
+;
+; The three suites pin behavior that lives BELOW the runner (document policy,
+; the example runner's discovery/skip/failure verdicts) and the runner's own
+; CLI surface (file selection, the JSON aggregate, exit codes). The ExUnit
+; suites drove `bl test` from a plain ExUnit VM because the isolated runner is
+; not reentrant on itself; here the CLI is called from inside a ward fork and
+; each call spawns its OWN worker forks, so nesting is a second independent
+; run, not a re-entry. Every case uses a scratch tree — no real document,
+; example or fixture is ever rewritten.
+;
+; Run: bl test test/bl/docs_examples_testverb_port_test.bl
+(ns docs.examples.testverb-port-test
+  (:require [bl.cli :as cli]
+            [bl.doc :as doc]
+            [bl.examples :as ex]
+            [bl.json :as json]
+            [vm.session :as session]
+            [vm.paths :as paths]))
+
+; ── helpers ────────────────────────────────────────────────────────────
+
+(defn- scratch-root []
+  (str (System/tmp_dir!) "/bl_doc_examples_"
+       (erlang/unique_integer (list :positive))))
+
+(defn- with-scratch [f]
+  (let [root (scratch-root)]
+    (try (do (File/mkdir_p! root) (f root))
+         (finally (File/rm_rf! root)))))
+
+(defn- write! [root rel text]
+  (let [p (str root "/" rel)]
+    (File/mkdir_p! (Path/dirname p))
+    (File/write! p text)
+    p))
+
+(defn- capture
+  "Run `f` with this process's group leader on a StringIO, so the command's
+   stdout is a value here. Returns a two-element list of the return value and
+   the captured output; restores the leader in a finally."
+  [f]
+  (let [prev (Process/group_leader)
+        dev (erlang/element 2 (StringIO/open ""))]
+    (Process/group_leader (erlang/self) dev)
+    (let [r (try (f) (finally (Process/group_leader (erlang/self) prev)))]
+      (list r (erlang/element 2 (StringIO/contents dev))))))
+
+(defn- run-in
+  "The CLI, cold: cwd bound the way a daemon request binds its client's."
+  [dir argv]
+  (BeamLisp/with_cwd dir (fn [] (capture (fn [] (cli/run-argv (to-list argv)))))))
+
+(defn- last-json-line [out]
+  (last (filter (fn [l] (not= "" (trim l))) (split out "\n"))))
+
+; ══════════════════════════════════════════════════════════════════════
+; document policy  (document_policy_test.exs)
+;
+; A non-trusted policy refuses a SILENT cell that would write, BEFORE any cell
+; runs: the marker is never created and the document is never rewritten. Only
+; `:trusted` executes.
+; ══════════════════════════════════════════════════════════════════════
+
+(defn- doc-source [marker]
+  (join "\n"
+        (list "#+begin_src beam-lisp :id effect silent"
+              (str "(File/write " (pr-str marker) " \"ran\")")
+              "#+end_src"
+              "")))
+
+(deftest doc-policy-non-trusted-refuses-without-writing
+  (with-scratch
+    (fn [root]
+      (let [marker (str root "/executed")
+            path (str root "/change.bl.org")
+            source (doc-source marker)]
+        (File/write! path source)
+        (is (not (File/exists? marker)) "precondition: the effect has not run")
+        (doseq [policy (list :read_only :changes_only :unknown)]
+          (is (try (do (doc/run-and-write! path {:policy policy}) false)
+                   (catch BeamLisp.ExInfo e
+                     (includes? (str (ex-message e)) "denied by policy"))
+                   (catch e false))
+              (str "policy " policy " refuses with a typed, named denial"))
+          (is (not (File/exists? marker))
+              (str "policy " policy ": the silent cell never wrote"))
+          (is (= source (File/read! path))
+              (str "policy " policy ": the document was left untouched")))
+        (is (not (File/exists? marker)) "no refusal leaked a write")))))
+
+(deftest doc-policy-trusted-runs-the-cell
+  (with-scratch
+    (fn [root]
+      (let [marker (str root "/executed")
+            path (str root "/change.bl.org")]
+        (File/write! path (doc-source marker))
+        (doc/run-and-write! path {:policy :trusted})
+        (is (File/exists? marker) "the trusted run executed the cell")
+        (is (= "ran" (File/read! marker)))))))
+
+; ══════════════════════════════════════════════════════════════════════
+; examples  (examples_test.exs)
+;
+; `bl examples` hands files to ward's isolated, timed, dep-aware runner. These
+; pin discovery (one glob, every file, one order), the two non-failure verdicts
+; (a passing example, an optional-dep SKIP) and the one failure verdict (any
+; other error), and the command's exit/JSON contract. Scratch copies only.
+; ══════════════════════════════════════════════════════════════════════
+
+(deftest examples-discovery-expands-globs-sorted-and-unique
+  (with-scratch
+    (fn [root]
+      (File/mkdir_p! (str root "/sub"))
+      (File/write! (str root "/b.bl") "(println :b)\n")
+      (File/write! (str root "/sub/a.bl") "(println :a)\n")
+      (is (= [(str root "/b.bl") (str root "/sub/a.bl")]
+             (into [] (ex/match-paths (list (str root "/**/*.bl")))))
+          "one glob, every file, in one order")
+      (is (= [(str root "/b.bl")]
+             (into [] (ex/match-paths (list (str root "/b.bl") (str root "/b.bl")))))
+          "the same file named twice is selected once")
+      (is (= [] (into [] (ex/match-paths (list (str root "/nothing/*.bl")))))))))
+
+(deftest examples-pass-skip-and-failure-are-distinguished
+  (with-scratch
+    (fn [root]
+      (File/write! (str root "/ok.bl") "(println :hi)\n")
+      ; An absent OPTIONAL dependency is an environment fact, not a defect: the
+      ; runner classifies the error by its message and SKIPS the example.
+      (File/write! (str root "/skip.bl") "(throw (ex-info \"module Bandit\" {}))\n")
+      (File/write! (str root "/bad.bl") "(throw (ex-info \"boom\" {}))\n")
+      (let [d (ex/analyze (ex/match-paths (list (str root "/*.bl"))))
+            st (reduce (fn [m r] (assoc m (:path r) (:status r))) {} (:files d))]
+        (is (= 1 (:passed d)))
+        (is (= 1 (:skipped d)))
+        (is (= 1 (:failed d)))
+        (is (not (:ok d)) "a real failure is not green")
+        (is (= :passed (get st (str root "/ok.bl"))))
+        (is (= :skipped (get st (str root "/skip.bl")))
+            "an optional-dep error skips, it does not fail")
+        (is (= :failed (get st (str root "/bad.bl"))))))))
+
+(deftest examples-a-trivial-example-passes-and-a-throw-fails-the-run
+  (with-scratch
+    (fn [root]
+      (let [p (write! root "only.bl" "(println :hi)\n")
+            d (ex/analyze (list p))]
+        (is (= 1 (:passed d)))
+        (is (= 0 (:failed d)))
+        (is (:ok d) "one passing example is a green run"))
+      (let [p (write! root "bad.bl" "(throw (ex-info \"boom\" {}))\n")
+            d (ex/analyze (list p))]
+        (is (= 1 (:failed d)))
+        (is (not (:ok d)))))))
+
+(deftest examples-run-exits-per-the-verdict-and-emits-one-json-object
+  (with-scratch
+    (fn [root]
+      (File/write! (str root "/ok.bl") "(println :hi)\n")
+      (let [[code out] (capture (fn []
+                                  (ex/run (list (str root "/*.bl"))
+                                          (cli/parse-argv (list "examples" "--json")))))]
+        (is (= 0 code) "a green example exits 0")
+        (is (includes? out "\"passed\":1") "the JSON names the totals")
+        (is (includes? out "\"ok\":true")))
+      (File/write! (str root "/bad.bl") "(throw (ex-info \"boom\" {}))\n")
+      (is (= 1 (first (capture (fn []
+                                 (ex/run (list (str root "/*.bl"))
+                                         (cli/parse-argv (list "examples" "--json")))))))
+          "a failing example exits 1")
+      (is (= 2 (first (capture (fn []
+                                 (ex/run (list (str root "/none/*.bl"))
+                                         (cli/parse-argv (list "examples")))))))
+          "an empty selection is a typo, not a green run over nothing"))))
+
+; ══════════════════════════════════════════════════════════════════════
+; `bl test`  (test_verb_test.exs)
+;
+; Selection, isolation, containment, the literate/shebang reads, the shared
+; escape, the JSON aggregate, the warm-daemon path and the test-library guards.
+; All driven through the real CLI on scratch trees.
+; ══════════════════════════════════════════════════════════════════════
+
+(deftest test-verb-a-passing-suite-is-green
+  (with-scratch
+    (fn [dir]
+      (write! dir "test/ok_test.bl" "(ns ok-test)\n(deftest fine (is (= 4 (* 2 2))))\n")
+      (let [[code out] (run-in dir (list "test"))]
+        (is (= 0 code))
+        (is (includes? out "ok-test"))
+        (is (includes? out "1 passed"))))))
+
+(deftest test-verb-a-failing-test-fails-the-run-with-the-why
+  (with-scratch
+    (fn [dir]
+      (write! dir "test/bad_test.bl" "(ns bad-test)\n(deftest wrong (is (= 1 2)))\n")
+      (let [[code out] (run-in dir (list "test"))]
+        (is (= 1 code))
+        (is (includes? out "wrong"))
+        (is (includes? out "expected"))))))
+
+(deftest test-verb-a-file-that-crashes-at-load-is-contained
+  (with-scratch
+    (fn [dir]
+      (write! dir "test/explodes_test.bl"
+              (join "\n" (list "(ns explodes-test)"
+                               "(throw \"kaboom at load\")"
+                               "(deftest never (is true))"
+                               "")))
+      (write! dir "test/after_test.bl" "(ns after-test)\n(deftest runs (is true))\n")
+      (let [[code out] (run-in dir (list "test"))]
+        (is (= 1 code) "the run is not green")
+        (is (includes? out "INCOHERENT"))
+        (is (includes? out "after-test") "and the sibling still ran")))))
+
+(deftest test-verb-files-cannot-see-each-others-world
+  (with-scratch
+    (fn [dir]
+      (write! dir "test/definer_test.bl"
+              (join "\n" (list "(ns definer-test)"
+                               "(def secret 42)"
+                               "(deftest ok (is (= 42 secret)))"
+                               "")))
+      (write! dir "test/peeker_test.bl"
+              (join "\n" (list "(ns peeker-test)"
+                               "(deftest cannot-see"
+                               "  (is (= :isolated (try (BeamLisp.Env/fetch! \"definer-test\" \"secret\")"
+                               "                        (catch _ :isolated)))))"
+                               "")))
+      (let [[code out] (run-in dir (list "test"))]
+        (is (= 0 code))
+        (is (includes? out "2 file(s) passed"))))))
+
+(deftest test-verb-the-shared-escape-runs-the-files-not-every-suite
+  (with-scratch
+    (fn [dir]
+      (write! dir "test/plain_test.bl" "(ns plain-test)\n(deftest fine (is (= 1 1)))\n")
+      (let [[c1 o1] (run-in dir (list "test" "--shared"))
+            [c2 o2] (run-in dir (list "test" "--shared"))]
+        (is (= 0 c1) (str "the shared run must be green; it said:\n" o1))
+        (is (= 0 c2) (str "the second shared run must be green; it said:\n" o2))
+        (is (includes? o1 "Ran 1 tests")
+            "the shared run answers with the files it named, not every suite this image ran")
+        (is (includes? o2 "Ran 1 tests")
+            "and the second run does not answer with the first run's tests")))))
+
+(deftest test-verb-the-aggregate-is-available-as-json
+  (with-scratch
+    (fn [dir]
+      (write! dir "test/one_test.bl" "(ns one-test)\n(deftest a (is true))\n")
+      (let [[code out] (run-in dir (list "test" "--json"))
+            d (json/decode (last-json-line out))]
+        (is (= 0 code) (str "the suite must be green; it said:\n" out))
+        (is (= 1 (get d "pass")))
+        (is (= 0 (get d "fail")))
+        (is (= 0 (get d "error")))
+        (is (= 1 (get d "files")))))))
+
+(deftest test-verb-a-test-library-that-vanished-from-cores-module-is-reloaded
+  (with-scratch
+    (fn [dir]
+      (write! dir "test/rel_test.bl" "(ns rel-test)\n(deftest a (is (= 1 1)))\n")
+      ; The observed failure state: a later reload puts core back from its BEAM
+      ; (core.bl alone), so the assertion runtime `is` expands into is gone from
+      ; the module while `deftest` still resolves in core's ENV. ward's guard
+      ; checked the env alone, said "available", skipped the load, and every
+      ; file in the run died on `is-report/4 is undefined`.
+      (let [core (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Core")
+            _p (erlang/apply :code :purge (list core))
+            _d (erlang/apply :code :delete (list core))
+            _l (erlang/apply :code :load_file (list core))
+            ; compute BEFORE any `is` runs: once is-report/4 is gone from the
+            ; module, an `is` would itself be the failure it is testing for.
+            gone (not (erlang/function_exported core :is-report 4))
+            [code out] (run-in dir (list "test"))]
+        (is gone "precondition: the beam carries core.bl alone")
+        (is (= 0 code) (str "a run in this state must still work; it said:\n" out))))))
+
+; ── how a test file is READ ──
+
+(def ^:private literate-md
+  (join "\n"
+        (list
+         "# A literate test"
+         ""
+         "This prose is not code. `(ns prose-decoy)` is a sentence here, and so is"
+         "`(deftest prose-decoy (is false))`."
+         ""
+         "```beam-lisp"
+         "(ns doc-test)"
+         "```"
+         ""
+         "A cell that passes:"
+         ""
+         "```beam-lisp"
+         "(deftest lit-passes (is (= 2 (+ 1 1))))"
+         "```"
+         ""
+         "A fence in another language is not this file's program:"
+         ""
+         "```clojure"
+         "(deftest wrong-language (is false))"
+         "```"
+         "")))
+
+(def ^:private literate-org
+  (join "\n"
+        (list
+         "#+TITLE: A literate org test"
+         ""
+         "The prose here is not code; (ns prose-decoy) is a sentence."
+         ""
+         "#+begin_src beam-lisp"
+         "(ns org-test)"
+         "#+end_src"
+         ""
+         "#+begin_src beam-lisp"
+         "(deftest org-fails (is (= 1 2)))"
+         "#+end_src"
+         "")))
+
+(deftest test-verb-a-literate-md-test-runs-its-code-cells-not-its-prose
+  (with-scratch
+    (fn [dir]
+      (write! dir "test/doc_test.bl.md" literate-md)
+      ; The read the runner uses, asserted at the seam: the cells are the
+      ; program, the prose (and a fence in another language) is not.
+      (let [src (BeamLisp.Loader/read_source (str dir "/test/doc_test.bl.md"))]
+        (is (includes? src "(ns doc-test)"))
+        (is (not (includes? src "prose-decoy")))
+        (is (not (includes? src "wrong-language"))))
+      (let [[code out] (run-in dir (list "test" "test/doc_test.bl.md"))]
+        (is (= 0 code) (str "a literate file must run; it said:\n" out))
+        (is (includes? out "doc-test") "the ns comes from the cells")
+        (is (includes? out "1 passed") "one test: the one the cells declare")
+        (is (not (includes? out "prose-decoy")) "prose is not code")
+        (is (not (includes? out "wrong-language"))
+            "nor is a fence in another language")))))
+
+(deftest test-verb-a-literate-org-test-is-red-on-its-code-with-the-why
+  (with-scratch
+    (fn [dir]
+      (write! dir "test/org_test.bl.org" literate-org)
+      (let [[code out] (run-in dir (list "test" "test/org_test.bl.org"))]
+        (is (= 1 code) (str "the failing cell makes the run red; it said:\n" out))
+        (is (includes? out "org-test") "the ns comes from the cells")
+        (is (includes? out "org-fails") "the failing test is named")
+        (is (includes? out "expected:") "and the why is reported, not a prose crash")
+        (is (includes? out "actual:"))
+        (is (not (includes? out "prose-decoy")))))))
+
+(deftest test-verb-a-shebanged-script-is-a-test-file
+  (with-scratch
+    (fn [dir]
+      (write! dir "test/script_test.bl"
+              "#!/usr/bin/env bl\n(ns script-test)\n(deftest a (is true))\n")
+      (let [[code out] (run-in dir (list "test" "test/script_test.bl"))]
+        (is (= 0 code) (str "an executable test script must run; it said:\n" out))
+        (is (includes? out "script-test"))
+        (is (includes? out "1 passed"))))))
+
+(deftest test-verb-a-literate-file-runs-the-same-under-shared-and-async
+  (with-scratch
+    (fn [dir]
+      (write! dir "test/doc_test.bl.md" literate-md)
+      (doseq [mode (list "--shared" "--async")]
+        (let [[code out] (run-in dir (list "test" "test/doc_test.bl.md" mode))]
+          (is (= 0 code) (str mode " must run the literate file; it said:\n" out))
+          (is (includes? out "Ran 1 tests")
+              (str mode " runs the one test the cells declare"))
+          (is (not (includes? out "prose-decoy"))
+              (str mode " reads the cells, not the prose")))))))
+
+; ── the warm daemon path ──
+;
+; The daemon serves `bl test` like any other command: ward's forks happen INSIDE
+; one request, so the warm image is shared and each file still gets its own env.
+; Speak the SAME AF_UNIX wire a real client speaks — raw ETF frames.
+
+(defn- daemon-run
+  "Start a pure-beam-lisp daemon on `root`, run `argv` with the client's cwd
+   `cwd`, return `{:outs [...] :code n}`, then stop the daemon."
+  [root argv cwd]
+  (let [listener (:ok (session/start root))
+        _ (erlang/apply :timer :sleep (list 200))
+        ep (:ok (paths/endpoints root))
+        charlist (erlang/binary_to_list (:sock ep))
+        token (File/read! (:token ep))
+        conn (elem (gen_tcp/connect (tuple :local charlist) 0
+                                    (list (tuple :inet_backend :inet) :local :binary
+                                          (tuple :packet 4) (tuple :active false)))
+                   1)]
+    (gen_tcp/send conn (erlang/apply :erlang :term_to_binary
+                                     (list (tuple :bl 1 :hello
+                                                  {:tree (paths/fingerprint root) :token token}))))
+    (gen_tcp/recv conn 0 5000)
+    (let [id (erlang/apply :crypto :strong_rand_bytes (list 16))]
+      (gen_tcp/send conn (erlang/apply :erlang :term_to_binary
+                                       (list (tuple :bl 1 :request id
+                                                    {:argv argv :cwd cwd :env {}}))))
+      (let [r (loop [outs [] code nil]
+                (let [rr (gen_tcp/recv conn 0 120000)]
+                  (if (not= :ok (elem rr 0))
+                    {:outs outs :code code}
+                    (let [f (erlang/apply :erlang :binary_to_term (list (elem rr 1)))
+                          tag (elem f 2)]
+                      (cond
+                        (= tag :stdout) (recur (conj outs (elem f 5)) code)
+                        (= tag :exit) {:outs outs :code (elem f 4)}
+                        :else (recur outs code))))))]
+        (gen_tcp/close conn)
+        (session/stop listener)
+        r))))
+
+(deftest test-verb-a-warm-suite-runs-through-the-daemon
+  (with-scratch
+    (fn [dir]
+      (write! dir "test/warm_test.bl" "(ns warm-test)\n(deftest warm (is true))\n")
+      (let [r (daemon-run (File/cwd!) (list "test") dir)]
+        (is (= 0 (:code r)))
+        (is (some (fn [o] (if (includes? o "warm-test") o nil)) (:outs r)))))))

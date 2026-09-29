@@ -14,7 +14,7 @@ This is a literate Beam Lisp program. Its `beam-lisp` blocks run top to bottom.
 From the repository root, with a working build:
 
 ```sh
-mix run -e '"docs/memory-policy/07-streaming-without-the-heap.bl.md" |> BeamLisp.Loader.read_source() |> BeamLisp.eval()'
+bin/bl run docs/memory-policy/07-streaming-without-the-heap.bl.md
 ```
 
 ```beam-lisp
@@ -115,15 +115,19 @@ Two independent things improve, and they are separate promises.
 
 **Memory.** A consumer that folds a million-element list holds the whole list;
 a consumer that folds the same input through a cursor holds one chunk. Measured
-in `scripts/memocell_prototypes.exs`: **15.81 MB versus about 0.02 MB** — the
-consumer's heap is roughly three orders of magnitude smaller.
+in `bench/memocell_bench.bl` (its `E` line): **about 27 MB versus about 0.02
+MB** — the consumer's heap is roughly three orders of magnitude smaller.
 
 **Speed.** Pulling a chunk on the cheap crossing versus the safe-but-slow one,
-measured in `scripts/memocell_cas_breakdown.exs`: **about 1.15 microseconds
-versus about 16.8 microseconds per chunk** — a fourteen-fold difference. Before
-this, the memory was already saved but every chunk paid the detour; now the
-off-heap walk is cheap enough to be the default for any finite input past the
-chunk size, not a special case you opt into.
+measured in the same bench (`cursor_chunk_FAST` against
+`cursor_chunk_DIRTY`): **a thirteen-to-sixteen-fold difference per chunk**. The
+memory was already saved without the cheap crossing; it is what makes the
+off-heap walk the default for any finite input past the chunk size, not a
+special case you opt into.
+
+Every number above is printed by the bench, so rebuild it on your machine with
+`bin/bl run bench/memocell_bench.bl`. The ratio is the durable part — a busy
+machine inflates both sides together.
 
 ```beam-lisp
 (println "Streaming: all checks passed")
@@ -148,7 +152,7 @@ Streaming: all checks passed
 
 ## Keep exploring
 
-- `lib/beam_lisp/seq_cursor.ex` — the chunk adapter that keeps one chunk on the
+- `priv/host/seq_cursor.bl` — the chunk adapter that keeps one chunk on the
   heap and threads the lane decision.
 - `native/lazy_memo/src/lib.rs` — `cursor`, `cursor_chunk`, and the
   `dirty_chunks` decision made once at creation.

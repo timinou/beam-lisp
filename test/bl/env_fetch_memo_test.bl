@@ -1,0 +1,121 @@
+; env_fetch_memo_test.bl — the epoch + per-process memo on `Env.fetch/2`
+; (blueprint FUP-019). Ported from test/beam_lisp/env_fetch_memo_test.exs.
+;
+; Every var deref used to be a raw `:ets.lookup`, and an ETS read copies the
+; term into the caller's heap: a loop referencing a `(def big …)` of 20k
+; elements paid ~40 µs per deref (807 ms for 20k iterations vs 1 ms for a
+; let-bound local). The memo makes a repeat deref a pdict read + an atomics
+; read; every mutation path (`put_key/2`, `delete_key/1`, `destroy/1`,
+; `match_delete_own/1`) bumps a global epoch that invalidates it.
+;
+; These tests pin the two properties that make the memo SAFE — invalidation on
+; write and isolation across env chains — plus the one that makes it WORTHWHILE
+; — a hot deref stops copying. An ExUnit test process carried no env binding,
+; so its `intern` landed at `:global`; each body here is wedged in `at-global`
+; to keep that binding.
+;
+; Run: bin/bl test test/bl/env_fetch_memo_test.bl
+;
+; ── MAP: env_fetch_memo_test.exs → here (4 tests, 12 assertions) ──────────
+;   a re-interned var is visible on the very next fetch (epoch invalidation)
+;     → a-re-interned-var-is-visible-on-the-very-next-fetch
+;   an undefined var is gone on the very next fetch
+;     → an-undefined-var-is-gone-on-the-very-next-fetch
+;   the memo is keyed by env chain: a fork's shadow never leaks to global
+;     → the-memo-is-keyed-by-env-chain-so-a-forks-shadow-never-leaks
+;   a hot deref of a large var stops paying the ETS copy
+;     → a-hot-deref-of-a-large-var-stops-paying-the-ets-copy
+;
+; NB the last one is a RATIO here, not the ExUnit absolute ceiling — see the
+; comment on the test for why (the beam-lisp loop's own per-iteration cost is
+; comparable to that ceiling, so the loop would be measured, not the memo).
+
+(ns env-fetch-memo.test)
+
+(defn- at-global
+  "Run `f` bound at the `:global` env — the binding an ExUnit test process
+   implicitly had."
+  [f]
+  (BeamLisp.Env/with_env :global (fn [] (f))))
+
+(deftest a-re-interned-var-is-visible-on-the-very-next-fetch
+  (at-global
+    (fn []
+      (BeamLisp.Env/intern "memo.t" "v" :one)
+      (is (= (tuple :ok :one) (BeamLisp.Env/fetch "memo.t" "v")))
+      ; Second fetch is served by the memo; the re-intern must still win.
+      (is (= (tuple :ok :one) (BeamLisp.Env/fetch "memo.t" "v")))
+      (BeamLisp.Env/intern "memo.t" "v" :two)
+      (is (= (tuple :ok :two) (BeamLisp.Env/fetch "memo.t" "v"))
+          "the epoch bumped by the re-intern invalidated the memo"))))
+
+(deftest an-undefined-var-is-gone-on-the-very-next-fetch
+  (at-global
+    (fn []
+      (BeamLisp.Env/intern "memo.t" "doomed" :here)
+      (is (= (tuple :ok :here) (BeamLisp.Env/fetch "memo.t" "doomed")))
+      (BeamLisp.Env/undefine_var "memo.t" "doomed")
+      (is (= :error (BeamLisp.Env/fetch "memo.t" "doomed"))
+          "the delete bumped the epoch and the memo refetched"))))
+
+(deftest the-memo-is-keyed-by-env-chain-so-a-forks-shadow-never-leaks
+  (at-global
+    (fn []
+      (BeamLisp.Env/intern "memo.t" "chained" :global_value)
+      (is (= (tuple :ok :global_value) (BeamLisp.Env/fetch "memo.t" "chained")))
+      (let [fork (BeamLisp.Env/fork)]
+        (BeamLisp.Env/with_env fork
+          (fn []
+            (is (= (tuple :ok :global_value)
+                   (BeamLisp.Env/fetch "memo.t" "chained"))
+                "the fork reads through to the base")
+            (BeamLisp.Env/intern "memo.t" "chained" :shadowed)
+            (is (= (tuple :ok :shadowed)
+                   (BeamLisp.Env/fetch "memo.t" "chained")))
+            ; memo hit inside the fork
+            (is (= (tuple :ok :shadowed)
+                   (BeamLisp.Env/fetch "memo.t" "chained")))))
+        ; Back at the base the memo entry for THIS chain still says
+        ; :global_value, and the fork's write never touched it.
+        (is (= (tuple :ok :global_value)
+               (BeamLisp.Env/fetch "memo.t" "chained"))
+            "the fork's shadow never leaked to the base")
+        (BeamLisp.Env/destroy fork)))))
+
+(defn- best-us
+  "Best-of-`n` wall time of `f`, in microseconds: the MINIMUM, so one noisy or
+   GC-paused run cannot inflate the measurement."
+  [n f]
+  (reduce (fn [a b] (if (< a b) a b))
+          (map (fn [_]
+                 (let [t0 (erlang/monotonic_time :microsecond)]
+                   (f)
+                   (- (erlang/monotonic_time :microsecond) t0)))
+               (range n))))
+
+(deftest a-hot-deref-of-a-large-var-stops-paying-the-ets-copy
+  ; The ExUnit original pinned an ABSOLUTE bound (~100 ms for 20k derefs) on
+  ; the Elixir reference host. A ward body runs the same loop through the
+  ; beam-lisp `doseq` expander, whose own per-iteration cost already brushes
+  ; that bound, so an absolute ceiling would measure the loop, not the memo.
+  ; The property is relative anyway — a repeat deref copies NOTHING — so it is
+  ; pinned against the SMALL-var control: with the memo, a 20k-element list
+  ; derefs for the same cost as an integer. A memo-less build copies 20k cons
+  ; cells per iteration (≈10x the control here); 4x leaves room for a noisy
+  ; host while no copied deref can pass.
+  (at-global
+    (fn []
+      (let [big (Enum/to_list (range 20000))
+            derefs (fn [name]
+                     (fn []
+                       (doseq [_ (range 20000)]
+                         (BeamLisp.Env/fetch! "memo.t" name))))]
+        (BeamLisp.Env/intern "memo.t" "big" big)
+        (BeamLisp.Env/intern "memo.t" "tiny" 1)
+        ; Warm the memo.
+        (is (= (tuple :ok big) (BeamLisp.Env/fetch "memo.t" "big")))
+        (let [big-us (best-us 5 (derefs "big"))
+              tiny-us (best-us 5 (derefs "tiny"))]
+          (is (< big-us (* 4 tiny-us))
+              (str "20k derefs: big " big-us "µs vs tiny " tiny-us
+                   "µs — the memo is not holding")))))))

@@ -1,22 +1,36 @@
 # P13d — SMT-verified deodorant rules: findings
 
-Run: `elixir research/p13d_rule_proofs/rules.exs` (requires z3 on PATH)
+Run: `bin/bl run research/p13d_rule_proofs/rules.bl` (uses the repo's pinned z3, `priv/z3/bin/z3`)
 
 ## Results
 
-| rule | verdict | ms |
-|---|---|---|
-| `(if p true false) → (boolean p)` | PROVEN ∀p | 7 |
-| `(not (nil? x)) → (some? x)` | PROVEN ∀x | 5 |
-| `(= x 0) → (zero? x)` | COUNTEREXAMPLE: `tag_x=3` (a string) | 4 |
-| same, under discharged `x : int` | PROVEN — auto-promoted to SAFE | 2 |
-| `(= x 1) → (zero? x)` (broken on purpose) | COUNTEREXAMPLE (`tag_x=5`: raise asymmetry) | 3 |
+| rule | verdict |
+|---|---|
+| `(if p true false) → (boolean p)` | PROVEN ∀p |
+| `(not (nil? x)) → (some? x)` | PROVEN ∀x |
+| `(= x 0) → (zero? x)` | COUNTEREXAMPLE: `tag_x=3` (a string) |
+| same, under discharged `x : int` | PROVEN — auto-promoted to SAFE |
+| `(= x 1) → (zero? x)` (broken on purpose) | COUNTEREXAMPLE (`tag_x=5`: raise asymmetry) |
+
+`rules.bl` prints a per-rule millisecond figure beside each verdict; it tracks
+machine load, not solver behavior.
+
+## Porting note
+
+`rules.bl` builds the negated-soundness assertion itself and drives the pinned
+solver through `BeamLisp.Z3Port`. It does not use `z3/prove-equiv`: that function
+renders each term separately with `smt/emit` and then embeds the resulting TEXT
+into a form, so `smt/emit` quotes it — z3 is asked `(= "p" "(ite p true false)")`
+and compares the strings, not the terms. Identical sides then "prove" and
+differing sides "refute", whatever they mean. Verified against the pinned
+solver; the fix belongs in `priv/lib/z3.bl`, a shared file this port does not
+touch.
 
 ## Answers
 
 **(a) Can the solver PROVE safe rules?** Yes — soundness is encoded as
 "same result AND same raised-ness for all inputs"; asserting its negation
-and getting `unsat` is a proof. Single-digit milliseconds per rule.
+and getting `unsat` is a proof. Milliseconds per rule.
 
 **(b) Can it DERIVE an idiomatic rule's assumption?** Yes, and this is
 the demo that matters: the counterexample to `(= x 0) → (zero? x)` is
@@ -33,7 +47,7 @@ counterexample; pinning `tag_x = int` would surface the value-level one,
 `x = 1`. A rule can be unsound for several independent reasons — the
 verifier should enumerate counterexamples until unsat, not stop at one.)
 
-## Protocol lessons (for the future smt library)
+## Protocol lessons (they inform priv/lib/z3.bl)
 
 1. `(reset)` before every independent query — a persistent solver
    accumulates declarations; query 3 collided with query 2's consts.

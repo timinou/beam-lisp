@@ -1,0 +1,682 @@
+; memo_bounds_sunset_port_test.bl — three ExUnit suites in one BL file, in this
+; order:
+;
+;   §1 the NATIVE MEMO's GC/ownership contracts — the force state machine's
+;      cell-level behaviour, the two scheduler lanes chosen by measured size,
+;      cursor chunking, immutable finite inputs, budget admission and the
+;      native library's repeated real unload.
+;      (test/beam_lisp/lazy_memo_native_test.exs, 18 tests / 71 assertions)
+;
+;   §2 per-env RESOURCE BOUNDS — a forked env's `:max_heap_words` narrows
+;      monotonically (a child never exceeds its parent) and the unbounded
+;      default is unchanged for futures.
+;      (test/beam_lisp/resource_bounds_test.exs, all 3 tests)
+;
+;   §3 the SUNSET / SOURCE-INVENTORY gate, updated for the zero-Elixir-source
+;      end state: no sunset module may be re-defined in ANY repository Elixir
+;      source (not only under lib/), no workaround-ecosystem token may return
+;      to the daemon source, the production tree may only carry the pinned
+;      not-yet-removed substrate, no authored Elixir source may appear outside
+;      the two in-flight roots, and the repository inventory may not grow.
+;      (test/beam_lisp/sunset_gate_test.exs, 2 tests, extended)
+;
+; A bounded future installs a hard OTP heap limit. It unlinks from its caller
+; before allocating, so a heap kill terminates only the task. This case used
+; to fail: `kill: false` warned but did not stop allocation on OTP 29.
+;
+; ── coverage map (§1), ExUnit test → BL deftest, in order ─────────────────
+;
+;   "CAS compares exactly and notifies only a committed transition"
+;       → cas-compares-exactly-and-notifies-only-a-committed-transition
+;   "bare handles are tracked and cycles do not change the cell"
+;       → bare-handles-are-tracked-and-cycles-do-not-change-the-cell
+;   "metadata dependencies cannot conceal a cycle"
+;       → metadata-dependencies-cannot-conceal-a-cycle
+;   "a result that refers to its evaluator is rejected on the first force"
+;       → a-result-that-refers-to-its-evaluator-is-rejected-on-the-first-force
+;   "failure diagnostics cannot retain their own memo"
+;       → failure-diagnostics-cannot-retain-their-own-memo
+;   "an attached waiter sees its failed attempt after owner exit and a successful retry"
+;       → an-attached-waiter-sees-its-failed-attempt-after-owner-exit-and-a-retry
+;   "a small-element cursor pulls chunks on the fast lane and preserves order"
+;       → a-small-element-cursor-pulls-chunks-on-the-fast-lane-and-preserves-order
+;   "a large-element cursor routes chunks to the dirty lane"
+;       → a-large-element-cursor-routes-chunks-to-the-dirty-lane
+;   "create routes by size and both lanes hold the same value"
+;       → create-routes-by-size-and-both-lanes-hold-the-same-value
+;   "small cells route to the fast lane; large cells stay dirty"
+;       → small-cells-route-to-the-fast-lane-large-cells-stay-dirty
+;   "fast CAS reroutes on a large replacement and on a NEW dependency edge"
+;       → fast-cas-reroutes-on-a-large-replacement-and-on-a-new-dependency-edge
+;   "fast lane preserves CAS exactness and single-shot notification"
+;       → fast-lane-preserves-cas-exactness-and-single-shot-notification
+;   "a cell that grows past the ceiling migrates lanes and stays correct"
+;       → a-cell-that-grows-past-the-ceiling-migrates-lanes-and-stays-correct
+;   "fast lane ceiling is tunable and accounting survives inline reclaim"
+;       → fast-lane-ceiling-is-tunable-and-accounting-survives-inline-reclaim
+;   "finite inputs use immutable shared storage and preserve all values"
+;       → finite-inputs-use-immutable-shared-storage-and-preserve-all-values
+;   "lazy and improper inputs are not prematurely forced by cursor conversion"
+;       → lazy-and-improper-inputs-are-not-prematurely-forced-by-cursor-conversion
+;   "admission collects unreachable handles rather than rejecting reclaimable memory"
+;       → admission-collects-unreachable-handles-rather-than-rejecting-reclaimable-memory
+;   "native library repeatedly unloads after reclamation without a stray thread"
+;       → native-library-repeatedly-unloads-after-reclamation-without-a-stray-thread
+;
+; Every `assert`/`refute`/`assert_raise`/`assert_receive`/`refute_received`
+; becomes one `is`, so the assertion count is unchanged (71).
+;
+; ── ADAPTATIONS, and why each one is not a weakening ──────────────────────
+;
+;   * `use ExUnit.Case, async: false` has no ward equivalent: `bl test` runs
+;     each FILE in its own isolated fork and the tests inside a file run in
+;     order in that one process.
+;   * `setup`/`on_exit` become a `try`/`finally` (the fast-lane ceiling and the
+;     lazy cache budget are restored even when a test fails).
+;   * `retained_bytes` is a GLOBAL NIF counter, so the churn-drift case reads it
+;     at a QUIESCENT point (`quiesce!`: collect, then drain the async reclaimer).
+;     ExUnit gave each test a fresh process; ward runs a file's tests in ONE
+;     process, where ambient reclamation would otherwise be read as drift.
+;   * `assert_receive ^tag` / `refute_received ^tag`. The NIF notifies by
+;     SENDING THE TAG ITSELF (native/lazy_memo/src/lib.rs: `env.send(&pid,
+;     message)` with the caller's term). BL receive patterns are vector-shaped
+;     and a guard may only mention variables bound by its own pattern, so the
+;     mailbox is read with `process_info(self(), :messages)` — the exact
+;     assertion `assert_receive` makes, for a message that is not a vector.
+;   * `assert_raise LazySeq.ForceError, ~r/cyclic_memo/` keeps BOTH halves: a
+;     typed `catch BeamLisp.LazySeq.ForceError` (any other raise reports
+;     UNEXPECTED) plus the message containing `cyclic_memo`.
+;   * `throw(value)` is `(erlang/throw value)`, NOT the language's `throw`:
+;     BL's `throw` builds a normalizable error whose message INSPECTS the value
+;     (forcing the lazy it was handed), which turns the fixture into a
+;     re-entrant force and answers `:recursive_force` instead of `:cyclic_memo`.
+;     Reproducing Elixir's `throw` class is what this case is about.
+;   * `{:a 1}` is an Erlang TUPLE here (`(tuple :a 1)`); `{:a 1}` is a MAP.
+;     `maps/get`/`maps/put` take the key FIRST, unlike `erlang/map_get`.
+;   * `Enum/filter`, `Enum/map`, `Enum/each`, `Enum/reject` keep ELIXIR
+;     argument order (collection first); `BeamLisp.Ns.Rt/map`, `Rt/filter`,
+;     `Rt/map_multi`, `Rt/take_while` keep CLOJURE order (function first).
+;   * BL `map` is LAZY — a fixture built with `(map …)` does not run until the
+;     seq is forced. Nothing here needs `mapv`; the fixtures that must run
+;     eagerly use `Enum/reduce` or `Enum/each`.
+;
+; Run: bin/bl test test/bl/memo_bounds_sunset_port_test.bl
+
+(ns memo-bounds-sunset-port.test)
+
+; ═══════════════════════════════════════════════════════════════════════════
+; §1  native memo — helpers
+; ═══════════════════════════════════════════════════════════════════════════
+
+; Lane is no longer a separate NIF (PLAN-132 Phase 1 deleted nif_lane): reads
+; self-guard, so the OBSERVABLE lane is whether nif_read_fast reroutes. A cell
+; is :dirty iff the fast read refuses it. (Valid for every value except the
+; literal atom :reroute, which no test here stores.)
+(defn- lane
+  [resource]
+  (if (= :reroute (BeamLisp.LazyMemo/nif_read_fast resource)) :dirty :fast))
+
+(defn- messages
+  "This process's mailbox, unconsumed — `assert_receive`/`refute_received`
+   without taking a vector pattern for a message that is a bare reference."
+  []
+  (erlang/element 2 (erlang/process_info (erlang/self) :messages)))
+
+(defn- has-message?
+  [tag]
+  (some (fn [m] (= m tag)) (messages)))
+
+(defn- flush-message!
+  "Consume the head of the mailbox. The tag is asserted present by `has-message?`
+   first; a foreign head is reported as :foreign rather than silently dropped."
+  [tag]
+  (receive m (if (= m tag) :ok :foreign) (after 1000 :timeout)))
+
+(defn- force-error
+  "The message of the `BeamLisp.LazySeq.ForceError` that forcing `lazy` raises,
+   or a loud marker when it raises something else (or nothing) — the original's
+   `assert_raise LazySeq.ForceError, ~r/…/` with the TYPE kept."
+  [lazy]
+  (try
+    (do (BeamLisp.LazySeq/force lazy) "NO-ERROR")
+    (catch BeamLisp.LazySeq.ForceError e (ex-message e))
+    (catch e (str "UNEXPECTED-FORCE-ERROR:" (ex-message e)))))
+
+(defn- int-map
+  "A map of `n` entries — the size fixture `Map.new(1..n, fn i -> {i,i} end)`."
+  [n]
+  (Enum/reduce (range 1 (erlang/+ n 1)) (maps/new) (fn [i m] (maps/put i i m))))
+
+(defn- await-registered
+  "Wait until `lazy` shows a RUNNING state with a registered waiter — the
+   original's recursive poll on the same tuple shape."
+  [lazy deadline]
+  (let [st (BeamLisp.LazySeq/memo_state lazy)]
+    (if (and (erlang/is_tuple st)
+             (erlang/== :running (erlang/element 1 st))
+             (erlang/is_list (erlang/element 5 st))
+             (not (empty? (erlang/element 5 st))))
+      :ok
+      (if (erlang/< (System/monotonic_time :millisecond) deadline)
+        (do (erlang/yield) (await-registered lazy deadline))
+        :timeout))))
+
+(defn- drain-reclaimer!
+  [deadline]
+  (if (erlang/== 0 (maps/get :pending_reclaims (BeamLisp.LazyMemo/stats)))
+    :ok
+    (if (erlang/< (System/monotonic_time :millisecond) deadline)
+      (do (Process/sleep 2) (drain-reclaimer! deadline))
+      :timeout)))
+
+(defn- quiesce!
+  "Take a retained-byte reading at a QUIESCENT point: collect, then wait for
+   the async reclaimer to drain. ward runs a file's tests in ONE process, so
+   cells from earlier tests are still being reclaimed while a later test churns;
+   the ExUnit case never saw that (its test process was fresh). Without this the
+   global reading measures ambient reclamation, not the churn."
+  []
+  (erlang/garbage_collect)
+  (drain-reclaimer! (erlang/+ (System/monotonic_time :millisecond) 5000)))
+
+; ═══════════════════════════════════════════════════════════════════════════
+; §1  native memo — the tests
+; ═══════════════════════════════════════════════════════════════════════════
+
+(deftest cas-compares-exactly-and-notifies-only-a-committed-transition
+  (let [resource (BeamLisp.LazyMemo/create (tuple :value 1))
+        tag (erlang/make_ref)]
+    (is (= :retry (BeamLisp.LazyMemo/exchange resource (tuple :value 1.0) :wrong
+                   (list (tuple (erlang/self) tag)))))
+    (is (not (has-message? tag)) "a refused CAS must not notify")
+    (is (= (tuple :value 1) (BeamLisp.LazyMemo/read resource)))
+    (is (= :ok (BeamLisp.LazyMemo/exchange resource (tuple :value 1) :right
+                (list (tuple (erlang/self) tag)))))
+    (is (has-message? tag) "a committed transition notifies its waiter")
+    (flush-message! tag)
+    (is (= :right (BeamLisp.LazyMemo/read resource)))))
+
+(deftest bare-handles-are-tracked-and-cycles-do-not-change-the-cell
+  (let [a (BeamLisp.LazyMemo/create :pending)
+        b (BeamLisp.LazyMemo/create (tuple :child a))]
+    (is (= (list b) (BeamLisp.LazyMemo/dependencies (tuple b (erlang/make_ref)))))
+    (is (= :cycle (BeamLisp.LazyMemo/exchange a :pending (tuple :child b))))
+    (is (= :pending (BeamLisp.LazyMemo/read a)) "a refused CAS leaves the cell alone")))
+
+(deftest metadata-dependencies-cannot-conceal-a-cycle
+  (let [root (BeamLisp.LazySeq/new (fn [] :root))
+        other (BeamLisp.LazySeq/new (fn [] :other))
+        wrapped (maps/put :metadata {:root root} other)
+        resource (erlang/map_get :resource root)]
+    (is (= :cycle
+           (BeamLisp.LazyMemo/exchange resource
+             (BeamLisp.LazyMemo/read resource) (tuple :completed wrapped))))
+    (let [st (BeamLisp.LazyMemo/read resource)]
+      (is (and (erlang/is_tuple st) (erlang/== :pending (erlang/element 1 st)))))))
+
+(deftest a-result-that-refers-to-its-evaluator-is-rejected-on-the-first-force
+  (let [holder (erlang/apply :ets :new (list :cyclic_result_fixture (list :public)))
+        lazy (BeamLisp.LazySeq/new
+               (fn [] (erlang/element 2
+                         (first (erlang/apply :ets :lookup (list holder :value))))))]
+    (erlang/apply :ets :insert (list holder (tuple :value lazy)))
+    (is (includes? (force-error lazy) "cyclic_memo")
+        "a result that refers to its own evaluator refuses as cyclic_memo")
+    (is (= (tuple :terminal :cyclic_memo) (BeamLisp.LazySeq/memo_state lazy)))
+    (erlang/apply :ets :delete (list holder))))
+
+(deftest failure-diagnostics-cannot-retain-their-own-memo
+  (let [holder (erlang/apply :ets :new (list :cyclic_error_fixture (list :public)))
+        lazy (BeamLisp.LazySeq/new
+               (fn [] (erlang/throw
+                        (erlang/element 2
+                          (first (erlang/apply :ets :lookup (list holder :value)))))))]
+    (erlang/apply :ets :insert (list holder (tuple :value lazy)))
+    (is (includes? (force-error lazy) "cyclic_memo")
+        "a failure diagnostic that retains its own memo refuses as cyclic_memo")
+    (is (= (tuple :terminal :cyclic_memo) (BeamLisp.LazySeq/memo_state lazy)))
+    (erlang/apply :ets :delete (list holder))))
+
+(deftest an-attached-waiter-sees-its-failed-attempt-after-owner-exit-and-a-retry
+  (let [parent (erlang/self)
+        calls (erlang/apply :atomics :new (list 1 (list)))
+        lazy (BeamLisp.LazySeq/new
+               (fn []
+                 (if (erlang/== 1 (erlang/apply :atomics :add_get (list calls 1 1)))
+                   (do (erlang/send parent [:started (erlang/self)])
+                       (receive :release
+                         (erlang/error (Elixir.RuntimeError/exception "first attempt"))
+                         (after 10000 :timeout)))
+                   :recovered)))
+        capture (fn []
+                  (try (tuple :ok (BeamLisp.LazySeq/force lazy))
+                       (catch e (tuple :error (ex-message e)))))
+        owner (Task/async capture)
+        owner-pid (erlang/map_get :pid owner)
+        started (receive [:started p] p (after 5000 :timeout))]
+    (is (erlang/== owner-pid started) "the owner's thunk reports itself")
+    (let [waiter (Task/async capture)
+          waiter-pid (erlang/map_get :pid waiter)]
+      (is (= :ok (await-registered lazy
+                    (erlang/+ (System/monotonic_time :millisecond) 5000)))
+          "the waiter registers on the running attempt")
+      (erlang/suspend_process waiter-pid)
+      (erlang/send owner-pid :release)
+      (let [owner-result (Task/await owner)]
+        (is (= (tuple :error "first attempt") owner-result)
+            "the owner sees its own failed attempt")
+        (is (= :recovered (BeamLisp.LazySeq/force lazy))
+            "an explicit force after the owner's failure retries and succeeds")
+        (erlang/resume_process waiter-pid)
+        (is (= (tuple :error "first attempt") (Task/await waiter))
+            "the waiter still sees the FAILED attempt it attached to")
+        (is (erlang/== 2 (erlang/apply :atomics :get (list calls 1)))
+            "the thunk ran exactly twice: the failed attempt and the retry")))))
+
+(deftest a-small-element-cursor-pulls-chunks-on-the-fast-lane-and-preserves-order
+  (let [values (Enum/to_list (range 1 1001))
+        cur (BeamLisp.LazyMemo/cursor values)]
+    (is (not (BeamLisp.LazyMemo/cursor_dirty_chunks? cur)))
+    (let [chunk (erlang/element 1 (BeamLisp.LazyMemo/nif_cursor_chunk_fast cur))]
+      (is (= (Enum/to_list (range 1 33)) chunk)
+          "a fast-lane pull yields the first 32 values"))
+    (is (= values (Enum/to_list (BeamLisp.SeqCursor/new values)))
+        "the public SeqCursor walk preserves every value")))
+
+(deftest a-large-element-cursor-routes-chunks-to-the-dirty-lane
+  ; 3000 elements each a ~3KB map: 32 of them exceeds a 64KiB chunk budget.
+  (let [big-elem (int-map 300)
+        values (erlang/apply :lists :duplicate (list 3000 big-elem))
+        cur (BeamLisp.LazyMemo/cursor values)]
+    (is (BeamLisp.LazyMemo/cursor_dirty_chunks? cur))
+    (is (= (list big-elem big-elem) (Enum/take (BeamLisp.SeqCursor/new values) 2))
+        "the dirty lane is still correct")))
+
+(deftest create-routes-by-size-and-both-lanes-hold-the-same-value
+  (let [small (BeamLisp.LazyMemo/create :x)
+        big (BeamLisp.LazyMemo/create (int-map 50000))]
+    (is (= :fast (lane small)))
+    (is (= :x (BeamLisp.LazyMemo/read small)))
+    (is (= :dirty (lane big)))))
+
+(deftest small-cells-route-to-the-fast-lane-large-cells-stay-dirty
+  (let [small (BeamLisp.LazyMemo/create (tuple :value 1))
+        big (BeamLisp.LazyMemo/create (int-map 50000))]
+    (is (= :fast (lane small)))
+    (is (= :dirty (lane big)))
+    (is (= (tuple :value 1) (BeamLisp.LazyMemo/read small)) "both lanes read the same value")
+    (is (= (BeamLisp.LazyMemo/read big) (BeamLisp.LazyMemo/nif_read big)))))
+
+(deftest fast-cas-reroutes-on-a-large-replacement-and-on-a-new-dependency-edge
+  (let [small (BeamLisp.LazyMemo/create :a)
+        big-term (int-map 50000)
+        big-bytes (BeamLisp.LazyMemo/estimate_bytes big-term)]
+    (is (= :reroute (BeamLisp.LazyMemo/nif_compare_exchange_fast
+                      small :a big-term (list) big-bytes (list))))
+    (is (= :a (BeamLisp.LazyMemo/read small)) "a rerouted CAS left the cell untouched")
+    (let [other (BeamLisp.LazyMemo/create :o)]
+      ; adding a brand-new edge is unbounded cycle-walk work: not fast-lane
+      (is (= :reroute (BeamLisp.LazyMemo/nif_compare_exchange_fast
+                        small :a (tuple :dep other) (list other) 16 (list))))
+      (is (= :a (BeamLisp.LazyMemo/read small)))
+      (is (= :ok (BeamLisp.LazyMemo/exchange small :a (tuple :dep other))))
+      (is (= (tuple :dep other) (BeamLisp.LazyMemo/read small))
+          "the public router completes what the fast lane rerouted"))))
+
+(deftest fast-lane-preserves-cas-exactness-and-single-shot-notification
+  (let [r (BeamLisp.LazyMemo/create 0)
+        tag (erlang/make_ref)]
+    (is (= :fast (lane r)))
+    (is (= :retry (BeamLisp.LazyMemo/exchange r 0.0 1 (list (tuple (erlang/self) tag)))))
+    (is (not (has-message? tag)))
+    (is (= :ok (BeamLisp.LazyMemo/exchange r 0 1 (list (tuple (erlang/self) tag)))))
+    (is (has-message? tag))
+    (flush-message! tag)
+    (is (= 1 (BeamLisp.LazyMemo/read r)))))
+
+(deftest a-cell-that-grows-past-the-ceiling-migrates-lanes-and-stays-correct
+  (let [r (BeamLisp.LazyMemo/create 0)
+        big (Enum/to_list (range 1 100001))]
+    (is (= :fast (lane r)))
+    (is (= :ok (BeamLisp.LazyMemo/exchange r 0 big)))
+    (is (= :dirty (lane r)) "a cell past the ceiling migrates to the dirty lane")
+    (is (= big (BeamLisp.LazyMemo/read r)))
+    (is (= :ok (BeamLisp.LazyMemo/exchange r big 1)))
+    (is (= :fast (lane r)) "and migrates back when it shrinks")
+    (is (= 1 (BeamLisp.LazyMemo/read r)))))
+
+(deftest fast-lane-ceiling-is-tunable-and-accounting-survives-inline-reclaim
+  (let [old (BeamLisp.LazyMemo/fast_lane_bytes)]
+    (try
+      (let [r (BeamLisp.LazyMemo/create 0)]
+        ; lower the ceiling below any real term: everything becomes dirty
+        (BeamLisp.LazyMemo/set_fast_lane_bytes 0)
+        (is (= :dirty (lane r)) "with a zero ceiling no cell is fast-lane")
+        (is (= :ok (BeamLisp.LazyMemo/exchange r 0 1)))
+        (is (= 1 (BeamLisp.LazyMemo/read r))))
+      (finally (BeamLisp.LazyMemo/set_fast_lane_bytes old))))
+  ; churn a small cell through the fast lane; retained bytes must not drift
+  (let [r (BeamLisp.LazyMemo/create 0)]
+    (quiesce!)
+    (let [before (maps/get :retained_bytes (BeamLisp.LazyMemo/stats))]
+      (Enum/reduce (range 1 1001) 0 (fn [i v]
+                                     (BeamLisp.LazyMemo/exchange r v i)
+                                     i))
+      (quiesce!)
+      (let [after (maps/get :retained_bytes (BeamLisp.LazyMemo/stats))]
+        ; Other cells may be reclaimed while this process churns; only positive
+        ; retained-byte drift would indicate that replacements leak.
+        (is (erlang/< (erlang/- after before) 1024)
+            "replacements through the fast lane do not leak retained bytes")))))
+
+(deftest finite-inputs-use-immutable-shared-storage-and-preserve-all-values
+  (let [values (Enum/to_list (range 1 1001))
+        input (BeamLisp.LazySeq/input values)]
+    (is (= :"Elixir.BeamLisp.SeqCursor" (maps/get :__struct__ input)))
+    (let [source (BeamLisp.LazyMemo/nif_dependency_resource (erlang/map_get :tail input))]
+      (is (thrown? (BeamLisp.LazyMemo/compare_exchange source values (list) (list) 0))
+          "a finite input's shared storage is IMMUTABLE — a CAS on it raises"))
+    (is (= values (Enum/to_list input)))
+    (is (= (Enum/to_list (range 2 1002))
+           (Enum/to_list (BeamLisp.Ns.Rt/map (fn [x] (erlang/+ x 1)) values))))
+    (is (= (Enum/filter values (fn [x] (erlang/== 0 (erlang/rem x 2))))
+           (Enum/to_list (BeamLisp.Ns.Rt/filter
+                           (fn [x] (erlang/== 0 (erlang/rem x 2))) values))))
+    (is (= (Enum/map values (fn [x] (erlang/* x 2)))
+           (Enum/to_list (BeamLisp.Ns.Rt/map_multi
+                           (fn [a b] (erlang/+ a b)) values (list values)))))
+    (is (= (erlang/++ values values)
+           (Enum/to_list (BeamLisp.Ns.Rt/concat (list values values)))))
+    (is (= (Enum/to_list (range 1 500))
+           (Enum/to_list (BeamLisp.Ns.Rt/take_while (fn [x] (erlang/< x 500)) values))))
+    (is (= (erlang/++ values (erlang/++ values (list 1)))
+           (Enum/take (BeamLisp.Ns.Rt/cycle values) 2001)))))
+
+(deftest lazy-and-improper-inputs-are-not-prematurely-forced-by-cursor-conversion
+  (let [calls (erlang/apply :atomics :new (list 1 (list)))
+        tail (BeamLisp.LazySeq/new
+               (fn []
+                 (erlang/apply :atomics :add_get (list calls 1 1))
+                 (Enum/to_list (range 2 1001))))
+        mapped (BeamLisp.Ns.Rt/map (fn [x] (erlang/+ x 1)) (cons 1 tail))]
+    (is (erlang/== 0 (erlang/apply :atomics :get (list calls 1)))
+        "building the lazy input does not force its tail")
+    (is (= (Enum/to_list (range 2 1002)) (Enum/to_list mapped)))
+    (is (erlang/== 1 (erlang/apply :atomics :get (list calls 1)))
+        "walking it forces the tail exactly once")))
+
+(deftest admission-collects-unreachable-handles-rather-than-rejecting-reclaimable-memory
+  (let [previous (Application/get_env :beam_lisp :lazy_cache_budget_bytes)
+        baseline (maps/get :retained_bytes (BeamLisp.LazyMemo/stats))]
+    (try
+      (do
+        (Application/put_env :beam_lisp :lazy_cache_budget_bytes (erlang/+ baseline 10000))
+        (let [result (Task/await
+                       (Task/async
+                         (fn []
+                           (Process/flag :min_heap_size 1000000)
+                           (erlang/garbage_collect)
+                           (Enum/each (range 1 2001)
+                             (fn [_] (BeamLisp.LazyMemo/create :discarded)))
+                           (BeamLisp.LazySeq/force (BeamLisp.LazySeq/new (fn [] :accepted)))))
+                       10000)]
+          (is (= :accepted result)
+              "admission reclaims discarded cells instead of refusing the force")))
+      (finally
+        (if (nil? previous)
+          (Application/delete_env :beam_lisp :lazy_cache_budget_bytes)
+          (Application/put_env :beam_lisp :lazy_cache_budget_bytes previous))))))
+
+(deftest native-library-repeatedly-unloads-after-reclamation-without-a-stray-thread
+  (BeamLisp.LazyMemo/ensure_loaded!)
+  (let [which (code/which :"Elixir.BeamLisp.LazyMemo")
+        dir (if (erlang/is_list which)
+              (Path/dirname (erlang/list_to_binary which))
+              (str which))
+        script (str
+                 "for _ <- 1..3 do\n"
+                 "  parent = self()\n"
+                 "  {pid, monitor} = spawn_monitor(fn ->\n"
+                 "    for _ <- 1..1000, do: BeamLisp.LazyMemo.create(:temporary)\n"
+                 "    send(parent, :created)\n"
+                 "  end)\n"
+                 "  receive do :created -> :ok end\n"
+                 "  receive do {:DOWN, ^monitor, :process, ^pid, :normal} -> :ok end\n"
+                 "  wait = fn wait, n ->\n"
+                 "    stats = BeamLisp.LazyMemo.stats()\n"
+                 "    if stats.live_cells == 0 and stats.pending_reclaims == 0 do\n"
+                 "      :ok\n"
+                 "    else\n"
+                 "      if n == 0, do: raise(\"reclamation did not finish\")\n"
+                 "      Process.sleep(1)\n"
+                 "      wait.(wait, n - 1)\n"
+                 "    end\n"
+                 "  end\n"
+                 "  wait.(wait, 5000)\n"
+                 "  true = :code.delete(BeamLisp.LazyMemo)\n"
+                 "  :code.purge(BeamLisp.LazyMemo)\n"
+                 "end\n"
+                 "IO.puts(\"unload-ok\")\n")
+        r (System/cmd "elixir"
+            (to-list (list "-pa" dir "-e" script))
+            (to-list (list (tuple :stderr_to_stdout true))))]
+    (is (zero? (erlang/element 2 r))
+        (str "the child VM exited " (erlang/element 2 r) ":\n" (erlang/element 1 r)))
+    (is (includes? (erlang/element 1 r) "unload-ok")
+        "three create/reclaim/delete/purge rounds leave the library unloadable")))
+
+; ═══════════════════════════════════════════════════════════════════════════
+; §2  per-env resource bounds
+; ═══════════════════════════════════════════════════════════════════════════
+;
+(deftest max-heap-words-kills-a-runaway-future-not-the-vm
+  (let [env (BeamLisp.Env/fork :global (list (tuple :max_heap_words 50000)))]
+    (try
+      (BeamLisp.Env/with_env env
+        (fn []
+          (let [f (BeamLisp.Refs/future_exec
+                    (fn [] (erlang/apply :lists :seq (list 1 1000000))))]
+            (is (= :heap_bound_enforced
+                   (BeamLisp.Refs/deref f 5000 :heap_bound_enforced))
+                "a hard heap kill returns the timed deref default")
+            (is (not (Process/alive? (erlang/map_get :pid (erlang/map_get :task f))))
+                "the bounded task is dead and its caller remains alive"))))
+      (finally (BeamLisp.Env/destroy env)))))
+
+(deftest bounded-heap-is-monotonic-a-child-never-exceeds-its-parent
+  (let [parent (BeamLisp.Env/fork :global (list (tuple :max_heap_words 100000)))
+        child (BeamLisp.Env/fork parent (list (tuple :max_heap_words 200000)))
+        grandchild (BeamLisp.Env/fork parent (list (tuple :max_heap_words 50000)))]
+    (is (= 100000 (BeamLisp.Env/heap_of child))
+        "a WIDER child is clamped to the parent's bound")
+    (is (= 50000 (BeamLisp.Env/heap_of grandchild))
+        "a narrower child keeps its own bound")))
+
+(deftest unbounded-envs-spawn-unbounded-futures-default-unchanged
+  (is (nil? (BeamLisp.Env/max_heap)) "the default env has no heap bound")
+  (let [f (BeamLisp.Refs/future_exec (fn [] (BeamLisp/eval "(+ 1 2)")))]
+    (is (= 3 (BeamLisp.Refs/deref f 5000 :timeout))
+        "an unbounded env's future runs and answers")))
+
+; ═══════════════════════════════════════════════════════════════════════════
+; §3  the sunset / source-inventory gate
+; ═══════════════════════════════════════════════════════════════════════════
+;
+; The FUP-082 sunset gate: modules whose POLICY has moved to beam-lisp must not
+; reappear as Elixir, and the workaround-ecosystem tokens must not return.
+;
+; UPDATED FOR ZERO ELIXIR SOURCE. The original scanned `lib/**/*.ex` only, which
+; goes vacuous the moment `lib/` is Elixir-free — exactly the state this gate
+; exists to reach. So the scan is now over EVERY repository Elixir source, and
+; the gate carries the source-INVENTORY half of PLAN-150 step 5: the production
+; tree may only hold the pinned, not-yet-removed substrate; no authored Elixir
+; source may appear outside the two in-flight roots (`lib/`, `test/`); and the
+; repository inventory may not grow. The migration's target is ZERO, so both
+; pins are meant to be deleted by the waves that finish the job — at which
+; point this stays a real gate instead of an empty one.
+
+; Module names that have been sunset — their policy is now beam-lisp.
+; A `defmodule <name>` in ANY repository Elixir source is a regression.
+(def ^:private sunset-modules
+  (list
+    ; PLAN-122 (T3/native)
+    "BeamLisp.Native"
+    "BeamLisp.NativeTask"
+    "BeamLisp.Cargo"
+    ; PLAN-123 + FUP-085 (T2/daemon + the routing edge): the WHOLE daemon is
+    ; beam-lisp now (priv/std/vm/*.bl). No BeamLisp.Daemon.* may return.
+    "BeamLisp.Daemon"
+    "BeamLisp.Daemon.Paths"
+    "BeamLisp.Daemon.Names"
+    "BeamLisp.Daemon.Ports"
+    "BeamLisp.Daemon.Gateway"
+    "BeamLisp.Daemon.CA"
+    "BeamLisp.Daemon.IndexWorker"
+    "BeamLisp.Daemon.Server"
+    "BeamLisp.Daemon.Listener"
+    "BeamLisp.Daemon.IO"
+    "BeamLisp.Daemon.Protocol"
+    "BeamLisp.Daemon.Inspect"
+    "BeamLisp.Daemon.HTTP"
+    "BeamLisp.Daemon.Executor"
+    "BeamLisp.Daemon.Workers"
+    "BeamLisp.Daemon.WatchRegistry"
+    "BeamLisp.Daemon.StdErr"))
+
+; The workaround ecosystem (PLAN-121/123) must not return: the single serial
+; worker is gone, and so is everything that compensated for it.
+(def ^:private banned-tokens
+  (list
+    "owns_process"
+    "owns-process?"
+    "refuse_owning"
+    "Attach::Busy"
+    "ready_busy"
+    "DaemonMode::Queue"
+    "BL_DAEMON=queue"))
+
+; The daemon is beam-lisp now (priv/std/vm); the token gate still watches the
+; whole runtime + the Rust launcher for a serial-worker assumption creeping back.
+(def ^:private daemon-src
+  (list "priv/std/vm" "lib/beam_lisp" "tooling/drop/src"))
+
+(def ^:private authored-roots
+  "The repository's authored source roots. `build/`, `tmp/`, `.local/` and
+   `projects/` are NOT authored source (generated, scratch and a foreign
+   project respectively) and are excluded by construction."
+  (list "lib" "test" "priv" "bin" "config" "scripts" "research" "examples"
+        "native" "tooling" "editors" "bench" "docs"))
+
+(defn- elixir-under
+  "The sorted `.ex`/`.exs` files beneath `root` (or `root` itself when it is a
+   file)."
+  [root]
+  (if (File/dir? root)
+    (let [p (str root "/**/")]
+      (sort (concat (Path/wildcard (str p "*.ex")) (Path/wildcard (str p "*.exs")))))
+    (if (File/regular? root) (list root) (list))))
+
+(defn- authored-elixir
+  "Every repository-authored Elixir source file, sorted."
+  []
+  (vec (sort (apply concat
+                (concat (list (Path/wildcard "*.ex") (Path/wildcard "*.exs"))
+                        (map elixir-under authored-roots))))))
+
+(defn- defines-module?
+  "True when `text` carries a real `defmodule Mod do` at the head of a line —
+   not a comment or a string mention. The scan is line-wise, so `^` is the line
+   start, exactly as the original's per-line regex."
+  [text mod]
+  (let [re (Regex/compile! (str "^\\s*defmodule\\s+" (Regex/escape mod) "\\s+do"))]
+    (some (fn [line] (Regex/match? re line))
+          (clojure.string/split text "\n"))))
+
+(defn- documents-removal?
+  "A line that mentions a token only to say it is gone (a `#`/`//` comment
+   containing removed/gone/no longer/…). A real code use is NOT this."
+  [line]
+  (let [t (String/trim line)
+        comment? (or (String/starts_with? t "#")
+                     (String/starts_with? t "//")
+                     (String/starts_with? t "///"))]
+    (and comment?
+         (some? (re-find
+                  (re-pattern "(?i)gone|removed|no longer|deleted|PLAN-12[13]|there is no|never busy")
+                  line)))))
+
+(defn- sunset-offenders
+  "Every `[module path]` pair where a repository Elixir source re-defines a
+   sunset module."
+  []
+  (vec (apply concat
+         (map (fn [p]
+                (let [text (File/read! p)]
+                  (map (fn [mod] (list mod p))
+                       (filter (fn [mod] (defines-module? text mod)) sunset-modules))))
+              (authored-elixir)))))
+
+(defn- daemon-source-files
+  "The daemon-source files the token gate scans, sorted."
+  []
+  (sort (apply concat
+          (map (fn [dir]
+                 (if (File/dir? dir)
+                   (concat (Path/wildcard (str dir "/**/*.ex"))
+                           (Path/wildcard (str dir "/**/*.rs"))
+                           (Path/wildcard (str dir "/**/*.bl")))
+                   (list)))
+               daemon-src))))
+
+(defn- token-offenders
+  "Every `[token basename line]` where a banned token is USED (not merely
+   documented as removed) in the daemon source."
+  []
+  (vec (apply concat
+         (map (fn [f]
+                (let [lines (clojure.string/split (File/read! f) "\n")]
+                  (apply concat
+                    (map (fn [token]
+                           (map (fn [line] (list token (Path/basename f) (String/trim line)))
+                                (filter (fn [line]
+                                          (and (String/contains? line token)
+                                               (not (documents-removal? line))))
+                                        lines)))
+                         banned-tokens))))
+              (daemon-source-files)))))
+
+(deftest the-production-tree-has-no-elixir-source
+  (let [sources (elixir-under "lib")]
+    (is (= [] sources)
+        (str "lib/ must be source-free: " (pr-str sources)))))
+
+(deftest no-repository-elixir-source-lives-outside-the-in-flight-roots
+  (let [foreign (Enum/reject (authored-elixir)
+                             (fn [p] (or (starts-with? p "lib/")
+                                         (starts-with? p "test/"))))]
+    (is (= [] foreign)
+        (str "Elixir source appeared outside lib/ and test/ (this is the zero-source "
+             "boundary the FUP-082 sunset moved): " (pr-str foreign)))))
+
+(deftest no-sunset-module-is-defined-in-any-repository-elixir-source
+  (let [offenders (sunset-offenders)]
+    (is (= [] offenders)
+        (str "sunset modules re-defined in repository Elixir source (their policy "
+             "moved to beam-lisp; it lives in priv/std/vm/native.bl): "
+             (pr-str offenders)))))
+
+(deftest no-workaround-token-reappears-in-daemon-source
+  (let [files (daemon-source-files)
+        offenders (token-offenders)]
+    ; A gate over NOTHING passes; the daemon source is still real (priv/std/vm).
+    (is (not (empty? files))
+        (str "the daemon-source scan found no files — a gate over nothing: "
+             (pr-str daemon-src)))
+    (is (= [] offenders)
+        (str "workaround tokens reappeared in daemon source (the serial worker is "
+             "gone): " (pr-str offenders)))))
+
+(deftest the-repository-contains-no-authored-elixir-source
+  (let [inv (authored-elixir)]
+    (is (= [] inv)
+        (str "repository Elixir source inventory must be empty: " (pr-str inv)))))

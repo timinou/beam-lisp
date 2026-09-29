@@ -36,8 +36,11 @@ cp "$P/releases/COOKIE" "$T/releases/COOKIE"
 printf '17.0.1 %s' "$VS" > "$T/releases/start_erl.data"
 
 # Generate start.script + start.boot from the shipped .rel, in the drop's VM.
-BL_PAYLOAD="$P" BL_OUT="$T/releases/$VS" \
-  "$P/bin/bl" eval "Code.eval_file(\"$HERE/gen_start_boot.exs\")"
+# The generator is BL, run through the drop's OWN CLI `run` verb — the drop's
+# `eval` is Elixir and only starts the language. BL_REL names the drop's release
+# file (the mix drop ships bl.rel; a post-W4 tree beam_lisp.rel).
+BL_PAYLOAD="$P" BL_OUT="$T/releases/$VS" BL_REL="${BL_REL:-bl.rel}" \
+  "$P/bin/bl" eval "BeamLisp.Ns.Bl.Cli.main([\"run\",\"$HERE/gen_start_boot.bl\"])"
 
 echo "P5  tree contents:"
 ls -A "$T" "$T/releases" "$T/releases/$VS"

@@ -72,26 +72,40 @@ provably ready to BE the compiler.
 ## Reproduce
 
 ```
-mix beam_lisp.run research/sh13_cutover/fixpoint.bl
+bin/bl run research/sh13_cutover/fixpoint.bl
 ```
+
+NOTE: `fixpoint.bl` requires `priv/self/oracle.bl`; that namespace was deleted
+in the PLAN-083 hard cutover and is absent from the current tree, so the
+fixpoint probe does not run today. The ck2 preflight below is the part of this
+experiment kept runnable.
 
 ## CHECKPOINT 2 preflight — the .bl compiler loads and runs real code
 
-`ck2_preflight.exs` proves the delegation mechanism end-to-end WITHOUT touching
-the live `Compiler.compile/2`: it takes a real multi-form module, compiles each
-form via `apply(BeamLisp.Ns.Compiler, :compile, [form, env])` (the .bl
-compiler), evaluates each, and confirms the linked definitions work:
+`ck2_preflight.bl` proves the compiler loads and runs real code end-to-end: it
+takes a real multi-form module, compiles each form with `BeamLisp.Compiler`
+(the frozen .bl compiler), evaluates it, and confirms the linked definitions
+work:
+
+```
+$ bin/bl run research/sh13_cutover/ck2_preflight.bl
+sum-sq [1 2 3 4] via the .bl compiler backend: 30
+CK2-PREFLIGHT PASS: .bl compiler loads+runs real code
+```
 
 ```
 (defn sq [x] (* x x))
 (defn sum-sq [xs] (reduce + 0 (map sq xs)))
 (sum-sq [1 2 3 4])   =>  30
-CK2-PREFLIGHT PASS: .bl compiler loads+runs real code
 ```
 
-This is exactly what the loader does, done by the self-hosted compiler. Combined
-with the fixpoint (compiler compiles its own source identically) and CHECKPOINT
-1 (932/932 of the prelude), the .bl compiler is proven ready to BE the compiler.
+`ck2_preflight.bl` compiles each form through `BeamLisp.Compiler/eval_string`,
+the public entry the loader itself uses. The original reached into
+`BeamLisp.Ns.Compiler:compile/2` and eval'd the returned Elixir AST; the
+compiler now lowers to ANF and emits through Emit/Link, so that AST is no
+longer a value `Code.eval_quoted` accepts. The contract is unchanged — the .bl
+compiler loads and runs real code — and is now the live path rather than a
+preflight of a planned delegation.
 
 ### The remaining in-place step (the live cutover) — the one bootstrap subtlety
 

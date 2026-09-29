@@ -272,7 +272,7 @@ verdict is `Bootstrap/key_matches?/1` rather than a second copy of the rule.
   []
   (let [m (BeamLisp.Bootstrap/manifest)]
     (if (nil? m)
-      {:ok false :detail "absent (no priv/bootstrap/seed/manifest.exs)"}
+      {:ok false :detail "absent (no priv/bootstrap/seed/manifest.term)"}
       (let [n (count (keys (get m "modules")))
             ok? (BeamLisp.Bootstrap/key_matches? m)]
         {:ok ok?

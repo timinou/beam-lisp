@@ -1,0 +1,119 @@
+; test/bl/reader_safety_port_test.bl — the reader's atom-table GUARD, in beam-lisp.
+;
+; Ported from the ExUnit `test/beam_lisp/reader_safety_test.exs`. The original
+; pinned the security/bounds contract of the LIVE reader (`BeamLisp.Reader`):
+;
+;   * hitting the high-water mark raises a CLEAN, CATCHABLE `AtomLimitError`
+;     — never the uncatchable VM abort a full atom table would cause (atoms are
+;     never collected; filling the table kills the whole VM);
+;   * that error NAMES the offending token and quotes the LIVE atom limit;
+;   * the DEFAULT config never fires on an ordinary read;
+;   * plain literals (numbers, strings, nil, booleans) intern no atoms and so
+;     never advance the sampling counter, even at fraction 0.0 / interval 1;
+;   * the sampling counter does NOT leak between reads.
+;
+; HOW WE TEST WITHOUT FILLING THE ATOM TABLE
+;
+; The guard reads its ceiling from application env (:beam_lisp,
+; :atom_high_water_fraction / :atom_check_interval). Set the fraction to 0.0 and
+; the interval to 1: EVERY sampled token is then "past the ceiling", so the
+; guard must fire on the first fresh name — no need to approach the real table
+; limit. interval N fires on the Nth token, which is how the no-leak contract is
+; observed: 4 tokens (< 5) pass, a fresh 1-token read must also pass, and a
+; 5-token read fires on its 5th.
+;
+; The original was `async: false` and cleared the env in `on_exit` because the
+; guard reads GLOBAL application env. Here `with-tight-guard` restores the env in
+; a `finally` — a leaked 0.0 fraction would make every later read in the same VM
+; refuse, so the cleanup is not optional.
+;
+; Run:  bl test test/bl/reader_safety_port_test.bl
+
+(ns reader-safety-port.test)
+
+; --- guard-config scaffolding -------------------------------------------------
+
+(defn- set-guard!
+  [fraction interval]
+  (Application/put_env :beam_lisp :atom_high_water_fraction fraction)
+  (Application/put_env :beam_lisp :atom_check_interval interval))
+
+(defn- clear-guard!
+  []
+  (Application/delete_env :beam_lisp :atom_high_water_fraction)
+  (Application/delete_env :beam_lisp :atom_check_interval))
+
+(defn- with-tight-guard
+  "Pin the guard so the first sampled token is refused, run `thunk`, and ALWAYS
+   restore the env. A raised error propagates."
+  [fraction interval thunk]
+  (set-guard! fraction interval)
+  (try (thunk)
+       (finally (clear-guard!))))
+
+(defn- thrown
+  "The exception `thunk` raises, or nil when it returns normally — the value the
+   original `assert_raise` inspected."
+  [thunk]
+  (try (do (thunk) nil) (catch e e)))
+
+; --- the guard raises a clean, catchable error --------------------------------
+
+(deftest guard-raises-a-clean-catchable-error
+  (testing "fraction 0.0 / interval 1 refuses the very first sampled symbol"
+    ; fraction 0 ⇒ any sampled token is past the ceiling; interval 1 ⇒ the very
+    ; first symbol samples.
+    (let [e (with-tight-guard 0.0 1
+              (fn [] (thrown (fn [] (BeamLisp.Reader/read_one "foo")))))]
+      (is (= :Elixir.BeamLisp.Reader.AtomLimitError (:__struct__ e))
+          "the refusal is a typed, catchable AtomLimitError — not a VM abort")
+      (is (boolean (re-find #"refusing to intern \"foo\".*atom table" (str (ex-message e))))
+          "the message names the token and explains the atom-table hazard"))))
+
+(deftest error-names-the-offending-keyword-and-the-live-limit
+  (testing "a keyword refusal carries the keyword and the live atom limit"
+    (let [e (with-tight-guard 0.0 1
+              (fn [] (thrown (fn [] (BeamLisp.Reader/read_one ":danger")))))
+          msg (str (ex-message e))]
+      (is (= :Elixir.BeamLisp.Reader.AtomLimitError (:__struct__ e)))
+      (is (includes? msg ":danger")
+          "the offending keyword is named")
+      (is (includes? msg (str (erlang/system_info :atom_limit)))
+          "the LIVE atom limit is quoted, not a hardcoded ceiling"))))
+
+; --- the guard must NOT fire where it should not ------------------------------
+
+(deftest default-config-never-fires-on-normal-reads
+  (testing "with no env override, a prelude-style read passes untouched"
+    ; 0.9 high-water, interval 256; the live table is far below 90% of the
+    ; limit, so the whole prelude-style read must return its five forms.
+    (clear-guard!)
+    (let [forms (BeamLisp.Reader/read_all "(defn foo [x y] (let [a 1 b :kw c (map f [1 2 3])] (+ x (* a y) c)))\n:ok :again\n[a b c] {k v}\n")]
+      (is (= 5 (count forms))
+          "defn / :ok / :again / [a b c] / {k v} — five forms, zero refusals"))))
+
+(deftest plain-literals-never-count-toward-the-sampling-counter
+  (testing "numbers, strings, nil, booleans intern no atoms — no refusal"
+    ; Even at fraction 0.0 / interval 1, an all-literal read must pass untouched.
+    (let [v (with-tight-guard 0.0 1
+              (fn [] (BeamLisp.Reader/read_all "42 -7 2.5 \"text\" nil true false")))]
+      (is (= v [42 -7 2.5 "text" nil true false])
+          "the literals read back exactly, in order")
+      (is (= v '(42 -7 2.5 "text" nil true false))
+          "the read is the literal seq itself, not a rewritten one"))))
+
+(deftest sampling-counter-does-not-leak-between-reads
+  (testing "the per-read sample counter resets; a fresh read starts at zero"
+    (with-tight-guard 0.0 5
+      (fn []
+        ; 4 tokens < interval 5 → no sample, no error.
+        (is (= 4 (count (BeamLisp.Reader/read_all "a b c d")))
+            "4 tokens never reach interval 5")
+        ; A fresh 1-token read must NOT fire: if the counter had leaked it would
+        ; sit at 4 and this token would sample at 5 and trip the guard.
+        (is (= 1 (count (BeamLisp.Reader/read_all "e")))
+            "a fresh read starts its counter over, so 1 token is safe")
+        ; A 5-token read fires on its 5th token.
+        (is (= :Elixir.BeamLisp.Reader.AtomLimitError
+               (:__struct__ (thrown (fn [] (BeamLisp.Reader/read_all "e f g h i")))))
+            "the 5th token of a 5-token read samples and is refused")))))

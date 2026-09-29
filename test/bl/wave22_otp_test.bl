@@ -1,0 +1,199 @@
+; test/bl/wave22_otp_test.bl — supervision, hot code replacement and bounded
+; tracing, ported from test/beam_lisp/wave22_otp_test.exs.
+;
+; The original pinned the live BEAM-facing runtime the way a long-running
+; process meets it: a `supervise` tree heals a killed child, `:temporary`
+; children are DROPPED rather than left `:undefined`, `:one-for-all` restarts
+; its siblings, a running process observes a redefinition mid-flight through
+; var linking, and `trace`/`untrace` bracket a count-capped `:dbg` install.
+;
+; HOW THIS PORT IS FAITHFUL. Every assertion and every message shape is the
+; original's: the same `supervise` sources, the same `child-pid` poll, the same
+; vector-literal supervision children, the same `:saw` messages across the hot
+; swap, the same `count @seen == 2` / `@hits == 3` trace totals. The ExUnit
+; `setup`'s `on_exit(BeamLisp.Trace.untrace(nil, "cleanup"))` becomes a
+; `try`/`finally` around each trace test, because a failing trace left armed
+; would cascade into the NEXT test in this file — the same hazard the original
+; named.
+;
+; ONE ADAPTATION, forced by the isolated runner. The original bound its trace
+; counters with `(def seen (atom []))`, and the handler did a VAR lookup for
+; `w22tr/seen` at call time. `:dbg` runs the handler in a tracer process of its
+; own, which carries no beam-lisp env; under ExUnit that was harmless because
+; every var lived in the one global env, but `bl test` runs each file in a
+; FORKED env, so the tracer's `:global` fallback does not hold the file's vars.
+; The counters are therefore bound LEXICALLY (`(let [seen (atom [])] …)`), so the
+; handler fun captures the atom in its own closure — which is what crosses into
+; the tracer process — and the assertion (`count @seen == 2`, `@hits == 3`) is
+; unchanged. The traced fn, the calls, and the cap are exactly the original's.
+;
+; Restart tests race by nature: killing a child and asking for the new pid are
+; separate events. Every wait here POLLS with a deadline (`until`), exactly as
+; the original did — a hopeful sleep is a flaky test.
+;
+; ── coverage map (ExUnit test → BL deftest) ────────────────────────────────
+;   a killed child comes back with a new pid          → a-killed-child-comes-back-with-a-new-pid
+;   which_children and count_children report the tree → which-children-and-count-children-report-the-tree
+;   :temporary children are not restarted             → temporary-children-are-not-restarted
+;   :one-for-all restarts a sibling when one child dies→ one-for-all-restarts-a-sibling-when-one-child-dies
+;   a running process observes a redefinition mid-flight→ a-running-process-observes-a-redefinition-mid-flight
+;   trace captures calls and untrace stops it          → trace-captures-calls-and-untrace-stops-it
+;   the count cap engages so a trace cannot run away   → the-count-cap-engages-so-a-trace-cannot-run-away
+;
+; Run: bin/bl test test/bl/wave22_otp_test.bl
+
+(ns wave22-otp.test)
+
+; The ExUnit `eval/2`: `BeamLisp.init/0`, claim the namespace GLOBALLY
+; (`in_ns`, because `current_ns` outlives one evaluation and the caller's own
+; `deftest` records land by it), then compile and run `source` at a fresh env.
+(defn- ev [ns source]
+  (BeamLisp/init)
+  (BeamLisp.Env/in_ns ns)
+  (BeamLisp.Compiler/eval_string source (BeamLisp.Compiler/new_env ns)))
+
+; Poll `f` until it returns truthy or the deadline passes. `nil` and `false`
+; are the two "keep waiting" answers the original distinguished, so a truthy
+; result other than them is returned as-is (the original returned the VALUE,
+; not merely true — `second = until(...)` relied on it).
+(defn- until
+  ([f] (until f 2000))
+  ([f timeout]
+   (do-until f (+ (System/monotonic_time :millisecond) timeout))))
+
+(defn- do-until [f deadline]
+  (let [v (f)]
+    (cond
+      (nil? v) (if (< (System/monotonic_time :millisecond) deadline)
+                 (do (Process/sleep 10) (do-until f deadline))
+                 nil)
+      (erlang/== false v) (if (< (System/monotonic_time :millisecond) deadline)
+                            (do (Process/sleep 10) (do-until f deadline))
+                            false)
+      :else v)))
+
+; The module/function a var currently links to. Resolving once and calling
+; through it is exactly what a long-running process does.
+; `BeamLisp.Env.link` answers `{:ok, {mod, fixed, variadic}}`.
+(defn- greet-link [ns]
+  (let [inner (erlang/element 2 (BeamLisp.Env/link ns "greet"))]
+    (list (erlang/element 1 inner) (get (erlang/element 2 inner) 0))))
+
+; The pid of child `id` in `sup`, polling while the child is absent (mid-restart
+; or `:undefined`). `which_children` hands back tuples `{id, pid, type, mods}`.
+(defn- child-pid [sup id]
+  (until (fn []
+           (let [c (Enum/find (Supervisor/which_children sup)
+                              (fn [t] (and (erlang/is_tuple t)
+                                           (= id (erlang/element 1 t))
+                                           (erlang/is_pid (erlang/element 2 t)))))]
+             (if (nil? c) nil (erlang/element 2 c))))))
+
+; ── supervision trees ─────────────────────────────────────────────────────────
+
+(deftest a-killed-child-comes-back-with-a-new-pid
+  (let [sup (ev "w22sup1"
+                "(ns w22sup1) (supervise :one-for-one [(worker :w (fn [] (Process/sleep 60000)))])")
+        first (child-pid sup :w)]
+    (is (erlang/is_pid first))
+
+    (Process/exit first :kill)
+
+    (let [second (until (fn []
+                          (let [p (child-pid sup :w)]
+                            (if (and (erlang/is_pid p) (not= p first)) p nil))))]
+      (is (erlang/is_pid second))
+      (is (not= second first))
+
+      (Supervisor/stop sup))))
+
+(deftest which-children-and-count-children-report-the-tree
+  (let [sup (ev "w22sup2"
+                "(ns w22sup2) (supervise :one-for-one [(worker :a (fn [] (Process/sleep 60000))) (worker :b (fn [] (Process/sleep 60000)))])")
+        c (Supervisor/count_children sup)]
+    (is (= 2 (get c :active)))
+    (is (= 2 (get c :workers)))
+    (is (= 2 (get c :specs)))
+    (is (= 2 (count (Supervisor/which_children sup))))
+
+    (Supervisor/stop sup)))
+
+(deftest temporary-children-are-not-restarted
+  ; OTP does not merely leave a :temporary child dead — it drops the spec
+  ; entirely, so the child disappears from the tree rather than lingering as
+  ; :undefined the way a :transient one would.
+  (let [sup (ev "w22sup3"
+                "(ns w22sup3) (supervise :one-for-one [(worker :t (fn [] (Process/sleep 60000)) {:restart :temporary})])")
+        pid (child-pid sup :t)]
+    (Process/exit pid :kill)
+
+    (is (until (fn [] (if (empty? (Supervisor/which_children sup)) true nil))))
+    (let [c (Supervisor/count_children sup)]
+      (is (= 0 (get c :active)))
+      (is (= 0 (get c :specs))))
+
+    (Supervisor/stop sup)))
+
+(deftest one-for-all-restarts-a-sibling-when-one-child-dies
+  (let [sup (ev "w22sup4"
+                "(ns w22sup4) (supervise :one-for-all [(worker :a (fn [] (Process/sleep 60000))) (worker :b (fn [] (Process/sleep 60000)))])")
+        a1 (child-pid sup :a)
+        b1 (child-pid sup :b)]
+
+    (Process/exit a1 :kill)
+
+    ; The sibling is restarted too — that is what distinguishes :one-for-all
+    ; from :one-for-one, and it is the only observable difference between the
+    ; two strategies.
+    (let [b2 (until (fn []
+                      (let [p (child-pid sup :b)]
+                        (if (and (erlang/is_pid p) (not= p b1)) p nil))))]
+      (is (erlang/is_pid b2))
+      (is (not= b2 b1))
+
+      (Supervisor/stop sup))))
+
+; ── hot code replacement ──────────────────────────────────────────────────────
+
+(deftest a-running-process-observes-a-redefinition-mid-flight
+  ; This is the BEAM capability no other Lisp host offers. It already worked
+  ; as a consequence of var linking; the test is what turns it from an
+  ; accident into a guarantee.
+  (ev "w22hot" "(ns w22hot) (defn greet [] \"v1\")")
+
+  (let [test-pid (erlang/self)
+        ; Call the linked fn directly: `Env.current_ns` is a single global
+        ; Agent, so a looping process that evaluated source would fight every
+        ; other test for it — and resolving once and calling through is what a
+        ; real long-running process does anyway.
+        [mod fname] (greet-link "w22hot")
+        looper (spawn (fn []
+                        (Enum/each (Range/new 1 60)
+                                   (fn [_]
+                                     (erlang/send test-pid
+                                                  (tuple :saw (erlang/apply mod fname (list))))
+                                     (Process/sleep 20)))))]
+    (is (receive [:saw "v1"] true (after 2000 false)))
+
+    (ev "w22hot" "(defn greet [] \"v2\")")
+
+    ; The SAME process, never restarted, must start seeing the new definition.
+    (is (receive [:saw "v2"] true (after 3000 false)))
+
+    (Process/exit looper :kill)))
+
+; ── tracing ───────────────────────────────────────────────────────────────────
+
+(deftest trace-captures-calls-and-untrace-stops-it
+  (try
+    (is (== 2 (ev "w22tr"
+                  "(ns w22tr) (defn work [x] (* x 2)) (let [seen (atom [])] (trace 'work (fn [call] (swap! seen conj call))) (work 1) (work 2) (Process/sleep 200) (untrace 'work) (work 3) (Process/sleep 200) (count @seen))")))
+    (finally (BeamLisp.Trace/untrace nil "cleanup"))))
+
+(deftest the-count-cap-engages-so-a-trace-cannot-run-away
+  ; :dbg can take a production node down under load. The cap is the difference
+  ; between a tool and a footgun, so it is asserted rather than trusted.
+  (try
+    (is (== 3 (ev "w22cap"
+                  "(ns w22cap) (defn tick [x] x) (let [hits (atom 0)] (trace 'tick (fn [_call] (swap! hits inc)) {:max-calls 3}) (doall (map tick (range 20))) (Process/sleep 300) (untrace 'tick) @hits)")))
+    (finally (BeamLisp.Trace/untrace nil "cleanup"))))

@@ -564,10 +564,9 @@ calling our `NONE`, our `doseqres` and our `compiled-select-any*`:
 - **slice 14 (`do-keypath-transform`)** — rebuilds a map around a new value,
   leaving everything else untouched.
 
-They are registered in `specter_compat_test.exs` under "verbatim slices
-running on beam-lisp's ported engine". The engine is published as
-`com.rpl.specter.impl`, which is where a vendored slice's `i/` alias
-points — the fixture is not adapted to us, we are adapted to it.
+They are registered in `test/bl/specter_compat_test.bl` under the
+verbatim-slice tests. The engine is published as `com.rpl.specter.impl`,
+which is where a vendored slice's `i/` alias points — the fixture is not adapted to us, we are adapted to it.
 
 ### What the port found that the tests did not
 

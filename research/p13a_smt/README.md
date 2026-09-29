@@ -1,6 +1,6 @@
 # P13a — SMT encoding spike: findings
 
-Run: `elixir research/p13a_smt/encode.exs` (requires z3 on PATH; tested 4.16.0)
+Run: `bin/bl run research/p13a_smt/encode.bl` (uses the repo's pinned z3, `priv/z3/bin/z3`; 4.16.0)
 
 ## Questions and answers
 
@@ -28,27 +28,34 @@ operand grammar with `+`/`-` is a small, safe v0.1 extension that turns
 that case into a proof.
 
 **Q: latency?**
-100 queries, tagged encoding:
+100 queries, tagged encoding. Recorded on the Elixir spike (idle machine):
 
 | mode | p50 | p99 | max |
 |---|---|---|---|
 | fresh `z3 -smt2` process | 10 ms | 13 ms | 13 ms |
 | persistent `z3 -in` port | 2 ms | 3 ms | 3 ms |
 
-At 2 ms/query, every guard in the repo (dozens) costs well under 100 ms,
-once, and FEAT-002-style caching (queries are pure functions of source)
-amortizes repeats to ~0. Latency is a non-issue; no NIF needed.
+`encode.bl` re-measures both — a z3 spawned per query against one persistent
+`z3 -in` port — and prints p50/p99/max itself. The absolute milliseconds
+track machine load; the comparison is the point, and the persistent port is
+several times cheaper at p50. Every guard in the repo (dozens) therefore
+costs well under 100 ms, once, and FEAT-002-style caching (queries are pure
+functions of source) amortizes repeats to ~0. Latency is a non-issue; no NIF
+needed.
 
 ## Surprise finding
 
-Elixir 1.20's own type checker flagged a genuinely dead branch in this
-spike mid-run (`is_integer(x)` under an `is_atom(x)` guard). Inference
-catching bugs in the inference prototype: the strongest possible argument
-for the feature, delivered live.
+Elixir 1.20's own type checker flagged a genuinely dead branch in the
+Elixir prototype of this spike mid-run (`is_integer(x)` under an
+`is_atom(x)` guard). Inference catching bugs in the inference prototype:
+the strongest possible argument for the feature, delivered live.
+
+The `encode.bl` port carries no such branch: `operand` tests `symbol?` and
+`int?` as disjoint cases, so every clause is reachable.
 
 ## Architecture conclusions (input to the backend decision gate)
 
-1. Port driver (`z3 -in`), not NIF: 2 ms p50 removes the performance
+1. Port driver (`z3 -in`), not NIF: a few ms p50 removes the performance
    motive for vendoring C++.
 2. The tag lattice and the solver COMPOSE, neither replaces the other:
    tags discharge solver preconditions (a comparison only encodes when

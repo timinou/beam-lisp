@@ -126,7 +126,7 @@ code never becomes bytecode); dynamic handles are checked at invocation;
 `defnative` is unavailable in any capped env. `:global` holds `:all`, so
 nothing existing changes. Hot path: 28–42ns per check.
 
-See `test/beam_lisp/caps_test.exs` — the deny-corpus that keeps every
+See `test/bl/caps_port_test.bl` — the deny-corpus that keeps every
 escape spelling failing closed.
 
 ### Tokens drive the fork — and the audit, and the rows

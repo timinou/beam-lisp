@@ -1,0 +1,591 @@
+; dispatch_table_test.bl — THE hazard-closure artifact. beam-lisp's map is a
+; PLAIN Elixir map and a struct IS a map on the BEAM, so every collection fn
+; must decide per value whether it sees a real collection, a record (a
+; user-facing map), a reference (atom/volatile/promise/future/reduced —
+; deliberately NOT collections), or a scalar that just is not one. Five
+; separate bugs of this exact class were found one at a time by accident over
+; the project's life; this table checks them ALL at once.
+;
+; Ported from the ExUnit `test/beam_lisp/dispatch_table_test.exs`. The table —
+; values, fn call-shapes, and the big expectation map — is preserved VERBATIM
+; as DATA, so the whole 18x18 (324-cell) matrix stays visible at a glance and a
+; wrong expectation is a one-line diff, not a buried assertion.
+;
+; What changes in the port:
+;
+;   * Values are CONSTRUCTED IN BEAM-LISP, by `ev-user` reading source in the
+;     `user` namespace — the same construction path the ExUnit original used
+;     (`Compiler.eval_string(src, Compiler.new_env("user"))`), so `#user/R{…}`,
+;     `{:bl_deftype …}` and `{:bl_reify …}` printing are pinned against the real
+;     user-facing path, not an Elixir term handed to the test.
+;   * The ExUnit `assert_raise mod` becomes `(catch e …)` + `(Map/get e
+;     :__struct__)`: BL catches a named exception class directly, and the class
+;     atom (`:Elixir.FunctionClauseError`) is what the old assertion compared.
+;   * `matches?`'s `result == expected` (Elixir `==`) becomes `erlang/=:=`,
+;     which for the types in this table agrees with `==` but keeps list vs
+;     vector STRICT — the original pinned `(rest v)` as an Elixir LIST and
+;     `(seq v)` as a `%Vector{}`, and BL's own `=` would equate the two.
+;
+; A cell with no decided expectation is a bug in the table itself, and a cell
+; whose `{:gap, _, reason}` is not in the deliberate inventory is a silent
+; divergence — both are themselves asserted below.
+;
+; Run: bl test test/bl/dispatch_table_test.bl
+
+(ns dispatch-table.test)
+
+; ── eval in the `user` namespace, exactly as the ExUnit setup did ────────────
+; The record/deftype/protocol fixtures must live in `user` so their printed
+; identity (`#user/R{`), which the table pins, is the user-facing one.
+
+(defn- ev-user [src]
+  (BeamLisp.Compiler/eval_string src (BeamLisp.Compiler/new_env "user")))
+
+; A load-time foreign-ns eval leaves the process in `user`, which would make
+; every LATER top-level form — the `deftest`s — compile and register in the
+; wrong namespace (ward then reports `0 passed` while staying green). So the
+; ns is captured and restored inside ONE form, before the next form compiles.
+(defn- setup-fixtures! []
+  (let [here (BeamLisp.Env/current_ns)]
+    (ev-user "(defrecord R [a b])")
+    (ev-user "(deftype DT [a b])")
+    (ev-user "(defprotocol RP (rm [this]))")
+    (BeamLisp.Env/in_ns here)))
+
+(setup-fixtures!)
+
+; ── the table ────────────────────────────────────────────────────────────────
+
+; Each value's beam-lisp construction expression. These are interpolated into
+; every fn's call shape below.
+(def values
+  [["plain map" "{:a 1 :b 2}"]
+   ["vector" "[1 2 3]"]
+   ["set" "#{1 2 3}"]
+   ["list" "(list 1 2 3)"]
+   ["lazy seq" "(map inc (range 1 4))"]
+   ["string" "\"ab\""]
+   ["nil" "nil"]
+   ["integer" "42"]
+   ["keyword" ":k"]
+   ["atom-ref" "(atom 1)"]
+   ["volatile" "(volatile! 1)"]
+   ["promise" "(promise)"]
+   ["record" "(->R 1 2)"]
+   ["deftype" "(->DT 1 2)"]
+   ["reify" "(reify RP (rm [this] :v))"]
+   ["fn" "(fn ([x] x) ([x y] y))"]
+   ["transient" "(transient {:a 1})"]
+   ; An Erlang tuple: POSITIONAL data, not associative. It reads with
+   ; first/rest/nth/seq/count exactly as a vector does — the language's
+   ; pattern layer already treats the two alike (`[p q]` matches both) —
+   ; while the associative ops refuse, because a tuple has no keys.
+   ;
+   ; `coll?`/`vector?`/`seq?` are all FALSE: a tuple is a distinct type
+   ; that happens to be readable positionally, not a beam-lisp collection
+   ; literal, and conflating them would make `(vector? t)` lie about what
+   ; `conj` will accept.
+   ["tuple" "(tuple 1 2 3)"]])
+
+; Each fn's call shape; `%s` is replaced by the value expression. One shape
+; per fn — the fixed extra args (`:a` for key-ops, `4` for conj) are chosen
+; so every collection type answers meaningfully.
+;
+; `get` deliberately ANSWERS `nil` on a non-associative value (string/keyword/
+; number/fn/deftype/reify/list/tuple) — the project's standing design after
+; 9f5d08b — while REFERENCES (atom/volatile/promise) still RAISE. The table
+; asserts the deviation instead of papering over it.
+(def fns
+  [["count" "(count %s)"]
+   ["seq" "(seq %s)"]
+   ["first" "(first %s)"]
+   ["rest" "(rest %s)"]
+   ["next" "(next %s)"]
+   ["get" "(get %s :a)"]
+   ["assoc" "(assoc %s :a 1)"]
+   ["conj" "(conj %s 4)"]
+   ["contains?" "(contains? %s :a)"]
+   ["find" "(find %s :a)"]
+   ["empty?" "(empty? %s)"]
+   ["coll?" "(coll? %s)"]
+   ["map?" "(map? %s)"]
+   ["vector?" "(vector? %s)"]
+   ["set?" "(set? %s)"]
+   ["seq?" "(seq? %s)"]
+   ["transientable?" "(transientable? %s)"]
+   ["print-str" "(print-str %s)"]])
+
+; Expectation shapes:
+;   [:eq v]             exact structural equality (Elixir `==`; see `same?`)
+;   [:raises mod]       raises an exception of class `mod`
+;   [:truthy]/[:falsey] not nil-or-false / nil-or-false
+;   [:prefix s]         a string starting with s
+;   [:entry [k v]]      a single [k v] entry vector
+;   [:entry_one_of kvs] a single entry whose [k v] is in the list
+;   [:entries kvs]      a list of entry vectors whose [k v] SET equals kvs
+;   [:one_of exps]      any of the sub-expectations holds
+;   [:record_fields m]  a user record whose public fields equal m
+;   [:gap inner r]      asserts `inner` (current behaviour) and records a
+;                       KNOWINGLY-RECORDED divergence reason `r` in the gap
+;                       inventory (guarded by a dedicated test, so gaps
+;                       cannot silently multiply).
+;
+; The value literals below are BEAM-LISP: `[1 2 3]` is a Vector (Elixir
+; `Vector.new([1,2,3])` / `%Vector{items: {…}}`), `(list 2 3)` is a proper
+; list (Elixir `[2, 3]`), `#{…}` is a Set, `{:a 1}` is a plain map.
+(def expectations
+  {"plain map" {"count" [:eq 2]
+                "seq" [:entries [[:a 1] [:b 2]]]
+                "first" [:entry_one_of [[:a 1] [:b 2]]]
+                "rest" [:one_of [[:entries [[:a 1]]] [:entries [[:b 2]]]]]
+                "next" [:one_of [[:entries [[:a 1]]] [:entries [[:b 2]]]]]
+                "get" [:eq 1]
+                "assoc" [:eq {:a 1 :b 2}]
+                "conj" [:raises :Elixir.FunctionClauseError]
+                "contains?" [:eq true]
+                "find" [:eq [:a 1]]
+                "empty?" [:eq false]
+                "coll?" [:eq true]
+                "map?" [:eq true]
+                "vector?" [:eq false]
+                "set?" [:eq false]
+                "seq?" [:eq false]
+                "transientable?" [:eq true]
+                "print-str" [:prefix "{:"]}
+   "vector" {"count" [:eq 3]
+             "seq" [:eq [1 2 3]]
+             "first" [:eq 1]
+             "rest" [:eq (list 2 3)]
+             "next" [:eq (list 2 3)]
+             "get" [:eq nil]
+             "assoc" [:raises :Elixir.ArgumentError]
+             "conj" [:eq [1 2 3 4]]
+             "contains?" [:eq false]
+             "find" [:eq nil]
+             "empty?" [:eq false]
+             "coll?" [:eq true]
+             "map?" [:eq false]
+             "vector?" [:eq true]
+             "set?" [:eq false]
+             "seq?" [:eq false]
+             "transientable?" [:eq true]
+             "print-str" [:eq "[1 2 3]"]}
+   "set" {"count" [:eq 3]
+          "seq" [:eq (list 1 2 3)]
+          "first" [:eq 1]
+          "rest" [:eq (list 2 3)]
+          "next" [:eq (list 2 3)]
+          "get" [:eq nil]
+          "assoc" [:raises :Elixir.ArgumentError]
+          "conj" [:eq #{1 2 3 4}]
+          "contains?" [:eq false]
+          "find" [:eq nil]
+          "empty?" [:eq false]
+          "coll?" [:eq true]
+          "map?" [:eq false]
+          "vector?" [:eq false]
+          "set?" [:eq true]
+          "seq?" [:eq false]
+          "transientable?" [:eq true]
+          "print-str" [:eq "#{1 2 3}"]}
+   "list" {"count" [:eq 3]
+           "seq" [:eq (list 1 2 3)]
+           "first" [:eq 1]
+           "rest" [:eq (list 2 3)]
+           "next" [:eq (list 2 3)]
+           ; total get: non-associative → nil (9f5d08b)
+           "get" [:eq nil]
+           "assoc" [:raises :Elixir.FunctionClauseError]
+           "conj" [:eq (list 4 1 2 3)]
+           "contains?" [:eq false]
+           "find" [:eq nil]
+           "empty?" [:eq false]
+           "coll?" [:eq true]
+           "map?" [:eq false]
+           "vector?" [:eq false]
+           "set?" [:eq false]
+           "seq?" [:eq true]
+           "transientable?" [:eq false]
+           "print-str" [:eq "(1 2 3)"]}
+   "lazy seq" {"count" [:eq 3]
+               "seq" [:truthy]
+               "first" [:eq 2]
+               "rest" [:eq (list 3 4)]
+               "next" [:eq (list 3 4)]
+               "get" [:eq nil]
+               "assoc" [:raises :Elixir.ArgumentError]
+               "conj" [:truthy]
+               "contains?" [:eq false]
+               "find" [:eq nil]
+               "empty?" [:eq false]
+               "coll?" [:eq true]
+               "map?" [:eq false]
+               "vector?" [:eq false]
+               "set?" [:eq false]
+               "seq?" [:eq true]
+               "transientable?" [:eq false]
+               "print-str" [:eq "(2 3 4)"]}
+   "string" {"count" [:eq 2]
+             ; A string is seqable, as in Clojure. Elements are single-character
+             ; STRINGS (beam-lisp has no character type), which is what `count`
+             ; and `subs` already assumed — both are char-based, so `seq` had to
+             ; agree or the language disagreed with itself about one value.
+             ;
+             ; This was the `:string_seq` gap. It closed when `(into [] "ab")`
+             ; was found to answer `[nil]`: silently wrong, which is worse than
+             ; the FunctionClauseError beside it, because nothing about a
+             ; plausible vector looks wrong.
+             "seq" [:eq (list "a" "b")]
+             "first" [:eq "a"]
+             "rest" [:eq (list "b")]
+             "next" [:eq (list "b")]
+             "get" [:eq nil]
+             "assoc" [:raises :Elixir.FunctionClauseError]
+             "conj" [:raises :Elixir.FunctionClauseError]
+             "contains?" [:eq false]
+             "find" [:eq nil]
+             "empty?" [:eq false]
+             "coll?" [:eq false]
+             "map?" [:eq false]
+             "vector?" [:eq false]
+             "set?" [:eq false]
+             "seq?" [:eq false]
+             "transientable?" [:eq false]
+             "print-str" [:eq "ab"]}
+   "nil" {"count" [:eq 0]
+          "seq" [:eq nil]
+          "first" [:eq nil]
+          "rest" [:eq (list)]
+          "next" [:eq nil]
+          "get" [:eq nil]
+          "assoc" [:eq {:a 1}]
+          "conj" [:eq (list 4)]
+          "contains?" [:eq false]
+          "find" [:eq nil]
+          "empty?" [:eq true]
+          "coll?" [:eq false]
+          "map?" [:eq false]
+          "vector?" [:eq false]
+          "set?" [:eq false]
+          "seq?" [:eq false]
+          "transientable?" [:eq false]
+          "print-str" [:eq "nil"]}
+   "integer" {"count" [:raises :Elixir.FunctionClauseError]
+              "seq" [:raises :Elixir.FunctionClauseError]
+              "first" [:eq nil]
+              "rest" [:eq (list)]
+              "next" [:eq nil]
+              "get" [:eq nil]
+              "assoc" [:raises :Elixir.FunctionClauseError]
+              "conj" [:raises :Elixir.FunctionClauseError]
+              "contains?" [:eq false]
+              "find" [:eq nil]
+              "empty?" [:raises :Elixir.FunctionClauseError]
+              "coll?" [:eq false]
+              "map?" [:eq false]
+              "vector?" [:eq false]
+              "set?" [:eq false]
+              "seq?" [:eq false]
+              "transientable?" [:eq false]
+              "print-str" [:eq "42"]}
+   "keyword" {"count" [:raises :Elixir.FunctionClauseError]
+              "seq" [:raises :Elixir.FunctionClauseError]
+              "first" [:eq nil]
+              "rest" [:eq (list)]
+              "next" [:eq nil]
+              "get" [:eq nil]
+              "assoc" [:raises :Elixir.FunctionClauseError]
+              "conj" [:raises :Elixir.FunctionClauseError]
+              "contains?" [:eq false]
+              "find" [:eq nil]
+              "empty?" [:raises :Elixir.FunctionClauseError]
+              "coll?" [:eq false]
+              "map?" [:eq false]
+              "vector?" [:eq false]
+              "set?" [:eq false]
+              "seq?" [:eq false]
+              "transientable?" [:eq false]
+              "print-str" [:eq ":k"]}
+   "atom-ref" {"count" [:raises :Elixir.ArgumentError]
+               "seq" [:raises :Elixir.ArgumentError]
+               "first" [:raises :Elixir.ArgumentError]
+               "rest" [:raises :Elixir.ArgumentError]
+               "next" [:raises :Elixir.ArgumentError]
+               "get" [:raises :Elixir.ArgumentError]
+               "assoc" [:raises :Elixir.ArgumentError]
+               "conj" [:raises :Elixir.ArgumentError]
+               "contains?" [:raises :Elixir.ArgumentError]
+               "find" [:raises :Elixir.ArgumentError]
+               "empty?" [:raises :Elixir.ArgumentError]
+               "coll?" [:eq false]
+               "map?" [:eq false]
+               "vector?" [:eq false]
+               "set?" [:eq false]
+               "seq?" [:eq false]
+               "transientable?" [:eq false]
+               "print-str" [:prefix "%BeamLisp.Atom"]}
+   "volatile" {"count" [:raises :Elixir.ArgumentError]
+               "seq" [:raises :Elixir.ArgumentError]
+               "first" [:raises :Elixir.ArgumentError]
+               "rest" [:raises :Elixir.ArgumentError]
+               "next" [:raises :Elixir.ArgumentError]
+               "get" [:raises :Elixir.ArgumentError]
+               "assoc" [:raises :Elixir.ArgumentError]
+               "conj" [:raises :Elixir.ArgumentError]
+               "contains?" [:raises :Elixir.ArgumentError]
+               "find" [:raises :Elixir.ArgumentError]
+               "empty?" [:raises :Elixir.ArgumentError]
+               "coll?" [:eq false]
+               "map?" [:eq false]
+               "vector?" [:eq false]
+               "set?" [:eq false]
+               "seq?" [:eq false]
+               "transientable?" [:eq false]
+               "print-str" [:prefix "%BeamLisp.Volatile"]}
+   "promise" {"count" [:raises :Elixir.ArgumentError]
+              "seq" [:raises :Elixir.ArgumentError]
+              "first" [:raises :Elixir.ArgumentError]
+              "rest" [:raises :Elixir.ArgumentError]
+              "next" [:raises :Elixir.ArgumentError]
+              "get" [:raises :Elixir.ArgumentError]
+              "assoc" [:raises :Elixir.ArgumentError]
+              "conj" [:raises :Elixir.ArgumentError]
+              "contains?" [:raises :Elixir.ArgumentError]
+              "find" [:raises :Elixir.ArgumentError]
+              "empty?" [:raises :Elixir.ArgumentError]
+              "coll?" [:eq false]
+              "map?" [:eq false]
+              "vector?" [:eq false]
+              "set?" [:eq false]
+              "seq?" [:eq false]
+              "transientable?" [:eq false]
+              "print-str" [:prefix "%BeamLisp.Promise"]}
+   "record" {"count" [:eq 2]
+             "seq" [:entries [[:a 1] [:b 2]]]
+             "first" [:entry_one_of [[:a 1] [:b 2]]]
+             "rest" [:one_of [[:entries [[:a 1]]] [:entries [[:b 2]]]]]
+             "next" [:one_of [[:entries [[:a 1]]] [:entries [[:b 2]]]]]
+             "get" [:eq 1]
+             "assoc" [:record_fields {:a 1 :b 2}]
+             "conj" [:raises :Elixir.FunctionClauseError]
+             "contains?" [:eq true]
+             "find" [:eq [:a 1]]
+             "empty?" [:eq false]
+             "coll?" [:eq true]
+             ; Resolved in wave 27: a record answers map? true, as in Clojure.
+             "map?" [:eq true]
+             "vector?" [:eq false]
+             "set?" [:eq false]
+             "seq?" [:eq false]
+             "transientable?" [:eq true]
+             "print-str" [:prefix "#user/R{"]}
+   "deftype" {"count" [:raises :Elixir.FunctionClauseError]
+              "seq" [:raises :Elixir.FunctionClauseError]
+              "first" [:eq nil]
+              "rest" [:eq (list)]
+              "next" [:eq nil]
+              "get" [:eq nil]
+              "assoc" [:raises :Elixir.FunctionClauseError]
+              "conj" [:raises :Elixir.FunctionClauseError]
+              "contains?" [:eq false]
+              "find" [:eq nil]
+              "empty?" [:raises :Elixir.FunctionClauseError]
+              "coll?" [:eq false]
+              "map?" [:eq false]
+              "vector?" [:eq false]
+              "set?" [:eq false]
+              "seq?" [:eq false]
+              "transientable?" [:eq false]
+              "print-str" [:prefix "{:bl_deftype"]}
+   "reify" {"count" [:raises :Elixir.FunctionClauseError]
+            "seq" [:raises :Elixir.FunctionClauseError]
+            "first" [:eq nil]
+            "rest" [:eq (list)]
+            "next" [:eq nil]
+            "get" [:eq nil]
+            "assoc" [:raises :Elixir.FunctionClauseError]
+            "conj" [:raises :Elixir.FunctionClauseError]
+            "contains?" [:eq false]
+            "find" [:eq nil]
+            "empty?" [:raises :Elixir.FunctionClauseError]
+            "coll?" [:eq false]
+            "map?" [:eq false]
+            "vector?" [:eq false]
+            "set?" [:eq false]
+            "seq?" [:eq false]
+            "transientable?" [:eq false]
+            "print-str" [:prefix "{:bl_reify"]}
+   "fn" {"count" [:raises :Elixir.FunctionClauseError]
+         "seq" [:raises :Elixir.FunctionClauseError]
+         "first" [:eq nil]
+         "rest" [:eq (list)]
+         "next" [:eq nil]
+         "get" [:eq nil]
+         "assoc" [:raises :Elixir.FunctionClauseError]
+         "conj" [:raises :Elixir.FunctionClauseError]
+         "contains?" [:eq false]
+         "find" [:eq nil]
+         "empty?" [:raises :Elixir.FunctionClauseError]
+         "coll?" [:eq false]
+         "map?" [:eq false]
+         "vector?" [:eq false]
+         "set?" [:eq false]
+         "seq?" [:eq false]
+         "transientable?" [:eq false]
+         "print-str" [:eq "#fn[multi-arity]"]}
+   "tuple" {"count" [:eq 3]
+            "seq" [:eq (list 1 2 3)]
+            "first" [:eq 1]
+            "rest" [:eq (list 2 3)]
+            "next" [:eq (list 2 3)]
+            ; No keys, so every associative op refuses rather than inventing a
+            ; meaning for `(get {1,2,3} :a)`.
+            "get" [:eq nil]
+            "assoc" [:raises :Elixir.FunctionClauseError]
+            "conj" [:raises :Elixir.FunctionClauseError]
+            "contains?" [:eq false]
+            "find" [:eq nil]
+            "empty?" [:eq false]
+            "coll?" [:eq false]
+            "map?" [:eq false]
+            "vector?" [:eq false]
+            "set?" [:eq false]
+            "seq?" [:eq false]
+            "transientable?" [:eq false]
+            "print-str" [:eq "{1, 2, 3}"]}
+   "transient" {"count" [:raises :Elixir.FunctionClauseError]
+                "seq" [:raises :Elixir.FunctionClauseError]
+                "first" [:eq nil]
+                "rest" [:eq (list)]
+                "next" [:eq nil]
+                "get" [:eq 1]
+                "assoc" [:gap [:raises :Elixir.FunctionClauseError] :transient_map_ops]
+                "conj" [:gap [:raises :Elixir.FunctionClauseError] :transient_map_ops]
+                "contains?" [:gap [:eq false] :transient_map_ops]
+                "find" [:gap [:eq nil] :transient_map_ops]
+                "empty?" [:raises :Elixir.FunctionClauseError]
+                "coll?" [:gap [:eq false] :transient_coll_false]
+                "map?" [:gap [:eq false] :transient_coll_false]
+                "vector?" [:eq false]
+                "set?" [:eq false]
+                "seq?" [:eq false]
+                "transientable?" [:eq false]
+                "print-str" [:prefix "{:\"$transient\""]}})
+
+; Every `[:gap _, _, reason]` reason that the table must currently record.
+; A divergence that is known, deliberate, and reported is acceptable; a silent
+; one is not. Adding a new gap here is a conscious act.
+; (`:record_map_deliberate_false` was retired in wave 27 — `map?` now answers
+; true for a record, as Clojure does. `:string_seq` was retired when strings
+; became seqable. This list shrinking is the point: a resolved gap must leave
+; the inventory.)
+(def known-gap-reasons
+  [:transient_map_ops :transient_coll_false])
+
+; ── the comparison engine ────────────────────────────────────────────────────
+
+; Elixir `==` restricted to the types this table produces. `=:=` is exact
+; term equality, so it keeps the Vector-vs-list distinction the ExUnit
+; original's `==` had, and two independently-built Sets/records/maps compare
+; structurally. (No cell mixes an int and a float, where `==` and `=:=`
+; would differ.)
+(defn- same? [a b] (erlang/=:= a b))
+
+; `{:entries kvs}`: a single entry vector normalizes to itself; a seq of
+; entries normalizes element-wise and sorts, so map/set iteration order is
+; not part of the contract.
+(defn- normalize-entries [x]
+  (if (vector? x)
+    [(nth x 0) (nth x 1)]
+    (sort (map normalize-entries x))))
+
+(defn- matches? [result exp]
+  (let [k (nth exp 0) v (nth exp 1)]
+    (cond
+      (= :eq k) (same? result v)
+      (= :entry k) (same? result v)
+      (= :truthy k) (if result true false)
+      (= :falsey k) (not (if result true false))
+      (= :prefix k) (and (string? result) (starts-with? result v))
+      (= :entry_one_of k) (and (vector? result) (some? (some (fn [e] (same? e result)) v)))
+      (= :entries k) (same? (normalize-entries result) (sort v))
+      (= :one_of k) (some? (some (fn [e] (matches? result e)) v))
+      (= :record_fields k) (and (BeamLisp.Record/record? result)
+                                (same? (dissoc result :__struct__) v))
+      (= :gap k) (matches? result v)
+      :else false)))
+
+; `[:ok value]` or `[:raised class]` — the RAW exception module, what the
+; ExUnit `assert_raise mod` compared.
+(defn- outcome [thunk]
+  (try (list :ok (thunk))
+       (catch e (list :raised (Map/get e :__struct__)))))
+
+; Run one cell: `true` when it satisfies `exp`, else a human sentence naming
+; what was seen. `:raises` cannot go through `matches?` (it must not evaluate
+; to a value), and a `:gap` wraps either shape.
+(defn- cell-result [src exp]
+  (let [inner (if (= :gap (nth exp 0)) (nth exp 1) exp)
+        o (outcome (fn [] (ev-user src)))]
+    (cond
+      (= :raises (nth inner 0))
+      (if (and (= :raised (nth o 0)) (same? (nth inner 1) (nth o 1)))
+        true
+        (str "expected raise " (nth inner 1) ", got " (nth o 0) " " (nth o 1)))
+
+      (= :raised (nth o 0)) (str "unexpected raise " (nth o 1))
+      (matches? (nth o 1) inner) true
+      :else (str "got " (pr-str (nth o 1)) ", expected " (pr-str inner)))))
+
+; ── the matrix ───────────────────────────────────────────────────────────────
+
+(deftest every-value-answers-every-collection-fn-per-the-decided-semantics
+  (doseq [[vn vex] values
+          [fnn shape] fns]
+    (let [exp (get (get expectations vn) fnn)]
+      ; A cell with no decided expectation is a bug in the table itself.
+      (is (some? exp) (str "missing expectation for " vn " x " fnn))
+      (when (some? exp)
+        (let [r (cell-result (replace-str shape "%s" vex) exp)]
+          (is (same? true r) (str "cell " vn " x " fnn ": " r))))))
+
+  ; Every value was actually exercised (324 = 18 x 18); the loop above already
+  ; asserts each cell, so this count guards the table's own shape.
+  (is (= 324 (* (count values) (count fns)))))
+
+(deftest the-known-gap-inventory-is-exactly-what-is-recorded-no-silent-drift
+  ; Static over the table DATA (not the run): every `[:gap _, _, reason]`
+  ; recorded in the expectation matrix must be in the deliberate inventory, and
+  ; every deliberate reason must actually appear. A divergence that is known,
+  ; deliberate, and reported is acceptable; a silent one is not — and adding a
+  ; gap becomes a conscious act, not an accidental one.
+  (let [reasons (for [[vn _] values
+                      [fnn _] fns
+                      :let [exp (get (get expectations vn) fnn)]
+                      :when (and (some? exp) (= :gap (nth exp 0)))]
+                  (nth exp 2))]
+    (is (= (sort (distinct reasons)) (sort known-gap-reasons)))))
+
+; ── cells a single fixed call shape cannot express ───────────────────────────
+
+(deftest map-assoc-with-a-new-key-and-conj-with-a-k-v-entry
+  (is (= {:a 1 :c 3} (ev-user "(assoc {:a 1} :c 3)")))
+  (is (= {:a 1 :c 3} (ev-user "(conj {:a 1} [:c 3])"))))
+
+(deftest record-assoc-conj-add-a-new-field-while-preserving-the-type
+  (let [rec (ev-user "(->R 1 2)")]
+    (is (same? (ev-user "(assoc (->R 1 2) :c 3)") (Map/put rec :c 3)))
+    (is (same? (ev-user "(conj (->R 1 2) [:c 3])") (Map/put rec :c 3)))))
+
+(deftest a-set-get-contains-with-a-present-member-reads-through
+  (is (= 2 (ev-user "(get #{1 2 3} 2)")))
+  (is (= true (ev-user "(contains? #{1 2 3} 2)")))
+  ; `(find #{1 2 3} 2)` in Clojure is `[2 2]`; beam-lisp answers nil (find
+  ; is a map fn and a set is not a map). Reported; not fixed.
+  (is (= nil (ev-user "(find #{1 2 3} 2)"))))
+
+(deftest a-lazy-seq-conj-prepends-without-corrupting-improper-tail
+  (is (= 4 (ev-user "(first (conj (map inc (range 1 4)) 4))"))))
+
+(deftest empty-lazy-results-are-not-empty-vector
+  (is (= nil (ev-user "(seq (map inc (range 4 1)))"))))

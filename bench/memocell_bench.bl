@@ -1,0 +1,479 @@
+; bench/memocell_bench.bl — the MemoCell measurements, re-run as one bl program.
+;
+; These numbers were produced by three Elixir developer scripts that no longer
+; run here: `scripts/memocell_prototypes.exs`,
+; `scripts/memocell_cas_internals.exs` and `scripts/memocell_cas_breakdown.exs`.
+; They were `.exs` files started with `mix run`, and this tree has no Mix — the
+; one way in is `bin/bl`. The measurements are worth keeping: a citation in
+; docs/memory-policy/07-streaming-without-the-heap.bl.md depends on them, and a
+; benchmark that cannot run is a claim with no witness. So they are ported, in
+; the language the tree actually runs.
+;
+; Run it under a memory cap so a mistake in sizing kills this program and not
+; the machine:
+;
+;   systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=1G -- \
+;     bin/bl run bench/memocell_bench.bl
+;
+;   # or, where systemd-run is not available and you accept the cost:
+;   bin/bl run bench/memocell_bench.bl
+;
+; Every Erlang/OTP primitive — the clock, counters, `erts_debug`, process and
+; memory introspection, `:atomics` — is reached through bl's native interop
+; (`erlang/...`, `Process/...`, `Elixir.Agent/...`). The cells themselves go
+; through the public `BeamLisp.LazyMemo` surface. Nothing here is Elixir.
+;
+; The sections mirror the originals, one per claim:
+;
+;   A  one shared large immutable: copy-per-process vs one cell + N handles
+;   B  a CAS-backed mutable ref (`swap!`) vs an `Agent`
+;   C  herd protection: N concurrent forcers of one LazySeq compute once
+;   D  a dependency chain's build cost, and cycle rejection
+;   E  the consumer heap when folding 1M items: a list vs a native cursor
+;   F  live accounting read from stats, never by walking
+;   G  off-scheduler reclaim of a large cell
+;   H  the NIF-level CAS floor: nanoseconds per operation (the internals script)
+;   I  the CAS breakdown: which layer each nanosecond belongs to
+;
+; The lane-routing probe of the old breakdown is NOT here, because the thing it
+; named is gone: `nif_lane` was removed in PLAN-132 Phase 1 and reads now
+; self-guard inside the fast NIF (an over-ceiling cell answers `:reroute`). The
+; surviving shape is measured instead — the routing ANSWER, and the `op_lane`
+; counter that must stay zero.
+
+(ns bench.memocell)
+
+(BeamLisp.LazyMemo/ensure_loaded!)
+
+;; ── shared helpers ──────────────────────────────────────────────────────────
+
+(defn- mb [bytes] (Float/round (/ (* 1.0 bytes) 1048576) 2))
+
+(defn- us [t] (Float/round (* 1.0 t) 0))
+
+(defn- ns-per-op [t n] (Float/round (/ (* 1.0 t 1000) n) 0))
+
+(defn- flat-bytes [term]
+  (erlang/* (erlang/apply :erts_debug :flat_size (list term))
+            (erlang/system_info :wordsize)))
+
+(defn- total-mem [] (erlang/apply :erlang :memory (list :total)))
+
+(defn- gc-all
+  "Collect every process, then this one, then let the reclaimer settle. A
+   process that died between the listing and the collect is fine — the walk is
+   best-effort by design, which is why each collect is guarded."
+  []
+  (doseq [p (Process/list)]
+    (try (erlang/apply :erlang :garbage_collect (list p)) (catch _ :ok)))
+  (erlang/apply :erlang :garbage_collect (list))
+  (Process/sleep 50))
+
+(defn- tc
+  "Run `f` `n` times and print its cost per call, in nanoseconds. The label is
+   the whole prefix of the line, so callers own the section tag."
+  [label f n]
+  (let [res (erlang/apply :timer :tc
+              (list (fn []
+                      (loop [i 0]
+                        (if (< i n) (do (f) (recur (+ i 1))) :done)))))]
+    (println (str label "|ns_per_op=" (ns-per-op (first res) n)))))
+
+(defn- swap!
+  "`swap!` on a memo cell: read, apply, publish by compare-and-swap, retry on a
+   lost race. The retry branch is the whole point of the primitive."
+  [r f]
+  (let [cur (BeamLisp.LazyMemo/read r)
+        ans (BeamLisp.LazyMemo/exchange r cur (f cur) (list))]
+    (cond
+      (erlang/== ans :ok) :ok
+      (erlang/== ans :retry) (swap! r f)
+      :else (erlang/error (str "memo swap! gave up on " ans)))))
+
+(defn- drain
+  "Walk a raw cursor to exhaustion, timing one chunk pull. `pull` is the NIF
+   under test (`nif_cursor_chunk_fast` or the dirty `nif_cursor_chunk`); the
+   answer is `{chunk, tail}`, and a `nil` tail marks the last chunk."
+  [label pull big-list]
+  (let [c0 (BeamLisp.LazyMemo/cursor big-list)
+        res (erlang/apply :timer :tc
+              (list (fn []
+                      (loop [c c0 k 0]
+                        (let [v (pull c)]
+                          (if (nil? (erlang/element 2 v))
+                            (+ k 1)
+                            (recur (erlang/element 2 v) (+ k 1))))))))
+        t (first res)
+        chunks (erlang/element 2 res)]
+    (println (str label "|ns_per_chunk=" (ns-per-op t chunks) "|chunks=" chunks))))
+
+;; ── A. one shared immutable ─────────────────────────────────────────────────
+
+(defn- proto-a
+  "Hold one large map two ways across N processes: copied by message send, and
+   as N handles to one cell. The bytes are the consumer processes' own memory,
+   measured as a delta around each phase."
+  []
+  (let [n 500
+        big (Map/new (mapv (fn [i] (tuple i (tuple i (* i 2) (str "v" i))))
+                           (range 1 50001)))
+        size (flat-bytes big)]
+    (gc-all)
+    (let [base (total-mem)
+          copies (mapv (fn [_]
+                         (spawn (fn []
+                                  (receive [:hold t]
+                                    (do (Process/put :t t)
+                                        (receive [:stop] :ok))))))
+                       (range 1 (+ n 1)))]
+      (doseq [p copies] (erlang/send p (tuple :hold big)))
+      (Process/sleep 200)
+      (gc-all)
+      (let [copy-delta (- (total-mem) base)]
+        (doseq [p copies] (erlang/send p (tuple :stop)))
+        (Process/sleep 100)
+        (gc-all)
+        (let [base2 (total-mem)
+              cell (BeamLisp.LazyMemo/create big)
+              holders (mapv (fn [_]
+                              (spawn (fn []
+                                       (receive [:hold rr]
+                                         (do (Process/put :r rr)
+                                             (receive [:stop] :ok))))))
+                            (range 1 (+ n 1)))]
+          (doseq [p holders] (erlang/send p (tuple :hold cell)))
+          (Process/sleep 200)
+          (gc-all)
+          (let [cell-delta (- (total-mem) base2)
+                cd (max cell-delta 0)]
+            (doseq [p holders] (erlang/send p (tuple :stop)))
+            (println (str "A|value_bytes=" size
+                          "|n=" n
+                          "|expected_if_copied_mb=" (mb (* size n))
+                          "|copy_delta_mb=" (mb copy-delta)
+                          "|cell_delta_mb=" (mb cd)
+                          "|copies_held_equiv=" (Float/round (/ (* 1.0 copy-delta) size) 1)))))))))
+
+;; ── B. CAS ref vs Agent ─────────────────────────────────────────────────────
+
+(defn- proto-b
+  "The same counter, incremented the same number of times, through a memo cell's
+   compare-and-swap and through an Agent. This is a mutable-ref comparison: both
+   are correct, they differ in what each step costs."
+  []
+  (let [iters 100000
+        r (BeamLisp.LazyMemo/create 0)]
+    (swap! r (fn [_] 0))
+    (let [t-cas (first (erlang/apply :timer :tc
+                       (list (fn []
+                               (loop [i 0]
+                                 (if (< i iters)
+                                   (do (swap! r (fn [v] (+ v 1))) (recur (+ i 1)))
+                                   :done))))))
+          ag (Elixir.Agent/start_link (fn [] 0))
+          pid (erlang/element 2 ag)
+          t-ag (first (erlang/apply :timer :tc
+                      (list (fn []
+                              (loop [i 0]
+                                (if (< i iters)
+                                  (do (Elixir.Agent/update pid (fn [v] (+ v 1)))
+                                      (recur (+ i 1)))
+                                  :done))))))]
+      (Elixir.Agent/stop pid)
+      (println (str "B|iters=" iters
+                    "|cas_us=" (us t-cas)
+                    "|agent_us=" (us t-ag)
+                    "|cas_ops_per_s=" (Float/round (/ (* 1.0 iters) (/ (* 1.0 t-cas) 1000000)) 0)
+                    "|agent_ops_per_s=" (Float/round (/ (* 1.0 iters) (/ (* 1.0 t-ag) 1000000)) 0))))))
+
+;; ── C. herd protection ──────────────────────────────────────────────────────
+
+(defn- proto-c
+  "N processes force ONE shared LazySeq at once. The body must run once; the
+   independent run, where each process does the same work itself, is the
+   baseline. The counters are the evidence, the times are the payoff."
+  []
+  (let [n 200
+        parent (erlang/self)
+        ctr (erlang/apply :counters :new (list 1 (list)))
+        work (fn [] (erlang/apply :counters :add (list ctr 1 1)) (Process/sleep 30) :done)
+        lazy (BeamLisp.LazySeq/new (fn [] (list (work))))
+        t-shared (first (erlang/apply :timer :tc
+                    (list (fn []
+                            (doseq [_ (range 1 (+ n 1))]
+                              (spawn (fn []
+                                       (BeamLisp.LazySeq/to_list lazy)
+                                       (erlang/send parent (tuple :ok)))))
+                            (doseq [_ (range 1 (+ n 1))] (receive [:ok] :ok))))))
+        shared-runs (erlang/apply :counters :get (list ctr 1))
+        ctr2 (erlang/apply :counters :new (list 1 (list)))
+        work2 (fn [] (erlang/apply :counters :add (list ctr2 1 1)) (Process/sleep 30) :done)
+        t-indep (first (erlang/apply :timer :tc
+                   (list (fn []
+                           (doseq [_ (range 1 (+ n 1))]
+                             (spawn (fn []
+                                      (work2)
+                                      (erlang/send parent (tuple :ok)))))
+                           (doseq [_ (range 1 (+ n 1))] (receive [:ok] :ok))))))
+        indep-runs (erlang/apply :counters :get (list ctr2 1))]
+    (println (str "C|n=" n
+                  "|shared_runs=" shared-runs
+                  "|indep_runs=" indep-runs
+                  "|shared_ms=" (Float/round (/ (* 1.0 t-shared) 1000) 0)
+                  "|indep_ms=" (Float/round (/ (* 1.0 t-indep) 1000) 0)))))
+
+;; ── D. dependency chain + cycle rejection ───────────────────────────────────
+
+(defn- proto-d
+  "Build a chain of `depth` cells, each depending on its predecessor, and time
+   the build. Then try to close the chain into a cycle. Honest about scope: the
+   NIF rejects the cycle; reverse-edge invalidation is not in the NIF."
+  []
+  (let [depth 2000
+        built (erlang/apply :timer :tc
+                (list (fn []
+                        (reduce (fn [acc i]
+                                  (let [dep (if (empty? acc)
+                                              (tuple :node i)
+                                              (tuple :node i (first acc)))]
+                                    (cons (BeamLisp.LazyMemo/create dep) acc)))
+                                (list)
+                                (range 1 (+ depth 1))))))
+        t-build (first built)
+        chain (erlang/element 2 built)
+        head (first chain)
+        tail (last chain)
+        cyc (erlang/apply :timer :tc
+              (list (fn []
+                      (BeamLisp.LazyMemo/exchange tail (BeamLisp.LazyMemo/read tail)
+                                                  (tuple :back head) (list)))))
+        t-cyc (first cyc)
+        res (erlang/element 2 cyc)]
+    (println (str "D|depth=" depth
+                  "|build_us=" (us t-build)
+                  "|cycle_check_us=" (us t-cyc)
+                  "|cycle_result=" res))))
+
+;; ── E. off-heap cursor ──────────────────────────────────────────────────────
+
+(defn- proto-e
+  "Fold one million items in a fresh process, twice: once over the list itself,
+   once through a cursor over the same list. `total_heap_size` is the process's
+   allocated heap — what the walk had to make room for. The list walk allocates
+   the whole list; the cursor walk allocates one chunk at a time."
+  []
+  (let [big (Enum/to_list (range 1 1000001))
+        ;; the source is copied into native memory ONCE, here in the parent; the
+        ;; consumer below receives the handle, never the list.
+        cur (BeamLisp.SeqCursor/new big)
+        parent (erlang/self)
+        wordsize (erlang/system_info :wordsize)
+        heap-msg (fn [tag]
+                   (let [info (Process/info (erlang/self) :total_heap_size)]
+                     (erlang/send parent (tuple tag (* (erlang/element 2 info) wordsize)))))]
+    ;; list consumer: the source is copied into the process that folds it, so
+    ;; the walk has to make room for the whole list.
+    (spawn (fn []
+             (let [lst big]
+               (reduce + 0 lst)
+               (heap-msg :list_heap))))
+    (let [list-heap (receive [:list_heap b] b (after 30000 -1))]
+      ;; cursor consumer: it holds one handle and at most one chunk.
+      (spawn (fn []
+               (let [c cur]
+                 (loop [cc c acc 0]
+                   (let [cell (BeamLisp.SeqCursor/cell cc)]
+                     (if (nil? cell)
+                       acc
+                       (recur (rest cell) (+ acc (first cell))))))
+                 (heap-msg :cur_heap))))
+      (let [cur-heap (receive [:cur_heap b] b (after 30000 -1))]
+        (println (str "E|items=1000000"
+                      "|list_consumer_heap_mb=" (mb list-heap)
+                      "|cursor_consumer_heap_mb=" (mb cur-heap)
+                      "|ratio=" (Float/round (/ (* 1.0 list-heap) (max cur-heap 1)) 1)))))))
+
+;; ── F. live accounting ──────────────────────────────────────────────────────
+
+(defn- proto-f
+  "Create K cells holding flat terms, then read the live/retained accounting
+   from `stats` — no manual walking, no bookkeeping in the caller. The terms are
+   lists, not reference-counted binaries, so the retained bytes are the real
+   flat size."
+  []
+  (gc-all)
+  (let [s0 (BeamLisp.LazyMemo/stats)
+        mk (fn [seed] (mapv (fn [i] (tuple i (* i seed) (+ i seed))) (range 1 3001)))
+        k 100
+        cells (mapv (fn [j] (BeamLisp.LazyMemo/create (tuple :blob (mk j))))
+                    (range 1 (+ k 1)))]
+    (Process/sleep 50)
+    (let [s1 (BeamLisp.LazyMemo/stats)]
+      ;; use `cells` once more so the list is live at the peak reading, exactly
+      ;; as the original did; then collect and read the settled state.
+      (let [dropped (mapv (fn [_] nil) cells)]
+        (gc-all)
+        (Process/sleep 150)
+        (gc-all)
+        (let [s2 (BeamLisp.LazyMemo/stats)]
+          (println (str "F|created=" k
+                        "|cells_before=" (maps/get :live_cells s0 nil)
+                        "|cells_peak=" (maps/get :live_cells s1 nil)
+                        "|cells_after=" (maps/get :live_cells s2 nil)
+                        "|retained_before_mb=" (mb (maps/get :retained_bytes s0 nil))
+                        "|retained_peak_mb=" (mb (maps/get :retained_bytes s1 nil))
+                        "|retained_after_mb=" (mb (maps/get :retained_bytes s2 nil))
+                        "|dropped=" (count dropped))))))))
+
+;; ── G. off-scheduler reclaim ────────────────────────────────────────────────
+
+(defn- proto-g
+  "Time the collection of a large term freed as a plain BEAM value, versus the
+   same term dropped through a cell. The cell's free is deferred to the
+   reclaimer thread; `pending_reclaims` is polled to observe the deferral."
+  []
+  (let [parent (erlang/self)
+        mk (fn [] (mapv (fn [i] (tuple i (str "s" i) (list i (+ i 1) (+ i 2))))
+                        (range 1 100001)))
+        huge (mk)
+        sz (flat-bytes huge)
+        plain-owner (spawn (fn []
+                             (let [t (mk)]
+                               (receive [:go] :ok)
+                               (let [res (erlang/apply :timer :tc
+                                           (list (fn [] (erlang/apply :erlang :garbage_collect (list)))))]
+                                 (erlang/send parent (tuple :plain (first res)))))))
+        cell-owner (spawn (fn []
+                            (let [c (BeamLisp.LazyMemo/create (mk))]
+                              (receive [:go] :ok)
+                              (let [res (erlang/apply :timer :tc
+                                          (list (fn [] (erlang/apply :erlang :garbage_collect (list)))))]
+                                (erlang/send parent (tuple :cell (first res)))))))
+        _sent1 (erlang/send plain-owner (tuple :go))
+        t-plain (receive [:plain t] t (after 60000 -1))
+        _sent2 (erlang/send cell-owner (tuple :go))
+        t-cell (receive [:cell t] t (after 60000 -1))
+        max-pending (reduce (fn [acc _]
+                              (let [p (maps/get :pending_reclaims (BeamLisp.LazyMemo/stats) 0)]
+                                (Process/sleep 1)
+                                (max acc p)))
+                            0
+                            (range 1 51))]
+    (println (str "G|huge_bytes=" sz
+                  "|plain_owner_gc_us=" (us t-plain)
+                  "|cell_owner_gc_us=" (us t-cell)
+                  "|max_pending_observed=" max-pending))))
+
+;; ── H. the NIF-level CAS floor ──────────────────────────────────────────────
+
+(defn- cas-internals
+  "The internals script: nanoseconds per operation at the NIF boundary, with the
+   surrounding work argued away. `cas_fast_ok` is a CAS that succeeds; it fails
+   only the equality check. `nif_id` is the floor — the cost of a call that does
+   nothing but cross."
+  []
+  (let [n 100000
+        r (BeamLisp.LazyMemo/create 0)]
+    (Process/put :v (BeamLisp.LazyMemo/nif_read_fast r))
+    (tc "INT|cas_fast_ok"
+        (fn [] (let [v (Process/get :v)]
+                 (BeamLisp.LazyMemo/nif_compare_exchange_fast r v (+ v 1) (list) 8 (list))
+                 (Process/put :v (+ v 1))))
+        n)
+    (tc "INT|cas_fast_retry"
+        (fn [] (BeamLisp.LazyMemo/nif_compare_exchange_fast r :never 1 (list) 8 (list)))
+        n)
+    (tc "INT|read_fast"
+        (fn [] (BeamLisp.LazyMemo/nif_read_fast r))
+        n)
+    (tc "INT|nif_id_floor"
+        (fn [] (BeamLisp.LazyMemo/nif_id r))
+        n)))
+
+;; ── I. the CAS breakdown ────────────────────────────────────────────────────
+
+(defn- cas-breakdown
+  "The breakdown script: the same 100k-iteration loop over each layer, from the
+   full public swap down to the trivial NIF, so each nanosecond has an owner.
+   The fast-lane raw NIFs are the new floor; the dirty-lane ones are what the
+   router falls back to for a large cell."
+  []
+  (let [n 100000
+        r (BeamLisp.LazyMemo/create 0)]
+    (tc "CAS|full_swap"
+        (fn [] (let [v (BeamLisp.LazyMemo/read r)]
+                 (BeamLisp.LazyMemo/exchange r v (+ v 1) (list))))
+        n)
+    (tc "CAS|nif_read_only"
+        (fn [] (BeamLisp.LazyMemo/nif_read r))
+        n)
+    (Process/put :v (BeamLisp.LazyMemo/nif_read r))
+    (tc "CAS|nif_cas_only"
+        (fn [] (let [v (Process/get :v)]
+                 (BeamLisp.LazyMemo/nif_compare_exchange r v (+ v 1) (list) 8 (list))
+                 (Process/put :v (+ v 1))))
+        n)
+    (tc "CAS|nif_read_FAST"
+        (fn [] (BeamLisp.LazyMemo/nif_read_fast r))
+        n)
+    (Process/put :v (BeamLisp.LazyMemo/nif_read_fast r))
+    (tc "CAS|nif_cas_FAST"
+        (fn [] (let [v (Process/get :v)]
+                 (BeamLisp.LazyMemo/nif_compare_exchange_fast r v (+ v 1) (list) 8 (list))
+                 (Process/put :v (+ v 1))))
+        n)
+    ;; the lane question, in the shape the tree still answers it: a large cell's
+    ;; fast read refuses and routes to the dirty lane; `op_lane` must stay 0.
+    (let [big (BeamLisp.LazyMemo/create (Map/new (mapv (fn [i] (tuple i i)) (range 1 50001))))]
+      (println (str "CAS|big_cell_read_fast=" (BeamLisp.LazyMemo/nif_read_fast big)
+                    "|small_cell_read_fast=" (BeamLisp.LazyMemo/nif_read_fast r)))
+      (println (str "CAS|op_lane_stat="
+                    (maps/get :op_lane (BeamLisp.LazyMemo/nif_stats) nil))))
+    (tc "CAS|elixir_walk+estimate"
+        (fn [] (BeamLisp.LazyMemo/dependencies 1) (BeamLisp.LazyMemo/estimate_bytes 1))
+        n)
+    (tc "CAS|nif_stats_nondirty"
+        (fn [] (BeamLisp.LazyMemo/nif_stats))
+        n)
+    (tc "CAS|nif_id_nondirty"
+        (fn [] (BeamLisp.LazyMemo/nif_id r))
+        n)
+    ;; cursor chunk pull: the cheap lane vs the safe one, on a pre-built cursor
+    (let [big-list (Enum/to_list (range 1 1000001))
+          cur (BeamLisp.LazyMemo/cursor big-list)]
+      (println (str "CAS|cursor_dirty_chunks=" (BeamLisp.LazyMemo/cursor_dirty_chunks? cur)))
+      (drain "CAS|cursor_chunk_FAST" (fn [c] (BeamLisp.LazyMemo/nif_cursor_chunk_fast c)) big-list)
+      (drain "CAS|cursor_chunk_DIRTY" (fn [c] (BeamLisp.LazyMemo/nif_cursor_chunk c)) big-list))
+    (tc "CAS|create_small_FAST"
+        (fn [] (BeamLisp.LazyMemo/nif_new_fast 0 (list) 8))
+        n)
+    (tc "CAS|create_small_DIRTY"
+        (fn [] (BeamLisp.LazyMemo/nif_new 0 (list) 8))
+        n)
+    ;; a process-per-ref baseline, and the true lock-free primitive floor
+    (let [ag (Elixir.Agent/start_link (fn [] 0))
+          pid (erlang/element 2 ag)]
+      (tc "CAS|agent_update" (fn [] (Elixir.Agent/update pid (fn [v] (+ v 1)))) n)
+      (Elixir.Agent/stop pid))
+    (let [a (erlang/apply :atomics :new (list 1 (list)))]
+      (tc "CAS|atomics_add" (fn [] (erlang/apply :atomics :add (list a 1 1))) n))))
+
+;; ── run ─────────────────────────────────────────────────────────────────────
+
+(defn- guarded [name f]
+  (try (f) (catch e (println (str name "|ERROR|" (ex-message e))))))
+
+(defn- run-all []
+  (println "=== MEMOCELL BENCH START ===")
+  (guarded "A" proto-a)
+  (guarded "B" proto-b)
+  (guarded "C" proto-c)
+  (guarded "D" proto-d)
+  (guarded "E" proto-e)
+  (guarded "F" proto-f)
+  (guarded "G" proto-g)
+  (guarded "H" cas-internals)
+  (guarded "I" cas-breakdown)
+  (println "=== MEMOCELL BENCH END ==="))
+
+(run-all)
