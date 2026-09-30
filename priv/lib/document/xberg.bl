@@ -899,39 +899,75 @@
   (into []
         (map (fn [f] {:extension (field f :extension) :mime (field f :mime_type)}) (to-list (Xberg/list_supported_formats)))))
 
-(defn- probe-capabilities
-  "Probe this deployment's readiness. `tessdata` is the directory the extraction
-   config points the engine at: the probe must ask THAT directory, not the host
-   default, or a shipped language pack is reported missing and the host default
-   can be mistaken for the configured one."
+(defn- ocr-readiness
+  "The half of OCR readiness the deployment's ASSETS decide: which language data
+   the CONFIGURED tessdata directory holds, and so whether tesseract is usable at
+   all. `tesseract --list-langs` is a shell probe needing no NIF, so the SAME
+   answer is available to a parent whose engine runs in another process — which
+   is what keeps a worker handshake's language answer honest and config-aware."
   [tessdata]
   (let [langs (tesseract-languages tessdata)]
+    (if (some? (get langs :ok))
+      {:ready (list "tesseract")
+       :tesseract {:state :ready :languages (get langs :ok)}}
+      {:ready (list)
+       :tesseract {:state :unavailable :reason (get langs :error)}})))
+
+(defn- probe-capabilities
+  "Probe this deployment's readiness IN THIS VM. `tessdata` is the directory the
+   extraction config points the engine at: the probe must ask THAT directory, not
+   the host default, or a shipped language pack is reported missing and the host
+   default can be mistaken for the configured one.
+
+   `:engine` is the full engine identity beside the version string, and
+   `:source` names the authority that answered — `:in-process` here, `:worker`
+   over a handshake, `:unresolved` when nobody could name the bytes. A caller
+   that has to mint identity from the answer must not reconstruct the engine from
+   a version string."
+  [tessdata]
+  (let [ocr (ocr-readiness tessdata)]
     {:xberg/version (get (engine-id) :xberg)
+     :engine (engine-id)
+     :source :in-process
      :available? true
      :formats (format-rows)
      :renderers (ok-list (Xberg/list_renderers))
      :document-extractors (ok-list (Xberg/list_document_extractors))
-     :ocr {:registered (ok-list (Xberg/list_ocr_backends))
-           :ready (if (some? (get langs :ok)) (list "tesseract") (list))
-           :tesseract (if (some? (get langs :ok))
-                        {:state :ready :languages (get langs :ok)}
-                        {:state :unavailable :reason (get langs :error)})}
+     :ocr (assoc ocr :registered (ok-list (Xberg/list_ocr_backends)))
      :ner {:onnx :ready :llm :needs-egress}
      :layout {:available? false :reason :no-regions-produced-at-1.0.14}
      :formats-verified []}))
 
 (defn capabilities
-  "What this deployment can ACTUALLY do: the engine registries projected, plus
-   the readiness the engine will not answer (a system binary, installed language
-   data, model weights). Never raises; when the engine is absent the answer is
-   `{:error {:xberg :absent} reason}` — absence is a value, not an exception.
+  "What this deployment can ACTUALLY do, and on whose authority. Never raises;
+   absence is a value, not an exception.
+
+   THREE ANSWERS, never a guess:
+     • the engine registries projected, when the binding is callable HERE
+       (`:source :in-process`);
+     • otherwise the configured OS worker's PROVEN handshake (`:source :worker`)
+       — the worker loads its own pinned carrier and answers from its engine
+       registry;
+     • otherwise `{:error {:xberg :absent} reason}`, naming what is missing.
+   A hand-rolled format list is what this gate exists to refuse: a count nobody
+   measured is not an admission policy.
 
    `opts` may carry `:config`, the extraction config: its
    `[:ocr :tessdata_path]` is the directory the tesseract probe asks, so
-   readiness follows the CONFIGURED assets rather than the host default.
+   readiness follows the CONFIGURED assets rather than the host default — for the
+   worker path too (the language half of a handshake is re-derived locally).
+
+   `:ok :engine` is the engine identity this deployment READS WITH, and
+   `:source` names the authority (`:in-process` | `:worker`) — the SAME fact
+   `librarium.reader` mints artifact ids from, reported here rather than asked
+   for separately, so a reader needs ONE boundary call to know what it will read
+   with. A boundary that predates that field omits it, and the reader falls back
+   to this VM's own identity instead of failing to load.
 
    Cached for a minute so a per-file loop does not shell out per file, KEYED by
-   the probed tessdata directory; `{:refresh true}` bypasses it."
+   the probed tessdata directory; `{:refresh true}` bypasses it. The WORKER
+   handshake is cached more strongly (see `worker-capabilities`): a carrier a
+   deployment pinned does not become a different carrier between two calls."
   ([] (capabilities {}))
   ([opts]
    (let [c (get opts :config)
@@ -943,11 +979,26 @@
               (erlang/== (get hit :tessdata nil) tessdata)
               (< (- now (get hit :at 0)) 60000))
        (get hit :value)
-       (let [v (if (available?)
-                 (try {:ok (probe-capabilities tessdata)}
-                      (catch _ {:error (merge {:xberg :call} {:message "capability probe failed"})}))
-                 {:error (merge {:xberg :absent} {:message (str "the Xberg binding is not callable in this VM"
-                                 " (set LIBRARIUM_XBERG=1 and put the xberg carrier on the code path)")})})]
+         (let [v (cond
+                   (available?)
+                   (try {:ok (probe-capabilities tessdata)}
+                        (catch _ {:error (merge {:xberg :call} {:message "capability probe failed"})}))
+
+                   ;; The parent has no binding of its own, but the DEPLOYMENT
+                   ;; reads through an OS worker. The worker's own registry is
+                   ;; then the only authority — and it is ASKED, not assumed.
+                   (worker-configured?)
+                   (let [r (worker-capabilities (default-worker))]
+                     (if (contains? r :ok)
+                       {:ok (with-local-ocr (get r :ok) tessdata)}
+                       r))
+
+                   :else
+                   {:error (merge {:xberg :absent}
+                                  {:message (str "no capability authority in this VM: the Xberg binding is not"
+                                                 " callable (set LIBRARIUM_XBERG=1 and put the carrier on the code"
+                                                 " path or in ERL_LIBS), and no OS worker is configured: "
+                                                 (worker-absence))})})]
          (erlang/apply :persistent_term :put (list :document-xberg-caps {:at now :value v :tessdata tessdata}))
          v)))))
 
@@ -1246,16 +1297,16 @@
        (erlang/apply :erlang :unique_integer (list (list :positive)))
        ".out"))
 
-(defn- worker-request-json
-  "The request the worker reads. It names the DOCUMENT and the CONFIG only —
-   never a runtime, never a native path: the worker resolves those from its own
-   environment."
+(defn- worker-request
+  "The request the worker reads, as a MAP (`os-worker-call` encodes and writes
+   it, and refuses it on the request budget before it is written). It names the
+   DOCUMENT and the CONFIG only — never a runtime, never a native path: the
+   worker resolves those from its own environment."
   [path opts]
-  (json/encode
-    (merge {:kind "uri" :uri (str "file://" path) :config (or (get opts :config) {})}
-           (let [want (into [] (to-list (or (get opts :require-languages) [])))]
-             (if (seq want) {:languages want} {}))
-           (if (get opts :allow-degraded? false) {:allow-degraded? true} {}))))
+  (merge {:kind "uri" :uri (str "file://" path) :config (or (get opts :config) {})}
+         (let [want (into [] (to-list (or (get opts :require-languages) [])))]
+           (if (seq want) {:languages want} {}))
+         (if (get opts :allow-degraded? false) {:allow-degraded? true} {})))
 
 (defn- read-bounded
   "Read a response file that is at most `max` bytes, or `{:error …}` when it is
@@ -1286,16 +1337,22 @@
 
    Worker contract: read the request JSON file named as the last argument, write
    the response JSON to stdout. A response may be the engine's raw answer
-   (bare), the `{:raw :engine}` envelope the shipped worker sends, or
-   `{:__worker_error__ …}` for a refusal — the parent reads all three, so a
-   canned fixture and the real worker speak one protocol."
-  [worker request-json timeout-ms budget]
+   (bare), the `{:raw :engine}` envelope the shipped worker sends, the
+   `{:caps …}` capability HANDSHAKE, or `{:__worker_error__ …}` for a refusal —
+   the parent reads all four, so a canned fixture and the real worker speak one
+   protocol.
+
+   `request` is the request MAP, not a path: this function writes it to its own
+   temp file (and refuses it on SIZE before writing), so the two callers — a
+   document read and a capability handshake — cannot drift into two protocols."
+  [worker request timeout-ms budget]
   (let [cmd (get worker :cmd)
         extra (into [] (to-list (get worker :args [])))
-        args (into extra (list request-json))
         wrapper "/usr/bin/timeout"
         secs (let [q (erlang/div (+ timeout-ms 999) 1000)] (if (> q 1) q 1))
         max-out (get budget :max-output-bytes)
+        max-req (get budget :max-request-bytes)
+        body (json/encode request)
         out (temp-out-path)
         rt (runtime-dir)]
     (cond
@@ -1309,8 +1366,14 @@
                                     " that cannot be proven")
                       :native-stopped? false})}
 
+      (> (bsize body) max-req)
+      {:error (merge {:xberg :budget}
+                     {:message (str "worker request " (bsize body)
+                                    " bytes exceeds the " max-req " byte request budget")})}
+
       :else
-      (let [argv (into [] (concat [wrapper "-s" "KILL" (str secs) cmd] args))
+      (let [reqf (temp-file! body ".json")
+            argv (into [] (concat [wrapper "-s" "KILL" (str secs) cmd] extra (list reqf)))
             ;; BL_DAEMON=off is not decoration: a warm `bl` daemon answers in ITS
             ;; OWN process, so `timeout` would kill a client that already
             ;; returned while the native read kept running where nothing can
@@ -1359,9 +1422,13 @@
                     (and (contains? m :raw) (contains? m :engine))
                     {:ok {:raw (get m :raw) :engine (get m :engine)}}
 
+                    (contains? m :caps)
+                    {:ok {:caps (get m :caps)}}
+
                     :else
                     {:ok {:raw m}})))))
-          (finally (try (File/rm! out) (catch _ :ok))))))))
+          (finally (try (File/rm! out) (catch _ :ok))
+                   (try (File/rm! reqf) (catch _ :ok))))))))
 
 ;; ═══ input shape ═══════════════════════════════════════════════════════════
 
@@ -1417,13 +1484,19 @@
   "The one result shape a bounded call returns, whichever transport ran."
   [ni cfg started isolation r]
   (if (contains? r :ok)
-    (let [ok (get r :ok)]
+    (let [ok (get r :ok)
+          os? (erlang/== :os_worker isolation)]
       {:ok {:raw (get ok :raw)
-            :transport (if (erlang/== :os_worker isolation) :json :native)
-            ;; the worker's OWN identity, when it answered: the parent VM has no
-            ;; NIF loaded, so its `engine-id` would report the NIF digest
-            ;; `:unresolved` — and an artifact id is built on it.
-            :engine (or (get ok :engine) (engine-id))
+            :transport (if os? :json :native)
+            ;; THE IDENTITY OF THE ENGINE THAT READ. In-process that is this
+            ;; VM's own binding. Through an OS worker it is the WORKER's answer
+            ;; and nothing else: the parent VM may have no NIF at all, so its
+            ;; own `engine-id` reports `:unresolved` — borrowing that for a
+            ;; worker response would mint an artifact id from a fingerprint that
+            ;; never read the document, and two worker builds would collide.
+            ;; A worker that names no engine leaves it nil; the reader decides
+            ;; what an unnamed engine means.
+            :engine (if os? (get ok :engine) (or (get ok :engine) (engine-id)))
             :isolation isolation
             :config cfg
             :config-hash (config-hash cfg)
@@ -1440,15 +1513,62 @@
   (if (nil? worker)
     {:error (merge {:xberg :worker}
                    {:message (str "no OS worker is configured: " (worker-absence))})}
-    (let [req (worker-request-json path opts)]
-      (if (> (bsize req) (get budget :max-request-bytes))
-        {:error (merge {:xberg :budget}
-                       {:message (str "worker request " (bsize req)
-                                     " bytes exceeds the " (get budget :max-request-bytes)
-                                     " byte request budget")})}
-        (let [wf (temp-file! req ".json")]
-          (try (os-worker-call worker wf timeout-ms budget)
-               (finally (try (File/rm! wf) (catch _ :ok)))))))))
+    (os-worker-call worker (worker-request path opts) timeout-ms budget)))
+
+(defn with-local-ocr
+  "The worker's capability answer with the LANGUAGE half re-derived HERE, from
+   `tessdata`: which tesseract data a deployment ships is the deployment's asset
+   fact — a shell probe needs no NIF — so the answer follows the EFFECTIVE config
+   even when the registry came over a handshake. The backend REGISTRY still comes
+   from the engine that will run; only the assets half is local."
+  [caps tessdata]
+  (if (map? caps)
+    (let [o (ocr-readiness tessdata)]
+      (assoc caps :ocr (merge (get caps :ocr)
+                              {:ready (get o :ready)
+                               :tesseract (get o :tesseract)})))
+    caps))
+
+(defn worker-capabilities
+  "Ask the CONFIGURED OS worker what it can read — the ONE *proven* fallback for
+   a deployment whose parent VM has no binding. Nothing about the carrier is
+   assumed: the worker loads its own pinned runtime and answers from the engine
+   registry. Its language answer is the WORKER's host default; the caller
+   overlays the configured assets (`with-local-ocr`), which is why the cached
+   answer here is the raw one.
+
+   Cached for the life of the VM, keyed by the worker spec: the carrier a
+   deployment pins is an environment fact, and re-proving it on every admission
+   call would buy a process spawn each time. `{:refresh true}` deliberately does
+   NOT bypass THIS cache — only a different worker spec does.
+
+   → `{:ok caps}` (with `:source :worker`) | `{:error {:xberg
+   :worker-capability …}}` — a NAMED refusal, never a guessed format list."
+  ([] (worker-capabilities (default-worker)))
+  ([worker]
+   (if (nil? worker)
+     {:error (merge {:xberg :worker-capability}
+                    {:message (str "no OS worker is configured: " (worker-absence))})}
+     (let [k [:document-xberg-worker-caps (get worker :cmd)
+              (into [] (to-list (get worker :args [])))]
+           hit (erlang/apply :persistent_term :get (list k ::none))]
+       (if-not (erlang/== hit ::none)
+         hit
+         (let [r (try
+                   (let [q (os-worker-call worker {:kind :caps} (get DEFAULTS :timeout-ms) DEFAULTS)]
+                     (cond
+                       (contains? q :error) q
+                       (map? (get (get q :ok) :caps))
+                       {:ok (assoc (get (get q :ok) :caps) :source :worker)}
+                       :else
+                       {:error (merge {:xberg :worker-capability}
+                                      {:message (str "the worker answered no capability handshake"
+                                                     " (it predates the `:kind :caps` request)")})}))
+                   (catch e {:error (merge {:xberg :worker-capability}
+                                           {:message (str "the capability handshake failed: "
+                                                          (try (get e :message) (catch _ "unknown")))})}))]
+           (erlang/apply :persistent_term :put (list k r))
+           r))))))
 
 (defn- call-with
   "One bounded call. `ni` is a normalized input (see `normalize-input`).
