@@ -31,6 +31,7 @@ defmodule BeamLisp.Native.Datom.StoreFjall do
   @on_load :__bl_load
   def __bl_load, do: :erlang.load_nif(~c"#{lib}", 0)
   def fjall_open(_a), do: :erlang.nif_error(:nif_not_loaded)
+  def fjall_canonical_path(_a), do: :erlang.nif_error(:nif_not_loaded)
   def fjall_get(_a, _b), do: :erlang.nif_error(:nif_not_loaded)
   def fjall_range(_a, _b, _c), do: :erlang.nif_error(:nif_not_loaded)
   def fjall_range_chunk(_a, _b, _c, _d, _e), do: :erlang.nif_error(:nif_not_loaded)

@@ -117,9 +117,11 @@ pub(crate) struct DbHandle {
     /// read-modify-write atomic belongs to the store, not to whichever handle
     /// happened to open it.
     pub(crate) lock: Arc<Mutex<()>>,
-    /// The exclusive ownership of this store's directory, held for exactly as
-    /// long as this handle is. Declared LAST so it drops last — the engine's
-    /// teardown (its final flush) happens while the store is still ours.
+    /// The exclusive ownership of this store's directory. Declared LAST so it
+    /// drops after this handle's own `keyspace`/`datoms`/`lock` clones. Holding
+    /// the flock THROUGH the engine's teardown is not this ordering's job: it
+    /// lives inside `StoreClaim`, whose `engine` field precedes its `_lock`
+    /// (see RELEASE ORDER there).
     _claim: Arc<StoreClaim>,
 }
 
@@ -160,17 +162,42 @@ struct StoreEngine {
 /// shares this engine. (A second `flock` on a fresh fd would be refused even
 /// here: the lock belongs to the open file description, not to the process, so
 /// the registry is what makes the distinction the kernel cannot make.)
-struct StoreClaim {
+///
+/// RELEASE ORDER — the reason these two fields are in this order. Rust drops a
+/// struct's fields in DECLARATION order, and the order that is correct here is
+/// `engine` FIRST and `_lock` LAST. Engine teardown is not a no-op: fjall's
+/// `Keyspace` drop stops and JOINS its background flush/compaction threads
+/// (which may be mid-flush, writing segment files) and its journal drop
+/// persists with `PersistMode::SyncAll`. Releasing the flock first leaves the
+/// directory unowned for exactly that window — the corruption this type exists
+/// to prevent, reopened at the one moment a second owner is most likely to
+/// appear (the old one's shutdown). The unit test at the foot of this file
+/// pins the order against THIS declaration: it builds the same `StoreClaim<E>`
+/// production declares, with a recording engine, so swapping the two fields
+/// fails a test rather than only a comment.
+///
+/// `E` is that engine — `StoreEngine` in production, the recording stand-in in
+/// the test. The parameter exists so the order under test is the real type's
+/// release order, not a copy of it kept in sync by hand.
+struct StoreClaim<E = StoreEngine> {
+    /// The one engine over this directory, shared by every handle that joins
+    /// this claim. Declared FIRST so it drops FIRST — see RELEASE ORDER above.
+    engine: E,
     /// The fd whose `flock` IS the ownership. Dropping this claim — the LAST
-    /// `Arc` — closes it and releases the lock.
+    /// `Arc` — closes it and releases the lock, so it is declared LAST: the
+    /// directory stays ours until the engine over it is gone.
     _lock: File,
-    engine: StoreEngine,
 }
 
 /// Canonical path → a WEAK claim. Weak, not strong, so the registry never
 /// keeps a store alive: an entry dies with its last handle, and THAT death is
 /// what releases the flock, while a dead `Weak` left behind is simply a miss
-/// on the next open.
+/// on the next open. A dead entry is PRUNED, not merely tolerated: every
+/// `claim_store` retains only the live entries under this same lock before it
+/// looks one up, so the map is bounded by the stores actually open rather than
+/// by every store the process has ever opened (the codebase cache opens one
+/// scratch store per namespace and content hash, and a per-request store would
+/// otherwise grow this map for the life of the process).
 fn claims() -> &'static Mutex<HashMap<PathBuf, Weak<StoreClaim>>> {
     static CLAIMS: OnceLock<Mutex<HashMap<PathBuf, Weak<StoreClaim>>>> = OnceLock::new();
     CLAIMS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -208,6 +235,12 @@ fn claim_store(path: &Path) -> Result<Arc<StoreClaim>, ClaimError> {
     // real directory, so the map keys the same way the kernel's flock does.
     let canon = fs::canonicalize(path).map_err(ClaimError::Io)?;
     let mut claims = claims().lock().unwrap_or_else(|e| e.into_inner());
+    // A DEAD entry is a MISS, not a claim — but it is not left to rot either.
+    // Dropping the dead ones here (we hold the lock, so the sweep is free)
+    // bounds the registry by the stores that are open rather than by every
+    // store ever opened, and it runs BEFORE the lookup so the entry consulted
+    // below is either live or absent.
+    claims.retain(|_, w| w.strong_count() > 0);
     if let Some(claim) = claims.get(&canon).and_then(Weak::upgrade) {
         return Ok(claim);
     }
@@ -285,6 +318,37 @@ fn fjall_open<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
         _claim: claim,
     });
     Ok(arc.encode(env))
+}
+
+/// `fjall_canonical_path`: the ONE directory a store path REFERS TO — the
+/// identity the claim's flock, the registry and the engine are all keyed by.
+///
+/// WHY IT IS A NIF. This is a realpath question and bl's `File` surface has no
+/// realpath: `fs::canonicalize` collapses a symlink, a `..`, a trailing
+/// separator and a relative path onto the one real directory, which is what
+/// lets the claim agree with the kernel (the flock is on the inode) about
+/// which directory a store IS.
+///
+/// WHY IT IS EXPOSED. The claim already canonicalizes for the flock; the bl
+/// layer derives TWO more things from a store's path — the record's `:path`
+/// and the blob sibling `<path>.blobs` — and after this commit a same-process
+/// open through an alias is no longer refused, it JOINS the claim. If the
+/// record kept the caller's spelling, those two spellings would share one datom
+/// log and yet write their bytes to two different sibling directories, so a
+/// datom read through the alias would name a blob only the other spelling can
+/// find. Asking the same canonicalization native here is what makes `:path`,
+/// the blob dir, the engine and the flock one identity.
+///
+/// Creates the directory first, exactly as `fjall-open` does, so a brand-new
+/// store canonicalizes rather than failing. Returns the canonical path, or
+/// `{:error, reason}` — the same shape every other native failure takes — so a
+/// caller handles it the way it already handles a `fjall-open` failure.
+#[rustler::nif]
+fn fjall_canonical_path<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
+    let p = Path::new(&path);
+    fs::create_dir_all(p).map_err(|e| err(e))?;
+    let canon = fs::canonicalize(p).map_err(|e| err(e))?;
+    Ok(to_binary(env, canon.to_string_lossy().as_bytes())?.to_term(env))
 }
 
 /// `-get`: the value at `key`, or `nil`.
@@ -1321,6 +1385,121 @@ fn __nif_loaded__() -> bool {
 }
 
 rustler::init!("Elixir.BeamLisp.Native.Datom.StoreFjall");
+
+// ══ the claim's release order and registry lifetime, pinned ══════════
+//
+// The correctness argument for `StoreClaim`'s field order is at its definition.
+// These tests hold it to that argument. They build the SAME generic declaration
+// production builds — only the engine type is swapped for a recorder — so they
+// observe the real release order, and they drive `claim_store` itself, so the
+// pruning is the behaviour of the function that takes claims, not a restatement
+// of `retain`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A fresh, unique directory under the system temp dir, created, so a test
+    /// never inherits a store (or its flock) from a previous run.
+    fn tmp_dir(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "datom-fjall-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create the temp store dir");
+        dir
+    }
+
+    /// An engine whose whole job is to look, at the instant it drops, at
+    /// whether the claim's flock is still held.
+    struct ProbeEngine {
+        dir: PathBuf,
+        held_at_drop: Rc<Cell<Option<bool>>>,
+    }
+
+    impl Drop for ProbeEngine {
+        fn drop(&mut self) {
+            // A second `open` + `try_lock` in THIS process is a second OPEN
+            // FILE DESCRIPTION, so it conflicts with the claim's flock exactly
+            // as another process's would — a flock belongs to the description,
+            // not to the process. `WouldBlock` therefore means the directory is
+            // still ours, which can only be true if `_lock` drops AFTER this
+            // field does.
+            let probe = File::open(&self.dir).expect("reopen the store dir to probe it");
+            let still_ours = matches!(probe.try_lock(), Err(TryLockError::WouldBlock));
+            self.held_at_drop.set(Some(still_ours));
+        }
+    }
+
+    /// The field order in `StoreClaim` IS the release order (Rust drops a
+    /// struct's fields in declaration order), and this asserts it on the same
+    /// generic type production uses — only the engine is swapped, so swapping
+    /// the two fields fails HERE rather than only in a doc comment.
+    #[test]
+    fn the_flock_outlives_the_engine() {
+        let dir = tmp_dir("droporder");
+        let lock = File::open(&dir).expect("open the claim's lock fd");
+        lock.try_lock().expect("the claim takes the flock");
+        let held_at_drop = Rc::new(Cell::new(None));
+        let claim = StoreClaim {
+            engine: ProbeEngine { dir: dir.clone(), held_at_drop: held_at_drop.clone() },
+            _lock: lock,
+        };
+
+        assert_eq!(held_at_drop.get(), None, "the engine is alive until the claim drops");
+        drop(claim);
+        assert_eq!(
+            held_at_drop.get(),
+            Some(true),
+            "the engine must tear down while the store is STILL flocked — \
+             `engine` must be declared before `_lock` in StoreClaim"
+        );
+
+        // ... and the flock is gone once the whole claim has dropped, so the
+        // ordering does not turn ownership into a leak.
+        let after = File::open(&dir).expect("reopen after the claim dropped");
+        assert!(after.try_lock().is_ok(), "the flock is released with the claim");
+        drop(after);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A claim that has DIED must not linger in the registry: every
+    /// `claim_store` retains only live entries, so the map is bounded by the
+    /// stores actually open rather than by every store ever opened.
+    #[test]
+    fn the_registry_prunes_dead_claims() {
+        let a = tmp_dir("prune-a");
+        let b = tmp_dir("prune-b");
+        drop(claim_store(&a).unwrap_or_else(|_| panic!("claim a")));
+        drop(claim_store(&b).unwrap_or_else(|_| panic!("claim b")));
+
+        // Claiming a THIRD store is what gets the sweep to run; the two dead
+        // entries must not survive it.
+        let c = tmp_dir("prune-c");
+        let live = claim_store(&c).unwrap_or_else(|_| panic!("claim c"));
+
+        let reg = claims().lock().unwrap_or_else(|e| e.into_inner());
+        let canon_a = fs::canonicalize(&a).expect("canon a");
+        let canon_b = fs::canonicalize(&b).expect("canon b");
+        let canon_c = fs::canonicalize(&c).expect("canon c");
+        assert!(!reg.contains_key(&canon_a), "a dead claim is pruned from the registry");
+        assert!(!reg.contains_key(&canon_b), "a dead claim is pruned from the registry");
+        assert!(reg.contains_key(&canon_c), "the live claim stays registered");
+        drop(reg);
+
+        drop(live);
+        let _ = fs::remove_dir_all(&a);
+        let _ = fs::remove_dir_all(&b);
+        let _ = fs::remove_dir_all(&c);
+    }
+}
 
 
 
