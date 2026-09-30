@@ -1,0 +1,352 @@
+; test/bl/lazy_fold_test.bl — the W2 fold path for pending lazy producers.
+; Run: bl test test/bl/lazy_fold_test.bl
+;
+; A lazy producer built by `map`/`filter`/`range`/`iterate`/`repeat`/`cycle`/
+; `concat`/`take-while`/`drop-while`/`map-multi` may carry a FOLD RECIPE: a
+; 2-arity fn that folds the seq's elements straight from its SOURCE instead of
+; walking one memo cell per element. This file proves the recipe path is
+; behaviourally identical to the eager reference AND to the memo walk, and that
+; it does not pay the memo-cell cost it exists to avoid.
+;
+; Three properties, three instruments:
+;
+;   EQUIVALENCE — every folded producer matches an EAGER reference written with
+;     loop/recur over a list, at sizes 0, 1, 31, 32, 33, 100 and 1000 (the
+;     chunk boundary is 32, the only place a chunking bug shows).
+;   HALTING — a step returning `(reduced v)` stops the SOURCE fold at that
+;     element. A side-effect counter sees it where a stopwatch cannot: the
+;     counting fn must run exactly once per element actually read, including
+;     over an INFINITE source bounded only by `take-while`.
+;   NO CELLS — the fold path allocates no memo cell per element, so the
+;     LazyMemo `:op_new` + `:op_new_fast` counters barely move across a fold of
+;     an 8000-element producer. The memo walk of the same shape creates 501
+;     cells (measured), one per 32-element chunk plus its tails.
+;
+; `BeamLisp.LazyMemo/stats` is GLOBAL and noisy — other work in the VM bumps
+; its counters — so each row measures a DELTA around its own expression and
+; asserts `<= 2`, which is a claim about the recipe's existence, not about the
+; exact node count of one producer.
+
+(ns lazy.fold.test)
+
+; ── the off-heap cache valve ──────────────────────────────────────────────
+; `BeamLisp.LazyMemo/admit!` refuses a NEW memo once the native cell cache
+; exceeds `:lazy_cache_budget_bytes` (default 512 MiB). The ward evaluates
+; every file in a corpus several times in ONE VM (fresh process + env fork per
+; evaluation, but ONE native heap), so the corpus reaches ~400 MiB before this
+; file runs; a fold that legitimately realises an 8000-element producer then
+; trips a valve meant for a long-lived application, not for a test run.
+;
+; The raise is SCOPED, not VM-wide: `:lazy_cache_budget_bytes` is Application
+; env, shared by every file a parallel run evaluates, and the resource-limit
+; suites set and restore the SAME key (`test/bl/memo_bounds_sunset_port_test.bl`
+; §1, `test/bl/legacy_wave23_lazyseq_test.bl`). A permanent raise would race
+; their windows and mask an over-budget regression elsewhere.
+; `with-cache-budget` is the same save/raise/restore lever those files use.
+
+(defn- with-cache-budget
+  "Run `f` with the lazy-cache admission budget raised to `bytes`; restore the
+   previous value — or delete the key — on every exit."
+  [bytes f]
+  (let [previous (Application/get_env :beam_lisp :lazy_cache_budget_bytes)]
+    (Application/put_env :beam_lisp :lazy_cache_budget_bytes bytes)
+    (try
+      (f)
+      (finally
+        (if (nil? previous)
+          (Application/delete_env :beam_lisp :lazy_cache_budget_bytes)
+          (Application/put_env :beam_lisp :lazy_cache_budget_bytes previous))))))
+
+(def sizes [0 1 31 32 33 100 1000])
+
+(defn- v [n] (vec (range n)))
+
+; ── eager references (naive loop/recur over the list) ────────────────────────
+
+(defn- ref-map [f c]
+  (loop [xs (to-list c) acc ()]
+    (if (empty? xs)
+      (vec (reverse acc))
+      (recur (rest xs) (cons (f (first xs)) acc)))))
+
+(defn- ref-filter [pred c]
+  (loop [xs (to-list c) acc ()]
+    (if (empty? xs)
+      (vec (reverse acc))
+      (recur (rest xs) (if (pred (first xs)) (cons (first xs) acc) acc)))))
+
+(defn- ref-sum [c]
+  (loop [xs (to-list c) s 0]
+    (if (empty? xs) s (recur (rest xs) (+ s (first xs))))))
+
+(defn- ref-take [n c]
+  (loop [i 0 xs (to-list c) acc ()]
+    (if (or (erlang/== i n) (empty? xs))
+      (vec (reverse acc))
+      (recur (inc i) (rest xs) (cons (first xs) acc)))))
+
+(defn- ref-drop [n c]
+  (loop [i 0 xs (to-list c)]
+    (if (or (erlang/== i n) (empty? xs))
+      (vec xs)
+      (recur (inc i) (rest xs)))))
+
+(defn- ref-take-while [pred c]
+  (loop [xs (to-list c) acc ()]
+    (if (and (not (empty? xs)) (pred (first xs)))
+      (recur (rest xs) (cons (first xs) acc))
+      (vec (reverse acc)))))
+
+(defn- ref-drop-while [pred c]
+  (loop [xs (to-list c)]
+    (if (and (not (empty? xs)) (pred (first xs)))
+      (recur (rest xs))
+      (vec xs))))
+
+(defn- ref-map-multi [f a b]
+  (loop [xs (to-list a) ys (to-list b) acc ()]
+    (if (or (empty? xs) (empty? ys))
+      (vec (reverse acc))
+      (recur (rest xs) (rest ys) (cons (f (first xs) (first ys)) acc)))))
+
+(defn- ref-append [a b]
+  (loop [xs (reverse (to-list a)) acc (to-list b)]
+    (if (empty? xs)
+      (vec acc)
+      (recur (rest xs) (cons (first xs) acc)))))
+
+(defn- ref-cycle-take [n pat]
+  (loop [i 0 acc ()]
+    (if (erlang/== i n)
+      (vec (reverse acc))
+      (recur (inc i) (cons (nth pat (mod i (count pat))) acc)))))
+
+(defn- ref-freqs [f c]
+  (loop [xs (to-list c) m {}]
+    (if (empty? xs)
+      m
+      (let [k (f (first xs))]
+        (recur (rest xs) (assoc m k (inc (get m k 0))))))))
+
+; ── 1. EQUIVALENCE vs the eager reference ────────────────────────────────────
+
+(deftest map-fold-matches-eager
+  (doseq [n sizes]
+    (let [c (v n)]
+      (is (= (ref-map inc c) (into [] (map inc c))) (str "into at n=" n))
+      (is (= (ref-map inc c) (mapv inc c)) (str "mapv at n=" n))
+      (is (= (ref-map inc c) (vec (map inc c))) (str "vec at n=" n))
+      (is (= (ref-sum (ref-map inc c)) (reduce + 0 (map inc c))) (str "reduce at n=" n))
+      (is (= n (count (map inc c))) (str "count at n=" n)))))
+
+(deftest frequencies-fold-matches-eager
+  (doseq [n sizes]
+    (let [c (v n) f (fn [x] (mod x 7))]
+      (is (= (ref-freqs f c) (frequencies (map f c))) (str "frequencies at n=" n)))))
+
+(deftest filter-fold-matches-eager
+  (doseq [n sizes]
+    (let [c (v n)]
+      (is (= (ref-filter even? c) (into [] (filter even? c))) (str "into at n=" n))
+      (is (= (ref-filter even? c) (filterv even? c)) (str "filterv at n=" n))
+      (is (= (ref-sum (ref-filter even? c)) (reduce + 0 (filter even? c))) (str "reduce at n=" n))
+      (is (= (count (ref-filter even? c)) (count (filter even? c))) (str "count at n=" n)))))
+
+(deftest range-fold-matches-eager
+  (doseq [n sizes]
+    (is (= (v n) (into [] (range n))) (str "into at n=" n))
+    (is (= (ref-sum (v n)) (reduce + 0 (range n))) (str "reduce at n=" n))
+    (is (= n (count (range n))) (str "count at n=" n)))
+  ; the infinite range, bounded by `take`
+  (is (= (v 10) (into [] (take 10 (range)))))
+  (is (= (ref-sum (v 10)) (reduce + 0 (take 10 (range)))))
+  (is (= 10 (count (take 10 (range))))))
+
+(deftest iterate-take-fold-matches-eager
+  (doseq [n sizes]
+    (is (= (v n) (into [] (take n (iterate inc 0)))) (str "into at n=" n))
+    (is (= (ref-sum (v n)) (reduce + 0 (take n (iterate inc 0)))) (str "reduce at n=" n))
+    (is (= n (count (take n (iterate inc 0)))) (str "count at n=" n))))
+
+(deftest repeat-take-fold-matches-eager
+  (doseq [n sizes]
+    (is (= (vec (repeat n :x)) (into [] (take n (repeat :x)))) (str "into at n=" n))
+    (is (= (* 3 n) (reduce + 0 (take n (repeat 3)))) (str "reduce at n=" n))))
+
+(deftest cycle-take-fold-matches-eager
+  (doseq [n sizes]
+    (let [pat [1 2 3]]
+      (is (= (ref-cycle-take n pat) (into [] (take n (cycle pat)))) (str "into at n=" n))
+      (is (= (ref-sum (ref-cycle-take n pat)) (reduce + 0 (take n (cycle pat)))) (str "reduce at n=" n))
+      (is (= n (count (take n (cycle pat)))) (str "count at n=" n)))))
+
+(deftest concat-fold-matches-eager
+  (doseq [n sizes]
+    (let [a (v n) b (v n)]
+      (is (= (ref-append a b) (into [] (concat a b))) (str "into at n=" n))
+      (is (= (ref-sum (ref-append a b)) (reduce + 0 (concat a b))) (str "reduce at n=" n))
+      (is (= (* 2 n) (count (concat a b))) (str "count at n=" n)))))
+
+(deftest take-while-fold-matches-eager
+  (doseq [n sizes]
+    (let [c (v n) pred (fn [x] (< x 5))]
+      (is (= (ref-take-while pred c) (into [] (take-while pred c))) (str "into at n=" n))
+      (is (= (ref-sum (ref-take-while pred c)) (reduce + 0 (take-while pred c))) (str "reduce at n=" n)))))
+
+(deftest drop-and-drop-while-fold-match-eager
+  (doseq [n sizes]
+    (let [c (v n)]
+      (is (= (ref-drop 3 c) (into [] (drop 3 c))) (str "drop into at n=" n))
+      (is (= (ref-sum (ref-drop 3 c)) (reduce + 0 (drop 3 c))) (str "drop reduce at n=" n))
+      (is (= (ref-drop-while (fn [x] (< x 5)) c) (into [] (drop-while (fn [x] (< x 5)) c)))
+          (str "drop-while into at n=" n))
+      (is (= (ref-sum (ref-drop-while (fn [x] (< x 5)) c))
+             (reduce + 0 (drop-while (fn [x] (< x 5)) c))) (str "drop-while reduce at n=" n)))))
+
+(deftest map-multi-fold-matches-eager
+  (doseq [n sizes]
+    (let [a (v n) b (vec (map (fn [x] (+ 1000 x)) (range n)))]
+      (is (= (ref-map-multi + a b) (into [] (map + a b))) (str "into at n=" n))
+      (is (= (ref-map-multi + a b) (mapv + a b)) (str "mapv at n=" n))
+      (is (= (ref-sum (ref-map-multi + a b)) (reduce + 0 (map + a b))) (str "reduce at n=" n))
+      (is (= n (count (map + a b))) (str "count at n=" n))))
+  ; the fold stops at the shortest input, as the seq walk does:
+  ; [1 2 3] + [10 20] → [11 22], whose sum is 33
+  (is (= [11 22] (into [] (map + [1 2 3] [10 20]))))
+  (is (= 33 (reduce + 0 (map + [1 2 3] [10 20])))))
+
+(deftest nested-fold-matches-eager
+  (doseq [n sizes]
+    (let [c (v n)]
+      (is (= (ref-map inc (ref-filter even? (ref-map inc c)))
+             (into [] (map inc (filter even? (map inc c)))))
+          (str "into at n=" n))
+      (is (= (ref-sum (ref-map inc (ref-filter even? (ref-map inc c))))
+             (reduce + 0 (map inc (filter even? (map inc c)))))
+          (str "reduce at n=" n)))))
+
+; ── 2. `reduced` STOPS the source ────────────────────────────────────────────
+
+; How many elements an eager walk visits before the step refuses to continue,
+; and the accumulator it halts with. The halting element IS read, so it counts.
+(defn- ref-reduced-visits [c]
+  (loop [xs (to-list c) acc 0 k 0]
+    (if (empty? xs)
+      [k acc]
+      (if (> acc 10)
+        [(inc k) acc]
+        (recur (rest xs) (+ acc (first xs)) (inc k))))))
+
+(deftest reduced-stops-the-source
+  (testing "a step returning (reduced x) halts; the source is not read further"
+    (let [calls (atom 0)
+          c (v 1000)
+          refs (ref-reduced-visits c)
+          r (reduce (fn [acc x] (if (> acc 10) (reduced acc) (+ acc x)))
+                    0
+                    (map (fn [x] (swap! calls inc) x) c))]
+      (is (= (nth refs 1) r) "the halted accumulator is returned unwrapped")
+      (is (= (nth refs 0) @calls) "the counting fn ran once per element actually visited")))
+  (testing "take-while over an INFINITE source terminates on a bounded read"
+    (let [calls (atom 0)
+          out (into [] (take-while (fn [x] (swap! calls inc) (< x 5)) (range)))]
+      (is (= [0 1 2 3 4] out))
+      (is (= 6 @calls) "the pred runs once per element through the failing one")
+      (is (<= @calls 33) "a bounded read of (range), never the whole infinite source"))))
+
+; ── 3. MEMO-CELL CREATIONS ───────────────────────────────────────────────────
+
+(defn- news []
+  (let [s (BeamLisp.LazyMemo/stats)]
+    (+ (:op_new s) (:op_new_fast s))))
+
+(defn- with-delta
+  "Run `f` and answer [cell-creation-delta result]."
+  [f]
+  (let [a (news)
+        r (f)
+        b (news)]
+    [(- b a) r]))
+
+(deftest folds-allocate-no-memo-cells
+  ; The 8000-element producers are the one place this file outgrows the default
+  ; budget; raise it for this test only (see the valve note above).
+  (with-cache-budget 2147483648
+    (fn []
+      (testing "a fold of a pending producer creates no per-element memo cell"
+        ; Memo-walk baseline for this shape: 501 cells — one per 32-element chunk
+        ; plus its tails (measured). The fold allocates nothing like it: the recipe
+        ; folds the SOURCE directly and never forms a cell.
+        (let [vv (v 8000)
+              [d1 r1] (with-delta (fn [] (reduce + 0 (map inc vv))))
+              [d2 r2] (with-delta (fn [] (count (map inc vv))))
+              [d3 r3] (with-delta (fn [] (into [] (map inc vv))))
+              [d4 r4] (with-delta (fn [] (mapv inc vv)))]
+          (is (= (ref-sum (ref-map inc vv)) r1))
+          (is (= 8000 r2))
+          (is (= (ref-map inc vv) r3))
+          (is (= (ref-map inc vv) r4))
+          (is (<= d1 2) (str "reduce cell delta=" d1))
+          (is (<= d2 2) (str "count cell delta=" d2))
+          (is (<= d3 2) (str "into cell delta=" d3))
+          (is (<= d4 2) (str "mapv cell delta=" d4)))))))
+
+; ── 4. A REALISED PREFIX IS NOT RE-COMPUTED ──────────────────────────────────
+
+(deftest realised-prefix-is-not-recomputed
+  (testing "realising a prefix publishes it; a later fold never re-runs f for it"
+    (let [n 1000
+          calls (atom 0)
+          vv (v n)
+          l (map (fn [x] (swap! calls inc) x) vv)
+          prefix (count (take 10 l))
+          after-prefix @calls
+          pend (BeamLisp.LazySeq/pending? l)
+          total (reduce + 0 l)
+          after-total @calls]
+      (is (= 10 prefix))
+      ; `take` realises one 32-element chunk from the source, publishing it.
+      (is (= 32 after-prefix) "the chunked prefix read one chunk of the source")
+      (is (not pend) "realising the prefix leaves the head cell no longer :pending")
+      (is (= (ref-sum vv) total))
+      (is (= n after-total)
+          "f ran EXACTLY once per element overall — no re-run for the realised prefix"))))
+
+; ── 5. A FOLD REALISES: A SECOND CONSUMER NEVER RE-RUNS THE PRODUCER ─────────
+;
+; The fold recipe walks the source without a memo cell per element, but it is
+; still a consumer of a SHARED lazy seq: once it has produced every element it
+; publishes them, so the next fold/count/vec reads the answer. Before this a
+; seq folded N times ran its producer N times (`(count (filter odd? s))` then
+; `(count (filter even? s))` over one `(map f …)` ran `f` twice per element).
+; That broke a checker that folded its lazy intermediates repeatedly: the work
+; multiplied, and so did the cells it allocated, until the lazy cache budget
+; tripped mid-suite.
+
+(deftest a-fold-realises-the-seq-it-folds
+  (testing "f under map runs once per element across any number of folds"
+    (let [calls (atom 0)
+          s (map (fn [x] (swap! calls inc) x) [1 2 3])]
+      (count (filter odd? s))
+      (count (filter even? s))
+      (vec s)
+      (reduce + 0 s)
+      (is (= 3 @calls))
+      (is (not (BeamLisp.LazySeq/pending? s)) "the completed fold published the seq")))
+  (testing "reduce, count and into each consume the same realised answer"
+    (let [calls (atom 0)
+          s (map (fn [x] (swap! calls inc) (* 2 x)) (v 300))]
+      (is (= (reduce + 0 (map (fn [x] (* 2 x)) (v 300))) (reduce + 0 s)))
+      (is (= 300 (count s)))
+      (is (= 300 (count (into [] s))))
+      (is (= 300 @calls)))))
+
+(deftest a-halted-fold-publishes-nothing
+  (testing "a Reduced stops the source and leaves the node pending"
+    (let [calls (atom 0)
+          s (map (fn [x] (swap! calls inc) x) (v 1000))
+          r (reduce (fn [a x] (if (>= x 5) (reduced a) (+ a x))) 0 s)]
+      (is (= 10 r))
+      (is (BeamLisp.LazySeq/pending? s) "a halted fold did not produce the whole seq")
+      (is (< @calls 1000) "the halt stopped the source")
+      (is (= (ref-sum (v 1000)) (reduce + 0 s)) "a later full fold is still correct"))))

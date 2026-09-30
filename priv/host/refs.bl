@@ -2,40 +2,73 @@
 ;
 ; `BeamLisp.Refs` is beam-lisp's Clojure-shaped reference runtime: atoms
 ; (`deref`/`swap!`/`reset!`/`compare-and-set!` plus `add-watch!`/`remove-watch!`),
-; volatiles (a process-dictionary box), promises (a single-assignment cell
-; backed by a small process), futures (a running `Task`), and the `deref` that
-; reads all of them — including the two value-shaped references that live
-; ELSEWHERE in the pinned floor, `BeamLisp.Delay` and `BeamLisp.Derived`.
+; volatiles (an unsynchronized box), promises (a single-assignment cell),
+; futures (a running `Task`), and the `deref` that reads all of them — including
+; the two value-shaped references that live ELSEWHERE in the pinned floor,
+; `BeamLisp.Delay` and `BeamLisp.Derived`.
 ;
 ; This is the `.bl` port of `lib/beam_lisp/refs.ex`'s `BeamLisp.Refs` half,
 ; compiled by `BeamLisp.AOT/compile_host_file` into ONE exact-named beam
 ; (`Elixir.BeamLisp.Refs.beam`).
 ;
-; ── THE STRUCT TYPES ARE A SEPARATE WAVE (and why this file needs none) ────
+; ── EVERY REFERENCE IS A NATIVE MEMO CELL ─────────────────────────────────
+;
+; An atom's value and its watch table are each ONE GC-owned memo cell; so are a
+; volatile's value and a promise's state. Nothing here leaks by construction — a
+; cell dies with its last reference, and a cycle a cell closes is the native
+; collector's to reclaim (`native/lazy_memo/src/collector.rs`) — and two of the
+; three carried a leak before:
+;
+;   * a volatile used to be a process-dictionary key nothing ever deleted: one
+;     leaked key per `(volatile!)`, and every `take`/`drop`/`partition-all`
+;     transducer instance builds one. It is now a cell written with the
+;     unconditional `LazyMemo/put` (last writer wins — the volatile contract),
+;     so it is also readable from another process, as Clojure's is; it is only
+;     its WRITES that are unsynchronized.
+;
+;   * a promise used to be a looping process per promise, which nothing
+;     stopped: every `(promise)` leaked a process, delivered or not. It is now
+;     one cell holding `{:unset, waiters}` or `{:set, v}`; `deliver` publishes
+;     `{:set, v}` and notifies every registered waiter IN THE SAME NATIVE CALL
+;     — so a waiter registered before the publish is always told, and one that
+;     reads after it sees the value — and a waiting `deref` registers with a
+;     version CAS. No polling, and no process of its own.
+;
+; The `:pid` and `:key` FIELD NAMES are unchanged (see `priv/host/refs_structs.bl`):
+; the struct types are public ABI and keep their shapes, so `Promise` still
+; holds its state under `:pid` and `Volatile` its cell under `:key` — what
+; changed is what those fields carry, not what they are called.
+;
+; ── VERSIONED TRANSITIONS ─────────────────────────────────────────────────
+;
+; Every write is `LazyMemo/read_versioned` (the state WITH its publication
+; counter) followed by `LazyMemo/exchange_version … :keep`. The comparison is an
+; INTEGER, so the old full-term compare — the whole value loaded and compared on
+; every `swap!` — is gone. A racing writer bumps the counter, the exchange
+; answers `:retry`, and the loop re-reads and re-applies: Clojure's atom
+; contract, and the reason a step fn must be pure.
+;
+; `:keep` is the edge policy for a transition that reaches nothing new — an atom
+; swap, a watch-table update, a waiter registration — so it does no dependency
+; walk, takes no graph lock and runs no cycle check. That is also what lets an
+; atom hold a cycle the way Clojure's does: `(reset! a {:me a})` is ACCEPTED, and
+; the native collector reclaims it once the atom itself is unreachable. An atom
+; owns ordinary data; a cycle in it is not a reason to refuse the write.
+;
+; `compare-and-set!` keeps Clojure's VALUE equality (`==`: `1` and `1.0` are the
+; same value) checked in the caller against the read term, while the exact race
+; is still closed by the version.
+;
+; ── THE FIVE STRUCT TYPES (and why this file needs none of them loaded) ────
 ;
 ; `refs.ex` declares six modules, but only ONE of them carries behaviour. The
-; other five are bare `defstruct` types:
+; other five are bare `defstruct` types — `Atom`, `Volatile`, `Reduced`,
+; `Promise`, `Future` — pinned from ONE source (`priv/host/refs_structs.bl`, the
+; `reader_exception.bl` idiom: one file, five exact module atoms, each seed entry
+; carrying the `:struct-fields` that name ITS shape).
 ;
-;     defstruct [:cell, :watches]   ; Atom
-;     defstruct [:key]              ; Volatile
-;     defstruct [:value]            ; Reduced
-;     defstruct [:pid]              ; Promise
-;     defstruct [:task]             ; Future
-;
-; A bare `defstruct` generates exactly `__struct__/0,1` and `__info__/1` and
-; NOTHING else, and `compile_host_file` REFUSES a source with no top-level
-; `defn` while `:struct_fields` may not be combined with a hand-written
-; `__struct__`/`__info__` (it refuses the collision). So there is exactly one
-; honest shape for each of them — spell the generated surface out by hand, the
-; technique `priv/host/sorted_map.bl` documents for `SortedMap`'s
-; `defstruct [:tree]` — and it is PER TYPE, because that hand-written surface
-; must spell that type's own field names. No two of the five share a field list,
-; so no two can share a source: five sources, one per exact atom. That is a
-; separate slice of work (a port wave of its own), and this file is deliberately
-; INDEPENDENT of it.
-;
-; Independence is possible because a struct is only ever a TAGGED MAP: the tag
-; is the `:"Elixir.BeamLisp.Atom"` atom, and nothing needs `BeamLisp.Atom` to be
+; A struct is only ever a TAGGED MAP: the tag is the
+; `:"Elixir.BeamLisp.Atom"` atom, and nothing needs `BeamLisp.Atom` to be
 ; LOADED to build or read one. So — exactly as `priv/host/reactive.bl` spells
 ; `:"Elixir.BeamLisp.Derived"` and `priv/host/deferred.bl` spells
 ; `:"Elixir.BeamLisp.Delay"` — every type tag here is spelled LITERALLY and
@@ -49,21 +82,20 @@
 ; and `BeamLisp.Ns.Rt` classifies `BeamLisp.Atom`, `Volatile`, `Promise`,
 ; `Future`, `Delay` and `Derived` as REFERENCE-CELL kinds — for those, a
 ; collection read is REFUSED (`get: BeamLisp.Atom is a reference, not a
-; collection`). The recalled Elixir module pattern-matched and used `atom.cell`,
-; which is a raw map read; so is `erlang/map_get/2`. `tag/1` is the one guarded
-; read: a non-map has no tag, and `maps/get/3` would raise on one.
+; collection`). The recalled Elixir module pattern-matched and used
+; `atom.cell`, which is a raw map read; so is `erlang/map_get/2`. `tag/1` is the
+; one guarded read: a non-map has no tag, and `maps/get/3` would raise on one.
 ;
 ; ── WHAT THE PINNED PORT OWES ─────────────────────────────────────────────
 ;
 ; ABI parity is the contract: the same answers, the same VALUE shapes (a real
-; `%BeamLisp.Atom{}`-tagged map, a real `Promise` pid, a real `Task`), the same
-; exception CLASSES AND MESSAGES, and the same PROCESS SEMANTICS —
+; `%BeamLisp.Atom{}`-tagged map, a real `Task` in a future), the same exception
+; CLASSES AND MESSAGES, and the same PROCESS SEMANTICS —
 ;
 ;   * `swap!`/`reset!`/`compare-and-set!` run the caller's fn IN THE CALLER's
 ;     process and notify watches IN THE CALLER's process, after the commit;
 ;   * `future_exec` runs the thunk in a `Task` that INHERITS the spawning env;
-;   * `promise/0`'s loop runs in a fresh process that inherits it too, and
-;     `deref` registers as a waiter (no polling);
+;   * `promise/0` is a cell, and `deref` registers as a waiter (no polling);
 ;   * `deref` of a `Delay`/`Derived` delegates to the pinned `Deferred`/
 ;     `Reactive` modules, so the already-seeded native pair answers here.
 ;
@@ -76,12 +108,13 @@
 ;
 ; A pinned module has NO PRIVATE SURFACE: the emitter exports every top-level
 ; `defn`, and `defn-` is not privatized on this path (the same divergence
-; `priv/host/vector.bl` documents). `refs.ex`'s four `defp`s — `update_watches/2`,
-; `notify_watches/3`, `apply_heap_bound/0` and `promise_loop/2` — ride along as
-; exports here, along with `tag/1`, `rethrow/1` and `timeout-exit?/1`. Every
-; export the live module serves, this beam serves; the beam is a SUPERSET by
-; exactly those. Nothing calls them from outside; they are the shared internals
-; written once rather than duplicated per call site.
+; `priv/host/vector.bl` documents). `refs.ex`'s private helpers —
+; `update_watches/2`, `notify_watches/3`, `apply_heap_bound/0` and its promise
+; waiter loop — ride along as exports here, along with `tag/1`, `rethrow/1`,
+; `timeout-exit?/1` and `promise_wait/2`. Every export the live module serves,
+; this beam serves; the beam is a SUPERSET by exactly those. Nothing calls them
+; from outside; they are the shared internals written once rather than
+; duplicated per call site.
 ;
 ; ── BOOT SAFETY: NO HOST-NAMESPACE VAR IN THE PATH ────────────────────────
 ;
@@ -107,7 +140,7 @@
 ; observe anyway (the live catch swallows the timeout's stack too). Nothing else
 ; in this file needs a class-typed catch.
 ;
-; Run: bin/bl test test/bl/host_refs_test.bl
+; Run: bin/bl test test/bl/host_refs_test.bl test/bl/ref_cycles_test.bl
 
 (ns host.refs)
 
@@ -124,10 +157,13 @@
 
 (defn- update_watches
   "CAS-loop on a watches cell, so concurrent add/remove do not lose each
-   other. `f` maps the old table to the new one."
+   other. `f` maps the old table to the new one. `:keep` edges: a watch table
+   reaches nothing new, so the exchange does no dependency walk."
   [cell f]
-  (let [old (BeamLisp.LazyMemo/read cell)
-        outcome (BeamLisp.LazyMemo/exchange_ref cell old (f old))]
+  (let [cur (BeamLisp.LazyMemo/read_versioned cell)
+        version (erlang/element 1 cur)
+        old (erlang/element 2 cur)
+        outcome (BeamLisp.LazyMemo/exchange_version cell version (f old) :keep)]
     (cond
       (erlang/== :ok outcome) :ok
       (erlang/== :retry outcome) (update_watches cell f)
@@ -188,6 +224,25 @@
        (or (erlang/== :timeout (erlang/element 1 (erlang/element 2 e)))
            (erlang/== :killed (erlang/element 1 (erlang/element 2 e))))))
 
+(defn- promise_wait
+  "Register THIS process as a waiter on a promise cell, or answer the cell's
+   `{:set, v}` state when it is already delivered. A version CAS on the native
+   cell: a `deliver` that lands between the read and the exchange answers
+   `:retry` and we re-read, so a waiter registered before the publish is always
+   notified (`deliver` notifies in the same native call that publishes, and
+   replies carry the cell so a timed-out waiter can never confuse one promise's
+   value with another's). Answers `:waiting` when this process is parked."
+  [cell me]
+  (let [cur (BeamLisp.LazyMemo/read_versioned cell)
+        version (erlang/element 1 cur)
+        state (erlang/element 2 cur)]
+    (if (erlang/== :set (erlang/element 1 state))
+      state
+      (let [outcome
+            (BeamLisp.LazyMemo/exchange_version cell version
+              (tuple :unset (erlang/++ (list me) (erlang/element 2 state))) :keep)]
+        (if (erlang/== :ok outcome) :waiting (promise_wait cell me))))))
+
 ; ── atoms ─────────────────────────────────────────────────────────────────
 
 (defn atom
@@ -200,22 +255,24 @@
       (maps/put :watches (BeamLisp.LazyMemo/create_ref (maps/new)) (maps/new)))))
 
 (defn swap!
-  "Swap the atom's value: `new = (f old & args)`, published with a
+  "Swap the atom's value: `new = (f old & args)`, published with a version
    compare-exchange retry loop, and watches notified after the commit IN THE
    CALLER's process. Returns `new`."
   ([ref f] (swap! ref f (list)))
   ([x f args]
    (if (erlang/== :"Elixir.BeamLisp.Atom" (tag x))
      (let [cell (erlang/map_get :cell x)
-           old (BeamLisp.LazyMemo/read cell)
+           cur (BeamLisp.LazyMemo/read_versioned cell)
+           version (erlang/element 1 cur)
+           old (erlang/element 2 cur)
            new (BeamLisp.Ns.Rt/invoke f (erlang/++ (list old) args))
-           outcome (BeamLisp.LazyMemo/exchange_ref cell old new)]
+           outcome (BeamLisp.LazyMemo/exchange_version cell version new :keep)]
        (cond
          (erlang/== :ok outcome)
          (do (notify_watches x old new) new)
 
-         ; A concurrent writer moved the cell: re-read and re-apply — Clojure's
-         ; atom contract, and the reason the step fn must be pure.
+         ; A concurrent writer bumped the version: re-read and re-apply —
+         ; Clojure's atom contract, and the reason the step fn must be pure.
          (erlang/== :retry outcome)
          (swap! x f args)
 
@@ -228,13 +285,15 @@
          (list (tuple :message (erlang/iolist_to_binary (list "swap!: not a reference: " (Kernel/inspect x))))))))))
 
 (defn reset!
-  "Set the atom's value to `v` (compare-exchange retry loop), notifying watches
-   after the commit. Returns `v`."
+  "Set the atom's value to `v` (version compare-exchange retry loop),
+   notifying watches after the commit. Returns `v`."
   [x v]
   (if (erlang/== :"Elixir.BeamLisp.Atom" (tag x))
     (let [cell (erlang/map_get :cell x)
-          old (BeamLisp.LazyMemo/read cell)
-          outcome (BeamLisp.LazyMemo/exchange_ref cell old v)]
+          cur (BeamLisp.LazyMemo/read_versioned cell)
+          version (erlang/element 1 cur)
+          old (erlang/element 2 cur)
+          outcome (BeamLisp.LazyMemo/exchange_version cell version v :keep)]
       (cond
         (erlang/== :ok outcome) (do (notify_watches x old v) v)
         (erlang/== :retry outcome) (reset! x v)
@@ -272,12 +331,14 @@
   [x old new]
   (if (erlang/== :"Elixir.BeamLisp.Atom" (tag x))
     (let [cell (erlang/map_get :cell x)
-          current (BeamLisp.LazyMemo/read cell)]
+          cur (BeamLisp.LazyMemo/read_versioned cell)
+          version (erlang/element 1 cur)
+          current (erlang/element 2 cur)]
       ; Check value equality against the current term, then exchange against
-      ; THAT exact term: a racing writer changes the term, the exact exchange
-      ; answers `:retry`, and we re-check.
+      ; THAT read's version: a racing writer bumps the counter, the exact
+      ; exchange answers `:retry`, and we re-check.
       (if (erlang/== current old)
-        (let [outcome (BeamLisp.LazyMemo/exchange_ref cell current new)]
+        (let [outcome (BeamLisp.LazyMemo/exchange_version cell version new :keep)]
           (cond
             (erlang/== :ok outcome) (do (notify_watches x current new) true)
             (erlang/== :retry outcome) (compare_and_set! x old new)
@@ -292,38 +353,40 @@
 
 ; ── volatiles ─────────────────────────────────────────────────────────────
 ;
-; An unsynchronized box in the CREATING process's dictionary, keyed by a unique
-; reference — deliberately cheaper than an atom, honouring the deal Clojure's
-; volatiles make with stateful transducers (single-threaded by contract). The
-; struct holds only the key, never the value, so it is safe to send anywhere;
-; the value simply is not visible outside its home process.
+; An unsynchronized box: ONE GC-owned ref cell, written with an unconditional
+; `put` (no CAS — last writer wins, the volatile contract), so a cycle it closes
+; is the collector's to reclaim. It used to be a process-dictionary key nothing
+; ever deleted, which no reader outside the creating process could see and
+; nothing ever reclaimed; a cell is freed with its last reference, and being a
+; cell, the box IS shared — another process reads the same value. Only its
+; writes are unsynchronized, which is the deal Clojure's volatiles make with
+; stateful transducers (single-threaded by contract).
 
 (defn volatile
-  "A new volatile holding `v`, in this process's dictionary."
+  "A new volatile holding `v`: one ref cell."
   [v]
-  (let [key (erlang/make_ref)]
-    (Process/put (tuple :"Elixir.BeamLisp.Volatile" key) v)
-    (maps/put :__struct__ :"Elixir.BeamLisp.Volatile"
-      (maps/put :key key (maps/new)))))
+  (maps/put :__struct__ :"Elixir.BeamLisp.Volatile"
+    (maps/put :key (BeamLisp.LazyMemo/create_ref v) (maps/new))))
 
 (defn vreset!
   "Overwrite the volatile's value. Returns `v`."
   [x v]
   (if (erlang/== :"Elixir.BeamLisp.Volatile" (tag x))
-    (do (Process/put (tuple :"Elixir.BeamLisp.Volatile" (erlang/map_get :key x)) v) v)
+    (do (BeamLisp.LazyMemo/put (erlang/map_get :key x) v) v)
     (erlang/error
       (Elixir.ArgumentError/exception (erlang/iolist_to_binary (list "vreset!: not a volatile: " (Kernel/inspect x)))))))
 
 (defn vswap!
-  "Read-modify-write the volatile, in the caller's process — atomic only
-   against other ops in this same process, which is exactly the contract."
+  "Read-modify-write the volatile. NOT atomic — there is no compare-exchange on
+   this path, so a racing writer may be lost, which is exactly the volatile
+   contract."
   ([vol f] (vswap! vol f (list)))
   ([x f args]
    (if (erlang/== :"Elixir.BeamLisp.Volatile" (tag x))
-     (let [key (erlang/map_get :key x)
+     (let [cell (erlang/map_get :key x)
            new (BeamLisp.Ns.Rt/invoke f
-                 (erlang/++ (list (Process/get (tuple :"Elixir.BeamLisp.Volatile" key))) args))]
-       (Process/put (tuple :"Elixir.BeamLisp.Volatile" key) new)
+                 (erlang/++ (list (BeamLisp.LazyMemo/read cell)) args))]
+       (BeamLisp.LazyMemo/put cell new)
        new)
      (erlang/error
        (Elixir.ArgumentError/exception (erlang/iolist_to_binary (list "vswap!: not a volatile: " (Kernel/inspect x))))))))
@@ -398,45 +461,23 @@
         (list (tuple :message (erlang/iolist_to_binary (list "future-cancel: not a future: " (Kernel/inspect x)))))))))
 
 ; ── promises ──────────────────────────────────────────────────────────────
+;
+; A single-assignment reference: ONE GC-owned ref cell holding `{:unset,
+; waiters}` or `{:set, v}`, under the struct's `:pid` field. `deliver` publishes
+; `{:set, v}` and sends `{:bl_promise, cell, v}` to every registered waiter in
+; the SAME native call, so a waiter registered before the publish is always
+; told and one that reads after it sees the value; a waiting `deref` parks on
+; that message, keyed by the cell so a timed-out derer can never confuse one
+; promise's value with another's. A waiter that times out leaves its pid in the
+; list, and the delivery's one stray message is the whole cost of that — the
+; cell and the promise are still reclaimed with their last reference (the old
+; design left a process behind for every promise ever built).
 
 (defn promise
-  "A single-assignment reference backed by a small process. `deliver` sets a
-   value once; `deref` registers as a waiter and is answered when the value
-   arrives — no polling anywhere. The loop process inherits the caller's env
-   binding, exactly as `future_exec/1` does."
+  "A fresh, undelivered single-assignment reference: one cell, no process."
   []
-  (let [token (BeamLisp.Env/capture)
-        pid (erlang/spawn
-              (fn []
-                (BeamLisp.Env/bind token)
-                (apply_heap_bound)
-                (promise_loop :unset (list))))]
-    (maps/put :__struct__ :"Elixir.BeamLisp.Promise"
-      (maps/put :pid pid (maps/new)))))
-
-(defn- promise_loop
-  "The promise process: `:unset` (plus a waiter list) or `{:set, v}`. A `deref`
-   while unset parks the caller; on `deliver` every waiter is answered (in
-   registration order) and the state becomes set, after which later derefs are
-   answered immediately and later deliveries are refused. Replies carry this
-   process's pid so a timed-out deref can never confuse one promise's value with
-   another's."
-  [state waiters]
-  (receive
-    [:bl_deref from]
-    (if (erlang/== :unset state)
-      (promise_loop state (erlang/++ (list from) waiters))
-      (do (erlang/send from (tuple (erlang/self) :bl_value (erlang/element 2 state)))
-          (promise_loop state waiters)))
-
-    [:bl_set from v]
-    (if (erlang/== :unset state)
-      (do (Enum/each (Enum/reverse waiters)
-            (fn [w] (erlang/send w (tuple (erlang/self) :bl_value v))))
-          (erlang/send from (tuple (erlang/self) :bl_set_ack true))
-          (promise_loop (tuple :set v) (list)))
-      (do (erlang/send from (tuple (erlang/self) :bl_set_ack false))
-          (promise_loop state waiters)))))
+  (maps/put :__struct__ :"Elixir.BeamLisp.Promise"
+    (maps/put :pid (BeamLisp.LazyMemo/create_ref (tuple :unset (list))) (maps/new))))
 
 (defn deliver
   "Deliver `v` to a promise. Returns the promise on the FIRST delivery, `nil` on
@@ -444,11 +485,17 @@
    callers detect the no-op."
   [x v]
   (if (erlang/== :"Elixir.BeamLisp.Promise" (tag x))
-    (let [pid (erlang/map_get :pid x)]
-      (erlang/send pid (tuple :bl_set (erlang/self) v))
-      (receive
-        [ack :bl_set_ack true] :when (== ack pid) x
-        [ack :bl_set_ack false] :when (== ack pid) nil))
+    (let [cell (erlang/map_get :pid x)
+          cur (BeamLisp.LazyMemo/read_versioned cell)
+          state (erlang/element 2 cur)]
+      (if (erlang/== :set (erlang/element 1 state))
+        nil
+        (let [note (tuple :bl_promise cell v)
+              waiters (erlang/element 2 state)
+              outcome (BeamLisp.LazyMemo/exchange_version
+                        cell (erlang/element 1 cur) (tuple :set v) :keep
+                        (Enum/map waiters (fn [w] (tuple w note))))]
+          (if (erlang/== :ok outcome) x (deliver x v)))))
     (erlang/error
       (Elixir.ArgumentError/exception (erlang/iolist_to_binary (list "deliver: not a promise: " (Kernel/inspect x)))))))
 
@@ -474,7 +521,7 @@
      (deref x :infinity nil)
 
      (erlang/== :"Elixir.BeamLisp.Volatile" (tag x))
-     (Process/get (tuple :"Elixir.BeamLisp.Volatile" (erlang/map_get :key x)))
+     (BeamLisp.LazyMemo/read (erlang/map_get :key x))
 
      (erlang/== :"Elixir.BeamLisp.Reduced" (tag x))
      (erlang/map_get :value x)
@@ -502,17 +549,19 @@
          (if (timeout-exit? e) timeout_val (rethrow e))))
 
      (erlang/== :"Elixir.BeamLisp.Volatile" (tag x))
-     (Process/get (tuple :"Elixir.BeamLisp.Volatile" (erlang/map_get :key x)))
+     (BeamLisp.LazyMemo/read (erlang/map_get :key x))
 
      (erlang/== :"Elixir.BeamLisp.Reduced" (tag x))
      (erlang/map_get :value x)
 
      (erlang/== :"Elixir.BeamLisp.Promise" (tag x))
-     (let [pid (erlang/map_get :pid x)]
-       (erlang/send pid (tuple :bl_deref (erlang/self)))
-       (receive
-         [p :bl_value v] :when (== p pid) v
-         (after timeout_ms timeout_val)))
+     (let [cell (erlang/map_get :pid x)
+           state (promise_wait cell (erlang/self))]
+       (if (erlang/== :waiting state)
+         (receive
+           [:bl_promise c v] :when (== c cell) v
+           (after timeout_ms timeout_val))
+         (erlang/element 2 state)))
 
      ; NOTE: deliberately no Delay/Derived clause here — the recalled `deref/3`
      ; had none either, so `(deref d 10 :tv)` on a delay is refused, not a
