@@ -73,6 +73,36 @@ Job payload (carried as `:job/payload`, so it survives a restart):
  :proj/scope <scope eid>}                          ; the partition
 ```
 
+### Requiring the clause
+
+A clause head is resolved when the `defserver` form is **COMPILED** (expanded),
+not when the server starts, so the namespace that registers it must be loadable
+*before* that expansion. The reliable order:
+
+```clojure
+(ns app.sync
+  (:require [proc :as proc]              ; the door: it loads proc.reconcile,
+                                         ; so `reconcile` expands here
+            [proc.reconcile :as rec]))   ; optional: the bundle's VERBS
+```
+
+- `[proc :as proc]` is enough to write the clause. `proc` is the tier's one door
+  and it loads every bundle (`proc.queue`, `proc.tick`, `proc.sched`,
+  `proc.reconcile`, …), so an image that has `proc` registers `:reconcile` at
+  load. The clause head needs **no var** — it is a symbol the expander looks up —
+  so a `:refer` of the bundle is unnecessary (and its public names collide with
+  `sched`'s and `queue`'s: `arm!`, `status`, `enqueue!`).
+- Require `[proc.reconcile :as rec]` directly when you want its verbs — `pump!`,
+  `status`, `failures`, `retry!`, `enqueue!`, `unwatch-all!` — every name in §3.
+- **Why order matters, measured.** A whole-file compiler that expands a file's
+  `defserver` forms *before* that file's `:require`s run — the isolated `ward`
+  runner, BUG-082 — can only see a clause the *image* already carries. That is
+  why `proc` loading `proc.reconcile` is load-bearing rather than tidiness: with
+  an EMPTY `BEAM_LISP_AOT_CACHE_DIR` (source-only compilation, nothing warm),
+  `bl -p priv/std test test/bl/proc/reconcile_test.bl` is green; before `proc`
+  carried the bundle the same command died with `unknown clause reconcile` from
+  `proc.server`.
+
 ## 2 · Laws
 
 1. **A job re-judges before it acts.** Between enqueue and run the revision may
@@ -154,23 +184,34 @@ drain and the failure history.
 ## 6 · Tests
 
 ```
-bl -p priv/std test --shared test/bl/proc/reconcile_test.bl     # 14 tests, 54 assertions
-bl test test/bl/datom/reconcile_test.bl                          # 25 assertions (executor + model)
-bl -p priv/std test --shared test/bl/queue_test.bl               # 17 tests (unchanged)
+# isolated default, SOURCE-ONLY (an EMPTY AOT cache): the gate that caught the
+# missing `proc` require — see §1 "Requiring the clause". Either path spelling
+# works; the second is the one a foreign checkout uses.
+BEAM_LISP_AOT_CACHE_DIR=$(mktemp -d) \
+  bl -p priv/std test test/bl/proc/reconcile_test.bl test/bl/datom/reconcile_test.bl
+BEAM_LISP_PATH=$PWD/priv/lib:$PWD/priv/std BEAM_LISP_AOT_CACHE_DIR=$(mktemp -d) \
+  bl test test/bl/proc/reconcile_test.bl test/bl/datom/reconcile_test.bl
+# → proc.reconcile-test 59 passed · datom.reconcile-test 25 passed · all green
+bl -p priv/std test --shared test/bl/proc/reconcile_test.bl   # 15 tests, 59 assertions
+bl -p priv/std test --shared test/bl/queue_test.bl            # 17 tests (unchanged)
 ```
 
-Observed green on 2026-09-29 in the isolated runner (`~/.cache/bl-plan036-head`,
-`e420f8b1`) with the three owned sources copied in. Note the `--shared` and
-`-p priv/std` requirement: a clause is resolved when a file's `defserver` forms
-are EXPANDED, and the isolated runner expands before the file's `require`s run
-(BUG-082) — the same requirement `queue_test` documents.
+Both isolated lines are green on 2026-09-30 against an EMPTY
+`BEAM_LISP_AOT_CACHE_DIR` — no warm beam to hide behind. The `proc` require added
+with the clause is what makes them work; before it the same command died with
+`unknown clause reconcile` (see §1). `--shared` compiles the same file in one
+image and remains the fallback for a consumer that cannot rely on `proc` being
+loaded before its `defserver` forms expand.
 
 The clause suite covers: level convergence and restart recovery; an obsolete
-queued revision not publishing; transient failure → queue backoff → publish;
-exhausted retries parked with `failures` and no hot loop; a newer revision
-eligible after an older one is parked; manual retry; move/retire; the L4 crash
-window (a `:pending` intent retired when its source leaves); pause; the level
-timer; and a watch-only server (`:level nil`) converging on an edge trigger.
+queued revision not publishing; an edit applying rev1 and then rev2 through the
+QUEUE (the `:prev` path — the superseded origin must be dropped, the regression
+`perform!`'s dropped `:prev` used to leave live); transient failure → queue
+backoff → publish; exhausted retries parked with `failures` and no hot loop; a
+newer revision eligible after an older one is parked; manual retry; move/retire;
+the L4 crash window (a `:pending` intent retired when its source leaves); pause;
+the level timer; and a watch-only server (`:level nil`) converging on an edge
+trigger.
 
 ## 7 · Known limitations
 
