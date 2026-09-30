@@ -1017,6 +1017,12 @@
 
 (declare k-count)
 
+; The fold toolkit lives with `k-reduce` at the bottom of the file — it needs
+; `step`, which is defined there — but `k-count`/`k-to-list` and the lazy
+; producers above need it first, so the names are reserved here.
+(declare lazy-recipe lazy-fold-pending lazy-fold-source lazy-reduce-source)
+(declare reduce-reduced? reduce-reduced unwrap k-fold k-reduce)
+
 (defn- count-list [xs]
   (loop [ys xs n 0]
     (cond
@@ -1030,6 +1036,17 @@
     (erlang/is_list x) (count-list x)
     :else (k-count-classified x)))
 
+(defn- lazy-count
+  "Count a lazy seq. A node that still carries an unused fold recipe is counted
+   straight from its source (no memo cell per element, no capture copied) and
+   realised as it goes (`lazy-fold-pending`); anything else walks the shared
+   memo cells as before."
+  [x]
+  (let [rv (lazy-recipe x)]
+    (cond
+      (erlang/== rv nil) (BeamLisp.LazySeq/count x)
+      :else (erlang/length (erlang/element 2 (lazy-fold-pending x rv (fn [a _] a) nil))))))
+
 (defn- k-count-classified [x]
   (let [kd (kind-kind x)]
     (cond
@@ -1037,7 +1054,7 @@
       (erlang/== kd :list) (count-list x)
       (erlang/== kd :text) (String/length x)
       (erlang/== kd :vector) (BeamLisp.Vector/count x)
-      (erlang/== kd :lazy) (BeamLisp.LazySeq/count x)
+      (erlang/== kd :lazy) (lazy-count x)
       (erlang/== kd :set) (BeamLisp.Set/count x)
       (erlang/== kd :sorted-set) (BeamLisp.Sorted/set_count x)
       (erlang/== kd :sorted-map) (BeamLisp.Sorted/map_count x)
@@ -1157,8 +1174,9 @@
       (erlang/== kd :lazy) (erlang/== nil (BeamLisp.LazySeq/cell x))
       :else (erlang/== 0 (k-count x)))))
 
-(defn k-to-list
-  "Realize a sequence as a proper list. The one place a lazy seq is forced."
+(defn- to-list-memo
+  "The memo walk behind `k-to-list`: force one cell at a time and share every
+   answer. This is what `doall` is defined to do — it REALISES the memo."
   [x]
   (let [s (k-seq x)]
     (loop [acc () ys s]
@@ -1166,7 +1184,22 @@
         (erlang/== ys nil) (rev acc)
         :else (recur (k-cons (k-first ys) acc) (k-next ys))))))
 
-(defn k-doall [x] (k-to-list x))
+(defn k-to-list
+  "Realize a sequence as a proper list. The one place a lazy seq is forced.
+   A lazy node that still carries an unused fold recipe is realized through it:
+   the same list, built and published without a memo cell per element.
+   Anything else walks the shared cells, so an already-realised seq is not
+   recomputed."
+  [x]
+  (let [rv (lazy-recipe x)]
+    (cond
+      (erlang/== rv nil) (to-list-memo x)
+      :else (erlang/element 2 (lazy-fold-pending x rv (fn [a _] a) nil)))))
+
+; `doall` is defined to REALISE: it publishes every cell so a second consumer
+; reads the shared answers. It therefore walks the memo, never a fold recipe —
+; the recipe is for consumers that walk the seq once and discard it.
+(defn k-doall [x] (to-list-memo x))
 
 (defn k-take
   "The first `n` elements as a list. For `n <= 0` it returns the empty list
@@ -2439,6 +2472,11 @@
   (lazy-map f (BeamLisp.LazySeq/input (seqable coll))))
 
 (defn- lazy-map [f coll]
+  ; The fold recipe folds the SOURCE (a cursor or list, not a memo cell), so a
+  ; `count`/`reduce`/`vec` over the result pays one `f` call per element and no
+  ; cell — which is what removes the captured-environment cost from the env
+  ; bench rows. Forcing still goes through `BeamLisp.LazySeq/cell`, so laziness
+  ; and the chunked shape are untouched.
   (BeamLisp.LazySeq/new
     (fn []
       (let [cell (BeamLisp.LazySeq/cell coll)]
@@ -2455,7 +2493,12 @@
               (cond
                 (erlang/== nil rest) elems
                 :else (BeamLisp.LazySeq/chain elems
-                         (fn [] (lazy-map f rest)))))))))))
+                         (fn [] (lazy-map f rest)))))))))
+    (fn [rf init]
+      (lazy-reduce-source
+        (fn [acc x] (rf acc (lazy-invoke f (lazy-one x))))
+        init
+        coll))))
 
 (defn- map-chunk [f acc coll n]
   "Collect up to n elements from coll, applying f to each, accumulating in
@@ -2501,10 +2544,25 @@
           (let [args (lists/map (fn [seq] (erlang/hd seq)) seqs)]
             (raw-cons (lazy-invoke f args)
               (lazy-multi-map f
-                (lists/map (fn [seq] (erlang/tl seq)) seqs)))))))))
+                (lists/map (fn [seq] (erlang/tl seq)) seqs)))))))
+      ; Lockstep through the sources' CELLS — `LazySeq.cell` is the one
+      ; accessor that understands a SeqCursor, a list, a vector and a lazy node
+      ; alike — so the result folds without ever forming a cell of its own. The
+      ; fold stops at the shortest source, as the seq walk does.
+      (fn [rf init]
+        (loop [acc init ss colls]
+          (let [cells (lists/map (fn [s] (BeamLisp.LazySeq/cell s)) ss)]
+            (cond
+              (lists/any (fn [c] (erlang/== c nil)) cells) acc
+              :else
+              (let [args (lists/map (fn [c] (erlang/hd c)) cells)
+                    acc2 (rf acc (lazy-invoke f args))]
+                (cond
+                  (reduce-reduced? acc2) acc2
+                  :else (recur acc2 (lists/map (fn [c] (erlang/tl c)) cells))))))))))
 
 ;; ── filter: select elements matching a predicate ──────────────────────────
-(declare filter-chunk skip-filter lazy-filter*)
+(declare filter-chunk lazy-filter-realise lazy-filter*)
 
 (defn lazy-filter [pred coll]
   "Filter `coll` with `pred`, lazily. Returns a lazy seq of elements for which
@@ -2514,48 +2572,43 @@
 (defn- lazy-filter* [pred coll]
   (let [coll (BeamLisp.LazySeq/input coll)]
     (BeamLisp.LazySeq/new
-      (fn []
-        (let [first-match (skip-filter pred coll)]
-          (cond
-            (erlang/== nil first-match) nil
-            :else
-            (let [h (erlang/hd first-match)
-                  t (erlang/tl first-match)
-                  chunk-size (BeamLisp.LazySeq/chunk_size)
-                  result (filter-chunk pred (raw-cons h ()) t (erlang/- chunk-size 1))]
-              (let [elems (erlang/element 1 result)
-                    rest (erlang/element 2 result)]
-                (cond
-                  (erlang/== nil rest) elems
-                  :else (BeamLisp.LazySeq/chain elems
-                           (fn [] (lazy-filter* pred rest))))))))))))
+      (fn [] (lazy-filter-realise pred coll))
+      ; The fold keeps only matching elements, so the source's cells never form.
+      (fn [rf init]
+        (lazy-reduce-source
+          (fn [acc x]
+            (cond
+              (lazy-invoke pred (lazy-one x)) (rf acc x)
+              :else acc))
+          init
+          coll)))))
 
-(defn- skip-filter [pred coll]
-  "Find the next element in coll matching pred, skipping non-matches."
-  (let [cell (BeamLisp.LazySeq/cell coll)]
+(defn- lazy-filter-realise [pred coll]
+  "One cell of `filter`: scan up to `chunk_size` INPUTS (never 'until 32
+   matches' — a sparse predicate over an infinite coll must still seal a
+   chunk), looping in place past an all-reject scan so no cell is empty."
+  (let [r (filter-chunk pred () coll (BeamLisp.LazySeq/chunk_size))
+        elems (erlang/element 1 r)
+        rest (erlang/element 2 r)]
     (cond
-      (erlang/== nil cell) nil
-      :else
-      (let [h (erlang/hd cell)
-            t (erlang/tl cell)]
-        (cond
-          (lazy-invoke pred (lazy-one h))
-          (raw-cons h t)
-          :else (skip-filter pred t))))))
+      (erlang/== nil rest) elems
+      (erlang/== () elems) (lazy-filter-realise pred rest)
+      :else (BeamLisp.LazySeq/chain elems (fn [] (lazy-filter* pred rest))))))
 
 (defn- filter-chunk [pred acc coll n]
-  "Collect up to n elements matching pred, accumulating in reverse.
-   Returns [elements rest]."
+  "Scan up to n INPUT elements, keeping those matching pred (reversed in acc).
+   Returns {elements rest}; rest is nil when the input ran out."
   (cond
     (erlang/== n 0) (tuple2 (lists/reverse acc) coll)
     :else
-    (let [first-match (skip-filter pred coll)]
+    (let [cell (BeamLisp.LazySeq/cell coll)]
       (cond
-        (erlang/== nil first-match) (tuple2 (lists/reverse acc) nil)
+        (erlang/== nil cell) (tuple2 (lists/reverse acc) nil)
         :else
-        (let [h (erlang/hd first-match)
-              t (erlang/tl first-match)]
-          (filter-chunk pred (raw-cons h acc) t (erlang/- n 1)))))))
+        (let [h (erlang/hd cell)]
+          (filter-chunk pred
+                        (cond (lazy-invoke pred (lazy-one h)) (raw-cons h acc) :else acc)
+                        (erlang/tl cell) (erlang/- n 1)))))))
 
 ;; ── filter-xform: transducer version of filter ─────────────────────────────
 (defn lazy-filter-xform [pred]
@@ -2606,7 +2659,19 @@
    the first falsy pred result."
   (let [input (BeamLisp.LazySeq/input (seqable coll))]
     (BeamLisp.LazySeq/new
-      (fn [] (take-while-seg pred input)))))
+      (fn [] (take-while-seg pred input))
+      ; The fold BOUNDS an infinite source: on the first falsy pred it wraps
+      ; the accumulator in a Reduced, which stops the source fold at that
+      ; element — no further element is read. The wrapper is peeled by the
+      ; caller, so the fold's value is the ordinary accumulator.
+      (fn [rf init]
+        (lazy-reduce-source
+          (fn [acc x]
+            (cond
+              (lazy-invoke pred (lazy-one x)) (rf acc x)
+              :else (reduce-reduced acc)))
+          init
+          input)))))
 
 (defn- take-while-seg [pred coll]
   "Chunked version that collects up to chunk_size consecutive matching elements."
@@ -2653,8 +2718,25 @@
 (defn lazy-drop-while [pred coll]
   "Lazy seq with leading elements removed where pred is truthy. Returns the
    first element where pred is falsy and everything after it."
-  (BeamLisp.LazySeq/new
-    (fn [] (drop-while-skip pred (seqable coll)))))
+  (let [input (BeamLisp.LazySeq/input (seqable coll))]
+    (BeamLisp.LazySeq/new
+      (fn [] (drop-while-skip pred input))
+      ; One volatile carries the phase: while dropping, a matching element is
+      ; skipped without touching the accumulator; the first miss flips the
+      ; phase and every element after it is folded. The pred runs once per
+      ; element in order, as the cell walk does.
+      (fn [rf init]
+        (let [dropping (BeamLisp.Refs/volatile true)]
+          (lazy-reduce-source
+            (fn [acc x]
+              (cond
+                (BeamLisp.Refs/deref dropping)
+                (cond
+                  (lazy-invoke pred (lazy-one x)) acc
+                  :else (do (BeamLisp.Refs/vreset! dropping false) (rf acc x)))
+                :else (rf acc x)))
+            init
+            input))))))
 
 (defn- drop-while-skip [pred coll]
   "Skip leading elements while pred is truthy, returning the rest."
@@ -2673,9 +2755,23 @@
 (declare range-chunk range-build)
 
 (defn lazy-range
-  ([] (BeamLisp.LazySeq/new (fn [] (range-chunk 0 nil))))
+  ([] (lazy-range 0 nil))
   ([end_] (lazy-range 0 end_))
-  ([start end_] (BeamLisp.LazySeq/new (fn [] (range-chunk start end_)))))
+  ([start end_]
+   (BeamLisp.LazySeq/new
+     (fn [] (range-chunk start end_))
+     ; A generator's fold is a plain counter loop — no source to walk, no cell
+     ; to publish. `end_` nil is the infinite range, bounded only by a consumer
+     ; step that returns a Reduced.
+     (fn [rf init]
+       (loop [i start acc init]
+         (cond
+           (erlang/and (erlang/== false (erlang/== end_ nil)) (erlang/>= i end_)) acc
+           :else
+           (let [acc2 (rf acc i)]
+             (cond
+               (reduce-reduced? acc2) acc2
+               :else (recur (erlang/+ i 1) acc2)))))))))
 
 (defn- range-chunk [start end_]
   "Build one chunk of integers (up to chunk_size) with a lazy tail if not exhausted."
@@ -2708,7 +2804,17 @@
 
 (defn lazy-iterate [f x]
   "Infinite lazy seq starting with x, then (f x), (f (f x)), etc."
-  (BeamLisp.LazySeq/new (fn [] (iterate-from f x))))
+  (BeamLisp.LazySeq/new
+    (fn [] (iterate-from f x))
+    ; The generator's fold applies f in the same order the cell walk does, so
+    ; the elements agree; an infinite seq is bounded only by a consumer step
+    ; returning a Reduced.
+    (fn [rf init]
+      (loop [x x acc init]
+        (let [acc2 (rf acc x)]
+          (cond
+            (reduce-reduced? acc2) acc2
+            :else (recur (lazy-invoke f (lazy-one x)) acc2)))))))
 
 (defn- iterate-from [f x]
   "Generate the next element: x, then tail is the infinite iteration of f."
@@ -2720,7 +2826,14 @@
 (declare repeat-from)
 
 (defn lazy-repeat
-  ([x] (BeamLisp.LazySeq/new (fn [] (repeat-from x))))
+  ([x] (BeamLisp.LazySeq/new
+         (fn [] (repeat-from x))
+         (fn [rf init]
+           (loop [acc init]
+             (let [acc2 (rf acc x)]
+               (cond
+                 (reduce-reduced? acc2) acc2
+                 :else (recur acc2)))))))
   ([n x] (lists/duplicate (erlang/max n 0) x)))
 
 (defn- repeat-from [x]
@@ -2740,7 +2853,17 @@
       (cond
         (erlang/== nil cell) nil
         :else (BeamLisp.LazySeq/new
-                (fn [] (cycle-from input input)))))))
+                (fn [] (cycle-from input input))
+                ; Re-walk the source for each lap until the consumer halts. The
+                ; source is immutable (a cursor or list) or a memoised lazy seq,
+                ; so a later lap replays it; a halt returns the Reduced as-is
+                ; for the caller to peel.
+                (fn [rf init]
+                  (loop [acc init]
+                    (let [acc2 (lazy-fold-source rf acc input)]
+                      (cond
+                        (reduce-reduced? acc2) acc2
+                        :else (recur acc2))))))))))
 
 (defn- cycle-from [current original]
   "Yield current's head, then recursively cycle through tail. When current ends,
@@ -2951,7 +3074,20 @@
   [seqs]
   (let [inputs (lists/map (fn [x] (BeamLisp.LazySeq/input x)) (k-to-list seqs))
         cursor (BeamLisp.SeqCursor/new inputs)]
-    (BeamLisp.LazySeq/new (fn [] (concat-chunk nil cursor)))))
+    (BeamLisp.LazySeq/new
+      (fn [] (concat-chunk nil cursor))
+      ; Fold each input in order, stopping the whole concat when the consumer's
+      ; step halts: the raw source fold returns the Reduced, so the next input
+      ; is never entered.
+      (fn [rf init]
+        (loop [acc init ss inputs]
+          (cond
+            (empty-list? ss) acc
+            :else
+            (let [acc2 (lazy-fold-source rf acc (erlang/hd ss))]
+              (cond
+                (reduce-reduced? acc2) acc2
+                :else (recur acc2 (erlang/tl ss))))))))))
 
 
 ;; ════ rt.num ═══════════════════════════════════════════════════════════════════
@@ -3738,22 +3874,129 @@
           (reduce-reduced? acc2) acc2
           :else (recur acc2 (k-next ys)))))))
 
+;; ── the fold recipe toolkit ────────────────────────────────────────────────
+; A lazy producer may attach a fold recipe (`BeamLisp.LazySeq.new/2`): a
+; 2-arity fn that folds the seq's elements straight from its SOURCE. The
+; toolkit below is what a recipe is built from, and it decides WHEN a recipe
+; may be used at all.
+;
+; `lazy-recipe` is the one rule: only a node whose head cell is still `:pending`
+; folds from source. Once ANYTHING is realised the memo walk is used instead, so
+; an element already published keeps its shared value and a side-effecting `f`
+; is not re-run for it. What a fold means for a still-pending node — the
+; elements are RE-computed and NOT published — is on `BeamLisp.LazySeq`.
+
+(defn- reduce-cursor
+  "Fold a `SeqCursor` — native, chunked storage for a finite eager input. It
+   carries no memo cell, so this is a plain walk of `SeqCursor.cell`."
+  [f acc cursor]
+  (loop [acc acc cell (BeamLisp.SeqCursor/cell cursor)]
+    (cond
+      (erlang/== cell nil) acc
+      :else
+      (let [acc2 (step f acc (erlang/hd cell))]
+        (cond
+          (reduce-reduced? acc2) acc2
+          :else (recur acc2 (BeamLisp.SeqCursor/cell (erlang/tl cell))))))))
+
+(defn lazy-fold-source
+  "Fold `rf` over a producer's SOURCE, RAW: a step returning a `Reduced` stops
+   the fold and the sentinel is returned as-is, so a recipe can tell a halt from
+   an exhausted source (concat, cycle). A `SeqCursor` is walked directly;
+   everything else goes through `k-fold`, which consults a nested LazySeq's own
+   recipe. `rf` is a raw 2-arity fun."
+  [rf init source]
+  (cond
+    (struct-of? source :"Elixir.BeamLisp.SeqCursor") (reduce-cursor rf init source)
+    :else (k-fold rf init source)))
+
+(defn lazy-reduce-source
+  "`lazy-fold-source`, with the `Reduced` peeled — what a recipe whose fold
+   simply propagates a halt uses, so its value is the ordinary accumulator."
+  [rf init source]
+  (let [out (lazy-fold-source rf init source)]
+    (cond (reduce-reduced? out) (unwrap out) :else out)))
+
+(defn- lazy-recipe
+  "`{recipe version}` for a LazySeq whose head cell is still
+   `{:pending thunk recipe}` at `version`; nil otherwise. The version is what
+   `lazy-fold-pending` publishes the folded elements against."
+  [x]
+  (cond
+    (erlang/== false (struct-of? x :"Elixir.BeamLisp.LazySeq")) nil
+    :else (BeamLisp.LazySeq/pending_recipe x)))
+
+(defn- lazy-fold-pending
+  "Fold the pending node `l` through its recipe (`rv` = `{recipe version}`) and
+   REALISE it: every element the recipe yields is also collected, and a fold
+   that runs to the end publishes the complete list as the node's shared
+   answer. A second consumer then reads the memo instead of re-running the
+   producer: the realise-once contract Clojure's `seq-reduce` keeps (a
+   side-effecting `f` under `map` runs once per element, however many folds).
+   A fold the step halts publishes nothing (the rest of the seq was never
+   produced), and the node stays `:pending`.
+
+   The halt is carried IN the accumulator (`{acc buf halted?}`), never read
+   off the recipe's return: a recipe that propagates a halt through
+   `lazy-reduce-source` peels the `Reduced` before returning, and a partial
+   list published as the whole seq would be a wrong answer forever after.
+
+   Returns `{acc elems}`: `acc` is the step's accumulator (a `Reduced` when it
+   halted) and `elems` the published list (nil when halted)."
+  [l rv f acc]
+  (let [out (lazy-invoke (erlang/element 1 rv)
+              (lazy-two
+                (fn [p x]
+                  (let [a2 (step f (erlang/element 1 p) x)
+                        buf (raw-cons x (erlang/element 2 p))]
+                    (cond
+                      (reduce-reduced? a2) (reduce-reduced (tuple (unwrap a2) buf true))
+                      :else (tuple a2 buf false))))
+                (tuple acc () false)))
+        p (cond (reduce-reduced? out) (unwrap out) :else out)]
+    (cond
+      (erlang/element 3 p)
+      (tuple (reduce-reduced (erlang/element 1 p)) nil)
+      :else
+      (let [elems (erlang/apply :lists :reverse (list (erlang/element 2 p)))]
+        (BeamLisp.LazySeq/publish_folded l (erlang/element 2 rv) elems)
+        (tuple (erlang/element 1 p) elems)))))
+
+(defn- lazy-fold
+  "Fold a LazySeq with the callable `f`: from source through its recipe when it
+   may be used (realising the node, see `lazy-fold-pending`), otherwise the
+   memo-cell walk."
+  [f acc l]
+  (let [rv (lazy-recipe l)]
+    (cond
+      (erlang/== rv nil) (reduce-lazy f acc l)
+      :else (erlang/element 1 (lazy-fold-pending l rv f acc)))))
+
 ;; ── the one entry point ────────────────────────────────────────────────────
+(defn k-fold
+  "`k-reduce`'s walk, WITHOUT peeling the `Reduced` sentinel, so a fold recipe
+   that must know its consumer halted can read it (see `lazy-fold-source`).
+   Prefer `k-reduce`."
+  [f init coll]
+  (let [kd (kind-kind coll)]
+    (cond
+      (erlang/== kd :list) (reduce-list f init coll)
+      (erlang/== kd :vector) (reduce-vector f init coll)
+      (erlang/== kd :lazy) (lazy-fold f init coll)
+      (erlang/== kd :map) (reduce-map f init coll)
+      (erlang/== kd :nil) init
+      :else (reduce-seq f init coll))))
+
 (defn k-reduce
   "`(reduce f init coll)`: fold `f` as `(f acc x)` over `coll`, returning the
    accumulator. Dispatch happens once, on the collection's kind; the walk is
    then representation-directed. A step returning a `Reduced` stops the fold
    immediately — no further callback, no further lazy force — and its value is
-   returned unwrapped."
+   returned unwrapped. A lazy seq still carrying an unused fold recipe is folded
+   straight from its source: no memo cell per element, no captured environment
+   copied."
   [f init coll]
-  (let [kd (kind-kind coll)
-        out (cond
-              (erlang/== kd :list) (reduce-list f init coll)
-              (erlang/== kd :vector) (reduce-vector f init coll)
-              (erlang/== kd :lazy) (reduce-lazy f init coll)
-              (erlang/== kd :map) (reduce-map f init coll)
-              (erlang/== kd :nil) init
-              :else (reduce-seq f init coll))]
+  (let [out (k-fold f init coll)]
     (cond
       (reduce-reduced? out) (unwrap out)
       :else out)))

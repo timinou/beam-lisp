@@ -1,0 +1,143 @@
+; ref_cycles_test.bl — reference types are leak-free, cycles included.
+; Run: bl test test/bl/ref_cycles_test.bl
+;
+; Atoms, delays, promises, volatiles and lazy nodes are native memo cells:
+; reference counted, so a cycle through their saved values never reached zero
+; and leaked for the VM's lifetime. `native/lazy_memo/src/collector.rs` finds
+; and breaks such cycles (trial deletion over a runtime-calibrated view of each
+; resource's refcount). Promises and volatiles were worse — a process per
+; promise and a process-dictionary key per volatile, never reclaimed — and are
+; now ordinary cells.
+;
+; Every case builds garbage 20 times and asserts the live cell and process
+; counts return to where they started. A cycle that is still REACHABLE must
+; survive every round and stay readable.
+;
+; RUNTIME: each case runs 20 times, and `settle!` garbage-collects every process
+; and runs cycle rounds until the live count stops moving — twice per case, plus
+; three times in the reachable-cycle test. The racing test drives 200 ring walks
+; against a back-to-back collector loop (bounded at 60 s). Expect minutes on a
+; quiet VM; a busy suite lengthens it. CAP: none beyond the default — the
+; garbage it builds is tiny and dropped at once.
+;
+; The COLLECTOR GATE is fallback-aware: the pinned collector calibrates itself
+; against the RUNNING emulator (indices, refcount offsets, ETF census) and can
+; legitimately stay off when it cannot prove the layout. The gate asserts the
+; report is honest, and the reclamation cases run for real only when the
+; collector is on; the honest fallback is pinned otherwise. On an OTP 29 image
+; the calibration is expected to pass, so every case runs for real.
+
+(ns ref-cycles.test)
+
+(defn- live [] (:live_cells (BeamLisp.LazyMemo/stats)))
+
+(defn- settle!
+  "Collect every process heap (drops dead references), then run cycle rounds
+   until the count stops moving."
+  []
+  (loop [prev -1 i 0]
+    (doseq [p (erlang/processes)] (erlang/garbage_collect p))
+    (BeamLisp.LazyMemo/collect_cycles)
+    (let [now (live)]
+      (when (and (not= now prev) (< i 5)) (recur now (inc i))))))
+
+(defn- leaks
+  "`{:cells n :procs n}` left behind by 20 runs of `f`."
+  [f]
+  (settle!)
+  (let [c0 (live) p0 (erlang/system_info :process_count)]
+    (doseq [_ (range 20)] (f))
+    (settle!)
+    {:cells (- (live) c0) :procs (- (erlang/system_info :process_count) p0)}))
+
+; The collector calibrates against the running emulator's layout; when it can
+; prove it, `collector_status` is the empty string and `:cycle_enabled` is true;
+; when it cannot, the status carries the reason and the collector is off. Both
+; facts must hold together — a status that disagrees with `:cycle_enabled`
+; would mean the gate is lying about what it proved.
+(def ^:private calibration (BeamLisp.LazyMemo/collector_status))
+(def ^:private collector-on? (erlang/== "" calibration))
+
+(deftest the-collector-reports-its-calibration-honestly
+  (is (erlang/is_binary calibration))
+  (is (= collector-on? (:cycle_enabled (BeamLisp.LazyMemo/stats)))
+      "cycle collection is on exactly when the emulator calibrated"))
+
+(deftest cyclic-garbage-is-reclaimed
+  (if collector-on?
+    (doseq [[nm f]
+            [["atom holding itself"         #(let [a (atom nil)] (reset! a {:me a}))]
+             ["watch fn capturing its atom" #(let [a (atom 0)] (add-watch a :k (fn [& _] a)) (swap! a inc))]
+             ["value fn capturing its atom" #(let [a (atom 0)] (swap! a (fn [_] (fn [] a))))]
+             ["atom -> lazy seq -> atom"    #(let [a (atom nil)] (reset! a (map (fn [_] @a) [1 2])))]
+             ["two atoms, each the other's" #(let [a (atom nil) b (atom a)] (reset! a b))]
+             ["delay reaching itself"       #(let [p (promise) d (delay @p)] (deliver p d) d)]
+             ["volatile holding itself"     #(let [v (volatile! nil)] (vreset! v v))]
+             ["promise holding itself"      #(let [p (promise)] (deliver p p))]
+             ["cycle through a distinct"    #(let [a (atom nil)] (reset! a (distinct [a a 1])) (doall @a))]]]
+      (is (= {:cells 0 :procs 0} (leaks f)) nm))
+    (testing "collector off on this emulator: the fallback is reported, not silent"
+      (is (not= "" calibration) calibration)
+      (is (= 0 (BeamLisp.LazyMemo/collect_cycles))))))
+
+(deftest acyclic-references-never-leaked-and-still-do-not
+  (doseq [[nm f]
+          [["promise, delivered"   #(let [p (promise)] (deliver p 1) @p)]
+           ["promise, never"       #(promise)]
+           ["volatile"             #(vswap! (volatile! 1) inc)]
+           ["atom holding an atom" #(let [a (atom (atom 1))] @@a)]]]
+    (is (= {:cells 0 :procs 0} (leaks f)) nm)))
+
+(deftest a-reachable-cycle-survives-every-round
+  (let [a (atom nil)
+        b (atom a)]
+    (reset! a {:peer b :n 1})
+    (doseq [_ (range 3)] (settle!))
+    (is (= 1 (:n @(deref (:peer @a)))) "a <-> b, still held by this process")
+    (swap! a update :n inc)
+    (settle!)
+    (is (= 2 (:n @a)))))
+
+(deftest a-cycle-held-only-by-another-process-survives
+  (let [holder (Task/async
+                 (fn []
+                   (let [a (atom nil)]
+                     (reset! a {:me a :v 42})
+                     (receive [:go from] (erlang/send from [:v (:v @(:me @a))])))))]
+    (doseq [_ (range 3)] (settle!))
+    (erlang/send (:pid holder) [:go (erlang/self)])
+    (is (= [:v 42] (receive [:v x] [:v x] (after 5000 :timeout))))
+    (Task/await holder)))
+
+(deftest rounds-racing-readers-never-free-what-a-reader-reaches
+  ; A reader walks a ring of atoms (each holding the next) while rounds run
+  ; back to back. The ring is only ever reachable through the reader, which
+  ; drops and re-reaches it: a sound collector frees nothing it can read.
+  (let [ring (let [as (vec (map (fn [_] (atom nil)) (range 50)))]
+               (doseq [i (range 50)] (reset! (as i) {:i i :next (as (mod (inc i) 50))}))
+               (as 0))
+        stop (atom false)
+        rounds (Task/async (fn [] (loop [k 0] (if @stop k (do (BeamLisp.LazyMemo/collect_cycles) (recur (inc k)))))))
+        walk (fn [a steps] (loop [a a k 0] (if (= k steps) (:i @a) (recur (:next @a) (inc k)))))]
+    (doseq [r (range 200)] (is (= (mod (* r 7) 50) (walk ring (* r 7)))))
+    (reset! stop true)
+    (is (pos? (Task/await rounds 60000)))))
+
+(deftest promise-and-volatile-keep-their-contracts
+  (let [p (promise)
+        t (Task/async (fn [] @p))]
+    (Process/sleep 20)
+    (is (= p (deliver p 42)))
+    (is (nil? (deliver p 1)) "a second delivery is a no-op")
+    (is (= 42 (Task/await t)) "a waiter registered before delivery is woken")
+    (is (= 42 @p))
+    (is (= :timeout (deref (promise) 10 :timeout))))
+  (let [v (volatile! 1)]
+    (is (= 2 (vswap! v inc)))
+    (is (= 5 (vreset! v 5)))
+    (is (= 5 @v)))
+  (let [xf (fn [] (into [] (comp (map inc) (take 2)) [1 2 3]))
+        _ (xf) ; warm: the first call site memoises its var lookup in the pdict
+        d0 (count (erlang/get))]
+    (doseq [_ (range 100)] (xf))
+    (is (= d0 (count (erlang/get))) "a transducer's volatile leaves nothing in the process dictionary")))
