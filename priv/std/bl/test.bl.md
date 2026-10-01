@@ -15,6 +15,9 @@ second runner to choose between.
 
 **Isolated (the default).** Every file forks; a misbehaving file is contained.
 Warm because the image the forks come from is the one this process already has.
+A file that runs past 300 s is reported incoherent and killed; `BL_TEST_TIMEOUT=N`
+(whole seconds) moves that bound for one run, so a slow suite on a loaded host
+keeps its isolation instead of retreating to `--shared`.
 
 **`--shared`.** Every file runs in ONE image, one after another, sharing what
 the files set up between them — the old behavior. The image is forked from this

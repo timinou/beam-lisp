@@ -156,7 +156,9 @@
     use: 1, symbol: 1, marker: 1, filter: 1, image: 1
   };
   function render(node, svg) {
-    if (node === null || node === undefined) return document.createTextNode("");
+    // live.diff/splice-children drops nil: an empty fragment preserves those
+    // child indices, whereas an empty text node shifts every later patch.
+    if (node === null || node === undefined) return document.createDocumentFragment();
     if (typeof node === "string" || typeof node === "number") {
       return document.createTextNode(String(node));
     }
