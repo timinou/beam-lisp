@@ -240,12 +240,11 @@
   // ── apply one op ──────────────────────────────────────────────────────
   // ── apply one patch (a list of ops) ───────────────────────────────────
   // The server's reference (diff.bl apply-ops) applies ALL structural ops
-  // first — grouped by parent path, deepest parents first — and only then
-  // the deep ops, whose paths index the REBUILT tree. Applying in raw wire
-  // order patches pre-move nodes: a keyed list whose reconcile moves a child
-  // would set attributes/text on whatever sat at that index BEFORE the move.
-  // Grouping here is the exact mirror: within a parent, wire order already
-  // is removes → placements (anchor-fill); across parents, deepest first.
+  // first — grouped by parent path, SHALLOWEST parents first — and only then
+  // the deep ops, whose paths index the REBUILT tree. Every path under a list
+  // indexes that list's NEW children, so an inner parent is addressable only
+  // after its outer list is rebuilt (deepest-first patched the row one late).
+  // Within a parent, wire order already is removes → placements (anchor-fill).
   const STRUCTURAL = { remove: 1, "remove-at": 1, insert: 1, move: 1 };
   function applyPatch(root, ops) {
     const structural = [];
@@ -258,7 +257,7 @@
       byPath.get(k).push(op);
     }
     const paths = Array.from(byPath.keys()).sort(
-      (a, b) => JSON.parse(b).length - JSON.parse(a).length);
+      (a, b) => JSON.parse(a).length - JSON.parse(b).length);
     for (const p of paths) for (const op of byPath.get(p)) applyOp(root, op);
     for (const op of deep) applyOp(root, op);
   }
