@@ -156,3 +156,146 @@
       (is (not= (get (:key p) leaf) (get (:key p) root)))
       (is (= [leaf] (vec (get (:deps p) root))) "the require resolved to a path"))
     (File/rm_rf! dir)))
+
+; ── the on-disk level: a cold VM does not re-parse ─────────────────────────
+;
+; The ETS memo above dies with its VM, and every `bl` command without a daemon is
+; a new VM. The disk level stores each parse under the content hash, inside the
+; generation `AOTCache/build_key` names — so what these pin is the contract a
+; drop store depends on: bytes → the same answer from disk, an edit → a miss, a
+; moved toolchain → nothing read, and a damaged or hostile file → a parse, never
+; a wrong answer or a crash.
+
+(defn- restore-env [name value]
+  (if (nil? value) (System/delete_env name) (System/put_env name value)))
+
+(defn- with-parts-root
+  "Run `f` with a FRESH cache root and an empty VM memo, restoring both."
+  [f]
+  (let [root (str (System/tmp_dir!) "/bl_parts_" (erlang/unique_integer (list :positive)))
+        prev (System/get_env "BEAM_LISP_AOT_CACHE_DIR")
+        prev-on (System/get_env "BEAM_LISP_AOT_CACHE")]
+    (System/put_env "BEAM_LISP_AOT_CACHE_DIR" root)
+    (System/delete_env "BEAM_LISP_AOT_CACHE")
+    (File/mkdir_p! root)
+    (bp/clear-memo)
+    (try
+      (f root)
+      (finally
+        (restore-env "BEAM_LISP_AOT_CACHE_DIR" prev)
+        (restore-env "BEAM_LISP_AOT_CACHE" prev-on)
+        (bp/clear-memo)
+        (File/rm_rf! root)))))
+
+(defn- part-files [root]
+  (let [gens (Path/wildcard (Path/join root "parts/*"))]
+    (vec (mapcat (fn [g] (Path/wildcard (Path/join g "*"))) gens))))
+
+(def SRC "(ns disk.a (:require [disk.b :as b]))\n(defn f [] (b/g))\n")
+
+(deftest a-cold-vm-reads-the-parse-from-disk
+  (with-parts-root
+    (fn [root]
+      (let [first (bp/memo-node "disk.a" SRC)]
+        (is (= 1 (count (part-files root))) "the parse was published")
+        (bp/clear-memo)
+        (let [again (bp/memo-node "disk.a" SRC)]
+          (is (= first again) "a fresh VM memo answers the SAME node from disk")
+          (is (= ["disk.b"] (vec (:reqs again)))))
+        (is (= 1 (count (part-files root))) "…and wrote nothing new")))))
+
+(defn- generation-of [root]
+  (Path/basename (Path/dirname (first (part-files root)))))
+
+(deftest the-generation-is-the-build-key
+  (with-parts-root
+    (fn [root]
+      (bp/memo-node "disk.a" SRC)
+      (is (= (BeamLisp.AOTCache/build_key) (generation-of root))
+          "two drop builds of one toolchain share a directory; a moved toolchain gets its own"))))
+
+(deftest an-edit-is-a-miss
+  (with-parts-root
+    (fn [root]
+      (bp/memo-node "disk.a" SRC)
+      (bp/clear-memo)
+      (let [edited (bp/memo-node "disk.a" "(ns disk.a (:require [disk.c :as c]))\n(defn f [] 1)\n")]
+        (is (= ["disk.c"] (vec (:reqs edited))) "new bytes are parsed, never answered from the old entry")
+        (is (= 2 (count (part-files root))))))))
+
+(deftest a-damaged-file-is-a-parse-not-a-wrong-answer
+  (with-parts-root
+    (fn [root]
+      (let [good (bp/memo-node "disk.a" SRC)
+            f (first (part-files root))]
+        (doseq [damage [(fn [_] "")                       ; truncated to nothing
+                        (fn [b] (binary/part b 0 20))     ; shorter than the digest
+                        (fn [b] (str "x" (binary/part b 1 (- (erlang/byte_size b) 1)))) ; digest broken
+                        (fn [_] (str (crypto/hash :sha256 "junk") "junk"))] ; valid digest, not a term
+                ]
+          (File/write! f (damage (File/read! f)))
+          (bp/clear-memo)
+          (is (= good (bp/memo-node "disk.a" SRC)) "answers by parsing")
+          (is (= good (bp/memo-node "disk.a" SRC))))
+        (is (= 1 (count (part-files root))) "and the bad file was replaced")))))
+
+(deftest a-file-under-the-wrong-hash-is-refused
+  (with-parts-root
+    (fn [root]
+      (bp/memo-node "disk.a" SRC)
+      (let [other "(ns disk.z)\n(defn z [] 1)\n"
+            a-file (first (part-files root))
+            z-name (binary/encode_hex (crypto/hash :sha256 other))
+            z-file (Path/join (Path/dirname a-file) z-name)]
+        (File/cp! a-file z-file)
+        (bp/clear-memo)
+        (let [z (bp/memo-node "disk.z" other)]
+          (is (= "disk.z" (:ns z)) "another source's parse placed under this hash is not served"))))))
+
+(deftest an-unwritable-root-still-answers
+  (with-parts-root
+    (fn [root]
+      (File/write! (Path/join root "parts") "a file where a directory must go")
+      (let [n (bp/memo-node "disk.a" SRC)]
+        (is (= "disk.a" (:ns n)) "the store failed; the parse did not")
+        (is (= 0 (count (part-files root))))))))
+
+(deftest cache-off-touches-no-disk
+  (with-parts-root
+    (fn [root]
+      (System/put_env "BEAM_LISP_AOT_CACHE" "off")
+      (bp/memo-node "disk.a" SRC)
+      (is (= 0 (count (part-files root))) "BEAM_LISP_AOT_CACHE=off reads and writes nothing"))))
+
+(deftest old-generations-are-bounded
+  (with-parts-root
+    (fn [root]
+      (doseq [i (range 12)]
+        (let [g (Path/join root (str "parts/" (String/duplicate (str i) 64)))]
+          (File/mkdir_p! g)
+          (File/write! (Path/join g "x") "old")))
+      (bp/memo-node "disk.a" SRC)
+      (let [gens (Path/wildcard (Path/join root "parts/*"))]
+        (is (<= (count gens) bp/PARTS-KEEP) "creating a generation prunes beyond the bound")
+        (is (some (fn [g] (= (BeamLisp.AOTCache/build_key) (Path/basename g))) gens)
+            "the current generation is never pruned")))))
+
+(deftest a-warm-store-parses-nothing
+  ;; The point of the disk level, stated as a count rather than a stopwatch: with
+  ;; every part already stored, a cold VM's gate walk calls `content-parts` ZERO
+  ;; times. A real, unedited part is indistinguishable from a fresh parse by
+  ;; value, so the proof PLANTS one: a valid, correctly-framed file for these very
+  ;; bytes whose `:inames` differs from what parsing would say. If it comes back,
+  ;; the answer came from the file and nothing was parsed.
+  (with-parts-root
+    (fn [root]
+      (let [real (bp/memo-node "disk.a" SRC)
+            f (first (part-files root))
+            planted {:macros (:macros real) :hash (:hash real) :iface (:iface real)
+                     :inames ["planted-marker"] :refs (:refs real)
+                     :headers (list (list "disk.a" (:reqs real)))}
+            payload (erlang/term_to_binary planted)]
+        (File/write! f (str (crypto/hash :sha256 payload) payload))
+        (bp/clear-memo)
+        (is (= ["planted-marker"] (vec (:inames (bp/memo-node "disk.a" SRC))))
+            "the stored bytes were served; nothing was re-parsed")))))
