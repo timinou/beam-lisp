@@ -168,7 +168,9 @@
                  (cond seen? resources
                        :else (erlang/++ (list resource) resources))))
 
-    ; ── a bare memo handle (or a cursor, whose source it answers) ──
+    ; ── a bare memo handle (or a cursor root, whose source it answers). A
+    ;    `{root, index}` cursor token reaches this same arm through its root
+    ;    element, so a walk handle is a graph boundary however it is spelled. ──
     (erlang/is_reference cur)
     (let [found (nif_dependency_resource cur)
           seen? (cond (erlang/== found nil) true
@@ -298,21 +300,31 @@
        thunk}` at creation, `{:completed value}`, `{:failed …}`). It is UNIONED
        with the cell's existing edges; only genuinely new ids are cycle-checked,
        and a new edge is not fast-lane work (the cycle walk is unbounded in the
-       reachable set), so such a call answers `:reroute` and we retry dirty."
+       reachable set). A NON-EMPTY list therefore routes straight to the dirty
+       lane — the fast lane could only answer `:reroute` to it. `:keep` and `()`
+       still try the fast lane first: they may be a SUBSET of the edges the cell
+       already holds, which is the fast case that lane exists for."
   ([resource expected_version replacement deps_mode]
     (exchange_version resource expected_version replacement deps_mode (list)))
   ([resource expected_version replacement deps_mode notifications]
     (ensure_loaded!)
     (let [bytes (estimate_bytes replacement)]
-      (if (erlang/=< bytes (nif_fast_lane_bytes))
-        (let [answer (nif_exchange_version_fast
-                       resource expected_version replacement deps_mode bytes notifications)]
-          (if (erlang/== answer :reroute)
-            (nif_exchange_version
-              resource expected_version replacement deps_mode bytes notifications)
-            answer))
-        (nif_exchange_version
-          resource expected_version replacement deps_mode bytes notifications)))))
+      (cond
+        (and (erlang/is_list deps_mode) (not (erlang/== deps_mode ())))
+          (nif_exchange_version
+            resource expected_version replacement deps_mode bytes notifications)
+
+        (erlang/=< bytes (nif_fast_lane_bytes))
+          (let [answer (nif_exchange_version_fast
+                         resource expected_version replacement deps_mode bytes notifications)]
+            (if (erlang/== answer :reroute)
+              (nif_exchange_version
+                resource expected_version replacement deps_mode bytes notifications)
+              answer))
+
+        :else
+          (nif_exchange_version
+            resource expected_version replacement deps_mode bytes notifications)))))
 
 (defn put
   "Unconditional replace of a ref cell's value — the last writer wins (a
@@ -362,20 +374,53 @@
   (nif_collector_status))
 
 ; ── cursors over an eager list ───────────────────────────────────────────────
+;
+; ONE ROOT PER WALK (PLAN-155). `cursor/1` builds the walk's single native
+; resource — the root — and answers it. The root owns the source's saved list
+; AND an index of one saved position per 32-head chunk boundary, built once at
+; creation, so a chunk pull is O(32) and never scans from the head or copies a
+; tail. Every position AFTER the first is named by a `{root, index}` token: an
+; ordinary 2-tuple whose first element IS the root resource. A tail therefore
+; costs no allocation and no collector-registry operation, and `new/1` on a
+; 16k-element list mints ONE resource where the old shape minted 512.
+;
+; A HANDLE — what `cursor_chunk/1,2` accepts, and what `:tail` holds — is
+; either spelling of a position: the root resource itself (chunk 0, what
+; `cursor/1` answers) or a `{root, index}` token. Pulling READS only, so the
+; same handle always answers the same `{chunk, tail}`; a walk can be replayed,
+; and two consumers may share one root without disturbing each other.
+;
+; The dependency walk needs no special case: a token is a tuple, so
+; `deps_walk` descends it, reaches the root's reference and answers the source
+; cell through `nif_dependency_resource` — exactly the boundary a bare cursor
+; resource used to be.
 
 (defn cursor [items]
+  "The root resource of a walk over the eager list `items`: chunk 0, and the
+   owner of the whole position index. Copying the list into native storage and
+   building the index is the O(n) cost of the walk, paid here and once."
   (ensure_loaded!)
   (nif_cursor items (dependencies items) (estimate_bytes items)))
 
-(defn cursor_dirty_chunks? [resource]
-  (nif_cursor_dirty_chunks resource))
+(defn cursor_dirty_chunks? [handle]
+  "Whether `handle`'s chunks must take the dirty lane — decided once, at
+   creation, from the source's average element size. Accepts the root or a
+   `{root, index}` token."
+  (nif_cursor_dirty_chunks handle))
 
 (defn cursor_chunk
-  ([resource] (nif_cursor_chunk_fast resource))
-  ([resource dirty?]
+  "Pull the next 32-head chunk of `handle` as `{chunk, tail}`.
+
+   `chunk` is a raw Erlang list of at most 32 heads; `tail` is the `{root,
+   index}` handle for the chunk after it, or `nil` when the walk is spent. A
+   pull only reads: `handle` is unchanged, and the same handle always answers
+   the same pair. `dirty?` is the lane `cursor_dirty_chunks?` answered at
+   creation."
+  ([handle] (nif_cursor_chunk_fast handle))
+  ([handle dirty?]
     (cond
-      (erlang/== dirty? false) (nif_cursor_chunk_fast resource)
-      (erlang/== dirty? true) (nif_cursor_chunk resource)
+      (erlang/== dirty? false) (nif_cursor_chunk_fast handle)
+      (erlang/== dirty? true) (nif_cursor_chunk handle)
       :else (erlang/error (Elixir.FunctionClauseError/exception
         (list (erlang/list_to_tuple (list :module (self-module)))
               (erlang/list_to_tuple (list :function :cursor_chunk))
@@ -394,6 +439,19 @@
    O(1). Everything else (a `{:pending thunk}`, a `{:completed value}`, a
    `{:failed …}`) measures exactly.
 
+   THE COUNTED OVERHEADS (PLAN-154 B). The cache ceiling bounds the bytes
+   retained OFF-HEAP, and the accounting is exactly this: one cell's native
+   overhead (the native `accounted_bytes/1` adds `size_of::<MemoCell>` to every
+   state) plus this estimate. So a `:running`/`:terminal` control state costs
+   the constant above; a `:pending` recipe costs its own thunk and recipe (the
+   capture that keeps the producer alive); and a `:failed` state costs its thunk
+   plus the RECORDED failure — class, unnormalized reason and the full frame
+   list, which is what makes a failure replay bit for bit. A publication
+   REPLACES the state the cell held, so what admission charges it is the
+   DIFFERENCE: replacing a large state with a smaller one grows nothing and is
+   therefore never refused, which is what lets a control transition commit at
+   any budget.
+
    `:erts_debug.flat_size/1` is exact, O(size) at the BIF, and safe on every
    term a cell here can hold: a lazy node's `resource` is a HANDLE into the
    native graph, so `flat_size` stops at it the way it stops at any resource and
@@ -409,31 +467,133 @@
     64
     :else (erlang/* (erts_debug/flat_size term) (erlang/system_info :wordsize))))
 
+(defn cache_budget
+  "The configured lazy-cache byte ceiling: `:lazy_cache_budget_bytes` in the
+   `:beam_lisp` application environment (default 512 MiB), validated. Read on
+   EVERY admission, so a budget changed while a producer is being forced takes
+   effect at the next publication."
+  []
+  (let [budget (Application/get_env :beam_lisp :lazy_cache_budget_bytes 536870912)]
+    (when-not (and (erlang/is_integer budget) (erlang/>= budget 0))
+      (erlang/error (Elixir.ArgumentError/exception
+        "lazy_cache_budget_bytes must be a non-negative integer")))
+    budget))
+
+(defn retained_bytes
+  "The bytes currently retained off-heap. ONE atomic native load — the
+   admission gate's cheap instrument, in place of the whole 23-field stats map."
+  []
+  (ensure_loaded!)
+  (nif_retained_bytes))
+
+(defn reserved_bytes
+  "The bytes an admitted publication has reserved but not committed yet: one
+   atomic native load. `retained_bytes + reserved_bytes` is the total admission
+   is tested against, which is what stops concurrent publishers that each start
+   below the ceiling from jointly exceeding it."
+  []
+  (ensure_loaded!)
+  (nif_reserved_bytes))
+
+(defn peek
+  "`{tag version}` for a cell's state, in CONSTANT size: the tag is read where
+   the state lives and is never exported, so a cell holding an n-element
+   published value costs one atom and one integer to interrogate. Answers
+   `:pending`, `:completed`, `:failed`, `:running`, `:terminal`, a bare atom
+   state's own atom, or `:other`.
+
+   NOT A SNAPSHOT: the cell can publish between this peek and any later read. A
+   caller that ACTS on the tag must read the versioned state and check the
+   version, or hand the version to `exchange_version*` (whose compare-exchange
+   rejects a moved cell). The full-state API — `read/1`, `read_versioned/1`,
+   `LazySeq/memo_state/1` — is unchanged and still promises the whole state."
+  [resource]
+  (ensure_loaded!)
+  (nif_peek resource))
+
 (defn- await-budget [budget deadline]
   (cond
-    (erlang/< (maps/get :retained_bytes (stats)) budget) :ok
+    (erlang/< (retained_bytes) budget) :ok
     (erlang/>= (System/monotonic_time :millisecond) deadline)
       (erlang/error (BeamLisp.LazySeq.ForceError/exception
         (erlang/list_to_tuple (list :lazy_cache_budget_exceeded budget))))
     :else (do (Process/sleep 1) (await-budget budget deadline))))
 
 (defn admit!
-  "The cache budget gate. `:lazy_cache_budget_bytes` (default 512 MiB) bounds the
-   bytes retained off-heap; a budget of 0 refuses every new attempt. At or over
-   budget, collect and give the deferred off-heap reclaim a bounded grace period
-   before refusing — live answers are untouched."
+  "The cache budget gate, run BEFORE a new attempt claims a cell. The ceiling
+   `:lazy_cache_budget_bytes` (default 512 MiB) bounds the bytes retained
+   off-heap; a budget of 0 refuses every new attempt. At or over budget, collect
+   and give the deferred off-heap reclaim a bounded grace period before
+   refusing — live answers are untouched.
+
+   This is the OCCUPANCY check: it reads the retained counter, not the whole
+   stats map. The SOUND enforcement is at the publication itself
+   (`exchange_version_admitted`), which reserves the growth it is about to
+   retain atomically; this gate exists so a refusal happens before the producer
+   runs at all."
   []
-  (let [budget (Application/get_env :beam_lisp :lazy_cache_budget_bytes 536870912)]
-    (when-not (and (erlang/is_integer budget) (erlang/>= budget 0))
-      (erlang/error (Elixir.ArgumentError/exception
-        "lazy_cache_budget_bytes must be a non-negative integer")))
+  (let [budget (cache_budget)]
     (when (erlang/== budget 0)
       (erlang/error (BeamLisp.LazySeq.ForceError/exception
         (erlang/list_to_tuple (list :lazy_cache_budget_exceeded budget)))))
-    (when (erlang/>= (maps/get :retained_bytes (stats)) budget)
+    (when (erlang/>= (retained_bytes) budget)
       (erlang/garbage_collect)
       (await-budget budget (erlang/+ (System/monotonic_time :millisecond) 25)))
     :ok))
+
+(defn- admitted_call
+  "INTERNAL: one admitted publication attempt, on the right lane. A KNOWN
+   non-empty dependency list may add an edge, and a new edge is not fast-lane
+   work (the cycle walk is unbounded), so it routes straight to the dirty lane
+   instead of paying a crossing that can only answer `:reroute`. `:keep` and
+   `()` may still be a SUBSET of the cell's existing edges — the fast case the
+   lane split exists for — so they keep the fast attempt."
+  [resource expected_version replacement deps_mode notifications bytes budget]
+  (cond
+    (and (erlang/is_list deps_mode) (not (erlang/== deps_mode ())))
+      (nif_exchange_version_admitted
+        resource expected_version replacement deps_mode bytes notifications budget)
+
+    (erlang/=< bytes (nif_fast_lane_bytes))
+      (let [answer (nif_exchange_version_admitted_fast
+                     resource expected_version replacement deps_mode bytes notifications budget)]
+        (if (erlang/== :reroute answer)
+          (nif_exchange_version_admitted
+            resource expected_version replacement deps_mode bytes notifications budget)
+          answer))
+
+    :else
+      (nif_exchange_version_admitted
+        resource expected_version replacement deps_mode bytes notifications budget)))
+
+(defn exchange_version_admitted
+  "`exchange_version/4,5` WITH the byte-budget admission (PLAN-154 B). The
+   native side reserves the bytes this publication GROWS (the replacement minus
+   the state it replaces) atomically against `retained + reserved`, commits them
+   with the state, and releases the reservation on every path that does not
+   commit (a cycle, a fast reroute). Two publishers that each start below the
+   ceiling therefore cannot jointly exceed it.
+
+   Answers `:ok`, `:retry`, `:cycle` or `:over_budget`. A REFUSAL changes
+   nothing: the cell keeps the state it had. At `:over_budget` this collects and
+   gives the deferred off-heap reclaim the same bounded grace period `admit!`
+   does before answering `:over_budget` to the caller."
+  ([resource expected_version replacement deps_mode budget]
+    (exchange_version_admitted resource expected_version replacement deps_mode (list) budget))
+  ([resource expected_version replacement deps_mode notifications budget]
+    (ensure_loaded!)
+    (let [bytes (estimate_bytes replacement)
+          deadline (erlang/+ (System/monotonic_time :millisecond) 25)]
+      (loop []
+        (let [answer (admitted_call resource expected_version replacement deps_mode
+                                    notifications bytes budget)]
+          (if (erlang/== :over_budget answer)
+            (if (erlang/>= (System/monotonic_time :millisecond) deadline)
+              :over_budget
+              (do (erlang/garbage_collect)
+                  (Process/sleep 1)
+                  (recur)))
+            answer))))))
 
 ; ── the plain doors ──────────────────────────────────────────────────────────
 
@@ -488,6 +648,9 @@
 (defn nif_id [resource] (erlang/nif_error :nif_not_loaded))
 (defn nif_resource_id [term] (erlang/nif_error :nif_not_loaded))
 (defn nif_stats [] (erlang/nif_error :nif_not_loaded))
+(defn nif_peek [resource] (erlang/nif_error :nif_not_loaded))
+(defn nif_retained_bytes [] (erlang/nif_error :nif_not_loaded))
+(defn nif_reserved_bytes [] (erlang/nif_error :nif_not_loaded))
 (defn nif_new_fast [state deps bytes] (erlang/nif_error :nif_not_loaded))
 (defn nif_cursor [items deps bytes] (erlang/nif_error :nif_not_loaded))
 (defn nif_cursor_chunk [cursor] (erlang/nif_error :nif_not_loaded))
@@ -501,6 +664,12 @@
   (erlang/nif_error :nif_not_loaded))
 (defn nif_exchange_version
   [resource expected_version replacement deps_mode bytes notifications]
+  (erlang/nif_error :nif_not_loaded))
+(defn nif_exchange_version_admitted_fast
+  [resource expected_version replacement deps_mode bytes notifications budget]
+  (erlang/nif_error :nif_not_loaded))
+(defn nif_exchange_version_admitted
+  [resource expected_version replacement deps_mode bytes notifications budget]
   (erlang/nif_error :nif_not_loaded))
 (defn nif_put_fast [resource value bytes] (erlang/nif_error :nif_not_loaded))
 (defn nif_put [resource value bytes] (erlang/nif_error :nif_not_loaded))

@@ -246,7 +246,8 @@
                     0
                     (map (fn [x] (swap! calls inc) x) c))]
       (is (= (nth refs 1) r) "the halted accumulator is returned unwrapped")
-      (is (= (nth refs 0) @calls) "the counting fn ran once per element actually visited")))
+      (is (= 32 @calls)
+          "the chunked producer publishes one chunk; the reducer still halts at its boundary")))
   (testing "take-while over an INFINITE source terminates on a bounded read"
     (let [calls (atom 0)
           out (into [] (take-while (fn [x] (swap! calls inc) (< x 5)) (range)))]
@@ -268,15 +269,16 @@
         b (news)]
     [(- b a) r]))
 
-(deftest folds-allocate-no-memo-cells
+(deftest folds-allocate-no-per-element-memo-cells
   ; The 8000-element producers are the one place this file outgrows the default
   ; budget; raise it for this test only (see the valve note above).
   (with-cache-budget 2147483648
     (fn []
       (testing "a fold of a pending producer creates no per-element memo cell"
-        ; Memo-walk baseline for this shape: 501 cells — one per 32-element chunk
-        ; plus its tails (measured). The fold allocates nothing like it: the recipe
-        ; folds the SOURCE directly and never forms a cell.
+        ; Count/mapv have trusted non-halting kernels. Arbitrary reducers (also
+        ; used by into) keep realized chunks so Reduced cannot restart effects.
+        ; Their bound is two cells per 32-element chunk plus the root, not one
+        ; cell per element; producer replay correctness outranks a zero-cell path.
         (let [vv (v 8000)
               [d1 r1] (with-delta (fn [] (reduce + 0 (map inc vv))))
               [d2 r2] (with-delta (fn [] (count (map inc vv))))
@@ -286,9 +288,11 @@
           (is (= 8000 r2))
           (is (= (ref-map inc vv) r3))
           (is (= (ref-map inc vv) r4))
-          (is (<= d1 2) (str "reduce cell delta=" d1))
+          (is (<= d1 (inc (* 2 (erlang/div (+ 8000 31) 32))))
+              (str "reduce keeps bounded chunks; cell delta=" d1))
           (is (<= d2 2) (str "count cell delta=" d2))
-          (is (<= d3 2) (str "into cell delta=" d3))
+          (is (<= d3 (inc (* 2 (erlang/div (+ 8000 31) 32))))
+              (str "into keeps bounded chunks; cell delta=" d3))
           (is (<= d4 2) (str "mapv cell delta=" d4)))))))
 
 ; ── 4. A REALISED PREFIX IS NOT RE-COMPUTED ──────────────────────────────────
@@ -341,12 +345,166 @@
       (is (= 300 (count (into [] s))))
       (is (= 300 @calls)))))
 
-(deftest a-halted-fold-publishes-nothing
-  (testing "a Reduced stops the source and leaves the node pending"
+(deftest a-halted-fold-preserves-its-realized-prefix
+  (testing "Reduced leaves an immutable prefix, not a pending producer to restart"
     (let [calls (atom 0)
           s (map (fn [x] (swap! calls inc) x) (v 1000))
           r (reduce (fn [a x] (if (>= x 5) (reduced a) (+ a x))) 0 s)]
       (is (= 10 r))
-      (is (BeamLisp.LazySeq/pending? s) "a halted fold did not produce the whole seq")
-      (is (< @calls 1000) "the halt stopped the source")
-      (is (= (ref-sum (v 1000)) (reduce + 0 s)) "a later full fold is still correct"))))
+      (is (not (BeamLisp.LazySeq/pending? s))
+          "the memo walk published its prefix, without mistaking it for the whole seq")
+      (is (= 32 @calls) "only the first producer chunk was realized")
+      (is (= (ref-sum (v 1000)) (reduce + 0 s)) "a later full fold is still correct")
+      (is (= 1000 @calls) "the producer's prefix was not run a second time")
+      (is (= 1000 (count s)))
+      (is (= 1000 @calls) "a third consumer still reuses every realized value"))))
+
+; ── 6. ONE PRODUCER, HOWEVER MANY CONCURRENT CONSUMERS ───────────────────────
+;
+; Deciding "may I use the recipe?" used to be a READ of the pending cell: two
+; folds could both read it and both run the recipe, and a fold could run the
+; recipe while a force ran the thunk. The claim (`BeamLisp.LazySeq/claim_recipe`)
+; is now taken BEFORE the recipe runs, on the SAME `:running` attempt a force
+; takes, so whichever consumer wins the cell the other one waits on (or reads)
+; its answer instead of producing a second one.
+
+(defn- producer-over
+  "A lazy producer over `n` elements that bumps `c` once per element as it is
+   produced — the effect counter every concurrency assertion reads."
+  [c n]
+  (map (fn [x] (swap! c inc) x) (v n)))
+
+(defn- raised-class
+  "The exception class `f` raised; `:no-raise` when it did not, and `:raw-term`
+   when the raise normalized to something that is not an exception struct."
+  [f]
+  (try
+    (do (f) :no-raise)
+    (catch e (cond (erlang/is_map e) (maps/get :__struct__ e nil) :else :raw-term))))
+
+(defn- race
+  "Start a `count` and `op` concurrently over ONE producer, then consume it a
+   third time with `again`. Answers `[count op again producer-runs]`."
+  [op again n]
+  (let [calls (atom 0)
+        s (producer-over calls n)
+        a (Task/async (fn [] (count s)))
+        b (Task/async (fn [] (op s)))]
+    [(Task/await a 10000) (Task/await b 10000) (again s) @calls]))
+
+(deftest concurrent-consumers-run-the-producer-once
+  (testing "count+count, count+first and count+reduce over one node"
+    (is (= [400 400 400 400]
+           (race (fn [s] (count s)) (fn [s] (count s)) 400))
+        "two folds and a later fold: one producer run")
+    (is (= [400 0 400 400]
+           (race (fn [s] (first s)) (fn [s] (count s)) 400))
+        "a fold and a force: one producer run")
+    (is (= [400 79800 400 400]
+           (race (fn [s] (reduce + 0 s)) (fn [s] (count s)) 400))
+        "a fold and a reduce-fold: one producer run")))
+
+(deftest a-realised-answer-is-identical-for-every-later-consumer
+  (let [calls (atom 0)
+        s (map (fn [x] (swap! calls inc) (* 2 x)) (v 300))
+        expected (vec (map (fn [x] (* 2 x)) (v 300)))]
+    (is (= 300 (count s)))
+    (is (= expected (vec s)))
+    (is (= 300 (count (into [] s))))
+    (is (= (ref-sum expected) (reduce + 0 s)))
+    (is (= expected (to-list s)))
+    (is (= 300 @calls) "one producer run, five consumers")))
+
+; ── 7. A FOLD'S FAILURE IS RECORDED AND REPLAYED UNCHANGED ─────────────────
+;
+; A fold runs its recipe under the cell's attempt, so a producer that throws
+; fails the ATTEMPT: the class, the UNNORMALIZED reason and the raw frames are
+; recorded against the node's own thunk, and the fold itself raises the ORIGINAL
+; failure. `memo_state` is the record read directly, so this file needs no
+; `catch-raw` of its own — and the differential against the ordinary force path
+; is what proves the fold reports what a force reports.
+
+(deftest a-fold-failure-is-recorded-and-replayed
+  (testing "a throw records what the equivalent force records"
+    (let [s (map (fn [x] (if (>= x 3) (throw "boom") x)) (v 10))
+          direct (BeamLisp.LazySeq/new (fn [] (throw "boom")))]
+      (is (= (raised-class (fn [] (BeamLisp.LazySeq/force direct)))
+             (raised-class (fn [] (count s))))
+          "the fold reports what the equivalent force reports")
+      ; `(throw x)` lowers to `BeamLisp.ExInfo/raise_payload`, so the record is
+      ; `{:failed thunk :error <ExInfo> frames}` — the SAME record the ordinary
+      ; force path keeps. Assert the differential, not a hand-written `:throw`
+      ; class the lowering never produces.
+      (let [state (BeamLisp.LazySeq/memo_state s)
+            direct-state (BeamLisp.LazySeq/memo_state direct)]
+        (is (erlang/== :failed (erlang/element 1 state)))
+        (is (erlang/== (erlang/element 3 direct-state) (erlang/element 3 state))
+            "the class is preserved")
+        (is (erlang/== (erlang/element 4 direct-state) (erlang/element 4 state))
+            "the reason is UNNORMALIZED")
+        (is (erlang/== (ex-message (erlang/element 4 state))
+                       (ex-message (erlang/element 4 direct-state))))
+        (is (erlang/is_list (erlang/element 5 state)) "the raw frames are stable data")
+        (is (erlang/is_function (erlang/element 2 state))
+            "the recorded thunk is what a retry re-runs"))))
+  (testing "an :error term and an exit keep their kind"
+    (let [s (map (fn [x] (if (>= x 3) (erlang/error :raw_term) x)) (v 10))]
+      (is (= (raised-class (fn [] (BeamLisp.LazySeq/force
+                                    (BeamLisp.LazySeq/new (fn [] (erlang/error :raw_term))))))
+             (raised-class (fn [] (count s)))))
+      (is (erlang/== [:error :raw_term]
+                     (let [st (BeamLisp.LazySeq/memo_state s)]
+                       [(erlang/element 3 st) (erlang/element 4 st)]))))
+    (let [s (map (fn [x] (if (>= x 3) (erlang/exit "bye") x)) (v 10))]
+      (is (= (raised-class (fn [] (BeamLisp.LazySeq/force
+                                    (BeamLisp.LazySeq/new (fn [] (erlang/exit "bye"))))))
+             (raised-class (fn [] (count s))))
+          "the fold reports the exit the equivalent force reports")
+      (is (erlang/== [:exit "bye"]
+                     (let [st (BeamLisp.LazySeq/memo_state s)]
+                       [(erlang/element 3 st) (erlang/element 4 st)])))))
+  (testing "a later consumer replays the recorded failure"
+    (let [s (map (fn [x] (if (>= x 3) (throw "boom") x)) (v 10))
+          first-class (raised-class (fn [] (count s)))]
+      (is (erlang/== :failed (erlang/element 1 (BeamLisp.LazySeq/memo_state s))))
+      (is (= first-class (raised-class (fn [] (count s))))
+          "the retry re-runs the producer and reports the same class")
+      (is (= first-class (raised-class (fn [] (first s))))))))
+
+; ── 8. A CONCURRENT CONSUMER IS RELEASED WITH THE OWNER'S FAILURE ──────────
+
+(defn- await-waiter
+  "Poll until the running cell has a registered waiter; bounded by wall clock."
+  [s]
+  (let [deadline (erlang/+ (System/monotonic_time :millisecond) 5000)]
+    (loop []
+      (let [state (BeamLisp.LazySeq/memo_state s)]
+        (cond
+          (and (erlang/is_tuple state)
+               (erlang/== 5 (erlang/tuple_size state))
+               (erlang/== :running (erlang/element 1 state))
+               (erlang/is_list (erlang/element 5 state))
+               (not (erlang/== () (erlang/element 5 state))))
+          true
+          (erlang/>= (System/monotonic_time :millisecond) deadline) false
+          :else (do (Process/sleep 1) (recur)))))))
+
+(deftest a-fold-failure-releases-its-waiters-with-the-same-failure
+  (let [parent (erlang/self)
+        s (map (fn [x]
+                 (erlang/send parent [:holding x (erlang/self)])
+                 (receive :boom (throw "boom")))
+               [0 1 2 3])
+        folder (Task/async (fn [] (raised-class (fn [] (count s)))))
+        folder-pid (receive [:holding _x p] p (after 5000 :timeout))]
+    (is (erlang/is_pid folder-pid) "the folding consumer holds the claim")
+    (let [waiter (Task/async (fn [] (raised-class (fn [] (first s)))))]
+      (is (await-waiter s) "the second consumer registered on the running attempt")
+      (erlang/send folder-pid :boom)
+      (let [owner-class (Task/await folder 10000)
+            waiter-class (Task/await waiter 10000)]
+        (is (= owner-class waiter-class)
+            "the waiter replays the owner's own failure")
+        (is (not (erlang/== :Elixir.BeamLisp.LazySeq.ForceError owner-class))
+            "released with the producer's failure, not a terminal verdict")
+        (is (erlang/== :failed (erlang/element 1 (BeamLisp.LazySeq/memo_state s))))))))

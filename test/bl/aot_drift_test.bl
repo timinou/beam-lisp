@@ -13,8 +13,13 @@
 ; beam predates it. The drift gate in `AOT.ensure_loaded/1` reads the beam's
 ; `__bl_provenance__/0` stamp, compares it to the live source hash, and:
 ;
-;   * dev (default)           → returns `:no_module`, so the loader falls to the
-;                               SOURCE path and the new def is present (auto-heal)
+;   * dev (default)           → repairs the stale artifact once — compiles the live
+;                               source, publishes it under the live closure key, and
+;                               loads it — and answers `:loaded`. When no repair is
+;                               possible (cache off, or no source to compile) the
+;                               older contract holds: `:no_module`, and the loader
+;                               falls to the SOURCE path, so the new def is
+;                               present (auto-heal)
 ;   * BEAM_LISP_AOT_STRICT=1  → raises a loud, actionable error (refuse)
 ;
 ; Without the gate, `ensure_loaded` would run the stale beam's `__bl_init__/0`,
@@ -26,6 +31,14 @@
 ; reproduced explicitly: `fresh!` cleans the tree before each test (so a crashed
 ; prior run or a sibling cannot leave fixture state behind), and each test
 ; removes it again in a `finally`.
+;
+; The same rule governs the SEARCH ROOTS. A test pins `src-dir` for the gate's
+; duration through `Loader/with_search_dir` — never a bare `Process/put` — so
+; the pin is released on the error path too. `bl test --shared` runs every file
+; in ONE image, where a pinned root left behind shadows the NEXT file's own
+; fixture: its `with_search_dir`/`with_ambient_dirs` work happens under a
+; `:bl_search_dirs` the loader prefers, and every namespace it writes is
+; reported absent with `searched: [<this file's tmp dir> …]`.
 ;
 ; Run: bin/bl test test/bl/aot_drift_test.bl
 
@@ -48,6 +61,12 @@
 (def fixture-mod
   (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Drift.Fixture" :utf8))
 
+; The shared AOT cache is OFF for this file, as in the gate-cost suite: `compile!`
+; below must be a real cold compile, and a cache hit would make `:built` zero.
+; The one test that exercises the REPAIR turns it back on for that assertion and
+; off again afterwards.
+(System/put_env "BEAM_LISP_AOT_CACHE" "off")
+
 ; v1: only `base`. v2: adds `added`, which a stale v1 beam cannot provide.
 (def v1 "(ns drift.fixture)\n(defn base [] :v1)\n")
 (def v2 "(ns drift.fixture)\n(defn base [] :v2)\n(defn added [] :new)\n")
@@ -68,12 +87,14 @@
   []
   (File/rm_rf! tmp-dir)
   (File/mkdir_p! (Path/dirname fixture-src))
+  (System/put_env "BEAM_LISP_AOT_CACHE_DIR" (Path/join tmp-dir "cache"))
   (Code/append_path out-dir))
 
 (defn- cleanup!
   "Remove the fixture tree — the ExUnit `on_exit`. Called from a `finally` so a
    failing assertion never leaves the tree behind."
   []
+  (System/delete_env "BEAM_LISP_AOT_CACHE_DIR")
   (File/rm_rf! tmp-dir))
 
 (defn- compile!
@@ -140,9 +161,33 @@
       (is (= (elem prov 1) (BeamLisp.AOTCache/compiler_key))))
     (finally (cleanup!))))
 
-; ── dev: a stale beam is routed to the source path ───────────────────────
+; ── strict: a stale beam refuses loud instead of healing ─────────────────
+;
+; FIRST, before any other test has loaded `drift.fixture` into this VM: the
+; strict gate raises only when the gate is actually consulted, and an already
+; loaded namespace answers `:loaded` before it is reached.
 
-(deftest dev-the-drift-gate-routes-a-stale-beam-to-the-source-path
+(deftest strict-a-stale-beam-refuses-loud-instead-of-healing
+  (fresh!)
+  (try
+    (forge-stale!)
+    (System/put_env "BEAM_LISP_AOT_STRICT" "1")
+    (is (thrown-with-msg? "stale AOT beam for drift.fixture"
+          (BeamLisp.Loader/with_search_dir src-dir
+            (fn [] (BeamLisp.AOT/ensure_loaded ns-name)))))
+    (finally
+      (System/delete_env "BEAM_LISP_AOT_STRICT")
+      (cleanup!))))
+
+; ── dev: a stale library beam is REPAIRED, not re-interpreted every boot ──
+;
+; The gate compiles the live source ONCE, publishes the beams to the AOT cache
+; under the live closure key, and loads them — so this VM ends up loaded, and the
+; next VM LINKS the published entry instead of reading source. With the cache off
+; there is nothing to publish to, and the old contract holds exactly:
+; `:no_module`, and the loader interprets the source.
+
+(deftest dev-a-stale-library-beam-is-repaired-instead-of-re-interpreted
   (fresh!)
   (try
     (forge-stale!)
@@ -152,12 +197,20 @@
     (is (not= (elem (beam-provenance) 0) (live-hash))
         "precondition: beam must be stale vs source")
 
-    ; Drift detected → :no_module, so `Loader` falls to the SOURCE path. The
-    ; gate resolves the live source hash via find_file, which needs the pinned
-    ; search dir.
-    (Process/put :bl_search_dirs (list src-dir))
-    (is (= :no_module (BeamLisp.AOT/ensure_loaded ns-name)))
-    (finally (cleanup!))))
+    ; The gate resolves the live source hash via find_file, which needs the
+    ; pinned search dir.
+    (BeamLisp.Loader/with_search_dir src-dir
+      (fn []
+        (System/put_env "BEAM_LISP_AOT_CACHE" "off")
+        (is (= :no_module (BeamLisp.AOT/ensure_loaded ns-name))
+            "cache off: no repair is possible, so the gate defers to the source path")
+
+        (System/delete_env "BEAM_LISP_AOT_CACHE")
+        (is (= :loaded (BeamLisp.AOT/ensure_loaded ns-name))
+            "cache on: the stale artifact is repaired in place")))
+    (finally
+      (System/put_env "BEAM_LISP_AOT_CACHE" "off")
+      (cleanup!))))
 
 ; ── dev: a fresh VM auto-heals through the loader ────────────────────────
 
@@ -195,17 +248,3 @@
       (is (includes? text "base=:v2") text)
       (is (includes? text "added=:new") text))
     (finally (cleanup!))))
-
-; ── strict: a stale beam refuses loud instead of healing ─────────────────
-
-(deftest strict-a-stale-beam-refuses-loud-instead-of-healing
-  (fresh!)
-  (try
-    (forge-stale!)
-    (System/put_env "BEAM_LISP_AOT_STRICT" "1")
-    (is (thrown-with-msg? "stale AOT beam for drift.fixture"
-          (do (Process/put :bl_search_dirs (list src-dir))
-              (BeamLisp.AOT/ensure_loaded ns-name))))
-    (finally
-      (System/delete_env "BEAM_LISP_AOT_STRICT")
-      (cleanup!))))

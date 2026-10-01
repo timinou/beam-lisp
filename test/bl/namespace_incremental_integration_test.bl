@@ -1,0 +1,122 @@
+; Integration contracts shared by source evaluation, AOT replay and freshness.
+(ns namespace-incremental-integration-test (:require [build-plan :as bp]))
+
+(defn- fixture [f]
+  (let [dir (str (System/tmp_dir!) "/bl-demand-integration-" (erlang/unique_integer (list :positive)))
+        prefix (str "demandintegration" (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p! dir)
+    (try (BeamLisp.Loader/with_ambient_dirs (list dir) (fn [] (f dir prefix)))
+      (finally (File/rm_rf! dir)))))
+(defn- source! [dir ns body]
+  (let [path (Path/join dir (str ns ".bl"))]
+    (File/write! path (str "(ns " ns ")\n" body)) path))
+(defn- invoke [ns name args]
+  (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! ns name) (to-list args)))
+
+(deftest deferred-refers-shadow-core-functions-and-macros
+  (fixture
+    (fn [dir p]
+      (let [provider (str p "provider") consumer (str p "consumer")]
+        (source! dir provider "(defn map [x] :provider)\n(defn when [x] :provider)\n")
+        (File/write! (Path/join dir (str consumer ".bl"))
+          (str "(ns " consumer " (:require [" provider " :refer [map when]]))\n"
+               "(defn result [] [(map 1) (when 2)])\n"))
+        (BeamLisp.Loader/ensure_loaded consumer)
+        (is (not (BeamLisp.Env/loaded_ns? provider)))
+        (is (= [:provider :provider] (invoke consumer "result" [])))
+        (is (BeamLisp.Env/loaded_ns? provider))))))
+
+(deftest aliased-private-call-is-refused-without-provider-initialization
+  (fixture
+    (fn [dir p]
+      (let [provider (str p "provider") consumer (str p "consumer")
+            flag (Path/join dir "effect")]
+        (source! dir provider
+          (str "(def initialized (File/write! \"" flag "\" \"ran\"))\n(defn- secret [] 7)\n"))
+        (let [err (try
+                    (BeamLisp/eval
+                      (str "(ns " consumer " (:require [" provider " :as p]))\n(defn bad [] (p/secret))"))
+                    nil
+                    (catch e (str e)))]
+          (is (some? err))
+          (is (String/contains? err "is not public"))
+          (is (not (File/exists? flag))))))))
+
+(deftest declaration-cache-sees-edits-and-separates-namespace-sections
+  (fixture
+    (fn [dir p]
+      (let [path (source! dir p "(defn  x [] 1)\n")]
+        (is (= :public (BeamLisp.Loader/source_decl p "x")))
+        ; Equal-length bytes: no timestamp/size-only cache may answer this.
+        (File/write! path (str "(ns " p ")\n(defn- x [] 1)\n"))
+        (is (= :private (BeamLisp.Loader/source_decl p "x")))
+        (File/write! path
+          (str "(ns " p ")\n(defn- x [] 1)\n(ns " p "other)\n(defn x [] 2)\n"))
+        (is (= :private (BeamLisp.Loader/source_decl p "x")))))))
+
+(deftest repaired-failure-does-not-reexecute-earlier-initializers
+  (fixture
+    (fn [dir p]
+      (let [flag (Path/join dir "effect")]
+        (File/write! flag "")
+        (source! dir p
+          (str "(def initialized (File/write! \"" flag "\" \"once\" (list :append)))\n"
+               "(erlang/error :deliberate-repair-failure)\n"))
+        ; Enable repair explicitly: other suite fixtures may disable caches.
+        ; The transparent loader must propagate a repair failure without replay.
+        (let [old-cache (System/get_env "BEAM_LISP_AOT_CACHE")
+              old-repair (System/get_env "BEAM_LISP_AOT_REPAIR")]
+          (try
+            (System/put_env "BEAM_LISP_AOT_CACHE" "1")
+            (System/put_env "BEAM_LISP_AOT_REPAIR" "1")
+            (is (some? (try (BeamLisp.Loader/ensure_loaded p) nil (catch e e))))
+            (finally
+              (if (nil? old-cache) (System/delete_env "BEAM_LISP_AOT_CACHE")
+                (System/put_env "BEAM_LISP_AOT_CACHE" old-cache))
+              (if (nil? old-repair) (System/delete_env "BEAM_LISP_AOT_REPAIR")
+                (System/put_env "BEAM_LISP_AOT_REPAIR" old-repair)))))
+        (is (= "once" (File/read! flag)))
+        (is (not (BeamLisp.Env/loaded_ns? p)))))))
+
+(deftest aot-replay-defers-unused-alias-and-preserves-bare-require
+  (fixture
+    (fn [dir p]
+      (let [provider (str p "provider") consumer (str p "consumer")
+            flag (Path/join dir "effect") out (Path/join dir "ebin")]
+        (source! dir provider
+          (str "(def initialized (File/write! \"" flag "\" \"ran\"))\n(defn value [] 9)\n"))
+        (let [src (str "(ns " consumer " (:require [" provider " :as p]))\n(defn result [] (p/value))")
+              beams (BeamLisp.AOT/compile_source src (list (tuple :output_dir out)))
+              mod (BeamLisp.Link/module_for consumer)]
+          (is (seq beams))
+          (erlang/apply mod :__bl_init__ (list))
+          (is (not (File/exists? flag)))
+          (is (= 9 (erlang/apply mod :result (list))))
+          (is (= "ran" (File/read! flag))))))))
+
+(deftest macro-helper-and-foreign-helper-edits-invalidate-expanded-consumers
+  (let [root "macroconsumer" provider "macroprovider" helper "macrohelper"
+        r "(ns macroconsumer (:require [macroprovider :as p])) (defn f [] (p/choose 1))"
+        p "(ns macroprovider (:require [macrohelper :as h])) (defn local [x] x) (defmacro choose [x] (h/convert (local x)))"
+        p2 "(ns macroprovider (:require [macrohelper :as h])) (defn local [x] (+ x 1)) (defmacro choose [x] (h/convert (local x)))"
+        h "(ns macrohelper) (defn convert [x] x)"
+        h2 "(ns macrohelper) (defn convert [x] (+ x 1))"
+        key (fn [sources] (bp/key-for root (fn [n] (get sources n)) nil bp/memo-node))
+        before {root r provider p helper h}]
+    (is (not= (key before) (key (assoc before provider p2))))
+    (is (not= (key before) (key (assoc before helper h2))))))
+
+(deftest qualified-value-callable-without-a-link-uses-invocation
+  (is (= true (BeamLisp/eval "(core/not false)")))
+  (is (= :yes (BeamLisp/eval "(if-not false :yes :no)"))))
+
+(deftest initialized-referred-value-still-shadows-core-direct-link
+  (fixture
+    (fn [dir p]
+      (let [provider (str p "provider") consumer (str p "consumer")]
+        (source! dir provider "(def inc (fn [x] :provider))\n")
+        (BeamLisp.Loader/ensure_loaded provider)
+        (BeamLisp/eval
+          (str "(ns " consumer " (:require [" provider " :refer [inc]]))\n"
+               "(defn result [] (inc 1))"))
+        (is (= :provider (invoke consumer "result" [])))))))

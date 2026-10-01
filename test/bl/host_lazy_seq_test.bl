@@ -35,9 +35,10 @@
 ;   * the native memo: a forced node answers its memoized value with the thunk
 ;     run ONCE, and two concurrent forcers share one attempt across processes;
 ;   * the versioned cell ABI: `pending_recipe`/`pending?` answer the fold recipe
-;     and the publication version it was read at, `publish_folded` CASes a
-;     realise-once publication, and `memo_state` reports a running cell in the
-;     recalled 5-tuple shape;
+;     and the publication version it was read at, `claim_recipe`/`release_recipe`
+;     take and hand back the SAME `:running` attempt a force takes,
+;     `publish_folded` CASes an unclaimed realise-once publication, and
+;     `memo_state` reports a running cell in the recalled 5-tuple shape;
 ;   * the error paths: a failed attempt reaches every waiter with the same
 ;     exception and a later explicit force retries; a recursive force and a
 ;     retained cycle become terminal `:cyclic_memo`;
@@ -167,7 +168,10 @@
       ; pinned functions-only module exports every top-level defn.
       (is (every? (fn [entry] (erlang/function_exported struct-mod (erlang/element 1 entry) (erlang/element 2 entry)))
                   (list (t2 :new 2) (t2 :pending_recipe 1) (t2 :pending? 1)
-                        (t2 :publish_folded 3) (t2 :force_state 2)
+                        (t2 :publish_folded 3) (t2 :claim_recipe 1)
+                        (t2 :release_recipe 3) (t2 :capture_attempt 1)
+                        (t2 :complete_attempt 3) (t2 :fail_attempt 6)
+                        (t2 :force_state 2)
                         (t2 :attempt_deps 1) (t2 :attempt_owner? 3)
                         (t2 :realize_step 2) (t2 :tagged? 2)
                         (t2 :normalize_cell 1))))
@@ -269,6 +273,46 @@
       (is (= :keep (erlang/apply struct-mod :attempt_deps (list (tuple :terminal :cyclic_memo)))))
       (File/rm_rf! dir))))
 
+
+; ── the fold CLAIM: the same `:running` attempt a force takes ────────────
+;
+; A fold used to decide "may I run the recipe?" by READING the pending cell,
+; so two folds could both read it and both run the producer. The claim is now a
+; versioned compare-exchange to the ORDINARY `{:running owner attempt waiters}`
+; state; the halt path hands the `{:pending thunk recipe}` it replaced back, and
+; a recipe-less pending cell is not claimable at all.
+
+(deftest pinned-fold-claim-and-release
+  (testing "a fold claim is the ordinary running attempt; a halt restores pending"
+    (let [dir (tmp-dir)]
+      (compile-err dir)
+      (compile-struct dir)
+      (let [r (fn [acc _x] (tuple :cont acc))
+            n (new-node-r struct-mod (fn [] (list 1 2 3)) r)
+            claim (erlang/apply struct-mod :claim_recipe (list n))]
+        (is (erlang/is_tuple claim) "the pending recipe is claimable")
+        (is (= :claimed (erlang/element 1 claim)))
+        (is (erlang/== 3 (erlang/tuple_size (erlang/element 3 claim)))
+            "the `{:pending thunk recipe}` the claim replaced")
+        (let [st (erlang/apply struct-mod :memo_state (list n))]
+          (is (erlang/== :running (erlang/element 1 st))
+              "the claim publishes the ordinary running attempt, not a second registry")
+          (is (erlang/== (erlang/self) (erlang/element 3 st)))
+          (is (erlang/== () (erlang/element 5 st))))
+        (is (nil? (erlang/apply struct-mod :claim_recipe (list n)))
+            "a second claimant finds no recipe while the cell is claimed")
+        ; the halt path: the cell goes back to `:pending` and stays usable.
+        (erlang/apply struct-mod :release_recipe
+          (list n (erlang/element 2 claim) (erlang/element 3 claim)))
+        (is (= true (erlang/apply struct-mod :pending? (list n))))
+        (is (erlang/== 2 (erlang/tuple_size
+                           (erlang/apply struct-mod :pending_recipe (list n)))))
+        (is (= (list 1 2 3) (erlang/apply struct-mod :to_list (list n)))
+            "the released node still realises correctly"))
+      ; a pending cell with no recipe is not claimable
+      (is (nil? (erlang/apply struct-mod :claim_recipe
+                              (list (new-node struct-mod (fn [] :v))))))
+      (File/rm_rf! dir))))
 ; ── realization, memoization and the walks ───────────────────────────────
 
 (defn- obs-realize [mod]
@@ -512,33 +556,38 @@
                                     (list n :bogus (fn [x acc] (tuple :cont acc)))))))))
       (File/rm_rf! dir))))
 
-; ── the impl under its EXACT atom, then restored ─────────────────────────
+; ── the impl under its EXACT atom ─────────────────────────────────────────
 
 (deftest enum-pinned-live-dispatch-at-the-exact-atom
-  (testing "loads at Elixir.Enumerable.BeamLisp.LazySeq, streams, restores"
-    (let [dir (tmp-dir)
-          orig-path (erlang/apply :code :which (list live-enum))
-          orig-bin (File/read! (erlang/list_to_binary orig-path))
-          probe (Path/join dir "Elixir.Enumerable.BeamLisp.LazySeq.beam")]
-      (is (not= :non_existing orig-path) "precondition: the live impl beam is a readable file")
-      (try
-        (BeamLisp.AOT/compile_host_file (enum-source)
-          (list (t2 :module live-enum) (t2 :output_dir dir) (t2 :load? false)))
-        (drop! enum-shim)
-        (drop! live-enum)
-        (code/load_binary live-enum (erlang/binary_to_list probe) (File/read! probe))
-        (let [n (new-node struct-mod (fn [] (list 1 2 3 4)))]
-          (is (= live-enum (erlang/apply :Elixir.Enumerable :impl_for (list n))))
-          (is (= (list 1 2 3 4) (Enum/to_list n)))
-          (is (= 4 (Enum/count n)))
-          (is (= (list 1 2 3) (Enum/take n 3)))
-          (is (= (list 1 2 3 4) (Enum/to_list (Stream/take n 4)))))
-        ; an infinite chain: bounded take does not force the tail.
-        (let [n (inf struct-mod 1)]
-          (is (= (list 1 2 3) (Enum/to_list (Stream/take n 3)))))
-        (finally
-          (drop! live-enum)
-          (code/load_binary live-enum orig-path orig-bin)))
+  (testing "the live impl answers at Elixir.Enumerable.BeamLisp.LazySeq, streaming"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      ; The pinned SOURCE compiles to exactly the live impl's export surface —
+      ; the module `Enum`/`Stream` reach by the value's tag.
+      (compile-enum dir)
+      (is (= (Enum/sort (erlang/apply enum-mod :module_info (list :exports)))
+             (Enum/sort (erlang/apply live-enum :module_info (list :exports))))
+          "the pinned source exports the live impl's surface")
+      (drop! enum-mod)
+      ; NO MODULE SURGERY HERE. Replacing the beam at the LIVE atom —
+      ; `code:delete`/`code:purge`/`code:load_binary`, every one of which purges —
+      ; KILLS the test runner. The harness realises `run-tests` as a lazy `map`,
+      ; so the runner sits inside `Enumerable.BeamLisp.LazySeq`'s reduce for the
+      ; whole suite, and the purge kills the process lingering in the very module
+      ; it is replacing. Reproduced: `code:soft_purge/1` on that atom answers
+      ; false during a run, and `code:purge/1` exits the runner with `:killed`
+      ; before the totals. `erlang:load_module/2` installs without the purge but
+      ; refuses to restore (`:not_purged`), so the dispatch claims are pinned
+      ; against the module the runtime actually loads.
+      (let [n (new-node struct-mod (fn [] (list 1 2 3 4)))]
+        (is (= live-enum (erlang/apply :Elixir.Enumerable :impl_for (list n))))
+        (is (= (list 1 2 3 4) (Enum/to_list n)))
+        (is (= 4 (Enum/count n)))
+        (is (= (list 1 2 3) (Enum/take n 3)))
+        (is (= (list 1 2 3 4) (Enum/to_list (Stream/take n 4)))))
+      ; an infinite chain: bounded take does not force the tail.
+      (let [n (inf struct-mod 1)]
+        (is (= (list 1 2 3) (Enum/to_list (Stream/take n 3)))))
       (is (= live-enum
              (erlang/apply :Elixir.Enumerable :impl_for (list (new-node struct-mod (fn [] (list 1)))))))
       (File/rm_rf! dir))))

@@ -1,0 +1,250 @@
+; test/bl/aot_protocol_replay_test.bl — every TOP-LEVEL PROTOCOL EXTENSION in a
+; namespace must survive AOT, not just the last one per key.
+;
+; ── The defect this pins ────────────────────────────────────────────────────
+;
+; AOT captures each replayed top-level form under a key (`AOT.definition_name`)
+; and keeps the LAST form per key. `extend-type` used to key on the TYPE alone,
+; so two extensions of ONE type with TWO protocols collapsed to the last: the
+; earlier `Multi.extend_type` call was dropped from the emitted `__bl_init__/0`.
+; The first VM never noticed — it COMPILED and EVALUATED the source, so both
+; calls ran — but a cache-hit VM only replays the artifact, and dispatch on the
+; dropped protocol then failed with
+;
+;   No implementation of method <m> of protocol <ns>/<Proto> for type <T>
+;
+; This is the 2026-09-30 `veritas` failure: `Gen` rungs (int/one-of/tuple/coll)
+; were extended again by the new `GenShrink` rungs beside them, so a second VM
+; lost `gen-constrain` for exactly those types. The tree already carried a
+; workaround for the same collision — `priv/lib/datom/blob-fs.bl` and
+; `priv/lib/datom/store-fjall.bl` both say "two `extend-type <Type>` blocks
+; would collide under AOT" and extend from the protocol side instead.
+;
+; ── What is asserted, and why it needs a REAL second VM ────────────────────
+;
+;   SOURCE-FIRST  compiling the fixture EVALUATES it. All extensions are
+;                 installed and every protocol dispatches.
+;   CACHE-SECOND  a fresh `elixir` child loads ONLY the published beams and
+;                 runs `__bl_init__/0`. On the old key the earlier extension of
+;                 each colliding pair is simply absent from the artifact, so
+;                 the child raises where the parent answered.
+;
+; The fixture covers all three shapes that install an extension at top level,
+; and BOTH collision forms:
+;
+;   R   two `extend-type` blocks over one record — the reported failure.
+;   S   two `extend-protocol` blocks over ONE protocol with DIFFERENT records —
+;       the same collapse through the other form (its key is the protocol, so
+;       the second form used to displace the first).
+;   U   a `defrecord` whose trailing protocol blocks compile to `extend_type`
+;       calls — one form, no collision, but it must keep replaying too.
+;
+; EXACTLY-ONCE is the other half: the fixture's `marker` `def` appends to a
+; file, so the count is "how many times this namespace's initializers ran".
+; The source stage must leave 1; each fresh VM must add exactly 1 more.
+;
+; Run: bin/bl test test/bl/aot_protocol_replay_test.bl
+
+(ns aot.protocol-replay-test)
+
+(def dir (Path/join (System/tmp_dir!) "beam_lisp_aot_protocol_replay"))
+(def src-dir (Path/join dir "src"))
+(def out-dir (Path/join dir "out"))
+(def mark (Path/join dir "init.log"))
+
+; {record-ctor, protocol-method, expected keyword}. Each answer is the METHOD's
+; own keyword, so a dispatch landing on the wrong extension cannot pass by
+; coincidence.
+(def dispatches
+  (list (tuple "mk-r" "call-p" :rp)
+        (tuple "mk-r" "call-q" :rq)
+        (tuple "mk-s" "call-p" :sp)
+        (tuple "mk-s2" "call-p" :s2p)
+        (tuple "mk-u" "call-p" :up)
+        (tuple "mk-u" "call-q" :uq)))
+
+(defn- fresh!
+  "A clean fixture tree; `out/` is where the source stage publishes its beams."
+  []
+  (File/rm_rf! dir)
+  (File/mkdir_p! (Path/join src-dir "inc"))
+  (File/mkdir_p! out-dir)
+  :ok)
+
+(defn- cleanup! [] (File/rm_rf! dir))
+
+(defn- marks
+  "How many times the fixture's initializer has run in this tree."
+  []
+  (if (File/exists? mark)
+    (erlang/length (Enum/reject (String/split (File/read! mark) "\n")
+                                (fn [s] (erlang/== s ""))))
+    0))
+
+; `mk-*` build one record per extension shape; `call-p`/`call-q` dispatch P and
+; Q on whatever they are given. R is extended by two `extend-type` blocks, S and
+; S2 by two `extend-protocol` blocks of the SAME protocol, and U installs both
+; protocols inline in its `defrecord`.
+(def fixture
+  (str "(ns inc.proto)\n"
+       "(defprotocol P\n"
+       "  (p-c [g v]))\n"
+       "(defprotocol Q\n"
+       "  (q-c [g v]))\n"
+       "(defrecord R [a])\n"
+       "(extend-type R P\n"
+       "  (p-c [g v] :rp))\n"
+       "(extend-type R Q\n"
+       "  (q-c [g v] :rq))\n"
+       "(defrecord S [a])\n"
+       "(defrecord S2 [a])\n"
+       "(extend-protocol P\n"
+       "  S (p-c [g v] :sp))\n"
+       "(extend-protocol P\n"
+       "  S2 (p-c [g v] :s2p))\n"
+       "(defrecord U [a]\n"
+       "  P\n"
+       "  (p-c [g v] :up)\n"
+       "  Q\n"
+       "  (q-c [g v] :uq))\n"
+       "(def marker (erlang/apply :file :write_file\n"
+       "               (list (System/get_env \"PROTO_MARK\") \"x\\n\" (list :append))))\n"
+       "(defn mk-r [] (->R 1))\n"
+       "(defn mk-s [] (->S 2))\n"
+       "(defn mk-s2 [] (->S2 3))\n"
+       "(defn mk-u [] (->U 4))\n"
+       "(defn call-p [x] (p-c x 0))\n"
+       "(defn call-q [x] (q-c x 0))\n"))
+
+(def fixture-path (Path/join src-dir "inc/proto.bl"))
+
+(defn- compile-fixture!
+  "The SOURCE-FIRST stage: compile the fixture from live source, which EVALUATES
+   every top-level form, and publish the beams into `out/`."
+  []
+  (File/write! fixture-path fixture)
+  (System/put_env "PROTO_MARK" mark)
+  (try
+    (BeamLisp.Loader/with_load_path src-dir
+      (fn []
+        (BeamLisp.AOT/compile_file fixture-path (list (tuple :output_dir out-dir)
+                                                      (tuple :mark_loaded? true)))))
+    (finally (System/delete_env "PROTO_MARK"))))
+
+(defn- dispatch
+  "Call the fixture's `call-p`/`call-q` on a freshly built record; a raise is a
+   VALUE, so an absent implementation is visible as text instead of aborting
+   the suite."
+  [rec f]
+  (try
+    (let [x (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "inc.proto" rec) (list))]
+      (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "inc.proto" f) (list x)))
+    (catch e (str "RAISED " (Elixir.Exception/message e)))))
+
+(defn- dispatch_line
+  "One child-side `IO.puts` that reports a dispatch as `rec/method=<answer>`."
+  [d]
+  (let [rec (elem d 0) f (elem d 1)]
+    (str "IO.puts(" (pr-str (str rec "/" f "="))
+         " <> dispatch.(" (pr-str rec) ", " (pr-str f) "))\n")))
+
+(defn- child-script
+  "A fresh VM: no source, no parent state — load the published beams, run
+   `__bl_init__/0` (the only thing a cache hit does), and report every dispatch.
+
+   The boot is the application's own start, not a hand-rolled `init`: a checkout
+   whose committed floor is another generation only boots with the previous
+   floor's staging authority in the app env, and the parent already carries it
+   in `.bootstrap_staging.term` beside its beams. Reading it here keeps the
+   child faithful to how the parent booted instead of diverging on the tier
+   ordering."
+  []
+  (str "Code.prepend_path(" (pr-str out-dir) ")\n"
+       "ebin = System.get_env(\"BL_EBIN\")\n"
+       "if ebin do\n"
+       "  case :file.consult(String.to_charlist(Path.join(ebin, \".bootstrap_staging.term\"))) do\n"
+       "    {:ok, [nslist]} -> Application.put_env(:beam_lisp, :bootstrap_staging, nslist)\n"
+       "    _ -> :ok\n"
+       "  end\n"
+       "end\n"
+       "{:ok, _} = Application.ensure_all_started(:beam_lisp)\n"
+       "mod = BeamLisp.Emit.module_for(\"inc.proto\")\n"
+       "{:module, ^mod} = Code.ensure_loaded(mod)\n"
+       "IO.puts(\"init_exported=\" <> inspect(function_exported?(mod, :__bl_init__, 0)))\n"
+       "apply(mod, :__bl_init__, [])\n"
+       "dispatch = fn rec, f ->\n"
+       "  try do\n"
+       "    x = BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!(\"inc.proto\", rec), [])\n"
+       "    inspect(BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!(\"inc.proto\", f), [x]))\n"
+       "  rescue\n"
+       "    e -> \"RAISED \" <> Exception.message(e)\n"
+       "  end\n"
+       "end\n"
+       (Enum/join (Enum/map dispatches dispatch_line) "")
+       "m = case File.read(" (pr-str mark) ") do\n"
+       "      {:ok, s} -> length(String.split(s, \"\\n\", trim: true))\n"
+       "      _ -> 0\n"
+       "    end\n"
+       "IO.puts(\"marks=\" <> inspect(m))\n"))
+
+(defn- run-child!
+  "One child VM's merged output; a non-zero exit is a failure in itself.
+
+   The child is handed the PARENT's whole code path, so it can only fail on the
+   property under test and never on a dependency the parent had and it did
+   not."
+  []
+  (let [pa (Enum/flat_map (Enum/reverse (code/get_path))
+             (fn [d] (list "-pa" (erlang/list_to_binary d))))
+        r (System/cmd "elixir"
+              (to-list (erlang/++ pa (list "-e" (child-script))))
+              (to-list [(tuple :stderr_to_stdout true)
+                        (tuple :env (to-list [(tuple "PROTO_MARK" mark)]))]))]
+    (is (= 0 (elem r 1)) (str "child VM exited " (elem r 1) ":\n" (elem r 0)))
+    (elem r 0)))
+
+(defn- assert-all-dispatch!
+  "Every extension answers with its OWN method, on the record it was extended
+   for. A dropped extension is the missing-implementation RAISE, not a value."
+  [text]
+  (Enum/each dispatches
+    (fn [d]
+      (let [expect (str (elem d 0) "/" (elem d 1) "=" (pr-str (elem d 2)))]
+        (is (includes? text expect)
+            (str "expected " expect " in child output:\n" text))))))
+
+(deftest source-first-installs-every-extension
+  (fresh!)
+  (try
+    (let [beams (compile-fixture!)]
+      (is (includes? (pr-str (Enum/map beams (fn [b] (elem b 0))))
+            "BeamLisp.Ns.Init.Inc.Proto")
+          "the value-initializer companion was emitted"))
+    (Enum/each dispatches
+      (fn [d]
+        (let [label (str (elem d 0) "/" (elem d 1))]
+          (is (= (elem d 2) (dispatch (elem d 0) (elem d 1)))
+              (str label " after source evaluation")))))
+    (is (= 1 (marks)) "the source was evaluated exactly once here")
+    (finally (cleanup!))))
+
+(deftest a-cache-hit-replays-every-extension-exactly-once
+  (fresh!)
+  (try
+    (compile-fixture!)
+    (is (= 1 (marks)) "source stage ran the initializers once")
+    ; child 1: the artifact must carry BOTH extensions of R (and of S/S2, U)
+    (let [text (run-child!)]
+      (is (includes? text "init_exported=true") text)
+      (assert-all-dispatch! text)
+      (is (includes? text "marks=2")
+          (str "the replay ran the initializers exactly once:\n" text)))
+    ; child 2: and again, reproducibly, once per VM
+    (let [text (run-child!)]
+      (is (includes? text "init_exported=true") text)
+      (assert-all-dispatch! text)
+      (is (includes? text "marks=3")
+          (str "a second fresh VM replays once more, not twice:\n" text)))
+    (finally (cleanup!))))
+
+(run-tests)

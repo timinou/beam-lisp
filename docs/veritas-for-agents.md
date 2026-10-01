@@ -19,6 +19,22 @@ is written from the agent's side, from what this session actually lacked.
 
 ---
 
+## A counterexample must belong to its generator
+
+For `veritas` and `veritas.property`, shrinking keeps two facts true: the value
+is inside the generator's domain, and it still fails the property. For a
+finite generator that produces only `1`, shrinking to `0` is not a smaller
+counterexample—it is an invalid input.
+
+`GenShrink` supplies domain-aware candidates. Unsupported custom generators
+keep the original witness. Reports keep the original `:witness` alongside
+`:shrunk`. `shrink-in-domain(gen, fail?, witness)` is the shared bounded walk;
+`shrink-coords(fail?, witness)` is a generator-blind compatibility API, not a
+substitute when a generator is available. Unknown coverage is not proof.
+
+The sections below describe broader verification design directions; the core
+contract above applies to the runnable generator-aware paths.
+
 ## 0 · What I needed today, and did by hand
 
 | need (this session) | what I did | what veritas could not do |
@@ -419,7 +435,7 @@ every machine, and `replay` is exact.
 |---|---|---|---|
 | U1 | `:why` and `:seed` on every verdict; seeded sampling in `run-sample` | `veritas.bl` | small, and everything else reports through it |
 | U2 | `veritas.ledger`: verdict datoms, `record!`, `:fn/hash` in the codebase graph, `stale` over the call closure, `report`, `bl veritas` CLI | new `priv/lib/veritas/ledger.bl`, `priv/std/codebase.bl`, `priv/std/bl/cli.bl` | makes every later capability durable |
-| U3 | general shrinking: a `Shrink` protocol beside `Gen` (vectors, maps, strings, tuples, histories, databases) | `veritas.bl` | the model and datalog layers depend on it; today only ints shrink |
+| U3 | general shrinking: a `Shrink` protocol beside `Gen` (vectors, maps, strings, tuples, histories, databases) | `veritas.bl` | the model and datalog layers depend on it; model-specific domains need their own valid candidates |
 | U4 | `veritas.model`: `defmodel`, `check`, history shrinking, `kill!`/`drop-next!` hooks | new `priv/lib/veritas/model.bl` | the largest single gain |
 | U5 | `vm/serve` and `vm/conforms?`; `veritas.mock` becomes a stateless model | `veritas/model.bl`, `veritas/mock.bl` | the M365 fake becomes a model (knowledger doc 22) |
 | U6 | `veritas.datom`: `db-of`, `equivalent?`, `reads-sound?`, `tx-preserves?`, `monotone?` | new `priv/lib/veritas/datom.bl` | `reads-sound?` over every registered relation catches BUG-100's class |

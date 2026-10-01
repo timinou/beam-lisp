@@ -514,6 +514,29 @@
   (when (and (not= target-ns (:ns env))
            (private-var? target-ns var)) (compile-error env (str "var " target-ns "/" var " is not public"))))
 
+(defn- reject-private-static!
+  "Refuse an explicit `:refer [sym]` of a PRIVATE var, exactly as
+   `reject-private!` does, but WITHOUT initializing a provider that has not been
+   initialized yet: the provider's SOURCE metadata answers when it can.
+
+   A name the scan cannot account for is UNKNOWN — another macro may have
+   defined it — so the provider is loaded and the registry answers: the
+   conservative fallback that keeps privacy exact for generated exports and for
+   sourceless (AOT-only) providers."
+  [env target sym]
+  (cond
+    (= target (:ns env)) :ok
+    (or (BeamLisp.Env/loaded_ns? target)
+        (not= :error (BeamLisp.Env/lookup (tuple target sym))))
+      (reject-private! env target sym)
+    :else
+    (let [kind (BeamLisp.Loader/source_decl target sym)]
+      (cond
+        (= :private kind) (compile-error env (str "var " target "/" sym " is not public"))
+        (contains? #{:public :value :macro} kind) :ok
+        :else (do (BeamLisp.Loader/load_provider target)
+                  (reject-private! env target sym))))))
+
 (defn- compile-symbol
   "Turn a symbol into the tree that produces its VALUE.
 
@@ -552,13 +575,13 @@
           (a/remote mod-rt :remote_fun (list (a/lit (second tgt)) (a/lit (nth tgt 2))))
           :else
           ; a var in another namespace: refuse a private one, else a reference
-          (do (reject-private! env (second tgt) (nth tgt 2))
+          (do (reject-private-static! env (second tgt) (nth tgt 2))
               (a/global (second tgt) (nth tgt 2)))))
     ; a dotted class-name reference to a record/type in another ns
     ; (`datalog.parser.type.Function`): the same var as `…/Function`
     (some? (dotted-var-ref env name))
       (let [ref (dotted-var-ref env name)]
-        (reject-private! env (first ref) (second ref))
+        (reject-private-static! env (first ref) (second ref))
         (a/global (first ref) (second ref)))
     :else
       (a/global (:ns env) name)))
@@ -676,6 +699,39 @@
     (str "core/" (subs name (count "clojure.core/")))
     name))
 
+(defn- macro-value
+  "The expanding fn of a tagged macro value `v` — `{:\"$macro\", fn}` — or nil
+   when `v` is anything else."
+  [v]
+  (when (and (erlang/is_tuple v) (>= (erlang/tuple_size v) 2)
+             (= (erlang/binary_to_atom "$macro") (erlang/element 1 v)))
+    (erlang/element 2 v)))
+
+(defn- name-provider
+  "The `[provider-ns member]` a name would be resolved from when that provider
+   is ANOTHER namespace, or nil.
+
+   A qualified name resolves through the declaring namespace's alias table — an
+   alias is registered when the `(ns …)` form runs, BEFORE its provider is
+   initialized — else by its own prefix; a bare name through its `:refer`
+   source. `core`/`sugar` and the namespace being compiled are never providers
+   here: the first two are always initialized, and loading the third would be
+   re-entrant."
+  [ns name]
+  (if (has-slash? name)
+    (let [sv (split-slash name)
+          prefix (first sv)]
+      (if (lists/member prefix (list "core" "sugar" "clojure.core"))
+        nil
+        (let [at (BeamLisp.Env/alias_target ns prefix)]
+          (if (and (nil? at) (uppercase-first? prefix))
+            nil ; An unaliased host module is not a BL macro provider.
+            (list (if (some? at) at prefix) (second sv))))))
+    (let [src (BeamLisp.Env/refer_source ns name)]
+      (if (or (nil? src) (= src "core") (= src "sugar"))
+        nil
+        (list src name)))))
+
 (defn- macro-lookup
   "The macro FUNCTION bound to `name` in namespace `ns`, or nil when `name` is
    not a macro.
@@ -685,16 +741,34 @@
    is the function that does the expanding. This looks the name up (normalized
    the same way calls are, so `clojure.core/x` finds `core/x`) and, when the
    value is that tagged pair, hands back just the function. Anything else —
-   an ordinary value, an unbound name — yields nil."
+   an ordinary value, an unbound name — yields nil.
+
+   A miss in the registry may still name a macro of a DECLARED deferred
+   provider. The provider's SOURCE metadata decides (see
+   `BeamLisp.Loader/maybe_load_macro/2`), so an ordinary foreign function is
+   never initialized merely because the compiler asked whether its call was a
+   macro."
   [ns name]
   ; `peek`, not `fetch`: probing whether a name is a macro at COMPILE time must
   ; not materialize a `^:per-env` value. A per-env descriptor is never a macro,
   ; so it correctly falls through. Mirrors genesis `macro_for`.
-  (let [r (BeamLisp.Env/peek ns (core-qualified name))]
-    (when (and (erlang/is_tuple r)
-             (= :ok (erlang/element 1 r))) (let [v (erlang/element 2 r)]
-        (when (and (erlang/is_tuple v)
-                 (= (erlang/binary_to_atom "$macro") (erlang/element 1 v))) (erlang/element 2 v))))))
+  (let [q (core-qualified name)
+        pv (name-provider ns name)
+        pending (and (some? pv) (not= (first pv) ns)
+                     (not (BeamLisp.Env/loaded_ns? (first pv)))
+                     (= :error (BeamLisp.Env/lookup (tuple (first pv) (second pv)))))
+        ordinary (and pending
+                      (contains? #{:public :private}
+                        (BeamLisp.Loader/source_decl (first pv) (second pv))))]
+    ; An explicit refer may shadow a core macro. Do not expand that fallback
+    ; while its ordinary provider is still deferred.
+    (if ordinary
+      nil
+      (do
+        (when pending (BeamLisp.Loader/maybe_load_macro (first pv) (second pv)))
+        (let [r (BeamLisp.Env/peek ns q)]
+          (when (and (erlang/is_tuple r) (= :ok (erlang/element 1 r)))
+            (macro-value (erlang/element 2 r))))))))
 
 (defn- macro?
   "Say whether `name` names a macro visible in this environment's namespace.
@@ -768,6 +842,44 @@
     :map {}
     :keyword :_))
 
+(defn- boot-ns?
+  "Whether `ns` belongs to the BOOT (codegen) tier.
+
+   Those namespaces are initialized by the boot ladder before any author code
+   runs, and the ladder itself has no loader to defer to — so a readiness guard
+   on a call into one could only add cost. The tier membership is the same list
+   `BeamLisp.Tiers/boot_namespaces` gives the AOT drift gate; it is read once
+   per compile process and held as a set."
+  [ns]
+  ; `core` and `sugar` are the two namespaces EVERY program links into (most
+  ; of the prelude resolves through them), so they are named here as well: a
+  ; checkout whose tier directory cannot be listed must still never guard them.
+  (if (or (= ns "core") (= ns "sugar"))
+    true
+    (let [k (tuple :"$bl_boot_ns_set" :set)
+          cached (Process/get k nil)]
+      (if (erlang/== nil cached)
+        (let [tier (set (BeamLisp.Tiers/boot_namespaces))]
+          (Process/put k tier)
+          (contains? tier ns))
+        (contains? cached ns)))))
+
+(defn- ready-guard
+  "Wrap a DIRECT cross-namespace call in the loader's readiness guard, so an
+   AOT-baked `Module.fn(args)` initializes its namespace on FIRST use instead of
+   running against an uninitialized one. `Loader/ensure_ready/1` answers from
+   one registry read once the namespace is up.
+
+   A call inside the CURRENT namespace needs no guard (its own code is already
+   running), and neither does a call into the boot tier."
+  [owner node env]
+  (if (or (nil? owner)
+          (= owner (:ns env))
+          (boot-ns? (:ns env))
+          (boot-ns? owner))
+    node
+    (a/doo (list (a/remote mod-loader :ensure_ready (list (a/lit owner))) node))))
+
 (defn- compile-call
   "Turn a call form (head arg ...) into the tree that runs it.
 
@@ -835,11 +947,14 @@
             ; use the linked direct call when it is a linked defn, else invoke
             ; its fetched value
             (let [tns (second tgt) tvar (nth tgt 2)]
-              (reject-private! env tns tvar)
-              (let [link (BeamLisp.Env/link tns tvar)]
-                (or (and (not= link :error)
-                         (linked-call (second (erlang/tuple_to_list link)) arg-nodes env))
-                    (anf-invoke (a/global tns tvar) arg-nodes))))))
+              (reject-private-static! env tns tvar)
+              (let [link (BeamLisp.Env/link tns tvar)
+                    direct (if (= link :error)
+                             nil
+                             (linked-call (second (erlang/tuple_to_list link)) arg-nodes env))]
+                (if (some? direct)
+                  (ready-guard tns direct env)
+                  (anf-invoke (a/global tns tvar) arg-nodes))))))
 
       ; (.method recv args…) — a Java instance method through the manifest.
       ; Keyed by method NAME (a call site names no class); the target is a
@@ -888,19 +1003,23 @@
       (= tag :symbol)
         (let [name (rn/node-name head)]
           (if (local? env name)
-            (let [link (BeamLisp.Env/link (:ns env) (core-qualified name))
+            (let [lo (BeamLisp.Env/link_owner (:ns env) (core-qualified name))
                   local-node (compile-symbol name env)
-                  direct (and (not= link :error)
-                              (linked-call (second (erlang/tuple_to_list link)) arg-nodes env))]
-              (if direct
+                  direct (if (erlang/== :error lo)
+                           nil
+                           (linked-call (erlang/element 3 lo) arg-nodes env))]
+              (if (some? direct)
                 (a/iff (a/remote mod-rt :invocable? (list local-node (a/lit (count arg-nodes))))
                        (anf-invoke local-node arg-nodes)
-                       direct)
+                       (ready-guard (erlang/element 2 lo) direct env))
                 (anf-invoke local-node arg-nodes)))
-            (let [link (BeamLisp.Env/link (:ns env) (core-qualified name))]
-              (or (and (not= link :error)
-                       (linked-call (second (erlang/tuple_to_list link)) arg-nodes env))
-                  (anf-invoke (compile-symbol name env) arg-nodes)))))
+            (let [lo (BeamLisp.Env/link_owner (:ns env) (core-qualified name))
+                  direct (if (erlang/== :error lo)
+                           nil
+                           (linked-call (erlang/element 3 lo) arg-nodes env))]
+              (if (some? direct)
+                (ready-guard (erlang/element 2 lo) direct env)
+                (anf-invoke (compile-symbol name env) arg-nodes)))))
 
       ; (expr args) with a compound head — compile it, then call it
       :else
@@ -3237,8 +3356,24 @@
                       (list (a/remote mod-env :add_core_excludes
                                       (list (a/lit name) (a/lit (apply list excludes))))))
         parsed (map (fn [s] (parse-require-spec s env)) specs)
+        ; A spec that names an alias or an explicit refer list DECLARES its
+        ; target: the alias and the dependency's search context are registered
+        ; now, its top-level forms run on first use. A bare (effect-only) spec
+        ; and a `:refer :all` (whose ns-time snapshot needs the provider's vars
+        ; present) load now, as does everything in the preboot tier — a decision
+        ; `Loader/declare_require/3` makes at RUN time, when this form runs, so
+        ; the same source is eager during boot and demand-driven afterwards.
         loads (apply list
-                (map (fn [p] (a/remote mod-loader :ensure_loaded (list (a/lit (first p)))))
+                (map (fn [p]
+                       (let [target (first p)
+                             alias (second p)
+                             refer (nth p 2)
+                             deferrable (or (some? alias)
+                                            (and (not= :all refer) (not (empty? refer))))]
+                         (if deferrable
+                           (a/remote mod-loader :declare_require
+                                     (list (a/lit target) (a/lit alias) (a/lit refer)))
+                           (a/remote mod-loader :ensure_loaded (list (a/lit target))))))
                      parsed))
         ; aliases/refers accumulate in REVERSE spec order (the existing compiler
         ; prepends each spec's op-group), but ops WITHIN a spec stay forward.
@@ -3264,7 +3399,7 @@
                                            ; time, exactly like a qualified
                                            ; reference — a private var is not part
                                            ; of another namespace's public surface.
-                                           (do (reject-private! env (first p) sym)
+                                           (do (reject-private-static! env (first p) sym)
                                                (a/remote mod-env :add_refer
                                                          (list (a/lit name) (a/lit sym) (a/lit (first p))))))
                                          r)))))

@@ -359,14 +359,16 @@ For bounded-memory streaming, advancing the consumer is not sufficient if
 another reference keeps the original head. Let consumed prefixes become
 unreachable; do not accidentally store every prefix in a log or global value.
 
-Lazy results are no longer kept in a global ETS table. Metadata also lives on
-the value, not in a permanent identity-indexed table. Adding metadata preserves
+Lazy results and metadata live on shared native resources. Their lifetime
+follows the references that keep the value reachable. Adding metadata preserves
 the shared memo: annotating a sequence does not replay its recipe.
 
 There is still an important finite-input tradeoff: collection operators use
-shared cursors over large, already-eager lists and vectors. Each native input
-is copied once, and deferred tails retain small cursor handles rather than
-copying the remaining list at every chunk. That removes quadratic input copying.
+shared cursors over large, already-eager lists and vectors. One root holds the
+input and builds its index once. Each position is an immutable root-and-index
+token, so reading a position twice gives the same chunk without rescanning or
+copying the remaining tail. Chunks are bounded by element count; a single large
+element can still require a large byte copy.
 The finite input storage stays alive while any cursor needs it; this is not a
 promise to free prefixes of that storage individually. A genuinely lazy input
 is not eagerly consumed merely to create a cursor.
@@ -383,12 +385,12 @@ for handles; native graph validation checks their transitive dependencies.
 A rejected result becomes a terminal `cyclic_memo` error. It is not returned
 successfully to the evaluator and secretly rejected for everyone else.
 
-This is cycle rejection, **not** general tracing garbage collection. An opaque
-third-party NIF resource can hide references that this scanner cannot inspect.
-Do not construct ownership cycles through foreign native containers and expect
-this memo graph to collect them. Recursive evaluation is separately rejected
-with `recursive_force`; cyclic retained values need not have been evaluated
-recursively to be invalid.
+Cycle rejection protects memo publication. A separate native collector can
+reclaim supported resource cycles after their external roots disappear. It
+counts reference occurrences, including closure captures, and retains candidates
+when it cannot establish safety. Foreign NIF containers can hide references, so
+this is not a promise of general tracing collection. Recursive evaluation is
+separately rejected with `recursive_force`.
 
 ## 10. What this enables—and what it does not
 
@@ -437,31 +439,31 @@ Shared lazy values: all checks passed
 
 ## Keep exploring
 
-- `priv/boot/core.bl`: the `lazy-seq` macro wraps its body in a zero-argument
-  function—a **thunk**, meaning a recipe with no arguments.
-- `lib/beam_lisp/lazy_seq.ex`: realization, sharing, waiting, failure, and memo
-  retention semantics.
-- `lib/beam_lisp/lazy_memo.ex`: native loading, dependency discovery, and soft
-  live-memory admission checks.
-- `native/lazy_memo/src/lib.rs`: cells, atomic publication, cycle checks,
-  shared input cursors, and resource cleanup.
-- `lib/beam_lisp/seq_cursor.ex`: the finite-input chunk adapter.
-- `test/beam_lisp/lazy_memo_native_test.exs`: native lifetime and cursor checks.
+- `priv/host/lazy_seq.bl`: realization, shared attempts and failure replay.
+- `priv/host/lazy_memo.bl`: peek, versioned reads and admitted publication.
+- `priv/host/seq_cursor.bl`: immutable finite-input positions.
+- `native/lazy_memo/src/`: cells, byte accounting, graph checks and collection.
+- `test/bl/lazy_budget_test.bl`, `lazy_fold_test.bl` and
+  `host_seq_cursor_test.bl`: budget, prefix replay and cursor lifetime checks.
 
-Building from source requires Cargo when a current native artifact is absent.
-The normal Mix build installs the library before compiling `.bl` sources.
-A release carries it in the application's `priv/native` directory. Restart the
-VM after changing native runtime modules: live NIF upgrades are deliberately
-unsupported.
+Cargo builds a missing or stale native artifact. The language's native build
+step installs it in `priv/native`; a packaged release carries the same library.
+Restart the VM after native runtime changes: live NIF upgrades are unsupported.
 
-`BeamLisp.LazyMemo.stats()` exposes `live_cells`, `retained_bytes`, and
-`pending_reclaims`. These describe native memo/input storage, not the whole VM.
-`retained_bytes` is a live-term estimate, not an exact RSS measurement or a hard
-allocator limit; pending cleanup and shared binary storage are separate costs.
-The configurable `lazy_cache_budget_bytes` remains a soft admission guard.
-It never evicts a live answer to make room.
-- `test/beam_lisp/wave23_lazyseq_test.exs`: runtime regression cases, including
-  cross-process attempts and failures.
+`BeamLisp.LazyMemo.stats()` exposes live cells, accounted retained bytes,
+reservations and pending cleanup. These are not whole-VM RSS measurements.
+
+Creation and admitted publication reserve growth against one atomic occupied
+counter. Concurrent publishers share the same ceiling. Admission covers
+accounted saved terms, not arbitrary producer allocations or all shared binary
+storage. Live answers are not evicted to make room.
+
+A post-production budget refusal is terminal: repeating a consumer does not
+rerun effects from that attempt. Ordinary failed force attempts remain retryable.
+A reduced result preserves its realized prefix; later readers continue from it.
+
+`LazyMemo.peek` asks only for a tag and version. A caller that then reads the
+full state must validate that version. The full-state API remains available.
 
 The central idea is small: **share the answer while someone needs it, and let
 ownership—not a permanent table—decide how long it lives.**

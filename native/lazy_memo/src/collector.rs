@@ -24,11 +24,11 @@
 //!    the calibrated offsets.
 //!
 //! # A round
-//! Pin every registered node, trace each one's saved term (cached per state,
-//! so a state is encoded at most once in its life), count INTERNAL references
-//! (held by traced nodes). A node whose refcount exceeds its internal count is
-//! held from outside — a root. Everything a root reaches is live; the rest is
-//! garbage candidate `G`.
+//! Pin every registered node, trace each one's saved term (censused at most
+//! once per state, so a state costs its size at most once in its life), count
+//! INTERNAL references (held by traced nodes). A node whose refcount exceeds
+//! its internal count is held from outside — a root. Everything a root
+//! reaches is live; the rest is garbage candidate `G`.
 //!
 //! Mutators are never stopped. Validation is two passes over `G`, in this
 //! order: (1) every member's outside count is zero; (2) every member is still
@@ -47,7 +47,8 @@
 //! Breaking a validated cycle takes each `G` cell's state; the refcounts then
 //! fall to zero in ERTS's own order and the ordinary destructors run.
 
-use rustler::{Encoder, OwnedEnv, ResourceArc};
+use rustler::types::tuple::get_tuple;
+use rustler::{Encoder, MapIterator, OwnedEnv, ResourceArc, Term, TermType};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
@@ -60,7 +61,7 @@ pub type Key = [u32; 3];
 pub enum Traced {
     /// Holds no state (never filled, or already detached): no edges.
     Vacant,
-    /// Holds a term the ETF census could not read: a conservative root.
+    /// Holds a term the census could not read: a conservative root.
     Opaque,
     /// Holds a state at this version; its references were visited.
     At(u64),
@@ -96,7 +97,9 @@ fn registry() -> &'static Mutex<HashMap<u64, Entry>> {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Make a freshly allocated resource visible to the collector.
@@ -127,7 +130,9 @@ pub fn unregister(id: u64) {
 
 /// The reference number of a resource the caller holds (so it is live).
 pub fn key_of<T: rustler::Resource>(resource: &ResourceArc<T>) -> Key {
-    layout().map(|l| l.key(resource.as_c_arg() as usize)).unwrap_or([0; 3])
+    layout()
+        .map(|l| l.key(resource.as_c_arg() as usize))
+        .unwrap_or([0; 3])
 }
 
 // ── calibration ─────────────────────────────────────────────────────────────
@@ -244,17 +249,63 @@ fn calibrate() -> Result<Layout, &'static str> {
             })
             .collect();
         if let [refn] = hits[..] {
-            return Ok(Layout { refc, refn, refn_reversed: reversed });
+            let layout = Layout {
+                refc,
+                refn,
+                refn_reversed: reversed,
+            };
+            // The IN-PLACE census must agree with the proven ETF reader on this
+            // exact emulator — every occurrence, order aside — before a single
+            // round may rely on it. A walker this build cannot vouch for (a
+            // type it mis-classifies, a container it fails to descend) must
+            // leave the collector OFF, never collect through a wrong census.
+            // The probe term mixes nesting shapes so this proves more than the
+            // flat list above: tuple, list-in-list, and list-in-tuple.
+            let probe = &probes[0];
+            let env = OwnedEnv::new();
+            let term = env.run(|e| {
+                let t = probe.encode(e);
+                let pair = (t, t).encode(e);
+                let nested = vec![t, t].encode(e);
+                env.save(vec![t, pair, nested].encode(e))
+            });
+            let by_etf = env.run(|e| etf_keys(term.load(e).to_binary().as_slice()));
+            let by_walk = env.run(|e| {
+                census_keys(term.load(e), |t| {
+                    t.decode::<ResourceArc<Probe>>()
+                        .ok()
+                        .map(|p| layout.key(p.as_c_arg() as usize))
+                })
+            });
+            match (sorted_keys(by_walk), sorted_keys(by_etf)) {
+                (Some(walk), Some(etf)) if !walk.is_empty() && walk == etf => {}
+                _ => return Err("the in-place census disagrees with the ETF census"),
+            }
+            return Ok(layout);
         }
     }
     Err("reference number offset not found")
+}
+
+/// A census answer with its occurrences in a canonical order, so two readers
+/// that visit the same occurrences in different orders compare equal. The
+/// collector counts occurrences, so order carries no meaning to it.
+fn sorted_keys(keys: Option<Vec<Key>>) -> Option<Vec<Key>> {
+    keys.map(|mut keys| {
+        keys.sort();
+        keys
+    })
 }
 
 static LAYOUT: OnceLock<Option<Layout>> = OnceLock::new();
 
 fn layout() -> Option<&'static Layout> {
     LAYOUT
-        .get_or_init(|| calibrate().map_err(|why| *CALIBRATION_ERROR.lock().unwrap() = why).ok())
+        .get_or_init(|| {
+            calibrate()
+                .map_err(|why| *CALIBRATION_ERROR.lock().unwrap() = why)
+                .ok()
+        })
         .as_ref()
 }
 
@@ -270,6 +321,11 @@ pub fn enabled() -> bool {
 /// reader does not know (the node is then a conservative root). ETF is prefix
 /// order, so a single `pending` counter replaces a stack: a container adds
 /// its children, every term consumes one.
+///
+/// This is the reference reader for a term that has to be SERIALISED: the
+/// `Seen` set's admitted keys, the calibration probes, and the `census_keys`
+/// fallback for a closure (no public accessor for its captures) or an
+/// unclassified term. A whole state is walked in place instead.
 pub fn etf_keys(etf: &[u8]) -> Option<Vec<Key>> {
     let mut r = Reader { bytes: etf, at: 0 };
     if r.u8()? != 131 {
@@ -350,6 +406,120 @@ pub fn etf_keys(etf: &[u8]) -> Option<Vec<Key>> {
     Some(keys)
 }
 
+// ── in-place census ─────────────────────────────────────────────────────────
+
+/// Every reference `term` holds, ONCE PER OCCURRENCE — read by walking the term
+/// IN PLACE, with no whole-term export.
+///
+/// The whole-cell censuses that came before this walked `term_to_binary`: the
+/// state was serialised to ETF (a fresh allocation the size of the term) and the
+/// bytes were parsed, both under the cell's own state lock. This walk reaches
+/// the same occurrences through the NIF's public shape API instead:
+///
+/// * `Term::get_type` (an `enif_term_type` call) classifies every subterm. No
+///   assumption is made about ERTS's word layout — this is the public API.
+/// * a cons, tuple or map is descended element by element, so the answer is
+///   occurrence-EXACT: a term holding the same resource 20 times reports 20
+///   keys, exactly as `term_to_binary` did, not one key for a unique node.
+/// * a resource is recognised by the resource API itself — `resource_key`
+///   answers the collector key of a subterm that IS a collector node, and None
+///   for everything else (a plain reference, a resource of another type).
+///
+/// Two shapes still need the ETF reader above, on that SUBTERM alone:
+///   * a closure — the installed NIF API exposes no accessor for a fun's
+///     captured environment, and a closure may capture a resource, so its
+///     captures are read from its own ETF;
+///   * a type this build cannot classify (`TermType::Unknown`), which is read
+///     rather than guessed at.
+///
+/// `None` means a subterm could not be read at all: the caller MUST treat the
+/// node as an OPAQUE root — a conservative root that is never collected through.
+///
+/// The worklist is explicit, so a deeply nested term costs heap, not stack.
+pub fn census_keys<'a, F>(term: Term<'a>, resource_key: F) -> Option<Vec<Key>>
+where
+    F: Fn(Term<'a>) -> Option<Key>,
+{
+    let mut keys = Vec::new();
+    let mut pending: Vec<Term<'a>> = vec![term];
+    while let Some(current) = pending.pop() {
+        match current.get_type() {
+            // A leaf: no reference can be inside it.
+            TermType::Atom
+            | TermType::Integer
+            | TermType::Float
+            | TermType::Binary
+            | TermType::Pid
+            | TermType::Port => {}
+            // A plain reference is a leaf; a collector node's reference is a key.
+            TermType::Ref => {
+                if let Some(key) = resource_key(current) {
+                    keys.push(key);
+                }
+            }
+            TermType::List => {
+                let mut cell = current;
+                loop {
+                    if cell.is_empty_list() {
+                        break;
+                    }
+                    match cell.list_get_cell() {
+                        Ok((head, tail)) => {
+                            push(&mut pending, head);
+                            cell = tail;
+                        }
+                        // An improper tail (`[1 | foo]`) is a term on its own.
+                        // The classifier guard is what makes this loop
+                        // terminate: a term that is not a cons cannot be a
+                        // list, so a `List` answer here must not re-enter.
+                        Err(_) => {
+                            if !matches!(cell.get_type(), TermType::List) {
+                                push(&mut pending, cell);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            TermType::Tuple => {
+                for element in get_tuple(current).ok()? {
+                    push(&mut pending, element);
+                }
+            }
+            TermType::Map => {
+                for (key, value) in MapIterator::new(current)? {
+                    push(&mut pending, key);
+                    push(&mut pending, value);
+                }
+            }
+            // No public accessor for a closure's captures; an unclassified
+            // term is read rather than guessed at. Both are read from their
+            // OWN ETF, so the rest of the term is never serialised.
+            TermType::Fun | TermType::Unknown => {
+                keys.extend(etf_keys(current.to_binary().as_slice())?);
+            }
+        }
+    }
+    Some(keys)
+}
+
+/// Queue a subterm unless it can hold no reference at all. A flat list of
+/// numbers — the common shape of a produced chunk or a range's backing — then
+/// costs one shape test per element and no worklist growth.
+fn push<'a>(pending: &mut Vec<Term<'a>>, term: Term<'a>) {
+    if !matches!(
+        term.get_type(),
+        TermType::Atom
+            | TermType::Integer
+            | TermType::Float
+            | TermType::Binary
+            | TermType::Pid
+            | TermType::Port
+    ) {
+        pending.push(term);
+    }
+}
+
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -370,10 +540,12 @@ impl<'a> Reader<'a> {
         self.take(1).map(|b| b[0] as usize)
     }
     fn u16(&mut self) -> Option<usize> {
-        self.take(2).map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
+        self.take(2)
+            .map(|b| u16::from_be_bytes([b[0], b[1]]) as usize)
     }
     fn u32(&mut self) -> Option<usize> {
-        self.take(4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        self.take(4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize)
     }
     fn atom(&mut self) -> Option<()> {
         match self.u8()? {
@@ -413,7 +585,8 @@ impl Pin {
             if count <= 0 {
                 return None;
             }
-            match refc.compare_exchange_weak(count, count + 1, Ordering::AcqRel, Ordering::Acquire) {
+            match refc.compare_exchange_weak(count, count + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => break,
                 Err(now) => count = now,
             }
@@ -422,7 +595,10 @@ impl Pin {
         // is the ordinary path (and a debug emulator's shadow count agrees).
         unsafe { rustler::sys::enif_keep_resource(entry.raw as *const c_void) };
         refc.fetch_sub(1, Ordering::AcqRel);
-        Some(Pin { raw: entry.raw, node: entry.node })
+        Some(Pin {
+            raw: entry.raw,
+            node: entry.node,
+        })
     }
 
     fn node(&self) -> &dyn Node {
@@ -449,7 +625,10 @@ pub fn collect() -> usize {
 
     let pins: Vec<Pin> = {
         let registry = lock(registry());
-        registry.values().filter_map(|&e| Pin::new(layout, e)).collect()
+        registry
+            .values()
+            .filter_map(|&e| Pin::new(layout, e))
+            .collect()
     };
     let n = pins.len();
     let index: HashMap<Key, usize> = pins
@@ -493,7 +672,9 @@ pub fn collect() -> usize {
     // Validate the whole set before touching any of it — counts FIRST, then
     // quiet (the order is the soundness argument in the module header).
     let valid = garbage.iter().all(|&(i, _)| outside(i) == 0)
-        && garbage.iter().all(|&(i, version)| pins[i].node().quiet(version));
+        && garbage
+            .iter()
+            .all(|&(i, version)| pins[i].node().quiet(version));
     if !valid {
         ABORTS.fetch_add(1, Ordering::Relaxed);
         return 0;
@@ -634,5 +815,25 @@ mod tests {
         assert!(etf_keys(&[130, 106]).is_none());
         assert!(etf_keys(&[131, 104, 2, 106]).is_none(), "truncated tuple");
         assert_eq!(etf_keys(&[131, 106]), Some(vec![]));
+    }
+
+    #[test]
+    fn the_census_canonical_order_keeps_every_occurrence() {
+        // The in-place walk and the ETF reader visit the same occurrences in
+        // different orders (the walk pops a LIFO worklist). The calibration
+        // compares them by occurrence, NOT by position — so a repeated
+        // reference must survive canonicalisation as many times as it appears.
+        let one = [7, 8, 9];
+        let two = [1, 2, 3];
+        let walked = Some(vec![one, two, one]);
+        let etf = Some(vec![one, one, two]);
+        assert_eq!(sorted_keys(walked.clone()), sorted_keys(etf));
+        let canonical = sorted_keys(walked).expect("readable");
+        assert_eq!(canonical.iter().filter(|k| **k == one).count(), 2);
+        assert_ne!(
+            sorted_keys(Some(vec![one])),
+            sorted_keys(Some(vec![one, two]))
+        );
+        assert_eq!(sorted_keys(None), None);
     }
 }
