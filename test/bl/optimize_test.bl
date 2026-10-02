@@ -1,0 +1,181 @@
+(ns optimize.test
+  (:require [optimize :as o] [anf :as a] [compiler :as c] [lower :as l]))
+
+(defn- fresh [stem]
+  (erlang/binary_to_atom (str "Elixir.OptimizeTest." stem "." (erlang/unique_integer (list :positive)))))
+
+(defn- descriptor [source]
+  (c/reset-fresh!)
+  (a/module (fresh "Image")
+    (list {:op :defn-clause :fname :run :params (list) :guard nil
+           :body (c/compile-node (BeamLisp.Reader/read_one source) (c/new-env "user")) :ann {}})
+    (list [:run 0]) (list)))
+
+(defn- emit [m enabled]
+  (let [pair (l/descriptor->beam m {:enabled? enabled})]
+    (is (= (tuple :module (elem pair 0)) (code/load_binary (elem pair 0) '() (elem pair 1))))
+    pair))
+(defn- execute [source enabled]
+  (let [pair (emit (descriptor source) enabled)] (erlang/apply (elem pair 0) :run '())))
+(defn- report [source] (o/explain (descriptor source)))
+(defn- rules-used [r] (set (map :rule (:evidence r))))
+(defn- outcome [f args]
+  (try [:ok (erlang/apply f args)] (catch-raw [kind reason stack] [kind reason])))
+
+(defn- instructions [beam]
+  (let [image (beam_disasm/file beam)]
+    (mapcat (fn [f] (nth (erlang/tuple_to_list f) 4)) (nth (erlang/tuple_to_list image) 5))))
+(defn- references? [beam module fun]
+  (some (fn [ins] (and (erlang/is_tuple ins)
+                      (some (fn [v] (= v (tuple :extfunc module fun 2))) (erlang/tuple_to_list ins))))
+        (instructions beam)))
+
+(deftest one-cohesive-api-and-bounded-pass
+  (let [m (descriptor "(let [f (fn [a x] (+ a x))] (f 3 4))") r (o/explain m)]
+    (is (= "optimize-1" (:version r)))
+    (is (= (:descriptor r) (o/module m)))
+    (is (contains? (rules-used r) :native-call))
+    (is (= m (o/module m {:enabled? false})))
+    (is (= :native-call (:rule (second (o/rules)))))
+    (let [limited (o/explain m {:max-nodes 1})]
+      (is (:limited? (:stats limited)))
+      (is (<= (:visited (:stats limited)) 1))
+      (is (= m (:descriptor limited))))
+    (is (thrown? Elixir.ArgumentError (o/module m {:max-nodes 0}))))
+  (is (= (a/lit 3) (o/node (a/lit 3)))))
+
+(deftest dominating-native-guard-produces-a-direct-call
+  (let [src "(fn [f a x] (if (erlang/is_function f 2) (f a x) (f a x)))"
+        baseline (execute src false) optimized (execute src true)
+        f (fn [a x] (+ a x)) wrong-arity (fn [x] x)]
+    (is (= 9 (erlang/apply optimized (list f 4 5))))
+    (is (= (outcome baseline (list :answer {:answer 9} 0))
+           (outcome optimized (list :answer {:answer 9} 0))))
+    (is (= (outcome baseline (list wrong-arity 4 5))
+           (outcome optimized (list wrong-arity 4 5))))
+    (is (contains? (rules-used (report src)) :native-call)))
+  (let [m (descriptor "(fn [f a x] (when (erlang/is_function f 2) (f a x)))")
+        beam (elem (emit m true) 1)]
+    (is (some (fn [ins] (and (erlang/is_tuple ins) (contains? #{:call_fun :call_fun2} (elem ins 0))))
+              (instructions beam)))))
+
+(deftest callback-effects-and-failure-kind-remain-ordered
+  (let [src "(fn [f a x] (if (erlang/is_function f 2) (f a x) (f a x)))"
+        baseline (execute src false) optimized (execute src true) seen (atom [])
+        callback (fn [a x] (swap! seen conj [a x]) (+ a x))]
+    (is (= 7 (erlang/apply optimized (list callback 3 4))))
+    (is (= [[3 4]] @seen))
+    (doseq [f [(fn [a x] (throw :sentinel)) (fn [a x] (erlang/error :sentinel))]]
+      (is (= (outcome baseline (list f 3 4)) (outcome optimized (list f 3 4)))))))
+
+(deftest metadata-and-global-names-are-not-proof-authority
+  (let [n (a/remote :Elixir.BeamLisp.Ns.Rt :invoke (list (a/var "f") (a/cons-cell (a/lit 1) a/enil)))
+        claimed (assoc n :ann {:verified true :native-arity 1 :pure true})]
+    (is (= claimed (o/node claimed))))
+  (is (not (contains? (rules-used (report "(+ 1 (identity 2))")) :native-call)))
+  (let [r (report "(reduce + 0 (map (fn [x] (* x 2)) (range 8)))")]
+    (is (some (fn [x] (= :live-provider-or-observable-lazy-demand (:reason x))) (:refusals r)))))
+
+(deftest lexical-aliases-and-shadowing-do-not-freeze-values
+  (is (= 9 (execute "(let [f (fn [a x] (+ a x)) g f] (g 4 5))" true)))
+  (is (= 11 (execute "(let [f (fn [a x] (+ a x))] ((fn [f] (f {:answer 11})) :answer))" true)))
+  (let [f (a/fnn (list (a/clause (list (a/pvar "a") (a/pvar "b")) nil (a/lit 0))))
+        invoke (a/remote :Elixir.BeamLisp.Ns.Rt :invoke
+                 (list (a/var "f") (a/cons-cell (a/lit {:answer 7}) a/enil)))
+        n (a/lett "f" f (a/lett "f" (a/lit :answer) invoke))]
+    (is (= invoke (:body (:body (o/node n)))))))
+
+(deftest numeric-refinement-preserves-unknown-numeric-tower
+  (let [src "(fn [a b] (if (erlang/is_integer a) (if (erlang/is_integer b) (+ a b) (+ a b)) (+ a b)))"
+        baseline (execute src false) optimized (execute src true)]
+    (doseq [args [(list 2 3) (list 2.5 3) (list :wrong 3) (list 123456789012345678901234567890 3)]]
+      (is (= (outcome baseline args) (outcome optimized args))))
+    (is (contains? (rules-used (report src)) :numeric-domain)))
+  (let [src "(let [x 3] ((fn [x] (+ x 2)) :wrong))"]
+    (is (= :error (first (outcome (execute "(fn [] (let [x 3] ((fn [x] (+ x 2)) :wrong)))" true) '()))))))
+
+(deftest ordinary-integer-fold-specializes-without-body-cloning
+  (let [src "(lists/foldl (fn [x a] (+ a x)) 0 (lists/seq 0 31))" r (report src)]
+    (is (= 496 (execute src false)))
+    (is (= 496 (execute src true)))
+    (is (contains? (rules-used r) :integer-callback)))
+  (let [src "(lists/foldl (fn [x a] (+ a x)) 0.5 (lists/seq 0 31))"]
+    (is (= (execute src false) (execute src true)))
+    (is (not (contains? (rules-used (report src)) :integer-callback)))))
+
+(deftest ordinary-strict-map-fold-fuses-with-order-preserved
+  (doseq [n [0 1 31 32 33 63 64 65 1000]]
+    (let [src (str "(lists/foldl (fn [x a] (- a x)) 0 (lists/map (fn [x] (* x 2)) (lists/seq 0 " (dec n) ")))" )]
+      (is (= (- (* n (dec n))) (execute src true)))
+      (is (= (execute src false) (execute src true)))
+      (is (contains? (rules-used (report src)) :strict-map-fold))))
+  (let [src "(lists/foldl (fn [x a] (+ a x)) 0 (lists/map (fn [x] (* x x)) (lists/seq 0 64)))"
+        m (descriptor src) beam (elem (emit m true) 1)]
+    (is (not (references? beam :lists :map)))
+    (is (= 89440 (erlang/apply (elem (emit m true) 0) :run '())))))
+
+(deftest fusion-is-alpha-safe-and-keeps-inner-let-evaluation-once
+  (let [source "(lists/foldl (fn [x a] (+ a x)) 0 (lists/map (fn [x] (let [a (+ x 1)] (+ a x))) (lists/seq 0 31)))"]
+    (is (= 1024 (execute source true)))
+    (is (= (execute source false) (execute source true))))
+  (let [source "(lists/foldl (fn [x a] (let [x (+ x 1)] (+ x a))) 0 (lists/map (fn [x] (* x 2)) (lists/seq 0 31)))"]
+    (is (= 1024 (execute source true)))
+    (is (= (execute source false) (execute source true)))))
+
+(deftest observable-or-partial-mappers-are-not-fused
+  (doseq [src ["(lists/foldl (fn [x a] (+ a x)) 0 (lists/map (fn [x] (/ 1 x)) (lists/seq 0 31)))"
+               "(lists/foldl (fn [x a] (+ a x)) 0 (lists/map (fn [x] (do (println x) x)) (lists/seq 0 31)))"
+               "(let [xs (lists/map (fn [x] (* x 2)) (lists/seq 0 31))] [(lists/foldl (fn [x a] (+ a x)) 0 xs) xs])"
+               "(lists/foldl (fn [x a] (+ a x)) 0 (lists/map (fn [x] (+ x 1)) '(1 :wrong 3)))"]]
+    (is (not (contains? (rules-used (report src)) :strict-map-fold)))))
+
+(deftest literal-data-and-source-annotations-are-preserved
+  (let [data {:op :remote :mod :Elixir.BeamLisp.Ns.Rt :fun :invoke :ann {:verified true}}
+        n (assoc (a/lit data) :ann {:line 17 :file "optimizer-fixture.bl"})]
+    (is (= n (o/node n))))
+  (let [n (assoc (a/arith :add :+ (list (a/lit 2) (a/lit 3))) :ann {:line 19 :col 4 :file "optimizer-fixture.bl"})
+        result (o/node n)]
+    (is (= :remote (:op result)))
+    (is (= (:ann n) (:ann result)))))
+
+(deftest a-wildcard-is-not-an-integer-parameter-binding
+  (let [rf (a/fnn (list (a/clause (list (a/pvar "x") (a/pvar "a")) nil
+                         (a/arith :add :+ (list (a/var "a") (a/var "x"))))))
+        mf (a/fnn (list (a/clause (list (a/pvar "_")) nil
+                         (a/arith :add :+ (list (a/var "_") (a/lit 1))))))
+        source (a/remote :lists :seq (list (a/lit 0) (a/lit 3)))
+        mapped (a/remote :lists :map (list mf source))
+        n (a/remote :lists :foldl (list rf (a/lit 0) mapped))]
+    (is (= n (o/node n)))
+    (let [captured (a/lett "_" (a/lit 8) n)
+          m (a/module (fresh "Wildcard")
+              (list {:op :defn-clause :fname :run :params '() :guard nil :body captured :ann {}})
+              (list [:run 0]) '())]
+      ; Simple native-fun parameters bind "_" in the backend shortcut.
+      (is (= 10 (erlang/apply (elem (emit m false) 0) :run '())))
+      (is (= 10 (erlang/apply (elem (emit m true) 0) :run '()))))))
+
+
+(deftest simple-fun-wildcard-shadows-outer-domain-facts
+  (let [fn-node (a/fnn (list (a/clause (list (a/pvar "_")) nil
+                         (a/arith :add :+ (list (a/var "_") (a/lit 1))))))
+        n (a/lett "_" (a/lit 8) fn-node)]
+    (is (= n (o/node n)) "the native-fun shortcut binds its own underscore argument")))
+
+
+(deftest native-call-arguments-keep-cons-evaluation-order
+  (let [src "(fn [mark] ((fn [a b] [a b]) (mark :a) (mark :b)))"
+        baseline (execute src false) optimized (execute src true)
+        seen (atom []) mark (fn [x] (swap! seen conj x) x)]
+    (is (= [:a :b] (erlang/apply baseline (list mark))))
+    (is (= [:b :a] @seen))
+    (reset! seen [])
+    (is (= [:a :b] (erlang/apply optimized (list mark))))
+    (is (= [:b :a] @seen))
+    (let [stop (fn [x] (swap! seen conj x) (throw x))]
+      (reset! seen [])
+      (let [reference (outcome baseline (list stop))]
+        (is (= [:b] @seen))
+        (reset! seen [])
+        (is (= reference (outcome optimized (list stop))))
+        (is (= [:b] @seen))))))
