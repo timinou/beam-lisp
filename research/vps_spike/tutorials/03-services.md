@@ -47,7 +47,7 @@ from a log file.
 ### Step 1 — the namespace: which organs this spike touches
 
 ```clojure
-(ns vps.services (:require [super] [vm.core :as vm] [proc.sched :as sched]))
+(ns vps.services (:require [proc.super :as super] [vm.core :as vm] [proc.sched :as sched]))
 ```
 
 Three real organs, three different jobs. `super` is the supervision bundle

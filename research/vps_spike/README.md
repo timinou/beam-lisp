@@ -12,11 +12,14 @@ research/vps_spike/run.sh --podman   # + 09 platform-swap, real containers, capp
 **Every spike has a step-by-step tutorial in [`tutorials/`](tutorials/README.md)** —
 what it proves, a walk of its code, and an honest real-vs-modelled boundary.
 
-Runtime: `./blx` — a wrapper that runs the checkout-matched `bl-v2026.4` drop
-with this worktree's `priv/std` + `priv/lib` on `BEAM_LISP_PATH` (so the REAL
-`proc.sched`, `reload`, `vm.*` load) and a `z3` for the verifier tiers. The
-stderr line `env.bl: unknown key schedules` is a harmless env mismatch; `run.sh`
-filters it.
+Runtime: `./blx` — runs THIS checkout from source (`bin/bl`) with this worktree's
+`priv/std` + `priv/lib` on `BEAM_LISP_PATH` (so the REAL `proc.sched`, `reload`,
+`vm.*` load) and a `z3` for the verifier tiers. It used to exec a prebuilt
+`bl-v2026.4` drop; a prebuilt drop is a generation behind the tree it is asked to
+run, and the file is gone. The stderr line `env.bl: unknown key schedules` is a
+harmless env mismatch; `run.sh` filters it. After pulling main, run `./bin/bl build`
+once — a stale build tier is the one thing that makes a spike fail for a reason
+that is not the spike's.
 
 ## The spikes and what they prove
 
