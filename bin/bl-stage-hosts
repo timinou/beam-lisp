@@ -1,0 +1,484 @@
+#!/usr/bin/env escript
+%%! -noshell
+%% -*- erlang -*-
+%
+% bl-stage-hosts — put the bootstrap seed's pinned HOST beams on a build's code
+% path, VERIFIED, before the Elixir substrate is compiled.
+%
+% Why this exists
+% ---------------
+% `bin/bl`'s cold path turns `lib/**/*.ex` into beams with `elixirc`, and some
+% of those sources name a pinned HOST module at COMPILE time — `refs.ex` matches
+% `%BeamLisp.Delay{}`, which asks for `BeamLisp.Delay.__struct__/0` while
+% `refs.ex` is being compiled. `lib/beam_lisp/delay.ex` is already gone (the
+% module is seeded from `priv/host/delay.bl` instead), so a clean checkout has
+% nothing to answer that question and the cold bootstrap dies:
+%
+%     error: struct BeamLisp.Delay is undefined (module BeamLisp.Delay is not
+%     available or is yet to be defined)
+%     == Compilation error in file lib/beam_lisp/refs.ex ==
+%
+% The runtime installs those beams (`Bootstrap.install_hosts!/1`), but that runs
+% INSIDE the VM — after `elixirc`, too late for the compiler that needs them.
+% So the staging has to happen out here, in the launcher, and it has to happen
+% the same way every other consumer of the seed treats it: by SHA, never by
+% trust.
+%
+% What it does
+% ------------
+% Reads the seed MANIFEST, takes the pinned HOST beams it NAMES (its "hosts"
+% list — the same authority `Bootstrap.install!/1` consumes, so a pinned leaf
+% outside `Elixir.BeamLisp.*`, e.g. a protocol-impl module, can be staged; a
+% floor too old to carry the list falls back to the `Elixir.BeamLisp.*`-not-`Ns.*`
+% name rule), SHA-verifies each beam against the manifest, and copies it into
+% DEST_EBIN only when the destination is absent or drifted. A malformed or
+% duplicate host inventory is fatal.
+%
+% It also stages the seed's optional `app` resource (`beam_lisp.app`) — the term
+% OTP reads to START the application, without which a Mix-free cold tree dies
+% with `no such file or directory, beam_lisp.app`. Its SHA is verified with the
+% host set, BEFORE any destination write, and it is published only when
+% DEST_EBIN has none — the same "a floor is a bootstrap, not a correction" rule
+% `Bootstrap.install!/1` keeps, so a tree that built its own `.app` keeps it.
+%
+% Nothing is compiled; nothing is loaded; no build
+% runs (so there is no way for this to recurse into `bin/bl`). A corrupt seed is
+% FATAL and writes nothing.
+%
+% The manifest is Erlang TERM data (`manifest.term`, read with
+% `file:consult/1`): the stage PARSES a term, it never EVALUATES a program. The
+% old Elixir manifest had to be run (`Code.eval_file`), which meant spawning an
+% `elixir` VM to execute the seed's manifest HERE — before `elixirc`, before
+% `Ns.Rt` — with nothing to stop a hostile file from executing. A consulted term
+% can call nothing, and this escript's own Erlang node reads it, so the stage
+% needs neither Elixir nor the runtime it stages beams for.
+%
+% Usage
+% -----
+%   bin/bl-stage-hosts MANIFEST SEED_DIR DEST_EBIN
+%
+% MANIFEST is the seed's Erlang-term manifest (`manifest.term`), never the
+% legacy `manifest.exs`: the old Elixir file is a program, and this stage does
+% not run programs. A floor that still carries only `manifest.exs` is refused
+% with a message pointing at `bl seed`.
+%
+% Exit status: 0 when the stage is complete (including "already current"), 1
+% when the seed is missing, corrupt, or unreadable, 2 on a usage error.
+
+-mode(compile).
+
+-include_lib("kernel/include/file.hrl").
+
+main(Args) ->
+    {ok, _} = application:ensure_all_started(crypto),
+    case Args of
+        [Manifest, SeedDir, DestDir] ->
+            halt(stage_all(Manifest, SeedDir, DestDir));
+        _ ->
+            usage()
+    end.
+
+usage() ->
+    io:format(standard_error,
+              "usage: bl-stage-hosts MANIFEST SEED_DIR DEST_EBIN~n", []),
+    halt(2).
+
+% ── the stage ───────────────────────────────────────────────────────────────
+
+stage_all(Manifest, SeedDir, DestDir) ->
+    ManifestAbs = filename:absname(Manifest),
+    SeedAbs = filename:absname(SeedDir),
+    DestAbs = filename:absname(DestDir),
+    case read_manifest(ManifestAbs) of
+        {ok, Map} ->
+            Modules = manifest_modules(Map, ManifestAbs),
+            % The pinned host beams to stage: the manifest's own `hosts` list when
+            % it carries one (the same authority `Bootstrap.install!/1` consumes),
+            % else the prefix rule a pre-change floor was built under.
+            Hosts = host_entries(Map, Modules, ManifestAbs),
+            % VERIFY THE WHOLE SET BEFORE ANY OF IT IS USED, never the first
+            % beam at a time: a seed that is corrupt in its third entry must
+            % leave the destination exactly as it found it, the same
+            % verify-then-publish order the seed generator keeps for its own
+            % floor. So nothing is created or written until every pinned host
+            % beam has been read and matched against the manifest.
+            Verified = lists:map(fun({Name, Sha}) ->
+                                         verify_one(SeedAbs, Name, Sha)
+                                 end, Hosts),
+            % The optional `app` resource joins the same verify-then-publish
+            % order: its SHA is checked HERE, with the host set and before any
+            % destination write, so a malformed or corrupt app entry leaves
+            % DEST_EBIN exactly as it found it.
+            App = verify_app(Map, SeedAbs, ManifestAbs),
+            ok = ensure_dir(DestAbs),
+            % THE APP RESOURCE FIRST — `Bootstrap.install!/1`'s order, and for
+            % the same reason: OTP reads what to start from `beam_lisp.app`, so
+            % it must be in place before the application these beams belong to
+            % can start. Published only when the destination has none.
+            install_app(DestAbs, App),
+            lists:foreach(fun(Beam) -> install_one(DestAbs, Beam) end, Verified),
+            report(length(Verified), App, DestAbs),
+            0;
+        {error, Message} ->
+            fail(Message)
+    end.
+
+% A pinned HOST leaf by the LEGACY name rule: an `Elixir.BeamLisp.*` module that
+% is NOT part of the namespace generation ladder. This is `Bootstrap.host_leaf?/1`'s
+% rule, spelled with prefix patterns rather than string surgery so no other name
+% can slip in — and it is the FALLBACK for a floor too old to carry the explicit
+% `hosts` list (`host_entries/3`). A current floor names its host beams as DATA.
+is_host_leaf(<<"Elixir.BeamLisp.Ns.", _/binary>>) -> false;
+is_host_leaf(<<"Elixir.BeamLisp.", _/binary>>) -> true;
+is_host_leaf(_) -> false.
+
+verify_one(SeedDir, Name, Want) when is_binary(Want) ->
+    Source = filename:join(SeedDir, Name),
+    case file:read_file(Source) of
+        {error, Reason} ->
+            fail(io_lib:format("the seed does not carry ~ts (~p)", [Name, Reason]));
+        {ok, Bytes} ->
+            case sha256_hex(Bytes) of
+                Want -> {Name, Bytes, file_mode(Source), Want};
+                Got ->
+                    fail(io_lib:format(
+                           "the seed beam ~ts is CORRUPT~n  manifest: ~s~n  on disk:  ~s",
+                           [Name, Want, Got]))
+            end
+    end;
+verify_one(_SeedDir, Name, Want) ->
+    fail(io_lib:format(
+           "the seed manifest records ~ts with a non-string checksum: ~p",
+           [Name, Want])).
+
+% The optional `app` map: `#{<<"file">> => <<"beam_lisp.app">>,
+% <<"sha256">> => <<64 lowercase hex>>}`. ABSENT — no key, or the generator's
+% own `nil` for a floor built without an app resource — stages nothing, so a
+% pre-change seed keeps working. Any OTHER shape is FATAL: the `.app` is part of
+% the floor, and a floor that lies about it must not be half-installed.
+verify_app(Map, SeedDir, Manifest) ->
+    case maps:find(<<"app">>, Map) of
+        error ->
+            none;
+        {ok, nil} ->
+            none;
+        {ok, App} when is_map(App) ->
+            verify_app_map(App, SeedDir, Manifest);
+        {ok, Other} ->
+            fail(io_lib:format(
+                   "the seed manifest's \"app\" is not a map (~p): ~ts",
+                   [Other, Manifest]))
+    end.
+
+verify_app_map(App, SeedDir, Manifest) ->
+    % THE EXACT FILENAME. `Bootstrap.install!/1` reads `file` as a seed-root
+    % entry, so a name carrying a separator or `..` would let the manifest point
+    % the copy outside the seed directory. The one name OTP reads for this
+    % application is all that is accepted; anything else is refused.
+    case maps:find(<<"file">>, App) of
+        {ok, <<"beam_lisp.app">>} ->
+            ok;
+        {ok, File} when is_binary(File) ->
+            fail(io_lib:format(
+                   "the seed manifest's \"app\" file is not exactly "
+                   "beam_lisp.app: ~ts (~ts)", [File, Manifest]));
+        {ok, File} ->
+            fail(io_lib:format(
+                   "the seed manifest's \"app\" file is not a string: ~p (~ts)",
+                   [File, Manifest]));
+        error ->
+            fail(io_lib:format(
+                   "the seed manifest's \"app\" has no \"file\": ~ts",
+                   [Manifest]))
+    end,
+    case maps:find(<<"sha256">>, App) of
+        {ok, Sha} when is_binary(Sha) ->
+            case is_sha_hex(Sha) of
+                true ->
+                    verify_app_sha(SeedDir, Sha, Manifest);
+                false ->
+                    fail(io_lib:format(
+                           "the seed manifest's \"app\" sha256 is not 64 hex "
+                           "characters: ~p (~ts)", [Sha, Manifest]))
+            end;
+        {ok, Sha} ->
+            fail(io_lib:format(
+                   "the seed manifest's \"app\" sha256 is not a string: ~p (~ts)",
+                   [Sha, Manifest]));
+        error ->
+            fail(io_lib:format(
+                   "the seed manifest's \"app\" has no \"sha256\": ~ts",
+                   [Manifest]))
+    end.
+
+verify_app_sha(SeedDir, Want, Manifest) ->
+    Source = filename:join(SeedDir, "beam_lisp.app"),
+    case file:read_file(Source) of
+        {error, Reason} ->
+            fail(io_lib:format("the seed does not carry beam_lisp.app (~p): ~ts",
+                               [Reason, Manifest]));
+        {ok, Bytes} ->
+            case sha256_hex(Bytes) of
+                Want ->
+                    {<<"beam_lisp.app">>, Bytes, file_mode(Source)};
+                Got ->
+                    fail(io_lib:format(
+                           "the seed app resource beam_lisp.app is CORRUPT~n"
+                           "  manifest: ~s~n  on disk:  ~s", [Want, Got]))
+            end
+    end.
+
+is_sha_hex(Bin) when is_binary(Bin), byte_size(Bin) =:= 64 ->
+    lists:all(fun(C) ->
+                      (C >= $0 andalso C =< $9) orelse (C >= $a andalso C =< $f)
+              end, binary_to_list(Bin));
+is_sha_hex(_) ->
+    false.
+
+% The destination is written only when it is absent or drifted, so a warm tree
+% does no writing at all. A file that already holds the pinned bytes is left
+% untouched (its mtime stays put, which keeps `find -newer` judgements honest).
+install_one(DestDir, {Name, Bytes, Mode, Want}) ->
+    Dest = filename:join(DestDir, Name),
+    case file:read_file(Dest) of
+        {ok, DestBytes} ->
+            case sha256_hex(DestBytes) of
+                Want -> ok;
+                _ -> write_atomic(Dest, Bytes, Mode)
+            end;
+        _ ->
+            write_atomic(Dest, Bytes, Mode)
+    end.
+
+% The app resource is published ONLY when the destination has NONE: a floor is a
+% bootstrap, not a correction, so a tree that ran `bl build` — which writes its
+% own `beam_lisp.app` from the current project value — keeps its own. The bytes
+% were SHA-verified in `verify_app/3` BEFORE any write, so a corrupt floor is
+% refused even when the destination would not have been touched.
+install_app(_DestDir, none) ->
+    ok;
+install_app(DestDir, {Name, Bytes, Mode}) ->
+    Dest = filename:join(DestDir, Name),
+    case file:read_file_info(Dest) of
+        {ok, _} ->
+            ok;
+        _ ->
+            write_atomic(Dest, Bytes, Mode)
+    end.
+
+% Write-then-rename: a reader sees the old beam or the new one, never a torn
+% file (the same publish discipline every other writer in this tree keeps). The
+% temp name is in the DESTINATION directory, so the rename is a same-filesystem
+% atomic replace, and the source's mode is carried over so a staged file keeps
+% the permissions the seed gave it.
+write_atomic(Dest, Bytes, Mode) ->
+    % `filename:join/2` promotes to a binary once any part is one, and the seed
+    % entry names are binaries — so build the temp name in binaries too, never
+    % `++` a list onto it. The OS pid is in the name beside the VM-local unique
+    % integer: two `bl` runs in separate VMs share neither counter, and this
+    % stage may run in both at once.
+    Tmp = <<Dest/binary, ".tmp.", (tmp_tag())/binary>>,
+    case file:write_file(Tmp, Bytes) of
+        ok ->
+            _ = set_mode(Tmp, Mode),
+            case file:rename(Tmp, Dest) of
+                ok ->
+                    ok;
+                {error, Reason} ->
+                    _ = file:delete(Tmp),
+                    fail(io_lib:format("cannot stage ~ts: ~p",
+                                       [filename:basename(Dest), Reason]))
+            end;
+        {error, Reason} ->
+            fail(io_lib:format("cannot write ~ts: ~p", [Tmp, Reason]))
+    end.
+
+set_mode(_Path, undefined) -> ok;
+set_mode(Path, Mode) -> file:change_mode(Path, Mode).
+
+file_mode(Path) ->
+    case file:read_file_info(Path) of
+        {ok, #file_info{mode = Mode}} -> Mode;
+        _ -> undefined
+    end.
+
+ensure_dir(Dir) ->
+    case filelib:ensure_dir(filename:join(Dir, "x")) of
+        ok -> ok;
+        {error, Reason} ->
+            fail(io_lib:format("cannot create ~ts: ~p", [Dir, Reason]))
+    end.
+
+report(Count, App, Dest) ->
+    Note =
+        case App of
+            none -> <<"no app resource in the seed">>;
+            {Name, _, _} -> <<"app resource ", Name/binary>>
+        end,
+    io:format(standard_error,
+              "bl-stage-hosts: ~p pinned host beams staged into ~ts (~ts)~n",
+              [Count, Dest, Note]).
+
+% ── reading the manifest ────────────────────────────────────────────────────
+
+% `manifest.term` is Erlang TERM data: this script CONSULTS it
+% (`file:consult/1`), it never EVALUATES it. That is the point of the format —
+% the old Elixir manifest was a program (`Code.eval_file`), so reading it meant
+% spawning an `elixir` VM to RUN a file this stage is meant to only READ, before
+% `elixirc` has compiled anything and with nothing to stop a hostile file from
+% executing. A consulted term can call nothing, so the seed is data all the way
+% down.
+read_manifest(Manifest) ->
+    case filelib:is_regular(Manifest) of
+        false ->
+            {error, io_lib:format(
+                      "the bootstrap seed manifest is missing: ~ts "
+                      "(a floor that predates the Erlang-term manifest carries "
+                      "manifest.exs; regenerate it with `bl seed`)",
+                      [Manifest])};
+        true ->
+            % The one wrong file a reader is likely to reach for: the legacy
+            % Elixir manifest it used to be given. Name it as such — a generic
+            % consult syntax error (`illegal character` on the `#` header) says
+            % what is wrong but not what to do.
+            case is_legacy_exs(Manifest) of
+                true ->
+                    {error, io_lib:format(
+                              "the seed manifest given is the LEGACY Elixir file: ~ts~n"
+                              "  this stage reads the data-only Erlang-term manifest "
+                              "(`manifest.term`); an Elixir manifest would have to be "
+                              "EVALUATED, which is exactly what it must not do. "
+                              "Regenerate the floor with `bl seed`",
+                              [Manifest])};
+                false ->
+                    consult_manifest(Manifest)
+            end
+    end.
+
+% Whether `Path` names the legacy Elixir manifest. `filename:extension/1`
+% returns a list for a list path and a binary for a binary one, and escript
+% ARGV arrives as lists — normalize before comparing, or the check silently
+% never fires (measured).
+is_legacy_exs(Path) ->
+    case filename:extension(Path) of
+        Ext when is_binary(Ext) -> Ext =:= <<".exs">>;
+        Ext -> unicode:characters_to_binary(Ext) =:= <<".exs">>
+    end.
+
+consult_manifest(Manifest) ->
+    case file:consult(Manifest) of
+        {ok, [Map]} when is_map(Map) ->
+            {ok, Map};
+        {ok, [Other]} ->
+            {error, io_lib:format(
+                      "the bootstrap seed manifest is not an Erlang map: ~ts~n"
+                      "  read: ~p", [filename:basename(Manifest), Other])};
+        {ok, Terms} ->
+            {error, io_lib:format(
+                      "the bootstrap seed manifest must hold exactly one term, "
+                      "found ~p: ~ts", [length(Terms), Manifest])};
+        {error, {Line, Mod, Reason}} ->
+            {error, io_lib:format(
+                      "the bootstrap seed manifest is not readable "
+                      "(~ts, line ~p): ~ts",
+                      [filename:basename(Manifest), Line, Mod:format_error(Reason)])}
+    end.
+
+manifest_modules(Map, Manifest) ->
+    case maps:find(<<"modules">>, Map) of
+        {ok, Modules} when is_map(Modules) ->
+            Modules;
+        _ ->
+            fail(io_lib:format(
+                   "the seed manifest has no \"modules\" map: ~ts", [Manifest]))
+    end.
+
+% The pinned host beams to stage, as `[{Name, Sha}]` in the manifest's own
+% order.
+%
+% A manifest with an explicit "hosts" list is the AUTHORITY — the same list
+% `Bootstrap.install!/1` consumes — so a pinned leaf OUTSIDE `Elixir.BeamLisp.*`
+% (a protocol-impl module compiled beside its host source, e.g.
+% `Elixir.Enumerable.BeamLisp.Set`) can be named. Every entry is validated
+% against "modules" FIRST: it must be a leaf beam the floor carries (so it is
+% SHA-checked below), never a `Elixir.BeamLisp.Ns.*` generation-ladder module,
+% and neither malformed nor duplicated. A malformed inventory is FATAL — the
+% stage writes nothing — never guessed around.
+%
+% An OLDER floor carries no "hosts" key: fall back to the prefix rule those
+% floors were built under, so a pre-change committed seed stages exactly what it
+% staged before.
+host_entries(Map, Modules, Manifest) ->
+    case maps:find(<<"hosts">>, Map) of
+        {ok, Names} when is_list(Names) ->
+            ok = validate_hosts(Names, Modules, Manifest),
+            [{Name, maps:get(Name, Modules)} || Name <- Names];
+        {ok, Other} ->
+            fail(io_lib:format(
+                   "the seed manifest's \"hosts\" is not a list (~p): ~ts",
+                   [Other, Manifest]));
+        error ->
+            lists:sort([{Name, Sha} || {Name, Sha} <- maps:to_list(Modules),
+                                        is_host_leaf(Name)])
+    end.
+
+validate_hosts(Names, Modules, Manifest) ->
+    lists:foreach(fun(Name) -> validate_host(Name, Modules, Manifest) end, Names),
+    case length(lists:usort(Names)) =:= length(Names) of
+        true ->
+            ok;
+        false ->
+            fail(io_lib:format(
+                   "the seed manifest lists a pinned host more than once: ~ts",
+                   [Manifest]))
+    end.
+
+validate_host(Name, Modules, Manifest) when is_binary(Name) ->
+    case Name of
+        <<"Elixir.BeamLisp.Ns.", _/binary>> ->
+            fail(io_lib:format(
+                   "the seed manifest lists a generation-ladder module as a pinned "
+                   "host: ~ts (~ts)", [Name, Manifest]));
+        _ ->
+            ok
+    end,
+    case {filename:basename(Name), filename:extension(Name)} of
+        {Name, <<".beam">>} ->
+            case maps:is_key(Name, Modules) of
+                true ->
+                    ok;
+                false ->
+                    fail(io_lib:format(
+                           "the seed manifest lists pinned host ~ts that is absent "
+                           "from its \"modules\" map: ~ts", [Name, Manifest]))
+            end;
+        _ ->
+            fail(io_lib:format(
+                   "the seed manifest lists a malformed pinned host name: ~ts (~ts)",
+                   [Name, Manifest]))
+    end;
+validate_host(Name, _Modules, Manifest) ->
+    fail(io_lib:format(
+           "the seed manifest lists a malformed pinned host entry: ~p (~ts)",
+           [Name, Manifest])).
+
+% A tag unique BOTH within this VM and across VMs: `unique_integer/1` is only
+% unique inside one VM, and two concurrent `bl` runs each have their own.
+tmp_tag() ->
+    <<(integer_to_binary(erlang:unique_integer([positive])))/binary, ".",
+      (unicode:characters_to_binary(os:getpid()))/binary>>.
+
+% ── bytes ───────────────────────────────────────────────────────────────────
+
+sha256_hex(Bin) ->
+    Digest = crypto:hash(sha256, Bin),
+    << <<(hex(Nibble))>> || <<Nibble:4>> <= Digest >>.
+
+hex(Nibble) when Nibble < 10 -> $0 + Nibble;
+hex(Nibble) -> $a + (Nibble - 10).
+
+% ── failure ─────────────────────────────────────────────────────────────────
+
+fail(Message) ->
+    io:format(standard_error, "bl-stage-hosts: ~ts~n", [Message]),
+    halt(1).

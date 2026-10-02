@@ -494,7 +494,7 @@ round.
    rendering one writes a document and does not index this tree."
   []
   (BeamLisp.Loader/ensure_loaded "mcp.skill")
-  (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "mcp.skill" "db") (list)))
+  (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "mcp.skill" "db") (list)))
 
 (defn- skill-steps
   "Write the skill for one found agent. Returns the one-line detail the report
@@ -502,10 +502,10 @@ round.
   [agent ctx]
   (let [where (skills-dir (:dir ctx) (get agent "root"))]
     (BeamLisp.Loader/ensure_loaded "mcp.skill")
-    (let [paths (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "mcp.skill" "write!")
+    (let [paths (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "mcp.skill" "write!")
                                     (list where (corpus)))]
       (str (count (to-list paths)) " files, v"
-           (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "mcp.skill" "version") (list))
+           (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "mcp.skill" "version") (list))
            " — " (u/rel-path where)))))
 
 (defn- agent-install
@@ -514,9 +514,9 @@ round.
    directory exists before a config file lands in it."
   [agent ctx]
   (let [name (get agent "name")
-        seen (BeamLisp.RT/invoke (get agent "detect") (list ctx))
+        seen (BeamLisp.Ns.Rt/invoke (get agent "detect") (list ctx))
         skill (skill-steps agent ctx)
-        reg (BeamLisp.RT/invoke (get agent "register") (list ctx))]
+        reg (BeamLisp.Ns.Rt/invoke (get agent "register") (list ctx))]
     [{:name name :ok (not (contains? reg :error)) :detail (str "found — " seen)}
      (step (str name " skill") {:ok skill})
      (step (str name " server")
@@ -529,7 +529,7 @@ round.
   [ctx]
   (into []
         (keep (fn [a]
-                (let [seen (BeamLisp.RT/invoke (get a "detect") (list ctx))]
+                (let [seen (BeamLisp.Ns.Rt/invoke (get a "detect") (list ctx))]
                   (if (some? seen) [a seen] nil)))
               agents)))
 
@@ -563,7 +563,7 @@ skill whose idioms have moved.
   [agent ctx]
   (let [where (skills-dir (:dir ctx) (get agent "root"))]
     (BeamLisp.Loader/ensure_loaded "mcp.skill")
-    (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "mcp.skill" "stale?") (list where))))
+    (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "mcp.skill" "stale?") (list where))))
 
 (defn- check-mcp [dir-arg]
   (let [dir (u/resolve (or dir-arg "."))
@@ -580,7 +580,7 @@ skill whose idioms have moved.
               name (get agent "name")
               where (skills-dir dir (get agent "root"))
               status (skill-status agent context)
-              registered (BeamLisp.RT/invoke (get agent "registered?") (list context))]
+              registered (BeamLisp.Ns.Rt/invoke (get agent "registered?") (list context))]
           [{:name (str name " skill")
             :ok (= status :current)
             :detail (cond
@@ -950,7 +950,7 @@ the corpus assembles.
   [_arg]
   (BeamLisp.Loader/ensure_loaded "z3-asset")
   (asset-steps "z3"
-               (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "z3-asset" "fetch!") (list))))
+               (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "z3-asset" "fetch!") (list))))
 
 (defn- embed-fetch-steps
   [arg]
@@ -959,15 +959,15 @@ the corpus assembles.
                {:dir (u/resolve arg) :bundle false :force false}
                {:bundle false :force false})]
     (asset-steps "embed"
-                 (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "embed-asset" "fetch!") (list opts)))))
+                 (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "embed-asset" "fetch!") (list opts)))))
 
 (defn- embed-check-steps
   "The `--check` half for the embedding: present or not, WITHOUT downloading."
   [_arg]
   (BeamLisp.Loader/ensure_loaded "embed-asset")
-  (let [dir (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "embed-asset" "dest-for")
+  (let [dir (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "embed-asset" "dest-for")
                                 (list {:bundle false}))
-        ok (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "embed-asset" "fetched?")
+        ok (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "embed-asset" "fetched?")
                                (list dir))]
     [{:name "embedding" :ok (= true ok)
       :detail (if (= true ok) (str "present — " dir) (str "absent — run: bl install embed"))}]))

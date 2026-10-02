@@ -42,8 +42,11 @@
 
 use rustler::{Atom, Binary, Encoder, Env, Error, NifResult, OwnedBinary, Resource, ResourceArc, Term};
 use rustler::types::map::map_new;
+use std::collections::HashMap;
+use std::fs::{self, File, TryLockError};
 use std::io::Write;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 
@@ -68,6 +71,35 @@ mod atoms {
         // own stdlib atoms use: `false_ = "false"`).
         true_ = "true",
         false_ = "false",
+        // `fjall_count_range` keys. KEYS ONLY: the count a semi-join gate asks
+        // for before choosing a multi-prefix read over one column scan, and
+        // `capped` says whether the walk stopped at the limit (more may
+        // follow) or ran the range out (the count is exact).
+        count,
+        capped,
+        // `fjall_stats` keys. The engine's own reporting surface: compaction,
+        // flushing, journal and disk accounting, plus the block cache's
+        // capacity. NONE of it was readable before this NIF, which is why
+        // "the cache is too small" and "compaction has never been observed"
+        // were inferences rather than measurements.
+        cache_capacity,
+        write_buffer,
+        flushes_completed,
+        active_compactions,
+        compactions_completed,
+        time_compacting_us,
+        journal_count,
+        journal_bytes,
+        disk_bytes,
+        partitions,
+        // The tag `fjall_open` refuses with when the store's directory is
+        // already held by an exclusive OS lock. It is what makes that refusal
+        // a TYPED answer — `{:error, {:already_open, path}}` — and therefore
+        // distinguishable from every `err()` reply, which is a binary
+        // describing an I/O or engine failure. "Another process owns this
+        // store" is not "this store is broken", and a caller has to be able
+        // to tell them apart.
+        already_open,
     }
 }
 
@@ -80,7 +112,158 @@ mod atoms {
 pub(crate) struct DbHandle {
     pub(crate) keyspace: Keyspace,
     pub(crate) datoms: PartitionHandle,
-    pub(crate) lock: Mutex<()>,
+    /// Serializes `-cas` and each write batch. SHARED, because two handles over
+    /// one store directory are two views of ONE engine: the lock that makes a
+    /// read-modify-write atomic belongs to the store, not to whichever handle
+    /// happened to open it.
+    pub(crate) lock: Arc<Mutex<()>>,
+    /// The exclusive ownership of this store's directory. Declared LAST so it
+    /// drops after this handle's own `keyspace`/`datoms`/`lock` clones. Holding
+    /// the flock THROUGH the engine's teardown is not this ordering's job: it
+    /// lives inside `StoreClaim`, whose `engine` field precedes its `_lock`
+    /// (see RELEASE ORDER there).
+    _claim: Arc<StoreClaim>,
+}
+
+/// The one open engine over a store directory, shared by every handle in this
+/// image that opens that directory.
+struct StoreEngine {
+    keyspace: Keyspace,
+    datoms: PartitionHandle,
+    lock: Arc<Mutex<()>>,
+}
+
+/// The process-wide claim on ONE canonical store directory.
+///
+/// WHY THIS EXISTS. fjall takes no lock of its own, so two OS processes
+/// opening one keyspace directory write the same segment files: a CORRUPTION,
+/// not a slower read. The datom layer already serialises writers WITHIN a
+/// process (`datom.conn`'s single-transactor registry), but nothing stopped a
+/// second process — a store root is a directory a user can point two `bl
+/// serve`s at, and a stale owner is indistinguishable from an absent one until
+/// the segment files are already interleaved.
+///
+/// WHAT IT IS. A directory-level `flock(2)` — the standard exclusive OS lock,
+/// taken through `std::fs::File::try_lock` — held for as long as the handle
+/// that took it. There is no lock FILE, so there is nothing to leave behind
+/// and no PID to compare: the kernel drops the lock when the fd closes, which
+/// is either the resource's drop (a normal close) or the process's death (a
+/// crash, a SIGKILL). No stale-lock heuristic exists to get wrong.
+///
+/// Because the lock is on the INODE, a symlink, a relative path or a `..`
+/// alias reaches the same lock. The path is `canonicalize`d before the claim
+/// so that the registry below agrees with the kernel about which directory is
+/// which — one identity for the map, the flock and the engine.
+///
+/// Reuse inside one PROCESS is not refused, and does not open a second engine.
+/// `datom.conn`'s own semantics let a store be opened more than once in one
+/// image (a probe handle, a reconnect), and the honest reading is that those
+/// are two VIEWS of one store — so a same-process open joins this claim and
+/// shares this engine. (A second `flock` on a fresh fd would be refused even
+/// here: the lock belongs to the open file description, not to the process, so
+/// the registry is what makes the distinction the kernel cannot make.)
+///
+/// RELEASE ORDER — the reason these two fields are in this order. Rust drops a
+/// struct's fields in DECLARATION order, and the order that is correct here is
+/// `engine` FIRST and `_lock` LAST. Engine teardown is not a no-op: fjall's
+/// `Keyspace` drop stops and JOINS its background flush/compaction threads
+/// (which may be mid-flush, writing segment files) and its journal drop
+/// persists with `PersistMode::SyncAll`. Releasing the flock first leaves the
+/// directory unowned for exactly that window — the corruption this type exists
+/// to prevent, reopened at the one moment a second owner is most likely to
+/// appear (the old one's shutdown). The unit test at the foot of this file
+/// pins the order against THIS declaration: it builds the same `StoreClaim<E>`
+/// production declares, with a recording engine, so swapping the two fields
+/// fails a test rather than only a comment.
+///
+/// `E` is that engine — `StoreEngine` in production, the recording stand-in in
+/// the test. The parameter exists so the order under test is the real type's
+/// release order, not a copy of it kept in sync by hand.
+struct StoreClaim<E = StoreEngine> {
+    /// The one engine over this directory, shared by every handle that joins
+    /// this claim. Declared FIRST so it drops FIRST — see RELEASE ORDER above.
+    engine: E,
+    /// The fd whose `flock` IS the ownership. Dropping this claim — the LAST
+    /// `Arc` — closes it and releases the lock, so it is declared LAST: the
+    /// directory stays ours until the engine over it is gone.
+    _lock: File,
+}
+
+/// Canonical path → a WEAK claim. Weak, not strong, so the registry never
+/// keeps a store alive: an entry dies with its last handle, and THAT death is
+/// what releases the flock, while a dead `Weak` left behind is simply a miss
+/// on the next open. A dead entry is PRUNED, not merely tolerated: every
+/// `claim_store` retains only the live entries under this same lock before it
+/// looks one up, so the map is bounded by the stores actually open rather than
+/// by every store the process has ever opened (the codebase cache opens one
+/// scratch store per namespace and content hash, and a per-request store would
+/// otherwise grow this map for the life of the process).
+fn claims() -> &'static Mutex<HashMap<PathBuf, Weak<StoreClaim>>> {
+    static CLAIMS: OnceLock<Mutex<HashMap<PathBuf, Weak<StoreClaim>>>> = OnceLock::new();
+    CLAIMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Why a store could not be claimed.
+enum ClaimError {
+    /// The directory exists and someone else owns it — another process, or a
+    /// lock that outlived the handle that took it.
+    Held(PathBuf),
+    /// The path could not be created, canonicalized, or opened.
+    Io(std::io::Error),
+    /// The directory is ours, but the engine over it would not open.
+    Engine(fjall::Error),
+}
+
+/// Take (or join) the exclusive claim on `path`'s directory, opening the one
+/// engine if this is the first handle for it.
+///
+/// The claim and its engine are created under ONE lock, before any caller can
+/// see either: a same-process open of the same directory must join this claim
+/// rather than take a `flock` of its own, which the OS would refuse — the lock
+/// is on the open file description, so a second fd in the SAME process is a
+/// second owner as far as the kernel is concerned.
+///
+/// The claim is taken BEFORE the engine opens: two processes racing to create
+/// the same store must not both reach `Config::open`, or the loser has already
+/// begun writing segments it must not touch. A flock taken and then abandoned
+/// by a failed open is released when its `File` drops.
+fn claim_store(path: &Path) -> Result<Arc<StoreClaim>, ClaimError> {
+    // The directory must exist to be canonicalized and opened. fjall creates
+    // it too, later, when it is already ours.
+    fs::create_dir_all(path).map_err(ClaimError::Io)?;
+    // Collapse symlinks, relative paths and trailing separators to the one
+    // real directory, so the map keys the same way the kernel's flock does.
+    let canon = fs::canonicalize(path).map_err(ClaimError::Io)?;
+    let mut claims = claims().lock().unwrap_or_else(|e| e.into_inner());
+    // A DEAD entry is a MISS, not a claim — but it is not left to rot either.
+    // Dropping the dead ones here (we hold the lock, so the sweep is free)
+    // bounds the registry by the stores that are open rather than by every
+    // store ever opened, and it runs BEFORE the lookup so the entry consulted
+    // below is either live or absent.
+    claims.retain(|_, w| w.strong_count() > 0);
+    if let Some(claim) = claims.get(&canon).and_then(Weak::upgrade) {
+        return Ok(claim);
+    }
+    let dir = File::open(&canon).map_err(ClaimError::Io)?;
+    match dir.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Err(ClaimError::Held(canon)),
+        Err(TryLockError::Error(e)) => return Err(ClaimError::Io(e)),
+    }
+    let keyspace = Config::new(&canon).open().map_err(ClaimError::Engine)?;
+    let datoms = keyspace
+        .open_partition("datoms", PartitionCreateOptions::default())
+        .map_err(ClaimError::Engine)?;
+    let claim = Arc::new(StoreClaim {
+        _lock: dir,
+        engine: StoreEngine {
+            keyspace,
+            datoms,
+            lock: Arc::new(Mutex::new(())),
+        },
+    });
+    claims.insert(canon, Arc::downgrade(&claim));
+    Ok(claim)
 }
 
 #[rustler::resource_impl]
@@ -102,18 +285,70 @@ fn to_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Binary<'a>> {
 /// An empty database and a missing partition are the same thing to every
 /// caller above, so the partition is created eagerly: a read against a
 /// brand-new database sees an empty partition, never a "no such partition".
+///
+/// EXCLUSIVE OWNERSHIP FIRST. The claim (`StoreClaim`) is taken before the
+/// engine is opened and is held until this handle drops, so a second OS process
+/// is refused a store that is already being written. The refusal is TYPED —
+/// `{:error, {:already_open, canonical-path}}` — and not the binary `err()` an
+/// I/O failure carries: "another process owns this store" is a different answer
+/// from "this store is broken", and the caller must be able to choose between
+/// them. A claim taken and then abandoned by a failed open is released when its
+/// `File` drops.
+///
+/// A SECOND handle for the same directory in the SAME process JOINS the claim
+/// and shares its engine and write lock, so it is a view of one store rather
+/// than a second LSM instance over the same segment files.
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_open<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
-    let keyspace = Config::new(&path).open().map_err(|e| err(e))?;
-    let datoms = keyspace
-        .open_partition("datoms", PartitionCreateOptions::default())
-        .map_err(|e| err(e))?;
+    let claim = match claim_store(Path::new(&path)) {
+        Ok(claim) => claim,
+        Err(ClaimError::Held(canon)) => {
+            return Err(Error::Term(Box::new((
+                atoms::already_open(),
+                canon.to_string_lossy().into_owned(),
+            ))))
+        }
+        Err(ClaimError::Io(e)) => return Err(err(e)),
+        Err(ClaimError::Engine(e)) => return Err(err(e)),
+    };
     let arc = ResourceArc::new(DbHandle {
-        keyspace,
-        datoms,
-        lock: Mutex::new(()),
+        keyspace: claim.engine.keyspace.clone(),
+        datoms: claim.engine.datoms.clone(),
+        lock: claim.engine.lock.clone(),
+        _claim: claim,
     });
     Ok(arc.encode(env))
+}
+
+/// `fjall_canonical_path`: the ONE directory a store path REFERS TO — the
+/// identity the claim's flock, the registry and the engine are all keyed by.
+///
+/// WHY IT IS A NIF. This is a realpath question and bl's `File` surface has no
+/// realpath: `fs::canonicalize` collapses a symlink, a `..`, a trailing
+/// separator and a relative path onto the one real directory, which is what
+/// lets the claim agree with the kernel (the flock is on the inode) about
+/// which directory a store IS.
+///
+/// WHY IT IS EXPOSED. The claim already canonicalizes for the flock; the bl
+/// layer derives TWO more things from a store's path — the record's `:path`
+/// and the blob sibling `<path>.blobs` — and after this commit a same-process
+/// open through an alias is no longer refused, it JOINS the claim. If the
+/// record kept the caller's spelling, those two spellings would share one datom
+/// log and yet write their bytes to two different sibling directories, so a
+/// datom read through the alias would name a blob only the other spelling can
+/// find. Asking the same canonicalization native here is what makes `:path`,
+/// the blob dir, the engine and the flock one identity.
+///
+/// Creates the directory first, exactly as `fjall-open` does, so a brand-new
+/// store canonicalizes rather than failing. Returns the canonical path, or
+/// `{:error, reason}` — the same shape every other native failure takes — so a
+/// caller handles it the way it already handles a `fjall-open` failure.
+#[rustler::nif]
+fn fjall_canonical_path<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
+    let p = Path::new(&path);
+    fs::create_dir_all(p).map_err(|e| err(e))?;
+    let canon = fs::canonicalize(p).map_err(|e| err(e))?;
+    Ok(to_binary(env, canon.to_string_lossy().as_bytes())?.to_term(env))
 }
 
 /// `-get`: the value at `key`, or `nil`.
@@ -212,6 +447,65 @@ fn fjall_range_chunk<'a>(
         ));
     }
     Ok(pairs.encode(env))
+}
+
+/// `fjall_count_range`: how many KEYS lie in `[start, stop]`, counting at most
+/// `limit` of them.
+///
+/// The counter the engine's semi-join gate asks before choosing between a
+/// multi-prefix read and one column scan. That gate needs the SIZE OF ITS
+/// TARGET COLUMN, and an earlier clause's scan cannot tell it: a query's first
+/// scan may be of a column two rows wide while the semi-join targets one two
+/// hundred rows wide. So the size is asked of the column ITSELF.
+///
+/// KEYS ONLY. The value of every entry is dropped unread, so no datom is
+/// decoded and no term is constructed — the answer is one integer pair, not
+/// rows — and the walk stops the moment `limit` keys have been seen. So the
+/// cost is `min(range, limit)`, and `limit` is chosen from the number of
+/// prefixes being judged: asking is never proportional to the column.
+///
+/// Returns `{count, capped}`. `capped` says the range holds AT LEAST `limit`
+/// keys, so `count` is `min(range, limit)` and is EXACT exactly when `capped`
+/// is false. The break happens ON the `limit`-th key — never one step past it —
+/// so a range holding exactly `limit` keys is not read past its end to find out.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_count_range<'a>(
+    env: Env<'a>,
+    handle: ResourceArc<DbHandle>,
+    start: Option<Binary>,
+    stop: Option<Binary>,
+    limit: usize,
+) -> NifResult<Term<'a>> {
+    use std::ops::Bound;
+    let lower = match &start {
+        Some(b) => Bound::Included(b.as_slice().to_vec()),
+        None => Bound::Unbounded,
+    };
+    let upper = match &stop {
+        Some(b) => Bound::Included(b.as_slice().to_vec()),
+        None => Bound::Unbounded,
+    };
+
+    let mut n: usize = 0;
+    // A zero limit counts nothing and settles nothing, so it reports `capped`
+    // (the range was NOT shown to be empty). A degenerate input, and it must
+    // not cost a key read.
+    if limit > 0 {
+        for entry in handle.datoms.range((lower, upper)) {
+            // The value is dropped UNREAD — counting a range must never pay a
+            // datom decode. `entry?` still surfaces an I/O error, which is a
+            // failed count and must not read as an empty range.
+            entry.map_err(|e| err(e))?;
+            n += 1;
+            if n >= limit {
+                break;
+            }
+        }
+    }
+    let out = map_new(env)
+        .map_put(atoms::count(), n as u64)?
+        .map_put(atoms::capped(), n >= limit)?;
+    Ok(out)
 }
 
 // ══ the datom read path: one crossing, decoded natively ═════════════
@@ -772,6 +1066,35 @@ fn fjall_delete(handle: ResourceArc<DbHandle>, key: Binary) -> NifResult<Atom> {
 /// once at the end of a transaction (or a bulk load), turning N per-group
 /// fsyncs into one. This is the durability boundary a caller can rely on: after
 /// it returns, every prior put/delete/commit is on disk.
+/// Engine statistics, for the questions only the engine can answer: how full the
+/// block cache is, whether compaction runs at all, how much of the disk is the
+/// journal.
+///
+/// WHY THIS EXISTS. `lsm-tree`'s block cache exposes `size`/`capacity`/`len` and
+/// NO hit/miss counters, so the "block cache hit rate" cannot be measured — ever,
+/// on this stack. What CAN be measured is what a hit rate is a proxy for: how
+/// much the read path pulls from the OS (see the `rchar` deltas in
+/// knowledger's `semantica/benches/bench-s93.bl`) and how full the cache is.
+/// This NIF is the second half; without it, cache sizing was an inference.
+///
+/// Cheap and side-effect free: it reads atomics the engine already maintains.
+#[rustler::nif]
+fn fjall_stats<'a>(env: Env<'a>, handle: ResourceArc<DbHandle>) -> NifResult<Term<'a>> {
+    let ks = &handle.keyspace;
+    let m = map_new(env)
+        .map_put(atoms::cache_capacity(), ks.cache_capacity())?
+        .map_put(atoms::write_buffer(), ks.write_buffer_size())?
+        .map_put(atoms::flushes_completed(), ks.flushes_completed())?
+        .map_put(atoms::active_compactions(), ks.active_compactions())?
+        .map_put(atoms::compactions_completed(), ks.compactions_completed())?
+        .map_put(atoms::time_compacting_us(), ks.time_compacting().as_micros() as u64)?
+        .map_put(atoms::journal_count(), ks.journal_count())?
+        .map_put(atoms::journal_bytes(), ks.journal_disk_space())?
+        .map_put(atoms::disk_bytes(), ks.disk_space())?
+        .map_put(atoms::partitions(), ks.partition_count())?;
+    Ok(m)
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_sync(handle: ResourceArc<DbHandle>) -> NifResult<Atom> {
     let _g = handle.lock.lock().map_err(|e| err(e))?;
@@ -1062,6 +1385,121 @@ fn __nif_loaded__() -> bool {
 }
 
 rustler::init!("Elixir.BeamLisp.Native.Datom.StoreFjall");
+
+// ══ the claim's release order and registry lifetime, pinned ══════════
+//
+// The correctness argument for `StoreClaim`'s field order is at its definition.
+// These tests hold it to that argument. They build the SAME generic declaration
+// production builds — only the engine type is swapped for a recorder — so they
+// observe the real release order, and they drive `claim_store` itself, so the
+// pruning is the behaviour of the function that takes claims, not a restatement
+// of `retain`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A fresh, unique directory under the system temp dir, created, so a test
+    /// never inherits a store (or its flock) from a previous run.
+    fn tmp_dir(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "datom-fjall-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create the temp store dir");
+        dir
+    }
+
+    /// An engine whose whole job is to look, at the instant it drops, at
+    /// whether the claim's flock is still held.
+    struct ProbeEngine {
+        dir: PathBuf,
+        held_at_drop: Rc<Cell<Option<bool>>>,
+    }
+
+    impl Drop for ProbeEngine {
+        fn drop(&mut self) {
+            // A second `open` + `try_lock` in THIS process is a second OPEN
+            // FILE DESCRIPTION, so it conflicts with the claim's flock exactly
+            // as another process's would — a flock belongs to the description,
+            // not to the process. `WouldBlock` therefore means the directory is
+            // still ours, which can only be true if `_lock` drops AFTER this
+            // field does.
+            let probe = File::open(&self.dir).expect("reopen the store dir to probe it");
+            let still_ours = matches!(probe.try_lock(), Err(TryLockError::WouldBlock));
+            self.held_at_drop.set(Some(still_ours));
+        }
+    }
+
+    /// The field order in `StoreClaim` IS the release order (Rust drops a
+    /// struct's fields in declaration order), and this asserts it on the same
+    /// generic type production uses — only the engine is swapped, so swapping
+    /// the two fields fails HERE rather than only in a doc comment.
+    #[test]
+    fn the_flock_outlives_the_engine() {
+        let dir = tmp_dir("droporder");
+        let lock = File::open(&dir).expect("open the claim's lock fd");
+        lock.try_lock().expect("the claim takes the flock");
+        let held_at_drop = Rc::new(Cell::new(None));
+        let claim = StoreClaim {
+            engine: ProbeEngine { dir: dir.clone(), held_at_drop: held_at_drop.clone() },
+            _lock: lock,
+        };
+
+        assert_eq!(held_at_drop.get(), None, "the engine is alive until the claim drops");
+        drop(claim);
+        assert_eq!(
+            held_at_drop.get(),
+            Some(true),
+            "the engine must tear down while the store is STILL flocked — \
+             `engine` must be declared before `_lock` in StoreClaim"
+        );
+
+        // ... and the flock is gone once the whole claim has dropped, so the
+        // ordering does not turn ownership into a leak.
+        let after = File::open(&dir).expect("reopen after the claim dropped");
+        assert!(after.try_lock().is_ok(), "the flock is released with the claim");
+        drop(after);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A claim that has DIED must not linger in the registry: every
+    /// `claim_store` retains only live entries, so the map is bounded by the
+    /// stores actually open rather than by every store ever opened.
+    #[test]
+    fn the_registry_prunes_dead_claims() {
+        let a = tmp_dir("prune-a");
+        let b = tmp_dir("prune-b");
+        drop(claim_store(&a).unwrap_or_else(|_| panic!("claim a")));
+        drop(claim_store(&b).unwrap_or_else(|_| panic!("claim b")));
+
+        // Claiming a THIRD store is what gets the sweep to run; the two dead
+        // entries must not survive it.
+        let c = tmp_dir("prune-c");
+        let live = claim_store(&c).unwrap_or_else(|_| panic!("claim c"));
+
+        let reg = claims().lock().unwrap_or_else(|e| e.into_inner());
+        let canon_a = fs::canonicalize(&a).expect("canon a");
+        let canon_b = fs::canonicalize(&b).expect("canon b");
+        let canon_c = fs::canonicalize(&c).expect("canon c");
+        assert!(!reg.contains_key(&canon_a), "a dead claim is pruned from the registry");
+        assert!(!reg.contains_key(&canon_b), "a dead claim is pruned from the registry");
+        assert!(reg.contains_key(&canon_c), "the live claim stays registered");
+        drop(reg);
+
+        drop(live);
+        let _ = fs::remove_dir_all(&a);
+        let _ = fs::remove_dir_all(&b);
+        let _ = fs::remove_dir_all(&c);
+    }
+}
 
 
 

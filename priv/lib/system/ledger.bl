@@ -1,0 +1,169 @@
+; system/ledger.bl — WHO answered, as data: the decision ladder's rollup and its
+; per-process trail. This is the single BL home for the ledger, ported from the
+; former Elixir host module so the repo keeps no Elixir source of its own.
+; `priv/lib/system/decide.bl` and `priv/lib/oracle.bl` record here.
+;
+; A decision ladder is only honest if you can tell which rung answered, and the
+; only way to know is to count. Every decision records two facts:
+;
+;   * the FRAGMENT the question lives in (`:tag-lattice`, `:arith`, `:general`) —
+;     what a native rung would have to decide; and
+;   * the TIER that actually answered (`:native-witness`, `:oracle`, `:memo`).
+;
+; The histogram over those counters is the measurement that decides whether
+; another native rung is worth building: a number, not a taste.
+;
+; Two mechanisms, chosen deliberately:
+;
+;   * the ROLLUP is `:counters` — atomic increments, so concurrent recorders
+;     cannot lose each other's counts. (An atom with `reset!(conj …)` did exactly
+;     that earlier in this work, and turned a working path into "one of eight
+;     answered".)
+;   * per-call attribution is the PROCESS DICTIONARY — a decision's tiers belong
+;     to the caller that made it. `here` is how a handler reports what its own
+;     request used.
+;
+; The counters are created at LOAD, in one process, before anything can race.
+; Two earlier shapes were measured and rejected and the lesson carries: an ETS
+; named table created on first use is a check-then-create across processes, so
+; racers died with "table name already exists" (~1 in 200); an ETS table created
+; at load then VANISHED ("the table identifier does not refer to an existing ETS
+; table") because a table dies with the process that made it, and the loader is
+; short-lived. A `:counters` ref has NO owner: it outlives the process that
+; created it, and the `def` below runs on the load path — once, before any
+; `record` can be called — so there is no concurrent first use to lose an
+; increment to.
+
+(ns system.ledger)
+
+(def ^:private fragments
+  "The three fragments a question can live in — the fragment keys `record` accepts."
+  (to-list [:"tag-lattice" :arith :general]))
+
+(def ^:private tiers
+  "The tiers that can answer — the tier keys `record` accepts."
+  (to-list [:"native-witness" :oracle :memo]))
+
+; EVERY slot, and the key → slot map, 1-based because `:counters` is. These
+; are plain defs, evaluated in file order, so they sit above the functions that
+; need them. `:total` is a slot like any other, so the histogram reports it
+; without arithmetic — an earlier version derived the slot with
+; `find_index(...) + 1` and handed `:counters` a 0.
+(def ^:private all (concat fragments tiers (list :total)))
+
+(def ^:private index
+  (into {} (map-indexed (fn [i k] [k (inc i)]) all)))
+
+; Created ONCE, at namespace load, in the loading process. `:counters` is a
+; lock-free, ownerless array that outlives its creator, so it survives the
+; short-lived loader; and the load path itself cannot race, so every `record`
+; after load increments the SAME array.
+(def ^:private counters-ref
+  (erlang/apply :counters :new (list (count all) (to-list [:write_concurrency]))))
+
+(def ^:private here-key (tuple :system.ledger :here))
+
+(defn- trail
+  "This process's recorded decisions, newest first."
+  []
+  (let [t (erlang/get here-key)]
+    ; `erlang/get` answers `:undefined` for an unset key — not nil — so a plain
+    ; `(or t (list))` would keep the sentinel.
+    (if (or (nil? t) (= :undefined t)) (list) t)))
+
+(defn- canon
+  "Canonicalise a key against the FIXED set — never inventing an atom from data.
+   A keyword and its text name are the SAME slot, because a key may reach us from
+   beam-lisp as an atom or as its text; anything else is a programming error and
+   says so."
+  [key]
+  (let [s (if (keyword? key) (name key) (str key))
+        found (first (filter (fn [k] (= (name k) s)) all))]
+    (if (nil? found)
+      (throw (ex-info (str "unknown ledger key " (pr-str key)
+                           " (expected one of " (pr-str all) ")") {}))
+      found)))
+
+(defn- ix [key] (get index (canon key)))
+
+(defn- bump [key]
+  (erlang/apply :counters :add (list counters-ref (ix key) 1)))
+
+(defn- slot [key]
+  (erlang/apply :counters :get (list counters-ref (ix key))))
+
+(defn record
+  "Record one decision: the question's `fragment`, the `tier` that answered, and
+   the `status` it answered WITH — `sat`, `unsat`, or `unknown`.
+
+   The status is half the record. The tier says WHO answered; the status says
+   whether there was an answer at all, and `unknown` collapsed into a boolean is
+   how a machine whose invariant holds came to be reported as violated (FUP-058).
+
+   `why` carries the solver's own reason for an `unknown` (timeout, memout,
+   canceled, or incomplete), so a refusal names WHY beside the status; nil for a
+   decided answer."
+  ([fragment tier] (record fragment tier nil nil nil))
+  ([fragment tier status] (record fragment tier status nil nil))
+  ([fragment tier status us] (record fragment tier status us nil))
+  ([fragment tier status us why]
+   ; Validate BOTH keys before the first increment: a refused tier must not
+   ; leave a fragment count without a matching tier or total.
+   (let [fragment-slot (ix fragment)
+         tier-slot (ix tier)]
+     (erlang/apply :counters :add (list counters-ref fragment-slot 1))
+     (erlang/apply :counters :add (list counters-ref tier-slot 1))
+     (bump :total)
+     ; A MAP, not a tuple: the trail is read from beam-lisp, and there `(get tuple 1)`
+     ; returns nil (an Elixir tuple is not indexable from the language), which made
+     ; tier-for fall through to its default. Keyword keys on a plain map read fine.
+     (erlang/put here-key
+       (conj (trail) {:fragment fragment :tier tier :status status :us us :why why}))
+     :ok)))
+
+(defn here
+  "The decisions this process has recorded since `clear-here`, oldest first."
+  []
+  (vec (reverse (trail))))
+
+(defn clear-here
+  "Forget this process's trail (called at the start of a unit of work)."
+  []
+  (erlang/put here-key (list))
+  :ok)
+
+(defn undecided
+  "The decisions in this process's trail that the solver could NOT decide.
+
+   `unknown` is an answer about the SOLVER, not about the question: a fragment it
+   cannot decide, or a ceiling it hit. Read as a boolean it becomes \"not proved\",
+   and the verifier renders \"not proved\" as \"violated\" — so this is what the
+   boundary asks before it lets a verdict out. The status is a string or an atom,
+   and both spellings are `unknown`."
+  []
+  (vec (filter (fn [e]
+                 (let [s (:status e)]
+                   (or (= s "unknown") (= s :unknown))))
+               (here))))
+
+(defn cost
+  "The COST of this process's decisions, in microseconds — the instrument behind
+   choosing a deadline from a measured distribution instead of an argument."
+  []
+  (let [us (map (fn [e] (or (:us e) 0)) (here))]
+    {:count (count us)
+     :total_us (reduce + 0 us)
+     :max_us (reduce (fn [a b] (if (> b a) b a)) 0 us)}))
+
+(defn histogram
+  "The rollup, zeroes included so a missing tier is visibly zero."
+  []
+  {:total (slot :total)
+   :fragments (into {} (map (fn [f] [f (slot f)]) fragments))
+   :tiers (into {} (map (fn [t] [t (slot t)]) tiers))})
+
+(defn reset
+  "Reset the rollup (tests, and a fresh measurement). Also clears this trail."
+  []
+  (doseq [k all] (erlang/apply :counters :put (list counters-ref (ix k) 0)))
+  (clear-here))

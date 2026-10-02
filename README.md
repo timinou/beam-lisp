@@ -37,8 +37,11 @@ Use it to build applications that are safe, scalable, and whose complexity stays
 
 ## Getting started
 
-- **Install.** Download the `bl` drop for your platform from the latest release,
-  or build one from a checkout with `mix bl.build`.
+- **Install.** Download the `bl` drop for your platform from the latest release
+  and run `./bl-linux-x86_64 self-install`: `~/.local/bin/bl` becomes a small
+  launcher that picks the right build for wherever you run it: a release, `main`,
+  or the worktree you are standing in. `bl which` says which build and why; `bl version` says where
+  that build came from ([`docs/native-bundler.md` §15](docs/native-bundler.md)).
 - **Check the machine.** `bl doctor` reports the language, the native tiers,
   the solver, and the embedding (which copy of the weights is answering).
 - **Run something.** `bl run examples/hello.bl` — the last value prints.
@@ -47,6 +50,8 @@ Use it to build applications that are safe, scalable, and whose complexity stays
 The full command reference is [`docs/bl/00-the-cli.md`](docs/bl/00-the-cli.md);
 the first-hour walkthrough is
 [`docs/bl/01-first-hour.bl.md`](docs/bl/01-first-hour.bl.md).
+Namespace initialization, incremental rebuilds, and lazy memory behavior are
+covered in [`docs/namespace-loading.md`](docs/namespace-loading.md).
 
 ## Composable experiences
 

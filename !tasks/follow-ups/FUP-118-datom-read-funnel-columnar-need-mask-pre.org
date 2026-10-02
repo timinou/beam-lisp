@@ -14,6 +14,51 @@ ok your goal is very simple: i want you to look at the query history of the know
 - W3b c63e5342 plan memo by form, filter-datoms fast path, registry flag: point q 0.86 → 0.13 ms
 - W6 005da149 bl lint datalog/n+1-read + bl ask nplus1 (:call/loop-depth), one vocabulary in datalog-shape
 
+* Done in this session, after PLAN-138's W1/W3/W6 (the "even more performant" wave)
+- W7a 9f185a85 a wrapper keeps the fast paths (options: they are dispatched on the store
+  VALUE, so `datom.store-overlay` had silently dropped Scan/MultiScan/PageScan for every
+  dry-run and every `conn/with`) + new store/Underlying + identity-of so wrappers stop
+  forking the derived-column caches. Measured on the real 64 708-row corpus, same query:
+  64 708 rows read / 5 836 ms through a capability-dropping wrapper vs 2 000 rows /
+  2 141 ms through the fixed overlay (and 2 287 ms through the base).
+- W7b 73ce5d47 `datom.profile` — EXPLAIN ANALYZE in the library: a counted store decorator
+  (`watch`) + the engine's per-clause trace (shape/index/candidates/rows in-out) + static
+  plan and smells in one report. The instrument reports what the SUBSTRATE did, not what
+  the caller asked for (Transparent protocol), which is what makes it trustworthy.
+- W7c 4891a9a0 / d3dbde3a a derived column that outlives the VM: `datom.derived` (bytes in
+  the blob tier, pointer in the store's internal keyspace), DURABLE per-attribute marks
+  written inside the transaction's own commit, a dumpable+loadable resident index
+  (vec_resident_dump/load), and corpus's three-tier read (ETS -> durable -> assemble).
+  Measured on sources-legales (64 708 x 768): cold build 8 060 ms; restart restore
+  340–541 ms with ZERO rows of the column read; a write to the column still rebuilds
+  (10 861 ms). Before this the marks were ETS-only, so a cold VM always rebuilt.
+- knowledger 32b82c1 knowledger.store (the app's one store opener, DATOM_PROFILE=1) +
+  mcp/call-tool snapshot-delta -> `:retrieval/store-reads` / `:retrieval/store-rows` in the
+  ledger, so /queries shows what a call cost the STORE beside how long it took.
+
+* STANDING: these items are gated on a research spike
+
+**knowledger FUP-019 — "Research spike: where the next 10x in datom reads actually is"**
+(knowledger = the app this engine is measured through; its audit
+`docs/15-datom-performance-audit.md` §10 is where the decisions land).
+
+Why a gate: every item below is a HYPOTHESIS with a plausible story and no
+measured decision. The wave that produced this file also produced the evidence
+that plausible stories are how the expensive mistakes get in: `datom.store-overlay`
+dropped three optional capabilities for several waves, silently, and read 32x more
+rows than it had to (audit §9.1) precisely because "a wrapper implements Store, so
+it must be fine" was never tested. So the items below are taken in this order:
+
+| item | gate |
+|---|---|
+| W2b need-mask (`:columns`) | S3 — measure `:columns` vs `:datoms` on the real corpus, and answer whether a planner-derived need-mask is ever UNSOUND |
+| W2c predicate pushdown | S4 — decide predicate-language vs chunk-streaming fold (parity risk) |
+| W4 vector lane + fjall config | S5 (encoding design) and S7 (cache/partition/fsync sizing) |
+| W5 HNSW | S6 — the flat-index curve; a negative result DELETES this item, which is a win |
+
+**Not gated** (already have a baseline and a test): W2d `:limit` / native count.
+Start there if you want to work on this file today.
+
 * Remaining, in order, each TDD against cost_test COUNTS (never timings)
 ** W2b columnar need-mask (store-fjall.bl -scan-datoms, engine.bl pattern-scan-once, lib.rs)
 Engine passes `{:need #{:e :v}}`; fjall requests `:columns`, materialises only the needed
@@ -39,3 +84,55 @@ hnsw.rs: `parallel_insert` + `file_dump`/load beside the store; `Hnsw::new` caps
 max_elements at 50 000 (below knowledger's 64 708) — size from the corpus. Cold build
 measured 178 s single-threaded; resident flat index is 2 s build / 12 ms query and stays
 the default until W5 lands.
+
+* S1 RESOLVED — the read tax is a per-row LOOKUP on a large value, and here is what that changes
+** Measured law (beam-lisp 889e6cad, audit 10 / S1)
+A key lookup on a large structure costs reductions in proportion to its SIZE, and a bl
+function call costs ~100-150 reductions whatever it does. So a hot loop that reads a field
+off `db`/`store`/the schema pays per row for the whole structure:
+- integer 159 red/row; 1-entry map 171; +200 entries 448; +2 000 entries 3 079;
+  +20 000 entries 28 889 (semantica/benches/probe-arglaw.bl)
+- the fjall-backed `db` 919 red/row versus the ets fixture's 218 for the SAME call;
+  capture and argument are equal (2 996 vs 3 079) — it is the lookup, not the call.
+`filter-datoms` read `basis-t`/`:since-t`/`:valid-at`/`:valid-between` off `db` inside its
+per-row loop through `visible? -> within-basis? -> basis-t`. Fix: hoist the scalars, call
+less, delete the near-copy helpers. Result, in reductions:
+- `db/datoms` :chunk/src 67 400 879 -> 16 601 261 (-75%); :chunk/text 94 254 359 -> 41 163 093 (-56%)
+- whole-column `q` 250 967 236 -> 198 352 268 (-21%); read share of `q` 43% -> 24%
+- clean process, real column, filter alone: 1 008 -> 217 red/row (4.6x)
+** What this does to W2b / W2c (their justification was wrong, their work is still right)
+S3 showed the read LAYER costs the same in `:columns` mode as in `:datoms` mode, so
+"never decode 64 708 chunk texts" buys far less than this file originally claimed. What is
+left, and is now measured, is TERM CONSTRUCTION AND CALLS: every per-row predicate and
+every per-row field read is ~100-150 reductions, times 64 708 rows. W2b/W2c therefore buy
+*behaviour, not decode* — restate their acceptance as "rows that never become terms", count
+them at the NIF boundary, and do not claim a decode win.
+** W8 (new, UNGATED — S1 proved it): the per-row large-value lookup has a NAME
+Add a `bl lint` smell in the datalog/hot family: a lookup form (`(k obj)`, `(get obj k)`,
+`(datom.db/basis-t db)`) inside a loop whose target is bound OUTSIDE the loop. Purely
+structural — binding scope, no name heuristics — and it would have flagged
+`filter-datoms` itself before the fix. Ship it with the law documented where authors will
+meet it, and a counting test that the smell fires on the pre-fix shape (kept as a fixture)
+and not on the post-fix one. This is the bug CLASS: the fix above removes one instance.
+
+* W2d is now BLOCKING a measured regression, and its acceptance is written
+** The regression (2026-09-22, beam-lisp 880b6b5b; knowledger audit 10 "Chasing /activity")
+The semi-join gate is `(<= prefixes SEMI-JOIN-MAX)` alone, so a 692-row column joined by
+685 entities is read as 685 prefixes — 4 110 native range reads to avoid six scans. The
+/activity screen's own query, measured: 23 670 168 reductions on the old engine, 67 259 334
+on the new one, SAME 53 rows. Exchange rate, measured: ~16 000 reductions per prefix
+(crossing + decode) against ~1 000 per row of a scanned column.
+** Why the obvious gate is unsound (do not re-derive this)
+Comparing prefixes against the size of a column an EARLIER clause scanned flips the W1 win
+(a 32x row saving on a column 3 000x the binding set) back to a full scan: a query's first
+scan can be of a column two rows wide while the semi-join targets one two hundred rows
+wide. Written, tested, reverted.
+** What W2d needs to provide
+`datom.store/Count` + native `count-range` over an index range: KEYS ONLY, no value decode,
+no term construction, so it is cheap enough to ask once per semi-join decision.
+** Then the rule and its test
+Rule: `prefixes x SEMI-JOIN-PREFIX-RATIO < column-rows`, with a small absolute allowance
+for prefix lists that are cheap in any case. Test (cost_test, counts not timings): a column
+the size of its binding set takes NO multi-prefix read — the counter is `:multiscan` in that
+file's CountingStore, added for this — and the sibling test that guards the win
+(`a-semi-join-still-pays-when-the-column-is-large`, rows read, not time) must stay green.

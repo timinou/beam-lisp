@@ -1,0 +1,148 @@
+; test/bl/system/multi_clause_consumers_test.bl — the incremental, linear and
+; type-check consumers must read EVERY clause of a multi-arity/multi-clause
+; defn, not just the first :body. analyze/fn-bodies already carries all of them
+; in :clauses (and unions the summary over them); these are the consumers that
+; still keyed on the first body:
+;
+;   system.incr      — hash + summary must cover every clause, so an edit in a
+;                      later arity invalidates the cached summary;
+;   system.linear    — size/duplication/affine/call-census over all bodies, each
+;                      clause checked with its OWN bound params, never conflated
+;                      into the first clause's;
+;   system.typecheck — every clause inspected, so a type error in a later arity
+;                      is reported instead of being read as a clean first body.
+;
+; The reverse is asserted too: a FIRST-body map (a legacy input, and the shape
+; of the synthetic `<top>` entry) is still accepted.
+(ns system.multi-clause-consumers-test
+  (:require [system.incr :as incr]
+            [system.linear :as lin]
+            [system.typecheck :as tc]
+            [system.analyze :as analyze]))
+
+; a macro that splices its body twice — tier 3 (system.linear) must see the
+; duplicate in whichever clause pays for it. Same probe as linear_test.
+(defmacro twice-bad [x] `(if (rand-nth [true false]) ~x ~x))
+
+; ── system.incr: hash and summary over all clauses ─────────────────────────
+
+(deftest clauses-of-covers-every-arity
+  (testing "a multi-clause entry normalises to all of its clauses; a legacy
+            first-body map to the one clause it carries"
+    (let [d (get (into {} (analyze/fn-bodies "(defn f ([x] x) ([x y] y))")) "f")]
+      (is (= 2 (count (incr/clauses-of d))) "both arities are present")
+      (is (= 2 (count (:params (second (incr/clauses-of d))))) "the later arity's own params"))
+    (is (= [{:params ["x"] :body :sentinel}]
+           (incr/clauses-of {:params ["x"] :body :sentinel}))
+        "a first-body map yields its one clause")))
+
+(deftest fn-hash-covers-arities
+  (testing "the cache key changes when an arity is added or a later body edited"
+    (let [h1 (incr/fn-hash (get (into {} (analyze/fn-bodies "(defn f [x] x)")) "f"))
+          h2 (incr/fn-hash (get (into {} (analyze/fn-bodies "(defn f ([x] x) ([x y] y))")) "f"))
+          h3 (incr/fn-hash (get (into {} (analyze/fn-bodies "(defn f ([x] x) ([x y] (erlang/+ x y)))")) "f"))]
+      (is (not= h1 h2) "an added arity is not the first body")
+      (is (not= h2 h3) "an edit in the later arity is noticed"))))
+
+(deftest parameter-positions-are-not-alpha-equivalent
+  (let [left (get (into {} (analyze/fn-bodies "(defn pick [a b] a)")) "pick")
+        right (get (into {} (analyze/fn-bodies "(defn pick [a b] b)")) "pick")]
+    (is (not= (incr/fn-hash left) (incr/fn-hash right)))))
+
+(deftest later-clause-edit-invalidates-the-summary
+  (testing "editing ONLY the second arity misses the cache instead of reusing
+            a summary computed over the first"
+    (let [v1 "(defn f ([x] (erlang/+ x 1))\n         ([x y] (erlang/* x y)))"
+          v2 "(defn f ([x] (erlang/+ x 1))\n         ([x y] (erlang/+ x y)))"
+          r1 (incr/analyze-incremental {} v1)
+          r2 (incr/analyze-incremental (:cache r1) v2)]
+      (is (= ["f"] (:misses r1)) "cold run misses")
+      (is (some? (index-of (pr-str (:misses r2)) "f"))
+          "the second arity changed → f is a miss")
+      (is (empty? (:hits r2)) "nothing is reused over the changed body"))))
+
+(deftest later-clause-rename-is-still-a-hit
+  (testing "alpha-invariance applies to every clause — renaming a later arity's
+            params is not an invalidation"
+    (let [v1 "(defn f ([x] x) ([x y] (erlang/+ x y)))"
+          v2 "(defn f ([a] a) ([p q] (erlang/+ p q)))"
+          r1 (incr/analyze-incremental {} v1)
+          r2 (incr/analyze-incremental (:cache r1) v2)]
+      (is (some? (index-of (pr-str (:hits r2)) "f")) "renames are cache hits"))))
+
+(deftest incremental-summary-unions-all-clauses
+  (testing "the cached summary carries the later arity's calls and effects"
+    (let [s (get (:summaries (incr/analyze-incremental {} "(defn f ([x] x) ([x y] (File/read! x)))")) "f")]
+      (is (contains? (:calls s) [:Elixir.File :read!])
+          "the second clause's host call is in the summary")
+      (is (not (empty? (:footprint s))) "and its effect"))))
+
+; ── system.linear: all bodies, per-clause params ───────────────────────────
+
+(deftest ratios-count-every-clause
+  (testing "the emitted-node count is over the whole defn"
+    (let [r1 (first (filter (fn [r] (= "f" (:fn r))) (lin/ratios "(defn f ([x] (erlang/+ x 1)))")))
+          r2 (first (filter (fn [r] (= "f" (:fn r))) (lin/ratios "(defn f ([x] (erlang/+ x 1)) ([x y] (erlang/- x y)))")))]
+      (is (< (:emitted r1) (:emitted r2)) "the second clause's IR is counted"))))
+
+(deftest later-clause-duplicate-is-caught
+  (testing "a duplicate in a later arity is the caller's cost, reported with a
+            position"
+    (let [src (str "(defn victim ([x] x) "
+                   "([xs] (system.multi-clause-consumers-test/twice-bad "
+                   "(reduce (fn [a b] (erlang/+ a (erlang/* b 2))) 0 xs))))")
+          ds (lin/check-source src)]
+      (is (= ["victim"] (map :fn ds)))
+      (is (= 2 (:count (first (:duplicates (first ds))))))
+      (let [d (first (lin/diagnostics src))]
+        (is (= :non-linear-emission (:kind d)))
+        (is (int? (:line d)))
+        (is (some? (index-of (:msg d) "victim")))))))
+
+(deftest later-clause-affine-violation-uses-its-own-params
+  (testing "tier 1 checks each clause with that clause's bound params — the
+            second arity's `inner-fn` is placed twice, and the FIRST arity's
+            params are not read in its place"
+    (let [src (str "(defn- two-arity\n"
+                   "  ([a b] (a/var a))\n"
+                   "  ([self inner-fn]\n"
+                   "    (let [outer-fn (a/fnn (list (a/clause (list (a/pvar self)) nil inner-fn)))]\n"
+                   "      (a/lett self outer-fn inner-fn))))")
+          vs (lin/param-violations src)]
+      (is (= 1 (count vs)) (pr-str vs))
+      (is (some? (index-of (:local (first vs)) "inner-fn"))
+          (str "the later clause's own param is the child: " (pr-str (:local (first vs)))))
+      (is (= 2 (:placements (first vs)))))))
+
+
+; ── system.typecheck: every clause inspected ───────────────────────────────
+
+(deftest later-clause-type-error-is-caught
+  (testing "a type error inside the second arity is reported, not hidden by a
+            clean first clause"
+    (let [ws (tc/check-source (str "(defn f ([x] x) ([x y] (erlang/+ 1 (mk))))\n"
+                                   "(defn mk [] :a-keyword)"))]
+      (is (= 1 (count ws)) (pr-str ws))
+      (is (some? (:line (first ws))) "the warning carries a source position"))))
+
+(deftest first-clause-type-error-still-caught
+  (is (= 1 (count (tc/check-source (str "(defn g ([x] (erlang/+ 1 (mk))) ([x y] y))\n"
+                                          "(defn mk [] :a-keyword)"))))))
+
+(deftest multi-clause-clean-warns-nothing
+  (is (= 0 (count (tc/check-source "(defn h ([x] (erlang/+ x 1)) ([x y] (erlang/* x y)))")))))
+
+(deftest bundled-check-inspects-every-clause
+  (testing "the bundle-taking entry point (lsp) checks all clauses too"
+    (let [src (str "(defn f ([x] x) ([x y] (erlang/+ 1 (mk))))\n"
+                   "(defn mk [] :a-keyword)")
+          known (reduce (fn [m [n s]] (assoc m n (:returns s))) {} (analyze/analyze src))
+          bodies (analyze/fn-bodies src)]
+      (is (= 1 (count (tc/check-source* known bodies)))))))
+
+(deftest legacy-first-body-map-still-checked
+  (testing "a {fn → {:params :body}} table (no :clauses) is still accepted"
+    (let [bs (into {} (map (fn [[k d]] [k {:params (:params d) :body (:body d)}])
+                           (analyze/fn-bodies (str "(defn f [] (erlang/+ 1 (mk)))\n"
+                                                   "(defn mk [] :a-keyword)"))))]
+      (is (= 1 (count (tc/check-source* {"mk" #{:kw}} bs)))))))

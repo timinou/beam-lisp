@@ -66,7 +66,7 @@
 ; all 113 — and neither may a user's graph, quietly).
 
 (ns build-plan
-  (:require [source-graph :as sg] [ns-interface]))
+  (:require [source-graph :as sg] [ns-interface] [reader-node :as rn]))
 
 ; ── input indexing ───────────────────────────────────────────────────────────
 
@@ -164,7 +164,10 @@
                          (let [refs (as-list (maps/get x (maps/get :refs d (maps/new)) (list)))
                                inames (maps/get :inames xn (list))]
                            ; `:refer :all` → names unattributable → not covered
-                           (if (lists/member :all refs) false
+                           (if (or (lists/member :all refs)
+                                   (erlang/not (erlang/== (maps/get :macros d (list)) (list)))
+                                   (lists/any (fn [r] (lists/member r (maps/get :macros xn (list)))) refs))
+                             false
                              (lists/all (fn [r] (lists/member r inames)) refs)))))))
         ; Who requires X, across the whole graph — computed ONCE (a reverse
         ; edge map), so asking it per closure member stays O(deg), keeping the
@@ -238,20 +241,423 @@
 ; builds the same nodes the build builds, and calls the same `plan`. One
 ; definition of "the key"; two callers.
 
+(defn- ns-form?
+  "Is this bare reader node an `(ns …)` list?"
+  [form]
+  (if (erlang/=:= :list (rn/node-tag form))
+    (let [items (rn/node-items form)]
+      (if (erlang/=:= items (list))
+        false
+        (let [h (erlang/hd items)]
+          (if (erlang/=:= :symbol (rn/node-tag h))
+            (erlang/=:= "ns" (rn/node-name h))
+            false))))
+    false))
+
+(defn- header-of
+  "The `[ns reqs]` ONE `(ns …)` form declares, through source-graph's own
+   header reader — so a multi-namespace file answers each of its namespaces
+   with the requires THAT form declares, not the first form's."
+  [form]
+  (let [h (Enum/to_list (sg/header-forms (list form)))]
+    (list (erlang/hd h) (erlang/hd (erlang/tl h)))))
+
+(defn- content-parts
+  "What a source's bytes ALONE determine about its node: `:hash`, `:iface`,
+   `:inames`, `:refs`, and `:headers` — every `[ns reqs]` the file declares, in
+   source order. Pure in `content`, so it is memoizable by content hash and
+   never by path or mtime."
+  [content]
+  (let [fs (sg/forms content)
+        macros (lists/filtermap
+                 (fn [line]
+                   (if (String/starts_with? line "macro ")
+                     (tuple true (lists/nth 2 (String/split line " ")))
+                     false))
+                 (ns-interface/lines-forms fs))
+        headers (lists/foldl
+                  (fn [f acc]
+                    (if (ns-form? f) (lists/append acc (list (header-of f))) acc))
+                  (list) fs)]
+    (maps/put :macros macros
+    (maps/put :hash (binary/encode_hex (crypto/hash :sha256 content))
+      (maps/put :iface (ns-interface/hash-forms fs)
+        (maps/put :inames (ns-interface/names-forms fs)
+          (maps/put :refs (sg/references-forms fs)
+            (maps/put :headers headers (maps/new)))))))))
+
+(defn- assemble
+  "Assemble the node for `label` from content parts: the header whose ns is
+   `label`, else the first (a file with no `(ns …)` declares none). The build
+   passes the FILE PATH as `label` — it plans one node per file — and the gate
+   the NAMESPACE, so each of a multi-namespace file's namespaces resolves its
+   own header."
+  [label parts]
+  (let [hdrs (maps/get :headers parts)
+        found (lists/foldl
+                (fn [hr acc]
+                  (if (erlang/=:= acc nil)
+                    (if (erlang/=:= label (erlang/hd (Enum/to_list hr))) hr nil)
+                    acc))
+                nil hdrs)
+        h (if (erlang/=:= found nil)
+            (if (erlang/=:= hdrs (list)) (list nil (list)) (erlang/hd hdrs))
+            found)
+        hl (Enum/to_list h)]
+    (maps/put :macros (maps/get :macros parts (list))
+    (maps/put :path label
+      (maps/put :ns (erlang/hd hl)
+        (maps/put :reqs (erlang/hd (erlang/tl hl))
+          (maps/put :hash (maps/get :hash parts)
+            (maps/put :iface (maps/get :iface parts)
+              (maps/put :inames (maps/get :inames parts)
+                (maps/put :refs (maps/get :refs parts) (maps/new)))))))))))
+
 (defn node-from
   "The plan node for a source: `{:path :ns :reqs :hash :iface :inames :refs}`,
    with the interface fields. `path` is whatever the caller wants in the
-   node (the build uses the file path; the gate the ns name)."
+   node (the build uses the file path; the gate the ns name). A file declaring
+   several namespaces answers with its FIRST header here; the gate, which asks
+   by name, uses `memo-node` and gets that name's header."
   [path content]
-  (let [fs (sg/forms content)
-        h (sg/header-forms fs)]
-    (maps/put :path path
-      (maps/put :ns (erlang/hd (Enum/to_list h))
-        (maps/put :reqs (erlang/hd (erlang/tl (Enum/to_list h)))
-          (maps/put :hash (binary/encode_hex (crypto/hash :sha256 content))
-            (maps/put :iface (ns-interface/hash-forms fs)
-              (maps/put :inames (ns-interface/names-forms fs)
-                (maps/put :refs (sg/references-forms fs) (maps/new))))))))))
+  (assemble path (content-parts content)))
+
+; ── paths → plan (the build's own entry) ─────────────────────────────────────
+
+(defn plan-paths
+  "Read every source ONCE (through the loader's own reader) and plan the
+   build. `paths` are source files; each becomes a node via `node-from` — the
+   same node the runtime gate builds, so build and gate agree."
+  [paths]
+  (plan (map (fn [path] (node-from path (BeamLisp.Loader/read_source path))) paths)))
+
+; ── the memo layer: parse once per content, key once per byte-set ───────────
+;
+; A plan node's bytes-derived part is a PURE function of a source's bytes:
+; forms, header, interface hash, interface names, references. The runtime drift
+; gate asks `key-for` once per namespace it vets, and each call walks that
+; namespace's whole require-closure — so the same ninety files were read and
+; parsed ninety times over. Measured on a ninety-namespace application: 71.7s
+; of a 72.5s load was this gate; the beams' own `__bl_init__` replay was under
+; a second. Keying that memo on the CONTENT HASH (never the path, never mtime)
+; keeps the gate's guarantee intact: an edited file has new bytes, a new key,
+; and is parsed afresh.
+;
+; Two memos, both VM-wide and owned by the pinned `Loader.Server` (the same
+; rule as native.bl's declarations table): created lazily by the first caller,
+; they must outlive that caller — a parallel-build worker exits after its one
+; file.
+;
+;   1. NODE PARTS (`MEMO-TABLE`) — content hash → `content-parts`. The walk
+;      still resolves and hashes every member on every call, so an edit is
+;      never missed; only the parse is shared. Assembling the node for a NAME
+;      (`assemble`) is cheap and applies OUTSIDE the memo, so one row per
+;      content serves every name that asks about it, and a multi-namespace
+;      file still answers each of its namespaces with the right header.
+;
+;   2. PLAN KEY (`KEY-MEMO-TABLE`) — namespace → {node-set signature, key}.
+;      The key `plan` folds for a namespace is a pure function of the node set
+;      its closure resolved to, so a signature over every member's path,
+;      content hash and interface hash decides whether the fold can be
+;      skipped. This is deliberately NOT a root-only cache: a dependency can
+;      be edited while the root is untouched, and that changes the signature.
+;      It is also what makes interface keying pay off at the gate — a
+;      body-only edit to a covered dependency leaves `:iface` unchanged, so
+;      the consumer's signature (and key) is unchanged and its artifact stays
+;      reusable.
+
+(def MEMO-TABLE :beam_lisp_build_plan_nodes_v2)
+
+(def KEY-MEMO-TABLE
+  "The plan-KEY memo: namespace → {node-set signature, key}. A key is a pure
+   function of the node SET a closure resolves to, and the signature captures
+   that set — every member's path, content hash and interface hash — so a
+   repeated validation of unchanged bytes recomputes nothing below the walk,
+   while an edit ANYWHERE in the closure (the root included) changes the
+   signature and forces the key to be folded again."
+  :beam_lisp_build_plan_keys_v2)
+
+(defn- ensure-table
+  "Create `name` as a public read-concurrent set inside the pinned
+   `Loader.Server` if it does not exist, and answer the name. A concurrent
+   first caller loses the create race and takes the winner's table."
+  [name]
+  (if (erlang/=:= :undefined (erlang/apply :ets :whereis (list name)))
+    (do
+      (BeamLisp.Loader.Server/run
+        (fn []
+          (try
+            (erlang/apply :ets :new
+              (list name (list :named_table :public :set (tuple :read_concurrency true))))
+            (catch _ :ok))))
+      name)
+    name))
+
+(defn- memo-table
+  "The VM-wide node-part memo: content hash → node parts."
+  []
+  (ensure-table MEMO-TABLE))
+
+(defn- key-memo-table
+  "The VM-wide plan-key memo: namespace → {node-set signature, key}."
+  []
+  (ensure-table KEY-MEMO-TABLE))
+
+; ── the on-disk level of the node memo ────────────────────────────────────────────────────────
+;
+; The ETS memo dies with its VM, and every `bl` command that does not reach a
+; daemon is a fresh VM — which then re-parsed the same installed sources, every
+; time. Measured on an installed build: 22–24 s to parse its 345 sources cold,
+; ~1 s with the parts cached; hashing the same 6.3 MB is 6 ms. The parse is the
+; cost, and the parse is a pure function of the bytes — so it is stored by
+; content hash.
+;
+;   <AOTCache/dir>/parts/<build-key>/<hex content hash>
+;
+; THE GENERATION IS `AOTCache/build_key`, and that is the whole compatibility
+; story with drop. It hashes the build-driver sources (`priv/build/` — this
+; file, source-graph, ns-interface: the code that SHAPES a part) and folds in
+; `compiler_key` (the boot reader, the runtime triple, the codegen). So two drop
+; builds of the same toolchain share every entry, a build whose toolchain moved
+; reads none of its predecessor's, and nothing is ever versioned by hand. The
+; directory name is not a 64-hex sha, so `AOTCache` cleanup does not see it; it
+; has its own bound (`PARTS-KEEP`).
+;
+; A file is on-disk INPUT, never assumed: `sha256(payload) ++ payload`, decoded
+; with `:safe` (an unknown atom is a miss, not an atom-table leak), and refused
+; unless it is the right shape for the content it was asked about. Every failure
+; — absent, truncated, corrupt, unreadable, a read-only home — degrades to the
+; parse this layer sits in front of. Writes are tmp + rename: a concurrent
+; reader sees a whole file or none, and two writers of one hash write one value.
+
+(def PARTS-KEEP
+  "Generations kept under `parts/`. A drop store holds many builds; this bounds
+   the cache without a clock. The CURRENT generation is never pruned."
+  8)
+
+(defn- parts-generation
+  "The directory this toolchain's parts live in."
+  []
+  (Path/join (Path/join (BeamLisp.AOTCache/dir) "parts") (BeamLisp.AOTCache/build_key)))
+
+(defn- parts-file [hash]
+  (Path/join (parts-generation) (binary/encode_hex hash)))
+
+(defn- parts-shape?
+  "Is `p` what `content-parts` answers for the content hashing to `hash`? The
+   stored `:hash` is checked against the ASKED hash, so a file moved or
+   renamed under another name is a miss, not a wrong answer."
+  [p hash]
+  (and (erlang/is_map p)
+       (erlang/=:= (maps/get :hash p nil) (binary/encode_hex hash))
+       (maps/is_key :macros p)
+       (maps/is_key :iface p)
+       (maps/is_key :inames p)
+       (maps/is_key :refs p)
+       (maps/is_key :headers p)))
+
+(defn- frame
+  "The bytes a parts file holds: `sha256(payload) ++ payload`. DETERMINISTIC
+   encoding, so the same parts are the same bytes on every machine — a primed
+   store inside a drop must not break the fixpoint gate (gen-2 == gen-3)."
+  [parts]
+  (let [payload (erlang/term_to_binary parts (list :deterministic))]
+    (erlang/iolist_to_binary (list (crypto/hash :sha256 payload) payload))))
+
+(defn- parts-read
+  "The stored parts for `hash` in the file at `file`, or nil."
+  [file hash]
+  (try
+    (let [r (File/read file)]
+      (if (erlang/=:= :ok (erlang/element 1 r))
+        (let [f (erlang/element 2 r)]
+          (if (erlang/>= (erlang/byte_size f) 32)
+            (let [sp (erlang/split_binary f 32)
+                  digest (erlang/element 1 sp)
+                  payload (erlang/element 2 sp)]
+              (if (erlang/=:= digest (crypto/hash :sha256 payload))
+                (let [p (erlang/binary_to_term payload (list :safe))]
+                  (if (parts-shape? p hash) p nil))
+                nil))
+            nil))
+        nil))
+    (catch _ nil)))
+
+(defn- prune-generations
+  "Drop the oldest generations beyond `PARTS-KEEP`, never `current`. Runs only
+   when a generation is first created, so a warm run never lists the directory."
+  [current]
+  (let [root (Path/dirname current)
+        listed (File/ls root)]
+    (if (erlang/=:= :ok (erlang/element 1 listed))
+      (let [gens (lists/filtermap
+                   (fn [n]
+                     (let [p (Path/join root n)
+                           r (File/lstat p (list (tuple :time :posix)))]
+                       (if (and (erlang/=:= :ok (erlang/element 1 r))
+                                (erlang/=:= :directory (Map/get (erlang/element 2 r) :type))
+                                (erlang/not (erlang/=:= p current)))
+                         (tuple true (tuple (Map/get (erlang/element 2 r) :mtime) p))
+                         false)))
+                   (erlang/element 2 listed))
+            doomed (Enum/drop (lists/reverse (lists/sort gens)) (erlang/- PARTS-KEEP 1))]
+        (Enum/each doomed (fn [g] (File/rm_rf (erlang/element 2 g))))
+        :ok)
+      :ok)))
+
+(defn- parts-write
+  "Publish `parts` for `hash`. Best-effort: a failure costs the next VM a parse,
+   never this one its answer."
+  [hash parts]
+  (try
+    (let [gen (parts-generation)
+          tmp (Path/join gen (str ".tmp-" (System/pid) "-"
+                                  (Integer/to_string (System/unique_integer (list :positive)))))
+          fresh (erlang/not (File/dir? gen))
+          bytes (frame parts)]
+      (try
+        (do
+          (File/mkdir_p! gen)
+          (File/write! tmp bytes)
+          (File/rename! tmp (parts-file hash))
+          (if fresh (prune-generations gen) :ok)
+          :ok)
+        (catch _ (do (File/rm tmp) :ok))))
+    (catch _ :ok)))
+
+; ── the primed level: parts that ship INSIDE a build ─────────────────────────────────────────
+;
+; The cache above makes the SECOND run on a machine fast; the first run still
+; parses every source the build ships (14–19 s measured). `prime!` closes that:
+; `bl self-build` parses the tier sources once, while it already holds them, and
+; writes the result into the build's own `priv/parts/<build-key>/`. The drop
+; carries it, so a fresh machine starts warm.
+;
+; The same file format and the same generation key as the cache — so the only
+; thing a seed can ever be wrong about is being for another toolchain, and that
+; is a different directory name, never a wrong answer. Read-only at runtime (an
+; installed payload is not ours to write), consulted before the cache.
+
+(defn- parts-gen-in
+  "The generation directory for THIS toolchain under a `parts/` root."
+  [parts-root]
+  (Path/join parts-root (BeamLisp.AOTCache/build_key)))
+
+(defn seeded-parts
+  "The parts for `hash` primed into the image whose `priv/` is `priv`, or nil."
+  [priv hash]
+  (parts-read (Path/join (parts-gen-in (Path/join priv "parts")) (binary/encode_hex hash)) hash))
+
+(defn prime!
+  "Parse every source in `paths` ONCE and store the results under
+   `<priv>/parts/<build-key>/`, replacing whatever a previous build left there.
+   Answers how many distinct contents were stored. A source the reader refuses is
+   skipped: it would raise at the gate too, and a seed is only ever a shortcut."
+  [priv paths]
+  (let [root (Path/join priv "parts")
+        gen (parts-gen-in root)]
+    (File/rm_rf! root)
+    (File/mkdir_p! gen)
+    (lists/foldl
+      (fn [path n]
+        (try
+          (let [content (BeamLisp.Loader/read_source path)
+                hash (crypto/hash :sha256 content)
+                file (Path/join gen (binary/encode_hex hash))]
+            (if (File/exists? file)
+              n
+              (do (File/write! file (frame (content-parts content)))
+                  (erlang/+ n 1))))
+          (catch _ n)))
+      0
+      (Enum/to_list paths))))
+
+(defn- parts-for
+  "`content-parts` for `content` (whose sha256 is `hash`): primed into this
+   image, else on disk from a run of this toolchain, else parsed here and
+   published."
+  [hash content]
+  (let [on (BeamLisp.AOTCache/enabled?)
+        seeded (if on (seeded-parts (BeamLisp.Tiers/priv_root) hash) nil)
+        cached (if (erlang/=:= seeded nil)
+                 (if on (parts-read (parts-file hash) hash) nil)
+                 seeded)]
+    (if (erlang/=:= cached nil)
+      (let [p (content-parts content)]
+        (if on (parts-write hash p) :ok)
+        p)
+      cached)))
+
+(defn memo-node
+  "`content-parts` memoized by content hash, ASSEMBLED for `ns`. A node's
+   bytes-derived part is a pure function of the source's bytes, so the SAME
+   closure member is parsed once however many namespaces' closures mention it;
+   which namespace a multi-namespace file answers for is NOT in the bytes, so
+   it is applied on the way out and never stored. Keyed on the CONTENT HASH —
+   never the path, never mtime — so an edit is new bytes, a new key, and a
+   fresh parse.
+
+   TWO LEVELS. The ETS table is this VM's; behind it sits the on-disk store
+   (`parts-for`), so a COLD VM — every `bl` command without a daemon — finds
+   the parse another process already paid for. A disk miss parses and publishes."
+  [ns content]
+  (let [hash (crypto/hash :sha256 content)
+        t (memo-table)
+        hit (erlang/apply :ets :lookup (list t hash))
+        parts (if (erlang/=:= (list) hit)
+                (let [p (parts-for hash content)]
+                  (erlang/apply :ets :insert (list t (tuple hash p)))
+                  p)
+                (erlang/element 2 (erlang/hd hit)))]
+    (assemble ns parts)))
+
+(defn clear-memo
+  "Forget every memoized node part and every memoized plan key (tests; a
+   toolchain change rotates the parse)."
+  []
+  (if (erlang/=/= :undefined (erlang/apply :ets :whereis (list MEMO-TABLE)))
+    (erlang/apply :ets :delete_all_objects (list MEMO-TABLE)))
+  (if (erlang/=/= :undefined (erlang/apply :ets :whereis (list KEY-MEMO-TABLE)))
+    (erlang/apply :ets :delete_all_objects (list KEY-MEMO-TABLE)))
+  :ok)
+
+(defn- node-signature
+  "A digest of the node SET a key was folded from: each node's path, content
+   hash and interface hash, sorted. Two validations over the SAME bytes produce
+   the same signature; an edit to ANY member of the closure — the root or a
+   dependency the root never mentions — changes it. Interface-keyed plans are
+   covered because a body-only edit to a covered dependency leaves `:iface`
+   alone and therefore leaves the signature (and the key) alone, which is
+   exactly what makes an intermediate artifact reusable."
+  [nodes]
+  (sg/hash-lines
+    (lists/sort
+      (lists/map (fn [n]
+                   (erlang/iolist_to_binary
+                     (list (if (erlang/== nil (maps/get :path n nil)) "-" (maps/get :path n))
+                           ":"
+                           (if (erlang/== nil (maps/get :hash n nil)) "-" (maps/get :hash n))
+                           ":"
+                           (if (erlang/== nil (maps/get :iface n nil)) "-" (maps/get :iface n)))))
+                 nodes))))
+
+(defn- key-memo
+  "`(maps/get ns (:key (plan nodes)))`, remembered VM-wide under `ns` while the
+   node set's signature is unchanged. A root-only cache would be unsound (a
+   dependency can be edited with the root untouched), so the signature covers
+   every member. One row per namespace — a changed signature overwrites it —
+   so the memo is bounded by the namespace count, never by edit history."
+  [ns nodes]
+  (let [sig (node-signature nodes)
+        t (key-memo-table)
+        hit (erlang/apply :ets :lookup (list t ns))
+        cached (if (erlang/=:= (list) hit) nil (erlang/element 2 (erlang/hd hit)))]
+    (if (and (erlang/not (erlang/== nil cached))
+             (erlang/== sig (erlang/element 1 cached)))
+      (erlang/element 2 cached)
+      (let [k (maps/get ns (maps/get :key (plan nodes)))]
+        (erlang/apply :ets :insert (list t (tuple ns (tuple sig k))))
+        k))))
 
 (defn key-for
   "The freshness key of namespace `ns`, given `resolve`: ns → source content
@@ -263,11 +669,15 @@
 
    `node-of` (4-ary form) is `(fn [ns content] node)` — how a member becomes
    its plan node; the 3-ary form uses `node-from` directly. The runtime gate
-   passes a content-keyed memo of `node-from`: parsing a source into its node
-   is a pure function of its bytes, and the gate asks for the SAME closure
-   members once per namespace it vets — ninety namespaces re-parsing a
-   ninety-file closure each was 99% of an application's load. The key itself
-   is still recomputed from the live bytes every call."
+   passes `memo-node`, a content-keyed memo of `node-from`: parsing a source
+   into its node is a pure function of its bytes, and the gate asks for the
+   SAME closure members once per namespace it vets — ninety namespaces
+   re-parsing a ninety-file closure each was 99% of an application's load.
+
+   The walk is still over LIVE bytes on every call — each member is resolved
+   and hashed afresh, so an edit is never missed — but the KEY is folded from
+   that walk's node set through `key-memo`, so validating the same bytes again
+   does not re-plan them (`node-signature`)."
   ([ns resolve seed] (key-for ns resolve seed node-from))
   ([ns resolve seed node-of]
    (let [seed-ns (if (erlang/=:= seed nil) nil (erlang/hd (Enum/to_list seed)))
@@ -288,4 +698,4 @@
                                  (recur (lists/append (as-list (maps/get :reqs node)) more)
                                         (maps/put n true seen)
                                         (lists/append (list node) acc)))))))))]
-         (maps/get ns (maps/get :key (plan nodes))))))))
+         (key-memo ns nodes))))))

@@ -1,0 +1,126 @@
+; veritas/ledger.bl — a verdict is a FACT: what was claimed, how it was
+; checked, what it found, and how to see it again.
+;
+; ── Why ─────────────────────────────────────────────────────────────────────
+;
+; A verdict held in a variable dies with the session that computed it. The one
+; who writes most of the code (an agent) loses context between turns, so a
+; check it cannot find later is a check it will either repeat or — worse —
+; remember wrongly. The ledger makes "what have I verified, and how strongly?"
+; a query, and generates the report from it, so a summary can never claim more
+; than a recorded verdict supports.
+;
+; ── What is here, and what is not yet ───────────────────────────────────────
+;
+; Here: the verdict schema, `record!`, reading back, and `report` (markdown,
+; grouped by modality, with the seed and the replay hint). Not yet: STALENESS
+; (a verdict whose code changed). That needs a content hash per definition in
+; the codebase graph (`priv/std/codebase.bl` has none today); the `:about` refs
+; are recorded now so staleness can be computed over existing verdicts later.
+; See docs/veritas-for-agents.md §2 and PLAN-151 V4.
+
+(ns veritas.ledger
+  (:require [datom] [datom.store-fjall]))
+
+(def schema
+  [{:db/ident :verdict/id       :db/valueType :db.type/string :db/unique :db.unique/identity}
+   {:db/ident :verdict/claim    :db/valueType :db.type/string}
+   {:db/ident :verdict/modality :db/valueType :db.type/keyword :db/index true}
+   {:db/ident :verdict/engine   :db/valueType :db.type/keyword}
+   {:db/ident :verdict/why      :db/valueType :db.type/string}
+   {:db/ident :verdict/seed     :db/valueType :db.type/long}
+   {:db/ident :verdict/tried    :db/valueType :db.type/long}
+   {:db/ident :verdict/witness  :db/valueType :db.type/term}
+   {:db/ident :verdict/replay   :db/valueType :db.type/string}
+   {:db/ident :verdict/about    :db/valueType :db.type/string :db/cardinality :db.cardinality/many :db/index true}
+   {:db/ident :verdict/by       :db/valueType :db.type/string}
+   {:db/ident :verdict/at       :db/valueType :db.type/long :db/index true}])
+
+(defn open
+  "A ledger: a durable datom conn at `path` (fjall), or in memory when `path` is
+   nil (tests, throwaway sessions)."
+  [path]
+  (if (nil? path)
+    (datom/connect schema)
+    (datom/connect-with (datom.store-fjall/open path) schema)))
+
+(defn- vid [claim at]
+  (str "vd-" at "-" (erlang/phash2 claim 1000000)))
+
+(defn record!
+  "Record verdict `v` (any veritas verdict map) under `meta`
+   {:claim str (required) :about [str …] :by str :replay str}. The shrunk
+   witness is kept when present (it is the one worth replaying). → the id."
+  [ledger v meta]
+  (let [at (erlang/system_time :millisecond)
+        id (vid (:claim meta) at)
+        w (if (contains? v :shrunk) (:shrunk v) (:witness v))]
+    (datom/transact! ledger
+      [(cond-> {:db/id -1 :verdict/id id :verdict/claim (:claim meta)
+                :verdict/modality (:modality v) :verdict/at at}
+         (:engine v) (assoc :verdict/engine (:engine v))
+         (:why v) (assoc :verdict/why (:why v))
+         (int? (:seed v)) (assoc :verdict/seed (:seed v))
+         (int? (:tried v)) (assoc :verdict/tried (:tried v))
+         (some? w) (assoc :verdict/witness w)
+         (:replay meta) (assoc :verdict/replay (:replay meta))
+         (:by meta) (assoc :verdict/by (:by meta)))])
+    ;; many-valued refs go in as list-form adds: a map-form SET value is
+    ;; rejected as one wrong-typed value (measured), not expanded
+    (when (seq (:about meta))
+      (let [e (first (first (into [] (datom/q '[:find ?e :in $ ?id :where [?e :verdict/id ?id]]
+                                              (datom/db ledger) id))))]
+        (datom/transact! ledger (mapv (fn [a] [:db/add e :verdict/about a]) (distinct (:about meta))))))
+    id))
+
+(def ^:private PULL
+  [:verdict/id :verdict/claim :verdict/modality :verdict/engine :verdict/why
+   :verdict/seed :verdict/tried :verdict/witness :verdict/replay :verdict/about
+   :verdict/by :verdict/at])
+
+(defn all
+  "Every verdict, newest first; `since` (epoch ms) narrows."
+  ([ledger] (all ledger 0))
+  ([ledger since]
+   (let [d (datom/db ledger)
+         es (into [] (datom/q '[:find ?e ?at :in $ ?since
+                                :where [?e :verdict/at ?at] [(>= ?at ?since)]]
+                              d since))]
+     (mapv (fn [[e _]] (datom/pull d PULL e))
+           (reverse (sort-by second es))))))
+
+(defn about
+  "Every verdict resting on `thing` (a string naming code: \"ns/fn\")."
+  [ledger thing]
+  (let [d (datom/db ledger)]
+    (mapv (fn [[e]] (datom/pull d PULL e))
+          (into [] (datom/q '[:find ?e :in $ ?t :where [?e :verdict/about ?t]] d thing)))))
+
+(def ^:private SECTIONS
+  [[:refuted "Refuted"] [:unknown "Unknown"] [:witnessed "Witnessed (sampled — not a proof)"]
+   [:proven "Proven"]])
+
+(defn- line [v]
+  (str "- " (:verdict/claim v)
+       " — " (name (or (:verdict/engine v) :unknown))
+       (if (some? (:verdict/tried v)) (str ", " (:verdict/tried v) " tried") "")
+       (if (some? (:verdict/seed v)) (str ", seed " (:verdict/seed v)) "")
+       (if (and (= :refuted (:verdict/modality v)) (some? (:verdict/witness v)))
+         (str "\n  witness: " (pr-str (:verdict/witness v))) "")
+       (if (some? (:verdict/replay v)) (str "\n  replay: " (:verdict/replay v)) "")
+       "  [" (:verdict/id v) "]"))
+
+(defn report
+  "Markdown: refuted first (what is broken), then unknown, witnessed, proven —
+   each line with its engine, effort, seed, witness and replay. Only recorded
+   verdicts appear, so the report cannot claim what was not checked."
+  ([ledger] (report ledger 0))
+  ([ledger since]
+   (let [vs (all ledger since)
+         by (group-by :verdict/modality vs)]
+     (join "\n"
+       (mapcat (fn [[k title]]
+                 (let [xs (get by k)]
+                   (if (empty? xs) []
+                     (concat [(str "## " title " (" (count xs) ")")] (map line xs) [""]))))
+               SECTIONS)))))

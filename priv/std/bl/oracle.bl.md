@@ -1,7 +1,7 @@
 # bl.oracle — the oracle's own dashboard
 
 The tree can already measure itself in three places, and none of them adds up.
-`decide/cost` times one process's decisions. `Z3.Ledger` keeps a `:counters`
+`decide/cost` times one process's decisions. `system.ledger` keeps a `:counters`
 rollup of who answered. `z3corpus/corpus` walks a tree of `.bl` files and asks
 `system.core/verify-process` about every machine it finds. What is missing is the
 thing a developer actually runs: **one command that rolls those up and prints

@@ -1,0 +1,264 @@
+; drop_pack_test.bl — `drop/pack`: sealing a release directory into a drop,
+; pinned against the Rust packer's bytes.
+;
+; Ported from the ExUnit `test/beam_lisp/build_pack_test.exs`, which was the
+; last live caller of the Elixir façade `BeamLisp.Drop` (now deleted). The calls
+; go straight to `priv/build/drop.bl` — `dr/walk-files`, `dr/tar`, `dr/payload`,
+; `dr/gzip`, `dr/gunzip`, `dr/parse-trailer`, `dr/verify`, `dr/pack` — with no
+; interop boundary in the path, so the façade's one wrinkle is gone with it: bl
+; vectors (the `[rel abs]` walk pairs, the path list) arrived in Elixir as
+; `%BeamLisp.Vector{}` and were normalised by the old `bl/1` helper. Here the
+; values are native and the path lists compare against `[...]` literals.
+;
+; The acceptance is BYTE-IDENTITY with `drop pack` on the same tree, so the test
+; does exactly that: build a fixture release, pack it with the Rust tool, pack
+; it with the language, and compare — the uncompressed TAR first (which isolates
+; tar exactness from deflate exactness), then the payload, then the whole
+; compound. When they differ the test says at WHICH layer, which is the only way
+; to know whether the difference is a fixable dialect mistake or a different
+; deflate implementation.
+;
+; The fixture is deliberately small and awkward: a nested directory, a file over
+; one 512-byte block (so padding is exercised), an empty file, and a file whose
+; name sorts before and after a directory name (so the walk ORDER matters). It
+; is built ONCE per run through an atom, because the byte comparison needs ONE
+; tree: rebuilding it between tests would re-roll the random bytes and the two
+; producers would be packing different input.
+;
+; ── WHAT IS OPTIONAL, AND WHY THAT IS SAID OUT LOUD ────────────────────────
+;
+; The Rust comparison depends on an optional packer (`BL_DROP`, default
+; `/home/user/.cache/cargo-target/release/drop`); the full launch depends on a
+; stock launcher (`BL_LAUNCHER`). Absent, each PRINTS which path is missing.
+; The full launch assembles a fresh release at `/tmp/beam_lisp_release_tree`
+; unless `BL_RELEASE_TREE` explicitly supplies a prebuilt tree; a broken tree
+; fails instead of silently skipping the launch. Everything else — the walk order, the
+; trailer arithmetic and digest, the gzip round trip, the executable bit and the
+; launcher prefix, the native-object refusal — runs for real, always.
+;
+; Two files under `/tmp` are left behind on purpose, exactly as the ExUnit test
+; left them: `/tmp/beam_lisp_pack_rust.bl` and `/tmp/beam_lisp_pack_ours.bl` are
+; the two producers' compounds other suites compare (`pristine_test`'s
+; two-producer case names both paths).
+;
+; Run: bin/bl test test/bl/drop_pack_test.bl
+
+(ns drop-pack.test
+  (:require [drop :as dr] [release :as rel]))
+
+(def release-dir "/tmp/beam_lisp_pack_fixture")
+(def launcher-path "/tmp/beam_lisp_pack_launcher")
+(def rust-out "/tmp/beam_lisp_pack_rust.bl")
+(def ours-out "/tmp/beam_lisp_pack_ours.bl")
+(def wrong-out "/tmp/beam_lisp_pack_wrong.bl")
+
+; A path over the 100-byte ustar name field: the crate writes a GNU
+; `././@LongLink` entry for it, and a packer that just pads the name field
+; produces a header that is not 512 bytes — every reader rejects it.
+(def long-name (str (String/duplicate "N" 90) ".beam"))
+
+(def fixture-state (atom nil))
+
+; ── the fixture ─────────────────────────────────────────────────────────────
+; Built once for the file. The atom is per-run state (the runner forks a fresh
+; env per file), so the memo cannot leak between files — and within one file it
+; is what makes the two producers pack the SAME tree.
+
+(defn- fixture!
+  []
+  (or @fixture-state
+      (do
+        (File/rm_rf! release-dir)
+        (File/mkdir_p! (Path/join release-dir "bin"))
+        (File/mkdir_p! (Path/join release-dir "lib/thing-0.1.0/ebin"))
+        (File/mkdir_p! (Path/join release-dir "lib/thing-0.1.0/priv/deep"))
+
+        (File/write! (Path/join release-dir "bin/bl") "#!/bin/sh\necho fixture\n")
+        (File/write! (Path/join release-dir "lib/thing-0.1.0/ebin/thing.app")
+                     "{application, thing, []}.\n")
+        (File/write! (Path/join release-dir "lib/thing-0.1.0/priv/data.bin")
+                     (crypto/strong_rand_bytes 1500))
+        (File/write! (Path/join release-dir "lib/thing-0.1.0/priv/empty") "")
+        (File/write! (Path/join release-dir "lib/thing-0.1.0/priv/deep/leaf.txt")
+                     (String/duplicate "leaf\n" 40))
+        (File/write! (Path/join release-dir (str "lib/thing-0.1.0/ebin/" long-name))
+                     "LONG")
+
+        ; A release must carry a native object for the target or `drop pack`
+        ; refuses it ("wrong release for this target?") — a 4-byte ELF magic is
+        ; enough for that question, which is all either packer asks.
+        (File/write! (Path/join release-dir "lib/thing-0.1.0/priv/native.so")
+                     (erlang/iolist_to_binary (list 127 "ELF" 0 0 0 0)))
+
+        (File/write! launcher-path
+                     (erlang/iolist_to_binary (list "LAUNCHER-BYTES-"
+                                                    (crypto/strong_rand_bytes 64))))
+        (reset! fixture-state true))))
+
+; ── helpers ─────────────────────────────────────────────────────────────────
+
+(defn- payload-of
+  "The payload slice of a compound, located by its own trailer."
+  [compound]
+  (let [t (dr/parse-trailer
+            (binary/part compound (- (erlang/byte_size compound) 56) 56))]
+    (binary/part compound (:offset t) (:len t))))
+
+(defn- first-difference
+  "Where two binaries first disagree, or that they agree over the shorter one."
+  [a b]
+  (let [n (min (erlang/byte_size a) (erlang/byte_size b))]
+    (loop [i 0]
+      (if (>= i n)
+        (str "identical over the first " n " bytes; sizes "
+             (erlang/byte_size a) " vs " (erlang/byte_size b))
+        (if (not= (binary/at a i) (binary/at b i))
+          (str "first difference at byte " i ": ours " (binary/at a i)
+               " vs rust " (binary/at b i))
+          (recur (+ i 1)))))))
+
+(defn- yes [x] (if x "yes" "no"))
+
+; ── the tests ───────────────────────────────────────────────────────────────
+
+(deftest the-walk-order-is-depth-first-and-lexicographic-like-the-packers
+  (fixture!)
+  (let [rels (vec (map (fn [pair] (first pair)) (dr/walk-files release-dir)))]
+    ; `bin/` sorts before `lib/`; inside lib, the app dir before its children;
+    ; `empty` (a file) before the `deep` DIRECTORY only if "deep" < "empty" —
+    ; here 'd' < 'e', so deep/leaf.txt comes first. That ordering is the thing
+    ; a "glob everything and sort" implementation gets wrong.
+    (is (= rels
+           ["bin/bl"
+            (str "lib/thing-0.1.0/ebin/" long-name)
+            "lib/thing-0.1.0/ebin/thing.app"
+            "lib/thing-0.1.0/priv/data.bin"
+            "lib/thing-0.1.0/priv/deep/leaf.txt"
+            "lib/thing-0.1.0/priv/empty"
+            "lib/thing-0.1.0/priv/native.so"]))))
+
+(deftest the-tar-and-the-payload-against-the-rust-packer
+  (fixture!)
+  (let [drop-bin (or (System/get_env "BL_DROP")
+                     "/home/user/.cache/cargo-target/release/drop")]
+    (if (File/exists? drop-bin)
+      (let [c (System/cmd drop-bin
+                          (to-list ["pack" "--release" release-dir
+                                    "--launcher" launcher-path "--out" rust-out])
+                          (to-list [(tuple :stderr_to_stdout true)]))
+            out (elem c 0)
+            code (elem c 1)]
+        (is (= 0 code) (str "drop pack failed:\n" out))
+
+        (let [rust-compound (File/read! rust-out)
+              rust-payload (payload-of rust-compound)
+              rust-tar (dr/gunzip rust-payload)
+              ours-tar (dr/tar release-dir)
+              ours-payload (dr/payload release-dir)]
+
+          (println (str "drop_pack_test: rust tar " (erlang/byte_size rust-tar)
+                        " B, ours " (erlang/byte_size ours-tar) " B"))
+          (println (str "drop_pack_test: rust payload " (erlang/byte_size rust-payload)
+                        " B, ours " (erlang/byte_size ours-payload) " B"))
+          (println (str "drop_pack_test: tar identical?     " (yes (= ours-tar rust-tar))))
+          (println (str "drop_pack_test: payload identical? " (yes (= ours-payload rust-payload))))
+
+          ; The tar is ours to get exactly right: same bytes, byte for byte.
+          (is (= ours-tar rust-tar) (first-difference ours-tar rust-tar))
+
+          ; The payload wraps that tar in OUR gzip envelope. If flate2 and
+          ; Erlang's zlib agree the bytes match; if they do not, the difference
+          ; is confined to the deflate stream, and the test says so instead of
+          ; pretending.
+          (if (= ours-payload rust-payload)
+            (println "drop_pack_test: deflate streams agree — the compound is byte-identical")
+            (do
+              ; Same input, same header AND TRAILER bytes, different deflate
+              ; stream: flate2's compressor and Erlang's zlib do not emit
+              ; identical blocks. The envelope is OURS to get right, so both
+              ; ends of it are asserted — the 10-byte header, and the 8-byte
+              ; trailer (crc32 and isize of the SAME tar, both little-endian),
+              ; whatever the compressor did in between. Measured: the Rust
+              ; packer's own trailer decodes as exactly crc32/isize of its
+              ; payload's tar, which is the tar we gzipped.
+              (is (= (binary/part ours-payload 0 10) (binary/part rust-payload 0 10)))
+              (is (= (binary/part ours-payload (- (erlang/byte_size ours-payload) 8) 8)
+                     (binary/part rust-payload (- (erlang/byte_size rust-payload) 8) 8)))
+
+              (println "drop_pack_test: deflate streams DIFFER (same tar, same header/trailer)")))))
+
+      (do
+        (println (str "drop_pack_test: skipped the Rust-packer comparison — no packer at "
+                      drop-bin "; set BL_DROP to compare against it"))
+        (is true)))))
+
+(deftest a-packed-drop-verifies-and-runs
+  (fixture!)
+  (let [r (dr/pack release-dir launcher-path ours-out 0)]
+    (is (:ok? r) (str "pack refused: " (pr-str (:errors r))))
+    (is (File/exists? ours-out))
+
+    ; The trailer we wrote describes the file we wrote.
+    (let [v (dr/verify ours-out)]
+      (is (:ok? v) (str "our own compound must verify: " (pr-str v)))
+      (is (= (:size v) (+ (:offset r) (:len r) 56)))
+      (is (= (:expected v) (:sha r))))
+
+    ; And the payload is our own tar, gzipped: the round trip through a real
+    ; reader (gunzip) returns exactly the bytes `tar` produced.
+    (is (= (dr/gunzip (dr/payload release-dir)) (dr/tar release-dir)))
+
+    ; It is executable, and the launcher prefix is intact.
+    (is (not= 0 (erlang/band (:mode (File/stat! ours-out)) 73)))  ; 73 = 0o111
+    (is (= (binary/part (File/read! ours-out) 0 (erlang/byte_size (File/read! launcher-path)))
+           (File/read! launcher-path)))))
+
+(deftest a-drop-we-packed-sealed-with-the-real-launcher-runs
+  ; The whole wave in one test: assemble and pack a fresh release tree,
+  ; with the stock `drop-launcher` as the prefix, then run the result. If this
+  ; passes, the language can seal a drop without the Rust tool; the Rust tool's
+  ; own acceptance is then a byte-diff inside the deflate stream, which the test
+  ; above measures rather than assumes.
+  (let [launcher (or (System/get_env "BL_LAUNCHER")
+                     "/home/user/.cache/cargo-target/release/drop-launcher")
+        tree (or (System/get_env "BL_RELEASE_TREE")
+                 "/tmp/beam_lisp_release_tree")]
+    (cond
+      (not (File/exists? launcher))
+      (do
+        (println (str "drop_pack_test: skipped the self-packed run — no launcher at "
+                      launcher "; set BL_LAUNCHER to run this"))
+        (is true))
+
+      :else
+      (let [provided? (some? (System/get_env "BL_RELEASE_TREE"))
+            assembled (if provided?
+                        {:ok? (File/dir? (Path/join tree "bin"))}
+                        (do (File/rm_rf! tree)
+                            (rel/assemble (rel/value :beam_lisp) tree)))
+            out "/tmp/beam_lisp_selfpacked.bl"]
+        (is (:ok? assembled)
+            (str "release fixture unavailable: " tree " " (pr-str (:errors assembled))))
+        (File/rm out)
+        (let [r (dr/pack tree launcher out 0)]
+          (is (:ok? r) (str "pack refused: " (pr-str (:errors r))))
+
+          ; It is a drop by our own reader...
+          (is (:ok? (dr/verify out)))
+
+          ; ...and by the LAUNCHER, which is the acceptance: a stock launcher, a
+          ; payload we built, and a release that runs.
+          (let [c (System/cmd out (to-list ["version"])
+                              (to-list [(tuple :stderr_to_stdout true)]))]
+            (is (= 0 (elem c 1)) (str "packed drop failed to run:\n" (elem c 0)))
+            (is (includes? (elem c 0) "0.1.0")
+                (str "the packed drop must report the release: " (elem c 0)))))))))
+
+(deftest a-release-with-no-native-object-for-the-target-is-refused
+  (fixture!)
+  ; Same tree, wrong target: `drop pack` says "wrong release for this target?",
+  ; and so does this packer — before it writes anything.
+  (let [r (dr/pack release-dir launcher-path wrong-out 1)]
+    (is (not (:ok? r)))
+    (is (some (fn [e] (includes? (str e) "wrong release for this target")) (:errors r)))
+    (is (not (File/exists? wrong-out)) "a refused pack must leave no file behind")))

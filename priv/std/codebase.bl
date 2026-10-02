@@ -55,6 +55,8 @@
    ;; with depth ≥ 1 is one request per row of the enclosing collection: the
    ;; N+1 class, answered by `bl ask nplus1` as a query over these facts.
    {:db/ident :call/loop-depth :db/valueType :db.type/long :db/index true}
+   {:db/ident :call/effective-loop-depth :db/valueType :db.type/long :db/index true}
+   {:db/ident :call/cost-coverage :db/valueType :db.type/string :db/index true}
    ;; require edges (the namespace graph as facts): one entity per edge, so a
    ;; cycle in the static `:require` graph is a QUERY over the same store —
    ;; answered by sg/cycles (require-cycles below), never by loading a
@@ -90,10 +92,43 @@
   "The version of the fact SCHEMA these indexers emit. Part of every cache
    key beside the source hash: a source that has not changed still needs
    re-reading when the facts it yields have gained a column."
-  "facts-2")
+  "facts-3")
 
-(def LOOP-HEADS shape/LOOP-HEADS)
-(def STORE-READ-NAMES shape/STORE-READ-NAMES)
+;; The N+1 vocabulary lives in ONE home (`datalog-shape`, which both this
+;; namespace and `deodorant` read), and this is the door to it.
+;;
+;; A bare `shape/LOOP-HEADS` at a use site cannot be used, and the reason is
+;; narrower than it looks: this code runs in MORE THAN ONE Env. The durable
+;; analysis path (`analyze-cached`, taken once the native backend is
+;; initialised) evaluates the index in an Env seeded with the CORE only, so a
+;; call-site reference to a std namespace's var raises `undefined var:
+;; datalog-shape/LOOP-HEADS` — measured, with `[codebase :as cb] [typed :as tt]
+;; [vm.paths]` and nothing else, while the same call in the CLI's Env succeeds.
+;;
+;; So the door ENSURES the home is initialised before reading it (the idiom is
+;; `bl.search`'s and `bl.cli`'s), and remembers that it did. The alternative —
+;; a copy of the sets in every consumer — is two homes for one vocabulary, and
+;; the drift between them is a bug report about the tools rather than the code;
+;; the other alternative, a bare var, is a tool that depends on which Env it
+;; happens to run in.
+(defn- vocab
+  "`{:loops :reads :callee-name}` from `datalog-shape`, loaded if this Env has
+   not initialised it."
+  []
+  (let [hit (erlang/get :datalog-shape-vocab)]
+    ; `erlang/get` answers :undefined for an unset key, NOT nil — so `some?`
+    ; here would treat "no memo yet" as a hit and hand back :undefined, which
+    ; `get` then reads as a vocabulary of nil: the lint stops firing and
+    ; reports nothing, quietly. (The same trap `oracle.bl:289` documents.)
+    (if (and (some? hit) (not= :undefined hit))
+      hit
+      (let [v (do (try (BeamLisp.Loader/ensure_loaded "datalog-shape")
+                       (catch _ nil))
+                  {:loops datalog-shape/LOOP-HEADS
+                   :reads datalog-shape/STORE-READ-NAMES
+                   :callee-name datalog-shape/callee-name})]
+        (erlang/put :datalog-shape-vocab v)
+        v))))
 
 (def special-heads
   #{"ns" "def" "fn" "if" "do" "quote" "syntax-quote" "let" "loop" "recur"
@@ -245,7 +280,18 @@
             (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth))
                     [acc next-id] items)
             (let [hname (node-name head)
-                  loop? (contains? LOOP-HEADS hname)
+                  foreign-index (get {"Enum/map" 1 "Enum/each" 1
+                                      "Elixir.Enum/map" 1 "Elixir.Enum/each" 1
+                                      "Enum/reduce" (- (count (rest items)) 1)
+                                      "Elixir.Enum/reduce" (- (count (rest items)) 1)
+                                      "lists/map" 0 "lists/foldl" 0 "lists/foldr" 0}
+                                     hname)
+                  loop? (or (contains? (get (vocab) :loops) hname) (some? foreign-index))
+                  callback-arity (cond
+                                   (contains? #{"reduce" "reductions" "Enum/reduce" "Elixir.Enum/reduce"
+                                                "lists/foldl" "lists/foldr"} hname) 2
+                                   (contains? #{"map" "mapv" "mapcat"} hname) (- (count (rest items)) 1)
+                                   :else 1)
                   ; Which arguments run per element. `for`/`doseq`: the BODY
                   ; (everything after the binding vector). The `map` family:
                   ; the FUNCTION (first arg) — the collection argument is
@@ -253,12 +299,24 @@
                   per-element? (fn [k]
                                  (cond
                                    (not loop?) false
+                                   (some? foreign-index) (= k foreign-index)
                                    (contains? #{"for" "doseq"} hname) (>= k 1)
                                    :else (= k 0)))
                   rec-children (fn [a i]
                                  (reduce (fn [[a2 i2] [k sub]]
-                                           (walk-calls-at caller ns-str sub a2 i2 hint
-                                                          (if (per-element? k) (+ depth 1) depth)))
+                                           (let [inner-depth (if (per-element? k) (+ depth 1) depth)
+                                                 f (node-form sub)]
+                                             (if (and (per-element? k)
+                                                      (not (contains? #{"for" "doseq"} hname))
+                                                      (= :symbol (node-tag f)))
+                                               (let [p (node-pos sub)]
+                                                 [(conj a2 {:db/id i2 :call/caller caller
+                                                            :call/callee (node-name f)
+                                                            :call/arity callback-arity
+                                                            :call/line (if p (:line p) 0)
+                                                            :call/loop-depth inner-depth})
+                                                  (inc i2)])
+                                               (walk-calls-at caller ns-str sub a2 i2 hint inner-depth))))
                                          [a i] (map-indexed (fn [k x] [k x]) (rest items))))]
               (cond
                 ; a loop head is walked as WRITTEN, never through its
@@ -452,6 +510,53 @@
                    fn-acc (concat call-acc cf)
                    (if (nil? ifact) instr-acc (concat instr-acc [ifact])))))))))
 
+(defn- graph-reachable [graph roots]
+  (loop [seen #{} todo (into [] roots)]
+    (if (empty? todo) seen
+      (let [n (first todo)]
+        (if (contains? seen n)
+          (recur seen (rest todo))
+          (recur (conj seen n) (concat (rest todo) (get graph n #{}))))))))
+
+(defn loop-context
+  "Add potential local call-path loop depths to indexed facts.
+   Syntactic depths stay unchanged. Recursive contexts make no finite-depth
+   claim; callers outside this source remain outside the analysis."
+  [ns-str facts]
+  (let [names (set (map :fn/name (:fn facts)))
+        local (fn [s]
+                (cond
+                  (contains? names s) s
+                  (and (string? s) (String/starts_with? s (str ns-str "/")))
+                    (let [n (String/replace_prefix s (str ns-str "/") "")]
+                      (when (contains? names n) n))
+                  :else nil))
+        edges (keep (fn [c]
+                      (let [to (local (:call/callee c))]
+                        (when to [(:call/caller c) to (get c :call/loop-depth 0)])))
+                    (:calls facts))
+        graph (reduce (fn [g [from to _]] (update g from (fn [xs] (conj (or xs #{}) to))))
+                      {} edges)
+        recursive (set (filter (fn [n]
+                                 (contains? (graph-reachable graph (get graph n #{})) n))
+                               names))
+        unknown (graph-reachable graph recursive)
+        depths (loop [n (count names) ds {}]
+                 (if (= n 0) ds
+                   (let [next (reduce (fn [d [from to w]]
+                                        (assoc d to (max (get d to 0) (+ (get ds from 0) w))))
+                                      ds edges)]
+                     (if (= next ds) ds (recur (dec n) next)))))]
+    (assoc facts :calls
+      (mapv (fn [c]
+              (let [caller (:call/caller c)]
+                (if (contains? unknown caller)
+                  (assoc (dissoc c :call/effective-loop-depth) :call/cost-coverage "recursive")
+                  (assoc c :call/cost-coverage "local-context"
+                           :call/effective-loop-depth
+                           (+ (get depths caller 0) (get c :call/loop-depth 0))))))
+            (:calls facts)))))
+
 (defn index-source
   "Source text → {:fn […] :calls […] :instr […] :requires […]}.
 
@@ -464,7 +569,7 @@
   (when-not (string? src)
     (throw (ex-info "codebase/index-source: source is not a string"
                     {:ns ns-str :source src})))
-  (assoc (index-forms sigs ns-str (BeamLisp.Reader/read_string src))
+  (assoc (loop-context ns-str (index-forms sigs ns-str (BeamLisp.Reader/read_string src)))
          :requires (requires-facts ns-str src)))
 
 (defn connect-codebase
@@ -847,21 +952,30 @@
    sorted by caller then line.
 
    The N+1 CLASS as a question over facts: every `:call/*` row whose callee
-   is a datom read and whose `:call/loop-depth` is ≥ 1 is one store request
-   per row of the enclosing collection. deodorant's `datalog/n+1-read` smell
+   is a datom read with syntactic or inherited loop depth ≥ 1 may issue one
+   store request per row. Inherited context covers local helpers; recursive
+   and external call contexts remain partial rather than a finite cost proof. deodorant's `datalog/n+1-read` smell
    reports the same sites file by file at lint time; this is the whole-corpus
    view, answerable from the indexed store in milliseconds."
   [db]
-  (sort (into []
-    (filter (fn [row] (contains? STORE-READ-NAMES (shape/callee-name (nth (vec row) 1))))
-            (datom/q '[:find ?caller ?callee ?line ?d
-                       :where
-                       [?c :call/loop-depth ?d]
-                       [(>= ?d 1)]
-                       [?c :call/caller ?caller]
-                       [?c :call/callee ?callee]
-                       [?c :call/line ?line]]
-                     db)))))
+  (let [{:keys [reads callee-name]} (vocab)
+        rows (concat
+               (datom/q '[:find ?caller ?callee ?line ?d :where
+                          [?c :call/loop-depth ?d] [(>= ?d 1)]
+                          [?c :call/caller ?caller] [?c :call/callee ?callee]
+                          [?c :call/line ?line]] db)
+               (datom/q '[:find ?caller ?callee ?line ?d :where
+                          [?c :call/effective-loop-depth ?d] [(>= ?d 1)]
+                          [?c :call/caller ?caller] [?c :call/callee ?callee]
+                          [?c :call/line ?line]] db))
+        sites (reduce (fn [m row]
+                        (let [[caller callee line depth] (vec row)
+                              k [caller callee line]
+                              old (get m k)]
+                          (if (contains? reads (callee-name callee))
+                            (assoc m k [caller callee line (max depth (if old (nth old 3) 0))])
+                            m))) {} rows)]
+    (sort (vals sites))))
 
 (defn arity-mismatches
   "Calls whose callee is defined but never at the called arity

@@ -11,23 +11,59 @@
 //! # Why it is here at all
 //!
 //! A beam-lisp call costs ~0.7–1.0 us (measured), and a serialiser needs several per
-//! node, so bl-level traversal cannot compete with a native loop. MEASURED, same
-//! process, 24.3 KB, best of 11:
+//! node, so bl-level traversal cannot compete with a native loop.
+//!
+//! MEASURED with `bench/json.bl`, 51 samples, medians, one build, on a 24.3 KB mixed
+//! document (3501 JSON values). These move with host load, so they are quoted as a set
+//! and never as a single number — the same decode read 0.22, 0.35, 0.47 and 1.19 ms across
+//! one session while nothing about the code changed. They are also ORDER-SENSITIVE: the
+//! harness used to time one layer's 51 samples and then the next layer's, so each landed
+//! in the noise regime of its own second (an ordered run put the wrapper at 1.81x the NIF;
+//! a rotated one, 0.82x). The decode layers are interleaved now. Read the ratios.
 //!
 //! ```text
-//!                     bl.json today    this crate    Jason
-//!   encode            16–23 ms         0.43–0.59 ms  0.46–0.57 ms
-//!   decode            2.5 ms           0.85 ms       0.35 ms
+//!                      bl.json   NIF   OTP   Jason
+//!   decode 24.3 KB      0.40 ms  0.42  0.42  0.49
+//!   flat 500-key        0.12 ms  0.14  0.16  0.18
+//!   500 ints            0.03 ms  0.03  0.03  0.04
+//!   ~110 B frame        0.01 ms  0.01  0.00  0.00
 //! ```
 //!
-//! Encode is at parity with Jason and ~30x better than assembling in bl. Decode is 3x
-//! better than bl.json; the remaining 2.5x gap splits into 0.35 ms of building bl
-//! Vectors (which Jason does not do, because bl documents that arrays decode to Vectors
-//! so a round trip holds) and a ~1.5x serde-visitor cost that would need a hand-written
-//! parser to remove.
+//! One INTERLEAVED run, so the four columns share a noise regime and comparing them means
+//! something. `bl.json` and the NIF are the same call — the wrapper measured 0.96x the raw
+//! NIF, i.e. nothing. Against Jason that is parity on the big document, 1.5x ahead on the
+//! flat one, and BEHIND on a 110-byte frame, where the crossing is not paid back.
 //!
-//! Both directions are byte-compatible with the codec they replace, and compose:
-//! `bl.json/encode(json_decode(bytes)) == bytes`.
+//! Where the time goes, from instruments that isolate a layer instead of comparing columns:
+//! `json-count` holds the parser and the visitor and builds no terms, which puts the parse
+//! at roughly half of a mixed decode; `binary_to_term` on the same values is the floor
+//! beneath both.
+//!
+//! Per byte, since the corpora differ: the counting parse measures 2.9 ns/byte in a
+//! standalone Rust bench with no BEAM in it at all (24,281 B, best of 200), which is the
+//! floor serde_json reaches when it builds nothing. `json-count` and the full decode
+//! report the SAME parse time, which is what proves no intermediate tree is built and no
+//! second pass over the terms happens.
+//!
+//! The decoder measured 0.88 ms before terms were built with raw `enif_*` calls instead of
+//! rustler's per-value wrappers, and 0.60 ms after; hoisting the Vector atoms out of the
+//! per-Vector path took it to 0.22 ms. Vector construction fell from 591 to 117 ns across
+//! three interleaved A/B pairs. Encoding 24.3 KB costs 0.29 ms here against 14.1 ms
+//! through bl's own walk, which is why the byte loop lives in Rust at all.
+//!
+//! `json-count` is what makes the rest attributable: it holds the parser, the visitor
+//! machinery and the input constant, and varies ONLY whether Erlang terms are built. That
+//! puts the parse at ~0.12 ms of a 0.22 ms decode, and BEAM's own construction of the same
+//! values from ETF at 0.06 ms. What remains is therefore roughly the parse plus 2x BEAM's
+//! own builder — no single hotspot left, and the cheap levers are spent: `arbitrary_precision`
+//! is load-bearing (see its note in Cargo.toml), `Cow`-borrowed keys measured SLOWER because
+//! serde_json's key reader already reuses a scratch buffer, and the output-buffer copy in
+//! `json_encode` is under 1%.
+//!
+//! The two directions are VALUE-compatible with the codec they replace, and compose:
+//! `bl.json/decode(bl.json/encode(v)) == v`. Not BYTE-compatible, and the distinction is
+//! real: a float can come back as `35000000000.0` where bl's own walk wrote `3.5e10` — the
+//! same number, spelled differently. `bl.json`'s suite compares values.
 //!
 //! # Two things this crate must NOT do
 //!
@@ -618,9 +654,13 @@ fn json_count(data: Binary) -> NifResult<u64> {
             while let Some(c) = s.next_element_seed(S)? { n += c; }
             Ok(n)
         }
-        // A number still arrives as a one-entry map under `arbitrary_precision`, so it
-        // counts 2 here and 1 in `json-decode`'s terms. Irrelevant to timing; noted so the
-        // count is not mistaken for a term count.
+        // A FLOAT arrives as a one-entry map under `arbitrary_precision`, so it counts 2
+        // here and 1 in `json-decode`'s terms — measured: a `[1.5]` document counts 3
+        // nodes, and 2 without the flag. In-range integers do NOT take this path
+        // (`[1,2,3]` counts 4 either way); only a number whose lexeme has to be kept
+        // does, which is exactly the point — it is how a wider-than-i64 integer is
+        // noticed and declined instead of silently becoming an f64. Irrelevant to
+        // timing; noted so the count is not mistaken for a term count.
         fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<u64, A::Error> {
             let mut n = 1;
             while let Some(_k) = m.next_key::<String>()? {

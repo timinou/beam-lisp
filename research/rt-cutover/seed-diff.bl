@@ -1,0 +1,115 @@
+; seed-diff.bl — the tables `seed-core` writes, against the ones the Elixir
+; runtime writes. The oracle cannot see these: every oracle row calls the facade
+; directly and never consults the `core` table the seeder builds.
+;
+; Each seeder runs in its OWN forked env, so what the fork holds afterwards is
+; exactly what that seeder wrote and nothing the prelude added. Then:
+;
+;   LINKS   row by row, as terms, with `BeamLisp.RT` renamed to the facade.
+;           A link row decides how a BARE name compiles — a wrong row is a
+;           miscompile in every namespace that calls the name.
+;   VALUES  by callable SHAPE (plain fn arity, or multi-fn arities + variadic
+;           minimum), then by BEHAVIOUR on the prims whose value is a closure
+;           the facade does not export (arithmetic, chains, `str`).
+;   EXPORTS every link row's target function exists at the arity it names.
+;
+; Run: BL_NO_LOCK=1 bin/bl -p research/rt-cutover run research/rt-cutover/seed-diff.bl
+
+(ns rt.seed-diff
+  (:require [rt :as r]))
+
+(def RT-OLD :"Elixir.BeamLisp.RT")
+(def RT-NEW :"Elixir.BeamLisp.Ns.Rt")
+(def BLFN (erlang/binary_to_atom "$blfn"))
+
+(defn- own-rows [key-pat]
+  (into {} (map (fn [row] [(first row) (second row)])
+                (BeamLisp.Env/match_own (erlang/list_to_tuple (list key-pat :$2))))))
+
+(defn- tables
+  "Run `seed!` in a fresh fork; answer what it wrote."
+  [seed!]
+  (BeamLisp.Env/isolated
+    (fn []
+      (seed!)
+      {:links (own-rows (erlang/list_to_tuple (list :link "core" :$1)))
+       :core (own-rows (erlang/list_to_tuple (list "core" :$1)))
+       :cpp (own-rows (erlang/list_to_tuple (list "cpp" :$1)))})))
+
+(defn- canon-link [info]
+  (let [[m fixed v] (erlang/tuple_to_list info)]
+    (erlang/list_to_tuple (list (if (erlang/== m RT-OLD) RT-NEW m) fixed v))))
+
+(defn- shape
+  "A callable's arity signature, independent of which module implements it."
+  [f]
+  (cond
+    (erlang/is_function f) [:fn (erlang/element 2 (erlang/fun_info f :arity))]
+    (and (erlang/is_tuple f) (erlang/== 3 (erlang/tuple_size f)) (erlang/== BLFN (erlang/element 1 f)))
+      (let [v (erlang/element 3 f)]
+        [:multi (sort (keys (erlang/element 2 f))) (when (erlang/is_tuple v) (erlang/element 1 v))])
+    :else [:other f]))
+
+(defn- exported? [info]
+  (let [[m fixed v] (erlang/tuple_to_list info)]
+    (and (erlang/is_atom m)
+         (do (code/ensure_loaded m) true)
+         (every? (fn [[a f]] (erlang/function_exported m f a)) fixed)
+         (or (nil? v)
+             (and (erlang/is_tuple v)
+                  (erlang/function_exported m (erlang/element 2 v) (erlang/+ 1 (erlang/element 1 v))))))))
+
+(defn- outcome [f args]
+  (try {:ok (BeamLisp.RT/invoke f args)} (catch _e :raised)))
+
+(def behaviour-rows
+  [["+" []] ["+" [1 2 3]] ["*" []] ["*" [2 3 4]] ["-" [5]] ["-" [10 1 2]]
+   ["/" [2]] ["/" [12 2 3]] ["<" [1 2 3]] ["<" [1 3 2]] [">" [3 2 1]]
+   ["<=" [1 1 2]] [">=" [2 2 1]] ["==" [1 1.0]] ["=" [[1] '(1) [1]]] ["=" [1 2]]
+   ["str" []] ["str" [nil "a" :b 1]] ["not" [nil]] ["concat" [[1] '(2)]]
+   ["apply" [(fn [x] (count x)) [[1 2]]]] ["list*" [1 [2]]] ["hash-map" [:a 1 :b 2]]
+   ["map" [(fn [x] (count x)) [[1] [1 2]]]] ["get" [{:a 1} :a]] ["nth" [[1 2] 5 :d]]])
+
+; Rows where the Elixir table was WRONG and this one is not, each with the
+; defect. `rt.ex`'s `rt_fns` gave an atom spec arity 2 unconditionally, so these
+; three linked at an arity whose function does not exist: `(pr-str x)` missed
+; the link and fell back to `invoke`, and `(pr-str a b)` raised
+; UndefinedFunctionError instead of an arity error. The rows here link the
+; arity that exists.
+(def declared
+  {"pr-str" "rt.ex linked print_readably/2, which does not exist"
+   "print-str" "rt.ex linked print_str/2, which does not exist"
+   "read-data" "rt.ex linked read_data/2, which does not exist"})
+
+(defn- report [label pairs]
+  (println (str label ": " (count pairs)))
+  (doseq [[n a b] pairs] (println (str "  " n "\n    old " (pr-str a) "\n    new " (pr-str b)))))
+
+(defn run []
+  (let [old (tables (fn [] (BeamLisp.RT/seed_core)))
+        new (tables (fn [] (r/seed-core)))
+        cmp (fn [k f]
+              (let [o (get old k) n (get new k)]
+                (->> (distinct (concat (keys o) (keys n))) sort
+                     (map (fn [nm] [nm (some-> (get o nm) f) (some-> (get n nm) f)]))
+                     (filter (fn [[_ a b]] (not (erlang/=:= a b)))))))
+        behave (->> behaviour-rows
+                    (map (fn [[nm args]]
+                           [(str nm " " (pr-str args))
+                            (outcome (get (:core old) nm) args)
+                            (outcome (get (:core new) nm) args)]))
+                    (filter (fn [[_ a b]] (not (erlang/== a b)))))
+        unexported (->> (:links new) (filter (fn [[_ i]] (not (exported? i)))) (map (fn [[n i]] [n i nil])))]
+    (println (str "links old " (count (:links old)) " new " (count (:links new))
+                  " · core values old " (count (:core old)) " new " (count (:core new))
+                  " · cpp values old " (count (:cpp old)) " new " (count (:cpp new))))
+    (let [links (cmp :links canon-link)]
+      (report "LINK rows differ (undeclared)" (filter (fn [[n]] (not (contains? declared n))) links))
+      (println (str "LINK rows differ (declared fixes): "
+                    (count (filter (fn [[n]] (contains? declared n)) links)))))
+    (report "CORE value shapes differ" (cmp :core shape))
+    (report "CPP value shapes differ" (cmp :cpp shape))
+    (report "BEHAVIOUR differs" behave)
+    (report "LINK targets not exported" unexported)))
+
+(run)

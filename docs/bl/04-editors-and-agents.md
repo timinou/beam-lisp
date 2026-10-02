@@ -1,13 +1,14 @@
 # Editors and agents
 
-beam-lisp meets a tool on three surfaces. Two speak a standard protocol, so any
-client that speaks it reaches the language; the third is `--json`, which every
+beam-lisp meets a tool on four surfaces. Three speak a standard protocol, so any
+client that speaks it reaches the language; the fourth is `--json`, which every
 command that produces a report offers.
 
 | surface | command | protocol |
 |---|---|---|
 | intelligence | `bl lsp serve` | Language Server Protocol over stdin/stdout |
 | facts | `bl mcp` | Model Context Protocol, one JSON object per line |
+| a live session | `bl harness` | Model Context Protocol over HTTP, in the tree's warm VM |
 | reports | `bl … --json` | one JSON object per command run |
 
 `bl doctor --json` reports what the machine can do, for an agent deciding what
@@ -195,7 +196,115 @@ Two resources accompany the tools:
 | `code://beam-lisp/schema` | the fact schema: the `fn` and `call` attributes |
 | `code://beam-lisp/namespaces` | the namespaces currently mounted |
 
-## `--json`, the third surface
+## The harness — a live session an agent drives
+
+`bl harness` puts a beam-lisp session inside the tree's warm VM and serves it
+over MCP. An agent connects and gets three tools. Each one takes beam-lisp —
+`.bl` (plain code) or `.bl.md` (prose with ```` ```beam-lisp ```` cells) — and
+answers with the blocks it added to the session:
+
+| tool | does |
+|---|---|
+| `eval` | runs the cells now and returns each one with its result |
+| `start_turn` | hands a task to the model, returns at once; the model works on its own |
+| `steer_turn` | adds more; a running turn reads it on its next step, an idle session starts one |
+
+Each takes `code` (or `path`, a file relative to the tree), and optionally
+`session` (default `main`), `format` (`bl` or `bl.md`) and `timeout_ms` for a
+slow cell.
+
+```sh
+$ bl daemon start
+$ bl harness
+harness  http://127.0.0.1:7717/mcp
+config   …/.local/harness/mcp.json  (url + bearer token for an MCP client)
+vm       beam-lisp@574618
+```
+
+`.local/harness/mcp.json` is a ready `mcpServers` entry — the URL and the
+bearer token together. Copy it into your agent's MCP config (for spell:
+`.spell/mcp.json`). The token lives in `.local/harness/token` (mode 0600, git
+ignores the directory): `eval` runs any code, so the port answers only a caller
+that can read your tree. Loopback only; `:ports {:harness N}` in `env.bl` picks
+another port.
+
+### The session is a livebook
+
+Everything lands in one file, `.local/harness/<session>.bl.md`, appended and
+never rewritten:
+
+````markdown
+## eval
+
+```beam-lisp id=c1
+(def x 41) (inc x)
+```
+
+```bl-result c1
+42
+```
+
+## task
+
+How many tests are in test/bl/doc_test.bl?
+
+## model · t1 · 1
+
+```beam-lisp id=c2
+(count (filter #(clojure.string/starts-with? % "(deftest")
+               (clojure.string/split (File/read! "test/bl/doc_test.bl") "\n")))
+```
+
+```bl-result c2
+14
+```
+
+## model · t1 · 2
+
+There are 14.
+````
+
+That one file is the transcript you read, the source of the model's chat
+history, and a document `bl.doc` slices like any other. When the model reads
+it, each `## model` section is an assistant message; each `bl-result` block is
+a separate user message tied to its cell id. The readable file stays unchanged.
+
+Cells run in the session's own namespace (`harness.session.<id>`), so a `def`
+stays for the next cell, and
+`(ns harness.session.main (:require [clojure.string :as s]))` gives every later
+cell its aliases. A cell that fails shows `;; error: …` as its result; one that
+runs past its deadline (20 s) is killed and says so.
+
+### Turns
+
+A turn is the model working a task. Each step, the session file becomes chat
+messages and the model replies in `.bl.md`; its cells run and their results are
+appended for the next step. A reply with no code ends the turn — unless a steer
+arrived meanwhile, in which case the model reads it first. One turn runs per
+session at a time.
+
+The model is DeepSeek V4.1 Flash, keyed by `DEEPSEEK_API_KEY` in the tree's
+`.env` (`HARNESS_MODEL` names another). A session is plain data, so the same
+tools read it from any cell:
+
+```beam-lisp
+(harness/status "main")      ; the running turn and how the last one ended
+(harness/tail "main")        ; the end of the document
+(harness/await-turn "main")  ; wait for the turn to finish
+(harness/stop! "main")       ; stop it
+```
+
+### Where it lives
+
+The harness is part of the tree's VM, not a process beside it: its HTTP
+endpoint, its keeper and every turn are members of the VM (`vm.owner`), cells
+evaluate in the VM's env, and every connected agent shares that one VM.
+Draining the VM takes the harness with it; after `bl daemon stop`, run
+`bl harness` again. The code is `priv/lib/harness*` — `harness` (sessions and
+turns), `harness.doc` (blocks), `harness.model` (the model), `harness.mcp` (the
+tools and the endpoint).
+
+## `--json`, the fourth surface
 
 Every command that produces a report offers `--json`, and it prints exactly
 **one JSON object per run** — the same value the human report renders, so the

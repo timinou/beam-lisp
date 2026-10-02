@@ -1,0 +1,134 @@
+; test/bl/hotswap_probe_test.bl — the SELF cluster's load step (PLAN-019),
+; demonstrated end to end with the machinery that ALREADY EXISTS.
+;
+; Ported from the ExUnit `test/beam_lisp/hotswap_probe_test.exs`. PLAN-019
+; listed SELF as blocked on a "hotswap API (compile→binary callable from the
+; language)". The binary was never missing: `BeamLisp.AOT/compile_source`
+; compiles a namespace and writes its `.beam` bytes; everything below is `:code`.
+;
+; The load step is therefore not new machinery, it is a WRAPPER. What is
+; genuinely missing is `reason` (an LLM proposing a revision) and `validate`
+; (deciding whether to keep it) — not the ability to swap.
+;
+; PLAN-019 decision 1, proven here rather than asserted: the ROLLBACK ARTIFACT
+; is the compiled BINARY, not source text. A remembered binary cannot fail to
+; recompile — it already compiled. Re-evaluating remembered SOURCE can fail
+; against a changed sibling, which is the failure mode this deletes.
+;
+; PARITY MAPPING (ExUnit `test` → BL `deftest`): the one ExUnit test,
+;   "compile → load → detect a bad revision → revert to the remembered binary",
+;   is `compile-load-detect-a-bad-revision-revert-to-the-remembered-binary`,
+;   assertion for assertion and in order.
+;
+; ADAPTATIONS (ExUnit → ward):
+;   * `:code.purge(m)` + `:code.load_abs(rootname(p))` becomes `code/purge` +
+;     `code/load_binary(m, path, File/read!(path))` — the byte-load the pinned
+;     host suites already use, so the emitted file is loaded from disk either
+;     way and no `Path/rootname` spelling is needed.
+;   * `Module.split(ns_mod)` has no ward counterpart; the hot-swap unit is
+;     selected by the same module-name SET the ExUnit built (`{ns_mod, body,
+;     init}`) with the camelized namespace segment spelled directly.
+;   * `Enum.filter/load_all` over the emitted list are `filter`/`map`; the
+;     emitted shape (`{module, path}`) is unchanged.
+;   * `try … rescue e -> {:error, Exception.message(e)}` becomes a `catch`
+;     binding `e`, so the failing revision is asserted by its message.
+;   * every process and file this test creates is cleaned in a `finally` — the
+;     compiled beams are purged AND deleted, and the temp dir is removed even
+;     when an assertion fails.
+;
+; Run: bin/bl test test/bl/hotswap_probe_test.bl
+
+(ns hotswap.probe-test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir) "/bl_hotswap_" (erlang/unique_integer (list :positive))))
+
+(defn- ns-beams
+  "The hot-swap UNIT: the beams whose module is the namespace module or lives
+   under its `Body`/`Init` children — the ExUnit's set `[ns_mod, body, init]`,
+   selected by module name. Loading only the shim would leave the old body code
+   in place, so all of them move together. `base` is the camelized namespace
+   segment, e.g. `Hotswapprobe`."
+  [emitted base]
+  (filterv
+    (fn [p]
+      (let [m (Atom/to_string (erlang/element 1 p))]
+        (or (= m (str "Elixir.BeamLisp.Ns." base))
+            (= m (str "Elixir.BeamLisp.Ns.Body." base))
+            (= m (str "Elixir.BeamLisp.Ns.Init." base)))))
+    emitted))
+
+(defn- load-all
+  "Load every beam in an emitted set from disk, newest code wins — the ExUnit's
+   `load_all` (`:code.purge` then `:code.load_abs`), loading the same bytes the
+   pinned-host suites load."
+  [emitted]
+  (mapv
+    (fn [p]
+      (let [m (erlang/element 1 p)
+            path (erlang/element 2 p)]
+        (code/purge m)
+        (code/load_binary m (erlang/binary_to_list path) (File/read! path))))
+    emitted))
+
+(defn- call [mod] (erlang/apply mod :greet (list 1)))
+
+(defn- thrown-message
+  "The `ex-message` of the error `thunk` raises, or nil when it does not throw."
+  [thunk]
+  (try (do (thunk) nil) (catch e (ex-message e))))
+
+(deftest compile-load-detect-a-bad-revision-revert-to-the-remembered-binary
+  (let [tmp (tmp-dir)
+        _ (File/mkdir_p! tmp)
+        base (Macro/camelize "hotswapprobe")
+        mod (Module/concat :"Elixir.BeamLisp.Ns" base)
+        body (Module/concat :"Elixir.BeamLisp.Ns.Body" base)
+        v1 "(ns hotswapprobe)\n(defn greet [x] \"v1\")\n"
+        v2 "(ns hotswapprobe)\n(defn greet [x] \"v2\")\n"
+        bad "(ns hotswapprobe)\n(defn greet [x] (throw (ex-info \"boom\" {})))\n"
+        ; read/emit + load: compile a namespace to a real beam SET, then load it.
+        ; `compile_source` leaves the image in the compiled ns, so come home
+        ; before the next top-level form resolves anywhere else.
+        compile! (fn [src]
+                   (let [e (ns-beams (BeamLisp.AOT/compile_source src (list (t2 :output_dir tmp))) base)]
+                     (BeamLisp.Env/in_ns "hotswap.probe-test")
+                     (load-all e)
+                     (BeamLisp.AOT/ensure_loaded "hotswapprobe")
+                     e))]
+    (try
+      (let [e1 (compile! v1)]
+        (is (= "v1" (call mod)) "a compiled revision is callable at once")
+
+        ; the known-good artifact is the BINARY set — this is the whole decision:
+        ; remembered bytes cannot fail to recompile because they already compiled.
+        ; `mapv`, not `map`: the remembered bytes must be read NOW. beam-lisp's
+        ; `map` is lazy, so a lazy capture would re-`File/read!` at revert time —
+        ; after the bad revision has overwritten the very beam files it captured.
+        (let [good (mapv (fn [p] (t2 (erlang/element 1 p) (File/read! (erlang/element 2 p)))) e1)]
+          ; load: a compatible revision swaps in live, no restart
+          (compile! v2)
+          (is (= "v2" (call mod)) "a compatible revision swaps the running fn in place")
+
+          ; validate: a bad revision loads fine and fails only when RUN — which is
+          ; exactly why `validate` cannot be "did it compile?" (it did)
+          (compile! bad)
+          (is (= "boom" (thrown-message (fn [] (call mod))))
+              "a bad revision compiles and loads; only running it fails")
+
+          ; revert: load the remembered bytes; cannot fail to compile
+          (doseq [pair good]
+            (let [m (erlang/element 1 pair)
+                  bin (erlang/element 2 pair)]
+              (code/purge m)
+              (code/load_binary m (erlang/binary_to_list "revert") bin)))
+          (BeamLisp.AOT/ensure_loaded "hotswapprobe")
+          (is (= "v1" (call mod)) "the remembered binary restores the good revision")))
+      (finally
+        (BeamLisp.Env/in_ns "hotswap.probe-test")
+        (doseq [m (list mod body)]
+          (code/purge m)
+          (code/delete m))
+        (File/rm_rf! tmp)))))

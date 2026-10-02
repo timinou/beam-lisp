@@ -42,10 +42,11 @@
 
 (defn- author-meta
   "Reader locations describe code, never the value that code evaluates to.
-   Use the diagnostic vocabulary so new position keys cannot become user meta."
+   These are the location keys from diag/position-keys, repeated here because
+   the compiler must parse diag's own source before its vars can be interned."
   [m]
   (if (erlang/is_map m)
-    (maps/without (to-list diag/position-keys) m)
+    (maps/without (list :line :col :file :offset :end-line :end-col :end-offset) m)
     {}))
 
 (defn- with-ann
@@ -172,7 +173,7 @@
   {:add :+ :sub :- :mul :* :div :/
    :lt :< :gt :> :le :"=<" :ge :>= :num_eq :==})
 (def ^:private mod-body-lower (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Body.Lower"))
-(def ^:private mod-rt (erlang/binary_to_atom "Elixir.BeamLisp.RT"))
+(def ^:private mod-rt (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Rt"))
 (def ^:private mod-env (erlang/binary_to_atom "Elixir.BeamLisp.Env"))
 (def ^:private mod-vector (erlang/binary_to_atom "Elixir.BeamLisp.Vector"))
 (def ^:private mod-set (erlang/binary_to_atom "Elixir.BeamLisp.Set"))
@@ -193,7 +194,7 @@
   (reduce (fn [acc n] (a/cons-cell n acc)) a/enil (reverse nodes)))
 
 (defn- anf-invoke
-  "The general beam-lisp call: BeamLisp.RT.invoke(f, [args]) — handles plain
+  "The general beam-lisp call: BeamLisp.Ns.Rt.invoke(f, [args]) — handles plain
    fns, keywords, remote references, and the $blfn dispatch tuple."
   [f-node arg-nodes]
   (a/remote mod-rt :invoke (list f-node (anf-list arg-nodes))))
@@ -427,7 +428,7 @@
    Loaded on first use, so a program that never touches Java pays nothing."
   [fname args]
   (BeamLisp.Loader/ensure_loaded "java.manifest")
-  (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "java.manifest" fname) args))
+  (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "java.manifest" fname) args))
 
 (defn- manifest-answer->node
   "A manifest answer — `[:fn ns name]` or `[:lit v]` — as the ANF node that
@@ -513,6 +514,29 @@
   (when (and (not= target-ns (:ns env))
            (private-var? target-ns var)) (compile-error env (str "var " target-ns "/" var " is not public"))))
 
+(defn- reject-private-static!
+  "Refuse an explicit `:refer [sym]` of a PRIVATE var, exactly as
+   `reject-private!` does, but WITHOUT initializing a provider that has not been
+   initialized yet: the provider's SOURCE metadata answers when it can.
+
+   A name the scan cannot account for is UNKNOWN — another macro may have
+   defined it — so the provider is loaded and the registry answers: the
+   conservative fallback that keeps privacy exact for generated exports and for
+   sourceless (AOT-only) providers."
+  [env target sym]
+  (cond
+    (= target (:ns env)) :ok
+    (or (BeamLisp.Env/loaded_ns? target)
+        (not= :error (BeamLisp.Env/lookup (tuple target sym))))
+      (reject-private! env target sym)
+    :else
+    (let [kind (BeamLisp.Loader/source_decl target sym)]
+      (cond
+        (= :private kind) (compile-error env (str "var " target "/" sym " is not public"))
+        (contains? #{:public :value :macro} kind) :ok
+        :else (do (BeamLisp.Loader/load_provider target)
+                  (reject-private! env target sym))))))
+
 (defn- compile-symbol
   "Turn a symbol into the tree that produces its VALUE.
 
@@ -551,13 +575,13 @@
           (a/remote mod-rt :remote_fun (list (a/lit (second tgt)) (a/lit (nth tgt 2))))
           :else
           ; a var in another namespace: refuse a private one, else a reference
-          (do (reject-private! env (second tgt) (nth tgt 2))
+          (do (reject-private-static! env (second tgt) (nth tgt 2))
               (a/global (second tgt) (nth tgt 2)))))
     ; a dotted class-name reference to a record/type in another ns
     ; (`datalog.parser.type.Function`): the same var as `…/Function`
     (some? (dotted-var-ref env name))
       (let [ref (dotted-var-ref env name)]
-        (reject-private! env (first ref) (second ref))
+        (reject-private-static! env (first ref) (second ref))
         (a/global (first ref) (second ref)))
     :else
       (a/global (:ns env) name)))
@@ -580,7 +604,7 @@
 (defn- compile-map
   "Turn a map literal like {:a 1} into the tree that builds a beam-lisp map.
 
-   Every key is wrapped in `BeamLisp.RT.hash_key(...)` so that keys compare
+   Every key is wrapped in `BeamLisp.Ns.Rt.hash_key(...)` so that keys compare
    the way beam-lisp expects (metadata on a key is invisible to equality, so
    it must be invisible to the map too). The result is Elixir's map syntax
    `%{k => v, ...}` with each key and value compiled."
@@ -608,7 +632,7 @@
   "Try to build a DIRECT call to a linked function, or return nil.
 
    Some names are linked to a specific implementation: `+` to the Erlang BIF
-   `:erlang.+`, `first` to `BeamLisp.RT.first`, and so on. When a name is
+   `:erlang.+`, `first` to `BeamLisp.Ns.Rt.first`, and so on. When a name is
    linked and the call's argument count matches, the call compiles to a direct
    `Module.function(args)` — no lookup, no dispatch, which is what makes hot
    loops fast. `link-info` is what `BeamLisp.Env/link` returned: a
@@ -675,6 +699,39 @@
     (str "core/" (subs name (count "clojure.core/")))
     name))
 
+(defn- macro-value
+  "The expanding fn of a tagged macro value `v` — `{:\"$macro\", fn}` — or nil
+   when `v` is anything else."
+  [v]
+  (when (and (erlang/is_tuple v) (>= (erlang/tuple_size v) 2)
+             (= (erlang/binary_to_atom "$macro") (erlang/element 1 v)))
+    (erlang/element 2 v)))
+
+(defn- name-provider
+  "The `[provider-ns member]` a name would be resolved from when that provider
+   is ANOTHER namespace, or nil.
+
+   A qualified name resolves through the declaring namespace's alias table — an
+   alias is registered when the `(ns …)` form runs, BEFORE its provider is
+   initialized — else by its own prefix; a bare name through its `:refer`
+   source. `core`/`sugar` and the namespace being compiled are never providers
+   here: the first two are always initialized, and loading the third would be
+   re-entrant."
+  [ns name]
+  (if (has-slash? name)
+    (let [sv (split-slash name)
+          prefix (first sv)]
+      (if (lists/member prefix (list "core" "sugar" "clojure.core"))
+        nil
+        (let [at (BeamLisp.Env/alias_target ns prefix)]
+          (if (and (nil? at) (uppercase-first? prefix))
+            nil ; An unaliased host module is not a BL macro provider.
+            (list (if (some? at) at prefix) (second sv))))))
+    (let [src (BeamLisp.Env/refer_source ns name)]
+      (if (or (nil? src) (= src "core") (= src "sugar"))
+        nil
+        (list src name)))))
+
 (defn- macro-lookup
   "The macro FUNCTION bound to `name` in namespace `ns`, or nil when `name` is
    not a macro.
@@ -684,16 +741,34 @@
    is the function that does the expanding. This looks the name up (normalized
    the same way calls are, so `clojure.core/x` finds `core/x`) and, when the
    value is that tagged pair, hands back just the function. Anything else —
-   an ordinary value, an unbound name — yields nil."
+   an ordinary value, an unbound name — yields nil.
+
+   A miss in the registry may still name a macro of a DECLARED deferred
+   provider. The provider's SOURCE metadata decides (see
+   `BeamLisp.Loader/maybe_load_macro/2`), so an ordinary foreign function is
+   never initialized merely because the compiler asked whether its call was a
+   macro."
   [ns name]
   ; `peek`, not `fetch`: probing whether a name is a macro at COMPILE time must
   ; not materialize a `^:per-env` value. A per-env descriptor is never a macro,
   ; so it correctly falls through. Mirrors genesis `macro_for`.
-  (let [r (BeamLisp.Env/peek ns (core-qualified name))]
-    (when (and (erlang/is_tuple r)
-             (= :ok (erlang/element 1 r))) (let [v (erlang/element 2 r)]
-        (when (and (erlang/is_tuple v)
-                 (= (erlang/binary_to_atom "$macro") (erlang/element 1 v))) (erlang/element 2 v))))))
+  (let [q (core-qualified name)
+        pv (name-provider ns name)
+        pending (and (some? pv) (not= (first pv) ns)
+                     (not (BeamLisp.Env/loaded_ns? (first pv)))
+                     (= :error (BeamLisp.Env/lookup (tuple (first pv) (second pv)))))
+        ordinary (and pending
+                      (contains? #{:public :private}
+                        (BeamLisp.Loader/source_decl (first pv) (second pv))))]
+    ; An explicit refer may shadow a core macro. Do not expand that fallback
+    ; while its ordinary provider is still deferred.
+    (if ordinary
+      nil
+      (do
+        (when pending (BeamLisp.Loader/maybe_load_macro (first pv) (second pv)))
+        (let [r (BeamLisp.Env/peek ns q)]
+          (when (and (erlang/is_tuple r) (= :ok (erlang/element 1 r)))
+            (macro-value (erlang/element 2 r))))))))
 
 (defn- macro?
   "Say whether `name` names a macro visible in this environment's namespace.
@@ -767,6 +842,44 @@
     :map {}
     :keyword :_))
 
+(defn- boot-ns?
+  "Whether `ns` belongs to the BOOT (codegen) tier.
+
+   Those namespaces are initialized by the boot ladder before any author code
+   runs, and the ladder itself has no loader to defer to — so a readiness guard
+   on a call into one could only add cost. The tier membership is the same list
+   `BeamLisp.Tiers/boot_namespaces` gives the AOT drift gate; it is read once
+   per compile process and held as a set."
+  [ns]
+  ; `core` and `sugar` are the two namespaces EVERY program links into (most
+  ; of the prelude resolves through them), so they are named here as well: a
+  ; checkout whose tier directory cannot be listed must still never guard them.
+  (if (or (= ns "core") (= ns "sugar"))
+    true
+    (let [k (tuple :"$bl_boot_ns_set" :set)
+          cached (Process/get k nil)]
+      (if (erlang/== nil cached)
+        (let [tier (set (BeamLisp.Tiers/boot_namespaces))]
+          (Process/put k tier)
+          (contains? tier ns))
+        (contains? cached ns)))))
+
+(defn- ready-guard
+  "Wrap a DIRECT cross-namespace call in the loader's readiness guard, so an
+   AOT-baked `Module.fn(args)` initializes its namespace on FIRST use instead of
+   running against an uninitialized one. `Loader/ensure_ready/1` answers from
+   one registry read once the namespace is up.
+
+   A call inside the CURRENT namespace needs no guard (its own code is already
+   running), and neither does a call into the boot tier."
+  [owner node env]
+  (if (or (nil? owner)
+          (= owner (:ns env))
+          (boot-ns? (:ns env))
+          (boot-ns? owner))
+    node
+    (a/doo (list (a/remote mod-loader :ensure_ready (list (a/lit owner))) node))))
+
 (defn- compile-call
   "Turn a call form (head arg ...) into the tree that runs it.
 
@@ -797,7 +910,7 @@
       ; runtime raises for a head it could not see through.
       (= tag :scalar)
         (compile-error env
-                       (BeamLisp.RT/call_shape_error (rn/node-form head) (count args))
+                       (BeamLisp.Ns.Rt/call_shape_error (rn/node-form head) (count args))
                        (first items))
 
       ; ({:a 1}) / ([1 2] 0 1) / (:a) — a callable literal with an arity it
@@ -807,7 +920,7 @@
       (and (contains? #{:map :vector :set :keyword} tag)
            (not (literal-arity-ok? tag (count args))))
         (compile-error env
-                       (BeamLisp.RT/call_shape_error (literal-shape-value tag) (count args))
+                       (BeamLisp.Ns.Rt/call_shape_error (literal-shape-value tag) (count args))
                        (first items))
 
       ; (:keyword m ...) — the keyword looks itself up in its argument
@@ -823,7 +936,7 @@
             (= :java (first tgt))
               (let [answer (second tgt)]
                 (if (= :lit (first answer))
-                  (compile-error env (BeamLisp.RT/call_shape_error (second answer) (count args)) (first items))
+                  (compile-error env (BeamLisp.Ns.Rt/call_shape_error (second answer) (count args)) (first items))
                   (anf-invoke (manifest-answer->node answer) arg-nodes)))
             (= :remote (first tgt))
             ; a host-module call: Module.fun(args) directly
@@ -834,11 +947,14 @@
             ; use the linked direct call when it is a linked defn, else invoke
             ; its fetched value
             (let [tns (second tgt) tvar (nth tgt 2)]
-              (reject-private! env tns tvar)
-              (let [link (BeamLisp.Env/link tns tvar)]
-                (or (and (not= link :error)
-                         (linked-call (second (erlang/tuple_to_list link)) arg-nodes env))
-                    (anf-invoke (a/global tns tvar) arg-nodes))))))
+              (reject-private-static! env tns tvar)
+              (let [link (BeamLisp.Env/link tns tvar)
+                    direct (if (= link :error)
+                             nil
+                             (linked-call (second (erlang/tuple_to_list link)) arg-nodes env))]
+                (if (some? direct)
+                  (ready-guard tns direct env)
+                  (anf-invoke (a/global tns tvar) arg-nodes))))))
 
       ; (.method recv args…) — a Java instance method through the manifest.
       ; Keyed by method NAME (a call site names no class); the target is a
@@ -887,19 +1003,23 @@
       (= tag :symbol)
         (let [name (rn/node-name head)]
           (if (local? env name)
-            (let [link (BeamLisp.Env/link (:ns env) (core-qualified name))
+            (let [lo (BeamLisp.Env/link_owner (:ns env) (core-qualified name))
                   local-node (compile-symbol name env)
-                  direct (and (not= link :error)
-                              (linked-call (second (erlang/tuple_to_list link)) arg-nodes env))]
-              (if direct
+                  direct (if (erlang/== :error lo)
+                           nil
+                           (linked-call (erlang/element 3 lo) arg-nodes env))]
+              (if (some? direct)
                 (a/iff (a/remote mod-rt :invocable? (list local-node (a/lit (count arg-nodes))))
                        (anf-invoke local-node arg-nodes)
-                       direct)
+                       (ready-guard (erlang/element 2 lo) direct env))
                 (anf-invoke local-node arg-nodes)))
-            (let [link (BeamLisp.Env/link (:ns env) (core-qualified name))]
-              (or (and (not= link :error)
-                       (linked-call (second (erlang/tuple_to_list link)) arg-nodes env))
-                  (anf-invoke (compile-symbol name env) arg-nodes)))))
+            (let [lo (BeamLisp.Env/link_owner (:ns env) (core-qualified name))
+                  direct (if (erlang/== :error lo)
+                           nil
+                           (linked-call (erlang/element 3 lo) arg-nodes env))]
+              (if (some? direct)
+                (ready-guard (erlang/element 2 lo) direct env)
+                (anf-invoke (compile-symbol name env) arg-nodes)))))
 
       ; (expr args) with a compound head — compile it, then call it
       :else
@@ -1007,12 +1127,12 @@
 (declare destructure-steps)
 
 (defn- rt-nth-node
-  "The node for `BeamLisp.RT.nth(whole, i)` — the i-th element of a sequence."
+  "The node for `BeamLisp.Ns.Rt.nth(whole, i)` — the i-th element of a sequence."
   [whole-node i]
   (a/remote mod-rt :nth (list whole-node (a/lit i))))
 
 (defn- rt-get-node
-  "The node for `BeamLisp.RT.get(whole, key, default)` — a map lookup with a
+  "The node for `BeamLisp.Ns.Rt.get(whole, key, default)` — a map lookup with a
    fallback used when the key is absent."
   [whole-node key default-node]
   (a/remote mod-rt :get (list whole-node (a/lit key) default-node)))
@@ -1506,6 +1626,16 @@
                 (= :symbol (rn/node-tag (rn/node-form (first items))))
                 (= "catch" (rn/node-name (rn/node-form (first items)))))))))
 
+(defn- catch-raw-clause-form?
+  "Say whether a try sub-form is a (catch-raw [kind reason stack] ...) clause."
+  [form]
+  (let [f (rn/node-form form)]
+    (and (= :list (rn/node-tag f))
+         (let [items (rn/node-items f)]
+           (and (not (empty? items))
+                (= :symbol (rn/node-tag (rn/node-form (first items))))
+                (= "catch-raw" (rn/node-name (rn/node-form (first items)))))))))
+
 (defn- finally-clause-form?
   "Say whether a try sub-form is a (finally ...) clause."
   [form]
@@ -1524,13 +1654,40 @@
 
 (defn- catch-handler-node
   "Build the body a catch clause runs once it matches: bind the handler's name
-   to the normalized exception value, then run the handler forms. Shared by the
-   typed and untyped branches, mirroring the genesis `run_handler`."
-  [e-name handler-forms e-var env]
+   to the normalized exception value AND bind `__STACKTRACE__` to the frame
+   list, then run the handler forms. Shared by the typed and untyped branches,
+   mirroring the genesis `run_handler`.
+
+   The frame list is not new work: `compile-try` already computes it for
+   `Exception.normalize`. What was missing was a NAME for it. Without one the
+   value reached the normalizer and nothing else, so a handler could read the
+   exception and never where it came from — which is why every failure in the
+   language arrived as a message with no location.
+
+   `__STACKTRACE__` is Elixir's own name for exactly this value, so a reader who
+   has caught an exception in Elixir already knows what it holds: a list of
+   `{module, function, arity, location}` frames.
+
+   `__EXCEPTION_KIND__` is the RAW Erlang catch class — `:throw`, `:error` or
+   `:exit` — that `compile-try`'s single catch clause already patterns as
+   `kind-var`. `e` is the FOLD of that class (a `:throw` keeps its value, an
+   `:error` becomes `Exception.normalize`, an `:exit` becomes `{:exit, v}`), so
+   the folded value alone cannot tell a raw `(erlang/throw exc)` from an
+   `(erlang/error exc)` of the same struct — both normalize to the same
+   exception. Binding the class here makes it nameable without changing the
+   fold: the ANF is identical to before unless a handler actually reads it.
+   Available in both the typed and untyped branches, exactly like
+   `__STACKTRACE__`, and NOT visible outside a catch handler."
+  [e-name handler-forms e-var kind-var env]
   (let [handler-var (fresh-var e-name)
-        handler-env (put-local env e-name handler-var)
+        stk-var (fresh-var "stacktrace")
+        handler-env (put-local (put-local (put-local env e-name handler-var)
+                                          "__STACKTRACE__" stk-var)
+                               "__EXCEPTION_KIND__" kind-var)
         handler-body (compile-body handler-forms handler-env)]
-    (a/lett handler-var (a/var e-var) handler-body)))
+    (a/lett handler-var (a/var e-var)
+            (a/lett stk-var (a/var "__STACKTRACE__")
+                    handler-body))))
 
 (defn- catch-cond-branch
   "Compile ONE (catch …) clause into a `cond` branch `[test] -> handler`.
@@ -1544,7 +1701,7 @@
    A first element that is neither a bare variable nor a dotted Module.Name
    (e.g. `(catch :bad e …)`) is refused with the same message the genesis
    compiler raises, because a keyword/literal names no catchable shape."
-  [catch-form e-var env]
+  [catch-form e-var kind-var env]
   (let [items (rn/node-items (rn/node-form catch-form))
         first-node (rn/node-form (second items))
         first-tag (rn/node-tag first-node)]
@@ -1596,11 +1753,11 @@
                                                                  (list (a/remote (erlang/binary_to_atom "Elixir.BeamLisp.ExInfo") :ex_data (list (a/var e-var)))
                                                                        (a/lit :type) (a/lit nil)))
                                                        (a/lit (second jmatch))))))
-                handler (catch-handler-node e-name handler-forms e-var env)]
+                handler (catch-handler-node e-name handler-forms e-var kind-var env)]
             (a/clause (list test) nil handler))
           ; untyped: (catch e handler…)
           (let [handler-forms (rest (rest items))
-                handler (catch-handler-node name handler-forms e-var env)]
+                handler (catch-handler-node name handler-forms e-var kind-var env)]
             (a/clause (list (a/lit true)) nil handler)))))))
 
 (defn- compile-catch-dispatch
@@ -1613,7 +1770,7 @@
    clause is typed and none matched, so an unmatched typed catch propagates
    instead of being swallowed. Mirrors the genesis catch dispatch."
   [catches e-var kind-var value-var stack-var env]
-  (let [branches (apply list (map (fn [c] (catch-cond-branch c e-var env)) catches))
+  (let [branches (apply list (map (fn [c] (catch-cond-branch c e-var kind-var env)) catches))
         reraise (a/remote mod-erlang :raise (list (a/var kind-var) (a/var value-var) (a/var stack-var)))
         fallthrough (a/clause (list (a/lit true)) nil reraise)
         all-branches (apply list (concat branches (list fallthrough)))]
@@ -1693,9 +1850,61 @@
    `try` with a single catch-all clause (normalizing the caught value) and an
    optional `after` block."
   [forms env]
-  (let [catches (filter catch-clause-form? forms)
+  (let [raws (filter catch-raw-clause-form? forms)
+        catches (filter catch-clause-form? forms)
         finallies (filter finally-clause-form? forms)
-        body (filter (fn [f] (not (or (catch-clause-form? f) (finally-clause-form? f)))) forms)]
+        body (filter (fn [f] (not (or (catch-clause-form? f) (catch-raw-clause-form? f)
+                                      (finally-clause-form? f)))) forms)]
+    (cond
+      (and (seq raws) (or (seq catches) (next raws)))
+      (compile-error env "try: a catch-raw clause is the ONLY catch of its try (no other catch, at most one catch-raw)")
+
+      (seq raws)
+      (compile-try-raw (first raws) body finallies env)
+
+      :else
+      (compile-try-normalized catches finallies body env))))
+
+(defn- compile-try-raw
+  "`(try body… (catch-raw [kind reason stack] handler…) (finally …)?)` — the
+   exception exactly as the VM raised it: `kind` is the class atom (:error,
+   :throw, :exit), `reason` the UNnormalized reason, and `stack` the frame
+   LIST built from the VM's raw catch token. Unlike that ephemeral token, the
+   list survives storage in a memo cell and `erlang:raise/3` can replay it.
+   Every class is caught; the reason is not normalized. This is
+   the runtime's own clause (memo cells record a failure and replay it to
+   waiters) — user code wants `catch`."
+  [raw-form body finallies env]
+  (let [items (rn/node-items (rn/node-form raw-form))
+        binder (rn/node-form (second items))
+        names (if (= :vector (rn/node-tag binder))
+                (map (fn [n] (rn/node-name (rn/node-form n))) (rn/node-items binder))
+                nil)]
+    (if-not (and (some? names) (= 3 (count names)))
+      (compile-error env "catch-raw requires a binding vector [kind reason stack]")
+      (let [body-node (compile-body body env)
+            kind-var (fresh-var "kind")
+            value-var (fresh-var "value")
+            k-var (fresh-var (first names))
+            r-var (fresh-var (second names))
+            s-var (fresh-var (nth names 2))
+            h-env (put-local (put-local (put-local env (first names) k-var)
+                                        (second names) r-var)
+                             (nth names 2) s-var)
+            handler (a/lett k-var (a/var kind-var)
+                      (a/lett r-var (a/var value-var)
+                        (a/lett s-var (a/var "__STACKTRACE__")
+                          (compile-body (rest (rest items)) h-env))))
+            after-node (if (empty? finallies) nil
+                         (compile-body (rest (rn/node-items (rn/node-form (first finallies))))
+                                       (notail env)))]
+        (a/tryy body-node
+                (list (a/clause (list (a/pvar kind-var) (a/pvar value-var)) nil handler))
+                after-node)))))
+
+(defn- compile-try-normalized
+  [catches finallies body env]
+  (let []
     (if (and (empty? catches) (empty? finallies))
       (compile-body body env)
       (let [body-node (compile-body body env)
@@ -1704,15 +1913,18 @@
             e-var (fresh-var "e")
             stack-var (fresh-var "stack")
             ; e = case kind do :throw -> value; :error -> normalize; :exit -> {:exit,value}
-            ; stack-var is v3_core's RAW stacktrace (a wrapper tuple): the
-            ; reraise below must pass it to raise/raw_raise AS IS — the primop
-            ; takes the raw form and a plain frame list SEGFAULTS the VM. But
-            ; Exception.normalize wants the frame LIST (element 2 of the raw
-            ; form — what Elixir's compiler emits for a __STACKTRACE__ read),
-            ; or an undef normalizes to a fieldless %UndefinedFunctionError{}
-            ; ("undefined function" with no module named).
-            raw-stack (a/var stack-var)
-            frame-list (a/remote mod-erlang :element (list (a/lit 2) raw-stack))
+            ; raw-stack is the raw catch value and frame-list the FRAME LIST —
+            ; the lowerer binds both around every catch clause, and they are NOT
+            ; interchangeable. The reraise below lowers to the `raw_raise`
+            ; primop, which takes the raw form and SEGFAULTS the VM given a
+            ; frame list. `__STACKTRACE__` is `primop build_stacktrace` applied
+            ; to the raw, i.e. exactly what v3_core binds a `catch C:R:S`
+            ; clause's `S` to. The lowerer emits Core Erlang itself and starts
+            ; from `from_core` — the stage AFTER v3_core — so that rewrite had to
+            ; be made there; before it, every handler held the raw
+            ; `{Tag, Value, Info}` triple and no error could name its own site.
+            raw-stack (a/var "__STACKTRACE_RAW__")
+            frame-list (a/var "__STACKTRACE__")
             ; e = case kind do :throw -> value; :error -> normalize; :exit -> {:exit,value}
             normalize (a/casee (a/var kind-var)
                                (list (a/clause (list (a/plit :throw)) nil (a/var value-var))
@@ -1723,13 +1935,16 @@
                                                (a/tup (list (a/lit :exit) (a/var value-var))))))
             ; the catch branch exists only when there ARE catch clauses (a try
             ; with only a finally emits just [body, after]); the lowerer binds
-            ; the cerl var `__STACKTRACE__` around every catch clause's body
+            ; the cerl vars `__STACKTRACE__` (frames) and `__STACKTRACE_RAW__`
+            ; (raw) around every catch clause's body, and `kind-var` is the
+            ; clause's own raw Class pattern — a handler reads it as
+            ; `__EXCEPTION_KIND__` (see catch-handler-node)
             dispatch-body (if (empty? catches) nil
                             (compile-catch-dispatch catches e-var kind-var value-var stack-var env))
             catch-clauses (if (empty? catches) (list)
                             (list (a/clause (list (a/pvar kind-var) (a/pvar value-var))
                                             nil
-                                            (a/lett stack-var (a/var "__STACKTRACE__")
+                                            (a/lett stack-var raw-stack
                                                     (a/lett e-var normalize dispatch-body)))))
             after-node (if (empty? finallies) nil
                          (let [fin-items (rest (rn/node-items (rn/node-form (first finallies))))]
@@ -2396,7 +2611,7 @@
 (defn- synq-list
   "Build the constructor for a template list's items, right to left. Each
    ordinary item is consed onto the growing tail; a ~@xs item splices its whole
-   sequence with BeamLisp.RT.splice. Returns [node new-gensym-map]."
+   sequence with BeamLisp.Ns.Rt.splice. Returns [node new-gensym-map]."
   [items env g]
   (reduce (fn [acc item]
             (let [built-node (first acc)
@@ -3141,8 +3356,24 @@
                       (list (a/remote mod-env :add_core_excludes
                                       (list (a/lit name) (a/lit (apply list excludes))))))
         parsed (map (fn [s] (parse-require-spec s env)) specs)
+        ; A spec that names an alias or an explicit refer list DECLARES its
+        ; target: the alias and the dependency's search context are registered
+        ; now, its top-level forms run on first use. A bare (effect-only) spec
+        ; and a `:refer :all` (whose ns-time snapshot needs the provider's vars
+        ; present) load now, as does everything in the preboot tier — a decision
+        ; `Loader/declare_require/3` makes at RUN time, when this form runs, so
+        ; the same source is eager during boot and demand-driven afterwards.
         loads (apply list
-                (map (fn [p] (a/remote mod-loader :ensure_loaded (list (a/lit (first p)))))
+                (map (fn [p]
+                       (let [target (first p)
+                             alias (second p)
+                             refer (nth p 2)
+                             deferrable (or (some? alias)
+                                            (and (not= :all refer) (not (empty? refer))))]
+                         (if deferrable
+                           (a/remote mod-loader :declare_require
+                                     (list (a/lit target) (a/lit alias) (a/lit refer)))
+                           (a/remote mod-loader :ensure_loaded (list (a/lit target))))))
                      parsed))
         ; aliases/refers accumulate in REVERSE spec order (the existing compiler
         ; prepends each spec's op-group), but ops WITHIN a spec stay forward.
@@ -3168,7 +3399,7 @@
                                            ; time, exactly like a qualified
                                            ; reference — a private var is not part
                                            ; of another namespace's public surface.
-                                           (do (reject-private! env (first p) sym)
+                                           (do (reject-private-static! env (first p) sym)
                                                (a/remote mod-env :add_refer
                                                          (list (a/lit name) (a/lit sym) (a/lit (first p))))))
                                          r)))))
@@ -3908,7 +4139,7 @@
   [macro-fn form args env]
   (canonical-gensyms
     (data->form
-      (BeamLisp.RT/invoke macro-fn
+      (BeamLisp.Ns.Rt/invoke macro-fn
         (apply list
           (concat (list (datum form) (macro-env env))
                   (map datum args)))))))
@@ -3972,7 +4203,7 @@
   (let [tag (rn/node-tag form)]
     (cond
       ; a metadata wrapper carries two kinds of key. Positional keys
-      ; (:line/:col/:file) are source location — thread them into the env and
+      ; (:line/:col/:file and span/offset keys) are source location — thread them into the env and
       ; compile the bare form. AUTHOR keys (anything else, e.g. `^{:key …}`) are
       ; USER DATA and must survive onto the value at run time, so the compiled
       ; value is wrapped in FormMeta.with-meta with the (compiled) author map.

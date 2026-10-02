@@ -32,7 +32,7 @@ object for a machine.
 
 ```beam-lisp
 (ns bl.lint
-  (:require [bl.util :as u] [deodorant] [reader-node]))
+  (:require [bl.util :as u] [deodorant] [reader-node] [span-rewrite]))
 ```
 
 ## Tiers name rulesets
@@ -77,6 +77,11 @@ every list and vector, itself included — and hands each node the nearest
 enclosing span, so a bare symbol the reader did not wrap still names the line
 of the form it sits in. Because both walks cover the same nodes, the count here
 equals `deodorant/report-source` for the same source, which the tests pin.
+
+A TEXT smell (see `deodorant/deftextsmell`) is the one stated exception: it
+reads the SOURCE, not a form — a string literal is one of the shapes the reader
+does not wrap, so it has no span for a form walk to hold. `text-smell-entries`
+below reads those, and `lint-source` and `smell-count` count both kinds.
 
 ```beam-lisp
 (defn node->data
@@ -131,6 +136,11 @@ names the rule it matched, its tier, the line the matched form starts on, and
 the before/after text — `deodorize-with` applied to that one rule, so the
 `after` is the fix that rule alone would make, not the sum of all rules.
 
+A TEXT rule reports the same four facts from the other side: the edit's own
+offset names the line, and `:before`/`:after` are the source text it replaces and
+writes. The two kinds share one report and one ordering — source order — so a
+reader does not have to know which kind a line came from.
+
 A node whose conversion or match raises is skipped rather than aborting the
 sweep; a linter reports what it can read and keeps going.
 
@@ -163,10 +173,47 @@ sweep; a linter reports what it can read and keeps going.
        :after (pr-str (deodorant/deodorize-with (list rule) form))
        :ensures ensures})))
 
+(defn- line-at
+  "The 1-based line that CODEPOINT offset `off` falls on, given `offs` — a map
+   of line number to the offset where that line starts
+   (`span-rewrite/line-offsets`)."
+  [offs off]
+  (loop [ln 1]
+    (let [nxt (get offs (inc ln))]
+      (if (and (some? nxt) (>= off nxt)) (recur (inc ln)) ln))))
+
+(defn- text-smell-entries
+  "Every TEXT smell in `rules` that `src` holds, as report entries. A text rule
+   answers with source OFFSETS ({:offset :remove :insert}), so the entry's
+   `:before` and `:after` are the source text the edit replaces and writes — a
+   literal is one of the shapes the reader does not wrap, so there is no node to
+   print, and `pr-str` of a literal would not round-trip."
+  [rules src]
+  (let [text-rules (deodorant/text-smells rules)]
+    (if (empty? text-rules)
+      []
+      (let [cps (into [] (String/codepoints src))
+            offs (span-rewrite/line-offsets src)]
+        (into []
+              (mapcat
+               (fn [rule]
+                 (map (fn [e]
+                        {:name (str (:name rule))
+                         :tier (:tier rule)
+                         :line (line-at offs (:offset e))
+                         :before (apply str (subvec cps (:offset e)
+                                                    (+ (:offset e) (:remove e))))
+                         :after (:insert e)
+                         :ensures []})
+                      ((:text rule) src)))
+               text-rules))))))
+
 (defn lint-source
   "Every smell in one source text under `rules`: `{:path :smells [...]}`. Walks
-   each node of every top-level form and reports each rule that matches there,
-   the same surface and count as `deodorant/report-source`."
+   each node of every top-level form for the FORM rules — the same surface and
+   count as `deodorant/report-source` — and reads the source once for the TEXT
+   rules, which have no form to match. Both kinds land in one list, in source
+   order."
   [rules path src]
   (let [forms (BeamLisp.Reader/read_string src)
         smells-at
@@ -176,15 +223,19 @@ sweep; a linter reports what it can read and keeps going.
               (let [form (node->data (first node))]
                 (map (fn [rule] (smell rule form pos))
                      (deodorant/matches rules form)))
-              (catch _ []))))]
+              (catch _ []))))
+        found (into [] (mapcat smells-at (mapcat (fn [n] (subnodes-with-pos n nil)) forms)))]
     {:path path
-     :smells (into [] (mapcat smells-at (mapcat (fn [n] (subnodes-with-pos n nil)) forms)))}))
+     :smells (vec (sort-by (fn [s] (:line s))
+                           (concat found (text-smell-entries rules src))))}))
 
 (defn smell-count
   "How many smells `src` holds under `rules` — the count without the positions,
-   for a caller that only needs the number."
+   for a caller that only needs the number. Counts BOTH kinds: the form rules
+   `deodorant/report-source` sees, and the text rules it cannot."
   [rules src]
-  (reduce + 0 (vals (deodorant/report-source rules src))))
+  (+ (count (text-smell-entries rules src))
+     (reduce + 0 (vals (deodorant/report-source rules src)))))
 
 (defn skipped-rule
   "One INERT rule as JSON-safe data: the rule's name and tier, the

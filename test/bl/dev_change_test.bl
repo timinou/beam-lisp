@@ -1,0 +1,556 @@
+; dev_change_test.bl — the DevChange transaction contract, in beam-lisp.
+;
+; Ported from the ExUnit `test/beam_lisp/dev_change_test.exs`
+; (`BeamLisp.DevChangeTest` 12 tests + `BeamLisp.DevChangeHardeningTest` 9 = 21).
+; Every assertion of the original is carried here, in the original order and
+; against the SAME module, `Elixir.BeamLisp.DevChange` — which is now itself a
+; BL-seeded host (`priv/host/dev_change.bl`), not the deleted `.ex`.
+;
+; The contract under test: `plan`/`preview` are pure reads; `verify` runs the
+; candidate in an isolated copy under an allow-listed command and persists
+; evidence; `apply!` re-reads that evidence under a writer lock and installs the
+; exact candidate with an intent→applied journal; `undo!` proposes the guarded
+; INVERSE. Nothing here may mutate the source workspace except an authorized,
+; verified `apply!`.
+;
+; ── MAP: dev_change_test.exs → here (21 tests) ─────────────────────────────
+;   DevChangeTest
+;   real verifier reports the child exit status, not its launcher status
+;     → real-verifier-reports-the-child-exit-status-not-its-launcher-status
+;   verification evaluates the candidate while the source workspace stays unchanged
+;     → verification-evaluates-the-candidate-while-the-source-workspace-stays-unchanged
+;   plan and preview do not modify source bytes
+;     → plan-and-preview-do-not-modify-source-bytes
+;   candidate changes only selected top-level form and preserves exact surrounding bytes
+;     → candidate-changes-only-the-selected-top-level-form-and-preserves-exact-surrounding-bytes
+;   rejects missing, malformed, and ambiguous definitions
+;     → rejects-missing-malformed-and-ambiguous-definitions
+;   rejects traversal, absolute, symlink, missing, and unsupported targets
+;     → rejects-traversal-absolute-symlink-missing-and-unsupported-targets
+;   rejects stale basis and invalid replacements
+;     → rejects-stale-basis-and-invalid-replacements
+;   verification uses injected runner and reports success or failure
+;     → verification-uses-injected-runner-and-reports-success-or-failure
+;   verification refuses absent and non-allowlisted commands
+;     → verification-refuses-absent-and-non-allowlisted-commands
+;   apply requires authorization and verified candidate
+;     → apply-requires-authorization-and-verified-candidate
+;   apply is repeat-safe, receipt is durable, drift blocks undo, and undo proposes inverse
+;     → apply-is-repeat-safe-receipt-is-durable-drift-blocks-undo-and-undo-proposes-inverse
+;   invalid plans and receipt queries return tagged errors
+;     → invalid-plans-and-receipt-queries-return-tagged-errors
+;   DevChangeHardeningTest
+;   strict scanner rejects malformed delimiters, quoted/discarded targets, renames, and multiple forms
+;     → strict-scanner-rejects-malformed-delimiters-quoted-discarded-targets-renames-and-multiple-forms
+;   verify revalidates immutable plan fields and source basis
+;     → verify-revalidates-immutable-plan-fields-and-source-basis
+;   caller allowlist is ignored and runner failures are contained and cleaned
+;     → caller-allowlist-is-ignored-and-runner-failures-are-contained-and-cleaned
+;   default runner times out a supervised OS process without changing source
+;     → default-runner-times-out-a-supervised-os-process-without-changing-source
+;   verification honors descriptor cwd and refuses workspace symlinks
+;     → verification-honors-descriptor-cwd-and-refuses-workspace-symlinks
+;   apply trusts persisted evidence, rejects plan mutation, and preserves source mode
+;     → apply-trusts-persisted-evidence-rejects-plan-mutation-and-preserves-source-mode
+;   busy lock and reused edit IDs refuse without overwrite
+;     → busy-lock-and-reused-edit-ids-refuse-without-overwrite
+;   intent recovery reports old, new, and neither explicitly
+;     → intent-recovery-reports-old-new-and-neither-explicitly
+;   workspace ancestors and journal symlinks are refused
+;     → workspace-ancestors-and-journal-symlinks-are-refused
+;
+; ── PARITY with the pinned-host suite ──────────────────────────────────────
+; `test/bl/host_dev_change_test.bl` diffs the pinned port against this same live
+; module case-for-case (plan/preview purity, span splice, refusals, path safety,
+; verify success/failure/refusal/crash/timeout, apply authorization/repeat/mode,
+; receipt, recovery, lock, undo, cwd). It is DIFFERENTIAL — it compares the port
+; to the live module — so the pinned outcomes it names are proven equal, not
+; restated absolutely. This suite is the ABSOLUTE counterpart: it pins the
+; answers themselves, so it keeps its teeth after the pinned port and the live
+; module become the same seeded beam (when the diff would pass trivially). Each
+; case below therefore has a host-suite twin; no case is dropped on the strength
+; of the diff alone.
+;
+; ── Adaptations, and why ──────────────────────────────────────────────────
+;   * `use ExUnit.Case, async: false` has no ward equivalent: `bl test` runs each
+;     FILE in its own isolated fork, and the tests inside one file run in order
+;     in that env.
+;   * `setup`/`on_exit` → a per-test `try`/`finally`: the temp workspace is
+;     removed however the body exits.
+;   * `send`/`assert_receive` for the injected runner's command → the runner
+;     writes into a local `atom`, read after `verify` returns. No cross-process
+;     mailbox is needed.
+;   * `{:ok, x}` pattern matches → `ok-tag?`/`ok!`: `ok!` unwraps and
+;     `ok-tag?` is asserted where the original discarded the payload (`{:ok, _}`),
+;     so a refusal cannot pass unnoticed.
+;   * Elixir keyword opts `runner: f` → `(list (tuple :runner f))`: bl map
+;     literals are REAL maps to the host, and `Keyword.get` wants a list.
+;   * `0o640`/`0o777` → `416`/`511` with `erlang/band`, as the host suite does;
+;     `File.chmod!` → `File/chmod`.
+;   * The default verifier really launches `systemd-run --user`; the timeout and
+;     child-status cases exercise it, exactly as the ExUnit originals did.
+;   * A load-time sweep of `<tmp>/beam-lisp-change-*` clears candidate copies a
+;     previous VM leaked. The module names them with `unique_integer`, which
+;     restarts LOW in a fresh VM, so a leaked name collides and verification
+;     answers `:eexist` instead of running. Same hazard, same fix as
+;     `host_dev_change_test.bl`; neither the module nor its naming changes.
+;
+; Run: bin/bl test test/bl/dev_change_test.bl
+
+(ns dev-change.test
+  (:require [env]))
+
+; ── scaffolding ─────────────────────────────────────────────────────────────
+
+(defn- sha
+  "Lowercase sha256 hex of `s` — the module's own hash spelling."
+  [s]
+  (String/downcase (Base/encode16 (crypto/hash :sha256 s))))
+
+(defn- tmp-root
+  [tag]
+  (str (System/tmp_dir!) "/bl_dev_change_" tag "_" (erlang/unique_integer (list :positive))))
+
+(defn- fixture!
+  "Create `root/fixture.bl` holding `source`; return `root`. Cleanup is the
+   caller's — `try`/`finally` in every test."
+  [tag source]
+  (let [root (tmp-root tag)]
+    (File/mkdir_p! root)
+    (File/write! (Path/join root "fixture.bl") source)
+    root))
+
+(defn- base-spec [root source id]
+  {:workspace root
+   :target "fixture.bl"
+   :selector "demo/target"
+   :replacement "(defn target [] \"changed\")"
+   :expected_hash (sha source)
+   :id id
+   :verification {:argv (list "true")}})
+
+(defn- spec
+  ([root source id] (spec root source id (Map/new)))
+  ([root source id extra] (Map/merge (base-spec root source id) extra)))
+
+(defn- plan-of
+  "Plan `source` in a throwaway fixture and return the answer as-is (an `{:ok,
+   plan}` or an `{:error, tag}`) — the refusal cases' one-liner."
+  ([tag source id] (plan-of tag source id (Map/new)))
+  ([tag source id extra]
+   (let [root (fixture! tag source)]
+     (try (BeamLisp.DevChange/plan (spec root source id extra))
+          (finally (File/rm_rf root))))))
+
+(defn- ok-tag? [r]
+  (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r))))
+
+(defn- ok!
+  "The payload of `{:ok, x}`, or `r` unchanged on anything else."
+  [r]
+  (if (ok-tag? r) (erlang/element 2 r) r))
+
+(defn- err [k] (tuple :error k))
+
+(defn- runner [f] (list (tuple :runner f)))
+
+; ── hygiene ─────────────────────────────────────────────────────────────────
+;
+; `verify` names its candidate copy `<tmp>/beam-lisp-change-<unique_integer>`.
+; `unique_integer` restarts LOW in a fresh VM, so a copy leaked by an earlier
+; run (a killed VM, an aborted suite) collides with this run's mkdir — the copy
+; `mkdir` answers `{:error, :eexist}` and the verification never happens. Clean
+; the module's own namespace under `System.tmp_dir!` ONCE, at load — the same
+; hazard `host_dev_change_test.bl` clears, and hermetic without changing either
+; the module or its naming.
+(defn- clean-stale-copies! []
+  (Enum/each (Path/wildcard (Path/join (System/tmp_dir!) "beam-lisp-change-*"))
+             (fn [p] (File/rm_rf p))))
+
+(clean-stale-copies!)
+
+; ── BeamLisp.DevChangeTest ──────────────────────────────────────────────────
+
+(deftest real-verifier-reports-the-child-exit-status-not-its-launcher-status
+  (testing "`true` verifies, `false` fails on the CHILD's status, source intact"
+    (let [source "(ns demo)\n(defn target [] :old)\n"
+          root (fixture! "verify" source)]
+      (try
+        (let [passing (ok! (BeamLisp.DevChange/plan (spec root source "e1"
+                                                       {:verification {:argv (list "true") :timeout 5000}})))
+              evidence (ok! (BeamLisp.DevChange/verify passing))
+              failing (ok! (BeamLisp.DevChange/plan (spec root source "e2"
+                                                       {:verification {:argv (list "false") :timeout 5000}})))
+              bad (BeamLisp.DevChange/verify failing)]
+          (is (zero? (get evidence :exit_status)))
+          (is (= :verified (get evidence :status)))
+          (is (= :error (erlang/element 1 bad)))
+          (is (not= 0 (get (erlang/element 2 (erlang/element 2 bad)) :exit_status)))
+          (is (= (get passing :old_bytes) (File/read! (Path/join root "fixture.bl")))))
+        (finally (File/rm_rf root))))))
+
+(deftest verification-evaluates-the-candidate-while-the-source-workspace-stays-unchanged
+  (testing "the runner forks an env and evaluates the copied candidate; the source is untouched"
+    (BeamLisp/init)
+    (let [ns (str "candidate_behavior_" (erlang/unique_integer (list :positive)))
+          original (str "(ns " ns ")\n(defn target [] \"old\")\n")
+          root (fixture! "candidate" original)]
+      (try
+        (let [plan (ok! (BeamLisp.DevChange/plan (spec root original "e1" {:selector (str ns "/target")})))
+              run (fn [command]
+                    (is (not= (get command :cwd) root)
+                        "the candidate runs in a copy, never the source workspace")
+                    (let [child (env/fork)]
+                      (try
+                        (let [value (env/with-env child
+                                      (fn []
+                                        (BeamLisp/eval
+                                          (str (File/read! (Path/join (get command :cwd) "fixture.bl"))
+                                               "\n(" ns "/target)"))))]
+                          (is (= "changed" value)))
+                        (finally (env/destroy child))))
+                    :ok)
+              r (BeamLisp.DevChange/verify plan (runner run))]
+          (is (ok-tag? r))
+          (is (= :verified (get (ok! r) :status)))
+          (is (= original (File/read! (Path/join root "fixture.bl")))))
+        (finally (File/rm_rf root))))))
+
+(deftest plan-and-preview-do-not-modify-source-bytes
+  (testing "plan and preview are reads"
+    (let [source "(ns demo)\n; preserve this comment (and delimiter-looking text: ) )\n(defn sibling [] \"keep λ\")\n(defn target [] \"old\")\n"
+          root (fixture! "pure" source)
+          path (Path/join root "fixture.bl")
+          before (File/read! path)]
+      (try
+        (let [plan (ok! (BeamLisp.DevChange/plan (spec root source "e1")))
+              preview (ok! (BeamLisp.DevChange/preview plan))]
+          (is (= (get plan :id) (get preview :id)))
+          (is (= (get plan :old_hash) (get preview :old_hash)))
+          (is (= (get plan :new_hash) (get preview :new_hash)))
+          (is (includes? (get preview :diff) "@@ changed"))
+          (is (= before (File/read! path))))
+        (finally (File/rm_rf root))))))
+
+(deftest candidate-changes-only-the-selected-top-level-form-and-preserves-exact-surrounding-bytes
+  (testing "the splice keeps every byte outside the span"
+    (let [source "(ns demo)\r\n; λ comment\r\n(defn sibling [] \"text ) (def fake [] )\")\r\n(defn target [] \"old value\")\r\n(defn tail [] :tail)\r\n"
+          root (fixture! "splice" source)
+          path (Path/join root "fixture.bl")]
+      (try
+        (let [plan (ok! (BeamLisp.DevChange/plan (spec root source "e1")))
+              span (get plan :span)
+              start (get span :start)
+              stop (get span :stop)
+              bytes (get plan :candidate_bytes)
+              replacement (get plan :replacement)
+              prefix (erlang/binary_part source 0 start)
+              suffix (erlang/binary_part source stop (erlang/- (erlang/byte_size source) stop))
+              candidate-suffix (erlang/binary_part bytes
+                                   (erlang/+ start (erlang/byte_size replacement))
+                                   (erlang/- (erlang/byte_size bytes)
+                                             (erlang/+ start (erlang/byte_size replacement))))]
+          (is (= prefix (erlang/binary_part bytes 0 start)))
+          (is (= suffix candidate-suffix))
+          (is (includes? bytes "sibling [] \"text ) (def fake [] )\""))
+          (is (includes? bytes "tail [] :tail"))
+          (is (includes? bytes "target [] \"changed\""))
+          (is (= source (File/read! path))))
+        (finally (File/rm_rf root))))))
+
+(deftest rejects-missing-malformed-and-ambiguous-definitions
+  (testing "namespace, syntax, and target-cardinality guards"
+    (is (= (err :missing_namespace) (plan-of "missing" "(defn target [] :ok)\n" "e1")))
+    (is (= (err :invalid_source) (plan-of "malformed" "(ns demo)\n(defn target [] (if true :yes)\n" "e1")))
+    (is (= (err :ambiguous_target) (plan-of "ambiguous" "(ns demo)\n(defn target [] :one)\n(defn target [] :two)\n" "e1")))))
+
+(deftest rejects-traversal-absolute-symlink-missing-and-unsupported-targets
+  (testing "target resolution refuses everything outside a relative regular .bl"
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "paths" source)]
+      (try
+        (let [outside (Path/join root "outside.txt")]
+          (File/write! outside "not source")
+          (File/ln_s! outside (Path/join root "link.bl"))
+          (is (= (err :invalid_target) (BeamLisp.DevChange/plan (spec root source "e1" {:target "../outside.txt"}))))
+          (is (= (err :invalid_target) (BeamLisp.DevChange/plan (spec root source "e1" {:target (Path/join root "fixture.bl")}))))
+          (is (= (err :symlink_target) (BeamLisp.DevChange/plan (spec root source "e1" {:target "link.bl"}))))
+          (is (= (err :missing_target) (BeamLisp.DevChange/plan (spec root source "e1" {:target "missing.bl"}))))
+          (is (= (err :unsupported_target) (BeamLisp.DevChange/plan (spec root source "e1" {:target "outside.txt"})))))
+        (finally (File/rm_rf root))))))
+
+(deftest rejects-stale-basis-and-invalid-replacements
+  (testing "hash guard and replacement shape"
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "basis" source)]
+      (try
+        (is (= (err :stale_basis)
+               (BeamLisp.DevChange/plan (spec root source "e1" {:expected_hash (String/duplicate "0" 64)}))))
+        (is (= (err :invalid_replacement)
+               (BeamLisp.DevChange/plan (spec root source "e1" {:replacement "not a form"}))))
+        (is (= (err :invalid_replacement)
+               (BeamLisp.DevChange/plan (spec root source "e1" {:replacement "(defn target []"}))))
+        (finally (File/rm_rf root))))))
+
+(deftest verification-uses-injected-runner-and-reports-success-or-failure
+  (testing "the runner sees the resolved command; success and failure are told apart"
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "runner" source)]
+      (try
+        (let [plan (ok! (BeamLisp.DevChange/plan (spec root source "e1")))]
+          (let [seen (atom nil)
+                r (BeamLisp.DevChange/verify plan (runner (fn [command] (reset! seen command) :ok)))]
+            (is (ok-tag? r))
+            (is (= (list "true") (get @seen :argv)))
+            (is (starts-with? (get @seen :cwd) (System/tmp_dir!)))
+            (let [verified (ok! r)]
+              (is (= :verified (get verified :status)))
+              (is (= (get plan :id) (get verified :edit_id)))
+              (is (= (get plan :old_hash) (get verified :basis_hash)))
+              (is (= (get plan :new_hash) (get verified :candidate_hash)))))
+          (let [bad (BeamLisp.DevChange/verify plan (runner (fn [_] (tuple :error :bad_fixture))))]
+            (is (= :error (erlang/element 1 bad)))
+            (is (= :verification_failed (erlang/element 1 (erlang/element 2 bad))))
+            (let [evidence (erlang/element 2 (erlang/element 2 bad))]
+              (is (= :failed (get evidence :status)))
+              (is (= 1 (get evidence :exit_status)))
+              (is (includes? (get evidence :output) "bad_fixture")))))
+        (finally (File/rm_rf root))))))
+
+(deftest verification-refuses-absent-and-non-allowlisted-commands
+  (testing "no command and a non-allowlisted command never reach the runner"
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "refuse" source)
+          boom (fn [_] (is false "runner must not run") :ok)]
+      (try
+        (let [plan (ok! (BeamLisp.DevChange/plan (spec root source "e1" {:verification nil})))
+              forbidden (ok! (BeamLisp.DevChange/plan (spec root source "e2" {:verification {:argv (list "./build")}})))]
+          (is (= (err :missing_verification_command)
+                 (BeamLisp.DevChange/verify plan (runner boom))))
+          (is (= (err :command_not_allowlisted)
+                 (BeamLisp.DevChange/verify forbidden (runner boom)))))
+        (finally (File/rm_rf root))))))
+
+(deftest apply-requires-authorization-and-verified-candidate
+  (testing "authorization gates the ledger; an absent receipt is :enoent; source intact"
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "apply" source)]
+      (try
+        (let [plan (ok! (BeamLisp.DevChange/plan (spec root source "e1")))
+              bad-auth {:id (get plan :id) :candidate_hash (String/duplicate "0" 64)}
+              forged {:edit_id (get plan :id) :basis_hash (get plan :old_hash)
+                      :candidate_hash (get plan :new_hash) :status :verified}]
+          (is (= (err :unauthorized)
+                 (BeamLisp.DevChange/apply! plan {:candidate_hash (get plan :new_hash) :status :ok} bad-auth)))
+          (is (= (err :enoent)
+                 (BeamLisp.DevChange/apply! plan forged
+                                             {:id (get plan :id) :candidate_hash (get plan :new_hash)})))
+          (is (includes? (File/read! (Path/join root "fixture.bl")) "[] :ok")))
+        (finally (File/rm_rf root))))))
+
+(deftest apply-is-repeat-safe-receipt-is-durable-drift-blocks-undo-and-undo-proposes-inverse
+  (testing "apply writes once, a repeat reads the receipt, drift blocks undo, undo proposes the inverse"
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "cycle" source)]
+      (try
+        (let [plan (ok! (BeamLisp.DevChange/plan (spec root source "e1")))
+              receipt (ok! (BeamLisp.DevChange/verify plan (runner (fn [_] :ok))))
+              auth {:id (get plan :id) :candidate_hash (get plan :new_hash)}
+              first (ok! (BeamLisp.DevChange/apply! plan receipt auth))
+              second (ok! (BeamLisp.DevChange/apply! plan receipt auth))
+              stored (ok! (BeamLisp.DevChange/receipt (get plan :id) root))
+              inverse (ok! (BeamLisp.DevChange/undo! (get plan :id) auth root))]
+          (is (= :applied (get first :phase)))
+          (is (= "applied" (get second "phase")))
+          (is (= (get plan :new_hash) (get stored "after_hash")))
+          (is (= "(defn target [] :ok)" (get inverse :replacement)))
+          (File/write! (Path/join root "fixture.bl") (str (get inverse :candidate_bytes) "\n"))
+          (is (= (err :conflict) (BeamLisp.DevChange/undo! (get plan :id) auth root))))
+        (finally (File/rm_rf root))))))
+
+(deftest invalid-plans-and-receipt-queries-return-tagged-errors
+  (testing "shape guards answer with tags, never raise"
+    (is (= (err :invalid_spec) (BeamLisp.DevChange/plan :not_a_map)))
+    (is (= (err :invalid_plan) (BeamLisp.DevChange/preview (Map/new))))
+    (is (= (err :invalid_plan) (BeamLisp.DevChange/verify (Map/new) (list))))
+    (is (= (err :not_found) (BeamLisp.DevChange/receipt "missing" (System/tmp_dir!))))
+    (is (= (err :invalid_receipt_query) (BeamLisp.DevChange/receipt :bad (System/tmp_dir!))))))
+
+; ── BeamLisp.DevChangeHardeningTest ─────────────────────────────────────────
+
+(deftest strict-scanner-rejects-malformed-delimiters-quoted-discarded-targets-renames-and-multiple-forms
+  (testing "the lexical scan refuses malformed closers and prefixed forms; replacements must be ONE matching form"
+    (Enum/each
+      (list "(ns demo)\n(defn target [] [1 2})\n"
+            "(ns demo)\n(defn target [] {1 2])\n"
+            "(ns demo)\n'(defn target [] :quoted)\n"
+            "(ns demo)\n#_(defn target [] :discarded)\n")
+      (fn [source]
+        (is (Enum/member? (list (err :invalid_source) (err :target_not_found))
+                          (plan-of "scan" source "e1")))))
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "renames" source)]
+      (try
+        (is (= (err :invalid_replacement)
+               (BeamLisp.DevChange/plan (spec root source "e1" {:replacement "(defn renamed [] :bad)"}))))
+        (is (= (err :invalid_replacement)
+               (BeamLisp.DevChange/plan (spec root source "e1" {:replacement "(defn target [] :a) (defn target [] :b)"}))))
+        (finally (File/rm_rf root))))))
+
+(deftest verify-revalidates-immutable-plan-fields-and-source-basis
+  (testing "a mutated plan is refused before the runner; drift is a conflict"
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "revalidate" source)
+          boom (fn [_] (is false "invalid plans must not execute") :ok)]
+      (try
+        (let [plan (ok! (BeamLisp.DevChange/plan (spec root source "e1")))]
+          (is (= (err :invalid_plan)
+                 (BeamLisp.DevChange/verify
+                   (Map/put plan :candidate_bytes (str (get plan :candidate_bytes) "x"))
+                   (runner boom))))
+          (is (= (err :invalid_plan)
+                 (BeamLisp.DevChange/verify (Map/put plan :selector "demo/other") (runner boom))))
+          (File/write! (Path/join root "fixture.bl") "(ns demo)\n(defn target [] :drift)\n")
+          (is (= (err :conflict) (BeamLisp.DevChange/verify plan (runner boom)))))
+        (finally (File/rm_rf root))))))
+
+(deftest caller-allowlist-is-ignored-and-runner-failures-are-contained-and-cleaned
+  (testing "the caller's :allow is ignored; a crashing runner is `runner_failed` and leaves no copy"
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "contain" source)]
+      (try
+        (let [plan (ok! (BeamLisp.DevChange/plan
+                          (spec root source "e1"
+                                {:verification {:argv (list "forbidden") :allow (list "forbidden")}})))]
+          (is (= (err :command_not_allowlisted)
+                 (BeamLisp.DevChange/verify plan (runner (fn [_] (is false "must not run") :ok))))))
+        (let [allowed (ok! (BeamLisp.DevChange/plan (spec root source "e2")))
+              seen (atom nil)
+              r (BeamLisp.DevChange/verify allowed
+                  (runner (fn [command]
+                            (reset! seen (Path/dirname (get command :cwd)))
+                            (erlang/exit :runner_crash))))]
+          (is (= :error (erlang/element 1 r)))
+          (is (= :runner_failed (erlang/element 1 (erlang/element 2 r))))
+          (is (not (File/exists? @seen)) "the candidate copy was cleaned up"))
+        (is (includes? (File/read! (Path/join root "fixture.bl")) "[] :ok"))
+        (finally (File/rm_rf root))))))
+
+(deftest default-runner-times-out-a-supervised-os-process-without-changing-source
+  (testing "a sleeping child is `verification_timeout`, never a launcher answer"
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "timeout" source)
+          verification {:argv (list "elixir" "-e"
+                                    "spawn(fn -> Process.sleep(:infinity) end); Process.sleep(:infinity)")
+                        :timeout 25}]
+      (try
+        (let [plan (ok! (BeamLisp.DevChange/plan (spec root source "e1" {:verification verification})))]
+          (is (= (err :verification_timeout) (BeamLisp.DevChange/verify plan))))
+        (is (includes? (File/read! (Path/join root "fixture.bl")) "[] :ok"))
+        (finally (File/rm_rf root))))))
+
+(deftest verification-honors-descriptor-cwd-and-refuses-workspace-symlinks
+  (testing "a nested cwd resolves inside the copy; a workspace symlink is refused"
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "cwd" source)]
+      (try
+        (File/mkdir_p! (Path/join root "nested"))
+        (File/write! (Path/join root "real") "outside copy")
+        (let [plan (ok! (BeamLisp.DevChange/plan
+                          (spec root source "e1" {:verification {:argv (list "true") :cwd "nested"}})))]
+          (let [seen (atom nil)
+                r (BeamLisp.DevChange/verify plan (runner (fn [command] (reset! seen (get command :cwd)) :ok)))]
+            (is (ok-tag? r))
+            (is (= "nested" (Path/basename @seen))))
+          (File/ln_s! (Path/join root "real") (Path/join root "copied-link"))
+          (is (= (err :symlink_in_workspace)
+                 (BeamLisp.DevChange/verify plan (runner (fn [_] (is false "copy must refuse first") :ok))))))
+        (finally (File/rm_rf root))))))
+
+(deftest apply-trusts-persisted-evidence-rejects-plan-mutation-and-preserves-source-mode
+  (testing "the persisted evidence is trusted; a tampered plan is refused; the file mode survives"
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "trust" source)
+          path (Path/join root "fixture.bl")]
+      (try
+        (File/chmod path 416)
+        (let [plan (ok! (BeamLisp.DevChange/plan (spec root source "e1")))
+              evidence (ok! (BeamLisp.DevChange/verify plan (runner (fn [_] :ok))))
+              auth {:id (get plan :id) :candidate_hash (get plan :new_hash)}
+              forged (Map/put evidence :candidate_hash (String/duplicate "0" 64))]
+          (is (ok-tag? (BeamLisp.DevChange/apply! plan forged auth)))
+          (is (= 416 (erlang/band (get (ok! (File/stat path)) :mode) 511))))
+        (finally (File/rm_rf root))))
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root2 (fixture! "tamper" source)]
+      (try
+        (let [plan2 (ok! (BeamLisp.DevChange/plan (spec root2 source "e1")))]
+          (is (ok-tag? (BeamLisp.DevChange/verify plan2 (runner (fn [_] :ok)))))
+          (is (= (err :invalid_plan)
+                 (BeamLisp.DevChange/apply! (Map/put plan2 :old_hash (String/duplicate "f" 64))
+                                            (Map/new)
+                                            {:id (get plan2 :id) :candidate_hash (get plan2 :new_hash)}))))
+        (finally (File/rm_rf root2))))))
+
+(deftest busy-lock-and-reused-edit-ids-refuse-without-overwrite
+  (testing "the mkdir lock reports `busy`; a second edit under one id is `edit_id_reused`"
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "lock" source)
+          path (Path/join root "fixture.bl")]
+      (try
+        (let [plan (ok! (BeamLisp.DevChange/plan (spec root source "stable")))
+              evidence (ok! (BeamLisp.DevChange/verify plan (runner (fn [_] :ok))))
+              auth {:id (get plan :id) :candidate_hash (get plan :new_hash)}
+              lock (Path/join root ".beam-lisp/change.lock")]
+          (File/mkdir_p! lock)
+          (is (= (err :busy) (BeamLisp.DevChange/apply! plan evidence auth)))
+          (File/rmdir lock)
+          (is (ok-tag? (BeamLisp.DevChange/apply! plan evidence auth)))
+          (File/write! path (get plan :old_bytes))
+          (let [different (ok! (BeamLisp.DevChange/plan (spec root source "stable"
+                                                             {:replacement "(defn target [] :different)"})))
+                different-evidence (ok! (BeamLisp.DevChange/verify different (runner (fn [_] :ok))))]
+            (is (= (err :edit_id_reused)
+                   (BeamLisp.DevChange/apply! different different-evidence
+                                               {:id (get different :id) :candidate_hash (get different :new_hash)})))))
+        (finally (File/rm_rf root))))))
+
+(deftest intent-recovery-reports-old-new-and-neither-explicitly
+  (testing "a hand-written intent journal is classified by the current bytes"
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "recover" source)
+          path (Path/join root "fixture.bl")]
+      (try
+        (let [plan (ok! (BeamLisp.DevChange/plan (spec root source "recover")))
+              dir (Path/join root ".beam-lisp/change-journal")]
+          (File/mkdir_p! dir)
+          (File/write! (Path/join dir (str (sha (get plan :id)) ".json"))
+                       (JSON/encode! {:phase :intent :id (get plan :id) :target (get plan :target)
+                                      :selector (get plan :selector)
+                                      :old_hash (get plan :old_hash) :after_hash (get plan :new_hash)}))
+          (is (= "old" (get (ok! (BeamLisp.DevChange/receipt (get plan :id) root)) "recovery")))
+          (File/write! path (get plan :candidate_bytes))
+          (is (= "new" (get (ok! (BeamLisp.DevChange/receipt (get plan :id) root)) "recovery")))
+          (File/write! path "(ns demo)\n(defn target [] :other)\n")
+          (is (= "neither" (get (ok! (BeamLisp.DevChange/receipt (get plan :id) root)) "recovery"))))
+        (finally (File/rm_rf root))))))
+
+(deftest workspace-ancestors-and-journal-symlinks-are-refused
+  (testing "a symlinked workspace and a symlinked journal component are both refused"
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          base (fixture! "ws" source)
+          linked (str base "-linked")]
+      (try
+        (File/ln_s! base linked)
+        (is (= (err :symlink_workspace) (BeamLisp.DevChange/plan (spec linked source "e1"))))
+        (finally (File/rm linked) (File/rm_rf base))))
+    (let [source "(ns demo)\n(defn target [] :ok)\n"
+          root (fixture! "journallink" source)
+          outside (fixture! "outside" "(ns outside)\n(defn target [] :outside)\n")]
+      (try
+        (File/mkdir_p! (Path/join root ".beam-lisp"))
+        (File/ln_s! outside (Path/join root ".beam-lisp/change-journal"))
+        (let [plan (ok! (BeamLisp.DevChange/plan (spec root source "e1")))]
+          (is (= (err :symlink_in_workspace)
+                 (BeamLisp.DevChange/verify plan (runner (fn [_] :ok))))))
+        (finally (File/rm_rf root) (File/rm_rf outside))))))

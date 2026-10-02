@@ -1,0 +1,438 @@
+; datom/profile.bl — what a query actually COST, measured rather than argued.
+;
+; ── The gap this fills ────────────────────────────────────────────────
+;
+; Two instruments existed and neither answered the question an application
+; actually asks ("why is THIS request slow?").
+;
+; `datom.explain` reads the query text and the schema and reports the PLAN and
+; its smells — before anything runs. Correct, and blind to what happens: a plan
+; that looks narrow can still scan a column, and a count of store requests
+; cannot see the work between them (cost_test.bl records a join that passed a
+; "constant number of requests" test for the whole time it took five seconds,
+; because the quadratic part was in memory).
+;
+; `CountingStore` (test/bl/datom/cost_test.bl) counts store operations
+; truthfully — but it lives in a TEST, as a decorator a test builds by hand.
+; In production the only figure available was the request's own wall-clock
+; time, which says nothing about which of the three layers spent it, and which
+; cannot even be compared across runs on a loaded host (two identical bulk runs
+; there differed by 2.2x).
+;
+; This namespace promotes both ideas into the library:
+;
+;   · `watch`      — a store decorator that COUNTS every operation and row
+;                    (the test double, promoted and capability-forwarding);
+;   · `analyze`    — a query run with that store AND the engine's per-clause
+;                    trace on, returning result, counters, per-clause facts,
+;                    the static plan, and a verdict.
+;
+; The two halves answer different questions on purpose. Store counters answer
+; "what did we ask the store for?" — the figure that predicts cost behind a
+; network. Per-clause rows-in/rows-out answer "how much work happened between
+; the requests?" — the figure that predicts CPU. A report with only one of them
+; is the half that misled somebody already.
+;
+; ── Why measuring must not CHANGE what it measures ───────────────────
+;
+; A wrapper around the store is a different VALUE, and the caches above the
+; port (`datom.attr-basis`, `datom.query.corpus`) are keyed by store value. A
+; naive profile would therefore build its own derived columns and report the
+; BUILD as the query's cost — the measurement perturbing the measured. So
+; `ProfilingStore` declares `datom.store/Underlying`, and those caches key the
+; base store (see `datom.store/identity-of`).
+;
+; The same reasoning drives capability forwarding: `MultiScan`/`PageScan` are
+; optional protocols dispatched on the store value, so a wrapper that omitted
+; them would silently make the profiled query read a whole column where the
+; unprofiled one read 3 520 datoms — and the profile would confidently report
+; the wrong shape. All three read capabilities are forwarded and counted.
+
+(ns datom.profile
+  (:require [datom.db] [datom.store] [datom.query.engine] [datom.query.parse]
+            [datom.query.plan] [datom.explain]))
+
+;; ── the counted store ───────────────────────────────────────────────
+
+(def COUNTER-KEYS
+  "Every counter this decorator keeps, so a report can render them all and a
+   test can ask for one by name. `:rows` is what came BACK; the op counters are
+   what was ASKED. A wrapper must forward the capability protocol, or the
+   op counters quietly report a slower read shape than the unprofiled one."
+  [:get :range :put :delete :update :commit
+   :scan :multiscan :page :count :rows :bounds])
+
+(defn- empty-counters []
+  (reduce (fn [m k] (assoc m k 0)) {} COUNTER-KEYS))
+
+(defn- bump
+  "Add `n` to counter `k`. An ETS-free atom: a profile is per-value and
+   short-lived, and an atom's `swap!` is the cheapest correct increment."
+  [counters k n]
+  (swap! counters (fn [m] (assoc m k (+ (or (get m k) 0) n)))))
+
+(defrecord ProfilingStore [inner counters]
+  datom.store/Store
+  (-get [s k] (bump (:counters s) :get 1) (datom.store/-get (:inner s) k))
+  (-range [s lo hi]
+    (bump (:counters s) :range 1)
+    (let [r (datom.store/-range (:inner s) lo hi)]
+      (bump (:counters s) :rows (count r))
+      r))
+  (-put [s k v] (bump (:counters s) :put 1) (datom.store/-put (:inner s) k v))
+  (-delete [s k] (bump (:counters s) :delete 1) (datom.store/-delete (:inner s) k))
+  (-update [s k f] (bump (:counters s) :update 1) (datom.store/-update (:inner s) k f))
+  (-commit [s ops] (bump (:counters s) :commit 1) (datom.store/-commit (:inner s) ops)))
+
+;; `extend-protocol`, not a second `extend-type`: in this dialect an `extend-type`
+;; on a type REPLACES its protocol table, so a second one here would delete the
+;; `Store` implementation above it.
+;;
+;; ── Every counter names the operation the SUBSTRATE performed ────────
+;;
+;; Not the entry point the caller used. A profiler implements the read
+;; protocols so it can intercept them, and the tempting implementation is
+;; `(bump :multiscan 1)` on entry — which reports a multi-prefix read even when
+;; the store beneath it has no such capability and answered with N single
+;; reads. Measured, on the real 64 708-row corpus, against a decorator that
+;; implemented only `Store`: the report said "1 multiscan" for a read that was
+;; 2 000 separate scans. An instrument that reports what was ASKED rather than
+;; what was DONE is worse than no instrument, because it is believed.
+;;
+;; So each branch below asks what the inner store actually declares and counts
+;; THAT: a native path when it has one, the fallback's OWN requests when it
+;; does not (`N` scans for the prefix fallback, one range for the page
+;; fallback — the exact reads `datom.store/scan-via-prefixes` and
+;; `scan-via-range-page` make).
+
+(extend-protocol datom.store/Scan
+  ProfilingStore
+  (-scan-datoms [s lo hi]
+    (let [inner (:inner s)]
+      (if (satisfies? datom.store/Scan inner)
+        (bump (:counters s) :scan 1)
+        (bump (:counters s) :range 1))
+      (let [r (datom.store/scan-datoms inner lo hi)]
+        (bump (:counters s) :rows (count r))
+        r))))
+
+(extend-protocol datom.store/MultiScan
+  ProfilingStore
+  (-scan-prefixes [s bounds]
+    (let [inner (:inner s)
+          n (count bounds)]
+      (if (datom.store/multi-scan? inner)
+        (do (bump (:counters s) :multiscan 1)
+            (bump (:counters s) :bounds n))
+        ; The fallback is one `scan-datoms` per bound — counted as the scans
+        ; (or range reads) it really is, never as the one request it is not.
+        (if (satisfies? datom.store/Scan inner)
+          (bump (:counters s) :scan n)
+          (bump (:counters s) :range n)))
+      (let [r (datom.store/scan-prefixes inner bounds)]
+        (bump (:counters s) :rows (count r))
+        r))))
+
+(extend-protocol datom.store/PageScan
+  ProfilingStore
+  (-scan-datoms-page [s start after hi limit]
+    (let [inner (:inner s)]
+      (if (satisfies? datom.store/PageScan inner)
+        (bump (:counters s) :page 1)
+        ; `scan-via-range-page` materializes the range first: one range read.
+        (bump (:counters s) :range 1))
+      (let [r (datom.store/page-datoms inner start after hi limit)]
+        (bump (:counters s) :rows (count (get r :datoms)))
+        r))))
+
+;; A bounded key count — the semi-join gate's question. It is ONE store
+;; operation (a key walk with no decode), so it is counted as itself: NOT as a
+;; range read (it reads no rows) and never as a scan. When the store beneath has
+;; no bounded counter the dispatcher answers `nil` and NOTHING happened, so
+;; nothing is counted — the same "count what was DONE" rule as the reads above.
+(extend-protocol datom.store/Count
+  ProfilingStore
+  (-count-range [s lo hi limit]
+    (let [r (datom.store/count-range (:inner s) lo hi limit)]
+      (when (some? r) (bump (:counters s) :count 1))
+      r)))
+
+; The store this profile wraps IS the store, for anything keyed by store value:
+; the derived-column caches ask `identity-of`, so a profiled read reuses the
+; corpus the base built instead of building a second one and billing it here.
+(extend-protocol datom.store/Underlying
+  ProfilingStore
+  (-underlying [s] (datom.store/identity-of (:inner s))))
+
+; ... and its CAPABILITIES are the inner store's, for anything that asks. This
+; is the other half of honest counting: `multi-scan?` must answer about the
+; substrate, so the engine chooses a shape the store can actually answer.
+(extend-protocol datom.store/Transparent
+  ProfilingStore
+  (-transparent-to [s] (datom.store/capability-target (:inner s))))
+
+(extend-protocol datom.store/Alive?
+  ProfilingStore
+  (-alive? [s] (datom.store/alive? (:inner s))))
+
+; Not forwarded, deliberately: `Closeable` (a profile owns nothing to free, and
+; closing one must never close the store it watches) and `FileBacked` (a profile
+; is not opened at a path).
+
+(def ^:private REGISTRY
+  "Every watched store in this process, in the order they were opened."
+  (atom []))
+
+(defn watch
+  "A store that counts every operation and row it is asked for, delegating to
+   `store`. Returns the wrapper; read it with `counters`.
+
+   Registered process-wide, so an application can ask what its stores did as a
+   whole (`totals`, `delta`) without threading an accounting object through
+   every call site. An application that never calls `watch` pays nothing: the
+   registry stays empty and every read here is a `deref` of it."
+  [store]
+  (let [ps (->ProfilingStore store (atom (empty-counters)))]
+    (swap! REGISTRY (fn [v] (conj v ps)))
+    ps))
+
+(defn profiled?
+  "Whether anything in this process is being watched — an application's switch
+   for whether to bother reading counters at all."
+  []
+  (not (empty? (deref REGISTRY))))
+
+(defn watched-stores [] (deref REGISTRY))
+
+; ── the other half of a read: what the PROCESS pulled from the OS ──────
+;;
+;; `watch` counts what a STORE was asked for. It cannot see a block-cache hit
+;; inside the engine (the store skipped the work) and it does not include the
+;; bytes the engine moved — so two very different situations look identical: "the
+;; column is cached" and "the store was not asked". `/proc/self/io`'s `rchar`
+;; closes that: it counts bytes read through syscalls IN THIS PROCESS, so a cache
+;; hit (no syscall at all) is excluded and a re-read is not.
+;;
+;; This exists because the spike asked for a fjall block-cache HIT RATE and the
+;; answer is that no such counter exists on this stack (`lsm-tree`'s cache exposes
+;; size/capacity/len only). Read volume plus `store-fjall/stats`' capacity is the
+;; measurable replacement, and this is the read-volume half.
+(defn os-reads
+  "Bytes this process has read through syscalls, as `{:rchar :syscr :read_bytes}`.
+   `nil` where there is no /proc (the caller then knows it cannot attribute).
+
+   HOW TO USE THIS, AND HOW NOT TO. `:rchar` (bytes) is the usable field: measure
+   it around ONE operation in ONE process and alternate the order between
+   configurations, because it counts bytes the page cache serves as readily as
+   bytes the device serves — an in-process A/B measured a 60% \"win\" that was
+   entirely the cache the first configuration had warmed.
+
+   `:syscr` is NOT an I/O proxy and must not be read as one: a BEAM process issues
+   read syscalls of its own while it computes, so the count tracks WORK, not reads.
+   Measured on this host: pure CPU (`(vec (range 3000000))`, zero I/O) reports
+   325 418 read syscalls, which is three times what a full 64 708-row column read
+   reports. Every hypothesis built on that number was false, and the store counters
+   (`:scan`/`:get`/`:rows`) said the truth all along: the engine performs one scan.
+
+   The general rule this cost: an instrument that has not been validated against a
+   NULL CASE is not an instrument. Run it once on something that should do no work
+   before trusting it on something that does."
+  []
+  (let [r (try (File/read "/proc/self/io") (catch _ nil))
+        txt (if (and (tuple? r) (= :ok (erlang/element 1 r))) (erlang/element 2 r) nil)]
+    (if (nil? txt)
+      nil
+      (let [; `Integer/parse` answers `{n, rest}` — the number FIRST (bl/cli.bl).
+            num (fn [s] (let [p (Integer/parse (String/trim s))]
+                          (cond
+                            (number? p) p
+                            (and (tuple? p) (number? (erlang/element 1 p))) (erlang/element 1 p)
+                            :else 0)))
+            field (fn [k]
+                    (let [l (first (filter (fn [x] (String/starts_with? x k))
+                                           (String/split txt "\n")))]
+                      (if (nil? l) 0 (num (nth (String/split l ":") 1)))))]
+        {:rchar (field "rchar") :syscr (field "syscr") :read_bytes (field "read_bytes")}))))
+
+; ── the unit of work, from the VM itself ──────────────────────────────
+;;
+;; S3 measured that the read LAYER costs the same whatever decodes it, and that
+;; the audit's "BEAM read tax" is therefore CPU and allocation rather than I/O.
+;; Reductions are the VM's own unit of that work — counted by the scheduler, not
+;; by us, and (unlike a wall clock on this host) not swayed by whatever else is
+;; running. A delta over ONE call in ONE process attributes the work to the code
+;; that did it:
+;;
+;;   (profile/reduced (fn [] (datom/q …)))     ; {:value … :reductions 4812033}
+;;
+;; Use it the way the store counters are used: a number that MOVES, compared
+;; between two shapes, rather than a threshold anyone has to trust.
+(defn reductions
+  "This process's reduction count. The VM's unit of work."
+  []
+  (erlang/element 2 (erlang/process_info (erlang/self) :reductions)))
+
+(defn reduced
+  "`f` run once, beside the reductions it cost: `{:value … :reductions n}`.
+
+   A COUNTER, so it is read as a delta around one call and never as an absolute.
+   Reductions include the work of every function `f` calls, so the number answers
+   \"how much work is inside this call\" — which is the question a phase split
+   inside the fold needs, and the one a wall clock on a shared host cannot answer."
+  [f]
+  (let [before (reductions)
+        v (f)]
+    {:value v :reductions (- (reductions) before)}))
+
+(defn os-reads-delta
+  "`f` run once, beside what the process read from the OS doing it. nil when
+   this platform cannot report it (never a zero that reads as measured)."
+  [f]
+  (let [a (os-reads)]
+    (if (nil? a)
+      (do (f) nil)
+      (let [v (f) b (os-reads)]
+        {:value v
+         :rchar (- (get b :rchar) (get a :rchar))
+         :syscr (- (get b :syscr) (get a :syscr))
+         :read_bytes (- (get b :read_bytes) (get a :read_bytes))}))))
+
+(defn totals
+  "Every watched store's counters, summed. One number per operation for the
+   whole process, which is what an application wants when it asks 'what did
+   that request cost the storage layer?' without knowing which stores the
+   request reached."
+  []
+  (reduce (fn [acc ps] (merge-with + acc (counters ps)))
+          (empty-counters)
+          (watched-stores)))
+
+(defn delta
+  "What the watched stores did BETWEEN `before` (a `totals` snapshot) and now,
+   with the operations that predict cost summed into `:reads`.
+
+   Snapshot, work, subtract — the shape that lets a caller attribute a request
+   without knowing which store inside it was hit. Returns nil when nothing is
+   watched, so a caller stores nothing rather than zeros that look measured."
+  [before]
+  (when (profiled?)
+    (let [now (totals)
+          d (reduce (fn [m k] (assoc m k (- (or (get now k) 0) (or (get before k) 0))))
+                    {}
+                    COUNTER-KEYS)]
+      (assoc d :reads (+ (get d :get) (get d :range) (get d :scan)
+                         (get d :multiscan) (get d :page) (get d :count))))))
+
+(defn counters
+  "The live counter map of a `watch`ed store: `{op n …, :rows n :bounds n}`."
+  [ps]
+  (deref (:counters ps)))
+
+(defn watched
+  "The store a profiler wraps (through any chain of wrappers)."
+  [ps]
+  (datom.store/identity-of (:inner ps)))
+
+(defn reset!
+  "Zero every counter. A measurement should not inherit another's totals.
+
+   `swap!` and not `reset!`: inside THIS namespace `reset!` is the name defined
+   here, so the obvious body would call itself — with the atom and the map as
+   two arguments to a one-argument function. The failure reads as a bad arity in
+   `datom.profile`, which is exactly where it was."
+  [ps]
+  (swap! (:counters ps) (fn [_] (empty-counters)))
+  ps)
+
+;; ── a database value read through the counter ───────────────────────
+
+(defn db
+  "`db` with its store wrapped for counting — the same schema, basis, filter
+   and blob tier, so every answer is identical (only the accounting differs)."
+  [db]
+  (datom.db/db-value (watch (datom.db/store-of db))
+                     (datom.db/schema-of db)
+                     (datom.db/basis-t db)
+                     (datom.db/blobs-of db)))
+
+;; ── the analyze report ──────────────────────────────────────────────
+
+(defn- clause-line [f]
+  (str "  " (pr-str (get f :clause))
+       "  shape=" (pr-str (get f :shape))
+       "  index=" (pr-str (get f :index))
+       (let [n (get f :prefixes)]
+         (if (and (some? n) (> n 0)) (str "  prefixes=" n) ""))
+       "  candidates=" (get f :candidates)
+       "  rows " (get f :rows-in) "→" (get f :rows-out)))
+
+(defn- verdict
+  "One line naming what the run cost, in the terms that predict it: what the
+   STORE was asked for, and how many rows moved between the requests."
+  [counters facts]
+  (let [asks (+ (get counters :range) (get counters :scan)
+                (get counters :multiscan) (get counters :page)
+                (get counters :get))
+        worst (reduce (fn [a f]
+                        (if (or (nil? a) (> (get f :candidates) (get a :candidates))) f a))
+                      nil facts)]
+    (str asks " store read" (if (= 1 asks) "" "s")
+         " · " (get counters :rows) " rows back · "
+         (count facts) " clause" (if (= 1 (count facts)) "" "s")
+         (if (nil? worst)
+           ""
+           (str " · widest read: " (pr-str (get worst :clause))
+                " (" (get worst :candidates) " candidates)")))))
+
+(defn analyze
+  "Run `query` against `db` (with optional `inputs`) and report what it cost:
+
+     {:result    the query's answer — identical to `q`'s
+      :store     store counters: ops asked, rows returned, bounds listed
+      :clauses   per clause: shape, index, candidates, rows in and out
+      :plan      the static plan (`datom.query.plan`) — the before picture
+      :smells    static per-row rescans (`datom.explain`)
+      :verdict   one line}
+
+   Both halves of the picture in one call: `:store` is what a network would have
+   charged for, `:clauses` is what the CPU did between the requests. Callers who
+   only want the answer should call `datom.query.engine/q`; this is the call for
+   when the answer was not the interesting part.
+
+   The trace is per PROCESS and restored on exit, so a nested or concurrent
+   query is unaffected — and the result is not a projection, so `analyze` is
+   `q` with accounting."
+  [query db & inputs]
+  (let [pdb (db db)
+        [result facts] (datom.query.engine/with-trace
+                         (fn [] (apply datom.query.engine/q query pdb inputs)))]
+    {:result result
+     :store (counters (datom.db/store-of pdb))
+     :clauses facts
+     :plan (datom.query.plan/plan (datom.query.parse/parse query))
+     :smells (try (datom.explain/smells query db) (catch _ []))
+     :verdict (verdict (counters (datom.db/store-of pdb)) facts)}))
+
+(defn render
+  "The report as text — a REPL or `bl run` wants one call."
+  [report]
+  (let [c (get report :store)]
+    (join "\n"
+          (concat
+            [(str "store: " (get c :range) " range · " (get c :multiscan) " multiscan"
+                  (let [b (get c :bounds)] (if (> b 0) (str " (" b " bounds)") ""))
+                  " · " (get c :scan) " scan · " (get c :page) " page · "
+                  (get c :get) " get · " (get c :rows) " rows")]
+            ["clauses:"]
+            (map clause-line (get report :clauses))
+            (if (seq (get report :smells))
+              (into [(str "smells: " (count (get report :smells)) " per-row rescan(s)")]
+                    (map (fn [s] (str "  " (pr-str (get s :clause))
+                                      " → " (pr-str (get s :index)))) (get report :smells)))
+              [])
+            [(str "verdict: " (get report :verdict))]))))
+
+(defn analyze-str
+  "`analyze` rendered to text."
+  [query db & inputs]
+  (render (apply analyze query db inputs)))

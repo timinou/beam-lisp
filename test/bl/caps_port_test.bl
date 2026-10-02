@@ -1,0 +1,232 @@
+; test/bl/caps_port_test.bl — the capability gate's deny-corpus, in beam-lisp.
+;
+; Ported from the ExUnit `test/beam_lisp/caps_test.exs`. Every bl→host escape
+; spelling, attempted from a capability-restricted env, must FAIL CLOSED. Same
+; discipline as the Biscuit conformance corpus: the point is not that these
+; tests pass today but that they keep failing-closed forever — a regression here
+; is a privilege-escalation hole, not a behavior change.
+;
+; The interop surface (audited, 4 paths):
+;   1. static remote call        `(File/read "x")`        → compile error
+;   2. remote fn as value        `String/upcase`          → remote_fun raise
+;   3. dynamic invoke of handle  forged `{:"$remote",…}`  → invoke raise
+;   4. defnative                 NIF installation         → compile error
+;
+; ── coverage map (ExUnit test → BL deftest) ────────────────────────────────
+; All 13 ExUnit tests map one-to-one onto a same-named BL deftest, in the
+; original order: static Elixir deny; static Erlang deny; granted runs; forged
+; remote fn; smuggled $remote handle; defnative deny; fork ∩ monotonicity;
+; capture/bind propagation; destroyed env fails closed; :global keeps :all;
+; pure bl unaffected; DOCTRINE global-closure leak; DOCTRINE confused deputy.
+;
+; Adaptations, and why:
+;   * `use ExUnit.Case, async: false` has no ward equivalent: `bl test` already
+;     runs each FILE in its own isolated fork, and the tests inside one file run
+;     in order in that one env, so nothing is raced.
+;   * `alias BeamLisp.Env` becomes direct `BeamLisp.Env/…` for the facilities the
+;     stdlib does not expose (`caps_of`, `caps_allowed?`), and the `env` namespace
+;     for fork/isolated/with-env/capture/bind/destroy/eval. The stdlib form is
+;     used wherever it exists because BL keyword opts are REAL LISTS to the host
+;     (`(env/fork parent {:caps …})` builds `[caps: …]`); a raw
+;     `(BeamLisp.Env/fork parent {:caps …})` would hand the host a struct.
+;   * `assert_raise BeamLisp.CompileError, ~r/…/` becomes `refused?` — the typed
+;     struct check plus the message needle, which is exactly what `assert_raise`
+;     with a regex asserted.
+;   * Caps specs are module ATOMS (`:Elixir.String`), as the original passed
+;     `String`/`File`/`System`; `env/caps-entry` passes atoms through unchanged.
+;   * Erlang TUPLE messages `{:read, …}` become vectors `[:read …]`: BL's
+;     `receive` patterns are vector patterns (the same shape `datom` sends), and
+;     a tuple pattern would be read as a call. The message is an implementation
+;     detail of the fixture, not the security property.
+;   * `setup`/`on_exit` becomes a per-test `try`/`finally` (the `finally`
+;     restores the temp secret) and `(BeamLisp/init)` at the top of each test
+;     that compiles.
+;
+; Run:  bl test test/bl/caps_port_test.bl
+
+(ns caps-port.test
+  (:require [env]))
+
+; --- scaffolding --------------------------------------------------------------
+
+(defn- eval-in
+  "Fork a capped env off `:global`, bind it, compile+run `source`, destroy —
+   the original's `eval_in/2`."
+  [caps source]
+  (env/isolated (env/fork :global {:caps caps}) (fn [] (env/eval source))))
+
+(defn- raised
+  "The exception `thunk` raises, or nil when it returns normally — the value
+   the original `assert_raise` inspected."
+  [thunk]
+  (try (do (thunk) nil) (catch e e)))
+
+(defn- refused?
+  "Whether `thunk` is refused with a `BeamLisp.CompileError` whose message
+   contains `needle` — the original's
+   `assert_raise BeamLisp.CompileError, ~r/needle/`."
+  [needle thunk]
+  (let [e (raised thunk)]
+    (and (some? e)
+         (= :Elixir.BeamLisp.CompileError (:__struct__ e))
+         (includes? (str (ex-message e)) needle))))
+
+(defn- tmp-secret!
+  "A fresh file holding the leak marker; the caller removes it."
+  []
+  (let [path (str (System/tmp_dir!) "/caps_secret_" (System/unique_integer (list :positive)))]
+    (File/write! path "TOP-SECRET")
+    path))
+
+; -- path 1: static remote call -------------------------------------
+
+(deftest static-elixir-interop-denied-at-compile-time
+  (BeamLisp/init)
+  (is (refused? "module File is not granted"
+        (fn [] (eval-in [:Elixir.String] "(ns t.capped) (File/read \"/etc/passwd\")")))
+      "no bytecode exists for an ungranted static call"))
+
+(deftest static-erlang-interop-denied
+  (BeamLisp/init)
+  (is (refused? "module :os is not granted"
+        (fn [] (eval-in [] "(ns t.capped) (os/cmd \"id\")")))
+      "the lowercase Erlang prefix path is gated too"))
+
+(deftest granted-modules-compile-and-run
+  (BeamLisp/init)
+  (is (= "HI" (eval-in [:Elixir.String] "(ns t.ok) (String/upcase \"hi\")"))))
+
+; -- path 2: remote fn as a value -----------------------------------
+
+(deftest remote-fn-handle-cannot-be-forged-in-a-capped-env
+  (BeamLisp/init)
+  (is (refused? "module System is not granted"
+        (fn [] (eval-in [:Elixir.String] "(ns t.capped) (map System/getenv [\"HOME\"])")))))
+
+; -- path 3: dynamic invoke of a handle smuggled in from outside -----
+
+(deftest a-remote-handle-created-at-global-cannot-fire-inside-a-capped-env
+  (BeamLisp/init)
+  (let [handle (BeamLisp.Ns.Rt/remote_fun :Elixir.String :upcase)]
+    (is (refused? "module String is not granted"
+          (fn [] (env/isolated (env/fork :global {:caps []})
+                     (fn [] (BeamLisp.Ns.Rt/invoke handle (list "hi")))))))))
+
+; -- path 4: defnative -----------------------------------------------
+
+(deftest defnative-denied-in-a-capped-env
+  (BeamLisp/init)
+  (is (refused? "defnative is not available"
+        (fn [] (eval-in [:Elixir.String] "(ns t.capped) (defnative \"evil\" (pwn 1))")))
+      "NIFs are substrate; only :global-capability code installs them"))
+
+; -- attenuation monotonicity (the Biscuit invariant) ----------------
+
+(deftest fork-caps-are-parent-intersect-spec
+  (BeamLisp/init)
+  (let [parent (env/fork :global {:caps [:Elixir.File :Elixir.String]})
+        ; child asks for MORE than the parent holds → System absent
+        child (env/fork parent {:caps [:Elixir.File :Elixir.String :Elixir.System]})]
+    (is (= (MapSet/new (list :Elixir.File :Elixir.String)) (BeamLisp.Env/caps_of child)))
+    ; child asks for nothing → inherits parent's set exactly
+    (is (= (MapSet/new (list :Elixir.File :Elixir.String))
+           (BeamLisp.Env/caps_of (env/fork parent))))
+    ; grandchild narrows further
+    (let [grandchild (env/fork child {:caps [:Elixir.String]})]
+      (is (= (MapSet/new (list :Elixir.String)) (BeamLisp.Env/caps_of grandchild)))
+      ; ...and cannot regain File
+      (is (refused? "module File is not granted"
+            (fn [] (env/isolated grandchild
+                       (fn [] (env/eval "(ns t.deep) (File/read \"/etc/passwd\")")))))))))
+
+(deftest caps-travel-with-capture-bind
+  (BeamLisp/init)
+  (let [e (env/fork :global {:caps [:Elixir.String]})
+        token (env/with-env e (fn [] (env/capture)))
+        task (Task/async (fn [] (do (env/bind token) (env/caps))))]
+    (is (= (MapSet/new (list :Elixir.String)) (Task/await task))
+        "caps ride the capture/bind token across the spawn")))
+
+(deftest a-destroyed-envs-stale-binding-fails-closed
+  (BeamLisp/init)
+  (let [e (env/fork :global {:caps [:Elixir.String]})
+        token (env/with-env e (fn [] (env/capture)))]
+    (env/destroy e)
+    (is (= (MapSet/new (list)) (BeamLisp.Env/caps_of e)))
+    (is (= (MapSet/new (list))
+           (Task/await (Task/async (fn [] (do (env/bind token) (env/caps))))))
+        "a stale token yields NO caps — not :all")))
+
+(deftest global-and-unbound-processes-keep-all
+  (BeamLisp/init)
+  (is (= :all (env/caps)))
+  (is (= :all (BeamLisp.Env/caps_of :global)))
+  (is (BeamLisp.Env/caps_allowed? :Elixir.System))
+  (is (= "hi" (eval-in :all "(ns t.global) (String/downcase \"HI\")"))))
+
+(deftest ungranted-pure-bl-code-is-unaffected
+  (BeamLisp/init)
+  (is (= 42 (eval-in [] "(ns t.pure) (defn dbl [x] (* x 2)) (dbl 21)"))
+      "the gate only mediates host calls"))
+
+; ══ doctrine boundary ═══════════════════════════════════════════════
+;
+; The gate governs NEW compilation and dynamic forging inside a capped
+; env. It does NOT re-mediate code that was already compiled at :global
+; — by doctrine the base image is part of the parent's authority
+; (setuid-helper semantics, PLAN-047 "Known limits"). These two tests
+; PIN that boundary: they document exactly where authority leaks by
+; design, and assert the mitigation. A change in EITHER direction —
+; the escape starting to deny, or the mitigation starting to leak — is
+; a semantic shift someone must notice on purpose.
+
+(deftest doctrine-a-closure-compiled-at-global-carries-its-authority-past-the-gate
+  (BeamLisp/init)
+  (let [secret (tmp-secret!)]
+    (try
+      ; Built where File IS granted — the static (File/read …) baked a DIRECT
+      ; apply, not a gated $remote handle. Nothing re-checks it later.
+      (let [leak (BeamLisp/eval "(ns atk.forge) (fn [p] (File/read p))")]
+        ; Invoked inside an env that grants ONLY String, it STILL reads the
+        ; file: a :global-compiled wrapper reachable from a sandbox lends the
+        ; sandbox its authority.
+        (is (= (tuple :ok "TOP-SECRET")
+               (env/isolated (env/fork :global {:caps [:Elixir.String]})
+                 (fn [] (BeamLisp.Ns.Rt/invoke leak (list secret)))))))
+      ; The mitigation is compile-time: writing that SAME call *inside* the
+      ; capped env never produces bytecode.
+      (is (refused? "module File is not granted"
+            (fn [] (eval-in [:Elixir.String]
+                      (str "(ns atk.inline) (File/read \"" secret "\")")))))
+      (finally (File/rm secret)))))
+
+(deftest doctrine-a-confused-deputy-leaks-unless-it-conveys-the-callers-env
+  (BeamLisp/init)
+  (let [secret (tmp-secret!)]
+    (try
+      ; A naive deputy serves whoever asks, using its OWN :global authority.
+      (let [naive (erlang/spawn
+                    (fn [] (receive
+                             [:read path from] (erlang/send from [:served (File/read! path)]))))
+            naive-result (env/isolated (env/fork :global {:caps [:Elixir.String]})
+                           (fn [] (erlang/send naive [:read secret (erlang/self)])
+                                  (receive msg msg (after 1000 :timeout))))]
+        ; The capped client could not read the file itself, yet the deputy did
+        ; it on their behalf — the classic confused-deputy exposure.
+        (is (= [:served "TOP-SECRET"] naive-result)))
+
+      ; The fix: the deputy re-enters the CALLER's conveyed env before doing
+      ; the work, and reaches the resource through the gated interop path.
+      (let [fileread (BeamLisp.Ns.Rt/remote_fun :Elixir.File :read)
+            convey (erlang/spawn
+                     (fn [] (receive
+                              [:read path token from]
+                              (let [res (try (do (env/bind token)
+                                                 [:served (BeamLisp.Ns.Rt/invoke fileread (list path))])
+                                             (catch e [:denied (:__struct__ e)]))]
+                                (erlang/send from res)))))]
+        (is (= [:denied :Elixir.BeamLisp.CompileError]
+               (env/isolated (env/fork :global {:caps [:Elixir.String]})
+                 (fn [] (erlang/send convey [:read secret (env/capture) (erlang/self)])
+                        (receive msg msg (after 1000 :timeout)))))))
+      (finally (File/rm secret)))))

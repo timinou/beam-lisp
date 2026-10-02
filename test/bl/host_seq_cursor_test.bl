@@ -1,0 +1,754 @@
+; host_seq_cursor_test.bl — the pinned `SeqCursor` type and its `Enumerable` impl.
+;
+; Two `.bl` sources under `priv/host/` replace the two halves of
+; `lib/beam_lisp/seq_cursor.ex` at their exact module atoms:
+;
+;   * `priv/host/seq_cursor.bl` → `Elixir.BeamLisp.SeqCursor`, a STRUCT whose
+;     `__struct__/0,1` pair and `__info__/1` are synthesized by
+;     `compile_host_file`'s `:struct_fields` option in the order the live module
+;     declares them (`:chunk`, `:tail`, `:dirty`), plus `new/1` and `cell/1`.
+;   * `priv/host/seq_cursor_enumerable.bl` → `Elixir.Enumerable.BeamLisp.SeqCursor`,
+;     the protocol impl, FUNCTIONS-ONLY.
+;
+; The live modules are never left replaced. Each source is compiled at its OWN
+; probe atom, the namespace shim beside it is dropped, and the pinned beam is
+; loaded ALONE — so a leftover shim reference would be `undef` here.
+;
+; What each block pins:
+;   * the struct surface — the tag is the PROBE atom (never hard-coded), the
+;     defaults are `[]`/`nil`/`false` in declaration order, and `new`/`cell`
+;     answer the same data as the live module on the same inputs across every
+;     chunk boundary (0, 1, 32, 32±1, 64, 100);
+;   * `cell` reads the backing fields BY KEY — a value the production tag
+;     carries and a value the probe tag carries walk identically, and a value
+;     whose `:chunk` is not a list is the live module's `FunctionClauseError`;
+;   * the NATIVE RESOURCE is held by the struct, one chunk at a time — a fresh
+;     cursor's `:tail` is a resource that survives a GC, the first `cell` copies
+;     one chunk (32 heads, not the whole list) and leaves the rest on the
+;     resource, and the resource is only pulled again when the chunk empties;
+;   * the impl — direct invocation over a live-tagged cursor (the tag its
+;     `BeamLisp.SeqCursor/cell` call resolves against) covering `count`/`member?`/
+;     `slice` refusals and `reduce`'s cont/halt/suspend arms, then dispatched
+;     through `Enumerable.impl_for`;
+;   * and, the live impl beam saved first, the impl loaded under its EXACT atom,
+;     `Enum`/`Stream` driven through it over both lanes (a small-element list and
+;     a large-element list that forces the dirty chunk lane), the live beam
+;     RESTORED afterwards.
+;
+; Run: bin/bl test test/bl/host_seq_cursor_test.bl
+
+(ns host.seq-cursor.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_seq_cursor_" (erlang/unique_integer (list :positive))))
+
+(defn- struct-source [] (Path/join (BeamLisp/cwd) "priv/host/seq_cursor.bl"))
+(defn- enum-source [] (Path/join (BeamLisp/cwd) "priv/host/seq_cursor_enumerable.bl"))
+
+(def ^:private struct-mod :Elixir.BeamLisp.HostSeqCursorProbe)
+(def ^:private enum-mod :Elixir.Enumerable.BeamLisp.HostSeqCursorProbe)
+(def ^:private struct-shim :Elixir.BeamLisp.Ns.Host.SeqCursor)
+(def ^:private enum-shim :Elixir.BeamLisp.Ns.Host.SeqCursorEnumerable)
+(def ^:private live-struct :Elixir.BeamLisp.SeqCursor)
+(def ^:private live-enum :Elixir.Enumerable.BeamLisp.SeqCursor)
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-pinned [mod path]
+  (do (drop! mod)
+      (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+      mod))
+
+; Compile `src` at `mod` and publish ONLY the pinned beam: the compile's own
+; load (and the namespace shim it built beside it) is dropped first.
+(defn- compile-pinned [mod src opts]
+  (let [res (BeamLisp.AOT/compile_host_file src opts)]
+    (load-pinned mod (elem res 1))))
+
+; The struct defaults, in the live module's declaration order. `()` is the RAW
+; Erlang empty list the native `chunk` NIF hands back — a bl `[]` would be a
+; `BeamLisp.Vector` and the whole walk would be wrong.
+(defn- struct-fields []
+  (list (t2 :chunk ()) (t2 :tail nil) (t2 :dirty false)))
+
+(defn- compile-struct [dir]
+  (let [m (compile-pinned struct-mod (struct-source)
+            (list (t2 :module struct-mod) (t2 :output_dir dir) (t2 :load? false)
+                  (t2 :struct_fields (struct-fields))))]
+    (drop! struct-shim)
+    m))
+
+(defn- compile-enum [dir]
+  (let [m (compile-pinned enum-mod (enum-source)
+            (list (t2 :module enum-mod) (t2 :output_dir dir) (t2 :load? false)))]
+    (drop! enum-shim)
+    m))
+
+(defn- raise-class [f]
+  (try (do (f) :no-raise)
+       (catch e (:__struct__ e))))
+
+(defn- seq-list [n] (erlang/apply :lists :seq (list 1 n)))
+
+(defn- big-elem [] (Map/new (range 300) (fn [i] (tuple i i))))
+
+; 200 × ~3 KB elements: 32 of them exceed the 64 KiB fast-lane ceiling, so the
+; native cursor decides the dirty chunk lane ONCE at creation.
+(defn- dirty-list []
+  (erlang/apply :lists :duplicate (list 200 (big-elem))))
+
+; ── native cursor handles ────────────────────────────────────────────────
+;
+; A walk threads ONE native resource — the root `LazyMemo/cursor` mints — named
+; by a HANDLE: either the root itself (a reference; chunk 0) or the
+; `{root, index}` token a pull answered. Each pull costs no new resource, so a
+; 16k-element walk still mints exactly one.
+(defn- handle? [h]
+  (cond
+    (erlang/is_reference h) true
+    (and (erlang/is_tuple h) (erlang/== 2 (erlang/tuple_size h))
+         (erlang/is_reference (erlang/element 1 h))
+         (erlang/is_integer (erlang/element 2 h))) true
+    :else false))
+
+(defn- handle-root [h]
+  (cond (erlang/is_reference h) h
+        :else (erlang/element 1 h)))
+
+; The index a handle names: 0 for a bare root, else the token's second element.
+(defn- handle-index [h]
+  (cond (erlang/is_reference h) 0
+        :else (erlang/element 2 h)))
+
+(defn- cursor-new-count [] (:op_cursor_new (BeamLisp.LazyMemo/stats)))
+
+(defn- live-cells [] (:live_cells (BeamLisp.LazyMemo/stats)))
+
+; ── cell walking ─────────────────────────────────────────────────────────
+
+; Walk the cursor to its end through `mod`'s `cell`, collecting elements. Each
+; step is an improper cons `[head | sub-cursor]`, so the walk reads `hd`/`tl`,
+; never a list comprehension.
+(defn- walk-cursor [mod cursor]
+  (loop [c cursor acc ()]
+    (let [cell (erlang/apply mod :cell (list c))]
+      (if (nil? cell)
+        (erlang/apply :lists :reverse (list acc))
+        (recur (erlang/tl cell) (cons (erlang/hd cell) acc))))))
+
+(defn- walk [mod lst]
+  (walk-cursor mod (erlang/apply mod :new (list lst))))
+
+; Step exactly `n` cells, discarding their heads — the cursor left holding
+; whatever chunk position `n` lands on.
+(defn- drain [mod cursor n]
+  (loop [i 0 c cursor]
+    (if (erlang/< i n)
+      (recur (erlang/+ i 1) (erlang/tl (erlang/apply mod :cell (list c))))
+      c)))
+
+; One observation vector over the struct surface and one full walk, for a list
+; of `n` elements. Tag-free, so the same vector answers for the probe and the
+; live module when the ABI is identical.
+(defn- obs [mod n]
+  (let [lst (seq-list n)
+        c (erlang/apply mod :new (list lst))]
+    (list (erlang/map_get :chunk c)
+          (erlang/map_get :dirty c)
+          (erlang/is_reference (erlang/map_get :tail c))
+          (walk mod lst))))
+
+; ── the SeqCursor struct surface ─────────────────────────────────────────
+
+(deftest struct-pinned-struct-is-probe-tagged
+  (testing "`:struct_fields` synthesizes __struct__/0,1 in declaration order"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (= :non_existing (erlang/apply :code :which (list struct-shim))))
+      ; The export surface IS the live module's, datum for datum.
+      (is (= (Enum/sort (erlang/apply live-struct :module_info (list :exports)))
+             (Enum/sort (erlang/apply struct-mod :module_info (list :exports)))))
+      (is (erlang/function_exported struct-mod :new 1))
+      (is (erlang/function_exported struct-mod :cell 1))
+      ; __struct__/0 — the tag is the PROBE atom, and the three fields default.
+      (let [s0 (erlang/apply struct-mod :__struct__ (list))]
+        (is (erlang/is_map s0))
+        (is (= 4 (erlang/map_size s0)))
+        (is (= struct-mod (erlang/map_get :__struct__ s0)))
+        (is (= () (erlang/map_get :chunk s0)))
+        (is (nil? (erlang/map_get :tail s0)))
+        (is (= false (erlang/map_get :dirty s0))))
+      ; __struct__/1 updates through the synthesized reducer.
+      (let [s1 (erlang/apply struct-mod :__struct__ (list (list (tuple :chunk (list 9 8)) (tuple :dirty true))))]
+        (is (= (list 9 8) (erlang/map_get :chunk s1)))
+        (is (= true (erlang/map_get :dirty s1)))
+        (is (nil? (erlang/map_get :tail s1))))
+      ; new/1 is the cursor, tagged with the PROBE atom — a hard-coded
+      ; `BeamLisp.SeqCursor` tag would make the next line false.
+      (let [c (erlang/apply struct-mod :new (list (seq-list 3)))]
+        (is (= struct-mod (erlang/map_get :__struct__ c)))
+        (is (= () (erlang/map_get :chunk c)))
+        (is (erlang/is_reference (erlang/map_get :tail c))))
+      ; __info__(:struct) is the live beam's list, datum for datum, so
+      ; `Inspect.Any` renders the same and the field ORDER is preserved.
+      (is (= (erlang/apply live-struct :__info__ (list :struct))
+             (erlang/apply struct-mod :__info__ (list :struct))))
+      (is (= (list :chunk :tail :dirty)
+             (Enum/map (erlang/apply struct-mod :__info__ (list :struct))
+                       (fn [f] (erlang/map_get :field f)))))
+      (is (= (list () nil false)
+             (Enum/map (erlang/apply struct-mod :__info__ (list :struct))
+                       (fn [f] (erlang/map_get :default f)))))
+      (is (= "%BeamLisp.HostSeqCursorProbe{chunk: [], tail: nil, dirty: false}"
+             (Kernel/inspect (erlang/apply struct-mod :__struct__ (list)))))
+      ; The SAME source compiles at its PRODUCTION atom — read, not loaded:
+      ; `:load? false` writes the beam without replacing the live module.
+      (let [res (BeamLisp.AOT/compile_host_file (struct-source)
+                  (list (t2 :module live-struct) (t2 :output_dir dir) (t2 :load? false)
+                        (t2 :struct_fields (struct-fields))))]
+        (is (= live-struct (elem res 0)))
+        (is (File/exists? (elem res 1))))
+      ; ... and the live module is untouched: it still answers at its own atom.
+      (is (= live-struct (erlang/map_get :__struct__ (erlang/apply live-struct :new (list (seq-list 1))))))
+      (File/rm_rf! dir))))
+
+; ── the SeqCursor API, diffed against the live module ────────────────────
+
+(deftest struct-pinned-cell-matches-the-live-module
+  (testing "same chunks, same lane, same normalized walk — across chunk boundaries"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      ; PINNED ANSWERS first — the ABI itself, not merely probe == live.
+      (is (= (list 1 2 3) (walk struct-mod (list 1 2 3))))
+      (is (= (seq-list 40) (walk struct-mod (seq-list 40))))
+      (is (= () (walk struct-mod (seq-list 0))))
+      (is (= () (erlang/map_get :chunk (erlang/apply struct-mod :new (list (seq-list 0))))))
+      (is (= false (erlang/map_get :dirty (erlang/apply struct-mod :new (list (seq-list 0))))))
+      ; The 0/1/31/32/33/63/64/65/100 boundaries each land cells differently;
+      ; every one must answer identically.
+      (is (= (Enum/map (list 0 1 31 32 33 40 63 64 65 100) (fn [n] (obs live-struct n)))
+             (Enum/map (list 0 1 31 32 33 40 63 64 65 100) (fn [n] (obs struct-mod n)))))
+      ; A 40-element list: one chunk of 32, then a chunk of 8 pulled later.
+      (let [c (erlang/apply struct-mod :new (list (seq-list 40)))
+            t1 (erlang/tl (erlang/apply struct-mod :cell (list c)))]
+        (is (= () (erlang/map_get :chunk c)))
+        (is (erlang/is_reference (erlang/map_get :tail c)))
+        (is (= 31 (erlang/length (erlang/map_get :chunk t1))))   ; 32 heads copied, 1 consumed
+        ; The sub-cursor's `:tail` names chunk 1 with a `{root, 1}` token — the
+        ; SAME root the fresh cursor holds, so no new resource was minted.
+        (is (handle? (erlang/map_get :tail t1)))
+        (is (= 1 (handle-index (erlang/map_get :tail t1))))
+        (is (erlang/== (erlang/map_get :tail c) (handle-root (erlang/map_get :tail t1))))
+        (is (= 33 (erlang/hd (erlang/apply struct-mod :cell (list (drain struct-mod c 32)))))))
+      ; The chunk is a RAW Erlang list, never a bl vector.
+      (let [t1 (erlang/tl (erlang/apply struct-mod :cell (list (erlang/apply struct-mod :new (list (seq-list 5))))))]
+        (is (erlang/is_list (erlang/map_get :chunk t1)))
+        (is (not (vector? (erlang/map_get :chunk t1)))))
+      ; An empty chunk with no resource is the end, `nil`; the live module agrees.
+      (is (nil? (erlang/apply struct-mod :cell
+                   (list (erlang/apply struct-mod :__struct__ (list (list (tuple :chunk ()))))))))
+      ; Large elements take the dirty chunk lane — decided by the native cursor,
+      ; the same answer the live module gets for the same list.
+      (is (= true (erlang/map_get :dirty (erlang/apply struct-mod :new (list (dirty-list))))))
+      (is (= (erlang/map_get :dirty (erlang/apply live-struct :new (list (dirty-list))))
+             (erlang/map_get :dirty (erlang/apply struct-mod :new (list (dirty-list))))))
+      (is (= 200 (erlang/length (walk struct-mod (dirty-list)))))
+      (File/rm_rf! dir))))
+
+; ── backing fields read by KEY, not by tag ───────────────────────────────
+
+(deftest struct-pinned-works-on-a-production-tagged-cursor
+  (testing "`cell` reads :chunk/:tail/:dirty by key; the tag is preserved"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      ; A cursor the PROBE built, re-tagged to the PRODUCTION atom: the value
+      ; shape the live code path hands around. `cells` reads only the backing
+      ; keys, so it walks this exactly as it walks a probe-tagged one.
+      (let [prod (maps/put :__struct__ live-struct
+                    (erlang/apply struct-mod :new (list (seq-list 40))))]
+        (is (= live-struct (erlang/map_get :__struct__ prod)))
+        (is (= (seq-list 40) (walk-cursor struct-mod prod)))
+        (is (= live-struct (erlang/map_get :__struct__
+                               (erlang/tl (erlang/apply struct-mod :cell (list prod))))))
+        ; The pinned `cell` and the live `cell` agree on the SAME production
+        ; value: same head, same chunk, same preserved production tag. (The
+        ; tail sub-cursor is a FRESH native resource on each pull, so the two
+        ; conses are compared structurally, never by resource identity.)
+        (let [a (erlang/apply struct-mod :cell (list prod))
+              b (erlang/apply live-struct :cell (list prod))]
+          (is (= (erlang/hd a) (erlang/hd b)))
+          (is (= (erlang/map_get :chunk (erlang/tl a)) (erlang/map_get :chunk (erlang/tl b))))
+          (is (handle? (erlang/map_get :tail (erlang/tl a))))
+          (is (erlang/== (handle-root (erlang/map_get :tail (erlang/tl a)))
+                         (handle-root (erlang/map_get :tail prod))))
+          (is (= live-struct (erlang/map_get :__struct__ (erlang/tl a))))))
+      ; ... and on a value the PRODUCTION module built, the probe still walks it.
+      (is (= (seq-list 40) (walk-cursor struct-mod (erlang/apply live-struct :new (list (seq-list 40))))))
+      ; The walk over a production-tagged cursor is the live module's walk.
+      (is (= (walk-cursor live-struct (erlang/apply live-struct :new (list (seq-list 40))))
+             (walk-cursor struct-mod (erlang/apply live-struct :new (list (seq-list 40))))))
+      ; A value whose `:chunk` is not a list is refused, exactly as the live
+      ; struct head refused it — for a bare map and for a wrong-typed chunk.
+      (is (= :Elixir.FunctionClauseError
+             (raise-class (fn [] (erlang/apply struct-mod :cell (list (maps/new)))))))
+      (is (= :Elixir.FunctionClauseError
+             (raise-class (fn [] (erlang/apply live-struct :cell (list (maps/new)))))))
+      (is (= :Elixir.FunctionClauseError
+             (raise-class (fn [] (erlang/apply struct-mod :cell
+                                  (list (maps/put :chunk 5 (maps/new))))))))
+      (is (= (raise-class (fn [] (erlang/apply live-struct :cell
+                               (list (maps/put :chunk 5 (maps/new))))))
+             (raise-class (fn [] (erlang/apply struct-mod :cell
+                               (list (maps/put :chunk 5 (maps/new))))))))
+      (File/rm_rf! dir))))
+
+; ── the native cursor resource is held by the struct ─────────────────────
+
+(deftest struct-pinned-holds-the-native-resource
+  (testing "one chunk on the heap, the rest on the walk's one root resource"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (let [c (erlang/apply struct-mod :new (list (seq-list 100)))
+            root (erlang/map_get :tail c)]
+        (is (erlang/is_reference root) "a fresh cursor holds the ROOT itself")
+        (is (= 0 (handle-index root)))
+        ; A resource is GC-owned; the struct holds the only handle a walker has,
+        ; so it survives a collection (nothing else references it).
+        (erlang/garbage_collect)
+        (is (erlang/== root (erlang/map_get :tail c)))
+        ; The first cell copies one chunk; the root still holds the rest.
+        (let [t1 (erlang/tl (erlang/apply struct-mod :cell (list c)))]
+          (is (= 31 (erlang/length (erlang/map_get :chunk t1))))
+          (is (= 1 (handle-index (erlang/map_get :tail t1))))
+          (is (erlang/== root (handle-root (erlang/map_get :tail t1)))))
+        ; Draining the 32-head chunk leaves the chunk empty but the root
+        ; untouched — the NEXT pull is deferred to the next cell.
+        (let [d32 (drain struct-mod c 32)]
+          (is (= () (erlang/map_get :chunk d32)))
+          (is (= 1 (handle-index (erlang/map_get :tail d32))))
+          (is (erlang/== root (handle-root (erlang/map_get :tail d32))))
+          (is (= 33 (erlang/hd (erlang/apply struct-mod :cell (list d32))))))
+        ; After the first pull the sub-cursor holds the root token and a full chunk.
+        (let [sub (erlang/tl (erlang/apply struct-mod :cell (list c)))]
+          (erlang/garbage_collect)
+          (is (handle? (erlang/map_get :tail sub))))
+        ; The whole walk never keeps more than one chunk: walking all 100
+        ; elements and collecting at the end still leaves the head cursor valid.
+        (is (= (seq-list 100) (walk-cursor struct-mod c))))
+      (File/rm_rf! dir))))
+
+; ── one resource per walk, and a replayable position ─────────────────────
+
+(deftest cursor-walk-mints-one-native-resource-whatever-its-length
+  (testing "`op_cursor_new` is O(1) in the walk length, not O(n/32)"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (doseq [n (list 0 1 32 33 64 1000 16384)]
+        (let [before (cursor-new-count)
+              walk (fn []
+                     (let [c (erlang/apply struct-mod :new (list (seq-list n)))]
+                       (is (= 0 (handle-index (erlang/map_get :tail c))))
+                       (is (= (seq-list n) (walk-cursor struct-mod c)))))]
+          (walk)
+          ; ONE root per walk, whatever the length: 16 384 elements pull 512
+          ; chunks and still mint a single resource (the old shape minted 512).
+          (is (= 1 (erlang/- (cursor-new-count) before))
+              (str "n=" n " mints one cursor root"))))
+      (File/rm_rf! dir))))
+
+(deftest a-pull-reads-so-the-same-handle-replays
+  (testing "the same {root,index} answers the same chunk and the same tail"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (let [root (BeamLisp.LazyMemo/cursor (seq-list 70))
+            dirty (BeamLisp.LazyMemo/cursor_dirty_chunks? root)]
+        ; Pull chunk 0 twice from the SAME handle: identical chunk, identical tail.
+        (let [a (BeamLisp.LazyMemo/cursor_chunk root dirty)
+              b (BeamLisp.LazyMemo/cursor_chunk root dirty)]
+          (is (= (erlang/element 1 a) (erlang/element 1 b)))
+          (is (erlang/== (erlang/element 2 a) (erlang/element 2 b)))
+          (is (= 1 (handle-index (erlang/element 2 a)))))
+        ; ... and so does chunk 1, from the token, while the first token stays
+        ; valid and still names chunk 1 (nothing was advanced in place).
+        (let [t1 (erlang/element 2 (BeamLisp.LazyMemo/cursor_chunk root dirty))
+              c1a (BeamLisp.LazyMemo/cursor_chunk t1 dirty)
+              c1b (BeamLisp.LazyMemo/cursor_chunk t1 dirty)]
+          (is (= 32 (erlang/length (erlang/element 1 c1a))))
+          (is (= (erlang/element 1 c1a) (erlang/element 1 c1b)))
+          (is (= 2 (handle-index (erlang/element 2 c1a))))
+          (is (= 1 (handle-index t1)) "replaying chunk 1 did not move its token")
+          (is (erlang/== (handle-root t1) root)))
+        ; Interleaved pulls: chunk 0 stays available AFTER chunk 1 was pulled, so
+        ; the walk position is a value, not a mutable cursor that moved on.
+        (let [first-again (BeamLisp.LazyMemo/cursor_chunk root dirty)]
+          (is (= (seq-list 32) (erlang/element 1 first-again)))
+          (is (= 1 (handle-index (erlang/element 2 first-again))))))
+      (File/rm_rf! dir))))
+
+(deftest a-16k-walk-answers-the-same-on-every-visit
+  (testing "16 384 elements: repeated head reads and repeated full walks agree"
+    (let [dir (tmp-dir)
+          n 16384
+          values (seq-list n)]
+      (compile-struct dir)
+      ; The element after 512 full chunks is the first head of the LAST chunk:
+      ; draining 16 352 cells lands exactly on it, with no boundary overrun.
+      (let [c (erlang/apply struct-mod :new (list values))
+            landed (drain struct-mod c 16352)]
+        (is (= 16353 (erlang/hd (erlang/apply struct-mod :cell (list landed)))))
+        ; Repeating the head read is effect-free: the same cursor answers the
+        ; same element every time, and the head cursor itself is unchanged.
+        (is (= 1 (erlang/hd (erlang/apply struct-mod :cell (list c)))))
+        (is (= 1 (erlang/hd (erlang/apply struct-mod :cell (list c))))))
+      ; Repeated FULL walks answer identically, and each mints one root.
+      (let [before (cursor-new-count)]
+        (is (= values (walk struct-mod values)))
+        (is (= values (walk struct-mod values)))
+        (is (= 2 (erlang/- (cursor-new-count) before))))
+      ; The enumerable walk agrees with the module walk, three ways.
+      (is (= values (Enum/to_list (BeamLisp.SeqCursor/new values))))
+      (is (= n (Enum/count (BeamLisp.SeqCursor/new values))))
+      (is (= values (erlang/apply :lists :reverse
+                       (list (Enum/reduce (BeamLisp.SeqCursor/new values) ()
+                               (fn [x acc] (cons x acc)))))))
+      (File/rm_rf! dir))))
+
+(deftest a-walk-survives-collector-rounds-between-chunks
+  (testing "a round between chunk pulls never frees a walking cursor's source"
+    (let [dir (tmp-dir)
+          values (seq-list 200)]
+      (compile-struct dir)
+      ; The walker holds the cursor, so the walk is reachable and its source —
+      ; which owns the environment the position index lives in — must survive
+      ; every round. A round that detached it would leave the NEXT pull with
+      ; nothing to read, not a wrong answer.
+      (let [c (erlang/apply struct-mod :new (list values))]
+        (is (= values
+               (loop [cur c acc ()]
+                 (BeamLisp.LazyMemo/collect_cycles)
+                 (let [cell (erlang/apply struct-mod :cell (list cur))]
+                   (if (nil? cell)
+                     (erlang/apply :lists :reverse (list acc))
+                     (recur (erlang/tl cell) (cons (erlang/hd cell) acc))))))))
+      (File/rm_rf! dir))))
+
+; ── the Enumerable impl: direct probe invocation ─────────────────────────
+
+(deftest enum-pinned-direct-probe
+  (testing "impl surface and direct invocation over a live-tagged cursor"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      ; Before the impl beam exists, the tag-derived impl atom resolves to nothing.
+      (is (nil? (erlang/apply :Elixir.Enumerable :impl_for
+                   (list (erlang/apply struct-mod :new (list (seq-list 3)))))))
+      (compile-enum dir)
+      ; After it exists, the SAME derivation (tag → `Enumerable.<tag>`) finds it.
+      (is (= enum-mod (erlang/apply :Elixir.Enumerable :impl_for
+                          (list (erlang/apply struct-mod :new (list (seq-list 3)))))))
+      (is (= :non_existing (erlang/apply :code :which (list enum-shim))))
+      (is (erlang/function_exported enum-mod :__impl__ 1))
+      (is (erlang/function_exported enum-mod :count 1))
+      (is (erlang/function_exported enum-mod :member? 2))
+      (is (erlang/function_exported enum-mod :reduce 3))
+      (is (erlang/function_exported enum-mod :slice 1))
+      ; FUNCTIONS-ONLY: no synthesized struct surface.
+      (is (not (erlang/function_exported enum-mod :__struct__ 0)))
+      (is (not (erlang/function_exported enum-mod :__info__ 1)))
+      ; __impl__/1 answers exactly the live impl's pair; unknown key refuses.
+      (is (= (erlang/apply live-enum :__impl__ (list :for))
+             (erlang/apply enum-mod :__impl__ (list :for))))
+      (is (= (erlang/apply live-enum :__impl__ (list :protocol))
+             (erlang/apply enum-mod :__impl__ (list :protocol))))
+      (is (= :Elixir.BeamLisp.SeqCursor (erlang/apply enum-mod :__impl__ (list :for))))
+      (is (= :Elixir.Enumerable (erlang/apply enum-mod :__impl__ (list :protocol))))
+      (is (= :Elixir.FunctionClauseError
+             (raise-class (fn [] (erlang/apply enum-mod :__impl__ (list :bogus))))))
+      ; The impl is FOR `BeamLisp.SeqCursor`: direct-invoke its functions on a
+      ; LIVE cursor — the tag its `BeamLisp.SeqCursor/cell` call resolves against.
+      (let [c (erlang/apply live-struct :new (list (seq-list 3)))]
+        ; No size, no constant-time member: count/member?/slice all refuse.
+        (is (= (tuple :error enum-mod) (erlang/apply enum-mod :count (list c))))
+        (is (= (tuple :error enum-mod) (erlang/apply enum-mod :member? (list c 2))))
+        (is (= (tuple :error enum-mod) (erlang/apply enum-mod :slice (list c))))
+        (is (= (tuple :error live-enum) (erlang/apply live-enum :slice (list c))))
+        ; reduce/3 straight through the tagged accumulator protocol.
+        (is (= (tuple :done (list 3 2 1))
+               (erlang/apply enum-mod :reduce
+                 (list c (tuple :cont ()) (fn [x acc] (tuple :cont (cons x acc)))))))
+        ; `{:halt, acc}` from the caller's fun stops the walk.
+        (is (= (tuple :halted (list 2 1))
+               (erlang/apply enum-mod :reduce
+                 (list c (tuple :cont ())
+                       (fn [x acc] (if (erlang/== x 2)
+                                     (tuple :halt (cons x acc))
+                                     (tuple :cont (cons x acc))))))))
+        ; `{:suspend, acc}` answers a continuation that resumes the SAME cursor
+        ; with nothing consumed.
+        (let [s (erlang/apply enum-mod :reduce
+                  (list c (tuple :suspend ()) (fn [x acc] (tuple :cont (cons x acc)))))]
+          (is (= :suspended (erlang/element 1 s)))
+          (is (= () (erlang/element 2 s)))
+          (is (= (tuple :done (list 3 2 1))
+                 ((erlang/element 3 s) (tuple :cont ())))))
+        ; An accumulator that is none of the three tags is the live refusal.
+        (is (= :Elixir.FunctionClauseError
+               (raise-class (fn [] (erlang/apply enum-mod :reduce (list c :bogus (fn [x acc] (tuple :cont (cons x acc))))))))))
+      (File/rm_rf! dir))))
+
+; ── production-tagged dispatch through the probe body ────────────────────
+
+(deftest enum-pinned-production-tagged-dispatch
+  (testing "the probe impl streams a PRODUCTION-tagged cursor directly"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (compile-enum dir)
+      ; A cursor built by the PRODUCTION constructor — its tag is the live atom,
+      ; so `Enumerable.impl_for` derives the LIVE impl, and the probe impl is
+      ; invoked DIRECTLY over that value (the shape a probe atom would break:
+      ; its `BeamLisp.SeqCursor/cell` call resolves against the value's tag).
+      (let [c (erlang/apply live-struct :new (list (seq-list 40)))]
+        (is (= live-enum (erlang/apply :Elixir.Enumerable :impl_for (list c))))
+        (is (= (tuple :error enum-mod) (erlang/apply enum-mod :count (list c))))
+        (let [r (erlang/apply enum-mod :reduce
+                  (list c (tuple :cont ()) (fn [x acc] (tuple :cont (cons x acc)))))]
+          (is (= :done (erlang/element 1 r)))
+          (is (= (seq-list 40) (erlang/apply :lists :reverse (list (erlang/element 2 r))))))
+        ; A probe-TAGGED cursor, by contrast, derives the PROBE impl.
+        (let [p (erlang/apply struct-mod :new (list (seq-list 3)))]
+          (is (= enum-mod (erlang/apply :Elixir.Enumerable :impl_for (list p))))))
+      (File/rm_rf! dir))))
+
+; ── the impl under its EXACT atom, then restored ─────────────────────────
+
+(deftest enum-pinned-live-dispatch-at-the-exact-atom
+  (testing "loads at Elixir.Enumerable.BeamLisp.SeqCursor, streams both lanes, restores"
+    (let [dir (tmp-dir)
+          orig-path (erlang/apply :code :which (list live-enum))
+          orig-bin (File/read! (erlang/list_to_binary orig-path))
+          probe (Path/join dir "Elixir.Enumerable.BeamLisp.SeqCursor.beam")]
+      (is (not= :non_existing orig-path)
+          "precondition: the live impl beam is a readable file")
+      (try
+        ; Compile at the EXACT atom, then load it OVER the live impl.
+        (BeamLisp.AOT/compile_host_file (enum-source)
+          (list (t2 :module live-enum) (t2 :output_dir dir) (t2 :load? false)))
+        (drop! enum-shim)
+        (drop! live-enum)
+        (code/load_binary live-enum (erlang/binary_to_list probe) (File/read! probe))
+        (let [c (erlang/apply live-struct :new (list (seq-list 40)))]
+          (is (= live-enum (erlang/apply :Elixir.Enumerable :impl_for (list c))))
+          ; Finite enumeration: to_list drains the whole walk.
+          (is (= (seq-list 40) (Enum/to_list c)))
+          ; count falls back from the `{:error, …}` answer to a `reduce` walk.
+          (is (= 40 (Enum/count c)))
+          ; take HALTS after N (no overfetch past the chunk it reads).
+          (is (= (list 1 2 3) (Enum/take c 3)))
+          ; Stream/take SUSPENDS; resuming finishes the enumeration.
+          (is (= (list 1 2 3 4) (Enum/to_list (Stream/take c 4))))
+          (is (= :Elixir.FunctionClauseError
+                 (raise-class (fn [] (erlang/apply live-enum :__impl__ (list :bogus)))))))
+        ; Large elements: the same enumeration over the DIRTY chunk lane.
+        (let [c (erlang/apply live-struct :new (list (dirty-list)))]
+          (is (= true (erlang/map_get :dirty c)))
+          (is (= 200 (Enum/count c)))
+          (is (= 5 (erlang/length (Enum/take c 5)))))
+        (finally
+          (drop! live-enum)
+          (code/load_binary live-enum orig-path orig-bin)))
+      ; RESTORED: the live impl answers again at the same atom.
+      (is (= live-enum
+             (erlang/apply :Elixir.Enumerable :impl_for
+               (list (erlang/apply live-struct :new (list (seq-list 1)))))))
+      (is (= (seq-list 40) (Enum/to_list (erlang/apply live-struct :new (list (seq-list 40))))))
+      (File/rm_rf! dir))))
+
+; ── cold runtime: no namespace vars, across the chunk boundary ─────────
+
+; Every `Env.fetch!` call site in a compiled beam, as `{fn, arity}` tuples. A
+; pinned host module MUST have none: its own namespace's vars are never interned
+; in a fresh VM, so a surviving var lookup would be `undefined var` there —
+; exactly what a warm test VM hides.
+(defn- env-fetch-ins? [ins]
+  (cond
+    (not (erlang/is_tuple ins)) false
+    (not (erlang/== :call_ext (erlang/element 1 ins))) false
+    (not (erlang/is_tuple (erlang/element 3 ins))) false
+    (not (erlang/== :extfunc (erlang/element 1 (erlang/element 3 ins)))) false
+    :else (and (= :Elixir.BeamLisp.Env (erlang/element 2 (erlang/element 3 ins)))
+               (= :fetch! (erlang/element 3 (erlang/element 3 ins))))))
+
+(defn- env-fetch-sites [path]
+  (let [fns (erlang/element 6 (erlang/apply :beam_disasm :file (list (erlang/binary_to_list path))))]
+    (reduce
+      (fn [acc f]
+        (if (= :function (erlang/element 1 f))
+          (let [nm (erlang/element 2 f)
+                ar (erlang/element 3 f)]
+            (reduce (fn [a ins] (if (env-fetch-ins? ins) (cons (tuple nm ar) a) a))
+                    acc
+                    (erlang/element 5 f)))
+          acc))
+      ()
+      fns)))
+
+(deftest struct-pinned-cold-without-namespace-vars
+  (testing "`cell` walks with every `host.seq-cursor` var deleted"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (let [path (Path/join dir "Elixir.BeamLisp.HostSeqCursorProbe.beam")]
+        ; The beam makes NO `Env.fetch!` call at all, so a fresh VM — which
+        ; never interns `host.seq-cursor` — has nothing to fail on.
+        (is (= () (env-fetch-sites path)))
+        ; The SAME source at the PRODUCTION atom is var-free too. Read, not
+        ; loaded (`:load? false`), so the live module is untouched.
+        (let [res (BeamLisp.AOT/compile_host_file (struct-source)
+                    (list (t2 :module live-struct) (t2 :output_dir dir) (t2 :load? false)
+                          (t2 :struct_fields (struct-fields))))]
+          (is (= live-struct (erlang/element 1 res)))
+          (is (= () (env-fetch-sites (erlang/element 2 res)))))
+        ; COLD for THIS VM too: drop the vars the compile interned. After a
+        ; delete in the current env the name resolves nowhere (no refer, and
+        ; `host.seq-cursor` is not core/sugar), which is the fresh-VM state.
+        (doseq [nm (list "new" "cell")]
+          (BeamLisp.Env/delete_key (tuple "host.seq-cursor" nm)))
+        (is (not (BeamLisp.Env/bound? "host.seq-cursor" "cell")))
+        (is (not (BeamLisp.Env/bound? "host.seq-cursor" "new")))
+        ; 100 elements: the first chunk plus THREE later pulls, all cold.
+        (is (= (seq-list 100) (walk struct-mod (seq-list 100))))
+        (is (= () (walk struct-mod (seq-list 0))))
+        ; The 33rd cell is the first one the SECOND chunk answers — the pull
+        ; happens mid-walk, with the vars gone.
+        (is (= 33 (erlang/hd (erlang/apply struct-mod :cell
+                              (list (drain struct-mod (erlang/apply struct-mod :new (list (seq-list 40))) 32)))))))
+      (File/rm_rf! dir))))
+
+(deftest enum-pinned-cold-without-namespace-vars
+  (testing "`reduce` streams with every `host.seq-cursor-enumerable` var deleted"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (compile-enum dir)
+      (let [path (Path/join dir "Elixir.Enumerable.BeamLisp.HostSeqCursorProbe.beam")]
+        (is (= () (env-fetch-sites path)))
+        ; At the PRODUCTION atom as well (read-only compile of the same source).
+        (let [res (BeamLisp.AOT/compile_host_file (enum-source)
+                    (list (t2 :module live-enum) (t2 :output_dir dir) (t2 :load? false)))]
+          (is (= live-enum (erlang/element 1 res)))
+          (is (= () (env-fetch-sites (erlang/element 2 res)))))
+        (doseq [nm (list "__impl__" "count" "member?" "slice" "reduce")]
+          (BeamLisp.Env/delete_key (tuple "host.seq-cursor-enumerable" nm)))
+        ; `reduce`/`count` also resolve through `core`, so the deletion is shown
+        ; by a name core does not carry; the streaming assertions below are the
+        ; behavioural half.
+        (is (not (BeamLisp.Env/bound? "host.seq-cursor-enumerable" "__impl__")))
+        ; A PRODUCTION-tagged cursor: the impl's `BeamLisp.SeqCursor/cell` call
+        ; resolves against the value's tag, and its self re-entry goes through
+        ; the module read, not a var — so 40 elements cross the boundary cold.
+        (let [c (erlang/apply live-struct :new (list (seq-list 40)))]
+          (is (= (tuple :done (erlang/apply :lists :reverse (list (seq-list 40))))
+                 (erlang/apply enum-mod :reduce
+                   (list c (tuple :cont ()) (fn [x acc] (tuple :cont (cons x acc)))))))
+          ; the suspend continuation re-enters the SAME way
+          (let [s (erlang/apply enum-mod :reduce
+                    (list c (tuple :suspend ()) (fn [x acc] (tuple :cont (cons x acc)))))]
+            (is (= :suspended (erlang/element 1 s)))
+            (is (= (tuple :done (erlang/apply :lists :reverse (list (seq-list 40))))
+                   ((erlang/element 3 s) (tuple :cont ())))))))
+      (File/rm_rf! dir))))
+
+; ── the collector's census, over the shapes a memo state holds ───────────
+;
+; The cycle collector counts INTERNAL references OCCURRENCE BY OCCURRENCE: a
+; value holding the same resource 20 times must count 20, not 1, or the cell
+; reads as externally held and its cycle is never reclaimed. These build such
+; cycles out of the same memo cells the cursor walk uses and assert the
+; collector frees them — and that a REACHABLE cycle always survives.
+
+(defn- settle!
+  "Collect every process heap (drops dead references), then run cycle rounds
+   until the live count stops moving."
+  []
+  (loop [prev -1 i 0]
+    (doseq [p (erlang/processes)] (erlang/garbage_collect p))
+    (BeamLisp.LazyMemo/collect_cycles)
+    (let [now (live-cells)]
+      (when (and (not= now prev) (< i 5)) (recur now (inc i))))))
+
+; Three runs, not twenty: the census is a COUNTING property, so one unreachable
+; cycle that is not freed is already decisive, and this file's cursor cases
+; above are the expensive ones.
+(defn- leaked-cells [f]
+  (settle!)
+  (let [before (live-cells)]
+    (doseq [_ (range 3)] (f))
+    (settle!)
+    (erlang/- (live-cells) before)))
+
+(def ^:private collector-on? (erlang/== "" (BeamLisp.LazyMemo/collector_status)))
+
+(deftest the-collector-census-is-occurrence-exact
+  (if collector-on?
+    (doseq [[nm f]
+            [["one cell held 20 TIMES by its own value"
+              #(let [a (atom nil)]
+                 (reset! a (erlang/apply :lists :duplicate (list 20 a))))]
+             ["20 distinct cells, each holding their common parent"
+              #(let [a (atom nil)
+                     bs (erlang/apply :lists :map
+                           (list (fn [_] (atom a)) (erlang/apply :lists :seq (list 1 20))))]
+                 (reset! a bs))]
+             ["a closure capturing its own cell"
+              #(let [a (atom nil)] (reset! a (fn [] a)))]
+             ["a tuple holding a closure that captures the cell"
+              #(let [a (atom nil)] (reset! a (tuple 1 (fn [] (tuple a a)))))]
+             ["a lazy seq reaching back through its own cell"
+              ; UNFORCED, exactly as `ref_cycles_test`'s "atom -> lazy seq ->
+              ; atom" builds it: the atom holds a lazy seq whose closure derefs
+              ; that same atom, and the cycle is never published. Forcing it
+              ; (`doall`) only raises `cyclic_memo` — a refusal, not collector
+              ; ownership — so the 0-leak assertion is what proves the census
+              ; frees the cycle. The deftest below shows this build mints a
+              ; cell, so the assertion is not a no-op.
+              #(let [a (atom nil)] (reset! a (map (fn [_] @a) [1 2])))]]]
+      (is (= 0 (leaked-cells f)) nm))
+    (testing "collector off on this emulator: reported, not silent"
+      (is (not= "" (BeamLisp.LazyMemo/collector_status))))))
+
+(deftest a-reachable-cycle-survives-every-collector-round
+  ; The same 20-occurrence cycle as the case above, still held by this process:
+  ; a sound census must leave it alone AND leave its value intact.
+  (let [a (atom nil)]
+    (reset! a (erlang/apply :lists :duplicate (list 20 a)))
+    (doseq [_ (range 3)] (settle!))
+    (is (= 20 (erlang/length @a)) "still reachable, value intact")
+    (is (erlang/== a (erlang/hd @a)))))
+
+(deftest a-reachable-lazy-cycle-survives-and-is-freed-when-dropped
+  ; The census case above builds the lazy cycle and drops it at once. This
+  ; holds the SAME construction open across rounds and then lets it go, so
+  ; both halves are observed directly and the census case cannot pass
+  ; vacuously: while the builder frame is live the cycle is REACHABLE and no
+  ; round may free it (its cell stays live); the frame gone, the cycle is
+  ; unreachable and the next settle frees it.
+  (if collector-on?
+    (let [_ (settle!)
+          before (live-cells)
+          held ((fn []
+                  (let [a (atom nil)]
+                    (reset! a (map (fn [_] @a) [1 2]))
+                    ; `a` is derefed AFTER the rounds, so the closure's atom —
+                    ; and the lazy cell that captures it — is a live root
+                    ; through every one of them.
+                    (doseq [_ (range 3)] (settle!))
+                    (let [alive (erlang/- (live-cells) before)]
+                      (erlang/== @a @a)
+                      alive))))]
+      (is (pos? held) "reachable: the lazy cycle's cell survives every round")
+      ; The builder frame is gone; nothing references the cycle now.
+      (settle!)
+      (is (= 0 (erlang/- (live-cells) before)) "unreachable: the dropped lazy cycle is freed"))
+    (testing "collector off on this emulator: reported, not silent"
+      (is (not= "" (BeamLisp.LazyMemo/collector_status))))))

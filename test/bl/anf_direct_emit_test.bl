@@ -1,0 +1,400 @@
+; anf_direct_emit_test.bl — the canonical cutover oracle: the `compiler`
+; namespace IS the self-hosted backend, and every form in the frozen corpus
+; compiles to the SAME canonical ANF the seed snapshots record.
+;
+; Ported from the ExUnit `test/beam_lisp/anf_direct_emit_test.exs`. The corpus
+; comparison is STRUCTURAL (including guards); no canonicalize/quote round-trip
+; is allowed — the whole point of the direct emitter was to remove it. The
+; snapshot `.etf` files are trusted repository fixtures read with lossless
+; Erlang terms, not `pr-str`: printed atom names can contain reader delimiters.
+;
+; The equivalence walk canonicalizes only the two representations the cutover
+; knowingly changed:
+;
+;   · GROUND DATA. The old pipeline decomposed quoted data into
+;     `:cons`/`:tuple`/`:struct` constructors; the direct emitter embeds it as
+;     one `:lit`. Ground constructors are interpreted back to the VALUE they
+;     denote, at every level, and compared with fresh-name normalisation;
+;
+;   · `:do` ASSOCIATIVITY. The old pipeline right-nested blocks, the direct
+;     emitter keeps a flat statement list; blocks are flattened on both sides,
+;     and the old side's pure-constant no-ops and discarded cons-list statements
+;     (absent alias/refer groups, `ns` requires) are dropped — evaluating a
+;     no-op or a discarded list has the same effect as omitting it.
+;
+; `ANF_CORPUS_REFREEZE=1 bl test test/bl/anf_direct_emit_test.bl` re-blesses the
+; snapshots from the CURRENT compiler in the exact scope the comparison runs
+; in — for a deliberate emit change (a new link target, a new special form),
+; never to make a red run green without reading the diff first.
+;
+; Run: bl test test/bl/anf_direct_emit_test.bl
+
+(ns anf-direct-emit.test
+  (:require [compiler :as c]))
+
+(def ^:private corpus-files
+  (list "priv/boot/core.bl"
+        "priv/boot/sugar.bl"
+        "priv/boot/compiler.bl"
+        "priv/boot/reader.bl"
+        "priv/std/multi.bl"
+        "priv/std/optics.bl"))
+
+(def ^:private rt-mod :"Elixir.BeamLisp.Ns.Rt")
+(def ^:private link-mod :"Elixir.BeamLisp.Link")
+
+; ── tagged results ───────────────────────────────────────────────────────────
+
+(defn- tagged? [tag x]
+  (and (tuple? x) (= 2 (erlang/tuple_size x)) (= tag (elem x 0))))
+
+(defn- ground-tag? [x] (tagged? :ground x))
+(defn- ground-val [x] (elem x 1))
+(defn- ok-tag? [x] (tagged? :ok x))
+(defn- ok-val [x] (elem x 1))
+
+(defn- snapshot-path [path]
+  (str "test/fixtures/anf_canonical_corpus/" (String/replace path "/" "_") ".etf"))
+
+; ── normalisation of the two representations ─────────────────────────────────
+
+; `(norm node)` canonicalizes the genesis `:struct` spelling (a `:fields` list)
+; to the direct emitter's `:pairs`. Both spellings describe the same struct
+; field pairs, not different operations.
+(defn- norm [node]
+  (if (and (map? node) (= :struct (:op node)) (contains? node :fields))
+    (assoc (dissoc node :fields) :pairs (:fields node))
+    node))
+
+(defn- flatten-stmts [stmts]
+  (mapcat (fn [s]
+            (if (and (map? s) (= :do (:op s)))
+              (flatten-stmts (:stmts s))
+              (list s)))
+          stmts))
+
+(defn- cons-chain [node]
+  (cond
+    (and (map? node) (= :cons (:op node))) (cons (:head node) (cons-chain (:tail node)))
+    (and (map? node) (= :enil (:op node))) (list)
+    :else (list node)))
+
+(defn- noop-stmt? [s]
+  (or (and (map? s) (= :enil (:op s)))
+      (and (map? s) (= :lit (:op s)) (nil? (:val s)))))
+
+; Drop pure-constant NON-FINAL statements (the final one carries the value) and
+; splice the elements of a non-final cons-list stmt into individual statements
+; (evaluating them in order has the same effects; the list is discarded).
+(defn- drop-noops [stmts]
+  (if (empty? stmts)
+    stmts
+    (let [n (count stmts)
+          init (take (dec n) stmts)
+          last (drop (dec n) stmts)
+          spliced (mapcat (fn [s]
+                            (if (and (map? s) (= :cons (:op s))) (cons-chain s) (list s)))
+                          init)
+          kept (filter (fn [s] (not (noop-stmt? s))) spliced)]
+      (concat kept last))))
+
+(defn- flatten-do [node]
+  (if (and (map? node) (= :do (:op node)))
+    (assoc node :stmts (drop-noops (flatten-stmts (:stmts node))))
+    node))
+
+; ── ground data reconstruction ───────────────────────────────────────────────
+
+; `list?` is true only for an Erlang cons/nil; `map`/`filter`/`concat`/`take`
+; answer a LAZY seq, and the walk must treat both as the same sequential shape
+; (`=` already compares them element-wise).
+(defn- lst? [x] (or (list? x) (seq? x)))
+
+(defn- proper-list? [x]
+  (cond
+    (seq? x) true
+    (list? x) (try (do (erlang/length x) true) (catch _ false))
+    :else false))
+
+(defn- to-enum [x]
+  (cond
+    (vector? x) (erlang/tuple_to_list (erlang/map_get :items x))
+    (tuple? x) (erlang/tuple_to_list x)
+    (lst? x) x
+    :else x))
+
+(defn- ground-data-list [xs acc]
+  (if (empty? xs)
+    (tuple :ok (reverse acc))
+    (let [d (ground-data (first xs))]
+      (if (ok-tag? d)
+        (ground-data-list (rest xs) (cons (ok-val d) acc))
+        :no))))
+
+; Ground DATA (not nodes): atoms, numbers, binaries, and proper lists /
+; tuples / bl vectors / maps thereof.
+(defn- ground-data [v]
+  (cond
+    (or (erlang/is_atom v) (number? v) (string? v)) (tuple :ok v)
+    (lst? v) (if (proper-list? v) (ground-data-list v (list)) :no)
+    (tuple? v) (let [r (ground-data-list (erlang/tuple_to_list v) (list))]
+                 (if (ok-tag? r) (tuple :ok (erlang/list_to_tuple (ok-val r))) :no))
+    (vector? v) (let [r (ground-data-list (erlang/tuple_to_list (erlang/map_get :items v)) (list))]
+                  (if (ok-tag? r) (tuple :ok (BeamLisp.Vector/new (ok-val r))) :no))
+    (map? v) (let [r (ground-data-list (Map/to_list v) (list))]
+               (if (ok-tag? r) (tuple :ok (Map/new (ok-val r))) :no))
+    :else :no))
+
+(defn- ground-all [xs acc]
+  (if (empty? xs)
+    (tuple :ground (reverse acc))
+    (let [g (groundify (first xs))]
+      (if (ground-tag? g)
+        (ground-all (rest xs) (cons (ground-val g) acc))
+        :no))))
+
+(defn- ground-list [xs done]
+  (let [r (ground-all xs (list))]
+    (if (ground-tag? r) (done (ground-val r)) :no)))
+
+(defn- ground-map [pairs]
+  (reduce (fn [acc pair]
+            (if (ground-tag? acc)
+              (let [kv (to-enum pair)
+                    k (groundify (first kv))
+                    v (groundify (second kv))]
+                (if (and (ground-tag? k) (ground-tag? v))
+                  (tuple :ground (assoc (ground-val acc) (ground-val k) (ground-val v)))
+                  :no))
+              acc))
+          (tuple :ground {})
+          (to-enum pairs)))
+
+; Reconstruct the DATA a ground subtree denotes: `:lit` of a ground term, or a
+; `:cons`/`:tuple`/`:enil`/`:struct`/`:map` composition of ground subtrees.
+; Interpret only ground constructors, never arbitrary compiled calls.
+(defn- groundify [node]
+  (cond
+    (and (map? node) (= :lit (:op node)))
+      (let [d (ground-data (:val node))]
+        (if (ok-tag? d) (tuple :ground (ok-val d)) :no))
+    (and (map? node) (= :enil (:op node))) (tuple :ground (list))
+    (and (map? node) (= :cons (:op node)))
+      (let [h (groundify (:head node)) t (groundify (:tail node))]
+        (if (and (ground-tag? h) (ground-tag? t))
+          (tuple :ground (cons (ground-val h) (ground-val t)))
+          :no))
+    (and (map? node) (= :tuple (:op node)))
+      (ground-list (to-enum (:elems node))
+        (fn [ds] (tuple :ground (erlang/list_to_tuple ds))))
+    (and (map? node) (= :struct (:op node)) (contains? node :fields))
+      (groundify (norm node))
+    (and (map? node) (= :struct (:op node)))
+      (ground-list (to-enum (:pairs node))
+        (fn [ds]
+          (let [fields (Map/new ds (fn [kv] (tuple (first kv) (second kv))))]
+            (tuple :ground (Kernel/struct! (:mod node) fields)))))
+    (and (map? node) (= :map (:op node)))
+      (ground-map (:pairs node))
+    (and (map? node) (= :remote (:op node)) (= rt-mod (:mod node))
+         (= :hash_key (:fun node)) (= 1 (count (:args node))))
+      (let [g (groundify (first (:args node)))]
+        (if (ground-tag? g) (tuple :ground (BeamLisp.Ns.Rt/hash_key (ground-val g))) :no))
+    (vector? node)
+      (ground-list (to-enum node) (fn [ds] (tuple :ground ds)))
+    :else :no))
+
+; ── ground value equality ────────────────────────────────────────────────────
+
+; Fresh-name counters are generation-order dependent: "x_12" ≡ :x_2830.
+(defn- fresh [s]
+  (Regex/replace (Regex/compile! "__?[0-9]+") s "_N"))
+
+; `{:__aliases__, _, segs}` resolves to its module atom; atoms and binaries
+; canonicalize to their fresh()-ed string spelling; vectors carry a `:vector`
+; tag so they never compare equal to a plain list.
+(defn- ground-norm [x]
+  (cond
+    (and (tuple? x) (= 3 (erlang/tuple_size x)) (= :__aliases__ (elem x 0)) (lst? (elem x 2)))
+      (Atom/to_string (Module/concat (Enum/map (elem x 2) Atom/to_string)))
+    (erlang/is_atom x) (fresh (Atom/to_string x))
+    (string? x) (fresh x)
+    (lst? x) (Enum/map x ground-norm)
+    (tuple? x) (erlang/list_to_tuple (Enum/map (erlang/tuple_to_list x) ground-norm))
+    (vector? x) (tuple :vector (Enum/map (erlang/tuple_to_list (erlang/map_get :items x)) ground-norm))
+    :else x))
+
+(defn- ground-eq [a b]
+  (= (ground-norm a) (ground-norm b)))
+
+; ── the structural walk ──────────────────────────────────────────────────────
+
+(defn- defvar? [x]
+  (and (map? x) (= :remote (:op x)) (= link-mod (:mod x)) (= :defvar (:fun x))))
+
+(defn- def-ast-equiv [a b]
+  (if (and (map? a) (= :"defn-clause" (:op a)) (map? b) (= :"defn-clause" (:op b)))
+    (do-equiv a b)
+    (tuple :diff (str "not def-ast vs defn-clause: " (pr-str a) " vs " (pr-str b)))))
+
+(defn- entry-key [e]
+  (list (elem e 0) (elem e 1) (elem e 2)))
+
+(defn- entries-equiv [old-node new-node]
+  (let [go (groundify old-node)
+        gn (groundify new-node)]
+    (cond
+      (not (and (ground-tag? go) (ground-tag? gn)))
+        (tuple :diff "entries not ground")
+      (not= (count (ground-val go)) (count (ground-val gn)))
+        (tuple :diff "entries length")
+      :else
+        (reduce
+          (fn [acc pair]
+            (if (= acc :ok)
+              (let [e1 (first pair) e2 (second pair)]
+                (if (= (entry-key e1) (entry-key e2))
+                  (let [d (def-ast-equiv (elem e1 3) (elem e2 3))]
+                    (if (= d :ok) :ok (tuple :diff (str "def-ast readback: " (elem d 1)))))
+                  (tuple :diff (str "entry " (pr-str (entry-key e1)) " vs " (pr-str (entry-key e2))))))
+              acc))
+          :ok
+          (map (fn [x y] (list x y)) (ground-val go) (ground-val gn))))))
+
+(defn- do-defvar-equiv [a b]
+  (let [aa (:args a)
+        bb (:args b)
+        r1 (do-equiv (nth aa 0 nil) (nth bb 0 nil))]
+    (if (not= r1 :ok)
+      r1
+      (let [r2 (do-equiv (nth aa 1 nil) (nth bb 1 nil))]
+        (if (not= r2 :ok)
+          r2
+          (let [r3 (entries-equiv (nth aa 2 nil) (nth bb 2 nil))]
+            (if (not= r3 :ok)
+              r3
+              (do-equiv (nth aa 3 nil) (nth bb 3 nil)))))))))
+
+(defn- do-keys-equiv [a b]
+  (let [ka (sort (keys (dissoc a :ann)))
+        kb (sort (keys (dissoc b :ann)))]
+    (if (not= ka kb)
+      (tuple :diff (str "keys " (pr-str ka) " vs " (pr-str kb)))
+      (reduce (fn [acc k] (if (= acc :ok) (do-equiv (get a k) (get b k)) acc)) :ok ka))))
+
+(defn- do-list-equiv [a b]
+  (if (= (count a) (count b))
+    (reduce (fn [acc pair]
+              (if (= acc :ok) (do-equiv (first pair) (second pair)) acc))
+            :ok
+            (map (fn [x y] (list x y)) a b))
+    (tuple :diff (str "list lengths " (count a) " vs " (count b)))))
+
+(defn- walk [a b]
+  (cond
+    (and (vector? a) (vector? b))
+      (do-equiv (erlang/tuple_to_list (erlang/map_get :items a))
+                (erlang/tuple_to_list (erlang/map_get :items b)))
+
+    ; Mixed seed/full rebuilds can compare a quoted genesis def entry with an E3
+    ; :defn-clause node. Canonicalise the entries as data, then compare each
+    ; def's executable readback contract rather than its generation encoding.
+    (and (defvar? a) (defvar? b)) (do-defvar-equiv a b)
+
+    ; `:ann` carries source positions (metadata, not semantics): the direct
+    ; emitter stamps it from reader meta; canonicalize of genesis's quoted
+    ; output has none. Positions are pinned by wave20, not by this oracle.
+    (and (map? a) (map? b)) (do-keys-equiv a b)
+
+    (and (tuple? a) (tuple? b))
+      (do-equiv (erlang/tuple_to_list a) (erlang/tuple_to_list b))
+
+    (and (lst? a) (lst? b)) (do-list-equiv a b)
+
+    (and (string? a) (string? b))
+      (if (= (fresh a) (fresh b)) :ok (tuple :diff (str (pr-str a) " vs " (pr-str b))))
+
+    (and (erlang/is_atom a) (erlang/is_atom b))
+      (if (= (fresh (Atom/to_string a)) (fresh (Atom/to_string b)))
+        :ok
+        (tuple :diff (str (pr-str a) " vs " (pr-str b))))
+
+    (or (number? a) (erlang/is_boolean a) (nil? a))
+      (if (= a b) :ok (tuple :diff (str (pr-str a) " vs " (pr-str b))))
+
+    :else (tuple :diff (str "shape " (pr-str a) " vs " (pr-str b)))))
+
+(defn- do-equiv [a b]
+  (let [na (flatten-do (norm a))
+        nb (flatten-do (norm b))
+        ga (groundify na)
+        gb (groundify nb)]
+    (cond
+      (and (ground-tag? ga) (ground-tag? gb))
+        (if (ground-eq (ground-val ga) (ground-val gb))
+          :ok
+          (tuple :diff (str "ground " (pr-str (ground-val ga)) " vs " (pr-str (ground-val gb)))))
+      (ground-tag? ga)
+        (tuple :diff (str "old side is ground, new is not: " (pr-str nb)))
+      (ground-tag? gb)
+        (tuple :diff (str "new side is ground, old is not: " (pr-str na)))
+      :else (walk na nb))))
+
+(defn- equiv [a b] (do-equiv a b))
+
+; ── corpus comparison ────────────────────────────────────────────────────────
+
+(defn- refreeze! [path entries env]
+  (let [refrozen (Enum/map entries
+                   (fn [entry]
+                     (c/reset-fresh!)
+                     (list (first entry) (tuple :ok (c/compile (first entry) env)))))]
+    (File/write! (snapshot-path path)
+                 (erlang/term_to_binary {:version 2 :source path :entries refrozen}))
+    (println "refroze" path (count refrozen) "forms")))
+
+(defn- diff-why [r] (elem r 1))
+
+(defn- compare-file [acc path]
+  (let [snap (erlang/binary_to_term (File/read! (snapshot-path path)))]
+    (is (= 2 (get snap :version)) (str path " corpus version 2"))
+    (is (= path (get snap :source)) (str path " corpus names its source"))
+    (let [entries (get snap :entries)]
+      (is (not (empty? entries)) (str path " corpus is non-empty"))
+      (is (every? (fn [e] (= :ok (first (second e)))) entries)
+          (str path " corpus entries all compiled"))
+      ; `compile/2` binds the ambient `Env.current_ns` over `env[:ns]`, and the
+      ; frozen snapshots were cut with the ambient at "user". The ExUnit suite
+      ; ran with that ambient by default; the ward fork carries the test file's
+      ; namespace, so pin it back for the comparison and the refreeze alike.
+      (BeamLisp.Env/with_ns "user"
+        (fn []
+          (let [env (assoc (c/new-env "anfcensus") :ns "anfcensus")]
+            (when (= "1" (System/get_env "ANF_CORPUS_REFREEZE"))
+              (refreeze! path entries env))
+            (reduce (fn [acc [i entry]]
+                      (let [form (first entry)
+                            expected (second (second entry))]
+                        (try
+                          (c/reset-fresh!)
+                          (let [canonical (c/compile form env)
+                                r (equiv expected canonical)]
+                            (if (= :ok r)
+                              acc
+                              (conj acc (list path i (diff-why r)))))
+                          (catch e
+                            (conj acc (list path i (str "compile error: " (ex-message e))))))))
+                    acc
+                    (map-indexed (fn [i e] (list i e)) entries))))))))
+
+(defn- compare-files [paths]
+  (reduce compare-file (list) paths))
+
+(deftest public-compiler-matches-frozen-corpus-snapshots-including-guards
+  (let [mismatches (compare-files corpus-files)]
+    (is (= [] mismatches)
+        (str (count mismatches) " corpus form(s) differ from frozen snapshots:\n"
+             (join "\n"
+                   (map (fn [m]
+                          (str "  " (first m) " form " (second m) ": " (nth m 2)))
+                        (take 5 mismatches)))))))

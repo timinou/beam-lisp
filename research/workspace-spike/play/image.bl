@@ -1,0 +1,157 @@
+; Runtime namespace shims are VM-global. Images use private names so a trial
+; cannot hot-replace a function in another image, even when envs are forked.
+(ns play.image
+  (:require [env] [reader-node :as rn] [play.change :as change]))
+
+(defn- fresh [] (String/downcase (Base/encode16 (crypto/strong_rand_bytes 10))))
+(defn- datum [node]
+  (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "compiler" "datum") (list node)))
+
+(defn- declared [source]
+  (try
+    (let [form (first (filter change/ns-form? (BeamLisp.Reader/read_string source)))]
+      (when form (rn/node-name (rn/node-form (second (rn/node-items (rn/node-form form)))))))
+    (catch _e nil)))
+
+(defn- mapped-symbol [value image namespace]
+  (let [s (str value) parts (String/split s "/")]
+    (if (= 2 (count parts))
+      (let [prefix (first parts)
+            alias (BeamLisp.Env/alias_target namespace prefix)
+            logical (or (get (:history image) alias) (get (:history image) prefix) prefix)
+            target (get (:names image) logical)]
+        (if target (symbol target (second parts)) value))
+      value)))
+
+(declare rewrite-form)
+
+(defn- rewrite-require [clause image]
+  (apply list
+    (first clause)
+    (map (fn [spec]
+           (if (and (vector? spec) (symbol? (first spec)))
+             (assoc spec 0 (symbol (get (:names image) (str (first spec)) (str (first spec)))))
+             spec))
+         (rest clause))))
+
+(defn- rewrite-form [form image namespace]
+  (cond
+    (symbol? form) (mapped-symbol form image namespace)
+    (list? form)
+      (cond
+        (= 'quote (first form)) form
+        (= 'ns (first form))
+          (apply list 'ns
+            (symbol (get (:names image) (str (second form)) (str (second form))))
+            (map (fn [clause]
+                   (if (and (list? clause) (= :require (first clause)))
+                     (rewrite-require clause image) clause))
+                 (drop 2 form)))
+        :else (apply list (map (fn [item] (rewrite-form item image namespace)) form)))
+    (vector? form) (mapv (fn [item] (rewrite-form item image namespace)) form)
+    (map? form) (into {} (map (fn [[k v]] [(rewrite-form k image namespace)
+                                         (rewrite-form v image namespace)]) form))
+    (set? form) (set (map (fn [item] (rewrite-form item image namespace)) form))
+    :else form))
+
+(defn source
+  "Rewrite executable references, leaving quoted proposal/data symbols alone."
+  [image text namespace]
+  (join "\n" (map (fn [node] (BeamLisp.RT/print_str (rewrite-form (datum node) image namespace)))
+                    (BeamLisp.Reader/read_string text))))
+
+(defn build!
+  "Build a private source image. Files live only under a fresh temporary root.
+   Candidate source never overwrites project files or another image's shims."
+  [root changes parent]
+  (let [suffix (fresh)
+        prefix (str "play.image.i" suffix)
+        dir (Path/join (System/tmp_dir!) (str "bl-image-" suffix))
+        files (into {} (for [p (Path/wildcard (str root "/src/**/*.bl"))]
+                         [(Path/relative_to p root) (File/read! (change/resolve-path! root (Path/relative_to p root)))]))
+        files (reduce (fn [all ch] (if (nil? (:after ch)) (dissoc all (:path ch))
+                                     (assoc all (:path ch) (:after ch)))) files changes)
+        named (vec (keep (fn [[path text]] (when-let [n (declared text)] [n text])) files))
+        session (or (:session parent) (str "play.session.i" suffix ".user"))
+        names (assoc (into {} (map (fn [[n _]] [n (str prefix "." n)]) named)) "user" session)
+        history (merge (or (:history parent) {}) (into {} (map (fn [[n p]] [p n]) names)))
+        runtime (env/fork (or (:env parent) :global))
+        image {:env runtime :directory dir :names names :history history :session session
+               :sources (into {} named)}]
+    (try
+      (File/mkdir_p! dir)
+      (env/with-env runtime
+        (fn []
+          (BeamLisp.Env/add_search_path dir)
+          (doseq [[n text] named]
+            (let [physical (get names n)
+                  path (Path/join dir (str (String/replace physical "." "/") ".bl"))]
+              (File/mkdir_p! (Path/dirname path))
+              (File/write! path (source image text session))))))
+      image
+      (catch e
+        (env/destroy runtime)
+        (File/rm_rf dir)
+        (throw e)))))
+
+(defn- requirements [text]
+  (mapcat
+    (fn [node]
+      (let [form (datum node)]
+        (if (and (list? form) (= 'ns (first form)))
+          (mapcat (fn [clause]
+                    (if (and (list? clause) (= :require (first clause)))
+                      (map (fn [spec] (str (if (vector? spec) (first spec) spec))) (rest clause))
+                      [])) (drop 2 form))
+          []))) (BeamLisp.Reader/read_string text)))
+
+(defn- ensure-source! [image logical visiting]
+  (when-let [text (get (:sources image) logical)]
+    (let [physical (get (:names image) logical)]
+      (when-not (BeamLisp.Env/loaded_ns? physical)
+        (when (contains? visiting logical)
+          (throw (ex-info "This prototype cannot load a cyclic namespace requirement." {:namespace logical})))
+        (doseq [dependency (requirements text)]
+          (ensure-source! image dependency (conj visiting logical)))
+        (env/eval (source image text (:session image)))
+        (BeamLisp.Env/mark_loaded physical)))))
+
+(defn- referenced-projects [form image namespace]
+  (cond
+    (symbol? form)
+      (let [parts (String/split (str form) "/") prefix (first parts)
+            alias (BeamLisp.Env/alias_target namespace prefix)
+            logical (or (get (:history image) alias) (get (:history image) prefix) prefix)]
+        (if (and (= 2 (count parts)) (contains? (:sources image) logical)) [logical] []))
+    (and (list? form) (= 'quote (first form))) []
+    (or (list? form) (vector? form) (set? form))
+      (mapcat (fn [x] (referenced-projects x image namespace)) form)
+    (map? form) (mapcat (fn [[k v]] (concat (referenced-projects k image namespace)
+                                           (referenced-projects v image namespace))) form)
+    :else []))
+
+(defn load-changes! [image changes]
+  (env/with-env (:env image)
+    (fn []
+      (doseq [ch changes]
+        (when-let [text (:after ch)]
+          (if-let [ns-name (declared text)]
+            (ensure-source! image ns-name #{})
+            (do (BeamLisp.Env/in_ns (:session image))
+                (env/eval (source image text (:session image))))))))))
+
+(defn evaluate! [image namespace text]
+  (env/with-env (:env image)
+    (fn []
+      (BeamLisp.Env/in_ns namespace)
+      (doseq [logical (distinct (concat (requirements text)
+                                (mapcat (fn [node] (referenced-projects (datum node) image namespace))
+                                        (BeamLisp.Reader/read_string text))))]
+        (ensure-source! image logical #{}))
+      (BeamLisp.Env/in_ns namespace)
+      [(BeamLisp.RT/print_str (env/eval (source image text namespace)))
+       (BeamLisp.Env/current_ns)])))
+
+(defn destroy! [image]
+  (env/destroy (:env image))
+  (File/rm_rf (:directory image)))

@@ -1,0 +1,243 @@
+; release_test.bl — the release VALUE and the TREE it becomes, pinned at the
+; production entry point.
+;
+; Ported from the ExUnit `test/beam_lisp/build_release_test.exs`, which was the
+; last live caller of the Elixir façade `BeamLisp.Release` (now deleted). The
+; calls go straight to `priv/build/release.bl` — `rel/value`, `rel/app-closure`,
+; `rel/app-permanent-set`, `rel/write-rel!`, `rel/assemble` — with no interop
+; boundary in the path, so the bl shapes are read directly: the closure is a
+; VECTOR, the value a map with keyword keys, and the `bl/1` normaliser the
+; ExUnit test needed is gone with the façade.
+;
+; What a release must CARRY is derived from the running VM, and a tree is what
+; the closure is built FROM. Both are pinned against the one thing that cannot
+; be argued with — Erlang's own parser reading the `.rel` we write back — and
+; then the assembled tree is INSPECTED and BOOTED. A tree is only a release if
+; the release runs, so the boot is the gate.
+;
+; The tree at `/tmp/beam_lisp_release_tree` is the SAME fixture the ExUnit test
+; wrote and `build_pack_test.exs` still reads (its `BL_RELEASE_TREE` default),
+; so the path is preserved: under `bl test` the `.bl` half runs before the
+; `.exs` half, which is what lets the packer find what the assembler wrote.
+;
+; The assembly is one `File/rm_rf!` + closure copy + boot-script generation,
+; measured well under a second on this host — cheap enough to stay in the
+; default suite, as it was in ExUnit (the original carried no skip tag).
+;
+; Run: bin/bl test test/bl/release_test.bl
+
+(ns release.test
+  (:require [release :as rel]))
+
+(def out (Path/join (System/tmp_dir!) "beam_lisp_release_tree"))
+
+; Assembled ONCE for the file, lazily: the two tree tests share one tree, and a
+; value-only run never pays for it. The atom is per-run state (the runner forks a
+; fresh env per file), so the memo cannot leak between files.
+(def tree-state (atom nil))
+
+(defn- tree!
+  []
+  (or @tree-state
+      (let [value (rel/value :beam_lisp)
+            result (do (File/rm_rf! out) (rel/assemble value out))]
+        (reset! tree-state {:value value :result result})
+        @tree-state)))
+
+; ── the value ──────────────────────────────────────────────────────────────
+
+(deftest the-app-closure-is-the-transitive-applications-closure-of-the-root
+  (let [closure (rel/app-closure :beam_lisp)]
+    ; `beam_lisp` requires OTP and its deps; whatever else it requires must be
+    ; IN the closure, and nothing in the closure may be there without a path
+    ; from the root.
+    (is (vector? closure))
+    (is (contains? (set closure) :kernel))
+    (is (contains? (set closure) :stdlib))
+    (is (contains? (set closure) :beam_lisp))
+    (is (contains? (set closure) :elixir))
+
+    ; Nothing is repeated, and every app's own requirements are also present.
+    (is (= closure (distinct closure)))
+
+    (doseq [app closure
+            req (or (Application/spec app :applications) [])]
+      (is (contains? (set closure) req)
+          (str app " requires " req ", which is not in the closure")))))
+
+(deftest the-value-names-every-app-with-the-version-systools-will-compare
+  (let [value (rel/value :beam_lisp)
+        closure (rel/app-closure :beam_lisp)
+        apps (:apps value)
+        named (map (fn [a] (:app a)) apps)]
+    (is (= "beam_lisp" (:name value)))
+    (is (string? (:vsn value)))
+    (is (not= "" (:vsn value)))
+    (is (string? (:vsn (:erts value))))
+    (is (= (rel/text (erlang/system_info :version)) (:vsn (:erts value))))
+
+    ; Every app the closure requires is NAMED here: a missing one is a boot
+    ; that dies on a dependency. This used to be a size floor (`>= 25`), which
+    ; pinned a number a different manifest happened to produce instead of the
+    ; property that matters — and a proxy that cannot drift with its derivation
+    ; goes stale silently.
+    (is (= [] (sort (remove (set named) closure))))
+
+    ; What may be named BEYOND the closure is exactly the assembly tools: they
+    ; ride in the tree without being started, which is why the `.rel` writes
+    ; them `none`, and why `:sasl` is present and not in the closure.
+    (is (= [:sasl] (remove (set closure) named)))
+
+    (doseq [a apps]
+      (is (string? (:vsn a)) (str (:app a) " has no version"))
+      (is (not= "" (:vsn a)) (str (:app a) " has no version"))
+      (is (File/dir? (:dir a)) (str (:app a) "'s directory does not exist: " (:dir a)))
+      ; The version in the value is the one the `.app` file declares — that is
+      ; what `systools` compares a `.rel` against.
+      (is (= (rel/text (Application/spec (:app a) :vsn)) (:vsn a))
+          (str (:app a) " version disagrees with its .app")))
+
+    ; One app, one entry: a duplicate would be written into the `.rel` twice.
+    (is (= named (distinct named)))))
+
+(deftest the-rel-we-write-is-a-release-term-erlang-itself-parses
+  (let [value (rel/value :beam_lisp)
+        out (Path/join (System/tmp_dir!) "beam_lisp_release_value")]
+    (File/rm_rf! out)
+    (let [path (rel/write-rel! value out)]
+      (is (= (Path/join (list out "releases" (:vsn value) "beam_lisp.rel")) path))
+      (is (File/exists? path))
+
+      (let [text (File/read! path)
+            scanned (erl_scan/string (String/to_charlist text))]
+        (is (= :ok (elem scanned 0)))
+        (let [parsed (erl_parse/parse_term (elem scanned 1))]
+          (is (= :ok (elem parsed 0)))
+          (let [term (elem parsed 1)
+                name (elem (elem term 1) 0)
+                vsn (elem (elem term 1) 1)
+                erts (elem (elem term 2) 1)
+                app-terms (elem term 3)
+                permanent (rel/app-permanent-set value)
+                expected (sort-by (fn [t] (elem t 0))
+                                  (map (fn [a]
+                                         (tuple (:app a)
+                                                (String/to_charlist (:vsn a))
+                                                (if (contains? permanent (:app a))
+                                                  :permanent :none)))
+                                       (:apps value)))]
+            ; The shape `systools` requires, read back by Erlang's own parser.
+            (is (= :release (elem term 0)))
+            (is (= (:name value) (rel/text name)))
+            (is (= (:vsn value) (rel/text vsn)))
+            (is (= (:vsn (:erts value)) (rel/text erts)))
+
+            ; Every app in the term is one the value named, with the same
+            ; version and the right boot TYPE — the round trip through Erlang's
+            ; parser is the assertion, not the string.
+            ;
+            ; The type is NOT always `permanent`: the assembly TOOLS are
+            ; carried, not started, so they are written `none` (mix's own
+            ; release does exactly this; `sasl` is the one here, and it is
+            ; listed `none` in the drop's own `.rel`). The permanent set is the
+            ; API's answer, not a second opinion computed here.
+            (is (= expected (sort-by (fn [t] (elem t 0)) app-terms)))
+
+            (is (includes? text "beam_lisp") "the .rel must name the apps")))))))
+
+; ── the tree ───────────────────────────────────────────────────────────────
+;
+; Assembled ONCE for the file (it copies the whole dependency closure), then
+; inspected and BOOTED. The boot is the gate: a tree is only a release if the
+; release runs.
+
+(deftest the-tree-has-what-a-release-needs-and-nothing-it-does-not
+  (let [t (tree!)
+        value (:value t)
+        r (:result t)]
+    (is (= true (:ok? r)) (str "assembly reported: " (pr-str (:errors r))))
+    (is (= (count (:apps value)) (:apps r)))
+    (is (= [] (:errors r)))
+    ; systools validated the .rel against the tree; its warnings are about the
+    ; apps' own code (an undefined function, say), not about the assembly.
+    (is (erlang/is_integer (:warnings r)))
+
+    (let [rel (Path/join (list out "releases" (:vsn value)))]
+      (doseq [f ["beam_lisp.rel" "start_clean.rel" "beam_lisp.script" "beam_lisp.boot"
+                 "start_clean.script" "start_clean.boot" "elixir" "iex" "sys.config"
+                 "vm.args" "remote.vm.args" "env.sh"]]
+        (is (File/exists? (Path/join rel f)) (str "missing releases/<vsn>/" f)))
+
+      (doseq [f ["bin/bl" "releases/COOKIE" "releases/start_erl.data"]]
+        (is (File/exists? (Path/join out f)) (str "missing " f)))
+
+      ; ERTS: the `erl` the patched Elixir wrapper execs.
+      (is (File/exists?
+            (Path/join (list out (str "erts-" (:vsn (:erts value))) "bin" "erl"))))
+
+      ; Every app is present as `<app>-<vsn>/ebin/<app>.app` — the shape
+      ; systools walked to accept the .rel, so one passing assembly proves it
+      ; for all of them.
+      (doseq [a (:apps value)]
+        (is (File/exists?
+              (Path/join (list out "lib" (str (:app a) "-" (:vsn a)) "ebin"
+                               (str (:app a) ".app"))))))
+
+      ; The two substitutions in the Elixir wrapper: ERTS is release-relative,
+      ; and the host's `-elixir_root/-pa` pair is gone.
+      (let [wrapper (File/read! (Path/join rel "elixir"))]
+        (is (includes? wrapper (str "ERTS_BIN=\"$SCRIPT_PATH\"/../../erts-"
+                                    (:vsn (:erts value)) "/bin/")))
+        (is (not (includes? wrapper "-elixir_root"))))
+
+      ; The rewrite happened BEFORE script2boot, so the paths are already
+      ; release-relative in both the script and the COMPILED boot file.
+      (is (includes? (File/read! (Path/join rel "beam_lisp.script")) "$RELEASE_LIB"))
+      (is (not (includes? (File/read! (Path/join rel "beam_lisp.script")) "$ROOT/lib")))
+      (is (not (includes? (File/read! (Path/join rel "beam_lisp.boot")) "$ROOT/lib")))
+
+      ; Byte-for-byte what a mix release writes: no trailing newline, and the
+      ; launcher's `cut -d' ' -f2` reads it either way.
+      (is (= (str (:vsn (:erts value)) " " (:vsn value))
+             (File/read! (Path/join out "releases/start_erl.data"))))
+
+      (is (not (File/exists?
+                 (Path/join (list out "lib" "beam_lisp-0.1.0" "priv" ".spell"))))
+          "editor state must not be packaged")
+
+      ; The priv MUST be real bytes, not the relative symlink Mix leaves in
+      ; _build: a release that shipped the link would carry no `.bl` sources at
+      ; all, and nothing in a boot test would notice — the beams run fine until
+      ; the language needs to compile something.
+      (let [priv (Path/join (list out "lib" "beam_lisp-0.1.0" "priv"))]
+        (is (not= :symlink (:type (File/lstat! priv)))
+            "priv is a symlink, not a directory of sources")
+        (is (File/exists? (Path/join (list priv "boot" "compiler.bl")))
+            "the release must carry the language's own sources")))))
+
+(deftest the-gate-the-tree-boots-and-the-language-runs-in-it
+  (let [r (:result (tree!))
+        launcher (Path/join (list out "bin" "bl"))]
+    (is (= true (:ok? r)) (str "assembly reported: " (pr-str (:errors r))))
+
+    ; `eval` boots `start_clean`: the release's code is on the path and nothing
+    ; is started. This is the gate — a tree is only a release if it runs.
+    (let [c (System/cmd launcher
+                        (to-list ["eval" "IO.puts(\"BOOT \" <> System.version())"])
+                        (to-list [(tuple :stderr_to_stdout true)]))]
+      (is (= 0 (elem c 1)) (str "eval exited " (elem c 1) ":\n" (elem c 0)))
+      (is (includes? (elem c 0) "BOOT 1.20") (str "eval printed: " (elem c 0))))
+
+    ; …and the LANGUAGE runs in it, through a launcher that generated every
+    ; piece of the tree itself (the same invocation W0's hand-assembled probe
+    ; used, where all of it came from a shipped payload).
+    (let [c (System/cmd launcher
+                        (to-list ["eval" "BeamLisp.Ns.Bl.Cli.main([\"eval\",\"(+ 40 2)\"])"])
+                        (to-list [(tuple :stderr_to_stdout true)]))]
+      (is (= 0 (elem c 1)) (str "language eval exited " (elem c 1) ":\n" (elem c 0)))
+      (is (includes? (elem c 0) "42") (str "language eval printed: " (elem c 0))))
+
+    (let [c (System/cmd launcher (to-list ["version"])
+                        (to-list [(tuple :stderr_to_stdout true)]))]
+      (is (= 0 (elem c 1)))
+      (is (includes? (elem c 0) "beam_lisp")))))

@@ -1,0 +1,660 @@
+; host_vector_test.bl — the pinned `Vector` type and its `Enumerable` impl.
+;
+; Two `.bl` sources under `priv/host/` replace the two halves of
+; `lib/beam_lisp/vector.ex` at their exact module atoms:
+;
+;   * `priv/host/vector.bl` → `Elixir.BeamLisp.Vector`, a STRUCT whose
+;     `__struct__/0,1` pair and `__info__/1` are synthesized by
+;     `compile_host_file`'s `:struct_fields` option (`items: {}`, `meta: nil`),
+;     plus the public `new/0,1` `count/1` `nth/2` `first/1` `rest/1` `conj/2`
+;     `assoc/3` `drop/2` `to_list/1`.
+;   * `priv/host/vector_enumerable.bl` → `Elixir.Enumerable.BeamLisp.Vector`,
+;     the protocol impl, FUNCTIONS-ONLY.
+;
+; The live modules are never left replaced. Each source is compiled at its OWN
+; probe atom, the namespace shim beside it is dropped, and the pinned beam is
+; loaded ALONE — so a leftover shim reference would be `undef` here.
+;
+; The suite is DIFFERENTIAL against the running `lib/beam_lisp/vector.ex`
+; beams: a corpus of observations runs through each module and the answer sets
+; must be equal — values, exception CLASSES and MESSAGES. The observation is
+; normalized on two axes only: the probe atom in a message/binary, and struct
+; tags (`:__struct__` and the impl module) collapse to `:VEC`/`:ENUM`, because
+; the probe builds probe-tagged values and the live module builds
+; production-tagged ones. Everything else compares raw.
+;
+; What each block pins:
+;   * the struct surface — `__info__(:struct)`, `inspect`, `Map.from_struct`,
+;     `Kernel.struct!`, and the exported public ABI;
+;   * the public ABI on the whole value space — the tail tuple (≤ 32), the trie,
+;     and the >1024 shift growth; `nth`/`assoc` bounds and wrong types;
+;     `conj`/`assoc` metadata preservation; `==` seeing metadata while
+;     `hash_key`/`eqv` do not;
+;   * the `Enumerable` impl by DIRECT invocation over live vectors, with the
+;     tagged accumulator protocol (`:cont`/`:halt`/`:suspend`) and `Enum`/
+;     `Stream` through the LIVE impl;
+;   * both pinned beams STANDING IN at their exact production atoms — exercised
+;     through `Enum`/`Stream`, suspension included — then the live beams
+;     RESTORED;
+;   * the cold runtime: NO `Env.fetch!` in either beam, and both answering with
+;     every `host.vector*` namespace var deleted;
+;   * a genuinely cold CHILD VM (no application boot) resolving both pinned
+;     atoms off the code path and driving the vector through them.
+;
+; Run: bin/bl test test/bl/host_vector_test.bl
+
+(ns host.vector.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_vector_" (erlang/unique_integer (list :positive))))
+
+(defn- vec-source [] (Path/join (BeamLisp/cwd) "priv/host/vector.bl"))
+(defn- enum-source [] (Path/join (BeamLisp/cwd) "priv/host/vector_enumerable.bl"))
+
+(def ^:private probe :Elixir.BeamLisp.VectorAbiProbe)
+(def ^:private enum-probe :Elixir.Enumerable.BeamLisp.VectorAbiProbe)
+(def ^:private vec-shim :Elixir.BeamLisp.Ns.Host.Vector)
+(def ^:private enum-shim :Elixir.BeamLisp.Ns.Host.VectorEnumerable)
+(def ^:private live :Elixir.BeamLisp.Vector)
+(def ^:private live-enum :Elixir.Enumerable.BeamLisp.Vector)
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-pinned [mod path]
+  (do (drop! mod)
+      (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+      mod))
+
+(defn- vec-fields []
+  (list (t2 :items (erlang/list_to_tuple (list))) (t2 :meta nil)))
+
+; Compile `src` at `mod` and publish ONLY the pinned beam: the compile's own
+; load (and the namespace shim it built beside it) is dropped first.
+(defn- compile-pinned [mod src opts]
+  (let [res (BeamLisp.AOT/compile_host_file src opts)]
+    (load-pinned mod (erlang/element 2 res))))
+
+(defn- compile-vec [dir]
+  (let [m (compile-pinned probe (vec-source)
+            (list (t2 :module probe) (t2 :output_dir dir) (t2 :load? false)
+                  (t2 :struct_fields (vec-fields))))]
+    (drop! vec-shim)
+    m))
+
+(defn- compile-enum [dir]
+  (let [m (compile-pinned enum-probe (enum-source)
+            (list (t2 :module enum-probe) (t2 :output_dir dir) (t2 :load? false)))]
+    (drop! enum-shim)
+    m))
+
+(defn- raise-class [f]
+  (try (do (f) :no-raise)
+       (catch e (:__struct__ e))))
+
+(defn- mk [mod xs] (erlang/apply mod :new (list xs)))
+(defn- op [mod f args] (erlang/apply mod f args))
+(defn- lv [xs] (erlang/apply live :new (list xs)))
+(defn- rng [n] (to-list (range n)))
+
+; ── observation normalization ────────────────────────────────────────────
+
+(defn- norm-str
+  "Two by-design differences folded so the two runs' texts compare: the probe atom
+   the pinned emitter names, and the `defimpl`-generated inlined `__impl__` name
+   (`-inlined-__impl__/1-`) the live impl raises, which the pinned plain `__impl__/1`
+   does not."
+  [s]
+  (String/replace
+    (String/replace
+      (String/replace s "Enumerable.BeamLisp.VectorAbiProbe" "Enumerable.BeamLisp.Vector")
+      "BeamLisp.VectorAbiProbe" "BeamLisp.Vector")
+    "\"-inlined-__impl__/1-\"" "__impl__"))
+
+(defn- canon-atom
+  "The two probe atoms and the two production atoms collapse to one canonical
+   marker each, so probe-built and live-built values compare structurally. The
+   struct tag is asserted EXACTLY in the struct-surface test, so this masking
+   cannot hide a wrong tag."
+  [a]
+  (cond
+    (or (erlang/== a :Elixir.BeamLisp.VectorAbiProbe)
+        (erlang/== a :Elixir.BeamLisp.Vector)) :VEC
+    (or (erlang/== a :Elixir.Enumerable.BeamLisp.VectorAbiProbe)
+        (erlang/== a :Elixir.Enumerable.BeamLisp.Vector)) :ENUM
+    :else a))
+
+(defn- scrub [v]
+  (cond
+    (erlang/is_map v)
+    (let [m (Enum/reduce (maps/to_list v) (maps/new)
+              (fn [pair acc]
+                (maps/put (erlang/element 1 pair) (scrub (erlang/element 2 pair)) acc)))]
+      (if (erlang/is_map_key :__struct__ m) (maps/put :__struct__ :VEC m) m))
+    (erlang/is_list v) (Enum/map v (fn [x] (scrub x)))
+    (erlang/is_tuple v)
+    (erlang/list_to_tuple (Enum/map (erlang/tuple_to_list v) (fn [x] (scrub x))))
+    (erlang/is_atom v) (canon-atom v)
+    :else v))
+
+(defn- obs
+  "`[:ok value]` or `[:raise class message]`, normalized."
+  [thunk]
+  (try (list :ok (scrub (thunk)))
+       (catch e (list :raise (:__struct__ e) (norm-str (ex-message e))))))
+
+; ── the differential corpus: the whole public ABI ─────────────────────────
+
+(defn- cases [mod]
+  (list
+    ; ── empty and small: the tail tuple ──────────────────────────────
+    (fn [] (let [v (mk mod (list))]
+             (list (op mod :count (list v)) (op mod :to_list (list v))
+                   (op mod :first (list v)) (op mod :rest (list v))
+                   (op mod :nth (list v 0)) (op mod :drop (list v 3)))))
+    (fn [] (let [v (mk mod (list 1 2 3))]
+             (list (op mod :count (list v)) (op mod :to_list (list v))
+                   (op mod :nth (list v 0)) (op mod :nth (list v 2))
+                   (op mod :nth (list v 3)) (op mod :nth (list v -1))
+                   (op mod :nth (list v :x)) (op mod :nth (list v 1.5))
+                   (op mod :first (list v)) (op mod :rest (list v))
+                   (op mod :drop (list v 1)) (op mod :drop (list v 9)))))
+    (fn [] (let [v (mk mod (list :a "b" nil))]
+             (list (op mod :nth (list v 1)) (op mod :to_list (list v)))))
+    ; ── the 32/33 tail→trie boundary ─────────────────────────────────
+    (fn [] (let [v (mk mod (rng 32)) g (op mod :conj (list v 32))]
+             (list (op mod :count (list v)) (op mod :nth (list v 31))
+                   (op mod :nth (list v 32)) (op mod :to_list (list v))
+                   (op mod :count (list g)) (op mod :nth (list g 32))
+                   (op mod :to_list (list g)))))
+    (fn [] (let [v (mk mod (rng 33)) g (op mod :conj (list v 33))]
+             (list (op mod :count (list v)) (op mod :nth (list v 0))
+                   (op mod :nth (list v 32)) (op mod :nth (list v 33))
+                   (op mod :to_list (list v)) (op mod :count (list g))
+                   (op mod :to_list (list g)) (op mod :first (list v))
+                   (op mod :rest (list v)))))
+    ; ── the 1024/1056/1057 shift-growth boundary ─────────────────────
+    (fn [] (let [v (mk mod (rng 1024))]
+             (list (op mod :count (list v)) (op mod :nth (list v 0))
+                   (op mod :nth (list v 1023)) (op mod :nth (list v 1024))
+                   (erlang/== (op mod :to_list (list v)) (rng 1024))
+                   (op mod :count (list (op mod :conj (list v 1024)))))))
+    (fn [] (let [v (mk mod (rng 1056))]
+             (list (op mod :count (list v)) (op mod :nth (list v 1055))
+                   (op mod :nth (list v 1056))
+                   (erlang/== (op mod :to_list (list v)) (rng 1056)))))
+    (fn [] (let [v (mk mod (rng 1057))]
+             (list (op mod :count (list v)) (op mod :nth (list v 0))
+                   (op mod :nth (list v 1056)) (op mod :nth (list v 1057))
+                   (erlang/== (op mod :to_list (list v)) (rng 1057))
+                   (op mod :count (list (op mod :conj (list v 1057)))))))
+    (fn [] (let [v (mk mod (rng 2048))]
+             (list (op mod :count (list v)) (op mod :nth (list v 2047))
+                   (erlang/== (op mod :to_list (list v)) (rng 2048)))))
+    (fn [] (let [v (mk mod (rng 5000))]
+             (list (op mod :count (list v)) (op mod :nth (list v 4999))
+                   (erlang/== (op mod :to_list (list v)) (rng 5000))
+                   (op mod :count (list (op mod :conj (list v 5000)))))))
+    ; ── assoc: in place, append at count, bounds, wrong index ────────
+    (fn [] (let [v (mk mod (list 1 2 3))]
+             (list (op mod :to_list (list (op mod :assoc (list v 1 99))))
+                   (op mod :to_list (list (op mod :assoc (list v 3 99)))))))
+    (fn [] (let [v (mk mod (rng 40))]
+             (list (op mod :nth (list (op mod :assoc (list v 0 99)) 0))
+                   (op mod :nth (list (op mod :assoc (list v 39 99)) 39))
+                   (op mod :count (list (op mod :assoc (list v 40 99))))
+                   (op mod :nth (list (op mod :assoc (list v 40 99)) 40)))))
+    (fn [] (op mod :assoc (list (mk mod (list 1 2 3)) 4 99)))       ; OOB tuple
+    (fn [] (op mod :assoc (list (mk mod (rng 40)) 41 99)))          ; OOB trie
+    (fn [] (op mod :assoc (list (mk mod (list 1 2 3)) -1 99)))      ; negative
+    (fn [] (op mod :assoc (list (mk mod (list 1 2 3)) :x 99)))      ; non-int
+    (fn [] (op mod :assoc (list (mk mod (list 1 2 3)) 1.5 99)))     ; float
+    ; ── metadata: carried by conj/assoc, invisible to reads, visible to == ──
+    (fn [] (let [v (mk mod (list 1 2 3))]
+             (list (maps/get :meta v) (op mod :count (list v))
+                   (op mod :nth (list v 1)) (op mod :to_list (list v))
+                   (op mod :first (list v)) (op mod :rest (list v)))))
+    (fn [] (maps/get :meta (op mod :conj (list (maps/put :meta {:a 1} (mk mod (list 1 2 3))) 4))))
+    (fn [] (maps/get :meta (op mod :assoc (list (maps/put :meta {:a 1} (mk mod (rng 40))) 0 9))))
+    (fn [] (maps/get :meta (op mod :assoc (list (maps/put :meta {:a 1} (mk mod (list 1 2))) 2 9))))
+    (fn [] (let [v (maps/put :meta {:a 1} (mk mod (list 1 2)))]
+             (list (maps/get :meta v) (op mod :count (list v))
+                   (erlang/== (op mod :conj (list v 3)) (op mod :conj (list (mk mod (list 1 2)) 3))))))
+    (fn [] (list (erlang/== (mk mod (list 1 2)) (mk mod (list 1 2)))
+                 (erlang/== (maps/put :meta {:a 1} (mk mod (list 1 2))) (mk mod (list 1 2)))
+                 (erlang/== (mk mod (rng 40)) (mk mod (rng 40)))))
+    ; ── wrong types: the live FunctionClauseError, class and message ──
+    (fn [] (op mod :count (list 5)))
+    (fn [] (op mod :count (list nil)))
+    (fn [] (op mod :count (list "s")))
+    (fn [] (op mod :count (list (list 1 2))))
+    (fn [] (op mod :count (list (maps/new))))
+    (fn [] (op mod :count (list {:items (erlang/list_to_tuple (list))})))
+    (fn [] (op mod :count (list {:__struct__ "s" :items (erlang/list_to_tuple (list))})))
+    (fn [] (op mod :nth (list 5 0)))
+    (fn [] (op mod :nth (list (list 1 2) 0)))
+    (fn [] (op mod :first (list 5)))
+    (fn [] (op mod :rest (list 5)))
+    (fn [] (op mod :conj (list 5 1)))
+    (fn [] (op mod :assoc (list 5 0 1)))
+    (fn [] (op mod :drop (list 5 1)))
+    (fn [] (op mod :to_list (list 5)))
+    (fn [] (op mod :to_list (list nil)))
+    (fn [] (op mod :new (list 5)))
+    (fn [] (op mod :new (list "ab")))
+    (fn [] (op mod :new (list (maps/new))))
+    (fn [] (op mod :new (list nil)))))
+
+(defn- corpus [mod]
+  (Enum/map (cases mod) (fn [th] (obs th))))
+
+; ── the struct surface ────────────────────────────────────────────────────
+
+(deftest vector-pinned-struct-is-probe-tagged
+  (testing "`:struct_fields` synthesizes the constructor pair; `new/0,1` is module-exact"
+    (let [dir (tmp-dir)]
+      (compile-vec dir)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (= :non_existing (erlang/apply :code :which (list vec-shim))))
+      ; The exported public ABI is present; the trie helpers are the documented
+      ; extra exports a pinned module cannot keep private.
+      (is (= probe (erlang/apply probe :__info__ (list :module))))
+      (doseq [f (list (t2 :new 0) (t2 :new 1) (t2 :count 1) (t2 :nth 2)
+                      (t2 :first 1) (t2 :rest 1) (t2 :conj 2) (t2 :assoc 3)
+                      (t2 :drop 2) (t2 :to_list 1)
+                      (t2 :__struct__ 0) (t2 :__struct__ 1) (t2 :__info__ 1))]
+        (is (erlang/function_exported probe (erlang/element 1 f) (erlang/element 2 f))))
+      (doseq [f (list (t2 :new 0) (t2 :new 1) (t2 :count 1) (t2 :nth 2)
+                      (t2 :first 1) (t2 :rest 1) (t2 :conj 2) (t2 :assoc 3)
+                      (t2 :drop 2) (t2 :to_list 1))]
+        (is (erlang/function_exported live (erlang/element 1 f) (erlang/element 2 f))))
+      ; Every export the live module has, the pinned beam has (the pinned
+      ; surface is a SUPERSET: it adds the trie helpers).
+      (is (every? (fn [e] (erlang/function_exported probe (erlang/element 1 e) (erlang/element 2 e)))
+                  (erlang/apply live :module_info (list :exports))))
+      ; __struct__/0 — the tag is the PROBE atom, the fields default exactly as
+      ; `defstruct items: {}, meta: nil` set them.
+      (let [s0 (erlang/apply probe :__struct__ (list))]
+        (is (erlang/is_map s0))
+        (is (= 3 (erlang/map_size s0)))
+        (is (= probe (erlang/map_get :__struct__ s0)))
+        (is (= (erlang/list_to_tuple (list)) (erlang/map_get :items s0)))
+        (is (nil? (erlang/map_get :meta s0))))
+      ; __info__(:struct) is the live beam's list, datum for datum, so
+      ; `Inspect.Any` renders the same.
+      (is (= (erlang/apply live :__info__ (list :struct))
+             (erlang/apply probe :__info__ (list :struct))))
+      (is (= "%BeamLisp.Vector{items: {}, meta: nil}"
+             (Kernel/inspect (erlang/apply live :__struct__ (list)))))
+      (is (= "%BeamLisp.VectorAbiProbe{items: {}, meta: nil}"
+             (Kernel/inspect (erlang/apply probe :__struct__ (list)))))
+      ; Map.from_struct strips the tag and nothing else; Kernel.struct! folds
+      ; over the same defaults.
+      (is (= (erlang/apply :Elixir.Map :from_struct (list (erlang/apply live :__struct__ (list))))
+             (erlang/apply :Elixir.Map :from_struct (list (erlang/apply probe :__struct__ (list))))))
+      (is (= "%BeamLisp.VectorAbiProbe{items: {}, meta: :forced}"
+             (Kernel/inspect (erlang/apply :Elixir.Kernel :struct! (list probe (list (t2 :meta :forced)))))))
+      ; The SAME source compiles at its PRODUCTION atom — read, not loaded.
+      (let [res (BeamLisp.AOT/compile_host_file (vec-source)
+                  (list (t2 :module live) (t2 :output_dir dir) (t2 :load? false)
+                        (t2 :struct_fields (vec-fields))))]
+        (is (= live (erlang/element 1 res)))
+        (is (File/exists? (erlang/element 2 res))))
+      (File/rm_rf! dir))))
+
+; ── the public ABI, diffed against the live module ───────────────────────
+
+(deftest vector-pinned-api-matches-the-live-module
+  (testing "same answers as live `BeamLisp.Vector` — same trie, same metadata, same refusals"
+    (let [dir (tmp-dir)]
+      (compile-vec dir)
+      (let [l (corpus live)
+            p (corpus probe)]
+        (is (= l p) "probe answers equal the live module's on the whole corpus")
+        (is (> (count l) 40) "the corpus covers every public clause shape")
+        (doseq [i (range (count l))]
+          (is (= (nth l i) (nth p i))
+              (str "observation " i " " (nth l i) " vs " (nth p i)))))
+      (File/rm_rf! dir))))
+
+; ── hash/eq: the production tag carries the same identity ────────────────
+
+(deftest vector-pinned-hash-eq-on-production-tag
+  (testing "a probe-built value, re-tagged production, hashes and compares as the live one"
+    (let [dir (tmp-dir)]
+      (compile-vec dir)
+      ; `Rt.hash_key` strips metadata; `Rt.eqv` walks elements — both dispatch
+      ; on the PRODUCTION tag, so the probe value is re-tagged before use.
+      (let [retag (fn [v] (maps/put :__struct__ live v))
+            p-small (retag (mk probe (list 1 2 3)))
+            l-small (lv (list 1 2 3))
+            p-big (retag (mk probe (rng 1057)))
+            l-big (lv (rng 1057))]
+        (is (= (BeamLisp.Ns.Rt/hash_key l-small) (BeamLisp.Ns.Rt/hash_key p-small)))
+        (is (= (BeamLisp.Ns.Rt/hash_key l-big) (BeamLisp.Ns.Rt/hash_key p-big)))
+        (is (BeamLisp.Ns.Rt/eqv l-small p-small))
+        (is (BeamLisp.Ns.Rt/eqv l-big p-big))
+        ; metadata is invisible to the hash and the equality, but VISIBLE to `==`
+        (is (= (BeamLisp.Ns.Rt/hash_key p-small)
+               (BeamLisp.Ns.Rt/hash_key (maps/put :meta {:a 1} p-small))))
+        (is (BeamLisp.Ns.Rt/eqv (maps/put :meta {:a 1} p-small) p-small))
+        (is (not (erlang/== (maps/put :meta {:a 1} p-small) p-small)))
+        (is (erlang/== p-small l-small)))
+      (File/rm_rf! dir))))
+
+; ── the Enumerable impl: direct probe invocation ─────────────────────────
+
+(defn- enum-cases [emod]
+  (list
+    (fn [] (op emod :count (list (lv (rng 0)))))
+    (fn [] (op emod :count (list (lv (rng 33)))))
+    (fn [] (op emod :count (list (lv (rng 1057)))))
+    (fn [] (op emod :member? (list (lv (list 1 2)) 2)))
+    (fn [] (op emod :member? (list (lv (list 1 2)) 9)))
+    (fn [] (op emod :member? (list (lv (rng 40)) 39)))
+    (fn [] (op emod :member? (list (lv (rng 40)) 40)))
+    (fn [] (op emod :slice (list (lv (rng 3)))))
+    (fn [] (op emod :__impl__ (list :for)))
+    (fn [] (op emod :__impl__ (list :protocol)))
+    (fn [] (op emod :__impl__ (list :bogus)))
+    (fn [] (op emod :count (list 5)))
+    (fn [] (op emod :member? (list 5 1)))
+    ; tagged accumulators: cont / halt / suspend
+    (fn [] (op emod :reduce
+             (list (lv (rng 40)) (tuple :cont ())
+                   (fn [x acc] (tuple :cont (cons x acc))))))
+    (fn [] (op emod :reduce
+             (list (lv (rng 40)) (tuple :halt :h)
+                   (fn [x acc] (tuple :cont (cons x acc))))))
+    (fn [] (op emod :reduce
+             (list (lv (rng 40)) (tuple :cont 0)
+                   (fn [x acc] (if (erlang/== x 5) (tuple :halt :stop) (tuple :cont (erlang/+ acc 1)))))))
+    (fn [] (let [s (op emod :reduce
+                    (list (lv (rng 40)) (tuple :suspend ())
+                          (fn [x acc] (tuple :cont (cons x acc)))))]
+             (list (erlang/element 1 s) (erlang/element 2 s)
+                   ((erlang/element 3 s) (tuple :cont ())))))
+    (fn [] (op emod :reduce (list (lv (rng 3)) (tuple :weird 1) (fn [x acc] (tuple :cont acc)))))))
+
+(defn- enum-corpus [emod]
+  (Enum/map (enum-cases emod) (fn [th] (obs th))))
+
+(deftest enum-pinned-direct-probe
+  (testing "impl surface, direct invocation over live vectors, and the accumulator protocol"
+    (let [dir (tmp-dir)]
+      (compile-vec dir)
+      ; Before the impl beam exists, the tag-derived impl atom resolves to
+      ; nothing (the probe atom has no impl).
+      (is (nil? (erlang/apply :Elixir.Enumerable :impl_for (list (mk probe (list 1))))))
+      (compile-enum dir)
+      (is (= :non_existing (erlang/apply :code :which (list enum-shim))))
+      (is (erlang/function_exported enum-probe :__impl__ 1))
+      (is (erlang/function_exported enum-probe :count 1))
+      (is (erlang/function_exported enum-probe :member? 2))
+      (is (erlang/function_exported enum-probe :reduce 3))
+      (is (erlang/function_exported enum-probe :slice 1))
+      ; FUNCTIONS-ONLY: no synthesized struct surface (the same divergence the
+      ; Set and SeqCursor impls carry).
+      (is (not (erlang/function_exported enum-probe :__struct__ 0)))
+      (is (not (erlang/function_exported enum-probe :__info__ 1)))
+      ; __impl__ answers the EXACT type and protocol atoms.
+      (is (= :Elixir.BeamLisp.Vector (erlang/apply enum-probe :__impl__ (list :for))))
+      (is (= :Elixir.Enumerable (erlang/apply enum-probe :__impl__ (list :protocol))))
+      (is (= (erlang/apply live-enum :__impl__ (list :for))
+             (erlang/apply enum-probe :__impl__ (list :for))))
+      (is (= (erlang/apply live-enum :__impl__ (list :protocol))
+             (erlang/apply enum-probe :__impl__ (list :protocol))))
+      (is (= :Elixir.FunctionClauseError
+             (raise-class (fn [] (erlang/apply enum-probe :__impl__ (list :bogus))))))
+      ; The impl is FOR `BeamLisp.Vector`: direct-invoke its functions on LIVE
+      ; vectors — the tag its `BeamLisp.Vector/*` calls resolve against.
+      (is (= (tuple :ok 3) (erlang/apply enum-probe :count (list (lv (list 1 2 3))))))
+      (is (= (tuple :ok true) (erlang/apply enum-probe :member? (list (lv (list 1 2 3)) 2))))
+      (is (= (tuple :error enum-probe) (erlang/apply enum-probe :slice (list (lv (list 1))))))
+      (is (= (tuple :error live-enum) (erlang/apply live-enum :slice (list (lv (list 1))))))
+      ; the whole protocol ABI, differenced against the live impl
+      (let [l (enum-corpus live-enum)
+            p (enum-corpus enum-probe)]
+        (is (= l p) "probe answers equal the live impl's on the whole corpus")
+        (doseq [i (range (count l))]
+          (is (= (nth l i) (nth p i)) (str "impl observation " i))))
+      (File/rm_rf! dir))))
+
+; ── both beams under their EXACT atoms, then restored ────────────────────
+
+(deftest vector-pinned-stands-in-at-the-production-atoms
+  (testing "production atoms serve `Enum`/`Stream` through the pinned beams, then restore"
+    (let [dir (tmp-dir)
+          out (str dir "/prod")
+          vpath (Path/join out (str live ".beam"))
+          epath (Path/join out (str live-enum ".beam"))
+          vorig (erlang/apply :code :which (list live))
+          eorig (erlang/apply :code :which (list live-enum))
+          vbin (File/read! (erlang/list_to_binary vorig))
+          ebin (File/read! (erlang/list_to_binary eorig))
+          before (corpus live)
+          before-enum (enum-corpus live-enum)]
+      (is (not= :non_existing vorig) "precondition: the live vector beam is a readable file")
+      (is (not= :non_existing eorig) "precondition: the live impl beam is a readable file")
+      (BeamLisp.AOT/compile_host_file (vec-source)
+        (list (t2 :module live) (t2 :output_dir out) (t2 :load? false) (t2 :struct_fields (vec-fields))))
+      (BeamLisp.AOT/compile_host_file (enum-source)
+        (list (t2 :module live-enum) (t2 :output_dir out) (t2 :load? false)))
+      (is (File/exists? vpath))
+      (is (File/exists? epath))
+      (try
+        (drop! live)
+        (code/load_binary live (erlang/binary_to_list vpath) (File/read! vpath))
+        (drop! live-enum)
+        (code/load_binary live-enum (erlang/binary_to_list epath) (File/read! epath))
+        ; the pinned beams answer EXACTLY as the live ones did, observation for
+        ; observation, at the production atoms.
+        (is (= before (corpus live)))
+        (is (= before-enum (enum-corpus live-enum)))
+        ; the impl atom derives from the value's tag and finds the pinned beam.
+        (is (= live-enum (erlang/apply :Elixir.Enumerable :impl_for (list (lv (rng 3))))))
+        ; Enum / Stream through the pinned impl, across the trie boundary.
+        (is (= (rng 40) (Enum/to_list (lv (rng 40)))))
+        (is (= (rng 1057) (Enum/to_list (lv (rng 1057)))))
+        (is (= (Enum/take (rng 40) 5) (Enum/take (lv (rng 40)) 5)))
+        (is (= (Enum/map (rng 40) (fn [x] (erlang/* x 2)))
+               (Enum/to_list (Stream/map (lv (rng 40)) (fn [x] (erlang/* x 2))))))
+        (is (= (Enum/reduce (rng 40) 0 (fn [x acc] (erlang/+ x acc)))
+               (Enum/reduce (lv (rng 40)) 0 (fn [x acc] (erlang/+ x acc)))))
+        (is (= (erlang/length (Enum/filter (lv (rng 40)) (fn [x] (erlang/> x 19)))) 20))
+        (is (= (rng 0) (Enum/to_list (lv (rng 0)))))
+        ; suspension: the continuation resumes the same walk.
+        (let [s (Elixir.Enumerable/reduce (lv (rng 40)) (tuple :suspend ())
+                  (fn [x acc] (tuple :cont (cons x acc))))]
+          (is (= :suspended (erlang/element 1 s)))
+          (is (= (tuple :done (Enum/reverse (rng 40)))
+                 ((erlang/element 3 s) (tuple :cont ())))))
+        ; halt short-circuits.
+        (is (= (tuple :halted :stop)
+               (Elixir.Enumerable/reduce (lv (rng 40)) (tuple :cont 0)
+                 (fn [x acc] (if (erlang/== x 5) (tuple :halt :stop) (tuple :cont (erlang/+ acc 1)))))))
+        (finally
+          (drop! live)
+          (code/load_binary live vorig vbin)
+          (drop! live-enum)
+          (code/load_binary live-enum eorig ebin)))
+      ; RESTORED: the live beams own the atoms and answer again.
+      (is (= vorig (erlang/apply :code :which (list live))))
+      (is (= eorig (erlang/apply :code :which (list live-enum))))
+      (is (= before (corpus live)) "the restored live vector answers as before")
+      (is (= before-enum (enum-corpus live-enum)) "the restored live impl answers as before")
+      (File/rm_rf! dir))))
+
+; ── cold runtime: no namespace vars, no `Env.fetch!` ─────────────────────
+
+(defn- env-fetch-ins? [ins]
+  (cond
+    (not (erlang/is_tuple ins)) false
+    (not (erlang/== :call_ext (erlang/element 1 ins))) false
+    (not (erlang/is_tuple (erlang/element 3 ins))) false
+    (not (erlang/== :extfunc (erlang/element 1 (erlang/element 3 ins)))) false
+    :else (and (= :Elixir.BeamLisp.Env (erlang/element 2 (erlang/element 3 ins)))
+               (= :fetch! (erlang/element 3 (erlang/element 3 ins))))))
+
+(defn- ext-of
+  "The `{:extfunc, mod, fun, arity}` of a call instruction, or nil."
+  [ins]
+  (if (and (erlang/is_tuple ins) (erlang/> (erlang/tuple_size ins) 2))
+    (let [e (erlang/element 3 ins)]
+      (if (and (erlang/is_tuple e) (erlang/== :extfunc (erlang/element 1 e))) e nil))
+    nil))
+
+(defn- ns-deps
+  "Every remote target module in the beam that is a beam-lisp NAMESPACE
+   (`Elixir.BeamLisp.Ns.*`). A boot-safe pinned beam has NONE: `core` is itself
+   interned during boot, so a `BeamLisp.Ns.Core` call — `(list …)`/`(tuple …)`,
+   `str`, `concat` — would be circular on the boot path. This is the mechanical
+   face of the rule `priv/host/vector.bl`'s header states."
+  [path]
+  (let [fns (erlang/element 6 (erlang/apply :beam_disasm :file (list (erlang/binary_to_list path))))
+        ins (Enum/flat_map (Enum/filter fns (fn [f] (erlang/== :function (erlang/element 1 f))))
+              (fn [f] (erlang/element 5 f)))]
+    (Enum/uniq
+      (Enum/filter
+        (Enum/map (Enum/filter (Enum/map ins ext-of) (fn [x] (not (nil? x))))
+          (fn [t] (erlang/element 2 t)))
+        (fn [m] (String/starts_with? (Atom/to_string m) "Elixir.BeamLisp.Ns."))))))
+
+(defn- env-fetch-sites [path]
+  (let [fns (erlang/element 6 (erlang/apply :beam_disasm :file (list (erlang/binary_to_list path))))]
+    (reduce
+      (fn [acc f]
+        (if (= :function (erlang/element 1 f))
+          (let [nm (erlang/element 2 f)
+                ar (erlang/element 3 f)]
+            (reduce (fn [a ins] (if (env-fetch-ins? ins) (cons (tuple nm ar) a) a))
+                    acc (erlang/element 5 f)))
+          acc))
+      ()
+      fns)))
+
+(deftest vector-pinned-cold-without-namespace-vars
+  (testing "both beams answer with every `host.vector*` var deleted"
+    (let [dir (tmp-dir)]
+      (compile-vec dir)
+      (compile-enum dir)
+      (let [vpath (Path/join dir "Elixir.BeamLisp.VectorAbiProbe.beam")
+            epath (Path/join dir "Elixir.Enumerable.BeamLisp.VectorAbiProbe.beam")]
+        ; No `Env.fetch!` anywhere, so a fresh VM — which never interns
+        ; `host.vector` — has nothing to fail on. The same holds at the
+        ; production atom, read not loaded.
+        (is (= () (env-fetch-sites vpath)))
+        (is (= () (env-fetch-sites epath)))
+        ; ... and NO beam-lisp namespace dependency: boot is where `core` is
+        ; itself being interned, so `(list …)`/`(tuple …)` there would be circular.
+        (is (= () (ns-deps vpath))
+            "the TYPE beam calls no beam-lisp namespace at all (boot interning)")
+        ; The IMPL is not on the boot path — it is reached only through `Enum.*`/
+        ; `Enumerable.*` — so it carries exactly the two namespace deps its Set and
+        ; SeqCursor siblings carry (`(tuple …)`/`(list …)` and `=`); anything MORE
+        ; would be an unintended coupling.
+        (is (= () (Enum/reject (ns-deps epath)
+                     (fn [m] (Enum/member? (list :Elixir.BeamLisp.Ns.Core :Elixir.BeamLisp.Ns.Rt) m))))
+            "the impl beam's only namespace deps are Core and Rt, as its siblings'")
+        (let [vres (BeamLisp.AOT/compile_host_file (vec-source)
+                     (list (t2 :module live) (t2 :output_dir dir) (t2 :load? false)
+                           (t2 :struct_fields (vec-fields))))
+              eres (BeamLisp.AOT/compile_host_file (enum-source)
+                     (list (t2 :module live-enum) (t2 :output_dir dir) (t2 :load? false)))]
+          (is (= live (erlang/element 1 vres)))
+          (is (= live-enum (erlang/element 1 eres)))
+          (is (= () (env-fetch-sites (erlang/element 2 vres))))
+          (is (= () (env-fetch-sites (erlang/element 2 eres))))
+          (is (= () (ns-deps (erlang/element 2 vres))))
+          (is (= () (Enum/reject (ns-deps (erlang/element 2 eres))
+                       (fn [m] (Enum/member? (list :Elixir.BeamLisp.Ns.Core :Elixir.BeamLisp.Ns.Rt) m))))))
+        ; COLD for THIS VM too: delete EVERY var the compile interned, read off
+        ; the pinned beams' own export surface (a helper added tomorrow is deleted
+        ; tomorrow, so the exercise cannot go stale).
+        (doseq [e (erlang/apply probe :module_info (list :exports))]
+          (BeamLisp.Env/delete_key (tuple "host.vector" (Atom/to_string (erlang/element 1 e)))))
+        (doseq [e (erlang/apply enum-probe :module_info (list :exports))]
+          (BeamLisp.Env/delete_key (tuple "host.vector-enumerable" (Atom/to_string (erlang/element 1 e)))))
+        (is (not (BeamLisp.Env/bound? "host.vector" "new")))
+        (is (not (BeamLisp.Env/bound? "host.vector" "trie?")))
+        (is (not (BeamLisp.Env/bound? "host.vector-enumerable" "__impl__")))
+        ; A PRODUCTION-tagged value the probe built: every pinned function reads
+        ; by key, so 1057 elements cross the shift-growth boundary cold.
+        (let [v (maps/put :__struct__ live (mk probe (rng 1057)))]
+          (is (= 1057 (op probe :count (list v))))
+          (is (= 1056 (op probe :nth (list v 1056))))
+          (is (= (rng 1057) (op probe :to_list (list v))))
+          (is (= 1058 (op probe :count (list (op probe :conj (list v 1057))))))
+          (is (= 99 (op probe :nth (list (op probe :assoc (list v 0 99)) 0)))))
+        ; the impl's `BeamLisp.Vector/*` calls resolve against the tag, cold.
+        (let [v (lv (rng 40))]
+          (is (= (tuple :ok 40) (erlang/apply enum-probe :count (list v))))
+          (is (= (tuple :ok true) (erlang/apply enum-probe :member? (list v 5))))
+          (is (= (tuple :done (Enum/reverse (rng 40)))
+                 (erlang/apply enum-probe :reduce
+                   (list v (tuple :cont ()) (fn [x acc] (tuple :cont (cons x acc)))))))))
+      (File/rm_rf! dir))))
+
+; ── the COLD CHILD: a fresh VM, no application boot ──────────────────────
+
+(defn- child-code-args
+  "This VM's whole code path as `-pa` args, with `pinned` LAST so it lands
+   FIRST: `-pa` PREPENDS, so the last one named wins."
+  [pinned]
+  (concat (mapcat (fn [p] (list "-pa" (erlang/list_to_binary p))) (code/get_path))
+          (list "-pa" pinned)))
+
+(defn- cold-script []
+  (str
+    "v = BeamLisp.Vector.new(Enum.to_list(1..33))\n"
+    "IO.puts(\"which-v=\" <> List.to_string(:code.which(BeamLisp.Vector)))\n"
+    "IO.puts(\"which-e=\" <> List.to_string(:code.which(Enumerable.BeamLisp.Vector)))\n"
+    "IO.puts(\"count=\" <> inspect(BeamLisp.Vector.count(v)))\n"
+    "IO.puts(\"nth32=\" <> inspect(BeamLisp.Vector.nth(v, 32)))\n"
+    "IO.puts(\"nth33=\" <> inspect(BeamLisp.Vector.nth(v, 33)))\n"
+    "IO.puts(\"tolist=\" <> inspect(BeamLisp.Vector.to_list(v) == Enum.to_list(1..33)))\n"
+    "IO.puts(\"impl=\" <> inspect(Enumerable.impl_for(v)))\n"
+    "IO.puts(\"enum=\" <> inspect(Enum.to_list(v) == Enum.to_list(1..33)))\n"
+    "IO.puts(\"enum-count=\" <> inspect(Enum.count(v)))\n"
+    "IO.puts(\"assoc=\" <> inspect(BeamLisp.Vector.to_list(BeamLisp.Vector.assoc(v, 0, 99))))\n"
+    "m = Map.put(v, :meta, %{a: 1})\n"
+    "IO.puts(\"meta=\" <> inspect(Map.get(BeamLisp.Vector.conj(m, 7), :meta)))\n"
+    "IO.puts(\"meta-count=\" <> inspect(BeamLisp.Vector.count(m)))\n"
+    "IO.puts(\"ok\")\n"))
+
+(deftest vector-pinned-beams-answer-in-a-cold-child-vm
+  (testing "a fresh VM with no application boot resolves and exercises both pinned atoms"
+    (let [dir (tmp-dir)
+          out (str dir "/cold")
+          script (Path/join dir "cold.exs")]
+      (BeamLisp.AOT/compile_host_file (vec-source)
+        (list (t2 :module live) (t2 :output_dir out) (t2 :load? false) (t2 :struct_fields (vec-fields))))
+      (BeamLisp.AOT/compile_host_file (enum-source)
+        (list (t2 :module live-enum) (t2 :output_dir out) (t2 :load? false)))
+      (is (File/exists? (Path/join out (str live ".beam"))))
+      (is (File/exists? (Path/join out (str live-enum ".beam"))))
+      (File/write! script (cold-script))
+      (let [r (System/cmd "elixir"
+                          (to-list (concat (child-code-args out) (list script)))
+                          (to-list [(tuple :stderr_to_stdout true)
+                                    (tuple :env (list (tuple "ERL_CRASH_DUMP" "/dev/null")))]))
+            text (erlang/element 1 r)]
+        (is (zero? (erlang/element 2 r)) (str "the child VM exited " (erlang/element 2 r) ":\n" text))
+        ; THE REPLACEMENT: the code server resolves both atoms to the pinned
+        ; beams, in a VM that never booted the language.
+        (is (includes? text (str "which-v=" (Path/join out (str live ".beam")))) text)
+        (is (includes? text (str "which-e=" (Path/join out (str live-enum ".beam")))) text)
+        (is (includes? text "count=33") text)
+        (is (includes? text "nth32=33") text)
+        (is (includes? text "nth33=nil") text)
+        (is (includes? text "tolist=true") text)
+        (is (includes? text "impl=Enumerable.BeamLisp.Vector") text)
+        (is (includes? text "enum=true") text)
+        (is (includes? text "enum-count=33") text)
+        (is (includes? text "assoc=[99, 2, 3, ") text)
+        (is (includes? text "meta=%{a: 1}") text)
+        (is (includes? text "meta-count=33") text)
+        (is (includes? text "ok") text))
+      (File/rm_rf! dir))))

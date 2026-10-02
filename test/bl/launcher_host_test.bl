@@ -1,0 +1,463 @@
+; launcher_host_test.bl — the pinned `BeamLisp.Launcher`, its preboot subset and
+; its decisions.
+;
+; `priv/host/launcher.bl` is the `.bl` port of the Elixir boot program `bin/bl`
+; fed to `elixir -e`: install the pinned hosts, judge whether `build/` holds
+; THIS tree's boot tier, rebuild it in a child VM when it does not, re-exec
+; `bin/bl` under `BL_BOOT_REEXECED`, start the application (or the language
+; alone for `deps`), bring the native crates current, and dispatch `bl.cli`
+; `run-argv`. It is compiled by `compile_host_file` into ONE exact-named beam
+; (`Elixir.BeamLisp.Launcher.beam`) that a trampoline calls `main/0`/`main/1`
+; on. Nothing here replaces a live module: the source is compiled at its OWN
+; probe atom, the namespace shim beside it is dropped, and the pinned beam is
+; loaded ALONE — so a leftover shim reference would be `undef` here.
+;
+; WHAT THE SUITE PINS
+;
+;   * SURFACE — `main/0`, `main/1`, `boot/2` and `rebuild_tier/0` are exported
+;     (the trampoline contract), the beam is functions-only (no synthesized
+;     struct/introspection pair), and a rebuild is the same bytes; the seed
+;     records a sha256 per host beam, so a non-deterministic emitter would make
+;     the committed floor unverifiable.
+;
+;   * PREBOOT ATOMS — the emitted beam names the pinned host modules the flow
+;     calls, and names NO `Elixir.BeamLisp.Ns.Core`. That absence is the
+;     subset proof: `(list …)`, `(tuple …)`, `str`, `nil?`, `case`, map/vector
+;     literals, destructuring, `for` and calling a locally-bound fn each lower
+;     to a `BeamLisp.Ns.Core`/`Ns.Rt` call, which is `undef` before the floor
+;     boots. `lst`/`tup`/`bcat` and `call0/1/2/3` are the BIF-only stand-ins.
+;
+;   * PREBOOT RUN — a fresh `elixir` child whose ONLY added code path entry is
+;     the pinned beam answers the decisions (module atoms, provisioning verb,
+;     tier verdict) and never loads `BeamLisp.Ns.Rt`, `BeamLisp.Ns.Core` or
+;     `BeamLisp.Env`. This is the preboot/warm distinction, measured rather than
+;     argued: the SAME source in THIS warm VM also answers, through the tree.
+;
+;   * FLOW — `boot/2`'s effectful edges are seams; the test drives each branch
+;     with fakes and asserts the ORDER of the calls, the exact stderr
+;     diagnostics and the exit codes, including the two child commands the
+;     stale-tier path runs and the exit 70 of every refusal. Nothing here halts
+;     a VM: the halt seam throws a tagged value the test catches.
+;
+; The end-to-end trampoline (a real `main/0` booting the real application) is
+; the integrating wave's gate, not this suite's: it needs the seed entry that
+; points the production atom at this file.
+;
+; Run: bin/bl test test/bl/launcher_host_test.bl
+
+(ns host.launcher.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_launcher_" (erlang/unique_integer (list :positive))))
+
+(defn- launcher-source [] (Path/join (BeamLisp/cwd) "priv/host/launcher.bl"))
+
+(def ^:private probe :Elixir.BeamLisp.HostLauncherProbe)
+(def ^:private shim :Elixir.BeamLisp.Ns.Host.Launcher)
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-beam! [mod path]
+  (drop! mod)
+  (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+  mod)
+
+(defn- pinned-beam-path [dir]
+  (Path/join dir "Elixir.BeamLisp.HostLauncherProbe.beam"))
+
+; Compile the pinned source at `mod` into `dir` and load ONLY that beam; the
+; namespace shim the compile built beside it is dropped.
+(defn- compile-pinned [mod dir]
+  (let [res (BeamLisp.AOT/compile_host_file (launcher-source)
+              (list (t2 :module mod) (t2 :output_dir dir) (t2 :load? false)))]
+    (load-beam! mod (elem res 1))
+    (drop! shim)
+    mod))
+
+; The same compile, written and NOT loaded — for byte reads.
+(defn- write-pinned [mod dir]
+  (elem (BeamLisp.AOT/compile_host_file (launcher-source)
+          (list (t2 :module mod) (t2 :output_dir dir) (t2 :load? false)))
+        1))
+
+(def ^:private probe-dir (tmp-dir))
+
+; Compile the probe ONCE per run; every in-process test reads the same beam.
+(defn- pinned! []
+  (if (File/exists? (pinned-beam-path probe-dir))
+    probe
+    (compile-pinned probe probe-dir)))
+
+(defn- beam-atoms [path]
+  (let [chunks (erlang/apply :beam_lib :chunks
+                             (list (erlang/binary_to_list path) (list :atoms)))
+        pairs (erlang/element 2 (first (erlang/element 2 (erlang/element 2 chunks))))]
+    (map (fn [pair] (erlang/element 2 pair)) pairs)))
+
+(defn- has-atom? [atoms name]
+  (some (fn [a] (erlang/== a (erlang/binary_to_atom name :utf8))) atoms))
+
+; ── the surface: the trampoline contract ────────────────────────────────────
+
+(deftest launcher-pinned-exports-the-trampoline-surface
+  (testing "main/0, main/1, boot/2 and rebuild_tier/0 are exported from a functions-only beam"
+    (pinned!)
+    ; NO SHIM: the compile's own namespace module is gone; the pinned beam
+    ; answers at its probe atom.
+    (is (= :non_existing (code/which shim)))
+
+    ; THE TRAMPOLINE. An Erlang/Elixir entry point reaches the launcher by
+    ; name: `main/0` (this VM's argv) and `main/1` (an explicit one).
+    (is (erlang/function_exported probe :main 0))
+    (is (erlang/function_exported probe :main 1))
+    ; The seam-taking flow and the child VM's rebuild entry.
+    (is (erlang/function_exported probe :boot 2))
+    (is (erlang/function_exported probe :rebuild_tier 0))
+
+    ; A pinned module is functions-only: no synthesized struct pair and no
+    ; Elixir compiler introspection export.
+    (is (not (erlang/function_exported probe :__struct__ 0)))
+    (is (not (erlang/function_exported probe :__struct__ 1)))
+    (is (not (erlang/function_exported probe :__info__ 1)))
+
+    ; The child's program is a trampoline to `rebuild_tier/0`, never a program
+    ; body: a NAME cannot be truncated by a shell quote.
+    (is (= "BeamLisp.Launcher.rebuild_tier()"
+           (erlang/apply probe :build_program (list))))))
+
+(deftest launcher-pinned-rebuild-is-the-same-beam
+  (testing "the same source compiled twice is the same bytes"
+    (let [first-dir (tmp-dir)
+          again (tmp-dir)]
+      (pinned!)
+      (write-pinned probe first-dir)
+      (write-pinned probe again)
+      (is (= (File/read! (pinned-beam-path first-dir))
+             (File/read! (pinned-beam-path again)))
+          "a rebuild of priv/host/launcher.bl is the same beam")
+      (File/rm_rf! first-dir)
+      (File/rm_rf! again))))
+
+; ── the preboot atoms ───────────────────────────────────────────────────────
+
+(deftest launcher-beam-names-the-pinned-hosts-and-no-core
+  (testing "the emitted beam references the host modules the flow calls, and no `BeamLisp.Ns.Core`"
+    (pinned!)
+    (let [atoms (beam-atoms (pinned-beam-path probe-dir))]
+      ; Every module the flow calls by name. These are the atoms a preboot VM
+      ; must be able to resolve from pinned beams alone.
+      (doseq [m ["Elixir.BeamLisp.Bootstrap"
+                 "Elixir.BeamLisp.AOT"
+                 "Elixir.BeamLisp.AOTCache"
+                 "Elixir.BeamLisp.Tiers"
+                 "Elixir.BeamLisp.Env"
+                 "Elixir.BeamLisp.Loader"
+                 "Elixir.BeamLisp.Ns.Rt"
+                 "Elixir.Application"
+                 "Elixir.System"
+                 "Elixir.IO"
+                 "Elixir.Path"
+                 "Elixir.Code"
+                 "erlang"]]
+        (is (has-atom? atoms m) (str "the beam names " m)))
+
+      ; THE SUBSET PROOF. A `(list …)`, `(tuple …)`, `str`, `nil?`, `case`,
+      ; map/vector literal, destructuring, `for`, or a call to a locally-bound
+      ; fn would each put `BeamLisp.Ns.Core` (or `Ns.Rt`) in this table — the
+      ; runtime the launcher must run without.
+      (is (not (has-atom? atoms "Elixir.BeamLisp.Ns.Core"))
+          "no preboot construct lowers into the runtime"))))
+
+; ── the decisions, in THIS (warm) VM ────────────────────────────────────────
+
+(deftest launcher-provisioning-verb-is-exactly-deps
+  (testing "the one verb allowed to boot without the application, matched at first position"
+    (let [p (pinned!)]
+      (is (erlang/apply p :provisioning_argv? (list (list "deps" "fetch"))))
+      (is (erlang/apply p :provisioning_argv? (list (list "deps"))))
+      (is (not (erlang/apply p :provisioning_argv? (list (list "version")))))
+      (is (not (erlang/apply p :provisioning_argv? (list (list)))) "empty argv is no verb")
+      (is (not (erlang/apply p :provisioning_argv? (list (list "depsomething")))))
+      (is (not (erlang/apply p :provisioning_argv? (list (list "version" "deps"))))
+          "`deps` not first is not the provisioning verb"))))
+
+(deftest launcher-boot-module-atoms-are-the-live-tree-s
+  (testing "each boot namespace maps to the module atom its beam is emitted at"
+    (let [p (pinned!)]
+      (is (= :"Elixir.BeamLisp.Ns.Reader-node"
+             (erlang/apply p :tier_module (list "reader-node"))))
+      (is (= :"Elixir.BeamLisp.Ns.Rt"
+             (erlang/apply p :tier_module (list "rt"))))
+      (is (= :"Elixir.BeamLisp.Ns.Body.Reader-node"
+             (erlang/apply p :tier_module (list "body.reader-node"))))
+      (is (= :"Elixir.BeamLisp.Ns.Multi"
+             (erlang/apply p :tier_module (list "multi"))))
+
+      ; THE DIFFERENTIAL: for every boot namespace the LIVE tier reports, the
+      ; derived atom resolves to a beam on this VM's code path. A drift in the
+      ; naming rule (or in the tier) shows up here, before the launcher ever
+      ; runs it.
+      (doseq [ns (BeamLisp.Tiers/boot_namespaces)]
+        (let [mod (erlang/apply p :tier_module (list ns))]
+          (is (erlang/is_atom mod) ns)
+          (is (not (erlang/== :non_existing (code/which mod)))
+              (str "a beam exists for " mod)))))))
+
+(deftest launcher-provenance-and-tier-verdict
+  (testing "the key a provenance carries, and the all-one-generation verdict"
+    (let [p (pinned!)]
+      ; `{hash, key}` is what `AOT.beam_provenance/1` answers; the map shape is
+      ; the older clause; anything else is unanswerable.
+      (is (= "K" (erlang/apply p :provenance_key (list (t2 "hash" "K")))))
+      (is (= "K" (erlang/apply p :provenance_key (list {:key "K"}))))
+      (is (nil? (erlang/apply p :provenance_key (list nil))))
+      (is (nil? (erlang/apply p :provenance_key (list (t2 "hash" :not-a-key)))))
+      (is (nil? (erlang/apply p :provenance_key (list :whatever))))
+
+      ; ONE generation is the whole question: a single mismatched beam is not
+      ; current.
+      (is (erlang/apply p :tier_current?
+            (list (list (t2 "reader" (t2 "h" "K")) (t2 "rt" (t2 "h" "K"))) "K")))
+      (is (not (erlang/apply p :tier_current?
+                 (list (list (t2 "reader" (t2 "h" "K")) (t2 "rt" (t2 "h" "OLD"))) "K"))))
+      (is (not (erlang/apply p :tier_current? (list (list (t2 "reader" nil)) "K")))
+          "an unanswerable provenance is not a yes")
+      (is (erlang/apply p :tier_current? (list (list) "K"))
+          "no boot namespaces is vacuously current")
+
+      ; A tree with no seed has nothing to compare against; an unanswerable
+      ; provenance question rebuilds, which is always the safe direction.
+      (is (erlang/apply p :tier_verdict (list nil true (list) "K")))
+      (is (not (erlang/apply p :tier_verdict
+                 (list {:x 1} false (list (t2 "reader" nil)) "K"))))
+      (is (erlang/apply p :tier_verdict
+            (list {:x 1} true (list (t2 "reader" (t2 "h" "K"))) "K"))))))
+
+; ── the preboot run: a language-less child VM ───────────────────────────────
+
+(defn- preboot-script
+  "The child VM's program. Every line it prints is read back as an assertion.
+   `apply/3` is used for the `?`-suffixed names so the script reads the same
+   whether or not Elixir's parser likes them."
+  []
+  (str
+    "mod = BeamLisp.HostLauncherProbe\n"
+    "IO.puts(\"tm=\" <> Atom.to_string(apply(mod, :tier_module, [\"reader-node\"])))\n"
+    "IO.puts(\"tm2=\" <> Atom.to_string(apply(mod, :tier_module, [\"body.reader-node\"])))\n"
+    "IO.puts(\"prov=\" <> inspect(apply(mod, :provisioning_argv?, [[\"deps\", \"fetch\"]])))\n"
+    "IO.puts(\"prov2=\" <> inspect(apply(mod, :provisioning_argv?, [[\"version\"]])))\n"
+    "IO.puts(\"cur=\" <> inspect(apply(mod, :tier_current?, [[{\"a\", {\"h\", \"K\"}}], \"K\"])))\n"
+    "IO.puts(\"stale=\" <> inspect(apply(mod, :tier_current?, [[{\"a\", {\"h\", \"OLD\"}}], \"K\"])))\n"
+    "IO.puts(\"verdict=\" <> inspect(apply(mod, :tier_verdict, [nil, true, [], \"K\"])))\n"
+    "IO.puts(\"cant=\" <> inspect(apply(mod, :tier_verdict, [%{x: 1}, false, [{\"a\", nil}], \"K\"])))\n"
+    "IO.puts(\"main1=\" <> inspect(:erlang.function_exported(mod, :main, 1)))\n"
+    "IO.puts(\"boot2=\" <> inspect(:erlang.function_exported(mod, :boot, 2)))\n"
+    "IO.puts(\"rebuild0=\" <> inspect(:erlang.function_exported(mod, :rebuild_tier, 0)))\n"
+    "IO.puts(\"prog=\" <> inspect(apply(mod, :build_program, [])))\n"
+    "IO.puts(\"rt-loaded=\" <> inspect(:erlang.module_loaded(BeamLisp.Ns.Rt)))\n"
+    "IO.puts(\"core-loaded=\" <> inspect(:erlang.module_loaded(BeamLisp.Ns.Core)))\n"
+    "IO.puts(\"env-loaded=\" <> inspect(:erlang.module_loaded(BeamLisp.Env)))\n"
+    "IO.puts(\"which-rt=\" <> inspect(:code.which(BeamLisp.Ns.Rt)))\n"
+    "IO.puts(\"ok\")\n"))
+
+(deftest launcher-preboot-decisions-answer-in-a-language-less-vm
+  (testing "the pinned beam's preboot path runs with only Elixir/OTP beside it"
+    (let [dir (tmp-dir)
+          script (Path/join dir "preboot.exs")]
+      (pinned!)
+      (File/mkdir_p! dir)
+      (File/write! script (preboot-script))
+
+      ; ONLY the pinned beam is added to the child's code path: `BeamLisp.Ns.*`
+      ; and `BeamLisp.Env` are not loadable there, so a decision that reached
+      ; the runtime would be `undef`.
+      (let [r (System/cmd "elixir"
+                          (list "-pa" probe-dir script)
+                          (list (t2 :stderr_to_stdout true)))
+            text (elem r 0)]
+        (is (zero? (elem r 1)) (str "the child VM exited " (elem r 1)))
+
+        ; The decisions ANSWER, and they answer the same thing they answer in
+        ; the warm VM above.
+        (is (includes? text "tm=Elixir.BeamLisp.Ns.Reader-node"))
+        (is (includes? text "tm2=Elixir.BeamLisp.Ns.Body.Reader-node"))
+        (is (includes? text "prov=true"))
+        (is (includes? text "prov2=false"))
+        (is (includes? text "cur=true"))
+        (is (includes? text "stale=false"))
+        (is (includes? text "verdict=true"))
+        (is (includes? text "cant=false"))
+
+        ; The trampoline contract resolves in a FRESH VM — the code server
+        ; finds the beam and the exports are callable there, not merely in the
+        ; VM that compiled it.
+        (is (includes? text "main1=true"))
+        (is (includes? text "boot2=true"))
+        (is (includes? text "rebuild0=true"))
+        (is (includes? text "prog=\"BeamLisp.Launcher.rebuild_tier()\""))
+
+        ; THE PREBOOT PROOF: none of the runtime the launcher must run WITHOUT
+        ; was loaded (or even found) by any of the above.
+        (is (includes? text "rt-loaded=false"))
+        (is (includes? text "core-loaded=false"))
+        (is (includes? text "env-loaded=false"))
+        (is (includes? text "which-rt=:non_existing"))
+        (is (includes? text "ok")))
+
+      (File/rm_rf! dir))))
+
+; ── the flow, driven through the seams ──────────────────────────────────────
+
+(defn- reset-log! []
+  (do (Process/put :calls (list))
+      (Process/put :cmd-calls (list))
+      :ok))
+
+(defn- log! [entry]
+  (Process/put :calls (erlang/++ (Process/get :calls) (list entry)))
+  entry)
+
+(defn- cmd-log! [exe args opts]
+  (Process/put :cmd-calls (erlang/++ (Process/get :cmd-calls) (list (list exe args opts)))))
+
+(defn- env-fn [extra]
+  (fn [name] (get (merge {"BL_EBIN" "/tmp/bl/ebin" "BL_ROOT" "/tmp/bl"} extra) name)))
+
+(defn- base-seams [over]
+  (merge
+    {:get_env (env-fn {})
+     :stderr (fn [msg] (log! (list :stderr msg)))
+     :halt (fn [code] (log! (list :halt code)) (erlang/throw (t2 :halted code)))
+     :cmd (fn [exe args opts] (cmd-log! exe args opts) (t2 (list) 0))
+     :code_path (fn [] (list "/pa/one" "/pa/two"))
+     :find_executable (fn [name] "/usr/bin/elixir")
+     :install_hosts (fn [ebin] (log! (list :install-hosts ebin)))
+     :manifest (fn [] {"compiler_key" "k"})
+     :key_now (fn [] "K")
+     :provenance (fn [mod] (t2 "hash" "K"))
+     :boot_namespaces (fn [] (list "reader" "rt"))
+     :start_app (fn [] (t2 :ok (list)))
+     :load_app (fn [] (log! (list :load-app true)))
+     :aot_boot (fn [] (log! (list :aot-boot true)))
+     :ensure_loaded (fn [ns] (log! (list :ensure-loaded ns)))
+     :fetch (fn [ns name] (log! (list :fetch ns name)) (str "RUN:" ns))
+     :invoke (fn [f args] (log! (list :invoke f args)) (if (string? f) 3 :ok))}
+    over))
+
+(defn- run-boot [argv over]
+  (reset-log!)
+  (try
+    (erlang/apply (pinned!) :boot (list argv (base-seams over)))
+    (catch e e)))
+
+(deftest launcher-flow-serves-a-warm-tree
+  (testing "a current tier starts the application, builds natives, and dispatches bl.cli"
+    (let [out (run-boot (list "version") {})]
+      (is (= (t2 :halted 3) out) "the CLI's return value IS the exit code")
+      (is (= (list (list :install-hosts "/tmp/bl/ebin")
+                   (list :ensure-loaded "vm.native")
+                   (list :fetch "vm.native" "build-all!")
+                   (list :invoke "RUN:vm.native" (list))
+                   (list :ensure-loaded "bl.cli")
+                   (list :fetch "bl.cli" "run-argv")
+                   (list :invoke "RUN:bl.cli" (list (list "version")))
+                   (list :halt 3))
+             (Process/get :calls))
+          "the host install runs BEFORE the app starts, and bl.cli dispatches last")
+      (is (= (list) (Process/get :cmd-calls)) "no child VM on a warm tree"))))
+
+(deftest launcher-flow-lets-deps-boot-without-the-application
+  (testing "`deps` runs the language alone when a library is missing, and says why"
+    (let [out (run-boot (list "deps" "fetch")
+                        {:start_app (fn [] (t2 :error (t2 :x509 "no such file")))})]
+      (is (= (t2 :halted 3) out))
+      (is (= (list (list :install-hosts "/tmp/bl/ebin")
+                   (list :load-app true)
+                   (list :stderr
+                         (str "bl: the application did not start ("
+                              (Kernel/inspect (t2 :error (t2 :x509 "no such file")))
+                              "); running deps anyway, because it installs what the application needs"))
+                   (list :aot-boot true)
+                   (list :ensure-loaded "bl.cli")
+                   (list :fetch "bl.cli" "run-argv")
+                   (list :invoke "RUN:bl.cli" (list (list "deps" "fetch")))
+                   (list :halt 3))
+             (Process/get :calls))))))
+
+(deftest launcher-flow-refuses-a-half-started-image
+  (testing "any other verb stops, loudly, with the reason and exit 70"
+    (let [out (run-boot (list "version")
+                        {:start_app (fn [] (t2 :error (t2 :enoent "beam_lisp.app")))})]
+      (is (= (t2 :halted 70) out))
+      (is (= (list (list :install-hosts "/tmp/bl/ebin")
+                   (list :stderr
+                         (str "bl: the application did not start: "
+                              (Kernel/inspect (t2 :error (t2 :enoent "beam_lisp.app")))))
+                   (list :stderr
+                         "bl: this image is not usable as-is; `bl build --force` rebuilds it, and `bl doctor` says what it is")
+                   (list :halt 70))
+             (Process/get :calls))
+          "two diagnostics and exit 70 — never silence and exit 0"))))
+
+(deftest launcher-flow-rebuilds-a-stale-tier-in-a-child-and-reexecs
+  (testing "a tier from another generation is rebuilt as a unit, then bin/bl re-execs under BL_BOOT_REEXECED"
+    (let [n (atom 0)
+          out (run-boot (list "version")
+                        {:provenance (fn [mod] (t2 "hash" "OLD"))
+                         :cmd (fn [exe args opts]
+                                (cmd-log! exe args opts)
+                                (swap! n inc)
+                                (t2 (list) (if (erlang/== 1 (deref n)) 0 2)))})]
+      (is (= (t2 :halted 2) out) "the re-exec's status is the exit code")
+      (is (= (list (list :install-hosts "/tmp/bl/ebin")
+                   (list :stderr "bl: the boot tier in build/ is not this tree's generation; rebuilding it as a unit")
+                   (list :halt 2))
+             (Process/get :calls)))
+
+      (let [calls (Process/get :cmd-calls)]
+        (is (= 2 (erlang/length calls)) "exactly one rebuild and one re-exec")
+
+        (let [child (first calls)]
+          (is (= "/usr/bin/elixir" (first child)))
+          (is (= (list "-pa" "/pa/two" "-pa" "/pa/one"
+                       "-e" "BeamLisp.Launcher.rebuild_tier()"
+                       "--" "/tmp/bl/ebin")
+                 (second child))
+              "the child gets this VM's whole code path, the trampoline, and the ebin")
+          (is (some (fn [o] (erlang/== o (t2 :stderr_to_stdout true))) (nth child 2))))
+
+        (let [again (second calls)]
+          (is (= "/tmp/bl/bin/bl" (first again)))
+          (is (= (list "version") (second again)))
+          (is (some (fn [o] (erlang/== o (t2 :env (list (t2 "BL_BOOT_REEXECED" "1")))))
+                    (nth again 2))
+              "the re-exec is marked so a second stale verdict refuses"))))))
+
+(deftest launcher-flow-a-tier-that-will-not-compile-is-a-real-error
+  (testing "a rebuild that exits nonzero names the failure and halts 70"
+    (let [out (run-boot (list "version")
+                        {:provenance (fn [mod] (t2 "hash" "OLD"))
+                         :cmd (fn [exe args opts] (cmd-log! exe args opts) (t2 (list) 3))})]
+      (is (= (t2 :halted 70) out))
+      (is (= (list (list :install-hosts "/tmp/bl/ebin")
+                   (list :stderr "bl: the boot tier in build/ is not this tree's generation; rebuilding it as a unit")
+                   (list :stderr "bl: the boot tier does not rebuild from source (exit 3); this image is unusable")
+                   (list :halt 70))
+             (Process/get :calls)))
+      (is (= 1 (erlang/length (Process/get :cmd-calls))) "no re-exec after a failed rebuild"))))
+
+(deftest launcher-flow-refuses-a-second-stale-verdict
+  (testing "a tree still stale after a rebuild refuses another restart, exit 70"
+    (let [out (run-boot (list "version")
+                        {:get_env (env-fn {"BL_BOOT_REEXECED" "1"})
+                         :provenance (fn [mod] (t2 "hash" "OLD"))})]
+      (is (= (t2 :halted 70) out))
+      (is (= (list (list :install-hosts "/tmp/bl/ebin")
+                   (list :stderr "bl: the boot tier in build/ is not this tree's generation; rebuilding it as a unit")
+                   (list :stderr "bl: boot tier is still stale after a rebuild; refusing another restart")
+                   (list :halt 70))
+             (Process/get :calls)))
+      (is (= 1 (erlang/length (Process/get :cmd-calls))) "the guard fires before the re-exec"))))

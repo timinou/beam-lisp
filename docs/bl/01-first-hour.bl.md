@@ -70,12 +70,14 @@ $ printf '(* 6 7)\n' | bl eval -
 
 ## Open a session
 
-`bl repl` — or just `bl` — reads a form, evaluates it, prints the value, and
-waits. A form may span lines; the prompt continues while one is open. `*1` is
-the previous value.
+`bl repl` — or just `bl` — opens an interactive session. With a display and the
+native WebView backend it opens a window on the session's `/repl` page; on a
+headless host it reads forms in the terminal. `bl repl --terminal` always gives
+the terminal loop, `bl repl --web` that page in your browser. A form may span
+lines; the prompt continues while one is open. `*1` is the previous value.
 
 ```sh
-$ bl repl
+$ bl repl --terminal
 beam-lisp on the BEAM — Ctrl+D to exit
 user=> (+ 1 2)
 3

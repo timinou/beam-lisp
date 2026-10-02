@@ -1,0 +1,372 @@
+; A generation is an owned conversation, not a blocking HTTP call.
+(ns play.gen
+  (:require [proc :as proc]
+            [proc.super :as super]
+            [dev.workspace :as ws]
+            [play.change :as change]
+            [gen.llm :as llm]
+            [clojure.edn :as edn]))
+
+(defn- fail! [message data] (throw (ex-info message data)))
+(defn- workspace [x] {:kind :workspace :root (:root x) :id (:root x)})
+(defn- handle [x] (select-keys x [:kind :root :id]))
+(defn- now [] (erlang/system_time :millisecond))
+(defn- new-id [] (str "g-" (Base/encode16 (crypto/strong_rand_bytes 10))))
+
+(defn- source-path! [w path]
+  (when (or (not (string? path)) (= path "") (not= :relative (Path/type path)))
+    (fail! "Choose a relative source file inside the playground." {}))
+  (let [parts (String/split path "/")]
+    (when (some (fn [part] (or (= part "") (String/starts_with? part "."))) parts)
+      (fail! "Hidden files and parent traversal are not generation sources." {}))
+    (reduce (fn [parent part]
+              (let [p (Path/join parent part)
+                    link (File/read_link p)]
+                (when (= :ok (erlang/element 1 link))
+                  (fail! "Generation sources cannot pass through symlinks." {}))
+                p))
+            (:root w) parts)))
+
+(defn cache-path
+  "The one ledger owned by a source: src/demo.bl -> src/.demo.cache.bl."
+  [w source]
+  (let [p (source-path! w source)]
+    (when-not (String/ends_with? p ".bl")
+      (fail! "Generation history belongs to a .bl source file." {}))
+    (Path/join (Path/dirname p) (str "." (Path/basename p ".bl") ".cache.bl"))))
+
+(defn- read-ledger [path]
+  (let [link (File/read_link path)]
+    (when (= :ok (erlang/element 1 link))
+      (fail! "A generation ledger cannot be a symlink." {})))
+  (if (File/exists? path)
+    (let [value (edn/read-string (File/read! path))]
+      (when-not (and (map? value) (= 1 (:schema value)) (map? (:experiences value)))
+        (fail! "This generation ledger is not a supported data document." {}))
+      value)
+    {:schema 1 :experiences {}}))
+
+(defn- persist! [x]
+  (let [path (cache-path (workspace x) (:source-path x))
+        ledger (read-ledger path)
+        temp (str path ".tmp-" (erlang/unique_integer (list :positive)))
+        updated (assoc-in ledger [:experiences (:id x)] x)]
+    (File/mkdir_p! (Path/dirname path))
+    (try
+      (File/write! temp (str "; Generation history is data. Loading it never calls a model.\n"
+                             (pr-str updated) "\n"))
+      (File/rename! temp path)
+      (finally (when (File/exists? temp) (File/rm temp))))
+    x))
+
+(defn- publish! [x]
+  (try
+    (persist! x)
+    (ws/remember! (workspace x) x)
+    x
+    (catch e
+      (try (ws/remember! (workspace x)
+                        (assoc x :status :failed :error "Could not persist the generation ledger; inspect the workspace before retrying."))
+           (catch _ignored nil))
+      (throw e))))
+
+(defn- visible-options [opts]
+  {:provider (get opts :provider :fake)
+   :ns (str (get opts :ns "billing.rules"))
+   :max-repairs (min 1 (max 0 (get opts :max-repairs 1)))})
+
+(defn- fake-response [w target]
+  (let [path (str "src/" (String/replace target "." "/") ".bl")
+        definition "'(defn total [subtotal-cents fee-cents] (+ subtotal-cents fee-cents))"
+        first-op (if (File/exists? (source-path! w path))
+                   (str "(change/in-namespace '" target " (change/replace-definition 'total " definition "))")
+                   (str "(change/create-namespace '" target " " definition ")"))]
+    (str "(change/bundle \"Include the late fee in invoice totals\"\n  " first-op
+         "\n  (change/in-namespace 'app.invoices\n"
+         "    (change/require '[" target "])\n"
+         "    (change/replace-definition 'total\n"
+         "      '(defn total [invoice]\n"
+         "         (" target "/total (:subtotal-cents invoice) (:late-fee-cents invoice))))))")))
+
+(def system-prompt
+  "You write Beam Lisp structural change proposals. Return exactly ONE form, no prose:
+(change/bundle \"short title\" operations...)
+Allowed operations:
+(change/create-namespace 'qualified.name '(defn function [args] body)...)
+(change/in-namespace 'qualified.name (change/require '[another.ns :as alias]) (change/replace-definition 'name '(defn name [args] body)) (change/add-definition '(defn new-name [args] body)))
+Use complete quoted defn forms. Do not use defn-, ns forms, require outside change/require, markdown explanations, JSON, filesystem calls, eval, or arbitrary expressions in the proposal constructors. The quoted function bodies are ordinary Beam Lisp. No functions are required merely to construct a proposal.
+For this exercise introduce a namespace with total [subtotal-cents fee-cents] that adds integer cents, and replace app.invoices/total [invoice] to delegate using :subtotal-cents and :late-fee-cents. Add its require alias. Keep existing unrelated functions. If the target namespace already exists, replace its total rather than create it again. Tests will call app.invoices/total with 1000 and 250 and expect 1250. The tool manages file paths, source hashes and state; do not invent them.")
+
+(defn- context-text [w target]
+  (apply str
+    (for [path ["src/app/invoices.bl" (str "src/" (String/replace target "." "/") ".bl")]]
+      (let [full (source-path! w path)]
+        (when (File/regular? full)
+          (str "\nSource " path ":\n" (File/read! full) "\n"))))))
+
+(defn load-key!
+  "Load only DEEPSEEK_API_KEY from an explicitly chosen dotenv file. Returns
+   presence, never the value. A pre-existing environment value wins."
+  [path]
+  (when (or (nil? (System/get_env "DEEPSEEK_API_KEY"))
+            (= "" (System/get_env "DEEPSEEK_API_KEY")))
+    (when (File/regular? path)
+      (doseq [line (String/split (File/read! path) "\n")]
+        (let [line (String/trim line)
+              line (if (String/starts_with? line "export ") (subs line 7) line)]
+          (when (String/starts_with? line "DEEPSEEK_API_KEY=")
+            (let [value (String/trim (subs line 17))
+                  value (if (and (>= (count value) 2)
+                                 (or (and (String/starts_with? value "\"") (String/ends_with? value "\""))
+                                     (and (String/starts_with? value "'") (String/ends_with? value "'"))))
+                          (subs value 1 (dec (count value))) value)]
+              (when-not (= value "") (System/put_env "DEEPSEEK_API_KEY" value))))))))
+  (boolean (seq (System/get_env "DEEPSEEK_API_KEY"))))
+
+(defn- request [w opts messages]
+  (cond
+    (:ask-fn opts) ((:ask-fn opts) messages)
+    (= :fake (:provider opts))
+      (do (Process/sleep (get opts :delay-ms 500))
+          {:ok (fake-response w (:ns opts))})
+    (= :deepseek (:provider opts))
+      (if (seq (System/get_env "DEEPSEEK_API_KEY"))
+        (let [result (llm/chat (assoc llm/deepseek :max-tokens 2400 :timeout-ms 60000) (to-list messages))]
+          (if (:ok result) {:ok (:ok result)}
+            {:error "The provider request failed. Check credentials/connectivity; no source was changed."}))
+        {:error "DEEPSEEK_API_KEY is not loaded. Start with --deepseek-env PATH, or choose the demo provider."})
+    :else {:error "Choose :fake or :deepseek."}))
+
+(defn- notify [owner id epoch turn]
+  (cast owner [:turn id epoch turn]))
+
+(defn- generated-function? [form]
+  (and (list? form) (= 'defn (first form)) (symbol? (second form))))
+
+(defn- validate-generated! [bundle]
+  ; Public change constructors can express trusted file operations. Automatic
+  ; generation is narrower: namespace/function proposals, never setup programs.
+  (doseq [op (:operations bundle)]
+    (when-not (and (contains? #{:create-namespace :in-namespace} (:op op))
+                   (Regex/match? (Regex/compile! "\\A[A-Za-z_][A-Za-z0-9_.-]*\\z") (:ns op)))
+      (fail! "Generate a named namespace/function proposal, not raw file operations or setup code." {}))
+    (if (= :create-namespace (:op op))
+      (when-not (every? generated-function? (:definitions op))
+        (fail! "Generated namespace contents must be named defn forms." {}))
+      (doseq [change (:ops op)]
+        (case (:op change)
+          :require
+            (when-not (and (vector? (:vector change)) (symbol? (first (:vector change)))
+                           (every? (fn [v] (or (symbol? v) (keyword? v)
+                                              (and (vector? v) (every? symbol? v)))) (:vector change)))
+              (fail! "Require specs must contain literal namespace/alias symbols." {}))
+          :replace-definition
+            (when-not (generated-function? (:form change))
+              (fail! "Replace a function with a named defn form." {}))
+          :add-definition
+            (when-not (generated-function? (:form change))
+              (fail! "Add a function with a named defn form." {}))
+          (fail! "This generation profile accepts only function and require edits." {})))))
+  bundle)
+
+(defn- execute-run [owner x epoch opts history]
+  (let [w (workspace x)
+        base [{:role "system" :content system-prompt}
+              {:role "user" :content (str "Target namespace: " (:ns opts) "\n"
+                                          (:prompt x) (context-text w (:ns opts)))}]
+        base (if (empty? history) base
+               (conj base {:role "user" :content (str "Previous visible conversation:\n" (pr-str history))}))]
+    (try
+      (loop [attempt 0 messages base]
+        (notify owner (tuple (:root x) (:id x)) epoch {:role "status" :text (str "Request " (inc attempt) " of " (inc (:max-repairs opts)) " · " (name (:provider opts)))})
+        (let [answer (request w opts messages)]
+          (if-let [text (:ok answer)]
+            (do
+              (notify owner (tuple (:root x) (:id x)) epoch {:role "assistant" :text text})
+              (let [result
+                    (try
+                      (let [bundle (validate-generated! (change/decode text))
+                            active (call owner [:active? (tuple (:root x) (:id x)) epoch])]
+                        (if active
+                          (let [p (ws/propose! w bundle)
+                                verified (ws/verify! p)]
+                            (if (= :verified (:status verified))
+                              {:ok p}
+                              {:error (or (:error verified) "The proposed code did not verify.")}))
+                          {:cancelled true}))
+                      (catch e {:error (ex-message e)}))]
+                (cond
+                  (:cancelled result) nil
+                  (:ok result)
+                    (cast owner [:ready (tuple (:root x) (:id x)) epoch (:ok result)])
+                  (< attempt (:max-repairs opts))
+                    (do (notify owner (tuple (:root x) (:id x)) epoch {:role "check" :text (str "Repair needed: " (:error result))})
+                        (recur (inc attempt)
+                               (conj messages {:role "assistant" :content text}
+                                     {:role "user" :content (str "Correct the proposal. Verification said: " (:error result))})))
+                  :else (cast owner [:failed (tuple (:root x) (:id x)) epoch (:error result)]))))
+            (cast owner [:failed (tuple (:root x) (:id x)) epoch (:error answer)]))))
+      (catch _e
+        (cast owner [:failed (tuple (:root x) (:id x)) epoch "The generation worker failed. No candidate was published."])))))
+
+(defn- active-run? [st id epoch]
+  (let [run (get-in st [:runs id])]
+    (and run (= epoch (:epoch run)) (= :running (get-in run [:snapshot :status])))))
+
+(defn- launch [st x opts]
+  (let [id (tuple (:root x) (:id x))
+        epoch (erlang/unique_integer (list :positive :monotonic))
+        parent (erlang/self)
+        opts (merge (visible-options opts) (select-keys opts [:delay-ms :ask-fn]))
+        history (:turns x)
+        x (assoc x :status :running :error nil :provider (:provider opts)
+                   :target-ns (:ns opts) :updated-at (now)
+                   :turns (conj (vec history) {:role "user" :text (:prompt x)}))
+        _ (publish! x)
+        [pid ref] (spawn-monitor (fn [] (execute-run parent x epoch opts history)))]
+    [(handle x) (assoc-in st [:runs id] {:epoch epoch :pid pid :ref ref :opts opts :snapshot x})]))
+
+(proc/defserver generation-owner
+  (init [_] (ok {:runs {}}))
+  (handle-call [:start x opts] [_from st]
+    (try
+      (let [[h next] (launch st x opts)] (reply {:ok h} next))
+      (catch e (reply {:error (ex-message e)} st))))
+  (handle-call [:active? id epoch] [_from st]
+    (reply (active-run? st id epoch) st))
+  (handle-call [:cancel id] [_from st]
+    (if-let [run (get-in st [:runs id])]
+      (let [x (:snapshot run)]
+        (if (= :running (:status x))
+          (do (erlang/exit (:pid run) :kill)
+              (let [x (assoc x :status :cancelled :updated-at (now)
+                               :turns (conj (:turns x) {:role "status" :text "Cancelled locally. A provider may already have processed the request."}))]
+                (publish! x)
+                (reply x (assoc-in st [:runs id :snapshot] x))))
+          (reply x st)))
+      (reply nil st)))
+  (handle-cast [:turn id epoch turn] [st]
+    (if (active-run? st id epoch)
+      (let [x (-> (get-in st [:runs id :snapshot])
+                  (update :turns conj turn) (assoc :updated-at (now)))]
+        (publish! x)
+        (noreply (assoc-in st [:runs id :snapshot] x)))
+      (noreply st)))
+  (handle-cast [:ready id epoch proposal] [st]
+    (if (active-run? st id epoch)
+      (let [x (-> (get-in st [:runs id :snapshot])
+                  (assoc :status :ready :proposal proposal :updated-at (now))
+                  (update :versions conj proposal)
+                  (update :turns conj {:role "check" :text "Candidate verified. Preview, try, save and make live are separate actions."}))]
+        (publish! x)
+        (noreply (assoc-in st [:runs id :snapshot] x)))
+      (noreply st)))
+  (handle-cast [:failed id epoch message] [st]
+    (if (active-run? st id epoch)
+      (let [x (-> (get-in st [:runs id :snapshot])
+                  (assoc :status :failed :error message :updated-at (now))
+                  (update :turns conj {:role "check" :text message}))]
+        (publish! x)
+        (noreply (assoc-in st [:runs id :snapshot] x)))
+      (noreply st)))
+  (handle-info [:DOWN ref :process _pid reason] [st]
+    (let [hit (first (filter (fn [[_ run]] (= ref (:ref run))) (:runs st)))]
+      (if (and hit (not= reason :normal) (= :running (get-in (second hit) [:snapshot :status])))
+        (let [id (first hit)
+              x (assoc (:snapshot (second hit)) :status :failed :error "Generation worker exited before completion.")]
+          (publish! x)
+          (noreply (assoc-in st [:runs id :snapshot] x)))
+        (noreply st)))))
+
+(super/defsupervisor generation-tree
+  (strategy :one-for-one)
+  (intensity 3 5000)
+  (child :generation generation-owner nil {:name :play-generation}))
+
+(defn- ensure-owner! []
+  (or (Process/whereis :play-generation)
+      (do (try (start generation-tree) (catch _e nil))
+          (or (Process/whereis :play-generation)
+              (fail! "Could not start the generation owner." {})))))
+
+(defn use!
+  "Bind the no-ceremony gen/ns context in THIS evaluation environment."
+  [w source]
+  (source-path! w source)
+  (BeamLisp.Env/intern "play.context" "generation" {:workspace w :source-path source})
+  {:workspace w :source-path source})
+
+(defn ns
+  "Start a bounded generation and return its experience immediately.
+   Default is the deterministic demo provider. Use explicit :deepseek to opt in."
+  ([prompt]
+   (let [context (try (BeamLisp.Env/fetch! "play.context" "generation") (catch _e nil))]
+     (when-not context (fail! "First call (gen/use! workspace \"src/playground.bl\")." {}))
+     (play.gen/ns (:workspace context) (:source-path context) prompt {})))
+  ([w source prompt] (play.gen/ns w source prompt {}))
+  ([w source prompt opts]
+   (when-not (and (string? prompt) (seq (String/trim prompt)))
+     (fail! "Tell the generator what you would like to build." {}))
+   (when-not (File/regular? (source-path! w source))
+     (fail! "Save the owning source file before generating a durable version." {}))
+   (let [x {:kind :experience :root (:root w) :id (new-id)
+            :source-path source :prompt prompt :status :queued
+            :turns [] :versions [] :proposal nil :error nil :created-at (now)}
+         result (call (ensure-owner!) [:start x opts])]
+     (if (:ok result) (:ok result) (fail! (:error result) {})))))
+
+(defn await!
+  "Wait for a terminal experience snapshot; a timeout never pretends success."
+  [x timeout-ms]
+  (let [until (+ (erlang/monotonic_time :millisecond) timeout-ms)]
+    (loop []
+      (let [snapshot (ws/snapshot x)]
+        (cond
+          (contains? #{:ready :failed :cancelled} (:status snapshot)) snapshot
+          (>= (erlang/monotonic_time :millisecond) until) (fail! "Still running; inspect or cancel the experience." {:experience x})
+          :else (do (Process/sleep 25) (recur)))))))
+
+(defn turns [x] (:turns (ws/snapshot x)))
+(defn versions [x] (:versions (ws/snapshot x)))
+(defn proposal [x] (:proposal (ws/snapshot x)))
+(defn cancel! [x]
+  (call (ensure-owner!) [:cancel (tuple (:root x) (:id x))])
+  (ws/snapshot x))
+
+(defn refine! [x prompt]
+  (when-not (and (string? prompt) (seq (String/trim prompt)))
+    (fail! "A follow-up needs a prompt." {}))
+  (let [snapshot (ws/snapshot x)]
+    (when (= :running (:status snapshot)) (fail! "Cancel or finish the current turn before refining." {}))
+    (let [result (call (ensure-owner!) [:start (assoc snapshot :prompt prompt)
+                                      {:provider (:provider snapshot) :ns (:target-ns snapshot)}])]
+      (if (:ok result) (:ok result) (fail! (:error result) {})))))
+
+(defn accept!
+  "Save the verified source proposal BEFORE advancing the accepted ledger pointer.
+   The prototype uses two durable writes, not a crash-atomic cross-file commit."
+  [x]
+  (let [snapshot (ws/snapshot x)
+        p (:proposal snapshot)]
+    (when-not (and p (= :ready (:status snapshot)))
+      (fail! "There is no ready proposal to accept. Finish or cancel the active turn first." {}))
+    (ws/save! p)
+    (let [updated (assoc snapshot :accepted p)]
+      (publish! updated)
+      updated)))
+
+(defn restore!
+  "Restore persisted conversation data. Does not call a provider or replay code."
+  [w source]
+  (let [ledger (read-ledger (cache-path w source))
+        local-handle (fn [h] (when h (assoc h :root (:root w))))]
+    (vec
+      (for [[_ stored] (:experiences ledger)]
+        (let [x (assoc stored :root (:root w) :source-path source
+                             :proposal (local-handle (:proposal stored))
+                             :accepted (local-handle (:accepted stored))
+                             :versions (mapv local-handle (:versions stored)))
+              x (if (contains? #{:running :queued} (:status x))
+                  (assoc x :status :failed :error "The previous run was interrupted. Start a new turn explicitly.") x)]
+          (ws/remember! w x)
+          (handle x))))))

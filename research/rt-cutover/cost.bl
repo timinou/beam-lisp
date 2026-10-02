@@ -1,0 +1,316 @@
+; rt/cost.bl — the census' second question: not "what does this cost to NAME",
+; but "how does the cost GROW".
+;
+; census.bl answers "which functions re-resolve a variable per iteration" by
+; looking for `:global` inside a loop. That is a constant-factor question. This
+; asks the asymptotic one, and it is answerable from the same IR for the same
+; reason: the compiler already decided what every call IS.
+;
+; THE LATTICE. Every function gets a work class in its collection argument:
+;
+;     0   constant        no iteration, calls nothing that is not constant
+;     1   linear          iterates with a constant body
+;     2   quadratic       iterates over something linear
+;     3   worse           iterates over a quadratic
+;
+; class(f) = (iterates? f ? 1 : 0) + max class of the functions f calls,
+; computed over the CONDENSATION of the call graph. Mutual recursion is one
+; unit of work, not a chain of them — `k-first` calls `k-seq` which calls
+; `k-first`, and a rule of the form "1 + the callee" has no value around that
+; loop. Collapsing each strongly connected component first is what makes the
+; answer exist, and exist independently of the order names are visited in.
+;
+; THE FINDING is a call to a class>=1 function on an argument that does NOT
+; change across a loop's iterations — a factor of n the loop did not have to
+; pay. `wasteful` in the fixture is the shape; so was the first `seq-cmp`,
+; which realized both sides into lists on every element.
+;
+; WHAT THIS IS NOT: a proof, and not a substitute for measuring. The argument
+; check is textual — a caller that reaches a loop variable through a temp is
+; read as invariant, so this over-reports in that direction — and the host work
+; table is a list of known-linear calls, not a law. Every finding is a
+; candidate to be measured, and the FIXTURE at the top of the sweep is what
+; keeps the instrument honest: a run that cannot flag `wasteful` has found
+; nothing, and saying so is the only useful thing it can do.
+
+(ns rt.cost
+  (:require [system.analyze :as an]
+            [system.ir :as ir]))
+
+(def files
+  [;; the instrument's own test first: its findings are known by construction, so
+   ;; a run can be judged instead of believed.
+   "research/rt-cutover/rt-cost-fixture.bl"
+   "research/rt-cutover/rt/raw.bl"
+   "research/rt-cutover/rt/kind.bl"
+   "research/rt-cutover/rt/seq.bl"
+   "research/rt-cutover/rt/eq.bl"
+   "research/rt-cutover/rt/key.bl"
+   "research/rt-cutover/rt/number.bl"
+   "research/rt-cutover/rt/reduce.bl"])
+
+;; ── generic traversal over ir/child-nodes ──────────────────────────────────
+
+(defn- collect [n pred]
+  (cond
+    (not (ir/node? n)) ()
+    :else (concat
+            (if (pred n) (list n) ())
+            (mapcat (fn [c] (collect c pred)) (ir/child-nodes n)))))
+
+(defn- any-node? [n pred] (erlang/> (count (collect n pred)) 0))
+
+;; ── call nodes ─────────────────────────────────────────────────────────────
+; A call is an :apply (the callee is a value) or a :remote (the callee is named
+; by mod/fun). A call to a DEFINED function compiles to `RT.invoke` with the
+; function as its FIRST argument — the callee is in the argument list, not in
+; the node. Reading only the node reported every call as a call to `invoke`,
+; which made every callee in the runtime invisible.
+
+(defn- call? [n]
+  (and (erlang/is_map n)
+       (or (erlang/== (:op n) :apply) (erlang/== (:op n) :remote))))
+
+(defn- calls [n] (collect n call?))
+
+(defn- args-of [c] (let [a (:args c)] (cond (ir/node? a) (list a) :else (if (nil? a) () a))))
+
+(defn- call-target [c]
+  (let [as (args-of c)
+        head (first as)]
+    (cond
+      (erlang/== (:op c) :remote)
+      (let [m (str (:mod c)) f (str (:fun c))]
+        (cond
+          (and (erlang/== m "Elixir.BeamLisp.RT") (erlang/== f "invoke")
+               (ir/node? head) (erlang/== (:op head) :global))
+          {:key (str (:name head)) :args (rest as)}
+
+          (erlang/== m "erlang") {:key (str "erlang/" f) :args as}
+          :else {:key (str m "/" f) :args as}))
+
+      (and (erlang/== (:op c) :apply) (ir/node? (:fn c))
+           (erlang/== (:op (:fn c)) :var))
+      {:key (str (:name (:fn c))) :args as}
+
+      (and (erlang/== (:op c) :apply) (ir/node? (:fn c))
+           (erlang/== (:op (:fn c)) :global))
+      {:key (str (:ns (:fn c)) "/" (:name (:fn c))) :args as}
+
+      :else {:key nil :args as})))
+
+;; ── loops ──────────────────────────────────────────────────────────────────
+; `loop`/`recur` compiles to a :let binding a local fn that its own body
+; applies by name. The iterations run the innermost clause body; the names that
+; vary are that clause's `:pats` (NOT `:params`, which does not exist — reading
+; the wrong key reported every loop as carrying nothing, which turned a
+; shrinking walk into a false quadratic).
+
+(defn- loop-span [n]
+  (and (erlang/== (:op n) :let)
+       (let [b (:body n)]
+         (and (ir/node? b) (erlang/== (:op b) :apply)
+              (ir/node? (:fn b)) (erlang/== (:op (:fn b)) :var)
+              (erlang/== (str (:name (:fn b))) (str (:name n)))))))
+
+(defn- innermost-fn-body [n]
+  (cond
+    (and (ir/node? n) (erlang/== (:op n) :fn))
+    (let [b (:body (first (:clauses n)))]
+      (cond (and (ir/node? b) (erlang/== (:op b) :fn)) (innermost-fn-body b)
+            :else b))
+    :else nil))
+
+(defn- body-of-loop [n] (innermost-fn-body (:init n)))
+
+(defn- chain-pats [n]
+  (cond
+    (and (ir/node? n) (erlang/== (:op n) :fn))
+    (let [cl (first (:clauses n))
+          b (:body cl)]
+      (concat (map (fn [p] (:name p)) (or (:pats cl) ()))
+              (if (ir/node? b) (chain-pats b) ())))
+    :else ()))
+
+(defn- loop-params [n] (chain-pats (:init n)))
+
+(defn- loop-names-in [body]
+  (set (map (fn [l] (str (:name l))) (collect body loop-span))))
+
+(defn- self-call? [loop-name c]
+  (and (erlang/== (:op c) :apply)
+       (ir/node? (:fn c))
+       (erlang/== (:op (:fn c)) :var)
+       (erlang/== (str (:name (:fn c))) (str loop-name))))
+
+;; ── host work: a TABLE, because it is a fact about the host, not about us ──
+; Anything not listed is assumed constant in its arguments, which can only HIDE
+; a finding, never invent one.
+
+(def linear-remote
+  #{"erlang/append" "erlang/reverse" "erlang/sort" "erlang/length" "erlang/flatten"
+    "erlang/list_to_binary" "erlang/binary_to_list" "erlang/tuple_to_list"
+    "BeamLisp.Vector/to_list" "BeamLisp.Vector/from_list" "BeamLisp.Vector/conj"
+    "BeamLisp.Set/to_list" "BeamLisp.Set/new" "BeamLisp.Sorted/set_to_list"
+    "BeamLisp.LazySeq/to_list" "BeamLisp.RT/apply" "BeamLisp.RT/to_list"})
+
+;; ── the work class ─────────────────────────────────────────────────────────
+
+(defn- iterates?
+  "A `loop`, or a call to its own name — a function that calls itself recurses
+   just as surely as one whose `recur` compiles to a loop."
+  [bodies name]
+  (let [node (get bodies name)
+        lnames (loop-names-in (:body node))
+        self? (erlang/> (count (filter (fn [c] (erlang/== (str (:key (call-target c))) (str name)))
+                                       (calls (:body node))))
+                        0)]
+    (or (erlang/> (count lnames) 0) self?)))
+
+(defn- callee-set [node]
+  (set (map (fn [c] (str (:key (call-target c)))) (calls (:body node)))))
+
+(defn- reach-table
+  "name -> every name it can reach, transitively."
+  [callees]
+  (loop [r (reduce (fn [m n] (assoc m n (set (callees n)))) {} (keys callees))
+         pass 0]
+    (cond
+      (erlang/> pass 40) r
+      :else
+      (let [next (reduce (fn [m n]
+                           (assoc m n (reduce (fn [s c] (into s (get r c #{})))
+                                              (get r n #{})
+                                              (get r n #{}))))
+                         {} (keys r))]
+        (cond (erlang/== next r) r
+              :else (recur next (erlang/+ pass 1)))))))
+
+(defn- component-of
+  "The strongly connected component of `name`: every name it reaches that also
+   reaches it."
+  [reach name]
+  (sort (conj (set (filter (fn [y] (contains? (get reach y #{}) name)) (get reach name #{})))
+              name)))
+
+(defn- class-table [bodies]
+  (let [names (into [] (keys bodies))
+        callees (reduce (fn [m n] (assoc m n (callee-set (get bodies n)))) {} names)
+        reach (reach-table callees)
+        cid (fn [n] (str (component-of reach n)))
+        citer (reduce (fn [m n] (assoc m (cid n) (or (get m (cid n) false) (iterates? bodies n))))
+                      {} names)
+        cedges (reduce (fn [m n]
+                         (let [id (cid n)]
+                           (assoc m id (into (get m id #{})
+                                             (set (map cid
+                                                       (filter (fn [c] (and (contains? bodies c)
+                                                                            (not (erlang/== (cid c) id))))
+                                                               (callees n))))))))
+                       {} names)
+        cc (loop [cc {} pass 0]
+             (cond
+               (erlang/> pass 6) cc
+               :else
+               (let [next (reduce (fn [acc id]
+                                    (let [inner (reduce (fn [best c] (let [v (get cc c 0)]
+                                                                      (if (erlang/> v best) v best)))
+                                                        0 (get cedges id #{}))
+                                          base (cond (get citer id false) (erlang/+ 1 inner)
+                                                     :else inner)
+                                          v (cond (erlang/> base 3) 3 :else base)]
+                                      (assoc acc id v)))
+                                  {} (keys citer))]
+                 (cond (erlang/== next cc) cc
+                       :else (recur next (erlang/+ pass 1))))))]
+    (reduce (fn [m n] (assoc m n (get cc (cid n) 0))) {} names)))
+
+(defn- class-of-call [classes c]
+  (let [k (:key (call-target c))]
+    (cond
+      (nil? k) 0
+      (contains? linear-remote k) 1
+      (contains? classes k) (get classes k)
+      :else 0)))
+
+;; ── loop-invariant arguments ───────────────────────────────────────────────
+
+(defn- mentions? [n params]
+  (any-node? n (fn [x] (and (erlang/== (:op x) :var)
+                            (contains? (set params) (:name x))))))
+
+(defn- invariant-call? [c params]
+  (not (some (fn [a] (mentions? a params)) (:args (call-target c)))))
+
+(defn- quadratic-findings [name fnode classes]
+  (let [body (:body fnode)
+        loops (collect body loop-span)]
+    (mapcat
+      (fn [l]
+        (let [lname (:name l)
+              params (loop-params l)
+              scope (body-of-loop l)
+              cs (filter (fn [c] (not (self-call? lname c))) (calls scope))]
+          (map (fn [c] {:fn name :callee (:key (call-target c)) :class (class-of-call classes c)
+                        :carried (count params)})
+               (filter (fn [c] (and (erlang/>= (class-of-call classes c) 1)
+                                    (invariant-call? c params)))
+                       cs))))
+      loops)))
+
+;; ── report ─────────────────────────────────────────────────────────────────
+
+(def debug?
+  "Per-definition counters. Off by default — the census' output is the findings,
+   and a clean run must read as clean."
+  false)
+
+(defn- global-bodies
+  "ONE table of every definition in the sweep. A per-file table could not answer
+   for a call that crosses a file — `k-first` lives in seq.bl and the `kind` it
+   asks about lives in kind.bl — and every such callee read as constant, which
+   is the direction that HIDES findings."
+  []
+  (reduce (fn [m p] (merge m (an/fn-bodies (File/read! p)))) {} files))
+
+(defn- report [path classes]
+  (let [src (File/read! path)
+        bodies (an/fn-bodies src)
+        rows (map (fn [n] {:name n :class (get classes n)}) (keys bodies))
+        by-class (group-by (fn [r] (:class r)) rows)
+        worst (filter (fn [r] (erlang/> (:class r) 1)) rows)]
+    (println (str "─── » " path "  (" (count rows) " definitions)"))
+    (cond
+      debug?
+      (doseq [n (sort (keys bodies))]
+        (let [b (:body (get bodies n))]
+          (println (str "      " n
+                        "  lets=" (count (collect b (fn [x] (erlang/== (:op x) :let))))
+                        "  loops=" (count (collect b loop-span))
+                        "  lnames=" (loop-names-in b)
+                        "  calls=" (count (calls b))
+                        "  class=" (get classes n)))))
+      :else nil)
+    (println (str "   work class: " (count (get by-class 0)) " constant, "
+                  (count (get by-class 1)) " linear, "
+                  (count (get by-class 2)) " quadratic, "
+                  (count (get by-class 3)) " worse"))
+    (doseq [r (sort-by (fn [r] (erlang/- 0 (:class r))) worst)]
+      (println (str "   class " (:class r) "  " (:name r))))
+    (let [findings (mapcat (fn [n] (quadratic-findings n (get bodies n) classes))
+                           (keys bodies))]
+      (cond
+        (erlang/> (count findings) 0)
+        (do (println (str "   QUADRATIC-shaped: " (count findings)
+                          " loop-invariant call(s) to a non-constant function"))
+            (doseq [f findings]
+              (println (str "        in " (:fn f) "  ->  " (:callee f)
+                            "  (class " (:class f) ", " (:carried f) " carried)"))))
+        :else (println "   no loop-invariant non-constant calls")))))
+
+(defn run []
+  (let [classes (class-table (global-bodies))]
+    (doseq [f files] (report f classes)))
+  (println "done"))
+
+(run)

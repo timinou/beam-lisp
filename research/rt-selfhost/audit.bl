@@ -1,0 +1,191 @@
+; audit.bl — static module-import closure for the rt-selfhost experiment.
+;
+; Port of the former audit.escript (removed): read each module's import chunk
+; with beam_lib, index the generated beams plus the AOT kernel beams, then walk
+; the static module-import closure with cycle tracking. The result is
+; conservative at MODULE granularity — it does not prove that every operation
+; invokes every module it imports. Dynamic Env lookups, apply/3 and callback
+; targets are NOT captured; see the LIMIT line, retained verbatim.
+;
+; Run from the repository root:
+;   BL_NO_LOCK=1 KRT_OUT=/tmp/rt-selfhost-execution \
+;     bin/bl -p research/rt-selfhost run research/rt-selfhost/audit.bl
+;
+; KRT_OUT   generated + AOT root (default /tmp/rt-selfhost-execution)
+; KRT_AOT   AOT module directory   (default $KRT_OUT/aot)
+;
+; The run PRINTS the report and SAVES it to $KRT_OUT/dependencies.txt. It exits
+; non-zero (throws) when the closure contracts do not hold:
+;   * Elixir.Krt.Intrinsics is present and reaches no Elixir.BeamLisp.RT;
+;   * at least one kernel root reaches RT transitively.
+; A report is written before the contracts are asserted, so a failing run still
+; leaves the snapshot behind.
+(ns krt.audit)
+
+(def out-dir (or (System/get_env "KRT_OUT") "/tmp/rt-selfhost-execution"))
+(def aot-dir (or (System/get_env "KRT_AOT") (str out-dir "/aot")))
+(def paths-file (str out-dir "/code-paths.etf"))
+(def report-file (str out-dir "/dependencies.txt"))
+
+(def limit-line
+  "LIMIT: static imports only; Env lookups, apply/3 and callback targets remain dynamic obligations.\n")
+
+(defn- charlist [s] (erlang/binary_to_list s))
+(defn- fmt [f args] (erlang/iolist_to_binary (io_lib/format f args)))
+(defn- emit! [s] (io/put_chars s) s)
+
+; Restore the code paths a generation run saved, so the code:get_object_code
+; fallback below can resolve modules that live in neither $KRT_OUT nor $KRT_AOT.
+; Optional: absent (or unreadable) is not an error.
+(when (File/exists? paths-file)
+  (code/add_pathsz (erlang/binary_to_term (File/read! paths-file))))
+
+; ── identities ───────────────────────────────────────────────────────────────
+; ROOT prefixes and the host filter are EXACTLY the ones the escript used.
+
+(defn- prefix? [p m] (lists/prefix (charlist p) (erlang/atom_to_list m)))
+(defn- root? [m]
+  (or (prefix? "Elixir.Krt." m)
+      (prefix? "Elixir.BeamLisp.Ns.Body.Krt." m)
+      (prefix? "Elixir.BeamLisp.Ns.Krt." m)))
+(defn- host? [m] (or (prefix? "Elixir.BeamLisp." m) (root? m)))
+
+; ── indexing ─────────────────────────────────────────────────────────────────
+
+(defn- wild [pat] (to-list (filelib/wildcard (charlist pat))))
+
+(def files
+  (lists/usort
+    (to-list (concat (wild (str out-dir "/*.beam"))
+                     (concat (wild (str aot-dir "/**/*.beam"))
+                             (wild (str aot-dir "/*.beam")))))))
+
+(defn- chunk-imports [file]
+  (let [r (beam_lib/chunks file (list :imports))]
+    (if (= :ok (elem r 0))
+      (tuple (elem (elem r 1) 0)
+             (elem (first (to-list (elem (elem r 1) 1))) 1))
+      nil)))
+
+(def index
+  (reduce (fn [acc f]
+            (let [c (chunk-imports f)]
+              (if (nil? c) acc
+                (maps/put (elem c 0) {:file f :imports (elem c 1)} acc))))
+          {} files))
+
+; A module outside the index: ask the running BL VM (code:get_object_code).
+(defn- imports-of [m]
+  (if (contains? index m)
+    (:imports (get index m))
+    (let [oc (code/get_object_code m)]
+      (if (and (erlang/is_tuple oc) (= m (elem oc 0)))
+        (let [r (beam_lib/chunks (elem oc 1) (list :imports))]
+          (if (= :ok (elem r 0))
+            (elem (first (to-list (elem (elem r 1) 1))) 1)
+            :unresolved))
+        :unresolved))))
+
+; ── the closure walk (BFS; the Seen map is the cycle guard) ──────────────────
+
+(defn- path-rev [path] (to-list (lists/reverse (to-list path))))
+
+; The host-filtered successors of `is`, each carrying its extended path,
+; appended after the remaining queue.
+(defn- extend-queue [tail is path]
+  (let [deps (lists/usort
+               (to-list (filter host? (map (fn [i] (elem i 0)) (to-list is)))))
+        nxt (map (fn [d] (tuple d (cons d path))) deps)]
+    (to-list (concat tail nxt))))
+
+(defn- walk [root]
+  (loop [queue (list (tuple root (list root)))
+         seen {}
+         lines []
+         rt []
+         unres []]
+    (if (empty? queue)
+      {:lines lines :rt rt :unresolved unres}
+      (let [pair (first queue)
+            m (elem pair 0)
+            path (elem pair 1)
+            tail (to-list (rest queue))]
+        (if (contains? seen m)
+          (recur tail seen lines rt unres)
+          (let [seen (assoc seen m true)
+                is (imports-of m)]
+            (cond
+              (= m :Elixir.BeamLisp.RT)
+                (let [rev (path-rev path)]
+                  (recur tail seen
+                         (conj lines (fmt "  RT-PATH ~p~n" (list rev)))
+                         (conj rt rev) unres))
+
+              (= is :unresolved)
+                (let [rev (path-rev path)]
+                  (recur tail seen
+                         (conj lines (fmt "  UNRESOLVED ~p~n" (list rev)))
+                         rt (conj unres rev)))
+
+              :else
+                (recur (extend-queue tail is path) seen lines rt unres))))))))
+
+; ── run ──────────────────────────────────────────────────────────────────────
+
+(def roots (lists/sort (to-list (filter root? (to-list (maps/keys index))))))
+(when (empty? roots)
+  (throw (ex-info "no kernel beams" {:out-dir out-dir :aot-dir aot-dir
+                                     :indexed (count (to-list (maps/keys index)))})))
+
+(def scan
+  (loop [rs (to-list roots) lines [] results []]
+    (if (empty? rs)
+      {:lines lines :results results}
+      (let [m (first rs)
+            is (:imports (get index m))
+            root-line (fmt "ROOT ~p DIRECT ~p~n" (list m is))
+            w (walk m)
+            wlines (to-list (:lines w))]
+        (emit! root-line)
+        (doseq [l wlines] (emit! l))
+        (recur (to-list (rest rs))
+               (into lines (cons root-line wlines))
+               (conj results {:module m
+                              :direct is
+                              :rt (to-list (:rt w))
+                              :unresolved (to-list (:unresolved w))}))))))
+
+(def results (to-list (:results scan)))
+(def total-rt (reduce (fn [a r] (+ a (count (:rt r)))) 0 results))
+(def total-unres (reduce (fn [a r] (+ a (count (:unresolved r)))) 0 results))
+(def summary-line
+  (str "SUMMARY roots=" (count results) " rt-paths=" total-rt
+       " unresolved-paths=" total-unres "\n"))
+
+(File/write! report-file (join "" (to-list (concat (:lines scan) (list limit-line summary-line)))))
+(emit! limit-line)
+(emit! summary-line)
+
+; ── contracts (non-zero exit on violation) ───────────────────────────────────
+
+(def intrinsic :Elixir.Krt.Intrinsics)
+(when-not (contains? index intrinsic)
+  (throw (ex-info "expected generated intrinsic module is missing"
+                  {:module intrinsic
+                   :indexed (count (to-list (maps/keys index)))
+                   :out-dir out-dir})))
+
+(def by-module
+  (reduce (fn [acc r] (assoc acc (:module r) r)) {} results))
+
+(when-not (empty? (:rt (get by-module intrinsic)))
+  (throw (ex-info "intrinsic reaches RT" {:module intrinsic
+                                          :paths (:rt (get by-module intrinsic))})))
+
+(def rt-roots (filter (fn [r] (not (empty? (:rt r)))) results))
+(when (empty? rt-roots)
+  (throw (ex-info "no root reaches RT transitively" {:roots (count results)})))
+
+(println (str "PASS static closure: intrinsic " intrinsic " reaches no RT; "
+              (count (to-list rt-roots)) " of " (count results)
+              " roots reach RT; report " report-file))

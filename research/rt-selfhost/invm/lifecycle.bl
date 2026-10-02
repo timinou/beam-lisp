@@ -1,0 +1,591 @@
+; lifecycle.bl — the resource-lifecycle contract of the in-VM NIF kernel bridge.
+;
+; WHAT THIS IS. `(invm.lifecycle/run ir-path)` drives the *lifecycle* half of the
+; PLAN-141 comparison: not throughput, but what a compiled kernel RESOURCE
+; promises about its own code. Everything here is beam-lisp; there is no shell,
+; no Elixir, no Python, and no host driver. The only non-BL things this file
+; touches are:
+;
+;   fusion.invm   the NIF namespace MAIN declares before this module is loaded.
+;                 kernel-compile[ir-string] → resource (dirty)
+;                 kernel-call[resource bin u64] → u64 (regular, ≤4096 B)
+;                 kernel-call-dirty[resource bin u64] → u64 (dirty, ≤1 MiB)
+;                 kernel-close[resource] → bool
+;                 kernel-noop[bin u64] / kernel-noop-dirty[bin u64] → init
+;   invm.host     MAIN's loader/normalizer: stats → {:created :live :freed
+;                 :inflight}, optionally a reload helper.
+;   fusion.pipeline  the BL/RT reference for the frozen byte fold
+;                 (`rt-run`), used here as the independent oracle for values.
+;                 This module never runs the generator and never installs the
+;                 generated BEAM — the reference is enough.
+;
+; WHAT IT CHECKS, and why each is a distinct claim:
+;
+;   1. COMPILE. One `kernel-compile` of the descriptor's own IR text returns an
+;      opaque resource and moves `:created`/`:live` by exactly one each.
+;   2. CONCURRENT CALLS AGREE. N callers on the dirty path, each with its own
+;      input, every value equal to the BL reference. Agreement between callers,
+;      not between two implementations of the fold.
+;   3. ACTIVE CALLS RETAIN CODE ACROSS CLOSE. An in-flight call is *observed*
+;      (`:inflight ≥ 1`, polled) and the kernel is closed underneath it; the
+;      call must still return the correct value. New calls afterwards must throw.
+;   4. CLOSE IS IDEMPOTENT. A second close returns false and the resource
+;      stays unusable, matching the native host's explicit contract.
+;   5. DROPPED RESOURCE FREES. A worker compiles its own kernel and exits without
+;      closing it; `:freed` must eventually rise and `:live` must fall back.
+;      This is the finalizer, not the close.
+;   6. KILLED DIRTY CALLER. A worker looping dirty calls is observed in flight,
+;      killed, and its `:DOWN` is read. `:inflight` must drain and the worker's
+;      resource must free. This file does NOT claim the dirty call was
+;      interrupted — a dirty NIF runs to completion; only the *process* dies.
+;   7. REFUSALS. Closed resources, forged resources, wrong argument types, and
+;      out-of-bounds inputs all throw, on both the regular and dirty paths.
+;   8. RELOAD/PURGE. Only `Elixir.BeamLisp.Native.Fusion.Invm` may be reloaded,
+;      and only through a helper MAIN exposes. If no zero-argument helper is
+;      exported this module reports the scenario UNTESTED (see `:untested`) and
+;      does not pretend otherwise — it never purges a module itself.
+;
+; BOUNDED, NO ORPHANS. Every wait has an explicit deadline; every child is
+; monitored; every monitor is flushed; a deadline that expires kills its
+; children and throws. `run` throws on the first failed check.
+;
+; PUBLIC
+;   (invm.lifecycle/run ir-path) → evidence map. `ir-path` is the path to the
+;   descriptor's native IR text (fusion.pipeline/native-ir, e.g.
+;   <out>/pipeline.ir).
+
+(ns invm.lifecycle)
+
+;; ── constants ───────────────────────────────────────────────────────────────
+
+(def U64 18446744073709551615)
+(def REGULAR-BYTES 4096)          ; the regular-call admission cap
+(def BIG-BYTES 1048576)           ; the dirty-call admission cap (1 MiB)
+(def CONCURRENCY 4)               ; callers per concurrent phase
+(def POLL-DEADLINE-MS 15000)      ; generous: stats transitions are event-driven
+(def CALL-DEADLINE-MS 30000)      ; one caller's whole call may wait on a queue
+(def TALLY-KEY :invm-lifecycle-checks)
+(def HOST-MOD :Elixir.BeamLisp.Native.Fusion.Invm)
+(def INVMBL-MOD :Elixir.BeamLisp.Ns.Invm.Host)
+
+;; ── assertions, tallied like fusion.driver ──────────────────────────────────
+
+(defn- reset-tally! []
+  (erlang/put TALLY-KEY {})
+  0)
+
+(defn- tally! [kind]
+  (let [counts (erlang/get TALLY-KEY)
+        n (erlang/+ 1 (get counts kind 0))]
+    (erlang/put TALLY-KEY (assoc counts kind n))
+    n))
+
+(defn- tally-count []
+  (let [counts (erlang/get TALLY-KEY)]
+    (assoc counts :total
+           (reduce (fn [a k] (erlang/+ a (get counts k))) 0 (keys counts)))))
+
+(defn check!
+  "A contract assertion: tallied, and thrown on every mismatch. A non-boolean
+   truthy value fails too, so nothing is silently accepted."
+  [kind label ok]
+  (tally! kind)
+  (when (not (erlang/== true ok))
+    (throw (ex-info (str "invm.lifecycle: assertion failed: " label)
+                    {:label label :kind kind :actual ok})))
+  true)
+
+(defn- refuses?
+  "True when `f` throws. The refusal itself is the claim; the reason text
+   belongs to whoever refused, so it is not inspected here."
+  [f]
+  (try (do (f) false) (catch _ true)))
+
+;; ── host observations ───────────────────────────────────────────────────────
+
+(defn- stats [] (invm.host/stats))
+(defn- sget [s k] (get s k 0))
+(defn- mono-ms [] (erlang/monotonic_time :millisecond))
+(defn- mono-us [] (erlang/monotonic_time :microsecond))
+(defn- sleep-ms [n]
+  (let [args (list n)]
+    (erlang/apply :timer :sleep args)))
+
+(defn- poll-stat
+  "Poll `stats` until `(pred s)` holds or `deadline-ms` elapse. Returns
+   `{:observed bool :polls n :ms elapsed :stats s}`. The 1 ms gap keeps a long
+   wait from burning a scheduler; every transition this file waits on is slower
+   than that (a finalizer, or a ≥2 ms kernel call)."
+  [pred deadline-ms]
+  (let [t0 (mono-ms)]
+    (loop [n 0]
+      (let [s (stats)
+            elapsed (erlang/- (mono-ms) t0)]
+        (cond
+          (pred s) {:observed true :polls (erlang/+ n 1) :ms elapsed :stats s}
+          (erlang/>= elapsed deadline-ms)
+            {:observed false :polls (erlang/+ n 1) :ms elapsed :stats s}
+          :else (do (sleep-ms 1) (recur (erlang/+ n 1))))))))
+
+;; ── fixtures ────────────────────────────────────────────────────────────────
+
+(defn- pattern
+  "A deterministic byte spread — a stand-in for a random sample that needs no
+   RNG (and therefore no VM-version dependence)."
+  [n]
+  (loop [i 0 acc (list)]
+    (if (erlang/< i n)
+      (recur (erlang/+ i 1) (cons (erlang/rem (erlang/* i 37) 256) acc))
+      (erlang/list_to_binary (reverse acc)))))
+
+;; ── callers: one call each, one result message each ─────────────────────────
+
+(defn- demonitor-pid! [workers pid]
+  (let [hit (first (filter (fn [w] (erlang/== (first w) pid)) workers))]
+    (when (some? hit) (erlang/demonitor (second hit) (list :flush)))))
+
+(defn- call-until-close
+  "Keep a bounded stream active until the parent closes the handle. A single
+   millisecond-scale call can finish before an observer gets scheduled."
+  [res sp]
+  (let [started (mono-ms)]
+    (loop [completed 0 last-value nil]
+      (if (erlang/>= (erlang/- (mono-ms) started) CALL-DEADLINE-MS)
+        {:unexpected "close was not observed before the deadline"}
+        (let [result (try {:ok (fusion.invm/kernel-call-dirty res (:bin sp) (:init sp))}
+                          (catch e {:err (str e)}))]
+          (if (contains? result :ok)
+            (if (= (:expected sp) (:ok result))
+              (recur (erlang/+ completed 1) (:ok result))
+              {:unexpected (str "wrong kernel value " (:ok result))})
+            (if (erlang/> completed 0)
+              {:ok last-value :completed completed :closed true}
+              result)))))))
+
+(defn- spawn-callers
+  "Spawn `n` monitored callers. Each waits for `[:invm-call-go]`, runs ONE call
+   of `kind` (:dirty or :regular) on the shared resource for its spec, and sends
+   `[:call-result pid idx result]` where result is `{:ok v}` or `{:err text}`.
+   Returns `[[pid ref] …]`."
+  [parent res specs kind]
+  (mapv
+    (fn [sp]
+      (spawn-monitor
+        (fn []
+          (let [go (receive
+                     [:invm-call-go] :go
+                     (after CALL-DEADLINE-MS :no-go))]
+            (if (not (erlang/== go :go))
+              (erlang/send parent [:call-result (erlang/self) (:idx sp) {:err "caller never told to go"}])
+              (let [r (try
+                        (cond
+                          (erlang/== kind :dirty-until-close) (call-until-close res sp)
+                          (erlang/== kind :dirty) {:ok (fusion.invm/kernel-call-dirty res (:bin sp) (:init sp))}
+                          :else {:ok (fusion.invm/kernel-call res (:bin sp) (:init sp))})
+                        (catch e {:err (str e)}))]
+                (erlang/send parent [:call-result (erlang/self) (:idx sp) r])))))))
+    specs))
+
+(defn- go! [workers]
+  (doseq [w workers] (erlang/send (first w) [:invm-call-go]))
+  true)
+
+(defn- collect-callers
+  "Collect one result per caller, bounded by `deadline-ms`. A caller that exits
+   before reporting counts as an error (its DOWN arrives after any result it
+   sent, so a DOWN here is always a caller that did not report). On timeout every
+   caller is killed and the phase throws — no orphan is left behind."
+  [workers deadline-ms]
+  (let [t0 (mono-ms)]
+    (loop [n 0 results {} errors []]
+      (if (erlang/>= n (count workers))
+        {:results results :errors errors}
+        (let [left (erlang/- deadline-ms (erlang/- (mono-ms) t0))
+              m (receive
+                  [:call-result who idx r] [:done who idx r]
+                  [:DOWN ref :process p reason] [:down p reason]
+                  (after (if (erlang/< left 1) 1 left) :timeout))]
+          (cond
+            (erlang/== m :timeout)
+              (do (doseq [w workers] (erlang/exit (first w) :kill))
+                  (throw (ex-info "invm.lifecycle: callers did not finish before the deadline"
+                                  {:collected n :of (count workers)})))
+            (erlang/== (first m) :down)
+              (recur (erlang/+ n 1) results
+                     (conj errors (str "caller DOWN before reporting: " (pr-str m))))
+            :else
+              (let [who (second m)]
+                (demonitor-pid! workers who)
+                (recur (erlang/+ n 1) (assoc results (nth m 2) (nth m 3)) errors))))))))
+
+(defn- flush-callers! [workers]
+  (doseq [w workers]
+    (when (erlang/is_process_alive (first w)) (erlang/exit (first w) :kill))
+    (erlang/demonitor (second w) (list :flush)))
+  true)
+
+;; ── 2. concurrent dirty callers agree ───────────────────────────────────────
+
+(defn- spec [idx bin init] {:idx idx :bin bin :init init})
+
+(defn- agree-phase
+  "N concurrent dirty calls, one value check each. Returns
+   `{:sent n :ok n :wrong [..] :errors [..] :ms t}`."
+  [res specs counter]
+  (let [parent (erlang/self)
+        workers (spawn-callers parent res specs :dirty)
+        t0 (mono-ms)
+        _ (go! workers)]
+    (try
+      (let [got (collect-callers workers CALL-DEADLINE-MS)
+            ms (erlang/- (mono-ms) t0)
+            rows (into []
+                   (map (fn [sp]
+                          (let [r (get (:results got) (:idx sp))
+                                v (get r :ok)
+                                want (get counter (:idx sp))]
+                            (check! :concurrent
+                                    (str "dirty caller " (:idx sp) " agrees with the reference")
+                                    (and (some? r) (erlang/== true (contains? r :ok)) (erlang/== want v)))
+                            {:idx (:idx sp) :ok (erlang/== true (contains? r :ok)) :value v :expected want}))
+                        specs))]
+        {:sent (count specs)
+         :ok (count (filterv (fn [r] (erlang/== true (:ok r))) rows))
+         :rows rows
+         :errors (:errors got)
+         :ms ms})
+      (finally (flush-callers! workers)))))
+
+;; ── 3. active calls retain code across close ────────────────────────────────
+
+(defn- retain-phase
+  "Close the kernel while `CONCURRENCY` dirty calls are in flight, then require
+   that at least one in-flight call still returns the correct value.
+
+   The observed `:inflight ≥ 1` is what makes 'in flight' a measurement rather
+   than an assumption. A caller that had not yet entered the kernel when close
+   landed is refused (correctly) and is recorded, not counted as a failure — but
+   ZERO successful callers fails. Calls repeat until close to avoid mistaking a
+   missed short observation window for a resource failure; every value is
+   checked. Native unit tests separately hold an Arc deterministically across
+   close, so code lifetime does not depend on a timing-only argument."
+  [res specs counter]
+  (let [parent (erlang/self)
+        prepared (mapv (fn [sp] (assoc sp :expected (get counter (:idx sp)))) specs)
+        workers (spawn-callers parent res prepared :dirty-until-close)]
+    (go! workers)
+    (try
+     (let [obs (poll-stat (fn [s] (erlang/>= (sget s :inflight) 1)) POLL-DEADLINE-MS)
+          _ (check! :retain "an in-flight dirty call was observed before close" (:observed obs))
+          t-close (mono-us)
+          close-first (try {:ok (fusion.invm/kernel-close res)} (catch e {:err (str e)}))
+          _ (check! :retain "close during in-flight calls returns true"
+                    (erlang/== true (get close-first :ok)))
+          got (collect-callers workers CALL-DEADLINE-MS)
+          rows (into []
+                 (map (fn [sp]
+                        (let [r (get (:results got) (:idx sp))]
+                          {:idx (:idx sp)
+                           :kind (cond (contains? r :ok) :survived
+                                       (contains? r :unexpected) :unexpected
+                                       :else :refused)
+                           :value (get r :ok)
+                           :expected (get counter (:idx sp))
+                           :error (or (get r :err) (get r :unexpected))}))
+                      specs))
+          survived (filterv (fn [r] (erlang/== :survived (:kind r))) rows)
+          correct (filterv (fn [r] (erlang/== true (erlang/== (:expected r) (:value r)))) survived)]
+      (check! :retain "no caller failed unexpectedly"
+              (and (empty? (:errors got))
+                   (empty? (filterv (fn [r] (= :unexpected (:kind r))) rows))))
+      (check! :retain "active callers completed work across the shutdown sequence" (erlang/> (count survived) 0))
+      (check! :retain "every call that survived close returned the reference value"
+              (erlang/== (count survived) (count correct)))
+      {:observed-before-close (:observed obs)
+       :inflight-at-observation (:stats obs)
+       :close-first (get close-first :ok)
+       :close-ms (- (mono-ms) (quot t-close 1000))
+       :survived (count survived)
+       :correct (count correct)
+       :refused (erlang/- (count rows) (count survived))
+       :rows rows
+       :errors (:errors got)})
+     (finally (flush-callers! workers)))))
+
+;; ── 5. dropped resource frees ───────────────────────────────────────────────
+
+(defn- drop-phase
+  "A worker compiles its OWN kernel and exits without closing it. The finalizer
+   must fire: `:freed` rises and `:live` falls back to where it started. Process
+   teardown releases the worker's references; a parent GC is not what frees
+   them. Poll for the asynchronous destructor rather than relying on DOWN."
+  [ir]
+  (let [parent (erlang/self)
+        before (stats)
+        [pid mref] (spawn-monitor
+                     (fn []
+                       ;; NB: the resource is deliberately NOT sent to the parent —
+                       ;; a message carrying it would keep the last reference
+                       ;; alive and the finalizer would never run.
+                       (fusion.invm/kernel-compile ir)
+                       (erlang/send parent [:drop-compiled (erlang/self)])
+                       :done))
+        compiled (receive
+                   [:drop-compiled who] [:ok who]
+                   [:DOWN ref :process p reason] [:down p reason]
+                   (after CALL-DEADLINE-MS :timeout))
+        _ (check! :drop "the worker compiled its own kernel" (erlang/== :ok (first compiled)))
+        down (receive
+               [:DOWN ref :process _down-pid reason] :when (= ref mref) {:reason reason}
+               (after CALL-DEADLINE-MS :timeout))
+        _ (check! :drop "the worker exited after compiling" (erlang/== :normal (get down :reason)))
+        _ (erlang/demonitor mref (list :flush))
+        _ (erlang/garbage_collect)
+        obs (poll-stat (fn [s] (erlang/> (sget s :freed) (sget before :freed))) POLL-DEADLINE-MS)
+        after (stats)]
+    (check! :drop "the finalizer ran once the last reference was dropped" (:observed obs))
+    {:created-delta (erlang/- (sget after :created) (sget before :created))
+     :freed-delta (erlang/- (sget after :freed) (sget before :freed))
+     :live-before (sget before :live)
+     :live-after (sget after :live)
+     :polls (:polls obs)
+     :ms (:ms obs)}))
+
+;; ── 6. killed dirty caller ──────────────────────────────────────────────────
+
+(defn- kill-phase
+  "A worker compiles its own kernel and loops dirty calls. The parent observes
+   `:inflight ≥ 1`, kills the worker, and reads its DOWN. The claim is bounded to
+   what is observable: the process dies (DOWN `:killed`), `:inflight` drains, and
+   the worker's resource is freed. There is NO claim that a dirty NIF was
+   interrupted mid-call: DOWN can arrive before native execution finishes."
+  [ir bin init]
+  (let [parent (erlang/self)
+        before (stats)
+        [pid mref] (spawn-monitor
+                     (fn []
+                       (let [r (fusion.invm/kernel-compile ir)]
+                         (erlang/send parent [:kill-compiled (erlang/self)])
+                         (loop [i 0]
+                           (if (erlang/< i 1000000)
+                             (do (fusion.invm/kernel-call-dirty r bin init)
+                                 (recur (erlang/+ i 1)))
+                             :done)))))]
+    (try
+     (let [compiled (receive
+                      [:kill-compiled who] [:ok who]
+                      [:DOWN ref :process p reason] [:down p reason]
+                      (after CALL-DEADLINE-MS :timeout))
+           _ (check! :kill "the worker compiled its own kernel" (erlang/== :ok (first compiled)))
+           obs (poll-stat (fn [s] (erlang/>= (sget s :inflight) 1)) POLL-DEADLINE-MS)
+           _ (check! :kill "a dirty call was observed in flight before the kill" (:observed obs))
+           t-kill (mono-us)
+           _ (erlang/exit pid :kill)
+           down (receive
+                  ;; the pid is deliberately NOT kept: the evidence is written as
+                  ;; readable data (`pr-str`), and a #PID<> would not read back.
+                  [:DOWN ref :process _down-pid reason] :when (= ref mref)
+                    {:reason reason :kill-to-down-us (erlang/- (mono-us) t-kill)}
+                  (after CALL-DEADLINE-MS :timeout))
+           _ (check! :kill "the killed caller is reported DOWN with :killed"
+                     (erlang/== :killed (get down :reason)))
+           _ (erlang/demonitor mref (list :flush))
+           drained (poll-stat (fn [s] (erlang/== 0 (sget s :inflight))) POLL-DEADLINE-MS)
+           _ (check! :kill "in-flight calls drain to zero" (:observed drained))
+           freed (poll-stat (fn [s] (erlang/> (sget s :freed) (sget before :freed))) POLL-DEADLINE-MS)
+           _ (check! :kill "the killed worker's resource is eventually freed" (:observed freed))
+           after (stats)]
+       {:down down
+        :kill-to-down-us (get down :kill-to-down-us)
+        :inflight-before-close (sget (:stats obs) :inflight)
+        :drain-ms (:ms drained)
+        :freed-delta (erlang/- (sget after :freed) (sget before :freed))
+        :hard-interrupt-claimed false
+        :note "caller exit notification can precede native completion; native execution drains separately"})
+     (finally
+       (when (erlang/is_process_alive pid) (erlang/exit pid :kill))
+       (erlang/demonitor mref (list :flush))))))
+
+;; ── 8. reload/purge, only through a helper MAIN exposes ─────────────────────
+
+(defn- reload-phase
+  "Reload/purge of `Elixir.BeamLisp.Native.Fusion.Invm`, restricted to a helper
+   MAIN publishes. This module never calls `:code.purge` itself: purging is
+   VM-global and would take the bridge down for every other user of it.
+
+   If no zero-argument helper is exported the scenario is reported UNTESTED with
+   the exact need, rather than faked. `invm.host/load![app-root so-path]` carries
+   arguments this module does not have, so it does not count as available.
+
+   `invm.host/probe-reload!` is the real helper, and it refuses to run outside
+   the dedicated reload child (`INVM_MODE=reload`) BY ITS OWN DESIGN — it purges
+   a VM-global module. So in every other mode this reports UNTESTED with that
+   exact reason instead of triggering an assertion or pretending a pass."
+  [ir expect-small small-bin init]
+  (let [probe0? (erlang/function_exported INVMBL-MOD :probe-reload! 0)
+        reload0? (erlang/function_exported INVMBL-MOD :reload! 0)
+        load0? (erlang/function_exported INVMBL-MOD :load! 0)
+        load2? (erlang/function_exported INVMBL-MOD :load! 2)
+        mode (System/get_env "INVM_MODE")
+        helper (cond probe0? :probe-reload! reload0? :reload! load0? :load! :else nil)]
+    (cond
+      (nil? helper)
+        {:status :untested
+         :host-module (pr-str HOST-MOD)
+         :reason (str "no zero-argument reload helper exported by " (pr-str INVMBL-MOD)
+                      (if load2? "; load!/2 needs [app-root so-path], which this module does not have" ""))
+         :need "invm.host/reload![] (or probe-reload![])"}
+      (and (erlang/== helper :probe-reload!) (not (erlang/== mode "reload")))
+        {:status :untested
+         :host-module (pr-str HOST-MOD)
+         :reason (str "invm.host/probe-reload! purges only inside the dedicated reload child "
+                      "(INVM_MODE=reload; this run is " (pr-str mode) "), so no purge was attempted")
+         :need "run the reload scenario in the INVM_MODE=reload child"}
+      :else
+        (let [parent (erlang/self)
+              [pid mref] (spawn-monitor
+                           (fn []
+                             (erlang/send parent
+                                          [:reload-result (erlang/self)
+                                           (try {:ok (let [args (list)] (erlang/apply INVMBL-MOD helper args))}
+                                                (catch e {:err (str e)}))])))
+              r (receive
+                  [:reload-result who result] result
+                  [:DOWN ref :process _hpid reason] {:err (str "reload helper exited: " (pr-str reason))}
+                  (after CALL-DEADLINE-MS :timeout))]
+          (erlang/demonitor mref (list :flush))
+          (check! :reload "the reload helper returned without throwing"
+                  (erlang/== true (contains? r :ok)))
+          (let [post (try {:ok (fusion.invm/kernel-call (fusion.invm/kernel-compile ir) small-bin init)}
+                          (catch e {:err (str e)}))]
+            (check! :reload "the bridge still compiles and calls after the reload"
+                    (and (erlang/== true (contains? post :ok))
+                         (erlang/== expect-small (get post :ok))))
+            ;; the helper's raw return is folded to a string: it may carry a
+            ;; module atom or other value the evidence reader need not know.
+            {:status :reloaded :via (pr-str helper) :mode (pr-str mode)
+             :result (pr-str (get r :ok)) :post-value (get post :ok)})))))
+
+;; ── the entry point ─────────────────────────────────────────────────────────
+
+(defn run
+  "Drive the resource-lifecycle contract against the kernel compiled from the IR
+   text at `ir-path`. Returns the evidence map; throws on the first failed
+   check. Nothing is generated, installed or built here."
+  [ir-path]
+  (reset-tally!)
+  (let [t-start (mono-ms)
+        ir (File/read! ir-path)
+        _ (check! :input "the IR text is a non-empty binary"
+                  (and (erlang/is_binary ir) (erlang/> (erlang/byte_size ir) 0)))
+        reg (pattern REGULAR-BYTES)
+        big (binary/copy reg 256)
+        quarter (binary/copy reg 64)
+        small (binary/part reg 0 17)
+        small-init 3
+        expect-small (fusion.pipeline/rt-run small small-init)
+        expect-reg (fusion.pipeline/rt-run reg 0)
+        expect-quarter-0 (fusion.pipeline/rt-run quarter 0)
+        expect-quarter-1 (fusion.pipeline/rt-run quarter 1)
+        expect-quarter-2 (fusion.pipeline/rt-run quarter 2)
+        expect-quarter-3 (fusion.pipeline/rt-run quarter 3)
+        expect-big-0 (fusion.pipeline/rt-run big 0)
+        expect-big-1 (fusion.pipeline/rt-run big 1)
+        expect-big-2 (fusion.pipeline/rt-run big 2)
+        expect-big-3 (fusion.pipeline/rt-run big 3)
+        counter {0 expect-quarter-0 1 expect-quarter-1 2 expect-quarter-2 3 expect-quarter-3}
+        big-counter {0 expect-big-0 1 expect-big-1 2 expect-big-2 3 expect-big-3}
+        s0 (stats)
+        res (fusion.invm/kernel-compile ir)
+        s1 (stats)
+        _ (check! :compile "compile returns an opaque resource" (some? res))
+        _ (check! :compile "created moves by exactly one"
+                  (erlang/== (erlang/+ 1 (sget s0 :created)) (sget s1 :created)))
+        _ (check! :compile "live moves by exactly one"
+                  (erlang/== (erlang/+ 1 (sget s0 :live)) (sget s1 :live)))
+        _ (check! :compile "nothing is in flight after compile" (erlang/== 0 (sget s1 :inflight)))
+        _ (check! :call "a small regular call agrees with the reference"
+                  (erlang/== expect-small (fusion.invm/kernel-call res small small-init)))
+        _ (check! :call "a cap-sized (4096 B) regular call agrees with the reference"
+                  (erlang/== expect-reg (fusion.invm/kernel-call res reg 0)))
+        _ (check! :call-dirty "a 1 MiB dirty call agrees with the reference"
+                  (erlang/== expect-big-0 (fusion.invm/kernel-call-dirty res big 0)))
+        agree (agree-phase res
+                           [(spec 0 quarter 0) (spec 1 quarter 1) (spec 2 quarter 2) (spec 3 quarter 3)]
+                           counter)
+        retain (retain-phase res
+                             [(spec 0 big 0) (spec 1 big 1) (spec 2 big 2) (spec 3 big 3)]
+                             big-counter)
+        close-again (try {:value (fusion.invm/kernel-close res)} (catch e {:err (str e)}))
+        _ (check! :close "a second close throws nothing"
+                  (erlang/== true (contains? close-again :value)))
+        _ (check! :close "a second close reports no new transition"
+                  (erlang/== false (get close-again :value)))
+        _ (check! :close "the closed resource refuses a regular call"
+                  (refuses? (fn [] (fusion.invm/kernel-call res small 0))))
+        _ (check! :close "the closed resource refuses a dirty call"
+                  (refuses? (fn [] (fusion.invm/kernel-call-dirty res small 0))))
+        over-regular (binary/copy reg 2)
+        over-dirty (binary/copy (binary/part big 0 1) (erlang/+ BIG-BYTES 1))
+        refusals
+          {:forged-map    (refuses? (fn [] (fusion.invm/kernel-call {:nope 1} small 0)))
+           :forged-ref    (refuses? (fn [] (fusion.invm/kernel-call (erlang/make_ref) small 0)))
+           :forged-int    (refuses? (fn [] (fusion.invm/kernel-call 123 small 0)))
+           :forged-binary (refuses? (fn [] (fusion.invm/kernel-call "" small 0)))
+           :close-forged  (refuses? (fn [] (fusion.invm/kernel-close :not-a-resource)))
+           :call-nonbinary (refuses? (fn [] (fusion.invm/kernel-call res :not-a-binary 0)))
+           :call-negative-init (refuses? (fn [] (fusion.invm/kernel-call res small -1)))
+           :call-init-over-u64 (refuses? (fn [] (fusion.invm/kernel-call res small (erlang/+ U64 1))))
+           :call-over-regular-cap (refuses? (fn [] (fusion.invm/kernel-call res over-regular 0)))
+           :dirty-nonbinary (refuses? (fn [] (fusion.invm/kernel-call-dirty res :nope 0)))
+           :dirty-over-cap (refuses? (fn [] (fusion.invm/kernel-call-dirty res over-dirty 0)))
+           :compile-nonbinary (refuses? (fn [] (fusion.invm/kernel-compile :not-ir-text)))
+           :noop-over-cap (refuses? (fn [] (fusion.invm/kernel-noop over-dirty 0)))}
+        _ (doseq [k (keys refusals)]
+            (check! :refusal (str "refusal " (pr-str k)) (erlang/== true (get refusals k))))
+        _ (check! :noop "kernel-noop returns the supplied initial accumulator"
+                  (erlang/== 7 (fusion.invm/kernel-noop small 7)))
+        _ (check! :noop "kernel-noop-dirty returns the supplied initial accumulator"
+                  (erlang/== 9 (fusion.invm/kernel-noop-dirty small 9)))
+        drop (drop-phase ir)
+        kill (kill-phase ir big 0)
+        reload (reload-phase ir expect-small small small-init)
+        s-final (stats)
+        untested (if (erlang/== :untested (:status reload)) ["module reload/purge"] [])]
+    {:passed true
+     :module "invm.lifecycle"
+     :ir-path ir-path
+     :ir-bytes (erlang/byte_size ir)
+     :env {:schedulers_online (erlang/system_info :schedulers_online)
+           :dirty_cpu_schedulers_online (erlang/system_info :dirty_cpu_schedulers_online)
+           :dirty_io_schedulers (erlang/system_info :dirty_io_schedulers)
+           :otp_release (erlang/list_to_binary (to-list (erlang/system_info :otp_release)))}
+     :checks (:total (tally-count))
+     :check-counts (tally-count)
+     :counts {:callers-per-phase CONCURRENCY
+              :regular-cap REGULAR-BYTES
+              :dirty-cap BIG-BYTES}
+     :stats {:before s0 :after-compile s1 :final s-final}
+     :concurrent agree
+     :retain retain
+     :close {:first (get retain :close-first) :second close-again :calls-refused true}
+     :refusals refusals
+     :drop drop
+     :kill kill
+     :reload reload
+     :untested untested
+     :wall-ms (erlang/- (mono-ms) t-start)}))
+
+(defn main
+  "CLI-less convenience: run against the descriptor IR path given by INVM_IR
+   (or the frozen evidence path). MAIN's real wiring calls `run` directly."
+  []
+  (let [p (or (System/get_env "INVM_IR")
+              "research/rt-selfhost/fusion/evidence/pipeline.ir")
+        r (run p)]
+    (println (str "PASS invm lifecycle: checks=" (:checks r)
+                  " concurrent-ok=" (get (:concurrent r) :ok)
+                  " retained=" (get (:retain r) :survived)
+                  " untested=" (pr-str (:untested r))
+                  " wall-ms=" (:wall-ms r)))
+    r))

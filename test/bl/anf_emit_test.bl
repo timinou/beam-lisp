@@ -1,0 +1,145 @@
+; anf_emit_test.bl — ANF emit through the PINNED Emit/Link host modules and the
+; live AOT entry point.
+;
+; Ported from the ExUnit `test/beam_lisp/anf_emit_test.exs`. Every call goes to
+; the pinned host ABI (`Elixir.BeamLisp.Emit`, a `.bl` source compiled to an
+; exact-named beam — see `priv/host/emit.bl`) and to `BeamLisp.AOT/compile_source`
+; directly. No Elixir seam is left in the path.
+;
+; What is pinned, and why each assertion is worth carrying over:
+;
+;   · ANF shims COLLAPSE guarded clauses of the same arity into one forwarding
+;     clause (the guard lives in the body module, the shim forwards), while
+;     DISTINCT arities stay distinct — the clause/arity contract the body split
+;     depends on;
+;   · no generated consumer carries a quoted reverse bridge — the cutover's whole
+;     point was removing the `quote`/`normalise`/`Module.create` round-trip, so
+;     the surviving sources are scanned for it;
+;   · a canonical descriptor boundary validates a real body module and a neutral
+;     shim module (module op, Vector export pairs, `defn-clause` shim clauses)
+;     and yields a binary beam;
+;   · AOT compiles guarded and multi-arity canonical ANF definitions to a
+;     namespace shim and a body module, publishes them, and the live runtime
+;     answers every guarded/multi-arity call.
+;
+; Run: bl test test/bl/anf_emit_test.bl
+
+(ns anf-emit.test)
+
+(def ^:private body-mod :"Elixir.BeamLisp.Ns.Body.AnfEmitFixture")
+
+; ── shim collapse and arity preservation ─────────────────────────────────────
+
+(defn- clause
+  "The five-field def tuple for one `classify` clause built through the pinned
+   tuple shape: `{:fixed arity fname clause-payload body-module}`."
+  [fname params guard]
+  (tuple :fixed (count params) fname
+    {:op :"defn-clause" :fname fname
+     :params (Enum/map params (fn [n] {:pop :pvar :name n}))
+     :guard guard
+     :body {:op :lit :val :unused}
+     :ann {}}
+    body-mod))
+
+(deftest anf-shims-collapse-guarded-clauses-and-preserve-distinct-arities
+  (let [defs {"classify"
+              (list (clause :classify (list "x") {:op :lit :val true})
+                    (clause :classify (list "y") nil)
+                    (clause :classify (list "x" "y") nil))}
+        shims (BeamLisp.Emit/shim_clauses defs)]
+    (is (= 2 (count shims))
+        "a guarded and an unguarded clause of the SAME arity collapse to one shim")
+    (is (= (list 1 2) (sort (map (fn [s] (count (:params s))) shims)))
+        "both arities survive")
+    (is (every? (fn [shim]
+                  (and (= :"defn-clause" (:op shim))
+                       (nil? (:guard shim))
+                       (= :remote (:op (:body shim)))
+                       (= body-mod (:mod (:body shim)))
+                       (= :classify (:fun (:body shim)))
+                       (= (count (:params shim)) (count (:args (:body shim))))))
+                shims)
+        "each shim forwards into the body module, unguarded, with matching args")))
+
+; ── no quoted reverse bridge ─────────────────────────────────────────────────
+
+(defn- absent?
+  "Whether `token` never occurs in `source` as a whole identifier/call token.
+   The reverse-bridge spellings name a MECHANISM; prose that merely contains the
+   letters (`normalises it to KeyError`, a doc sentence) is not one, so the scan
+   is boundary-aware rather than a bare substring match."
+  [source token]
+  (empty? (Regex/scan
+            (Regex/compile!
+              (str "(?<![A-Za-z0-9_])" (Regex/escape token) "(?![A-Za-z0-9_])"))
+            source)))
+
+(deftest generated-live-and-disk-consumers-contain-no-quoted-reverse-bridge
+  (doseq [path (list "priv/host/link.bl" "priv/host/emit.bl" "priv/host/aot.bl")]
+    (let [source (File/read! path)]
+      (is (absent? source "quote do") (str path " carries no `quote do`"))
+      (is (absent? source "quote-node") (str path " carries no `quote-node`"))
+      (is (absent? source "normalise") (str path " carries no `normalise`"))
+      (is (absent? source "Code.compile_quoted") (str path " carries no `Code.compile_quoted`"))
+      (is (absent? source ":elixir_compiler.quoted") (str path " carries no `:elixir_compiler.quoted`"))
+      (is (absent? source "Module.create") (str path " carries no `Module.create`")))))
+
+; ── descriptor boundary ──────────────────────────────────────────────────────
+
+(deftest canonical-descriptor-boundary-validates-body-and-neutral-shim-modules
+  (let [descriptor-body-mod :"Elixir.BeamLisp.Ns.Body.DescriptorFixture"
+        clause {:op :"defn-clause" :fname :identity
+                :params (list {:pop :pvar :name "x"}) :guard nil
+                :body {:op :var :name "x" :ann {}} :ann {}}
+        defs {"identity" (list (tuple :fixed 1 :identity clause descriptor-body-mod))}
+        body (BeamLisp.Emit/descriptor_for descriptor-body-mod (list clause))
+        shim (BeamLisp.Emit/descriptor_for :"Elixir.BeamLisp.Ns.DescriptorFixture"
+               (BeamLisp.Emit/shim_clauses defs))]
+    (is (= :module (:op body)))
+    (is (= 1 (count (:exports body))))
+    (is (vector? (first (:exports body))))
+    (is (= (tuple :identity 1) (erlang/map_get :items (first (:exports body))))
+        "an export is a Vector `{fname, arity}` pair")
+    (is (= 1 (count (:clauses shim))))
+    (is (= :"defn-clause" (:op (first (:clauses shim)))))
+    (is (nil? (:guard (first (:clauses shim)))))
+    (let [built (BeamLisp.Emit/compile_descriptor body)]
+      (is (= descriptor-body-mod (first built)))
+      (is (erlang/is_binary (second built))))))
+
+; ── AOT: guarded and multi-arity defns compile, publish and run ──────────────
+
+(defn- purge-module! [mod]
+  (code/purge mod)
+  (code/delete mod))
+
+(deftest aot-compiles-guarded-and-multi-arity-canonical-anf-definitions
+  (let [output-dir (str (System/tmp_dir!) "/beam_lisp_anf_emit_"
+                        (erlang/unique_integer (list :positive)))
+        source #|(ns anf_emit_fixture)
+(defn classify
+  ([n] :when (pos? n) :positive)
+  ([n] :when (neg? n) :negative)
+  ([_n] :zero)
+  ([a b] (+ a b)))
+|]
+    (try
+      (let [emitted (BeamLisp.AOT/compile_source source (list (tuple :output_dir output-dir)))
+            emitted-modules (into #{} (map first emitted))
+            mod :"Elixir.BeamLisp.Ns.AnfEmitFixture"]
+        (is (contains? emitted-modules :"Elixir.BeamLisp.Ns.AnfEmitFixture")
+            "the namespace shim is emitted")
+        (is (contains? emitted-modules :"Elixir.BeamLisp.Ns.Body.AnfEmitFixture")
+            "its body module is emitted")
+        ; Emission publishes body code before namespace shims. No manual load or
+        ; purge should be needed for the running compiler to use the new body.
+        (is (= :ok (erlang/apply mod :__bl_init__ (list))))
+        (is (= :positive (BeamLisp.Ns.AnfEmitFixture/classify 4)))
+        (is (= :negative (BeamLisp.Ns.AnfEmitFixture/classify -4)))
+        (is (= :zero (BeamLisp.Ns.AnfEmitFixture/classify 0)))
+        (is (= 5 (BeamLisp.Ns.AnfEmitFixture/classify 2 3))))
+      (finally
+        (purge-module! :"Elixir.BeamLisp.Ns.AnfEmitFixture")
+        (purge-module! :"Elixir.BeamLisp.Ns.Body.AnfEmitFixture")
+        (File/rm_rf! output-dir)))))

@@ -13,6 +13,31 @@
 ; native range decode is deferred (FUP-022); the generic -range scan is correct
 ; and is what everything above uses today.
 
+;; ── EXCLUSIVE OWNERSHIP (one store, one OS process) ──────────────────
+;;
+;; fjall locks nothing of its own, so two OS processes opening one keyspace
+;; directory would write the same segment files: silent CORRUPTION, not a slow
+;; read. `open` therefore takes an exclusive OS lock — a `flock` on the store's
+;; real directory, taken by the native `fjall-open` — held for the lifetime of
+;; the store's native handle. The kernel releases it when that fd closes: at the
+;; resource's drop (a normal close) or at process death (a crash, a SIGKILL).
+;; There is no lock FILE and no PID to compare, so there is no stale lock to
+;; misread — a dead owner's store is simply free.
+;;
+;; Two consequences a caller can rely on:
+;;   * a store another PROCESS owns raises a TYPED error from `open`
+;;     (`{:reason :store-already-open}` in its `ex-data`) — an answer distinct
+;;     from an I/O failure (a plain message), and never a corruption report;
+;;   * a second open of the SAME store inside one process is ALLOWED and shares
+;;     the one lock, matching `datom.conn`'s semantics (its writer and basis are
+;;     keyed by the store VALUE, and two connections over one store are two
+;;     views of one database). A path alias — a symlink, a relative path, a
+;;     trailing separator — cannot evade the lock: the directory is
+;;     canonicalized before it is locked, so aliases meet on one inode. The
+;;     alias resolves to the same `:path`, and therefore to the same blob tier
+;;     (`<path>.blobs`), so the two spellings are one store in every respect,
+;;     not only in the lock.
+
 (ns datom.store-fjall
   (:require [datom.store] [datom.blob] [datom.blob-fs] [datom.value-codec]))
 
@@ -26,6 +51,14 @@
 
 (defnative "datom_fjall"
   (fjall-open 1)
+  ; fjall-canonical-path: (path) → the CANONICAL directory the path refers to,
+  ; or {:error, reason}. Symlinks, `..`, a trailing separator and a relative
+  ; spelling collapse onto the one real directory the claim's flock is taken
+  ; on. The claim already canonicalizes internally; this exposes the SAME
+  ; answer so `open` can key the record's :path — and with it the
+  ; `<path>.blobs` sibling — off the store's ONE identity rather than off
+  ; whatever spelling the caller used. bl has no realpath of its own.
+  (fjall-canonical-path 1)
   (fjall-get 2)
   (fjall-range 3)
   ; fjall-range-chunk: the next `limit` [k v] pairs — `start` (inclusive)
@@ -51,6 +84,13 @@
   ; anything. Measured on 50 000 identical rows: 112ms read as datoms through
   ; this path where the BEAM-decoding path needs 479ms.
   (fjall-resolve-chunk 6)
+  ; fjall-count-range: (handle lo hi limit) → {count capped} — how many KEYS lie
+  ; in [lo, hi], counting at most `limit` of them. The VALUE of every entry is
+  ; dropped unread, so no datom is decoded and no term is built, and the walk
+  ; stops ON the limit-th key: `capped` says the range holds AT LEAST `limit`
+  ; keys. The semi-join gate's cheap question (datom.store/Count), the
+  ; counterpart to fjall-resolve-prefixes' expensive answer.
+  (fjall-count-range 4)
   ; fjall-resolve-prefixes: (handle bounds) where bounds is a list of {lo hi}
   ; 2-tuples, inclusive. Every datom under any bound, decoded in Rust, ONE
   ; crossing. Returns {n datoms}. The semi-join read (datom.store/MultiScan).
@@ -60,6 +100,14 @@
   (fjall-cas 4)
   (fjall-commit 2)
   (fjall-sync 1)
+  ; fjall-stats: what the ENGINE reports — block-cache capacity, write buffer,
+  ; compaction (count, in flight, time spent), journal and disk accounting,
+  ; partition count. `lsm-tree`'s cache exposes size/capacity and NO hit/miss
+  ; counters, so a hit RATE cannot be measured on this stack; read volume
+  ; (rchar deltas) plus this capacity is what answers the same question, and
+  ; compaction is what write amplification is made of — neither was observable
+  ; before this. Cheap: atomics the engine already maintains.
+  (fjall-stats 1)
   ; keycodec-encode: the order-preserving KEY encoding in Rust, byte-identical
   ; to datom.codec/encode-value for the four bulk lanes (int/str/kw/bool). Args:
   ; (tag ival sval bval). Returns the key binary, or nil for an out-of-lane
@@ -154,6 +202,27 @@
         (throw (ex-info (str "native multi-prefix scan failed: " res) {:bounds (count bounds)}))
         (into [] (to-list (get res "datoms")))))))
 
+;; ── the bounded key count: `Count` ────────────────────────────────────
+;;
+;; The semi-join gate needs the SIZE OF ITS TARGET COLUMN — an earlier clause's
+;; scan cannot tell it, and the column may be two rows or two hundred thousand.
+;; This is the cheap answer: keys only (the value of every entry is dropped in
+;; Rust, so nothing is decoded and no term is built) and stopped as soon as the
+;; question is settled, so the walk is `min(range, limit)` rather than the
+;; range. The limit is chosen by the gate from the prefix count being judged.
+(extend-protocol datom.store/Count
+  FjallStore
+  (-count-range [store lo hi limit]
+    (let [res (fjall-count-range (:handle store) lo hi limit)
+          n (get res :count)]
+      ; A native count that FAILED comes back without a `count`, and would
+      ; otherwise read as an empty range — a probe that silently picks the
+      ; wrong read shape. The RESULT SHAPE is the test, never the number.
+      (if (nil? n)
+        (throw (ex-info (str "native range count failed: " res)
+                        {:lo lo :hi hi :limit limit}))
+        {:count n :capped (get res :capped)}))))
+
 ;; ── the bounded page read: `PageScan` ───────────────────────────────
 ;;
 ;; ONE native crossing per page, bounded by `limit` and resuming from `after`
@@ -180,9 +249,66 @@
 
 (defn open
   "Open (or create) a fjall-backed store at `path`. The keyspace persists after
-   the process exits — which is the whole point: reopening recovers every datom."
+   the process exits — which is the whole point: reopening recovers every datom.
+
+   EXCLUSIVELY OWNED. A store is one OS process's at a time: `fjall-open` takes
+   an exclusive `flock` on the store's directory and holds it for as long as this
+   store's native handle lives (released when the last reference is dropped —
+   `datom.conn/release!` then collection, or `datom.conn/close!` — and by the
+   kernel if the process dies). Opening a store another PROCESS owns raises a
+   TYPED error:
+
+       (ex-info … {:reason :store-already-open, :path …, :locked-path …})
+
+   That `:reason` is the contract. It is deliberately NOT an I/O message and
+   never a corruption report — an owned store is not a damaged store, and a
+   caller can back off, retry, or tell the user, instead of treating a healthy
+   database as damaged. Reuse inside ONE process is allowed
+   and shares the one lock, matching `datom.conn`: two connections over the same
+   store are two views of one database.
+
+   CANONICAL PATH. `:path` on the returned store is the store directory's REAL
+   directory, not the spelling passed in: a symlink, a relative path, a `..` or
+   a trailing separator resolves onto the one directory the lock is on. That
+   matters because everything a store derives from its path — notably the
+   default blob tier, the sibling `<path>.blobs` — must key off that same
+   identity. Two spellings of one store are then one store: one datom log AND
+   one set of bytes, not a shared log with bytes split across two directories.
+
+   Any other native failure keeps the pre-existing behaviour (the native
+   `{:error, reason}` is carried into the record, exactly as before), so this
+   change narrows nothing but the lock case."
   [path]
-  (->FjallStore (fjall-open path) path))
+  ; ONE IDENTITY FOR THE STORE. The claim's flock, its registry and its engine
+  ; are all keyed by the directory's CANONICAL path (the lock is on the inode,
+  ; so a symlink, a `..`, a relative spelling and a trailing separator all reach
+  ; the same lock). The record and the blob tier must key off that SAME
+  ; directory: because a same-process reopen through an alias now JOINS the
+  ; claim rather than being refused, a record that kept the caller's spelling
+  ; would share the one datom log and yet write its bytes to a different
+  ; sibling (`<alias>.blobs`) — a datom read back through the alias would name a
+  ; blob only the other spelling could find. `fjall-canonical-path` is the same
+  ; canonicalization the claim takes, asked once, here.
+  (let [canon (fjall-canonical-path path)]
+    (if (and (erlang/is_tuple canon)
+             (= :error (erlang/element 1 canon)))
+      ; The directory could not be created or resolved. That is the SAME
+      ; {:error, reason} the pre-existing `open` carried up from `fjall-open`,
+      ; so it is carried the same way: into the record's handle, never raised.
+      (->FjallStore canon path)
+      (let [handle (fjall-open canon)]
+        (if (and (erlang/is_tuple handle)
+                 (= :error (erlang/element 1 handle))
+                 (erlang/is_tuple (erlang/element 2 handle))
+                 (= :already_open (erlang/element 1 (erlang/element 2 handle))))
+          (let [locked (erlang/element 2 (erlang/element 2 handle))]
+            (throw (ex-info (str "store already open: " canon
+                                 " is exclusively owned by another OS process ("
+                                 locked ")")
+                            {:reason :store-already-open
+                             :path canon
+                             :locked-path locked})))
+          (->FjallStore handle canon))))))
 
 (defn available?
   "Whether the native fjall backend loaded. A persistent backend that fails to
@@ -282,14 +408,21 @@
 
 ;; A durable database keeps its file bytes beside it: `<path>.blobs`, a
 ;; sibling directory, so database and bytes are backed up and moved as one.
+;; `(:path store)` is the store's CANONICAL directory (see `open`), so the
+;; sibling is derived from the store's one identity and not from whatever
+;; spelling a caller opened it with — an alias reaches the SAME bytes.
 ;; S3 is the opt-in for this tier (`{:blobs (datom.blob-s3/open …)}`).
 (extend-protocol datom.blob/DefaultBlobs
   FjallStore
   (-default-blobs [store] (datom.blob-fs/open (str (:path store) ".blobs"))))
 
 ;; Closing a durable store is a durability boundary, not a deletion: sync the
-;; journal, then let go. The Rustler handle (and its file lock) is freed by GC
-;; once `release!` has dropped the registry's reference — the last one.
+;; journal, then let go. The exclusive OS lock `open` took lives on the native
+;; handle's fd, so it goes with the handle: after `datom.conn/release!` has
+;; dropped the registry's last reference, collection frees the resource and
+;; closes that fd; a process that dies releases it without any of this. Nothing
+;; here has to remember to unlock, which is the point of holding it on an fd
+;; rather than in a file.
 (extend-protocol datom.store/Closeable
   FjallStore
   (-close [store] (fjall-sync (:handle store)) nil))
@@ -308,3 +441,19 @@
   [store]
   (fjall-sync (:handle store))
   store)
+
+(defn stats
+  "What the engine itself reports: block-cache capacity, the write buffer,
+   compaction (count, in flight, time spent), and the disk/journal accounting.
+
+   WHY THIS EXISTS. `lsm-tree`'s block cache exposes size/capacity and NO hit or
+   miss counters, so a block-cache hit rate cannot be measured on this stack —
+   ever. What answers the same question is (a) how much the read path pulls from
+   the OS (measured with `rchar` deltas; see knowledger's
+   `semantica/benches/bench-s93.bl`) and (b) how full the cache is, which is this.
+   Before it, `the cache is too small` was an inference, and compaction — the
+   thing that decides write amplification — had never been observed at all.
+
+   Returns a map of plain numbers; `:cache_capacity` is bytes."
+  [store]
+  (fjall-stats (:handle store)))

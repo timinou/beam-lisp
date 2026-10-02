@@ -433,6 +433,77 @@ pub fn vec_resident_count(index: ResourceArc<Resident>) -> usize {
     index.n
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Persisting the resident index (PLAN-138 W7c)
+//
+// A `Resident` is a pure function of the corpus bytes: decode to f32, quantise
+// each row. Recomputing it on every process start is the same work the index
+// exists to avoid doing per query — on the live corpus (62 396 x 768) that is
+// 8.8 s of decode+quantise in the boot path, paid again after every restart,
+// deploy or crash.
+//
+// So the index is DUMPABLE. This is a serializer for a cache entry, not a
+// format for a database: the blob carries a magic and the three dimensions, and
+// the reader validates the total length against them — a truncated or mismatched
+// blob is REFUSED rather than searched. Wrong bytes that load silently would
+// rank garbage, which is the one outcome worse than a slow start.
+
+const RESIDENT_MAGIC: &[u8; 8] = b"RSDT1001";
+const RESIDENT_HEADER: usize = 8 + 4 + 4 + 8; // magic, dim, words, n
+
+/// `vec_resident_dump(index)` → the whole index as one self-describing binary:
+/// `magic | dim:u32 | words:u32 | n:u64 | n*dim f32 | n*words u64`, little-endian.
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn vec_resident_dump<'a>(env: Env<'a>, index: ResourceArc<Resident>) -> NifResult<Binary<'a>> {
+    let mut out = Vec::with_capacity(RESIDENT_HEADER + index.flat.len() * 4 + index.codes.len() * 8);
+    out.extend_from_slice(RESIDENT_MAGIC);
+    out.extend_from_slice(&(index.dim as u32).to_le_bytes());
+    out.extend_from_slice(&(index.words as u32).to_le_bytes());
+    out.extend_from_slice(&(index.n as u64).to_le_bytes());
+    for v in index.flat.iter() {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    for c in index.codes.iter() {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    bin(env, &out)
+}
+
+/// `vec_resident_load(blob)` → the index `vec_resident_dump` wrote, or an error.
+///
+/// Validates the magic AND the arithmetic (every dimension against the byte
+/// length) before allocating, so a corrupt or short blob cannot be read as a
+/// smaller valid one.
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn vec_resident_load(blob: Binary) -> NifResult<ResourceArc<Resident>> {
+    let b = blob.as_slice();
+    if b.len() < RESIDENT_HEADER || &b[0..8] != RESIDENT_MAGIC {
+        return Err(err("not a resident index blob"));
+    }
+    let dim = u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize;
+    let words = u32::from_le_bytes(b[12..16].try_into().unwrap()) as usize;
+    let n = u64::from_le_bytes(b[16..24].try_into().unwrap()) as usize;
+    if dim == 0 || words != words_for(dim) {
+        return Err(err("resident index blob has an inconsistent geometry"));
+    }
+    let expected = RESIDENT_HEADER + n * dim * 4 + n * words * 8;
+    if b.len() != expected {
+        return Err(err("resident index blob length disagrees with its header"));
+    }
+    let mut flat = Vec::with_capacity(n * dim);
+    let mut off = RESIDENT_HEADER;
+    for _ in 0..(n * dim) {
+        flat.push(f32::from_le_bytes(b[off..off + 4].try_into().unwrap()));
+        off += 4;
+    }
+    let mut codes = Vec::with_capacity(n * words);
+    for _ in 0..(n * words) {
+        codes.push(u64::from_le_bytes(b[off..off + 8].try_into().unwrap()));
+        off += 8;
+    }
+    Ok(ResourceArc::new(Resident { dim, words, n, flat, codes }))
+}
+
 /// Decode a packed corpus binary into a contiguous f32 matrix (row-major).
 fn decode_corpus(bytes: &[u8], dim: usize) -> Result<(usize, Vec<f32>), Error> {
     if dim == 0 || bytes.len() % (dim * 4) != 0 {

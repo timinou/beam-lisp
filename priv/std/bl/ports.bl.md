@@ -65,7 +65,7 @@ next one.
         here (second (File/cwd))
         live (filter (fn [c] (= n (:name c))) (list-ports))]
     (or (some (fn [c] (when (= here (:root c)) c)) live)
-        (first live))))
+        (some (fn [c] (when (:pinned c) c)) live))))
 
 (defn live
   "The two facts every printed address depends on, resolved ONCE: the gateway's
@@ -76,17 +76,16 @@ next one.
   (let [p (vm.gateway/port)]
     {:port p :fronted (vm.gateway/fronted-on? p)}))
 
+(defn- claim-url [c facts]
+  (if (or (nil? c) (empty? (:hosts c)))
+    nil
+    (vm.gateway/url (first (:hosts c)) (:port facts) (:fronted facts))))
+
 (defn url-for*
   "`url-for` with the live facts already in hand — the same rule, for a caller
    printing many addresses."
   [name facts]
-  (let [c (claim-for name)]
-    (if (nil? c)
-      nil
-      (let [hs (:hosts c)]
-        (if (empty? hs)
-          nil
-          (vm.gateway/url (first hs) (:port facts) (:fronted facts)))))))
+  (claim-url (claim-for name) facts))
 
 (defn url-for
   "The address `name` answers at — its first host, through the gateway, so a
@@ -100,11 +99,39 @@ next one.
   [name]
   (url-for* name (live)))
 
+(defn open-external
+  "Hand `url` to the desktop's opener, returning true when it was handed over.
+
+   Argv, never a shell string: `System/cmd` is Elixir's, so its second argument
+   is a LIST of arguments, and `xdg-open <url>` passed as one string asks for a
+   program whose name contains a space (the same bug shape FUP-100 fixed in
+   the build). A host with no opener is not an error — the caller has already
+   printed the address — so this reports instead of raising."
+  [url]
+  (try
+    (do (System/cmd "xdg-open" (u/to-list [url])) true)
+    (catch _e false)))
+
 (defn- loopback-url
   "The same listener with no name in it. Never depends on the gateway — this is
    the half of the address that is always true."
   [c]
   (str "http://127.0.0.1:" (:port c) "/"))
+
+(defn page-url
+  "A named port's page at `path`, on the LOOPBACK address — or nil when this
+   tree holds no such claim.
+
+   The loopback half on purpose: a window (or any embedder) is a fresh browser
+   with no gateway, proxy or DNS setup, so a name that resolves in the
+   developer's shell can still be a blank page there. `url`/`url-for` stay the
+   human-facing address; this one is what a program opens."
+  [name path]
+  (if-let [c (claim-for name)]
+    (let [base (loopback-url c)
+          base (if (String/ends_with? base "/") (String/slice base 0 (- (count base) 1)) base)]
+      (str base (if (String/starts_with? path "/") path (str "/" path))))
+    nil))
 ```
 
 ## The verbs
@@ -126,7 +153,7 @@ address a human keeps; the number is the implementation detail beside it.
         (u/each
           (fn [p]
             (println (str "  " (pad (:name p))
-                          (or (url-for* (:name p) facts) (loopback-url p))
+                          (or (claim-url p facts) (loopback-url p))
                           "  → " (:port p)
                           "  " (Path/basename (:root p)) " (pid " (:pid p) ")")))
           (sort-by (fn [p] (:name p)) ps))
@@ -162,7 +189,7 @@ it.
         (when (not (nil? named))
           (println (str "  → " plain)))
         (when (some (fn [a] (= a "--open")) args)
-          (System/cmd (str "xdg-open " (or named plain))))
+          (open-external (or named plain)))
         0))))
 
 (defn url

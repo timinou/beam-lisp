@@ -1,0 +1,120 @@
+; vm/hotpatch.bl — recompile boot-tier namespaces from CURRENT source INSIDE
+; the running VM.
+;
+; Port of the retired dev-only Elixir hotpatch host helper (PLAN-150). It
+; exists so the edit→test loop for toolchain work is seconds, not a seed regen's
+; minutes: for each named namespace `foo`, `<source-root>/foo.bl` (default
+; `priv/boot`) is compiled with the live seed toolchain
+; (`BeamLisp.AOT.compile_file/2` into a UNIQUE temp dir), then the emitted
+; beams are swapped into the running VM with `:code.purge` + `:code.delete` +
+; `:code.load_binary`. The namespace's vars are re-interned as a side effect of
+; the compile, so both the var path and the direct `Ns.Body.*` path see the new
+; code.
+;
+; Each successfully hot-patched namespace is recorded in `vm.generation`
+; (`record_hotpatch`) — and only AFTER all of its beams have loaded, because the
+; receipt's claim is that the namespace IS this code.
+;
+; This replaces the SEED only IN THIS VM: `priv/bootstrap/seed` on disk is
+; untouched. A seed regen is still the commit-time gate — this exists so the
+; edit→test loop is seconds, not minutes.
+;
+;   BL_HOTPATCH=compiler,lower bl test test/bl/vm/guards_test.bl
+;   BL_HOTPATCH=anf bl run --no-start my_probe.exs
+;
+; An UNKNOWN name (no source at `<source-root>/<name>.bl`) is refused, never
+; silently skipped. The per-namespace temp dir is removed once its beams are
+; loaded — the running modules hold the code, and a leaked `bl_hotpatch_*` dir
+; per call is litter; the bytes are read out before the delete, so the modules
+; survive it.
+
+(ns vm.hotpatch
+  (:require [vm.generation :as gen]))
+
+(defn- opt
+  "Read `key` from an options value that may be a beam-lisp map OR an Elixir
+   keyword list (the list-of-`{:k, v}`-tuples an Elixir `apply/3` hands across
+   the boundary) — `get` reads maps only, so the keyword case needs its own
+   reader. `default` when absent."
+  [opts key default]
+  (cond
+    (nil? opts) default
+    (erlang/is_map opts) (get opts key default)
+    :else (Keyword/get opts key default)))
+
+(defn- name-str
+  "`x` as a string, the way `to_string/1` would: an atom's name, a binary
+   unchanged."
+  [x]
+  (if (erlang/is_binary x)
+    x
+    (erlang/atom_to_binary x :utf8)))
+
+(defn- load-beam!
+  "Purge, delete and reload ONE emitted `{module, beam-path}` pair. Returns the
+   module atom; raises when the code server refused the load, exactly as the
+   host helper's `{:module, ^mod}` match did."
+  [pair]
+  (let [mod (elem pair 0)
+        path (elem pair 1)
+        bytes (File/read! path)]
+    (erlang/apply :code :purge (list mod))
+    (erlang/apply :code :delete (list mod))
+    (let [r (erlang/apply :code :load_binary
+                          (list mod (erlang/binary_to_list path) bytes))]
+      (when-not (and (erlang/is_tuple r) (= :module (elem r 0)))
+        (throw (ex-info (str "hot-patch load failed for " mod)
+                        {:module mod :result r}))))
+    mod))
+
+(defn- hotpatch-ns!
+  "Compile and swap ONE namespace from `<source-root>/<name>.bl`. Raises when
+   the source is absent — an UNKNOWN name is never silently accepted."
+  [name source-root]
+  (let [path (Path/join source-root (str name ".bl"))]
+    (when-not (File/exists? path)
+      (throw (ex-info (str "no boot source for namespace " name ": " path " not found")
+                      {:ns name :path path})))
+    (let [nonce (Base/url_encode64 (erlang/apply :crypto :strong_rand_bytes (list 12))
+                                   (list (tuple :padding false)))
+          dir (Path/join (System/tmp_dir)
+                         (str "bl_hotpatch_" (Path/basename name) "_" nonce))]
+      (File/mkdir_p! dir)
+      (try
+        (let [started (System/monotonic_time :millisecond)
+              emitted (BeamLisp.AOT/compile_file path (list (tuple :output_dir dir)))]
+          (doseq [pair emitted] (load-beam! pair))
+          (let [ms (- (System/monotonic_time :millisecond) started)]
+            (erlang/apply :logger :info
+                          (list (str "hot-patched " name ": " (erlang/length emitted)
+                                     " beams emitted and loaded, " ms "ms")))))
+        (finally
+          (File/rm_rf! dir))))))
+
+(defn hotpatch!
+  "Hot-patch the given boot namespaces from `<source-root>/<name>.bl` sources.
+   `names` is a list of names (`\"compiler\"`, `\"lower\"`) or a comma-separated
+   string; `opts[:source_root]` selects an explicit source snapshot (default
+   `\"priv/boot\"`). Records each namespace in `vm.generation` only AFTER all its
+   beams have loaded, so a partial compile never appears as a hotpatch."
+  ([names] (hotpatch! names (list)))
+  ([names opts]
+   (let [ns-list (if (erlang/is_binary names)
+                   (String/split names "," (list (tuple :trim true)))
+                   (to-list names))
+         source-root (opt opts :source_root "priv/boot")]
+     (doseq [name ns-list]
+       (let [n (name-str name)]
+         (hotpatch-ns! n source-root)
+         (gen/record_hotpatch (list n))))
+     :ok)))
+
+(defn apply-env!
+  "Read `BL_HOTPATCH` and apply it. Called from `test_helper.exs`; safe to call
+   when the variable is unset or empty (no-op)."
+  []
+  (let [names (System/get_env "BL_HOTPATCH")]
+    (cond
+      (nil? names) :ok
+      (= "" names) :ok
+      :else (hotpatch! names))))

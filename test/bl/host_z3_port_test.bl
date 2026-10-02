@@ -1,0 +1,519 @@
+; host_z3_port_test.bl — the pinned z3 port driver, diffed against the live module.
+;
+; `priv/host/z3_port.bl` is the `.bl` port of `lib/beam_lisp/z3_port.ex`,
+; compiled FUNCTIONS-ONLY by `BeamLisp.AOT/compile_host_file` into the exact atom
+; `Elixir.BeamLisp.Z3Port`. Nothing here replaces the live module: the source is
+; compiled at its OWN probe atom, the namespace shim beside it is dropped, and
+; the pinned beam is loaded ALONE — so a leftover shim reference would be `undef`.
+;
+; The ABI and the protocol are both checked:
+;
+;   * the CALLABLE SURFACE: every export of the live module is exported by the
+;     probe at the same arity; the source's `defn-` helpers are exported on
+;     BOTH production and probe pinned beams and are asserted by name.
+;   * the PROTOCOL: a deterministic fake solver — a shell script that logs every
+;     line it reads and answers from a fixed script — drives both modules, and
+;     the answers AND the wire bytes (the log) must be identical: framing, the
+;     check-sat sanitizer, `(echo …)` acknowledgement, `(get-model)`,
+;     `(get-unsat-core)`, `check-sat-assuming`, push/pop scoping, and `unknown`
+;     with its `:reason-unknown` round trip.
+;   * the EDGES: read timeouts (raise vs. bounded error), a dead child (exit),
+;     `alive?`/`close`, and `open_port`'s artifact resolution + `BEAM_LISP_Z3`
+;     pin. Real verdicts are checked against the pinned z3 binary as well.
+;
+; Every port here is opened BY THIS TEST and closed by it; the pool
+; (`priv/std/z3pool.bl`) is never started, so no user solver process is touched.
+;
+; Run: bin/bl test test/bl/host_z3_port_test.bl
+
+(ns host.z3_port.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (let [d (str (System/tmp_dir!) "/bl_host_z3_port_" (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p! d)
+    d))
+
+(defn- source [] (Path/join (BeamLisp/cwd) "priv/host/z3_port.bl"))
+
+(def ^:private probe-mod :Elixir.BeamLisp.HostZ3PortProbe)
+(def ^:private probe-shim :Elixir.BeamLisp.Ns.Host.Z3Port)
+(def ^:private live :Elixir.BeamLisp.Z3Port)
+
+(defn- drop! [mod] (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-pinned! [mod path]
+  (do (drop! mod)
+      (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+      mod))
+
+(defn- compile-probe!
+  "Compile the pinned source at the probe atom and publish ONLY the pinned beam:
+   the compile's own load (and the namespace shim it built beside it) is dropped
+   first, so every call below runs against the pinned code alone."
+  [dir]
+  (let [res (BeamLisp.AOT/compile_host_file (source)
+              (list (t2 :module probe-mod) (t2 :output_dir dir) (t2 :load? false)))]
+    (load-pinned! probe-mod (elem res 1))
+    (drop! probe-shim)
+    probe-mod))
+
+(defn- write-script!
+  "Write an executable shell script; return its path."
+  [dir name body]
+  (let [p (Path/join (list dir name))]
+    (File/write! p (str "#!/bin/sh\n" body))
+    (File/chmod! p 493)
+    p))
+
+(defn- open-port! [exe args]
+  (erlang/open_port (erlang/list_to_tuple (list :spawn_executable exe))
+                    (list :binary :stream :use_stdio (t2 :args args))))
+
+(defn- close! [p]
+  (try (do (erlang/port_close p) :ok)
+       (catch _e :ok)))
+
+(defn- outcome
+  "`[:value v]` or `[:raise Class message]` — lets a corpus compare calls that
+   may or may not raise, CLASS included."
+  [f]
+  (try (list :value (f))
+       (catch e (list :raise (:__struct__ e) (ex-message e)))))
+
+(defn- with-env [name value f]
+  (let [old (System/get_env name)]
+    (try
+      (do (System/put_env name value) (f))
+      (finally (if (nil? old)
+                 (System/delete_env name)
+                 (System/put_env name old))))))
+
+; ── the deterministic fake solver ────────────────────────────────────────
+;
+; A shell script that reads SMT-LIB lines and answers from a FIXED script. `$1`
+; is an optional log path (the module's own `open_port/0` passes `-in`, which the
+; `/*` guard ignores), and every line read is appended to it — so the test can
+; assert the exact bytes the driver WROTE, not merely the answers it read.
+
+(defn- z3-script
+  [status reason]
+  (str "log=\"\"\n"
+       "case \"$1\" in /*) log=\"$1\" ;; esac\n"
+       "while IFS= read -r line; do\n"
+       "  if [ -n \"$log\" ]; then printf '%s\\n' \"$line\" >> \"$log\"; fi\n"
+       "  case \"$line\" in\n"
+       "    \"(check-sat)\") printf '" status "\\n' ;;\n"
+       "    \"(check-sat-assuming\"*) printf '" status "\\n' ;;\n"
+       "    \"(get-model)\") printf '(model\\n  (define-fun x () Int 0))\\n' ;;\n"
+       "    \"(get-unsat-core)\") printf '(n1)\\n' ;;\n"
+       "    \"(get-info :reason-unknown)\") printf '" reason "\\n' ;;\n"
+       "    *bl-ok*) printf '~~bl-ok~~\\n' ;;\n"
+       "    *) : ;;\n"
+       "  esac\n"
+       "done\n"))
+
+(defn- error-script
+  "A solver that refuses every command with an `(error …)` line, then waits — so
+   the error line is read on its own, before any marker could arrive — and then
+   EXITS, so the double never outlives the test's scratch directory (a second
+   iteration would append to a path the test has already removed)."
+  []
+  (str "log=\"\"\n"
+       "case \"$1\" in /*) log=\"$1\" ;; esac\n"
+       "while IFS= read -r line; do\n"
+       "  if [ -n \"$log\" ]; then printf '%s\\n' \"$line\" >> \"$log\"; fi\n"
+       "  printf '(error \"boom\")\\n'\n"
+       "  sleep 1\n"
+       "  exit 0\n"
+       "done\n"))
+
+(defn- silent-script
+  "A solver that consumes every command and never answers."
+  []
+  (str "while IFS= read -r line; do :; done\n"))
+
+(defn- run-both
+  "Run `run-fn` against the probe and the live module, each on its OWN fake
+   binary and log, and return both answer lists plus both logs."
+  [dir tag script run-fn]
+  (let [fake-p (write-script! dir (str tag "-probe.sh") script)
+        fake-l (write-script! dir (str tag "-live.sh") script)
+        log-p (str dir "/" tag "-probe.log")
+        log-l (str dir "/" tag "-live.log")
+        _ (File/write! log-p "")
+        _ (File/write! log-l "")]
+    (let [rp (run-fn probe-mod fake-p log-p)
+          rl (run-fn live fake-l log-l)]
+      {:probe rp :live rl
+       :log-probe (File/read! log-p) :log-live (File/read! log-l)})))
+
+; ── the callable surface ─────────────────────────────────────────────────
+
+(def ^:private probe-published-helpers
+  "The `defp` helpers of `lib/beam_lisp/z3_port.ex`. A pinned host module is
+   FUNCTIONS-ONLY — `compile_host_file` refuses value definitions and emits every
+   `defn`/`defn-` as an export — so the probe publishes exactly these, which the
+   check below freezes rather than leaves unnoticed."
+  (list (t2 :balanced? 1) (t2 :candidate_paths 0) (t2 :extract_reason 1)
+        (t2 :missing_solver_message 0) (t2 :read_answer 2) (t2 :read_sexp 2)
+        (t2 :read_until_marker 3) (t2 :resolve_exe 0)))
+
+(deftest the-pinned-port-carries-the-live-callable-surface
+  (testing "every live export is exported by the probe at the same arity"
+    (let [dir (tmp-dir)]
+      (compile-probe! dir)
+      (let [live-x (erlang/apply live :module_info (list :exports))
+            want (Enum/sort (Enum/reject live-x
+                              (fn [e] (erlang/== :__info__ (erlang/element 1 e)))))
+            got (Enum/sort (erlang/apply probe-mod :module_info (list :exports)))
+            extra (Enum/sort (Enum/reject got (fn [e] (Enum/member? want e))))]
+        ; nothing the live module offered is lost, arity for arity
+        (is (every? (fn [e] (Enum/member? got e)) want)
+            "the probe exports every live callable at the same arity")
+        ; Production and probe are pinned from the same source; helpers are
+        ; present in both rather than an export delta against legacy Elixir.
+        (is (= () extra) "the production and probe exports match")
+        (is (every? (fn [e] (Enum/member? got e)) probe-published-helpers)
+            "the pinned private helpers remain exported")
+        ; `__info__/1` is Elixir's own module introspection, which a pinned
+        ; functions-only beam does not synthesize (that arrives with
+        ; `:struct_fields`/`:macro_exports`, neither of which applies here).
+        (is (not (Enum/member? want (t2 :__info__ 1))))
+        (is (not (erlang/function_exported live :__info__ 1)))
+        (is (not (erlang/function_exported probe-mod :__info__ 1)))
+        (File/rm_rf! dir)))))
+
+; ── the protocol, answer for answer and byte for byte ────────────────────
+
+(defn- protocol-run
+  ;; FRAMING, in one place: `raw_check` CONCATENATES its script with `(check-sat)`,
+  ;; so a script must be newline-terminated; `raw_scoped` and `raw_command` insert
+  ;; their own newline, so theirs must NOT be. The wire assertion below pins both.
+  [mod exe log]
+  (let [p (open-port! exe (list log))]
+    (try
+      (let [r1 (erlang/apply mod :raw_check (list p "(assert (> x 0))\n" false))
+            ; the caller's own (check-sat) must be stripped, or z3 answers twice
+            r2 (erlang/apply mod :raw_check
+                  (list p "(declare-const y Int)\n(assert (= y 1))\n(check-sat)" true))
+            r3 (erlang/apply mod :raw_command (list p "(push 1)"))
+            r4 (erlang/apply mod :raw_check_here
+                  (list p {:assume (list "a" "b") :core? false :model? false}))
+            r5 (erlang/apply mod :raw_check_here3 (list p (list "a") false true))
+            r6 (erlang/apply mod :raw_scoped (list p "(assert (= x 2))" true))]
+        (Process/sleep 150)
+        (list r1 r2 r3 r4 r5 r6))
+      (finally (close! p)))))
+
+(defn- protocol-wire
+  []
+  (str "(reset)\n(assert (> x 0))\n(check-sat)\n"
+       "(reset)\n(declare-const y Int)\n(assert (= y 1))\n(check-sat)\n(get-model)\n"
+       "(push 1)\n(echo \"~~bl-ok~~\")\n"
+       "(check-sat-assuming (a b))\n"
+       "(check-sat-assuming (a))\n(get-model)\n"
+       "(push 1)\n(assert (= x 2))\n(check-sat)\n(get-model)\n(pop 1)\n"))
+
+(deftest the-protocol-is-identical-on-a-deterministic-solver
+  (testing "answers and wire bytes match the frozen shapes, and the live module"
+    (let [dir (tmp-dir)
+          script (z3-script "sat" "(:reason-unknown \"timeout\")")
+          model "(model\n  (define-fun x () Int 0))\n"
+          expected (list {:status "sat" :model nil}
+                         {:status "sat" :model model}
+                         {:ok true :output ""}
+                         {:status "sat" :core nil}
+                         {:status "sat" :core nil :model model}
+                         {:status "sat" :core nil :model model})
+          _ (compile-probe! dir)
+          r (run-both dir "proto" script protocol-run)]
+      ; the FROZEN ABI: the answers are pinned values, not merely probe == live
+      (is (= expected (:probe r)) "the pinned answers are the source's answers")
+      ; and the live module must agree, answer for answer
+      (is (= (:probe r) (:live r)) "probe and live answer identically")
+      ; THE WIRE: every byte the driver wrote, sanitizer included
+      (is (= (protocol-wire) (:log-probe r)) "the probe writes the pinned bytes")
+      (is (= (:log-probe r) (:log-live r)) "probe and live write identical bytes")
+      (File/rm_rf! dir))))
+
+(defn- unsat-run
+  [mod exe log]
+  (let [p (open-port! exe (list log))]
+    (try
+      (let [r1 (erlang/apply mod :raw_check (list p "(assert false)\n" false))
+            r2 (erlang/apply mod :raw_check_here
+                  (list p {:assume (list) :core? true :model? false}))
+            r3 (erlang/apply mod :raw_scoped (list p "(assert false)" false))]
+        (Process/sleep 150)
+        (list r1 r2 r3))
+      (finally (close! p)))))
+
+(deftest refusals-and-unsat-cores-match
+  (testing "unsat, the unsat core, and a scoped refutation"
+    (let [dir (tmp-dir)]
+      (compile-probe! dir)
+      (let [r (run-both dir "unsat" (z3-script "unsat" "(:reason-unknown \"timeout\")")
+                unsat-run)]
+        (is (= (list {:status "unsat" :why nil :model nil}
+                     {:status "unsat" :core "(n1)\n"}
+                     {:status "unsat" :core nil :model nil})
+               (:probe r)))
+        (is (= (:probe r) (:live r)))
+        (is (= (:log-probe r) (:log-live r)))
+        (is (= (str "(reset)\n(assert false)\n(check-sat)\n"
+                    "(check-sat)\n(get-unsat-core)\n"
+                    "(push 1)\n(assert false)\n(check-sat)\n(pop 1)\n")
+               (:log-probe r))))
+      (File/rm_rf! dir))))
+
+(defn- unknown-run
+  [mod exe log]
+  (let [p (open-port! exe (list log))]
+    (try
+      (let [r1 (erlang/apply mod :raw_check (list p "(assert hard)\n" false))
+            ; a decided verdict never asks for a reason (no round trip)
+            r2 (erlang/apply mod :raw_reason (list p "sat" ""))
+            r3 (erlang/apply mod :raw_reason (list p "unknown" ""))]
+        (Process/sleep 150)
+        (list r1 r2 r3))
+      (finally (close! p)))))
+
+(deftest undecided-verdicts-keep-their-reason
+  (testing "unknown carries `:reason-unknown`; an empty reason is nil, not a guess"
+    (let [dir (tmp-dir)]
+      (compile-probe! dir)
+      (let [r (run-both dir "unknown" (z3-script "unknown" "(:reason-unknown \"timeout\")")
+                unknown-run)]
+        (is (= (list {:status "unknown" :model nil :why "timeout"} nil "timeout")
+               (:probe r)))
+        (is (= (:probe r) (:live r)))
+        (is (= (:log-probe r) (:log-live r)))
+        (is (= (str "(reset)\n(assert hard)\n(check-sat)\n"
+                    "(get-info :reason-unknown)\n"
+                    "(get-info :reason-unknown)\n")
+               (:log-probe r)))
+        ; an EMPTY reason string comes back nil — never readable as a name
+        (let [empty (run-both dir "unknown-empty"
+                      (z3-script "unknown" "(:reason-unknown \"\")") unknown-run)]
+          (is (= (list {:status "unknown" :model nil :why nil} nil nil)
+                 (:probe empty)))
+          (is (= (:probe empty) (:live empty)))))
+      (File/rm_rf! dir))))
+
+(defn- command-run
+  [mod exe log]
+  (let [p (open-port! exe (list log))]
+    (try
+      (let [r (erlang/apply mod :raw_command (list p "(oops)"))]
+        (Process/sleep 150)
+        r)
+      (finally (close! p)))))
+
+(deftest a-refused-command-does-not-desynchronize-the-reader
+  (testing "an `(error …)` line is reported, not left to poison the next read"
+    (let [dir (tmp-dir)]
+      (compile-probe! dir)
+      (let [r (run-both dir "error" (error-script) command-run)]
+        (is (= {:ok false :error "(error \"boom\")" :output "(error \"boom\")"}
+               (:probe r)))
+        (is (= (:probe r) (:live r)))
+        (is (= (:log-probe r) (:log-live r)))
+        (is (includes? (:log-probe r) "(oops)") "the command reached the solver"))
+      (File/rm_rf! dir))))
+
+; ── the edges: timeouts, a dead child, alive?/close ──────────────────────
+
+(defn- read-timeout-run
+  [mod exe _log]
+  (let [p (open-port! exe (list))]
+    (try
+      (list (outcome (fn [] (erlang/apply mod :raw_check (list p "(assert true)" false))))
+            (outcome (fn [] (erlang/apply mod :raw_command (list p "(reset)")))))
+      (finally (close! p)))))
+
+(deftest a-silent-solver-hits-the-read-deadline
+  (testing "an answer that never comes raises in read_answer; a stray byte is read for a max"
+    (let [dir (tmp-dir)]
+      (compile-probe! dir)
+      (with-env "BL_Z3_READ_TIMEOUT" "150"
+        (fn []
+          (let [r (run-both dir "silent" (silent-script) read-timeout-run)]
+            (is (= (list (list :raise :Elixir.RuntimeError "z3 timeout (acc: \"\")")
+                         (list :value {:ok false
+                                       :error "timeout waiting for z3 to acknowledge"
+                                       :output ""}))
+                   (:probe r)))
+            (is (= (:probe r) (:live r))))))
+      (File/rm_rf! dir))))
+
+(defn- await-dead
+  [mod p]
+  (loop [n 0]
+    (cond
+      (not (erlang/apply mod :alive? (list p))) true
+      (erlang/> n 100) false
+      :else (do (Process/sleep 20) (recur (erlang/+ n 1))))))
+
+(defn- dead-child-run
+  [mod exe _log]
+  (let [p (open-port! exe (list))
+        dead (await-dead mod p)]
+    (try
+      (list dead
+            (erlang/apply mod :alive? (list p))
+            ; a closed port refuses the write — the honest report, not a hang
+            (outcome (fn [] (erlang/apply mod :raw_check (list p "(assert true)" false))))
+            (erlang/apply mod :close (list p))
+            (erlang/apply mod :alive? (list p)))
+      (finally (close! p)))))
+
+(deftest a-child-that-exits-leaves-a-closed-port
+  (testing "exit is visible to alive?; writing to the dead port raises, as ever"
+    (let [dir (tmp-dir)
+          true-exe (or (System/find_executable "true") "/bin/true")]
+      (compile-probe! dir)
+      (let [r (run-both dir "dead" "" (fn [mod _exe _log] (dead-child-run mod true-exe nil)))]
+        (is (= (list true false (list :raise :Elixir.ArgumentError "argument error") :ok false)
+               (:probe r)))
+        (is (= (:probe r) (:live r))))
+      ; alive?/close on a live port, and alive? on a non-port
+      (let [p (open-port! (or (System/find_executable "cat") "/usr/bin/cat") (list))]
+        (is (erlang/apply probe-mod :alive? (list p)))
+        (is (= (erlang/apply probe-mod :alive? (list p))
+               (erlang/apply live :alive? (list p))))
+        (is (= (erlang/apply probe-mod :close (list p)) :ok))
+        (is (= (erlang/apply probe-mod :alive? (list p)) false))
+        (is (= (erlang/apply probe-mod :close (list p)) :ok)
+            "closing an already-closed port is idempotent")
+        (is (= (erlang/apply probe-mod :alive? (list 42))
+               (erlang/apply live :alive? (list 42))))
+        (is (= (erlang/apply probe-mod :alive? (list 42)) false)))
+      (File/rm_rf! dir))))
+
+; ── resolution, the env pin, and the read-timeout knob ───────────────────
+
+(deftest open-port-resolves-the-pinned-artifact
+  (testing "default resolution opens the repo's pinned z3 and answers a real query"
+    (let [dir (tmp-dir)]
+      (compile-probe! dir)
+      (let [rp (erlang/apply probe-mod :open_port (list))
+            rl (erlang/apply live :open_port (list))]
+        (is (erlang/== :ok (erlang/element 1 rp)))
+        (is (erlang/== :ok (erlang/element 1 rl)))
+        (is (erlang/is_port (erlang/element 2 rp)))
+        (let [a (erlang/apply probe-mod :raw_check
+                  (list (erlang/element 2 rp) "(declare-const x Int)\n(assert (= x 3))" true))
+              b (erlang/apply live :raw_check
+                  (list (erlang/element 2 rl) "(declare-const x Int)\n(assert (= x 3))" true))]
+          (is (= "sat" (erlang/map_get :status a)))
+          (is (= a b)))
+        (is (= (erlang/apply probe-mod :close (list (erlang/element 2 rp))) :ok))
+        (is (= (erlang/apply live :close (list (erlang/element 2 rl))) :ok)))
+      (File/rm_rf! dir))))
+
+(deftest beam_lisp-z3-pins-another-artifact
+  (testing "BEAM_LISP_Z3 takes precedence over priv/z3/bin/z3 for both modules"
+    (let [dir (tmp-dir)
+          fake (write-script! dir "pin.sh" (z3-script "sat" "(:reason-unknown \"timeout\")"))]
+      (compile-probe! dir)
+      (with-env "BEAM_LISP_Z3" fake
+        (fn []
+          (let [rp (erlang/apply probe-mod :open_port (list))
+                rl (erlang/apply live :open_port (list))]
+            (is (erlang/== :ok (erlang/element 1 rp)))
+            (is (erlang/== :ok (erlang/element 1 rl)))
+            ; the FAKE answers `sat` even for `(assert false)` — the ONLY way to
+            ; tell this apart is where the port points
+            (let [a (erlang/apply probe-mod :raw_check
+                      (list (erlang/element 2 rp) "(assert false)\n" false))
+                  b (erlang/apply live :raw_check
+                      (list (erlang/element 2 rl) "(assert false)\n" false))]
+              (is (= {:status "sat" :model nil} a))
+              (is (= a b))
+              (is (= "sat" (erlang/map_get :status a))))
+            (erlang/apply probe-mod :close (list (erlang/element 2 rp)))
+            (erlang/apply live :close (list (erlang/element 2 rl))))))
+      ; the env pin is gone again: the default still resolves the pinned artifact
+      (is (erlang/== :ok (erlang/element 1 (erlang/apply probe-mod :open_port (list)))))
+      (File/rm_rf! dir))))
+
+(deftest env-ms-and-read-timeout-parity
+  (testing "positive integers read; junk, zero and negatives fall back"
+    (let [dir (tmp-dir)]
+      (compile-probe! dir)
+      (doseq [v ["5000" "0" "-3" "abc" "12x" "" " 7" "7 "]]
+        (with-env "BL_Z3_READ_TIMEOUT" v
+          (fn []
+            (is (= (erlang/apply live :read_timeout (list))
+                   (erlang/apply probe-mod :read_timeout (list)))
+                (str "read_timeout parity for " (pr-str v))))))
+      (is (= 5000 (with-env "BL_Z3_READ_TIMEOUT" "5000"
+                     (fn [] (erlang/apply probe-mod :read_timeout (list))))))
+      (is (= 20000 (with-env "BL_Z3_READ_TIMEOUT" "0"
+                      (fn [] (erlang/apply probe-mod :read_timeout (list))))))
+      (is (= 20000 (with-env "BL_Z3_READ_TIMEOUT" "-3"
+                      (fn [] (erlang/apply probe-mod :read_timeout (list))))))
+      (is (= 20000 (with-env "BL_Z3_READ_TIMEOUT" "abc"
+                      (fn [] (erlang/apply probe-mod :read_timeout (list))))))
+      (is (= 7 (with-env "BL_Z3_READ_TIMEOUT" "7"
+                  (fn [] (erlang/apply probe-mod :read_timeout (list))))))
+      ; env_ms/2's own contract, called directly
+      (is (= 3 (with-env "BL_Z3_READ_TIMEOUT" "3"
+                 (fn [] (erlang/apply probe-mod :env_ms (list "BL_Z3_READ_TIMEOUT" 99))))))
+      (is (= 99 (with-env "BL_Z3_READ_TIMEOUT" "nope"
+                  (fn [] (erlang/apply probe-mod :env_ms (list "BL_Z3_READ_TIMEOUT" 99))))))
+      (is (= 99 (erlang/apply probe-mod :env_ms (list "BL_NO_SUCH_ENV_VAR_AT_ALL" 99))))
+      (File/rm_rf! dir))))
+
+; ── real verdicts, against the pinned binary ─────────────────────────────
+
+(defn- real-z3 []
+  (let [pinned (Path/join (list (BeamLisp.Tiers/priv_root) "z3" "bin" "z3"))]
+    (if (File/exists? pinned) pinned (System/find_executable "z3"))))
+
+(defn- real-run
+  ;; ORDER IS LOAD-BEARING: z3 4.16's push/pop stops behaving after an
+  ;; `(assert false)` + check-sat in the same context (measured: `(reset)`, assert
+  ;; x=3, check, reset, assert false, check, push, assert x=5, check, pop, check
+  ;; answers a trailing `unsat` on BOTH the pinned and the system binary, while
+  ;; the same script without the `(assert false)` answers `sat`). The scoped
+  ;; conversation therefore runs FIRST, and the one-shot refutation last — so
+  ;; every verdict here is about the driver, not about that solver quirk.
+  [mod exe _log]
+  (let [p (open-port! exe (list "-in"))]
+    (try
+      (let [; a CONVERSATION: the prelude once, then questions in one state
+            _ (erlang/apply mod :raw_command
+                  (list p "(declare-const x Int)\n(assert (= x 3))\n"))
+            here (erlang/apply mod :raw_check_here
+                   (list p {:assume (list) :core? false :model? false}))
+            ; a SCOPED contradiction — push/assert/check/pop in ONE call
+            scoped (erlang/apply mod :raw_scoped (list p "(assert (= x 5))" false))
+            ; … and the pop is real: x=3 alone is satisfiable again
+            after (erlang/apply mod :raw_check_here
+                    (list p {:assume (list) :core? false :model? false}))
+            ; one-shot checks, each resetting first
+            sat (erlang/apply mod :raw_check
+                  (list p "(declare-const x Int)\n(assert (= x 3))\n" true))
+            unsat (erlang/apply mod :raw_check (list p "(assert false)\n" false))]
+        (list (erlang/map_get :status here)
+              (erlang/map_get :status scoped)
+              (erlang/map_get :status after)
+              (erlang/map_get :status sat)
+              (erlang/map_get :status unsat)
+              (some? (erlang/map_get :model sat))))
+      (finally (close! p)))))
+
+(deftest real-verdicts-match-the-live-module
+  (testing "sat / unsat / scoped push-pop, against the pinned z3"
+    (let [dir (tmp-dir)
+          exe (real-z3)]
+      (compile-probe! dir)
+      (is (some? exe) "a z3 binary is resolvable")
+      (let [a (real-run probe-mod exe nil)
+            b (real-run live exe nil)]
+        (is (= (list "sat" "unsat" "sat" "sat" "unsat" true) a) "the pinned verdicts")
+        (is (= a b) "probe and live return the same verdicts"))
+      (File/rm_rf! dir))))

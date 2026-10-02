@@ -1229,3 +1229,150 @@ from a before/after pair on this host.
 REMAINING: ~0.07 ms above the ceiling. Floats are now the most expensive leaf (61 ns/value
 against ints at 19), which points at the `Encoder::encode(&f64)` path rather than at
 containers.
+
+NOTE [2026-09-21]: INTEGRATION VERIFIED END-TO-END (the question "is this actually in beam-lisp?" — yes, and now with evidence rather than a claim).
+
+THREE LAYERS, all checked:
+1. ROUTE — bl.json:100 requires bl.json-native; :447 calls (native/json-encode v); :653 calls
+   (native/json-decode s keys). bl.json-native declares (defnative "bl_json" (json-encode 1)
+   (json-decode 2) (json-count 1)) -> vm.native -> erlang/load_nif on priv/native/bl_json.so.
+   No production path bypasses it: the only remaining Jason/ references are 4 lines in json.bl
+   (the documented foreign-struct escape hatch), bench/json.bl (the control), and
+   json_differential_test.bl (the differential oracle).
+2. BUILD — native/bl_json/ (Cargo.toml + Cargo.lock tracked) is found by build-native's glob
+   <root>/native/*, so no list has to be maintained; the cdylib installs to
+   priv/native/<crate>.so, the exact name vm.native/artifact-name asks for. priv/native/* is
+   gitignored, so the .so is a build product and never a committed binary — correct.
+3. THE ARTEFACT — sha256 closes it:
+     store key 1044dd4d… built 16:04:48  548584  38c5872b03edd347
+     priv/native/bl_json.so              548584  38c5872b03edd347
+     the file I benchmarked              548584  38c5872b03edd347
+   The build's native-key is a digest over the crate source, so a cache hit PROVES that
+   artefact belongs to the current source — the build is self-verifying here. And the three
+   digests being identical proves the performance numbers describe what bl build ships.
+
+ALARM AND RETRACTION, worth recording as a method lesson: I first read the store as holding a
+DIFFERENT 548584-byte artefact, which would have meant the build ships something other than
+what I measured. That was my error — a `find … | head -3` loop hashed three files that all
+belonged to a single store key, and I compared the wrong one. The install guard in
+install-artifact! (size, then digest) was right the whole time: it skipped the copy because
+the bytes were equal. Rule: when hashing a set, print the KEY next to each digest, never
+assume find's order gives you the candidate you mean.
+
+Also confirmed: install-artifact! renames rather than overwriting, because bl build runs in
+the VM that has these .so files mapped as NIFs — a truncating copy drops mapped PTEs and the
+next relocated .got slot reads zero, which was the SIGSEGV history.
+
+NOTE [2026-09-21]: TRIED AND REJECTED: dropping serde_json's `arbitrary_precision` for float speed. The suites caught it, and the reason is worse than a perf miss — it is silent data loss.
+
+WHAT I FOUND — the float cost of the flag, now measured deterministically:
+`json-count` is a noise-free discriminator here, because the flag changes how many visits a
+number takes. With the flag ON: `[1.5]` counts 3, `[1.5,"x",[2]]` counts 6. With it OFF:
+2 and 5. In-range integers are UNAFFECTED — `[1,2,3]` counts 4 and `{"a":1}` counts 2
+either way, and 1500 ints counts 1501 either way. So the flag is a FLOAT-SIDE cost only:
+a float arrives as a one-entry map, paying an extra visit plus a String for the key and
+another for the value, then a full-precision f64 parse. That is the 54 ns float boundary
+cost, and my earlier hypothesis (rustler's `Encoder::encode(&f64)`) was WRONG.
+
+WHY IT CANNOT BE DROPPED: without the flag serde_json does NOT error on an integer wider
+than i64/u64 — it SILENTLY produces an f64.
+  expected: 123456789012345678901234567890
+    actual: 1.2345678901234568e29
+Six tests catch it (bl.json-test/integers-are-exact, data-survives-a-round-trip, four in
+json_differential_test). The flag is the only thing keeping the lexeme in hand so bl.json
+can DECLINE to otp-decode and let the BEAM build a real bignum — a NIF cannot.
+
+THE INSTRUMENT THAT LIED, which is the lesson worth keeping: I had been quoting
+`/tmp/v.bl`'s "bignum exact" line as evidence for the bignum guarantee. It reads
+  (println "bignum exact:" (j/encode 123456789012345678901234567890))
+— ENCODE, against a literal the compiler had already made exact. It never touched the
+DECODER, which is the only place the flag matters. It printed "bignum exact" on the broken
+arm. Self-authored smoke tests are evidence of coverage, not of correctness: I wrote a
+check that exercised the half I had not broken, run it, watched it pass, and treated the
+pass as evidence about the other half. Only a test I did not write to please myself
+(json_test's `(= 123456789012345678901234567890 (j/decode "…"))`) had teeth.
+
+ALSO: `pertype.bl` measured parse and decode SEQUENTIALLY, so on a host whose noise swings
+18x they landed in different regimes — one row even went negative. Replaced with PAIRED
+sampling (measure parse then decode inside one sample, take the median of the differences),
+which cancels the drift. Negative control holds: strings and arrays, which contain no
+numbers, read the same in both arms.
+
+DISPOSITION: flag kept; both comments (Cargo.toml, and the CountSeed visit_map note) now
+say why, and name the ONE remaining lever: read the AP lexeme without allocating rather
+than dropping the flag. Verified after the comment-only rebuild that `bl build` compiles
+the crate for real (log: "bl_json — building" then "built") and produces BYTE-IDENTICAL
+output, 548584 / 38c5872b03edd347 — so release+LTO carries no path dependence, which is
+also why the earlier store-artefact digest match was meaningful. Suites green (163 + 940).
+
+NOTE [2026-09-21]: SPIKE RESULT: the remaining optimisation levers are SPENT, and two of them were measured and REJECTED. Recording the numbers so nobody re-tries them blind.
+
+LEVER 1 — borrowed keys (`Cow<'de, str>` instead of `String` in visit_map): REJECTED.
+Premise was wrong. `serde_json`'s key reader already reuses a scratch buffer, so a
+per-key allocation was never happening. Pure-Rust bench, 51 samples, one strategy per
+monomorph (the first attempt put both paths in one function and was itself misleading):
+  flat500 keys:  String 32.53 us   COW 47.50 us   -> COW 46% SLOWER
+  float doc:     String 99.46 us   COW 79.57 us   -> COW 20% faster — but the bench
+                 cannot separate the AP-marker KEY from the lexeme VALUE, so no claim
+                 either way.
+Raw cost of a short String alloc on this host: 14.4 ns. Against a 64 us BEAM boundary
+that is ~8%, and the BEAM-level paired A/B could not resolve it at all (every measured
+value moved by 2-3x between samples 30 s apart). Reverted: an unproven change whose only
+clean instrument says it is a regression on short keys is not worth shipping.
+
+LEVER 2 — the output-buffer copy in json_encode (Vec -> OwnedBinary): measured by
+arithmetic, under 1% of a 24.3 KB encode. Not worth code.
+
+LEVER 3 — what is actually left: with the parse at 0.12 ms of a 0.22 ms decode and BEAM's
+own construction of the same values from ETF at 0.06 ms, the residue is the parse plus
+~2x BEAM's own term builder. No single hotspot, and nothing left that is cheap.
+
+ALSO FIXED: the crate header still advertised the pre-native table (decode 0.85 ms vs
+Jason 0.35 ms, "the remaining 2.5x gap...") and claimed BYTE-compatibility. Both were
+stale: decode is 0.22 ms against Jason's 0.23 ms, and the directions are VALUE-compatible
+only — a float can come back as `35000000000.0` where bl's walk wrote `3.5e10`.
+
+BUILD REPRODUCIBILITY, a correction to something I recorded wrong: a comment-only edit
+changed the .so's digest (38c5872b -> c0e0ff28) and I first called the toolchain
+non-deterministic. It is not. The two artefacts are 548584 bytes each, differ in 29 bytes
+out of 548584, and have IDENTICAL strings tables — the difference is the ELF build-id note
+at offset ~697. The code is identical; only a hash differs. Conclusion that matters:
+a sha256 is NOT a proxy for code equality here, and the store's source-digest key is the
+right identity. Corollary: the install guard's whole-file digest check re-installs after a
+comment edit, which is correct — the file genuinely differs — and stable when the source
+is unchanged.
+
+NOTE [2026-09-22]: INSTRUMENT DEFECT, PARTLY FIXED (commit 0e1ef227).
+
+bench/json.bl timed its decode layers one after another - 51 samples of the NIF, then 51 of
+OTP, then 51 of bl.json, then 51 of Jason - so each layer landed in the noise regime of its
+own second. That is fatal on this host. The same calls measured full/NIF = 1.81 ordered and
+0.82 rotated, twenty minutes apart, and I raised a false alarm on the strength of the
+ordered run ("bl.json/decode is 2x the NIF") which a seven-layer rotated bisect then
+refuted: every step from the bare NIF to bl.json/decode sat within +-25% of every other, and
+the wrapper is only let + normalize-opts + try + first/second over the same NIF call. The
+wrapper is free - interleaved it measures 0.96x the raw NIF.
+
+FIXED: the decode layers are now measured inside one sample, in rotated order. Fresh
+interleaved run on the 24.3 KB document: bl.json 0.40, NIF 0.42, OTP 0.42, Jason 0.49.
+bl.json is at parity-or-better with Jason on every shape except the ~110-byte frame, where
+crossing into the NIF is not paid back. The crate header carries these numbers now, framed
+as one interleaved run, with a note that they are order-sensitive and drift 2-5x.
+
+STILL OPEN, same root cause, NOT fixed:
+ 1. The ENCODE half of the same file still measures its layers sequentially. Its
+    cross-layer ratios (bl.json/Jason - frame 6.0, flat 3.7, mixed 0.74) carry the identical
+    defect and must be re-measured before anyone quotes them again.
+ 2. bl.json/encode's docstring quotes 37.7x / 29.2x / 6.8x / 1.05x from a "best of 15"
+    pre-native comparison - same class of instrument, unverified since. Only the FLOAT
+    SPELLING finding there (value-identical, not byte-identical) still stands, and it was
+    separately confirmed.
+ 3. "the parse is ~half of a mixed decode" in the crate header rests on json-count, which was
+    NOT re-run this session. It is carried. json-count is the one instrument here that is not
+    timing-based at all (it counts visits deterministically), so it is the most trustworthy
+    of the three - but it is carried, not re-observed.
+
+Lessons to keep: (a) interleave and rotate, or the instrument reports the host and not the
+code; (b) a median over 51 samples does not make an ordered measurement safe, because all 51
+sit in one regime; (c) this same flaw had already been fixed once in pertype.bl - when a
+measurement flaw is found, grep for the pattern rather than trusting it was a one-off.

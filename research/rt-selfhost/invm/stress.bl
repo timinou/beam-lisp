@@ -1,0 +1,467 @@
+; stress.bl — scheduler responsiveness and call latency under controlled load.
+;
+; WHAT THIS IS. `(invm.stress/run ir-path)` is the *contention* half of
+; PLAN-141. It answers one question: when the kernel is called from N concurrent
+; beam-lisp workers on a deliberately tiny scheduler set, what happens to the
+; calls themselves and to an unrelated process that just wants to wake up on
+; time?
+;
+; Everything here is beam-lisp. The only non-BL things it touches are
+; `fusion.invm` (the NIF namespace MAIN declares first), `invm.host` (MAIN's
+; normalizer, for `stats`), `fusion.pipeline` (the BL/RT reference and the
+; generated BEAM module), and `fusion.driver`'s protocol-free surface is not
+; needed here at all.
+;
+; THE CONTROLLED VM. MAIN launches this in a child VM pinned to
+; `+S1:1 +SDcpu1:1 +SDio2`. The environment is captured and reported, never
+; asserted — this module measures *whatever* scheduler set it is handed.
+;
+; THE FOUR MEASUREMENTS, one phase each:
+;
+;   :beam         Elixir.Krt.FusedPipeline.run/2 over 1 MiB — the preemptible
+;                 generated-BEAM baseline. Reductions let the scheduler rotate.
+;   :regular      kernel-call over 4096 B — the bounded regular-NIF path. A
+;                 regular NIF runs to completion without yielding, so a call is
+;                 a scheduler stall of its own bounded size.
+;   :dirty        kernel-call-dirty over 1 MiB — the off-scheduler path. With
+;                 one dirty CPU scheduler, four callers queue there while the
+;                 normal scheduler stays free.
+;   :noop / :noop-dirty
+;                 kernel-noop[bin init] / kernel-noop-dirty[bin init] — the same
+;                 ENTRY with no kernel behind it. This separates entry/argument
+;                 cost from kernel cost; it is not a throughput competitor.
+;
+; A HEARTBEAT process wakes every 2 ms for the whole phase and records the gap
+; between wakeups. A baseline heartbeat is taken BEFORE any load. That gap is
+; the scheduler-responsiveness signal: it is the number that says whether the
+; normal scheduler was available while work was happening.
+;
+; BUDGETS. Each worker runs until 100 calls or 1000 ms, whichever comes first,
+; and never for less than 150 ms. The floor exists because the cheap paths cost
+; microseconds per call: 100 calls of a 4096 B entry would finish inside one
+; heartbeat interval and the phase would report NO responsiveness samples at
+; all. Latencies are sampled at most once per 1.5 ms (100 samples over the 150 ms
+; floor), so the recorded distribution SPANS the phase instead of clustering in
+; its warmup; every call is still value-checked. `:calls` is therefore the
+; completed request count and `:latency-n` is the sample size, and they differ on
+; the cheap paths by design.
+; Every phase runs with 1 worker and with 4 workers. A worker whose call returns
+; the wrong value fails the phase; a worker that does not report by the deadline
+; is killed and the run fails — no orphan process is left behind.
+;
+; HONEST LIMITS. This is not a throughput ranking. `:regular` (4096 B) and
+; `:dirty` (1 MiB) exist to test DIFFERENT SAFETY ROLES — a bounded stall versus
+; an off-scheduler kernel — and reporting one as "faster" than the other would
+; compare inputs, not implementations. The comparison that IS fair is the same
+; variant at 1 vs 4 workers: that is queue contention. `:interruption-limits`
+; records what the numbers do and do not say.
+;
+; PUBLIC
+;   (invm.stress/run ir-path) → evidence map. `ir-path` is the descriptor's
+;   native IR text.
+
+(ns invm.stress)
+
+;; ── constants ───────────────────────────────────────────────────────────────
+
+(def REGULAR-BYTES 4096)
+(def BIG-BYTES 1048576)
+(def MAX-CALLS 100)               ; recorded-call budget, per worker
+(def MIN-PHASE-MS 150)            ; runtime floor: keeps the heartbeat window real
+(def MAX-PHASE-MS 1000)           ; finite runtime budget, per worker
+(def SAMPLE-EVERY-US (quot (erlang/* MIN-PHASE-MS 1000) MAX-CALLS))  ; 1500 us
+(def HEARTBEAT-MS 1)              ; inside the 1–5 ms band
+(def BASELINE-MS 250)             ; the no-load heartbeat window
+(def WORKER-DEADLINE-MS 30000)    ; generous; a breach means a hang, not a slow run
+(def CONCURRENCIES [1 4])
+(def TALLY-KEY :invm-stress-checks)
+
+(def VARIANTS
+  [{:variant :beam :bin :big
+    :role "generated BEAM loop, 1 MiB (preemptible)"}
+   {:variant :regular :bin :reg
+    :role "regular NIF, 4096 B (bounded normal-scheduler stall)"}
+   {:variant :dirty :bin :big
+    :role "dirty CPU NIF, 1 MiB (off-scheduler kernel)"}
+   {:variant :noop :bin :reg
+    :role "regular entry baseline, 4096 B (no kernel behind it)"}
+   {:variant :noop-dirty :bin :big
+    :role "dirty entry baseline, 1 MiB (no kernel behind it)"}])
+
+;; ── assertions ──────────────────────────────────────────────────────────────
+
+(defn- reset-tally! []
+  (erlang/put TALLY-KEY {})
+  0)
+
+(defn- tally! [kind]
+  (let [counts (erlang/get TALLY-KEY)
+        n (erlang/+ 1 (get counts kind 0))]
+    (erlang/put TALLY-KEY (assoc counts kind n))
+    n))
+
+(defn- tally-count []
+  (let [counts (erlang/get TALLY-KEY)]
+    (assoc counts :total
+           (reduce (fn [a k] (erlang/+ a (get counts k))) 0 (keys counts)))))
+
+(defn check!
+  "A contract assertion: tallied, thrown on every mismatch."
+  [kind label ok]
+  (tally! kind)
+  (when (not (erlang/== true ok))
+    (throw (ex-info (str "invm.stress: assertion failed: " label)
+                    {:label label :kind kind :actual ok})))
+  true)
+
+;; ── time, percentiles ───────────────────────────────────────────────────────
+
+(defn- mono-ms [] (erlang/monotonic_time :millisecond))
+(defn- mono-us [] (erlang/monotonic_time :microsecond))
+(defn- sleep-ms [n]
+  (let [args (list n)]
+    (erlang/apply :timer :sleep args)))
+
+(defn- pct
+  "Nearest-rank percentile over `xs` (integers, microseconds)."
+  [xs p]
+  (let [s (into [] (sort xs))
+        n (count s)]
+    (if (erlang/== 0 n)
+      0
+      (nth s (min (erlang/- n 1)
+                  (max 0 (erlang/- (quot (erlang/+ (erlang/* p n) 99) 100) 1)))))))
+
+(defn- lat-stats [xs]
+  (if (erlang/== 0 (count xs))
+    {:n 0 :p50 nil :p95 nil :p99 nil :min nil :max nil :status :no-samples}
+    {:n (count xs)
+     :p50 (pct xs 50)
+     :p95 (pct xs 95)
+     :p99 (pct xs 99)
+     :min (reduce min xs)
+     :max (reduce max xs)}))
+
+;; ── fixtures and the generated BEAM path ────────────────────────────────────
+
+(defn- pattern
+  "A deterministic byte spread; no RNG, so no VM-version dependence."
+  [n]
+  (loop [i 0 acc (list)]
+    (if (erlang/< i n)
+      (recur (erlang/+ i 1) (cons (erlang/rem (erlang/* i 37) 256) acc))
+      (erlang/list_to_binary (reverse acc)))))
+
+(defn- ensure-fused!
+  "The :beam variant needs Elixir.Krt.FusedPipeline loaded. If it is not, build
+   it from the descriptor through fusion.pipeline's own installer. Returns
+   `:present` or `:installed`. Never rebuilds when already loaded."
+  []
+  (if (erlang/function_exported :Elixir.Krt.FusedPipeline :run 2)
+    :present
+    (let [dir (or (System/get_env "INVM_OUT")
+                  (System/get_env "FUSION_OUT")
+                  "/tmp/bl-invm-stress")]
+      (fusion.pipeline/install! dir)
+      :installed)))
+
+;; ── the one call dispatch ───────────────────────────────────────────────────
+
+(defn- call-variant [ctx v]
+  (cond
+    (erlang/== :beam (:variant v)) (fusion.pipeline/fused-run (get ctx :big) (get ctx :big-init))
+    (erlang/== :regular (:variant v)) (fusion.invm/kernel-call (get ctx :res) (get ctx :reg) (get ctx :reg-init))
+    (erlang/== :dirty (:variant v)) (fusion.invm/kernel-call-dirty (get ctx :res) (get ctx :big) (get ctx :big-init))
+    (erlang/== :noop (:variant v)) (fusion.invm/kernel-noop (get ctx :reg) (get ctx :reg-init))
+    (erlang/== :noop-dirty (:variant v)) (fusion.invm/kernel-noop-dirty (get ctx :big) (get ctx :big-init))
+    :else (throw (ex-info (str "invm.stress: unknown variant " (pr-str (:variant v))) {}))))
+
+(defn- expected-of [ctx v]
+  (cond
+    (erlang/== :regular (:variant v)) (get ctx :expect-reg)
+    (erlang/== :noop (:variant v)) (get ctx :reg-init)
+    (erlang/== :noop-dirty (:variant v)) (get ctx :big-init)
+    :else (get ctx :expect-big)))
+
+;; ── workers ─────────────────────────────────────────────────────────────────
+
+(defn- demonitor-pid! [workers pid]
+  (let [hit (first (filter (fn [w] (erlang/== (first w) pid)) workers))]
+    (when (some? hit) (erlang/demonitor (second hit) (list :flush)))))
+
+(defn- worker
+  "Loop until 100 calls or 1000 ms, with a 150 ms floor. Every value is checked
+   against the reference — a fast wrong answer fails here. Latencies are sampled
+   at most once per SAMPLE-EVERY-US so they span the phase. Returns the batch to
+   the parent in one message; any throw becomes a `:worker-error`."
+  [parent v ctx]
+  (try
+    (let [t-start (mono-ms)]
+      (loop [i 0 lats [] last-sampled nil]
+        (let [elapsed (erlang/- (mono-ms) t-start)
+              stop? (or (erlang/>= elapsed MAX-PHASE-MS)
+                        (and (erlang/>= i MAX-CALLS) (erlang/>= elapsed MIN-PHASE-MS)))]
+          (if stop?
+            (erlang/send parent
+                         [:worker-done (erlang/self)
+                          {:variant (:variant v) :calls i :latency-n (count lats)
+                           :latencies lats}])
+            (let [t0 (mono-us)
+                  got (call-variant ctx v)
+                  t1 (mono-us)
+                  want (expected-of ctx v)]
+              (if (erlang/== want got)
+                ;; Sample at most one call per SAMPLE-EVERY-US, so the recorded
+                ;; latencies SPAN the phase instead of clustering in its warmup.
+                (if (or (nil? last-sampled)
+                        (erlang/>= (erlang/- t1 last-sampled) SAMPLE-EVERY-US))
+                  (recur (erlang/+ i 1) (conj lats (erlang/- t1 t0)) t1)
+                  (recur (erlang/+ i 1) lats last-sampled))
+                (throw (ex-info (str "invm.stress: wrong value for " (pr-str (:variant v)))
+                                {:variant (:variant v) :got got :want want}))))))))
+    (catch e
+      (erlang/send parent [:worker-error (erlang/self) (str e)]))))
+
+(defn- collect-workers
+  "One report per worker within `deadline-ms`. A worker that exits before
+   reporting is recorded as an error; a deadline breach kills every worker and
+   throws. Monitors are flushed as reports land."
+  [workers deadline-ms]
+  (let [t0 (mono-ms)]
+    (loop [n 0 done [] errors []]
+      (if (erlang/>= n (count workers))
+        {:done done :errors errors}
+        (let [left (erlang/- deadline-ms (erlang/- (mono-ms) t0))
+              m (receive
+                  [:worker-done who payload] [:done who payload]
+                  [:worker-error who reason] [:error who reason]
+                  [:DOWN ref :process p reason] [:down p reason]
+                  (after (if (erlang/< left 1) 1 left) :timeout))]
+          (cond
+            (erlang/== m :timeout)
+              (do (doseq [w workers] (erlang/exit (first w) :kill))
+                  (throw (ex-info "invm.stress: workers did not finish before the deadline"
+                                  {:collected n :of (count workers)})))
+            (erlang/== (first m) :down)
+              (recur (erlang/+ n 1) done
+                     (conj errors (str "worker DOWN before reporting: " (pr-str m))))
+            :else
+              (let [who (second m)]
+                (demonitor-pid! workers who)
+                (if (erlang/== (first m) :done)
+                  (recur (erlang/+ n 1) (conj done (nth m 2)) errors)
+                  (recur (erlang/+ n 1) done (conj errors (nth m 2)))))))))))
+
+;; ── the heartbeat ───────────────────────────────────────────────────────────
+
+(defn- heartbeat
+  "Record the gap between successive scheduled wakeups, every `interval-ms`, for
+   at most `max-ms`, or until `[:invm-heartbeat-stop]`. The truncated final wait
+   is never counted. Sends `[:heartbeat-done samples interval-ms]`."
+  [parent interval-ms max-ms]
+  (let [t-start (mono-us)]
+    (loop [samples []]
+      (let [t0 (mono-us)
+            msg (receive
+                  [:invm-heartbeat-stop] :stop
+                  (after interval-ms :tick))
+            t1 (mono-us)]
+        (if (erlang/== msg :stop)
+          (erlang/send parent [:heartbeat-done (reverse samples) interval-ms])
+          (let [gap (erlang/- t1 t0)]
+            (if (erlang/>= (erlang/- t1 t-start) (erlang/* max-ms 1000))
+              (erlang/send parent [:heartbeat-done (reverse (cons gap samples)) interval-ms])
+              (recur (cons gap samples)))))))))
+
+(defn- stop-heartbeat! [hb max-ms]
+  (let [hb-pid (first hb)
+        hb-ref (second hb)]
+    (erlang/send hb-pid [:invm-heartbeat-stop])
+    (let [m (receive
+              [:heartbeat-done samples interval] [:ok samples interval]
+              [:DOWN ref :process p reason] [:down reason]
+              (after max-ms :timeout))]
+      (erlang/demonitor hb-ref (list :flush))
+      m)))
+
+(defn- baseline-phase
+  "The no-load heartbeat. Taken BEFORE any kernel is called."
+  [parent]
+  (let [hb (spawn-monitor (fn [] (heartbeat parent HEARTBEAT-MS (erlang/+ BASELINE-MS 5000))))]
+    (sleep-ms BASELINE-MS)
+    (let [m (stop-heartbeat! hb WORKER-DEADLINE-MS)
+          samples (if (erlang/== :ok (first m)) (second m) [])]
+      (check! :baseline "the baseline heartbeat reported" (erlang/== :ok (first m)))
+      (check! :baseline "the baseline contains heartbeat samples" (erlang/> (count samples) 0))
+      {:window-ms BASELINE-MS
+       :interval-ms HEARTBEAT-MS
+       :samples (lat-stats samples)})))
+
+;; ── a phase: N workers of one variant, with the heartbeat running ───────────
+
+(defn- phase [parent v c ctx]
+  (let [phase-start (mono-ms)
+        hb (spawn-monitor (fn [] (heartbeat parent HEARTBEAT-MS WORKER-DEADLINE-MS)))
+        workers (mapv (fn [_] (spawn-monitor (fn [] (worker parent v ctx)))) (range c))]
+    (try
+      (let [out (collect-workers workers WORKER-DEADLINE-MS)
+            hb-msg (stop-heartbeat! hb WORKER-DEADLINE-MS)]
+        (check! :workers (str "every " (pr-str (:variant v)) " x" c " worker reported")
+                (empty? (:errors out)))
+        (check! :heartbeat (str "the heartbeat reported for " (pr-str (:variant v)) " x" c)
+                (erlang/== :ok (first hb-msg)))
+        (let [latencies (into [] (mapcat (fn [p] (:latencies p)) (:done out)))
+              calls (reduce (fn [a p] (erlang/+ a (:calls p))) 0 (:done out))
+              hb-samples (second hb-msg)]
+          (check! :calls (str "the " (pr-str (:variant v)) " x" c " phase completed a call")
+                  (erlang/> calls 0))
+          (check! :heartbeat (str "the " (pr-str (:variant v)) " x" c " phase has heartbeat samples")
+                  (erlang/> (count hb-samples) 0))
+          {:variant (:variant v)
+           :concurrency c
+           :role (:role v)
+           :workers c
+           :calls calls
+           :latency-n (count latencies)
+           :calls-per-worker (mapv (fn [p] (:calls p)) (:done out))
+           :latency-us (lat-stats latencies)
+           :heartbeat-us (lat-stats hb-samples)
+           :heartbeat-interval-ms HEARTBEAT-MS
+           :wall-ms (erlang/- (mono-ms) phase-start)
+           :heartbeat-coverage-us (reduce (fn [a x] (erlang/+ a x)) 0 hb-samples)
+           :errors (:errors out)}))
+      (finally
+        (doseq [w workers]
+          (when (erlang/is_process_alive (first w)) (erlang/exit (first w) :kill))
+          (erlang/demonitor (second w) (list :flush)))
+        (when (erlang/is_process_alive (first hb)) (erlang/exit (first hb) :kill))
+        (erlang/demonitor (second hb) (list :flush))))))
+
+;; ── contention: the fair 1-vs-4 comparison ──────────────────────────────────
+
+(defn- phase-of [phases variant c]
+  (first (filterv (fn [p] (and (erlang/== variant (:variant p))
+                               (erlang/== c (:concurrency p))))
+                  phases)))
+
+(defn- contention
+  [phases]
+  (mapv
+    (fn [v]
+      (let [variant (:variant v)
+            one (phase-of phases variant 1)
+            four (phase-of phases variant 4)]
+        {:variant variant
+         :role (:role v)
+         :calls {:c1 (:calls one) :c4 (:calls four)}
+         :latency-p50-us {:c1 (get-in one [:latency-us :p50]) :c4 (get-in four [:latency-us :p50])}
+         :latency-p99-us {:c1 (get-in one [:latency-us :p99]) :c4 (get-in four [:latency-us :p99])}
+         :heartbeat-p50-us {:c1 (get-in one [:heartbeat-us :p50]) :c4 (get-in four [:heartbeat-us :p50])}
+         :heartbeat-p99-us {:c1 (get-in one [:heartbeat-us :p99]) :c4 (get-in four [:heartbeat-us :p99])}
+         :heartbeat-max-us {:c1 (get-in one [:heartbeat-us :max]) :c4 (get-in four [:heartbeat-us :max])}}))
+    VARIANTS))
+
+;; ── the entry point ─────────────────────────────────────────────────────────
+
+(defn run
+  "Measure call latency and scheduler responsiveness for each variant, at 1 and
+   4 concurrent workers, against a no-load heartbeat baseline. Returns the
+   evidence map; throws on the first failed check. The kernel is closed after
+   every worker has drained."
+  [ir-path]
+  (reset-tally!)
+  (let [t-start (mono-ms)
+        sched (erlang/system_info :schedulers_online)
+        dsched (erlang/system_info :dirty_cpu_schedulers_online)
+        dsched-io (erlang/system_info :dirty_io_schedulers)
+        _ (check! :env "at least one normal scheduler" (erlang/>= sched 1))
+        _ (check! :env "at least one dirty CPU scheduler" (erlang/>= dsched 1))
+        ir (File/read! ir-path)
+        _ (check! :input "the IR text is a non-empty binary"
+                  (and (erlang/is_binary ir) (erlang/> (erlang/byte_size ir) 0)))
+        fused (ensure-fused!)
+        reg (pattern REGULAR-BYTES)
+        big (binary/copy reg 256)
+        reg-init 17
+        big-init 42
+        expect-reg (fusion.pipeline/rt-run reg reg-init)
+        expect-big (fusion.pipeline/rt-run big big-init)
+        s0 (invm.host/stats)
+        res (fusion.invm/kernel-compile ir)
+        s1 (invm.host/stats)
+        _ (check! :compile "kernel-compile returns a resource" (some? res))
+        _ (check! :compile "created/live move by one"
+                  (and (erlang/== (erlang/+ 1 (get s0 :created 0)) (get s1 :created 0))
+                       (erlang/== (erlang/+ 1 (get s0 :live 0)) (get s1 :live 0))))
+        ctx {:res res :reg reg :big big :reg-init reg-init :big-init big-init
+             :expect-reg expect-reg :expect-big expect-big}
+        parent (erlang/self)
+        base (baseline-phase parent)
+        phases (into [] (mapcat (fn [v] (mapv (fn [c] (phase parent v c ctx)) CONCURRENCIES))
+                                VARIANTS))
+        s-drained (invm.host/stats)
+        _ (check! :drain "no call is in flight once the phases end"
+                  (erlang/== 0 (get s-drained :inflight 0)))
+        closed (try {:ok (fusion.invm/kernel-close res)} (catch e {:err (str e)}))
+        _ (check! :close "the kernel closes after the workers drain" (erlang/== true (get closed :ok)))
+        s-final (invm.host/stats)
+        cont (contention phases)
+        result
+          {:passed true
+           :module "invm.stress"
+           :ir-path ir-path
+           :env {:schedulers_online sched
+                 :dirty_cpu_schedulers_online dsched
+                 :dirty_io_schedulers dsched-io
+                 :otp_release (erlang/list_to_binary (to-list (erlang/system_info :otp_release)))
+                 :controlled {:expected "+S1:1 +SDcpu1:1 +SDio2"
+                              :observed (str "+S" sched ":" dsched ":" dsched-io)
+                              :matches (and (erlang/== 1 sched) (erlang/== 1 dsched))}}
+           :checks (:total (tally-count))
+           :check-counts (tally-count)
+           :budget {:recorded-calls-per-worker MAX-CALLS
+                    :sample-every-us SAMPLE-EVERY-US
+                    :min-ms-per-worker MIN-PHASE-MS
+                    :max-ms-per-worker MAX-PHASE-MS
+                    :concurrencies CONCURRENCIES
+                    :heartbeat-interval-ms HEARTBEAT-MS}
+           :fused (str fused)
+           :baseline base
+           :phases phases
+           :contention cont
+           :stats {:before s0 :after-compile s1 :drained s-drained :final s-final}
+           :close {:first (get closed :ok)}
+           :interruption-limits
+             {:measured {:baseline-heartbeat-us base
+                         :worst-heartbeat-max-us
+                           (reduce (fn [a p] (max a (get-in p [:heartbeat-us :max]))) 0 phases)}
+              :regular-nif
+                "a regular NIF is not preempted: one call is a bounded normal-scheduler stall, with both a 4096 B input cap and a 65536 body-operation budget"
+              :dirty-nif
+                "a dirty NIF runs off the normal scheduler and cannot be interrupted once started; four callers queue on one dirty CPU scheduler, which shows up as latency, not as a heartbeat gap"
+              :beam
+                "the generated BEAM loop is preemptible; it does not stall the scheduler, it competes for it"
+              :claimed "none: no hard-cancellation or crash-isolation claim is made from these numbers"}
+           :notes
+             ["regular 4096 B and dirty 1 MiB are different safety roles; their timings are not a speed ranking"
+              "the fair comparison is each variant at 1 vs 4 workers, which isolates queue contention"
+              "noop/noop-dirty measure the call ENTRY with no kernel behind it"
+              "heartbeat gaps are the scheduler-responsiveness signal; call latencies are the queue signal"]
+           :wall-ms (erlang/- (mono-ms) t-start)}]
+    (println (str "PASS invm stress: checks=" (:checks result)
+                  " env=+S" sched ":" dsched ":" dsched-io
+                  " phases=" (count phases)
+                  " closed=" (get closed :ok)
+                  " wall-ms=" (:wall-ms result)))
+    result))
+
+(defn main
+  "CLI-less convenience: run against the descriptor IR path given by INVM_IR (or
+   the frozen evidence path). MAIN's real wiring calls `run` directly."
+  []
+  (let [p (or (System/get_env "INVM_IR")
+              "research/rt-selfhost/fusion/evidence/pipeline.ir")
+        r (run p)]
+    (println (pr-str (mapv (fn [c] [(:variant c) (:calls c) (:latency-p50-us c) (:heartbeat-p99-us c)])
+                          (:contention r))))
+    r))

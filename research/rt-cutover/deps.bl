@@ -1,0 +1,126 @@
+; deps.bl — what the runtime's compiled code reaches OUTSIDE itself.
+;
+; The runtime runs before `core` exists — `seed-core` is what CREATES `core` —
+; and it arrives as beams, never as source. So its compiled closure may reach
+; host modules and itself, and nothing else:
+;
+;   FORBIDDEN  a remote into `BeamLisp.Ns.Core`/`Ns.Sugar` (a prelude defn: not
+;              loaded yet), into `BeamLisp.RT` (the module being deleted), or a
+;              `:global` read of a `core`/`sugar` var (an Env lookup of a name
+;              that is not interned yet).
+;   COST       a `:global` read of the runtime's OWN var — an Env lookup at run
+;              time (~0.2 µs). Legal, but every one on a hot path is a lever.
+;
+; Every definition is compiled with the real compiler IN ITS OWN NAMESPACE (the
+; runtime is required first, so its aliases and links are live), so this sees
+; what the emitter sees: macros expanded, bare names resolved, literals lowered.
+; (`system.analyze/fn-bodies` compiles each defn in a synthetic `an-<name>` ns,
+; which turns every same-namespace call into an `invoke` — right for its
+; purpose, wrong for this one.)
+;
+; Run: BL_NO_LOCK=1 bin/bl -p DIR run research/rt-cutover/deps.bl -- DIR
+; Exit status 1 when anything FORBIDDEN is reached.
+
+(ns rt.deps
+  (:require [rt]
+            [system.ir :as ir]
+            [typed]
+            [compiler :as c]))
+
+(def root (or (first (BeamLisp/argv)) "research/rt-cutover"))
+
+(defn- collect
+  "Every ANF node under `n` satisfying `pred`. Structural over maps and
+   sequences, not `ir/child-nodes`: a `defn` compiles to a definition node whose
+   clause bodies sit in fields the expression walker does not visit."
+  [n pred]
+  (cond
+    (and (map? n) (contains? n :op))
+      (concat (if (pred n) (list n) ())
+              (mapcat (fn [v] (collect v pred)) (vals n)))
+    (map? n) (mapcat (fn [v] (collect v pred)) (vals n))
+    (or (list? n) (vector? n)) (mapcat (fn [v] (collect v pred)) n)
+    ; a `defn` compiles to `Link.defvar` whose clauses ride in a :lit as
+    ; `{:fixed arity fname clause}` tuples — the bodies are in there
+    (erlang/is_tuple n) (mapcat (fn [v] (collect v pred)) (erlang/tuple_to_list n))
+    :else ()))
+
+; `BeamLisp.RT` is NOT here: the compiler lowers literals, higher-order calls
+; and bare linked names to `mod-rt`, which the flip re-points at `Ns.Rt` — so
+; those references become the runtime calling itself. Reported separately.
+(def forbidden-mods #{:Elixir.BeamLisp.Ns.Core :Elixir.BeamLisp.Ns.Sugar})
+(def self-after-flip :Elixir.BeamLisp.RT)
+
+(defn- own-ns? [ns] (or (= ns "rt") (starts-with? ns "rt.")))
+
+(defn- ns-of [path]
+  (let [base (Path/basename path ".bl")]
+    (if (= base "rt") "rt" (str "rt." base))))
+
+(defn- head [form]
+  (let [f (typed/node-form form)]
+    (when (= :list (typed/node-tag f))
+      (let [its (typed/node-items f)]
+        (when (and (seq its) (= :symbol (typed/node-tag (typed/node-form (first its)))))
+          (typed/node-name (typed/node-form (first its))))))))
+
+(defn- def-name [form]
+  (typed/node-name (typed/node-form (second (typed/node-items (typed/node-form form))))))
+
+(defn- compiled-defs
+  "{name → anf} for every top-level def/defn in `path`, each compiled whole, in
+   the file's own namespace."
+  [path]
+  (let [ns (ns-of path)
+        env (c/new-env ns)
+        forms (BeamLisp.Reader/read_string (File/read! path))]
+    ; PRELINK the whole unit first, exactly as `AOT.compile_source` does: a
+    ; call to a defn defined LATER in the file must compile to the direct call
+    ; the emitter will produce, not the `Env` lookup a lone form would get.
+    (doseq [f forms] (c/prelink-defn f ns))
+    (reduce (fn [m form]
+              (if (contains? #{"defn" "defn-" "def"} (head form))
+                (assoc m (def-name form) (c/compile-node form env))
+                m))
+            {} forms)))
+
+(defn- file-report [path]
+  (let [bodies (compiled-defs path)
+        defined (set (keys bodies))
+        rows (for [[fname b] bodies]
+               (let [nodes (collect b (fn [_] true))
+                     remotes (filter (fn [n] (= :remote (:op n))) nodes)
+                     globals (filter (fn [n] (= :global (:op n))) nodes)]
+                 {:fn fname
+                  :bad (distinct (concat
+                                   (map (fn [n] (str (:mod n) "/" (:fun n)))
+                                        (filter (fn [n] (contains? forbidden-mods (:mod n))) remotes))
+                                   (map (fn [n] (str (:ns n) "/" (:name n)))
+                                        (filter (fn [n] (or (not (own-ns? (:ns n)))
+                                                            (not (contains? defined (:name n)))))
+                                                globals))))
+                  :self (distinct (map (fn [n] (str (:fun n)))
+                                       (filter (fn [n] (= self-after-flip (:mod n))) remotes)))
+                  :own (distinct (map (fn [n] (str (:ns n) "/" (:name n)))
+                                      (filter (fn [n] (and (own-ns? (:ns n)) (contains? defined (:name n)))) globals)))}))]
+    {:path path :fns (count rows)
+     :bad (filter (fn [r] (seq (:bad r))) rows)
+     :own (filter (fn [r] (seq (:own r))) rows)
+     :self (sort (distinct (mapcat :self rows)))}))
+
+(defn run []
+  (let [files (sort (concat [(str root "/rt.bl")] (Path/wildcard (str root "/rt/*.bl"))))
+        _ (when (empty? (filter File/exists? files)) (throw (ex-info "no runtime files" {:root root})))
+        reports (map file-report files)
+        nbad (reduce + 0 (map (fn [r] (count (:bad r))) reports))]
+    (doseq [r reports]
+      (println (str (Path/basename (:path r)) "  fns " (:fns r)
+                    "  forbidden " (count (:bad r))
+                    "  own-var readers " (count (:own r))))
+      (doseq [row (:bad r)] (println (str "   FORBIDDEN " (:fn row) " → " (join " " (:bad row)))))
+      (doseq [row (:own r)] (println (str "   var " (:fn row) " → " (join " " (:own row)))))
+      (println (str "   self-after-flip (BeamLisp.RT → Ns.Rt): " (join " " (:self r)))))
+    (println (str "forbidden sites: " nbad))
+    (when (pos? nbad) (System/halt 1))))
+
+(run)

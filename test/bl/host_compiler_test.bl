@@ -1,0 +1,456 @@
+; host_compiler_test.bl — the pinned `BeamLisp.Compiler` facade ABI.
+;
+; `priv/host/compiler.bl` ports `lib/beam_lisp/compiler.ex` to ONE exact-named
+; beam. The live Elixir module is still the ground truth here, so this suite is
+; DIFFERENTIAL: the same corpus runs through the pinned probe and through
+; `Elixir.BeamLisp.Compiler`, and the two answer sets must be equal — values and
+; exception CLASSES, question for question.
+;
+; The facade is the boot's front door: `BeamLisp.init/0` calls
+; `Compiler.enable_bl_backend/0` (which interns `BeamLisp.Ns.Compiler`) and then
+; drives `Compiler.eval_string/3`; both happen BEFORE `multi`/`sugar` are
+; interned, so nothing behind the call may need a var interned later. That is
+; why the cold block below proves the emitted beam makes NO `Env.fetch!` call at
+; all — a pinned facade that captured its own namespace's helpers would be
+; `undefined var` at exactly the moment the language is being brought up.
+;
+; What each block pins:
+;   * the export surface — every FUNCTIONAL live export is present at the same
+;     name and arity (the live module's Elixir `__info__/1` is not a functional
+;     export and is deliberately absent);
+;   * the default-argument clauses — `new_env/0` passes `Env.current_ns/0`,
+;     `eval_string/1,2` pass a fresh `new_env/0` and a `nil` file — plus
+;     `eval_form`, `macroexpand_1`, `prelink_defn`, `reset_fresh!`, `read_data`,
+;     `read_all_data`, `compile`, `enable_bl_backend`, each diffed answer for
+;     answer against the live module;
+;   * `compile/2`'s fresh-name-sensitive output: reset the counter, compile the
+;     same form through each module, compare the canonical bl-ANF node;
+;   * the raise diagnostics — the `compile/2` boot-order refusal is compared as
+;     an ARTIFACT: both beams' literal message and the `:erlang.error/3` shape
+;     are read from the disassembly and must be byte-identical (the branch
+;     cannot be triggered at runtime without un-interning the compiler, so the
+;     artifact IS the evidence);
+;   * the cold runtime — no `Env.fetch!` in the beam, and the module still
+;     answers with every `host.compiler` var deleted;
+;   * the cutover — the same source loaded OVER `Elixir.BeamLisp.Compiler`,
+;     `BeamLisp/eval` driven through it, and the live beam restored afterwards.
+;
+; Run: bin/bl test test/bl/host_compiler_test.bl
+
+(ns host.compiler.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_compiler_" (erlang/unique_integer (list :positive))))
+
+(defn- compiler-source [] (Path/join (BeamLisp/cwd) "priv/host/compiler.bl"))
+
+(def ^:private probe :Elixir.BeamLisp.HostCompilerProbe)
+(def ^:private shim :Elixir.BeamLisp.Ns.Host.Compiler)
+(def ^:private live :Elixir.BeamLisp.Compiler)
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-pinned [mod path]
+  (drop! mod)
+  (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+  mod)
+
+; Compile the pinned source at `mod` and publish ONLY the pinned beam: the
+; compile's own load (and the namespace shim it built beside it) is dropped.
+;
+; The compile EVALUATES the source, whose `(ns host.compiler)` form switches the
+; current namespace — so the caller's ns is restored around it, exactly as any
+; host that compiles a namespace on someone else's behalf must.
+(defn- compile-pinned [mod dir]
+  (BeamLisp.Env/with_ns (BeamLisp.Env/current_ns)
+    (fn []
+      (let [res (BeamLisp.AOT/compile_host_file (compiler-source)
+                  (list (t2 :module mod) (t2 :output_dir dir) (t2 :load? false)))]
+        (load-pinned mod (elem res 1))))))
+
+(defn- core-env [] {:ns "core" :locals {} :recur nil :tail true})
+
+(defn- default-env-ns
+  "`new_env/0`'s namespace, with the current ns PINNED: the default argument asks
+   `Env.current_ns/0` at call time, so a differential needs a fixed caller ns."
+  [mod]
+  (BeamLisp.Env/with_ns "host.compiler.test.default"
+    (fn [] (erlang/map_get :ns (erlang/apply mod :new_env (list))))))
+
+; ── the observation: a call's whole answer, a raise's class included ──────
+
+(defn- answer
+  "`[:value v]` or `[:raise Class]`. The CLASS is part of the ABI a caller's
+   `catch`/`rescue` reads; the message is compared separately (it names the
+   module that raised, which differs by construction)."
+  [mod fname args]
+  (try (list :value (erlang/apply mod fname args))
+       (catch e (list :raise (:__struct__ e)))))
+
+(defn- answers [mod qs]
+  (map (fn [q] (list (first q) (answer mod (first q) (second q)))) qs))
+
+(defn- raise-class [f]
+  (try (do (f) :no-raise)
+       (catch e (:__struct__ e))))
+
+; ── reader forms for the form-taking entry points ────────────────────────
+
+(defn- one-form [src]
+  (first (BeamLisp.Reader/read_string src)))
+
+(defn- queries
+  "The whole differential corpus as `[fname args]` questions. Form-taking
+   entries get a REAL reader form, read once and handed to both modules."
+  []
+  (let [let-form (one-form "(let [a 1 b 2] (+ a b))")
+        macro-form (one-form "(when true 1)")
+        defn-form (one-form "(defn host-compiler-diff-fn [x] x)")
+        env (erlang/apply live :new_env (list "user"))]
+    (list
+      ; `new_env/0` is NOT in the corpus: its default asks `Env.current_ns/0` at
+      ; call time, and `eval_string` below switches the current ns, so the two
+      ; passes would answer from different namespaces. It is diffed separately
+      ; with the caller ns pinned (`default-env-ns`).
+      (list :new_env (list "core"))
+      (list :new_env (list "user"))
+      (list :eval_string (list "(+ 1 2)"))
+      (list :eval_string (list "(+ 40 2)" env))
+      (list :eval_string (list "(str \"a\" \"b\")" env "diff"))
+      (list :eval_form (list let-form env))
+      (list :macroexpand_1 (list macro-form "user"))
+      (list :prelink_defn (list defn-form "host.compiler.diff"))
+      (list :reset_fresh! (list))
+      (list :read_data (list "(a b)"))
+      (list :read_data (list "a"))
+      (list :read_all_data (list "(+ 1 2) (* 3 4)"))
+      (list :read_data (list 42))
+      (list :read_all_data (list 42))
+      (list :enable_bl_backend (list)))))
+
+; ── the pinned ABI, answer for answer ────────────────────────────────────
+
+(deftest pinned-compiler-answers-the-live-facade
+  (testing "export surface and the whole corpus, probe against the live module"
+    (let [dir (tmp-dir)]
+      (compile-pinned probe dir)
+      (drop! shim)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (= :non_existing (erlang/apply :code :which (list shim))))
+      ; FUNCTIONS-ONLY: no synthesized struct surface.
+      (is (not (erlang/function_exported probe :__struct__ 0)))
+      (is (not (erlang/function_exported probe :__info__ 1)))
+      ; Every FUNCTIONAL live export is present on the probe at its exact name
+      ; and arity. The live Elixir `__info__/1` is introspection, not a
+      ; functional export, and the pinned module has none.
+      (is (every? (fn [e] (or (erlang/== :__info__ (elem e 0))
+                              (erlang/function_exported probe (elem e 0) (elem e 1))))
+                  (erlang/apply live :module_info (list :exports)))
+          "the pinned ABI covers every FUNCTIONAL live export")
+      (is (= (Enum/sort (list (t2 :compile 2) (t2 :enable_bl_backend 0) (t2 :eval_form 2)
+                              (t2 :eval_string 1) (t2 :eval_string 2) (t2 :eval_string 3)
+                              (t2 :macroexpand_1 2) (t2 :module_info 0) (t2 :module_info 1)
+                              (t2 :new_env 0) (t2 :new_env 1) (t2 :prelink_defn 2)
+                              (t2 :read_all_data 1) (t2 :read_data 1) (t2 :reset_fresh! 0)))
+             (Enum/sort (erlang/apply probe :module_info (list :exports))))
+          "exactly the live call surface, nothing added, nothing dropped")
+
+      ; PINNED ANSWERS first — the ABI itself, not merely probe == live.
+      (is (= (core-env) (erlang/apply probe :new_env (list "core"))))
+      (is (= (erlang/apply live :new_env (list "core")) (erlang/apply probe :new_env (list "core"))))
+      ; the two default-argument clauses, with the caller ns pinned
+      (is (= "host.compiler.test.default" (default-env-ns probe)))
+      (is (= (default-env-ns live) (default-env-ns probe)))
+      (is (= 3 (erlang/apply probe :eval_string (list "(+ 1 2)"))))
+      (is (= "ab" (erlang/apply probe :eval_string (list "(str \"a\" \"b\")"))))
+      (is (= 3 (erlang/apply probe :eval_form (list (one-form "(let [a 1 b 2] (+ a b))")
+                                                    (erlang/apply probe :new_env (list "user"))))))
+      ; a symbol datum is a `{tag, name}` TUPLE, not a map.
+      (is (= (tuple :symbol "a") (erlang/apply probe :read_data (list "a"))))
+      (is (= 42 (erlang/apply probe :read_data (list "42"))))
+      (is (= :bl (erlang/apply probe :enable_bl_backend (list))))
+      (is (nil? (erlang/apply probe :reset_fresh! (list))))
+
+      ; THE DIFF. One question list, two modules, equal answers — values and
+      ; exception classes. Per-question, so a failure names the entry point.
+      (let [qs (queries)]
+        (is (= (answers live qs) (answers probe qs)))
+        (doseq [q qs]
+          (is (= (answer live (first q) (second q))
+                 (answer probe (first q) (second q)))
+              (str "facade " (first q)))))
+
+      ; `read_data`/`read_all_data` keep their `is_binary/1` guards: a
+      ; non-binary is refused by the clause head in BOTH modules.
+      (is (= :Elixir.FunctionClauseError (raise-class (fn [] (erlang/apply probe :read_data (list 42))))))
+      (is (= :Elixir.FunctionClauseError (raise-class (fn [] (erlang/apply live :read_data (list 42))))))
+      (is (= :Elixir.FunctionClauseError (raise-class (fn [] (erlang/apply probe :read_all_data (list 42))))))
+      (is (= :Elixir.FunctionClauseError (raise-class (fn [] (erlang/apply live :read_all_data (list 42))))))
+      (is (= (raise-class (fn [] (erlang/apply live :read_data (list 42))))
+             (raise-class (fn [] (erlang/apply probe :read_data (list 42))))))
+
+      ; REPRODUCIBLE: a rebuild of the same source is the same bytes.
+      (let [dir2 (tmp-dir)
+            again (elem (BeamLisp.Env/with_ns (BeamLisp.Env/current_ns)
+                          (fn [] (BeamLisp.AOT/compile_host_file (compiler-source)
+                                   (list (t2 :module probe) (t2 :output_dir dir2) (t2 :load? false)))))
+                        1)]
+        (is (= (File/read! (Path/join dir "Elixir.BeamLisp.HostCompilerProbe.beam"))
+               (File/read! again))))
+      (File/rm_rf! dir))))
+
+; ── compile/2: the fresh-name-sensitive node, diffed ─────────────────────
+
+(deftest pinned-compiler-compile-matches-the-live-node
+  (testing "the same form compiles to the same canonical bl-ANF node"
+    (let [dir (tmp-dir)
+          env (erlang/apply live :new_env (list "user"))]
+      (compile-pinned probe dir)
+      ; A plain form and a form whose lowering mints fresh names: the
+      ; per-process counter is reset before EACH call, so the nodes are a
+      ; function of the form alone and must be equal.
+      (doseq [src (list "(+ 1 2)"
+                        "(let [a 1 b 2] (+ a b))"
+                        "(fn [x] (fn [y] (+ x y)))")]
+        (let [form (one-form src)]
+          (erlang/apply probe :reset_fresh! (list))
+          (let [node (erlang/apply probe :compile (list form env))]
+            (erlang/apply probe :reset_fresh! (list))
+            (is (= node (erlang/apply live :compile (list form env)))
+                (str "compile " src)))))
+      (File/rm_rf! dir))))
+
+; ── the raise branch: compared as an artifact ────────────────────────────
+;
+; `compile/2`'s refusal branch fires only when `BeamLisp.Ns.Compiler` is not
+; interned — a state this VM cannot be put in without tearing the compiler out
+; from under every other test. So the differential is read from the BEAMS: the
+; literal message and the `raise` shape must be identical in the live module
+; and in the pinned port. That is the whole contract of "preserve rescue
+; diagnostics": `rescue e -> e` gets the same `%RuntimeError{}` and
+; `Exception.message/1` gets the same bytes.
+
+(defn- fns-of [path]
+  (erlang/element 6 (erlang/apply :beam_disasm :file (list (erlang/binary_to_list path)))))
+
+(defn- fn-ins [path fname ar]
+  (reduce
+    (fn [acc f]
+      (if (and (= :function (erlang/element 1 f))
+               (erlang/== fname (erlang/element 2 f))
+               (erlang/== ar (erlang/element 3 f)))
+        (concat acc (erlang/element 5 f))
+        acc))
+    () (fns-of path)))
+
+(defn- raise-message [path]
+  "The binary literal in `compile/2` that carries the boot-order refusal."
+  (reduce
+    (fn [acc ins]
+      (if (and (erlang/is_tuple ins)
+               (erlang/== :move (erlang/element 1 ins))
+               (erlang/is_tuple (erlang/element 2 ins))
+               (erlang/== :literal (erlang/element 1 (erlang/element 2 ins))))
+        (let [l (erlang/element 2 (erlang/element 2 ins))]
+          (if (and (erlang/is_binary l) (includes? l "beam-lisp compiler not loaded")) l acc))
+        acc))
+    nil (fn-ins path :compile 2)))
+
+(defn- ext-calls [path fname ar]
+  "Every `{Module, function, arity}` the named function calls.
+
+   The instruction OP is tested FIRST: only `call_ext`/`call_ext_last` carry the
+   `{:extfunc, …}` operand at index 3, and reading index 3 of a short instruction
+   (`{:label, 1}`) is an out-of-range error."
+  (reduce
+    (fn [acc ins]
+      (cond
+        (not (erlang/is_tuple ins)) acc
+        (not (or (erlang/== :call_ext (erlang/element 1 ins))
+                 (erlang/== :call_ext_last (erlang/element 1 ins)))) acc
+        :else
+        (let [ext (erlang/element 3 ins)]
+          (if (and (erlang/is_tuple ext) (erlang/== :extfunc (erlang/element 1 ext)))
+            (cons (tuple (erlang/element 2 ext) (erlang/element 3 ext) (erlang/element 4 ext)) acc)
+            acc))))
+    () (fn-ins path fname ar)))
+
+(defn- atoms-in
+  "Every atom MOVED into a register by the named function — the literals a
+   module carries inline (its delegation target, its guard strings, …)."
+  [path fname ar]
+  (reduce
+    (fn [acc ins]
+      (if (and (erlang/is_tuple ins)
+               (erlang/== :move (erlang/element 1 ins))
+               (erlang/is_tuple (erlang/element 2 ins))
+               (erlang/== :atom (erlang/element 1 (erlang/element 2 ins))))
+        (cons (erlang/element 2 (erlang/element 2 ins)) acc)
+        acc))
+    () (fn-ins path fname ar)))
+
+(defn- live-path []
+  (erlang/list_to_binary (erlang/apply :code :which (list live))))
+
+(deftest pinned-compiler-keeps-the-raise-diagnostics
+  (testing "compile/2's refusal message and raise shape are the live beam's"
+    (let [dir (tmp-dir)]
+      (compile-pinned probe dir)
+      (let [probe-path (Path/join dir "Elixir.BeamLisp.HostCompilerProbe.beam")
+            live-msg (raise-message (live-path))
+            probe-msg (raise-message probe-path)]
+        ; The message is reproduced BYTE FOR BYTE — trailing newline included
+        ; (an Elixir heredoc keeps it, and the live literal carries it).
+        (is (erlang/is_binary live-msg))
+        (is (= live-msg probe-msg))
+        (is (includes? probe-msg "beam-lisp compiler not loaded: BeamLisp.Ns.Compiler is not interned"))
+        (is (includes? probe-msg "the seed is missing/corrupt."))
+        ; The raise SHAPE: a `RuntimeError` built by `RuntimeError.exception/1`
+        ; and raised through the 3-arity `erlang/error/3` — exactly what
+        ; Elixir's `raise` emits, error_info included.
+        (is (some (fn [c] (= (tuple :Elixir.RuntimeError :exception 1) c))
+                  (ext-calls (live-path) :compile 2)))
+        (is (some (fn [c] (= (tuple :Elixir.RuntimeError :exception 1) c))
+                  (ext-calls probe-path :compile 2)))
+        (is (some (fn [c] (= (tuple :erlang :error 3) c)) (ext-calls (live-path) :compile 2)))
+        (is (some (fn [c] (= (tuple :erlang :error 3) c)) (ext-calls probe-path :compile 2)))
+        ; Both production and probe now late-bind the same compiler namespace
+        ; through apply/3; their emitted beams carry its exact atom.
+        (is (some (fn [a] (= :Elixir.BeamLisp.Ns.Compiler a))
+                  (atoms-in (live-path) :compile 2)))
+        (is (some (fn [c] (= (tuple :erlang :apply 3) c))
+                  (ext-calls (live-path) :compile 2)))
+        (is (some (fn [a] (= :Elixir.BeamLisp.Ns.Compiler a))
+                  (atoms-in probe-path :compile 2)))
+        (is (some (fn [c] (= (tuple :erlang :apply 3) c))
+                  (ext-calls probe-path :compile 2))))
+      (File/rm_rf! dir))))
+
+; ── cold runtime: no namespace vars ──────────────────────────────────────
+
+; Every `Env.fetch!` call site in a compiled beam, as `{fn, arity}` tuples. A
+; pinned host module MUST have none: its own namespace's vars are never
+; interned in a fresh VM, so a surviving var lookup would be `undefined var`
+; there — exactly what a warm test VM hides. The facade is called by
+; `BeamLisp.init/0` while `multi`/`sugar` are still uninterned, so this is the
+; boot-shape check, not a formality.
+(defn- env-fetch-ins? [ins]
+  (cond
+    (not (erlang/is_tuple ins)) false
+    (not (erlang/== :call_ext (erlang/element 1 ins))) false
+    (not (erlang/is_tuple (erlang/element 3 ins))) false
+    (not (erlang/== :extfunc (erlang/element 1 (erlang/element 3 ins)))) false
+    :else (and (= :Elixir.BeamLisp.Env (erlang/element 2 (erlang/element 3 ins)))
+               (= :fetch! (erlang/element 3 (erlang/element 3 ins))))))
+
+(defn- env-fetch-sites [path]
+  (reduce
+    (fn [acc f]
+      (if (= :function (erlang/element 1 f))
+        (let [nm (erlang/element 2 f) ar (erlang/element 3 f)]
+          (reduce (fn [a ins] (if (env-fetch-ins? ins) (cons (tuple nm ar) a) a))
+                  acc (erlang/element 5 f)))
+        acc))
+    () (fns-of path)))
+
+(deftest pinned-compiler-cold-without-namespace-vars
+  (testing "the facade answers with every `host.compiler` var deleted"
+    (let [dir (tmp-dir)]
+      (compile-pinned probe dir)
+      (drop! shim)
+      (let [probe-path (Path/join dir "Elixir.BeamLisp.HostCompilerProbe.beam")]
+        ; The beam makes NO `Env.fetch!` call at all, so a fresh VM — which
+        ; never interns `host.compiler` — has nothing to fail on.
+        (is (= () (env-fetch-sites probe-path)))
+        ; The SAME source at the PRODUCTION atom is var-free too. Read, not
+        ; loaded (`:load? false`), so the live module is untouched.
+        (let [res (BeamLisp.Env/with_ns (BeamLisp.Env/current_ns)
+                    (fn [] (BeamLisp.AOT/compile_host_file (compiler-source)
+                             (list (t2 :module live) (t2 :output_dir dir) (t2 :load? false)))))]
+          (is (= live (erlang/element 1 res)))
+          (is (= () (env-fetch-sites (erlang/element 2 res)))))
+        ; COLD for THIS VM too: drop the vars the compile interned. After the
+        ; delete the name resolves nowhere (no refer, and `host.compiler` is
+        ; not core/sugar), which is the fresh-VM state.
+        (doseq [nm (list "new_env" "eval_string" "compile" "enable_bl_backend"
+                         "eval_form" "macroexpand_1" "prelink_defn" "reset_fresh!"
+                         "read_data" "read_all_data")]
+          (BeamLisp.Env/delete_key (tuple "host.compiler" nm)))
+        (is (not (BeamLisp.Env/bound? "host.compiler" "new_env")))
+        (is (not (BeamLisp.Env/bound? "host.compiler" "eval_string")))
+        ; Every facade entry still answers, cold.
+        (is (= (core-env) (erlang/apply probe :new_env (list "core"))))
+        (is (= "host.compiler.test.default" (default-env-ns probe)))
+        (is (= 3 (erlang/apply probe :eval_string (list "(+ 1 2)"))))
+        (is (= "ab" (erlang/apply probe :eval_string (list "(str \"a\" \"b\")"))))
+        (is (= 3 (erlang/apply probe :eval_form
+                    (list (one-form "(let [a 1 b 2] (+ a b))")
+                          (erlang/apply probe :new_env (list "user"))))))
+        ; `compile/2` is the one entry that consults `Env.loaded_ns?`; with the
+        ; compiler ns interned its true branch runs, and the node is still the
+        ; live module's for the same form with the fresh counter reset.
+        (let [c-form (one-form "(let [c 1] c)")
+              env (erlang/apply probe :new_env (list "user"))]
+          (erlang/apply probe :reset_fresh! (list))
+          (let [node (erlang/apply probe :compile (list c-form env))]
+            (erlang/apply probe :reset_fresh! (list))
+            (is (= node (erlang/apply live :compile (list c-form env))))))
+        (is (= :bl (erlang/apply probe :enable_bl_backend (list))))
+        (is (= (tuple :symbol "a") (erlang/apply probe :read_data (list "a"))))
+        (is (nil? (erlang/apply probe :reset_fresh! (list))))
+        (is (= (erlang/apply live :macroexpand_1 (list (one-form "(when true 1)") "user"))
+               (erlang/apply probe :macroexpand_1 (list (one-form "(when true 1)") "user"))))
+        (is (= (erlang/apply live :prelink_defn (list (one-form "(defn cold-prelink [x] x)") "host.compiler.cold"))
+               (erlang/apply probe :prelink_defn (list (one-form "(defn cold-prelink [x] x)") "host.compiler.cold")))))
+      (File/rm_rf! dir))))
+
+; ── the pinned beam AT the production atom, then restored ────────────────
+;
+; The differential above proves the ABI at a probe atom. This one proves the
+; CUTOVER shape: the same source compiled to `Elixir.BeamLisp.Compiler` and
+; loaded OVER the live module drives the LANGUAGE (`BeamLisp/eval` →
+; `Compiler.eval_string`), and the live beam is restored afterwards. Loading a
+; pinned port mid-flight is exactly what `:load? false` exists to avoid for a
+; generator; doing it deliberately, with the saved beam put back in `finally`,
+; is what shows the pinned beam can take the atom.
+(deftest pinned-compiler-beam-stands-in-at-the-production-atom
+  (testing "BeamLisp/eval runs on the pinned facade, then the live beam is restored"
+    (let [dir (tmp-dir)
+          out (str dir "/prod")
+          beam (Path/join out "Elixir.BeamLisp.Compiler.beam")
+          ; `code.which/1` answers a CHARLIST, and `:code.load_binary/3` takes one
+          ; — the file READ wants the binary form, the LOAD wants the original.
+          orig-path (erlang/apply :code :which (list live))
+          orig-bin (File/read! (erlang/list_to_binary orig-path))]
+      (is (not= :non_existing orig-path) "precondition: the live beam is a readable file")
+      (BeamLisp.Env/with_ns (BeamLisp.Env/current_ns)
+        (fn []
+          (BeamLisp.AOT/compile_host_file (compiler-source)
+            (list (t2 :module live) (t2 :output_dir out) (t2 :load? false)))))
+      (drop! shim)
+      (try
+        (drop! live)
+        (code/load_binary live (erlang/binary_to_list beam) (File/read! beam))
+        (is (= (erlang/binary_to_list beam) (erlang/apply :code :which (list live)))
+            "the test beam now owns the production compiler atom")
+        ; The LANGUAGE drives through the facade: `BeamLisp/eval` →
+        ; `Compiler.eval_string/1`, which must delegate to the self-hosted ns.
+        (is (= 3 (BeamLisp/eval "(+ 1 2)")))
+        (is (= "ab" (BeamLisp/eval "(str \"a\" \"b\")")))
+        (is (= 12 (BeamLisp/eval "(let [x 4] (* x 3))")))
+        ; ... and the facade entry points answer directly at the exact atom.
+        (is (= 42 (erlang/apply live :eval_string (list "(+ 40 2)"))))
+        (is (= (core-env) (erlang/apply live :new_env (list "core"))))
+        (is (= :bl (erlang/apply live :enable_bl_backend (list))))
+        (is (= (tuple :symbol "a") (erlang/apply live :read_data (list "a"))))
+        (finally
+          (drop! live)
+          (code/load_binary live orig-path orig-bin)))
+      ; RESTORED: the original production beam owns the atom again.
+      (is (= orig-path (erlang/apply :code :which (list live))))
+      (is (= 3 (BeamLisp/eval "(+ 1 2)")))
+      (is (= (core-env) (erlang/apply live :new_env (list "core"))))
+      (File/rm_rf! dir))))

@@ -100,7 +100,7 @@
 ; THE ANF TRANSLATOR
 ; ══════════════════════════════════════════════════════════════════════════
 
-(def rt :Elixir.BeamLisp.RT)
+(def rt :Elixir.BeamLisp.Ns.Rt)
 
 (defn- untranslatable? [x] (= x :untranslatable))
 
@@ -195,6 +195,79 @@
   (let [ts (map (fn [n] (translate-node ctx n)) nodes)]
     (if (some untranslatable? ts) :untranslatable ts)))
 
+; ── clause selection: WHICH clause a call runs ─────────────────────────
+;
+; A helper reached by INLINING must be the clause THIS call runs. `fn-bodies`
+; carries every clause, but its :params/:body are the FIRST one — right only for
+; a single-clause fn. Selecting the clause by the call's arity against the
+; SOURCE clause shapes (the ANF list renames params and drops the `&`, so it
+; cannot tell a variadic clause from a fixed one of the same printed length) is
+; what keeps a 2-ary call from being translated as the 1-ary body — and what
+; makes a call no single clause fits an honest :untranslatable, never a proof.
+
+(defn- source-clause-shapes
+  "For each top-level defn/defn- of `src`, its clauses' SOURCE shapes in order:
+   {:arity n :variadic bool :guarded bool}. :arity counts FIXED params (a `&`
+   rest binding is not one), :variadic marks a `&` clause, :guarded a `:when`."
+  [src]
+  (let [shapes (fn [clauses]
+                 (into []
+                   (map (fn [c]
+                          (let [names (into [] (map (fn [p] (typed/node-name (typed/node-form p)))
+                                                    (:params c)))
+                                amp (loop [i 0]
+                                      (cond (= i (count names)) nil
+                                            (= "&" (nth names i)) i
+                                            :else (recur (inc i))))]
+                            {:arity (if (some? amp) amp (count names))
+                             :variadic (some? amp)
+                             :guarded (some? (:guard c))})))
+                   clauses))]
+    (reduce
+      (fn [m form]
+        (try
+          (let [f (typed/node-form form)]
+            (if (not (and (= :list (typed/node-tag f))
+                          (contains? #{"defn" "defn-"}
+                                     (typed/node-name (typed/node-form (first (typed/node-items f)))))))
+              m
+              (let [its (into [] (typed/node-items f))
+                    nm (typed/node-name (typed/node-form (second its)))]
+                (assoc m nm (shapes (nth (typed/defn-clauses its) 2))))))
+          (catch _e m)))
+      {}
+      (try (BeamLisp.Reader/read_string src) (catch _e [])))))
+
+(defn- clause-for
+  "The one ANF clause of `d` a call with `argc` actuals runs, or nil when no
+   SINGLE clause is soundly selectable: the source shapes are absent or do not
+   line up with the compiled clauses, the fn has a variadic clause, no clause
+   has this arity, several do (a guarded/duplicate group), or the one that does
+   is guarded. nil ⇒ the caller refuses (:untranslatable) rather than
+   translating another arity's — or a guarded — body as if it were this call's."
+  [sig d argc]
+  (let [anf (if (seq (:clauses d))
+              (:clauses d)
+              [{:params (:params d) :body (:body d)}])]
+    (when (and (some? sig)
+               (= (count sig) (count anf))
+               (not (some (fn [s] (if (:variadic s) true nil)) sig)))
+      (let [hits (filter (fn [pair] (= argc (:arity (second pair))))
+                         (map-indexed (fn [i s] [i s]) sig))]
+        (when (and (= 1 (count hits))
+                   (not (:guarded (second (first hits)))))
+          (nth anf (first (first hits))))))))
+
+(defn- inline-call [ctx f actuals]
+  (let [cl (clause-for (get (:sigs ctx) f) (get (:bodies ctx) f) (count actuals))
+        ts (t-args ctx actuals)]
+    (if (or (nil? cl) (untranslatable? ts) (contains? (or (:inlining ctx) #{}) f))
+      :untranslatable
+      (let [benv (reduce (fn [m [p a]] (assoc m p a))
+                         (:env ctx) (map (fn [p a] [p a]) (:params cl) ts))]
+        (translate-node (assoc ctx :env benv :inlining (conj (or (:inlining ctx) #{}) f))
+                        (:body cl))))))
+
 (defn- t-invoke
   "An (RT/invoke (:global f) argcons) call: payload accessor, nth, primitive
    desugar, or pure-helper inline. Otherwise :untranslatable (honest — an
@@ -229,13 +302,11 @@
       (get (:funs ctx) f)
         (let [ts (t-args ctx actuals)]
           (if (untranslatable? ts) :untranslatable (apply list (symbol f) ts)))
-      ; pure-helper inline
+      ; pure-helper inline — the clause THIS call's arity runs. :params/:body
+      ; are the FIRST clause only; using them for a different arity is a false
+      ; proof, so an unselectable call refuses (see clause-for).
       (and (contains? (:bodies ctx) f) ((:pure? ctx) f))
-        (let [d (get (:bodies ctx) f)
-              params (:params d)
-              benv (reduce (fn [m [p a]] (assoc m p (translate-node ctx a)))
-                           (:env ctx) (map (fn [p a] [p a]) params actuals))]
-          (translate-node (assoc ctx :env benv) (:body d)))
+        (inline-call ctx f actuals)
       :else :untranslatable)))
 
 ; collection-length ops keyed by :fun (mod-agnostic — RT or Core). First arg is
@@ -283,6 +354,12 @@
         (let [ts (t-args ctx args)]
           (if (untranslatable? ts) :untranslatable (apply list (symbol (name fun)) ts)))
       (and (= (:mod node) rt) (= fun :invoke)) (t-invoke ctx node)
+      ; Repeated analysis can leave a declared helper in the compiler's module
+      ; environment, so its next call is resolved directly. Only the analysis
+      ; module's own source-defined helpers share the dynamic inline boundary.
+      (and (= (:mod node) :Elixir.BeamLisp.Ns.System.Smt)
+           (contains? (:bodies ctx) (name fun)) ((:pure? ctx) (name fun)))
+        (inline-call ctx (name fun) args)
       ; collection length (mod-agnostic, only when a coll var is present)
       (and (not (empty? (:colls ctx)))
            (contains? #{:count :conj :rest :pop :next :empty?} fun)
@@ -326,10 +403,11 @@
 
 (defn translate-node
   "bl-ANF node → an SMT formula (a quoted s-expr) or :untranslatable, under
-   `ctx` {:env :variants :colls :bodies :pure?}. env maps a var/param name to an
+   `ctx` {:env :variants :colls :bodies :sigs :pure?}. env maps a var/param name to an
    already-translated formula (inlining); variants maps an enum tag string to
    its z3 constructor entry; colls is the set of length-abstracted var names;
-   bodies/pure? gate pure-helper inlining."
+   bodies/sigs/pure? gate pure-helper inlining (sigs are the SOURCE clause
+   shapes that let a call select the clause its arity runs)."
   [ctx node]
   (cond
     (not (ir/node? node)) :untranslatable
@@ -392,9 +470,10 @@
   ([vars variants colls prog-src]
    (let [summaries (if prog-src (analyze/analyze prog-src) {})
          bodies (if prog-src (into {} (analyze/fn-bodies prog-src)) {})
+         sigs (if prog-src (source-clause-shapes prog-src) {})
          pure? (fn [nm] (empty? (:footprint (get summaries nm {:footprint {:x 1}}))))]
      {:env (reduce (fn [m v] (assoc m v (symbol v))) {} (into [] vars))
-      :variants variants :colls colls :bodies bodies :pure? pure?})))
+      :variants variants :colls colls :bodies bodies :sigs sigs :pure? pure?})))
 
 (defn- ->anf-src
   "Compile a SOURCE string to bl-ANF (read, then compile the first form)."
@@ -595,17 +674,25 @@
   "Lower a defn SOURCE to (define-fun name ((p Sort)…) Ret body) over `ret-sort`
    (all params share it — the arithmetic common case), via the ANF descriptor.
    Folds guarded clauses to nested ite. :untranslatable when the body leaves the
-   fragment. The returned form is a z3 prelude: assert a law over (name …)."
+   fragment, OR when the clauses do not share ONE arity (an overload) or the
+   source params do not line up with the compiled ones (a `&` rest clause) — a
+   single (define-fun …) has one signature, so no single body is the whole name.
+   The returned form is a z3 prelude: assert a law over (name …)."
   [defn-src ret-sort]
   (let [anf (->anf-src defn-src)
         clauses (descriptor-clauses anf)]
     (if (nil? clauses) :untranslatable
       (let [cls (into [] clauses)
-            cps (source-param-names defn-src)
-            body-smt (fold-clauses cps cls)]
-        (if (untranslatable? body-smt) :untranslatable
-          ; eager lists: a form is data, never a half-realized thunk
-          (apply list 'define-fun (symbol (:val (nth (:args anf) 1)))
-                 (apply list (map (fn [p] (list (symbol p) (symbol ret-sort))) cps))
-                 (symbol ret-sort)
-                 (list body-smt)))))))
+            parts (map clause-parts cls)
+            ref (count (:params (first parts)))
+            cps (source-param-names defn-src)]
+        (if (or (not= ref (count cps))
+                (some (fn [p] (not= ref (count (:params p)))) parts))
+          :untranslatable
+          (let [body-smt (fold-clauses cps cls)]
+            (if (untranslatable? body-smt) :untranslatable
+              ; eager lists: a form is data, never a half-realized thunk
+              (apply list 'define-fun (symbol (:val (nth (:args anf) 1)))
+                     (apply list (map (fn [p] (list (symbol p) (symbol ret-sort))) cps))
+                     (symbol ret-sort)
+                     (list body-smt)))))))))

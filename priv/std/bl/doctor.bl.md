@@ -19,7 +19,7 @@ still exits 0.
 
 ```beam-lisp
 (ns bl.doctor
-  (:require [bl.util :as u] [vm.client]))
+  (:require [bl.util :as u] [vm.client] [model] [vm.image :as image]))
 ```
 
 ## A probe never crashes
@@ -175,15 +175,15 @@ invocation, so it reports `not running` and changes nothing.
    (probe "embedding" false
      (fn []
        (let [m    (BeamLisp/eval "code.embed/MODEL")
-             tier (BeamLisp.Model/tier m)
-             dir  (BeamLisp.Model/dir m)]
+             tier (model/tier m)
+             dir  (model/dir m)]
          (case tier
            :bundled {:ok true :detail (str "present (bundled: " dir ")")}
            :env     {:ok true :detail (str "present (BEAM_LISP_MODEL_DIR: " dir ")")}
            :ambient {:ok true :detail (str "present (fetched into the cache: " dir ")")}
            {:ok false
             :detail (str "absent — `bl search` needs it; looked in "
-                         (join ", " (BeamLisp.Model/searched_dirs m)))}))))])
+                         (join ", " (model/searched-dirs m)))}))))])
 ```
 
 ## The deep probes
@@ -205,14 +205,14 @@ repository cannot pass would be a probe that lies about the tree it is reporting
 on. It says what is left and why, which is the fact a reader acts on.
 
 Nothing here infers an answer it could read. The image kind is asked
-(`BeamLisp.Image/kind`, the one implementation), the floor's provenance is read
+(`vm.image/kind`, the one implementation), the floor's provenance is read
 from the manifest the floor shipped with (`Bootstrap/manifest`), and the seed's
 verdict is `Bootstrap/key_matches?/1` rather than a second copy of the rule.
 
 ```beam-lisp
 (defn- mix-loaded?
   "Whether the Elixir build tool is RUNNING in this VM. Not a signal this
-   toolchain needs — `BeamLisp.Image/kind` answers the questions that used to be
+   toolchain needs — `vm.image/kind` answers the questions that used to be
    asked of Mix — but the honest answer to \"does this `bl` depend on Mix?\".
 
    RUNNING, not loadable, and the difference is the whole probe: `mix/ebin` ships
@@ -257,7 +257,7 @@ verdict is `Bootstrap/key_matches?/1` rather than a second copy of the rule.
    report and not a reason to fail."
   []
   (do (BeamLisp.Loader/ensure_loaded "deps")
-      (let [r (BeamLisp.RT/invoke (BeamLisp.Env/fetch! "deps" "verify")
+      (let [r (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "deps" "verify")
                                   (list (BeamLisp/cwd)))]
         (if (:ok? r)
           {:ok true :detail (str (:checked r) " locked, all present offline")}
@@ -272,7 +272,7 @@ verdict is `Bootstrap/key_matches?/1` rather than a second copy of the rule.
   []
   (let [m (BeamLisp.Bootstrap/manifest)]
     (if (nil? m)
-      {:ok false :detail "absent (no priv/bootstrap/seed/manifest.exs)"}
+      {:ok false :detail "absent (no priv/bootstrap/seed/manifest.term)"}
       (let [n (count (keys (get m "modules")))
             ok? (BeamLisp.Bootstrap/key_matches? m)]
         {:ok ok?
@@ -284,10 +284,10 @@ verdict is `Bootstrap/key_matches?/1` rather than a second copy of the rule.
                         "…) — reseed with `bl seed`"))}))))
 
 (defn- image-line []
-  (let [k (BeamLisp.Image/kind)]
+  (let [k (image/kind)]
     {:ok true
      :detail (str k
-                  (if (BeamLisp.Image/mutable?)
+                  (if (image/mutable?)
                     " (mutating reloads allowed)"
                     " (reloads refuse to mutate in place)"))}))
 

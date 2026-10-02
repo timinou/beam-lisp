@@ -1,0 +1,222 @@
+(ns connector.google.gdrive
+  (:require [connector :as conn] [connector.http] [credential :as cred]))
+
+(def ^:private DT (erlang/binary_to_atom "Elixir.DateTime"))
+
+(def spec
+  "What Drive IS. One `files.list` answers full metadata — no N+1, which is why
+   Drive is the EASIER of the two and the wrong one to build a cursor fold
+   against: a fold with a bug passes on it.
+
+   `:fields` is not an optimisation to skip. Drive's default projection omits
+   almost everything, and asking for a field the projection did not name returns
+   an object that is missing a key rather than an error — a difference that
+   surfaces much later as a nil where a value should be."
+  {:service :google
+   :id :gdrive
+   :base-url "https://www.googleapis.com/drive/v3"
+   :scopes ["https://www.googleapis.com/auth/drive.readonly"]
+   :resources
+   {:files
+    {:list {:path "/files"
+            :query [["pageSize" 100]
+                    ["fields" "nextPageToken,files(id,name,mimeType,modifiedTime,size,md5Checksum,owners(displayName))"]]
+            :items "files"
+            :next "nextPageToken"
+            :as {:relation :~file/files :mode :ff}}
+     :get  {:path "/files/{id}"
+            :query [["fields" "id,name,mimeType,modifiedTime,size,md5Checksum,parents,trashed"]]
+            :as {:relation :~file/files :mode :bf}}}}})
+
+(defn millis
+  "RFC 3339 → epoch milliseconds, or nil.
+
+   Drive reports `modifiedTime` as a date-TIME with an offset, which is one
+   `DateTime.from_iso8601` away from the integer every other instant in this
+   tree is. Returning nil rather than raising keeps a malformed timestamp a
+   missing value on one file instead of a failed sync of ten thousand."
+  [s]
+  (if (nil? s)
+    nil
+    (let [r (erlang/apply DT :from_iso8601 (list s))]
+      (if (= :ok (erlang/element 1 r))
+        (erlang/apply DT :to_unix (list (erlang/element 2 r) :millisecond))
+        nil))))
+
+(defn entity
+  "`[:gdrive namespace file-id]` — identity is the provider's NAMESPACE, not the
+   account that saw it (docs/connectors/entities-and-projections.md §2). For My
+   Drive the namespace is the account's subject; a shared drive would be its
+   drive id (not supported yet — refused by the keep)."
+  [namespace f]
+  [:gdrive namespace (get f "id")])
+
+(defn file-map
+  "A Drive file resource → `{:key :name :mime :folder? :modified :size :md5
+   :parents :trashed :rev}`. `:rev` is what re-owes a projection: the content
+   checksum when Drive has one (binary files), else the modifiedTime (Google
+   Docs, whose bytes are an export and carry no checksum)."
+  [namespace f]
+  (let [mime (get f "mimeType")
+        md5 (get f "md5Checksum")
+        mod (get f "modifiedTime")]
+    {:key (entity namespace f)
+     :id (get f "id")
+     :name (get f "name")
+     :mime mime
+     :folder? (= mime "application/vnd.google-apps.folder")
+     :modified (millis mod)
+     :size (let [s (get f "size")] (if (nil? s) nil (String/to_integer s)))
+     :md5 md5
+     :parents (into [] (or (get f "parents") []))
+     :trashed (= true (get f "trashed"))
+     :rev (or md5 mod)}))
+
+(def FILE-FIELDS
+  "The fields every listing asks for — one place, so the keep, the browser and
+   the fetch cannot drift apart on what a file IS."
+  "id,name,mimeType,modifiedTime,size,md5Checksum,parents,trashed")
+
+(defn fetch
+  "Files from one connection, as `file-map`s. → {:ok [map …]} | {:error …}.
+   ONE request per page — the metadata is in the listing."
+  [c {:keys [limit query]}]
+  (let [r (conn/walk c (str (:base-url spec) "/files")
+                     (concat [["fields" (str "nextPageToken,files(" FILE-FIELDS ")")]]
+                             (if (nil? query) [] [["q" query]]))
+                     "files" "nextPageToken" {:limit limit})]
+    (if (= :error (first (keys r)))
+      r
+      {:ok (mapv (fn [f] (file-map (:account-id c) f)) (to-list (get r :ok)))})))
+
+;; ── the feed: what connector.keep needs from Drive ──────────────────────────
+;;
+;; A FEED is data + four pure functions; `connector.keep` owns the algorithm
+;; (cursor first, root closure, seed, commit last) and knows no provider. Every
+;; request goes through `get` — `(fn [url] → {:ok json} | {:error …})` — so a
+;; test or a fake serves the exact URLs below and nothing else changes.
+;;
+;; Verified against the Drive v3 reference, 2026-09-28: changes.list returns
+;; `changes`, `nextPageToken` (absent at the end) and `newStartPageToken`
+;; (present only at the end); page tokens do not expire; pageSize max 1000;
+;; `includeRemoved` reports deletions and loss of access as `removed: true`.
+
+(def ^:private BASE "https://www.googleapis.com/drive/v3")
+
+(defn start-token-url [] (str BASE "/changes/startPageToken"))
+
+(defn changes-url [token]
+  (conn/with-query (str BASE "/changes")
+    [["pageToken" token] ["pageSize" 1000] ["includeRemoved" "true"]
+     ["restrictToMyDrive" "true"] ["spaces" "drive"]
+     ["fields" (str "nextPageToken,newStartPageToken,changes(fileId,removed,file(" FILE-FIELDS "))")]]))
+
+(defn children-url [folder-id page-token]
+  (conn/with-query (str BASE "/files")
+    [["q" (str "'" folder-id "' in parents and trashed = false")]
+     ["pageSize" 1000] ["pageToken" page-token]
+     ["fields" (str "nextPageToken,files(" FILE-FIELDS ")")]]))
+
+(defn file-url [file-id]
+  (conn/with-query (str BASE "/files/" file-id) [["fields" FILE-FIELDS]]))
+
+(defn feed
+  "The Drive feed for the My Drive of the account whose subject is `namespace`."
+  [namespace]
+  {:provider :gdrive
+   :namespace namespace
+   :start-token (fn [get] (let [r (get (start-token-url))]
+                            (if (contains? r :ok) {:ok (get-in r [:ok "startPageToken"])} r)))
+   :changes (fn [get token]
+              (let [r (get (changes-url token))]
+                (if (contains? r :ok)
+                  (let [b (:ok r)]
+                    {:ok {:items (mapv (fn [ch]
+                                         (if (= true (get ch "removed"))
+                                           {:key [:gdrive namespace (get ch "fileId")] :removed true}
+                                           (file-map namespace (get ch "file"))))
+                                       (into [] (or (get b "changes") [])))
+                          :next (get b "nextPageToken")
+                          :cursor (get b "newStartPageToken")}})
+                  r)))
+   :children (fn [get parent-key page]
+               (let [r (get (children-url (nth parent-key 2) page))]
+                 (if (contains? r :ok)
+                   {:ok {:items (mapv (fn [f] (file-map namespace f)) (into [] (or (get-in r [:ok "files"]) [])))
+                         :next (get-in r [:ok "nextPageToken"])}}
+                   r)))
+   :item (fn [get key]
+           (let [r (get (file-url (nth key 2)))]
+             (if (contains? r :ok) {:ok (file-map namespace (:ok r))} r)))
+   :parent-key (fn [item] (let [ps (:parents item)]
+                            (if (empty? ps) nil [:gdrive namespace (first ps)])))})
+
+;; ── content: download a binary file, export a Google Doc ────────────────────
+;;
+;; Verified against the Drive v3 reference, 2026-09-28: files.export returns
+;; the converted bytes and "the exported content is limited to 10 MB";
+;; `mimeType` is required. A binary file is read with `alt=media`.
+
+(def EXPORT-LIMIT (* 10 1024 1024))
+
+(def EXPORTS
+  "What a Google-native type is exported AS, for ingestion. Text-first: the
+   formats a reader can index without a converter. Sheets/Slides/Drawings are
+   not ingested here (a CSV of one sheet or a PDF of slides loses too much to
+   pretend it is the document) — they are refused by name."
+  {"application/vnd.google-apps.document" "text/markdown"})
+
+(defn content-request
+  "How to read `item`'s bytes: {:url u :limit n :as mime} | {:refused reason}."
+  [item max-bytes]
+  (let [mime (:mime item)
+        native? (starts-with? (or mime "") "application/vnd.google-apps.")]
+    (cond
+      (:folder? item) {:refused :folder}
+      (and native? (contains? EXPORTS mime))
+        {:url (conn/with-query (str BASE "/files/" (nth (:key item) 2) "/export")
+                [["mimeType" (get EXPORTS mime)]])
+         :limit (min max-bytes EXPORT-LIMIT) :as (get EXPORTS mime) :export true}
+      native? {:refused :unsupported-google-type}
+      (and (some? (:size item)) (> (:size item) max-bytes)) {:refused :too-large}
+      :else {:url (conn/with-query (str BASE "/files/" (nth (:key item) 2)) [["alt" "media"]])
+             :limit max-bytes :as mime})))
+
+(defn content!
+  "The bytes of `item` through connection `c`. → {:ok bin :mime m} |
+   {:refused reason} (terminal: record and move on) | {:error …} (transient:
+   retry). A 10 MB export overflow is `:export-too-large`, by name."
+  [c item max-bytes]
+  (let [req (content-request item max-bytes)]
+    (if (contains? req :refused) req
+      (let [a (conn/access! c)]
+        (if (not (cred/good? a)) a
+          (let [r (connector.http/get-bytes (:url req) (cred/bearer (cred/ok a)) (:limit req))]
+            (cond
+              (contains? r :ok) {:ok (:ok r) :mime (:as req)}
+              (= :too-large (get-in r [:error :reason]))
+                {:refused (if (:export req) :export-too-large :too-large)}
+              (contains? #{403 404} (get-in r [:error :status])) {:refused :no-access}
+              :else r)))))))
+
+;; ── browse: a folder's children, NOW, writing nothing ───────────────────────
+
+(defn browse
+  "The children of folder `folder-id` (\"root\" for My Drive) as file maps,
+   folders first then by name. A live call — nothing is written anywhere, so
+   browsing never puts a folder name into a store (docs/connectors/
+   entities-and-projections.md R2). `get` as in `feed`."
+  [get namespace folder-id]
+  (loop [page nil out []]
+    (let [r (get (children-url folder-id page))]
+      (if (contains? r :error) r
+        (let [out (into out (map (fn [f] (file-map namespace f)) (or (get-in r [:ok "files"]) [])))
+              nxt (get-in r [:ok "nextPageToken"])]
+          (if (nil? nxt)
+            {:ok (into [] (sort-by (fn [f] [(if (:folder? f) 0 1) (String/downcase (or (:name f) ""))]) out))}
+            (recur nxt out)))))))
+
+(defn get-via
+  "The `get` a keep or a browse uses for a real connection: renews the grant
+   (once on 401) through `connector/get!`."
+  [c] (fn [url] (conn/get! c url)))
