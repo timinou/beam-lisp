@@ -1,0 +1,293 @@
+; vm/machine.bl — the machine console: every bl VM, as a page.
+;
+; `bl vm` in a browser. The same rows (`vm.inventory`), a different face — so the
+; terminal and the page cannot disagree, because neither owns the truth.
+;
+;   GET  /machine          the page: attention first, then the VM tree
+;   GET  /api/vms          the rows as JSON (what the page renders)
+;   POST /api/vms/<id>/stop   stop one VM — token + Host guarded
+;
+; ══ WHY A PAGE THAT CAN STOP PROCESSES NEEDS MORE THAN A TOKEN ══════════════
+;
+; Loopback is not a trust boundary: any web page you visit can ask your browser to
+; call 127.0.0.1. Two attacks are specific to a page like this one and a bare
+; token does not stop both.
+;
+;   cross-site POST    a hostile page POSTs /api/vms/<id>/stop. Defeated by the
+;                      token in a custom header: a cross-origin caller cannot set
+;                      one without a preflight this server never approves.
+;   DNS rebinding      a hostile name resolves to 127.0.0.1, so the browser treats
+;                      it as same-origin and reads the page — token included. The
+;                      token alone is then the attacker's. Defeated by checking the
+;                      Host header: a rebound request arrives with the attacker's
+;                      name in it, which no legitimate caller ever sends.
+;
+; So every request is refused unless its Host is one we would put in a link: a
+; loopback address, `localhost`, or a name a live claim holds. And stopping needs
+; the token on top.
+;
+; ══ DESIGN RULES THIS PAGE FOLLOWS ══════════════════════════════════════════
+;
+; (docs/design/realm/console.md has the full list; the ones a reviewer can check
+; from this file)
+;   • status is a WORD and a mark, never colour alone
+;   • body text meets 4.5:1 on its background; lines stay under ~75 characters
+;   • no card inside a card, no side-stripe accent, no gradient, no glow
+;   • one size scale and one spacing scale, named once at the top of the CSS
+;   • nothing animates layout; `prefers-reduced-motion` is honoured
+;   • an empty machine says one sentence and the command that fixes it
+
+(ns vm.machine
+  (:require [web] [bl.json] [vm.inventory :as inv] [vm.ports :as ports] [vm.paths :as paths]))
+
+;; ── escaping ────────────────────────────────────────────────────────────────
+
+(defn- esc [v]
+  (if (nil? v)
+    ""
+    (-> (str v)
+        (String/replace "&" "&amp;") (String/replace "<" "&lt;")
+        (String/replace ">" "&gt;") (String/replace "\"" "&quot;")
+        (String/replace "'" "&#39;"))))
+
+;; ── the Host guard ──────────────────────────────────────────────────────────
+
+(defn- host-name
+  "The host part of a Host header: no port, lowercased. An IPv6 literal keeps its
+   brackets (`[::1]:4000` → `[::1]`); everything else is cut at the first colon."
+  [h]
+  (let [h (String/downcase (or h ""))]
+    (if (String/starts_with? h "[")
+      (let [i (index-of h "]")]
+        (if (nil? i) h (String/slice h 0 (+ i 1))))
+      (first (String/split h ":")))))
+
+(defn host-ok?
+  "Whether `host` (a Host header value) is one this console answers to: loopback,
+   `localhost`, or a name a live claim holds. Anything else is a request that
+   reached us under a name we never published — the signature of DNS rebinding."
+  [host]
+  (let [n (host-name host)]
+    (boolean
+      (or (contains? #{"127.0.0.1" "localhost" "[::1]" "::1"} n)
+          (some? (ports/holder-of-host n))))))
+
+(defn- guard [conn f]
+  (if (host-ok? (web/req-header conn "host"))
+    (f)
+    (web/json conn 403 {"error" "this console does not answer to that host name"})))
+
+;; ── token ───────────────────────────────────────────────────────────────────
+
+(defn token-hex
+  "The session token as the page carries it: lowercase hex. The token is 32 raw
+   bytes — not valid UTF-8, so it cannot be JSON-encoded or put in a header as it
+   is. One encoding, here, used by the page that embeds it and the check that
+   compares it, so the two cannot drift."
+  [raw]
+  (if (erlang/is_binary raw) (String/downcase (Base/encode16 raw)) ""))
+
+(defn- token-ok? [opts conn]
+  (let [given (or (web/req-header conn "x-bl-token") "")
+        hex (token-hex (get opts :token))]
+    (and (> (erlang/byte_size hex) 0)
+         (erlang/is_binary given)
+         (= (erlang/byte_size hex) (erlang/byte_size given))
+         (erlang/apply :crypto :hash_equals (list hex given)))))
+
+;; ── the page ────────────────────────────────────────────────────────────────
+
+(def CSS
+  (str
+    ;; ONE scale each, named once. Every later rule reads these.
+    ":root{color-scheme:light dark;"
+    "--s1:.25rem;--s2:.5rem;--s3:1rem;--s4:1.5rem;--s5:2.5rem;"
+    "--t-sm:.875rem;--t-md:1rem;--t-lg:1.25rem;--t-xl:1.75rem;"
+    "--bg:#fbfaf8;--fg:#1b1a17;--muted:#58554c;--line:#d9d5c9;--row:#f1efe8;"
+    "--up:#0b6b3a;--warn:#8a4b00;--dead:#8a1f1f;--focus:#0b4fd1;"
+    "--btn:#1b1a17;--btn-fg:#fbfaf8}"
+    "@media (prefers-color-scheme:dark){:root{"
+    "--bg:#14130f;--fg:#efece3;--muted:#b3afa2;--line:#3a382f;--row:#1d1c17;"
+    "--up:#5fd18f;--warn:#f0b35a;--dead:#ff9a9a;--focus:#8fb4ff;"
+    "--btn:#efece3;--btn-fg:#14130f}}"
+    "*{box-sizing:border-box}"
+    "body{margin:0;background:var(--bg);color:var(--fg);"
+    "font:var(--t-md)/1.55 system-ui,-apple-system,'Segoe UI',sans-serif}"
+    "main{max-width:60rem;margin:0 auto;padding:var(--s5) var(--s3)}"
+    "h1{font-size:var(--t-xl);line-height:1.2;margin:0 0 var(--s2);font-weight:650}"
+    "h2{font-size:var(--t-lg);margin:var(--s5) 0 var(--s3);font-weight:650}"
+    "p{margin:0 0 var(--s3);max-width:62ch}"
+    ".lede{color:var(--muted)}"
+    "code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:var(--t-sm)}"
+    "a{color:var(--focus)}"
+    "a:focus-visible,button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}"
+    "table{width:100%;border-collapse:collapse}"
+    "th{text-align:left;font-size:var(--t-sm);font-weight:600;color:var(--muted);"
+    "padding:var(--s2) var(--s3) var(--s2) 0;border-bottom:1px solid var(--line)}"
+    "td{padding:var(--s2) var(--s3) var(--s2) 0;border-bottom:1px solid var(--line);vertical-align:top}"
+    "td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}"
+    "tr.realm td{background:var(--row);border-bottom-color:transparent}"
+    "tr.realm td:first-child{padding-left:var(--s4)}"
+    ".state{font-weight:600;white-space:nowrap}"
+    ".state.up{color:var(--up)}.state.old{color:var(--warn)}.state.gone{color:var(--dead)}"
+    ".att{list-style:none;margin:0 0 var(--s3);padding:0}"
+    ".att li{padding:var(--s2) 0;border-bottom:1px solid var(--line)}"
+    ".att .why{font-weight:600}.att .fix{display:block;color:var(--muted)}"
+    "button{font:inherit;font-size:var(--t-sm);padding:var(--s1) var(--s3);"
+    "background:var(--btn);color:var(--btn-fg);border:0;border-radius:4px;cursor:pointer}"
+    "button[disabled]{opacity:.55;cursor:default}"
+    ".quiet{background:transparent;color:var(--fg);border:1px solid var(--line)}"
+    ".empty{padding:var(--s5) 0}"
+    "#msg{min-height:1.5rem;color:var(--muted);margin-top:var(--s3)}"
+    "@media (max-width:40rem){th.hide,td.hide{display:none}}"
+    "@media (prefers-reduced-motion:no-preference){button{transition:opacity .15s}}"))
+
+(defn- age [s]
+  (cond (nil? s) "–"
+        (< s 60) (str s "s")
+        (< s 3600) (str (erlang/div s 60) "m")
+        (< s 86400) (str (erlang/div s 3600) "h")
+        :else (str (erlang/div s 86400) "d")))
+
+(defn- size [kb]
+  (cond (nil? kb) "–"
+        (< kb 1024) (str kb " KB")
+        (< kb 1048576) (str (erlang/div kb 1024) " MB")
+        :else (str (/ (erlang/round (* 10 (/ kb 1048576.0))) 10.0) " GB")))
+
+(defn- state-cell [row]
+  (cond (= :dead (:state row)) "<span class=\"state gone\">✕ gone</span>"
+        (:legacy row)          "<span class=\"state old\">▲ up, unregistered</span>"
+        :else                  "<span class=\"state up\">● up</span>"))
+
+(defn- route-links [rm]
+  (join ", "
+        (map (fn [rt] (str "<a href=\"" (esc (:url rt)) "\">" (esc (:name rt)) "</a>"))
+             (:routes rm))))
+
+(defn- vm-row [row]
+  (str "<tr><td><span class=\"mono\">" (esc (:id row)) "</span></td>"
+       "<td>" (esc (name (:role row))) "</td>"
+       "<td class=\"hide mono\">" (esc (:build row)) "</td>"
+       "<td>" (state-cell row) "</td>"
+       "<td class=\"num\">" (age (:uptime-s row)) "</td>"
+       "<td class=\"num\">" (size (:memory-kb row)) "</td>"
+       "<td>"
+       (if (or (:self row) (= :dead (:state row)))
+         ""
+         (str "<button type=\"button\" class=\"quiet\" data-stop=\"" (esc (:id row))
+              "\">Stop</button>"))
+       "</td></tr>"
+       (apply str
+              (map (fn [rm]
+                     (str "<tr class=\"realm\"><td colspan=\"7\">"
+                          "<strong>" (esc (:name rm)) "</strong> "
+                          "<span class=\"mono\">" (esc (:root rm)) "</span>"
+                          (if (empty? (:routes rm)) "" (str " · " (route-links rm)))
+                          "</td></tr>"))
+                   (:realms row)))))
+
+(defn- attention [notes]
+  (if (empty? notes)
+    ""
+    (str "<h2>Needs attention</h2><ul class=\"att\">"
+         (apply str (map (fn [n]
+                           (str "<li><span class=\"why\">" (esc (:text n)) "</span>"
+                                "<code class=\"fix\">" (esc (:fix n)) "</code></li>"))
+                         notes))
+         "</ul>")))
+
+(defn- empty-state []
+  (str "<div class=\"empty\"><p>No bl VM is running.</p>"
+       "<p class=\"lede\">Start one in a project: <code>bl daemon start</code></p></div>"))
+
+(defn- script [token]
+  (str "const TOKEN=" (bl.json/encode token) ";"
+       "const msg=document.getElementById('msg');"
+       "document.addEventListener('click',async e=>{"
+       "const b=e.target.closest('[data-stop]');if(!b)return;"
+       "const id=b.dataset.stop;b.disabled=true;msg.textContent='Stopping '+id+'…';"
+       "try{const r=await fetch('/api/vms/'+encodeURIComponent(id)+'/stop',"
+       "{method:'POST',headers:{'x-bl-token':TOKEN}});const d=await r.json();"
+       "msg.textContent=r.ok?id+' '+d.how:id+': '+(d.error||'failed');"
+       "if(r.ok)setTimeout(()=>location.reload(),600);else b.disabled=false;"
+       "}catch(err){msg.textContent=id+': '+err;b.disabled=false;}});"))
+
+(defn- u-count [rows]
+  (let [n (count rows)
+        realms (reduce (fn [a r] (+ a (count (:realms r)))) 0 rows)]
+    (str n (if (= n 1) " VM" " VMs") ", "
+         realms (if (= realms 1) " realm" " realms") ".")))
+
+(defn page
+  "The whole page as a string. Pure in `rows`/`notes`, so a test renders it
+   without a server."
+  [rows notes token]
+  (str "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+       "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+       "<title>bl · machine</title><style>" CSS "</style></head><body><main>"
+       "<h1>Running on this machine</h1>"
+       "<p class=\"lede\">" (u-count rows) "</p>"
+       (attention notes)
+       (if (empty? rows)
+         (empty-state)
+         (str "<h2>VMs</h2><table><thead><tr>"
+              "<th>VM</th><th>Role</th><th class=\"hide\">Build</th><th>State</th>"
+              "<th class=\"num\">Up</th><th class=\"num\">Memory</th><th></th>"
+              "</tr></thead><tbody>"
+              (apply str (map vm-row rows))
+              "</tbody></table>"))
+       "<div id=\"msg\" role=\"status\" aria-live=\"polite\"></div>"
+       "</main><script>" (script (token-hex token)) "</script></body></html>"))
+
+;; ── handlers ────────────────────────────────────────────────────────────────
+
+(defn- stop-route
+  "`/api/vms/<id>/stop` → <id>, or nil."
+  [p]
+  (let [parts (String/split p "/")]
+    (when (and (= 5 (count parts)) (= "" (nth parts 0)) (= "api" (nth parts 1))
+               (= "vms" (nth parts 2)) (= "stop" (nth parts 4)))
+      (erlang/apply (erlang/binary_to_atom "Elixir.URI") :decode (list (nth parts 3))))))
+
+(defn- stop-vm [conn opts id]
+  (let [[_ conn] (web/read-body* conn)]
+    (cond
+      (not (token-ok? opts conn))
+      (web/json conn 403 {"error" "missing or wrong x-bl-token"})
+      :else
+      (let [r (inv/resolve (inv/rows {}) id)]
+        (if (not (contains? r :ok))
+          (web/json conn 404 {"error" (str "no VM matches " id)})
+          (let [s (inv/stop! (:ok r) {})]
+            (if (contains? s :ok)
+              (web/json conn 200 {"ok" true "id" (:id (:ok r)) "how" (name (:ok s))})
+              (web/json conn 409 {"ok" false "id" (:id (:ok r))
+                                  "error" (let [e (:error s)] (if (tuple? e) (nth e 1) (str e)))}))))))))
+
+(defn handler
+  "A plug for the machine routes, or nil when `conn` is not one of them — so the
+   caller can fall through to its own router. `opts` carries the :token."
+  [conn opts]
+  (let [m (web/method conn) p (web/path conn)]
+    (cond
+      (and (= m "get") (= p "/machine"))
+      (guard conn (fn []
+                    (let [rows (inv/rows {}) notes (inv/attention rows)]
+                      (web/html conn 200 (page rows notes (get opts :token))))))
+
+      (and (= m "get") (= p "/api/vms"))
+      (guard conn (fn []
+                    (let [rows (inv/rows {})]
+                      (web/json conn 200 {"vms" rows "attention" (inv/attention rows)}))))
+
+      (and (= m "post") (some? (stop-route p)))
+      (guard conn (fn [] (stop-vm conn opts (stop-route p))))
+
+      :else nil)))
+
+(defn mine?
+  "Whether `conn`'s path belongs to this console."
+  [conn]
+  (let [p (web/path conn)]
+    (or (= p "/machine") (= p "/api/vms") (some? (stop-route p)))))

@@ -1,0 +1,267 @@
+; inventory_test.bl — vm.inventory: the join, the guard rails, and the stop ladder.
+;
+; Every test runs in a throwaway runtime dir. The processes it stops are REAL —
+; a `sleep` spawned for the test — because a stop that was only ever aimed at a
+; planted fake pid has proved nothing about signalling the right process.
+
+(ns vm.inventory-test
+  (:require [vm.inventory :as inv] [vm.registry :as registry] [vm.paths :as paths]
+            [vm.ports :as ports]))
+
+(defn- with-runtime [f]
+  (let [prev (System/get_env "XDG_RUNTIME_DIR")
+        rt (str "/tmp/bl-inventory-test-" (erlang/apply :erlang :unique_integer (list (to-list [:positive]))))]
+    (File/mkdir_p! rt)
+    (System/put_env "XDG_RUNTIME_DIR" rt)
+    (try (f rt)
+         (finally
+           (if (nil? prev) (System/delete_env "XDG_RUNTIME_DIR") (System/put_env "XDG_RUNTIME_DIR" prev))
+           (File/rm_rf! rt)))))
+
+(defn- own-pid [] (erlang/list_to_integer (erlang/apply :os :getpid (list))))
+
+(defn- spawn-sleeper
+  "A real, detached `sleep` process; returns its pid. Detached so killing it
+   cannot touch this test's own process group."
+  []
+  (let [out (erlang/apply :os :cmd (list (erlang/binary_to_list "setsid sleep 300 >/dev/null 2>&1 & echo $!")))]
+    (erlang/binary_to_integer (erlang/apply :string :trim (list (erlang/list_to_binary out))))))
+
+(defn- pid-alive? [pid] (File/dir? (str "/proc/" pid)))
+
+(defn- record-for
+  "A registry record for a REAL pid, with the kernel's own start ticks."
+  [pid role build]
+  {:id (str build "-" pid) :role role :build build :pid pid
+   :ticks (registry/start-ticks pid) :started (erlang/system_time :second) :label nil})
+
+(defn- plant-record! [rt rec]
+  (let [dir (str rt "/beam_lisp/vms")]
+    (File/mkdir_p! dir)
+    (File/write! (str dir "/" (:id rec) ".rec") (erlang/term_to_binary rec))))
+
+(defn- reap [pid] (erlang/apply :os :cmd (list (erlang/binary_to_list (str "kill -9 " pid " 2>/dev/null")))))
+
+;; ── the join ────────────────────────────────────────────────────────────────
+
+(deftest a-published-vm-is-a-row
+  (testing "this process publishes, and the inventory lists it as itself"
+    (with-runtime
+      (fn [_]
+        (registry/publish! :warm {:label "me"})
+        (let [rows (inv/rows)
+              me (first (filter (fn [r] (= (own-pid) (:pid r))) rows))]
+          (is (some? me))
+          (is (= :up (:state me)))
+          (is (= true (:self me)) "the row for the running VM says so, so stop can refuse it")
+          (is (= false (:legacy me)))
+          (is (pos? (:memory-kb me))))))))
+
+(deftest rows-order-the-gateway-first
+  (testing "gateway, then warm VMs, oldest first within a role"
+    (with-runtime
+      (fn [rt]
+        (let [a (spawn-sleeper) b (spawn-sleeper) c (spawn-sleeper)]
+          (try
+            (plant-record! rt (assoc (record-for a :warm "aaaa") :started 100))
+            (plant-record! rt (assoc (record-for b :warm "bbbb") :started 50))
+            (plant-record! rt (assoc (record-for c :gateway "gggg") :started 999))
+            (is (= [:gateway :warm :warm] (mapv (fn [r] (:role r)) (inv/rows))))
+            (is (= [c b a] (mapv (fn [r] (:pid r)) (inv/rows))))
+            (finally (reap a) (reap b) (reap c))))))))
+
+(deftest a-claim-adopts-its-owner-as-a-legacy-row
+  (testing "a VM that never published still appears, marked, via its port claim"
+    (with-runtime
+      (fn [_]
+        (let [pid (spawn-sleeper)]
+          (try
+            (ports/claim "web" 0 {:root "/tmp/some-proj" :pid pid :hosts ["web.some.test"]})
+            (let [row (first (filter (fn [r] (= pid (:pid r))) (inv/rows)))]
+              (is (some? row) "a claim's owner must not be invisible")
+              (is (= true (:legacy row)))
+              (is (= ["/tmp/some-proj"] (vec (:roots row))))
+              (is (= ["web"] (mapv (fn [rt] (:name rt)) (:routes row)))))
+            (finally (reap pid))))))))
+
+(deftest a-dead-record-appears-only-with-all
+  (testing "default listing omits it; --all lists it as gone"
+    (with-runtime
+      (fn [rt]
+        (plant-record! rt {:id "x-4000000" :role :warm :build "x" :pid 4000000 :ticks 7 :started 0})
+        (is (empty? (filter (fn [r] (= 4000000 (:pid r))) (inv/rows))))
+        (let [r (first (filter (fn [r] (= 4000000 (:pid r))) (inv/rows {:all true})))]
+          (is (= :dead (:state r))))))))
+
+;; ── resolving what a human typed ────────────────────────────────────────────
+
+(def ROWS [{:id "aaaa1111-10" :pid 10 :build "aaaa1111" :label "blueprint"}
+           {:id "bbbb2222-20" :pid 20 :build "bbbb2222" :label "knowledger"}
+           {:id "bbbb2222-21" :pid 21 :build "bbbb2222" :label nil}])
+
+(deftest resolve-takes-an-id-a-pid-a-prefix-a-label-or-a-lone-build
+  (is (= "aaaa1111-10" (:id (:ok (inv/resolve ROWS "aaaa1111-10")))))
+  (is (= "aaaa1111-10" (:id (:ok (inv/resolve ROWS "10")))) "a pid")
+  (is (= "aaaa1111-10" (:id (:ok (inv/resolve ROWS "aaaa")))) "a unique id prefix")
+  (is (= "bbbb2222-20" (:id (:ok (inv/resolve ROWS "knowledger")))) "a label")
+  (is (= "aaaa1111-10" (:id (:ok (inv/resolve ROWS "aaaa1111")))) "a build that exactly one VM runs"))
+
+(deftest resolve-refuses-to-guess
+  (testing "an ambiguous query names the candidates and picks none"
+    (let [r (inv/resolve ROWS "bbbb")]
+      (is (contains? r :error))
+      (is (= :ambiguous (first (:error r))))
+      (is (= ["bbbb2222-20" "bbbb2222-21"] (vec (nth (:error r) 2))))))
+  (testing "a build two VMs run is ambiguous too"
+    (is (= :ambiguous (first (:error (inv/resolve ROWS "bbbb2222"))))))
+  (testing "nothing matches"
+    (is (= :no-such-vm (first (:error (inv/resolve ROWS "zzz")))))))
+
+;; ── attention ───────────────────────────────────────────────────────────────
+
+(deftest attention-states-facts-with-fixes
+  (testing "named routes and no gateway"
+    (with-runtime
+      (fn [_]
+        (let [rows [{:role :warm :state :up :build "x" :id "x-1" :legacy false
+                     :routes [{:name "ui" :hosts ["ui.p.test"]}]}]
+              notes (inv/attention rows)
+              n (first (filter (fn [n] (= :gateway-down (:kind n))) notes))]
+          (is (some? n))
+          (is (= "bl gateway start" (:fix n)))))))
+  (testing "no routes, no gateway: nothing to say"
+    (with-runtime
+      (fn [_]
+        (is (empty? (filter (fn [n] (= :gateway-down (:kind n)))
+                            (inv/attention [{:role :warm :state :up :build "x" :id "x-1" :legacy false :routes []}])))))))
+  (testing "dead files are counted"
+    (with-runtime
+      (fn [rt]
+        (plant-record! rt {:id "d-4000000" :role :warm :build "d" :pid 4000000 :ticks 7 :started 0})
+        (is (some (fn [n] (= :dead-records (:kind n))) (inv/attention []))))))
+  (testing "a legacy row is explained"
+    (with-runtime
+      (fn [_]
+        (is (some (fn [n] (= :legacy (:kind n)))
+                  (inv/attention [{:role :warm :state :up :build "x" :id "x-1" :legacy true :routes []}])))))))
+
+;; ── stopping ────────────────────────────────────────────────────────────────
+
+(deftest a-vm-never-stops-the-vm-it-runs-in
+  (testing "stopping yourself would cut the command off mid-answer"
+    (with-runtime
+      (fn [_]
+        (registry/publish! :warm)
+        (let [me (first (filter (fn [r] (:self r)) (inv/rows)))
+              r (inv/stop! me {})]
+          (is (= :self (first (:error r))))
+          (is (pid-alive? (own-pid))))))))
+
+(deftest stopping-a-gone-vm-is-a-no-op
+  (let [r (inv/stop! {:id "g-4000000" :pid 4000000 :ticks 7 :role :warm :roots []} {})]
+    (is (= {:ok :gone} r))))
+
+(deftest a-process-that-will-not-leave-needs-force
+  (testing "SIGTERM first; SIGKILL only on request"
+    (with-runtime
+      (fn [rt]
+        (let [pid (spawn-sleeper)
+              ;; ignore TERM, as a wedged VM would: a shell that traps it
+              stubborn (erlang/binary_to_integer
+                         (erlang/apply :string :trim
+                           (list (erlang/list_to_binary
+                                   (erlang/apply :os :cmd
+                                     (list (erlang/binary_to_list
+                                             "setsid sh -c 'trap \"\" TERM; sleep 300' >/dev/null 2>&1 & echo $!")))))))]
+          (reap pid)
+          (try
+            (let [row (record-for stubborn :job "stub")
+                  gentle (inv/stop! row {})]
+              (is (= :still-running (:error gentle)) "TERM is ignored, and without --force that is the answer")
+              (is (pid-alive? stubborn))
+              (let [forced (inv/stop! row {:force true})]
+                (is (= {:ok :killed} forced))
+                (is (not (pid-alive? stubborn)))))
+            (finally (reap stubborn))))))))
+
+(deftest stop-terminates-a-cooperative-process-without-force
+  (with-runtime
+    (fn [_]
+      (let [pid (spawn-sleeper)]
+        (try
+          (let [r (inv/stop! (record-for pid :job "coop") {})]
+            (is (= {:ok :terminated} r))
+            (is (not (pid-alive? pid))))
+          (finally (reap pid)))))))
+
+(deftest an-adopted-row-is-signalled-only-if-it-is-a-beam
+  (testing "no start ticks, and the command line is `sleep`: refuse rather than guess"
+    (with-runtime
+      (fn [_]
+        (let [pid (spawn-sleeper)]
+          (try
+            (let [r (inv/stop! {:id (str "old-" pid) :role :warm :build "old" :pid pid
+                                :ticks nil :roots []} {})]
+              (is (= :refuse (first (:error r))))
+              (is (pid-alive? pid) "the sleeper must be untouched"))
+            (finally (reap pid))))))))
+
+(deftest a-reused-pid-is-never-signalled
+  (testing "the record's ticks do not match the process now holding the pid"
+    (with-runtime
+      (fn [_]
+        (let [pid (spawn-sleeper)]
+          (try
+            (let [row (assoc (record-for pid :warm "stale") :ticks 1)
+                  r (inv/stop! row {:force true})]
+              (is (= {:ok :gone} r) "to the registry that VM is gone")
+              (is (pid-alive? pid) "and the unrelated process lives"))
+            (finally (reap pid))))))))
+
+;; ── prune ───────────────────────────────────────────────────────────────────
+
+(deftest prune-removes-only-what-is-dead
+  (with-runtime
+    (fn [rt]
+      (let [live (spawn-sleeper)]
+        (try
+          (plant-record! rt (record-for live :warm "live"))
+          (plant-record! rt {:id "d-4000000" :role :warm :build "d" :pid 4000000 :ticks 7 :started 0})
+          (let [dry (inv/prune! {:dry-run true})]
+            (is (= true (:dry-run dry)))
+            (is (= 1 (count (:removed dry))))
+            (is (File/exists? (str rt "/beam_lisp/vms/d-4000000.rec")) "dry run must not delete"))
+          (let [real (inv/prune! {})]
+            (is (= 1 (count (:removed real))))
+            (is (not (File/exists? (str rt "/beam_lisp/vms/d-4000000.rec"))))
+            (is (File/exists? (str rt "/beam_lisp/vms/live-" live ".rec")) "the live record survives"))
+          (finally (reap live)))))))
+
+(deftest prune-sweeps-a-dead-daemons-endpoint-files
+  (testing "a .sock nobody listens on, with a meta naming a dead pid, goes as a group"
+    (with-runtime
+      (fn [rt]
+        (let [dir (str rt "/beam_lisp")]
+          (File/mkdir_p! dir)
+          (File/write! (str dir "/abc-old.sock") "")
+          (File/write! (str dir "/abc-old.token") "t")
+          (File/write! (str dir "/abc-old.meta")
+                       (erlang/term_to_binary {:pid 4000000 :root "/x" :build "old" :started_at 0}))
+          (let [r (inv/prune! {})]
+            (is (= 3 (count (:removed r))))
+            (is (not (File/exists? (str dir "/abc-old.sock"))))))))))
+
+(deftest prune-leaves-a-daemon-that-is-still-starting
+  (testing "a meta naming a LIVE pid keeps its group even though its socket is not up yet"
+    (with-runtime
+      (fn [rt]
+        (let [dir (str rt "/beam_lisp") pid (spawn-sleeper)]
+          (File/mkdir_p! dir)
+          (try
+            (File/write! (str dir "/abc-new.sock") "")
+            (File/write! (str dir "/abc-new.meta")
+                         (erlang/term_to_binary {:pid pid :root "/x" :build "new" :started_at 0}))
+            (is (empty? (:removed (inv/prune! {}))) "a daemon mid-start must never be swept")
+            (finally (reap pid))))))))
+
+(run-tests)
