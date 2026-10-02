@@ -1,0 +1,169 @@
+; test/bl/reload/watcher_files_test.bl — what a save APPLIES: the reload
+; watcher's file→source dispatch, driven with synthetic FileSystem events.
+;
+; Ported from the ExUnit `test/beam_lisp/reload_watcher_test.exs`. That file's
+; cases are split across the BL suites that own each concern, and this is the
+; piece no other suite holds: WHAT the watcher hands the stage seam for one
+; file event.
+;
+;   * "a saved .bl file updates the running image" and "an incoherent save is
+;     held; the old code keeps serving" → the stage→commit CONTRACT, in
+;     `test/bl/reload/watcher_test.bl`;
+;   * "a burst of events for one path applies ONCE" and the dead quiet-window
+;     case → the DEBOUNCE, in `test/bl/reload/debounce_test.bl`;
+;   * a deleted file reports `:removed` once, and a literate `.bl.md`/`.bl.org`
+;     or a `.clj` reaches the same seam → HERE;
+;   * the emitted-beam / inotify plumbing and the differential pinning of the
+;     `BeamLisp.ReloadWatcher` module → `test/bl/host_reload_watcher_test.bl`.
+;
+; Three shapes report through the same `{:file_event, fs, {path, events}}`
+; message, and each must reach the seam correctly:
+;
+;   * a plain `.bl` source is staged as itself (pinned by debounce_test's burst);
+;   * a literate document is recomposed to its CODE CELLS, so the prose never
+;     enters the bundle;
+;   * a DELETED file is announced `:removed` once, and the stage seam is never
+;     reached at all.
+;
+; The seam is the watcher's own injected `:apply` / `:on_result` — the same
+; injection the ExUnit used. Nothing commits into the image, so this suite is
+; deterministic, needs no `--shared`, and cannot depend on (or hang on) the
+; reload loop's commit path. `drain/1` is the barrier, and every watcher this
+; suite starts is stopped in a `finally`.
+;
+; Run: bin/bl test test/bl/reload/watcher_files_test.bl
+
+(ns reload.watcher-files-test
+  (:require [bl.util :as u]))
+
+(defn- tmp-dir []
+  (Path/join (System/tmp_dir)
+             (str "bl_watcher_files_" (erlang/unique_integer (list :positive)))))
+
+(defn- state-of [name] (erlang/apply :sys :get_state (list name)))
+
+(defn- file-event!
+  "One synthetic `{:file_event fs {path events}}` from the watcher's OWN
+   FileSystem process — its handler accepts no other sender, so a test can say
+   exactly which events a change is."
+  [name path events]
+  (let [fs (:fs (state-of name))
+        msg (erlang/list_to_tuple
+              (list :file_event fs (erlang/list_to_tuple (list path events))))]
+    (erlang/send name msg)))
+
+(defn- stop-watcher [name]
+  (erlang/apply :gen_server :stop (list name :normal 1000)))
+
+(defn- drain!
+  "The watcher's `drain/1` barrier with an explicit timeout, so a flush that
+   never settles fails the test loud rather than hanging the ward."
+  [name]
+  (erlang/apply :gen_server :call (list name :drain 10000)))
+
+(defn- start-recording
+  "Start a watcher over `dir` whose stage seam RECORDS instead of committing,
+   and whose `:on_result` forwards every tagged result. Both report to the test
+   process, `me`."
+  [name dir me]
+  (BeamLisp.ReloadWatcher/start_link
+    (u/kw [:dirs (u/to-list [dir])]
+          [:name name]
+          [:quiet_ms 30]
+          [:apply (fn [source path _commit?]
+                    (erlang/send me (erlang/list_to_tuple (list :applied path source)))
+                    {:status :applied :applied (list) :errors (list)})]
+          [:on_result (fn [result]
+                        (erlang/send me (erlang/list_to_tuple (list :result result))))])))
+
+(defn- collect-applied
+  "Every `[path source]` the stage seam was handed, oldest first, without
+   blocking. Returns a vector of `[path source]` pairs."
+  [acc]
+  (receive
+    [:applied path source] (collect-applied (conj acc [path source]))
+    (after 0 acc)))
+
+(defn- collect-results
+  "Every `:on_result` payload the watcher forwarded, oldest first."
+  [acc]
+  (receive
+    [:result result] (collect-results (conj acc result))
+    (after 0 acc)))
+
+; ── a deletion is announced, never staged ────────────────────────────────
+
+(deftest a-deleted-file-reports-removed-once-and-never-stages
+  (let [dir (tmp-dir)
+        path (Path/join dir "gone.bl")
+        me (erlang/self)]
+    (File/mkdir_p! dir)
+    (File/write! path "(ns wf.gone)\n(defn v [] 1)\n")
+    (is (= :ok (erlang/element 1 (start-recording :wf-gone dir me))))
+    (try
+      (File/rm! path)
+      (file-event! :wf-gone path (list :attrib))
+      (file-event! :wf-gone path (list :deleted))
+      (drain! :wf-gone)
+      (is (empty? (collect-applied (list)))
+          "there is no file to read, so the stage seam is never reached")
+      (let [results (collect-results (list))]
+        (is (= 1 (count results)) "the subscriber heard ONE :removed, not one per event")
+        (is (= :removed (:status (first results))) "…and it reports :removed")
+        (is (= path (:path (first results))) "…tagged with the path that was lost"))
+      (finally
+        (stop-watcher :wf-gone)
+        (File/rm_rf dir)))))
+
+; ── a literate save stages its code cells, never its prose ───────────────
+
+(deftest a-saved-bl-md-file-stages-its-code-cells-not-its-prose
+  (let [dir (tmp-dir)
+        path (Path/join dir "w1.bl.md")
+        me (erlang/self)
+        doc (fn [v] (str "# Watcher doc\n\nProse around the cells; prose is never staged.\n\n"
+                         "```beam-lisp\n(ns wf.doc)\n(defn v [] " v ")\n```\n\nMore prose.\n"))]
+    (File/mkdir_p! dir)
+    (File/write! path (doc ":first"))
+    (is (= :ok (erlang/element 1 (start-recording :wf-md dir me))))
+    (try
+      (file-event! :wf-md path (list :modified))
+      (drain! :wf-md)
+      (let [staged (collect-applied (list))]
+        (is (= 1 (count staged)) "one save stages once")
+        (is (= path (first (first staged))) "staged under the file that changed")
+        (let [source (second (first staged))]
+          (is (includes? source "(ns wf.doc)") "the code cell's ns is staged")
+          (is (includes? source "(defn v [] :first)") "…and its body")
+          (is (not (includes? source "Prose around the cells"))
+              "the prose is NOT staged — only the code cells")))
+      (finally
+        (stop-watcher :wf-md)
+        (File/rm_rf dir)))))
+
+; ── a Clojure save stages its raw source, conventions intact ─────────────
+
+(deftest a-saved-clj-file-stages-its-raw-source
+  ; A `.clj` file arrives wearing the two conventions a Clojure library uses —
+  ; a dashed namespace that munges to an underscore file name, and a namespace
+  ; docstring. The watcher stages it through the same seam as any other source,
+  ; so both must survive to the stage call.
+  (let [dir (tmp-dir)
+        path (Path/join dir "w_clj_sourced.clj")
+        me (erlang/self)
+        src (str "(ns w.clj-sourced\n  \"A docstring the reload path must survive too.\")\n\n"
+                 "(defn v [] :first)\n")]
+    (File/mkdir_p! dir)
+    (File/write! path src)
+    (is (= :ok (erlang/element 1 (start-recording :wf-clj dir me))))
+    (try
+      (file-event! :wf-clj path (list :modified))
+      (drain! :wf-clj)
+      (let [staged (collect-applied (list))]
+        (is (= 1 (count staged)) "one save stages once")
+        (is (= path (first (first staged))) "staged under the file that changed")
+        (is (= src (second (first staged)))
+            "a .clj is staged as itself — dashed ns and docstring intact"))
+      (finally
+        (stop-watcher :wf-clj)
+        (File/rm_rf dir)))))

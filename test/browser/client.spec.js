@@ -141,3 +141,53 @@ test("keyed reorder preserves the SAME DOM nodes (not a rewrite)", async ({
   );
   expect(survived).toBe("yes");
 });
+
+test("a nil child inside an inserted subtree does not shift later patches", async ({
+  page,
+}) => {
+  // REGRESSION (FUP-123): the differ drops nil children, so an op after an
+  // insert addresses the nil's NEXT sibling as index 0. A client that rendered
+  // nil as an empty text node kept a phantom child there, and every later op
+  // under that parent landed one node early — silently.
+  const nils = fixture.nils;
+  await page.setContent('<div id="live-root"></div>');
+  await page.addScriptTag({ content: clientJs });
+  await page.evaluate((mount) => {
+    document.getElementById("live-root").innerHTML = mount;
+  }, nils.mount);
+  for (let i = 0; i < nils.patches.length; i++) {
+    const step = nils.patches[i];
+    await page.evaluate((ops) => {
+      const root = document.getElementById("live-root");
+      for (const op of ops) window.Live.applyOp(root, op);
+    }, step.ops);
+    const got = await page.evaluate(
+      () => document.getElementById("live-root").innerHTML
+    );
+    expect(canonical(got), `nil step ${i + 1}`).toBe(canonical(step.html));
+  }
+});
+
+test("an inserted subtree with a seq of seqs renders every child", async ({
+  page,
+}) => {
+  // REGRESSION: render() flattened a child group one level only; a nested
+  // group reached createElementNS as an array "tag" and the patch was lost.
+  const nested = fixture.nested;
+  await page.setContent('<div id="live-root"></div>');
+  await page.addScriptTag({ content: clientJs });
+  await page.evaluate((mount) => {
+    document.getElementById("live-root").innerHTML = mount;
+  }, nested.mount);
+  for (let i = 0; i < nested.patches.length; i++) {
+    const step = nested.patches[i];
+    await page.evaluate((ops) => {
+      const root = document.getElementById("live-root");
+      for (const op of ops) window.Live.applyOp(root, op);
+    }, step.ops);
+    const got = await page.evaluate(
+      () => document.getElementById("live-root").innerHTML
+    );
+    expect(canonical(got), `nested step ${i + 1}`).toBe(canonical(step.html));
+  }
+});

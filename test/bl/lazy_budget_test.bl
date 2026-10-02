@@ -1,0 +1,455 @@
+; test/bl/lazy_budget_test.bl — the lazy cache BUDGET (PLAN-154 clusters B/D).
+; Run: bl test test/bl/lazy_budget_test.bl
+;
+; `:lazy_cache_budget_bytes` bounds the bytes a lazy value publication retains
+; off-heap. Before this wave the gate was an occupancy check taken BEFORE an
+; attempt claimed a cell, and the fold path did not take it at all — so
+; `(count (map inc (range 40)))` SUCCEEDED under a budget of 0 while
+; `(first …)` on the same producer threw, and concurrent publishers could
+; jointly walk past the ceiling.
+;
+; This file pins the repaired contract at the runtime level:
+;
+;   PARITY — at budget 0, and at a ceiling that cannot hold the published list,
+;     the FOLD path and the ordinary FORCE path reach the same verdict.
+;   NO STRAND — a ceiling that refuses the COMPLETION of an attempt still wakes
+;     the owner and every registered waiter; nothing hangs.
+;   CONCURRENT CEILING — N publishers forced at once under one ceiling cannot
+;     jointly retain more than it allows; at least one is refused.
+;   CLEANUP — a successful publication commits its reservation and a refused one
+;     leaves none behind (the reserved-byte counter settles back).
+;   PEEK — the constant-size `LazyMemo/peek` answers a tag without exporting the
+;     state, the full-state API (`memo_state/1`) is unchanged, and a publication
+;     that moved the version under a peek no longer yields a fold recipe.
+;
+; Every budget change is SCOPED: `:lazy_cache_budget_bytes` is Application env,
+; shared by every file a parallel run evaluates, so `with-cache-budget` restores
+; the previous value — or deletes the key — on every exit.
+
+(ns lazy.budget.test)
+
+; ── helpers ─────────────────────────────────────────────────────────────────
+
+(defn- with-cache-budget
+  "Run `f` with the lazy-cache admission budget set to `bytes`; restore the
+   previous value — or delete the key — on every exit. Returns `f`'s value."
+  [bytes f]
+  (let [previous (Application/get_env :beam_lisp :lazy_cache_budget_bytes)]
+    (Application/put_env :beam_lisp :lazy_cache_budget_bytes bytes)
+    (try
+      (f)
+      (finally
+        (if (nil? previous)
+          (Application/delete_env :beam_lisp :lazy_cache_budget_bytes)
+          (Application/put_env :beam_lisp :lazy_cache_budget_bytes previous))))))
+
+(defn- payload-list
+  "A proper list of `n` small integers, built with no lazy machinery, so a test
+   can reason about a publication's bytes exactly."
+  [n]
+  (loop [i n acc ()]
+    (if (erlang/== i 0) acc (recur (erlang/- i 1) (cons i acc)))))
+
+(defn- capture-force
+  "`{:ok value}` or `{:error message}` — the producer's answer, or its refusal."
+  [l]
+  (try
+    (tuple :ok (BeamLisp.LazySeq/force l))
+    (catch BeamLisp.LazySeq.ForceError e (tuple :error (ex-message e)))
+    (catch e (tuple :error (str e)))))
+
+(defn- refused?
+  "Did `f` raise the cache-budget refusal — a TYPED `ForceError` whose message
+   names it? Any other raise, or no raise, is false."
+  [f]
+  (try
+    (do (f) false)
+    (catch BeamLisp.LazySeq.ForceError e
+      (includes? (ex-message e) "lazy_cache_budget_exceeded"))
+    (catch e false)))
+
+(defn- verdict
+  "Run `f` under a ceiling set `extra` bytes above the retained total measured
+   NOW: `:ok`, `:budget` (the cache refused) or `:other` (any other failure)."
+  [extra f]
+  (let [budget (erlang/+ (BeamLisp.LazyMemo/retained_bytes) extra)]
+    (with-cache-budget budget
+      (fn []
+        (try
+          (do (f) :ok)
+          (catch BeamLisp.LazySeq.ForceError e
+            (if (includes? (ex-message e) "lazy_cache_budget_exceeded") :budget :other))
+          (catch e :other))))))
+
+(defn- reserved-settles-to?
+  "Poll until the native reserved-byte counter has fallen back to `ceil`. A
+   reservation lives inside ONE native call (reserve, then commit or release),
+   so seeing it settle is the observable form of 'no reservation leaked'."
+  [ceil]
+  (loop [deadline (erlang/+ (System/monotonic_time :millisecond) 2000)]
+    (cond
+      (erlang/=< (BeamLisp.LazyMemo/reserved_bytes) ceil) true
+      (erlang/>= (System/monotonic_time :millisecond) deadline) false
+      :else (do (Process/sleep 1) (recur deadline)))))
+
+(defn- await-waiter-registered
+  "Poll until the running cell has at least one registered waiter. Reads the
+   RAW cell (`LazyMemo/read`), whose running state is the 4-tuple
+   `{:running owner attempt waiters}` — the waiters in slot 4 (`memo_state`
+   answers the normalized 5-tuple, with a nil thunk slot, instead). Bounded by
+   wall clock so a scheduler stall cannot spin forever."
+  [l]
+  (let [deadline (erlang/+ (System/monotonic_time :millisecond) 5000)]
+    (loop []
+      (let [state (BeamLisp.LazyMemo/read (erlang/map_get :resource l))]
+        (cond
+          (and (erlang/is_tuple state)
+               (erlang/== 4 (erlang/tuple_size state))
+               (erlang/== :running (erlang/element 1 state))
+               (erlang/is_list (erlang/element 4 state))
+               (not (erlang/== () (erlang/element 4 state))))
+          true
+          (erlang/>= (System/monotonic_time :millisecond) deadline) false
+          :else (do (Process/sleep 1) (recur)))))))
+
+(defn- capture-fold
+  "`{:ok value}` or `{:error message}` — the fold's answer, or its refusal."
+  [l]
+  (try
+    (tuple :ok (count l))
+    (catch BeamLisp.LazySeq.ForceError e (tuple :error (ex-message e)))
+    (catch e (tuple :error (str e)))))
+
+(defn- outcome-verdict
+  "`{:ok value}` / `{:error message}` as `:ok` / `:budget` / `:other`."
+  [outcome]
+  (cond
+    (erlang/== :ok (erlang/element 1 outcome)) :ok
+    (includes? (erlang/element 2 outcome) "lazy_cache_budget_exceeded") :budget
+    :else :other))
+
+(defn- await-held
+  "Wait for a held producer's `[:held pid]`; answers the pid, or `:timed-out`."
+  []
+  (receive [:held p] p (after 5000 :timed-out)))
+
+(defn- held-force
+  "`[node owner]`: a force whose producer announces `[:held pid]` and blocks on
+   `:release`, then answers `payload-list n`."
+  [parent n]
+  (let [l (BeamLisp.LazySeq/new
+            (fn [] (erlang/send parent [:held (erlang/self)])
+                    (receive :release (payload-list n))))]
+    [l (Task/async (fn [] (capture-force l)))]))
+
+(defn- held-fold
+  "`[node owner]`: a fold over `n` elements whose producer bumps `calls` once per
+   element and blocks at its FIRST element until released — so the claim is held
+   with the recipe not yet run — then produces every element."
+  [parent calls n]
+  (let [released (atom false)
+        l (map (fn [x]
+                 (swap! calls inc)
+                 (if @released
+                   x
+                   (do (erlang/send parent [:held (erlang/self)])
+                       (receive :release nil)
+                       (reset! released true)
+                       x)))
+               (payload-list n))]
+    [l (Task/async (fn [] (capture-fold l)))]))
+
+(defn- held-verdict
+  "Release the held producer `owner` under a ceiling pinned `headroom` bytes
+   above the retained total read WHILE THE CLAIM IS HELD, and answer the
+   consumer's verdict — `:ok` when the completion fits, `:budget` when the
+   publication is refused, `:other` otherwise.
+
+   Measuring at the held instant is what makes the refusal deterministic: the
+   claim is already admitted, its cell is constant-size and nothing else grows,
+   so the completion is decided against a ceiling the test itself pinned. A bare
+   `retained + extra` read BEFORE the claim instead assumes the retained total
+   is stable while unrelated cells are still being reclaimed — the assumption
+   that let `extra` 300 admit the very publication it meant to refuse."
+  [headroom pid owner]
+  (with-cache-budget
+    (erlang/+ (BeamLisp.LazyMemo/retained_bytes) headroom)
+    (fn []
+      (erlang/send pid :release)
+      (outcome-verdict (Task/await owner 10000)))))
+
+; ── 1. budget 0: the fold path obeys the same ceiling as the force path ─────
+
+(deftest zero-budget-refuses-the-fold-and-the-force-alike
+  (testing "the reported defect: count succeeded where first threw"
+    (with-cache-budget 0
+      (fn []
+        (is (refused? (fn [] (count (map inc (range 40)))))
+            "(count (map inc (range 40))) must be refused, not silently succeed")
+        (is (refused? (fn [] (first (map inc (range 40)))))
+            "the equivalent ordinary force is refused")
+        (is (refused? (fn [] (reduce + 0 (map inc (range 40)))))
+            "reduce over the same fold path is refused too"))))
+  (testing "a published answer is served from the memo whatever the ceiling"
+    (let [l (BeamLisp.LazySeq/new (fn [] :value))]
+      (is (= :value (BeamLisp.LazySeq/force l)))
+      (with-cache-budget 0
+        (fn []
+          (is (= :value (BeamLisp.LazySeq/force l))
+              "successful results stay accessible under pressure")
+          (is (= :value (BeamLisp.LazySeq/force l))))))))
+
+; ── 2. a ceiling that cannot hold the published list refuses BOTH paths ────
+;
+; `(map inc (range n))` folds its source and publishes ONE `{:completed …}`
+; state; the ordinary force path publishes the SAME list onto its own head cell.
+; Their growth is the same quantity, so the ceiling must decide them the same
+; way. The refusal half holds each producer OPEN (its claim is admitted and its
+; cell is the constant-size `:running` state), pins the ceiling to the retained
+; total read at that instant plus a quarter of the publication's own accounted
+; cost, and only then releases it — so the COMPLETION, never the claim, is what
+; the ceiling decides, and the decision does not depend on when unrelated cells
+; are reclaimed.
+
+(deftest the-fold-and-the-force-reach-the-same-verdict
+  (let [n 40
+        cost (BeamLisp.LazyMemo/estimate_bytes (tuple :completed (payload-list n)))
+        fold (fn [] (count (map inc (range n))))
+        force (fn [] (count (BeamLisp.LazySeq/force
+                             (BeamLisp.LazySeq/new (fn [] (payload-list n))))))]
+    (testing "a ceiling that cannot hold the list refuses both"
+      (let [parent (erlang/self)
+            [fnode fowner] (held-fold parent (atom 0) n)
+            fpid (await-held)
+            [lnode lowner] (held-force parent n)
+            lpid (await-held)]
+        (is (erlang/is_pid fpid) "the fold claim is held")
+        (is (erlang/is_pid lpid) "the force claim is held")
+        (is (erlang/== :budget (held-verdict (erlang/div cost 4) fpid fowner))
+            "the fold publication is refused")
+        (is (erlang/== :budget (held-verdict (erlang/div cost 4) lpid lowner))
+            "the force publication is refused")))
+    (testing "a ceiling that can hold it admits both, with the same answer"
+      (is (erlang/== :ok (verdict 8192 fold)))
+      (is (erlang/== :ok (verdict 8192 force)))
+      (is (= n (fold)))
+      (is (= n (force))))))
+
+; ── 3. a refused publication never strands an owner or its waiters ─────────
+
+(deftest a-refused-completion-still-wakes-the-owner-and-every-waiter
+  (let [parent (erlang/self)
+        l (BeamLisp.LazySeq/new
+            (fn []
+              (erlang/send parent [:started (erlang/self)])
+              (receive :release (payload-list 64))))
+        owner (Task/async (fn [] (capture-force l)))
+        owner-pid (receive [:started p] p (after 5000 :timed-out))]
+    (is (erlang/is_pid owner-pid) "the owner announces its attempt")
+    (let [waiter (Task/async (fn [] (capture-force l)))]
+      (is (await-waiter-registered l) "the waiter registers on the running attempt")
+      ; Shrink the ceiling to a sliver and only then let the attempt finish: the
+      ; claim is already published, so the refusal happens on the COMPLETION,
+      ; with an owner and a waiter both live.
+      (let [owner-outcome (with-cache-budget
+                            (erlang/+ (BeamLisp.LazyMemo/retained_bytes) 16)
+                            (fn []
+                              (erlang/send owner-pid :release)
+                              (Task/await owner 10000)))
+            waiter-outcome (Task/await waiter 10000)]
+        (is (erlang/== :error (erlang/element 1 owner-outcome))
+            "the owner replays a refusal instead of hanging")
+        (is (includes? (erlang/element 2 owner-outcome) "lazy_cache_budget_exceeded"))
+        (is (erlang/== :error (erlang/element 1 waiter-outcome))
+            "the waiter is woken with the same refusal")
+        (is (includes? (erlang/element 2 waiter-outcome) "lazy_cache_budget_exceeded"))
+        (is (erlang/== :terminal (erlang/element 1 (BeamLisp.LazySeq/memo_state l)))
+            "the cell is left TERMINAL, so a later force fails fast rather than hanging")))))
+
+; ── 4. concurrent publishers cannot jointly exceed one ceiling ─────────────
+;
+; Eight publishers are built FIRST (their cells are already retained), then one
+; ceiling is set that can hold a single completion plus a little slack, and all
+; eight are forced at once. Each completion grows the retained set by its own
+; payload; the atomic reservation is what makes the sum respect the ceiling.
+
+(deftest concurrent-publishers-cannot-jointly-exceed-the-ceiling
+  (let [n-publishers 8
+        payload (payload-list 128)
+        nodes (loop [i 0 acc ()]
+                (if (erlang/== i n-publishers)
+                  acc
+                  (recur (erlang/+ i 1)
+                         (cons (BeamLisp.LazySeq/new (fn [] (payload-list 128))) acc))))
+        need (BeamLisp.LazyMemo/estimate_bytes (tuple :completed payload))
+        base (BeamLisp.LazyMemo/retained_bytes)
+        extra (erlang/+ need 200)
+        budget (erlang/+ base extra)]
+    (is (erlang/> need 400) "the payload is big enough for the ceiling to bind")
+    (let [outcomes (with-cache-budget
+                     budget
+                     (fn []
+                       (let [tasks (loop [ns nodes acc ()]
+                                     (if (erlang/== ns ())
+                                       acc
+                                       (let [l (erlang/hd ns)]
+                                         (recur (erlang/tl ns)
+                                                (cons (Task/async
+                                                        (fn []
+                                                          (try
+                                                            (do (BeamLisp.LazySeq/force l) :ok)
+                                                            (catch e (ex-message e)))))
+                                                      acc)))))
+                             results (loop [ts tasks acc ()]
+                                       (if (erlang/== ts ())
+                                         acc
+                                         (recur (erlang/tl ts)
+                                                (cons (Task/await (erlang/hd ts) 10000) acc))))]
+                         results)))
+          refusals (loop [rs outcomes acc 0]
+                     (if (erlang/== rs ())
+                       acc
+                       (recur (erlang/tl rs)
+                              (if (erlang/== :ok (erlang/hd rs)) acc (erlang/+ acc 1)))))]
+      (is (erlang/== (erlang/length outcomes) n-publishers))
+      (is (erlang/=< (BeamLisp.LazyMemo/retained_bytes) (erlang/+ budget 512))
+          "concurrent publications jointly respected the configured ceiling")
+      (is (erlang/>= refusals 1)
+          "the shared ceiling refused at least one publisher")
+      (is (erlang/>= (erlang/- n-publishers refusals) 1)
+          "...and still admitted one: the ceiling bounds, it does not forbid"))))
+
+; ── 5. reservations settle, and a cached failure still replays ─────────────
+
+(deftest a-publication-leaves-no-reservation-behind
+  (let [before (BeamLisp.LazyMemo/reserved_bytes)]
+    (is (= 40 (count (map inc (range 40)))) "the admitted fold still answers")
+    (is (reserved-settles-to? before)
+        "a committed publication is not still holding a reservation"))
+  (let [before (BeamLisp.LazyMemo/reserved_bytes)]
+    (is (refused? (fn [] (with-cache-budget 0
+                           (fn [] (count (map inc (range 40)))))))
+        "the ceiling refuses the publication")
+    (is (reserved-settles-to? before)
+        "a refused publication released everything it held")))
+
+(deftest a-cached-failure-replays-with-a-stable-frame-list
+  (let [l (BeamLisp.LazySeq/new
+            (fn [] (erlang/error (Elixir.RuntimeError/exception "budget-replay"))))
+        outcome (capture-force l)
+        state (BeamLisp.LazySeq/memo_state l)]
+    (is (erlang/== :error (erlang/element 1 outcome)))
+    (is (includes? (erlang/element 2 outcome) "budget-replay"))
+    (is (erlang/== :failed (erlang/element 1 state))
+        "the failure is cached on the cell, not re-derived")
+    (is (erlang/== 5 (erlang/tuple_size state))
+        "{:failed thunk kind reason stack} — the recalled shape")
+    (is (erlang/is_list (erlang/element 5 state))
+        "the recorded frame list is stable data, not an ephemeral VM token")))
+
+; ── 6. the constant-size peek, and the full-state API it must not narrow ───
+
+(deftest peek-is-constant-size-and-the-full-state-api-is-unchanged
+  (let [l (BeamLisp.LazySeq/new (fn [] (payload-list 512)))]
+    (is (BeamLisp.LazySeq/pending? l) "a fresh node is pending")
+    (is (= 512 (count (BeamLisp.LazySeq/to_list l))))
+    (is (erlang/== false (BeamLisp.LazySeq/pending? l)) "a realised node is not pending")
+    (let [peeked (BeamLisp.LazyMemo/peek (erlang/map_get :resource l))
+          full (BeamLisp.LazySeq/memo_state l)]
+      (is (erlang/== :completed (erlang/element 1 peeked)))
+      (is (erlang/is_integer (erlang/element 2 peeked)) "the publication version")
+      (is (erlang/== (erlang/* 3 (erlang/system_info :wordsize))
+                     (BeamLisp.LazyMemo/estimate_bytes peeked))
+          "the peek answers an atom, an integer and a 2-tuple — constant size")
+      (is (= (tuple :completed (payload-list 512)) full)
+          "memo_state still returns the whole logical state")
+      (is (erlang/> (BeamLisp.LazyMemo/estimate_bytes full)
+                    (erlang/* 100 (BeamLisp.LazyMemo/estimate_bytes peeked)))
+          "the full state is linear in the published value; the peek is not"))))
+
+(deftest the-cheap-counter-agrees-with-the-stats-map
+  (let [s (BeamLisp.LazyMemo/stats)]
+    (is (erlang/== (maps/get :retained_bytes s) (BeamLisp.LazyMemo/retained_bytes))
+        "the one-load admission counter reports what the full stats map reports")
+    (is (erlang/== (maps/get :reserved_bytes s) (BeamLisp.LazyMemo/reserved_bytes))
+        "and the new reservation counter is part of the same ledger")))
+
+(deftest dispatch-on-a-tag-takes-a-peek-not-a-read
+  ; ONE shared image (a `--shared`/`--async` run) means other files bump these
+  ; GLOBAL counters, so the read delta carries the suite's small tolerance; the
+  ; directed signal is that the peek counter moved at all and the reads did not
+  ; move with it. Test 6's answer-size comparison is the deterministic half.
+  (let [l (BeamLisp.LazySeq/new (fn [] (payload-list 256)))]
+    (BeamLisp.LazySeq/force l)
+    (let [before (BeamLisp.LazyMemo/stats)
+          probe (BeamLisp.LazySeq/pending? l)
+          after (BeamLisp.LazyMemo/stats)
+          reads-before (erlang/+ (maps/get :op_read before) (maps/get :op_read_fast before))
+          reads-after (erlang/+ (maps/get :op_read after) (maps/get :op_read_fast after))]
+      (is (erlang/== false probe) "a realised node is not pending")
+      (is (erlang/>= (erlang/- (maps/get :op_peek after) (maps/get :op_peek before)) 1)
+          "the tag came from a constant-size peek")
+      (is (erlang/=< (erlang/- reads-after reads-before) 2)
+          "no state was exported to answer it"))))
+
+(deftest a-peek-version-that-moved-no-longer-yields-a-recipe
+  (let [r (fn [acc _x] (tuple :cont acc))
+        l (BeamLisp.LazySeq/new (fn [] (payload-list 4)) r)
+        pending (BeamLisp.LazySeq/pending_recipe l)]
+    (is (erlang/is_tuple pending) "a pending node with a recipe answers one")
+    (is (erlang/is_integer (erlang/element 2 pending)))
+    (let [version (erlang/element 2 pending)]
+      (BeamLisp.LazySeq/force l)
+      (is (not (erlang/== version
+                          (erlang/element 2 (BeamLisp.LazyMemo/peek
+                                              (erlang/map_get :resource l)))))
+          "the publication moved the version")
+      (is (nil? (BeamLisp.LazySeq/pending_recipe l))
+          "the version guard refuses a recipe read at a stale version"))))
+
+; ── 7. a refused fold leaves a TERMINAL cell, not a pending producer ──────
+;
+; The reported P1: the fold published AFTER the recipe had already produced
+; every element, and a refusal raised out of the fold leaving the node ":pending"
+; — so the NEXT consumer ran the producer's effects a second time. A fold now
+; CLAIMS the cell first (`claim_recipe`) and publishes through the attempt
+; protocol (`complete_attempt`), so a refusal is the same un-strand a refused
+; force gets: the cell is TERMINAL, and every later `count`/`first`/`reduce`
+; fails fast with the same reason instead of re-running the producer.
+
+(deftest a-refused-fold-publication-leaves-a-terminal-cell
+  (let [calls (atom 0)
+        [s owner] (held-fold (erlang/self) calls 40)
+        pid (await-held)]
+    (is (erlang/is_pid pid) "the folding consumer holds the claim")
+    (testing "the fold runs the producer once and is refused; the cell is TERMINAL"
+      ; The claim has already succeeded. Zero growth headroom is decisive even
+      ; if unrelated native cells are reclaimed while the producer is suspended.
+      (is (erlang/== :budget
+            (with-cache-budget 0
+              (fn []
+                (erlang/send pid :release)
+                (outcome-verdict (Task/await owner 10000)))))
+          "post-claim refusal must be terminal, not a pending producer to repeat")
+      (is (= 40 @calls) "the producer ran once, to the end, before the refusal")
+      (let [state (BeamLisp.LazySeq/memo_state s)]
+        (is (erlang/== :terminal (erlang/element 1 state))
+            "the refusal is TERMINAL — the node is not left pending to recompute")
+        (is (erlang/== :lazy_cache_budget_exceeded
+                       (erlang/element 1 (erlang/element 2 state))))))
+    (testing "a repeat consumer replays the refusal: no producer run again"
+      (let [after @calls]
+        (is (erlang/== :budget (verdict 300 (fn [] (count s)))))
+        (is (erlang/== :budget (verdict 300 (fn [] (first s)))))
+        (is (erlang/== :budget (verdict 300 (fn [] (reduce + 0 s)))))
+        (is (= after @calls) "the producer's effect counter did not move")))))
+
+(deftest a-refused-fold-claim-never-runs-the-producer
+  (testing "a claim the ceiling refuses raises before any effect runs"
+    (let [calls (atom 0)
+          s (map (fn [x] (swap! calls inc) x) (payload-list 40))]
+      (is (refused? (fn [] (with-cache-budget 0 (fn [] (count s))))))
+      (is (erlang/== 0 @calls) "the fold was refused at the claim, before the recipe")
+      (is (BeamLisp.LazySeq/pending? s) "and the node is still claimable")
+      (is (refused? (fn [] (with-cache-budget 0 (fn [] (count s))))))
+      (is (erlang/== 0 @calls) "a repeat is refused the same way, with no effects"))))

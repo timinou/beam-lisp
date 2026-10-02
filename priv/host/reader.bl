@@ -1,0 +1,185 @@
+; host/reader.bl — the pinned HOST MODULE for `Elixir.BeamLisp.Reader`.
+;
+; `BeamLisp.Reader` is the HOST-FACING FRONT DOOR to the self-hosted reader
+; (`priv/boot/reader.bl`, interned as `BeamLisp.Ns.Reader`). This file is the
+; `.bl` port of `lib/beam_lisp/reader.ex`, compiled by
+; `BeamLisp.AOT/compile_host_file` into ONE exact-named beam with the file's
+; `defn`s as plain exported functions — no shim, no Elixir source.
+;
+; WHAT THE FACADE OWES, and what each piece below exists to keep:
+;
+;   * `read_string/1,2` — the entry every caller funnels through. It delegates
+;     to `BeamLisp.Ns.Reader.read_string/2` and returns position-bearing reader
+;     forms. The delegation is a DIRECT call to the Ns shim
+;     (`BeamLisp.Ns.Reader`), never to this file's own module: the pinned
+;     emitter re-points only calls to THIS file's namespace shim, so a call to
+;     another namespace's shim stays exactly the call the Elixir module made
+;     (`apply(@reader_ns, :read_string, …)`).
+;
+;   * `read_all/1`, `read_one/1` — the same delegation, arity 1, to the
+;     self-hosted reader's bare-form entry points.
+;
+;   * `enable_bl_reader/0` — the boot step that interns the `reader` ns from
+;     its beam. Idempotent; answers `:bl` when the ns is loaded and
+;     `:not_loaded` when interning failed, exactly as before.
+;
+;   * `mapping_atom_limit/1` — the ONE remaining host-glue seam. It runs the
+;     thunk, surfaces the host VM's atom-table guard
+;     (`BeamLisp.AtomGuard.LimitError`) as the reader-facing
+;     `BeamLisp.Reader.AtomLimitError`, and RENDERS a reader diagnostic
+;     (`{:diag true, :msg, …}`, or the pre-`diag.bl` spelling `{:bl_diag true,
+;     :msg, …}`) into `BeamLisp.Reader.SyntaxError` with the diagnostic's `:msg`
+;     VERBATIM. Anything else is re-raised untouched, so nothing is swallowed.
+;
+;     The diagnostic arrives as an `ErlangError` because the self-hosted reader
+;     raises the diagnostic as a bare MAP (`reader.bl`'s `fail!` →
+;     `erlang/error`), and `Exception.normalize/3` wraps a non-exception error
+;     reason in `%ErlangError{original: …}`. The class match on `ErlangError` is
+;     therefore load-bearing: it is what makes `e.original` the diagnostic.
+;
+;     `__STACKTRACE__` is the frame list the BL `try` binds around every catch
+;     clause body (Compiler's `compile-try` / Lower's `build_stacktrace`), i.e.
+;     exactly what the Elixir source's `reraise …, __STACKTRACE__` used.
+;
+; PRE-BOOT DISCIPLINE. `enable_bl_reader/0` runs during `BeamLisp.init/0`, after
+; `rt`/`core` are interned and before `multi`/`sugar` — so it must not reach for
+; a runtime helper in a namespace that may not be interned yet. It calls HOST
+; code only (`BeamLisp.Env`, `BeamLisp.Loader`) and uses `if` (a special form)
+; rather than `unless`/`not`.
+;
+; TWO NESTED EXCEPTION MODULES ARE NOT EMITTED HERE, AND CANNOT BE.
+; `lib/beam_lisp/reader.ex` also declares `BeamLisp.Reader.SyntaxError` and
+; `BeamLisp.Reader.AtomLimitError`, each `defexception [:message]`. A pinned
+; host source carries functions in exactly ONE namespace and compiles to
+; exactly ONE module (`AOT.pinned_namespace!/1`, one `descriptor_for/4`), and
+; `seed.bl`'s `host-sources` maps one source to one module — so this file
+; cannot also emit them.
+;
+; The exception SURFACE is expressible with the options that already exist —
+; MEASURED on a probe compiled exactly this way:
+;   * `:struct_fields [{:__exception__, true}, {:message, nil}]` gives the
+;     `%Mod{__exception__: true, message: nil}` default and `__info__(:struct)`;
+;   * `:behaviour :"Elixir.Exception"` records `-behaviour Exception` (readable
+;     as `module_info(:attributes)`; the pinned family records the bare atom,
+;     not Elixir's one-element list — see `priv/host/application.bl`);
+;   * `exception/1` / `message/1` MUST be hand-written defns that BUILD the map
+;     themselves, reading their own module atom from a fun literal
+;     (`erlang/fun_info (fn [] nil) :module`, the `num.bl` `no-clause!` idiom).
+;     They cannot call the generated `__struct__/1`: it is emitted as module
+;     clauses only, never interned as a namespace var, so a sibling call
+;     compiles to `undefined var: <ns>/__struct__` (MEASURED).
+;   * the result answers `Exception.exception?/1`, `rescue e in Mod`,
+;     `Exception.message/1` and `inspect` as the live module does (MEASURED),
+;     except `__info__(:attributes)`, which the pinned `__info__/1` does not
+;     serve — the same family-wide shape as the other pinned hosts.
+;
+; So the requirement is a WIRING one, not an expressibility one: to delete
+; `reader.ex`, EITHER
+;   (a) `AOT.compile_host_file/2` gains nested-module emission (one source →
+;       the module plus its nested modules), so this file can also carry the
+;       two `defexception`s; OR
+;   (b) `priv/host/` gains one exception source (the two modules are shape-
+;       identical, so ONE source serves both) and `seed.bl`'s `host-sources`
+;       gains two entries for it, one per exception atom, each with the
+;       `:struct_fields`/`:behaviour` pair above — no AOT change at all.
+;
+; Neither is done here: this wave writes source and tests only, and owns no
+; seed entry. Meanwhile this file raises both types by calling their
+; `exception/1`, so it is correct against the live modules today and becomes a
+; complete standalone facade the moment (a) or (b) lands.
+;
+; Run: bin/bl test test/bl/host_reader_test.bl
+
+(ns host.reader)
+
+(defn- reraise_with_stack
+  "Raise `value` as an error carrying `stack` — the frame list `try` binds to
+   `__STACKTRACE__` — exactly as Elixir's `reraise value, __STACKTRACE__` does.
+
+   Spelled through `erlang/apply`, not `erlang/raise`: the lowerer rewrites a
+   3-arity `erlang:raise/3` call to the `raw_raise` primop, which takes the RAW
+   catch form and SEGFAULTS the VM given a frame list (MEASURED: the pinned
+   reader's SyntaxError path killed the VM with SIGSEGV). `erlang:apply/3` is an
+   ordinary BIF call, so it reaches the real `erlang:raise/3`, which accepts the
+   frame list and preserves the original frames — the raise site a reader sees
+   stays the one that raised."
+  [value stack]
+  (erlang/apply :erlang :raise (list :error value stack)))
+
+(defn- mapping_atom_limit
+  "Run `fun`, surfacing the host VM's atom-table guard as
+   `BeamLisp.Reader.AtomLimitError` and RENDERING a reader diagnostic into
+   `BeamLisp.Reader.SyntaxError`. Anything else passes through untouched."
+  [fun]
+  (try
+    (erlang/apply fun (list))
+
+    (catch BeamLisp.AtomGuard.LimitError e
+      (reraise_with_stack
+        (BeamLisp.Reader.AtomLimitError/exception
+          (list (erlang/list_to_tuple
+                  (list :message (Elixir.Exception/message e)))))
+        __STACKTRACE__))
+
+    (catch ErlangError e
+      (let [orig (erlang/map_get :original e)]
+        (cond
+          ; the diagnostic marker `diag.bl` lands (`:diag`), then the spelling
+          ; it carried before that move (`:bl_diag`) — accepted so this front
+          ; door is correct against either reader.
+          (and (erlang/is_map orig)
+               (erlang/is_map_key :diag orig)
+               (erlang/== true (erlang/map_get :diag orig))
+               (erlang/is_map_key :msg orig)
+               (erlang/is_binary (erlang/map_get :msg orig)))
+          (reraise_with_stack
+            (BeamLisp.Reader.SyntaxError/exception
+              (list (erlang/list_to_tuple
+                      (list :message (erlang/map_get :msg orig)))))
+            __STACKTRACE__)
+
+          (and (erlang/is_map orig)
+               (erlang/is_map_key :bl_diag orig)
+               (erlang/== true (erlang/map_get :bl_diag orig))
+               (erlang/is_map_key :msg orig)
+               (erlang/is_binary (erlang/map_get :msg orig)))
+          (reraise_with_stack
+            (BeamLisp.Reader.SyntaxError/exception
+              (list (erlang/list_to_tuple
+                      (list :message (erlang/map_get :msg orig)))))
+            __STACKTRACE__)
+
+          :else
+          (reraise_with_stack e __STACKTRACE__))))))
+
+(defn read_string
+  "Read binary `source` into position-bearing reader forms, attributed to
+   `file`. THE reader entry every caller funnels through.
+
+   The guard rides the FULL-ARITY clause only, exactly as Elixir's default-arg
+   expansion does: the generated arity-1 head is unguarded and forwards here,
+   so a 1-arity call with a non-binary is the ARITY-2 `FunctionClauseError` —
+   the live module's answer, clause for clause."
+  ([source] (read_string source nil))
+  ([source file] :when (string? source)
+   (mapping_atom_limit (fn [] (BeamLisp.Ns.Reader/read_string source file)))))
+
+(defn read_all
+  "Read `source` into a list of BARE reader forms (positions stripped)."
+  ([source] :when (string? source)
+   (mapping_atom_limit (fn [] (BeamLisp.Ns.Reader/read_all source)))))
+
+(defn read_one
+  "Read exactly one bare form from `source`; raise if zero or many."
+  ([source] :when (string? source)
+   (mapping_atom_limit (fn [] (BeamLisp.Ns.Reader/read_one source)))))
+
+(defn enable_bl_reader
+  "Ensure the self-hosted beam-lisp reader is ready to serve `read_string/2`.
+   Interns the `reader` namespace from its beam. Idempotent. Returns `:bl` when
+   active, `:not_loaded` if interning failed."
+  []
+  (if (BeamLisp.Env/loaded_ns? "reader")
+    nil
+    (BeamLisp.Loader/ensure_loaded "reader"))
+  (if (BeamLisp.Env/loaded_ns? "reader") :bl :not_loaded))

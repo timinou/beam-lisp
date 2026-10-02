@@ -1,0 +1,684 @@
+; host_guards_test.bl — the pinned `BeamLisp.Guards` ABI, diffed against the
+; live module and driven through a compiling Elixir caller.
+;
+; `priv/host/guards.bl` replaces `lib/beam_lisp/guards.ex` at its exact module
+; atom `Elixir.BeamLisp.Guards`. The live module is mostly MACROS: `defguard
+; is_bl_map/1`, `is_ref_type/1` and `is_data_tuple/1` are compile-time pairs
+; (`MACRO-<name>/2` implementers plus the `__info__(:macros)` entries), and the
+; only plain function is `internal_tuple_tags/0`. Nothing else can stand in for
+; a macro's compile-time artifact, so the pinned module's whole value IS that
+; surface, and this suite is built around proving it:
+;
+;   * THE ABI, on a probe beam: `internal_tuple_tags/0` equals the live list
+;     (and is pinned absolutely, in order); `__info__(:macros)` equals the live
+;     module's; the three `MACRO-*`/2 implementers are exported and, exactly as
+;     in Elixir, are NOT in `__info__(:functions)`.
+;   * MACRO EXPANSION CLASSES, by comparing the CALLS each expansion makes. The
+;     guard branch must splice the caller's argument AST and emit a guard
+;     expression whose remote-call spine equals the live macro's, EXACTLY — this
+;     port keeps the one piece of dead code Elixir splices into `is_struct/2`
+;     (the per-tag `orelse(is_atom(Literal), :fail)` assertion) so that "equal
+;     spine" is a fact rather than a normalisation. The body branch must emit a
+;     block that BINDS the argument once and tests the binding.
+;   * THE RUNTIME TRUTH TABLE, on a corpus that exercises every clause of the
+;     three predicates: plain maps, maps with an atom / non-atom `:__struct__`
+;     tag, every reference struct plus a foreign struct, every reserved tuple
+;     tag, empty and ordinary data tuples, and the non-tuple scalars. Each value
+;     is observed through a guard clause, an `if` condition and a plain
+;     expression — three different expansion shapes — and all three must agree.
+;     The same corpus is run a second time through the OTHER caller shape —
+;     `require` plus a fully-qualified call, rather than `import` — and the two
+;     must answer identically, because both reach the same macro.
+;   * SINGLE EVALUATION: outside a guard the argument is read ONCE (the reason
+;     the body branch binds), asserted with a counting thunk.
+;   * THE DIFFERENTIAL: ONE fixture source is compiled and run twice — here
+;     against the live Elixir macros, and in a cold child VM whose only added
+;     code path entry is the pinned beam — and the two observations must be the
+;     SAME TERM, value for value.
+;   * THE PRECOMPILE EDGE, which is what the port is FOR: in a child VM where
+;     the pinned beam owns the atom, `elixirc` compiles `lib/beam_lisp/record.ex`
+;     — whose `import BeamLisp.Guards, only: [is_bl_map: 1]` is used in a GUARD —
+;     and the beam it emits then DISPATCHES: `map_construct/2` reaches its body
+;     for a plain map and declines a struct, exactly as the live module does.
+;   * BOOT SAFETY, read off the beam: no `Elixir.BeamLisp.Ns.*` target and no
+;     `BeamLisp.Env.fetch!` call site, and the WHOLE remote-module set asserted.
+;     The pinned beam is resolved by `elixirc` BEFORE any boot, so this is the
+;     port's real dependency contract, not a nicety.
+;
+; The live module is never left replaced. The pinned source is compiled at its
+; OWN probe atom, the namespace shim beside it is dropped, and the pinned beam
+; is loaded ALONE — a leftover shim reference would be `undef` here.
+;
+; Run: bin/bl test test/bl/host_guards_test.bl
+
+(ns host.guards.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_guards_" (erlang/unique_integer (list :positive))))
+
+(defn- guards-source [] (Path/join (BeamLisp/cwd) "priv/host/guards.bl"))
+
+(def ^:private probe :Elixir.BeamLisp.GuardsHostProbe)
+(def ^:private shim :Elixir.BeamLisp.Ns.Host.Guards)
+(def ^:private live :Elixir.BeamLisp.Guards)
+
+(defn- macro-exports []
+  (list (t2 :is_bl_map 1) (t2 :is_ref_type 1) (t2 :is_data_tuple 1)))
+
+(defn- probe-opts [dir]
+  (list (t2 :module probe) (t2 :output_dir dir) (t2 :load? false)
+        (t2 :macro_exports (macro-exports))))
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-pinned [mod path]
+  (do (drop! mod)
+      (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+      mod))
+
+; Compile the pinned module at the probe atom and publish ONLY the pinned beam:
+; the compile's own namespace shim is dropped, so every answer below comes from
+; the pinned bytes with no namespace behind them.
+(defn- compile-probe [dir]
+  (let [res (BeamLisp.AOT/compile_host_file (guards-source) (probe-opts dir))
+        m (load-pinned probe (erlang/element 2 res))]
+    (drop! shim)
+    m))
+
+(defn- struct-tag [x]
+  (if (erlang/is_map x) (maps/get :__struct__ x) nil))
+
+; ── reading an AST as data ───────────────────────────────────────────────
+
+(defn- base-env [] (erlang/apply :Elixir.Macro.Env :__struct__ (list)))
+(defn- guard-env [] (maps/put :context :guard (base-env)))
+
+(defn- expand*
+  "`(caller-env, argument-ast)` into a `MACRO-<name>/2` implementer — the two
+   shapes Elixir itself drives, one per caller context."
+  [mod fname arg guard?]
+  (erlang/apply mod fname (list (if guard? (guard-env) (base-env)) arg)))
+
+(defn- ast-head
+  "`(mod fun)` when `ast` is the remote-call node `{{:., _, [mod, fun]}, _, _}`,
+   else nil. A macro's contract is a TERM, so the term is read as data."
+  [ast]
+  (if (and (erlang/is_tuple ast) (erlang/== 3 (erlang/tuple_size ast)))
+    (let [f (erlang/element 1 ast)]
+      (if (and (erlang/is_tuple f)
+               (erlang/== 3 (erlang/tuple_size f))
+               (erlang/== :"." (erlang/element 1 f)))
+        (let [t (erlang/element 3 f)]
+          (list (first t) (second t)))
+        nil))
+    nil))
+
+(defn- ast-spine
+  "Every remote-call target in `ast`, pre-order, as `(mod fun)` pairs. Meta is
+   ignored and variables are not named, so two expansions are equal here when
+   they make the same CALLS, in the same order — which is the class of code the
+   caller's compiler will compile."
+  [ast]
+  (to-list (ast-spine* ast)))
+
+(defn- ast-spine*
+  [ast]
+  (cond
+    (erlang/is_tuple ast)
+    (if (and (erlang/== 3 (erlang/tuple_size ast))
+             (erlang/is_tuple (erlang/element 1 ast))
+             (erlang/== 3 (erlang/tuple_size (erlang/element 1 ast)))
+             (erlang/== :"." (erlang/element 1 (erlang/element 1 ast))))
+      (let [t (erlang/element 3 (erlang/element 1 ast))]
+        (concat (list (list (first t) (second t)))
+                (mapcat ast-spine* (erlang/element 3 ast))))
+      (mapcat ast-spine* (erlang/tuple_to_list ast)))
+    (erlang/is_list ast) (mapcat ast-spine* ast)
+    :else (list)))
+
+(defn- ast-terms
+  "Every sub-term of `ast`, so a caller's argument AST can be SEARCHED for
+   rather than position-matched."
+  [ast]
+  (to-list (ast-terms* ast)))
+
+(defn- ast-terms*
+  [ast]
+  (cond
+    (erlang/is_tuple ast) (concat (list ast) (mapcat ast-terms* (erlang/tuple_to_list ast)))
+    (erlang/is_list ast) (mapcat ast-terms* ast)
+    :else (list)))
+
+; ── the pinned ABI, answer for answer ────────────────────────────────────
+
+(deftest guards-pinned-matches-the-live-module
+  (testing "internal_tuple_tags/0 and the macro surface, against the live module"
+    (let [dir (tmp-dir)]
+      (let [m (compile-probe dir)]
+        ; NO SHIM: the compile's namespace module is gone; the pinned beam answers.
+        (is (erlang/== :non_existing (erlang/apply :code :which (list shim))))
+        ; FUNCTIONS-ONLY: no struct surface, exactly as the live module has none.
+        (is (not (erlang/function_exported m :__struct__ 0)))
+        ; THE PUBLIC MACROS: `__info__(:macros)` is live's, so `require`/`import`
+        ; expand the calls — without it they refuse at the call site.
+        (is (erlang/== (list (tuple :is_bl_map 1) (tuple :is_data_tuple 1) (tuple :is_ref_type 1))
+                       (erlang/apply m :__info__ (list :macros))))
+        (is (erlang/== (erlang/apply live :__info__ (list :macros))
+                       (erlang/apply m :__info__ (list :macros)))
+            "`__info__(:macros)` is the live module's, entry for entry")
+        ; THE IMPLEMENTERS exist, AND are not advertised as functions — Elixir's
+        ; own exclusion of `MACRO-*` from `:functions`, which the pinned emitter
+        ; reproduces.
+        (is (erlang/function_exported m :"MACRO-is_bl_map" 2))
+        (is (erlang/function_exported m :"MACRO-is_ref_type" 2))
+        (is (erlang/function_exported m :"MACRO-is_data_tuple" 2))
+        (is (not (Enum/member? (erlang/apply m :__info__ (list :functions))
+                               (tuple :"MACRO-is_bl_map" 2)))
+            "the MACRO- implementer is NOT in `:functions`, as in Elixir")
+        ; EVERY live export is present (the pinned module adds its own helpers,
+        ; the ONE documented divergence); `__info__/1` is excluded by name
+        ; because the pinned emitter synthesizes its own.
+        (is (every? (fn [e] (or (erlang/== :__info__ (erlang/element 1 e))
+                                (erlang/function_exported m (erlang/element 1 e) (erlang/element 2 e))))
+                    (erlang/apply live :module_info (list :exports)))
+            "the pinned ABI covers every live export")
+        ; THE TAG LIST is the live one, IN ORDER — the order is observable:
+        ; `is_data_tuple/1` folds its `=:=` chain over this list.
+        (is (erlang/== (erlang/apply live :internal_tuple_tags (list))
+                       (erlang/apply m :internal_tuple_tags (list))))
+        (is (erlang/== (list :"$blfn" :"$remote" :"$macro" :"$protocol" :"$transient"
+                             :symbol :meta :bl_deftype :bl_reify :bl_vec)
+                       (erlang/apply m :internal_tuple_tags (list)))
+            "the ten tags, in the live module's order")
+        (is (not (Enum/member? (erlang/apply m :internal_tuple_tags (list)) :bl_set))
+            "messages are not values: the `:bl_set` family stays out"))
+
+      ; REPRODUCIBLE: a rebuild of the same source is the same bytes, so the
+      ; beam can be committed into the seed and re-derived.
+      (let [dir2 (tmp-dir)]
+        (is (erlang/== (File/read! (erlang/element 2 (BeamLisp.AOT/compile_host_file
+                                                       (guards-source) (probe-opts dir))))
+                       (File/read! (erlang/element 2 (BeamLisp.AOT/compile_host_file
+                                                       (guards-source) (probe-opts dir2))))))
+        (File/rm_rf! dir2))
+
+      ; `:macro_exports` may stand ALONE — a macro-only pinned module, with no
+      ; struct surface at all. `__info__(:struct)` then answers `nil`, which is
+      ; what a live Elixir module without `defstruct` answers.
+      (let [res (BeamLisp.AOT/compile_host_file (guards-source)
+                  (list (t2 :module probe) (t2 :output_dir dir) (t2 :load? false)
+                        (t2 :macro_exports (macro-exports))))
+            m (load-pinned probe (erlang/element 2 res))]
+        (drop! shim)
+        (is (erlang/== (list (tuple :is_bl_map 1) (tuple :is_data_tuple 1) (tuple :is_ref_type 1))
+                       (erlang/apply m :__info__ (list :macros))))
+        (is (erlang/== nil (erlang/apply m :__info__ (list :struct)))))
+
+      ; THE REFUSAL: advertising a macro whose `MACRO-` function does not exist
+      ; would be an `undef` at the caller's first expansion, so it is refused
+      ; here, BY NAME — the message renders the implementer ATOM through
+      ; `inspect` (`:"MACRO-nope"/2`), so the name and its arity are matched as
+      ; substrings rather than as one quoting-dependent needle.
+      (is (erlang/== :refused
+                     (try (do (BeamLisp.AOT/compile_host_file (guards-source)
+                                (list (t2 :module probe) (t2 :output_dir dir) (t2 :load? false)
+                                      (t2 :macro_exports (list (t2 :nope 1)))))
+                              :compiled)
+                          (catch e (if (and (erlang/== :Elixir.ArgumentError (struct-tag e))
+                                            (includes? (ex-message e) "MACRO-nope")
+                                            (includes? (ex-message e) "/2"))
+                                      :refused
+                                      (list :wrong (struct-tag e) (ex-message e))))))
+          ":macro_exports with no implementer is refused BY NAME, not advertised")
+      (File/rm_rf! dir))))
+
+; ── the expansion classes ────────────────────────────────────────────────
+
+(defn- guard-head-of [fname]
+  (if (erlang/== :"MACRO-is_ref_type" fname)
+    (list :erlang :orelse)
+    (list :erlang :andalso)))
+
+(deftest guards-pinned-expansions-are-the-live-expansions
+  (testing "guard vs body shape, and the calls each one makes"
+    (let [dir (tmp-dir)
+          m (compile-probe dir)
+          ; a distinctive caller AST: whatever the caller wrote must be spliced,
+          ; not replaced and not re-derived.
+          arg (erlang/list_to_tuple (list :x (list) :Caller))]
+      (doseq [fname (list :"MACRO-is_bl_map" :"MACRO-is_ref_type" :"MACRO-is_data_tuple")]
+        ; IN A GUARD the expansion IS the guard expression: no `:=` binding, and
+        ; the caller's own argument AST appears in it.
+        (let [pinned (expand* m fname arg true)
+              live-ast (expand* live fname arg true)]
+          (is (not (erlang/== :__block__ (erlang/element 1 pinned)))
+              (str (erlang/atom_to_list fname) ": no block in a guard"))
+          (is (not (erlang/== :__block__ (erlang/element 1 live-ast)))
+              "control: live does not bind in a guard, either")
+          (is (Enum/member? (ast-terms pinned) arg)
+              (str (erlang/atom_to_list fname) ": the caller's argument AST is spliced in"))
+          (is (erlang/== (guard-head-of fname) (ast-head pinned))
+              (str (erlang/atom_to_list fname) ": guard head"))
+          (is (erlang/== (guard-head-of fname) (ast-head live-ast))
+              "control: live's guard head")
+          ; THE SPINE: the same calls, in the same order — EXACTLY, because the
+          ; port is byte-shape faithful including the dead `orelse(is_atom(Tag),
+          ; :fail)` assertion Elixir splices into `is_struct/2`.
+          (is (erlang/== (ast-spine live-ast) (ast-spine pinned))
+              (str (erlang/atom_to_list fname) ": guard spine, live vs pinned")))
+        ; OUTSIDE A GUARD the expansion binds the argument ONCE: a `__block__`
+        ; whose first statement binds and whose last statement is the guard over
+        ; the BINDING — never over the caller's expression.
+        (let [pinned (expand* m fname arg false)
+              live-ast (expand* live fname arg false)]
+          (is (erlang/== :__block__ (erlang/element 1 pinned))
+              (str (erlang/atom_to_list fname) ": a block in the body branch"))
+          (is (erlang/== :__block__ (erlang/element 1 live-ast))
+              "control: live's body branch is a block too")
+          (let [stmts (erlang/element 3 pinned)
+                bind (first stmts)
+                guard (second stmts)
+                lhs (first (erlang/element 3 bind))]
+            (is (erlang/== := (erlang/element 1 bind)) "the block opens with a binding")
+            (is (erlang/== arg (second (erlang/element 3 bind)))
+                "the binding's right-hand side is the caller's own argument AST")
+            (is (not (Enum/member? (ast-terms guard) arg))
+                "the guard tests the BINDING, not the caller's expression")
+            (is (Enum/member? (ast-terms guard) lhs) "…and the binding is what it tests")
+            (is (erlang/== (erlang/element 3 lhs) m)
+                "the binding's context is this module atom — hygienic by construction")
+            (is (erlang/== (ast-spine live-ast) (ast-spine pinned))
+                (str (erlang/atom_to_list fname) ": body spine, live vs pinned")))))
+      (File/rm_rf! dir))))
+
+; ── the fixture: one source, two VMs ─────────────────────────────────────
+
+(defn- fixture
+  "The Elixir fixture, as source text, ending with `out = Base.encode64(...)` so
+   the caller reads the value HERE and the child prints it. It holds no struct
+   in the OBSERVATION — only verdicts and counters — so the two runs' terms must
+   be equal rather than merely comparable. TWO caller shapes are covered:
+   `GuardsFixture` `import`s the macros and `GuardsRequired` `require`s them and
+   calls them fully qualified."
+  []
+  (str
+    "defmodule GuardsFixture do\n"
+    "  import BeamLisp.Guards, only: [is_bl_map: 1, is_ref_type: 1, is_data_tuple: 1]\n"
+    "\n"
+    "  def bm(x) when is_bl_map(x), do: true\n"
+    "  def bm(_), do: false\n"
+    "  def rt(x) when is_ref_type(x), do: true\n"
+    "  def rt(_), do: false\n"
+    "  def dt(x) when is_data_tuple(x), do: true\n"
+    "  def dt(_), do: false\n"
+    "\n"
+    "  def bm_if(x), do: if(is_bl_map(x), do: true, else: false)\n"
+    "  def rt_if(x), do: if(is_ref_type(x), do: true, else: false)\n"
+    "  def dt_if(x), do: if(is_data_tuple(x), do: true, else: false)\n"
+    "\n"
+    "  def bm_in(x), do: is_bl_map(x)\n"
+    "  def rt_in(x), do: is_ref_type(x)\n"
+    "  def dt_in(x), do: is_data_tuple(x)\n"
+    "\n"
+    "  def both(a, b), do: is_bl_map(a) and is_data_tuple(b)\n"
+    "end\n"
+    "\n"
+    "defmodule GuardsRequired do\n"
+    "  require BeamLisp.Guards\n"
+    "\n"
+    "  def bm(x) when BeamLisp.Guards.is_bl_map(x), do: true\n"
+    "  def bm(_), do: false\n"
+    "  def rt(x) when BeamLisp.Guards.is_ref_type(x), do: true\n"
+    "  def rt(_), do: false\n"
+    "  def dt(x) when BeamLisp.Guards.is_data_tuple(x), do: true\n"
+    "  def dt(_), do: false\n"
+    "\n"
+    "  def dt_in(x), do: BeamLisp.Guards.is_data_tuple(x)\n"
+    "end\n"
+    "\n"
+    "vals = [\n"
+    "  {:empty_map, %{}},\n"
+    "  {:one_map, %{a: 1}},\n"
+    "  {:atom_tag_map, %{__struct__: :not_a_module}},\n"
+    "  {:binary_tag_map, %{__struct__: \"tag\"}},\n"
+    "  {:uri, %URI{}},\n"
+    "  {:atom_struct, %BeamLisp.Atom{}},\n"
+    "  {:volatile_struct, %BeamLisp.Volatile{}},\n"
+    "  {:promise_struct, %BeamLisp.Promise{}},\n"
+    "  {:future_struct, %BeamLisp.Future{}},\n"
+    "  {:reduced_struct, %BeamLisp.Reduced{}},\n"
+    "  {:tag_only_reduced, %{__struct__: BeamLisp.Reduced}},\n"
+    "  {:vector_struct, %BeamLisp.Vector{}},\n"
+    "  {:decimal_struct, %BeamLisp.Decimal{}},\n"
+    "  {:empty_tuple, {}},\n"
+    "  {:one_tuple, {1}},\n"
+    "  {:ok_tuple, {:ok, 1}},\n"
+    "  {:three_tuple, {:a, 1, 2}},\n"
+    "  {:other_tag_tuple, {:other, 1}},\n"
+    "  {:nil_head_tuple, {nil, 1}},\n"
+    "  {:symbol_tuple, {:symbol, :x}},\n"
+    "  {:meta_tuple, {:meta, {:a, 0, 0}, %{}}},\n"
+    "  {:blfn_tuple, {:\"$blfn\", %{}, {0, fn -> 1 end}}},\n"
+    "  {:remote_tuple, {:\"$remote\", Enum, :map}},\n"
+    "  {:macro_tuple, {:\"$macro\", fn -> 1 end}},\n"
+    "  {:protocol_tuple, {:\"$protocol\", :p, %{}}},\n"
+    "  {:transient_tuple, {:\"$transient\", :hash_map, :key}},\n"
+    "  {:deftype_tuple, {:bl_deftype, Foo, {}}},\n"
+    "  {:reify_tuple, {:bl_reify, :ref, %{}}},\n"
+    "  {:blvec_tuple, {:bl_vec, 1, 2, []}},\n"
+    "  {:list, [1, 2]},\n"
+    "  {:int, 1},\n"
+    "  {:string, \"s\"},\n"
+    "  {:keyword, :k},\n"
+    "  {:nil, nil},\n"
+    "  {:pid, self()}\n"
+    "]\n"
+    "\n"
+    "rows = for {l, v} <- vals do\n"
+    "  {l, GuardsFixture.bm(v), GuardsFixture.rt(v), GuardsFixture.dt(v),\n"
+    "      GuardsFixture.bm_if(v), GuardsFixture.rt_if(v), GuardsFixture.dt_if(v),\n"
+    "      GuardsFixture.bm_in(v), GuardsFixture.rt_in(v), GuardsFixture.dt_in(v)}\n"
+    "end\n"
+    "\n"
+    ; THE SAME CORPUS, through the OTHER caller shape: `require` plus a
+    ; fully-qualified call, which is what a module that does not `import` writes.
+    "req = for {l, v} <- vals, do: {l, GuardsRequired.bm(v), GuardsRequired.rt(v), GuardsRequired.dt(v), GuardsRequired.dt_in(v)}\n"
+    "\n"
+    "c1 = :counters.new(1, [])\n"
+    "b1 = fn v -> :counters.add(c1, 1, 1); v end\n"
+    "once = [GuardsFixture.bm_in(b1.(%{a: 1})), :counters.get(c1, 1)]\n"
+    "c2 = :counters.new(1, [])\n"
+    "b2 = fn v -> :counters.add(c2, 1, 1); v end\n"
+    "onedt = [GuardsFixture.dt_in(b2.({:symbol, 1})), :counters.get(c2, 1)]\n"
+    "c3 = :counters.new(1, [])\n"
+    "b3 = fn v -> :counters.add(c3, 1, 1); v end\n"
+    "pair = [GuardsFixture.both(b3.(%{}), b3.({1})), :counters.get(c3, 1)]\n"
+    "\n"
+    "out = Base.encode64(:erlang.term_to_binary({rows, req, once, onedt, pair}))\n"))
+
+(defn- child-tail
+  "`fixture` plus what a CHILD prints: the observation, then the evidence that
+   the observation came from the pinned beam. `:code.which/1` is the
+   replacement proof — a live `guards.ex` beam would answer with its own path."
+  [body]
+  (str body
+    "IO.puts(\"observed=\" <> out)\n"
+    "IO.puts(\"which=\" <> List.to_string(:code.which(BeamLisp.Guards)))\n"
+    "IO.puts(\"source=\" <> List.to_string(BeamLisp.Guards.module_info(:compile)[:source]))\n"
+    "IO.puts(\"macros=\" <> inspect(BeamLisp.Guards.__info__(:macros)))\n"
+    "IO.puts(\"macro_functions=\" <> inspect(Enum.filter(BeamLisp.Guards.__info__(:functions), fn {n, _} -> String.starts_with?(Atom.to_string(n), \"MACRO-\") end)))\n"))
+
+(defn- child-code-args
+  "This VM's whole code path as `-pa` args, with `pinned` LAST so it lands
+   FIRST: `-pa` PREPENDS, so the last one named wins."
+  [pinned]
+  (to-list (concat (mapcat (fn [p] (list "-pa" (erlang/list_to_binary p))) (code/get_path))
+                   (list "-pa" pinned))))
+
+(defn- cmd-opts []
+  (to-list (list (tuple :stderr_to_stdout true)
+                 (tuple :env (list (tuple "ERL_CRASH_DUMP" "/dev/null"))))))
+
+(defn- child-run [exe args]
+  (System/cmd exe (to-list args) (cmd-opts)))
+
+; ── the truth table, and the differential ────────────────────────────────
+
+(def expected-rows
+  "The absolute truth table. Columns: `label / is_bl_map / is_ref_type /
+   is_data_tuple`, from the GUARD clause; the `if` and plain-expression forms
+   must agree (asserted per row, so the three expansion shapes cannot drift).
+   `:atom_tag_map` is a map carrying an ATOM `:__struct__` that names no module
+   — `is_struct/1` reads the tag only, so it is a struct; `:binary_tag_map` is
+   the converse, a NON-atom tag, which is a plain map."
+  (list
+    (tuple :empty_map true false false)
+    (tuple :one_map true false false)
+    (tuple :atom_tag_map false false false)
+    (tuple :binary_tag_map true false false)
+    (tuple :uri false false false)
+    (tuple :atom_struct false true false)
+    (tuple :volatile_struct false true false)
+    (tuple :promise_struct false true false)
+    (tuple :future_struct false true false)
+    (tuple :reduced_struct false true false)
+    (tuple :tag_only_reduced false true false)
+    (tuple :vector_struct false false false)
+    (tuple :decimal_struct false false false)
+    (tuple :empty_tuple false false true)
+    (tuple :one_tuple false false true)
+    (tuple :ok_tuple false false true)
+    (tuple :three_tuple false false true)
+    (tuple :other_tag_tuple false false true)
+    (tuple :nil_head_tuple false false true)
+    (tuple :symbol_tuple false false false)
+    (tuple :meta_tuple false false false)
+    (tuple :blfn_tuple false false false)
+    (tuple :remote_tuple false false false)
+    (tuple :macro_tuple false false false)
+    (tuple :protocol_tuple false false false)
+    (tuple :transient_tuple false false false)
+    (tuple :deftype_tuple false false false)
+    (tuple :reify_tuple false false false)
+    (tuple :blvec_tuple false false false)
+    (tuple :list false false false)
+    (tuple :int false false false)
+    (tuple :string false false false)
+    (tuple :keyword false false false)
+    (tuple :nil false false false)
+    (tuple :pid false false false)))
+
+(defn- find-row [rows label]
+  (first (filter (fn [r] (erlang/== label (erlang/element 1 r))) rows)))
+
+(defn- check-row [e rows]
+  (let [label (erlang/element 1 e)
+        r (find-row rows label)]
+    (if (nil? r)
+      (is false (str "row " label " is present"))
+      (let [want (list (erlang/element 2 e) (erlang/element 3 e) (erlang/element 4 e))
+            guard-form (list (erlang/element 2 r) (erlang/element 3 r) (erlang/element 4 r))
+            if-form (list (erlang/element 5 r) (erlang/element 6 r) (erlang/element 7 r))
+            in-form (list (erlang/element 8 r) (erlang/element 9 r) (erlang/element 10 r))]
+        (is (erlang/== want guard-form) (str "guard clause: " label))
+        (is (erlang/== want if-form) (str "if condition: " label))
+        (is (erlang/== want in-form) (str "plain expression: " label))))))
+
+(defn- observation
+  "The observation term, taken apart: `rows` (the import-style truth table),
+   `req` (the require-style one), and `once`/`onedt`/`pair` (the
+   single-evaluation readings)."
+  [b64]
+  (let [t (erlang/binary_to_term (erlang/apply :base64 :decode (list b64)))]
+    (list (erlang/element 1 t) (erlang/element 2 t) (erlang/element 3 t)
+          (erlang/element 4 t) (erlang/element 5 t))))
+
+(defn- check-required
+  "The `require`-style corpus must answer exactly as the `import`-style one —
+   both are the SAME macro reached two ways, and both must equal the absolute
+   table (already checked on `rows`)."
+  [rows req]
+  (doseq [r req]
+    (let [label (erlang/element 1 r)
+          row (find-row rows label)]
+      (is (erlang/== (list (erlang/element 2 row) (erlang/element 3 row) (erlang/element 4 row))
+                     (list (erlang/element 2 r) (erlang/element 3 r) (erlang/element 4 r)))
+          (str "require-style verdicts agree with import-style: " label))
+      (is (erlang/== (erlang/element 4 r) (erlang/element 5 r))
+          (str "require-style guard and body agree: " label)))))
+
+(deftest guards-pinned-answers-the-live-macros-in-a-cold-child
+  (testing "one fixture, two VMs: the live macros here, the pinned beam in a child"
+    (let [dir (tmp-dir)
+          out (str dir "/prod")
+          body (fixture)
+          here (erlang/element 1 (Code/eval_string (str body "out")))
+          obs (observation here)]
+      ; THE DIFFERENTIAL needs a big enough observation to mean something.
+      (is (< 100 (count here)) "the observation is a real term, not an empty one")
+      ; THE ABSOLUTE TABLE, on the live run first.
+      (let [rows (first obs)]
+        (is (erlang/== 35 (count rows)) "every corpus row is present")
+        (doseq [e expected-rows] (check-row e rows))
+        (check-required rows (second obs))
+        ; SINGLE EVALUATION: the argument is read ONCE outside a guard. Without
+        ; the bind, `is_bl_map(bump.())` would run `bump` once per test in the
+        ; expansion (four times).
+        (is (erlang/== (list true 1) (nth obs 2)) "is_bl_map reads its argument once")
+        (is (erlang/== (list false 1) (nth obs 3)) "is_data_tuple reads its argument once")
+        (is (erlang/== (list true 2) (nth obs 4)) "two expansions read two arguments, once each"))
+      ; THE PINNED BEAM at the PRODUCTION atom, written but NOT loaded here.
+      (BeamLisp.AOT/compile_host_file (guards-source)
+        (list (t2 :module live) (t2 :output_dir out) (t2 :load? false)
+              (t2 :macro_exports (macro-exports))))
+      (is (File/exists? (Path/join out (str live ".beam"))))
+      (is (erlang/function_exported live :internal_tuple_tags 0)
+          "the live module was never substituted mid-flight")
+      (let [r (child-run "elixir" (concat (child-code-args out) (list "-e" (child-tail body))))
+            text (erlang/element 1 r)]
+        (is (zero? (erlang/element 2 r)) (str "the cold child exited " (erlang/element 2 r) ":\n" text))
+        (is (includes? text (str "observed=" here))
+            "the PINNED macros answer exactly as the LIVE ones, value for value")
+        (is (includes? text (str "which=" out "/Elixir.BeamLisp.Guards.beam"))
+            "from the pinned beam: the child's ONLY added code path entry")
+        (is (includes? text (str "source=" (guards-source)))
+            "compiled from priv/host/guards.bl, not from guards.ex")
+        (is (includes? text "macros=[is_bl_map: 1, is_data_tuple: 1, is_ref_type: 1]")
+            "the child's module advertises all three macros")
+        (is (includes? text "macro_functions=[]")
+            "and does not advertise the implementers as functions"))
+      (File/rm_rf! dir))))
+
+; ── the precompile edge: Elixir guard import uses the pinned beam ──────
+;
+; A pre-boot Elixir consumer can `import is_bl_map/1` from the pinned beam.
+; The original Record consumer has moved to BL; a minimal fixture now proves
+; the same compile-time guard edge without retaining deleted Elixir source.
+
+(deftest guards-pinned-compiles-a-guard-before-the-boot
+  (testing "an Elixir guard import resolves against the pinned beam before boot"
+    (let [dir (tmp-dir)
+          out (str dir "/pin")
+          rec (str dir "/rec")]
+      (File/mkdir_p! out)
+      (File/mkdir_p! rec)
+      (BeamLisp.AOT/compile_host_file (guards-source)
+        (list (t2 :module live) (t2 :output_dir out) (t2 :load? false)
+              (t2 :macro_exports (macro-exports))))
+      (is (File/exists? (Path/join out (str live ".beam"))))
+      ; (1) THE BEAM WINS THE ATOM in a fresh VM that never booted the language.
+      (let [r (child-run "elixir" (concat (child-code-args out)
+                                 (list "-e" (str "IO.puts(\"which=\" <> List.to_string(:code.which(BeamLisp.Guards)))\n"
+                                                 "IO.puts(\"macros=\" <> inspect(BeamLisp.Guards.__info__(:macros)))"))))
+            text (erlang/element 1 r)]
+        (is (zero? (erlang/element 2 r)) text)
+        (is (includes? text (Path/join out (str live ".beam")))
+            "the code server resolves the PINNED beam, not the live one")
+        (is (includes? text "macros=[is_bl_map: 1, is_data_tuple: 1, is_ref_type: 1]") text))
+      ; (2) `elixirc` compiles a REAL guard consumer with only the pinned
+      ; Guards beam on its path — no seed, application or source macro.
+      (let [source (Path/join dir "guard_consumer.ex")
+            script (Path/join dir "guard_consumer.exs")]
+        (File/write! source
+          "defmodule GuardConsumer do\n  import BeamLisp.Guards, only: [is_bl_map: 1]\n  def classify(v) when is_bl_map(v), do: :plain\n  def classify(_), do: :struct\nend\n")
+        (let [r (child-run "elixirc" (concat (child-code-args out) (list "-o" rec source)))
+              text (erlang/element 1 r)]
+          (is (zero? (erlang/element 2 r)) (str "elixirc exited " (erlang/element 2 r) ":\n" text))
+          (is (File/exists? (Path/join rec "Elixir.GuardConsumer.beam"))
+              "a guard clause compiles against the pinned macro before boot"))
+        ; (3) The emitted guard executes: a plain map passes, a struct does not.
+        (File/write! script
+          "IO.puts(\"plain=\" <> inspect(GuardConsumer.classify(%{})))\nIO.puts(\"struct=\" <> inspect(GuardConsumer.classify(%URI{})))\nIO.puts(\"which=\" <> List.to_string(:code.which(GuardConsumer)))\n")
+        (let [r (child-run "elixir" (concat (child-code-args out) (list "-pa" rec script)))
+              text (erlang/element 1 r)]
+          (is (zero? (erlang/element 2 r)) (str "the guard child exited " (erlang/element 2 r) ":\n" text))
+          (is (includes? text (str "which=" rec "/Elixir.GuardConsumer.beam"))
+              "the fixture beam is what runs")
+          (is (includes? text "plain=:plain") "a plain map passes the guard")
+          (is (includes? text "struct=:struct") "a struct is declined")))
+      (File/rm_rf! dir))))
+
+; ── boot safety: no namespace dependency, no var lookup ──────────────────
+
+(defn- ext-of
+  "The `{:extfunc, mod, fun, arity}` of a call instruction, or nil."
+  [ins]
+  (if (and (erlang/is_tuple ins) (erlang/> (erlang/tuple_size ins) 2))
+    (let [e (erlang/element 3 ins)]
+      (if (and (erlang/is_tuple e) (erlang/== :extfunc (erlang/element 1 e))) e nil))
+    nil))
+
+(defn- remote-mods
+  "Every remote module the beam calls."
+  [path]
+  (Enum/uniq
+    (Enum/map
+      (Enum/filter
+        (Enum/map
+          (Enum/flat_map
+            (Enum/filter (erlang/element 6 (erlang/apply :beam_disasm :file
+                                                         (list (erlang/binary_to_list path))))
+                         (fn [f] (erlang/== :function (erlang/element 1 f))))
+            (fn [f] (erlang/element 5 f)))
+          ext-of)
+        (fn [x] (not (nil? x))))
+      (fn [t] (erlang/element 2 t)))))
+
+(defn- ns-deps
+  "Every remote target module in the beam that is a beam-lisp NAMESPACE
+   (`Elixir.BeamLisp.Ns.*`) — the modules interned DURING boot, so a call into
+   one from a beam `elixirc` resolves before the boot is the circularity
+   `priv/host/vector.bl` documents."
+  [path]
+  (Enum/filter (remote-mods path)
+               (fn [m] (String/starts_with? (Atom/to_string m) "Elixir.BeamLisp.Ns."))))
+
+(defn- env-fetch-ins?
+  "A call instruction into `BeamLisp.Env.fetch!/2` — the var lookup a name this
+   file does not define would compile to."
+  [ins]
+  (cond
+    (not (erlang/is_tuple ins)) false
+    (not (erlang/== :call_ext (erlang/element 1 ins))) false
+    (not (erlang/is_tuple (erlang/element 3 ins))) false
+    (not (erlang/== :extfunc (erlang/element 1 (erlang/element 3 ins)))) false
+    :else (and (erlang/== :Elixir.BeamLisp.Env (erlang/element 2 (erlang/element 3 ins)))
+               (erlang/== :fetch! (erlang/element 3 (erlang/element 3 ins))))))
+
+(defn- env-fetch-sites [path]
+  (let [fns (erlang/element 6 (erlang/apply :beam_disasm :file (list (erlang/binary_to_list path))))]
+    (reduce
+      (fn [acc f]
+        (if (erlang/== :function (erlang/element 1 f))
+          (let [nm (erlang/element 2 f)
+                ar (erlang/element 3 f)]
+            (reduce (fn [a ins] (if (env-fetch-ins? ins) (cons (tuple nm ar) a) a))
+                    acc (erlang/element 5 f)))
+          acc))
+      ()
+      fns)))
+
+(deftest guards-pinned-is-boot-safe
+  (testing "no beam-lisp namespace target, no var lookup, and a known remote set"
+    (let [dir (tmp-dir)]
+      (compile-probe dir)
+      (let [path (Path/join dir (str probe ".beam"))]
+        (is (erlang/== (list) (ns-deps path))
+            "no Elixir.BeamLisp.Ns.* target: nothing here is `(list …)`/`(tuple …)`/`str`")
+        (is (erlang/== (list) (env-fetch-sites path))
+            "no `BeamLisp.Env.fetch!/2` call site: every name is a direct call")
+        ; THE WHOLE REMOTE SET, pinned: the runtime, the stdlib, and the ONE
+        ; Elixir-internal normalizer a MACRO implementer needs — which runs only
+        ; when an Elixir compiler expands the macro, never on a boot path. The
+        ; module's OWN atom is excluded because the pinned emitter retargets the
+        ; file's sibling calls (shim → pinned) as direct calls, so the beam calls
+        ; ITSELF; nothing else may appear.
+        (is (erlang/== (list :"Elixir.Macro.Env" :elixir_env :erlang :lists)
+                       (lists/sort (Enum/reject (remote-mods path)
+                                                (fn [m] (erlang/== m probe)))))
+            (str "the beam's remote modules (besides itself) are :erlang, :lists, "
+                 ":elixir_env, Macro.Env; got " (pr-str (lists/sort (remote-mods path))))))
+      (File/rm_rf! dir))))

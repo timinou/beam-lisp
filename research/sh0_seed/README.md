@@ -27,7 +27,7 @@ entire floor the whole self-hosting effort rests on.
 ### 1. The seam works (`seam_probe.bl`)
 
 ```
-$ mix beam_lisp.run research/sh0_seed/seam_probe.bl
+$ bin/bl run research/sh0_seed/seam_probe.bl
 AST: {:+, [], [1, 2]}
 eval result: 3
 seam OK? true
@@ -35,20 +35,23 @@ seam OK? true
 
 beam-lisp builds a real Elixir AST tuple and evaluates it → 3.
 
-### 2. It runs with the compiler purged (`purge_proof.exs`)
+### 2. It runs with the compiler purged (`purge_proof.bl`)
 
 ```
-$ mix run research/sh0_seed/purge_proof.exs
+$ bin/bl -p priv run research/sh0_seed/purge_proof.bl
 with compiler present:  (+ 1 2) => 3
 compiler/reader loaded after purge: []
 with compiler PURGED:   (+ 1 2) => 3
 P0 PASS
 ```
 
-The AOT-compiled `nano.beam` is called, then `BeamLisp.Compiler` and
-`BeamLisp.Reader` are **deleted from the running VM**, then it is called
-again — still 3. beam-lisp's own compiler is provably not in the runtime
-loop.
+The `nano` namespace (compiled from `priv/bootstrap/nano.bl`, reached with
+`-p priv`) is called, then `BeamLisp.Compiler` and `BeamLisp.Reader` are
+**deleted from the running VM**, then it is called again — still 3. beam-lisp's
+own compiler is provably not in the runtime loop. Since the self-hosting
+cutover, `BeamLisp.Compiler` is itself a beam-lisp-built host beam, so the
+purge now says something stronger: the seed runs with even the .bl compiler
+gone.
 
 ### 3. It runs in a bare Erlang VM (`bare_erl_proof.erl`)
 
@@ -76,7 +79,7 @@ custom Elixir compiler.
 ## Reproduce
 
 ```
-mix beam_lisp.run research/sh0_seed/seam_probe.bl
-mix run research/sh0_seed/purge_proof.exs
+bin/bl run research/sh0_seed/seam_probe.bl
+bin/bl -p priv run research/sh0_seed/purge_proof.bl
 # bare erl: see bare_erl_proof.erl header
 ```

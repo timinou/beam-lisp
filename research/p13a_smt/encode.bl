@@ -1,0 +1,215 @@
+; P13a — SMT encoding spike: beam-lisp guards → SMT-LIB → z3
+;
+; Run: bin/bl run research/p13a_smt/encode.bl
+;
+; The beam-lisp port of encode.exs. Same encoder, same questions, same report:
+;
+;   1. Can bl guard expressions be MECHANICALLY encoded to SMT-LIB with
+;      correct dynamic-value semantics?
+;   2. What does the dynamic-value encoding cost vs direct encoding?
+;   3. Per-query latency: fresh process vs a persistent `z3 -in` port?
+;
+; Forms are QUOTED LISTS — the reader's output shape, standing in for it here:
+;   '(and (> x 3) (< x 3))     ; == the same guard the reader hands the compiler
+; The tag map simulates the lattice layer's narrowing: '{x :int}.
+;
+; Where the Elixir original shelled out to `System.cmd("z3", …)` and opened its
+; own `Port`, this port speaks to the repo's PINNED solver (`priv/z3/bin/z3`)
+; through `BeamLisp.Z3Port` — the one implementation of the z3 port protocol
+; (priv/host/z3_port.bl). "Fresh process" is a z3 spawned per query; "persistent
+; port" is one z3 reused. The process-start cost that the fresh/persistent
+; comparison measures is unchanged.
+
+(ns p13a.encode)
+
+(def tags {:int 1 :float 2 :string 3 :keyword 4 :bool 5 :map 6 :vec 7 :set 8 :fn 9 :nil 10})
+(def numeric #{:int :float :number})
+
+(def tag-preds '{int? :int float? :float string? :string
+                 keyword? :keyword bool? :bool map? :map
+                 vector? :vec set? :set fn? :fn nil? :nil})
+
+(def cmps {'> ">" '< "<" '>= ">=" '<= "<=" '= "="})
+(def numeric-cmps {'zero? "=" 'pos? ">" 'neg? "<"})
+(def combinators #{'and 'or 'not})
+
+; ── the encoder ──────────────────────────────────────────────────────────
+;
+; Returns {:ok sexp} | :unknown (sound-warnings-only: drop).
+;   :direct — only provably-numeric vars encoded, tag predicates resolved
+;             against the tag map at encode time.
+;   :tagged — every var gets tag + payload consts; tag predicates become
+;             runtime assertions. Measures the dynamic-typing tax.
+
+(declare expr)
+
+(defn- numeric? [x t] (contains? numeric (get t x)))
+
+(defn- nary [nm ps t m]
+  (let [encoded (map (fn [p] (expr p t m)) ps)
+        dropped? (some (fn [r] (= :unknown r)) encoded)]
+    ; A dropped conjunct can only WEAKEN a conjunction (unsat stays sound:
+    ; if the subset is unsat, the full set is unsat). For `or` it could
+    ; strengthen — so any unknown disjunct sinks the whole `or`.
+    (if (and (= nm "or") dropped?)
+      :unknown
+      (let [xs (vec (keep (fn [r] (if (= :unknown r) nil (:ok r))) encoded))]
+        (cond
+          (empty? xs) :unknown
+          (= 1 (count xs)) {:ok (first xs)}
+          :else {:ok (str "(" nm " " (join " " xs) ")")})))))
+
+(defn- operand [x t m]
+  (cond
+    (and (symbol? x) (= m :tagged)) {:ok (str x "_i")}
+    (and (symbol? x) (numeric? x t)) {:ok (str x)}
+    (int? x) {:ok (str x)}
+    :else :unknown))
+
+(defn- numeric-cmp [x pred t m]
+  (if (numeric? x t)
+    (let [r (operand x t m)]
+      (if (= :unknown r) :unknown {:ok (str "(" (get numeric-cmps pred) " " (:ok r) " 0)")}))
+    :unknown))
+
+(defn- tag-pred [tag x t m]
+  (if (= m :direct)
+    ; The lattice layer already knows — resolve statically.
+    (let [v (get t x)]
+      (cond
+        (nil? v) :unknown
+        (= v tag) {:ok "true"}
+        :else {:ok "false"}))
+    {:ok (str "(= tag_" x " " (get tags tag) ")")}))
+
+(defn expr [form t m]
+  (if-not (list? form)
+    :unknown
+    (let [op (first form)
+          n (count form)]
+      (cond
+        (contains? combinators op)
+        (if (= 'not op)
+          (let [r (expr (second form) t m)]
+            (if (= :unknown r) :unknown {:ok (str "(not " (:ok r) ")")}))
+          (nary (name op) (rest form) t m))
+
+        (contains? cmps op)
+        (if (= 3 n)
+          (let [ra (operand (second form) t m)
+                rb (operand (nth form 2) t m)]
+            (if (or (= :unknown ra) (= :unknown rb))
+              :unknown
+              {:ok (str "(" (get cmps op) " " (:ok ra) " " (:ok rb) ")")}))
+          :unknown)
+
+        (and (= 2 n) (symbol? (second form)) (contains? numeric-cmps op))
+        (numeric-cmp (second form) op t m)
+
+        (and (= 2 n) (symbol? (second form)) (contains? tag-preds op))
+        (tag-pred (get tag-preds op) (second form) t m)
+
+        :else :unknown))))
+
+(defn encode [form t m]
+  (let [r (expr form t m)]
+    (if (= :unknown r) :unknown {:ok (str "(assert " (:ok r) ")\n")})))
+
+(defn- variables [form]
+  (distinct (filter (fn [x] (symbol? x)) (flatten form))))
+
+(defn decls [form t m]
+  (let [vars (variables form)]
+    (if (= m :direct)
+      (apply str (map (fn [v] (str "(declare-const " v " Int)\n"))
+                      (filter (fn [v] (numeric? v t)) vars)))
+      (apply str (map (fn [v] (str "(declare-const tag_" v " Int)\n(declare-const " v "_i Int)\n"))
+                      (filter (fn [v] (and (not (contains? cmps v))
+                                           (not (contains? combinators v))
+                                           (not (contains? tag-preds v))
+                                           (not (contains? numeric-cmps v))))
+                              vars))))))
+
+; ── the runner ───────────────────────────────────────────────────────────
+
+(defn- now-us [] (erlang/monotonic_time :microsecond))
+
+(defn- query-once
+  "One cold query: a z3 process spawned for it, checked, closed."
+  [smt]
+  (let [p (BeamLisp.Z3Port/open)
+        t0 (now-us)
+        r (BeamLisp.Z3Port/raw_check p smt false)
+        ms (quot (- (now-us) t0) 1000)]
+    (BeamLisp.Z3Port/close p)
+    [(:status r) ms]))
+
+(defn- cold-samples [smt n]
+  (vec (map (fn [_] (second (query-once smt))) (range n))))
+
+(defn- warm-samples
+  "One persistent `z3 -in` port, reused. `raw_check` resets before each query,
+   the same discipline the Elixir runner spelled by hand."
+  [smt n]
+  (let [p (BeamLisp.Z3Port/open)]
+    (doseq [_ (range 5)] (BeamLisp.Z3Port/raw_check p smt false)) ; warmup
+    (let [xs (vec (map (fn [_]
+                         (let [t0 (now-us)]
+                           (BeamLisp.Z3Port/raw_check p smt false)
+                           (quot (- (now-us) t0) 1000)))
+                       (range n)))]
+      (BeamLisp.Z3Port/close p)
+      xs)))
+
+(defn- z3-version []
+  (let [p (BeamLisp.Z3Port/open)
+        r (BeamLisp.Z3Port/raw_command p "(get-info :version)")
+        _ (BeamLisp.Z3Port/close p)]
+    (if (:ok r)
+      (let [m (Regex/run (Regex/compile! "\"([0-9.]+)\"") (str (:output r)))]
+        (if (and (erlang/is_list m) (erlang/== 2 (erlang/length m)))
+          (Enum/at m 1)
+          "unknown"))
+      "unknown")))
+
+(defn- report-latency [label samples]
+  (let [sorted (vec (sort samples))
+        p50 (nth sorted 49)
+        p99 (nth sorted 98)
+        mx (last sorted)]
+    (println (str "   " label ": p50=" p50 " ms  p99=" p99 " ms  max=" mx " ms"))))
+
+; ── the run ──────────────────────────────────────────────────────────────
+
+(def QUERIES
+  [["contradiction (and (> x 3) (< x 3))"
+    '(and (> x 3) (< x 3)) '{x :int}]
+   ["satisfiable (and (> x 3) (int? x))"
+    '(and (> x 3) (int? x)) '{x :int}]
+   ["tag contradiction (and (int? y) (string? y))"
+    '(and (int? y) (string? y)) '{y :int}]
+   ["datom-style bound check (and (>= i n) (< i n))"
+    '(and (>= i n) (< i n)) '{i :int n :int}]
+   ["relational x > y + 3... via two conjuncts (and (> x (+ y 3)) (< x y)) — out of grammar, expect :unknown"
+    '(and (> x (+ y 3)) (< x y)) '{x :int y :int}]])
+
+(println (str "== P13a: beam-lisp guard → SMT-LIB → z3 " (z3-version) " ==\n"))
+
+(doseq [[label form t] QUERIES]
+  (println (str "-- " label))
+  (doseq [m [:direct :tagged]]
+    (let [e (encode form t m)]
+      (if (= :unknown e)
+        (println (str "   " (name m) ": :unknown (dropped — sound-warnings-only)"))
+        (let [[status ms] (query-once (str (decls form t m) (:ok e)))]
+          (println (str "   " (name m) ": " status " (" ms " ms cold)"))))))
+  (println ""))
+
+(println "== latency: 100 queries, tagged encoding, (and (> x 3) (< x 3)) ==")
+(let [form '(and (> x 3) (< x 3))
+      t '{x :int}
+      smt (str (decls form t :tagged) (:ok (encode form t :tagged)))
+      cold (cold-samples smt 100)
+      warm (warm-samples smt 100)]
+  (report-latency "fresh process" cold)
+  (report-latency "persistent port" warm))

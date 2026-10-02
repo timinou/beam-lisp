@@ -1,0 +1,1759 @@
+; document/xberg.bl — the thin native boundary to Xberg, in beam-lisp.
+;
+; ── What this owns, and what it deliberately does NOT ───────────────────────
+;
+; The engine (xberg 1.0.14, a rustler NIF) does the reading: parsing 119
+; formats, OCR, table recovery, layout, tokenising, chunk splitting. None of
+; that is re-implemented here, and none of it should be (see
+; docs/research/xberg-beam-investigation.md §7.10 in the knowledger tree).
+;
+; What the engine will NOT do for us is exactly what this module owns:
+;
+;   1. SAY WHAT IS USABLE. `list_ocr_backends/0` lists what is COMPILED IN, not
+;      what can run: tesseract needs a system binary and language data, the
+;      candle/paddle backends need model weights, `vlm` needs a provider. A
+;      registry listing is not a capability. `capabilities` projects the
+;      registries AND probes the host, so "registered" and "ready" stay two
+;      different facts.
+;
+;   2. VALIDATE THE CONFIG. At 1.0.14 an unknown key is SILENTLY IGNORED (a
+;      misspelled `chunking.max_chars` extracts with defaults, no error). After
+;      1.1.0 the same input is a hard deserialization error. A boundary that
+;      forwards user config maps is therefore quietly wrong today and loudly
+;      broken after the next bump. We validate against a pinned schema and
+;      reject unknown keys in OUR layer, so the contract is stable across the
+;      upgrade.
+;
+;   3. NAME THE IDENTITY. `H(bytes, engine, config)` is the reader's cache key
+;      and the reason a reader upgrade becomes visible instead of silent. The
+;      engine has no notion of a revision; we canonicalise the config and hand
+;      back a stable `:config-hash` beside the pinned engine id.
+;
+;   4. BOUND THE WORK. `extract_async` blocks a scheduler for the length of the
+;      read. Every call carries an input budget, an in-flight ceiling and a
+;      timeout, and the timeout is HONEST: killing the BEAM process that called
+;      the NIF does NOT stop the native computation (it runs on a dirty
+;      scheduler thread). So an in-process timeout reports
+;      `:native-stopped? false` and charges a leak counter. Real hard
+;      cancellation needs an OS process, which `:isolation :os_worker` provides
+;      when a worker command is configured.
+;
+;   5. TYPE THE ERRORS. The binding's own `@spec` claims `{:error, atom, msg}`
+;      while the measured failure is `{:error, binary}` — a 2-tuple. Any caller
+;      matching the spec crashes on the first real failure. This module never
+;      lets that shape escape: a whole-call failure and a per-input batch
+;      failure both arrive as `{:error {:xberg <kind> :message … …}}`.
+;
+; What it does NOT do: normalise the engine's result into the document model.
+; That is `librarium.reader`'s job (pages, spans, occurrence ids, geometry
+; policy). This module preserves the native response and hands back the small
+; set of accessors that make it safe to read.
+
+(ns document.xberg
+  (:require [bl.json :as json]))
+
+;; ═══ engine identity ═══════════════════════════════════════════════════════
+;
+; Pinned deliberately. An artifact id composes this with the bytes hash and the
+; canonical config hash, so a reader upgrade MOVES every derived id instead of
+; silently re-reading old bytes under a new reader (the "a reader upgrade never
+; re-ingests" defect, FUP-024 item 8). When the pin moves, that intent must move
+; with it.
+
+(def ENGINE-VERSION "1.0.14")
+(def ENGINE-CRATE "xberg_nif")
+(def XBERG-MODULE "Elixir.Xberg")
+
+(defn- system-arch []
+  (erlang/list_to_binary
+    (erlang/apply :erlang :system_info (list :system_architecture))))
+
+(defn- app-vsn
+  "The LOADED app's version if the application resource is reachable, else nil.
+   The pinned constant is the floor: identity must be answerable even when
+   nothing loaded the app."
+  []
+  (try
+    (do (erlang/apply :application :load (list :xberg))
+        (let [r (erlang/apply :application :get_key (list :xberg :vsn))]
+          (if (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+            (erlang/list_to_binary (erlang/element 2 r))
+            nil)))
+    (catch _ nil)))
+
+(defn- sha-hex [b]
+  (str "sha256:" (String/downcase (Base/encode16 (crypto/hash :sha256 b)))))
+
+(defn- nif-sha
+  "The digest of the LOADED NIF artifact — an identity a version string cannot
+   forge, because the string is a claim and the bytes are the thing. Resolved
+   once per VM from the xberg app's `priv/native`, and `:unresolved` when the
+   layout does not answer: an absent identity is reported absent, never
+   invented."
+  []
+  (let [cached (erlang/apply :persistent_term :get (list :document-xberg-nif ::none))]
+    (if-not (erlang/== cached ::none)
+      cached
+      (let [v (try
+                (let [w (erlang/apply :code :which
+                                      (list (erlang/binary_to_atom "Elixir.Xberg.Native")))
+                      ;; `:code.which/1` answers in ERLANG STRING (a charlist);
+                      ;; treating that as a binary made the whole lookup
+                      ;; silently `:unresolved`, which is at least honest.
+                      beam (cond (string? w) w
+                                 (list? w) (erlang/list_to_binary w)
+                                 :else nil)]
+                  (if (and (some? beam) (String/ends_with? beam ".beam"))
+                    (let [priv (Path/join (list (Path/dirname (Path/dirname beam)) "priv" "native"))
+                          ;; the directory ALSO holds the image/codec/onnx
+                          ;; dependencies, and `File.ls!` sorts — so "the first
+                          ;; .so" is libaom, not the NIF. Hash the crate's own
+                          ;; artifact and nothing else, and say :unresolved
+                          ;; rather than guess.
+                          so (first (filter (fn [f] (and (String/ends_with? f ".so")
+                                                         (String/contains? f ENGINE-CRATE)))
+                                            (to-list (File/ls! priv))))]
+                      (if (nil? so) :unresolved
+                          (sha-hex (File/read! (Path/join (list priv so))))))
+                    :unresolved))
+                (catch _ :unresolved))]
+        (erlang/apply :persistent_term :put (list :document-xberg-nif v))
+        v))))
+
+(defn engine-id
+  "The identity of the reader that produced an artifact: version, crate, host
+   architecture and the NIF digest. A document extracted by a different build —
+   or by a swapped artifact under the same version — is detectable, because the
+   digest is part of every artifact id."
+  []
+  {:xberg (or (app-vsn) ENGINE-VERSION)
+   :crate ENGINE-CRATE
+   :arch (system-arch)
+   :nif (nif-sha)})
+
+;; ═══ availability ══════════════════════════════════════════════════════════
+;
+; `Code.ensure_loaded?` is NOT enough: rustler_precompiled generates a module
+; whose @on_load swallows a failed NIF load and leaves every function as
+; `:erlang.nif_error(:nif_not_loaded)`. The module loads, the code path looks
+; right, and every call raises. So the probe is a real call, and only a real
+; answer counts.
+
+(defn- xberg-loaded? []
+  (Code/ensure_loaded? (erlang/binary_to_atom XBERG-MODULE)))
+
+(defn available?
+  "Whether the pinned binding is actually CALLABLE in this VM. Never raises — a
+   capability question is answered, not thrown. A `true` is latched in
+   persistent_term (a NIF cannot become unloaded in a VM); an absent answer is
+   re-asked, so installing the artifact under a running daemon is noticed."
+  []
+  (if (erlang/apply :persistent_term :get (list :document-xberg-available false))
+    true
+    (let [now (and (xberg-loaded?)
+                   (try (do (Xberg/list_supported_formats) true)
+                        (catch _ false)))]
+      (when now
+        (erlang/apply :persistent_term :put (list :document-xberg-available true)))
+      now)))
+
+(defn enabled?
+  "Whether the PRODUCT has switched the engine tier on (`LIBRARIUM_XBERG=1`).
+   Availability is a fact about the VM; enablement is policy about a deployment.
+   Both must hold before a reader is served — and they are different questions,
+   so they are different functions."
+  []
+  (= "1" (System/get_env "LIBRARIUM_XBERG")))
+
+;; ═══ reading the native response ═══════════════════════════════════════════
+;
+; The payload is a hybrid: plain maps (atom keys), `Xberg.*` structs (also maps)
+; and Rust enums as tagged tuples (`{:paragraph, %{…}}`), with map-shaped enums
+; for `Entity.category`. Keys arrive as atoms — but a binding refactor could
+; make them binaries, so both are read, without ever interning a new atom.
+
+(defn- kw-name [k]
+  (cond
+    (keyword? k) (name k)
+    (string? k) k
+    :else (str k)))
+
+(defn field
+  "One field of a native map/struct, by keyword or by string. Absence is the
+   default (nil). The other key form is tried too, so a binding that changes its
+   key encoding does not silently start returning nil everywhere."
+  ([m k] (field m k nil))
+  ([m k default]
+   (if (nil? m)
+     default
+     (let [v (get m k ::missing)]
+       (if-not (erlang/== v ::missing)
+         v
+         (let [alt (if (keyword? k) (name k) k)
+               a (try (erlang/binary_to_existing_atom alt) (catch _ ::missing))
+               v2 (if (erlang/== a ::missing) ::missing (get m a ::missing))]
+           (if (erlang/== v2 ::missing) (get m alt default) v2)))))))
+
+(defn- kw-of
+  "A tag from the wire as a KEYWORD, whatever the wire spelled it. The JSON
+   transport cannot carry a tuple, so an enum arrives as
+   `%{\"__enum__\" => [\"rectangle\", %{…}]}` and its tag is a STRING; comparing
+   that to `:rectangle` would silently miss. One spelling, both transports."
+  [x]
+  (cond
+    (keyword? x) x
+    (string? x) (try (erlang/binary_to_atom x) (catch _ x))
+    :else x))
+
+(defn- enum-wire
+  "When `v` is the JSON object form of a tagged enum, its two parts; else nil.
+   Only the `__enum__` object — a map that already holds `:format_type` is a
+   DIFFERENT wire shape and keeps its old reading."
+  [v]
+  (if (erlang/is_map v)
+    (let [e (or (get v :__enum__ nil) (get v "__enum__" nil))]
+      (if (and (sequential? e) (>= (count (to-list e)) 1))
+        (to-list e)
+        nil))
+    nil))
+
+(defn enum-tag
+  "The tag of a native enum value. Rust encodes these inconsistently:
+   `{:paragraph, %{…}}` (tuple), `:rectangle` (atom), `%{format_type: \"x\"}`
+   (map), or — over the OS worker's JSON transport, where a tuple cannot
+   survive — `%{\"__enum__\" => [\"rectangle\", %{…}]}`. One accessor for
+   all four, so consumers never pattern-match the wire shape: a tag is a
+   KEYWORD here whichever transport produced it."
+  [v]
+  (cond
+    (nil? v) nil
+    (erlang/is_tuple v) (erlang/element 1 v)
+    (erlang/is_map v) (let [e (enum-wire v)]
+                        (if (some? e)
+                          (kw-of (first e))
+                          (or (get v :__enum__ nil) (get v :format_type nil) (get v :type nil))))
+    :else v))
+
+(defn enum-value
+  "The payload of a tagged enum: the second element of a tuple, the payload of
+   the JSON `__enum__` object, `custom` for a map-enum, or the value itself for
+   a bare atom/string."
+  [v]
+  (cond
+    (nil? v) nil
+    (erlang/is_tuple v) (erlang/element 2 v)
+    (erlang/is_map v) (let [e (enum-wire v)]
+                        (if (some? e)
+                          (second e)
+                          (or (get v :custom nil) (get v :__enum__ nil) v)))
+    :else nil))
+
+(defn- bsize
+  "BYTE length of a binary. `count` counts a collection, and the unit it picks
+   for a binary is not this contract. An offset computed in the wrong unit is
+   precisely the bug this boundary exists to avoid, so bytes are asked for by
+   name."
+  [s] (erlang/apply :erlang :byte_size (list s)))
+
+(defn- bpart [s a b]
+  (erlang/apply :binary :part (list s a (erlang/- b a))))
+
+(defn dequote  "Strip ONE layer of surrounding double quotes. `metadata.additional` arrives
+   with its strings already quoted (`\"src\" => \"\\\"native\\\"\"`), because
+   the engine serialises an inner JSON document into a string field."
+  [s]
+  (if (and (string? s) (>= (bsize s) 2)
+           (erlang/== 34 (binary/at s 0))
+           (erlang/== 34 (binary/at s (erlang/- (bsize s) 1))))
+    (bpart s 1 (erlang/- (bsize s) 1))
+    s))
+
+(defn dequote-map
+  "The same, over every value of a map."
+  [m]
+  (if (nil? m)
+    m
+    (reduce (fn [acc k] (assoc acc k (dequote (get m k)))) {} (keys m))))
+
+;; ── the two channels of a call ──────────────────────────────────────────────
+
+(defn results
+  "Every extracted document in a raw response, as a list. An archive yields
+   several; the current app seam reads only `results[0]` and silently drops the
+   rest."
+  [raw]
+  (to-list (or (field raw :results) [])))
+
+(defn call-errors
+  "The PER-INPUT failures of a raw response, typed. Presence here does NOT mean
+   the call failed — a batch with one unreadable file returns the good results
+   plus one entry here."
+  [raw]
+  (map (fn [e]
+         {:index (field e :index)
+          :code (field e :code)
+          :error-type (field e :error_type)
+          :source (field e :source)
+          :message (field e :message)})
+       (to-list (or (field raw :errors) []))))
+
+(defn summary
+  "The engine's own counts for a batch: how many inputs, results and errors."
+  [raw]
+  (let [s (field raw :summary)]
+    {:inputs (field s :inputs)
+     :results (field s :results)
+     :errors (field s :errors)
+     :documents-downloaded (field s :documents_downloaded)
+     :pages-crawled (field s :pages_crawled)}))
+
+;; ═══ the pinned OCR profile ════════════════════════════════════════════════
+;
+; Arabic + French + English, on tesseract, with OCR on and vlm off. It is
+; PINNED — never "auto" — because language is not something to leave to a
+; guess: an Arabic legal scan read as English returns fluent nonsense, and the
+; engine still reports a quality score of 1.0 for it (§3.7: candle-trocr
+; returned garbage with `quality_score 1.0`). Availability is a separate,
+; probed fact (`language-capability`), and a caller that cannot run the profile
+; finds out BEFORE the call.
+
+(def OCR-LANGUAGES ["ara" "fra" "eng"])
+
+(def OCR-PROFILE
+  {:enabled true
+   :backend "tesseract"
+   :language OCR-LANGUAGES
+   :auto_rotate false
+   ;; the internally tagged wire form: `#[serde(tag = "mode", rename_all =
+   ;; "snake_case")]` over `Disabled | OnLowQuality | Always`
+   :vlm_fallback {:mode "disabled"}
+   :element_config {:include_elements true
+                    :min_level "word"
+                    :min_confidence 0.0}})
+
+(defn ocr-profile
+  "The pinned multilingual OCR config. `:language` is explicit; nothing is
+   inferred from the text."
+  []
+  {:enabled (get OCR-PROFILE :enabled)
+   :backend (get OCR-PROFILE :backend)
+   :language (into [] (get OCR-PROFILE :language))
+   :auto_rotate (get OCR-PROFILE :auto_rotate)
+   :vlm_fallback (get OCR-PROFILE :vlm_fallback)
+   :element_config (get OCR-PROFILE :element_config)})
+
+(def SECURITY-LIMITS
+  {:max_archive_size 524288000
+   :max_compression_ratio 100
+   :max_files_in_archive 10000
+   :max_nesting_depth 16
+   :max_entity_length 1048576
+   :max_content_size 104857600
+   :max_iterations 10000000
+   :max_xml_depth 256
+   :max_table_cells 100000})
+
+(defn default-config
+  "The explicit baseline every call is sent with — never a `nil` config, so the
+   engine's own defaults are not silently in play. No OCR section: pinning OCR
+   languages is a reader POLICY (`librarium.reader`), and the boundary answers
+   whether a pin is runnable rather than assuming it."
+  []
+  {:use_cache true
+   :result_format "unified"
+   :output_format "plain"
+   :include_document_structure true
+   :security_limits SECURITY-LIMITS})
+
+(defn profile-config
+  "`default-config` with the pinned multilingual OCR profile — what
+   `librarium.reader` sends by default."
+  []
+  (merge (default-config)
+         {:pages {:extract_pages true}
+          :chunking {:max_characters 1200 :overlap 200 :trim true :chunker_type "text"}
+          :pdf_options {:extract_tables true :extract_metadata true :reading_order false}
+          :ocr (ocr-profile)
+          :extraction_timeout_secs 120
+          :max_archive_depth 1}))
+
+;; ── installed language data ─────────────────────────────────────────────────
+;
+; `tesseract --list-langs` is the installed SOURCE of truth: the NIF has
+; `tessdata_path`/`tessdata_bytes` precisely because model data is a deployment
+; concern, and `list_ocr_backend_capabilities` (which would have answered this
+; from the engine) is NOT in 1.0.14.
+
+(defn- run-cmd [cmd args]
+  (try
+    (let [r (System/cmd cmd (to-list args) (to-list [(tuple :stderr_to_stdout true)]))]
+      {:ok (erlang/element 1 r) :status (erlang/element 2 r)})
+    (catch _ {:error :not-found})))
+
+(defn- lang-lines [out]
+  (into []
+        (remove (fn [l] (or (= "" l) (String/starts_with? l "List of available")))
+                (map (fn [l] (String/trim l)) (to-list (String/split out "\n"))))))
+
+(defn tesseract-languages
+  "The language codes the INSTALLED tesseract can actually read, probed from
+   `--list-langs` — the same data the engine will consult. `{:ok [codes]}` or
+   `{:error reason}`. Never an assumption: `ara` and `eng` are commonly absent
+   while `fra` is present, and the engine will not tell you.
+
+   `tessdata` (optional) is the directory a caller will pass to the engine as
+   `ocr.tessdata_path`; when given, the probe asks THE SAME directory, so a
+   pinned language pack is neither reported missing nor assumed present."
+  ([] (tesseract-languages nil))
+  ([tessdata]
+   (let [args (if (nil? tessdata)
+                (list "--list-langs")
+                (list "--list-langs" "--tessdata-dir" tessdata))
+         r (run-cmd "tesseract" args)]
+     (cond
+       (some? (get r :error)) {:error (get r :error)}
+       (not= 0 (get r :status)) {:error :unavailable}
+       :else {:ok (lang-lines (get r :ok))}))))
+
+(defn- ocr-backend
+  "The OCR backend an effective config selects. The engine's own default is
+   tesseract, so an absent `:ocr :backend` means tesseract — not `unknown`."
+  [cfg]
+  (kw-name (or (get-in (or cfg {}) [:ocr :backend]) "tesseract")))
+
+(defn- ocr-runs?
+  "Whether OCR will run at all for this config: a disabled OCR section (or
+   `:disable_ocr`) has no language dependency to refuse."
+  [cfg]
+  (let [c (or cfg {})
+        o (get c :ocr)]
+    (and (not (get c :disable_ocr false))
+         (not (and (map? o) (contains? o :enabled) (not (get o :enabled false)))))))
+
+(defn- ocr-languages-probed?
+  "Whether `tesseract --list-langs` can certify this config's languages at all:
+   only the tesseract backend reads tesseract language data, and only when OCR
+   runs."
+  [cfg]
+  (and (ocr-runs? cfg) (erlang/== "tesseract" (ocr-backend cfg))))
+
+(defn missing-languages
+  "Which of `langs` the installed OCR data cannot read. Empty means the profile
+   is runnable; non-empty is a reason to refuse or to record an explicit
+   degradation — never to silently proceed. `tessdata` names the directory the
+   engine will actually be pointed at; without it the host default is probed."
+  ([langs] (missing-languages langs "tesseract" nil))
+  ([langs backend] (missing-languages langs backend nil))
+  ([langs backend tessdata]
+   (if (not= backend "tesseract")
+     ;; `tesseract --list-langs` enumerates TESSERACT language data only; it
+     ;; says nothing about another backend's assets, so it can neither certify
+     ;; nor refuse them. Reporting them "missing" was a false refusal for a
+     ;; candle/paddle profile.
+     []
+     (let [probe (tesseract-languages tessdata)]
+       (if (some? (get probe :error))
+         (into [] (to-list langs))
+         (let [have (into #{} (get probe :ok))]
+           (into [] (remove (fn [l] (contains? have l)) (to-list langs)))))))))
+
+;; ═══ validated config ══════════════════════════════════════════════════════
+;
+; A pinned schema for the subset the product uses. Anything not listed is
+; REJECTED — including engine features we have chosen not to expose (layout at
+; this pin is inert; engine-side embeddings would create a second identity
+; system). Rejecting in our layer is what keeps the contract true across the
+; 1.1.0 strictness change.
+
+(def ^:private ENUMS
+  {;; MEASURED, and it corrected a source-only reading: rustler's enum derives
+   ;; give every unit enum `rename_all = "snake_case"`, so `OcrElementLevel`'s
+   ;; `Word | Line | Block | Page` crosses the wire as `word | line | …`. The
+   ;; engine's own error named the accepted variants after a PascalCase attempt.
+   :output_format #{"plain" "markdown" "djot" "html" "json" "structured"}
+   :result_format #{"unified" "element_based"}
+   :chunker_type #{"text" "markdown" "yaml" "semantic"}
+   :table_chunking #{"split" "keep"}
+   :ocr_element_level #{"word" "line" "block" "page"}})
+
+;; The one enum that is NOT a unit enum: `#[serde(tag = "mode", rename_all =
+;; "snake_case")]` over `Disabled | OnLowQuality | Always`.
+(def ^:private VLM_MODES #{"disabled" "on_low_quality" "always"})
+
+(def ^:private TOP-SCALARS
+  {:use_cache :bool
+   :enable_quality_processing :bool
+   :force_ocr :bool
+   :disable_ocr :bool
+   :force_ocr_pages :any
+   :ocr_strategy :any
+   :output_format :enum-output_format
+   :result_format :enum-result_format
+   :include_document_structure :bool
+   :escape_markdown :bool
+   :table_anchors :bool
+   :use_layout_for_markdown :bool
+   :extraction_timeout_secs :int
+   :max_concurrent_extractions :int
+   :max_embedded_file_bytes :int
+   :max_archive_depth :int
+   :cache_namespace :string
+   :cache_ttl_secs :int
+   :acceleration :any})
+
+(def ^:private SECTIONS
+  {:ocr {:enabled :bool
+         :backend :string
+         :language [:string]
+         :auto_rotate :bool
+         :vlm_fallback :vlm-policy
+         :vlm_config :any
+         :vlm_prompt :string
+         :tessdata_path :string
+         :tessdata_bytes :any
+         :tesseract_config :any
+         :paddle_ocr_config :any
+         :backend_options :any
+         :quality_thresholds :any
+         :pipeline :pipeline
+         :acceleration :any
+         :element_config {:include_elements :bool
+                          :min_level :enum-ocr_element_level
+                          :min_confidence :number
+                          :build_hierarchy :bool}}
+   :pages {:extract_pages :bool
+           :insert_page_markers :bool
+           :marker_format :string}
+   :chunking {:max_characters :int
+              :overlap :int
+              :trim :bool
+              :chunker_type :enum-chunker_type
+              :table_chunking :enum-table_chunking
+              :prepend_heading_context :bool
+              :topic_threshold :any}
+   :pdf_options {:extract_images :bool
+                 :extract_tables :bool
+                 :extract_metadata :bool
+                 :extract_annotations :bool
+                 :reading_order :bool
+                 :hierarchy :any
+                 :passwords :any
+                 :top_margin_fraction :any
+                 :bottom_margin_fraction :any
+                 :allow_single_column_tables :bool
+                 :ocr_inline_images :bool
+                 :extract_form_fields :bool}
+   :images {:extract_images :bool
+            :target_dpi :int
+            :max_image_dimension :int
+            :inject_placeholders :bool
+            :auto_adjust_dpi :bool
+            :min_dpi :int
+            :max_dpi :int
+            :max_images_per_page :any
+            :classify :bool
+            :include_page_rasters :bool
+            :run_ocr_on_images :bool
+            :ocr_text_only :bool
+            :append_ocr_text :bool
+            :output_format :any
+            :svg :any
+            :include_data_base64 :bool}
+   :security_limits {:max_archive_size :int
+                     :max_compression_ratio :int
+                     :max_files_in_archive :int
+                     :max_nesting_depth :int
+                     :max_entity_length :int
+                     :max_content_size :int
+                     :max_iterations :int
+                     :max_xml_depth :int
+                     :max_table_cells :int}
+   })
+
+; Features that reach a network or a model provider. Refused unless the caller
+; passes `:allow-egress? true`: the product's default is local-only, and a
+; config map is not an authorisation (docs/21 §5, synthesis §7.9).
+(def EGRESS-KEYS
+  #{:summarization :translation :structured_extraction :page_classification
+    :chunk_classification :captioning :redaction :keywords :token_reduction
+    :url :email :postprocessor :content_filter :html_options :html_output
+    :transcription :tree_sitter :qr_codes
+    ;; any NER config at all: the local `:onnx` path is fine, but the section is
+    ;; not in our schema (its `backend` is another unverifiable enum), so the
+    ;; conservative reading is "a caller asking for NER is asking for more than
+    ;; this boundary has verified".
+    :ner})
+
+(def EGRESS-SUBKEYS
+  [[:ocr :vlm_config] [:ocr :vlm_prompt]])
+
+(defn- present? [m k]
+  (and (map? m) (contains? m k) (some? (get m k))))
+
+;; An EXPLICIT `:ocr :pipeline` OVERRIDES `vlm_fallback` (the engine documents
+; it), so a remote stage there is invisible to the checks above. A stage that
+; names the `vlm` backend — or carries a provider config — is egress, and BOTH
+; wire shapes the engine accepts must be classified: the `OcrPipelineConfig`
+; map `{:stages [...]}` and a bare `[...]` stage list. The stage keys are
+; pinned here rather than typed `:any`: a stage key this boundary does not
+; understand fails closed instead of reaching the engine unexamined.
+(def PIPELINE-STAGE-KEYS
+  #{:backend :priority :language :tesseract_config :paddle_ocr_config
+    :vlm_config :backend_options})
+
+(defn- indexed
+  "`[[0 x0] [1 x1] …]` — the element beside its position, so a path can name
+   exactly which stage it means."
+  [xs]
+  (loop [cs (to-list xs), i 0, out []]
+    (if (empty? cs)
+      out
+      (recur (rest cs) (+ i 1) (conj out [i (first cs)])))))
+
+(defn- pipeline-stages
+  "The stage list of an `:ocr :pipeline`, in either wire shape the engine
+   accepts: the map `{:stages [...]}` or a bare list of stages."
+  [p]
+  (cond
+    (or (list? p) (vector? p)) (to-list p)
+    (map? p) (let [s (or (get p :stages) (get p "stages"))]
+               (if (or (list? s) (vector? s)) (to-list s) []))
+    :else []))
+
+(defn- stage-egress-paths
+  "The provider paths of an OCR pipeline's stages, each named by index. Empty
+   when every stage stays local."
+  [p]
+  (into []
+        (mapcat
+          (fn [pair]
+            (let [i (get pair 0)
+                  st (get pair 1)
+                  at (str "ocr.pipeline[" i "]")]
+              (if-not (map? st)
+                []
+                (let [remote? (erlang/== "vlm" (kw-name (or (get st :backend) "")))
+                      cfg? (or (present? st :vlm_config) (present? st :vlm_prompt))]
+                  (cond
+                    (and remote? cfg?)
+                    (list (str at ".backend=vlm") (str at ".vlm_config"))
+                    remote? (list (str at ".backend=vlm"))
+                    cfg? (list (str at ".vlm_config"))
+                    :else [])))))
+          (indexed (pipeline-stages p)))))
+
+(defn egress-paths
+  "The paths in `cfg` that would send text to a provider. Empty means the call
+   stays local."
+  [cfg]
+  (let [tops (into [] (filter (fn [k] (present? cfg k)) (sort-by kw-name (to-list EGRESS-KEYS))))
+        subs (into [] (filter (fn [p] (present? (get cfg (get p 0)) (get p 1))) EGRESS-SUBKEYS))
+        ocr (get cfg :ocr)
+        pipe (if (map? ocr)
+               (stage-egress-paths (or (get ocr :pipeline) (get ocr "pipeline")))
+               [])
+        vlm (= "vlm" (kw-name (or (get-in cfg [:ocr :backend]) "")))
+        vlm-fb (present? ocr :vlm_fallback)
+        vlm-fb-on (and vlm-fb
+                       (not= "disabled" (kw-name (get-in cfg [:ocr :vlm_fallback :mode]))))]
+    (into []
+          (concat (map kw-name tops)
+                  (map (fn [p] (str (kw-name (get p 0)) "." (kw-name (get p 1)))) subs)
+                  pipe
+                  (if vlm (list "ocr.backend=vlm") (list))
+                  (if vlm-fb-on (list "ocr.vlm_fallback") (list))))))
+
+(defn- enum-value-ok? [enum v]
+  (contains? (get ENUMS enum) (kw-name v)))
+
+(defn- type-ok? [t v]
+  (cond
+    (= t :any) true
+    (= t :bool) (or (erlang/== true v) (erlang/== false v))
+    (= t :int) (and (number? v) (erlang/== v (erlang/trunc v)))
+    (= t :number) (number? v)
+    (= t :string) (string? v)
+    (= t [:string]) (and (sequential? v)
+                         (every? (fn [x] (string? x)) (to-list v)))
+    (= t :enum-output_format) (enum-value-ok? :output_format v)
+    (= t :enum-result_format) (enum-value-ok? :result_format v)
+    (= t :enum-chunker_type) (enum-value-ok? :chunker_type v)
+    (= t :enum-table_chunking) (enum-value-ok? :table_chunking v)
+    (= t :vlm-policy) (and (map? v)
+                           (contains? VLM_MODES (kw-name (get v :mode))))
+    (= t :enum-ocr_element_level) (enum-value-ok? :ocr_element_level v)
+    :else false))
+
+(defn- validate-stage
+  "One OCR pipeline stage, against the pinned key set — an unknown stage key is
+   the same silent-wrong-today hazard as an unknown top-level key (1.0.14
+   ignores it, 1.1.0 rejects it), so it fails closed here."
+  [path st]
+  (cond
+    (not (map? st)) {:path path :message "expected an OCR pipeline stage object"}
+    :else
+    (let [bad (first (into [] (filter (fn [k] (not (contains? PIPELINE-STAGE-KEYS k)))
+                                      (sort-by kw-name (keys st)))))]
+      (cond
+        (some? bad)
+        {:path (str path "." (kw-name bad))
+         :message (str "unknown OCR pipeline stage key; allowed: "
+                       (join ", " (sort (map kw-name PIPELINE-STAGE-KEYS))))}
+
+        (not (or (nil? (get st :backend)) (string? (get st :backend))))
+        {:path (str path ".backend") :message "expected :string"}
+
+        (not (or (nil? (get st :priority))
+                 (and (number? (get st :priority))
+                      (erlang/== (get st :priority) (erlang/trunc (get st :priority))))))
+        {:path (str path ".priority") :message "expected :int"}
+
+        (not (or (nil? (get st :language))
+                 (and (sequential? (get st :language))
+                      (every? (fn [x] (string? x)) (to-list (get st :language))))))
+        {:path (str path ".language") :message "expected [:string]"}
+
+        :else nil))))
+
+(defn- validate-pipeline
+  "`:ocr :pipeline` in either accepted shape: a stage list, or the
+   `OcrPipelineConfig` map whose only keys are `:stages` and
+   `:quality_thresholds`."
+  [path p]
+  (cond
+    (or (list? p) (vector? p))
+    (first (remove nil?
+                   (map (fn [pair] (validate-stage (str path "[" (get pair 0) "]") (get pair 1)))
+                        (indexed (to-list p)))))
+
+    (map? p)
+    (let [unknown (first (into [] (filter (fn [k] (not (contains? #{:stages :quality_thresholds} k)))
+                                          (sort-by kw-name (keys p)))))]
+      (cond
+        (some? unknown)
+        {:path (str path "." (kw-name unknown))
+         :message "unknown OCR pipeline key; allowed: stages, quality_thresholds"}
+
+        (nil? (get p :stages))
+        nil
+
+        (not (or (list? (get p :stages)) (vector? (get p :stages))))
+        {:path (str path ".stages") :message "expected a list of pipeline stages"}
+
+        :else
+        (first (remove nil?
+                       (map (fn [pair]
+                              (validate-stage (str path ".stages[" (get pair 0) "]") (get pair 1)))
+                            (indexed (to-list (get p :stages))))))))
+
+    :else
+    {:path path :message "expected an OCR pipeline object or a list of stages"}))
+
+(defn- validate-section [path spec cfg]
+  (reduce
+    (fn [err k]
+      (if (some? err)
+        err
+        (let [s (get spec k)
+              v (get cfg k)
+              p (str path "." (kw-name k))]
+          (cond
+            ;; an unknown key INSIDE a section is the same silent-wrong-today
+            ;; hazard as an unknown top-level key (1.0.14 ignores it, 1.1.0
+            ;; rejects it), so it is rejected here too
+            (nil? s) {:path p
+                      :message (str "unknown key; allowed: "
+                                    (join ", " (sort (map kw-name (keys spec)))))}
+            (nil? v) nil
+            (erlang/== s :pipeline) (validate-pipeline p v)
+            (map? s) (if-not (map? v)
+                       {:path p :message "expected an object"}
+                       (validate-section p s v))
+            :else (if (type-ok? s v)
+                    nil
+                    {:path p :message (str "expected " s)})))))
+    nil
+    (sort-by kw-name (keys cfg))))
+
+(defn validate-config
+  "Validate `cfg` against the pinned schema. Returns `{:ok cfg}` or
+   `{:error {:path p :message m}}`. Unknown keys are the point of the function:
+   the engine ignores them silently today and rejects them after 1.1.0."
+  [cfg]
+  (let [c (or cfg {})]
+    (if-not (map? c)
+      {:error {:path "" :message "config must be a map"}}
+      (let [allowed (into #{} (concat (keys TOP-SCALARS) (keys SECTIONS)))
+            unknown (first (into [] (filter (fn [k] (not (contains? allowed k)))
+                                            (sort-by kw-name (keys c)))))]
+        (cond
+          (some? unknown)
+          {:error {:path (kw-name unknown)
+                   :message (str "unknown config key; allowed: "
+                                 (join ", " (sort (map kw-name (keys TOP-SCALARS))))
+                                 ", " (join ", " (sort (map kw-name (keys SECTIONS))))) }}
+
+          :else
+          (let [scalar-err
+                (reduce (fn [err k]
+                          (if (or (some? err) (not (contains? TOP-SCALARS k)))
+                            err
+                            (let [v (get c k)]
+                              (if (or (nil? v) (type-ok? (get TOP-SCALARS k) v))
+                                nil
+                                {:path (kw-name k)
+                                 :message (str "expected " (get TOP-SCALARS k))}))))
+                        nil (sort-by kw-name (keys c)))
+                sect-err
+                (reduce (fn [err s]
+                          (if (or (some? err) (not (contains? SECTIONS s)))
+                            err
+                            (let [v (get c s)]
+                              (if (nil? v) nil (validate-section (kw-name s) (get SECTIONS s) v)))))
+                        nil (sort-by kw-name (keys c)))]
+            (cond
+              (some? scalar-err) {:error scalar-err}
+              (some? sect-err) {:error sect-err}
+              :else {:ok c})))))))
+
+;; ── canonical form + hash ───────────────────────────────────────────────────
+;
+; Built by hand rather than by a JSON encoder because map iteration order is not
+; a contract, and `bl.json`'s own header says byte-identity of float spelling is
+; not guaranteed. The hash must be stable across runs and processes.
+
+; ── canonical form: typed, length-prefixed, injective ───────────────────────
+;
+; `path=value` lines joined by newlines were NOT injective: a string value
+; containing a newline aliases a sibling path, so
+;   {:cache_namespace "a\npages.extract_pages=true"}
+; and
+;   {:cache_namespace "a" :pages {:extract_pages true}}
+; canonicalised to the same text and hashed equal — a config change that did
+; not move the artifact id, exactly the silent-reuse class this reader exists
+; to prevent. Every path SEGMENT and every leaf TERM is therefore typed and
+; length-prefixed (so no value can forge a path or a sibling leaf), and each
+; whole record is length-prefixed too, so a newline inside a string cannot end
+; a line early.
+
+(defn- lp
+  "Length-prefix a byte string: `<byte length>:<s>`."
+  [s]
+  (str (bsize s) ":" s))
+
+(defn- enc-term
+  "A typed, injective encoding of a leaf term. Maps are expanded into path
+   lines by `canonical-lines`; every other term — including a map or a vector
+   nested INSIDE a vector — is encoded here."
+  [v]
+  (cond
+    (nil? v) "z:"
+    (erlang/== true v) "b:1"
+    (erlang/== false v) "b:0"
+    (string? v) (str "s:" (lp v))
+    (number? v) (str "n:" (str v))
+    (keyword? v) (str "k:" (lp (name v)))
+    (map? v) (str "m:"
+                  (join ";"
+                        (map (fn [k] (str (enc-term (kw-name k)) "=>" (enc-term (get v k))))
+                             (sort-by kw-name (keys v)))))
+    (or (list? v) (vector? v)) (str "v:" (join ";" (map enc-term (to-list v))))
+    (set? v) (str "t:" (join ";" (sort (map enc-term (to-list v)))))
+    :else (str "o:" (lp (str v)))))
+
+(defn- canonical-lines [segs v]
+  (if (map? v)
+    (mapcat (fn [k] (canonical-lines (conj segs (kw-name k)) (get v k)))
+            (sort-by kw-name (keys v)))
+    (list (str (join "." (map lp segs)) "=" (enc-term v)))))
+
+(defn canonical
+  "Deterministic text for a config: one typed, length-prefixed record per leaf,
+   sorted by path, each record itself length-prefixed. Equal configs hash equal
+   regardless of authoring order; unequal configs cannot collide."
+  [cfg]
+  (join "" (map lp (canonical-lines [] (or cfg {})))))
+
+(defn- sha256-hex [b]
+  (String/downcase (Base/encode16 (crypto/hash :sha256 b))))
+
+(defn sha256
+  "`\"sha256:<hex>\"` for a binary — the ONE spelling of a digest the reader and
+   the boundary share."
+  [b]
+  (sha-hex b))
+
+(defn config-hash
+  "The canonical config's digest — the reader-config half of an artifact id."
+  [cfg]
+  (sha256 (canonical cfg)))
+
+;; ═══ capabilities ══════════════════════════════════════════════════════════
+
+(defn- ok-list [r]
+  (if (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+    (into [] (to-list (erlang/element 2 r)))
+    []))
+
+(defn- format-rows []
+  (into []
+        (map (fn [f] {:extension (field f :extension) :mime (field f :mime_type)}) (to-list (Xberg/list_supported_formats)))))
+
+(defn- ocr-readiness
+  "The half of OCR readiness the deployment's ASSETS decide: which language data
+   the CONFIGURED tessdata directory holds, and so whether tesseract is usable at
+   all. `tesseract --list-langs` is a shell probe needing no NIF, so the SAME
+   answer is available to a parent whose engine runs in another process — which
+   is what keeps a worker handshake's language answer honest and config-aware."
+  [tessdata]
+  (let [langs (tesseract-languages tessdata)]
+    (if (some? (get langs :ok))
+      {:ready (list "tesseract")
+       :tesseract {:state :ready :languages (get langs :ok)}}
+      {:ready (list)
+       :tesseract {:state :unavailable :reason (get langs :error)}})))
+
+(defn- probe-capabilities
+  "Probe this deployment's readiness IN THIS VM. `tessdata` is the directory the
+   extraction config points the engine at: the probe must ask THAT directory, not
+   the host default, or a shipped language pack is reported missing and the host
+   default can be mistaken for the configured one.
+
+   `:engine` is the full engine identity beside the version string, and
+   `:source` names the authority that answered — `:in-process` here, `:worker`
+   over a handshake, `:unresolved` when nobody could name the bytes. A caller
+   that has to mint identity from the answer must not reconstruct the engine from
+   a version string."
+  [tessdata]
+  (let [ocr (ocr-readiness tessdata)]
+    {:xberg/version (get (engine-id) :xberg)
+     :engine (engine-id)
+     :source :in-process
+     :available? true
+     :formats (format-rows)
+     :renderers (ok-list (Xberg/list_renderers))
+     :document-extractors (ok-list (Xberg/list_document_extractors))
+     :ocr (assoc ocr :registered (ok-list (Xberg/list_ocr_backends)))
+     :ner {:onnx :ready :llm :needs-egress}
+     :layout {:available? false :reason :no-regions-produced-at-1.0.14}
+     :formats-verified []}))
+
+(defn capabilities
+  "What this deployment can ACTUALLY do, and on whose authority. Never raises;
+   absence is a value, not an exception.
+
+   THREE ANSWERS, never a guess:
+     • the engine registries projected, when the binding is callable HERE
+       (`:source :in-process`);
+     • otherwise the configured OS worker's PROVEN handshake (`:source :worker`)
+       — the worker loads its own pinned carrier and answers from its engine
+       registry;
+     • otherwise `{:error {:xberg :absent} reason}`, naming what is missing.
+   A hand-rolled format list is what this gate exists to refuse: a count nobody
+   measured is not an admission policy.
+
+   `opts` may carry `:config`, the extraction config: its
+   `[:ocr :tessdata_path]` is the directory the tesseract probe asks, so
+   readiness follows the CONFIGURED assets rather than the host default — for the
+   worker path too (the language half of a handshake is re-derived locally).
+
+   `:ok :engine` is the engine identity this deployment READS WITH, and
+   `:source` names the authority (`:in-process` | `:worker`) — the SAME fact
+   `librarium.reader` mints artifact ids from, reported here rather than asked
+   for separately, so a reader needs ONE boundary call to know what it will read
+   with. A boundary that predates that field omits it, and the reader falls back
+   to this VM's own identity instead of failing to load.
+
+   Cached for a minute so a per-file loop does not shell out per file, KEYED by
+   the probed tessdata directory; `{:refresh true}` bypasses it. The WORKER
+   handshake is cached more strongly (see `worker-capabilities`): a carrier a
+   deployment pinned does not become a different carrier between two calls."
+  ([] (capabilities {}))
+  ([opts]
+   (let [c (get opts :config)
+         tessdata (get-in (or c {}) [:ocr :tessdata_path])
+         now (erlang/apply :erlang :monotonic_time (list :millisecond))
+         hit (erlang/apply :persistent_term :get (list :document-xberg-caps nil))]
+     (if (and (not (get opts :refresh false))
+              (some? hit)
+              (erlang/== (get hit :tessdata nil) tessdata)
+              (< (- now (get hit :at 0)) 60000))
+       (get hit :value)
+         (let [v (cond
+                   (available?)
+                   (try {:ok (probe-capabilities tessdata)}
+                        (catch _ {:error (merge {:xberg :call} {:message "capability probe failed"})}))
+
+                   ;; The parent has no binding of its own, but the DEPLOYMENT
+                   ;; reads through an OS worker. The worker's own registry is
+                   ;; then the only authority — and it is ASKED, not assumed.
+                   (worker-configured?)
+                   (let [r (worker-capabilities (default-worker))]
+                     (if (contains? r :ok)
+                       {:ok (with-local-ocr (get r :ok) tessdata)}
+                       r))
+
+                   :else
+                   {:error (merge {:xberg :absent}
+                                  {:message (str "no capability authority in this VM: the Xberg binding is not"
+                                                 " callable (set LIBRARIUM_XBERG=1 and put the carrier on the code"
+                                                 " path or in ERL_LIBS), and no OS worker is configured: "
+                                                 (worker-absence))})})]
+         (erlang/apply :persistent_term :put (list :document-xberg-caps {:at now :value v :tessdata tessdata}))
+         v)))))
+
+(defn language-capability
+  "Per-language OCR readiness for `langs` (the pinned profile by default), as
+   `{:required [...] :missing [...] :ready [...]}`. A capability flag is not an
+   accuracy gate: this says which languages are INSTALLED, nothing about how
+   well they read. `opts` may carry `{:config cfg}`; the probe then follows the
+   config's OCR backend and `tessdata_path` — the assets extraction will use."
+  ([] (language-capability OCR-LANGUAGES {}))
+  ([langs] (language-capability langs {}))
+  ([langs opts]
+   (let [c (get opts :config)
+         backend (ocr-backend c)
+         tessdata (get-in (or c {}) [:ocr :tessdata_path])
+         miss (missing-languages langs backend tessdata)]
+     {:required (into [] (to-list langs))
+      :missing miss
+      :ready (into [] (remove (fn [l] (some (fn [m] (= m l)) miss)) (to-list langs)))})))
+
+;; ═══ budgets and the in-flight ceiling ═════════════════════════════════════
+
+(def DEFAULTS
+  {:timeout-ms 180000
+   :max-input-bytes 67108864      ; 64 MiB — a document, not a corpus
+   :max-output-bytes 67108864     ; 64 MiB — a response, refused UNREAD past it
+   :max-request-bytes 8388608      ; 8 MiB — the config the worker is asked to read
+   :max-concurrent 2})
+
+(def ^:private TABLE :document_xberg_inflight)
+
+(defn- ets-table [name]
+  (if (erlang/== :undefined (erlang/apply :ets :whereis (list name)))
+    (BeamLisp.Loader.Server/run
+      (fn []
+        (try (erlang/apply :ets :new (list name (list :named_table :public :set)))
+             (catch _ :ok))
+        ; ONE object that is a tuple of rows — `ets:insert/2` takes (Tab, Object),
+        ; and a bare list of objects is an arity error, silently swallowed by the
+        ; catch above until the first counter update blew up.
+        (try (erlang/apply :ets :insert
+                           (list name (tuple (tuple :inflight 0) (tuple :timeouts 0)
+                                             (tuple :saturated 0) (tuple :native-not-stopped 0))))
+             (catch _ :ok))
+        name))
+    name))
+
+(defn- bump [t k n]
+  ; self-healing: a counter row that is missing (a table created by an older
+  ; build, a row never inserted) is created at 0 rather than raising.
+  (let [tb (ets-table t)]
+    (try
+      (erlang/apply :ets :update_counter (list tb k (tuple 2 n)))
+      (catch _
+        (try (erlang/apply :ets :insert (list tb (tuple k 0))) (catch _ :ok))
+        (try (erlang/apply :ets :update_counter (list tb k (tuple 2 n))) (catch _ 0))))))
+
+(defn- now-ms [] (erlang/apply :erlang :monotonic_time (list :millisecond)))
+
+(defn inflight
+  "How many extractions this VM has admitted right now."
+  []
+  (try (bump TABLE :inflight 0) (catch _ 0)))
+
+(defn stats
+  "The resource facts a caller or an operator needs: what is running, what timed
+   out, what was refused for saturation, and how many timed-out natives we could
+   NOT prove stopped."
+  []
+  {:inflight (try (bump TABLE :inflight 0) (catch _ 0))
+   :timeouts (try (bump TABLE :timeouts 0) (catch _ 0))
+   :saturated (try (bump TABLE :saturated 0) (catch _ 0))
+   :native-not-stopped (try (bump TABLE :native-not-stopped 0) (catch _ 0))})
+
+(defn- acquire!
+  "Take one of `max` in-flight permits, waiting up to `wait-ms`. Returns true or
+   false — saturation is a refusal the caller can see, never a silent unbounded
+   fan-out onto a blocking NIF."
+  [max wait-ms]
+  (let [deadline (+ (now-ms) wait-ms)]
+    (loop []
+      (if (<= (bump TABLE :inflight 1) max)
+        true
+        (do (bump TABLE :inflight -1)
+            (if (< (now-ms) deadline)
+              (do (erlang/apply :timer :sleep (list 20)) (recur))
+              (do (try (bump TABLE :saturated 1) (catch _ :ok)) false)))))))
+
+(defn- release! []
+  (try (bump TABLE :inflight -1) (catch _ :ok)))
+
+;; ═══ the call ══════════════════════════════════════════════════════════════
+
+(defn- temp-file!
+  "Materialise `bytes` at a path UNIQUE to this call. The digest prefix keeps
+   the file recognisable; the OS pid and a VM-unique integer keep two concurrent
+   extractions of IDENTICAL bytes (a duplicate batch — the normal case) from
+   sharing a path. A shared path meant one call truncated the bytes another
+   call's native was reading, and one call's cleanup unlinked the other's input."
+  [bytes suffix]
+  (let [p (str (System/tmp_dir!) "/xberg-"
+               (subs (sha256-hex bytes) 0 12) "-"
+               (erlang/list_to_binary (erlang/apply :os :getpid (list))) "-"
+               (erlang/apply :erlang :unique_integer (list (list :positive)))
+               suffix)]
+    (File/write! p bytes)
+    p))
+
+(defn- extension-of [filename]
+  (let [e (Path/extname (or filename ""))]
+    (if (= "" e) ".bin" e)))
+
+(defn- in-process-call
+  "Call the pinned binding IN this VM, in a process that is NOT linked to the
+   caller.
+
+   That process OWNS the permit and the input: they are handed back only when
+   the native ACTUALLY returns (a `finally` after the call), so a BEAM-side
+   timeout — or the caller's own death — cannot give a slot back while a
+   dirty-scheduler NIF is still running. That is why a timeout here reports
+   `:native-stopped? false` and charges the leak counter.
+
+   `fn-override` is the explicit test seam (the `:in-process-fn` option): it
+   lets the timeout contract be exercised without the 112 MB carrier. It is the
+   CALLER's own choice — never read from a request or a document — and defaults
+   to the pinned binding."
+  [input-json-str config-json-str timeout-ms fn-override cleanup-path]
+  (let [cleanup (fn []
+                  (release!)
+                  (when (some? cleanup-path)
+                    (try (File/rm! cleanup-path) (catch _ :ok))))
+        t (try
+            (Task/async (fn []
+                          (try
+                            (if (some? fn-override)
+                              (fn-override input-json-str config-json-str)
+                              (Xberg.Native/extract_async input-json-str config-json-str))
+                            (finally (cleanup)))))
+            (catch _
+              ;; the native never started, so no process owns the permit
+              (cleanup)
+              nil))]
+    (if (nil? t)
+      {:error (merge {:xberg :call} {:message "the in-process native could not be started"})}
+      (let [;; UNLINK before waiting: `Task/async` links the work to the CALLER,
+            ;; and a caller that goes away would fire a monitor on a process
+            ;; whose dirty-scheduler NIF keeps running — a monitor firing is NOT
+            ;; the native finishing.
+            unlinked (try (Process/unlink (erlang/map_get :pid t)) (catch _ :ok))
+            r (Task/yield t timeout-ms)]
+        (cond
+          (nil? r)
+          (do (try (bump TABLE :timeouts 1) (catch _ :ok))
+              (try (bump TABLE :native-not-stopped 1) (catch _ :ok))
+              {:error (merge {:xberg :timeout} {:message (str "extraction exceeded " timeout-ms " ms")
+                :native-stopped? false
+                :note "a BEAM-side timeout does not interrupt a NIF running on a dirty scheduler"})})
+
+          (erlang/== :exit (erlang/element 1 r))
+          {:error (merge {:xberg :call} {:message (str "extraction process exited: " (erlang/element 2 r))})}
+
+          :else
+          (let [res (erlang/element 2 r)]
+            (if (and (erlang/is_tuple res) (erlang/== :ok (erlang/element 1 res)))
+              {:ok {:raw (erlang/element 2 res)}}
+              {:error (merge {:xberg :call} {:message (if (and (erlang/is_tuple res) (> (erlang/tuple_size res) 1))
+                           (str (erlang/element 2 res))
+                           "extraction failed")})})))))))
+
+; ── the OS worker ──
+;
+; A separate process is the only isolation that can actually STOP a runaway
+; native: the worker is launched under `timeout -s KILL`, which SIGKILLs and
+; REAPS the WHOLE PROCESS GROUP — so a worker that spawned children does not
+; leave them behind either. That is why `:os_worker` may claim
+; `:native-stopped? true` and `:in_process` may not.
+
+;; ── selecting the worker (deployment, not the caller) ──
+;
+; The REAL worker is `document.xberg-worker`, run by `bl`. Selection is ENV,
+; because which native artifact a deployment pins is a deployment fact:
+;
+;   XBERG_RUNTIME      the pinned Xberg build lib dir (…/_build/prod/lib).
+;                      REQUIRED — and never taken from the request.
+;   XBERG_WORKER_CMD   the worker command (default: `bl` on PATH)
+;   XBERG_WORKER_FILE  the worker `.bl`; default: the bundled
+;                      `priv/lib/document/xberg-worker.bl`
+;
+; With `XBERG_RUNTIME` set, `extract` chooses `:os_worker` with NO caller
+; option — that is the production path. Without it, extraction stays
+; `:in_process`, and an EXPLICIT `:isolation :os_worker` gets a refusal naming
+; what is missing rather than a silent downgrade.
+
+(def RUNTIME-ENV "XBERG_RUNTIME")
+(def WORKER-CMD-ENV "XBERG_WORKER_CMD")
+(def WORKER-FILE-ENV "XBERG_WORKER_FILE")
+
+;; Set in the OS worker's environment (and by the worker itself). The worker
+;; calls the boundary IN its own process, so a default of `:os_worker` there
+;; would spawn a nested worker — recursion, until the process tree dies.
+(def WORKER-CHILD-ENV "XBERG_WORKER_CHILD")
+
+(defn- worker-child?
+  "Whether this VM IS the OS worker's own process."
+  []
+  (erlang/== "1" (System/get_env WORKER-CHILD-ENV)))
+
+(defn- priv-dir []
+  (try
+    (let [p (erlang/apply :code :priv_dir (list (erlang/binary_to_atom "beam_lisp")))]
+      (cond (string? p) p
+            (list? p) (erlang/list_to_binary p)
+            :else nil))
+    (catch _ nil)))
+
+(defn- bundled-worker-file []
+  (let [priv (priv-dir)
+        p (if (nil? priv) nil (Path/join (list priv "lib" "document" "xberg-worker.bl")))]
+    (if (and (some? p) (File/regular? p)) p nil)))
+
+(defn runtime-dir
+  "The configured Xberg carrier build lib dir (`XBERG_RUNTIME`), or nil. A dir
+   that merely exists is not enough: it must hold the engine's own ebin. A path
+   the REQUEST could influence must never choose the code that runs."
+  []
+  (let [d (System/get_env RUNTIME-ENV)]
+    (if (and (string? d) (not= "" d)
+             (File/exists? (Path/join (list d "xberg" "ebin" "Elixir.Xberg.beam"))))
+      (Path/expand d)
+      nil)))
+
+(defn- worker-cmd
+  "The command that runs the worker. `XBERG_WORKER_CMD` is the deployment's
+   answer; otherwise the launcher this VM was STARTED by (`BL_BIN` — the drop
+   sets it to the compound `bl`), and only then whatever `bl` PATH resolves to.
+   PATH is last on purpose: inside a burrito drop PATH's first `bl` is the
+   DROP'S OWN RELEASE launcher, which answers `run` with a usage error (measured),
+   not the CLI."
+  []
+  (or (System/get_env WORKER-CMD-ENV)
+      (System/get_env "BL_BIN")
+      (System/find_executable "bl")))
+
+(defn- worker-root
+  "The load ROOT the worker's own `document.xberg` lives under, or nil: the
+   worker is `<root>/document/xberg-worker.bl`, and `bl run FILE` adds the
+   FILE's directory as a root — never the namespace root."
+  [wf]
+  (let [root (Path/dirname (Path/dirname wf))]
+    (if (File/exists? (Path/join (list root "document" "xberg.bl"))) root nil)))
+
+(defn default-worker
+  "The worker spec a deployment runs, or nil when it cannot be assembled:
+
+     {:cmd \"bl\" :args [\"-p\" … \"run\" \"…/document/xberg-worker.bl\" \"--\"]}
+
+   `:args` ends with `--`, so the request path the boundary appends arrives as
+   the program's own argv. `-p <root>` is added when the worker's sibling
+   `document/xberg.bl` is there: `bl run FILE` makes the FILE's dir a load root,
+   not the namespace root, so a checkout — where the worker is not yet shipped
+   in a drop — still resolves `document.xberg`. nil is a real answer — no
+   runtime, no command, or no worker file — and `extract` refuses rather than
+   pretends."
+  []
+  (let [rt (runtime-dir)
+        cmd (worker-cmd)
+        wf (or (System/get_env WORKER-FILE-ENV) (bundled-worker-file))
+        root (if (some? wf) (worker-root wf) nil)]
+    (if (and (some? rt) (some? cmd) (some? wf) (File/regular? wf))
+      {:cmd cmd
+       :args (into [] (concat (if (some? root) ["-p" root] []) ["run" wf "--"]))}
+      nil)))
+
+(defn worker-configured?
+  "Whether this deployment can run the OS worker at all — the ONE question
+   `extract` asks to choose a default isolation."
+  []
+  (some? (default-worker)))
+
+(defn worker-absence
+  "Why there is no worker, as text a deployment can act on."
+  []
+  (let [rt (runtime-dir)
+        cmd (worker-cmd)
+        wf (or (System/get_env WORKER-FILE-ENV) (bundled-worker-file))]
+    (cond
+      (nil? rt) (str RUNTIME-ENV " is unset or is not an Xberg carrier"
+                     " (…/_build/prod/lib holding xberg/ebin)")
+      (nil? cmd) (str "no worker command: set " WORKER-CMD-ENV " or put `bl` on PATH")
+      (nil? wf) (str "no worker file: set " WORKER-FILE-ENV)
+      (not (File/regular? wf)) (str WORKER-FILE-ENV " does not name a file: " wf)
+      :else "the worker environment is incomplete")))
+
+(defn- temp-out-path []
+  (str (System/tmp_dir!) "/xberg-worker-"
+       (erlang/apply :erlang :unique_integer (list (list :positive)))
+       ".out"))
+
+(defn- worker-request
+  "The request the worker reads, as a MAP (`os-worker-call` encodes and writes
+   it, and refuses it on the request budget before it is written). It names the
+   DOCUMENT and the CONFIG only — never a runtime, never a native path: the
+   worker resolves those from its own environment."
+  [path opts]
+  (merge {:kind "uri" :uri (str "file://" path) :config (or (get opts :config) {})}
+         (let [want (into [] (to-list (or (get opts :require-languages) [])))]
+           (if (seq want) {:languages want} {}))
+         (if (get opts :allow-degraded? false) {:allow-degraded? true} {})))
+
+(defn- read-bounded
+  "Read a response file that is at most `max` bytes, or `{:error …}` when it is
+   larger — WITHOUT reading it. The point of a cap is not to allocate past it,
+   so the SIZE is asked first and the bytes second."
+  [path max]
+  (let [st (try (File/stat! path) (catch _ nil))]
+    (cond
+      (nil? st) {:error {:xberg :worker :message "the worker wrote no response file"}}
+      (> (get st :size 0) max) {:error {:xberg :budget
+                                        :message (str "worker response " (get st :size 0)
+                                                      " bytes exceeds the " max
+                                                      " byte output budget")}}
+      :else {:ok (File/read! path)})))
+
+(defn- os-worker-call
+  "Run the worker as a SEPARATE OS PROCESS with a real, provable stop.
+
+   A BEAM-side timeout on a NIF (or on a `System.cmd`) does not kill anything;
+   it only stops waiting. So the worker is launched under `timeout -s KILL`,
+   which SIGKILLs and REAPS the process group at the deadline — the only reason
+   this function is allowed to say `:native-stopped? true`. When no such wrapper
+   is present it REFUSES rather than report a stop it cannot prove.
+
+   The response does not land in the BEAM heap unbounded: stdout is streamed
+   `:into` a temp file, and the file is refused on its SIZE before it is read.
+   The temp file is removed on every exit path.
+
+   Worker contract: read the request JSON file named as the last argument, write
+   the response JSON to stdout. A response may be the engine's raw answer
+   (bare), the `{:raw :engine}` envelope the shipped worker sends, the
+   `{:caps …}` capability HANDSHAKE, or `{:__worker_error__ …}` for a refusal —
+   the parent reads all four, so a canned fixture and the real worker speak one
+   protocol.
+
+   `request` is the request MAP, not a path: this function writes it to its own
+   temp file (and refuses it on SIZE before writing), so the two callers — a
+   document read and a capability handshake — cannot drift into two protocols."
+  [worker request timeout-ms budget]
+  (let [cmd (get worker :cmd)
+        extra (into [] (to-list (get worker :args [])))
+        wrapper "/usr/bin/timeout"
+        secs (let [q (erlang/div (+ timeout-ms 999) 1000)] (if (> q 1) q 1))
+        max-out (get budget :max-output-bytes)
+        max-req (get budget :max-request-bytes)
+        body (json/encode request)
+        out (temp-out-path)
+        rt (runtime-dir)]
+    (cond
+      (nil? cmd)
+      {:error (merge {:xberg :worker} {:message "no :cmd in the worker spec"})}
+
+      (not= true (File/exists? wrapper))
+      {:error (merge {:xberg :worker}
+                     {:message (str "no hard-kill wrapper at " wrapper
+                                    "; refusing :os_worker rather than claim a stop"
+                                    " that cannot be proven")
+                      :native-stopped? false})}
+
+      (> (bsize body) max-req)
+      {:error (merge {:xberg :budget}
+                     {:message (str "worker request " (bsize body)
+                                    " bytes exceeds the " max-req " byte request budget")})}
+
+      :else
+      (let [reqf (temp-file! body ".json")
+            argv (into [] (concat [wrapper "-s" "KILL" (str secs) cmd] extra (list reqf)))
+            ;; BL_DAEMON=off is not decoration: a warm `bl` daemon answers in ITS
+            ;; OWN process, so `timeout` would kill a client that already
+            ;; returned while the native read kept running where nothing can
+            ;; stop it. XBERG_RUNTIME is the ONE carrier the worker may load.
+            env (into [] (concat [(tuple "BL_DAEMON" "off")]
+                                 (if (some? rt) [(tuple RUNTIME-ENV rt)] [])
+                                 [(tuple WORKER-CHILD-ENV "1")]))
+            r (try
+                (System/cmd (first argv)
+                            (to-list (into [] (rest argv)))
+                            (to-list [(tuple :env (to-list env))
+                                      (tuple :into (File/stream! out (list :write)))]))
+                (catch e {:crashed true
+                          :message (try (get e :message) (catch _ "unknown"))}))]
+        (try
+          (cond
+            (contains? r :crashed)
+            {:error (merge {:xberg :worker} {:message (str "worker could not start: " (get r :message))})}
+
+            ;; timeout(1): 124 = its own deadline, 137 = the SIGKILL it sent
+            (some (fn [c] (= c (erlang/element 2 r))) (list 124 137))
+            (do (try (bump TABLE :timeouts 1) (catch _ :ok))
+                {:error (merge {:xberg :timeout}
+                               {:message (str "os worker exceeded " secs
+                                              "s and was SIGKILLed by " wrapper)
+                                :native-stopped? true
+                                :isolation :os_worker})})
+
+            :else
+            (let [got (read-bounded out max-out)]
+              (cond
+                (contains? got :error)
+                {:error (merge {:xberg :worker} (get got :error))}
+
+                (= 0 (bsize (String/trim (get got :ok))))
+                {:error (merge {:xberg :worker}
+                               {:message (str "worker exited " (erlang/element 2 r)
+                                              " with no response")})}
+
+                :else
+                (let [m (json/decode (get got :ok) {:keys :keyword})]
+                  (cond
+                    (contains? m :__worker_error__)
+                    {:error (merge {:xberg :worker} (get m :__worker_error__))}
+
+                    (and (contains? m :raw) (contains? m :engine))
+                    {:ok {:raw (get m :raw) :engine (get m :engine)}}
+
+                    (contains? m :caps)
+                    {:ok {:caps (get m :caps)}}
+
+                    :else
+                    {:ok {:raw m}})))))
+          (finally (try (File/rm! out) (catch _ :ok))
+                   (try (File/rm! reqf) (catch _ :ok))))))))
+
+;; ═══ input shape ═══════════════════════════════════════════════════════════
+
+(defn- normalize-input
+  "`{:bytes b :filename f}` or `{:path p}` — a LOCAL document. A remote URI is
+   refused here, unconditionally: an SSRF/crawl surface with no product need.
+   → `{:ok {:path p | :pending-bytes b, :filename f, :bytes n, :sha hex,
+   :temp? b}}` or `{:error …}`. A `:bytes` input is CARRIED, not written: the
+   temp file appears only once a permit is held (`call-with`)."
+  [input max-bytes]
+  (cond
+    (not (map? input))
+    {:error (merge {:xberg :config} {:message "input must be a map"})}
+
+    (some? (get input :uri))
+    {:error (merge {:xberg :egress} {:message "remote URI inputs are refused; pass :bytes or :path"})}
+
+    (some? (get input :bytes))
+    (let [b (get input :bytes)
+          f (get input :filename "document.bin")]
+      (cond
+        (not (string? b)) {:error (merge {:xberg :budget} {:message ":bytes must be a binary"})}
+        (> (bsize b) max-bytes)
+        {:error (merge {:xberg :budget} {:message (str "input " (bsize b) " bytes exceeds the " max-bytes " byte budget")})}
+        :else
+        ;; The bytes are CARRIED, not written: the temp file is materialised
+        ;; only once a permit is held (see `call-with`), so a saturated call
+        ;; writes nothing and no call can unlink a file another call is
+        ;; reading. Identical bytes therefore never share a path.
+        {:ok {:pending-bytes b :pending-suffix (extension-of f)
+              :filename f :bytes (bsize b) :sha (sha256 b) :temp? true}}))
+
+    (and (some? (get input :path)) (String/contains? (str (get input :path)) "://"))
+    {:error (merge {:xberg :egress}
+                   {:message "remote paths are refused; pass :bytes or a local :path"})}
+
+    (some? (get input :path))
+    (let [p (Path/expand (get input :path))]
+      (if (= true (File/exists? p))
+        (let [b (File/read! p)]
+          (if (> (bsize b) max-bytes)
+            {:error (merge {:xberg :budget} {:message (str "input " (bsize b) " bytes exceeds the " max-bytes " byte budget")})}
+            {:ok {:path p :filename (or (get input :filename) (Path/basename p))
+                  :bytes (bsize b) :sha (sha256 b) :temp? false}}))
+        {:error (merge {:xberg :budget} {:message (str "no such file: " p)})}))
+
+    :else
+    {:error (merge {:xberg :config} {:message "input must carry :bytes, :path or :uri"})}))
+
+;; ═══ extraction ════════════════════════════════════════════════════════════
+
+(defn- settle-call
+  "The one result shape a bounded call returns, whichever transport ran."
+  [ni cfg started isolation r]
+  (if (contains? r :ok)
+    (let [ok (get r :ok)
+          os? (erlang/== :os_worker isolation)]
+      {:ok {:raw (get ok :raw)
+            :transport (if os? :json :native)
+            ;; THE IDENTITY OF THE ENGINE THAT READ. In-process that is this
+            ;; VM's own binding. Through an OS worker it is the WORKER's answer
+            ;; and nothing else: the parent VM may have no NIF at all, so its
+            ;; own `engine-id` reports `:unresolved` — borrowing that for a
+            ;; worker response would mint an artifact id from a fingerprint that
+            ;; never read the document, and two worker builds would collide.
+            ;; A worker that names no engine leaves it nil; the reader decides
+            ;; what an unnamed engine means.
+            :engine (if os? (get ok :engine) (or (get ok :engine) (engine-id)))
+            :isolation isolation
+            :config cfg
+            :config-hash (config-hash cfg)
+            :input {:filename (get ni :filename) :bytes (get ni :bytes)
+                    :sha (get ni :sha) :temp? (get ni :temp?)}
+            :duration-ms (- (now-ms) started)}})
+    {:error (get r :error)}))
+
+(defn- os-worker-run
+  "The `:os_worker` transport. The caller releases the permit after this
+   returns, because THIS path can prove the stop (`timeout -s KILL` reaps the
+   process group)."
+  [opts budget timeout-ms worker path]
+  (if (nil? worker)
+    {:error (merge {:xberg :worker}
+                   {:message (str "no OS worker is configured: " (worker-absence))})}
+    (os-worker-call worker (worker-request path opts) timeout-ms budget)))
+
+(defn with-local-ocr
+  "The worker's capability answer with the LANGUAGE half re-derived HERE, from
+   `tessdata`: which tesseract data a deployment ships is the deployment's asset
+   fact — a shell probe needs no NIF — so the answer follows the EFFECTIVE config
+   even when the registry came over a handshake. The backend REGISTRY still comes
+   from the engine that will run; only the assets half is local."
+  [caps tessdata]
+  (if (map? caps)
+    (let [o (ocr-readiness tessdata)]
+      (assoc caps :ocr (merge (get caps :ocr)
+                              {:ready (get o :ready)
+                               :tesseract (get o :tesseract)})))
+    caps))
+
+(defn worker-capabilities
+  "Ask the CONFIGURED OS worker what it can read — the ONE *proven* fallback for
+   a deployment whose parent VM has no binding. Nothing about the carrier is
+   assumed: the worker loads its own pinned runtime and answers from the engine
+   registry. Its language answer is the WORKER's host default; the caller
+   overlays the configured assets (`with-local-ocr`), which is why the cached
+   answer here is the raw one.
+
+   Cached for the life of the VM, keyed by the worker spec: the carrier a
+   deployment pins is an environment fact, and re-proving it on every admission
+   call would buy a process spawn each time. `{:refresh true}` deliberately does
+   NOT bypass THIS cache — only a different worker spec does.
+
+   → `{:ok caps}` (with `:source :worker`) | `{:error {:xberg
+   :worker-capability …}}` — a NAMED refusal, never a guessed format list."
+  ([] (worker-capabilities (default-worker)))
+  ([worker]
+   (if (nil? worker)
+     {:error (merge {:xberg :worker-capability}
+                    {:message (str "no OS worker is configured: " (worker-absence))})}
+     (let [k [:document-xberg-worker-caps (get worker :cmd)
+              (into [] (to-list (get worker :args [])))]
+           hit (erlang/apply :persistent_term :get (list k ::none))]
+       (if-not (erlang/== hit ::none)
+         hit
+         (let [r (try
+                   (let [q (os-worker-call worker {:kind :caps} (get DEFAULTS :timeout-ms) DEFAULTS)]
+                     (cond
+                       (contains? q :error) q
+                       (map? (get (get q :ok) :caps))
+                       {:ok (assoc (get (get q :ok) :caps) :source :worker)}
+                       :else
+                       {:error (merge {:xberg :worker-capability}
+                                      {:message (str "the worker answered no capability handshake"
+                                                     " (it predates the `:kind :caps` request)")})}))
+                   (catch e {:error (merge {:xberg :worker-capability}
+                                           {:message (str "the capability handshake failed: "
+                                                          (try (get e :message) (catch _ "unknown")))})}))]
+           (erlang/apply :persistent_term :put (list k r))
+           r))))))
+
+(defn- call-with
+  "One bounded call. `ni` is a normalized input (see `normalize-input`).
+
+   WHO RELEASES THE PERMIT depends on the transport, and the difference is the
+   whole point: `:os_worker` can prove a stop, so this function releases when it
+   returns; `:in_process` cannot, so the spawned native process releases when
+   the NIF itself returns. A timeout never hands the slot back early."
+  [ni opts budget timeout-ms isolation]
+  (if-not (acquire! (get budget :max-concurrent) timeout-ms)
+    ;; Saturation refuses BEFORE anything is written: this call owns no temp
+    ;; path, so a refused call can never delete another call's input.
+    {:error (merge {:xberg :saturated} {:message "in-flight ceiling reached; retry when the reader is free"
+      :max-concurrent (get budget :max-concurrent)})}
+    (let [cfg (get opts :config)
+          started (now-ms)
+          os? (erlang/== :os_worker isolation)
+          worker (or (get opts :worker) (default-worker))
+          path (try
+                 (if (some? (get ni :pending-bytes))
+                   (temp-file! (get ni :pending-bytes) (get ni :pending-suffix))
+                   (get ni :path))
+                 (catch _ ::none))]
+      (cond
+        (erlang/== path ::none)
+        (do (release!)
+            {:error (merge {:xberg :budget}
+                           {:message "the input could not be materialised for extraction"})})
+
+        os?
+        (let [r (try
+                  (os-worker-run opts budget timeout-ms worker path)
+                  (catch e
+                    {:error (merge {:xberg :call}
+                                   {:message (str "worker transport failed: "
+                                                  (try (get e :message) (catch _ "unknown")))})}))]
+          (release!)
+          (when (get ni :temp?) (try (File/rm! path) (catch _ :ok)))
+          (settle-call ni cfg started isolation r))
+
+        :else
+        ;; IN-PROCESS: the spawned native process OWNS the permit and the input
+        ;; (see `in-process-call`), so both survive this function returning.
+        (let [r (try
+                  (in-process-call (json/encode {:kind "uri" :uri (str "file://" (Path/expand path))})
+                                   (json/encode (or cfg {}))
+                                   timeout-ms
+                                   (get opts :in-process-fn)
+                                   (when (get ni :temp?) path))
+                  (catch e
+                    (release!)
+                    (when (get ni :temp?) (try (File/rm! path) (catch _ :ok)))
+                    {:error (merge {:xberg :call}
+                                   {:message (str "native call failed: "
+                                                  (try (get e :message) (catch _ "unknown")))})}))]
+          (settle-call ni cfg started isolation r))))))
+
+(defn- run-extract [input opts]
+  (let [raw (if (some? (get opts :config)) (get opts :config) (default-config))
+        v (validate-config raw)
+        cfg (get v :ok)
+        budget (merge DEFAULTS (get opts :budget {}))
+        timeout-ms (get budget :timeout-ms)
+        ;; `:isolation` is a POLICY choice, not a number: the explicit option
+        ;; wins, then the budget map, and otherwise the DEPLOYMENT decides —
+        ;; `:os_worker` whenever a runtime + worker are configured, `:in_process`
+        ;; when they are not. That is what makes production pick the isolated
+        ;; path with no caller change. INSIDE the worker the default is ALWAYS
+        ;; `:in_process`: the worker IS the isolation.
+        isolation (or (get opts :isolation) (get budget :isolation)
+                      (if (and (not (worker-child?)) (worker-configured?))
+                        :os_worker
+                        :in_process))
+        hard? (or (get opts :hard-bound?) (get budget :hard-bound?))
+        eg (if (map? raw) (egress-paths raw) [])
+        want (into [] (to-list (or (get opts :require-languages) [])))
+        ;; the probe asks the SAME directory the engine will, for the backend
+        ;; the config actually selects: a pinned tessdata dir makes ara/fra/eng
+        ;; reachable, and a host-only probe would refuse a profile the engine
+        ;; can actually run.
+        miss (if (and (seq want) (ocr-languages-probed? cfg))
+               (missing-languages want (ocr-backend cfg) (get-in (or cfg {}) [:ocr :tessdata_path]))
+               [])]
+    (cond
+      ;; EGRESS IS ASKED FIRST. A config that reaches a provider is an
+      ;; authorisation question, and answering "unknown key" would hide the one
+      ;; thing the caller has to decide.
+      (and (seq eg) (not (get opts :allow-egress? false)))
+      {:error (merge {:xberg :egress} {:message (str "config would send text to a provider: " (join ", " eg)) :paths eg})}
+
+      (some? (get v :error))
+      {:error (merge {:xberg :config} (get v :error))}
+
+      ;; A nested OS worker is refused before anything is written: this process
+      ;; IS the worker, and `:os_worker` here would recurse.
+      (and (erlang/== :os_worker isolation) (worker-child?))
+      {:error (merge {:xberg :worker}
+                     {:message "refusing to spawn a nested OS worker: this process IS the worker"})}
+
+      ;; A caller that REQUIRES a hard bound must get one. `:in_process` cannot
+      ;; stop a dirty-scheduler NIF, so its timeout is honest but is NOT a
+      ;; bound; say so instead of silently downgrading.
+      (and hard? (erlang/== :in_process isolation))
+      {:error (merge {:xberg :worker}
+                     {:message (str "a hard bound was required but there is no OS worker: "
+                                    (worker-absence))
+                      :native-stopped? false})}
+
+      ;; The pinned profile asks for languages the installed OCR data may not
+      ;; have. Say so BEFORE the call: a scan read as the wrong language comes
+      ;; back fluent and wrong, and the engine will not notice.
+      (and (seq miss) (not (get opts :allow-degraded? false)))
+      {:error (merge {:xberg :capability} {:message (str "installed OCR data cannot read " (join ", " miss)) :missing miss})}
+
+      :else
+      (let [ni (normalize-input input (get budget :max-input-bytes))]
+        (if (contains? ni :error)
+          {:error (get ni :error)}
+          (call-with (get ni :ok) (assoc opts :config cfg) budget timeout-ms isolation))))))
+
+(defn extract
+  "Read one document. `bytes` is the exact file content, `filename` names it
+   (the extension decides the format), `opts` carries:
+
+     :config             a validated engine config (see `validate-config`);
+                         defaults to `default-config`
+     :budget             {:timeout-ms :max-input-bytes :max-output-bytes :max-concurrent}
+     :isolation          :os_worker when a runtime + worker are configured (the deployment default), else :in_process; an explicit value wins
+     :worker             {:cmd \"…\" :args [\"…\"]} — overrides `default-worker` (the env-resolved `bl run …/xberg-worker.bl`)
+     :require-languages  OCR language codes that MUST be installed (refusal);
+                         probed against the config's OCR backend and tessdata_path
+     :allow-degraded?    proceed even when `:require-languages` are missing
+     :allow-egress?      authorise provider-backed features (default false)
+     :hard-bound?        refuse unless the call is `:os_worker` (a stop that can
+                         be PROVEN); `:in_process` keeps an honest
+                         `:native-stopped? false` timeout instead
+     :in-process-fn      TEST SEAM: override the in-process native call (never
+                         read from a request or a document)
+
+   Returns `{:ok {:raw … :engine … :config-hash …}}` or
+   `{:error {:xberg kind :message …}}` — the SAME shape for a whole-call failure and
+   for a budget/config refusal."
+  ([bytes filename] (extract bytes filename {}))
+  ([bytes filename opts]
+   (run-extract {:bytes bytes :filename filename} opts)))
+
+(defn extract-path
+  "`extract` for a file already on disk (no temp materialisation)."
+  ([path] (extract-path path {}))
+  ([path opts] (run-extract {:path path} opts)))
+
+(defn extract-batch
+  "Read many inputs under one config, in windows of `:max-concurrent` so the
+   ceiling is real. Every input yields its OWN outcome; one poisoned document
+   never fails the pass — it becomes a recorded failure beside the successes,
+   matching the engine's own `errors[]` semantics.
+
+   Inputs: `[{:bytes b :filename f} …]` or `[{:path p} …]`.
+   Returns `{:ok [{:index i :ok true :result …} | {:index i :ok false :error …}]}`
+   or `{:error {:xberg :config} …}`."
+  ([inputs opts]
+   (let [v (validate-config (if (some? (get opts :config)) (get opts :config) (default-config)))
+         cfg (get v :ok)
+         budget (merge DEFAULTS (get opts :budget {}))
+         window (if (> (get budget :max-concurrent) 1) (get budget :max-concurrent) 1)]
+     (if (some? (get v :error))
+       {:error (merge {:xberg :config} (get v :error))}
+       (let [items (into [] (to-list inputs))]
+         {:ok (loop [is items, idx 0, acc []]
+                (if (empty? is)
+                  acc
+                  (let [chunk (into [] (take window is))
+                        pairs (loop [cs chunk, k 0, out []]
+                                (if (empty? cs) out
+                                    (recur (rest cs) (+ k 1) (conj out [k (first cs)]))))
+                        ts (into []
+                                 (map (fn [ci]
+                                        (let [j (get ci 0) in (get ci 1)]
+                                          (Task/async
+                                            (fn []
+                                              (let [r (if (some? (get in :path))
+                                                        (extract-path (get in :path) (assoc opts :config cfg))
+                                                        (extract (get in :bytes) (get in :filename) (assoc opts :config cfg)))]
+                                                (if (contains? r :ok)
+                                                  {:index (+ idx j) :ok true :result (get r :ok)}
+                                                  {:index (+ idx j) :ok false :error (get r :error)})))))) pairs))
+                        outs (into [] (map (fn [t] (Task/await t 600000)) ts))]
+                    (recur (drop window is) (+ idx (count chunk)) (into acc outs)))))})))))

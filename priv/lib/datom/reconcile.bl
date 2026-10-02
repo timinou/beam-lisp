@@ -1,0 +1,201 @@
+; datom/reconcile.bl — the projection EXECUTOR: owed and stale in, targets and
+; records out, bounded concurrency, honest about what failed and why.
+;
+; Design: docs/connectors/entities-and-projections.md §3.5 (laws L4–L6).
+;
+; ── The algorithm, and the process that triggers it ─────────────────────────
+;
+; The WORK — read owed, apply with bounded concurrency, record target-first —
+; does not need a process; what needs one is WHEN it runs (a tick, a watch, a
+; button). So `drain!` is the bulk executor over a conn (one pass, bounded
+; concurrency, testable without a VM process) and `priv/std/proc/reconcile.bl`
+; is the durable trigger: a `proc.queue` job per owed/stale row, retried with
+; backoff, re-judged against the current db before it acts.
+;
+; The two are ONE implementation of publication, not two. A row's execution is
+; the primitives below — `owed-row` / `stale-row` to describe the work,
+; `apply-row!` / `retire-row!` to publish it — and both the drain and the clause
+; call them. There is no second answer to "what does applying a row mean?".
+;
+; ── The contract with the consumer ──────────────────────────────────────────
+;
+;   :apply   (fn [row prev-target] → {:target t} | {:skip reason} ; or THROW)
+;            row = {:scope :src :rev :src-key :scope-key}. A THROW (or an
+;            {:error …} return) is TRANSIENT: nothing is recorded, the row stays
+;            owed and is retried on the next drain — an outage cannot suppress
+;            a revision. {:skip reason} is TERMINAL: recorded, answers this
+;            revision until it changes, keeps the previous target.
+;   :retire  (fn [row target] → any ; or THROW = retried next drain)
+;
+; L4: an INTENT record (:pending) is written before apply; the consumer's apply
+; writes the TARGET; this writes the ANSWER after it returns. A crash between
+; the two leaves the row owed (pending answers nothing) AND visible to stale if
+; the source leaves meanwhile; apply must therefore be idempotent on (src, rev)
+; — re-applying the same bytes is a no-op upsert — and retire must tolerate a
+; target it may never have written.
+;
+; ── Performance ─────────────────────────────────────────────────────────────
+;
+; Owed and stale are ONE query each per scope per drain. Applies run with
+; `:concurrency` (default 4) through Task.async_stream — network-bound work
+; (downloads) overlaps; records are written by the caller's process in one
+; transaction per BATCH of results, not one per row.
+
+(ns datom.reconcile
+  (:require [datom] [datom.projection :as pj]))
+
+(def ^:private T (erlang/binary_to_atom "Elixir.Task"))
+
+(defn source-key
+  "The identity a record is keyed by: the source entity's `:conn/key` (a
+   provider-qualified value), or nil when the entity carries none.
+
+   Public because a queued job re-reads its row against the CURRENT db and must
+   name the same source the owed/stale queries produced; a second spelling of
+   this lookup would be a second answer to one question."
+  [db e]
+  (let [ds (into [] (datom/datoms db :eavt e :conn/key))]
+    (if (empty? ds) nil (nth (first ds) 2))))
+
+(defn owed-row
+  "The row for ONE owed `[scope src rev]` triple against `db`: the identity a
+   consumer's `:apply` acts on (`:scope :src :rev :src-key :scope-key`) plus
+   `:prev`, the last good target this row's record holds (nil when there is
+   none). nil when the source carries no `:conn/key` — it vanished between the
+   query and the row."
+  [db p sk scope src rev]
+  (let [k (source-key db src)]
+    (if (nil? k)
+      nil
+      {:scope scope :src src :rev rev :src-key k :scope-key sk
+       :prev (:proj/target (pj/record p db sk k))})))
+
+(defn stale-row
+  "The row for ONE stale `[record src]` pair: the same keys, plus `:rec` (the
+   entity `retire-tx` writes) and `:prev` (the record's last target, which
+   `:retire` receives). `:rev` rides along for the caller's bookkeeping; the
+   consumer's `:retire` is handed every key but `:prev`/`:rec`."
+  [db p sk scope rec src]
+  (let [r (datom/pull db [:proj/rev :proj/target] rec)]
+    {:scope scope :src src :src-key (source-key db src) :scope-key sk
+     :rev (:proj/rev r) :prev (:proj/target r) :rec rec}))
+
+(defn apply-row!
+  "Publish ONE owed row through `apply-fn`, with the executor's exact
+   publication semantics: the INTENT record (`:pending`) is written BEFORE apply
+   (L4), apply runs, and the ANSWER (`:applied` / `:skipped`) is written after
+   it returns. A throw — or an `{:error …}` return — writes NO answer, so the
+   row stays owed and the next attempt may publish it; an outage cannot
+   suppress a revision.
+
+   → {:state :applied}
+   | {:state :skipped :reason r}
+   | {:state :error :error e}
+
+   The bulk `drain!` and the queued clause both call this, so a job and a drain
+   cannot diverge on what publication means."
+  [conn p row apply-fn]
+  (datom/transact! conn (pj/record-tx p row {:state :pending}))
+  (let [r (try (apply-fn (dissoc row :prev) (:prev row))
+               (catch e {:error (str e)}))]
+    (cond
+      (and (map? r) (contains? r :target))
+        (do (datom/transact! conn (pj/record-tx p row {:state :applied
+                                                       :target (:target r)}))
+            {:state :applied})
+      (and (map? r) (contains? r :skip))
+        (do (datom/transact! conn (pj/record-tx p row {:state :skipped
+                                                       :reason (str (:skip r))}))
+            {:state :skipped :reason (:skip r)})
+      (and (map? r) (contains? r :error))
+        {:state :error :error (:error r)}
+      :else
+        {:state :error :error (str r)})))
+
+(defn retire-row!
+  "Retire ONE stale row through `retire-fn` and record the retirement. A throw
+   means the retire did NOT happen and NOTHING is recorded, so the row stays
+   stale and is retried next pass.
+
+   → :retired | {:error e}"
+  [conn p row retire-fn]
+  (try
+    (retire-fn (dissoc row :prev :rec) (:prev row))
+    (datom/transact! conn (pj/retire-tx (:rec row)))
+    :retired
+    (catch e {:error (str e)})))
+
+(defn- run-concurrently
+  "Apply `f` to every x with at most `n` in flight; results in input order.
+   A crashed or timed-out task yields {:error …} for its row, never a crash
+   of the drain."
+  [n timeout-ms f xs]
+  (if (empty? xs) []
+    (let [st (erlang/apply T :async_stream
+                           (list (to-list xs)
+                                 (fn [x] (try (f x) (catch e {:error (str e)})))
+                                 (to-list [(tuple :max_concurrency n) (tuple :timeout timeout-ms)
+                                           (tuple :on_timeout :kill_task) (tuple :ordered true)])))]
+      (mapv (fn [r] (if (= :ok (erlang/element 1 r)) (erlang/element 2 r)
+                      {:error (str "task " (erlang/element 2 r))}))
+            (Enum/to_list st)))))
+
+(defn drain!
+  "One drain of projection `p` for `scope` over `conn`:
+     1. stale → :retire, then retire-tx (unless `:paused?` — a paused scope
+        retires NOTHING; its stale rows wait);
+     2. owed  → :apply with bounded concurrency, then record-tx per answer.
+   opts {:rules :scope-key :apply :retire :concurrency 4 :timeout-ms 300000
+         :paused? false :limit nil}. `:limit` bounds the owed rows applied in
+   one drain (the rest stay owed) so a first sync of 10 000 files progresses
+   in visible steps. → {:applied n :skipped n :failed n :retired n
+   :owed-left n :errors [{:src-key :error} …] :ms n}
+
+   A row's description and its publication both come from the primitives above,
+   so `proc.reconcile`'s queued job performs a row EXACTLY as this bulk pass
+   does — one implementation of publication, two triggers."
+  [conn p scope opts]
+  (let [t0 (erlang/monotonic_time :millisecond)
+        rules (get opts :rules [])
+        sk (:scope-key opts)
+        apply-fn (:apply opts)
+        retire-fn (:retire opts)
+        db (datom/db conn)
+        stale (if (:paused? opts) [] (into [] (pj/stale p db rules scope)))
+        retired (reduce (fn [n pair]
+                          (let [row (stale-row db p sk scope (nth pair 0) (nth pair 1))]
+                            (if (= :retired (retire-row! conn p row retire-fn))
+                              (+ n 1) n)))
+                        0 stale)
+        db (datom/db conn)
+        owed-all (into [] (sort-by (fn [r] (str (nth r 1))) (pj/owed p db rules scope)))
+        owed (if (some? (:limit opts)) (into [] (take (:limit opts) owed-all)) owed-all)
+        rows (into [] (keep (fn [t] (owed-row db p sk (nth t 0) (nth t 1) (nth t 2))) owed))
+        results (run-concurrently (get opts :concurrency 4) (get opts :timeout-ms 300000)
+                                  (fn [row] (apply-row! conn p row apply-fn)) rows)
+        pairs (into [] (map (fn [a b] [a b]) rows results))
+        answered? (fn [r] (or (= :applied (get r :state)) (= :skipped (get r :state))))
+        answers (filter (fn [pair] (answered? (nth pair 1))) pairs)
+        errors (filter (fn [pair] (not (answered? (nth pair 1)))) pairs)]
+    {:applied (count (filter (fn [pair] (= :applied (get (nth pair 1) :state))) answers))
+     :skipped (count (filter (fn [pair] (= :skipped (get (nth pair 1) :state))) answers))
+     :failed (count errors)
+     :retired retired
+     :owed-left (- (count owed-all) (count answers))
+     :errors (mapv (fn [pair] {:src-key (:src-key (nth pair 0))
+                               :error (get (nth pair 1) :error (str (nth pair 1)))})
+                   errors)
+     :ms (- (erlang/monotonic_time :millisecond) t0)}))
+
+(defn status
+  "What a console shows for (projection, scope): owed and stale counts, records
+   by state, skip reasons with counts. Queries only."
+  [db p scope rules]
+  (let [skipped (into [] (datom/q '[:find ?r ?e :in $ ?of ?scope
+                                    :where [?e :proj/of ?of] [?e :proj/scope ?scope]
+                                           [?e :proj/state :skipped] [?e :proj/reason ?r]]
+                                  db (:ident p) scope))]
+    {:owed (count (pj/owed p db rules scope))
+     :stale (count (pj/stale p db rules scope))
+     :records (pj/counts p db scope)
+     :skipped-by-reason (frequencies (map first skipped))}))

@@ -1,0 +1,100 @@
+; scripts/bench_lazy_ownership.bl — the native lazy-memo ownership and memory
+; benchmark, in beam-lisp.
+;
+; Run after building: bl run scripts/bench_lazy_ownership.bl
+; Samples measure map/count in fresh workers, not application startup.
+;
+; Two passes, both reported as plain maps so a run before and after a change
+; speaks the same fields:
+;
+;   sizing     rt/map + LazySeq/count at 1k … 32k elements, three samples each
+;              in a fresh worker; reported as elements · samples_us · median_us.
+;   ownership  20 000 freshly created cells are discarded per batch in a fresh
+;              worker; the memo is then allowed to settle and its live stats are
+;              reported with `discarded_batch`. A shared `kept` value is forced
+;              after every batch, proving reclaim does not take it with it.
+;
+; The BL VM boots with a live memo floor, so the ownership pass settles against
+; THAT floor — measured in this run — rather than the bare-VM zero.
+
+(ns bench.lazy-ownership)
+
+(BeamLisp.LazyMemo/ensure_loaded!)
+
+;; ── sizing: map/count in fresh workers ─────────────────────────────────
+
+(defn- median3 [samples]
+  "The middle of three timing samples."
+  (get (vec (sort samples)) 1))
+
+(doseq [size [1000 2000 4000 8000 32000]]
+  (let [workers (for [_ (range 3)]
+                  (Task/async
+                    (fn []
+                      (let [t0 (erlang/monotonic_time :microsecond)
+                            count (BeamLisp.LazySeq/count
+                                    (BeamLisp.Ns.Rt/map inc
+                                                        (to-list (range 1 (inc size)))))]
+                        (when (not= count size)
+                          (throw (ex-info "incorrect traversal count"
+                                          {:elements size :count count})))
+                        (- (erlang/monotonic_time :microsecond) t0)))))]
+    (let [samples (vec (map (fn [t] (Task/await t 60000)) workers))]
+      (println (assoc {:elements size :samples_us samples}
+                      :median_us (median3 samples))))))
+
+;; ── ownership: discarded cells reclaim; a shared live value survives ───
+
+; A settled batch must leave live_cells within this of the floor it started
+; from. It is far below the 20 000 cells a batch discards, so a leak cannot slip
+; through — the settle would time out instead.
+(def RECLAIM-TOLERANCE 32)
+
+(defn- await-floor []
+  "Poll the memo until no reclaim is pending and live_cells has held steady,
+   then answer that floor. Steady is three consecutive samples of the same
+   count; the sizing pass has just discarded its cells, so this waits for the
+   allocator to come to rest before the batch phase measures against it."
+  (let [deadline (+ (System/monotonic_time :millisecond) 5000)]
+    (loop [stable 0 last -1]
+      (let [stats (BeamLisp.LazyMemo/stats)
+            live (:live_cells stats)]
+        (cond
+          (and (>= stable 3) (zero? (:pending_reclaims stats))) stats
+          (>= (System/monotonic_time :millisecond) deadline)
+            (throw (ex-info "retention did not settle" {:stats stats}))
+          :else (do (Process/sleep 1)
+                    (recur (if (= live last) (inc stable) 0) live)))))))
+
+(defn- settle [floor]
+  "Poll the memo until no reclaim is pending and live_cells is back within
+   RECLAIM-TOLERANCE of `floor`, or refuse — the same refusal a batch that
+   retained its discarded cells deserves."
+  (let [deadline (+ (System/monotonic_time :millisecond) 5000)]
+    (loop []
+      (let [stats (BeamLisp.LazyMemo/stats)]
+        (cond
+          (and (zero? (:pending_reclaims stats))
+               (<= (:live_cells stats) (+ floor RECLAIM-TOLERANCE)))
+            stats
+          (>= (System/monotonic_time :millisecond) deadline)
+            (throw (ex-info "retention did not settle"
+                            {:floor floor :stats stats}))
+          :else (do (Process/sleep 1) (recur)))))))
+
+(def floor (:live_cells (await-floor)))
+(def kept (BeamLisp.LazySeq/new (fn [] :kept)))
+(BeamLisp.LazySeq/force kept)
+
+(doseq [batch [1 2 3]]
+  (let [worker (Task/async
+                 (fn []
+                   (doseq [value (range 1 20001)]
+                     (BeamLisp.LazySeq/force (BeamLisp.LazySeq/new (fn [] value))))
+                   :done))]
+    (Task/await worker 60000))
+  (println (assoc (settle floor) :discarded_batch batch))
+  (when (not= :kept (BeamLisp.LazySeq/force kept))
+    (throw (ex-info "the shared live value was lost" {}))))
+
+(println "Ownership checks passed: discarded cells reclaimed; shared live value preserved")

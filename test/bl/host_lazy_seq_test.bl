@@ -1,0 +1,837 @@
+; host_lazy_seq_test.bl — the pinned `LazySeq` type, its `Enumerable` impl, and
+; its nested `ForceError` exception.
+;
+; Four `.bl` sources under `priv/host/` replace the four halves of
+; `lib/beam_lisp/lazy_seq.ex` at their exact module atoms:
+;
+;   * `priv/host/lazy_seq.bl` → `Elixir.BeamLisp.LazySeq`, a STRUCT whose
+;     `__struct__/0,1` pair and `__info__/1` are synthesized by
+;     `compile_host_file`'s `:struct_fields` option in the live module's
+;     declaration order (`:resource`, `:metadata`), plus the recalled public
+;     defns and the versioned / fold-recipe internals.
+;   * `priv/host/lazy_seq_enumerable.bl` → `Elixir.Enumerable.BeamLisp.LazySeq`,
+;     the protocol impl, FUNCTIONS-ONLY.
+;   * `priv/host/lazy_seq_force_error.bl` → `Elixir.BeamLisp.LazySeq.ForceError`,
+;     the nested exception, a struct with `{:__exception__ :reason :message}`.
+;   * `priv/host/lazy_seq_inspect.bl` → `Elixir.Inspect.BeamLisp.LazySeq`, the
+;     `Inspect` protocol impl, FUNCTIONS-ONLY: the `(1 2 3…)` list face a human
+;     reads, which the type would otherwise lose to `Inspect.Any`.
+;
+; The live modules are never left replaced. Each source is compiled at its OWN
+; probe atom, the namespace shim beside it is dropped, and the pinned beam is
+; loaded ALONE — so a leftover shim reference would be `undef` here. The
+; `Enumerable` impl is ALSO loaded at its exact production atom (live beam saved
+; first, restored in `finally`) so `Enum`/`Stream` drive the pinned reduce.
+;
+; What each block pins:
+;   * the ABI: every live public export is answered by the pinned beam, and the
+;     struct metadata (`__info__(:struct)`) is equal datum for datum;
+;   * `new` builds a PRODUCTION-tagged node (the native memo graph recognizes
+;     only that tag), with a native resource and nil metadata; `ForceError`
+;     builds the same reason and message, and its `__info__(:struct)` matches;
+;   * realization: `cell`/`realize`/`input`/`chain`/`to_list`/`prefix`/`sample`/
+;     `count`/`nth`/`run` answer the live module's answers across the corpus,
+;     including a nested thunk, a vector, a set, a string and a `SeqCursor`;
+;   * the native memo: a forced node answers its memoized value with the thunk
+;     run ONCE, and two concurrent forcers share one attempt across processes;
+;   * the versioned cell ABI: `pending_recipe`/`pending?` answer the fold recipe
+;     and the publication version it was read at, `claim_recipe`/`release_recipe`
+;     take and hand back the SAME `:running` attempt a force takes,
+;     `publish_folded` CASes an unclaimed realise-once publication, and
+;     `memo_state` reports a running cell in the recalled 5-tuple shape;
+;   * the error paths: a failed attempt reaches every waiter with the same
+;     exception and a later explicit force retries; a recursive force and a
+;     retained cycle become terminal `:cyclic_memo`;
+;   * laziness: an infinite `raw-cons` chain realizes a bounded prefix, and the
+;     `Enumerable` impl answers `{:ok, n}`, `{:error, impl}`, and the
+;     cont/halt/suspend arms — with `Enum`/`Stream` at the exact atom;
+;   * inspect: the pinned `Inspect` impl answers the LIVE impl's `Inspect.Algebra`
+;     doc — term for term — over empty, small, truncated, infinite and nested
+;     values, and `opts.limit` positive, zero, negative and non-integer, and
+;     renders the same `(1 2 3…)` text at the EXACT atom while realizing a bounded
+;     prefix — never the infinite tail — of the same length the live impl realizes;
+;   * cold: no pinned beam makes an `Env.fetch!` call, so a fresh VM has nothing
+;     to fail on.
+;
+; Run: bin/bl test test/bl/host_lazy_seq_test.bl
+
+(ns host.lazy-seq.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_lazy_seq_" (erlang/unique_integer (list :positive))))
+
+(defn- lazy-source [] (Path/join (BeamLisp/cwd) "priv/host/lazy_seq.bl"))
+(defn- enum-source [] (Path/join (BeamLisp/cwd) "priv/host/lazy_seq_enumerable.bl"))
+(defn- err-source [] (Path/join (BeamLisp/cwd) "priv/host/lazy_seq_force_error.bl"))
+(defn- inspect-source [] (Path/join (BeamLisp/cwd) "priv/host/lazy_seq_inspect.bl"))
+
+(def ^:private struct-mod :Elixir.BeamLisp.HostLazySeqProbe)
+(def ^:private enum-mod :Elixir.Enumerable.BeamLisp.HostLazySeqProbe)
+(def ^:private err-mod :Elixir.BeamLisp.HostLazyForceErrorProbe)
+(def ^:private inspect-mod :Elixir.Inspect.BeamLisp.HostLazySeqProbe)
+(def ^:private struct-shim :Elixir.BeamLisp.Ns.Host.LazySeq)
+(def ^:private enum-shim :Elixir.BeamLisp.Ns.Host.LazySeqEnumerable)
+(def ^:private err-shim :Elixir.BeamLisp.Ns.Host.LazySeqForceError)
+(def ^:private inspect-shim :Elixir.BeamLisp.Ns.Host.LazySeqInspect)
+(def ^:private live-struct :Elixir.BeamLisp.LazySeq)
+(def ^:private live-enum :Elixir.Enumerable.BeamLisp.LazySeq)
+(def ^:private live-err :Elixir.BeamLisp.LazySeq.ForceError)
+(def ^:private live-inspect :Elixir.Inspect.BeamLisp.LazySeq)
+
+(defn- drop! [mod] (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-pinned [mod path]
+  (do (drop! mod)
+      (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+      mod))
+
+(defn- compile-pinned [mod src opts]
+  (let [res (BeamLisp.AOT/compile_host_file src opts)]
+    (load-pinned mod (erlang/element 2 res))))
+
+(defn- struct-fields [] (list (t2 :resource nil) (t2 :metadata nil)))
+(defn- exception-fields []
+  (list (t2 :__exception__ true) (t2 :reason nil) (t2 :message nil)))
+
+(defn- compile-struct [dir]
+  (let [m (compile-pinned struct-mod (lazy-source)
+            (list (t2 :module struct-mod) (t2 :output_dir dir) (t2 :load? false)
+                  (t2 :struct_fields (struct-fields))))]
+    (drop! struct-shim)
+    m))
+
+(defn- compile-enum [dir]
+  (let [m (compile-pinned enum-mod (enum-source)
+            (list (t2 :module enum-mod) (t2 :output_dir dir) (t2 :load? false)))]
+    (drop! enum-shim)
+    m))
+
+(defn- compile-err [dir]
+  (let [m (compile-pinned err-mod (err-source)
+            (list (t2 :module err-mod) (t2 :output_dir dir) (t2 :load? false)
+                  (t2 :struct_fields (exception-fields))))]
+    (drop! err-shim)
+    m))
+
+(defn- compile-inspect [dir]
+  (let [m (compile-pinned inspect-mod (inspect-source)
+            (list (t2 :module inspect-mod) (t2 :output_dir dir) (t2 :load? false)))]
+    (drop! inspect-shim)
+    m))
+
+(defn- raise-class [f]
+  (try (do (f) :no-raise) (catch e (maps/get :__struct__ e nil))))
+
+(defn- raise-message [f]
+  (try (do (f) :no-raise)
+       (catch e (try (Elixir.Exception/message e) (catch _ :no-message)))))
+
+(defn- new-node [mod thunk] (erlang/apply mod :new (list thunk)))
+(defn- new-node-r [mod thunk recipe] (erlang/apply mod :new (list thunk recipe)))
+(defn- force-node [mod node] (erlang/apply mod :force (list node)))
+(defn- default-opts [] (Inspect.Opts/__struct__))
+(defn- opts [limit] (maps/put :limit limit (default-opts)))
+(defn- render-doc [d] (erlang/iolist_to_binary (Inspect.Algebra/format d 80)))
+
+; an infinite chain: each node's thunk conses `n` onto the next node.
+(defn- inf [mod n]
+  (new-node mod (fn [] (BeamLisp.Ns.Rt/raw-cons n (inf mod (erlang/+ n 1))))))
+
+; ── the struct + ForceError surface ──────────────────────────────────────
+
+(deftest pinned-abi-surface
+  (testing "struct metadata, the public ABI, and the nested exception"
+    (let [dir (tmp-dir)]
+      (compile-err dir)
+      (compile-struct dir)
+      (compile-enum dir)
+      ; NO SHIMS: each compile's namespace shim is gone; the pinned beams answer.
+      (is (= :non_existing (erlang/apply :code :which (list struct-shim))))
+      (is (= :non_existing (erlang/apply :code :which (list enum-shim))))
+      (is (= :non_existing (erlang/apply :code :which (list err-shim))))
+      ; EVERY live public export is answered by the pinned beam.
+      (is (every? (fn [e] (erlang/function_exported struct-mod (erlang/element 1 e) (erlang/element 2 e)))
+                  (erlang/apply live-struct :module_info (list :exports))))
+      (is (every? (fn [e] (erlang/function_exported err-mod (erlang/element 1 e) (erlang/element 2 e)))
+                  (erlang/apply live-err :module_info (list :exports))))
+      ; __info__(:struct) is the live beam's list, datum for datum, so the field
+      ; ORDER and defaults are preserved.
+      (is (= (erlang/apply live-struct :__info__ (list :struct))
+             (erlang/apply struct-mod :__info__ (list :struct))))
+      (is (= (list :resource :metadata)
+             (Enum/map (erlang/apply struct-mod :__info__ (list :struct))
+                       (fn [f] (erlang/map_get :field f)))))
+      ; the versioned cell ABI and the fold-recipe internals are on the pinned
+      ; beam the branch's producers call — internal names, exported because a
+      ; pinned functions-only module exports every top-level defn.
+      (is (every? (fn [entry] (erlang/function_exported struct-mod (erlang/element 1 entry) (erlang/element 2 entry)))
+                  (list (t2 :new 2) (t2 :pending_recipe 1) (t2 :pending? 1)
+                        (t2 :publish_folded 3) (t2 :claim_recipe 1)
+                        (t2 :release_recipe 3) (t2 :capture_attempt 1)
+                        (t2 :complete_attempt 3) (t2 :fail_attempt 6)
+                        (t2 :force_state 2)
+                        (t2 :attempt_deps 1) (t2 :attempt_owner? 3)
+                        (t2 :realize_step 2) (t2 :tagged? 2)
+                        (t2 :normalize_cell 1))))
+      (is (= (erlang/apply live-err :__info__ (list :struct))
+             (erlang/apply err-mod :__info__ (list :struct))))
+      (is (= (list :__exception__ :reason :message)
+             (Enum/map (erlang/apply err-mod :__info__ (list :struct))
+                       (fn [f] (erlang/map_get :field f)))))
+      ; __impl__ answers exactly the live impl's pair; unknown key refuses.
+      (is (= (erlang/apply live-enum :__impl__ (list :for))
+             (erlang/apply enum-mod :__impl__ (list :for))))
+      (is (= (erlang/apply live-enum :__impl__ (list :protocol))
+             (erlang/apply enum-mod :__impl__ (list :protocol))))
+      (is (= :Elixir.BeamLisp.LazySeq (erlang/apply enum-mod :__impl__ (list :for))))
+      (is (= :Elixir.Enumerable (erlang/apply enum-mod :__impl__ (list :protocol))))
+      (is (= :Elixir.FunctionClauseError
+             (raise-class (fn [] (erlang/apply enum-mod :__impl__ (list :bogus))))))
+      (File/rm_rf! dir))))
+
+(deftest pinned-new-and-errors
+  (testing "a new node is production-tagged with a native resource and nil metadata"
+    (let [dir (tmp-dir)]
+      (compile-err dir)
+      (compile-struct dir)
+      (let [n (new-node struct-mod (fn [] :v))]
+        (is (= :"Elixir.BeamLisp.LazySeq" (erlang/map_get :__struct__ n))
+            "the native memo graph only recognizes the production tag")
+        (is (erlang/is_reference (erlang/map_get :resource n)))
+        (is (nil? (erlang/map_get :metadata n))))
+      ; lazy? is true for a production-tagged node, false for everything else.
+      (is (= true (erlang/apply struct-mod :lazy? (list (new-node struct-mod (fn [] :v))))))
+      (is (= false (erlang/apply struct-mod :lazy? (list :x))))
+      (is (= false (erlang/apply struct-mod :lazy? (list nil))))
+      (is (= 32 (erlang/apply struct-mod :chunk_size (list))))
+      ; a non-zero-arity recipe is the live FunctionClauseError, class for class.
+      (is (= (raise-class (fn [] (erlang/apply live-struct :new (list (fn [x] x)))))
+             (raise-class (fn [] (erlang/apply struct-mod :new (list (fn [x] x)))))))
+      ; ForceError builds the same reason and message; a probe-tagged tag is the
+      ; module-exact artifact of compiling the source at a probe atom.
+      (let [le (erlang/apply live-err :exception (list :cyclic_memo))
+            pe (erlang/apply err-mod :exception (list :cyclic_memo))]
+        (is (= (erlang/map_get :reason le) (erlang/map_get :reason pe)))
+        (is (= (erlang/map_get :message le) (erlang/map_get :message pe)))
+        (is (= "LazySeq force failed: :cyclic_memo" (erlang/map_get :message pe))))
+      (let [lt (erlang/apply live-err :exception (list (erlang/list_to_tuple (list :force_owner_lost :pid :ref))))
+            pt (erlang/apply err-mod :exception (list (erlang/list_to_tuple (list :force_owner_lost :pid :ref))))]
+        (is (= (erlang/map_get :message lt) (erlang/map_get :message pt))))
+      ; the generated `message/1` reads the struct's own :message.
+      (is (= "LazySeq force failed: :x"
+             (erlang/apply err-mod :message
+               (list (erlang/apply err-mod :exception (list :x))))))
+      (is (= "LazySeq force failed: :x"
+             (erlang/apply live-err :message
+               (list (erlang/apply live-err :exception (list :x))))))
+      (File/rm_rf! dir))))
+
+; ── the versioned cell ABI + the fold recipe ─────────────────────────────
+
+(deftest pinned-versioned-cells-and-fold-recipe
+  (testing "new/2 attaches a fold recipe on the cell; the versioned read answers it"
+    (let [dir (tmp-dir)]
+      (compile-err dir)
+      (compile-struct dir)
+      (let [r (fn [acc _x] (tuple :cont acc))
+            n (new-node-r struct-mod (fn [] (list 1 2 3)) r)]
+        (is (= :"Elixir.BeamLisp.LazySeq" (erlang/map_get :__struct__ n)))
+        (is (erlang/is_reference (erlang/map_get :resource n)))
+        (is (= true (erlang/apply struct-mod :pending? (list n))))
+        (let [p (erlang/apply struct-mod :pending_recipe (list n))]
+          (is (erlang/is_tuple p))
+          (is (= 2 (erlang/tuple_size p)))
+          (is (erlang/is_function (erlang/element 1 p)))
+          (is (erlang/is_integer (erlang/element 2 p))
+              "the recipe and the publication version it was read at"))
+        ; forcing claims the cell: the recipe is no longer pending, and the
+        ; memo read still answers the completed value.
+        (is (= (list 1 2 3) (erlang/apply struct-mod :to_list (list n))))
+        (is (= false (erlang/apply struct-mod :pending? (list n))))
+        (is (nil? (erlang/apply struct-mod :pending_recipe (list n))))
+        (is (= (tuple :completed (list 1 2 3))
+               (erlang/apply struct-mod :memo_state (list n)))))
+      ; a one-arity node has no recipe, and a one-arity recipe is refused.
+      (let [n (new-node struct-mod (fn [] :v))]
+        (is (nil? (erlang/apply struct-mod :pending_recipe (list n))))
+        (is (= true (erlang/apply struct-mod :pending? (list n)))))
+      (is (= (raise-class (fn [] (erlang/apply live-struct :new (list (fn [] 1) (fn [x] x)))))
+             (raise-class (fn [] (erlang/apply struct-mod :new (list (fn [] 1) (fn [x] x)))))))
+      ; the evaluator's own class is PRESERVED, not normalized: a thrown term
+      ; re-raises an Erlang throw as :throw with the original reason, an
+      ; `:error` term as :error, and keeps terminal edges unchanged.
+      (is (= [:throw :boom]
+             (try (force-node struct-mod (new-node struct-mod (fn [] (erlang/throw :boom))))
+                  :no-throw
+                  (catch-raw [kind reason _stack] [kind reason]))))
+      (is (= :Elixir.ErlangError
+             (raise-class (fn [] (force-node struct-mod (new-node struct-mod (fn [] (erlang/error :raw_term))))))))
+      (is (= :Elixir.ArgumentError
+             (raise-class (fn [] (force-node struct-mod (new-node struct-mod (fn [] (erlang/error (Elixir.ArgumentError/exception "x")))))))))
+      (is (= :keep (erlang/apply struct-mod :attempt_deps (list (tuple :terminal :cyclic_memo)))))
+      (File/rm_rf! dir))))
+
+
+; ── the fold CLAIM: the same `:running` attempt a force takes ────────────
+;
+; A fold used to decide "may I run the recipe?" by READING the pending cell,
+; so two folds could both read it and both run the producer. The claim is now a
+; versioned compare-exchange to the ORDINARY `{:running owner attempt waiters}`
+; state; the halt path hands the `{:pending thunk recipe}` it replaced back, and
+; a recipe-less pending cell is not claimable at all.
+
+(deftest pinned-fold-claim-and-release
+  (testing "a fold claim is the ordinary running attempt; a halt restores pending"
+    (let [dir (tmp-dir)]
+      (compile-err dir)
+      (compile-struct dir)
+      (let [r (fn [acc _x] (tuple :cont acc))
+            n (new-node-r struct-mod (fn [] (list 1 2 3)) r)
+            claim (erlang/apply struct-mod :claim_recipe (list n))]
+        (is (erlang/is_tuple claim) "the pending recipe is claimable")
+        (is (= :claimed (erlang/element 1 claim)))
+        (is (erlang/== 3 (erlang/tuple_size (erlang/element 3 claim)))
+            "the `{:pending thunk recipe}` the claim replaced")
+        (let [st (erlang/apply struct-mod :memo_state (list n))]
+          (is (erlang/== :running (erlang/element 1 st))
+              "the claim publishes the ordinary running attempt, not a second registry")
+          (is (erlang/== (erlang/self) (erlang/element 3 st)))
+          (is (erlang/== () (erlang/element 5 st))))
+        (is (nil? (erlang/apply struct-mod :claim_recipe (list n)))
+            "a second claimant finds no recipe while the cell is claimed")
+        ; the halt path: the cell goes back to `:pending` and stays usable.
+        (erlang/apply struct-mod :release_recipe
+          (list n (erlang/element 2 claim) (erlang/element 3 claim)))
+        (is (= true (erlang/apply struct-mod :pending? (list n))))
+        (is (erlang/== 2 (erlang/tuple_size
+                           (erlang/apply struct-mod :pending_recipe (list n)))))
+        (is (= (list 1 2 3) (erlang/apply struct-mod :to_list (list n)))
+            "the released node still realises correctly"))
+      ; a pending cell with no recipe is not claimable
+      (is (nil? (erlang/apply struct-mod :claim_recipe
+                              (list (new-node struct-mod (fn [] :v))))))
+      (File/rm_rf! dir))))
+; ── realization, memoization and the walks ───────────────────────────────
+
+(defn- obs-realize [mod]
+  (let [n (new-node mod (fn [] (list 1 2 3)))]
+    (list
+      (erlang/apply mod :realize (list n))
+      (erlang/apply mod :to_list (list n))
+      (erlang/apply mod :count (list n))
+      (erlang/apply mod :nth (list n 1))
+      (erlang/apply mod :prefix (list n 2))
+      (erlang/apply mod :sample (list n 10))
+      (erlang/apply mod :sample (list n 2))
+      (erlang/apply mod :run (list n))
+      (erlang/apply mod :memo_state (list n)))))
+
+(deftest pinned-realization-matches-live
+  (testing "the walks answer identically over the seqable corpus"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (is (= (obs-realize live-struct) (obs-realize struct-mod)))
+      ; nil, an empty list, a vector, a set, a string, a raw list, a cursor.
+      (let [empty-lz (new-node struct-mod (fn [] (list)))
+            vec-lz (new-node struct-mod (fn [] [1 2 3]))
+            set-lz (new-node struct-mod (fn [] (BeamLisp.Set/new (list 1 2))))
+            nested (new-node struct-mod (fn [] (new-node struct-mod (fn [] (list 7 8)))))
+            cursor (BeamLisp.SeqCursor/new (list 1 2 3))
+            cursor-lz (new-node struct-mod (fn [] cursor))]
+        (is (nil? (erlang/apply struct-mod :cell (list empty-lz))))
+        (is (= (list 1 2 3) (erlang/apply struct-mod :to_list (list vec-lz))))
+        (is (= (list 7 8) (erlang/apply struct-mod :to_list (list nested))))
+        (is (= (list 1 2 3) (erlang/apply struct-mod :to_list (list cursor-lz))))
+        (is (= 2 (erlang/apply struct-mod :count (list set-lz))))
+        ; a BARE string is seqable at the cell chokepoint (graphemes).
+        (is (= (list "a" "b") (erlang/apply struct-mod :cell (list "ab"))))
+        ; `cell` of a plain value is the value; of nil is nil.
+        (is (nil? (erlang/apply struct-mod :cell (list nil))))
+        (is (= :x (erlang/apply struct-mod :cell (list :x))))
+        (is (= (list 4 5) (erlang/apply struct-mod :cell (list (list 4 5))))))
+      ; `input`: a short list stays a list, a long list becomes a cursor.
+      (is (erlang/is_list (erlang/apply struct-mod :input (list (list 1 2)))))
+      (is (= :"Elixir.BeamLisp.SeqCursor"
+             (erlang/map_get :__struct__ (erlang/apply struct-mod :input (list (erlang/apply :lists :seq (list 1 40)))))))
+      ; `chain`: raw conses onto one shared tail node.
+      (let [n (erlang/apply struct-mod :chain (list (list 1 2) (fn [] (list 3))))]
+        (is (= (list 1 2 3) (erlang/apply struct-mod :to_list (list n)))))
+      (is (nil? (erlang/apply struct-mod :chain (list (list) :not-a-fun))))
+      ; a forced node answers its memoized value with the thunk run ONCE.
+      (let [c (erlang/apply :counters :new (list 1 ()))
+            n (new-node struct-mod (fn [] (do (erlang/apply :counters :add (list c 1 1)) :once)))]
+        (is (= :once (force-node struct-mod n)))
+        (is (= :once (force-node struct-mod n)))
+        (is (= 1 (erlang/apply :counters :get (list c 1)))))
+      ; a node's resource is a REFERENCE, so structural identity is per node;
+      ; BL `=` compares lazy operands element-wise, as the live runtime does.
+      (let [a (new-node struct-mod (fn [] (list 1 2)))
+            b (new-node struct-mod (fn [] (list 1 2)))
+            c (new-node struct-mod (fn [] (list 1 3)))]
+        (is (erlang/== a a))
+        (is (not (erlang/== a b)))
+        (is (= true (= a b)))
+        (is (= false (= a c))))
+      ; a probe-built node is usable by the LIVE module, and vice versa.
+      (is (= :interop (force-node live-struct (new-node struct-mod (fn [] :interop)))))
+      (is (= :interop (force-node struct-mod (new-node live-struct (fn [] :interop)))))
+      (File/rm_rf! dir))))
+
+; ── laziness: an infinite chain, bounded ────────────────────────────────
+
+(deftest pinned-infinite-bounded
+  (testing "an infinite chain realizes only the bounded prefix"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (is (= (list 1 2 3 4 5) (erlang/apply struct-mod :prefix (list (inf struct-mod 1) 5))))
+      (is (= (list 1 2 3 4 5) (erlang/apply live-struct :prefix (list (inf live-struct 1) 5))))
+      (is (= (list 0 1 2) (erlang/apply struct-mod :prefix (list (inf struct-mod 0) 3))))
+      (is (= (list 9 10 11) (erlang/apply struct-mod :prefix (list (inf struct-mod 9) 3))))
+      (is (= 7 (erlang/apply struct-mod :nth (list (inf struct-mod 1) 6))))
+      (File/rm_rf! dir))))
+
+; ── the native memo: sharing across processes ───────────────────────────
+
+(defn- await-waiters [mod node remaining]
+  (if (erlang/== 0 remaining)
+    false
+    (let [st (erlang/apply mod :memo_state (list node))]
+      (if (and (erlang/is_tuple st)
+               (erlang/== 5 (erlang/tuple_size st))
+               (erlang/== :running (erlang/element 1 st))
+               (not (erlang/== () (erlang/element 5 st))))
+        true
+        (do (erlang/yield) (await-waiters mod node (erlang/- remaining 1)))))))
+
+(defn- concurrency-scenario [mod]
+  (let [parent (erlang/self)
+        c (erlang/apply :counters :new (list 1 ()))
+        node (new-node mod (fn []
+                             (do (erlang/apply :counters :add (list c 1 1))
+                                 (erlang/send parent (tuple :started (erlang/self)))
+                                 (receive :release :shared))))
+        owner (Task/async (fn [] (force-node mod node)))
+        owner-pid (receive [:started p] p (after 5000 :timeout))
+        waiter (Task/async (fn [] (force-node mod node)))]
+    (await-waiters mod node 1000)
+    (erlang/send owner-pid :release)
+    [(Task/await owner) (Task/await waiter) (erlang/apply :counters :get (list c 1))]))
+
+(deftest pinned-concurrency-shares-one-attempt
+  (testing "two forcers share one attempt; the thunk runs once"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (is (= [:shared :shared 1] (concurrency-scenario struct-mod)))
+      (is (= [:shared :shared 1] (concurrency-scenario live-struct)))
+      (File/rm_rf! dir))))
+
+; ── error paths: retryable failure, recursive force, cycle ─────────────
+
+(defn- failure-scenario [mod]
+  (let [c (erlang/apply :counters :new (list 1 ()))
+        node (new-node mod (fn []
+                             (do (erlang/apply :counters :add (list c 1 1))
+                                 (if (erlang/== 1 (erlang/apply :counters :get (list c 1)))
+                                   (erlang/error (Elixir.RuntimeError/exception "known failure"))
+                                   :recovered))))
+        capture (fn [] (try (tuple :ok (force-node mod node))
+                            (catch e (tuple :error (Elixir.Exception/message e)))))]
+    [(capture) (capture) (force-node mod node) (erlang/apply :counters :get (list c 1))]))
+
+(deftest pinned-failed-attempt-retries
+  (testing "a failed attempt reaches the caller and a later force retries"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (is (= (failure-scenario live-struct) (failure-scenario struct-mod)))
+      (let [r (failure-scenario struct-mod)]
+        (is (= (tuple :error "known failure") (nth r 0)))
+        (is (= (tuple :ok :recovered) (nth r 1)))
+        (is (= :recovered (nth r 2)))
+        (is (= 2 (nth r 3))))
+      ; the stored state of a failed attempt names the thunk and an :error kind.
+      (let [n (new-node struct-mod (fn [] (erlang/error (Elixir.RuntimeError/exception "boom"))))]
+        (is (= :Elixir.RuntimeError (raise-class (fn [] (force-node struct-mod n)))))
+        (is (= "boom" (raise-message (fn [] (force-node struct-mod n))))) )
+      ; a BL `throw` and a raw non-exception `:error` re-raise the same reason a
+      ; waiter sees from the live module (the kind is reconstructed, not lost).
+      (let [ln (new-node live-struct (fn [] (throw "nope")))
+            pn (new-node struct-mod (fn [] (throw "nope")))]
+        (is (= (raise-class (fn [] (force-node live-struct ln)))
+               (raise-class (fn [] (force-node struct-mod pn)))))
+        (is (= (raise-message (fn [] (force-node live-struct ln)))
+               (raise-message (fn [] (force-node struct-mod pn))))))
+      (let [ln (new-node live-struct (fn [] (erlang/error :raw_term)))
+            pn (new-node struct-mod (fn [] (erlang/error :raw_term)))]
+        (is (= (raise-class (fn [] (force-node live-struct ln)))
+               (raise-class (fn [] (force-node struct-mod pn)))))
+        (is (= (raise-message (fn [] (force-node live-struct ln)))
+               (raise-message (fn [] (force-node struct-mod pn))))))
+      (File/rm_rf! dir))))
+
+(defn- recursive-outcome [mod]
+  (let [holder (Agent/start_link (fn [] nil))
+        h (erlang/element 2 holder)
+        n (new-node mod (fn [] (force-node mod (Agent/get h (fn [x] x)))))]
+    (Agent/update h (fn [_] n))
+    [(raise-class (fn [] (force-node mod n)))
+     (raise-message (fn [] (force-node mod n)))
+     (erlang/apply mod :memo_state (list n))]))
+
+(defn- direct-cycle-outcome [mod]
+  (let [holder (Agent/start_link (fn [] nil))
+        h (erlang/element 2 holder)
+        n (new-node mod (fn [] (Agent/get h (fn [x] x))))]
+    (Agent/update h (fn [_] n))
+    [(raise-class (fn [] (force-node mod n)))
+     (raise-message (fn [] (force-node mod n)))
+     (erlang/apply mod :memo_state (list n))]))
+
+; The live suite's pair: force(left) REALIZES to right (one shared cell), then
+; forcing right makes the retained cycle terminal.
+(defn- pair-cycle-outcome [mod]
+  (let [holder (Agent/start_link (fn [] {}))
+        h (erlang/element 2 holder)
+        left (new-node mod (fn [] (maps/get :right (Agent/get h (fn [x] x)) nil)))
+        right (new-node mod (fn [] (maps/get :left (Agent/get h (fn [x] x)) nil)))]
+    (Agent/update h (fn [_] {:left left :right right}))
+    [(= right (force-node mod left))
+     (raise-class (fn [] (force-node mod right)))
+     (erlang/apply mod :memo_state (list right))]))
+
+(deftest pinned-terminal-and-cycle
+  (testing "recursive force and retained cycles become terminal, as live"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (is (= (recursive-outcome live-struct) (recursive-outcome struct-mod)))
+      (is (= :Elixir.BeamLisp.LazySeq.ForceError (nth (recursive-outcome struct-mod) 0)))
+      (is (= (tuple :terminal :recursive_force) (nth (recursive-outcome struct-mod) 2)))
+      (is (= (direct-cycle-outcome live-struct) (direct-cycle-outcome struct-mod)))
+      (is (= (tuple :terminal :cyclic_memo) (nth (direct-cycle-outcome struct-mod) 2)))
+      (is (= (pair-cycle-outcome live-struct) (pair-cycle-outcome struct-mod)))
+      (is (= [true :Elixir.BeamLisp.LazySeq.ForceError (tuple :terminal :cyclic_memo)]
+             (pair-cycle-outcome struct-mod)))
+      (File/rm_rf! dir))))
+
+; ── the Enumerable impl: direct probe invocation ─────────────────────────
+
+(deftest enum-pinned-direct-probe
+  (testing "impl surface and direct invocation, suspension included"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (compile-enum dir)
+      (is (= :non_existing (erlang/apply :code :which (list enum-shim))))
+      (is (erlang/function_exported enum-mod :__impl__ 1))
+      (is (erlang/function_exported enum-mod :count 1))
+      (is (erlang/function_exported enum-mod :member? 2))
+      (is (erlang/function_exported enum-mod :reduce 3))
+      (is (erlang/function_exported enum-mod :slice 1))
+      ; FUNCTIONS-ONLY: no synthesized struct surface.
+      (is (not (erlang/function_exported enum-mod :__struct__ 0)))
+      (let [n (new-node struct-mod (fn [] (list 1 2 3)))]
+        (is (= (tuple :ok 3) (erlang/apply enum-mod :count (list n))))
+        (is (= (tuple :error enum-mod) (erlang/apply enum-mod :member? (list n 2))))
+        (is (= (tuple :error enum-mod) (erlang/apply enum-mod :slice (list n))))
+        ; reduce/3 straight through the tagged accumulator protocol.
+        (is (= (tuple :done (list 3 2 1))
+               (erlang/apply enum-mod :reduce
+                 (list n (tuple :cont ()) (fn [x acc] (tuple :cont (cons x acc)))))))
+        ; `{:halt, acc}` stops the walk.
+        (is (= (tuple :halted (list 2 1))
+               (erlang/apply enum-mod :reduce
+                 (list n (tuple :cont ())
+                       (fn [x acc] (if (erlang/== x 2)
+                                     (tuple :halt (cons x acc))
+                                     (tuple :cont (cons x acc))))))))
+        ; `{:suspend, acc}` answers a continuation resuming the SAME walk.
+        (let [s (erlang/apply enum-mod :reduce
+                  (list n (tuple :suspend ()) (fn [x acc] (tuple :cont (cons x acc)))))]
+          (is (= :suspended (erlang/element 1 s)))
+          (is (= () (erlang/element 2 s)))
+          (is (= (tuple :done (list 3 2 1)) ((erlang/element 3 s) (tuple :cont ())))))
+        ; an accumulator that is none of the three tags is the live refusal.
+        (is (= :Elixir.FunctionClauseError
+               (raise-class (fn [] (erlang/apply enum-mod :reduce
+                                    (list n :bogus (fn [x acc] (tuple :cont acc)))))))))
+      (File/rm_rf! dir))))
+
+; ── the impl under its EXACT atom ─────────────────────────────────────────
+
+(deftest enum-pinned-live-dispatch-at-the-exact-atom
+  (testing "the live impl answers at Elixir.Enumerable.BeamLisp.LazySeq, streaming"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      ; The pinned SOURCE compiles to exactly the live impl's export surface —
+      ; the module `Enum`/`Stream` reach by the value's tag.
+      (compile-enum dir)
+      (is (= (Enum/sort (erlang/apply enum-mod :module_info (list :exports)))
+             (Enum/sort (erlang/apply live-enum :module_info (list :exports))))
+          "the pinned source exports the live impl's surface")
+      (drop! enum-mod)
+      ; NO MODULE SURGERY HERE. Replacing the beam at the LIVE atom —
+      ; `code:delete`/`code:purge`/`code:load_binary`, every one of which purges —
+      ; KILLS the test runner. The harness realises `run-tests` as a lazy `map`,
+      ; so the runner sits inside `Enumerable.BeamLisp.LazySeq`'s reduce for the
+      ; whole suite, and the purge kills the process lingering in the very module
+      ; it is replacing. Reproduced: `code:soft_purge/1` on that atom answers
+      ; false during a run, and `code:purge/1` exits the runner with `:killed`
+      ; before the totals. `erlang:load_module/2` installs without the purge but
+      ; refuses to restore (`:not_purged`), so the dispatch claims are pinned
+      ; against the module the runtime actually loads.
+      (let [n (new-node struct-mod (fn [] (list 1 2 3 4)))]
+        (is (= live-enum (erlang/apply :Elixir.Enumerable :impl_for (list n))))
+        (is (= (list 1 2 3 4) (Enum/to_list n)))
+        (is (= 4 (Enum/count n)))
+        (is (= (list 1 2 3) (Enum/take n 3)))
+        (is (= (list 1 2 3 4) (Enum/to_list (Stream/take n 4)))))
+      ; an infinite chain: bounded take does not force the tail.
+      (let [n (inf struct-mod 1)]
+        (is (= (list 1 2 3) (Enum/to_list (Stream/take n 3)))))
+      (is (= live-enum
+             (erlang/apply :Elixir.Enumerable :impl_for (list (new-node struct-mod (fn [] (list 1)))))))
+      (File/rm_rf! dir))))
+
+; ── the Inspect impl: the list face, differential, bounded realization ──
+
+(defn- inspect-pair-text
+  "The pinned impl's rendered doc, after asserting it equals the live impl's doc
+   term for term. Reads `inspect-mod`, `render-doc`, `is`."
+  [node o]
+  (let [l (Inspect.BeamLisp.LazySeq/inspect node o)
+        p (erlang/apply inspect-mod :inspect (list node o))]
+    (is (= l p) "the pinned doc equals the live doc, term for term")
+    (is (= (render-doc l) (render-doc p)) "and renders to the same text")
+    (render-doc p)))
+
+(defn- counted-lazy
+  "An infinite chain whose every forced cell bumps `c` — the realization counter
+   the bounded-realization test reads."
+  [mod c n]
+  (new-node mod (fn []
+                  (do (erlang/apply :counters :add (list c 1 1))
+                      (BeamLisp.Ns.Rt/raw-cons n (counted-lazy mod c (erlang/+ n 1)))))))
+
+(deftest inspect-pinned-abi-surface
+  (testing "the Inspect impl exports exactly the live pair; __impl__ answers live"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (compile-inspect dir)
+      (is (= :non_existing (erlang/apply :code :which (list inspect-shim))))
+      (is (erlang/function_exported inspect-mod :__impl__ 1))
+      (is (erlang/function_exported inspect-mod :inspect 2))
+      ; FUNCTIONS-ONLY: no synthesized struct surface.
+      (is (not (erlang/function_exported inspect-mod :__struct__ 0)))
+      ; EVERY live export that is part of the generated impl is answered.
+      ; `__info__/1` is the module-introspection surface a FUNCTIONS-ONLY pinned
+      ; beam does not synthesize — only `:struct_fields` adds `__info__`, and the
+      ; pinned `Enumerable` impl omits it too — so it is excluded, not missing.
+      (is (every? (fn [e] (erlang/function_exported inspect-mod (erlang/element 1 e) (erlang/element 2 e)))
+                  (Enum/reject (erlang/apply live-inspect :module_info (list :exports))
+                               (fn [e] (erlang/== :__info__ (erlang/element 1 e))))))
+      ; ...and the pinned beam adds nothing else: exactly `__impl__/1` + `inspect/2`
+      ; beyond the runtime's `module_info` pair.
+      (is (= (Enum/sort (list (t2 :__impl__ 1) (t2 :inspect 2)))
+             (Enum/sort
+               (Enum/reject (erlang/apply inspect-mod :module_info (list :exports))
+                            (fn [e] (erlang/== :module_info (erlang/element 1 e)))))))
+      (is (= (erlang/apply live-inspect :__impl__ (list :for))
+             (erlang/apply inspect-mod :__impl__ (list :for))))
+      (is (= (erlang/apply live-inspect :__impl__ (list :protocol))
+             (erlang/apply inspect-mod :__impl__ (list :protocol))))
+      (is (= :Elixir.BeamLisp.LazySeq (erlang/apply inspect-mod :__impl__ (list :for))))
+      (is (= :Elixir.Inspect (erlang/apply inspect-mod :__impl__ (list :protocol))))
+      (is (= :Elixir.FunctionClauseError
+             (raise-class (fn [] (erlang/apply inspect-mod :__impl__ (list :bogus))))))
+      (File/rm_rf! dir))))
+
+(deftest inspect-pinned-differential
+  (testing "empty/small/truncated/infinite/nested render as live, limit or 20"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (compile-inspect dir)
+      (is (= "()" (inspect-pair-text (new-node struct-mod (fn [] (list))) (default-opts))))
+      (is (= "(1 2 3)" (inspect-pair-text (new-node struct-mod (fn [] (list 1 2 3))) (default-opts))))
+      (is (= "(1 2 3 4 5)" (inspect-pair-text (new-node struct-mod (fn [] (list 1 2 3 4 5))) (opts 20))))
+      ; A positive limit truncates with the ellipsis — and NO space before it:
+      ; `intersperse` puts spaces only BETWEEN elements, and the live impl
+      ; appends the ellipsis after the last one.
+      (is (= "(1 2 3…)" (inspect-pair-text (new-node struct-mod (fn [] (list 1 2 3 4 5))) (opts 3))))
+      (is (= "(1…)" (inspect-pair-text (new-node struct-mod (fn [] (list 1 2))) (opts 1))))
+      ; limit 0, negative and non-integer all fall back to 20.
+      (is (= "(1 2 3 4 5)" (inspect-pair-text (new-node struct-mod (fn [] (list 1 2 3 4 5))) (opts 0))))
+      (is (= "(1 2 3 4 5)" (inspect-pair-text (new-node struct-mod (fn [] (list 1 2 3 4 5))) (opts -7))))
+      (is (= "(1 2 3 4 5)" (inspect-pair-text (new-node struct-mod (fn [] (list 1 2 3 4 5))) (opts :none))))
+      ; an infinite chain renders a bounded prefix with the ellipsis.
+      (is (= "(1 2 3…)" (inspect-pair-text (inf struct-mod 1) (opts 3))))
+      (is (= "(9 10 11…)" (inspect-pair-text (inf struct-mod 9) (opts 3))))
+      ; nested lazy values and a map element — the same `to_doc` the live impl used.
+      (is (= "((1 2) (3 4))"
+             (inspect-pair-text
+               (new-node struct-mod (fn [] (list (new-node struct-mod (fn [] (list 1 2)))
+                                                 (new-node struct-mod (fn [] (list 3 4))))))
+               (default-opts))))
+      (is (= "(%{a: 1})" (inspect-pair-text (new-node struct-mod (fn [] (list {:a 1}))) (default-opts))))
+      (File/rm_rf! dir))))
+
+(deftest inspect-pinned-bounded-realization
+  (testing "inspect realizes a bounded prefix — never the infinite tail — and the same length as live"
+    (let [dir (tmp-dir)]
+      (compile-struct dir)
+      (compile-inspect dir)
+      ; limit 3: `sample` peeks one cell past the sample bound to learn
+      ; truncation, and `prefix` realizes one more in its final step — 5 cells,
+      ; and the LIVE impl realizes exactly the same 5. The ellipsis is the
+      ; evidence of the bounded stop; nothing walks the tail.
+      (let [cl (erlang/apply :counters :new (list 1 ()))
+            cp (erlang/apply :counters :new (list 1 ()))
+            nl (counted-lazy struct-mod cl 1)
+            np (counted-lazy struct-mod cp 1)
+            lt (render-doc (Inspect.BeamLisp.LazySeq/inspect nl (opts 3)))
+            pt (render-doc (erlang/apply inspect-mod :inspect (list np (opts 3))))]
+        (is (= "(1 2 3…)" lt))
+        (is (= lt pt))
+        (is (= 5 (erlang/apply :counters :get (list cl 1))))
+        (is (= (erlang/apply :counters :get (list cl 1))
+               (erlang/apply :counters :get (list cp 1)))
+            "the pinned and live impls realize the SAME bounded prefix"))
+      ; limit 0 falls back to 20 — the same bounded walk, one step longer.
+      (let [cl (erlang/apply :counters :new (list 1 ()))
+            cp (erlang/apply :counters :new (list 1 ()))
+            nl (counted-lazy struct-mod cl 1)
+            np (counted-lazy struct-mod cp 1)
+            lt (render-doc (Inspect.BeamLisp.LazySeq/inspect nl (opts 0)))
+            pt (render-doc (erlang/apply inspect-mod :inspect (list np (opts 0))))]
+        (is (= "(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20…)" lt))
+        (is (= lt pt))
+        (is (= 22 (erlang/apply :counters :get (list cl 1))))
+        (is (= (erlang/apply :counters :get (list cl 1))
+               (erlang/apply :counters :get (list cp 1)))))
+      (File/rm_rf! dir))))
+
+(deftest inspect-pinned-live-dispatch-at-the-exact-atom
+  (testing "loads at Elixir.Inspect.BeamLisp.LazySeq, renders via Kernel.inspect, restores"
+    (let [dir (tmp-dir)
+          orig-path (erlang/apply :code :which (list live-inspect))
+          orig-bin (File/read! (erlang/list_to_binary orig-path))
+          probe (Path/join dir "Elixir.Inspect.BeamLisp.LazySeq.beam")]
+      (is (not= :non_existing orig-path) "precondition: the live inspect impl beam is a readable file")
+      (try
+        (compile-struct dir)
+        (BeamLisp.AOT/compile_host_file (inspect-source)
+          (list (t2 :module live-inspect) (t2 :output_dir dir) (t2 :load? false)))
+        (drop! inspect-shim)
+        (drop! live-inspect)
+        (code/load_binary live-inspect (erlang/binary_to_list probe) (File/read! probe))
+        (let [n (new-node struct-mod (fn [] (list 1 2 3 4 5)))]
+          (is (= live-inspect (erlang/apply :Elixir.Inspect :impl_for (list n))))
+          (is (= "(1 2 3 4 5)" (Kernel/inspect n (list (t2 :limit 20)))))
+          (is (= "(1 2 3…)" (Kernel/inspect n (list (t2 :limit 3)))))
+          (is (= "()" (Kernel/inspect (new-node struct-mod (fn [] (list))))))
+          ; an infinite chain is bounded and flagged at the exact atom too.
+          (is (= "(1 2 3…)" (Kernel/inspect (inf struct-mod 1) (list (t2 :limit 3))))))
+        (finally
+          (drop! live-inspect)
+          (code/load_binary live-inspect orig-path orig-bin)))
+      (is (= live-inspect
+             (erlang/apply :Elixir.Inspect :impl_for (list (new-node struct-mod (fn [] (list 1)))))))
+      (File/rm_rf! dir))))
+
+; ── cold runtime: no namespace vars ─────────────────────────────────────
+
+(defn- env-fetch-ins? [ins]
+  (cond
+    (not (erlang/is_tuple ins)) false
+    (not (erlang/== :call_ext (erlang/element 1 ins))) false
+    (not (erlang/is_tuple (erlang/element 3 ins))) false
+    (not (erlang/== :extfunc (erlang/element 1 (erlang/element 3 ins)))) false
+    :else (and (= :Elixir.BeamLisp.Env (erlang/element 2 (erlang/element 3 ins)))
+               (= :fetch! (erlang/element 3 (erlang/element 3 ins))))))
+
+(defn- env-fetch-sites [path]
+  (let [fns (erlang/element 6 (erlang/apply :beam_disasm :file (list (erlang/binary_to_list path))))]
+    (reduce
+      (fn [acc f]
+        (if (= :function (erlang/element 1 f))
+          (let [nm (erlang/element 2 f)
+                ar (erlang/element 3 f)]
+            (reduce (fn [a ins] (if (env-fetch-ins? ins) (cons (tuple nm ar) a) a))
+                    acc
+                    (erlang/element 5 f)))
+          acc))
+      ()
+      fns)))
+
+(deftest pinned-cold-without-namespace-vars
+  (testing "the pinned beams make no Env.fetch! call and walk with vars deleted"
+    (let [dir (tmp-dir)]
+      (compile-err dir)
+      (compile-struct dir)
+      (compile-enum dir)
+      (compile-inspect dir)
+      (is (= () (env-fetch-sites (Path/join dir "Elixir.BeamLisp.HostLazySeqProbe.beam"))))
+      (is (= () (env-fetch-sites (Path/join dir "Elixir.Enumerable.BeamLisp.HostLazySeqProbe.beam"))))
+      (is (= () (env-fetch-sites (Path/join dir "Elixir.BeamLisp.HostLazyForceErrorProbe.beam"))))
+      (is (= () (env-fetch-sites (Path/join dir "Elixir.Inspect.BeamLisp.HostLazySeqProbe.beam"))))
+      ; the same sources at the PRODUCTION atoms are var-free too (read, not loaded).
+      (let [r1 (BeamLisp.AOT/compile_host_file (lazy-source)
+                 (list (t2 :module live-struct) (t2 :output_dir dir) (t2 :load? false)
+                       (t2 :struct_fields (struct-fields))))
+            r2 (BeamLisp.AOT/compile_host_file (enum-source)
+                 (list (t2 :module live-enum) (t2 :output_dir dir) (t2 :load? false)))
+            r3 (BeamLisp.AOT/compile_host_file (err-source)
+                 (list (t2 :module live-err) (t2 :output_dir dir) (t2 :load? false)
+                       (t2 :struct_fields (exception-fields))))
+            r4 (BeamLisp.AOT/compile_host_file (inspect-source)
+                 (list (t2 :module live-inspect) (t2 :output_dir dir) (t2 :load? false)))]
+        (is (= () (env-fetch-sites (erlang/element 2 r1))))
+        (is (= () (env-fetch-sites (erlang/element 2 r2))))
+        (is (= () (env-fetch-sites (erlang/element 2 r3))))
+        (is (= () (env-fetch-sites (erlang/element 2 r4)))))
+      ; The beam carries NO `Env.fetch!` call at all, so a fresh VM — which never
+      ; interns `host.lazy-seq` — has nothing to fail on. That is the whole
+      ; cold proof: there is no var reference to resolve. Walk anyway, so a
+      ; regression that reintroduced one shows up as a real walk here too.
+      (let [n (new-node struct-mod (fn [] (list 1 2 3)))]
+        (is (= (list 1 2 3) (force-node struct-mod n)))
+        (is (= (list 1 2 3) (erlang/apply struct-mod :to_list (list n))))
+        ; the pinned Inspect impl renders the production-tagged node with no var.
+        (is (= "(1 2 3…)"
+               (render-doc (erlang/apply inspect-mod :inspect
+                            (list (new-node struct-mod (fn [] (list 1 2 3 4))) (opts 3)))))))
+      (File/rm_rf! dir))))
+
+
+; ── the ForceError beam carries its `Exception` behaviour ────────────────
+
+; `compile_host_file`'s `:behaviour` option is the only way a pinned `.bl`
+; source records `-behaviour Exception`; without it the compiled beam still
+; answers `exception/1` and `message/1` (plain defns) while the ATTRIBUTE is
+; silently absent from the BEAM's `:attributes` chunk — the half a tool or a
+; behaviour walk reads. Pin the chunk, not just the runtime surface.
+;
+; PORTED from perf/lazy-engine 5340975e `test/bl/host_lazy_test.bl`
+; (`force-error-pinned-exception`). The `__info__(:struct)` and reason/message
+; parity that case also held are already asserted by `pinned-abi-surface` and
+; `pinned-new-and-errors`, so only the attribute half is appended here.
+(deftest pinned-force-error-carries-the-exception-behaviour
+  (testing "`:behaviour :Elixir.Exception` survives into the beam's attributes"
+    (let [dir (tmp-dir)]
+      (let [res (BeamLisp.AOT/compile_host_file (err-source)
+                  (list (t2 :module err-mod) (t2 :output_dir dir) (t2 :load? false)
+                        (t2 :struct_fields (exception-fields))
+                        (t2 :behaviour :"Elixir.Exception")))
+            path (erlang/element 2 res)]
+        (drop! err-mod)
+        (drop! err-shim)
+        (is (= :non_existing (erlang/apply :code :which (list err-shim))))
+        (code/load_binary err-mod (erlang/binary_to_list path) (File/read! path))
+        (is (erlang/function_exported err-mod :exception 1))
+        (is (erlang/function_exported err-mod :message 1))
+        (let [chunks (erlang/apply :beam_lib :chunks
+                       (list (erlang/binary_to_list path) (list :attributes)))
+              attrs (erlang/element 2
+                      (erlang/hd (erlang/element 2 (erlang/element 2 chunks))))]
+          (is (Enum/member? attrs (t2 :behaviour :"Elixir.Exception")))))
+      (drop! err-mod)
+      (File/rm_rf! dir))))

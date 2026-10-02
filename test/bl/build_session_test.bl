@@ -1,0 +1,148 @@
+; build_session_test.bl — a build is a SESSION: a claim names its owner, and the
+; work is visible in one journal.
+;
+; Ported from the ExUnit `test/beam_lisp/build_session_test.exs`. That suite
+; reached `claim` and `bl.cli` through the Elixir shell (`Loader.ensure_loaded`
+; + `Ns.Rt.invoke`); here both are plain `:require`s, so the call is the call
+; the build itself makes.
+;
+; What this replaces: Mix serializes builds on a lock file in `_build`, and that
+; lock is 0 bytes naming nobody (measured). cargo holds its own target lock the
+; same way. So the properties asserted here are the ones a lock cannot give:
+;
+;   * a live claim REFUSES a second builder, naming the pid that holds it —
+;     rather than waiting on it, which is what a lock does and why a wedged lock
+;     is indistinguishable from a slow build;
+;   * a claim whose owner is GONE is swept, so a killed build does not wedge the
+;     tree forever;
+;   * a claim THIS process wrote is ours, not a conflict, and release drops it;
+;   * a build writes :"build/start" and :"build/done" into `reload`'s journal, so the
+;     build appears in the same stream as every other change to the image.
+;
+; The native stage is bl code exercised from bl — see `test/bl/native_test.bl`.
+;
+; Run: bl test test/bl/build_session_test.bl
+
+(ns build.session.test
+  (:require [claim :as claim]
+            [bl.cli :as cli]
+            [reload :as reload]))
+
+(defn- restore-env
+  "Put an environment variable back the way it was found: unset stays unset."
+  [name value]
+  (if (nil? value) (System/delete_env name) (System/put_env name value)))
+
+(defn- with-cache
+  "Run `f` with a FRESH scratch cache root in `XDG_CACHE_HOME` — the ExUnit
+   suite's `setup`/`on_exit` — restoring the environment and removing the root
+   afterwards, so one test cannot read or leave another's claim files."
+  [f]
+  (let [cache (str (System/tmp_dir!) "/bl_build_session_"
+                   (erlang/unique_integer (list :positive)))
+        prev (System/get_env "XDG_CACHE_HOME")]
+    (File/rm_rf! cache)
+    (File/mkdir_p! cache)
+    (System/put_env "XDG_CACHE_HOME" cache)
+    (try
+      (f cache)
+      (finally
+        (restore-env "XDG_CACHE_HOME" prev)
+        (File/rm_rf! cache)))))
+
+(defn- spawned-pid
+  "A real OS process this VM does NOT own: a `sleep` on a port. Its pid reads as
+   a FOREIGN live pid — the test VM's own pid would read as OURS, and `held-by`
+   treats same-pid as not-a-conflict (the first version of this test used it and
+   learned that the hard way). Returns `[port pid-string]`; the caller closes the
+   port."
+  []
+  (let [port (erlang/open_port
+               (erlang/list_to_tuple (list :spawn_executable (System/find_executable "sleep")))
+               (list :binary :stream :use_stdio (tuple :args (list "30"))))]
+    (list port (str (elem (Port/info port :os_pid) 1)))))
+
+; ── the claim ───────────────────────────────────────────────────────────────
+
+(deftest a-live-claim-refuses-a-second-builder-and-names-the-holder
+  (with-cache
+    (fn [cache]
+      (let [dir (Path/join cache "claimed")]
+        (File/mkdir_p! dir)
+        (is (:ok? (claim/acquire! dir "first")))
+        (let [[port pid] (spawned-pid)]
+          (File/write! (Path/join dir ".claim")
+                       (str "[:claim " pid " 1 someone-else]"))
+          (let [held (claim/held-by dir)]
+            (is (= pid (:pid held)))
+            (is (= "someone-else" (:bin held)))
+            (is (not (:ok? (claim/acquire! dir "second"))))
+            (is (= pid (:pid (:held (claim/acquire! dir "second"))))
+                "a refusal must NAME the holder — that is the difference from a lock"))
+          ; A claim whose pid still has a `/proc` entry is HONOURED, even if the
+          ; process is a zombie: liveness here is deliberately conservative (see
+          ; `claim`), and the cost of being wrong in the other direction is
+          ; stomping another build. The swept case — a pid with no `/proc` entry
+          ; at all — is the next test.
+          (Port/close port)
+          (is (= pid (:pid (claim/held-by dir)))))))))
+
+(deftest a-claim-whose-owner-is-gone-is-swept-not-honoured
+  (with-cache
+    (fn [cache]
+      (let [dir (Path/join cache "dead")]
+        (File/mkdir_p! dir)
+        ; A pid that cannot exist: /proc answers for real processes only.
+        (File/write! (Path/join dir ".claim") "[:claim 999999999 1 a-build-that-died]")
+        (is (nil? (claim/held-by dir)))
+        (let [r (claim/acquire! dir "sweeper")]
+          (is (:ok? r))
+          (is (:swept r) "the stale claim should have been reported as swept")
+          (is (= "sweeper" (:bin (claim/read-claim dir)))))))))
+
+(deftest a-claim-by-this-process-is-ours-not-a-conflict
+  (with-cache
+    (fn [cache]
+      (let [dir (Path/join cache "mine")]
+        (claim/acquire! dir "me")
+        (is (nil? (claim/held-by dir)))
+        (is (:ok? (claim/acquire! dir "me again")))
+        (is (= :ok (claim/release! dir)))
+        (is (nil? (claim/read-claim dir)))))))
+
+; ── the journal ─────────────────────────────────────────────────────────────
+
+; The CLI is the thing that journals a build, and `bl.cli/run-argv` is the
+; re-entrant seam that makes it testable from here: it parses argv, takes the
+; claim, writes the events and releases the claim, all in THIS VM — so the
+; journal it writes is the journal this test reads.
+;
+; What this replaced: a `System.cmd("mix", ["bl", "build", …])`. A subprocess
+; is a separate VM with its own journal, so the test could not assert on
+; anything the build wrote. Binding THIS command's cwd to the scratch tree is
+; the other half: without it the build discovers the REPO's env.bl by walking up
+; from the VM's cwd, and its `:ex` stage compiles all of lib/**/*.ex inside this
+; test — what made the subprocess version exceed its 60 s budget.
+(deftest the-cli-build-writes-build-start-and-build-done-into-the-journal
+  (with-cache
+    (fn [cache]
+      (let [out (Path/join cache "out")
+            src (Path/join cache "src/tiny.bl")]
+        (File/mkdir_p! (Path/dirname src))
+        (File/write! src "(ns tiny) (defn answer [] 42)\n")
+        (let [before (count (vec (reload/journal)))]
+          (is (= 0 (BeamLisp/with_cwd cache (fn [] (cli/run-argv (list "build" src "--out" out))))))
+          (let [j (vec (reload/journal))]
+            (is (= (+ before 2) (count j))
+                "a build journals exactly its start and its finish")
+            (let [start (nth j (- (count j) 2))
+                  done (nth j (- (count j) 1))]
+              (is (= :build/start (:event start)))
+              (is (= out (:out start)))
+              (is (= :build/done (:event done)))
+              (is (= 1 (:built done)))
+              (is (= 0 (:errors done))))
+            ; the claim is the build's exclusion, and a build that returns must
+            ; not leave the directory wedged for the next one
+            (is (not (File/exists? (Path/join out ".claim")))
+                "a finished build releases its claim")))))))

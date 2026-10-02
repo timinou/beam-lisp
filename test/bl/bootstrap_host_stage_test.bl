@@ -1,0 +1,547 @@
+; bootstrap_host_stage_test.bl — the launcher stages VERIFIED pinned host beams
+; before it runs elixirc, and that is what lets a cold tree compile
+; `%BeamLisp.Delay{}`.
+;
+; The failing state this pins, measured on a clean checkout:
+;
+;     error: struct BeamLisp.Delay is undefined (module BeamLisp.Delay is not
+;     available or is yet to be defined)
+;     == Compilation error in file lib/beam_lisp/refs.ex ==
+;
+; `lib/beam_lisp/delay.ex` is gone — the module is seeded from
+; `priv/host/delay.bl` — and `Bootstrap.install_hosts!/1` only puts the seed
+; beam on the path INSIDE the VM, after `elixirc` has already failed. So the
+; launcher stages the seed's host leaves into `build/` first and puts `build/`
+; on elixirc's code path. `bin/bl-stage-hosts` is the stage: an Erlang escript
+; that CONSULTS the seed manifest (`file:consult/1` over the Erlang-term
+; `manifest.term` — never `Code.eval_file` on the legacy Elixir file, so the
+; stage cannot execute the seed and needs no Elixir VM before elixirc),
+; SHA-verifies every pinned host leaf against it, and publishes each by
+; write-then-rename.
+;
+; What is proven here, with a scratch seed that carries ONLY `Delay`:
+;   * WITHOUT the stage, `elixirc` on a `%BeamLisp.Delay{}` fixture FAILS;
+;   * WITH the stage, the SAME fixture compiles, off the staged path alone;
+;   * a corrupt seed is refused and writes nothing;
+;   * a drifted destination is replaced by the pinned bytes (the stage is
+;     repair, not one-shot);
+;   * `Elixir.BeamLisp.Ns.*` entries are never staged, even though the manifest
+;     names one whose file does not exist — the filter is load-bearing, and a
+;     wrong one would fail loudly on exactly that entry;
+;   * the committed seed really stages `Delay`, so the proof is about the
+;     artifact this tree boots from and not only about a fixture.
+;
+; And, with a manifest that carries the optional `app` entry:
+;   * a cold stage writes `beam_lisp.app` — the resource OTP reads to START the
+;     application, without which a Mix-free tree dies with `no such file or
+;     directory, beam_lisp.app`;
+;   * an app SHA mismatch is refused BEFORE any write, so a corrupt floor leaves
+;     the destination untouched (app and hosts alike);
+;   * an app resource the destination already has is left alone (a floor is a
+;     bootstrap, not a correction);
+;   * a malformed app entry — including a filename that is not exactly
+;     `beam_lisp.app` (the traversal guard) — is refused;
+;   * a floor that omits the app entry (or encodes "none" as `nil`) still stages
+;     its hosts.
+;
+; Run: bl test test/bl/bootstrap_host_stage_test.bl
+
+(ns bootstrap.host.stage.test)
+
+(def delay-beam "Elixir.BeamLisp.Delay.beam")
+(def ns-beam "Elixir.BeamLisp.Ns.Init.Core.beam")
+
+; A pinned leaf OUTSIDE the `Elixir.BeamLisp.*` prefix — the case the explicit
+; `hosts` list exists to name. `Elixir.Enumerable.BeamLisp.Set` is the real one
+; (a protocol-impl module compiled beside its host source); this probe stands in
+; for it with a name no other test loads.
+(def enum-probe-beam "Elixir.Enumerable.BeamLisp.Probe.beam")
+
+; An in-prefix leaf the manifests below carry but do NOT name in `hosts`: the
+; explicit list, not the prefix, is what selects.
+(def unlisted-beam "Elixir.BeamLisp.UnlistedProbe.beam")
+
+; The app resource the floor carries beside its manifest: OTP reads it to START
+; the application, and it is the ONE filename the stage accepts (anything else
+; — a bare name, a path, `..` — is refused before a byte is written).
+(def app-file "beam_lisp.app")
+
+; A 64-hex string for the phantom Ns.* entry. It is never read: the name has no
+; file behind it, so a filter that let it through would fail on the missing
+; beam rather than pass silently.
+(def phantom-sha
+  "0000000000000000000000000000000000000000000000000000000000000000")
+
+(defn- sha256-hex [bytes]
+  (String/downcase (Base/encode16 (erlang/apply :crypto :hash (list :sha256 bytes)))))
+
+(defn- tmp-root []
+  (let [root (str (System/tmp_dir!) "/bl_host_stage_"
+                  (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p! root)
+    root))
+
+(defn- committed-seed-dir []
+  (Path/join (BeamLisp/cwd) "priv/bootstrap/seed"))
+
+(defn- host-leaf?
+  "The launcher's filter, spelled the same way: `Elixir.BeamLisp.*` that is not
+   part of the `Elixir.BeamLisp.Ns.*` generation ladder."
+  [name]
+  (and (String/starts_with? name "Elixir.BeamLisp.")
+       (not (String/starts_with? name "Elixir.BeamLisp.Ns."))))
+
+(defn- term-text
+  "An Erlang CONSULT file holding one term: what the stage reads. Data, never
+   code — the stage parses it with `file:consult/1`."
+  [term]
+  (str (erlang/list_to_binary (erlang/apply :io_lib :format (list "~p" (list term))))
+       ".\n"))
+
+(defn- committed-beams
+  "The seed's pinned HOST beams as `[name sha]` pairs, read from the DATA-ONLY
+   manifest the same way the launcher reads it — `file:consult/1` over the Erlang
+   term, never `Code.eval_file` — so a manifest the tree regenerates cannot
+   silently change what this test believes, and the test fails if the manifest
+   stops being readable as data. The manifest's OWN `hosts` list is the inventory
+   when it carries one (the authority `bin/bl-stage-hosts` consumes, which can
+   name a leaf outside the `Elixir.BeamLisp.*` prefix); a pre-change floor without
+   it falls back to that prefix rule."
+  []
+  (let [r (erlang/apply :file :consult
+                        (list (erlang/binary_to_list
+                                (Path/join (committed-seed-dir) "manifest.term"))))
+        ; `file:consult/1` answers `{:ok, [Term]}` — the term is the FIRST element
+        ; of the returned list, not the list itself.
+        manifest (erlang/hd (erlang/element 2 r))
+        modules (get manifest "modules")
+        listed (get manifest "hosts")
+        names (if (some? listed)
+                (vec listed)
+                (filter host-leaf? (keys modules)))]
+    (map (fn [name] (list name (get modules name))) names)))
+
+(defn- write-scratch-seed!
+  "A seed directory carrying ONLY the committed Delay beam, with an Erlang-term
+   manifest that records its sha plus a phantom `Ns.*` entry. Returns
+   `{:seed :manifest :bytes :sha}`."
+  [root]
+  (let [seed (Path/join root "seed")
+        bytes (File/read! (Path/join (committed-seed-dir) delay-beam))
+        sha (sha256-hex bytes)
+        manifest (Path/join seed "manifest.term")]
+    (File/mkdir_p! seed)
+    (File/write! (Path/join seed delay-beam) bytes)
+    (File/write! manifest
+      (term-text {"modules" {delay-beam sha ns-beam phantom-sha}}))
+    {:seed seed :manifest manifest :bytes bytes :sha sha}))
+
+(defn- seed-with-hosts!
+  "A seed carrying the committed Delay beam AND an out-of-prefix probe beam,
+   whose manifest NAMES them in `hosts`, alongside an in-prefix beam the list does
+   NOT name and a phantom `Elixir.BeamLisp.Ns.*` module. The probe's bytes are the
+   committed Delay beam's: the stage verifies and copies BYTES and never loads the
+   module, so the sha is the whole question. Returns
+   `{:seed :manifest :bytes :sha}`."
+  [root]
+  (let [seed (Path/join root "seed")
+        bytes (File/read! (Path/join (committed-seed-dir) delay-beam))
+        sha (sha256-hex bytes)
+        manifest (Path/join seed "manifest.term")]
+    (File/mkdir_p! seed)
+    (File/write! (Path/join seed delay-beam) bytes)
+    (File/write! (Path/join seed enum-probe-beam) bytes)
+    (File/write! (Path/join seed unlisted-beam) bytes)
+    (File/write! manifest
+      (term-text {"hosts" (list enum-probe-beam delay-beam)
+                  "modules" {delay-beam sha
+                             enum-probe-beam sha
+                             unlisted-beam sha
+                             ns-beam phantom-sha}}))
+    {:seed seed :manifest manifest :bytes bytes :sha sha}))
+
+(defn- stage-from-manifest!
+  "Run the stage against a manifest written from the given `hosts` and `modules`
+   as DATA. Nothing needs to exist on disk: a malformed inventory fails BEFORE
+   any beam is read, so the assertion is about validation, not about a file."
+  [root hosts modules]
+  (let [seed (Path/join root "seed")
+        manifest (Path/join seed "manifest.term")]
+    (File/mkdir_p! seed)
+    (File/write! manifest (term-text {"hosts" hosts "modules" modules}))
+    (stage! manifest seed (Path/join root "build"))))
+
+(defn- write-seed-with-app!
+  "A seed carrying the committed Delay beam AND the committed `beam_lisp.app`,
+   with an Erlang-term manifest recording both — the cold floor the launcher
+   stages before `elixirc`. Returns `{:seed :manifest :bytes :sha :app-bytes
+   :app-sha}`."
+  [root]
+  (let [seed (Path/join root "seed")
+        bytes (File/read! (Path/join (committed-seed-dir) delay-beam))
+        sha (sha256-hex bytes)
+        app-bytes (File/read! (Path/join (committed-seed-dir) app-file))
+        app-sha (sha256-hex app-bytes)
+        manifest (Path/join seed "manifest.term")]
+    (File/mkdir_p! seed)
+    (File/write! (Path/join seed delay-beam) bytes)
+    (File/write! (Path/join seed app-file) app-bytes)
+    (File/write! manifest
+      (term-text {"hosts" (list delay-beam)
+                  "modules" {delay-beam sha}
+                  "app" {"file" app-file "sha256" app-sha}}))
+    {:seed seed :manifest manifest :bytes bytes :sha sha
+     :app-bytes app-bytes :app-sha app-sha}))
+
+(defn- stage-with-app!
+  "Run the stage against a manifest that names the committed Delay beam as a
+   pinned host and carries the given `app` entry (or `:omit` to leave the key
+   out). The seed carries the Delay bytes, so a malformed-app refusal is proven
+   to happen BEFORE the (otherwise valid) host would be written."
+  [root app]
+  (let [seed (Path/join root "seed")
+        bytes (File/read! (Path/join (committed-seed-dir) delay-beam))
+        sha (sha256-hex bytes)
+        manifest (Path/join seed "manifest.term")
+        base {"hosts" (list delay-beam) "modules" {delay-beam sha}}]
+    (File/mkdir_p! seed)
+    (File/write! (Path/join seed delay-beam) bytes)
+    (File/write! manifest
+      (term-text (if (= :omit app) base (assoc base "app" app))))
+    (stage! manifest seed (Path/join root "build"))))
+
+(defn- fixture!
+  "A tiny `%BeamLisp.Delay{}` source: the struct pattern is resolved at COMPILE
+   time, which is the whole question."
+  [root mod]
+  (let [path (Path/join root (str mod ".ex"))]
+    (File/write!
+      path
+      (str "defmodule " mod " do\n"
+           "  def keep(%BeamLisp.Delay{} = d), do: d\n"
+           "end\n"))
+    path))
+
+(defn- compile!
+  "elixirc with only `ebin` on the code path — the staged path, never the seed."
+  [fixture ebin out]
+  (System/cmd "elixirc"
+    (to-list ["-pa" ebin "-o" out fixture])
+    (to-list [(tuple :stderr_to_stdout true)])))
+
+(defn- stage!
+  "The launcher's stage, invoked the way `bin/bl` invokes it: as the executable
+   itself, not through `escript` (the shebang and the exec bit are part of what
+   `bin/bl` depends on)."
+  [manifest seed dest]
+  (System/cmd (Path/join (BeamLisp/cwd) "bin/bl-stage-hosts")
+    (to-list [manifest seed dest])
+    (to-list [(tuple :stderr_to_stdout true)])))
+
+; ── the fail-without / pass-with pair ────────────────────────────────────────
+
+(deftest a-cold-compile-needs-the-staged-host-path
+  (let [root (tmp-root)]
+    (try
+      (let [{:keys [seed manifest bytes sha]} (write-scratch-seed! root)
+            ebin (Path/join root "build")
+            fixture (fixture! root "BlHostStageProbeCold")
+            without (Path/join root "out-without")
+            with (Path/join root "out-with")]
+        (File/mkdir_p! ebin)
+        (File/mkdir_p! without)
+        (File/mkdir_p! with)
+
+        ; 1. WITHOUT the stage, the struct is undefined and elixirc fails.
+        (let [r (compile! fixture ebin without)]
+          (is (not= 0 (elem r 1))
+              (str "elixirc must FAIL with no host beam staged:\n" (elem r 0)))
+          (is (includes? (elem r 0) "struct BeamLisp.Delay is undefined")
+              (str "the failure must be the missing struct:\n" (elem r 0))))
+
+        ; 2. The stage puts the manifest's bytes in the ebin — and nothing else.
+        (let [s (stage! manifest seed ebin)]
+          (is (= 0 (elem s 1)) (str "bl-stage-hosts failed:\n" (elem s 0)))
+          (is (File/exists? (Path/join ebin delay-beam))
+              "the pinned Delay beam is staged")
+          (is (= sha (sha256-hex (File/read! (Path/join ebin delay-beam))))
+              "the staged beam is the manifest's bytes, not a bystander")
+          (is (= bytes (File/read! (Path/join ebin delay-beam))))
+          (is (not (File/exists? (Path/join ebin ns-beam)))
+              "an `Elixir.BeamLisp.Ns.*` entry is never staged"))
+
+        ; 3. WITH the stage, the SAME fixture compiles off the staged path alone.
+        (let [r (compile! fixture ebin with)]
+          (is (= 0 (elem r 1))
+              (str "elixirc must PASS with the staged host path:\n" (elem r 0)))
+          (is (File/exists? (Path/join with "Elixir.BlHostStageProbeCold.beam"))
+              "the fixture compiled to a beam")))
+      (finally (File/rm_rf! root)))))
+
+; ── the refusals ────────────────────────────────────────────────────────────
+
+(deftest a-corrupt-seed-is-refused-and-writes-nothing
+  (let [root (tmp-root)]
+    (try
+      (let [{:keys [seed manifest]} (write-scratch-seed! root)
+            ebin (Path/join root "build")]
+        (File/mkdir_p! ebin)
+        ; Corrupt the beam AFTER the manifest recorded its sha.
+        (File/write! (Path/join seed delay-beam) "not a beam")
+        (let [s (stage! manifest seed ebin)]
+          (is (not= 0 (elem s 1)) "a corrupt seed must fail the stage")
+          (is (includes? (elem s 0) "CORRUPT") (elem s 0))
+          (is (not (File/exists? (Path/join ebin delay-beam)))
+              "a refused seed leaves the destination untouched")))
+      (finally (File/rm_rf! root)))))
+
+(deftest a-missing-manifest-is-refused-loudly
+  (let [root (tmp-root)]
+    (try
+      (let [s (stage! (Path/join root "nope.term") root (Path/join root "build"))]
+        (is (not= 0 (elem s 1)))
+        (is (includes? (elem s 0) "missing") (elem s 0)))
+      (finally (File/rm_rf! root)))))
+
+; ── repair, not a one-shot ──────────────────────────────────────────────────
+
+(deftest a-drifted-destination-is-replaced-by-the-pinned-bytes
+  (let [root (tmp-root)]
+    (try
+      (let [{:keys [seed manifest bytes]} (write-scratch-seed! root)
+            ebin (Path/join root "build")]
+        (File/mkdir_p! ebin)
+        (File/write! (Path/join ebin delay-beam) "stale bytes that are not the seed")
+        (let [s (stage! manifest seed ebin)]
+          (is (= 0 (elem s 1)) (str (elem s 0)))
+          (is (= bytes (File/read! (Path/join ebin delay-beam)))
+              "a drifted beam is repaired by the seed")
+          ; And a second run changes nothing (idempotent).
+          (let [again (stage! manifest seed ebin)]
+            (is (= 0 (elem again 1)))
+            (is (= bytes (File/read! (Path/join ebin delay-beam)))))))
+      (finally (File/rm_rf! root)))))
+
+; ── the committed seed is the artifact this proof is about ─────────────────
+
+(deftest the-committed-seed-stages-its-pinned-host-leaves
+  (let [root (tmp-root)]
+    (try
+      (let [ebin (Path/join root "build")
+            hosts (committed-beams)
+            s (stage! (Path/join (committed-seed-dir) "manifest.term")
+                      (committed-seed-dir) ebin)]
+        (is (= 0 (elem s 1)) (str "the committed seed must stage:\n" (elem s 0)))
+        (is (>= (count hosts) 1))
+        (is (some (fn [[k _]] (= k delay-beam)) hosts)
+            "Delay is one of the committed seed's host leaves")
+        (doseq [[name sha] hosts]
+          (is (File/exists? (Path/join ebin name)) (str name " must be staged"))
+          (is (= sha (sha256-hex (File/read! (Path/join ebin name))))
+              (str name " must be the manifest's bytes"))))
+      (finally (File/rm_rf! root)))))
+
+; ── the manifest's `hosts` list is the staging authority ─────────────────────
+;
+; An explicit list, not a name prefix, selects what is staged — that is what lets
+; a pinned leaf OUTSIDE `Elixir.BeamLisp.*` (a protocol-impl module compiled
+; beside its host source) be named. The prefix rule survives only as the fallback
+; for a floor too old to carry the list.
+
+(deftest the-manifest-hosts-list-is-what-is-staged
+  (let [root (tmp-root)]
+    (try
+      (let [{:keys [seed manifest bytes]} (seed-with-hosts! root)
+            ebin (Path/join root "build")]
+        (File/mkdir_p! ebin)
+        (let [s (stage! manifest seed ebin)]
+          (is (= 0 (elem s 1)) (str "bl-stage-hosts failed:\n" (elem s 0)))
+          (is (File/exists? (Path/join ebin enum-probe-beam))
+              "a pinned leaf OUTSIDE `Elixir.BeamLisp.*`, named in `hosts`, is staged")
+          (is (= bytes (File/read! (Path/join ebin enum-probe-beam))))
+          (is (File/exists? (Path/join ebin delay-beam))
+              "a named in-prefix leaf is staged too")
+          (is (not (File/exists? (Path/join ebin unlisted-beam)))
+              "an in-prefix beam the list does NOT name is not staged")
+          (is (not (File/exists? (Path/join ebin ns-beam)))
+              "an `Elixir.BeamLisp.Ns.*` entry is never staged")))
+      (finally (File/rm_rf! root)))))
+
+(deftest a-malformed-hosts-inventory-is-refused
+  (let [root (tmp-root)]
+    (try
+      (let [one {delay-beam phantom-sha}]
+        ; a generation-ladder module named as a pinned host
+        (let [s (stage-from-manifest! root (list ns-beam) one)]
+          (is (not= 0 (elem s 1)) "an `Elixir.BeamLisp.Ns.*` host must fail")
+          (is (includes? (elem s 0) "generation-ladder") (elem s 0)))
+        ; a duplicate entry
+        (let [s (stage-from-manifest! root (list delay-beam delay-beam) one)]
+          (is (not= 0 (elem s 1)) "a duplicate host must fail")
+          (is (includes? (elem s 0) "more than once") (elem s 0)))
+        ; a name the floor does not carry
+        (let [s (stage-from-manifest! root (list unlisted-beam) one)]
+          (is (not= 0 (elem s 1)) "a host absent from `modules` must fail")
+          (is (includes? (elem s 0) "absent") (elem s 0)))
+        ; a malformed name (no `.beam`)
+        (let [s (stage-from-manifest! root (list "Elixir.BeamLisp.NotABeam") one)]
+          (is (not= 0 (elem s 1)) "a malformed host name must fail")
+          (is (includes? (elem s 0) "malformed") (elem s 0)))
+        ; `hosts` present but not a list
+        (let [s (stage-from-manifest! root "nope" one)]
+          (is (not= 0 (elem s 1)) "a non-list `hosts` must fail")
+          (is (includes? (elem s 0) "not a list") (elem s 0))))
+      (finally (File/rm_rf! root)))))
+
+(deftest a-floor-without-a-hosts-list-still-stages-by-the-prefix-rule
+  ;; Backwards compatibility: a floor built before the inventory field existed
+  ;; stages exactly what it staged before. The existing cold-compile tests use
+  ;; `write-scratch-seed!` (no `hosts`); this states the rule directly.
+  (let [root (tmp-root)]
+    (try
+      (let [{:keys [seed manifest bytes]} (write-scratch-seed! root)
+            ebin (Path/join root "build")]
+        (File/mkdir_p! ebin)
+        (let [s (stage! manifest seed ebin)]
+          (is (= 0 (elem s 1)) (str (elem s 0)))
+          (is (= bytes (File/read! (Path/join ebin delay-beam)))
+              "the prefix fallback stages the pinned `Elixir.BeamLisp.*` leaf")
+          (is (not (File/exists? (Path/join ebin ns-beam))))))
+      (finally (File/rm_rf! root)))))
+
+; ── the app resource is part of the floor ───────────────────────────────────
+;
+; `beam_lisp.app` is what OTP reads to START the application: a Mix-free cold
+; tree that compiled its substrate and then died with
+; `{:error, {:beam_lisp, {~c"no such file or directory", ~c"beam_lisp.app"}}}`
+; was a floor whose stage left the app resource behind. The stage now carries
+; it — SHA-verified with the host set and BEFORE any destination write, and
+; published only when the destination has none, the same "a floor is a
+; bootstrap, not a correction" rule `Bootstrap.install!/1` keeps.
+
+(deftest a-cold-stage-writes-the-seed-app-resource
+  (let [root (tmp-root)]
+    (try
+      (let [{:keys [seed manifest app-bytes]} (write-seed-with-app! root)
+            ebin (Path/join root "build")]
+        (File/mkdir_p! ebin)
+        (let [s (stage! manifest seed ebin)]
+          (is (= 0 (elem s 1)) (str "bl-stage-hosts failed:\n" (elem s 0)))
+          (is (File/exists? (Path/join ebin app-file))
+              "the seed's app resource is staged")
+          (is (= app-bytes (File/read! (Path/join ebin app-file)))
+              "the staged app resource is the seed's bytes, not a bystander")
+          ; Idempotent: a second run leaves the app resource alone.
+          (let [again (stage! manifest seed ebin)]
+            (is (= 0 (elem again 1)))
+            (is (= app-bytes (File/read! (Path/join ebin app-file)))))))
+      (finally (File/rm_rf! root)))))
+
+(deftest an-app-sha-mismatch-is-refused-before-any-write
+  (let [root (tmp-root)]
+    (try
+      (let [{:keys [seed manifest]} (write-seed-with-app! root)
+            ebin (Path/join root "build")]
+        (File/mkdir_p! ebin)
+        ; Corrupt the app AFTER the manifest recorded its sha, and leave the
+        ; (valid) host in place: the refusal must leave the destination
+        ; untouched — neither the app NOR the host that would otherwise stage.
+        (File/write! (Path/join seed app-file) "not the floor's app resource")
+        (let [s (stage! manifest seed ebin)]
+          (is (not= 0 (elem s 1)) "a corrupt app resource must fail the stage")
+          (is (includes? (elem s 0) "CORRUPT") (elem s 0))
+          (is (not (File/exists? (Path/join ebin app-file)))
+              "the corrupt app is not staged")
+          (is (not (File/exists? (Path/join ebin delay-beam)))
+              "the app is verified BEFORE the host set is written")))
+      (finally (File/rm_rf! root)))))
+
+(deftest an-existing-app-resource-is-not-overridden
+  (let [root (tmp-root)]
+    (try
+      (let [{:keys [seed manifest bytes]} (write-seed-with-app! root)
+            ebin (Path/join root "build")]
+        (File/mkdir_p! ebin)
+        ; A tree that ran `bl build` wrote its own app resource from the current
+        ; project value: a floor is a bootstrap, not a correction, so the stage
+        ; keeps it — even though the seed's copy is SHA-verified regardless.
+        (File/write! (Path/join ebin app-file) "the tree's own app resource")
+        (let [s (stage! manifest seed ebin)]
+          (is (= 0 (elem s 1)) (str (elem s 0)))
+          (is (= "the tree's own app resource" (File/read! (Path/join ebin app-file)))
+              "an existing app resource is left alone")
+          (is (= bytes (File/read! (Path/join ebin delay-beam)))
+              "the host set still stages around it")))
+      (finally (File/rm_rf! root)))))
+
+(deftest a-malformed-app-entry-is-refused
+  (let [root (tmp-root)]
+    (try
+      ; not a map at all
+      (let [s (stage-with-app! root "nope")]
+        (is (not= 0 (elem s 1)) "a non-map `app` must fail")
+        (is (includes? (elem s 0) "not a map") (elem s 0)))
+      ; a filename that is not EXACTLY `beam_lisp.app` — the traversal guard. A
+      ; separator, `..`, or an absolute path would let the manifest reach
+      ; outside the seed directory; only the one name OTP reads is accepted.
+      (doseq [bad (list "evil.app" "../beam_lisp.app" "sub/beam_lisp.app" "/etc/beam_lisp.app")]
+        (let [s (stage-with-app! root {"file" bad "sha256" phantom-sha})]
+          (is (not= 0 (elem s 1)) (str "`" bad "` must fail"))
+          (is (includes? (elem s 0) "not exactly beam_lisp.app") (elem s 0))))
+      ; no "sha256"
+      (let [s (stage-with-app! root {"file" app-file})]
+        (is (not= 0 (elem s 1)) "a missing sha256 must fail")
+        (is (includes? (elem s 0) "no \"sha256\"") (elem s 0)))
+      ; sha256 not a string
+      (let [s (stage-with-app! root {"file" app-file "sha256" 42})]
+        (is (not= 0 (elem s 1)) "a non-string sha256 must fail")
+        (is (includes? (elem s 0) "not a string") (elem s 0)))
+      ; sha256 is not 64 hex characters
+      (let [s (stage-with-app! root {"file" app-file "sha256" "deadbeef"})]
+        (is (not= 0 (elem s 1)) "a short sha256 must fail")
+        (is (includes? (elem s 0) "64 hex") (elem s 0)))
+      ; no "file"
+      (let [s (stage-with-app! root {"sha256" phantom-sha})]
+        (is (not= 0 (elem s 1)) "a missing file must fail")
+        (is (includes? (elem s 0) "no \"file\"") (elem s 0)))
+      ; the right shape, but the seed carries no such file: refused, not skipped
+      (let [s (stage-with-app! root {"file" app-file "sha256" phantom-sha})]
+        (is (not= 0 (elem s 1)) "a missing app file must fail")
+        (is (includes? (elem s 0) "does not carry beam_lisp.app") (elem s 0)))
+      (finally (File/rm_rf! root)))))
+
+(deftest a-floor-without-an-app-entry-is-still-staged
+  ;; Backwards compatibility: a pre-change floor carries no `app` key (the
+  ;; generator's own "no app" encoding is `nil`), and the stage must stage its
+  ;; hosts and simply carry no app resource. `write-scratch-seed!` writes
+  ;; neither shape of the key.
+  (let [root (tmp-root)]
+    (try
+      (let [{:keys [seed manifest bytes]} (write-scratch-seed! root)
+            ebin (Path/join root "build")]
+        (File/mkdir_p! ebin)
+        (let [s (stage! manifest seed ebin)]
+          (is (= 0 (elem s 1)) (str (elem s 0)))
+          (is (= bytes (File/read! (Path/join ebin delay-beam))))
+          (is (not (File/exists? (Path/join ebin app-file)))
+              "no app entry, no app resource staged")))
+      (finally (File/rm_rf! root)))
+    ; the generator's `nil` is ABSENT, not malformed
+    (let [s (stage-with-app! root nil)]
+      (is (= 0 (elem s 1)) (str "a `nil` app entry must be tolerated:\n" (elem s 0))))))
+
+; ── the committed seed's app resource is the real artifact ───────────────────
+
+(deftest the-committed-seed-stages-its-app-resource
+  (let [root (tmp-root)]
+    (try
+      (let [ebin (Path/join root "build")
+            app-bytes (File/read! (Path/join (committed-seed-dir) app-file))
+            s (stage! (Path/join (committed-seed-dir) "manifest.term")
+                      (committed-seed-dir) ebin)]
+        (is (= 0 (elem s 1)) (str "the committed seed must stage:\n" (elem s 0)))
+        (is (File/exists? (Path/join ebin app-file))
+            "the committed floor's app resource is staged")
+        (is (= app-bytes (File/read! (Path/join ebin app-file)))
+            "the staged app resource is the committed floor's bytes"))
+      (finally (File/rm_rf! root)))))

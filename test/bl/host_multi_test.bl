@@ -1,0 +1,661 @@
+; host_multi_test.bl — the pinned ABI for `BeamLisp.Multi`.
+;
+; `priv/host/multi.bl` is ONE pinned source that
+; `BeamLisp.AOT/compile_host_file` compiles at an exact atom with NO compile
+; options (functions-only — open dispatch lives in `BeamLisp.Env`'s ETS table,
+; not in a struct):
+;
+;     :module <atom>   :output_dir <dir>   :file priv/host/multi.bl
+;     :source_hash <sha256>   :load? false
+;
+; The running `Elixir.BeamLisp.Multi` (still `lib/beam_lisp/multi.ex`) is the
+; ground truth, so the suite is DIFFERENTIAL: one corpus of observations runs
+; through a probe compiled from the pinned source and through the live module,
+; and the two answer sets must be equal — values, exception CLASSES and
+; MESSAGES, and the ORDER of the `ancestors`/`method_keys` sets.
+;
+; The observation is normalized on two axes only:
+;   * the NAMESPACE the corpus runs under — the probe and the live module share
+;     one `BeamLisp.Env`, so each walks its OWN hierarchy/protocol/multi rows
+;     (`host.multi.test.probe` → `host.multi.test.live`); without this the two
+;     runs would read each other's tables;
+;   * FUNCTION values, REFERENCES and PIDS → `:fn-value`/`:ref`/`:pid`, because
+;     a method table holds fresh closures per run and a reify tag is a fresh
+;     per-evaluation reference. Everything else compares raw.
+;
+; What each block pins:
+;   * SURFACE — the pinned beam's exports against the live module's: the
+;     fifteen public functions and NOTHING else (no `defn-` helper escapes,
+;     because the live module's `multi!`/`no_method_error`/`walk_ancestors`/
+;     `protocol!` are private, and no synthesized struct surface);
+;   * TYPE TAGS — `type_of/1` over every clause head, and `normalize_key/1`,
+;     including the two the guard list decides: a struct whose `:__struct__` is
+;     an ATOM maps to its module, one whose tag is NOT an atom is a plain map
+;     (`is_bl_map/1` excludes structs, and `is_struct/1` requires an atom tag),
+;     and a reify tag (a reference) is scrubbed. OUTSIDE every clause — a PORT
+;     is the reachable one — the live module has NO catch-all: it is the live
+;     `FunctionClauseError`, and the pinned port must refuse the same way
+;     rather than answer a silent nil;
+;   * OPEN DISPATCH, differentially — multimethods (define/redefine keeping the
+;     table, `add_method`, exact-key and `isa?` dispatch, `:default`, the vector
+;     key normalization, the interned var re-entering `dispatch/3` through its
+;     `$blfn` variadic slot, `method_keys`, and the two `RuntimeError`s with
+;     their messages), the hierarchy (`derive`/`parents`/`ancestors`/`isa?`/
+;     `underive`, a CYCLE that must terminate, multi-parent `underive`), and
+;     protocols (`define_protocol`/`extend_type`/`dispatch_protocol`/
+;     `satisfies?`, an incomplete extension refused with the missing list, a
+;     type with no row, an empty protocol that satisfies nothing, and
+;     struct/deftype tags as first-class types);
+;   * RESET/CLEANUP — every key the corpus wrote is deleted from the store it
+;     was written to, and the suite asserts the store is EMPTY again, so the
+;     differential leaves no residue behind for the next test;
+;   * the pinned beam STANDING IN at the production atom, exercised, then the
+;     live beam RESTORED — the compiler calls `extend_type/4` on every record,
+;     so the atom has to keep answering.
+;
+; Run: bin/bl test test/bl/host_multi_test.bl
+
+(ns host.multi.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_multi_" (erlang/unique_integer (list :positive))))
+
+(defn- src [] (Path/join (BeamLisp/cwd) "priv/host/multi.bl"))
+
+(def ^:private probe :"Elixir.BeamLisp.HostMultiProbe")
+(def ^:private shim :"Elixir.BeamLisp.Ns.Host.Multi")
+(def ^:private live :"Elixir.BeamLisp.Multi")
+(def ^:private live-ns "host.multi.test.live")
+(def ^:private probe-ns "host.multi.test.probe")
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- seed-opts
+  "The EXACT option list the seed's `host-opts` builds for a functions-only host
+   entry: `:module`/`:output_dir`/`:file`/`:source_hash`/`:load? false`."
+  [mod dir]
+  (list (t2 :module mod)
+        (t2 :output_dir dir)
+        (t2 :file (src))
+        (t2 :source_hash (crypto/hash :sha256 (File/read! (src))))
+        (t2 :load? false)))
+
+(defn- compile-at
+  "Compile the pinned source at exact atom `mod`, then publish ONLY the pinned
+   beam: the compile's own load (and the namespace shim it built beside it) is
+   dropped first."
+  [mod dir]
+  (let [res (BeamLisp.AOT/compile_host_file (src) (seed-opts mod dir))
+        path (elem res 1)]
+    (drop! mod)
+    (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+    (drop! shim)
+    mod))
+
+(defn- nonbinary-bits
+  "A NON-binary bitstring — `<<5::3>>` — built without a bitstring literal (the
+   reader has none) by decoding its external term form. `is_binary/1` is false
+   for it and it matches no `type_of` clause, so the live `FunctionClauseError`
+   is the answer for either module."
+  []
+  (erlang/binary_to_term (erlang/list_to_binary (list 131 77 0 0 0 1 3 160))))
+
+(defn- exports [mod]
+  (Enum/sort (erlang/apply mod :module_info (list :exports))))
+
+(defn- functional-exports
+  "What a pinned beam's surface is measured against: `__info__/1` is generated
+   by the Elixir compiler for every Elixir module and is NOT part of the ABI a
+   pinned (functions-only) port carries."
+  [mod]
+  (Enum/sort (filter (fn [e] (not (erlang/== :__info__ (elem e 0)))) (exports mod))))
+
+; ── normalization ─────────────────────────────────────────────────────────
+
+(defn- norm
+  "The corpus namespace a run walked — the probe run's, rewritten to the live
+   run's — and the MODULE a refusal names: the pinned emitter names the atom it
+   was compiled into, so a `FunctionClauseError` message carries the probe atom
+   until it is rewritten to the production one."
+  [s]
+  (String/replace (String/replace s probe-ns live-ns)
+                  "BeamLisp.HostMultiProbe" "BeamLisp.Multi"))
+
+(defn- scrub
+  "The observation with the by-design differences erased: a fresh function value
+   becomes `:fn-value` (a method table holds per-run closures), a reference
+   `:ref`, a pid `:pid`, and the probe namespace becomes the live one. The walk
+   is structural — maps and tuples included — because a method table and a
+   hierarchy both hold the ns and carry closures."
+  [v]
+  (cond
+    (erlang/is_function v) :fn-value
+    (erlang/is_reference v) :ref
+    (erlang/is_pid v) :pid
+    (erlang/is_binary v) (norm v)
+    (erlang/is_list v) (Enum/map v scrub)
+    (erlang/is_tuple v) (erlang/list_to_tuple (Enum/map (erlang/tuple_to_list v) scrub))
+    (erlang/is_map v)
+    (Map/new (Enum/map v (fn [pair] (tuple (scrub (elem pair 0)) (scrub (elem pair 1))))))
+    :else v))
+
+(defn- obs
+  "`value` or `[:raise class message]`, normalized."
+  [thunk]
+  (try (scrub (thunk))
+       (catch e (list :raise (:__struct__ e) (norm (ex-message e))))))
+
+(defn- sorted-scrub [v] (Enum/sort (Enum/map v (fn [x] (scrub x)))))
+
+; ── the corpus ────────────────────────────────────────────────────────────
+;
+; A LIST of thunks so the side effects run in list order (`Enum/map` is
+; left-to-right; a bare `(list …)` of already-run calls would not be, since
+; beam-lisp evaluates call arguments right-to-left). Every thunk is
+; self-contained, so the corpus is reproducible in either module's run — and
+; everything it registers lives under the `ns` it is handed, which is why the
+; probe and the live module never touch each other's rows in the shared Env.
+
+(defn- cases
+  [mod ns]
+  (list
+    ; ── type_of: every clause head, in the order the guards decide ─────
+    (fn [] (erlang/apply mod :type_of (list 1)))
+    (fn [] (erlang/apply mod :type_of (list 1.5)))
+    (fn [] (erlang/apply mod :type_of (list "s")))
+    (fn [] (erlang/apply mod :type_of (list true)))
+    (fn [] (erlang/apply mod :type_of (list false)))
+    (fn [] (erlang/apply mod :type_of (list nil)))
+    (fn [] (erlang/apply mod :type_of (list :kw)))
+    (fn [] (erlang/apply mod :type_of (list (list 1 2))))
+    (fn [] (erlang/apply mod :type_of (list (BeamLisp.Vector/new (list 1 2)))))
+    (fn [] (erlang/apply mod :type_of (list (lazy-seq (list 1 2)))))
+    (fn [] (erlang/apply mod :type_of (list (maps/new))))
+    ; a struct tagged with a NON-atom is a PLAIN map: `is_struct/1` requires an
+    ; atom tag, so `is_bl_map/1` does not exclude it.
+    (fn [] (erlang/apply mod :type_of (list (maps/put :__struct__ "x" (maps/new)))))
+    (fn [] (erlang/apply mod :type_of (list (maps/put :__struct__ :"Elixir.Range" (maps/new)))))
+    (fn [] (erlang/apply mod :type_of (list (fn [] 1))))
+    (fn [] (erlang/apply mod :type_of (list (tuple 1 2))))
+    (fn [] (erlang/apply mod :type_of (list (erlang/self))))
+    (fn [] (erlang/apply mod :type_of (list (erlang/make_ref))))
+    (fn [] (erlang/apply mod :type_of (list (tuple :bl_deftype :"Elixir.Foo" (maps/new)))))
+    (fn [] (erlang/apply mod :type_of (list (tuple :bl_deftype "x" (maps/new)))))
+    (fn [] (erlang/apply mod :type_of (list (tuple :bl_reify (erlang/make_ref) (maps/new)))))
+    (fn [] (erlang/apply mod :type_of (list (tuple :bl_reify "x" (maps/new)))))
+
+    ; ── normalize_key: the vector case, and everything else as itself ──
+    (fn [] (erlang/apply mod :normalize_key (list (BeamLisp.Vector/new (list 1 2)))))
+    (fn [] (erlang/apply mod :normalize_key (list :plain)))
+    (fn [] (erlang/apply mod :normalize_key (list (list 1 2))))
+    (fn [] (erlang/apply mod :normalize_key (list (lazy-seq (list 1 2)))))
+
+    ; ── multimethods: the refusals first, then a real dispatch table ───
+    (fn [] (erlang/apply mod :dispatch (list ns "nope" (list 1))))
+    (fn [] (erlang/apply mod :add_method (list ns "nope" :a (fn [x] :a))))
+    (fn [] (erlang/apply mod :method_keys (list ns "nope")))
+    (fn [] (erlang/apply mod :define_multi (list ns "speak" (fn [k] k))))
+    (fn [] (sorted-scrub (erlang/apply mod :method_keys (list ns "speak"))))
+    (fn [] (erlang/apply mod :add_method (list ns "speak" :dog (fn [k] "woof"))))
+    (fn [] (erlang/apply mod :dispatch (list ns "speak" (list :dog))))
+    (fn [] (erlang/apply mod :dispatch (list ns "speak" (list :cat))))
+    (fn [] (erlang/apply mod :add_method (list ns "speak" :default (fn [k] "???"))))
+    (fn [] (erlang/apply mod :dispatch (list ns "speak" (list :cat))))
+    (fn [] (sorted-scrub (erlang/apply mod :method_keys (list ns "speak"))))
+    ; CLJ-1351: re-defining reuses the table and only swaps the dispatch fn.
+    (fn [] (erlang/apply mod :define_multi (list ns "speak" (fn [k] k))))
+    (fn [] (erlang/apply mod :dispatch (list ns "speak" (list :dog))))
+    (fn [] (sorted-scrub (erlang/apply mod :method_keys (list ns "speak"))))
+    ; the interned multi var re-enters dispatch/3 through its $blfn variadic.
+    (fn [] (let [r (BeamLisp.Env/lookup (tuple ns "speak"))]
+             (if (and (tuple? r) (erlang/== :ok (elem r 0)))
+               (BeamLisp.Ns.Rt/invoke (elem r 1) (list :dog))
+               :missing)))
+    ; a vector dispatch value normalizes, so a structurally-equal vector hits.
+    (fn [] (erlang/apply mod :define_multi (list ns "vkey" (fn [v] v))))
+    (fn [] (erlang/apply mod :add_method (list ns "vkey" (BeamLisp.Vector/new (list 1 2)) (fn [v] :vec-hit))))
+    (fn [] (erlang/apply mod :dispatch (list ns "vkey" (list (BeamLisp.Vector/new (list 1 2))))))
+    (fn [] (sorted-scrub (erlang/apply mod :method_keys (list ns "vkey"))))
+    (fn [] (erlang/apply mod :add_method (list ns "speak" :dog (fn [k] "WOOF"))))
+    (fn [] (erlang/apply mod :dispatch (list ns "speak" (list :dog))))
+
+    ; ── the hierarchy: derive/parents/ancestors/isa?/underive ──────────
+    (fn [] (erlang/apply mod :define_multi (list ns "sound" (fn [k] k))))
+    (fn [] (erlang/apply mod :add_method (list ns "sound" :animal (fn [k] :generic))))
+    (fn [] (erlang/apply mod :derive (list ns :dog :animal)))
+    (fn [] (erlang/apply mod :dispatch (list ns "sound" (list :dog))))
+    (fn [] (erlang/apply mod :parents (list ns :dog)))
+    (fn [] (sorted-scrub (erlang/apply mod :ancestors (list ns :dog))))
+    (fn [] (erlang/apply mod :isa? (list ns :dog :animal)))
+    (fn [] (erlang/apply mod :isa? (list ns :dog :dog)))
+    (fn [] (erlang/apply mod :isa? (list ns :dog :cat)))
+    (fn [] (erlang/apply mod :underive (list ns :dog :animal)))
+    (fn [] (erlang/apply mod :dispatch (list ns "sound" (list :dog))))
+    (fn [] (erlang/apply mod :underive (list ns :nope :x)))
+    (fn [] (erlang/apply mod :parents (list ns :unknown)))
+    (fn [] (do (erlang/apply mod :derive (list ns :puppy :dog))
+               (erlang/apply mod :derive (list ns :dog :animal))
+               (sorted-scrub (erlang/apply mod :ancestors (list ns :puppy)))))
+    (fn [] (do (erlang/apply mod :derive (list ns :x1 :y1))
+               (erlang/apply mod :derive (list ns :x1 :y1))
+               (erlang/apply mod :parents (list ns :x1))))
+    ; a CYCLE must terminate, and answer the same set on both sides.
+    (fn [] (do (erlang/apply mod :derive (list ns :ca :cb))
+               (erlang/apply mod :derive (list ns :cb :ca))
+               (sorted-scrub (erlang/apply mod :ancestors (list ns :ca)))))
+    (fn [] (erlang/apply mod :isa? (list ns :cb :ca)))
+    ; underive drops ONE parent and keeps the rest; the last one deletes the key.
+    (fn [] (do (erlang/apply mod :derive (list ns :m :p1))
+               (erlang/apply mod :derive (list ns :m :p2))
+               (erlang/apply mod :underive (list ns :m :p1))
+               (erlang/apply mod :parents (list ns :m))))
+    (fn [] (do (erlang/apply mod :underive (list ns :m :p2))
+               (erlang/apply mod :parents (list ns :m))))
+
+    ; ── protocols: descriptor, extension, dispatch, predicate ──────────
+    (fn [] (erlang/apply mod :satisfies? (list ns "Nope" 1)))
+    (fn [] (erlang/apply mod :dispatch_protocol (list ns "Nope" "m" (list 1))))
+    (fn [] (erlang/apply mod :extend_type (list ns "Nope" :integer (maps/new))))
+    (fn [] (erlang/apply mod :define_protocol (list ns "Shape" (list "area" "perim"))))
+    ; an INCOMPLETE extension is refused, naming the missing methods.
+    (fn [] (erlang/apply mod :extend_type (list ns "Shape" :integer (maps/put "area" (fn [x] x) (maps/new)))))
+    (fn [] (erlang/apply mod :satisfies? (list ns "Shape" 1)))
+    (fn [] (erlang/apply mod :dispatch_protocol (list ns "Shape" "area" (list 1))))
+    (fn [] (erlang/apply mod :extend_type (list ns "Shape" :float (maps/put "area" (fn [x] x) (maps/put "perim" (fn [x] x) (maps/new))))))
+    (fn [] (erlang/apply mod :satisfies? (list ns "Shape" 1.5)))
+    (fn [] (erlang/apply mod :dispatch_protocol (list ns "Shape" "perim" (list 2.5))))
+    (fn [] (erlang/apply mod :satisfies? (list ns "Shape" 1)))
+    (fn [] (erlang/apply mod :dispatch_protocol (list ns "Shape" "area" (list :kw))))
+    (fn [] (erlang/apply mod :satisfies? (list ns "Shape" "s")))
+    ; the interned method var re-enters dispatch_protocol/4.
+    (fn [] (let [r (BeamLisp.Env/lookup (tuple ns "area"))]
+             (if (and (tuple? r) (erlang/== :ok (elem r 0)))
+               (BeamLisp.Ns.Rt/invoke (elem r 1) (list 1))
+               :missing)))
+    ; an EMPTY protocol satisfies nothing even though nothing is missing.
+    (fn [] (erlang/apply mod :define_protocol (list ns "Empty" (list))))
+    (fn [] (erlang/apply mod :extend_type (list ns "Empty" :integer (maps/new))))
+    (fn [] (erlang/apply mod :satisfies? (list ns "Empty" 1)))
+    ; a struct module and a deftype module are first-class extensible types.
+    (fn [] (erlang/apply mod :define_protocol (list ns "Show" (list "show"))))
+    (fn [] (erlang/apply mod :extend_type (list ns "Show" :"Elixir.Range" (maps/put "show" (fn [x] :range) (maps/new)))))
+    (fn [] (erlang/apply mod :dispatch_protocol (list ns "Show" "show" (list (maps/put :__struct__ :"Elixir.Range" (maps/new))))))
+    (fn [] (erlang/apply mod :extend_type (list ns "Show" :"Elixir.Foo" (maps/put "show" (fn [x] :deftype) (maps/new)))))
+    (fn [] (erlang/apply mod :dispatch_protocol (list ns "Show" "show" (list (tuple :bl_deftype :"Elixir.Foo" (maps/new))))))
+    (fn [] (erlang/apply mod :satisfies? (list ns "Show" (tuple :bl_deftype :"Elixir.Foo" (maps/new)))))
+
+    ; a NON-BINARY bitstring (`<<5::3>>`) — `is_binary/1` is false and every
+    ; other `type_of` guard fails, so it is the same live `FunctionClauseError`
+    ; a port is, reached without a port.
+    (fn [] (erlang/apply mod :type_of (list (nonbinary-bits))))
+
+    ; a value outside EVERY `type_of` clause — a PORT is the reachable one — is
+    ; the live `FunctionClauseError`, named by the module that raised it, so the
+    ; pinned port must refuse exactly where the live module refuses (and not
+    ; answer a silent nil).
+    (fn [] (let [p (Port/open (tuple :spawn "true") (list))]
+             (try (erlang/apply mod :type_of (list p))
+                  (finally (Port/close p)))))))
+
+(defn- corpus [mod ns]
+  (Enum/map (cases mod ns) (fn [th] (obs th))))
+
+(defn- bad-rows
+  "The malformed `{:multi, ns, name}` rows a row can hold: a value that is not a
+   map carrying `:methods` at all (`nil`, a number, a plain map), and a map whose
+   `:methods` is not a map. `Env.put_key` accepts any of them, so every one is
+   externally reachable through an Env write — the edge the live module answers
+   with CaseClauseError/BadMapError/KeyError rather than an empty table."
+  []
+  (list (tuple :nil nil)
+        (tuple :number 5)
+        (tuple :empty-map (maps/new))
+        (tuple :methods-nonmap (maps/put :methods 5 (maps/new)))))
+
+(defn- bad-row-cases
+  "One thunk per (malformed row × entry point). Each thunk WRITES its row first:
+   `define_multi` REPAIRS the row it is handed (a `%{methods: 5}` row comes back
+   with a dispatch fn), so a row shared across thunks would make the run order
+   observable. Every observation runs under `ns`, so the two runs never touch
+   each other's rows."
+  [mod ns]
+  (Enum/flat_map
+    (bad-rows)
+    (fn [pair]
+      (let [row (elem pair 1)]
+        (list
+          (fn [] (BeamLisp.Env/put_key (tuple :multi ns "mrow") row)
+                 (erlang/apply mod :define_multi (list ns "mrow" (fn [k] k))))
+          (fn [] (BeamLisp.Env/put_key (tuple :multi ns "mrow") row)
+                 (erlang/apply mod :add_method (list ns "mrow" :k (fn [k] k))))
+          (fn [] (BeamLisp.Env/put_key (tuple :multi ns "mrow") row)
+                 (erlang/apply mod :method_keys (list ns "mrow")))
+          (fn [] (BeamLisp.Env/put_key (tuple :multi ns "mrow") row)
+                 (erlang/apply mod :dispatch (list ns "mrow" (list :k)))))))))
+
+(defn- first-mismatch
+  "The first observation the two runs disagree on, as `[index live probe]`."
+  [l p]
+  (let [bad (filter (fn [i] (not= (nth l i) (nth p i))) (range (count l)))]
+    (if (empty? bad) nil (list (first bad) (nth l (first bad)) (nth p (first bad))))))
+
+; ── reset / cleanup ───────────────────────────────────────────────────────
+;
+; Everything the corpus writes lives under its own namespace, so one list of
+; keys is the whole residue: the multi rows and the interned multi vars, the
+; hierarchy, the protocol descriptors and their interned vars, and one row per
+; (protocol, method, type-tag) extension. `wipe!` deletes them all from the
+; store they were written to, and `leftovers` reads the store back: a clean run
+; answers `[]`.
+
+(defn- written-keys
+  [ns]
+  (list (tuple :multi ns "speak")
+        (tuple :multi ns "vkey")
+        (tuple :multi ns "sound")
+        ; the malformed-row differential's multi — `Env.put_key` writes ANY row
+        (tuple :multi ns "mrow")
+        ; the namespace the stand-in test EVALs its defmulti into
+        (tuple :multi ns "edemo")
+        (tuple :hierarchy ns)
+        (tuple :protocol ns "Shape")
+        (tuple :protocol ns "Empty")
+        (tuple :protocol ns "Show")
+        (tuple ns "speak")
+        (tuple ns "vkey")
+        (tuple ns "sound")
+        (tuple ns "mrow")
+        (tuple ns "edemo")
+        (tuple ns "Shape")
+        (tuple ns "Empty")
+        (tuple ns "Show")
+        (tuple ns "area")
+        (tuple ns "perim")
+        (tuple ns "show")
+        (tuple (tuple :protocol ns "Shape" "area") :integer)
+        (tuple (tuple :protocol ns "Shape" "perim") :integer)
+        (tuple (tuple :protocol ns "Shape" "area") :float)
+        (tuple (tuple :protocol ns "Shape" "perim") :float)
+        (tuple (tuple :protocol ns "Show" "show") :"Elixir.Range")
+        (tuple (tuple :protocol ns "Show" "show") :"Elixir.Foo")))
+
+(defn- wipe!
+  [ns]
+  (Enum/each (written-keys ns) (fn [k] (BeamLisp.Env/delete_key k)))
+  :ok)
+
+(defn- leftovers
+  "The written keys that are still readable — the residue a reset missed."
+  [ns]
+  (filter (fn [k] (not (erlang/== :error (BeamLisp.Env/lookup k)))) (written-keys ns)))
+
+; ── the surface: exactly the live module's public functions ──────────────
+
+(deftest multi-pinned-surface-is-the-live-module
+  (testing "exports and the seed option contract, against the live module"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (= :non_existing (erlang/apply :code :which (list shim))))
+
+      (is (erlang/function_exported live :type_of 1) "the production module is loaded")
+
+      ; Every production function remains present at the probe atom, and the
+      ; probe exports NOTHING the live module does not (minus the Elixir-
+      ; generated `__info__/1`, which a pinned functions-only beam never has).
+      (is (= () (filter (fn [e] (not (erlang/function_exported probe (elem e 0) (elem e 1))))
+                        (functional-exports live)))
+          "the pinned beam reproduces every production function")
+      (is (= (functional-exports live) (exports probe))
+          "the pinned export surface equals the live module's minus __info__/1")
+
+      ; The fifteen public functions, by name and arity.
+      (is (erlang/function_exported probe :type_of 1))
+      (is (erlang/function_exported probe :normalize_key 1))
+      (is (erlang/function_exported probe :define_multi 3))
+      (is (erlang/function_exported probe :add_method 4))
+      (is (erlang/function_exported probe :method_keys 2))
+      (is (erlang/function_exported probe :dispatch 3))
+      (is (erlang/function_exported probe :derive 3))
+      (is (erlang/function_exported probe :parents 2))
+      (is (erlang/function_exported probe :ancestors 2))
+      (is (erlang/function_exported probe :isa? 3))
+      (is (erlang/function_exported probe :underive 3))
+      (is (erlang/function_exported probe :define_protocol 3))
+      (is (erlang/function_exported probe :extend_type 4))
+      (is (erlang/function_exported probe :dispatch_protocol 4))
+      (is (erlang/function_exported probe :satisfies? 3))
+
+      ; The live module's PRIVATE helpers are not exports, and a pinned module
+      ; exports exactly its file's top-level defns — so none of them may appear.
+      (is (not (erlang/function_exported probe :"multi!" 2)))
+      (is (not (erlang/function_exported probe :no_method_error 3)))
+      (is (not (erlang/function_exported probe :walk_ancestors 3)))
+      (is (not (erlang/function_exported probe :"protocol!" 2)))
+
+      ; FUNCTIONS-ONLY: no `:struct_fields`, so no struct surface; no
+      ; `:behaviour`, so this is not a callback module.
+      (is (not (erlang/function_exported probe :__struct__ 0)))
+      (is (not (erlang/function_exported probe :__struct__ 1)))
+      (is (not (erlang/function_exported probe :__info__ 1)))
+
+      ; The explicit seed option contract.
+      (let [opts (seed-opts probe dir)]
+        (is (= probe (Keyword/fetch! opts :module)))
+        (is (= (src) (Keyword/fetch! opts :file)))
+        (is (= false (Keyword/fetch! opts :load?)))
+        (is (erlang/is_binary (Keyword/fetch! opts :source_hash))))
+
+      ; REPRODUCIBLE: the same source compiled again is the same bytes. The seed
+      ; records a sha256 per host beam and `seed/check` re-derives it, so a
+      ; non-deterministic emitter would make the committed floor unverifiable.
+      (let [again (tmp-dir)
+            again-beam (elem (BeamLisp.AOT/compile_host_file (src) (seed-opts probe again)) 1)]
+        (is (= (File/read! (Path/join dir "Elixir.BeamLisp.HostMultiProbe.beam"))
+               (File/read! again-beam))
+            "a rebuild of priv/host/multi.bl is the same beam")
+        (File/rm_rf! again))
+
+      (File/rm_rf! dir))))
+
+; ── the whole ABI, differentially ────────────────────────────────────────
+
+(deftest multi-pinned-open-dispatch-matches-the-live-module
+  (testing "type tags, multimethods, hierarchies and protocols, observation for observation"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      (wipe! live-ns)
+      (wipe! probe-ns)
+      (let [l (corpus live live-ns)
+            p (corpus probe probe-ns)]
+        (is (= (count l) (count p)))
+        (is (= l p) "probe answers equal the live module's on the whole corpus")
+        (is (nil? (first-mismatch l p)))
+        (doseq [i (range (count l))]
+          (is (= (nth l i) (nth p i))
+              (str "observation " i ": " (pr-str (nth l i)) " vs " (pr-str (nth p i)))))
+
+        ; The corpus is not vacuously equal — it really exercised the engine.
+        (is (= (list :integer :float :binary :boolean :boolean :nil :keyword :list :vector :seq
+                     :map :map :"Elixir.Range" :fn :tuple :pid :reference
+                     :"Elixir.Foo" :tuple :ref :tuple)
+               (Enum/map (Enum/take p 21) (fn [x] (if (erlang/is_list x) (elem x 1) x))))
+            "the first twenty-one observations are the type tags the clauses decide")
+        (is (= "woof" (nth p 31)) "exact-key dispatch runs the registered method")
+        (is (= (list :raise :Elixir.RuntimeError
+                     (str "No method in multimethod " live-ns "/speak for dispatch value: :cat"))
+               (nth p 32))
+            "an unmatched dispatch value with no :default is the live RuntimeError")
+        (is (= (list :raise :Elixir.RuntimeError
+                     (str "No multimethod named " live-ns "/nope — defmulti it before adding methods"))
+               (nth p 26))
+            "adding a method to an undefined multi is the live RuntimeError")
+        (is (= (list :raise :Elixir.RuntimeError
+                     (str "extend-type " live-ns "/Shape for :integer is missing methods: [\"perim\"]"))
+               (nth p 69))
+            "an incomplete extension is refused, naming the missing methods")
+        (is (= (list :raise :Elixir.RuntimeError
+                     (str "No implementation of method m of protocol " live-ns "/Nope for type :integer"))
+               (nth p 66))
+            "dispatching a protocol method with no row is the live RuntimeError")
+        (is (= (list :raise :Elixir.RuntimeError
+                     (str "No protocol named " live-ns "/Nope — defprotocol it before extending"))
+               (nth p 67))
+            "extending an undefined protocol is the live RuntimeError")
+        (is (= (list :default :dog) (nth p 35)) ":default and the registered key share the table")
+        (is (= :vec-hit (nth p 42)) "a structurally-equal vector hits the normalized key")
+        (is (= :generic (nth p 49)) "isa? dispatch reaches the parent's method")
+        (is (= "WOOF" (nth p 45)) "replacing a method replaces it, in place")
+
+        ; ── the NON-BINARY bitstring: `is_binary/1` is false, so it matches no
+        ; type_of clause and is the live FunctionClauseError — the same class and
+        ; message a port answers. Both checks stay inside the corpus let (the
+        ; port check below closes it), so `p` is in scope for them.
+        (is (let [b (nonbinary-bits)]
+              (and (erlang/is_bitstring b) (not (erlang/is_binary b))))
+            "the constructed bitstring really is outside is_binary/1")
+        (is (= (list :raise :Elixir.FunctionClauseError
+                     "no function clause matching in BeamLisp.Multi.type_of/1")
+               (nth p 88))
+            "a non-binary bitstring is the live FunctionClauseError")
+
+        (is (= (list :raise :Elixir.FunctionClauseError
+                     "no function clause matching in BeamLisp.Multi.type_of/1")
+               (last p))
+            "a value outside every type_of clause is the live FunctionClauseError, named at the production atom"))
+
+        ; ── MALFORMED ROWS, differentially. `Env.put_key` accepts ANY value under
+        ; `{:multi, ns, name}`, so a row that is not a map carrying `:methods` is
+        ; externally reachable, and the live module's answer is a specific
+        ; exception (class AND message) at each entry point — never a lenient nil
+        ; or a silent empty table.
+        (let [bl (Enum/map (bad-row-cases live live-ns) (fn [th] (obs th)))
+              bp (Enum/map (bad-row-cases probe probe-ns) (fn [th] (obs th)))]
+          (is (= (count bl) (count bp)))
+          (is (= bl bp) "malformed rows refuse exactly as the live module does")
+          (is (nil? (first-mismatch bl bp)))
+          (doseq [i (range (count bl))]
+            (is (= (nth bl i) (nth bp i))
+                (str "malformed-row observation " i ": " (pr-str (nth bl i))
+                     " vs " (pr-str (nth bp i)))))
+
+          ; nil row: define_multi is the live `case`'s no-match; the three field
+          ; reads are the live `BadMapError`.
+          (is (= (list :raise :Elixir.CaseClauseError "no case clause matching:\n\n    {:ok, nil}\n") (nth bp 0)))
+          (is (= (list :raise :Elixir.BadMapError "expected a map, got:\n\n    nil\n") (nth bp 1)))
+          (is (= (list :raise :Elixir.BadMapError "expected a map, got:\n\n    nil\n") (nth bp 2)))
+          (is (= (list :raise :Elixir.BadMapError "expected a map, got:\n\n    nil\n") (nth bp 3)))
+          ; number row.
+          (is (= (list :raise :Elixir.CaseClauseError "no case clause matching:\n\n    {:ok, 5}\n") (nth bp 4)))
+          (is (= (list :raise :Elixir.BadMapError "expected a map, got:\n\n    5\n") (nth bp 5)))
+          (is (= (list :raise :Elixir.BadMapError "expected a map, got:\n\n    5\n") (nth bp 6)))
+          (is (= (list :raise :Elixir.BadMapError "expected a map, got:\n\n    5\n") (nth bp 7)))
+          ; a plain map missing `:methods`: the live KeyError, naming the FIRST
+          ; field each entry point reads (`:dispatch` before `:methods`).
+          (is (= (list :raise :Elixir.CaseClauseError "no case clause matching:\n\n    {:ok, %{}}\n") (nth bp 8)))
+          (is (= (list :raise :Elixir.KeyError "key :methods not found in:\n\n    %{}\n") (nth bp 9)))
+          (is (= (list :raise :Elixir.KeyError "key :methods not found in:\n\n    %{}\n") (nth bp 10)))
+          (is (= (list :raise :Elixir.KeyError "key :dispatch not found in:\n\n    %{}\n") (nth bp 11)))
+          ; `:methods` non-map: define_multi still REUSES the (non-map) table —
+          ; the live module only swaps the dispatch fn — so it succeeds;
+          ; add_method and method_keys reach `Map.put`/`Map.keys` on the non-map;
+          ; dispatch still fails on the missing `:dispatch`.
+          (is (= :"$blfn" (elem (nth bp 12) 0)) "define_multi reuses any :methods value")
+          (is (= (list :raise :Elixir.BadMapError "expected a map, got:\n\n    5\n") (nth bp 13)))
+          (is (= (list :raise :Elixir.BadMapError "expected a map, got:\n\n    5\n") (nth bp 14)))
+          (is (= (list :raise :Elixir.KeyError "key :dispatch not found in:\n\n    %{methods: 5}\n") (nth bp 15))))
+
+      ; RESET: the corpus really wrote its keys, and the suite clears them.
+      (is (not= () (leftovers live-ns)) "the live run wrote its keys")
+      (is (not= () (leftovers probe-ns)) "the probe run wrote its keys")
+      (wipe! live-ns)
+      (wipe! probe-ns)
+      (is (= () (leftovers live-ns)) "the live run's keys are all gone")
+      (is (= () (leftovers probe-ns)) "the probe run's keys are all gone")
+
+      (File/rm_rf! dir))))
+
+; ── the pinned beam AT the production atom, restored afterwards ──────────
+
+(deftest multi-pinned-beam-stands-in-at-the-production-atom
+  (testing "the production atom serves on the pinned beam, then the live beam returns"
+    (let [dir (tmp-dir)
+          out (str dir "/prod")
+          beam (Path/join out (str live ".beam"))
+          orig-path (erlang/apply :code :which (list live))
+          orig-bin (File/read! (erlang/list_to_binary orig-path))
+          app-ns "host.multi.test.standin"]
+      (is (not= :non_existing orig-path) "precondition: the live beam is a readable file")
+
+      ; A clean store, so the two runs below are the same question asked twice.
+      (wipe! live-ns)
+      (wipe! probe-ns)
+      (let [before (corpus live app-ns)]
+        (wipe! app-ns)
+
+        ; `:load? false` writes the beam at the production atom WITHOUT
+        ; substituting the live module mid-flight.
+        (BeamLisp.AOT/compile_host_file (src) (seed-opts live out))
+        (drop! shim)
+        (is (File/exists? beam))
+        (is (= orig-path (erlang/apply :code :which (list live)))
+            "the compile never substituted the production module")
+
+        (try
+          (drop! live)
+          (code/load_binary live (erlang/binary_to_list beam) (File/read! beam))
+          (is (= (erlang/binary_to_list beam) (erlang/apply :code :which (list live)))
+              "the test beam now owns the production atom")
+          (is (erlang/function_exported live :extend_type 4))
+
+          ; The pinned beam answers EXACTLY as the live one did at this atom —
+          ; the whole corpus, observation for observation.
+          (let [after (corpus live app-ns)]
+            (is (= before after) "the production atom still answers the whole corpus")
+            (is (nil? (first-mismatch before after))))
+
+          ; THE COMPILER PATH. The language's own `defmulti`/`defmethod` emit
+          ; `BeamLisp.Multi.define_multi/3` and `.add_method/4`, and the
+          ; prelude's `type` calls `type_of/1` — so the production atom has to
+          ; serve them on the pinned beam, not merely answer the corpus. The
+          ; eval'd program declares its OWN namespace so its rows are a known,
+          ; wipeable set, and the caller's namespace is restored afterwards.
+          (let [saved (BeamLisp.Env/current_ns)
+                woof (BeamLisp/eval
+                       (str "(ns host.multi.test.eval) "
+                            "(defmulti edemo (fn [k] k)) "
+                            "(defmethod edemo :dog [k] \"woof\") "
+                            "(edemo :dog)"))]
+            (is (= "woof" woof)
+                "a defmulti/defmethod compiled through the pinned atom dispatches")
+            (is (not= () (leftovers "host.multi.test.eval"))
+                "the eval'd defmulti really wrote its rows through the pinned atom")
+            (BeamLisp.Env/in_ns saved)
+            (wipe! "host.multi.test.eval"))
+          (is (= :integer (BeamLisp/eval "(type 3)"))
+              "the prelude's `type` reaches the pinned type_of/1")
+
+          ; NO OTHER NAMESPACE WAS TOUCHED by a corpus that ran on its own.
+          (is (= () (leftovers live-ns)))
+          (is (= () (leftovers probe-ns)))
+          (wipe! app-ns)
+          (finally
+            (wipe! app-ns)
+            (wipe! "host.multi.test.eval")
+            (drop! live)
+            (code/load_binary live orig-path orig-bin)))
+
+        ; RESTORED: the live beam owns the atom and answers again.
+        (is (= orig-path (erlang/apply :code :which (list live))))
+        (wipe! app-ns)
+        (is (= before (corpus live app-ns)) "the restored live beam answers as before")
+        (wipe! app-ns))
+
+      (is (= () (leftovers app-ns)) "the stand-in runs left no residue")
+      (is (= () (leftovers "host.multi.test.eval")))
+      (is (= () (leftovers live-ns)))
+      (is (= () (leftovers probe-ns)))
+      (File/rm_rf! dir))))

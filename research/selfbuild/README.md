@@ -30,7 +30,7 @@ around.
 ## P1 — launcher and packer
 
     research/selfbuild/p1_launcher.sh <bin-dir> <release-tree> <workdir>
-    research/selfbuild/p1f_trailer_recovery.exs   (run inside a drop)
+    research/selfbuild/p1f_trailer_recovery.bl    (run inside a drop with its bin/bl run verb)
 
     BL_BIN: 1        (drop-launcher, HEAD build)
     BL_BIN: 0        (drop — the pack tool does not need it)
@@ -59,7 +59,7 @@ predates `BL_BIN`; hence `--launcher FILE` stays mandatory in v1).
 
 ## P2 — the Elixir substrate, compiled in-drop
 
-    BL_TREE=<tree> "$PAYLOAD/bin/bl" eval 'Code.eval_file("research/selfbuild/p2_parallel_compiler.exs")'
+    BL_TREE=<tree> "$PAYLOAD/bin/bl" eval 'BeamLisp.Ns.Bl.Cli.main(["run","<absolute-tree>/research/selfbuild/p2_parallel_compiler.bl"])'
 
     P2  files=86 out=… mix_loaded=false parallel_compiler=true
     P2  RESULT ok modules=86 warnings=9 beams=86 ms=9902
@@ -77,7 +77,7 @@ W4/W7 should pass `return_diagnostics: true` to silence the fourth warning.
 
 ## P3 — systools
 
-    BL_PAYLOAD=<payload> "$PAYLOAD/bin/bl" eval 'Code.eval_file("research/selfbuild/p3_systools.exs")'
+    BL_PAYLOAD=<payload> "$PAYLOAD/bin/bl" eval 'BeamLisp.Ns.Bl.Cli.main(["run","<absolute-tree>/research/selfbuild/p3_systools.bl"])'
 
     P3  systools=…/lib/sasl-4.4/ebin/systools.beam
     P3  make_script ok warnings=0
@@ -105,7 +105,7 @@ though `is_binary` reports true — build the tarball bytes as a
 ## P5 — the hand-assembled release boots
 
     research/selfbuild/p5_handbuilt_release.sh <payload> <tree>
-    research/selfbuild/gen_start_boot.exs
+    research/selfbuild/gen_start_boot.bl
 
     P5  consolidated dir present? NO
     P5  BOOT OK elixir=1.20.2

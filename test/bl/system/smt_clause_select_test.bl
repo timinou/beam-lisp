@@ -1,0 +1,150 @@
+; test/bl/system/smt_clause_select_test.bl — a call inlines the clause ITS
+; arity runs, never the first clause of a different arity.
+;
+; The bug this suite keeps out: `fn-bodies`' :params/:body are the FIRST clause,
+; so `(f a b)` against `(defn f ([x] x) ([x y] (+ x y)))` used to inline the
+; 1-ary body — `(>= a 0)` for every call — a FALSE proof over the wrong
+; function. Selection is by the call's arity against the SOURCE clause shapes;
+; a call no single clause fits (variadic, guarded, duplicate arity, no such
+; arity) is an honest :untranslatable, never a proof.
+(ns system.smt-clause-select-test
+  (:require [system.smt :as smt] [smt :as smtlib] [oracle] [z3]))
+
+; ── exact-arity selection across overloads ─────────────────────────────────
+
+(def overload-src "(defn pick ([x] x) ([x y] (erlang/+ x y)))")
+
+(deftest later-arity-call-inlines-the-later-body
+  (is (= '(>= (+ a b) 0)
+         (smt/of-source-inlining overload-src ["a" "b"] "(erlang/>= (pick a b) 0)"))
+      "a 2-ary call runs the 2-ary clause, not the 1-ary one"))
+
+(deftest first-arity-call-inlines-the-first-body
+  (is (= '(>= a 0)
+         (smt/of-source-inlining overload-src ["a"] "(erlang/>= (pick a) 0)"))
+      "a 1-ary call still runs the 1-ary clause"))
+
+(deftest parameters-come-from-the-selected-clause
+  ;; 3-ary: the FIRST clause's single param `x` must not shape a 3-arg call.
+  (let [three "(defn f ([x] 1) ([x y] 2) ([x y z] (erlang/+ x (erlang/+ y z))))"
+        r3 (smt/of-source-inlining three ["a" "b" "c"] "(erlang/>= (f a b c) 0)")
+        r2 (smt/of-source-inlining three ["a" "b"] "(erlang/>= (f a b) 0)")
+        r1 (smt/of-source-inlining three ["a"] "(erlang/>= (f a) 0)")]
+    (is (= '(>= (+ a (+ b c)) 0) r3) "3-ary call uses its own parameters")
+    (is (= '(>= 2 0) r2) (pr-str r2))
+    (is (= '(>= 1 0) r1) (pr-str r1))))
+
+(deftest zero-arity-inlines
+  (is (= '(>= 42 0)
+         (smt/of-source-inlining "(defn z [] 42)" [] "(erlang/>= (z) 0)"))))
+
+; ── refusal: no single clause the call soundly runs ────────────────────────
+
+(deftest no-matching-arity-refuses
+  (is (= :untranslatable
+         (smt/of-source-inlining "(defn one [x] x)" ["a" "b"] "(erlang/>= (one a b) 0)"))
+      "a call with no clause of that arity is not modelled as the 1-ary body"))
+
+(deftest variadic-clause-refuses
+  (let [v "(defn g [a & rest] a)"]
+    ;; the ANF clause prints two params for `[a & rest]`, so a 2-arg call would
+    ;; match it by COUNT yet bind `a`/`rest` as if the rest were a single value.
+    (is (= :untranslatable (smt/of-source-inlining v ["a"] "(erlang/>= (g a) 0)"))
+        "1-arg call against a variadic clause refuses")
+    (is (= :untranslatable (smt/of-source-inlining v ["a" "b"] "(erlang/>= (g a b) 0)"))
+        "2-arg call against a variadic clause refuses too")))
+
+(deftest guarded-clauses-refuse
+  (testing "a guarded/duplicate-arity group has no single clause to pick"
+    (is (= :untranslatable
+           (smt/of-source-inlining
+             "(defn sign ([n] :when (pos? n) 1) ([n] :when (neg? n) -1) ([n] 0))"
+             ["a"] "(erlang/>= (sign a) 0)")))
+    (is (= :untranslatable
+           (smt/of-source-inlining "(defn f [x] :when (pos? x) x)"
+                                   ["a"] "(erlang/>= (f a) 0)"))
+        "a single guarded clause is not total, so it is not inlined as one")))
+
+(deftest unsupported-later-body-refuses
+  ;; Vector construction is outside the certified scalar primitive set.
+  ;; The whole-function summary therefore stays opaque at every arity.
+  (let [uns "(defn f ([x] x) ([x y] [x y]))"]
+    (is (= :untranslatable (smt/of-source-inlining uns ["a" "b"] "(erlang/>= (f a b) 0)"))
+        "an untranslatable later body refuses rather than falling back to the first")
+    (is (= :untranslatable (smt/of-source-inlining uns ["a"] "(erlang/>= (f a) 0)"))
+        "unknown later effects are not proof of whole-function purity")))
+
+(deftest impure-fn-refuses-inlining-for-every-arity
+  ;; the summary UNIONS every clause, so a later I/O clause makes the whole fn
+  ;; impure — no arity's pure-looking body escapes the footprint.
+  (let [eff "(defn f ([x] x) ([x y] (File/write! x y)))"]
+    (is (= :untranslatable (smt/of-source-inlining eff ["a" "b"] "(erlang/>= (f a b) 0)"))
+        "the effectful 2-ary call refuses")
+    (is (= :untranslatable (smt/of-source-inlining eff ["a"] "(erlang/>= (f a) 0)"))
+        "the 1-ary call refuses too — the fn is impure by union")))
+
+; ── end-to-end: the SELECTED body is what z3 reasons about ─────────────────
+
+(deftest later-arity-body-is-refutable-not-falsely-proven
+  (testing "z3 refutes (add2 a b) >= 0 for arbitrary a,b — the pre-fix
+            (>= a 0) term would have read as a proof"
+    (let [prog "(defn add2 ([x] x) ([x y] (erlang/+ x y)))"
+          inv (smt/of-source-inlining prog ["a" "b"] "(erlang/>= (add2 a b) 0)")
+          port (z3/open)]
+      (is (= '(>= (+ a b) 0) inv) "the 2-ary body is the translated term")
+      (is (oracle/refuted?
+            (z3/check port
+                      [(smtlib/declare-const 'a 'Int)
+                       (smtlib/declare-const 'b 'Int)
+                       (smtlib/assert (list 'not inv))]))
+          "a=0,b=-1 breaks it — a real counterexample"))))
+
+(deftest later-arity-body-is-provable-under-its-precondition
+  (testing "with a,b >= 0 the law holds, so the selected body is genuinely used"
+    (let [prog "(defn add2 ([x] x) ([x y] (erlang/+ x y)))"
+          inv (smt/of-source-inlining prog ["a" "b"] "(erlang/>= (add2 a b) 0)")
+          port (z3/open)]
+      (is (oracle/proven?
+            (z3/check port
+                      [(smtlib/declare-const 'a 'Int)
+                       (smtlib/declare-const 'b 'Int)
+                       (smtlib/assert (list '>= 'a 0))
+                       (smtlib/assert (list '>= 'b 0))
+                       (smtlib/assert (list 'not inv))]))))))
+
+; ── define-fun lowering: one signature cannot be two arities ───────────────
+;
+; `defn->define-fun` folds a defn's clauses into ONE (define-fun …) over the
+; FIRST clause's params. An overload (several arities) or a variadic clause does
+; not fit that shape, so it must refuse rather than emit a definition whose
+; params disagree with its body.
+
+(deftest define-fun-refuses-an-overload
+  (is (= :untranslatable
+         (smt/defn->define-fun "(defn f ([x] x) ([x y] (erlang/+ x y)))" "Int"))
+      "two arities cannot fold to one signature"))
+
+(deftest define-fun-refuses-a-variadic-clause
+  (is (= :untranslatable (smt/defn->define-fun "(defn g [a & rest] a)" "Int"))
+      "a `&` rest clause has no fixed signature to pin"))
+
+(deftest define-fun-still-lowers-shared-arity-clauses
+  ;; guarded multi-clause (same arity) is the shape it EXISTS for — unchanged.
+  (is (= "(define-fun sign ((n Int)) Int (ite (> n 0) 1 (ite (< n 0) (- 1) 0)))"
+         (smtlib/emit (smt/defn->define-fun
+                        "(defn sign ([n] :when (pos? n) 1) ([n] :when (neg? n) -1) ([n] 0))"
+                        "Int")))
+      "same-arity guarded clauses still fold to nested ite"))
+
+
+(deftest inlining-does-not-drop-unsupported-actual-arguments
+  (is (= :untranslatable
+         (smt/of-source-inlining "(defn constant [x] 1)" ["x"]
+                                 "(erlang/>= (constant (File/read! x)) 0)"))))
+
+(deftest recursive-inlining-is-an-explicit-refusal
+  (is (= :untranslatable
+         (smt/of-source-inlining "(defn again [x] (again x))" ["x"]
+                                 "(erlang/>= (again x) 0)"))))
+
+(run-tests)

@@ -1,0 +1,126 @@
+; aot_reproducible_test.bl — a compiled beam is a function of its source,
+; nothing else.
+;
+; Ported from the ExUnit `test/beam_lisp/aot_reproducible_test.exs`, which ran
+; through the Elixir shell `BeamLisp.BuildTask`. Every call here goes straight
+; to `priv/build/build.bl` (`build/run`, `build/clean`) and to the self-hosted
+; reader and compiler — no Elixir seam in the path.
+;
+; Reproducibility is what makes the AOT cache, the byte-parity oracle and "did
+; this edit change the output?" mean anything, and it is exactly what a
+; PARALLEL build can quietly lose. This suite pins the four leaks that were
+; found and closed (see the commit "Reproducible AOT"), on fixtures shaped to
+; trigger each:
+;
+;   * template gensyms (`x#` in a macro used by a dependent)
+;   * forward references (a defn calling one defined later in the file)
+;   * map literals through macros (atom-key enumeration order)
+;   * a defnative declaration surviving the worker that made it
+;
+; The property under test: compile the same sources twice — serially, then
+; with 4 jobs, then serially again after unrelated compilation has advanced
+; every VM-global counter — and every beam is byte-identical.
+;
+; The scratch tree is UNIQUE per run, and the shared AOT cache is forced OFF
+; (`BEAM_LISP_AOT_CACHE=off`, plus `:force?` so the store is never consulted),
+; so no run can be flattered by state another left behind.
+;
+; Run: bl test test/bl/aot_reproducible_test.bl
+
+(ns aot-reproducible.test
+  (:require [build :as b] [reader :as r] [compiler :as c]))
+
+; ── isolated scratch ────────────────────────────────────────────────────────
+
+(def root (str (System/tmp_dir!) "/bl_aot_repro_" (erlang/unique_integer (list :positive))))
+(def src (str root "/src"))
+(def out (str root "/ebin"))
+(def manifest (str out "/compile.beam_lisp"))
+
+; The two fixtures, verbatim from the ExUnit suite: a macro whose template
+; carries a gensym (`t#`, `m#`), and a dependent that forward-references a defn
+; defined below it and threads a map literal through the macro.
+(def macros-src
+  #|(ns repro.macros)
+(defmacro my-or [a b]
+  `(let [t# ~a] (if t# t# ~b)))
+(defmacro with-map [x]
+  `(let [m# {:zeta 1 :alpha 2 :on-click ~x :variant 3}] m#))
+|)
+
+(def user-src
+  #|(ns repro.user (:require [repro.macros :as m]))
+;; forward reference: mplus calls bind, defined below it
+(defn mplus [a b] (if (nil? a) b (bind a b)))
+(defn bind [a b] (m/my-or a b))
+(defn both [x] (m/my-or (m/my-or x 1) (m/with-map x)))
+(defn nested [xs] (when-let [s (seq xs)] (first s)))
+|)
+
+(defn- write-fixtures! []
+  (File/rm_rf! root)
+  (File/mkdir_p! src)
+  (File/write! (Path/join src "macros.bl") macros-src)
+  (File/write! (Path/join src "user.bl") user-src))
+
+(defn- sources [] (vec (sort (Path/wildcard (Path/join src "**/*.bl")))))
+
+; Clean, then build with `jobs` workers. `:force?` makes every source a real
+; compile (a freshness hit would compare bytes never written this run), so the
+; returned map names the beams this build produced, hashed.
+(defn- build! [jobs]
+  (b/clean out manifest)
+  (System/put_env "BEAM_LISP_AOT_CACHE" "off")
+  (let [r (b/run {:sources (sources) :out out :manifest manifest :force? true :jobs jobs})]
+    (is (= [] (vec (:errors r))) (str "build errors: " (pr-str (vec (:errors r)))))
+    (into {}
+          (map (fn [p] [(Path/basename p) (crypto/hash :sha256 (File/read! p))])
+               (Path/wildcard (Path/join out "Elixir.BeamLisp.Ns.*Repro.*.beam"))))))
+
+; Advance every VM-global counter the old emitters leaked through:
+; unique_integer, atom creation order, gensym baking.
+(defn- perturb! []
+  (doseq [i (range 1 51)]
+    (String/to_atom (str "repro_perturb_atom_" i "_" (erlang/unique_integer (list :positive)))))
+  (c/eval-string "(defmacro perturb-or [a b] `(let [t# ~a] (if t# t# ~b))) (perturb-or 1 2)"
+                 (c/new-env "repro.perturb") nil)
+  :ok)
+
+(defn- differing
+  "The basenames whose digest differs between builds `a` and `b`."
+  [a b]
+  (vec (filter (fn [k] (not= (get a k) (get b k))) (keys a))))
+
+; ── the property ────────────────────────────────────────────────────────────
+
+(deftest serial-parallel-and-post-perturbation-builds-emit-byte-identical-beams
+  (try
+    (write-fixtures!)
+    (let [a (build! 1)]
+      (is (>= (count a) 4)
+          (str "expected shim/body/init beams for both namespaces, got " (count a)))
+      (let [b (build! 4)]
+        (is (= a b) (str "parallel build differs from serial: " (pr-str (differing a b)))))
+      (perturb!)
+      (let [c (build! 1)]
+        (is (= a c) (str "build after VM-global perturbation differs: " (pr-str (differing a c))))))
+    (finally
+      (b/clean out manifest)
+      (File/rm_rf! root))))
+
+; The canonical-gensym rule itself, at the level the leak lived: a macro's
+; baked template gensym must come back as `__c` (canonical, minted THIS unit),
+; never `__auto` (the number baked when the macro's own defmacro compiled).
+;
+; The ExUnit suite rendered the compiled Elixir AST with `Macro.to_string` and
+; scanned the text; here the compiled bl-ANF node is printed with `pr-str` and
+; scanned the same way. Same gensym names, same assertion, no Elixir seam.
+(deftest an-expansions-gensyms-are-canonical-never-baked
+  (c/reset-fresh!)
+  (let [form (r/read_one "(fn [x] (when-let [s (seq x)] (first s)))")
+        node (c/compile form (c/new-env "repro.user"))
+        text (pr-str node)
+        names (vec (distinct (map second
+                                  (Regex/scan (Regex/compile! "temp__[0-9]+__(auto|c)") text))))]
+    (is (= ["c"] names)
+        (str "expected only canonical gensyms, saw " (pr-str names) " in " text))))

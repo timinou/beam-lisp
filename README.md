@@ -50,6 +50,8 @@ Use it to build applications that are safe, scalable, and whose complexity stays
 The full command reference is [`docs/bl/00-the-cli.md`](docs/bl/00-the-cli.md);
 the first-hour walkthrough is
 [`docs/bl/01-first-hour.bl.md`](docs/bl/01-first-hour.bl.md).
+Namespace initialization, incremental rebuilds, and lazy memory behavior are
+covered in [`docs/namespace-loading.md`](docs/namespace-loading.md).
 
 ## Composable experiences
 

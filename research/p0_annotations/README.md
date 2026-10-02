@@ -32,8 +32,8 @@ both the source spelling `'([x])` and Specter's `(list 'quote …)` stamp
 use it to MEAN "the datum, literally".
 
 Regression coverage: `test/bl/prelude_test.bl`
-`var-metadata-values-are-data` + `wave27_macrometa_test.exs` (6/6) +
-`specter_compat_test.exs` (13/13, the defnav `:arglists` stamp).
+`var-metadata-values-are-data` + `test/bl/wave27_macrometa_port_test.bl` (6 tests) +
+`test/bl/specter_compat_test.bl` (13 tests, including the defnav `:arglists` stamp).
 
 ## The annotation convention (v1)
 

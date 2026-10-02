@@ -1,0 +1,368 @@
+; sorted_test.bl — `BeamLisp.Sorted` and its `BeamLisp.Ns.Rt` integration,
+; in beam-lisp itself.
+;
+; Ported from the ExUnit `test/beam_lisp/sorted_test.exs`: every case there is
+; here, grouped the same way, and the original is gone once this suite is green.
+;
+; WHY THIS SUITE EXISTS. Two concerns live here, and they fail differently:
+;
+;   1. ORDERING — does the key encoding reproduce the language's `compare`
+;      order? A wrong answer silently mis-sorts an index, which surfaces much
+;      later as a query returning the wrong rows. The absolute assertions below
+;      (not just a differential) are what pin that down: a differential against
+;      a second implementation cannot catch an order BOTH agree on but the
+;      language does not.
+;
+;   2. CLAUSE-ORDER — a SortedMap IS a struct, and a struct IS a map on the
+;      BEAM, so an RT function whose generic map/struct clause precedes the
+;      sorted clause reads the STRUCT's fields instead of the collection's
+;      contents. That bug is silent: `find/2` returned nil for present keys
+;      during development and every other operation still looked correct.
+;      §"RT integration" asserts on operations that "obviously" work because
+;      they obviously worked right up until a clause landed above them.
+;
+; PARITY with the existing native BL suites. `test/bl/host_sorted_test.bl`
+; (166 assertions) is the DIFFERENTIAL of the pinned `priv/host/sorted*.bl`
+; sources against the seeded `BeamLisp.Sorted` beams: ranks, element-wise tuple
+; ordering, the tagged `:unbounded` sentinel, the bounded scans and the
+; collection ops are all proven there as "the two implementations agree". What
+; that differential cannot prove, and this suite pins, is that the agreed answer
+; is the RIGHT one — the absolute values, the Clojure semantics (a sorted map
+; equals a plain map; `:unbounded` is a legal key; an improper `[h | LazySeq]`
+; key encodes), and the error CLASS + MESSAGE of every refusal.
+;
+; Run: bin/bl test test/bl/sorted_test.bl
+
+(ns sorted.test)
+
+; ── helpers ────────────────────────────────────────────────────────────────
+
+; A `{k, v}` pair. `Sorted/map_new` and the `map_*` family take 2-TUPLES (that
+; is the live ABI), not the `[k v]` vectors `sorted_map_of` accepts.
+(defn- t2 [k v] (tuple k v))
+
+; The collection contents, in key order, as plain lists.
+(defn- stl [s] (BeamLisp.Sorted/set_to_list s))
+(defn- mkeys [m] (BeamLisp.Sorted/map_keys m))
+(defn- mvals [m] (BeamLisp.Sorted/map_vals m))
+
+(defn- entry-keys [entries] (map (fn [e] (erlang/element 1 e)) entries))
+
+; The refusal contract, both halves: the CLASS is the live exception struct's
+; module atom (`:Elixir.ArgumentError` — a bare `ArgumentError` is a var and
+; resolves to nothing at a value position) and the MESSAGE carries the reason.
+; A test that pinned only one would pass on the WRONG error at the same call
+; site.
+(defn- refuses? [class needle f]
+  (try
+    (do (f) false)
+    (catch e
+      (and (erlang/== class (erlang/map_get :__struct__ e))
+           (includes? (str (ex-message e)) needle)))))
+
+; ══ key encoding reproduces Clojure's compare order ════════════════════════
+
+(deftest numbers-order-numerically-across-int-and-float
+  ; Erlang's term order agrees with Clojure here, but only because ints and
+  ; floats share an encoding rank. Separate ranks would sort all ints before
+  ; all floats — silently wrong for `[?e :age ?a]` range predicates over mixed
+  ; numeric data.
+  (is (= (stl (BeamLisp.Sorted/set_new (list 3 1.5 2 1 2.5)))
+         (list 1 1.5 2 2.5 3))))
+
+(deftest nil-sorts-before-every-other-value
+  (is (= (first (stl (BeamLisp.Sorted/set_new (list :kw nil 5 "str"))))
+         nil)))
+
+(deftest cross-type-ordering-is-total-and-stable
+  ; Clojure's `compare` raises across most types; a total order is required
+  ; here instead, because an index must never crash on heterogeneous values.
+  ; The exact interleaving matters less than it being deterministic.
+  (let [values (list :kw "str" 5 nil true (list 1 2))
+        once (stl (BeamLisp.Sorted/set_new values))
+        twice (stl (BeamLisp.Sorted/set_new (reverse values)))]
+    (is (= once twice) (str "unstable total order: " once " vs " twice))))
+
+(deftest booleans-do-not-interleave-with-keywords
+  ; Both are atoms on the BEAM: without separate ranks, `true` would sort
+  ; between the keywords `:a` and `:z` by atom name.
+  (let [lst (stl (BeamLisp.Sorted/set_new (list :a true :z false)))
+        boolpos (filter (fn [i] (let [x (Enum/at lst i)]
+                                  (or (erlang/== x true) (erlang/== x false))))
+                        (range 4))]
+    (is (= boolpos (list 0 1)) (str "booleans must group, got: " lst))))
+
+(deftest tuples-order-element-wise-the-datom-key-layout
+  ; Precisely how index keys are shaped: {e, a, v, tx}. Element-wise ordering
+  ; is what makes a prefix scan possible.
+  (is (= (stl (BeamLisp.Sorted/set_new
+                (list (t2 1 :b) (t2 1 :a) (t2 0 :z) (t2 2 :a))))
+         (list (t2 0 :z) (t2 1 :a) (t2 1 :b) (t2 2 :a)))))
+
+(deftest vectors-order-element-wise-like-tuples
+  (let [s (BeamLisp.Sorted/set_new
+            (list (BeamLisp.Vector/new (list 1 2))
+                  (BeamLisp.Vector/new (list 1 1))
+                  (BeamLisp.Vector/new (list 0 9))))]
+    (is (= (map (fn [e] (BeamLisp.Vector/to_list e)) (stl s))
+           (list (list 0 9) (list 1 1) (list 1 2))))))
+
+; ══ range scans ════════════════════════════════════════════════════════════
+
+(deftest inclusive-on-both-bounds
+  ; the ExUnit fixture was `1..20`.
+  (let [s (BeamLisp.Sorted/set_new (range 1 21))]
+    (is (= (entry-keys (BeamLisp.Sorted/subseq_entries s (t2 :bound 5) (t2 :bound 8)))
+           (list 5 6 7 8)))))
+
+(deftest unbounded-below-and-above
+  (let [s (BeamLisp.Sorted/set_new (range 1 21))]
+    (is (= (entry-keys (BeamLisp.Sorted/subseq_entries s :unbounded (t2 :bound 3)))
+           (list 1 2 3)))
+    (is (= (entry-keys (BeamLisp.Sorted/subseq_entries s (t2 :bound 18) :unbounded))
+           (list 18 19 20)))))
+
+(deftest bounds-that-fall-between-keys-still-bracket-correctly
+  (let [s (BeamLisp.Sorted/set_new (list 10 20 30 40))]
+    (is (= (entry-keys (BeamLisp.Sorted/subseq_entries s (t2 :bound 15) (t2 :bound 35)))
+           (list 20 30)))))
+
+(deftest empty-range-yields-empty-not-an-error
+  (let [s (BeamLisp.Sorted/set_new (range 1 21))]
+    (is (= (BeamLisp.Sorted/subseq_entries s (t2 :bound 100) (t2 :bound 200)) ()))
+    ; inverted bounds are empty rather than a crash
+    (is (= (BeamLisp.Sorted/subseq_entries s (t2 :bound 8) (t2 :bound 5)) ()))))
+
+(deftest descending-reverses-the-same-bounded-window
+  (let [s (BeamLisp.Sorted/set_new (range 1 21))]
+    (is (= (entry-keys (BeamLisp.Sorted/rsubseq_entries s (t2 :bound 5) (t2 :bound 8)))
+           (list 8 7 6 5)))))
+
+(deftest scan-on-an-empty-collection-is-empty
+  (is (= (BeamLisp.Sorted/subseq_entries
+           (BeamLisp.Sorted/set_new (list)) :unbounded :unbounded) ()))
+  (is (= (BeamLisp.Sorted/subseq_entries
+           (BeamLisp.Sorted/map_new) (t2 :bound 1) (t2 :bound 5)) ())))
+
+; ══ sorted map basics ══════════════════════════════════════════════════════
+
+(deftest put-replaces-an-equal-key-rather-than-duplicating
+  (let [m (BeamLisp.Sorted/map_put
+            (BeamLisp.Sorted/map_put (BeamLisp.Sorted/map_new) :a 1) :a 2)]
+    (is (= (BeamLisp.Sorted/map_count m) 1))
+    (is (= (BeamLisp.Sorted/map_get m :a) 2))))
+
+(deftest get-returns-the-default-for-an-absent-key
+  (let [m (BeamLisp.Sorted/map_new (list (t2 :a 1)))]
+    (is (= (BeamLisp.Sorted/map_get m :zz :missing) :missing))
+    (is (= (BeamLisp.Sorted/map_get m :zz) nil))))
+
+(deftest delete-is-idempotent
+  (let [m (BeamLisp.Sorted/map_new (list (t2 :a 1)))
+        once (BeamLisp.Sorted/map_delete m :a)
+        twice (BeamLisp.Sorted/map_delete once :a)]
+    (is (= (BeamLisp.Sorted/map_count twice) 0))))
+
+(deftest first-last-are-endpoints-nil-when-empty
+  (let [m (BeamLisp.Sorted/map_new (list (t2 :b 2) (t2 :a 1) (t2 :c 3)))]
+    (is (= (BeamLisp.Sorted/first_entry m) (t2 :a 1)))
+    (is (= (BeamLisp.Sorted/last_entry m) (t2 :c 3)))
+    (is (= (BeamLisp.Sorted/first_entry (BeamLisp.Sorted/map_new)) nil))
+    (is (= (BeamLisp.Sorted/last_key (BeamLisp.Sorted/set_new (list))) nil))))
+
+(deftest keys-and-vals-are-both-in-key-order
+  (let [m (BeamLisp.Sorted/map_new (list (t2 "c" 3) (t2 "a" 1) (t2 "b" 2)))]
+    (is (= (mkeys m) (list "a" "b" "c")))
+    (is (= (mvals m) (list 1 2 3)))))
+
+; ══ RT integration: the struct-is-a-map hazard ═════════════════════════════
+; Every assertion below guards a clause that MUST precede the generic
+; map/struct clauses in `BeamLisp.Ns.Rt`. `find/2` is the one that actually
+; regressed during development, and it regressed silently.
+
+(defn- rt-map [] (BeamLisp.Sorted/map_new (list (t2 "a" 1) (t2 "b" 2))))
+(defn- rt-set [] (BeamLisp.Sorted/set_new (list 1 2 3)))
+
+(deftest find-returns-the-entry-for-a-present-key-not-nil
+  ; THE regression: the generic struct clause matched first, `record?` said
+  ; false, and find read the struct's :tree field — nil for every real key.
+  (is (= (BeamLisp.Ns.Rt/find (rt-map) "a") ["a" 1]))
+  (is (= (BeamLisp.Ns.Rt/find (rt-map) "absent") nil)))
+
+(deftest count-reports-entries-not-struct-fields
+  ; A struct has 1 field here; a wrong clause order returns 1.
+  (is (= (BeamLisp.Ns.Rt/count (rt-map)) 2))
+  (is (= (BeamLisp.Ns.Rt/count (rt-set)) 3)))
+
+(deftest get-reads-contents-not-fields
+  (is (= (BeamLisp.Ns.Rt/get (rt-map) "b" :miss) 2))
+  (is (= (BeamLisp.Ns.Rt/get (rt-map) :tree :miss) :miss)
+      "must not expose the backing field")
+  (is (= (BeamLisp.Ns.Rt/get (rt-set) 2 :miss) 2))
+  (is (= (BeamLisp.Ns.Rt/get (rt-set) 99 :miss) :miss)))
+
+(deftest seq-yields-ordered-contents-and-nil-when-empty
+  (is (= (BeamLisp.Ns.Rt/seq (rt-set)) (list 1 2 3)))
+  (is (= (BeamLisp.Ns.Rt/seq (rt-map)) (list ["a" 1] ["b" 2])))
+  (is (= (BeamLisp.Ns.Rt/seq (BeamLisp.Sorted/set_new (list))) nil))
+  (is (= (BeamLisp.Ns.Rt/seq (BeamLisp.Sorted/map_new)) nil)))
+
+(deftest first-rest-next-read-contents
+  (is (= (BeamLisp.Ns.Rt/first (rt-set)) 1))
+  (is (= (BeamLisp.Ns.Rt/rest (rt-set)) (list 2 3)))
+  (is (= (BeamLisp.Ns.Rt/next (rt-set)) (list 2 3)))
+  (is (= (BeamLisp.Ns.Rt/first (BeamLisp.Sorted/set_new (list))) nil)))
+
+(deftest contains-is-membership-for-sets-and-key-presence-for-maps
+  (is (BeamLisp.Ns.Rt/contains? (rt-set) 2))
+  (is (not (BeamLisp.Ns.Rt/contains? (rt-set) 99)))
+  (is (BeamLisp.Ns.Rt/contains? (rt-map) "a"))
+  (is (not (BeamLisp.Ns.Rt/contains? (rt-map) 1))
+      "a map's contains? asks about KEYS, not values"))
+
+(deftest predicates-agree-with-the-operations-that-act-on-these-types
+  (is (BeamLisp.Ns.Rt/map? (rt-map))
+      "a sorted map answers every map operation, so map? must agree")
+  (is (not (BeamLisp.Ns.Rt/map? (rt-set))))
+  (is (BeamLisp.Ns.Rt/set? (rt-set)))
+  (is (and (BeamLisp.Ns.Rt/coll? (rt-map)) (BeamLisp.Ns.Rt/coll? (rt-set))))
+  (is (and (BeamLisp.Ns.Rt/sorted? (rt-map)) (BeamLisp.Ns.Rt/sorted? (rt-set))))
+  (is (not (BeamLisp.Ns.Rt/sorted? {})) "a plain map is unordered")
+  (is (BeamLisp.Ns.Rt/sorted_map? (rt-map)))
+  (is (not (BeamLisp.Ns.Rt/sorted_map? (rt-set))))
+  (is (BeamLisp.Ns.Rt/sorted_set? (rt-set)))
+  (is (not (BeamLisp.Ns.Rt/sorted_set? (rt-map)))))
+
+(deftest assoc-maintains-order-conj-adds-members-entries
+  (is (= (mkeys (BeamLisp.Ns.Rt/assoc (rt-map) "aa" 99)) (list "a" "aa" "b")))
+  (let [s2 (BeamLisp.Ns.Rt/conj (rt-set) 0)]
+    (is (BeamLisp.Ns.Rt/sorted_set? s2))
+    (is (= (BeamLisp.Ns.Rt/first s2) 0)))
+  (let [m2 (BeamLisp.Ns.Rt/conj (rt-map) ["z" 26])]
+    (is (BeamLisp.Ns.Rt/sorted_map? m2))))
+
+(deftest assoc-on-a-sorted-set-raises-rather-than-corrupting-the-struct
+  (is (refuses? :Elixir.ArgumentError "not supported on a sorted set"
+        (fn [] (BeamLisp.Ns.Rt/assoc (rt-set) :k :v)))))
+
+(deftest conj-on-a-sorted-map-rejects-a-non-entry-loudly
+  (is (refuses? :Elixir.ArgumentError "expects a [k v] entry"
+        (fn [] (BeamLisp.Ns.Rt/conj (rt-map) 42)))))
+
+(deftest disj-removes-a-member
+  (is (= (BeamLisp.Ns.Rt/count (BeamLisp.Ns.Rt/disj (rt-set) 2)) 2))
+  (is (= (BeamLisp.Ns.Rt/count (BeamLisp.Ns.Rt/disj (rt-set) 99)) 3)
+      "disj is idempotent"))
+
+(deftest printing-is-ordered-and-deterministic
+  (is (= (BeamLisp.Ns.Rt/print_str (rt-set)) (str "#" "{1 2 3}")))
+  (is (= (BeamLisp.Ns.Rt/print_str (rt-map)) "{\"a\" 1, \"b\" 2}")))
+
+(deftest map-filter-iterate-in-key-order
+  (is (= (to-list (BeamLisp.Ns.Rt/map (fn [x] (* x 10)) (rt-set)))
+         (list 10 20 30)))
+  (is (= (to-list (BeamLisp.Ns.Rt/map
+                    (fn [entry] (BeamLisp.Ns.Rt/get entry 0 nil)) (rt-map)))
+         (list "a" "b"))))
+
+(deftest transientable-is-false-gb-trees-is-already-persistent
+  (is (not (BeamLisp.Ns.Rt/transientable? (rt-map))))
+  (is (not (BeamLisp.Ns.Rt/transientable? (rt-set)))))
+
+; ══ constructors ═══════════════════════════════════════════════════════════
+
+(deftest sorted-map-1-pairs-flat-args
+  (is (= (mkeys (BeamLisp.Ns.Rt/sorted_map [:b 2 :a 1])) (list :a :b))))
+
+(deftest sorted-map-1-rejects-an-odd-argument-count-loudly
+  (is (refuses? :Elixir.ArgumentError "no value supplied for key"
+        (fn [] (BeamLisp.Ns.Rt/sorted_map [:a 1 :b])))))
+
+(deftest sorted-set-of-1-de-duplicates
+  (is (= (stl (BeamLisp.Ns.Rt/sorted_set_of [3 1 3 1])) (list 1 3))))
+
+(deftest sorted-map-of-1-accepts-entry-vectors
+  (is (= (mkeys (BeamLisp.Ns.Rt/sorted_map_of [["b" 2] ["a" 1]])) (list "a" "b"))))
+
+; ══ review-gate regressions: the encoder must PROJECT RT.compare ═══════════
+; The encoder invented its own rank table and disagreed with the language's
+; authoritative order in three places. Two competing definitions of "sorted" is
+; how an index silently returns wrong rows.
+
+(deftest agrees-with-rt-compare-for-every-cross-type-pair
+  (let [values [nil false true 0 1.5 "s" :s [1 2]]
+        bad (filter
+              (fn [[a b]]
+                (let [cmp (BeamLisp.Ns.Rt/compare a b)
+                      x (first (stl (BeamLisp.Sorted/set_new (list a b))))]
+                  (cond
+                    (< cmp 0) (not (BeamLisp.Ns.Rt/eqv x a))
+                    (> cmp 0) (not (BeamLisp.Ns.Rt/eqv x b))
+                    :else false)))
+              (for [a values b values] [a b]))]
+    (is (= bad ()) (str "encoder disagrees with RT.compare on: " bad))))
+
+(deftest a-sorted-set-matches-rt-sort-for-a-mixed-value-set
+  (let [values (list :kw "str" 5 nil true false 1.5)]
+    (is (= (stl (BeamLisp.Sorted/set_new values))
+           (to-list (BeamLisp.Ns.Rt/sort values))))))
+
+(deftest keywords-compare-by-name-not-by-atom-identity
+  (is (= (stl (BeamLisp.Sorted/set_new (list :zebra :apple))) (list :apple :zebra))))
+
+; ══ review-gate regressions: sentinel and improper lists ═══════════════════
+
+(deftest a-legal-unbounded-keyword-is-usable-as-a-real-bound
+  ; `:unbounded` was the raw internal marker, so scanning FOR that keyword was
+  ; read as "no bound" and returned everything.
+  (let [s (BeamLisp.Sorted/set_new (list :a :unbounded :z))]
+    (is (= (BeamLisp.Ns.Rt/subseq s :unbounded :unbounded) (list :unbounded)))
+    (is (= (BeamLisp.Ns.Rt/subseq s :a :unbounded) (list :a :unbounded)))))
+
+(deftest an-improper-head-lazyseq-key-encodes-instead-of-crashing
+  ; `RT.cons/2` legitimately produces these; the Elixir `Enum.map` raised on
+  ; the non-list tail. A key that crashes on INSERT fails a whole transaction
+  ; for a value the language allows.
+  (let [improper (BeamLisp.Ns.Rt/cons 0 (BeamLisp.LazySeq/new (fn [] nil)))]
+    (is (= (BeamLisp.Sorted/set_count (BeamLisp.Sorted/set_new (list improper))) 1))))
+
+(deftest a-lazy-tail-is-realised-into-the-encoding-so-order-is-by-contents
+  ; A lazy-seq thunk yields a CELL (a list), not a {head, tail} tuple.
+  (let [lazy-23 (BeamLisp.LazySeq/new (fn [] (list 2 3)))
+        improper (BeamLisp.Ns.Rt/cons 1 lazy-23)
+        ; Encoding must realise the tail, so this sorts by CONTENTS (1,2,3)
+        ; rather than by the opaque struct sitting in the tail.
+        s (BeamLisp.Sorted/set_new (list (list 1 9) improper))]
+    (is (= (BeamLisp.Sorted/set_count s) 2))
+    (let [first-key (first (stl s))]
+      ; (1,2,3) < (1,9) element-wise, so the improper value sorts first.
+      (is (= (BeamLisp.LazySeq/to_list first-key) (list 1 2 3))))))
+
+; ══ review-gate regressions: equality and stack ops ════════════════════════
+
+(deftest a-sorted-map-equals-a-plain-map-with-the-same-entries
+  ; Clojure: sortedness is an index property, not part of identity.
+  (is (BeamLisp.Ns.Rt/eqv (BeamLisp.Sorted/map_new (list (t2 :a 1))) {:a 1}))
+  (is (BeamLisp.Ns.Rt/eqv {:a 1} (BeamLisp.Sorted/map_new (list (t2 :a 1)))))
+  (is (not (BeamLisp.Ns.Rt/eqv (BeamLisp.Sorted/map_new (list (t2 :a 1))) {:a 2})))
+  (is (not (BeamLisp.Ns.Rt/eqv (BeamLisp.Sorted/map_new (list (t2 :a 1)))
+                               {:a 1 :b 2}))))
+
+(deftest a-sorted-set-equals-a-hashed-set-with-the-same-members
+  (is (BeamLisp.Ns.Rt/eqv (BeamLisp.Sorted/set_new (list 1 2)) (BeamLisp.Set/new (list 1 2))))
+  (is (not (BeamLisp.Ns.Rt/eqv (BeamLisp.Sorted/set_new (list 1 2))
+                               (BeamLisp.Set/new (list 1 3))))))
+
+(deftest two-sorted-collections-are-equal-regardless-of-build-order
+  (is (BeamLisp.Ns.Rt/eqv (BeamLisp.Sorted/set_new (list 1 2))
+                          (BeamLisp.Sorted/set_new (list 2 1)))))
+
+(deftest peek-and-pop-reject-ordered-collections-rather-than-answering-first-rest
+  (is (refuses? :Elixir.ArgumentError "not a stack"
+        (fn [] (BeamLisp.Ns.Rt/peek (BeamLisp.Sorted/set_new (list 1 2))))))
+  (is (refuses? :Elixir.ArgumentError "not a stack"
+        (fn [] (BeamLisp.Ns.Rt/pop (BeamLisp.Sorted/set_new (list 1 2))))))
+  (is (refuses? :Elixir.ArgumentError "not a stack"
+        (fn [] (BeamLisp.Ns.Rt/peek (BeamLisp.Sorted/map_new (list (t2 :a 1)))))))
+  (is (refuses? :Elixir.ArgumentError "not a stack"
+        (fn [] (BeamLisp.Ns.Rt/pop (BeamLisp.Sorted/map_new (list (t2 :a 1))))))))

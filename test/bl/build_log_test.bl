@@ -1,0 +1,176 @@
+; build_log_test.bl — the build's memory is a LOG OF FACTS; the manifest is its
+; projection, pinned at the language it is written in.
+;
+; Ported from the ExUnit `test/beam_lisp/build_log_test.exs`, which ran through
+; the Elixir façade `BeamLisp.BuildLog` (now deleted). The calls go straight to
+; `priv/build/build-log.bl` — `path-for`, `read-facts`, `replay`, `manifest`,
+; `stale`, `impact`, `coverage` — with no interop boundary in the path; the
+; `bl/1` normaliser the ExUnit test needed is gone with it, because inside the
+; language a `[]` is a `[]`.
+;
+; What this pins, and why each one is worth a test:
+;
+;   * what a build left behind can be QUERIED — stale, impact, coverage —
+;     instead of only asked one yes/no question per source;
+;   * a build directory whose manifest is gone still knows what it did (the log
+;     resumes it), which is what makes an interrupted build resumable;
+;   * the log and the manifest say exactly the same thing, because one is
+;     computed from the other rather than written beside it;
+;   * the log is on-disk INPUT, so a torn or non-fact line is DROPPED rather
+;     than fatal — the cost of dropping a half-written last fact is rebuilding
+;     one source, while the cost of raising is a build that cannot start.
+;
+; The fixtures are a two-source tree: `log.a` alone, `log.b` requiring it, so a
+; stale set and an impact set are both non-trivial.
+;
+; Run: bl test test/bl/build_log_test.bl
+
+(ns build-log.test
+  (:require [build :as b] [build-log :as blog] [build-plan :as bp]))
+
+; A scratch tree unique per file load: two files (or two runs) never share it,
+; and a leftover from a killed run cannot be adopted. FUP-073's fixed shared
+; tmp paths are the failure this avoids.
+(def root (str (System/tmp_dir!) "/bl_build_log_test_"
+               (erlang/unique_integer (list :positive))))
+(def src (Path/join root "src"))
+(def out (Path/join root "ebin"))
+(def manifest (Path/join out "compile.beam_lisp"))
+
+; ── helpers ──────────────────────────────────────────────────────────────────
+
+(defn- write [rel text] (File/write! (Path/join src rel) text))
+
+(defn- sources [] (sort (Path/wildcard (Path/join src "*.bl"))))
+
+(defn- fresh!
+  "A two-source tree: `log.a` alone, `log.b` requiring it."
+  []
+  (File/rm_rf! root)
+  (File/mkdir_p! src)
+  (write "a.bl" "(ns log.a)\n(defn one [] 1)\n")
+  (write "b.bl" "(ns log.b (:require [log.a :as a]))\n(defn two [] (+ 1 (a/one)))\n"))
+
+(defn- run-build
+  "The build driver on the fixture tree. The shared AOT cache is OFF so every
+   satisfied source is a real compile and two runs cannot be confused by a hit."
+  [force?]
+  (System/put_env "BEAM_LISP_AOT_CACHE" "off")
+  (b/run {:sources (sources) :out out :manifest manifest :jobs 1 :force? force?}))
+
+(defn- noop?
+  "A run that had nothing to do: nothing built, nothing failed."
+  [r] (and (= 0 (:built r)) (empty? (:errors r))))
+
+(defn- log-state []
+  (blog/replay (blog/read-facts (blog/path-for manifest))))
+
+(defn- plan!
+  "The plan over the CURRENT sources — recomputed after an edit, because stale
+   compares the log's record against the sources as they are now."
+  []
+  (bp/plan (mapv (fn [p] (bp/node-from p (File/read! p))) (sources))))
+
+; ── the log and its projection ───────────────────────────────────────────────
+
+(deftest a-build-logs-facts-and-the-manifest-is-their-projection
+  (fresh!)
+  (let [r (run-build true)
+        log (blog/path-for manifest)]
+    (is (empty? (:errors r)) (str "build errors: " (str (vec (:errors r)))))
+    (is (File/exists? log) "the build wrote no fact log")
+    (is (includes? (File/read! log) "[:build/built ")
+        "facts are text data, not a serialised term")
+    (let [facts (blog/read-facts log)
+          tags (set (vec (map first facts)))]
+      (is (contains? tags :build/run))
+      (is (contains? tags :build/built))
+      (is (contains? tags :build/end))
+      (is (= 1 (count (vec (filter (fn [f] (= :build/run (first f))) facts))))
+          "the compaction keeps the LAST run, not a history")
+      (let [state (blog/replay facts)]
+        (is (= 2 (count (:sources state))) "both sources are remembered")
+        (is (= (b/read-manifest manifest) (blog/manifest state))
+            "the manifest on disk must be exactly the log's projection")))))
+
+; ── the queries ──────────────────────────────────────────────────────────────
+
+(deftest the-stale-set-is-a-query-and-an-edit-moves-exactly-what-it-should
+  (fresh!)
+  (run-build true)
+  (let [state (log-state)]
+    (is (= [] (vec (blog/stale (plan!) state out)))
+        "nothing to do after a clean build")
+
+    ; A BODY edit: the interface `b` compiled against is unchanged, so `a` is
+    ; still fresh and only `b` is not.
+    (write "b.bl" "(ns log.b (:require [log.a :as a]))\n(defn two [] (+ 2 (a/one)))\n")
+
+    (is (= [(Path/join src "b.bl")] (vec (blog/stale (plan!) state out))))
+
+    ; `a` is what an edit to `a` would reach: b, and nothing else.
+    (is (= [(Path/join src "b.bl")] (vec (blog/impact (plan!) (Path/join src "a.bl")))))
+    (is (= [] (vec (blog/impact (plan!) (Path/join src "b.bl")))))))
+
+(deftest coverage-says-how-much-of-the-plan-the-log-accounts-for
+  (fresh!)
+  (run-build true)
+  (let [cov (blog/coverage (plan!) (log-state) out)]
+    (is (= 2 (:sources cov)))
+    (is (= 2 (:fresh cov)))
+    (is (= 2 (:recorded cov)))
+    (is (= [] (vec (:stale cov))))))
+
+; ── resumption, and failure ──────────────────────────────────────────────────
+
+(deftest a-build-with-no-manifest-resumes-from-the-log-alone
+  (fresh!)
+  (run-build true)
+  (let [manifest-before (b/read-manifest manifest)]
+    (is (= 2 (count manifest-before)))
+    (File/rm! manifest)
+
+    ; Nothing changed, so the log alone is enough to know there is no work —
+    ; the property a single rewritten document cannot have, because the
+    ; document IS the memory.
+    (is (noop? (run-build false)))
+
+    (is (= manifest-before (b/read-manifest manifest))
+        "the resumed build rewrote the projection")))
+
+(deftest a-source-that-fails-records-why-and-is-not-claimed-as-built
+  (fresh!)
+  (write "c.bl" "(ns log.c (:require [log.nope :as nope]))\n(defn three [] (nope/missing))\n")
+  (let [r (run-build true)
+        log (blog/path-for manifest)]
+    (is (some (fn [e] (includes? (str e) "c.bl")) (:errors r))
+        (str "the failure must name the source, got: " (str (vec (:errors r)))))
+    (let [text (File/read! log)]
+      (is (includes? text "[:build/failed ") "the log records the failure as a fact")
+      (is (includes? text "log.nope") "and carries the reason with it"))
+    (let [state (blog/replay (blog/read-facts log))]
+      (is (not (contains? (blog/manifest state) (Path/join src "c.bl")))
+          "a failed source is not part of the projection")
+      (is (contains? (set (vec (blog/stale (plan!) state out))) (Path/join src "c.bl"))))))
+
+; ── the log is input, not a trusted document ─────────────────────────────────
+
+(deftest a-torn-or-non-fact-line-is-dropped-not-fatal
+  (fresh!)
+  (File/mkdir_p! out)
+  (let [log (blog/path-for manifest)]
+    ; No log at all reads as no facts: an absent file is not a corrupt one.
+    (is (= [] (vec (blog/read-facts log))))
+
+    ; A torn final line (a crash mid-append) is dropped and the complete fact
+    ; before it survives — the reason the log is read as DATA.
+    (File/write! log (str (blog/fact->line (blog/run-fact "1" 7)) "\n[not closed\n"))
+    (let [facts (blog/read-facts log)]
+      (is (= 1 (count facts)) "a torn final line is dropped, not fatal")
+      (is (= :build/run (first (first facts))))
+      (is (= 1 (count (:runs (blog/replay facts))))))
+
+    ; A line that PARSES but is not a fact is dropped too: a reader node that is
+    ; not a vector carries no fact shape.
+    (File/write! log (str (blog/fact->line (blog/run-fact "2" 8)) "\n(defn x [] 1)\n"))
+    (is (= 1 (count (blog/read-facts log))) "a non-fact line is dropped")))

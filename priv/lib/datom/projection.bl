@@ -1,0 +1,177 @@
+; datom/projection.bl — what we MADE from something, with identity and a lifecycle.
+;
+; Design: docs/connectors/entities-and-projections.md §3 (laws L1–L7). Proven
+; first as an offline model in knowledger (apps/knowledger/test/
+; sync-store-prototype.bl, 33 assertions); this is that generator, upstream.
+;
+; ── The idea ────────────────────────────────────────────────────────────────
+;
+; A projection is DATA: which entities are members of a scope, which value of
+; a member means "redo it", and when the scope may start new work. From that
+; one declaration this module GENERATES the three standing queries whose
+; answers are work:
+;
+;   owed      [scope src rev]  members whose CURRENT revision has no live answer
+;   stale     [record src]     live records holding a target whose source left
+;   proposed  [scope src]      members with no record at all (an adoption view)
+;
+; and the record schema + transactions that answer them. Hand-writing these
+; queries per consumer produced two bugs in the prototype that only execution
+; found (a skipped revision still holds a target; a retired record must not
+; answer a returning source). Generating them makes those properties of the
+; generator, not of each author.
+;
+; ── The contract of a declaration ───────────────────────────────────────────
+;
+; Three FIXED variables are the whole interface: ?scope ?src ?rev.
+;   :active    clauses over ?scope — gates OWED only. Never STALE: pausing a
+;              scope must never retire anything; the executor decides.
+;   :member    clauses binding ?src from ?scope, revision-agnostic
+;   :revision  clauses binding ?rev from ?src
+; Locals are the declaration's own business; the generator never renames them
+; (it splices), so a local named ?p would collide with the record variable —
+; `projection` refuses the reserved names instead of guessing.
+;
+; ── Records ─────────────────────────────────────────────────────────────────
+;
+; One record per (projection, scope, src), keyed by the VALUES
+; [ident scope-key src-key] — the entities' unique keys, never their eids, so a
+; record survives the source entity being re-created and reads the same in any
+; store. :proj/target is a VALUE (a pointer into another database), never a
+; ref: a projection's target usually lives elsewhere.
+
+(ns datom.projection
+  (:require [datom]))
+
+(def schema
+  [{:db/ident :proj/key    :db/valueType :db.type/term :db/unique :db.unique/identity}
+   {:db/ident :proj/of     :db/valueType :db.type/keyword :db/index true}
+   {:db/ident :proj/scope  :db/valueType :db.type/ref :db/index true}
+   {:db/ident :proj/source :db/valueType :db.type/ref :db/index true}
+   {:db/ident :proj/rev    :db/valueType :db.type/term}
+   {:db/ident :proj/state  :db/valueType :db.type/keyword :db/index true}
+   {:db/ident :proj/target :db/valueType :db.type/term}
+   {:db/ident :proj/reason :db/valueType :db.type/string}
+   {:db/ident :proj/at     :db/valueType :db.type/long}])
+
+(def states #{:pending :applied :skipped :retired})
+
+;; `:pending` is an INTENT record, written before the consumer's apply runs.
+;; It holds no target and answers no revision (owed ignores it: its :proj/rev is
+;; the revision being attempted, but the owed anti-join only counts records
+;; that are not :retired AND not :pending). What it buys is L4's crash window:
+;; apply writes a target, the process dies before the answer is recorded, and
+;; the source then LEAVES the scope. Without an intent record there is nothing
+;; for STALE to find — the orphaned target lives forever (found by the
+;; drive-sync model, shrunk to [crash, add, sync, trash]). With it, stale sees a
+;; pending record whose source left and retires it through the consumer's
+;; :retire, which receives the pending row's LAST GOOD target (or nil) plus the
+;; key, so it can drop the origin it may have written.
+
+(def ^:private RESERVED '#{?p})
+
+(defn- vars-in [clauses]
+  (into #{} (filter (fn [x] (and (symbol? x) (starts-with? (name x) "?")))
+                    (flatten (into [] clauses)))))
+
+(defn projection
+  "Validate and return a projection declaration. Refuses, by name: a missing
+   :ident/:member/:revision; a :member that does not mention ?scope and ?src;
+   a :revision that does not bind ?rev; any clause using a reserved variable."
+  [ident spec]
+  (let [p (assoc spec :ident ident)
+        mv (vars-in (:member p))
+        rv (vars-in (:revision p))
+        all (into (into mv rv) (vars-in (:active p)))]
+    (cond
+      (not (keyword? ident)) (throw (str "projection: ident must be a keyword, got " (pr-str ident)))
+      (empty? (:member p)) (throw (str "projection " ident ": :member is required"))
+      (empty? (:revision p)) (throw (str "projection " ident ": :revision is required"))
+      (not (and (contains? mv '?scope) (contains? mv '?src)))
+        (throw (str "projection " ident ": :member must bind ?src from ?scope"))
+      (not (contains? rv '?rev)) (throw (str "projection " ident ": :revision must bind ?rev"))
+      (seq (filter (fn [x] (contains? RESERVED x)) all))
+        (throw (str "projection " ident ": ?p is reserved for the record variable"))
+      :else p)))
+
+(defmacro defprojection
+  "(defprojection name ident doc spec) — a validated projection var."
+  [nm ident doc spec]
+  `(def ~nm ~doc (projection ~ident ~spec)))
+
+(defn- record-of [p]
+  [['?p :proj/scope '?scope] ['?p :proj/source '?src] ['?p :proj/of (:ident p)]])
+
+(defn owed-query
+  "[scope src rev] for every member whose current revision has no live answer."
+  [p]
+  (into '[:find ?scope ?src ?rev :in $ % ?scope :where]
+        (concat (:active p) (:member p) (:revision p)
+                [(into [:not-join '[?scope ?src ?rev]]
+                       (concat (record-of p)
+                               ['[?p :proj/rev ?rev] '[:not [?p :proj/state :retired]]
+                                '[:not [?p :proj/state :pending]]]))])))
+
+(defn stale-query
+  "[record src] for every live record whose source left: one holding a target,
+   or a :pending intent (an apply that may have written a target before a
+   crash)."
+  [p]
+  (into '[:find ?p ?src :in $ % ?scope :where]
+        (concat (record-of p)
+                ['[:or [?p :proj/target _] [?p :proj/state :pending]]
+                 '[:not [?p :proj/state :retired]]
+                 (into [:not-join '[?scope ?src]] (:member p))])))
+
+(defn proposed-query
+  "[scope src] for every member with no record at all."
+  [p]
+  (into '[:find ?scope ?src :in $ % ?scope :where]
+        (concat (:member p) [(into [:not-join '[?scope ?src]] (record-of p))])))
+
+(defn- run [q db rules scope]
+  (into #{} (into [] (datom/q q db (or rules []) scope))))
+
+(defn owed     [p db rules scope] (run (owed-query p) db rules scope))
+(defn stale    [p db rules scope] (run (stale-query p) db rules scope))
+(defn proposed [p db rules scope] (run (proposed-query p) db rules scope))
+
+(defn record-key [p scope-key src-key] [(:ident p) scope-key src-key])
+
+(defn record
+  "The record for (scope-key, src-key), pulled, with :db/id — or nil."
+  [p db scope-key src-key]
+  (let [rs (into [] (datom/q '[:find ?e :in $ ?k :where [?e :proj/key ?k]]
+                             db (record-key p scope-key src-key)))]
+    (if (empty? rs) nil
+      (datom/pull db [:db/id :proj/state :proj/rev :proj/target :proj/reason :proj/at]
+                  (first (first rs))))))
+
+(defn record-tx
+  "The transaction that records an answer: upsert by key. `answer` is
+   {:state :applied|:skipped :target t? :reason s?}. A :skipped answer with no
+   :target KEEPS any existing target (the last good content stays until the
+   source leaves — docs/17 case 1); :applied replaces it."
+  [p {:keys [scope scope-key src src-key rev]} answer]
+  (when-not (contains? #{:pending :applied :skipped} (:state answer))
+    (throw (str "record-tx: state must be :pending, :applied or :skipped, got " (:state answer))))
+  [(cond-> {:db/id -1 :proj/key (record-key p scope-key src-key) :proj/of (:ident p)
+            :proj/scope scope :proj/source src :proj/rev rev :proj/state (:state answer)
+            :proj/at (erlang/system_time :millisecond)}
+     (contains? answer :target) (assoc :proj/target (:target answer))
+     (contains? answer :reason) (assoc :proj/reason (:reason answer)))])
+
+(defn retire-tx
+  "The transaction that retires record entity `rec`: state :retired, target kept
+   as history (a retired record answers nothing, so keeping it is safe)."
+  [rec]
+  [[:db/add rec :proj/state :retired]
+   [:db/add rec :proj/at (erlang/system_time :millisecond)]])
+
+(defn counts
+  "{state n} over this projection's records for `scope` — a query, for consoles."
+  [p db scope]
+  (frequencies (map first (into [] (datom/q '[:find ?s ?e :in $ ?of ?scope
+                                              :where [?e :proj/of ?of] [?e :proj/scope ?scope]
+                                                     [?e :proj/state ?s]]
+                                            db (:ident p) scope)))))

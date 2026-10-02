@@ -1,0 +1,456 @@
+; namespace_demand_test.bl — demand-driven `:require`: what loads, when, and how
+; often.
+;
+; `(ns a (:require [b :as b']))` DECLARES `b`, it no longer initializes it:
+; `b`'s top-level forms run at the first use of a name from `b` — a runtime var
+; deref (`BeamLisp.Env/fetch/2`'s miss hook), a macro the compiler needs to
+; expand, or a DIRECT call an AOT-baked beam makes (`Loader/ensure_ready/1`).
+; A bare (effect-only) require, a `:refer :all`, and the boot tier stay eager.
+;
+; Every test below builds its namespaces in a private tmp dir and loads them
+; through the ordinary loader, so what is asserted is the real path: the
+; default reader/compiler/emitter and the real registry. Namespaces load ONCE
+; per VM, so each call site gets a fresh name.
+;
+; Run: bin/bl test test/bl/namespace_demand_test.bl
+
+(ns namespace-demand-test)
+
+; ── fixtures ────────────────────────────────────────────────────────────────
+
+(defn- uniq-ns
+  "A fresh namespace name. A namespace loads once per VM, so reusing a name
+   would have the second test assert against the first test's loaded state."
+  [prefix]
+  (str prefix (erlang/unique_integer (list :positive))))
+
+(defn- tmp-dir [label]
+  (str (System/tmp_dir!) "/" label "_" (erlang/unique_integer (list :positive))))
+
+(defn- write-mod!
+  "Write `(ns <ns> <ns-body>)` plus `body` to `dir/<ns>.bl`, answering the path."
+  [dir ns ns-body body]
+  (File/mkdir_p! dir)
+  (let [path (Path/join dir (str (String/replace ns "." "/") ".bl"))]
+    (File/mkdir_p! (Path/dirname path))
+    (File/write! path (str "(ns " ns " " ns-body ")\n" body "\n"))
+    path))
+
+(defn- with-dirs
+  "Run `f` with `dir` as the only ambient search root, so `declare_require`
+   CAPTURES it and a deferred load later restores it."
+  [dir f]
+  (BeamLisp.Loader/with_ambient_dirs (list dir) f))
+
+(defn- fresh
+  "Run `f` with the runtime initialized and no configured search paths."
+  [f]
+  (BeamLisp/init)
+  (BeamLisp.Env/clear_search_paths)
+  (try
+    (f)
+    (finally (BeamLisp.Env/clear_search_paths))))
+
+(defn- load-outcome
+  "`nil` when `ns` loads, else the raised exception — whatever its class."
+  [ns]
+  (try
+    (do (BeamLisp.Loader/ensure_loaded ns) nil)
+    (catch e e)))
+
+(defn- anf-has?
+  "Whether the bl-ANF tree `x` contains a node satisfying `pred`."
+  [x pred]
+  (cond
+    (erlang/is_map x)
+      (if (pred x)
+        true
+        (some (fn [kv] (anf-has? (erlang/element 2 kv) pred)) (maps/to_list x)))
+
+    (erlang/is_list x)
+      (some (fn [v] (anf-has? v pred)) x)
+
+    (erlang/is_tuple x)
+      (some (fn [v] (anf-has? v pred)) (erlang/tuple_to_list x))
+
+    :else false))
+
+(defn- ready-guard-node?
+  "The `Loader/ensure_ready(ns)` call the compiler puts ahead of a direct
+   cross-namespace call."
+  [m]
+  (and (erlang/is_map m)
+       (erlang/== :remote (maps/get :op m nil))
+       (erlang/== :Elixir.BeamLisp.Loader (maps/get :mod m nil))
+       (erlang/== :ensure_ready (maps/get :fun m nil))))
+
+(defn- compile-anf
+  "The bl-ANF tree for one form, compiled as if written in namespace `ns`."
+  [ns source]
+  (let [forms (Enum/to_list (BeamLisp.Ns.Reader/read_string source "probe"))]
+    (BeamLisp.Compiler/compile (erlang/hd forms) (BeamLisp.Compiler/new_env ns))))
+
+(defn- counter-body
+  "A provider body whose `init-count` def appends one byte to `path` every time
+   the provider's top-level forms RUN. A count of 1 therefore proves the
+   provider was initialized exactly once, however many names are used."
+  [path]
+  (str "(def init-count\n"
+       "  (let [p \"" path "\"]\n"
+       "    (do (File/write! p (str (File/read! p) \"+\"))\n"
+       "        (String/length (File/read! p)))))\n"))
+
+(defn- counter-file [dir label]
+  (File/mkdir_p! dir)
+  (let [path (str dir "/" label ".count")]
+    (File/write! path "")
+    path))
+
+; ── nothing loads until a name is used ──────────────────────────────────────
+
+(deftest unused-aliased-provider-is-not-initialized
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd-unused")
+            prov (uniq-ns "ndprov_u")
+            caller (uniq-ns "ndcall_u")
+            count (counter-file dir "unused")]
+        (try
+          (write-mod! dir prov "" (counter-body count))
+          (write-mod! dir caller
+            (str "(:require [" prov " :as p])")
+            "(defn unrelated [] 1)")
+          (with-dirs dir
+            (fn []
+              (is (= :ok (BeamLisp.Loader/ensure_loaded caller)))
+              ; The requiring namespace loaded; the required one did not.
+              (is (not (BeamLisp.Env/loaded_ns? prov))
+                  "an aliased require alone does not initialize its provider")
+              (is (not (BeamLisp.Env/bound? prov "init-count")))
+              (is (erlang/== 0 (String/length (File/read! count)))
+                  "the provider's top-level forms never ran")))
+          (finally (File/rm_rf! dir)))))))
+
+(deftest first-use-initializes-the-provider-exactly-once
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd-once")
+            prov (uniq-ns "ndprov_o")
+            caller (uniq-ns "ndcall_o")
+            count (counter-file dir "once")]
+        (try
+          (write-mod! dir prov "" (str (counter-body count) "(defn answer [] 42)"))
+          (write-mod! dir caller
+            (str "(:require [" prov " :as p])")
+            "(defn use-it [] (p/answer))")
+          (with-dirs dir
+            (fn []
+              (BeamLisp.Loader/ensure_loaded caller)
+              (is (not (BeamLisp.Env/loaded_ns? prov)))
+              (is (= 42 (BeamLisp/eval (str "(" caller "/use-it)")))
+                  "the first use of an aliased function initializes its provider")
+              (is (BeamLisp.Env/loaded_ns? prov))
+              (is (= 42 (BeamLisp/eval (str "(" caller "/use-it)")))
+                  "later uses are ordinary calls")
+              (is (erlang/== 1 (String/length (File/read! count)))
+                  "the provider's init ran exactly once across two uses")))
+          (finally (File/rm_rf! dir)))))))
+
+(deftest an-ordinary-foreign-call-does-not-load-its-provider
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd-plain")
+            prov (uniq-ns "ndprov_p")
+            caller (uniq-ns "ndcall_p")]
+        (try
+          ; The provider defines an ordinary fn the caller calls. Compiling
+          ; that call asks "is `plain` a macro?" — the answer must come from
+          ; the provider's SOURCE, not from loading it.
+          (write-mod! dir prov "" "(defn plain [] 7)\n(defmacro unused-macro [x] x)")
+          (write-mod! dir caller
+            (str "(:require [" prov " :as p])")
+            "(defn use-plain [] (p/plain))")
+          (with-dirs dir
+            (fn []
+              (BeamLisp.Loader/ensure_loaded caller)
+              (is (not (BeamLisp.Env/loaded_ns? prov))
+                  "asking whether a foreign fn is a macro does not initialize it")
+              (is (= 7 (BeamLisp/eval (str "(" caller "/use-plain)"))))
+              (is (BeamLisp.Env/loaded_ns? prov))))
+          (finally (File/rm_rf! dir)))))))
+
+; ── macros: the provider loads only because an EXPANSION needs it ───────────
+
+(deftest a-macro-provider-is-loaded-for-expansion
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd-macro")
+            prov (uniq-ns "ndprov_m")
+            caller (uniq-ns "ndcall_m")]
+        (try
+          (write-mod! dir prov "" "(defmacro twice [x] (list (quote +) x x))")
+          (write-mod! dir caller
+            (str "(:require [" prov " :as q])")
+            "(defn use-macro [x] (q/twice x))")
+          (with-dirs dir
+            (fn []
+              (BeamLisp.Loader/ensure_loaded caller)
+              (is (BeamLisp.Env/loaded_ns? prov)
+                  "a needed macro provider is initialized at compile time")
+              (is (= 6 (BeamLisp/eval (str "(" caller "/use-macro 3)")))
+                  "the macro expanded to (+ x x)")))
+          (finally (File/rm_rf! dir)))))))
+
+(deftest macro-probes-do-not-materialize-per-env-values
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd-perenv")
+            prov (uniq-ns "ndprov_pe")
+            caller (uniq-ns "ndcall_pe")
+            plain (uniq-ns "ndprov_pv")]
+        (try
+          (write-mod! dir prov ""
+            "(def ^:per-env scratch 1)\n(defn plain [] 1)")
+          (write-mod! dir caller
+            (str "(:require [" prov " :as p])")
+            "(defn peek-it [] (p/scratch))")
+          (with-dirs dir
+            (fn []
+              (BeamLisp.Loader/ensure_loaded caller)
+              ; Compiling `(p/scratch)` probed for a macro and found an
+              ; ordinary (per-env) def in the SOURCE: the provider stays down.
+              (is (not (BeamLisp.Env/loaded_ns? prov))
+                  "a per-env value's provider is not loaded for a macro probe")
+              ; `peek` is the non-materializing read the probe uses: a per-env
+              ; var answers with its DESCRIPTOR, never an instance.
+              (write-mod! dir plain "" "(def ^:per-env scratch 1)\n(defn plain [] 1)")
+              (BeamLisp.Loader/ensure_loaded plain)
+              (let [r (BeamLisp.Env/peek plain "scratch")]
+                (is (= :ok (erlang/element 1 r)))
+                (is (not (erlang/is_integer (erlang/element 2 r)))
+                    "peek returns the descriptor, not a materialized value"))))
+          (finally (File/rm_rf! dir)))))))
+
+; ── privacy and missing namespaces still fail at the `(ns …)` form ──────────
+
+(deftest a-private-refer-is-refused-at-the-ns-form
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd-private")
+            prov (uniq-ns "ndprov_pr")
+            caller (uniq-ns "ndcall_pr")]
+        (try
+          (write-mod! dir prov "" "(defn- hidden [] 1)\n(defn visible [] 2)")
+          (write-mod! dir caller
+            (str "(:require [" prov " :refer [hidden]])") "")
+          (with-dirs dir
+            (fn []
+              (let [e (load-outcome caller)]
+                (is (some? e) "referring a private var is a compile error")
+                (is (includes? (ex-message e) "is not public")))
+              (is (not (BeamLisp.Env/loaded_ns? prov))
+                  "the refusal came from source metadata, not from a load")))
+          (finally (File/rm_rf! dir)))))))
+
+(deftest a-missing-namespace-is-refused-at-the-ns-form
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd-missing")
+            caller (uniq-ns "ndcall_ms")]
+        (try
+          (write-mod! dir caller "(:require [definitely.not.here :as n])" "")
+          (with-dirs dir
+            (fn []
+              (let [e (load-outcome caller)]
+                (is (some? e) "requiring a namespace that does not exist raises")
+                (is (includes? (ex-message e) "namespace not found")))))
+          (finally (File/rm_rf! dir)))))))
+
+; ── what stays eager ────────────────────────────────────────────────────────
+
+(deftest a-bare-require-still-loads-eagerly
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd-bare")
+            prov (uniq-ns "ndprov_b")
+            caller (uniq-ns "ndcall_b")
+            count (counter-file dir "bare")]
+        (try
+          (write-mod! dir prov "" (counter-body count))
+          (write-mod! dir caller (str "(:require " prov ")") "")
+          (with-dirs dir
+            (fn []
+              (BeamLisp.Loader/ensure_loaded caller)
+              (is (BeamLisp.Env/loaded_ns? prov)
+                  "a bare (effect-only) require loads now")
+              (is (erlang/== 1 (String/length (File/read! count))))))
+          (finally (File/rm_rf! dir)))))))
+
+(deftest refer-all-keeps-its-ns-time-snapshot
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd-referall")
+            prov (uniq-ns "ndprov_ra")
+            caller (uniq-ns "ndcall_ra")]
+        (try
+          (write-mod! dir prov "" "(defn pub1 [] 1)\n(defn pub2 [] 2)")
+          (write-mod! dir caller
+            (str "(:require [" prov " :refer :all])")
+            "(defn call1 [] (pub1))")
+          (with-dirs dir
+            (fn []
+              (BeamLisp.Loader/ensure_loaded caller)
+              (is (BeamLisp.Env/loaded_ns? prov)
+                  ":refer :all needs the provider's vars to take its snapshot")
+              (is (= 1 (BeamLisp/eval (str "(" caller "/call1)"))))
+              (is (= prov (BeamLisp.Env/refer_source caller "pub1")))))
+          (finally (File/rm_rf! dir)))))))
+
+; ── referred, qualified, first-class ────────────────────────────────────────
+
+(deftest referred-qualified-and-first-class-uses-initialize-the-provider
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd-forms")
+            prov (uniq-ns "ndprov_f")
+            caller (uniq-ns "ndcall_f")]
+        (try
+          (write-mod! dir prov "" "(defn r-fn [] 99)")
+          (write-mod! dir caller
+            (str "(:require [" prov " :refer [r-fn] :as z])")
+            (str "(defn via-refer [] (r-fn))\n"
+                 "(defn via-alias [] (z/r-fn))\n"
+                 "(defn via-value [] z/r-fn)"))
+          (with-dirs dir
+            (fn []
+              (BeamLisp.Loader/ensure_loaded caller)
+              (is (not (BeamLisp.Env/loaded_ns? prov)))
+              (is (= 99 (BeamLisp/eval (str "(" caller "/via-refer)")))
+                  "a referred name initializes its provider")
+              (is (= 99 (BeamLisp/eval (str "(" caller "/via-alias)")))
+                  "an alias-qualified name resolves to the same var")
+              (is (= 99 (BeamLisp/eval (str "((" caller "/via-value))")))
+                  "a first-class var reference fetches the provider's value")))
+          (finally (File/rm_rf! dir)))))))
+
+; ── the AOT direct-call guard ───────────────────────────────────────────────
+
+(deftest a-direct-cross-namespace-call-is-guarded
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd-guard")
+            prov (uniq-ns "ndprov_g")]
+        (try
+          (write-mod! dir prov "" "(defn answer [] 42)")
+          (with-dirs dir
+            (fn []
+              (BeamLisp.Loader/ensure_loaded prov)
+              ; `prov` is initialized, so the compiler resolves a direct call
+              ; into its shim — exactly the call an AOT beam bakes in.
+              (is (anf-has? (compile-anf "ndprobe" (str "(" prov "/answer)"))
+                            ready-guard-node?)
+                  "a direct call into another namespace carries the readiness guard")
+              ; A call into the boot tier is never guarded: those namespaces
+              ; are initialized by the boot ladder before author code runs.
+              (is (not (anf-has? (compile-anf "ndprobe" "(core/first (list 1))")
+                                 ready-guard-node?))
+                  "a boot-tier call pays no guard")))
+          (finally (File/rm_rf! dir)))))))
+
+(deftest the-readiness-guard-initializes-a-deferred-namespace-once
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd-ready")
+            prov (uniq-ns "ndprov_r")
+            caller (uniq-ns "ndcall_r")
+            count (counter-file dir "ready")]
+        (try
+          (write-mod! dir prov "" (counter-body count))
+          (write-mod! dir caller (str "(:require [" prov " :as p])") "")
+          (with-dirs dir
+            (fn []
+              (BeamLisp.Loader/ensure_loaded caller)
+              (is (not (BeamLisp.Env/ns_ready? prov))
+                  "a declared-but-uninitialized namespace is not ready")
+              (is (= :ok (BeamLisp.Loader/ensure_ready prov))
+                  "the guard initializes it")
+              (is (BeamLisp.Env/ns_ready? prov))
+              (is (BeamLisp.Env/loaded_ns? prov))
+              (is (= :ok (BeamLisp.Loader/ensure_ready prov))
+                  "a second guard call is a no-op")
+              (is (erlang/== 1 (String/length (File/read! count)))
+                  "init ran exactly once")))
+          (finally (File/rm_rf! dir)))))))
+
+; ── boundedness: cycles, re-entrancy, undeclared targets ────────────────────
+
+(deftest cyclic-deferred-requires-are-bounded
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd-cycle")
+            a (uniq-ns "ndcyc_a")
+            b (uniq-ns "ndcyc_b")]
+        (try
+          (write-mod! dir a
+            (str "(:require [" b " :as b])")
+            "(defn a-fn [] 1)\n(defn use-b [] (b/b-fn))")
+          (write-mod! dir b
+            (str "(:require [" a " :as a])")
+            "(defn b-fn [] 2)\n(defn use-a [] (a/a-fn))")
+          (with-dirs dir
+            (fn []
+              (is (= :ok (BeamLisp.Loader/ensure_loaded a)))
+              (is (not (BeamLisp.Env/loaded_ns? b))
+                  "the cycle's other half is still a declaration")
+              (is (= 2 (BeamLisp/eval (str "(" a "/use-b)")))
+                  "the first cross-cycle use initializes the other half")
+              (is (BeamLisp.Env/loaded_ns? b))
+              (is (= 1 (BeamLisp/eval (str "(" b "/use-a)")))
+                  "and the cycle closes without a second load")))
+          (finally (File/rm_rf! dir)))))))
+
+(deftest a-lookup-inside-the-loader-server-runs-inline
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd-inline")
+            prov (uniq-ns "ndprov_i")
+            caller (uniq-ns "ndcall_i")]
+        (try
+          (write-mod! dir prov "" "(defn answer [] 42)")
+          (write-mod! dir caller (str "(:require [" prov " :as p])") "")
+          (with-dirs dir
+            (fn []
+              (BeamLisp.Loader/ensure_loaded caller)
+              ; A deferred load triggered from inside the loader process must
+              ; run INLINE — a nested GenServer call would deadlock.
+              (is (= :ok (BeamLisp.Loader.Server/run
+                           (fn [] (BeamLisp.Loader/ensure_deferred prov)))))
+              (is (BeamLisp.Env/loaded_ns? prov))))
+          (finally (File/rm_rf! dir)))))))
+
+(deftest ensure-deferred-leaves-an-undeclared-namespace-alone
+  (fresh
+    (fn []
+      (is (= :ok (BeamLisp.Loader/ensure_deferred "namespace.demand.undeclared")))
+      (is (not (BeamLisp.Env/loaded_ns? "namespace.demand.undeclared"))))))
+
+(deftest extending-a-deferred-protocol-initializes-its-provider
+  (fresh
+    (fn []
+      (let [dir (tmp-dir "nd_protocol")
+            provider (uniq-ns "ndproto")
+            caller (uniq-ns "ndextend")
+            flag (Path/join dir "initialized")]
+        (try
+          (write-mod! dir provider ""
+            (str "(def initialized (File/write! \"" flag "\" \"once\" (list :append)))\n"
+                 "(defprotocol P (value [x]))"))
+          (write-mod! dir caller (str "(:require [" provider " :as p])")
+            "(defrecord T [])\n(extend-type T p/P (value [x] 7))\n(defn run [] (p/value (->T)))")
+          (with-dirs dir
+            (fn []
+              (is (= :ok (BeamLisp.Loader/ensure_loaded caller)))
+              (is (BeamLisp.Env/loaded_ns? provider))
+              (is (= 7 (BeamLisp/eval (str "(" caller "/run)"))))
+              (is (= "once" (File/read! flag)))))
+          (finally (File/rm_rf! dir)))))))

@@ -15,6 +15,9 @@ second runner to choose between.
 
 **Isolated (the default).** Every file forks; a misbehaving file is contained.
 Warm because the image the forks come from is the one this process already has.
+A file that runs past 300 s is reported incoherent and killed; `BL_TEST_TIMEOUT=N`
+(whole seconds) moves that bound for one run, so a slow suite on a loaded host
+keeps its isolation instead of retreating to `--shared`.
 
 **`--shared`.** Every file runs in ONE image, one after another, sharing what
 the files set up between them — the old behavior. The image is forked from this
@@ -54,7 +57,8 @@ that mutates globals wants the default instead.
   ; Report the RESOLVED path: the run's cwd may not be the caller's by the time
   ; the message is read, and a relative name would point nowhere.
   (let [rs (map u/resolve args)]
-    (filter (fn [p] (empty? (u/expand-targets p))) rs)))
+    (filter (fn [p] (and (empty? (u/expand-targets p))
+                          (empty? (exs-under p)))) rs)))
 
 (defn- exs-under
   "The `*_test.exs` files under one path: a file contributes itself when that is
@@ -176,15 +180,15 @@ anything reading the number rather than the picture.
       (let [out "/tmp/bl-test-support"]
         (File/mkdir_p! out)
         (Kernel.ParallelCompiler/compile_to_path
-          (to-list support) out (list (erlang/list_to_tuple (list :return-diagnostics true))))
+          (to-list support) out (list (erlang/list_to_tuple (list :return_diagnostics true))))
         (erlang/apply :code :add_patha (list (String/to_charlist out)))))))
 
 (defn run-exunit
   "The `.exs` half: ExUnit on whatever Elixir is running this VM — the same
    framework `mix test` used, with no Mix underneath it.
 
-   `test_helper.exs` runs first, because it is where ExUnit starts; it starts
-   ExUnit with `autorun: false` so the only report is this run's. With `--json`
+   The runner starts ExUnit itself with `autorun: false` and applies the
+   toolchain hotpatch before loading suites. With `--json`
    the whole run is silenced and one object is emitted: a caller reading a number
    must not have to skip past a report.
 
@@ -193,8 +197,8 @@ anything reading the number rather than the picture.
   [paths st]
   (compile-test-support!)
   (let [run! (fn []
-               (when (File/regular? "test/test_helper.exs")
-                 (Code/require_file "test/test_helper.exs"))
+               (BeamLisp.Loader/ensure_loaded "vm.hotpatch")
+               (erlang/apply :"Elixir.BeamLisp.Ns.Vm.Hotpatch" :apply-env! (list))
                (start-exunit st)
                (u/each (fn [f] (Code/require_file f)) paths)
                (ExUnit/run))

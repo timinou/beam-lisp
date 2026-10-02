@@ -1,0 +1,170 @@
+; vm/generation.bl — which source, seed and live code this VM is running.
+;
+; Port of the `BeamLisp.Generation` host module (PLAN-150 wave 2). A receipt
+; keeps three identities APART because they are easy to conflate:
+;
+;   :source  the toolchain key the current source + codegen inputs hash to
+;            (`current_compiler_key`), plus the VM's memoized snapshot of it
+;            (`compiler_key`). The snapshot is NOT proof of loaded code.
+;   :seed    the committed bootstrap manifest's sha256 — the floor a fresh
+;            build starts from.
+;   :loaded  per-module identity of the live compiler. `loaded_md5` is the
+;            RUNNING module's fingerprint; `object_code` is the code-path
+;            file's sha256 and whether it matches. An in-memory hotpatch can
+;            differ from the file on disk, so the two are reported separately.
+;
+; Building a receipt LOADS NOTHING. `code/is_loaded`, `code/get_object_code`
+; and `code/module_md5` are queries; `code/ensure_loaded` is never called here,
+; so asking for the receipt cannot drag a compiler module into the VM.
+;
+; The hotpatch set is PROCESS-GLOBAL (`:persistent_term`), keyed identically to
+; the transitional `BeamLisp.Generation`, so a namespace recorded here is the
+; one its `receipt/0` reports until that module is deleted and this is the only
+; implementation left.
+
+(ns vm.generation)
+
+(def ^:private HOTPATCH-KEY
+  (tuple (erlang/binary_to_atom "Elixir.BeamLisp.Generation") :hotpatched_namespaces))
+
+(def ^:private MIX (erlang/binary_to_atom "Elixir.Mix"))
+(def ^:private MIX-STATE (erlang/binary_to_atom "Elixir.Mix.State"))
+
+(def LOADED-MODULES
+  "The live compiler modules a receipt fingerprints by default: the namespace
+   shims `BeamLisp.Ns.{Compiler,Lower,Anf}`, whose `module_info(:md5)` is the
+   identity of the code the VM is actually running."
+  [(erlang/binary_to_atom "Elixir.BeamLisp.Ns.Compiler")
+   (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Lower")
+   (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Anf")])
+
+(defn- as-binary
+  "A binary from a path that may arrive as a charlist (`code/get_object_code`)
+   or already be one."
+  [x]
+  (cond
+    (erlang/is_binary x) x
+    (erlang/is_list x) (erlang/list_to_binary x)
+    :else (erlang/iolist_to_binary (to-list x))))
+
+(defn- name-str
+  "`x` as a string, the way `to_string/1` would: an atom's name, a binary
+   unchanged, anything else via iolist."
+  [x]
+  (cond
+    (erlang/is_binary x) x
+    (erlang/is_atom x) (erlang/atom_to_binary x :utf8)
+    :else (erlang/iolist_to_binary (to-list x))))
+
+(defn- seed-dir
+  "The committed seed directory: `<priv>/bootstrap/seed`, falling back to the
+   source-tree spelling when `:code.priv_dir/1` answers a non-directory (an
+   escript's archive path)."
+  []
+  (let [d (code/priv_dir :beam_lisp)]
+    (if (erlang/is_list d)
+      (Path/join (erlang/list_to_binary d) "bootstrap/seed")
+      (Path/expand "priv/bootstrap/seed"))))
+
+(defn- seed-identity
+  "The committed seed's identity: the sha256 of its `manifest.term`, or a nil
+   digest plus the read error's name when it is absent."
+  []
+  (let [path (Path/join (seed-dir) "manifest.term")
+        r (File/read path)]
+    (if (= :ok (elem r 0))
+      {:manifest_sha256 (sha256-hex (elem r 1))
+       :path (Path/expand path)}
+      {:manifest_sha256 nil
+       :path (Path/expand path)
+       :error (erlang/atom_to_binary (elem r 1) :utf8)})))
+
+(defn- module-identity
+  "`[name identity]` for one module. `identity` carries the LOADED module's
+   md5 and, separately, the code-path object file's sha256/path and whether
+   that object matches the loaded code — `false` for an in-memory hotpatch,
+   `nil` for a module with no object file."
+  [mod]
+  (let [live-md5 (if (not= false (code/is_loaded mod))
+                   (erlang/apply mod :module_info (list :md5))
+                   nil)
+        object (let [oc (code/get_object_code mod)]
+                 (if (and (erlang/is_tuple oc) (= mod (elem oc 0)))
+                   (let [bytes (elem oc 1)
+                         path (elem oc 2)]
+                     {:sha256 (sha256-hex bytes)
+                      :path (Path/expand (as-binary path))
+                      :matches_loaded (and (some? live-md5)
+                                           (= (code/module_md5 bytes) live-md5))})
+                   nil))]
+    [(erlang/atom_to_binary mod :utf8)
+     {:loaded_md5 (if (some? live-md5)
+                    (String/downcase (Base/encode16 live-md5))
+                    nil)
+      :object_code object}]))
+
+(defn- mix-env
+  "The Mix environment when Mix is loaded, else `\"release\"`. Mix is OPTIONAL:
+   a plain `bl` VM, a test run without it, or a drop all answer `\"release\"`
+   rather than crashing on a missing `Mix.State`."
+  []
+  (if (= :undefined (erlang/apply :erlang :whereis (list MIX-STATE)))
+    "release"
+    (erlang/atom_to_binary (erlang/apply MIX :env (list)) :utf8)))
+
+(defn- cache-mode
+  "`\"strict\"` when `BEAM_LISP_AOT_STRICT` is set to 1/true, else `\"fallback\"`."
+  []
+  (if (contains? #{"1" "true"} (System/get_env "BEAM_LISP_AOT_STRICT"))
+    "strict"
+    "fallback"))
+
+(defn hotpatched_namespaces
+  "The bootstrap namespaces hot-patched in this VM, sorted. Process-global
+   (`:persistent_term`); `[]` when none."
+  []
+  (erlang/apply :persistent_term :get (list HOTPATCH-KEY [])))
+
+(defn record_hotpatch
+  "Record `names` as successfully hot-patched — strings (or atoms) per name.
+   The set is de-duplicated and sorted, so recording a namespace twice is
+   idempotent. Returns `:ok`.
+
+   Only call this AFTER every emitted beam of the namespace has loaded; the
+   receipt's claim is that the namespace IS this code."
+  [names]
+  (let [updated (to-list (sort (distinct (to-list (concat (hotpatched_namespaces)
+                                                          (to-list (map name-str names)))))))]
+    (erlang/apply :persistent_term :put (list HOTPATCH-KEY updated))
+    :ok))
+
+(defn reset_hotpatches
+  "Forget every recorded hotpatch in this VM. Process-global: the next receipt
+   reports none."
+  []
+  (erlang/apply :persistent_term :erase (list HOTPATCH-KEY)))
+
+(defn receipt
+  "The machine-readable generation receipt, built WITHOUT loading anything.
+
+   Opts: `{:modules [mod …]}` selects which live modules to fingerprint; the
+   default is `LOADED-MODULES`. Returns a map with `:source`, `:seed`,
+   `:loaded`, `:hotpatched_namespaces`, `:build` and `:cache`, each identity
+   distinct from the others."
+  ([] (receipt {}))
+  ([opts]
+   (let [mods (or (:modules opts) LOADED-MODULES)
+         modules (reduce (fn [acc m]
+                           (let [pair (module-identity m)]
+                             (assoc acc (first pair) (second pair))))
+                         {} mods)]
+     {:source {:codegen_key (BeamLisp.AOTCache/current_compiler_key)
+               :memoized_codegen_key (BeamLisp.AOTCache/compiler_key)}
+      :seed (seed-identity)
+      :loaded {:modules modules}
+      :hotpatched_namespaces (hotpatched_namespaces)
+      :build {:mix_env (mix-env)
+              :aot_backend (erlang/atom_to_binary (BeamLisp.AOTCache/aot_backend) :utf8)}
+      :cache {:mode (cache-mode)
+              :directory (System/get_env "BEAM_LISP_AOT_CACHE_DIR")
+              :enabled (not= "off" (System/get_env "BEAM_LISP_AOT_CACHE"))}})))

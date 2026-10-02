@@ -104,3 +104,274 @@
     (is (waves-honest? p))
     (is (every? (fn [n] (contains? (:key p) (:path n))) nodes) "every source keyed")
     (is (> (count (first (:waves p))) 10) "the prelude has real parallelism in wave 1")))
+
+; ── the node memo: content-keyed, VM-wide ───────────────────────────────────
+;
+; `memo-node` is what the runtime drift gate hands `key-for` as its `node-of`:
+; a plan node is a pure function of a source's bytes, so the SAME closure
+; member is parsed once however many namespaces' closures mention it. Keying on
+; the content hash — never the path, never mtime — keeps the gate honest: an
+; edit is new bytes, a new key, and a fresh parse.
+
+(defn- memo-size
+  "Rows in `build-plan`'s content-keyed node-part memo, named by the table the
+   module PUBLISHES (`build-plan/MEMO-TABLE`) rather than a copy of the atom: a
+   schema bump in the module cannot leave this instrumentation counting a table
+   that no longer exists."
+  []
+  (let [t bp/MEMO-TABLE]
+    (if (= :undefined (ets/whereis t))
+      0
+      (ets/info t :size))))
+
+(deftest memo-is-content-keyed-and-relabels-the-path
+  (bp/clear-memo)
+  (is (= 0 (memo-size)) "clear-memo forgets everything")
+  (let [src "(ns memo.a)\n(defn f [] 1)\n"
+        a (bp/memo-node "memo.a" src)
+        b (bp/memo-node "memo.other" src)]
+    (is (= "memo.a" (:path a)))
+    (is (= "memo.other" (:path b)) "a hit is re-labelled to the asking name")
+    (is (= (:hash a) (:hash b)) "…and not re-parsed: same bytes, same node")
+    (is (= (:iface a) (:iface b)))
+    (is (= 1 (memo-size)) "one row per content, however many names ask")
+    (let [edited (bp/memo-node "memo.a" "(ns memo.a)\n(defn f [] 2)\n")]
+      (is (not= (:hash a) (:hash edited)) "an edit is new bytes → a new key")
+      (is (= 2 (memo-size)) "…and a fresh parse")))
+  (bp/clear-memo)
+  (is (= 0 (memo-size))))
+
+(deftest plan-paths-reads-sources-into-one-plan
+  (let [dir (Path/join (System/tmp_dir!) "bl_build_plan_paths")
+        leaf (Path/join dir "pw/leaf.bl")
+        root (Path/join dir "pw/root.bl")]
+    (File/rm_rf! dir)
+    (File/mkdir_p! (Path/dirname leaf))
+    (File/write! leaf "(ns pw.leaf)\n(defn one [] 1)\n")
+    (File/write! root "(ns pw.root (:require [pw.leaf :as l]))\n(defn two [] (l/one))\n")
+    (let [p (bp/plan-paths (list leaf root))]
+      (is (= [leaf root] (vec (map :path (:order p)))) "leaf before its requirer")
+      (is (contains? (:key p) leaf))
+      (is (contains? (:key p) root))
+      (is (not= (get (:key p) leaf) (get (:key p) root)))
+      (is (= [leaf] (vec (get (:deps p) root))) "the require resolved to a path"))
+    (File/rm_rf! dir)))
+
+; ── the on-disk level: a cold VM does not re-parse ─────────────────────────
+;
+; The ETS memo above dies with its VM, and every `bl` command without a daemon is
+; a new VM. The disk level stores each parse under the content hash, inside the
+; generation `AOTCache/build_key` names — so what these pin is the contract a
+; drop store depends on: bytes → the same answer from disk, an edit → a miss, a
+; moved toolchain → nothing read, and a damaged or hostile file → a parse, never
+; a wrong answer or a crash.
+
+(defn- restore-env [name value]
+  (if (nil? value) (System/delete_env name) (System/put_env name value)))
+
+(defn- with-parts-root
+  "Run `f` with a FRESH cache root and an empty VM memo, restoring both."
+  [f]
+  (let [root (str (System/tmp_dir!) "/bl_parts_" (erlang/unique_integer (list :positive)))
+        prev (System/get_env "BEAM_LISP_AOT_CACHE_DIR")
+        prev-on (System/get_env "BEAM_LISP_AOT_CACHE")]
+    (System/put_env "BEAM_LISP_AOT_CACHE_DIR" root)
+    (System/delete_env "BEAM_LISP_AOT_CACHE")
+    (File/mkdir_p! root)
+    (bp/clear-memo)
+    (try
+      (f root)
+      (finally
+        (restore-env "BEAM_LISP_AOT_CACHE_DIR" prev)
+        (restore-env "BEAM_LISP_AOT_CACHE" prev-on)
+        (bp/clear-memo)
+        (File/rm_rf! root)))))
+
+(defn- part-files [root]
+  (let [gens (Path/wildcard (Path/join root "parts/*"))]
+    (vec (mapcat (fn [g] (Path/wildcard (Path/join g "*"))) gens))))
+
+(def SRC "(ns disk.a (:require [disk.b :as b]))\n(defn f [] (b/g))\n")
+
+(deftest a-cold-vm-reads-the-parse-from-disk
+  (with-parts-root
+    (fn [root]
+      (let [first (bp/memo-node "disk.a" SRC)]
+        (is (= 1 (count (part-files root))) "the parse was published")
+        (bp/clear-memo)
+        (let [again (bp/memo-node "disk.a" SRC)]
+          (is (= first again) "a fresh VM memo answers the SAME node from disk")
+          (is (= ["disk.b"] (vec (:reqs again)))))
+        (is (= 1 (count (part-files root))) "…and wrote nothing new")))))
+
+(defn- generation-of [root]
+  (Path/basename (Path/dirname (first (part-files root)))))
+
+(deftest the-generation-is-the-build-key
+  (with-parts-root
+    (fn [root]
+      (bp/memo-node "disk.a" SRC)
+      (is (= (BeamLisp.AOTCache/build_key) (generation-of root))
+          "two drop builds of one toolchain share a directory; a moved toolchain gets its own"))))
+
+(deftest an-edit-is-a-miss
+  (with-parts-root
+    (fn [root]
+      (bp/memo-node "disk.a" SRC)
+      (bp/clear-memo)
+      (let [edited (bp/memo-node "disk.a" "(ns disk.a (:require [disk.c :as c]))\n(defn f [] 1)\n")]
+        (is (= ["disk.c"] (vec (:reqs edited))) "new bytes are parsed, never answered from the old entry")
+        (is (= 2 (count (part-files root))))))))
+
+(deftest a-damaged-file-is-a-parse-not-a-wrong-answer
+  (with-parts-root
+    (fn [root]
+      (let [good (bp/memo-node "disk.a" SRC)
+            f (first (part-files root))]
+        (doseq [damage [(fn [_] "")                       ; truncated to nothing
+                        (fn [b] (binary/part b 0 20))     ; shorter than the digest
+                        (fn [b] (str "x" (binary/part b 1 (- (erlang/byte_size b) 1)))) ; digest broken
+                        (fn [_] (str (crypto/hash :sha256 "junk") "junk"))] ; valid digest, not a term
+                ]
+          (File/write! f (damage (File/read! f)))
+          (bp/clear-memo)
+          (is (= good (bp/memo-node "disk.a" SRC)) "answers by parsing")
+          (is (= good (bp/memo-node "disk.a" SRC))))
+        (is (= 1 (count (part-files root))) "and the bad file was replaced")))))
+
+(deftest a-file-under-the-wrong-hash-is-refused
+  (with-parts-root
+    (fn [root]
+      (bp/memo-node "disk.a" SRC)
+      (let [other "(ns disk.z)\n(defn z [] 1)\n"
+            a-file (first (part-files root))
+            z-name (binary/encode_hex (crypto/hash :sha256 other))
+            z-file (Path/join (Path/dirname a-file) z-name)]
+        (File/cp! a-file z-file)
+        (bp/clear-memo)
+        (let [z (bp/memo-node "disk.z" other)]
+          (is (= "disk.z" (:ns z)) "another source's parse placed under this hash is not served"))))))
+
+(deftest an-unwritable-root-still-answers
+  (with-parts-root
+    (fn [root]
+      (File/write! (Path/join root "parts") "a file where a directory must go")
+      (let [n (bp/memo-node "disk.a" SRC)]
+        (is (= "disk.a" (:ns n)) "the store failed; the parse did not")
+        (is (= 0 (count (part-files root))))))))
+
+(deftest cache-off-touches-no-disk
+  (with-parts-root
+    (fn [root]
+      (System/put_env "BEAM_LISP_AOT_CACHE" "off")
+      (bp/memo-node "disk.a" SRC)
+      (is (= 0 (count (part-files root))) "BEAM_LISP_AOT_CACHE=off reads and writes nothing"))))
+
+(deftest old-generations-are-bounded
+  (with-parts-root
+    (fn [root]
+      (doseq [i (range 12)]
+        (let [g (Path/join root (str "parts/" (String/duplicate (str i) 64)))]
+          (File/mkdir_p! g)
+          (File/write! (Path/join g "x") "old")))
+      (bp/memo-node "disk.a" SRC)
+      (let [gens (Path/wildcard (Path/join root "parts/*"))]
+        (is (<= (count gens) bp/PARTS-KEEP) "creating a generation prunes beyond the bound")
+        (is (some (fn [g] (= (BeamLisp.AOTCache/build_key) (Path/basename g))) gens)
+            "the current generation is never pruned")))))
+
+(deftest a-warm-store-parses-nothing
+  ;; The point of the disk level, stated as a count rather than a stopwatch: with
+  ;; every part already stored, a cold VM's gate walk calls `content-parts` ZERO
+  ;; times. A real, unedited part is indistinguishable from a fresh parse by
+  ;; value, so the proof PLANTS one: a valid, correctly-framed file for these very
+  ;; bytes whose `:inames` differs from what parsing would say. If it comes back,
+  ;; the answer came from the file and nothing was parsed.
+  (with-parts-root
+    (fn [root]
+      (let [real (bp/memo-node "disk.a" SRC)
+            f (first (part-files root))
+            planted {:macros (:macros real) :hash (:hash real) :iface (:iface real)
+                     :inames ["planted-marker"] :refs (:refs real)
+                     :headers (list (list "disk.a" (:reqs real)))}
+            payload (erlang/term_to_binary planted)]
+        (File/write! f (str (crypto/hash :sha256 payload) payload))
+        (bp/clear-memo)
+        (is (= ["planted-marker"] (vec (:inames (bp/memo-node "disk.a" SRC))))
+            "the stored bytes were served; nothing was re-parsed")))))
+
+; ── the primed level: parts that ship inside a build ───────────────────────
+;
+; `self-build` parses the tier sources once and seals the result into the drop's
+; `priv/parts/<build-key>/`, so a machine that has never run this build starts
+; warm. The contract pinned here: what `prime!` writes is what `memo-node` serves
+; (before the per-user cache is even looked at), it is byte-for-byte reproducible
+; (the fixpoint gate compares two builds' bytes), it replaces rather than
+; accretes, and it can only ever be right or absent — a seed from another
+; toolchain sits in a differently-named directory and is never read.
+
+(defn- with-priv
+  "Run `f` with a fresh `priv`-shaped directory holding two real sources."
+  [f]
+  (let [priv (str (System/tmp_dir!) "/bl_priv_" (erlang/unique_integer (list :positive)))
+        a (Path/join priv "lib/prime/a.bl")
+        b (Path/join priv "lib/prime/b.bl")]
+    (File/mkdir_p! (Path/dirname a))
+    (File/write! a "(ns prime.a (:require [prime.b :as b]))\n(defn f [] (b/g))\n")
+    (File/write! b "(ns prime.b)\n(defn g [] 1)\n")
+    (try (f priv a b) (finally (File/rm_rf! priv)))))
+
+(defn- seed-files [priv]
+  (vec (Path/wildcard (Path/join priv "parts/*/*"))))
+
+(deftest prime-stores-each-distinct-content-once
+  (with-priv
+    (fn [priv a b]
+      (is (= 2 (bp/prime! priv [a b])))
+      (is (= 2 (count (seed-files priv))))
+      (is (= 1 (bp/prime! priv [a a])) "the same bytes under two paths are one entry")
+      (is (= 1 (count (seed-files priv))) "…and a re-prime REPLACES, never accretes"))))
+
+(deftest prime-skips-what-the-reader-refuses
+  (with-priv
+    (fn [priv a b]
+      (let [bad (Path/join priv "lib/prime/bad.bl")]
+        (File/write! bad "(ns prime.bad (")
+        (is (= 2 (bp/prime! priv [a b bad])) "an unreadable source is skipped, not fatal")))))
+
+(deftest a-primed-part-is-served-before-the-cache-and-needs-no-cache
+  (with-parts-root
+    (fn [root]
+      (with-priv
+        (fn [priv a b]
+          (bp/prime! priv [a b])
+          (let [content (BeamLisp.Loader/read_source a)
+                hash (crypto/hash :sha256 content)
+                seeded (bp/seeded-parts priv hash)]
+            (is (map? seeded) "the primed part is found by content hash")
+            (is (= (:hash seeded) (binary/encode_hex hash)))
+            (is (nil? (bp/seeded-parts priv (crypto/hash :sha256 "other bytes")))
+                "a hash that was not primed is a miss")))))))
+
+(deftest priming-is-byte-for-byte-reproducible
+  ;; gen-2 == gen-3 is a gate this feature must not break: the same sources must
+  ;; prime to the same bytes, however many times and wherever.
+  (with-priv
+    (fn [priv a b]
+      (bp/prime! priv [a b])
+      (let [first-run (into {} (map (fn [f] [(Path/basename f) (File/read! f)]) (seed-files priv)))]
+        (bp/prime! priv [b a])
+        (let [second-run (into {} (map (fn [f] [(Path/basename f) (File/read! f)]) (seed-files priv)))]
+          (is (= first-run second-run) "identical bytes, independent of source order"))))))
+
+(deftest a-seed-for-another-toolchain-is-never-read
+  (with-priv
+    (fn [priv a b]
+      (bp/prime! priv [a b])
+      (let [f (first (seed-files priv))
+            other (Path/join priv (str "parts/" (String/duplicate "0" 64)))]
+        (File/mkdir_p! other)
+        (File/rename! f (Path/join other (Path/basename f)))
+        (let [hash (binary/decode_hex (Path/basename f))]
+          (is (nil? (bp/seeded-parts priv hash))
+              "moved under another generation's name: a miss, so a parse"))))))

@@ -1,0 +1,350 @@
+; veritas/model.bl — a stateful system, checked against a model: generated
+; histories, invariants after every step, and the SHORTEST failing story.
+;
+; ── Where this sits ─────────────────────────────────────────────────────────
+;
+; veritas core quantifies over VALUES: ∀ v ∈ gen. pred(v). Most code worth
+; checking has a LIFECYCLE instead — a keep that polls a feed, a queue that
+; claims jobs, a projection that owes and retires. Its bugs live in ORDERS of
+; operations, not in single inputs. This layer makes an order a value: a
+; HISTORY is a vector of commands `[name args]`, histories are generated from a
+; model, and the one verb `check` quantifies over them:
+;
+;     ∀ history ∈ model. every invariant holds after every step,
+;                        and every :eventually holds once the history ends.
+;
+; The verdict is the core's shape — :witnessed / :refuted, :seed, :why, :tried —
+; plus what only a history has: the step it broke at, the invariant it broke,
+; and the SHRUNK history: the fewest commands, with the simplest arguments,
+; that still break it.
+;
+; ── The two states ──────────────────────────────────────────────────────────
+;
+; A model keeps TWO things per history and never confuses them:
+;   state   the MODEL — pure data, what SHOULD be true (`:next` updates it)
+;   sys     the REAL system under test (`:init` builds it, `:run` drives it)
+; An invariant is `(fn [state sys] bool)`: it can check the system alone, the
+; model alone, or that they agree — which is how "the real thing does what
+; the model says" is written.
+;
+; Predicates here are FUNCTIONS, not quoted forms. The quoted-form rule belongs
+; to the symbolic core (a form is what z3 translates); a model reads a LIVE
+; system and is never symbolic, so a closure is the honest representation.
+;
+; ── Generation ──────────────────────────────────────────────────────────────
+;
+; `:args` is `(fn [state rng] [args rng'])` — arguments drawn FROM THE CURRENT
+; STATE (move an item that exists; pick a folder that is mounted). `pick`,
+; `fresh`, `one-of`, `int-in` build such functions. The rng is `:rand`'s
+; explicit state threaded through, so a seed determines every history exactly:
+; `replay` needs nothing but the model and the history, and `check` with the
+; same seed returns the same verdict.
+;
+; `:pre` filters: a command whose precondition fails in the current state is
+; not generated, and during shrinking a candidate history whose preconditions
+; fail on replay is simply not a valid history.
+;
+; ── Honesty ─────────────────────────────────────────────────────────────────
+;
+; A model check SAMPLES histories, so a pass is :witnessed — never :proven —
+; and says how many histories, how long, and which commands actually ran
+; (:coverage). A command that never ran is a hole in the evidence, and the
+; verdict names it rather than letting the count imply it was exercised.
+
+(ns veritas.model
+  (:require [veritas :as v] [core]))
+
+;; ── rng: explicit, seeded, threaded ─────────────────────────────────────────
+
+(defn rng [seed] (rand/seed_s :exsss (+ 1 seed)))
+
+(defn- uniform
+  "An int in [0, n) and the next rng."
+  [n g]
+  (let [r (rand/uniform_s n g)] [(- (erlang/element 1 r) 1) (erlang/element 2 r)]))
+
+;; ── argument generators ─────────────────────────────────────────────────────
+;; An arg generator is `(fn [state rng] → [value rng'])`, or a map
+;; `{:draw that-fn :domain pred :simplest x}` when it can say what values it
+;; produces (then shrinking stays inside its domain).
+
+(defn constant [x] (fn [_ g] [x g]))
+
+(defn one-of
+  "One of `xs`, uniformly. Shrinks toward the FIRST element, never outside the
+   set (a shrunk history must be one the model could generate)."
+  [xs]
+  (let [v (into [] xs)
+        members (into #{} v)]
+    {:draw (fn [_ g] (let [[i g2] (uniform (count v) g)] [(nth v i) g2]))
+     :domain (fn [x] (contains? members x))
+     :simplest (first v)}))
+
+(defn int-in
+  "An int in [lo, hi]. Returned as an ARG-GEN MAP carrying its domain, so
+   shrinking never offers an argument the generator could not have produced (a
+   shrunk history must be a history the model could generate). A map, not a fn
+   with metadata: fns do not carry metadata here (measured: `with-meta` on a fn
+   yields `(meta f)` = nil)."
+  [lo hi]
+  {:draw (fn [_ g] (let [[i g2] (uniform (+ 1 (- hi lo)) g)] [(+ lo i) g2]))
+   :domain (fn [x] (and (int? x) (>= x lo) (<= x hi)))
+   :simplest lo})
+
+(defn- draw
+  "Draw from an arg generator: a bare fn `(fn [state rng])`, or an arg-gen map
+   `{:draw fn :domain pred :simplest x}`."
+  [gen state g]
+  (if (map? gen) ((:draw gen) state g) (gen state g)))
+
+(defn pick
+  "One element of the collection `(f state)`, or nil when it is empty — a
+   command whose args are nil is not generated (see `gen-command`). Carries
+   `:valid` (state, x) so a SHRUNK or replayed history cannot pick something
+   the state never held — a history is only valid if every pick was possible."
+  [f]
+  {:draw (fn [state g]
+           (let [xs (into [] (f state))]
+             (if (empty? xs) [nil g]
+               (let [[i g2] (uniform (count xs) g)] [(nth xs i) g2]))))
+   :valid (fn [state x] (some (fn [y] (= x y)) (f state)))})
+
+(defn fresh
+  "A name not yet in `(f state)`: `prefix` + the next integer. Deterministic, so a
+   replayed history names things the same way."
+  [prefix f]
+  (fn [state g]
+    (let [taken (into #{} (f state))]
+      [(loop [i 0] (let [k (keyword (str prefix i))] (if (contains? taken k) (recur (+ i 1)) k))) g])))
+
+(defn tuple
+  "Several argument generators, drawn in order, as one vector. nil if any is nil.
+   Its domain is the product of the parts' domains (a part with none accepts
+   anything of the right position), so a tuple shrinks coordinate-wise inside
+   each part's domain and keeps its arity."
+  [& gens]
+  (let [gs (into [] gens)]
+    {:draw (fn [state g]
+             (loop [gs gs g g out []]
+               (if (empty? gs) [out g]
+                 (let [[x g2] (draw (first gs) state g)]
+                   (if (nil? x) [nil g2] (recur (rest gs) g2 (conj out x)))))))
+     :domain (fn [x] (and (vector? x) (= (count x) (count gs))
+                          (every? (fn [i] (let [p (:domain (nth gs i))] (or (nil? p) (p (nth x i)))))
+                                  (range 0 (count gs)))))
+     :valid (fn [state x] (and (vector? x) (= (count x) (count gs))
+                               (every? (fn [i] (let [p (:valid (nth gs i))] (or (nil? p) (p state (nth x i)))))
+                                       (range 0 (count gs)))))
+     :coords gs}))
+
+;; ── the model value ─────────────────────────────────────────────────────────
+
+(defn model
+  "A model from a spec map:
+     :state       initial model state (data) or (fn [] data)
+     :init        (fn [] sys) — a FRESH real system per history
+     :cleanup     (fn [sys]) — optional, after each history
+     :commands    {name {:args argfn? :pre (fn [state args] bool)?
+                         :next (fn [state args] state')? :run (fn [sys args] sys'|any)}}
+     :invariants  {name (fn [state sys] bool)} — after EVERY step
+     :eventually  {name (fn [state sys] bool)} — after the history, following
+                  the optional :settle command (e.g. a final drain)
+     :settle      a command name run once at the end before :eventually
+   `:run` may return a new sys (when the system is a value) or anything else
+   (when it is a process/conn mutated in place) — a map result with key
+   ::sys replaces sys; otherwise sys is kept."
+  [name spec]
+  (assoc spec :name name))
+
+(defmacro defmodel
+  "(defmodel name doc spec) — define a model var."
+  [name doc spec]
+  `(def ~name ~doc (model ~(str name) ~spec)))
+
+(defn- initial-state [m] (let [s (:state m)] (if (fn? s) (s) s)))
+
+;; ── running one history ─────────────────────────────────────────────────────
+
+(defn- run-cmd [m sys state [nm args]]
+  (let [c (get (:commands m) nm)
+        r ((:run c) sys args)
+        sys2 (if (and (map? r) (contains? r ::sys)) (::sys r) sys)
+        nx (:next c)]
+    [sys2 (if (nil? nx) state (nx state args))]))
+
+(defn- broken-invariant [m state sys]
+  (core/some (fn [[k f]] (if (try (f state sys) (catch _ false)) nil k))
+             (into [] (:invariants m))))
+
+(defn- pre-ok?
+  "Is `[nm args]` a command the model could issue in `state`? Its generator's
+   :valid (a pick must pick something that exists) AND its :pre."
+  [m state [nm args]]
+  (let [c (get (:commands m) nm)
+        gen (:args c)
+        valid (if (map? gen) (:valid gen) nil)]
+    (and (some? c)
+         (or (nil? valid) (try (valid state args) (catch _ false)))
+         (let [p (:pre c)] (or (nil? p) (try (p state args) (catch _ false)))))))
+
+(defn replay
+  "Run `history` on a fresh system. → {:ok true :steps n :state s} or
+   {:ok false :at i :broke name :kind :invariant|:eventually|:crash|:pre
+    :error e :state s}. Deterministic: the history is the whole input."
+  [m history]
+  (let [sys0 ((:init m))]
+    (try
+      (loop [i 0 sys sys0 state (initial-state m) h (seq history)]
+        (if (empty? h)
+          (let [[sys2 state2] (if (some? (:settle m))
+                                (run-cmd m sys state [(:settle m) nil])
+                                [sys state])
+                bad (core/some (fn [[k f]] (if (try (f state2 sys2) (catch _ false)) nil k))
+                               (into [] (:eventually m)))]
+            (if (nil? bad)
+              {:ok true :steps i :state state2}
+              {:ok false :at i :broke bad :kind :eventually :state state2}))
+          (let [cmd (first h)]
+            (if (not (pre-ok? m state cmd))
+              {:ok false :at i :kind :pre :broke (first cmd) :state state}
+              (let [res (try {:v (run-cmd m sys state cmd)} (catch e {:error e}))]
+                (if (contains? res :error)
+                  {:ok false :at i :kind :crash :broke (first cmd) :error (:error res) :state state}
+                  (let [[sys2 state2] (:v res)
+                        bad (broken-invariant m state2 sys2)]
+                    (if (some? bad)
+                      {:ok false :at i :broke bad :kind :invariant :state state2}
+                      (recur (+ i 1) sys2 state2 (rest h))))))))))
+      (finally (when (some? (:cleanup m)) ((:cleanup m) sys0))))))
+
+;; ── generating one history ──────────────────────────────────────────────────
+
+(defn- gen-command
+  "One command valid in `state`, or nil when none can be generated."
+  [m state g]
+  (let [names (into [] (sort (keys (:commands m))))]
+    (loop [tries 0 g g]
+      (if (>= tries (* 3 (count names))) [nil g]
+        (let [[i g2] (uniform (count names) g)
+              nm (nth names i)
+              c (get (:commands m) nm)
+              [args g3] (if (nil? (:args c)) [::none g2] (draw (:args c) state g2))
+              args (if (= args ::none) nil args)
+              cmd [nm args]]
+          (if (and (not (and (some? (:args c)) (nil? args))) (pre-ok? m state cmd))
+            [cmd g3]
+            (recur (+ tries 1) g3)))))))
+
+(defn- gen-history
+  "A history of up to `max-len` commands, generated against the MODEL state
+   only (the real system is not touched while generating)."
+  [m max-len g]
+  (let [[len g] (uniform (+ 1 max-len) g)]
+    (loop [i 0 state (initial-state m) g g out []]
+      (if (>= i len) [out g]
+        (let [[cmd g2] (gen-command m state g)]
+          (if (nil? cmd) [out g2]
+            (let [c (get (:commands m) (first cmd))
+                  nx (:next c)]
+              (recur (+ i 1) (if (nil? nx) state (nx state (second cmd))) g2 (conj out cmd)))))))))
+
+;; ── shrinking a failing history ─────────────────────────────────────────────
+
+(defn- gen-candidates
+  "Simpler values than `a` that generator `gen` could have produced. A tuple
+   shrinks coordinate-wise through each part; a part with a domain stays in it
+   and offers its :simplest first; a bare fn part gets value-directed
+   candidates (its :pre guards them on replay)."
+  [gen a]
+  (cond
+    (and (some? (:coords gen)) (vector? a))
+      (let [cs (:coords gen)]
+        (mapcat (fn [i] (map (fn [x] (assoc a i x))
+                             (gen-candidates (let [c (nth cs i)] (if (map? c) c nil)) (nth a i))))
+                (range 0 (count a))))
+    :else
+      (let [inside (get gen :domain)
+            simplest (get gen :simplest)
+            cands (concat (if (and (some? simplest) (not= simplest a)) [simplest] [])
+                          (v/shrink-candidates a))]
+        (distinct (if (nil? inside) cands (filter inside cands))))))
+
+(defn- arg-candidates
+  "Simpler args for command `nm`, kept inside its generator's domain when the
+   generator declares one (`int-in` does): candidates outside it are dropped,
+   and the generator's simplest value is offered first. A generator with no
+   domain (a closure over state) gets the value-directed candidates; `:pre`
+   still guards them on replay."
+  [m nm a]
+  (let [gen (:args (get (:commands m) nm))]
+    (gen-candidates (if (map? gen) gen nil) a)))
+
+(defn- history-candidates
+  "Shorter histories first (halves, then each command dropped), then each
+   command's ARGS shrunk in place — shape-preserving: a command stays
+   `[name args]`, so no candidate is malformed."
+  [m h]
+  (let [n (count h)
+        halves (if (> n 1) [(subvec h 0 (quot n 2)) (subvec h (quot n 2))] [])
+        drops (map (fn [i] (into (subvec h 0 i) (subvec h (+ i 1)))) (range 0 n))
+        args (mapcat (fn [i]
+                       (let [[nm a] (nth h i)]
+                         (map (fn [a2] (assoc h i [nm a2])) (arg-candidates m nm a))))
+                     (range 0 n))]
+    (concat halves drops args)))
+
+(defn- same-failure? [m broke h]
+  (let [r (replay m h)]
+    (and (not (:ok r)) (not= :pre (:kind r)) (= broke (:broke r)))))
+
+(defn shrink-history
+  "The shortest, simplest history that still breaks the same invariant.
+   Candidates that violate a precondition on replay are invalid, not failures."
+  [m broke h]
+  (loop [best h fuel 300]
+    (if (<= fuel 0) best
+      (let [nxt (core/some (fn [c] (if (same-failure? m broke c) [c] nil)) (history-candidates m best))]
+        (if (nil? nxt) best (recur (first nxt) (- fuel 1)))))))
+
+;; ── the verb ────────────────────────────────────────────────────────────────
+
+(defn- coverage [hs]
+  (frequencies (map first (apply concat hs))))
+
+(defn check
+  "∀ generated history, every invariant holds after every step and every
+   :eventually after the end. opts {:seed 0 :histories 100 :max-len 30
+   :budget-ms nil}. → a veritas verdict:
+     {:modality :witnessed :engine :model :tried n :seed s :why …
+      :coverage {cmd n} :unexercised [cmd …]}
+     {:modality :refuted :engine :model :witness h :shrunk h' :broke name
+      :kind … :at i :seed s :why …}"
+  ([m] (check m {}))
+  ([m opts]
+   (let [seed (get opts :seed 0)
+         n (get opts :histories 100)
+         max-len (get opts :max-len 30)
+         deadline (if (some? (:budget-ms opts)) (+ (erlang/monotonic_time :millisecond) (:budget-ms opts)) nil)
+         cmd-names (into #{} (keys (:commands m)))]
+     (loop [i 0 g (rng seed) seen []]
+       (let [out-of-time (and (some? deadline) (> (erlang/monotonic_time :millisecond) deadline))]
+         (if (or (>= i n) out-of-time)
+           (let [cov (coverage seen)
+                 missing (into [] (sort (filter (fn [c] (not (contains? cov c))) cmd-names)))]
+             {:modality :witnessed :engine :model :tried i :seed seed
+              :coverage cov :unexercised missing
+              :why (str "sampled " i " histories (max-len " max-len ", seed " seed ")"
+                        (if out-of-time "; stopped at the time budget" "")
+                        (if (empty? missing) "" (str "; never generated: " (join " " (map str missing)))))})
+           (let [[h g2] (gen-history m max-len g)
+                 r (replay m h)]
+             (if (:ok r)
+               (recur (+ i 1) g2 (conj seen h))
+               (let [small (shrink-history m (:broke r) h)
+                     rs (replay m small)]
+                 {:modality :refuted :engine :model :tried (+ i 1) :seed seed
+                  :witness h :shrunk small :broke (:broke r) :kind (:kind r)
+                  :at (:at rs) :error (:error rs)
+                  :why (str "history " (+ i 1) " broke " (:broke r)
+                            " (" (name (:kind r)) "); shrunk from " (count h)
+                            " to " (count small) " commands")})))))))))

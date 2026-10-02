@@ -6,6 +6,30 @@ Status at plan creation: source-reviewed design and prototype plan, 2026-09-21. 
 
 Tracking: PLAN-137-evaluate-native-lowering-and-runtime-rep. Production cutover remains separate (FUP-117).
 
+## Production mechanisms to understand
+
+The self-hosted runtime keeps language meaning in BL and selects smaller work
+only when that selection is sound:
+
+- A plain BEAM function uses a direct function-kind check. Other callables use
+  the same general protocol, including dynamic host capability checks.
+- The emitter can replace an own closure's module lookup with its known module
+  atom. A reloadable namespace call still runs as a namespace call.
+- Lazy producers share a claimed attempt. General reductions preserve memoized
+  prefixes; trusted complete consumers can use full-fold recipes.
+- Native publication reserves accounted-byte growth against one atomic quota.
+  Peek reads only a tag/version, and immutable cursor positions share one root.
+- Analyses read every clause and guard. Exact host signatures supply purity
+  evidence; unknown effects and unsupported SMT arities stay unknown.
+
+These mechanisms are explained in the [self-hosting guide](../../docs/self-hosting.md)
+and [lazy guide](../../docs/runtime/lazy-realization.bl.org). The
+[final measurement ledger](../../!tasks/artifacts/performance-final-measurements.json)
+records complete samples; it is not a promise that every workload improves.
+The experiments and broader proposals below keep their own scope. Native graph
+safety, hot reload and per-environment bindings are constraints on optimization,
+not overhead to remove without proof.
+
 ## 1. Conclusion
 
 Self-host the semantics, not necessarily every storage mechanism. Describe each value family once; compile that description into direct BEAM operations where shapes are known, retain a generic BL implementation where they are not, and offload bounded bulk kernels only where conversion and scheduling costs justify it.

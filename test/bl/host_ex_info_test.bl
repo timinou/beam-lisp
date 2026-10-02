@@ -1,0 +1,446 @@
+; host_ex_info_test.bl — the pinned ABI for `BeamLisp.ExInfo`, the exception
+; `throw` compiles to and `try`'s untyped catch binds.
+;
+; `priv/host/ex_info.bl` is ONE pinned source that `BeamLisp.AOT/compile_host_file`
+; compiles at an exact atom with the pair of options the seed's exception entries
+; carry:
+;
+;     :struct_fields [{:__exception__ true} {:message nil} {:data nil}]
+;     :behaviour     :"Elixir.Exception"
+;
+; The running `Elixir.BeamLisp.ExInfo` (still `lib/beam_lisp/ex_info.ex`) is the
+; ground truth, so the suite is DIFFERENTIAL: the same corpus runs through a
+; probe compiled from the pinned source and through the live module, and the two
+; answer sets must be equal — values, exception CLASSES and MESSAGES.
+;
+; Nothing here replaces the live module. The probe is compiled at its own atom
+; with `:load? false`, the namespace shim beside it is dropped, and the pinned
+; beam is loaded ALONE — so a leftover shim reference would be `undef` here.
+;
+; What each block pins:
+;   * the synthesized struct surface — `__struct__/0,1`, `__info__(:struct)`
+;     (keys, order, defaults), the module-exact self tag, and the `:behaviour`
+;     attribute (`:Elixir.Exception`, recorded as the BARE atom);
+;   * `exception/1` and `message/1` against the live generated code, clause for
+;     clause: keyword lists (message/data default nil, unknown key → KeyError),
+;     bare binaries, bad args → FunctionClauseError, `message/1` value / nil /
+;     BadMapError / KeyError;
+;   * the payload helpers — `ex_info/2`, `ex_data/1`, `ex_message/1`,
+;     `ex_original/1` — over ExInfos, plain structs, ErlangErrors and arbitrary
+;     values;
+;   * `raise_payload/1` with a RAISED payload: a map becomes an ExInfo carrying
+;     it as `data` and its printed form as `message`; an exception is re-raised
+;     as-is; anything else an ExInfo with `inspect`'s text and no data. The
+;     raise is `erlang/error/1`, never `erlang:raise/3`;
+;   * the ONE-SOURCE-ANY-ATOM wiring: the same source bytes at two arbitrary
+;     atoms build two structs each tagged with its own atom;
+;   * the explicit seed option contract (`host-opts`'s exact list);
+;   * the cutover — the pinned source loaded OVER the live atom, exercised with a
+;     raised payload, and the live beam restored afterwards;
+;   * the cold child — a fresh VM with NO application boot resolves the pinned
+;     beam and answers, proving the exception needs no host-namespace Env.
+;
+; Run: bin/bl test test/bl/host_ex_info_test.bl
+
+(ns host.ex-info.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_ex_info_" (erlang/unique_integer (list :positive))))
+
+(defn- src [] (Path/join (BeamLisp/cwd) "priv/host/ex_info.bl"))
+
+(def ^:private probe :Elixir.BeamLisp.ExInfoProbe)
+(def ^:private shim :Elixir.BeamLisp.Ns.Host.ExInfo)
+(def ^:private live :Elixir.BeamLisp.ExInfo)
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- struct-fields
+  "The `:struct_fields` list, in order: the `defexception [:message, :data]` shape."
+  []
+  (list (t2 :__exception__ true) (t2 :message nil) (t2 :data nil)))
+
+(defn- seed-opts
+  "The EXACT option list the seed's `host-opts` builds for one exception entry:
+   the isolated base (`:module`/`:output_dir`/`:file`/`:source_hash`/`:load?
+   false`) followed by `:struct_fields` then `:behaviour`, in that order."
+  [mod dir]
+  (list (t2 :module mod)
+        (t2 :output_dir dir)
+        (t2 :file (src))
+        (t2 :source_hash (crypto/hash :sha256 (File/read! (src))))
+        (t2 :load? false)
+        (t2 :struct_fields (struct-fields))
+        (t2 :behaviour :"Elixir.Exception")))
+
+(defn- compile-at
+  "Compile the pinned source at exact atom `mod`, then publish ONLY the pinned
+   beam: the compile's own load (and the namespace shim it built beside it) is
+   dropped first."
+  [mod dir]
+  (let [res (BeamLisp.AOT/compile_host_file (src) (seed-opts mod dir))
+        path (elem res 1)]
+    (drop! mod)
+    (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+    (drop! shim)
+    mod))
+
+(defn- compile-pinned-file
+  "Compile the source at `mod` and return the beam PATH, never loading it."
+  [mod dir]
+  (elem (BeamLisp.AOT/compile_host_file (src) (seed-opts mod dir)) 1))
+
+; ── normalization: the probe names ITS own atom, by design ────────────────
+
+(defn- norm [m]
+  (if (erlang/is_binary m)
+    (String/replace m "BeamLisp.ExInfoProbe" "BeamLisp.ExInfo")
+    m))
+
+; ── the observation: a call's whole answer, a raise included ──────────────
+
+(defn- ex-data-of [e]
+  (if (and (erlang/is_map e) (erlang/is_map_key :data e)) (erlang/map_get :data e) nil))
+
+(defn- value-shape
+  "A struct value drops its own tag (`Map.from_struct`), so a probe-built struct
+   and a live-built one compare equal despite different `__struct__` atoms."
+  [v]
+  (if (and (erlang/is_map v) (erlang/is_map_key :__struct__ v))
+    (list :struct (Map/from_struct v))
+    (list :value v)))
+
+(defn- raised-class
+  "The class of a caught value, with the module-under-test's OWN struct folded to
+   `:self` (the probe atom and the live atom differ by design)."
+  [self e]
+  (if (and (erlang/is_map e) (erlang/is_map_key :__struct__ e))
+    (let [t (erlang/map_get :__struct__ e)]
+      (if (erlang/== t self) :self t))
+    :none))
+
+(defn- obs
+  "`[:ok shape]` or `[:raise class message data-shape]`, with the probe's own
+   atom normalized out of a message."
+  [self thunk]
+  (try (let [v (thunk)]
+         (list :ok (value-shape (if (erlang/is_binary v) (norm v) v))))
+       (catch e (list :raise (raised-class self e) (norm (ex-message e))
+                      (value-shape (ex-data-of e))))))
+
+; ── the differential corpus ──────────────────────────────────────────────
+
+(defn- corpus
+  "Every observation the exception ABI owes, as a LIST so probe and live compare
+   index for index. `mod` supplies the entry points and is also the `:self`
+   detector."
+  [mod]
+  (let [E (fn [arg] (fn [] (erlang/apply mod :exception (list arg))))
+        M (fn [arg] (fn [] (erlang/apply mod :message (list arg))))
+        C (fn [f args] (fn [] (erlang/apply mod f args)))
+        e0 (fn [] (erlang/apply mod :exception (list (list))))
+        ex1 (fn [] (erlang/apply mod :ex_info (list "m" (maps/put :d 1 (maps/new)))))
+        rte (fn [] (Elixir.RuntimeError/exception "x"))
+        ere (fn [] (Elixir.ErlangError/exception (list (t2 :original :epipe))))]
+    (list
+      ; ── exception/1: keyword lists, message/data default nil ─────────
+      (obs mod (E (list)))
+      (obs mod (E (list (t2 :message nil))))
+      (obs mod (E (list (t2 :message "hi"))))
+      (obs mod (E (list (t2 :message "hi") (t2 :data (maps/put :x 1 (maps/new))))))
+      (obs mod (E (list (t2 :data (maps/put :x 1 (maps/new))))))
+      (obs mod (E (list (t2 :message "a") (t2 :message "b"))))
+      (obs mod (E (list (t2 :data 1) (t2 :data 2))))
+      ; ── exception/1: a bare binary message ───────────────────────────
+      (obs mod (E "bin"))
+      (obs mod (E ""))
+      ; ── exception/1: an undeclared key is the live struct!'s KeyError ─
+      (obs mod (E (list (t2 :other 1))))
+      (obs mod (E (list (t2 :message "a") (t2 :other 1))))
+      (obs mod (E (list (t2 :original :x))))
+      ; ── exception/1: a changed tag is the live validate_struct!'s ArgumentError
+      (obs mod (E (list (t2 :__struct__ :other))))
+      (obs mod (E (list (t2 :__struct__ "not-an-atom"))))
+      (obs mod (E (list (t2 :__struct__ mod))))
+      (obs mod (E (list (t2 :__struct__ mod) (t2 :message "m"))))
+      ; ── exception/1: bad args are FunctionClauseError ────────────────
+      (obs mod (E :nope))
+      (obs mod (E nil))
+      (obs mod (E 42))
+      (obs mod (E (maps/new)))
+      ; ── message/1: value, nil, and the live field-access refusals ────
+      (obs mod (M (maps/put :message "m" (maps/new))))
+      (obs mod (M (maps/put :message nil (maps/new))))
+      (obs mod (M (maps/put :message "" (maps/new))))
+      (obs mod (M (maps/new)))
+      (obs mod (M 1))
+      (obs mod (M nil))
+      (obs mod (M "str"))
+      (obs mod (fn [] (erlang/apply mod :message (list (e0)))))
+      (obs mod (fn [] (erlang/apply mod :message (list (E "m")))))
+      ; ── ex_info/2 ────────────────────────────────────────────────────
+      (obs mod (fn [] (erlang/apply mod :ex_info (list "m" (maps/put :a 1 (maps/new))))))
+      (obs mod (fn [] (erlang/apply mod :ex_info (list nil nil))))
+      (obs mod (fn [] (erlang/apply mod :ex_info (list "m" nil))))
+      ; ── ex_data/1 ────────────────────────────────────────────────────
+      (obs mod (C :ex_data (list (e0))))
+      (obs mod (C :ex_data (list (ex1))))
+      (obs mod (C :ex_data (list (rte))))
+      (obs mod (C :ex_data (list (ere))))
+      (obs mod (C :ex_data (list 42)))
+      (obs mod (C :ex_data (list nil)))
+      (obs mod (C :ex_data (list (maps/new))))
+      (obs mod (C :ex_data (list (erlang/apply mod :ex_info (list "m" (BeamLisp.Decimal/new 1))))))
+      ; ── ex_message/1 ─────────────────────────────────────────────────
+      (obs mod (C :ex_message (list (ex1))))
+      (obs mod (C :ex_message (list (e0))))
+      (obs mod (C :ex_message (list (rte))))
+      (obs mod (C :ex_message (list (ere))))
+      (obs mod (C :ex_message (list 42)))
+      (obs mod (C :ex_message (list nil)))
+      (obs mod (C :ex_message (list "str")))
+      (obs mod (C :ex_message (list (maps/new))))
+      (obs mod (C :ex_message (list (maps/put :__struct__ :foo (maps/new)))))
+      (obs mod (C :ex_message (list (maps/put :__struct__ "s"
+                                               (maps/put :__exception__ true (maps/new))))))
+      ; ── ex_original/1 ────────────────────────────────────────────────
+      (obs mod (C :ex_original (list (ere))))
+      (obs mod (C :ex_original (list (rte))))
+      (obs mod (C :ex_original (list (e0))))
+      (obs mod (C :ex_original (list 42)))
+      (obs mod (C :ex_original (list nil)))
+      ; ── raise_payload/1: raised payloads ─────────────────────────────
+      (obs mod (C :raise_payload (list (maps/put :a 1 (maps/new)))))
+      (obs mod (C :raise_payload (list (maps/new))))
+      (obs mod (C :raise_payload (list (maps/put :__struct__ :foo (maps/new)))))
+      (obs mod (C :raise_payload (list (BeamLisp.Decimal/new 1))))
+      (obs mod (C :raise_payload (list (rte))))
+      (obs mod (C :raise_payload (list (ere))))
+      (obs mod (C :raise_payload (list (ex1))))
+      (obs mod (C :raise_payload (list 42)))
+      (obs mod (C :raise_payload (list :foo)))
+      (obs mod (C :raise_payload (list "str")))
+      (obs mod (C :raise_payload (list nil)))
+      (obs mod (C :raise_payload (list true))))))
+
+(defn- differential [probe-mod]
+  (is (= (corpus live) (corpus probe-mod))
+      "probe answers equal the live module's on the whole corpus")
+  (let [ls (corpus live)
+        ps (corpus probe-mod)]
+    (doseq [i (range (count ls))]
+      (is (= (nth ls i) (nth ps i)) (str "observation " i)))))
+
+(deftest exinfo-pinned-matches-the-live-module
+  (testing "the pinned source answers exactly as the live module does"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (= :non_existing (erlang/apply :code :which (list shim))))
+      (differential probe)
+      (File/rm_rf! dir))))
+
+; ── the struct surface: keys, order, tag, behaviour ──────────────────────
+
+(defn- struct-info [mod]
+  (erlang/apply mod :__info__ (list :struct)))
+
+(defn- attributes [mod]
+  (erlang/apply mod :module_info (list :attributes)))
+
+(defn- has-behaviour? [mod modname]
+  (some (fn [pair] (and (= :behaviour (elem pair 0)) (= modname (elem pair 1))))
+        (attributes mod)))
+
+(deftest exinfo-pinned-struct-surface
+  (testing ":struct_fields + :behaviour synthesize the defexception surface"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      (is (erlang/function_exported probe :__struct__ 0))
+      (is (erlang/function_exported probe :__struct__ 1))
+      (is (erlang/function_exported probe :__info__ 1))
+      (is (erlang/function_exported probe :exception 1))
+      (is (erlang/function_exported probe :message 1))
+      (is (erlang/function_exported probe :ex_info 2))
+      (is (erlang/function_exported probe :ex_data 1))
+      (is (erlang/function_exported probe :ex_message 1))
+      (is (erlang/function_exported probe :ex_original 1))
+      (is (erlang/function_exported probe :raise_payload 1))
+      ; __struct__/0 — the tag is MODULE-EXACT, defaults are the legacy triple.
+      (let [s0 (erlang/apply probe :__struct__ (list))]
+        (is (erlang/is_map s0))
+        (is (= 4 (erlang/map_size s0)))
+        (is (= probe (erlang/map_get :__struct__ s0)))
+        (is (= true (erlang/map_get :__exception__ s0)))
+        (is (nil? (erlang/map_get :message s0)))
+        (is (nil? (erlang/map_get :data s0))))
+      ; __struct__/1 folds the given values over the defaults.
+      (let [s1 (erlang/apply probe :__struct__ (list (list (t2 :message "hi"))))]
+        (is (= probe (erlang/map_get :__struct__ s1)))
+        (is (= true (erlang/map_get :__exception__ s1)))
+        (is (= "hi" (erlang/map_get :message s1))))
+      ; __info__(:struct) is the live module's, datum for datum: keys, order
+      ; and defaults — what `Inspect.Any` reads to rebuild `%Mod{…}`.
+      (is (= (struct-info live) (struct-info probe)))
+      (is (= (list (maps/put :field :__exception__ (maps/put :required false (maps/put :default true (maps/new))))
+                   (maps/put :field :message (maps/put :required false (maps/put :default nil (maps/new))))
+                   (maps/put :field :data (maps/put :required false (maps/put :default nil (maps/new)))))
+             (struct-info probe)))
+      ; the pinned beam serves the live module's public functions and its own
+      ; helpers (the pinned emitter exports `defn-` as well as public defs).
+      (is (every? (fn [e] (erlang/function_exported probe (elem e 0) (elem e 1)))
+                  (erlang/apply live :__info__ (list :functions))))
+      (is (every? (fn [e] (erlang/function_exported probe (elem e 0) (elem e 1)))
+                  (list (tuple :kv 2) (tuple :self_module 0) (tuple :struct_default 0)
+                        (tuple :build_struct! 2) (tuple :struct_like? 1)
+                        (tuple :exception_value? 1) (tuple :tags? 2) (tuple :struct_map 2))))
+      ; -behaviour Exception, as the pinned emitter records it (BARE atom; the
+      ; live Elixir beam records the one-element list — a family-wide shape).
+      (is (has-behaviour? probe :"Elixir.Exception"))
+      ; the pinned __info__/1 does NOT serve :attributes — the family shape.
+      (is (= :Elixir.FunctionClauseError
+             (:__struct__ (try (erlang/apply probe :__info__ (list :attributes)) nil (catch e e)))))
+    (File/rm_rf! dir))))
+
+; ── ANY source the same bytes occupy, tags itself ────────────────────────
+
+(deftest exinfo-any-atom-tags-itself
+  (testing "the same source bytes at two arbitrary atoms each build their own tag"
+    (let [dir (tmp-dir)
+          a-dir (str dir "/a")
+          b-dir (str dir "/b")
+          a :Elixir.BeamLisp.ExInfoProbeA
+          b :Elixir.BeamLisp.ExInfoProbeB]
+      (let [a-beam (compile-pinned-file a a-dir)
+            b-beam (compile-pinned-file b b-dir)]
+        (is (not= a-beam b-beam))
+        (is (File/exists? a-beam))
+        (is (File/exists? b-beam))
+        (drop! a) (drop! b)
+        (code/load_binary a (erlang/binary_to_list a-beam) (File/read! a-beam))
+        (code/load_binary b (erlang/binary_to_list b-beam) (File/read! b-beam))
+        (drop! shim)
+        (is (= a (:__struct__ (erlang/apply a :exception (list "x")))))
+        (is (= b (:__struct__ (erlang/apply b :exception (list "x")))))
+        (is (= a (erlang/map_get :__struct__ (erlang/apply a :ex_info (list "m" nil)))))
+        (is (= b (erlang/map_get :__struct__ (erlang/apply b :ex_info (list "m" nil)))))
+        (is (= a (erlang/map_get :__struct__ (erlang/apply a :__struct__ (list)))))
+        (is (= b (erlang/map_get :__struct__ (erlang/apply b :__struct__ (list)))))
+        (is (= "%BeamLisp.ExInfoProbeA{message: \"x\", data: nil}"
+               (Kernel/inspect (erlang/apply a :exception (list "x")))))
+        (is (= "%BeamLisp.ExInfoProbeB{message: \"x\", data: nil}"
+               (Kernel/inspect (erlang/apply b :exception (list "x")))))
+        ; ex_data reads only its OWN module's tag: b does not recognise a's struct.
+        (is (nil? (erlang/apply b :ex_data (list (erlang/apply a :exception (list "x"))))))
+        (drop! a) (drop! b))
+      ; ── the explicit seed option contract ────────────────────────────
+      (let [opts (seed-opts probe dir)]
+        (is (= probe (Keyword/fetch! opts :module)))
+        (is (= (src) (Keyword/fetch! opts :file)))
+        (is (= false (Keyword/fetch! opts :load?)))
+        (is (erlang/is_binary (Keyword/fetch! opts :source_hash)))
+        (is (= (struct-fields) (Keyword/fetch! opts :struct_fields)))
+        (is (= :"Elixir.Exception" (Keyword/fetch! opts :behaviour))))
+      (File/rm_rf! dir))))
+
+; ── the pinned beam AT the production atom, saved and restored ───────────
+
+(deftest exinfo-pinned-beam-stands-in-at-the-production-atom
+  (testing "the production atom serves and raises on the pinned beam, then the live beam returns"
+    (let [dir (tmp-dir)
+          out (str dir "/prod")
+          beam (Path/join out (str live ".beam"))
+          orig-path (erlang/apply :code :which (list live))
+          orig-bin (File/read! (erlang/list_to_binary orig-path))
+          before (corpus live)]
+      (is (not= :non_existing orig-path) "precondition: the live beam is a readable file")
+      (compile-pinned-file live out)
+      (is (File/exists? beam))
+      (try
+        (drop! live)
+        (code/load_binary live (erlang/binary_to_list beam) (File/read! beam))
+        (is (erlang/function_exported live :__info__ 1)
+            "the struct surface rides along: __info__/1 is served")
+        ; the pinned beam answers EXACTLY as the live one did at this atom,
+        ; observation for observation — the raised payload included.
+        (is (= before (corpus live)))
+        (is (= live (:__struct__ (erlang/apply live :exception (list "x")))))
+        (is (= "hi" (erlang/apply live :message
+                                 (list (erlang/apply live :exception (list (list (t2 :message "hi"))))))))
+        ; a raised payload's struct is the PRODUCTION tag.
+        (is (= live (:__struct__ (try (erlang/apply live :raise_payload (list (maps/put :a 1 (maps/new))))
+                                      nil (catch e e)))))
+        (is (= "%BeamLisp.ExInfo{message: \"x\", data: nil}"
+               (Kernel/inspect (erlang/apply live :exception (list "x")))))
+        (finally
+          (drop! live)
+          (code/load_binary live orig-path orig-bin)))
+      ; RESTORED: the live beam owns the atom and answers again.
+      (is (= orig-path (erlang/apply :code :which (list live))))
+      (is (= before (corpus live)) "the restored live beam answers as before")
+      (File/rm_rf! dir))))
+
+; ── the COLD CHILD: a fresh VM, no application boot, no host-ns Env ──────
+
+(defn- child-code-args
+  "This VM's whole code path as `-pa` args, with `pinned` LAST so it lands FIRST:
+   `-pa` PREPENDS, so the last one named wins."
+  [pinned]
+  (concat (mapcat (fn [p] (list "-pa" (erlang/list_to_binary p))) (code/get_path))
+          (list "-pa" pinned)))
+
+(defn- cold-script
+  "The child VM's program. It NEVER starts the application: it resolves the
+   pinned exception beam off the path and exercises it — the struct surface, the
+   payload helpers, and a raised payload through `BeamLisp.Ns.Rt`'s printer."
+  []
+  (str
+    "IO.puts(\"which=\" <> List.to_string(:code.which(BeamLisp.ExInfo)))\n"
+    "e = BeamLisp.ExInfo.exception([message: \"cold\", data: %{k: 1}])\n"
+    "IO.puts(\"e-msg=\" <> inspect(BeamLisp.ExInfo.message(e)))\n"
+    "IO.puts(\"e-inspect=\" <> inspect(e))\n"
+    "IO.puts(\"e-exc=\" <> inspect(Exception.exception?(e)))\n"
+    "IO.puts(\"ex-info=\" <> inspect(BeamLisp.ExInfo.ex_info(\"m\", %{d: 2})))\n"
+    "IO.puts(\"ex-data=\" <> inspect(BeamLisp.ExInfo.ex_data(e)))\n"
+    "IO.puts(\"ex-msg=\" <> inspect(BeamLisp.ExInfo.ex_message(e)))\n"
+    "IO.puts(\"ex-orig=\" <> inspect(BeamLisp.ExInfo.ex_original(%ErlangError{original: :epipe})))\n"
+    "IO.puts(\"kw=\" <> inspect(BeamLisp.ExInfo.exception(message: \"k\")))\n"
+    "r = try do\n"
+    "  BeamLisp.ExInfo.raise_payload(%{a: 1})\n"
+    "rescue\n"
+    "  x in BeamLisp.ExInfo -> {Exception.message(x), Map.get(x, :data)}\n"
+    "end\n"
+    "IO.puts(\"rescued=\" <> inspect(r))\n"
+    "IO.puts(\"ok\")\n"))
+
+(deftest exinfo-pinned-beam-answers-in-a-cold-child-vm
+  (testing "a fresh VM with no application boot resolves and exercises the pinned exception"
+    (let [dir (tmp-dir)
+          out (str dir "/cold")
+          script (Path/join dir "cold.exs")
+          beam (compile-pinned-file live out)]
+      (is (File/exists? beam))
+      (File/write! script (cold-script))
+      (let [r (System/cmd "elixir"
+                          (to-list (concat (child-code-args out) (list script)))
+                          (to-list [(tuple :stderr_to_stdout true)
+                                    (tuple :env (list (tuple "ERL_CRASH_DUMP" "/dev/null")))]))
+            text (elem r 0)]
+        (is (zero? (elem r 1)) (str "the child VM exited " (elem r 1) ":\n" text))
+        ; THE REPLACEMENT: the code server resolves the atom to the pinned beam,
+        ; in a VM that never booted the language.
+        (is (includes? text (str "which=" beam)) text)
+        (is (includes? text "e-msg=\"cold\"") text)
+        (is (includes? text "e-inspect=%BeamLisp.ExInfo{message: \"cold\", data: %{k: 1}}") text)
+        (is (includes? text "e-exc=true") text)
+        (is (includes? text "ex-info=%BeamLisp.ExInfo{message: \"m\", data: %{d: 2}}") text)
+        (is (includes? text "ex-data=%{k: 1}") text)
+        (is (includes? text "ex-msg=\"cold\"") text)
+        (is (includes? text "ex-orig=:epipe") text)
+        (is (includes? text "kw=%BeamLisp.ExInfo{message: \"k\", data: nil}") text)
+        (is (includes? text "rescued={\"{:a 1}\", %{a: 1}}") text)
+        (is (includes? text "ok") text))
+      (File/rm_rf! dir))))

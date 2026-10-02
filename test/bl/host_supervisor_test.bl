@@ -1,0 +1,765 @@
+; host_supervisor_test.bl — the pinned ABI for `BeamLisp.Supervisor`.
+;
+; `priv/host/supervisor.bl` is ONE pinned source that
+; `BeamLisp.AOT/compile_host_file` compiles at an exact atom with NO compile
+; options (functions-only — a child spec is a map, a tree is an OTP supervisor):
+;
+;     :module <atom>   :output_dir <dir>   :file priv/host/supervisor.bl
+;     :source_hash <sha256>   :load? false
+;
+; The running `Elixir.BeamLisp.Supervisor` (still `lib/beam_lisp/supervisor.ex`)
+; is the ground truth, so the suite is DIFFERENTIAL: one corpus of observations
+; runs through a probe compiled from the pinned source and through the live
+; module, and the two answer sets must be equal — values, exception CLASSES and
+; MESSAGES.
+;
+; The observation is normalized on two axes only:
+;   * the PROBE ATOM (`BeamLisp.HostSupervisorProbe` → `BeamLisp.Supervisor`),
+;     because the pinned emitter names the module it was compiled into — in a
+;     message AND in the `__MODULE__` field of every child spec it builds;
+;   * PIDS and REFERENCES → `:pid` / `:ref`, because a live tree's children are
+;     fresh processes per run and the two runs cannot share one.
+; Everything else compares raw.
+;
+; What each block pins:
+;   * SURFACE — the pinned beam's exports against the live module's: the eight
+;     public functions and NOTHING else (no `defn-` helper escapes, because the
+;     live module's helpers are private, and no synthesized struct surface);
+;   * the PURE ABI — `worker/2,3`, `server/2,3,4`, `pool/5` (including the
+;     `0..(n-1)` index range, whose `n < 1` descending enumeration the live code
+;     inherits from `Range`), and every clause-head refusal as the live
+;     `FunctionClauseError`;
+;   * LIVE TREES — `supervise/2,3`, `start_link/1` and `start_named_sup/2`
+;     really start OTP supervisors: child order and counts, a killed child
+;     HEALING into a new pid, `terminate_child`/`restart_child`, `:stop`, the
+;     `:one-for-all` strategy reaching OTP, and restart INTENSITY both ways —
+;     `%{:"max-restarts" 1, :"max-seconds" 1}` making the tree GIVE UP (with the
+;     `{:EXIT, sup, :shutdown}` event it reports), and the default keeping it
+;     alive;
+;   * the pinned beam STANDING IN at the production atom, exercised, then the
+;     live beam RESTORED — with the OTP application's own registered supervisor
+;     (`BeamLisp.Supervisor` is its NAME) asserted untouched throughout;
+;   * a COLD CHILD VM resolving `BeamLisp.Supervisor` to the pinned beam, booting
+;     the application on it, and healing an unregistered tree of its own.
+;
+; Nothing here replaces the live module outside the stand-in block, and nothing
+; here starts, stops or renames the application's supervisor: `supervise/2,3`
+; and `start_link/1` start UNREGISTERED trees, so a probe tree and the runtime's
+; own tree cannot collide.
+;
+; TWO EXPECTED STDOUT WARNINGS. `pool/5` with `n < 1` builds its index range as
+; `0..(n-1)`, which Elixir's `Range.new/2` warns about ("default step of -1").
+; The live module and the pinned port emit it identically — that is the
+; `n = 0` case below, which pins the descending `w0`/`w-1` ids — so it is
+; reproduced here on purpose, not worked around.
+;
+; Run: bin/bl test test/bl/host_supervisor_test.bl
+
+(ns host.supervisor.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_supervisor_" (erlang/unique_integer (list :positive))))
+
+(defn- src [] (Path/join (BeamLisp/cwd) "priv/host/supervisor.bl"))
+
+(def ^:private probe :Elixir.BeamLisp.HostSupervisorProbe)
+(def ^:private shim :Elixir.BeamLisp.Ns.Host.Supervisor)
+(def ^:private live :Elixir.BeamLisp.Supervisor)
+(def ^:private dispatcher :Elixir.NoSuchDispatcherMod)
+(def ^:private target :Elixir.NoSuchTargetMod)
+
+; A REAL defserver, so `server/4`'s MFA child can be STARTED in a test — the
+; generated module is `BeamLisp.Server.Host.Supervisor.Test.ProbeChild` and the
+; binding `probe-child` is the atom itself.
+(defserver probe-child
+  (init [arg] (ok {:arg arg}))
+  (handle-call :arg [_from s] (reply (:arg s) s)))
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- seed-opts
+  "The EXACT option list the seed's `host-opts` builds for a functions-only host
+   entry: `:module`/`:output_dir`/`:file`/`:source_hash`/`:load? false`."
+  [mod dir]
+  (list (t2 :module mod)
+        (t2 :output_dir dir)
+        (t2 :file (src))
+        (t2 :source_hash (crypto/hash :sha256 (File/read! (src))))
+        (t2 :load? false)))
+
+(defn- compile-at
+  "Compile the pinned source at exact atom `mod`, then publish ONLY the pinned
+   beam: the compile's own load (and the namespace shim it built beside it) is
+   dropped first."
+  [mod dir]
+  (let [res (BeamLisp.AOT/compile_host_file (src) (seed-opts mod dir))
+        path (elem res 1)]
+    (drop! mod)
+    (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+    (drop! shim)
+    mod))
+
+(defn- exports [mod]
+  (Enum/sort (erlang/apply mod :module_info (list :exports))))
+
+(defn- functional-exports
+  "What a pinned beam's surface is measured against: `__info__/1` is generated
+   by the Elixir compiler for every Elixir module and is NOT part of the ABI a
+   pinned (functions-only) port carries."
+  [mod]
+  (Enum/sort (filter (fn [e] (not (erlang/== :__info__ (elem e 0)))) (exports mod))))
+
+; ── normalization ─────────────────────────────────────────────────────────
+
+(defn- norm-str
+  "The probe atom the pinned emitter names in a message, and the `__MODULE__` it
+   writes into a child spec's `:start`."
+  [s]
+  (String/replace s "BeamLisp.HostSupervisorProbe" "BeamLisp.Supervisor"))
+
+(defn- scrub
+  "The observation with the by-design differences erased: the probe atom becomes
+   the production atom, a fresh pid becomes `:pid` and a fresh reference `:ref`.
+   The walk is structural — maps and tuples included — because a child spec
+   carries the module atom and a live tree carries real pids in both."
+  [v]
+  (cond
+    (erlang/== v probe) live
+    (erlang/is_pid v) :pid
+    (erlang/is_reference v) :ref
+    (erlang/is_binary v) (norm-str v)
+    (erlang/is_list v) (Enum/map v scrub)
+    (erlang/is_tuple v) (erlang/list_to_tuple (Enum/map (erlang/tuple_to_list v) scrub))
+    (erlang/is_map v)
+    (Map/new (Enum/map v (fn [pair] (tuple (scrub (elem pair 0)) (scrub (elem pair 1))))))
+    :else v))
+
+(defn- obs
+  "`[:ok value]` or `[:raise class message]`, normalized."
+  [thunk]
+  (try (scrub (thunk))
+       (catch e (list :raise (:__struct__ e) (norm-str (ex-message e))))))
+
+; ── the pure ABI corpus ───────────────────────────────────────────────────
+
+(defn- mfa
+  "A `{module, fun, args}` child-start tuple. A literal `{…}` in beam-lisp is a
+   MAP, never a tuple, so the MFA shape is built with `tuple`."
+  []
+  (tuple dispatcher :go (list 1 2)))
+
+(defn- pure-cases
+  "Every PURE public-ABI observation, as a LIST of thunks so the side effects run
+   in list order (`Enum/map` is left-to-right; a bare `(list …)` of already-run
+   calls would not be, since beam-lisp evaluates call arguments right-to-left).
+   Each thunk is self-contained, so the corpus is reproducible in either
+   module's run."
+  [mod]
+  (list
+    ; ── worker/2 : the two start shapes, then the refusal ────────────
+    (fn [] (erlang/apply mod :worker (list :a (fn [] 1))))
+    (fn [] (erlang/apply mod :worker (list :a (mfa))))
+    (fn [] (erlang/apply mod :worker (list :a :nope)))
+    (fn [] (erlang/apply mod :worker (list :a (tuple :m :f))))
+    (fn [] (erlang/apply mod :worker (list :a (tuple :m :f :nope))))
+    (fn [] (erlang/apply mod :worker (list :a (tuple "s" :f (list)))))
+    (fn [] (erlang/apply mod :worker (list :a (fn [x] x))))
+
+    ; ── worker/3 : optional keys, and the `nil` that means ABSENT ────
+    (fn [] (erlang/apply mod :worker (list :a (fn [] 1) (maps/new))))
+    (fn [] (erlang/apply mod :worker (list :a (fn [] 1) {:restart :transient :shutdown 5 :type :worker :name :zz})))
+    (fn [] (erlang/apply mod :worker (list :a (fn [] 1) {:restart nil :shutdown nil :type nil})))
+    (fn [] (erlang/apply mod :worker (list :a (mfa) {:restart :temporary :shutdown :infinity :type :supervisor})))
+    (fn [] (erlang/apply mod :worker (list :a (fn [] 1) 7)))
+    (fn [] (erlang/apply mod :worker (list :a :nope (maps/new))))
+    (fn [] (erlang/apply mod :worker (list :a (fn [] 1) (list))))
+
+    ; ── server/2,3,4 : the MFA child of a defserver ──────────────────
+    (fn [] (erlang/apply mod :server (list :a dispatcher)))
+    (fn [] (erlang/apply mod :server (list :a dispatcher 7)))
+    (fn [] (erlang/apply mod :server (list :a dispatcher nil (maps/new))))
+    (fn [] (erlang/apply mod :server (list :a dispatcher 7 {:restart :temporary :name :nn})))
+    (fn [] (erlang/apply mod :server (list :a dispatcher 7 {:name nil :type :worker})))
+    (fn [] (erlang/apply mod :server (list :a dispatcher 1 7)))
+    (fn [] (erlang/apply mod :server (list :a dispatcher 7 (list))))
+
+    ; ── pool/5 : the id atoms, the dispatcher, the index range ───────
+    (fn [] (let [e (erlang/apply mod :pool (list :p :mysup dispatcher target 2))]
+             (list (:id e) (:type e)
+                   (Enum/map (first (elem (:start e) 2)) (fn [c] (list (:id c) (:start c)))))))
+    (fn [] (let [e (erlang/apply mod :pool (list :p :mysup dispatcher target 1))]
+             (Enum/map (first (elem (:start e) 2)) (fn [c] (:id c)))))
+    ; n = 0 is `0..-1`, which enumerates DESCENDING — the live behaviour.
+    (fn [] (let [e (erlang/apply mod :pool (list :p :mysup dispatcher target 0))]
+             (Enum/map (first (elem (:start e) 2)) (fn [c] (:id c)))))
+    (fn [] (let [e (erlang/apply mod :pool (list :p :mysup dispatcher target 3))]
+             (Enum/map (first (elem (:start e) 2)) (fn [c] (:id c)))))
+    (fn [] (let [e (erlang/apply mod :pool (list :p :mysup dispatcher target 2))]
+             (nth (elem (:start e) 2) 1)))
+
+    ; ── supervise/2,3 : the refusals (the starts are live-tree cases) ─
+    (fn [] (erlang/apply mod :supervise (list "x" (list))))
+    (fn [] (erlang/apply mod :supervise (list 5 (list))))
+    (fn [] (erlang/apply mod :supervise (list "x" (list) (maps/new))))
+    (fn [] (erlang/apply mod :supervise (list :one_for_one :nope)))
+    (fn [] (erlang/apply mod :supervise (list :one_for_one 5)))
+    (fn [] (erlang/apply mod :supervise (list :one_for_one "x")))
+    ; a NON-map opts is the live `Map.get/2` BadMapError, raised by
+    ; `intensity_opts/1` before any child is looked at.
+    (fn [] (erlang/apply mod :supervise (list :one_for_one (list) "x")))
+
+    ; ── start_link/1 : the head, and the intensity shapes that fall to [] ──
+    (fn [] (erlang/apply mod :start_link (list :nope)))
+    (fn [] (erlang/apply mod :start_link (list (maps/new))))
+    (fn [] (erlang/apply mod :start_link (list {:strategy :one_for_one})))
+    (fn [] (erlang/apply mod :start_link (list {:children (list)})))
+    (fn [] (erlang/apply mod :start_link (list {:strategy "x" :children (list)})))
+    (fn [] (erlang/apply mod :start_link (list {:strategy 5 :children (list)})))
+    ; `:intensity` present but NOT a 2-tuple vector: both live clauses agree it
+    ; is absent, so the strategy default is the only intensity that reaches OTP
+    ; — proven here by a start that is INVALID for a different reason (a
+    ; non-list child list), so nothing is started.
+    (fn [] (erlang/apply mod :start_link (list {:strategy :one_for_one :intensity (list 3 9) :children :nope})))
+    (fn [] (erlang/apply mod :start_link (list {:strategy :one_for_one :intensity (BeamLisp.Vector/new (list 3 9 4)) :children :nope})))
+    (fn [] (erlang/apply mod :start_link (list {:strategy :one_for_one :intensity (BeamLisp.Vector/new (list 3)) :children :nope})))
+
+    ; ── start_server/3 : the name clause-head refusal ─────────────────
+    (fn [] (erlang/apply mod :start_server (list dispatcher 1 "s")))
+    (fn [] (erlang/apply mod :start_server (list dispatcher 1 (tuple :a))))))
+
+(defn- pure-corpus [mod]
+  (Enum/map (pure-cases mod) (fn [th] (obs th))))
+
+; ── the live-tree corpus ──────────────────────────────────────────────────
+;
+; Every one of these starts REAL processes, so each runs in its OWN process with
+; `:trap_exit` set: a supervisor that exceeds its restart intensity exits
+; `:shutdown`, and the EXIT it sends the process that started it must not take
+; the test process down. The worker also keeps the observation self-contained —
+; the tree it starts and stops is invisible outside it.
+;
+; The worker is a plain `Task`, which conveys NO var environment, so a corpus
+; thunk may only call the namespace's own `defn`s (compiled to DIRECT module
+; calls) and read values its closure CAPTURES. Binding a plain `def`'s value
+; inside the thunk would be a var lookup in a process that has no env — `child-mod`
+; below is therefore a PARAMETER, read once in the test process.
+
+(defn- in-worker [f]
+  (Task/await
+    (Task/async
+      (fn []
+        (Process/flag :trap_exit true)
+        (try (f) (catch e (tuple :raised (:__struct__ e) (ex-message e))))))
+    20000))
+
+(defn- sleeper
+  "A zero-arity worker body that outlives the observation — a `Task` child that
+   stays up until it is killed, which is what makes a restart observable."
+  []
+  (fn [] (Process/sleep 100000)))
+
+(defn- wait-for
+  "`f` until it answers non-nil, or nil after ~3s. Polling, not sleeping a fixed
+   time: a restart is a process spawn, and a fixed sleep is a flake."
+  [f]
+  (loop [n 0]
+    (let [r (f)]
+      (cond
+        (some? r) r
+        (erlang/> n 300) nil
+        :else (do (Process/sleep 10) (recur (erlang/+ n 1)))))))
+
+(defn- child-pid
+  "The pid `id` names in `sup`, or nil when the child is `:undefined` (after
+   `terminate_child`), `:restarting`, or absent."
+  [sup id]
+  (let [t (List/keyfind (Supervisor/which_children sup) id 0)]
+    (if (and (some? t) (erlang/is_pid (elem t 1))) (elem t 1) nil)))
+
+(defn- exits-from
+  "The reasons of the `{:EXIT, pid, reason}` events sitting in THIS process's
+   mailbox — the report a supervisor sends the process that started it."
+  [pid]
+  (let [msgs (elem (Process/info (erlang/self) :messages) 1)]
+    (Enum/map
+      (filter (fn [m] (and (erlang/is_tuple m)
+                           (erlang/== 3 (erlang/tuple_size m))
+                           (erlang/== :EXIT (elem m 0))
+                           (erlang/== pid (elem m 1))))
+              msgs)
+      (fn [m] (elem m 2)))))
+
+(defn- tree-of
+  "Start `mod`'s own tree: two `:permanent` sleeper workers, one-for-one.
+   Returns `[sup a-pid b-pid]`."
+  [mod]
+  (let [sup (erlang/apply mod :supervise
+              (list :one-for-one
+                    (list (erlang/apply mod :worker (list :a (sleeper)))
+                          (erlang/apply mod :worker (list :b (sleeper))))))]
+    (list sup (child-pid sup :a) (child-pid sup :b))))
+
+(defn- intensity-tree
+  "Start a one-for-one tree of ONE sleeper worker through `supervise/3` with
+   `opts`. Returns the supervisor pid."
+  [mod opts]
+  (erlang/apply mod :supervise
+    (list :one-for-one (list (erlang/apply mod :worker (list :a (sleeper)))) opts)))
+
+(defn- kill-times
+  "Kill the `:a` child up to `n` times, waiting for the RESTARTED pid between
+   kills — a fixed sleep would race the supervisor's own spawn and re-kill a
+   corpse. Enough to exceed a `:max-restarts` of 1 inside a `:max-seconds` of 1,
+   and not enough to exceed the default limits. Returns whether the supervisor
+   SURVIVED."
+  [sup n]
+  (loop [i 0 last nil]
+    (cond
+      (erlang/>= i n) (Process/alive? sup)
+      (not (Process/alive? sup)) false
+      :else
+      (let [p (wait-for (fn [] (let [x (child-pid sup :a)]
+                                 (if (and (some? x) (not= x last)) x nil))))]
+        (if (some? p) (Process/exit p :kill) nil)
+        (Process/sleep 30)
+        (recur (erlang/+ i 1) p)))))
+
+(defn- live-cases
+  [mod child-mod]
+  (list
+    ; ── the tree as OTP sees it, a healed child, terminate/restart, stop ──
+    (fn []
+      (let [sup (first (tree-of mod))
+            kids (Enum/sort (Enum/map (Supervisor/which_children sup) (fn [t] (tuple (elem t 0) (elem t 2)))))
+            counts (Supervisor/count_children sup)
+            p0 (child-pid sup :a)
+            _ (Process/exit p0 :kill)
+            p1 (wait-for (fn [] (let [p (child-pid sup :a)]
+                                  (if (and (some? p) (not= p0 p)) p nil))))
+            term (Supervisor/terminate_child sup :b)
+            gone (child-pid sup :b)
+            restart (Supervisor/restart_child sup :b)
+            restart-ok (and (erlang/is_tuple restart)
+                            (erlang/== :ok (elem restart 0))
+                            (erlang/is_pid (elem restart 1)))
+            counts2 (Supervisor/count_children sup)
+            stop (Supervisor/stop sup)
+            _ (Process/sleep 30)]
+        (list kids counts (some? p1) term (nil? gone) restart-ok counts2 stop (Process/alive? sup))))
+
+    ; ── the strategy REACHES OTP: one-for-all heals the SIBLING too ────
+    (fn []
+      (let [x (erlang/apply mod :worker (list :x (sleeper)))
+            y (erlang/apply mod :worker (list :y (sleeper)))
+            sup (erlang/apply mod :start_link
+                  (list {:strategy :one-for-all
+                         :intensity (BeamLisp.Vector/new (list 3 5))
+                         :children (list x y)}))
+            xp (child-pid sup :x)
+            yp (child-pid sup :y)
+            _ (Process/exit xp :kill)
+            healed (wait-for (fn [] (let [p (child-pid sup :x)]
+                                      (if (and (some? p) (not= xp p)) p nil))))
+            y2 (wait-for (fn [] (let [p (child-pid sup :y)]
+                                  (if (and (some? p) (not= yp p)) p nil))))
+            stop (Supervisor/stop sup)]
+        (list (some? healed) (some? y2) (not= yp y2) stop)))
+
+    ; ── the strategy as a VECTOR child list: a beam-lisp literal ──────
+    (fn []
+      (let [sup (erlang/apply mod :supervise
+                  (list :one-for-one
+                        (BeamLisp.Vector/new
+                          (list (erlang/apply mod :worker (list :v (sleeper)))))))
+            ids (Enum/sort (Enum/map (Supervisor/which_children sup) (fn [t] (elem t 0))))
+            p0 (child-pid sup :v)
+            _ (Process/exit p0 :kill)
+            p1 (wait-for (fn [] (let [p (child-pid sup :v)]
+                                  (if (and (some? p) (not= p0 p)) p nil))))
+            stop (Supervisor/stop sup)]
+        (list ids (some? p1) stop)))
+
+    ; ── INTENSITY through supervise/3 opts: the tree gives up ─────────
+    (fn []
+      (let [sup (intensity-tree mod {:"max-restarts" 1 :"max-seconds" 1})
+            survived (kill-times sup 3)
+            _ (wait-for (fn [] (if (erlang/== 0 (erlang/length (exits-from sup))) nil true)))
+            events (exits-from sup)
+            stop-if-alive (if (Process/alive? sup) (Supervisor/stop sup) :dead)]
+        (list survived events stop-if-alive)))
+
+    ; ── the SAME tree without the opts survives: the options mattered ──
+    (fn []
+      (let [sup (intensity-tree mod (maps/new))
+            survived (kill-times sup 2)
+            alive (Process/alive? sup)
+            stop (Supervisor/stop sup)]
+        (list survived alive stop)))
+
+    ; ── INTENSITY through start_link/1: the vector is forwarded ───────
+    (fn []
+      (let [sup (erlang/apply mod :start_link
+                  (list {:strategy :one-for-one
+                         :intensity (BeamLisp.Vector/new (list 1 1))
+                         :children (list (erlang/apply mod :worker (list :a (sleeper))))}))
+            survived (kill-times sup 3)
+            _ (wait-for (fn [] (if (erlang/== 0 (erlang/length (exits-from sup))) nil true)))
+            events (exits-from sup)]
+        (list survived events)))
+
+    ; ── a `nil`-valued intensity is ABSENT: the tree survives ─────────
+    (fn []
+      (let [sup (erlang/apply mod :start_link
+                  (list {:strategy :one-for-one
+                         :intensity nil
+                         :children (list (erlang/apply mod :worker (list :a (sleeper))))}))
+            survived (kill-times sup 2)
+            stop (Supervisor/stop sup)]
+        (list survived stop)))
+
+    ; ── the defserver child, started FOR REAL: `server/4` -> `start_server/3`
+    ;    -> `BeamLisp.Server.start_link` -> a genuine gen_server under a NAMED
+    ;    one-for-one sub-supervisor. Restarting it re-runs the child start, so
+    ;    the MFA spec is proven to be startable, not merely well-shaped.
+    ;    `start_named_sup/2` answers the RAW `{:ok, pid}` an OTP child start must,
+    ;    while `supervise/2,3` unwraps — pinned here by using the registered NAME
+    ;    for the tree operations and asserting the tuple's shape. ──
+    (fn []
+      (let [started (erlang/apply mod :start_named_sup
+                      (list (list (erlang/apply mod :server (list :w child-mod 7)))
+                            :bl_host_sup_probe_pool))
+            ok (and (erlang/is_tuple started) (erlang/== :ok (elem started 0)))
+            key :bl_host_sup_probe_pool
+            named (Process/whereis key)
+            ids (Enum/sort (Enum/map (Supervisor/which_children key) (fn [t] (elem t 0))))
+            p0 (child-pid key :w)
+            _ (Process/exit p0 :kill)
+            p1 (wait-for (fn [] (let [p (child-pid key :w)]
+                                  (if (and (some? p) (not= p0 p)) p nil))))
+            stop (Supervisor/stop key)
+            gone (wait-for (fn [] (if (some? (Process/whereis key)) nil true)))]
+        (list ok (erlang/is_pid named) ids (some? p0) (some? p1) stop (some? gone))))
+
+    ; ── a start that FAILS: `Supervisor.start_link/2` answers `{:error, …}`,
+    ;    so the live `{:ok, pid} = …` raises. The EXIT a failed supervisor sends
+    ;    the process that started it is trapped by this case's worker — the only
+    ;    way that branch is reachable at all — and the reason is whatever OTP
+    ;    reports (scrubbed of pids), so the class is the assertion and the
+    ;    message is only compared probe-against-live. ──
+    (fn []
+      (let [bad (maps/put :start (tuple :no_such_module_zzz :nope (list))
+                  (maps/put :id :dead (maps/new)))]
+        (try
+          (erlang/apply mod :supervise (list :one-for-one (list bad)))
+          (catch e (list :raised (:__struct__ e))))))))
+
+(defn- live-corpus [mod]
+  (Enum/map (live-cases mod probe-child) (fn [th] (scrub (in-worker th)))))
+
+; ── the app's own supervisor is NOT this module's business ───────────────
+
+(defn- app-supervisor []
+  (Process/whereis live))
+
+(defn- app-tree-size []
+  (erlang/map_get :specs (erlang/apply :Elixir.Supervisor :count_children (list live))))
+
+; ── the surface: exactly the live module's public functions ──────────────
+
+(deftest supervisor-pinned-surface-is-the-live-module
+  (testing "exports and the seed option contract, against the live module"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (= :non_existing (erlang/apply :code :which (list shim))))
+
+      (is (erlang/function_exported live :supervise 2) "the production module is loaded")
+
+      ; Every production function remains present at the probe atom, and the
+      ; probe exports NOTHING the live module does not (minus the Elixir-
+      ; generated `__info__/1`, which a pinned functions-only beam never has).
+      (is (= () (filter (fn [e] (not (erlang/function_exported probe (elem e 0) (elem e 1))))
+                        (functional-exports live)))
+          "the pinned beam reproduces every production function")
+      (is (= (functional-exports live) (exports probe))
+          "the pinned export surface equals the live module's minus __info__/1")
+
+      ; The eight public functions, by name and arity.
+      (is (erlang/function_exported probe :worker 2))
+      (is (erlang/function_exported probe :worker 3))
+      (is (erlang/function_exported probe :supervise 2))
+      (is (erlang/function_exported probe :supervise 3))
+      (is (erlang/function_exported probe :server 2))
+      (is (erlang/function_exported probe :server 3))
+      (is (erlang/function_exported probe :server 4))
+      (is (erlang/function_exported probe :start_server 3))
+      (is (erlang/function_exported probe :pool 5))
+      (is (erlang/function_exported probe :start_named_sup 2))
+      (is (erlang/function_exported probe :start_link 1))
+
+      ; The live module's PRIVATE helpers are not exports, and a pinned module
+      ; exports exactly its file's top-level defns — so none of them may appear.
+      (is (not (erlang/function_exported probe :start_spec 1)))
+      (is (not (erlang/function_exported probe :maybe_put 3)))
+      (is (not (erlang/function_exported probe :normalize_strategy 1)))
+      (is (not (erlang/function_exported probe :child_list 1)))
+      (is (not (erlang/function_exported probe :intensity_from 1)))
+      (is (not (erlang/function_exported probe :intensity_opts 1)))
+      (is (not (erlang/function_exported probe :"self-mod" 0)))
+
+      ; FUNCTIONS-ONLY: no `:struct_fields`, so no struct surface; no
+      ; `:behaviour`, so this is not a callback module.
+      (is (not (erlang/function_exported probe :__struct__ 0)))
+      (is (not (erlang/function_exported probe :__struct__ 1)))
+      (is (not (erlang/function_exported probe :__info__ 1)))
+
+      ; The explicit seed option contract.
+      (let [opts (seed-opts probe dir)]
+        (is (= probe (Keyword/fetch! opts :module)))
+        (is (= (src) (Keyword/fetch! opts :file)))
+        (is (= false (Keyword/fetch! opts :load?)))
+        (is (erlang/is_binary (Keyword/fetch! opts :source_hash))))
+
+      ; REPRODUCIBLE: the same source compiled again is the same bytes. The seed
+      ; records a sha256 per host beam and `seed/check` re-derives it, so a
+      ; non-deterministic emitter would make the committed floor unverifiable.
+      (let [again (tmp-dir)
+            again-beam (elem (BeamLisp.AOT/compile_host_file (src) (seed-opts probe again)) 1)]
+        (is (= (File/read! (Path/join dir "Elixir.BeamLisp.HostSupervisorProbe.beam"))
+               (File/read! again-beam))
+            "a rebuild of priv/host/supervisor.bl is the same beam")
+        (File/rm_rf! again))
+
+      (File/rm_rf! dir))))
+
+; ── the pure ABI: probe answers == live answers ──────────────────────────
+
+(deftest supervisor-pinned-pure-abi-matches-the-live-module
+  (testing "child specs, pool ids and every refusal, observation for observation"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      (let [l (pure-corpus live)
+            p (pure-corpus probe)]
+        (is (= l p) "probe answers equal the live module's on the whole corpus")
+        (doseq [i (range (count l))]
+          (is (= (nth l i) (nth p i))
+              (str "observation " i ": " (pr-str (nth l i)) " vs " (pr-str (nth p i))))))
+      ; The `pool/5` id atoms are pinned exactly, not merely matched: `w0` and
+      ; the DESCENDING `w-1` the `0..(n-1)` range yields for n = 0.
+      (is (= (list :dispatcher :w0 :w-1)
+             (Enum/map (first (elem (:start (erlang/apply probe :pool (list :p :s dispatcher target 0))) 2))
+                       (fn [c] (:id c)))))
+      ; A `nil`-valued option is ABSENT: the key is not written at all.
+      (is (= (list :id :start)
+             (Enum/sort (Map/keys (erlang/apply probe :worker (list :a (fn [] 1) {:restart nil :shutdown nil :type nil})))))
+          "a nil :restart/:shutdown/:type writes no key")
+      (is (= (list :id :restart :shutdown :start :type)
+             (Enum/sort (Map/keys (erlang/apply probe :worker (list :a (fn [] 1) {:restart :transient :shutdown 5 :type :worker})))))
+          "every non-nil option is written")
+      (File/rm_rf! dir))))
+
+; ── the live trees: probe answers == live answers ────────────────────────
+
+(deftest supervisor-pinned-live-trees-match-the-live-module
+  (testing "isolated supervisor pids: restart, strategy, intensity, stop"
+    (let [dir (tmp-dir)
+          before (app-supervisor)]
+      (compile-at probe dir)
+      (is (erlang/is_pid before) "precondition: this VM runs the application tree")
+
+      (let [l (live-corpus live)
+            p (live-corpus probe)]
+        (is (= l p) "probe trees behave exactly like the live module's")
+        (doseq [i (range (count l))]
+          (is (= (nth l i) (nth p i))
+              (str "tree observation " i ": " (pr-str (nth l i)) " vs " (pr-str (nth p i))))))
+
+      ; Every one of those trees answered the pinned expectations, not merely
+      ; the same wrong thing: shape, healing, terminate/restart, stop, the
+      ; one-for-all strategy, and intensity BOTH ways. `tree` below is the
+      ; corpus produced live by the PINNED beam.
+      (let [tree (live-corpus probe)
+            counts {:active 2 :workers 2 :supervisors 0 :specs 2}]
+        (is (= (list (list (tuple :a :worker) (tuple :b :worker))
+                     counts true :ok true true counts :ok false)
+               (nth tree 0))
+            "the tree heals a killed child, terminates/restarts it, and stops")
+        (is (= (list true true true :ok) (nth tree 1))
+            "one-for-all heals the SIBLING of the killed child")
+        (is (= (list (list :v) true :ok) (nth tree 2))
+            "a BeamLisp.Vector child list starts and heals")
+        (is (= (list false (list :shutdown) :dead) (nth tree 3))
+            "max-restarts 1 / max-seconds 1 makes the tree GIVE UP, reporting :shutdown")
+        (is (= (list true true :ok) (nth tree 4))
+            "the same tree without the opts survives — the options are what limited it")
+        (is (= (list false (list :shutdown)) (nth tree 5))
+            "start_link/1 forwards the intensity vector")
+        (is (= (list true :ok) (nth tree 6))
+            "a nil intensity is absent, so the default limits apply")
+        (is (= (list true true (list :w) true true :ok true) (nth tree 7))
+            "a defserver child starts for real under a named sub-supervisor, heals under it, and releases the name")
+        (is (= (list :raised :Elixir.MatchError) (nth tree 8))
+            "a FAILED supervisor start is the live MatchError, not a swallowed error"))
+
+      ; THE APPLICATION'S SUPERVISOR IS UNTOUCHED. `BeamLisp.Supervisor` is the
+      ; OTP application's registered NAME; these trees were unregistered pids
+      ; and none of them renamed or stopped that process.
+      (is (= before (app-supervisor)) "the application's supervisor is the same pid")
+      (is (= 2 (app-tree-size)) "the application's tree still has its two children")
+      (is (= 3 (BeamLisp/eval "(+ 1 2)")) "the language still answers")
+
+      (File/rm_rf! dir))))
+
+; ── the pinned beam AT the production atom, restored afterwards ──────────
+
+(deftest supervisor-pinned-beam-stands-in-at-the-production-atom
+  (testing "the production atom serves on the pinned beam, then the live beam returns"
+    (let [dir (tmp-dir)
+          out (str dir "/prod")
+          beam (Path/join out (str live ".beam"))
+          orig-path (erlang/apply :code :which (list live))
+          orig-bin (File/read! (erlang/list_to_binary orig-path))
+          before-pure (pure-corpus live)
+          before-live (live-corpus live)
+          app-sup (app-supervisor)]
+      (is (not= :non_existing orig-path) "precondition: the live beam is a readable file")
+      (is (erlang/is_pid app-sup) "precondition: the application tree is up")
+
+      ; `:load? false` writes the beam at the production atom WITHOUT
+      ; substituting the live module mid-flight.
+      (BeamLisp.AOT/compile_host_file (src) (seed-opts live out))
+      (is (File/exists? beam))
+      (is (= orig-path (erlang/apply :code :which (list live)))
+          "the compile never substituted the production module")
+
+      (try
+        (drop! live)
+        (code/load_binary live (erlang/binary_to_list beam) (File/read! beam))
+        (is (= (erlang/binary_to_list beam) (erlang/apply :code :which (list live)))
+            "the test beam now owns the production atom")
+        (is (erlang/function_exported live :supervise 2))
+
+        ; The pinned beam answers EXACTLY as the live one did at this atom —
+        ; child specs, refusals AND live trees, observation for observation.
+        (is (= before-pure (pure-corpus live)))
+        (is (= before-live (live-corpus live)))
+
+        ; ...and a tree started through the production atom really is OTP's.
+        (let [sup (erlang/apply live :supervise
+                    (list :one-for-one (list (erlang/apply live :worker (list :p (sleeper))))))
+              p0 (child-pid sup :p)
+              _ (Process/exit p0 :kill)
+              p1 (wait-for (fn [] (let [p (child-pid sup :p)]
+                                    (if (and (some? p) (not= p0 p)) p nil))))]
+          (is (erlang/is_pid p1) "the production atom's tree heals a child")
+          (is (= :ok (Supervisor/stop sup))))
+
+        ; THE RUNTIME'S OWN TREE IS STILL THE RUNTIME'S. Load nothing over the
+        ; registered process; only a module shared an atom with its NAME.
+        (is (= app-sup (app-supervisor)) "the application's supervisor is untouched")
+        (is (= 2 (app-tree-size)))
+        (is (= 3 (BeamLisp/eval "(+ 1 2)")))
+        (finally
+          (drop! live)
+          (code/load_binary live orig-path orig-bin)))
+
+      ; RESTORED: the live beam owns the atom and answers again.
+      (is (= orig-path (erlang/apply :code :which (list live))))
+      (is (= before-pure (pure-corpus live)) "the restored live beam answers as before")
+      (is (= app-sup (app-supervisor)))
+      (is (= 2 (app-tree-size)))
+      (File/rm_rf! dir))))
+
+; ── a cold child VM: the pinned beam, no warm-VM trust ───────────────────
+
+(defn- child-code-args
+  "This VM's whole code path as `-pa` args, with `pinned` LAST so it lands
+   FIRST: `-pa` PREPENDS, so the last one named wins (`bin/bl` relies on the
+   same rule for the same reason)."
+  [pinned]
+  (concat (mapcat (fn [p] (list "-pa" (erlang/list_to_binary p))) (code/get_path))
+          (list "-pa" pinned)))
+
+(defn- boot-script
+  "The child VM's program, as Elixir source. Every line it prints is read back
+   as an assertion: the beam the code server resolved, the application's own
+   supervisor, an UNREGISTERED tree of the pinned module's own making, the
+   restart it heals, and the fact that the application tree was never touched."
+  []
+  (str
+    "app = :beam_lisp\n"
+    "{:ok, _} = Application.ensure_all_started(app)\n"
+    "IO.puts(\"which=\" <> List.to_string(:code.which(BeamLisp.Supervisor)))\n"
+    "sup0 = Process.whereis(BeamLisp.Supervisor)\n"
+    "IO.puts(\"app-sup=\" <> inspect(is_pid(sup0)))\n"
+    "IO.puts(\"app-kids=\" <> inspect(Supervisor.which_children(sup0) |> Enum.map(&elem(&1, 0)) |> Enum.sort()))\n"
+    "IO.puts(\"exports=\" <> inspect(Enum.sort(BeamLisp.Supervisor.module_info(:exports))))\n"
+    "free = BeamLisp.Supervisor.supervise(:\"one-for-one\", [BeamLisp.Supervisor.worker(:c, fn -> Process.sleep(60000) end)])\n"
+    "IO.puts(\"free-pid=\" <> inspect(is_pid(free)))\n"
+    "IO.puts(\"free-specs=\" <> inspect(Map.get(Supervisor.count_children(free), :specs)))\n"
+    "IO.puts(\"distinct=\" <> inspect(free != sup0))\n"
+    "[{:c, p0, _, _}] = Supervisor.which_children(free)\n"
+    "Process.exit(p0, :kill)\n"
+    "p1 = Enum.reduce_while(1..300, nil, fn _, _ ->\n"
+    "  case Supervisor.which_children(free) do\n"
+    "    [{:c, p, _, _}] when is_pid(p) and p != p0 -> {:halt, p}\n"
+    "    _ -> Process.sleep(10); {:cont, nil}\n"
+    "  end\n"
+    "end)\n"
+    "IO.puts(\"healed=\" <> inspect(is_pid(p1) and p1 != p0))\n"
+    "IO.puts(\"app-untouched=\" <> inspect(Process.whereis(BeamLisp.Supervisor) == sup0))\n"
+    "IO.puts(\"eval=\" <> inspect(BeamLisp.eval(\"(+ 1 2)\")))\n"
+    "IO.puts(\"stop=\" <> inspect(Supervisor.stop(free)))\n"
+    "wait = Enum.reduce_while(1..300, nil, fn _, _ -> if Process.alive?(free), do: (Process.sleep(10); {:cont, nil}), else: {:halt, :dead} end)\n"
+    "IO.puts(\"free-dead=\" <> inspect(wait == :dead))\n"
+    "IO.puts(\"ok\")\n"))
+
+(deftest supervisor-pinned-tree-runs-in-an-isolated-child-vm
+  (testing "a fresh VM resolves BeamLisp.Supervisor to the pinned beam and heals on it"
+    (let [dir (tmp-dir)
+          out (str dir "/boot")
+          script (Path/join dir "boot.exs")
+          beam (Path/join out (str live ".beam"))]
+      ; The pinned beam AT the production atom, written here, never loaded here.
+      (BeamLisp.AOT/compile_host_file (src) (seed-opts live out))
+      (is (File/exists? beam))
+      (File/write! script (boot-script))
+
+      (let [r (System/cmd "elixir"
+                          (to-list (concat (child-code-args out) (list script)))
+                          (to-list [(tuple :stderr_to_stdout true)]))
+            text (elem r 0)]
+        (is (zero? (elem r 1)) (str "the child VM exited " (elem r 1) ":\n" text))
+
+        ; THE REPLACEMENT: the code server resolves the module to the pinned
+        ; beam, so the tree below is the port's, not the live module's.
+        (is (includes? text (str "which=" beam)) text)
+
+        ; THE APPLICATION CAME UP ON ITS OWN supervisor, which is registered
+        ; under the very name this module shares.
+        (is (includes? text "app-sup=true") text)
+        (is (includes? text "app-kids=[BeamLisp.Env, BeamLisp.Loader.Server]") text)
+
+        ; The pinned surface really is functions-only at the production atom.
+        (is (includes? text
+              "exports=[module_info: 0, module_info: 1, pool: 5, server: 2, server: 3, server: 4, start_link: 1, start_named_sup: 2, start_server: 3, supervise: 2, supervise: 3, worker: 2, worker: 3]")
+            text)
+
+        ; AN UNREGISTERED TREE the pinned module starts is a real OTP
+        ; supervisor, distinct from the application's, and it HEALS a child.
+        (is (includes? text "free-pid=true") text)
+        (is (includes? text "free-specs=1") text)
+        (is (includes? text "distinct=true") text)
+        (is (includes? text "healed=true") text)
+
+        ; ...and the application's own tree was never touched by any of it.
+        (is (includes? text "app-untouched=true") text)
+        (is (includes? text "eval=3") text)
+        (is (includes? text "stop=:ok") text)
+        (is (includes? text "free-dead=true") text)
+        (is (includes? text "ok") text))
+
+      (File/rm_rf! dir))))

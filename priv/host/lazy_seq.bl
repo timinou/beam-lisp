@@ -1,0 +1,950 @@
+; host/lazy_seq.bl — the pinned HOST MODULE for `Elixir.BeamLisp.LazySeq`.
+;
+; The lazy sequence: a recipe, run at most once per node, whose successful
+; answer is shared, whose known failures may be retried, and whose recursive
+; force, cyclic retained value and lost evaluator are terminal. This file is the
+; `.bl` port of `lib/beam_lisp/lazy_seq.ex`'s `BeamLisp.LazySeq` half, compiled
+; by `BeamLisp.AOT/compile_host_file` into ONE exact-named beam whose
+; `__struct__/0,1` pair and `__info__/1` are SYNTHESIZED by the `:struct_fields`
+; option in the live module's declaration order (`:resource`, `:metadata`).
+;
+; THE PRODUCTION TAG IS SPELLED LITERALLY, never read from a fun literal. The
+; native memo graph recognizes a lazy node by its struct tag:
+; `BeamLisp.LazyMemo.dependencies/1` descends into
+; `%{__struct__: BeamLisp.LazySeq, resource: resource}`, and the cycle guard is
+; built on that walk. A value tagged with a probe atom is an OPAQUE map there:
+; its memo resource is neither edge-shared nor cycle-checked, so a probe compile
+; that minted its own tag would answer DIFFERENT cycle/retry behaviour and prove
+; nothing. `new/1,2` therefore builds `%BeamLisp.LazySeq{}` at any compile target
+; (the `reactive.bl` `Derived`-tag idiom), and every tag test below compares
+; against that same literal. The module-exact fun-literal read is used only to
+; name THIS beam in the exception it raises for a bad argument.
+;
+; THE CELL HOLDS THE RECIPE (perf/lazy-engine, PLAN-151 W5). A node's cell state
+; is one of `{:pending thunk}` (or `{:pending thunk recipe}`, see THE FOLD
+; RECIPE), `{:running owner attempt waiters}`, `{:completed value}`,
+; `{:failed thunk kind reason stack}` or `{:terminal reason}`. The struct is
+; `resource metadata`: a handle into that cell plus the value-owned metadata.
+; The THUNK (and the fold recipe) is on the cell — it is the recipe, and the
+; state that owns it keeps it alive. The running state does NOT carry it: its
+; owner is executing it, and every other process reaches the outcome through the
+; attempt's reply. `memo_state/1` reports the running cell in the RECALLED
+; 5-tuple shape (`{:running nil owner attempt waiters}`) so callers keep the
+; logical view.
+;
+; WHY THE THUNK IS NOT A STRUCT FIELD. A produced value can EMBED a node:
+; `chain/2` builds `[e | %LazySeq{…}]`. A closure in the struct would make every
+; deep copy of such a value walk the closure's free variables — and for a
+; realised chain those hold the previous node, whose own thunk holds the one
+; before it. The struct's `resource` is ONE word, so the cell copy, the CAS
+; comparison and `estimate_bytes/1`'s `flat_size` all stop at it.
+;
+; ONE WALK AND ONE COPY IN, ONE COPY OUT. Realising one element costs exactly:
+; one walk of the thunk's captured environment (at create — those are the cell's
+; cycle edges), one copy of it into the cell (create), one copy out (the claimer
+; reads `{:pending thunk}`), plus the value's own walk and copy when it is
+; published. Everything else is O(1): a claim, a waiter registration and a
+; terminal transition are VERSION compare-and-swaps carrying `:keep` — no term
+; load, no term compare, no dependency walk, no graph lock (see
+; `BeamLisp.LazyMemo`).
+;
+; THE FAILURE IS RECORDED BIT-FOR-BIT. The live `evaluate_attempt` catches
+; `kind, reason` in two variables and stores `{:failed, thunk, kind, reason,
+; __STACKTRACE__}`; a waiter replays it with `:erlang.raise(kind, reason,
+; frames)`. A plain `catch` NORMALIZES what it caught — an `:error` becomes an
+; exception struct, a throw of a non-exception an ExInfo, an `:exit` a
+; `{:exit, value}` pair — which is right for user code and lossy for a cell that
+; must RECORD and REPLAY a failure unchanged. `(catch-raw [kind reason stack]
+; …)` is the branch's clause for exactly that (PLAN-151, carried with this
+; wave): the class atom, the unnormalized reason and the raw stack.
+;
+; ## THE FOLD RECIPE
+;
+; A producer that can also compute its elements from its SOURCE may attach a
+; fold `recipe` to its node. A reducing consumer calls it INSTEAD of the cell
+; walk, and it creates no cells at all:
+;
+;     recipe :: (fn [rf init] -> acc | BeamLisp.Reduced)
+;
+; `rf` is a raw 2-arity Erlang fun `(rf acc x)`. Only a node whose head cell is
+; still `{:pending thunk recipe}` may fold from source, and a reducing consumer
+; must CLAIM that recipe before running it (`claim_recipe`): the cell goes
+; `:running` under the consumer, so a concurrent force — or a concurrent fold —
+; shares the one attempt instead of running the producer a second time. A fold
+; that runs to the end publishes the complete element list as the node's
+; `{:completed …}` state (`complete_attempt`) — Clojure's realise-once contract.
+; A fold the consumer HALTS produced only a prefix, publishes nothing, and hands
+; the cell back `:pending` (`release_recipe`) so a later full read still folds
+; from the start. Once ANYTHING is realised the memo walk is used instead, and a
+; fold that lost the claim race reads the fulfilled memo (or waits on the
+; winner) rather than re-running the producer.
+;
+; ## THE CACHE BUDGET (PLAN-154 B)
+;
+; `:lazy_cache_budget_bytes` (default 512 MiB) bounds the bytes a lazy VALUE
+; publication retains off-heap. Every state has a measured cost — one cell's
+; native overhead plus `estimate_bytes/1` (a `:running`/`:terminal` control
+; state is a constant 64; a `:pending` recipe, a `:completed` value and a
+; `:failed` class/reason/frame record are measured) — and a publication is
+; charged the DIFFERENCE it makes, so replacing a large state with a smaller one
+; is free.
+;
+; The ADMITTED publications are the fold's claim (`claim_recipe`), its
+; completion or failure (`complete_attempt`/`fail_attempt`), its halt release
+; (`release_recipe`), the attempt's `publish_attempt`, and the pending → running
+; claim. They go through `LazyMemo/exchange_version_admitted`, which reserves
+; the growth atomically against `retained + reserved` and commits or releases it
+; with the state. A fold claim is a SHRINK (the constant-size running state
+; replaces the measured pending recipe) and the release that undoes it restores
+; exactly the state the claim replaced, so the pair is retained-neutral: a fold
+; and the equivalent force decide IDENTICALLY, and two publishers that each
+; start below the ceiling cannot jointly exceed it. The two constant-size
+; control transitions that can grow NOTHING — a waiter registration
+; (`wait_for_attempt`) and the owner-loss terminal (`owner_lost`) — stay on the
+; unadmitted exchange: a resource verdict there could only strand a waiter.
+;
+; A refused publication never strands an attempt AND never leaves one
+; `:pending` to be recomputed. Every path that holds a claim — the fold's
+; completion, the fold's halt release, the ordinary attempt — turns the refusal
+; into a TERMINAL budget-refusal state: a constant-size replacement that is
+; admitted at any budget, wakes every registered waiter with the owner's own
+; reason, and makes a later read fail fast with the same reason rather than
+; re-running a producer that already ran.
+;
+; THE FOLD RECIPE HELPERS ARE TOP LEVEL, like the force protocol. A pinned module
+; is functions-only and EVERY top-level `defn` is exported; the recalled
+; module's private helpers would normally be LOCAL closures, but a call through a
+; closure is an INDIRECT call, and on this host an indirect call costs up to ten
+; times a direct one. `force/1` runs on every realised element, so its whole
+; protocol is compiled as direct calls. The PUBLIC ABI is unchanged; the extra
+; names are internal and their docstrings say so.
+;
+; THE BOOT EDGE. `lazy-seq` is a core macro that expands to
+; `(BeamLisp.LazySeq/from_fun (fn [] …))`, so `new`/`from_fun` run while the
+; boot tier is loading. Their HAPPY path touches only Erlang BIFs, `Map`,
+; `BeamLisp.LazyMemo` and the native resource; the tuple for the pending recipe
+; is built with `erlang/make_tuple` + `erlang/setelement`, never BL `tuple`, and
+; the realize error message with `erlang/iolist_to_binary`, never BL `str`. The
+; walks' `raw-cons` resolves directly to a boot-tier body module the caller has
+; already loaded.
+;
+; Run: bin/bl test test/bl/host_lazy_seq_test.bl
+
+(ns host.lazy-seq)
+
+(defn lazy?
+  "True for a lazy node — a map tagged with the production `BeamLisp.LazySeq`
+   struct. Any other value, nil included, is false."
+  [x]
+  (and (erlang/is_map x)
+       (erlang/== :"Elixir.BeamLisp.LazySeq" (maps/get :__struct__ x nil))))
+
+(defn chunk_size
+  "The chunk width a producer copies per realization step."
+  []
+  32)
+
+(defn new
+  "Wrap a zero-arity recipe in a shared lazy node. A successful answer is
+   memoized; a failure is stored as a retryable state. The `{:pending, thunk}`
+   tuple is built with Erlang BIFs so the boot edge reaches no BL runtime helper.
+   A non-zero-arity thunk is the `FunctionClauseError` the live guard raised.
+
+   The two-arity form also gives the node a fold `recipe` a reducing consumer
+   may use while it is still `:pending` (see the namespace header). The recipe
+   lives ON THE CELL, `{:pending, thunk, recipe}`, for the reason the thunk does:
+   a struct field would be copied with every value that embeds the node."
+  ([thunk]
+    (let [own (erlang/element 2 (erlang/fun_info (fn [] nil) :module))]
+      (if (erlang/is_function thunk 0)
+        (maps/put :metadata nil
+          (maps/put :resource
+            (BeamLisp.LazyMemo/create
+              (erlang/setelement 2 (erlang/make_tuple 2 :pending) thunk))
+            (maps/put :__struct__ :"Elixir.BeamLisp.LazySeq" (maps/new))))
+        (erlang/error
+          (Elixir.FunctionClauseError/exception
+            (list (tuple :module own) (tuple :function :new) (tuple :arity 1)))))))
+  ([thunk recipe]
+    (let [own (erlang/element 2 (erlang/fun_info (fn [] nil) :module))]
+      (if (and (erlang/is_function thunk 0)
+               (erlang/is_function recipe)
+               (erlang/== 2 (erlang/element 2 (erlang/fun_info recipe :arity))))
+        (maps/put :metadata nil
+          (maps/put :resource
+            (BeamLisp.LazyMemo/create
+              (erlang/setelement 3
+                (erlang/setelement 2 (erlang/make_tuple 3 :pending) thunk)
+                recipe))
+            (maps/put :__struct__ :"Elixir.BeamLisp.LazySeq" (maps/new))))
+        (erlang/error
+          (Elixir.FunctionClauseError/exception
+            (list (tuple :module own) (tuple :function :new) (tuple :arity 2))))))))
+
+(defn from_fun
+  "`new/1` under the name the `lazy-seq` core macro expands to. A non-function
+   argument is the `FunctionClauseError` the live guard raised."
+  [thunk]
+  (if (erlang/is_function thunk 0)
+    (new thunk)
+    (erlang/error
+      (Elixir.FunctionClauseError/exception
+        (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+              (tuple :function :from_fun)
+              (tuple :arity 1))))))
+
+(defn input
+  "Normalize a producer input: a vector is unwrapped and reclassified; a list
+   longer than one chunk becomes a native `SeqCursor`, a shorter list stays a
+   list; anything else is itself. `length` refusing an improper list answers 0,
+   exactly as the live `rescue ArgumentError` did."
+  [x]
+  (cond
+    (and (erlang/is_map x) (erlang/== :"Elixir.BeamLisp.Vector" (maps/get :__struct__ x nil)))
+      (input (BeamLisp.Vector/to_list x))
+
+    (erlang/is_list x)
+      (let [size
+            (try
+              (erlang/length x)
+              (catch e
+                (if (erlang/== :"Elixir.ArgumentError" (maps/get :__struct__ e nil))
+                  0
+                  (erlang/apply :erlang :raise (list :error e __STACKTRACE__)))))]
+        (if (erlang/> size 32) (BeamLisp.SeqCursor/new x) x))
+
+    :else x))
+
+(defn chain
+  "Prepend `elems` to a node produced by `tail_fun`: one shared tail node, each
+   element a raw cons onto it. The empty `elems` answers nil whatever `tail_fun`
+   is, as the live first clause did; a non-zero-arity tail is the live
+   `FunctionClauseError`."
+  [elems tail_fun]
+  (cond
+    (and (erlang/is_list elems) (erlang/== elems ())) nil
+
+    (erlang/is_function tail_fun 0)
+      (erlang/apply :lists :foldr
+        (list (fn [e acc] (BeamLisp.Ns.Rt/raw-cons e acc)) (new tail_fun) elems))
+
+    :else
+      (erlang/error
+        (Elixir.FunctionClauseError/exception
+          (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+                (tuple :function :chain)
+                (tuple :arity 2))))))
+
+; ── the fold recipe ──────────────────────────────────────────────────────────
+
+(defn pending_recipe
+  "`{recipe version}` when the node's head cell is `{:pending thunk recipe}` at
+   `version`, else nil: no recipe, or already claimed, realised, failed or
+   terminal. The version is what `publish_folded` CASes against.
+
+   A CONSTANT-SIZE PEEK answers the dominant non-pending case first (PLAN-154
+   D): the SECOND fold of a realised node learns it is `:completed` from an atom
+   and an integer instead of exporting the whole published value onto the heap
+   to discover the same thing. Only a `:pending` tag pays for the full versioned
+   read, and that read must agree with the peeked version — the peek is not a
+   snapshot, and a version that moved means the pending state the recipe
+   belonged to is gone."
+  [l]
+  (let [resource (erlang/map_get :resource l)
+        peeked (BeamLisp.LazyMemo/peek resource)]
+    ; A pinned host resolves NO namespace var, so the tests are stated
+    ; positively: `(not x)` would compile to `Env.fetch!("host.lazy-seq", "not")`
+    ; and a cold VM (which never interns that ns) would fail on it.
+    (cond
+      (erlang/== :pending (erlang/element 1 peeked))
+      (let [current (BeamLisp.LazyMemo/read_versioned resource)
+            version (erlang/element 1 current)
+            state (erlang/element 2 current)]
+        (cond
+          (erlang/== version (erlang/element 2 peeked))
+          (cond
+            (and (erlang/is_tuple state)
+                 (erlang/== 3 (erlang/tuple_size state))
+                 (erlang/== :pending (erlang/element 1 state)))
+            (tuple (erlang/element 3 state) version)
+            :else nil)
+          :else nil))
+      :else nil)))
+
+(defn pending?
+  "Whether the node's head cell is still `:pending` — the one state in which a
+   fold recipe may be used (see the namespace header). Any other state — already
+   realised, in flight elsewhere, failed-then-retried, or terminal — reads
+   through the memo walk instead.
+
+   One constant-size peek answers it (PLAN-154 D): no state is exported, so a
+   node holding a large published value costs an atom to interrogate."
+  [l]
+  (cond
+    (lazy? l)
+    (erlang/== :pending
+      (erlang/element 1 (BeamLisp.LazyMemo/peek (erlang/map_get :resource l))))
+    :else
+    (erlang/error
+      (Elixir.FunctionClauseError/exception
+        (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+              (tuple :function :pending?)
+              (tuple :arity 1))))))
+
+(defn claim_recipe
+  "INTERNAL: claim a node's pending fold `recipe` for THIS process, before any
+   of the recipe's effects run.
+
+   A fold produces the SAME node a force produces, so it takes the SAME
+   ownership: the versioned `:running` state — owner, attempt, waiters —
+   published by the admitted compare-exchange `claim_attempt` uses. There is NO
+   second ownership registry. A concurrent force (or fold) that reaches the cell
+   while this claim is held finds a running attempt, registers as a waiter, and
+   is answered by `publish_attempt` (or re-dispatched by `release_recipe`),
+   exactly as it would be for a force.
+
+   Answers `{:claimed attempt pending}` when this process won, where `pending`
+   is the `{:pending thunk recipe}` state the claim replaced — the halt path
+   hands it back through `release_recipe`. Answers nil when there is nothing to
+   claim: no recipe, a cell already realised/claimed/failed/terminal, or one
+   that published between the peek and the compare-exchange (whose `:retry`
+   means exactly that). Either way the caller still reaches a correct answer —
+   the memo walk reads the fulfilled value, or waits on the winner.
+
+   A claim the cache ceiling refuses raises
+   `ForceError({:lazy_cache_budget_exceeded budget})` BEFORE the recipe runs:
+   the same verdict, at the same point, as the ordinary force path."
+  [l]
+  (if (lazy? l)
+    (let [resource (erlang/map_get :resource l)
+          peeked (BeamLisp.LazyMemo/peek resource)]
+      ; Positively stated for the same reason `pending_recipe` is: a pinned host
+      ; must resolve no namespace var (`not` compiles to an `Env.fetch!`).
+      (cond
+        (erlang/== :pending (erlang/element 1 peeked))
+        (let [current (BeamLisp.LazyMemo/read_versioned resource)
+              version (erlang/element 1 current)
+              state (erlang/element 2 current)]
+          (cond
+            (erlang/== version (erlang/element 2 peeked))
+            (cond
+              (and (erlang/is_tuple state)
+                   (erlang/== 3 (erlang/tuple_size state))
+                   (erlang/== :pending (erlang/element 1 state)))
+              (do
+                (BeamLisp.LazyMemo/admit!)
+                (let [budget (BeamLisp.LazyMemo/cache_budget)
+                      attempt (erlang/make_ref)
+                      running (tuple :running (erlang/self) attempt ())
+                      outcome (BeamLisp.LazyMemo/exchange_version_admitted
+                                resource version running :keep budget)]
+                  (cond
+                    (erlang/== :ok outcome) (tuple :claimed attempt state)
+                    (erlang/== :retry outcome) nil
+                    (erlang/== :over_budget outcome)
+                    (force_error (tuple :lazy_cache_budget_exceeded budget))
+                    :else (force_error :cyclic_memo))))
+              :else nil)
+            :else nil))
+        :else nil))
+    (erlang/error
+      (Elixir.FunctionClauseError/exception
+        (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+              (tuple :function :claim_recipe)
+              (tuple :arity 1))))))
+
+(defn publish_folded
+  "Publish the COMPLETE element list a fold recipe produced over the node's
+   pending head cell at `version` — the recipe's answer becomes the shared
+   answer, so a later consumer reads it instead of re-running the producer
+   (Clojure's realise-once contract). A version that moved or a would-be cycle
+   leaves the cell as it is: publishing is an optimisation of the NEXT read,
+   never needed for this fold's own answer.
+
+   THE PUBLICATION IS ADMITTED (PLAN-154 B). The completed list is the fold
+   path's whole retained cost, so it is reserved against the cache ceiling
+   atomically with the commit — bypassing the gate here is what let a fold
+   succeed under a budget under which the equivalent force was refused.
+
+   UNCLAIMED, AND NO LONGER THE FOLD PATH. A publication at a version the caller
+   read is not an OWNERSHIP claim: two folds could both read the pending version
+   and both run the producer, and a refusal leaves the node `:pending` for the
+   next consumer to recompute. The reducing consumers therefore go through
+   `claim_recipe` + `complete_attempt`, which claim the cell first and turn a
+   refusal into the terminal budget state. This door stays because the pinned
+   ABI pins it (`pinned-abi-surface`), and a direct caller still gets the exact
+   versioned CAS and the admitted refusal.
+
+   Answers `:ok`, `:retry` or `:cycle`, and raises `ForceError` on refusal."
+  [l version elems]
+  (let [state (tuple :completed (cond (erlang/== elems ()) nil :else elems))
+        budget (BeamLisp.LazyMemo/cache_budget)
+        answer (BeamLisp.LazyMemo/exchange_version_admitted
+                 (erlang/map_get :resource l) version state
+                 (attempt_deps state) budget)]
+    (cond
+      (erlang/== :over_budget answer)
+      (force_error (tuple :lazy_cache_budget_exceeded budget))
+      :else answer)))
+
+; ── the force protocol ───────────────────────────────────────────────────────
+;
+; INTERNAL, AND TOP LEVEL FOR A MEASURED REASON. A call through a local closure
+; is an INDIRECT call, and on this host an indirect call costs up to ten times a
+; direct one. `force/1` runs on every realised element, so its whole protocol
+; lives at top level — the recalled module's own private names, one level up —
+; and the dispatch between them is a direct call.
+;
+; `again` is the caller's FRESH REFERENCE: a term minted inside this call, so no
+; user value can equal it. That is how a helper says "the cell moved under me,
+; re-dispatch" without a sentinel a user term could be mistaken for.
+
+(defn force_error
+  "INTERNAL: the refusal every force failure is reported as."
+  [reason]
+  (erlang/error (BeamLisp.LazySeq.ForceError/exception reason)))
+
+(defn return_outcome
+  "INTERNAL: peel an attempt outcome — the value, the evaluator's own failure
+   replayed with `erlang:raise/3`, or the terminal reason."
+  [outcome]
+  (cond
+    (erlang/== :completed (erlang/element 1 outcome))
+      (erlang/element 2 outcome)
+
+    (erlang/== :failed (erlang/element 1 outcome))
+      (erlang/apply :erlang :raise
+        (list (erlang/element 2 outcome)
+              (erlang/element 3 outcome)
+              (erlang/element 4 outcome)))
+
+    :else (force_error (erlang/element 2 outcome))))
+
+(defn attempt_outcome
+  "INTERNAL: a CELL state as the OUTCOME a waiter replays. The two differ for a
+   failure: the cell keeps the recipe so a retry can run it, the outcome is the
+   class, the unnormalized reason and the raw stack."
+  [state]
+  (cond
+    (erlang/== :failed (erlang/element 1 state))
+      (tuple :failed (erlang/element 3 state)
+             (erlang/element 4 state) (erlang/element 5 state))
+    :else state))
+
+(defn attempt_deps
+  "INTERNAL: the edge policy for publishing `state` — `:keep` for a terminal
+   state (it reaches nothing new), the state's own walk otherwise, which the NIF
+   UNIONS with the cell's existing edges."
+  [state]
+  (cond
+    (erlang/== :terminal (erlang/element 1 state)) :keep
+    :else (BeamLisp.LazyMemo/dependencies state)))
+
+(defn attempt_owner?
+  "INTERNAL: is `state` the running attempt `attempt` owned by `owner`?"
+  [state attempt owner]
+  (and (erlang/is_tuple state)
+       (erlang/== :running (erlang/element 1 state))
+       (erlang/== owner (erlang/element 2 state))
+       (erlang/== attempt (erlang/element 3 state))))
+
+(defn attempt_notifications
+  "INTERNAL: one `{:lazy_attempt, identity, attempt, outcome}` per waiter. No
+   waiters is the common case and answers without minting an identity. `outcome`
+   is the attempt's outcome — or `:redispatch`, the halt release's instruction to
+   re-read a cell that is claimable again."
+  [resource attempt waiters outcome]
+  (cond
+    (erlang/== waiters ()) ()
+    :else
+    (let [identity (BeamLisp.LazyMemo/id resource)]
+      (Enum/map waiters
+        (fn [w] (tuple w (tuple :lazy_attempt identity attempt outcome)))))))
+
+(defn publish_attempt
+  "INTERNAL: publish `state` over the attempt this process owns, waking every
+   registered waiter with the outcome. Returns the OUTCOME; the caller peels it
+   with `return_outcome`.
+
+   An evaluator cannot be interrupted between publication and notification: both
+   are one native operation, so a waiter that arrives after a successful publish
+   still reads its exact answer.
+
+   ADMITTED (PLAN-154 B): running → completed/failed can GROW the cell, so the
+   publication reserves its growth atomically against the cache ceiling. A
+   REFUSAL MUST NOT STRAND THE ATTEMPT — the owner holds a running cell and may
+   have registered waiters — so the refusal is turned into a TERMINAL
+   `{:lazy_cache_budget_exceeded budget}` state instead: a constant-size control
+   state replacing the constant-size running one, which grows nothing, is
+   admitted at any budget, and wakes every waiter with the same reason the owner
+   replays. The budget refusal is therefore terminal for the cell: it produced
+   no value, and a later force fails fast with the same reason rather than
+   re-running a producer that already ran."
+  [l attempt state]
+  (let [budget (BeamLisp.LazyMemo/cache_budget)
+        resource (erlang/map_get :resource l)
+        current (BeamLisp.LazyMemo/read_versioned resource)
+        version (erlang/element 1 current)
+        cell (erlang/element 2 current)]
+    (cond
+      (attempt_owner? cell attempt (erlang/self))
+      (let [waiters (erlang/element 4 cell)
+            outcome (attempt_outcome state)
+            outgoing (BeamLisp.LazyMemo/exchange_version_admitted
+                       resource version state (attempt_deps state)
+                       (attempt_notifications resource attempt waiters outcome)
+                       budget)]
+        (cond
+          (erlang/== :ok outgoing) outcome
+          (erlang/== :retry outgoing) (publish_attempt l attempt state)
+          (erlang/== :over_budget outgoing)
+            (publish_attempt l attempt
+              (tuple :terminal (tuple :lazy_cache_budget_exceeded budget)))
+          :else (publish_attempt l attempt (tuple :terminal :cyclic_memo))))
+
+      (and (erlang/is_tuple cell) (erlang/== :terminal (erlang/element 1 cell)))
+      cell
+
+      :else (force_error (tuple :stale_force_owner attempt)))))
+
+(defn evaluate_attempt
+  "INTERNAL: run the recipe and publish what it produced — its value, or the
+   failure `catch-raw` recorded bit for bit."
+  [l attempt thunk]
+  (return_outcome
+    (publish_attempt l attempt
+      (try
+        (tuple :completed (erlang/apply thunk (list)))
+        (catch-raw [kind reason stack]
+          (tuple :failed thunk kind reason stack))))))
+
+(defn capture_attempt
+  "INTERNAL: run `thunk` and answer `{:ok value}` or
+   `{:failed kind reason stack}`.
+
+   The failure is captured with `catch-raw`, NOT a plain `catch`: a cell that
+   must REPLAY a failure has to keep the class atom, the UNNORMALIZED reason and
+   the raw frame list, and a plain `catch` rewrites exactly those (`:error`
+   becomes an exception struct, a non-exception throw an ExInfo). This is the
+   one seam the fold path needs from the branch's clause, so a fold's failure is
+   recorded and re-raised bit for bit."
+  [thunk]
+  (try
+    (tuple :ok (erlang/apply thunk (list)))
+    (catch-raw [kind reason stack]
+      (tuple :failed kind reason stack))))
+
+(defn complete_attempt
+  "INTERNAL: publish the COMPLETE element list a claimed fold produced as the
+   node's shared `{:completed …}` answer, waking every waiter with it.
+
+   Answers `:ok`; a publication the ceiling refuses RAISES the refusal, after
+   `publish_attempt` has left the cell in the constant-size TERMINAL budget
+   state — so a later read fails fast with the same reason instead of re-running
+   a producer that already ran. The empty list publishes as nil, exactly as
+   `publish_folded` did."
+  [l attempt elems]
+  (let [outcome (publish_attempt l attempt
+                  (tuple :completed (cond (erlang/== elems ()) nil :else elems)))]
+    (cond
+      (erlang/== :completed (erlang/element 1 outcome)) :ok
+      :else (return_outcome outcome))))
+
+(defn fail_attempt
+  "INTERNAL: publish a claimed fold's FAILURE — the node's ORIGINAL producer
+   `thunk` with the class, unnormalized reason and raw frames `catch-raw`
+   recorded — and re-raise it to this caller.
+
+   Every registered waiter is woken with the same `{:failed kind reason stack}`
+   outcome and replays it, so one consumer's failure reaches all of them
+   unchanged; the cell keeps the producer thunk, so a later force RETRIES it,
+   which is the recalled retryable-failure contract. Never returns: the raise IS
+   the fold's own failure."
+  [l attempt thunk kind reason stack]
+  (return_outcome
+    (publish_attempt l attempt (tuple :failed thunk kind reason stack))))
+
+(defn release_recipe
+  "INTERNAL: hand a claimed fold cell back UNPUBLISHED — the halt path: the
+   recipe stopped at a `Reduced`, so only a prefix exists and nothing may be
+   published as the node's answer.
+
+   `pending` is the state `claim_recipe` replaced; restoring it is what keeps
+   `pending?` — and a later full fold — working exactly as before the claim.
+   Every registered waiter is woken with `:redispatch`: the cell is claimable
+   again, so a waiter re-reads it and claims it itself instead of waiting for an
+   answer that is not coming. `wait_for_attempt` maps that outcome onto its
+   caller's fresh re-dispatch reference.
+
+   THE RESTORE IS ADMITTED. Restoring a measured `{:pending thunk recipe}` over
+   the constant-size running state GROWS the cell, so it is reserved like any
+   other publication; it undoes a claim whose own commit had released exactly
+   those bytes, so the claim/release pair is retained-neutral. A refusal turns
+   the cell into the constant-size TERMINAL budget state instead (the same
+   un-strand `publish_attempt` uses) rather than stranding every future consumer
+   on a `:running` cell whose owner has already departed."
+  [l attempt pending]
+  (let [budget (BeamLisp.LazyMemo/cache_budget)
+        resource (erlang/map_get :resource l)
+        current (BeamLisp.LazyMemo/read_versioned resource)
+        version (erlang/element 1 current)
+        cell (erlang/element 2 current)]
+    (cond
+      (attempt_owner? cell attempt (erlang/self))
+      (let [outgoing (BeamLisp.LazyMemo/exchange_version_admitted
+                       resource version pending :keep
+                       (attempt_notifications resource attempt
+                                              (erlang/element 4 cell) :redispatch)
+                       budget)]
+        (cond
+          (erlang/== :ok outgoing) :ok
+          (erlang/== :retry outgoing) (release_recipe l attempt pending)
+          (erlang/== :over_budget outgoing)
+          (publish_attempt l attempt (tuple :terminal (tuple :lazy_cache_budget_exceeded budget)))
+          :else (publish_attempt l attempt (tuple :terminal :cyclic_memo))))
+
+      (and (erlang/is_tuple cell) (erlang/== :terminal (erlang/element 1 cell)))
+      cell
+
+      :else (force_error (tuple :stale_force_owner attempt)))))
+
+(defn claim_attempt
+  "INTERNAL: claim the pending (or failed) state at `version` and run it.
+
+   The claim swaps the VERSION and keeps the edges: the cell was created with the
+   recipe's own captured resources as its edges, so `:keep` is exact — no
+   dependency walk, no graph lock, no term comparison. The running state does not
+   carry the recipe: its owner is executing it.
+
+   `admit!` refuses BEFORE the thunk runs; the claim publication itself is
+   admitted too (PLAN-154 B), because pending → running can GROW the cell (a
+   small recipe against the constant 64-byte running state) — so a refusal here
+   still happens before any side effect."
+  [l version thunk again]
+  (BeamLisp.LazyMemo/admit!)
+  (let [budget (BeamLisp.LazyMemo/cache_budget)
+        resource (erlang/map_get :resource l)
+        attempt (erlang/make_ref)
+        running (tuple :running (erlang/self) attempt ())
+        outcome (BeamLisp.LazyMemo/exchange_version_admitted
+                  resource version running :keep budget)]
+    (cond
+      (erlang/== :ok outcome) (evaluate_attempt l attempt thunk)
+      (erlang/== :retry outcome) again
+      (erlang/== :over_budget outcome)
+        (force_error (tuple :lazy_cache_budget_exceeded budget))
+      :else (force_error :cyclic_memo))))
+
+(defn owner_lost
+  "INTERNAL: the evaluator is gone. Publish a TERMINAL reply to every registered
+   waiter so no waiter hangs on a dead owner; the reply rides the same native
+   operation as the commit.
+
+   NOT ADMITTED, deliberately: running → terminal replaces one constant 64-byte
+   control state with another, so it grows NOTHING (see `estimate_bytes/1`) and
+   admission could never refuse it. Gating it would only add a way for a waiter
+   to be stranded by a resource verdict."
+  [l owner attempt]
+  (let [resource (erlang/map_get :resource l)
+        current (BeamLisp.LazyMemo/read_versioned resource)
+        version (erlang/element 1 current)
+        cell (erlang/element 2 current)]
+    (cond
+      (attempt_owner? cell attempt owner)
+      (let [terminal (tuple :terminal (tuple :force_owner_lost owner attempt))
+            outgoing (BeamLisp.LazyMemo/exchange_version
+                       resource version terminal :keep
+                       (attempt_notifications resource attempt
+                                              (erlang/element 4 cell) terminal))]
+        (cond
+          (erlang/== :ok outgoing) :ok
+          (erlang/== :retry outgoing) (owner_lost l owner attempt)
+          :else (force_error :cyclic_memo)))
+      :else :ok)))
+
+(defn receive_attempt
+  "INTERNAL: wait for our attempt's reply, or for the owner's death.
+
+   A receive clause's guard is a BARE `:when`, and its guard vocabulary is the
+   language's own (`==`, `and`, …), never an `erlang/`-prefixed call. Both
+   clauses are guarded, which is what keeps receive SELECTIVE: a message that is
+   neither our attempt's reply nor our monitor's DOWN is left in the mailbox,
+   exactly as the recalled module's pinned patterns did.
+
+   Answers the RAW outcome; `wait_for_attempt` peels it, because one outcome —
+   `:redispatch` — is not a value but an instruction to re-read the cell."
+  [l identity owner attempt monitor]
+  (receive
+    [:lazy_attempt i a outcome]
+    :when (and (== i identity) (== a attempt))
+    (do (Process/demonitor monitor (list :flush))
+        outcome)
+
+    [:DOWN ref :process _own _reason]
+    :when (== ref monitor)
+    (do (owner_lost l owner attempt)
+        ; A commit and its notifications are one native operation, so if the
+        ; commit won before owner death its exact reply is still in flight —
+        ; read it. Otherwise `owner-lost` just published ours.
+        (receive
+          [:lazy_attempt i2 a2 outcome2]
+          :when (and (== i2 identity) (== a2 attempt))
+          outcome2))))
+
+(defn wait_for_attempt
+  "INTERNAL: join a running attempt — register as a waiter with a version CAS
+   (edges kept: a waiter is not a dependency), monitor the owner, and wait.
+
+   NOT ADMITTED, for the same reason as `owner_lost`: running → running replaces
+   one constant 64-byte control state with another (the waiter list is charged
+   the constant, not its length), so it grows nothing and a refusal could only
+   strand the waiter."
+  [l owner attempt again]
+  (let [resource (erlang/map_get :resource l)
+        identity (BeamLisp.LazyMemo/id resource)
+        monitor (Process/monitor owner)
+        current (BeamLisp.LazyMemo/read_versioned resource)
+        version (erlang/element 1 current)
+        cell (erlang/element 2 current)]
+    (cond
+      (attempt_owner? cell attempt owner)
+      (let [outcome (BeamLisp.LazyMemo/exchange_version
+                      resource version
+                      (tuple :running owner attempt
+                             (erlang/++ (list (erlang/self))
+                                        (erlang/element 4 cell)))
+                      :keep)]
+        (cond
+          (erlang/== :ok outcome)
+            (let [reply (receive_attempt l identity owner attempt monitor)]
+              ; a released (halted) fold puts the cell back in play; the waiter
+              ; re-dispatches instead of waiting for an answer that is not coming
+              (cond (erlang/== reply :redispatch) again
+                    :else (return_outcome reply)))
+          (erlang/== :retry outcome)
+            (do (Process/demonitor monitor (list :flush)) again)
+          :else
+            (do (Process/demonitor monitor (list :flush))
+                (force_error :cyclic_memo))))
+      :else (do (Process/demonitor monitor (list :flush)) again))))
+
+(defn force_state
+  "INTERNAL: the force state machine — a TOP-LEVEL self-recursion, so every
+   re-dispatch after a lost race is a direct call. `again` is the caller's fresh
+   reference (see the section header)."
+  [l again]
+  (let [resource (erlang/map_get :resource l)
+        current (BeamLisp.LazyMemo/read_versioned resource)
+        version (erlang/element 1 current)
+        state (erlang/element 2 current)
+        tag (cond (erlang/is_tuple state) (erlang/element 1 state) :else state)]
+    (cond
+      (erlang/== tag :completed) (erlang/element 2 state)
+      (erlang/== tag :terminal) (return_outcome state)
+
+      (erlang/== tag :running)
+      (cond
+        (erlang/== (erlang/element 2 state) (erlang/self))
+          (return_outcome (publish_attempt l (erlang/element 3 state)
+                                           (tuple :terminal :recursive_force)))
+        :else
+          (let [r (wait_for_attempt l (erlang/element 2 state) (erlang/element 3 state) again)]
+            (cond (erlang/== r again) (force_state l again) :else r)))
+
+      (erlang/== tag :pending)
+      (let [r (claim_attempt l version (erlang/element 2 state) again)]
+        (cond (erlang/== r again) (force_state l again) :else r))
+
+      (erlang/== tag :failed)
+      (let [r (claim_attempt l version (erlang/element 2 state) again)]
+        (cond (erlang/== r again) (force_state l again) :else r))
+
+      :else (force_error (tuple :stale_force_owner state)))))
+
+(defn force
+  "Force a node to its value: the shared answer if one is published, the
+   evaluator's own failure replayed if the attempt failed, `ForceError`
+   otherwise. Concurrent forces of one node share one attempt; the waiter is told
+   the exact outcome, and the owner's death is terminal.
+
+   Every transition is a VERSION compare-and-swap, and the `deps_mode` it passes
+   is the point: `:keep` for a claim, a waiter registration and a terminal state
+   (they reach nothing the cell did not already hold, so no dependency is walked
+   and no cycle is checked), and the state's own walk for a `{:completed v}` or
+   `{:failed …}`, which the NIF UNIONS with the cell's existing edges."
+  [l]
+  (if (lazy? l)
+    (force_state l (erlang/make_ref))
+    (erlang/error
+      (Elixir.FunctionClauseError/exception
+        (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+              (tuple :function :force)
+              (tuple :arity 1))))))
+
+(defn memo_state
+  "The cell's state in the LOGICAL shape callers use. `{:pending thunk}`,
+   `{:completed value}`, `{:failed thunk kind reason stack}` and
+   `{:terminal reason}` are the cell's own states, returned as they are. A
+   running cell answers `{:running nil owner attempt waiters}`: the shape is the
+   recalled one — a waiter list, an owner, an attempt — but the thunk slot is
+   `nil` because the recipe is on the owner's stack by then, not on the cell.
+   `Deferred`'s `realized?` reads only the `:completed` tag."
+  [l]
+  (if (lazy? l)
+    (let [state (BeamLisp.LazyMemo/read (erlang/map_get :resource l))]
+      (if (and (erlang/is_tuple state)
+               (erlang/== :running (erlang/element 1 state)))
+        (tuple :running nil (erlang/element 2 state)
+               (erlang/element 3 state) (erlang/element 4 state))
+        state))
+    (erlang/error
+      (Elixir.FunctionClauseError/exception
+        (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+              (tuple :function :memo_state)
+              (tuple :arity 1))))))
+
+; ── realization ──────────────────────────────────────────────────────────────
+
+(defn normalize_cell
+  "INTERNAL: nil for the empty list, else the list itself — the realized value
+   an empty or non-empty collection normalizes to."
+  [xs]
+  (cond (erlang/== xs ()) nil :else xs))
+
+(defn tagged?
+  "INTERNAL: a map tagged with the struct `name` (`:__struct__` is the tag)."
+  [v name]
+  (and (erlang/is_map v)
+       (erlang/== name (maps/get :__struct__ v nil))))
+
+(defn realize_step
+  "INTERNAL: one realize step — force, then normalize the head. TOP LEVEL so a
+   nested lazy chain (`(lazy-seq (concat …))` hands back another node) is peeled
+   by a direct self-call instead of an indirect one."
+  [node depth]
+  (if (erlang/> depth 100000)
+    (erlang/error
+      (Elixir.RuntimeError/exception
+        (erlang/iolist_to_binary
+          (list "LazySeq.realize: thunk chain "
+                (Integer/to_string depth)
+                " deep without a head — a self-referential lazy seq never produces a cell; it would hang forever"))))
+    (let [v (force node)]
+      (cond
+        (erlang/== v ()) nil
+
+        (tagged? v :"Elixir.BeamLisp.Vector") (normalize_cell (BeamLisp.Vector/to_list v))
+
+        (tagged? v :"Elixir.BeamLisp.Set") (normalize_cell (BeamLisp.Set/to_list v))
+
+        (lazy? v) (realize_step v (erlang/+ depth 1))
+
+        (tagged? v :"Elixir.BeamLisp.SeqCursor") (BeamLisp.SeqCursor/cell v)
+
+        :else v))))
+
+(defn realize
+  "Force a node and normalize to a realized cell: `nil` or `[head | tail]`.
+
+   A lazy-seq body may hand back any seqable rather than a cons cell — jank
+   writes `(lazy-seq c1)` around a bare collection — so normalize it here, at the
+   one place a thunk's value enters the walk. The invariant every walk relies on
+   is: forcing a node yields `nil` or a `[h | t]` cell, never a bare LazySeq —
+   and Clojure `lazy-seq` bodies routinely return another seq. Only the HEAD is
+   normalized; the tail stays lazy, so an infinite seq still realizes one cell at
+   a time."
+  [l]
+  (if (lazy? l)
+    (realize_step l 0)
+    (erlang/error
+      (Elixir.FunctionClauseError/exception
+        (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+              (tuple :function :realize)
+              (tuple :arity 1))))))
+
+(defn cell
+  "Normalize any seqable to a realized cell: `nil`, a `[head | tail]` list
+   (whose tail may be a lazy node), or, for non-seqables, the value itself.
+   A string is seqable (its graphemes); anything else Enumerable becomes a
+   cell, and a non-seqable passes through. The one chokepoint every seq walk
+   (forcing, `first`, `rest`, `take`, `count`, `Enum`) goes through."
+  [x]
+  (cond
+    (erlang/== x nil) nil
+    (erlang/== x ()) nil
+    (lazy? x) (realize x)
+    (tagged? x :"Elixir.BeamLisp.SeqCursor") (BeamLisp.SeqCursor/cell x)
+    (erlang/is_list x) x
+    (tagged? x :"Elixir.BeamLisp.Vector") (normalize_cell (BeamLisp.Vector/to_list x))
+    (tagged? x :"Elixir.BeamLisp.Set") (normalize_cell (BeamLisp.Set/to_list x))
+    (erlang/is_binary x) (normalize_cell (String/graphemes x))
+    :else (let [impl (Enumerable/impl_for x)]
+            (if (erlang/== impl nil) x (normalize_cell (Enum/to_list x))))))
+
+(defn to_list
+  "Fully realize into a proper list. Iterative, so a 100k `doall` cannot blow
+   the stack."
+  [lazy]
+  (let [step
+        (fn step [c acc]
+          (if (erlang/== c nil)
+            (Enum/reverse acc)
+            (step (cell (erlang/tl c)) (BeamLisp.Ns.Rt/raw-cons (erlang/hd c) acc))))]
+    (step (cell lazy) ())))
+
+(defn prefix
+  "Realize up to `n` elements, iteratively. `n` must be an integer."
+  [lazy n]
+  (if (erlang/is_integer n)
+    (let [step
+          (fn step [c k acc]
+            (cond
+              (<= k 0) (Enum/reverse acc)
+              (erlang/== c nil) (Enum/reverse acc)
+              :else (step (cell (erlang/tl c)) (erlang/- k 1)
+                          (BeamLisp.Ns.Rt/raw-cons (erlang/hd c) acc))))]
+      (step (cell lazy) n ()))
+    (erlang/error
+      (Elixir.FunctionClauseError/exception
+        (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+              (tuple :function :prefix)
+              (tuple :arity 2))))))
+
+(defn sample
+  "`{taken, truncated?}`: sample up to `n` elements, flag if more remain."
+  [lazy n]
+  (let [taken (prefix lazy (erlang/+ n 1))]
+    (if (erlang/> (erlang/length taken) n)
+      (tuple (Enum/take taken n) true)
+      (tuple taken false))))
+
+(defn count
+  "Element count, forcing the whole seq, iteratively."
+  [lazy]
+  (let [step
+        (fn step [c acc]
+          (if (erlang/== c nil) acc (step (cell (erlang/tl c)) (erlang/+ acc 1))))]
+    (step (cell lazy) 0)))
+
+(defn nth
+  "Element at `i`, or `nil`. `i` must be a non-negative integer."
+  [lazy i]
+  (if (and (erlang/is_integer i) (erlang/>= i 0))
+    (let [step
+          (fn step [c k]
+            (cond
+              (erlang/== c nil) nil
+              (erlang/== k 0) (erlang/hd c)
+              :else (step (cell (erlang/tl c)) (erlang/- k 1))))]
+      (step (cell lazy) i))
+    (erlang/error
+      (Elixir.FunctionClauseError/exception
+        (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+              (tuple :function :nth)
+              (tuple :arity 2))))))
+
+(defn run
+  "Force the whole seq for side effects, discarding elements."
+  [lazy]
+  (let [step (fn step [c] (if (erlang/== c nil) :ok (step (cell (erlang/tl c)))))]
+    (step (cell lazy))))

@@ -29,7 +29,7 @@ older, port-level surface that sits beneath it.
 | L6 | The oracle as an effect: `ask` performs it, `with-oracle` handles it (`pool-handler`, `table`, `deny`). | `priv/lib/oracle.bl` |
 | L7 | Fan-out: `ask-all` runs N obligations over the pool's N solvers, the lease registry is the backpressure. | `priv/lib/oracle.bl`, `priv/std/z3pool.bl` |
 
-Under all of it: `lib/beam_lisp/z3_ledger.ex` — the `:counters` rollup and the
+Under all of it: `priv/lib/system/ledger.bl` — the `:counters` rollup and the
 process-dictionary trail that record *who answered, in which fragment, at what
 cost* — with the language's view of it in `priv/lib/system/decide.bl`.
 

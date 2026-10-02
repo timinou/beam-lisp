@@ -1,0 +1,217 @@
+; test/bl/compiler_retention_port_test.bl — compiler descriptor retention, in
+; beam-lisp.
+;
+; Port of the retired probe !tasks/artifacts/compiler-retention-probe.exs (this
+; file replaces it), which pinned three contracts of the compiler's FINITE
+; traversal after the eager cutover (PLAN-090):
+;
+;   1. REPEATED DESCRIPTOR BYTES. Compiling the same form again emits the
+;      byte-identical beam, so the descriptor's sha256 is a function of the
+;      source, not of the fresh-name counter or of compile order.
+;
+;   2. ZERO LAZY MEMO REGISTRATIONS. Compiling a finite form (no deferred
+;      input) never calls `BeamLisp.LazySeq.new/1`; eager helpers carry the
+;      traversal. The pre-cutover baseline registered 1,630 handles per
+;      10-unit batch for the small fixture and 13,910 for the 64-binding one;
+;      the eager compiler registers zero.
+;
+;   3. NO CODE OR MEMORY GROWTH. The batches load and purge no modules, the
+;      native memo accumulates no handle pending reclamation, and post-GC
+;      process memory stays bounded across batches.
+;
+; HOW THE OBSERVATION IS MADE, AND WHY NOT cprof
+;
+; The probe counted registrations with `:cprof` on `BeamLisp.LazySeq.new/1`.
+; `cprof` is VM-global and pulls its own tracing modules in; here the count
+; comes from `:erlang.trace_pattern/3` + `:erlang.trace(self(), :call, …)` —
+; the probe's own `trace_lazy_sources/1` technique. The trace flag is set on
+; the TEST process alone, so a concurrent `bl test --async` file cannot inflate
+; the count; only the pattern table is global, and `count-lazy-new` restores it
+; in a `finally`. A positive control (tracing a real `LazySeq.new`) proves the
+; probe is live, never vacuous.
+;
+; The 64 chained bindings of the large fixture are what force a compiler that
+; traverses its input lazily to register thousands of handles; ten units of it
+; is the leak-sized sample the probe used. The emitter still allocates
+; short-lived native memo REFS (the `op_new_fast` counter, ~12 per unit), but
+; those are not `LazySeq` nodes, they are reclaimed (`pending_reclaims` stays
+; flat), and the profile reports them rather than asserting on them. The
+; probe's per-batch profile is kept for manual capture behind
+; `BL_RETENTION_PROFILE=1` (`profile!`), not in the assertions.
+;
+; Run: bl test test/bl/compiler_retention_port_test.bl
+
+(ns compiler-retention-port.test
+  (:require [vm.generation :as gen]))
+
+; ── fixtures ────────────────────────────────────────────────────────────────
+
+(def ^:private ten
+  "Ten unit iterations as a PLAIN Erlang list. `(range 10)` would build a
+   `BeamLisp.LazySeq` and pollute the very counter the registration test reads."
+  (list 1 2 3 4 5 6 7 8 9 10))
+
+(def ^:private batches (list 1 2 3))
+
+(def ^:private small-source
+  "(fn [x] (let [y (+ x 1)] (if (> y 3) [y x] [x y])))")
+
+(defn- chained-binding
+  "The i-th `v<i> (+ v<i-1> 1)` binding; `v0` adds `x`."
+  [i]
+  (let [prev (if (zero? i) "x" (str "v" (dec i)))]
+    (str "v" i " (+ " prev " 1)")))
+
+(def ^:private large-source
+  (str "(fn [x] (let ["
+       (Enum/map_join (range 64) " " (fn [i] (chained-binding i)))
+       "] (if (> v63 3) [v63 x] [x v63])))"))
+
+(def ^:private small-form (BeamLisp.Reader/read_one small-source))
+(def ^:private large-form (BeamLisp.Reader/read_one large-source))
+
+(defn- new-env [] (BeamLisp.Compiler/new_env "compiler-retention-probe"))
+
+; ── the unit under observation ──────────────────────────────────────────────
+
+(defn- unit-hash
+  "Compile `form` at `env` and answer the sha256 of the emitted descriptor
+   bytes — the probe's `unit/0`."
+  [form env]
+  (BeamLisp.Compiler/reset_fresh!)
+  (let [node (BeamLisp.Compiler/compile form env)
+        descriptor (BeamLisp.Emit/descriptor_for
+                     :bl_compiler_retention_probe
+                     (list (BeamLisp.Emit/function_clause :run node)))
+        pair (BeamLisp.Emit/compile_descriptor descriptor)]
+    (crypto/hash :sha256 (elem pair 1))))
+
+(defn- hashes-for
+  "Ten consecutive `unit-hash` results for `form`, in order."
+  [form env]
+  (reduce (fn [acc _] (conj acc (unit-hash form env))) [] ten))
+
+; ── the lazy-registration probe ─────────────────────────────────────────────
+
+(defn- drain
+  "Count `:call` trace messages until `:finish`, then report the total."
+  [parent counts]
+  (receive
+    [:trace _pid _kind _mfa] (drain parent (inc counts))
+    :finish (erlang/send parent (tuple :done counts))
+    _ (drain parent counts)))
+
+(defn- count-lazy-new
+  "Calls to `BeamLisp.LazySeq.new/1` made by THIS process while `thunk` runs."
+  [thunk]
+  (let [parent (erlang/self)
+        tracer (erlang/spawn (fn [] (drain parent 0)))
+        pattern (tuple :Elixir.BeamLisp.LazySeq :new 1)]
+    (erlang/trace_pattern pattern true (list))
+    (erlang/trace (erlang/self) true (list :call (tuple :tracer tracer)))
+    (try
+      (thunk)
+      (finally
+        (erlang/trace (erlang/self) false (list :call))
+        (erlang/trace_pattern pattern false (list))
+        ; Wait until every trace message has reached the tracer, so `:finish`
+        ; can never overtake a counted call.
+        (erlang/trace_delivered (erlang/self))
+        (receive [:trace_delivered _ref _] nil (after 5000 nil))
+        (erlang/send tracer :finish)))
+    (receive [:done n] n (after 5000 -1))))
+
+(defn- profile!
+  "The probe's per-batch `IO.inspect`, kept for manual capture: prints only when
+   `BL_RETENTION_PROFILE=1`."
+  [label data]
+  (when (= "1" (System/get_env "BL_RETENTION_PROFILE"))
+    (println "COMPILER_RETENTION" label data)))
+
+; ── contracts ───────────────────────────────────────────────────────────────
+
+(deftest repeated-descriptor-bytes-are-identical
+  (testing "ten recompiles of one source emit the byte-identical beam"
+    (let [env (new-env)
+          small-expected (unit-hash small-form env)
+          large-expected (unit-hash large-form env)
+          small-hashes (hashes-for small-form env)
+          large-hashes (hashes-for large-form env)]
+      (is (= 10 (count small-hashes)))
+      (is (every? (fn [h] (= h small-expected)) small-hashes)
+          "small: a repeated compile changed the emitted bytes")
+      (is (every? (fn [h] (= h large-expected)) large-hashes)
+          "large: a repeated compile changed the emitted bytes")
+      (profile! "hashes" {:small (Base/encode16 small-expected)
+                          :large (Base/encode16 large-expected)}))))
+
+(deftest finite-forms-register-no-lazy-memo-handles
+  (let [env (new-env)]
+    (unit-hash small-form env) ; warm the compiler before the traced region
+    (testing "a real LazySeq.new IS counted, so the probe is live"
+      (is (= 1 (count-lazy-new (fn [] (BeamLisp.LazySeq/new (fn [] (list))))))))
+    (testing "ten finite units register zero memo handles"
+      (is (zero? (count-lazy-new (fn [] (hashes-for small-form env))))
+          "small: the compiler created lazy memo handles")
+      (is (zero? (count-lazy-new (fn [] (hashes-for large-form env))))
+          "large: the compiler created lazy memo handles"))))
+
+(deftest repeated-compilation-loads-no-code-and-grows-no-memory
+  (let [env (new-env)]
+    (unit-hash small-form env) ; warm both fixtures and the emit path
+    (unit-hash large-form env)
+    (let [memo-before (BeamLisp.LazyMemo/stats)
+          base-memory (do (erlang/garbage_collect)
+                          (elem (Process/info (erlang/self) :memory) 1))
+          batch-data
+          (reduce
+            (fn [acc _]
+              (let [before (count (code/all_loaded))]
+                (hashes-for small-form env)
+                (hashes-for large-form env)
+                (erlang/garbage_collect)
+                (conj acc
+                      {:modules (- (count (code/all_loaded)) before)
+                       :memory (- (elem (Process/info (erlang/self) :memory) 1)
+                                  base-memory)})))
+            [] batches)
+          memo-after (BeamLisp.LazyMemo/stats)]
+      (testing "the batches load and purge no modules"
+        (is (every? (fn [b] (zero? (:modules b))) batch-data)
+            (str "loaded-module delta per batch: "
+                 (mapv (fn [b] (:modules b)) batch-data))))
+      (testing "post-GC process memory stays bounded across batches"
+        ; The probe grew ~3 KB per batch. 8 MB is a leak-sized ceiling, not a
+        ; tight fit: it fails only on unbounded growth, never on allocator noise.
+        (is (every? (fn [b] (< (:memory b) 8388608)) batch-data)
+            (str "post-GC growth per batch: "
+                 (mapv (fn [b] (:memory b)) batch-data))))
+      (testing "the batches leave no memo handle pending reclamation"
+        ; `pending_reclaims` is GLOBAL: a warm ward env can carry unreachable
+        ; handles into the test. The leak direction is the invariant — the
+        ; compiler's zero-registration batches add nothing pending. Whether the
+        ; counter is zero here depends on what ran before, so it is reported,
+        ; never pinned to zero.
+        (is (<= (:pending_reclaims memo-after) (:pending_reclaims memo-before))
+            (str "pending_reclaims " (:pending_reclaims memo-before)
+                 " -> " (:pending_reclaims memo-after))))
+      (profile! "batches"
+                {:batches batch-data
+                 :memo-before (select-keys memo-before
+                                           (list :pending_reclaims :live_cells
+                                                 :retained_bytes :op_new :op_new_fast))
+                 :memo-after (select-keys memo-after
+                                          (list :pending_reclaims :live_cells
+                                                :retained_bytes :op_new :op_new_fast))}))))
+
+(deftest generation-receipt-survives-the-batches
+  (testing "the loaded-code identity receipt is still complete after the batches"
+    (let [env (new-env)]
+      (hashes-for large-form env)
+      (let [r (gen/receipt)]
+        (is (contains? r :source))
+        (is (contains? r :seed))
+        (is (contains? r :loaded))
+        (is (erlang/is_binary (get (:seed r) :manifest_sha256)))))))
+
+(run-tests)

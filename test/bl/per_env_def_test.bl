@@ -1,0 +1,254 @@
+; per_env_def_test.bl — `^:per-env` defs, ported from
+; test/beam_lisp/per_env_def_test.exs.
+;
+; A stateful `def` marked `^:per-env` materializes its OWN instance in each
+; consuming env (fork), while an un-marked def keeps one global instance. This
+; is the keystone that lets ward isolate a test file's app dependencies and
+; lets a gateway run per-tenant state in one VM.
+;
+; PLAN-060-A. The two probes that matter: (1) two sibling forks get DISTINCT
+; per-env instances but the SAME global instance; (2) it survives AOT
+; compilation (the value replays as a descriptor, not an eager intern).
+;
+; The ExUnit suite reached the AOT build through the Elixir `BeamLisp.BuildTask`
+; façade; the AOT half here calls `priv/build/build.bl`'s `run` DIRECTLY — the
+; `.bl` program the façade delegates to. `BuildTask.clean` becomes the rm_rf of
+; the isolated out dir.
+;
+; NB the ns is unique to this suite (`per-env-def.test`): every file in a ward
+; run shares one VM, so a namespace collision would merge suites.
+;
+; Run: bl test test/bl/per_env_def_test.bl
+
+(ns per-env-def.test
+  (:require [env] [build :as b]))
+
+; ── helpers ─────────────────────────────────────────────────────────────────
+
+(defn- fresh-ns
+  "A uniquely-named ns per test run so repeated runs don't collide."
+  []
+  (str "pe.src" (erlang/unique_integer (list :positive))))
+
+(defn- ev [src]
+  (env/eval src))
+
+(defn- ev-global
+  "Evaluate `src` in the :global env — the semantics the ExUnit suite used
+   implicitly: an ExUnit test process carries NO env binding, so its
+   `BeamLisp.eval` interned the source ns VM-wide. A ward file instead runs
+   inside its own isolated env (BeamLisp.TestRT/run_file_isolated), while the
+   loader that serves `(:require …)` lives at :global — a ns defined only in
+   the file's env is invisible to it, and the require comes back `namespace
+   not found`. So the port defines the source ns where the ExUnit suite did:
+   at :global (the PLAN-060 design interns a required library's descriptor at
+   :global too)."
+  [src]
+  (env/with-env :global (fn [] (env/eval src))))
+
+(defn- in-fork
+  "A fresh isolated fork that evaluates `src` and returns the value."
+  [src]
+  (env/isolated (fn [] (ev src))))
+
+(defn- define-source!
+  "The ExUnit `setup`: define a fresh ns's `shared`/`tenant` pair; return the ns."
+  []
+  (let [n (fresh-ns)]
+    (ev-global (str "(ns " n ")\n"
+                    "(def shared (atom :s))\n"
+                    "(def ^:per-env tenant (atom :t))\n"))
+    n))
+
+(defn- tenant-read
+  "The `{:shared … :tenant …}` read pair for ns `n`, as binary terms."
+  [n]
+  (str "(ns _r (:require [" n " :as p]))\n"
+       "{:shared (erlang/term_to_binary p/shared)\n"
+       " :tenant (erlang/term_to_binary p/tenant)}"))
+
+; ── source path ─────────────────────────────────────────────────────────────
+
+(deftest two-sibling-forks-share-the-global-def-but-isolate-the-per-env-def
+  (let [n (define-source!)
+        probe (tenant-read n)
+        a (in-fork probe)
+        b (in-fork probe)]
+    (is (= (:shared a) (:shared b)) "un-marked def must be ONE shared global instance")
+    (is (not= (:tenant a) (:tenant b)) "^:per-env def must be a DISTINCT instance per fork")))
+
+(deftest the-per-env-instance-is-identity-stable-within-one-fork
+  ; Two reads in the same fork must see the same instance (materialized once).
+  (let [n (define-source!)
+        same (env/isolated
+               (fn []
+                 (ev (str "(ns _r (:require [" n " :as p]))\n"
+                          "(identical? p/tenant p/tenant)"))))]
+    (is (= true same))))
+
+(deftest a-captured-worker-sees-its-parent-envs-per-env-instance
+  ; A parent fork materializes its instance, then a spawned worker BOUND to
+  ; that env must observe the SAME instance (worker runs under parent's env).
+  (let [n (define-source!)
+        parent (env/fork)]
+    (let [[pv wv]
+          (env/with-env parent
+            (fn []
+              (let [pv (ev (str "(ns _p (:require [" n " :as p]))\n"
+                                "(erlang/term_to_binary p/tenant)"))
+                    token (env/capture)
+                    me (erlang/self)]
+                (spawn
+                  (fn []
+                    (env/bind token)
+                    (let [wv (ev (str "(ns _w (:require [" n " :as p]))\n"
+                                      "(erlang/term_to_binary p/tenant)"))]
+                      (erlang/send me [:worker wv]))))
+                (let [wv (receive
+                           [:worker w] w
+                           (after 5000 :timeout))]
+                  [pv wv]))))]
+      (is (not= :timeout wv) "worker never replied")
+      (is (= pv wv) "a bound worker must see the parent env's instance"))))
+
+(deftest a-true-child-env-does-not-inherit-the-parents-materialized-instance
+  ; Parent materializes; a nested isolated CHILD must get its own instance.
+  (let [n (define-source!)
+        parent (env/fork)]
+    (let [[pv cv]
+          (env/with-env parent
+            (fn []
+              (let [pv (ev (str "(ns _p (:require [" n " :as p]))\n"
+                                "(erlang/term_to_binary p/tenant)"))
+                    cv (env/isolated
+                         (fn []
+                           (ev (str "(ns _c (:require [" n " :as p]))\n"
+                                    "(erlang/term_to_binary p/tenant)"))))]
+                [pv cv])))]
+      (is (not= pv cv) "a child env must materialize its OWN per-env instance"))))
+
+(deftest destroying-an-env-drops-its-per-env-instance-row
+  (let [n (define-source!)
+        e (env/fork)]
+    (env/with-env e (fn [] (ev (str "(ns _d (:require [" n " :as p])) p/tenant"))))
+
+    ; Instance row present before destroy, gone after.
+    (let [before (env/with-env e (fn [] (BeamLisp.Env/explain n "tenant")))]
+      (is (some (fn [row] (= :per_env_materialized_here (get row :kind))) before)))
+
+    (env/destroy e)
+
+    ; A fresh env with the same id space cannot see the old instance (it was
+    ; swept by destroy's env-prefixed select_delete).
+    (let [e2 (env/fork)
+          swept (env/with-env e2 (fn [] (BeamLisp.Env/explain n "tenant")))]
+      (is (not (some (fn [row] (= :per_env_materialized_here (get row :kind))) swept))))))
+
+(deftest redefining-a-per-env-def-rematerializes-in-an-already-live-env
+  (let [n (define-source!)
+        e (env/fork)
+        v1 (env/with-env e
+             (fn []
+               (ev (str "(ns _d (:require [" n " :as p])) "
+                        "(reset! p/tenant :first) (deref p/tenant)"))))]
+    (is (= :first v1))
+
+    ; Redefine the per-env def (new generation) — the live env must pick up the
+    ; NEW thunk on next read, not serve the stale instance.
+    (ev-global (str "(ns " n ") (def ^:per-env tenant (atom :second))"))
+
+    (let [v2 (env/with-env e
+               (fn [] (ev (str "(ns _d (:require [" n " :as p])) (deref p/tenant)"))))]
+      (is (= :second v2) "a redefined per-env def must rematerialize (generation bump)"))))
+
+; ── rejections ──────────────────────────────────────────────────────────────
+
+(defn- compile-error-of
+  "Evaluate `src`; return the `BeamLisp.CompileError` it raises, or nil."
+  [src]
+  (try
+    (do (ev src) nil)
+    (catch BeamLisp.CompileError e e)))
+
+(deftest per-env-on-a-defn-is-a-compile-error
+  (let [e (compile-error-of "(ns pe.rej1) (defn ^:per-env f [] 1)")
+        msg (if (some? e) (str (ex-message e)) "")]
+    (is (some? e) "^:per-env on a defn is a compile error")
+    (is (includes? msg "per-env is only valid on a `def`"))))
+
+(deftest per-env-on-a-defmacro-is-a-compile-error
+  (let [e (compile-error-of "(ns pe.rej2) (defmacro ^:per-env m [] 1)")
+        msg (if (some? e) (str (ex-message e)) "")]
+    (is (some? e) "^:per-env on a defmacro is a compile error")
+    (is (includes? msg "per-env is only valid on a `def`"))))
+
+; ── cycle detection ─────────────────────────────────────────────────────────
+
+(deftest a-per-env-init-that-reads-itself-raises-a-deterministic-cycle-error
+  (let [n (str "pe.cyc" (erlang/unique_integer (list :positive)))]
+    ; `a`'s initializer reads `a` — a per-env self-cycle. Must raise, not hang.
+    (ev-global (str "(ns " n ") (def ^:per-env a (deref a))"))
+
+    (let [e (try
+              (do (in-fork (str "(ns _r (:require [" n " :as p])) p/a")) nil)
+              (catch RuntimeError ex ex))
+          msg (if (some? e) (str (ex-message e)) "")]
+      (is (some? e) "a self-reading per-env init must raise, not hang")
+      (is (includes? msg "cyclic per-env initialization")))))
+
+; ── AOT path ────────────────────────────────────────────────────────────────
+;
+; The fixture set is compiled by `build/run` DIRECTLY (the ExUnit suite called
+; `BeamLisp.BuildTask.run`, whose whole job is to reach this same `.bl`
+; program). Sources are discovered the way `BuildTask.discover` did: every
+; plain `.bl` plus the literate extensions.
+
+(def fixture-dir "test/fixtures/aot")
+
+(def aot-out
+  (str (System/tmp_dir!) "/bl_per_env_def_aot_"
+       (erlang/unique_integer (list :positive))))
+
+(def aot-manifest (str aot-out "/compile.beam_lisp"))
+
+(defn- fixture-sources []
+  (sort (vec (mapcat (fn [ext] (Path/wildcard (str fixture-dir "/**/*" ext)))
+                     [".bl" ".bl.md" ".bl.org"]))))
+
+(defn- build-fixtures!
+  "The ExUnit AOT `setup`: clean, compile the fixture set into an isolated
+   ebin, put it on the code path, and load `per-env-fixture` exactly as a
+   fresh VM would."
+  []
+  (File/rm_rf! aot-out)
+  (File/mkdir_p! aot-out)
+  (System/put_env "BEAM_LISP_AOT_CACHE" "off")
+  (let [r (b/run {:sources (fixture-sources)
+                  :out aot-out
+                  :manifest aot-manifest
+                  :jobs 2})]
+    (is (= [] (:errors r)) "the fixture set compiles with no errors")
+    (is (pos? (:built r)) "the AOT build emitted beams"))
+  (Code/append_path aot-out)
+  (is (= :ok (BeamLisp.Loader/ensure_loaded "per-env-fixture"))
+      "per-env-fixture loads from its AOT beam"))
+
+(deftest an-aot-compiled-per-env-def-isolates-per-fork-the-global-def-is-shared
+  (build-fixtures!)
+  (let [probe (str "(ns _r (:require [per-env-fixture :as p]))\n"
+                   "{:shared (erlang/term_to_binary p/shared-counter)\n"
+                   " :tenant (erlang/term_to_binary p/tenant-counter)}")
+        a (in-fork probe)
+        b (in-fork probe)]
+    (is (= (:shared a) (:shared b)) "AOT: un-marked def stays one shared global")
+    (is (not= (:tenant a) (:tenant b)) "AOT: ^:per-env def isolates per fork")))
+
+(deftest aot-per-env-mutation-stays-within-a-fork
+  ; Each fork bumps its own tenant-counter; neither sees the other's count.
+  (build-fixtures!)
+  (let [bump (str "(ns _r (:require [per-env-fixture :as p]))\n"
+                  "(p/bump-tenant) (p/bump-tenant) (p/tenant-value)")
+        a (in-fork bump)
+        b (in-fork bump)]
+    (is (= 2 a))
+    (is (= 2 b) "a fork's per-env mutations must not leak into another fork")))

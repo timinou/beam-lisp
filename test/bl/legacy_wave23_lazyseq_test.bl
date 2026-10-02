@@ -1,0 +1,394 @@
+; legacy_wave23_lazyseq_test.bl — wave 23's LazySeq force state machine and
+; bare-lazy-seq interop, in beam-lisp, replacing
+; test/beam_lisp/wave23_lazyseq_test.exs.
+;
+; Two contracts are pinned here:
+;
+;   * the native memo cell's FORCE STATE MACHINE — a completed answer survives
+;     memory pressure and new attempts are rejected before their thunk runs; a
+;     single attempt is shared by concurrent forcers; a failed attempt reaches
+;     every waiter and a later explicit force retries; a recursive force and a
+;     retained cycle become terminal; a lost owner is terminal and never
+;     replays the thunk; discarded cells and long chains are reclaimed; copies
+;     and closure captures retain their resources; and a force preserves its
+;     caller's context even when the caller is Loader.Server.
+;
+;   * a `lazy-seq` THUNK may return a bare LazySeq (or an empty vector, a set,
+;     nil), and `take` over an infinite lazy seq realizes only what it needs.
+;
+; PARITY MAPPING — one `deftest` per ExUnit `test`, same order; each `assert`
+; becomes one `is`, so the assertion count is unchanged:
+;
+;   describe "lazy force state machine"
+;     "completed values survive pressure and new attempts are rejected before effects"
+;         → completed-values-survive-pressure-and-new-attempts-are-rejected
+;     "concurrent callers share one attempt while another node progresses"
+;         → concurrent-callers-share-one-attempt-while-another-node-progresses
+;     "failed attempt reaches waiters and a later explicit force retries"
+;         → failed-attempt-reaches-waiters-and-a-later-explicit-force-retries
+;     "recursive force fails immediately"
+;         → recursive-force-fails-immediately
+;     "owner death is terminal and never replays the thunk"
+;         → owner-death-is-terminal-and-never-replays-the-thunk
+;     "memo survives Loader.Server restart"
+;         → memo-survives-loader-server-restart
+;     "existing-table force progresses while Loader.Server is busy"
+;         → existing-table-force-progresses-while-loader-server-is-busy
+;     "Loader.Server may wait on a worker forcing an existing lazy"
+;         → loader-server-may-wait-on-a-worker-forcing-an-existing-lazy
+;     "direct and indirect retained-state cycles become terminal"
+;         → direct-and-indirect-retained-state-cycles-become-terminal
+;     "discarded cells and long chains are reclaimed iteratively"
+;         → discarded-cells-and-long-chains-are-reclaimed-iteratively
+;     "copies and closure captures retain resources while a live value remains usable"
+;         → copies-and-closure-captures-retain-resources
+;     "force preserves its caller context even when the caller is Loader.Server"
+;         → force-preserves-its-caller-context-even-when-the-caller-is-loader-server
+;
+;   describe "lazy-seq thunk may return a bare LazySeq (wave 23)"
+;     "minimal repro: nested lazy-seq returning another seq via concat"
+;         → minimal-repro-nested-lazy-seq-returning-another-seq-via-concat
+;     "a thunk returning a bare lazy seq at several nesting depths"
+;         → a-thunk-returning-a-bare-lazy-seq-at-several-nesting-depths
+;     "take over an infinite lazy seq realizes only what it needs"
+;         → take-over-an-infinite-lazy-seq-realizes-only-what-it-needs
+;     "thunks returning [], a vector, a set, and nil all normalize"
+;         → thunks-returning-empty-vector-set-nil-all-normalize
+;     "concat combines lazy and strict inputs in both orders"
+;         → concat-combines-lazy-and-strict-inputs-in-both-orders
+;
+; ADAPTATIONS. ExUnit details that do not cross verbatim:
+;
+;   * `setup`/`on_exit`. Ward runs a file's tests in ONE process with no
+;     per-test setup, so the budget env the first test sets is restored in a
+;     `finally`, not an `on_exit`. `Env.current_ns` is untouched by this file.
+;   * `assert_raise Type, ~r/msg/` keeps BOTH halves of the contract: a typed
+;     `catch LazySeq.ForceError e` (a raise of any other type is a failure) plus
+;     the message regex, via `force-error`.
+;   * `:counters` and `Task`/`Agent` are reached through their Erlang/Elixir
+;     modules — `(erlang/apply :counters :new …)`, `Task/async`, `Agent/get`.
+;   * `LazySeq.force(left) == right` compares two LazySeq STRUCTS; BL `=`
+;     realizes a seq to compare it, which would force the cycle. `erlang/==`
+;     is the struct-identity comparison the Elixir `==` performed.
+;   * `assert_receive` scans the mailbox for a MATCH; a plain `receive` takes
+;     the oldest message. Where a matching message is the only expected one the
+;     port uses a plain `receive` with a timeout fallback; the reclamation
+;     assertion bounds its wait by WALL CLOCK (not a spin count), because a
+;     lazy-seq pressure walk under scheduler load would otherwise flake.
+;   * `assert_stats_converge` becomes `stats-converge`, returning the predicate
+;     result so it is asserted like everything else: a test cannot pass on a
+;     non-converged counter.
+;   * the improper list `[child | :tail]` has no reader literal; it is built as
+;     `(erlang/++ (list child) :tail)`.
+;
+; Run: bin/bl test test/bl/legacy_wave23_lazyseq_test.bl
+
+(ns legacy.wave23.lazyseq-test)
+
+; ── helpers ──────────────────────────────────────────────────────────────
+
+(defn- ev
+  "The suite's `eval/1`."
+  [source]
+  (BeamLisp/eval source))
+
+(defn- counter [] (erlang/apply :counters :new (list 1 ())))
+(defn- bump [c] (erlang/apply :counters :add (list c 1 1)))
+(defn- cget [c] (erlang/apply :counters :get (list c 1)))
+
+(defn- force-error
+  "Force through `f` and return its `LazySeq.ForceError` message — the typed
+   half of `assert_raise LazySeq.ForceError`. A raise of any other type, or no
+   raise at all, answers the empty string so the message assertion fails."
+  [f]
+  (try
+    (do (f) "")
+    (catch BeamLisp.LazySeq.ForceError e (ex-message e))
+    (catch e "")))
+
+(defn- capture-force
+  "The suite's `capture`: `{:ok, value}` or `{:error, message}`."
+  [lazy]
+  (try
+    (tuple :ok (BeamLisp.LazySeq/force lazy))
+    (catch e (tuple :error (ex-message e)))))
+
+(defn- await-waiter-registered
+  "Poll until the running memo has at least one registered waiter — the ExUnit
+   helper's `{:running, _thunk, _owner, _attempt, [_ | _]}`. Bounded by wall
+   clock so a scheduler stall cannot spin forever; the caller asserts the
+   result."
+  [lazy]
+  (let [deadline (+ (System/monotonic_time :millisecond) 5000)]
+    (loop []
+      (let [state (BeamLisp.LazySeq/memo_state lazy)]
+        (cond
+          (and (erlang/is_tuple state)
+               (erlang/== 5 (erlang/tuple_size state))
+               (erlang/== :running (erlang/element 1 state))
+               (erlang/is_list (erlang/element 5 state))
+               (not (erlang/== () (erlang/element 5 state))))
+            true
+
+          (>= (System/monotonic_time :millisecond) deadline)
+            false
+
+          :else
+            (do (erlang/apply :erlang :yield (list)) (recur)))))))
+
+(defn- stats-converge
+  "The suite's `assert_stats_converge`: `:erlang.garbage_collect/0`, then read
+   the native memo stats and test `pred`, retrying by WALL CLOCK for up to
+   `@converge_ms`. Returns the predicate's truth so the caller asserts it."
+  [pred]
+  (loop [deadline (+ (System/monotonic_time :millisecond) 5000)]
+    (erlang/apply :erlang :garbage_collect (list))
+    (let [stats (BeamLisp.LazyMemo/stats)]
+      (cond
+        (pred stats) true
+        (>= (System/monotonic_time :millisecond) deadline) false
+        :else (do (Process/sleep 1) (recur deadline))))))
+
+(defn- wait-for-loader
+  "Bounded wait until the supervised `Loader.Server` is back after the restart
+   test killed it — pure sequencing, no assertion."
+  []
+  (loop [i 0]
+    (cond
+      (erlang/is_pid (Process/whereis :"Elixir.BeamLisp.Loader.Server")) :ok
+      (> i 2000) :timeout
+      :else (do (Process/sleep 1) (recur (+ i 1))))))
+
+; ── lazy force state machine ─────────────────────────────────────────────
+
+(deftest completed-values-survive-pressure-and-new-attempts-are-rejected
+  (let [old-budget (Application/get_env :beam_lisp :lazy_cache_budget_bytes)
+        counter (counter)]
+    (try
+      (let [lazy (BeamLisp.LazySeq/new (fn [] (bump counter) :value))]
+        (is (= :value (BeamLisp.LazySeq/force lazy)))
+        (Application/put_env :beam_lisp :lazy_cache_budget_bytes 0)
+        (is (= :value (BeamLisp.LazySeq/force lazy)) "a completed answer survives pressure")
+        (is (= 1 (cget counter)))
+        (let [rejected (BeamLisp.LazySeq/new (fn [] (bump counter) :never))]
+          (is (includes? (force-error (fn [] (BeamLisp.LazySeq/force rejected)))
+                         "lazy_cache_budget_exceeded")
+              "a new attempt is rejected before its thunk runs")
+          (is (= 1 (cget counter)))))
+      (finally
+        (if (nil? old-budget)
+          (Application/delete_env :beam_lisp :lazy_cache_budget_bytes)
+          (Application/put_env :beam_lisp :lazy_cache_budget_bytes old-budget))))))
+
+(deftest concurrent-callers-share-one-attempt-while-another-node-progresses
+  (let [parent (erlang/self)
+        counter (counter)
+        lazy (BeamLisp.LazySeq/new
+               (fn []
+                 (bump counter)
+                 (erlang/send parent [:started (erlang/self)])
+                 (receive :release :shared)))
+        owner (Task/async (fn [] (BeamLisp.LazySeq/force lazy)))
+        owner-pid (receive [:started p] p (after 2000 :timed-out))]
+    (is (erlang/is_pid owner-pid) "the owner announces its attempt")
+    (let [waiter (Task/async (fn [] (BeamLisp.LazySeq/force lazy)))]
+      (is (await-waiter-registered lazy) "the waiter registers on the running attempt")
+      (is (= :unrelated (BeamLisp.LazySeq/force (BeamLisp.LazySeq/new (fn [] :unrelated)))))
+      (erlang/send owner-pid :release)
+      (is (= :shared (Task/await owner)))
+      (is (= :shared (Task/await waiter)))
+      (is (= 1 (cget counter)) "one attempt, one thunk run"))))
+
+(deftest failed-attempt-reaches-waiters-and-a-later-explicit-force-retries
+  (let [parent (erlang/self)
+        counter (counter)
+        lazy (BeamLisp.LazySeq/new
+               (fn []
+                 (bump counter)
+                 (let [attempt (cget counter)]
+                   (erlang/send parent [:attempt_started (erlang/self) attempt])
+                   (receive :release :ok)
+                   (if (erlang/== attempt 1)
+                     (erlang/error (Elixir.RuntimeError/exception "known failure"))
+                     :recovered))))
+        owner (Task/async (fn [] (capture-force lazy)))
+        m1 (receive [:attempt_started p a] (tuple p a) (after 2000 :timed-out))]
+    (is (= 1 (erlang/element 2 m1)) "the owner is on attempt 1")
+    (let [waiter (Task/async (fn [] (capture-force lazy)))]
+      (is (await-waiter-registered lazy))
+      (erlang/send (erlang/element 1 m1) :release)
+      (is (= (tuple :error "known failure") (Task/await owner)))
+      (is (= (tuple :error "known failure") (Task/await waiter)))
+      (let [retry (Task/async (fn [] (capture-force lazy)))
+            m2 (receive [:attempt_started p a] (tuple p a) (after 2000 :timed-out))]
+        (is (= 2 (erlang/element 2 m2)) "a later explicit force retries on attempt 2")
+        (erlang/send (erlang/element 1 m2) :release)
+        (is (= (tuple :ok :recovered) (Task/await retry)))
+        (is (= :recovered (BeamLisp.LazySeq/force lazy)))
+        (is (= 2 (cget counter)))))))
+
+(deftest recursive-force-fails-immediately
+  (let [holder (erlang/element 2 (Agent/start_link (fn [] nil)))
+        lazy (BeamLisp.LazySeq/new (fn [] (BeamLisp.LazySeq/force (Agent/get holder (fn [x] x)))))]
+    (Agent/update holder (fn [_] lazy))
+    (is (includes? (force-error (fn [] (BeamLisp.LazySeq/force lazy))) "recursive_force"))))
+
+(deftest owner-death-is-terminal-and-never-replays-the-thunk
+  (let [parent (erlang/self)
+        counter (counter)
+        lazy (BeamLisp.LazySeq/new
+               (fn []
+                 (bump counter)
+                 (erlang/send parent [:owner_started (erlang/self)])
+                 (receive :never :value)))
+        owner (Task/async (fn [] (BeamLisp.LazySeq/force lazy)))
+        owner-pid (:pid owner)]
+    (is (erlang/is_pid (receive [:owner_started p] p (after 2000 :timed-out)))
+        "the owner announces its attempt")
+    (let [waiter (Task/async (fn [] (try (BeamLisp.LazySeq/force lazy)
+                                         (catch BeamLisp.LazySeq.ForceError e (:reason e)))))]
+      (is (await-waiter-registered lazy))
+      (Process/unlink owner-pid)
+      (Process/exit owner-pid :kill)
+      (let [reason (Task/await waiter)]
+        (is (= :force_owner_lost (erlang/element 1 reason)))
+        (is (erlang/== owner-pid (erlang/element 2 reason))))
+      (is (includes? (force-error (fn [] (BeamLisp.LazySeq/force lazy))) "force_owner_lost"))
+      (is (= 1 (cget counter)) "the thunk was never replayed")
+      (is (= :exit (try (do (Task/await owner) :no-exit) (catch e :exit)))))))
+
+(deftest memo-survives-loader-server-restart
+  (let [counter (counter)
+        lazy (BeamLisp.LazySeq/new (fn [] (bump counter) :value))]
+    (is (= :value (BeamLisp.LazySeq/force lazy)))
+    (let [loader (Process/whereis :"Elixir.BeamLisp.Loader.Server")
+          monitor (Process/monitor loader)]
+      (Process/unlink loader)
+      (Process/exit loader :kill)
+      (is (receive [:DOWN m :process p r]
+            (and (erlang/== m monitor) (erlang/== p loader))
+            (after 3000 false))
+          "the loader server goes down")
+      (is (= :value (BeamLisp.LazySeq/force lazy)) "the memo outlives the loader")
+      (is (= 1 (cget counter))))))
+
+(deftest existing-table-force-progresses-while-loader-server-is-busy
+  (wait-for-loader)
+  (let [parent (erlang/self)
+        lazy (BeamLisp.LazySeq/new (fn [] :unrelated_value))
+        blocker (Task/async
+                  (fn []
+                    (BeamLisp.Loader.Server/run
+                      (fn []
+                        (erlang/send parent [:loader_busy (erlang/self)])
+                        (receive :release_loader :ok)))))]
+    (let [loader-pid (receive [:loader_busy p] p (after 2000 :timed-out))]
+      (is (erlang/is_pid loader-pid) "the loader server is busy")
+      (let [force (Task/async (fn [] (BeamLisp.LazySeq/force lazy)))]
+        (is (= :unrelated_value (Task/await force 1000)))
+        (erlang/send loader-pid :release_loader)
+        (is (= :ok (Task/await blocker)))))))
+
+(deftest loader-server-may-wait-on-a-worker-forcing-an-existing-lazy
+  (wait-for-loader)
+  (let [parent (erlang/self)
+        lazy (BeamLisp.LazySeq/new (fn [] :value))
+        load (Task/async
+               (fn []
+                 (BeamLisp.Loader.Server/run
+                   (fn []
+                     (let [worker (Task/async (fn [] (BeamLisp.LazySeq/force lazy)))]
+                       (erlang/send parent :loader_waiting_on_force)
+                       (Task/await worker 1000))))))]
+    (is (erlang/== :loader_waiting_on_force
+                   (receive :loader_waiting_on_force :loader_waiting_on_force (after 2000 :timed-out)))
+        "the loader server reached the worker")
+    (is (= :value (Task/await load 1000)))))
+
+(deftest direct-and-indirect-retained-state-cycles-become-terminal
+  (let [direct-holder (erlang/element 2 (Agent/start_link (fn [] nil)))
+        direct (BeamLisp.LazySeq/new (fn [] (Agent/get direct-holder (fn [x] x))))]
+    (Agent/update direct-holder (fn [_] direct))
+    (is (includes? (force-error (fn [] (BeamLisp.LazySeq/force direct))) "cyclic_memo"))
+    (is (= (tuple :terminal :cyclic_memo) (BeamLisp.LazySeq/memo_state direct)))
+    (let [holder (erlang/element 2 (Agent/start_link (fn [] (maps/new))))
+          left (BeamLisp.LazySeq/new (fn [] (Agent/get holder (fn [m] (:right m)))))
+          right (BeamLisp.LazySeq/new (fn [] (Agent/get holder (fn [m] (:left m)))))]
+      (Agent/update holder (fn [_] (maps/put :left left (maps/put :right right (maps/new)))))
+      (is (erlang/== (BeamLisp.LazySeq/force left) right))
+      (is (includes? (force-error (fn [] (BeamLisp.LazySeq/force right))) "cyclic_memo"))
+      (is (= (tuple :terminal :cyclic_memo) (BeamLisp.LazySeq/memo_state right))))))
+
+(deftest discarded-cells-and-long-chains-are-reclaimed-iteratively
+  (let [baseline (:live_cells (BeamLisp.LazyMemo/stats))
+        task (Task/async
+               (fn []
+                 (Enum/each (range 20000) (fn [_] (BeamLisp.LazySeq/new (fn [] :discarded))))
+                 (Enum/reduce (range 1 20001) (BeamLisp.LazySeq/new (fn [] nil))
+                   (fn [n tail]
+                     (let [node (BeamLisp.LazySeq/new (fn [] (erlang/++ (list n) tail)))]
+                       (BeamLisp.LazySeq/force node)
+                       node)))
+                 :ok))]
+    (is (= :ok (Task/await task 30000)))
+    (is (stats-converge (fn [stats] (and (<= (:live_cells stats) baseline)
+                                         (= 0 (:pending_reclaims stats))))))))
+
+(deftest copies-and-closure-captures-retain-resources
+  (let [baseline (:live_cells (BeamLisp.LazyMemo/stats))
+        child (BeamLisp.LazySeq/new (fn [] :child))
+        copy child
+        captured (fn [] child)
+        parent (BeamLisp.LazySeq/new
+                 (fn []
+                   {:copy copy
+                    :captured captured
+                    :tuple (tuple child)
+                    :improper (erlang/++ (list child) :tail)}))
+        value (BeamLisp.LazySeq/force parent)]
+    (erlang/apply :erlang :garbage_collect (list))
+    (is (>= (:live_cells (BeamLisp.LazyMemo/stats)) (+ baseline 2)))
+    (is (= :child (BeamLisp.LazySeq/force (:copy value))))
+    (is (= :child (BeamLisp.LazySeq/force ((:captured value)))))
+    (is (erlang/== (:tuple value) (tuple child)))
+    (is (erlang/== (:improper value) (erlang/++ (list child) :tail)))))
+
+(deftest force-preserves-its-caller-context-even-when-the-caller-is-loader-server
+  (wait-for-loader)
+  (let [parent (erlang/self)
+        loader-pid (Process/whereis :"Elixir.BeamLisp.Loader.Server")
+        lazy (BeamLisp.LazySeq/new (fn [] (erlang/send parent [:thunk_pid (erlang/self)]) :value))
+        force (Task/async (fn [] (BeamLisp.Loader.Server/run (fn [] (BeamLisp.LazySeq/force lazy)))))
+        thunk-pid (receive [:thunk_pid p] p (after 2000 :timed-out))]
+    (is (erlang/is_pid thunk-pid) "the thunk announces the process it ran in")
+    (is (erlang/== thunk-pid loader-pid) "force preserves the caller context")
+    (is (= :value (Task/await force 1000)))))
+
+; ── lazy-seq thunk may return a bare LazySeq (wave 23) ───────────────────
+
+(deftest minimal-repro-nested-lazy-seq-returning-another-seq-via-concat
+  (is (= [1 2 3]
+         (ev "(reduce conj [] (concat (lazy-seq (concat (lazy-seq (list 1)) (list 2))) (list 3)))"))))
+
+(deftest a-thunk-returning-a-bare-lazy-seq-at-several-nesting-depths
+  (is (= [1 2 3] (ev "(reduce conj [] (lazy-seq (lazy-seq (lazy-seq (lazy-seq (list 1 2 3))))))")))
+  (is (= 42 (ev "(first (lazy-seq (lazy-seq (list 42))))")))
+  (is (= [7] (ev "(reduce conj [] (concat (lazy-seq []) (lazy-seq (list 7))))"))))
+
+(deftest take-over-an-infinite-lazy-seq-realizes-only-what-it-needs
+  (is (= '(1 2 3 4 5) (ev "(take 5 (concat (lazy-seq (map inc (range))) (list 99)))")))
+  ; the counter proves the infinite seq is not fully forced: map is chunked at
+  ; 32, so `take 5` realizes exactly one 32-element chunk of the infinite
+  ; source, never its tail.
+  (is (= 32 (ev "(let [n (atom 0) inf (map (fn [x] (swap! n inc) x) (range))] (doall (take 5 (concat (lazy-seq inf) (list 99)))) @n)"))))
+
+(deftest thunks-returning-empty-vector-set-nil-all-normalize
+  (is (= [] (ev "(reduce conj [] (lazy-seq []))")))
+  (is (= [1 2 3] (ev "(reduce conj [] (concat (lazy-seq [1 2]) (lazy-seq [3])))")))
+  ; a set's member order is unspecified — check membership, not order.
+  (is (= '(1 2) (sort (BeamLisp.Vector/to_list (ev "(reduce conj [] (lazy-seq #{1 2}))")))))
+  (is (= [5] (ev "(reduce conj [] (concat (lazy-seq nil) (list 5)))"))))
+
+(deftest concat-combines-lazy-and-strict-inputs-in-both-orders
+  (is (= [1 2] (ev "(reduce conj [] (concat (list 1) (lazy-seq (list 2))))")))
+  (is (= [1 2] (ev "(reduce conj [] (concat (lazy-seq (list 1)) (list 2)))"))))
