@@ -32,7 +32,8 @@ The node agenda becomes cheap after PLAN-157 lands four things:
 | FUP-134 | Self-hosted compiler running in a Worker (REPL, notebooks, live edit) | reader/compiler are BL (`priv/boot`); the emitter already compiles BL→JS | W1.1, W1.2, an eval story |
 | FUP-135 | Ship bl-ANF over the wire, hot-load in the browser | ANF is data; versioned `:module` descriptor (`priv/boot/anf.bl:252`) | W2, W4 |
 | FUP-136 | Full JS actor runtime parity: ports, ETS, nested supervisors, dynamic children | README "Supported surface and limits"; `verify-tables.mjs:360-393` deviation list | FUP-133 |
-| FUP-137 | Exact numerics on JS (int/float tag, decimals, BigInt) | `04-exact-numeric-spike.md` (34 cases, timings); `number_rule.bl` | FUP-141 |
+| ~~FUP-137~~ | Exact numerics on JS: **pulled into PLAN-157 W2 as FEAT-056** (user decision D3, 2026-10-02). Lean exact: Number for safe ints, BigInt beyond, boxed floats, BigInt-backed decimals. | `04-exact-numeric-spike.md` (34 cases, timings) | — |
+| FUP-143 | Refined client replica: per-screen read-sets, partial replicas, lazy fetch (v1 = whole guarded worlds, decision D2) | `:listen :attrs` commit filter in `priv/lib/live/socket.bl` | W3, W1.4 |
 | FUP-138 | datom in the browser: recursive rules, IndexedDB, offline queue survives close | BL nested-loop engine is portable; rules fixpoint is a Rust NIF | W3 |
 | FUP-139 | One placement lattice: browser / BEAM / native NIF / edge | `system.prove/native-eligible?` and split portability are the same question | W1.4 |
 | FUP-140 | JS artifacts in the self-build fixpoint gate | bundles already deterministic (PLAN-147/149) | W1.2, W2 |
