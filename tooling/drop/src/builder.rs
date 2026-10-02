@@ -241,12 +241,11 @@ fn cargo_target_dir(dir: &Path) -> PathBuf {
 }
 
 fn tree_bl(tree: &Path, args: &[&str]) -> Command {
+    // The in-tree `bin/bl` is a shell script that starts one fresh VM; it has no
+    // transport to choose, so it is given no transport flag. (`--cold` here made
+    // every tree whose CLI predates the flag, main's among them, refuse to build.)
     let mut cmd = Command::new(tree.join(LAUNCHER_REL));
-    // The in-tree `bin/bl` is a launcher too: `--cold` says run this build fresh
-    // instead of reaching for a warm VM. It used to be an environment toggle;
-    // the launcher only ever reads flags now.
-    cmd.arg("--cold")
-        .args(args)
+    cmd.args(args)
         .current_dir(tree)
         .env_remove("BL_BUILD_ID")
         .env_remove("BL_USE");
