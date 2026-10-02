@@ -136,7 +136,7 @@ next one.
 
 ## The verbs
 
-`run` is the verb entry the CLI loads on first use, so `bl ports` costs nothing
+`run` is the verb entry the CLI loads on first use, so `bl vm` costs nothing
 until someone asks for it. Each row shows the name first, because that is the
 address a human keeps; the number is the implementation detail beside it.
 
@@ -144,7 +144,7 @@ address a human keeps; the number is the implementation detail beside it.
 (defn- pad [s] (String/pad_trailing (str s) 10))
 
 (defn run
-  "`bl ports` — name · the host it answers at · the port behind it · owner."
+  "`bl vm` — name · the host it answers at · the port behind it · owner."
   [_args _st]
   (let [ps (list-ports)]
     (if (empty? ps)
@@ -162,7 +162,7 @@ address a human keeps; the number is the implementation detail beside it.
                      (nil? (vm.gateway/port)))
             (println "")
             (println (str "  " (count named) " name(s) registered, but no gateway answers them:"))
-            (println "      bl gateway start    (one per user; `bl install gateway` keeps it running)")))))
+            (println "      bl vm start gateway    (one per user; `bl install gateway` keeps it running)")))))
     0))
 ```
 
@@ -213,7 +213,7 @@ it.
   [args _st]
   (let [c (claim-for "ui")]
     (if (nil? c)
-      (do (u/io-err "bl ui: no session is running for this tree (bl daemon start)")
+      (do (u/io-err "bl vm ui: no session is running for this tree (bl realm start)")
           1)
       (do (start-index!)
           (open-url "ui" args)))))

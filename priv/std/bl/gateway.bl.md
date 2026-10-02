@@ -6,10 +6,10 @@ hand it to the port that registered it. That something is the gateway — one
 process per USER, because it holds the one port a URL is allowed to leave out.
 
 ```
-bl gateway            is it up, and which names does it answer?
-bl gateway start      start it (the systemd unit when installed, detached otherwise)
-bl gateway stop       stop the running one
-bl gateway run        run it in the foreground — what the unit execs
+bl vm                  is it up, and which names does it answer?
+bl vm start gateway    start it (the systemd unit when installed, detached otherwise)
+bl vm stop gateway     stop the running one
+bl vm start gateway --foreground   run it in the foreground — what the unit execs
 bl install gateway    the systemd unit, so it starts at login
 bl install redirect   make port 80 answer for it — the portless address, one root step
 ```
@@ -72,7 +72,7 @@ registry `bl ports` prints, seen from the other end.
   [_args _st]
   (if (not (running?))
     (do
-      (println "bl gateway: not running")
+      (println "bl vm: gateway not running")
       (println (if (installed?)
                  "  it is installed but stopped — bl gateway start"
                  "  bl gateway start       start it now (detached)"))
@@ -110,7 +110,7 @@ command the unit would run, so both paths start the same process.
 (defn- wait-up
   "Poll until the gateway answers, up to ~60s. Returns true when it is up.
 
-   A COLD drop boot is what sets the budget: starting `bl gateway run` pays for
+   A COLD drop boot is what sets the budget: starting `bl vm start gateway --foreground` pays for
    the whole substrate (AOT, the native tier, priv/), measured at ~20s on this
    machine the first time and ~1s warm. A five-second budget reported a healthy
    gateway as a failure — and the gateway then came up anyway, which is worse
@@ -132,17 +132,17 @@ command the unit would run, so both paths start the same process.
     (str dir "/gateway.log")))
 
 (defn- detach
-  "Start `bl gateway run` as an orphan of this process. `setsid` gives it its own
+  "Start `bl vm start gateway --foreground` as an orphan of this process. `setsid` gives it its own
    session so no terminal teardown can reach it, stdin comes from nowhere, and
    its output goes to a log file rather than nowhere. The gateway's own endpoint
    file is still how it is found again — it needs no parent watching it."
   []
   (let [bin (vm.gateway/command)]
     (if (nil? bin)
-      (do (u/io-err "bl gateway: no `bl` on PATH — run `bl gateway run` from a checkout, or set BL_BIN")
+      (do (u/io-err "bl vm: no `bl` on PATH — run `bl vm start gateway --foreground` from a checkout, or set BL_BIN")
           nil)
       (System/cmd "sh"
-                  (u/to-list ["-c" (str "setsid " bin " gateway run < /dev/null > " (log-file)
+                  (u/to-list ["-c" (str "setsid " bin " vm start gateway --foreground < /dev/null > " (log-file)
                                        " 2>&1 &")])))))
 
 (defn run-start
@@ -151,22 +151,22 @@ command the unit would run, so both paths start the same process.
   [_args _st]
   (cond
     (running?)
-    (do (println (str "bl gateway: already running on port " (port-of))) 0)
+    (do (println (str "bl vm: gateway already running on port " (port-of))) 0)
 
     (and (installed?) (systemctl?))
     (do
       (System/cmd "systemctl" (u/to-list ["--user" "start" unit-name]))
       (if (wait-up 120)
-        (do (println (str "bl gateway: up on " (port-of) " (systemd)")) 0)
-        (do (u/io-err "bl gateway: systemctl --user start did not bring it up (systemctl --user status bl-gateway)") 1)))
+        (do (println (str "bl vm: gateway up on " (port-of) " (systemd)")) 0)
+        (do (u/io-err "bl vm: gateway systemctl --user start did not bring it up (systemctl --user status bl-gateway)") 1)))
 
     :else
     (do
       (detach)
-      (println "bl gateway: starting… (a cold start takes a few seconds)")
+      (println "bl vm: gateway starting… (a cold start takes a few seconds)")
       (if (wait-up 120)
-        (do (println (str "bl gateway: up on " (port-of))) 0)
-        (do (u/io-err (str "bl gateway: did not come up — " (log-file) " says why")) 1)))))
+        (do (println (str "bl vm: gateway up on " (port-of))) 0)
+        (do (u/io-err (str "bl vm: gateway did not come up — " (log-file) " says why")) 1)))))
 ```
 
 `stop` asks systemd when systemd owns it, and signals the process otherwise.
@@ -179,12 +179,12 @@ with reality immediately after.
    1 when none was running."
   [_args _st]
   (if (not (running?))
-    (do (println "bl gateway: not running") 1)
+    (do (println "bl vm: gateway not running") 1)
     (do
       (if (and (installed?) (systemctl?))
         (System/cmd "systemctl" (u/to-list ["--user" "stop" unit-name]))
         (vm.gateway/stop))
-      (println "bl gateway: stopped")
+      (println "bl vm: gateway stopped")
       0)))
 ```
 
@@ -207,7 +207,7 @@ what a systemd `Type=simple` service wants.
    that cannot be bound is an error, never a silent move."
   [_args st]
   (let [r (vm.gateway/run {:port (:port st)})]
-    (u/io-err (str "bl gateway: " (refusal r)))
+    (u/io-err (str "bl vm: gateway " (refusal r)))
     1))
 ```
 
@@ -221,5 +221,5 @@ what a systemd `Type=simple` service wants.
       (= sub "start") (run-start args st)
       (= sub "stop") (run-stop args st)
       (= sub "run") (run-run args st)
-      :else (u/usage-error (str "bl gateway: unknown subcommand \"" sub "\" (start|stop|status|run)")))))
+      :else (u/usage-error (str "bl vm: gateway unknown subcommand \"" sub "\" (start|stop|status|run)")))))
 ```

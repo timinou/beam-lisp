@@ -1,11 +1,11 @@
-# The warm daemon, and the names it answers to
+# The warm VM, and the names it answers to
 
 A cold `bl` starts a fresh BEAM, loads what your command touches, runs it, and
 exits. That is the right shape for one program. It is the wrong shape for a
 day of programs: every `bl test`, every `bl ask`, every save-and-reload pays
 the same startup and warms the same caches from nothing, over and over.
 
-The daemon is the warm shape of the same `bl`. One VM per checkout, alive
+The warm VM is the warm shape of the same `bl`. One VM per checkout, alive
 between commands, holding what a cold run throws away — the compiled image, the
 analysis cache, a code index built and kept warm, the ports your apps serve on.
 You talk to it with the exact commands you already know; they just answer
@@ -17,27 +17,28 @@ This chapter is that loop, end to end.
 
 ---
 
-## 1. One tree, one daemon
+## 1. One tree, one warm VM
 
 ```
-bl daemon start      # become the warm VM for this checkout (blocks; run detached)
-bl daemon status     # what it is and what it holds
-bl daemon stop       # let it go
+bl realm start      # start this project's warm VM (blocks; run detached)
+bl realm show       # what it is and what it holds
+bl realm stop       # let it go
 ```
 
-The daemon is keyed by the checkout root — the directory `env.bl` lives in. One
-tree, one daemon. Two checkouts of the same project are two daemons that never
+The warm VM is keyed by the checkout root — the directory `env.bl` lives in. One
+tree, one warm VM. Two checkouts of the same project are two warm VMs that never
 contend, because each owns its own `build/` and its own image. You never name
-the daemon or pick a port for it; the tree it sits in is its identity.
+the warm VM or pick a port for it; the tree it sits in is its identity.
 
-`start` becomes the daemon and blocks, so in real use it runs detached — a
-`systemd --user` unit, or the launcher's background start. `status` and `stop`
-are ordinary clients: they find the tree's socket, ask one question, and exit.
+`bl realm start` becomes the warm VM and blocks, so in real use it runs
+detached — a `systemd --user` unit, or the launcher's background start.
+`bl realm show` and `bl realm stop` are ordinary clients: they find the tree's
+socket, ask one question, and exit.
 
-`status` is the whole daemon in one view:
+`bl realm show` is the whole realm in one view:
 
 ```
-bl daemon
+bl realm
   tree          pulse  (/tmp/pulse)
   pid           2731855
   tree_id       704adf131eb5572e
@@ -60,8 +61,8 @@ value. Add a fact to the model and it appears in all three at once.
 
 ## 2. Every command runs in the tree's VM
 
-When you run a command inside a checkout that has a daemon, `bl` hands it to the
-daemon instead of starting a fresh VM:
+When you run a command inside a checkout that has a warm VM, `bl` hands it to
+the warm VM instead of starting a fresh VM:
 
 ```
 bl test test/foo_test.bl     # runs in the warm image — image already built
@@ -79,19 +80,19 @@ Two things make this safe to lean on:
   in the one VM, not a queue — a long `bl test` never blocks a quick `bl eval`.
 - **Each request runs in a capped env.** Your shell's environment for that
   command is bound *process-locally* for the duration — never written into the
-  daemon's global table, never leaking into the next command. The daemon runs a
+  warm VM's global table, never leaking into the next command. The warm VM runs a
   hundred commands and its own environment never drifts.
 
 Your file arguments resolve against **your** working directory, not the
-daemon's checkout, so `bl test test/foo_test.bl` means the file you're looking
-at. The daemon is where the command runs; it is not where the command *is*.
+warm VM's checkout, so `bl test test/foo_test.bl` means the file you're looking
+at. The warm VM is where the command runs; it is not where the command *is*.
 
 ---
 
 ## 3. Ports have names
 
 An app serves on a port. The OS picks a number; nobody wants to type a number.
-So the daemon keeps a registry of named ports, and turns each name into a host.
+So the warm VM keeps a registry of named ports, and turns each name into a host.
 
 You declare a port in `env.bl`:
 
@@ -124,16 +125,16 @@ The rule is small and total:
 
 If the checkout is on a non-default git branch — anything but `main`/`master`/
 `trunk` — the branch qualifies the base, so a feature branch gets its own names
-(`pulse-featurex.test`) and its own daemon, and never collides with `main`.
+(`pulse-featurex.test`) and its own warm VM, and never collides with `main`.
 Declare `:instance "..."` in `env.bl` to pin that qualifier yourself.
 
 Ask about names without opening anything:
 
 ```
-bl ports              # every named port this session holds, with its URL
-bl open web           # print the address behind the :web port
-bl open web --open    # …and open it in a browser
-bl ui                 # the session's own URL (the dashboard)
+bl vm                 # the tree of VMs, realms, and their routes
+bl realm open web     # print the address behind the :web port
+bl realm open web --open    # …and open it in a browser
+bl vm ui              # the session's own URL (the dashboard)
 ```
 
 ---
@@ -147,9 +148,9 @@ allowed to omit (80 when it can bind it, else 7777), reading each request's
 that name.
 
 ```
-bl gateway start      # the machine's name-router (one, shared by every tree)
-bl gateway status
-bl gateway stop
+bl vm start gateway   # the machine's name-router (one, shared by every tree)
+bl vm                 # lists the gateway and every route it answers
+bl vm stop gateway
 ```
 
 The gateway reads no `env.bl` and knows no projects. Its entire routing table
@@ -163,7 +164,7 @@ Two more things it serves, both about making a fresh machine trust the names:
 - **`/bl.pac`** — a proxy-autoconfig file. Point your browser or OS at it and
   every `*.test` / `*.localhost` host routes through the gateway automatically,
   with no `/etc/hosts` editing. Everything else stays `DIRECT`.
-- **`/bl-ca.crt`** — the root certificate of the daemon's own certificate
+- **`/bl-ca.crt`** — the root certificate of the warm VM's own certificate
   authority. `https://web.pulse.test/` works because the gateway mints a leaf
   certificate for each name on the fly, signed by this root. Trust the root
   once and every name your machine serves is https, no per-app setup.
@@ -176,7 +177,7 @@ answer without a port at all.
 
 ## 5. The dashboard is the status you can click
 
-The daemon's `:ui` port serves a page at its own address — `http://pulse.test/`
+The warm VM's `:ui` port serves a page at its own address — `http://pulse.test/`
 above. It is the `status` model with buttons:
 
 | path | method | what it is |
@@ -196,7 +197,7 @@ The dashboard shows every declared task as a button. `env.bl` said:
 ```
 
 so the page offers **demo**, and pressing it POSTs to `/intent`, which runs the
-task on the daemon's sequencer — the same place a save-triggered reload runs, so
+task on the warm VM's sequencer — the same place a save-triggered reload runs, so
 a task you launch and a reload you triggered take turns instead of racing.
 
 That `/mcp` row is the quiet strength: your agent tools and your browser reach
@@ -204,7 +205,7 @@ the identical MCP server, one over stdio and one over HTTP, both answering from
 the warm VM that already has the index built. The tool your editor talks to and
 the page you have open are the same running program.
 
-Writes (`/intent`, `/index`, `/mcp`) carry a token the daemon minted into its
+Writes (`/intent`, `/index`, `/mcp`) carry a token the warm VM minted into its
 endpoint file at boot; reads are open. Loopback is not a trust boundary — any
 page you visit can POST to localhost — so the token is what says *this request
 came from you*.
@@ -213,7 +214,7 @@ came from you*.
 
 ## 6. The loop, in a sentence
 
-Start the daemon in your checkout; every `bl` you already run answers from a
+Start the warm VM in your checkout; every `bl` you already run answers from a
 warm VM in a capped env; declare a port and it becomes a name; start the gateway
 and the name just opens; the dashboard is that whole state, live, with a button
 for every task. One VM per tree, one gateway per machine, and not a port number

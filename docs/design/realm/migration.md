@@ -23,7 +23,7 @@ living side by side forever.
 | `bl ports` | `bl vm` (machine) · `bl realm show` (project) |
 | `bl open NAME` | `bl realm open NAME` |
 | `bl gateway start\|stop\|status` | `bl vm start gateway` · `bl vm stop gateway` · `bl vm` |
-| `bl ui` | unchanged |
+| `bl ui` | `bl vm ui` |
 | `bl install gateway` | unchanged |
 
 Top-level verbs: 35 today, 37 with `vm` and `realm` added, 33 after the four old ones are removed.

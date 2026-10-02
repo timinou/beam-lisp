@@ -647,7 +647,7 @@ the corpus assembles.
          ""
          "[Service]"
          "Type=simple"
-         (str "ExecStart=" bin " gateway run")
+         (str "ExecStart=" bin " vm start gateway --foreground")
          "Restart=on-failure"
          "RestartSec=2"
          ""
@@ -732,7 +732,7 @@ the corpus assembles.
                               :else {:error (str "not free (" (pr-str verdict)
                                                  ") — the gateway will use 7777 (" (port-80-pointer) ")")}))
            {:name "next" :ok true
-            :detail "open what it routes: bl ports, then a name"}])))))
+            :detail "open what it routes: bl vm, then a name"}])))))
 
 (defn- check-gateway [_arg]
   (let [unit (unit-file)
@@ -742,7 +742,7 @@ the corpus assembles.
     [{:name "unit" :ok (File/regular? unit)
       :detail (if (File/regular? unit) unit "absent — run: bl install gateway")}
      {:name "gateway" :ok (not (nil? up))
-      :detail (if (nil? up) "not running — bl gateway start" (str "on port " up))}
+      :detail (if (nil? up) "not running — bl vm start gateway" (str "on port " up))}
      ;; The question a developer actually has: can I leave the port out of the
      ;; URL? Not "could I bind 80" — whether something answers there. So the
      ;; check probes, and names the two ways to make it answer.
@@ -882,7 +882,7 @@ the corpus assembles.
 
       (nil? port)
       [{:name "gateway" :ok false
-        :detail "not running — bl gateway start first (a redirect would have nothing to forward to)"}]
+        :detail "not running — bl vm start gateway first (a redirect would have nothing to forward to)"}]
 
       :else
       (let [r (run-script (install-script (write-stage port)))]
@@ -894,7 +894,7 @@ the corpus assembles.
                     (str "on " port ", not " redirect-port
                          " — the rule follows it now, but restart the gateway on the fallback"
                          " port so the boot rule keeps pointing at it"))}
-         {:name "next" :ok true :detail "bl ports — the addresses printed there need no port"}]))))
+         {:name "next" :ok true :detail "bl vm — the addresses printed there need no port"}]))))
 
 (defn- remove-redirect [_arg]
   (let [r (run-script (remove-script))]

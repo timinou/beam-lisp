@@ -1,7 +1,7 @@
 # The live loop
 
 beam-lisp keeps a VM alive and adds code to it. `bl` has a verb for each way
-that pays off: a **daemon** that makes every command fast, a **watcher** that
+that pays off: a **warm VM** that makes every command fast, a **watcher** that
 reloads a file the moment you save it, a **dashboard** that re-renders the
 running image, a **server runner** that parks the VM after a program starts a
 web server, and **`bl doc`**, which runs a document's cells and writes their
@@ -9,52 +9,51 @@ results back into the file.
 
 Nothing here needs a restart.
 
-## The daemon
+## The warm VM
 
-Every `bl` command pays a VM boot unless one is already warm. `bl daemon` keeps
+Every `bl` command pays a VM boot unless one is already warm. `bl realm` keeps
 one warm, per tree.
 
 ```sh
-$ bl daemon start      # become the daemon (blocks; the launcher runs it detached)
-$ bl daemon status
-bl daemon
+$ bl realm start      # start this project's warm VM (blocks; the launcher runs it detached)
+$ bl realm show       # the realm's VM: pid, tree, build, compiler key, uptime
+bl realm
   pid           1812553
   tree          57461829a20cc2af
   compiler_key  3ac9ac2ebd0b84e00a2b27f98efd9e0c15834b2348d3ee9522781918bd709ec6
   build_id      2026.0.0
   uptime_ms     706826
-  queue_depth   0
-$ bl daemon stop
-bl daemon: stopped (…/beam-lisp)
+$ bl realm stop
+bl realm: stopped (…/beam-lisp)
 ```
 
-- **One daemon per tree.** A tree is a checkout or an extracted drop payload.
-  The daemon is keyed by the tree root, so two terminals in the same tree share
+- **One warm VM per tree.** A tree is a checkout or an extracted drop payload.
+  The warm VM is keyed by the tree root, so two terminals in the same tree share
   one warm VM and never contend.
 - **The socket is discovery; an authenticated hello is authority.** A client
   connects over a Unix socket and presents the tree's token; only then does the
-  daemon run its command.
-- **Each command is its own process, in its own VM.** The daemon holds one warm
-  VM per project and runs each request as a fresh process under it, with the
+  warm VM run its command.
+- **Each command is its own process, in its own VM.** The warm VM runs each
+  request as a fresh process under it, with the
   caller's environment bound process-locally — so concurrent commands never
   queue and never leak env into one another. A long `bl test` and a quick
   `bl eval` from two terminals run at once.
-- **Staleness is a restart, never a hot-swap.** The daemon freezes the compiler
+- **Staleness is a restart, never a hot-swap.** The warm VM freezes the compiler
   key it booted with. When the checkout changes under it — or a client presents
   a different key — it refuses work with `restart_required`; the launcher stops
   that VM and a fresh one loads one coherent image. A stale VM never serves.
-- **It stops itself when idle.** `BL_DAEMON_IDLE_SECONDS` (default `28800`, 8
-  hours; `0` disables) bounds how long a quiet daemon lives.
+- **It stops itself when idle.** A quiet warm VM expires on its own, so a warm
+  VM costs nothing once you stop using it.
 
-The drop's launcher uses the daemon automatically: a served command returns in
-tens of milliseconds instead of ~1s. `BL_DAEMON=off` skips the daemon entirely;
-`BL_DAEMON=auto` starts one detached when none is up.
+The drop's launcher uses the warm VM automatically: a served command returns in
+tens of milliseconds instead of ~1s. `--cold` runs in a fresh VM; `--warm` uses
+the warm VM and starts one if none runs.
 
-For the whole warm-VM DX — the per-tree daemon, the named ports, the gateway
+For the whole warm-VM DX — the per-tree warm VM, the named ports, the gateway
 that resolves those names, and the dashboard that renders it all live — see
 [06-the-warm-daemon.md](06-the-warm-daemon.md).
 
-`bl daemon status` exits `0` when a daemon answers, `1` when none is running.
+`bl realm show` exits `0` when a warm VM answers, `1` when none is running.
 
 ## Watch: reload on save
 
@@ -68,21 +67,21 @@ bl watch: watching /home/you/proj/src — Ctrl+C to stop
 ```
 
 A save that does not cohere is held back with its reason; the old code keeps
-serving. That is the same stage → check → commit pipeline the daemon and the
+serving. That is the same stage → check → commit pipeline the warm VM and the
 monitor use.
 
-When a daemon is running for your tree, the **daemon hosts the watcher**: the
+When a warm VM is running for your tree, the **warm VM hosts the watcher**: the
 watch runs as its own process like any request, and every reload's apply rides
-the daemon's sequencer, so a reload is ordered against the other reloads and
+the warm VM's sequencer, so a reload is ordered against the other reloads and
 intents rather than racing them. A second client can `bl ask` or `bl test` while
 your watch streams. Results arrive as ordinary output frames, plus a heartbeat
 while the tree is quiet, so the stream stays live without a terminal frame.
-Without a daemon (`BL_DAEMON=off`, or no daemon for this tree) the same verb
+Without a warm VM (`--cold`, or none for this tree) the same verb
 runs the same watcher in its own VM.
 
 The verbs that hold a process of their own — `bl repl`, `bl monitor`,
 `bl serve`, `bl mcp`, `bl lsp serve` — take a VM of their own rather than the
-tree's warm one, so a parked server never sits inside the daemon everyone else
+tree's warm one, so a parked server never sits inside the warm VM everyone else
 is using.
 
 Live reload needs the `:file_system` application, which the release ships.
@@ -232,7 +231,7 @@ bl doc build: 1 page → site
 ```
 edit ──▶ bl watch / bl monitor ──▶ stage ──▶ coherence check ──▶ commit
                                               │
-                    bl daemon ◀── warm VM ────┘
+                    bl realm ◀── warm VM ────┘
 ```
 
 Read [00-the-cli.md](00-the-cli.md) for the flags of each verb, and

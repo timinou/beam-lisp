@@ -13,7 +13,9 @@ runs.
 ```
 bl vm [ls] [--all] [--json]       the tree: VMs → realms → routes
 bl vm show ID [--json]            one VM in full
-bl vm stop ID… | --all [--force]  ask, then TERM; --force adds KILL
+bl vm ui [--open]                 the machine console
+bl vm start gateway [--foreground]   the gateway (systemd unit when installed)
+bl vm stop ID… | gateway | --all [--force]   ask, then TERM; --force adds KILL
 bl vm prune [--dry-run]           remove what dead VMs left behind
 ```
 
@@ -69,13 +71,14 @@ nobody. `--dry-run` lists and removes nothing.
 ## `bl realm` — the project
 
 ```
-bl realm [show] [--json]     this project's realm: VM, routes, address
-bl realm open [NAME] [--open]   the address of a route (default: ui)
-bl realm stop                 drain this project's realm
+bl realm [show] [--json]            this project's VM, routes, address, status
+bl realm open [NAME] [--open]       the address of a route (default: ui)
+bl realm start [--foreground]       start this project's warm VM
+bl realm stop                       stop it
 ```
 
 The realm is found the way the daemon finds it: the nearest `env.bl` (or tree
-root) above the current directory, or `BL_DAEMON_ROOT`.
+root) above the current directory, or the directory `--root DIR` names.
 
 Today one VM serves one realm, so `bl realm stop` stops the VM. When one VM hosts
 many realms, `stop` drains only this realm and the VM stays for the others. The
@@ -89,22 +92,38 @@ verb does not change.
 | `bl ports` | the tree in `bl vm`, and `bl realm show` |
 | `bl open NAME` | `bl realm open NAME` |
 | `bl gateway start\|stop\|status` | `bl vm` lists it; `bl vm stop gateway` |
-| `bl ui` | stays: the one human front door |
+| `bl ui` | `bl vm ui` |
 
 The first slice adds `vm` and `realm` and leaves the old verbs working. The
 cutover removes them (see the migration plan).
 
-## Planned, not built
+## Global flags
 
-These are in the plan and are not in the first slice:
+These work on every command, before a literal `--`:
+
+| flag | meaning |
+|---|---|
+| `--cold` | run in a fresh VM; never use a warm one |
+| `--warm` | use the warm VM, and start one if none runs |
+| `--root DIR` | key the realm on `DIR` instead of the current directory |
+
+A project or `~/.config/bl/config.bl` can declare `:warm "off" \| "attach" \| "start"`.
+The order is flag, then `env.bl`, then config, then the built-in default (`attach`).
+Warm is the preferred path; `--cold` is the exception.
+
+Why `--cold` is still needed, and what would remove each reason:
+
+| reason | structural fix |
+|---|---|
+| testing a packaged image itself, not a warm VM | none: this is the flag's purpose |
+| a child `bl` run under `timeout`: a killed client cannot cancel the command a warm VM keeps running | cancel a request when its client disconnects (follow-up) |
+
+## Planned, not built
 
 | command | does |
 |---|---|
 | `bl vm logs ID [-f]` | tail a VM's log (needs detached VMs to write one) |
 | `bl vm restart ID` | stop, then start the same role on the same build |
-| `bl vm start [warm\|gateway]` | start a VM explicitly |
 | `bl vm top` | live terminal view of the same rows |
-| `bl realm start` | explicit, foreground (systemd, CI) |
 | `bl realm restart` | drain and respawn this realm only |
 | `bl realm members` | the processes a realm owns, with elapsed time |
-| `bl vm config` | show and set auto-start, idle timeout, scope |
