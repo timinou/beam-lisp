@@ -1,0 +1,195 @@
+; test/bl/system/optimizer_call_shape_test.bl — the ONE canonical call-site
+; reading (system.ir/call-site), and the proof that a rewrite changing
+; RT.invoke → a native :apply cannot drop a call, an effect or a flow edge.
+;
+; A direct-call rewrite turns the callable ABI
+;   RT.invoke(f, [a b])         →   :apply {:fn f :args [a b]}
+; The call graph, the flow facts and the footprint must read BOTH the same
+; way. These tests compare them before/after that rewrite, and pin the
+; control forms (:apply loop/recur/scaffold) as NON-calls.
+(ns system.optimizer-call-shape-test
+  (:require [system.ir :as ir]
+            [system.summary :as s]
+            [system.footprint :as fp]
+            [system.analyze :as an]
+            [compiler :as c]
+            [anf :as a]))
+
+(defn- read1 [s] (first (BeamLisp.Reader/read_string s)))
+(defn- anf1 [s] (c/compile-node (read1 s) (c/new-env "opt-shape")))
+
+(defn- cons-pack
+  "The compiler's argument chain: [n1 n2] → (cons n1 (cons n2 enil))."
+  [nodes]
+  (reduce (fn [acc n] (a/cons-cell n acc)) a/enil (reverse nodes)))
+
+(defn- inv
+  "The callable-ABI call the compiler emits: RT.invoke(callee, CONS)."
+  [callee args]
+  (a/remote ir/inv-mod :invoke (list callee (cons-pack args))))
+
+(defn- app
+  "The native apply a direct-call rewrite emits: args already unpacked."
+  [callee args]
+  (a/app callee args))
+
+; ── the test-local rewriter: RT.invoke → native :apply ────────────────────
+;
+; A faithful stand-in for the optimizer's structural rewrite: every
+; RT.invoke(f, CONS) becomes :apply {:fn f :args (cells of CONS)}, everything
+; else is rebuilt as-is. Only the call shape changes.
+
+(defn- rewrite-to-apply [x]
+  (cond
+    (ir/node? x)
+      (let [y (reduce (fn [m k] (assoc m k (rewrite-to-apply (get m k)))) x (keys x))]
+        (if (and (= :remote (:op y)) (= (:mod y) ir/inv-mod) (= (:fun y) :invoke))
+          (let [args (:args y)]
+            {:op :apply :fn (first args) :args (ir/cons-args (second args)) :ann (:ann y)})
+          y))
+    (and (map? x) (contains? x :body) (contains? x :pats))
+      (assoc x :guard (rewrite-to-apply (:guard x)) :body (rewrite-to-apply (:body x)))
+    (list? x)   (apply list (map rewrite-to-apply x))
+    (vector? x) (into [] (map rewrite-to-apply x))
+    :else x))
+
+; ── the reading itself ────────────────────────────────────────────────────
+
+(deftest call-site-reads-the-callable-abi
+  (let [xs (a/var "x") l (a/lit 1)
+        cs (ir/call-site (inv (a/global "u" "g") (list xs l)))]
+    (is (= :invoke (:mode cs)) "RT.invoke is the callable ABI")
+    (is (= "g" (:name (:callee cs))) "the callee is the first argument")
+    (is (= [xs l] (:args cs)) "the cons chain is unpacked to the argument nodes")
+    (is (= 2 (:arity cs)) "arity is the READ count, not an annotation")
+    (is (nil? (:mod cs)) "a user call names no host module")))
+
+(deftest call-site-reads-a-native-apply
+  (let [xs (a/var "x") l (a/lit 1)
+        cs (ir/call-site (app (a/global "u" "g") (list xs l)))]
+    (is (= :apply (:mode cs)) "a native apply is its own ABI mode")
+    (is (= "g" (:name (:callee cs))))
+    (is (= [xs l] (:args cs)) "apply args are NOT cons-packed")
+    (is (not= :cons (:op (first (:args cs)))) "the first argument is the node, not a cell")
+    (is (= 2 (:arity cs)))))
+
+(deftest call-site-reads-a-resolved-remote
+  (let [l (a/lit 1)
+        cs (ir/call-site (a/remote :erlang :+ (list l l)))]
+    (is (= :remote (:mode cs)))
+    (is (nil? (:callee cs)) "a remote call has no callee node")
+    (is (= :erlang (:mod cs)))
+    (is (= :+ (:fun cs)))
+    (is (= 2 (:arity cs)) "the exact primitive arity")))
+
+(deftest call-site-is-nil-for-non-calls
+  (is (nil? (ir/call-site (a/var "x"))))
+  (is (nil? (ir/call-site (a/lit 1))))
+  (is (nil? (ir/call-site (a/fnn (list (a/clause (list (a/pvar "x")) nil (a/var "x"))))))
+      "a fn VALUE is construction, deferred — not a call"))
+
+; ── the invoke/apply pair agrees on everything but the mode ───────────────
+
+(deftest invoke-and-apply-share-callee-args-and-arity
+  (let [callee (a/global "u" "g") xs (a/var "x") l (a/lit 1)
+        ci (ir/call-site (inv callee (list xs l)))
+        ca (ir/call-site (app callee (list xs l)))]
+    (is (= (:callee ci) (:callee ca)) "same callee node")
+    (is (= (:args ci) (:args ca)) "same argument nodes")
+    (is (= (:arity ci) (:arity ca)) "same arity")
+    (is (not= (:mode ci) (:mode ca)) "but the callable ABI and native apply stay distinct")))
+
+; ── control :apply forms are not external calls ───────────────────────────
+
+(deftest loop-scaffold-recur-and-knot-are-not-calls
+  (let [loop-node (anf1 "(loop [i 0] (recur (inc i)))")
+        parts (ir/loop-parts loop-node)
+        recur-node (:body parts)
+        knot (:body (:fn loop-node))]
+    (is (ir/anf-loop? loop-node) "the loop scaffold is the compiled control form")
+    (is (nil? (ir/call-site loop-node)) "the loop scaffold is not an external call")
+    (is (ir/recur? recur-node) "the back-edge is a recur")
+    (is (nil? (ir/call-site recur-node)) "the recur back-edge is not an external call")
+    (is (nil? (ir/call-site knot)) "the self scaffold's knot is not a call")
+    (is (not (contains? (s/calls-in loop-node) [:flow (:self parts)]))
+        "the self-application invents no [:flow self] callee")
+    (is (not (contains? (s/calls-in loop-node) (:self parts)))
+        "and no self-named callee either")))
+
+(deftest loop-footprint-is-its-body-not-a-call
+  (let [loop-node (anf1 "(loop [i 0] (recur (inc i)))")
+        body (:body (ir/loop-parts loop-node))]
+    (is (= (fp/fp-anf body) (fp/fp-anf loop-node))
+        "the scaffold contributes only its inits (here none) and its body")))
+
+; ── construction (deferred) versus invocation (realized) ──────────────────
+
+(deftest pure-construction-versus-invocation
+  (let [f (anf1 "(fn [a] (swap! a inc))")
+        xs (a/var "x")]
+    (is (= {} (fp/fp-anf f)) "constructing the fn has no footprint — it is deferred")
+    (is (nil? (ir/call-site f)) "the fn value is not a call")
+    (let [ivi (fp/fp-anf (inv f (list xs)))
+          apv (fp/fp-anf (app f (list xs)))]
+      (is (contains? ivi fp/opaque-world) "invoking the VALUE realizes its effect")
+      (is (= ivi apv) "invoke and native apply of the same value effect identically"))))
+
+; ── unknown native values are opaque; known globals resolve ───────────────
+
+(deftest unknown-callable-value-stays-opaque
+  (let [f (a/var "f") l (a/lit 1)]
+    (is (= {fp/opaque-world :W} (fp/fp-anf (app f (list l))))
+        "a native apply of an unknown value is opaque")
+    (is (= (fp/fp-anf (inv f (list l))) (fp/fp-anf (app f (list l))))
+        "and matches the callable-ABI reading of the same value")))
+
+(deftest known-global-target-resolves-for-both-shapes
+  (let [g (a/global "u" "helper") l (a/lit 1)
+        resolve (fn [name] (if (= name "helper") {"acc" :W} :unknown))
+        ivi (fp/fp-anf ir/empty-aliases resolve (inv g (list l)))
+        apv (fp/fp-anf ir/empty-aliases resolve (app g (list l)))]
+    (is (= {"acc" :W} ivi) "a known global callee contributes its summary")
+    (is (= ivi apv) "the native apply resolves it consistently")))
+
+(deftest author-annotations-grant-no-facts
+  (let [f (a/var "f") l (a/lit 1)
+        n (assoc (app f (list l)) :ann {:pure true :arity 0 :native true})]
+    (is (= {fp/opaque-world :W} (fp/fp-anf n))
+        "a forged :ann cannot make an unknown callable pure")
+    (is (= 1 (:arity (ir/call-site n)))
+        "arity is the read argument count, never the authored :arity")))
+
+; ── reusing the reading: calls, footprints, flow, returns ─────────────────
+
+(deftest rewrite-invoke-to-apply-preserves-readings
+  (let [bodies (an/fn-bodies "(defn helper [x] (erlang/+ x 1))
+                              (defn main [] (helper 4))")
+        body (:body (get bodies "main"))
+        known {"helper" #{:int}}
+        resolve (fn [name] (if (= name "helper") {"acc" :W} :unknown))]
+    (is (= :invoke (:mode (ir/call-site body))) "the compiler emitted the callable ABI")
+    (let [rw (rewrite-to-apply body)]
+      (is (= :apply (:mode (ir/call-site rw))) "the rewrite produced a native apply")
+      (is (= (s/calls-in body) (s/calls-in rw)) "the call SET is unchanged")
+      (is (= (s/summarize known resolve body) (s/summarize known resolve rw))
+          "the whole summary — footprint, returns, calls — is unchanged"))))
+
+(deftest rewrite-preserves-higher-order-flow-keys
+  (let [bodies (an/fn-bodies "(defn main [f y] (f y))")
+        body (:body (get bodies "main"))
+        rw (rewrite-to-apply body)]
+    (is (some (fn [k] (and (vector? k) (= :flow (first k)))) (s/calls-in body))
+        "the parameter call is a higher-order flow key")
+    (is (= (s/calls-in body) (s/calls-in rw))
+        "the flow key survives RT.invoke → native apply")))
+
+(deftest rewrite-preserves-every-clause
+  (let [bodies (an/fn-bodies "(defn helper [x] x)
+                              (defn helper2 [x y] x)
+                              (defn mc ([x] (helper x)) ([x y] (helper2 x y)))")
+        clauses (:clauses (get bodies "mc"))]
+    (is (= 2 (count clauses)) "both arities are analyzed")
+    (doseq [cl clauses]
+      (let [rw (rewrite-to-apply (:body cl))]
+        (is (= (s/calls-in (:body cl)) (s/calls-in rw))
+            "each clause's call set is unchanged by the rewrite")))))
