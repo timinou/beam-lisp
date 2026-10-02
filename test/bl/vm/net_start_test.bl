@@ -1,0 +1,133 @@
+; net_start_test.bl — one daemon per endpoint, exactly.
+;
+; `vm.net/listen` used to unlink the socket path and bind, so a second start for
+; the same endpoint took the path from the first: both returned {:ok …}, both
+; accept loops lived, and the first was left running and unreachable. These tests
+; state the contract that replaced it: one winner, the rest told so, the path
+; always reaching the winner.
+;
+; NB the old behaviour was measured separately (two `listen` calls in one VM, both
+; {:ok …}); these tests use `net/answering?` and the lock constants, which the old
+; code does not have, so they cannot be run against it to show a red-then-green.
+
+(ns vm.net-start-test
+  (:require [vm.net :as net] [vm.paths :as paths]))
+
+(defn- with-runtime [f]
+  (let [prev (System/get_env "XDG_RUNTIME_DIR")
+        rt (str "/tmp/bl-netstart-" (erlang/apply :erlang :unique_integer (list (to-list [:positive]))))]
+    (File/mkdir_p! rt)
+    (File/chmod rt 448)
+    (System/put_env "XDG_RUNTIME_DIR" rt)
+    (try (f rt)
+         (finally
+           (if (nil? prev) (System/delete_env "XDG_RUNTIME_DIR") (System/put_env "XDG_RUNTIME_DIR" prev))
+           (File/rm_rf! rt)))))
+
+(defn- project [rt]
+  (let [root (str rt "/proj")]
+    (File/mkdir_p! (str root "/priv/boot"))
+    (File/write! (str root "/priv/boot/core.bl") "")
+    root))
+
+(def NOOP (fn [_frame _send] nil))
+
+(defn- sock-of [root] (:sock (:ok (paths/endpoints root))))
+
+(deftest a-second-start-for-one-endpoint-is-refused-and-the-first-survives
+  (testing "the measured failure: the second used to take the path"
+    (with-runtime
+      (fn [rt]
+        (let [root (project rt)
+              a (net/listen root NOOP)
+              b (net/listen root NOOP)]
+          (is (contains? a :ok))
+          (is (= {:error :already-running} b) "the loser is told, not given a socket")
+          (is (net/answering? (sock-of root)) "and the path still reaches the first")
+          (is (erlang/is_process_alive (:pid (:ok a))) "whose accept loop is still running")
+          (net/stop (:ok a)))))))
+
+(deftest many-simultaneous-starts-yield-exactly-one-daemon
+  (testing "N processes call listen at once; the lock makes them take turns"
+    (with-runtime
+      (fn [rt]
+        (let [root (project rt)
+              me (erlang/self)
+              n 12
+              ;; The listen socket belongs to the process that called `listen`, and
+              ;; closes when that process dies. In production that is the daemon
+              ;; process, which lives for the daemon's whole life; so each worker
+              ;; here STAYS ALIVE until told to go, or the winner's socket would
+              ;; vanish the moment its worker returned.
+              _ (doseq [i (range n)]
+                  (spawn (fn []
+                           (erlang/send me (tuple :done (net/listen root NOOP)))
+                           (receive :go :ok (after 30000 :ok)))))
+              results (vec (map (fn [_] (receive [:done r] r (after 20000 :timeout))) (range n)))
+              winners (filter (fn [r] (and (map? r) (contains? r :ok))) results)
+              refused (filter (fn [r] (= {:error :already-running} r)) results)]
+          (is (= 1 (count winners)) "exactly one bound")
+          (is (= (- n 1) (count refused)) "every other was told a daemon is already there")
+          (is (empty? (filter (fn [r] (= :timeout r)) results)) "nobody hung on the lock")
+          (is (net/answering? (sock-of root)))
+          (is (not (File/exists? (:lock (:ok (paths/endpoints root))))) "the lock is released")
+          (net/stop (:ok (first winners))))))))
+
+(deftest a-socket-left-by-a-crash-is-reclaimed
+  (testing "a file at the path that nothing accepts on is a corpse, not a daemon"
+    (with-runtime
+      (fn [rt]
+        (let [root (project rt)
+              a (net/listen root NOOP)
+              sock (sock-of root)]
+          ;; simulate a crash: close the listener without unlinking anything
+          (gen_tcp/close (:lsock (:ok a)))
+          (erlang/apply :timer :sleep (list 100))
+          (is (File/exists? sock) "the dead socket's file is still there")
+          (is (not (net/answering? sock)) "and nothing accepts on it")
+          (let [b (net/listen root NOOP)]
+            (is (contains? b :ok) "so a new start takes it over")
+            (is (net/answering? sock))
+            (net/stop (:ok b))))))))
+
+(deftest a-lock-left-by-a-dead-starter-does-not-wedge-the-endpoint
+  (testing "a lock older than the stale age is recovered"
+    (with-runtime
+      (fn [rt]
+        (let [root (project rt)
+              lock (:lock (:ok (paths/endpoints root)))
+              long-ago (- (erlang/system_time :millisecond) (* 2 net/LOCK-STALE-MS))]
+          (File/mkdir_p! (Path/dirname lock))
+          (File/write! lock (str "99999 " long-ago))
+          (let [r (net/listen root NOOP)]
+            (is (contains? r :ok) "the start went through")
+            (is (not (File/exists? lock)))
+            (net/stop (:ok r))))))))
+
+(deftest a-fresh-lock-is-respected
+  (testing "a lock someone just took is waited for, not stolen"
+    (with-runtime
+      (fn [rt]
+        (let [root (project rt)
+              lock (:lock (:ok (paths/endpoints root)))]
+          (File/mkdir_p! (Path/dirname lock))
+          (File/write! lock (str "99999 " (erlang/system_time :millisecond)))
+          (let [me (erlang/self)
+                _ (spawn (fn []
+                           (erlang/send me (tuple :r (net/listen root NOOP)))
+                           (receive :go :ok (after 30000 :ok))))]
+            ;; release it shortly: the waiting starter must then proceed
+            (erlang/apply :timer :sleep (list 300))
+            (File/rm lock)
+            (let [r (receive [:r x] x (after 8000 :timeout))]
+              (is (and (map? r) (contains? r :ok)) "it waited, then bound")
+              (when (and (map? r) (contains? r :ok)) (net/stop (:ok r))))))))))
+
+(deftest answering-is-honest-about-a-path-with-nothing-behind-it
+  (with-runtime
+    (fn [rt]
+      (is (not (net/answering? (str rt "/no-such.sock"))))
+      (File/write! (str rt "/plain-file.sock") "")
+      (is (not (net/answering? (str rt "/plain-file.sock"))) "a regular file is not a daemon"))))
+
+(run-tests)

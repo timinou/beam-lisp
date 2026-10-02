@@ -16,7 +16,27 @@
 ;   (net/listen root handler)   → {:ok listener} | {:error reason}
 ;       handler : (fn [frame conn-send] …)  called per decoded request frame;
 ;                 conn-send is (fn [bytes] …) to write a frame back.
+;       {:error :already-running} when a LIVE daemon already answers on this
+;       endpoint — the caller attaches to it; it is not a failure to report.
+;   (net/answering? sock-path)  → true | false   does anything accept there?
 ;   (net/stop listener)         → :ok
+;
+; ══ ONE DAEMON PER ENDPOINT, EXACTLY ════════════════════════════════════════
+;
+; A unix socket is a FILE, and binding over a file that exists is not an error
+; here: `listen` used to unlink the path and bind, so a second start for the
+; same endpoint took the path from the first (measured: both `listen`s returned
+; {:ok …}, both accept loops lived, the path reached the second, and the first
+; kept running unreachable). Two things close it:
+;
+;   • the bind happens under the endpoint's `.start` lock — an exclusive create,
+;     held for milliseconds, so two starters take turns instead of racing;
+;   • inside the lock the existing path is PROBED, not trusted: something that
+;     accepts is a live daemon (→ :already-running); something that refuses is
+;     the leftover of a crash and is reclaimed.
+;
+; A lock whose holder died inside its millisecond section is recovered by age
+; (LOCK-STALE-MS), so a crash can delay a start but never wedge it.
 
 (ns vm.net
   (:require [vm.wire :as wire] [vm.paths :as paths]))
@@ -33,6 +53,79 @@
 
 (defn- connect-opts []
   (list (tuple :inet_backend :inet) :local :binary (tuple :packet 4) (tuple :active false)))
+
+;; How long a starter waits for another starter's bind to finish, how often it
+;; looks, and how old a lock must be before its holder is presumed dead. The wait
+;; is generous (a bind takes milliseconds; a loaded host stretches it), the stale
+;; age is longer than any honest hold.
+(def LOCK-WAIT-MS 5000)
+(def LOCK-POLL-MS 25)
+(def LOCK-STALE-MS 15000)
+(def PROBE-TIMEOUT-MS 500)
+
+(defn answering?
+  "Whether anything accepts connections at the unix socket `sock-path`. A refused
+   connect is the honest proof a socket is dead: the file's existence proves
+   nothing, because a crashed daemon leaves it behind."
+  [sock-path]
+  (let [r (gen_tcp/connect (tuple :local (erlang/binary_to_list sock-path)) 0
+            (connect-opts) PROBE-TIMEOUT-MS)]
+    (if (= :ok (elem r 0))
+      (do (gen_tcp/close (elem r 1)) true)
+      false)))
+
+;; ── the start lock ──────────────────────────────────────────────────────────
+
+(defn- now-ms [] (erlang/system_time :millisecond))
+
+(defn- take-lock
+  "Create `path` exclusively, recording who and when. :ok | {:error reason}."
+  [path]
+  (let [r (erlang/apply :file :open
+            (list (erlang/binary_to_list path) (to-list [:write :exclusive :binary])))]
+    (if (= :ok (elem r 0))
+      (let [fd (elem r 1)]
+        (erlang/apply :file :write
+          (list fd (str (erlang/apply :os :getpid (list)) " " (now-ms))))
+        (erlang/apply :file :close (list fd))
+        :ok)
+      {:error (elem r 1)})))
+
+(defn- lock-age-ms
+  "How long ago `path` was taken, from the timestamp it carries; nil when it is
+   unreadable or gone (a lock being released is not an old lock)."
+  [path]
+  (let [r (try (File/read! path) (catch e nil))]
+    (if (erlang/is_binary r)
+      (let [parts (erlang/apply :binary :split (list r " "))]
+        (if (= 2 (count parts))
+          (try (- (now-ms) (erlang/binary_to_integer (nth parts 1))) (catch e nil))
+          nil))
+      nil)))
+
+(defn- acquire-lock
+  "Take the start lock, waiting up to LOCK-WAIT-MS. A lock older than
+   LOCK-STALE-MS belonged to a starter that died mid-bind and is removed."
+  [path]
+  (let [deadline (+ (now-ms) LOCK-WAIT-MS)]
+    (loop []
+      (let [r (take-lock path)]
+        (cond
+          (= :ok r) :ok
+          (not= :eexist (:error r)) {:error (tuple :start-lock (:error r))}
+          (let [age (lock-age-ms path)] (and age (> age LOCK-STALE-MS)))
+            (do (File/rm path) (recur))
+          (> (now-ms) deadline) {:error :start-lock-timeout}
+          :else (do (erlang/apply :timer :sleep (list LOCK-POLL-MS)) (recur)))))))
+
+(defn- with-start-lock
+  "Run `f` holding the endpoint's start lock; release it however `f` ends.
+   {:error …} when the lock could not be had."
+  [path f]
+  (let [l (acquire-lock path)]
+    (if (= :ok l)
+      (try (f) (finally (File/rm path)))
+      l)))
 
 (defn- frame-recv [conn timeout-ms]
   (let [r (gen_tcp/recv conn 0 timeout-ms)]
@@ -122,34 +215,48 @@
     [:DOWN _ref :process _pid _reason] :ok
     (after 0 :ok)))
 
+(defn- bind-endpoint
+  "Bind `sock-path`, chmod it, mint the token if absent, start accepting, and
+   write the meta. Called only under the start lock, after the path was probed."
+  [root handler paths-map]
+  (let [sock-path (:sock paths-map)
+        token-path (:token paths-map)
+        charlist (erlang/binary_to_list sock-path)]
+    ;; reaching here means nothing answers: whatever file is at the path is the
+    ;; leftover of a daemon that died without unlinking it
+    (File/rm sock-path)
+    (let [lr (gen_tcp/listen 0 (listen-opts charlist))]
+      (if (not= :ok (elem lr 0))
+        {:error (elem lr 1)}
+        (let [lsock (elem lr 1)]
+          (File/chmod sock-path 384)  ; 0o600
+          (when (not (File/exists? token-path))
+            (File/write! token-path (erlang/apply :crypto :strong_rand_bytes (list 32)))
+            (File/chmod token-path 384))
+          (let [token (File/read! token-path)
+                pid (spawn (fn [] (accept-loop lsock root token handler)))]
+            (write-meta! (:meta paths-map) root (:build paths-map))
+            {:ok {:lsock lsock :pid pid :sock-path sock-path
+                  :token-path token-path :meta-path (:meta paths-map)}}))))))
+
 (defn listen
   "Bind the daemon socket for `root` and accept connections, dispatching each
    decoded request frame to `handler` (fn [frame conn-send]). Returns
    {:ok {:lsock :pid :sock-path}} | {:error reason}. The socket is chmod 0600 —
-   the security boundary is file perms + the hello token."
+   the security boundary is file perms + the hello token.
+
+   One daemon per endpoint: when a live daemon already answers there, returns
+   {:error :already-running} and touches nothing of it."
   [root handler]
   (let [ep (paths/endpoints root)]
     (if (nil? (:ok ep))
       ep
-      (let [paths-map (:ok ep)
-            sock-path (:sock paths-map)
-            token-path (:token paths-map)
-            charlist (erlang/binary_to_list sock-path)]
-        (File/rm sock-path)
-        (let [lr (gen_tcp/listen 0 (listen-opts charlist))]
-          (if (not= :ok (elem lr 0))
-            {:error (elem lr 1)}
-            (let [lsock (elem lr 1)]
-              (File/chmod sock-path 384)  ; 0o600
-              ;; mint + persist the token if absent
-              (when (not (File/exists? token-path))
-                (File/write! token-path (erlang/apply :crypto :strong_rand_bytes (list 32)))
-                (File/chmod token-path 384))
-              (let [token (File/read! token-path)
-                    pid (spawn (fn [] (accept-loop lsock root token handler)))]
-                (write-meta! (:meta paths-map) root (:build paths-map))
-                {:ok {:lsock lsock :pid pid :sock-path sock-path
-                      :token-path token-path :meta-path (:meta paths-map)}}))))))))
+      (let [paths-map (:ok ep)]
+        (with-start-lock (:lock paths-map)
+          (fn []
+            (if (answering? (:sock paths-map))
+              {:error :already-running}
+              (bind-endpoint root handler paths-map))))))))
 
 (defn- write-meta!
   "Record who serves this socket: the OS pid, the tree, the build, and when it
