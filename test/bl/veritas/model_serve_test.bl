@@ -1,0 +1,175 @@
+; test/bl/veritas/model_serve_test.bl — a model served over HTTP IS a fake service.
+; Commands are tried in sorted name order, so :create-fail (a fault) outranks :create-ok.
+; One stateful "servers" API (a slice of the Hetzner shape): routes + params,
+; query, JSON bodies, :pre selection, 404/409, fault injection, serialization,
+; port release, the request log, and `check` still working on the same model.
+
+(ns veritas.model-serve-test
+  (:require [veritas.model :as vm]))
+
+(defn- id-of [req] (String/to_integer (get (:params req) "id")))
+
+(def api
+  (vm/model "servers"
+    {:state {:next-id 1 :servers {} :fail-next-create false}
+     :init (fn [] nil)
+     :commands
+     {:create-fail {:request [:post "/servers"]
+                    :pre (fn [s _] (:fail-next-create s))
+                    :next (fn [s _] (assoc s :fail-next-create false))
+                    :response (fn [_ _] {:status 500 :body {:error {:code "server_error" :message "injected"}}})}
+      :create-ok   {:request [:post "/servers"]
+                    :args (fn [s g] [{:method :post :path "/servers" :params {} :query {} :headers {}
+                                      :body {"name" "web"}} g])
+                    :pre (fn [s req] (string? (get (:body req) "name")))
+                    :next (fn [s req]
+                            (let [id (:next-id s)]
+                              (-> s (assoc :next-id (+ id 1))
+                                    (assoc-in [:servers id] {"id" id "name" (get (:body req) "name")}))))
+                    :response (fn [s req]
+                                {:status 201 :headers {"X-Made" "yes"}
+                                 :body {"server" (get (:servers s) (- (:next-id s) 1))}})}
+      :get         {:request [:get "/servers/:id"]
+                    :pre (fn [s req] (contains? (:servers s) (id-of req)))
+                    :response (fn [s req] {:body {"server" (get (:servers s) (id-of req))}})}
+      :get-missing {:request [:get "/servers/:id"]
+                    :response (fn [_ req] {:status 404 :body {:error {:code "not_found" :message (get (:params req) "id")}}})}
+      :list        {:request [:get "/servers"]
+                    :response (fn [s req]
+                                (let [want (get (:query req) "name")]
+                                  {:body {"servers" (into [] (filter (fn [x] (or (nil? want) (= want (get x "name"))))
+                                                                     (vals (:servers s))))}}))}
+      :delete      {:request [:delete "/servers/:id"]
+                    :pre (fn [s req] (contains? (:servers s) (id-of req)))
+                    :next (fn [s req] (update s :servers dissoc (id-of req)))}
+      :arm-fault   {:pre (fn [s _] (not (:fail-next-create s)))
+                    :next (fn [s _] (assoc s :fail-next-create true))}}
+     :invariants {:ids-below-next (fn [s _] (every? (fn [id] (< id (:next-id s))) (keys (:servers s))))}}))
+
+(defn- http [srv method path & [body]] (vm/request srv method path body))
+
+(deftest route-params-and-json-body
+  (let [srv (vm/serve api)]
+    (try
+      (let [c (http srv :post "/servers" {"name" "alpha"})]
+        (is (= 201 (:status c)))
+        (is (= "yes" (get (:headers c) "x-made")) "response headers are sent")
+        (is (= {"id" 1 "name" "alpha"} (get (:body c) "server")) ":response sees the POST state")
+        (is (= {"id" 1 "name" "alpha"} (get (:body (http srv :get "/servers/1")) "server")) "path param reaches :pre/:response"))
+      (finally ((:stop srv))))))
+
+(deftest query-string-is-parsed-and-decoded
+  (let [srv (vm/serve api)]
+    (try
+      (http srv :post "/servers" {"name" "a b"})
+      (http srv :post "/servers" {"name" "other"})
+      (is (= 2 (count (get (:body (http srv :get "/servers")) "servers"))))
+      (is (= [{"id" 1 "name" "a b"}] (get (:body (http srv :get "/servers?name=a%20b")) "servers")))
+      (finally ((:stop srv))))))
+
+(deftest pre-selects-the-command
+  ; :get and :get-missing share a route; name order + :pre decides.
+  (let [srv (vm/serve api)]
+    (try
+      (is (= 404 (:status (http srv :get "/servers/9"))))
+      (is (= "9" (get-in (:body (http srv :get "/servers/9")) ["error" "message"])) ":get-missing answered, not the 404 fallback")
+      (http srv :post "/servers" {"name" "x"})
+      (is (= 200 (:status (http srv :get "/servers/1"))))
+      (finally ((:stop srv))))))
+
+(deftest unmatched-route-is-404-and-unmet-pre-is-409
+  (let [srv (vm/serve api)]
+    (try
+      (let [r (http srv :get "/nope")]
+        (is (= 404 (:status r)))
+        (is (= "not_found" (get-in (:body r) ["error" "code"]))))
+      (is (= 404 (:status (http srv :put "/servers"))) "method is part of the route")
+      (let [r (http srv :delete "/servers/5")]
+        (is (= 409 (:status r)))
+        (is (= "conflict" (get-in (:body r) ["error" "code"]))))
+      (is (= 409 (:status (http srv :post "/servers" {"nope" 1}))) ":pre rejects a body with no name")
+      (finally ((:stop srv))))))
+
+(deftest bad-json-is-400-and-oversized-body-is-413
+  (let [srv (vm/serve api)]
+    (try
+      (is (= 400 (:status (http srv :post "/servers" "{not json"))))
+      (is (= 413 (:status (http srv :post "/servers" (apply str (repeat 1100000 "x"))))))
+      (is (= {} (:servers ((:state srv)))) "refused input never reaches the model")
+      (is (= 0 (count ((:log srv)))) "…and is not logged")
+      (finally ((:stop srv))))))
+
+(deftest inject-runs-a-non-http-command-and-respects-pre
+  (let [srv (vm/serve api)]
+    (try
+      (is (= true (:ok ((:inject! srv) :arm-fault nil))))
+      (is (= true (:fail-next-create ((:state srv)))))
+      (is (= {:ok false :reason :pre} ((:inject! srv) :arm-fault nil)) "already armed → :pre refuses")
+      (is (= {:ok false :reason :unknown} ((:inject! srv) :nope nil)))
+      (is (= 500 (:status (http srv :post "/servers" {"name" "x"}))) "the armed fault fires once")
+      (is (= 201 (:status (http srv :post "/servers" {"name" "x"}))) "…then the model recovers")
+      (finally ((:stop srv))))))
+
+(deftest concurrent-creates-serialize
+  (let [srv (vm/serve api)
+        parent (erlang/self)
+        n 40]
+    (try
+      (doseq [i (range 0 n)]
+        (spawn (fn [] (erlang/send parent [:done (get-in (:body (http srv :post "/servers" {"name" (str "s" i)})) ["server" "id"])]))))
+      (let [ids (into [] (map (fn [_] (receive [:done id] id (after 20000 :timeout))) (range 0 n)))]
+        (is (= n (count (distinct ids))) "N parallel creates → N distinct ids")
+        (is (= (into [] (range 1 (+ n 1))) (into [] (sort ids)))))
+      (is (= n (count (:servers ((:state srv))))))
+      (finally ((:stop srv))))))
+
+(deftest stop-frees-the-port
+  (let [a (vm/serve api)
+        port (:port a)]
+    (is (> port 0) "port 0 reports the real bound port")
+    (is (= (str "http://127.0.0.1:" port) (:url a)))
+    ((:stop a))
+    (let [b (vm/serve api {:port port})]
+      (try
+        (is (= port (:port b)) "the same port binds again")
+        (is (= 404 (:status (http b :get "/x"))))
+        (finally ((:stop b)))))))
+
+(deftest log-records-requests-and-is-bounded
+  (let [srv (vm/serve api)]
+    (try
+      (http srv :post "/servers" {"name" "x"})
+      (http srv :get "/servers?name=x")
+      (http srv :get "/zzz")
+      (let [l ((:log srv))]
+        (is (= [:create-ok :list nil] (map :command l)))
+        (is (= [201 200 404] (map :status l)))
+        (is (= [:post :get :get] (map :method l)))
+        (is (= {"name" "x"} (:query (second l)))))
+      (doseq [_ (range 0 505)] (http srv :get "/zzz"))
+      (is (= 500 (count ((:log srv)))) "the log keeps the last 500")
+      (finally ((:stop srv))))))
+
+(deftest deterministic-replay-of-a-request-sequence
+  (let [run (fn []
+              (let [srv (vm/serve api)]
+                (try
+                  [(:body (http srv :post "/servers" {"name" "a"}))
+                   (:body (http srv :post "/servers" {"name" "b"}))
+                   (:status (http srv :delete "/servers/1"))
+                   (:body (http srv :get "/servers"))]
+                  (finally ((:stop srv))))))]
+    (is (= (run) (run)))))
+
+(deftest state-override
+  (let [srv (vm/serve api {:state {:next-id 10 :servers {} :fail-next-create false}})]
+    (try
+      (is (= 10 (get-in (:body (http srv :post "/servers" {"name" "x"})) ["server" "id"])))
+      (finally ((:stop srv))))))
+
+(deftest check-still-works-on-a-served-model
+  ; :create-ok has :args drawing req-shaped maps; served-only commands without :args
+  ; are not generated; :run is optional.
+  (let [v (vm/check api {:histories 20 :max-len 6})]
+    (is (= :witnessed (:modality v)))
+    (is (pos? (get (:coverage v) :create-ok 0)))))
