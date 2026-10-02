@@ -1,6 +1,6 @@
 // Daemon fast-path for the `bl` launcher.
 //
-// When a warm `bl daemon` is running for the caller's tree, the launcher
+// When a warm VM is running for the caller's tree, the launcher
 // forwards the command over an `AF_UNIX` socket and streams the reply, instead
 // of cold-booting the release VM (~1.2s → ~30ms). This module is a MINIMAL,
 // self-contained ETF (Erlang term) codec + socket client — no serde, no extra
@@ -583,7 +583,7 @@ fn stream_until_exit(stream: &mut UnixStream) -> Attach {
                     let code = t.get(4).and_then(|x| x.as_int()).unwrap_or(0);
                     if code != 0 && !wrote_anything {
                         eprintln!(
-                            "bl: the daemon ended this command with exit {code} and no output; \
+                            "bl: the warm VM ended this command with exit {code} and no output; \
                              run it cold (`bl --cold …`) to see why"
                         );
                     }
@@ -598,7 +598,7 @@ fn stream_until_exit(stream: &mut UnixStream) -> Attach {
                         wrote_anything = wrote_anything || !b.is_empty();
                     }
                     if !wrote_anything {
-                        eprintln!("bl: the daemon refused this command (exit {code})");
+                        eprintln!("bl: the warm VM refused this command (exit {code})");
                     }
                     return Attach::Exit(code as i32);
                 }

@@ -65,10 +65,9 @@ fork, not by an OS process.
 | [`vocabulary.md`](vocabulary.md) | each noun in full: what it is, what it is not, its lifetime, when to reach for it |
 | [`architecture.md`](architecture.md) | the layers, the registry record, liveness, the data flow for a command |
 | [`commands.md`](commands.md) | every verb, its flags, its output, its exit codes |
-| [`console.md`](console.md) | the `bl ui` machine page: views, actions, the design rules it follows |
+| [`console.md`](console.md) | the `bl vm ui` machine page: views, actions, the design rules it follows |
 | [`security.md`](security.md) | the trust model: who may stop what, and why the page cannot be turned on you |
 | [`caveats.md`](caveats.md) | what breaks, what is not yet true, what to watch while building it |
-| [`migration.md`](migration.md) | old name → new name, and how the cutover happens |
 
 The build order is the PLAN in `!tasks/plans/`. This folder says what the
 system *is*; the plan says how to get there.

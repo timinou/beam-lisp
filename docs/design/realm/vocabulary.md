@@ -111,8 +111,8 @@ the project file, the fork primitive, and a process's OS variables. Users meet
 
 | they say | they mean | the word |
 |---|---|---|
-| "my daemon" | my project, warm | **realm** |
-| "the daemon process" | the OS process | **vm** |
+| "my warm VM" | my project, alive and warm | **realm** |
+| "the process" | the OS process | **vm** |
 | "env" | the project file | **project** (`env.bl`) |
 
 ## What each one answers

@@ -122,37 +122,32 @@ fn warm_spelling(v: &str) -> Option<Transport> {
 
 // ── verb recognition ────────────────────────────────────────────────────────
 
-/// The verb sequence that starts a warm VM, and — when deprecated — the
-/// spelling that replaces it.
-pub type StartSpelling = (&'static [&'static str], Option<&'static str>);
-
 /// The verb that starts a warm VM in the foreground: `realm start`.
 pub const REALM_START: &[&str] = &["realm", "start"];
 /// The verb that stops the warm VM: `realm stop`.
 pub const REALM_STOP: &[&str] = &["realm", "stop"];
 
-/// Every invocation that ASKS the launcher to start a warm VM. `bl realm start`
-/// is the spelling; `bl daemon start` still works and is nudged once.
-pub const START_SPELLINGS: &[StartSpelling] =
-    &[(REALM_START, None), (&["daemon", "start"], Some("bl realm start"))];
-
-/// Whether `argv` is a request to start a warm VM. `--foreground` is NOT a
-/// request: that invocation must reach the VM, which becomes the warm VM in
-/// the foreground.
-pub fn start_requested(argv: &[String]) -> Option<&'static StartSpelling> {
+/// Whether `argv` is a request for the launcher to start a warm VM: the verb
+/// sequence `realm start`, with the global flags before the verb skipped. The
+/// old `daemon start` is NOT recognised here — the launcher knows only the new
+/// spelling, so it is just an unknown verb. `--foreground` is NOT a request:
+/// that invocation must reach the VM, which becomes the warm VM in the
+/// foreground.
+pub fn start_requested(argv: &[String]) -> bool {
     if flag_present(argv, FOREGROUND_FLAG) {
-        return None;
+        return false;
     }
-    let i = verb_index(argv)?;
-    START_SPELLINGS
-        .iter()
-        .find(|(words, _)| words.iter().enumerate().all(|(k, w)| argv.get(i + k).map(String::as_str) == Some(*w)))
+    let Some(i) = verb_index(argv) else {
+        return false;
+    };
+    REALM_START.iter().enumerate().all(|(k, w)| argv.get(i + k).map(String::as_str) == Some(*w))
 }
 
-/// Verbs the launcher never attaches for: they talk to the warm VM themselves
-/// (`start` / `stop` / `status`), so they must reach the release path — exactly
-/// as a bare `daemon` did.
-pub const LIFECYCLE_VERBS: &[&str] = &["daemon", "realm"];
+/// Verbs the launcher never attaches for: `realm` and `vm` manage warm VMs
+/// themselves, so they must run in a FRESH process — a `bl vm stop X` running
+/// INSIDE warm VM X could not stop X (the command would cut itself off). They
+/// never attach to a warm VM.
+pub const LIFECYCLE_VERBS: &[&str] = &["realm", "vm"];
 
 /// The release argv that starts a warm VM for `root` in the foreground.
 pub fn warm_start_argv(root: &Path) -> Vec<String> {
@@ -173,12 +168,6 @@ pub fn warm_stop_argv(root: &Path) -> Vec<String> {
 
 fn words(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
-}
-
-/// The one line that nudges a deprecated start spelling to its replacement
-/// (`START_SPELLINGS`). Built from the table, so the words cannot drift.
-pub fn deprecation_line(words: &[&str], replacement: &str) -> String {
-    format!("bl: `bl {}` is deprecated; use `{replacement}`", words.join(" "))
 }
 
 #[cfg(test)]
@@ -254,40 +243,43 @@ mod transport_tests {
         assert_eq!(verb_index(&a(&["--root"])), None);
     }
 
-    /// The start table: realm start is the spelling, daemon start is nudged,
-    /// and `--foreground` is not a request (it reaches the VM).
+    /// `realm start` is the request; a global flag before the verb is skipped.
     #[test]
-    fn the_start_spelling_table() {
-        let new = start_requested(&a(&["realm", "start"])).expect("realm start is a request");
-        assert_eq!(new.0, REALM_START);
-        assert_eq!(new.1, None);
-
-        let old = start_requested(&a(&["daemon", "start"])).expect("daemon start still works");
-        assert_eq!(old.0, &["daemon", "start"][..]);
-        assert_eq!(old.1, Some("bl realm start"));
-
-        assert!(start_requested(&a(&["--json", "realm", "start"])).is_some());
-        assert!(start_requested(&a(&["--root", "/x", "daemon", "start"])).is_some());
-
-        assert!(start_requested(&a(&["realm", "start", "--foreground"])).is_none());
-        assert!(start_requested(&a(&["realm"])).is_none());
-        assert!(start_requested(&a(&["realm", "stop"])).is_none());
-        assert!(start_requested(&a(&["run", "realm", "start"])).is_none(), "an argument is not a verb");
-    }
-
-    /// The deprecation nudge for the old spelling is exactly one line, naming
-    /// the replacement it was built from.
-    #[test]
-    fn the_deprecation_line_names_the_replacement() {
-        assert_eq!(
-            deprecation_line(&["daemon", "start"], "bl realm start"),
-            "bl: `bl daemon start` is deprecated; use `bl realm start`"
+    fn realm_start_is_a_start_request() {
+        assert!(start_requested(&a(&["realm", "start"])));
+        assert!(
+            start_requested(&a(&["--json", "realm", "start"])),
+            "a global flag before the verb is skipped"
         );
+        assert!(start_requested(&a(&["--root", "/x", "realm", "start"])), "--root takes a value");
+        assert!(start_requested(&a(&["realm", "start", "--json"])), "a trailing flag does not hide the request");
     }
 
     #[test]
-    fn lifecycle_verbs_are_daemon_and_realm() {
-        assert_eq!(LIFECYCLE_VERBS, &["daemon", "realm"]);
+    fn realm_start_foreground_is_not_a_start_request() {
+        assert!(!start_requested(&a(&["realm", "start", "--foreground"])));
+    }
+
+    /// The old spelling is gone: to the launcher it is just an unknown verb.
+    #[test]
+    fn daemon_start_is_not_a_start_request() {
+        assert!(!start_requested(&a(&["daemon", "start"])));
+    }
+
+    #[test]
+    fn argv_that_is_not_the_verb_is_not_a_request() {
+        assert!(!start_requested(&a(&["realm", "stop"])));
+        assert!(!start_requested(&a(&["realm"])));
+        assert!(!start_requested(&a(&["realm", "started"])));
+        assert!(!start_requested(&a(&["run", "realm", "start"])), "an argument is not a verb");
+    }
+
+    #[test]
+    fn lifecycle_verbs_are_realm_and_vm() {
+        assert_eq!(LIFECYCLE_VERBS, &["realm", "vm"]);
+        for v in ["test", "run", "eval"] {
+            assert!(!LIFECYCLE_VERBS.contains(&v), "{v} attaches to a warm VM");
+        }
     }
 
     /// Warm start/stop hand the release named arguments, not string soup.

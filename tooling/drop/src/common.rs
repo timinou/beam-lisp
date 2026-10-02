@@ -187,7 +187,7 @@ pub fn safe_path(base: &std::path::Path, rel: &std::path::Path) -> std::io::Resu
 pub fn extract_tar_gz(payload: &[u8], dest: &std::path::Path) -> std::io::Result<()> {
     // Stage under a name only THIS process owns. Two `bl` invocations extract
     // the same version more easily than it looks — an editor opening two
-    // workspaces, `bl daemon start` beside a `bl run`, two jobs on one
+    // workspaces, `bl realm start` beside a `bl run`, two jobs on one
     // machine — and a SHARED staging path makes them delete each other's work
     // mid-unpack (observed: "failed to unpack … into <dir>.tmp/…", and
     // "Directory not empty" when the loser's rename met the winner's tree).

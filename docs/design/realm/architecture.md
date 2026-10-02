@@ -70,7 +70,7 @@ port-claim owners ┘              + memory, uptime (live)
 ### Adoption: the road from today to the registry
 
 A VM that started before the registry has no record. Listing only records would
-make every running daemon **invisible the day this ships** — the opposite of the
+make every running warm VM **invisible the day this ships** — the opposite of the
 goal. So a live `.meta`, a live port claim, and the gateway endpoint each *adopt*
 their pid as a row marked `:legacy`. It is listed, it can be stopped, and it
 becomes an ordinary row the next time that VM starts. Adoption is the migration
@@ -82,7 +82,7 @@ Only concrete problems, each stating a fact and the command that resolves it:
 
 | fact | fix |
 |---|---|
-| names are claimed and no gateway answers | `bl gateway start` |
+| names are claimed and no gateway answers | `bl vm start gateway` |
 | files from VMs that are gone | `bl vm prune` |
 | a warm VM runs a different build than this command | `bl vm stop ID` |
 | VMs started before the registry | restart them |
@@ -103,7 +103,7 @@ mid-answer. A query that matches several VMs is an error that lists them; it
 stops none.
 
 To reach a VM on a *different build*, the client names that build in the hello
-and dials that build's endpoint (`<tree>-<build>.sock`). A daemon rejects a
+and dials that build's endpoint (`<tree>-<build>.sock`). A warm VM rejects a
 client that expects another build with `restart_required`, so naming it is not
 optional.
 
@@ -113,7 +113,7 @@ Removes only what belongs to VMs that are gone:
 
 - registry records whose VM is not live;
 - `.sock/.token/.meta/.pid` groups where **the socket accepts nobody and the
-  meta names no live pid**. Both conditions, so a daemon mid-start (socket not up
+  meta names no live pid**. Both conditions, so a warm VM mid-start (socket not up
   yet, pid alive) is never swept.
 
 Port claims are swept by `vm.ports` as it reads them, so they need no pass.
@@ -150,4 +150,4 @@ token.
 
 The existing `vm.*` namespaces that really mean *realm* (`core`, `owner`, `scope`,
 `osenv`, `spec`, `manager`, `sched`, `index`, `repl`, `inspect`) are renamed
-**last**, mechanically, once behaviour is settled. See [`migration.md`](migration.md).
+**last**, mechanically, once behaviour is settled.

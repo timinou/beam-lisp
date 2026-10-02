@@ -93,10 +93,9 @@ mod verb_tests {
         assert_eq!(v(&["-p"]), None);
         assert_eq!(v(&["--"]), None);
     }
-
-    // `bl realm start` / `bl daemon start` are the invocations the launcher
-    // answers ITSELF; that recognition is the `START_SPELLINGS` table in
-    // transport.rs, tested by `transport_tests::the_start_spelling_table`.
+    // `bl realm start` is the invocation the launcher answers ITSELF; that
+    // recognition is `start_requested` in transport.rs, tested by
+    // `transport_tests::realm_start_is_a_start_request`.
 }
 
 fn fail(msg: &str) -> ! {
@@ -437,8 +436,8 @@ fn maintenance(argv: &[String], t: &Trailer, sha8: &str) -> ! {
 /// instead of looking up `bl` on a PATH where, inside a drop, the first match
 /// can be the release script itself.
 ///
-/// The failure it prevents, seen for real: `bl gateway start` in an installed
-/// drop detached `setsid <payload>/bin/bl gateway run`, and the release script
+/// The failure it prevents, seen for real: `bl vm start gateway` in an installed
+/// drop detached `setsid <payload>/bin/bl vm start gateway --foreground`, and the release script
 /// answered `Usage: bl COMMAND … ERROR: Unknown command gateway`.
 fn self_bl() -> std::path::PathBuf {
     std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bl"))
@@ -454,12 +453,12 @@ fn after_attach(a: Attach) -> Option<i32> {
     match a {
         Attach::Exit(code) => Some(code),
         Attach::LostAfterSend => {
-            eprintln!("bl: daemon connection lost mid-command; outcome unknown");
+            eprintln!("bl: warm VM connection lost mid-command; outcome unknown");
             Some(1)
         }
         Attach::Stalled(secs) => {
             eprintln!(
-                "bl: the daemon has sent nothing — not even its heartbeat — for {secs}s, so it \
+                "bl: the warm VM has sent nothing — not even its heartbeat — for {secs}s, so it \
                  is unresponsive. The command may still be running there, and it is NOT re-run \
                  here (outcome unknown). Run `bl vm` to see it, or `bl vm stop` to end it."
             );
@@ -481,7 +480,7 @@ fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path, t: Transport) -> 
             // Say so: a daemon that vanishes without a word looks like a command
             // that failed for no reason, and the next command pays a cold boot.
             eprintln!(
-                "bl: the daemon for this tree was started from a different build; \
+                "bl: the warm VM for this tree was started from a different build; \
                  stopping it and running this command cold"
             );
             stop_daemon(bin, &root);
@@ -750,8 +749,8 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
     // cold boot. The transport is DECLARED — `--cold` / `--warm`, the tree's
     // `env.bl :warm`, the config, then DEFAULT_TRANSPORT — never read from the
     // environment. Cold skips both this path and the start handoff; lifecycle
-    // verbs (`daemon`, `realm`) never attach, because they talk to the VM
-    // themselves. Every other verb — including repl/serve/mcp/gateway and
+    // verbs (`realm`, `vm`) never attach, because they talk to the VM
+    // themselves. Every other verb — including repl/serve/mcp and
     // `bl watch` — runs in its own VM process under the warm one (PLAN-121), so
     // nothing is exiled to a cold VM to avoid parking a serial worker: there is
     // no serial worker.
@@ -760,39 +759,30 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
         let cwd = std::env::current_dir().ok();
         let root = cwd.as_deref().and_then(|c| tree_root(c, &argv));
         let t = root.as_deref().map(|r| transport(r, &argv)).unwrap_or(DEFAULT_TRANSPORT);
-        let verb = verb_of(&argv);
-        let is_lifecycle = verb.as_deref().is_some_and(|v| LIFECYCLE_VERBS.contains(&v));
-
-        // `bl realm start` (and the deprecated `bl daemon start`) is a REQUEST
-        // for a warm VM, not a command to run inside one. Exec'd, the release
-        // parks in the foreground and dies with the shell that asked for it —
-        // so detach here and return: the VM outlives this process, and the
-        // caller learns whether it actually came up.
-        let start = start_requested(&argv);
-        if let Some((words, deprecated)) = start {
-            if let Some(replacement) = deprecated {
-                eprintln!("{}", deprecation_line(words, replacement));
-            }
-        }
+        let is_lifecycle = verb_of(&argv).as_deref().is_some_and(|v| LIFECYCLE_VERBS.contains(&v));
+        // `bl realm start` is a REQUEST for a warm VM, not a command to run
+        // inside one. Exec'd, the release parks in the foreground and dies with
+        // the shell that asked for it — so detach here and return: the VM
+        // outlives this process, and the caller learns whether it actually came
+        // up.
         if t != Transport::Cold {
-            if start.is_some() {
+            if start_requested(&argv) {
                 if let Some(root) = root.as_deref() {
                     if daemon_ready(root) {
-                        println!("bl: daemon already running for this tree");
+                        println!("bl: a warm VM is already running for this tree");
                         std::process::exit(0);
                     }
 
                     start_daemon_detached(&bin, root);
 
                     if wait_ready(root) {
-                        println!("bl: daemon started — commands for this tree are now warm");
+                        println!("bl: warm VM started — commands for this tree are now warm");
                         std::process::exit(0);
                     }
-                    eprintln!("bl: daemon did not become ready (see `bl realm status`)");
+                    eprintln!("bl: the warm VM did not become ready (see `bl vm`, or `bl realm show`)");
                     std::process::exit(1);
                 }
             }
-
             if !is_lifecycle {
                 if let Some(code) = maybe_attach_daemon(&argv, &bin, t) {
                     std::process::exit(code);

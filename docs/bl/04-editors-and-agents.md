@@ -214,7 +214,7 @@ Each takes `code` (or `path`, a file relative to the tree), and optionally
 slow cell.
 
 ```sh
-$ bl daemon start
+$ bl realm start
 $ bl harness
 harness  http://127.0.0.1:7717/mcp
 config   …/.local/harness/mcp.json  (url + bearer token for an MCP client)
@@ -299,7 +299,7 @@ tools read it from any cell:
 The harness is part of the tree's VM, not a process beside it: its HTTP
 endpoint, its keeper and every turn are members of the VM (`vm.owner`), cells
 evaluate in the VM's env, and every connected agent shares that one VM.
-Draining the VM takes the harness with it; after `bl daemon stop`, run
+Draining the VM takes the harness with it; after `bl realm stop`, run
 `bl harness` again. The code is `priv/lib/harness*` — `harness` (sessions and
 turns), `harness.doc` (blocks), `harness.model` (the model), `harness.mcp` (the
 tools and the endpoint).

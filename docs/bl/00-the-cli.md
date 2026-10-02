@@ -967,22 +967,3 @@ exec bl check --changed
 ```
 
 It is idempotent, and it refuses to overwrite a hook that is not this one.
-
-## Deprecated spellings
-
-These verbs still work: each prints a one-line notice and forwards to its
-replacement.
-
-| old | new |
-|---|---|
-| `bl daemon start` | `bl realm start` |
-| `bl daemon stop` | `bl realm stop` |
-| `bl daemon status` | `bl realm show` |
-| `bl ports` | `bl vm` |
-| `bl open NAME` | `bl realm open NAME` |
-| `bl ui` | `bl vm ui` |
-| `bl gateway start` | `bl vm start gateway` |
-| `bl gateway stop` | `bl vm stop gateway` |
-| `bl gateway status` | `bl vm` |
-| `bl gateway run` | `bl vm start gateway --foreground` |
-

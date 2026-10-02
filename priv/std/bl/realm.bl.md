@@ -102,8 +102,8 @@ the page at `/` renders (`vm.inspect`), so the two faces cannot disagree.
 ## open
 
 `open NAME` prints the address behind a route and, with `--open`, hands it to the
-desktop. A raw port number works too, and a name is looked up across the whole
-machine when this project does not hold it — the verb `bl open` always did.
+desktop. A raw port number works too. A name this project does not hold is looked
+up across the whole machine, so you can open another project's route from anywhere.
 
 ```beam-lisp
 (defn- route-named [h name]

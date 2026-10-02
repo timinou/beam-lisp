@@ -1,8 +1,6 @@
 # The console
 
-`bl ui` should answer one question: **what is running, and is it healthy?** The
-old page answered a different one — *what is this one project's daemon holding?* —
-and put it nine panes deep.
+`bl vm ui` should answer one question: **what is running, and is it healthy?** A project's own dashboard answers a narrower one — *what is my realm holding?*
 
 ## What exists (the first slice)
 
@@ -14,7 +12,7 @@ and put it nine panes deep.
 - under each VM, one tinted row per realm with its path and routes as links;
 - one sentence and the command, when nothing is running.
 
-It renders the same rows as `bl vm`. Verified live: a real daemon appeared in the
+It renders the same rows as `bl vm`. Verified live: a real warm VM appeared in the
 table, the Stop button for a *second* VM stopped that process and removed its
 files, and the page's own VM had no button.
 
@@ -79,7 +77,7 @@ check the rules that are checkable from the CSS text.
 ## What the page deliberately does not do
 
 - Show **a health score**. Each concern states a fact and a command.
-- Offer **start**. Starting a VM is a project's decision (`bl daemon start` in the
+- Offer **start**. Starting a VM is a project's decision (`bl realm start` in the
   project, or auto-start); the machine view is about what already runs.
 - Replace the REPL, the catalog or the schedules page; those stay per-realm.
 - Embed the API reference. That moved off the page.

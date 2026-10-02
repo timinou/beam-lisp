@@ -21,7 +21,7 @@ to drift.
 
 ```beam-lisp
 (ns bl.install
-  (:require [bl.util :as u] [datom] [clojure.string :as str] [vm.gateway]))
+  (:require [bl.util :as u] [datom] [clojure.string :as str] [vm.gateway] [bl.gateway]))
 ```
 
 ## Where things live
@@ -651,7 +651,7 @@ the corpus assembles.
          ""
          "[Service]"
          "Type=simple"
-         (str "ExecStart=" bin " vm start gateway --foreground")
+         (str "ExecStart=" bin " " (join " " bl.gateway/UNIT-EXEC-ARGS))
          "Restart=on-failure"
          "RestartSec=2"
          ""

@@ -51,9 +51,9 @@ isolates *names and capabilities*, not *code*: two realms cannot run different
 versions of a module. That is why **build is part of a VM's identity**, and why
 a project that pins a different build gets a different VM.
 
-## 4. Existing daemons are invisible without adoption
+## 4. Existing warm VMs are invisible without adoption
 
-**Measured.** On this machine two daemons from before the registry were running
+**Measured.** On this machine two warm VMs from before the registry were running
 (one for 2½ days). Listing only records would have shown an empty machine.
 `vm.inventory` therefore adopts live `.meta` files, port-claim owners and the
 gateway endpoint as `:legacy` rows.
@@ -69,19 +69,13 @@ read 8 MB with 237 MB swapped. The listing sums both. **Caveat:** that includes
 memory the kernel may have compressed to zram, so the figure is *what the VM
 holds*, not *what it costs in RAM right now*.
 
-## 6. `bl daemon status` and `bl vm` disagree on vocabulary until the cutover
-
-The first slice adds `bl vm` and `bl realm` beside the old verbs. Until the old
-ones are removed, `bl daemon status` says "daemon" and `bl vm` says "realm".
-This is deliberate: renaming first would have made the slice unreviewable.
-
-## 7. Test harness
+## 6. Test harness
 
 **Measured.**
 
 - `vm.owner` defines a `defserver` with the `(registry …)` clause. Under the
   **ward-isolated** test run (the default) that clause is not registered in the
-  forked VM, so any test that starts a daemon session fails with
+  forked VM, so any test that starts a warm VM session fails with
   `unknown clause registry`. Under `--shared` it passes. This is **pre-existing**:
   `session_test.bl` fails the same way on unmodified HEAD. New tests that start a
   session therefore run with `--shared`.
@@ -93,7 +87,7 @@ This is deliberate: renaming first would have made the slice unreviewable.
   [bl.json])` explicitly. `vm.http` calls it without requiring it and works only
   because something else loaded it first.
 
-## 8. Fresh worktrees do not boot in source mode
+## 7. Fresh worktrees do not boot in source mode
 
 **Measured.** A new worktree of `main` fails to boot: `bl native build` itself
 needs the `lazy_memo` NIF it is meant to produce. Copying the `.so` files from a
@@ -101,7 +95,7 @@ checkout with identical `native/` sources into `priv/native/` (gitignored) fixes
 it. This is a bootstrap problem independent of this design, and it costs the
 first hour of anyone's first worktree.
 
-## 9. Things that are inherently racy
+## 8. Things that are inherently racy
 
 - **Two starts for one endpoint — measured: the second one wins, silently.**
   `vm.net/listen` runs `(File/rm sock-path)` *before* it binds. Calling it twice
@@ -109,7 +103,7 @@ first hour of anyone's first worktree.
   loops alive, and the path now reaches the *second*. The first keeps running and
   is unreachable by name. The only guard is `client/start-foreground`'s probe,
   which is a check followed by a bind, not atomic.
-  - Three simultaneous `bl daemon start` for one root produced one daemon (the
+  - Three simultaneous `bl realm start` for one root produced one warm VM (the
     probe happened to serialise them; the other two died loading modules while the
     first was compiling). Not proof the probe is sound — only that it held there.
   - **Fix before auto-start ships:** bind first and treat `eaddrinuse` as "someone
@@ -121,7 +115,7 @@ first hour of anyone's first worktree.
 - **A VM that stops itself while `stop` is waiting.** The poll treats
   "no longer live" as success. *Tested.*
 
-## 10. The console
+## 9. The console
 
 - It is mounted on a **session** VM's HTTP server, so it lives and dies with that
   VM. If that VM is the one you stop, the page goes away. The target hosts it in
@@ -130,7 +124,7 @@ first hour of anyone's first worktree.
   need server-sent events or polling and a no-layout-shift diff.
 - The page cannot tell you *why* a VM is using 7 GB. It shows the number.
 
-## 11. Impeccable
+## 10. Impeccable
 
 **Measured.** `impeccable detect` on the new page: **0 findings**. On the old
 dashboard it found 8 (7 warnings, 1 advisory). **Caveat:** the detector covers

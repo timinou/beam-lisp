@@ -243,7 +243,7 @@ installed, so the service manager keeps owning its lifecycle.
 (defn- cmd-start [args st]
   (let [what (first args)]
     (cond
-      (= what "gateway") (if (:foreground st) (gw/run-run args st) (gw/run-start args st))
+      (= what "gateway") (if (:foreground st) (gw/serve args st) (gw/start args st))
       (nil? what) (u/usage-error "usage: bl vm start gateway [--foreground]")
       :else (u/usage-error (str "bl vm start: \"" what "\" — a project's VM starts with `bl realm start`")))))
 ```
@@ -270,7 +270,7 @@ stopped through the service manager when one owns it.
 
 (defn- stop-one [row st]
   (if (= :gateway (:role row))
-    (gw/run-stop nil st)
+    (gw/stop nil st)
     (let [r (inv/stop! row {:force (:force st)})]
       (if (contains? r :ok)
         (do (println (str "bl vm: " (:id row) " " (how-word (:ok r)))) 0)

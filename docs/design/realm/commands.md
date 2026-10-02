@@ -30,7 +30,7 @@ gateway-3302     gateway  a238fa91  4h      18M    up
 c7704-12         warm     277640b0  2d15h   7.0G   up (old)
 
 ! 2 name(s) are claimed, and nothing answers them
-    → bl gateway start
+    → bl vm start gateway
 ```
 
 | column | meaning |
@@ -65,7 +65,7 @@ the command itself runs in.
 
 ### `bl vm prune`
 
-Removes stale registry records and the endpoint files of daemons that accept
+Removes stale registry records and the endpoint files of VMs that accept
 nobody. `--dry-run` lists and removes nothing.
 
 ## `bl realm` — the project
@@ -77,25 +77,12 @@ bl realm start [--foreground]       start this project's warm VM
 bl realm stop                       stop it
 ```
 
-The realm is found the way the daemon finds it: the nearest `env.bl` (or tree
+The realm is found the way the warm VM finds it: the nearest `env.bl` (or tree
 root) above the current directory, or the directory `--root DIR` names.
 
 Today one VM serves one realm, so `bl realm stop` stops the VM. When one VM hosts
 many realms, `stop` drains only this realm and the VM stays for the others. The
 verb does not change.
-
-## The top level stays small
-
-| old | new |
-|---|---|
-| `bl daemon start\|stop\|status` | `bl realm …` (start is implicit; see [`migration.md`](migration.md)) |
-| `bl ports` | the tree in `bl vm`, and `bl realm show` |
-| `bl open NAME` | `bl realm open NAME` |
-| `bl gateway start\|stop\|status` | `bl vm` lists it; `bl vm stop gateway` |
-| `bl ui` | `bl vm ui` |
-
-The first slice adds `vm` and `realm` and leaves the old verbs working. The
-cutover removes them (see the migration plan).
 
 ## Global flags
 
