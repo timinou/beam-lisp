@@ -178,14 +178,17 @@
     for (const k in attrs) {
       setAttr(el, k, attrs[k]);
     }
-    for (const child of rest) {
-      // a nested array of children (a spliced seq) flattens
-      if (Array.isArray(child) && typeof child[0] !== "string") {
-        for (const c of child) el.appendChild(render(c, inSvg));
-      } else {
-        el.appendChild(render(child, inSvg));
+    // a nested array of children (a spliced seq) flattens — at ANY depth, as
+    // hiccup->html and diff's splice-children do: a seq of seqs (a `& body`
+    // rest-arg handed on as one child) used to reach render() as a "tag" that
+    // was an array, createElementNS threw, and the whole patch was dropped
+    const appendKids = (kids) => {
+      for (const child of kids) {
+        if (Array.isArray(child) && typeof child[0] !== "string") appendKids(child);
+        else el.appendChild(render(child, inSvg));
       }
-    }
+    };
+    appendKids(rest);
     return el;
   }
 
