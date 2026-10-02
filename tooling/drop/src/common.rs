@@ -13,6 +13,20 @@ pub const TRAILER_LEN: usize = 8 + 8 + 32 + 1 + 1 + 2 + 4;
 /// "apps not started" in eval mode is irrelevant.
 pub const CLI_ENTRY: &str = "BeamLisp.Ns.Bl.Cli.main(System.argv())";
 
+/// The layout names shared by the launcher, the packer, and the store. One
+/// spelling each, so a rename cannot drift between the two that read them.
+#[allow(dead_code)] // pack.rs includes this file but does not use them all
+pub const PROJECT_FILE: &str = "env.bl";
+/// The release entry script, relative to a payload or payload tree.
+#[allow(dead_code)]
+pub const LAUNCHER_REL: &str = "bin/bl";
+/// A file every beam-lisp tree root has; the launcher walks up to find it.
+#[allow(dead_code)]
+pub const TREE_MARKER: &str = "priv/boot/core.bl";
+/// A payload's printed build facts; the launcher reads one field from it.
+#[allow(dead_code)]
+pub const BUILD_INFO_FILE: &str = "BUILD_INFO.bl";
+
 pub const OS_LINUX: u8 = 0;
 pub const OS_DARWIN: u8 = 1;
 pub const OS_WINDOWS: u8 = 2;
@@ -204,7 +218,7 @@ fn unpack_into(payload: &[u8], tmp: &std::path::Path) -> std::io::Result<()> {
         }
         e.unpack(&out)?;
     }
-    make_entry_executable(tmp, "bin/bl");
+    make_entry_executable(tmp, LAUNCHER_REL);
     Ok(())
 }
 

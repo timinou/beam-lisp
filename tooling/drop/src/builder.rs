@@ -241,13 +241,15 @@ fn cargo_target_dir(dir: &Path) -> PathBuf {
 }
 
 fn tree_bl(tree: &Path, args: &[&str]) -> Command {
-    let mut cmd = Command::new(tree.join("bin/bl"));
-    cmd.args(args)
+    let mut cmd = Command::new(tree.join(LAUNCHER_REL));
+    // The in-tree `bin/bl` is a launcher too: `--cold` says run this build fresh
+    // instead of reaching for a warm VM. It used to be an environment toggle;
+    // the launcher only ever reads flags now.
+    cmd.arg("--cold")
+        .args(args)
         .current_dir(tree)
-        .env("BL_DAEMON", "off")
         .env_remove("BL_BUILD_ID")
-        .env_remove("BL_USE")
-        .env_remove("BL_DAEMON_ROOT");
+        .env_remove("BL_USE");
     cmd
 }
 
@@ -268,7 +270,7 @@ pub fn build_tree(store: &Store, tree: &Path, launcher: &Path, extra: &[&str]) -
     let before = stamp(tree);
 
     // The lock was waited for: another build may have produced exactly this.
-    if let Some(p) = store.read(&format!("bleeding-edge/{}", tree_id(tree))) {
+    if let Some(p) = store.read(&store.bleeding_edge_key(&tree_id(tree))) {
         if p.get("stamp") == Some(before.as_str()) && store.has(&p.build) {
             for rel in extra {
                 store.write(rel, &p).map_err(|e| e.to_string())?;
@@ -325,9 +327,9 @@ pub fn build_tree(store: &Store, tree: &Path, launcher: &Path, extra: &[&str]) -
     } else {
         say("the tree changed while it was building; this build is kept, and the tree runs from source until it is built again");
     }
-    store.write(&format!("bleeding-edge/{}", tree_id(tree)), &p).map_err(|e| e.to_string())?;
+    store.write(&store.bleeding_edge_key(&tree_id(tree)), &p).map_err(|e| e.to_string())?;
     if let Some(k) = &key {
-        store.write(&format!("sources/{k}"), &p).map_err(|e| e.to_string())?;
+        store.write(&store.source_key(k), &p).map_err(|e| e.to_string())?;
     }
     for rel in extra {
         store.write(rel, &p).map_err(|e| e.to_string())?;
@@ -424,7 +426,7 @@ pub fn fetch_release(store: &Store, tag: Option<&str>) -> Result<(String, String
         return Err(format!("{base}/{asset}.sha256 does not hold a sha256"));
     }
 
-    if let Some(p) = store.read(&format!("tags/{tag}")) {
+    if let Some(p) = store.read(&store.tag_key(&tag)) {
         if p.get("asset-sha256") == Some(want.as_str()) && store.has(&p.build) {
             return Ok((tag, p.build));
         }
@@ -452,7 +454,7 @@ pub fn fetch_release(store: &Store, tag: Option<&str>) -> Result<(String, String
     }
     let id = publish_drop(store, &file)?;
     let p = Pointer::new(&id).with("tag", &tag).with("asset-sha256", &want);
-    store.write(&format!("tags/{tag}"), &p).map_err(|e| e.to_string())?;
+    store.write(&store.tag_key(&tag), &p).map_err(|e| e.to_string())?;
     say(&format!("{tag} → {id}"));
     Ok((tag, id))
 }
@@ -476,19 +478,20 @@ pub fn self_update(store: &Store, spec: Option<&str>, me: &Path, cwd: &Path) -> 
     match parse_spec(spec)? {
         Spec::Channel(c) if c == "stable" => {
             let (tag, id) = fetch_release(store, None)?;
-            store.write("channels/stable", &Pointer::new(&id).with("tag", &tag)).map_err(|e| e.to_string())?;
+            store.write(&store.channel_key("stable"), &Pointer::new(&id).with("tag", &tag)).map_err(|e| e.to_string())?;
             Ok(format!("{id} ({tag})"))
         }
         Spec::Channel(_) => match source_repo() {
             // A machine with the source checkout: `latest` is ITS main, built here.
             Some(src) => {
-                let b = build_commit(store, &src, "main", me, &["channels/latest"])?;
+                let latest = store.channel_key("latest");
+                let b = build_commit(store, &src, "main", me, &[latest.as_str()])?;
                 Ok(format!("{} (main {})", b.id, b.commit.as_deref().map(|c| &c[..8.min(c.len())]).unwrap_or("?")))
             }
             // Without one: the rolling `latest` pre-release CI publishes from main.
             None => {
                 let (_, id) = fetch_release(store, Some("latest"))?;
-                store.write("channels/latest", &Pointer::new(&id).with("tag", "latest")).map_err(|e| e.to_string())?;
+                store.write(&store.channel_key("latest"), &Pointer::new(&id).with("tag", "latest")).map_err(|e| e.to_string())?;
                 Ok(id)
             }
         },

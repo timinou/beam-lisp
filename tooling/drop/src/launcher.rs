@@ -9,6 +9,7 @@ use std::process::Command;
 include!("common.rs");
 include!("daemon.rs");
 include!("store.rs");
+include!("transport.rs");
 include!("builder.rs");
 include!("hooks.rs");
 
@@ -22,7 +23,7 @@ const EXIT_LAUNCHER_FAILURE: i32 = 126;
 /// send `bl -p lib repl` to the daemon, where it would hold the single worker
 /// forever. `--` is skipped too: everything after it is the program's argv.
 fn verb_index(argv: &[String]) -> Option<usize> {
-    const VALUED: [&str; 8] = [
+    const VALUED: [&str; 9] = [
         "-p",
         "--path",
         "--code-path",
@@ -31,6 +32,7 @@ fn verb_index(argv: &[String]) -> Option<usize> {
         "--tier",
         "--jobs",
         "--port",
+        ROOT_FLAG,
     ];
     let mut i = 0;
     while i < argv.len() {
@@ -61,19 +63,13 @@ fn verb_of(argv: &[String]) -> Option<String> {
     verb_index(argv).map(|i| argv[i].clone())
 }
 
-/// Is this invocation the REQUEST to start the daemon — `bl daemon start`?
-/// Only the explicit subcommand counts: a bare `bl daemon` is `status`.
-fn daemon_start_requested(argv: &[String]) -> bool {
-    match verb_index(argv) {
-        Some(i) => argv[i] == "daemon" && argv.get(i + 1).map(String::as_str) == Some("start"),
-        None => false,
-    }
-}
+// The start-spelling recognition lives in transport.rs (`start_requested`),
+// beside the `LIFECYCLE_VERBS` it belongs with.
 
 // ── tests: the daemon fast-path's verb detection ────────────────────────────
 #[cfg(test)]
 mod verb_tests {
-    use super::{daemon_start_requested, verb_of};
+    use super::verb_of;
 
     fn v(args: &[&str]) -> Option<String> {
         verb_of(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
@@ -86,6 +82,7 @@ mod verb_tests {
         assert_eq!(v(&["-p", "lib", "repl"]).as_deref(), Some("repl"));
         assert_eq!(v(&["--code-path", "beams", "--json", "ask", "impact"]).as_deref(), Some("ask"));
         assert_eq!(v(&["-o", "out"]).as_deref(), None);
+        assert_eq!(v(&["--root", "/x", "run", "f"]).as_deref(), Some("run"), "--root takes a value");
         assert_eq!(v(&["", "lint"]).as_deref(), Some("lint"));
     }
 
@@ -97,27 +94,9 @@ mod verb_tests {
         assert_eq!(v(&["--"]), None);
     }
 
-    /// `bl daemon start` is the one invocation the launcher answers ITSELF:
-    /// it detaches the VM and returns. Every other daemon word (`status`,
-    /// `stop`, and the bare verb, which means `status`) must still reach the
-    /// release — and a `daemon` that merely appears as an ARGUMENT of another
-    /// verb is not a daemon invocation at all.
-    #[test]
-    fn only_an_explicit_daemon_start_is_the_launchers_own_work() {
-        let ds = |args: &[&str]| {
-            daemon_start_requested(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-        };
-
-        assert!(ds(&["daemon", "start"]));
-        assert!(ds(&["-p", "lib", "daemon", "start"]));
-        assert!(ds(&["--json", "daemon", "start"]));
-
-        assert!(!ds(&["daemon"]), "a bare `bl daemon` is `status`");
-        assert!(!ds(&["daemon", "status"]));
-        assert!(!ds(&["daemon", "stop"]));
-        assert!(!ds(&["run", "daemon", "start"]), "an argument, not the verb");
-        assert!(!ds(&[]));
-    }
+    // `bl realm start` / `bl daemon start` are the invocations the launcher
+    // answers ITSELF; that recognition is the `START_SPELLINGS` table in
+    // transport.rs, tested by `transport_tests::the_start_spelling_table`.
 }
 
 fn fail(msg: &str) -> ! {
@@ -180,6 +159,11 @@ fn hours_env(name: &str, default: u64) -> u64 {
 /// reach.
 const TMP_KEEP_HOURS: u64 = 24;
 
+/// Seconds per hour and per day — the units the windows above are stated in,
+/// named once so no magic number drifts.
+const SECS_PER_HOUR: u64 = 3_600;
+const SECS_PER_DAY: u64 = 86_400;
+
 /// Why a build is kept.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Keep {
@@ -196,7 +180,7 @@ pub enum Keep {
 /// nothing (that is how a deleted worktree's builds become collectable).
 pub fn referenced(store: &Store) -> std::collections::HashMap<String, String> {
     let mut refs = std::collections::HashMap::new();
-    for dir in ["channels", "tags", "bleeding-edge", "sources"] {
+    for &dir in POINTER_DIRS {
         for (name, p) in list(store, dir) {
             let alive = match p.get("root") {
                 Some(root) if dir == "bleeding-edge" || dir == "sources" => Path::new(root).exists(),
@@ -273,7 +257,7 @@ fn touch_used(dir: &Path) {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age < std::time::Duration::from_secs(3_600));
+        .is_some_and(|age| age < std::time::Duration::from_secs(SECS_PER_HOUR));
     if !fresh {
         let _ = std::fs::write(&stamp, b"");
     }
@@ -326,10 +310,10 @@ pub fn gc_by_reference(install: &Path, in_use: &str, dry_run: bool) -> Vec<GcRow
         daemons: daemon_builds(),
         running: running_builds(install),
         now: std::time::SystemTime::now(),
-        grace: std::time::Duration::from_secs(hours_env("BL_DROP_GRACE_HOURS", DEFAULT_GRACE_HOURS) * 3_600),
-        recent: std::time::Duration::from_secs(hours_env("BL_DROP_KEEP_DAYS", DEFAULT_RECENT_DAYS) * 86_400),
+        grace: std::time::Duration::from_secs(hours_env("BL_DROP_GRACE_HOURS", DEFAULT_GRACE_HOURS) * SECS_PER_HOUR),
+        recent: std::time::Duration::from_secs(hours_env("BL_DROP_KEEP_DAYS", DEFAULT_RECENT_DAYS) * SECS_PER_DAY),
     };
-    let tmp_window = std::time::Duration::from_secs(TMP_KEEP_HOURS * 3_600);
+    let tmp_window = std::time::Duration::from_secs(TMP_KEEP_HOURS * SECS_PER_HOUR);
 
     let mut rows = vec![];
     let Ok(rd) = std::fs::read_dir(install) else { return rows };
@@ -440,10 +424,10 @@ fn maintenance(argv: &[String], t: &Trailer, sha8: &str) -> ! {
     }
 }
 
-/// Try the warm daemon. Returns `Some(exit_code)` when the command was served
-/// (or lost after send — unknown outcome, exit 1), or `None` to fall back to a
-/// cold `bin/bl` boot. With `BL_DAEMON=auto`, a missing daemon is auto-started
-/// from `bin/bl daemon start` (detached) and retried once.
+/// Try the warm VM: attach when one answers for this tree, and — only under
+/// `Transport::Start` — start one (detached) and retry once. `Some(exit_code)`
+/// when the command was served (or lost after send — unknown outcome, exit 1);
+/// `None` to fall back to a cold `bin/bl` boot.
 
 /// `bl` is THIS executable — the launcher. The release's own `bin/bl` is a
 /// different program with a different command surface (`start`, `daemon`,
@@ -475,10 +459,9 @@ fn after_attach(a: Attach) -> Option<i32> {
         }
         Attach::Stalled(secs) => {
             eprintln!(
-                "bl: the daemon has sent nothing for {secs}s, but the connection is still open \
-                 — the command is probably still running, and it is NOT re-run here \
-                 (outcome unknown). Raise BL_DAEMON_READ_TIMEOUT to wait longer, or run it \
-                 cold with BL_DAEMON=off to see it through."
+                "bl: the daemon has sent nothing — not even its heartbeat — for {secs}s, so it \
+                 is unresponsive. The command may still be running there, and it is NOT re-run \
+                 here (outcome unknown). Run `bl vm` to see it, or `bl vm stop` to end it."
             );
             Some(1)
         }
@@ -486,9 +469,9 @@ fn after_attach(a: Attach) -> Option<i32> {
     }
 }
 
-fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path) -> Option<i32> {
+fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path, t: Transport) -> Option<i32> {
     let cwd = std::env::current_dir().ok()?;
-    let root = resolve_root(&cwd)?;
+    let root = tree_root(&cwd, argv)?;
 
     match try_attach(&root, argv) {
         Attach::Exit(code) => Some(code),
@@ -501,56 +484,58 @@ fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path) -> Option<i32> {
                 "bl: the daemon for this tree was started from a different build; \
                  stopping it and running this command cold"
             );
-            let _ = std::process::Command::new(bin)
-                .arg("eval")
-                .arg("BeamLisp.Ns.Bl.Cli.main([\"daemon\",\"stop\"])")
-                .env("BL_DAEMON_ROOT", &root)
-                .env("BL_BIN", self_bl())
-                .status();
-            if autostart_enabled() {
-                start_daemon_detached(bin, &root);
-                if wait_ready(&root) {
-                    return match try_attach(&root, argv) {
-                        Attach::Exit(code) => Some(code),
-                        other => after_attach(other),
-                    };
-                }
-            }
-            None
+            stop_daemon(bin, &root);
+            retry_from_warm(bin, &root, argv, t)
         }
-        Attach::Fallback => {
-            if autostart_enabled() {
-                start_daemon_detached(bin, &root);
-                if wait_ready(&root) {
-                    return match try_attach(&root, argv) {
-                        Attach::Exit(code) => Some(code),
-                        other => after_attach(other),
-                    };
-                }
-            }
-            None
-        }
+        Attach::Fallback => retry_from_warm(bin, &root, argv, t),
     }
 }
 
+/// When the transport permits Start, bring a warm VM up and serve `argv` once
+/// from it; otherwise `None`, so the caller falls back to the cold path.
 #[cfg(unix)]
-fn autostart_enabled() -> bool {
-    std::env::var("BL_DAEMON").map(|v| v == "auto").unwrap_or(false)
+fn retry_from_warm(bin: &std::path::Path, root: &std::path::Path, argv: &[String], t: Transport) -> Option<i32> {
+    if t != Transport::Start {
+        return None;
+    }
+    start_daemon_detached(bin, root);
+    if wait_ready(root) {
+        return match try_attach(root, argv) {
+            Attach::Exit(code) => Some(code),
+            other => after_attach(other),
+        };
+    }
+    None
 }
 
-/// Spawn `bin/bl daemon start` fully detached so it outlives this launcher.
+/// Stop the warm VM for `root` by asking the release, which owns the lifecycle.
+#[cfg(unix)]
+fn stop_daemon(bin: &std::path::Path, root: &std::path::Path) {
+    let mut cmd = release_command(bin);
+    cmd.args(warm_stop_argv(root));
+    let _ = cmd.status();
+}
+
+/// Spawn the release's `realm start --foreground --root <root>` fully detached,
+/// so the VM outlives this launcher.
 #[cfg(unix)]
 fn start_daemon_detached(bin: &std::path::Path, root: &std::path::Path) {
     use std::process::Stdio;
-    let _ = std::process::Command::new(bin)
-        .arg("eval")
-        .arg("BeamLisp.Ns.Bl.Cli.main([\"daemon\",\"start\"])")
-        .env("BL_DAEMON_ROOT", root)
-        .env("BL_BIN", self_bl())
+    let mut cmd = release_command(bin);
+    cmd.args(warm_start_argv(root))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+        .stderr(Stdio::null());
+    let _ = cmd.spawn();
+}
+
+/// A release invocation: `bin/bl eval <CLI_ENTRY> <argv…>`. Trailing args land
+/// in `System.argv()` verbatim — the one handoff both `exec_payload` and the
+/// lifecycle helpers use, so the entry expression is spelled once.
+fn release_command(bin: &std::path::Path) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.arg("eval").arg(CLI_ENTRY).env("BL_BIN", self_bl());
+    cmd
 }
 
 /// Poll for an authenticated-reachable daemon, up to a startup deadline.
@@ -637,7 +622,7 @@ fn resolving_main(me: &std::path::Path, argv: &[String]) -> ! {
             run_build(&path, &t, argv)
         }
         Target::SourceMode(root) => {
-            let bin = root.join("bin/bl");
+            let bin = root.join(LAUNCHER_REL);
             let mut cmd = Command::new(&bin);
             cmd.args(argv).env("BL_BIN", me).env_remove("BL_BUILD_ID");
             exec_or_fail(cmd, &bin)
@@ -713,7 +698,7 @@ fn run_build(file: &std::path::Path, t: &Trailer, argv: &[String]) -> ! {
 /// carries `BUILD_INFO.bl` does (one stat); an older one is asked by reading
 /// its `vm.paths` source for `build-id`.
 fn names_its_build(dest: &std::path::Path) -> bool {
-    if dest.join("BUILD_INFO.bl").is_file() {
+    if dest.join(BUILD_INFO_FILE).is_file() {
         return true;
     }
     std::fs::read_dir(dest.join("lib"))
@@ -758,71 +743,69 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
     touch_used(dest);
     let argv = argv.to_vec();
 
-    let bin = dest.join(if cfg!(windows) { r"bin\bl.bat" } else { "bin/bl" });
+    let bin = dest.join(if cfg!(windows) { r"bin\bl.bat" } else { LAUNCHER_REL });
 
-    // ── daemon fast-path (unix) ──────────────────────────────────────────────
-    // A warm global daemon serves the command over a socket in ~30ms instead of
-    // a ~1.2s cold VM boot. Skipped only when BL_DAEMON=off and for the `bl
-    // daemon` lifecycle verbs (which must reach the release). Every other verb —
-    // including repl/serve/mcp/gateway and `bl watch` — runs in its own VM
-    // process under the daemon (PLAN-121), so nothing is exiled to a cold VM to
-    // avoid parking a serial worker: there is no serial worker.
+    // ── warm-VM fast path (unix) ────────────────────────────────────────────
+    // A warm VM serves the command over a socket in ~30ms instead of a ~1.2s
+    // cold boot. The transport is DECLARED — `--cold` / `--warm`, the tree's
+    // `env.bl :warm`, the config, then DEFAULT_TRANSPORT — never read from the
+    // environment. Cold skips both this path and the start handoff; lifecycle
+    // verbs (`daemon`, `realm`) never attach, because they talk to the VM
+    // themselves. Every other verb — including repl/serve/mcp/gateway and
+    // `bl watch` — runs in its own VM process under the warm one (PLAN-121), so
+    // nothing is exiled to a cold VM to avoid parking a serial worker: there is
+    // no serial worker.
     #[cfg(unix)]
     {
-        let mode = std::env::current_dir()
-            .ok()
-            .as_deref()
-            .and_then(resolve_root)
-            .map(|r| daemon_mode(&r))
-            .unwrap_or(DaemonMode::Auto);
-        let off = mode == DaemonMode::Off;
+        let cwd = std::env::current_dir().ok();
+        let root = cwd.as_deref().and_then(|c| tree_root(c, &argv));
+        let t = root.as_deref().map(|r| transport(r, &argv)).unwrap_or(DEFAULT_TRANSPORT);
         let verb = verb_of(&argv);
-        let is_lifecycle = verb.as_deref() == Some("daemon");
-        // PLAN-121/123: NO verb is exiled to a cold VM. A long-lived command
-        // (repl, serve, mcp, gateway, lsp serve) is just a process under its
-        // VM's capped env — the single serial worker it would have parked is
-        // gone. Only `bl daemon` lifecycle verbs still reach the release path.
+        let is_lifecycle = verb.as_deref().is_some_and(|v| LIFECYCLE_VERBS.contains(&v));
 
-        // `bl daemon start` is a REQUEST for a daemon, not a command to run
-        // inside one. Exec'd, the release parks in the foreground and dies with
-        // the shell that asked for it — while the verb's own docstring (and
-        // docs/bl/03) says the launcher runs it detached, which is what makes
-        // `bl daemon start && bl run …` mean anything. So detach here and
-        // return: the daemon outlives this process, and the caller learns
-        // whether it actually came up. `BL_DAEMON=off` keeps the old
-        // foreground behavior: ask for no daemon and you get none.
-        if !off && daemon_start_requested(&argv) {
-            let cwd = std::env::current_dir().ok();
-            if let Some(root) = cwd.as_deref().and_then(resolve_root) {
-                if daemon_ready(&root) {
-                    println!("bl: daemon already running for this tree");
-                    std::process::exit(0);
-                }
-
-                start_daemon_detached(&bin, &root);
-
-                if wait_ready(&root) {
-                    println!("bl: daemon started — commands for this tree are now warm");
-                    std::process::exit(0);
-                }
-                eprintln!("bl: daemon did not become ready (see `bl daemon status`)");
-                std::process::exit(1);
+        // `bl realm start` (and the deprecated `bl daemon start`) is a REQUEST
+        // for a warm VM, not a command to run inside one. Exec'd, the release
+        // parks in the foreground and dies with the shell that asked for it —
+        // so detach here and return: the VM outlives this process, and the
+        // caller learns whether it actually came up.
+        let start = start_requested(&argv);
+        if let Some((words, deprecated)) = start {
+            if let Some(replacement) = deprecated {
+                eprintln!("{}", deprecation_line(words, replacement));
             }
         }
+        if t != Transport::Cold {
+            if start.is_some() {
+                if let Some(root) = root.as_deref() {
+                    if daemon_ready(root) {
+                        println!("bl: daemon already running for this tree");
+                        std::process::exit(0);
+                    }
 
-        if !off && !is_lifecycle {
-            if let Some(code) = maybe_attach_daemon(&argv, &bin) {
-                std::process::exit(code);
+                    start_daemon_detached(&bin, root);
+
+                    if wait_ready(root) {
+                        println!("bl: daemon started — commands for this tree are now warm");
+                        std::process::exit(0);
+                    }
+                    eprintln!("bl: daemon did not become ready (see `bl realm status`)");
+                    std::process::exit(1);
+                }
+            }
+
+            if !is_lifecycle {
+                if let Some(code) = maybe_attach_daemon(&argv, &bin, t) {
+                    std::process::exit(code);
+                }
             }
         }
     }
 
-    let mut cmd = Command::new(&bin);
-    cmd.env("BL_BIN", self_bl());
     // Trailing args after `eval EXPR` land in System.argv() verbatim
     // (verified: bin/bl eval passes "$@" through as erl -extra). A `--`
     // would leak into argv, so it is NOT added here.
-    cmd.arg("eval").arg(CLI_ENTRY).args(&argv);
+    let mut cmd = release_command(&bin);
+    cmd.args(&argv);
     exec_or_fail(cmd, &bin)
 }
 
@@ -876,8 +859,8 @@ mod gc_tests {
             daemons: ["dddddddd".to_string()].into(),
             running: ["rrrrrrrr".to_string()].into(),
             now: std::time::SystemTime::now(),
-            grace: std::time::Duration::from_secs(24 * 3_600),
-            recent: std::time::Duration::from_secs(14 * 86_400),
+            grace: std::time::Duration::from_secs(24 * SECS_PER_HOUR),
+            recent: std::time::Duration::from_secs(14 * SECS_PER_DAY),
         }
     }
 
@@ -886,7 +869,7 @@ mod gc_tests {
     #[test]
     fn only_an_unheld_unused_build_goes() {
         let f = facts();
-        let ago = |days: u64| Some(f.now - std::time::Duration::from_secs(days * 86_400));
+        let ago = |days: u64| Some(f.now - std::time::Duration::from_secs(days * SECS_PER_DAY));
         assert_eq!(keep_reason("cccccccc", ago(400), &f), Some(Keep::InUse));
         assert_eq!(keep_reason("pppppppp", ago(400), &f), Some(Keep::Pointed("channels/stable".into())));
         assert_eq!(keep_reason("dddddddd", ago(400), &f), Some(Keep::Daemon));
@@ -904,9 +887,9 @@ mod gc_tests {
         let store = Store { root: install.clone() };
         let live = install.join("live-wt");
         std::fs::create_dir_all(&live).unwrap();
-        store.write("channels/stable", &Pointer::new("11111111")).unwrap();
-        store.write("bleeding-edge/a", &Pointer::new("22222222").with("root", &live.to_string_lossy())).unwrap();
-        store.write("bleeding-edge/b", &Pointer::new("33333333").with("root", "/no/such/worktree")).unwrap();
+        store.write(&store.channel_key("stable"), &Pointer::new("11111111")).unwrap();
+        store.write(&store.bleeding_edge_key("a"), &Pointer::new("22222222").with("root", &live.to_string_lossy())).unwrap();
+        store.write(&store.bleeding_edge_key("b"), &Pointer::new("33333333").with("root", "/no/such/worktree")).unwrap();
         let refs = referenced(&store);
         assert!(refs.contains_key("11111111"));
         assert!(refs.contains_key("22222222"));
@@ -936,11 +919,11 @@ mod gc_tests {
         std::fs::write(dest.join("lib/partial.beam"), b"half").unwrap();
         // the finished staging tree
         std::fs::create_dir_all(tmp.join("bin")).unwrap();
-        std::fs::write(tmp.join("bin/bl"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(tmp.join(LAUNCHER_REL), b"#!/bin/sh\n").unwrap();
 
         publish(&tmp, &dest).expect("debris must not be fatal");
 
-        assert!(dest.join("bin/bl").is_file(), "the complete tree is published");
+        assert!(dest.join(LAUNCHER_REL).is_file(), "the complete tree is published");
         assert!(!tmp.exists(), "the staging tree moves, not copies");
         assert!(
             !dest.join("lib/partial.beam").exists(),
@@ -959,14 +942,14 @@ mod gc_tests {
         let tmp = dir.join("c94bd7eb.tmp-4321");
 
         std::fs::create_dir_all(dest.join("bin")).unwrap();
-        std::fs::write(dest.join("bin/bl"), b"winner\n").unwrap();
+        std::fs::write(dest.join(LAUNCHER_REL), b"winner\n").unwrap();
         std::fs::create_dir_all(tmp.join("bin")).unwrap();
-        std::fs::write(tmp.join("bin/bl"), b"loser\n").unwrap();
+        std::fs::write(tmp.join(LAUNCHER_REL), b"loser\n").unwrap();
 
         publish(&tmp, &dest).expect("losing the race is not failure");
 
         assert_eq!(
-            std::fs::read(dest.join("bin/bl")).unwrap(),
+            std::fs::read(dest.join(LAUNCHER_REL)).unwrap(),
             b"winner\n",
             "the published tree is left exactly as the winner wrote it"
         );

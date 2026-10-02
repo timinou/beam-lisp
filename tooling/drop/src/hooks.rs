@@ -94,7 +94,7 @@ fn events_for(top: &Path) -> Vec<&'static str> {
     if source_tree(top).is_some() {
         ev.extend_from_slice(SOURCE_EVENTS);
     }
-    let latest = std::fs::read_to_string(top.join("env.bl"))
+    let latest = std::fs::read_to_string(top.join(PROJECT_FILE))
         .ok()
         .and_then(|t| scan_literal(&t, "bl"))
         .is_some_and(|s| s == "latest");
@@ -246,11 +246,12 @@ pub fn drain(store: &Store, me: &Path) -> Result<String, String> {
                 if on_main {
                     let clean = b.key.as_deref().is_some_and(|k| !k.contains('+'));
                     let latest = if clean {
-                        store.read(&format!("bleeding-edge/{}", tree_id(&tree)))
-                            .map(|p| store.write("channels/latest", &p).map(|_| b.id.clone()).map_err(|e| e.to_string()))
+                        store.read(&store.bleeding_edge_key(&tree_id(&tree)))
+                            .map(|p| store.write(&store.channel_key("latest"), &p).map(|_| b.id.clone()).map_err(|e| e.to_string()))
                             .unwrap_or_else(|| Err("the build left no pointer".to_string()))
                     } else {
-                        build_commit(store, &tree, "main", me, &["channels/latest"]).map(|l| l.id)
+                        let rel = store.channel_key("latest");
+                        build_commit(store, &tree, "main", me, &[rel.as_str()]).map(|l| l.id)
                     };
                     match latest {
                         Ok(id) => built.push(format!("latest → {id}")),
@@ -291,7 +292,7 @@ pub fn guard_verdict(ahead: Option<u32>, fetched: bool, override_set: bool) -> R
 
 fn guard_latest(cwd: &Path) -> Result<(), String> {
     let top = git_out(cwd, &["rev-parse", "--show-toplevel"]).map(PathBuf::from).unwrap_or_else(|| cwd.to_path_buf());
-    let on_latest = std::fs::read_to_string(top.join("env.bl"))
+    let on_latest = std::fs::read_to_string(top.join(PROJECT_FILE))
         .ok()
         .and_then(|t| scan_literal(&t, "bl"))
         .is_some_and(|s| s == "latest");
