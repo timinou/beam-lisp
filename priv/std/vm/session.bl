@@ -39,11 +39,13 @@
             [vm.manager :as mgr] [vm.index :as index] [vm.inspect :as inspect]
             [vm.ports :as ports] [vm.names :as names] [vm.paths :as paths]
             [vm.exec :as exec] [vm.http :as http]
-            [vm.sched :as sched] [vm.spec :as spec] [vm.registry :as registry]))
+            [vm.sched :as sched] [vm.spec :as spec] [vm.registry :as registry]
+            [vm.idle :as idle] [vm.owner :as owner]))
 
 (def PT-ROOT (tuple :vm_session :root))
 (def PT-STARTED (tuple :vm_session :started-at))
 (def PT-RECORD (tuple :vm_session :record))
+(def PT-IDLE (tuple :vm_session :idle))
 
 (defn- status-text []
   (inspect/render-text
@@ -100,6 +102,7 @@
         env (or (:env m) {})]
     ;; run in the caller's process (this per-connection process) with a group
     ;; leader that turns the command's stdout into :stdout frames on conn.
+    (idle/begin!)
     (let [worker (erlang/self)
           proxy (io/start-with-send conn-send id)
           beat (start-heartbeat conn-send id wire/HEARTBEAT-MS)
@@ -114,6 +117,7 @@
                      (do (conn-send (wire/stderr id 999999 (str "bl: " (ex-message e) "\n"))) 1))
                    (finally
                      (stop-heartbeat beat)
+                     (idle/end!)
                      (erlang/group_leader prev-gl worker)))]
         (io/finish proxy)
         (conn-send (wire/exit id code))))))
@@ -143,29 +147,65 @@
   (erlang/apply :persistent_term :put (list PT-ROOT root))
   (erlang/apply :persistent_term :put (list PT-STARTED (erlang/system_time :second))))
 
+(defn- busy?
+  "Whether anything besides a running request is using this VM: a route it holds
+   that someone may open, or a process a realm owns (a schedule, a `serve`, a
+   `watch`). Either keeps it alive — a VM that serves a name or runs a job is not
+   idle however quiet its command line is."
+  []
+  (let [pid (erlang/apply :os :getpid (list))
+        mine (filter (fn [c] (= (get c :pid) (erlang/list_to_integer pid)))
+                     (ports/list-claims))
+        vms (mgr/list-vms)]
+    (or (> (count mine) 0)
+        (some (fn [vm] (> (owner/count (:id vm)) 0)) (to-list vms)))))
+
+(defn- arm-idle!
+  "Start the idle clock for `limit` seconds and remember its watcher. When it
+   expires the VM stops itself the way `bl realm stop` does: it flips the stop flag
+   the foreground loop is waiting on, so the same drain path runs."
+  [limit]
+  (let [w (idle/start-watcher limit busy?
+            (fn [] (println "bl realm: idle, stopping")
+                   (erlang/apply :persistent_term :put (list (tuple :vm_session :stop) true))))]
+    (when w (erlang/apply :persistent_term :put (list PT-IDLE w)))
+    w))
+
+(defn- release-start-marker!
+  "The launcher wrote `.starting` before it spawned this VM so a second `bl` would
+   not start another. This VM is listening now, so the marker has done its job."
+  [root]
+  (let [ep (paths/endpoints root)]
+    (when (contains? ep :ok) (File/rm (:starting (:ok ep))))))
+
 (defn start
   "Boot the warm VM for `root`: bind the socket first, and only if it is
    ours start the services behind it. Returns {:ok listener} | {:error reason};
    {:error :already-running} means a live daemon answers for this endpoint and
-   NOTHING was started — attach to it."
-  [root]
-  ;; the socket first, and the services after: binding is what decides who the
-  ;; daemon is, so a start that loses must not have armed an index and a
-  ;; scheduler it will never serve. The listener accepts at once, but a request
-  ;; that arrives before the services are up waits on the manager like any other.
-  (let [r (net/listen root request-handler)]
-    (if (contains? r :ok)
-      (do (boot-realm-services! root)
-          ;; the HTTP face on :ui, a view over the same read-model. A failure here
-          ;; does NOT stop the daemon: its job is serving commands, the page is a
-          ;; view.
-          (start-ui root)
-          ;; become visible to the machine: one record, written once. A failure to
-          ;; publish costs `bl vm` a row (the old files still adopt this pid),
-          ;; never the daemon its job.
-          (publish-self! (:ok r))
-          r)
-      r)))
+   NOTHING was started — attach to it. `opts` {:idle seconds :log path}: :idle arms
+   the idle clock (0 or absent: the VM stays until stopped); :log is where this VM's
+   output goes, recorded so `bl vm show` and `bl vm logs` can find it."
+  ([root] (start root {}))
+  ([root opts]
+   ;; the socket first, and the services after: binding is what decides who the
+   ;; daemon is, so a start that loses must not have armed an index and a
+   ;; scheduler it will never serve. The listener accepts at once, but a request
+   ;; that arrives before the services are up waits on the manager like any other.
+   (let [r (net/listen root request-handler)]
+     (if (contains? r :ok)
+       (do (boot-realm-services! root)
+           ;; the HTTP face on :ui, a view over the same read-model. A failure
+           ;; here does NOT stop the daemon: its job is serving commands, the
+           ;; page is a view.
+           (start-ui root)
+           ;; become visible to the machine: one record, written once. A failure
+           ;; to publish costs `bl vm` a row (the old files still adopt this pid),
+           ;; never the daemon its job.
+           (publish-self! (:ok r) (get opts :log))
+           (release-start-marker! root)
+           (arm-idle! (get opts :idle 0))
+           r)
+       r))))
 
 (defn- project-ui-port
   "The tree's declared :ui port, or nil for ephemeral. Reads the SPEC — the
@@ -194,10 +234,10 @@
 (defn- publish-self!
   "Publish this VM's record and remember it on the listener so `stop` can retract
    exactly it. A VM is labelled with the project it was started for."
-  [listener]
+  [listener log]
   (try
     (let [root (erlang/apply :persistent_term :get (list PT-ROOT nil))
-          r (registry/publish! :warm {:label (if root (Path/basename root) nil)})]
+          r (registry/publish! :warm {:label (if root (Path/basename root) nil) :log log})]
       (when (contains? r :ok)
         (erlang/apply :persistent_term :put (list PT-RECORD (:ok r)))))
     (catch e nil)))
@@ -206,6 +246,8 @@
   "Stop the daemon session's listener, and leave the registry: a clean stop
    removes the record, so only a crash ever leaves one for `prune` to find."
   [listener]
+  (idle/stop-watcher (erlang/apply :persistent_term :get (list PT-IDLE nil)))
+  (erlang/apply :persistent_term :erase (list PT-IDLE))
   (let [rec (erlang/apply :persistent_term :get (list PT-RECORD nil))]
     (when rec (registry/retract! rec))
     (erlang/apply :persistent_term :erase (list PT-RECORD)))

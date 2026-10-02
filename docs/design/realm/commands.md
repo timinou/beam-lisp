@@ -14,6 +14,7 @@ runs.
 bl vm [ls] [--all] [--json]       the tree: VMs → realms → routes
 bl vm show ID [--json]            one VM in full
 bl vm ui [--open]                 the machine console
+bl vm logs ID [--lines N] [--follow]   what a VM printed: its boot and its errors
 bl vm start gateway [--foreground]   the gateway (systemd unit when installed)
 bl vm stop ID… | gateway | --all [--force]   ask, then TERM; --force adds KILL
 bl vm prune [--dry-run]           remove what dead VMs left behind
@@ -73,7 +74,7 @@ nobody. `--dry-run` lists and removes nothing.
 ```
 bl realm [show] [--json]            this project's VM, routes, address, status
 bl realm open [NAME] [--open]       the address of a route (default: ui)
-bl realm start [--foreground]       start this project's warm VM
+bl realm start [--foreground] [--idle SECONDS]   start this project's warm VM
 bl realm stop                       stop it
 ```
 
@@ -93,6 +94,9 @@ These work on every command, before a literal `--`:
 | `--cold` | run in a fresh VM; never use a warm one |
 | `--warm` | use the warm VM, and start one if none runs |
 | `--root DIR` | key the realm on `DIR` instead of the current directory |
+| `--idle SECONDS` | `realm start`: stop the VM after this long unused (default 28800; 0 never) |
+| `--log PATH` | `realm start`: where the VM writes what it prints |
+| `--lines N`, `--follow` | `vm logs`: how much to show, and whether to keep going |
 
 A project or `~/.config/bl/config.bl` can declare `:warm "off" \| "attach" \| "start"`.
 The order is flag, then `env.bl`, then config, then the built-in default (`attach`).
@@ -109,7 +113,6 @@ Why `--cold` is still needed, and what would remove each reason:
 
 | command | does |
 |---|---|
-| `bl vm logs ID [-f]` | tail a VM's log (needs detached VMs to write one) |
 | `bl vm restart ID` | stop, then start the same role on the same build |
 | `bl vm top` | live terminal view of the same rows |
 | `bl realm restart` | drain and respawn this realm only |

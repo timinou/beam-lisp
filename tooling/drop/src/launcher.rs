@@ -23,7 +23,7 @@ const EXIT_LAUNCHER_FAILURE: i32 = 126;
 /// send `bl -p lib repl` to the daemon, where it would hold the single worker
 /// forever. `--` is skipped too: everything after it is the program's argv.
 fn verb_index(argv: &[String]) -> Option<usize> {
-    const VALUED: [&str; 9] = [
+    const VALUED: [&str; 12] = [
         "-p",
         "--path",
         "--code-path",
@@ -33,6 +33,9 @@ fn verb_index(argv: &[String]) -> Option<usize> {
         "--jobs",
         "--port",
         ROOT_FLAG,
+        LOG_FLAG,
+        IDLE_FLAG,
+        LINES_FLAG,
     ];
     let mut i = 0;
     while i < argv.len() {
@@ -92,6 +95,17 @@ mod verb_tests {
         assert_eq!(v(&["--json"]), None);
         assert_eq!(v(&["-p"]), None);
         assert_eq!(v(&["--"]), None);
+    }
+
+    /// The log/idle/lines flags take a VALUE: a value that looks like a verb must
+    /// not become the verb.
+    #[test]
+    fn the_new_global_flags_are_skipped_by_verb_index() {
+        let a = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(super::verb_index(&a(&["--log", "x", "realm", "start"])), Some(2));
+        assert_eq!(super::verb_index(&a(&["--idle", "30", "run", "f"])), Some(2));
+        assert_eq!(super::verb_index(&a(&["--lines", "50", "run", "f"])), Some(2));
+        assert_eq!(v(&["--log", "x", "realm", "start"]).as_deref(), Some("realm"));
     }
     // `bl realm start` is the invocation the launcher answers ITSELF; that
     // recognition is `start_requested` in transport.rs, tested by
@@ -490,19 +504,20 @@ fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path, t: Transport) -> 
     }
 }
 
-/// When the transport permits Start, bring a warm VM up and serve `argv` once
-/// from it; otherwise `None`, so the caller falls back to the cold path.
+/// When the transport permits Start, kick off a warm VM and return `None` so
+/// the caller runs THIS command cold, right now. The start is NEVER awaited: a
+/// boot the command did not ask to wait for must not delay it, and a start that
+/// fails costs it nothing. Only the first starter acts — `claim_start` keeps a
+/// second from spawning a duplicate VM for the same endpoint.
 #[cfg(unix)]
-fn retry_from_warm(bin: &std::path::Path, root: &std::path::Path, argv: &[String], t: Transport) -> Option<i32> {
+fn retry_from_warm(bin: &std::path::Path, root: &std::path::Path, _argv: &[String], t: Transport) -> Option<i32> {
     if t != Transport::Start {
         return None;
     }
-    start_daemon_detached(bin, root);
-    if wait_ready(root) {
-        return match try_attach(root, argv) {
-            Attach::Exit(code) => Some(code),
-            other => after_attach(other),
-        };
+    if let Some(ep) = endpoints(root) {
+        if claim_start(&ep.starting, now_secs(), START_GRACE_SECS) {
+            start_daemon_detached(bin, root, &build_id());
+        }
     }
     None
 }
@@ -513,19 +528,6 @@ fn stop_daemon(bin: &std::path::Path, root: &std::path::Path) {
     let mut cmd = release_command(bin);
     cmd.args(warm_stop_argv(root));
     let _ = cmd.status();
-}
-
-/// Spawn the release's `realm start --foreground --root <root>` fully detached,
-/// so the VM outlives this launcher.
-#[cfg(unix)]
-fn start_daemon_detached(bin: &std::path::Path, root: &std::path::Path) {
-    use std::process::Stdio;
-    let mut cmd = release_command(bin);
-    cmd.args(warm_start_argv(root))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let _ = cmd.spawn();
 }
 
 /// A release invocation: `bin/bl eval <CLI_ENTRY> <argv…>`. Trailing args land
@@ -773,13 +775,31 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
                         std::process::exit(0);
                     }
 
-                    start_daemon_detached(&bin, root);
+                    // The explicit request goes through the SAME start as the
+                    // automatic one, so it lands in the same log; it claims the
+                    // marker too, so a start already in flight is WAITED for,
+                    // not duplicated. This is the one caller that does wait:
+                    // the user asked for a warm VM and is owed the outcome.
+                    let log = log_path(root, &build_id());
+                    let claimed = endpoints(root)
+                        .is_some_and(|e| claim_start(&e.starting, now_secs(), START_GRACE_SECS));
+                    if claimed {
+                        start_daemon_detached(&bin, root, &build_id());
+                    }
 
                     if wait_ready(root) {
                         println!("bl: warm VM started — commands for this tree are now warm");
                         std::process::exit(0);
                     }
-                    eprintln!("bl: the warm VM did not become ready (see `bl vm`, or `bl realm show`)");
+                    match log {
+                        Some(p) => {
+                            eprintln!("bl: the warm VM did not become ready — its log: {}", p.display());
+                            eprintln!("bl: read it with `bl vm logs` once the VM is listed (`bl vm`).");
+                        }
+                        None => eprintln!(
+                            "bl: the warm VM did not become ready (no log path; set XDG_STATE_HOME or HOME)"
+                        ),
+                    }
                     std::process::exit(1);
                 }
             }

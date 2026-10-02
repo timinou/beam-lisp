@@ -42,8 +42,10 @@ bl realm: stopped (…/beam-lisp)
   key it booted with. When the checkout changes under it — or a client presents
   a different key — it refuses work with `restart_required`; the launcher stops
   that VM and a fresh one loads one coherent image. A stale VM never serves.
-- **It stops itself when idle.** A quiet warm VM expires on its own, so a warm
-  VM costs nothing once you stop using it.
+- **It stops itself when idle.** A warm VM with no command running, no route held
+  and no job alive stops after eight hours (`bl realm start --idle SECONDS`
+  changes the limit; `--idle 0` turns the clock off). A VM that serves a name or
+  runs a schedule is not idle however quiet your terminal is.
 
 The drop's launcher uses the warm VM automatically: a served command returns in
 tens of milliseconds instead of ~1s. `--cold` runs in a fresh VM; `--warm` uses

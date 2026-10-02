@@ -54,6 +54,12 @@ A project declares its own default in `env.bl`, and the machine in
 flag > `env.bl` > `config.bl` > the built-in default, `attach` — use a running
 warm VM, never start one.
 
+With `start`, the command that finds no warm VM runs cold, right away, and starts
+a warm VM in the background for the next one. It never waits for the VM. What the
+background VM prints goes to `~/.local/state/beam-lisp/logs/` (read it with
+`bl vm logs`), and a second command that arrives while one is starting does not
+start another.
+
 `bl realm start`, `stop` and `show` are the lifecycle — see
 [03-the-live-loop.md](03-the-live-loop.md) for the reload loop and
 [06-the-warm-daemon.md](06-the-warm-daemon.md) for the whole warm-VM DX: named
@@ -898,6 +904,10 @@ Flags may appear anywhere before `--`.
 | `--cold` | run in a fresh VM; never use a warm one |
 | `--warm` | use the warm VM, starting one if none runs |
 | `--root DIR` | the project root the warm VM is keyed on |
+| `--idle SECONDS` | `realm start`: stop the VM after this long unused (default 28800; 0 never) |
+| `--log PATH` | `realm start`: where the VM writes what it prints |
+| `--lines N` | `vm logs`: how many lines to show (default 50) |
+| `--follow` | `vm logs`: keep printing as the VM writes |
 | `-h, --help` | show help |
 | `--version` | print the version |
 | `--` | everything after this goes to the program |

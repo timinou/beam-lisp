@@ -15,6 +15,7 @@ not stored in the file, because they would be one machine's pids and paths.
 bl vm [ls] [--all] [--json]          the tree: VMs → realms → routes
 bl vm show ID [--json]               one VM in full
 bl vm ui [--open]                    the machine console, in a browser
+bl vm logs ID [--lines N] [--follow] what a VM wrote: its boot, its errors
 bl vm start gateway [--foreground]   start the gateway (systemd unit if installed)
 bl vm stop ID… | gateway | --all [--force]
 bl vm prune [--dry-run]              remove what dead VMs left behind
@@ -33,6 +34,7 @@ runs. An ambiguous `ID` lists the candidates and stops none.
 :bl.vm
 ```
 
+
 ## Reading the machine
 
 Every row comes from `vm.inventory`, which joins the registry record each VM
@@ -45,6 +47,7 @@ Live: the VMs on this machine, right now.
 (mapv (fn [r] (select-keys r [:id :role :build :state :uptime-s]))
       (inv/rows {}))
 ```
+
 
 ## Showing a row
 
@@ -78,6 +81,7 @@ hundreds sit in compressed swap.
 &BeamLisp.Ns.Bl.Vm."human-kb"/1
 ```
 
+
 ```beam-lisp
 [(human-age 45) (human-age 14400) (human-age (+ (* 2 86400) (* 15 3600)))
  (human-kb 512) (human-kb (* 212 1024)) (human-kb (* 7 1024 1024))]
@@ -86,6 +90,7 @@ hundreds sit in compressed swap.
 ```bl-result cell3
 ["45s" "4h" "2d15h" "512K" "212M" "7.0G"]
 ```
+
 
 ```beam-lisp
 (defn- pad [s n] (String/pad_trailing (str s) n))
@@ -142,11 +147,13 @@ hundreds sit in compressed swap.
 &BeamLisp.Ns.Bl.Vm.render/2
 ```
 
+
 Live: `bl vm` as this machine prints it.
 
 ```beam-lisp
 (join "\n" (to-list (render (inv/rows {}) (inv/attention (inv/rows {})))))
 ```
+
 
 ## ls
 
@@ -159,6 +166,7 @@ Live: `bl vm` as this machine prints it.
       (u/each println (to-list (render rows notes))))
     0))
 ```
+
 
 ## show
 
@@ -200,6 +208,7 @@ Live: `bl vm` as this machine prints it.
           0)))))
 ```
 
+
 ## ui
 
 The console is a page on a warm VM's own server. `bl vm ui` prints its address —
@@ -227,10 +236,96 @@ hands it to the desktop.
           0))))
 ```
 
+
 Live:
 
 ```beam-lisp
 (console-url)
+```
+
+
+## logs
+
+A warm VM has no terminal, so what it prints goes to a file the launcher chose
+before it started the VM. `logs` shows the end of that file: the last `--lines N`
+(default `DEFAULT-LOG-LINES`), and with `--follow` it keeps printing as the VM
+writes. This is where a VM that failed to boot says why, which is the whole reason
+the file exists.
+
+The file is named for the tree and the build, so one VM has one log; when it grows
+past 4 MiB the launcher keeps it as `.log.1` and starts a fresh one.
+
+```beam-lisp
+(def DEFAULT-LOG-LINES 50)
+
+(defn tail-lines
+  "The last `n` lines of `text`, as a vector. A trailing newline does not make an
+   empty last line. Pure."
+  [text n]
+  (let [lines (vec (String/split (String/trim_trailing text "\n") "\n"))
+        lines (if (= lines [""]) [] lines)]
+    (vec (drop (max 0 (- (count lines) n)) lines))))
+```
+
+```bl-result DEFAULT-LOG-LINES
+&BeamLisp.Ns.Bl.Vm."tail-lines"/2
+```
+
+
+```beam-lisp
+[(tail-lines "a\nb\nc\n" 2) (tail-lines "a\nb" 5) (tail-lines "" 3)]
+```
+
+```bl-result cell11
+[["b" "c"] ["a" "b"] []]
+```
+
+
+```beam-lisp
+(defn- log-of
+  "The log a VM wrote: the path its record carries, else the path the launcher would
+   have chosen for its tree and build. nil when neither exists on disk."
+  [row]
+  (let [recorded (:log row)
+        guess (when-let [root (first (:roots row))]
+                (paths/log-path root (:build row)))
+        found (first (filter (fn [p] (and p (File/regular? p))) [recorded guess]))]
+    found))
+
+(defn- follow!
+  "Print what is appended to `path` after `size`, until interrupted. Polls: a log is
+   a file, and watching a file for growth portably is polling it."
+  [path size]
+  (let [now (:size (File/stat! path))]
+    (cond
+      (> now size)
+      (let [f (erlang/apply :file :open (list (erlang/binary_to_list path) (to-list [:read :binary])))]
+        (erlang/apply :file :position (list (elem f 1) size))
+        (let [data (erlang/apply :file :read (list (elem f 1) (- now size)))]
+          (when (= :ok (elem data 0)) (IO/write (elem data 1)))
+          (erlang/apply :file :close (list (elem f 1))))
+        (follow! path now))
+      :else (do (Process/sleep 500) (follow! path (if (< now size) 0 size))))))
+
+(defn- cmd-logs [args st]
+  (if (empty? args)
+    (u/usage-error "usage: bl vm logs ID [--lines N] [--follow]")
+    (let [r (resolve-or-say (first args))]
+      (if (:exit r)
+        (:exit r)
+        (let [path (log-of (:ok r))]
+          (if (nil? path)
+            (do (u/io-err (str "bl vm: " (:id (:ok r)) " has no log — it was not started by `bl realm start`"
+                               " or its log was removed"))
+                1)
+            (let [text (File/read! path)]
+              (u/each println (to-list (tail-lines text (or (:lines st) DEFAULT-LOG-LINES))))
+              (when (:follow st) (follow! path (erlang/byte_size text)))
+              0)))))))
+```
+
+```bl-result log-of
+&BeamLisp.Ns.Bl.Vm."cmd-logs"/2
 ```
 
 ## start
@@ -251,6 +346,8 @@ installed, so the service manager keeps owning its lifecycle.
 ```bl-result cmd-start
 &BeamLisp.Ns.Bl.Vm."cmd-start"/2
 ```
+
+
 
 ## stop
 
@@ -298,6 +395,7 @@ stopped through the service manager when one owns it.
         (if (every? zero? codes) 0 1)))))
 ```
 
+
 ## prune
 
 Removes registry records whose VM is gone, and the endpoint files of warm VMs that
@@ -313,17 +411,19 @@ never touched. `--dry-run` lists and removes nothing.
     0))
 ```
 
+
 Live: what a prune would remove from this machine, without removing it.
 
 ```beam-lisp
 (select-keys (inv/prune! {:dry-run true}) [:dry-run :removed])
 ```
 
+
 ## The verb
 
 ```beam-lisp
 (defn run
-  "`bl vm [ls|show|ui|start|stop|prune]`."
+  "`bl vm [ls|show|ui|logs|start|stop|prune]`."
   [args st]
   (let [args (u/to-list args)
         sub (or (first args) "ls")
@@ -332,12 +432,14 @@ Live: what a prune would remove from this machine, without removing it.
       (= sub "ls")    (cmd-ls st)
       (= sub "show")  (cmd-show more st)
       (= sub "ui")    (cmd-ui st)
+      (= sub "logs")  (cmd-logs more st)
       (= sub "start") (cmd-start more st)
       (= sub "stop")  (cmd-stop more st)
       (= sub "prune") (cmd-prune st)
-      :else (u/usage-error "usage: bl vm [ls [--all] | show ID | ui [--open] | start gateway [--foreground] | stop ID…|gateway|--all [--force] | prune [--dry-run]]"))))
+      :else (u/usage-error "usage: bl vm [ls [--all] | show ID | ui [--open] | logs ID [--lines N] [--follow] | start gateway [--foreground] | stop ID…|gateway|--all [--force] | prune [--dry-run]]"))))
 ```
 
 ```bl-result run
 &BeamLisp.Ns.Bl.Vm.run/2
 ```
+

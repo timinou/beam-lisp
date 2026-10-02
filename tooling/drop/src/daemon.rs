@@ -276,6 +276,48 @@ pub fn tree_fingerprint(root: &Path) -> Vec<u8> {
     sha256_bytes(canonical.to_string_lossy().as_bytes())
 }
 
+// ── the VM log (must match BeamLisp.Daemon.Paths) ──────────────────────────
+
+/// Directory under the user's state root that holds this app's files.
+pub const STATE_APP_DIR: &str = "beam-lisp";
+/// Subdirectory of `STATE_APP_DIR` that holds VM logs.
+pub const LOG_DIR: &str = "logs";
+/// Extension of a VM log file.
+pub const LOG_EXT: &str = "log";
+/// Extension of a start-in-flight marker (same directory as the socket).
+pub const STARTING_EXT: &str = "starting";
+
+/// The user's state root: `$XDG_STATE_HOME` when set and non-empty, else
+/// `$HOME/.local/state`. `None` when neither names one — a log path built from
+/// nothing would be a lie, and the caller falls back to null streams.
+fn state_dir() -> Option<PathBuf> {
+    if let Ok(d) = std::env::var("XDG_STATE_HOME") {
+        if !d.is_empty() {
+            return Some(PathBuf::from(d));
+        }
+    }
+    std::env::var("HOME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .map(|h| PathBuf::from(h).join(".local/state"))
+}
+
+/// The log for `root`'s VM built by `build`:
+/// `<state>/beam-lisp/logs/<tree-id>-<build>.log`, where the tree id and build
+/// are the ones `endpoints_for` names the socket with.
+pub fn log_path(root: &Path, build: &str) -> Option<PathBuf> {
+    Some(log_path_in(&state_dir()?, &tree_id(root), build))
+}
+
+/// The pure half of `log_path`: one path from its parts, with no environment
+/// read, so it is testable without touching the process.
+pub fn log_path_in(state_dir: &Path, tree_id: &str, build: &str) -> PathBuf {
+    state_dir
+        .join(STATE_APP_DIR)
+        .join(LOG_DIR)
+        .join(format!("{tree_id}-{build}.{LOG_EXT}"))
+}
+
 /// The runtime dir the daemon binds under (mirror of Paths.runtime_dir).
 fn runtime_dir() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
@@ -308,6 +350,10 @@ unsafe fn libc_getuid() -> u32 {
 pub struct Endpoints {
     pub sock: PathBuf,
     pub token: PathBuf,
+    /// The start-in-flight marker: a VM for this endpoint is being started, so
+    /// no second one should be. The VM removes it once it is listening; the
+    /// launcher treats one older than `START_GRACE_SECS` as stale.
+    pub starting: PathBuf,
 }
 
 /// Which build this process is: `BL_BUILD_ID`, cleaned exactly as
@@ -346,7 +392,11 @@ pub fn endpoints(root: &Path) -> Option<Endpoints> {
         Err(_) => {
             let dir = runtime_dir()?;
             let id = tree_id(root);
-            Some(Endpoints { sock: dir.join(format!("{id}.sock")), token: dir.join(format!("{id}.token")) })
+            Some(Endpoints {
+                sock: dir.join(format!("{id}.sock")),
+                token: dir.join(format!("{id}.token")),
+                starting: dir.join(format!("{id}.{STARTING_EXT}")),
+            })
         }
     }
 }
@@ -357,7 +407,154 @@ pub fn endpoints_for(root: &Path, build: &str) -> Option<Endpoints> {
     Some(Endpoints {
         sock: dir.join(format!("{base}.sock")),
         token: dir.join(format!("{base}.token")),
+        starting: dir.join(format!("{base}.{STARTING_EXT}")),
     })
+}
+
+// ── starting a warm VM (marker + log) ────────────────────────────────────────
+
+/// How long a start marker means "a VM is being started". A marker older than
+/// this was left by a start that died before it could delete it, and a new
+/// start may take it over. The VM deletes its own marker once it is listening.
+pub const START_GRACE_SECS: u64 = 120;
+
+/// Try to claim the right to start the VM for one endpoint. `now_secs` is the
+/// clock, passed in so this is pure in its inputs. `create_new` makes the claim
+/// atomic, so two commands cannot both start a VM for the same endpoint.
+///
+/// A marker that already exists means a start is in flight — but only while it
+/// is younger than `grace_secs`. An OLDER marker, or one whose contents cannot
+/// be read as a unix time, is stale (a start that crashed) and is replaced. An
+/// unreadable marker is treated as stale on purpose: a wrong `false` would
+/// block this endpoint forever, while a wrong `true` costs one extra start.
+pub fn claim_start(marker: &Path, now_secs: u64, grace_secs: u64) -> bool {
+    match create_marker(marker, now_secs) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let held = std::fs::read_to_string(marker).ok().and_then(|s| s.trim().parse::<u64>().ok());
+            match held {
+                Some(t) if now_secs.saturating_sub(t) < grace_secs => false,
+                _ => {
+                    let _ = std::fs::remove_file(marker);
+                    create_marker(marker, now_secs).is_ok()
+                }
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Create `marker` exclusively, holding `now_secs`. Fails `AlreadyExists` when
+/// another claim holds it.
+fn create_marker(marker: &Path, now_secs: u64) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = marker.parent() {
+        ensure_dir(parent)?;
+    }
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(marker)?;
+    write!(f, "{now_secs}")
+}
+
+/// Create `path` and its parents. Directories holding sockets and logs are 0700
+/// on unix: they hold a per-user token.
+fn ensure_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
+/// Rotate a log to `<name>.<ext>.1` once it passes `max_bytes`, replacing an
+/// older backup. One generation is enough to see what a failed boot printed, and
+/// a bounded log never grows without limit.
+pub fn rotate_if_large(path: &Path, max_bytes: u64) -> std::io::Result<()> {
+    let too_big = std::fs::metadata(path).map(|m| m.len() > max_bytes).unwrap_or(false);
+    if !too_big {
+        return Ok(());
+    }
+    let backup = path.with_extension(format!("{LOG_EXT}.1"));
+    let _ = std::fs::remove_file(&backup);
+    std::fs::rename(path, backup)
+}
+
+/// The largest a VM log may grow before it is rotated.
+#[cfg(unix)]
+const LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The `--log` argument used when no real log could be opened.
+#[cfg(unix)]
+const NULL_LOG: &str = "/dev/null";
+
+/// Unix seconds, or 0 before the epoch.
+#[cfg(unix)]
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Open (creating) the VM log for append, with its directory. `None` on any
+/// failure: a log that cannot be opened must never stop a VM from starting.
+#[cfg(unix)]
+fn open_log(path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent).ok()?;
+    }
+    let _ = rotate_if_large(path, LOG_MAX_BYTES);
+    std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(path).ok()
+}
+
+/// Write the one header line that marks a fresh VM start in the log.
+#[cfg(unix)]
+fn write_log_header(file: &mut std::fs::File, root: &Path) {
+    use std::io::Write;
+    let _ = writeln!(file, "--- {} bl vm start ({}) ---", now_secs(), root.display());
+}
+
+/// Spawn the release's `realm start --foreground --root <root> --log <log>`
+/// fully detached, so the VM outlives this launcher. stdout and stderr both land
+/// in the SAME log file, so a VM that fails to boot leaves a trace instead of
+/// silence in /dev/null; the log is opened here and its path handed to the VM so
+/// `bl vm logs` reads the very file this launcher's child writes. When no log can
+/// be opened the streams fall back to null — logging must never stop a start.
+/// Returns the log path when one was opened.
+#[cfg(unix)]
+fn start_daemon_detached(bin: &Path, root: &Path, build: &str) -> Option<PathBuf> {
+    use std::process::Stdio;
+    let log = log_path(root, build);
+    let mut file = log.as_deref().and_then(open_log);
+    if let Some(f) = file.as_mut() {
+        write_log_header(f, root);
+    }
+    let log_arg = log.clone().unwrap_or_else(|| PathBuf::from(NULL_LOG));
+    let mut cmd = release_command(bin);
+    cmd.args(warm_start_argv(root, &log_arg)).stdin(Stdio::null());
+    // The SAME file feeds stdout and stderr. If it cannot be duplicated it is
+    // unusable, so both streams fall back to null together — the one fallback
+    // path documented above.
+    let dup = file.as_ref().and_then(|f| f.try_clone().ok());
+    let opened = dup.is_some();
+    match (file, dup) {
+        (Some(f), Some(d)) => {
+            cmd.stdout(Stdio::from(f)).stderr(Stdio::from(d));
+        }
+        _ => {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
+    let _ = cmd.spawn();
+    if opened {
+        log
+    } else {
+        None
+    }
 }
 
 /// Walk up from `cwd` to the nearest beam-lisp tree root (checkout or extracted
@@ -957,7 +1154,74 @@ mod tests {
         assert!(a.sock.to_string_lossy().ends_with(&format!("{tree}-3ffa4c3a.sock")));
         assert!(a.token.to_string_lossy().ends_with(&format!("{tree}-3ffa4c3a.token")));
         assert!(b.sock.to_string_lossy().ends_with(&format!("{tree}-5e0dd11f.sock")));
+        assert!(a.starting.to_string_lossy().ends_with(&format!("{tree}-3ffa4c3a.starting")));
 
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A VM log's path is built from its parts alone — no environment read.
+    #[test]
+    fn a_log_path_names_the_tree_the_build_and_the_state_root() {
+        assert_eq!(
+            log_path_in(Path::new("/state"), "abc123", "3ffa4c3a"),
+            PathBuf::from("/state/beam-lisp/logs/abc123-3ffa4c3a.log")
+        );
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("drop-log-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// `create_new` makes the first claim win and a live marker refuse a second;
+    /// once the grace passes, the marker is stale and may be taken over.
+    #[test]
+    fn a_fresh_marker_wins_and_a_live_one_blocks() {
+        let d = scratch("claim");
+        let m = d.join("e.starting");
+        assert!(claim_start(&m, 1_000, 120), "the first claim wins");
+        assert!(!claim_start(&m, 1_001, 120), "a live marker refuses a second claim");
+        assert_eq!(std::fs::read_to_string(&m).unwrap(), "1000");
+        assert!(!claim_start(&m, 1_119, 120), "still inside the grace");
+        assert!(claim_start(&m, 1_120, 120), "at the grace the marker is stale");
+        assert_eq!(std::fs::read_to_string(&m).unwrap(), "1120", "the stale marker is replaced");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A marker whose time cannot be read must not block the endpoint forever.
+    #[test]
+    fn an_unreadable_marker_is_treated_as_stale() {
+        let d = scratch("unreadable");
+        let m = d.join("e.starting");
+        std::fs::write(&m, "not-a-time").unwrap();
+        assert!(claim_start(&m, 500, 120), "junk cannot be trusted to mean a live start");
+        assert_eq!(std::fs::read_to_string(&m).unwrap(), "500");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Rotation keeps one generation: a log at the limit is untouched, a larger
+    /// one is renamed to `.log.1`, and an older backup is replaced.
+    #[test]
+    fn rotate_if_large_keeps_one_generation() {
+        let d = scratch("rotate");
+        let log = d.join("x.log");
+        let backup = d.join("x.log.1");
+
+        std::fs::write(&log, vec![b'a'; 100]).unwrap();
+        rotate_if_large(&log, 100).unwrap();
+        assert!(log.exists(), "a log at the limit is not rotated");
+        assert!(!backup.exists());
+
+        std::fs::write(&log, vec![b'b'; 101]).unwrap();
+        rotate_if_large(&log, 100).unwrap();
+        assert!(!log.exists(), "a log past the limit is moved aside");
+        assert_eq!(std::fs::read(&backup).unwrap(), vec![b'b'; 101]);
+
+        std::fs::write(&log, vec![b'c'; 200]).unwrap();
+        rotate_if_large(&log, 100).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), vec![b'c'; 200], "the older backup is replaced");
         let _ = std::fs::remove_dir_all(&d);
     }
 

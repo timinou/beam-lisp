@@ -20,6 +20,13 @@ pub const WARM_FLAG: &str = "--warm";
 pub const ROOT_FLAG: &str = "--root";
 /// Boolean; only meaningful to `realm start` (it becomes the VM in the foreground).
 pub const FOREGROUND_FLAG: &str = "--foreground";
+/// The VM's log file, handed to `realm start` so `bl vm logs` reads the very
+/// file the VM writes (VALUED: it takes the next token).
+pub const LOG_FLAG: &str = "--log";
+/// How long an idle warm VM lingers before it exits (VALUED).
+pub const IDLE_FLAG: &str = "--idle";
+/// How many trailing log lines a reader shows (VALUED).
+pub const LINES_FLAG: &str = "--lines";
 
 /// How a command reaches a VM.
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
@@ -29,16 +36,23 @@ pub enum Transport {
     /// Use the warm VM if one is running; never start one.
     Attach,
     /// Use the warm VM, and start one (detached) if none is running.
+    ///
+    /// Starting NEVER blocks the command that triggered it: the VM comes up in
+    /// the background and THIS command runs cold, immediately. A boot the user
+    /// did not ask to wait for must not slow the command that hinted at it, and
+    /// a start that fails costs this command nothing.
     Start,
 }
 
 /// The transport when nothing says otherwise.
 ///
-/// ATTACH, not `Start`, today: `Start` makes the FIRST command pay for a
-/// detached VM that must boot and write its log before it can serve, and if it
-/// cannot come up the command falls cold anyway. Attach keeps the launcher's
-/// promise narrow — a warm VM is used when it is there, never conjured.
-/// Flipping this default later is this ONE line.
+/// ATTACH, not `Start`, today: a warm VM belongs to ONE tree, so `Start` would
+/// conjure one VM PER DIRECTORY — more than a user asked for — until
+/// one-VM-per-user lands. Attach keeps the launcher's promise narrow: a warm VM
+/// is used when it is there, never started behind the user's back. A command
+/// still runs fine when none is running (it goes cold); `--warm` or a tree's
+/// `:warm "start"` asks for a warm VM explicitly. Flipping this default later
+/// is this ONE line.
 pub const DEFAULT_TRANSPORT: Transport = Transport::Attach;
 
 /// The declaration key: `:warm "…"` in `env.bl` or the config, read by
@@ -149,12 +163,16 @@ pub fn start_requested(argv: &[String]) -> bool {
 /// never attach to a warm VM.
 pub const LIFECYCLE_VERBS: &[&str] = &["realm", "vm"];
 
-/// The release argv that starts a warm VM for `root` in the foreground.
-pub fn warm_start_argv(root: &Path) -> Vec<String> {
+/// The release argv that starts a warm VM for `root` in the foreground, with
+/// its log at `log`. The log path is an ARGUMENT so the VM knows where to write
+/// and `bl vm logs` reads the very file the launcher's child writes.
+pub fn warm_start_argv(root: &Path, log: &Path) -> Vec<String> {
     let mut a = words(REALM_START);
     a.push(FOREGROUND_FLAG.to_string());
     a.push(ROOT_FLAG.to_string());
     a.push(root.to_string_lossy().into_owned());
+    a.push(LOG_FLAG.to_string());
+    a.push(log.to_string_lossy().into_owned());
     a
 }
 
@@ -286,7 +304,19 @@ mod transport_tests {
     #[test]
     fn the_warm_argv_lists_name_realm() {
         let root = Path::new("/tree");
-        assert_eq!(warm_start_argv(root), a(&["realm", "start", "--foreground", "--root", "/tree"]));
+        let log = Path::new("/state/beam-lisp/logs/tree-abc.log");
+        assert_eq!(
+            warm_start_argv(root, log),
+            a(&["realm", "start", "--foreground", "--root", "/tree", "--log", "/state/beam-lisp/logs/tree-abc.log"])
+        );
         assert_eq!(warm_stop_argv(root), a(&["realm", "stop", "--root", "/tree"]));
+    }
+
+    /// The log/idle/lines flags take a value; one spelling each.
+    #[test]
+    fn the_log_and_reader_flags_are_valued() {
+        assert_eq!(LOG_FLAG, "--log");
+        assert_eq!(IDLE_FLAG, "--idle");
+        assert_eq!(LINES_FLAG, "--lines");
     }
 }

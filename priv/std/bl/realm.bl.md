@@ -139,10 +139,28 @@ The launcher recognises `realm start` before this code runs: it detaches the VM,
 waits for it to answer, and reports. `--foreground` skips that, so the request
 reaches here and this process *is* the VM.
 
+A warm VM that nobody uses leaves by itself: after `DEFAULT-IDLE-SECONDS` with no
+command running, no route held and no job alive, it stops. `--idle SECONDS` changes
+the limit and `--idle 0` turns the clock off, which is what a service manager that
+owns the VM's lifetime wants. The VM also records where its output goes
+(`--log PATH`, set by the launcher), so `bl vm logs` can show it.
+
 ```beam-lisp
+(def DEFAULT-IDLE-SECONDS
+  "Eight hours: a VM survives a lunch break and a meeting, and does not survive the
+   weekend. One definition; the CLI reference quotes this number."
+  28800)
+
+(defn start-options
+  "What `realm start` hands the VM, from the parsed flags: the idle limit (the flag,
+   else the default; 0 disables) and the log path the launcher chose."
+  [st]
+  {:idle (or (:idle st) DEFAULT-IDLE-SECONDS)
+   :log (:log st)})
+
 (defn cmd-start [st]
   (let [root (root-of st)]
-    (client/start-foreground root)
+    (client/start-foreground root (start-options st))
     0))
 
 (defn cmd-stop [st]
