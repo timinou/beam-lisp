@@ -76,6 +76,31 @@ Longer prefixes come first on purpose: `daemon start` must match before bare
            (join " " (second row)) "`"))))
 ```
 
+## Finding an old spelling in text that outlives a release
+
+A systemd unit, a shell alias or a script is text, not argv. `stale-in` says which
+old spelling a command line uses, so `bl doctor` can report a unit the installer
+wrote before the rename. It compares the words after the executable, and only the
+table's own rows count, so a new spelling is never reported.
+
+```beam-lisp silent
+(defn stale-in
+  "The old spelling a command line `text` runs, as {:old \"gateway run\" :new
+   \"vm start gateway --foreground\"}, or nil. `text` is what follows `ExecStart=`
+   or `alias x=`: the executable first, then the words."
+  [text]
+  (let [words (vec (rest (filter (fn [w] (not= "" w)) (String/split (str text) " "))))
+        row (match words)]
+    (when row
+      {:old (join " " (first row)) :new (join " " (second row))})))
+```
+
+```beam-lisp
+[(stale-in "/home/u/.local/bin/bl gateway run")
+ (stale-in "/home/u/.local/bin/bl vm start gateway --foreground")
+ (stale-in "/usr/bin/bl daemon start")]
+```
+
 ## Live
 
 What each old spelling becomes, computed from the table above:

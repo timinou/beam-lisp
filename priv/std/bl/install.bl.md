@@ -639,7 +639,11 @@ the corpus assembles.
   (let [cfg (or (System/get_env "XDG_CONFIG_HOME") (str (home) "/.config"))]
     (str cfg "/systemd/user/bl-gateway.service")))
 
-(defn- unit-text [bin]
+(defn unit-text
+  "The systemd user unit for the gateway, as text. Public so the contract with
+   `bl doctor` is checkable: what this writes must never be what doctor reports as
+   a stale spelling."
+  [bin]
   (join "\n"
         ["[Unit]"
          "Description=beam-lisp gateway — answers the names beam-lisp projects declare"

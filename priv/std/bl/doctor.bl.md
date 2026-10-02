@@ -19,7 +19,7 @@ still exits 0.
 
 ```beam-lisp
 (ns bl.doctor
-  (:require [bl.util :as u] [vm.client] [model] [vm.image :as image]))
+  (:require [bl.util :as u] [vm.client] [model] [vm.image :as image] [bl.deprecated :as dep] [bl.gateway] [bl.json]))
 ```
 
 ## A probe never crashes
@@ -145,6 +145,23 @@ invocation, so it reports `not running` and changes nothing.
          (if (contains? r :ok)
            {:ok true :detail "running (warm VM for this tree)"}
            {:ok false :detail (str "not running (" (pr-str (:error r)) ")")}))))
+
+   ;; An installed unit is text a release cannot rewrite. The installer writes the
+   ;; current spelling; a unit from before a rename keeps working through the
+   ;; forwarder, which is exactly why nothing would ever tell you to fix it. The
+   ;; old spellings are `bl.deprecated/TABLE`'s, not a second list kept here.
+   (probe "gateway unit" false
+     (fn []
+       (let [path (bl.gateway/unit-path)]
+         (if (not (File/regular? path))
+           {:ok true :detail "not installed"}
+           (let [exec (first (filter (fn [l] (String/starts_with? l "ExecStart="))
+                                     (String/split (File/read! path) "\n")))
+                 stale (when exec (dep/stale-in (subs exec (count "ExecStart="))))]
+             (if (nil? stale)
+               {:ok true :detail "installed, current spelling"}
+               {:ok false
+                :detail (str "runs `bl " (:old stale) "`, which is deprecated — `bl install gateway` rewrites it as `bl " (:new stale) "`")}))))))
 
    (probe "src/" false
      (fn [] (let [ok? (File/dir? (u/resolve "src"))]
