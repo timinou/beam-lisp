@@ -721,6 +721,26 @@ fn names_its_build(dest: &std::path::Path) -> bool {
         })
 }
 
+/// The marker a payload carries when its VM can serve many projects: the
+/// `shared?` rule in its `vm.paths`. An older payload binds only per-tree sockets,
+/// so a project that asks to share a VM must be given its own on that payload —
+/// the shared socket name would be one nobody binds.
+const SHARED_VM_MARKER: &str = "(defn shared?";
+
+/// Whether the payload at `dest` can host a shared VM. Read from the payload's own
+/// `vm.paths` source, the same way `names_its_build` reads an older one.
+fn supports_shared_vm(dest: &std::path::Path) -> bool {
+    std::fs::read_dir(dest.join("lib"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("beam_lisp-"))
+        .any(|e| {
+            std::fs::read_to_string(e.path().join("priv/std/vm/paths.bl"))
+                .is_ok_and(|t| t.contains(SHARED_VM_MARKER))
+        })
+}
+
 fn exec_or_fail(mut cmd: Command, bin: &std::path::Path) -> ! {
     #[cfg(unix)]
     {
@@ -772,7 +792,7 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
         // Read <root>/env.bl ONCE: `--share-vm`/`--own-vm` or the `:vm` declaration
         // decides the endpoint for this whole invocation (the default is own).
         let env_bl = root.as_deref().and_then(|r| std::fs::read_to_string(r.join(PROJECT_FILE)).ok());
-        let shared = shared_for(&argv, env_bl.as_deref());
+        let shared = shared_for(&argv, env_bl.as_deref()) && supports_shared_vm(dest);
         let is_lifecycle = verb_of(&argv).as_deref().is_some_and(|v| LIFECYCLE_VERBS.contains(&v));
         // `bl realm start` is a REQUEST for a warm VM, not a command to run
         // inside one. Exec'd, the release parks in the foreground and dies with
@@ -836,6 +856,26 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
 #[cfg(test)]
 mod gc_tests {
     use super::*;
+
+    fn payload_with_paths(tag: &str, paths_bl: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("drop-shared-probe-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let dir = d.join("lib/beam_lisp-0.1.0/priv/std/vm");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("paths.bl"), paths_bl).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_payload_that_can_host_a_shared_vm_says_so_in_its_paths() {
+        let new = payload_with_paths("new", "(defn shared? [root build] false)\n");
+        let old = payload_with_paths("old", "(defn build-id [] \"src\")\n");
+        assert!(supports_shared_vm(&new));
+        assert!(!supports_shared_vm(&old), "an older payload binds per-tree sockets only");
+        assert!(!supports_shared_vm(&std::env::temp_dir().join("drop-no-such-payload")));
+        let _ = std::fs::remove_dir_all(&new);
+        let _ = std::fs::remove_dir_all(&old);
+    }
 
     /// `maintenance meta` names the target; every name parses back to its tags.
     #[test]
