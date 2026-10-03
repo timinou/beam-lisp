@@ -1,0 +1,112 @@
+#+TITLE: Spike: ns_defs as datom facts (per-clause, queryable) instead of a per-namespace map
+#+STATE: ITEM
+#+SESSION_ID: 1596dbb9bf7ac421
+#+TRANSCRIPT_PATH: [[file:/home/user/.spell/agent/sessions/-code-undefine-beam-lisp/2026-10-02T20-06-22-205Z_1596dbb9bf7ac421.jsonl]]
+#+CUSTOM_ID: FUP-133-spike-ns-defs-as-datom-facts-per-clause
+
+* Initial Message
+
+can you inspect the running instances of the various beam lisp instances on and tell me why thye use so much memory?
+
+* Initial Message
+
+"isn't ns_defs more powerful maybe with a lazymemo and/or datom?" — then: "ok C. Put the B as a research spike FUP complete with tradeoffs and pointers for further research."
+
+* Status
+
+RESEARCH SPIKE, not scheduled. Nothing here is implemented. Option C (beam-backed ns_defs, worktree ~beam-lisp--nsdefs~, branch ~ns-defs-beam~) is the change this follows; this item is what to do AFTER it, and whether to do it at all.
+
+* Context: what ns_defs is and what it cost
+
+~BeamLisp.Env/ns_defs ns~ returns ~{name => [{kind, arity, fname, def_ast, body_mod}]}~ — the whole compiled AST of every def in a namespace. It lives in ~:beam_lisp_vars~ under key ~{env, :ns_defs, ns}~ (priv/host/env.bl ~ns_defs~, ~put_ns_defs~).
+
+Measured 2026-10-02 (flat term size via ~erts_debug:flat_size~; two different knowledger QA servers, so the numbers are NOT additive):
+- Server A, 7h old: 269 ns_defs rows = 69 MB of a 78 MB ~beam_lisp_vars~ (74 MB flat). Largest rows: ~knowledger.live~ 5.2 MB, ~knowledger.scree*~ 3.5 MB, ~compiler~ 2.3 MB.
+- Server B, freshly restarted: 82 namespaces, 2,382 def entries, 16.9 MB flat. Largest: ~compiler~ 2.3 MB, ~rt~ 1.8 MB, ~reader~ 0.66 MB.
+- On B, the compiler's shim beam (build/Elixir.BeamLisp.Ns.Compiler.beam, 1.2 MB) carries the SAME table as one inlined literal: 202 keys, 2.3 MB. 197 of those keys are in the ETS copy; the shapes are equal. They differ at 11,228 leaf points, of which about 6,958 are binaries and 4,250 ints; the four samples I looked at were fresh-name suffixes (~items_177~ vs ~items_183~) and line numbers, but I did not classify them all. So the AST is held at least twice.
+- An ETS read COPIES the term to the caller's heap: 33-39 ms per ~compiler~/~rt~ lookup, 1.5 ms for ~reader~. Every reader pays a whole-namespace copy to look at one def.
+- Per-entry ~term_to_binary(compressed)~: ~10x smaller (16.9 MB flat -> 1.6 MB) but 230-330 us per entry to unpack. Rejected: it keeps both copies and makes per-def reads slower.
+
+Option C makes the AOT shim's ~__bl_ns_defs__/0~ literal the source of truth; ETS holds ~{:"$beam", Mod}~ or, after a live edit, an overlay map. That removes the duplicate and the copy for AOT'd namespaces. It does NOT change the SHAPE: callers still get one whole-namespace map. A source-loaded namespace (no beam) is unchanged: it still holds the full map in ETS.
+
+* Who reads ns_defs (the actual query workload)
+
+| reader | file | what it wants |
+|--------+------+---------------|
+| Link/defvar | priv/host/link.bl | one namespace map, to add ONE name and regenerate the shim (needs every clause HEAD for shim_clauses) |
+| callers_of | priv/host/env.bl | for a target, every def in every OTHER namespace whose AST contains a remote call to it: a full scan of every AST in the VM |
+| AOT emit | priv/host/aot.bl (~unit_defs~, ~emit_module~, ~compile_host_file~) | per-namespace map; ~unit_defs~ filters by body module |
+| repl index | priv/std/vm/repl.bl | arglists only (clause arity) per var |
+| undefine_var | priv/host/env.bl | delete one name |
+| reload | priv/std/reload.bl | ~callers_of~ for impact analysis |
+| tests | test/bl/link_test.bl, live/web_test.bl | snapshots |
+
+Only callers_of and AOT need AST BODIES. defvar needs clause heads; the repl index needs arglists. That asymmetry is the case for splitting the data.
+
+* The proposal under study (B): one datom fact per def clause
+
+Model each ~{ns, name, clause#}~ as an entity with attributes, in the same fact store the code index uses:
+- ~:def/ns~, ~:def/name~, ~:def/kind~ (fixed|variadic), ~:def/arity~, ~:def/fname~, ~:def/body-mod~: small, indexed, cheap to read.
+- ~:def/ast~: the body, as a blob attribute (or an interned content hash into a separate blob store, deduped across namespaces).
+- ~:def/calls~ (cardinality many, ref or [mod fun arity]): extracted at write time, so ~callers_of~ is an index lookup on the reverse-ref index instead of an AST walk of the whole VM.
+
+Reads become per-entity: arglists = one range scan on ~:def/arity~; "who calls X" = reverse ref lookup; defvar reads one name's clauses plus the heads of its siblings.
+
+* Tradeoffs
+
+Wins:
+- ~callers_of~ goes from O(all ASTs in the VM) to O(callers). It is the one reader that is genuinely expensive, and reload impact analysis depends on it.
+- No whole-namespace copy per read; a read touches only the entities it asks for.
+- Bodies can be evicted or live on disk: memory scales with what is QUERIED, not what is loaded. C cannot do this (a beam literal is resident while the module is loaded).
+- Bitemporal / branches if the store has them (docs/datom-bitemporal.bl.md, datom-branches.bl.md): "what did ns X define before this reload" becomes a query; today it is lost the moment ~put_ns_defs~ overwrites.
+- Persists across VM restarts, so a warm start could skip re-deriving the table.
+- Convergence: ~code.semantic~ already indexes functions as facts (docs/code-semantic-search.md, "a file is a fact"). Two stores describing the same code violates one-need-one-implementation.
+
+Costs and risks:
+- BOOT ORDER. ~Env~ is a pinned host loaded before almost everything, and ns_defs is read during compile (Link/defvar) and AOT init. The datom layer (priv/lib/datom, NIFs datom_redb / datom_fjall / datom_datalog) is a LIBRARY above the boot tier; Env cannot depend on it. Any design needs a boot-safe fallback (the C map) and a promotion path, or the store must be injected after boot. This is the hardest constraint and the main reason B is a spike, not a task.
+- WRITE AMPLIFICATION. ~Link/defvar~ is the live-reload hot path (a REPL eval of a defn). A transaction per def plus call-edge extraction (an AST walk) on every eval must be measured against today's single ~ets:insert~. Likely needs async or batched writes, with the C overlay serving reads until they land.
+- CONSISTENCY WITH THE SHIM. The shim and body modules are the executable truth; ns_defs is derived. A second durable store raises which wins after a crash or partial reload. ~Link/defvar~'s "compile, load, THEN publish" ordering (a failing descriptor changes nothing) must survive.
+- AST SHAPE CHURN. The AST is the compiler's internal ANF; it changes whenever the compiler does. A persisted ~:def/ast~ is invalidated by every codegen key rotation (~AOTCache/compiler_key~), so persistence needs the compiler key in the fact, or it is stale by design and only worth keeping in memory.
+- FRESH NAMES. The beam literal and the live copy differ in gensym suffixes and line numbers (see above). Content-addressing bodies (dedup across namespaces, cheap equality) needs an alpha-normalising hash first, or nothing dedups.
+- COLD BOOT. PLAN-153 made namespace loading demand-driven; per-entity transactions for 80+ namespaces at startup must not reintroduce an eager pass.
+
+* Alternative: LazyMemo (the other half of the question)
+
+~BeamLisp.LazyMemo~ (priv/host/lazy_memo.bl, native/lazy_memo) is a NIF-backed cell with versioned CAS transitions (create / claim / publish), dependency edges used only for cycle detection, and an ownership model where a saved state keeps embedded resources alive.
+
+Fit: "compute this namespace's table on first ask, from the beam or from disk, then hold it" is a memo. A cell can be dropped when unreferenced, so a table nobody reads falls out of memory, which would beat C for rarely-read namespaces.
+
+Open questions (NOT verified; I read the header comments only, I did not run it):
+- It was built for LazySeq forcing: small chunk states, hot-path CAS. Does a multi-MB term as a published value behave (copy-in on publish, copy-out on read)? If a read copies the term out it has the SAME per-read copy cost as ETS and gains only reclaimability.
+- Reclaim is by ownership, not memory pressure; there is no LRU. "Evict the biggest cold table" needs new machinery.
+- It cannot answer cross-entry queries (callers_of): it is a cache for ONE shape, not an index.
+∴ Likely a layer UNDER B (a per-entity body cache), a poor replacement for it. Test it as the body cache, not as the table.
+
+* Pointers for further research
+
+Code:
+- priv/host/env.bl: ~ns_defs~, ~put_ns_defs~, ~link_ns_defs~, ~unlink_ns_defs~, ~callers_of~, ~namespaces~, ~undefine_var~ (on branch ns-defs-beam).
+- priv/host/link.bl ~defvar~ (write path); priv/host/aot.bl ~emit_module~ / ~build_init_ast~ (where ~__bl_ns_defs__~ is emitted); priv/host/emit.bl ~shim_clauses~, ~body_modules~.
+- priv/lib/datom/ and native/datom_*: the fact store; test/bl/datom/ for API shapes.
+- priv/lib/ code-semantic indexer and docs/code-semantic-search.md: the existing code-as-facts index to converge with.
+- priv/host/lazy_memo.bl and native/lazy_memo/src/lib.rs.
+- test/bl/ns_defs_beam_test.bl: the contract any new store must keep.
+
+Docs: docs/datom-files-a-file-is-a-fact.md, datom-query-plans.md, datom-bitemporal.bl.md, datom-branches.bl.md, datom-excision.bl.md (dropping a def), docs/datomic-in-beam-lisp/, docs/jj-in-front-datom-in-the-back.md.
+
+* Experiments to run, in order (each is cheap and decides whether the next is worth it)
+
+1. MEASURE the real query mix. Instrument ~ns_defs~ and ~callers_of~ for a day on a dev VM and a server: calls/sec, which namespaces, ms. If ~callers_of~ is rare, B's headline win is small.
+2. PROTOTYPE the read side only, off the hot path: load every namespace's ns_defs into a throwaway datom db (per-clause entities, ~:def/calls~ extracted) and time (a) ~callers_of~ vs the AST scan, (b) arglists vs the repl index build. No Env change; a script, not a patch.
+3. MEASURE the write side: one ~defvar~ with a synchronous transaction vs today. Kill the idea here if it adds more than a few ms to a REPL eval.
+4. TEST LazyMemo with a 2 MB published term: publish cost, read cost, whether two readers share or copy, what reclaim frees. A 30-line .bl script against the pinned module.
+5. DECIDE the boot story (inject after boot vs a second boot-safe store) on paper before any code. This is where B most likely dies or lives.
+6. Only then: alpha-normalised body hashing for dedup, and persistence keyed by the compiler key.
+
+* Exit criteria
+
+Adopt B only if (2) shows callers_of at least 10x faster on the real corpus AND (3) shows <5 ms added to a REPL eval AND (5) has a boot story that does not touch cold-boot time. If any fails, close this item with the numbers; C stays as the design, and ~callers_of~ can be made cheaper locally with a one-time inverted index built lazily on first call (no datom, no boot dependency).
+
+* Non-goals
+
+Changing the AST shape. Persisting ASTs across compiler generations. Replacing the shim/body modules as the executable truth.
