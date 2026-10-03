@@ -2,17 +2,22 @@
 
 Beam Lisp → ES modules for code that runs to completion in response to an
 event: editors, views, parsers, validators. It is the profile bl-ed is built on
-(PLAN-161). The actor profile in `research/js-actors` stays for code that needs
-processes, mailboxes and preemption.
+(PLAN-161), and the base of the one unified JS target (PLAN-162): core
+compiled from priv/boot, actors as a library with selective suspension. Until
+PLAN-162 lands, `research/js-actors` is the prototype for processes.
 
 ```sh
-JS_ENTRY=my.app JS_OUT=out/my-app JS_ROOTS=src[:more] \
-JS_HOST_FNS=now,measure bl run scripts/js-build.bl
+bl js build my.app -p src [-p more] [--out out/my-app] [--host now,measure]
+bl js watch my.app -p src            # rebuild on every .bl change under the roots
+bl js test                           # the BEAM <-> JS differential (test/js/diff)
 ```
 
-The command reads `my.app` and every namespace it requires under the roots. It
-compiles each one with the BEAM compiler to bl-ANF, emits one ES module per
-namespace, and writes `rt.mjs`, `core.mjs` and a `host.mjs` stub beside them.
+`bl js build` reads `my.app` and every namespace it requires under the roots
+(`-p`, repeatable; default the current directory; `priv/std` is always searched
+last). It compiles each one with the BEAM compiler to bl-ANF, emits one ES
+module per namespace, and writes `rt.mjs`, `core.mjs` and a `host.mjs` stub
+beside them. `--host` names the `js/` functions the page provides on
+`globalThis.BL_HOST`; any other `js/` name is a build error.
 
 ## What a program becomes
 
