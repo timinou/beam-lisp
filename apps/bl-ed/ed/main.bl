@@ -37,13 +37,13 @@
   [cell]
   {"ed/state" (fn [] @cell)
    "ed/text" (fn [] (t/to-string (:text @cell)))
-   "ed/cmd" (fn [name] (swap! cell km/run-command (keyword name)) nil)
+   "ed/cmd" (fn [cmd-name] (swap! cell km/run-command (keyword cmd-name)) nil)
    "ed/commands" (fn [] (vec (sort (map name (keys (merge cmds/table (:user-commands @cell)))))))
-   "ed/doc" (fn [name] (:doc (cmds/lookup @cell (keyword name))))
+   "ed/doc" (fn [cmd-name] (:doc (cmds/lookup @cell (keyword cmd-name))))
    "ed/bind" (fn [mode seq-str cmd] (swap! cell assoc-in [:user-keys (keyword mode) seq-str] (keyword cmd)) (str seq-str " → " (name cmd)))
-   "ed/defcmd" (fn [name doc f]
-                 (swap! cell assoc-in [:user-commands (keyword name)] {:doc doc :run (fn [ed] (let [r (f ed)] (if (map? r) r ed)))})
-                 (str "defined " (name name)))
+   "ed/defcmd" (fn [cmd-name doc f]
+                 (swap! cell assoc-in [:user-commands (keyword cmd-name)] {:doc doc :run (fn [ed] (let [r (f ed)] (if (map? r) r ed)))})
+                 (str "defined " (name cmd-name)))
    "ed/insert" (fn [s] (swap! cell c/insert-at-heads s) nil)
    "ed/goto" (fn [n] (swap! cell (fn [ed] (let [p (t/clamp (:text ed) [(dec n) 0])] (c/scroll-to-cursor (assoc ed :sels [{:anchor p :head p}] :primary 0))))) nil)
    "ed/find" (fn [needle]
@@ -159,7 +159,15 @@
               (c/message (str "wrote " (:path ed))))
           (c/message ed (str "save failed: " (:message ev))))
       (= ty :eval-result) (c/message ed (str (:id ev) " ⇒ " (:text ev)))
-      (= ty :load) (assoc (c/new-editor (:text ev) (:path ev)) :view (:view ed))
+      ; the BEAM rewrote result spans: take the new text as ONE undoable edit
+      ; that keeps the cursor, the history, the folds and the session state
+      (= ty :load)
+        (if (= (:text ev) (t/to-string (:text ed)))
+          ed
+          (let [p (:head (c/primary ed))
+                ed2 (c/apply-edits ed [[[0 0] (t/doc-end (:text ed)) (:text ev)]] (fn [_ end] {:anchor end :head end}) nil)
+                q (t/clamp (:text ed2) p)]
+            (c/scroll-to-cursor (assoc ed2 :sels [{:anchor q :head q}] :primary 0))))
       :else ed)))
 
 (defn take-effects [ed] [(assoc ed :effects []) (:effects ed)])
@@ -180,24 +188,66 @@
       (if (or (= r (:from b)) (and (not (:open? b)) (= r (dec (:to b))))) :fence :code)
     :else :prose))
 
-(defn- prose-segments
-  "Prose lines: keyword lines (#+TITLE:) and inline =code= / ~code~."
-  [l kind]
-  (cond
-    (starts-with? (triml l) "#+") [{:text l :kind :keyword-line}]
-    :else [{:text l :kind kind}]))
+(def ^:private inline-marks
+  "Org emphasis markers and the segment kind each produces."
+  {"=" :verbatim "~" :verbatim "*" :strong "/" :emph})
 
-(defn- heading-segments [l b]
-  (let [stars (subs l 0 (:level b))
-        rest (subs l (:level b))]
-    (into [{:text stars :kind :stars}]
-          (let [todo (if (some? (:todo b)) (upper-case (name (:todo b))) nil)
-                i (if (some? todo) (index-of rest todo) nil)]
-            (if (nil? i)
-              [{:text rest :kind (keyword (str "heading-" (min 6 (:level b))))}]
-              [{:text (subs rest 0 i) :kind (keyword (str "heading-" (min 6 (:level b))))}
-               {:text todo :kind (if (= :done (:todo b)) :done :todo)}
-               {:text (subs rest (+ i (count todo))) :kind (keyword (str "heading-" (min 6 (:level b))))}])))))
+(defn- boundary? [l i]
+  (or (< i 0) (>= i (count l))
+      (contains? #{" " "\t" "(" ")" "\"" "'" "," "." ";" ":" "-" "!" "?" "{" "}" "[" "]"} (subs l i (inc i)))))
+
+(defn- inline-segments
+  "Split prose line `l` into segments: org emphasis (=x= ~x~ *x* /x/) when the
+   marker sits on a word boundary, [[links]], and plain prose between."
+  [l]
+  (let [n (count l)]
+    (loop [i 0 start 0 out []]
+      (if (>= i n)
+        (if (< start n) (conj out {:text (subs l start) :kind :prose}) out)
+        (let [ch (subs l i (inc i))]
+          (cond
+            (and (= ch "[") (< (inc i) n) (= "[" (subs l (inc i) (+ i 2))))
+              (let [close (index-of (subs l i) "]]")]
+                (if (nil? close) (recur (inc i) start out)
+                  (let [end (+ i close 2)
+                        out (if (< start i) (conj out {:text (subs l start i) :kind :prose}) out)]
+                    (recur end end (conj out {:text (subs l i end) :kind :link})))))
+            (and (contains? inline-marks ch) (boundary? l (dec i)) (< (inc i) n) (not= " " (subs l (inc i) (+ i 2))))
+              (let [close (some (fn [j] (if (and (= ch (subs l j (inc j))) (not= " " (subs l (dec j) j)) (boundary? l (inc j))) j nil))
+                                (range (+ i 2) n))]
+                (if (nil? close) (recur (inc i) start out)
+                  (let [out (if (< start i) (conj out {:text (subs l start i) :kind :prose}) out)]
+                    (recur (inc close) (inc close) (conj out {:text (subs l i (inc close)) :kind (get inline-marks ch)})))))
+            :else (recur (inc i) start out)))))))
+
+(defn- prose-segments
+  "Prose lines: keyword lines (#+TITLE:), list bullets, inline markup."
+  [l kind]
+  (let [t (triml l)
+        lead (- (count l) (count t))]
+    (cond
+      (starts-with? t "#+") [{:text l :kind :keyword-line}]
+      (or (starts-with? t "- ") (starts-with? t "+ "))
+        (into [{:text (subs l 0 (+ lead 1)) :kind :list-bullet}] (inline-segments (subs l (+ lead 1))))
+      :else (inline-segments l))))
+
+(defn- heading-segments
+  "stars · optional TODO keyword · title · optional :tags:"
+  [l b]
+  (let [hk (keyword (str "heading-" (min 6 (:level b))))
+        stars (subs l 0 (:level b))
+        rest (subs l (:level b))
+        todo (if (some? (:todo b)) (upper-case (name (:todo b))) nil)
+        ti (if (some? todo) (index-of rest todo) nil)
+        [pre after] (if (nil? ti) ["" rest] [(subs rest 0 ti) (subs rest (+ ti (count todo)))])
+        tag-i (if (and (seq (:tags b)) (ends-with? (trimr after) ":")) (last-index-of after " :") nil)
+        [title tags] (if (nil? tag-i) [after ""] [(subs after 0 (inc tag-i)) (subs after (inc tag-i))])]
+    (vec (filter (fn [s] (not= "" (:text s)))
+                 [{:text stars :kind :stars}
+                  {:text pre :kind hk}
+                  {:text (or todo "") :kind (if (= :done (:todo b)) :done :todo)}
+                  {:text title :kind hk}
+                  {:text tags :kind :tag}]))))
 
 (defn- code-marks
   "Per-row column marks from a forest: [{:row :from :to :kind :depth}] for the
@@ -258,12 +308,24 @@
         bs (:blocks (:struct ed))
         rows (visible-rows ed)
         folds (or (:folds ed) #{})
-        marks (reduce (fn [acc [from forest]] (into acc (code-marks forest rows))) [] (:forms ed))
+        ; only the cells that intersect the visible rows contribute marks
+        r-lo (if (empty? rows) 0 (first rows))
+        r-hi (if (empty? rows) 0 (inc (last rows)))
+        marks (reduce (fn [acc b] (into acc (code-marks (get (:forms ed) (:from b) []) rows)))
+                      [] (filter (fn [b] (= :cell (:kind b))) (org/blocks-in bs r-lo r-hi)))
         marks-by-row (group-by :row marks)
+        cur-row (first (:head (c/primary ed)))
         line-view (fn [r]
-                    (let [l (t/line tx r) b (org/block-at bs r) k (hl-kind b r)]
+                    (let [l (t/line tx r) b (org/block-at bs r) k (hl-kind b r)
+                          blk? (and (some? b) (contains? #{:cell :prose-code :result} (:kind b)))]
                       {:row r
                        :folded? (contains? folds r)
+                       ; the block band a line belongs to: lets the host draw a
+                       ; cell as ONE full-width card, with rounded first/last rows
+                       :band (if blk? (name (:kind b)) nil)
+                       :band-first? (and blk? (= r (:from b)))
+                       :band-last? (and blk? (= r (dec (:to b))))
+                       :current? (= r cur-row)
                        :segments (cond
                                    (= :heading (:kind b)) (heading-segments l b)
                                    (= k :code) (if (= :cell (:kind b)) (segments-with-marks l (get marks-by-row r []) :code) [{:text l :kind :code}])

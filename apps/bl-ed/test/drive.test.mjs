@@ -176,6 +176,18 @@ test("save is an effect, not a side effect", () => {
   assert.equal(get(ed2, "effects").cnt, 0);
 });
 
+test("an eval reload keeps the cursor and is one undo step", () => {
+  let ed = boot("#+begin_src beam-lisp :id a\n(+ 1 2)\n#+end_src");
+  ed = keys(ed, "j l l");
+  const before = heads(ed);
+  const withResults = "#+begin_src beam-lisp :id a\n(+ 1 2)\n#+end_src\n#+RESULTS: a\n: 3\n";
+  ed = M.d_handle(ed, R.hashMap(K("type"), K("load"), K("text"), withResults, K("path"), "t"));
+  assert.equal(text(ed), withResults);
+  assert.deepEqual(heads(ed), before, "the cursor stays where it was");
+  ed = key(ed, "u");
+  assert.equal(text(ed), "#+begin_src beam-lisp :id a\n(+ 1 2)\n#+end_src", "undo removes the results");
+});
+
 test("render model: segments, problems, status", () => {
   let ed = boot("#+begin_src beam-lisp\n(f [x)\n#+end_src");
   ed = key(ed, "j");
@@ -184,6 +196,32 @@ test("render model: segments, problems, status", () => {
   const kinds = get(line1, "segments").toArray().map(s => get(s, "kind").name);
   assert.ok(kinds.includes("error"), "a mismatched closer renders as an error: " + kinds);
   assert.equal(get(get(v, "status"), "problems"), 2);
+});
+
+test("incremental structure == full derive, over random typing in real documents", async () => {
+  const C = await import(pathToFileURL(path.join(out, "ed.core.mjs")).href);
+  const root = path.resolve(process.env.BLED_ROOT || ".");
+  const docs = ["docs/tools/02-lsp.bl.org", "docs/changelog/v2026.4.bl.org", "docs/split/01-how-one-file-becomes-two-programs.bl.org"]
+    .map(p => path.join(root, p)).filter(p => fs.existsSync(p));
+  let s = 12345; const rnd = () => ((s = (Math.imul(s, 1103515245) + 12345) >>> 0) / 4294967296);
+  const chars = ["a", " ", "(", ")", "\"", "*", "#", "\n", "x", ";", "[", "]"];
+  let checks = 0;
+  for (const f of docs) {
+    let ed = boot(fs.readFileSync(f, "utf8"));
+    const nLines = () => get(get(ed, "text"), "lines").cnt;
+    for (let step = 0; step < 150; step++) {
+      const r = Math.floor(rnd() * nLines());
+      ed = M.d_handle(ed, R.hashMap(K("type"), K("click"), K("pos"), R.vec(r, Math.floor(rnd() * 40))));
+      ed = key(ed, "i");
+      ed = M.d_handle(ed, R.hashMap(K("type"), K("text"), K("text"), chars[Math.floor(rnd() * chars.length)]));
+      ed = key(ed, "Escape");
+      const full = C.d_derive_structure(ed);
+      assert.ok(R.eqv(get(ed, "struct"), get(full, "struct")), `struct diverged at step ${step} in ${f}`);
+      assert.ok(R.eqv(get(ed, "forms"), get(full, "forms")), `forms diverged at step ${step} in ${f}`);
+      checks++;
+    }
+  }
+  assert.ok(checks >= 300, "ran " + checks);
 });
 
 test("round trip: every repo .bl.org is reproduced byte-for-byte", () => {

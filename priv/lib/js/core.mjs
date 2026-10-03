@@ -89,7 +89,7 @@ export function cons(h, t) { return R.cons(h, t instanceof Cons || t === EMPTY ?
     measured (count "é👍🏽") = 2). Intl.Segmenter where the host has it. */
 const SEG = typeof Intl !== "undefined" && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
 export function graphemes(s) { if (SEG) { const out = []; for (const g of SEG.segment(s)) out.push(g.segment); return out; } return [...s]; }
-function strCount(s) { if (/^[\x00-\x7f]*$/.test(s)) return s.length; return graphemes(s).length; }
+function strCount(s) { if (s.length < 64 ? /^[\x00-\x7f]*$/.test(s) : asciiLong(s)) return s.length; return graphemesCached(s).length; }
 export function count(x) {
   if (x === null || x === undefined || x === EMPTY) return 0;
   if (x instanceof Cons) return x.n;
@@ -394,6 +394,8 @@ function chain(op) { return (a, ...xs) => { let p = a; for (let i = 0; i < xs.le
 export const lt = chain(R.lt), gt = chain(R.gt), le = chain(R.le), ge = chain(R.ge), num_eq = chain(R.numEq);
 export function int(x) { if (x instanceof Flt) return Math.trunc(x.v); if (typeof x === "string" && x.length === 1) return x.codePointAt(0); return x; }
 export function double(x) { return R.flt(R.toNumber(x)); }
+/** NOT in BEAM core (2026-10-03): kept for JS-only code; portable code
+    parses with plain BL (see apps/bl-ed/ed/num.bl). */
 export function parse_long(s) { return /^[+-]?\d+$/.test(s) ? (Number.isSafeInteger(Number(s)) ? Number(s) : BigInt(s)) : null; }
 export function parse_double(s) { const v = Number(s); return s.trim() === "" || Number.isNaN(v) ? null : R.flt(v); }
 export function rand_int(n) { return Math.floor(Math.random() * n); }
@@ -408,17 +410,41 @@ export function name(x) { if (typeof x === "string") return x; if (x instanceof 
 export function namespace(x) { return x instanceof Kw ? x.ns : null; }
 export function keyword(a, b) { if (b !== undefined) return R.kw(a + "/" + b); if (a instanceof Kw) return a; return R.kw(a instanceof Sym ? a.name : a); }
 export function symbol(x) { return R.sym(x instanceof Kw ? x.fq : x); }
-/** `subs` by GRAPHEME index, as BEAM's String.slice (é and 👍🏽 are one each). */
+/** `subs` by GRAPHEME index, as BEAM's String.slice (é and 👍🏽 are one each).
+ *
+ *  Hot in UI code (a scanner calls `(subs l i (inc i))` per character), so:
+ *  ASCII strings slice directly; other strings cache their grapheme array
+ *  in a small LRU keyed by the string itself (strings are values: a cached
+ *  segmentation can never go stale), making repeated subs O(1) after the
+ *  first instead of O(n) each. */
+const ASCII = /^[\x00-\x7f]*$/;
+const GCACHE = new Map(); const GCACHE_MAX = 256;
+function graphemesCached(s) {
+  let g = GCACHE.get(s);
+  if (g !== undefined) { GCACHE.delete(s); GCACHE.set(s, g); return g; }
+  g = graphemes(s);
+  GCACHE.set(s, g);
+  if (GCACHE.size > GCACHE_MAX) GCACHE.delete(GCACHE.keys().next().value);
+  return g;
+}
 export function subs(s, start, end) {
-  if (/^[\x00-\x7f]*$/.test(s)) {
+  if (s.length < 64 ? ASCII.test(s) : asciiLong(s)) {
     const n = s.length; if (end === undefined) end = n;
     if (start < 0 || end > n || end < start) throw new BLError("subs: index out of range " + start + " " + end + " for length " + n);
     return s.slice(start, end);
   }
-  const g = graphemes(s), n = g.length;
+  const g = graphemesCached(s), n = g.length;
   if (end === undefined) end = n;
   if (start < 0 || end > n || end < start) throw new BLError("subs: index out of range " + start + " " + end + " for length " + n);
+  if (end === start + 1) return g[start];
   return g.slice(start, end).join("");
+}
+/** ASCII test for long strings, memoized per string (same value argument). */
+const ACACHE = new Map();
+function asciiLong(s) {
+  let v = ACACHE.get(s);
+  if (v === undefined) { v = ASCII.test(s); ACACHE.set(s, v); if (ACACHE.size > GCACHE_MAX) ACACHE.delete(ACACHE.keys().next().value); }
+  return v;
 }
 export function join(sep, coll) { if (coll === undefined) { coll = sep; sep = ""; } return toArray(coll).map(R.strOf).join(sep); }
 export function split(s, sep, limit) {
