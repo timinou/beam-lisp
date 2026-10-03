@@ -1,0 +1,176 @@
+; ed/lisp.bl — a small Beam Lisp evaluator, written in Beam Lisp, for the
+; editor's command line.
+;
+; The editor is a Lisp machine: `:` reads a form and evaluates it against the
+; LIVE editor. The JS sync profile compiles ahead of time and has no `eval`
+; (compiling BL in the browser is FUP-134), so this namespace interprets a
+; well-defined subset — enough to inspect and reprogram the editor:
+;
+;   literals    nil true false numbers "strings" :keywords [vectors] {maps} #{sets}
+;   special     quote if do let fn def when cond and or ->
+;   calls       any function in `builtins` (core fns + the `ed/` API), any fn
+;               value made by `fn`, keywords/maps as functions
+;
+; The `ed/` API is the editor's own surface, for the command line:
+;   (ed/state)                 the editor value
+;   (ed/text)                  the document as a string
+;   (ed/cmd :name)             run a command by name
+;   (ed/bind :normal "g d" :name)    rebind a key sequence
+;   (ed/defcmd :name "doc" (fn [ed] …))  define a command (persists in session)
+;   (ed/commands)              the command names
+;   (ed/insert "s")            insert at every cursor
+;   (ed/goto 12)               go to line 12 (1-based)
+;   (ed/find "needle")         select every occurrence
+;
+; Reading is total: a malformed form is a value `{:error …}`, never a crash.
+
+(ns ed.lisp
+  (:require [ed.text :as t]
+            [ed.num :as num]))
+
+; ─── reader ─────────────────────────────────────────────────────────────────
+
+(defn- ws? [ch] (contains? #{" " "\n" "\t" "\r" ","} ch))
+(defn- delim? [ch] (or (nil? ch) (ws? ch) (contains? #{"(" ")" "[" "]" "{" "}" "\"" ";"} ch)))
+
+(defn- skip-ws [s i]
+  (loop [i i]
+    (let [ch (if (< i (count s)) (subs s i (inc i)) nil)]
+      (cond (nil? ch) i
+            (ws? ch) (recur (inc i))
+            (= ch ";") (recur (or (some (fn [j] (if (= "\n" (subs s j (inc j))) j nil)) (range i (count s))) (count s)))
+            :else i))))
+
+(defn- parse-atom [tok]
+  (cond
+    (= tok "nil") nil
+    (= tok "true") true
+    (= tok "false") false
+    (starts-with? tok ":") (keyword (subs tok 1))
+    (some? (num/parse-int tok)) (num/parse-int tok)
+    (some? (num/parse-decimal tok)) (num/parse-decimal tok)
+    :else {:sym tok}))
+
+(declare read-at)
+
+(defn- read-seq [s i close]
+  (loop [i i items []]
+    (let [i (skip-ws s i)]
+      (cond
+        (>= i (count s)) {:error (str "unclosed, expected " close)}
+        (= close (subs s i (inc i))) {:val items :next (inc i)}
+        :else (let [r (read-at s i)]
+                (if (some? (:error r)) r (recur (:next r) (conj items (:val r)))))))))
+
+(defn read-at
+  "Read one form from string `s` at grapheme index `i`: {:val v :next j} | {:error msg}."
+  [s i]
+  (let [i (skip-ws s i)]
+    (if (>= i (count s))
+      {:error "nothing to read"}
+      (let [ch (subs s i (inc i))]
+        (cond
+          (= ch "(") (let [r (read-seq s (inc i) ")")] (if (:error r) r {:val {:list (:val r)} :next (:next r)}))
+          (= ch "[") (read-seq s (inc i) "]")
+          (= ch "{") (let [r (read-seq s (inc i) "}")]
+                       (cond (:error r) r
+                             (odd? (count (:val r))) {:error "a map needs an even number of forms"}
+                             :else {:val {:map (:val r)} :next (:next r)}))
+          (and (= ch "#") (< (inc i) (count s)) (= "{" (subs s (inc i) (+ i 2))))
+            (let [r (read-seq s (+ i 2) "}")] (if (:error r) r {:val {:set (:val r)} :next (:next r)}))
+          (= ch "'") (let [r (read-at s (inc i))] (if (:error r) r {:val {:list [{:sym "quote"} (:val r)]} :next (:next r)}))
+          (= ch "\"")
+            (loop [j (inc i) acc ""]
+              (cond
+                (>= j (count s)) {:error "unterminated string"}
+                (= "\"" (subs s j (inc j))) {:val acc :next (inc j)}
+                (= "\\" (subs s j (inc j)))
+                  (let [e (if (< (inc j) (count s)) (subs s (inc j) (+ j 2)) "")]
+                    (recur (+ j 2) (str acc (get {"n" "\n" "t" "\t" "\"" "\"" "\\" "\\"} e e))))
+                :else (recur (inc j) (str acc (subs s j (inc j))))))
+          (contains? #{")" "]" "}"} ch) {:error (str "unexpected " ch)}
+          :else
+            (let [j (or (some (fn [k] (if (delim? (subs s k (inc k))) k nil)) (range i (count s))) (count s))]
+              {:val (parse-atom (subs s i j)) :next j}))))))
+
+(defn read-string*
+  "Read the single form in `s`."
+  [s]
+  (let [r (read-at s 0)]
+    (cond
+      (:error r) r
+      (< (skip-ws s (:next r)) (count s)) {:error "more than one form; wrap them in (do …)"}
+      :else r)))
+
+; ─── evaluator ──────────────────────────────────────────────────────────────
+
+(defn- sym? [x] (and (map? x) (contains? x :sym)))
+(defn- lst? [x] (and (map? x) (contains? x :list)))
+
+(defn- fail [msg] (throw (ex-info msg {:ed-lisp true})))
+
+(declare evaluate)
+
+(defn- lookup [env name]
+  (cond
+    (contains? (:locals env) name) (get (:locals env) name)
+    (contains? @(:globals env) name) (get @(:globals env) name)
+    (contains? (:builtins env) name) (get (:builtins env) name)
+    :else (fail (str "Unable to resolve symbol: " name))))
+
+(defn- bind-params [env params args]
+  (let [ps (vec params)
+        amp (some (fn [i] (if (= "&" (:sym (nth ps i))) i nil)) (range (count ps)))
+        fixed (if (nil? amp) ps (subvec ps 0 amp))]
+    (when (and (nil? amp) (not= (count fixed) (count args)))
+      (fail (str "wrong number of args (" (count args) ") passed to fn of " (count fixed))))
+    (let [env (reduce (fn [e [p a]] (assoc-in e [:locals (:sym p)] a)) env (map (fn [p a] [p a]) fixed args))]
+      (if (nil? amp) env (assoc-in env [:locals (:sym (nth ps (inc amp)))] (seq (drop (count fixed) args)))))))
+
+(defn- make-fn [env params body]
+  (fn [& args]
+    (let [e (bind-params env params (vec args))]
+      (reduce (fn [_ f] (evaluate e f)) nil body))))
+
+(defn- call [f args]
+  (cond
+    (fn? f) (apply f args)
+    (keyword? f) (get (first args) f (second args))
+    (map? f) (get f (first args) (second args))
+    (set? f) (if (contains? f (first args)) (first args) nil)
+    :else (fail (str (pr-str f) " is not a function"))))
+
+(defn evaluate
+  "Evaluate form `f` (from `read-string*`) in `env`
+   {:locals {} :globals (atom {}) :builtins {}}."
+  [env f]
+  (cond
+    (sym? f) (lookup env (:sym f))
+    (vector? f) (mapv (fn [x] (evaluate env x)) f)
+    (and (map? f) (contains? f :map)) (apply hash-map (map (fn [x] (evaluate env x)) (:map f)))
+    (and (map? f) (contains? f :set)) (set (map (fn [x] (evaluate env x)) (:set f)))
+    (lst? f)
+      (let [[head & args] (:list f)
+            op (if (sym? head) (:sym head) nil)]
+        (cond
+          (nil? head) ()
+          (= op "quote") (first args)
+          (= op "if") (if (evaluate env (first args)) (evaluate env (second args)) (if (> (count args) 2) (evaluate env (nth args 2)) nil))
+          (= op "when") (if (evaluate env (first args)) (reduce (fn [_ x] (evaluate env x)) nil (rest args)) nil)
+          (= op "do") (reduce (fn [_ x] (evaluate env x)) nil args)
+          (= op "and") (reduce (fn [acc x] (if acc (evaluate env x) (reduced acc))) true args)
+          (= op "or") (reduce (fn [acc x] (if acc (reduced acc) (evaluate env x))) nil args)
+          (= op "cond") (loop [cs args]
+                          (cond (empty? cs) nil
+                                (evaluate env (first cs)) (evaluate env (second cs))
+                                :else (recur (drop 2 cs))))
+          (= op "let") (let [bs (first args)
+                             env2 (reduce (fn [e [s v]] (assoc-in e [:locals (:sym s)] (evaluate e v)))
+                                          env (partition 2 bs))]
+                         (reduce (fn [_ x] (evaluate env2 x)) nil (rest args)))
+          (= op "fn") (make-fn env (first args) (rest args))
+          (= op "def") (let [v (evaluate env (second args))] (swap! (:globals env) assoc (:sym (first args)) v) v)
+          (= op "->") (evaluate env (reduce (fn [acc step] (if (lst? step) {:list (into [(first (:list step)) acc] (rest (:list step)))} {:list [step acc]}))
+                                            (first args) (rest args)))
+          :else (call (evaluate env head) (mapv (fn [x] (evaluate env x)) args))))
+    :else f))

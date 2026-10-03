@@ -1,0 +1,122 @@
+; split/log.bl — a split app's durable history, as datom facts on fjall.
+;
+; An app that declares `:server {:history n}` keeps every commit. One commit is
+; one entity:
+;
+;   :split.commit/app       the app's name
+;   :split.commit/revision  the revision it produced (1, 2, 3, …)
+;   :split.commit/actor     the signed-in person's id (absent: nobody)
+;   :split.commit/op        the intent (a keyword)
+;   :split.commit/args      its decoded arguments (BL data, stored as itself)
+;   :split.commit/nonce     the proposal's nonce
+;
+; The log holds INTENTS, not states: the state is what replaying them through
+; the same authority produces. So a restart decides every commit again — with
+; the same rules, the same permissions — and a line the authority refuses
+; stops the start (split.core/start), rather than serving a history nobody
+; can explain.
+;
+; `append!` returns only once the transaction is fsync'd; the authority calls
+; it BEFORE it acknowledges the commit, so an answer the browser sees is
+; never ahead of the log.
+
+(ns split.log
+  (:require [datom] [datom.store-fjall]))
+
+(def schema
+  [{:db/ident :split.commit/app :db/valueType :db.type/string :db/index true}
+   {:db/ident :split.commit/revision :db/valueType :db.type/long}
+   {:db/ident :split.commit/actor :db/valueType :db.type/string}
+   {:db/ident :split.commit/op :db/valueType :db.type/keyword}
+   ; no value type: any BL term, stored as itself
+   {:db/ident :split.commit/args}
+   {:db/ident :split.commit/nonce :db/valueType :db.type/string}])
+
+; ── one owner per keyspace ─────────────────────────────────────────────────────
+;
+; fjall does not lock its directory: two servers opening the same keyspace
+; would each replay it, then commit DIFFERENT next revisions into it. So a log
+; is owned: `<path>.owner`, created exclusively, holds the owning OS process
+; id. A second open while that process lives refuses; an owner file left by a
+; process that is gone (a crash, a kill -9) is taken over. The same VM asking
+; twice (one stem mounted twice) is refused too.
+
+(defn- os-pid [] (erlang/list_to_binary (os/getpid)))
+
+(defn- alive? [pid] (and (string? pid) (not (= "" pid)) (File/exists? (str "/proc/" pid))))
+
+(defn- claim!
+  "Own `path`'s keyspace for this OS process, or raise naming the owner."
+  [path]
+  (let [owner-file (str path ".owner")
+        take (fn [] (let [r (file/open owner-file (list :write :exclusive))]
+                      (if (= :ok (erlang/element 1 r))
+                        (do (file/write (erlang/element 2 r) (os-pid)) (file/close (erlang/element 2 r)) :ok)
+                        :taken)))]
+    (when (= :taken (take))
+      (let [holder (String/trim (try (File/read! owner-file) (catch _ "")))]
+        (if (alive? holder)
+          (throw (ex-info (str "split: " path " is already served by OS process " holder
+                               " — one server per log") {:path path :owner holder}))
+          (do (File/rm owner-file)
+              (when (= :taken (take))
+                (throw (ex-info (str "split: " path " was claimed by another server while starting") {:path path})))))))
+    owner-file))
+
+(defn open
+  "Open (or create) the log for app `app-name` in the fjall keyspace `path`,
+   owning it for this OS process (see `claim!`)."
+  [path app-name]
+  (claim! path)
+  (let [store (datom.store-fjall/open path)]
+    {:conn (datom/connect-with store schema) :store store :app app-name :path path}))
+
+(defn- refuse-if-asked!
+  "Fault injection for the durable-ack proof (verify-durable-ack.mjs): while
+   the file named by SPLIT_LOG_REFUSE exists, every append raises exactly as a
+   full or failed disk would. Unset (always, outside that proof), it is a no-op."
+  []
+  (let [flag (System/get_env "SPLIT_LOG_REFUSE")]
+    (when (and (some? flag) (File/exists? flag))
+      (throw (ex-info "split: the log refused the commit (SPLIT_LOG_REFUSE)" {:flag flag})))))
+
+(defn append!
+  "Record one commit (split.core's commit record). Raises when the store
+   refuses — which stops the authority before anything is acknowledged."
+  [log commit]
+  (refuse-if-asked!)
+  (let [e (:entry commit)]
+    (datom/transact! (:conn log)
+                     [(merge {:db/id -1 :split.commit/app (:app log)
+                              :split.commit/revision (:revision e)
+                              :split.commit/op (:op e)
+                              :split.commit/args (:args commit)
+                              :split.commit/nonce (:nonce commit)}
+                             (if (nil? (:actor commit)) {} {:split.commit/actor (:actor commit)}))])
+    ; fjall journals every write but fsyncs only when asked: ask, so the
+    ; commit is on disk before the authority acknowledges it
+    (datom.store-fjall/sync! (:store log))
+    :ok))
+
+(defn commits
+  "Every recorded commit of this app, in revision order:
+   [{:revision :actor :op :args :nonce} …]."
+  [log]
+  (->> (datom/q '[:find ?e ?r ?op ?a ?n :in $ ?app
+                  :where [?e :split.commit/app ?app] [?e :split.commit/revision ?r]
+                         [?e :split.commit/op ?op] [?e :split.commit/args ?a] [?e :split.commit/nonce ?n]]
+                (datom/db (:conn log)) (:app log))
+       (map (fn [[e r op a n]]
+              {:revision r :op op :args a :nonce n
+               :actor (get (datom/entity (datom/db (:conn log)) e) :split.commit/actor)}))
+       (sort-by :revision)
+       vec))
+
+(defn proposals
+  "The log as proposals the authority decides again at boot (split.core/start
+   `:replay`), each against the revision before it."
+  [log digest]
+  (vec (map-indexed (fn [i c]
+                      {:request (inc i) :revision (dec (:revision c)) :digest digest
+                       :nonce (:nonce c) :actor (:actor c) :op (:op c) :args (:args c)})
+                    (commits log))))

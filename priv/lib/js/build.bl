@@ -1,0 +1,301 @@
+; priv/lib/js/build.bl — namespaces → ES modules, linked at build time.
+;
+; `(build {:roots ["apps/bl-ed"] :entry "ed.main" :out "out/bl-ed"})` reads the
+; entry namespace, follows its `(:require …)` graph through the roots, compiles
+; every namespace with the BEAM compiler to bl-ANF, emits each as one ES module
+; (js.emit), and writes them plus the runtime (rt.mjs, core.mjs) to `:out`.
+;
+; LINKING. Every `:global {ns name}` is resolved HERE, not at run time:
+;   1. a top-level def of THAT namespace           → its local JS binding
+;   2. a def of a namespace it requires (by alias)  → an import
+;   3. a core name (core.mjs `CORE` registry)       → C.<impl>
+;   4. otherwise                                    → a BUILD ERROR naming the
+;                                                     namespace, name and line
+; Rule 3 mirrors Env.fetch!'s ns→core fallback (FUP-141 records that the IR
+; does not state it; this is where the JS target states it).
+;
+; HOST FFI. `(js/name args…)` — a :remote with module `js` — calls the host
+; function `name` that the page registers (`H.<name>`). The set of host
+; functions is declared by the app (`:host` in its build config), so an
+; unknown one is a build error too. That keeps the closed-world audit the
+; actor target has, without its allowlist file.
+
+(ns js.build
+  (:require [js.emit :as e]
+            [reader-node :as rn]
+            [system.ir :as ir]))
+
+; ─── reading a namespace ────────────────────────────────────────────────────
+
+(defn- rn-tag [n] (rn/node-tag (rn/node-form n)))
+(defn- rn-items [n] (rn/node-items n))
+(defn- rn-name [n] (rn/node-name (rn/node-form n)))
+(defn- unwrap [n] (rn/node-form n))
+(defn- sym? [n s] (and (= :symbol (rn-tag n)) (or (nil? s) (= s (rn-name n)))))
+(defn- kw-node? [n s] (and (= :keyword (rn-tag n)) (= s (rn-name n))))
+
+(defn ns-path
+  "The file for namespace `ns` under one of `roots`: `ed.text` → `<root>/ed/text.bl`."
+  [roots ns]
+  (let [rel (str (replace-str (replace-str ns "." "/") "-" "_") ".bl")]
+    (first (filter (fn [p] (File/exists? p)) (map (fn [r] (str r "/" rel)) roots)))))
+
+(defn read-forms [path]
+  (BeamLisp.Ns.Reader/read (File/read! path) {:file path}))
+
+(defn- ns-head
+  "{:ns name :requires [[ns alias]…]} from a file's `(ns …)` form."
+  [forms]
+  (let [h (first forms)]
+    (if (and (= :list (rn-tag h)) (sym? (first (rn-items h)) "ns"))
+      (let [items (rn-items h)
+            name (rn-name (second items))
+            clauses (filter (fn [c] (= :list (rn-tag c))) (rest (rest items)))
+            reqs (mapcat (fn [c]
+                           (let [its (rn-items c)]
+                             (if (kw-node? (first its) "require")
+                               (map (fn [spec]
+                                      (let [s (rn-items spec)
+                                            target (rn-name (first s))
+                                            as-i (index-where s (fn [x] (kw-node? x "as")))]
+                                        [target (if (nil? as-i) target (rn-name (nth s (inc as-i))))]))
+                                    (filter (fn [s] (= :vector (rn-tag s))) (rest its)))
+                               [])))
+                         clauses)]
+        {:ns name :requires (vec reqs)})
+      (throw (ex-info "js.build: a namespace file must start with (ns …)" {:form h})))))
+
+(defn- index-where [xs pred]
+  (loop [i 0 s (seq xs)] (cond (empty? s) nil (pred (first s)) i :else (recur (inc i) (rest s)))))
+
+; ─── top-level forms → definitions ──────────────────────────────────────────
+
+(defn- defn-like? [f] (and (= :list (rn-tag f)) (let [h (first (rn-items f))] (or (sym? h "defn") (sym? h "defn-")))))
+(defn- def-like? [f] (and (= :list (rn-tag f)) (sym? (first (rn-items f)) "def")))
+(defn- defmacro? [f] (and (= :list (rn-tag f)) (sym? (first (rn-items f)) "defmacro")))
+(defn- comment-form? [f] (and (= :list (rn-tag f)) (sym? (first (rn-items f)) "comment")))
+(defn- declare-form? [f] (and (= :list (rn-tag f)) (sym? (first (rn-items f)) "declare")))
+
+(defn- strip-doc+attrs
+  "The clause part of `(defn name doc? attrs? clauses…)`."
+  [items]
+  (let [b0 (rest (rest items))
+        b1 (if (and (> (count b0) 1) (erlang/is_binary (unwrap (first b0)))) (rest b0) b0)
+        b2 (if (and (> (count b1) 1) (= :map (rn-tag (first b1)))) (rest b1) b1)]
+    b2))
+
+(defn- wrap-pos [form like]
+  (let [m (rn/node-pos like)]
+    (if (nil? m) form (rn/meta-node form m))))
+
+(defn- top-defs
+  "Definitions a file contributes, in order: {:name :private? :form :kind}.
+   `defn` → `(fn name clauses…)`; `def` → its init form. Macros run in the
+   BEAM compiler only (they shaped this ANF already), so they emit nothing."
+  [forms]
+  (vec
+    (keep (fn [f]
+            (cond
+              (defn-like? f)
+                (let [its (rn-items f)
+                      nm (rn-name (second its))]
+                  {:name nm :kind :fn :private? (sym? (first its) "defn-")
+                   :form (wrap-pos (rn/list-node (cons (rn/sym-node "fn") (cons (second its) (strip-doc+attrs its)))) f)})
+              (def-like? f)
+                (let [its (rn-items f)
+                      nm (rn-name (second its))
+                      body (rest (rest its))
+                      init (if (and (> (count body) 1) (erlang/is_binary (unwrap (first body)))) (second body) (first body))]
+                  {:name nm :kind :val :private? false :form init})
+              (or (defmacro? f) (comment-form? f) (declare-form? f)) nil
+              (and (= :list (rn-tag f)) (sym? (first (rn-items f)) "ns")) nil
+              :else {:name nil :kind :expr :form f}))
+          forms)))
+
+; ─── one namespace ──────────────────────────────────────────────────────────
+
+(defn- first-form-text
+  "The exact source text of the file's first form (its `(ns …)`), sliced by
+   the reader's own span."
+  [path]
+  (let [src (File/read! path)
+        pos (rn/node-pos (first (read-forms path)))]
+    ; reader offsets count CODEPOINTS (not bytes): slice the codepoint list
+    (if (and (some? pos) (some? (get pos :offset)) (some? (get pos :end-offset)))
+      (unicode/characters_to_binary
+        (lists/sublist (unicode/characters_to_list src) (inc (get pos :offset))
+                       (- (get pos :end-offset) (get pos :offset))))
+      (throw (ex-info (str "js.build: " path ": the ns form carries no source span") {:pos pos})))))
+
+(defn compile-ns
+  "Compile namespace file `path` to {:ns :requires :defs [{:name :kind :node}]}.
+   The BEAM compiler is given the real namespace, so macros, aliases and
+   refers resolve exactly as they would on BEAM. Each def is interned as a
+   placeholder FIRST so later forms' references to earlier (and forward)
+   names resolve to `:global` of this namespace."
+  [path]
+  (let [forms (read-forms path)
+        head (ns-head forms)
+        ns (:ns head)
+        ; evaluate the ns form on BEAM so aliases/requires exist for the compiler
+        _ (BeamLisp.Compiler/eval_string (first-form-text path) (BeamLisp.Compiler/new_env "user") path)
+        defs (top-defs (rest forms))
+        _ (doseq [d defs] (when (some? (:name d)) (BeamLisp.Env/intern ns (:name d) nil)))
+        env (BeamLisp.Ns.Compiler/new_env ns)]
+    {:ns ns :path path :requires (:requires head)
+     :defs (vec (map (fn [d]
+                       (assoc d :node
+                         (try (BeamLisp.Ns.Compiler/compile (:form d) env)
+                              (catch ex
+                                (throw (ex-info (str path ": " (or (:name d) "top-level form") ": " (ex-message ex))
+                                                {:path path :name (:name d)}))))))
+                     defs))}))
+
+; ─── linking ────────────────────────────────────────────────────────────────
+
+(def ^:private rt-mod :Elixir.BeamLisp.Ns.Rt)
+(def ^:private core-mod :Elixir.BeamLisp.Ns.Core)
+(def ^:private set-mod :Elixir.BeamLisp.Set)
+(def ^:private refs-mod :Elixir.BeamLisp.Refs)
+(def ^:private exinfo-mod :Elixir.BeamLisp.ExInfo)
+
+(def ^:private rt-specific
+  "Runtime functions the compiler calls DIRECTLY in an argument order of their
+   own (priv/boot/rt.bl documents each). They resolve to `rt:<fun>` entries in
+   core.mjs, never to the BL core name that happens to share the word."
+  #{"drop" "drop_clj" "apply_variadic" "apply_to" "map_multi"})
+
+(defn rt-aliases
+  "{[mod fun] → BL core name} for every runtime function the BEAM core table
+   seeds under a different name (`:print_readably` is `pr-str`, `:not_` is
+   `not`, `:drop_clj` is `drop`, …). Read from the LIVE link table, so the
+   JS target never keeps its own copy of BEAM's naming: `(BeamLisp.Env/link
+   \"core\" name)` is the one place a BL name meets its BEAM function."
+  [names]
+  (reduce (fn [m nm]
+            (let [l (try (BeamLisp.Env/link "core" nm) (catch e :error))]
+              (if (and (erlang/is_tuple l) (= :ok (erlang/element 1 l)))
+                (let [info (erlang/element 2 l)
+                      mod (erlang/element 1 info)
+                      fixed (erlang/element 2 info)
+                      var (erlang/element 3 info)
+                      fs (concat (map second fixed) (if (nil? var) [] [(erlang/element 2 var)]))]
+                  (reduce (fn [m2 f] (if (contains? m2 [mod f]) m2 (assoc m2 [mod f] nm))) m fs))
+                m)))
+          {} names))
+
+(defn- core-name
+  "The CORE registry key a compiler-emitted runtime op maps to, or nil.
+   `aliases` is `rt-aliases` (BEAM function → BL name)."
+  [m f arity aliases]
+  (let [fname (name f)
+        fname (if (ends-with? fname "__bl_v") (subs fname 0 (- (count fname) 6)) fname)]
+    (cond
+      ; a runtime function whose CALL convention differs from the BL name
+      ; it shares a word with (Rt/drop is (coll, n); core drop is (n, coll))
+      (and (= m rt-mod) (contains? rt-specific fname)) (str "rt:" fname)
+      (contains? aliases [m f]) (get aliases [m f])
+      (or (= m rt-mod) (= m core-mod)) fname
+      (and (= m set-mod) (= f :new)) "set"
+      (and (= m :Elixir.Exception) (= f :normalize)) "Exception/normalize"
+      (and (= m :erlang) (= f :raise)) "erlang/raise"
+      (= m refs-mod) (get {"swap!" "swap!" "reset!" "reset!" "deref" "deref" "atom" "atom"} fname)
+      ; `(throw x)` lowers to ExInfo.raise_payload(x)
+      (= m exinfo-mod) (get {"ex_info" "ex-info" "ex_message" "ex-message" "ex_data" "ex-data"
+                             "raise_payload" "throw"} fname)
+      (= m :erlang) (get {"+" "+" "-" "-" "*" "*" "==" "==" "=:=" "=" "<" "<" ">" ">" "=<" "<=" ">=" ">="
+                          "not" "not" "rem" "rem" "div" "quot" "abs" "abs" "is_integer" "int?" "is_binary" "string?"
+                          "is_map" "map?" "is_function" "fn?" "error" "throw"} fname)
+      :else nil)))
+
+(defn link-ctx
+  "The emitter context for namespace `cns`: resolvers for globals and remotes.
+   `table` maps ns → set of def names; `core` is the set of CORE keys;
+   `host` the set of declared host fns. `missing` collects unresolved names."
+  [cns table core host missing rt-alias]
+  (let [aliases (into {} (map (fn [[t a]] [a t]) (:requires cns)))
+        own (get table (:ns cns))
+        resolve (fn [ns nm arity]
+                  (let [ns* (get aliases ns ns)]
+                    (cond
+                      (and (= ns* (:ns cns)) (contains? own nm)) (str "d_" (e/mangle nm))
+                      (contains? (get table ns* #{}) nm) (str "N_" (e/mangle ns*) ".d_" (e/mangle nm))
+                      (contains? core nm) (str "C.CORE[" (e/js-str nm) "]")
+                      :else (do (swap! missing conj [(:ns cns) ns nm]) (str "MISSING(" (e/js-str (str ns "/" nm)) ")")))))
+        remote (fn [m f arity]
+                 (cond
+                   (= m :js) (let [nm (name f)]
+                               (if (contains? host nm) (str "H[" (e/js-str nm) "]")
+                                 (do (swap! missing conj [(:ns cns) "js" nm]) (str "MISSING(" (e/js-str (str "js/" nm)) ")"))))
+                   :else (let [k (core-name m f arity rt-alias)]
+                           (if (and (some? k) (contains? core k)) (str "C.CORE[" (e/js-str k) "]") nil))))]
+    {:ns (:ns cns) :resolve resolve :remote remote :dest nil}))
+
+(defn emit-ns
+  "One compiled namespace → ES module text."
+  [cns table core host missing rt-alias]
+  (e/reset-state!)
+  (let [ctx (link-ctx cns table core host missing rt-alias)
+        imports (map (fn [[t _]] (str "import * as N_" (e/mangle t) " from \"./" t ".mjs\";"))
+                     (filter (fn [[t _]] (contains? table t)) (:requires cns)))
+        body (mapcat (fn [d]
+                       (let [r (e/emit (:node d) ctx)]
+                         (cond
+                           (= :fn (:kind d))
+                             (concat (:lines r) (list (str "export const d_" (e/mangle (:name d)) " = " (:val r) ";")))
+                           (= :val (:kind d))
+                             (concat (:lines r) (list (str "export const d_" (e/mangle (:name d)) " = " (:val r) ";")))
+                           :else (concat (:lines r) (if (nil? (:val r)) (list) (list (str (:val r) ";")))))))
+                     (:defs cns))
+        ; `function` declarations hoist; consts do not. A def that refers to a
+        ; LATER def must not run before it: emit fn defs as hoisted functions.
+        kws (e/kw-decls)]
+    (str "// GENERATED by priv/lib/js/build.bl from " (:path cns) " — do not edit.\n"
+         "import * as R from \"./rt.mjs\";\n"
+         "import * as C from \"./core.mjs\";\n"
+         "import { H } from \"./host.mjs\";\n"
+         (join "\n" imports) "\n"
+         "const MISSING = (n) => { throw new R.BLError(\"unresolved \" + n); };\n"
+         (join "\n" kws) "\n\n"
+         (join "\n" body) "\n")))
+
+; ─── the build ──────────────────────────────────────────────────────────────
+
+(defn- load-order
+  "Namespaces reachable from `entry` (within `roots`), dependencies first."
+  [roots entry]
+  (loop [todo [entry] seen #{} order [] compiled {}]
+    (if (empty? todo)
+      {:order order :compiled compiled}
+      (let [ns (first todo)]
+        (if (contains? seen ns)
+          (recur (rest todo) seen order compiled)
+          (let [path (ns-path roots ns)]
+            (if (nil? path)
+              (recur (rest todo) (conj seen ns) order compiled)   ; not ours: core or BEAM-only
+              (let [head (ns-head (read-forms path))
+                    deps (vec (filter (fn [d] (and (not (contains? seen d)) (some? (ns-path roots d))))
+                                      (map first (:requires head))))]
+                (if (empty? (filter (fn [d] (not (contains? (set order) d))) deps))
+                  (let [c (compile-ns path)]
+                    (recur (rest todo) (conj seen ns) (conj order ns) (assoc compiled ns c)))
+                  (recur (concat deps todo) seen order compiled))))))))))
+
+(defn build
+  "Build `entry` and every namespace it requires under `roots` into `out`.
+   opts: {:roots [dirs] :entry ns :out dir :core #{names} :host #{names}}.
+   Returns {:modules [ns…] :bytes n}; throws listing EVERY unresolved name."
+  [opts]
+  (let [{:keys [roots entry out core host]} opts
+        {:keys [order compiled]} (load-order roots entry)
+        table (into {} (map (fn [ns] [ns (set (keep :name (:defs (get compiled ns))))]) order))
+        missing (atom [])
+        rt-alias (rt-aliases (vec core))
+        texts (into {} (map (fn [ns] [ns (emit-ns (get compiled ns) table core host missing rt-alias)]) order))]
+    (when (seq @missing)
+      (throw (ex-info (str "js.build: " (count @missing) " unresolved name(s):\n"
+                           (join "\n" (map (fn [[in ns nm]] (str "  in " in ": " ns "/" nm)) (distinct @missing))))
+                      {:missing @missing})))
+    (File/mkdir_p! out)
+    (doseq [ns order] (File/write! (str out "/" ns ".mjs") (get texts ns)))
+    {:modules order :bytes (reduce + 0 (map count (vals texts)))}))
