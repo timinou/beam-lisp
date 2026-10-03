@@ -327,6 +327,17 @@ export function partial(f, ...pre) { return (...args) => invoke(f, ...pre, ...ar
 export function complement(f) { return (...args) => !R.truthy(invoke(f, ...args)); }
 export function juxt(...fs) { return (...args) => R.vecFromArray(fs.map(f => invoke(f, ...args))); }
 export function fnil(f, ...ds) { return (...args) => invoke(f, ...args.map((a, i) => (a === null || a === undefined) && i < ds.length ? ds[i] : a)); }
+/** RT.invocable?(v, n): can value `v` be called with `n` arguments? The
+    compiler asks this when a LOCAL in call position shadows a linked core
+    name (`(name x)` with a parameter called `name`). A JS function's arity is
+    not reliable (variadics report 0), so any function answers true; data
+    callables follow Clojure: keywords, maps, sets take 1-2, vectors 1. */
+export function invocable_Q(v, n) {
+  if (typeof v === "function") return true;
+  if (v instanceof Kw || v instanceof Sym || v instanceof HMap || v instanceof HSet) return n === 1 || n === 2;
+  if (v instanceof Vec) return n === 1;
+  return false;
+}
 export function apply(f, ...args) { const lastArg = args.pop(); return invoke(f, ...args, ...toArray(lastArg)); }
 export function memoize(f) { let cache = EMPTY_MAP; return (...args) => { const k = R.vecFromArray(args); const v = cache.get(k, NF); if (v !== NF) return v; const r = invoke(f, ...args); cache = cache.assoc(k, r); return r; }; }
 
@@ -522,7 +533,7 @@ export const CORE = {
   "interleave": interleave, "distinct": distinct, "dedupe": dedupe, "flatten": flatten, "frequencies": frequencies,
   "group-by": group_by, "index-by": index_by, "sort": sort, "sort-by": sort_by, "max-key": max_key, "min-key": min_key,
   "identity": identity, "constantly": constantly, "comp": comp, "partial": partial, "complement": complement,
-  "juxt": juxt, "fnil": fnil, "apply": apply, "apply_to": (f, args) => invoke(f, ...toArray(args)), "memoize": memoize,
+  "juxt": juxt, "fnil": fnil, "apply": apply, "invocable?": invocable_Q, "apply_to": (f, args) => invoke(f, ...toArray(args)), "memoize": memoize,
   "nil?": nil_Q, "some?": some_Q, "true?": true_Q, "false?": false_Q, "boolean?": boolean_Q, "string?": string_Q,
   "keyword?": keyword_Q, "symbol?": symbol_Q, "number?": number_Q, "int?": int_Q, "integer?": integer_Q, "float?": float_Q,
   "fn?": fn_Q, "ifn?": ifn_Q, "map?": map_Q, "vector?": vector_Q, "set?": set_Q, "list?": list_Q, "seq?": seq_Q,
