@@ -1,0 +1,624 @@
+// priv/lib/js/rt.mjs — the value layer of the SYNC JS profile of Beam Lisp.
+//
+// The sync profile (priv/lib/js/emit.bl) compiles a BL function to a plain JS
+// function and a call to a plain JS call. Its values live here:
+//
+//   nil            null
+//   true/false     JS booleans
+//   integer        JS Number in the safe range, BigInt beyond (one canonical
+//                  form: a result that fits is normalized back to a Number)
+//   float          Flt — a boxed double, so 1 and 1.0 stay distinct values
+//                  (PLAN-157 D3: exact numerics, Elm-lean, NOT Elm-inexact)
+//   string         JS string (UTF-16); text functions count CODEPOINTS
+//   keyword        Kw, interned (identity = equality)
+//   symbol         Sym, interned
+//   list           Cons cells ending in EMPTY; `()` is EMPTY, distinct from nil
+//   vector         Vec — persistent 32-way trie + tail (structural sharing)
+//   map            HMap — persistent hash array mapped trie
+//   set            HSet — an HMap of element → true
+//   tuple          Tup (Erlang tuple; the compiler emits a few)
+//   fn             a JS function; multi-arity/variadic via a dispatch wrapper
+//
+// Equality and hashing follow BL: lists and vectors are ONE sequential family
+// under `=`, but map KEYS keep them apart (as BEAM's hash_key does). Every
+// collection operation is O(log32 n) and shares structure, so an editor whose
+// document is a vector of lines pays per edit for the lines it touches.
+
+// ─── scalars ────────────────────────────────────────────────────────────────
+
+export class Kw {
+  constructor(ns, name) { this.ns = ns; this.name = name; this.fq = ns ? ns + "/" + name : name; this.h = 0; }
+  toString() { return ":" + this.fq; }
+}
+const KWS = new Map();
+export function kw(fq) {
+  let k = KWS.get(fq);
+  if (k === undefined) {
+    const i = fq.indexOf("/");
+    k = (i > 0 && fq.length > 1) ? new Kw(fq.slice(0, i), fq.slice(i + 1)) : new Kw(null, fq);
+    k.h = (strHash(fq) ^ 0x5bd1e995) | 0;
+    KWS.set(fq, k);
+  }
+  return k;
+}
+
+export class Sym {
+  constructor(name) { this.name = name; this.h = (strHash(name) ^ 0x1b873593) | 0; }
+  toString() { return this.name; }
+}
+const SYMS = new Map();
+export function sym(name) {
+  let s = SYMS.get(name);
+  if (s === undefined) { s = new Sym(name); SYMS.set(name, s); }
+  return s;
+}
+
+export class Flt {
+  constructor(v) { this.v = v; }
+}
+export function flt(v) { return new Flt(+v); }
+
+export class Tup {
+  constructor(items) { this.items = items; }
+}
+export function tup(items) { return new Tup(items); }
+
+// ─── lists ──────────────────────────────────────────────────────────────────
+
+export class Cons {
+  constructor(h, t) { this.h = h; this.t = t; this.n = t instanceof Cons ? t.n + 1 : 1; }
+}
+export const EMPTY = Object.freeze(Object.create(null, { __empty: { value: true } }));
+export function cons(h, t) { return new Cons(h, t === null ? EMPTY : t); }
+export function list(...xs) { return listFromArray(xs); }
+export function listFromArray(a, from = 0) {
+  let l = EMPTY;
+  for (let i = a.length - 1; i >= from; i--) l = new Cons(a[i], l);
+  return l;
+}
+
+// ─── persistent vector (32-way trie + tail) ─────────────────────────────────
+
+const BITS = 5, WIDTH = 32, MASK = 31;
+const EMPTY_NODE = Object.freeze([]);
+
+export class Vec {
+  constructor(cnt, shift, root, tail, meta) {
+    this.cnt = cnt; this.shift = shift; this.root = root; this.tail = tail; this.meta = meta || null; this._h = undefined;
+  }
+  tailOff() { return this.cnt < WIDTH ? 0 : ((this.cnt - 1) >>> BITS) << BITS; }
+  arrayFor(i) {
+    if (i >= this.tailOff()) return this.tail;
+    let node = this.root;
+    for (let lvl = this.shift; lvl > 0; lvl -= BITS) node = node[(i >>> lvl) & MASK];
+    return node;
+  }
+  nth(i, dflt) {
+    if (i >= 0 && i < this.cnt && Number.isInteger(i)) return this.arrayFor(i)[i & MASK];
+    return dflt;
+  }
+  conj(x) {
+    if (this.cnt - this.tailOff() < WIDTH) {
+      const t = this.tail.slice(); t.push(x);
+      return new Vec(this.cnt + 1, this.shift, this.root, t, this.meta);
+    }
+    let newRoot, newShift = this.shift;
+    const tailNode = this.tail;
+    if ((this.cnt >>> BITS) > (1 << this.shift)) {
+      newRoot = [this.root, newPath(this.shift, tailNode)];
+      newShift += BITS;
+    } else {
+      newRoot = pushTail(this.cnt, this.shift, this.root, tailNode);
+    }
+    return new Vec(this.cnt + 1, newShift, newRoot, [x], this.meta);
+  }
+  assocN(i, x) {
+    if (i >= 0 && i < this.cnt) {
+      if (i >= this.tailOff()) {
+        const t = this.tail.slice(); t[i & MASK] = x;
+        return new Vec(this.cnt, this.shift, this.root, t, this.meta);
+      }
+      return new Vec(this.cnt, this.shift, doAssoc(this.shift, this.root, i, x), this.tail, this.meta);
+    }
+    if (i === this.cnt) return this.conj(x);
+    throw new BLError("index " + i + " out of bounds for a vector of " + this.cnt);
+  }
+  pop() {
+    if (this.cnt === 0) throw new BLError("can't pop an empty vector");
+    if (this.cnt === 1) return EMPTY_VEC;
+    if (this.cnt - this.tailOff() > 1) return new Vec(this.cnt - 1, this.shift, this.root, this.tail.slice(0, -1), this.meta);
+    const newTail = this.arrayFor(this.cnt - 2);
+    let newRoot = popTail(this.cnt, this.shift, this.root);
+    let newShift = this.shift;
+    if (newRoot === null) newRoot = EMPTY_NODE;
+    if (this.shift > BITS && newRoot[1] === undefined) { newRoot = newRoot[0]; newShift -= BITS; }
+    return new Vec(this.cnt - 1, newShift, newRoot, newTail, this.meta);
+  }
+  *[Symbol.iterator]() {
+    for (let i = 0; i < this.cnt; i += WIDTH) {
+      const a = this.arrayFor(i);
+      const n = Math.min(WIDTH, this.cnt - i);
+      for (let j = 0; j < n; j++) yield a[j];
+    }
+  }
+  toArray() { const out = new Array(this.cnt); let k = 0; for (const x of this) out[k++] = x; return out; }
+}
+function newPath(level, node) { return level === 0 ? node : [newPath(level - BITS, node)]; }
+function pushTail(cnt, level, parent, tailNode) {
+  const sub = ((cnt - 1) >>> level) & MASK;
+  const ret = parent.slice();
+  let ins;
+  if (level === BITS) ins = tailNode;
+  else {
+    const child = parent[sub];
+    ins = child !== undefined ? pushTail(cnt, level - BITS, child, tailNode) : newPath(level - BITS, tailNode);
+  }
+  ret[sub] = ins;
+  return ret;
+}
+function doAssoc(level, node, i, x) {
+  const ret = node.slice();
+  if (level === 0) ret[i & MASK] = x;
+  else { const sub = (i >>> level) & MASK; ret[sub] = doAssoc(level - BITS, node[sub], i, x); }
+  return ret;
+}
+function popTail(cnt, level, node) {
+  const sub = ((cnt - 2) >>> level) & MASK;
+  if (level > BITS) {
+    const child = popTail(cnt, level - BITS, node[sub]);
+    if (child === null && sub === 0) return null;
+    const ret = node.slice();
+    if (child === null) ret.length = sub; else ret[sub] = child;
+    return ret;
+  }
+  if (sub === 0) return null;
+  const ret = node.slice(); ret.length = sub; return ret;
+}
+export const EMPTY_VEC = new Vec(0, BITS, EMPTY_NODE, [], null);
+export function vec(...xs) { return vecFromArray(xs); }
+export function vecFromArray(a) {
+  if (a.length <= WIDTH) return new Vec(a.length, BITS, EMPTY_NODE, a.slice(), null);
+  let v = EMPTY_VEC;
+  for (const x of a) v = v.conj(x);
+  return v;
+}
+/** subvec: a fresh vector of [from, to). O(k log n); views are not worth it here. */
+export function subvec(v, from, to) {
+  if (to === undefined) to = v.cnt;
+  if (from < 0 || to > v.cnt || from > to) throw new BLError("subvec " + from + ".." + to + " out of bounds for " + v.cnt);
+  const out = new Array(to - from);
+  for (let i = from; i < to; i++) out[i - from] = v.nth(i);
+  return vecFromArray(out);
+}
+
+// ─── persistent hash map (HAMT) ─────────────────────────────────────────────
+//
+// Bitmap-indexed nodes; a collision node holds entries whose hashes are equal
+// in all 32 bits. Keys compare with `keyEq` (the hash_key relation: a list and
+// a vector are different keys).
+
+const NOT_FOUND = { nf: true };
+
+class BNode {   // bitmap-indexed: arr = [k0, v0, k1, v1, ...]; a key slot of NODE_MARK holds a sub-node in v
+  constructor(bitmap, arr) { this.bitmap = bitmap; this.arr = arr; }
+}
+class CNode {   // collision: all keys share `hash`
+  constructor(hash, arr) { this.hash = hash; this.arr = arr; }
+}
+const NODE_MARK = { node: true };
+function popcount(x) { x -= (x >>> 1) & 0x55555555; x = (x & 0x33333333) + ((x >>> 2) & 0x33333333); return (((x + (x >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24; }
+function bitpos(hash, shift) { return 1 << ((hash >>> shift) & 31); }
+function bidx(bitmap, bit) { return popcount(bitmap & (bit - 1)); }
+
+function nodeGet(node, shift, hash, key) {
+  for (;;) {
+    if (node instanceof CNode) {
+      const a = node.arr;
+      for (let i = 0; i < a.length; i += 2) if (keyEq(a[i], key)) return a[i + 1];
+      return NOT_FOUND;
+    }
+    const bit = bitpos(hash, shift);
+    if ((node.bitmap & bit) === 0) return NOT_FOUND;
+    const i = 2 * bidx(node.bitmap, bit);
+    const k = node.arr[i];
+    if (k === NODE_MARK) { node = node.arr[i + 1]; shift += 5; continue; }
+    return keyEq(k, key) ? node.arr[i + 1] : NOT_FOUND;
+  }
+}
+// returns [newNode, added?]
+function nodeAssoc(node, shift, hash, key, val) {
+  if (node instanceof CNode) {
+    if (hash === node.hash) {
+      const a = node.arr;
+      for (let i = 0; i < a.length; i += 2) {
+        if (keyEq(a[i], key)) {
+          if (a[i + 1] === val) return [node, false];
+          const b = a.slice(); b[i + 1] = val; return [new CNode(hash, b), false];
+        }
+      }
+      return [new CNode(hash, a.concat([key, val])), true];
+    }
+    // nest the collision node under a bitmap node
+    const wrap = new BNode(bitpos(node.hash, shift), [NODE_MARK, node]);
+    return nodeAssoc(wrap, shift, hash, key, val);
+  }
+  const bit = bitpos(hash, shift);
+  const i = 2 * bidx(node.bitmap, bit);
+  if ((node.bitmap & bit) === 0) {
+    const a = node.arr.slice(); a.splice(i, 0, key, val);
+    return [new BNode(node.bitmap | bit, a), true];
+  }
+  const k = node.arr[i], v = node.arr[i + 1];
+  if (k === NODE_MARK) {
+    const [n2, added] = nodeAssoc(v, shift + 5, hash, key, val);
+    if (n2 === v) return [node, false];
+    const a = node.arr.slice(); a[i + 1] = n2; return [new BNode(node.bitmap, a), added];
+  }
+  if (keyEq(k, key)) {
+    if (v === val) return [node, false];
+    const a = node.arr.slice(); a[i + 1] = val; return [new BNode(node.bitmap, a), false];
+  }
+  // two different keys in one slot: push both one level down
+  const sub = mergeTwo(shift + 5, k, v, hashOf(k), key, val, hash);
+  const a = node.arr.slice(); a[i] = NODE_MARK; a[i + 1] = sub;
+  return [new BNode(node.bitmap, a), true];
+}
+function mergeTwo(shift, k1, v1, h1, k2, v2, h2) {
+  if (h1 === h2) return new CNode(h1, [k1, v1, k2, v2]);
+  if (shift > 30) return new CNode(h1, [k1, v1, k2, v2]); // unreachable with 32-bit hashes; defensive
+  const b1 = bitpos(h1, shift), b2 = bitpos(h2, shift);
+  if (b1 === b2) return new BNode(b1, [NODE_MARK, mergeTwo(shift + 5, k1, v1, h1, k2, v2, h2)]);
+  // array order is popcount order = UNSIGNED bit order; `1 << 31` is negative
+  // in JS, so compare the slot numbers, never the signed bit values
+  const s1 = (h1 >>> shift) & 31, s2 = (h2 >>> shift) & 31;
+  return s1 < s2 ? new BNode(b1 | b2, [k1, v1, k2, v2]) : new BNode(b1 | b2, [k2, v2, k1, v1]);
+}
+// returns newNode | null (emptied) | node (unchanged)
+function nodeDissoc(node, shift, hash, key) {
+  if (node instanceof CNode) {
+    const a = node.arr;
+    for (let i = 0; i < a.length; i += 2) {
+      if (keyEq(a[i], key)) {
+        if (a.length === 2) return null;
+        const b = a.slice(); b.splice(i, 2); return new CNode(node.hash, b);
+      }
+    }
+    return node;
+  }
+  const bit = bitpos(hash, shift);
+  if ((node.bitmap & bit) === 0) return node;
+  const i = 2 * bidx(node.bitmap, bit);
+  const k = node.arr[i], v = node.arr[i + 1];
+  if (k === NODE_MARK) {
+    const n2 = nodeDissoc(v, shift + 5, hash, key);
+    if (n2 === v) return node;
+    if (n2 !== null) { const a = node.arr.slice(); a[i + 1] = n2; return new BNode(node.bitmap, a); }
+    if (node.bitmap === bit) return null;
+    const a = node.arr.slice(); a.splice(i, 2); return new BNode(node.bitmap ^ bit, a);
+  }
+  if (!keyEq(k, key)) return node;
+  if (node.bitmap === bit) return null;
+  const a = node.arr.slice(); a.splice(i, 2); return new BNode(node.bitmap ^ bit, a);
+}
+function* nodeEntries(node) {
+  const a = node.arr;
+  for (let i = 0; i < a.length; i += 2) {
+    if (a[i] === NODE_MARK) yield* nodeEntries(a[i + 1]);
+    else yield [a[i], a[i + 1]];
+  }
+}
+const EMPTY_BNODE = new BNode(0, []);
+
+export class HMap {
+  constructor(cnt, root, meta) { this.cnt = cnt; this.root = root; this.meta = meta || null; this._h = undefined; }
+  get(k, dflt) { const v = nodeGet(this.root, 0, hashOf(k), k); return v === NOT_FOUND ? dflt : v; }
+  has(k) { return nodeGet(this.root, 0, hashOf(k), k) !== NOT_FOUND; }
+  assoc(k, v) {
+    const [r, added] = nodeAssoc(this.root, 0, hashOf(k), k, v);
+    return r === this.root ? this : new HMap(added ? this.cnt + 1 : this.cnt, r, this.meta);
+  }
+  dissoc(k) {
+    const r = nodeDissoc(this.root, 0, hashOf(k), k);
+    if (r === this.root) return this;
+    return new HMap(this.cnt - 1, r === null ? EMPTY_BNODE : r, this.meta);
+  }
+  *[Symbol.iterator]() { yield* nodeEntries(this.root); }
+  /** entries in a DETERMINISTIC order (see `sortedEntries`); printing, keys,
+      vals and seq use it so output never depends on hash layout */
+  entries() { return sortedEntries([...nodeEntries(this.root)]); }
+}
+export const EMPTY_MAP = new HMap(0, EMPTY_BNODE, null);
+export function hashMap(...kvs) {
+  let m = EMPTY_MAP;
+  for (let i = 0; i < kvs.length; i += 2) m = m.assoc(kvs[i], kvs[i + 1]);
+  return m;
+}
+
+export class HSet {
+  constructor(m, meta) { this.m = m; this.meta = meta || null; this._h = undefined; }
+  get cnt() { return this.m.cnt; }
+  has(x) { return this.m.has(x); }
+  conj(x) { const m = this.m.assoc(x, true); return m === this.m ? this : new HSet(m, this.meta); }
+  disj(x) { const m = this.m.dissoc(x); return m === this.m ? this : new HSet(m, this.meta); }
+  *[Symbol.iterator]() { for (const [k] of this.m) yield k; }
+  elements() { return this.m.entries().map(e => e[0]); }
+}
+export const EMPTY_SET = new HSet(EMPTY_MAP, null);
+export function hashSet(...xs) { let s = EMPTY_SET; for (const x of xs) s = s.conj(x); return s; }
+
+// Map/set enumeration order: BL's total `compare` where it is defined, kind
+// order otherwise. Deterministic across runs and hosts; it is NOT the BEAM
+// atom-table order (FUP-141 records that small-map order on BEAM depends on
+// the atom table and cannot be reproduced anywhere else).
+function sortedEntries(es) { return es.sort((a, b) => compare(a[0], b[0])); }
+
+// ─── hashing + equality ─────────────────────────────────────────────────────
+
+export function strHash(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return h | 0;
+}
+function mix(h, x) { h = Math.imul(h ^ x, 0x9e3779b1); return (h ^ (h >>> 15)) | 0; }
+function numHash(n) {
+  if (Number.isInteger(n)) return (n | 0) ^ ((n / 4294967296) | 0);
+  return strHash(String(n));
+}
+
+/** The hash_key hash: consistent with `keyEq`. */
+export function hashOf(x) {
+  if (x === null || x === undefined) return 0;
+  switch (typeof x) {
+    case "number": return numHash(x);
+    case "bigint": return strHash(x.toString());
+    case "string": return strHash(x);
+    case "boolean": return x ? 1231 : 1237;
+    case "function": return fnId(x);
+  }
+  if (x instanceof Kw || x instanceof Sym) return x.h;
+  if (x instanceof Flt) return mix(0x3f800000, numHash(x.v));
+  if (x._h !== undefined && x._h !== null) return x._h;
+  let h;
+  if (x instanceof Vec) { h = 0x7e57; for (const e of x) h = mix(h, hashOf(e)); x._h = h; return h; }
+  if (x instanceof HMap) { h = 0x4d41; for (const [k, v] of x) h = (h + (mix(hashOf(k), hashOf(v)))) | 0; x._h = h; return h; }
+  if (x instanceof HSet) { h = 0x5345; for (const e of x) h = (h + hashOf(e)) | 0; x._h = h; return h; }
+  if (x === EMPTY) return 0x4c00;
+  if (x instanceof Cons) { h = 0x4c49; for (let p = x; p instanceof Cons; p = p.t) h = mix(h, hashOf(p.h)); return h; }
+  if (x instanceof Tup) { h = 0x5455; for (const e of x.items) h = mix(h, hashOf(e)); return h; }
+  return fnId(x);
+}
+const IDS = new WeakMap(); let nextId = 1;
+function fnId(x) { let i = IDS.get(x); if (i === undefined) { i = nextId++; IDS.set(x, i); } return i; }
+
+/** hash_key equality: structural, but a list and a vector differ. */
+export function keyEq(a, b) {
+  if (a === b) return true;
+  if (a === null || b === null || a === undefined || b === undefined) return false;
+  const ta = typeof a;
+  if (ta !== "object" || typeof b !== "object") {
+    if ((ta === "number" || ta === "bigint") && (typeof b === "number" || typeof b === "bigint")) return a == b; // eslint-disable-line eqeqeq
+    return false;
+  }
+  if (a instanceof Flt) return b instanceof Flt && (a.v === b.v || (a.v !== a.v && b.v !== b.v));
+  if (a instanceof Vec) return b instanceof Vec && seqEqv(a, b, keyEq);
+  if (a instanceof Cons || a === EMPTY) return (b instanceof Cons || b === EMPTY) && seqEqv(a, b, keyEq);
+  if (a instanceof HMap) return b instanceof HMap && mapEqv(a, b, keyEq);
+  if (a instanceof HSet) return b instanceof HSet && a.cnt === b.cnt && [...a].every(e => b.has(e));
+  if (a instanceof Tup) return b instanceof Tup && a.items.length === b.items.length && a.items.every((e, i) => keyEq(e, b.items[i]));
+  return false;
+}
+/** BL `=`, measured against BEAM (2026-10-03): lists and vectors are one
+    sequential family, and numbers compare NUMERICALLY across int/float —
+    (= 1 1.0), (= [1] [1.0]) are true. Map/set KEYS do not: (get {1 :a} 1.0)
+    is nil, (contains? #{1} 1.0) is false — that is `keyEq`. */
+export function eqv(a, b) {
+  if (a === b) return true;
+  if (a === null || b === null || a === undefined || b === undefined) return false;
+  if (isNumV(a)) return isNumV(b) && Number(numOf(a)) === Number(numOf(b)) && (typeof a !== "bigint" || typeof b !== "bigint" || a === b);
+  const ta = typeof a;
+  if (ta !== "object" || typeof b !== "object") return false;
+  if (isSeqColl(a)) return isSeqColl(b) && seqEqv(a, b, eqv);
+  if (a instanceof HMap) return b instanceof HMap && mapEqv(a, b, eqv);
+  if (a instanceof HSet) return b instanceof HSet && a.cnt === b.cnt && [...a].every(e => b.has(e));
+  if (a instanceof Tup) return b instanceof Tup && a.items.length === b.items.length && a.items.every((e, i) => eqv(e, b.items[i]));
+  return false;
+}
+function isSeqColl(x) { return x instanceof Vec || x instanceof Cons || x === EMPTY; }
+function isNumV(x) { return typeof x === "number" || typeof x === "bigint" || x instanceof Flt; }
+function seqEqv(a, b, eq) {
+  const ia = iter(a), ib = iter(b);
+  for (;;) {
+    const x = ia.next(), y = ib.next();
+    if (x.done || y.done) return x.done === y.done;
+    if (!eq(x.value, y.value)) return false;
+  }
+}
+function mapEqv(a, b, eq) {
+  if (a.cnt !== b.cnt) return false;
+  for (const [k, v] of a) { const w = b.get(k, NOT_FOUND); if (w === NOT_FOUND || !eq(v, w)) return false; }
+  return true;
+}
+function* iter(x) {
+  if (x instanceof Vec) { yield* x; return; }
+  for (let p = x; p instanceof Cons; p = p.t) yield p.h;
+}
+
+// ─── ordering (BL `compare`) ────────────────────────────────────────────────
+//
+// numbers < (nil false true) < keywords < symbols < strings < sequential
+// < maps < sets < everything else. Strings order by CODEPOINT (= UTF-8 byte
+// order, as BEAM binaries do), sequentials element-wise then by length.
+
+function rank(x) {
+  if (typeof x === "number" || typeof x === "bigint" || x instanceof Flt) return 0;
+  if (x === null || x === undefined || x === false || x === true) return 1;
+  if (x instanceof Kw) return 2;
+  if (x instanceof Sym) return 3;
+  if (typeof x === "string") return 4;
+  if (isSeqColl(x)) return 5;
+  if (x instanceof HMap) return 6;
+  if (x instanceof HSet) return 7;
+  if (x instanceof Tup) return 8;
+  return 9;
+}
+export function compare(a, b) {
+  const ra = rank(a), rb = rank(b);
+  if (ra !== rb) return ra < rb ? -1 : 1;
+  switch (ra) {
+    case 0: { const x = numOf(a), y = numOf(b); return x < y ? -1 : x > y ? 1 : 0; }
+    case 1: { const o = v => v === null || v === undefined ? 0 : v === false ? 1 : 2; return o(a) - o(b); }
+    case 2: return strCmp(a.fq, b.fq);
+    case 3: return strCmp(a.name, b.name);
+    case 4: return strCmp(a, b);
+    case 5: {
+      const ia = iter(a), ib = iter(b);
+      for (;;) {
+        const x = ia.next(), y = ib.next();
+        if (x.done || y.done) return x.done && y.done ? 0 : x.done ? -1 : 1;
+        const c = compare(x.value, y.value); if (c !== 0) return c;
+      }
+    }
+    case 6: case 7: { const ca = a.cnt, cb = b.cnt; if (ca !== cb) return ca < cb ? -1 : 1; return compare(printStr(a), printStr(b)); }
+    case 8: { const n = Math.min(a.items.length, b.items.length); for (let i = 0; i < n; i++) { const c = compare(a.items[i], b.items[i]); if (c) return c; } return a.items.length - b.items.length; }
+    default: return 0;
+  }
+}
+function numOf(x) { return x instanceof Flt ? x.v : x; }
+export function strCmp(a, b) {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n;) {
+    const ca = a.codePointAt(i), cb = b.codePointAt(i);
+    if (ca !== cb) return ca < cb ? -1 : 1;
+    i += ca > 0xffff ? 2 : 1;
+  }
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+}
+
+// ─── errors ─────────────────────────────────────────────────────────────────
+
+/** A BL raise: `(throw (ex-info msg data))` or a runtime error. */
+export class BLError extends Error {
+  constructor(message, data, cause) { super(message); this.data = data === undefined ? null : data; this.blCause = cause || null; }
+}
+
+// ─── exact arithmetic ───────────────────────────────────────────────────────
+
+const MAX = 9007199254740991, MIN = -9007199254740991;
+function norm(b) { return (b >= -9007199254740991n && b <= 9007199254740991n) ? Number(b) : b; }
+function isIntV(x) { return typeof x === "number" || typeof x === "bigint"; }
+function needNum(op, a, b) {
+  if (!(isIntV(a) || a instanceof Flt) || !(isIntV(b) || b instanceof Flt))
+    throw new BLError(op + " needs numbers, got " + printStr(a) + " and " + printStr(b));
+}
+export function add(a, b) {
+  if (typeof a === "number" && typeof b === "number") { const r = a + b; if (r <= MAX && r >= MIN) return r; return norm(BigInt(a) + BigInt(b)); }
+  needNum("+", a, b);
+  if (a instanceof Flt || b instanceof Flt) return new Flt(numOf(a) + Number(numOf(b)));
+  return norm(BigInt(a) + BigInt(b));
+}
+export function sub(a, b) {
+  if (typeof a === "number" && typeof b === "number") { const r = a - b; if (r <= MAX && r >= MIN) return r; return norm(BigInt(a) - BigInt(b)); }
+  needNum("-", a, b);
+  if (a instanceof Flt || b instanceof Flt) return new Flt(Number(numOf(a)) - Number(numOf(b)));
+  return norm(BigInt(a) - BigInt(b));
+}
+export function mul(a, b) {
+  if (typeof a === "number" && typeof b === "number") { const r = a * b; if (r <= MAX && r >= MIN) return r === 0 ? 0 : r; return norm(BigInt(a) * BigInt(b)); }
+  needNum("*", a, b);
+  if (a instanceof Flt || b instanceof Flt) return new Flt(Number(numOf(a)) * Number(numOf(b)));
+  return norm(BigInt(a) * BigInt(b));
+}
+/** BEAM `/` answers a float, always. */
+export function div(a, b) {
+  needNum("/", a, b);
+  const y = Number(numOf(b));
+  if (y === 0) throw new BLError("divide by zero");
+  return new Flt(Number(numOf(a)) / y);
+}
+function intArgs(op, a, b) {
+  if (!isIntV(a) || !isIntV(b)) throw new BLError(op + " needs integers, got " + printStr(a) + " and " + printStr(b));
+  if (b === 0 || b === 0n) throw new BLError(op + " by zero");
+}
+export function quot(a, b) { intArgs("quot", a, b); if (typeof a === "number" && typeof b === "number") return Math.trunc(a / b) || 0; return norm(BigInt(a) / BigInt(b)); }
+export function rem(a, b) { intArgs("rem", a, b); if (typeof a === "number" && typeof b === "number") return (a % b) || 0; return norm(BigInt(a) % BigInt(b)); }
+export function mod(a, b) {
+  intArgs("mod", a, b);
+  if (typeof a === "number" && typeof b === "number") { const m = a % b; return (m !== 0 && (m < 0) !== (b < 0) ? m + b : m) || 0; }
+  const x = BigInt(a), y = BigInt(b), m = x % y; return norm(m !== 0n && (m < 0n) !== (y < 0n) ? m + y : m);
+}
+export function lt(a, b) { if (typeof a === "number" && typeof b === "number") return a < b; needNum("<", a, b); return numOf(a) < numOf(b); }
+export function gt(a, b) { if (typeof a === "number" && typeof b === "number") return a > b; needNum(">", a, b); return numOf(a) > numOf(b); }
+export function le(a, b) { if (typeof a === "number" && typeof b === "number") return a <= b; needNum("<=", a, b); return numOf(a) <= numOf(b); }
+export function ge(a, b) { if (typeof a === "number" && typeof b === "number") return a >= b; needNum(">=", a, b); return numOf(a) >= numOf(b); }
+/** `==`: numeric equality across int/float (BEAM `==`). */
+export function numEq(a, b) { needNum("==", a, b); return Number(numOf(a)) === Number(numOf(b)) || a == b; } // eslint-disable-line eqeqeq
+export function isInt(x) { return typeof x === "number" || typeof x === "bigint"; }
+export function isFloat(x) { return x instanceof Flt; }
+export function isNumber(x) { return isInt(x) || x instanceof Flt; }
+export function toNumber(x) { return x instanceof Flt ? x.v : Number(x); }
+
+// ─── strings by codepoint ───────────────────────────────────────────────────
+
+/** Codepoint count (BL text length on the wire and in this profile). */
+export function cpCount(s) { let n = 0; for (let i = 0; i < s.length; i++) { const c = s.charCodeAt(i); if (c < 0xd800 || c > 0xdbff) n++; } return n; }
+/** UTF-16 index of codepoint index `cp` (clamped to s.length). */
+export function cpToUnit(s, cp) {
+  let u = 0;
+  for (let k = 0; k < cp && u < s.length; k++) { const c = s.charCodeAt(u); u += (c >= 0xd800 && c <= 0xdbff) ? 2 : 1; }
+  return u;
+}
+export function unitToCp(s, u) { let n = 0; for (let i = 0; i < u && i < s.length; i++) { const c = s.charCodeAt(i); if (c < 0xd800 || c > 0xdbff) n++; } return n; }
+/** (subs s start end) by codepoints, BL semantics: out of range raises. */
+export function subs(s, start, end) {
+  const n = cpCount(s);
+  if (end === undefined) end = n;
+  if (start < 0 || end > n || start > end) throw new BLError("subs " + start + ".." + end + " out of range for a string of " + n);
+  if (s.length === n) return s.slice(start, end);
+  const a = cpToUnit(s, start);
+  return s.slice(a, cpToUnit(s, end));
+}
+
+// ─── printing ───────────────────────────────────────────────────────────────
+
+function escStr(s) {
+  return '"' + s.replace(/[\\"\n\t\r]/g, c => c === "\n" ? "\\n" : c === "\t" ? "\\t" : c === "\r" ? "\\r" : "\\" + c) + '"';
+}
+/** `pr-str` — the readable printer. */
+export function printStr(x) {
+  if (x === null || x === undefined) return "nil";
+  switch (typeof x) {
+    case "string": return escStr(x);
+    case "number": case "bigint": return String(x);
+    case "boolean": return x ? "true" : "false";
+    case "function": return "#<fn " + (x.blName || x.name || "anonymous") + ">";
+  }
+  if (x instanceof Flt) { const s = String(x.v); return /[.eEn]|Infinity/.test(s) ? s : s + ".0"; }
+  if (x instanceof Kw) return ":" + x.fq;
+  if (x instanceof Sym) return x.name;
+  if (x instanceof Vec) return "[" + x.toArray().map(printStr).join(" ") + "]";
+  if (x === EMPTY) return "()";
+  if (x instanceof Cons) { const a = []; for (let p = x; p instanceof Cons; p = p.t) a.push(printStr(p.h)); return "(" + a.join(" ") + ")"; }
+  if (x instanceof HMap) return "{" + x.entries().map(([k, v]) => printStr(k) + " " + printStr(v)).join(", ") + "}";
+  if (x instanceof HSet) return "#{" + x.elements().sort(compare).map(printStr).join(" ") + "}";
+  if (x instanceof Tup) return "{" + x.items.map(printStr).join(", ") + "}";
+  if (x instanceof BLError) return "#error {:message " + escStr(x.message) + "}";
+  if (x instanceof Atom) return "#<atom " + printStr(x.v) + ">";
+  return "#<host " + Object.prototype.toString.call(x) + ">";
+}
+/** `str` of one value: strings bare, nil empty, keywords with their colon. */
+export function strOf(x) {
+  if (typeof x === "string") return x;
+  if (x === null || x === undefined) return "";
+  if (x instanceof Kw) return x.fq;
+  return printStr(x);
+}
+
+// ─── atoms (the one mutable reference type) ─────────────────────────────────
+
+export class Atom {
+  constructor(v) { this.v = v; this.watches = null; }
+}
+
+// ─── truthiness ─────────────────────────────────────────────────────────────
+
+export function truthy(x) { return x !== null && x !== undefined && x !== false; }

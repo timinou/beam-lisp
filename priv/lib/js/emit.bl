@@ -1,0 +1,582 @@
+; priv/lib/js/emit.bl — Beam Lisp → JavaScript, the SYNC profile.
+;
+; One BL namespace becomes one ES module. Every top-level `defn` becomes a JS
+; function, every call a JS call, every `loop`/`recur` a labelled `for(;;)`.
+; There is no scheduler, no mailbox and no step machine: this profile is for
+; code that RUNS TO COMPLETION in response to an event — an editor's command,
+; a view, a parser — which is most UI code. (The actor profile in
+; research/js-actors keeps the generator machine for code that must be
+; preempted; PLAN-161 D2.)
+;
+; ── Pipeline ──────────────────────────────────────────────────────────────
+;
+;   source → BeamLisp reader (positioned) → the BEAM compiler → bl-ANF
+;          → THIS emitter → JS text → (js.build links names) → ES module
+;
+; The emitter consumes the SAME canonical bl-ANF the BEAM backend lowers
+; (priv/boot/anf.bl). It never re-parses, re-expands or re-desugars.
+;
+; ── Destinations ─────────────────────────────────────────────────────────
+;
+; Every node is emitted toward a DESTINATION, the one place its value goes:
+;
+;   nil                       produce a JS expression (the caller binds it)
+;   [:return]                 `return v;`            — function tail
+;   [:assign var label]       `var = v; break label;` — a case/if/try arm
+;   [:loop res label]         `res = v; break label;` — leaving a loop
+;
+; Expression-shaped nodes (literals, calls, collections) build a value and
+; hand it to `finish`, which delivers it. Statement-shaped nodes (if, case,
+; let, do, loop, try) push the SAME destination into their branches. So a
+; branch never guesses what its parent wanted: there is exactly one rule, and
+; recur — which delivers to no destination at all — is the only exception.
+;
+; Emission returns {:lines [stmt…] :val expr}; :val is nil iff the value was
+; delivered. Temporaries come from a per-module counter (`reset-state!`), so a
+; module's text is a pure function of its source.
+
+(ns js.emit
+  (:require [system.ir :as ir]))
+
+(defn- codepoints
+  "The Unicode codepoints of string `s`, as a list of integers."
+  [s]
+  (unicode/characters_to_list s))
+
+; ─── names ──────────────────────────────────────────────────────────────────
+
+(def ^:private reserved
+  #{"break" "case" "catch" "class" "const" "continue" "debugger" "default" "delete"
+    "do" "else" "export" "extends" "finally" "for" "function" "if" "import" "in"
+    "instanceof" "new" "return" "super" "switch" "this" "throw" "try" "typeof" "var"
+    "void" "while" "with" "yield" "let" "static" "enum" "await" "implements" "package"
+    "protected" "interface" "private" "public" "null" "true" "false" "arguments" "eval"})
+
+(defn mangle
+  "A legal JS identifier for a BL name. Letters, digits and `_` pass through;
+   `-` becomes `_`; other punctuation becomes a `$`-escape, so the map stays
+   readable (`empty?` → `empty$Q`) and injective in practice. A reserved word
+   gains a trailing `$`; a leading digit gains `_`."
+  [s]
+  (let [out (apply str
+              (map (fn [c]
+                     (if (or (and (>= c 97) (<= c 122)) (and (>= c 65) (<= c 90))
+                             (and (>= c 48) (<= c 57)) (= c 95))
+                       (unicode/characters_to_binary (list c))
+                       (cond (= c 45) "_" (= c 63) "$Q" (= c 33) "$B" (= c 42) "$S"
+                             (= c 62) "$G" (= c 60) "$L" (= c 61) "$E" (= c 43) "$P"
+                             (= c 47) "$D" (= c 46) "$O" (= c 39) "$T" :else (str "$" c "$"))))
+                   (codepoints s)))
+        out (if (and (> (count out) 0)
+                     (let [c (first (codepoints out))] (and (>= c 48) (<= c 57))))
+              (str "_" out) out)]
+    (if (contains? reserved out) (str out "$") out)))
+
+(defn local-name [n] (str "v_" (mangle n)))
+
+(defn js-escape
+  "A JS double-quoted string literal body. Every non-ASCII codepoint is passed
+   through as itself (the module is UTF-8); control characters are escaped."
+  [s]
+  (apply str
+    (map (fn [c]
+           (cond
+             (= c 34) "\\\"" (= c 92) "\\\\" (= c 10) "\\n" (= c 13) "\\r" (= c 9) "\\t"
+             (= c 8232) "\\u2028" (= c 8233) "\\u2029"
+             (< c 32) (str "\\u00" (if (< c 16) "0" "") (lower-case (Integer/to_string c 16)))
+             :else (unicode/characters_to_binary (list c))))
+         (codepoints s))))
+
+(defn js-str [s] (str "\"" (js-escape s) "\""))
+
+; ─── emission state (per module) ────────────────────────────────────────────
+
+(def ^:private st-key :js_emit_state)
+
+(defn reset-state! []
+  (erlang/put st-key {:n 0 :kws {} :kw-order []}))
+
+(defn- st [] (erlang/get st-key))
+(defn- st! [m] (erlang/put st-key m))
+
+(defn- tmp []
+  (let [s (st) n (inc (:n s))]
+    (st! (assoc s :n n))
+    (str "t" n)))
+
+(defn- label [prefix] (str prefix (subs (tmp) 1)))
+
+(defn- kw-ref
+  "A module-level const for keyword `k` — interned once per module, so a
+   keyword literal in a hot path is a variable read, not a table lookup."
+  [k]
+  (let [fq (if (some? (namespace k)) (str (namespace k) "/" (name k)) (name k))
+        s (st)]
+    (if (contains? (:kws s) fq)
+      (get (:kws s) fq)
+      (let [id (str "K_" (count (:kws s)))]
+        (st! (assoc s :kws (assoc (:kws s) fq id) :kw-order (conj (:kw-order s) [id fq])))
+        id))))
+
+(defn kw-decls
+  "The const declarations for every keyword the module interned, in first-use order."
+  []
+  (map (fn [[id fq]] (str "const " id " = R.kw(" (js-str fq) ");")) (:kw-order (st))))
+
+; ─── literals ───────────────────────────────────────────────────────────────
+
+(def ^:private safe-max 9007199254740991)
+
+(defn lit-js [v]
+  (cond
+    (nil? v) "null"
+    (= v true) "true"
+    (= v false) "false"
+    (erlang/is_integer v) (if (and (<= v safe-max) (>= v (- 0 safe-max))) (str v) (str v "n"))
+    (erlang/is_float v) (str "R.flt(" (erlang/float_to_binary v (list :short)) ")")
+    (erlang/is_binary v) (js-str v)
+    (keyword? v) (kw-ref v)
+    (erlang/is_atom v) (kw-ref (keyword (erlang/atom_to_binary v)))
+    ; quoted DATA: `'(1 2)`, `'[a :b]`, a quoted map — a BL value the compiler
+    ; folded into one literal. Rebuilt structurally, element by element.
+    (symbol? v) (str "R.sym(" (js-str (name v)) ")")
+    (vector? v) (str "R.vec(" (join ", " (map lit-js v)) ")")
+    (or (list? v) (seq? v)) (if (empty? v) "R.EMPTY" (str "R.list(" (join ", " (map lit-js v)) ")"))
+    (set? v) (str "R.hashSet(" (join ", " (map lit-js v)) ")")
+    (map? v) (str "R.hashMap(" (join ", " (mapcat (fn [[k x]] [(lit-js k) (lit-js x)]) v)) ")")
+    (erlang/is_tuple v) (str "R.tup([" (join ", " (map lit-js (erlang/tuple_to_list v))) "])")
+    :else (throw (ex-info (str "js.emit: no JS literal for " (pr-str v)) {:value v}))))
+
+; ─── the context ────────────────────────────────────────────────────────────
+;
+;   :ns       the namespace being compiled (string)
+;   :resolve  (fn [ns name arity?] → js-expr) — the linker's global resolver
+;   :remote   (fn [mod fun arity] → js-expr | nil) — the core/host op resolver
+;   :dest     where this node's value goes (see Destinations)
+;   :loop     {:self "loop_N" :vars [js-names] :label "L3"} inside a loop body
+;   :selves   {scaffold-self-name → js function name} for self-calls
+
+(defn- to [ctx dest] (assoc ctx :dest dest))
+(defn- expr-ctx [ctx] (assoc ctx :dest nil))
+
+(defn- finish
+  "Deliver an expression value to the destination."
+  [r ctx]
+  (let [d (:dest ctx) v (:val r)]
+    (cond
+      (nil? d) r
+      (nil? v) r
+      (= :return (first d)) {:lines (concat (:lines r) (list (str "return " v ";"))) :val nil}
+      (= :assign (first d)) {:lines (concat (:lines r) (list (str (nth d 1) " = " v "; break " (nth d 2) ";"))) :val nil}
+      (= :loop (first d)) {:lines (concat (:lines r) (list (str (nth d 1) " = " v "; break " (nth d 2) ";"))) :val nil}
+      :else (throw (ex-info "js.emit: bad destination" {:dest d})))))
+
+(defn- open-dest
+  "For a statement-shaped node in VALUE position (dest nil): make a result
+   variable and a label so its branches can deliver, then hand the variable
+   back as the value. {:pre [stmts] :dest d :val res :close [stmts]}."
+  [ctx]
+  (if (nil? (:dest ctx))
+    (let [res (tmp) lbl (label "B")]
+      {:pre (list (str "let " res ";") (str lbl ": {")) :dest [:assign res lbl] :val res :close (list "}")})
+    {:pre (list) :dest (:dest ctx) :val nil :close (list)}))
+
+(declare emit)
+
+(defn- simple-val?
+  "A value expression that is safe to reuse without re-evaluation: a local,
+   a module const, a number or a string literal."
+  [v]
+  (and (some? v)
+       (nil? (index-of v "("))
+       (let [c (first (codepoints v))]
+         (or (and (>= c 48) (<= c 57)) (= c 34) (= c 45) (and (>= c 97) (<= c 122)) (= c 75)))))
+
+(defn- emit-all
+  "Emit `nodes` as values, in order. Each non-trivial value is bound to a
+   temp so evaluation order is source order. {:lines :vals}."
+  [nodes ctx]
+  (reduce (fn [acc n]
+            (let [r (emit n (expr-ctx ctx))]
+              (if (simple-val? (:val r))
+                {:lines (concat (:lines acc) (:lines r)) :vals (conj (:vals acc) (:val r))}
+                (let [t (tmp)]
+                  {:lines (concat (:lines acc) (:lines r) (list (str "const " t " = " (:val r) ";")))
+                   :vals (conj (:vals acc) t)}))))
+          {:lines (list) :vals []}
+          nodes))
+
+; ─── calls ──────────────────────────────────────────────────────────────────
+
+(def ^:private rt-mod :Elixir.BeamLisp.Ns.Rt)
+
+(defn- global-js [node ctx arity]
+  ((:resolve ctx) (:ns node) (:name node) arity))
+
+(defn- call-js
+  "A call expression: `callee(args…)` after the argument statements."
+  [callee-js args ctx]
+  (finish {:lines (:lines args) :val (str callee-js "(" (join ", " (:vals args)) ")")} ctx))
+
+(defn- self-of
+  "If `n` is a self-scaffold knot `(s s)` for a known self, its JS name."
+  [n ctx]
+  (let [selves (or (:selves ctx) {})]
+    (cond
+      (and (= :var (:op n)) (contains? selves (:name n))) (get selves (:name n))
+      (and (= :apply (:op n)) (= :var (:op (:fn n))) (contains? selves (:name (:fn n)))) (get selves (:name (:fn n)))
+      :else nil)))
+
+(defn- emit-invoke
+  "RT.invoke(f, CONS): the callable ABI. A named global or a self-call
+   becomes a direct call; anything else goes through C.invoke, which handles
+   keywords, maps, sets and vectors as functions."
+  [node ctx]
+  (let [cs (ir/call-site node)
+        callee (:callee cs)
+        self (self-of callee ctx)]
+    (cond
+      (= :global (:op callee)) (call-js (global-js callee ctx (count (:args cs))) (emit-all (:args cs) ctx) ctx)
+      (some? self) (call-js self (emit-all (:args cs) ctx) ctx)
+      :else
+        (let [all (emit-all (cons callee (:args cs)) ctx)]
+          (call-js "C.invoke" all ctx)))))
+
+(defn- emit-remote [node ctx]
+  (let [m (:mod node) f (:fun node) args (:args node)]
+    (cond
+      (and (= m rt-mod) (= f :invoke)) (emit-invoke node ctx)
+      (and (= m rt-mod) (= f :apply_to)) (call-js "C.apply" (emit-all args ctx) ctx)
+      :else
+        (let [target ((:remote ctx) m f (count args))]
+          (if (nil? target)
+            (throw (ex-info (str "js.emit: " (:ns ctx) ": no JS implementation for "
+                                 m "/" (name f) "/" (count args)
+                                 (let [a (:ann node)] (if (some? (get a :line)) (str " at line " (get a :line)) "")))
+                            {:mod m :fun f :arity (count args)}))
+            (let [all (emit-all args ctx)]
+              (if (rest-list-call? m f)
+                ; the BEAM variadic ABI: the LAST argument is the rest-args
+                ; LIST. JS core functions are ordinary JS variadics, so the
+                ; list is spread at the call site.
+                (let [vals (:vals all)]
+                  (finish {:lines (:lines all)
+                           :val (str target "(" (join ", " (concat (butlast vals) [(str "...C.toArray(" (last vals) ")")])) ")")}
+                          ctx))
+                (call-js target all ctx))))))))
+
+(defn- rest-list-call?
+  "Does a direct call of [mod fun] pass its rest args as one trailing BL list?
+   True for every compiled variadic clause (`<name>__bl_v`, the BEAM name the
+   compiler gives the `& rest` arity) and for `swap!` (Refs.swap!(a, f, args))."
+  [m f]
+  (or (ends-with? (name f) "__bl_v")
+      (and (= m :Elixir.BeamLisp.Refs) (= f :swap!))))
+
+(def ^:private arith-js
+  {:add "R.add" :sub "R.sub" :mul "R.mul" :div "R.div"
+   :lt "R.lt" :gt "R.gt" :le "R.le" :ge "R.ge" :num_eq "R.numEq"})
+
+(defn- emit-arith [node ctx]
+  (let [f (get arith-js (:fun node))]
+    (when (nil? f) (throw (ex-info (str "js.emit: unknown arith op " (:fun node)) {:node node})))
+    (call-js f (emit-all (:args node) ctx) ctx)))
+
+(defn- emit-apply
+  "A native :apply. The scaffold knot `(s s)` IS the function `s` names; a
+   call of it with args is a direct self-call."
+  [node ctx]
+  (let [f (:fn node) args (:args node)
+        selves (or (:selves ctx) {})]
+    (cond
+      ; (apply (var s) [(var s)]) — the knot itself: the function value
+      (and (= :var (:op f)) (contains? selves (:name f)) (= 1 (count args))
+           (= :var (:op (first args))) (= (:name f) (:name (first args))))
+        (finish {:lines (list) :val (get selves (:name f))} ctx)
+      (some? (self-of f ctx)) (call-js (self-of f ctx) (emit-all args ctx) ctx)
+      :else (call-js "C.invoke" (emit-all (cons f args) ctx) ctx))))
+
+; ─── patterns ───────────────────────────────────────────────────────────────
+
+(defn- pattern-lines
+  "Statements that test value `v` against pattern `p`, binding its variables,
+   and `break <lbl>` on a mismatch."
+  [p v lbl]
+  (let [op (:pop p)]
+    (cond
+      (= op :pvar) (if (= "_" (:name p)) (list) (list (str "const " (local-name (:name p)) " = " v ";")))
+      (= op :plit) (list (str "if (!R.keyEq(" v ", " (lit-js (:val p)) ")) break " lbl ";"))
+      (= op :pnil) (list (str "if (" v " !== R.EMPTY) break " lbl ";"))
+      (= op :ptuple)
+        (let [t (tmp) n (count (:elems p))]
+          (concat (list (str "const " t " = " v ";")
+                        (str "if (!(" t " instanceof R.Tup) || " t ".items.length !== " n ") break " lbl ";"))
+                  (mapcat (fn [i] (pattern-lines (nth (:elems p) i) (str t ".items[" i "]") lbl)) (range n))))
+      (= op :pcons)
+        (let [t (tmp)]
+          (concat (list (str "const " t " = " v ";")
+                        (str "if (!(" t " instanceof R.Cons)) break " lbl ";"))
+                  (pattern-lines (:head p) (str t ".h") lbl)
+                  (pattern-lines (:tail p) (str t ".t") lbl)))
+      (= op :palias) (concat (pattern-lines (:b p) v lbl) (pattern-lines (:a p) v lbl))
+      (= op :pmap)
+        (let [t (tmp)]
+          (concat (list (str "const " t " = " v ";")
+                        (str "if (!(" t " instanceof R.HMap)) break " lbl ";"))
+                  (mapcat (fn [pr]
+                            (let [k (lit-js (:val (first pr))) u (tmp)]
+                              (concat (list (str "const " u " = " t ".get(" k ", C.NOT_FOUND);")
+                                            (str "if (" u " === C.NOT_FOUND) break " lbl ";"))
+                                      (pattern-lines (second pr) u lbl))))
+                          (:pairs p))))
+      :else (throw (ex-info (str "js.emit: pattern " op " is not in the sync profile") {:pattern p})))))
+
+(defn- clause-lines
+  "One clause: pattern tests, guard, body delivered to ctx's destination.
+   Falls through (to the next clause) on a mismatch."
+  [cl vals ctx]
+  (let [lbl (label "C")
+        pats (:pats cl)
+        binds (mapcat (fn [i] (pattern-lines (nth pats i) (nth vals i) lbl)) (range (count pats)))
+        g (if (nil? (:guard cl)) nil (emit (:guard cl) (expr-ctx ctx)))
+        body (emit (:body cl) ctx)]
+    (concat (list (str lbl ": {"))
+            binds
+            (if (nil? g) (list)
+              (concat (:lines g) (list (str "if (!R.truthy(" (:val g) ")) break " lbl ";"))))
+            (:lines body)
+            (list "}"))))
+
+; ─── functions ──────────────────────────────────────────────────────────────
+;
+; The BEAM compiler emits every fn through the self-application scaffold
+;   (let s (fn [s] INNER) (s s))
+; so INNER can call itself through `s`. Here INNER becomes a NAMED JS function
+; and `s` names it: `(s s)` is the function itself, and a call of `(s s)` with
+; arguments is a direct self-call.
+
+(defn- fn-js
+  "A JS function expression for a :fn node of one arity. `self` is the
+   scaffold's self name; inside one arity of a multi-arity fn the self name
+   reaches the whole fn (`:self-target`, the dispatcher)."
+  [fnode self jsname ctx]
+  (let [cls (:clauses fnode)
+        arity (count (:pats (first cls)))
+        params (vec (map (fn [i] (str "a" i)) (range arity)))
+        target (or (:self-target ctx) jsname)
+        ctx2 (assoc ctx :dest [:return] :loop nil :self-target nil
+                    :selves (if (nil? self) (:selves ctx) (assoc (or (:selves ctx) {}) self target)))
+        body (concat (mapcat (fn [cl] (clause-lines cl params ctx2)) cls)
+                     (list (str "throw new R.BLError(\"no matching clause for " (js-escape (or (:fn-label ctx) jsname))
+                                " with \" + [" (join ", " (map (fn [p] (str "R.printStr(" p ")")) params)) "].join(\" \"));")))]
+    (str "function " jsname "(" (join ", " params) ") {\n" (join "\n" body) "\n}")))
+
+(defn- fn-value
+  "A bare fn value (a scaffold or a raw :fn): {:lines :val} where :val names
+   or IS the function."
+  [node ctx]
+  (cond
+    (ir/self-scaffold? node)
+      (let [self (:name node)
+            jsname (str "f_" (mangle self))]
+        {:lines (list) :val (str "(" (fn-js (ir/scaffold-inner node) self jsname ctx) ")")})
+    (= :fn (:op node))
+      {:lines (list) :val (str "(" (fn-js node nil (label "anon") ctx) ")")}
+    :else (throw (ex-info "js.emit: not a fn" {:node node}))))
+
+(defn- blfn-tuple?
+  "The multi-arity / variadic dispatch value `{:$blfn {arity fn…} variadic}`."
+  [node]
+  (and (= :tuple (:op node))
+       (let [h (first (:elems node))] (and (= :lit (:op h)) (= "$blfn" (str (:val h)))))))
+
+(defn- emit-blfn
+  "A multi-arity / variadic fn: one JS function dispatching on arguments.length.
+   The variadic slot receives the extra args as a BL list, nil when there are
+   none (Clojure's `& rest`)."
+  [node ctx]
+  (let [[_ fixed variadic] (:elems node)
+        nm (label "multi")
+        actx (assoc ctx :self-target nm :dest nil)
+        arms (map (fn [pr] [(:val (first pr)) (fn-value (second pr) actx)]) (:pairs fixed))
+        v (if (and (some? variadic) (= :tuple (:op variadic)))
+            (let [[mn f] (:elems variadic)] [(:val mn) (fn-value f actx)])
+            nil)
+        lines (concat
+                (map (fn [[n r]] (str "const " nm "_" n " = " (:val r) ";")) arms)
+                (if (nil? v) (list) (list (str "const " nm "_v = " (:val (second v)) ";"))))
+        dispatch (str "function " nm "(...args) {\n"
+                      (join "\n" (map (fn [[n _]] (str "if (args.length === " n ") return " nm "_" n "(...args);")) arms))
+                      "\n"
+                      (if (nil? v) ""
+                        (str "if (args.length >= " (first v) ") return " nm "_v(...args.slice(0, " (first v) "), args.length > " (first v) " ? R.listFromArray(args, " (first v) ") : null);\n"))
+                      "throw new R.BLError(\"wrong number of args (\" + args.length + \")\");\n}")]
+    (finish {:lines (concat lines (list dispatch)) :val nm} ctx)))
+
+; ─── loops ──────────────────────────────────────────────────────────────────
+
+(defn- emit-loop
+  "(apply SCAFFOLD inits): `for(;;)` with the loop vars as `let`s. A recur
+   reassigns them (parallel assignment) and continues; any other value leaves
+   the loop toward the loop's own destination. In a function tail the body
+   simply returns; in value position it stores and breaks."
+  [node ctx]
+  (let [{:keys [self vars body inits]} (ir/loop-parts node)
+        r (emit-all inits ctx)
+        lbl (label "L")
+        jsvars (vec (map local-name vars))
+        o (if (= :return (first (:dest ctx)))
+            {:pre (list) :dest [:return] :val nil :close (list)}
+            (let [res (tmp)] {:pre (list (str "let " res ";")) :dest [:loop res lbl] :val res :close (list)}))
+        lctx (assoc ctx :loop {:self self :vars jsvars :label lbl} :dest (:dest o))
+        b (emit body lctx)
+        deliver-out (if (or (nil? (:dest ctx)) (= :return (first (:dest ctx)))) nil (:dest ctx))]
+    {:lines (concat (:lines r)
+                    (map (fn [i] (str "let " (nth jsvars i) " = " (nth (:vals r) i) ";")) (range (count jsvars)))
+                    (:pre o)
+                    (list (str lbl ": for (;;) {"))
+                    (:lines b)
+                    (list "}")
+                    (if (some? deliver-out) (:lines (finish {:lines (list) :val (:val o)} ctx)) (list)))
+     :val (if (some? deliver-out) nil (:val o))}))
+
+(defn- emit-recur [node ctx]
+  (let [lp (:loop ctx)]
+    (when (nil? lp) (throw (ex-info "js.emit: recur outside a loop" {:node node})))
+    (let [r (emit-all (ir/recur-vals node) ctx)
+          ts (map (fn [_] (tmp)) (:vars lp))]
+      {:lines (concat (:lines r)
+                      (map (fn [t v] (str "const " t " = " v ";")) ts (:vals r))
+                      (map (fn [var t] (str var " = " t ";")) (:vars lp) ts)
+                      (list (str "continue " (:label lp) ";")))
+       :val nil})))
+
+; ─── control ────────────────────────────────────────────────────────────────
+
+(defn- emit-let [node ctx]
+  (if (ir/self-scaffold? node)
+    (finish (fn-value node ctx) ctx)
+    (let [init (emit (:init node) (expr-ctx ctx))
+          body (emit (:body node) ctx)]
+      {:lines (concat (:lines init) (list (str "const " (local-name (:name node)) " = " (:val init) ";")) (:lines body))
+       :val (:val body)})))
+
+(defn- emit-if [node ctx]
+  (let [t (emit (:test node) (expr-ctx ctx))]
+    (if (nil? (:dest ctx))
+      ; value position: a ternary when both arms are pure expressions
+      (let [th (emit (:then node) ctx) el (emit (:else node) ctx)]
+        (if (and (empty? (:lines th)) (empty? (:lines el)))
+          {:lines (:lines t) :val (str "(R.truthy(" (:val t) ") ? " (:val th) " : " (:val el) ")")}
+          (let [o (open-dest ctx)
+                c2 (to ctx (:dest o))
+                th (emit (:then node) c2) el (emit (:else node) c2)]
+            {:lines (concat (:lines t) (:pre o)
+                            (list (str "if (R.truthy(" (:val t) ")) {")) (:lines th) (list "} else {") (:lines el) (list "}")
+                            (:close o))
+             :val (:val o)})))
+      (let [th (emit (:then node) ctx) el (emit (:else node) ctx)]
+        {:lines (concat (:lines t)
+                        (list (str "if (R.truthy(" (:val t) ")) {")) (:lines th) (list "} else {") (:lines el) (list "}"))
+         :val nil}))))
+
+(defn- emit-do [node ctx]
+  (let [stmts (:stmts node) n (count stmts)
+        pre (reduce (fn [acc s]
+                      (let [r (emit s (expr-ctx ctx))]
+                        (concat acc (:lines r) (if (or (nil? (:val r)) (simple-val? (:val r))) (list) (list (str (:val r) ";"))))))
+                    (list) (take (dec n) stmts))
+        last-r (emit (last stmts) ctx)]
+    {:lines (concat pre (:lines last-r)) :val (:val last-r)}))
+
+(defn- emit-case [node ctx]
+  (let [s (emit (:subj node) (expr-ctx ctx))
+        sv (tmp)
+        o (open-dest ctx)
+        arms (mapcat (fn [cl] (clause-lines cl [sv] (to ctx (:dest o)))) (:clauses node))]
+    {:lines (concat (:lines s) (list (str "const " sv " = " (:val s) ";"))
+                    (:pre o)
+                    arms
+                    (list (str "throw new R.BLError(\"no case clause matched \" + R.printStr(" sv "));"))
+                    (:close o))
+     :val (:val o)}))
+
+(defn- emit-try
+  "A JS try/catch/finally. The protected body and the catch arms deliver to a
+   result variable (never `return` from inside `try`: a `finally` must still
+   run, and JS would run it — but a uniform shape keeps the emitter simple);
+   the try's value then goes to the destination."
+  [node ctx]
+  (let [res (tmp)
+        done (label "T")
+        dest [:assign res done]
+        b (emit (:body node) (to ctx dest))
+        catches (:catch node)
+        cv (tmp)
+        arms (mapcat (fn [c] (clause-lines c ["C.K_error" cv] (to ctx dest))) catches)
+        af (if (nil? (:after node)) nil (emit (:after node) (expr-ctx ctx)))]
+    (finish
+      {:lines (concat (list (str "let " res ";") "try {" (str done ": {"))
+                      (:lines b)
+                      (list "}")
+                      (if (empty? catches) (list)
+                        (concat (list (str "} catch (" cv ") {")
+                                      (str "const " (local-name "__STACKTRACE__") " = null;")
+                                      (str "const " (local-name "__STACKTRACE_RAW__") " = null;")
+                                      (str done ": {"))
+                                arms
+                                (list (str "throw " cv ";") "}")))
+                      (if (nil? af) (list) (concat (list "} finally {") (:lines af)
+                                                   (if (or (nil? (:val af)) (simple-val? (:val af))) (list) (list (str (:val af) ";")))))
+                      (list "}"))
+       :val res}
+      ctx)))
+
+(defn- emit-coll [node ctx]
+  (let [op (:op node)]
+    (cond
+      (= op :tuple)
+        (if (blfn-tuple? node) (emit-blfn node ctx)
+          (let [r (emit-all (:elems node) ctx)] (finish {:lines (:lines r) :val (str "R.tup([" (join ", " (:vals r)) "])")} ctx)))
+      (= op :map)
+        (call-js "R.hashMap" (emit-all (mapcat (fn [p] [(first p) (second p)]) (:pairs node)) ctx) ctx)
+      (= op :cons)
+        (let [items (ir/cons-args node)
+              tail (loop [n node] (if (= :cons (:op n)) (recur (:tail n)) n))]
+          (if (= :enil (:op tail))
+            (call-js "R.list" (emit-all items ctx) ctx)
+            (call-js "R.cons" (emit-all (list (:head node) (:tail node)) ctx) ctx)))
+      (= op :enil) (finish {:lines (list) :val "R.EMPTY"} ctx)
+      (= op :struct)
+        (if (= :Elixir.BeamLisp.Vector (:mod node))
+          (call-js "R.vec" (emit-all (:elems (second (first (:fields node)))) ctx) ctx)
+          (throw (ex-info (str "js.emit: struct " (:mod node) " is not in the sync profile") {:node node}))))))
+
+; ─── the dispatcher ─────────────────────────────────────────────────────────
+
+(defn emit
+  "Emit one bl-ANF node toward `(:dest ctx)`. {:lines [js-stmt…] :val expr|nil};
+   :val is nil exactly when the value was delivered to a destination."
+  [node ctx]
+  (let [op (:op node)]
+    (cond
+      (= op :lit) (finish {:lines (list) :val (lit-js (:val node))} ctx)
+      (= op :var)
+        (finish {:lines (list) :val (let [selves (or (:selves ctx) {})]
+                                      (if (contains? selves (:name node)) (get selves (:name node)) (local-name (:name node))))}
+                ctx)
+      (= op :global) (finish {:lines (list) :val (global-js node ctx nil)} ctx)
+      (= op :remote) (emit-remote node ctx)
+      (= op :arith) (emit-arith node ctx)
+      (ir/anf-loop? node) (emit-loop node ctx)
+      (and (= op :apply) (some? (:loop ctx)) (ir/recur? node (:self (:loop ctx)))) (emit-recur node ctx)
+      (= op :apply) (emit-apply node ctx)
+      (= op :let) (emit-let node ctx)
+      (= op :if) (emit-if node ctx)
+      (= op :do) (emit-do node ctx)
+      (= op :case) (emit-case node ctx)
+      (= op :fn) (finish (fn-value node ctx) ctx)
+      (= op :try) (emit-try node ctx)
+      (= op :recv) (throw (ex-info (str "js.emit: " (:ns ctx) ": `receive` is not in the sync JS profile (no processes)") {:node node}))
+      (contains? #{:tuple :map :cons :enil :struct} op) (emit-coll node ctx)
+      :else (throw (ex-info (str "js.emit: unknown ANF op " op) {:node node})))))
