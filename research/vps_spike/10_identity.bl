@@ -1,0 +1,122 @@
+; 10_identity.bl — one capability, end to end: mint → attenuate → authorize
+;                  → RLS → audit → revoke.
+; Run: ./blx run research/vps_spike/10_identity.bl
+;
+; Hints at: devops.md §identity/secrets, fleet.md §blast radius, the whole
+;           "capped everything, one token" security spine.
+;
+; The design rests on ONE capability story, and this spike walks all of it on
+; the REAL auth stack (Ed25519 Biscuit tokens, offline verification, datalog
+; checks, row-level security, audit-as-datoms, revocation):
+;
+;   issue      a root mints a token carrying FACTS (who, what rights)
+;   attenuate  the bearer narrows it — append-only, can only RESTRICT
+;   authorize  a pure decision: does this token satisfy this request's check?
+;   caps-for   an :allow yields the exact modules an env fork may call
+;   RLS        the token's principal scopes which ROWS a query can even see
+;   audit      every verdict is a datom — the trail is queryable
+;   revoke     add the token's id to an oracle → it fails closed, forever
+;
+; The blast-radius arithmetic the docs claim becomes concrete: a leaked,
+; attenuated token can do exactly one thing, and everything it did is a fact.
+
+(ns vps.identity (:require [auth] [datom]))
+
+;; ── a root authority, and a token for alice ─────────────────────────────────
+(def root (auth/keypair))
+(def rootpub (auth/public root))
+
+;; alice: may deploy "web", and (as a capped env) may call String only
+(def alice-tok
+  (auth/issue root [["user" "alice"]
+                    ["right" "deploy" "web"]
+                    ["right" "Elixir.String" "all"]]))
+
+(println "── issue ──")
+(println "  verifies offline under root pubkey:" (auth/verify rootpub alice-tok))
+(println "  principal:" (auth/principal rootpub alice-tok))
+
+;; ── the request check: the operation must join a granted right ──────────────
+(def right-check
+  {:kind 0
+   :queries [{:head {:name "q" :terms []}
+              :body [{:name "operation" :terms [{:var 1} {:var 2}]}
+                     {:name "right"     :terms [{:var 1} {:var 2}]}]
+              :exprs [] :symbols []}]})
+
+(defn decide [tok op res]
+  (:verdict (auth/authorize rootpub tok
+              (auth/context {:facts [["operation" op res]]
+                             :checks [right-check]
+                             :policies [(auth/allow [])]}))))
+
+(println "── authorize (a pure decision) ──")
+(def d-web (decide alice-tok "deploy" "web"))     ; granted
+(def d-api (decide alice-tok "deploy" "api"))     ; never granted
+(println "  deploy web:" d-web "   deploy api:" d-api)
+
+;; ── attenuate: hand a deploy-bot a token that can ONLY deploy web ───────────
+;; append-only narrowing: a check that pins the operation to "web"
+(def only-web-check
+  {:kind 0
+   :queries [{:head {:name "q" :terms []}
+              :body [{:name "operation" :terms [{:var 1} "web"]}]
+              :exprs [] :symbols []}]})
+(def bot-tok (auth/attenuate alice-tok {:facts [["agent" "deploy-bot"]]
+                                        :checks [only-web-check]}))
+(println "── attenuate (only narrows) ──")
+(def b-web (decide bot-tok "deploy" "web"))       ; still ok
+(def b-api (decide bot-tok "deploy" "api"))       ; now doubly denied
+(println "  bot deploy web:" b-web "   bot deploy api:" b-api)
+
+;; ── caps-for: an :allow becomes the env's capability set ────────────────────
+(def caps (auth/caps-for rootpub alice-tok (auth/context {:policies [(auth/allow [])]})))
+(println "── caps-for (token → env caps) ──")
+(println "  granted modules:" (pr-str (:ok caps)))
+
+;; ── RLS: the principal scopes which rows the query can see ──────────────────
+(def conn (datom/connect [{:db/ident :svc/name :db/valueType :db.type/string}
+                          {:db/ident :svc/owner :db/valueType :db.type/string}]))
+(datom/transact! conn [{:db/id -1 :svc/name "web"  :svc/owner "alice"}
+                       {:db/id -2 :svc/name "api"  :svc/owner "alice"}
+                       {:db/id -3 :svc/name "billing" :svc/owner "bob"}])
+(def all-svcs '[:find ?n :where [?s :svc/name ?n]])
+(def alice-view (auth/guard all-svcs [(auth/owner-filter '?s :svc/owner "alice")]))
+(def bob-view   (auth/guard all-svcs [(auth/owner-filter '?s :svc/owner "bob")]))
+(println "── RLS (one query, scoped per principal) ──")
+(println "  raw sees:  " (pr-str (datom/q all-svcs (datom/db conn))))
+(println "  alice sees:" (pr-str (datom/q alice-view (datom/db conn))))
+(println "  bob sees:  " (pr-str (datom/q bob-view (datom/db conn))))
+
+;; ── audit: every verdict is a datom ─────────────────────────────────────────
+(def audit (auth/audit-conn))
+(auth/record! audit alice-tok
+  (auth/authorize rootpub alice-tok
+    (auth/context {:facts [["operation" "deploy" "web"]] :checks [right-check]
+                   :policies [(auth/allow [])]})) {})
+(def audit-rows (datom/q '[:find ?tok :where [?e :audit/token ?tok]] (datom/db audit)))
+(println "── audit (verdicts are facts) ──")
+(println "  audit records:" (count audit-rows))
+
+;; ── revoke: the token fails closed, forever ─────────────────────────────────
+(def oracle (auth/revocation-set (auth/revocation-ids alice-tok)))
+(def d-revoked (:verdict (auth/authorize rootpub alice-tok
+                 (auth/context {:facts [["operation" "deploy" "web"]]
+                                :checks [right-check]
+                                :policies [(auth/allow [])] :revocation oracle}))))
+(println "── revoke ──")
+(println "  same request, now revoked:" d-revoked)
+
+;; ── assertions ──────────────────────────────────────────────────────────────
+(def ok (and (auth/verify rootpub alice-tok)
+             (= "alice" (auth/principal rootpub alice-tok))
+             (= :allow d-web) (= :deny d-api)      ; authorize joins rights
+             (= :allow b-web) (= :deny b-api)      ; attenuation preserved allow, kept deny
+             (= 1 (count (:ok caps)))              ; caps map to env modules (a {Module op} tuple)
+             (= :all (erlang/element 2 (first (:ok caps))))
+             (= #{["web"] ["api"]} (set (datom/q alice-view (datom/db conn))))
+             (= #{["billing"]} (set (datom/q bob-view (datom/db conn))))
+             (>= (count audit-rows) 1)             ; the verdict is a fact
+             (= :deny d-revoked)))                 ; revocation fails closed
+(println "")
+(println (str (if ok "PASS" "FAIL") " 10_identity  (one token: mint→attenuate→authz→RLS→audit→revoke)"))
