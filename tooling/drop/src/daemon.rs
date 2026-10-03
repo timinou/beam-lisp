@@ -276,38 +276,46 @@ pub fn tree_fingerprint(root: &Path) -> Vec<u8> {
     sha256_bytes(canonical.to_string_lossy().as_bytes())
 }
 
-// ── endpoint identity: one VM per user and build (drop), per checkout (src) ──
+// ── endpoint identity: one VM per tree, or a shared VM per user and build ────
 
-/// The endpoint key shared by every drop build. A drop's code is immutable, so
-/// ONE VM per user and build serves every project: the key is a constant, not
-/// the tree. A source build runs the checkout's own (mutable) code and stays
-/// one VM per checkout.
+/// The endpoint key the shared VM of a build is named by. A shared VM serves
+/// every project that declares `:vm "shared"` (or passes `--shared`), so its key
+/// is a constant, not a tree.
 pub const SHARED_KEY: &str = "warm";
 
 /// The build id of a source run: the checkout's own code, keyed by its tree.
 pub const SRC_BUILD: &str = "src";
 
-/// The key a daemon's files are named by: the tree id for a source build (one
-/// VM per checkout), `warm` for every other build (one VM per user and build,
-/// shared by every project). Every endpoint file is `<key>-<build>.<ext>`.
-/// Must match `vm.paths/endpoints` byte for byte.
-pub fn endpoint_key(root: &Path, build: &str) -> String {
-    if build == SRC_BUILD {
-        tree_id(root)
-    } else {
+/// Whether `build` answers on the shared endpoint for a `shared` request: a
+/// source checkout runs its OWN sources and never shares, so it is always keyed
+/// by its tree. Mirrors `vm.paths/served-shared?`.
+fn served_shared(build: &str, shared: bool) -> bool {
+    shared && build != SRC_BUILD
+}
+
+/// The key a daemon's files are named by: `warm` when the request is shared and
+/// the build is not a source checkout, else the tree id. Sharing is OPT-IN (a
+/// project's `:vm "shared"`, or `--shared`), never the build's default: two
+/// projects that define a namespace of the same name must not meet in one node.
+/// Every endpoint file is `<key>-<build>.<ext>`. Must match
+/// `vm.paths/endpoint-key` byte for byte.
+pub fn endpoint_key(root: &Path, build: &str, shared: bool) -> String {
+    if served_shared(build, shared) {
         SHARED_KEY.to_string()
+    } else {
+        tree_id(root)
     }
 }
 
 /// The 32-byte hello `:tree` field for `root` run by `build`: the checkout's
-/// fingerprint for a source build (the VM serves only that tree), the shared
-/// constant otherwise (the VM serves every project). Must match the release's
+/// fingerprint when the VM is per-tree (including every source build), the
+/// shared constant when it serves every shared project. Must match the release's
 /// own `vm.paths`/daemon hello.
-pub fn hello_fingerprint(root: &Path, build: &str) -> Vec<u8> {
-    if build == SRC_BUILD {
-        tree_fingerprint(root)
-    } else {
+pub fn hello_fingerprint(root: &Path, build: &str, shared: bool) -> Vec<u8> {
+    if served_shared(build, shared) {
         sha256_bytes(SHARED_KEY.as_bytes())
+    } else {
+        tree_fingerprint(root)
     }
 }
 
@@ -340,8 +348,8 @@ fn state_dir() -> Option<PathBuf> {
 /// The log for `root`'s VM built by `build`:
 /// `<state>/beam-lisp/logs/<endpoint-key>-<build>.log`, the same key and build
 /// `endpoints_for` names the socket with.
-pub fn log_path(root: &Path, build: &str) -> Option<PathBuf> {
-    Some(log_path_in(&state_dir()?, &endpoint_key(root, build), build))
+pub fn log_path(root: &Path, build: &str, shared: bool) -> Option<PathBuf> {
+    Some(log_path_in(&state_dir()?, &endpoint_key(root, build, shared), build))
 }
 
 /// The pure half of `log_path`: one path from its parts, with no environment
@@ -428,30 +436,30 @@ fn legacy_endpoints(root: &Path) -> Option<Endpoints> {
 }
 
 /// The endpoints of the daemon for `root` run by THIS build:
-/// `<endpoint-key>-<build>.sock`, where a drop build shares `warm` across
-/// projects and a source build is keyed by its checkout. Must match
-/// `vm.paths/endpoints` byte for byte.
+/// `<endpoint-key>-<build>.sock`, where a shared project reaches the build's
+/// `warm` VM and an own project (or any source build) is keyed by its tree.
+/// Must match `vm.paths/endpoints` byte for byte.
 ///
 /// A payload built before daemons were named by build binds `<tree-id>.sock`,
 /// and the launcher running it leaves `BL_BUILD_ID` unset (`names_its_build`),
 /// so it looks there instead.
-pub fn endpoints(root: &Path) -> Option<Endpoints> {
+pub fn endpoints(root: &Path, shared: bool) -> Option<Endpoints> {
     match std::env::var("BL_BUILD_ID") {
-        Ok(_) => endpoints_for(root, &build_id()),
+        Ok(_) => endpoints_for(root, &build_id(), shared),
         Err(_) => legacy_endpoints(root),
     }
 }
 
 /// The endpoints for `root` run by `build`, under the user's runtime dir.
-pub fn endpoints_for(root: &Path, build: &str) -> Option<Endpoints> {
-    Some(endpoints_in(&runtime_dir()?, root, build))
+pub fn endpoints_for(root: &Path, build: &str, shared: bool) -> Option<Endpoints> {
+    Some(endpoints_in(&runtime_dir()?, root, build, shared))
 }
 
 /// The pure endpoint set for `root`/`build` under `dir`: every file is
 /// `<endpoint-key>-<build>.<ext>`. No environment read, so it tests without
 /// touching the process.
-pub fn endpoints_in(dir: &Path, root: &Path, build: &str) -> Endpoints {
-    let base = format!("{}-{build}", endpoint_key(root, build));
+pub fn endpoints_in(dir: &Path, root: &Path, build: &str, shared: bool) -> Endpoints {
+    let base = format!("{}-{build}", endpoint_key(root, build, shared));
     Endpoints {
         sock: dir.join(format!("{base}.sock")),
         token: dir.join(format!("{base}.token")),
@@ -566,24 +574,24 @@ fn write_log_header(file: &mut std::fs::File, root: &Path) {
     let _ = writeln!(file, "--- {} bl vm start ({}) ---", now_secs(), root.display());
 }
 
-/// Spawn the release's `realm start --foreground --root <root> --log <log>`
-/// fully detached, so the VM outlives this launcher. stdout and stderr both land
-/// in the SAME log file, so a VM that fails to boot leaves a trace instead of
-/// silence in /dev/null; the log is opened here and its path handed to the VM so
-/// `bl vm logs` reads the very file this launcher's child writes. When no log can
-/// be opened the streams fall back to null — logging must never stop a start.
-/// Returns the log path when one was opened.
+/// Spawn the release's `realm start --foreground [--root <root>|--shared] --log
+/// <log>` fully detached, so the VM outlives this launcher. stdout and stderr
+/// both land in the SAME log file, so a VM that fails to boot leaves a trace
+/// instead of silence in /dev/null; the log is opened here and its path handed to
+/// the VM so `bl vm logs` reads the very file this launcher's child writes. When
+/// no log can be opened the streams fall back to null — logging must never stop
+/// a start. Returns the log path when one was opened.
 #[cfg(unix)]
-fn start_daemon_detached(bin: &Path, root: &Path, build: &str) -> Option<PathBuf> {
+fn start_daemon_detached(bin: &Path, root: &Path, build: &str, shared: bool) -> Option<PathBuf> {
     use std::process::Stdio;
-    let log = log_path(root, build);
+    let log = log_path(root, build, shared);
     let mut file = log.as_deref().and_then(open_log);
     if let Some(f) = file.as_mut() {
         write_log_header(f, root);
     }
     let log_arg = log.clone().unwrap_or_else(|| PathBuf::from(NULL_LOG));
     let mut cmd = release_command(bin);
-    cmd.args(warm_start_argv(root, &log_arg)).stdin(Stdio::null());
+    cmd.args(warm_start_argv(root, shared, &log_arg)).stdin(Stdio::null());
     // The SAME file feeds stdout and stderr. If it cannot be duplicated it is
     // unusable, so both streams fall back to null together — the one fallback
     // path documented above.
@@ -646,15 +654,13 @@ fn is_tree_root(dir: &Path) -> bool {
         || (dir.join(LAUNCHER_REL).exists() && dir.join("releases").is_dir())
 }
 
-/// The cwd the request frame carries, absolute. Normally the process cwd; an
-/// explicit `--root DIR` makes the command act as if it ran in DIR, so a shared
-/// (drop) VM resolves the realm from there. A source build keeps the process
-/// cwd: its `--root` chose the checkout whose code the VM runs, and the
-/// endpoint is that checkout's tree.
-pub fn request_cwd(cwd: &Path, argv: &[String], build: &str) -> PathBuf {
-    if build == SRC_BUILD {
-        return cwd.to_path_buf();
-    }
+/// The cwd the request frame carries, absolute: the process cwd, unless an
+/// explicit `--root DIR` says to act as if the command ran in DIR. That holds in
+/// EVERY mode — a shared VM resolves the realm from this cwd, and an own VM
+/// serves DIR's tree — so the frame never disagrees with what the user asked
+/// for. DIR is canonicalized; if it cannot be, it is passed as written (the
+/// release reports a bad path).
+pub fn request_cwd(cwd: &Path, argv: &[String]) -> PathBuf {
     match root_override(argv) {
         Some(dir) => std::fs::canonicalize(&dir).unwrap_or(dir),
         None => cwd.to_path_buf(),
@@ -700,10 +706,10 @@ fn hello_build() -> String {
 }
 
 #[cfg(unix)]
-fn hello(root: &Path, build: &str) -> Hello {
+fn hello(root: &Path, build: &str, shared: bool) -> Hello {
     // A build-named daemon is found under its endpoint key; a payload that
     // predates build-named daemons binds and looks for the old `<tree>.sock`.
-    let ep = if build.is_empty() { legacy_endpoints(root) } else { endpoints_for(root, build) };
+    let ep = if build.is_empty() { legacy_endpoints(root) } else { endpoints_for(root, build, shared) };
     let ep = match ep {
         Some(e) => e,
         None => return Hello::No,
@@ -725,7 +731,7 @@ fn hello(root: &Path, build: &str) -> Hello {
 
     // The legacy payload predates shared VMs and still keys its hello on the
     // tree fingerprint; every current build uses the endpoint-key fingerprint.
-    let fp = if build.is_empty() { tree_fingerprint(root) } else { hello_fingerprint(root, build) };
+    let fp = if build.is_empty() { tree_fingerprint(root) } else { hello_fingerprint(root, build, shared) };
     if send_frame(&mut stream, &encode_hello(&fp, &token, build)).is_err() {
         return Hello::No;
     }
@@ -748,13 +754,13 @@ fn hello(root: &Path, build: &str) -> Hello {
 /// loop inside a caller that is about to print its OWN command's output, and
 /// probing with a real command wrote that command's output into the caller.
 #[cfg(unix)]
-pub fn daemon_ready(root: &Path) -> bool {
-    matches!(hello(root, &hello_build()), Hello::Ready(_))
+pub fn daemon_ready(root: &Path, shared: bool) -> bool {
+    matches!(hello(root, &hello_build(), shared), Hello::Ready(_))
 }
 
 #[cfg(unix)]
-pub fn try_attach(root: &Path, argv: &[String]) -> Attach {
-    let mut stream = match hello(root, &hello_build()) {
+pub fn try_attach(root: &Path, argv: &[String], shared: bool) -> Attach {
+    let mut stream = match hello(root, &hello_build(), shared) {
         Hello::Ready(s) => s,
         Hello::RestartRequired => return Attach::RestartRequired,
         Hello::No => return Attach::Fallback,
@@ -763,10 +769,10 @@ pub fn try_attach(root: &Path, argv: &[String]) -> Attach {
 
     // request — from here, NEVER fall back (side effects may happen).
     let here = std::env::current_dir().unwrap_or_else(|_| root.to_path_buf());
-    // A shared (drop) VM resolves the realm from the frame cwd, so `--root DIR`
-    // makes the command act as if it ran in DIR; a source build keeps the
-    // process cwd because its `--root` already chose the checkout above.
-    let cwd = request_cwd(&here, argv, &hello_build());
+    // The request carries the cwd the command should act in: the process cwd,
+    // or `--root DIR`'s realpath. An own VM serves DIR's tree; a shared VM
+    // resolves the realm from it — one rule for both modes.
+    let cwd = request_cwd(&here, argv);
     let env_paths = collect_env_paths();
     // THE CALLER'S ENVIRONMENT, on the wire. A daemon runs a request in its OWN
     // environment (D17: `FOO=bar bl eval '(System/get_env "FOO")'` answered nil
@@ -791,7 +797,7 @@ pub fn try_attach(root: &Path, argv: &[String]) -> Attach {
 }
 
 #[cfg(not(unix))]
-pub fn try_attach(_root: &Path, _argv: &[String]) -> Attach {
+pub fn try_attach(_root: &Path, _argv: &[String], _shared: bool) -> Attach {
     Attach::Fallback
 }
 
@@ -1216,64 +1222,88 @@ mod tests {
         assert!(pairs.iter().all(|(k, _)| k.as_atom() != Some("build")));
     }
 
-    /// A drop build's endpoint is shared by every project: the file name is
-    /// `warm-<build>`, independent of the tree. Golden `warm-a238fa91.sock`, so
-    /// the bl side (`vm.paths/endpoints`) can pin the exact string.
+    /// Sharing is OPT-IN: an own drop build is keyed by its tree like any other
+    /// per-tree VM, so two roots are two files — golden
+    /// `<tree-id>-a238fa91.sock`.
     #[test]
-    fn a_drop_build_endpoint_is_shared_across_roots() {
+    fn an_own_drop_build_endpoint_is_per_tree() {
         let rt = Path::new("/run/beam_lisp");
-        let a = endpoints_in(rt, Path::new("/tmp/proj"), "a238fa91");
-        let b = endpoints_in(rt, Path::new("/some/other/project"), "a238fa91");
+        let a = endpoints_in(rt, Path::new("/tmp/proj"), "a238fa91", false);
+        let b = endpoints_in(rt, Path::new("/some/other/project"), "a238fa91", false);
+        let tree = tree_id(Path::new("/tmp/proj"));
+        assert!(a.sock.to_string_lossy().ends_with(&format!("/{tree}-a238fa91.sock")));
+        assert!(a.token.to_string_lossy().ends_with(&format!("/{tree}-a238fa91.token")));
+        assert!(a.starting.to_string_lossy().ends_with(&format!("/{tree}-a238fa91.starting")));
+        assert_ne!(a.sock, b.sock, "two roots are two endpoints");
+        assert_ne!(a.token, b.token);
+        assert_ne!(a.starting, b.starting);
+    }
+
+    /// A DECLARED shared drop build is one endpoint for every project: golden
+    /// `warm-a238fa91.sock`, identical for two roots. The bl side
+    /// (`vm.paths/endpoints`) pins the same string.
+    #[test]
+    fn a_shared_drop_build_endpoint_is_shared_across_roots() {
+        let rt = Path::new("/run/beam_lisp");
+        let a = endpoints_in(rt, Path::new("/tmp/proj"), "a238fa91", true);
+        let b = endpoints_in(rt, Path::new("/some/other/project"), "a238fa91", true);
         assert!(a.sock.to_string_lossy().ends_with("/warm-a238fa91.sock"));
         assert!(a.token.to_string_lossy().ends_with("/warm-a238fa91.token"));
         assert!(a.starting.to_string_lossy().ends_with("/warm-a238fa91.starting"));
-        assert_eq!(a.sock, b.sock, "one build, every project: the same endpoint");
+        assert_eq!(a.sock, b.sock, "one shared build, every project: the same endpoint");
         assert_eq!(a.token, b.token);
         assert_eq!(a.starting, b.starting);
     }
 
-    /// Two builds are two daemons even when they share the `warm` key, so the
-    /// build is still part of the name.
+    /// Two builds are two daemons even when both are shared, so the build is
+    /// still part of the name.
     #[test]
-    fn two_drop_builds_are_two_endpoints() {
+    fn two_shared_drop_builds_are_two_endpoints() {
         let rt = Path::new("/run/beam_lisp");
-        let a = endpoints_in(rt, Path::new("/tmp/proj"), "a238fa91");
-        let b = endpoints_in(rt, Path::new("/tmp/proj"), "5e0dd11f");
+        let a = endpoints_in(rt, Path::new("/tmp/proj"), "a238fa91", true);
+        let b = endpoints_in(rt, Path::new("/tmp/proj"), "5e0dd11f", true);
         assert_ne!(a.sock, b.sock);
         assert_ne!(a.token, b.token);
         assert_ne!(a.starting, b.starting);
     }
 
     /// A source build runs a checkout's own code, so it stays keyed by the tree
-    /// id: one endpoint per checkout, golden `<tree-id>-src.sock`.
+    /// id even when asked to share: one endpoint per checkout, golden
+    /// `<tree-id>-src.sock`.
     #[test]
-    fn a_source_build_endpoint_carries_the_tree() {
+    fn a_source_build_endpoint_carries_the_tree_even_shared() {
         let rt = Path::new("/run/beam_lisp");
         let root = Path::new("/tmp/proj");
         let tree = tree_id(root);
-        let a = endpoints_in(rt, root, SRC_BUILD);
-        assert!(a.sock.to_string_lossy().ends_with(&format!("/{tree}-src.sock")));
-        assert!(a.token.to_string_lossy().ends_with(&format!("/{tree}-src.token")));
-        assert!(a.starting.to_string_lossy().ends_with(&format!("/{tree}-src.starting")));
+        for shared in [false, true] {
+            let a = endpoints_in(rt, root, SRC_BUILD, shared);
+            assert!(a.sock.to_string_lossy().ends_with(&format!("/{tree}-src.sock")));
+            assert!(a.token.to_string_lossy().ends_with(&format!("/{tree}-src.token")));
+            assert!(a.starting.to_string_lossy().ends_with(&format!("/{tree}-src.starting")));
+        }
     }
 
-    /// The hello `:tree` field: the shared constant for a drop build (the VM
-    /// serves every project), the checkout's fingerprint for a source build.
+    /// The hello `:tree` field follows the same split: an own VM checks its
+    /// checkout, a shared one checks the constant, and a source build checks its
+    /// checkout even when shared.
     #[test]
-    fn the_hello_fingerprint_is_shared_except_for_source_builds() {
-        let a = hello_fingerprint(Path::new("/tmp/proj"), "a238fa91");
-        let b = hello_fingerprint(Path::new("/another/tree"), "a238fa91");
-        assert_eq!(a, b, "one drop build serves every project");
-        assert_eq!(a, sha256_bytes(SHARED_KEY.as_bytes()));
+    fn the_hello_fingerprint_is_shared_only_for_a_shared_drop_build() {
+        let a = hello_fingerprint(Path::new("/tmp/proj"), "a238fa91", false);
+        let b = hello_fingerprint(Path::new("/another/tree"), "a238fa91", false);
+        assert_ne!(a, b, "an own build is keyed by its tree");
+        assert_eq!(a, tree_fingerprint(Path::new("/tmp/proj")));
 
-        let c = hello_fingerprint(Path::new("/tmp/proj"), SRC_BUILD);
-        let d = hello_fingerprint(Path::new("/another/tree"), SRC_BUILD);
-        assert_ne!(c, d, "a source build is keyed by its checkout");
-        assert_eq!(c, tree_fingerprint(Path::new("/tmp/proj")));
+        let c = hello_fingerprint(Path::new("/tmp/proj"), "a238fa91", true);
+        let d = hello_fingerprint(Path::new("/another/tree"), "a238fa91", true);
+        assert_eq!(c, d, "one shared build serves every project");
+        assert_eq!(c, sha256_bytes(SHARED_KEY.as_bytes()));
+
+        let e = hello_fingerprint(Path::new("/tmp/proj"), SRC_BUILD, true);
+        assert_eq!(e, tree_fingerprint(Path::new("/tmp/proj")), "a source build never shares");
     }
 
     /// A VM log's path is built from its parts alone — no environment read. A
-    /// drop build's log is shared like its socket: golden `warm-a238fa91.log`.
+    /// shared build's log is shared like its socket: golden `warm-a238fa91.log`.
     #[test]
     fn a_log_path_names_the_key_the_build_and_the_state_root() {
         assert_eq!(
@@ -1462,11 +1492,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    /// `--root DIR` sets the request cwd to DIR's realpath for a shared build,
-    /// so its VM resolves the realm there; a source build keeps the process cwd
-    /// (its `--root` chose the checkout whose code it runs).
+    /// `--root DIR` sets the request cwd to DIR's realpath in EVERY mode; no
+    /// override keeps the process cwd, and a valueless `--root` is not one.
     #[test]
-    fn root_override_sets_the_request_cwd_for_shared_builds() {
+    fn root_override_sets_the_request_cwd_in_every_mode() {
         let d = std::env::temp_dir().join(format!("drop-request-cwd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
@@ -1475,10 +1504,9 @@ mod tests {
         let a = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
 
         let with_root = a(&["--root", &dir.to_string_lossy(), "run"]);
-        assert_eq!(request_cwd(here, &with_root, "a238fa91"), dir, "a shared build acts in DIR");
-        assert_eq!(request_cwd(here, &with_root, SRC_BUILD), here, "a source build keeps the process cwd");
-        assert_eq!(request_cwd(here, &a(&["run"]), "a238fa91"), here, "no override, process cwd");
-        assert_eq!(request_cwd(here, &a(&["--root"]), "a238fa91"), here, "no value, no override");
+        assert_eq!(request_cwd(here, &with_root), dir, "an override acts in DIR");
+        assert_eq!(request_cwd(here, &a(&["run"])), here, "no override, process cwd");
+        assert_eq!(request_cwd(here, &a(&["--root"])), here, "no value, no override");
 
         let _ = std::fs::remove_dir_all(&d);
     }

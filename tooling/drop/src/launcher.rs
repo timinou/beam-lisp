@@ -490,11 +490,11 @@ fn after_attach(a: Attach) -> Option<i32> {
     }
 }
 
-fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path, t: Transport) -> Option<i32> {
+fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path, t: Transport, shared: bool) -> Option<i32> {
     let cwd = std::env::current_dir().ok()?;
     let root = tree_root(&cwd, argv)?;
 
-    match try_attach(&root, argv) {
+    match try_attach(&root, argv, shared) {
         Attach::Exit(code) => Some(code),
         a @ (Attach::LostAfterSend | Attach::Stalled(_)) => after_attach(a),
         Attach::RestartRequired => {
@@ -506,9 +506,9 @@ fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path, t: Transport) -> 
                  stopping it and running this command cold"
             );
             stop_daemon(bin, &root);
-            retry_from_warm(bin, &root, argv, t)
+            retry_from_warm(bin, &root, argv, t, shared)
         }
-        Attach::Fallback => retry_from_warm(bin, &root, argv, t),
+        Attach::Fallback => retry_from_warm(bin, &root, argv, t, shared),
     }
 }
 
@@ -518,13 +518,13 @@ fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path, t: Transport) -> 
 /// fails costs it nothing. Only the first starter acts — `claim_start` keeps a
 /// second from spawning a duplicate VM for the same endpoint.
 #[cfg(unix)]
-fn retry_from_warm(bin: &std::path::Path, root: &std::path::Path, _argv: &[String], t: Transport) -> Option<i32> {
+fn retry_from_warm(bin: &std::path::Path, root: &std::path::Path, _argv: &[String], t: Transport, shared: bool) -> Option<i32> {
     if t != Transport::Start {
         return None;
     }
-    if let Some(ep) = endpoints(root) {
+    if let Some(ep) = endpoints(root, shared) {
         if claim_start(&ep.starting, now_secs(), START_GRACE_SECS) {
-            start_daemon_detached(bin, root, &build_id());
+            start_daemon_detached(bin, root, &build_id(), shared);
         }
     }
     None
@@ -549,10 +549,10 @@ fn release_command(bin: &std::path::Path) -> Command {
 
 /// Poll for an authenticated-reachable daemon, up to a startup deadline.
 #[cfg(unix)]
-fn wait_ready(root: &std::path::Path) -> bool {
+fn wait_ready(root: &std::path::Path, shared: bool) -> bool {
     for _ in 0..600 {
         // 600 * 200ms = 120s
-        if daemon_ready(root) {
+        if daemon_ready(root, shared) {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -769,6 +769,10 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
         let cwd = std::env::current_dir().ok();
         let root = cwd.as_deref().and_then(|c| tree_root(c, &argv));
         let t = root.as_deref().map(|r| transport(r, &argv)).unwrap_or(DEFAULT_TRANSPORT);
+        // Read <root>/env.bl ONCE: `--shared`/`--own` or the `:vm` declaration
+        // decides the endpoint for this whole invocation (the default is own).
+        let env_bl = root.as_deref().and_then(|r| std::fs::read_to_string(r.join(PROJECT_FILE)).ok());
+        let shared = shared_for(&argv, env_bl.as_deref());
         let is_lifecycle = verb_of(&argv).as_deref().is_some_and(|v| LIFECYCLE_VERBS.contains(&v));
         // `bl realm start` is a REQUEST for a warm VM, not a command to run
         // inside one. Exec'd, the release parks in the foreground and dies with
@@ -778,7 +782,7 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
         if t != Transport::Cold {
             if start_requested(&argv) {
                 if let Some(root) = root.as_deref() {
-                    if daemon_ready(root) {
+                    if daemon_ready(root, shared) {
                         println!("bl: a warm VM is already running for this tree");
                         std::process::exit(0);
                     }
@@ -788,14 +792,14 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
                     // marker too, so a start already in flight is WAITED for,
                     // not duplicated. This is the one caller that does wait:
                     // the user asked for a warm VM and is owed the outcome.
-                    let log = log_path(root, &build_id());
-                    let claimed = endpoints(root)
+                    let log = log_path(root, &build_id(), shared);
+                    let claimed = endpoints(root, shared)
                         .is_some_and(|e| claim_start(&e.starting, now_secs(), START_GRACE_SECS));
                     if claimed {
-                        start_daemon_detached(&bin, root, &build_id());
+                        start_daemon_detached(&bin, root, &build_id(), shared);
                     }
 
-                    if wait_ready(root) {
+                    if wait_ready(root, shared) {
                         println!("bl: warm VM started — commands for this tree are now warm");
                         std::process::exit(0);
                     }
@@ -812,7 +816,7 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
                 }
             }
             if !is_lifecycle {
-                if let Some(code) = maybe_attach_daemon(&argv, &bin, t) {
+                if let Some(code) = maybe_attach_daemon(&argv, &bin, t, shared) {
                     std::process::exit(code);
                 }
             }

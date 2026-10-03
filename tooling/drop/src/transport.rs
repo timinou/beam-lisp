@@ -9,6 +9,10 @@
 //
 // `Path`/`PathBuf` come from daemon.rs, included before this file.
 //
+// VM SHARING follows the same declared rule: `--shared`/`--own`, then the
+// tree's `:vm` declaration, then own. It chooses which VM answers for the
+// project (`daemon.rs::endpoint_key`), never whether one is started.
+//
 // `warm` is the declared spelling. The daemon that answers is the release's
 // long-lived VM (`bl realm start`); a cold path boots a fresh one per command.
 
@@ -66,6 +70,41 @@ pub const WARM_SPELLINGS: &[(&str, Transport)] = &[
     ("attach", Transport::Attach),
     ("start", Transport::Start),
 ];
+
+/// The declaration key for VM sharing: `:vm "…"` in `env.bl`, read by
+/// `scan_literal` — SCANNED, never evaluated.
+pub const VM_KEY: &str = "vm";
+
+/// The accepted `:vm` spellings and whether each asks for a SHARED VM. A value
+/// not in this table is ignored: prose must not become policy.
+pub const VM_SPELLINGS: &[(&str, bool)] = &[("own", false), ("shared", true)];
+
+/// Boolean flag; force a shared VM for this invocation.
+pub const SHARED_FLAG: &str = "--shared";
+/// Boolean flag; force this project's own VM. Beats `SHARED_FLAG`.
+pub const OWN_FLAG: &str = "--own";
+
+/// Whether the invocation asks for a SHARED VM: `--shared`/`--own` first, then
+/// `env_bl_text`'s `:vm` declaration, then the default (own). The flags are
+/// BOOLEAN (they take no value), and `--own` wins when both are given: an
+/// explicit request for isolation is the safe choice, and an extra flag must
+/// never silently share a VM. `--` ends the scan (`flag_present`).
+pub fn shared_for(argv: &[String], env_bl_text: Option<&str>) -> bool {
+    if flag_present(argv, OWN_FLAG) {
+        return false;
+    }
+    if flag_present(argv, SHARED_FLAG) {
+        return true;
+    }
+    env_bl_text
+        .and_then(|t| scan_literal(t, VM_KEY))
+        .and_then(|v| vm_spelling(&v))
+        .unwrap_or(false)
+}
+
+fn vm_spelling(v: &str) -> Option<bool> {
+    VM_SPELLINGS.iter().find(|(s, _)| *s == v).map(|(_, b)| *b)
+}
 
 /// Is `flag` present in `argv` before a literal `--`? Everything after `--`
 /// belongs to the program being run, not to `bl`.
@@ -163,14 +202,21 @@ pub fn start_requested(argv: &[String]) -> bool {
 /// never attach to a warm VM.
 pub const LIFECYCLE_VERBS: &[&str] = &["realm", "vm"];
 
-/// The release argv that starts a warm VM for `root` in the foreground, with
-/// its log at `log`. The log path is an ARGUMENT so the VM knows where to write
-/// and `bl vm logs` reads the very file the launcher's child writes.
-pub fn warm_start_argv(root: &Path, log: &Path) -> Vec<String> {
+/// The release argv that starts a warm VM in the foreground, with its log at
+/// `log`. A SHARED VM boots rootless (`--shared`, NO `--root`): it serves every
+/// shared project of the build and resolves the realm per request from the
+/// frame cwd. An own VM is handed its root. The log path is an ARGUMENT so the
+/// VM knows where to write and `bl vm logs` reads the very file the launcher's
+/// child writes.
+pub fn warm_start_argv(root: &Path, shared: bool, log: &Path) -> Vec<String> {
     let mut a = words(REALM_START);
     a.push(FOREGROUND_FLAG.to_string());
-    a.push(ROOT_FLAG.to_string());
-    a.push(root.to_string_lossy().into_owned());
+    if shared {
+        a.push(SHARED_FLAG.to_string());
+    } else {
+        a.push(ROOT_FLAG.to_string());
+        a.push(root.to_string_lossy().into_owned());
+    }
     a.push(LOG_FLAG.to_string());
     a.push(log.to_string_lossy().into_owned());
     a
@@ -300,16 +346,48 @@ mod transport_tests {
         }
     }
 
-    /// Warm start/stop hand the release named arguments, not string soup.
+    /// Warm start/stop hand the release named arguments, not string soup: an own
+    /// VM is given its root, a shared VM boots rootless with `--shared`.
     #[test]
     fn the_warm_argv_lists_name_realm() {
         let root = Path::new("/tree");
         let log = Path::new("/state/beam-lisp/logs/tree-abc.log");
         assert_eq!(
-            warm_start_argv(root, log),
+            warm_start_argv(root, false, log),
             a(&["realm", "start", "--foreground", "--root", "/tree", "--log", "/state/beam-lisp/logs/tree-abc.log"])
         );
+        assert_eq!(
+            warm_start_argv(root, true, log),
+            a(&["realm", "start", "--foreground", "--shared", "--log", "/state/beam-lisp/logs/tree-abc.log"]),
+            "a shared VM boots rootless: no --root"
+        );
         assert_eq!(warm_stop_argv(root), a(&["realm", "stop", "--root", "/tree"]));
+    }
+
+    /// Sharing is a DECLARATION a flag may override, never a default: no flag
+    /// and no key means own, a spelling outside the table is ignored, and `--own`
+    /// wins when both flags are given. `--` ends the scan.
+    #[test]
+    fn sharing_is_flagged_declared_then_owned() {
+        let shared = Some(r#"{:vm "shared"}"#);
+        let own = Some(r#"{:vm "own"}"#);
+        let bogus = Some(r#"{:vm "bogus"}"#);
+        assert!(!shared_for(&a(&[]), None), "the default is own");
+        assert!(shared_for(&a(&[]), shared));
+        assert!(!shared_for(&a(&[]), own));
+        assert!(!shared_for(&a(&[]), bogus), "an unknown spelling is ignored");
+        assert!(shared_for(&a(&["--shared"]), own), "the flag beats the declaration");
+        assert!(!shared_for(&a(&["--own"]), shared));
+        assert!(!shared_for(&a(&["--shared", "--own"]), None), "own wins when both are given");
+        assert!(!shared_for(&a(&["--own", "--shared"]), None));
+        assert!(!shared_for(&a(&["run", "--", "--shared"]), None), "-- ends the scan");
+    }
+
+    #[test]
+    fn the_sharing_flags_and_key_are_one_spelling_each() {
+        assert_eq!(SHARED_FLAG, "--shared");
+        assert_eq!(OWN_FLAG, "--own");
+        assert_eq!(VM_KEY, "vm");
     }
 
     /// The log/idle/lines flags take a value; one spelling each.
