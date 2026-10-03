@@ -7,7 +7,7 @@ processes, mailboxes and preemption.
 
 ```sh
 JS_ENTRY=my.app JS_OUT=out/my-app JS_ROOTS=src[:more] \
-JS_HOST_FNS=now,measure bl run priv/lib/js/cli.bl
+JS_HOST_FNS=now,measure bl run scripts/js-build.bl
 ```
 
 The command reads `my.app` and every namespace it requires under the roots. It

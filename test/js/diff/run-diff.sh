@@ -15,7 +15,7 @@ mkdir -p "$out"
 run=${RUN:-}
 
 cd "$root"
-JS_ENTRY=diff.corpus JS_OUT="$out" JS_ROOTS="test/js/diff" $run bl run priv/lib/js/cli.bl >"$out/build.log" 2>&1 \
+JS_ENTRY=diff.corpus JS_OUT="$out" JS_ROOTS="test/js/diff" $run bl run scripts/js-build.bl >"$out/build.log" 2>&1 \
   || { grep -v '^  at' "$out/build.log" | tail -5; exit 2; }
 (cd "$here" && $run bl run beam-side.bl) 2>&1 | grep -P '^[a-z-]+\t' >"$out/beam.out"
 node "$here/js-side.mjs" "$out" >"$out/js.out"
