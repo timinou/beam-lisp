@@ -3701,6 +3701,16 @@
 ; this module — but it IS a runtime dependency on RT and is recorded here
 ; deliberately: the fast path has no RT edge, the general path does.
 ;
+; POLICY. `k-fold`/`k-reduce` take a 4th argument selecting the fold's boundary
+; rule; the 3-arity is `:kernel`. `:kernel` is the representation walk's own
+; rule: an improper cons chain stops at its first non-lazy, non-list tail, and a
+; foreign opaque struct folds the entries `k-seq` yields. `:compat` is the
+; historical public `core/reduce` rule over the SAME single walk: a supported
+; collection used as a tail still folds, an UNSUPPORTED tail raises the same
+; `count`-shaped `empty?` refusal it always did (after the prefix, no replay),
+; and a foreign opaque struct folds ONE `nil` callback when non-empty (and none
+; when the tag is its only field). See `reduce-tail` / `reduce-opaque`.
+;
 ; The vector walk mirrors `lib/beam_lisp/vector.ex`: a small vector stores its
 ; elements directly as the `items` tuple; a trie stores `{bl_vec, cnt, shift,
 ; root, tail}` and `leaves_to_list(root, div(shift,5))` is the ordered leaf
@@ -3772,19 +3782,39 @@
     :else (call-invoke f `(~acc ~x))))
 
 ;; ── representation-directed walks ──────────────────────────────────────────
-(declare reduce-lazy)
+(declare reduce-lazy reduce-tail)
 
-(defn- reduce-list [f acc xs]
+(defn- reduce-list [f acc xs policy]
   (loop [acc acc ys xs]
     (cond
-      (erlang/== false (erlang/is_list ys))
-      (cond (erlang/== (kind-kind ys) :lazy) (reduce-lazy f acc ys) :else acc)
+      (erlang/== false (erlang/is_list ys)) (reduce-tail f acc ys policy)
       (erlang/== ys ()) acc
       :else
       (let [acc2 (step f acc (erlang/hd ys))]
         (cond
           (reduce-reduced? acc2) acc2
           :else (recur acc2 (erlang/tl ys)))))))
+
+(defn- reduce-tail
+  "Fold the non-list tail of a cons chain according to `policy` (see
+   `reduce-list`). `:kernel` — the 3-arity kernel default — stops at the tail
+   and returns the accumulator. `:compat` — the historical public
+   `core/reduce` rule — reproduces the old generic loop's step at the tail:
+   `empty?` FIRST (so an unsupported tail raises `count`'s FunctionClauseError,
+   and never after a halting step), then `first` steps and `rest` — a proper
+   list for every supported representation — resumes the one spine walk. No
+   element of the already-folded prefix is replayed. A lazy tail was already
+   folded in either mode."
+  [f acc ys policy]
+  (cond
+    (erlang/== (kind-kind ys) :lazy) (reduce-lazy f acc ys)
+    (erlang/== policy :kernel) acc
+    (k-empty? ys) acc
+    :else
+    (let [acc2 (step f acc (k-first ys))]
+      (cond
+        (reduce-reduced? acc2) acc2
+        :else (reduce-list f acc2 (k-rest ys) policy)))))
 
 (defn- reduce-lazy [f acc l]
   (loop [acc acc cell (BeamLisp.LazySeq/cell l)]
@@ -3886,6 +3916,17 @@
         (cond
           (reduce-reduced? acc2) acc2
           :else (recur acc2 (k-next ys)))))))
+
+(defn- reduce-opaque
+  "Fold a foreign (non-beam-lisp) struct the way the historical public
+   `core/reduce` did: `first` has no opaque clause, so the step sees `nil`, and
+   `rest` is empty — exactly ONE callback, and none at all when the struct has
+   no fields beyond its tag. Reached only from the `:compat` boundary; the
+   kernel's own rule (`:kernel`) folds the entries `k-seq` yields instead."
+  [f acc coll]
+  (cond
+    (k-empty? coll) acc
+    :else (step f acc (k-first coll))))
 
 ;; ── the fold recipe toolkit ────────────────────────────────────────────────
 ; A lazy producer may attach a fold recipe (`BeamLisp.LazySeq.new/2`): a
@@ -4026,30 +4067,85 @@
 (defn k-fold
   "`k-reduce`'s walk, WITHOUT peeling the `Reduced` sentinel, so a fold recipe
    that must know its consumer halted can read it (see `lazy-fold-source`).
-   Prefer `k-reduce`."
-  [f init coll]
-  (let [kd (kind-kind coll)]
+   Prefer `k-reduce`. The 4-arity carries the tail/opaque POLICY (see
+   `reduce-list`): the 3-arity is `:kernel`, the representation walk's own rule,
+   unchanged; `:compat` is the historical public `core/reduce` rule."
+  ([f init coll] (k-fold f init coll :kernel))
+  ([f init coll policy]
+   (let [kd (kind-kind coll)]
+     (cond
+       (erlang/== kd :list) (reduce-list f init coll policy)
+       (erlang/== kd :vector) (reduce-vector f init coll)
+       (erlang/== kd :lazy) (lazy-fold f init coll)
+       (erlang/== kd :map) (reduce-map f init coll)
+       (erlang/== kd :nil) init
+       (erlang/== kd :opaque) (cond (erlang/== policy :compat) (reduce-opaque f init coll)
+                                    :else (reduce-seq f init coll))
+       :else (reduce-seq f init coll)))))
+
+(defn- compat-reduced?
+  "The LIVE public `core/reduced?`, fetched at each call so a rebinding made
+   mid-fold (by the step fn or by a prior predicate) is honoured exactly as the
+   historical loop's late-bound `(reduced? acc)` was. A raw arity-1 fn is
+   applied directly; any other callable goes through `call-invoke`."
+  [x]
+  (let [p (BeamLisp.Env/fetch! "core" "reduced?")]
     (cond
-      (erlang/== kd :list) (reduce-list f init coll)
-      (erlang/== kd :vector) (reduce-vector f init coll)
-      (erlang/== kd :lazy) (lazy-fold f init coll)
-      (erlang/== kd :map) (reduce-map f init coll)
-      (erlang/== kd :nil) init
-      :else (reduce-seq f init coll))))
+      (erlang/is_function p 1) (p x)
+      :else (call-invoke p (reduce-one x)))))
+
+(defn- compat-finish
+  "Resolve a `:compat` fold's outcome. The kernel only ever saw OUR values:
+   `{:$reduce_acc acc}` (exhausted) or the intrinsic Reduced holding
+   `{:$reduce_halt v}` (the public predicate already said stop; `v` is the
+   already-dereferenced payload, returned with no second predicate or peel).
+   Exhaustion unwraps the user acc and runs the historical final LIVE
+   predicate/deref once."
+  [out]
+  (let [r (cond (reduce-reduced? out) (unwrap out) :else out)]
+    (cond
+      (erlang/== (erlang/element 1 r) :"$reduce_halt") (erlang/element 2 r)
+      :else
+      (let [acc (erlang/element 2 r)]
+        (cond (compat-reduced? acc) (BeamLisp.Refs/deref acc)
+              :else acc)))))
 
 (defn k-reduce
   "`(reduce f init coll)`: fold `f` as `(f acc x)` over `coll`, returning the
    accumulator. Dispatch happens once, on the collection's kind; the walk is
    then representation-directed. A step returning a `Reduced` stops the fold
    immediately — no further callback, no further lazy force — and its value is
-   returned unwrapped. A lazy seq still carrying an unused fold recipe is folded
-   straight from its source: no memo cell per element, no captured environment
-   copied."
-  [f init coll]
-  (let [out (k-fold f init coll)]
-    (cond
-      (reduce-reduced? out) (unwrap out)
-      :else out)))
+   returned unwrapped. Arbitrary lazy reducers walk shared memo cells, publishing
+   realized prefixes before callbacks so effects and early termination replay
+   safely. Trusted count/materialization consumers have a separate recipe path.
+
+   The 4-arity threads the POLICY `k-fold` takes (see `reduce-list`); the
+   3-arity is `:kernel`, whose behaviour is unchanged.
+
+   `:compat` keeps the ONE `k-fold` traversal and adapts only the accumulator:
+   the kernel folds an internal envelope `{:$reduce_acc acc}`, so a user value
+   the kernel's own sentinel test would take for Reduced (but live
+   `core/reduced?` rejects) can never halt it. Per element: unwrap, call `f`
+   once, THEN ask the live `core/reduced?`; truthy → `BeamLisp.Refs/deref` once
+   and return the intrinsic Reduced carrying `{:$reduce_halt payload}`; else
+   re-envelope."
+  ([f init coll] (k-reduce f init coll :kernel))
+  ([f init coll policy]
+   (cond
+     (erlang/== policy :compat)
+     (compat-finish
+       (k-fold (fn [env x]
+                 (let [r (step f (erlang/element 2 env) x)]
+                   (cond
+                     (compat-reduced? r)
+                     (reduce-reduced (tuple :"$reduce_halt" (BeamLisp.Refs/deref r)))
+                     :else (tuple :"$reduce_acc" r))))
+               (tuple :"$reduce_acc" init) coll policy))
+     :else
+     (let [out (k-fold f init coll policy)]
+       (cond
+         (reduce-reduced? out) (unwrap out)
+         :else out)))))
 
 
 ;; ════ rt.sorted ════════════════════════════════════════════════════════════════
