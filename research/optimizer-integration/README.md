@@ -11,12 +11,12 @@ Status: **experimental research record.** What shipped by default is a small set
 - Design proposal the work started from: `!tasks/artifacts/sequence-prototype/generalization.md`; kernel experiment: `!tasks/artifacts/sequence-prototype/` (`README.md`, `results.json`, `test.log`, `benchmark.log`); overhead diagnosis: `!tasks/artifacts/sequence-overhead-diagnosis.md`, `sequence-overhead-summary.json`.
 - Raw logs (hash-indexed): `!tasks/artifacts/performance-evidence/optimizer-prototypes/` (`index.json`).
 - Harnesses and tests, all reproducible from the repository:
-  - `!tasks/artifacts/optimizer-lexical-measure.bl` – normal-source compile/code/timing, disabled vs current vs lexical.
+  - `!tasks/artifacts/optimizer-lexical-measure.bl` – current normal-source compile/code/timing, disabled vs production. The historical three-mode harness and its 135 samples are retained at commit `22fd15ee` and in the immutable prototype evidence; current runs are a distinct generation.
   - `!tasks/artifacts/optimizer-mode-measure.bl`, `optimizer-mode-stage.bl` (isolated whole-RT variants; `BL_MODE_PACKED=1`), `optimizer-mode-audit.bl` (step disassembly, ingress).
   - `test/bl/optimizer_lexical_prototype_test.bl`, `optimizer_mode_prototype_test.bl` (`BL_MODE_SNAPSHOTS=1` for machine-readable outcomes), `optimizer_open_world_prototype_test.bl`.
   - `!tasks/artifacts/optimizer-stage.sh`, `optimizer-cold.sh` for staged images and cold acceptance.
 
-A finding is only as current as the generation it ran against. The prototype ran against a frozen checkout (`9f76122a` plus overlay) while `main` moved on. A strict or cold proof of that frozen generation does **not** prove the current `main`. The production cut that promotes part of the prototype needs its own verification on the current generation; until that is recorded in the delivery artifact, treat promoted behavior as implemented but unverified there.
+A finding is only as current as the generation it ran against. The prototype ran against a frozen checkout (`9f76122a` plus overlay) while `main` moved on. A strict or cold proof of that frozen generation does **not** prove the current `main`. The production cut has independent acceptance on snapshot `f4e26caf`:317sources built without errors,105focused tests/3680assertions, executable guide,150checked samples, an official97module seed and strict cold105/3680with zero staging exemptions. See `!tasks/artifacts/optimizer-promotion-delivery.md` and the immutable `performance-evidence/optimizer-promotion` checkpoint. The requested `ns-defs-beam` merge needs a separate combined-generation gate; neither pre-merge acceptance nor an old branch seed proves that combination.
 
 ## 2. Separating three questions
 
@@ -42,7 +42,7 @@ The 135 lexical timing samples are three cases × sizes 1000/16000/64000 × thre
 
 ## 4. Negative results and why baseline remains the default
 
-Runtime normalization is an explicit fifth argument to `rt/k-reduce` (`:baseline` or `:normalized`); three/four-argument calls are baseline. Hoisted variants exist only as isolated generated images (`optimizer-mode-stage.bl`) and never as the published walker. Normalization applies only to VM-internal identities (callable representation chosen once per traversal), and equality across separately started VMs is not claimed.
+Runtime normalization is an explicit fifth argument to `rt/k-reduce` (`:baseline` or `:normalized`); three/four-argument calls are baseline. Hoisted variants exist only as isolated generated images (`optimizer-mode-stage.bl`) and never as the published walker. Callback normalization chooses callable representation once per traversal. Separately, trace comparisons normalize only cross-VM reference/function identities; they do not mask changed semantic values or assume map traversal order agrees between VMs.
 
 Initial run (4800 checked rows), 16000/list/kernel VM reductions: native 160161 baseline vs 160459 packed hoist (no reduction); tagged adder 306311 baseline vs 705587.5 normalized; public `+` 1009952.5 vs 1410459. The generic wrapper added a `reduce-two` helper and `erlang:apply/2`.
 
@@ -68,14 +68,14 @@ Common rules for every row:
 - **Failure now:** code growth with no work saved; leftover original closures.
 - **Dependencies:** a dead-closure elimination that proves the original binding unreferenced and its construction effect-free (closure creation is pure but must be checked after rewriting); or evidence that a downstream pass consumes the cloned form.
 - **Counterexamples:** alias used by both a rewritten and an unrewritten call; shadowing; alias captured by another closure.
-- **Promotion evidence:** disassembly showing fewer instructions *and* no larger BEAM on the alias-only case, plus a workload where a lexical alias blocked a measured win.
+- **Promotion evidence:** a measured ordinary-source workload where alias specialization removes real execution work, with bounded callback expansion and an explicit acceptable compile/output-size tradeoff. Smaller BEAM alone is not an execution-speed proof, and small bounded growth need not forbid a useful win.
 - **Home:** `Optimize` fact/rewrite plus dead-binding cleanup, same file. **Tests:** extend `optimizer_lexical_prototype_test.bl`; measure with `optimizer-lexical-measure.bl`.
 
 ### 5.2 Immutable captures
 
 - **Rationale:** callbacks with captured scalars (`(fn [x] (* x k))`) are common; facts need the capture's domain and immutability.
 - **Failure now:** wrong-domain capture (float, decimal, map) would take the integer path and silently change results; a rebound global would be read at a different time.
-- **Dependencies:** lexical binding identity, proof the capture is an integer literal or integer-domain local bound before the closure and not rebound; interaction with the 64-node bound.
+- **Dependencies:** lexical binding identity, proof of the actual integer value/domain captured at closure construction, resolved in its definition environment; later shadowing must not reinterpret that capture. Preserve original binding evaluation and distinguish a captured immutable integer from a captured mutable reference or a live global read; retain the 64-node bound.
 - **Counterexamples:** captured value shadowed; a `var`/atom reference; a capture derived from a call that can raise.
 - **Promotion evidence:** ordinary-source cases where captures prevent fusion, with measured win and parity on shadowing/overflow-to-bignum.
 - **Home:** `Optimize/fact`, `int-callback`. **Tests:** lexical prototype tests plus capture negative controls.
@@ -100,7 +100,7 @@ Common rules for every row:
 
 ### 5.5 Public `+` value, helper flow, body invalidation, guarded suffix
 
-- **Rationale:** `(reduce + 0 coll)` is the commonest form, but the public `+` is a tagged variadic callable. Native arity does not identify the operation; the name may be rebound.
+- **Rationale:** `(reduce + 0 coll)` is a common source form, but the public `+` is a tagged variadic callable. Native arity does not identify the operation; the name may be rebound.
 - **Failure now:** specializing on the name or on arity would mis-handle floats, decimals, mixed values, a rebound `+`, and error text.
 - **Dependencies:** exact captured callable and body identity; numeric-domain equivalence for the binary case; dependency invalidation so a helper body-only edit (same module/name/arity) invalidates facts; helper parameter flow needs function/arity identities with explicit widening to unknown (coarse 0-CFA alone is insufficient); for entry-proven facts that can change mid-traversal, a **guarded suffix continuation** that falls back from the current state. **Never replay a prefix** that already had effects. Entry epoch checks do not justify dropping later live reads.
 - **Counterexamples:** rebinding before and during traversal; body replacement; first element float; bignum; one/zero element.
@@ -113,7 +113,7 @@ Common rules for every row:
 - **Failure now:** extra reduction per element for tagged and public callables; native unchanged.
 - **Dependencies:** a wrapper that adds no frame (inline the mode into the shared loop mechanics) or a once-per-traversal check shown to beat the existing per-element check; preservation of live `core/reduced?` fetches after callbacks and at exhaustion, initial/empty behavior, one sentinel peel, improper-tail errors, no eager rejection of an invalid callable on empty input.
 - **Counterexamples:** the wrapper envelope being native while the user callback is not; predicate rebinding before/mid/terminal.
-- **Promotion evidence:** matched VM reductions *below* baseline for native, tagged and public callables at chunk sizes 31/32/33/63/64/65, with the same-VM step oracle passing.
+- **Promotion evidence:** matched VM-work improvement for the exact admitted callable domain, baseline fallback without regression for other domains, and the same-VM step oracle plus all ingress/empty/error/live-predicate gates passing. Include chunk sizes 31/32/33/63/64/65; do not infer a large-input win from a tiny loop or vice versa.
 - **Home:** `rt` `step`, `k-fold`, `k-reduce` only; hoisting stays in isolated generated images unless that evidence appears. **Tests:** `optimizer_mode_prototype_test.bl`, `reduce_kernel_cutover_test.bl`; audit with `optimizer-mode-audit.bl`.
 
 ### 5.7 Indexed consumers, early halt, transducers, builders
@@ -146,7 +146,7 @@ Common rules for every row:
 
 Milestones, in order, each with its own gate; nothing here is blocked or forgotten.
 
-1. **Current generation verification** of the promoted cut (strict focused suite, `optimizer-cold.sh`, regenerated package audit and outside-tree smoke). Owner: orchestrator. Prerequisite for any claim on `main`.
+1. **Current generation verification** of the promoted cut (strict focused suite and `optimizer-cold.sh`). Owner: orchestrator. A newly published distributable additionally requires regenerated package audit and outside-tree smoke. Current-source acceptance does not imply package publication.
 2. **Real-workload scan:** run `explain` over compiler/build/analysis/datom namespaces to list which refusals are most frequent; this picks the next row of §5 instead of intuition. Trigger: after milestone 1.
 3. **§5.3 and §5.2** together (use/escape and captures) if the scan shows they block common fusions.
 4. **§5.4** then **§5.5**; §5.5 only with the dependency-invalidation tests.
