@@ -28,7 +28,7 @@ something a developer never reads: the gateway routes a name to the number, and
 
 ```beam-lisp silent
 (ns bl.ports
-  (:require [bl.util :as u] [vm.ports] [vm.index] [vm.gateway]))
+  (:require [bl.util :as u] [vm.ports] [vm.index] [vm.paths :as paths] [vm.gateway]))
 ```
 
 ## Reading
@@ -141,6 +141,12 @@ next one.
   (let [c (claim-for "ui")]
     (if (nil? c) nil (or (url-for "ui") (loopback-url c)))))
 
+(defn- tree-root
+  "The bl tree root the current directory belongs to, or nil when it is in no
+   tree. The index owner is per realm, so asking about one needs its root."
+  []
+  (:ok (vm.paths/resolve-root (second (File/cwd)))))
+
 (defn start-index!
   "Ask the running session to index this tree, and report what it found.
 
@@ -154,12 +160,13 @@ next one.
    daemon dropped a command's stderr; the per-request group-leader proxy (vm.io)
    forwards it now, so the line can be on the stream it belongs to."
   []
-  (let [p (vm.index/owner-pid)]
+  (let [root (tree-root)
+        p (if (nil? root) nil (vm.index/owner-pid root))]
     (if (nil? p)
       nil
       (do
-        (vm.index/ensure-building)
-        (let [s (vm.index/progress)]
+        (vm.index/ensure-building root)
+        (let [s (vm.index/progress root)]
           (u/io-err
             (str "  index: "
                  (case (:phase s)

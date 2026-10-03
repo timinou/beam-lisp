@@ -1,0 +1,125 @@
+; index_realm_test.bl — vm.index is PER REALM (PLAN-158 step 9).
+;
+; A warm VM serves many checkouts; each is a realm with its own root. ONE
+; node-global index owner could only hold ONE tree's conn, so a question about
+; one realm could be answered from another's tables — the silent wrong answer
+; this step exists to remove. These prove the properties that make that
+; impossible: two roots get two owners with separate rows; a run reaches the
+; owner of the root it named and no other; start is idempotent and race-safe;
+; stop and death are per root; and a scheduled refresh answers for the root the
+; declaration names.
+
+(ns vm.index-realm-test
+  (:require [vm.index :as index]))
+
+(defn- tmp-root [tag]
+  (str "/tmp/bl-realm-" tag "-"
+       (erlang/apply :erlang :unique_integer (list (to-list [:positive])))))
+
+(defn- wait-until [f n]
+  "Poll `f` until it answers truthy, or give up after `n` tries. A fixed sleep
+   is a flake on a slow machine and a false green if the event never happens."
+  [f n]
+  (loop [i 0]
+    (let [v (f)]
+      (cond
+        v v
+        (>= i n) false
+        :else (do (erlang/apply :timer :sleep (list 25)) (recur (inc i)))))))
+
+(deftest two-roots-own-two-indexes
+  (testing "each root gets its own owner and its own progress row"
+    (let [a (tmp-root "a")
+          b (tmp-root "b")
+          pa (index/start-for a "realm-a@test" {:build false})
+          pb (index/start-for b "realm-b@test" {:build false})]
+      (is (erlang/is_pid pa))
+      (is (erlang/is_pid pb))
+      (is (not= pa pb) "two roots are two owners")
+      (is (= pa (index/owner-pid a)))
+      (is (= pb (index/owner-pid b)))
+      (index/progress! a {:phase :building :done 1 :total 10 :file "a.bl"})
+      (index/progress! b {:phase :building :done 7 :total 90 :file "b.bl"})
+      (is (= 1 (:done (index/progress a))) "A's row is A's")
+      (is (= 7 (:done (index/progress b))) "B's row is B's")
+      (is (= "a.bl" (:file (index/progress a))))
+      (is (= "b.bl" (:file (index/progress b))))
+      (is (= :cold (:phase (index/progress (tmp-root "c")))) "an unknown root is cold")
+      (index/stop-for a)
+      (index/stop-for b))))
+
+(deftest run-stays-on-the-roots-own-owner
+  (testing "run/2 for root A runs on A's owner, never B's"
+    (let [a (tmp-root "a")
+          b (tmp-root "b")
+          pa (index/start-for a "realm-a@test" {:build false})
+          pb (index/start-for b "realm-b@test" {:build false})]
+      (is (= pa (index/run a (fn [] (erlang/self)))) "A's thunk ran on A")
+      (is (= pb (index/run b (fn [] (erlang/self)))) "B's thunk ran on B")
+      (is (not= pa pb))
+      (index/stop-for a)
+      (index/stop-for b))))
+
+(deftest start-for-is-idempotent
+  (testing "the second start for a root is the first owner, not a second"
+    (let [a (tmp-root "a")
+          p1 (index/start-for a "realm-a@test" {:build false})
+          p2 (index/start-for a "realm-a@test" {:build false})]
+      (is (= p1 p2))
+      (index/stop-for a))))
+
+(deftest start-for-is-race-safe
+  (testing "eight concurrent starts for one root leave exactly one owner"
+    (let [a (tmp-root "a")
+          parent (erlang/self)
+          _ (doseq [_ (range 8)]
+              (spawn (fn [] (erlang/send parent [:started (index/start-for a "realm-a@test" {:build false})]))))
+          pids (map (fn [_] (receive [:started p] p (after 10000 :timeout))) (range 8))
+          distinct (vec (distinct pids))]
+      (is (= 1 (count distinct)) "all eight callers got the one owner")
+      (is (erlang/is_pid (first distinct)))
+      (is (= (first distinct) (index/owner-pid a)))
+      ;; if a second owner had leaked, stopping the known one would leave the
+      ;; other registered; it must not.
+      (index/stop-for a)
+      (is (nil? (index/owner-pid a)) "one stop leaves nothing behind"))))
+
+(deftest stop-for-is-scoped-and-idempotent
+  (testing "stop-for removes only the named root, and an unknown root is a no-op"
+    (let [a (tmp-root "a")
+          b (tmp-root "b")
+          pa (index/start-for a "realm-a@test" {:build false})
+          pb (index/start-for b "realm-b@test" {:build false})]
+      (index/progress! b {:phase :building :done 3 :total 5 :file "b.bl"})
+      (is (= :stopped (index/stop-for a)))
+      (is (nil? (index/owner-pid a)) "A is gone")
+      (is (= pb (index/owner-pid b)) "B is untouched")
+      (is (= 3 (:done (index/progress b))) "B's row survives")
+      (is (= :none (index/stop-for (tmp-root "none"))))
+      (is (= :stopped (index/stop-for b)))
+      (is (= :none (index/stop-for b)) "stopping twice is a no-op"))))
+
+(deftest killing-an-owner-clears-its-row
+  (testing "an owner killed out from under the registry clears its entry and its row"
+    (let [a (tmp-root "a")]
+      (index/start-for a "realm-a@test" {:build false})
+      (index/progress! a {:phase :building :done 4 :total 9 :file "a.bl"})
+      (is (= :building (:phase (index/progress a))))
+      (erlang/apply :erlang :exit (list (index/owner-pid a) :kill))
+      (is (wait-until (fn [] (= :cold (:phase (index/progress a)))) 200)
+          "the progress row is cleared when the owner dies")
+      (is (wait-until (fn [] (nil? (index/owner-pid a))) 200)
+          "the registry entry retracts when the owner dies"))))
+
+(deftest refresh-scheduled-answers-per-root
+  (testing "the refresh goes to the owner of (:root occ), or says there is none"
+    (let [a (tmp-root "a")
+          b (tmp-root "b")]
+      (is (= {:refreshed false :why :no-owner} (index/refresh-scheduled {:root a})))
+      (index/start-for a "realm-a@test" {:build false})
+      (is (= {:refreshed true :root a} (index/refresh-scheduled {:root a})))
+      (is (= {:refreshed false :why :no-owner} (index/refresh-scheduled {:root b}))
+          "a declaration from another tree is not answered from A's index")
+      (index/stop-for a))))
+
+(run-tests)
