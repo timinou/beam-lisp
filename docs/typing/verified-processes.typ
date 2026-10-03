@@ -95,7 +95,7 @@ checker already built. The clause / guard / dispatch machinery written for
 The counter above, written as a raw `receive` loop, as an OTP `defserver`, and
 as a `defmulti` dispatch, all lower to the identical transition graph.
 
-#ran("BeamLisp.run_file(\"research/p16_model/run.bl\")")[
+#ran("BeamLisp.run_file(\"research/archive/p16_model/run.bl\")")[
   ```
   raw receive-loop  ([:dec "(- n 1)"] [:inc "(+ n 1)"] [:reset "0"])
   defserver (OTP)   ([:dec "(- n 1)"] [:inc "(+ n 1)"] [:reset "0"])
@@ -130,7 +130,7 @@ check for unsatisfiability. If `init` establishes the invariant and every
 transition preserves it, then $square "Inv"$ holds by induction over an
 unbounded state space.
 
-#ran("BeamLisp.run_file(\"research/p16_model/run_inductive.bl\")")[
+#ran("BeamLisp.run_file(\"research/archive/p16_model/run_inductive.bl\")")[
   ```
   ── claim: □(balance ≥ 0) holds — proven, unbounded ──
     init establishes balance ≥ 0:  true
@@ -170,7 +170,7 @@ engines cooperating with zero overlap.
     senders already guarantee $P$? If so, it needs no annotation at all.
 ]
 
-#ran("BeamLisp.run_file(\"research/p16_model/run_abduce.bl\")")[
+#ran("BeamLisp.run_file(\"research/archive/p16_model/run_abduce.bl\")")[
   ```
   ── rung 2: unguarded withdraw — abduce the missing precondition ──
     candidates enumerated by miniKanren, decided by z3.
@@ -204,7 +204,7 @@ Read (R), append/monotone (A), write (W), send (S), receive (K), spawn (X). The
 ladder is recovered as `rank(join of modes)` — nothing regresses — and the
 algebra the footprint carries #emph[is] the guarantees.
 
-#ran("BeamLisp.run_file(\"research/p16_model/run_footprint.bl\")")[
+#ran("BeamLisp.run_file(\"research/archive/p16_model/run_footprint.bl\")")[
   ```
   (datom/transact! conn tx)  footprint {"conn" :A}  monotone? true
   (swap! cache assoc k v)    footprint {"cache" :W}  monotone? false
@@ -255,7 +255,7 @@ sandbox already enforces the upper bound; effect inference supplies the lower.
 And the consequences are exactly the security properties the sandbox
 documentation states as operator rules — now machine-checked.
 
-#ran("BeamLisp.run_file(\"research/p16_model/run_sandbox.bl\")")[
+#ran("BeamLisp.run_file(\"research/archive/p16_model/run_sandbox.bl\")")[
   ```
   payoff 1  disjoint caps ⟹ disjoint footprints ⟹ all A-workers commute
             with all B-workers — a fleet's race-freedom from the fork tree,
@@ -284,7 +284,7 @@ resulting "waits-for" graph is a deadlock. That graph is datoms — one
 they never block — and a cycle is `A reachable from A`, a recursive datalog
 query on the shipped fixpoint engine. No z3, no state exploration.
 
-#ran("BeamLisp.run_file(\"research/p16_model/run_deadlock.bl\")")[
+#ran("BeamLisp.run_file(\"research/archive/p16_model/run_deadlock.bl\")")[
   ```
   orders→billing→shipping→orders  (a cycle), + orders→audit
     deadlocked servers: ("billing" "orders" "shipping")
@@ -313,7 +313,7 @@ $k$ is a guarantee #emph[up to] $k$ — and that is not a proof.
   guarantees are exact, and which are bounded?" is itself a query.
 ]
 
-#ran("BeamLisp.run_file(\"research/p16_model/run_liveness.bl\")")[
+#ran("BeamLisp.run_file(\"research/archive/p16_model/run_liveness.bl\")")[
   ```
   buggy handler (:retry spins): lasso found at depth 2, trace [:idle :pending :pending]
   approximate guarantees: (:~replies-eventually)   ; bound 20
@@ -332,7 +332,7 @@ of A, proven by a simulation relation $R(a, c)$ that related states preserve.
 When C refines A, every property proven on A transfers to C for free. It buys
 three things, in rising order of "this is why it matters."
 
-#ran("BeamLisp.run_file(\"research/p16_model/run_refine.bl\")")[
+#ran("BeamLisp.run_file(\"research/archive/p16_model/run_refine.bl\")")[
   ```
   payoff 1  a batched counter refines the simple one → balance≥0 transfers free.
   payoff 2  a connection refines the open/close protocol → it can never emit
@@ -372,7 +372,7 @@ corrupts itself mid-flight, with no restart to catch it.
   + therefore every property proven on v1 survives the swap.
 ]
 
-#ran("BeamLisp.run_file(\"research/p16_model/run_refine.bl\")")[
+#ran("BeamLisp.run_file(\"research/archive/p16_model/run_refine.bl\")")[
   ```
   ── payoff 3: VERIFIED HOT UPGRADE — code_change preserves the invariant ──
     migration b2 := b1 preserves balance ≥ 0:               true
@@ -424,7 +424,7 @@ prototyped and runs today, on the bundled z3, with no JVM anywhere.
 #line(length: 100%, stroke: 0.4pt + rule-hair)
 #v(0.4em)
 #text(9pt, fill: ink-faint)[
-  All demos: `research/p16_model/`. Run with the direct harness
+  All demos: `research/archive/p16_model/`. Run with the direct harness
   (`elixir -pa _build/dev/lib/*/ebin -e 'BeamLisp.init() …'`) — the eight
   drivers `run.bl`, `run_inductive.bl`, `run_abduce.bl`, `run_footprint.bl`,
   `run_sandbox.bl`, `run_deadlock.bl`, `run_liveness.bl`, `run_refine.bl` each

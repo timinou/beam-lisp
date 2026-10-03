@@ -135,7 +135,7 @@ taste — and then every candidate is applied and the result **re-read**
 
 Two candidates at one edit each; only one yields a text that parses. The tie
 **collapses**, and `ambiguous?` says so. This is
-`research/p21_repair/spike_repair.bl`'s move — abduce the candidate, check it
+`research/archive/p21_repair/spike_repair.bl`'s move — abduce the candidate, check it
 forward — one layer down: the syntax instead of the state machine.
 
 Where the tie does **not** collapse, the tool must not guess. `(a b))` has two
@@ -192,7 +192,7 @@ reader that wraps composites; the reader narrowed to lists. 368 call sites go
 through `node-form` and 267 through `node-items`; those are unaffected.
 
 **The cost has already been paid once, and it is recorded.** The prototype that
-wrapped every composite (`research/p2_positions`, still in the tree) writes:
+wrapped every composite (`research/archive/p2_positions`, still in the tree) writes:
 
 > *Meta wraps composite nodes only — and helpers must peel it. First version
 > missed every bug because `walk-if`'s test and each `->>` step arrive
@@ -235,7 +235,7 @@ identity.** Three rules, and the spike implements the first:
   backtrack, so a source where the second repair only works if the first was
   different would not be solved. No such fixture is claimed.
 - **No repair for a *semantic* mistake** — a form that parses and is wrong. That
-  is `research/p21_repair`'s territory; the split is deliberate.
+  is `research/archive/p21_repair`'s territory; the split is deliberate.
 - **No performance claim.** Nothing here is timed, and the forward check re-reads
   the source once per candidate. That is fine on a diagnostic path and would not
   be on a hot one.
@@ -278,7 +278,7 @@ sources (295 top-level forms — `priv/boot/reader.bl`, `priv/boot/core.bl`,
 - deletes (NOT yet — and the gate is the point): `span-rewrite.bl`'s
   `line-offsets` and the three arithmetic sites built on it. The gate is that
   EVERY producer of a pos map carries offsets — including the compiler's
-  synthesized positions for desugared macro nodes (`research/p2_positions`),
+  synthesized positions for desugared macro nodes (`research/archive/p2_positions`),
   which are built outside the reader. Until those carry offsets, `slice-node`
   needs its fallback and the table stays; deleting the table first would make a
   rewrite degrade to `pr-str` instead of failing loudly.
@@ -330,9 +330,9 @@ diagnostics as data.
 
 - `research/edamame/README.md` — the study: what edamame is, what it does that we
   do not, why the dependency is the wrong move and the ORACLE is the right one.
-- `research/p2_positions/README.md` — the earlier wide-location prototype, and the
+- `research/archive/p2_positions/README.md` — the earlier wide-location prototype, and the
   recorded cost of getting the peel wrong.
-- `research/p21_repair/spike_repair.bl` — the same abduce-then-verify move, for
+- `research/archive/p21_repair/spike_repair.bl` — the same abduce-then-verify move, for
   state machines instead of syntax.
 - `!tasks/follow-ups/FUP-102-…org` — the acceptance §1 is written to.
 - `!tasks/plans/PLAN-135-…org` — the build order §Port expands.
