@@ -40,17 +40,28 @@
             [vm.ports :as ports] [vm.names :as names] [vm.paths :as paths]
             [vm.exec :as exec] [vm.http :as http]
             [vm.sched :as sched] [vm.spec :as spec] [vm.registry :as registry]
-            [vm.idle :as idle] [vm.owner :as owner]))
+            [vm.idle :as idle] [vm.owner :as owner] [vm.realm :as realm]))
 
 (def PT-ROOT (tuple :vm_session :root))
 (def PT-STARTED (tuple :vm_session :started-at))
 (def PT-RECORD (tuple :vm_session :record))
 (def PT-IDLE (tuple :vm_session :idle))
 
+(defn- shared-status-text
+  "What a shared VM answers to `realm show`: it serves no single project, so it
+   names the realms it has open."
+  []
+  (let [roots (realm/roots)]
+    (str "shared VM  " (count roots) " realm(s)"
+         (apply str (map (fn [r] (str "\n  " r)) roots)))))
+
 (defn- status-text []
-  (inspect/render-text
-    (inspect/model {:root (erlang/apply :persistent_term :get (list PT-ROOT (BeamLisp/cwd)))
-                    :started-at (erlang/apply :persistent_term :get (list PT-STARTED nil))})))
+  (let [root (erlang/apply :persistent_term :get (list PT-ROOT nil))]
+    (if (nil? root)
+      (shared-status-text)
+      (inspect/render-text
+        (inspect/model {:root root
+                        :started-at (erlang/apply :persistent_term :get (list PT-STARTED nil))})))))
 
 (defn- control-handler [frame conn-send]
   ;; frame = {:control id op} where op ∈ #{:status :stop}
@@ -123,28 +134,23 @@
         (conn-send (wire/exit id code))))))
 
 (defn- boot-realm-services!
-  "What a daemon runs besides its socket: the manager, the code index, the
-   sequencer, the schedules, and the facts the status read-model reports. Runs
-   only AFTER the socket is ours — a start that lost the race must leave nothing
-   of itself behind."
+  "What a daemon runs besides its socket: the manager, the sequencer, and the
+   facts the status read-model reports. Runs only AFTER the socket is ours — a
+   start that lost the race must leave nothing of itself behind.
+
+   A VM started for ONE project (`root`) opens that project's realm now, so its
+   index is warm and its declared schedules fire before the first command: a daemon
+   that sits warm overnight is exactly when a nightly prune should happen. A shared
+   VM (`root` nil) has no project yet; each realm opens on its first request, which
+   is the same `realm/open` call."
   [root]
   (mgr/start)
-  ;; the tree's warm code index owner: build at boot so the first code question
-  ;; (bl ask / bl search / the MCP mount) finds it warm rather than paying for
-  ;; its own conn (see vm.index).
-  (index/start {:root root})
   ;; the reload/intent sequencer (vm.exec): a watch commit and a dashboard intent
   ;; take turns here, never racing a program the daemon is running.
   (exec/start)
-  ;; the tree's DECLARED periodic work (env.bl `:schedules`) — a wheel per
-  ;; project, armed at BOOT for the same reason the index is: a daemon that sits
-  ;; warm overnight is exactly when a nightly prune should happen, and waiting
-  ;; for the first session command means waiting for someone to be awake. The
-  ;; spawn path arms it too (vm.manager/ensure), idempotently, so a tree that is
-  ;; used before it is idle is covered either way.
-  (sched/start-for (spec/read root))
-  ;; remember what this session is, for the status read-model.
-  (erlang/apply :persistent_term :put (list PT-ROOT root))
+  (when (some? root)
+    (realm/open root)
+    (erlang/apply :persistent_term :put (list PT-ROOT root)))
   (erlang/apply :persistent_term :put (list PT-STARTED (erlang/system_time :second))))
 
 (defn- busy?
@@ -180,35 +186,46 @@
 (defn- release-start-marker!
   "The launcher wrote `.starting` before it spawned this VM so a second `bl` would
    not start another. This VM is listening now, so the marker has done its job."
-  [root]
-  (let [ep (paths/endpoints root)]
+  [root shared]
+  (let [ep (paths/endpoints root (paths/build-id) shared)]
     (when (contains? ep :ok) (File/rm (:starting (:ok ep))))))
 
 (defn start
   "Boot the warm VM for `root`: bind the socket first, and only if it is
    ours start the services behind it. Returns {:ok listener} | {:error reason};
    {:error :already-running} means a live daemon answers for this endpoint and
-   NOTHING was started — attach to it. `opts` {:idle seconds :log path}: :idle arms
-   the idle clock (0 or absent: the VM stays until stopped); :log is where this VM's
-   output goes, recorded so `bl vm show` and `bl vm logs` can find it."
+   NOTHING was started — attach to it. {:error :shared-needs-a-build} means a shared
+   VM was asked of a source checkout (which runs its own sources and is never
+   shared); {:error :no-root} means an own VM was asked with no project. `opts`
+   {:idle seconds :log path :shared bool}:
+   :idle arms the idle clock (0 or absent: the VM stays until stopped); :log is where
+   this VM's output goes, recorded so `bl vm show` and `bl vm logs` can find it;
+   :shared boots the build's SHARED VM, which needs no `root` (pass nil) and opens a
+   realm per request."
   ([root] (start root {}))
   ([root opts]
    ;; the socket first, and the services after: binding is what decides who the
    ;; daemon is, so a start that loses must not have armed an index and a
    ;; scheduler it will never serve. The listener accepts at once, but a request
    ;; that arrives before the services are up waits on the manager like any other.
-   (let [r (net/listen root request-handler)]
+   (let [shared (= true (get opts :shared))
+         r (cond
+             (and shared (= (paths/build-id) paths/SRC-BUILD))
+             {:error :shared-needs-a-build}
+             (and (not shared) (nil? root))
+             {:error :no-root}
+             :else (net/listen root request-handler {:shared shared}))]
      (if (contains? r :ok)
-       (do (boot-realm-services! root)
+       (do (boot-realm-services! (if shared nil root))
            ;; the HTTP face on :ui, a view over the same read-model. A failure
            ;; here does NOT stop the daemon: its job is serving commands, the
            ;; page is a view.
-           (start-ui root)
+           (start-ui root shared)
            ;; become visible to the machine: one record, written once. A failure
            ;; to publish costs `bl vm` a row (the old files still adopt this pid),
            ;; never the daemon its job.
            (publish-self! (:ok r) (get opts :log))
-           (release-start-marker! root)
+           (release-start-marker! root shared)
            (arm-idle! (get opts :idle 0))
            r)
        r))))
@@ -225,17 +242,23 @@
           (and (map? ui) (erlang/is_integer (get ui :port))) (get ui :port)
           :else nil)))
 
-(defn- start-ui [root]
-  (try
+(defn- start-ui
+  "The dashboard for the project this VM serves. A shared VM serves no single
+   project, and the dashboard's pages read ONE root, so it starts none: a page
+   that answered for the wrong realm would be worse than no page. Per-realm pages
+   under one console are PLAN-158 step 12."
+  [root shared]
+  (when-not shared
+   (try
     (let [want (or (project-ui-port root) 0)
           r (ports/claim "ui" want {:root root :hosts (to-list (names/hosts root "ui"))})]
       (when (contains? r :ok)
         (let [port (:ok r)
-              ep (:ok (paths/endpoints root))
+              ep (:ok (paths/endpoints root (paths/build-id) false))
               token (if (and ep (File/exists? (:token ep))) (File/read! (:token ep)) nil)]
           (http/serve port {:root root :tree-id (paths/tree-id root)
                             :token token :started-at (erlang/system_time :second)}))))
-    (catch e nil)))
+    (catch e nil))))
 
 (defn- publish-self!
   "Publish this VM's record and remember it on the listener so `stop` can retract

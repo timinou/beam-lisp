@@ -153,10 +153,13 @@ owns the VM's lifetime wants. The VM also records where its output goes
 
 (defn start-options
   "What `realm start` hands the VM, from the parsed flags: the idle limit (the flag,
-   else the default; 0 disables) and the log path the launcher chose."
+   else the default; 0 disables), the log path the launcher chose, and whether this
+   is the build's SHARED VM (`--share-vm`, passed by the launcher for a project that
+   declares `:vm \"shared\"`)."
   [st]
   {:idle (or (:idle st) DEFAULT-IDLE-SECONDS)
-   :log (:log st)})
+   :log (:log st)
+   :shared (= true (:share-vm st))})
 
 (defn cmd-start [st]
   (let [root (root-of st)]

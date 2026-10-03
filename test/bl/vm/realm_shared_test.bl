@@ -1,0 +1,134 @@
+; realm_shared_test.bl — the step-9 gate: two projects, one VM.
+;
+; A shared VM boots with no project and opens a realm per request, chosen from the
+; request's cwd. This drives REAL frames over the real socket:
+;   · two projects answer from their own cwd and env, concurrently;
+;   · neither sees the other's variables;
+;   · each realm gets its own index owner;
+;   · closing one realm leaves the other serving.
+
+(ns vm.realm-shared-test
+  (:require [vm.session :as session] [vm.paths :as paths] [vm.realm :as realm]
+            [vm.index :as index] [vm.owner :as owner] [vm.manager :as mgr]))
+
+(def DROP "a238fa91")
+
+(defn- project [name]
+  (let [root (str "/tmp/bl-realm-shared-" name "-" (erlang/apply :erlang :unique_integer (list (to-list [:positive]))))]
+    (File/mkdir_p! (str root "/priv/boot"))
+    (File/write! (str root "/priv/boot/core.bl") "")
+    (File/write! (str root "/env.bl") (str "{:name \"" name "\" :vm \"shared\"}"))
+    root))
+
+(defn- shared-endpoint [] (:ok (paths/endpoints nil (paths/build-id) true)))
+
+(defn- request
+  "One request to the shared VM: `argv` with `cwd` and `env`. {:out text :code n}."
+  [cwd argv env]
+  (let [ep (shared-endpoint)
+        conn (elem (gen_tcp/connect (tuple :local (erlang/binary_to_list (:sock ep))) 0
+                     (list (tuple :inet_backend :inet) :local :binary (tuple :packet 4) (tuple :active false))) 1)]
+    (gen_tcp/send conn (erlang/apply :erlang :term_to_binary
+                         (list (tuple :bl 1 :hello {:tree (paths/hello-fingerprint nil (paths/build-id) true)
+                                                    :token (File/read! (:token ep))}))))
+    (gen_tcp/recv conn 0 5000)
+    (gen_tcp/send conn (erlang/apply :erlang :term_to_binary
+                         (list (tuple :bl 1 :request (erlang/apply :crypto :strong_rand_bytes (list 16))
+                                      {:argv (to-list argv) :cwd cwd :env env}))))
+    (loop [out ""]
+      (let [r (gen_tcp/recv conn 0 20000)]
+        (if (not= :ok (elem r 0))
+          {:out out :code nil}
+          (let [f (erlang/apply :erlang :binary_to_term (list (elem r 1)))
+                tag (elem f 2)]
+            (cond
+              (= tag :stdout) (recur (str out (erlang/apply :unicode :characters_to_binary (list (elem f 5)))))
+              (= tag :exit) (do (gen_tcp/close conn) {:out out :code (elem f 4)})
+              :else (recur out))))))))
+
+(defn- as-drop-build
+  "Run `f` as a DROP build: a source build is never shared, and a test runs from
+   a checkout. The id is only a name for the endpoint, so a made-up one is exact."
+  [f]
+  (let [prev (System/get_env "BL_BUILD_ID")]
+    (System/put_env "BL_BUILD_ID" DROP)
+    (try (f)
+      (finally (if (nil? prev) (System/delete_env "BL_BUILD_ID") (System/put_env "BL_BUILD_ID" prev))))))
+
+(defn- with-shared-vm [f]
+  (as-drop-build
+    (fn []
+      (let [listener (:ok (session/start nil {:shared true}))]
+        (try (f) (finally (session/stop listener)))))))
+
+(deftest a-source-checkout-refuses-to-be-shared
+  (is (= {:error :shared-needs-a-build} (session/start nil {:shared true}))
+      "a checkout runs its own sources: sharing it would answer one project with another's code"))
+
+(deftest two-projects-are-answered-from-their-own-cwd
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha") b (project "beta")
+            ra (request a ["eval" "(println (BeamLisp/cwd))"] {})
+            rb (request b ["eval" "(println (BeamLisp/cwd))"] {})]
+        (is (= 0 (:code ra))) (is (= 0 (:code rb)))
+        (is (clojure.string/includes? (:out ra) a) "A's command ran in A")
+        (is (clojure.string/includes? (:out rb) b) "B's command ran in B")
+        (is (not (clojure.string/includes? (:out ra) b)))))))
+
+(deftest concurrent-requests-do-not-see-each-others-env
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha") b (project "beta")
+            prog "(println (vm.osenv/get \"WHO\"))"
+            futs (doall (map (fn [i]
+                               (let [root (if (even? i) a b) who (if (even? i) "alpha-env" "beta-env")]
+                                 {:who who :f (future (request root ["eval" prog] {"WHO" who}))}))
+                             (range 12)))]
+        (doseq [x futs]
+          (let [r (deref (:f x))]
+            (is (clojure.string/includes? (:out r) (:who x)) (str "saw its own " (:who x)))
+            (is (not (clojure.string/includes? (:out r) (if (= "alpha-env" (:who x)) "beta-env" "alpha-env")))
+                "and never the other's")))))))
+
+(deftest each-realm-gets-its-own-index-owner
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha") b (project "beta")]
+        (request a ["eval" "1"] {}) (request b ["eval" "1"] {})
+        (let [pa (index/owner-pid a) pb (index/owner-pid b)]
+          (is (some? pa)) (is (some? pb))
+          (is (not= pa pb) "one owner per realm"))
+        (is (= 2 (count (filter (fn [r] (or (= r a) (= r b))) (realm/roots)))) "both realms are open")))))
+
+(deftest closing-one-realm-leaves-the-other-serving
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha") b (project "beta")]
+        (request a ["eval" "1"] {}) (request b ["eval" "1"] {})
+        (let [pb (index/owner-pid b)]
+          (realm/close a)
+          (is (nil? (index/owner-pid a)) "A's index is gone")
+          (is (= pb (index/owner-pid b)) "B's owner is the same process, untouched")
+          (is (= 0 (:code (request b ["eval" "(+ 1 2)"] {}))) "B still answers")
+          (is (not (some (fn [r] (= r a)) (realm/roots))) "A is no longer open"))))))
+
+(deftest a-realm-reopens-after-it-is-closed
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha")]
+        (request a ["eval" "1"] {})
+        (realm/close a)
+        (is (= 0 (:code (request a ["eval" "(+ 1 2)"] {}))) "the next request opens it afresh")
+        (is (some? (index/owner-pid a)))))))
+
+(deftest concurrent-first-requests-open-a-realm-once
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha")
+            fs (doall (map (fn [_] (future (request a ["eval" "1"] {}))) (range 8)))]
+        (doseq [f fs] (is (= 0 (:code (deref f)))))
+        (is (= 1 (count (filter (fn [r] (= r a)) (realm/roots)))) "one row for the realm")
+        (is (some? (index/owner-pid a)))))))
+
+(run-tests)
