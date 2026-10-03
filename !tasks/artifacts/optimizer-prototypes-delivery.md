@@ -95,3 +95,7 @@ A clean-state generation later timed out at compiler compilation. Concurrent wor
 - `optimizer-prototypes-results.json`: retained computed results; raw logs are immutable/hash-indexed through the existing evidence archiver.
 
 Use the existing `optimizer-stage.sh` phases against an isolated ebin. Do not copy foreign `compile.beam_lisp`/`build.log` ownership state into a new image. Do not substitute old-package evidence for this generation's acceptance. The full repository suite, arbitrary lazy/resource fusion, and total-memory behavior are not claimed verified.
+
+## Production cut pointer (appended; the sections above are unchanged historical evidence)
+
+Status: the useful subset of this prototype is being promoted into the default optimizer (PLAN-160): default bounded callback facts and private strict `lists:map`/`lists:foldl` fusion including aliases, the `{:lexical? true}` option retired, standalone alias rematerialization refused, runtime normalization and hoisting not promoted. Implementation is in progress and **verification on the current generation is pending**. The frozen-baseline floor (`9f76122a` plus overlay) described above does not become acceptance for current `main`, and no seed or package is claimed. Deferred work, evidence and revisit conditions: `research/optimizer-integration/README.md`; current design: `docs/compiler/optimizer.bl.md`.
