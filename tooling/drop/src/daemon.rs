@@ -279,7 +279,7 @@ pub fn tree_fingerprint(root: &Path) -> Vec<u8> {
 // ── endpoint identity: one VM per tree, or a shared VM per user and build ────
 
 /// The endpoint key the shared VM of a build is named by. A shared VM serves
-/// every project that declares `:vm "shared"` (or passes `--shared`), so its key
+/// every project that declares `:vm "shared"` (or passes `--share-vm`), so its key
 /// is a constant, not a tree.
 pub const SHARED_KEY: &str = "warm";
 
@@ -295,7 +295,7 @@ fn served_shared(build: &str, shared: bool) -> bool {
 
 /// The key a daemon's files are named by: `warm` when the request is shared and
 /// the build is not a source checkout, else the tree id. Sharing is OPT-IN (a
-/// project's `:vm "shared"`, or `--shared`), never the build's default: two
+/// project's `:vm "shared"`, or `--share-vm`), never the build's default: two
 /// projects that define a namespace of the same name must not meet in one node.
 /// Every endpoint file is `<key>-<build>.<ext>`. Must match
 /// `vm.paths/endpoint-key` byte for byte.
@@ -574,7 +574,7 @@ fn write_log_header(file: &mut std::fs::File, root: &Path) {
     let _ = writeln!(file, "--- {} bl vm start ({}) ---", now_secs(), root.display());
 }
 
-/// Spawn the release's `realm start --foreground [--root <root>|--shared] --log
+/// Spawn the release's `realm start --foreground [--root <root>|--share-vm] --log
 /// <log>` fully detached, so the VM outlives this launcher. stdout and stderr
 /// both land in the SAME log file, so a VM that fails to boot leaves a trace
 /// instead of silence in /dev/null; the log is opened here and its path handed to

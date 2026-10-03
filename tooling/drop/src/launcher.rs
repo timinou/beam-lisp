@@ -769,7 +769,7 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
         let cwd = std::env::current_dir().ok();
         let root = cwd.as_deref().and_then(|c| tree_root(c, &argv));
         let t = root.as_deref().map(|r| transport(r, &argv)).unwrap_or(DEFAULT_TRANSPORT);
-        // Read <root>/env.bl ONCE: `--shared`/`--own` or the `:vm` declaration
+        // Read <root>/env.bl ONCE: `--share-vm`/`--own-vm` or the `:vm` declaration
         // decides the endpoint for this whole invocation (the default is own).
         let env_bl = root.as_deref().and_then(|r| std::fs::read_to_string(r.join(PROJECT_FILE)).ok());
         let shared = shared_for(&argv, env_bl.as_deref());

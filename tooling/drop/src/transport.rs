@@ -9,7 +9,7 @@
 //
 // `Path`/`PathBuf` come from daemon.rs, included before this file.
 //
-// VM SHARING follows the same declared rule: `--shared`/`--own`, then the
+// VM SHARING follows the same declared rule: `--share-vm`/`--own-vm`, then the
 // tree's `:vm` declaration, then own. It chooses which VM answers for the
 // project (`daemon.rs::endpoint_key`), never whether one is started.
 //
@@ -80,13 +80,13 @@ pub const VM_KEY: &str = "vm";
 pub const VM_SPELLINGS: &[(&str, bool)] = &[("own", false), ("shared", true)];
 
 /// Boolean flag; force a shared VM for this invocation.
-pub const SHARED_FLAG: &str = "--shared";
+pub const SHARED_FLAG: &str = "--share-vm";
 /// Boolean flag; force this project's own VM. Beats `SHARED_FLAG`.
-pub const OWN_FLAG: &str = "--own";
+pub const OWN_FLAG: &str = "--own-vm";
 
-/// Whether the invocation asks for a SHARED VM: `--shared`/`--own` first, then
+/// Whether the invocation asks for a SHARED VM: `--share-vm`/`--own-vm` first, then
 /// `env_bl_text`'s `:vm` declaration, then the default (own). The flags are
-/// BOOLEAN (they take no value), and `--own` wins when both are given: an
+/// BOOLEAN (they take no value), and `--own-vm` wins when both are given: an
 /// explicit request for isolation is the safe choice, and an extra flag must
 /// never silently share a VM. `--` ends the scan (`flag_present`).
 pub fn shared_for(argv: &[String], env_bl_text: Option<&str>) -> bool {
@@ -203,7 +203,7 @@ pub fn start_requested(argv: &[String]) -> bool {
 pub const LIFECYCLE_VERBS: &[&str] = &["realm", "vm"];
 
 /// The release argv that starts a warm VM in the foreground, with its log at
-/// `log`. A SHARED VM boots rootless (`--shared`, NO `--root`): it serves every
+/// `log`. A SHARED VM boots rootless (`--share-vm`, NO `--root`): it serves every
 /// shared project of the build and resolves the realm per request from the
 /// frame cwd. An own VM is handed its root. The log path is an ARGUMENT so the
 /// VM knows where to write and `bl vm logs` reads the very file the launcher's
@@ -347,7 +347,7 @@ mod transport_tests {
     }
 
     /// Warm start/stop hand the release named arguments, not string soup: an own
-    /// VM is given its root, a shared VM boots rootless with `--shared`.
+    /// VM is given its root, a shared VM boots rootless with `--share-vm`.
     #[test]
     fn the_warm_argv_lists_name_realm() {
         let root = Path::new("/tree");
@@ -358,14 +358,14 @@ mod transport_tests {
         );
         assert_eq!(
             warm_start_argv(root, true, log),
-            a(&["realm", "start", "--foreground", "--shared", "--log", "/state/beam-lisp/logs/tree-abc.log"]),
+            a(&["realm", "start", "--foreground", "--share-vm", "--log", "/state/beam-lisp/logs/tree-abc.log"]),
             "a shared VM boots rootless: no --root"
         );
         assert_eq!(warm_stop_argv(root), a(&["realm", "stop", "--root", "/tree"]));
     }
 
     /// Sharing is a DECLARATION a flag may override, never a default: no flag
-    /// and no key means own, a spelling outside the table is ignored, and `--own`
+    /// and no key means own, a spelling outside the table is ignored, and `--own-vm`
     /// wins when both flags are given. `--` ends the scan.
     #[test]
     fn sharing_is_flagged_declared_then_owned() {
@@ -376,17 +376,17 @@ mod transport_tests {
         assert!(shared_for(&a(&[]), shared));
         assert!(!shared_for(&a(&[]), own));
         assert!(!shared_for(&a(&[]), bogus), "an unknown spelling is ignored");
-        assert!(shared_for(&a(&["--shared"]), own), "the flag beats the declaration");
-        assert!(!shared_for(&a(&["--own"]), shared));
-        assert!(!shared_for(&a(&["--shared", "--own"]), None), "own wins when both are given");
-        assert!(!shared_for(&a(&["--own", "--shared"]), None));
-        assert!(!shared_for(&a(&["run", "--", "--shared"]), None), "-- ends the scan");
+        assert!(shared_for(&a(&["--share-vm"]), own), "the flag beats the declaration");
+        assert!(!shared_for(&a(&["--own-vm"]), shared));
+        assert!(!shared_for(&a(&["--share-vm", "--own-vm"]), None), "own wins when both are given");
+        assert!(!shared_for(&a(&["--own-vm", "--share-vm"]), None));
+        assert!(!shared_for(&a(&["run", "--", "--share-vm"]), None), "-- ends the scan");
     }
 
     #[test]
     fn the_sharing_flags_and_key_are_one_spelling_each() {
-        assert_eq!(SHARED_FLAG, "--shared");
-        assert_eq!(OWN_FLAG, "--own");
+        assert_eq!(SHARED_FLAG, "--share-vm");
+        assert_eq!(OWN_FLAG, "--own-vm");
         assert_eq!(VM_KEY, "vm");
     }
 
