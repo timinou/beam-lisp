@@ -1,6 +1,6 @@
 # Next steps 4 and 5: Beam Lisp compiled in the browser, and split cells in bl-ed
 
-This note designs steps 4 and 5 on top of the unified target (PLAN-162). Both
+This note designs steps 4 and 5 on top of the unified target (PLAN-163). Both
 assume U1–U2 have landed: core.bl and rt.bl compile to JS over the host-leaf
 ABI (168 leaves, measured). Each section says what exists today, what is
 missing, and how to build it. Every "today" fact was measured or read on
@@ -22,7 +22,7 @@ That means no server round trip, and `ed.lisp`'s stand-in interpreter goes.
 | priv/boot/compiler.bl | 202 | 4,375 | reader nodes → bl-ANF; macro expansion |
 | priv/boot/anf.bl | 41 | 260 | ANF shape + validation |
 | priv/boot/optimize.bl | 6 | 36 | checked optimizations |
-| priv/boot/core.bl + rt.bl | 611 | 7,029 | core (compiled in PLAN-162 U2) |
+| priv/boot/core.bl + rt.bl | 611 | 7,029 | core (compiled in PLAN-163 U2) |
 
 All of it is Beam Lisp. The JS backend (priv/lib/js/emit.bl, 583 lines) is
 Beam Lisp too. In principle the whole pipeline text → ANF → JS can run in a
@@ -50,7 +50,7 @@ source text ──reader.bl──▶ nodes ──compiler.bl──▶ bl-ANF ─
 ### What blocks it, and the fix for each
 | blocker | evidence | fix |
 |---|---|---|
-| core calls BEAM leaves | 168 leaves (research/bl-ed/core-host-leaves.txt) | PLAN-162 U1 |
+| core calls BEAM leaves | 168 leaves (research/bl-ed/core-host-leaves.txt) | PLAN-163 U1 |
 | global name resolution goes through `Env/fetch!` with an ns→core fallback | PLAN-157 lesson 1 | a JS `Env` leaf set over the live table. The Env leaves are 7 of the 168 (fetch!, intern, lookup, put_key, put_link, caps_allowed?, doc_string) |
 | ANF fresh names come from a process-global counter, so output depends on history | PLAN-157 W1.2 | thread the counter through the compile env. Required for byte-reproducible JS on both targets |
 | the compiler references `Elixir.*` atoms as data (module names for remotes) | compiler.bl `slash-target` | atoms are interned Kw/Atom values in rt.mjs; module-name remotes become link-table lookups (js.build already does this at build time; dc781b46) |

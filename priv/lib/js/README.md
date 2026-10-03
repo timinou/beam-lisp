@@ -2,9 +2,9 @@
 
 Beam Lisp → ES modules for code that runs to completion in response to an
 event: editors, views, parsers, validators. It is the profile bl-ed is built on
-(PLAN-161), and the base of the one unified JS target (PLAN-162): core
+(PLAN-161), and the base of the one unified JS target (PLAN-163): core
 compiled from priv/boot, actors as a library with selective suspension. Until
-PLAN-162 lands, `research/js-actors` is the prototype for processes.
+PLAN-163 lands, `research/js-actors` is the prototype for processes.
 
 ```sh
 bl js build my.app -p src [-p more] [--out out/my-app] [--host now,measure]
