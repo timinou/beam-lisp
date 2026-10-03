@@ -5,4 +5,4 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 out=apps/bl-ed/web/out
-JS_ENTRY=ed.main JS_OUT="$out" JS_ROOTS=apps/bl-ed ${RUN:-} bl run scripts/js-build.bl
+JS_ENTRY=ed.main JS_OUT="$out" JS_ROOTS=apps/bl-ed:priv/std ${RUN:-} bl run scripts/js-build.bl
