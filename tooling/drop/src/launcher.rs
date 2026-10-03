@@ -207,19 +207,27 @@ pub fn referenced(store: &Store) -> std::collections::HashMap<String, String> {
     refs
 }
 
-/// Build ids a live daemon serves, from the runtime dir's `<tree>-<build>.sock`.
+/// Build ids a live daemon serves, from a runtime-dir socket name.
 fn daemon_builds() -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     let Some(dir) = runtime_dir() else { return out };
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
-            let n = e.file_name().to_string_lossy().into_owned();
-            if let Some((_, b)) = n.strip_suffix(".sock").and_then(|s| s.rsplit_once('-')) {
+            if let Some(b) = build_from_sock(&e.file_name().to_string_lossy()) {
                 out.insert(b.to_string());
             }
         }
     }
     out
+}
+
+/// The build a daemon socket names: the segment after the LAST '-' before
+/// `.sock`. Generic over both `<endpoint-key>-<build>` names — a tree id and
+/// the shared `warm` key both carry no '-' — so `warm-3ffa4c3a.sock` names
+/// `3ffa4c3a` exactly as `<tree-id>-3ffa4c3a.sock` does. `None` for a legacy
+/// `<tree-id>.sock` (no build) or a non-socket file.
+fn build_from_sock(name: &str) -> Option<&str> {
+    name.strip_suffix(".sock")?.rsplit_once('-').map(|(_, build)| build)
 }
 
 /// Build ids some process runs from: an executable or a mapped file under
@@ -833,6 +841,16 @@ mod gc_tests {
             assert_eq!(target_name(o, a), t);
         }
         assert_eq!(target_name(9, 9), "os9/arch9");
+    }
+
+    /// A daemon socket names its build after the LAST '-', so both the shared
+    /// `warm-<build>` and the per-checkout `<tree-id>-<build>` names parse.
+    #[test]
+    fn a_socket_names_its_build_after_the_last_dash() {
+        assert_eq!(build_from_sock("warm-3ffa4c3a.sock"), Some("3ffa4c3a"));
+        assert_eq!(build_from_sock("57461829a20cc2af-3ffa4c3a.sock"), Some("3ffa4c3a"));
+        assert_eq!(build_from_sock("57461829a20cc2af.sock"), None, "a legacy tree socket names no build");
+        assert_eq!(build_from_sock("warm-3ffa4c3a.token"), None);
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
