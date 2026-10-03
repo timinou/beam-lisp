@@ -1,0 +1,528 @@
+; split/web.bl — the HTTP face of split apps, on web.bl.
+;
+; One server mounts any number of apps. Each app gets an AUTHORITY process
+; (split.core) and a HUB process that owns its open event streams; the router
+; below only translates HTTP into messages to them and back. Nothing here
+; decides anything about app data: shape (the codec), identity (the session)
+; and delivery (the streams) are transport; every decision is the authority's.
+;
+; THE ROUTES, under each app's mount point (`/` for a single app, `/<name>/`
+; when several share a port):
+;
+;   GET  /                 the page (showcase.html) — CSP, no-store, nosniff
+;   GET  /<asset>          the browser half: page + Worker + codec + host
+;                          modules, the app's compiled client, contract,
+;                          manifest, stylesheet and page metadata
+;   GET  /api/app          {app, digest}
+;   POST /api/intent       one proposal → the authority's answer
+;   GET  /api/events       SSE: `hello` (the current board), then every
+;                          commit as `snapshot`, and `presence` for people apps
+;   POST /api/login        {user} → a signed session cookie   (people apps)
+;   POST /api/logout                                         (people apps)
+;   GET  /api/me           {person, people}                   (people apps)
+;   GET  /api/peek?revision=k   a past board                  (history apps)
+;
+; WHAT THE TRANSPORT GUARANTEES, each the same rule the research Node server
+; kept (the research Node transport this replaced):
+;
+;   * Host and Origin: a write must come from this server's own origin, and
+;     every request must name this server as its Host (DNS rebinding).
+;   * Bodies: JSON only, at most 4 KiB, decoded BY THE CONTRACT — exact record
+;     keys, bounded text (codepoints), safe integer ranges, bounded lists,
+;     depth 24, a declared op. Garbage is refused before the authority sees it.
+;   * The actor is STAMPED from a verified session. A proposal that carries an
+;     `actor` has the wrong keys and is refused as malformed.
+;   * Sessions: an HMAC-SHA256-signed random id in an HttpOnly,
+;     SameSite=Strict cookie; verified in constant time; 12 hours.
+;   * Streams: at most 16 per client address and 256 in all, so one client
+;     cannot lock everyone else out.
+;   * A proposal the authority does not answer in 4 s is 503.
+
+(ns split.web
+  (:require [web] [bl.json] [split.core :as core] [split.wire :as wire] [split.log :as slog]))
+
+(def ^:private Conn (erlang/binary_to_atom "Elixir.Plug.Conn"))
+
+(def max-body 4096)
+(def authority-timeout-ms 4000)
+(def streams-per-client 16)
+(def streams-total 256)
+(def session-ttl-s 43200)
+(def max-depth 24)
+
+; ── small validators (closed character classes; no regex engine needed) ────────
+
+(defn- chars-in? [s ok?] (every? ok? (erlang/binary_to_list s)))
+(defn- lower? [c] (and (<= 97 c) (<= c 122)))
+(defn- digit? [c] (and (<= 48 c) (<= c 57)))
+(defn- alnum-lower? [c] (or (lower? c) (digit? c)))
+
+(defn tab-id? [s] (and (string? s) (<= 8 (count s)) (<= (count s) 32) (chars-in? s alnum-lower?)))
+
+(defn nonce? [s]
+  (and (string? s)
+       (let [parts (String/split s ":")]
+         (and (= 2 (count parts)) (tab-id? (first parts))
+              (let [n (nth parts 1)] (and (<= 1 (count n)) (<= (count n) 9) (chars-in? n digit?)))))))
+
+(defn exact-digits? [s]
+  ; an integer too large for a JSON number travels as its decimal digits:
+  ; -?[1-9][0-9]{15,99}
+  (and (string? s)
+       (let [b (if (String/starts_with? s "-") (subs s 1) s)]
+         (and (<= 16 (count b)) (<= (count b) 100) (chars-in? b digit?) (not (String/starts_with? b "0"))))))
+
+(def safe-max 9007199254740991)
+
+(defn wire-json
+  "BL closed data → a JSON value the browser codec decodes exactly: keywords
+   become their names (bl.json does that), and an integer outside the safe
+   range (±(2^53-1)) becomes its decimal DIGITS — a JSON number that large
+   would be rounded by every browser (split-codec.mjs `encode` does the same)."
+  [v]
+  (cond
+    (and (int? v) (or (< safe-max v) (< v (- safe-max)))) (str v)
+    (map? v) (reduce (fn [m k] (assoc m k (wire-json (get v k)))) {} (keys v))
+    (vector? v) (mapv wire-json v)
+    (or (list? v) (seq? v)) (mapv wire-json v)
+    :else v))
+
+; ── the codec: JSON value → BL value of the declared shape ─────────────────────
+
+(defn- bad [why] (throw (ex-info why {:split/codec why})))
+
+(defn decode
+  "The BL value `v` (decoded JSON: string keys) denotes under wire `spec`, or a
+   raise naming why. Shape only — the authority re-checks and decides."
+  [types spec v depth]
+  (let [t (wire/wire-resolve types spec)]
+    (cond
+      (nil? t) (bad "unknown wire type")
+      (= t :bool) (if (boolean? v) v (bad "expected a boolean"))
+      (= t :exact) (cond (and (int? v) (<= (- safe-max) v) (<= v safe-max)) v
+                         (exact-digits? v) (erlang/binary_to_integer v)
+                         :else (bad "expected an exact integer"))
+      (not (vector? t)) (bad "malformed contract type")
+      (and (contains? #{:list :record} (first t)) (<= max-depth depth)) (bad "nested too deep")
+      (= (first t) :text) (if (and (string? v) (<= (nth t 1) (wire/wire-text-length v))
+                                   (<= (wire/wire-text-length v) (nth t 2)))
+                            v (bad "text out of bounds"))
+      (= (first t) :int) (if (and (int? v) (<= (nth t 1) v) (<= v (nth t 2))) v (bad "integer out of bounds"))
+      (= (first t) :one-of) (or (some (fn [k] (if (= (name k) v) k nil)) (rest t)) (bad "not one of the choices"))
+      (= (first t) :list) (if (and (vector? v) (<= (count v) (nth t 1)))
+                            (mapv (fn [x] (decode types (nth t 2) x (inc depth))) v)
+                            (bad "expected a bounded list"))
+      (= (first t) :record)
+        (let [fields (nth t 1)]
+          (if (and (map? v) (= (sort (map name (keys fields))) (sort (keys v))))
+            (reduce (fn [m k] (assoc m k (decode types (get fields k) (get v (name k)) (inc depth)))) {} (keys fields))
+            (bad "record keys differ")))
+      :else (bad "unknown wire tag"))))
+
+(def proposal-keys ["args" "digest" "nonce" "op" "request" "revision"])
+
+(defn decode-proposal
+  "A browser proposal → `[:ok proposal]` or `[:bad status reason]`."
+  [a j]
+  (let [c (:contract a)]
+    (cond
+      (not (and (map? j) (= proposal-keys (sort (keys j))))) [:bad 400 :malformed-proposal]
+      (not (and (int? (get j "request")) (<= 1 (get j "request")) (<= (get j "request") safe-max)
+                (int? (get j "revision")) (<= 0 (get j "revision")) (<= (get j "revision") safe-max)
+                (string? (get j "digest")) (string? (get j "op")) (nonce? (get j "nonce"))))
+        [:bad 400 :malformed-proposal]
+      (not (= (:digest a) (get j "digest"))) [:bad 409 :client-outdated]
+      :else
+        (let [op (some (fn [k] (if (= (name k) (get j "op")) k nil)) (keys (:intents c)))]
+          (if (nil? op)
+            [:bad 400 :unknown-intent]
+            (try [:ok {:request (get j "request") :revision (get j "revision") :digest (get j "digest")
+                       :nonce (get j "nonce") :op op :actor nil
+                       :args (decode (:wire c) [:record (get-in c [:intents op :params])] (get j "args") 0)}]
+                 (catch _ [:bad 400 :malformed-args])))))))
+
+; ── sessions: an HMAC-signed random id in a cookie ──────────────────────────────
+
+(def ^:private Base (erlang/binary_to_atom "Elixir.Base"))
+
+(defn- b64url [bin] (erlang/apply Base :url_encode64 (list bin (list (tuple :padding false)))))
+
+(defn cookie-mac
+  "The session MAC: HMAC-SHA256 of the id, base64url without padding (43 chars)."
+  [secret sid] (b64url (crypto/mac :hmac :sha256 secret sid)))
+
+(defn- b64url-char? [c] (or (alnum-lower? c) (and (<= 65 c) (<= c 90)) (= c 45) (= c 95)))
+
+(defn cookie-sid
+  "The session id a `split_sid` cookie value carries, if its signature holds."
+  [secret raw]
+  (when (string? raw)
+    (let [parts (String/split raw ".")]
+      (when (= 2 (count parts))
+        (let [[sid m] parts]
+          (when (and (<= 20 (count sid)) (<= (count sid) 64) (chars-in? sid b64url-char?)
+                     (= 43 (count m)) (chars-in? m b64url-char?)
+                     (crypto/hash_equals (cookie-mac secret sid) m))
+            sid))))))
+
+(defn- cookie-value [secret sid] (str sid "." (cookie-mac secret sid)))
+
+(defn- set-session-cookie
+  "The session cookie, scoped to the app's mount (`/` alone, `/<stem>/` when
+   several apps share the server): each app keeps its own session, and
+   signing in or out of one never touches another's."
+  [conn path value max-age]
+  (web/resp-header conn "set-cookie"
+                   (str "split_sid=" value "; HttpOnly; SameSite=Strict; Path=" path "; Max-Age=" max-age)))
+
+; ── the hub: one per app — the open streams, presence, the stamped tabs ────────
+
+(defn- sse-line [event v] (str "event: " event "\ndata: " (bl.json/encode (wire-json v)) "\n\n"))
+
+(defn- hub-loop [auth st]
+  (receive
+    [:open pid who ip]
+      (let [mine (count (filter (fn [s] (= ip (:ip s))) (vals (:streams st))))]
+        (if (or (<= streams-total (count (:streams st))) (<= streams-per-client mine))
+          (do (erlang/send pid [:split/refused :too-many-streams]) (hub-loop auth st))
+          (do (erlang/monitor :process pid)
+              (erlang/send pid [:split/opened])
+              (let [st2 (assoc-in st [:streams pid] {:who who :ip ip})]
+                (erlang/send (erlang/self) [:presence-changed])
+                (hub-loop auth st2)))))
+    [:DOWN _ _ pid _]
+      (if (contains? (:streams st) pid)
+        (do (erlang/send (erlang/self) [:presence-changed])
+            (hub-loop auth (update st :streams dissoc pid)))
+        (hub-loop auth st))
+    [:presence-changed]
+      (if (:people? st)
+        (let [users (vec (sort (distinct (filter some? (map :who (vals (:streams st)))))))
+              people (core/call auth [:people {:users users}] :split/people authority-timeout-ms)
+              line (sse-line "presence" {:people (if (vector? people) people [])})]
+          (doseq [pid (keys (:streams st))] (erlang/send pid [:split/line line]))
+          (hub-loop auth (assoc st :presence line)))
+        (hub-loop auth st))
+    [:split/snapshot v]
+      (let [line (sse-line "snapshot" (assoc (dissoc v :request :tab) :by (:tab v)))]
+        (doseq [pid (keys (:streams st))] (erlang/send pid [:split/line line]))
+        (hub-loop auth st))
+    [:presence-line from]
+      (do (erlang/send from [:split/presence-line (:presence st)]) (hub-loop auth st))))
+
+; ── static files: the browser half ─────────────────────────────────────────────
+
+(defn statics
+  "path (under the mount) → [file content-type csp?]. `research` is the
+   research/js-actors directory: the page, Worker, codec and host modules and
+   the compiled client live there."
+  [research stem]
+  (let [js "text/javascript" json "application/json"]
+    {"/" [(str research "/showcase.html") "text/html" true]
+     "/showcase-page.mjs" [(str research "/showcase-page.mjs") js]
+     "/split-worker.mjs" [(str research "/split-worker.mjs") js]
+     "/split-codec.mjs" [(str research "/split-codec.mjs") js]
+     "/host.mjs" [(str research "/host.mjs") js]
+     "/app.css" [(str research "/apps/" stem ".css") "text/css"]
+     "/app.page.json" [(str research "/apps/" stem ".page.json") json]
+     (str "/out/" stem "-client.mjs") [(str research "/out/" stem "-client.mjs") js]
+     (str "/out/" stem ".contract.json") [(str research "/out/" stem ".contract.json") json]
+     (str "/out/" stem ".split.json") [(str research "/out/" stem ".split.json") json]}))
+
+; ── one mounted app ────────────────────────────────────────────────────────────
+
+(defn mount
+  "Start app `a`'s authority and hub. `opts`: `:data` (a directory: the app's
+   durable log lives at <data>/<stem>.fjall when the app keeps :history; nil
+   keeps nothing), `:secret` (bytes; the session key, shared by the server's
+   apps). Answers the mount record the router serves."
+  [a opts]
+  (let [log (if (and (some? (:data opts)) (< 0 (core/history-size a)))
+              ; named by the stem the app is served under: the name an
+              ; operator sees in the URL is the name of its data
+              (slog/open (str (:data opts) "/" (:stem opts) ".fjall") (:stem opts))
+              nil)
+        replay (if (nil? log) [] (slog/proposals log (:digest a)))
+        auth (core/start a {:replay replay
+                            :commit! (if (nil? log) nil (fn [commit] (slog/append! log commit)))})
+        hub (spawn (fn [] (hub-loop auth {:streams {} :people? (some? (core/roster a))
+                                           :presence (sse-line "presence" {:people []})})))]
+    (erlang/send auth [:subscribe hub])
+    {:app a :stem (:stem opts) :auth auth :hub hub :log log :secret (:secret opts) :replayed (count replay)
+     :statics (statics (:research opts) (:stem opts))
+     :sessions (atom {}) :next-request (atom 0)}))
+
+; ── responses ──────────────────────────────────────────────────────────────────
+
+(defn- no-store [conn]
+  (-> conn (web/resp-header "cache-control" "no-store") (web/resp-header "x-content-type-options" "nosniff")))
+
+(defn send-json [conn status v] (web/json (no-store conn) status (wire-json v)))
+
+(def csp-page
+  (str "default-src 'none'; script-src 'self'; worker-src 'self'; child-src 'self'; "
+       "connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+       "object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"))
+
+; ── requests ───────────────────────────────────────────────────────────────────
+
+(defn- host-ok? [conn port]
+  (let [h (web/req-header conn "host")]
+    (contains? #{(str "127.0.0.1:" port) (str "localhost:" port)} h)))
+
+(defn- origin-ok? [conn port]
+  (let [o (web/req-header conn "origin")]
+    (or (nil? o) (contains? #{(str "http://127.0.0.1:" port) (str "http://localhost:" port)} o))))
+
+(defn- json-body
+  "The request body parsed as JSON: `[:ok value conn]` or `[:bad status reason conn]`."
+  [conn]
+  (let [ct (first (String/split (String/downcase (or (web/req-header conn "content-type") "")) ";"))]
+    (if (not (= "application/json" (String/trim ct)))
+      [:bad 415 :content-type-refused conn]
+      (let [r (erlang/apply Conn :read_body (list conn (list (tuple :length max-body) (tuple :read_length max-body))))
+            tag (erlang/element 1 r)]
+        (cond
+          (= tag :more) [:bad 413 :oversized-body (erlang/element 3 r)]
+          (not (= tag :ok)) [:bad 400 :malformed-json conn]
+          ; bl.json's native decoder reads an object whose key is serde's
+          ; private number token as a NUMBER; a browser never sends that key,
+          ; so a body containing it is refused rather than reshaped
+          (String/contains? (erlang/element 2 r) "$serde_json::private::Number") [:bad 400 :malformed-json (erlang/element 3 r)]
+          :else (let [c2 (erlang/element 3 r)
+                      j (try (bl.json/decode (erlang/element 2 r)) (catch _ ::bad))]
+                  (if (= j ::bad) [:bad 400 :malformed-json c2] [:ok j c2])))))))
+
+(defn- session-of [m conn]
+  (when (some? (core/roster (:app m)))
+    (let [sid (cookie-sid (:secret m) (web/req-cookie conn "split_sid"))
+          s (when sid (get @(:sessions m) sid))]
+      (cond
+        (nil? s) nil
+        (< session-ttl-s (- (erlang/system_time :second) (:created s))) (do (swap! (:sessions m) dissoc sid) nil)
+        :else (assoc s :sid sid)))))
+
+(defn- current [m] (core/call (:auth m) [:current] :split/current authority-timeout-ms))
+
+(defn- unavailable [conn] (send-json conn 503 {:ok false :reason :authority-unavailable}))
+
+(defn- write-refusal
+  "Why a write request is refused before its body is read, or nil. Checked
+   FIRST, so a refusal answers on a connection whose body is untouched (and
+   Bandit drains it) — never on one a read already advanced."
+  [conn port]
+  (cond
+    (not (= "post" (web/method conn))) [405 :method-not-allowed]
+    (not (origin-ok? conn port)) [403 :origin-refused]
+    :else nil))
+
+(defn handle-intent [m conn port]
+  (let [a (:app m)
+        refusal (write-refusal conn port)
+        [tag x y z] (if (nil? refusal) (json-body conn) [:refused])]
+    (cond
+      (some? refusal) (send-json conn (first refusal) {:ok false :reason (second refusal)})
+      (= tag :bad) (send-json z x {:ok false :reason y})
+      :else
+        (let [j x conn y
+              d (decode-proposal a j)
+              cur (fn [] (let [c (current m)] (if (map? c) c {})))]
+          (if (= :bad (first d))
+            (let [c (cur)]
+              (send-json conn (nth d 1) {:ok false :reason (nth d 2) :request (if (map? j) (get j "request") nil)
+                                         :revision (:revision c) :board (:board c)}))
+            (let [session (session-of m conn)]
+              (if (and (some? (core/roster a)) (nil? session))
+                (let [c (cur)]
+                  (send-json conn 401 {:ok false :reason :not-signed-in :revision (:revision c) :board (:board c)}))
+                (let [n (swap! (:next-request m) inc)
+                      tab (web/req-header conn "x-split-tab")
+                      p (assoc (nth d 1) :request n :actor (if (nil? session) nil (:user session))
+                               :tab (if (tab-id? tab) tab nil))]
+                  (let [r (core/call (:auth m) [:intent p] :split/result authority-timeout-ms)]
+                    (if (map? r)
+                      (send-json conn (cond (:ok r) 200 (= :stale-revision (:reason r)) 409 :else 422)
+                                 (assoc r :request (get j "request")))
+                      (unavailable conn)))))))))))
+
+(def heartbeat-ms
+  "How often an idle stream writes a comment line. Bandit tells a streaming
+   handler nothing when its client goes away — only the next write fails — so
+   this is also how fast a closed tab leaves presence (and its stream slot)."
+  1000)
+
+(defn- stream-loop
+  "Write lines the hub sends until the client or the hub goes away. A stream
+   whose hub died ends, so the tab reconnects instead of hanging on a live but
+   silent connection."
+  [conn hub-ref]
+  (receive
+    [:split/line line]
+      (let [r (erlang/apply Conn :chunk (list conn line))]
+        (if (= :ok (erlang/element 1 r)) (stream-loop (erlang/element 2 r) hub-ref) conn))
+    [:DOWN r _ _ _] :when (= r hub-ref) conn
+    (after heartbeat-ms
+      (let [r (web/sse-comment conn)] (if (:ok r) (stream-loop (:ok r) hub-ref) conn)))))
+
+(defn- client-ip [conn] (erlang/map_get :remote_ip conn))
+
+(defn handle-events [m conn]
+  (let [a (:app m)
+        session (session-of m conn)
+        who (if (nil? session) nil (:user session))]
+    (erlang/send (:hub m) [:open (erlang/self) who (client-ip conn)])
+    (receive
+      [:split/refused why] (send-json conn 503 {:ok false :reason why})
+      [:split/opened]
+        (let [c (current m)]
+          (if (not (map? c))
+            (unavailable conn)
+            (let [hello (merge {:digest (:digest a) :revision (:revision c) :board (:board c)
+                                :recent (:recent c) :history (:history c)}
+                               (if (some? (:people c))
+                                 {:people (:people c) :me (if (nil? who) nil (core/person a who))}
+                                 {}))
+                  s (-> conn no-store (web/resp-header "content-type" "text/event-stream; charset=utf-8")
+                        (web/resp-header "connection" "keep-alive"))
+                  s (erlang/apply Conn :send_chunked (list s 200))
+                  r (erlang/apply Conn :chunk (list s (sse-line "hello" hello)))]
+              (stream-loop (erlang/element 2 r) (erlang/monitor :process (:hub m))))))
+      (after authority-timeout-ms (unavailable conn)))))
+
+(defn handle-login [m conn port]
+  (let [people? (some? (core/roster (:app m)))
+        refusal (if people? (write-refusal conn port) [404 :not-found])
+        [tag x y z] (if (nil? refusal) (json-body conn) [:refused])]
+    (cond
+      (some? refusal) (send-json conn (first refusal) {:ok false :reason (second refusal)})
+      (= tag :bad) (send-json z x {:ok false :reason y})
+      :else
+        (let [j x conn y
+              user (if (map? j) (get j "user") nil)]
+          (if (not (and (string? user) (<= 1 (count user)) (<= (count user) 64)))
+            (send-json conn 400 {:ok false :reason :malformed-login})
+            (let [p (core/call (:auth m) [:login {:user user}] :split/login authority-timeout-ms)]
+              (cond
+                ; no answer (slow, or the authority is gone) is not a verdict
+                (contains? #{:timeout :down} p) (unavailable conn)
+                (not (map? p)) (send-json conn 403 {:ok false :reason :unknown-person})
+                :else
+                  (let [sid (b64url (crypto/strong_rand_bytes 18))]
+                    (swap! (:sessions m) assoc sid {:user (:id p) :created (erlang/system_time :second)})
+                    (send-json (set-session-cookie conn (:cookie-path m) (cookie-value (:secret m) sid) session-ttl-s)
+                               200 {:ok true :person p})))))))))
+
+(defn handle-logout [m conn port]
+  (cond
+    (nil? (core/roster (:app m))) (send-json conn 404 {:ok false :reason :not-found})
+    (not (= "post" (web/method conn))) (send-json conn 405 {:ok false :reason :method-not-allowed})
+    (not (origin-ok? conn port)) (send-json conn 403 {:ok false :reason :origin-refused})
+    :else (let [sid (cookie-sid (:secret m) (web/req-cookie conn "split_sid"))]
+            (when sid (swap! (:sessions m) dissoc sid))
+            (send-json (set-session-cookie conn (:cookie-path m) "" 0) 200 {:ok true}))))
+
+(defn handle-me [m conn]
+  (if (nil? (core/roster (:app m)))
+    (send-json conn 404 {:ok false :reason :not-found})
+    (let [s (session-of m conn)]
+      (send-json conn 200 {:person (if (nil? s) nil (core/person (:app m) (:user s)))
+                           :people (core/public-people (:app m))}))))
+
+(defn handle-peek [m conn]
+  (if (= 0 (core/history-size (:app m)))
+    (send-json conn 404 {:ok false :reason :not-found})
+    (let [raw (get (erlang/apply (erlang/binary_to_atom "Elixir.URI") :decode_query (list (web/query conn))) "revision")]
+      (if (not (and (string? raw) (<= 1 (count raw)) (<= (count raw) 9) (chars-in? raw digit?)))
+        (send-json conn 400 {:ok false :reason :malformed-revision})
+        (let [k (erlang/binary_to_integer raw)
+              p (core/call (:auth m) [:peek {:revision k}] :split/peek authority-timeout-ms)]
+          (if (map? p) (send-json conn 200 p) (unavailable conn)))))))
+
+(defn static-fallback
+  "What a missing optional file serves: an app may ship no stylesheet and no
+   page metadata, and the shell still works. Anything else missing is nil (a 500)."
+  [sub stem]
+  (cond (= sub "/app.css") ""
+        (= sub "/app.page.json") (bl.json/encode {:title stem :lede "" :hints []})
+        :else nil))
+
+(defn handle-static [m conn sub]
+  (let [entry (get (:statics m) sub)]
+    (cond
+      (not (contains? #{"get" "head"} (web/method conn))) (send-json conn 405 {:ok false :reason :method-not-allowed})
+      (nil? entry) (send-json conn 404 {:ok false :reason :not-found})
+      :else
+        (let [[file ct csp?] entry
+              data (try (File/read! file) (catch _ (static-fallback sub (:stem m))))
+              c (no-store conn)
+              c (if csp? (web/resp-header c "content-security-policy" csp-page) c)]
+          (if (nil? data)
+            (send-json conn 500 {:ok false :reason :static-unavailable})
+            (web/bytes c ct data))))))
+
+; ── the router ─────────────────────────────────────────────────────────────────
+
+(defn- unsafe-path? [raw]
+  (let [l (String/downcase raw)]
+    (or (String/contains? l "..") (String/contains? l "%2e") (String/contains? l "%2f")
+        (String/contains? l "%5c") (String/contains? l "\\"))))
+
+(def read-routes #{"/api/app" "/api/events" "/api/me" "/api/peek"})
+
+(defn- route-app [m conn sub port]
+  (cond
+    ; the read APIs answer GET only: a POST to /api/events must not open a stream
+    (and (contains? read-routes sub) (not (= "get" (web/method conn))))
+      (send-json conn 405 {:ok false :reason :method-not-allowed})
+    (= sub "/api/app") (send-json conn 200 {:app (:stem m) :digest (:digest (:app m))})
+    (= sub "/api/intent") (handle-intent m conn port)
+    (= sub "/api/events") (handle-events m conn)
+    (= sub "/api/login") (handle-login m conn port)
+    (= sub "/api/logout") (handle-logout m conn port)
+    (= sub "/api/me") (handle-me m conn)
+    (= sub "/api/peek") (handle-peek m conn)
+    :else (handle-static m conn sub)))
+
+(defn router
+  "The plug for `mounts` (a map of prefix → mount; prefix \"\" is the root
+   app) plus an optional `:index` page (html) served at `/` when no app sits
+   at the root."
+  [mounts index port]
+  (fn [conn]
+    (let [raw (erlang/map_get :request_path conn)]
+      (cond
+        (unsafe-path? raw) (send-json conn 404 {:ok false :reason :not-found})
+        (not (host-ok? conn port)) (send-json conn 403 {:ok false :reason :host-refused})
+        (contains? mounts "") (route-app (get mounts "") conn raw port)
+        (and (= raw "/") (some? index)) (web/html (no-store conn) index)
+        :else
+          (let [seg (second (String/split raw "/"))
+                m (get mounts (or seg ""))]
+            (cond
+              (nil? m) (send-json conn 404 {:ok false :reason :not-found})
+              (= raw (str "/" seg)) (web/redirect conn (str "/" seg "/"))
+              :else (route-app m conn (subs raw (inc (count seg))) port)))))))
+
+; ── serving ────────────────────────────────────────────────────────────────────
+
+(def default-research "research/js-actors")
+
+(defn serve
+  "Serve split apps on 127.0.0.1:`port`. `apps` is a vector of
+   `[stem app-value]` (stem: the name the JS build compiled the browser half
+   under, e.g. \"groceries\"). One app is served at `/`; several are each
+   served at `/<stem>/`, with `:index` (html) at `/`. `opts`: `:port`,
+   `:data` (directory for durable logs; nil keeps no history on disk),
+   `:research` (where the browser half was built; default
+   research/js-actors), `:index`. Answers {:port :mounts}."
+  [apps opts]
+  (let [port (get opts :port 4040)
+        secret (crypto/strong_rand_bytes 32)
+        base {:data (:data opts) :secret secret :research (get opts :research default-research)}
+        mounts (reduce (fn [acc [stem a]] (assoc acc stem (mount a (assoc base :stem stem)))) {} apps)
+        routed (if (= 1 (count apps))
+                 {"" (assoc (get mounts (first (first apps))) :cookie-path "/")}
+                 (reduce (fn [acc [stem m]] (assoc acc stem (assoc m :cookie-path (str "/" stem "/")))) {} mounts))]
+    (web/serve {:port port :ip (tuple 127 0 0 1) :log :off
+                :plug (router routed (:index opts) port)})
+    {:port port :mounts mounts}))

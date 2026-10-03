@@ -1,0 +1,396 @@
+#+TITLE: How one file becomes two programs
+#+STARTUP: showall
+
+* One file, two programs, zero glue
+
+A split app is one =.bl= file: plain =defn=s and one declaration,
+=(split/defapp name {…})=. Out of it come *two programs*: one runs in the
+browser and one runs on the server. They talk over HTTP. The app author writes
+no route, no JSON encoder, no fetch call, no message handler, no socket code
+and no second copy of any rule. This document shows exactly how that works,
+piece by piece, on real apps from =research/js-actors/apps/=, and each claim
+below is backed by a cell that runs.
+
+The short version: *the declaration is the only glue*. Everything that is
+usually glue is *derived* from it, by four mechanisms:
+
+| mechanism            | input                     | output                                        |
+|----------------------+---------------------------+-----------------------------------------------|
+| the contract         | =:wire= + =:intents=      | a data value both halves check, and its hash  |
+| placement            | the functions' own code   | which functions run where, with evidence      |
+| the shells           | nothing app-specific      | the two loops that move data between halves   |
+| dispatch             | the role slots            | =op → function= tables, one per role          |
+
+Read in this order: [[*The declaration][the declaration]] → [[*The contract][the contract]] →
+[[*Placement][placement]] → [[*The two shells][the shells]] → [[*One click, end to end][one click, end to end]] →
+[[*What the author never writes][what the author never writes]] → [[*Where the seams are][where the seams are]].
+
+* The declaration
+
+This is the whole declaration of the groceries app. Everything else in its file
+is ordinary functions.
+
+#+begin_src beam-lisp :id declaration
+(ns split-doc (:require [bl.json]))
+
+(defn app-source [stem] (File/read! (str "research/js-actors/apps/" stem ".bl")))
+
+(defn declaration-text
+  "The `(split/defapp …)` form of an app file, as written."
+  [stem]
+  (let [src (app-source stem)
+        at (binary/match src "(split/defapp")]
+    (erlang/binary_part src (erlang/element 1 at) (- (erlang/byte_size src) (erlang/element 1 at)))))
+
+(println (String/trim_trailing (declaration-text "groceries")))
+#+end_src
+#+RESULTS: declaration
+: (split/defapp groceries
+:   {:wire {:item [:record {:id [:int 0 9999] :name [:text 1 32] :qty [:int 1 99]
+:                           :aisle :aisle :got :bool}]
+:           :aisle [:one-of :produce :bakery :dairy :pantry :other]
+:           :basket [:record {:items [:list 40 :item]}]}
+:    :server {:init initial-list :snapshot :basket}
+:    :client {:init initial-local :view list-view :on on-event}
+:    :intents {:add-item {:params {:name [:text 1 32] :aisle :aisle}
+:                         :check add-problem :predict predict-add :agrees? same-but-ids? :apply add-item}
+:              :tick-item {:params {:id [:int 1 9999] :got :bool}
+:                          :check tick-problem :predict predict-tick :apply tick-item}
+:              :change-qty {:params {:id [:int 1 9999] :delta [:int -1 1]}
+:                           :check qty-problem :predict predict-qty :apply change-qty}
+:              :remove-item {:params {:id [:int 1 9999]}
+:                            :check exists-problem :predict predict-remove :apply remove-item}
+:              :clear-basket {:params {}
+:                             :check clear-problem :predict predict-clear :apply clear-basket}}})
+: :ok
+
+
+A declaration has four parts, and each has one job:
+
+- =:wire= — the *shapes* that may cross the network. A shape is data:
+  =[:text 1 32]=, =[:int 0 9999]=, =:bool=, =[:one-of :produce …]=,
+  =[:list 40 :item]=, =[:record {…}]=, or the name of another shape.
+- =:server= — what only the server holds: =:init= (the first state) and
+  =:snapshot= (the shape of the part everyone may see).
+- =:client= — what each browser tab holds: =:init= (its local state, like a
+  draft), =:view= (the screen, as data) and =:on= (what a UI event does
+  locally, and which intent it asks for).
+- =:intents= — the only ways to change shared state. Each intent names its
+  arguments' shape (=:params=) and up to eight *roles*:
+
+| role       | who runs it | question it answers                                    |
+|------------+-------------+--------------------------------------------------------|
+| =:check=   | both        | is this allowed on this board? (nil = yes, else why)   |
+| =:predict= | browser     | what board do I expect back? (shown at once)           |
+| =:agrees?= | browser     | does the server's answer count as my guess?            |
+| =:allow=   | server      | may *this person* do it?                               |
+| =:guard=   | server      | a check that needs private state                       |
+| =:apply=   | server      | the next state                                         |
+| =:says=    | server      | one line for the activity feed                         |
+
+A role is a *symbol naming a defn*. That is the point where the declaration
+touches code, and it is the only one.
+
+* The contract
+
+The contract is the part of the declaration both halves must agree on: the
+shapes, the snapshot's shape, and each intent's argument shape. It is plain
+data. Its canonical JSON (sorted keys, no spaces) is hashed, and the hash (the
+/digest/) travels with every proposal and every hello. Two halves built from
+different declarations cannot talk: the digest differs and the server answers
+=client-outdated=.
+
+#+begin_src beam-lisp :id contract
+(def contract (bl.json/decode (File/read! "research/js-actors/out/groceries.contract.json")))
+(println "digest " (subs (get contract "digest") 0 16) "…")
+(println "snapshot" (get contract "snapshot"))
+(doseq [op (sort (keys (get contract "intents")))]
+  (println "intent " op (bl.json/encode (get-in contract ["intents" op "params"]))))
+#+end_src
+#+RESULTS: contract
+: digest  bbf37e375d12248c …
+: snapshot basket
+: intent  add-item {"aisle":"aisle","name":["text",1,32]}
+: intent  change-qty {"delta":["int",-1,1],"id":["int",1,9999]}
+: intent  clear-basket {}
+: intent  remove-item {"id":["int",1,9999]}
+: intent  tick-item {"got":"bool","id":["int",1,9999]}
+: nil
+
+
+Notice what is *not* in the contract: no function, no role, no view. The
+contract says what may cross; it says nothing about what anyone does with it.
+That keeps it small, stable and safe to publish.
+
+The digest is computed the same way on BEAM. This cell recomputes it from the
+contract body with the canonical rule and compares it with the one the JS
+build wrote:
+
+#+begin_src beam-lisp :id digest
+(defn cjson-str [s] (let [e (bl.json/encode [s])] (subs e 1 (dec (count e)))))
+(defn cjson [v]
+  (cond (nil? v) "null" (= v true) "true" (= v false) "false" (int? v) (str v)
+        (string? v) (cjson-str v)
+        (map? v) (str "{" (apply str (interpose "," (map (fn [k] (str (cjson-str k) ":" (cjson (get v k))))
+                                                        (sort (keys v))))) "}")
+        :else (str "[" (apply str (interpose "," (map cjson v))) "]")))
+(defn hex [bin]
+  (apply str (map (fn [b] (let [s (String/downcase (Integer/to_string b 16))] (if (< b 16) (str "0" s) s)))
+                  (erlang/binary_to_list bin))))
+(def body (dissoc contract "digest"))
+(println "recomputed = stamped:" (= (get contract "digest") (hex (crypto/hash :sha256 (cjson body)))))
+#+end_src
+#+RESULTS: digest
+: recomputed = stamped: true
+: :ok
+
+
+* Placement
+
+Every function in the file ends up in one of four places: *browser only*,
+*both halves*, *server only*, or *unused*. The author never marks a function.
+The build walks the call graph from each half's /roots/:
+
+- browser roots: =:client :init=, =:view=, =:on=, every =:check=, =:predict=,
+  =:agrees?=
+- server roots: =:server :init=, every =:check=, =:guard=, =:apply=, =:allow=,
+  =:says=, and the =:people= / =:undo-allow= slots
+
+A function reached only from browser roots is browser-only; only from server
+roots, server-only; from both, it is compiled into both halves. That is how
+=:check= works on both sides without being written twice: it is *one* function
+that both halves happen to reach.
+
+#+begin_src beam-lisp :id placement
+(defn manifest [stem] (bl.json/decode (File/read! (str "research/js-actors/out/" stem ".split.json"))))
+(defn by-place [stem]
+  (reduce (fn [m f] (update m (get f "placement") (fn [xs] (conj (or xs []) (get f "name")))))
+          {} (get (manifest stem) "functions")))
+(doseq [[place names] (sort (by-place "groceries"))]
+  (println (str place " (" (count names) "):") (apply str (interpose " " names))))
+#+end_src
+#+RESULTS: placement
+: client (12): predict-add same-but-ids? initial-local on-event touched-ids member? item-row aisle-block reason-text note-banner sync-bar list-view
+: server (6): initial-list add-item tick-item change-qty remove-item clear-basket
+: shared (16): item aisles max-items find-item find-named known-aisle? add-problem tick-problem qty-problem exists-problem clear-problem with-item predict-tick predict-qty predict-remove predict-clear
+: unused (1): pending-names
+: nil
+
+
+Reaching a function is necessary, not sufficient. A function may only run in
+the browser if three independent oracles agree it is *portable*, and each keeps
+its evidence in the manifest:
+
+| oracle   | reads                                  | refuses when                                           |
+|----------+----------------------------------------+--------------------------------------------------------|
+| =graph=  | the indexed source call graph          | it calls something the browser runtime does not define |
+| =effects=| the whole-program effect analysis      | it has a footprint, or termination is not proven       |
+| =abi=    | the compiled ANF of the function       | it receives, calls the host, or leaves the JS ABI      |
+
+A fourth analysis, /closure flow/, follows function values (=comp=,
+=partial=, a predicate chosen from data) so a call through a value is judged
+like a direct call, and any recursion must be proven to descend into its own
+data.
+
+Portability is a *greatest fixpoint*: a function is portable when it has no
+reason of its own AND everything it calls is portable. A browser root that is
+not portable refuses the whole app, naming the path from the root to the
+offender and the reason, with line numbers.
+
+#+begin_src beam-lisp :id evidence
+(defn evidence [stem name]
+  (some (fn [f] (if (= name (get f "name")) f nil)) (get (manifest stem) "functions")))
+(doseq [n ["predict-add" "tick-problem" "tick-item"]]
+  (let [f (evidence "groceries" n)]
+    (println n "→" (get f "placement")
+             "| graph" (get-in f ["evidence" "graph"]) "| effects" (get-in f ["evidence" "effects"])
+             "| abi" (get-in f ["evidence" "abi"]))))
+#+end_src
+#+RESULTS: evidence
+: predict-add → client | graph ok | effects ok | abi ok
+: tick-problem → shared | graph ok | effects ok | abi ok
+: tick-item → server | graph ok | effects ok | abi ok
+: nil
+
+
+=tick-item= passes all three oracles, yet it is server-only. Portability allows
+a function to go to the browser; reachability decides whether it does. The
+browser never reaches an =:apply=, so no =:apply= is ever shipped. The server
+keeps the only copy of the rule that decides.
+
+A function can also be /forced/ to stay home with =:server {:private [f]}=:
+private data (an audit log, the roster) is then refused if any browser root
+reaches it.
+
+* The two shells
+
+The halves are not generated per app. Each is a *shell*, a generic BL program
+that names no app function; the app's own functions plug into it through a
+small /dispatch/ layer.
+
+| shell                     | runs on | owns                                                        |
+|---------------------------+---------+-------------------------------------------------------------|
+| =priv/lib/split/wire.bl=  | both    | =wire-ok?= and =wire-project=: the shape grammar, one source |
+| =priv/lib/split/core.bl=  | BEAM    | the authority: decide, commit, history, nonces, feed        |
+| =priv/lib/split/web.bl=   | BEAM    | HTTP: codec, sessions, streams, presence, static files      |
+| =split-client.bl=         | browser | the tab loop: predict, queue, send, settle, rebase, offline |
+
+The dispatch layer is what makes a generic shell call an app function, and it
+takes a different form on each side.
+
+*On BEAM it is not source at all.* =split/defapp= is a macro that keeps the
+declaration twice: quoted, for the contract, and evaluated, so each role
+symbol becomes the function it names. The authority reaches a role by
+looking it up in that app value:
+
+#+begin_example
+(defn check [a op board args]
+  (let [f (get-in a [:intents op :check])]
+    (if (nil? f) :unknown-intent (f board args))))
+#+end_example
+
+*In the browser it is generated source,* because the JS bundle carries only
+the functions the client roots reach and nothing else, and one =cond= per
+role names exactly those:
+
+#+begin_example
+(defn split-check [op board args]
+  (cond
+    (= op :add-item) (add-problem board args)
+    (= op :tick-item) (tick-problem board args)
+    …
+    :else :unknown-intent))
+#+end_example
+
+The two agree by construction: both read the same declaration, and both
+compute the same contract digest from it. This cell loads groceries natively
+and asks the BEAM app value for its digest:
+
+#+begin_src beam-lisp :id beam-digest
+(BeamLisp.Env/add_search_path "research/js-actors/apps")
+(BeamLisp.Loader/ensure_loaded "groceries")
+(def app (BeamLisp.Compiler/eval_string "groceries/groceries"))
+(println "BEAM digest = browser digest:" (= (:digest app) (get contract "digest")))
+(println "roles resolved to functions:" (fn? (get-in app [:intents :tick-item :check]))
+         (fn? (get-in app [:intents :tick-item :apply])))
+#+end_src
+#+RESULTS: beam-digest
+: BEAM digest = browser digest: true
+: roles resolved to functions: true true
+: :ok
+
+
+** The authority, step by step
+
+For each proposal, in order, the server answers exactly once:
+
+1. the digest must match this build;
+2. the op must be declared, and its args must satisfy the declared shape;
+3. an app with a roster needs a signed-in person (stamped by the transport,
+   never sent by the browser);
+4. the revision must be the one the proposal was made against;
+5. the shared =:check= runs *again*, here, on the authoritative board;
+6. =:allow= (this person?) and then =:guard= (private state?) run;
+7. =:apply= computes the next state, which must still project onto the
+   snapshot shape.
+
+Only then does the revision advance. A refusal is a value, never a crash, so
+no proposal can take the authority down. A repeated nonce answers =duplicate=
+and commits nothing, which makes resending safe.
+
+** The tab, step by step
+
+The browser half owns the last *confirmed* board, the tab's local state, and a
+/sync/ record. The view never sees the confirmed board directly; it sees the
+confirmed board *with every pending prediction applied in order*. That is why
+an edit shows in the same frame. When the answer comes back:
+
+- *ok*: the intent leaves the queue, and the server's board replaces the guess;
+- *stale-revision*: someone else committed first; the tab adopts the newer
+  board, re-checks the intent against it, and resends (at most 3 tries);
+- *refused*: the intent leaves the queue, its prediction stops applying (the
+  row slides back), and the reason is shown;
+- *no answer*: the link is down; the intent waits at the head of the queue and
+  new ones queue behind it, still shown at once.
+
+* One click, end to end
+
+A tick on "Cherry tomatoes", traced through every layer. No layer below is
+written by the app author.
+
+| # | where        | what happens                                                   | written by       |
+|---+--------------+----------------------------------------------------------------+------------------|
+| 1 | page         | the button carries =[:tick 4]= as data; a click posts it       | the app's =:view= |
+| 2 | Worker       | the event reaches the tab loop as =[:browser :event …]=        | shell            |
+| 3 | tab          | =:on= turns it into intent =[:tick-item {:id 4 :got true}]=    | the app's =:on=  |
+| 4 | tab          | =:check= (shared) passes on the shown board                    | the app          |
+| 5 | tab          | the intent is queued; =:predict= draws it ticked at once       | the app          |
+| 6 | tab          | the head is re-checked and posted with digest, revision, nonce | shell            |
+| 7 | transport    | JSON decoded *by the contract*; actor stamped from the session | derived          |
+| 8 | authority    | steps 1–7 above; =:apply= makes the next state                 | shell + the app  |
+| 9 | authority    | the result goes back; a snapshot goes to every open tab        | shell            |
+|10 | every tab    | the snapshot is adopted if newer; views re-render              | shell            |
+
+The author wrote rows 1, 3, 4, 5 and the =:apply= in row 8, each as a pure
+function of data.
+
+* What the author never writes
+
+Counted over the six research apps. /code/ is non-blank, non-comment lines;
+/declaration/ is the =defapp= form; the rest of the column set comes from each
+app's manifest and contract.
+
+#+begin_src beam-lisp :id counts
+(defn code-lines [stem]
+  (count (filter (fn [l] (let [t (String/trim l)] (and (not (= "" t)) (not (String/starts_with? t ";")))))
+                 (String/split (app-source stem) "\n"))))
+(println "app        code  fns  browser  both  server  intents")
+(doseq [stem ["outline" "groceries" "team" "triage" "ledger"]]
+  (let [p (by-place stem)
+        c (bl.json/decode (File/read! (str "research/js-actors/out/" stem ".contract.json")))]
+    (println (String/pad_trailing stem 10) (String/pad_leading (str (code-lines stem)) 5)
+             (String/pad_leading (str (count (get (manifest stem) "functions"))) 4)
+             (String/pad_leading (str (count (get p "client"))) 8)
+             (String/pad_leading (str (count (get p "shared"))) 5)
+             (String/pad_leading (str (count (get p "server"))) 7)
+             (String/pad_leading (str (count (get c "intents"))) 8))))
+#+end_src
+#+RESULTS: counts
+: app        code  fns  browser  both  server  intents
+: outline      261   36       18    14       4        3
+: groceries    204   35       12    16       6        5
+: team         251   46       12    18      16        7
+: triage       173   24       12    10       2        4
+: ledger       161   23       16     4       3        2
+: nil
+
+
+Against that, the parts an author would otherwise write are all generic:
+routes, the JSON codec, proposal validation, revision and nonce bookkeeping,
+the optimistic queue, offline replay, rebasing after a conflict, the push
+channel, presence, the durable log and its replay, and undo/redo. Every one of
+them lives once, in a shell or the transport, and serves every app.
+
+* Where the seams are
+
+The design has exactly three seams, and each is closed by a rule, not by
+convention.
+
+1. *The wire.* Only contract shapes cross. The server re-checks every argument
+   with =wire-ok?=; it /projects/ every state onto the snapshot shape before
+   publishing, so a field the shape does not name (a counter, an audit trail)
+   cannot leak even if =:apply= stored it.
+2. *The runtime.* Shared functions run on two runtimes. A difference in
+   meaning between them would let the browser's =:check= disagree with the
+   server's. The parity suite (=research/js-actors/order-parity.bl=) runs the
+   same expressions on both and requires equal answers; the prototype found
+   more (=count= of text, =boolean?=), listed in
+   =research/split-beam/proto/README.md=. The server's answer always wins, so
+   a disagreement shows up as a refusal, never as wrong data.
+3. *Identity.* The browser never names who it is in a proposal; the transport
+   stamps the person from a verified session, and the authority decides
+   =:allow= with it. A proposal that carries an actor is malformed.
+
+That is the whole mechanism: one declaration, a contract hashed from it, a
+placement proven from the code, two generic loops, and a dispatch table.
+Nothing app-specific is written twice, and nothing generic is written per app.

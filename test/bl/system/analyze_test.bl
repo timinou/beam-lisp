@@ -1,7 +1,7 @@
 ; test/bl/system/analyze_test.bl — the shared inter-procedural pass: one call
 ; graph, one fixpoint, feeding footprint / return-flow / reachability.
 (ns system.analyze-test
-  (:require [system.analyze :as an]))
+  (:require [system.analyze :as an] [system.footprint :as fp]))
 
 (deftest interprocedural-footprint
   (testing "a caller inherits its callee's global effect"
@@ -44,3 +44,157 @@
       ; runtime-call invokes (chooser) — a runtime value; no edge to add1
       (is (not (contains? (:edges (get s "runtime-call")) "add1"))
           "no edge invented to a fn chosen at runtime"))))
+
+(deftest fn-bodies-keeps-every-clause
+  (testing "a multi-arity defn exposes ALL its clauses, not just the first"
+    (let [b (an/fn-bodies "(defn f ([x] 1) ([x y] 2))")]
+      (is (= 2 (count (:clauses (get b "f")))))))
+  (testing "a single-clause defn is a one-entry clause set (no behavior lost)"
+    (let [b (an/fn-bodies "(defn f [x] (erlang/+ x 1))")]
+      (is (= 1 (count (:clauses (get b "f")))))
+      (is (= (:body (get b "f")) (:body (first (:clauses (get b "f")))))))))
+
+(deftest effect-in-later-clause-is-not-pure
+  (testing "a same-arity SECOND clause's write joins the fn's footprint"
+    (let [s (an/analyze "(defn f ([x] 1) ([y] (swap! acc inc)))")]
+      (is (= {"acc" :W} (:footprint (get s "f")))
+          "the later clause's effect cannot be labelled pure")))
+  (testing "an arity-VARIANT second clause's write joins too"
+    (let [s (an/analyze "(defn f ([] 1) ([x] (swap! acc inc)))")]
+      (is (= {"acc" :W} (:footprint (get s "f")))))))
+
+(deftest calls-in-later-clause-become-edges
+  (testing "a same-arity later clause's call is a resolved edge"
+    (let [s (an/analyze "(defn helper [x] (erlang/+ x 1))
+                         (defn f ([x] x) ([y] (helper y)))")]
+      (is (contains? (:edges (get s "f")) "helper"))))
+  (testing "an arity-variant later clause's call is a resolved edge"
+    (let [s (an/analyze "(defn helper [x] (erlang/+ x 1))
+                         (defn f ([] 1) ([x] (helper x)))")]
+      (is (contains? (:edges (get s "f")) "helper"))
+      (is (contains? (an/reachable s ["f"]) "helper")))))
+
+(deftest opacity-in-later-clause-fails-closed
+  (testing "an opaque call in a later clause keeps the whole fn opaque"
+    (let [s (an/analyze "(defn f ([x] 1) ([x y] (some-unknown-op x)))")]
+      (is (= {:opaque-world :W} (:footprint (get s "f")))
+          "one opaque clause is not averaged away by a pure sibling")))
+  (testing "a non-terminating later clause makes the fn non-terminating"
+    (let [s (an/analyze "(defn f ([x] 1) ([x y] (loop [n x] (recur n))))")]
+      (is (= false (:terminates (get s "f")))))))
+
+(deftest higher-order-through-later-clause
+  (testing "a callback passed at a later clause's call site is a live edge"
+    (let [s (an/analyze "(defn inc2 [n] (erlang/+ n 1))
+                         (defn apply2 ([f x] f) ([f x] (f x)))
+                         (defn main [] (apply2 inc2 5))")]
+      (is (contains? (:edges (get s "apply2")) "inc2"))
+      (is (contains? (an/reachable s ["main"]) "inc2")))))
+
+
+(deftest first-order-core-values-are-pure
+  (testing "str, not and name are first-order core values: no footprint of their own"
+    (let [s (an/analyze "(defn label [n] (str (name :open) \" \" n))
+                         (defn off [x] (not x))")]
+      (is (= {} (:footprint (get s "label"))))
+      (is (= {} (:footprint (get s "off"))))))
+  (testing "a higher-order core name stays opaque: it calls its argument"
+    (let [s (an/analyze "(defn each [f xs] (filter f xs))")]
+      (is (contains? (:footprint (get s "each")) :opaque-world))))
+  (testing "a program that redefines a core name is judged by its own body"
+    (let [s (an/analyze "(defn str [x] (swap! acc inc))
+                         (defn use-it [] (str 1))")]
+      (is (= {"acc" :W} (:footprint (get s "use-it")))
+          "the local `str` wins over the core table")))
+  (testing "a program that rebinds a core name with `def` is not proven pure"
+    (let [s (an/analyze "(def str (fn [x] (swap! acc inc)))
+                         (defn use-it [] (str 1))")]
+      (is (contains? (:footprint (get s "use-it")) :opaque-world)
+          "a def-bound `str` is the program's, not the core table's")))
+  (testing "a `declare`d core name is treated as shadowed"
+    (let [s (an/analyze "(declare str)
+                         (defn use-it [] (str 1))")]
+      (is (contains? (:footprint (get s "use-it")) :opaque-world))))
+  (testing "the engine with NO resolver never calls a core name pure"
+    (let [f (fp/fp-walk nil (BeamLisp.Reader/read_one "(str 1)"))]
+      (is (contains? f :opaque-world)
+          "a name is not a proof: purity needs a program-aware resolver")))
+  (testing "an unknown global is still opaque"
+    (let [s (an/analyze "(defn go [] (mystery 1))")]
+      (is (contains? (:footprint (get s "go")) :opaque-world)))))
+
+(deftest latent-effects-of-function-values
+  (testing "a lambda's body effect is charged to the function that creates it"
+    (let [s (an/analyze "(defn each-print [xs] (mapv (fn [x] (println x)) xs))")]
+      (is (not (= {} (:latent (get s "each-print"))))
+          "footprint alone defers the lambda; latent sees the print")))
+  (testing "a pure lambda, a keyword and a pure named function are latent-pure"
+    (let [s (an/analyze "(defn inc-all [xs] (mapv (fn [x] (inc x)) xs))
+                         (defn titles [xs] (mapv :title xs))
+                         (defn twice [x] (* 2 x))
+                         (defn doubled [xs] (mapv twice xs))")]
+      (is (= {} (:latent (get s "inc-all"))))
+      (is (= {} (:latent (get s "titles"))))
+      (is (= {} (:latent (get s "doubled"))))))
+  (testing "naming an effectful function as a value is latent-effectful"
+    (let [s (an/analyze "(defn shout [x] (println x))
+                         (defn pick [] shout)")]
+      (is (= {} (:footprint (get s "pick"))) "naming it does nothing by itself")
+      (is (not (= {} (:latent (get s "pick")))) "but the value it hands out prints")))
+  (testing "a function value returned by a callee is inherited by the caller"
+    (let [s (an/analyze "(defn shout [x] (println x))
+                         (defn pick [] shout)
+                         (defn run-it [x] ((pick) x))")]
+      (is (not (= {} (:latent (get s "run-it")))))))
+  (testing "a lambda passed through a parameter is still charged to its creator"
+    (let [s (an/analyze "(defn call-it [f x] (f x))
+                         (defn via [x] (call-it (fn [y] (println y)) x))")]
+      (is (= {} (:latent (get s "call-it"))) "call-it creates no function value")
+      (is (not (= {} (:latent (get s "via")))))))
+  (testing "an unknown global used as a value is opaque, a pure core value is not"
+    (let [s (an/analyze "(defn by [xs] (sort-by :id compare xs))
+                         (defn odd [xs] (filterv mystery xs))")]
+      (is (contains? (:latent (get s "odd")) :opaque-world))
+      (is (= {} (:latent (get s "by")))
+          "compare is a first-order core value the program never rebinds")))
+  (testing "a program that rebinds compare cannot pass it off as pure"
+    (let [s (an/analyze "(defn compare [a b] (println a) 0)
+                         (defn by [xs] (sort-by :id compare xs))")]
+      (is (not (= {} (:latent (get s "by")))))))
+  (testing "a function value inside a vector or map literal is still seen"
+    (let [s (an/analyze "(defn in-vec [] [:a (fn [x] (println x))])
+                         (defn in-map [] {:f (fn [x] (println x))})
+                         (defn in-list [] (list 1 (fn [x] (println x))))")]
+      (is (not (= {} (:latent (get s "in-vec")))))
+      (is (not (= {} (:latent (get s "in-map")))))
+      (is (not (= {} (:latent (get s "in-list")))))))
+  (testing "a host function reference is opaque"
+    (let [s (an/analyze "(defn selves [xs] (mapv erlang/self xs))")]
+      (is (contains? (:latent (get s "selves")) :opaque-world)))))
+
+(deftest first-order-predicates-are-pure-values
+  (testing "a first-order predicate handed to a higher-order function has no latent effect"
+    (let [s (an/analyze "(defn evens [xs] (filterv even? xs))
+                         (defn both [p q] (fn [x] (and (p x) (q x))))
+                         (defn top [] ((both even? pos?) 4))")]
+      (is (= {} (:latent (get s "evens"))))
+      (is (= {} (:latent (get s "top"))))))
+  (testing "a shadowed predicate name is the program's, not core's"
+    (let [s (an/analyze "(defn even? [x] (println x))
+                         (defn evens [xs] (filterv even? xs))")]
+      (is (contains? (:latent (get s "evens")) :io)))))
+
+(deftest recursion-converges-to-its-real-effects
+  (testing "a recursive function is as pure as its body: the fixpoint starts at bottom"
+    (let [s (an/analyze "(defn walk [xs] (if (seq xs) (inc (walk (rest xs))) 0))
+                         (defn ping [n] (if (pos? n) (pong (dec n)) 0))
+                         (defn pong [n] (ping n))")]
+      (is (= {} (:footprint (get s "walk"))))
+      (is (= {} (:footprint (get s "ping"))))
+      (is (= {} (:footprint (get s "pong"))))))
+  (testing "an effect anywhere on the recursion still reaches every member"
+    (let [s (an/analyze "(defn loud [xs] (if (seq xs) (do (println 1) (loud (rest xs))) 0))
+                         (defn a [n] (b n))
+                         (defn b [n] (if (pos? n) (a (dec n)) (host-io n)))")]
+      (is (= {:io :W} (:footprint (get s "loud"))))
+      (is (contains? (:footprint (get s "a")) :opaque-world) "the unknown call reaches a through b"))))

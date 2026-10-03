@@ -1,0 +1,149 @@
+; split/wire.bl — the wire grammar, in BL, shared by BOTH split halves.
+;
+; The SAME file runs on both targets: natively on BEAM inside the authority
+; (split.core), and compiled to JavaScript inside the browser half (the
+; research JS backend compiles every defn here into the client bundle). So it
+; uses only what both runtimes define, and its answers are pinned equal by the
+; parity suite.
+;
+; A `split/defapp` declares its wire as data:
+;
+;   [:text min max]      a string of min..max Unicode codepoints
+;                        (`wire-text-length`: the same count on both targets)
+;   [:int min max]       an exact integer in [min, max] (inside ±(2^53-1))
+;   :bool                true or false
+;   :exact               an integer of ANY size (JSON: its decimal digits as a
+;                        string, so nothing is rounded on the way)
+;   [:one-of k …]        one of the listed keywords (JSON: its name)
+;   [:list max T]        a vector of at most `max` values of type T
+;   [:record {k T …}]    a map with EXACTLY the declared keyword keys
+;   :name                a reference to another entry of the `:wire` table;
+;                        a type may name ITSELF through a list (an outline
+;                        item holds `[:list 16 :item]`), so values are finite
+;                        trees of any shape — bounded by `wire-max-depth`
+;
+; Two operations, both total and side-effect free:
+;
+;   wire-ok?       does a value have the declared type? The server asks it of
+;                  every intent's arguments AND of every snapshot it is about to
+;                  publish; the browser asks it of every snapshot it receives.
+;                  The JS codec checks shape too, but only this answer
+;                  authorizes anything.
+;   wire-project   the declared view of a value: a record keeps ONLY its
+;                  declared keys, recursively. This is how server-private state
+;                  (an audit log, an id counter) never reaches the wire — the
+;                  projection has no field for it, whatever the handler stored.
+;
+; The grammar is closed. An unknown type tag, an unknown reference, or a type
+; that is not one of the shapes above is simply not satisfied (wire-ok? is
+; false), so a malformed contract fails closed rather than admitting anything.
+
+(ns split.wire)
+
+(defn wire-resolve
+  "The type a spec denotes: a named reference is looked up in `types`; a
+   primitive keyword or a vector type is itself."
+  [types spec]
+  (cond
+    (= spec :bool) :bool
+    (= spec :exact) :exact
+    (keyword? spec) (get types spec)
+    (vector? spec) spec
+    :else nil))
+
+(defn wire-text-length
+  "The length a `[:text min max]` bound measures: Unicode CODEPOINTS, on both
+   targets. `count` of a string does not agree across them (graphemes on BEAM,
+   UTF-16 units in JavaScript: \"🍌\" is 1 there and 2 here), so the wire never
+   asks it. The JS codec measures the same way (split-codec.mjs `textLength`)."
+  [s]
+  (erlang/length (unicode/characters_to_list s)))
+
+(defn wire-max-depth
+  "How many lists and records may nest in one wire value. A recursive type
+   admits trees of any depth; the wire does not. The JS codec holds the same
+   bound (split-codec.mjs MAX_DEPTH)."
+  [] 24)
+
+(defn wire-every? [types spec xs depth]
+  (cond
+    (empty? xs) true
+    (wire-ok-at types spec (first xs) depth) (wire-every? types spec (rest xs) depth)
+    :else false))
+
+(defn wire-fields-ok? [types fields ks v depth]
+  (cond
+    (empty? ks) true
+    (not (contains? v (first ks))) false
+    (wire-ok-at types (get fields (first ks)) (get v (first ks)) depth)
+      (wire-fields-ok? types fields (rest ks) v depth)
+    :else false))
+
+(defn wire-ok-at
+  "`wire-ok?` for a value found `depth` containers deep."
+  [types spec v depth]
+  (let [t (wire-resolve types spec)]
+    (cond
+      (nil? t) false
+      (= t :bool) (boolean? v)
+      (= t :exact) (int? v)
+      (not (vector? t)) false
+      :else
+        (let [k (first t)]
+          (cond
+            (= k :text) (and (string? v) (<= (nth t 1) (wire-text-length v)) (<= (wire-text-length v) (nth t 2)))
+            (= k :int) (and (int? v) (<= (nth t 1) v) (<= v (nth t 2)))
+            (= k :one-of) (and (keyword? v) (some? (some (fn [x] (if (= x v) x nil)) (rest t))))
+            (< (wire-max-depth) (inc depth)) false
+            (= k :list) (and (vector? v) (<= (count v) (nth t 1))
+                             (wire-every? types (nth t 2) (seq v) (inc depth)))
+            (= k :record) (let [fields (nth t 1)]
+                            (and (map? v) (map? fields)
+                                 (= (count v) (count fields))
+                                 (wire-fields-ok? types fields (keys fields) v (inc depth))))
+            :else false)))))
+
+(defn wire-ok?
+  "Does `v` satisfy `spec` under the named `types`?"
+  [types spec v]
+  (wire-ok-at types spec v 0))
+
+(defn wire-project-fields [types fields ks v acc]
+  (if (empty? ks)
+    acc
+    (let [k (first ks)]
+      (wire-project-fields types fields (rest ks) v
+                           (if (contains? v k)
+                             (assoc acc k (wire-project types (get fields k) (get v k)))
+                             acc)))))
+
+(defn wire-project
+  "The declared view of `v`: records keep only declared keys, lists project
+   each item, everything else is itself. The result still needs `wire-ok?`."
+  [types spec v]
+  (let [t (wire-resolve types spec)]
+    (cond
+      (not (vector? t)) v
+      (and (= :record (first t)) (map? v))
+        (wire-project-fields types (nth t 1) (keys (nth t 1)) v {})
+      (and (= :list (first t)) (vector? v))
+        (mapv (fn [x] (wire-project types (nth t 2) x)) v)
+      :else v)))
+
+(defn wire-intent
+  "The contract entry for intent `op`, or nil for an undeclared intent."
+  [contract op]
+  (get (:intents contract) op))
+
+(defn wire-args-ok?
+  "Do `args` satisfy intent `op`'s declared parameter record?"
+  [contract op args]
+  (let [intent (wire-intent contract op)]
+    (and (some? intent)
+         (wire-ok? (:wire contract) [:record (:params intent)] args))))
+
+(defn wire-snapshot-ok? [contract board]
+  (wire-ok? (:wire contract) (:snapshot contract) board))
+
+(defn wire-snapshot [contract state]
+  (wire-project (:wire contract) (:snapshot contract) state))

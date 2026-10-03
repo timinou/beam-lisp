@@ -110,7 +110,7 @@ is the beam-lisp way: don't add a language, expose a value.
 ## 3. The build-vs-wrap decision: a pure beam-lisp Biscuit
 
 The tempting shortcut is a Rust NIF over `biscuit-auth` (the crate exists,
-`native/datom_redb` already proves we can ship a `rustler` NIF in this repo).
+`native/datom_fjall` already proves we can ship a `rustler` NIF in this repo).
 It is the wrong call here, and the reason is not "Rust is hard" — it is that a
 NIF **breaks the thesis**.
 

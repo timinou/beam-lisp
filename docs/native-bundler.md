@@ -512,4 +512,3 @@ beam-lisp 0.1.0
 ```
 
 `bl version --json` prints the whole record.
-

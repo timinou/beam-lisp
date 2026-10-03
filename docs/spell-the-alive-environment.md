@@ -203,12 +203,11 @@ A handoff chip is the `:handoff` edge; a "claim this file" chip is the
 The proven "app on beam-lisp" skeleton is `ora/djinn-bl`: one Mix host,
 beam-lisp as path dep, app code in `.bl` namespaces, `.local/blrun --path src
 src/…/main.bl`, ward suites via `.local/bltest`. The existing
-`undefine/spell` umbrella carries the Phoenix/Spacetime emitter experiment —
-its interface↔spell compile-time bridge and generated LiveView are the
-encumbrance to leave behind. Live UI comes from `priv/live` + `web/serve`
-(same seam catalog and vitals already use). Durability comes from
-`datom.store-fjall` (already required by `priv/std/codebase.bl:27`) — no redb, no
-Phoenix.
+`undefine/spell` umbrella carries an emitter experiment — its interface↔spell
+compile-time bridge and generated view module are the encumbrance to leave
+behind. Live UI comes from `priv/lib/live` + `web.bl` (same seam catalog and
+vitals already use). Durability comes from `datom.store-fjall` (required by
+`priv/std/codebase.bl`), beside the in-memory ETS, map, and overlay stores.
 
 ### R10 — The MVP cut
 
@@ -226,7 +225,7 @@ spell boot
 ```
 
 Explicitly **not** MVP: multi-tenancy, MCP face, branding, remote deploy,
-Phoenix anything, and W6 reactive re-run (impact-scoped re-run on save) —
+and W6 reactive re-run (impact-scoped re-run on save) —
 that lands after the notebook view exists (it is W5's prerequisite).
 
 ## Prior-art ledger (what was taken from where)
@@ -239,7 +238,7 @@ that lands after the notebook view exists (it is W5's prerequisite).
 | `ora/blueprint` | scenario DSL, worlds, verdict algebra, patterns, certificates | legacy film DSL as primary path; manufacturing domain |
 | `ora/spell/beam/spell_agent` | cassette shape (digest-matched, raw SSE, modes, redaction-by-construction) | Req.Test plug mechanism (replaced by fn seam) |
 | `products/knowledger` | library-as-datom-space, schema packs, procedures suggest/propose-save (later) | multi-tenant onboarding/branding/product scope |
-| `undefine/spell` umbrella | ladder philosophy, journal-vs-transcript separation, session IDs | Phoenix/Spacetime emitter, interface↔spell compile bridge, fixture MCP corpus |
+| `undefine/spell` umbrella | ladder philosophy, journal-vs-transcript separation, session IDs | its emitter, interface↔spell compile bridge, fixture MCP corpus |
 
 ## Linchpins
 

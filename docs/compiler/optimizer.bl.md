@@ -8,7 +8,7 @@ The compiler calls one API:
 (optimize/module descriptor)
 ```
 
-That returns a validated, optimized descriptor. AOT compilation, interactive evaluation and live emission share this path through one hook in the lowerer, so every program is offered to the optimizer and no application namespace needs its own pass. Eligibility is the only thing that varies: a program benefits when the optimizer can prove a law applies, and otherwise it compiles exactly as before.
+That returns a validated, optimized descriptor. AOT compilation, interactive evaluation and live emission share this path through one hook in the lowerer, so every program is offered to the optimizer and no application namespace needs its own pass. Each rule checks its own eligibility. Proven regions can benefit while other regions keep their reference form.
 
 ## Look inside a decision
 
@@ -45,7 +45,7 @@ An explanation contains:
 
 - `:descriptor`: the resulting program.
 - `:evidence`: applied rules, source positions and checked conditions.
-- `:refusals`: candidate rules whose conditions remain unknown.
+- `:refusals`: retained candidates, with safety/coverage or profitability reasons.
 - `:stats`: visited nodes, rewrite count, callback nodes inlined and budget status.
 - `:version`: the rule implementation version.
 
@@ -68,7 +68,7 @@ An explanation contains:
 
 The mapper runs once per element and the left-fold order stays the same. The fused fold keeps a private copy of each callback body, bounded by a per-descriptor inlining allowance (see below). Shared lazy values, escaping lists and live namespace providers retain their regular path.
 
-**Why aliases alone are left alone.** Copying a callback body to where it is applied, when no intermediate list disappears, does not reduce the work the program does, and the original closure definition may stay behind, so output can grow. The optimizer therefore only rematerializes callbacks when a fusion removes real work.
+**Why aliases alone are left alone.** Standalone alias specialization requires a demonstrated benefit. Rematerializing a callback can leave its original closure definition behind and grow the output without removing a traversal. The optimizer therefore only rematerializes callbacks when a fusion removes real work.
 
 **Literal specialization.** A closed integer callback written inline at its fold is specialized without copying.
 
@@ -111,6 +111,12 @@ The pass uses checked laws without starting a solver. Anything unproven keeps it
 - **Escapes and sharing.** A mapped list returned, stored, captured or used twice keeps its map.
 - **Ordinary heap values.** Public arithmetic functions passed as values, maps, decimals and floats keep their normal dispatch.
 - **Lazy sequences.** Shared realization, replay and native resource limits stay with the lazy runtime; the optimizer neither fuses nor reorders them.
-- **Shapes with no law.** Filters, indexed maps, transducers and longer chains compile as written.
+- **Composition boundaries.** Filters, indexed maps and transducers keep their regular contracts. A longer strict map chain can retain stages outside the checked map/fold pair.
 
 Correctness never depends on an annotation or an external tool. A missing fact costs speed, not meaning.
+
+## Extending a law
+
+A new rule needs executable binding and domain facts, a law preserving the relevant observations, baseline and counterexample tests, bounded generated code, and a measured benefit on ordinary source. Helper-dependent facts also need body-change invalidation; lazy rules need demand, replay and resource contracts. Build and strict cold checks validate the exact compiler generation; package audits validate a distributable.
+
+The [research revisit ledger](../../research/optimizer-integration/README.md) names the deferred domains, their missing obligations and the evidence required to revisit each one.
