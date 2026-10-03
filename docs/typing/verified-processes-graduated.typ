@@ -278,6 +278,6 @@ full query planner so reachability is a plain `datom/q` rather than a helper.
 #text(9pt, fill: ink-faint)[
   Modules: `priv/{footprint,model,system,effects}.bl`. Tests:
   `test/bl/system/{model,system}_test.bl`. Demos: `examples/system/01..08`.
-  Numbers + regression: `research/p16_model/GRADUATION.md`. Plan:
+  Numbers + regression: `research/archive/p16_model/GRADUATION.md`. Plan:
   `!tasks/plans/PLAN-048`. Companion: `docs/typing/verified-processes.typ`.
 ]

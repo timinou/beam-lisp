@@ -1,0 +1,163 @@
+# Optimizer integration: spike record and revisit ledger
+
+Status: **experimental research record.** What shipped by default is a small set of checked laws (see `docs/compiler/optimizer.bl.md`). Everything else below was prototyped, measured or analysed and deliberately left out of the default. This file says why, and what evidence would change that. It makes no performance promise for any program or domain not measured here.
+
+## 1. Orientation
+
+- Implementation home: `priv/host/optimize.bl` (`BeamLisp.Optimize`), thin facade `priv/boot/optimize.bl`, one shared hook in `lower/module->core`. Do not add a competing rule engine or an application-level pass.
+- Compiler guide (current design): `docs/compiler/optimizer.bl.md`.
+- Roadmap and dependency order: `!tasks/artifacts/optimizer-coverage-roadmap.md`.
+- Historical delivery (immutable evidence): `!tasks/artifacts/optimizer-prototypes-delivery.md`, `!tasks/artifacts/optimizer-prototypes-results.json`, earlier `!tasks/artifacts/optimizer-delivery.md`, `optimizer-measure-results.json`.
+- Design proposal the work started from: `!tasks/artifacts/sequence-prototype/generalization.md`; kernel experiment: `!tasks/artifacts/sequence-prototype/` (`README.md`, `results.json`, `test.log`, `benchmark.log`); overhead diagnosis: `!tasks/artifacts/sequence-overhead-diagnosis.md`, `sequence-overhead-summary.json`.
+- Raw logs (hash-indexed): `!tasks/artifacts/performance-evidence/optimizer-prototypes/` (`index.json`).
+- Harnesses and tests, all reproducible from the repository:
+  - `!tasks/artifacts/optimizer-lexical-measure.bl` – normal-source compile/code/timing, disabled vs current vs lexical.
+  - `!tasks/artifacts/optimizer-mode-measure.bl`, `optimizer-mode-stage.bl` (isolated whole-RT variants; `BL_MODE_PACKED=1`), `optimizer-mode-audit.bl` (step disassembly, ingress).
+  - `test/bl/optimizer_lexical_prototype_test.bl`, `optimizer_mode_prototype_test.bl` (`BL_MODE_SNAPSHOTS=1` for machine-readable outcomes), `optimizer_open_world_prototype_test.bl`.
+  - `!tasks/artifacts/optimizer-stage.sh`, `optimizer-cold.sh` for staged images and cold acceptance.
+
+A finding is only as current as the generation it ran against. The prototype ran against a frozen checkout (`9f76122a` plus overlay) while `main` moved on. A strict or cold proof of that frozen generation does **not** prove the current `main`. The production cut that promotes part of the prototype needs its own verification on the current generation; until that is recorded in the delivery artifact, treat promoted behavior as implemented but unverified there.
+
+## 2. Separating three questions
+
+Every deferral below fails one of these, and mixing them is how bad optimizations get approved.
+
+1. **Facts** – what is known about the program. Only from executable ANF plus lexical scope. Source annotations, diagnostic tags, coarse flow and read footprints are not certificates. The solver is offline only: it may validate laws and reject negative controls, and has no production dependency. Missing, timed-out or unknown means baseline.
+2. **Safety** – does the rewrite preserve results, errors, effect count and order, demand (what a lazy source is forced to produce), and resource/quota behavior that programs can observe. Unknown → baseline.
+3. **Profitability** – does the emitted code do less work, and is compile time, output size and deployment cost acceptable. A rewrite can be safe and still not worth shipping.
+
+Identity note: *arithmetic* (what `+` computes on integers) and *name* (the symbol `+`) are different from the **value** passed to `reduce`. The production public `+` value is a tagged variadic callable, not a native binary adder; the symbol can be shadowed or rebound. Facts must name the exact value, not the spelling.
+
+## 3. What the default contains and why
+
+| Piece | Evidence | Verdict |
+|---|---|---|
+| Native invocation, numeric domains, literal integer fold | ordinary-source samples at 16000: guarded native loop 1263→1054 µs, 144380→80279 VM reductions; integer fold 536→582 µs, 54229→55530 (no gain observed) (roadmap, "Evidence") | native call kept; integer-fold specialization is retained but is not a speed claim |
+| Strict map/fold including callback aliases and a private mapped list | lexical harness, 16000: private list 931→269 µs, 118615→55550 reductions; aliases+private list 989→172 µs, 118615→53189 (delivery doc). Fusion removes the `lists:map/2` instruction. Strict fusion reduced execution work by more than 2× in the private prototype | **default**, bounded: 64-node callback grammar, cumulative inline allowance seeded by `:max-nodes`, visitor budget |
+| Standalone callback-alias rematerialization (no intermediate removed) | alias only: 327→276 µs but 55255→55708 reductions, i.e. no work saved; BEAM 1040→1140 bytes; unused closure definitions stay | **refused** as unprofitable |
+| Runtime normalization / guard hoisting | see §4 | **not promoted** |
+| `{:lexical? true}` option | existed so the experiment could be gated | **retired**: the capability is default and bounded; there is no flag. `:enabled? false` remains the reference emission |
+
+The 135 lexical timing samples are three cases × sizes 1000/16000/64000 × three variants × five alternating-order repeats; every answer is checked; input construction is included. Timings are contended-host observations. No allocation or total-memory claim exists for them.
+
+## 4. Negative results and why baseline remains the default
+
+Runtime normalization is an explicit fifth argument to `rt/k-reduce` (`:baseline` or `:normalized`); three/four-argument calls are baseline. Hoisted variants exist only as isolated generated images (`optimizer-mode-stage.bl`) and never as the published walker. Normalization applies only to VM-internal identities (callable representation chosen once per traversal), and equality across separately started VMs is not claimed.
+
+Initial run (4800 checked rows), 16000/list/kernel VM reductions: native 160161 baseline vs 160459 packed hoist (no reduction); tagged adder 306311 baseline vs 705587.5 normalized; public `+` 1009952.5 vs 1410459. The generic wrapper added a `reduce-two` helper and `erlang:apply/2`.
+
+After removing that helper (2400 further rows, corrected wrapper), baseline → normalized: native 160080→161303; tagged adder 305217→323002; public `+` 1008768.5→1025296.5. Packed image ≈160565 / 323372.5 / 1025805.5. The wrapper still adds roughly one reduction per element and native work is unchanged. **Why baseline:** the only per-element saving available is a guard the VM already evaluates cheaply; wrapping adds a call frame that costs more than it saves. Packed hoist removes the guard and list allocation in `step/3` bytecode (`call_fun/2`) but showed no native-work reduction. Cross-image wall times come from separate contended VMs and are not controlled speedups.
+
+Also negative: the first lexical implementation could materialize a callback body per use (unbounded growth); that is why the cumulative allowance exists. A named wrapper that only moves a check, or hoisting that adds a helper plus generic `apply`, is not an improvement.
+
+Safety evidence for normalization remains useful if it is ever revived: 2128 canonical outcomes matched helper-hoisted outcomes after normalizing only cross-VM reference IDs and generated Eval function identities; a SAME-VM oracle adds 512 assertions. Gates: strict 103 tests / 3141 assertions; helper and packed hoist 80 tests / 2904 assertions each; these overlap and are not a repository total.
+
+## 5. Revisit ledger
+
+Common rules for every row:
+
+- *Failure if shipped now* = what would break or regress today.
+- *Gate* = tests that must exist and pass before the default changes; each also needs on/off parity (`:enabled? false`) for results, errors and effects, and a negative control for every counterexample listed.
+- Measure, as relevant: compile time, output node/BEAM size, evidence storage, matched VM reductions, allocation (only if claimed), and deployment (below).
+- *Deployment gate* where the change alters the compiler or runtime: coherent source-free seed, fresh-installation strict check with no prior-generation exemptions, rebuilt package audit and outside-tree smoke. Old package or frozen-generation evidence never substitutes.
+- Unsafe or unknown cases report a refusal, never an approximation.
+
+### 5.1 Alias-only cloning and dead closure cleanup
+
+- **Rationale for deferral:** profitability. Measured: no VM-work reduction, BEAM size grew.
+- **Failure now:** code growth with no work saved; leftover original closures.
+- **Dependencies:** a dead-closure elimination that proves the original binding unreferenced and its construction effect-free (closure creation is pure but must be checked after rewriting); or evidence that a downstream pass consumes the cloned form.
+- **Counterexamples:** alias used by both a rewritten and an unrewritten call; shadowing; alias captured by another closure.
+- **Promotion evidence:** disassembly showing fewer instructions *and* no larger BEAM on the alias-only case, plus a workload where a lexical alias blocked a measured win.
+- **Home:** `Optimize` fact/rewrite plus dead-binding cleanup, same file. **Tests:** extend `optimizer_lexical_prototype_test.bl`; measure with `optimizer-lexical-measure.bl`.
+
+### 5.2 Immutable captures
+
+- **Rationale:** callbacks with captured scalars (`(fn [x] (* x k))`) are common; facts need the capture's domain and immutability.
+- **Failure now:** wrong-domain capture (float, decimal, map) would take the integer path and silently change results; a rebound global would be read at a different time.
+- **Dependencies:** lexical binding identity, proof the capture is an integer literal or integer-domain local bound before the closure and not rebound; interaction with the 64-node bound.
+- **Counterexamples:** captured value shadowed; a `var`/atom reference; a capture derived from a call that can raise.
+- **Promotion evidence:** ordinary-source cases where captures prevent fusion, with measured win and parity on shadowing/overflow-to-bignum.
+- **Home:** `Optimize/fact`, `int-callback`. **Tests:** lexical prototype tests plus capture negative controls.
+
+### 5.3 General use / escape analysis
+
+- **Rationale:** current private-use proof is structural: the let body is the sole direct consumer. More general proof needs use counts and dominance across nested scopes.
+- **Failure now:** treating a list as private when it is returned, stored, closed over, or consumed twice would drop a visible intermediate or its order of evaluation.
+- **Dependencies:** binder-aware use counting, evaluation-order preservation (the backend evaluates packed cons arguments tail before head; do not assume a standard order), recursion-knot refusal.
+- **Counterexamples:** use inside a closure that is never called; shadowed name; use in an accumulator; use under `recur`.
+- **Promotion evidence:** shapes in real code that the structural rule misses, measured. 
+- **Home:** `Optimize`. **Tests:** escape/aliasing matrix incl. wildcard binding ABI and generated-name collisions.
+
+### 5.4 Strict map chains and filter/fold
+
+- **Rationale:** interleaving stages is only equivalent when stages are total, stable and effect-free over the accepted inputs, since baseline runs whole stages in sequence.
+- **Failure now:** a filter or chain with a partial mapper changes which error is raised first, or whether it is raised at all; reducer orientation could flip.
+- **Dependencies:** per-stage domain facts (e.g. total integer comparisons), sequential fold order, a law per composition.
+- **Counterexamples:** mapper raising on a late element after a filter would have rejected it; noncommutative reducer; empty and all/none filters; bignum, zero, negative.
+- **Promotion evidence:** a real call site with measured benefit; a law and a counterexample negative control per composition (offline solver may check the law).
+- **Home:** `Optimize/fuse-fold`. **Tests:** new fusion tests beside `optimizer_lexical_prototype_test.bl`.
+
+### 5.5 Public `+` value, helper flow, body invalidation, guarded suffix
+
+- **Rationale:** `(reduce + 0 coll)` is the commonest form, but the public `+` is a tagged variadic callable. Native arity does not identify the operation; the name may be rebound.
+- **Failure now:** specializing on the name or on arity would mis-handle floats, decimals, mixed values, a rebound `+`, and error text.
+- **Dependencies:** exact captured callable and body identity; numeric-domain equivalence for the binary case; dependency invalidation so a helper body-only edit (same module/name/arity) invalidates facts; helper parameter flow needs function/arity identities with explicit widening to unknown (coarse 0-CFA alone is insufficient); for entry-proven facts that can change mid-traversal, a **guarded suffix continuation** that falls back from the current state. **Never replay a prefix** that already had effects. Entry epoch checks do not justify dropping later live reads.
+- **Counterexamples:** rebinding before and during traversal; body replacement; first element float; bignum; one/zero element.
+- **Promotion evidence:** open-world tests (`optimizer_open_world_prototype_test.bl`) extended to the public value, plus measured win over the 1.0M-reduction baseline above.
+- **Home:** `Optimize` plus `rt`/`core` providers. **Deployment gate applies.**
+
+### 5.6 Runtime normalization and hoists
+
+- **Rationale:** §4. Only the fifth-argument explicit control exists in source; hoists exist only in generated isolated images.
+- **Failure now:** extra reduction per element for tagged and public callables; native unchanged.
+- **Dependencies:** a wrapper that adds no frame (inline the mode into the shared loop mechanics) or a once-per-traversal check shown to beat the existing per-element check; preservation of live `core/reduced?` fetches after callbacks and at exhaustion, initial/empty behavior, one sentinel peel, improper-tail errors, no eager rejection of an invalid callable on empty input.
+- **Counterexamples:** the wrapper envelope being native while the user callback is not; predicate rebinding before/mid/terminal.
+- **Promotion evidence:** matched VM reductions *below* baseline for native, tagged and public callables at chunk sizes 31/32/33/63/64/65, with the same-VM step oracle passing.
+- **Home:** `rt` `step`, `k-fold`, `k-reduce` only; hoisting stays in isolated generated images unless that evidence appears. **Tests:** `optimizer_mode_prototype_test.bl`, `reduce_kernel_cutover_test.bl`; audit with `optimizer-mode-audit.bl`.
+
+### 5.7 Indexed consumers, early halt, transducers, builders
+
+- **Rationale:** `map-indexed`/`keep-indexed`/`for` use the chunked lazy engine, not `lists:map`. Index-before-filter differs from index-after-filter. Transducers need the 0/1/2-arity init/complete/step protocol, early Reduced completion, stateful ordering, output representation, transient/persistent boundaries and metadata. `reduce-kv` is a separate contract.
+- **Failure now:** wrong index after a filter, extra demand after halt, suppressed chunk lookahead errors, a missing completion call, lost metadata.
+- **Dependencies:** an explicit halt model; closed finite sources and scalar consumers first; shared builder mechanics for `into`, `sequence`, `mapv`, `filterv` (result storage still allocates).
+- **Counterexamples:** sparse filters; finite consumer over infinite input; stateful `take`/`filter`; empty and transient-threshold inputs.
+- **Promotion evidence:** force/chunk-publication traces equal baseline, not just sums, plus measured gain.
+- **Home:** core engine and `Optimize` laws. **Tests:** extend the lazy/xform suites.
+
+### 5.8 Shared lazy values, replay, quota, native authority
+
+- **Rationale:** highest risk. Single syntactic use does not prove a lazy value is private (aliases, saved sources, shared memo cells, concurrent consumers). Native admission/quota refusals are observable. `system.linear` checks emission size, not ownership.
+- **Failure now:** fusing would skip a refusal or charge a program can observe, break replay of a published prefix, or change retry after producer failure.
+- **Dependencies:** ownership/use/demand facts separating construction, realization, replay, failure/retry, immutable cursor roots (`BeamLisp.LazySeq`, `LazyMemo`, `SeqCursor`); a decided resource policy (preserve logical charges, or a documented supported policy). A solver proof of arithmetic does not decide that policy. Native admission authority is not bypassed.
+- **Counterexamples:** two consumers; escape through return/container/closure; partial realization; chunk boundaries; quota refusal; concurrent realization; collector roots.
+- **Promotion evidence:** all of the above pass as refusals or as parity; a measured need that strict code cannot meet.
+- **Home:** lazy hosts and `Optimize`. **Deployment gate applies.**
+
+### 5.9 Closed forms, scalar replacement, query/native offload
+
+- **Rationale:** each needs obligations beyond fusion: arithmetic and termination for formulas (the earlier formula prototype covers its closed DSL only); construction/access/metadata/error contracts for scalar replacement of tuples, vectors, maps, closures; null/duplicate/order/effect/scheduling/domain laws for query pushdown, batching and native offload.
+- **Failure now:** a formula that changes overflow or error behavior; a scalar-replaced value whose identity or metadata is observed; offload that reorders effects.
+- **Dependencies:** a profile showing the remaining cost is in these shapes; per-domain law and counterexample.
+- **Promotion evidence:** real-workload profile first; no inference from current eligibility verdicts. I/O, algorithms or scheduling may dominate.
+- **Home:** separate design per domain, `Optimize` for the law; datom/query libraries as beneficiaries. **Deployment gate applies.**
+
+## 6. Review plan
+
+Milestones, in order, each with its own gate; nothing here is blocked or forgotten.
+
+1. **Current generation verification** of the promoted cut (strict focused suite, `optimizer-cold.sh`, regenerated package audit and outside-tree smoke). Owner: orchestrator. Prerequisite for any claim on `main`.
+2. **Real-workload scan:** run `explain` over compiler/build/analysis/datom namespaces to list which refusals are most frequent; this picks the next row of §5 instead of intuition. Trigger: after milestone 1.
+3. **§5.3 and §5.2** together (use/escape and captures) if the scan shows they block common fusions.
+4. **§5.4** then **§5.5**; §5.5 only with the dependency-invalidation tests.
+5. **§5.6** only if a design avoids the extra frame; otherwise leave closed.
+6. **§5.7**, then **§5.8**, **§5.9** each needing a stated policy or profile before work starts.
+
+Revisit sooner if: a measured workload shows a refused shape dominating; a runtime change lands that makes a gate cheap (e.g. cursor ownership); the seed/package process changes.
+
+## 7. Boundaries that stay fixed
+
+- Broaden eligibility inside the one optimizer; do not add passes to applications.
+- Lazy ownership is not a linear code-size check.
+- Normalize only VM-internal identities; no blanket cross-VM equality (atom-key map iteration and generated references differ across VMs; the run crossed midnight once and a foreign-date fixture was fixed).
+- No runtime/native/namespace deletion or seed/package replacement is implied by this record.

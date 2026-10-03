@@ -1,0 +1,537 @@
+; optimize.bl — the checked-rewrite home for canonical bl-ANF.
+;
+; Public API: module / node for compilation, explain for evidence, rules for
+; discovery. Facts are derived from executable ANF, never author annotations.
+; The boot pass is deterministic, bounded and solver-independent: its rules
+; instantiate structural/inductive laws with checked domain preconditions.
+; Unknown callables, live providers and observable lazy ownership stay baseline.
+(ns host.optimize)
+
+(defn version [] "optimize-2")
+(defn- runtime-module [] :Elixir.BeamLisp.Ns.Rt)
+
+(defn- map [f xs] (BeamLisp.CompilerData/eager_map f xs))
+(defn- getv [m k] (if (erlang/is_map m) (maps/get k m nil) nil))
+(defn- put [m k v] (maps/put k v m))
+(defn- item [xs i] (erlang/hd (lists/nthtail i xs)))
+(defn- op? [n op] (erlang/== op (getv n :op)))
+(defn- lit? [n v] (and (op? n :lit) (erlang/=:= v (getv n :val))))
+(defn- call? [n mod fun] (and (op? n :remote) (erlang/== mod (getv n :mod)) (erlang/== fun (getv n :fun))))
+(defn- named? [n name] (and (op? n :var) (erlang/== name (getv n :name))))
+
+(defn rules
+  "The optimizer's owned rule vocabulary. This is descriptive, not authority:
+   executable preconditions are checked again for every candidate."
+  []
+  (list
+    {:rule :own-module :law :literal-closure-module :proof :structural}
+    {:rule :native-call :law :fixed-native-arity :proof :structural}
+    {:rule :numeric-domain :law :non-map-numeric-dispatch :proof :domain}
+    {:rule :integer-callback :law :integer-fold-invariant :proof :induction}
+    {:rule :strict-map-fold :law :total-map-fold-composition :proof :induction}))
+
+; —— facts and scope ——————————————————————————————————————————————————————
+
+(defn- pattern-names [p]
+  (cond
+    (erlang/== :pvar (getv p :pop)) (if (erlang/== "_" (getv p :name)) (list) (list (getv p :name)))
+    (or (erlang/== :ptuple (getv p :pop)) (erlang/== :pstruct (getv p :pop)))
+      (if (erlang/== :ptuple (getv p :pop))
+        (lists/append (map (fn [x] (pattern-names x)) (getv p :elems)))
+        (lists/append (map (fn [kv] (pattern-names (second kv))) (getv p :fields))))
+    (erlang/== :pcons (getv p :pop)) (erlang/++ (pattern-names (getv p :head)) (pattern-names (getv p :tail)))
+    (erlang/== :palias (getv p :pop)) (erlang/++ (pattern-names (getv p :a)) (pattern-names (getv p :b)))
+    (erlang/== :pmap (getv p :pop)) (lists/append (map (fn [kv] (pattern-names (second kv))) (getv p :pairs)))
+    :else (list)))
+
+(defn- shadow [env pats]
+  (lists/foldl (fn [name acc] (maps/remove name acc)) env
+    (lists/append (map (fn [p] (pattern-names p)) pats))))
+
+(defn- scaffold-body [n]
+  (when (op? n :let)
+    (let [name (getv n :name) init (getv n :init) cls (getv init :clauses) body (getv n :body)]
+      (when (and (op? init :fn) (erlang/is_list cls) (erlang/== 1 (erlang/length cls)))
+        (let [cl (erlang/hd cls) pats (getv cl :pats) args (getv body :args)]
+          (when (and (nil? (getv cl :guard)) (erlang/is_list pats) (erlang/== 1 (erlang/length pats))
+                     (erlang/== :pvar (getv (erlang/hd pats) :pop))
+                     (erlang/== name (getv (erlang/hd pats) :name))
+                     (op? body :apply) (named? (getv body :fn) name)
+                     (erlang/is_list args) (erlang/== 1 (erlang/length args)) (named? (erlang/hd args) name))
+            (getv cl :body)))))))
+
+(defn- literal-fn [n]
+  (if (op? n :fn) n
+    (let [body (scaffold-body n)] (when (op? body :fn) body))))
+
+(defn- native-arity [n]
+  (let [f (literal-fn n) cls (getv f :clauses)]
+    (when (and (some? f) (erlang/is_list cls) (not (erlang/== cls (list))))
+      (let [argc (erlang/length (getv (erlang/hd cls) :pats))]
+        (when (lists/all (fn [cl] (erlang/== argc (erlang/length (getv cl :pats)))) cls) argc)))))
+
+(defn- integer-list? [xs]
+  (cond
+    (erlang/== xs (list)) true
+    (erlang/is_list xs) (and (erlang/is_integer (erlang/hd xs)) (integer-list? (erlang/tl xs)))
+    :else false))
+
+(declare fact)
+(defn- args-tag? [args env tag]
+  (lists/all (fn [n] (erlang/== tag (getv (fact n env) :tag))) args))
+
+(defn- integer-op? [n]
+  (and (or (op? n :arith) (and (op? n :remote) (erlang/== :erlang (getv n :mod))))
+       (lists/member (if (op? n :arith) (getv n :bif) (getv n :fun)) (list :+ :- :*))
+       (erlang/== 2 (erlang/length (getv n :args)))))
+
+(declare closed-int?)
+(defn- closed-int?
+  "Total integer expressions over this explicit lexical domain. No globals,
+   mutable reads, guards, division, captured unknowns or callable annotations."
+  [n env]
+  (cond
+    (op? n :lit) (erlang/is_integer (getv n :val))
+    (op? n :var) (erlang/== :int (getv (maps/get (getv n :name) env {}) :tag))
+    (integer-op? n) (lists/all (fn [arg] (closed-int? arg env)) (getv n :args))
+    (op? n :let) (and (closed-int? (getv n :init) env)
+                      (closed-int? (getv n :body) (put env (getv n :name) {:tag :int})))
+    :else false))
+
+
+(defn- expression-fuel
+  "Remaining node fuel for the supported integer-expression grammar, or nil.
+   Stops before descending beyond the bound, including deeply nested bodies."
+  [n left]
+  (when (erlang/> left 0)
+    (cond
+      (or (op? n :lit) (op? n :var)) (erlang/- left 1)
+      (integer-op? n)
+        (let [a (expression-fuel (item (getv n :args) 0) (erlang/- left 1))]
+          (when (some? a) (expression-fuel (item (getv n :args) 1) a)))
+      (op? n :let)
+        (let [a (expression-fuel (getv n :init) (erlang/- left 1))]
+          (when (some? a) (expression-fuel (getv n :body) a)))
+      :else nil)))
+
+(defn- int-callback
+  "A closed total integer callback of `argc` parameters, within a bounded node
+   budget. A variable resolves to the callback recorded in its DEFINITION-scope
+   fact, never to the current meaning of its name; that fn is closed over its own
+   parameters, so re-materializing it elsewhere captures nothing."
+  [n argc env]
+  (let [src (if (op? n :var)
+              (getv (maps/get (getv n :name) env {}) :callback) n)
+        f (literal-fn src) cls (getv f :clauses)]
+    (when (and (some? f) (erlang/is_list cls) (erlang/== 1 (erlang/length cls)))
+      (let [cl (erlang/hd cls) pats (getv cl :pats)]
+        (when (and (nil? (getv cl :guard)) (erlang/== argc (erlang/length pats))
+                   (lists/all (fn [p] (and (erlang/== :pvar (getv p :pop))
+                                          (not (erlang/== "_" (getv p :name))))) pats))
+          (let [names (map (fn [p] (getv p :name)) pats)
+                env (lists/foldl (fn [name e] (put e name {:tag :int})) {} names)]
+            (when (and (erlang/== argc (erlang/length (lists/usort names)))
+                       (some? (expression-fuel (getv cl :body) 64))
+                       (closed-int? (getv cl :body) env))
+              {:fn f :clause cl :names names})))))))
+
+(defn- fact [n env]
+  (cond
+    (op? n :var) (maps/get (getv n :name) env {})
+    (op? n :lit)
+      (let [v (getv n :val)]
+        (cond (erlang/is_integer v) {:tag :int}
+              (erlang/is_float v) {:tag :float}
+              (integer-list? v) {:tag :integer-list}
+              :else {}))
+    (op? n :enil) {:tag :integer-list}
+    (op? n :cons)
+      (if (and (erlang/== :int (getv (fact (getv n :head) env) :tag))
+               (erlang/== :integer-list (getv (fact (getv n :tail) env) :tag)))
+        {:tag :integer-list} {})
+    (some? (native-arity n))
+      (let [a (native-arity n) cb (when (lists/member a (list 1 2)) (int-callback n a env))]
+        (if (some? cb) {:arity a :callback (getv cb :fn)} {:arity a}))
+    (integer-op? n) (if (args-tag? (getv n :args) env :int) {:tag :int} {})
+    (and (call? n :lists :seq) (lists/member (erlang/length (getv n :args)) (list 2 3))
+         (args-tag? (getv n :args) env :int)) {:tag :integer-list}
+    (and (call? n :lists :map) (erlang/== 2 (erlang/length (getv n :args)))
+         (some? (int-callback (item (getv n :args) 0) 1 env))
+         (erlang/== :integer-list (getv (fact (item (getv n :args) 1) env) :tag))) {:tag :integer-list}
+    :else {}))
+
+(defn- refine [env test]
+  (let [args (getv test :args)]
+    (cond
+      (and (call? test :erlang :is_function) (erlang/== 2 (erlang/length args))
+           (op? (item args 0) :var) (op? (item args 1) :lit)
+           (erlang/is_integer (getv (item args 1) :val)) (erlang/>= (getv (item args 1) :val) 0))
+        (put env (getv (item args 0) :name) {:arity (getv (item args 1) :val)})
+      (and (op? test :remote) (erlang/== :erlang (getv test :mod))
+           (lists/member (getv test :fun) (list :is_integer :is_float :is_number))
+           (erlang/== 1 (erlang/length args)) (op? (item args 0) :var))
+        (put env (getv (item args 0) :name)
+             {:tag (cond (erlang/== :is_integer (getv test :fun)) :int
+                         (erlang/== :is_float (getv test :fun)) :float :else :number)})
+      (and (op? test :if) (or (lit? (getv test :else) nil) (lit? (getv test :else) false)))
+        (refine (refine env (getv test :test)) (getv test :then))
+      :else env)))
+
+; —— checked laws ————————————————————————————————————————————————————————
+
+(defn- unpack [n]
+  (cond
+    (op? n :enil) {:args (list)}
+    (op? n :cons) (let [tail (unpack (getv n :tail))]
+                   (when (some? tail) {:args (cons (getv n :head) (getv tail :args))}))
+    :else nil))
+
+(defn- own-module [n mod]
+  (let [args (getv n :args)]
+    (when (and (some? mod) (call? n :erlang :element) (erlang/== 2 (erlang/length args)) (lit? (item args 0) 2))
+      (let [fi (item args 1) fa (getv fi :args)]
+        (when (and (call? fi :erlang :fun_info) (erlang/== 2 (erlang/length fa))
+                   (some? (literal-fn (item fa 0))) (lit? (item fa 1) :module))
+          (put (BeamLisp.Ns.Anf/lit mod) :ann (getv n :ann)))))))
+
+(defn- numeric-domain [n env]
+  (when (and (op? n :arith)
+             (lists/all (fn [arg] (lists/member (getv (fact arg env) :tag) (list :int :float :number))) (getv n :args)))
+    (put (BeamLisp.Ns.Anf/remote :erlang (getv n :bif) (getv n :args)) :ann (getv n :ann))))
+
+(defn- int-expression [n]
+  (cond
+    (integer-op? n) (put (BeamLisp.Ns.Anf/remote :erlang (if (op? n :arith) (getv n :bif) (getv n :fun))
+                                   (map (fn [arg] (int-expression arg)) (getv n :args))) :ann (getv n :ann))
+    (op? n :let) (put (put n :init (int-expression (getv n :init))) :body (int-expression (getv n :body)))
+    :else n))
+
+(defn- replace-var [n old new]
+  (cond
+    (named? n old) (put new :ann (getv n :ann))
+    (integer-op? n) (put n :args (map (fn [arg] (replace-var arg old new)) (getv n :args)))
+    (op? n :let)
+      (put (put n :init (replace-var (getv n :init) old new)) :body
+           (if (erlang/== old (getv n :name)) (getv n :body) (replace-var (getv n :body) old new)))
+    :else n))
+
+(defn- all-names [n]
+  (cond
+    (op? n :var) (list (getv n :name))
+    (integer-op? n) (lists/append (map (fn [arg] (all-names arg)) (getv n :args)))
+    (op? n :let) (cons (getv n :name) (erlang/++ (all-names (getv n :init)) (all-names (getv n :body))))
+    :else (list)))
+
+(defn- mapped-name [names]
+  (loop [i 0]
+    (let [name (erlang/iolist_to_binary (list "__bl_opt_mapped_" (erlang/integer_to_binary i)))]
+      (if (lists/member name names) (recur (erlang/+ i 1)) name))))
+
+(defn- integer-fold-candidate
+  "A safe integer fold: callback (literal or alias) in the callback grammar and
+   accumulator/list domains proven. Returns the callback, else nil."
+  [n env]
+  (when (and (call? n :lists :foldl) (erlang/== 3 (erlang/length (getv n :args))))
+    (let [args (getv n :args) f (int-callback (item args 0) 2 env)]
+      (when (and (some? f) (erlang/== :int (getv (fact (item args 1) env) :tag))
+                 (erlang/== :integer-list (getv (fact (item args 2) env) :tag)))
+        f))))
+
+(defn- alias-only-fold?
+  "A safe fold candidate whose callback is a variable. Standalone specialization
+   stays literal-only: rematerializing the alias body copies code without
+   removing execution work. Aliases pay off only when fused."
+  [n env]
+  (and (some? (integer-fold-candidate n env))
+       (op? (item (getv n :args) 0) :var)))
+
+(defn- integer-fold [n env]
+  (let [f (integer-fold-candidate n env) args (getv n :args)]
+    (when (and (some? f) (not (op? (item args 0) :var)))
+      (let [cl (getv f :clause) fn-node (getv f :fn)
+            new-fn (put fn-node :clauses (list (put cl :body (int-expression (getv cl :body)))))]
+        (put n :args (list new-fn (item args 1) (item args 2)))))))
+
+(defn- fuse-fold [n env]
+  (when (and (call? n :lists :foldl) (erlang/== 3 (erlang/length (getv n :args))))
+    (let [args (getv n :args) rf (int-callback (item args 0) 2 env) mapped (item args 2)]
+      (when (and (some? rf) (call? mapped :lists :map) (erlang/== 2 (erlang/length (getv mapped :args)))
+                 (erlang/== :int (getv (fact (item args 1) env) :tag)))
+        (let [ma (getv mapped :args) mf (int-callback (item ma 0) 1 env) source (item ma 1)]
+          (when (and (some? mf) (erlang/== :integer-list (getv (fact source env) :tag)))
+            (let [rc (getv rf :clause) mc (getv mf :clause) rn (getv rf :names)
+                  used (erlang/++ rn (erlang/++ (getv mf :names)
+                          (erlang/++ (all-names (getv rc :body)) (all-names (getv mc :body)))))
+                  element-name (mapped-name used)
+                  acc-name (mapped-name (cons element-name used))
+                  mn (mapped-name (cons acc-name (cons element-name used)))
+                  mapped-body (replace-var (getv mc :body) (item (getv mf :names) 0) (BeamLisp.Ns.Anf/var element-name))
+                  reduced-body (replace-var (replace-var (getv rc :body) (item rn 0) (BeamLisp.Ns.Anf/var mn))
+                                           (item rn 1) (BeamLisp.Ns.Anf/var acc-name))
+                  body (put (BeamLisp.Ns.Anf/lett mn (int-expression mapped-body) (int-expression reduced-body)) :ann (getv n :ann))
+                  combined (put (getv rf :fn) :clauses
+                               (list (put (put rc :body body) :pats
+                                      (list (BeamLisp.Ns.Anf/pvar element-name) (BeamLisp.Ns.Anf/pvar acc-name)))))]
+              (put n :args (list combined (item args 1) source)))))))))
+
+(defn- private-fold
+  "(let [xs (lists/map mf src)] (lists/foldl rf init xs)) -> one fold. Only this
+   immediate shape: the let body IS the sole consumer, xs occurs only as its list
+   argument (rf is a closed callback or an alias other than xs; init must be a
+   closed integer expression checked in the scope where xs is bound, so it
+   cannot mention xs and cannot fail or effect). Hence removing the strict
+   intermediate moves no effect, read or failure; source/map errors still arise
+   from the same source evaluation. Returns {:node n}, {:refused true} or nil."
+  [n env]
+  (let [init (getv n :init) body (getv n :body) name (getv n :name)]
+    (when (and (call? init :lists :map) (erlang/== 2 (erlang/length (getv init :args)))
+               (call? body :lists :foldl) (erlang/== 3 (erlang/length (getv body :args)))
+               (named? (item (getv body :args) 2) name))
+      (let [args (getv body :args)
+            inner (put env name (fact init env))
+            ok (and (not (erlang/== "_" name)) (not (named? (item args 0) name))
+                    (closed-int? (item args 1) inner))
+            fused (when ok (fuse-fold (put body :args (list (item args 0) (item args 1) init)) env))]
+        (if (some? fused) {:node fused} {:refused true})))))
+
+(defn- argument-name [state]
+  (loop [i (getv state :fresh)]
+    (let [name (erlang/iolist_to_binary (list "__bl_opt_arg_" (erlang/integer_to_binary i)))]
+      (if (maps/is_key name (getv state :used-names)) (recur (erlang/+ i 1))
+        (tuple name (put (put state :fresh (erlang/+ i 1)) :used-names
+                         (put (getv state :used-names) name true)))))))
+
+(defn- ordered-apply
+  "Preserve the backend's observed packed-cons order: tail before head.
+   Core apply may schedule complex arguments differently, so bind them in
+   that same order. Atomic arguments need no bindings. Observed names prevent
+   capture; argument positions themselves remain unchanged."
+  [f args ann state]
+  (if (lists/all (fn [n] (or (op? n :var) (op? n :lit))) args)
+    (tuple (put (BeamLisp.Ns.Anf/app f args) :ann ann) state)
+    (loop [rest args vars (list) bindings (list) s state]
+      (if (erlang/== rest (list))
+        (let [body (put (BeamLisp.Ns.Anf/app f (lists/reverse vars)) :ann ann)
+              result (lists/foldl (fn [b inner]
+                                    (put (BeamLisp.Ns.Anf/lett (elem b 0) (elem b 1) inner) :ann ann))
+                                  body (lists/reverse bindings))]
+          (tuple result s))
+        (let [p (argument-name s) name (elem p 0)]
+          (recur (erlang/tl rest) (cons (BeamLisp.Ns.Anf/var name) vars)
+                 (cons (tuple name (erlang/hd rest)) bindings) (elem p 1)))))))
+
+; —— evidence and traversal ————————————————————————————————————————————————
+
+(defn- applied [state rule n detail]
+  (let [s (put state :rewrites (erlang/+ 1 (getv state :rewrites)))]
+    (if (getv s :report?)
+      (put s :evidence (cons {:rule rule :at (getv n :ann) :conditions detail
+                                    :authority :checked-anf :version (version)} (getv s :evidence))) s)))
+
+(defn- refused [state rule n reason]
+  (if (getv state :report?)
+    (put state :refusals (cons {:rule rule :at (getv n :ann) :reason reason} (getv state :refusals))) state))
+
+(defn- checked-fold-result
+  "Callback expansion is cumulative, not a fresh allowance at each use. The
+   callback grammar cap bounds analysis work per candidate; this separate
+   run-wide budget prevents repeated body materialization growing output
+   quadratically. Applies to literal and alias candidates alike."
+  [n result env state rule detail]
+  (let [f (literal-fn (item (getv result :args) 0))
+        body (getv (erlang/hd (getv f :clauses)) :body)
+        fuel (expression-fuel body 132)
+        cost (when (some? fuel) (erlang/+ 4 (erlang/- 132 fuel)))]
+    (if (and (some? cost) (erlang/=< cost (getv state :inline-left)))
+      (tuple result (applied (put state :inline-left (erlang/- (getv state :inline-left) cost)) rule n detail))
+      (tuple n (refused state rule n :callback-inline-budget)))))
+
+(defn- rewrite [n env state mod]
+  (let [own (own-module n mod) numeric (numeric-domain n env)]
+    (cond
+      (some? own) (tuple own (applied state :own-module n :own-literal-closure))
+      (some? numeric) (tuple numeric (applied state :numeric-domain n :non-map-operands))
+      (and (call? n (runtime-module) :invoke) (erlang/== 2 (erlang/length (getv n :args))))
+        (let [args (getv n :args) f (item args 0) unpacked (unpack (item args 1))
+              arity (getv (fact f env) :arity)]
+          (if (and (some? unpacked) (some? arity) (erlang/== arity (erlang/length (getv unpacked :args))))
+            (let [p (ordered-apply f (getv unpacked :args) (getv n :ann) state)]
+              (tuple (elem p 0) (applied (elem p 1) :native-call n
+                                        {:arity arity :scope :lexical :arguments :ordered})))
+            (tuple n (refused state :native-call n :unknown-or-mismatched-native-arity))))
+      (and (op? n :let) (some? (private-fold n env)))
+        (let [r (private-fold n env)]
+          (if (some? (getv r :node))
+            (checked-fold-result n (getv r :node) env state :strict-map-fold
+              {:domain :integer :callback :closed-total :ownership :private-let-single-consumer
+               :binding :definition-scope :order :sequential-left-fold :resources :ordinary-heap})
+            (tuple n (refused state :strict-map-fold n :private-use-not-provable))))
+      (call? n :lists :foldl)
+        (let [fused (fuse-fold n env)]
+          (if (some? fused)
+            (checked-fold-result n fused env state :strict-map-fold
+              {:domain :integer :callback :closed-total :ownership :immediate-single-consumer
+               :order :sequential-left-fold :resources :ordinary-heap})
+            (let [specialized (integer-fold n env)]
+              (if (and (some? specialized) (not (erlang/=:= specialized n)))
+                (checked-fold-result n specialized env state :integer-callback :integer-accumulator-invariant)
+                (tuple n (refused state :strict-map-fold n
+                           (if (alias-only-fold? n env)
+                             :callback-rematerialization-not-profitable
+                             :unproven-domain-or-callback)))))))
+      (and (op? n :remote) (lists/member (getv n :mod) (list :Elixir.BeamLisp.Ns.Core (runtime-module)))
+           (lists/member (getv n :fun) (list :reduce :transduce :map-indexed)))
+        (tuple n (refused state :strict-map-fold n :live-provider-or-observable-lazy-demand))
+      :else (tuple n state))))
+
+(declare walk)
+(defn- walk-list [xs env state mod]
+  (loop [rest xs out (list) s state]
+    (if (erlang/== rest (list)) (tuple (lists/reverse out) s)
+      (let [pair (walk (erlang/hd rest) env s mod)]
+        (recur (erlang/tl rest) (cons (elem pair 0) out) (elem pair 1))))))
+
+(defn- walk-clauses [clauses env state mod]
+  (loop [rest clauses out (list) s state]
+    (if (erlang/== rest (list)) (tuple (lists/reverse out) s)
+      (let [cl (erlang/hd rest) scoped (shadow env (getv cl :pats))
+            gp (walk (getv cl :guard) scoped s mod)
+            bp (walk (getv cl :body) (refine scoped (elem gp 0)) (elem gp 1) mod)
+            new-cl (put (put cl :guard (elem gp 0)) :body (elem bp 0))]
+        (recur (erlang/tl rest) (cons new-cl out) (elem bp 1))))))
+
+(defn- rebuilt-pair [pair k v]
+  (cond
+    (erlang/is_tuple pair) (erlang/setelement 2 (erlang/setelement 1 pair k) v)
+    (erlang/is_list pair) (list k v)
+    :else (assoc (assoc pair 0 k) 1 v)))
+
+(defn- walk-pairs [pairs env state mod]
+  (loop [rest pairs out (list) s state]
+    (if (erlang/== rest (list)) (tuple (lists/reverse out) s)
+      (let [kv (erlang/hd rest) kp (walk (first kv) env s mod) vp (walk (second kv) env (elem kp 1) mod)]
+        (recur (erlang/tl rest) (cons (rebuilt-pair kv (elem kp 0) (elem vp 0)) out) (elem vp 1))))))
+
+(defn- field [n key env state mod]
+  (let [p (walk (getv n key) env state mod)] (tuple (put n key (elem p 0)) (elem p 1))))
+(defn- fields-list [n key env state mod]
+  (let [p (walk-list (getv n key) env state mod)] (tuple (put n key (elem p 0)) (elem p 1))))
+
+(defn- children [n env state mod]
+  (let [op (getv n :op)]
+    (cond
+      (erlang/== op :let)
+        (let [ip (walk (getv n :init) env state mod) init (elem ip 0)
+              scoped (put env (getv n :name) (fact init env))
+              bp (walk (getv n :body) scoped (elem ip 1) mod)]
+          (tuple (put (put n :init init) :body (elem bp 0)) (elem bp 1)))
+      (erlang/== op :if)
+        (let [tp (walk (getv n :test) env state mod)
+              yp (walk (getv n :then) (refine env (elem tp 0)) (elem tp 1) mod)
+              np (walk (getv n :else) env (elem yp 1) mod)]
+          (tuple (put (put (put n :test (elem tp 0)) :then (elem yp 0)) :else (elem np 0)) (elem np 1)))
+      (or (erlang/== op :remote) (erlang/== op :arith)) (fields-list n :args env state mod)
+      (erlang/== op :apply)
+        (let [fp (field n :fn env state mod)] (fields-list (elem fp 0) :args env (elem fp 1) mod))
+      (erlang/== op :fn)
+        ; The backend's plain-fun shortcut binds every parameter name, including
+        ; "_". Case-pattern wildcards do not bind it. Match that actual ABI.
+        (let [cls (getv n :clauses) cl (erlang/hd cls)
+              simple (and (erlang/== 1 (erlang/length cls)) (nil? (getv cl :guard))
+                          (lists/all (fn [p] (erlang/== :pvar (getv p :pop))) (getv cl :pats)))
+              scoped (if simple
+                       (lists/foldl (fn [p e] (maps/remove (getv p :name) e)) env (getv cl :pats)) env)
+              p (walk-clauses cls scoped state mod)]
+          (tuple (put n :clauses (elem p 0)) (elem p 1)))
+      (erlang/== op :case)
+        (let [sp (walk (getv n :subj) env state mod) cp (walk-clauses (getv n :clauses) env (elem sp 1) mod)]
+          (tuple (put (put n :subj (elem sp 0)) :clauses (elem cp 0)) (elem cp 1)))
+      (erlang/== op :do) (fields-list n :stmts env state mod)
+      (erlang/== op :tuple) (fields-list n :elems env state mod)
+      (erlang/== op :cons)
+        (let [hp (field n :head env state mod)] (field (elem hp 0) :tail env (elem hp 1) mod))
+      (or (erlang/== op :map) (erlang/== op :struct))
+        (let [key (if (erlang/== op :map) :pairs :fields) p (walk-pairs (getv n key) env state mod)]
+          (tuple (put n key (elem p 0)) (elem p 1)))
+      (erlang/== op :try)
+        (let [bp (field n :body env state mod) cp (walk-clauses (getv n :catch) env (elem bp 1) mod)
+              base (put (elem bp 0) :catch (elem cp 0))]
+          (field base :after env (elem cp 1) mod))
+      (erlang/== op :recv)
+        (let [cp (walk-clauses (getv n :clauses) env state mod) base (put n :clauses (elem cp 0))
+              tp (field base :timeout env (elem cp 1) mod)]
+          (field (elem tp 0) :after env (elem tp 1) mod))
+      :else (tuple n state))))
+
+(defn- walk [n env state mod]
+  (cond
+    (nil? n) (tuple n state)
+    (erlang/>= (getv state :visited) (getv state :max-nodes))
+      (tuple n (put state :limited? true))
+    :else
+      (let [visited (put state :visited (erlang/+ 1 (getv state :visited)))
+            s (if (or (op? n :var) (op? n :let))
+                (put visited :used-names (put (getv visited :used-names) (getv n :name) true)) visited)
+            p (children n env s mod)]
+        (if (getv (elem p 1) :limited?) p
+          (rewrite (elem p 0) env (elem p 1) mod)))))
+
+(defn run
+  "Validate and optimize a canonical ANF module descriptor.
+
+   Returns {:descriptor … :evidence … :refusals … :stats … :version …}.
+   Options: :enabled? (default true; false is the reference path), :report?
+   (default true), :max-nodes (default 100000: visited nodes and cumulative
+   callback-expansion cost; it does not cap whole-module validation). Budget
+   exhaustion leaves remaining regions unchanged. Definition-scope callback
+   aliases and the private let-bound map->fold shape are always recognized.
+   Alias-only standalone folds are refused as :callback-rematerialization-not-profitable.
+   Solver absence/author metadata cannot grant rewrite authority. No external
+   facts are accepted: scope/domain/ownership obligations are checked here."
+  ([descriptor] (run descriptor {}))
+  ([descriptor opts]
+   (let [m (BeamLisp.Ns.Anf/validate-module! descriptor) limit (get opts :max-nodes 100000)
+         enabled (get opts :enabled? true)
+         context (when (get opts :module-identity? true) (getv m :name))]
+     (when (or (not (erlang/is_integer limit)) (erlang/< limit 1))
+       (erlang/error (Elixir.ArgumentError/exception "optimize: :max-nodes must be a positive integer")))
+     (let [base-env {}
+           initial {:visited 0 :rewrites 0 :evidence (list) :refusals (list)
+                    :fresh 0 :used-names {} :inline-left limit :max-nodes limit :limited? false :report? (get opts :report? true)}
+           p (if enabled
+               (loop [rest (getv m :clauses) out (list) s initial]
+                 (if (erlang/== rest (list)) (tuple (lists/reverse out) s)
+                   (let [cl (erlang/hd rest) gp (walk (getv cl :guard) base-env s context)
+                         bp (walk (getv cl :body) (refine base-env (elem gp 0)) (elem gp 1) context)
+                         new-cl (put (put cl :guard (elem gp 0)) :body (elem bp 0))]
+                     (recur (erlang/tl rest) (cons new-cl out) (elem bp 1)))))
+               (tuple (getv m :clauses) initial))
+           s (elem p 1) result (put m :clauses (elem p 0))]
+       {:descriptor (BeamLisp.Ns.Anf/validate-module! result)
+        :version (version)
+        :evidence (lists/reverse (getv s :evidence))
+        :refusals (lists/reverse (getv s :refusals))
+        :stats {:enabled? enabled :visited (getv s :visited) :rewrites (getv s :rewrites)
+                :limited? (getv s :limited?) :max-nodes limit
+                :inlined-nodes (erlang/- limit (getv s :inline-left))}}))))
+
+(defn module
+  "Compiler-facing API: validated optimized descriptor, without report storage.
+   Use explain for evidence. :enabled? false provides the reference path."
+  ([descriptor] (module descriptor {}))
+  ([descriptor opts] (:descriptor (run descriptor (assoc opts :report? false)))))
+
+(defn node
+  "Optimize one ANF expression under an empty lexical scope. Free values stay
+   unknown. This is the same module pass, not a second node optimizer."
+  ([expression] (node expression {}))
+  ([expression opts]
+   (let [m (BeamLisp.Ns.Anf/module :Elixir.BeamLisp.Optimize.Node
+             (list {:op :defn-clause :fname :run :params (list) :guard nil :body expression :ann {}})
+             (list [:run 0]) (list))]
+     (:body (erlang/hd (:clauses (module m (assoc opts :module-identity? false))))))))
+
+(defn explain
+  "The full checked rewrite/refusal report over the same compiler pass."
+  ([descriptor] (run descriptor))
+  ([descriptor opts] (run descriptor (assoc opts :report? true))))

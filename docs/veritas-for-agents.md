@@ -241,28 +241,62 @@ and record, converge") without a hand-written crash test.
 
 ## 4 · Stateful mocks: a model, served
 
+**Built** (U5, minimal): `veritas.model/serve`. **Still design:** `conforms?` and
+`veritas.mock` as a stateless model (below).
+
 The Microsoft fake of knowledger doc 22 is "a state machine that answers HTTP".
 A model already is a state machine. Serving it is one function:
 
 ```clojure
-(vm/defmodel graph-drive
-  {:state {:items {} :cursor-snapshots {} :expired #{}}
-   :commands
-   {:delta   {:request  [:get "/drives/:d/root/delta" {:token ?t}]
-              :pre      '(not (contains? (:expired state) t))
-              :next     (fn [s req] (snapshot s))
-              :response (fn [s req] (delta-page s req))}
-    :expired {:request  [:get "/drives/:d/root/delta" {:token ?t}]
-              :pre      '(contains? (:expired state) t)
-              :response (fn [_ _] {:status 410 :headers {"Location" …}})}
-    …}})
+(def api
+  (vm/model "servers"
+    {:state {:next-id 1 :servers {}}
+     :commands
+     {:create {:request  [:post "/servers"]
+               :pre      (fn [s req] (string? (get (:body req) "name")))
+               :next     (fn [s req] (add-server s (:body req)))
+               :response (fn [s req] {:status 201 :body {"server" (newest s)}})}
+      :get    {:request  [:get "/servers/:id"]
+               :pre      (fn [s req] (exists? s (get (:params req) "id")))
+               :response (fn [s req] {:body {"server" (lookup s (get (:params req) "id"))}})}
+      :fail   {:pre (fn [s _] (not (:failing s)))      ; no :request → inject! only
+               :next (fn [s _] (assoc s :failing true))}}}))
 
-(def fake (vm/serve graph-drive {:port 0 :state (load-tree "~/.knowledger/fake-m365")}))
-(:url fake)   ; → "http://127.0.0.1:53811"
+(def fake (vm/serve api {:port 0}))
+(:url fake)                          ; → "http://127.0.0.1:53811"
+((:inject! fake) :fail nil)          ; a fault, by command name
+((:log fake))                        ; last 500 requests, for assertions
+((:stop fake))                       ; frees the port
 ```
 
-- `vm/serve` routes each request to the command whose `:request` pattern
-  matches and whose `:pre` holds, applies `:next`, and returns `:response`.
+Runnable: `examples/veritas/07-the-model-served.bl`; tests:
+`test/bl/veritas/model_serve_test.bl`.
+
+**Contract (as built).**
+
+- **One args shape.** A command with `:request` takes the *request map* as its
+  `args`: `{:method :path :params {"id" "12"} :query {…} :body <decoded JSON|nil> :headers {…}}`
+  (string keys below the top level; lowercase header names). `:pre`, `:next` and
+  `:response` all receive it; `check` draws the same map from the command's
+  `:args`. One command map, two drivers; `check` ignores `:request`/`:response`
+  and `:run` is optional.
+- **Routing.** `:request` is `[method "/path/:param"]`. Commands are tried in
+  sorted name order: no route match → 404 `{:error {:code "not_found"}}`; routes
+  match but no `:pre` holds → 409 `conflict`; else the first match whose `:pre`
+  holds runs. A model-specific refusal is a later-named command on the same
+  route. Bad JSON → 400; body over 1 MiB → 413 (neither reaches the model).
+- **Response.** `(fn [post-state req])` → `{:status :headers :body}`; the POST
+  state, as a real create answers. Body is JSON-encoded; no `:response` → 204.
+  An exception in a command → 500 `model_error`, state unchanged.
+- **Serialization.** State lives in one agent; each request is one atomic step,
+  so N parallel creates yield N distinct ids.
+- **`inject!`** runs a non-HTTP command against the served state, `:pre`
+  respected → `{:ok true :state s}` or `{:ok false :reason :pre|:unknown}`.
+- Binds loopback only; `:port 0` is ephemeral and `:port` reports the real one.
+  `vm/request` is a tiny test client.
+
+Still design:
+
 - **The same model generates tests of the client.** `vm/check` drives the
   *connector* with random server-side events (edits, moves, expiries,
   throttles) between its calls. The fake and its test generator are one
@@ -271,9 +305,9 @@ A model already is a state machine. Serving it is one function:
   real responses (doc 22 §3.2) and checks that each one is a response the
   model could have given in that state. Differences come back as named
   commands.
-- `veritas.mock` keeps its role: a stateless contract becomes a one-command
-  model with no state, so the stateless mock is a special case of `serve`
-  rather than a second server.
+- `veritas.mock` keeps its role, and is **not yet** refactored: a stateless
+  contract is a one-command model with no state, so the stateless mock is a
+  special case of `serve` rather than a second server — that cutover is open.
 
 ---
 
@@ -437,7 +471,7 @@ every machine, and `replay` is exact.
 | U2 | `veritas.ledger`: verdict datoms, `record!`, `:fn/hash` in the codebase graph, `stale` over the call closure, `report`, `bl veritas` CLI | new `priv/lib/veritas/ledger.bl`, `priv/std/codebase.bl`, `priv/std/bl/cli.bl` | makes every later capability durable |
 | U3 | general shrinking: a `Shrink` protocol beside `Gen` (vectors, maps, strings, tuples, histories, databases) | `veritas.bl` | the model and datalog layers depend on it; model-specific domains need their own valid candidates |
 | U4 | `veritas.model`: `defmodel`, `check`, history shrinking, `kill!`/`drop-next!` hooks | new `priv/lib/veritas/model.bl` | the largest single gain |
-| U5 | `vm/serve` and `vm/conforms?`; `veritas.mock` becomes a stateless model | `veritas/model.bl`, `veritas/mock.bl` | the M365 fake becomes a model (knowledger doc 22) |
+| U5 | **`serve` built** (`veritas/model.bl`: routes, params, JSON, 404/409, `inject!`, log). Open: `vm/conforms?`; `veritas.mock` becomes a stateless model | `veritas/model.bl`, `veritas/mock.bl` | the M365 fake becomes a model (knowledger doc 22) |
 | U6 | `veritas.datom`: `db-of`, `equivalent?`, `reads-sound?`, `tx-preserves?`, `monotone?` | new `priv/lib/veritas/datom.bl` | `reads-sound?` over every registered relation catches BUG-100's class |
 | U7 | `veritas.code`: `code-law`, `deflaw`, graph and footprint predicates | new `priv/lib/veritas/code.bl` | needs the codebase graph's footprint export |
 | U8 | `check-concurrent` (linearizability) | `veritas/model.bl` | for `proc.queue` and the projection executor |

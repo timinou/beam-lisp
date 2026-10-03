@@ -89,7 +89,7 @@ only the seam narrowed it to one. Fixing that opened the whole ladder.
 
 == Proof: multi-variable relational invariants (Rung 1)
 
-To show the machinery generalizes, `research/p18_state_models/spike_multivar.bl`
+To show the machinery generalizes, `research/archive/p18_state_models/spike_multivar.bl`
 models a two-variable state with a #term[relational] invariant — one that a
 single-integer model #term[cannot express]:
 
@@ -102,7 +102,7 @@ invariant  (and (>= reserved 0) (>= balance reserved))
 The check declares the whole tuple, primes it jointly (`balance2`, `reserved2`),
 and asks z3 whether any transition can break the coupled predicate.
 
-#ran("elixir … research/p18_state_models/spike_multivar.bl")[
+#ran("elixir … research/archive/p18_state_models/spike_multivar.bl")[
   ```
   reserve  preserves invariant: true
   release  preserves invariant: true
@@ -178,10 +178,10 @@ the lattice. Assemble those into a #term[Houdini fixpoint] (Flanagan–Leino) �
 start from every candidate that holds at the initial state, drop any conjunct a
 transition can break, iterate — and the invariant #term[falls out of the code].
 
-`research/p18_state_models/spike_discover.bl` runs exactly this on an
+`research/archive/p18_state_models/spike_discover.bl` runs exactly this on an
 #term[unannotated] account machine:
 
-#ran("elixir … research/p18_state_models/spike_discover.bl")[
+#ran("elixir … research/archive/p18_state_models/spike_discover.bl")[
   ```
   candidate vocabulary (6): (<= balance 0) (<= balance 1) (<= balance 5)
                             (>= balance 0) (>= balance 1) (>= balance 5)
