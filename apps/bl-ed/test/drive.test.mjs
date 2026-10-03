@@ -164,6 +164,41 @@ test("describe-key explains a binding", () => {
   assert.match(msg(ed), /\] h runs :heading-next/);
 });
 
+test("search: / n N * with smart-case and wrap", () => {
+  let ed = boot("alpha beta\nGamma alpha\nbeta ALPHA");
+  ed = key(ed, "/");
+  ed = type(ed, "alpha");
+  ed = key(ed, "Enter");
+  assert.deepEqual(sel(ed), [[1, 6], [1, 10]], "first match after the cursor");
+  ed = key(ed, "n");
+  assert.deepEqual(sel(ed), [[2, 5], [2, 9]], "lowercase needle matches ALPHA");
+  ed = key(ed, "n");
+  assert.deepEqual(sel(ed), [[0, 0], [0, 4]], "wraps to the top");
+  assert.match(msg(ed), /wrapped/);
+  ed = key(ed, "N");
+  assert.deepEqual(sel(ed), [[2, 5], [2, 9]], "N goes back, wrapping");
+  ed = key(ed, "/"); ed = type(ed, "ALPHA"); ed = key(ed, "Enter");
+  assert.deepEqual(sel(ed), [[2, 5], [2, 9]], "an uppercase needle is case-sensitive");
+  ed = keys(ed, "g g w *");
+  assert.deepEqual(sel(ed), [[2, 0], [2, 3]], "* searches the word under the cursor (beta)");
+});
+
+test("dirty is derived: an edit dirties, undo back to the saved text cleans, a save at the current rev cleans", () => {
+  const dirty = (ed) => get(get(M.d_render(ed), "status"), "dirty?");
+  let ed = boot("abc");
+  assert.equal(dirty(ed), false);
+  ed = keys(ed, "A"); ed = type(ed, "d"); ed = key(ed, "Escape");
+  assert.equal(dirty(ed), true);
+  ed = key(ed, "u");
+  assert.equal(dirty(ed), false, "undo to the loaded text is clean");
+  ed = key(ed, "U");
+  const rev = get(ed, "rev");
+  ed = M.d_handle(ed, R.hashMap(K("type"), K("saved"), K("rev"), rev, K("ok?"), true, K("message"), ""));
+  assert.equal(dirty(ed), false, "saved at the current revision");
+  ed = key(ed, "u");
+  assert.equal(dirty(ed), true, "undo past the save is dirty again");
+});
+
 test("save is an effect, not a side effect", () => {
   let ed = boot("a");
   ed = type(ed, "ib");

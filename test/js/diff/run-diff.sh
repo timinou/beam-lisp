@@ -11,6 +11,7 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../../.." && pwd)
 out=${OUT:-$(mktemp -d "${TMPDIR:-/tmp}/bl-jsdiff.XXXXXX")}
+mkdir -p "$out"
 run=${RUN:-}
 
 cd "$root"
