@@ -4,52 +4,61 @@ What breaks, what is not yet true, and what to watch while building the rest.
 Each item says **how we know** (measured / read in source / inferred), because a
 caveat nobody can check is a rumour.
 
-## 1. Many realms in one VM is designed, not yet true
+## 1. Sharing a VM: what is isolated and what is not
 
-**Known (read in source).** A request already routes to a realm by directory:
-`bl.daemon/handle-in-vm` calls `spec/read cwd`, then `mgr/ensure`, then
-`mgr/run`. So one VM *can* host several realms.
+**Built.** A shared VM boots with no project. Each request carries its working
+directory; the VM finds the project (`bl.env/find`) and opens its realm on the
+first request, once, however many requests arrive together (the manager decides
+which caller created it). A realm has its own env fork, its own index owner and
+its own declared schedules. `bl realm stop` closes one realm and leaves the VM
+and every other realm running.
 
-**Not yet true.** Boot is single-root. `vm.session/start` calls
-`(index/start {:root root})`, stores `root` in `PT-ROOT`, and calls
-`(start-ui root)` — all bound to the *one* root the VM was started for. The
-launcher also keys the warm VM by **tree**, not by (user, build).
+**Isolated (measured).** Two projects answer from their own working directory;
+twelve concurrent requests with different environments each saw only their own;
+closing one realm left the other's index owner the same process.
 
-**What has to change, in order:**
+**Not isolated (measured).** *Code.* Two projects that define a namespace of the
+same name get one namespace: the second sees the first one's. *Environment.* A
+project's `:env` is written into the node's OS environment by `bl.cli/with-project`,
+so a process that never bound a project reads the last one's values. These are
+why sharing is a project's declaration, not the build's default. Fixing them means
+making namespace publication and project binding realm-local.
 
-| singleton today | becomes |
-|---|---|
-| `PT-ROOT` (`persistent_term`) | a per-realm table in `vm.manager` |
-| `index/start {:root}` | one index per realm, started on `ensure` |
-| `start-ui root` | one console per VM; per-realm pages under it |
-| `sched/start-for` | already per-VM-spec: verify it is idempotent per realm |
-| socket name `<tree>-<build>` | `<user>-<build>`; the realm is a request field |
-| launcher `resolve_root` | send `cwd`; the VM resolves the realm |
+**Not built.** One console with a page per realm. A shared VM starts no dashboard,
+because the dashboard's pages read one root.
 
-**Watch for.** Anything stored in `persistent_term` or a named process in a
-`vm.*` namespace is a singleton. Grep for it before declaring a namespace
-realm-safe.
+**Watch for.** Anything stored in `persistent_term`, an ETS table or a named
+process in a `vm.*` namespace is a singleton. Grep for it before declaring a
+namespace realm-safe. `vm.exec`, `vm.repl` and `vm.gateway` still are.
 
 ## 2. Blast radius
 
 **Known.** One VM hosting many realms means a native fault, an out-of-memory
 kill, or a runaway allocation takes every realm in that VM with it.
 
-**What bounds it.** An env fork carries `:max-heap-words`, and `vm.scope` denies
-`System/halt`. **Not verified:** what the heap cap bounds — per process or per
-realm — or that a runaway *member* cannot starve the scheduler. This must be
-measured before one-VM-per-user is the default.
+**What bounds it, measured.**
 
-**Mitigation if it bites.** `bl vm start --isolated` for a project that needs its
-own OS process. The nouns do not change; that realm just gets its own VM.
+- `:max-heap-words` is a **per-process** limit (OTP `max_heap_size`), not a
+  per-realm quota. Twelve members of about 5 MB each lived under an 8 MB cap. The
+  total a realm holds is unbounded.
+- A member that outgrows the cap is killed at once; its siblings and the owner
+  registry are untouched.
+- Eight busy-loop processes on four schedulers did not delay a sleeping process
+  (21 ms): the scheduler preempts by reductions.
+- `vm.scope` denies `System/halt`.
+
+**Not bounded.** Aggregate memory, ETS tables, binaries, NIF memory, the atom
+table, file descriptors and process count. The default `:caps :all` also grants
+the node's halt.
+
+**If it bites.** Leave `:vm` unset: the project keeps its own VM.
 
 ## 3. The VM is not an isolation boundary for code
 
-**Inferred (not tested).** A BEAM node loads each module once, and
-`vm/generation.bl` documents its hotpatch set as process-global. So an env fork
-isolates *names and capabilities*, not *code*: two realms cannot run different
-versions of a module. That is why **build is part of a VM's identity**, and why
-a project that pins a different build gets a different VM.
+**Measured.** A BEAM node loads each module once. An env fork isolates *names and
+capabilities*, not *code*: two projects cannot run different versions of a
+namespace in one node. That is why **build is part of a VM's identity**, and why a
+project that needs different code needs its own VM.
 
 ## 4. Existing warm VMs are invisible without adoption
 
@@ -73,14 +82,16 @@ holds*, not *what it costs in RAM right now*.
 
 **Measured.**
 
-- `vm.owner` defines a `defserver` with the `(registry …)` clause. Under the
-  **ward-isolated** test run (the default) that clause is not registered in the
-  forked VM, so any test that starts a warm VM session fails with
-  `unknown clause registry`. Under `--shared` it passes. This is **pre-existing**:
-  `session_test.bl` fails the same way on unmodified HEAD. New tests that start a
-  session therefore run with `--shared`.
-- `test/bl/vm/http_test.bl` has a **pre-existing** alternating failure on
-  `GET /` (two assertions, every other run), identical on unmodified HEAD.
+- A namespace that uses a `defserver` clause (`(registry …)`) must require the
+  namespace that registers it **bare** as well as aliased: an aliased require is
+  demand-driven, so the clause is not registered when the `defserver` compiles
+  (`unknown clause registry`). `vm.owner` and `live.app` do.
+- The dashboard's first render takes about 5 s (it builds the model). A test that
+  waits less reads the timeout as a failure; the console tests wait 30 s.
+- A qualified call `alias/name` whose `name` is also a core name (`count`, `get`,
+  `first`) compiles to the core function when the alias's namespace is not yet
+  loaded: `(owner/count id)` answers the length of the id string (BUG-111). Until
+  the compiler is fixed, call `(count (owner/procs id))`.
 - `re-find` and `re-pattern` are not in scope inside `vm.*` namespaces; use
   `:re` directly.
 - `bl.json` is not loaded for you in a namespace reached on its own; `(:require

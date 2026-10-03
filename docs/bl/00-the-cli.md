@@ -47,12 +47,34 @@ Three global flags choose the mode (they may appear anywhere before `--`):
 |---|---|
 | `--cold` | run this command in a fresh VM; never use a warm one |
 | `--warm` | use the warm VM, starting one if none runs |
-| `--root DIR` | the project root the warm VM is keyed on |
+| `--root DIR` | act as if the command ran in `DIR`: the project, and so the warm VM, it belongs to |
+| `--share-vm` | use the one VM this build shares between projects |
+| `--own-vm` | use this project's own VM (wins over `--share-vm`) |
 
 A project declares its own default in `env.bl`, and the machine in
 `~/.config/bl/config.bl`, with `:warm "off" | "attach" | "start"`. Precedence:
 flag > `env.bl` > `config.bl` > the built-in default, `attach` — use a running
 warm VM, never start one.
+
+### One VM per project, or one shared
+
+By default a project has its own warm VM. A project that has checked it can live
+beside others declares it in `env.bl`:
+
+```clojure
+{:name "notes"
+ :vm "shared"}     ; "own" (the default) | "shared"
+```
+
+Every project on one build that says `"shared"` then uses a single VM, and each
+command finds its project from the directory it runs in (the nearest `env.bl`
+at or above it). `bl realm stop` in such a project closes that project's realm and
+leaves the VM and the other projects running; `bl vm stop` ends the VM itself.
+
+Sharing is a choice because the VM keeps one copy of each namespace: two shared
+projects that both define a namespace named `app` share it. A source checkout is
+never shared. `--share-vm` and `--own-vm` decide for one command; precedence is
+flag > `env.bl` > own.
 
 With `start`, the command that finds no warm VM runs cold, right away, and starts
 a warm VM in the background for the next one. It never waits for the VM. What the

@@ -43,20 +43,32 @@ bl vm               every VM on the machine, with the realms inside each
 
 Everything else is a verb on one of those two nouns. See [`commands.md`](commands.md).
 
-## Why one VM per user per build
+## One VM per project, or one VM shared
 
-A BEAM node loads each module once. Two builds cannot share a node, so *build*
-is part of a VM's identity. Nothing else is: a user's projects are realms
-inside the VM of the build they run, isolated from each other by an `env`
-fork, not by an OS process.
+A BEAM node loads each module once, so *build* is part of a VM's identity: two
+builds are two VMs. What else belongs to its identity is the project's choice.
 
-- **Cheap.** One ~200 MB node instead of one per checkout.
-- **Warm everywhere.** A scratch directory with no `env.bl` gets a realm, not a
-  cold start.
-- **Easy to track.** `bl vm` has one row per build, not one per tree.
-- **Honest about the cost.** A native fault or a runaway allocation reaches
-  every realm in that VM. [`caveats.md`](caveats.md) says how that is bounded,
-  and what is not.
+| the project says | the VM is |
+|---|---|
+| nothing (the default) | its own: one VM per project tree |
+| `:vm "shared"` in `env.bl`, or `--share-vm` on a command | the one VM its build runs for every project that said so |
+
+A source checkout (build `src`) always has its own VM: it runs its own sources,
+so sharing it would answer one project with another's code.
+
+**Why sharing is a choice, not the default.** Two projects that each define a
+namespace named `app` meet in one node, and the node keeps one `app`. Measured:
+the second project got the first one's code, and a project's `:env` leaked into
+the node's environment. A project that has checked it can live beside others opts
+in; nobody is shared by surprise.
+
+**What sharing buys.** One ~200 MB node instead of one per project, and a
+directory you have never run `bl` in gets a realm from the warm VM instead of a
+cold start. The realm is chosen *per request*, from the request's working
+directory: the nearest directory at or above it that holds an `env.bl`.
+
+**What it costs.** A native fault or a runaway allocation reaches every realm in
+that VM. [`caveats.md`](caveats.md) says how that is bounded, and what is not.
 
 ## The documents
 
@@ -72,10 +84,9 @@ fork, not by an OS process.
 The build order is the PLAN in `!tasks/plans/`. This folder says what the
 system *is*; the plan says how to get there.
 
-## What exists today, and what does not
+## What is built, and what is not
 
-Written down so nobody has to guess:
-
-| exists and is used | `vm.manager`, `vm.core`, `vm.owner`, `vm.scope`, `vm.osenv`, `vm.spec`, `vm.net`, `vm.wire`, `vm.ports`, `vm.gateway`, `vm.http` |
-| exists, not yet true | many realms in one VM. Requests already route to a realm by directory, but the index, the root and the page are bound to *one* root at boot |
-| new in the first slice | the VM registry, the inventory, `bl vm`, `bl realm`, the machine page |
+| built | `vm.manager`, `vm.core`, `vm.owner`, `vm.scope`, `vm.osenv`, `vm.spec`, `vm.net`, `vm.wire`, `vm.ports`, `vm.gateway`, `vm.http`, the VM registry, the inventory, `bl vm`, `bl realm`, the machine page |
+| built | **realms in a shared VM**: `vm.realm` opens a realm on its first request and closes it on `bl realm stop`; `vm.index` keeps one index owner per realm |
+| not built | per-realm pages under one console: a shared VM serves no dashboard (its pages read one root) |
+| not built | project-local code and environment in a shared VM: a namespace defined by two projects is one namespace |

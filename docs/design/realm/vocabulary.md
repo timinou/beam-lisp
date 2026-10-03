@@ -40,7 +40,7 @@ It has a pid, a start time, a memory footprint, and a role.
 
 | role | what it does | how many |
 |---|---|---|
-| `warm` | hosts realms; answers commands without a cold boot | one per user per build |
+| `warm` | hosts realms; answers commands without a cold boot | one per project tree, or one per user per build for projects that share |
 | `gateway` | routes names to ports | at most one per user |
 | `job` | a long-lived `serve`/`watch`/`monitor` | as many as you start |
 
