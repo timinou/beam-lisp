@@ -45,7 +45,7 @@ An explanation contains:
 
 - `:descriptor`: the resulting program.
 - `:evidence`: applied rules, source positions and checked conditions.
-- `:refusals`: candidate rules whose conditions remain unknown.
+- `:refusals`: retained candidates, with safety/coverage or profitability reasons.
 - `:stats`: visited nodes, rewrite count, callback nodes inlined and budget status.
 - `:version`: the rule implementation version.
 

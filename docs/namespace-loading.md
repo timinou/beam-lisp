@@ -44,6 +44,16 @@ The build driver accepts `:scope :scoped` for a partial inventory. Scoped builds
 preserve unrelated manifest entries, logs, and BEAMs; a full build owns deletion.
 A deleted scoped source remains until a full authoritative inventory removes it.
 
+## Definition tables and live edits
+
+An AOT namespace carries its function declarations in the BEAM as a shared literal. Its environment stores a small reference to that table; reading declarations does not copy the whole namespace through ETS. Source-loaded and edited namespaces use an environment-local map snapshot.
+
+The declaration table is available before value initializers run. Initializers keep their source order, and the namespace becomes ready after initialization completes. An initializer can define another function in its own namespace: the new definition extends the declarations and leaves a live map snapshot.
+
+Before a live edit replaces a namespace shim, every environment referencing its table materializes its own snapshot. Existing map snapshots stay unchanged; only the writing environment's table receives the edit. Removing a definition or explicitly storing an empty table remains a local override. Destroying a fork removes its snapshots and preserves other environments' tables.
+
+A table reference names the currently loaded module, not an immutable helper-body certificate. Compiler specialization still needs checked binding/domain facts and body-change validity; a stable name or signature is not enough.
+
 ## Lazy values and memory
 
 Lazy values retain realized elements so later consumers see the same values.
