@@ -19,7 +19,7 @@ still exits 0.
 
 ```beam-lisp
 (ns bl.doctor
-  (:require [bl.util :as u] [vm.client] [model] [vm.image :as image]))
+  (:require [bl.util :as u] [vm.client] [model] [vm.image :as image] [bl.gateway] [bl.json]))
 ```
 
 ## A probe never crashes
@@ -145,6 +145,19 @@ invocation, so it reports `not running` and changes nothing.
          (if (contains? r :ok)
            {:ok true :detail "running (warm VM for this tree)"}
            {:ok false :detail (str "not running (" (pr-str (:error r)) ")")}))))
+
+   ;; An installed unit is text a release cannot rewrite. One written by an earlier
+   ;; installer runs a command that no longer exists, so systemd starts nothing at
+   ;; the next login — and nothing would say so until the names stopped answering.
+   (probe "gateway unit" false
+     (fn []
+       (case (bl.gateway/unit-state)
+         :absent  {:ok true :detail "not installed"}
+         :current {:ok true :detail "installed"}
+         :other   {:ok true :detail "installed (edited by hand; not checked)"}
+         :retired {:ok false
+                   :detail (str "runs a command that no longer exists, so it will not start at login"
+                                " — `bl install gateway` rewrites it")})))
 
    (probe "src/" false
      (fn [] (let [ok? (File/dir? (u/resolve "src"))]

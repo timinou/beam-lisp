@@ -1,0 +1,152 @@
+; registry_test.bl — vm.registry, the machine's one record per bl VM.
+;
+; Every test runs against a throwaway runtime dir (XDG_RUNTIME_DIR), never the
+; real one: a test that wrote records into the live machine's inventory would
+; show up in `bl vm` on the developer's screen.
+
+(ns vm.registry-test
+  (:require [vm.registry :as registry] [vm.paths :as paths]))
+
+(defn- fresh-runtime []
+  (let [d (str "/tmp/bl-registry-test-" (erlang/apply :erlang :unique_integer (list (to-list [:positive]))))]
+    (File/mkdir_p! d)
+    (System/put_env "XDG_RUNTIME_DIR" d)
+    d))
+
+(defn- vms-dir [rt] (str rt "/beam_lisp/vms"))
+
+(defn- with-runtime [f]
+  (let [prev (System/get_env "XDG_RUNTIME_DIR")
+        rt (fresh-runtime)]
+    (try (f rt)
+         (finally
+           (if (nil? prev) (System/delete_env "XDG_RUNTIME_DIR") (System/put_env "XDG_RUNTIME_DIR" prev))
+           (File/rm_rf! rt)))))
+
+(defn- own-pid [] (erlang/list_to_integer (erlang/apply :os :getpid (list))))
+
+(deftest publishing-makes-this-vm-visible
+  (testing "one live record, naming this pid, build and role"
+    (with-runtime
+      (fn [_]
+        (let [r (registry/publish! :warm {:label "proj"})
+              rec (:ok r)]
+          (is (contains? r :ok))
+          (is (= (own-pid) (:pid rec)))
+          (is (= :warm (:role rec)))
+          (is (= "proj" (:label rec)))
+          (is (= (paths/build-id) (:build rec)))
+          (is (= [(:id rec)] (mapv (fn [x] (:id x)) (registry/all)))))))))
+
+(deftest a-record-carries-the-kernels-start-time
+  (testing "ticks come from /proc/<pid>/stat field 22, and are what makes liveness exact"
+    (with-runtime
+      (fn [_]
+        (let [rec (:ok (registry/publish! :warm))]
+          (is (pos? (:ticks rec)))
+          (is (= (:ticks rec) (registry/start-ticks (own-pid)))))))))
+
+(deftest retracting-leaves-nothing-behind
+  (testing "a clean stop removes the record, and retracting twice is fine"
+    (with-runtime
+      (fn [rt]
+        (let [rec (:ok (registry/publish! :warm))]
+          (registry/retract! rec)
+          (registry/retract! rec)
+          (is (empty? (registry/all)))
+          (is (empty? (registry/stale)))
+          (is (not (File/exists? (str (vms-dir rt) "/" (:id rec) ".rec")))))))))
+
+(deftest publishing-twice-is-one-record
+  (testing "idempotent: a second publish from the same pid rewrites the same file"
+    (with-runtime
+      (fn [_]
+        (registry/publish! :warm)
+        (registry/publish! :warm)
+        (is (= 1 (count (registry/all))))))))
+
+;; ── liveness ────────────────────────────────────────────────────────────────
+
+(defn- plant!
+  "Write a record by hand, as a VM that has since died (or been reused) would."
+  [rt rec]
+  (let [dir (vms-dir rt)]
+    (File/mkdir_p! dir)
+    (File/write! (str dir "/" (:id rec) ".rec") (erlang/term_to_binary rec))))
+
+(deftest a-dead-pid-is-stale-and-not-listed
+  (testing "no process has this pid, so the record is stale — listed only by `stale`"
+    (with-runtime
+      (fn [rt]
+        (plant! rt {:id "dead-1" :role :warm :build "dead" :pid 4000000 :ticks 5 :started 0})
+        (is (empty? (registry/all)))
+        (is (= 1 (count (registry/stale))))))))
+
+(deftest a-reused-pid-is-not-the-vm-that-wrote-the-record
+  (testing "the pid exists but began at another time: the record is stale"
+    (with-runtime
+      (fn [rt]
+        ;; our own pid, with start ticks that are not ours — a pid the kernel
+        ;; handed to a different program after the VM died
+        (plant! rt {:id "reused-1" :role :warm :build "old" :pid 1 :ticks 1 :started 0})
+        (is (not (registry/live? {:pid 1 :ticks 1})) "pid 1 did not begin at tick 1")
+        (is (empty? (registry/all)))))))
+
+(deftest an-adopted-row-with-no-ticks-is-judged-by-the-pid-alone
+  (testing "legacy rows carry no start time; the pid existing is all there is to check"
+    (is (registry/live? {:pid (own-pid) :ticks nil}))
+    (is (registry/live? {:pid 1 :ticks nil}))
+    (is (not (registry/live? {:pid 4000000 :ticks nil})))
+    (is (not (registry/live? {:pid "nope" :ticks nil})))))
+
+(deftest reading-never-mutates-and-sweep-is-the-one-delete
+  (testing "all and stale leave the file; sweep! removes it and counts"
+    (with-runtime
+      (fn [rt]
+        (plant! rt {:id "dead-2" :role :warm :build "dead" :pid 4000000 :ticks 5 :started 0})
+        (registry/all) (registry/stale)
+        (is (File/exists? (str (vms-dir rt) "/dead-2.rec")) "reading must not delete")
+        (is (= 1 (registry/sweep!)))
+        (is (not (File/exists? (str (vms-dir rt) "/dead-2.rec"))))
+        (is (= 0 (registry/sweep!)) "sweeping again finds nothing")))))
+
+(deftest a-torn-or-foreign-file-is-swept-and-never-crashes-the-reader
+  (testing "bytes that are not a record are stale, and do not empty the inventory"
+    (with-runtime
+      (fn [rt]
+        (registry/publish! :warm)
+        (File/write! (str (vms-dir rt) "/garbage.rec") "not a term")
+        (File/write! (str (vms-dir rt) "/shape.rec") (erlang/term_to_binary {:hello "world"}))
+        (is (= 1 (count (registry/all))) "the live record still lists")
+        (is (= 2 (count (registry/stale))) "both bad files are stale")
+        (is (= 2 (registry/sweep!)))
+        (is (= 1 (count (registry/all))))))))
+
+(deftest a-write-in-flight-is-not-a-record-yet
+  (testing "a .tmp file is skipped: readers never see half a record"
+    (with-runtime
+      (fn [rt]
+        (registry/publish! :warm)
+        (File/write! (str (vms-dir rt) "/x.rec.tmp.1") "half")
+        (is (= 1 (count (registry/all))))
+        (is (= 0 (count (registry/stale))))))))
+
+(deftest memory-counts-swap-because-resident-alone-lies
+  (testing "a VM idle for hours shows ~8 MB resident and hundreds of MB in swap"
+    (let [kb (registry/memory-kb {:pid (own-pid)})]
+      (is (pos? kb))
+      (is (>= kb (let [s (File/read! (str "/proc/" (own-pid) "/status"))
+                       m (re-find #"VmRSS:\s+(\d+) kB" s)]
+                   (erlang/binary_to_integer (second m))))
+          "at least the resident part"))
+    (is (nil? (registry/memory-kb {:pid 4000000})) "a gone VM has no memory to report")))
+
+(deftest the-records-dir-is-private
+  (testing "0700, like every other runtime file"
+    (with-runtime
+      (fn [rt]
+        (registry/publish! :warm)
+        (let [mode (:mode (File/stat! (vms-dir rt)))]
+          (is (= 0 (erlang/band mode 63)) "no group or world bits"))))))
+
+(run-tests)

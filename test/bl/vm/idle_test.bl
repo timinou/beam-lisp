@@ -1,0 +1,148 @@
+; idle_test.bl — a warm VM that nobody uses leaves, and one that is used stays.
+;
+; The rule is a pure function of (limit, now, last-active, busy?), so most of this
+; needs no clock. The watcher and the in-flight count are tested with a real,
+; short tick, because a counter that races is exactly what lets an in-use VM look
+; idle and be stopped under someone's command.
+
+(ns vm.idle-test
+  (:require [vm.idle :as idle] [vm.paths :as paths] [bl.realm :as realm]
+            [vm.owner :as owner] [vm.manager :as mgr] [vm.realm :as vmr]))
+
+;; ── the rule ────────────────────────────────────────────────────────────────
+
+(deftest a-vm-idle-for-the-limit-expires
+  (is (= true (idle/expired? 60 1000 940 false)) "exactly the limit")
+  (is (= true (idle/expired? 60 1000 100 false)) "far past it")
+  (is (= false (idle/expired? 60 1000 941 false)) "one second short"))
+
+(deftest a-busy-vm-never-expires
+  (testing "however long ago it was last stamped"
+    (is (= false (idle/expired? 60 100000 0 true)))))
+
+(deftest a-limit-of-zero-or-nothing-means-never
+  (is (= false (idle/expired? 0 100000 0 false)) "0 turns the clock off")
+  (is (= false (idle/expired? -5 100000 0 false)))
+  (is (= false (idle/expired? nil 100000 0 false)))
+  (is (= false (idle/expired? "soon" 100000 0 false)) "a non-number is not a limit"))
+
+;; ── the in-flight count ─────────────────────────────────────────────────────
+
+(deftest requests-are-counted-in-and-out
+  (let [base (idle/running)]
+    (idle/begin!) (idle/begin!)
+    (is (= (+ base 2) (idle/running)))
+    (idle/end!)
+    (is (= (+ base 1) (idle/running)))
+    (idle/end!)
+    (is (= base (idle/running)))))
+
+(deftest concurrent-requests-never-lose-a-count
+  (testing "200 processes begin at once; a read-then-write counter would drop some"
+    (let [base (idle/running)
+          me (erlang/self)
+          n 200]
+      (doseq [_ (range n)]
+        (spawn (fn [] (idle/begin!) (erlang/send me :began))))
+      (doseq [_ (range n)] (receive :began :ok (after 10000 :timeout)))
+      (is (= (+ base n) (idle/running)) "every begin was counted")
+      (doseq [_ (range n)] (idle/end!))
+      (is (= base (idle/running)) "and every end"))))
+
+;; ── the watcher ─────────────────────────────────────────────────────────────
+
+(deftest no-limit-starts-no-watcher
+  (is (nil? (idle/start-watcher 0 (fn [] false) (fn [] nil))))
+  (is (nil? (idle/start-watcher nil (fn [] false) (fn [] nil)))))
+
+(deftest the-tick-is-far-below-any-sane-limit
+  (testing "a VM may overshoot its limit by one tick, so the tick must be small against it"
+    (is (<= idle/TICK-S 60))
+    (is (>= (quot 28800 idle/TICK-S) 100) "the default limit is at least 100 ticks")))
+
+;; ── realm start hands the VM its limit ──────────────────────────────────────
+
+(deftest realm-start-defaults-to-eight-hours-and-obeys-the-flag
+  (is (= 28800 realm/DEFAULT-IDLE-SECONDS))
+  (is (= 28800 (:idle (realm/start-options {}))) "no flag: the default")
+  (is (= 90 (:idle (realm/start-options {:idle 90}))))
+  (is (= 0 (:idle (realm/start-options {:idle 0}))) "--idle 0 is honoured, not replaced by the default")
+  (is (= "/x.log" (:log (realm/start-options {:log "/x.log"})))))
+
+;; ── the log path agrees with the launcher ───────────────────────────────────
+
+(deftest the-log-path-is-built-from-the-tree-the-build-and-the-state-dir
+  (is (= "/s/beam-lisp/logs/abc123-3ffa4c3a.log" (paths/log-path-in "/s" "abc123" "3ffa4c3a"))))
+
+(defn- includes? [s sub] (String/contains? s sub))
+
+(deftest the-launcher-and-the-vm-name-the-log-identically
+  (testing "the Rust golden string is the .bl one: a mismatch makes `bl vm logs` look in the wrong place"
+    (let [rust (File/read! "tooling/drop/src/daemon.rs")]
+      (is (includes? rust (str "\"" paths/STATE-APP-DIR "\"")) "same app directory")
+      (is (includes? rust (str "\"" paths/LOG-DIR "\"")) "same logs directory")
+      (is (includes? rust (str "\"" paths/LOG-EXT "\"")) "same extension"))))
+
+(deftest the-start-marker-is-named-like-the-endpoint
+  (let [ep (:ok (paths/endpoints "/tmp"))
+        base (String/slice (:sock ep) 0 (- (count (:sock ep)) (count ".sock")))]
+    (is (= (str base ".starting") (:starting ep)))))
+
+;; ── what counts as a route in use ───────────────────────────────────────────
+
+(deftest a-vms-own-console-is-not-use
+  (testing "every warm VM claims `ui`; if that counted, no VM could ever go idle"
+    (let [claims [{:name "ui" :pid 7} {:name "ui" :pid 8}]]
+      (is (empty? (idle/serving-claims claims 7)) "its own dashboard is not a reason to stay"))))
+
+(deftest a-projects-own-routes-are-use
+  (let [claims [{:name "ui" :pid 7} {:name "web" :pid 7} {:name "api" :pid 9}]]
+    (is (= ["web"] (mapv (fn [c] (:name c)) (idle/serving-claims claims 7)))
+        "web is why the VM is running")
+    (is (empty? (idle/serving-claims claims 12)) "another VM's claims are not ours")))
+
+;; ── what keeps a VM alive: work, not furniture ──────────────────────────────
+
+(defn- project [name]
+  (let [root (str "/tmp/bl-idle-" name "-" (erlang/apply :erlang :unique_integer (list (to-list [:positive]))))]
+    (File/mkdir_p! (str root "/priv/boot"))
+    (File/write! (str root "/priv/boot/core.bl") "")
+    (File/write! (str root "/env.bl") (str "{:name \"" name "\"}"))
+    root))
+
+(deftest an-idle-realm-owns-furniture-but-no-work
+  (testing "opening a realm starts its index owner, a member; that is not use"
+    (mgr/start)
+    (let [root (project "furniture")
+          vm (vmr/open root)]
+      (try
+        (is (> (count (owner/procs (:id vm))) 0) "the index owner IS a member of the realm")
+        (is (= 0 (count (idle/active-members (:id vm)))) "but a realm with only furniture is not busy")
+        (finally (vmr/close root))))))
+
+(deftest a-running-job-is-work
+  (testing "a member under a role that is not furniture keeps the realm busy"
+    (mgr/start)
+    (let [root (project "job")
+          vm (vmr/open root)
+          p (owner/spawn (:id vm) :serve (fn [] (Process/sleep 5000)))]
+      (try
+        (is (= 1 (count (idle/active-members (:id vm)))) "the serve counts, the index does not")
+        (finally (erlang/exit p :kill) (vmr/close root))))))
+
+(deftest the-furniture-roles-are-a-named-table
+  (is (contains? idle/FURNITURE-ROLES :index))
+  (is (not (contains? idle/FURNITURE-ROLES :serve)))
+  (is (not (contains? idle/FURNITURE-ROLES :schedules)) "declared periodic work is work"))
+
+(deftest racing-first-requests-all-land-in-one-counter
+  (testing "the cell is created once however many requests arrive first together"
+    (erlang/apply :persistent_term :erase (list idle/PT-IN-FLIGHT))
+    (let [n 64
+          fs (doall (map (fn [_] (future (idle/begin!))) (range n)))]
+      (doseq [f fs] (deref f))
+      (is (= n (idle/running)) "every begin! was counted: a lost count lets a busy VM look idle")
+      (doseq [_ (range n)] (idle/end!))
+      (is (= 0 (idle/running))))))
+
+(run-tests)

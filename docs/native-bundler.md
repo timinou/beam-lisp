@@ -128,7 +128,7 @@ magic check) and fails loudly on a host-only payload — the classic
 3. **Versioned payload dir**: `<install>/<sha8>/` — extraction is atomic
    (`.tmp` + rename). A payload dir is removed only when nothing holds it
    (see §15, *Cleaning up*): a VM execs helper binaries (`inet_gethost`,
-   `erl_child_setup`) out of its own erts dir, lazily, and a daemon runs from
+   `erl_child_setup`) out of its own erts dir, lazily, and a warm VM runs from
    its tree for its whole life, so deleting a tree some process runs from kills
    it with `Can not execute …/erts-*/bin/inet_gethost : enoent`.
 4. **Exec**:
@@ -252,31 +252,31 @@ Two release-integration findings baked into the design:
    a `--` separator LEAKS into argv (verified empirically), so the launcher
    does not add one.
 
-## 12. The warm daemon — a ~instant dev loop
+## 12. The warm VM — a ~instant dev loop
 
 A drop's launcher does more than extract-and-exec: before it cold-boots the
-release VM (~1s), it looks for a **warm `bl daemon`** for the caller's tree and
+release VM (~1s), it looks for a **warm VM** for the caller's tree and
 forwards the command to it over a Unix socket. A served command returns in
 ~20ms instead of ~1s. The escript path costs ~30s per invocation (it cold-loads
-its whole archive every time) and cannot load NIFs at all — the daemon+drop
+its whole archive every time) and cannot load NIFs at all — the warm-VM + drop
 pair is strictly better, so the escript is deprecated.
 
-### One daemon per tree and build
+### One warm VM per tree and build
 
-A daemon runs ONE build's code for ONE tree, so it is named by both. The tree
+A warm VM runs ONE build's code for ONE tree, so it is named by both. The tree
 key is the first 16 hex of `sha256(realpath(root))`; the build is `BL_BUILD_ID`
 — the payload's sha8, which the launcher sets, or `src` for a checkout run
 through `bin/bl`. Its endpoints live under `$XDG_RUNTIME_DIR/beam_lisp/` (a
 `0700` dir): `<tree>-<build>.sock` (the `AF_UNIX` stream socket, `0600`),
 `<tree>-<build>.token` (a 256-bit secret), and `<tree>-<build>.meta` (pid, root,
-build, start time). Two builds used in one tree are two daemons, side by side;
-`daemon stop` removes all three files. The socket's existence is discovery; an
+build, start time). Two builds used in one tree are two warm VMs, side by side;
+`bl realm stop` removes all three files. The socket's existence is discovery; an
 **authenticated hello** (constant-time token compare + matching tree
 fingerprint + the build the client expects) is authority.
 
 ### The wire
 
-Frames are length-prefixed (`{packet, 4}`) Erlang terms (ETF). The daemon
+Frames are length-prefixed (`{packet, 4}`) Erlang terms (ETF). The warm VM
 decodes with `binary_to_term(bin, [:safe])` and then a total, allowlisted schema
 check — a malformed or oversized frame is refused, never executed. A client
 `hello` (`tree`, `token`, `build`) gets `ready` or a `reject` (`unauthorized` ·
@@ -286,19 +286,19 @@ check — a malformed or oversized frame is refused, never executed. A client
 
 ### A VM per project, a process per request
 
-The daemon holds a **warm VM per project** and runs each command as its own
-process under that VM. Per request it forks a fresh env, binds the client's
+One warm VM serves one project; each command runs as its own process under
+it. Per request the warm VM forks a fresh env, binds the client's
 roots and cwd/argv, overlays the client's environment *process-locally* (never
 the node-global table), and routes stdout through a per-request group-leader
 proxy — so N concurrent commands are N processes, never a queue, and one
 command's env never leaks into the next. Two `bl run`s from two terminals run at
 once. Only the reload/intent **sequencer** takes turns: a save's stage→commit
 and a dashboard-launched task ride one sequencer so they are ordered against
-each other, never racing a program the daemon is running.
+each other, never racing a program the warm VM is running.
 
 ### Staleness is a restart, never a hot-swap
 
-The daemon freezes the compiler key it booted with. When the checkout changes
+The warm VM freezes the compiler key it booted with. When the checkout changes
 under it (the live key moves) or a client presents a different key, it refuses
 work with `restart_required`: a stale VM never serves: it is stopped and a fresh
 one loads a single coherent image. Mixing old loaded code with new sources is
@@ -307,15 +307,20 @@ the one thing a warm VM must not do.
 ### Using it
 
 ```
-bl daemon start     # become the daemon (blocks; the launcher runs it detached)
-bl daemon status    # a live daemon's pid, tree, build, compiler key, uptime
-bl daemon stop      # drain and exit; the socket is removed
+bl realm start      # start this project's warm VM (blocks; the launcher runs it detached)
+bl realm show       # the realm's VM: pid, tree, build, compiler key, uptime
+bl realm stop       # drain this project's realm and remove the socket
 
-BL_DAEMON=off       # every command cold-boots, no daemon
-BL_DAEMON=auto      # a missing daemon is auto-started, then attached
+--cold              # run this command in a fresh VM; never use a warm one
+--warm              # use the warm VM, starting one if none runs
+--root DIR          # the project root the warm VM is keyed on
 ```
 
-The fallback is total: no daemon (or `BL_DAEMON=off`) means each `bl` is an
+A project declares its default in `env.bl` (or `~/.config/bl/config.bl`) with
+`:warm "off" | "attach" | "start"` — flag beats `env.bl` beats `config.bl`
+beats the built-in `attach`.
+
+The fallback is total: no warm VM (or `--cold`) means each `bl` is an
 ordinary cold boot — correct, just slower. A command is never silently retried
 after its request frame is sent, because side effects may already have happened;
 a lost connection there is an unknown outcome (exit 1), not a re-run.
@@ -374,7 +379,7 @@ the macOS legs compile it to an empty cdylib and `wry/*` reads as ABSENT
 (§5, and the `defnative` doctrine). The Linux legs install
 `libgtk-3-dev libwebkit2gtk-4.1-dev libgtk-layer-shell-dev` first.
 
-The smoke step runs the artifact the way a user does — cold, no daemon, no
+The smoke step runs the artifact the way a user does — cold, no warm VM, no
 checkout — and asserts a live native surface of each tier: the language, a
 Rust NIF (`datom.store-fjall/available?`), Explorer (`datom.frame/available?`),
 the `lazy_memo` runtime, and the z3 port (`z3/check` → `sat`). A payload that
@@ -392,7 +397,7 @@ is what `bl self-update latest` fetches on a machine with no beam-lisp checkout.
 ## 15. One `bl` on PATH, many builds behind it
 
 `~/.local/bin/bl` is the launcher with NO payload. On every call it decides
-which build runs here, then runs it exactly as that drop would (daemon
+which build runs here, then runs it exactly as that drop would (warm-VM
 fast-path included). The decision is `bl which`:
 
 ```
@@ -487,7 +492,7 @@ and called first. `bl hooks remove` puts them back.
 ### Cleaning up
 
 A payload dir stays while anything holds it: it is the build being run, a
-pointer names it (a channel, a tag, or a worktree that still exists), a daemon
+pointer names it (a channel, a tag, or a worktree that still exists), a warm VM
 serves it, a process runs from it, or it was used in the last
 `BL_DROP_KEEP_DAYS` (14) days. Anything else is removed after
 `BL_DROP_GRACE_HOURS` (24). The launcher sweeps after each first extraction;

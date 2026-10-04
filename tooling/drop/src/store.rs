@@ -38,7 +38,7 @@ pub const BUILD_INPUTS: &[&str] = &[
     "tooling/drop/Cargo.toml",
     "tooling/drop/Cargo.lock",
     "bin",
-    "env.bl",
+    PROJECT_FILE,
     "bl.lock",
 ];
 
@@ -46,6 +46,16 @@ pub const BUILD_INPUTS: &[&str] = &[
 /// keeps a build's own products from changing the stamp of the tree it built.
 const STAMP_SKIP_DIRS: &[&str] = &["target", ".spell", ".cargo"];
 const STAMP_SKIP_PATHS: &[&str] = &["priv/native", "priv/embed", "priv/z3", "priv/codegen.sources"];
+
+// ── store layout names ──────────────────────────────────────────────────────
+// One spelling each: the golden strings the on-disk store is built from.
+pub const CHANNELS_DIR: &str = "channels";
+pub const TAGS_DIR: &str = "tags";
+pub const BLEEDING_EDGE_DIR: &str = "bleeding-edge";
+pub const SOURCES_DIR: &str = "sources";
+
+/// The pointer directories under `store/`, in `referenced`'s listing order.
+pub const POINTER_DIRS: &[&str] = &[CHANNELS_DIR, TAGS_DIR, BLEEDING_EDGE_DIR, SOURCES_DIR];
 
 // ── the store ───────────────────────────────────────────────────────────────
 
@@ -83,6 +93,26 @@ impl Store {
 
     pub fn write(&self, rel: &str, p: &Pointer) -> std::io::Result<()> {
         write_atomic(&self.meta().join(rel), p.render().as_bytes())
+    }
+
+    /// `channels/<name>` — a channel pointer (`stable`, `latest`).
+    pub fn channel_key(&self, name: &str) -> String {
+        format!("{CHANNELS_DIR}/{name}")
+    }
+
+    /// `bleeding-edge/<tree-id>` — one worktree's newest build.
+    pub fn bleeding_edge_key(&self, id: &str) -> String {
+        format!("{BLEEDING_EDGE_DIR}/{id}")
+    }
+
+    /// `tags/<tag>` — a release pointer.
+    pub fn tag_key(&self, tag: &str) -> String {
+        format!("{TAGS_DIR}/{tag}")
+    }
+
+    /// `sources/<source-key>` — a commit (+diff) build.
+    pub fn source_key(&self, key: &str) -> String {
+        format!("{SOURCES_DIR}/{key}")
     }
 }
 
@@ -298,9 +328,9 @@ pub fn expand_home(p: &str) -> PathBuf {
 // ── declarations, by scan ───────────────────────────────────────────────────
 
 /// A top-level `:KEY "value"` literal in a `.bl` data file, by SCAN — the
-/// launcher never evaluates a project's code to decide how to run it (the
-/// `declared_daemon_mode` rule). Comment lines are skipped; the key must stand
-/// alone (`:bl` does not match `:bl-foo`).
+/// launcher never evaluates a project's code to decide how to run it (the rule
+/// `:warm`/`:bl`/`:default` all follow). Comment lines are skipped; the key must
+/// stand alone (`:bl` does not match `:bl-foo`).
 pub fn scan_literal(text: &str, key: &str) -> Option<String> {
     let needle = format!(":{key}");
     for line in text.lines() {
@@ -347,7 +377,7 @@ pub fn source_repo() -> Option<PathBuf> {
 pub fn source_tree(cwd: &Path) -> Option<PathBuf> {
     let mut dir = cwd.to_path_buf();
     loop {
-        if dir.join("priv/boot/core.bl").is_file() && dir.join("bin/bl").is_file() && dir.join(".git").exists() {
+        if dir.join(TREE_MARKER).is_file() && dir.join(LAUNCHER_REL).is_file() && dir.join(".git").exists() {
             return Some(std::fs::canonicalize(&dir).unwrap_or(dir));
         }
         if !dir.pop() {
@@ -360,7 +390,7 @@ pub fn source_tree(cwd: &Path) -> Option<PathBuf> {
 pub fn nearest_env(cwd: &Path) -> Option<PathBuf> {
     let mut dir = cwd.to_path_buf();
     loop {
-        let f = dir.join("env.bl");
+        let f = dir.join(PROJECT_FILE);
         if f.is_file() {
             return Some(f);
         }
@@ -395,15 +425,25 @@ pub struct Resolution {
     pub tree: Option<PathBuf>,
 }
 
-/// Which build runs for a command started in `cwd`. First match wins:
-///   1. `BL_USE=<spec>`
+/// Which build runs for a command started in `cwd`: the thin reader that loads
+/// the two inputs from outside — `BL_USE` and the config text — and hands them
+/// to the PURE core, `resolve_with`.
+pub fn resolve(store: &Store, cwd: &Path) -> Resolution {
+    let use_spec = std::env::var("BL_USE").ok().filter(|s| !s.trim().is_empty());
+    let config_text = std::fs::read_to_string(config_path()).ok();
+    resolve_with(store, cwd, use_spec, config_text)
+}
+
+/// Which build runs for a command started in `cwd`, PURE in its inputs so a test
+/// never has to read the developer's environment or config. First match wins:
+///   1. `use_spec` (`BL_USE=<spec>`)
 ///   2. a beam-lisp source tree: its build whose stamp matches, else source mode
 ///   3. the nearest `env.bl`'s `:bl "<spec>"`
-///   4. the config's `:default`, else `stable`
-pub fn resolve(store: &Store, cwd: &Path) -> Resolution {
+///   4. `config_text`'s `:default`, else `stable`
+pub fn resolve_with(store: &Store, cwd: &Path, use_spec: Option<String>, config_text: Option<String>) -> Resolution {
     let mut steps = Vec::new();
 
-    if let Some(spec) = std::env::var("BL_USE").ok().filter(|s| !s.trim().is_empty()) {
+    if let Some(spec) = use_spec {
         steps.push(format!("1 BL_USE={spec}"));
         let target = lookup(store, &spec, &mut steps);
         return Resolution { steps, target, tree: None };
@@ -414,7 +454,7 @@ pub fn resolve(store: &Store, cwd: &Path) -> Resolution {
         steps.push(format!("2 beam-lisp source tree {}", tildify(&root)));
         let id = tree_id(&root);
         let now = stamp(&root);
-        let target = match store.read(&format!("bleeding-edge/{id}")) {
+        let target = match store.read(&store.bleeding_edge_key(&id)) {
             Some(p) if p.get("stamp") == Some(now.as_str()) && store.has(&p.build) => {
                 steps.push(format!("  its last build {} matches this state", p.build));
                 Target::Build(p.build)
@@ -448,7 +488,7 @@ pub fn resolve(store: &Store, cwd: &Path) -> Resolution {
         steps.push("3 no env.bl above this directory".to_string());
     }
 
-    let spec = config_literal("default").unwrap_or_else(|| "stable".to_string());
+    let spec = config_text.as_deref().and_then(|t| scan_literal(t, "default")).unwrap_or_else(|| "stable".to_string());
     steps.push(format!("4 default {spec} ({})", tildify(&config_path())));
     let target = lookup(store, &spec, &mut steps);
     Resolution { steps, target, tree: None }
@@ -473,9 +513,9 @@ pub fn lookup(store: &Store, spec: &str, steps: &mut Vec<String>) -> Target {
         None => None,
     };
     match parsed {
-        Spec::Channel(c) => found(store.read(&format!("channels/{c}")), format!("channel {c}"), steps)
+        Spec::Channel(c) => found(store.read(&store.channel_key(&c)), format!("channel {c}"), steps)
             .unwrap_or_else(|| missing(format!("no `{c}` build is stored yet; `bl self-update {c}` gets one"))),
-        Spec::Tag(t) => found(store.read(&format!("tags/{t}")), format!("tag {t}"), steps)
+        Spec::Tag(t) => found(store.read(&store.tag_key(&t)), format!("tag {t}"), steps)
             .unwrap_or_else(|| missing(format!("release {t} is not stored; `bl self-update {t}` fetches it"))),
         Spec::Build(id) => {
             if store.has(&id) {
@@ -494,7 +534,7 @@ pub fn lookup(store: &Store, spec: &str, steps: &mut Vec<String>) -> Target {
             }
         }
         Spec::Commit(c) => {
-            let hits: Vec<(String, Pointer)> = list(store, "sources")
+            let hits: Vec<(String, Pointer)> = list(store, SOURCES_DIR)
                 .into_iter()
                 .filter(|(k, _)| k.starts_with(&c) && !k.contains('+'))
                 .collect();
@@ -515,7 +555,7 @@ pub fn lookup(store: &Store, spec: &str, steps: &mut Vec<String>) -> Target {
                     Some(std::fs::canonicalize(expand_home(x)).unwrap_or_else(|_| expand_home(x)))
                 }
                 Some(branch) => {
-                    let hit = list(store, "bleeding-edge").into_iter().find(|(_, p)| p.get("branch") == Some(branch));
+                    let hit = list(store, BLEEDING_EDGE_DIR).into_iter().find(|(_, p)| p.get("branch") == Some(branch));
                     return hit
                         .and_then(|(_, p)| found(Some(p), format!("bleeding-edge of branch {branch}"), steps))
                         .unwrap_or_else(|| missing(format!("no worktree on branch {branch} has been built")));
@@ -525,7 +565,7 @@ pub fn lookup(store: &Store, spec: &str, steps: &mut Vec<String>) -> Target {
                 return missing("no `:source` checkout in the config to take bleeding-edge from".to_string());
             };
             found(
-                store.read(&format!("bleeding-edge/{}", tree_id(&tree))),
+                store.read(&store.bleeding_edge_key(&tree_id(&tree))),
                 format!("bleeding-edge of {}", tildify(&tree)),
                 steps,
             )
@@ -584,7 +624,7 @@ pub fn sha8_of(t: &Trailer) -> String {
 
 /// The value of `:KEY "…"` in a payload's `BUILD_INFO.bl` (a printed map).
 pub fn build_info_field(payload: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(payload.join("BUILD_INFO.bl")).ok()?;
+    let text = std::fs::read_to_string(payload.join(BUILD_INFO_FILE)).ok()?;
     let needle = format!(":{key} \"");
     let at = text.find(&needle)? + needle.len();
     let end = text[at..].find('"')?;
@@ -630,7 +670,7 @@ mod store_tests {
             std::fs::create_dir_all(&wt).unwrap();
             let wt = std::fs::canonicalize(&wt).unwrap();
             stored(store, "abababab");
-            store.write(&format!("bleeding-edge/{}", tree_id(&wt)), &Pointer::new("abababab")).unwrap();
+            store.write(&store.bleeding_edge_key(&tree_id(&wt)), &Pointer::new("abababab")).unwrap();
             let mut s = vec![];
             assert_eq!(lookup(store, &format!("bleeding-edge:{}", wt.display()), &mut s), Target::Build("abababab".into()));
             assert!(matches!(lookup(store, "bleeding-edge:no/such-branch", &mut s), Target::Missing { .. }));
@@ -664,8 +704,8 @@ mod store_tests {
         std::fs::create_dir_all(dir.join("priv/boot")).unwrap();
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         std::fs::create_dir_all(dir.join(".git/refs/heads")).unwrap();
-        std::fs::write(dir.join("priv/boot/core.bl"), "core").unwrap();
-        std::fs::write(dir.join("bin/bl"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.join(TREE_MARKER), "core").unwrap();
+        std::fs::write(dir.join(LAUNCHER_REL), "#!/bin/sh\n").unwrap();
         std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::write(dir.join(".git/refs/heads/main"), "1111111111111111111111111111111111111111\n").unwrap();
     }
@@ -687,7 +727,7 @@ mod store_tests {
         assert_ne!(a, b, "a new commit moves it");
 
         std::thread::sleep(std::time::Duration::from_millis(10));
-        std::fs::write(d.join("priv/boot/core.bl"), "core, edited").unwrap();
+        std::fs::write(d.join(TREE_MARKER), "core, edited").unwrap();
         assert_ne!(b, stamp(&d), "an edited input moves it");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -728,24 +768,30 @@ mod store_tests {
         std::fs::create_dir_all(store.payload(id).join("bin")).unwrap();
     }
 
+    /// The resolver with NO environment and NO config: the pure core, so a test
+    /// cannot see the developer's `~/.config/bl/config.bl` or `BL_USE`.
+    fn resolve_iso(store: &Store, cwd: &Path) -> Resolution {
+        resolve_with(store, cwd, None, None)
+    }
+
     #[test]
     fn lookup_answers_from_the_store_alone() {
         with_store("lookup", |store, _| {
             let mut s = vec![];
             assert!(matches!(lookup(store, "stable", &mut s), Target::Missing { .. }));
             stored(store, "aaaaaaaa");
-            store.write("channels/stable", &Pointer::new("aaaaaaaa")).unwrap();
+            store.write(&store.channel_key("stable"), &Pointer::new("aaaaaaaa")).unwrap();
             assert_eq!(lookup(store, "stable", &mut s), Target::Build("aaaaaaaa".into()));
 
-            store.write("sources/1cf72d26294b95444125fbea569a592f1f37c1af", &Pointer::new("aaaaaaaa")).unwrap();
-            store.write("sources/1cf72d26294b95444125fbea569a592f1f37c1af+ac81415ef986", &Pointer::new("bbbbbbbb")).unwrap();
+            store.write(&store.source_key("1cf72d26294b95444125fbea569a592f1f37c1af"), &Pointer::new("aaaaaaaa")).unwrap();
+            store.write(&store.source_key("1cf72d26294b95444125fbea569a592f1f37c1af+ac81415ef986"), &Pointer::new("bbbbbbbb")).unwrap();
             assert_eq!(lookup(store, "commit:1cf72d26", &mut s), Target::Build("aaaaaaaa".into()), "a commit is its CLEAN build");
 
-            store.write("channels/latest", &Pointer::new("cccccccc")).unwrap();
+            store.write(&store.channel_key("latest"), &Pointer::new("cccccccc")).unwrap();
             assert!(matches!(lookup(store, "latest", &mut s), Target::Missing { .. }), "a pointer to a build that is gone is missing");
 
             stored(store, "dddddddd");
-            store.write("bleeding-edge/0000", &Pointer::new("dddddddd").with("branch", "names/portless")).unwrap();
+            store.write(&store.bleeding_edge_key("0000"), &Pointer::new("dddddddd").with("branch", "names/portless")).unwrap();
             assert_eq!(lookup(store, "bleeding-edge:names/portless", &mut s), Target::Build("dddddddd".into()));
             assert!(matches!(lookup(store, "nonsense", &mut s), Target::Invalid(_)));
         });
@@ -758,16 +804,16 @@ mod store_tests {
             fake_tree(&tree);
             let tree = std::fs::canonicalize(&tree).unwrap();
             let sub = tree.join("priv/boot");
-            assert_eq!(resolve(store, &sub).target, Target::SourceMode(tree.clone()), "never built: source mode");
+            assert_eq!(resolve_iso(store, &sub).target, Target::SourceMode(tree.clone()), "never built: source mode");
 
             stored(store, "eeeeeeee");
-            let key = format!("bleeding-edge/{}", tree_id(&tree));
+            let key = store.bleeding_edge_key(&tree_id(&tree));
             store.write(&key, &Pointer::new("eeeeeeee").with("stamp", &stamp(&tree))).unwrap();
-            assert_eq!(resolve(store, &sub).target, Target::Build("eeeeeeee".into()), "built from this state: that build");
+            assert_eq!(resolve_iso(store, &sub).target, Target::Build("eeeeeeee".into()), "built from this state: that build");
 
             std::thread::sleep(std::time::Duration::from_millis(10));
-            std::fs::write(tree.join("priv/boot/core.bl"), "edited").unwrap();
-            assert_eq!(resolve(store, &sub).target, Target::SourceMode(tree.clone()), "edited since: source mode");
+            std::fs::write(tree.join(TREE_MARKER), "edited").unwrap();
+            assert_eq!(resolve_iso(store, &sub).target, Target::SourceMode(tree.clone()), "edited since: source mode");
         });
     }
 
@@ -778,14 +824,27 @@ mod store_tests {
             std::fs::create_dir_all(proj.join("src")).unwrap();
             stored(store, "aaaaaaaa");
             stored(store, "ffffffff");
-            store.write("channels/stable", &Pointer::new("aaaaaaaa")).unwrap();
-            store.write("channels/latest", &Pointer::new("ffffffff")).unwrap();
+            store.write(&store.channel_key("stable"), &Pointer::new("aaaaaaaa")).unwrap();
+            store.write(&store.channel_key("latest"), &Pointer::new("ffffffff")).unwrap();
 
-            std::fs::write(proj.join("env.bl"), "{:name \"p\"}").unwrap();
-            assert_eq!(resolve(store, &proj.join("src")).target, Target::Build("aaaaaaaa".into()), "no :bl → stable");
+            std::fs::write(proj.join(PROJECT_FILE), "{:name \"p\"}").unwrap();
+            assert_eq!(resolve_iso(store, &proj.join("src")).target, Target::Build("aaaaaaaa".into()), "no :bl → stable");
 
-            std::fs::write(proj.join("env.bl"), "{:name \"p\" :bl \"latest\"}").unwrap();
-            assert_eq!(resolve(store, &proj.join("src")).target, Target::Build("ffffffff".into()), ":bl latest");
+            std::fs::write(proj.join(PROJECT_FILE), "{:name \"p\" :bl \"latest\"}").unwrap();
+            assert_eq!(resolve_iso(store, &proj.join("src")).target, Target::Build("ffffffff".into()), ":bl latest");
         });
+    }
+
+    /// The layout helpers produce exactly the golden strings the on-disk store
+    /// is keyed by — a rename here would silently orphan every pointer.
+    #[test]
+    fn store_keys_are_the_golden_layout() {
+        let store = Store { root: PathBuf::from("/x") };
+        assert_eq!(store.channel_key("stable"), "channels/stable");
+        assert_eq!(store.channel_key("latest"), "channels/latest");
+        assert_eq!(store.bleeding_edge_key("57461829a20cc2af"), "bleeding-edge/57461829a20cc2af");
+        assert_eq!(store.tag_key("v2026.4"), "tags/v2026.4");
+        assert_eq!(store.source_key("1cf72d26"), "sources/1cf72d26");
+        assert_eq!(POINTER_DIRS, &["channels", "tags", "bleeding-edge", "sources"]);
     }
 }

@@ -94,7 +94,7 @@ fn events_for(top: &Path) -> Vec<&'static str> {
     if source_tree(top).is_some() {
         ev.extend_from_slice(SOURCE_EVENTS);
     }
-    let latest = std::fs::read_to_string(top.join("env.bl"))
+    let latest = std::fs::read_to_string(top.join(PROJECT_FILE))
         .ok()
         .and_then(|t| scan_literal(&t, "bl"))
         .is_some_and(|s| s == "latest");
@@ -182,9 +182,7 @@ pub fn request_build(store: &Store, tree: &Path, me: &Path) {
 fn spawn_detached(me: &Path, args: &[&str], cwd: &Path) {
     let mut cmd = Command::new(me);
     cmd.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    for var in GIT_INVOCATION_ENV {
-        cmd.env_remove(var);
-    }
+    scrub_git_env(&mut cmd);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -201,12 +199,40 @@ fn spawn_detached(me: &Path, args: &[&str], cwd: &Path) {
     let _ = cmd.spawn();
 }
 
-/// The variables git sets for ONE invocation (a hook sees them). None of them
-/// may outlive it: they name the firing worktree's git dir and index.
-const GIT_INVOCATION_ENV: &[&str] = &[
-    "GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_PREFIX", "GIT_COMMON_DIR",
-    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE",
+/// The variables git sets for a hook so that git commands inside it act on the
+/// repository that fired it. Exactly `git rev-parse --local-env-vars` (a test
+/// keeps this table equal to what the installed git reports).
+///
+/// They must not reach the drainer: it builds OTHER trees, and with `GIT_DIR`
+/// naming the worktree that committed, every `git -C <tree>` it ran read that
+/// worktree's repository instead. Measured on the real build: a tree at
+/// `9870f1e4` answered `rev-parse HEAD` as `6a67c2a6` (a feature-branch commit
+/// that is not on main) when run under the hook's `GIT_DIR`, and `latest` was
+/// stamped with it.
+const GIT_LOCAL_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
 ];
+
+/// Remove from `cmd` every variable that ties a git command to one repository.
+fn scrub_git_env(cmd: &mut Command) {
+    for var in GIT_LOCAL_ENV {
+        cmd.env_remove(var);
+    }
+}
 
 #[cfg(unix)]
 extern "C" {
@@ -263,11 +289,12 @@ pub fn drain(store: &Store, me: &Path) -> Result<String, String> {
                 if on_main {
                     let clean = b.key.as_deref().is_some_and(|k| !k.contains('+'));
                     let latest = if clean {
-                        store.read(&format!("bleeding-edge/{}", tree_id(&tree)))
-                            .map(|p| store.write("channels/latest", &p).map(|_| b.id.clone()).map_err(|e| e.to_string()))
+                        store.read(&store.bleeding_edge_key(&tree_id(&tree)))
+                            .map(|p| store.write(&store.channel_key("latest"), &p).map(|_| b.id.clone()).map_err(|e| e.to_string()))
                             .unwrap_or_else(|| Err("the build left no pointer".to_string()))
                     } else {
-                        build_commit(store, &tree, "main", me, &["channels/latest"]).map(|l| l.id)
+                        let rel = store.channel_key("latest");
+                        build_commit(store, &tree, "main", me, &[rel.as_str()]).map(|l| l.id)
                     };
                     match latest {
                         Ok(id) => built.push(format!("latest → {id}")),
@@ -308,7 +335,7 @@ pub fn guard_verdict(ahead: Option<u32>, fetched: bool, override_set: bool) -> R
 
 fn guard_latest(cwd: &Path) -> Result<(), String> {
     let top = git_out(cwd, &["rev-parse", "--show-toplevel"]).map(PathBuf::from).unwrap_or_else(|| cwd.to_path_buf());
-    let on_latest = std::fs::read_to_string(top.join("env.bl"))
+    let on_latest = std::fs::read_to_string(top.join(PROJECT_FILE))
         .ok()
         .and_then(|t| scan_literal(&t, "bl"))
         .is_some_and(|s| s == "latest");
@@ -339,6 +366,27 @@ fn guard_latest(cwd: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod hooks_tests {
     use super::*;
+
+    #[test]
+    fn a_detached_drainer_gets_no_repository_pinned_by_its_hook() {
+        let mut cmd = Command::new("true");
+        scrub_git_env(&mut cmd);
+        let removed: Vec<_> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+        for var in ["GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_PREFIX", "GIT_COMMON_DIR"] {
+            assert!(removed.iter().any(|r| r == var), "{var} must be removed from the drainer's environment");
+        }
+        assert_eq!(removed.len(), GIT_LOCAL_ENV.len());
+    }
+
+    #[test]
+    fn the_scrubbed_list_is_what_git_calls_local() {
+        let Some(out) = Command::new("git").args(["rev-parse", "--local-env-vars"]).output().ok().filter(|o| o.status.success()) else {
+            return; // no git here: nothing to compare against
+        };
+        let theirs = String::from_utf8_lossy(&out.stdout);
+        let missing: Vec<&str> = theirs.lines().map(str::trim).filter(|v| !v.is_empty() && !GIT_LOCAL_ENV.contains(v)).collect();
+        assert!(missing.is_empty(), "git now reports local variables the drainer would inherit: {missing:?}");
+    }
 
     #[test]
     fn the_guard_refuses_only_unpushed_main() {

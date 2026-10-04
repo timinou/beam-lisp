@@ -1,9 +1,9 @@
-; vm/client.bl — the `bl daemon` lifecycle from the CLI (ports Daemon facade).
+; vm/client.bl — the `bl realm` lifecycle from the CLI (ports Daemon facade).
 ;
 ; The three verbs a terminal (and the launcher) drive:
 ;
 ;   (client/start-foreground root)  → become the daemon (blocks). The launcher
-;      runs this detached; `bl daemon start` in a terminal runs it foreground.
+;      runs this detached; `bl realm start` in a terminal runs it foreground.
 ;   (client/status root)            → connect, print the daemon's status. 0/1.
 ;   (client/stop root)              → ask the daemon to drain and exit. 0/1.
 ;   (client/probe root)             → {:ok ready-meta} | {:error reason}, the
@@ -23,23 +23,32 @@
 ;; ── start (become the daemon) ───────────────────────────────────────────────
 
 (defn start-foreground
-  "Run as the daemon for `root` (default BL_DAEMON_ROOT or cwd), blocking until
-   a :control :stop frame flips the stop flag. If one is already up for this
-   tree, prints a notice and returns :already_running."
-  [root]
-  (let [root (or root (System/get_env "BL_DAEMON_ROOT") (BeamLisp/cwd))
-        p (probe root)]
+  "Run as the warm VM for `root` (default: the cwd's tree), blocking until
+   a :control :stop frame flips the stop flag, or the idle clock `opts` {:idle
+   seconds} arms runs out. If one is already up for this tree, prints a notice
+   and returns :already_running."
+  ([root] (start-foreground root {}))
+  ([root opts]
+  (let [shared (= true (get opts :shared))
+        root (if shared nil (or root (BeamLisp/cwd)))
+        p (if shared (probe-shared) (probe root))]
     (if (contains? p :ok)
-      (do (println (str "bl daemon: already running for " root)) :already_running)
-      (let [r (session/start root)]
-        (if (contains? r :ok)
+      (do (println (str "bl realm: already running for " (or root "the shared VM"))) :already_running)
+      (let [r (session/start root opts)]
+        (cond
+          (contains? r :ok)
           (let [listener (:ok r)]
             (erlang/apply :persistent_term :put (list PT-STOP false))
             (wait-for-stop)
             (session/stop listener)
             :ok)
-          (do (IO/puts :stderr (str "bl daemon: failed to start: " (pr-str r)))
-              {:error r}))))))
+          ;; lost the race to another starter: that one IS the daemon, which is
+          ;; what the caller wanted. Not a failure.
+          (= :already-running (:error r))
+          (do (println (str "bl realm: already running for " (or root "the shared VM"))) :already_running)
+          :else
+          (do (IO/puts :stderr (str "bl realm: failed to start: " (pr-str r)))
+              {:error r})))))))
 
 (defn- wait-for-stop []
   (if (erlang/apply :persistent_term :get (list PT-STOP false))
@@ -49,7 +58,7 @@
 ;; ── the client side (status / stop / probe) ─────────────────────────────────
 
 (defn- resolve-root [root]
-  (or root (System/get_env "BL_DAEMON_ROOT") (BeamLisp/cwd)))
+  (or root (BeamLisp/cwd)))
 
 (defn- do-connect [sock-path]
   (let [r (gen_tcp/connect (tuple :local (erlang/binary_to_list sock-path)) 0
@@ -65,9 +74,20 @@
       {:error (elem r 1)})))
 
 (defn- connect-hello
-  "Connect + the hello/token handshake; {:ok sock ready-meta} | {:error reason}."
-  [root]
-  (let [ep (paths/endpoints root)]
+  "Connect + the hello/token handshake; {:ok sock ready-meta} | {:error reason}.
+   The 2-arg form dials the daemon of ANOTHER build — the one a machine-wide stop
+   has to reach, since a daemon runs one build's code and answers to its own
+   endpoint names."
+  ([root] (connect-hello root nil))
+  ([root build]
+   (connect-hello* root build)))
+
+(defn- connect-hello*
+  "The handshake against an endpoint. `shared` picks the build's shared endpoint,
+   which needs no `root`; the 2-arity asks the project's own declaration."
+  ([root build] (connect-hello* root build (paths/shared? root (or build (paths/build-id)))))
+  ([root build shared]
+  (let [ep (paths/endpoints root (or build (paths/build-id)) shared)]
     (if (not (contains? ep :ok))
       {:error :no_endpoints}
       (let [em (:ok ep)]
@@ -79,7 +99,7 @@
               {:error (:error c)}
               (let [sock (:ok c)]
                 (gen_tcp/send sock (erlang/apply :erlang :term_to_binary
-                                     (list (tuple :bl 1 :hello {:tree (paths/fingerprint root) :token token
+                                     (list (tuple :bl 1 :hello {:tree (paths/hello-fingerprint root (:build em) (:shared em)) :token token
                                                                 :build (:build em)}))))
                 (let [f (recv-frame sock)]
                   (if (not (contains? f :ok))
@@ -88,20 +108,38 @@
                       (cond
                         (= tag :ready) {:ok sock :ready (elem frame 3)}
                         (= tag :reject) (do (gen_tcp/close sock) {:error (tuple :reject (elem frame 3))})
-                        :else (do (gen_tcp/close sock) {:error frame})))))))))))))
+                        :else (do (gen_tcp/close sock) {:error frame}))))))))))))))
 
 (defn- drain-to-exit
-  "Read frames for request `id`, writing stdout/stderr, until :exit."
+  "Read frames for request `id`, writing stdout/stderr, until :exit. Answers HOW it
+   ended: {:ok :exit} when the VM said it was done, {:error reason} when the
+   connection ended without it (`:closed` when the VM went away, `:timeout` when it
+   went quiet). Callers decide what each means for them (see `outcome`)."
   [sock id]
   (let [f (recv-frame sock)]
     (if (not (contains? f :ok))
-      :ok
+      f
       (let [frame (:ok f) tag (elem frame 2)]
         (cond
           (and (= tag :stdout) (= (elem frame 3) id)) (do (IO/write (elem frame 5)) (drain-to-exit sock id))
           (and (= tag :stderr) (= (elem frame 3) id)) (do (IO/write :stderr (elem frame 5)) (drain-to-exit sock id))
-          (and (= tag :exit) (= (elem frame 3) id)) :ok
+          (and (= tag :exit) (= (elem frame 3) id)) {:ok :exit}
           :else (drain-to-exit sock id))))))
+
+(defn outcome
+  "The exit code of a control operation `op`, from how its connection `ended`
+   (what `drain-to-exit` answered). Pure.
+
+   `:stop` asks the VM to leave, so the VM closing the connection IS its answer: it
+   is gone. Anything that asks the VM to do something and KEEP RUNNING (`{:close
+   root}`) is only done when the VM says so with an exit frame; a closed connection
+   there means it died or refused, and reporting success would be a lie. Silence is
+   never confirmation."
+  [op ended]
+  (cond
+    (contains? ended :ok) 0
+    (and (= op :stop) (= :closed (:error ended))) 0
+    :else 1))
 
 (defn- control [root op done-msg]
   (let [root (resolve-root root)
@@ -111,10 +149,11 @@
             id (erlang/apply :crypto :strong_rand_bytes (list 16))]
         (gen_tcp/send sock (erlang/apply :erlang :term_to_binary
                              (list (tuple :bl 1 :control id op))))
-        (drain-to-exit sock id)
-        (gen_tcp/close sock)
-        (when done-msg (println done-msg))
-        0)
+        (let [ended (drain-to-exit sock id)
+              code (outcome op ended)]
+          (gen_tcp/close sock)
+          (when (and done-msg (= 0 code)) (println done-msg))
+          code))
       c)))
 
 (defn status
@@ -123,15 +162,80 @@
   (let [root (resolve-root root)
         r (control root :status nil)]
     (if (= 0 r) 0
-      (do (println (str "bl daemon: not running for " root " (" (pr-str (:error r)) ")")) 1))))
+      (do (println (str "bl realm: not running for " root " (" (pr-str (:error r)) ")")) 1))))
 
 (defn stop
-  "Stop the daemon for `root`. Returns 0 on stop, 1 if none was running."
+  "End the project at `root`. A project with its own VM stops that VM. A project
+   served by a shared VM closes only its REALM: the VM and every other project in
+   it keep running (stop the process itself with `bl vm stop`). Returns 0 on stop,
+   1 if none was running."
   [root]
   (let [root (resolve-root root)
-        r (control root :stop (str "bl daemon: stopped (" root ")"))]
+        shared (paths/shared? root (paths/build-id))
+        r (if shared
+            (control root (tuple :close (erlang/list_to_binary (erlang/binary_to_list root))) nil)
+            (control root :stop (str "bl realm: stopped (" root ")")))]
     (if (= 0 r) 0
-      (do (println (str "bl daemon: not running for " root)) 1))))
+      (do (println (str "bl realm: not running for " root)) 1))))
+
+(defn- stdout-of
+  "Run control op `op` against the endpoint `connect` reaches and collect what the VM
+   prints, as one string; nil when it cannot be reached or does not confirm."
+  [conn op]
+  (if (contains? conn :ok)
+    (let [sock (:ok conn)
+          id (erlang/apply :crypto :strong_rand_bytes (list 16))]
+      (gen_tcp/send sock (erlang/apply :erlang :term_to_binary (list (tuple :bl 1 :control id op))))
+      (let [text (loop [acc ""]
+                   (let [f (recv-frame sock)]
+                     (if (not (contains? f :ok))
+                       nil
+                       (let [frame (:ok f) tag (elem frame 2)]
+                         (cond
+                           (and (= tag :stdout) (= (elem frame 3) id))
+                           (recur (str acc (erlang/apply :unicode :characters_to_binary (list (elem frame 5)))))
+                           (and (= tag :exit) (= (elem frame 3) id)) acc
+                           :else (recur acc))))))]
+        (gen_tcp/close sock)
+        text))
+    nil))
+
+(defn- realm-op
+  "Ask the VM that serves `root` to run `{op root}` and answer what it prints, or nil
+   when it cannot be reached or does not confirm. A project with its own VM is asked
+   at its own endpoint; a project that shares, at the build's shared one."
+  [root op]
+  (let [root (resolve-root root)
+        c (connect-hello root)]
+    (stdout-of c (tuple op (erlang/list_to_binary (erlang/binary_to_list root))))))
+
+(defn members
+  "The members of the realm at `root`: [{:pid :role :age-s}] as text-parsed rows, or
+   nil when no VM answers for it."
+  [root]
+  (let [text (realm-op root :members)]
+    (if (nil? text)
+      nil
+      (vec (map (fn [line]
+                  (let [[pid role age] (String/split line " ")]
+                    {:pid pid :role (keyword role) :age-s (erlang/binary_to_integer age)}))
+                (filter (fn [l] (not= "" l)) (String/split text "\n")))))))
+
+(defn restart
+  "Close and reopen the realm at `root`, leaving the VM and every other realm
+   running. 0 when the VM confirms, 1 when it does not."
+  [root]
+  (if (nil? (realm-op root :restart)) 1 0))
+
+(defn realms
+  "The project roots the SHARED VM of `build` has open, as a list of strings; nil
+   when no shared VM answers. Asked of the VM itself: a shared VM serves no one
+   project, so no file names its realms."
+  [build]
+  (let [text (stdout-of (connect-hello* nil build true) :realms)]
+    (if (nil? text)
+      nil
+      (to-list (filter (fn [l] (not= "" l)) (String/split text "\n"))))))
 
 (defn probe
   "Whether a live, authenticated daemon answers for `root`. {:ok ready-meta} |
@@ -140,4 +244,28 @@
   (let [c (connect-hello (resolve-root root))]
     (if (contains? c :ok)
       (do (gen_tcp/close (:ok c)) {:ok (:ready c)})
+      c)))
+
+(defn probe-shared
+  "Whether a live, authenticated SHARED VM answers on this build's shared
+   endpoint. No project is involved: the endpoint is the build's."
+  []
+  (let [c (connect-hello* nil (paths/build-id) true)]
+    (if (contains? c :ok)
+      (do (gen_tcp/close (:ok c)) {:ok (:ready c)})
+      c)))
+
+(defn request-stop
+  "Ask the daemon for `root` that runs `build` to drain and exit. Unlike `stop`
+   this names the build, so a VM on a superseded build can be reached from a
+   newer one. {:ok :asked} | {:error reason}; prints nothing."
+  [root build]
+  (let [c (connect-hello (resolve-root root) build)]
+    (if (contains? c :ok)
+      (let [sock (:ok c)
+            id (erlang/apply :crypto :strong_rand_bytes (list 16))]
+        (gen_tcp/send sock (erlang/apply :erlang :term_to_binary
+                             (list (tuple :bl 1 :control id :stop))))
+        (gen_tcp/close sock)
+        {:ok :asked})
       c)))

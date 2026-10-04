@@ -11,7 +11,7 @@
 > the unbuilt piece. So this isn't "add a scheduler subsystem" — it's **name the
 > last patterns (Tick, Deadline Queue, Claim/Lease, Retry, Idempotency Key),
 > bundle them into two `def*` forms, and let the store be the timer wheel.** The
-> `bl ui` pane then falls out for free, because `vm.inspect` already is the one
+> `bl vm ui` pane then falls out for free, because `vm.inspect` already is the one
 > model with three faces.
 
 This document is the design of record for the implementation. It is written so
@@ -31,7 +31,7 @@ its periodic child **Heartbeat §4.1** is marked `◐ vitals; ○ stdlib fns` an
 the unbuilt piece. So this isn't "add a scheduler subsystem" — it's **name the
 last patterns (Tick, Deadline Queue, Claim/Lease, Retry, Idempotency Key),
 bundle them into two `def*` forms, and let the store be the timer wheel.** The
-`bl ui` pane then falls out for free, because `vm.inspect` already is the one
+`bl vm ui` pane then falls out for free, because `vm.inspect` already is the one
 model with three faces.
 
 ---
@@ -92,7 +92,7 @@ Two honest findings:
    delivery, at-most-once *effect*. Same trick as knowledger's `job-id`. This is
    the pattern, not an accident.
 
-### 1.3 The daemon already hand-rolls four schedulers, in three shapes
+### 1.3 The warm VM already hand-rolls four schedulers, in three shapes
 
 This is the sharpest finding, and it's the "why now":
 
@@ -730,7 +730,7 @@ priv/std/proc/queue.bl  (ns proc.queue)   ✅ the durable owed-work CLAUSE — d
 vm/inspect.bl           ✅ :schedules (:deep), :jobs, :ticker — the pane, no new model
 vm/http.bl              ✅ GET /schedules · POST /schedules/<server>/<id>/{pause,resume,run-now}
                             and the pane renders both rows (there is no `bl jobs` or
-                            `bl schedules` VERB — the terminal face is `bl daemon status`,
+                            `bl schedules` VERB — the terminal face is `bl realm show`,
                             which builds the SAME model the page builds)
 ```
 
@@ -942,8 +942,8 @@ so a migration smell binds a whole sub-form as one variable (`?keys` holding
 
 ### 4.6.2 As built (P4) — a tree declares its periodic work
 
-P4's line was *“cut the daemon's own housekeeping over”*. The cut landed on the
-other side of the question: the work became a **declaration**, and the daemon
+P4's line was *“cut the warm VM's own housekeeping over”*. The cut landed on the
+other side of the question: the work became a **declaration**, and the warm VM
 stopped being the place it was written down.
 
 ```
@@ -955,7 +955,7 @@ stopped being the place it was written down.
         v
    vm.spec/read                   the VM's spec carries what the tree SAID
         |
-        |  vm.sched/start-for        at daemon boot AND at VM spawn, idempotently
+        |  vm.sched/start-for        at warm-VM boot AND at VM spawn, idempotently
         v
    (proc/defserver declared       ONE module, `:server (:id start-opts)`
      (sched {:clock tick/wall-ms   — one wheel per project, told apart by its id
@@ -963,13 +963,13 @@ stopped being the place it was written down.
              :from (:schedules start-opts)}))
         |
         v
-   the store (datoms)  →  bl daemon status · the dashboard · GET /schedules
+   the store (datoms)  →  bl realm show · the dashboard · GET /schedules
 ```
 
 Measured on this tree, first boot after the cut:
 
 ```
-bl daemon
+bl realm
   schedules     2 declared
   schedule      beam-lisp@574618/cache-prune    active  0 runs  in 49233.0s
   schedule      beam-lisp@574618/index-refresh  active  0 runs  in 1754.2s
@@ -983,7 +983,7 @@ Six decisions, each from something that broke:
 | **a verb is resolved when it FIRES, not when it is declared** | a project may name a verb it has not written yet, and a file's typo must not cost the tree its tool. The first occurrence fails, `:fails` climbs, `:last-error` holds the reason — loud where a human is looking |
 | **`start-opts` is in scope for every clause's init** | `server.bl` gained a documented name for the map a server was started with. A clause is a slice of a server someone else starts; without the start argument there is no way to configure one, and a hard-coded default is the only alternative |
 | **one module, many owners** | `:server (:id start-opts)` — the wheel's name comes from the VM, so two projects' `cache-prune` rows do not collide on one key in one store |
-| **the tree is told, not inferred** | the wheel runs in the daemon's process, where cwd is the daemon's; the tree travels as `:ctx {:root …}` in the declaration, merged into the occurrence every body is handed. The occurrence IS the argument, so this costs no new channel |
+| **the tree is told, not inferred** | the wheel runs in the warm VM's process, where cwd is the warm VM's; the tree travels as `:ctx {:root …}` in the declaration, merged into the occurrence every body is handed. The occurrence IS the argument, so this costs no new channel |
 | **a refusal is a FACT** | if arming fails, `vm.sched` writes a `:refused` row per declaration with the reason. `declares nothing` and `declares something that cannot turn` are the same picture to a reader — an absent row — and they are the two things a reader most needs told apart. Measured: `:every [30 :min]` (`:min` is not a unit `proc.tick` knows) armed nothing, said nothing, and showed exactly the empty pane of a tree with no declarations at all |
 
 **What did NOT need a schedule**, and why that is the finding rather than a gap:
@@ -1020,7 +1020,7 @@ AOT-compiling the tree's `.bl` sources; every measurement in this section was
 taken with it. See FUP-093 for the general case.
 
 
-## 5. The `bl ui` pane — prior art, then the design
+## 5. The `bl vm ui` pane — prior art, then the design
 
 ### 5.1 Prior art worth stealing from
 
@@ -1040,7 +1040,7 @@ invariant it is proven to hold, and its live vitals — in one row.**
 ### 5.2 The pane
 
 A field in the model (`vm.inspect/model` gains `:schedules` + `:jobs`), so it
-appears in `bl daemon status`, the HTML page, **and** `/model` at once. FUP-086
+appears in `bl realm show`, the HTML page, **and** `/model` at once. FUP-086
 is the precedent (and `index-pane` is the pattern to copy: read a public ETS row,
 never queue behind the work you're reporting on).
 
@@ -1078,7 +1078,7 @@ The **deep** row (unique to beam-lisp): click a schedule → its
 history** — the datoms that moved its state — which is just `datom/q history`.
 That's Temporal's event history, for free, because the state was facts all along.
 
-**First tenant, so the pane is never empty: the daemon's own four hand-rolled
+**First tenant, so the pane is never empty: the warm VM's own four hand-rolled
 schedulers, cut over.** Plus `bl cache prune`, which is a periodic job run by
 hand today.
 
@@ -1089,7 +1089,7 @@ stale-entry cleanup is itself a schedule, which is a pleasing bootstrap.
 ### 5.2.1 As built (P3) — the schedules half
 
 Landed: `vm.inspect/model` gains `:schedules`, so the field appears in
-`bl daemon status` (the terminal face), the HTML page, `GET /model`, and a new
+`bl realm show` (the terminal face), the HTML page, `GET /model`, and a new
 `GET /schedules` at once. The op path is
 `POST /schedules/<server>/<id>/<op>` for `pause` · `resume` · `run-now`, behind
 the same `x-bl-token` guard `/intent` uses.
@@ -1125,7 +1125,7 @@ form of the caveat.
 
 Still open in the pane: `:jobs` (awaiting `defqueue`), the deep row
 (graph · invariant · `verify` · event history — `datom/q history` on the
-schedule's own entity), the ticker line, and the daemon's four hand-rolled
+schedule's own entity), the ticker line, and the warm VM's four hand-rolled
 schedulers as first tenants (P4).
 
 ---
@@ -1135,7 +1135,7 @@ schedulers as first tenants (P4).
 1. **⚠ The host's one dirty-IO scheduler.** The AGENTS.md host notes: `+SDio 1`,
    and `file:call/2` ops queue behind *every* other dirty-IO op in the VM with no
    timeout. A scheduler that reads the store on every tick will (a) stall when
-   the daemon does file I/O and (b) *become the thing that stalls everyone else*.
+   the warm VM does file I/O and (b) *become the thing that stalls everyone else*.
    **Consequence: the hot wheel must be an ETS `ordered_set` (a public row, the
    `vm.exec`/`vm.index` shape); the store is the durable *declaration and
    outcome*, written on claim/finish, not on wake.** Also: never render the pane
@@ -1151,7 +1151,7 @@ schedulers as first tenants (P4).
    clock internally, you can't test a week in a second, can't time-travel the
    pane, and break the `effects` lattice (reading the clock is `io` — tempo §9
    says so explicitly). **Pass the clock in. (SETTLED: injected everywhere; the
-   daemon passes wall time.)**
+   warm VM passes wall time.)**
 4. **Recurrence arithmetic is a library, not a decision.** "every 15 min anchored
    where", DST, month-ends, "last Friday", "every Friday the 13th".
    `datom.time` has intervals + Allen + `expand`, but **no RRULE** (no
@@ -1235,9 +1235,9 @@ P3  ✅ vm.inspect :schedules → the terminal + HTML + JSON faces, GET /schedul
      never-run schedule appears (the row is written at boot), and the read path
      is proven not to write (FUP-101)
       reads the store, so the pane never asks a ticker anything
-      acceptance: `bl daemon status` and the page render the SAME numbers
+      acceptance: `bl realm show` and the page render the SAME numbers
 P4  ✅ CUTOVER: the tree's periodic work is a DECLARATION (env.bl `:schedules`)
-     — `bl cache prune` as a scheduled verb, the index refresh, armed at daemon
+     — `bl cache prune` as a scheduled verb, the index refresh, armed at warm-VM
      boot and at VM spawn, visible in the pane, and a refusal that cannot arm is
      itself a visible row. Findings: the stale-port sweep needs no schedule (the
      read IS the sweep); the watcher's debounce is a State Timeout (a `tick`
@@ -1301,10 +1301,10 @@ per the repo's ethics). P5/P6 are separate waves with a real consumer each.
 | # | question | decision |
 |---|---|---|
 | 1 | Is a schedule a **fact** or a **process**? | **Fact-first.** `defscheduler` over a datom relation for anything declared/monitored; the `(tick …)` clause for private per-process beats (debounce, polling, prune). Both lower to the same Timeout Edge. |
-| 2 | What is the first wave's deliverable? | **Substrate + pane + cut the daemon's own housekeeping over (P1–P4).** The daemon already hand-rolls four schedulers (two languages, three shapes); the pane is non-empty on day one and the pattern is proven against a real tenant. |
-| 3 | Should the clock be injected? | **Injected everywhere** (a fn → seconds); the daemon passes wall time. Without it you cannot test a week in a second, cannot time-travel the pane, and "this scheduler secretly reads now" becomes an invisible smell. |
-| 4 | Where are schedules **declared**? | **Both.** `env.bl :schedules` for the tree's; `defscheduler` for a namespace's; the pane unions them. `:tasks` (a verb the daemon runs) and `:ports` (a claim the session hosts) are the precedent. |
-| 5 | What does the pane **monitor**? | **A session-wide registry**, like `ports/list-claims` — any app registers a schedule, and `bl ui` is the one place to see all recurrent work. The stale-entry cleanup is itself a schedule. |
+| 2 | What is the first wave's deliverable? | **Substrate + pane + cut the warm VM's own housekeeping over (P1–P4).** The warm VM already hand-rolls four schedulers (two languages, three shapes); the pane is non-empty on day one and the pattern is proven against a real tenant. |
+| 3 | Should the clock be injected? | **Injected everywhere** (a fn → seconds); the warm VM passes wall time. Without it you cannot test a week in a second, cannot time-travel the pane, and "this scheduler secretly reads now" becomes an invisible smell. |
+| 4 | Where are schedules **declared**? | **Both.** `env.bl :schedules` for the tree's; `defscheduler` for a namespace's; the pane unions them. `:tasks` (a verb the warm VM runs) and `:ports` (a claim the session hosts) are the precedent. |
+| 5 | What does the pane **monitor**? | **A session-wide registry**, like `ports/list-claims` — any app registers a schedule, and `bl vm ui` is the one place to see all recurrent work. The stale-entry cleanup is itself a schedule. |
 | 6 | Is a durable queue a **form** (`defqueue`) or a **clause** (`(queue …)`)? | **Clause.** §4.3 originally prescribed `defqueue`; the user pushed back and the doc agreed with itself: `defbeat` was DELETED when `(tick …)` landed (a macro is a fork), and §3.2 already calls the durable patterns — *Idempotency Key*, *Claim/Lease* — "no new machinery". So: the store IS the queue, the clause is the claim loop, `enqueue!` is a write, `stats` is a query, `prune` is a `:schedules` declaration, and nothing gets a registry of its own. |
 
 ---

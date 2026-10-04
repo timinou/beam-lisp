@@ -217,7 +217,7 @@ three ways to look at it.
 
    The window is a view of a running session, so the default mode attaches to
    the tree's session when there is one and boots one when there is not —
-   exactly the composition `bl daemon start` uses. A host that cannot open a
+   exactly the composition `bl realm start` uses. A host that cannot open a
    window (no native backend, no display) degrades to the terminal loop rather
    than failing: the REPL exists either way."
   [args st]

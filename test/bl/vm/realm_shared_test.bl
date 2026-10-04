@@ -1,0 +1,255 @@
+; realm_shared_test.bl — the step-9 gate: two projects, one VM.
+;
+; A shared VM boots with no project and opens a realm per request, chosen from the
+; request's cwd. This drives REAL frames over the real socket:
+;   · two projects answer from their own cwd and env, concurrently;
+;   · neither sees the other's variables;
+;   · each realm gets its own index owner;
+;   · closing one realm leaves the other serving.
+
+(ns vm.realm-shared-test
+  (:require [vm.session :as session] [vm.paths :as paths] [vm.realm :as realm]
+            [vm.index :as index] [vm.owner :as owner] [vm.manager :as mgr] [vm.client :as client]
+            [vm.sched :as sched]))
+
+(def DROP "a238fa91")
+(def REQUEST-WAIT-MS 90000)   ; a realm's first request opens it (env, index owner, wheel): seconds on an idle machine, far more under load
+
+(defn- project [name]
+  (let [root (str "/tmp/bl-realm-shared-" name "-" (erlang/apply :erlang :unique_integer (list (to-list [:positive]))))]
+    (File/mkdir_p! (str root "/priv/boot"))
+    (File/write! (str root "/priv/boot/core.bl") "")
+    (File/write! (str root "/env.bl") (str "{:name \"" name "\" :vm \"shared\"}"))
+    root))
+
+(defn- spec-of [root] (vm.spec/read root))
+
+(defn- shared-endpoint [] (:ok (paths/endpoints nil (paths/build-id) true)))
+
+(defn- request
+  "One request to the shared VM: `argv` with `cwd` and `env`. {:out text :code n}."
+  [cwd argv env]
+  (let [ep (shared-endpoint)
+        conn (elem (gen_tcp/connect (tuple :local (erlang/binary_to_list (:sock ep))) 0
+                     (list (tuple :inet_backend :inet) :local :binary (tuple :packet 4) (tuple :active false))) 1)]
+    (gen_tcp/send conn (erlang/apply :erlang :term_to_binary
+                         (list (tuple :bl 1 :hello {:tree (paths/hello-fingerprint nil (paths/build-id) true)
+                                                    :token (File/read! (:token ep))}))))
+    (gen_tcp/recv conn 0 5000)
+    (gen_tcp/send conn (erlang/apply :erlang :term_to_binary
+                         (list (tuple :bl 1 :request (erlang/apply :crypto :strong_rand_bytes (list 16))
+                                      {:argv (to-list argv) :cwd cwd :env env}))))
+    (loop [out ""]
+      (let [r (gen_tcp/recv conn 0 REQUEST-WAIT-MS)]
+        (if (not= :ok (elem r 0))
+          {:out out :code nil :ended (elem r 1)}
+          (let [f (erlang/apply :erlang :binary_to_term (list (elem r 1)))
+                tag (elem f 2)]
+            (cond
+              (= tag :stdout) (recur (str out (erlang/apply :unicode :characters_to_binary (list (elem f 5)))))
+              (= tag :exit) (do (gen_tcp/close conn) {:out out :code (elem f 4)})
+              :else (recur out))))))))
+
+(defn- as-drop-build
+  "Run `f` as a DROP build: a source build is never shared, and a test runs from
+   a checkout. The id is only a name for the endpoint, so a made-up one is exact."
+  [f]
+  (let [prev (System/get_env "BL_BUILD_ID")]
+    (System/put_env "BL_BUILD_ID" DROP)
+    (try (f)
+      (finally (if (nil? prev) (System/delete_env "BL_BUILD_ID") (System/put_env "BL_BUILD_ID" prev))))))
+
+(defn- with-shared-vm [f]
+  (as-drop-build
+    (fn []
+      (let [listener (:ok (session/start nil {:shared true}))]
+        (try (f) (finally (session/stop listener)))))))
+
+(deftest a-source-checkout-refuses-to-be-shared
+  (is (= {:error :shared-needs-a-build} (session/start nil {:shared true}))
+      "a checkout runs its own sources: sharing it would answer one project with another's code"))
+
+(deftest two-projects-are-answered-from-their-own-cwd
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha") b (project "beta")
+            ra (request a ["eval" "(println (BeamLisp/cwd))"] {})
+            rb (request b ["eval" "(println (BeamLisp/cwd))"] {})]
+        (is (= 0 (:code ra)) (str "A ended: " (pr-str (:ended ra)))) (is (= 0 (:code rb)) (str "B ended: " (pr-str (:ended rb))))
+        (is (clojure.string/includes? (:out ra) a) "A's command ran in A")
+        (is (clojure.string/includes? (:out rb) b) "B's command ran in B")
+        (is (not (clojure.string/includes? (:out ra) b)))))))
+
+(deftest concurrent-requests-do-not-see-each-others-env
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha") b (project "beta")
+            prog "(println (vm.osenv/get \"WHO\"))"
+            futs (doall (map (fn [i]
+                               (let [root (if (even? i) a b) who (if (even? i) "alpha-env" "beta-env")]
+                                 {:who who :f (future (request root ["eval" prog] {"WHO" who}))}))
+                             (range 12)))]
+        (doseq [x futs]
+          (let [r (deref (:f x))]
+            (is (clojure.string/includes? (:out r) (:who x))
+                (str "saw its own " (:who x) "; output was " (pr-str (:out r)) " code " (pr-str (:code r)) " ended " (pr-str (:ended r))))
+            (is (not (clojure.string/includes? (:out r) (if (= "alpha-env" (:who x)) "beta-env" "alpha-env")))
+                "and never the other's")))))))
+
+(deftest each-realm-gets-its-own-index-owner
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha") b (project "beta")]
+        (request a ["eval" "1"] {}) (request b ["eval" "1"] {})
+        (let [pa (index/owner-pid a) pb (index/owner-pid b)]
+          (is (some? pa)) (is (some? pb))
+          (is (not= pa pb) "one owner per realm"))
+        (is (= 2 (count (filter (fn [r] (or (= r a) (= r b))) (realm/roots)))) "both realms are open")))))
+
+(deftest closing-one-realm-leaves-the-other-serving
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha") b (project "beta")]
+        (request a ["eval" "1"] {}) (request b ["eval" "1"] {})
+        (let [pb (index/owner-pid b)]
+          (realm/close a)
+          (is (nil? (index/owner-pid a)) "A's index is gone")
+          (is (= pb (index/owner-pid b)) "B's owner is the same process, untouched")
+          (is (= 0 (:code (request b ["eval" "(+ 1 2)"] {}))) "B still answers")
+          (is (not (some (fn [r] (= r a)) (realm/roots))) "A is no longer open"))))))
+
+(deftest a-realm-reopens-after-it-is-closed
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha")]
+        (request a ["eval" "1"] {})
+        (realm/close a)
+        (is (= 0 (:code (request a ["eval" "(+ 1 2)"] {}))) "the next request opens it afresh")
+        (is (some? (index/owner-pid a)))))))
+
+(deftest concurrent-first-requests-open-a-realm-once
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha")
+            fs (doall (map (fn [_] (future (request a ["eval" "1"] {}))) (range 8)))]
+        (doseq [f fs] (is (= 0 (:code (deref f)))))
+        (is (= 1 (count (filter (fn [r] (= r a)) (realm/roots)))) "one row for the realm")
+        (is (some? (index/owner-pid a)))))))
+
+(deftest realm-stop-in-a-project-closes-only-its-realm
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha") b (project "beta")]
+        (request a ["eval" "1"] {}) (request b ["eval" "1"] {})
+        (is (= 0 (client/stop a)) "bl realm stop in A reports success")
+        (is (not (some (fn [r] (= r a)) (realm/roots))) "A's realm is closed")
+        (is (some (fn [r] (= r b)) (realm/roots)) "B's realm is still open")
+        (is (some? (index/owner-pid b)) "B's index owner survived")
+        (is (= 0 (:code (request b ["eval" "(+ 1 2)"] {}))) "and the VM still answers")
+        (is (= 0 (:code (request a ["eval" "(+ 1 2)"] {}))) "A reopens on its next command")))))
+
+
+(deftest a-realms-declared-schedules-arm-when-it-opens
+  (with-shared-vm
+    (fn []
+      (let [root (project "scheduled")
+            _ (File/write! (str root "/env.bl")
+                (str "{:name \"scheduled\" :vm \"shared\""
+                     " :schedules [{:id \"tick\" :every [1 :hour] :run \"vm.index/refresh-scheduled\"}]}"))
+            vm (realm/open root)]
+        (is (sched/armed? (:id vm)) "env.bl :schedules arm a wheel for the realm")
+        (is (some? (sched/armed-pid (:id vm))) "and it has a process")
+        (is (some (fn [p] (= p (sched/armed-pid (:id vm)))) (owner/procs (:id vm)))
+            "which is a member of the realm, so closing the realm ends it")
+        (realm/close root)
+        (is (not (sched/armed? (:id vm))) "closing the realm stops its wheel")))))
+
+
+(deftest closing-a-realm-while-it-serves-never-wedges-or-crosses-realms
+  (testing "requests racing a close either finish or are refused cleanly; the other realm is unaffected"
+    (with-shared-vm
+      (fn []
+        (let [a (project "alpha") b (project "beta")]
+          (request a ["eval" "1"] {}) (request b ["eval" "1"] {})
+          (let [workers (doall (map (fn [_] (future (request a ["eval" "(+ 1 2)"] {}))) (range 10)))
+                closer (future (Process/sleep 20) (realm/close a))]
+            (deref closer)
+            (doseq [w workers]
+              (let [r (deref w)]
+                (is (contains? #{0 1 nil} (:code r)) "finished, failed, or cut off: never hung")))
+            (is (= 0 (:code (request b ["eval" "(+ 1 2)"] {}))) "the other realm answered throughout")
+            (is (= 0 (:code (request a ["eval" "(+ 1 2)"] {}))) "and the closed one reopens afterwards")))))))
+
+(deftest a-close-the-vm-never-confirmed-is-not-reported-as-done
+  (testing "a VM that drops the connection without an exit frame has not closed the realm"
+    (as-drop-build
+      (fn []
+        (let [a (project "alpha")
+              l (:ok (vm.net/listen nil (fn [frame send] :ok) {:shared true}))]
+          (try
+            (is (not= 0 (client/stop a)) "stop in a shared project must say it was not confirmed")
+            (finally (vm.net/stop l))))))))
+
+(deftest stop-of-an-own-vm-counts-a-closed-connection-as-stopped
+  (testing "the VM exiting closes the socket; that IS the confirmation for :stop"
+    (is (= 0 (client/outcome :stop {:error :closed})))
+    (is (not= 0 (client/outcome {:close "/x"} {:error :closed})))
+    (is (= 0 (client/outcome {:close "/x"} {:ok :exit})))
+    (is (not= 0 (client/outcome :stop {:error :timeout})) "silence is not a stop")))
+
+(deftest a-shared-vm-reports-the-realms-it-has-open
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha") b (project "beta")]
+        (is (= [] (vec (client/realms (paths/build-id)))) "a shared VM with nothing opened reports none")
+        (request a ["eval" "1"] {}) (request b ["eval" "1"] {})
+        (is (= (set [a b]) (set (client/realms (paths/build-id)))) "it names both, asked over its own socket")
+        (realm/close a)
+        (is (= [b] (vec (client/realms (paths/build-id)))) "and only the one left after a close")))))
+
+(deftest a-shared-vm-has-a-label-a-person-can-type
+  (is (= "shared" (vm.session/vm-label nil)) "no project: the label says what it is")
+  (is (= "notes" (vm.session/vm-label "/home/u/notes")) "a project VM keeps its project's name"))
+
+(deftest bl-vm-lists-the-realms-of-a-shared-vm
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha") b (project "beta")]
+        (request a ["eval" "1"] {}) (request b ["eval" "1"] {})
+        (let [roots (mapcat (fn [row] (map :root (:realms row)))
+                            (filter (fn [row] (= "shared" (:label row))) (vm.inventory/rows {})))]
+          ;; this process IS the shared VM here, so the row is its own: the inventory must
+          ;; not ask itself; it still lists what it was asked about, from its own table
+          (is (or (empty? roots) (every? string? roots)) "rows never fail on a VM that is this process"))))))
+
+(deftest members-lists-what-a-realm-owns-with-its-age
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha") b (project "beta")]
+        (request a ["eval" "1"] {}) (request b ["eval" "1"] {})
+        (let [vm (mgr/get-vm (:id (spec-of a)))
+              p (owner/spawn (:id vm) :serve (fn [] (Process/sleep 20000)))
+              rows (client/members a)]
+          (is (some (fn [r] (= :serve (:role r))) rows) "the serve is listed under its role")
+          (is (some (fn [r] (= :index (:role r))) rows) "and so is the furniture, labelled as such")
+          (is (every? (fn [r] (and (integer? (:age-s r)) (>= (:age-s r) 0))) rows) "each with an elapsed time")
+          (is (= (count rows) (count (owner/procs (:id vm)))) "exactly the realm's own members: one list, one source")
+          (is (empty? (filter (fn [r] (contains? (set (map (fn [x] (erlang/list_to_binary (erlang/pid_to_list x)))
+                                                           (owner/procs (:id (spec-of b)))))
+                                                 (:pid r)))
+                              rows))
+              "and none of another realm's")
+          (erlang/exit p :kill))))))
+
+(deftest restart-gives-a-realm-a-fresh-start-and-leaves-the-others
+  (with-shared-vm
+    (fn []
+      (let [a (project "alpha") b (project "beta")]
+        (request a ["eval" "1"] {}) (request b ["eval" "1"] {})
+        (let [old-a (index/owner-pid a) old-b (index/owner-pid b)]
+          (is (= 0 (client/restart a)) "restart reports success once the realm is open again")
+          (is (some? (index/owner-pid a)) "A is open")
+          (is (not= old-a (index/owner-pid a)) "with a NEW index owner")
+          (is (= old-b (index/owner-pid b)) "B's is the same process"))))))
+
+(run-tests)

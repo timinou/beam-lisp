@@ -1,6 +1,6 @@
 # The warm session
 
-A daemon is a VM that stays up so the next command is fast. One per project
+A warm VM is a VM that stays up so the next command is fast. One per project
 tree. It is not a background service you have to think about: you start it, it
 prints where it is, and everything else in `bl` gets faster without changing
 what it means.
@@ -17,15 +17,15 @@ what it means.
 ## Starting it
 
 ```
-bl daemon start      # become the session (blocks; the launcher detaches it)
-bl daemon status     # what the running session IS
-bl daemon stop       # drain and exit
+bl realm start      # become the session (blocks; the launcher detaches it)
+bl realm show       # what the running session IS
+bl realm stop       # drain and exit
 ```
 
 Starting prints the thing you will want later:
 
 ```
-bl daemon up for /home/user/code/undefine/beam-lisp
+bl realm
   ui:   http://127.0.0.1:35969   (ephemeral — pin it in env.bl with :ports {:ui 7700})
   mcp:  http://127.0.0.1:35969/mcp   (the same MCP `bl mcp` serves over stdio)
 ```
@@ -112,7 +112,7 @@ An editor, an agent and a browser need one address, not a registry of them.
 ```
 
 
-`bl ui` prints that URL; `bl ui --open` hands it to the desktop's opener. When
+`bl vm ui` prints that URL; `bl vm ui --open` hands it to the desktop's opener. When
 no session is running for the tree, both say so rather than inventing one.
 
 ## Tasks
@@ -132,9 +132,9 @@ value `bl tasks` lists and `bl <name>` runs. This repository declares two:
 
 Two things keep their own process and therefore do NOT run through the session:
 `bl serve` (a server), `bl monitor` (a repainting watcher), `bl mcp` (an agent
-transport), `bl repl`, and any task declared `:watch true`. The daemon has ONE
+transport), `bl repl`, and any task declared `:watch true`. The warm VM has ONE
 worker; parking it would block every later client, so it refuses them by name
-and says why. `bl watch` is the exception — the daemon HOSTS that watcher, so
+and says why. `bl watch` is the exception — the warm VM HOSTS that watcher, so
 its reload commits ride the same worker as everything else and nothing races.
 
 ```beam-lisp id=owns-process

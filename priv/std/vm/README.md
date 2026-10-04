@@ -3,7 +3,7 @@
 A global daemon that hosts per-project **VMs** — built entirely from
 beam-lisp's own concurrency + env primitives, no Elixir daemon code. The
 premise: the Elixir daemon's whole workaround surface (single serial worker,
-`owns_process?` special-casing, `BL_DAEMON=off/queue` tri-mode, "System.halt
+`owns_process?` special-casing, cold/warm/queue mode selection, "System.halt
 kills the daemon") exists because it fakes isolation with one process. Give each
 project a **capped env** and let its work be **ordinary BEAM processes under
 that env**, and the BEAM manages the concurrency — the bugs stop being
