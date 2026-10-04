@@ -320,11 +320,10 @@ function G(ns, name) {
 }
 // a linked core op (`Elixir.BeamLisp.Ns.Rt/first/1`) is its CORE function
 function X(lk) {
-  // a core op FIRST, exactly as the static linker (build.bl link-ctx: CORE
-  // before leaves): this page's values are core.mjs's (its errors, its
-  // `throw` payloads), and core's ops spread rest args as this emitter calls
-  // them; a BEAM-ABI leaf of the same name (ExInfo/*, Refs/swap!/3) is the
-  // compiled-core (--self-host) side of the cut
+  // OPS holds exactly the calls build.bl `remote-link` (THE link rule, which
+  // the static linker also uses) sends to core.mjs; every other key is the
+  // rule's leaf. Same decision as a static build, by construction
+  // (test/bl/js_diff_test: linkers-agree).
   const k = OPS[lk];
   if (k !== undefined && Object.prototype.hasOwnProperty.call(C.CORE, k)) return C.CORE[k];
   if (Object.prototype.hasOwnProperty.call(LEAVES, lk)) return LEAVES[lk];

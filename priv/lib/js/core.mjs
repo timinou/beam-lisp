@@ -699,7 +699,7 @@ export const CORE = {
   // Erlang term comparison (erlang/=:= exact, /= and =/= the negations)
   "erlang/<": (a, b) => R.termCompare(a, b) < 0, "erlang/>": (a, b) => R.termCompare(a, b) > 0,
   "erlang/=<": (a, b) => R.termCompare(a, b) <= 0, "erlang/>=": (a, b) => R.termCompare(a, b) >= 0,
-  "erlang/=:=": (a, b) => R.keyEq(a, b), "erlang//=": (a, b) => !R.eqv(a, b), "erlang/=/=": (a, b) => !R.keyEq(a, b), "not=": not_eq, "identical?": identical_Q, "compare": compare, "hash": hash, "hash_key": identity,
+  "erlang/==": (a, b) => R.erlEq(a, b), "erlang/=:=": (a, b) => R.keyEq(a, b), "erlang//=": (a, b) => !R.erlEq(a, b), "erlang/=/=": (a, b) => !R.keyEq(a, b), "not=": not_eq, "identical?": identical_Q, "compare": compare, "hash": hash, "hash_key": identity,
   "inc": inc, "dec": dec, "abs": abs, "max": max, "min": min, "quot": quot, "rem": rem, "mod": mod,
   "+": plus, "-": minus, "*": times, "/": divide, "<": lt, ">": gt, "<=": le, ">=": ge, "==": num_eq,
   "int": int, "double": double, "parse-long": parse_long, "parse-double": parse_double, "rand-int": rand_int,
