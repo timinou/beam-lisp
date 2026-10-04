@@ -183,15 +183,18 @@
                    (MapSet/put ids (nif_id found)) functions
                    (erlang/++ (list found) resources))))
 
-    ; ── a closure: walk its captured environment, once per fun ──
+    ; ── a closure: walk its captured environment, once per fun. A LARGE
+    ;    captured value is answered by `deps_env` — walked alone the first time,
+    ;    then recognised by identity — so a lazy pipeline whose step closes over
+    ;    the same big context does not re-walk it for every cell it creates. ──
     (erlang/is_function cur)
     (cond
       (MapSet/member? functions cur)
       (deps_walk :advance cur stack ids functions resources)
       :else
-      (let [env (erlang/element 2 (erlang/fun_info cur :env))]
-        (deps_walk :advance cur (erlang/++ env stack)
-                   ids (MapSet/put functions cur) resources)))
+      (let [split (deps_env (erlang/element 2 (erlang/fun_info cur :env)) () resources)]
+        (deps_walk :advance cur (erlang/++ (erlang/element 1 split) stack)
+                   ids (MapSet/put functions cur) (erlang/element 2 split))))
 
     ; ── a tuple: walk its elements ──
     (erlang/is_tuple cur)
@@ -205,6 +208,91 @@
                ids functions resources)
 
     :else (deps_walk :advance cur stack ids functions resources)))
+
+;; ── the clean-capture memo: walk a big captured value once, not per cell ──
+;;
+;; A lazy step's thunk closes over whatever its producer closed over. When that
+;; is a large immutable value — a page's whole render context, a 2 000-entry
+;; map — every cell the pipeline creates walked it again, looking for memo
+;; resources it does not contain: measured 21.5 ms and 0.9 M reductions per
+;; cell over a 110 K-word capture, so a lazy `filter` + `sort-by` over 800
+;; elements cost 1 659 ms where `filterv` cost 26 ms.
+;;
+;; The walk's answer for a term is a function of the term, and BEAM terms are
+;; immutable: the SAME heap object (`erts_debug:same/2`, an O(1) pointer test)
+;; has the same contents, so a value once proven resource-free is resource-free
+;; forever. So a large captured value is walked ALONE; when it holds nothing,
+;; it is remembered (by identity, per process, a bounded most-recent list) and
+;; every later capture of the same object costs one identity test. A value
+;; that DOES hold a resource is never remembered — its resources are reported
+;; every time, exactly as before — so no edge is ever lost.
+;;
+;; Retention: the memo holds at most DEPS-CLEAN-MAX values alive in the process
+;; that created the cells. Those values are, by construction, captured by live
+;; closures of that process at the time, so the bound is on values it was
+;; already holding.
+
+(defn deps_clean_max [] 16)
+
+(defn deps_big?
+  "INTERNAL: a value large enough that remembering it beats re-walking it — a
+   map or tuple of 8+ slots, or a struct whose `:items` tuple is (a vector).
+   Every test is O(1)."
+  [t]
+  (cond
+    (erlang/is_tuple t) (erlang/>= (erlang/tuple_size t) 8)
+    (erlang/is_map t)
+      (or (erlang/>= (erlang/map_size t) 8)
+          (and (erlang/is_map_key :items t)
+               (let [items (erlang/map_get :items t)]
+                 (and (erlang/is_tuple items) (erlang/>= (erlang/tuple_size items) 8)))))
+    :else false))
+
+(defn deps_clean_hit?
+  "INTERNAL: is `t` (by identity) one of `memo`, the remembered clean values?"
+  [t memo]
+  (cond
+    (erlang/== memo ()) false
+    (erts_debug/same t (erlang/hd memo)) true
+    :else (deps_clean_hit? t (erlang/tl memo))))
+
+(defn deps_clean_take
+  "INTERNAL: the first `n` elements of list `xs`."
+  [xs n]
+  (cond
+    (erlang/== n 0) ()
+    (erlang/== xs ()) ()
+    :else (erlang/++ (list (erlang/hd xs)) (deps_clean_take (erlang/tl xs) (erlang/- n 1)))))
+
+(defn deps_clean_remember!
+  [t]
+  (let [memo (Process/get :bl_deps_clean ())]
+    (Process/put :bl_deps_clean
+                 (deps_clean_take (erlang/++ (list t) memo) (deps_clean_max)))))
+
+(defn deps_env
+  "INTERNAL: split a fun's captured environment `env` into
+   `{to-walk, resources}`: scalars drop out, a BIG value is answered here (a
+   remembered clean one costs an identity test; a new one is walked alone and
+   remembered when it holds nothing), everything else is left on the shared
+   worklist. `acc` and `resources` thread through."
+  [env acc resources]
+  (cond
+    (erlang/== env ()) (tuple acc resources)
+    :else
+    (let [e (erlang/hd env)
+          rest (erlang/tl env)]
+      (cond
+        (deps_scalar? e) (deps_env rest acc resources)
+        (deps_big? e)
+        (cond
+          (deps_clean_hit? e (Process/get :bl_deps_clean ())) (deps_env rest acc resources)
+          :else
+          (let [found (deps_walk :inspect e () (MapSet/new) (MapSet/new) ())]
+            (cond
+              (erlang/== found ()) (do (deps_clean_remember! e) (deps_env rest acc resources))
+              :else (deps_env rest acc (erlang/++ found resources)))))
+        :else (deps_env rest (erlang/++ (list e) acc) resources)))))
 
 (defn dependencies
   "The memo resources `term` can reach, in a list, deduplicated by the NIF's cell

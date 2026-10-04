@@ -384,6 +384,91 @@
                      (into bound (clause-variables best))
                      (conj ordered best))))))))))
 
+;; ── equality pushdown: a pinned value is a pattern constant ───────────
+;;
+;; `[?j :job/state ?st] [(= ?st :queued)]` is ONE question — "which jobs are
+;; queued?" — written as a scan and a filter. Left as written, the scan reads
+;; the whole `:job/state` column (or, joined, one prefix per entity) and the
+;; filter discards almost all of it: measured on knowledger's control store,
+;; 21.8 M reductions to answer an empty set that `[?j :job/state :queued]`
+;; answers in 0.078 M — 280x — because a constant in the value slot is an
+;; AVET prefix (and, unindexed, still one column read filtered at the scan
+;; instead of per binding row).
+;;
+;; The rewrite preserves the answer under exactly these conditions, and only
+;; these are taken:
+;;
+;;   · the predicate is `(= ?v C)` or `(= C ?v)`, C a scalar constant — not a
+;;     variable, not a call, not a collection (a collection is compared by
+;;     value in `=` but matched by encoded identity in a pattern slot; not
+;;     obviously the same thing, so not taken);
+;;   · ?v occurs in EXACTLY that predicate and ONE pattern, in the pattern's
+;;     VALUE slot only, and is not a :find/:with/:in variable — so dropping it
+;;     can change neither another clause's bindings nor the result's shape.
+;;
+;; Then `[?x a ?v] ∧ (= ?v C)` and `[?x a C]` admit the same bindings of every
+;; remaining variable: the pattern binds ?v to each matching datom's value and
+;; the predicate keeps the rows whose value equals C; the constant pattern
+;; matches exactly those datoms. Anything outside the conditions is left as
+;; written — this never guesses. `normalize_test.bl` checks the equivalence on
+;; generated queries and databases (veritas `for-all`).
+
+(defn- eq-pin
+  "`[?v C]` when `clause` is `[(= ?v C)]` / `[(= C ?v)]` with C a scalar
+   constant, else nil."
+  [clause]
+  (when (and (datom.query.parse/predicate-clause? clause)
+             (= 1 (count clause)))
+    (let [call (get clause 0)
+          args (into [] (rest call))
+          scalar? (fn [x] (and (datom.query.parse/constant? x)
+                               (not (coll? x))
+                               (not (symbol? x))
+                               (not (nil? x))))]
+      (when (and (= (symbol "=") (first call)) (= 2 (count args)))
+        (let [a (get args 0) b (get args 1)]
+          (cond
+            (and (datom.query.parse/variable? a) (scalar? b)) [a b]
+            (and (datom.query.parse/variable? b) (scalar? a)) [b a]
+            :else nil))))))
+
+(defn- mentions? [clause v] (some (fn [x] (= x v)) (clause-variables clause)))
+
+(defn normalize-where
+  "`clauses` with every pushable equality folded into its pattern (the
+   conditions above). `protected` holds the variables that must survive
+   (:find, :with, :in). Pure: clause data in, clause data out."
+  [protected clauses]
+  (reduce
+    (fn [acc pred]
+      (let [pin (eq-pin pred)
+            v (get pin 0)
+            c (get pin 1)
+            users (filterv (fn [x] (mentions? x v)) acc)
+            pats (filterv datom.query.parse/pattern-clause? users)
+            pat (first pats)]
+        (if (and (not (contains? protected v))
+                 (= 2 (count users))
+                 (= 1 (count pats))
+                 (some (fn [x] (= x pred)) users)
+                 (> (count pat) 2)
+                 (= v (get pat 2))
+                 (= 1 (count (filterv (fn [x] (= x v)) pat))))
+          (into [] (keep (fn [x] (cond (= x pred) nil
+                                       (= x pat) (assoc pat 2 c)
+                                       :else x))
+                         acc))
+          acc)))
+    (into [] clauses)
+    (filterv eq-pin (into [] clauses))))
+
+(defn protected-variables
+  "The variables a rewrite may not remove: the :find, :with and :in ones."
+  [parsed]
+  (into #{} (concat (datom.query.parse/all-variables (:find parsed))
+                    (datom.query.parse/all-variables (or (:with parsed) []))
+                    (datom.query.parse/all-variables (:in parsed)))))
+
 (defn order-clauses
   "Order `clauses` so each runs with as much bound as possible."
   [initial-bindings clauses]
@@ -420,13 +505,15 @@
                    :cost (clause-cost bound clause)
                    :bound bound})))
        (datom.query.parse/input-variables parsed)
-       (:where parsed))
+       (normalize-where (protected-variables parsed) (:where parsed)))
      {:order (into [] (map (fn [s] (get s :clause)) (deref steps)))
       :steps (deref steps)})))
 
 (defn plan
-  "A parsed query with its `:where` clauses ordered for evaluation."
+  "A parsed query with its `:where` clauses normalized (equality pushdown,
+   `normalize-where`) and ordered for evaluation."
   [parsed]
   (assoc parsed
          :where
-         (order-clauses (datom.query.parse/input-variables parsed) (:where parsed))))
+         (order-clauses (datom.query.parse/input-variables parsed)
+                        (normalize-where (protected-variables parsed) (:where parsed)))))
