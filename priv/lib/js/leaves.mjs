@@ -211,10 +211,6 @@ Object.assign(LEAVES, {
   "Elixir.Process/put/2": (k, v) => { const old = PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : null; PDICT.set(pkey(k), v); return old; },
   "Elixir.System/unique_integer/1": (() => { let n = 0; return () => ++n; })(),
 
-  // regex (the compiler compiles one pattern: the gensym name shape)
-  "Elixir.Regex/compile!/1": (src) => new RegExp(src),
-  "Elixir.Regex/run/2": (re, s) => { const m = re.exec(s); return m ? list([...m].map((g) => (g === undefined ? "" : g))) : null; },
-
   "erlang/function_exported/3": () => false,
   "erlang/is_float/1": (x) => x instanceof R.Flt,
   // `float_to_binary(f, [:short])`: the shortest round-tripping digits, always
@@ -345,16 +341,25 @@ ENV.declare_ns("core");
     fn: `globalThis.BL_HOST = { run }` before importing js.eval's build. */
 export function run(body) { return new Function("R", "C", "G", "X", body)(R, C, G, X); }
 
-// BeamLisp.LazySeq / SeqCursor / Deferred / LazyMemo.seen — lazy.mjs
-Object.assign(LEAVES, LAZY_LEAVES);
-// what compiled core.bl/rt.bl reach (host-leaves.mjs), incl. the struct-aware
-// map_get/maps.get (the tag protocol). Leaves ALREADY above keep their entry.
-for (const [k, f] of Object.entries(HOST_LEAVES)) if (!Object.prototype.hasOwnProperty.call(LEAVES, k)) LEAVES[k] = f;
+// ONE table, assembled from its parts with NO silent override: a leaf key
+// defined in two places is a load error naming both. (Two files once both
+// defined maps.get and Regex.run; the first silently won, so compiled code
+// ran a different leaf than the one its author edited.)
+function addLeaves(part, entries) {
+  for (const [k, f] of entries) {
+    if (Object.prototype.hasOwnProperty.call(LEAVES, k)) throw new Error("leaf " + k + " is defined twice (" + LEAF_OWNER.get(k) + " and " + part + ")");
+    LEAVES[k] = f; LEAF_OWNER.set(k, part);
+  }
+}
+const LEAF_OWNER = new Map(Object.keys(LEAVES).map((k) => [k, "leaves.mjs"]));
+// BeamLisp.LazySeq / SeqCursor / Deferred / LazyMemo.seen
+addLeaves("lazy.mjs", Object.entries(LAZY_LEAVES));
+// what compiled core.bl/rt.bl reach, incl. the struct-aware map_get/maps.get
+addLeaves("host-leaves.mjs", Object.entries(HOST_LEAVES));
+// BeamLisp.Env — the namespace/var registry, every function at the arity the
+// BL sources call it with
+addLeaves("env.mjs", Object.entries(ENV).map(([name, fn]) => ["Elixir.BeamLisp.Env/" + name + "/" + fn.length, fn]));
 bindTable(LEAVES);
-
-// BeamLisp.Env — the namespace/var registry (env.mjs), every function at
-// the arity the BL sources call it with
-for (const [name, fn] of Object.entries(ENV)) LEAVES["Elixir.BeamLisp.Env/" + name + "/" + fn.length] = fn;
 
 /** `#tag` → reader symbol node, registered with `registerDataReader`. */
 const DATA_READERS = new Map();
