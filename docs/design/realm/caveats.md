@@ -17,7 +17,7 @@ and every other realm running.
 twelve concurrent requests with different environments each saw only their own;
 closing one realm left the other's index owner the same process.
 
-**Isolated by default (spike, not yet wired).** A namespace served from a project
+**Isolated by default (built in the loader; the manager wiring is PLAN-163 task 1a).** A namespace served from a project
 file compiles into a module named from its realm (`BeamLisp.Ns.R<key>.<Ns>`,
 `BeamLisp.Server.R<key>.<Ns>.<Name>`), so two projects that define the same
 namespace each keep their own, macros and servers included. Namespaces under a tier
