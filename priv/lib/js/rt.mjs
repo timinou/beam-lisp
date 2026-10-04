@@ -11,7 +11,7 @@
 //                  (PLAN-157 D3: exact numerics, Elm-lean, NOT Elm-inexact)
 //   string         JS string (UTF-16); text functions count CODEPOINTS
 //   keyword        Kw, interned (identity = equality)
-//   symbol         Sym, interned
+//   symbol         the BEAM's own reader node {:symbol, "name"} (a Tup)
 //   list           Cons cells ending in EMPTY; `()` is EMPTY, distinct from nil
 //   vector         Vec — persistent 32-way trie + tail (structural sharing)
 //   map            HMap — persistent hash array mapped trie
@@ -40,17 +40,6 @@ export function kw(fq) {
     KWS.set(fq, k);
   }
   return k;
-}
-
-export class Sym {
-  constructor(name) { this.name = name; this.h = (strHash(name) ^ 0x1b873593) | 0; }
-  toString() { return this.name; }
-}
-const SYMS = new Map();
-export function sym(name) {
-  let s = SYMS.get(name);
-  if (s === undefined) { s = new Sym(name); SYMS.set(name, s); }
-  return s;
 }
 
 export class Flt {
@@ -86,6 +75,17 @@ export class Tup {
   constructor(items) { this.items = items; }
 }
 export function tup(items) { return new Tup(items); }
+
+/** A symbol is what it is on the BEAM: the reader node `{:symbol, "name"}`,
+    a Tup — so a symbol a macro builds and a quoted symbol are ONE kind of
+    value (`(= 'a (symbol "a"))`, map keys, printing). `Sym` is that Tup's
+    recognizer, not a separate class. */
+const SYM_TAG = kw("symbol");
+export function isSym(x) { return x instanceof Tup && x.items.length === 2 && x.items[0] === SYM_TAG && typeof x.items[1] === "string"; }
+export const Sym = { [Symbol.hasInstance]: isSym };
+export function sym(name) { return new Tup([SYM_TAG, name]); }
+export function symName(x) { return x.items[1]; }
+
 
 // ─── lists ──────────────────────────────────────────────────────────────────
 
@@ -399,7 +399,7 @@ export function hashOf(x) {
     case "boolean": return x ? 1231 : 1237;
     case "function": return fnId(x);
   }
-  if (x instanceof Kw || x instanceof Sym) return x.h;
+  if (x instanceof Kw) return x.h;
   if (x instanceof Flt) return mix(0x3f800000, numHash(x.v));
   if (x._h !== undefined && x._h !== null) return x._h;
   let h;
@@ -433,6 +433,52 @@ export function keyEq(a, b) {
   if (a instanceof Dec) return b instanceof Dec && a.u === b.u && a.s === b.s;
   return false;
 }
+/** Erlang TERM order (`erlang/<`, `=<`, `lists:sort`) on the JS value model:
+    number < atom < fun < tuple < map < list < binary. Atoms (nil, booleans,
+    keywords) order by name; tuples by size then element-wise; lists
+    element-wise, shorter first; binaries by codepoint (= UTF-8 byte order).
+    A BEAM vector/set/decimal is a struct, i.e. a map. Numbers compare by
+    value (1 and 1.0 are neither less than the other). */
+export function termCompare(a, b) {
+  const ra = termRank(a), rb = termRank(b);
+  if (ra !== rb) return ra < rb ? -1 : 1;
+  switch (ra) {
+    case 0: { const x = numOf(a), y = numOf(b); return x < y ? -1 : x > y ? 1 : 0; }
+    case 1: { const x = atomName(a), y = atomName(b); return x < y ? -1 : x > y ? 1 : 0; }
+    case 2: return 0;
+    case 3: {
+      if (a.items.length !== b.items.length) return a.items.length < b.items.length ? -1 : 1;
+      for (let i = 0; i < a.items.length; i++) { const c = termCompare(a.items[i], b.items[i]); if (c) return c; }
+      return 0;
+    }
+    case 4: return compare(a, b);
+    case 5: {
+      let p = a, q = b;
+      for (;;) {
+        const ea = p === EMPTY, eb = q === EMPTY;
+        if (ea || eb) return ea && eb ? 0 : ea ? -1 : 1;
+        const c = termCompare(p.h, q.h); if (c) return c;
+        p = p.t; q = q.t;
+      }
+    }
+    case 6: { const ia = a[Symbol.iterator](), ib = b[Symbol.iterator]();
+      for (;;) { const x = ia.next(), y = ib.next(); if (x.done || y.done) return x.done && y.done ? 0 : x.done ? -1 : 1;
+        const ca = x.value.codePointAt(0), cb = y.value.codePointAt(0); if (ca !== cb) return ca < cb ? -1 : 1; } }
+  }
+  return 0;
+}
+function termRank(x) {
+  if (typeof x === "number" || typeof x === "bigint" || x instanceof Flt) return 0;
+  if (x === null || x === undefined || x === true || x === false || x instanceof Kw) return 1;
+  if (typeof x === "function") return 2;
+  if (x instanceof Tup) return 3;
+  if (x instanceof HMap || x instanceof Vec || x instanceof HSet || x instanceof Dec) return 4;
+  if (x === EMPTY || x instanceof Cons) return 5;
+  if (typeof x === "string") return 6;
+  return 4;
+}
+function atomName(x) { return x === null || x === undefined ? "nil" : x === true ? "true" : x === false ? "false" : x.fq; }
+
 /** BL `=`, measured against BEAM (2026-10-03): lists and vectors are one
     sequential family, and numbers compare NUMERICALLY across int/float —
     (= 1 1.0), (= [1] [1.0]) are true. Map/set KEYS do not: (get {1 :a} 1.0)
@@ -622,7 +668,7 @@ export function printStr(x) {
   if (x instanceof Flt) { const s = String(x.v); return /[.eEn]|Infinity/.test(s) ? s : s + ".0"; }
   if (x instanceof Dec) return x.plain() + "M";
   if (x instanceof Kw) return ":" + x.fq;
-  if (x instanceof Sym) return x.name;
+  if (isSym(x)) return x.items[1];
   if (x instanceof Vec) return "[" + x.toArray().map(printStr).join(" ") + "]";
   if (x === EMPTY) return "()";
   if (x instanceof Cons) { const a = []; for (let p = x; p instanceof Cons; p = p.t) a.push(printStr(p.h)); return "(" + a.join(" ") + ")"; }

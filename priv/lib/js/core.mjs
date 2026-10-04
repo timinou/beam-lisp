@@ -30,7 +30,6 @@ export function invoke(f, ...args) {
   if (f instanceof HMap) return f.get(args[0], args.length > 1 ? args[1] : null);
   if (f instanceof HSet) return f.has(args[0]) ? args[0] : (args.length > 1 ? args[1] : null);
   if (f instanceof Vec) { const v = f.nth(args[0], NF); if (v === NF) throw new BLError("index " + R.printStr(args[0]) + " out of bounds"); return v; }
-  if (f instanceof Sym) return get(args[0], f, args.length > 1 ? args[1] : null);
   throw new BLError(R.printStr(f) + " is not a function");
 }
 const NF = { nf: true };
@@ -334,7 +333,7 @@ export function fnil(f, ...ds) { return (...args) => invoke(f, ...args.map((a, i
     callables follow Clojure: keywords, maps, sets take 1-2, vectors 1. */
 export function invocable_Q(v, n) {
   if (typeof v === "function") return true;
-  if (v instanceof Kw || v instanceof Sym || v instanceof HMap || v instanceof HSet) return n === 1 || n === 2;
+  if (v instanceof Kw || v instanceof HMap || v instanceof HSet) return n === 1 || n === 2;
   if (v instanceof Vec) return n === 1;
   return false;
 }
@@ -406,9 +405,9 @@ export function bit_or(a, b) { return a | b; }
 
 export function str(...xs) { let s = ""; for (const x of xs) s += R.strOf(x); return s; }
 export function pr_str(...xs) { return xs.map(R.printStr).join(" "); }
-export function name(x) { if (typeof x === "string") return x; if (x instanceof Kw) return x.name; if (x instanceof Sym) return x.name; throw new BLError("name of " + R.printStr(x)); }
-export function namespace(x) { return x instanceof Kw ? x.ns : null; }
-export function keyword(a, b) { if (b !== undefined) return R.kw(a + "/" + b); if (a instanceof Kw) return a; return R.kw(a instanceof Sym ? a.name : a); }
+export function name(x) { if (typeof x === "string") return x; if (x instanceof Kw) return x.name; if (x instanceof Sym) { const n = R.symName(x); const i = n.indexOf("/"); return i > 0 ? n.slice(i + 1) : n; } throw new BLError("name of " + R.printStr(x)); }
+export function namespace(x) { if (x instanceof Kw) return x.ns; if (x instanceof Sym) { const n = R.symName(x); const i = n.indexOf("/"); return i > 0 ? n.slice(0, i) : null; } return null; }
+export function keyword(a, b) { if (b !== undefined) return R.kw(a + "/" + b); if (a instanceof Kw) return a; return R.kw(a instanceof Sym ? R.symName(a) : a); }
 export function symbol(x) { return R.sym(x instanceof Kw ? x.fq : x); }
 /** `subs` by GRAPHEME index, as BEAM's String.slice (é and 👍🏽 are one each).
  *
@@ -530,7 +529,60 @@ export function type(x) {
 // JS identifiers cannot carry `?`, `!`, `-`, `=`, so exports use _Q/_BANG/_
 // spellings; the registry maps every BL name the compiler can emit to them.
 
+// ─── metadata, list*, refs, transients (the rest of BEAM's core table) ──────
+// Measured against BEAM (2026-10-04): (meta (with-meta [1] {:a 1})) {:a 1};
+// (meta [1]) nil; (list* 1 2 [3 4]) (1 2 3 4); (list* [1]) [1];
+// (boolean nil) false; (ident? :a) true; (struct? {}) false;
+// (doall s) the realized seq; (dorun s) nil; volatile!/vswap!; transients.
+
+function withMetaColl(x, m) {
+  if (x instanceof Vec) return new Vec(x.cnt, x.shift, x.root, x.tail, m);
+  if (x instanceof HMap) return new HMap(x.cnt, x.root, m);
+  if (x instanceof HSet) return new HSet(x.m, m);
+  if (x instanceof Cons) { const c = new Cons(x.h, x.t); c.meta = m; return c; }
+  if (typeof x === "function") { const f = (...a) => x(...a); f.meta = m; return f; }
+  throw new BLError("with-meta: " + R.printStr(x) + " cannot carry metadata");
+}
+export function meta(x) { return (x && typeof x === "object") || typeof x === "function" ? (x.meta ?? null) : null; }
+export function with_meta(x, m) { return withMetaColl(x, m); }
+export function vary_meta(x, f, ...args) { return withMetaColl(x, invoke(f, meta(x), ...args)); }
+export function list_star(...xs) {
+  if (xs.length === 1) return xs[0];
+  let r = seq(xs[xs.length - 1]); const tail = r === null ? EMPTY : (r instanceof Cons || r === EMPTY ? r : L(toArray(r)));
+  let out = tail; for (let i = xs.length - 2; i >= 0; i--) out = new Cons(xs[i], out);
+  return out;
+}
+export function boolean_(x) { return R.truthy(x); }
+export function ident_Q(x) { return x instanceof Kw || x instanceof Sym; }
+export function struct_Q(_x) { return false; }
+export function doall(s) { return s; }
+export function dorun(_s) { return null; }
+class Volatile { constructor(v) { this.v = v; } }
+export function volatile_B(v) { return new Volatile(v); }
+export function vreset_B(vol, v) { vol.v = v; return v; }
+export function vswap_B(vol, f, ...args) { vol.v = invoke(f, vol.v, ...args); return vol.v; }
+export function volatile_Q(x) { return x instanceof Volatile; }
+export function transientable_Q(x) { return x instanceof Vec || x instanceof HMap || x instanceof HSet; }
+// transients are the persistent value under a mutable box: a one-owner
+// builder, observably the same as the BEAM's (persistent! yields the value)
+class Transient { constructor(v) { this.v = v; } }
+export function transient(x) { return new Transient(x); }
+export function persistent_B(t) { return t.v; }
+export function conj_B(t, ...xs) { if (xs.length === 0) return t; for (const x of xs) t.v = conj(t.v, x); return t; }
+export function assoc_B(t, k, v) { t.v = assoc(t.v, k, v); return t; }
+export function dissoc_B(t, k) { t.v = dissoc(t.v, k); return t; }
+
+let GENSYM = 0;
+/** `(gensym)` / `(gensym "p")`: a fresh SYMBOL `G__N__auto` / `p__N__auto`. */
+export function gensym(prefix) { return R.sym((prefix === undefined ? "G" : prefix instanceof Kw ? prefix.fq : String(prefix)) + "__" + (++GENSYM) + "__auto"); }
+
 export const CORE = {
+  "gensym": gensym,
+  "meta": meta, "with-meta": with_meta, "vary-meta": vary_meta, "list*": list_star, "boolean": boolean_,
+  "ident?": ident_Q, "struct?": struct_Q, "doall": doall, "dorun": dorun,
+  "volatile!": volatile_B, "vreset!": vreset_B, "vswap!": vswap_B, "volatile?": volatile_Q,
+  "transientable?": transientable_Q, "transient": transient, "persistent!": persistent_B,
+  "conj!": conj_B, "assoc!": assoc_B, "dissoc!": dissoc_B,
   "invoke": invoke, "seq": seq, "first": first, "rest": rest, "next": next, "second": second, "last": last, "butlast": butlast,
   "cons": cons, "count": count, "nth": nth, "empty?": empty_Q, "not-empty": not_empty,
   "vector": vector, "vec": vec, "list": list, "hash-map": hash_map, "hash-set": hash_set, "set": set,
@@ -567,6 +619,8 @@ export const CORE = {
   "neg?": neg_Q, "even?": even_Q, "odd?": odd_Q, "not": not, "is?": is_Q,
   "=": eqv, "eqv": eqv,
   // Erlang term comparison (erlang/=:= exact, /= and =/= the negations)
+  "erlang/<": (a, b) => R.termCompare(a, b) < 0, "erlang/>": (a, b) => R.termCompare(a, b) > 0,
+  "erlang/=<": (a, b) => R.termCompare(a, b) <= 0, "erlang/>=": (a, b) => R.termCompare(a, b) >= 0,
   "erlang/=:=": (a, b) => R.keyEq(a, b), "erlang//=": (a, b) => !R.eqv(a, b), "erlang/=/=": (a, b) => !R.keyEq(a, b), "not=": not_eq, "identical?": identical_Q, "compare": compare, "hash": hash, "hash_key": identity,
   "inc": inc, "dec": dec, "abs": abs, "max": max, "min": min, "quot": quot, "rem": rem, "mod": mod,
   "+": plus, "-": minus, "*": times, "/": divide, "<": lt, ">": gt, "<=": le, ">=": ge, "==": num_eq,

@@ -22,6 +22,7 @@
 import * as R from "./rt.mjs";
 import * as C from "./core.mjs";
 import { ENV } from "./env.mjs";
+import { LINKS, OPS } from "./core-links.mjs";
 const { EMPTY, Cons, Tup, Kw, HMap, Vec, BLError } = R;
 
 const OK = R.kw("ok"), ERROR = R.kw("error");
@@ -104,7 +105,12 @@ export const LEAVES = {
   },
   "erlang/byte_size/1": (s) => new TextEncoder().encode(s).length,
   "erlang/binary_part/3": (s, start, len) => new TextDecoder().decode(new TextEncoder().encode(s).subarray(start, start + len)),
-  "erlang/map_get/2": (k, m) => { const v = m.get(k, MISSING); if (v === MISSING) badarg("map_get", k); return v; },
+  // On the BEAM a vector/set/map value is a struct: `map_get(:meta, v)` reads
+  // its metadata field. The JS collections carry the same field as `.meta`.
+  "erlang/map_get/2": (k, m) => {
+    if (k === R.kw("meta") && (m instanceof Vec || m instanceof R.HSet || m instanceof R.Cons)) return m.meta ?? null;
+    const v = m.get(k, MISSING); if (v === MISSING) badarg("map_get", k); return v;
+  },
   "erlang/map_size/1": (m) => m.cnt,
   "erlang/trunc/1": (x) => (x instanceof R.Flt ? Math.trunc(x.v) : x),
   "erlang/length/1": (l) => arr(l).length,
@@ -131,7 +137,7 @@ export const LEAVES = {
   },
   "lists/sublist/2": (l, n) => { const a = []; for (let p = l; p instanceof Cons && a.length < n; p = p.t) a.push(p.h); return list(a); },
   "lists/sublist/3": (l, start, n) => list(arr(l).slice(start - 1, start - 1 + n)),
-  "lists/sort/1": (l) => list(arr(l).sort(R.compare)),
+  "lists/sort/1": (l) => list(arr(l).sort(R.termCompare)),
   "lists/nth/2": (n, l) => arr(l)[n - 1],
 
   // maps
@@ -189,6 +195,7 @@ export function moduleFor(ns) {
 // the eager collection ops the compiler runs over finite data (CompilerData)
 const eagerList = (x) => (x === null || x === undefined ? [] : C.toArray(x));
 const PDICT = new Map();
+const nextGensym = (() => { let n = 0; return () => ++n; })();
 const UNDEFINED = R.kw("undefined");
 const pkey = (k) => R.printStr(k);
 Object.assign(LEAVES, {
@@ -213,6 +220,16 @@ Object.assign(LEAVES, {
   "Elixir.Regex/run/2": (re, s) => { const m = re.exec(s); return m ? list([...m].map((g) => (g === undefined ? "" : g))) : null; },
 
   "erlang/function_exported/3": () => false,
+  "erlang/is_float/1": (x) => x instanceof R.Flt,
+  // `float_to_binary(f, [:short])`: the shortest round-tripping digits, always
+  // with a `.` (0.1, 100.0, 1.0e21) — JS's shortest digits, Erlang's spelling
+  "erlang/float_to_binary/2": (f) => {
+    const v = f instanceof R.Flt ? f.v : f;
+    let s = String(v);
+    if (/e/.test(s)) { let [m, e] = s.split("e"); if (!m.includes(".")) m += ".0"; return m + "e" + (e.startsWith("+") ? e.slice(1) : e); }
+    return s.includes(".") || !Number.isFinite(v) ? s : s + ".0";
+  },
+  "Elixir.Integer/to_string/2": (n, base) => n.toString(base).toUpperCase(),
   "erlang/is_number/1": (x) => R.isNumber(x),
   "erlang/is_bitstring/1": (x) => typeof x === "string",
   "lists/sort/2": (f, l) => list(arr(l).sort((a, b) => (R.truthy(C.invoke(f, a, b)) ? -1 : 1))),
@@ -225,7 +242,10 @@ Object.assign(LEAVES, {
   "Elixir.BeamLisp.Tiers/boot_namespaces/0": () => list(["anf", "compiler", "core", "diag", "lower", "optimize", "reader", "reader-node", "rt", "sugar"]),
   "Elixir.BeamLisp.Record/record_module?/1": () => false,
   "Elixir.BeamLisp.Record/deftype_module?/1": () => false,
-  "Elixir.BeamLisp.FormMeta/with_meta/2": (form, m) => (form && typeof form === "object" && "meta" in form ? Object.assign(Object.create(Object.getPrototypeOf(form)), form, { meta: m }) : form),
+  // metadata on values (core's meta/with-meta/vary-meta are these on BEAM)
+  "Elixir.BeamLisp.FormMeta/meta/1": C.meta,
+  "Elixir.BeamLisp.FormMeta/with_meta/2": C.with_meta,
+  "Elixir.BeamLisp.FormMeta/vary_meta/2": C.vary_meta,
 
   // defserver codegen tables (priv/host/server.bl, verbatim)
   "Elixir.BeamLisp.Server/callback/1": (n) => ({ "init": T(R.kw("init"), 1, R.kw("vector")), "handle-call": T(R.kw("handle_call"), 3, R.kw("pattern")), "handle-cast": T(R.kw("handle_cast"), 2, R.kw("pattern")), "handle-info": T(R.kw("handle_info"), 2, R.kw("pattern")), "handle-continue": T(R.kw("handle_continue"), 2, R.kw("vector")), "terminate": T(R.kw("terminate"), 2, R.kw("vector")) }[n] ?? null),
@@ -249,6 +269,17 @@ Object.assign(LEAVES, {
     return R.kw("Elixir.BeamLisp.Server." + (ns + "." + name).split(".").map(camel).join("."));
   },
   "Elixir.BeamLisp.Server/return_constructors/0": () => R.EMPTY_MAP,
+  // `~@`: a vector or list spreads, nil is empty, a map yields its entries
+  // as {k, v} tuples (rt/k-splice) — the tail is shared
+  "Elixir.BeamLisp.Ns.Rt/splice/2": (spliced, tail) => {
+    const xs = spliced === null || spliced === undefined ? [] : spliced instanceof HMap ? spliced.entries().map(([k, v]) => T(k, v)) : C.toArray(spliced);
+    let r = tail === null || tail === undefined ? EMPTY : tail;
+    for (let i = xs.length - 1; i >= 0; i--) r = new Cons(xs[i], r);
+    return r;
+  },
+  // a fresh symbol DATUM in the `base__N__auto` shape (rt/print-gensym)
+  "Elixir.BeamLisp.Ns.Rt/gensym/0": () => T(R.kw("symbol"), "G__" + nextGensym() + "__auto"),
+  "Elixir.BeamLisp.Ns.Rt/gensym/1": (p) => T(R.kw("symbol"), (p instanceof Kw ? p.fq : String(p)) + "__" + nextGensym() + "__auto"),
   "Elixir.BeamLisp.Env/op_of/2": (mod, fun) => null,
   "Elixir.BeamLisp.Env/caps_allowed?/2": (mod, op) => true,
 
@@ -262,6 +293,37 @@ function kwGet(opts, k) {
   for (const p of arr(opts)) if (p instanceof Tup && p.items[0] === R.kw(k)) return p.items[1];
   return null;
 }
+
+// ─── js/run: evaluate emitted JS in this realm (priv/lib/js/eval.bl) ─────────
+//
+// The text is a function body from js.emit with run-time linking: `G(ns,
+// name)` reads the live registry (then core), `X("mod/fun/arity")` a core
+// op or a leaf. `R`/`C` are the runtime and core modules.
+const MACRO = R.kw("$macro");
+function G(ns, name) {
+  const r = ENV.fetch(ns, name);
+  if (r instanceof Tup) {
+    const v = r.items[1];
+    // a macro value is {:$macro fn}; called as a fn it is its fn
+    return v instanceof Tup && v.items[0] === MACRO ? v.items[1] : v;
+  }
+  if (Object.prototype.hasOwnProperty.call(C.CORE, name)) return C.CORE[name];
+  throw new BLError("undefined var: " + ns + "/" + name);
+}
+// a linked core op (`Elixir.BeamLisp.Ns.Rt/first/1`) is its CORE function
+function X(lk) {
+  if (Object.prototype.hasOwnProperty.call(LEAVES, lk)) return LEAVES[lk];
+  const k = OPS[lk];
+  if (k !== undefined && Object.prototype.hasOwnProperty.call(C.CORE, k)) return C.CORE[k];
+  throw new BLError("no JS implementation for " + lk);
+}
+// seed the registry with BEAM's core links, so the compiler in JS links
+// core calls exactly as the BEAM compiler does
+for (const [name, info] of LINKS) ENV.put_link("core", name, info);
+ENV.declare_ns("core");
+/** Run one emitted function body. A page installs it as its `js/run` host
+    fn: `globalThis.BL_HOST = { run }` before importing js.eval's build. */
+export function run(body) { return new Function("R", "C", "G", "X", body)(R, C, G, X); }
 
 // BeamLisp.Env — the namespace/var registry (env.mjs), every function at
 // the arity the BL sources call it with
