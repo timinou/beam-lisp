@@ -23,7 +23,7 @@ import * as R from "./rt.mjs";
 import * as C from "./core.mjs";
 import { ENV } from "./env.mjs";
 import { LAZY_LEAVES } from "./lazy.mjs";
-import { HOST_LEAVES, bindTable } from "./host-leaves.mjs";
+import { HOST_LEAVES, bindTable, registerModule } from "./host-leaves.mjs";
 import { LINKS, OPS } from "./core-links.mjs";
 const { EMPTY, Cons, Tup, Kw, HMap, Vec, BLError } = R;
 
@@ -107,12 +107,6 @@ export const LEAVES = {
   },
   "erlang/byte_size/1": (s) => new TextEncoder().encode(s).length,
   "erlang/binary_part/3": (s, start, len) => new TextDecoder().decode(new TextEncoder().encode(s).subarray(start, start + len)),
-  // On the BEAM a vector/set/map value is a struct: `map_get(:meta, v)` reads
-  // its metadata field. The JS collections carry the same field as `.meta`.
-  "erlang/map_get/2": (k, m) => {
-    if (k === R.kw("meta") && (m instanceof Vec || m instanceof R.HSet || m instanceof R.Cons)) return m.meta ?? null;
-    const v = m.get(k, MISSING); if (v === MISSING) badarg("map_get", k); return v;
-  },
   "erlang/map_size/1": (m) => m.cnt,
   "erlang/trunc/1": (x) => (x instanceof R.Flt ? Math.trunc(x.v) : x),
   "erlang/length/1": (l) => arr(l).length,
@@ -145,8 +139,6 @@ export const LEAVES = {
   // maps
   "maps/new/0": () => R.EMPTY_MAP,
   "maps/put/3": (k, v, m) => m.assoc(k, v),
-  "maps/get/2": (k, m) => { const v = m.get(k, MISSING); if (v === MISSING) badarg("maps:get", k); return v; },
-  "maps/get/3": (k, m, d) => m.get(k, d),
   "maps/is_key/2": (k, m) => m.has(k),
   "maps/from_list/1": (l) => { let m = R.EMPTY_MAP; for (const p of arr(l)) m = m.assoc(p.items[0], p.items[1]); return m; },
   "maps/to_list/1": (m) => list([...m.entries()].map(([k, v]) => T(k, v))),
@@ -332,12 +324,17 @@ function G(ns, name) {
 }
 // a linked core op (`Elixir.BeamLisp.Ns.Rt/first/1`) is its CORE function
 function X(lk) {
+  // a core op FIRST, exactly as the static linker (build.bl link-ctx: CORE
+  // before leaves): this page's values are core.mjs's (its errors, its
+  // `throw` payloads), and core's ops spread rest args as this emitter calls
+  // them; a BEAM-ABI leaf of the same name (ExInfo/*, Refs/swap!/3) is the
+  // compiled-core (--self-host) side of the cut
+  const k = OPS[lk];
+  if (k !== undefined && Object.prototype.hasOwnProperty.call(C.CORE, k)) return C.CORE[k];
   if (Object.prototype.hasOwnProperty.call(LEAVES, lk)) return LEAVES[lk];
   // `clojure.string/upper-case/1` and friends: a native namespace's fn
   const parts = lk.split("/");
   if (parts.length === 3 && NATIVE_NS.has(parts[0])) return G("user", parts[0] + "/" + parts[1]);
-  const k = OPS[lk];
-  if (k !== undefined && Object.prototype.hasOwnProperty.call(C.CORE, k)) return C.CORE[k];
   throw new BLError("no JS implementation for " + lk);
 }
 // seed the registry with BEAM's core links, so the compiler in JS links
@@ -350,8 +347,8 @@ export function run(body) { return new Function("R", "C", "G", "X", body)(R, C, 
 
 // BeamLisp.LazySeq / SeqCursor / Deferred / LazyMemo.seen — lazy.mjs
 Object.assign(LEAVES, LAZY_LEAVES);
-// what compiled core.bl/rt.bl reach (host-leaves.mjs). Leaves ALREADY above
-// keep their entry: they were measured first for the compiler's own sources.
+// what compiled core.bl/rt.bl reach (host-leaves.mjs), incl. the struct-aware
+// map_get/maps.get (the tag protocol). Leaves ALREADY above keep their entry.
 for (const [k, f] of Object.entries(HOST_LEAVES)) if (!Object.prototype.hasOwnProperty.call(LEAVES, k)) LEAVES[k] = f;
 bindTable(LEAVES);
 
@@ -364,6 +361,20 @@ const DATA_READERS = new Map();
 export function registerDataReader(tag, symName) { DATA_READERS.set(tag, T(R.kw("symbol"), symName)); }
 
 const MISSING = { missing: true };
+
+// ─── the module table: compiled namespaces, by name ─────────────────────────
+// Each compiled namespace module registers its exports when it finishes
+// loading. A namespace that refers to one LATER in load order (rt → core) holds
+// a late-bound view: property reads go to the registered module at CALL time.
+const NAMESPACES = new Map();
+export function registerNamespace(ns, modName, exports) { NAMESPACES.set(ns, exports); registerModule(modName, exports); }
+export function lateModule(ns) {
+  return new Proxy({}, { get(_, k) {
+    const m = NAMESPACES.get(ns);
+    if (!m) throw new BLError(ns + " is not loaded yet (a call into it during the load of a namespace it depends on)");
+    return m[k];
+  } });
+}
 
 /** The declared leaf names, for the build's linker. */
 export const NAMES = Object.keys(LEAVES);

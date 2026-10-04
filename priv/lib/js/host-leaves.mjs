@@ -47,7 +47,7 @@ export function structTag(x) {
   if (x instanceof R.Atom) return kw("Elixir.BeamLisp.Atom");
   if (x instanceof Z.Delay) return kw("Elixir.BeamLisp.Delay");
   if (x instanceof Z.SeqCursor) return kw("Elixir.BeamLisp.SeqCursor");
-  if (x.blStruct instanceof Kw) return x.blStruct;      // Reduced, Sorted, Volatile, records …
+  if (x.blStruct instanceof Kw) return x.blStruct;      // Regex, Reduced, Sorted, Volatile, records …      // Reduced, Sorted, Volatile, records …
   return undefined;
 }
 /** `is_map` on the BEAM is true for every struct: a struct IS a map. */
@@ -55,11 +55,16 @@ export const isMap = (x) => x instanceof HMap || structTag(x) !== undefined;
 
 const MISSING = {};
 function mapGet(k, m, dflt) {
-  if (k === STRUCT) { const t = structTag(m); if (t !== undefined) return t; }
+  // a plain map is checked FIRST: a struct rt.bl builds BY HAND
+  // (`(maps/put :__struct__ :"Elixir.BeamLisp.Reduced" (maps/new))`) is an
+  // HMap carrying the key itself, exactly the BEAM's representation
   if (m instanceof HMap) return m.get(k, dflt);
+  if (k === STRUCT) { const t = structTag(m); if (t !== undefined) return t; }
+  if (k === kw("meta") && m instanceof Cons) return m.meta ?? null;
   if (structTag(m) !== undefined) {
     // a struct-backed value's own fields (contract C2 moves rt.bl off these)
     if (m.blFields && Object.prototype.hasOwnProperty.call(m.blFields, k.fq)) return m.blFields[k.fq];
+    // the metadata field a vector/set/lazy seq carries (`:meta` on the BEAM)
     if (k === kw("meta") || k === kw("metadata")) return m.meta ?? null;
     return dflt;
   }
@@ -114,6 +119,9 @@ export const ERLANG = {
   // keyword/map/set/vector called as a fn is core's `invoke`
   "erlang/apply/2": (f, args) => (typeof f === "function" ? f(...arr(args)) : C.invoke(f, ...arr(args))),
   "erlang/apply/3": (m, f, args) => applyMFA(m, f, arr(args)),
+  // `fun M:F/A` as a value: resolved against the leaf table and the self-host
+  // module table at CALL time (rt's seed captures its own exports this way)
+  "erlang/make_fun/3": (m, f, a) => { const k = (m instanceof Kw ? m.fq : String(m)) + "/" + (f instanceof Kw ? f.fq : String(f)) + "/" + a; const g = (...xs) => applyKey(k, xs); Object.defineProperty(g, "length", { value: a }); return g; },
   "erlang/error/1": (reason) => { throw reason instanceof Error ? reason : Object.assign(new BLError(R.printStr(reason)), { data: reason }); },
   "erlang/raise/3": (_kind, reason, _stack) => { throw reason; },
 };
@@ -129,7 +137,9 @@ function erlEq(a, b) {
     let p = a, q = b;
     for (;;) {
       if (p === EMPTY || q === EMPTY) return p === q;
-      if (!(p instanceof Cons) || !(q instanceof Cons)) return erlEq(p, q);
+      // one side ran out of cells: equal only if both tails are the same
+      // non-cell term (an improper tail: a lazy node, a cursor)
+      if (!(p instanceof Cons) || !(q instanceof Cons)) return !(p instanceof Cons) && !(q instanceof Cons) && erlEq(p, q);
       if (!erlEq(p.h, q.h)) return false;
       p = p.t; q = q.t;
     }
@@ -161,10 +171,38 @@ function iolist(x) {
 let TABLE = null;
 export function bindTable(t) { TABLE = t; }
 function applyMFA(m, f, args) {
-  const k = (m instanceof Kw ? m.fq : String(m)) + "/" + (f instanceof Kw ? f.fq : String(f)) + "/" + args.length;
+  return applyKey((m instanceof Kw ? m.fq : String(m)) + "/" + (f instanceof Kw ? f.fq : String(f)) + "/" + args.length, args);
+}
+/** `mod/fun/arity` → a leaf, or a function of a namespace compiled into this
+    build (registered by module name: `Elixir.BeamLisp.Ns.Rt/first/1`). */
+const MODULES = new Map();
+export function registerModule(modName, exports) { MODULES.set(modName, exports); }
+function applyKey(k, args) {
   const fn = TABLE && TABLE[k];
-  if (fn === undefined) throw new BLError("no JS implementation for " + k);
-  return fn(...args);
+  if (fn !== undefined) return fn(...args);
+  const [mod, fun] = k.split("/");
+  const ex = MODULES.get(mod);
+  if (ex) {
+    const g = ex["d_" + mangle(fun)] ?? (fun.endsWith("__bl_v") ? ex["d_" + mangle(fun.slice(0, -6))] : undefined);
+    if (typeof g === "function") return g(...args);
+  }
+  throw new BLError("no JS implementation for " + k);
+}
+/** js.emit's `mangle` (priv/lib/js/emit.bl), for looking a BEAM function
+    name up in a compiled module's exports. Injective, as there: letters and
+    digits pass, `-`→`_`, `_`→`$U`, punctuation by name, a leading digit gains
+    `$N`, a reserved word `$R`. emit.bl is the authority; test/js/rt.test.mjs
+    pins this copy against names it emitted. */
+const RESERVED = new Set("break case catch class const continue debugger default delete do else export extends finally for function if import in instanceof new return super switch this throw try typeof var void while with yield let static enum await implements package protected interface private public null true false arguments eval".split(" "));
+const PUNCT = { 45: "_", 95: "$U", 63: "$Q", 33: "$B", 42: "$S", 62: "$G", 60: "$L", 61: "$E", 43: "$P", 47: "$D", 46: "$O", 39: "$T" };
+export function mangle(name) {
+  let out = "";
+  for (const ch of name) {
+    const c = ch.codePointAt(0);
+    out += (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) ? ch : PUNCT[c] ?? "$" + c + "$";
+  }
+  if (out.length && out.charCodeAt(0) >= 48 && out.charCodeAt(0) <= 57) out = "$N" + out;
+  return RESERVED.has(out) ? out + "$R" : out;
 }
 
 // ─── lists / maps ────────────────────────────────────────────────────────────
@@ -227,17 +265,70 @@ export const STRING = {
   "Elixir.String/to_atom/1": (s) => kw(s),
 };
 
+// ─── Regex: Elixir's %Regex{} (PCRE) as a JS RegExp ──────────────────────────
+// The source text is kept (`~r/…/` prints it); matching uses a `u`-flag RegExp.
+// PCRE and JS agree on the patterns Clojure code writes (classes, groups,
+// anchors, quantifiers); PCRE-only syntax (possessive `++`, `(?<name>…)` is
+// shared) raises at compile, named. Answers measured on the BEAM: `run`
+// drops TRAILING unmatched groups ((a)(x)?b on "zab" → ("ab" "a")), a
+// replacement's `\1` is group 1, `{:global false}` replaces once.
+export class Regex {
+  constructor(source) {
+    this.source = source; this.blStruct = kw("Elixir.Regex");
+    try { this.re = new RegExp(source, "u"); }
+    catch (e) { const err = new BLError("regex " + JSON.stringify(source) + " is not supported on the JS target: " + e.message); err.blType = kw("Elixir.Regex.CompileError"); throw err; }
+  }
+  global() { return new RegExp(this.re.source, "gu"); }
+}
+const trimGroups = (m) => { const a = [...m].map((x) => (x === undefined ? "" : x)); let n = m.length; while (n > 1 && m[n - 1] === undefined) n--; return L(a.slice(0, n)); };
+const jsTemplate = (t) => t.replace(/\$/g, "$$$$").replace(/\\(\d)/g, "$$$1");
+const reOpts = (o) => new Map(arr(o).map((t) => [t.items[0].fq, t.items[1]]));
+export const REGEX = {
+  "Elixir.Regex/compile!/1": (s) => new Regex(s),
+  "Elixir.Regex/regex?/1": (x) => x instanceof Regex,
+  "Elixir.Regex/source/1": (r) => r.source,
+  "Elixir.Regex/run/2": (r, s) => { const m = r.re.exec(s); return m ? trimGroups(m) : null; },
+  "Elixir.Regex/scan/2": (r, s) => L([...s.matchAll(r.global())].map(trimGroups)),
+  "Elixir.Regex/replace/3": (r, s, rep) => repl(r, s, rep, true),
+  "Elixir.Regex/replace/4": (r, s, rep, o) => repl(r, s, rep, reOpts(o).get("global") !== false),
+  "Elixir.String/replace/4": (s, pat, rep, o) => {
+    const g = reOpts(o).get("global") !== false;
+    if (pat instanceof Regex) return repl(pat, s, rep, g);
+    return g ? s.split(pat).join(rep) : s.replace(pat, () => rep);
+  },
+  "Elixir.String/reverse/1": (s) => graphemes(s).reverse().join(""),
+  "Elixir.String/to_charlist/1": (s) => L([...s].map((c) => c.codePointAt(0))),
+  "Elixir.List/to_string/1": (l) => iolist(l),
+  "erlang/list_to_binary/1": (l) => iolist(l),
+  // clojure.core-ext's `macroexpand-1` reaches the compiler by module: a page
+  // that carries it (`--with compiler`, as js.eval) links the real one first;
+  // otherwise this names the gap instead of failing the whole build
+  "Elixir.BeamLisp.Ns.Compiler/macroexpand_1/2": (f, ns) => {
+    const g = TABLE && TABLE.__compiler_macroexpand_1;
+    if (!g) throw new BLError("macroexpand-1 needs the compiler in this JS build (bl js build … --with compiler)");
+    return g(f, ns);
+  },
+};
+function repl(r, s, rep, global) {
+  const re = global ? r.global() : r.re;
+  if (typeof rep === "function") return s.replace(re, (...m) => R.strOf(call(rep, m[0])));
+  return s.replace(re, jsTemplate(rep));
+}
+// `String.split(s, %Regex{})`: split on a pattern
+const splitPlain = STRING["Elixir.String/split/2"];
+STRING["Elixir.String/split/2"] = (s, sep) => (sep instanceof Regex ? L(s.split(sep.global())) : splitPlain(s, sep));
+
 // ─── BEAM-only (contract C3): linked, and a named refusal when called ───────
 
 const beamOnly = (k) => () => { throw new BLError(k + " runs on the BEAM only (not part of the JS target)"); };
 export const BEAM_ONLY = Object.fromEntries([
-  "erlang/monitor/2", "erlang/exit/2", "erlang/make_fun/3", "io/format/2",
+  "erlang/monitor/2", "erlang/exit/2", "io/format/2",
   "Elixir.Code/ensure_loaded?/1", "crypto/hash/2", "Elixir.Base/encode16/1",
   "Elixir.BeamLisp.Trace/trace/3", "Elixir.BeamLisp.Trace/trace/4", "Elixir.BeamLisp.Trace/untrace/2",
   "Elixir.BeamLisp.Refs/spawn_exec/1", "Elixir.BeamLisp.Refs/spawn_exec/2",
 ].map((k) => [k, beamOnly(k)]));
 
-export const HOST_LEAVES = { ...ERLANG, ...LISTS, ...STRING, ...BEAM_ONLY };
+export const HOST_LEAVES = { ...ERLANG, ...LISTS, ...STRING, ...REGEX, ...BEAM_ONLY };
 // (COLLECTIONS, NUMBERS, REFS_ERRORS are merged in below, where they are defined)
 
 // ─── collections: Vector / Set / Sorted / Transient ──────────────────────────
@@ -294,6 +385,12 @@ export const COLLECTIONS = {
   "Elixir.BeamLisp.Sorted/rsubseq_entries/3": (c, lo, hi) => rangeEntries(c, lo, hi, true),
 
   "Elixir.BeamLisp.Transient/transient/1": (x) => new Transient(x),
+  // `hash-map`'s link row ({0 :hash_map_empty} (2 :hash_map)): rest is a LIST
+  "Elixir.BeamLisp.Transient/hash_map_empty/0": () => R.EMPTY_MAP,
+  "Elixir.BeamLisp.Transient/hash_map/3": (k, v, rest) => {
+    const xs = arr(rest); if (xs.length % 2) badarg("hash-map requires an even number of forms, got " + (xs.length + 2));
+    let m = R.EMPTY_MAP.assoc(k, v); for (let i = 0; i < xs.length; i += 2) m = m.assoc(xs[i], xs[i + 1]); return m;
+  },
   "Elixir.BeamLisp.Transient/persistent!/1": (t) => t.v,
   "Elixir.BeamLisp.Transient/get/3": (t, k, d) => C.get(t.v, k, d),
 };
@@ -329,11 +426,26 @@ export const NUMBERS = {
 // ─── refs and errors: Refs / ExInfo / Exception / Record / Multi ────────────
 
 class Volatile { constructor(v) { this.v = v; this.blStruct = kw("Elixir.BeamLisp.Volatile"); } }
+function refsDeref(a) {
+  if (a instanceof HMap && a.get(STRUCT, null) === kw("Elixir.BeamLisp.Reduced")) return a.get(kw("value"), null);
+  if (a instanceof Volatile) return a.v;
+  return C.deref(a);
+}
 const exMessage = (e) => (e instanceof Error ? e.message : R.printStr(e));
 export const REFS_ERRORS = {
   "Elixir.BeamLisp.Refs/atom/1": (v) => C.atom(v),
-  "Elixir.BeamLisp.Refs/deref/1": (a) => C.deref(a),
+  // Refs.deref reads EVERY derefable (refs.bl deref/1): atoms and volatiles
+  // (`.v`), delays (forced), and the `Reduced` sentinel — a map rt.bl builds
+  // by hand, `{:__struct__ Reduced, :value v}` — whose payload is `:value`
+  "Elixir.BeamLisp.Refs/deref/1": (a) => refsDeref(a),
+  "Elixir.BeamLisp.Refs/deref/3": (a) => refsDeref(a),
   "Elixir.BeamLisp.Refs/swap!/2": (a, f) => C.swap_BANG(a, f),
+  // BEAM ABI: the extra args arrive as ONE list (Refs.swap!(a, f, args))
+  "Elixir.BeamLisp.Refs/swap!/3": (a, f, rest) => C.swap_BANG(a, f, ...arr(rest)),
+  "Elixir.BeamLisp.Refs/reset!/2": (a, v) => C.reset_BANG(a, v),
+  "Elixir.BeamLisp.Refs/vswap!/2": (v, f) => { v.v = call(f, v.v); return v.v; },
+  "Elixir.BeamLisp.Refs/vswap!/3": (v, f, rest) => { v.v = call(f, v.v, ...arr(rest)); return v.v; },
+  "Elixir.BeamLisp.Refs/volatile?/1": (x) => x instanceof Volatile,
   "Elixir.BeamLisp.Refs/volatile/1": (v) => new Volatile(v),
   "Elixir.BeamLisp.Refs/vreset!/2": (v, x) => { v.v = x; return x; },
   "Elixir.BeamLisp.ExInfo/ex_info/2": (m, d) => C.ex_info(m, d),

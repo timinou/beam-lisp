@@ -27,6 +27,10 @@ const { EMPTY, EMPTY_VEC, EMPTY_MAP, EMPTY_SET, Cons, Vec, HMap, HSet, Kw, Sym, 
 
 export function invoke(f, ...args) {
   if (typeof f === "function") return f(...args);
+  // `{:$blfn %{arity => f} {min f} | nil}` — the BEAM's multi-arity fn VALUE
+  // (rt/multi-fn; every seeded core value: `+`, `str`, `map` …). The variadic
+  // clause takes the fixed args then the rest as ONE list (Rt.invoke).
+  if (f instanceof Tup && f.items.length === 3 && f.items[0] === BLFN) return invokeBlfn(f, args);
   if (f instanceof Kw) return get(args[0], f, args.length > 1 ? args[1] : null);
   if (f instanceof HMap) return f.get(args[0], args.length > 1 ? args[1] : null);
   if (f instanceof HSet) return f.has(args[0]) ? args[0] : (args.length > 1 ? args[1] : null);
@@ -34,6 +38,17 @@ export function invoke(f, ...args) {
   throw new BLError(R.printStr(f) + " is not a function");
 }
 const NF = { nf: true };
+const BLFN = R.kw("$blfn");
+function invokeBlfn(f, args) {
+  const fixed = f.items[1], v = f.items[2];
+  const g = fixed instanceof HMap ? fixed.get(args.length, NF) : NF;
+  if (g !== NF) return invoke(g, ...args);
+  if (v instanceof Tup) {
+    const mn = v.items[0];
+    if (args.length >= mn) return invoke(v.items[1], ...args.slice(0, mn), R.listFromArray(args.slice(mn)));
+  }
+  throw new BLError("wrong number of args (" + args.length + ") passed to a multi-arity fn");
+}
 /** The sentinel compiled map patterns compare against (`{:keys [a]}` in a fn
     head is a pmap: a key that is ABSENT fails the clause). */
 export const NOT_FOUND = NF;
@@ -509,17 +524,24 @@ function notify(a, old, nu) { if (a.watches && old !== nu) for (const [k, f] of 
 // ─── errors ─────────────────────────────────────────────────────────────────
 
 export function ex_info(msg, data, cause) { return new BLError(msg, data === undefined ? EMPTY_MAP : data, cause); }
-export function ex_message(e) { return e instanceof Error ? e.message : null; }
+/** BEAM (measured 2026-10-04): `(ex-message "plain")` is "\"plain\"" — a
+    non-exception's message is its printed form; `(throw {:k 1})` caught gives
+    ["{:k 1}" {:k 1}] (a map payload IS the data), `(throw "str")` gives
+    ["\"str\"" nil]. */
+export function ex_message(e) { return e instanceof Error ? e.message : R.printStr(e); }
 export function ex_data(e) { return e instanceof BLError ? e.data : null; }
 export function ex_cause(e) { return e instanceof BLError ? e.blCause : null; }
-export function throw_(e) { throw e; }
+export function throw_(e) {
+  if (e instanceof Error) throw e;
+  const err = new BLError(R.printStr(e), e instanceof HMap ? e : null); err.blOriginal = e; throw err;
+}
 /** The frontend lowers every `catch` through Exception.normalize(kind, value,
     stack) and re-raises a miss with erlang:raise(kind, value, stack). A JS
     throw is already the normalized value; a non-Error is wrapped once so
     ex-message/ex-data see a BLError. */
 export function exception_normalize(_kind, v, _stack) {
   if (v instanceof Error) return v;
-  return new BLError(R.strOf(v), R.hashMap(R.kw("thrown"), v));
+  const err = new BLError(R.printStr(v), v instanceof HMap ? v : null); err.blOriginal = v; return err;
 }
 export function erlang_raise(_kind, v, _stack) { throw v; }
 /** `catch` clause type tests compile to a struct check against the
@@ -619,13 +641,10 @@ export function repeat_(n, x) {
   const inf = () => new Z.LazySeq(() => new Cons(n, inf()));
   return inf();
 }
-/** `realized?`: a delay or lazy seq that has published its value (a
-    non-lazy value is trivially realized). */
-export function realized_Q(x) {
-  if (x instanceof Z.Delay) return Z.deferredRealized(x);
-  if (x instanceof Z.LazySeq) return x.s[0] === 2;
-  return true;
-}
+/** `realized?` is BeamLisp.Deferred's: a DELAY that has published its value;
+    anything else — a lazy seq included — is trivially realized (BEAM,
+    measured 2026-10-04: (realized? (lazy-seq (list 1))) is true unforced). */
+export function realized_Q(x) { return Z.deferredRealized(x); }
 /** `lazy-seq`'s runtime half: a lazy node over a zero-arity thunk — the
     `BeamLisp.LazySeq/from_fun` leaf the `lazy-seq` macro expands to. */
 export function lazy_seq(thunk) { return Z.newLazy(() => invoke(thunk)); }

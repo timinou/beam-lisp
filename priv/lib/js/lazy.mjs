@@ -203,11 +203,12 @@ export function chain(elems, tailFn) {
 }
 
 /** A finite list walked a chunk at a time: on the BEAM the list is copied once
-    off-heap; here it is the list itself, walked in place. Its cell is the
-    list's own cell, so the shape (`[h | rest]`) is the BEAM's. */
+    off-heap; here it is the list itself, walked in place. A cell is the BEAM's
+    shape exactly — `[head | cursor']`, the TAIL a sub-cursor, never the bare
+    rest of the list (rt.bl walks `(SeqCursor/cell (tl cell))`). nil at the end. */
 export class SeqCursor {
   constructor(list) { this.l = list; }
-  cell() { return this.l === R.EMPTY ? null : this.l; }
+  cell() { const l = this.l; return l instanceof R.Cons ? new R.Cons(l.h, new SeqCursor(l.t)) : null; }
 }
 
 /** Normalize a producer input (BeamLisp.LazySeq/input): a vector is unwrapped,

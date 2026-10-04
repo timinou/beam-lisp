@@ -759,6 +759,7 @@ export function printStr(x) {
   if (x instanceof Tup) return "{" + x.items.map(printStr).join(", ") + "}";
   if (x instanceof BLError) return "#error {:message " + escStr(x.message) + "}";
   if (x instanceof Atom) return "#<atom " + printStr(x.v) + ">";
+  if (x !== null && typeof x === "object" && x.blStruct && x.blStruct.fq === "Elixir.Regex") return "~r/" + x.source + "/";
   if (x instanceof Z.Delay) return "#<delay " + (x.seq.s[0] === 2 ? printStr(x.seq.s[1]) : ":pending") + ">";
   return "#<host " + Object.prototype.toString.call(x) + ">";
 }
