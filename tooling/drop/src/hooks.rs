@@ -162,7 +162,7 @@ pub fn request_build(store: &Store, tree: &Path, me: &Path) {
     let queue = store.meta().join("queue");
     let _ = std::fs::create_dir_all(&queue);
     let _ = write_atomic(&queue.join(tree_id(tree)), tree.to_string_lossy().as_bytes());
-    spawn_detached(me, &["hooks", "drain"], tree);
+    spawn_detached(me, &[crate::VERB_HOOKS, crate::HOOKS_DRAIN], tree);
 }
 
 /// Start `me ARGS` fully detached: its own process group, stdio on /dev/null,
