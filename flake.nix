@@ -27,13 +27,36 @@
       pkgs = nixpkgs.legacyPackages.${system};
       beam = import ./nix/beam.nix { inherit pkgs otp-src elixir-src; };
       rustPkgs = nixpkgs-rust.legacyPackages.${system};
-      drop = import ./nix/bl-drop.nix { inherit pkgs rustPkgs self; inherit (beam) erlang elixir; };
+      drop = import ./nix/bl-drop.nix { inherit pkgs rustPkgs; inherit (beam) erlang elixir; };
     in
     {
       packages.${system} = {
         inherit (beam) erlang elixir;
         bl-drop = drop.bl-drop;
         default = drop.bl-drop;
+      };
+
+      # `nix flake check` — the gate (CI runs it too). Fails loudly when the build
+      # or its contract (runs; glibc floor <= the servers' 2.40) breaks.
+      checks.${system} = {
+        # the drop starts and evaluates, with no /nix/store paths on its PATH/LD path
+        drop-runs = pkgs.runCommand "bl-drop-runs" { } ''
+          export HOME=$TMPDIR/home BL_DAEMON=off
+          mkdir -p $HOME
+          cp ${drop.bl-drop}/bl.drop ./bl.drop && chmod +x ./bl.drop
+          got=$(./bl.drop eval '(+ 1 2)')
+          [ "$got" = 3 ] || { echo "drop eval (+ 1 2) = '$got', want 3" >&2; exit 1; }
+          touch $out
+        '';
+        glibc-floor = pkgs.runCommand "bl-glibc-floor" { nativeBuildInputs = [ pkgs.binutils pkgs.findutils ]; } ''
+          export DROP_BIN=${drop.drop-tools}/bin/drop
+          got=$(sh ${./tooling/drop/glibc-floor.sh} ${drop.bl-drop}/bl.drop)
+          echo "$got"
+          v=$(echo "$got" | cut -d' ' -f1)
+          [ "$(printf '%s\n2.40\n' "$v" | sort -V | tail -1)" = 2.40 ] \
+            || { echo "glibc floor $v > 2.40 (the servers' glibc)" >&2; exit 1; }
+          touch $out
+        '';
       };
     };
 }

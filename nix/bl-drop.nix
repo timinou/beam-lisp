@@ -11,7 +11,7 @@
 # with no RUNPATH, so the drop does not depend on /nix/store paths existing on
 # the target. On NixOS that loader is nix-ld's, which resolves libc from the HOST:
 # the host's glibc must therefore be >= the drop's symbol floor, which is the point.
-{ pkgs, rustPkgs, self, erlang, elixir }:
+{ pkgs, rustPkgs, erlang, elixir }:
 let
   inherit (pkgs) lib;
 
@@ -45,26 +45,90 @@ let
     '') hexDeps}
   '';
 
-  # ── crates: one merged vendor dir for every Cargo.lock we build ──────────────
-  crateLocks = [
-    ../native/bl_json/Cargo.lock
-    ../native/code_embed/Cargo.lock
-    ../native/datom_datalog/Cargo.lock
-    ../native/datom_fjall/Cargo.lock
-    ../native/datom_vector/Cargo.lock
-    ../native/lazy_memo/Cargo.lock
-    ../tooling/drop/Cargo.lock
-  ];
-  vendors = map (l: pkgs.rustPlatform.importCargoLock { lockFile = l; }) crateLocks;
-  vendorDir = pkgs.runCommand "bl-cargo-vendor" { } ''
-    mkdir -p $out
-    for v in ${toString vendors}; do
-      for c in $v/*; do
-        n=$(basename $c)
-        [ "$n" = Cargo.lock ] && continue
-        [ -e $out/$n ] || ln -s $(readlink -f $c) $out/$n
+  # ── crates: one merged vendor dir per Cargo.lock set ─────────────────────────
+  mkVendor = name: locks:
+    let vs = map (l: pkgs.rustPlatform.importCargoLock { lockFile = l; }) locks; in
+    pkgs.runCommand name { } ''
+      mkdir -p $out
+      for v in ${toString vs}; do
+        for c in $v/*; do
+          n=$(basename $c)
+          [ "$n" = Cargo.lock ] && continue
+          [ -e $out/$n ] || ln -s $(readlink -f $c) $out/$n
+        done
       done
-    done
+    '';
+  cargoEnv = vendorDir: ''
+    export HOME=$TMPDIR/home CARGO_HOME=$TMPDIR/cargo CARGO_NET_OFFLINE=true
+    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=${pkgs.stdenv.cc}/bin/cc
+    mkdir -p $HOME $CARGO_HOME
+    cat > $CARGO_HOME/config.toml <<EOF
+    [source.crates-io]
+    replace-with = "vendored"
+    [source.vendored]
+    directory = "${vendorDir}"
+    [net]
+    offline = true
+    EOF
+  '';
+
+  # Each derivation sees ONLY what it reads, so a change elsewhere cannot rebuild it.
+  nativeCrates = [ "bl_json" "code_embed" "datom_datalog" "datom_fjall" "datom_vector" "lazy_memo" ];
+  nativeSrc = lib.fileset.toSource {
+    root = ../.;
+    fileset = lib.fileset.unions (map (c: ../native + "/${c}") nativeCrates);
+  };
+  toolSrc = lib.fileset.toSource { root = ../.; fileset = ../tooling/drop; };
+
+  # 1. launcher + pack tool — keyed on tooling/drop only.
+  drop-tools = pkgs.stdenv.mkDerivation {
+    pname = "bl-drop-tools";
+    version = "0.1.0";
+    src = toolSrc;
+    nativeBuildInputs = [ rustPkgs.rustc rustPkgs.cargo pkgs.gcc ];
+    dontConfigure = true;
+    dontFixup = true;
+    buildPhase = ''
+      ${cargoEnv (mkVendor "bl-vendor-tools" [ ../tooling/drop/Cargo.lock ])}
+      cargo build --release --offline --manifest-path tooling/drop/Cargo.toml --target-dir $TMPDIR/t
+    '';
+    installPhase = ''
+      install -Dm755 $TMPDIR/t/release/drop-launcher $out/bin/drop-launcher
+      install -Dm755 $TMPDIR/t/release/drop $out/bin/drop
+    '';
+  };
+
+  # 2. the NIFs — keyed on native/** (the six server crates) + their Cargo.locks.
+  natives = pkgs.stdenv.mkDerivation {
+    pname = "bl-natives";
+    version = "0.1.0";
+    src = nativeSrc;
+    nativeBuildInputs = [ rustPkgs.rustc rustPkgs.cargo pkgs.gcc ];
+    dontConfigure = true;
+    dontFixup = true;
+    buildPhase = ''
+      ${cargoEnv (mkVendor "bl-vendor-natives" (map (c: ../native + "/${c}/Cargo.lock") nativeCrates))}
+      mkdir -p $out
+      for c in ${toString nativeCrates}; do
+        # in the crate dir, so its .cargo/config.toml (dynamic_lookup) applies
+        (cd native/$c && cargo build --release --offline --target-dir $TMPDIR/t-$c)
+        install -m755 $TMPDIR/t-$c/release/lib$c.so $out/$c.so
+      done
+    '';
+    installPhase = "true";
+  };
+
+  # `bl build` runs `cargo build --release --target-dir D` per crate and looks for
+  # D/release/lib<crate>.so. This answers that one call from the `natives` output
+  # (so the bl build step needs no Rust compile); everything else is real cargo.
+  cargoShim = pkgs.writeShellScriptBin "cargo" ''
+    if [ "$1" = build ] && [ -f ${natives}/$(basename "$PWD").so ]; then
+      while [ $# -gt 0 ]; do [ "$1" = --target-dir ] && td=$2; shift; done
+      mkdir -p "$td/release"
+      cp ${natives}/$(basename "$PWD").so "$td/release/lib$(basename "$PWD").so"
+      exit 0
+    fi
+    exec ${rustPkgs.cargo}/bin/cargo "$@"
   '';
 
   # ── pinned binary assets ─────────────────────────────────────────────────────
@@ -87,15 +151,17 @@ let
       ../bin ../priv ../env.bl ../bl.lock
       ../native/bl_json ../native/code_embed ../native/datom_datalog
       ../native/datom_fjall ../native/datom_vector ../native/lazy_memo
-      ../tooling/drop
+      ../tooling/drop/src ../tooling/drop/Cargo.toml ../tooling/drop/Cargo.lock
     ];
   };
 
+  # 3. the bl build + self-build + ELF retarget. Compiles no Rust: NIFs and the
+  # launcher come from the two derivations above.
   bl-drop = pkgs.stdenv.mkDerivation {
     pname = "bl-drop";
     version = "0.1.0";
     inherit src;
-    nativeBuildInputs = [ erlang elixir rustPkgs.rustc rustPkgs.cargo pkgs.gcc pkgs.patchelf pkgs.binutils pkgs.unzip pkgs.git pkgs.gnutar pkgs.gzip pkgs.findutils ];
+    nativeBuildInputs = [ erlang elixir cargoShim pkgs.patchelf pkgs.binutils pkgs.unzip pkgs.git pkgs.gnutar pkgs.gzip pkgs.findutils ];
     dontConfigure = true;
     dontFixup = true; # the drop is one opaque file
 
@@ -103,20 +169,9 @@ let
       runHook preBuild
       export HOME=$TMPDIR/home XDG_CACHE_HOME=$TMPDIR/home/.cache
       export BL_DAEMON=off LANG=C.UTF-8 ELIXIR_ERL_OPTIONS="+fnu"
-      export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=${pkgs.stdenv.cc}/bin/cc
-      export CARGO_HOME=$TMPDIR/cargo CARGO_NET_OFFLINE=true CARGO_TARGET_DIR=$TMPDIR/cargo-target
       export RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH=$TMPDIR/rp-cache
       export EXPLORER_USE_LEGACY_ARTIFACTS=false
-      mkdir -p $HOME $XDG_CACHE_HOME/beam_lisp $CARGO_HOME $RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH
-
-      cat > $CARGO_HOME/config.toml <<EOF
-      [source.crates-io]
-      replace-with = "vendored"
-      [source.vendored]
-      directory = "${vendorDir}"
-      [net]
-      offline = true
-      EOF
+      mkdir -p $HOME $XDG_CACHE_HOME/beam_lisp $RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH
 
       cp ${explorerNif} $RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH/libexplorer-v0.12.0-nif-2.15-x86_64-unknown-linux-gnu.so.tar.gz
       cp -r ${hexStore} $XDG_CACHE_HOME/beam_lisp/lib
@@ -127,13 +182,9 @@ let
       cd $TMPDIR/tree
       patchShebangs bin
 
-      # the launcher + pack tool; the launcher is the file the target executes
-      cargo build --release --offline --manifest-path tooling/drop/Cargo.toml
-
       # the one native the boot itself needs (see release.yml "Bootstrap the native crates")
       mkdir -p priv/native
-      cargo build --release --offline --manifest-path native/lazy_memo/Cargo.toml
-      install -m755 $CARGO_TARGET_DIR/release/liblazy_memo.so priv/native/lazy_memo.so
+      install -m755 ${natives}/lazy_memo.so priv/native/lazy_memo.so
 
       ./bin/bl deps verify
       ./bin/bl deps compile
@@ -147,8 +198,8 @@ let
       echo 7288c49a5bd6dbafd7b0b0d1f65956b91672da24b08f09242919af159be3418e > priv/z3/.fetched
 
       # the launcher the target executes: FHS loader, no store RUNPATH
-      cp $CARGO_TARGET_DIR/release/drop-launcher $TMPDIR/launcher
-      cp $CARGO_TARGET_DIR/release/drop $TMPDIR/drop
+      cp ${drop-tools}/bin/drop-launcher $TMPDIR/launcher
+      cp ${drop-tools}/bin/drop $TMPDIR/drop
       chmod u+w $TMPDIR/launcher
       patchelf --set-interpreter /lib64/ld-linux-x86-64.so.2 --remove-rpath $TMPDIR/launcher
 
@@ -178,4 +229,4 @@ let
     '';
   };
 in
-{ inherit bl-drop; }
+{ inherit bl-drop drop-tools natives; }
