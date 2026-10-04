@@ -560,3 +560,32 @@ Foundry's `pinned-host-glibc` constant to that release's glibc.
 The workstation drop (`make-drops.sh`, §11) stays the right tool for the
 operator's own machine; a drop that ships to a server comes from this build.
 
+### Lean + always working (split, gates, one command)
+
+`nix/bl-drop.nix` is three derivations, each with a `lib.fileset` source holding
+only what it reads:
+
+| derivation | src | rebuilds when |
+|---|---|---|
+| `drop-tools` (launcher + `drop` pack tool) | `tooling/drop` | the tool changes |
+| `natives` (six server NIFs) | `native/<6 crates>` + their `Cargo.lock`s | a crate changes |
+| `bl-drop` (deps, `bl build`, self-build, ELF retarget) | `bin priv env.bl bl.lock` + `tooling/drop/{src,Cargo.*}` | any `.bl` change |
+
+`bl-drop` compiles no Rust: it takes the launcher/`drop` from `drop-tools`, and a
+`cargo` shim answers `bl build`'s native stage from `natives` (real cargo for
+anything else). OTP/Elixir are separate store paths, never rebuilt by a `.bl`
+change. Measured (this host, loaded): a one-line `.bl` change on the **old**
+single derivation = 54 min buildPhase (every NIF + the launcher recompiled,
+~54 min wall total 3235 s); after the split the NIF/tool compile is skipped
+(first build of the split also had to build `natives` once).
+
+Gates (`nix flake check`, also the CI `nix-drop` job): `drop-runs` (the drop
+evaluates `(+ 1 2)` = 3) and `glibc-floor` (≤ 2.40). `tooling/drop/check-pins.sh`
+fails when this flake's nixpkgs ≠ `apps/foundry/infra/flake.lock`'s (it reads a
+sibling repo, so it is a script/CI step, not a sandboxed check).
+`nixpkgs-rust` (unstable) stays: it is the only pinned source of rustc ≥ 1.91
+without adding another input.
+
+One command: `tooling/drop/server-drop.sh` builds `.#bl-drop`, copies it to
+`~/.cache/foundry/drops/bl-nix-<sha8>.drop`, prints `path=` and `sha256=`
+(the Foundry deploy spec `:runtime {:path :sha256}`). Idempotent.
