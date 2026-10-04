@@ -645,6 +645,24 @@ pub fn tree_root(cwd: &Path, argv: &[String]) -> Option<PathBuf> {
     }
 }
 
+/// The directory holding the project's `env.bl`: the nearest one at or above `cwd`,
+/// or `None` when no `env.bl` encloses it. This is the walk the VM makes to pick a
+/// realm (`bl.env/find`), and it is NOT `resolve_root`'s: that finds an engine
+/// checkout (`priv/boot/core.bl`) and falls back to `cwd`, which for an ordinary
+/// project in a subdirectory names the wrong directory. What a project DECLARES
+/// (`:vm`) is read from where it declares it.
+pub fn project_dir(cwd: &Path) -> Option<PathBuf> {
+    let mut dir = cwd.to_path_buf();
+    loop {
+        if dir.join(PROJECT_FILE).is_file() {
+            return canonical_or(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 fn canonical_or(path: PathBuf) -> Option<PathBuf> {
     std::fs::canonicalize(&path).ok().or(Some(path))
 }
@@ -1126,6 +1144,20 @@ fn is_reject(t: &[Term], reason: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_project_is_found_by_its_env_file_from_any_subdirectory() {
+        let top = std::env::temp_dir().join(format!("drop-projdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&top);
+        let deep = top.join("a/b/c");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(top.join("a").join(PROJECT_FILE), "{:vm \"shared\"}").unwrap();
+        let want = std::fs::canonicalize(top.join("a")).unwrap();
+        assert_eq!(project_dir(&deep), Some(want.clone()), "from three levels down");
+        assert_eq!(project_dir(&top.join("a")), Some(want), "from the root itself");
+        assert_eq!(project_dir(&top), None, "above the project there is none");
+        let _ = std::fs::remove_dir_all(&top);
+    }
 
     fn unhex(s: &str) -> Vec<u8> {
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()

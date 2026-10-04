@@ -169,6 +169,18 @@ pub fn transport(root: &Path, argv: &[String]) -> Transport {
     transport_from(argv, tree_text.as_deref(), config_text.as_deref())
 }
 
+/// The transport actually used, given what the payload can do: starting a VM in the
+/// background is only offered by a payload whose VM idles out. Anything else that
+/// asked to start attaches to a running VM instead (and runs cold when there is
+/// none), so a command is never answered worse, and no VM is started that nothing
+/// would end.
+pub fn effective_transport(wanted: Transport, payload_can_start: bool) -> Transport {
+    match wanted {
+        Transport::Start if !payload_can_start => Transport::Attach,
+        other => other,
+    }
+}
+
 fn warm_spelling(v: &str) -> Option<Transport> {
     WARM_SPELLINGS.iter().find(|(s, _)| *s == v).map(|(_, t)| *t)
 }
@@ -237,6 +249,16 @@ fn words(list: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+
+    #[test]
+    fn a_payload_that_cannot_idle_out_is_never_started_in_the_background() {
+        assert_eq!(effective_transport(Transport::Start, true), Transport::Start);
+        assert_eq!(effective_transport(Transport::Start, false), Transport::Attach);
+        for t in [Transport::Cold, Transport::Attach] {
+            assert_eq!(effective_transport(t, false), t, "only Start is withheld");
+            assert_eq!(effective_transport(t, true), t);
+        }
+    }
     use std::path::{Path, PathBuf};
 
     fn a(args: &[&str]) -> Vec<String> {

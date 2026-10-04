@@ -721,24 +721,36 @@ fn names_its_build(dest: &std::path::Path) -> bool {
         })
 }
 
-/// The marker a payload carries when its VM can serve many projects: the
-/// `shared?` rule in its `vm.paths`. An older payload binds only per-tree sockets,
-/// so a project that asks to share a VM must be given its own on that payload —
-/// the shared socket name would be one nobody binds.
+/// What a payload can do is read from its own `vm` sources, the way
+/// `names_its_build` reads an older one: the launcher outlives the payloads it runs.
+const VM_SOURCE_DIR: &str = "priv/std/vm";
+/// The rule a payload carries when its VM can serve many projects. An older payload
+/// binds per-tree sockets only, so a project that asks to share must be given its own
+/// VM there: the shared socket name would be one nobody binds.
 const SHARED_VM_MARKER: &str = "(defn shared?";
+/// The file a payload carries when its warm VM leaves by itself after idling. A VM
+/// started from a payload without it would live until someone stopped it.
+const IDLE_EXIT_FILE: &str = "idle.bl";
 
-/// Whether the payload at `dest` can host a shared VM. Read from the payload's own
-/// `vm.paths` source, the same way `names_its_build` reads an older one.
-fn supports_shared_vm(dest: &std::path::Path) -> bool {
+/// The text of `priv/std/vm/<file>` in the payload at `dest`, if it has one.
+fn payload_vm_source(dest: &std::path::Path, file: &str) -> Option<String> {
     std::fs::read_dir(dest.join("lib"))
         .into_iter()
         .flatten()
         .flatten()
         .filter(|e| e.file_name().to_string_lossy().starts_with("beam_lisp-"))
-        .any(|e| {
-            std::fs::read_to_string(e.path().join("priv/std/vm/paths.bl"))
-                .is_ok_and(|t| t.contains(SHARED_VM_MARKER))
-        })
+        .find_map(|e| std::fs::read_to_string(e.path().join(VM_SOURCE_DIR).join(file)).ok())
+}
+
+/// Whether the payload at `dest` can host a shared VM.
+fn supports_shared_vm(dest: &std::path::Path) -> bool {
+    payload_vm_source(dest, "paths.bl").is_some_and(|t| t.contains(SHARED_VM_MARKER))
+}
+
+/// Whether the payload at `dest` can be started in the background without leaving a
+/// VM that never ends.
+fn supports_background_start(dest: &std::path::Path) -> bool {
+    payload_vm_source(dest, IDLE_EXIT_FILE).is_some()
 }
 
 fn exec_or_fail(mut cmd: Command, bin: &std::path::Path) -> ! {
@@ -788,10 +800,21 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
     {
         let cwd = std::env::current_dir().ok();
         let root = cwd.as_deref().and_then(|c| tree_root(c, &argv));
-        let t = root.as_deref().map(|r| transport(r, &argv)).unwrap_or(DEFAULT_TRANSPORT);
+        let t = effective_transport(
+            root.as_deref().map(|r| transport(r, &argv)).unwrap_or(DEFAULT_TRANSPORT),
+            supports_background_start(dest),
+        );
         // Read <root>/env.bl ONCE: `--share-vm`/`--own-vm` or the `:vm` declaration
         // decides the endpoint for this whole invocation (the default is own).
-        let env_bl = root.as_deref().and_then(|r| std::fs::read_to_string(r.join(PROJECT_FILE)).ok());
+        // The declaration is read from the nearest env.bl at or above where the
+        // command ran (an explicit --root names that directory instead), not from
+        // the engine-checkout root: a command typed in a subdirectory of a shared
+        // project must still see `:vm "shared"`.
+        let declared_at = match root_override(&argv) {
+            Some(r) => Some(r),
+            None => cwd.as_deref().and_then(project_dir),
+        };
+        let env_bl = declared_at.and_then(|d| std::fs::read_to_string(d.join(PROJECT_FILE)).ok());
         let shared = shared_for(&argv, env_bl.as_deref()) && supports_shared_vm(dest);
         let is_lifecycle = verb_of(&argv).as_deref().is_some_and(|v| LIFECYCLE_VERBS.contains(&v));
         // `bl realm start` is a REQUEST for a warm VM, not a command to run
@@ -864,6 +887,17 @@ mod gc_tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("paths.bl"), paths_bl).unwrap();
         d
+    }
+
+    #[test]
+    fn only_a_payload_whose_vm_idles_out_can_be_started_in_the_background() {
+        let with = payload_with_paths("idle-yes", "(defn build-id [] \"x\")\n");
+        std::fs::write(with.join("lib/beam_lisp-0.1.0/priv/std/vm/idle.bl"), "(ns vm.idle)\n").unwrap();
+        let without = payload_with_paths("idle-no", "(defn build-id [] \"x\")\n");
+        assert!(supports_background_start(&with));
+        assert!(!supports_background_start(&without), "no idle.bl: it would never end");
+        let _ = std::fs::remove_dir_all(&with);
+        let _ = std::fs::remove_dir_all(&without);
     }
 
     #[test]
