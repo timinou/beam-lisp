@@ -15,7 +15,7 @@ A namespace name is a claim on a BEAM module name. Two projects in one VM that d
 ```clojure
 {:realm  "pulse"                               ; optional alias for people
  :shadow ["datom.query.plan" "proc.server"]    ; local improvements of library namespaces
- :deps   {"lib.common" {:path "../common"
+ :uses   {"lib.common" {:path "../common"
                         :hash "sha256:…"}}}    ; shared code, by content
 ```
 
