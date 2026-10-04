@@ -940,20 +940,37 @@ Flags may appear anywhere before `--`.
 
 ## Environment variables
 
-| variable | meaning |
-|---|---|
-| `BEAM_LISP_PATH` | colon-separated extra library roots — searched after the cwd and before the shipped tiers |
-| `BEAM_LISP_CODE_PATH` | colon-separated directories of prebuilt AOT beams to add to the VM code path |
-| `BL_CACHE_DIR` | where the analysis store lives — overrides every tier, relative to the cwd; the model is unaffected, so a CI job can point the store at a scratch volume without moving the weights |
-| `BL_CACHE_MAX_MB` | the store cap in MB, default `512` |
-| `BLANALYSIS_DIR` | one explicit store directory for a single run; `BL_CACHE_DIR` wins over it |
-| `BL_VERSION` | the release CI's version stamp: it writes `env.bl`'s `:app :vsn` when a build is packed; nothing reads it at runtime |
-| `BL_USE` | the build to run here, overriding every other rule (`stable`, `latest`, `commit:SHA`, …) |
-| `BL_BUILD=never` | a missing build fails instead of being fetched or built |
-| `BL_AUTOBUILD=off` | git hooks queue no builds |
-| `BL_ALLOW_UNPUSHED_LATEST=1` | the `latest` pre-push guard lets the push through |
-| `BL_DROP_KEEP_DAYS` / `BL_DROP_GRACE_HOURS` | how long an unreferenced build is kept (14 days since last use / 24 h) |
-| `BL_BUILD_TIMEOUT_MIN` | a build step is stopped after this many minutes (45) |
+Every variable `bl` reads, once. A preference belongs in `env.bl`, `~/.config/bl/config.bl` or a flag; a variable is here only as an override, a handoff between the launcher and the VM, a test seam, or a standard one. `test/bl/env_vars_test.bl` diffs this table against what the code reads, so a variable cannot be read without being listed or listed without being read.
+
+| variable | kind | meaning |
+|---|---|---|
+| `BEAM_LISP_PATH` | override | colon-separated extra library roots, searched after the cwd and before the shipped tiers (`env.bl :paths` is the declared form) |
+| `BEAM_LISP_CODE_PATH` | override | colon-separated directories of prebuilt AOT beams to add to the VM code path |
+| `BEAM_LISP_AOT_CACHE` / `BEAM_LISP_AOT_CACHE_DIR` | override | turn the AOT cache off; move it |
+| `BEAM_LISP_AOT_REPAIR` / `BEAM_LISP_AOT_STRICT` | override | whether a stale library beam is repaired in place; whether staleness is an error |
+| `BEAM_LISP_DEV` / `BEAM_LISP_RELOAD` / `BEAM_LISP_IMAGE` | declaration | what a tree says about itself to the reloader and the image builder |
+| `BEAM_LISP_MODEL_DIR` | override | where the embedding model's weights live |
+| `BEAM_LISP_Z3` / `BEAM_LISP_Z3_FORCE` | workaround | z3 provisioning (to be fixed, then deleted) |
+| `BEAM_LISP_NIF_TRACE` | test | trace native calls |
+| `BL_USE` | override | the build to run here, overriding every other rule (`stable`, `latest`, `commit:SHA`, …) |
+| `BL_BUILD` | override | `never`: a missing build fails instead of being fetched or built |
+| `BL_AUTOBUILD` | override | `off`: git hooks queue no builds |
+| `BL_ALLOW_UNPUSHED_LATEST` | override | `1`: the `latest` pre-push guard lets the push through |
+| `BL_DROP_KEEP_DAYS` / `BL_DROP_GRACE_HOURS` | override | how long an unreferenced build is kept (14 days since last use / 24 h) |
+| `BL_BUILD_TIMEOUT_MIN` | override | a build step is stopped after this many minutes (45) |
+| `BL_INSTALL_BIN` | override | where `self-install` puts the launcher |
+| `BL_CACHE_DIR` / `BL_CACHE_MAX_MB` | override | where the analysis store lives (overrides every tier, relative to the cwd) and its cap in MB (512) |
+| `BL_CATALOG_DIR` / `BL_CATALOG_LIB` | override | the component catalog's examples and vocabulary directories (`env.bl :catalog` is the declared form) |
+| `BL_HOTPATCH` | override | hot-patching of a running VM |
+| `BL_INDEX_WORKERS` | override | how many workers the code index uses |
+| `BL_NAMES_SUFFIXES` | override | the host-name suffixes a route may claim |
+| `BL_ORACLE_SESSIONS` | override | where the oracle looks for sessions |
+| `BL_SEED_EBIN` / `BL_SEED_EBIN_FALLBACK` | override | the beam directory `bl seed` reads (`--ebin` is the flag) |
+| `BL_BIN` / `BL_ROOT` / `BL_BUILD_ID` / `BL_BOOT_REEXECED` / `BL_EBIN` | protocol | the launcher's handoff to the VM: which launcher, which tree, which build. Do not set these |
+| `BL_TEST_TIMEOUT` / `BL_TEST_TIMES` / `BL_TEST_UID` / `BL_SELFBUILD_GATE` | test | test-runner seams |
+| `BL_Z3_TIMEOUT` / `BL_Z3_READ_TIMEOUT` | override | the z3 solver's time limits |
+
+`BL_VERSION` is not here: only the release workflow sets it, to stamp `env.bl :app :vsn`; nothing reads it at run time.
 
 ## Where a namespace is found
 
