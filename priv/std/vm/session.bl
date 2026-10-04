@@ -139,6 +139,40 @@
   (erlang/send pid :stop)
   :ok)
 
+(defn- run-command
+  "Run the command of request `id` in a CHILD of this connection's process and wait
+   for it. Returns the exit code, or `:cancelled` when the client left first.
+
+   The child is what a cancel ends, so this process stays alive to run the request's
+   cleanup (the in-flight count, the heartbeat, the group leader): a process killed
+   from outside skips its `finally`. A cancel ends the command's OWN process, and with
+   it whatever it was blocked in. Processes the command started that outlive it are
+   not touched: a `serve` or a schedule is a realm member on purpose, and ending a
+   realm's members for one request's departure would stop other requests' work in a
+   shared VM."
+  [argv cwd env conn-send id]
+  (let [parent (erlang/self)
+        child (spawn
+                (fn []
+                  (let [r (try
+                            (let [_loaded (BeamLisp.Loader/ensure_loaded "bl.daemon")
+                                  handler (BeamLisp.Env/fetch! "bl.daemon" "handle-in-vm")
+                                  r (handler argv cwd env)]
+                              (if (erlang/is_integer r) r 0))
+                            (catch e
+                              (do (conn-send (wire/stderr id 999999 (str "bl: " (ex-message e) "\n"))) 1)))]
+                    (erlang/send parent [:command-done r]))))]
+    (let [mref (erlang/apply :erlang :monitor (list :process child))]
+      (receive
+        [:command-done code] (do (erlang/apply :erlang :demonitor (list mref (list :flush))) code)
+        :client_gone (do (erlang/apply :erlang :demonitor (list mref (list :flush)))
+                         (erlang/exit child :client_gone)
+                         :cancelled)
+        ; the command's process ended without answering (an exit the try did not see)
+        [:DOWN _r :process _p reason]
+        (do (conn-send (wire/stderr id 999999 (str "bl: the command ended abnormally: " (pr-str reason) "\n")))
+            1)))))
+
 (defn- dispatch-command [frame conn-send]
   ;; frame = {:request id %{argv cwd env …}}
   (let [id (elem frame 1)
@@ -146,8 +180,7 @@
         argv (to-list (:argv m))
         cwd (:cwd m)
         env (or (:env m) {})]
-    ;; run in the caller's process (this per-connection process) with a group
-    ;; leader that turns the command's stdout into :stdout frames on conn.
+    ;; the command's stdout becomes :stdout frames on conn, through a group leader
     (idle/begin!)
     (let [worker (erlang/self)
           proxy (io/start-with-send conn-send id)
@@ -155,18 +188,14 @@
           prev-gl (erlang/group_leader)]
       (erlang/group_leader proxy worker)
       (let [code (try
-                   (let [_loaded (BeamLisp.Loader/ensure_loaded "bl.daemon")
-                         handler (BeamLisp.Env/fetch! "bl.daemon" "handle-in-vm")
-                         r (handler argv cwd env)]
-                     (if (erlang/is_integer r) r 0))
-                   (catch e
-                     (do (conn-send (wire/stderr id 999999 (str "bl: " (ex-message e) "\n"))) 1))
+                   (run-command argv cwd env conn-send id)
                    (finally
                      (stop-heartbeat beat)
                      (idle/end!)
                      (erlang/group_leader prev-gl worker)))]
         (io/finish proxy)
-        (conn-send (wire/exit id code))))))
+        (when (not= :cancelled code)
+          (conn-send (wire/exit id code)))))))
 
 (defn- boot-realm-services!
   "What a daemon runs besides its socket: the manager, the sequencer, and the
