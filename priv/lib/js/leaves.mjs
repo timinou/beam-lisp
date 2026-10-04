@@ -21,6 +21,7 @@
 
 import * as R from "./rt.mjs";
 import * as C from "./core.mjs";
+import { ENV } from "./env.mjs";
 const { EMPTY, Cons, Tup, Kw, HMap, Vec, BLError } = R;
 
 const OK = R.kw("ok"), ERROR = R.kw("error");
@@ -176,6 +177,95 @@ export const LEAVES = {
   // the data-reader registry (`#tag form`): tag name → {:symbol name}
   "Elixir.BeamLisp.Ns.Rt/data_reader/1": (tag) => (DATA_READERS.has(tag) ? T(OK, DATA_READERS.get(tag)) : ERROR),
 };
+
+// ─── the compiler's leaves (priv/boot/compiler.bl, anf.bl, diag.bl) ───────────
+
+/** BeamLisp.Ns.<Camelized> for a namespace — Emit.module_for's rule (each
+    dot-segment camelized: `reader-node` → `Reader-node`, `a.b_c` → `A.BC`). */
+export function moduleFor(ns) {
+  const camel = (seg) => seg.split("_").map((p) => (p ? p[0].toUpperCase() + p.slice(1) : "")).join("");
+  return R.kw("Elixir.BeamLisp.Ns." + ns.split(".").map(camel).join("."));
+}
+// the eager collection ops the compiler runs over finite data (CompilerData)
+const eagerList = (x) => (x === null || x === undefined ? [] : C.toArray(x));
+const PDICT = new Map();
+const UNDEFINED = R.kw("undefined");
+const pkey = (k) => R.printStr(k);
+Object.assign(LEAVES, {
+  "Elixir.BeamLisp.CompilerData/eager_map/2": (f, c) => list(eagerList(c).map((x) => C.invoke(f, x))),
+  "Elixir.BeamLisp.CompilerData/eager_map/3": (f, a, b) => { const xs = eagerList(a), ys = eagerList(b), n = Math.min(xs.length, ys.length); const o = []; for (let i = 0; i < n; i++) o.push(C.invoke(f, xs[i], ys[i])); return list(o); },
+  "Elixir.BeamLisp.CompilerData/eager_filter/2": (f, c) => list(eagerList(c).filter((x) => R.truthy(C.invoke(f, x)))),
+  "Elixir.BeamLisp.CompilerData/eager_concat/1": (cs) => list(eagerList(cs).flatMap(eagerList)),
+  "Elixir.BeamLisp.CompilerData/eager_mapcat/2": (f, c) => list(eagerList(c).flatMap((x) => eagerList(C.invoke(f, x)))),
+  "Elixir.BeamLisp.CompilerData/eager_map_indexed/2": (f, c) => list(eagerList(c).map((x, i) => C.invoke(f, i, x))),
+  "Elixir.BeamLisp.CompilerData/eager_distinct/1": (c) => { const out = []; let seen = R.EMPTY_SET; for (const x of eagerList(c)) if (!seen.has(x)) { seen = seen.conj(x); out.push(x); } return list(out); },
+
+  // the process dictionary: one JS realm is one "process"
+  // erlang:get/put answer the atom `undefined` for a missing key, not nil
+  "erlang/get/1": (k) => (PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : UNDEFINED),
+  "erlang/put/2": (k, v) => { const old = PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : UNDEFINED; PDICT.set(pkey(k), v); return old; },
+  "Elixir.Process/get/2": (k, d) => (PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : d),
+  "Elixir.Process/put/2": (k, v) => { const old = PDICT.has(pkey(k)) ? PDICT.get(pkey(k)) : null; PDICT.set(pkey(k), v); return old; },
+  "Elixir.System/unique_integer/1": (() => { let n = 0; return () => ++n; })(),
+
+  // regex (the compiler compiles one pattern: the gensym name shape)
+  "Elixir.Regex/compile!/1": (src) => new RegExp(src),
+  "Elixir.Regex/run/2": (re, s) => { const m = re.exec(s); return m ? list([...m].map((g) => (g === undefined ? "" : g))) : null; },
+
+  "erlang/function_exported/3": () => false,
+  "erlang/is_number/1": (x) => R.isNumber(x),
+  "erlang/is_bitstring/1": (x) => typeof x === "string",
+  "lists/sort/2": (f, l) => list(arr(l).sort((a, b) => (R.truthy(C.invoke(f, a, b)) ? -1 : 1))),
+  "maps/filter/2": (f, m) => { let o = R.EMPTY_MAP; for (const [k, v] of m.entries()) if (R.truthy(C.invoke(f, k, v))) o = o.assoc(k, v); return o; },
+  "maps/without/2": (ks, m) => { let o = m; for (const k of arr(ks)) o = o.dissoc(k); return o; },
+
+  "Elixir.BeamLisp.Link/module_for/1": moduleFor,
+  // a JS compile never loads beams: there is nothing for settle to rebuild
+  "Elixir.BeamLisp.Link/settle/0": () => OK,
+  "Elixir.BeamLisp.Tiers/boot_namespaces/0": () => list(["anf", "compiler", "core", "diag", "lower", "optimize", "reader", "reader-node", "rt", "sugar"]),
+  "Elixir.BeamLisp.Record/record_module?/1": () => false,
+  "Elixir.BeamLisp.Record/deftype_module?/1": () => false,
+  "Elixir.BeamLisp.FormMeta/with_meta/2": (form, m) => (form && typeof form === "object" && "meta" in form ? Object.assign(Object.create(Object.getPrototypeOf(form)), form, { meta: m }) : form),
+
+  // defserver codegen tables (priv/host/server.bl, verbatim)
+  "Elixir.BeamLisp.Server/callback/1": (n) => ({ "init": T(R.kw("init"), 1, R.kw("vector")), "handle-call": T(R.kw("handle_call"), 3, R.kw("pattern")), "handle-cast": T(R.kw("handle_cast"), 2, R.kw("pattern")), "handle-info": T(R.kw("handle_info"), 2, R.kw("pattern")), "handle-continue": T(R.kw("handle_continue"), 2, R.kw("vector")), "terminate": T(R.kw("terminate"), 2, R.kw("vector")) }[n] ?? null),
+  "Elixir.BeamLisp.Server/callback_order/0": () => list(["init", "handle_call", "handle_cast", "handle_info", "handle_continue", "terminate", "code_change"].map(R.kw)),
+
+  // the loader, in a page: every namespace the page has is already loaded
+  // (built in), so probes answer from the registry and loads are no-ops
+  "Elixir.BeamLisp.Loader/ensure_loaded/1": () => OK,
+  "Elixir.BeamLisp.Loader/load_provider/1": () => OK,
+  "Elixir.BeamLisp.Loader/maybe_load_macro/2": () => null,
+  "Elixir.BeamLisp.Loader/resolvable?/1": (ns) => ENV["ns_exists?"](ns),
+  "Elixir.BeamLisp.Loader/source_decl/2": () => null,
+
+  // core/rt functions the compiler reaches by MODULE name (not linked as core
+  // globals): their BL definitions, on the JS value model
+  "Elixir.BeamLisp.Ns.Core/tuple__bl_v/1": (xs) => new Tup(arr(xs)),
+  "Elixir.BeamLisp.Ns.Core/run!/2": (f, coll) => { for (const x of C.toArray(coll)) C.invoke(f, x); return null; },
+  "Elixir.BeamLisp.Ns.Rt/call_shape_error/2": (v, arity) => "cannot call " + R.printStr(v) + " with " + arity + " argument" + (arity === 1 ? "" : "s") + " — it is not a function",
+  "Elixir.BeamLisp.Server/module_for/2": (ns, name) => {
+    const camel = (seg) => seg.split(/[-_]/).map((p) => (p ? p[0].toUpperCase() + p.slice(1) : "")).join("");
+    return R.kw("Elixir.BeamLisp.Server." + (ns + "." + name).split(".").map(camel).join("."));
+  },
+  "Elixir.BeamLisp.Server/return_constructors/0": () => R.EMPTY_MAP,
+  "Elixir.BeamLisp.Env/op_of/2": (mod, fun) => null,
+  "Elixir.BeamLisp.Env/caps_allowed?/2": (mod, op) => true,
+
+  // errors
+  "Elixir.BeamLisp.CompileError/exception/1": (opts) => { const e = new BLError(kwGet(opts, "message") ?? "compile error"); e.blData = opts; return e; },
+  "Elixir.RuntimeError/exception/1": (msg) => new BLError(typeof msg === "string" ? msg : R.printStr(msg)),
+});
+/** `[{:message m} …]` keyword-list option lookup. */
+function kwGet(opts, k) {
+  if (opts instanceof HMap) return opts.get(R.kw(k), null);
+  for (const p of arr(opts)) if (p instanceof Tup && p.items[0] === R.kw(k)) return p.items[1];
+  return null;
+}
+
+// BeamLisp.Env — the namespace/var registry (env.mjs), every function at
+// the arity the BL sources call it with
+for (const [name, fn] of Object.entries(ENV)) LEAVES["Elixir.BeamLisp.Env/" + name + "/" + fn.length] = fn;
 
 /** `#tag` → reader symbol node, registered with `registerDataReader`. */
 const DATA_READERS = new Map();
