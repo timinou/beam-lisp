@@ -133,6 +133,16 @@ worst kind of configuration bug.
   matched against.
 - `:release` — `{:name :vsn :output :permanent :include :cookie :env}`: what to
   assemble, and what must be permanent in it.
+- `:realm` — a string: the human alias of this project's realm (URLs, `bl realm`,
+  the console). Absent, the project directory's name is used.
+- `:shadow` — `["ns" …]`: library namespaces (std, lib, compat) this project
+  REPLACES within its own realm. A project file whose name a library owns is
+  refused unless the name is listed here; every other realm keeps the library's
+  version. See `docs/design/realm/namespace-ownership.md`.
+- `:uses` — `{"ns" {:path "dir" :hash "sha256:…"} …}`: source shared with other
+  projects, by content. Two projects declaring the same hash share one module;
+  different hashes cannot clash. (`:deps` is different: external libraries,
+  resolved into `bl.lock`.)
 - `:deps` — `[{:name :vsn} …]`: what this tree requires. The digests a
   resolution produced live in `bl.lock`, not here, so the declaration cannot
   disagree with itself.
@@ -156,8 +166,8 @@ per thing it could not. `normalize` collects them, so a file with three
 problems reports all three in one pass.
 
 ```beam-lisp silent
-(def known-keys [:name :instance :bl :warm :vm :paths :tasks :ports :schedules :env :doc
-                 :app :build :release :deps :browser :catalog])
+(def known-keys [:name :instance :bl :warm :vm :realm :shadow :uses :paths :tasks :ports
+                 :schedules :env :doc :app :build :release :deps :browser :catalog])
 
 ;; How `bl` reaches a warm VM for this tree. The LAUNCHER reads this key (it must
 ;; decide before any VM exists), so the vocabulary lives in
@@ -498,6 +508,76 @@ problems reports all three in one pass.
            nil)
          errs])))
 
+(def NAME-CHARS "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+(def HEX-CHARS "0123456789abcdef")
+(def HASH-PREFIX "sha256:")
+(def HASH-DIGITS 64)
+
+(defn- all-in?
+  "Whether every character of `s` is one of the characters of `allowed`."
+  [s allowed]
+  (every? (fn [c] (String/contains? allowed (str c))) (seq s)))
+
+(defn- name-ok?
+  "A URL- and file-safe name: non-empty, starts alphanumeric, then letters, digits, . _ -."
+  [v]
+  (and (string? v) (not (empty? v))
+       (all-in? v NAME-CHARS)
+       (not (String/contains? "._-" (subs v 0 1)))))
+
+(defn- hash-ok?
+  "`sha256:` followed by exactly 64 lowercase hex digits."
+  [v]
+  (and (string? v)
+       (String/starts_with? v HASH-PREFIX)
+       (= HASH-DIGITS (count (subs v (count HASH-PREFIX))))
+       (all-in? (subs v (count HASH-PREFIX)) HEX-CHARS)))
+
+(defn- norm-realm
+  "`:realm` — the realm's alias: a name safe in a URL and a file name."
+  [v]
+  (cond
+    (nil? v) [nil []]
+    (name-ok? v) [v []]
+    :else [nil [":realm must be a name of letters, digits, . _ - (starting with a letter or digit)"]]))
+
+(defn- norm-shadow
+  "`:shadow` — the library namespaces this project replaces in its realm: a vector
+   of namespace strings. That each names a namespace a library owns is checked by
+   the loader (it alone knows the tiers); here only the shape."
+  [v]
+  (cond
+    (nil? v) [[] []]
+    (not (vector? v)) [[] [":shadow must be a vector of namespace strings"]]
+    (not (every? string? v)) [[] [":shadow entries must be namespace strings"]]
+    :else [(vec (distinct v)) []]))
+
+(defn- norm-uses
+  "`:uses` — source shared with other projects, by content: a map of namespace
+   string -> {:path :hash}. The hash is what makes two projects' declarations the
+   same module, so it is required and must have its one shape."
+  [v]
+  (cond
+    (nil? v) [{} []]
+    (not (map? v)) [{} [":uses must be a map of namespace -> {:path :hash}"]]
+    :else
+      (reduce
+        (fn [acc [ns d]]
+          (let [errs (if (map? d)
+                       (concat
+                         (if (string? ns) [] [":uses keys are namespace strings"])
+                         (if (string? (:path d)) [] [(str ":uses " (pr-str ns) " needs :path, a string")])
+                         (if (hash-ok? (:hash d))
+                           []
+                           [(str ":uses " (pr-str ns) " needs :hash as sha256:<64 hex>")])
+                         (unknown-errs d [:path :hash] (str ":uses " (pr-str ns))))
+                       [(str ":uses " (pr-str ns) " must be a map")])]
+            (if (empty? errs)
+              [(assoc (nth acc 0) ns {:path (:path d) :hash (:hash d)}) (nth acc 1)]
+              [(nth acc 0) (concat (nth acc 1) errs)])))
+        [{} []]
+        v)))
+
 (defn- norm-deps
   "`:deps` — the libraries this tree requires, as a list of `{:name :vsn}`. A
    digest does not belong here: digests are what RESOLUTION produced, and they
@@ -647,6 +727,9 @@ shape, whatever the file said.
         [app aerr]     (norm-app (:app m))
         [bld berr]     (norm-build (:build m) root)
         [rel rerr]     (norm-release (:release m) root)
+        [realm rlmerr] (norm-realm (:realm m))
+        [shadow shderr] (norm-shadow (:shadow m))
+        [uses useserr] (norm-uses (:uses m))
         [deps derr]    (norm-deps (:deps m))
         [brw brerr]    (norm-browser (:browser m))
         [cat cerr]     (norm-catalog (:catalog m) root)]
@@ -657,6 +740,9 @@ shape, whatever the file said.
      :bl (if (string? blspec) blspec nil)
      :warm (if warm-ok? warmspec nil)
      :vm (if vm-ok? vmspec nil)
+     :realm realm
+     :shadow shadow
+     :uses uses
      :paths paths
      :tasks tasks
      :ports ports
@@ -668,7 +754,7 @@ shape, whatever the file said.
      :deps deps
      :browser brw
      :catalog cat
-     :errors (concat perr nerr ierr blerr werr vmerr terr porerr serr eerr aerr berr rerr derr
+     :errors (concat perr nerr ierr blerr werr vmerr rlmerr shderr useserr terr porerr serr eerr aerr berr rerr derr
                      brerr cerr
                      (map (fn [k] (str "unknown key " k)) (unknown-keys m known-keys)))}))
 
@@ -676,7 +762,8 @@ shape, whatever the file said.
   "A tree with no env.bl: a project value with nothing declared. Not a special
    case — every accessor reads it the same way it reads a declared one."
   [root]
-  {:path nil :root root :name nil :instance nil :bl nil :warm nil :vm nil :paths [] :tasks {} :ports {}
+  {:path nil :root root :name nil :instance nil :bl nil :warm nil :vm nil
+   :realm nil :shadow [] :uses {} :paths [] :tasks {} :ports {}
    :schedules []
    :env {} :app nil :build nil :release nil :deps [] :browser nil :catalog nil
    :errors []})
