@@ -29,7 +29,8 @@
 (ns connector.microsoft.graph
   (:require [connector :as conn] [connector.http :as http] [credential :as cred] [credential.flow]
             [credential.oauth2 :as oauth] [credential.flow] [credential.store :as store]
-            [connector.google.gdrive :as gdrive]))
+            [connector.google.gdrive :as gdrive]
+            [connector.acl :as acl]))
 
 (def SCOPE "https://graph.microsoft.com/.default")
 
@@ -109,18 +110,133 @@
 
 (defn item-url [base drive-id id] (str base "/drives/" drive-id "/items/" id))
 
+
+;; ── permissions → grants (docs/connectors/rights-as-relations.md §1, §6) ────
+;
+; Pure shape mapping, so a test can feed it JSON without a server.
+
+(defn- idset-grantees
+  "One sharePointIdentitySet → [grantee …], or nil when it names nothing we can
+   key (a siteUser without an Entra id, a device…). An id is the provider's own
+   unique one: Entra object ids are tenant-unique; a siteGroup id is unique only
+   WITHIN its site, hence the `<site>/<id>` namespace; a sharePointGroup id is
+   global (`global/<id>`). A set carrying BOTH `user` and `siteUser` (SharePoint
+   returns both for one person) is the user."
+  [tenant site-id s]
+  (let [u (get s "user") g (get s "group") sg (get s "siteGroup")
+        spg (get s "sharePointGroup") ap (get s "application")]
+    (cond-> []
+      (and (some? u) (some? (get u "id")))
+        (conj {:key (acl/identity-key :graph tenant :person (get u "id")) :kind :person
+               :email (get u "email") :name (get u "displayName")})
+      (and (some? g) (some? (get g "id")))
+        (conj {:key (acl/identity-key :graph tenant :group (get g "id")) :kind :group :name (get g "displayName")})
+      (and (some? sg) (some? (get sg "id")))
+        (conj {:key (acl/identity-key :graph tenant :site-group (str site-id "/" (get sg "id")))
+               :kind :group :name (get sg "displayName") :unexpandable? true})
+      (and (some? spg) (some? (get spg "id")))
+        (conj {:key (acl/identity-key :graph tenant :site-group (str "global/" (get spg "id")))
+               :kind :group :name (get spg "displayName") :unexpandable? true})
+      (and (some? ap) (some? (get ap "id")))
+        (conj {:key (acl/identity-key :graph tenant :application (get ap "id")) :kind :application
+               :name (get ap "displayName")}))))
+
+(defn- idset-names-app? [app-id s] (and (some? app-id) (= app-id (get-in s ["application" "id"]))))
+
+(defn permission-grants
+  "Graph `permission` resources → {:grants [{:grantee g :role r} …] :complete? b}.
+   `opts` {:tenant :site-id :client-id}.
+
+   A permission we cannot map (unknown link scope, a grantee with no key, a role
+   outside the table) yields a grant with a nil :role — `connector.acl/grants-tx`
+   records the ACL INCOMPLETE rather than dropping it silently. `existingAccess`
+   links name nobody new and are skipped.
+
+   :complete? — the OWNER-VIEW INFERENCE (doc §1): for an owner Graph lists every
+   permission, for a non-owner only those that apply to the caller, i.e. the
+   caller's own application permission. So a list holding ANY grant that is not
+   our own application proves we saw more than our own, hence the owner view; a
+   list of only our own permission (or an empty one) proves nothing and is
+   incomplete. Inferred from the documented rule, not yet confirmed on a real
+   tenant (doc §7 Q1). Without `:client-id` we cannot tell our grant from
+   another's → never complete."
+  [opts perms]
+  (let [tenant (:tenant opts) site (:site-id opts) app (:client-id opts)
+        own? (fn [p] (let [sets (concat [(get p "grantedToV2")] (get p "grantedToIdentitiesV2"))]
+                       (some (fn [s] (and (map? s) (idset-names-app? app s))) sets)))
+        sets-of (fn [p] (into [] (filter map? (concat [(get p "grantedToV2")] (into [] (or (get p "grantedToIdentitiesV2") []))))))
+        ->grants (fn [p]
+                   (let [role (acl/graph-role (into [] (or (get p "roles") [])))
+                         lk (get p "link")
+                         scope (if (nil? lk) nil (get lk "scope"))
+                         mk (fn [gs] (if (empty? gs) [{:grantee nil :role nil}] (mapv (fn [g] {:grantee g :role role}) gs)))
+                         aud (fn [kind] {:key (acl/identity-key :graph tenant :audience (name kind)) :kind :audience :audience kind})]
+                     (cond
+                       (= scope "existingAccess") []
+                       (= scope "organization") [{:grantee (aud :organization) :role role}]
+                       (= scope "anonymous") [{:grantee (aud :anyone) :role role}]
+                       (= scope "users") (mk (into [] (mapcat (fn [s] (idset-grantees tenant site s)) (sets-of p))))
+                       (some? lk) [{:grantee nil :role nil}]
+                       :else (mk (into [] (mapcat (fn [s] (idset-grantees tenant site s)) (sets-of p)))))))
+        perms (into [] perms)]
+    {:grants (into [] (mapcat ->grants perms))
+     :complete? (and (some? app) (boolean (some (fn [p] (not (own? p))) perms)))}))
+
+(defn permissions-url [base drive-id item-id]
+  (str base "/drives/" drive-id "/items/" item-id "/permissions"))
+
+(defn members-url [base group-id] (str base "/groups/" group-id "/transitiveMembers"))
+
+(defn- walk-values
+  "Follow @odata.nextLink from `url` → {:ok [json …]} | {:error …}."
+  [get url]
+  (loop [u url out [] hops 0]
+    (let [r (get u)]
+      (cond
+        (contains? r :error) r
+        (> hops 1000) {:error {:status 0 :body "paging did not end"}}
+        :else (let [out (into out (into [] (or (get-in r [:ok "value"]) [])))
+                    nxt (get-in r [:ok "@odata.nextLink"])]
+                (if (nil? nxt) {:ok out} (recur nxt out (+ hops 1))))))))
+
+(defn acl-fn
+  "`:acl` of the feed: `(fn [get item-key] → {:ok {:grants … :complete? b}} | {:error …})`
+   — GET …/items/{i}/permissions, paged. SharePoint returns EFFECTIVE grants
+   per item with no `inheritedFrom`, which is exactly the unit the ACL facts
+   store, so nothing is derived from a parent here."
+  [drive-id base opts]
+  (fn [get item-key]
+    (let [r (walk-values get (permissions-url base drive-id (nth item-key 2)))]
+      (if (contains? r :error) r
+        {:ok (permission-grants opts (:ok r))}))))
+
+(defn members-fn
+  "`:members` of the feed: `(fn [get group-key] → {:ok {:members [person …] :complete? b}} | {:error …})`.
+   An Entra group (`:group`) is expanded with GET /groups/{id}/transitiveMembers
+   (GroupMember.ReadBasic.All): persons only — transitive, so nested groups are
+   already flattened. A SharePoint site group cannot be expanded with
+   client-secret Graph (doc §1) → {:members [] :complete? false}, which a check
+   reads as :group-unresolved, never as 'nobody'."
+  [base tenant]
+  (fn [get group-key]
+    (if (not= :group (nth group-key 2))
+      {:ok {:members [] :complete? false}}
+      (let [r (walk-values get (members-url base (nth group-key 3)))]
+        (if (contains? r :error) r
+          {:ok {:members (into [] (keep (fn [m]
+                                          (when (= "#microsoft.graph.user" (get m "@odata.type"))
+                                            {:key (acl/identity-key :graph tenant :person (get m "id")) :kind :person
+                                             :email (or (get m "mail") (get m "userPrincipalName"))
+                                             :name (get m "displayName")}))
+                                        (:ok r)))
+                :complete? true}})))))
+
 ;; ── the feed ────────────────────────────────────────────────────────────────
 
 (defn- stale [e]
   (assoc e :resync true))
 
-(defn feed
-  "The Graph feed for ONE drive. The cursor is the FULL deltaLink URL, followed
-   verbatim: Graph's links are opaque and carry their own query state, so
-   rebuilding one from parts is how a cursor silently stops working.
-   A 410 is answered as `{:error {:status 410 :resync true …}}` — connector.keep
-   (M5) re-seeds, from the carried `:location` when Graph sent one.
-   `:enumerate` is the seed: one full tokenless delta (see below). Deleted items → {:key … :removed true}."
+(defn- base-feed
   [drive-id base]
   {:provider :graph
    :namespace drive-id
@@ -174,6 +290,23 @@
              (if (contains? r :ok) {:ok (item-map drive-id (:ok r))} r)))
    :parent-key (fn [item] (let [ps (:parents item)]
                             (if (empty? ps) nil (entity drive-id (first ps)))))})
+
+(defn feed
+  "The Graph feed for ONE drive. The cursor is the FULL deltaLink URL, followed
+   verbatim: Graph's links are opaque and carry their own query state, so
+   rebuilding one from parts is how a cursor silently stops working.
+   A 410 is answered as `{:error {:status 410 :resync true …}}` — connector.keep
+   (M5) re-seeds, from the carried `:location` when Graph sent one.
+   `:enumerate` is the seed: one full tokenless delta (see below). Deleted items → {:key … :removed true}.
+   With `opts` {:tenant t :client-id app :site-id s} the feed also carries `:acl`
+   and `:members` (see `acl-fn`, `members-fn`); without `:tenant` it has neither
+   and connector.keep writes no ACL facts."
+  ([drive-id base] (feed drive-id base nil))
+  ([drive-id base opts]
+  (cond-> (base-feed drive-id base)
+    (some? (:tenant opts))
+      (assoc :acl (acl-fn drive-id base (assoc opts :site-id (or (:site-id opts) drive-id)))
+             :members (members-fn base (:tenant opts))))))
 
 ;; ── browse: from CONFIGURED sites (search=* is not allowed on Sites.Selected) ─
 

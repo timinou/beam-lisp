@@ -32,6 +32,21 @@ closure) and commits that deltaLink as the cursor, so there is no
 renew-on-401 path with `get!` (`connector/authed!`). The fake's request log
 redacts `authorization`/`cookie`/`x-api-key` values (presence stays visible).
 
+## Permissions surface (rights-as-relations.md)
+
+`(g/feed drive base {:tenant t :client-id app :site-id s})` adds two feed fns:
+`:acl` = `GET /drives/{d}/items/{i}/permissions` (paged) mapped by
+`permission-grants` — user → person (Entra id), group → Entra group,
+siteGroup/sharePointGroup → a site-group identity marked unexpandable,
+application → application, link `organization`/`anonymous` → audience, link
+`users` → its persons, `existingAccess` → nothing; and `:members` =
+`GET /groups/{id}/transitiveMembers` (persons only; site groups → `:complete? false`).
+`:complete?` is INFERRED: true only when the list holds a grant that is not our
+own application (the owner view). With a site role of `read` the app sees only
+its own permission, so every item is `:acl-incomplete`; seeing other people's
+access needs the site grant `fullcontrol` (setup step 4). Unverified on a real
+tenant (rights doc §7 Q1).
+
 ## The fake (`connector.microsoft.fake-graph`)
 
 A `veritas.model` served with `vm/serve`: HTTP endpoints are commands with
@@ -53,6 +68,13 @@ final `*name` path segment captures the rest of the path.
 | stale cursor | `:expire-cursors` → 410 + Location + `resyncChangesApplyDifferences` |
 | download | `/content` 302 → `/_fake/blob/<token>` (60 s, no auth) |
 | throttle | `:throttle n` → next n authorised calls 429 `Retry-After: 1` |
+
+Fake permissions: per-item effective lists with inheritance computed in the
+fake (unique permissions on first share/break-inheritance), Entra groups with
+nested members, site groups, the owner-view rule keyed on the site role
+(`:grant-site [site-id role]`, default `:read`), commands `:share`, `:unshare`,
+`:break-inheritance`, `:add-member`, `:remove-member`; permission changes do
+not enter the delta log.
 
 ## Verified vs assumed
 
