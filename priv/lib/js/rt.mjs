@@ -781,3 +781,51 @@ export class Atom {
 // ─── truthiness ─────────────────────────────────────────────────────────────
 
 export function truthy(x) { return x !== null && x !== undefined && x !== false; }
+
+/** Erlang `==`: exact structure, except that numbers compare by VALUE across
+    integer and float (1 == 1.0, {1} == {1.0}). A vector is a struct (a map) and
+    never equals a list. Map KEYS still match exactly (=:=), as on the BEAM. */
+export function erlEq(a, b) {
+  if (a === b) return true;
+  // the common case in rt.bl's loops: a scalar against a keyword/nil/number
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
+    if (typeof a === "number" && typeof b === "number") return a === b;
+    if (!isNumber(a) || !isNumber(b)) return false;
+  }
+  if (isNumber(a) && isNumber(b)) return (typeof a === "bigint" || typeof b === "bigint") && !(a instanceof Flt) && !(b instanceof Flt) ? BigInt(a) === BigInt(b) : Number(numv(a)) === Number(numv(b));
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+  if (a instanceof Tup) return b instanceof Tup && a.items.length === b.items.length && a.items.every((x, i) => erlEq(x, b.items[i]));
+  if (a instanceof Cons || a === EMPTY) {
+    let p = a, q = b;
+    for (;;) {
+      if (p === EMPTY || q === EMPTY) return p === q;
+      // one side ran out of cells: equal only if both tails are the same
+      // non-cell term (an improper tail: a lazy node, a cursor)
+      if (!(p instanceof Cons) || !(q instanceof Cons)) return !(p instanceof Cons) && !(q instanceof Cons) && erlEq(p, q);
+      if (!erlEq(p.h, q.h)) return false;
+      p = p.t; q = q.t;
+    }
+  }
+  if (a instanceof Vec) return b instanceof Vec && a.cnt === b.cnt && a.toArray().every((x, i) => erlEq(x, b.nth(i)));
+  if (a instanceof HMap) { if (!(b instanceof HMap) || a.cnt !== b.cnt) return false; for (const [k, v] of a.entries()) { const w = b.get(k, NO_KEY); if (w === NO_KEY || !erlEq(v, w)) return false; } return true; }
+  return keyEq(a, b);
+}
+const NO_KEY = {};
+const numv = (x) => (x instanceof Flt ? x.v : x);
+
+// ─── BIF intrinsics (js.emit inlines `erlang/hd` & co to these, PLAN-163 U3) ─
+// Each is EXACTLY its leaf (leaves.mjs / host-leaves.mjs), badarg included:
+// the emitter calls a module function instead of a leaf-table property call.
+const bad = (what, x) => { const e = new BLError("errors were found at the given arguments: " + what + " " + printStr(x)); e.blType = kw("Elixir.ArgumentError"); throw e; };
+export function hd(l) { return l instanceof Cons ? l.h : bad("hd", l); }
+export function tl(l) { return l instanceof Cons ? l.t : bad("tl", l); }
+export function element(i, t) { return t instanceof Tup && i >= 1 && i <= t.items.length ? t.items[i - 1] : bad("element", t); }
+export function tupleSize(t) { return t instanceof Tup ? t.items.length : bad("tuple_size", t); }
+export const isList = (x) => x === EMPTY || x instanceof Cons;
+/** rt.bl's raw constructors (rt.raw): `[x | xs]` with ANY tail (a lazy node
+    stays the tail, unforced), and fixed tuples. */
+export const consRaw = (x, xs) => new Cons(x, xs);
+export const tuple2 = (a, b) => new Tup([a, b]);
+export const tuple3 = (a, b, c) => new Tup([a, b, c]);
+export const emptyList = () => EMPTY;
+export const isAtom = (x) => x instanceof Kw || x === true || x === false || x === null;

@@ -121,33 +121,20 @@ export const ERLANG = {
   "erlang/apply/3": (m, f, args) => applyMFA(m, f, arr(args)),
   // `fun M:F/A` as a value: resolved against the leaf table and the self-host
   // module table at CALL time (rt's seed captures its own exports this way)
-  "erlang/make_fun/3": (m, f, a) => { const k = (m instanceof Kw ? m.fq : String(m)) + "/" + (f instanceof Kw ? f.fq : String(f)) + "/" + a; const g = (...xs) => applyKey(k, xs); Object.defineProperty(g, "length", { value: a }); return g; },
+  // The target is resolved on the FIRST call and kept (a seeded core fn — `+`,
+  // `map` — is a make_fun capture, called in every loop); not at creation,
+  // because rt's seed captures core functions before core has loaded.
+  "erlang/make_fun/3": (m, f, a) => {
+    const k = (m instanceof Kw ? m.fq : String(m)) + "/" + (f instanceof Kw ? f.fq : String(f)) + "/" + a;
+    let target = null;
+    const g = (...xs) => (target ??= resolveKey(k))(...xs);
+    Object.defineProperty(g, "length", { value: a });
+    return g;
+  },
   "erlang/error/1": (reason) => { throw reason instanceof Error ? reason : Object.assign(new BLError(R.printStr(reason)), { data: reason }); },
   "erlang/raise/3": (_kind, reason, _stack) => { throw reason; },
 };
-/** Erlang `==`: exact structure, except that numbers compare by VALUE across
-    integer and float (1 == 1.0, {1} == {1.0}). A vector is a struct (a map) and
-    never equals a list. Map KEYS still match exactly (=:=), as on the BEAM. */
-function erlEq(a, b) {
-  if (a === b) return true;
-  if (R.isNumber(a) && R.isNumber(b)) return (typeof a === "bigint" || typeof b === "bigint") && !(a instanceof Flt) && !(b instanceof Flt) ? BigInt(a) === BigInt(b) : Number(num(a)) === Number(num(b));
-  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
-  if (a instanceof Tup) return b instanceof Tup && a.items.length === b.items.length && a.items.every((x, i) => erlEq(x, b.items[i]));
-  if (a instanceof Cons || a === EMPTY) {
-    let p = a, q = b;
-    for (;;) {
-      if (p === EMPTY || q === EMPTY) return p === q;
-      // one side ran out of cells: equal only if both tails are the same
-      // non-cell term (an improper tail: a lazy node, a cursor)
-      if (!(p instanceof Cons) || !(q instanceof Cons)) return !(p instanceof Cons) && !(q instanceof Cons) && erlEq(p, q);
-      if (!erlEq(p.h, q.h)) return false;
-      p = p.t; q = q.t;
-    }
-  }
-  if (a instanceof Vec) return b instanceof Vec && a.cnt === b.cnt && a.toArray().every((x, i) => erlEq(x, b.nth(i)));
-  if (a instanceof HMap) { if (!(b instanceof HMap) || a.cnt !== b.cnt) return false; for (const [k, v] of a.entries()) { const w = b.get(k, MISSING); if (w === MISSING || !erlEq(v, w)) return false; } return true; }
-  return R.keyEq(a, b);
-}
+const erlEq = (a, b) => R.erlEq(a, b);
 
 /** iodata → string: binaries, codepoint ints, nested lists. */
 function iolist(x) {
@@ -177,14 +164,19 @@ function applyMFA(m, f, args) {
     build (registered by module name: `Elixir.BeamLisp.Ns.Rt/first/1`). */
 const MODULES = new Map();
 export function registerModule(modName, exports) { MODULES.set(modName, exports); }
-function applyKey(k, args) {
+function applyKey(k, args) { return resolveKey(k)(...args); }
+/** The function `mod/fun/arity` names: a leaf, else a compiled namespace's
+    export (a `f__bl_v` name is the variadic clause, `.v`). */
+function resolveKey(k) {
   const fn = TABLE && TABLE[k];
-  if (fn !== undefined) return fn(...args);
-  const [mod, fun] = k.split("/");
+  if (fn !== undefined) return fn;
+  const i = k.lastIndexOf("/"), j = k.lastIndexOf("/", i - 1);
+  const mod = k.slice(0, j), fun = k.slice(j + 1, i);
   const ex = MODULES.get(mod);
   if (ex) {
-    const g = ex["d_" + mangle(fun)] ?? (fun.endsWith("__bl_v") ? ex["d_" + mangle(fun.slice(0, -6))] : undefined);
-    if (typeof g === "function") return g(...args);
+    const v = fun.endsWith("__bl_v");
+    const g = ex["d_" + mangle(v ? fun.slice(0, -6) : fun)];
+    if (typeof g === "function") return v && typeof g.v === "function" ? g.v : g;
   }
   throw new BLError("no JS implementation for " + k);
 }

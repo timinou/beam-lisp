@@ -101,24 +101,57 @@ export function force(l) {
   }
 }
 
-/** Does `v` contain `node` — through list cells, nested lazy nodes' PUBLISHED
-    values, or collections? The NIF's dependency walk, for the one cycle a
-    program can make: a node whose answer embeds itself. Pending nodes are
-    edges too (their thunk may hold the node, but a thunk is opaque — on the
-    BEAM it is walked through its captured environment; here a pending node is
-    only identity-compared). */
-function reaches(v, node) {
+/** The cycle guard, as the NIF keeps it (native/lazy_memo would_cycle): each
+    node has EDGES — the lazy nodes its published value reaches directly (the
+    walk stops AT a lazy node: that node's own edges are the graph beyond it).
+    Publishing `v` into `node` is a cycle when `node` is reachable from `v`'s
+    edges through the edge graph. Edges are found by walking `v` only down to
+    its first lazy nodes, so a long realised seq costs O(new cells) per
+    publish, not a re-walk of everything behind it. */
+function directEdges(v) {
+  // the NIF's pre-check (lazy_memo.bl dependencies): a scalar, or a proper
+  // list of scalars (a produced chunk), cannot reach a node — no walk
+  if (v === null || typeof v !== "object") return NO_EDGES;
+  if (v instanceof R.Cons) {
+    let p = v;
+    while (p instanceof R.Cons && (p.h === null || typeof p.h !== "object")) p = p.t;
+    if (p === R.EMPTY) return NO_EDGES;
+  }
+  const out = [];
   const seen = new Set();
   const stack = [v];
   while (stack.length) {
     const x = stack.pop();
     if (x === null || typeof x !== "object" || seen.has(x)) continue;
-    if (x === node) return true;
     seen.add(x);
+    if (x instanceof LazySeq) { out.push(x); continue; }
     if (x instanceof R.Cons) { stack.push(x.h, x.t); continue; }
-    if (x instanceof LazySeq) { if (x.s[0] === COMPLETED) stack.push(x.s[1]); continue; }
     if (x instanceof R.Tup) { for (const e of x.items) stack.push(e); continue; }
+    if (x instanceof R.Vec) { for (const e of x) stack.push(e); continue; }
+    if (x instanceof R.HMap) { for (const [k, w] of x.entries()) stack.push(k, w); continue; }
+    if (x instanceof R.HSet) { for (const e of x) stack.push(e); continue; }
   }
+  return out;
+}
+const NO_EDGES = [];
+/** Would publishing a value with edges `deps` into `node` close a cycle? */
+function wouldCycle(node, deps) {
+  const seen = new Set();
+  const stack = deps.slice();
+  while (stack.length) {
+    const d = stack.pop();
+    if (d === node) return true;
+    if (seen.has(d)) continue;
+    seen.add(d);
+    if (d.edges) for (const e of d.edges) stack.push(e);
+  }
+  return false;
+}
+/** Publish-time check + edge record; true when it would cycle. */
+function reaches(v, node) {
+  const deps = directEdges(v);
+  if (wouldCycle(node, deps)) return true;
+  if (deps.length) node.edges = deps;
   return false;
 }
 
