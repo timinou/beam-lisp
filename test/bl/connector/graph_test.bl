@@ -1,0 +1,267 @@
+; test/bl/connector/graph_test.bl — Microsoft Graph through the REAL connector
+; (open + access! + get-via + keep) against the SERVED fake (a veritas.model).
+; Only base URLs and credentials differ from a live run.
+
+(ns connector.graph-test
+  (:require [datom] [files] [connector :as conn] [connector.keep :as keep]
+            [connector.microsoft.graph :as g]
+            [connector.microsoft.fake-graph :as fg]
+            [credential :as cred] [credential.store :as store]
+            [veritas.model :as vm]))
+
+(files/register-under!)
+
+(defn- tmp-dir [] (str "/tmp/graph-test-" (erlang/unique_integer (list :positive))))
+
+(defn- connection [f]
+  (let [c (conn/open g/spec {:account-id "app" :client {:client-id (:client-id f) :client-secret (:client-secret f)}
+                             :store (store/store-file (tmp-dir))})
+        r (g/connect! c {:tenant (:tenant f) :login-base (:login-base f)})]
+    {:c c :connect r}))
+
+(defmacro with-fake [[f c] & body]
+  `(let [~f (fg/start! {})
+         ~c (:c (connection ~f))]
+     (try (do ~@body) (finally ((:stop ~f))))))
+
+(defn- k [id] [:graph fg/DRIVE id])
+
+(defn- keep-for [f c root]
+  (let [cn (datom/connect (keep/full-schema))]
+    {:conn cn :feed (g/feed fg/DRIVE (:graph-base f)) :get (g/get-via c) :roots (fn [_] [(k root)])}))
+
+(defn- mirrored [kp root]
+  (let [db (datom/db (:conn kp))
+        ds (into [] (datom/datoms db :avet :conn/key (k root)))]
+    (if (empty? ds) #{}
+      (into #{} (map (fn [e] (nth (:conn/key (datom/pull db [:conn/key] e)) 2))
+                     (files/descendants db (nth (first ds) 0) true))))))
+
+(defn- all-keys [kp]
+  (into #{} (map (fn [r] (nth (first r) 2))
+                 (into [] (datom/q '[:find ?k :where [?e :conn/key ?k]] (datom/db (:conn kp)))))))
+
+(deftest token-mint-and-site-and-drives
+  (with-fake [f c]
+    (let [get (g/get-via c)
+          base (:graph-base f)
+          s (g/site-by-path get base (:site-host f) (:site-path f))]
+      (is (= (:site-id f) (get-in s [:ok "id"])))
+      (is (= [fg/DRIVE] (mapv (fn [d] (get d "id")) (:ok (g/drives get base (:site-id f))))))
+      (is (cred/good? (conn/access! c)))
+      (is (= :allowed (:ok (g/probe-delta get base fg/DRIVE)))))))
+
+(deftest browse-lists-folders-first-and-pages
+  (with-fake [f c]
+    (let [r (g/browse (g/get-via c) (:graph-base f) fg/DRIVE "root")]
+      (is (= ["Benali" "Clients" "Outside" "Pleadings 2026.docx"] (mapv :name (:ok r))))
+      (is (= [true true true false] (mapv :folder? (:ok r))))
+      (is (= ["Dupont — 2026-014"] (mapv :name (:ok (g/browse (g/get-via c) (:graph-base f) fg/DRIVE "clients"))))))))
+
+(deftest seed-then-converge-through-edit-rename-move-delete
+  (with-fake [f c]
+    (let [kp (keep-for f c "dupont")]
+      (is (= :seeded (:ok (keep/step! kp))))
+      (is (= #{"engagement" "memo" "unique" "priv"} (mirrored kp "dupont")))
+      (is (not (contains? (all-keys kp) "hr")) "M1: Outside/ never mirrored")
+      (fg/do! f :edit [fg/DRIVE "memo" "# memo v2"])
+      (fg/do! f :rename [fg/DRIVE "engagement" "letter.pdf"])
+      (fg/do! f :add-file [fg/DRIVE "n" "unique" "n.md" "new"])
+      (fg/do! f :move [fg/DRIVE "notes" "dupont"])       ; moved IN from Benali
+      (fg/do! f :move [fg/DRIVE "memo" "outside"])       ; moved OUT
+      (fg/do! f :delete [fg/DRIVE "priv"])
+      (keep/step! kp)
+      (is (= (fg/visible f fg/DRIVE "dupont") (mirrored kp "dupont")))
+      (is (not (contains? (all-keys kp) "hr"))))))
+
+(deftest moving-a-folder-in-seeds-its-subtree
+  (with-fake [f c]
+    (let [kp (keep-for f c "dupont")]
+      (keep/step! kp)
+      (fg/do! f :move [fg/DRIVE "benali" "dupont"])
+      (keep/step! kp)
+      (is (contains? (mirrored kp "dupont") "notes")))))
+
+(deftest stale-cursor-resyncs-with-no-duplicates
+  (with-fake [f c]
+    (let [kp (keep-for f c "dupont")]
+      (keep/step! kp)
+      (fg/do! f :expire-cursors nil)
+      (fg/do! f :delete [fg/DRIVE "memo"])
+      (fg/do! f :add-file [fg/DRIVE "z" "dupont" "z.md" "z"])
+      (let [r (keep/step! kp)]
+        (is (= :resynced (:ok r))))
+      (is (= (fg/visible f fg/DRIVE "dupont") (mirrored kp "dupont")))
+      (is (= (count (all-keys kp)) (count (distinct (all-keys kp)))))
+      (is (= :idle (:ok (keep/step! kp))) "the fresh cursor works"))))
+
+(deftest throttle-surfaces-retry-after
+  (with-fake [f c]
+    (fg/do! f :throttle 1)
+    (let [r ((g/get-via c) (str (:graph-base f) "/drives/" fg/DRIVE "/items/root"))]
+      (is (= 429 (get-in r [:error :status])))
+      (is (= 1 (get-in r [:error :retry-after]))))
+    (is (cred/good? ((g/get-via c) (str (:graph-base f) "/drives/" fg/DRIVE "/items/root"))) "then it passes")))
+
+(deftest an-ungranted-site-is-403
+  (with-fake [f c]
+    (let [r (g/site-by-path (g/get-via c) (:graph-base f) fg/SITE-HOST "/sites/other-site")]
+      (is (= 403 (get-in r [:error :status]))))
+    (fg/do! f :revoke-site (:site-id f))
+    (is (= 403 (get-in (g/probe-delta (g/get-via c) (:graph-base f) fg/DRIVE) [:error :status])))
+    (fg/do! f :grant-site (:site-id f))
+    (is (= :allowed (:ok (g/probe-delta (g/get-via c) (:graph-base f) fg/DRIVE))))))
+
+(deftest rotated-secret-fails-as-config-error
+  (with-fake [f c]
+    (fg/do! f :rotate-secret "new-secret")
+    (fg/do! f :expire-token nil)
+    ;; our own clock still says live; the server says dead → the 401 path renews
+    (let [r ((g/get-via c) (str (:graph-base f) "/drives/" fg/DRIVE "/items/root"))]
+      (is (= :config-error (get-in r [:disposition])) "get! surfaces the renewal's disposition"))
+    (let [r (conn/renew! c)]
+      (is (contains? r :error))
+      (is (= :config-error (:disposition r))))))
+
+(deftest an-expired-token-is-renewed-on-401
+  (with-fake [f c]
+    (is (cred/good? ((g/get-via c) (str (:graph-base f) "/drives/" fg/DRIVE "/items/root"))))
+    (fg/do! f :expire-token nil)
+    (is (cred/good? ((g/get-via c) (str (:graph-base f) "/drives/" fg/DRIVE "/items/root"))) "re-minted once")))
+
+(deftest content-follows-the-302-without-the-bearer
+  (with-fake [f c]
+    (let [kp (keep-for f c "dupont")
+          _ (keep/step! kp)
+          item ((:ok ((:item (:feed kp)) (g/get-via c) (k "memo"))) :key) 
+          it (:ok ((:item (:feed kp)) (g/get-via c) (k "memo")))
+          r (g/content! c (:graph-base f) it 1000000)
+          log ((:log (:server f)))
+          blob (first (filter (fn [e] (starts-with? (:path e) "/_fake/blob/")) log))
+          content (first (filter (fn [e] (ends-with? (:path e) "/content")) log))]
+      (is (= "# memo" (:ok r)))
+      (is (some? (get (:headers content) "authorization")) "the Graph call carries the bearer")
+      (is (nil? (get (:headers blob) "authorization")) "the pre-authenticated blob call does not")
+      (is (= {:refused :folder} (g/content! c (:graph-base f) (:ok ((:item (:feed kp)) (g/get-via c) (k "unique"))) 10)))
+      (is (= {:refused :too-large} (g/content! c (:graph-base f) (assoc it :size 99) 10))))))
+
+(deftest item-map-shapes
+  (let [m (g/item-map "d" {"id" "r" "name" "Documents" "root" {} "folder" {}})]
+    (is (and (:folder? m) (empty? (:parents m)))))
+  (let [m (g/item-map "d" {"id" "x" "name" "a.pdf" "file" {"mimeType" "application/pdf"} "cTag" "c1" "eTag" "e1"
+                           "parentReference" {"id" "p"} "size" 3})]
+    (is (= [:graph "d" "x"] (:key m)))
+    (is (= "c1" (:rev m)))
+    (is (= ["p"] (:parents m))))
+  (is (:removed (g/item-map "d" {"id" "x" "deleted" {}}))))
+
+(deftest the-graph-seed-is-a-delta-enumeration-not-children-listings
+  (with-fake [f c]
+    (let [kp (keep-for f c "dupont")]
+      (is (= :seeded (:ok (keep/step! kp))))
+      (is (= #{"engagement" "memo" "unique" "priv"} (mirrored kp "dupont")))
+      (let [log ((:log (:server f)))
+            paths (map :path log)]
+        (is (empty? (filter (fn [p] (ends-with? p "/children")) paths)) "no children call on the first step")
+        (is (some? (first (filter (fn [e] (and (ends-with? (:path e) "/root/delta") (nil? (get (:query e) "token")))) log)))
+            "a tokenless delta enumerated the drive"))
+      (is (empty? (clojure.set/intersection (all-keys kp) #{"outside" "hr" "clients" "benali" "pleadings" "root"}))
+          "M1: nothing outside the root, not even names")
+      (is (= :idle (:ok (keep/step! kp))) "the enumeration's deltaLink is the cursor"))))
+
+(deftest a-410-re-enumerates-from-the-location-header
+  (with-fake [f c]
+    (let [kp (keep-for f c "dupont")]
+      (keep/step! kp)
+      (fg/do! f :expire-cursors nil)
+      (fg/do! f :delete [fg/DRIVE "memo"])
+      (let [n (count ((:log (:server f))))
+            r (keep/step! kp)
+            log (drop n ((:log (:server f))))
+            got-410 (first (filter (fn [e] (= 410 (:status e))) log))
+            after (rest (drop-while (fn [e] (not= 410 (:status e))) log))]
+        (is (= :resynced (:ok r)))
+        (is (some? got-410))
+        (is (nil? (get (:query (first after)) "token")) "the first call after the 410 is the Location: a tokenless delta")
+        (is (empty? (filter (fn [e] (ends-with? (:path e) "/children")) log)) "no children listing on resync"))
+      (is (= (fg/visible f fg/DRIVE "dupont") (mirrored kp "dupont"))))))
+
+(deftest content-renews-an-early-expired-token-and-retries
+  (with-fake [f c]
+    (let [kp (keep-for f c "dupont")
+          _ (keep/step! kp)
+          it (:ok ((:item (:feed kp)) (g/get-via c) (k "memo")))]
+      (fg/do! f :expire-token nil)
+      (is (= "# memo" (:ok (g/content! c (:graph-base f) it 1000000))) "401 on /content → renew once → retry"))))
+
+(deftest the-request-log-redacts-the-bearer
+  (with-fake [f c]
+    ((g/get-via c) (str (:graph-base f) "/drives/" fg/DRIVE "/items/root"))
+    (let [e (first (filter (fn [e] (ends-with? (:path e) "/items/root")) ((:log (:server f)))))]
+      (is (= "<redacted>" (get (:headers e) "authorization")) "presence visible, value not"))))
+
+;; ── the model: every order of world changes ─────────────────────────────────
+
+(def IDS ["f0" "f1" "f2" "f3" "d0" "d1"])
+(def PLACES ["dupont" "d0" "d1" "outside"])
+
+(defn- world []
+  (let [f (fg/start! {})
+        c (:c (connection f))]
+    {:f f :kp (keep-for f c "dupont") :ever (atom #{})}))
+
+(defn- ids-of [s] (sort (keys (:made s))))
+(defn- parent-ok [s p] (or (contains? #{"dupont" "outside"} p) (contains? (:made s) p)))
+(defn- no-cycle [s id p]
+  (let [up (fn up [x n] (cond (> n 8) false (= x id) true (nil? x) false :else (up (get (:made s) x) (+ n 1))))]
+    (not (up p 0))))
+
+(def graph-model
+  (vm/model "graph-keep"
+    {:state {:made {}}
+     :init world
+     :cleanup (fn [w] ((:stop (:f w))))
+     :commands
+     {:add {:args (vm/tuple (vm/one-of IDS) (vm/one-of PLACES))
+            :pre (fn [s [id p]] (and (not (contains? (:made s) id)) (not= id p) (parent-ok s p)
+                                     (or (starts-with? id "f") (not (contains? (:made s) id)))))
+            :next (fn [s [id p]] (assoc-in s [:made id] p))
+            :run (fn [w [id p]] (if (starts-with? id "d")
+                                  (fg/do! (:f w) :add-folder [fg/DRIVE id p id])
+                                  (fg/do! (:f w) :add-file [fg/DRIVE id p id id])))}
+      :move {:args (vm/tuple (vm/pick ids-of) (vm/one-of PLACES))
+             :pre (fn [s [id p]] (and (not= id p) (parent-ok s p) (no-cycle s id p)))
+             :next (fn [s [id p]] (assoc-in s [:made id] p))
+             :run (fn [w [id p]] (fg/do! (:f w) :move [fg/DRIVE id p]))}
+      :edit {:args (vm/pick (fn [s] (filter (fn [i] (starts-with? i "f")) (ids-of s))))
+             :run (fn [w id] (fg/do! (:f w) :edit [fg/DRIVE id (str id (erlang/unique_integer))]))}
+      :rename {:args (vm/pick ids-of)
+               :run (fn [w id] (fg/do! (:f w) :rename [fg/DRIVE id (str id "-r")]))}
+      :expire {:run (fn [w _] (fg/do! (:f w) :expire-cursors nil))}
+      :step {:run (fn [w _] (keep/step! (:kp w)))}}
+     :settle :step
+     :invariants
+     {:outside-never-mirrored
+      ;; M1: the seeded Outside/ branch and its file are never keys in the mirror,
+      ;; and every mirrored key was structurally under dupont at some point.
+      (fn [_ w]
+        (let [s ((:state (:server (:f w))))
+              under (fn [] (let [items (get-in s [:drives fg/DRIVE :items])]
+                             (loop [fr ["dupont"] out #{}]
+                               (if (empty? fr) out
+                                 (let [ks (mapcat (fn [p] (keep (fn [[id it]] (if (= p (:parent it)) id nil)) (into [] items))) fr)]
+                                   (recur (into [] ks) (into out ks)))))))]
+          (swap! (:ever w) into (under))
+          (let [ks (all-keys (:kp w))]
+            (and (not (contains? ks "hr")) (not (contains? ks "outside")) (not (contains? ks "pleadings"))
+                 (every? (fn [id] (or (= id "dupont") (contains? @(:ever w) id))) ks)))))}
+     :eventually
+     {:mirror-equals-fake
+      (fn [_ w] (= (mirrored (:kp w) "dupont") (fg/visible (:f w) fg/DRIVE "dupont")))}}))
+
+(deftest the-keep-agrees-with-the-fake-over-every-generated-history
+  (let [r (vm/check graph-model {:seed 51 :histories 100 :max-len 14 :budget-ms 600000})]
+    (when (= :refuted (:modality r))
+      (println "  shrunk:" (pr-str (:shrunk r)) "broke:" (:broke r) (:kind r) (:error r)))
+    (println (str "  model: " (:why r)))
+    (is (= :witnessed (:modality r)))))
