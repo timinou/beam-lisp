@@ -800,22 +800,24 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
     {
         let cwd = std::env::current_dir().ok();
         let root = cwd.as_deref().and_then(|c| tree_root(c, &argv));
-        let t = effective_transport(
-            root.as_deref().map(|r| transport(r, &argv)).unwrap_or(DEFAULT_TRANSPORT),
-            supports_background_start(dest),
-        );
-        // Read <root>/env.bl ONCE: `--share-vm`/`--own-vm` or the `:vm` declaration
-        // decides the endpoint for this whole invocation (the default is own).
-        // The declaration is read from the nearest env.bl at or above where the
-        // command ran (an explicit --root names that directory instead), not from
-        // the engine-checkout root: a command typed in a subdirectory of a shared
-        // project must still see `:vm "shared"`.
+        // Read the project's env.bl ONCE: `--share-vm`/`--own-vm` or the `:vm`
+        // declaration decides the endpoint for this whole invocation (the default
+        // is own). The declaration is read from the nearest env.bl at or above
+        // where the command ran (an explicit --root names that directory instead),
+        // not from the engine-checkout root: a command typed in a subdirectory of
+        // a shared project must still see `:vm "shared"`.
         let declared_at = match root_override(&argv) {
             Some(r) => Some(r),
             None => cwd.as_deref().and_then(project_dir),
         };
         let env_bl = declared_at.and_then(|d| std::fs::read_to_string(d.join(PROJECT_FILE)).ok());
         let shared = shared_for(&argv, env_bl.as_deref()) && supports_shared_vm(dest);
+        // Whether the project shares its VM decides the DEFAULT transport (an own
+        // VM attaches, a shared one starts); anything the user declared still wins.
+        let t = effective_transport(
+            root.as_deref().map(|r| transport(r, &argv, shared)).unwrap_or_else(|| default_transport(shared)),
+            supports_background_start(dest),
+        );
         let is_lifecycle = verb_of(&argv).as_deref().is_some_and(|v| LIFECYCLE_VERBS.contains(&v));
         // `bl realm start` is a REQUEST for a warm VM, not a command to run
         // inside one. Exec'd, the release parks in the foreground and dies with

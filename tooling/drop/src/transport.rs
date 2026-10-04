@@ -48,16 +48,32 @@ pub enum Transport {
     Start,
 }
 
-/// The transport when nothing says otherwise.
+/// The transport when nothing says otherwise and the project has its OWN VM.
 ///
-/// ATTACH, not `Start`, today: a warm VM belongs to ONE tree, so `Start` would
-/// conjure one VM PER DIRECTORY — more than a user asked for — until
-/// one-VM-per-user lands. Attach keeps the launcher's promise narrow: a warm VM
-/// is used when it is there, never started behind the user's back. A command
-/// still runs fine when none is running (it goes cold); `--warm` or a tree's
-/// `:warm "start"` asks for a warm VM explicitly. Flipping this default later
-/// is this ONE line.
+/// ATTACH: an own VM belongs to ONE tree, so `Start` would conjure one VM PER
+/// DIRECTORY — more than a user asked for, and each one is hundreds of MB. Attach
+/// keeps the launcher's promise narrow: a warm VM is used when it is there, never
+/// started behind the user's back. A command still runs fine when none is running
+/// (it goes cold); `--warm` or a tree's `:warm "start"` asks for a warm VM
+/// explicitly.
 pub const DEFAULT_TRANSPORT: Transport = Transport::Attach;
+
+/// The transport when nothing says otherwise and the project SHARES its build's VM.
+///
+/// START: a shared VM is one per user and build however many projects use it, so
+/// starting it behind the user's back costs one process, once, and every later
+/// command in every shared project finds it. A project that shares has already
+/// said it wants that VM.
+pub const DEFAULT_TRANSPORT_SHARED: Transport = Transport::Start;
+
+/// The default for a project, by whether it shares its VM.
+pub fn default_transport(shared: bool) -> Transport {
+    if shared {
+        DEFAULT_TRANSPORT_SHARED
+    } else {
+        DEFAULT_TRANSPORT
+    }
+}
 
 /// The declaration key: `:warm "…"` in `env.bl` or the config, read by
 /// `scan_literal` — SCANNED, never evaluated.
@@ -146,27 +162,31 @@ pub fn root_override(argv: &[String]) -> Option<PathBuf> {
 /// An unrecognised `:warm` value is skipped, so the config below it still gets
 /// its say.
 pub fn transport_from(argv: &[String], tree_text: Option<&str>, config_text: Option<&str>) -> Transport {
+    declared_transport(argv, tree_text, config_text).unwrap_or(DEFAULT_TRANSPORT)
+}
+
+/// The transport something DECLARED (a flag, the tree, the config), or `None` when
+/// nothing did and the default applies. Kept apart from `transport_from` so the
+/// default can depend on whether the project shares its VM, which the declarations
+/// cannot know.
+pub fn declared_transport(argv: &[String], tree_text: Option<&str>, config_text: Option<&str>) -> Option<Transport> {
     if flag_present(argv, COLD_FLAG) {
-        return Transport::Cold;
+        return Some(Transport::Cold);
     }
     if flag_present(argv, WARM_FLAG) {
-        return Transport::Start;
+        return Some(Transport::Start);
     }
-    for text in [tree_text, config_text] {
-        let declared = text.and_then(|t| scan_literal(t, WARM_KEY)).and_then(|v| warm_spelling(&v));
-        if let Some(t) = declared {
-            return t;
-        }
-    }
-    DEFAULT_TRANSPORT
+    [tree_text, config_text]
+        .into_iter()
+        .find_map(|text| text.and_then(|t| scan_literal(t, WARM_KEY)).and_then(|v| warm_spelling(&v)))
 }
 
 /// The transport for `root` under `argv`: the thin reader that loads the tree's
 /// `env.bl` and the config, then calls `transport_from`.
-pub fn transport(root: &Path, argv: &[String]) -> Transport {
+pub fn transport(root: &Path, argv: &[String], shared: bool) -> Transport {
     let tree_text = std::fs::read_to_string(root.join(PROJECT_FILE)).ok();
     let config_text = std::fs::read_to_string(config_path()).ok();
-    transport_from(argv, tree_text.as_deref(), config_text.as_deref())
+    declared_transport(argv, tree_text.as_deref(), config_text.as_deref()).unwrap_or_else(|| default_transport(shared))
 }
 
 /// The transport actually used, given what the payload can do: starting a VM in the
@@ -251,6 +271,22 @@ mod transport_tests {
     use super::*;
 
     #[test]
+    fn a_declaration_beats_the_default_for_a_shared_project_too() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(declared_transport(&a(&[]), None, None), None, "nothing declared: the default applies");
+        assert_eq!(declared_transport(&a(&["--cold"]), None, None), Some(Transport::Cold));
+        assert_eq!(declared_transport(&a(&[]), Some(":warm \"off\""), None), Some(Transport::Cold));
+        let own = default_transport(false);
+        let shared = default_transport(true);
+        assert_ne!(own, shared);
+        // the project said "attach": a shared project still honours it
+        assert_eq!(
+            declared_transport(&a(&[]), Some(":warm \"attach\""), None).unwrap_or(shared),
+            Transport::Attach
+        );
+    }
+
+    #[test]
     fn a_payload_that_cannot_idle_out_is_never_started_in_the_background() {
         assert_eq!(effective_transport(Transport::Start, true), Transport::Start);
         assert_eq!(effective_transport(Transport::Start, false), Transport::Attach);
@@ -285,6 +321,9 @@ mod transport_tests {
         assert_eq!(transport_from(&[], None, Some(":warm \"off\"")), Transport::Cold);
         assert_eq!(transport_from(&[], None, None), DEFAULT_TRANSPORT);
         assert_eq!(DEFAULT_TRANSPORT, Transport::Attach);
+        assert_eq!(DEFAULT_TRANSPORT_SHARED, Transport::Start);
+        assert_eq!(default_transport(false), Transport::Attach, "an own VM is never started behind your back");
+        assert_eq!(default_transport(true), Transport::Start, "a shared VM is one process, once");
     }
 
     /// Prose must not become policy: an unknown value is ignored, not obeyed.

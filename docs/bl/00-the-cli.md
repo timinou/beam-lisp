@@ -53,8 +53,11 @@ Three global flags choose the mode (they may appear anywhere before `--`):
 
 A project declares its own default in `env.bl`, and the machine in
 `~/.config/bl/config.bl`, with `:warm "off" | "attach" | "start"`. Precedence:
-flag > `env.bl` > `config.bl` > the built-in default, `attach` — use a running
-warm VM, never start one.
+flag > `env.bl` > `config.bl` > the built-in default. The default depends on
+whether the project shares its VM (below): a project with its own VM `attach`es —
+it uses a running warm VM and never starts one, because that would be a VM per
+directory — while a project that shares its build's VM `start`s it, because that is
+one process however many projects use it.
 
 ### One VM per project, or one shared
 
