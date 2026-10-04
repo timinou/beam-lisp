@@ -1,0 +1,426 @@
+; connector/microsoft/fake_graph.bl — Microsoft (Entra + Graph) as a SERVED
+; `veritas.model`: the model's state is the tenant, the HTTP endpoints are
+; commands with :request/:response, and everything a real tenant does to a
+; client over time (rename, move, delete, stale cursor, throttle, secret
+; rotation, site-grant revoke) is a non-HTTP command driven by `:inject!`
+; or by `vm/check` histories. One state machine, two drivers — no second
+; hand-written fake to drift from the model.
+;
+; Fidelity per knowledger docs/22-m365-test-tenant.md §1.3:
+;   token       client_credentials; TTL 3600 s enforced; bad secret → 401
+;               invalid_client AADSTS7000215; unknown app/tenant → 400 with
+;               AADSTS700016 / AADSTS90002
+;   least priv. every Graph call needs a Bearer THIS fake issued, for a consented
+;               app (else 401 InvalidAuthenticationToken), and a granted site
+;               (else 403 accessDenied)
+;   ids         stable across rename and move; cTag = content hash, absent on folders
+;   delta       root only; pages of `page-size` (default 2); nextLink/deltaLink
+;               are FULL urls on the fake's own host (taken from the request's
+;               Host header); `deleted` facet; moving a folder in emits the
+;               FOLDER ONLY; stale cursor → 410 + Location + code
+;               resyncChangesApplyDifferences; the drive-root item is not emitted
+;   download    /content → 302 to /_fake/blob/<token> (60 s, NO auth needed —
+;               pre-authenticated), which serves raw bytes
+;   throttle    next n authorised calls → 429 Retry-After: 1
+;
+; Not modelled: permissions endpoints, deltashowsharingchanges, multiple
+; parents, versions, large-file upload sessions.
+
+(ns connector.microsoft.fake-graph
+  (:require [veritas.model :as vm] [connector.microsoft.graph :as g]))
+
+(def TOKEN-TTL-MS 3600000)
+(def BLOB-TTL-MS 60000)
+(def ^:private SCOPE "https://graph.microsoft.com/.default")
+
+(defn- now [] (erlang/system_time :millisecond))
+(defn- err [code msg] {:error {:code code :message msg}})
+
+;; ── pure state transitions (shared by commands and the seed) ────────────────
+
+(defn- touch
+  "Log `id` as changed and bump its version (eTag). A change is reported once
+   per window with the item's CURRENT state, as Graph coalesces."
+  [d id]
+  (-> d (update :log conj id) (update :t inc)
+        (update-in [:items id :version] (fnil inc 0))))
+
+(defn- upd [s did f] (update-in s [:drives did] f))
+
+(defn add-item
+  "Add file/folder `id` under `parent` in drive `did`."
+  [s did id {:keys [parent name folder? content]}]
+  (upd s did (fn [d] (touch (assoc-in d [:items id]
+                                      {:name name :parent parent :folder? (= true folder?)
+                                       :content content :version 0 :mt (:t d)})
+                            id))))
+
+(defn edit-item [s did id content]
+  (upd s did (fn [d] (touch (-> d (assoc-in [:items id :content] content) (assoc-in [:items id :mt] (:t d))) id))))
+(defn rename-item [s did id name] (upd s did (fn [d] (touch (assoc-in d [:items id :name] name) id))))
+(defn move-item [s did id parent] (upd s did (fn [d] (touch (assoc-in d [:items id :parent] parent) id))))
+(defn delete-item [s did id] (upd s did (fn [d] (touch (assoc-in d [:items id :deleted] true) id))))
+
+(defn visible-under
+  "Ids a real drive shows under `root` in drive `did` of model state `s`
+   (transitively; deleted items and everything below them excluded) — the
+   model's truth for a keep's invariants."
+  [s did root]
+  (let [items (get-in s [:drives did :items])
+        kids (fn [p] (keep (fn [[id it]] (if (and (= p (:parent it)) (not (:deleted it))) id nil))
+                           (into [] items)))]
+    (loop [frontier [root] out #{}]
+      (if (empty? frontier) out
+        (let [ks (mapcat kids frontier)]
+          (recur (into [] ks) (into out ks)))))))
+
+;; ── json shapes ─────────────────────────────────────────────────────────────
+
+(def ^:private MIMES
+  {"pdf" "application/pdf" "md" "text/markdown" "txt" "text/plain"
+   "docx" "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+   "xlsx" "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"})
+
+(defn- mime-of [name]
+  (let [parts (String/split (or name "") ".")]
+    (get MIMES (String/downcase (last parts)) "application/octet-stream")))
+
+(defn- sha [content]
+  (String/downcase (Base/encode16 (crypto/hash :sha256 (or content "")))))
+
+(defn- iso [t]
+  (str "2026-10-04T10:" (+ 10 (rem (quot t 60) 50)) ":" (+ 10 (rem t 50)) "Z"))
+
+(defn- item-json [did id it root-id]
+  (let [content (or (:content it) "")]
+    (cond-> {"id" id "name" (:name it) "size" (erlang/byte_size content)
+             "lastModifiedDateTime" (iso (:mt it))
+             "eTag" (str "\"{" id "},v" (:version it) "\"")}
+      (= id root-id) (assoc "root" {})
+      (not= id root-id) (assoc "parentReference" {"driveId" did "id" (:parent it)})
+      (:folder? it) (assoc "folder" {"childCount" 0})
+      (not (:folder? it)) (assoc "file" {"mimeType" (mime-of (:name it))}
+                                 "cTag" (str "\"c:{" id "},h" (sha (:content it)) "\""))
+      )))
+
+(defn- deleted-json [id] {"id" id "deleted" {"state" "deleted"}})
+
+;; ── gate: every Graph call passes the same four questions, in order ─────────
+
+(defn- bearer [req]
+  (let [h (get (:headers req) "authorization")]
+    (if (and (string? h) (starts-with? h "Bearer ")) (subs h 7) nil)))
+
+(defn- authed? [s req]
+  (let [t (get (:tokens s) (bearer req))]
+    (boolean (and t (> (:exp t) (now)) (get-in s [:apps (:app t) :consented])))))
+
+(defn- site-of-drive [s did] (get-in s [:drives did :site]))
+(defn- granted? [s site-id] (= true (get-in s [:sites site-id :granted])))
+
+(defn- tick
+  "Run before every Graph call's own :next: forget the last outcome, and eat one
+   throttle if the call is authorised."
+  [s req]
+  (let [s (assoc s :last {})]
+    (if (and (pos? (:throttle s)) (authed? s req))
+      (-> s (update :throttle dec) (assoc :last {:throttled true}))
+      s)))
+
+(defn- gate
+  "The response for a Graph call: 401, 429, 403, else `(f)`."
+  [s req site-id f]
+  (cond
+    (not (authed? s req))
+      {:status 401 :headers {"WWW-Authenticate" "Bearer"}
+       :body (err "InvalidAuthenticationToken" "Access token is empty, expired, or not issued for this tenant.")}
+    (get-in s [:last :throttled])
+      {:status 429 :headers {"Retry-After" "1"} :body (err "activityLimitReached" "The request has been throttled.")}
+    (and (some? site-id) (not (granted? s site-id)))
+      {:status 403 :body (err "accessDenied" "Access denied (no grant for this site under Sites.Selected).")}
+    :else (f)))
+
+(defn- base-of [req] (str "http://" (get (:headers req) "host") "/v1.0"))
+(defn- not-found [] {:status 404 :body (err "itemNotFound" "The resource could not be found.")})
+
+(defn- drive-id [req] (get (:params req) "d"))
+(defn- root-of [s did] (get-in s [:drives did :root]))
+(defn- live-item [s did id]
+  (let [it (get-in s [:drives did :items id])] (if (or (nil? it) (:deleted it)) nil it)))
+
+;; ── delta ───────────────────────────────────────────────────────────────────
+
+(defn- token-str [epoch from off]
+  (str "e" epoch "-" from (if (nil? off) "" (str "-" off))))
+
+(defn- delta-url [req did tok]
+  (str (base-of req) "/drives/" did "/root/delta" (if (nil? tok) "" (str "?token=" tok))))
+
+(defn- delta-body [s req]
+  (let [did (drive-id req)
+        d (get-in s [:drives did])
+        root-id (:root d)
+        tok (get (:query req) "token")
+        epoch (:epoch s)
+        n (count (:log d))]
+    (if (= tok "latest")
+      {:body {"value" [] "@odata.deltaLink" (delta-url req did (token-str epoch n nil))}}
+      (let [ps (if (nil? tok) [(str "e" epoch) "0"] (String/split tok "-"))
+            tok-epoch (first ps)
+            from (String/to_integer (second ps))
+            off (if (> (count ps) 2) (String/to_integer (nth ps 2)) 0)]
+        (if (not= tok-epoch (str "e" epoch))
+          {:status 410 :headers {"Location" (delta-url req did nil)}
+           :body (err "resyncChangesApplyDifferences" "The delta token is no longer valid; re-enumerate.")}
+          (let [ids (into [] (reverse (distinct (reverse (drop from (:log d))))))
+                ids (into [] (filter (fn [id] (not= id root-id)) ids))
+                chunk (into [] (take (:page-size s) (drop off ids)))
+                more (< (+ off (:page-size s)) (count ids))
+                value (mapv (fn [id] (let [it (get-in d [:items id])]
+                                       (if (:deleted it) (deleted-json id) (item-json did id it root-id))))
+                            chunk)]
+            {:body (if more
+                     {"value" value
+                      "@odata.nextLink" (delta-url req did (token-str epoch from (+ off (:page-size s))))}
+                     {"value" value
+                      "@odata.deltaLink" (delta-url req did (token-str epoch n nil))})}))))))
+
+;; ── children (paged by nextLink) ────────────────────────────────────────────
+
+(defn- children-body [s req parent-id]
+  (let [did (drive-id req)
+        d (get-in s [:drives did])
+        kids (into [] (sort (keep (fn [[id it]] (if (and (= parent-id (:parent it)) (not (:deleted it))) id nil))
+                                  (into [] (:items d)))))
+        off (let [p (get (:query req) "skip")] (if (nil? p) 0 (String/to_integer p)))
+        chunk (into [] (take (:page-size s) (drop off kids)))
+        more (< (+ off (:page-size s)) (count kids))]
+    {:body (cond-> {"value" (mapv (fn [id] (item-json did id (get-in d [:items id]) (:root d))) chunk)}
+             more (assoc "@odata.nextLink"
+                         (str "http://" (get (:headers req) "host") (:path req) "?skip=" (+ off (:page-size s)))))}))
+
+;; ── the model ───────────────────────────────────────────────────────────────
+
+(defn- mint-tok [s app]
+  (let [tok (str "fake-token-" (:seq s))]
+    [tok (-> s (update :seq inc) (assoc-in [:tokens tok] {:app app :exp (+ (now) TOKEN-TTL-MS)}))]))
+
+(defn- token-next [s req]
+  (let [s (assoc s :last {})
+        b (or (:body req) {})
+        app (get-in s [:apps (get b "client_id")])]
+    (cond
+      (not= (:tenant s) (get (:params req) "tenant")) (assoc s :last {:oauth :unknown-tenant})
+      (nil? app) (assoc s :last {:oauth :unknown-app})
+      (not= (:secret app) (get b "client_secret")) (assoc s :last {:oauth :bad-secret})
+      (not= "client_credentials" (get b "grant_type")) (assoc s :last {:oauth :bad-grant})
+      (not= SCOPE (get b "scope")) (assoc s :last {:oauth :bad-scope})
+      :else (let [[tok s2] (mint-tok s (get b "client_id"))] (assoc s2 :last {:token tok})))))
+
+(defn- oauth-error [kind]
+  (case kind
+    :bad-secret {:status 401 :body {"error" "invalid_client" "error_codes" [7000215]
+                                    "error_description" "AADSTS7000215: Invalid client secret provided."}}
+    :unknown-app {:status 400 :body {"error" "unauthorized_client" "error_codes" [700016]
+                                     "error_description" "AADSTS700016: Application not found in the directory."}}
+    :unknown-tenant {:status 400 :body {"error" "invalid_request" "error_codes" [90002]
+                                        "error_description" "AADSTS90002: Tenant not found."}}
+    :bad-scope {:status 400 :body {"error" "invalid_scope" "error_codes" [70011]
+                                   "error_description" "AADSTS70011: The provided scope is invalid."}}
+    {:status 400 :body {"error" "unsupported_grant_type" "error_codes" [70003]
+                        "error_description" "AADSTS70003: unsupported grant type."}}))
+
+(defn- site-json [s sid]
+  (let [st (get-in s [:sites sid])]
+    {"id" sid "name" (last (String/split (:path st) "/")) "displayName" (:name st)
+     "webUrl" (str "https://" (:host st) (:path st))}))
+
+(defn- drive-json [did] {"id" did "driveType" "documentLibrary" "name" "Documents"})
+
+(defn- site-by-address [s rest]
+  (let [parts (String/split rest ":")
+        host (first parts)
+        path (String/trim_trailing (join ":" (drop 1 parts)) ":")]
+    (core/some (fn [[sid st]] (if (and (= host (:host st)) (= path (:path st))) sid nil))
+               (into [] (:sites s)))))
+
+(defn- drive-cmd
+  "A /drives/:d/... endpoint: the shared tick/gate around `body-f` (s req did)."
+  [pattern body-f]
+  {:request [:get pattern]
+   :next (fn [s req] (tick s req))
+   :response (fn [s req]
+               (let [did (drive-id req)]
+                 (if (nil? (get-in s [:drives did]))
+                   (if (authed? s req) (not-found) (gate s req nil (fn [] nil)))
+                   (gate s req (site-of-drive s did) (fn [] (body-f s req did))))))})
+
+(defn- site-cmd [pattern body-f]
+  {:request [:get pattern]
+   :next (fn [s req] (tick s req))
+   :response (fn [s req]
+               (let [sid (get (:params req) "id")]
+                 (if (nil? (get-in s [:sites sid]))
+                   (if (authed? s req) (not-found) (gate s req nil (fn [] nil)))
+                   (gate s req sid (fn [] (body-f s req sid))))))})
+
+(def commands
+  {;; ── served endpoints ───────────────────────────────────────────────────
+   :token {:request [:post "/:tenant/oauth2/v2.0/token"]
+           :next token-next
+           :response (fn [s _]
+                       (let [l (:last s)]
+                         (if (:token l)
+                           {:body {"token_type" "Bearer" "expires_in" 3600 "ext_expires_in" 3600
+                                   "access_token" (:token l)}}
+                           (oauth-error (:oauth l)))))}
+
+   ;; `*rest` also matches /sites/:id/drives — :pre keeps this to host:path forms
+   :site-by-path {:request [:get "/v1.0/sites/*rest"]
+                  :pre (fn [_ req] (String/contains? (get (:params req) "rest") ":"))
+                  :next (fn [s req] (tick s req))
+                  :response (fn [s req]
+                              (let [sid (site-by-address s (get (:params req) "rest"))]
+                                (if (nil? sid)
+                                  (if (authed? s req) (not-found) (gate s req nil (fn [] nil)))
+                                  (gate s req sid (fn [] {:body (site-json s sid)})))))}
+
+   :site-drives (site-cmd "/v1.0/sites/:id/drives"
+                          (fn [s _ sid]
+                            {:body {"value" (mapv drive-json (sort (keep (fn [[did d]] (if (= sid (:site d)) did nil))
+                                                                         (into [] (:drives s)))))}}))
+   :site-drive (site-cmd "/v1.0/sites/:id/drive"
+                         (fn [s _ sid]
+                           (let [did (first (sort (keep (fn [[did d]] (if (= sid (:site d)) did nil)) (into [] (:drives s)))))]
+                             (if (nil? did) (not-found) {:body (drive-json did)}))))
+
+   :delta (drive-cmd "/v1.0/drives/:d/root/delta" (fn [s req _] (delta-body s req)))
+   :item (drive-cmd "/v1.0/drives/:d/items/:id"
+                    (fn [s req did]
+                      (let [id (get (:params req) "id") it (live-item s did id)]
+                        (if (nil? it) (not-found) {:body (item-json did id it (root-of s did))}))))
+   :children (drive-cmd "/v1.0/drives/:d/items/:id/children"
+                        (fn [s req did]
+                          (let [id (get (:params req) "id")]
+                            (if (nil? (live-item s did id)) (not-found) (children-body s req id)))))
+   :root-children (drive-cmd "/v1.0/drives/:d/root/children"
+                             (fn [s req did] (children-body s req (root-of s did))))
+
+   ;; /content: the 302 to a pre-authenticated blob; the blob token is minted
+   ;; in :next so the state, not the response, owns it
+   :content {:request [:get "/v1.0/drives/:d/items/:id/content"]
+             :next (fn [s req]
+                     (let [s (tick s req)
+                           did (drive-id req) id (get (:params req) "id")
+                           it (live-item s did id)]
+                       (if (and (nil? (get-in s [:last :throttled])) (authed? s req) (granted? s (site-of-drive s did))
+                                (some? it) (not (:folder? it)))
+                         (let [tok (str "blob-" (:seq s))]
+                           (-> s (update :seq inc)
+                               (assoc-in [:blobs tok] {:content (or (:content it) "") :name (:name it) :exp (+ (now) BLOB-TTL-MS)})
+                               (assoc :last {:blob tok})))
+                         s)))
+             :response (fn [s req]
+                         (let [did (drive-id req)
+                               tok (get-in s [:last :blob])]
+                           (if (nil? (get-in s [:drives did]))
+                             (if (authed? s req) (not-found) (gate s req nil (fn [] nil)))
+                             (gate s req (site-of-drive s did)
+                                   (fn [] (if (nil? tok) (not-found)
+                                            {:status 302 :headers {"Location" (str "http://" (get (:headers req) "host") "/_fake/blob/" tok)}}))))))}
+
+   :blob {:request [:get "/_fake/blob/:t"]
+          :response (fn [s req]
+                      (let [b (get (:blobs s) (get (:params req) "t"))]
+                        (if (or (nil? b) (<= (:exp b) (now)))
+                          {:status 404 :body (err "itemNotFound" "blob expired")}
+                          {:raw (:content b) :content-type (mime-of (:name b))})))}
+
+   ;; ── world changes (no HTTP; :inject! or a check history) ───────────────
+   :add-file {:next (fn [s [did id parent name content]] (add-item s did id {:parent parent :name name :content content}))}
+   :add-folder {:next (fn [s [did id parent name]] (add-item s did id {:parent parent :name name :folder? true}))}
+   :edit {:next (fn [s [did id content]] (edit-item s did id content))}
+   :rename {:next (fn [s [did id name]] (rename-item s did id name))}
+   :move {:next (fn [s [did id parent]] (move-item s did id parent))}
+   ;; Deleting a folder deletes what is under it, each reported with a deleted
+   ;; facet. ASSUMED (docs/connectors/microsoft-graph.md): real Graph may report
+   ;; the folder alone; a keep that is correct for both marks descendants gone
+   ;; via the folder and tolerates the extra items.
+   :delete {:next (fn [s [did id]]
+                    (let [under (conj (visible-under s did id) id)]
+                      (reduce (fn [s2 x] (delete-item s2 did x)) s (sort under))))}
+
+   ;; ── faults and governance ───────────────────────────────────────────────
+   :expire-cursors {:next (fn [s _] (update s :epoch inc))}
+   :throttle {:next (fn [s n] (assoc s :throttle n))}
+   :rotate-secret {:next (fn [s new-secret] (assoc-in s [:apps (:client-id s) :secret] new-secret))}
+   :grant-site {:next (fn [s sid] (assoc-in s [:sites sid :granted] true))}
+   :revoke-site {:next (fn [s sid] (assoc-in s [:sites sid :granted] false))}
+   ;; every issued token is now past its TTL (a clock jump, not a deletion)
+   :expire-token {:next (fn [s _] (update s :tokens (fn [ts] (into {} (map (fn [[k v]] [k (assoc v :exp 0)]) (into [] ts))))))}})
+
+(def model
+  (vm/model "microsoft-graph" {:state {} :commands commands}))
+
+;; ── the tenant, as docs/22 §1.2 lays it out ─────────────────────────────────
+
+(def TENANT "00000000-0000-0000-0000-00000000f00d")
+(def CLIENT-ID "11111111-0000-0000-0000-00000000a000")
+(def SECRET "local-only-secret")
+(def SITE-HOST "contoso.sharepoint.com")
+(def SITE-PATH "/sites/knowledger-test")
+(def DRIVE "b!knowledger-test-documents")
+(def OTHER-DRIVE "b!other-site-documents")
+(def SITE-ID "contoso.sharepoint.com,kt-guid,kt-web")
+(def OTHER-SITE-ID "contoso.sharepoint.com,other-guid,other-web")
+
+(defn seed
+  "The docs/22 §1.2 tree. `other-site` exists but is NOT granted."
+  [opts]
+  (let [f (fn [s id parent name content] (add-item s DRIVE id {:parent parent :name name :content content}))
+        d (fn [s id parent name] (add-item s DRIVE id {:parent parent :name name :folder? true}))]
+    (-> {:tenant TENANT :client-id CLIENT-ID
+         :apps {CLIENT-ID {:secret (get opts :secret SECRET) :consented true}}
+         :sites {SITE-ID {:host SITE-HOST :path SITE-PATH :name "Knowledger Test" :granted true}
+                 OTHER-SITE-ID {:host SITE-HOST :path "/sites/other-site" :name "Other Site" :granted false}}
+         :drives {DRIVE {:site SITE-ID :root "root" :log [] :t 1000
+                         :items {"root" {:name "Documents" :parent nil :folder? true :version 0 :mt 1000}}}
+                  OTHER-DRIVE {:site OTHER-SITE-ID :root "oroot" :log [] :t 1000
+                               :items {"oroot" {:name "Documents" :parent nil :folder? true :version 0 :mt 1000}
+                                       "osecret" {:name "other.md" :parent "oroot" :content "other" :version 0 :mt 1000}}}}
+         :tokens {} :blobs {} :seq 1 :epoch 0 :throttle 0 :last {}
+         :page-size (get opts :page-size 2)}
+        (d "clients" "root" "Clients")
+        (d "dupont" "clients" "Dupont — 2026-014")
+        (f "engagement" "dupont" "engagement-letter.pdf" "%PDF engagement")
+        (f "memo" "dupont" "memo.md" "# memo")
+        (d "unique" "dupont" "Unique")
+        (f "priv" "unique" "privileged.md" "privileged")
+        (f "pleadings" "root" "Pleadings 2026.docx" "docx bytes")
+        (d "benali" "root" "Benali")
+        (f "notes" "benali" "notes.md" "notes")
+        (d "outside" "root" "Outside")
+        (f "hr" "outside" "hr-salaries.xlsx" "salaries"))))
+
+(defn start!
+  "Serve a seeded tenant on loopback. opts {:page-size 2 :secret SECRET}. →
+   {:server <vm/serve handle> :graph-base … :login-base … :tenant :client-id
+    :client-secret :site-host :site-path :drive :site-id :stop (fn [])}.
+   Everything a connector needs is in the map: `(g/endpoints {:graph-base …
+   :login-base …})` is the only place the fake differs from Microsoft."
+  [opts]
+  (let [srv (vm/serve model {:state (seed (or opts {}))})]
+    {:server srv
+     :graph-base (str (:url srv) "/v1.0")
+     :login-base (:url srv)
+     :tenant TENANT :client-id CLIENT-ID :client-secret (get opts :secret SECRET)
+     :site-host SITE-HOST :site-path SITE-PATH :drive DRIVE :site-id SITE-ID
+     :stop (:stop srv)}))
+
+(defn do!
+  "Run world/fault command `nm` on a started fake: `(do! f :rename [drive id name])`."
+  [f nm args] ((:inject! (:server f)) nm args))
+
+(defn visible
+  "visible-under on the fake's CURRENT state."
+  [f did root] (visible-under ((:state (:server f))) did root))

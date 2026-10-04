@@ -52,7 +52,7 @@ provider guarantees uniqueness in:
 
 | provider | namespace | why |
 |---|---|---|
-| Microsoft Graph files | `<tenant-id>/<drive-id>` | driveItem ids are unique within a drive |
+| Microsoft Graph files | `<drive-id>` — key `[:graph drive-id item-id]` | delta exists only per drive root, so one feed = one drive; drive ids are globally unique in Graph, so a tenant prefix adds length, not information (decided 2026-10-04, PLAN-051; replaces `<tenant-id>/<drive-id>`) |
 | Google Drive | `<customer-or-account>/<drive-id or "my">` | file ids are global in practice; the prefix keeps shared drives distinct |
 | Gmail | `<account-sub>` | the mailbox is the namespace — unchanged |
 

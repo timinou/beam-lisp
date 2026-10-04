@@ -95,7 +95,7 @@
     (is (contains? (mirrored kp "dupont") "b") "untrash clears the flag")
     (fd/delete! d "b")
     (keep/step! kp)
-    (is (true? (:file/gone (datom/pull (datom/db (:conn kp)) [:file/gone] (eid kp "b")))))))
+    (is (= true (:file/gone (datom/pull (datom/db (:conn kp)) [:file/gone] (eid kp "b")))))))
 
 (deftest m3-a-failed-page-leaves-the-cursor-where-it-was
   (let [d (fd/make {:page-size 1}) kp (keep-for d ["dupont"])]
@@ -128,6 +128,95 @@
 (deftest a-file-root-is-refused-by-name
   (let [d (tree) kp (keep-for d ["a"])]
     (is (= :root-not-a-folder (:error (keep/step! kp))))))
+
+;; ── M5: a stale cursor resyncs ─────────────────────────────────────────────
+
+(defn- stale-once
+  "A keep whose feed answers 410 to the next :changes call, then behaves."
+  [kp]
+  (let [hit (atom false) ch (:changes (:feed kp))]
+    (assoc-in kp [:feed :changes]
+              (fn [get tok] (if @hit (ch get tok)
+                              (do (reset! hit true) {:error {:status 410 :resync true}}))))))
+
+(deftest m5-a-stale-cursor-reseeds-without-duplicates-and-marks-the-vanished
+  (let [d (tree) kp (keep-for d ["dupont"])]
+    (keep/step! kp)
+    (fd/delete! d "a")
+    (fd/add! d "n" {:name "n.md" :parent "sub" :content "new"})
+    (let [r (keep/step! (stale-once kp))
+          gone? (fn [id] (= true (:file/gone (datom/pull (datom/db (:conn kp)) [:file/gone] (eid kp id)))))]
+      (is (= :resynced (:ok r)))
+      (is (= #{"sub" "b" "n"} (mirrored kp "dupont")) "n arrived, a is no longer live")
+      (is (gone? "a") "vanished item is a fact, not a deletion")
+      (is (some? (keep/cursor (datom/db (:conn kp)) (:feed kp))) "fresh cursor committed")
+      (is (= (count (all-keys kp)) (count (distinct (all-keys kp)))))
+      (is (empty? (clojure.set/intersection (all-keys kp) #{"hr" "salaries" "clients"})) "M1 holds through a resync"))))
+
+(defn- gone-in? [kp id] (= true (:file/gone (datom/pull (datom/db (:conn kp)) [:file/gone] (eid kp id)))))
+
+(defn- stale-while
+  "A keep whose :changes answers 410 while `flag` holds, and whose start token
+   fails once while `fail-start` holds."
+  [kp flag fail-start]
+  (let [ch (:changes (:feed kp)) st (:start-token (:feed kp))]
+    (-> kp
+        (assoc-in [:feed :changes] (fn [get tok] (if @flag {:error {:status 410 :resync true}} (ch get tok))))
+        (assoc-in [:feed :start-token] (fn [get] (if @fail-start {:error {:status 429 :body "throttled"}} (st get)))))))
+
+(deftest a-failed-resync-keeps-the-stale-cursor-so-the-gone-marking-is-not-lost
+  (let [d (tree) kp (keep-for d ["dupont"])
+        flag (atom false) fail-start (atom false)
+        kp2 (stale-while kp flag fail-start)]
+    (keep/step! kp2)
+    (fd/delete! d "a")
+    (reset! flag true) (reset! fail-start true)
+    (is (contains? (keep/step! kp2) :error) "410, then the resync's start token is throttled")
+    (is (some? (keep/cursor (datom/db (:conn kp)) (:feed kp))) "the stale cursor is still there")
+    (reset! fail-start false)
+    (is (= :resynced (:ok (keep/step! kp2))) "the next step re-enters M5, not the no-cursor path")
+    (is (gone-in? kp "a") "the vanished item is marked gone")))
+
+(deftest an-item-marked-gone-by-a-resync-is-live-again-when-it-comes-back
+  (let [d (tree) kp (keep-for d ["dupont"])]
+    (keep/step! kp)
+    (fd/move! d "a" "hr")                         ; out during the "outage"
+    (keep/step! (stale-once kp))                   ; resync: a is no longer listed → gone
+    (is (gone-in? kp "a"))
+    (fd/move! d "a" "dupont")                      ; and back
+    (keep/step! kp)
+    (is (not (gone-in? kp "a")) "a page that lists it live clears :file/gone")
+    (is (contains? (mirrored kp "dupont") "a"))))
+
+(deftest a-reseed-that-lists-an-item-again-clears-gone
+  (let [d (tree) kp (keep-for d ["dupont"])]
+    (keep/step! kp)
+    (fd/move! d "a" "hr")
+    (keep/step! (stale-once kp))
+    (is (gone-in? kp "a"))
+    (fd/move! d "a" "dupont")
+    (keep/step! (stale-once kp))                   ; a second resync re-seeds it
+    (is (not (gone-in? kp "a")))
+    (is (contains? (mirrored kp "dupont") "a"))))
+
+(defn- with-page
+  "A keep whose next :changes page is exactly `items` (then the real feed)."
+  [kp items]
+  (let [hit (atom false) ch (:changes (:feed kp))]
+    (assoc-in kp [:feed :changes]
+              (fn [get tok] (if @hit (ch get tok)
+                              (do (reset! hit true) {:ok {:items items :next nil :cursor tok}}))))))
+
+(deftest within-a-page-the-last-report-of-an-item-wins
+  (let [d (tree) kp (keep-for d ["dupont"])
+        live (fn [id] (:ok ((:item (:feed kp)) (:get kp) (k id))))]
+    (keep/step! kp)
+    ;; [live new, removed new]: never mirrored
+    (keep/step! (with-page kp [(assoc (live "a") :key (k "new") :name "new" :parents ["dupont"]) {:key (k "new") :removed true}]))
+    (is (not (contains? (all-keys kp) "new")) "removed last → not written")
+    ;; [removed a, live a]: stays live
+    (keep/step! (with-page kp [{:key (k "a") :removed true} (live "a")]))
+    (is (not (gone-in? kp "a")) "live last → not gone")))
 
 ;; ── the model: every order of edits ─────────────────────────────────────────
 ;; The real system: a fake drive + a keep over root "r". The invariant after a
