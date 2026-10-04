@@ -145,7 +145,20 @@ no engine change — `inject` takes any clause vector, and `rls`'s own docstring
 just more clauses"*):
 
 ```clojure
-(defn account-filter
+;; hygienic form: a filter is (fn [query] clauses); names come from rls/fresh
+(defn account-filter [row-var principal]
+  (fn [query]
+    (let [[a acct] (rls/fresh query ['?a '?acct])]
+      [[a :conn/principal principal] [a :conn/account-id acct]
+       [row-var :conn/account-id acct]])))
+;; (auth/guard all-mail [(account-filter '?m principal)])
+
+;; scoping by ANY relation, through a join path (docs: auth.rls ns doc):
+;;   (rls/scope q {:var '?c :via [:chunk/src :src/origin]
+;;                 :allow {:clauses [[principal :~acl/source-reads '?key]]}})
+;;   (rls/scope-all q {:attrs {:chunk/text {:path [...]}} :allow {...}})  ; auto, fail-closed
+;; Measured: the relation clause is the fast path (≈1.2× unscoped); see rls_bench_test.bl.
+(defn account-filter-legacy
   "Clauses scoping `row-var` to the accounts `principal` may read. MEMBERSHIP, not
    equality — so it scales to N accounts with ONE join and no clause enumeration."
   [row-var principal]
@@ -154,7 +167,7 @@ just more clauses"*):
    [row-var :conn/account-id '?acct]])
 ```
 
-**2 · Hygienic variables.** A filter that binds `?acct` will silently **join** to the
+**2 · Hygienic variables (done: `rls/fresh`, FUP-121).** A filter that binds `?acct` will silently **join** to the
 caller's `?acct` if the caller happened to write one. It can never widen the answer —
 monotonicity holds — but it can *narrow the caller's own query*, which is a confusing
 bug rather than a breach. So the filter builder parses the query, collects its

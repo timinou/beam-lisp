@@ -1,0 +1,436 @@
+; test/bl/connector/acl_test.bl — source ACLs as facts + the two derived relations
+; (docs/connectors/rights-as-relations.md). Unit level here; Graph/Drive through
+; the served fakes and the model check are appended below.
+
+(ns connector.acl-test
+  (:require [datom] [files] [connector.acl :as acl] [connector.keep :as keep]
+            [datom.query.relation :as rel]
+            [connector :as conn] [connector.microsoft.graph :as g] [connector.microsoft.fake-graph :as fg]
+            [connector.google.gdrive :as gdrive] [connector.google.fake-drive :as fd]
+            [credential.store :as store] [veritas.model :as vm]))
+
+(files/register-under!)
+
+;; NO call to a registration fn: the relations must already be there. In an AOT
+;; build a bare top-level register call is gone; `defrelation` is a value def.
+(deftest relations-are-registered-without-any-registration-call
+  (is (rel/computed? :~ident/member-of))
+  (is (rel/computed? :~acl/source-reads))
+  (is (= #{:member/of :member/is} (get (rel/relation :~ident/member-of) :reads)))
+  (is (contains? (get (rel/relation :~acl/source-reads) :reads) :acl/grantee))
+  ;; defrelation expands to a private VALUE def (`__relation__ident__member-of`), the form an AOT
+  ;; image replays; this fresh test calls no registration fn, so what it sees was registered by load.
+  (is (= :derived (get (rel/relation :~acl/source-reads) :extension))))
+
+(deftest role-normalisation
+  (is (= :read (acl/graph-role "read")))
+  (is (= :write (acl/graph-role "write")))
+  (is (= :owner (acl/graph-role "owner")))
+  (is (= :owner (acl/graph-role "fullcontrol")))
+  (is (= :owner (acl/graph-role ["read" "owner"])) "strongest wins")
+  (is (nil? (acl/graph-role "weird")) "unmapped is nil, not read")
+  (is (= :read (acl/drive-role "reader")))
+  (is (= :read (acl/drive-role "commenter")))
+  (is (= :write (acl/drive-role "writer")))
+  (is (= :write (acl/drive-role "fileOrganizer")))
+  (is (= :owner (acl/drive-role "owner")))
+  (is (= :owner (acl/drive-role "organizer")))
+  (is (nil? (acl/drive-role "nope"))))
+
+;; ── a tiny hand-built world ─────────────────────────────────────────────────
+
+(def T "tenant-1")
+(defn- person [id & [email]] {:key (acl/identity-key :graph T :person id) :kind :person :email email})
+(defn- group [id] {:key (acl/identity-key :graph T :group id) :kind :group})
+(defn- aud [kind & [domain]]
+  {:key (acl/identity-key :graph T :audience (if (= kind :domain) domain (name kind)))
+   :kind :audience :audience kind :domain domain})
+(defn- ik [m] (:key m))
+
+(defn- item [c id]
+  (datom/transact! c [{:db/id -1 :conn/key [:graph "d" id] :file/name id}])
+  [:graph "d" id])
+
+(defn- world [] (datom/connect (into (into [] (keep/full-schema)) acl/schema)))
+
+(defn- eid [c k] (first (first (into [] (datom/q '[:find ?e :in $ ?k :where [?e :conn/key ?k]] (datom/db c) k)))))
+(defn- put-grants! [c ik grants complete? as-of]
+  (let [db (datom/db c)]
+    (datom/transact! c (acl/grants-tx db ik (eid c ik) grants complete? as-of))))
+(defn- put-members! [c g members complete? as-of]
+  (datom/transact! c (acl/members-tx (datom/db c) (ik g) members complete? as-of)))
+
+(defn- eid* [c k] (first (first (into [] (datom/q '[:find ?e :in $ ?k :where [?e :ident/key ?k]] (datom/db c) k)))))
+
+(defn- readers [c it]
+  (into #{} (map (fn [r] (nth (first (into [] (datom/q '[:find ?k :in $ ?e :where [?e :ident/key ?k]] (datom/db c) (first r)))) 0))
+                 (into [] (datom/q '[:find ?w :in $ ?i :where [?w :~acl/source-reads ?i]] (datom/db c) (eid c it))))))
+
+(defn- reads-of [c who]
+  (into #{} (map (fn [r] (nth (first (first (into [] (datom/q '[:find ?k :in $ ?e :where [?e :conn/key ?k]] (datom/db c) (first r))))) 2))
+                 (into [] (datom/q '[:find ?i :in $ ?w :where [?w :~acl/source-reads ?i]] (datom/db c) (eid* c who))))))
+
+(def AMINA (person "amina" "Amina@Contoso.com"))
+(def YOUSSEF (person "youssef" "y@contoso.com"))
+(def OUTSIDER {:key (acl/identity-key :graph "tenant-2" :person "ext") :kind :person :email "ext@other.org"})
+
+(deftest direct-grant-and-revocation-by-resync
+  (let [c (world) f (item c "f")]
+    (put-grants! c f [{:grantee AMINA :role :read}] true 1)
+    (put-members! c (group "none") [] true 1)
+    (is (= #{(ik AMINA)} (readers c f)))
+    (is (= :yes (acl/reads-verdict (datom/db c) (ik AMINA) f)))
+    (is (= :no (acl/reads-verdict (datom/db c) (ik YOUSSEF) f)))
+    ;; re-sync with Youssef instead of Amina: the revoked share DISAPPEARS
+    (put-grants! c f [{:grantee YOUSSEF :role :write}] true 2)
+    (is (= #{(ik YOUSSEF)} (readers c f)))
+    (is (= :no (acl/reads-verdict (datom/db c) (ik AMINA) f)))
+    (put-grants! c f [{:grantee YOUSSEF :role :write}] true 3)
+    (is (= 1 (count (into [] (datom/q '[:find ?a :where [?a :acl/key]] (datom/db c))))) "re-sync upserts, never duplicates")))
+
+(deftest groups-nested-and-cycles
+  (let [c (world) f (item c "f")
+        g1 (group "g1") g2 (group "g2")]
+    (put-members! c g1 [AMINA g2] true 1)
+    (put-members! c g2 [YOUSSEF g1] true 1)       ; a cycle g1 ↔ g2
+    (put-grants! c f [{:grantee g2 :role :read}] true 1)
+    (is (= #{(ik AMINA) (ik YOUSSEF) (ik g1) (ik g2)} (readers c f)) "nested + cycle terminate")
+    (is (= :yes (acl/reads-verdict (datom/db c) (ik AMINA) f)) "identity-bound direction: Amina → g1 → g2 (nested, via a cycle)")
+    (is (= #{"f"} (reads-of c (ik AMINA))))
+    (let [rows (into #{} (map first (datom/q '[:find ?g :in $ ?m :where [?m :~ident/member-of ?g]]
+                                             (datom/db c) (eid* c (ik YOUSSEF)))))]
+      (is (= 2 (count rows)) "Youssef is in g2 and, through it, g1"))
+    (put-members! c g2 [] true 2)
+    (is (= #{(ik g2)} (readers c f)) "g2 emptied: only the group itself; Amina was only in g1")))
+
+(deftest audiences-organization-anyone-domain
+  (let [c (world) f1 (item c "org") f2 (item c "any") f3 (item c "dom") f4 (item c "none")]
+    (put-members! c (group "x") [AMINA YOUSSEF OUTSIDER] true 1)   ; make the persons exist
+    (put-grants! c f1 [{:grantee (aud :organization) :role :read}] true 1)
+    (put-grants! c f2 [{:grantee (aud :anyone) :role :read}] true 1)
+    (put-grants! c f3 [{:grantee (aud :domain "contoso.com") :role :read}] true 1)
+    (put-grants! c f4 [] true 1)
+    (is (= #{(ik AMINA) (ik YOUSSEF)} (into #{} (filter (fn [k] (contains? (readers c f1) k)) [(ik AMINA) (ik YOUSSEF) (ik OUTSIDER)])))
+        "organization = same tenant: the tenant-2 outsider is not covered")
+    (is (contains? (readers c f2) (ik OUTSIDER)) "anyone covers every person")
+    (is (= #{(ik AMINA) (ik YOUSSEF)}
+           (into #{} (filter (fn [k] (= :person (nth k 2))) (readers c f3))))
+        "domain contoso.com covers by email domain, case-insensitively; ext@other.org is not covered")
+    (is (= #{} (readers c f4)))
+    (is (= :yes (acl/reads-verdict (datom/db c) (ik OUTSIDER) f2)))
+    (is (= :no (acl/reads-verdict (datom/db c) (ik OUTSIDER) f3)))
+    ;; a person from ANOTHER tenant is not covered by this tenant's organization audience
+    (let [foreign (acl/identity-key :graph "tenant-2" :person "z")]
+      (is (= :no (acl/reads-verdict (datom/db c) foreign f1)))
+      (is (= :yes (acl/reads-verdict (datom/db c) foreign f2))))))
+
+(deftest link-users-are-direct-grants-and-existing-access-grants-nothing
+  (let [c (world) f (item c "f")]
+    ;; the feed turns scope=users links into per-person grants and drops existingAccess; the
+    ;; model sees only the resulting grants
+    (put-grants! c f [{:grantee AMINA :role :read} {:grantee AMINA :role :write}] true 1)
+    (is (= #{(ik AMINA)} (readers c f)))
+    (is (= 1 (count (into [] (datom/q '[:find ?a :where [?a :acl/role :write]] (datom/db c))))) "same grantee twice → one grant, strongest role")))
+
+(deftest unknown-reasons-each-produced
+  (let [c (world) none (item c "none") part (item c "part") grp (item c "grp") old (item c "old")
+        g (assoc (group "site") :unexpandable? true)]
+    (put-grants! c part [{:grantee AMINA :role :read}] false 5)
+    (put-grants! c grp [{:grantee g :role :read}] true 5)
+    (put-grants! c old [{:grantee AMINA :role :read}] true 1)
+    (let [db (datom/db c)]
+      (is (= {:unknown :no-acl-data} (acl/reads-verdict db (ik AMINA) none)))
+      (is (= {:unknown :no-acl-data} (acl/reads-verdict db (ik AMINA) [:graph "d" "never-mirrored"])))
+      (is (= :yes (acl/reads-verdict db (ik AMINA) part)) "a definite grant stays a yes on an incomplete list")
+      (is (= {:unknown :acl-incomplete} (acl/reads-verdict db (ik YOUSSEF) part)))
+      (is (= {:unknown :group-unresolved} (acl/reads-verdict db (ik YOUSSEF) grp)) "grantee group never expanded")
+      (is (= {:unknown :stale} (acl/reads-verdict db (ik AMINA) old {:max-age-ms 10 :now 100})))
+      (is (= :yes (acl/reads-verdict db (ik AMINA) old {:max-age-ms 1000 :now 100}))))
+    ;; expanded but PARTIAL → still unresolved; expanded completely → decided
+    (put-members! c g [AMINA] false 6)
+    (is (= {:unknown :group-unresolved} (acl/reads-verdict (datom/db c) (ik YOUSSEF) grp)))
+    (is (= :yes (acl/reads-verdict (datom/db c) (ik AMINA) grp)) "…but Amina is a listed member: yes")
+    (put-members! c g [AMINA] true 7)
+    (is (= :no (acl/reads-verdict (datom/db c) (ik YOUSSEF) grp)))))
+
+(deftest coverage-within-exceeds-unknown
+  (let [c (world) a (item c "a") b (item c "b") u (item c "u")]
+    (put-grants! c a [{:grantee AMINA :role :read} {:grantee YOUSSEF :role :read}] true 1)
+    (put-grants! c b [{:grantee AMINA :role :read}] true 1)
+    (let [r (acl/coverage (datom/db c) [(ik AMINA) (ik YOUSSEF)] [a b] {})]
+      (is (= #{(ik AMINA)} (:within r)))
+      (is (= {(ik YOUSSEF) #{b}} (:exceeds r)))
+      (is (= {} (:unknown r))))
+    (let [r (acl/coverage (datom/db c) [(ik AMINA) (ik YOUSSEF)] [a b u] {})]
+      (is (= #{} (:within r)) "an unknown item makes nobody 'within'")
+      (is (= {(ik AMINA) {u :no-acl-data} (ik YOUSSEF) {u :no-acl-data}} (:unknown r)))
+      (is (= {(ik YOUSSEF) #{b}} (:exceeds r))))))
+
+;; ═══ Graph through the SERVED fake, the real connector and the keep ═════════
+
+(defn- tmp-dir [] (str "/tmp/acl-test-" (erlang/unique_integer (list :positive))))
+
+(defn- gk [id] [:graph fg/DRIVE id])
+(defn- gperson [uid] (acl/identity-key :graph fg/TENANT :person uid))
+
+(defmacro with-graph [[f kp] opts & body]
+  `(let [~f (fg/start! {})
+         c# (conn/open g/spec {:account-id "app" :client {:client-id (:client-id ~f) :client-secret (:client-secret ~f)}
+                               :store (store/store-file (tmp-dir))})
+         _# (g/connect! c# {:tenant (:tenant ~f) :login-base (:login-base ~f)})
+         ~kp {:conn (datom/connect (into (into [] (keep/full-schema {:acl? true})) []))
+              :acl? true
+              :feed (g/feed fg/DRIVE (:graph-base ~f) {:tenant fg/TENANT :client-id fg/CLIENT-ID :site-id fg/SITE-ID})
+              :get (g/get-via c#) :roots (fn [_] [(gk (or (get ~opts :root) "dupont"))])}]
+     (try (do ~@body) (finally ((:stop ~f))))))
+
+(defn- acl-keys [kp]
+  (into #{} (map (fn [r] (nth (first r) 2)) (into [] (datom/q '[:find ?k :where [?a :acl/item ?e] [?e :conn/key ?k]] (datom/db (:conn kp)))))))
+
+(defn- verdicts [kp who items] (into {} (map (fn [i] [i (acl/reads-verdict (datom/db (:conn kp)) who (gk i))]) items)))
+
+(deftest graph-app-read-role-sees-only-itself-so-everything-is-unknown
+  (with-graph [f kp] {}
+    (keep/step! kp)
+    (let [vs (verdicts kp (gperson "u-amina") ["dupont" "engagement" "memo" "unique" "priv"])]
+      (is (= {:unknown :acl-incomplete} (get vs "priv")))
+      (is (every? (fn [v] (= {:unknown :acl-incomplete} v)) (vals vs))
+          "owner-view rule: with a :read site role nothing is complete → nothing is a yes or a no"))
+    (let [vis (fg/visible-perms ((:state (:server f))) fg/DRIVE "priv")]
+      (is (= ["app-site-grant"] (mapv :id vis)) "the fake enforced the rule: only the app's own permission is listed"))))
+
+(deftest graph-fullcontrol-shows-the-private-file-exceeds
+  (with-graph [f kp] {}
+    (fg/do! f :grant-site [fg/SITE-ID :fullcontrol])
+    (fg/do! f :break-inheritance [fg/DRIVE "priv" false])
+    (fg/do! f :share [fg/DRIVE "priv" {:type :user :id "u-amina"} "read"])
+    (keep/step! kp)
+    (let [db (datom/db (:conn kp))
+          cov (acl/coverage db [(gperson "u-amina") (gperson "u-youssef")] [(gk "priv")] {})]
+      (is (= #{(gperson "u-amina")} (:within cov)))
+      (is (= {(gperson "u-youssef") #{(gk "priv")}} (:exceeds cov)) "Youssef reads the library but NOT the privileged file")
+      (is (= {} (:unknown cov))))
+    ;; the rest of the library inherits the root grant: Everyone = lawyers (Amina) + Youssef
+    (is (= :yes (acl/reads-verdict (datom/db (:conn kp)) (gperson "u-youssef") (gk "memo"))))
+    (is (= :yes (acl/reads-verdict (datom/db (:conn kp)) (gperson "u-amina") (gk "memo"))) "Amina through nested group lawyers ⊂ all")
+    (is (= :no (acl/reads-verdict (datom/db (:conn kp)) (gperson "u-omar") (gk "memo"))) "Omar is in no group")))
+
+(deftest graph-site-groups-are-unresolved-and-entra-groups-are-expanded
+  (with-graph [f kp] {}
+    (fg/do! f :grant-site [fg/SITE-ID :fullcontrol])
+    (fg/do! f :share [fg/DRIVE "memo" {:type :site-group :id "7"} "write"])
+    (keep/step! kp)
+    (let [db (datom/db (:conn kp))]
+      ;; Entra group g-all was expanded transitively (Amina via g-lawyers)
+      (is (= :yes (acl/reads-verdict db (gperson "u-amina") (gk "engagement"))))
+      (is (= :unknown (first (keys (acl/reads-verdict db (gperson "u-omar") (gk "memo"))))))
+      (is (= {:unknown :group-unresolved} (acl/reads-verdict db (gperson "u-omar") (gk "memo"))) "site group cannot be expanded")
+      (is (= :yes (acl/reads-verdict db (gperson "u-amina") (gk "memo"))) "…but a definite grant elsewhere still wins")
+      (is (= :no (acl/reads-verdict db (gperson "u-omar") (gk "engagement"))) "no site group there: a definite no"))))
+
+(deftest graph-unshare-then-refresh-moves-exceeds
+  (with-graph [f kp] {}
+    (fg/do! f :grant-site [fg/SITE-ID :fullcontrol])
+    (fg/do! f :break-inheritance [fg/DRIVE "priv" false])
+    (fg/do! f :share [fg/DRIVE "priv" {:type :user :id "u-amina"} "read"])
+    (keep/step! kp)
+    (let [cov (fn [] (acl/coverage (datom/db (:conn kp)) [(gperson "u-amina") (gperson "u-youssef")] [(gk "priv")] {}))]
+      (is (contains? (:exceeds (cov)) (gperson "u-youssef")))
+      ;; permission-only change: delta says nothing, a plain step does not see it
+      (fg/do! f :share [fg/DRIVE "priv" {:type :user :id "u-youssef"} "read"])
+      (fg/do! f :unshare [fg/DRIVE "priv" {:type :user :id "u-amina"}])
+      (is (= :idle (:ok (keep/step! kp))) "no content change → idle")
+      (is (contains? (:exceeds (cov)) (gperson "u-youssef")) "still the old view until the sweep")
+      (let [r (keep/refresh-acls! kp {})]
+        (is (pos? (:refreshed r)))
+        (is (= 0 (:errors r))))
+      (is (= {(gperson "u-amina") #{(gk "priv")}} (:exceeds (cov))) "the share moved")
+      (is (= #{(gperson "u-youssef")} (:within (cov))))
+      ;; a sweep with a budget skips what is fresh
+      (is (= 0 (:refreshed (keep/refresh-acls! kp {:older-than-ms 3600000})))))))
+
+(deftest graph-acl-facts-only-for-items-inside-the-root-m1
+  (with-graph [f kp] {}
+    (fg/do! f :grant-site [fg/SITE-ID :fullcontrol])
+    (fg/do! f :share [fg/DRIVE "hr" {:type :user :id "u-omar"} "read"])
+    (keep/step! kp)
+    (fg/do! f :share [fg/DRIVE "hr" {:type :user :id "u-youssef"} "read"])
+    (fg/do! f :edit [fg/DRIVE "hr" "x"])
+    (fg/do! f :add-file [fg/DRIVE "new" "outside" "n.md" "n"])
+    (fg/do! f :add-file [fg/DRIVE "in" "dupont" "i.md" "n"])
+    (keep/step! kp)
+    (keep/refresh-acls! kp {})
+    (is (empty? (clojure.set/intersection (acl-keys kp) #{"hr" "outside" "new" "clients" "benali" "pleadings" "root"})))
+    (is (contains? (acl-keys kp) "in"))
+    (is (not (contains? (into #{} (map (fn [r] (nth (first r) 2)) (into [] (datom/q '[:find ?k :where [?e :conn/key ?k]] (datom/db (:conn kp)))))) "hr"))
+        "hr was never even mirrored")))
+
+(deftest an-acl-less-keep-writes-no-acl-facts
+  (with-graph [f kp] {}
+    (keep/step! (assoc kp :acl? false))
+    (is (empty? (acl-keys kp)))))
+
+(deftest graph-permission-mapping-unit
+  (let [o {:tenant "t" :site-id "s" :client-id "app"}
+        p (fn [m] (g/permission-grants o [m]))
+        own {"id" "1" "roles" ["read"] "grantedToV2" {"application" {"id" "app"}}}]
+    (is (= false (:complete? (p own))) "only our own permission = non-owner view")
+    (is (= false (:complete? (g/permission-grants o []))))
+    (is (= true (:complete? (g/permission-grants o [own {"id" "2" "roles" ["write"] "grantedToV2" {"user" {"id" "u" "email" "A@x.com"}}}]))))
+    (let [r (g/permission-grants o [{"id" "3" "roles" ["read"] "link" {"scope" "users"}
+                                    "grantedToIdentitiesV2" [{"user" {"id" "a"}} {"user" {"id" "b"}}]}
+                                   {"id" "4" "roles" ["read"] "link" {"scope" "existingAccess"}}
+                                   {"id" "5" "roles" ["read"] "link" {"scope" "organization"}}
+                                   {"id" "6" "roles" ["read"] "link" {"scope" "anonymous"}}
+                                   {"id" "7" "roles" ["read"] "link" {"scope" "mystery"}}
+                                   {"id" "8" "roles" ["read"] "grantedToV2" {"siteGroup" {"id" "9"}}}])]
+      (is (= [[:graph "t" :person "a"] [:graph "t" :person "b"] [:graph "t" :audience "organization"]
+              [:graph "t" :audience "anyone"] nil [:graph "t" :site-group "s/9"]]
+             (mapv (fn [x] (get (:grantee x) :key)) (:grants r))) "users link → its persons; existingAccess → nothing; unknown scope → unmapped")
+      (is (some (fn [x] (nil? (:role x))) (:grants r))))
+    (is (= [:graph "t" :site-group "global/5"]
+           (get-in (first (:grants (p {"id" "1" "roles" ["owner"] "grantedToV2" {"sharePointGroup" {"id" "5"}}}))) [:grantee :key])))))
+
+;; ═══ Drive through the fake ═════════════════════════════════════════════════
+
+(deftest drive-domain-and-group-shares
+  (let [d (fd/make) ns "sub-1"
+        gk (fn [id] [:gdrive ns id])
+        person (fn [e] (acl/identity-key :gdrive ns :person e))]
+    (fd/add! d "dupont" {:name "D" :parent "root" :folder? true})
+    (fd/add! d "a" {:name "a.md" :parent "dupont" :content "x"})
+    (fd/add! d "b" {:name "b.md" :parent "dupont" :content "x"})
+    (fd/share! d "dupont" {:id "p1" :type "domain" :role "reader" :domain "Contoso.com"})
+    (fd/share! d "a" {:id "p3" :type "user" :role "owner" :email "Amina@Contoso.com"})
+    (fd/share! d "a" {:id "p4" :type "anyone" :role "reader"})
+    (fd/share! d "b" {:id "p9" :type "group" :role "writer" :email "team@contoso.com"})
+    (let [kp {:conn (datom/connect (keep/full-schema {:acl? true})) :acl? true
+              :feed (gdrive/feed ns {:acl? true}) :get (fd/get-fn d) :roots (fn [_] [(gk "dupont")])}]
+      (keep/step! kp)
+      (let [db (datom/db (:conn kp))]
+        (is (= :yes (acl/reads-verdict db (person "amina@contoso.com") (gk "a"))) "email lowercased")
+        (is (= :yes (acl/reads-verdict db (person "anybody@elsewhere.org") (gk "a"))) "anyone link")
+        (is (= :no (acl/reads-verdict db (person "x@elsewhere.org") (gk "dupont"))) "domain share does not reach other domains")
+        (is (= {:unknown :group-unresolved} (acl/reads-verdict db (person "q@elsewhere.net") (gk "b")))
+            "a Google group is never expanded without directory read: unknown, not no"))
+      ;; an identity known by email in the domain is covered by the domain audience
+      (datom/transact! (:conn kp) (acl/members-tx (datom/db (:conn kp)) (acl/identity-key :gdrive ns :group "g@contoso.com")
+                                                  [{:key (person "z@contoso.com") :kind :person :email "z@contoso.com"}] true 1))
+      (is (= :yes (acl/reads-verdict (datom/db (:conn kp)) (person "z@contoso.com") (gk "dupont"))) "domain audience by email domain")
+      ;; a share on the folder is inherited by the file in Drive's own effective list
+      (fd/share! d "dupont" {:id "p5" :type "user" :role "reader" :email "late@contoso.com"})
+      (keep/refresh-acls! kp {})
+      (is (= :yes (acl/reads-verdict (datom/db (:conn kp)) (person "late@contoso.com") (gk "a"))) "inherited on the child"))))
+
+;; ═══ the model: relation == brute-force reachability over the fake's state ═══
+
+(def PEOPLE ["u-amina" "u-youssef" "u-omar"])
+(def GRANTEES [{:type :user :id "u-amina"} {:type :user :id "u-youssef"} {:type :user :id "u-omar"}
+               {:type :group :id "g-lawyers"} {:type :group :id "g-all"}])
+(def MEMBERS [[:user "u-omar"] [:user "u-youssef"] [:user "u-amina"] [:group "g-all"] [:group "g-lawyers"]])
+(def GROUPS ["g-lawyers" "g-all"])
+(def ITEMS ["dupont" "engagement" "memo" "unique" "priv"])
+(def FILES ["engagement" "memo" "priv"])
+(def PLACES ["dupont" "unique" "outside"])
+
+(defn- acl-world []
+  (let [f (fg/start! {})
+        c (conn/open g/spec {:account-id "app" :client {:client-id (:client-id f) :client-secret (:client-secret f)}
+                             :store (store/store-file (tmp-dir))})]
+    (g/connect! c {:tenant (:tenant f) :login-base (:login-base f)})
+    (fg/do! f :grant-site [fg/SITE-ID :fullcontrol])
+    {:f f :kp {:conn (datom/connect (keep/full-schema {:acl? true})) :acl? true
+               :feed (g/feed fg/DRIVE (:graph-base f) {:tenant fg/TENANT :client-id fg/CLIENT-ID :site-id fg/SITE-ID})
+               :get (g/get-via c) :roots (fn [_] [(gk "dupont")])}}))
+
+(defn- model-reads?
+  "Brute force from the FAKE's state: some effective permission of `item` names
+   the user, or a group the user is transitively in."
+  [s uid item]
+  (boolean
+    (some (fn [p] (let [g (:grantee p)]
+                    (case (:type g)
+                      :user (= uid (:id g))
+                      :group (contains? (fg/group-users s (:id g)) uid)
+                      false)))
+          (fg/effective-perms s fg/DRIVE item))))
+
+(defn- rel-reads?
+  "All three access modes must agree: identity bound (:bf), item bound (:fb), both (:bb)."
+  [c uid item]
+  (let [db (datom/db c)
+        w (first (first (into [] (datom/q '[:find ?e :in $ ?k :where [?e :ident/key ?k]] db (gperson uid)))))
+        i (first (first (into [] (datom/q '[:find ?e :in $ ?k :where [?e :conn/key ?k]] db (gk item)))))]
+    (if (or (nil? w) (nil? i)) false
+      (let [bf (some (fn [r] (= i (first r))) (into [] (datom/q '[:find ?i :in $ ?w :where [?w :~acl/source-reads ?i]] db w)))
+            fb (some (fn [r] (= w (first r))) (into [] (datom/q '[:find ?w :in $ ?i :where [?w :~acl/source-reads ?i]] db i)))
+            bb (seq (into [] (datom/q '[:find ?z :in $ ?w ?i :where [?w :~acl/source-reads ?i] [(identity 1) ?z]] db w i)))]
+        (if (and (= (boolean bf) (boolean fb)) (= (boolean bf) (boolean bb))) (boolean bf) :modes-disagree)))))
+
+(def acl-model
+  (vm/model "acl-source-reads"
+    {:state {}
+     :init acl-world
+     :cleanup (fn [w] ((:stop (:f w))))
+     :commands
+     {:share {:args (vm/tuple (vm/one-of ITEMS) (vm/one-of GRANTEES))
+              :run (fn [w [id g]] (fg/do! (:f w) :share [fg/DRIVE id g "read"]))}
+      :unshare {:args (vm/tuple (vm/one-of ITEMS) (vm/one-of GRANTEES))
+                :run (fn [w [id g]] (fg/do! (:f w) :unshare [fg/DRIVE id g]))}
+      :break {:args (vm/tuple (vm/one-of ITEMS) (vm/one-of [true false]))
+              :run (fn [w [id keep?]] (fg/do! (:f w) :break-inheritance [fg/DRIVE id keep?]))}
+      :add-member {:args (vm/tuple (vm/one-of GROUPS) (vm/one-of MEMBERS))
+                   :run (fn [w [g m]] (fg/do! (:f w) :add-member [g m]))}
+      :remove-member {:args (vm/tuple (vm/one-of GROUPS) (vm/one-of MEMBERS))
+                      :run (fn [w [g m]] (fg/do! (:f w) :remove-member [g m]))}
+      :move {:args (vm/tuple (vm/one-of FILES) (vm/one-of PLACES))
+             :run (fn [w [id p]] (fg/do! (:f w) :move [fg/DRIVE id p]))}
+      :step {:run (fn [w _] (keep/step! (:kp w)))}
+      :refresh {:run (fn [w _] (keep/refresh-acls! (:kp w) {}))}
+      :sync {:run (fn [w _] (keep/step! (:kp w)) (keep/refresh-acls! (:kp w) {}))}}
+     :settle :sync
+     :eventually
+     {:source-reads-equals-brute-force
+      (fn [_ w]
+        (let [s ((:state (:server (:f w))))
+              items (into ["dupont"] (fg/visible (:f w) fg/DRIVE "dupont"))]
+          (every? (fn [it] (every? (fn [u] (= (model-reads? s u it) (boolean (rel-reads? (:conn (:kp w)) u it)))) PEOPLE))
+                  items)))
+      :verdict-equals-brute-force
+      ;; every group is expandable and the app is an owner. The one :unknown: an item whose
+      ;; effective list holds nothing but our own grant (or nothing) — indistinguishable from a
+      ;; non-owner view, so :acl-incomplete (design doc §1; Graph's own unavoidable ambiguity).
+      (fn [_ w]
+        (let [s ((:state (:server (:f w))))
+              db (datom/db (:conn (:kp w)))]
+          (every? (fn [it] (every? (fn [u] (= (cond (model-reads? s u it) :yes
+                                                                (empty? (fg/effective-perms s fg/DRIVE it)) {:unknown :acl-incomplete}
+                                                                :else :no)
+                                                          (acl/reads-verdict db (gperson u) (gk it)))) PEOPLE))
+                  (into ["dupont"] (fg/visible (:f w) fg/DRIVE "dupont")))))
+      :every-live-item-has-acl-facts
+      (fn [_ w]
+        (every? (fn [it] (some? (first (first (into [] (datom/q '[:find ?a :in $ ?k :where [?e :conn/key ?k] [?e :acl.item/as-of ?a]]
+                                                                  (datom/db (:conn (:kp w))) (gk it)))))))
+                (into ["dupont"] (fg/visible (:f w) fg/DRIVE "dupont"))))}}))
+
+(deftest source-reads-equals-brute-force-reachability-over-every-history
+  (let [r (vm/check acl-model {:seed 77 :histories 100 :max-len 12 :budget-ms 900000})]
+    (when (= :refuted (:modality r))
+      (println "  shrunk:" (pr-str (:shrunk r)) "broke:" (:broke r) (:kind r) (:error r)))
+    (println (str "  model: " (:why r)))
+    (is (= :witnessed (:modality r)))))
+
+(deftest a-failing-acl-fetch-writes-no-acl-fact-counts-an-error-and-never-allows
+  (let [d (fd/make) ns "sub-1" gk (fn [id] [:gdrive ns id])]
+    (fd/add! d "dupont" {:name "D" :parent "root" :folder? true})
+    (fd/add! d "a" {:name "a.md" :parent "dupont" :content "x"})
+    (fd/share! d "a" {:id "p" :type "anyone" :role "reader"})
+    (let [base (gdrive/feed ns {:acl? true})
+          kp {:conn (datom/connect (keep/full-schema {:acl? true})) :acl? true
+              :feed (assoc base :acl (fn [get k] {:error {:status 500 :body "boom"}}))
+              :get (fd/get-fn d) :roots (fn [_] [(gk "dupont")])}
+          r (keep/step! kp)]
+      (is (= :seeded (:ok r)) "the mirror itself still lands")
+      (is (pos? (:acl-errors r)))
+      (is (= {:unknown :no-acl-data} (acl/reads-verdict (datom/db (:conn kp)) (acl/identity-key :gdrive ns :person "x@y.z") (gk "a")))))))

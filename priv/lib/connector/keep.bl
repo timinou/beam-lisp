@@ -34,7 +34,7 @@
 ; provider — a Graph feed is the same keep.
 
 (ns connector.keep
-  (:require [datom] [files]))
+  (:require [datom] [files] [connector.acl :as acl]))
 
 (def schema
   "The keep's own facts: one cursor + bookkeeping per feed, one seeded mark per
@@ -46,7 +46,10 @@
    {:db/ident :feed/error-at  :db/valueType :db.type/long}
    {:db/ident :root/seeded    :db/valueType :db.type/term :db/unique :db.unique/identity}])
 
-(defn full-schema [] (into (into [] files/schema) schema))
+(defn full-schema
+  "The mirror schema; `{:acl? true}` adds connector.acl's identity/membership/ACL facts."
+  ([] (full-schema nil))
+  ([opts] (into (into (into [] files/schema) schema) (if (= true (:acl? opts)) acl/schema []))))
 
 (defn- now [] (erlang/system_time :millisecond))
 (defn feed-key [feed] [(:provider feed) (:namespace feed)])
@@ -110,6 +113,53 @@
             :else [])
           (if (has? :file/gone) [[:db/retract e :file/gone true]] []))))
 
+;; ── ACL facts (docs/connectors/rights-as-relations.md §6) ───────────────────
+;
+; Enabled by `:acl? true` on the keep AND a feed that has `:acl`. ACL facts ride
+; in the SAME transaction as the item's own facts, so:
+;   M1  they exist only for items the page/seed already judged inside the closure
+;       — the helper is called from the branch that writes the item, nowhere else;
+;   M3  every transaction of a page/chunk carries its items' ACLs, and the cursor
+;       rides in the LAST one: no cursor advance happens before the ACL facts of
+;       everything it covers are durable (a crash re-reads from the old cursor).
+; A failed `:acl` fetch writes NOTHING for that item (its older facts keep their
+; older :acl.item/as-of, which `reads-verdict` can age out as :stale) and is
+; counted in the step's report as :acl-errors — never swallowed, never an allow.
+; Group membership is fetched at most once per group per step (the ctx cache)
+; and written in the first transaction that references the group.
+
+(defn- acl-on? [k] (and (= true (:acl? k)) (some? (:acl (:feed k)))))
+
+(defn- with-ctx
+  "A keep value carrying this step's ACL context (as-of stamp, group cache, error count)."
+  [k]
+  (assoc k :acl-ctx {:as-of (now) :groups (atom #{}) :errors (atom 0)}))
+
+(defn- acl-tx
+  "ACL (+ first-seen group membership) facts for `item` as transaction items;
+   [] when ACLs are off or the fetch failed."
+  [k db ref item]
+  (if (not (acl-on? k)) []
+    (let [ctx (:acl-ctx k) as-of (:as-of ctx)
+          r ((:acl (:feed k)) (:get k) (:key item))]
+      (if (contains? r :error)
+        (do (swap! (:errors ctx) inc) [])
+        (let [grants (:grants (:ok r))
+              groups (into [] (distinct (keep (fn [g] (let [x (:grantee g)]
+                                                         (when (and (some? x) (= :group (:kind x))) (:key x))))
+                                              grants)))
+              fresh (into [] (remove (fn [gk] (contains? @(:groups ctx) gk)) groups))
+              mem (mapcat (fn [gk]
+                            (swap! (:groups ctx) conj gk)
+                            (let [m (if (some? (:members (:feed k))) ((:members (:feed k)) (:get k) gk) {:error :no-members-feed})]
+                              (if (contains? m :error)
+                                (do (swap! (:errors ctx) inc)
+                                    (acl/members-tx db gk [] false as-of))
+                                (acl/members-tx db gk (:members (:ok m)) (:complete? (:ok m)) as-of))))
+                          fresh)]
+          (into (acl/grants-tx db (:key item) (ref (:key item)) (:grants (:ok r)) (:complete? (:ok r)) as-of)
+                mem))))))
+
 ;; ── the root closure (M1) ───────────────────────────────────────────────────
 
 (defn- closure-keys
@@ -139,7 +189,8 @@
   [k root-key root-item]
   (let [db (datom/db (:conn k))]
     (loop [frontier [root-key] seen #{root-key}
-           txs [(let [ref (tempids db)] (into [(item-tx ref root-item nil)] (flags-tx db ref root-item)))] n 1]
+           txs [(let [ref (tempids db)] (into (into [(item-tx ref root-item nil)] (flags-tx db ref root-item))
+                                        (acl-tx k db ref root-item)))] n 1]
       (if (empty? frontier) {:ok txs :items n}
         (let [pk (first frontier)
               r (list-children k pk)]
@@ -151,7 +202,9 @@
                   ref (tempids (datom/db (:conn k)))
                   tx (if (empty? kids) []
                        (into [{:db/id (ref pk) :conn/key pk}]
-                             (mapcat (fn [i] (into [(item-tx ref i (ref pk))] (flags-tx db ref i))) kids)))
+                             (mapcat (fn [i] (into (into [(item-tx ref i (ref pk))] (flags-tx db ref i))
+                                                    (acl-tx k db ref i)))
+                                     kids)))
                   folders (map :key (filter :folder? kids))]
               (recur (into (into [] (rest frontier)) folders)
                      (into seen (map :key kids))
@@ -212,9 +265,10 @@
                 (update acc :dropped inc))
             lands
               (-> acc
-                  (update :tx into (into [{:db/id (ref parent) :conn/key parent}
-                                          (item-tx ref it (ref parent))]
-                                         (flags-tx db ref it)))
+                  (update :tx into (into (into [{:db/id (ref parent) :conn/key parent}
+                                                (item-tx ref it (ref parent))]
+                                               (flags-tx db ref it))
+                                         (acl-tx k db ref it)))
                   (update :arrived (fn [a] (if (and (:folder? it) (not inside)) (conj a (:key it)) a)))
                   (update :kept inc))
             inside
@@ -282,15 +336,16 @@
   (let [c (:conn k) pk (:parent-key (:feed k))]
     (doseq [[_ it] root-entries]
       (let [db (datom/db c) ref (tempids db)]
-        (datom/transact! c (into [(item-tx ref it nil)] (flags-tx db ref it)))))
+        (datom/transact! c (into (into [(item-tx ref it nil)] (flags-tx db ref it)) (acl-tx k db ref it)))))
     (let [chunks (if (empty? kept) [[]] (chunk kept 500))
           lastix (- (count chunks) 1)]
       (loop [i 0]
         (when (<= i lastix)
           (let [db (datom/db c) ref (tempids db)
                 body (into [] (mapcat (fn [it] (let [p (pk it)]
-                                                 (into [{:db/id (ref p) :conn/key p} (item-tx ref it (ref p))]
-                                                       (flags-tx db ref it))))
+                                                 (into (into [{:db/id (ref p) :conn/key p} (item-tx ref it (ref p))]
+                                                             (flags-tx db ref it))
+                                                       (acl-tx k db ref it))))
                                       (nth chunks i)))
                 tx (if (= i lastix) (into body (extra db)) body)]
             (when (seq tx) (datom/transact! c tx))
@@ -357,10 +412,22 @@
               {:ok (if resync? :resynced :seeded)
                :items (reduce + 0 (map :ok seeds)) :gone (count lost) :cursor (:ok st)})))))))
 
+(declare step-inner!)
+
 (defn step!
   "One unit of keeping. Returns
      {:ok :seeded|:paged|:idle :items n :dropped n :pages n :cursor c}
-     {:error reason …}  (recorded on the feed entity; the cursor is untouched)"
+     {:error reason …}  (recorded on the feed entity; the cursor is untouched)
+   With `:acl? true` on the keep (and a feed `:acl`) the item facts carry their
+   source ACLs too (see \"ACL facts\" above) and the report gains :acl-errors."
+  [k]
+  (let [k (with-ctx k)
+        r (step-inner! k)]
+    (if (and (acl-on? k) (map? r) (contains? r :ok))
+      (assoc r :acl-errors @(:errors (:acl-ctx k)))
+      r)))
+
+(defn- step-inner!
   [k]
   (let [c (:conn k) feed (:feed k) fk (feed-key feed)
         db (datom/db c)
@@ -426,3 +493,37 @@
      :roots (mapv (fn [r] {:root r :seeded (boolean (seeded? db r))
                            :items (let [e (eid db r)] (if (nil? e) 0 (count (files/descendants db e))))})
                   roots)}))
+
+;; ── the sweep: permission-only changes are not in delta ─────────────────────
+
+(defn refresh-acls!
+  "Re-fetch the ACL of every LIVE item under the roots whose ACL facts are older
+   than `:older-than-ms` (default 0 = all), writing in chunks of 100 items.
+   Why: Graph's delta does not report permission-only changes without
+   deltashowsharingchanges, and Drive's changes feed does not either (doc §1),
+   so a share/unshare is invisible to `step!` until the item changes. This is
+   the bounded-staleness half of the design: run it on a schedule, and
+   `reads-verdict` ages anything older than its budget to :stale.
+   opts {:older-than-ms n :now ms}. → {:refreshed n :skipped n :errors n} |
+   {:error :acl-disabled}. M1 holds by construction: only keys inside the roots'
+   live closure are fetched or written."
+  [k opts]
+  (if (not (acl-on? k)) {:error :acl-disabled}
+    (let [k (with-ctx k) c (:conn k)
+          now-ms (or (:now opts) (now))
+          cutoff (- now-ms (or (:older-than-ms opts) 0))
+          db0 (datom/db c)
+          roots (into [] ((:roots k) db0))
+          live-eids (into #{} (mapcat (fn [r] (let [re (eid db0 r)]
+                                                (if (nil? re) [] (into [re] (files/descendants db0 re true)))))
+                                      roots))
+          key-of (fn [e] (let [ds (into [] (datom/datoms db0 :eavt e :conn/key))] (if (empty? ds) nil (nth (first ds) 2))))
+          as-of-of (fn [e] (let [ds (into [] (datom/datoms db0 :eavt e :acl.item/as-of))] (if (empty? ds) nil (nth (first ds) 2))))
+          todo (into [] (keep (fn [e] (let [a (as-of-of e)] (when (or (nil? a) (<= a cutoff)) (key-of e)))) (sort live-eids)))
+          before @(:errors (:acl-ctx k))]
+      (doseq [ch (chunk todo 100)]
+        (let [db (datom/db c) ref (tempids db)
+              tx (into [] (mapcat (fn [ik] (acl-tx k db ref {:key ik})) ch))]
+          (when (seq tx) (datom/transact! c tx))))
+      {:refreshed (- (count todo) (- @(:errors (:acl-ctx k)) before)) :skipped (- (count live-eids) (count todo))
+       :errors @(:errors (:acl-ctx k))})))

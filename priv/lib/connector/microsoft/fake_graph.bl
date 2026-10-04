@@ -23,8 +23,19 @@
 ;               pre-authenticated), which serves raw bytes
 ;   throttle    next n authorised calls → 429 Retry-After: 1
 ;
-; Not modelled: permissions endpoints, deltashowsharingchanges, multiple
-; parents, versions, large-file upload sessions.
+;   permissions GET /drives/:d/items/:i/permissions (paged) returns EFFECTIVE
+;               grants, computed here the way SharePoint does: an item inherits
+;               its parent's list until it has UNIQUE permissions (break-
+;               inheritance copies or empties); no `inheritedFrom`. The OWNER-VIEW
+;               RULE (docs/connectors/rights-as-relations.md §1): with the app's
+;               site role :read only permissions granting the APP are listed;
+;               with :fullcontrol everything is. Permission changes do NOT enter
+;               the delta log (no deltashowsharingchanges).
+;   groups      GET /groups/:g/transitiveMembers (paged): users and nested
+;               groups, flattened; cycles terminate.
+;
+; Not modelled: deltashowsharingchanges, multiple parents, versions, large-file
+; upload sessions, sharing-link tokens, per-user hidden group membership.
 
 (ns connector.microsoft.fake-graph
   (:require [veritas.model :as vm] [connector.microsoft.graph :as g]))
@@ -199,6 +210,127 @@
              more (assoc "@odata.nextLink"
                          (str "http://" (get (:headers req) "host") (:path req) "?skip=" (+ off (:page-size s)))))}))
 
+;; ── permissions ─────────────────────────────────────────────────────────────
+;
+; Grantee = {:type :user|:group|:site-group|:link|:app :id …}; a link is
+; {:type :link :scope "organization"|"anonymous"|"users"|"existingAccess"
+; :users [uid …]}. A permission = {:id :grantee :role}. Directory:
+; (:users s) {uid {:mail :name}}, (:groups s) {gid {:name :members [[:user uid]
+; | [:group gid] …]}}.
+
+(defn- own-perms [s did id] (get-in s [:drives did :items id :perms] []))
+
+(defn effective-perms
+  "What SharePoint lists for `id`: its own list when it has unique permissions
+   (or is the root), else its parent's effective list."
+  [s did id]
+  (loop [x id n 0]
+    (let [it (get-in s [:drives did :items x])]
+      (if (or (nil? it) (> n 64)) []
+        (if (or (:unique? it) (nil? (:parent it))) (own-perms s did x)
+          (recur (:parent it) (+ n 1)))))))
+
+(defn- next-perm-id [s] (str "perm-" (:seq s)))
+
+(defn share
+  "Grant `grantee` `role` on `id`. Sharing an inheriting item gives it unique
+   permissions first (copy of what it inherited), as SharePoint does."
+  [s did id grantee role]
+  (let [s (if (get-in s [:drives did :items id :unique?]) s
+            (-> s (assoc-in [:drives did :items id :perms] (effective-perms s did id))
+                  (assoc-in [:drives did :items id :unique?] true)))
+        pid (next-perm-id s)]
+    (-> s (update :seq inc)
+          (update-in [:drives did :items id :perms] conj {:id pid :grantee grantee :role role}))))
+
+(defn unshare
+  "Remove the direct permissions of `grantee` on a UNIQUE `id`; on an inheriting
+   item it removes nothing (the grant lives on an ancestor)."
+  [s did id grantee]
+  (if (get-in s [:drives did :items id :unique?])
+    (update-in s [:drives did :items id :perms] (fn [ps] (into [] (remove (fn [p] (= (:grantee p) grantee)) ps))))
+    s))
+
+(defn break-inheritance
+  "Give `id` unique permissions: a COPY of its effective list when `keep?`, else empty."
+  [s did id keep?]
+  (-> s (assoc-in [:drives did :items id :perms] (if keep? (effective-perms s did id) []))
+        (assoc-in [:drives did :items id :unique?] true)))
+
+(defn group-users
+  "User ids that are (transitively) members of group `gid` — the model's truth
+   for group expansion; a cycle terminates."
+  [s gid]
+  (loop [frontier [gid] seen #{} users #{}]
+    (if (empty? frontier) users
+      (let [ms (mapcat (fn [g] (get-in s [:groups g :members] [])) frontier)
+            us (map second (filter (fn [m] (= :user (first m))) ms))
+            gs (remove (fn [g] (contains? seen g)) (map second (filter (fn [m] (= :group (first m))) ms)))]
+        (recur (into [] (distinct gs)) (into seen frontier) (into users us))))))
+
+(defn- user-json [s uid]
+  (let [u (get-in s [:users uid])]
+    (cond-> {"id" uid "displayName" (or (:name u) uid)} (some? (:mail u)) (assoc "email" (:mail u)))))
+
+(defn- grantee-set [s g]
+  (case (:type g)
+    :user {"user" (user-json s (:id g))}
+    :group {"group" {"id" (:id g) "displayName" (get-in s [:groups (:id g) :name] (:id g))}}
+    :site-group {"siteGroup" {"id" (:id g) "displayName" (str "Site group " (:id g))}}
+    :app {"application" {"id" (:id g) "displayName" "knowledger"}}
+    {}))
+
+(defn- perm-json [s p]
+  (let [g (:grantee p)]
+    (if (= :link (:type g))
+      (cond-> {"id" (:id p) "roles" [(:role p)] "link" {"scope" (:scope g) "type" (:role p)}}
+        (= "users" (:scope g)) (assoc "grantedToIdentitiesV2" (mapv (fn [u] (grantee-set s {:type :user :id u})) (:users g))))
+      {"id" (:id p) "roles" [(:role p)] "grantedToV2" (grantee-set s g)})))
+
+(defn- site-role [s did] (get-in s [:sites (site-of-drive s did) :role] :read))
+
+(defn visible-perms
+  "The permission resources the APP is shown for `id`: always its own site grant
+   as an application permission; the real list only with the :fullcontrol role."
+  [s did id]
+  (let [role (site-role s did)
+        app {:id "app-site-grant" :grantee {:type :app :id (:client-id s)} :role (name role)}]
+    (if (= role :fullcontrol)
+      (into (effective-perms s did id) [app])
+      [app])))
+
+(defn- permissions-body [s req did id]
+  (let [ps (visible-perms s did id)
+        off (let [p (get (:query req) "skip")] (if (nil? p) 0 (String/to_integer p)))
+        chunk (into [] (take (:page-size s) (drop off ps)))
+        more (< (+ off (:page-size s)) (count ps))]
+    {:body (cond-> {"value" (mapv (fn [p] (perm-json s p)) chunk)}
+             more (assoc "@odata.nextLink"
+                         (str "http://" (get (:headers req) "host") (:path req) "?skip=" (+ off (:page-size s)))))}))
+
+(defn- members-body [s req gid]
+  (let [g (get-in s [:groups gid])
+        flat (loop [frontier [gid] seen #{gid} out []]
+               (if (empty? frontier) out
+                 (let [ms (mapcat (fn [x] (get-in s [:groups x :members] [])) frontier)
+                       fresh (remove (fn [m] (or (and (= :group (first m)) (contains? seen (second m))))) ms)]
+                   (recur (into [] (distinct (map second (filter (fn [m] (= :group (first m))) fresh))))
+                          (into seen (map second (filter (fn [m] (= :group (first m))) ms)))
+                          (into out fresh)))))
+        flat (into [] (distinct flat))
+        off (let [p (get (:query req) "skip")] (if (nil? p) 0 (String/to_integer p)))
+        chunk (into [] (take (:page-size s) (drop off flat)))
+        more (< (+ off (:page-size s)) (count flat))
+        json (fn [m] (if (= :user (first m))
+                       (let [u (get-in s [:users (second m)])]
+                         {"@odata.type" "#microsoft.graph.user" "id" (second m) "displayName" (or (:name u) (second m))
+                          "mail" (:mail u) "userPrincipalName" (:mail u)})
+                       {"@odata.type" "#microsoft.graph.group" "id" (second m) "displayName" (get-in s [:groups (second m) :name])}))]
+    (if (nil? g) (not-found)
+      {:body (cond-> {"value" (mapv json chunk)}
+               more (assoc "@odata.nextLink"
+                           (str "http://" (get (:headers req) "host") (:path req) "?skip=" (+ off (:page-size s)))))})))
+
 ;; ── the model ───────────────────────────────────────────────────────────────
 
 (defn- mint-tok [s app]
@@ -303,6 +435,14 @@
                         (fn [s req did]
                           (let [id (get (:params req) "id")]
                             (if (nil? (live-item s did id)) (not-found) (children-body s req id)))))
+   :permissions (drive-cmd "/v1.0/drives/:d/items/:id/permissions"
+                           (fn [s req did]
+                             (let [id (get (:params req) "id")]
+                               (if (nil? (live-item s did id)) (not-found) (permissions-body s req did id)))))
+   :transitive-members {:request [:get "/v1.0/groups/:g/transitiveMembers"]
+                        :next (fn [s req] (tick s req))
+                        :response (fn [s req]
+                                    (gate s req nil (fn [] (members-body s req (get (:params req) "g")))))}
    :root-children (drive-cmd "/v1.0/drives/:d/root/children"
                              (fn [s req did] (children-body s req (root-of s did))))
 
@@ -354,7 +494,19 @@
    :expire-cursors {:next (fn [s _] (update s :epoch inc))}
    :throttle {:next (fn [s n] (assoc s :throttle n))}
    :rotate-secret {:next (fn [s new-secret] (assoc-in s [:apps (:client-id s) :secret] new-secret))}
-   :grant-site {:next (fn [s sid] (assoc-in s [:sites sid :granted] true))}
+   ;; `sid` or `[sid role]`; role :read (default — least privilege) | :fullcontrol.
+   ;; The role decides what /permissions shows the app (owner-view rule).
+   :grant-site {:next (fn [s a] (let [sid (if (vector? a) (first a) a)
+                                       role (if (vector? a) (second a) :read)]
+                                   (-> s (assoc-in [:sites sid :granted] true) (assoc-in [:sites sid :role] role))))}
+   ;; ── permission changes (not in the delta log) ────────────────────────────
+   :share {:next (fn [s [did id grantee role]] (share s did id grantee role))}
+   :unshare {:next (fn [s [did id grantee]] (unshare s did id grantee))}
+   :break-inheritance {:next (fn [s [did id keep?]] (break-inheritance s did id keep?))}
+   :add-member {:next (fn [s [gid member]] (update-in s [:groups gid :members]
+                                                      (fn [ms] (let [ms (or ms [])] (if (some (fn [m] (= m member)) ms) ms (conj ms member))))))}
+   :remove-member {:next (fn [s [gid member]] (update-in s [:groups gid :members]
+                                                         (fn [ms] (into [] (remove (fn [m] (= m member)) (or ms []))))))}
    :revoke-site {:next (fn [s sid] (assoc-in s [:sites sid :granted] false))}
    ;; every issued token is now past its TTL (a clock jump, not a deletion)
    :expire-token {:next (fn [s _] (update s :tokens (fn [ts] (into {} (map (fn [[k v]] [k (assoc v :exp 0)]) (into [] ts))))))}})
@@ -384,10 +536,17 @@
          :sites {SITE-ID {:host SITE-HOST :path SITE-PATH :name "Knowledger Test" :granted true}
                  OTHER-SITE-ID {:host SITE-HOST :path "/sites/other-site" :name "Other Site" :granted false}}
          :drives {DRIVE {:site SITE-ID :root "root" :log [] :t 1000
-                         :items {"root" {:name "Documents" :parent nil :folder? true :version 0 :mt 1000}}}
+                         :items {"root" {:name "Documents" :parent nil :folder? true :version 0 :mt 1000
+                                  ;; the library's inherited default: Everyone (lawyers + youssef) reads
+                                  :perms [{:id "p-root-all" :grantee {:type :group :id "g-all"} :role "read"}]}}}
                   OTHER-DRIVE {:site OTHER-SITE-ID :root "oroot" :log [] :t 1000
                                :items {"oroot" {:name "Documents" :parent nil :folder? true :version 0 :mt 1000}
                                        "osecret" {:name "other.md" :parent "oroot" :content "other" :version 0 :mt 1000}}}}
+         :users {"u-amina" {:mail "amina@contoso.com" :name "Amina"}
+                 "u-youssef" {:mail "youssef@contoso.com" :name "Youssef"}
+                 "u-omar" {:mail "omar@contoso.com" :name "Omar"}}
+         :groups {"g-lawyers" {:name "Lawyers" :members [[:user "u-amina"]]}
+                  "g-all" {:name "Everyone" :members [[:group "g-lawyers"] [:user "u-youssef"]]}}
          :tokens {} :blobs {} :seq 1 :epoch 0 :throttle 0 :last {}
          :page-size (get opts :page-size 2)}
         (d "clients" "root" "Clients")

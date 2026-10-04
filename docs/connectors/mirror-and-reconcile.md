@@ -265,6 +265,18 @@ mirrored with `:file/parents`. `:fb` (root bound → its cone) is the mode sync 
 
 ---
 
+### 3.4 · ACL facts under M1 and M3
+
+With `{:acl? true}` the keep also mirrors who may read each kept item
+(`connector.acl`, rights-as-relations.md). **M1:** ACL facts are written by the
+same code path as the item, only for items the closure judgement admitted —
+nothing outside a root gets a grant row, an identity or a membership edge via
+an item. **M3:** an item's grants ride in the item's own transaction and the
+cursor in the last one, so the cursor never advances past ACL facts that are
+not durable. A failed ACL fetch writes nothing for that item (older facts age
+out as `:stale`). Permission-only changes are not in delta: `refresh-acls!`
+re-fetches under a staleness budget.
+
 ## 4 · The reconcile clause — a standing query whose rows are owed work
 
 ### 4.1 · Why a clause, not a function
