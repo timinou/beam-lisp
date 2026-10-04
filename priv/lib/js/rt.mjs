@@ -828,4 +828,39 @@ export const consRaw = (x, xs) => new Cons(x, xs);
 export const tuple2 = (a, b) => new Tup([a, b]);
 export const tuple3 = (a, b, c) => new Tup([a, b, c]);
 export const emptyList = () => EMPTY;
+/** Self-host calling convention (PLAN-163 U3): a JS function is called
+    directly; ANY other callee goes to compiled rt's own `invoke(f, args)` —
+    the BEAM's Rt.invoke, with the arguments as one list — so keywords, maps,
+    $blfn multi-fns and vectors are called by the language's rule, never by
+    core.mjs. */
+export function call(f, invoke, ...args) { return typeof f === "function" ? f(...args) : invoke(f, listFromArray(args)); }
+export function callList(f, args, invoke) {
+  if (typeof f === "function") { const a = []; for (let p = args; p instanceof Cons; p = p.t) a.push(p.h); return f(...a); }
+  return invoke(f, args);
+}
+/** `erlang:apply(F, Args)`: a JS function spread over a proper list. A non-
+    function falls back to the leaf (which also calls keywords/maps). */
+export function applyList(f, args) {
+  if (typeof f === "function") {
+    if (args === EMPTY) return f();
+    if (args instanceof Cons && args.n >= 0) {
+      if (args.n === 1) return f(args.h);
+      if (args.n === 2) return f(args.h, args.t.h);
+      const a = new Array(args.n); let i = 0; for (let p = args; p instanceof Cons; p = p.t) a[i++] = p.h; return f(...a);
+    }
+  }
+  return APPLY2(f, args);
+}
+let APPLY2 = () => { throw new BLError("erlang:apply/2 leaf not bound"); };
+export function bindApply2(g) { APPLY2 = g; }
+/** `(list* a b rest)`: the heads consed onto `rest` (shared, unforced). */
+export function listStar(heads, rest) { let r = rest; for (let i = heads.length - 1; i >= 0; i--) r = new Cons(heads[i], r); return r; }
 export const isAtom = (x) => x instanceof Kw || x === true || x === false || x === null;
+export const isBool = (x) => x === true || x === false;
+/** `erlang:length/1`: a PROPER list's length (a Cons carries it), badarg on
+    anything else — an improper (lazy-tailed) chain included, as on the BEAM. */
+export function length(l) {
+  if (l === EMPTY) return 0;
+  if (l instanceof Cons && l.n >= 0) return l.n;
+  return bad("length", l);
+}

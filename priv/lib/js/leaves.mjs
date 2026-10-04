@@ -359,6 +359,7 @@ addLeaves("host-leaves.mjs", Object.entries(HOST_LEAVES));
 // BL sources call it with
 addLeaves("env.mjs", Object.entries(ENV).map(([name, fn]) => ["Elixir.BeamLisp.Env/" + name + "/" + fn.length, fn]));
 bindTable(LEAVES);
+R.bindApply2(LEAVES["erlang/apply/2"]);
 
 /** `#tag` → reader symbol node, registered with `registerDataReader`. */
 const DATA_READERS = new Map();

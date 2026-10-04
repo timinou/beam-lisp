@@ -37,21 +37,22 @@ function badarg(what) { const e = new BLError("errors were found at the given ar
 
 const STRUCT = kw("__struct__");
 /** The module atom a struct-backed JS value answers for `:__struct__`, or
-    undefined for a value that is not a struct (a plain map, a scalar …). */
+    undefined for a value that is not a struct (a plain map, a scalar …).
+    ONE property read: every struct-backed class carries `blStruct` on its
+    PROTOTYPE (set once below, or by the class itself: Regex, Sorted …), so
+    the hottest leaf of compiled core (rt.bl's classifier asks it per value)
+    is not an instanceof chain. */
 export function structTag(x) {
   if (x === null || typeof x !== "object") return undefined;
-  if (x instanceof Vec) return kw("Elixir.BeamLisp.Vector");
-  if (x instanceof HSet) return kw("Elixir.BeamLisp.Set");
-  if (x instanceof Z.LazySeq) return kw("Elixir.BeamLisp.LazySeq");
-  if (x instanceof Dec) return kw("Elixir.BeamLisp.Decimal");
-  if (x instanceof R.Atom) return kw("Elixir.BeamLisp.Atom");
-  if (x instanceof Z.Delay) return kw("Elixir.BeamLisp.Delay");
-  if (x instanceof Z.SeqCursor) return kw("Elixir.BeamLisp.SeqCursor");
-  if (x.blStruct instanceof Kw) return x.blStruct;      // Regex, Reduced, Sorted, Volatile, records …      // Reduced, Sorted, Volatile, records …
-  return undefined;
+  const t = x.blStruct;
+  return t instanceof Kw ? t : undefined;
+}
+for (const [cls, mod] of [[Vec, "Vector"], [HSet, "Set"], [Z.LazySeq, "LazySeq"], [Dec, "Decimal"],
+                          [R.Atom, "Atom"], [Z.Delay, "Delay"], [Z.SeqCursor, "SeqCursor"]]) {
+  Object.defineProperty(cls.prototype, "blStruct", { value: kw("Elixir.BeamLisp." + mod), writable: false });
 }
 /** `is_map` on the BEAM is true for every struct: a struct IS a map. */
-export const isMap = (x) => x instanceof HMap || structTag(x) !== undefined;
+export const isMap = (x) => x instanceof HMap || (x !== null && typeof x === "object" && x.blStruct instanceof Kw);
 
 const MISSING = {};
 function mapGet(k, m, dflt) {

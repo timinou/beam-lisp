@@ -30,6 +30,8 @@ const T = (...xs) => new Tup(xs);
 const ROWS = new Map();
 let CURRENT_NS = "user";
 let EPOCH = 0;
+const FETCHED = new Map();
+let FETCH_EPOCH = -1;
 
 /** A registry key: the printed tuple (keys are small strings/keywords). */
 const key = (k) => (k instanceof Tup ? k.items.map(keyPart).join("\u0001") : keyPart(k));
@@ -77,9 +79,18 @@ export const ENV = {
   put_key: putKey,
   delete_key: deleteKey,
   fetch: (ns, name) => { const r = resolve(ns, name, varRow); return r ? T(OK, r[1]) : ERROR; },
+  // rt.bl fetches LIVE vars in its hottest loops (`core/reduced?` per fold
+  // step, so a rebinding is honoured). Cached per (ns, name) and dropped on
+  // EVERY registry write (EPOCH), so a lookup still answers what the
+  // registry holds now: late binding exact, the key-building walk paid once.
   "fetch!": (ns, name) => {
+    if (FETCH_EPOCH !== EPOCH) { FETCHED.clear(); FETCH_EPOCH = EPOCH; }
+    const ck = ns + "\u0001" + name;
+    const hit = FETCHED.get(ck);
+    if (hit !== undefined) return hit.v;
     const r = resolve(ns, name, varRow);
     if (!r) throw new BLError("undefined var: " + ns + "/" + name);
+    FETCHED.set(ck, { v: r[1] });
     return r[1];
   },
   peek: (ns, name) => { const r = resolve(ns, name, varRow); return r ? T(OK, r[1]) : ERROR; },
