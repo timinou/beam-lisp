@@ -29,13 +29,17 @@ beside them. `--host` names the `js/` functions the page provides on
 | multi-arity / `& rest` | one dispatcher on `arguments.length`; rest is a BL list |
 | `try`/`catch`/`finally` | JS `try`/`catch`/`finally` |
 | keyword literal | a module-level const interned once |
-| `(js/name args)` | `H["name"](args)` — a host function the page provides (declared in `JS_HOST_FNS`) |
+| `(js/name args)` | `H["name"](args)` — a host function the page provides (declared with `--host name`) |
 | `receive`, `spawn` | **refused** at build time (not this profile) |
 
-**Linking happens at build time.** Every name resolves to one of four things:
+**Linking happens at build time.** Every name resolves to one of five things:
 a definition in the same namespace, a definition in a required namespace, a
-core function (`core.mjs` `CORE`), or a declared host function. Anything else
-fails the build, which lists *every* unresolved name. Runtime functions the
+core function (`core.mjs` `CORE`), a host LEAF (`leaves.mjs`, the BEAM
+primitives Beam Lisp's own sources call — `erlang/element`, `lists/split`,
+`BeamLisp.Env/fetch!` …), or a declared host function. Anything else fails the
+build, which lists *every* unresolved name. `--stub NS` leaves a namespace out
+deliberately (reaching it at run time is a named error); `--with NS` adds one
+reached only by module name. Runtime functions the
 compiler calls directly (`Ns.Rt/print_readably`, `Ns.Core/max__bl_v`) are
 mapped to their BL names through the BEAM's own link table. The JS side does
 not keep a copy of BEAM's naming.
@@ -52,6 +56,13 @@ not keep a copy of BEAM's naming.
   `hash_key` relation).
 - Strings are grapheme-indexed for `count`, `subs` and `index-of`, matching
   BEAM. Segmentation is cached per string, because strings are values.
+- A symbol is the BEAM's own reader node `{:symbol "name"}` (a `Tup`), so a
+  quoted symbol and one a macro builds are one kind of value.
+- Exact decimals (`1.50M`) are `Dec` (BigInt unscaled + scale) with BEAM's
+  arithmetic: scale-preserving `+ - *`, terminating `/` (else an error), no
+  floats. `(= 1.5M 1.50M)` is false; `(= 1.5M 1.5)` is true.
+- Lazy sequences (`Lazy`) realize one cell at a time, so `iterate`, `cycle`
+  and `(repeat x)` are infinite here too.
 
 ## Held to BEAM by a differential
 
@@ -72,7 +83,43 @@ models: 20,000–30,000 random operations and forced 32-bit hash collisions.
 ## Core library (`core.mjs`)
 
 Core has one semantics and one implementation per target (PLAN-161 D5). BEAM
-runs `priv/boot/core.bl` + `rt.bl`; this profile runs `core.mjs`. Sequence
-functions are eager here, because UI code consumes finite sequences
-immediately. Infinite generators (`iterate`, `cycle`, 1-arity `repeat`) are
-refused.
+runs `priv/boot/core.bl` + `rt.bl`; this profile runs `core.mjs`, held to the
+BEAM's answers by three differentials (below). Most sequence functions are
+eager (UI code consumes finite sequences); the infinite generators are lazy.
+
+## Beam Lisp in the page: `js.eval`
+
+The self-hosted reader, compiler, macro expander and this emitter are Beam
+Lisp too, so they compile to JS like any program:
+
+```sh
+bl js build js.eval -p priv/lib -p priv/boot --stub lower --with reader --host run --out out/
+```
+
+`priv/lib/js/eval.bl` runs read → compile → emit → `new Function` against a
+live registry (`env.mjs`, the JS twin of `BeamLisp.Env`), so a `defn` is
+callable by the next form and a `defmacro` expands the next compile. A page
+uses `repl.mjs`:
+
+```js
+const { start } = await import("./out/repl.mjs");
+const repl = await start(readFile);            // core's macros, ~10 ms
+repl.evalWith("(->> (range 9) (map inc))", "user");   // {:text "(1 2 … 9)"}
+repl.evalCells([{id, code}, …]);               // a livebook's cells, in order
+```
+
+`boot.mjs` loads core.bl's and sugar.bl's macros. `bl js build` compiles them
+once and writes `boot-cache.mjs`, which the page replays (~10 ms instead of
+~500 ms compiling them in the page). `core-links.mjs` is BEAM's core link
+table, generated per build, so the in-page compiler links core calls exactly
+as the BEAM compiler does.
+
+## Held to the BEAM: three differentials
+
+`bl test test/bl/js_diff_test.bl` (also `bl js test`) runs:
+
+| differential | what it compares |
+|---|---|
+| core (`test/js/diff`) | ~230 expressions, BEAM vs a JS build |
+| reader (`test/js/reader`) | the self-hosted reader in JS vs on BEAM, over 7 real sources (48 in the full run): identical forms |
+| eval (`test/js/eval`) | 76 forms evaluated by Beam Lisp IN JS (defs, macros, decimals, destructuring, try …) vs on BEAM: identical printed results |
