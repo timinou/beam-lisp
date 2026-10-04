@@ -23,6 +23,7 @@ import * as R from "./rt.mjs";
 import * as C from "./core.mjs";
 import { ENV } from "./env.mjs";
 import { LAZY_LEAVES } from "./lazy.mjs";
+import { HOST_LEAVES, bindTable } from "./host-leaves.mjs";
 import { LINKS, OPS } from "./core-links.mjs";
 const { EMPTY, Cons, Tup, Kw, HMap, Vec, BLError } = R;
 
@@ -349,6 +350,10 @@ export function run(body) { return new Function("R", "C", "G", "X", body)(R, C, 
 
 // BeamLisp.LazySeq / SeqCursor / Deferred / LazyMemo.seen — lazy.mjs
 Object.assign(LEAVES, LAZY_LEAVES);
+// what compiled core.bl/rt.bl reach (host-leaves.mjs). Leaves ALREADY above
+// keep their entry: they were measured first for the compiler's own sources.
+for (const [k, f] of Object.entries(HOST_LEAVES)) if (!Object.prototype.hasOwnProperty.call(LEAVES, k)) LEAVES[k] = f;
+bindTable(LEAVES);
 
 // BeamLisp.Env — the namespace/var registry (env.mjs), every function at
 // the arity the BL sources call it with
