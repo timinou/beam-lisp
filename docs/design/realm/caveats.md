@@ -88,15 +88,11 @@ holds*, not *what it costs in RAM right now*.
   (`unknown clause registry`). `vm.owner` and `live.app` do.
 - The dashboard's first render takes about 5 s (it builds the model). A test that
   waits less reads the timeout as a failure; the console tests wait 30 s.
-- A qualified call `alias/name` whose `name` is also a core name (`count`, `get`,
-  `first`) compiles to the core function when the alias's namespace is not yet
-  loaded: `(owner/count id)` answers the length of the id string (BUG-111). Until
-  the compiler is fixed, call `(count (owner/procs id))`.
-- `re-find` and `re-pattern` are not in scope inside `vm.*` namespaces; use
-  `:re` directly.
-- `bl.json` is not loaded for you in a namespace reached on its own; `(:require
-  [bl.json])` explicitly. `vm.http` calls it without requiring it and works only
-  because something else loaded it first.
+- A qualified call `alias/name` means that namespace's `name`, also when the
+  namespace is not loaded yet (a demand-driven require) and `name` is a core name
+  (`count`, `get`, `first`). `qualified_call_test` pins it with fixtures no other
+  test loads; `qualified_core_name_test` fails on a new function that shares a core
+  name.
 
 ## 7. Fresh worktrees do not boot in source mode
 
