@@ -93,6 +93,32 @@ export class Cons {
   constructor(h, t) { this.h = h; this.t = t; this.n = t instanceof Cons ? t.n + 1 : 1; }
 }
 export const EMPTY = Object.freeze(Object.create(null, { __empty: { value: true } }));
+
+/** A lazy sequence: a thunk producing the seq's first cell (a Cons whose
+    tail may be another Lazy, or EMPTY), run at most once and memoized —
+    BEAM's LazySeq. Infinite producers (`iterate`, `cycle`, `repeat`) are
+    Lazy; consumers walk them one cell at a time. */
+export class Lazy {
+  constructor(thunk) { this.thunk = thunk; this.v = undefined; }
+  /** The realized cell: a Cons or EMPTY. */
+  cell() {
+    let x = this;
+    while (x instanceof Lazy) {
+      if (x.v === undefined) { const f = x.thunk; x.thunk = null; x.v = f(); if (x.v === null || x.v === undefined) x.v = EMPTY; }
+      x = x.v;
+    }
+    return x;
+  }
+}
+export function lazy(thunk) { return new Lazy(thunk); }
+/** Realize a whole (finite) lazy seq into ordinary Cons cells. */
+export function realize(x) {
+  if (!(x instanceof Lazy) && !(x instanceof Cons && hasLazyTail(x))) return x;
+  const a = [];
+  for (let c = x instanceof Lazy ? x.cell() : x; c instanceof Cons; c = c.t instanceof Lazy ? c.t.cell() : c.t) a.push(c.h);
+  return listFromArray(a);
+}
+function hasLazyTail(c) { for (let p = c; p instanceof Cons; p = p.t) if (p.t instanceof Lazy) return true; return false; }
 export function cons(h, t) { return new Cons(h, t === null ? EMPTY : t); }
 export function list(...xs) { return listFromArray(xs); }
 export function listFromArray(a, from = 0) {
@@ -485,7 +511,19 @@ function atomName(x) { return x === null || x === undefined ? "nil" : x === true
     is nil, (contains? #{1} 1.0) is false — that is `keyEq`. */
 export function eqv(a, b) {
   if (a === b) return true;
+  if (a instanceof Lazy) a = realize(a);
+  if (b instanceof Lazy) b = realize(b);
   if (a === null || b === null || a === undefined || b === undefined) return false;
+  // decimals (BEAM, measured): two decimals compare by unscaled+scale
+  // ((= 1.5M 1.50M) false); a decimal and an int/float by value
+  // ((= 1.5M 1.5) true, (= 2M 2) true)
+  if (a instanceof Dec || b instanceof Dec) {
+    if (a instanceof Dec && b instanceof Dec) return a.u === b.u && a.s === b.s;
+    const d = a instanceof Dec ? a : b, o = a instanceof Dec ? b : a;
+    if (!isNumV(o)) return false;
+    if (o instanceof Flt) return Number(d.plain()) === o.v;
+    return decCmp(d, o) === 0;
+  }
   if (isNumV(a)) return isNumV(b) && Number(numOf(a)) === Number(numOf(b)) && (typeof a !== "bigint" || typeof b !== "bigint" || a === b);
   const ta = typeof a;
   if (ta !== "object" || typeof b !== "object") return false;
@@ -523,7 +561,7 @@ function* iter(x) {
 // order, as BEAM binaries do), sequentials element-wise then by length.
 
 function rank(x) {
-  if (typeof x === "number" || typeof x === "bigint" || x instanceof Flt) return 0;
+  if (typeof x === "number" || typeof x === "bigint" || x instanceof Flt || x instanceof Dec) return 0;
   if (x === null || x === undefined || x === false || x === true) return 1;
   if (x instanceof Kw) return 2;
   if (x instanceof Sym) return 3;
@@ -538,7 +576,13 @@ export function compare(a, b) {
   const ra = rank(a), rb = rank(b);
   if (ra !== rb) return ra < rb ? -1 : 1;
   switch (ra) {
-    case 0: { const x = numOf(a), y = numOf(b); return x < y ? -1 : x > y ? 1 : 0; }
+    case 0: {
+      if (a instanceof Dec || b instanceof Dec) {
+        if (a instanceof Flt || b instanceof Flt) { const x = a instanceof Dec ? Number(a.plain()) : a.v, y = b instanceof Dec ? Number(b.plain()) : b.v; return x < y ? -1 : x > y ? 1 : 0; }
+        return decCmp(a, b);
+      }
+      const x = numOf(a), y = numOf(b); return x < y ? -1 : x > y ? 1 : 0;
+    }
     case 1: { const o = v => v === null || v === undefined ? 0 : v === false ? 1 : 2; return o(a) - o(b); }
     case 2: return strCmp(a.fq, b.fq);
     case 3: return strCmp(a.name, b.name);
@@ -583,26 +627,65 @@ function needNum(op, a, b) {
   if (!(isIntV(a) || a instanceof Flt) || !(isIntV(b) || b instanceof Flt))
     throw new BLError(op + " needs numbers, got " + printStr(a) + " and " + printStr(b));
 }
+// ─── exact decimals (measured against BEAM, 2026-10-04) ───────────────────────
+// (+ 1.5M 1) 2.5M; (* 1.5M 2) 3.0M; (* 1.5M 1.5M) 2.25M; (/ 1M 4) 0.25M;
+// (/ 6M 3) 2M; (/ 1.20M 3) 0.40M; (/ 1M 3) raises (non-terminating);
+// a float operand raises; (- 1.5M) -1.5M. + and - align to the larger
+// scale, * adds scales, / keeps the dividend's scale when exact, else the
+// smallest scale that terminates.
+const isDec = (x) => x instanceof Dec;
+function toDec(x, op) {
+  if (x instanceof Dec) return x;
+  if (typeof x === "number" || typeof x === "bigint") return new Dec(BigInt(x), 0);
+  if (x instanceof Flt) throw new BLError("a float cannot enter decimal arithmetic: " + printStr(x) + " (use decimal/from-float to approximate on purpose)");
+  throw new BLError(op + " needs numbers, got " + printStr(x));
+}
+const P10 = (n) => 10n ** BigInt(n);
+function decArith(op, a, b) {
+  const x = toDec(a, op), y = toDec(b, op);
+  if (op === "*") return new Dec(x.u * y.u, x.s + y.s);
+  if (op === "/") {
+    if (y.u === 0n) throw new BLError("divide by zero");
+    // value = (x.u / 10^x.s) / (y.u / 10^y.s): try scales from the dividend's up
+    for (let s = x.s; s <= x.s + 64; s++) {
+      const num = x.u * P10(s - x.s + y.s), den = y.u;
+      if (num % den === 0n) return new Dec(num / den, s);
+    }
+    throw new BLError("non-terminating decimal expansion; no exact representable decimal result");
+  }
+  const s = Math.max(x.s, y.s), xu = x.u * P10(s - x.s), yu = y.u * P10(s - y.s);
+  return new Dec(op === "+" ? xu + yu : xu - yu, s);
+}
+function decCmp(a, b) {
+  const x = toDec(a, "compare"), y = toDec(b, "compare"), s = Math.max(x.s, y.s);
+  const xu = x.u * P10(s - x.s), yu = y.u * P10(s - y.s);
+  return xu < yu ? -1 : xu > yu ? 1 : 0;
+}
+
 export function add(a, b) {
   if (typeof a === "number" && typeof b === "number") { const r = a + b; if (r <= MAX && r >= MIN) return r; return norm(BigInt(a) + BigInt(b)); }
+  if (isDec(a) || isDec(b)) return decArith("+", a, b);
   needNum("+", a, b);
   if (a instanceof Flt || b instanceof Flt) return new Flt(numOf(a) + Number(numOf(b)));
   return norm(BigInt(a) + BigInt(b));
 }
 export function sub(a, b) {
   if (typeof a === "number" && typeof b === "number") { const r = a - b; if (r <= MAX && r >= MIN) return r; return norm(BigInt(a) - BigInt(b)); }
+  if (isDec(a) || isDec(b)) return decArith("-", a, b);
   needNum("-", a, b);
   if (a instanceof Flt || b instanceof Flt) return new Flt(Number(numOf(a)) - Number(numOf(b)));
   return norm(BigInt(a) - BigInt(b));
 }
 export function mul(a, b) {
   if (typeof a === "number" && typeof b === "number") { const r = a * b; if (r <= MAX && r >= MIN) return r === 0 ? 0 : r; return norm(BigInt(a) * BigInt(b)); }
+  if (isDec(a) || isDec(b)) return decArith("*", a, b);
   needNum("*", a, b);
   if (a instanceof Flt || b instanceof Flt) return new Flt(Number(numOf(a)) * Number(numOf(b)));
   return norm(BigInt(a) * BigInt(b));
 }
 /** BEAM `/` answers a float, always. */
 export function div(a, b) {
+  if (isDec(a) || isDec(b)) return decArith("/", a, b);
   needNum("/", a, b);
   const y = Number(numOf(b));
   if (y === 0) throw new BLError("divide by zero");
@@ -619,10 +702,10 @@ export function mod(a, b) {
   if (typeof a === "number" && typeof b === "number") { const m = a % b; return (m !== 0 && (m < 0) !== (b < 0) ? m + b : m) || 0; }
   const x = BigInt(a), y = BigInt(b), m = x % y; return norm(m !== 0n && (m < 0n) !== (y < 0n) ? m + y : m);
 }
-export function lt(a, b) { if (typeof a === "number" && typeof b === "number") return a < b; needNum("<", a, b); return numOf(a) < numOf(b); }
-export function gt(a, b) { if (typeof a === "number" && typeof b === "number") return a > b; needNum(">", a, b); return numOf(a) > numOf(b); }
-export function le(a, b) { if (typeof a === "number" && typeof b === "number") return a <= b; needNum("<=", a, b); return numOf(a) <= numOf(b); }
-export function ge(a, b) { if (typeof a === "number" && typeof b === "number") return a >= b; needNum(">=", a, b); return numOf(a) >= numOf(b); }
+export function lt(a, b) { if (typeof a === "number" && typeof b === "number") return a < b; if (isDec(a) || isDec(b)) return decCmp(a, b) < 0; needNum("<", a, b); return numOf(a) < numOf(b); }
+export function gt(a, b) { if (typeof a === "number" && typeof b === "number") return a > b; if (isDec(a) || isDec(b)) return decCmp(a, b) > 0; needNum(">", a, b); return numOf(a) > numOf(b); }
+export function le(a, b) { if (typeof a === "number" && typeof b === "number") return a <= b; if (isDec(a) || isDec(b)) return decCmp(a, b) <= 0; needNum("<=", a, b); return numOf(a) <= numOf(b); }
+export function ge(a, b) { if (typeof a === "number" && typeof b === "number") return a >= b; if (isDec(a) || isDec(b)) return decCmp(a, b) >= 0; needNum(">=", a, b); return numOf(a) >= numOf(b); }
 /** `==`: numeric equality across int/float (BEAM `==`). */
 export function numEq(a, b) { needNum("==", a, b); return Number(numOf(a)) === Number(numOf(b)) || a == b; } // eslint-disable-line eqeqeq
 export function isInt(x) { return typeof x === "number" || typeof x === "bigint"; }
@@ -659,6 +742,7 @@ function escStr(s) {
 /** `pr-str` — the readable printer. */
 export function printStr(x) {
   if (x === null || x === undefined) return "nil";
+  if (x instanceof Lazy || (x instanceof Cons && hasLazyTail(x))) x = realize(x);
   switch (typeof x) {
     case "string": return escStr(x);
     case "number": case "bigint": return String(x);

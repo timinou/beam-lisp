@@ -174,6 +174,8 @@ export const LEAVES = {
   "Elixir.BeamLisp.AtomGuard/reset/0": () => OK,
   "Elixir.BeamLisp.AtomGuard/check!/1": () => OK,
   "Elixir.BeamLisp.AtomGuard/to_atom/1": (s) => R.kw(s),
+  "Elixir.BeamLisp.Decimal/unscaled/1": (d) => (d.u >= BigInt(Number.MIN_SAFE_INTEGER) && d.u <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(d.u) : d.u),
+  "Elixir.BeamLisp.Decimal/scale/1": (d) => d.s,
   "Elixir.BeamLisp.Decimal/parse/1": (s) => { const d = R.parseDec(s); return d === null ? ERROR : T(OK, d); },
   "Elixir.BeamLisp.Vector/to_list/1": (v) => list(v.toArray()),
   "Elixir.BeamLisp.Vector/new/1": (l) => R.vecFromArray(C.toArray(l)),
@@ -254,6 +256,9 @@ Object.assign(LEAVES, {
   // the loader, in a page: every namespace the page has is already loaded
   // (built in), so probes answer from the registry and loads are no-ops
   "Elixir.BeamLisp.Loader/ensure_loaded/1": () => OK,
+  // the readiness guard the compiler puts before a direct call into another
+  // namespace (when that namespace was already loaded at compile time)
+  "Elixir.BeamLisp.Loader/ensure_ready/1": () => OK,
   "Elixir.BeamLisp.Loader/load_provider/1": () => OK,
   "Elixir.BeamLisp.Loader/maybe_load_macro/2": () => null,
   "Elixir.BeamLisp.Loader/resolvable?/1": (ns) => ENV["ns_exists?"](ns),
@@ -300,7 +305,20 @@ function kwGet(opts, k) {
 // name)` reads the live registry (then core), `X("mod/fun/arity")` a core
 // op or a leaf. `R`/`C` are the runtime and core modules.
 const MACRO = R.kw("$macro");
+// namespaces whose functions ARE core.mjs functions on this target (the BEAM
+// implements them in BL over Erlang; the meaning is the same)
+const NATIVE_NS = new Set(["clojure.string", "clojure.core"]);
+const STRING_REVERSE = (s) => [...s].reverse().join("");
 function G(ns, name) {
+  const slash = name.indexOf("/");
+  if (slash > 0) {
+    const q = name.slice(0, slash), n = name.slice(slash + 1);
+    const target = ENV.alias_target(ns, q) ?? q;
+    if (NATIVE_NS.has(target)) {
+      if (target === "clojure.string" && n === "reverse") return STRING_REVERSE;
+      if (Object.prototype.hasOwnProperty.call(C.CORE, n)) return C.CORE[n];
+    }
+  }
   const r = ENV.fetch(ns, name);
   if (r instanceof Tup) {
     const v = r.items[1];
@@ -313,6 +331,9 @@ function G(ns, name) {
 // a linked core op (`Elixir.BeamLisp.Ns.Rt/first/1`) is its CORE function
 function X(lk) {
   if (Object.prototype.hasOwnProperty.call(LEAVES, lk)) return LEAVES[lk];
+  // `clojure.string/upper-case/1` and friends: a native namespace's fn
+  const parts = lk.split("/");
+  if (parts.length === 3 && NATIVE_NS.has(parts[0])) return G("user", parts[0] + "/" + parts[1]);
   const k = OPS[lk];
   if (k !== undefined && Object.prototype.hasOwnProperty.call(C.CORE, k)) return C.CORE[k];
   throw new BLError("no JS implementation for " + lk);

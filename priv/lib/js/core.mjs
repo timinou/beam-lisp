@@ -41,8 +41,16 @@ export const NOT_FOUND = NF;
 
 /** Iterate any seqable (nil, list, vector, map entries, set, string). */
 export function* seqIter(x) {
+  if (x instanceof R.Lazy) x = x.cell();
   if (x === null || x === undefined || x === EMPTY) return;
-  if (x instanceof Cons) { for (let p = x; p instanceof Cons; p = p.t) yield p.h; return; }
+  if (x instanceof Cons) {
+    // a cons chain may end in a lazy tail (iterate/cycle/lazy-seq): step into it
+    for (let p = x; ; ) {
+      if (p instanceof R.Lazy) p = p.cell();
+      if (!(p instanceof Cons)) return;
+      yield p.h; p = p.t;
+    }
+  }
   if (x instanceof Vec) { yield* x; return; }
   if (x instanceof HMap) { for (const [k, v] of x.entries()) yield R.vec(k, v); return; }
   if (x instanceof HSet) { yield* x.elements().sort(R.compare); return; }
@@ -507,20 +515,25 @@ let OUT = (s) => { if (typeof console !== "undefined") console.log(s); };
 export function set_out_BANG(f) { OUT = f; }
 export function println(...xs) { OUT(xs.map(R.strOf).join(" ")); return null; }
 export function prn(...xs) { OUT(xs.map(R.printStr).join(" ")); return null; }
+/** `type`, measured against BEAM (2026-10-04): nil → nil, a string is
+    :binary, a symbol (a {:symbol name} tuple) is :tuple, a set is
+    :Elixir.BeamLisp.Set, a decimal :Elixir.BeamLisp.Decimal, an atom ref
+    :Elixir.BeamLisp.Atom; lists/vectors/maps/fns as their names. */
 export function type(x) {
-  if (x === null || x === undefined) return R.kw("nil");
-  if (typeof x === "string") return R.kw("string");
+  if (x === null || x === undefined) return null;
+  if (typeof x === "string") return R.kw("binary");
   if (typeof x === "boolean") return R.kw("boolean");
   if (R.isInt(x)) return R.kw("integer");
   if (x instanceof Flt) return R.kw("float");
+  if (x instanceof R.Dec) return R.kw("Elixir.BeamLisp.Decimal");
   if (x instanceof Kw) return R.kw("keyword");
-  if (x instanceof Sym) return R.kw("symbol");
+  if (x instanceof Tup) return R.kw("tuple");
   if (x instanceof Vec) return R.kw("vector");
   if (x instanceof HMap) return R.kw("map");
-  if (x instanceof HSet) return R.kw("set");
+  if (x instanceof HSet) return R.kw("Elixir.BeamLisp.Set");
   if (x instanceof Cons || x === EMPTY) return R.kw("list");
   if (typeof x === "function") return R.kw("fn");
-  if (x instanceof Atom) return R.kw("atom");
+  if (x instanceof Atom) return R.kw("Elixir.BeamLisp.Atom");
   return R.kw("host");
 }
 
@@ -572,12 +585,29 @@ export function conj_B(t, ...xs) { if (xs.length === 0) return t; for (const x o
 export function assoc_B(t, k, v) { t.v = assoc(t.v, k, v); return t; }
 export function dissoc_B(t, k) { t.v = dissoc(t.v, k); return t; }
 
+// ─── infinite / lazy producers (BEAM core is lazy here) ─────────────────────
+// (take 3 (iterate inc 0)) (0 1 2); (take 4 (cycle [1 2])) (1 2 1 2);
+// (take 2 (repeat :x)) (:x :x). Consumers walk them through seqIter.
+export function iterate(f, x) { const step = (v) => R.lazy(() => new Cons(v, step(invoke(f, v)))); return step(x); }
+export function cycle(c) {
+  const xs = toArray(c); if (xs.length === 0) return EMPTY;
+  const from = (i) => R.lazy(() => new Cons(xs[i % xs.length], from(i + 1)));
+  return from(0);
+}
+export function repeat_(n, x) {
+  if (arguments.length >= 2) return L(new Array(Math.max(0, n)).fill(x));
+  const inf = () => R.lazy(() => new Cons(n, inf()));
+  return inf();
+}
+/** `lazy-seq`'s runtime half: a lazy node over a zero-arity thunk. */
+export function lazy_seq(thunk) { return R.lazy(() => { const v = invoke(thunk); return v instanceof R.Lazy ? v.cell() : seq(v) ?? EMPTY; }); }
+
 let GENSYM = 0;
 /** `(gensym)` / `(gensym "p")`: a fresh SYMBOL `G__N__auto` / `p__N__auto`. */
 export function gensym(prefix) { return R.sym((prefix === undefined ? "G" : prefix instanceof Kw ? prefix.fq : String(prefix)) + "__" + (++GENSYM) + "__auto"); }
 
 export const CORE = {
-  "gensym": gensym,
+  "gensym": gensym, "iterate": iterate, "cycle": cycle, "repeat": repeat_, "lazy-seq*": lazy_seq,
   "meta": meta, "with-meta": with_meta, "vary-meta": vary_meta, "list*": list_star, "boolean": boolean_,
   "ident?": ident_Q, "struct?": struct_Q, "doall": doall, "dorun": dorun,
   "volatile!": volatile_B, "vreset!": vreset_B, "vswap!": vswap_B, "volatile?": volatile_Q,
