@@ -58,7 +58,13 @@ native `Ctrl+J/K/H/L`, which browsers reserve.
 
 ### The editor is a Lisp machine
 
-`:` reads a Beam Lisp form and evaluates it against the running editor:
+`:` evaluates real Beam Lisp IN THE PAGE — the self-hosted reader,
+compiler and macros (`priv/lib/js/eval.bl`, built into `web/out/` beside the
+editor), so `defn`, `defmacro`, destructuring, `->>`, `for`, exact decimals
+and every core macro work exactly as on the BEAM (`bl test
+test/bl/js_diff_test.bl` holds the two to the same answers). The language
+starts with the page (~0.5 s: core.bl's macros from source); one command
+takes 0.2–1.5 ms. The `ed` namespace is the live editor:
 
 ```clojure
 (ed/outline)                          ; [[level title line] …]
@@ -69,6 +75,8 @@ native `Ctrl+J/K/H/L`, which browsers reserve.
 (ed/cmd :heading-next)                ; run any command by name
 (count (ed/commands))                 ; 72 named commands
 (-> (ed/state) :sels count)           ; inspect the editor value
+(defmacro twice [x] `(do ~x ~x))      ; your own macros…
+(defn deepest [] (->> (ed/outline) (map first) (reduce max)))   ; …and fns
 ```
 
 Every key is bound to a NAMED command in one table (`ed/commands.bl`), and
@@ -89,7 +97,6 @@ ed/core.bl      the editor value, selections, multi-cursor edits, undo, and the
 ed/motion.bl    motions as (text, pos) → pos: Helix words, org, forms
 ed/commands.bl  the named command table (72), including paredit-style edits
 ed/keymap.bl    keymaps as data, counts, key sequences, the dispatcher
-ed/lisp.bl      a small Beam Lisp interpreter (in BL) for the `:` command line
 ed/num.bl       number parsing that behaves the same on BEAM and JS
 ed/main.bl      events in, view model out; minibuffer; palette
 web/host.mjs    DOM, input (hidden textarea: IME, dead keys, paste), effects

@@ -8,6 +8,13 @@ import { pathToFileURL } from "node:url";
 import fs from "node:fs";
 
 const out = path.resolve(process.env.BLED_OUT || "out/bl-ed");
+// the `:` command line evaluates real Beam Lisp: start the in-page language
+// (built into out/ by apps/bl-ed/build.sh) as the page host does
+const { start } = await import(pathToFileURL(path.join(out, "repl.mjs")).href);
+const repl = await start((f) => fs.readFileSync(path.join(out, "src", f), "utf8"));
+globalThis.BL_HOST = Object.assign(globalThis.BL_HOST || {}, {
+  "eval-ed": (src, api) => repl.evalWith(src, "ed", api),
+});
 const M = await import(pathToFileURL(path.join(out, "ed.main.mjs")).href);
 const R = await import(pathToFileURL(path.join(out, "rt.mjs")).href);
 const T = await import(pathToFileURL(path.join(out, "ed.text.mjs")).href);
@@ -143,6 +150,18 @@ test("the command line evaluates Beam Lisp against the live editor", () => {
   ed = type(ed, "(ed/goto 5)");
   ed = key(ed, "Enter");
   assert.deepEqual(heads(ed), [[4, 0]]);
+});
+
+test("the command line is the real language: macros, defn, destructuring, threading", () => {
+  let ed = boot(SAMPLE);
+  const run = (src) => { ed = key(ed, ":"); ed = type(ed, src); ed = key(ed, "Enter"); return msg(ed); };
+  assert.match(run("(defmacro twice [x] `(do ~x ~x))"), /\$macro/, "a macro defined from the command line");
+  assert.equal(run("(defn deepest [] (->> (ed/outline) (map first) (reduce max)))").startsWith("#<fn"), true);
+  assert.equal(run("(deepest)"), "2", "a user fn over the live outline");
+  assert.equal(run("(let [[[lvl title row]] (ed/outline)] (str title \"@\" row))"), '"Alpha@3"');
+  assert.equal(run("(twice (ed/goto 9))"), "nil");
+  assert.deepEqual(heads(ed), [[8, 0]], "a user macro drove the editor");
+  assert.match(run("(undefined-thing)"), /^error: undefined var/);
 });
 
 test("the palette finds and runs commands by fuzzy name", () => {

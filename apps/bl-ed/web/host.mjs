@@ -14,8 +14,18 @@
 // Rendering is keyed by row and diffed against the previous frame per line,
 // so a keystroke repaints the lines it changed, not the viewport.
 
+// Beam Lisp itself (reader + compiler + macros, compiled to JS) for the `:`
+// command line: started before the editor module loads, so `js/eval-ed` is
+// a host fn the editor can call (priv/lib/js/repl.mjs).
+const { start } = await import("./out/repl.mjs");
+const repl = await start(async (f) => (await fetch("./out/src/" + f)).text());
+globalThis.BL_HOST = Object.assign(globalThis.BL_HOST || {}, {
+  "eval-ed": (src, api) => repl.evalWith(src, "ed", api),
+});
+window.blRepl = repl;
+
 import * as R from "./out/rt.mjs";
-import * as M from "./out/ed.main.mjs";
+const M = await import("./out/ed.main.mjs");
 
 const K = R.kw;
 const get = (m, k) => (m == null ? null : m.get(K(k), null));
