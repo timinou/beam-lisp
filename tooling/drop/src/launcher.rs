@@ -581,7 +581,6 @@ pub const VERB_SELF_INSTALL: &str = "self-install";
 pub const VERB_SELF_GC: &str = "self-gc";
 pub const VERB_HOOKS: &str = "hooks";
 pub const VERB_MAINTENANCE: &str = "maintenance"; // a DROP's own verb (it carries the payload)
-pub const HOOKS_DRAIN: &str = "drain";
 
 /// Every verb the PATH launcher answers itself, in the order `bl help` lists them.
 pub const LAUNCHER_VERBS: &[&str] = &[VERB_WHICH, VERB_SELF_UPDATE, VERB_SELF_INSTALL, VERB_SELF_GC, VERB_HOOKS];
@@ -619,7 +618,6 @@ fn resolving_main(me: &std::path::Path, argv: &[String]) -> ! {
         Some(VERB_SELF_UPDATE) => finish(self_update(&store, rest.first().map(String::as_str), me, &cwd).map_err(bl_err)),
         Some(VERB_SELF_INSTALL) => finish(self_install(me, &rest, &cwd).map_err(bl_err)),
         Some(VERB_SELF_GC) => finish(self_gc(&rest).map_err(bl_err)),
-        Some(VERB_HOOKS) if rest.first().map(String::as_str) == Some(HOOKS_DRAIN) => finish(drain(&store, me).map_err(bl_err)),
         Some(VERB_HOOKS) => finish(hooks_verb(&store, &rest, me, &cwd).map_err(bl_err)),
         _ => {}
     }

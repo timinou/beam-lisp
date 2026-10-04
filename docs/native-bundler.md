@@ -469,16 +469,28 @@ Every write is temp + rename. At most one build runs on the machine at a time
 ```
 bl self-install [--source DIR]   put the launcher at ~/.local/bin/bl; record where beam-lisp lives
 bl self-update [NAME]            fetch or build NAME (default: stable, then latest)
-bl hooks install [DIR]           automatic builds / the latest guard, for the repo at DIR
+bl hooks install [DIR]           the staleness warnings / the latest guard, for the repo at DIR
+bl hooks status [DIR]            which recorded build no longer matches its inputs
 bl self-gc [--dry-run]           what the store holds, and why each build stays
 ```
 
 `bl hooks install` in a beam-lisp checkout adds `post-commit`, `post-merge`,
-`post-checkout` and `post-rewrite` to the hooks every worktree shares. Each
-queues the worktree that fired and starts one detached builder, which builds
-queued trees one at a time; a build of the `:source` checkout on `main` also
-moves `latest`. Uncommitted work never waits for a build: it runs from source.
-`BL_AUTOBUILD=off` stops the builds.
+`post-checkout` and `post-rewrite` to the hooks every worktree shares. Each is
+a check, not a build: it compares the commit the worktree's newest build was
+made from with HEAD, over the build inputs only, and prints one warning when an
+input moved:
+
+```
+bl: bleeding-edge was built from 06d5255d; build inputs have changed since (efdfb7e6)
+bl: when it suits you: `bl self-update bleeding-edge` in ~/code/beam-lisp, then `bl self-update` for latest
+```
+
+On the `:source` checkout's `main` the same check covers `latest`. A commit that
+only touches docs or tests warns nothing. The check is two git queries and
+reads no tree, so a commit or a merge costs no more than it did without hooks.
+Nothing is queued and nothing runs afterwards: a build takes minutes and holds
+the machine's one build lock, so you start it. Uncommitted work never waits for
+a build: it runs from source.
 
 In a project whose `env.bl` says `:bl "latest"`, `bl hooks install` adds a
 `pre-push` guard. When the local beam-lisp `main` has commits `origin/main` does

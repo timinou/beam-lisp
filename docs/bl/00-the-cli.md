@@ -955,7 +955,6 @@ Every variable `bl` reads, once. A preference belongs in `env.bl`, `~/.config/bl
 | `BL_USE` | override | the build to run here, overriding every other rule (`stable`, `latest`, `commit:SHA`, …) |
 | `BL_BUILD` | override | `never`: a missing build fails instead of being fetched or built |
 | `BL_GATEWAY` | override | `off`: a project that claims a name does not start the gateway for it (the one switch for a machine that wants no background process it did not ask for) |
-| `BL_AUTOBUILD` | override | `off`: git hooks queue no builds |
 | `BL_ALLOW_UNPUSHED_LATEST` | override | `1`: the `latest` pre-push guard lets the push through |
 | `BL_DROP_KEEP_DAYS` / `BL_DROP_GRACE_HOURS` | override | how long an unreferenced build is kept (14 days since last use / 24 h) |
 | `BL_BUILD_TIMEOUT_MIN` | override | a build step is stopped after this many minutes (45) |
