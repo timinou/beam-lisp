@@ -157,8 +157,20 @@ fn run_logged(mut cmd: Command, log: &Path, what: &str) -> Result<(), String> {
     }
 }
 
+/// A `git -C dir` command that names its repository by `dir` alone: git's
+/// per-invocation variables (set when we run under a hook) would otherwise
+/// point it at the worktree that fired the hook, index and all.
+fn git_at(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir);
+    for var in GIT_INVOCATION_ENV {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
-    let o = Command::new("git").arg("-C").arg(dir).args(args).stderr(Stdio::null()).output().ok()?;
+    let o = git_at(dir).args(args).stderr(Stdio::null()).output().ok()?;
     o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
@@ -370,8 +382,8 @@ pub fn build_commit(store: &Store, source: &Path, sha: &str, launcher: &Path, ex
     let tree = cache_dir().join("build-trees").join(&full[..12]);
     if !tree.join(".git").exists() {
         let _ = std::fs::create_dir_all(tree.parent().unwrap());
-        let mut cmd = Command::new("git");
-        cmd.arg("-C").arg(source).args(["worktree", "add", "--detach", "--force"]).arg(&tree).arg(&full);
+        let mut cmd = git_at(source);
+        cmd.args(["worktree", "add", "--detach", "--force"]).arg(&tree).arg(&full);
         let log = cache_dir().join("worktree-add.log");
         let _ = std::fs::create_dir_all(cache_dir());
         run_logged(cmd, &log, &format!("git worktree add {}", &full[..12]))?;
@@ -596,6 +608,54 @@ mod builder_tests {
         let t3 = config_set(&t2, "default", "latest");
         assert_eq!(scan_literal(&t3, "default").as_deref(), Some("latest"));
         assert_eq!(scan_literal(&t3, "source").as_deref(), Some("/b"));
+    }
+
+    /// A git run under a hook inherits `GIT_INDEX_FILE` naming the FIRING
+    /// worktree's index; `git_at` must not let a `worktree add` of another
+    /// commit write into it.
+    #[test]
+    fn git_at_ignores_a_hooks_index_and_git_dir() {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let d = std::env::temp_dir().join(format!("drop-gitenv-{}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let sh = |args: &[&str], dir: &Path| {
+            assert!(Command::new("git").arg("-C").arg(dir).args(args).env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t").env("GIT_COMMITTER_NAME", "t").env("GIT_COMMITTER_EMAIL", "t@t")
+                .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success(), "git {args:?}");
+        };
+        let r = d.join("r");
+        std::fs::create_dir_all(&r).unwrap();
+        sh(&["init", "-q"], &r);
+        sh(&["commit", "-q", "--allow-empty", "-m", "a"], &r);
+        std::fs::write(r.join("f"), "x").unwrap();
+        sh(&["add", "f"], &r);
+        sh(&["commit", "-q", "-m", "b"], &r);
+        sh(&["worktree", "add", "-q", "--detach", d.join("wt").to_str().unwrap(), "HEAD"], &r);
+        let wt_index = r.join(".git/worktrees/wt/index");
+        // the worktree's index CONTENT as git reads it (stat caches may be
+        // refreshed by any git run; the tracked files may not change)
+        let staged = || {
+            let mut c = Command::new("git");
+            c.arg("-C").arg(d.join("wt")).args(["ls-files", "--stage"]);
+            for var in GIT_INVOCATION_ENV {
+                c.env_remove(var);
+            }
+            let o = c.output().unwrap();
+            String::from_utf8_lossy(&o.stdout).to_string()
+        };
+        let before = staged();
+        assert!(before.contains("\tf"), "the worktree tracks f: {before}");
+        // what a hook fired in `wt` sees
+        std::env::set_var("GIT_INDEX_FILE", &wt_index);
+        std::env::set_var("GIT_DIR", r.join(".git/worktrees/wt"));
+        let mut cmd = git_at(&r);
+        cmd.args(["worktree", "add", "-q", "--detach", "--force"]).arg(d.join("other")).arg("HEAD~1");
+        let ok = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success();
+        std::env::remove_var("GIT_INDEX_FILE");
+        std::env::remove_var("GIT_DIR");
+        assert!(ok, "worktree add ran");
+        assert_eq!(staged(), before, "the firing worktree's index still holds its own tree");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
