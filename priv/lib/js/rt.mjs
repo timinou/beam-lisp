@@ -56,6 +56,30 @@ export function sym(name) {
 export class Flt {
   constructor(v) { this.v = v; }
 }
+
+/** An exact decimal (`1.50M`): unscaled BigInt `u` and scale `s` >= 0, value
+    u * 10^-s (PLAN-157 D3). As on the BEAM the scale is part of the value:
+    (= 1.5M 1.50M) is false, and `1.50M` prints with its two places. */
+export class Dec {
+  constructor(u, s) { this.u = BigInt(u); this.s = s; }
+  plain() {
+    const neg = this.u < 0n, d = (neg ? -this.u : this.u).toString().padStart(this.s + 1, "0");
+    const body = this.s === 0 ? d : d.slice(0, d.length - this.s) + "." + d.slice(d.length - this.s);
+    return (neg ? "-" : "") + body;
+  }
+}
+export function dec(u, s) { return new Dec(u, s); }
+/** Decimal.parse: "[+-]digits[.digits][e[+-]digits]" -> Dec, or null. A
+    negative scale from the exponent is folded into the unscaled value. */
+export function parseDec(text) {
+  const m = /^\s*([+-])?(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?\s*$/.exec(text);
+  if (!m || (!m[2] && !m[3])) return null;
+  const frac = m[3] || "", e = m[4] ? parseInt(m[4], 10) : 0;
+  let u = BigInt((m[2] || "") + frac || "0");
+  if (m[1] === "-") u = -u;
+  const s = frac.length - e;
+  return s >= 0 ? new Dec(u, s) : new Dec(u * 10n ** BigInt(-s), 0);
+}
 export function flt(v) { return new Flt(+v); }
 
 export class Tup {
@@ -384,6 +408,7 @@ export function hashOf(x) {
   if (x instanceof HSet) { h = 0x5345; for (const e of x) h = (h + hashOf(e)) | 0; x._h = h; return h; }
   if (x === EMPTY) return 0x4c00;
   if (x instanceof Cons) { h = 0x4c49; for (let p = x; p instanceof Cons; p = p.t) h = mix(h, hashOf(p.h)); return h; }
+  if (x instanceof Dec) return mix(strHash(x.u.toString()), x.s ^ 0x4dec);
   if (x instanceof Tup) { h = 0x5455; for (const e of x.items) h = mix(h, hashOf(e)); return h; }
   return fnId(x);
 }
@@ -405,6 +430,7 @@ export function keyEq(a, b) {
   if (a instanceof HMap) return b instanceof HMap && mapEqv(a, b, keyEq);
   if (a instanceof HSet) return b instanceof HSet && a.cnt === b.cnt && [...a].every(e => b.has(e));
   if (a instanceof Tup) return b instanceof Tup && a.items.length === b.items.length && a.items.every((e, i) => keyEq(e, b.items[i]));
+  if (a instanceof Dec) return b instanceof Dec && a.u === b.u && a.s === b.s;
   return false;
 }
 /** BL `=`, measured against BEAM (2026-10-03): lists and vectors are one
@@ -421,6 +447,7 @@ export function eqv(a, b) {
   if (a instanceof HMap) return b instanceof HMap && mapEqv(a, b, eqv);
   if (a instanceof HSet) return b instanceof HSet && a.cnt === b.cnt && [...a].every(e => b.has(e));
   if (a instanceof Tup) return b instanceof Tup && a.items.length === b.items.length && a.items.every((e, i) => eqv(e, b.items[i]));
+  if (a instanceof Dec) return b instanceof Dec && a.u === b.u && a.s === b.s;
   return false;
 }
 function isSeqColl(x) { return x instanceof Vec || x instanceof Cons || x === EMPTY; }
@@ -593,6 +620,7 @@ export function printStr(x) {
     case "function": return "#<fn " + (x.blName || x.name || "anonymous") + ">";
   }
   if (x instanceof Flt) { const s = String(x.v); return /[.eEn]|Infinity/.test(s) ? s : s + ".0"; }
+  if (x instanceof Dec) return x.plain() + "M";
   if (x instanceof Kw) return ":" + x.fq;
   if (x instanceof Sym) return x.name;
   if (x instanceof Vec) return "[" + x.toArray().map(printStr).join(" ") + "]";
@@ -609,6 +637,7 @@ export function printStr(x) {
 export function strOf(x) {
   if (typeof x === "string") return x;
   if (x === null || x === undefined) return "";
+  if (x instanceof Dec) return x.plain();
   if (x instanceof Kw) return x.fq;
   return printStr(x);
 }

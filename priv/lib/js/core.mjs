@@ -565,7 +565,9 @@ export const CORE = {
   "fn?": fn_Q, "ifn?": ifn_Q, "map?": map_Q, "vector?": vector_Q, "set?": set_Q, "list?": list_Q, "seq?": seq_Q,
   "sequential?": sequential_Q, "coll?": coll_Q, "associative?": associative_Q, "zero?": zero_Q, "pos?": pos_Q,
   "neg?": neg_Q, "even?": even_Q, "odd?": odd_Q, "not": not, "is?": is_Q,
-  "=": eqv, "eqv": eqv, "not=": not_eq, "identical?": identical_Q, "compare": compare, "hash": hash, "hash_key": identity,
+  "=": eqv, "eqv": eqv,
+  // Erlang term comparison (erlang/=:= exact, /= and =/= the negations)
+  "erlang/=:=": (a, b) => R.keyEq(a, b), "erlang//=": (a, b) => !R.eqv(a, b), "erlang/=/=": (a, b) => !R.keyEq(a, b), "not=": not_eq, "identical?": identical_Q, "compare": compare, "hash": hash, "hash_key": identity,
   "inc": inc, "dec": dec, "abs": abs, "max": max, "min": min, "quot": quot, "rem": rem, "mod": mod,
   "+": plus, "-": minus, "*": times, "/": divide, "<": lt, ">": gt, "<=": le, ">=": ge, "==": num_eq,
   "int": int, "double": double, "parse-long": parse_long, "parse-double": parse_double, "rand-int": rand_int,
