@@ -144,3 +144,19 @@ the BEAM, as today. The author writes one file and never chooses.
   conservative.
 - Order: a local re-run must respect document order for redefinitions. Use
   the cell order from `bl.doc.spans` and re-run strictly downstream.
+
+---
+
+## Status (2026-10-04): built
+
+Both are built and verified. See FUP-134 (DONE) and FEAT-057 (DONE).
+
+- **4.** `:` in bl-ed is the self-hosted language running in the page. Boot takes about 10 ms from the boot cache; an eval takes 0.2–1.5 ms. `bl test test/bl/js_diff_test.bl` holds it to the BEAM's answers (eval 76/76).
+- **5.** system.place places every cell. ● cells evaluate in the page and write their #+RESULTS at once; ◆ cells go to the BEAM, with the reason shown.
+
+## Next (proposed, in order)
+
+1. **Values across the line (5c).** Today a local cell that reads a beam cell's def is placed :beam, which is conservative. Next: once the beam cell has run, ship its value over the split wire (priv/lib/split/wire.bl), and place the reader cell :local against that value.
+2. **Compile core's functions (PLAN-163 U2 rest).** Mirror the LazySeq leaves (claim/complete/fail as a single-threaded state machine), then compile core.bl + rt.bl and delete core.mjs, keeping the three differentials as the oracle.
+3. **A notebook differential (5d).** `bl js test --doc FILE` runs every local cell of a document on both targets.
+4. **Actors as a library (U4/U5).** Selective suspension for receive-reachable fns, so the actor prototype in research/js-actors can be retired.
