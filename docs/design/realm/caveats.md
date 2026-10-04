@@ -22,7 +22,7 @@ same name get one namespace: the second sees the first one's. *Environment.* A
 project's `:env` is written into the node's OS environment by `bl.cli/with-project`,
 so a process that never bound a project reads the last one's values. These are
 why sharing is a project's declaration, not the build's default. Fixing them means
-making namespace publication and project binding realm-local.
+making namespace publication and project binding realm-local (FUP-151).
 
 **Not built.** One console with a page per realm. A shared VM starts no dashboard,
 because the dashboard's pages read one root.
