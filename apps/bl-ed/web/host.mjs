@@ -21,6 +21,7 @@ const { start } = await import("./out/repl.mjs");
 const repl = await start(async (f) => (await fetch("./out/src/" + f)).text());
 globalThis.BL_HOST = Object.assign(globalThis.BL_HOST || {}, {
   "eval-ed": (src, api) => repl.evalWith(src, "ed", api),
+  "eval-cells": (cells) => repl.evalCells(cells),
 });
 window.blRepl = repl;
 
@@ -104,6 +105,19 @@ async function perform(e) {
     } catch (err) {
       dispatch(ev(K("type"), K("eval-result"), K("id"), get(e, "id"), K("text"), "no evaluation server — run `bl run apps/bl-ed/serve.bl`"));
     }
+  } else if (kind === "place") {
+    // where each cell may run (system.place on the BEAM): local cells then
+    // evaluate in the page; no server → no placements, every cell goes there
+    try {
+      const r = await fetch("/api/place", { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: get(e, "path"), text: get(e, "text") }) });
+      const j = await r.json();
+      if (j.ok) {
+        let cells = R.EMPTY_MAP;
+        for (const [id, p] of Object.entries(j.cells)) cells = cells.assoc(id, R.hashMap(K("place"), K(p.place), K("why"), p.why ?? null));
+        dispatch(ev(K("type"), K("placements"), K("cells"), cells));
+      }
+    } catch (err) { /* offline: placements stay unknown */ }
   } else if (kind === "clipboard-write") {
     navigator.clipboard?.writeText(get(e, "text")).catch(() => {});
   }
@@ -135,15 +149,16 @@ function draw() {
     const band = get(ln, "band");
     const cls = "line" + (band ? " in-cell band-" + band : "") + (get(ln, "band-first?") ? " first" : "") +
       (get(ln, "band-last?") ? " last" : "") + (get(ln, "current?") ? " cur-line" : "");
+    const place = get(ln, "place"), why = get(ln, "place-why");
     const sig = segSig(segs) + (get(ln, "folded?") ? "\u0003" : "") + "\u0004" + cls;
     nextLines.set(row, sig);
-    frag.push([row, sig, segs, get(ln, "folded?"), cls, get(ln, "current?")]);
+    frag.push([row, sig, segs, get(ln, "folded?"), cls, get(ln, "current?"), place, why]);
   }
   // Reconcile by SLOT: slot i shows row frag[i]. A slot is touched only when
   // its row's signature changed (a scroll shifts every slot; a keystroke
   // usually touches one or two). The gutter is reconciled the same way.
   for (let i = 0; i < frag.length; i++) {
-    const [row, sig, segs, folded, cls, current] = frag[i];
+    const [row, sig, segs, folded, cls, current, place, why] = frag[i];
     let node = view.children[i];
     if (!node || node.dataset.sig !== sig) {
       const fresh = document.createElement("div");
@@ -161,10 +176,14 @@ function draw() {
       if (node) view.replaceChild(fresh, node); else view.appendChild(fresh);
     }
     let g = gutter.children[i];
-    const gcls = "gnum" + (current ? " cur" : ""), gtxt = String(row + 1);
+    // a cell's first row carries its placement: ● local (runs in the page),
+    // ◆ beam (runs on the BEAM; the title says why)
+    const gcls = "gnum" + (current ? " cur" : "") + (place ? " place-" + place : ""), gtxt = String(row + 1);
     if (!g) { g = document.createElement("div"); gutter.appendChild(g); }
     if (g.className !== gcls) g.className = gcls;
     if (g.textContent !== gtxt) g.textContent = gtxt;
+    const title = place === "local" ? "runs here, in the page (pure, terminates)" : place === "beam" ? "runs on the BEAM — " + (why || "") : "";
+    if (g.title !== title) g.title = title;
   }
   while (view.children.length > frag.length) view.lastChild.remove();
   while (gutter.children.length > frag.length) gutter.lastChild.remove();

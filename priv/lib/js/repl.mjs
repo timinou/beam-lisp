@@ -33,5 +33,25 @@ export async function start(readFile) {
       return R.hashMap(ERR, e && e.message ? e.message : String(e));
     }
   };
-  return { ...vm, evalWith };
+  /** Evaluate document cells in order, in a fresh namespace per call (a
+      cell sees the defs of the cells above it, as bl.doc's runner does):
+      {:results {id "printed value"}} or {:err "…"}. A cell's result is its
+      last form's value, printed with pr-str; an error is ";; error: …". */
+  let runN = 0;
+  const RESULTS = R.kw("results");
+  const evalCells = (cells) => {
+    const ns = "doc.page" + (++runN);
+    vm.Env.in_ns(ns);
+    let out = R.EMPTY_MAP;
+    for (const c of (cells instanceof R.Vec ? cells.toArray() : cells)) {
+      const id = c instanceof R.HMap ? c.get(R.kw("id"), null) : c.id;
+      const code = c instanceof R.HMap ? c.get(R.kw("code"), null) : c.code;
+      let s;
+      try { vm.Env.in_ns(ns); s = R.printStr(vm.evalString(code)); } catch (e) { s = ";; error: " + (e && e.message ? e.message : String(e)); }
+      out = out.assoc(id, s);
+    }
+    vm.Env.in_ns("user");
+    return R.hashMap(RESULTS, out);
+  };
+  return { ...vm, evalWith, evalCells };
 }

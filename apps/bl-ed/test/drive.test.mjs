@@ -14,6 +14,7 @@ const { start } = await import(pathToFileURL(path.join(out, "repl.mjs")).href);
 const repl = await start((f) => fs.readFileSync(path.join(out, "src", f), "utf8"));
 globalThis.BL_HOST = Object.assign(globalThis.BL_HOST || {}, {
   "eval-ed": (src, api) => repl.evalWith(src, "ed", api),
+  "eval-cells": (cells) => repl.evalCells(cells),
 });
 const M = await import(pathToFileURL(path.join(out, "ed.main.mjs")).href);
 const R = await import(pathToFileURL(path.join(out, "rt.mjs")).href);
@@ -164,6 +165,46 @@ test("the command line is the real language: macros, defn, destructuring, thread
   assert.match(run("(undefined-thing)"), /^error: undefined var/);
 });
 
+test("split cells: a local cell runs in the page; a beam cell becomes an effect", () => {
+  const DOC = [
+    "#+TITLE: split",
+    "#+begin_src beam-lisp :id sq",
+    "(defn sq [x] (* x x))",
+    "#+end_src",
+    "#+begin_src beam-lisp :id total",
+    "(reduce + (map sq [1 2 3]))",
+    "#+end_src",
+    "#+begin_src beam-lisp :id slurp",
+    "(File/read! \"x\")",
+    "#+end_src",
+  ].join("\n");
+  let ed = boot(DOC);
+  // boot asks where cells run (the host answers from the BEAM's analyzer)
+  const [ed1, fx] = M.d_take_effects(ed).toArray();
+  assert.deepEqual(fx.toArray().map((e) => get(e, "kind").name), ["place"]);
+  ed = ed1;
+  // the placements event, as /api/place answers it
+  const P = (place, why) => R.hashMap(K("place"), K(place), K("why"), why ?? null);
+  ed = M.d_handle(ed, R.hashMap(K("type"), K("placements"), K("cells"),
+    R.hashMap("sq", P("local"), "total", P("local"), "slurp", P("beam", "effect in an expression: footprint {:opaque-world :W}"))));
+  // a local cell: evaluated HERE, its result written into the text at once
+  ed = keys(ed, "j j j j j");
+  ed = keys(ed, "<sp> e");
+  assert.match(msg(ed), /^total ⇒ 14 +\(in the page\)/);
+  assert.match(text(ed), /#\+RESULTS: total\n: 14\n/, "the result span is written by bl.doc.spans");
+  assert.equal(M.d_take_effects(ed).toArray()[1].toArray().length, 0, "no BEAM round trip");
+  // a beam cell: an :eval-cell effect for the host, with the reason shown
+  ed = keys(ed, "G k");
+  ed = keys(ed, "<sp> e");
+  assert.match(msg(ed), /on the BEAM — effect/);
+  const [, fx2] = M.d_take_effects(ed).toArray();
+  assert.deepEqual(fx2.toArray().map((e) => get(e, "kind").name), ["eval-cell"]);
+  // the render model marks where each cell runs
+  const lines = get(M.d_render(keys(ed, "g g")), "lines").toArray();
+  const marks = lines.filter((l) => get(l, "place")).map((l) => [get(l, "row"), get(l, "place")]);
+  assert.deepEqual(marks.slice(0, 2), [[1, "local"], [4, "local"]]);
+});
+
 test("the palette finds and runs commands by fuzzy name", () => {
   let ed = boot(SAMPLE);
   ed = keys(ed, "<sp> <sp>");
@@ -224,7 +265,8 @@ test("save is an effect, not a side effect", () => {
   ed = key(ed, "Escape");
   ed = key(ed, "C-s");
   const [ed2, effects] = M.d_take_effects(ed).toArray();
-  const e = effects.toArray()[0];
+  // boot's placement request is first; the save follows
+  const e = effects.toArray().find((x) => get(x, "kind").name === "save");
   assert.equal(get(e, "kind").name, "save");
   assert.equal(get(e, "text"), "ba");
   assert.equal(get(ed2, "effects").cnt, 0);

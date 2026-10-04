@@ -9,7 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 out=apps/bl-ed/web/out
 ${RUN:-} bl js build js.eval -p priv/lib -p priv/boot --stub lower --with reader --host run --out "$out"
-${RUN:-} bl js build ed.main -p apps/bl-ed --host eval-ed --out "$out"
+${RUN:-} bl js build ed.main -p apps/bl-ed --host eval-ed,eval-cells --out "$out"
 # the language's own macros, read by the page at start (boot.mjs)
 mkdir -p "$out/src/priv/boot"
 cp priv/boot/core.bl priv/boot/sugar.bl "$out/src/priv/boot/"

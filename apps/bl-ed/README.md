@@ -45,7 +45,7 @@ and an action (`d c y p`, `>`, `C-c`, `space r`, …) applies to every selection
 | `m m` · `g j g k g H g L` | select the form under the cursor · form motion: first child / parent / previous / next |
 | `m i (` `m a (` `m s` `m c` `%` | inside / around the enclosing form · the section · the cell · matching delimiter |
 | `space r` `space w (` `space s` | raise · wrap · splice (structural edits in beam-lisp cells) |
-| `space e` / `C-Enter` | evaluate the cell on the BEAM and write `#+RESULTS` |
+| `space e` / `C-Enter` | evaluate the cell where it may run (● in the page, ◆ on the BEAM) and write `#+RESULTS` |
 | `C-s` | save |
 | `:` | evaluate a Beam Lisp form against the live editor |
 | `space space` / `M-x` | command palette (fuzzy) |
@@ -162,3 +162,15 @@ full structure.
 - IME composition is handled through the input sink (`compositionend` delivers
   one `:text` event). It has been tested with synthetic events, not yet with a
   real CJK input method.
+
+## Split cells: where does each cell run?
+
+On open and after every save, bl-ed asks the BEAM where each cell may run
+(`POST /api/place` → `system.place`, one whole-document analysis). A cell
+that is pure and provably terminates is marked **●** in the gutter and
+`space e` evaluates it **in the page**, through Beam Lisp compiled to JS, and
+writes its `#+RESULTS` at once (no round trip). Any other cell is marked
+**◆**; hover it to read why (`effect in an expression: footprint
+{:opaque-world :W}`), and `space e` runs it on the BEAM as before. Both
+write results through the same `bl.doc.spans/write-results`. Try it:
+`?file=apps/bl-ed/web/split-demo.bl.org`.
