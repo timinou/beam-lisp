@@ -72,6 +72,17 @@ fn verb_of(argv: &[String]) -> Option<String> {
 // ── tests: the daemon fast-path's verb detection ────────────────────────────
 #[cfg(test)]
 mod verb_tests {
+    #[test]
+    fn the_launcher_verb_table_is_what_main_answers() {
+        // every verb in the table is dispatched by `verb_of`, and spelled the way the CLI help lists it
+        for v in super::LAUNCHER_VERBS {
+            let argv = vec![v.to_string()];
+            assert_eq!(super::verb_of(&argv).as_deref(), Some(*v), "{v}");
+        }
+        assert_eq!(super::LAUNCHER_VERBS.len(), 5, "adding a verb is a row here, a row in bl.cli/LAUNCHER-VERBS, and a help line");
+        assert!(!super::LAUNCHER_VERBS.contains(&super::VERB_MAINTENANCE), "a drop's verb is not the PATH launcher's");
+    }
+
     use super::verb_of;
 
     fn v(args: &[&str]) -> Option<String> {
@@ -560,6 +571,20 @@ fn wait_ready(root: &std::path::Path, shared: bool) -> bool {
     false
 }
 
+/// The launcher's own verbs, spelled once. They answer questions about WHICH build runs, which only
+/// the launcher knows, so they are handled before any build is resolved or started. `bl help` lists
+/// them, and `test/bl/bl_transport_test.bl` reads this table from the source and pins it equal to the
+/// CLI's list (`bl.cli/LAUNCHER-VERBS`), so the launcher, the help and the docs cannot drift.
+pub const VERB_WHICH: &str = "which";
+pub const VERB_SELF_UPDATE: &str = "self-update";
+pub const VERB_SELF_INSTALL: &str = "self-install";
+pub const VERB_SELF_GC: &str = "self-gc";
+pub const VERB_HOOKS: &str = "hooks";
+pub const VERB_MAINTENANCE: &str = "maintenance"; // a DROP's own verb (it carries the payload)
+
+/// Every verb the PATH launcher answers itself, in the order `bl help` lists them.
+pub const LAUNCHER_VERBS: &[&str] = &[VERB_WHICH, VERB_SELF_UPDATE, VERB_SELF_INSTALL, VERB_SELF_GC, VERB_HOOKS];
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let me = std::env::current_exe().unwrap_or_else(|_| fail("cannot locate myself"));
@@ -570,7 +595,7 @@ fn main() {
     match try_read_trailer(&me) {
         Some(t) => {
             let sha8 = sha8_of(&t);
-            if argv.first().map(String::as_str) == Some("maintenance") {
+            if argv.first().map(String::as_str) == Some(VERB_MAINTENANCE) {
                 maintenance(&argv[1..], &t, &sha8);
             }
             run_build(&me, &t, &argv)
@@ -589,12 +614,11 @@ fn resolving_main(me: &std::path::Path, argv: &[String]) -> ! {
     let verb = verb_of(argv);
     let rest: Vec<String> = verb_index(argv).map(|i| argv[i + 1..].to_vec()).unwrap_or_default();
     match verb.as_deref() {
-        Some("which") => which(&store, &cwd, me),
-        Some("self-update") => finish(self_update(&store, rest.first().map(String::as_str), me, &cwd).map_err(bl_err)),
-        Some("self-install") => finish(self_install(me, &rest, &cwd).map_err(bl_err)),
-        Some("self-gc") => finish(self_gc(&rest).map_err(bl_err)),
-        Some("hooks") if rest.first().map(String::as_str) == Some("drain") => finish(drain(&store, me).map_err(bl_err)),
-        Some("hooks") => finish(hooks_verb(&store, &rest, me, &cwd).map_err(bl_err)),
+        Some(VERB_WHICH) => which(&store, &cwd, me),
+        Some(VERB_SELF_UPDATE) => finish(self_update(&store, rest.first().map(String::as_str), me, &cwd).map_err(bl_err)),
+        Some(VERB_SELF_INSTALL) => finish(self_install(me, &rest, &cwd).map_err(bl_err)),
+        Some(VERB_SELF_GC) => finish(self_gc(&rest).map_err(bl_err)),
+        Some(VERB_HOOKS) => finish(hooks_verb(&store, &rest, me, &cwd).map_err(bl_err)),
         _ => {}
     }
 

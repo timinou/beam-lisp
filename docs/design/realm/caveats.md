@@ -17,12 +17,20 @@ and every other realm running.
 twelve concurrent requests with different environments each saw only their own;
 closing one realm left the other's index owner the same process.
 
-**Not isolated (measured).** *Code.* Two projects that define a namespace of the
-same name get one namespace: the second sees the first one's. *Environment.* A
-project's `:env` is written into the node's OS environment by `bl.cli/with-project`,
-so a process that never bound a project reads the last one's values. These are
-why sharing is a project's declaration, not the build's default. Fixing them means
-making namespace publication and project binding realm-local (FUP-151).
+**Isolated by default (built in the loader; the manager wiring is PLAN-164 task 1a).** A namespace served from a project
+file compiles into a module named from its realm (`BeamLisp.Ns.R<key>.<Ns>`,
+`BeamLisp.Server.R<key>.<Ns>.<Name>`), so two projects that define the same
+namespace each keep their own, macros and servers included. Namespaces under a tier
+directory (std, lib, boot) stay shared. `test/bl/realm_namespace_test.bl` pins it.
+The manager does not yet create realm envs with a key, so a shared VM still
+publishes project code globally.
+
+**Not isolated (measured).** *Environment.* A project's `:env` is written into the
+node's OS environment by `bl.cli/with-project`, so a process that never bound a
+project reads the last one's values. *Registered names.* A named process, an ETS
+table or a `persistent_term` key in project code is one per VM. These are why
+sharing is a project's declaration, not the build's default (FUP-151,
+`!tasks/plans/PLAN-164-*`).
 
 **Not built.** One console with a page per realm. A shared VM starts no dashboard,
 because the dashboard's pages read one root.

@@ -1,0 +1,270 @@
+; connector/microsoft/graph.bl — SharePoint / OneDrive through Microsoft Graph,
+; shaped exactly like connector.google.gdrive so a caller treats providers
+; uniformly: `spec`, `item-map`, `feed` (the five keys connector.keep needs),
+; `browse`, `content-request`/`content!`, `get-via`.
+;
+; Credential model: an IT-registered Entra app, OAuth2 CLIENT CREDENTIALS
+; (tenant + client id + secret), scope `https://graph.microsoft.com/.default`.
+; There is no human and no refresh token: `credential/mint-app!` mints, and a
+; renewal is minting again (credential/refresh! does it for a grant that
+; carries :grant-type :client-credentials). The secret stays in the connection's
+; :client half; the stored grant carries only the token url and scope.
+;
+; ── Identity ────────────────────────────────────────────────────────────────
+;
+; An entity is `[:graph "<drive-id>" "<item-id>"]`. The namespace is the DRIVE
+; id, not `<tenant>/<drive>` (entities-and-projections.md first said the
+; latter). Reason: delta exists only per drive root, so one keep/feed is one
+; drive; and Graph drive ids are globally unique (`b!…`), so prefixing the
+; tenant adds characters, not information — and would make a rebind to the same
+; drive from a re-registered app (new tenant alias, same drive) look like a
+; different entity. Item ids are unique within the drive and stable across
+; rename and move.
+;
+; ── Not verified against a real tenant (docs/connectors/microsoft-graph.md) ──
+;   · root/delta under Sites.Selected (probe-delta names the outcome at connect)
+;   · whether a folder moved into scope reports its descendants (the keep
+;     assumes it does NOT and seeds the subtree — the strict reading)
+
+(ns connector.microsoft.graph
+  (:require [connector :as conn] [connector.http :as http] [credential :as cred] [credential.flow]
+            [credential.oauth2 :as oauth] [credential.flow] [credential.store :as store]
+            [connector.google.gdrive :as gdrive]))
+
+(def SCOPE "https://graph.microsoft.com/.default")
+
+(def spec
+  "What Graph IS for us: one service, one resource family (a drive's items).
+   `:scopes` is the one app-only scope; there is no per-API scope to choose."
+  {:service :microsoft
+   :id :graph
+   :base-url "https://graph.microsoft.com/v1.0"
+   :scopes [SCOPE]
+   :resources
+   {:items
+    {:list {:path "/drives/{drive}/items/{id}/children" :items "value" :next "@odata.nextLink"
+            :as {:relation :~file/files :mode :ff}}
+     :get  {:path "/drives/{drive}/items/{id}" :as {:relation :~file/files :mode :bf}}}}})
+
+(defn endpoints
+  "The two base URLs, as DATA. A fake (or a sovereign cloud) overrides them;
+   nothing else differs between a test run and a real one."
+  [cfg]
+  {:graph (get cfg :graph-base "https://graph.microsoft.com/v1.0")
+   :login (get cfg :login-base oauth/ENTRA-AUTHORITY)})
+
+(defn entity [drive-id item-id] [:graph drive-id item-id])
+
+;; ── connecting ──────────────────────────────────────────────────────────────
+
+(defn connect!
+  "Mint the app token for connection `c` and STORE the grant →
+   {:ok grant} | {:error … :disposition …}. `cfg` {:tenant … :login-base …}.
+   The secret is read from `(:client c)` and never written."
+  ([c cfg] (connect! c cfg nil))
+  ([c cfg post!]
+   (let [r (cred/mint-app! {:token-url (oauth/entra-token-endpoint (:login (endpoints cfg)) (:tenant cfg))
+                            :client-id (get-in c [:client :client-id])
+                            :client-secret (get-in c [:client :client-secret])
+                            :scope SCOPE
+                            :service (:service c) :account-id (:account-id c)
+                            :label (get cfg :label)}
+                           (or post! (fn [u b] (credential.flow/post-form! u b))))]
+     (when (cred/good? r) (store/-put (:store c) (:service c) (:account-id c) (cred/ok r)))
+     r)))
+
+;; ── items ───────────────────────────────────────────────────────────────────
+
+(defn item-map
+  "A driveItem → {:key :id :name :mime :folder? :modified :size :md5 :parents
+   :trashed :removed :rev}. `:rev` is the cTag (content) when present, else the
+   eTag — a metadata-only edit changes eTag but not cTag, and only content
+   re-owes a projection. The DRIVE ROOT (`root` facet) is a folder with no
+   parent. Graph has no trash flag in these views: a trashed item is `deleted`."
+  [drive-id it]
+  (let [root? (some? (get it "root"))
+        pid (get-in it ["parentReference" "id"])]
+    {:key (entity drive-id (get it "id"))
+     :id (get it "id")
+     :name (get it "name")
+     :mime (get-in it ["file" "mimeType"])
+     :folder? (or root? (some? (get it "folder")))
+     :modified (gdrive/millis (get it "lastModifiedDateTime"))
+     :size (get it "size")
+     :md5 nil
+     :parents (if (or root? (nil? pid)) [] [pid])
+     :trashed false
+     :removed (some? (get it "deleted"))
+     :rev (or (get it "cTag") (get it "eTag"))}))
+
+;; ── urls ────────────────────────────────────────────────────────────────────
+
+(defn delta-url [base drive-id token]
+  (conn/with-query (str base "/drives/" drive-id "/root/delta") [["token" token]]))
+
+(defn children-url [base drive-id folder-id]
+  (if (= "root" folder-id)
+    (str base "/drives/" drive-id "/root/children")
+    (str base "/drives/" drive-id "/items/" folder-id "/children")))
+
+(defn item-url [base drive-id id] (str base "/drives/" drive-id "/items/" id))
+
+;; ── the feed ────────────────────────────────────────────────────────────────
+
+(defn- stale [e]
+  (assoc e :resync true))
+
+(defn feed
+  "The Graph feed for ONE drive. The cursor is the FULL deltaLink URL, followed
+   verbatim: Graph's links are opaque and carry their own query state, so
+   rebuilding one from parts is how a cursor silently stops working.
+   A 410 is answered as `{:error {:status 410 :resync true …}}` — connector.keep
+   (M5) re-seeds, from the carried `:location` when Graph sent one.
+   `:enumerate` is the seed: one full tokenless delta (see below). Deleted items → {:key … :removed true}."
+  [drive-id base]
+  {:provider :graph
+   :namespace drive-id
+   :start-token (fn [get]
+                  (let [r (get (delta-url base drive-id "latest"))]
+                    (if (contains? r :ok)
+                      (let [l (get-in r [:ok "@odata.deltaLink"])]
+                        (if (nil? l) {:error {:status 0 :body "delta?token=latest answered no deltaLink"}} {:ok l}))
+                      r)))
+   :changes (fn [get token]
+              (let [r (get token)]
+                (cond
+                  (contains? r :ok)
+                  (let [b (:ok r)]
+                    {:ok {:items (mapv (fn [it] (let [m (item-map drive-id it)]
+                                                  (if (:removed m) {:key (:key m) :removed true} m)))
+                                       (into [] (or (get b "value") [])))
+                          :next (get b "@odata.nextLink")
+                          :cursor (get b "@odata.deltaLink")}})
+                  (= 410 (get-in r [:error :status]))
+                  ;; the Location header is a fresh FULL delta enumeration: carry it
+                  ;; out so the keep's re-seed starts there (docs: driveitem-delta, 410)
+                  {:error (assoc (stale (:error r)) :location (get-in r [:error :headers "location"]))}
+                  :else r)))
+   ;; Graph's children paging is NOT guaranteed complete under concurrent
+   ;; writes; a tokenless delta is the only guaranteed enumeration. `from` is a
+   ;; 410's Location (already a full delta URL) or nil for the drive root.
+   :enumerate (fn [get from]
+                (loop [url (or from (delta-url base drive-id nil)) out [] hops 0]
+                  (let [r (get url)]
+                    (cond
+                      (contains? r :error) r
+                      (> hops 10000) {:error {:status 0 :body "delta enumeration did not end"}}
+                      :else
+                      (let [b (:ok r)
+                            out (into out (keep (fn [it] (let [m (item-map drive-id it)] (if (:removed m) nil m)))
+                                                (into [] (or (get b "value") []))))
+                            nxt (get b "@odata.nextLink")]
+                        (cond
+                          (some? nxt) (recur nxt out (+ hops 1))
+                          (nil? (get b "@odata.deltaLink")) {:error {:status 0 :body "delta enumeration ended without a deltaLink"}}
+                          :else {:ok {:items out :cursor (get b "@odata.deltaLink")}}))))))
+   :children (fn [get parent-key page]
+               (let [r (get (or page (children-url base drive-id (nth parent-key 2))))]
+                 (if (contains? r :ok)
+                   {:ok {:items (mapv (fn [it] (item-map drive-id it)) (into [] (or (get-in r [:ok "value"]) [])))
+                         :next (get-in r [:ok "@odata.nextLink"])}}
+                   r)))
+   :item (fn [get key]
+           (let [r (get (item-url base drive-id (nth key 2)))]
+             (if (contains? r :ok) {:ok (item-map drive-id (:ok r))} r)))
+   :parent-key (fn [item] (let [ps (:parents item)]
+                            (if (empty? ps) nil (entity drive-id (first ps)))))})
+
+;; ── browse: from CONFIGURED sites (search=* is not allowed on Sites.Selected) ─
+
+(defn site-by-path
+  "The site at `host` + server-relative `path` (\"/sites/knowledger-test\") →
+   {:ok site-json} | {:error …}. GET /sites?search=* needs more than
+   Sites.Selected, so browsing starts from addresses an admin configured."
+  [get base host path]
+  (get (str base "/sites/" host ":" path)))
+
+(defn sites
+  "Resolve configured `addresses` [[host path] …] → {:ok [site-json …]} or the
+   first error (a site without a grant is a 403 NAMED by the address)."
+  [get base addresses]
+  (loop [as (into [] addresses) out []]
+    (if (empty? as) {:ok out}
+      (let [[h p] (first as)
+            r (site-by-path get base h p)]
+        (if (contains? r :error) (assoc r :address [h p])
+          (recur (rest as) (conj out (:ok r))))))))
+
+(defn drives
+  "The document libraries of `site-id` → {:ok [driveJson …]} | {:error …}."
+  [get base site-id]
+  (let [r (get (str base "/sites/" site-id "/drives"))]
+    (if (contains? r :ok) {:ok (into [] (or (get-in r [:ok "value"]) []))} r)))
+
+(defn browse
+  "Children of `folder-id` (\"root\" allowed) in `drive-id` as item maps, folders
+   first then by name. Live call; writes nothing (entities-and-projections R2)."
+  [get base drive-id folder-id]
+  (loop [url (children-url base drive-id folder-id) out []]
+    (let [r (get url)]
+      (if (contains? r :error) r
+        (let [out (into out (map (fn [it] (item-map drive-id it)) (or (get-in r [:ok "value"]) [])))
+              nxt (get-in r [:ok "@odata.nextLink"])]
+          (if (nil? nxt)
+            {:ok (into [] (sort-by (fn [f] [(if (:folder? f) 0 1) (String/downcase (or (:name f) ""))]) out))}
+            (recur nxt out)))))))
+
+(defn probe-delta
+  "One `delta?token=latest` call → {:ok :allowed} | {:error {:status 403 …}}.
+   The connect screen uses it to NAME whether Sites.Selected lets delta run
+   (docs/22 §2.6 call 4) before a library is bound."
+  [get base drive-id]
+  (let [r (get (delta-url base drive-id "latest"))]
+    (if (contains? r :ok) {:ok :allowed} r)))
+
+;; ── content ─────────────────────────────────────────────────────────────────
+
+(defn content-request
+  "How to read `item`'s bytes: {:url :limit :as mime} | {:refused :folder|:too-large}.
+   Office files go as-is (ingest decides); never `?format=pdf`."
+  [base item max-bytes]
+  (cond
+    (:folder? item) {:refused :folder}
+    (and (some? (:size item)) (> (:size item) max-bytes)) {:refused :too-large}
+    :else {:url (str (item-url base (nth (:key item) 1) (nth (:key item) 2)) "/content")
+           :limit max-bytes :as (:mime item)}))
+
+(defn content!
+  "The bytes of `item` → {:ok bin :mime m} | {:refused reason} | {:error …}.
+   `/content` answers 302 to a pre-authenticated URL; the redirect is read
+   WITHOUT following it (http/get-redirect) and fetched with NO bearer, so the
+   token never reaches the storage host. 403/404 → :no-access."
+  [c base item max-bytes]
+  (let [req (content-request base item max-bytes)]
+    (if (contains? req :refused) req
+      (let [loc (conn/authed! c (fn [bearer] (http/get-redirect (:url req) bearer)))]
+        (if (contains? loc :error)
+          (if (contains? #{403 404} (get-in loc [:error :status])) {:refused :no-access} loc)
+          (let [r (http/get-bytes (:ok loc) nil (:limit req))]
+            (cond
+              (contains? r :ok) {:ok (:ok r) :mime (or (:as req) (:content-type r))}
+              (= :too-large (get-in r [:error :reason])) {:refused :too-large}
+              (contains? #{403 404} (get-in r [:error :status])) {:refused :no-access}
+              :else r)))))))
+
+;; ── get-via ─────────────────────────────────────────────────────────────────
+
+(defn- retry-after [e]
+  (let [v (get-in e [:headers "retry-after"])]
+    (if (nil? v) nil (try (String/to_integer v) (catch _ nil)))))
+
+(defn get-via
+  "The `get` a keep or a browse uses: renews the app token (once on 401) through
+   `connector/get!`. A 429 comes back UNCHANGED plus `:retry-after` (seconds, or
+   nil) — backing off is the queue's job; nothing here sleeps."
+  [c]
+  (fn [url]
+    (let [r (conn/get! c url)]
+      (if (and (contains? r :error) (= 429 (get-in r [:error :status])))
+        (assoc-in r [:error :retry-after] (retry-after (:error r)))
+        r))))

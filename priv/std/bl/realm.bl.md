@@ -90,6 +90,8 @@ the page at `/` renders (`vm.inspect`), so the two faces cannot disagree.
             (u/each (fn [rt] (println (str "  route    " (vm/route-line rt))))
                     (to-list (:routes rm)))
             (println "")
+            ;; what the realm owns beyond the default: its alias, a shadow chip, shared code
+            (when-let [about (client/show root)] (println (String/trim_trailing about)))
             ;; the session's own account of itself, asked of the VM that holds it
             (client/status root)))
         0))))
