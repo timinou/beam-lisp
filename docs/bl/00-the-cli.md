@@ -72,7 +72,8 @@ beside others declares it in `env.bl`:
 Every project on one build that says `"shared"` then uses a single VM, and each
 command finds its project from the directory it runs in (the nearest `env.bl`
 at or above it). `bl realm stop` in such a project closes that project's realm and
-leaves the VM and the other projects running; `bl vm stop` ends the VM itself.
+leaves the VM and the other projects running; `bl realm members` lists what a
+project owns, `bl realm restart` closes and reopens it; `bl vm stop` ends the VM itself.
 
 Sharing is a choice because the VM keeps one copy of each namespace: two shared
 projects that both define a namespace named `app` share it. A source checkout is

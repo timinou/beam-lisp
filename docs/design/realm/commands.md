@@ -76,14 +76,22 @@ bl realm [show] [--json]            this project's VM, routes, address, status
 bl realm open [NAME] [--open]       the address of a route (default: ui)
 bl realm start [--foreground] [--idle SECONDS]   start this project's warm VM
 bl realm stop                       stop it
+bl realm members [--json]           what the realm owns: pid, role, how long
+bl realm restart                    close the realm and open it again
 ```
 
 The realm is found the way the warm VM finds it: the nearest `env.bl` (or tree
 root) above the current directory, or the directory `--root DIR` names.
 
-Today one VM serves one realm, so `bl realm stop` stops the VM. When one VM hosts
-many realms, `stop` drains only this realm and the VM stays for the others. The
-verb does not change.
+A project with its **own** VM has one realm, so `stop` stops that VM. A project
+served by a **shared** VM (`:vm "shared"`, see [`README.md`](README.md)) has a
+realm among others: `stop` closes only that realm, `restart` closes and reopens it,
+and the VM and every other project in it keep running. `bl vm stop` ends the
+process itself.
+
+`members` shows the realm's furniture as well as its work. The code index owner
+is listed under `index`; it does not keep an idle VM alive, a `serve` or a declared
+schedule does.
 
 ## Global flags
 
@@ -115,5 +123,4 @@ Why `--cold` is still needed, and what would remove each reason:
 |---|---|
 | `bl vm restart ID` | stop, then start the same role on the same build |
 | `bl vm top` | live terminal view of the same rows |
-| `bl realm restart` | drain and respawn this realm only |
-| `bl realm members` | the processes a realm owns, with elapsed time |
+

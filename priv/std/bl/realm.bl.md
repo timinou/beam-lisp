@@ -174,20 +174,57 @@ owns the VM's lifetime wants. The VM also records where its output goes
 &BeamLisp.Ns.Bl.Realm."cmd-stop"/1
 ```
 
+## members and restart
+
+`members` lists what this realm owns, one process per line with its role and how long
+it has run. A realm's index owner is there under `index`: it is the realm's furniture,
+not its work, and does not keep an idle VM alive. `restart` closes the realm and opens
+it again, which gives it a fresh index owner and re-arms its declared schedules; the VM
+and every other project in it keep running.
+
+```beam-lisp
+(defn- age-text
+  "Seconds as the shortest honest span: `45s`, `12m`, `3h`."
+  [s]
+  (cond (< s 90) (str s "s")
+        (< s 5400) (str (quot s 60) "m")
+        :else (str (quot s 3600) "h")))
+
+(defn cmd-members [st]
+  (let [root (root-of st)
+        rows (client/members root)]
+    (cond
+      (nil? rows) (none-running root)
+      (:json st) (do (println (bl.json/encode {:root root
+                                               :members (map (fn [r] {:pid (:pid r) :role (name (:role r)) :age-s (:age-s r)}) rows)}))
+                     0)
+      :else (do (println (str root "  " (count rows) " member(s)"))
+                (u/each (fn [r] (println (str "  " (:pid r) "  " (name (:role r)) "  " (age-text (:age-s r))))) (to-list rows))
+                0))))
+
+(defn cmd-restart [st]
+  (let [root (root-of st)]
+    (if (= 0 (client/restart root))
+      (do (println (str "bl realm: restarted " root)) 0)
+      (none-running root))))
+```
+
 ## The verb
 
 ```beam-lisp
 (defn run
-  "`bl realm [show|open|start|stop]`."
+  "`bl realm [show|open|start|stop|members|restart]`."
   [args st]
   (let [args (u/to-list args)
         sub (or (first args) "show")]
     (cond
-      (= sub "show")  (cmd-show st)
-      (= sub "open")  (cmd-open (rest args) st)
-      (= sub "start") (cmd-start st)
-      (= sub "stop")  (cmd-stop st)
-      :else (u/usage-error "usage: bl realm [show | open [NAME] [--open] | start [--foreground] | stop]  [--root DIR] [--json]"))))
+      (= sub "show")    (cmd-show st)
+      (= sub "open")    (cmd-open (rest args) st)
+      (= sub "start")   (cmd-start st)
+      (= sub "stop")    (cmd-stop st)
+      (= sub "members") (cmd-members st)
+      (= sub "restart") (cmd-restart st)
+      :else (u/usage-error "usage: bl realm [show | open [NAME] [--open] | start [--foreground] | stop | members | restart]  [--root DIR] [--json]"))))
 ```
 
 ```bl-result run
