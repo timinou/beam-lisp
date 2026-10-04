@@ -123,3 +123,15 @@ as the BEAM compiler does.
 | core (`test/js/diff`) | ~230 expressions, BEAM vs a JS build |
 | reader (`test/js/reader`) | the self-hosted reader in JS vs on BEAM, over 7 real sources (48 in the full run): identical forms |
 | eval (`test/js/eval`) | 76 forms evaluated by Beam Lisp IN JS (defs, macros, decimals, destructuring, try …) vs on BEAM: identical printed results |
+
+## Laziness (lazy.mjs)
+
+`lazy.mjs` is `BeamLisp.LazySeq`, `Deferred` and `SeqCursor` for JS: the BEAM's five cell states (pending, running, completed, failed, terminal), claim/complete/fail/release for fold recipes, and the leaf ABI rt.bl calls, name for name. It does not have waiters, versions or a cache budget; a page runs on one thread, so nothing else can run while a thunk runs. What a program can *see* matches the BEAM:
+- a node is realised once;
+- a thrown thunk can be retried;
+- a self-forcing node is `:recursive_force` (terminal);
+- a node whose value contains itself is `:cyclic_memo`;
+- a halted fold publishes nothing;
+- printing is bounded to 20 elements.
+
+`test/js/eval/lazy.bl` pins these answers, and `bl test test/bl/js_diff_test.bl` runs it. `test/js/eval/lazy-core.bl` pins the *producers*: chunked `map`/`filter` realise 32 at a time, and `list?`/`type` of a mapped seq. The hand-written core.mjs is eager, so this is the gate for core compiled from priv/boot (PLAN-163 U2).

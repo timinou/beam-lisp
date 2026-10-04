@@ -22,6 +22,7 @@
 import * as R from "./rt.mjs";
 import * as C from "./core.mjs";
 import { ENV } from "./env.mjs";
+import { LAZY_LEAVES } from "./lazy.mjs";
 import { LINKS, OPS } from "./core-links.mjs";
 const { EMPTY, Cons, Tup, Kw, HMap, Vec, BLError } = R;
 
@@ -345,6 +346,9 @@ ENV.declare_ns("core");
 /** Run one emitted function body. A page installs it as its `js/run` host
     fn: `globalThis.BL_HOST = { run }` before importing js.eval's build. */
 export function run(body) { return new Function("R", "C", "G", "X", body)(R, C, G, X); }
+
+// BeamLisp.LazySeq / SeqCursor / Deferred / LazyMemo.seen — lazy.mjs
+Object.assign(LEAVES, LAZY_LEAVES);
 
 // BeamLisp.Env — the namespace/var registry (env.mjs), every function at
 // the arity the BL sources call it with

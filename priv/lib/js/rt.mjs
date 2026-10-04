@@ -26,6 +26,8 @@
 
 // ─── scalars ────────────────────────────────────────────────────────────────
 
+import * as Z from "./lazy.mjs";
+
 export class Kw {
   constructor(ns, name) { this.ns = ns; this.name = name; this.fq = ns ? ns + "/" + name : name; this.h = 0; }
   toString() { return ":" + this.fq; }
@@ -89,36 +91,26 @@ export function symName(x) { return x.items[1]; }
 
 // ─── lists ──────────────────────────────────────────────────────────────────
 
+/** A list cell. `n` is the length of a PROPER list (ending in ()), and -1 for a
+    chain that ends in anything else — a lazy tail (`(cons 1 (map …))`, a
+    chunked seq's next node). Kept per cell so `count`, `=` and the printer ask
+    "is this a plain list?" in O(1) instead of walking to the end every time. */
 export class Cons {
-  constructor(h, t) { this.h = h; this.t = t; this.n = t instanceof Cons ? t.n + 1 : 1; }
+  constructor(h, t) {
+    this.h = h; this.t = t;
+    this.n = t instanceof Cons ? (t.n < 0 ? -1 : t.n + 1) : (t === EMPTY ? 1 : -1);
+  }
 }
 export const EMPTY = Object.freeze(Object.create(null, { __empty: { value: true } }));
 
-/** A lazy sequence: a thunk producing the seq's first cell (a Cons whose
-    tail may be another Lazy, or EMPTY), run at most once and memoized —
-    BEAM's LazySeq. Infinite producers (`iterate`, `cycle`, `repeat`) are
-    Lazy; consumers walk them one cell at a time. */
-export class Lazy {
-  constructor(thunk) { this.thunk = thunk; this.v = undefined; }
-  /** The realized cell: a Cons or EMPTY. */
-  cell() {
-    let x = this;
-    while (x instanceof Lazy) {
-      if (x.v === undefined) { const f = x.thunk; x.thunk = null; x.v = f(); if (x.v === null || x.v === undefined) x.v = EMPTY; }
-      x = x.v;
-    }
-    return x;
-  }
-}
-export function lazy(thunk) { return new Lazy(thunk); }
-/** Realize a whole (finite) lazy seq into ordinary Cons cells. */
+/** A lazy sequence is lazy.mjs's `LazySeq` (the BEAM's cell state machine).
+    `realize` turns a finite seq whose cells may be lazy into plain Cons cells. */
+export const Lazy = Z.LazySeq;
 export function realize(x) {
-  if (!(x instanceof Lazy) && !(x instanceof Cons && hasLazyTail(x))) return x;
-  const a = [];
-  for (let c = x instanceof Lazy ? x.cell() : x; c instanceof Cons; c = c.t instanceof Lazy ? c.t.cell() : c.t) a.push(c.h);
-  return listFromArray(a);
+  if (!(x instanceof Z.LazySeq) && !(x instanceof Cons && hasLazyTail(x))) return x;
+  return Z.toList(x);
 }
-function hasLazyTail(c) { for (let p = c; p instanceof Cons; p = p.t) if (p.t instanceof Lazy) return true; return false; }
+function hasLazyTail(c) { return c.n < 0; }
 export function cons(h, t) { return new Cons(h, t === null ? EMPTY : t); }
 export function list(...xs) { return listFromArray(xs); }
 export function listFromArray(a, from = 0) {
@@ -742,7 +734,13 @@ function escStr(s) {
 /** `pr-str` — the readable printer. */
 export function printStr(x) {
   if (x === null || x === undefined) return "nil";
-  if (x instanceof Lazy || (x instanceof Cons && hasLazyTail(x))) x = realize(x);
+  // a lazy or partly-lazy seq prints BOUNDED, as rt.bl's print-seq: at most 20
+  // elements, then ` …` — an infinite seq must never hang the printer
+  if (x instanceof Lazy || (x instanceof Cons && hasLazyTail(x))) {
+    const r = Z.sample(x, 20);
+    const a = []; for (let p = r.items[0]; p instanceof Cons; p = p.t) a.push(printStr(p.h));
+    return "(" + a.join(" ") + (r.items[1] ? " …" : "") + ")";
+  }
   switch (typeof x) {
     case "string": return escStr(x);
     case "number": case "bigint": return String(x);
@@ -761,6 +759,7 @@ export function printStr(x) {
   if (x instanceof Tup) return "{" + x.items.map(printStr).join(", ") + "}";
   if (x instanceof BLError) return "#error {:message " + escStr(x.message) + "}";
   if (x instanceof Atom) return "#<atom " + printStr(x.v) + ">";
+  if (x instanceof Z.Delay) return "#<delay " + (x.seq.s[0] === 2 ? printStr(x.seq.s[1]) : ":pending") + ">";
   return "#<host " + Object.prototype.toString.call(x) + ">";
 }
 /** `str` of one value: strings bare, nil empty, keywords with their colon. */
