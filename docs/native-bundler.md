@@ -576,8 +576,11 @@ only what it reads:
 anything else). OTP/Elixir are separate store paths, never rebuilt by a `.bl`
 change. Measured (this host, loaded): a one-line `.bl` change on the **old**
 single derivation = 54 min buildPhase (every NIF + the launcher recompiled,
-~54 min wall total 3235 s); after the split the NIF/tool compile is skipped
-(first build of the split also had to build `natives` once).
+~54 min wall total 3235 s). After the split a `.bl` change should not
+rebuild `natives`/`drop-tools` — by construction of the filesets, NOT yet
+measured: the first split build was stopped before it finished (2026-10-04),
+so neither the split drop nor the gates below have run green yet
+(apps/foundry FUP-016).
 
 Gates (`nix flake check`, also the CI `nix-drop` job): `drop-runs` (the drop
 evaluates `(+ 1 2)` = 3) and `glibc-floor` (≤ 2.40). `tooling/drop/check-pins.sh`
