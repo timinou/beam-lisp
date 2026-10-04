@@ -20,6 +20,10 @@
 #   windows/x64   — same; launcher triple x86_64-pc-windows-gnu + 7z for the
 #                   OTP installer unpack.
 #
+# A drop that ships to a SERVER must not be built here: it would link this
+# machine's glibc. Use the nix build instead (`nix build .#bl-drop`), pinned to
+# the servers' nixpkgs — docs/native-bundler.md §16.
+#
 # usage: ./make-drops.sh [RELEASE_DIR]   (default: MIX_ENV=prod mix release output)
 set -e
 cd "$(dirname "$0")"
