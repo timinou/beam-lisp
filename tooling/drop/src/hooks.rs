@@ -172,6 +172,13 @@ pub fn request_build(store: &Store, tree: &Path, me: &Path) {
 /// its caller's log and session files as fds 14 and 44). A long-lived child
 /// holding a pipe it inherited is what hangs `direnv` entry on this host
 /// (~/.agents/AGENTS.md), so every one above 2 is closed before exec.
+///
+/// It also drops git's per-invocation environment. A hook runs with
+/// `GIT_DIR` / `GIT_INDEX_FILE` (and friends) pointing at the worktree that
+/// fired it; any git the drainer runs later — `git worktree add` of another
+/// commit — would inherit them and write THAT worktree's index with another
+/// tree (measured: a commit in one worktree recorded main's tree, because the
+/// drainer checked out main's tip into the firing worktree's index).
 fn spawn_detached(me: &Path, args: &[&str], cwd: &Path) {
     let mut cmd = Command::new(me);
     cmd.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -338,9 +345,7 @@ fn guard_latest(cwd: &Path) -> Result<(), String> {
     let Some(src) = source_repo() else {
         return Ok(()); // no local beam-lisp: this machine's latest IS CI's
     };
-    let fetched = Command::new("git")
-        .arg("-C")
-        .arg(&src)
+    let fetched = git_at(&src)
         .args(["fetch", "--quiet", "origin", "main"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

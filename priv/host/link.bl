@@ -98,7 +98,25 @@
          all_defs (Map/put (BeamLisp.Env/ns_defs ns) name body_defs)
          body_clauses (Enum/map body_defs (fn [entry] (erlang/element 4 entry)))
          body_beam (BeamLisp.Emit/compile_descriptor (BeamLisp.Emit/descriptor_for body_mod body_clauses))
-         shim_beam (BeamLisp.Emit/compile_descriptor (BeamLisp.Emit/descriptor_for mod (BeamLisp.Emit/shim_clauses all_defs)))
+         ; {fname, arity} the shim must answer for this def
+         keys (Enum/uniq (Enum/map body_defs
+                           (fn [e] (tuple (erlang/element 3 e)
+                                          (erlang/length (erlang/map_get :params (erlang/element 4 e)))))))
+         state (let [r (BeamLisp.Env/lookup (tuple :shim_state ns))]
+                 (if (erlang/is_tuple r) (if (erlang/== :ok (erlang/element 1 r)) (erlang/element 2 r) nil) nil))
+         size (if (erlang/is_tuple state) (erlang/element 1 state) 0)
+         pending (if (erlang/is_tuple state) (erlang/element 2 state) 0)
+         ; FORWARD instead of recompiling the shim when the live shim can
+         ; route an unknown name (it carries the forwarding handler) and this
+         ; def adds only names it does not export yet. Recompiling the whole
+         ; shim per def made a source load O(N²) in its defs (BUG-112); with
+         ; a rebuild only when the pending names outgrow the compiled ones,
+         ; the shims compiled over a load sum to O(N). A REdefinition of an
+         ; exported name always rebuilds: the old shim calls the old body.
+         forward? (and (erlang/function_exported mod :"$handle_undefined_function" 2)
+                       (Enum/all? keys (fn [k] (erlang/not (erlang/function_exported mod (erlang/element 1 k) (erlang/element 2 k)))))
+                       (erlang/< (erlang/+ pending 1) (erlang/max 8 size)))
+         shim_beam (if forward? nil (compile_shim mod all_defs ns))
          ; `publication_filename/1` inlined: nil → the live default; a keyword
          ; list → its `:file` value (or the default when absent/false); anything
          ; else → `to_string/1` of it. `Access/get/2` is exactly the `location[:file]`
@@ -110,11 +128,16 @@
                     (list? location)
                     (String.Chars/to_string (or (Access/get location :file) "beam_lisp_live"))
                     :else (String.Chars/to_string location))]
-     ; The regenerated shim has no `__bl_ns_defs__/0`: turn every env's reference
-     ; to the OLD shim's table into the map it stands for before that shim goes.
-     (BeamLisp.Env/unlink_ns_defs ns)
      (BeamLisp.Emit/load_binary! body_beam filename)
-     (BeamLisp.Emit/load_binary! shim_beam filename)
+     (if forward?
+       (do (Enum/each keys (fn [k] (BeamLisp.Env/put_key (tuple :fwd ns (erlang/element 1 k) (erlang/element 2 k)) body_mod)))
+           (BeamLisp.Env/put_key (tuple :shim_state ns) (tuple size (erlang/+ pending 1) filename)))
+       (do
+         ; The regenerated shim has no `__bl_ns_defs__/0`: turn every env's
+         ; reference to the OLD shim's table into the map it stands for first.
+         (BeamLisp.Env/unlink_ns_defs ns)
+         (BeamLisp.Emit/load_binary! shim_beam filename)
+         (BeamLisp.Env/put_key (tuple :shim_state ns) (tuple (erlang/map_size all_defs) 0 filename))))
      (BeamLisp.Env/put_ns_defs ns all_defs)
      (let [shapes (BeamLisp.Emit/fixed_variadic new_defs)
            fixed (first shapes)
@@ -122,3 +145,58 @@
            value (BeamLisp.Emit/fn_value mod fixed variadic)]
        (BeamLisp.Env/put_key (tuple :link ns name) (tuple mod (Map/new fixed) variadic))
        (BeamLisp.Env/intern ns name value)))))
+
+; ── the forwarding shim (BUG-112) ─────────────────────────────────────────────────────
+;
+; A live shim carries one extra clause, `$handle_undefined_function/2`: the VM
+; calls it for any name the shim does not export. It forwards to the body
+; module recorded for that `{fname, arity}` (`defvar` writes the row when it
+; skips a rebuild), so a def is callable — by direct call, capture or apply —
+; the moment `defvar` returns, before the shim is rebuilt to export it.
+; `settle/1` rebuilds once at the end of a load, so steady-state calls are
+; plain exported calls again.
+
+(defn compile_shim
+  "The `{module, beam}` of `ns`'s shim over `all_defs`: one forwarding clause
+   per {fname, arity}, plus the undefined-function handler."
+  [mod all_defs ns]
+  (BeamLisp.Emit/compile_descriptor
+    (BeamLisp.Emit/descriptor_for mod
+      (erlang/++ (BeamLisp.Emit/shim_clauses all_defs)
+                 (list (BeamLisp.Emit/function_clause :"$handle_undefined_function"
+                         (BeamLisp.Emit/remote :Elixir.BeamLisp.Link :forward
+                           (list (BeamLisp.Emit/lit ns) (BeamLisp.Emit/var "f") (BeamLisp.Emit/var "args")))
+                         (list {:pop :pvar :name "f"} {:pop :pvar :name "args"})))))))
+
+(defn forward
+  "Route a call of `fname` with `args` on `ns`'s shim to the body module that
+   defines it, or raise the VM's own `undef` when nothing does."
+  [ns fname args]
+  (let [r (BeamLisp.Env/lookup (tuple :fwd ns fname (erlang/length args)))]
+    (if (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+      (erlang/apply (erlang/element 2 r) fname args)
+      (error_handler/raise_undef_exception (BeamLisp.Emit/module_for ns) fname args))))
+
+(defn settle
+  "Rebuild every namespace shim that has defs waiting behind the forwarding
+   handler, so each def is an exported function again — the one rebuild a
+   whole source load pays. A no-op when nothing is pending. Returns :ok."
+  []
+  (Enum/each
+    (ets/match_object :beam_lisp_vars (tuple (tuple :_ :shim_state :_) :_))
+    (fn [row]
+      (let [ns (erlang/element 3 (erlang/element 1 row))
+            st (erlang/element 2 row)]
+        (when (and (erlang/is_tuple st) (erlang/< 0 (erlang/element 2 st)))
+          (let [mod (BeamLisp.Emit/module_for ns)
+                all_defs (BeamLisp.Env/ns_defs ns)
+                beam (compile_shim mod all_defs ns)]
+            (BeamLisp.Env/unlink_ns_defs ns)
+            ; published under the filename of the def that last skipped a
+            ; rebuild, as the per-def path would have published it
+            (BeamLisp.Emit/load_binary! beam (erlang/element 3 st))
+            ; every name is exported again: the routes are dead weight
+            (ets/match_delete :beam_lisp_vars (tuple (tuple :_ :fwd ns :_ :_) :_))
+            (BeamLisp.Env/put_key (tuple :shim_state ns) (tuple (erlang/map_size all_defs) 0 (erlang/element 3 st))))))))
+  :ok)
+

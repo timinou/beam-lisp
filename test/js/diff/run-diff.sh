@@ -15,24 +15,8 @@ mkdir -p "$out"
 run=${RUN:-}
 
 cd "$root"
-JS_ENTRY=diff.corpus JS_OUT="$out" JS_ROOTS="test/js/diff" $run bl run scripts/js-build.bl >"$out/build.log" 2>&1 \
+$run bl js build diff.corpus -p test/js/diff --out "$out" >"$out/build.log" 2>&1 \
   || { grep -v '^  at' "$out/build.log" | tail -5; exit 2; }
 (cd "$here" && $run bl run beam-side.bl) 2>&1 | grep -P '^[a-z-]+\t' >"$out/beam.out"
 node "$here/js-side.mjs" "$out" >"$out/js.out"
-node --input-type=module -e "
-import { canon } from '$here/canon.mjs';
-import fs from 'node:fs';
-const read = f => Object.fromEntries(fs.readFileSync(f, 'utf8').trim().split('\n').map(l => { const i = l.indexOf('\t'); return [l.slice(0, i), l.slice(i + 1)]; }));
-const b = read('$out/beam.out'), j = read('$out/js.out');
-let bad = 0;
-for (const k of Object.keys(b)) {
-  const bc = canon(b[k]), jc = canon(j[k] ?? '#missing');
-  if (bc === jc) { console.log('SAME  ' + k); continue; }
-  bad++;
-  const bs = bc.split(' '), js = jc.split(' ');
-  let i = 0; while (i < bs.length && bs[i] === js[i]) i++;
-  console.log('DIFF  ' + k + ' at token ' + i + ':\n  beam: …' + bs.slice(Math.max(0, i - 3), i + 6).join(' ') + '\n  js:   …' + js.slice(Math.max(0, i - 3), i + 6).join(' '));
-}
-console.log(bad === 0 ? 'diff: all ' + Object.keys(b).length + ' cases identical' : 'diff: ' + bad + ' case(s) differ');
-process.exit(bad === 0 ? 0 : 1);
-"
+node "$here/compare.mjs" "$out/beam.out" "$out/js.out"

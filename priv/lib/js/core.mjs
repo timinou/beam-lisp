@@ -16,6 +16,7 @@
 // a list and a vector are one sequential family, `(map inc [1 2])` prints `(2 3)`.
 
 import * as R from "./rt.mjs";
+import * as Z from "./lazy.mjs";
 const { EMPTY, EMPTY_VEC, EMPTY_MAP, EMPTY_SET, Cons, Vec, HMap, HSet, Kw, Sym, Flt, Tup, BLError, Atom } = R;
 
 // ─── callables ──────────────────────────────────────────────────────────────
@@ -30,7 +31,6 @@ export function invoke(f, ...args) {
   if (f instanceof HMap) return f.get(args[0], args.length > 1 ? args[1] : null);
   if (f instanceof HSet) return f.has(args[0]) ? args[0] : (args.length > 1 ? args[1] : null);
   if (f instanceof Vec) { const v = f.nth(args[0], NF); if (v === NF) throw new BLError("index " + R.printStr(args[0]) + " out of bounds"); return v; }
-  if (f instanceof Sym) return get(args[0], f, args.length > 1 ? args[1] : null);
   throw new BLError(R.printStr(f) + " is not a function");
 }
 const NF = { nf: true };
@@ -42,8 +42,16 @@ export const NOT_FOUND = NF;
 
 /** Iterate any seqable (nil, list, vector, map entries, set, string). */
 export function* seqIter(x) {
+  if (x instanceof Z.LazySeq || x instanceof Z.SeqCursor) x = Z.cell(x);
   if (x === null || x === undefined || x === EMPTY) return;
-  if (x instanceof Cons) { for (let p = x; p instanceof Cons; p = p.t) yield p.h; return; }
+  if (x instanceof Cons) {
+    // a cons chain may end in a lazy tail (iterate/cycle/lazy-seq): step into it
+    for (let p = x; ; ) {
+      if (p instanceof Z.LazySeq || p instanceof Z.SeqCursor) p = Z.cell(p);
+      if (!(p instanceof Cons)) return;
+      yield p.h; p = p.t;
+    }
+  }
   if (x instanceof Vec) { yield* x; return; }
   if (x instanceof HMap) { for (const [k, v] of x.entries()) yield R.vec(k, v); return; }
   if (x instanceof HSet) { yield* x.elements().sort(R.compare); return; }
@@ -56,9 +64,12 @@ export function toArray(x) {
   const a = []; for (const e of seqIter(x)) a.push(e); return a;
 }
 const L = (a) => R.listFromArray(a);
+/** Does a cons chain end in something other than () — a lazy tail? */
+function hasLazy(c) { return c.n < 0; }
 
 export function seq(x) {
   if (x === null || x === undefined) return null;
+  if (x instanceof Z.LazySeq || x instanceof Z.SeqCursor) { const c = Z.cell(x); return c === null ? null : c; }
   if (x instanceof Cons) return x;
   if (x === EMPTY) return null;
   if (x instanceof Vec || x instanceof HMap || x instanceof HSet) return x.cnt === 0 ? null : L(toArray(x));
@@ -67,6 +78,7 @@ export function seq(x) {
 }
 export function first(x) {
   if (x === null || x === undefined || x === EMPTY) return null;
+  if (x instanceof Z.LazySeq) { const c = Z.cell(x); return c === null ? null : c.h; }
   if (x instanceof Cons) return x.h;
   if (x instanceof Vec) return x.cnt === 0 ? null : x.nth(0);
   for (const e of seqIter(x)) return e;
@@ -74,17 +86,27 @@ export function first(x) {
 }
 export function rest(x) {
   if (x instanceof Cons) return x.t;
+  // the tail of a realized cell, which may itself be lazy (an infinite seq
+  // stays infinite); an exhausted lazy seq is ()
+  if (x instanceof Z.LazySeq) { const c = Z.cell(x); return c === null ? EMPTY : c.t; }
   if (x === null || x === undefined || x === EMPTY) return EMPTY;
   const a = toArray(x); return a.length <= 1 ? EMPTY : L(a.slice(1));
 }
-export function next(x) { const r = rest(x); return r === EMPTY ? null : r; }
+export function next(x) { const r = rest(x); return r === EMPTY ? null : seq(r); }
 export function second(x) { return first(next(x)); }
 export function last(x) {
   if (x instanceof Vec) return x.cnt === 0 ? null : x.nth(x.cnt - 1);
   let l = null; for (const e of seqIter(x)) l = e; return l;
 }
 export function butlast(x) { const a = toArray(x); return a.length <= 1 ? null : L(a.slice(0, -1)); }
-export function cons(h, t) { return R.cons(h, t instanceof Cons || t === EMPTY ? t : (seq(t) || EMPTY)); }
+/** BEAM `cons` (rt.bl): onto nil/() a one-element list, onto a list or a
+    LAZY seq a cell whose tail is that value UNFORCED (an infinite or
+    self-referential seq stays lazy), onto anything else its seq. */
+export function cons(h, t) {
+  if (t === null || t === undefined) return new Cons(h, EMPTY);
+  if (t instanceof Cons || t === EMPTY || t instanceof Z.LazySeq) return new Cons(h, t);
+  return R.cons(h, seq(t) || EMPTY);
+}
 /** Grapheme clusters (BEAM `count` on a string is String.length: graphemes,
     measured (count "é👍🏽") = 2). Intl.Segmenter where the host has it. */
 const SEG = typeof Intl !== "undefined" && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
@@ -92,7 +114,8 @@ export function graphemes(s) { if (SEG) { const out = []; for (const g of SEG.se
 function strCount(s) { if (s.length < 64 ? /^[\x00-\x7f]*$/.test(s) : asciiLong(s)) return s.length; return graphemesCached(s).length; }
 export function count(x) {
   if (x === null || x === undefined || x === EMPTY) return 0;
-  if (x instanceof Cons) return x.n;
+  if (x instanceof Cons) return hasLazy(x) ? Z.count(x) : x.n;
+  if (x instanceof Z.LazySeq) return Z.count(x);
   if (x instanceof Vec || x instanceof HMap || x instanceof HSet) return x.cnt;
   if (typeof x === "string") return strCount(x);
   if (x instanceof Tup) return x.items.length;
@@ -103,7 +126,7 @@ export function count(x) {
 export function nth(x, i, dflt) {
   const d = arguments.length > 2 ? dflt : null;
   if (x instanceof Vec) return x.nth(i, d);
-  if (x instanceof Cons) { let p = x, k = i; while (k > 0 && p instanceof Cons) { p = p.t; k--; } return (k === 0 && p instanceof Cons) ? p.h : d; }
+  if (x instanceof Cons || x instanceof Z.LazySeq) { let p = Z.cell(x), k = i; while (k > 0 && p !== null) { p = Z.cell(p.t); k--; } return (k === 0 && p !== null) ? p.h : d; }
   if (x === null || x === undefined || x === EMPTY) return d;
   if (typeof x === "string") throw new BLError("nth is not supported on a string");
   const a = toArray(x); return i >= 0 && i < a.length ? a[i] : d;
@@ -334,7 +357,7 @@ export function fnil(f, ...ds) { return (...args) => invoke(f, ...args.map((a, i
     callables follow Clojure: keywords, maps, sets take 1-2, vectors 1. */
 export function invocable_Q(v, n) {
   if (typeof v === "function") return true;
-  if (v instanceof Kw || v instanceof Sym || v instanceof HMap || v instanceof HSet) return n === 1 || n === 2;
+  if (v instanceof Kw || v instanceof HMap || v instanceof HSet) return n === 1 || n === 2;
   if (v instanceof Vec) return n === 1;
   return false;
 }
@@ -360,10 +383,11 @@ export const ifn_Q = (x) => typeof x === "function" || x instanceof Kw || x inst
 export const map_Q = (x) => x instanceof HMap;
 export const vector_Q = (x) => x instanceof Vec;
 export const set_Q = (x) => x instanceof HSet;
+// a lazy seq is seq?/sequential?/coll? but not list? (BEAM, measured 2026-10-04)
 export const list_Q = (x) => x instanceof Cons || x === EMPTY;
-export const seq_Q = (x) => x instanceof Cons || x === EMPTY;
-export const sequential_Q = (x) => x instanceof Vec || x instanceof Cons || x === EMPTY;
-export const coll_Q = (x) => x instanceof Vec || x instanceof Cons || x === EMPTY || x instanceof HMap || x instanceof HSet;
+export const seq_Q = (x) => x instanceof Cons || x === EMPTY || x instanceof Z.LazySeq;
+export const sequential_Q = (x) => x instanceof Vec || x instanceof Cons || x === EMPTY || x instanceof Z.LazySeq;
+export const coll_Q = (x) => x instanceof Vec || x instanceof Cons || x === EMPTY || x instanceof HMap || x instanceof HSet || x instanceof Z.LazySeq;
 export const associative_Q = (x) => x instanceof HMap || x instanceof Vec;
 export const zero_Q = (x) => R.numEq(x, 0);
 export const pos_Q = (x) => R.gt(x, 0);
@@ -406,9 +430,9 @@ export function bit_or(a, b) { return a | b; }
 
 export function str(...xs) { let s = ""; for (const x of xs) s += R.strOf(x); return s; }
 export function pr_str(...xs) { return xs.map(R.printStr).join(" "); }
-export function name(x) { if (typeof x === "string") return x; if (x instanceof Kw) return x.name; if (x instanceof Sym) return x.name; throw new BLError("name of " + R.printStr(x)); }
-export function namespace(x) { return x instanceof Kw ? x.ns : null; }
-export function keyword(a, b) { if (b !== undefined) return R.kw(a + "/" + b); if (a instanceof Kw) return a; return R.kw(a instanceof Sym ? a.name : a); }
+export function name(x) { if (typeof x === "string") return x; if (x instanceof Kw) return x.name; if (x instanceof Sym) { const n = R.symName(x); const i = n.indexOf("/"); return i > 0 ? n.slice(i + 1) : n; } throw new BLError("name of " + R.printStr(x)); }
+export function namespace(x) { if (x instanceof Kw) return x.ns; if (x instanceof Sym) { const n = R.symName(x); const i = n.indexOf("/"); return i > 0 ? n.slice(0, i) : null; } return null; }
+export function keyword(a, b) { if (b !== undefined) return R.kw(a + "/" + b); if (a instanceof Kw) return a; return R.kw(a instanceof Sym ? R.symName(a) : a); }
 export function symbol(x) { return R.sym(x instanceof Kw ? x.fq : x); }
 /** `subs` by GRAPHEME index, as BEAM's String.slice (é and 👍🏽 are one each).
  *
@@ -475,7 +499,7 @@ export function repeat_str(s, n) { return s.repeat(Math.max(0, n)); }
 // ─── atoms ──────────────────────────────────────────────────────────────────
 
 export function atom(v) { return new Atom(v); }
-export function deref(a) { return a.v; }
+export function deref(a) { return a instanceof Z.Delay ? Z.deferredForce(a) : a.v; }
 export function reset_BANG(a, v) { const old = a.v; a.v = v; notify(a, old, v); return v; }
 export function swap_BANG(a, f, ...args) { const old = a.v; const v = invoke(f, old, ...args); a.v = v; notify(a, old, v); return v; }
 export function add_watch(a, k, f) { a.watches = (a.watches || EMPTY_MAP).assoc(k, f); return a; }
@@ -508,20 +532,27 @@ let OUT = (s) => { if (typeof console !== "undefined") console.log(s); };
 export function set_out_BANG(f) { OUT = f; }
 export function println(...xs) { OUT(xs.map(R.strOf).join(" ")); return null; }
 export function prn(...xs) { OUT(xs.map(R.printStr).join(" ")); return null; }
+/** `type`, measured against BEAM (2026-10-04): nil → nil, a string is
+    :binary, a symbol (a {:symbol name} tuple) is :tuple, a set is
+    :Elixir.BeamLisp.Set, a decimal :Elixir.BeamLisp.Decimal, an atom ref
+    :Elixir.BeamLisp.Atom; lists/vectors/maps/fns as their names. */
 export function type(x) {
-  if (x === null || x === undefined) return R.kw("nil");
-  if (typeof x === "string") return R.kw("string");
+  if (x === null || x === undefined) return null;
+  if (typeof x === "string") return R.kw("binary");
   if (typeof x === "boolean") return R.kw("boolean");
   if (R.isInt(x)) return R.kw("integer");
   if (x instanceof Flt) return R.kw("float");
+  if (x instanceof R.Dec) return R.kw("Elixir.BeamLisp.Decimal");
   if (x instanceof Kw) return R.kw("keyword");
-  if (x instanceof Sym) return R.kw("symbol");
+  if (x instanceof Tup) return R.kw("tuple");
   if (x instanceof Vec) return R.kw("vector");
   if (x instanceof HMap) return R.kw("map");
-  if (x instanceof HSet) return R.kw("set");
+  if (x instanceof HSet) return R.kw("Elixir.BeamLisp.Set");
   if (x instanceof Cons || x === EMPTY) return R.kw("list");
+  if (x instanceof Z.LazySeq) return R.kw("seq");
+  if (x instanceof Z.Delay) return R.kw("Elixir.BeamLisp.Delay");
   if (typeof x === "function") return R.kw("fn");
-  if (x instanceof Atom) return R.kw("atom");
+  if (x instanceof Atom) return R.kw("Elixir.BeamLisp.Atom");
   return R.kw("host");
 }
 
@@ -530,7 +561,87 @@ export function type(x) {
 // JS identifiers cannot carry `?`, `!`, `-`, `=`, so exports use _Q/_BANG/_
 // spellings; the registry maps every BL name the compiler can emit to them.
 
+// ─── metadata, list*, refs, transients (the rest of BEAM's core table) ──────
+// Measured against BEAM (2026-10-04): (meta (with-meta [1] {:a 1})) {:a 1};
+// (meta [1]) nil; (list* 1 2 [3 4]) (1 2 3 4); (list* [1]) [1];
+// (boolean nil) false; (ident? :a) true; (struct? {}) false;
+// (doall s) the realized seq; (dorun s) nil; volatile!/vswap!; transients.
+
+function withMetaColl(x, m) {
+  if (x instanceof Vec) return new Vec(x.cnt, x.shift, x.root, x.tail, m);
+  if (x instanceof HMap) return new HMap(x.cnt, x.root, m);
+  if (x instanceof HSet) return new HSet(x.m, m);
+  if (x instanceof Cons) { const c = new Cons(x.h, x.t); c.meta = m; return c; }
+  if (typeof x === "function") { const f = (...a) => x(...a); f.meta = m; return f; }
+  throw new BLError("with-meta: " + R.printStr(x) + " cannot carry metadata");
+}
+export function meta(x) { return (x && typeof x === "object") || typeof x === "function" ? (x.meta ?? null) : null; }
+export function with_meta(x, m) { return withMetaColl(x, m); }
+export function vary_meta(x, f, ...args) { return withMetaColl(x, invoke(f, meta(x), ...args)); }
+export function list_star(...xs) {
+  if (xs.length === 1) return xs[0];
+  let r = seq(xs[xs.length - 1]); const tail = r === null ? EMPTY : (r instanceof Cons || r === EMPTY ? r : L(toArray(r)));
+  let out = tail; for (let i = xs.length - 2; i >= 0; i--) out = new Cons(xs[i], out);
+  return out;
+}
+export function boolean_(x) { return R.truthy(x); }
+export function ident_Q(x) { return x instanceof Kw || x instanceof Sym; }
+export function struct_Q(_x) { return false; }
+/** Realize the whole seq (BEAM: doall answers the seq, dorun nil). */
+export function doall(s) { if (s instanceof Z.LazySeq) Z.run(s); return s; }
+export function dorun(s) { if (s instanceof Z.LazySeq) Z.run(s); return null; }
+class Volatile { constructor(v) { this.v = v; } }
+export function volatile_B(v) { return new Volatile(v); }
+export function vreset_B(vol, v) { vol.v = v; return v; }
+export function vswap_B(vol, f, ...args) { vol.v = invoke(f, vol.v, ...args); return vol.v; }
+export function volatile_Q(x) { return x instanceof Volatile; }
+export function transientable_Q(x) { return x instanceof Vec || x instanceof HMap || x instanceof HSet; }
+// transients are the persistent value under a mutable box: a one-owner
+// builder, observably the same as the BEAM's (persistent! yields the value)
+class Transient { constructor(v) { this.v = v; } }
+export function transient(x) { return new Transient(x); }
+export function persistent_B(t) { return t.v; }
+export function conj_B(t, ...xs) { if (xs.length === 0) return t; for (const x of xs) t.v = conj(t.v, x); return t; }
+export function assoc_B(t, k, v) { t.v = assoc(t.v, k, v); return t; }
+export function dissoc_B(t, k) { t.v = dissoc(t.v, k); return t; }
+
+// ─── infinite / lazy producers (BEAM core is lazy here) ─────────────────────
+// (take 3 (iterate inc 0)) (0 1 2); (take 4 (cycle [1 2])) (1 2 1 2);
+// (take 2 (repeat :x)) (:x :x). Consumers walk them through seqIter.
+export function iterate(f, x) { const step = (v) => new Z.LazySeq(() => new Cons(v, step(invoke(f, v)))); return step(x); }
+export function cycle(c) {
+  const xs = toArray(c); if (xs.length === 0) return EMPTY;
+  const from = (i) => new Z.LazySeq(() => new Cons(xs[i % xs.length], from(i + 1)));
+  return from(0);
+}
+export function repeat_(n, x) {
+  if (arguments.length >= 2) return L(new Array(Math.max(0, n)).fill(x));
+  const inf = () => new Z.LazySeq(() => new Cons(n, inf()));
+  return inf();
+}
+/** `realized?`: a delay or lazy seq that has published its value (a
+    non-lazy value is trivially realized). */
+export function realized_Q(x) {
+  if (x instanceof Z.Delay) return Z.deferredRealized(x);
+  if (x instanceof Z.LazySeq) return x.s[0] === 2;
+  return true;
+}
+/** `lazy-seq`'s runtime half: a lazy node over a zero-arity thunk — the
+    `BeamLisp.LazySeq/from_fun` leaf the `lazy-seq` macro expands to. */
+export function lazy_seq(thunk) { return Z.newLazy(() => invoke(thunk)); }
+
+let GENSYM = 0;
+/** `(gensym)` / `(gensym "p")`: a fresh SYMBOL `G__N__auto` / `p__N__auto`. */
+export function gensym(prefix) { return R.sym((prefix === undefined ? "G" : prefix instanceof Kw ? prefix.fq : String(prefix)) + "__" + (++GENSYM) + "__auto"); }
+
 export const CORE = {
+  "gensym": gensym, "iterate": iterate, "cycle": cycle, "repeat": repeat_, "lazy-seq*": lazy_seq,
+  "force": Z.deferredForce, "realized?": realized_Q, "delay?": Z.isDelay,
+  "meta": meta, "with-meta": with_meta, "vary-meta": vary_meta, "list*": list_star, "boolean": boolean_,
+  "ident?": ident_Q, "struct?": struct_Q, "doall": doall, "dorun": dorun,
+  "volatile!": volatile_B, "vreset!": vreset_B, "vswap!": vswap_B, "volatile?": volatile_Q,
+  "transientable?": transientable_Q, "transient": transient, "persistent!": persistent_B,
+  "conj!": conj_B, "assoc!": assoc_B, "dissoc!": dissoc_B,
   "invoke": invoke, "seq": seq, "first": first, "rest": rest, "next": next, "second": second, "last": last, "butlast": butlast,
   "cons": cons, "count": count, "nth": nth, "empty?": empty_Q, "not-empty": not_empty,
   "vector": vector, "vec": vec, "list": list, "hash-map": hash_map, "hash-set": hash_set, "set": set,
@@ -565,7 +676,11 @@ export const CORE = {
   "fn?": fn_Q, "ifn?": ifn_Q, "map?": map_Q, "vector?": vector_Q, "set?": set_Q, "list?": list_Q, "seq?": seq_Q,
   "sequential?": sequential_Q, "coll?": coll_Q, "associative?": associative_Q, "zero?": zero_Q, "pos?": pos_Q,
   "neg?": neg_Q, "even?": even_Q, "odd?": odd_Q, "not": not, "is?": is_Q,
-  "=": eqv, "eqv": eqv, "not=": not_eq, "identical?": identical_Q, "compare": compare, "hash": hash, "hash_key": identity,
+  "=": eqv, "eqv": eqv,
+  // Erlang term comparison (erlang/=:= exact, /= and =/= the negations)
+  "erlang/<": (a, b) => R.termCompare(a, b) < 0, "erlang/>": (a, b) => R.termCompare(a, b) > 0,
+  "erlang/=<": (a, b) => R.termCompare(a, b) <= 0, "erlang/>=": (a, b) => R.termCompare(a, b) >= 0,
+  "erlang/=:=": (a, b) => R.keyEq(a, b), "erlang//=": (a, b) => !R.eqv(a, b), "erlang/=/=": (a, b) => !R.keyEq(a, b), "not=": not_eq, "identical?": identical_Q, "compare": compare, "hash": hash, "hash_key": identity,
   "inc": inc, "dec": dec, "abs": abs, "max": max, "min": min, "quot": quot, "rem": rem, "mod": mod,
   "+": plus, "-": minus, "*": times, "/": divide, "<": lt, ">": gt, "<=": le, ">=": ge, "==": num_eq,
   "int": int, "double": double, "parse-long": parse_long, "parse-double": parse_double, "rand-int": rand_int,

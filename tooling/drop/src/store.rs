@@ -751,7 +751,15 @@ mod store_tests {
     fn with_store<T>(tag: &str, f: impl FnOnce(&Store, &Path) -> T) -> T {
         let d = scratch(tag);
         let store = Store { root: d.join("data") };
+        // resolution reads the user's launcher config (`:default`); a test must
+        // not see the machine's (`{:default "latest"}` flips "no :bl → stable")
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", d.join("config"));
         let r = f(&store, &d);
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
         let _ = std::fs::remove_dir_all(&d);
         r
     }

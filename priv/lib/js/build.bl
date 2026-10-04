@@ -35,10 +35,13 @@
 (defn- kw-node? [n s] (and (= :keyword (rn-tag n)) (= s (rn-name n))))
 
 (defn ns-path
-  "The file for namespace `ns` under one of `roots`: `ed.text` → `<root>/ed/text.bl`."
+  "The `.bl` file for namespace `ns` under one of `roots`, by the loader's own
+   rule (`Loader/source_relatives`): the dotted spelling first, then Clojure's
+   dash→underscore munging — `reader-node` is `reader-node.bl`, `ed.text` is
+   `ed/text.bl`."
   [roots ns]
-  (let [rel (str (replace-str (replace-str ns "." "/") "-" "_") ".bl")]
-    (first (filter (fn [p] (File/exists? p)) (map (fn [r] (str r "/" rel)) roots)))))
+  (let [rels (filter (fn [r] (ends-with? r ".bl")) (BeamLisp.Loader/source_relatives ns))]
+    (first (for [r roots rel rels :let [p (str r "/" rel)] :when (File/regular? p)] p))))
 
 (defn read-forms [path]
   (BeamLisp.Ns.Reader/read (File/read! path) {:file path}))
@@ -140,7 +143,12 @@
         ; evaluate the ns form on BEAM so aliases/requires exist for the compiler
         _ (BeamLisp.Compiler/eval_string (first-form-text path) (BeamLisp.Compiler/new_env "user") path)
         defs (top-defs (rest forms))
-        _ (doseq [d defs] (when (some? (:name d)) (BeamLisp.Env/intern ns (:name d) nil)))
+        ; a placeholder only where the name is unbound: interning nil over a LIVE
+        ; definition (compiling `core` itself, or any ns this VM already runs)
+        ; would break the very compiler doing the compiling
+        _ (doseq [d defs]
+            (when (and (some? (:name d)) (not (BeamLisp.Env/bound? ns (:name d))))
+              (BeamLisp.Env/intern ns (:name d) nil)))
         env (BeamLisp.Ns.Compiler/new_env ns)]
     {:ns ns :path path :requires (:requires head)
      :defs (vec (map (fn [d]
@@ -184,6 +192,81 @@
                 m)))
           {} names))
 
+(defn rest-fns
+  "#{[mod-name fname arity]}: every VARIADIC function the core link table
+   names, at its rest-list arity (min + 1) — called with the rest packed as
+   one trailing list, like a `__bl_v` clause."
+  [core]
+  (set (keep (fn [nm]
+               (let [l (try (BeamLisp.Env/link "core" nm) (catch e :error))]
+                 (when (and (erlang/is_tuple l) (= :ok (erlang/element 1 l)))
+                   (let [info (erlang/element 2 l) var (erlang/element 3 info)
+                         vf (when (erlang/is_tuple var) (name (erlang/element 2 var)))]
+                     ; an `rt:` entry (rt-specific) already takes the rest LIST
+                     ; as its own last parameter: never spread it
+                     (when (and (some? vf) (not (and (= rt-mod (erlang/element 1 info)) (contains? rt-specific vf))))
+                       [(name (erlang/element 1 info)) vf (inc (erlang/element 1 var))])))))
+             (concat core ["+" "-" "*" "/" "<" ">" "<=" ">=" "==" "="]))))
+
+(defn core-links-module
+  "ES-module text that seeds a JS page's registry with BEAM's core LINK table
+   (`{:link \"core\" name}` rows, read from this VM's live table), so the
+   compiler running in JS emits the same linked calls the BEAM compiler does
+   (`(+ 1 2)` → :arith), and the map `mod/fun/arity` → CORE key the run-time
+   linker resolves those calls with. Generated per build: one source, BEAM's."
+  [core]
+  (let [aliases (rt-aliases (vec core))
+        rows (keep (fn [nm]
+                     (let [l (try (BeamLisp.Env/link "core" nm) (catch e :error))]
+                       (when (and (erlang/is_tuple l) (= :ok (erlang/element 1 l)))
+                         [nm (erlang/element 2 l)])))
+                   (sort (concat core ["+" "-" "*" "/" "<" ">" "<=" ">=" "==" "="])))
+        triple (fn [info]
+                 (let [mod (erlang/element 1 info) fixed (erlang/element 2 info) var (erlang/element 3 info)]
+                   (str "R.tup([R.kw(" (e/js-str (name mod)) "), R.hashMap("
+                        (join ", " (map (fn [[a f]] (str a ", R.kw(" (e/js-str (name f)) ")")) (sort-by first fixed)))
+                        "), "
+                        (if (nil? var) "null"
+                          (str "R.tup([" (erlang/element 1 var) ", R.kw(" (e/js-str (name (erlang/element 2 var))) ")])"))
+                        "])")))
+        op-keys (distinct
+                  (for [[_ info] rows
+                        :let [mod (erlang/element 1 info) fixed (erlang/element 2 info) var (erlang/element 3 info)]
+                        [a f] (concat (map (fn [[a f]] [a f]) fixed)
+                                      (if (nil? var) [] [[(inc (erlang/element 1 var)) (erlang/element 2 var)]]))
+                        :let [k (core-name mod f a aliases)]
+                        :when (and (some? k) (contains? core k))]
+                    [(str (name mod) "/" (name f) "/" a) k]))
+        ; plus the fixed ops core-name maps by rule (not by link row): the
+        ; compiler emits these directly (RT/hash_key, Exception/normalize,
+        ; erlang comparisons, ExInfo, Refs, Set/new, the Rt calling-convention
+        ; variants) — the SAME rule the build links with
+        fixed (for [[mod fs] [[rt-mod (concat (vec rt-specific) ["hash_key" "invoke" "apply_to" "apply_variadic"])]
+                              [:Elixir.Exception ["normalize"]]
+                              [:erlang ["raise" "+" "-" "*" "==" "=:=" "/=" "=/=" "<" ">" "=<" ">=" "not" "rem" "div" "abs"
+                                        "is_integer" "is_binary" "is_map" "is_function" "error" "throw"]]
+                              [refs-mod ["swap!" "reset!" "deref" "atom"]]
+                              [exinfo-mod ["ex_info" "ex_message" "ex_data" "raise_payload"]]
+                              [set-mod ["new"]]]
+                     f fs
+                     a (range 0 5)
+                     :let [k (core-name mod (erlang/binary_to_atom f) a aliases)]
+                     :when (and (some? k) (contains? core k))]
+                 [(str (name mod) "/" f "/" a) k])
+        op-keys (distinct (concat op-keys fixed))]
+    (str "// GENERATED by priv/lib/js/build.bl (core-links-module) from this VM's core link table — do not edit.\n"
+         "import * as R from \"./rt.mjs\";\n"
+         "export const LINKS = [\n"
+         (join ",\n" (map (fn [[nm info]] (str "  [" (e/js-str nm) ", " (triple info) "]")) rows))
+         "\n];\n"
+         "export const OPS = {\n"
+         (join ",\n" (map (fn [[k v]] (str "  " (e/js-str k) ": " (e/js-str v))) op-keys))
+         "\n};\n"
+         ; variadic link fns at their rest-list arity (see `rest-fns`)
+         "export const REST_FNS = [\n"
+         (join ",\n" (map (fn [[m f a]] (str "  [" (e/js-str m) ", " (e/js-str f) ", " a "]")) (sort-by str (rest-fns core))))
+         "\n];\n")))
+
 (defn- core-name
   "The CORE registry key a compiler-emitted runtime op maps to, or nil.
    `aliases` is `rt-aliases` (BEAM function → BL name)."
@@ -203,7 +286,13 @@
       ; `(throw x)` lowers to ExInfo.raise_payload(x)
       (= m exinfo-mod) (get {"ex_info" "ex-info" "ex_message" "ex-message" "ex_data" "ex-data"
                              "raise_payload" "throw"} fname)
-      (= m :erlang) (get {"+" "+" "-" "-" "*" "*" "==" "==" "=:=" "=" "<" "<" ">" ">" "=<" "<=" ">=" ">="
+      ; Erlang comparison is TERM comparison: `==` is equality with numeric
+      ; coercion (1 == 1.0, [1] == [1.0], :a == :a) = BL `eqv`; `=:=` is exact
+      ; (1 =:= 1.0 is false) = map-key equality. Neither is number-only.
+      ; and `<` `>` `=<` `>=` are TERM order (any two terms: :a < "s"), not BL's
+      ; number-only `<`: `erlang/<` compares keywords in compiler code
+      (= m :erlang) (get {"+" "+" "-" "-" "*" "*" "==" "eqv" "=:=" "erlang/=:=" "/=" "erlang//=" "=/=" "erlang/=/="
+                          "<" "erlang/<" ">" "erlang/>" "=<" "erlang/=<" ">=" "erlang/>="
                           "not" "not" "rem" "rem" "div" "quot" "abs" "abs" "is_integer" "int?" "is_binary" "string?"
                           "is_map" "map?" "is_function" "fn?" "error" "throw"} fname)
       :else nil)))
@@ -212,7 +301,7 @@
   "The emitter context for namespace `cns`: resolvers for globals and remotes.
    `table` maps ns → set of def names; `core` is the set of CORE keys;
    `host` the set of declared host fns. `missing` collects unresolved names."
-  [cns table core host missing rt-alias]
+  [cns table core host missing rt-alias leaves stubs]
   (let [aliases (into {} (map (fn [[t a]] [a t]) (:requires cns)))
         own (get table (:ns cns))
         resolve (fn [ns nm arity]
@@ -221,21 +310,43 @@
                       (and (= ns* (:ns cns)) (contains? own nm)) (str "d_" (e/mangle nm))
                       (contains? (get table ns* #{}) nm) (str "N_" (e/mangle ns*) ".d_" (e/mangle nm))
                       (contains? core nm) (str "C.CORE[" (e/js-str nm) "]")
+                      ; a namespace the build deliberately leaves out (:stub):
+                      ; reaching it at run time is a named error, not a build error
+                      (contains? stubs ns*) (str "STUB(" (e/js-str (str ns* "/" nm)) ")")
                       :else (do (swap! missing conj [(:ns cns) ns nm]) (str "MISSING(" (e/js-str (str ns "/" nm)) ")")))))
+        ; a namespace the VM already runs is linked by MODULE: the compiler
+        ; emits `Ns.Foo.Bar/f` for its defs instead of a global. Map each
+        ; built namespace's module back to its own JS defs.
+        ; (a `__bl_v` call still passes its rest list; the emitter spreads it)
+        by-mod (into {} (map (fn [ns] [(BeamLisp.Link/module_for ns) ns]) (keys table)))
+        stub-mods (into {} (map (fn [ns] [(BeamLisp.Link/module_for ns) ns]) stubs))
+        base-name (fn [f] (let [n (name f)] (if (ends-with? n "__bl_v") (subs n 0 (- (count n) 6)) n)))
         remote (fn [m f arity]
                  (cond
+                   (and (contains? by-mod m) (contains? (get table (get by-mod m)) (base-name f)))
+                     (let [ns* (get by-mod m) n (e/mangle (base-name f))]
+                       (if (= ns* (:ns cns)) (str "d_" n) (str "N_" (e/mangle ns*) ".d_" n)))
+                   (contains? stub-mods m) (str "STUB(" (e/js-str (str (get stub-mods m) "/" (name f))) ")")
                    (= m :js) (let [nm (name f)]
                                (if (contains? host nm) (str "H[" (e/js-str nm) "]")
                                  (do (swap! missing conj [(:ns cns) "js" nm]) (str "MISSING(" (e/js-str (str "js/" nm)) ")"))))
-                   :else (let [k (core-name m f arity rt-alias)]
-                           (if (and (some? k) (contains? core k)) (str "C.CORE[" (e/js-str k) "]") nil))))]
+                   :else (let [k (core-name m f arity rt-alias)
+                               lk (str (name m) "/" (name f) "/" arity)]
+                           (cond
+                             (and (some? k) (contains? core k)) (str "C.CORE[" (e/js-str k) "]")
+                             ; a host leaf (priv/lib/js/leaves.mjs), keyed by its BEAM name
+                             (contains? leaves lk) (str "L.LEAVES[" (e/js-str lk) "]")
+                             ; collected like an unresolved global, so ONE build
+                             ; lists every missing leaf instead of stopping at the first
+                             :else (do (swap! missing conj [(:ns cns) "leaf" lk])
+                                       (str "MISSING(" (e/js-str lk) ")"))))))]
     {:ns (:ns cns) :resolve resolve :remote remote :dest nil}))
 
 (defn emit-ns
   "One compiled namespace → ES module text."
-  [cns table core host missing rt-alias]
+  [cns table core host missing rt-alias leaves stubs]
   (e/reset-state!)
-  (let [ctx (link-ctx cns table core host missing rt-alias)
+  (let [ctx (link-ctx cns table core host missing rt-alias leaves stubs)
         imports (map (fn [[t _]] (str "import * as N_" (e/mangle t) " from \"./" t ".mjs\";"))
                      (filter (fn [[t _]] (contains? table t)) (:requires cns)))
         body (mapcat (fn [d]
@@ -254,8 +365,10 @@
          "import * as R from \"./rt.mjs\";\n"
          "import * as C from \"./core.mjs\";\n"
          "import { H } from \"./host.mjs\";\n"
+         "import * as L from \"./leaves.mjs\";\n"
          (join "\n" imports) "\n"
          "const MISSING = (n) => { throw new R.BLError(\"unresolved \" + n); };\n"
+         "const STUB = (n) => (...a) => { throw new R.BLError(n + \" is not part of this JS build (a :stub namespace)\"); };\n"
          (join "\n" kws) "\n\n"
          (join "\n" body) "\n")))
 
@@ -263,18 +376,18 @@
 
 (defn- load-order
   "Namespaces reachable from `entry` (within `roots`), dependencies first."
-  [roots entry]
-  (loop [todo [entry] seen #{} order [] compiled {}]
+  [roots entries stubs]
+  (loop [todo (vec entries) seen #{} order [] compiled {}]
     (if (empty? todo)
       {:order order :compiled compiled}
       (let [ns (first todo)]
         (if (contains? seen ns)
           (recur (rest todo) seen order compiled)
-          (let [path (ns-path roots ns)]
+          (let [path (if (contains? stubs ns) nil (ns-path roots ns))]
             (if (nil? path)
               (recur (rest todo) (conj seen ns) order compiled)   ; not ours: core or BEAM-only
               (let [head (ns-head (read-forms path))
-                    deps (vec (filter (fn [d] (and (not (contains? seen d)) (some? (ns-path roots d))))
+                    deps (vec (filter (fn [d] (and (not (contains? seen d)) (not (contains? stubs d)) (some? (ns-path roots d))))
                                       (map first (:requires head))))]
                 (if (empty? (filter (fn [d] (not (contains? (set order) d))) deps))
                   (let [c (compile-ns path)]
@@ -284,18 +397,25 @@
 (defn build
   "Build `entry` and every namespace it requires under `roots` into `out`.
    opts: {:roots [dirs] :entry ns :out dir :core #{names} :host #{names}}.
-   Returns {:modules [ns…] :bytes n}; throws listing EVERY unresolved name."
+   Returns {:modules [ns…] :bytes n :sources [path…]}; throws listing EVERY
+   unresolved name."
   [opts]
   (let [{:keys [roots entry out core host]} opts
-        {:keys [order compiled]} (load-order roots entry)
+        leaves (or (:leaves opts) #{})
+        stubs (set (or (:stub opts) []))
+        ; `:with` adds namespaces reached only by MODULE name (no :require):
+        ; the compiler calls `BeamLisp.Ns.Reader/read_string` directly
+        {:keys [order compiled]} (load-order roots (cons entry (or (:with opts) [])) stubs)
         table (into {} (map (fn [ns] [ns (set (keep :name (:defs (get compiled ns))))]) order))
         missing (atom [])
         rt-alias (rt-aliases (vec core))
-        texts (into {} (map (fn [ns] [ns (emit-ns (get compiled ns) table core host missing rt-alias)]) order))]
+        _ (e/set-rest-fns! (rest-fns (vec core)))
+        texts (into {} (map (fn [ns] [ns (emit-ns (get compiled ns) table core host missing rt-alias leaves stubs)]) order))]
     (when (seq @missing)
       (throw (ex-info (str "js.build: " (count @missing) " unresolved name(s):\n"
-                           (join "\n" (map (fn [[in ns nm]] (str "  in " in ": " ns "/" nm)) (distinct @missing))))
+                           (join "\n" (map (fn [[in ns nm]] (str "  in " in ": " ns "/" nm)) (sort-by str (distinct @missing)))))
                       {:missing @missing})))
     (File/mkdir_p! out)
     (doseq [ns order] (File/write! (str out "/" ns ".mjs") (get texts ns)))
-    {:modules order :bytes (reduce + 0 (map count (vals texts)))}))
+    {:modules order :bytes (reduce + 0 (map count (vals texts)))
+     :sources (vec (map (fn [ns] (:path (get compiled ns))) order))}))

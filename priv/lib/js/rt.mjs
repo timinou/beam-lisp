@@ -11,7 +11,7 @@
 //                  (PLAN-157 D3: exact numerics, Elm-lean, NOT Elm-inexact)
 //   string         JS string (UTF-16); text functions count CODEPOINTS
 //   keyword        Kw, interned (identity = equality)
-//   symbol         Sym, interned
+//   symbol         the BEAM's own reader node {:symbol, "name"} (a Tup)
 //   list           Cons cells ending in EMPTY; `()` is EMPTY, distinct from nil
 //   vector         Vec — persistent 32-way trie + tail (structural sharing)
 //   map            HMap — persistent hash array mapped trie
@@ -25,6 +25,8 @@
 // document is a vector of lines pays per edit for the lines it touches.
 
 // ─── scalars ────────────────────────────────────────────────────────────────
+
+import * as Z from "./lazy.mjs";
 
 export class Kw {
   constructor(ns, name) { this.ns = ns; this.name = name; this.fq = ns ? ns + "/" + name : name; this.h = 0; }
@@ -42,19 +44,32 @@ export function kw(fq) {
   return k;
 }
 
-export class Sym {
-  constructor(name) { this.name = name; this.h = (strHash(name) ^ 0x1b873593) | 0; }
-  toString() { return this.name; }
-}
-const SYMS = new Map();
-export function sym(name) {
-  let s = SYMS.get(name);
-  if (s === undefined) { s = new Sym(name); SYMS.set(name, s); }
-  return s;
-}
-
 export class Flt {
   constructor(v) { this.v = v; }
+}
+
+/** An exact decimal (`1.50M`): unscaled BigInt `u` and scale `s` >= 0, value
+    u * 10^-s (PLAN-157 D3). As on the BEAM the scale is part of the value:
+    (= 1.5M 1.50M) is false, and `1.50M` prints with its two places. */
+export class Dec {
+  constructor(u, s) { this.u = BigInt(u); this.s = s; }
+  plain() {
+    const neg = this.u < 0n, d = (neg ? -this.u : this.u).toString().padStart(this.s + 1, "0");
+    const body = this.s === 0 ? d : d.slice(0, d.length - this.s) + "." + d.slice(d.length - this.s);
+    return (neg ? "-" : "") + body;
+  }
+}
+export function dec(u, s) { return new Dec(u, s); }
+/** Decimal.parse: "[+-]digits[.digits][e[+-]digits]" -> Dec, or null. A
+    negative scale from the exponent is folded into the unscaled value. */
+export function parseDec(text) {
+  const m = /^\s*([+-])?(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?\s*$/.exec(text);
+  if (!m || (!m[2] && !m[3])) return null;
+  const frac = m[3] || "", e = m[4] ? parseInt(m[4], 10) : 0;
+  let u = BigInt((m[2] || "") + frac || "0");
+  if (m[1] === "-") u = -u;
+  const s = frac.length - e;
+  return s >= 0 ? new Dec(u, s) : new Dec(u * 10n ** BigInt(-s), 0);
 }
 export function flt(v) { return new Flt(+v); }
 
@@ -63,12 +78,39 @@ export class Tup {
 }
 export function tup(items) { return new Tup(items); }
 
+/** A symbol is what it is on the BEAM: the reader node `{:symbol, "name"}`,
+    a Tup — so a symbol a macro builds and a quoted symbol are ONE kind of
+    value (`(= 'a (symbol "a"))`, map keys, printing). `Sym` is that Tup's
+    recognizer, not a separate class. */
+const SYM_TAG = kw("symbol");
+export function isSym(x) { return x instanceof Tup && x.items.length === 2 && x.items[0] === SYM_TAG && typeof x.items[1] === "string"; }
+export const Sym = { [Symbol.hasInstance]: isSym };
+export function sym(name) { return new Tup([SYM_TAG, name]); }
+export function symName(x) { return x.items[1]; }
+
+
 // ─── lists ──────────────────────────────────────────────────────────────────
 
+/** A list cell. `n` is the length of a PROPER list (ending in ()), and -1 for a
+    chain that ends in anything else — a lazy tail (`(cons 1 (map …))`, a
+    chunked seq's next node). Kept per cell so `count`, `=` and the printer ask
+    "is this a plain list?" in O(1) instead of walking to the end every time. */
 export class Cons {
-  constructor(h, t) { this.h = h; this.t = t; this.n = t instanceof Cons ? t.n + 1 : 1; }
+  constructor(h, t) {
+    this.h = h; this.t = t;
+    this.n = t instanceof Cons ? (t.n < 0 ? -1 : t.n + 1) : (t === EMPTY ? 1 : -1);
+  }
 }
 export const EMPTY = Object.freeze(Object.create(null, { __empty: { value: true } }));
+
+/** A lazy sequence is lazy.mjs's `LazySeq` (the BEAM's cell state machine).
+    `realize` turns a finite seq whose cells may be lazy into plain Cons cells. */
+export const Lazy = Z.LazySeq;
+export function realize(x) {
+  if (!(x instanceof Z.LazySeq) && !(x instanceof Cons && hasLazyTail(x))) return x;
+  return Z.toList(x);
+}
+function hasLazyTail(c) { return c.n < 0; }
 export function cons(h, t) { return new Cons(h, t === null ? EMPTY : t); }
 export function list(...xs) { return listFromArray(xs); }
 export function listFromArray(a, from = 0) {
@@ -375,7 +417,7 @@ export function hashOf(x) {
     case "boolean": return x ? 1231 : 1237;
     case "function": return fnId(x);
   }
-  if (x instanceof Kw || x instanceof Sym) return x.h;
+  if (x instanceof Kw) return x.h;
   if (x instanceof Flt) return mix(0x3f800000, numHash(x.v));
   if (x._h !== undefined && x._h !== null) return x._h;
   let h;
@@ -384,6 +426,7 @@ export function hashOf(x) {
   if (x instanceof HSet) { h = 0x5345; for (const e of x) h = (h + hashOf(e)) | 0; x._h = h; return h; }
   if (x === EMPTY) return 0x4c00;
   if (x instanceof Cons) { h = 0x4c49; for (let p = x; p instanceof Cons; p = p.t) h = mix(h, hashOf(p.h)); return h; }
+  if (x instanceof Dec) return mix(strHash(x.u.toString()), x.s ^ 0x4dec);
   if (x instanceof Tup) { h = 0x5455; for (const e of x.items) h = mix(h, hashOf(e)); return h; }
   return fnId(x);
 }
@@ -405,15 +448,74 @@ export function keyEq(a, b) {
   if (a instanceof HMap) return b instanceof HMap && mapEqv(a, b, keyEq);
   if (a instanceof HSet) return b instanceof HSet && a.cnt === b.cnt && [...a].every(e => b.has(e));
   if (a instanceof Tup) return b instanceof Tup && a.items.length === b.items.length && a.items.every((e, i) => keyEq(e, b.items[i]));
+  if (a instanceof Dec) return b instanceof Dec && a.u === b.u && a.s === b.s;
   return false;
 }
+/** Erlang TERM order (`erlang/<`, `=<`, `lists:sort`) on the JS value model:
+    number < atom < fun < tuple < map < list < binary. Atoms (nil, booleans,
+    keywords) order by name; tuples by size then element-wise; lists
+    element-wise, shorter first; binaries by codepoint (= UTF-8 byte order).
+    A BEAM vector/set/decimal is a struct, i.e. a map. Numbers compare by
+    value (1 and 1.0 are neither less than the other). */
+export function termCompare(a, b) {
+  const ra = termRank(a), rb = termRank(b);
+  if (ra !== rb) return ra < rb ? -1 : 1;
+  switch (ra) {
+    case 0: { const x = numOf(a), y = numOf(b); return x < y ? -1 : x > y ? 1 : 0; }
+    case 1: { const x = atomName(a), y = atomName(b); return x < y ? -1 : x > y ? 1 : 0; }
+    case 2: return 0;
+    case 3: {
+      if (a.items.length !== b.items.length) return a.items.length < b.items.length ? -1 : 1;
+      for (let i = 0; i < a.items.length; i++) { const c = termCompare(a.items[i], b.items[i]); if (c) return c; }
+      return 0;
+    }
+    case 4: return compare(a, b);
+    case 5: {
+      let p = a, q = b;
+      for (;;) {
+        const ea = p === EMPTY, eb = q === EMPTY;
+        if (ea || eb) return ea && eb ? 0 : ea ? -1 : 1;
+        const c = termCompare(p.h, q.h); if (c) return c;
+        p = p.t; q = q.t;
+      }
+    }
+    case 6: { const ia = a[Symbol.iterator](), ib = b[Symbol.iterator]();
+      for (;;) { const x = ia.next(), y = ib.next(); if (x.done || y.done) return x.done && y.done ? 0 : x.done ? -1 : 1;
+        const ca = x.value.codePointAt(0), cb = y.value.codePointAt(0); if (ca !== cb) return ca < cb ? -1 : 1; } }
+  }
+  return 0;
+}
+function termRank(x) {
+  if (typeof x === "number" || typeof x === "bigint" || x instanceof Flt) return 0;
+  if (x === null || x === undefined || x === true || x === false || x instanceof Kw) return 1;
+  if (typeof x === "function") return 2;
+  if (x instanceof Tup) return 3;
+  if (x instanceof HMap || x instanceof Vec || x instanceof HSet || x instanceof Dec) return 4;
+  if (x === EMPTY || x instanceof Cons) return 5;
+  if (typeof x === "string") return 6;
+  return 4;
+}
+function atomName(x) { return x === null || x === undefined ? "nil" : x === true ? "true" : x === false ? "false" : x.fq; }
+
 /** BL `=`, measured against BEAM (2026-10-03): lists and vectors are one
     sequential family, and numbers compare NUMERICALLY across int/float —
     (= 1 1.0), (= [1] [1.0]) are true. Map/set KEYS do not: (get {1 :a} 1.0)
     is nil, (contains? #{1} 1.0) is false — that is `keyEq`. */
 export function eqv(a, b) {
   if (a === b) return true;
+  if (a instanceof Lazy) a = realize(a);
+  if (b instanceof Lazy) b = realize(b);
   if (a === null || b === null || a === undefined || b === undefined) return false;
+  // decimals (BEAM, measured): two decimals compare by unscaled+scale
+  // ((= 1.5M 1.50M) false); a decimal and an int/float by value
+  // ((= 1.5M 1.5) true, (= 2M 2) true)
+  if (a instanceof Dec || b instanceof Dec) {
+    if (a instanceof Dec && b instanceof Dec) return a.u === b.u && a.s === b.s;
+    const d = a instanceof Dec ? a : b, o = a instanceof Dec ? b : a;
+    if (!isNumV(o)) return false;
+    if (o instanceof Flt) return Number(d.plain()) === o.v;
+    return decCmp(d, o) === 0;
+  }
   if (isNumV(a)) return isNumV(b) && Number(numOf(a)) === Number(numOf(b)) && (typeof a !== "bigint" || typeof b !== "bigint" || a === b);
   const ta = typeof a;
   if (ta !== "object" || typeof b !== "object") return false;
@@ -421,6 +523,7 @@ export function eqv(a, b) {
   if (a instanceof HMap) return b instanceof HMap && mapEqv(a, b, eqv);
   if (a instanceof HSet) return b instanceof HSet && a.cnt === b.cnt && [...a].every(e => b.has(e));
   if (a instanceof Tup) return b instanceof Tup && a.items.length === b.items.length && a.items.every((e, i) => eqv(e, b.items[i]));
+  if (a instanceof Dec) return b instanceof Dec && a.u === b.u && a.s === b.s;
   return false;
 }
 function isSeqColl(x) { return x instanceof Vec || x instanceof Cons || x === EMPTY; }
@@ -450,7 +553,7 @@ function* iter(x) {
 // order, as BEAM binaries do), sequentials element-wise then by length.
 
 function rank(x) {
-  if (typeof x === "number" || typeof x === "bigint" || x instanceof Flt) return 0;
+  if (typeof x === "number" || typeof x === "bigint" || x instanceof Flt || x instanceof Dec) return 0;
   if (x === null || x === undefined || x === false || x === true) return 1;
   if (x instanceof Kw) return 2;
   if (x instanceof Sym) return 3;
@@ -465,7 +568,13 @@ export function compare(a, b) {
   const ra = rank(a), rb = rank(b);
   if (ra !== rb) return ra < rb ? -1 : 1;
   switch (ra) {
-    case 0: { const x = numOf(a), y = numOf(b); return x < y ? -1 : x > y ? 1 : 0; }
+    case 0: {
+      if (a instanceof Dec || b instanceof Dec) {
+        if (a instanceof Flt || b instanceof Flt) { const x = a instanceof Dec ? Number(a.plain()) : a.v, y = b instanceof Dec ? Number(b.plain()) : b.v; return x < y ? -1 : x > y ? 1 : 0; }
+        return decCmp(a, b);
+      }
+      const x = numOf(a), y = numOf(b); return x < y ? -1 : x > y ? 1 : 0;
+    }
     case 1: { const o = v => v === null || v === undefined ? 0 : v === false ? 1 : 2; return o(a) - o(b); }
     case 2: return strCmp(a.fq, b.fq);
     case 3: return strCmp(a.name, b.name);
@@ -510,26 +619,65 @@ function needNum(op, a, b) {
   if (!(isIntV(a) || a instanceof Flt) || !(isIntV(b) || b instanceof Flt))
     throw new BLError(op + " needs numbers, got " + printStr(a) + " and " + printStr(b));
 }
+// ─── exact decimals (measured against BEAM, 2026-10-04) ───────────────────────
+// (+ 1.5M 1) 2.5M; (* 1.5M 2) 3.0M; (* 1.5M 1.5M) 2.25M; (/ 1M 4) 0.25M;
+// (/ 6M 3) 2M; (/ 1.20M 3) 0.40M; (/ 1M 3) raises (non-terminating);
+// a float operand raises; (- 1.5M) -1.5M. + and - align to the larger
+// scale, * adds scales, / keeps the dividend's scale when exact, else the
+// smallest scale that terminates.
+const isDec = (x) => x instanceof Dec;
+function toDec(x, op) {
+  if (x instanceof Dec) return x;
+  if (typeof x === "number" || typeof x === "bigint") return new Dec(BigInt(x), 0);
+  if (x instanceof Flt) throw new BLError("a float cannot enter decimal arithmetic: " + printStr(x) + " (use decimal/from-float to approximate on purpose)");
+  throw new BLError(op + " needs numbers, got " + printStr(x));
+}
+const P10 = (n) => 10n ** BigInt(n);
+function decArith(op, a, b) {
+  const x = toDec(a, op), y = toDec(b, op);
+  if (op === "*") return new Dec(x.u * y.u, x.s + y.s);
+  if (op === "/") {
+    if (y.u === 0n) throw new BLError("divide by zero");
+    // value = (x.u / 10^x.s) / (y.u / 10^y.s): try scales from the dividend's up
+    for (let s = x.s; s <= x.s + 64; s++) {
+      const num = x.u * P10(s - x.s + y.s), den = y.u;
+      if (num % den === 0n) return new Dec(num / den, s);
+    }
+    throw new BLError("non-terminating decimal expansion; no exact representable decimal result");
+  }
+  const s = Math.max(x.s, y.s), xu = x.u * P10(s - x.s), yu = y.u * P10(s - y.s);
+  return new Dec(op === "+" ? xu + yu : xu - yu, s);
+}
+function decCmp(a, b) {
+  const x = toDec(a, "compare"), y = toDec(b, "compare"), s = Math.max(x.s, y.s);
+  const xu = x.u * P10(s - x.s), yu = y.u * P10(s - y.s);
+  return xu < yu ? -1 : xu > yu ? 1 : 0;
+}
+
 export function add(a, b) {
   if (typeof a === "number" && typeof b === "number") { const r = a + b; if (r <= MAX && r >= MIN) return r; return norm(BigInt(a) + BigInt(b)); }
+  if (isDec(a) || isDec(b)) return decArith("+", a, b);
   needNum("+", a, b);
   if (a instanceof Flt || b instanceof Flt) return new Flt(numOf(a) + Number(numOf(b)));
   return norm(BigInt(a) + BigInt(b));
 }
 export function sub(a, b) {
   if (typeof a === "number" && typeof b === "number") { const r = a - b; if (r <= MAX && r >= MIN) return r; return norm(BigInt(a) - BigInt(b)); }
+  if (isDec(a) || isDec(b)) return decArith("-", a, b);
   needNum("-", a, b);
   if (a instanceof Flt || b instanceof Flt) return new Flt(Number(numOf(a)) - Number(numOf(b)));
   return norm(BigInt(a) - BigInt(b));
 }
 export function mul(a, b) {
   if (typeof a === "number" && typeof b === "number") { const r = a * b; if (r <= MAX && r >= MIN) return r === 0 ? 0 : r; return norm(BigInt(a) * BigInt(b)); }
+  if (isDec(a) || isDec(b)) return decArith("*", a, b);
   needNum("*", a, b);
   if (a instanceof Flt || b instanceof Flt) return new Flt(Number(numOf(a)) * Number(numOf(b)));
   return norm(BigInt(a) * BigInt(b));
 }
 /** BEAM `/` answers a float, always. */
 export function div(a, b) {
+  if (isDec(a) || isDec(b)) return decArith("/", a, b);
   needNum("/", a, b);
   const y = Number(numOf(b));
   if (y === 0) throw new BLError("divide by zero");
@@ -546,10 +694,10 @@ export function mod(a, b) {
   if (typeof a === "number" && typeof b === "number") { const m = a % b; return (m !== 0 && (m < 0) !== (b < 0) ? m + b : m) || 0; }
   const x = BigInt(a), y = BigInt(b), m = x % y; return norm(m !== 0n && (m < 0n) !== (y < 0n) ? m + y : m);
 }
-export function lt(a, b) { if (typeof a === "number" && typeof b === "number") return a < b; needNum("<", a, b); return numOf(a) < numOf(b); }
-export function gt(a, b) { if (typeof a === "number" && typeof b === "number") return a > b; needNum(">", a, b); return numOf(a) > numOf(b); }
-export function le(a, b) { if (typeof a === "number" && typeof b === "number") return a <= b; needNum("<=", a, b); return numOf(a) <= numOf(b); }
-export function ge(a, b) { if (typeof a === "number" && typeof b === "number") return a >= b; needNum(">=", a, b); return numOf(a) >= numOf(b); }
+export function lt(a, b) { if (typeof a === "number" && typeof b === "number") return a < b; if (isDec(a) || isDec(b)) return decCmp(a, b) < 0; needNum("<", a, b); return numOf(a) < numOf(b); }
+export function gt(a, b) { if (typeof a === "number" && typeof b === "number") return a > b; if (isDec(a) || isDec(b)) return decCmp(a, b) > 0; needNum(">", a, b); return numOf(a) > numOf(b); }
+export function le(a, b) { if (typeof a === "number" && typeof b === "number") return a <= b; if (isDec(a) || isDec(b)) return decCmp(a, b) <= 0; needNum("<=", a, b); return numOf(a) <= numOf(b); }
+export function ge(a, b) { if (typeof a === "number" && typeof b === "number") return a >= b; if (isDec(a) || isDec(b)) return decCmp(a, b) >= 0; needNum(">=", a, b); return numOf(a) >= numOf(b); }
 /** `==`: numeric equality across int/float (BEAM `==`). */
 export function numEq(a, b) { needNum("==", a, b); return Number(numOf(a)) === Number(numOf(b)) || a == b; } // eslint-disable-line eqeqeq
 export function isInt(x) { return typeof x === "number" || typeof x === "bigint"; }
@@ -586,6 +734,13 @@ function escStr(s) {
 /** `pr-str` — the readable printer. */
 export function printStr(x) {
   if (x === null || x === undefined) return "nil";
+  // a lazy or partly-lazy seq prints BOUNDED, as rt.bl's print-seq: at most 20
+  // elements, then ` …` — an infinite seq must never hang the printer
+  if (x instanceof Lazy || (x instanceof Cons && hasLazyTail(x))) {
+    const r = Z.sample(x, 20);
+    const a = []; for (let p = r.items[0]; p instanceof Cons; p = p.t) a.push(printStr(p.h));
+    return "(" + a.join(" ") + (r.items[1] ? " …" : "") + ")";
+  }
   switch (typeof x) {
     case "string": return escStr(x);
     case "number": case "bigint": return String(x);
@@ -593,8 +748,9 @@ export function printStr(x) {
     case "function": return "#<fn " + (x.blName || x.name || "anonymous") + ">";
   }
   if (x instanceof Flt) { const s = String(x.v); return /[.eEn]|Infinity/.test(s) ? s : s + ".0"; }
+  if (x instanceof Dec) return x.plain() + "M";
   if (x instanceof Kw) return ":" + x.fq;
-  if (x instanceof Sym) return x.name;
+  if (isSym(x)) return x.items[1];
   if (x instanceof Vec) return "[" + x.toArray().map(printStr).join(" ") + "]";
   if (x === EMPTY) return "()";
   if (x instanceof Cons) { const a = []; for (let p = x; p instanceof Cons; p = p.t) a.push(printStr(p.h)); return "(" + a.join(" ") + ")"; }
@@ -603,12 +759,14 @@ export function printStr(x) {
   if (x instanceof Tup) return "{" + x.items.map(printStr).join(", ") + "}";
   if (x instanceof BLError) return "#error {:message " + escStr(x.message) + "}";
   if (x instanceof Atom) return "#<atom " + printStr(x.v) + ">";
+  if (x instanceof Z.Delay) return "#<delay " + (x.seq.s[0] === 2 ? printStr(x.seq.s[1]) : ":pending") + ">";
   return "#<host " + Object.prototype.toString.call(x) + ">";
 }
 /** `str` of one value: strings bare, nil empty, keywords with their colon. */
 export function strOf(x) {
   if (typeof x === "string") return x;
   if (x === null || x === undefined) return "";
+  if (x instanceof Dec) return x.plain();
   if (x instanceof Kw) return x.fq;
   return printStr(x);
 }
