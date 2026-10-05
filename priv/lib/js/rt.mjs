@@ -132,7 +132,16 @@ export class Vec {
   /** The element list, built once: a vector is immutable, so every `seq` /
       `next` / fold of the same vector shares one spine (the BEAM pays this
       walk per call too, but over a flat tuple; here it was a fresh trie walk). */
-  toList() { return this._l === undefined ? (this._l = listFromArray(this.toArray())) : this._l; }
+  toList() {
+    if (this._l !== undefined) return this._l;
+    // built back to front, a leaf array at a time (no intermediate array)
+    let l = EMPTY;
+    for (let base = this.cnt === 0 ? -1 : ((this.cnt - 1) >>> BITS) << BITS; base >= 0; base -= WIDTH) {
+      const a = this.arrayFor(base), n = Math.min(WIDTH, this.cnt - base);
+      for (let j = n - 1; j >= 0; j--) l = new Cons(a[j], l);
+    }
+    return (this._l = l);
+  }
   arrayFor(i) {
     if (i >= this.tailOff()) return this.tail;
     let node = this.root;
@@ -187,7 +196,14 @@ export class Vec {
       for (let j = 0; j < n; j++) yield a[j];
     }
   }
-  toArray() { const out = new Array(this.cnt); let k = 0; for (const x of this) out[k++] = x; return out; }
+  toArray() {
+    const out = new Array(this.cnt);
+    for (let i = 0; i < this.cnt; i += WIDTH) {
+      const a = this.arrayFor(i), n = Math.min(WIDTH, this.cnt - i);
+      for (let j = 0; j < n; j++) out[i + j] = a[j];
+    }
+    return out;
+  }
 }
 function newPath(level, node) { return level === 0 ? node : [newPath(level - BITS, node)]; }
 function pushTail(cnt, level, parent, tailNode) {
