@@ -121,7 +121,9 @@ A principal links to an identity only by an explicit, audited fact:
 Unlinked principals: in `:mirror` mode they read **nothing** from that scope
 (fail closed); the people screen shows "not linked to Microsoft 365".
 
-### 4.1 Directory discovery (who exists at the source)
+### 4.1 Directory discovery (who exists at the source) — built
+
+Built (2026-10-04): `connector.microsoft.graph/directory-fn` (on every feed with `:tenant`), `connector.google.gdrive/directory-fn` (feed opts `{:domain d}`); fakes: `fake-graph` `GET /v1.0/users` (403 until command `:grant-directory`; seeds a guest and a disabled user), `fake-drive` `/admin/directory/v1/users` (`grant-directory!`, `add-user!`). Opts `{:group gid}` scopes Graph to one group. People come back as `{:id :key :email :name :title :enabled? :guest?}`. Tests: test/bl/connector/directory_test.bl.
 
 The same identities feed member discovery: the firm's directory is just the
 set of `:person` identities a provider can enumerate. A feed MAY add
