@@ -531,12 +531,54 @@
                          :checks (or (:checks auth-info) [])
                          :policies (or (:policies auth-info) [(auth/allow [])])}))))
 
+(defn- outcome-marker
+  "Recognise a writer abort marker on a caught exception.
+
+   A trusted performer or a `:db/fn` may abort a transaction by throwing an
+   `ex-info` whose data carries `:intent/outcome`:
+
+     {:intent/outcome {:status :refused :why \"…\"}}   a visible refusal
+     {:intent/outcome {:status :noop}}                a terminal no-op
+
+   Returns `{:status :refused :why …}` or `{:status :noop}` for a WELL-FORMED
+   marker, else nil. Anything else — an unrelated bug, a `:db/guard` refusal, a
+   malformed marker — is not swallowed. Markers are SERVER-CREATED (a trusted
+   performer or a registered `:db/fn`); a raw client payload is never a marker,
+   so a client cannot forge an outcome by shaping its intent data."
+  [e]
+  (let [o (get (ex-data e) :intent/outcome)]
+    (cond
+      (and (map? o) (= :refused (:status o)) (string? (:why o)))
+        {:status :refused :why (:why o)}
+      (and (map? o) (= :noop (:status o)))
+        {:status :noop}
+      :else nil)))
+
 (defn- perform-intent
   "Authorize (if :auth is set) then transact an intent. The intent's op is
    looked up in the socket's :intents registry — a map of op → a fn
-   (shared-conn payload principal) → tx-or-nil. Returns {:ok state} on a
-   commit (or a no-op), or {:denied why} when authorization refuses OR no
-   performer is registered for the op.
+   (shared-conn payload principal) → tx | nil | {:refused why}.
+
+   Returns one of:
+
+     {:ok state :committed true}   the performer returned a tx and
+                                   `transact!` returned a report.
+     {:ok state :committed false}  the performer returned nil, OR a writer
+                                   `:db/fn` aborted with a {:status :noop}
+                                   marker. Nothing wrote.
+     {:denied why}                 authorization denied, or no performer
+                                   registered. Non-writing and NOT terminal
+                                   (a re-authorized replay may succeed).
+     {:denied why :terminal true}  a trusted performer returned {:refused why},
+                                   OR a writer `:db/fn` aborted with a
+                                   {:status :refused :why …} marker. Non-writing
+                                   and TERMINAL: the gesture will never land,
+                                   so a durable client is ACKed and stops
+                                   replaying it.
+
+   A performer's `{:refused …}` is a RETURN VALUE; the writer marker is a
+   THROWN `ex-info` — both are server-created. Any OTHER exception (a bug, a
+   guard refusal, a malformed marker) is re-raised unchanged.
 
    The authority to perform lives HERE, not in the view: the view only
    NAMED the intent. A denied intent NEVER reaches transact!. An unregistered
@@ -554,13 +596,31 @@
           ;; learns [:denied why], nothing writes, the socket lives on.
           {:denied (str "no performer registered for intent " (pr-str op)
                         " — register it in :intents")}
-          (let [principal (if auth-info (:principal auth-info) nil)
-                tx (performer (:shared state) payload principal)]
-            ;; a nil tx is a legitimate no-op (the performer validated and
-            ;; chose not to write); a tx is committed to the SHARED world,
-            ;; whose commit lands on on-commit and re-renders everyone.
-            (when (some? tx) (datom/transact! (:shared state) tx))
-            {:ok state :committed (some? tx)}))))))
+          (let [principal (if auth-info (:principal auth-info) nil)]
+            (try
+              (let [out (performer (:shared state) payload principal)]
+                (cond
+                  ;; a nil tx is a legitimate no-op (the performer validated
+                  ;; and chose not to write).
+                  (nil? out) {:ok state :committed false}
+                  ;; a trusted performer may refuse in-band.
+                  (and (map? out) (contains? out :refused))
+                    {:denied (:refused out) :terminal true}
+                  :else
+                  ;; commit to the SHARED world; the commit lands on on-commit
+                  ;; and re-renders everyone. `committed` is the ACTUAL
+                  ;; outcome — a report came back — never the input vector: a
+                  ;; `[:db/fn …]` that aborts throws, so an explicitly aborted
+                  ;; transaction is never reported as committed just because
+                  ;; its input vector was non-nil.
+                  (let [report (datom/transact! (:shared state) out)]
+                    {:ok state :committed (some? report)})))
+              (catch e
+                (let [m (outcome-marker e)]
+                  (cond
+                    (= :refused (:status m)) {:denied (:why m) :terminal true}
+                    (= :noop (:status m))    {:ok state :committed false}
+                    :else (throw e)))))))))))
 
 ;; ── the outcome of the last intent, as a local the view can read ────
 ;;
@@ -658,13 +718,21 @@
              payload (merge (if (map? event-data) event-data {}) declared)
              result (perform-intent state op payload)]
          (if (contains? result :denied)
-           ;; NO write; record the refusal so the view can say so, re-render
-           ;; THIS viewer only, and mark the state so a surrounding vector of
-           ;; events stops here (see the fold above)
-           (-> (with-outcome state op :denied (:denied result))
-               (push! [:denied (:denied result)])
-               on-commit
-               (assoc :denied-last true))
+           ;; NO write. Record the denial/refusal so the view can say so,
+           ;; re-render THIS viewer only, and mark the state so a surrounding
+           ;; vector of events stops here (see the fold above). A TERMINAL
+           ;; refusal (a performer returned {:refused why}, or a writer :db/fn
+           ;; aborted with a {:status :refused} marker) also ACKs the gesture's
+           ;; idempotency key so a durable client stops replaying an intent that
+           ;; will never land. An auth denial is NOT terminal — a re-authorized
+           ;; replay may succeed — so it never ACKs.
+           (let [key (get payload :ev/id)
+                 st (-> (with-outcome state op :denied (:denied result))
+                        (push! [:denied (:denied result)]))
+                 st (if (and (:terminal result) key)
+                      (push! st [:ack key])
+                      st)]
+             (-> st on-commit (assoc :denied-last true)))
            ;; committed → the commit path renders everyone (with the outcome
            ;; already in locals); a no-op wrote nothing, so render here.
            ;; OFFLINE OUTBOX: when the gesture carried an idempotency key

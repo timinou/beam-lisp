@@ -47,9 +47,6 @@
   (let [rels (filter (fn [r] (ends-with? r ".bl")) (BeamLisp.Loader/source_relatives ns))]
     (first (for [r roots rel rels :let [p (str r "/" rel)] :when (File/regular? p)] p))))
 
-(defn read-forms [path]
-  (BeamLisp.Ns.Reader/read (File/read! path) {:file path}))
-
 (defn- ns-head
   "{:ns name :requires [[ns alias]…]} from a file's `(ns …)` form."
   [forms]
@@ -131,29 +128,51 @@
 
 ; ─── one namespace ──────────────────────────────────────────────────────────
 
-(defn form-text
-  "The exact source text of top-level reader node `f` from `path`: from its
-   start to the start of the NEXT top-level form (or the end of the file),
-   trailing comments and blank space included — harmless to `eval_string`.
-   Not the node's own end position: a form read through syntax-quote reports
-   a shrunken end, while every top-level START (line/col) is exact."
-  [path f]
-  (let [forms (read-forms path)
-        src-lines (vec (split (File/read! path) "\n"))
-        start (fn [n] (let [p (rn/node-pos n)] [(get p :line) (get p :col)]))
-        [l1 c1] (start f)
-        nxt (second (drop-while (fn [n] (not= (start n) [l1 c1])) forms))
-        [l2 c2] (if (some? nxt) (start nxt) [(inc (count src-lines)) 1])
-        cps (fn [s] (unicode/characters_to_list s))
-        cut (fn [s a b] (unicode/characters_to_binary (lists/sublist (cps s) a (max 0 (- b a)))))
-        line (fn [i] (if (<= i (count src-lines)) (nth src-lines (dec i)) ""))]
-    (if (= l1 l2)
-      (cut (line l1) c1 c2)
-      (join "\n" (concat [(cut (line l1) c1 (inc (count (cps (line l1)))))]
-                         (map line (range (inc l1) l2))
-                         [(cut (line l2) 1 c2)])))))
 
-(defn- first-form-text [path] (form-text path (first (read-forms path))))
+(defn read-forms+text
+  "[[node text]…] for every top-level form of `path`, in order. `text` is the
+   exact source the READER CONSUMED for that form: the stream's remaining
+   charlist before and after `read-next` share a tail, so the consumed prefix
+   is everything up to the `identical?` cell — leading blanks/comments
+   included (harmless to `eval_string`), the form's own end exact even when
+   several forms share a line, or a syntax-quote shrinks the node's end
+   position. No position metadata, no second parser."
+  [path]
+  (loop [st (BeamLisp.Ns.Reader/stream (File/read! path) path) out []]
+    (let [r (BeamLisp.Ns.Reader/read-next st)]
+      (if (= :ok (first r))
+        (let [st2 (nth r 2)
+              stop (get st2 :chars)
+              consumed (loop [c (get st :chars) acc []]
+                         (if (or (empty? c) (identical? c stop)) acc (recur (rest c) (conj acc (first c)))))]
+          (recur st2 (conj out [(second r) (unicode/characters_to_binary (to-list consumed))])))
+        out))))
+
+(defn read-forms [path] (vec (map first (read-forms+text path))))
+
+(defn- node-symbols
+  "Every symbol name appearing anywhere inside reader node `n`."
+  [n]
+  (let [f (rn/node-form n) t (rn/node-tag f)]
+    (cond
+      (= :symbol t) [(rn/node-name f)]
+      (contains? #{:list :vector :map :set} t) (vec (mapcat node-symbols (rn/node-items f)))
+      :else [])))
+
+(defn- macro-helper-forms
+  "The top-level `defn`/`defn-` forms (of `forms`) that the `defmacro`s
+   `mforms` reach, transitively through other defn bodies."
+  [forms mforms]
+  (let [defns (filter defn-like? forms)
+        by-name (into {} (map (fn [f] [(rn-name (second (rn-items f))) f]) defns))]
+    (loop [todo (vec mforms) seen #{} out []]
+      (if (empty? todo)
+        out
+        (let [syms (filter (fn [s] (and (contains? by-name s) (not (contains? seen s)))) (distinct (node-symbols (first todo))))]
+          (recur (vec (concat (rest todo) (map (fn [s] (get by-name s)) syms)))
+                 (into seen syms)
+                 (into out (map (fn [s] (get by-name s)) syms))))))))
+
 
 (defn compile-ns
   "Compile namespace file `path` to {:ns :requires :defs [{:name :kind :node}]}.
@@ -162,11 +181,18 @@
    placeholder FIRST so later forms' references to earlier (and forward)
    names resolve to `:global` of this namespace."
   [path]
-  (let [forms (read-forms path)
+  (let [texts (read-forms+text path)
+        forms (vec (map first texts))
         head (ns-head forms)
         ns (:ns head)
+        ; STAGING (see `build`): this namespace's definitions live in the
+        ; build's private env. Mark it loaded THERE so a name lookup that
+        ; misses (a forward ref in a macro helper, a def-bound name) cannot
+        ; make the loader run the whole namespace — top-level side effects
+        ; included. Per-env: the live VM's loaded set is untouched.
+        _ (BeamLisp.Env/mark_loaded ns)
         ; evaluate the ns form on BEAM so aliases/requires exist for the compiler
-        _ (BeamLisp.Compiler/eval_string (first-form-text path) (BeamLisp.Compiler/new_env "user") path)
+        _ (BeamLisp.Compiler/eval_string (second (first texts)) (BeamLisp.Compiler/new_env "user") path)
         defs (top-defs (rest forms))
         ; a placeholder only where the name is unbound: interning nil over a LIVE
         ; definition (compiling `core` itself, or any ns this VM already runs)
@@ -175,12 +201,20 @@
             (when (and (some? (:name d)) (not (BeamLisp.Env/bound? ns (:name d))))
               (BeamLisp.Env/intern ns (:name d) nil)))
         ; the namespace's OWN macros define its compile-time language: each
-        ; `defmacro` is defined on the BEAM (its source span, in this ns)
-        ; before the forms that use it compile. Not D3's "evaluate the ns":
-        ; a defmacro runs nothing but its own definition. A macro whose body
-        ; CALLS a fn of this ns (rare) still needs that fn on the BEAM.
-        _ (doseq [f (filter defmacro? (rest forms))]
-            (BeamLisp.Compiler/eval_string (form-text path f) (BeamLisp.Compiler/new_env ns) path))
+
+        ; `defmacro` is defined on the BEAM (its source span, in ITS ns) before
+        ; the forms that use it compile. Not "evaluate the ns": a defmacro runs
+        ; nothing but its own definition.
+        ; A macro body that CALLS a defn of its ns needs that fn on the BEAM at
+        ; expansion time: exactly the defn(s) the macros reach (transitively,
+        ; by symbol), evaluated first, in source order. A defn only DEFINES;
+        ; no other top-level form (def, side-effect expr) is ever run.
+        mforms (filter defmacro? (rest forms))
+        needed (macro-helper-forms (rest forms) mforms)
+        _ (doseq [[f text] (rest texts)
+                  :when (or (defmacro? f) (some (fn [n] (identical? n f)) needed))]
+            (BeamLisp.Compiler/eval_string text (BeamLisp.Compiler/new_env ns) path))
+
         env (BeamLisp.Ns.Compiler/new_env ns)]
     {:ns ns :path path :requires (:requires head)
      :defs (vec (map (fn [d]
@@ -486,17 +520,22 @@
         ; the compiler calls `BeamLisp.Ns.Reader/read_string` directly.
         ; They load BEFORE the entry: they are what the entry reaches by
         ; module name (rt, core, the clojure prelude), i.e. its dependencies.
+
         _ (e/set-rest-fns! (rest-fns (vec core)))
         ; Link, and follow module-name references: a call
         ; `BeamLisp.Ns.Clojure.String/upper-case` names a NAMESPACE (one whose
         ; source is under `roots`), which is compiled in like a :require —
         ; the BEAM would load it on that call. Repeat until nothing new.
+        ; Each discovery attempt stages in a fresh fork: macros, helpers and
+        ; loaded marks cannot affect the live VM or a later build.
         attempt (fn [entries]
-                  (let [{:keys [order compiled]} (load-order roots entries stubs)
-                        table (into {} (map (fn [ns] [ns (set (keep :name (:defs (get compiled ns))))]) order))
-                        missing (atom [])
-                        texts (into {} (map (fn [ns] [ns (emit-ns (get compiled ns) table host missing leaves stubs order)]) order))]
-                    {:order order :compiled compiled :texts texts :missing @missing}))
+                  (BeamLisp.Env/isolated
+                    (fn []
+                      (let [{:keys [order compiled]} (load-order roots entries stubs)
+                            table (into {} (map (fn [ns] [ns (set (keep :name (:defs (get compiled ns))))]) order))
+                            missing (atom [])
+                            texts (into {} (map (fn [ns] [ns (emit-ns (get compiled ns) table host missing leaves stubs order)]) order))]
+                        {:order order :compiled compiled :texts texts :missing @missing}))))
         first-try (attempt (concat (or (:with opts) []) [entry]))
         {:keys [order compiled texts missing]}
           (loop [r first-try entries (concat (or (:with opts) []) [entry]) n 0]

@@ -127,10 +127,21 @@ worst kind of configuration bug.
 - `:env` — name → value, the environment the tree expects.
 - `:app` — `{:name :vsn :applications :mod}`: what this tree IS as an OTP
   application, so a build need not interrogate the running VM about itself.
-- `:build` — `{:paths :seed :out :native :jobs :ex}`: which roots hold build
-  sources, where the output goes, which crates are native, how wide to compile.
-  `:ex :exclude` holds paths RELATIVE TO `:ex :root`, since that is what they are
-  matched against.
+- `:build` — `{:paths :seed :out :native :jobs :ex :exclude}`: which roots hold
+  build sources, where the output goes, which crates are native, how wide to
+  compile, and which sources must NEVER be compiled. `:exclude` holds paths
+  RELATIVE TO THE PROJECT ROOT (the env.bl's directory, like every other path
+  here): each names a FILE (matched exactly) or a DIRECTORY (every source
+  beneath it — the separator is what makes `src/foo` miss `src/foobar`).
+  Excluded sources are entry programs that bind listeners, open ports or touch
+  devices when they load (FUP-015): the build filters them out BEFORE the
+  source graph is read, planned or compiled, so they never evaluate and never
+  emit a beam, and an exclusion cannot be bypassed by `--force`. A compiled
+  source that REQUIRES an excluded one is refused with an actionable error
+  rather than secretly loading it; an excluded source a previous build emitted
+  is pruned with its beams. `:ex :exclude` is the SUBSTRATE stage's exclusion
+  and holds paths RELATIVE TO `:ex :root`, since that is what they are matched
+  against.
 - `:release` — `{:name :vsn :output :permanent :include :cookie :env}`: what to
   assemble, and what must be permanent in it.
 - `:realm` — a string: the human alias of this project's realm (URLs, `bl realm`,
@@ -441,6 +452,10 @@ problems reports all three in one pass.
             [native nerr] (norm-strings (:native v) ":build :native" root)
             [seed serr]   (norm-opt-string (:seed v) ":build :seed" root)
             [out oerr]    (norm-opt-string (:out v) ":build :out" root)
+            ; Sources never compiled: entry programs that bind listeners on
+            ; load. A FILE matches exactly; a DIRECTORY matches every source
+            ; beneath it (the separator makes `src/foo` miss `src/foobar`).
+            [xcl xerr]    (norm-strings (:exclude v) ":build :exclude" root)
             jobs          (:jobs v)
             jerr          (if (or (nil? jobs) (erlang/is_integer jobs)) []
                               [":build :jobs must be a number"])
@@ -455,14 +470,15 @@ problems reports all three in one pass.
                   [{:root r :exclude x}
                    (concat rerr xerr
                            (unknown-errs ex [:root :exclude] ":build :ex"))]))
-            errs (concat perr nerr serr oerr jerr exerr
-                         (unknown-errs v [:paths :seed :out :native :jobs :ex] ":build"))]
+            errs (concat perr nerr serr oerr jerr xerr exerr
+                         (unknown-errs v [:paths :seed :out :native :jobs :ex :exclude] ":build"))]
         [(if (empty? errs)
            {:paths paths
             :seed seed
             :out out
             :native native
             :jobs (or jobs 1)
+            :exclude xcl
             :ex exv}
            nil)
          errs])))
