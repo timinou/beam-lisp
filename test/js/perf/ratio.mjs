@@ -13,19 +13,21 @@ const load = async (out) => {
 const H = await load(hand), S = await load(self);
 const names = Object.keys(H).filter((k) => k.startsWith("d_p_")).sort();
 // Process CPU time, not wall time: on a busy host the scheduler parks this
-// process between slices, which wall time counts and CPU time does not. The
-// minimum of many interleaved runs then drops the residual (cache, GC) noise.
-const med = (xs) => Math.min(...xs);
+// process between slices, which wall time counts and CPU time does not. CPU
+// time still moves with clock frequency and cache contention, so the ratio is
+// the MEDIAN OF PER-PAIR RATIOS: a hand run and the self run right after it
+// see the same machine, and the median drops the pairs a burst split.
+const med = (xs) => xs.slice().sort((a, b) => a - b)[xs.length >> 1];
 const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; };
 let worst = 0, failed = [];
 for (const k of names) {
   for (let i = 0; i < 3; i++) { H[k](); S[k](); }
   const th = [], ts = [];
-  for (let i = 0; i < 15; i++) {
+  for (let i = 0; i < 21; i++) {
     let t = cpu(); H[k](); th.push(cpu() - t);
     t = cpu(); S[k](); ts.push(cpu() - t);
   }
-  const r = med(ts) / med(th);
+  const r = med(ts.map((t, i) => t / Math.max(th[i], 1e-3)));
   worst = Math.max(worst, r);
   if (r > max) failed.push(k);
   console.log(k.slice(4).padEnd(12), med(th).toFixed(2).padStart(8), med(ts).toFixed(2).padStart(8), r.toFixed(2).padStart(6) + "x");

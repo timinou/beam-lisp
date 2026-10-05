@@ -49,6 +49,26 @@ function invokeBlfn(f, args) {
   }
   throw new BLError("wrong number of args (" + args.length + ") passed to a multi-arity fn");
 }
+/** A `{:$blfn …}` multi-fn value as ONE JS function, resolved once: each
+    fixed arity is looked up per arity count up front, so a call is a length
+    switch plus a direct call, not a map lookup and two spreads. Any other value
+    keeps `invoke`. */
+export function blfnFn(f) {
+  if (typeof f === "function") return f;
+  if (!(f instanceof Tup && f.items.length === 3 && f.items[0] === BLFN)) return (...a) => invoke(f, ...a);
+  const fixed = f.items[1];
+  const at = (n) => { const g = fixed instanceof HMap ? fixed.get(n, NF) : NF; return g === NF ? null : typeof g === "function" ? g : (...a) => invoke(g, ...a); };
+  const f1 = at(1), f2 = at(2), f3 = at(3);
+  // `(...args)`: length 0, the shape every emitted multi-arity dispatcher has
+  // (`is_function/2` reads a 0-length fn as accepting any arity)
+  return function blfn(...args) {
+    const n = args.length;
+    if (n === 2 && f2 !== null) return f2(args[0], args[1]);
+    if (n === 1 && f1 !== null) return f1(args[0]);
+    if (n === 3 && f3 !== null) return f3(args[0], args[1], args[2]);
+    return invokeBlfn(f, args);
+  };
+}
 /** The sentinel compiled map patterns compare against (`{:keys [a]}` in a fn
     head is a pmap: a key that is ABSENT fails the clause). */
 export const NOT_FOUND = NF;

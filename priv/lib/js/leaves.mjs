@@ -171,7 +171,7 @@ export const LEAVES = {
   "Elixir.BeamLisp.Decimal/unscaled/1": (d) => (d.u >= BigInt(Number.MIN_SAFE_INTEGER) && d.u <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(d.u) : d.u),
   "Elixir.BeamLisp.Decimal/scale/1": (d) => d.s,
   "Elixir.BeamLisp.Decimal/parse/1": (s) => { const d = R.parseDec(s); return d === null ? ERROR : T(OK, d); },
-  "Elixir.BeamLisp.Vector/to_list/1": (v) => list(v.toArray()),
+  "Elixir.BeamLisp.Vector/to_list/1": (v) => v.toList(),
   "Elixir.BeamLisp.Vector/new/1": (l) => R.vecFromArray(C.toArray(l)),
   "Elixir.BeamLisp.Set/to_list/1": (s) => list(s.elements().sort(R.compare)),
   // core/to-list: any BL collection (or nil) as a plain list

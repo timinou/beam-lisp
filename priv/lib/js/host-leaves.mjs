@@ -231,6 +231,10 @@ export const LISTS = {
 
 const SEG = typeof Intl !== "undefined" && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
 const graphemes = (s) => (SEG ? [...SEG.segment(s)].map((g) => g.segment) : [...s]);
+/** Grapheme count. An all-ASCII string other than one holding "\r\n" (one
+    grapheme on the BEAM) has one grapheme per code unit — no segmenter. */
+const ASCII_NO_CRLF = /^[\x00-\x7f]*$/;
+const graphemeLength = (s) => (ASCII_NO_CRLF.test(s) && !s.includes("\r\n") ? s.length : graphemes(s).length);
 // Elixir's `String.trim` family strips Unicode whitespace
 const WS = "[\\s\\u0085\\u180e]";
 export const STRING = {
@@ -245,7 +249,7 @@ export const STRING = {
     return L(trim ? xs.filter((x) => x !== "") : xs);
   },
   "Elixir.String/graphemes/1": (s) => L(graphemes(s)),
-  "Elixir.String/length/1": (s) => graphemes(s).length,
+  "Elixir.String/length/1": graphemeLength,
   "Elixir.String/slice/3": (s, start, len) => graphemes(s).slice(start, start + len).join(""),
   "Elixir.String/replace/3": (s, a, b) => s.split(a).join(b),
   "Elixir.String/trim/1": (s) => s.replace(new RegExp("^" + WS + "+|" + WS + "+$", "g"), ""),

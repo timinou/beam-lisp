@@ -197,7 +197,7 @@ export function realize(l) {
     `hd` refuses it). */
 function headCell(v) {
   if (v instanceof R.Cons) return v;
-  if (v instanceof R.Vec) return normalizeList(R.listFromArray(v.toArray()));
+  if (v instanceof R.Vec) return normalizeList(v.toList());
   if (v instanceof R.HSet) return normalizeList(R.listFromArray([...v]));
   if (v instanceof SeqCursor) return v.cell();
   return v;
@@ -209,7 +209,7 @@ export function cell(x) {
   if (x instanceof LazySeq) return realize(x);
   if (x instanceof SeqCursor) return x.cell();
   if (x instanceof R.Cons) return x;
-  if (x instanceof R.Vec) return normalizeList(R.listFromArray(x.toArray()));
+  if (x instanceof R.Vec) return normalizeList(x.toList());
   if (x instanceof R.HSet) return normalizeList(R.listFromArray([...x]));
   if (typeof x === "string") return normalizeList(R.listFromArray([...x]));
   return x;
@@ -252,7 +252,7 @@ export class SeqCursor {
 /** Normalize a producer input (BeamLisp.LazySeq/input): a vector is unwrapped,
     a list longer than one chunk becomes a cursor, anything else is itself. */
 export function input(x) {
-  if (x instanceof R.Vec) return input(R.listFromArray(x.toArray()));
+  if (x instanceof R.Vec) return input(x.toList());
   if (x === R.EMPTY || x instanceof R.Cons) {
     let n = 0; for (let p = x; p instanceof R.Cons && n <= CHUNK; p = p.t) n++;
     return n > CHUNK ? new SeqCursor(x) : x;

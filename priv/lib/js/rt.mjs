@@ -126,9 +126,13 @@ const EMPTY_NODE = Object.freeze([]);
 
 export class Vec {
   constructor(cnt, shift, root, tail, meta) {
-    this.cnt = cnt; this.shift = shift; this.root = root; this.tail = tail; this.meta = meta || null; this._h = undefined;
+    this.cnt = cnt; this.shift = shift; this.root = root; this.tail = tail; this.meta = meta || null; this._h = undefined; this._l = undefined;
   }
   tailOff() { return this.cnt < WIDTH ? 0 : ((this.cnt - 1) >>> BITS) << BITS; }
+  /** The element list, built once: a vector is immutable, so every `seq` /
+      `next` / fold of the same vector shares one spine (the BEAM pays this
+      walk per call too, but over a flat tuple; here it was a fresh trie walk). */
+  toList() { return this._l === undefined ? (this._l = listFromArray(this.toArray())) : this._l; }
   arrayFor(i) {
     if (i >= this.tailOff()) return this.tail;
     let node = this.root;
@@ -834,6 +838,36 @@ export const emptyList = () => EMPTY;
     $blfn multi-fns and vectors are called by the language's rule, never by
     core.mjs. */
 export function call(f, invoke, ...args) { return typeof f === "function" ? f(...args) : invoke(f, listFromArray(args)); }
+// fixed-arity forms js.emit picks for 0–3 arguments: no rest array, no spread
+export function call0(f, invoke) { return typeof f === "function" ? f() : invoke(f, EMPTY); }
+export function call1(f, invoke, a) { return typeof f === "function" ? f(a) : invoke(f, new Cons(a, EMPTY)); }
+export function call2(f, invoke, a, b) { return typeof f === "function" ? f(a, b) : invoke(f, new Cons(a, new Cons(b, EMPTY))); }
+export function call3(f, invoke, a, b, c) { return typeof f === "function" ? f(a, b, c) : invoke(f, new Cons(a, new Cons(b, new Cons(c, EMPTY)))); }
+// Intrinsic forms of the hottest pure leaves (js.emit inlines the call; the
+// leaf in host-leaves.mjs / leaves.mjs answers identically): a small-integer
+// fast path, else exactly the leaf's own general path.
+export function ltI(a, b) { return typeof a === "number" && typeof b === "number" ? a < b : termCompare(a, b) < 0; }
+export function gtI(a, b) { return typeof a === "number" && typeof b === "number" ? a > b : termCompare(a, b) > 0; }
+export function leI(a, b) { return typeof a === "number" && typeof b === "number" ? a <= b : termCompare(a, b) <= 0; }
+export function geI(a, b) { return typeof a === "number" && typeof b === "number" ? a >= b : termCompare(a, b) >= 0; }
+export function addI(a, b) { if (typeof a === "number" && typeof b === "number") { const r = a + b; if (r <= MAX && r >= MIN) return r; } return add(a, b); }
+export function subI(a, b) { if (typeof a === "number" && typeof b === "number") { const r = a - b; if (r <= MAX && r >= MIN) return r; } return sub(a, b); }
+/** `lists:reverse/1` without the array round trip (an improper tail is
+    ignored, as the leaf does). */
+export function reverseI(l) {
+  let r = EMPTY;
+  for (let p = l; p instanceof Cons; p = p.t) r = new Cons(p.h, r);
+  return r;
+}
+/** `erlang:list_to_tuple/1`. */
+export function listToTupleI(l) {
+  const a = [];
+  for (let p = l; p instanceof Cons; p = p.t) a.push(p.h);
+  return new Tup(a);
+}
+/** `erlang:is_function(F, N)`, as host-leaves answers it (a JS fn of length 0
+    is a rest/variadic fn and accepts any arity). */
+export function isFnN(x, n) { return typeof x === "function" && (x.length === n || x.length === 0); }
 export function callList(f, args, invoke) {
   if (typeof f === "function") { const a = []; for (let p = args; p instanceof Cons; p = p.t) a.push(p.h); return f(...a); }
   return invoke(f, args);
@@ -859,7 +893,12 @@ export function bindApply2(g) { APPLY2 = g; }
 let SP = null;
 export function bindStructProtocol(p) { SP = p; }
 export function isMapI(x) { return x instanceof HMap || (x !== null && typeof x === "object" && x.blStruct instanceof Kw); }
-export function hasKeyI(k, m) { return SP.hasKey(k, m); }
+export function hasKeyI(k, m) {
+  // a plain map holding no `:__struct__` entry answers inline; the struct
+  // protocol owns every other case (a struct class, the `:__struct__` key)
+  if (m instanceof HMap && !(k instanceof Kw && k.fq === "__struct__")) return m.has(k);
+  return SP.hasKey(k, m);
+}
 export function mapGetI(k, m) { if (m instanceof HMap) { const v = m.get(k, NO_KEY); if (v !== NO_KEY) return v; } return SP.mapGet(k, m, NO_KEY) === NO_KEY ? bad("map_get " + printStr(k), m) : SP.mapGet(k, m, null); }
 export function mapsGet3I(k, m, d) { return m instanceof HMap ? m.get(k, d) : SP.mapGet(k, m, d); }
 /** `(list* a b rest)`: the heads consed onto `rest` (shared, unforced). */
