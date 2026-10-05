@@ -7,7 +7,7 @@ import fs from "node:fs";
 import { canon } from "../reader/canon.mjs";
 const out = path.resolve(process.argv[2]);
 const load = (m) => import(pathToFileURL(path.join(out, m)).href);
-const Cm = await load("compiler.mjs"), Rd = await load("reader.mjs"), R = await load("rt.mjs");
+const Cm = await load("ns/compiler.mjs"), Rd = await load("ns/reader.mjs"), R = await load("rt.mjs");
 const forms = Rd["d_read$Uall"](fs.readFileSync(process.argv[3], "utf8"));
 let i = 0;
 for (let p = forms; p instanceof R.Cons; p = p.t, i++) {

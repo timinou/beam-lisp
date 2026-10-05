@@ -351,3 +351,104 @@
   (let [orig (BeamLisp.Env/fetch! "core" "reduced?")]
     (with-core-reduced? (fn [_] false) (fn [] :ok))
     (is (= orig (BeamLisp.Env/fetch! "core" "reduced?")))))
+
+
+;; ── 5. prepared callback representation ───────────────────────────────────
+; `reduce-callback` now resolves the callable ONCE per traversal to a native
+; 2-arity fun (`call-prepare-callback` in rt.call): a native fn stays itself, a
+; fixed `$blfn` arm is used directly, an eligible variadic arm gets a native
+; adapter reproducing `invoke-multi`'s exact call, and everything else keeps
+; the ORIGINAL `call-invoke` wrapper. Preparation is effect-free and
+; nonthrowing, so an invalid callable still fails only at its first INVOCATION
+; — never on empty input, never while preparing.
+
+(defn- rd-baseline
+  [f init coll policy] (BeamLisp.Ns.Rt/k-reduce f init coll policy :baseline))
+
+(defn- rd-prepared
+  [f init coll policy] (BeamLisp.Ns.Rt/k-reduce f init coll policy :normalized))
+
+(defn- rd-outcome
+  "`[:ok value]` or `[:err message]` — value AND error differential."
+  [thunk]
+  (try [:ok (thunk)] (catch e [:err (str e)])))
+
+(deftest prepared-callbacks-match-baseline-for-every-shape
+  (let [variadic0 (fn [args] (count args))
+        variadic1 (fn [a rest] (tuple a (count rest)))
+        variadic2 (fn [a x rest] (tuple a x (count rest)))
+        callables
+        [["native" (fn [a x] (tuple a x))]
+         ["native-one" (fn [x] x)]
+         ["native-three" (fn [a b c] a)]
+         ["keyword" :k]
+         ["map" {:x :y}]
+         ["plus" +]
+         ["fixed-tuple" (BeamLisp.Ns.Rt/multi-fn {2 (fn [a x] (tuple :fixed a x))})]
+         ["variadic0" (BeamLisp.Ns.Rt/multi-fn {} (tuple 0 variadic0))]
+         ["variadic1" (BeamLisp.Ns.Rt/multi-fn {} (tuple 1 variadic1))]
+         ["variadic2" (BeamLisp.Ns.Rt/multi-fn {} (tuple 2 variadic2))]
+         ["fixed-over-variadic"
+          (BeamLisp.Ns.Rt/multi-fn {2 (fn [a x] (tuple :fixed a x))}
+                                   (tuple 2 (fn [a x rest] (tuple :variadic a x rest))))]
+         ["missing-arm" (BeamLisp.Ns.Rt/multi-fn {1 (fn [a] a)} nil)]
+         ["malformed-fixed" (tuple :"$blfn" {2 7} nil)]
+         ["malformed-variadic" (tuple :"$blfn" {} (tuple 1 7))]
+         ["negative-minimum" (tuple :"$blfn" {} (tuple -1 (fn [a b c] :wrong)))]
+         ["wrong-variadic-arity" (tuple :"$blfn" {} (tuple 0 (fn [a b] :wrong)))]
+         ["malformed-fixed-with-valid-variadic"
+          (tuple :"$blfn" {2 nil} (tuple 0 (fn [xs] :wrong)))]
+         ["variadic-too-high" (tuple :"$blfn" {} (tuple 3 (fn [a b c rest] a)))]
+         ["invalid-int" 7]
+         ["invalid-nil" nil]]
+        colls [nil () [] {} #{} (list 1 2 3) [1 2 3] (vec (range 65))
+               (map inc (list 1 2 3)) (map inc (range 65))]]
+    (doseq [[label f] callables coll colls]
+      (is (= (rd-outcome (fn [] (rd-baseline f 0 coll :kernel)))
+             (rd-outcome (fn [] (rd-prepared f 0 coll :kernel))))
+          (str label " / " (pr-str coll))))))
+
+(deftest prepared-multi-arity-fn-literal-round-trips
+  (let [f (fn ([a] a) ([a b] (+ a b)))]
+    (is (= 6 (rd-baseline f 0 (list 1 2 3) :kernel)))
+    (is (= 6 (rd-prepared f 0 (list 1 2 3) :kernel)))))
+
+(deftest invalid-callables-fail-only-at-the-first-invocation
+  (let [bad [7 nil (atom 1) "s" (fn [x] x) [:a] :k
+             (BeamLisp.Ns.Rt/multi-fn {1 (fn [a] a)} nil)]]
+    (doseq [f bad empty [nil () [] {} #{} (map inc [])]]
+      (is (= :init (rd-prepared f :init empty :kernel))
+          (str "preparation touched " (pr-str f)))
+      (is (= :init (rd-baseline f :init empty :kernel))))
+    (doseq [f bad]
+      (let [calls (atom 0)
+            s (map (fn [x] (swap! calls inc) x) (range))
+            b (rd-outcome (fn [] (rd-baseline f 0 s :kernel)))
+            after-b @calls
+            p (rd-outcome (fn [] (rd-prepared f 0 s :kernel)))]
+        (is (= b p) (str "lazy failure differs for " (pr-str f)))
+        (is (>= after-b 1) "the first chunk realized before the failure")))))
+
+(deftest prepared-variadic-adapters-reproduce-invoke-multi-exactly
+  ;; min0 sees (acc x); min1 sees acc and (x); min2 sees acc, x and ().
+  (is (= [7 8] (rd-prepared (BeamLisp.Ns.Rt/multi-fn {} (tuple 0 (fn [args] args))) 7 [8] :kernel)))
+  (is (= [7 [8]] (rd-prepared (BeamLisp.Ns.Rt/multi-fn {} (tuple 1 (fn [a rest] [a rest]))) 7 [8] :kernel)))
+  (is (= [7 8 []] (rd-prepared (BeamLisp.Ns.Rt/multi-fn {} (tuple 2 (fn [a x rest] [a x rest]))) 7 [8] :kernel))))
+
+(deftest prepared-plus-keeps-the-original-numeric-op-and-errors
+  (is (= 4.0 (rd-prepared + 0 [1.5 2.5] :kernel)))
+  (is (erlang/== (rd-prepared + 0 [(* -1.0 0.0) (* -1.0 0.0)] :kernel) (* -1.0 0.0))
+      "signed zero is preserved by the original +, not substituted")
+  (is (= 9007199254740993 (rd-prepared + 0 [9007199254740992 1] :kernel)))
+  (is (= 6 (rd-prepared + 0 [1 2 3] :kernel)))
+  (is (= (rd-outcome (fn [] (rd-baseline + 0 ["a" 1] :kernel)))
+         (rd-outcome (fn [] (rd-prepared + 0 ["a" 1] :kernel))))
+      "a nonnumeric + argument fails the same way"))
+
+(deftest prepared-unary-callbacks-in-map-and-filter
+  (is (= [2 4 6] (vec (map (fn [x] (* 2 x)) [1 2 3]))))
+  (is (= [2 4 6] (vec (map (BeamLisp.Ns.Rt/multi-fn {1 (fn [x] (* 2 x))}) [1 2 3]))))
+  (is (= [2 4 6] (vec (map (BeamLisp.Ns.Rt/multi-fn {} (tuple 0 (fn [args] (* 2 (first args))))) [1 2 3]))))
+  (is (= [2 4 6] (vec (map (BeamLisp.Ns.Rt/multi-fn {} (tuple 1 (fn [x rest] (* 2 x)))) [1 2 3]))))
+  (is (= [{:k 1} {:k 2}] (vec (filter :k [{:k 1} {} {:k 2}]))))
+  (is (= [1 3] (vec (filter (BeamLisp.Ns.Rt/multi-fn {1 (fn [x] (odd? x))}) [1 2 3])))))

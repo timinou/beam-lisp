@@ -680,6 +680,94 @@
 
     :else false))
 
+;; ── callback preparation ───────────────────────────────────────────────────
+; A fold or a lazy map/filter invokes ONE callable once per element. `step`'s
+; generic fallback runs the whole `call-invoke` protocol every time — classify
+; the callable, build an argument list, look up a fixed arm, split a variadic
+; rest list. `call-prepare-callback` moves that decision OUT of the loop: it
+; resolves a NATIVE fun of the fixed arity the call site uses, so the hot path
+; is the BEAM's direct call. It is the ONE shared preparation seam; the reduce
+; walk (`reduce-callback`) and the map/filter entry points all route through it.
+;
+; Preparation is EFFECT-FREE and NONTHROWING. It calls nothing, so an invalid
+; callable still fails only at its first INVOCATION (never on empty input), and
+; a malformed arm keeps its own failure rather than falling through to another.
+
+(defn- call-prepare-generic
+  "The fallback `call-prepare-callback` keeps for a callable it cannot turn into
+   a native arm: a native `n`-arity wrapper around the ORIGINAL `call-invoke`,
+   so the same arguments reach the same protocol and the same failure the
+   unprepared path would raise."
+  [f n]
+  (cond
+    (erlang/== n 1) (fn [x] (call-invoke f (raw-cons x ())))
+    :else (fn [acc x] (call-invoke f (raw-cons acc (raw-cons x ()))))))
+
+(defn- call-prepare-callback
+  "Normalize a callable for a FIXED arity `n` (1 or 2) into a native `n`-arity
+   fun, so a hot call site pays the BEAM's direct call instead of the generic
+   `call-invoke` protocol on every element. Resolved ONCE per traversal:
+
+     · a native fun of arity `n`                      → itself, unchanged;
+     · a well-formed `$blfn` tuple whose valid fixed arm is at `n`
+                                                      → that arm;
+     · a `$blfn` whose eligible variadic arm covers `n` (min ≤ n)
+                                                      → a native adapter that
+                                                        reproduces
+                                                        `invoke-multi`'s exact
+                                                        call: the first `min`
+                                                        arguments then the REST
+                                                        as ONE proper list;
+     · anything else (keyword/map/set/vector/remote/opaque, a wrong arity, or a
+       MALFORMED fixed/variadic descriptor)            → a native wrapper around
+                                                        the ORIGINAL
+                                                        `call-invoke`.
+
+   A present-but-malformed fixed arm is NOT skipped for a variadic one — the
+   wrapper preserves the fixed arm's own failure. The captured value is adapted
+   privately: the registry tuple and the callable's identity are never replaced,
+   so a later rebinding affects future captures, not this one."
+  [f n]
+  (cond
+    (erlang/is_function f n) f
+
+    (and (erlang/is_tuple f)
+         (erlang/== 3 (erlang/tuple_size f))
+         (erlang/== :"$blfn" (erlang/element 1 f)))
+    (let [fixed (erlang/element 2 f)
+          variadic (erlang/element 3 f)]
+      (cond
+        (erlang/== false (erlang/is_map fixed))
+        (call-prepare-generic f n)
+
+        (erlang/is_map_key n fixed)
+        (let [arm (maps/get n fixed)]
+          (cond
+            (erlang/is_function arm n) arm
+            :else (call-prepare-generic f n)))
+
+        (and (erlang/is_tuple variadic)
+             (erlang/== 2 (erlang/tuple_size variadic))
+             (erlang/is_integer (erlang/element 1 variadic))
+             (erlang/>= (erlang/element 1 variadic) 0)
+             (erlang/is_function (erlang/element 2 variadic)
+                                 (erlang/+ (erlang/element 1 variadic) 1))
+             (erlang/>= n (erlang/element 1 variadic)))
+        (let [mn (erlang/element 1 variadic)
+              vf (erlang/element 2 variadic)]
+          (cond
+            (erlang/== n 1)
+            (cond
+              (erlang/== mn 0) (fn [x] (vf (raw-cons x ())))
+              :else (fn [x] (vf x ())))
+            (erlang/== mn 0) (fn [acc x] (vf (raw-cons acc (raw-cons x ()))))
+            (erlang/== mn 1) (fn [acc x] (vf acc (raw-cons x ())))
+            :else (fn [acc x] (vf acc x ()))))
+
+        :else (call-prepare-generic f n)))
+
+    :else (call-prepare-generic f n)))
+
 ;; apply-to: apply with seq argument
 (defn call-apply-to [f args]
   (call-invoke f (seq-to-args args)))
@@ -2532,7 +2620,7 @@
 (defn lazy--map [f coll]
   "Map `f` over a collection lazily. The result is a lazy seq that applies `f`
    to each element as it is consumed; forcing only the prefix that is demanded."
-  (lazy-map f (BeamLisp.LazySeq/input (seqable coll))))
+  (lazy-map (call-prepare-callback f 1) (BeamLisp.LazySeq/input (seqable coll))))
 
 (defn- lazy-map [f coll]
   ; The fold recipe folds the SOURCE (a cursor or list, not a memo cell), so a
@@ -2548,30 +2636,34 @@
           :else
           (let [h (erlang/hd cell)
                 t (erlang/tl cell)
-                f-h (lazy-invoke f (lazy-one h))
+                f-h (lazy-invoke1 f h)
                 chunk-size (BeamLisp.LazySeq/chunk_size)
                 result (map-chunk f (raw-cons f-h ()) t (erlang/- chunk-size 1))]
-            (let [elems (erlang/element 1 result)
+            (let [acc (erlang/element 1 result)
                   rest (erlang/element 2 result)]
               (cond
-                (erlang/== nil rest) elems
-                :else (BeamLisp.LazySeq/chain elems
-                         (fn [] (lazy-map f rest)))))))))
+                (erlang/== nil rest) (lists/reverse acc)
+                :else (lists/reverse acc
+                         (BeamLisp.LazySeq/new (fn [] (lazy-map f rest))))))))))
     (fn [rf init]
       (lazy-reduce-source
-        (fn [acc x] (rf acc (lazy-invoke f (lazy-one x))))
+        (fn [acc x] (rf acc (lazy-invoke1 f x)))
         init
         coll))))
 
 (defn- map-chunk [f acc coll n]
   "Collect up to n elements from coll, applying f to each, accumulating in
-   reverse. Returns [elements rest]."
+   REVERSE. Returns [reversed-accumulator rest]; rest is nil when the input
+   ran out. The caller finishes the chunk ONCE (see `lazy-map`):
+   `lists/reverse/1` for an exhausted chunk, `lists/reverse/2` onto the tail
+   node for a continuing one, so an emitted element is consed once instead of
+   twice."
   (cond
-    (erlang/== n 0) (tuple2 (lists/reverse acc) coll)
+    (erlang/== n 0) (tuple2 acc coll)
     :else
     (let [cell (BeamLisp.LazySeq/cell coll)]
       (cond
-        (erlang/== nil cell) (tuple2 (lists/reverse acc) nil)
+        (erlang/== nil cell) (tuple2 acc nil)
         :else
         (let [h (erlang/hd cell)
               t (erlang/tl cell)
@@ -2630,7 +2722,7 @@
 (defn lazy-filter [pred coll]
   "Filter `coll` with `pred`, lazily. Returns a lazy seq of elements for which
    `pred` returns a truthy value."
-  (lazy-filter* pred (BeamLisp.LazySeq/input (seqable coll))))
+  (lazy-filter* (call-prepare-callback pred 1) (BeamLisp.LazySeq/input (seqable coll))))
 
 (defn- lazy-filter* [pred coll]
   (let [coll (BeamLisp.LazySeq/input coll)]
@@ -2641,7 +2733,7 @@
         (lazy-reduce-source
           (fn [acc x]
             (cond
-              (lazy-invoke pred (lazy-one x)) (rf acc x)
+              (lazy-invoke1 pred x) (rf acc x)
               :else acc))
           init
           coll)))))
@@ -2649,24 +2741,33 @@
 (defn- lazy-filter-realise [pred coll]
   "One cell of `filter`: scan up to `chunk_size` INPUTS (never 'until 32
    matches' — a sparse predicate over an infinite coll must still seal a
-   chunk), looping in place past an all-reject scan so no cell is empty."
+   chunk), looping in place past an all-reject scan so no cell is empty.
+
+   `filter-chunk` hands back a REVERSED accumulator; the chunk is finished
+   ONCE here — `lists/reverse/1` when the input ran out, `lists/reverse/2`
+   onto the tail node otherwise. An all-reject scan (empty accumulator) keeps
+   scanning IN PLACE rather than publishing an empty chunk, and so never
+   allocates the tail until a matching element exists."
   (let [r (filter-chunk pred () coll (BeamLisp.LazySeq/chunk_size))
-        elems (erlang/element 1 r)
+        acc (erlang/element 1 r)
         rest (erlang/element 2 r)]
     (cond
-      (erlang/== nil rest) elems
-      (erlang/== () elems) (lazy-filter-realise pred rest)
-      :else (BeamLisp.LazySeq/chain elems (fn [] (lazy-filter* pred rest))))))
+      (erlang/== nil rest) (lists/reverse acc)
+      (erlang/== () acc) (lazy-filter-realise pred rest)
+      :else (lists/reverse acc
+               (BeamLisp.LazySeq/new (fn [] (lazy-filter* pred rest)))))))
 
 (defn- filter-chunk [pred acc coll n]
-  "Scan up to n INPUT elements, keeping those matching pred (reversed in acc).
-   Returns {elements rest}; rest is nil when the input ran out."
+  "Scan up to n INPUT elements, keeping those matching pred (accumulated in
+   REVERSE). Returns {reversed-accumulator rest}; rest is nil when the input ran
+   out. The caller finishes the chunk once (see `lazy-filter-realise`) and NEVER
+   reverses an empty accumulator onto a tail."
   (cond
-    (erlang/== n 0) (tuple2 (lists/reverse acc) coll)
+    (erlang/== n 0) (tuple2 acc coll)
     :else
     (let [cell (BeamLisp.LazySeq/cell coll)]
       (cond
-        (erlang/== nil cell) (tuple2 (lists/reverse acc) nil)
+        (erlang/== nil cell) (tuple2 acc nil)
         :else
         (let [h (erlang/hd cell)]
           (filter-chunk pred
@@ -2837,28 +2938,32 @@
                :else (recur (erlang/+ i 1) acc2)))))))))
 
 (defn- range-chunk [start end_]
-  "Build one chunk of integers (up to chunk_size) with a lazy tail if not exhausted."
+  "Build one chunk of integers (up to chunk_size) with a lazy tail if not
+   exhausted. `range-build` hands back a REVERSED accumulator; the chunk is
+   finished ONCE here — `lists/reverse/1` when the range ran out,
+   `lists/reverse/2` onto the tail node for a continuing chunk."
   (cond
     (erlang/and (erlang/== false (erlang/== end_ nil)) (erlang/>= start end_))
     nil
     :else
     (let [chunk-size (BeamLisp.LazySeq/chunk_size)
           result (range-build start end_ () chunk-size)]
-      (let [elems (erlang/element 1 result)
+      (let [acc (erlang/element 1 result)
             next (erlang/element 2 result)]
         (cond
-          (erlang/== nil next) elems
-          :else (BeamLisp.LazySeq/chain elems
-                   (fn [] (range-chunk next end_))))))))
+          (erlang/== nil next) (lists/reverse acc)
+          :else (lists/reverse acc
+                   (BeamLisp.LazySeq/new (fn [] (range-chunk next end_)))))))))
 
 (defn- range-build [i end_ acc n]
-  "Accumulate integers from i until end_ or chunk is full. Returns [elems next]."
+  "Accumulate integers from i until end_ or chunk is full, in REVERSE. Returns
+   [reversed-accumulator next]."
   (cond
-    (erlang/== n 0) (tuple2 (lists/reverse acc) i)
+    (erlang/== n 0) (tuple2 acc i)
     :else
     (cond
       (erlang/and (erlang/== false (erlang/== end_ nil)) (erlang/>= i end_))
-      (tuple2 (lists/reverse acc) nil)
+      (tuple2 acc nil)
       :else
       (range-build (erlang/+ i 1) end_ (raw-cons i acc) (erlang/- n 1)))))
 
@@ -4167,14 +4272,15 @@
               :else acc)))))
 
 (defn reduce-callback
-  "PROTOTYPE. The step callback as ONE raw 2-arity fun: `f` itself when it
-   already is one, else a wrapper applying the original `call-invoke` with the
-   same `(acc x)` argument list. Building it calls nothing, so an invalid `f`
-   still fails only at its first step (never on empty input)."
+  "The step callback `(acc x)` as ONE native 2-arity fun, prepared ONCE per
+   traversal — see `call-prepare-callback`. A native 2-arity `f` is returned
+   itself; a fixed `$blfn` arm becomes that arm; an eligible variadic arm
+   becomes a native adapter reproducing `invoke-multi` exactly; anything else
+   is wrapped around the ORIGINAL `call-invoke`. Building it calls nothing, so
+   an invalid `f` still fails only at its first step (never on empty input),
+   and the original failure is preserved."
   [f]
-  (cond
-    (erlang/is_function f 2) f
-    :else (fn [acc x] (call-invoke f `(~acc ~x)))))
+  (call-prepare-callback f 2))
 
 (defn k-reduce
   "`(reduce f init coll)`: fold `f` as `(f acc x)` over `coll`, returning the
@@ -4196,17 +4302,17 @@
    and return the intrinsic Reduced carrying `{:$reduce_halt payload}`; else
    re-envelope.
 
-   PROTOTYPE `mode` (5-arity, explicit, additive; every ordinary call is
-   `:baseline`): `:normalized` selects the callback representation ONCE per
-   traversal with `reduce-callback` and then runs the SAME walks. It is
-   representation mechanics only — the generic wrapper delegates to the same
-   `call-invoke`, creating it never invokes `f`, and the live `reduced?` fetch
-   is untouched. This is the normalization CONTROL: `step` still checks
-   `is_function` per element, so native dispatch is not hoisted here. The
-   separate staged-image experiment tests native-only step application.
-   Baseline remains the default until the measured gate passes."
-  ([f init coll] (k-reduce f init coll :kernel :baseline))
-  ([f init coll policy] (k-reduce f init coll policy :baseline))
+   `mode` (5-arity, explicit, additive; every ordinary call is `:normalized`):
+   `:normalized` selects the callback representation ONCE per traversal with
+   `reduce-callback` and then runs the SAME walks. It is representation
+   mechanics only — the generic wrapper delegates to the same `call-invoke`,
+   creating it never invokes `f`, and the live `reduced?` fetch is untouched.
+   `:baseline` keeps the raw `f` as the differential ORACLE the prototype test
+   compares against; the ordinary arities PREPARE, because
+   `reduce-callback`/`call-prepare-callback` preserve the outcome and the
+   errors exactly while removing the per-element dispatch."
+  ([f init coll] (k-reduce f init coll :kernel :normalized))
+  ([f init coll policy] (k-reduce f init coll policy :normalized))
   ([f init coll policy mode]
    (let [cb (cond (erlang/== mode :normalized) (reduce-callback f) :else f)]
      (cond

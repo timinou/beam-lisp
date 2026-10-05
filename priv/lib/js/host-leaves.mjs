@@ -17,10 +17,10 @@
 
 import * as R from "./rt.mjs";
 import * as Z from "./lazy.mjs";
-// `invoke`/`toArray` are the CALLING CONVENTION (a keyword or map called as a
-// fn), which the emitter itself uses; they live in core.mjs until U3 moves
-// them into rt.mjs with the rest of the convention.
-import * as C from "./core.mjs";
+// `invoke`/`toArray`/metadata/refs/errors are the irreducible HOST ABI; they
+// live in abi.mjs, which reaches the general language operations through the
+// compiled runtime.
+import * as A from "./abi.mjs";
 const { EMPTY, Cons, Tup, Kw, HMap, HSet, Vec, Flt, Dec, BLError } = R;
 
 const kw = (s) => R.kw(s);
@@ -83,7 +83,16 @@ export const ERLANG = {
   "erlang/div/2": (a, b) => R.quot(a, b),
   "erlang/rem/2": (a, b) => R.rem(a, b),
   "erlang/abs/1": (a) => (a instanceof Flt ? R.flt(Math.abs(a.v)) : typeof a === "bigint" ? (a < 0n ? -a : a) : Math.abs(a)),
-  "erlang/bnot/1": (a) => (typeof a === "bigint" ? ~a : ~a),
+  // Exact two's-complement complement. An integer operand is a safe Number or
+  // a BigInt (rt's integer model); anything else — a Flt, a Dec, a non-integer
+  // or unsafe Number, nil, a boolean, a string — is the BEAM's badarg.
+  // Complement in BigInt so a 53-bit input keeps every bit (JS `~` coerces a
+  // Number to signed 32). R.add folds the result back through the runtime's
+  // one safe-range normalize: a fitting BigInt returns as a Number.
+  "erlang/bnot/1": (a) => {
+    if (typeof a !== "bigint" && !(typeof a === "number" && Number.isSafeInteger(a))) badarg("bnot");
+    return R.add(~BigInt(a), 0);
+  },
   "erlang/==/2": (a, b) => erlEq(a, b),
   "erlang//=/2": (a, b) => !erlEq(a, b),
   "erlang/=/=/2": (a, b) => !R.keyEq(a, b),
@@ -119,7 +128,7 @@ export const ERLANG = {
 
   // a call through a VALUE (`apply f args`): a JS fn spreads the list; a
   // keyword/map/set/vector called as a fn is core's `invoke`
-  "erlang/apply/2": (f, args) => (typeof f === "function" ? f(...arr(args)) : C.invoke(f, ...arr(args))),
+  "erlang/apply/2": (f, args) => (typeof f === "function" ? f(...arr(args)) : A.invoke(f, ...arr(args))),
   "erlang/apply/3": (m, f, args) => applyMFA(m, f, arr(args)),
   // `fun M:F/A` as a value: resolved against the leaf table and the self-host
   // module table at CALL time (rt's seed captures its own exports this way)
@@ -172,6 +181,13 @@ function applyKey(k, args) { return resolveKey(k)(...args); }
 function resolveKey(k) {
   const fn = TABLE && TABLE[k];
   if (fn !== undefined) return fn;
+  const g = moduleKey(k);
+  if (g !== undefined) return g;
+  throw new BLError("no JS implementation for " + k);
+}
+/** The compiled namespace export `mod/fun/arity` names, or undefined: a
+    `f__bl_v` name is the variadic CLAUSE, the dispatcher's `.v`. */
+function moduleKey(k) {
   const i = k.lastIndexOf("/"), j = k.lastIndexOf("/", i - 1);
   const mod = k.slice(0, j), fun = k.slice(j + 1, i);
   const ex = MODULES.get(mod);
@@ -180,6 +196,16 @@ function resolveKey(k) {
     const g = ex["d_" + mangle(v ? fun.slice(0, -6) : fun)];
     if (typeof g === "function") return v && typeof g.v === "function" ? g.v : g;
   }
+  return undefined;
+}
+/** `X`'s remote resolution: a COMPILED namespace's export first (a `__bl_v`
+    name as its `.v`), then the exact leaf. The one place a runtime remote
+    call resolves, so a static build and eval agree. */
+export function resolveRemote(k) {
+  const g = moduleKey(k);
+  if (g !== undefined) return g;
+  const fn = TABLE && TABLE[k];
+  if (fn !== undefined) return fn;
   throw new BLError("no JS implementation for " + k);
 }
 /** js.emit's `mangle` (priv/lib/js/emit.bl), for looking a BEAM function
@@ -201,7 +227,7 @@ export function mangle(name) {
 
 // ─── lists / maps ────────────────────────────────────────────────────────────
 
-const call = (f, ...a) => (typeof f === "function" ? f(...a) : C.invoke(f, ...a));
+const call = (f, ...a) => (typeof f === "function" ? f(...a) : A.invoke(f, ...a));
 export const LISTS = {
   "lists/map/2": (f, l) => L(arr(l).map((x) => call(f, x))),
   "lists/filter/2": (f, l) => L(arr(l).filter((x) => call(f, x) === true)),
@@ -220,7 +246,7 @@ export const LISTS = {
   "maps/next/1": (it) => { const l = it.items[1]; if (!(l instanceof Cons)) return kw("none"); return T(l.h.items[0], l.h.items[1], T(kw("bl_map_iter"), l.t)); },
   "Elixir.Map/delete/2": (m, k) => m.dissoc(k),
   "Elixir.Enum/join/2": (l, sep) => arr(l).map((x) => R.strOf(x)).join(sep),
-  "Elixir.Enum/to_list/1": (x) => (isList(x) ? x : L(C.toArray(x))),
+  "Elixir.Enum/to_list/1": (x) => (isList(x) ? x : L(A.toArray(x))),
   "binary/split/2": (s, sep) => { const i = s.indexOf(sep); return i < 0 ? L([s]) : L([s.slice(0, i), s.slice(i + sep.length)]); },
   "maps/get/3": (k, m, d) => mapGet(k, m, d),
   "maps/get/2": (k, m) => { const v = mapGet(k, m, MISSING); if (v === MISSING) { const e = new BLError("key " + R.printStr(k) + " not found"); e.blType = kw("Elixir.KeyError"); throw e; } return v; },
@@ -231,6 +257,11 @@ export const LISTS = {
 
 const SEG = typeof Intl !== "undefined" && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
 const graphemes = (s) => (SEG ? [...SEG.segment(s)].map((g) => g.segment) : [...s]);
+Z.bindEnumerableCell((x) => {
+  const xs = x instanceof HMap ? x.entries().map(([k, v]) => T(k, v))
+    : typeof x === "string" ? graphemes(x) : null;
+  return xs === null ? x : xs.length === 0 ? null : L(xs);
+});
 /** Grapheme count. An all-ASCII string other than one holding "\r\n" (one
     grapheme on the BEAM) has one grapheme per code unit — no segmenter. */
 const ASCII_NO_CRLF = /^[\x00-\x7f]*$/;
@@ -355,14 +386,14 @@ export const COLLECTIONS = {
   "Elixir.BeamLisp.Vector/count/1": (v) => v.cnt,
   "Elixir.BeamLisp.Vector/first/1": (v) => (v.cnt === 0 ? null : v.nth(0)),
   "Elixir.BeamLisp.Vector/nth/2": (v, i) => v.nth(i, null),
-  "Elixir.BeamLisp.Set/new/1": (l) => { let s = R.EMPTY_SET; for (const x of C.toArray(l)) s = s.conj(x); return s; },
+  "Elixir.BeamLisp.Set/new/1": (l) => { let s = R.EMPTY_SET; for (const x of A.toArray(l)) s = s.conj(x); return s; },
   "Elixir.BeamLisp.Set/add/2": (s, x) => s.conj(x),
   "Elixir.BeamLisp.Set/del/2": (s, x) => s.disj(x),
   "Elixir.BeamLisp.Set/member?/2": (s, x) => s.has(x),
   "Elixir.BeamLisp.Set/count/1": (s) => s.cnt,
 
   "Elixir.BeamLisp.Sorted/map_new/0": () => new Sorted("map", []),
-  "Elixir.BeamLisp.Sorted/map_new/1": (l) => SM(C.toArray(l).map(pairOf)),
+  "Elixir.BeamLisp.Sorted/map_new/1": (l) => SM(A.toArray(l).map(pairOf)),
   "Elixir.BeamLisp.Sorted/map_put/3": (m, k, v) => m.put(k, v),
   "Elixir.BeamLisp.Sorted/map_get/3": (m, k, d) => { const i = m.find(k); return i >= 0 ? m.es[i][1] : d; },
   "Elixir.BeamLisp.Sorted/map_has_key?/2": (m, k) => m.find(k) >= 0,
@@ -370,7 +401,7 @@ export const COLLECTIONS = {
   "Elixir.BeamLisp.Sorted/map_count/1": (m) => m.es.length,
   "Elixir.BeamLisp.Sorted/map_to_list/1": (m) => L(m.es.map(([k, v]) => T(k, v))),
   "Elixir.BeamLisp.Sorted/set_new/0": () => new Sorted("set", []),
-  "Elixir.BeamLisp.Sorted/set_new/1": (l) => SS(C.toArray(l)),
+  "Elixir.BeamLisp.Sorted/set_new/1": (l) => SS(A.toArray(l)),
   "Elixir.BeamLisp.Sorted/set_add/2": (s, x) => s.put(x, x),
   "Elixir.BeamLisp.Sorted/set_del/2": (s, x) => s.del(x),
   "Elixir.BeamLisp.Sorted/set_member?/2": (s, x) => s.find(x) >= 0,
@@ -390,7 +421,7 @@ export const COLLECTIONS = {
     let m = R.EMPTY_MAP.assoc(k, v); for (let i = 0; i < xs.length; i += 2) m = m.assoc(xs[i], xs[i + 1]); return m;
   },
   "Elixir.BeamLisp.Transient/persistent!/1": (t) => t.v,
-  "Elixir.BeamLisp.Transient/get/3": (t, k, d) => C.get(t.v, k, d),
+  "Elixir.BeamLisp.Transient/get/3": (t, k, d) => A.get(t.v, k, d),
 };
 function rangeEntries(c, lo, hi, rev) {
   const inLo = (k) => !(lo instanceof Tup) || R.compare(k, lo.items[1]) >= 0;
@@ -427,26 +458,26 @@ class Volatile { constructor(v) { this.v = v; this.blStruct = kw("Elixir.BeamLis
 function refsDeref(a) {
   if (a instanceof HMap && a.get(STRUCT, null) === kw("Elixir.BeamLisp.Reduced")) return a.get(kw("value"), null);
   if (a instanceof Volatile) return a.v;
-  return C.deref(a);
+  return A.deref(a);
 }
 const exMessage = (e) => (e instanceof Error ? e.message : R.printStr(e));
 export const REFS_ERRORS = {
-  "Elixir.BeamLisp.Refs/atom/1": (v) => C.atom(v),
+  "Elixir.BeamLisp.Refs/atom/1": (v) => A.atom(v),
   // Refs.deref reads EVERY derefable (refs.bl deref/1): atoms and volatiles
   // (`.v`), delays (forced), and the `Reduced` sentinel — a map rt.bl builds
   // by hand, `{:__struct__ Reduced, :value v}` — whose payload is `:value`
   "Elixir.BeamLisp.Refs/deref/1": (a) => refsDeref(a),
   "Elixir.BeamLisp.Refs/deref/3": (a) => refsDeref(a),
-  "Elixir.BeamLisp.Refs/swap!/2": (a, f) => C.swap_BANG(a, f),
+  "Elixir.BeamLisp.Refs/swap!/2": (a, f) => A.swap_BANG(a, f),
   // BEAM ABI: the extra args arrive as ONE list (Refs.swap!(a, f, args))
-  "Elixir.BeamLisp.Refs/swap!/3": (a, f, rest) => C.swap_BANG(a, f, ...arr(rest)),
-  "Elixir.BeamLisp.Refs/reset!/2": (a, v) => C.reset_BANG(a, v),
+  "Elixir.BeamLisp.Refs/swap!/3": (a, f, rest) => A.swap_BANG(a, f, ...arr(rest)),
+  "Elixir.BeamLisp.Refs/reset!/2": (a, v) => A.reset_BANG(a, v),
   "Elixir.BeamLisp.Refs/vswap!/2": (v, f) => { v.v = call(f, v.v); return v.v; },
   "Elixir.BeamLisp.Refs/vswap!/3": (v, f, rest) => { v.v = call(f, v.v, ...arr(rest)); return v.v; },
   "Elixir.BeamLisp.Refs/volatile?/1": (x) => x instanceof Volatile,
   "Elixir.BeamLisp.Refs/volatile/1": (v) => new Volatile(v),
   "Elixir.BeamLisp.Refs/vreset!/2": (v, x) => { v.v = x; return x; },
-  "Elixir.BeamLisp.ExInfo/ex_info/2": (m, d) => C.ex_info(m, d),
+  "Elixir.BeamLisp.ExInfo/ex_info/2": (m, d) => A.ex_info(m, d),
   "Elixir.BeamLisp.ExInfo/ex_message/1": (e) => exMessage(e),
   "Elixir.BeamLisp.ExInfo/ex_data/1": (e) => (e instanceof Error ? e.data ?? null : null),
   "Elixir.BeamLisp.ExInfo/ex_original/1": (e) => (e instanceof Error && e.blOriginal !== undefined ? e.blOriginal : e),
@@ -454,7 +485,7 @@ export const REFS_ERRORS = {
   // ex-info whose message is its printed form and whose data is the payload
   // when it is a map (BEAM: (throw {:k 1}) → ["{:k 1}" {:k 1}]; "str" → ["\"str\"" nil])
   "Elixir.BeamLisp.ExInfo/raise_payload/1": (x) => { if (x instanceof Error) throw x; const e = new BLError(R.printStr(x), x instanceof HMap ? x : null); e.blOriginal = x; throw e; },
-  "Elixir.Exception/normalize/3": (_kind, v) => C.exception_normalize(_kind, v, null),
+  "Elixir.Exception/normalize/3": (_kind, v) => A.exception_normalize(_kind, v, null),
   "Elixir.ArgumentError/exception/1": (msg) => { const e = new BLError(typeof msg === "string" ? msg : R.printStr(msg)); e.blType = kw("Elixir.ArgumentError"); return e; },
   "Elixir.FunctionClauseError/exception/1": (opts) => {
     const o = new Map(arr(opts).map((t) => [t.items[0].fq, t.items[1]]));
@@ -465,7 +496,7 @@ export const REFS_ERRORS = {
   "Elixir.BeamLisp.Record/record?/1": () => false,
   "Elixir.BeamLisp.Record/info/1": () => null,
   "Elixir.BeamLisp.Record/fields_of/1": () => EMPTY,
-  "Elixir.BeamLisp.Multi/type_of/1": (x) => C.type(x),
+  "Elixir.BeamLisp.Multi/type_of/1": (x) => A.type(x),
   "Elixir.BeamLisp.Env/match/1": () => EMPTY,
   // `read-string`: the compiler namespace's reader-to-data, when this page
   // carries the compiler (a js.eval build registers `compiler/read_data`);

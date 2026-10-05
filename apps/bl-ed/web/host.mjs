@@ -26,7 +26,7 @@ globalThis.BL_HOST = Object.assign(globalThis.BL_HOST || {}, {
 window.blRepl = repl;
 
 import * as R from "./out/rt.mjs";
-const M = await import("./out/ed.main.mjs");
+const M = await import("./out/ns/ed.main.mjs");
 
 const K = R.kw;
 const get = (m, k) => (m == null ? null : m.get(K(k), null));

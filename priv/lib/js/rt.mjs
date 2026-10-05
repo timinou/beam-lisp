@@ -849,10 +849,10 @@ export const tuple2 = (a, b) => new Tup([a, b]);
 export const tuple3 = (a, b, c) => new Tup([a, b, c]);
 export const emptyList = () => EMPTY;
 /** Self-host calling convention (PLAN-163 U3): a JS function is called
-    directly; ANY other callee goes to compiled rt's own `invoke(f, args)` —
-    the BEAM's Rt.invoke, with the arguments as one list — so keywords, maps,
-    $blfn multi-fns and vectors are called by the language's rule, never by
-    core.mjs. */
+    directly; ANY other callee goes to the compiled runtime's own `invoke(f,
+    args)` — the BEAM's Rt.invoke, with the arguments as one list — so keywords,
+    maps, $blfn multi-fns and vectors are called by the language's rule, never
+    by the host ABI's fast path. */
 export function call(f, invoke, ...args) { return typeof f === "function" ? f(...args) : invoke(f, listFromArray(args)); }
 // fixed-arity forms js.emit picks for 0–3 arguments: no rest array, no spread
 export function call0(f, invoke) { return typeof f === "function" ? f() : invoke(f, EMPTY); }
@@ -868,10 +868,14 @@ export function leI(a, b) { return typeof a === "number" && typeof b === "number
 export function geI(a, b) { return typeof a === "number" && typeof b === "number" ? a >= b : termCompare(a, b) >= 0; }
 export function addI(a, b) { if (typeof a === "number" && typeof b === "number") { const r = a + b; if (r <= MAX && r >= MIN) return r; } return add(a, b); }
 export function subI(a, b) { if (typeof a === "number" && typeof b === "number") { const r = a - b; if (r <= MAX && r >= MIN) return r; } return sub(a, b); }
-/** `lists:reverse/1` without the array round trip (an improper tail is
-    ignored, as the leaf does). */
-export function reverseI(l) {
-  let r = EMPTY;
+/** `lists:reverse/2` (and `/1` as its empty tail): the elements of a PROPER
+    first list reversed onto an arbitrary, UNFORCED tail — `()` for `/1`. An
+    empty first list returns the tail EXACTLY (identity, never forced); a
+    null, non-list or improper first list is the BEAM's badarg. ONE helper,
+    so the emitter intrinsic and the leaf cannot disagree. */
+export function reverseI(l, tail = EMPTY) {
+  if (l !== EMPTY && !(l instanceof Cons && l.n >= 0)) bad("reverse", l);
+  let r = tail;
   for (let p = l; p instanceof Cons; p = p.t) r = new Cons(p.h, r);
   return r;
 }

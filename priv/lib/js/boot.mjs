@@ -1,29 +1,51 @@
 // priv/lib/js/boot.mjs — start Beam Lisp in a JS realm: load the language's
-// own macros (and the helper defns they call) from priv/boot/core.bl and
-// sugar.bl, through the self-hosted compiler compiled to JS (js.eval).
+// own MACROS (and any support declaration the compiled base does not already
+// provide) from priv/boot/core.bl and sugar.bl, through the self-hosted
+// compiler compiled to JS (js.eval).
 //
-// core.mjs already provides the core FUNCTIONS natively; what a page still
-// needs from core.bl is everything that runs at COMPILE time — `when`, `->`,
-// `cond`, `case`, `for`, `doseq` … — and the plain defns those macros call.
-// So boot evaluates, in source order, every `defmacro`, every `def`, and every
-// `defn` whose name core.mjs does NOT already define. Forms that only make
-// sense on the BEAM (the doc-copying `prim-docs-installed`) fail to evaluate
-// and are reported, not fatal.
+// The compiled base already provides the core FUNCTIONS (out/ns/core.mjs,
+// runtime and clojure prelude): boot never reinstalls them. What a page still
+// needs from source is everything that runs at COMPILE time — `when`, `->`,
+// `cond`, `case`, `for`, `doseq` … — because the compiler's macro lookup reads
+// a macro from the LIVE registry (`Env/peek`), which the compiled module's
+// exports do not populate. So boot evaluates, in source order, every
+// `defmacro`, and every `def`/`defn` whose name the compiled namespaces (or the
+// registry) do not already bind. Forms that only make sense on the BEAM (the
+// doc-copying `prim-docs-installed`) fail to evaluate and are reported, not
+// fatal.
 //
 //   const { evalForm, evalString, readForms } = await boot(readFile)
 //
 // `readFile(relPath)` returns a source's text (fs in node, fetch in a page).
+//
+// The compiled namespaces live under ./ns/ (`ns-file`); the runtime (rt.mjs,
+// abi.mjs, leaves.mjs …) and this file live at the out root.
 
 import * as R from "./rt.mjs";
-import * as C from "./core.mjs";
 import { ENV } from "./env.mjs";
-import * as E from "./js.eval.mjs";
-import * as Rd from "./reader.mjs";
 import { REST_FNS } from "./core-links.mjs";
+import { mangle } from "./host-leaves.mjs";
+// the compiled base, loaded first so a `provided` check sees its exports; the
+// entry (js.eval) imports base.mjs, so the whole base is ready on first import
+import * as E from "./ns/js.eval.mjs";
+import * as Rd from "./ns/reader.mjs";
+import * as CompiledCore from "./ns/core.mjs";
+import * as CompiledSugar from "./ns/sugar.mjs";
 
 const META = R.kw("meta"), LIST = R.kw("list"), SYMBOL = R.kw("symbol");
 const unmeta = (n) => (n instanceof R.Tup && n.items[0] === META ? n.items[1] : n);
 const symName = (x) => (x instanceof R.Tup && x.items[0] === SYMBOL ? x.items[1] : null);
+
+/** Is `ns/name` already provided — by the compiled namespace's export or a
+    live registry binding? A compiled `defn` is not interned as a var, so the
+    module's `d_<mangle name>` is the answer for it; a name the page rebound
+    (or a per-env value) wins through `Env/bound?`. */
+const PROVIDED = { core: CompiledCore, sugar: CompiledSugar };
+function provided(ns, name) {
+  const m = PROVIDED[ns];
+  if (m !== undefined && m["d_" + mangle(name)] !== undefined) return true;
+  return ENV["bound?"](ns, name);
+}
 
 /** The reader's position-bearing forms of `src`, as a JS array. */
 export function readForms(src, file) {
@@ -50,8 +72,11 @@ function loadSource(ns, src, file, record) {
     const hn = headAndName(form);
     if (!hn) continue;
     const [head, name] = hn;
-    const wanted = head === "defmacro" || head === "def" ||
-      ((head === "defn" || head === "defn-") && C.CORE[name] === undefined);
+    // a macro is never in the compiled exports the compiler's `macro-lookup`
+    // reads, so it is always loaded; a def/defn is loaded only when the
+    // compiled base (or a live binding) does not already provide it
+    const wanted = head === "defmacro" ||
+      ((head === "def" || head === "defn" || head === "defn-") && !provided(ns, name));
     if (!wanted) continue;
     try {
       const v = record ? record(ns, name, head, () => E.d_eval_form(form)) : E.d_eval_form(form);

@@ -20,11 +20,11 @@
 // Beam Lisp, compiled here from the same source the BEAM runs.
 
 import * as R from "./rt.mjs";
-import * as C from "./core.mjs";
+import * as A from "./abi.mjs";
 import { ENV } from "./env.mjs";
 import { LAZY_LEAVES } from "./lazy.mjs";
-import { HOST_LEAVES, bindTable, registerModule } from "./host-leaves.mjs";
-import { LINKS, OPS } from "./core-links.mjs";
+import { HOST_LEAVES, bindTable, registerModule, resolveRemote, mangle } from "./host-leaves.mjs";
+import { LINKS } from "./core-links.mjs";
 const { EMPTY, Cons, Tup, Kw, HMap, Vec, BLError } = R;
 
 const OK = R.kw("ok"), ERROR = R.kw("error");
@@ -112,7 +112,11 @@ export const LEAVES = {
   "erlang/length/1": (l) => arr(l).length,
 
   // lists
-  "lists/reverse/1": (l) => list(arr(l).reverse()),
+  // ONE exact reverse. `/1` is `/2` with the empty tail; either arity takes a
+  // proper first list, shares (never forces) its tail, and raises R.reverseI's
+  // badarg — the intrinsic and the leaf are the same helper by construction.
+  "lists/reverse/1": (l) => R.reverseI(l),
+  "lists/reverse/2": (l, t) => R.reverseI(l, t),
   // `b` is shared as the tail, as on the BEAM
   "lists/append/2": (a, b) => { const xs = arr(a); let r = b; for (let i = xs.length - 1; i >= 0; i--) r = new Cons(xs[i], r); return r; },
   "lists/last/1": (l) => { const a = arr(l); if (!a.length) badarg("last", l); return a[a.length - 1]; },
@@ -128,7 +132,7 @@ export const LEAVES = {
   },
   "lists/splitwith/2": (f, l) => {
     const pre = []; let p = l;
-    while (p instanceof Cons && R.truthy(C.invoke(f, p.h))) { pre.push(p.h); p = p.t; }
+    while (p instanceof Cons && R.truthy(A.invoke(f, p.h))) { pre.push(p.h); p = p.t; }
     return T(list(pre), p);
   },
   "lists/sublist/2": (l, n) => { const a = []; for (let p = l; p instanceof Cons && a.length < n; p = p.t) a.push(p.h); return list(a); },
@@ -172,10 +176,10 @@ export const LEAVES = {
   "Elixir.BeamLisp.Decimal/scale/1": (d) => d.s,
   "Elixir.BeamLisp.Decimal/parse/1": (s) => { const d = R.parseDec(s); return d === null ? ERROR : T(OK, d); },
   "Elixir.BeamLisp.Vector/to_list/1": (v) => v.toList(),
-  "Elixir.BeamLisp.Vector/new/1": (l) => R.vecFromArray(C.toArray(l)),
+  "Elixir.BeamLisp.Vector/new/1": (l) => R.vecFromArray(A.toArray(l)),
   "Elixir.BeamLisp.Set/to_list/1": (s) => list(s.elements().sort(R.compare)),
   // core/to-list: any BL collection (or nil) as a plain list
-  "Elixir.BeamLisp.Ns.Core/to-list/1": (c) => (c === null || c === undefined ? EMPTY : isList(c) ? c : list(C.toArray(c))),
+  "Elixir.BeamLisp.Ns.Core/to-list/1": (c) => (c === null || c === undefined ? EMPTY : isList(c) ? c : list(A.toArray(c))),
   // the data-reader registry (`#tag form`): tag name → {:symbol name}
   "Elixir.BeamLisp.Ns.Rt/data_reader/1": (tag) => (DATA_READERS.has(tag) ? T(OK, DATA_READERS.get(tag)) : ERROR),
 };
@@ -189,18 +193,18 @@ export function moduleFor(ns) {
   return R.kw("Elixir.BeamLisp.Ns." + ns.split(".").map(camel).join("."));
 }
 // the eager collection ops the compiler runs over finite data (CompilerData)
-const eagerList = (x) => (x === null || x === undefined ? [] : C.toArray(x));
+const eagerList = (x) => (x === null || x === undefined ? [] : A.toArray(x));
 const PDICT = new Map();
 const nextGensym = (() => { let n = 0; return () => ++n; })();
 const UNDEFINED = R.kw("undefined");
 const pkey = (k) => R.printStr(k);
 Object.assign(LEAVES, {
-  "Elixir.BeamLisp.CompilerData/eager_map/2": (f, c) => list(eagerList(c).map((x) => C.invoke(f, x))),
-  "Elixir.BeamLisp.CompilerData/eager_map/3": (f, a, b) => { const xs = eagerList(a), ys = eagerList(b), n = Math.min(xs.length, ys.length); const o = []; for (let i = 0; i < n; i++) o.push(C.invoke(f, xs[i], ys[i])); return list(o); },
-  "Elixir.BeamLisp.CompilerData/eager_filter/2": (f, c) => list(eagerList(c).filter((x) => R.truthy(C.invoke(f, x)))),
+  "Elixir.BeamLisp.CompilerData/eager_map/2": (f, c) => list(eagerList(c).map((x) => A.invoke(f, x))),
+  "Elixir.BeamLisp.CompilerData/eager_map/3": (f, a, b) => { const xs = eagerList(a), ys = eagerList(b), n = Math.min(xs.length, ys.length); const o = []; for (let i = 0; i < n; i++) o.push(A.invoke(f, xs[i], ys[i])); return list(o); },
+  "Elixir.BeamLisp.CompilerData/eager_filter/2": (f, c) => list(eagerList(c).filter((x) => R.truthy(A.invoke(f, x)))),
   "Elixir.BeamLisp.CompilerData/eager_concat/1": (cs) => list(eagerList(cs).flatMap(eagerList)),
-  "Elixir.BeamLisp.CompilerData/eager_mapcat/2": (f, c) => list(eagerList(c).flatMap((x) => eagerList(C.invoke(f, x)))),
-  "Elixir.BeamLisp.CompilerData/eager_map_indexed/2": (f, c) => list(eagerList(c).map((x, i) => C.invoke(f, i, x))),
+  "Elixir.BeamLisp.CompilerData/eager_mapcat/2": (f, c) => list(eagerList(c).flatMap((x) => eagerList(A.invoke(f, x)))),
+  "Elixir.BeamLisp.CompilerData/eager_map_indexed/2": (f, c) => list(eagerList(c).map((x, i) => A.invoke(f, i, x))),
   "Elixir.BeamLisp.CompilerData/eager_distinct/1": (c) => { const out = []; let seen = R.EMPTY_SET; for (const x of eagerList(c)) if (!seen.has(x)) { seen = seen.conj(x); out.push(x); } return list(out); },
 
   // the process dictionary: one JS realm is one "process"
@@ -224,8 +228,8 @@ Object.assign(LEAVES, {
   "Elixir.Integer/to_string/2": (n, base) => n.toString(base).toUpperCase(),
   "erlang/is_number/1": (x) => R.isNumber(x),
   "erlang/is_bitstring/1": (x) => typeof x === "string",
-  "lists/sort/2": (f, l) => list(arr(l).sort((a, b) => (R.truthy(C.invoke(f, a, b)) ? -1 : 1))),
-  "maps/filter/2": (f, m) => { let o = R.EMPTY_MAP; for (const [k, v] of m.entries()) if (R.truthy(C.invoke(f, k, v))) o = o.assoc(k, v); return o; },
+  "lists/sort/2": (f, l) => list(arr(l).sort((a, b) => (R.truthy(A.invoke(f, a, b)) ? -1 : 1))),
+  "maps/filter/2": (f, m) => { let o = R.EMPTY_MAP; for (const [k, v] of m.entries()) if (R.truthy(A.invoke(f, k, v))) o = o.assoc(k, v); return o; },
   "maps/without/2": (ks, m) => { let o = m; for (const k of arr(ks)) o = o.dissoc(k); return o; },
 
   "Elixir.BeamLisp.Link/module_for/1": moduleFor,
@@ -235,9 +239,9 @@ Object.assign(LEAVES, {
   "Elixir.BeamLisp.Record/record_module?/1": () => false,
   "Elixir.BeamLisp.Record/deftype_module?/1": () => false,
   // metadata on values (core's meta/with-meta/vary-meta are these on BEAM)
-  "Elixir.BeamLisp.FormMeta/meta/1": C.meta,
-  "Elixir.BeamLisp.FormMeta/with_meta/2": C.with_meta,
-  "Elixir.BeamLisp.FormMeta/vary_meta/2": C.vary_meta,
+  "Elixir.BeamLisp.FormMeta/meta/1": A.meta,
+  "Elixir.BeamLisp.FormMeta/with_meta/2": A.with_meta,
+  "Elixir.BeamLisp.FormMeta/vary_meta/2": A.vary_meta,
 
   // defserver codegen tables (priv/host/server.bl, verbatim)
   "Elixir.BeamLisp.Server/callback/1": (n) => ({ "init": T(R.kw("init"), 1, R.kw("vector")), "handle-call": T(R.kw("handle_call"), 3, R.kw("pattern")), "handle-cast": T(R.kw("handle_cast"), 2, R.kw("pattern")), "handle-info": T(R.kw("handle_info"), 2, R.kw("pattern")), "handle-continue": T(R.kw("handle_continue"), 2, R.kw("vector")), "terminate": T(R.kw("terminate"), 2, R.kw("vector")) }[n] ?? null),
@@ -257,7 +261,7 @@ Object.assign(LEAVES, {
   // core/rt functions the compiler reaches by MODULE name (not linked as core
   // globals): their BL definitions, on the JS value model
   "Elixir.BeamLisp.Ns.Core/tuple__bl_v/1": (xs) => new Tup(arr(xs)),
-  "Elixir.BeamLisp.Ns.Core/run!/2": (f, coll) => { for (const x of C.toArray(coll)) C.invoke(f, x); return null; },
+  "Elixir.BeamLisp.Ns.Core/run!/2": (f, coll) => { for (const x of A.toArray(coll)) A.invoke(f, x); return null; },
   "Elixir.BeamLisp.Ns.Rt/call_shape_error/2": (v, arity) => "cannot call " + R.printStr(v) + " with " + arity + " argument" + (arity === 1 ? "" : "s") + " — it is not a function",
   "Elixir.BeamLisp.Server/module_for/2": (ns, name) => {
     const camel = (seg) => seg.split(/[-_]/).map((p) => (p ? p[0].toUpperCase() + p.slice(1) : "")).join("");
@@ -267,7 +271,7 @@ Object.assign(LEAVES, {
   // `~@`: a vector or list spreads, nil is empty, a map yields its entries
   // as {k, v} tuples (rt/k-splice) — the tail is shared
   "Elixir.BeamLisp.Ns.Rt/splice/2": (spliced, tail) => {
-    const xs = spliced === null || spliced === undefined ? [] : spliced instanceof HMap ? spliced.entries().map(([k, v]) => T(k, v)) : C.toArray(spliced);
+    const xs = spliced === null || spliced === undefined ? [] : spliced instanceof HMap ? spliced.entries().map(([k, v]) => T(k, v)) : A.toArray(spliced);
     let r = tail === null || tail === undefined ? EMPTY : tail;
     for (let i = xs.length - 1; i >= 0; i--) r = new Cons(xs[i], r);
     return r;
@@ -292,53 +296,59 @@ function kwGet(opts, k) {
 // ─── js/run: evaluate emitted JS in this realm (priv/lib/js/eval.bl) ─────────
 //
 // The text is a function body from js.emit with run-time linking: `G(ns,
-// name)` reads the live registry (then core), `X("mod/fun/arity")` a core
-// op or a leaf. `R`/`C` are the runtime and core modules.
+// name)` reads the live registry, then an uninterned compiled definition;
+// `X("mod/fun/arity")` a compiled namespace's export or a leaf. `R`/`A` are the
+// value runtime and the host ABI.
 const MACRO = R.kw("$macro");
-// namespaces whose functions ARE core.mjs functions on this target (the BEAM
-// implements them in BL over Erlang; the meaning is the same)
-const NATIVE_NS = new Set(["clojure.string", "clojure.core"]);
-const STRING_REVERSE = (s) => [...s].reverse().join("");
-function G(ns, name) {
+
+/** `d_<mangle name>` of the compiled namespace `ns`, or undefined. A compiled
+    `defn` is not interned as a var, so this is how an uninterned definition
+    (core/sugar, or a name nothing rebound) is reached. */
+function moduleDef(ns, name) {
+  const ex = NAMESPACES.get(ns);
+  return ex === undefined ? undefined : ex["d_" + mangle(name)];
+}
+/** The compiled export a global `ns/name` names, in `ENV.fetch!`'s candidate
+    order (the name, where it was referred from, `core`, `sugar`). */
+function compiledGlobal(ns, name) {
   const slash = name.indexOf("/");
   if (slash > 0) {
     const q = name.slice(0, slash), n = name.slice(slash + 1);
-    const target = ENV.alias_target(ns, q) ?? q;
-    if (NATIVE_NS.has(target)) {
-      if (target === "clojure.string" && n === "reverse") return STRING_REVERSE;
-      if (Object.prototype.hasOwnProperty.call(C.CORE, n)) return C.CORE[n];
-    }
+    return moduleDef(ENV.alias_target(ns, q) ?? q, n);
   }
+  const src = ENV.refer_source(ns, name);
+  const cands = src === null ? [ns, "core", "sugar"] : [ns, src, "core", "sugar"];
+  for (const c of cands) { const v = moduleDef(c, name); if (v !== undefined) return v; }
+  return undefined;
+}
+/** `G(ns, name)`: a name's value in `ns`. A LIVE Env binding wins — including
+    one bound to nil (a `def` of nil is a real binding) — with aliases/refers
+    resolved by `ENV.fetch`. A name no var holds falls back to the compiled
+    namespace that defines it. A `{:$macro fn}` value is its fn when called. */
+function G(ns, name) {
   const r = ENV.fetch(ns, name);
-  if (r instanceof Tup) {
-    const v = r.items[1];
-    // a macro value is {:$macro fn}; called as a fn it is its fn
-    return v instanceof Tup && v.items[0] === MACRO ? v.items[1] : v;
+  let v;
+  if (r instanceof Tup) v = r.items[1];
+  else {
+    v = compiledGlobal(ns, name);
+    if (v === undefined) throw new BLError("undefined var: " + ns + "/" + name);
   }
-  if (Object.prototype.hasOwnProperty.call(C.CORE, name)) return C.CORE[name];
-  throw new BLError("undefined var: " + ns + "/" + name);
+  if (v instanceof Tup && v.items[0] === MACRO) return v.items[1];
+  return v;
 }
-// a linked core op (`Elixir.BeamLisp.Ns.Rt/first/1`) is its CORE function
-function X(lk) {
-  // OPS holds exactly the calls build.bl `remote-link` (THE link rule, which
-  // the static linker also uses) sends to core.mjs; every other key is the
-  // rule's leaf. Same decision as a static build, by construction
-  // (test/bl/js_diff_test: linkers-agree).
-  const k = OPS[lk];
-  if (k !== undefined && Object.prototype.hasOwnProperty.call(C.CORE, k)) return C.CORE[k];
-  if (Object.prototype.hasOwnProperty.call(LEAVES, lk)) return LEAVES[lk];
-  // `clojure.string/upper-case/1` and friends: a native namespace's fn
-  const parts = lk.split("/");
-  if (parts.length === 3 && NATIVE_NS.has(parts[0])) return G("user", parts[0] + "/" + parts[1]);
-  throw new BLError("no JS implementation for " + lk);
-}
+/** `X("mod/fun/arity")`: the compiled namespace function (a `__bl_v` name as
+    its `.v`), else the exact leaf — ONE resolution rule, shared with
+    host-leaves' `erlang/apply`. No core-table fallback exists. */
+function X(lk) { return resolveRemote(lk); }
 // seed the registry with BEAM's core links, so the compiler in JS links
 // core calls exactly as the BEAM compiler does
 for (const [name, info] of LINKS) ENV.put_link("core", name, info);
 ENV.declare_ns("core");
-/** Run one emitted function body. A page installs it as its `js/run` host
-    fn: `globalThis.BL_HOST = { run }` before importing js.eval's build. */
-export function run(body) { return new Function("R", "C", "G", "X", body)(R, C, G, X); }
+/** Run one emitted function body. The emit target imports the host ABI as `A`
+    (`A.invokeList`, `A.NOT_FOUND`, `A.K_error`, `A.blfnFn`, `A.toArray`); a
+    page installs this as its `js/run` host fn: `globalThis.BL_HOST = { run }`
+    before importing js.eval's build. */
+export function run(body) { return new Function("R", "A", "G", "X", body)(R, A, G, X); }
 
 // ONE table, assembled from its parts with NO silent override: a leaf key
 // defined in two places is a load error naming both. (Two files once both
@@ -372,7 +382,17 @@ const MISSING = { missing: true };
 // loading. A namespace that refers to one LATER in load order (rt → core) holds
 // a late-bound view: property reads go to the registered module at CALL time.
 const NAMESPACES = new Map();
-export function registerNamespace(ns, modName, exports) { NAMESPACES.set(ns, exports); registerModule(modName, exports); }
+/** A compiled namespace module registers its exports under its ns name and its
+    BEAM module name. `rt` additionally binds the host ABI's runtime seam, so
+    the ABI's general operations (`toArray`, `get`, non-fn `invoke`) reach the
+    ONE compiled runtime. */
+export function registerNamespace(ns, modName, exports) {
+  NAMESPACES.set(ns, exports);
+  registerModule(modName, exports);
+  registerModule(ns, exports);
+  ENV.declare_ns(ns);
+  if (ns === "rt") A.bindRuntime(exports);
+}
 export function lateModule(ns) {
   return new Proxy({}, { get(_, k) {
     const m = NAMESPACES.get(ns);

@@ -10,6 +10,13 @@
 //   repl.evalWith("(ed/goto 5)", "ed", api)    // → {:text "nil"} | {:err "…"}
 //
 // The result is a BL map so BL callers read it with keywords.
+//
+// The compiled base (out/ns/core.mjs, sugar, the runtime) is already the one
+// implementation of the core FUNCTIONS; `start` binds only the host `run`
+// (the ABI-scoped evaluator) and boots the SOURCE macros. It never reinstalls
+// a core function, and it declares/interns a caller's namespace without
+// resetting the compiled core: an eval sees exactly the registry the build
+// seeded, plus what the caller binds.
 
 import * as R from "./rt.mjs";
 import * as L from "./leaves.mjs";
