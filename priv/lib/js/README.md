@@ -39,6 +39,11 @@ captured value, not by namespace/name; rebinding changes future captures while
 existing captures retain their identity. General callable and sequence rules
 belong to compiled `rt.bl`, not to the host adapters.
 
+The shared printer writes through the host `io/format/2` leaf's Unicode
+`~ts` and `~ts~n` formats. Node writes stdout; browsers write the console.
+Embeddings can bind an exact-text sink with `bindOutput` from `host-leaves.mjs`.
+Other format directives report a named unsupported-format error.
+
 ## Values and evaluation
 
 Integers use safe Numbers and promote to BigInt; floats are boxed so exact
@@ -80,6 +85,7 @@ Metadata belongs to the value; realization belongs to the shared memo resource.
 ```sh
 node --test test/js/*.test.mjs test/js/perf/run.test.mjs
 ./bin/bl test test/bl/js_diff_test.bl test/bl/js_compiled_core_test.bl
+./bin/bl test test/bl/js_macro_build_test.bl test/bl/js_cold_build_test.bl
 ./bin/bl run test/js/perf/build.bl
 node test/js/perf/run.mjs test/js/perf/out
 ```

@@ -347,17 +347,42 @@ function repl(r, s, rep, global) {
 const splitPlain = STRING["Elixir.String/split/2"];
 STRING["Elixir.String/split/2"] = (s, sep) => (sep instanceof Regex ? L(s.split(sep.global())) : splitPlain(s, sep));
 
+// ─── text output: the shared runtime formats values before this leaf ──────
+
+let output = null;
+/** Bind an exact-text sink for an embedding, or null for the host default. */
+export function bindOutput(write) {
+  if (write !== null && typeof write !== "function") badarg("output sink");
+  output = write;
+}
+function writeText(text) {
+  if (output) output(text);
+  else if (typeof process !== "undefined" && process.stdout?.write) process.stdout.write(text);
+  else console.log(text.endsWith("\n") ? text.slice(0, -1) : text);
+}
+export const IO = {
+  "io/format/2": (format, args) => {
+    // These are the Unicode text formats shared rt.bl's printer requests.
+    // Value formatting remains entirely in BL, not in this output primitive.
+    if (format !== "~ts" && format !== "~ts~n")
+      throw new BLError("io/format supports ~ts and ~ts~n on the JS target");
+    if (!(args instanceof Cons) || args.t !== EMPTY || typeof args.h !== "string") badarg("io/format");
+    writeText(args.h + (format === "~ts~n" ? "\n" : ""));
+    return kw("ok");
+  },
+};
+
 // ─── BEAM-only (contract C3): linked, and a named refusal when called ───────
 
 const beamOnly = (k) => () => { throw new BLError(k + " runs on the BEAM only (not part of the JS target)"); };
 export const BEAM_ONLY = Object.fromEntries([
-  "erlang/monitor/2", "erlang/exit/2", "io/format/2",
+  "erlang/monitor/2", "erlang/exit/2",
   "Elixir.Code/ensure_loaded?/1", "crypto/hash/2", "Elixir.Base/encode16/1",
   "Elixir.BeamLisp.Trace/trace/3", "Elixir.BeamLisp.Trace/trace/4", "Elixir.BeamLisp.Trace/untrace/2",
   "Elixir.BeamLisp.Refs/spawn_exec/1", "Elixir.BeamLisp.Refs/spawn_exec/2",
 ].map((k) => [k, beamOnly(k)]));
 
-export const HOST_LEAVES = { ...ERLANG, ...LISTS, ...STRING, ...REGEX, ...BEAM_ONLY };
+export const HOST_LEAVES = { ...ERLANG, ...LISTS, ...STRING, ...REGEX, ...IO, ...BEAM_ONLY };
 // (COLLECTIONS, NUMBERS, REFS_ERRORS are merged in below, where they are defined)
 
 // ─── collections: Vector / Set / Sorted / Transient ──────────────────────────

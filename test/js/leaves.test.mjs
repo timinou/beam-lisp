@@ -8,7 +8,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import * as R from "../../priv/lib/js/rt.mjs";
-import { ERLANG } from "../../priv/lib/js/host-leaves.mjs";
+import { ERLANG, IO, bindOutput } from "../../priv/lib/js/host-leaves.mjs";
 
 const dir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../priv/lib/js");
 
@@ -153,4 +153,33 @@ test("Enumerable input cells use host map entries and graphemes", async () => {
   const chars = Z.toList("e\u0301👍🏽");
   assert.equal(chars.n, 2);
   assert.deepEqual([chars.h, chars.t.h], ["e\u0301", "👍🏽"]);
+});
+
+test("shared printer output writes exact Unicode text and returns ok", () => {
+  const writes = [];
+  bindOutput(text => writes.push(text));
+  try {
+    assert.strictEqual(IO["io/format/2"]("~ts~n", R.list("é🙂\nsecond")), R.kw("ok"));
+    assert.strictEqual(IO["io/format/2"]("~ts", R.list("tail")), R.kw("ok"));
+    assert.strictEqual(IO["io/format/2"]("~ts~n", R.list("")), R.kw("ok"));
+    assert.deepEqual(writes, ["é🙂\nsecond\n", "tail", "\n"]);
+  } finally { bindOutput(null); }
+});
+
+test("output validates its arguments before writing and names unsupported formats", () => {
+  const writes = [];
+  bindOutput(text => writes.push(text));
+  try {
+    for (const args of [R.EMPTY, R.list("x", "y"), R.consRaw("x", null), R.list(1)])
+      assert.throws(() => IO["io/format/2"]("~ts~n", args), e => e.blType === R.kw("Elixir.ArgumentError"));
+    assert.throws(() => IO["io/format/2"]("~p", R.list(1)), /io\/format supports/);
+    assert.deepEqual(writes, []);
+  } finally { bindOutput(null); }
+});
+
+test("output propagates sink errors without substituting another printer", () => {
+  const error = new Error("closed sink");
+  bindOutput(() => { throw error; });
+  try { assert.throws(() => IO["io/format/2"]("~ts~n", R.list("x")), e => e === error); }
+  finally { bindOutput(null); }
 });
