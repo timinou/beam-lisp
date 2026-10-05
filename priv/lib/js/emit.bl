@@ -77,6 +77,13 @@
 
 (defn local-name [n] (str "v_" (mangle n)))
 
+(defn atom-text
+  "An atom's whole text. NOT `name`: `name` splits a keyword at its last `/`
+   (`(name :=/=)` is \"=\"), right for `:ns/kw` and wrong for a module or
+   function atom — `erlang:'=/='`, `erlang:'/='` must keep every character."
+  [a]
+  (erlang/atom_to_binary a))
+
 (defn js-escape
   "A JS double-quoted string literal body. Every non-ASCII codepoint is passed
    through as itself (the module is UTF-8); control characters are escaped."
@@ -91,6 +98,17 @@
          (codepoints s))))
 
 (defn js-str [s] (str "\"" (js-escape s) "\""))
+
+(defn- call-expr
+  "A call of an unknown callee `f` with argument expressions `args`: a JS fn
+   is called directly, anything else through the `invoke` fallback. 0–3
+   arguments take rt.mjs's fixed-arity `R.callN` (no rest array, no spread)."
+  [f invoke args]
+  (let [n (count args)
+        tail (apply str (map (fn [a] (str ", " a)) args))]
+    (if (< n 4)
+      (str "R.call" n "(" f ", " invoke tail ")")
+      (str "R.call(" f ", " invoke tail ")"))))
 
 ; ─── emission state (per module) ────────────────────────────────────────────
 
@@ -240,66 +258,169 @@
 
 (defn- emit-invoke
   "RT.invoke(f, CONS): the callable ABI. A named global or a self-call
-   becomes a direct call; anything else goes through C.invoke, which handles
-   keywords, maps, sets and vectors as functions."
+   becomes a direct call; anything else goes through the ONE fallback — rt's
+   compiled `call-invoke` (`(:invoke ctx)`), which handles keywords, maps,
+   sets and vectors as functions by the language's rule."
   [node ctx]
   (let [cs (ir/call-site node)
         callee (:callee cs)
         self (self-of callee ctx)]
     (cond
-      ; a COMPUTED argument list: spread it (`f(...heads, ...toArray(rest))`)
+      ; a COMPUTED argument list: pass it as ONE list through R.callList
+      ; (`R.call*` only spreads a JS fn; anything else is rt's own invoke,
+      ; with the argument LIST, exactly the BEAM's Rt.invoke(f, args))
       (contains? cs :rest)
         (let [all (emit-all (cons callee (:args cs)) ctx)
               vals (:vals all)
               heads (butlast (rest vals))]
           (finish {:lines (:lines all)
-                   :val (str "C.invoke(" (join ", " (concat [(first vals)] heads [(str "...C.toArray(" (last vals) ")")])) ")")}
+                   :val (str "R.callList(" (first vals) ", R.listStar([" (join ", " heads) "], " (last vals) "), " (:invoke ctx) ")")}
                   ctx))
       (= :global (:op callee)) (call-js (global-js callee ctx (count (:args cs))) (emit-all (:args cs) ctx) ctx)
       (some? self) (call-js self (emit-all (:args cs) ctx) ctx)
       :else
-        (let [all (emit-all (cons callee (:args cs)) ctx)]
-          (call-js "C.invoke" all ctx)))))
+        (let [all (emit-all (cons callee (:args cs)) ctx)
+              [f & args] (:vals all)]
+          (finish {:lines (:lines all)
+                   :val (call-expr f (:invoke ctx) args)}
+                  ctx)))))
+
+; ─── BIF intrinsics ─────────────────────────────────────────────────────────
+; A pure Erlang BIF the runtime calls in its hottest loops (rt.bl walks lists
+; and tuples with hd/tl/element on every step) is emitted INLINE — a JS
+; expression over rt.mjs — not as a leaf-table property call. Same semantics as
+; the leaf, badarg included (rt.mjs hd/tl/element/tupleSize raise exactly as
+; leaves.mjs did). {[mod fun arity] (fn [arg-js…] → js)}.
+(def ^:private intrinsics
+  {[:erlang :hd 1] (fn [[x]] (str "R.hd(" x ")"))
+   [:erlang :tl 1] (fn [[x]] (str "R.tl(" x ")"))
+   [:erlang :element 2] (fn [[i t]] (str "R.element(" i ", " t ")"))
+   [:erlang :tuple_size 1] (fn [[t]] (str "R.tupleSize(" t ")"))
+   [:erlang :is_list 1] (fn [[x]] (str "R.isList(" x ")"))
+   [:erlang :is_tuple 1] (fn [[x]] (str "(" x " instanceof R.Tup)"))
+   [:erlang :is_atom 1] (fn [[x]] (str "R.isAtom(" x ")"))
+   [:erlang :is_boolean 1] (fn [[x]] (str "R.isBool(" x ")"))
+   [:erlang :is_map 1] (fn [[x]] (str "R.isMapI(" x ")"))
+   [:erlang :is_map_key 2] (fn [[k m]] (str "R.hasKeyI(" k ", " m ")"))
+   [:erlang :map_get 2] (fn [[k m]] (str "R.mapGetI(" k ", " m ")"))
+   [:maps :get 3] (fn [[k m d]] (str "R.mapsGet3I(" k ", " m ", " d ")"))
+   [:erlang :is_number 1] (fn [[x]] (str "R.isNumber(" x ")"))
+   [:erlang :is_float 1] (fn [[x]] (str "(" x " instanceof R.Flt)"))
+   [:erlang :length 1] (fn [[x]] (str "R.length(" x ")"))
+   ; `erlang:apply(F, Args)` with a FUN F (rt's dispatch after classifying)
+   [:erlang :apply 2] (fn [[f args]] (str "R.applyList(" f ", " args ")"))
+   [:erlang :is_binary 1] (fn [[x]] (str "(typeof " x " === \"string\")"))
+   [:erlang :is_integer 1] (fn [[x]] (str "R.isInt(" x ")"))
+   [:erlang :is_function 1] (fn [[x]] (str "(typeof " x " === \"function\")"))
+   [:erlang :is_function 2] (fn [[x n]] (str "R.isFnN(" x ", " n ")"))
+   [:erlang :< 2] (fn [[a b]] (str "R.ltI(" a ", " b ")"))
+   [:erlang :> 2] (fn [[a b]] (str "R.gtI(" a ", " b ")"))
+   [:erlang :=< 2] (fn [[a b]] (str "R.leI(" a ", " b ")"))
+   [:erlang :>= 2] (fn [[a b]] (str "R.geI(" a ", " b ")"))
+   [:erlang :+ 2] (fn [[a b]] (str "R.addI(" a ", " b ")"))
+   [:erlang :- 2] (fn [[a b]] (str "R.subI(" a ", " b ")"))
+   [:erlang :list_to_tuple 1] (fn [[l]] (str "R.listToTupleI(" l ")"))
+   [:lists :reverse 1] (fn [[l]] (str "R.reverseI(" l ")"))
+   [:lists :reverse 2] (fn [[l t]] (str "R.reverseI(" l ", " t ")"))
+   [:erlang :== 2] (fn [[a b]] (str "R.erlEq(" a ", " b ")"))
+   [:erlang :/= 2] (fn [[a b]] (str "!R.erlEq(" a ", " b ")"))
+   [:erlang :=:= 2] (fn [[a b]] (str "R.keyEq(" a ", " b ")"))
+   [:erlang :=/= 2] (fn [[a b]] (str "!R.keyEq(" a ", " b ")"))})
+
+(defn- intrinsic-js
+  "The inline JS for remote [m f] over argument expressions `vals`, or nil."
+  [m f vals]
+  (let [g (get intrinsics [m f (count vals)])]
+    (when (some? g) (g vals))))
+
+(defn- atom-lit?
+  "A literal atom node (keyword, nil, true/false) — interned on JS, so Erlang
+   `==`/`=:=` against it IS identity (an atom equals only itself)."
+  [n]
+  (and (= :lit (:op n)) (let [v (:val n)] (or (nil? v) (boolean? v) (keyword? v)))))
+
+(defn- identity-lit?
+  "A literal whose only equal is itself on JS: an atom, or the empty list."
+  [n]
+  (or (atom-lit? n)
+      (= :enil (:op n))
+      (and (= :lit (:op n)) (let [v (:val n)] (and (or (list? v) (seq? v)) (empty? v))))))
+
+(defn- static-arg-list
+  "The argument nodes of an ANF list built from a fixed number of conses —
+   `(raw-cons a (raw-cons b ()))`, a `(list a b)` remote, or the literal `()` —
+   or nil when its length is not known at compile time."
+  [n]
+  (cond
+    (= :enil (:op n)) []
+    (and (= :lit (:op n)) (= () (:val n))) []
+    (and (= :remote (:op n)) (= 2 (count (:args n)))
+         (or (and (= rt-mod (:mod n)) (= :raw-cons (:fun n)))))
+      (let [tail (static-arg-list (second (:args n)))]
+        (when (some? tail) (vec (cons (first (:args n)) tail))))
+    :else nil))
+
+(declare emit-remote)
 
 (defn- emit-remote [node ctx]
   (let [m (:mod node) f (:fun node) args (:args node)]
     (cond
+      ; `(erlang/== kd :nil)` — rt.bl's classifier chains are hundreds of these
+      ; per comparison: identity, no call
+      ; the empty list is the one frozen `R.EMPTY`, so `(erlang/== xs ())` is
+      ; identity too
+      (and (= m :erlang) (contains? #{:== :=:= :/= :=/=} f) (= 2 (count args))
+           (or (identity-lit? (first args)) (identity-lit? (second args))))
+        (let [all (emit-all args ctx)
+              [a b] (:vals all)
+              op (if (contains? #{:== :=:=} f) " === " " !== ")]
+          (finish {:lines (:lines all) :val (str "(" a op b ")")} ctx))
+      (some? (get intrinsics [m f (count args)]))
+        (let [all (emit-all args ctx)]
+          (finish {:lines (:lines all) :val (intrinsic-js m f (:vals all))} ctx))
+      ; `(erlang/apply :lists :reverse (raw-cons xs ()))`: a LITERAL module and
+      ; function with a literal-length argument list is a static call — link
+      ; it now (the same resolver a direct `lists/reverse` call uses) instead
+      ; of resolving `mod/fun/arity` per call at run time
+      (and (= m :erlang) (= f :apply) (= 3 (count args))
+           (atom-lit? (first args)) (atom-lit? (second args))
+           (some? (static-arg-list (nth args 2))))
+        (emit-remote {:op :remote :mod (:val (first args)) :fun (:val (second args))
+                      :args (static-arg-list (nth args 2)) :ann (:ann node)} ctx)
+      ; `(invocable? self n)`: the compiler's local-vs-linked-global guard on a
+      ; self-call. The self is the JS function being emitted, whose arities
+      ; are known (`:self-arities`: one fn's arity, or a dispatcher's arms),
+      ; so the guard is decided here rather than asked per call
+      (and (= m rt-mod) (= f :invocable?) (= 2 (count args))
+           (some? (self-of (first args) ctx))
+           (= :lit (:op (second args)))
+           (contains? (or (:self-arities ctx) #{}) (:val (second args)))
+           (= (self-of (first args) ctx) (:self-js ctx)))
+        (finish {:lines (list) :val "true"} ctx)
       (and (= m rt-mod) (= f :invoke)) (emit-invoke node ctx)
-      (and (= m rt-mod) (= f :apply_to)) (call-js "C.apply" (emit-all args ctx) ctx)
+      ; `(apply f seq)`: spread the seq with rt's `seq-to-args`, then call
+      ; through the ONE fallback ABI (compiled rt's `call-invoke`)
+      (and (= m rt-mod) (= f :apply_to) (some? (:seq-to-args ctx)))
+        (let [all (emit-all args ctx) [fv lst] (:vals all)]
+          (finish {:lines (:lines all) :val (str "R.callList(" fv ", " (:seq-to-args ctx) "(" lst "), " (:invoke ctx) ")")} ctx))
       :else
         (let [target ((:remote ctx) m f (count args))]
           (if (nil? target)
             (throw (ex-info (str "js.emit: " (:ns ctx) ": no JS implementation for "
-                                 m "/" (name f) "/" (count args)
+                                 m "/" (atom-text f) "/" (count args)
                                  (let [a (:ann node)] (if (some? (get a :line)) (str " at line " (get a :line)) "")))
                             {:mod m :fun f :arity (count args)}))
-            (let [all (emit-all args ctx)]
-              (if (rest-list-call? m f (count args))
-                ; the BEAM variadic ABI: the LAST argument is the rest-args
-                ; LIST. JS core functions are ordinary JS variadics, so the
-                ; list is spread at the call site.
-                (let [vals (:vals all)]
-                  (finish {:lines (:lines all)
-                           :val (str target "(" (join ", " (concat (butlast vals) [(str "...C.toArray(" (last vals) ")")])) ")")}
-                          ctx))
-                (call-js target all ctx))))))))
-
-(defn- rest-list-call?
-  "Does a direct call of [mod fun] with `n` args pass its rest args as one
-   trailing BL list? True for every compiled variadic clause (`<name>__bl_v`,
-   the BEAM name the compiler gives the `& rest` arity) and for the 3-arity
-   `swap!` (Refs.swap!(a, f, args)); `(swap! a f)` is Refs.swap!/2, no list."
-  [m f n]
-  (or (ends-with? (name f) "__bl_v")
-      (and (= m :Elixir.BeamLisp.Refs) (= f :swap!) (= n 3))
-      ; a core link row's VARIADIC function (`{min fname}`) is the same ABI:
-      ; called with min+1 args, the last the rest LIST (`list*` →
-      ; Rt.list_star(x, rest)). The linker names them (ctx :rest-fns).
-      (contains? (or (erlang/get :js_emit_rest_fns) #{}) [(name m) (name f) n])))
+            ; the callee is a compiled BL function or a BEAM-shaped leaf, and
+            ; BOTH take their rest args as ONE trailing list, exactly as on the
+            ; BEAM (the compiler already packed it) — nothing is spread
+            (call-js target (emit-all args ctx) ctx))))))
 
 (defn set-rest-fns!
   "Declare #{[mod-name fname arity]} — the core link table's variadic
-   functions at their rest-list arity — for this emit process."
+   functions at their rest-list arity — for this emit process. The static
+   emitter passes the rest list through unchanged; the declaration is kept so
+   the eval/boot path (js.eval set-rest-fns!) shares the ONE rule, exported as
+   core-links.mjs REST_FNS."
   [s]
   (erlang/put :js_emit_rest_fns s))
 
@@ -324,7 +445,9 @@
            (= :var (:op (first args))) (= (:name f) (:name (first args))))
         (finish {:lines (list) :val (get selves (:name f))} ctx)
       (some? (self-of f ctx)) (call-js (self-of f ctx) (emit-all args ctx) ctx)
-      :else (call-js "C.invoke" (emit-all (cons f args) ctx) ctx))))
+      :else
+        (let [all (emit-all (cons f args) ctx) [fv & avs] (:vals all)]
+          (finish {:lines (:lines all) :val (call-expr fv (:invoke ctx) avs)} ctx)))))
 
 ; ─── patterns ───────────────────────────────────────────────────────────────
 
@@ -355,8 +478,8 @@
                         (str "if (!(" t " instanceof R.HMap)) break " lbl ";"))
                   (mapcat (fn [pr]
                             (let [k (lit-js (:val (first pr))) u (tmp)]
-                              (concat (list (str "const " u " = " t ".get(" k ", C.NOT_FOUND);")
-                                            (str "if (" u " === C.NOT_FOUND) break " lbl ";"))
+                              (concat (list (str "const " u " = " t ".get(" k ", A.NOT_FOUND);")
+                                            (str "if (" u " === A.NOT_FOUND) break " lbl ";"))
                                       (pattern-lines (second pr) u lbl))))
                           (:pairs p))))
       :else (throw (ex-info (str "js.emit: pattern " op " is not in the sync profile") {:pattern p})))))
@@ -395,6 +518,8 @@
         params (vec (map (fn [i] (str "a" i)) (range arity)))
         target (or (:self-target ctx) jsname)
         ctx2 (assoc ctx :dest [:return] :loop nil :self-target nil
+                    :self-arities (if (some? (:self-target ctx)) (:self-arities ctx) #{arity})
+                    :self-js target
                     :selves (if (nil? self) (:selves ctx) (assoc (or (:selves ctx) {}) self target)))
         body (concat (mapcat (fn [cl] (clause-lines cl params ctx2)) cls)
                      (list (str "throw new R.BLError(\"no matching clause for " (js-escape (or (:fn-label ctx) jsname))
@@ -427,7 +552,11 @@
   [node ctx]
   (let [[_ fixed variadic] (:elems node)
         nm (label "multi")
-        actx (assoc ctx :self-target nm :dest nil)
+        ; the dispatcher's own arities: `(invocable? self n)` on it is decided
+        ; when n has an arm (a variadic arm answers any n ≥ its minimum; the
+        ; dispatcher is a 0-length JS fn, which `is_function/2` accepts too)
+        actx (assoc ctx :self-target nm :dest nil
+                    :self-arities (set (map (fn [pr] (:val (first pr))) (:pairs fixed))))
         arms (map (fn [pr] [(:val (first pr)) (fn-value (second pr) actx)]) (:pairs fixed))
         v (if (and (some? variadic) (= :tuple (:op variadic)))
             (let [[mn f] (:elems variadic)] [(:val mn) (fn-value f actx)])
@@ -439,9 +568,13 @@
                       (join "\n" (map (fn [[n _]] (str "if (args.length === " n ") return " nm "_" n "(...args);")) arms))
                       "\n"
                       (if (nil? v) ""
-                        (str "if (args.length >= " (first v) ") return " nm "_v(...args.slice(0, " (first v) "), args.length > " (first v) " ? R.listFromArray(args, " (first v) ") : null);\n"))
+                        (str "if (args.length >= " (first v) ") return " nm "_v(...args.slice(0, " (first v) "), args.length > " (first v) " ? R.listFromArray(args, " (first v) ") : R.EMPTY);\n"))
                       "throw new R.BLError(\"wrong number of args (\" + args.length + \")\");\n}")]
-    (finish {:lines (concat lines (list dispatch)) :val nm} ctx)))
+    ; the variadic clause rides on the dispatcher as `.v`: a BEAM-ABI caller
+    ; (`ns/f__bl_v`, the rest args already ONE list) calls it directly
+    (finish {:lines (concat lines (list dispatch)
+                            (if (nil? v) (list) (list (str nm ".v = " nm "_v;"))))
+             :val nm} ctx)))
 
 ; ─── loops ──────────────────────────────────────────────────────────────────
 
@@ -543,7 +676,7 @@
         b (emit (:body node) (to ctx dest))
         catches (:catch node)
         cv (tmp)
-        arms (mapcat (fn [c] (clause-lines c ["C.K_error" cv] (to ctx dest))) catches)
+        arms (mapcat (fn [c] (clause-lines c ["A.K_error" cv] (to ctx dest))) catches)
         af (if (nil? (:after node)) nil (emit (:after node) (expr-ctx ctx)))]
     (finish
       {:lines (concat (list (str "let " res ";") "try {" (str done ": {"))

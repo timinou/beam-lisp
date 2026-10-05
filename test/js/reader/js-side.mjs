@@ -6,7 +6,8 @@ import path from "node:path";
 import fs from "node:fs";
 import { canon } from "./canon.mjs";
 const out = path.resolve(process.argv[2]);
-const Rd = await import(pathToFileURL(path.join(out, "reader.mjs")).href);
+// the compiled reader is a namespace under ns/; the runtime stays at the root
+const Rd = await import(pathToFileURL(path.join(out, "ns", "reader.mjs")).href);
 const R = await import(pathToFileURL(path.join(out, "rt.mjs")).href);
 for (const p of process.argv.slice(3)) {
   let s;

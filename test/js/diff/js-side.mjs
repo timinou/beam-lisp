@@ -5,7 +5,8 @@ import { pathToFileURL } from "node:url";
 import path from "node:path";
 
 const out = path.resolve(process.argv[2]);
-const C = await import(pathToFileURL(path.join(out, "diff.corpus.mjs")).href);
+// compiled namespaces live under ns/; the runtime (rt.mjs) stays at the root
+const C = await import(pathToFileURL(path.join(out, "ns", "diff.corpus.mjs")).href);
 const R = await import(pathToFileURL(path.join(out, "rt.mjs")).href);
 const cases = ["numbers", "equality", "collections", "seqs", "strings", "functions", "destructuring", "control"];
 for (const c of cases) {

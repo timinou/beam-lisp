@@ -7,7 +7,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 import fs from "node:fs";
 
-const out = path.resolve(process.env.BLED_OUT || "out/bl-ed");
+const out = path.resolve(process.env.BLED_OUT || "apps/bl-ed/web/out");
 // the `:` command line evaluates real Beam Lisp: start the in-page language
 // (built into out/ by apps/bl-ed/build.sh) as the page host does
 const { start } = await import(pathToFileURL(path.join(out, "repl.mjs")).href);
@@ -16,9 +16,11 @@ globalThis.BL_HOST = Object.assign(globalThis.BL_HOST || {}, {
   "eval-ed": (src, api) => repl.evalWith(src, "ed", api),
   "eval-cells": (cells) => repl.evalCells(cells),
 });
-const M = await import(pathToFileURL(path.join(out, "ed.main.mjs")).href);
+// compiled namespaces live under out/ns/; the runtime (rt.mjs/repl.mjs) stays
+// at the out root (apps/bl-ed/build.sh).
+const M = await import(pathToFileURL(path.join(out, "ns", "ed.main.mjs")).href);
 const R = await import(pathToFileURL(path.join(out, "rt.mjs")).href);
-const T = await import(pathToFileURL(path.join(out, "ed.text.mjs")).href);
+const T = await import(pathToFileURL(path.join(out, "ns", "ed.text.mjs")).href);
 const K = (s) => R.kw(s);
 const get = (m, k) => m.get(K(k), null);
 
@@ -295,7 +297,7 @@ test("render model: segments, problems, status", () => {
 });
 
 test("incremental structure == full derive, over random typing in real documents", async () => {
-  const C = await import(pathToFileURL(path.join(out, "ed.core.mjs")).href);
+  const C = await import(pathToFileURL(path.join(out, "ns", "ed.core.mjs")).href);
   const root = path.resolve(process.env.BLED_ROOT || ".");
   const docs = ["docs/tools/02-lsp.bl.org", "docs/changelog/v2026.4.bl.org", "docs/split/01-how-one-file-becomes-two-programs.bl.org"]
     .map(p => path.join(root, p)).filter(p => fs.existsSync(p));

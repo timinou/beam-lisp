@@ -8,9 +8,9 @@ import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 
 const out = path.resolve(process.env.BLED_OUT || "apps/bl-ed/web/out");
-const M = await import(pathToFileURL(path.join(out, "ed.main.mjs")).href);
+const M = await import(pathToFileURL(path.join(out, "ns", "ed.main.mjs")).href);
 const R = await import(pathToFileURL(path.join(out, "rt.mjs")).href);
-const S = await import(pathToFileURL(path.join(out, "ed.selftest.mjs")).href).catch(() => null);
+const S = await import(pathToFileURL(path.join(out, "ns", "ed.selftest.mjs")).href).catch(() => null);
 const file = process.argv[2] || "docs/changelog/v2026.4.bl.org";
 const src = fs.readFileSync(file, "utf8");
 const K = (s) => R.kw(s);

@@ -43,13 +43,32 @@ const PENDING = 0, RUNNING = 1, COMPLETED = 2, FAILED = 3, TERMINAL = 4;
 const K = new Proxy({}, { get: (_, n) => R.kw(n) });   // K.ok → :ok, at call time
 export const CHUNK = 32;
 
-/** A lazy node. `s` is the cell state (an array, tag first); `meta` the
-    value-owned metadata (the BEAM struct's `:metadata`). */
-export class LazySeq {
-  constructor(thunk, recipe, meta) {
+/** The shared native memo resource (the BEAM struct's `:resource`): ONE per
+    logical node, however many metadata-carrying `LazySeq` values reference it.
+    Holds the cell state `s` (an array, tag first) and the cycle-guard `edges`,
+    so a transition or an edge recorded through one alias is seen through every
+    other. `with-meta` is an immutable update of the VALUE; the resource is the
+    identity, exactly as `BeamLisp.Meta/with_meta` shares the struct's
+    `:resource` (priv/host/meta.bl). */
+class Memo {
+  constructor(thunk, recipe) {
     this.s = recipe ? [PENDING, thunk, recipe] : [PENDING, thunk];
+    this.edges = null;
+  }
+}
+
+/** A lazy node. `meta` is the VALUE-owned metadata (the BEAM struct's
+    `:metadata`); `memo` is the shared cell state + cycle edges. `s`/`edges`
+    read and write through the memo, so aliases of one node never diverge. */
+export class LazySeq {
+  constructor(thunk, recipe, meta, memo) {
+    this.memo = memo === undefined ? new Memo(thunk, recipe) : memo;
     this.meta = meta === undefined ? null : meta;
   }
+  get s() { return this.memo.s; }
+  set s(v) { this.memo.s = v; }
+  get edges() { return this.memo.edges; }
+  set edges(v) { this.memo.edges = v; }
 }
 const isLazy = (x) => x instanceof LazySeq;
 
@@ -101,24 +120,66 @@ export function force(l) {
   }
 }
 
-/** Does `v` contain `node` — through list cells, nested lazy nodes' PUBLISHED
-    values, or collections? The NIF's dependency walk, for the one cycle a
-    program can make: a node whose answer embeds itself. Pending nodes are
-    edges too (their thunk may hold the node, but a thunk is opaque — on the
-    BEAM it is walked through its captured environment; here a pending node is
-    only identity-compared). */
-function reaches(v, node) {
+/** The cycle guard, as the NIF keeps it (native/lazy_memo would_cycle): each
+    node has EDGES — the native memo resources its published value reaches
+    directly (the walk stops AT a lazy node: that node's own edges are the
+    graph beyond it). Publishing `v` into `node` is a cycle when `node`'s memo
+    is reachable from `v`'s edges through the edge graph. Edges are the MEMO,
+    not the LazySeq value, so an alias added by `with-meta` is the same node.
+    Edges are found by walking `v` only down to its first lazy nodes, so a long
+    realised seq costs O(new cells) per publish, not a re-walk of everything
+    behind it. */
+function directEdges(v) {
+  // the NIF's pre-check (lazy_memo.bl dependencies): a scalar, or a proper
+  // list of scalars (a produced chunk), cannot reach a node — no walk
+  if (v === null || typeof v !== "object") return NO_EDGES;
+  if (v instanceof R.Cons) {
+    let p = v;
+    while (p instanceof R.Cons && (p.h === null || typeof p.h !== "object")) p = p.t;
+    if (p === R.EMPTY) return NO_EDGES;
+    // a produced chunk with a lazy tail — the shape of nearly every publish:
+    // the walk would stop AT that node, so it is the one edge
+    if (p instanceof LazySeq) return [p.memo];
+  }
+  const out = [];
   const seen = new Set();
   const stack = [v];
   while (stack.length) {
     const x = stack.pop();
     if (x === null || typeof x !== "object" || seen.has(x)) continue;
-    if (x === node) return true;
     seen.add(x);
+    if (x instanceof LazySeq) { if (!seen.has(x.memo)) out.push(x.memo); continue; }
     if (x instanceof R.Cons) { stack.push(x.h, x.t); continue; }
-    if (x instanceof LazySeq) { if (x.s[0] === COMPLETED) stack.push(x.s[1]); continue; }
     if (x instanceof R.Tup) { for (const e of x.items) stack.push(e); continue; }
+    if (x instanceof R.Vec) { for (const e of x) stack.push(e); continue; }
+    if (x instanceof R.HMap) { for (const [k, w] of x.entries()) stack.push(k, w); continue; }
+    if (x instanceof R.HSet) { for (const e of x) stack.push(e); continue; }
   }
+  return out;
+}
+const NO_EDGES = [];
+/** Would publishing a value whose edges are the memos `deps` into `node`
+    close a cycle? Node identity is the MEMO, so an alias is the same node. */
+function wouldCycle(node, deps) {
+  if (deps.length === 0) return false;
+  const target = node.memo;
+  if (deps.length === 1 && deps[0] !== target && !deps[0].edges) return false;
+  const seen = new Set();
+  const stack = deps.slice();
+  while (stack.length) {
+    const d = stack.pop();
+    if (d === target) return true;
+    if (seen.has(d)) continue;
+    seen.add(d);
+    if (d.edges) for (const e of d.edges) stack.push(e);
+  }
+  return false;
+}
+/** Publish-time check + edge record; true when it would cycle. */
+function reaches(v, node) {
+  const deps = directEdges(v);
+  if (wouldCycle(node, deps)) return true;
+  if (deps.length) node.edges = deps;
   return false;
 }
 
@@ -159,22 +220,25 @@ export function realize(l) {
     `hd` refuses it). */
 function headCell(v) {
   if (v instanceof R.Cons) return v;
-  if (v instanceof R.Vec) return normalizeList(R.listFromArray(v.toArray()));
+  if (v instanceof R.Vec) return normalizeList(v.toList());
   if (v instanceof R.HSet) return normalizeList(R.listFromArray([...v]));
   if (v instanceof SeqCursor) return v.cell();
   return v;
 }
 
 /** Any seqable to a realized cell (BeamLisp.LazySeq/cell). */
+// The host's Enumerable protocol owns generic input coercion (maps and
+// grapheme strings); a lazy thunk's VALUE still follows headCell's contract.
+let enumerableCell = (x) => x;
+export function bindEnumerableCell(f) { enumerableCell = f; }
 export function cell(x) {
   if (x === null || x === undefined || x === R.EMPTY) return null;
   if (x instanceof LazySeq) return realize(x);
   if (x instanceof SeqCursor) return x.cell();
   if (x instanceof R.Cons) return x;
-  if (x instanceof R.Vec) return normalizeList(R.listFromArray(x.toArray()));
+  if (x instanceof R.Vec) return normalizeList(x.toList());
   if (x instanceof R.HSet) return normalizeList(R.listFromArray([...x]));
-  if (typeof x === "string") return normalizeList(R.listFromArray([...x]));
-  return x;
+  return enumerableCell(x);
 }
 
 // ─── constructors ──────────────────────────────────────────────────────────
@@ -201,23 +265,36 @@ export function chain(elems, tailFn) {
   for (let i = xs.length - 1; i >= 0; i--) r = new R.Cons(xs[i], r);
   return r;
 }
+/** `with_meta` on a lazy node (the owning host primitive, priv/host/meta.bl's
+    `BeamLisp.Meta/with_meta`): the SAME native memo resource under a NEW
+    value-owned metadata map. The original keeps its metadata; both values share
+    the cell state and the cycle edges, so realization, retry and the cycle
+    guard are the node's, never a per-metadata copy. */
+export function withMeta(l, m) {
+  if (!(l instanceof LazySeq)) throw new R.BLError("with-meta: " + R.printStr(l) + " cannot carry metadata");
+  return new LazySeq(null, null, m === undefined ? null : m, l.memo);
+}
 
 /** A finite list walked a chunk at a time: on the BEAM the list is copied once
-    off-heap; here it is the list itself, walked in place. Its cell is the
-    list's own cell, so the shape (`[h | rest]`) is the BEAM's. */
+    off-heap; here it is the list itself, walked in place. A cell is the BEAM's
+    shape exactly — `[head | cursor']`, the TAIL a sub-cursor, never the bare
+    rest of the list (rt.bl walks `(SeqCursor/cell (tl cell))`). nil at the end. */
 export class SeqCursor {
   constructor(list) { this.l = list; }
-  cell() { return this.l === R.EMPTY ? null : this.l; }
+  cell() { const l = this.l; return l instanceof R.Cons ? new R.Cons(l.h, new SeqCursor(l.t)) : null; }
 }
 
 /** Normalize a producer input (BeamLisp.LazySeq/input): a vector is unwrapped,
     a list longer than one chunk becomes a cursor, anything else is itself. */
 export function input(x) {
-  if (x instanceof R.Vec) return input(R.listFromArray(x.toArray()));
-  if (x === R.EMPTY || x instanceof R.Cons) {
-    let n = 0; for (let p = x; p instanceof R.Cons && n <= CHUNK; p = p.t) n++;
-    return n > CHUNK ? new SeqCursor(x) : x;
-  }
+  if (x instanceof R.Vec) return input(x.toList());
+  // Only a PROPER finite list longer than one chunk becomes a finite cursor,
+  // exactly as the BEAM's `(erlang/is_list x)` guard plus `length > 32` do:
+  // a Cons carries its proper length in `n` (`-1` when the chain ends in
+  // anything but `()` — a lazy tail, a cursor, a scalar), so this is O(1) and
+  // never forces a tail. An improper chain is returned unchanged: the walk
+  // decides (and a genuinely malformed tail still refuses downstream).
+  if (x instanceof R.Cons && x.n > CHUNK) return new SeqCursor(x);
   return x;
 }
 

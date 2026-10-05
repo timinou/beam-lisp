@@ -126,9 +126,22 @@ const EMPTY_NODE = Object.freeze([]);
 
 export class Vec {
   constructor(cnt, shift, root, tail, meta) {
-    this.cnt = cnt; this.shift = shift; this.root = root; this.tail = tail; this.meta = meta || null; this._h = undefined;
+    this.cnt = cnt; this.shift = shift; this.root = root; this.tail = tail; this.meta = meta || null; this._h = undefined; this._l = undefined;
   }
   tailOff() { return this.cnt < WIDTH ? 0 : ((this.cnt - 1) >>> BITS) << BITS; }
+  /** The element list, built once: a vector is immutable, so every `seq` /
+      `next` / fold of the same vector shares one spine (the BEAM pays this
+      walk per call too, but over a flat tuple; here it was a fresh trie walk). */
+  toList() {
+    if (this._l !== undefined) return this._l;
+    // built back to front, a leaf array at a time (no intermediate array)
+    let l = EMPTY;
+    for (let base = this.cnt === 0 ? -1 : ((this.cnt - 1) >>> BITS) << BITS; base >= 0; base -= WIDTH) {
+      const a = this.arrayFor(base), n = Math.min(WIDTH, this.cnt - base);
+      for (let j = n - 1; j >= 0; j--) l = new Cons(a[j], l);
+    }
+    return (this._l = l);
+  }
   arrayFor(i) {
     if (i >= this.tailOff()) return this.tail;
     let node = this.root;
@@ -183,7 +196,14 @@ export class Vec {
       for (let j = 0; j < n; j++) yield a[j];
     }
   }
-  toArray() { const out = new Array(this.cnt); let k = 0; for (const x of this) out[k++] = x; return out; }
+  toArray() {
+    const out = new Array(this.cnt);
+    for (let i = 0; i < this.cnt; i += WIDTH) {
+      const a = this.arrayFor(i), n = Math.min(WIDTH, this.cnt - i);
+      for (let j = 0; j < n; j++) out[i + j] = a[j];
+    }
+    return out;
+  }
 }
 function newPath(level, node) { return level === 0 ? node : [newPath(level - BITS, node)]; }
 function pushTail(cnt, level, parent, tailNode) {
@@ -759,6 +779,7 @@ export function printStr(x) {
   if (x instanceof Tup) return "{" + x.items.map(printStr).join(", ") + "}";
   if (x instanceof BLError) return "#error {:message " + escStr(x.message) + "}";
   if (x instanceof Atom) return "#<atom " + printStr(x.v) + ">";
+  if (x !== null && typeof x === "object" && x.blStruct && x.blStruct.fq === "Elixir.Regex") return "~r/" + x.source + "/";
   if (x instanceof Z.Delay) return "#<delay " + (x.seq.s[0] === 2 ? printStr(x.seq.s[1]) : ":pending") + ">";
   return "#<host " + Object.prototype.toString.call(x) + ">";
 }
@@ -780,3 +801,134 @@ export class Atom {
 // ─── truthiness ─────────────────────────────────────────────────────────────
 
 export function truthy(x) { return x !== null && x !== undefined && x !== false; }
+
+/** Erlang `==`: exact structure, except that numbers compare by VALUE across
+    integer and float (1 == 1.0, {1} == {1.0}). A vector is a struct (a map) and
+    never equals a list. Map KEYS still match exactly (=:=), as on the BEAM. */
+export function erlEq(a, b) {
+  if (a === b) return true;
+  // the common case in rt.bl's loops: a scalar against a keyword/nil/number
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
+    if (typeof a === "number" && typeof b === "number") return a === b;
+    if (!isNumber(a) || !isNumber(b)) return false;
+  }
+  if (isNumber(a) && isNumber(b)) return (typeof a === "bigint" || typeof b === "bigint") && !(a instanceof Flt) && !(b instanceof Flt) ? BigInt(a) === BigInt(b) : Number(numv(a)) === Number(numv(b));
+  if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+  if (a instanceof Tup) return b instanceof Tup && a.items.length === b.items.length && a.items.every((x, i) => erlEq(x, b.items[i]));
+  if (a instanceof Cons || a === EMPTY) {
+    let p = a, q = b;
+    for (;;) {
+      if (p === EMPTY || q === EMPTY) return p === q;
+      // one side ran out of cells: equal only if both tails are the same
+      // non-cell term (an improper tail: a lazy node, a cursor)
+      if (!(p instanceof Cons) || !(q instanceof Cons)) return !(p instanceof Cons) && !(q instanceof Cons) && erlEq(p, q);
+      if (!erlEq(p.h, q.h)) return false;
+      p = p.t; q = q.t;
+    }
+  }
+  if (a instanceof Vec) return b instanceof Vec && a.cnt === b.cnt && a.toArray().every((x, i) => erlEq(x, b.nth(i)));
+  if (a instanceof HMap) { if (!(b instanceof HMap) || a.cnt !== b.cnt) return false; for (const [k, v] of a.entries()) { const w = b.get(k, NO_KEY); if (w === NO_KEY || !erlEq(v, w)) return false; } return true; }
+  return keyEq(a, b);
+}
+const NO_KEY = {};
+const numv = (x) => (x instanceof Flt ? x.v : x);
+
+// ─── BIF intrinsics (js.emit inlines `erlang/hd` & co to these, PLAN-163 U3) ─
+// Each is EXACTLY its leaf (leaves.mjs / host-leaves.mjs), badarg included:
+// the emitter calls a module function instead of a leaf-table property call.
+const bad = (what, x) => { const e = new BLError("errors were found at the given arguments: " + what + " " + printStr(x)); e.blType = kw("Elixir.ArgumentError"); throw e; };
+export function hd(l) { return l instanceof Cons ? l.h : bad("hd", l); }
+export function tl(l) { return l instanceof Cons ? l.t : bad("tl", l); }
+export function element(i, t) { return t instanceof Tup && i >= 1 && i <= t.items.length ? t.items[i - 1] : bad("element", t); }
+export function tupleSize(t) { return t instanceof Tup ? t.items.length : bad("tuple_size", t); }
+export const isList = (x) => x === EMPTY || x instanceof Cons;
+/** rt.bl's raw constructors (rt.raw): `[x | xs]` with ANY tail (a lazy node
+    stays the tail, unforced), and fixed tuples. */
+export const consRaw = (x, xs) => new Cons(x, xs);
+export const tuple2 = (a, b) => new Tup([a, b]);
+export const tuple3 = (a, b, c) => new Tup([a, b, c]);
+export const emptyList = () => EMPTY;
+/** Self-host calling convention (PLAN-163 U3): a JS function is called
+    directly; ANY other callee goes to the compiled runtime's own `invoke(f,
+    args)` — the BEAM's Rt.invoke, with the arguments as one list — so keywords,
+    maps, $blfn multi-fns and vectors are called by the language's rule, never
+    by the host ABI's fast path. */
+export function call(f, invoke, ...args) { return typeof f === "function" ? f(...args) : invoke(f, listFromArray(args)); }
+// fixed-arity forms js.emit picks for 0–3 arguments: no rest array, no spread
+export function call0(f, invoke) { return typeof f === "function" ? f() : invoke(f, EMPTY); }
+export function call1(f, invoke, a) { return typeof f === "function" ? f(a) : invoke(f, new Cons(a, EMPTY)); }
+export function call2(f, invoke, a, b) { return typeof f === "function" ? f(a, b) : invoke(f, new Cons(a, new Cons(b, EMPTY))); }
+export function call3(f, invoke, a, b, c) { return typeof f === "function" ? f(a, b, c) : invoke(f, new Cons(a, new Cons(b, new Cons(c, EMPTY)))); }
+// Intrinsic forms of the hottest pure leaves (js.emit inlines the call; the
+// leaf in host-leaves.mjs / leaves.mjs answers identically): a small-integer
+// fast path, else exactly the leaf's own general path.
+export function ltI(a, b) { return typeof a === "number" && typeof b === "number" ? a < b : termCompare(a, b) < 0; }
+export function gtI(a, b) { return typeof a === "number" && typeof b === "number" ? a > b : termCompare(a, b) > 0; }
+export function leI(a, b) { return typeof a === "number" && typeof b === "number" ? a <= b : termCompare(a, b) <= 0; }
+export function geI(a, b) { return typeof a === "number" && typeof b === "number" ? a >= b : termCompare(a, b) >= 0; }
+export function addI(a, b) { if (typeof a === "number" && typeof b === "number") { const r = a + b; if (r <= MAX && r >= MIN) return r; } return add(a, b); }
+export function subI(a, b) { if (typeof a === "number" && typeof b === "number") { const r = a - b; if (r <= MAX && r >= MIN) return r; } return sub(a, b); }
+/** `lists:reverse/2` (and `/1` as its empty tail): the elements of a PROPER
+    first list reversed onto an arbitrary, UNFORCED tail — `()` for `/1`. An
+    empty first list returns the tail EXACTLY (identity, never forced); a
+    null, non-list or improper first list is the BEAM's badarg. ONE helper,
+    so the emitter intrinsic and the leaf cannot disagree. */
+export function reverseI(l, tail = EMPTY) {
+  if (l !== EMPTY && !(l instanceof Cons && l.n >= 0)) bad("reverse", l);
+  let r = tail;
+  for (let p = l; p instanceof Cons; p = p.t) r = new Cons(p.h, r);
+  return r;
+}
+/** `erlang:list_to_tuple/1`. */
+export function listToTupleI(l) {
+  const a = [];
+  for (let p = l; p instanceof Cons; p = p.t) a.push(p.h);
+  return new Tup(a);
+}
+/** `erlang:is_function(F, N)`, as host-leaves answers it (a JS fn of length 0
+    is a rest/variadic fn and accepts any arity). */
+export function isFnN(x, n) { return typeof x === "function" && (x.length === n || x.length === 0); }
+export function callList(f, args, invoke) {
+  if (typeof f === "function") { const a = []; for (let p = args; p instanceof Cons; p = p.t) a.push(p.h); return f(...a); }
+  return invoke(f, args);
+}
+/** `erlang:apply(F, Args)`: a JS function spread over a proper list. A non-
+    function falls back to the leaf (which also calls keywords/maps). */
+export function applyList(f, args) {
+  if (typeof f === "function") {
+    if (args === EMPTY) return f();
+    if (args instanceof Cons && args.n >= 0) {
+      if (args.n === 1) return f(args.h);
+      if (args.n === 2) return f(args.h, args.t.h);
+      const a = new Array(args.n); let i = 0; for (let p = args; p instanceof Cons; p = p.t) a[i++] = p.h; return f(...a);
+    }
+  }
+  return APPLY2(f, args);
+}
+let APPLY2 = () => { throw new BLError("erlang:apply/2 leaf not bound"); };
+export function bindApply2(g) { APPLY2 = g; }
+/** The struct protocol (host-leaves.mjs owns it; bound here so js.emit can
+    inline `erlang/is_map`, `is_map_key`, `map_get`, `maps:get/3`): a plain
+    HMap is answered inline, any other value by the bound protocol. */
+let SP = null;
+export function bindStructProtocol(p) { SP = p; }
+export function isMapI(x) { return x instanceof HMap || (x !== null && typeof x === "object" && x.blStruct instanceof Kw); }
+export function hasKeyI(k, m) {
+  // a plain map holding no `:__struct__` entry answers inline; the struct
+  // protocol owns every other case (a struct class, the `:__struct__` key)
+  if (m instanceof HMap && !(k instanceof Kw && k.fq === "__struct__")) return m.has(k);
+  return SP.hasKey(k, m);
+}
+export function mapGetI(k, m) { if (m instanceof HMap) { const v = m.get(k, NO_KEY); if (v !== NO_KEY) return v; } return SP.mapGet(k, m, NO_KEY) === NO_KEY ? bad("map_get " + printStr(k), m) : SP.mapGet(k, m, null); }
+export function mapsGet3I(k, m, d) { return m instanceof HMap ? m.get(k, d) : SP.mapGet(k, m, d); }
+/** `(list* a b rest)`: the heads consed onto `rest` (shared, unforced). */
+export function listStar(heads, rest) { let r = rest; for (let i = heads.length - 1; i >= 0; i--) r = new Cons(heads[i], r); return r; }
+export const isAtom = (x) => x instanceof Kw || x === true || x === false || x === null;
+export const isBool = (x) => x === true || x === false;
+/** `erlang:length/1`: a PROPER list's length (a Cons carries it), badarg on
+    anything else — an improper (lazy-tailed) chain included, as on the BEAM. */
+export function length(l) {
+  if (l === EMPTY) return 0;
+  if (l instanceof Cons && l.n >= 0) return l.n;
+  return bad("length", l);
+}
