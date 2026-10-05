@@ -51,6 +51,7 @@ for (const [cls, mod] of [[Vec, "Vector"], [HSet, "Set"], [Z.LazySeq, "LazySeq"]
                           [R.Atom, "Atom"], [Z.Delay, "Delay"], [Z.SeqCursor, "SeqCursor"]]) {
   Object.defineProperty(cls.prototype, "blStruct", { value: kw("Elixir.BeamLisp." + mod), writable: false });
 }
+R.bindStructProtocol({ isMap: (x) => isMap(x), mapGet: (k, m, d) => mapGet(k, m, d), hasKey: (k, m) => ERLANG["erlang/is_map_key/2"](k, m) });
 /** `is_map` on the BEAM is true for every struct: a struct IS a map. */
 export const isMap = (x) => x instanceof HMap || (x !== null && typeof x === "object" && x.blStruct instanceof Kw);
 

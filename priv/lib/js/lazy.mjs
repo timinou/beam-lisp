@@ -116,6 +116,9 @@ function directEdges(v) {
     let p = v;
     while (p instanceof R.Cons && (p.h === null || typeof p.h !== "object")) p = p.t;
     if (p === R.EMPTY) return NO_EDGES;
+    // a produced chunk with a lazy tail — the shape of nearly every publish:
+    // the walk would stop AT that node, so it is the one edge
+    if (p instanceof LazySeq) return [p];
   }
   const out = [];
   const seen = new Set();
@@ -136,6 +139,8 @@ function directEdges(v) {
 const NO_EDGES = [];
 /** Would publishing a value with edges `deps` into `node` close a cycle? */
 function wouldCycle(node, deps) {
+  if (deps.length === 0) return false;
+  if (deps.length === 1 && deps[0] !== node && !deps[0].edges) return false;
   const seen = new Set();
   const stack = deps.slice();
   while (stack.length) {

@@ -853,6 +853,15 @@ export function applyList(f, args) {
 }
 let APPLY2 = () => { throw new BLError("erlang:apply/2 leaf not bound"); };
 export function bindApply2(g) { APPLY2 = g; }
+/** The struct protocol (host-leaves.mjs owns it; bound here so js.emit can
+    inline `erlang/is_map`, `is_map_key`, `map_get`, `maps:get/3`): a plain
+    HMap is answered inline, any other value by the bound protocol. */
+let SP = null;
+export function bindStructProtocol(p) { SP = p; }
+export function isMapI(x) { return x instanceof HMap || (x !== null && typeof x === "object" && x.blStruct instanceof Kw); }
+export function hasKeyI(k, m) { return SP.hasKey(k, m); }
+export function mapGetI(k, m) { if (m instanceof HMap) { const v = m.get(k, NO_KEY); if (v !== NO_KEY) return v; } return SP.mapGet(k, m, NO_KEY) === NO_KEY ? bad("map_get " + printStr(k), m) : SP.mapGet(k, m, null); }
+export function mapsGet3I(k, m, d) { return m instanceof HMap ? m.get(k, d) : SP.mapGet(k, m, d); }
 /** `(list* a b rest)`: the heads consed onto `rest` (shared, unforced). */
 export function listStar(heads, rest) { let r = rest; for (let i = heads.length - 1; i >= 0; i--) r = new Cons(heads[i], r); return r; }
 export const isAtom = (x) => x instanceof Kw || x === true || x === false || x === null;

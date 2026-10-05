@@ -12,14 +12,18 @@ const load = async (out) => {
 };
 const H = await load(hand), S = await load(self);
 const names = Object.keys(H).filter((k) => k.startsWith("d_p_")).sort();
-const med = (xs) => xs.slice().sort((a, b) => a - b)[xs.length >> 1];
+// Process CPU time, not wall time: on a busy host the scheduler parks this
+// process between slices, which wall time counts and CPU time does not. The
+// minimum of many interleaved runs then drops the residual (cache, GC) noise.
+const med = (xs) => Math.min(...xs);
+const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; };
 let worst = 0, failed = [];
 for (const k of names) {
   for (let i = 0; i < 3; i++) { H[k](); S[k](); }
   const th = [], ts = [];
-  for (let i = 0; i < 9; i++) {
-    let t = performance.now(); H[k](); th.push(performance.now() - t);
-    t = performance.now(); S[k](); ts.push(performance.now() - t);
+  for (let i = 0; i < 15; i++) {
+    let t = cpu(); H[k](); th.push(cpu() - t);
+    t = cpu(); S[k](); ts.push(cpu() - t);
   }
   const r = med(ts) / med(th);
   worst = Math.max(worst, r);
