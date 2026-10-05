@@ -1,0 +1,393 @@
+; consumer.bl — research spike: a DOWNSTREAM CONSUMER of the central checked
+; optimizer, for the element-consumer shape `(first (filter pred coll))`.
+;
+; ── The question ─────────────────────────────────────────────────────────
+;
+; `(first (filter pred coll))` is the most common element-consumer in ordinary
+; source. The runtime evaluates it through the chunked lazy engine: forcing ONE
+; cell of `(filter pred coll)` scans up to `LazySeq/chunk_size` (= 32) INPUT
+; elements and runs `pred` on every one of them (priv/boot/rt.bl,
+; `lazy-filter-realise` / `filter-chunk`). So `first` forces 32 predicate runs
+; to return a match that may sit at index 0. For a PURE predicate that overscan
+; is unobservable; for an effectful or raising one it is an observable effect
+; count and a possible raise — which is exactly why a lowering may only be
+; offered for a total, effect-free, stable predicate over a materialized source.
+;
+; The candidate lowering replaces `first(filter(pred, coll))` with the runtime's
+; EXISTING halting fold, `rt/k-reduce` + `rt/reduced` (the same mechanism
+; `core/some` uses): a left-to-right scan that STOPS at the first element for
+; which `pred` is truthy and returns THAT ELEMENT. It is not `some`: `some`
+; returns its SELECTOR's result and treats a false/nil result as "no match", so
+; `(some (fn [e] (if (pred e) e nil)) coll)` is the plausible-but-WRONG lowering
+; that loses a `false` match. This spike proves the correct law and exhibits the
+; wrong one as a witness.
+;
+; ── Scope, honestly ──────────────────────────────────────────────────────
+;
+; This is an ADAPTER over a CLOSED, DECLARED supported domain — not a compiler
+; integration and not a second optimizer. It does not walk arbitrary code: it
+; recognizes one fixed shape (the candidate's own expression) and checks its
+; immediate operands. The DECLARED DOMAIN is:
+;
+;   collection  a materialized finite list: a quoted literal list of simple
+;               literals, a cons/enil chain of those, or `(lists/seq i j)` on
+;               integer literals with `i =< j` (a forward range is total; a
+;               backwards range raises and is refused).  No var, no lazy
+;               provider, no call that could force a lazy source or effect.
+;   predicate   a literal single-clause `(fn [p] body)` whose body is total,
+;               effect-free and non-raising over the declared elements:
+;               comparisons (`< > <= >= ==`) over literals and the parameter,
+;               combined with `if`/`and`/`or`/`not`. `BeamLisp.Num`'s ordering
+;               ops are total term order for non-decimal operands (priv/host/
+;               num.bl, "ordering"), so this grammar cannot raise or differ by
+;               evaluation order.
+;   resolution  the `filter` at the site must be proven to be the core lazy
+;               `filter`. The ordinary spelling compiles to
+;               `RT.invoke(fetch "filter", …)` (the link table gives `filter`
+;               only a `:value` row, no direct-call link), so this adapter can
+;               check the SHAPE but cannot prove the resolution — the caller
+;               must set `:resolved? true` having done so. A central rule would
+;               derive it from Env/link facts; that is the integration gap.
+;
+; ── What the central optimizer does today (accessible API) ───────────────
+;
+; `optimize/explain` on the compiled shape records NO evidence and refuses the
+; inner `RT.invoke` with `:unknown-or-mismatched-native-arity` because `filter`
+; reaches the node as an unresolved `:global`; the outer `first` is left
+; untouched. So the central pass neither fuses nor refuses the element-consumer
+; as a unit. The smallest extension is named in consumer.md: a `:strict-first-
+; filter` rule beside `:strict-map-fold`, a `closed-pred?` sibling of
+; `int-callback`, a `materialized-coll?` fact, `first`/`filter` added to the
+; provider-refusal list, and a public fact accessor so a consumer need not
+; re-derive domain facts. This module re-derives them ONLY because the API does
+; not expose them; it is deliberately the smallest possible duplicate.
+;
+; ── Fallback ─────────────────────────────────────────────────────────────
+;
+; Anything outside the declared domain returns a refusal and the caller keeps
+; the untouched lazy spelling: unknown/effectful/shared/lazy-provider collection,
+; partial or raising predicate, captured free variable (the central optimizer's
+; own deferred "immutable captures" domain), keyword/map/native predicate,
+; unproven `filter` resolution, or a non-`first`/`filter` expression.
+
+(ns research.structural.consumer
+  (:require [anf :as a]
+            [lower :as l]
+            [system.ir :as ir]
+            [system.footprint :as fp]))
+
+(def rt :Elixir.BeamLisp.Ns.Rt)
+(def core-mod :Elixir.BeamLisp.Ns.Core)
+
+(defn version [] "consumer-spike-1")
+
+;; ── node helpers (map shapes only; this is not a walker) ─────────────────
+
+(defn- op? [n k] (and (map? n) (= k (:op n))))
+
+(defn- remote? [n mod fun]
+  (and (op? n :remote) (= mod (:mod n)) (= fun (:fun n))))
+
+(defn- unpack-list
+  "A `:cons`/`:enil` list value node as a bl list of nodes, or nil."
+  [n]
+  (cond
+    (op? n :enil) (list)
+    (op? n :cons) (let [t (unpack-list (:tail n))]
+                    (when (some? t) (cons (:head n) t)))
+    :else nil))
+
+;; ── the candidate shape: (first (filter pred coll)) ──────────────────────
+;;
+;; `first` is linked (`:both`) so it compiles to a direct `rt/first`; `filter`
+;; is value-only so it compiles to `rt/invoke(global "filter", [pred coll])`.
+;; Both spellings are recognized; only the direct one is self-proving.
+
+(defn first-of-filter
+  "The `{:pred :coll :filter-resolved?}` a compiled `(first (filter p c))`
+   expression names, else nil. `:filter-resolved?` is true only for a direct
+   `rt/filter` call; the ordinary `RT.invoke(core/filter, …)` spelling is
+   recognized but its resolution to the core lazy filter is not proven here."
+  [n]
+  (when (and (remote? n rt :first) (= 1 (count (:args n))))
+    (let [inner (first (:args n))]
+      (cond
+        (and (remote? inner rt :filter) (= 2 (count (:args inner))))
+          {:pred (first (:args inner))
+           :coll (second (:args inner))
+           :filter-resolved? true}
+
+        (and (remote? inner rt :invoke) (= 2 (count (:args inner))))
+          (let [f (first (:args inner)) xs (unpack-list (second (:args inner)))]
+            (when (and (op? f :global) (= "filter" (:name f))
+                       (some? xs) (= 2 (count xs)))
+              {:pred (first xs) :coll (second xs) :filter-resolved? false}))
+
+        :else nil))))
+
+;; ── declared collection domain: materialized finite literals ─────────────
+
+(defn- simple-lit? [v]
+  (or (int? v) (float? v) (string? v) (keyword? v)
+      (= true v) (= false v) (nil? v)))
+
+(defn- literal-list?
+  "A quoted literal list (a `:lit` carrying a list), or a `:cons`/`:enil` chain
+   of simple literals."
+  [n]
+  (cond
+    (op? n :enil) true
+    (op? n :cons) (and (op? (:head n) :lit) (simple-lit? (:val (:head n)))
+                       (literal-list? (:tail n)))
+    (op? n :lit) (and (erlang/is_list (:val n)) (every? simple-lit? (:val n)))
+    :else false))
+
+(defn- seq-shape?
+  "`(lists/seq i j)` over integer literals, totality aside."
+  [n]
+  (and (remote? n :lists :seq) (= 2 (count (:args n)))
+       (every? (fn [x] (and (op? x :lit) (int? (:val x)))) (:args n))))
+
+(defn- seq-call?
+  "`(lists/seq i j)` over integer literals — Erlang's finite list, admitted only
+   when `i =< j`, so the call is TOTAL (non-raising) over the declared domain.
+   A literal range that runs backwards (`i > j`) is not admitted: `lists:seq/2`
+   raises for it, so treating it as a materialized value list would let a
+   raising source through disguised as data."
+  [n]
+  (and (seq-shape? n)
+       (let [iv (:val (first (:args n))) jv (:val (second (:args n)))]
+         (<= iv jv))))
+
+(defn- materialized? [n] (or (literal-list? n) (seq-call? n)))
+
+;; ── declared predicate domain: total, effect-free, non-raising ───────────
+
+(defn- fn-value-node
+  "The INNER `:fn` node of a compiled fn VALUE, or nil when `p` is not a bare
+   single fixed-arity fn value. The compiler emits EVERY fn through the
+   self-application scaffold `(let self (fn [self] INNER) (self self))`
+   (compiler.bl `self-apply`), so a source `(fn [x] …)` reaches the adapter as
+   a `:let`, not a `:fn` — the previous bare-`:fn` assumption made every
+   supported predicate read as not-total. A hand-built `:fn` (no scaffold) and
+   a scaffolded fn both unwrap to their inner `:fn`; a `$blfn` dispatch tuple
+   (multi-arity/variadic) does not."
+  [p]
+  (cond
+    (op? p :fn) p
+    (and (ir/self-scaffold? p) (op? (ir/scaffold-inner p) :fn)) (ir/scaffold-inner p)
+    :else nil))
+
+(defn- clause-only
+  "The single plain-parameter clause of a literal single-arity `:fn` value
+   (scaffolded or bare), or nil."
+  [p]
+  (let [f (fn-value-node p)]
+    (when (and (some? f) (= 1 (count (:clauses f))))
+      (let [cl (first (:clauses f)) pats (:pats cl)]
+        (when (and (nil? (:guard cl)) (= 1 (count pats))
+                   (map? (first pats)) (= :pvar (:pop (first pats)))
+                   (not= "_" (:name (first pats))))
+          {:fn f :clause cl :param (:name (first pats))})))))
+
+(defn- cmp-op? [n]
+  (and (op? n :arith) (contains? #{:lt :gt :le :ge :num_eq} (:fun n))
+       (= 2 (count (:args n)))))
+
+(defn- total-term?
+  "Total, effect-free, non-raising over the declared elements. `bound` tracks
+   the locals the `and`/`or` macros introduce; the parameter itself is allowed.
+   `BeamLisp.Num` ordering is total term order for non-decimal operands, and
+   `simple-lit?` excludes decimals, so no comparison can raise."
+  [n param bound]
+  (cond
+    (op? n :lit) (simple-lit? (:val n))
+    (op? n :var) (or (= param (:name n)) (contains? bound (:name n)))
+    (cmp-op? n) (every? (fn [x] (total-term? x param bound)) (:args n))
+    (op? n :if) (and (total-term? (:test n) param bound)
+                     (total-term? (:then n) param bound)
+                     (total-term? (:else n) param bound))
+    (op? n :let) (and (total-term? (:init n) param bound)
+                      (total-term? (:body n) param (conj bound (:name n))))
+    ;; Strict Erlang boolean BIFs raise on non-booleans. The declared source
+    ;; domain also contains integers/nil, so purity alone cannot admit them.
+    ;; BL and/or macros use the checked if/let cases above instead.
+    :else false))
+
+(defn- pure-pred?
+  "The predicate is in the total grammar AND the footprint engine sees no
+   effect in its clause bodies. Two independent checks: a grammar proof and an
+   effect proof (the same `system.footprint` the central pass consumes)."
+  [p]
+  (let [c (clause-only p)]
+    (and (some? c)
+         (total-term? (:body (:clause c)) (:param c) #{})
+         (fp/pure? (fp/fp-fn-body (:fn c))))))
+
+;; ── eligibility ──────────────────────────────────────────────────────────
+
+(defn eligible?
+  "`{:ok true :spec …}` or `{:ok false :refused reason}`. `candidate` is
+   `{:expr <compiled expression node> :resolved? bool}`; `:resolved?` is the
+   caller's proof that the site's `filter` is the core lazy filter when the
+   shape is the `RT.invoke` spelling."
+  [candidate]
+  (let [spec (first-of-filter (:expr candidate))]
+    (cond
+      (nil? spec) {:ok false :refused :not-a-first-of-filter}
+      (and (not (:filter-resolved? spec)) (not (= true (:resolved? candidate))))
+        {:ok false :refused :filter-resolution-unproven}
+      (not (materialized? (:coll spec)))
+        (if (seq-shape? (:coll spec))
+          {:ok false :refused :collection-range-not-total}
+          {:ok false :refused :collection-not-materialized})
+      (not (pure-pred? (:pred spec))) {:ok false :refused :predicate-not-total-effect-free}
+      :else {:ok true :spec spec})))
+
+;; ── the lowering: the existing halting fold ──────────────────────────────
+
+(defn- halting-fold
+  "`(rt/k-reduce (fn [acc el] (if (pred el) (rt/reduced el) acc)) nil coll)`.
+   The step tests `pred` for the HALT decision and returns the ELEMENT as the
+   payload, so a matched `false`/`nil` is preserved (unlike a selector fold)."
+  [pred coll]
+  (let [step {:op :fn
+              :clauses (list
+                         (a/clause (list (a/pvar "acc") (a/pvar "el")) nil
+                           (a/iff (a/app pred (list (a/var "el")))
+                                  (a/remote rt :reduced (list (a/var "el")))
+                                  (a/var "acc"))))
+              :ann {}}]
+    (a/remote rt :k-reduce (list step (a/lit nil) coll))))
+
+(defn lower
+  "Lower an eligible candidate, or refuse. Returns
+   `{:lowered node :evidence {:rule :first-filter-halting-fold …}}`
+   or `{:refused reason}`."
+  [candidate]
+  (let [e (eligible? candidate)]
+    (if (:ok e)
+      (let [spec (:spec e)]
+        {:lowered (halting-fold (:pred spec) (:coll spec))
+         :evidence
+         {:rule :first-filter-halting-fold
+          :law :halting-scan-equals-lazy-first-filter
+          :conditions
+          {:collection :materialized-literal-list
+           :predicate :total-effect-free-stable
+           :resolution (if (:filter-resolved? spec)
+                         :direct-rt-filter
+                         :declared-core-filter-resolution)
+           :order :sequential-left-to-right
+           :halt :first-truthy-predicate
+           :result :first-matching-element-or-nil}
+          :authority :research-adapter
+          :version (version)}})
+      {:refused (:refused e)})))
+
+;; ── the negative control: the plausible-but-wrong `some` lowering ─────────
+
+(defn naive-lower
+  "NEGATIVE CONTROL ONLY. `(some (fn [e] (if (pred e) e nil)) coll)`: `some`
+   treats a false/nil SELECTOR result as no match, so it returns nil when the
+   first matching element is `false`. Kept executable so the spike can exhibit
+   the witness (a `false` match) rather than assert it in prose."
+  [candidate]
+  (let [spec (first-of-filter (:expr candidate))]
+    (when (some? spec)
+      (let [sel {:op :fn
+                 :clauses (list
+                            (a/clause (list (a/pvar "e")) nil
+                              (a/iff (a/app (:pred spec) (list (a/var "e")))
+                                     (a/var "e")
+                                     (a/lit nil))))
+                 :ann {}}]
+        (a/remote core-mod :some (list sel (:coll spec)))))))
+
+;; ── the work / reduction experiment ──────────────────────────────────────
+;;
+;; Compile one module per variant, load it once, run it `n` times, and report
+;; the LAST run's reductions and wall time — so the measured reductions are
+;; execution, not the one-off compilation of the eval module. The lowered form
+;; is built even for a predicate outside the declared domain: this is a WORK
+;; instrument, not a correctness claim (correctness is the parity test).
+
+(defn- load-node [node]
+  (let [mname (erlang/binary_to_atom
+                (str "Elixir.Research.Structural.ConsumerM."
+                     (erlang/unique_integer (list :positive))))
+        desc (a/module mname
+               (list {:op :defn-clause :fname :run :params (list)
+                      :guard nil :body node :ann {}})
+               (list [:run 0]) (list))
+        pair (l/descriptor->beam desc)]
+    (code/load_binary (elem pair 0)
+                      (erlang/binary_to_list (str (elem pair 0) ".beam"))
+                      (elem pair 1))
+    (elem pair 0)))
+
+(defn- timed-runs [node n]
+  (let [mod (load-node node)]
+    (loop [i 0 last nil total 0]
+      (if (>= i n)
+        {:value (:value last) :reductions (:reductions last)
+         :total-reductions total :micros (:micros last) :runs n}
+        (let [r0 (elem (erlang/process_info (erlang/self) :reductions) 1)
+              t0 (erlang/monotonic_time :microsecond)
+              v (erlang/apply mod :run (list))
+              t1 (erlang/monotonic_time :microsecond)
+              r1 (elem (erlang/process_info (erlang/self) :reductions) 1)
+              r {:value v :reductions (erlang/- r1 r0) :micros (erlang/- t1 t0)}]
+          (recur (erlang/+ i 1) r (erlang/+ total (:reductions r))))))))
+
+(defn measure
+  "Run `node` (the baseline expression) and its candidate lowering `n` times
+   each; return `{:baseline {:value :reductions :total-reductions :micros :runs}
+   :lowered …}` or `{:refused :not-a-first-of-filter}`. Reductions are the
+   process's own counter around a single pre-compiled `run/0` invocation."
+  [node n]
+  (let [spec (first-of-filter node)]
+    (if (nil? spec)
+      {:refused :not-a-first-of-filter}
+      {:baseline (timed-runs node n)
+       :lowered  (timed-runs (halting-fold (:pred spec) (:coll spec)) n)})))
+
+;; ── the orchestrator report ───────────────────────────────────────────────
+;;
+;; One exported entry point that runs the whole admission decision AND the
+;; matched baseline/lowered workload, and carries the negative `some` witness.
+;; It adds no rule, no default and no central mutation: everything it reports
+;; comes from `eligible?`, `lower`, `measure` and `naive-lower` above.
+
+(defn report
+  "A structured report for one compiled expression `node`.
+
+   `n` timed runs per variant (default 5). Returns:
+     {:eligible bool        ; the admission decision
+      :refused  reason|nil  ; why, on a refusal
+      :rule     keyword|nil ; :first-filter-halting-fold when admitted
+      :conditions map|nil   ; the evidence's conditions
+      :lowered  node|nil    ; the emitted halting fold
+      :naive    node|nil    ; the plausible-but-wrong `some` control
+      :metrics  {...}|nil   ; matched baseline vs lowered runs
+      :authority :research-adapter :version …}
+
+   `:authority` is this research adapter, never a shipped optimizer rule — the
+   report is evidence for a promotion decision, not one."
+  ([node] (report node 5))
+  ([node n]
+   (let [candidate {:expr node :resolved? true}
+         e (eligible? candidate)
+         r (lower candidate)
+         m (when (:ok e) (measure node n))]
+     {:eligible (:ok e)
+      :refused (or (:refused r) (:refused e))
+      :rule (get-in r [:evidence :rule])
+      :conditions (get-in r [:evidence :conditions])
+      :lowered (:lowered r)
+      :naive (naive-lower candidate)
+      :metrics (when (some? m)
+                 {:baseline (:baseline m)
+                  :lowered-run (:lowered m)})
+      :authority :research-adapter
+      :version (version)})))

@@ -1,0 +1,396 @@
+; dependencies_test.bl — the dependency-certificate / live-relevance spike.
+;
+; Run (from the worktree root; one capped VM — see research/structural/README.md):
+;
+;   systemd-run --user --collect --wait --pipe --working-directory="$PWD" \
+;     --setenv=BL_DAEMON=off \
+;     --property=MemoryMax=8G --property=MemorySwapMax=2G \
+;     --property=RuntimeMaxSec=1200 \
+;     ./bin/bl --cold test -p . research/structural/dependencies_test.bl
+;
+; The load-bearing claims, each a deftest:
+;   1. an empty (negative) read is a dependency; a rows-inferred / attrs-only
+;      plan reuses a stale answer after an insert (the negative control);
+;   2. cross-store certificates never compare equal;
+;   3. an ACL source expires at its EXACT millisecond;
+;   4. a whole-basis observation invalidates on an unrelated write;
+;   5. an inferred / incomplete / hand-forged certificate can never justify
+;      reuse and makes every commit relevant;
+;   6. a queued [relevant, irrelevant] commit batch MUST render, and the
+;      last-commit-only design answers false (the queued-commit negative
+;      control);
+;   7. an actual multi-column projection: an unrelated write costs ZERO column
+;      reads, a relevant write rebuilds (measured at the store);
+;   8. HARDENING (adversarial): a changed plan rebuilds; a NESTED provider ACL
+;      expires; a stale/racing db is refused and never poisons the current
+;      cache; malformed plans/certificates and a copied-nonce forgery fail
+;      closed without throwing.
+;
+; The veritas/z3 section states the ABSTRACT design theorem over a bounded
+; boolean domain; the runtime tests are the concrete instances.
+
+(ns research.structural.dependencies-test
+  (:require [research.structural.dependencies :as dep]
+            [datom]
+            [datom.conn]
+            [datom.db]
+            [datom.profile]
+            [datom.store-ets]
+            [veritas :as v]
+            [z3]))
+
+(def schema
+  [{:db/ident :p/name  :db/valueType :db.type/string}
+   {:db/ident :p/score :db/valueType :db.type/long}
+   {:db/ident :p/tag   :db/valueType :db.type/string}
+   {:db/ident :p/audit :db/valueType :db.type/string}
+   {:db/ident :p/alias :db/valueType :db.type/string}])
+
+(def port (z3/open))
+
+(defn- fixture
+  "A fresh, counted connection with six scored entities."
+  []
+  (let [ps (datom.profile/watch (datom.store-ets/open))
+        c  (datom.conn/connect-with ps schema)]
+    (datom/transact! c (mapv (fn [i]
+                               {:db/id (- 0 (+ i 1))
+                                :p/name (str "n" i)
+                                :p/score i
+                                :p/tag (str "t" i)})
+                             (range 6)))
+    [c ps]))
+
+(defn- rows [ps] (get (datom.profile/counters ps) :rows 0))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 1. THE READ DSL AND THE ENFORCED COMPLETE FLAG
+; ═══════════════════════════════════════════════════════════════════════
+
+(deftest supported-reads-yield-a-complete-certificate
+  (let [[c ps] (fixture)
+        cert (dep/capture ps (datom/db c)
+                          [(dep/store-read)
+                           (dep/attr-read :p/name)
+                           (dep/empty-read :p/alias)
+                           (dep/basis-read)
+                           (dep/acl-read :doc/read 100000 [:acl/read])
+                           (dep/provider-read :rel/x [(dep/attr-read :p/score)])])]
+    (is (= true (:complete? cert)))
+    (is (= true (dep/usable? cert 0)))))
+
+(deftest inferred-reads-make-the-certificate-incomplete
+  (let [[c ps] (fixture)
+        bad (dep/capture ps (datom/db c) [(dep/inferred-read "(arbitrary code)")])
+        forged {:cert/source :capture :complete? true :reads [] :pinned 0 :tokens #{}}]
+    (is (= false (:complete? bad)))
+    (is (= false (dep/usable? bad 0)) "incomplete never justifies reuse")
+    (is (= false (dep/usable? forged 0)) "hand-built map lacks the process nonce")
+    (is (= false (dep/reusable? bad (dep/recheck ps (datom/db c) bad) 0)))
+    (is (= true (dep/commit-relevant? bad (dep/commit ps #{:p/name} 1)))
+        "an incomplete certificate makes every commit relevant")))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 2. NEGATIVE CONTROL — the empty read the naive plan never records
+; ═══════════════════════════════════════════════════════════════════════
+
+(deftest naive-attrs-only-reuses-a-stale-answer-after-an-insert
+  (let [[c ps] (fixture)
+        db (datom/db c)
+        plan [(dep/attr-read :p/name)
+              (dep/attr-read :p/score)
+              (dep/empty-read :p/alias)]
+        now 0
+        cert (dep/capture ps db plan)
+        naive-plan (dep/naive-reads plan)
+        naive-cert (dep/capture ps db naive-plan)]
+    ; nothing has written :p/alias yet, so the negative read is still valid
+    (is (= true (dep/usable? cert now)))
+    ; now insert the value the negative read asserted absent
+    (datom/transact! c [{:db/id -99 :p/alias "a"}])
+    (let [fresh (dep/recheck ps (datom/db c) cert)
+          nfresh (dep/recheck ps (datom/db c) naive-cert)]
+      (is (= true (contains? (dep/changed-facets cert fresh now) :empty))
+          "the negative read moved")
+      (is (= true (dep/recompute? cert fresh now)) "candidate recomputes")
+      (is (= false (dep/naive-recompute? cert fresh now))
+          "attrs-only plan misses the negative-read facet")
+      (is (= false (dep/reusable? cert fresh now)))
+      (is (= true (dep/reusable? naive-cert nfresh now))
+          "the naive PLAN (no :empty read) wrongly reuses"))))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 3. CROSS-STORE, ACL EXPIRY, BASIS
+; ═══════════════════════════════════════════════════════════════════════
+
+(deftest cross-store-certificates-never-compare-equal
+  (let [[c1 ps1] (fixture)
+        [c2 ps2] (fixture)
+        plan [(dep/store-read) (dep/attr-read :p/name)]
+        cert (dep/capture ps1 (datom/db c1) plan)
+        cross (dep/recheck ps2 (datom/db c2) cert)]
+    (is (= false (dep/reusable? cert cross 0)))
+    (is (= true (contains? (dep/changed-facets cert cross 0) :store)))))
+
+(deftest acl-source-expires-at-its-exact-millisecond
+  (let [[c ps] (fixture)
+        cert (dep/capture ps (datom/db c) [(dep/acl-read :doc/read 1000 [:acl/read])])]
+    (is (= true (dep/reusable? cert (dep/recheck ps (datom/db c) cert) 999)))
+    (is (= false (dep/reusable? cert (dep/recheck ps (datom/db c) cert) 1000)))
+    (is (= true (contains? (dep/changed-facets cert (dep/recheck ps (datom/db c) cert) 1000) :acl)))))
+
+(deftest basis-observation-invalidates-on-any-write
+  (let [[c ps] (fixture)
+        cert (dep/capture ps (datom/db c) [(dep/basis-read)])]
+    (datom/transact! c [{:db/id -99 :p/audit "x"}])
+    (let [fresh (dep/recheck ps (datom/db c) cert)]
+      (is (= false (dep/reusable? cert fresh 0)))
+      (is (= true (contains? (dep/changed-facets cert fresh 0) :basis))))))
+
+(deftest provider-footprint-is-a-dependency
+  (let [[c ps] (fixture)
+        cert (dep/capture ps (datom/db c)
+                          [(dep/provider-read :rel/x [(dep/attr-read :p/score)
+                                                      (dep/attr-read :p/tag)])])]
+    (datom/transact! c [{:db/id -99 :p/tag "changed"}])
+    (let [fresh (dep/recheck ps (datom/db c) cert)]
+      (is (= true (dep/recompute? cert fresh 0)))
+      (is (= true (contains? (dep/changed-facets cert fresh 0) :provider))))))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 4. LIVE RELEVANCE — the queued relevant-then-irrelevant commit
+; ═══════════════════════════════════════════════════════════════════════
+
+(deftest queued-relevant-then-irrelevant-must-render
+  (let [[c ps] (fixture)
+        cert (dep/capture ps (datom/db c) [(dep/attr-read :p/score)])
+        now 0
+        relevant   (dep/commit ps #{:p/score} 9)
+        irrelevant (dep/commit ps #{:p/audit} 10)
+        batch [relevant irrelevant]]
+    (is (= false (dep/naive-last-required? cert batch now))
+        "last-only skips because the LAST commit is irrelevant")
+    (is (= true (dep/batch-required? cert batch now))
+        "candidate renders because an EARLIER commit is relevant")
+    (is (= [relevant] (dep/relevant-commits cert batch)))))
+
+(deftest unknown-commit-is-always-relevant
+  (let [[c ps] (fixture)
+        cert (dep/capture ps (datom/db c) [(dep/attr-read :p/score)])]
+    (is (= true (dep/commit-relevant? cert (dep/unknown-commit ps 11))))
+    (is (= true (dep/batch-required? cert [(dep/unknown-commit ps 11)] 0)))))
+
+(deftest an-irrelevant-batch-may-be-skipped
+  (let [[c ps] (fixture)
+        cert (dep/capture ps (datom/db c) [(dep/attr-read :p/score)])
+        batch [(dep/commit ps #{:p/audit} 9) (dep/commit ps #{:p/tag} 10)]]
+    (is (= false (dep/batch-required? cert batch 0)))))
+
+(deftest another-store-commit-is-irrelevant
+  (let [[c1 ps1] (fixture)
+        [c2 ps2] (fixture)
+        cert (dep/capture ps1 (datom/db c1) [(dep/attr-read :p/score)])]
+    (is (= false (dep/commit-relevant? cert (dep/commit ps2 #{:p/score} 5))))))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 5. THE PROJECTION READ-COUNT ORACLE
+; ═══════════════════════════════════════════════════════════════════════
+
+(deftest unrelated-write-costs-zero-reads-relevant-write-rebuilds
+  (let [[c ps] (fixture)
+        attrs [:p/name :p/score :p/tag]
+        neg  [:p/alias]
+        now 0]
+    (datom.profile/reset! ps)
+    (let [r1 (dep/project nil ps (datom/db c) attrs neg now)
+          build-rows (rows ps)]
+      (is (= false (:reused? r1)))
+      (is (= 6 (count (:rows r1))))
+      (is (> build-rows 0) "the first build reads the columns")
+
+      ; an UNRELATED write (:p/audit is not in the plan). The counter is
+      ; zeroed AFTER the write, so it measures the PROJECTION's reads only.
+      (datom/transact! c [{:db/id -99 :p/audit "x"}])
+      (datom.profile/reset! ps)
+      (let [r2 (dep/project r1 ps (datom/db c) attrs neg now)]
+        (is (= true (:reused? r2)) "unrelated write reuses")
+        (is (= 0 (rows ps)) "and pays ZERO column reads")
+        (is (= (:rows r1) (:rows r2)))
+
+        ; a RELEVANT write (:p/score is in the plan)
+        (datom/transact! c [{:db/id -98 :p/score 42}])
+        (datom.profile/reset! ps)
+        (let [r3 (dep/project r2 ps (datom/db c) attrs neg now)]
+          (is (= false (:reused? r3)))
+          (is (> (rows ps) 0) "the relevant write rebuilds the projection")
+          (is (= 7 (count (:rows r3))))
+
+          ; the NEGATIVE read's column: writing it must rebuild too
+          (datom/transact! c [{:db/id -97 :p/alias "a"}])
+          (datom.profile/reset! ps)
+          (let [r4 (dep/project r3 ps (datom/db c) attrs neg now)]
+            (is (= false (:reused? r4)) "insert into the empty column invalidates")
+            (is (> (rows ps) 0))))))))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 6. HARDENING — adversarial cases the first pass missed
+; ═══════════════════════════════════════════════════════════════════════
+
+(deftest changed-plan-never-reuses
+  ; requirement 1: a cache keyed by a different projection must not be reused
+  (let [[c ps] (fixture)
+        db (datom/db c)
+        now 0
+        r1 (dep/project nil ps db [:p/name] [] now)
+        r2 (dep/project r1 ps db [:p/name :p/score] [] now)
+        r3 (dep/project r2 ps db [:p/name :p/score] [:p/alias] now)
+        r4 (dep/project r3 ps db [:p/name :p/score] [:p/alias] now)]
+    (is (= false (:reused? r2)) "a wider positive plan is a different plan")
+    (is (= false (:reused? r3)) "a different negative plan is a different plan")
+    (is (not= (set (:reads (:cert r1))) (set (:reads (:cert r2)))))
+    (is (= true (:reused? r4)) "an identical plan still reuses")))
+
+(deftest nested-provider-acl-expiry-is-honoured
+  ; requirement 2: expiry must be checked INSIDE a provider's nested plan
+  (let [[c ps] (fixture)
+        plan [(dep/provider-read :rel/y [(dep/acl-read :doc/read 1000 [:acl/read])])]
+        cert (dep/capture ps (datom/db c) plan)]
+    (is (= true (dep/usable? cert 999)))
+    (is (= false (dep/usable? cert 1000)) "a nested ACL expires too")
+    (is (= true (dep/reusable? cert (dep/recheck ps (datom/db c) cert) 999)))
+    (is (= false (dep/reusable? cert (dep/recheck ps (datom/db c) cert) 1000)))
+    (is (= true (contains? (dep/changed-facets cert (dep/recheck ps (datom/db c) cert) 1000)
+                           :acl)))))
+
+(deftest malformed-plans-and-certificates-fail-closed
+  ; requirement 3: reject malformed plan fields without throwing
+  (let [[c ps] (fixture)
+        db (datom/db c)
+        real (dep/capture ps db [(dep/attr-read :p/name)])
+        nonce (:nonce real)]
+    (doseq [plan [[(dep/attr-read 42)]
+                  [(dep/acl-read :k "soon" [:acl/read])]
+                  [{:kind :provider :id :r :reads :not-sequential}]
+                  [{:kind :provider :id :r :reads []}]
+                  [{:kind :provider :id :r :reads [{:kind :infer :src "x"}]}]
+                  []]]
+      (let [cert (dep/capture ps db plan)]
+        (is (= false (:complete? cert)))
+        (is (= false (dep/usable? cert 0)))))
+    ; malformed certificate maps: never throw, never justify reuse/relevance
+    (doseq [bad [{:cert/source :capture :nonce nonce :complete? true
+                  :reads [] :pinned 0 :tokens #{}}
+                 {:cert/source :capture :nonce nonce :complete? true
+                  :reads [(dep/attr-read :p/name)] :pinned 0 :tokens #{[:garbage]}}
+                 {:cert/source :capture :nonce nonce :complete? true
+                  :reads [(dep/attr-read :p/name)] :pinned 0 :tokens :not-a-coll}
+                 {:cert/source :capture :nonce nonce :complete? true
+                  :reads [(dep/inferred-read "x")] :pinned 0 :tokens #{[:whole 1]}}]]
+      (is (= false (dep/usable? bad 0)))
+      (is (= true (dep/commit-relevant? bad (dep/commit ps #{:p/name} 1)))))))
+
+(deftest store-token-relevance-is-store-scoped
+  ; the identity token cannot MOVE, but same-store commits stay conservative
+  (let [[c1 ps1] (fixture)
+        [c2 ps2] (fixture)
+        cert (dep/capture ps1 (datom/db c1) [(dep/store-read)])]
+    (is (= true (dep/commit-relevant? cert (dep/commit ps1 #{:p/audit} 1))))
+    (is (= false (dep/commit-relevant? cert (dep/commit ps2 #{:p/audit} 1))))))
+
+(deftest stale-db-after-a-relevant-write-never-poisons-the-current-cache
+  ; requirement 5: attr-basis marks are latest-store marks, so a certificate
+  ; captured against a stale db is refused and can never republish historical
+  ; rows under current marks.
+  (let [[c ps] (fixture)
+        attrs [:p/score]
+        stale-db (datom/db c)
+        now 0
+        r0 (dep/project nil ps stale-db attrs [] now)]
+    (datom/transact! c [{:db/id -99 :p/score 99}])
+    (let [r1 (dep/project r0 ps stale-db attrs [] now)]
+      (is (= false (:reused? r1)))
+      (is (= false (dep/usable? (:cert r1) now))
+          "a mark above the pinned basis refuses the certificate")
+      (let [r2 (dep/project r1 ps (datom/db c) attrs [] now)]
+        (is (= false (:reused? r2)) "the current world must rebuild, not reuse")
+        (is (= true (dep/usable? (:cert r2) now)))
+        (is (= 7 (count (:rows r2))))
+        (let [r3 (dep/project r2 ps (datom/db c) attrs [] now)]
+          (is (= true (:reused? r3)))
+          (is (= (:rows r2) (:rows r3))))))))
+
+(deftest a-forged-certificate-cannot-forge-a-reuse
+  ; requirement 4: the nonce is readable, so it is a boundary, not a signature.
+  ; A copied nonce plus a consistent-looking token set can pass the structural
+  ; check; it still cannot equal a GENUINE re-read, and an inconsistent forgery
+  ; is rejected without a throw.
+  (let [[c ps] (fixture)
+        db (datom/db c)
+        real (dep/capture ps db [(dep/attr-read :p/name)])
+        t0 (first (into [] (:tokens real)))
+        forged (assoc real :tokens #{[(get t0 0) (get t0 1) (get t0 2) 9999999999]})]
+    (is (= false (dep/reusable? forged (dep/recheck ps db forged) 0))
+        "a forged token set never equals a genuine re-read")
+    (is (= false (dep/usable? (assoc forged :tokens #{[:garbage]}) 0)))
+    (is (= false (dep/usable? (assoc forged :reads []) 0)))
+    (is (= false (dep/usable? (assoc forged :reads [(dep/inferred-read "x")]) 0)))))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 7. LOGIC — the abstract theorem over the stated bounded domain
+; ═══════════════════════════════════════════════════════════════════════
+;
+; Domain: 2 booleans (the two queued commits' relevance) for the live theorem,
+; and 6 booleans (one per dependency facet: d_0 = attr, d_1 = store,
+; d_2 = empty, d_3 = acl, d_4 = provider, d_5 = basis) for the cache theorem.
+; z3 decides; a finite Bool domain also exhausts, so :proven is real either way.
+
+(defn- pair-of-bools []
+  (v/tuple-of (v/bool-of) (v/bool-of)))
+
+(defn- six-facets []
+  (v/tuple-of (v/bool-of) (v/bool-of) (v/bool-of)
+              (v/bool-of) (v/bool-of) (v/bool-of)))
+
+(defn- seven-facets []
+  (v/tuple-of (v/bool-of) (v/bool-of) (v/bool-of)
+              (v/bool-of) (v/bool-of) (v/bool-of) (v/bool-of)))
+
+(deftest logic-naive-last-only-strands-a-relevant-earlier-commit
+  (let [r (v/exists port "q" (pair-of-bools) '(and (not q_1) q_0))]
+    (is (= :proven (:modality r)))
+    (is (contains? #{:oracle :enumerate} (:engine r)))))
+
+(deftest logic-candidate-covers-the-stranding-state
+  (let [r (v/for-all port "q" (pair-of-bools)
+            '(or (not (and (not q_1) q_0)) (or q_0 q_1)))]
+    (is (= :proven (:modality r)))))
+
+(deftest logic-candidate-never-loses-a-last-relevant-commit
+  (let [r (v/for-all port "q" (pair-of-bools)
+            '(or (not q_1) (or q_0 q_1)))]
+    (is (= :proven (:modality r)))))
+
+(deftest logic-naive-attrs-only-drops-an-ignored-facet
+  (let [r (v/exists port "d" (six-facets)
+            '(and (not d_0) (or d_1 d_2 d_3 d_4 d_5)))]
+    (is (= :proven (:modality r)))))
+
+(deftest logic-candidate-recomputes-on-every-ignored-facet
+  (let [r (v/for-all port "d" (six-facets)
+            '(or (not (or d_1 d_2 d_3 d_4 d_5))
+                 (or d_0 d_1 d_2 d_3 d_4 d_5)))]
+    (is (= :proven (:modality r)))))
+
+(deftest logic-unknown-always-renders
+  (let [r (v/for-all port "d" (seven-facets)
+            '(or (not d_6)
+                 (or d_0 d_1 d_2 d_3 d_4 d_5 d_6)))]
+    (is (= :proven (:modality r)))))
+
+(deftest logic-finite-facet-enumeration-has-a-non-attr-member
+  (let [r (v/exists port "f" (v/one-of :store :empty :acl :provider :basis)
+            '(not (= f :store)))]
+    (is (= :proven (:modality r)))
+    (is (= :enumerate (:engine r)))))
+
+; Executed by the bl test runner after all tests are registered.
