@@ -286,7 +286,7 @@ fn vector_items<'a>(items: Term<'a>) -> Result<Vec<Term<'a>>, &'static str> {
         return Err("invalid vector tail length");
     }
     let tree_count = count - tail.len();
-    if tree_count % 32 != 0 {
+    if tree_count % 32 != 0 || ((tree_count - 1) >> shift) >= 32 {
         return Err("invalid vector tree length");
     }
     // Grow only as validated leaves arrive; a malformed count cannot request an
