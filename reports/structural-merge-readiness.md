@@ -64,6 +64,12 @@ Main's ordered sweep also fails its old durable corpus fixtures that acquire a s
 
 The preparation commits corrected merged source, permanent tests, coherent seed and these receipts. The verified source snapshot is based on `b5e63edb`. During verification main advanced to `4ff1a2e7` through three live/UI commits; these do not overlap the corrected source paths. A follow-on compatibility merge and live/UI gate refresh is recorded below. Main source and unrelated working state are not overwritten. All owned capped services and review workers have exited; diagnostic probes are retained separately, not installed as application APIs. Deferred FUP-155/158/159/160/161 remain open.
 
+## Latest main compatibility refresh
+
+After verified snapshot commit `53894592`, preparation incorporates main `4ff1a2e736c1bebae523c30bbf830e3bfed2b0e6` (three additional live/UI commits). No source conflict or bootstrap-source change occurs. The floor checks current across 79 namespaces again. `artifact://1598ead9f02e4261/main/bash/582.txt` is green: **8 files, 1,213 assertions, zero failures/incoherent** — live app-context21, diff397, projection17, socket118, app3, optimizer174, lifetime32 and kernel451. Runtime34.817s, peak313.2M, zero swap.
+
+The five live files add 556 unique assertions to the selected25-file receipt: **30 selected files, 3,751 passing assertions across split receipts**. The separate final JSON/exception-kind diagnostics add coverage but are not counted in that selected total. Latest first/filter fixture is1,100,808 →90,717 reductions/200 calls,976 →1,208 bytes,46,819 →72,902 caller compilation reductions; preceding fixture table remains explicitly tied to artifact576. These fixture spreads are not an app/UI speed claim. Main is still not merged or deployed by this branch.
+
 ## Reproduction
 
 Run checkout `./bin/bl`, not the installed drop, with `BL_DAEMON=off`. Inspect `scripts/bl-mem` before each VM, serialize the runs, and use memory/swap/runtime caps. Corrected host source requires the current coherent seed before test results can certify this image.

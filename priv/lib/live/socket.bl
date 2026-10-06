@@ -32,6 +32,7 @@
 
 (ns live.socket
   (:require [live.hiccup :as hiccup]
+            [live.projection :as projection]
             [live.diff :as diff]
             [datom]
             [datom.store-ets]
@@ -386,21 +387,6 @@
     (seqish? m) (first m)
     :else nil))
 
-(defn- commit-queued?
-  "Is another world-movement message ALREADY in this process's mailbox?
-
-   A burst of commits (an ingest writing a hundred datoms, an agent's turn, a
-   soak) otherwise costs one FULL projection per commit, and the viewer sees
-   every projection but the last. Rendering once for the burst — the newer
-   commit renders the state that already includes the older one, because the
-   db is READ at render time — is the difference between a page that answers
-   in milliseconds and one that answers in tens of seconds (measured: 28s of
-   queued renders on a live instance, which is what \"the socket is slow\"
-   looked like from the outside)."
-  []
-  (some (fn [m] (let [head (msg-head m)] (or (= head :datom/tx) (= head :datom/changed))))
-        (mailbox)))
-
 (defn- cast-body
   "The message inside a cast, if it is one.
 
@@ -414,52 +400,33 @@
     (erlang/element 2 m)
     m))
 
-(defn- assign-queued?
-  "Is another `:assign` for the SAME locals path ALREADY in this process's
-   mailbox?
+(defn- projection-message [m]
+  (let [head (msg-head m)]
+    (cond
+      (or (= head :datom/tx) (= head :datom/changed)) [:commit]
+      (= head :"$gen_cast")
+        (let [body (cast-body m)]
+          (if (= :event (msg-head body))
+            (let [ev (normalize-event (erlang/element 2 body))]
+              ;; Compound gestures may write, refuse, or read locals. Treat the
+              ;; whole gesture as a barrier instead of peeking into its steps.
+              (if (event-term? ev) ev [:barrier]))
+            [:barrier]))
+      :else [:barrier])))
 
-   A keystroke is an `:assign`, and each one re-renders. Typing a word fires N
-   of them, so the socket renders N times for values of which only the last is
-   ever seen — and when the view is expensive (knowledger's search bar ranks
-   the firm's whole corpus per render, measurably ~1 s) that is N full searches
-   for one word.
-
-   The payload goes through `normalize-event` — the same function the cast
-   handler will use on it — so this reads the event the socket is ABOUT to read,
-   not a guess at the wire shape (an event arrives as a vector with keywords
-   in-process, and as lists of strings off a JSON round trip).
-
-   Superseding is safe BY CONSTRUCTION, not by policy: the queued event writes
-   the same path, so the state IT renders is the newer one, and nothing reads
-   locals between events. The chain always ends: the last queued assign finds
-   the mailbox empty and renders."
-  [path]
-  (let [want (str path)]
-    ; FAILS SAFE: anything this cannot read is not a supersession, so the render
-    ; happens exactly as it did before this existed. Getting that wrong costs one
-    ; render; guessing a supersession that is not there would cost the user their
-    ; keystroke.
-    (try
-      (some (fn [m]
-              (let [body (cast-body m)]
-                (if (= :event (msg-head body))
-                  (let [ev (normalize-event (erlang/element 2 body))
-                        ; one event, or a vector of them (an :on-* may carry several)
-                        evs (if (and (vector? ev) (> (count ev) 0) (vector? (first ev)))
-                              ev
-                              [ev])]
-                    (some (fn [e]
-                            ; `get`, not `nth`: a vector here is the runtime's own
-                            ; struct, which is what every vector accessor in this
-                            ; codebase indexes with.
-                            (and (vector? e)
-                                 (= :assign (first e))
-                                 (> (count e) 1)
-                                 (= want (str (get e 1)))))
-                          evs))
-                  false)))
-            (mailbox))
-      (catch _ false))))
+(defn- projection-queued? [change]
+  ;; Stop as soon as the decision is known: never decode the whole mailbox,
+  ;; allocate an event vector, or walk lazy captures on the render hot path.
+  ;; Malformed envelopes fail closed: render rather than lose feedback.
+  (try
+    (loop [xs (seq (mailbox))]
+      (if (empty? xs)
+        false
+        (let [d (projection/decision change (projection-message (first xs)))]
+          (cond (= d :skip) true
+                (= d :scan) (recur (rest xs))
+                :else false))))
+    (catch _ false)))
 
 (defn listen-options
   "Live views may read arbitrary facts and bases from any observed world.
@@ -484,15 +451,17 @@
    seen: re-rendering would advance `:tree` past the client's DOM. The commit
    is a no-op; the next `attach` renders once and ships the whole delta.
 
-   A commit that is not the LAST of a burst is also a no-op (`commit-queued?`):
-   the newer one renders the same, newer state.
+   Asynchronous commits may defer to a queued commit or navigation before an
+   ordering barrier. Local events decide separately whether to coalesce;
+   synchronous calls and intent feedback always project immediately.
 
    Every observed commit must eventually render: the view can query any world,
    basis, or local outcome. A queued commit can safely subsume an earlier one
    only because its own handler is guaranteed to render."
-  [state]
+  ([state] (on-commit state true))
+  ([state coalesce?]
   (if (or (not (:attached? state))
-          (commit-queued?))
+          (and coalesce? (projection-queued? [:commit])))
     state
     (let [t0 (now-us)
           next (render state)
@@ -500,7 +469,7 @@
           ms (/ (- (now-us) t0) 1000.0)
           state2 (ship-css! (assoc state :tree next))]
       (when (seq ops) (push! state2 [:patch ops]))
-      (tap! state2 {:kind :commit :ops (into [] ops) :tree next :ms ms}))))
+      (tap! state2 {:kind :commit :ops (into [] ops) :tree next :ms ms})))))
 
 ;; ── an event fired ──────────────────────────────────────────────────
 
@@ -682,7 +651,9 @@
            s
            (let [e (first es)
                  ;; inner steps keep the fold's outcome (only a NEW gesture clears it)
-                 s2 (handle-event* (if (:tap s) (assoc s :last-event e) s) e event-data buffered?)]
+                 ;; A compound gesture is one ordering barrier. Do not let a
+                 ;; future wire event suppress feedback from its inner steps.
+                 s2 (handle-event* (if (:tap s) (assoc s :last-event e) s) e event-data false)]
              (if (and (= :intent (first e))
                       (or (:denied-last s2)
                           (= :noop (get-in s2 [:locals :live/outcome :status]))))
@@ -698,14 +669,16 @@
          ; event, so this render would be thrown away: the later event renders
          ; the newer value. Type a word into a search box and this is the
          ; difference between N searches and one.
-         (if (and buffered? (assign-queued? path))
+         (if (and buffered? (projection-queued? [:assign (local-path path)]))
            state2
-           (on-commit state2)))
+           (on-commit state2 false)))
 
      (= :navigate (first ev))
        (let [target (nth ev 1)
              state2 (assoc state :locals (assoc (:locals state) :route target))]
-         (on-commit state2))
+         (if (and buffered? (projection-queued? [:navigate]))
+           state2
+           (on-commit state2 false)))
 
      (= :intent (first ev))
        ;; the intent's payload is what the VIEW declared ([:intent :post {:room r}]),
@@ -732,7 +705,7 @@
                  st (if (and (:terminal result) key)
                       (push! st [:ack key])
                       st)]
-             (-> st on-commit (assoc :denied-last true)))
+             (assoc (on-commit st false) :denied-last true))
            ;; committed → the commit path renders everyone (with the outcome
            ;; already in locals); a no-op wrote nothing, so render here.
            ;; OFFLINE OUTBOX: when the gesture carried an idempotency key
@@ -745,7 +718,7 @@
            (let [st (with-outcome (:ok result) op (if (:committed result) :committed :noop) nil)
                  key (get payload :ev/id)
                  st (if key (push! st [:ack key]) st)]
-             (if (:committed result) st (on-commit st)))))
+             (if (:committed result) st (on-commit st false)))))
 
      :else (throw (str "live: unknown event " (pr-str ev)))))
 
