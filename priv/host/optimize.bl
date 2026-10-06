@@ -7,7 +7,7 @@
 ; Unknown callables, live providers and observable lazy ownership stay baseline.
 (ns host.optimize)
 
-(defn version [] "optimize-2")
+(defn version [] "optimize-3")
 (defn- runtime-module [] :Elixir.BeamLisp.Ns.Rt)
 
 (defn- map [f xs] (BeamLisp.CompilerData/eager_map f xs))
@@ -28,7 +28,8 @@
     {:rule :native-call :law :fixed-native-arity :proof :structural}
     {:rule :numeric-domain :law :non-map-numeric-dispatch :proof :domain}
     {:rule :integer-callback :law :integer-fold-invariant :proof :induction}
-    {:rule :strict-map-fold :law :total-map-fold-composition :proof :induction}))
+    {:rule :strict-map-fold :law :total-map-fold-composition :proof :induction}
+    {:rule :strict-first-filter :law :private-total-filter-first :proof :induction}))
 
 ; —— facts and scope ——————————————————————————————————————————————————————
 
@@ -134,6 +135,81 @@
                        (some? (expression-fuel (getv cl :body) 64))
                        (closed-int? (getv cl :body) env))
               {:fn f :clause cl :names names})))))))
+
+(defn- scalar-value? [v]
+  (or (erlang/is_integer v) (erlang/is_float v) (erlang/is_binary v)
+      (erlang/is_atom v)))
+
+(defn- arith-comparison?
+  "Prove the executable comparison BIF, with its canonical numeric-tower pair.
+   A label alone cannot establish totality; noncanonical arithmetic keeps its
+   reference form rather than gaining authority from either field alone."
+  [n]
+  (cond
+    (erlang/== :lt (getv n :fun)) (erlang/== :< (getv n :bif))
+    (erlang/== :gt (getv n :fun)) (erlang/== :> (getv n :bif))
+    (erlang/== :le (getv n :fun)) (erlang/== :"=<" (getv n :bif))
+    (erlang/== :ge (getv n :fun)) (erlang/== :>= (getv n :bif))
+    (erlang/== :num_eq (getv n :fun)) (erlang/== :== (getv n :bif))
+    :else false))
+
+(defn- comparison? [n]
+  (and (erlang/is_list (getv n :args)) (erlang/== 2 (erlang/length (getv n :args)))
+       (or (and (op? n :arith) (arith-comparison? n))
+           (and (op? n :remote) (erlang/== :erlang (getv n :mod))
+                (lists/member (getv n :fun) (list :< :> :"=<" :>= :== :"=:=" :"/=" :"=/="))))))
+
+(defn- predicate-fuel
+  "A total, effect-free scalar expression, with a bounded structural proof.
+   Only explicit parameters and locals are in scope. Strict boolean BIFs,
+   arithmetic over unknown scalar types, globals and captures remain unknown."
+  [n scope left]
+  (when (erlang/> left 0)
+    (cond
+      (op? n :lit) (when (scalar-value? (getv n :val)) (erlang/- left 1))
+      (op? n :var) (when (maps/is_key (getv n :name) scope) (erlang/- left 1))
+      (comparison? n)
+        (let [a (predicate-fuel (item (getv n :args) 0) scope (erlang/- left 1))]
+          (when (some? a) (predicate-fuel (item (getv n :args) 1) scope a)))
+      (op? n :if)
+        (let [t (predicate-fuel (getv n :test) scope (erlang/- left 1))
+              y (when (some? t) (predicate-fuel (getv n :then) scope t))]
+          (when (some? y) (predicate-fuel (getv n :else) scope y)))
+      (op? n :let)
+        (let [a (predicate-fuel (getv n :init) scope (erlang/- left 1))]
+          (when (some? a) (predicate-fuel (getv n :body) (put scope (getv n :name) true) a)))
+      :else nil)))
+
+(defn- total-predicate? [n]
+  (let [f (literal-fn n) cls (getv f :clauses)]
+    (when (and (some? f) (erlang/is_list cls) (erlang/== 1 (erlang/length cls)))
+      (let [cl (erlang/hd cls) pats (getv cl :pats)]
+        (and (nil? (getv cl :guard)) (erlang/== 1 (erlang/length pats))
+             (erlang/== :pvar (getv (erlang/hd pats) :pop))
+             (not (erlang/== "_" (getv (erlang/hd pats) :name)))
+             (some? (predicate-fuel (getv cl :body) {(getv (erlang/hd pats) :name) true} 64)))))))
+
+(defn- scalar-list? [xs left]
+  (cond
+    (erlang/== xs (list)) true
+    (erlang/=< left 0) false
+    (erlang/is_list xs) (and (scalar-value? (erlang/hd xs))
+                             (scalar-list? (erlang/tl xs) (erlang/- left 1)))
+    :else false))
+
+(defn- materialized-scalars? [n left]
+  (cond
+    (erlang/=< left 0) false
+    (op? n :enil) true
+    (op? n :lit) (scalar-list? (getv n :val) left)
+    (op? n :cons) (and (op? (getv n :head) :lit) (scalar-value? (getv (getv n :head) :val))
+                       (materialized-scalars? (getv n :tail) (erlang/- left 1)))
+    (and (call? n :lists :seq) (erlang/== 2 (erlang/length (getv n :args))))
+      (let [a (item (getv n :args) 0) b (item (getv n :args) 1)]
+        (and (op? a :lit) (op? b :lit)
+             (erlang/is_integer (getv a :val)) (erlang/is_integer (getv b :val))
+             (erlang/=< (getv a :val) (getv b :val))))
+    :else false))
 
 (defn- fact [n env]
   (cond
@@ -301,6 +377,53 @@
         (tuple name (put (put state :fresh (erlang/+ i 1)) :used-names
                          (put (getv state :used-names) name true)))))))
 
+(defn- first-filter-shape [n]
+  (when (and (call? n (runtime-module) :first) (erlang/== 1 (erlang/length (getv n :args))))
+    (let [inner (item (getv n :args) 0) args (getv inner :args)]
+      (cond
+        (and (call? inner (runtime-module) :filter) (erlang/== 2 (erlang/length args)))
+          {:predicate (item args 0) :source (item args 1)}
+        (and (call? inner (runtime-module) :invoke) (erlang/== 2 (erlang/length args)))
+          (let [f (item args 0) packed (unpack (item args 1)) xs (getv packed :args)]
+            (when (and (op? f :global) (erlang/== "filter" (getv f :name))
+                       (some? packed) (erlang/== 2 (erlang/length xs)))
+              {:callee f :predicate (item xs 0) :source (item xs 1)}))
+        :else nil))))
+
+(defn- first-filter-result
+  "One private total consumer. Capture the live callee BEFORE the packed args,
+   then preserve packed-cons order (source before predicate). Guard failure calls
+   the captured value: it never rereads a binding or repeats an argument."
+  [spec state]
+  (let [fp (argument-name state) cp (argument-name (elem fp 1)) pp (argument-name (elem cp 1))
+        ap (argument-name (elem pp 1)) xp (argument-name (elem ap 1))
+        f (BeamLisp.Ns.Anf/var (elem fp 0)) c (BeamLisp.Ns.Anf/var (elem cp 0))
+        p (BeamLisp.Ns.Anf/var (elem pp 0)) acc (BeamLisp.Ns.Anf/var (elem ap 0))
+        x (BeamLisp.Ns.Anf/var (elem xp 0))
+        step {:op :fn :ann {}
+              :clauses (list {:pats (list (BeamLisp.Ns.Anf/pvar (elem ap 0))
+                                         (BeamLisp.Ns.Anf/pvar (elem xp 0)))
+                              :guard nil
+                              :body {:op :if :test (BeamLisp.Ns.Anf/app p (list x))
+                                     :then (BeamLisp.Ns.Anf/remote (runtime-module) :reduced (list x))
+                                     :else acc :ann {}}})}
+        fused (BeamLisp.Ns.Anf/remote (runtime-module) :k-reduce (list step (BeamLisp.Ns.Anf/lit nil) c))
+        body (if (some? (getv spec :callee))
+               {:op :if :ann {}
+                :test (BeamLisp.Ns.Anf/remote (runtime-module) :core_filter_2? (list f))
+                :then fused
+                :else (BeamLisp.Ns.Anf/remote (runtime-module) :first
+                        (list (BeamLisp.Ns.Anf/remote (runtime-module) :invoke
+                                (list f {:op :cons :head p
+                                         :tail {:op :cons :head c :tail {:op :enil :ann {}} :ann {}}
+                                         :ann {}}))))}
+               fused)
+        bound (BeamLisp.Ns.Anf/lett (elem cp 0) (getv spec :source)
+                (BeamLisp.Ns.Anf/lett (elem pp 0) (getv spec :predicate) body))
+        result (if (some? (getv spec :callee))
+                 (BeamLisp.Ns.Anf/lett (elem fp 0) (getv spec :callee) bound) bound)]
+    (tuple result (elem xp 1))))
+
 (defn- ordered-apply
   "Preserve the backend's observed packed-cons order: tail before head.
    Core apply may schedule complex arguments differently, so bind them in
@@ -347,10 +470,28 @@
       (tuple n (refused state rule n :callback-inline-budget)))))
 
 (defn- rewrite [n env state mod]
-  (let [own (own-module n mod) numeric (numeric-domain n env)]
+  (let [own (own-module n mod) numeric (numeric-domain n env)
+        consumer (first-filter-shape n)]
     (cond
       (some? own) (tuple own (applied state :own-module n :own-literal-closure))
       (some? numeric) (tuple numeric (applied state :numeric-domain n :non-map-operands))
+      (some? consumer)
+        (cond
+          (not (materialized-scalars? (getv consumer :source) 128))
+            (tuple n (refused state :strict-first-filter n :source-domain-or-budget-unproven))
+          (not (total-predicate? (getv consumer :predicate)))
+            (tuple n (refused state :strict-first-filter n :predicate-totality-or-effects-unproven))
+          (erlang/< (getv state :inline-left) 64)
+            (tuple n (refused state :strict-first-filter n :callback-inline-budget))
+          :else
+            (let [r (first-filter-result consumer state)]
+              (tuple (put (elem r 0) :ann (getv n :ann))
+                     (applied (put (elem r 1) :inline-left (erlang/- (getv state :inline-left) 64))
+                       :strict-first-filter n
+                       {:domain :materialized-scalars :predicate :closed-total
+                        :ownership :immediate-single-consumer :resources :ordinary-heap
+                        :binding (if (some? (getv consumer :callee)) :captured-runtime-identity :direct-intrinsic)
+                        :order :callee-then-packed-arguments :halt :first-matching-element}))))
       (and (call? n (runtime-module) :invoke) (erlang/== 2 (erlang/length (getv n :args))))
         (let [args (getv n :args) f (item args 0) unpacked (unpack (item args 1))
               arity (getv (fact f env) :arity)]
