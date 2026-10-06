@@ -242,9 +242,7 @@ impl<'a> Serialize for TermSer<'a> {
                     // `items` is a TUPLE, and rustler's `Vec<T>` decoder reads only LISTS
                     // (`ListIterator`) — so a plain decode::<Vec<Term>> fails on EVERY
                     // Vector and surfaces as a bare ArgumentError with no hint why.
-                    let items = get_tuple(items).map_err(|_| {
-                        serde::ser::Error::custom("Vector items is not a tuple")
-                    })?;
+                    let items = vector_items(items).map_err(serde::ser::Error::custom)?;
                     let seq = s.serialize_seq(Some(items.len()))?;
                     return write_seq::<S>(seq, *self, items);
                 }
@@ -262,6 +260,56 @@ impl<'a> Serialize for TermSer<'a> {
             "term has no JSON representation in the native walk",
         ))
     }
+}
+
+/// Read logical vector elements, never serialize the persistent trie's storage.
+/// Legacy flat tuples remain valid, including five-element vectors beginning :bl_vec.
+fn vector_items<'a>(items: Term<'a>) -> Result<Vec<Term<'a>>, &'static str> {
+    let fields = get_tuple(items).map_err(|_| "Vector items is not a tuple")?;
+    let tagged = fields.len() == 5
+        && fields[0].atom_to_string().ok().as_deref() == Some("bl_vec")
+        && fields[1].decode::<u64>().map(|n| n > 32).unwrap_or(false);
+    if !tagged {
+        return Ok(fields);
+    }
+    let count = fields[1]
+        .decode::<usize>()
+        .map_err(|_| "invalid vector count")?;
+    let shift = fields[2]
+        .decode::<usize>()
+        .map_err(|_| "invalid vector shift")?;
+    if shift == 0 || shift % 5 != 0 || shift >= usize::BITS as usize {
+        return Err("invalid vector shift");
+    }
+    let tail = get_tuple(fields[4]).map_err(|_| "invalid vector tail")?;
+    if tail.is_empty() || tail.len() > 32 || tail.len() > count {
+        return Err("invalid vector tail length");
+    }
+    let tree_count = count - tail.len();
+    if tree_count % 32 != 0 {
+        return Err("invalid vector tree length");
+    }
+    // Grow only as validated leaves arrive; a malformed count cannot request an
+    // enormous allocation before the storage has been checked.
+    let mut result = Vec::new();
+    for index in (0..tree_count).step_by(32) {
+        let mut node = fields[3];
+        for step in (1..=shift / 5).rev() {
+            let level = step * 5;
+            let children = get_tuple(node).map_err(|_| "invalid vector branch")?;
+            if children.len() != 32 {
+                return Err("invalid vector branch width");
+            }
+            node = children[(index >> level) & 31];
+        }
+        let leaf = get_tuple(node).map_err(|_| "invalid vector leaf")?;
+        if leaf.len() != 32 {
+            return Err("invalid vector leaf width");
+        }
+        result.extend(leaf);
+    }
+    result.extend(tail);
+    Ok(result)
 }
 
 fn write_seq<'a, S: SerTrait>(
