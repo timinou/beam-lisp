@@ -1,0 +1,150 @@
+; Default checked first/filter fusion over ordinary compiled source.
+(ns optimizer.first-filter-test
+  (:require [optimize :as o] [anf :as a] [compiler :as c] [lower :as l]))
+
+(defn- descriptor [source]
+  (c/reset-fresh!)
+  (a/module
+    (erlang/binary_to_atom (str "Elixir.FirstFilter.Image" (erlang/unique_integer '( :positive ))))
+    (list {:op :defn-clause :fname :run :params (list) :guard nil :ann {}
+           :body (c/compile-node (BeamLisp.Reader/read_one source) (c/new-env "user"))})
+    (list [:run 0]) (list)))
+
+(defn- emission [m enabled]
+  ;; Distinct images keep reference apply/3 calls from observing a later
+  ;; optimized replacement under the same module atom.
+  (let [image (assoc m :name (erlang/binary_to_atom
+                             (str "Elixir.FirstFilter.Run" (erlang/unique_integer '( :positive )))))
+        before (elem (erlang/process_info (erlang/self) :reductions) 1)
+        pair (l/descriptor->beam image {:enabled? enabled})]
+    {:pair pair :caller-compile-reductions
+     (- (elem (erlang/process_info (erlang/self) :reductions) 1) before)}))
+
+(defn- executable [m enabled]
+  (let [pair (:pair (emission m enabled))]
+    (is (= (tuple :module (elem pair 0)) (code/load_binary (elem pair 0) '() (elem pair 1))))
+    (fn [] (erlang/apply (elem pair 0) :run '()))))
+
+(defn- outcome [f]
+  (try [:ok (f)] (catch-raw [kind reason stack] [kind reason])))
+
+(defn- same? [source]
+  (let [m (descriptor source)]
+    (= (outcome (executable m false)) (outcome (executable m true)))))
+
+(defn- used? [m]
+  (some (fn [entry] (= :strict-first-filter (:rule entry))) (:evidence (o/explain m))))
+
+(deftest normal-source-is-automatically-admitted
+  (doseq [[source value]
+          [["(first (filter (fn [x] (> x 3)) (lists/seq 0 1000)))" 4]
+           ["(first (filter (fn [x] (> x 2000)) (lists/seq 0 1000)))" nil]
+           ["(first (filter (fn [x] (< x 0)) (quote (3 -2 1))))" -2]
+           ["(first (filter (fn [x] true) (quote (false nil true))))" false]
+           ["(first (filter (fn [x] true) (quote (nil false true))))" nil]
+           ["(first (filter (fn [x] (and (> x 2) (< x 5))) (lists/seq 0 9)))" 3]]]
+    (let [m (descriptor source)]
+      (is (used? m) source)
+      (is (= [:ok value] (outcome (executable m true))))
+      (is (= (outcome (executable m false)) (outcome (executable m true)))))))
+
+(deftest uncertain-predicates-sources-and-ownership-keep-reference-behavior
+  (doseq [source
+          ["(first (filter (fn [x] (erlang/not x)) (quote (false 0))))"
+           "(first (filter (fn [x] (erlang/and x true)) (quote (true 0))))"
+           "(first (filter (fn [x] (/ 1 x)) (lists/seq 0 5)))"
+           "(let [threshold 3] (first (filter (fn [x] (> x threshold)) (lists/seq 0 5))))"
+           "(first (filter (fn [x] (> x 3)) (range 10)))"
+           "(let [xs (filter (fn [x] (> x 3)) (lists/seq 0 5))] [(first xs) xs])"
+           "(first (filter (fn [x] (> x 3)) (lists/seq 5 0)))"]]
+    (let [m (descriptor source)]
+      (is (not (used? m)) source)
+      (is (same? source) source))))
+
+(deftest rejected-effects-keep-the-same-observed-prefix
+  (let [source "(fn [mark] (first (filter (fn [x] (mark x)) (lists/seq 0 40))))"
+        m (descriptor source)
+        b ((executable m false)) e ((executable m true))
+        seen (atom []) mark (fn [x] (swap! seen conj x) (> x 3))
+        bv (b mark) prefix (deref seen)]
+    (reset! seen [])
+    (is (not (used? m)))
+    (is (= bv (e mark)))
+    (is (= prefix (deref seen)))
+    (is (> (count prefix) 5) "the observable lazy chunk is retained")))
+
+(deftest compiled-live-callee-is-not-frozen
+  (let [m (descriptor "(first (filter (fn [x] (> x 3)) (lists/seq 0 9)))")
+        b (executable m false) e (executable m true)
+        fork (BeamLisp.Env/fork)]
+    (is (used? m))
+    (try
+      (BeamLisp.Env/with_env fork
+        (fn []
+          (is (= 4 (e)))
+          (BeamLisp.Env/intern "core" "filter" (fn [p xs] '( :replacement )))
+          (is (= :replacement (b)))
+          (is (= :replacement (e)))
+          (BeamLisp.Env/intern "core" "filter" :not-callable)
+          (is (= (outcome b) (outcome e)))))
+      (finally (BeamLisp.Env/destroy fork)))))
+
+(deftest runtime-identity-guard-checks-the-selected-arity
+  (let [f (erlang/make_fun :Elixir.BeamLisp.Ns.Rt :filter 2)]
+    (is (BeamLisp.Ns.Rt/core_filter_2? f))
+    (is (BeamLisp.Ns.Rt/core_filter_2? (tuple :"$blfn" {2 f 1 :irrelevant} nil)))
+    (is (not (BeamLisp.Ns.Rt/core_filter_2? (tuple :"$blfn" {2 (fn [p xs] xs)} nil))))
+    (is (not (BeamLisp.Ns.Rt/core_filter_2? nil)))
+    (is (not (BeamLisp.Ns.Rt/core_filter_2? (tuple :"$blfn" :not-a-map nil))))))
+
+(deftest default-and-disabled-budget-paths-are-explicit
+  (let [m (descriptor "(first (filter (fn [x] (> x 3)) (lists/seq 0 1000)))")
+        disabled (o/explain m {:enabled? false})
+        limited (o/explain m {:max-nodes 32})]
+    (is (not-any? (fn [entry] (= :strict-first-filter (:rule entry))) (:evidence disabled)))
+    (is (= m (:descriptor disabled)))
+    (is (not-any? (fn [entry] (= :strict-first-filter (:rule entry))) (:evidence limited)))
+    (is (= 0 (:inlined-nodes (:stats limited))))))
+
+(defn- reductions [f n]
+  (let [before (elem (erlang/process_info (erlang/self) :reductions) 1)]
+    (doseq [_ (range n)] (f))
+    (- (elem (erlang/process_info (erlang/self) :reductions) 1) before)))
+
+(deftest the-full-guarded-default-path-saves-net-work
+  (let [m (descriptor "(first (filter (fn [x] (> x 3)) (lists/seq 0 1000)))")
+        b (executable m false) e (executable m true)]
+    (is (= 4 (b)))
+    (is (= 4 (e)))
+    (let [baseline (reductions b 200) optimized (reductions e 200)]
+      (println "first-filter-default" {:runs 200 :baseline baseline :optimized optimized})
+      (is (< optimized (* baseline 0.75)) "guard + fold beats the authoritative lazy path"))
+    (let [reference (emission m false) optimized (emission m true)
+          before (erlang/byte_size (elem (:pair reference) 1))
+          after (erlang/byte_size (elem (:pair optimized) 1))]
+      (println "first-filter-emission"
+        {:reference-bytes before :optimized-bytes after
+         :reference-caller-compile-reductions (:caller-compile-reductions reference)
+         :optimized-caller-compile-reductions (:caller-compile-reductions optimized)
+         :admission-stats (:stats (o/explain m))})
+      (is (< after (* before 3)) "guarded emission has bounded code growth"))))
+
+(deftest author-metadata-cannot-prove-an-unknown-predicate
+  (let [m (descriptor "(fn [p] (first (filter p (lists/seq 0 9))))")
+        claimed (update m :ann assoc :pure true :resolved? true :total true)]
+    (is (not (used? claimed)))
+    (is (= m (o/module m {:enabled? false})))))
+
+(deftest generated-consumers-share-the-descriptor-allowance
+  (let [expr "(first (filter (fn [x] (> x 3)) (lists/seq 0 9)))"
+        m (descriptor (str "(list " expr " " expr " " expr ")"))
+        r (o/explain m {:max-nodes 128})
+        rules (filter (fn [entry] (= :strict-first-filter (:rule entry))) (:evidence r))]
+    (is (<= (:inlined-nodes (:stats r)) 128))
+    (is (<= (count rules) 2))
+    (is (some? (a/validate-module! (:descriptor r))))))
+
+(deftest large-literals-retain-their-reference-form
+  (let [m (descriptor (str "(first (filter (fn [x] true) (quote ("
+                           (Enum/join (lists/duplicate 129 "1") " ") "))))"))]
+    (is (not (used? m)))))

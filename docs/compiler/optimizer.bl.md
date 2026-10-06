@@ -14,7 +14,7 @@ That returns a validated, optimized descriptor. AOT compilation, interactive eva
 
 Callbacks bound to names, and a mapped list bound to a name, are ordinary source. The optimizer sees through them.
 
-```clojure
+```beam-lisp
 (ns docs.compiler.optimizer
   (:require [optimize :as opt] [anf :as anf] [compiler :as compiler]))
 
@@ -37,6 +37,10 @@ Callbacks bound to names, and a mapped list bound to a name, are ordinary source
 
 (assert (some (fn [entry] (= :strict-map-fold (:rule entry))) (:evidence plan)))
 (assert (= (:descriptor plan) (opt/module (descriptor source))))
+```
+
+```bl-result descriptor
+nil
 ```
 
 `mapper` and `reducer` are aliases of closed integer callbacks. `mapped` has one use, the fold, so no one else can observe the list. The mapper then runs once per element inside the fold, in the same order, and the intermediate list is never built.
@@ -74,9 +78,44 @@ The mapper runs once per element and the left-fold order stays the same. The fus
 
 **Module identity.** A closure literal's module is the module being emitted. Standalone expression optimization keeps module identity unknown.
 
+## A private first match
+
+Write the ordinary expression:
+
+```beam-lisp
+(first (filter (fn [x] (> x 3)) (lists/seq 0 1000)))
+```
+
+```bl-result cell1
+4
+```
+
+`:strict-first-filter` turns an eligible immediate consumer into the existing
+halting kernel. The matching **element** is returned, including `false` and
+`nil`. No lazy intermediate is needed when its predicate is closed, total and
+effect-free over the established element domain.
+
+The supported sources are proper scalar literal lists and finite `lists/seq`
+ranges over ascending integer literals. Literal-list analysis is capped at
+128 elements; predicate analysis at 64 expression nodes. Predicates use scalar
+literals, their parameter, comparisons, `if` and local `let` bindings. Unknown
+helpers, captured variables, strict boolean BIFs without operand proof, shared
+or escaping intermediates, and lazy/resource-producing sources retain their
+ordinary execution.
+
+A global `filter` remains live. The emitted program captures its actual value
+once, before evaluating its arguments. A runtime guard compares the selected
+arity-two callable with the runtime intrinsic. If that guard fails, the original
+captured callable receives the original evaluated arguments. No lookup or
+argument effect is repeated, and no global binding is frozen.
+
+Each admitted consumer reserves 64 nodes from the descriptor's cumulative
+emission allowance. `explain` reports the checked domain, ownership, binding
+guard and refusal reason; applications supply neither annotations nor flags.
+
 ## Small, predictable APIs
 
-```clojure
+```beam-lisp
 ; Compilation: descriptor in, descriptor out.
 (opt/module (descriptor "(+ 2 3)"))
 
@@ -89,6 +128,10 @@ The mapper runs once per element and the left-fold order stays the same. The fus
            (opt/module (descriptor "(+ 2 3)") {:enabled? false})))
 (assert (:limited? (:stats (opt/explain
   (descriptor "(let [x 2] (+ x 3))") {:max-nodes 1}))))
+```
+
+```bl-result cell2
+nil
 ```
 
 `module` avoids storing explanations during compilation. `run` returns the full result and accepts `:report?`; `explain` requests a report.
@@ -111,7 +154,7 @@ The pass uses checked laws without starting a solver. Anything unproven keeps it
 - **Escapes and sharing.** A mapped list returned, stored, captured or used twice keeps its map.
 - **Ordinary heap values.** Public arithmetic functions passed as values, maps, decimals and floats keep their normal dispatch.
 - **Lazy sequences.** Shared realization, replay and native resource limits stay with the lazy runtime; the optimizer neither fuses nor reorders them.
-- **Composition boundaries.** Filters, indexed maps and transducers keep their regular contracts. A longer strict map chain can retain stages outside the checked map/fold pair.
+- **Composition boundaries.** Indexed maps and transducers keep their regular contracts. Filters keep their demand and replay behavior outside an admitted private first-match consumer. A longer strict map chain can retain stages outside the checked map/fold pair.
 
 Correctness never depends on an annotation or an external tool. A missing fact costs speed, not meaning.
 
