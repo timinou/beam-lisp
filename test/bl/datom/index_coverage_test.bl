@@ -1,7 +1,8 @@
 (ns datom.index-coverage-test
   (:require [datom] [datom.conn :as conn] [datom.db :as db] [datom.time :as time]
             [datom.index :as index] [datom.schema :as schema] [datom.index-coverage :as coverage]
-            [datom.store :as store] [datom.store-ets :as ets] [datom.store-fjall :as fjall]))
+            [datom.store :as store] [datom.store-ets :as ets] [datom.store-fjall :as fjall]
+            [datom.query.page :as page]))
 
 (def components [{:db/ident :p/firm :db/valueType :db.type/long}
                  {:db/ident :p/at :db/valueType :db.type/long :db/index true}])
@@ -100,3 +101,84 @@
     (erlang/exit (:writer c) :kill)
     (conn/install-schema! c [composite])
     (is (= #{[[7 11]]} (datom/q '[:find ?v :where [?e :p/order ?v]] (conn/db c))))))
+
+(deftest tuple-components-recover-without-repeating-schema-definitions
+  (let [s (fjall/open-fresh) path (:path s) c (conn/connect-with s (conj components composite))
+        r (datom/transact! c [{:db/id -1 :p/firm 7 :p/at 11}]) e (get (:tempids r) -1)]
+    (datom/close! c)
+    (let [again (conn/connect-with (fjall/open path) [])]
+      (is (= [:p/firm :p/at] (schema/tuple-attrs (conn/schema again) :p/order)))
+      (datom/transact! again [[:db/add e :p/at 12]])
+      (is (= [7 12] (:p/order (db/entity (conn/db again) e))))
+      (datom/transact! again [[:db/retract e :p/firm 7]])
+      (is (= [nil 12] (:p/order (db/entity (conn/db again) e))))
+      (datom/close! again))))
+
+(deftest explicit-legacy-tuple-definitions-repair-durable-component-metadata-once
+  (let [s (fjall/open-fresh) path (:path s) defs (conj components composite)
+        c (conn/connect-with s defs)
+        r (datom/transact! c [{:db/id -1 :p/firm 7 :p/at 11}]) e (get (:tempids r) -1)
+        ae (index/-e (first (db/datoms (conn/db c) :avet :db/ident :p/order)))]
+    ;; Reproduce the old store representation, which recorded tuple type and
+    ;; index flags but omitted the component vector entirely.
+    (datom/transact! c [[:db/retract ae :db/tupleAttrs [:p/firm :p/at]]])
+    (datom/close! c)
+    (let [repaired (conn/connect-with (fjall/open path) defs)]
+      (is (= [[:p/firm :p/at]]
+             (mapv index/-v (db/datoms (conn/db repaired) :eavt ae :db/tupleAttrs))))
+      (datom/close! repaired))
+    (let [again (conn/connect-with (fjall/open path) [])]
+      (is (= [:p/firm :p/at] (schema/tuple-attrs (conn/schema again) :p/order)))
+      (datom/transact! again [[:db/add e :p/at 13]])
+      (is (= [7 13] (:p/order (db/entity (conn/db again) e))))
+      (datom/close! again))))
+
+(deftest schema-recovery-pairs-retractions-before-restoring-current-definitions
+  (let [s (fjall/open-fresh) path (:path s) c (conn/connect-with s (conj components composite))
+        r (datom/transact! c [{:db/id -1 :p/firm 7 :p/at 11}]) e (get (:tempids r) -1)]
+    (conn/install-schema! c [{:db/ident :p/at :db/valueType :db.type/long :db/index false}
+                            (assoc composite :db/tupleAttrs [:p/at :p/firm])])
+    (datom/close! c)
+    (let [again (conn/connect-with (fjall/open path) [])]
+      (is (not (schema/indexed? (conn/schema again) :p/at)))
+      (is (= [:p/at :p/firm] (schema/tuple-attrs (conn/schema again) :p/order)))
+      (datom/transact! again [[:db/add e :p/at 12]])
+      (is (= [12 7] (:p/order (db/entity (conn/db again) e))))
+      (datom/close! again))))
+
+(deftest stale-writer-component-gaps-cannot-be-hidden-by-later-correct-writes
+  (let [s (ets/open) stale (conn/connect-with s components)
+        r (datom/transact! stale [{:db/id -1 :p/firm 7 :p/at 11}
+                                  {:db/id -2 :p/firm 7 :p/at 21}])
+        a (get (:tempids r) -1) b (get (:tempids r) -2)
+        current (conn/connect-with s (conj components composite))]
+    (is (coverage/complete? s (conn/schema current) :p/order (db/basis-t (conn/db current))))
+    (datom/transact! stale [[:db/add a :p/at 12]])
+    (is (not (coverage/complete? s (conn/schema current) :p/order (db/basis-t (conn/db current)))))
+    (datom/transact! current [[:db/add b :p/at 22]])
+    (is (nil? (coverage/certificate s :p/order)))
+    (is (not (coverage/complete? s (conn/schema current) :p/order (db/basis-t (conn/db current)))))
+    (conn/install-schema! current [composite])
+    (is (coverage/complete? s (conn/schema current) :p/order (db/basis-t (conn/db current))))
+    (is (= [7 12] (:p/order (db/entity (conn/db current) a))))))
+
+(deftest bulk-components-without-derived-tuples-invalidate-until-repair
+  (let [s (ets/open) c (conn/connect-with s (conj components composite))]
+    (datom/load-facts! c [{:db/id 10000 :p/firm 7 :p/at 11}])
+    (is (not (coverage/complete? s (conn/schema c) :p/order (db/basis-t (conn/db c)))))
+    (conn/install-schema! c [composite])
+    (is (= [7 11] (:p/order (db/entity (conn/db c) 10000))))
+    (is (coverage/complete? s (conn/schema c) :p/order (db/basis-t (conn/db c))))))
+
+(deftest stale-unindexed-writer-cannot-leave-scalar-coverage-admitted
+  (let [s (ets/open) stale (conn/connect-with s [{:db/ident :p/at :db/valueType :db.type/long}])
+        current (conn/connect-with s [(second components)])]
+    (datom/transact! stale [{:db/id -1 :p/at 11}])
+    (is (not (coverage/complete? s (conn/schema current) :p/at (db/basis-t (conn/db current)))))
+    (is (= :unsupported-plan
+           (:reason (page/page '[:find ?e ?at :where [?e :p/at ?at]] (conn/db current)
+                               {:order-by ['?at :asc]} []))))
+    (datom/transact! current [{:db/id -2 :p/at 12}])
+    (is (nil? (coverage/certificate s :p/at)))
+    (conn/install-schema! current [(second components)])
+    (is (= #{11 12} (set (mapv index/-v (db/datoms (conn/db current) :avet :p/at)))))))
