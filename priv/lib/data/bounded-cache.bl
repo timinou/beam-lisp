@@ -1,0 +1,156 @@
+;; Optional finite-value cache. Computation belongs to callers; one owner only
+;; publishes entries after charging their complete retained data footprint.
+(ns data.bounded-cache (:require [data.cache-budget :as budget]))
+
+(declare binary-extra)
+(declare key-data)
+
+(defn- key-list [xs depth]
+  (loop [xs xs out []]
+    (cond
+      (erlang/== xs ()) out
+      (not (erlang/is_list xs)) nil
+      :else (when-let [x (key-data (erlang/hd xs) depth)]
+              (recur (erlang/tl xs) (conj out x))))))
+
+(defn- key-map [x depth]
+  (loop [it (maps/iterator x) out {}]
+    (let [entry (maps/next it)]
+      (if (= :none entry) out
+        (let [k (key-data (erlang/element 1 entry) depth)
+              v (key-data (erlang/element 2 entry) depth)]
+          (when (and k v) (recur (erlang/element 3 entry) (assoc out k v))))))))
+
+(defn key-data
+  "Typed identity without retaining local reference resources. Unsupported
+   identities decline caching; container tags prevent forged scalar collisions."
+  [x depth]
+  (when (<= depth 128)
+    (cond
+      (erlang/is_atom x) (tuple :atom x)
+      (erlang/is_integer x) (tuple :integer x)
+      (erlang/is_float x) (tuple :float x)
+      (erlang/is_binary x) (tuple :binary x)
+      (erlang/is_reference x)
+        (when (= (erlang/node x) (erlang/node))
+          (tuple :reference (erlang/node x) (erlang/ref_to_list x)))
+      (erlang/is_tuple x)
+        (when-let [v (key-list (erlang/tuple_to_list x) (inc depth))] (tuple :tuple v))
+      (erlang/is_map x)
+        (when-let [v (key-map x (inc depth))] (tuple :map v))
+      (erlang/is_list x)
+        (when-let [v (key-list x (inc depth))] (tuple :list v))
+      :else nil)))
+
+(defn- list-extra [xs depth]
+  (loop [xs xs acc 0]
+    (cond
+      (erlang/== xs ()) acc
+      (not (erlang/is_list xs)) nil
+      :else (let [n (binary-extra (erlang/hd xs) depth)]
+              (when (some? n) (recur (erlang/tl xs) (+ acc n)))))))
+
+(defn- tuple-extra [x depth]
+  (loop [i 1 acc 0]
+    (if (> i (erlang/tuple_size x)) acc
+      (let [n (binary-extra (erlang/element i x) depth)]
+        (when (some? n) (recur (inc i) (+ acc n)))))))
+
+(defn- map-extra [x depth]
+  (loop [it (maps/iterator x) acc 0]
+    (let [entry (maps/next it)]
+      (if (= :none entry) acc
+        (let [k (binary-extra (erlang/element 1 entry) depth)
+              v (binary-extra (erlang/element 2 entry) depth)]
+          (when (and (some? k) (some? v))
+            (recur (erlang/element 3 entry) (+ acc k v))))))))
+
+(defn- binary-extra [x depth]
+  ;; References, processes, ports, functions and deep/opaque values cannot
+  ;; hide native resource ownership inside a supposedly small cache entry.
+  (when (<= depth 128)
+    (cond
+      (erlang/is_binary x) (- (binary/referenced_byte_size x) (erlang/byte_size x))
+      (or (erlang/is_atom x) (erlang/is_number x)) 0
+      (erlang/is_tuple x) (tuple-extra x (inc depth))
+      (erlang/is_map x) (map-extra x (inc depth))
+      (erlang/is_list x) (list-extra x (inc depth))
+      :else nil)))
+
+(defn footprint
+  "Conservative charge for an entry, including sub-binaries' retained parents.
+   nil declines opaque/resource-bearing values. No serialization copy is made."
+  [entry]
+  (let [extra (binary-extra entry 0)]
+    (when (some? extra)
+      ;; Charge twice for owner metadata and ETS terms, plus per-entry overhead.
+      (+ 256 (* 2 (+ (* (erlang/system_info :wordsize) (erts_debug/flat_size entry))
+                       (erlang/external_size entry) extra))))))
+
+(defserver owner
+  (init [name]
+    (ets/new name (list :set :protected :named_table
+                       (tuple :read_concurrency true)))
+    (ok {:name name :budget (budget/empty-state)}))
+  (handle-call [:put key revision value] [_from st]
+    (let [entry (tuple key revision value)
+          weight (footprint entry)
+          decision (budget/offer (:budget st) key revision weight)]
+      (when (:accepted? decision)
+        (when (:clear? decision) (ets/delete_all_objects (:name st)))
+        (ets/insert (:name st) entry))
+      (reply (:accepted? decision) (assoc st :budget (:state decision)))))
+  (handle-call [:clear] [_from st]
+    (ets/delete_all_objects (:name st))
+    (reply :ok (assoc st :budget (budget/empty-state))))
+  (handle-call [:stats] [_from st]
+    (reply {:size (count (get-in st [:budget :entries]))
+            :bytes (get-in st [:budget :bytes])} st)))
+
+(defn- ensure-owner [name]
+  (or (Process/whereis name)
+      (try (start owner name {:name name})
+           ;; Racing first touches converge on the registered owner.
+           (catch _ (Process/whereis name)))))
+
+(defn lookup [name key revision]
+  (try
+    (let [key (key-data key 0) revision (key-data revision 0)]
+      (if (and key revision)
+        (do (ensure-owner name)
+            (let [entry (first (ets/lookup name key))]
+              (if (and entry (erlang/=:= revision (erlang/element 2 entry)))
+                {:hit? true :value (erlang/element 3 entry)}
+                {:hit? false})))
+        {:hit? false}))
+    (catch _ {:hit? false})))
+
+(defn put! [name key revision value]
+  ;; Cache failure can only cost a future computation, never fail the read.
+  (try (let [key (key-data key 0) revision (key-data revision 0)]
+         (when (and key revision)
+           (when-let [pid (ensure-owner name)] (call pid [:put key revision value]))))
+       (catch _ false)))
+
+(defn value
+  "Compute on a miss; optional cache failure never changes the answer or
+   suppresses computation errors. One revision occupies each logical key."
+  [name key revision f]
+  (if (or (not (erlang/is_function f))
+          (not= :local (erlang/element 2 (erlang/fun_info f :type)))) (f)
+    (let [revision (tuple :computation revision
+                          (erlang/element 2 (erlang/fun_info f :module))
+                          (erlang/element 2 (erlang/fun_info f :new_uniq))
+                          (erlang/element 2 (erlang/fun_info f :index)))
+          hit (lookup name key revision)]
+      (if (:hit? hit) (:value hit)
+        (let [v (f)] (put! name key revision v) v)))))
+
+(defn clear! [name]
+  (try (when-let [pid (Process/whereis name)] (call pid [:clear]))
+       (catch _ nil))
+  :ok)
+
+(defn stats [name]
+  (or (try (when-let [pid (Process/whereis name)] (call pid [:stats]))
+           (catch _ nil)) {:size 0 :bytes 0}))
