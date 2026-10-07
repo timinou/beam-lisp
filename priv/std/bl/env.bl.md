@@ -178,7 +178,7 @@ problems reports all three in one pass.
 
 ```beam-lisp silent
 (def known-keys [:name :instance :bl :warm :vm :realm :shadow :uses :paths :tasks :ports
-                 :schedules :env :doc :app :build :release :deps :browser :catalog])
+                 :schedules :env :doc :app :build :release :deps :browser :catalog :foundry])
 
 ;; How `bl` reaches a warm VM for this tree. The LAUNCHER reads this key (it must
 ;; decide before any VM exists), so the vocabulary lives in
@@ -714,6 +714,36 @@ a list, `:paths` is a list, `:tasks` and `:ports` are maps — always the right
 shape, whatever the file said.
 
 ```beam-lisp silent
+(defn- norm-foundry
+  "Foundry discovery is data, never a hook. Paths stay inside the source tree."
+  [value root]
+  (let [o (:observability value)
+        relative? (fn [p] (and (string? p) (not= "" p)
+                               (not (String/starts_with? p "/"))
+                               (not (some #(= ".." %) (String/split p "/")))))
+        errs (cond
+               (nil? value) []
+               (not (map? value)) [":foundry must be a map"]
+               (not (map? o)) [":foundry :observability must be a map"]
+               :else (concat
+                 (unknown-errs value [:observability] ":foundry")
+                 (unknown-errs o [:version :transport :schema :local-command :window-lines
+                                :max-record-bytes :domains :identity :content] ":foundry :observability")
+                 (when (not= 1 (:version o)) [":foundry :version must be 1"])
+                 (when (not= :journald (:transport o)) [":foundry :transport must be :journald"])
+                 (when (not (relative? (:schema o))) [":foundry :schema must be a relative source path"])
+                 (when (not (relative? (:local-command o))) [":foundry :local-command must be a relative source path"])
+                 (when (not (and (erlang/is_integer (:window-lines o)) (<= 1 (:window-lines o) 500)))
+                   [":foundry :window-lines must be 1..500"])
+                 (when (not= 8192 (:max-record-bytes o)) [":foundry :max-record-bytes must be 8192"])
+                 (when (not= :keyed-handles (:identity o)) [":foundry :identity must be :keyed-handles"])
+                 (when (not= :excluded (:content o)) [":foundry :content must be :excluded"])
+                 (when (not (and (vector? (:domains o)) (<= (count (:domains o)) 32)
+                                 (every? keyword? (:domains o)))) [":foundry :domains must be at most 32 keywords"])))]
+    (if (or (nil? value) (seq errs)) [nil errs]
+      [(assoc value :observability (assoc o :schema (Path/expand (:schema o) root)
+                                           :local-command (Path/expand (:local-command o) root))) []])))
+
 (defn normalize
   "The project value as the runtime reads it: `:paths` absolute against `root`,
    tasks and ports keyed by name, `:errors` — every shape problem found, as
@@ -747,6 +777,7 @@ shape, whatever the file said.
         [shadow shderr] (norm-shadow (:shadow m))
         [uses useserr] (norm-uses (:uses m))
         [deps derr]    (norm-deps (:deps m))
+        [fnd fnderr]   (norm-foundry (:foundry m) root)
         [brw brerr]    (norm-browser (:browser m))
         [cat cerr]     (norm-catalog (:catalog m) root)]
     {:path path
@@ -768,10 +799,11 @@ shape, whatever the file said.
      :build bld
      :release rel
      :deps deps
+     :foundry fnd
      :browser brw
      :catalog cat
      :errors (concat perr nerr ierr blerr werr vmerr rlmerr shderr useserr terr porerr serr eerr aerr berr rerr derr
-                     brerr cerr
+                     fnderr brerr cerr
                      (map (fn [k] (str "unknown key " k)) (unknown-keys m known-keys)))}))
 
 (defn empty-project
