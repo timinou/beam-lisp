@@ -1,0 +1,102 @@
+(ns datom.index-coverage-test
+  (:require [datom] [datom.conn :as conn] [datom.db :as db] [datom.time :as time]
+            [datom.index :as index] [datom.schema :as schema] [datom.index-coverage :as coverage]
+            [datom.store :as store] [datom.store-ets :as ets] [datom.store-fjall :as fjall]))
+
+(def components [{:db/ident :p/firm :db/valueType :db.type/long}
+                 {:db/ident :p/at :db/valueType :db.type/long :db/index true}])
+(def composite {:db/ident :p/order :db/valueType :db.type/tuple :db/tupleAttrs [:p/firm :p/at] :db/index true})
+
+(deftest installing-tuple-derives-existing-current-entities-atomically
+  (doseq [s [(ets/open) (fjall/open-fresh)]]
+    (let [c (conn/connect-with s components)
+          r (datom/transact! c [{:db/id -1 :p/firm 7 :p/at 11}])
+          e (get (:tempids r) -1) old (:db-after r)]
+      (datom/transact! c [[:db/add e :p/at 12]])
+      (conn/install-schema! c [composite])
+      (is (= [7 12] (:p/order (db/entity (conn/db c) e))))
+      (is (= 1 (count (db/datoms (conn/db c) :avet :p/order))))
+      (is (coverage/complete? s (conn/schema c) :p/order (db/basis-t (conn/db c))))
+      (is (= [] (db/datoms old :eavt e :p/order)))
+      (let [basis (db/basis-t (conn/db c))]
+        (conn/install-schema! c [composite])
+        (is (= 1 (count (db/datoms (conn/db c) :avet :p/order))))))))
+
+(deftest reopen-repairs-durable-schema-with-missing-index-coverage
+  (let [s (fjall/open-fresh) path (:path s)
+        c (conn/connect-with s [{:db/ident :p/at :db/valueType :db.type/long}])
+        r (datom/transact! c [{:db/id -1 :p/at 11}])
+        e (get (:tempids r) -1)]
+    (datom/transact! c [[:db/add e :p/at 12]])
+    ;; Simulate migration's durable schema commit followed by process loss
+    ;; before sync-schema!, the actual previously uncovered recovery window.
+    (datom/transact! c [{:db/id -2 :db/ident :p/at :db/valueType :db.type/long :db/index true}])
+    (is (= [] (db/datoms (conn/db c) :avet :p/at)))
+    (datom/close! c)
+    (let [reopened (fjall/open path) c2 (conn/connect-with reopened [])
+          now (conn/db c2) old (time/as-of now (:tx r))]
+      (is (= [12] (mapv index/-v (db/datoms now :avet :p/at))))
+      (is (= [11] (mapv index/-v (db/datoms old :avet :p/at))))
+      (is (coverage/complete? reopened (conn/schema c2) :p/at (db/basis-t now)))
+      (datom/close! c2))))
+
+(deftest interrupted-checkpoint-restarts-after-source-basis-changes
+  (let [s (ets/open) c (conn/connect-with s [{:db/ident :p/at :db/valueType :db.type/long}])]
+    (datom/transact! c [{:db/id -1 :p/at 1}])
+    (let [after (schema/install-all (conn/schema c) [(second components)])
+          basis (db/basis-t (conn/db c))]
+      ;; Checkpoint has an impossible past cursor; a changed basis must not
+      ;; resume from it and skip either old or new data.
+      (store/-put s (datom.derived/record-key (coverage/ident :p/at))
+        {:status :building :definition (coverage/definition after :p/at) :basis basis
+         :after (index/prefix-end (index/key-prefix :aevt :p/at)) :rows 1})
+      (datom/transact! c [{:db/id -2 :p/at 2}])
+      (conn/install-schema! c [(second components)])
+      (is (= #{1 2} (set (mapv index/-v (db/datoms (conn/db c) :avet :p/at))))))))
+
+(defrecord InterruptedStore [inner observe]
+  store/Store
+  (-get [s k] (store/-get (:inner s) k))
+  (-range [s lo hi] (store/-range (:inner s) lo hi))
+  (-put [s k v] (store/-put (:inner s) k v))
+  (-delete [s k] (store/-delete (:inner s) k))
+  (-update [s k f] (store/-update (:inner s) k f))
+  (-commit [s ops]
+    (when-let [f @(:observe s)] (f ops))
+    (store/-commit (:inner s) ops))
+  store/PageScan
+  (-scan-datoms-page [s lo after hi limit] (store/page-datoms (:inner s) lo after hi limit)))
+
+(deftest actual-writer-death-during-backfill-is-repaired-on-reopen
+  (let [inner (fjall/open-fresh) path (:path inner) observe (atom nil)
+        wrapped (->InterruptedStore inner observe)
+        c (conn/connect-with wrapped [{:db/ident :p/at :db/valueType :db.type/long}])
+        parent (erlang/self) attempts (atom 0)]
+    (datom/transact! c (mapv (fn [i] {:db/id (- -1 i) :p/at i}) (range 1100)))
+    ;; Durable migration schema exists before its live-map sync.
+    (datom/transact! c [{:db/id -2000 :db/ident :p/at :db/valueType :db.type/long :db/index true}])
+    (reset! observe (fn [_]
+                      (when (= 2 (swap! attempts inc))
+                        (erlang/send parent [:coverage-interrupted (erlang/self)])
+                        (receive :continue :ok (after 10000 (throw "interruption timed out"))))))
+    (let [worker (spawn (fn []
+                         (try (conn/sync-schema! c [(second components)]) (catch _ :interrupted))))]
+      (receive [:coverage-interrupted writer]
+        (erlang/exit writer :kill)
+        (after 10000 (assert false "did not reach second coverage batch")))
+      (reset! observe nil)
+      (is (= :building (:status (coverage/certificate inner :p/at))))
+      (is (= 1024 (:rows (coverage/certificate inner :p/at))))
+      (conn/release! c)
+      (store/close inner)
+      (let [s2 (fjall/open path) c2 (conn/connect-with s2 [])]
+        (is (= 1100 (count (db/datoms (conn/db c2) :avet :p/at))))
+        (is (coverage/complete? s2 (conn/schema c2) :p/at (db/basis-t (conn/db c2))))
+        (datom/close! c2)))))
+
+(deftest restarted-writer-can-perform-nested-schema-transaction
+  (let [c (datom/connect components)]
+    (datom/transact! c [{:db/id -1 :p/firm 7 :p/at 11}])
+    (erlang/exit (:writer c) :kill)
+    (conn/install-schema! c [composite])
+    (is (= #{[[7 11]]} (datom/q '[:find ?v :where [?e :p/order ?v]] (conn/db c))))))
