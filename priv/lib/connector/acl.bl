@@ -1,0 +1,401 @@
+; connector/acl.bl — who may read what, as facts and relations.
+;
+; Design of record: docs/connectors/rights-as-relations.md. A connector mirrors
+; a document system; this namespace mirrors its ACCESS CONTROL the same way —
+; identities, group membership and per-item grants are datoms, and the answer
+; "may X read Y at the source?" is one derived relation over them.
+;
+;   :ident/*   who      identity  [provider tenant kind remote-id]  (unique)
+;   :member/*  groups   membership edges, per group replaced wholesale
+;   :acl/*     grants   one entity per (item, grantee), upserted by :acl/key
+;
+; ── Where the "complete / as-of" facts live (decision) ──────────────────────
+;
+; `:acl.item/complete?` and `:acl.item/as-of` are on the MIRRORED ITEM entity,
+; not on a separate per-item ACL entity: they have exactly the item's lifecycle
+; (written in the same transaction as its grants), the check needs one lookup
+; (`as-of` absent = never fetched = :no-acl-data), and a separate entity would
+; need its own key for no gain. `:member/complete?` / `:member/as-of` likewise
+; sit on the GROUP identity entity: a group's expansion is replaced as a unit.
+;
+; ── Unknown is never allow ──────────────────────────────────────────────────
+;
+; A relation can only say what the facts SAY, so `:~acl/source-reads` lists
+; definite grants only. Everything the facts cannot say (no ACL fetched, the
+; fetch saw only part of it, a grantee group never expanded, data too old)
+; is a REASON that `reads-verdict` returns — absence from the relation is
+; never read as denial by a check.
+;
+; AOT: relations are registered with `defrelation`, a value def that a built
+; image replays; a bare top-level `(register-relation! …)` would be gone from a
+; build (docs: datom.query.relation/defrelation). The tests pin this by asking
+; the registry in a fresh test that never calls a registration fn.
+
+(ns connector.acl
+  (:require [datom] [datom.db] [datom.query.relation :as rel]))
+
+;; ── schema ──────────────────────────────────────────────────────────────────
+
+(def schema
+  "Identity, membership and ACL facts. `:ident/principal` is declared for the
+   explicit-link step (doc §4) and is NEVER written by this namespace."
+  [{:db/ident :ident/key        :db/valueType :db.type/term :db/unique :db.unique/identity}
+   {:db/ident :ident/kind       :db/valueType :db.type/keyword}
+   {:db/ident :ident/email      :db/valueType :db.type/string}
+   {:db/ident :ident/name       :db/valueType :db.type/string}
+   {:db/ident :ident/tenant     :db/valueType :db.type/term}
+   {:db/ident :ident/audience   :db/valueType :db.type/keyword}
+   {:db/ident :ident/domain     :db/valueType :db.type/string}
+   {:db/ident :ident/unexpandable :db/valueType :db.type/boolean}
+   {:db/ident :ident/principal  :db/valueType :db.type/ref}
+   ;; directory facts (doc §4.1): written by a feed's :directory, never by the keep
+   {:db/ident :ident/title      :db/valueType :db.type/string}
+   {:db/ident :ident/enabled    :db/valueType :db.type/boolean}
+   {:db/ident :ident/guest      :db/valueType :db.type/boolean}
+   {:db/ident :ident/listed-at  :db/valueType :db.type/long}
+   {:db/ident :member/key       :db/valueType :db.type/term :db/unique :db.unique/identity}
+   {:db/ident :member/of        :db/valueType :db.type/ref :db/index true}
+   {:db/ident :member/is        :db/valueType :db.type/ref :db/index true}
+   {:db/ident :member/as-of     :db/valueType :db.type/long}
+   {:db/ident :member/complete? :db/valueType :db.type/boolean}
+   {:db/ident :acl/key          :db/valueType :db.type/term :db/unique :db.unique/identity}
+   {:db/ident :acl/item         :db/valueType :db.type/ref :db/index true}
+   {:db/ident :acl/grantee      :db/valueType :db.type/ref :db/index true}
+   {:db/ident :acl/role         :db/valueType :db.type/keyword}
+   {:db/ident :acl/as-of        :db/valueType :db.type/long}
+   {:db/ident :acl.item/complete? :db/valueType :db.type/boolean}
+   {:db/ident :acl.item/as-of   :db/valueType :db.type/long}])
+
+;; ── roles ───────────────────────────────────────────────────────────────────
+
+(def ^:private RANK {:read 1 :write 2 :owner 3})
+
+(defn role-max
+  "The stronger of two normalised roles (nil is weaker than any)."
+  [a b]
+  (cond (nil? a) b (nil? b) a (>= (get RANK a) (get RANK b)) a :else b))
+
+(def ^:private GRAPH-ROLES
+  {"read" :read "write" :write "owner" :owner "fullcontrol" :owner
+   "sp.read" :read "sp.contribute" :write "sp.edit" :write "sp.full control" :owner})
+
+(def ^:private DRIVE-ROLES
+  {"reader" :read "commenter" :read "writer" :write "fileOrganizer" :write
+   "owner" :owner "organizer" :owner})
+
+(defn graph-role
+  "Microsoft role string(s) → :read | :write | :owner | nil (doc §2: read→:read,
+   write→:write, owner/fullcontrol→:owner). A vector of roles yields the
+   strongest mapped one; nil when NONE maps — the caller must then treat the
+   grant as not understood (never as 'no access')."
+  [roles]
+  (reduce (fn [acc r] (role-max acc (get GRAPH-ROLES (if (string? r) (String/downcase r) r))))
+          nil
+          (if (sequential? roles) (into [] roles) [roles])))
+
+(defn drive-role
+  "Drive role string → :read | :write | :owner | nil (reader/commenter→:read,
+   writer/fileOrganizer→:write, owner/organizer→:owner)."
+  [role]
+  (get DRIVE-ROLES role))
+
+;; ── identity ────────────────────────────────────────────────────────────────
+
+(defn identity-key
+  "`[provider tenant kind id]` — the namespace is where the provider guarantees
+   uniqueness (entities-and-projections §2), never 'the account that saw it'."
+  [provider tenant kind id]
+  [provider tenant kind id])
+
+(defn- fresh-tempid
+  "A tempid unique across every transaction builder in this VM, far below the
+   keep's own allocator (-1, -2, …) and its cursor tempids (≈ -1e9)."
+  []
+  (- 0 (+ 2000000000 (erlang/unique_integer (list :positive)))))
+
+(defn identity-tx
+  "The map that asserts (upserts by :ident/key) identity `g`
+   {:key :kind :email :name :title :enabled? :guest? :listed-at :audience :domain :unexpandable?}
+   (directory facts :title/:enabled?/:guest?/:listed-at are written by a feed's :directory). Its :db/id is a
+   fresh tempid other facts in the same transaction may reference."
+  [g]
+  (cond-> {:db/id (fresh-tempid)
+           :ident/key (:key g)
+           :ident/kind (:kind g)
+           :ident/tenant (nth (:key g) 1)}
+    (some? (:email g)) (assoc :ident/email (String/downcase (:email g)))
+    (some? (:name g)) (assoc :ident/name (:name g))
+    (some? (:title g)) (assoc :ident/title (:title g))
+    (some? (:enabled? g)) (assoc :ident/enabled (= true (:enabled? g)))
+    (some? (:guest? g)) (assoc :ident/guest (= true (:guest? g)))
+    (some? (:listed-at g)) (assoc :ident/listed-at (:listed-at g))
+    (some? (:audience g)) (assoc :ident/audience (:audience g))
+    (some? (:domain g)) (assoc :ident/domain (String/downcase (:domain g)))
+    (= true (:unexpandable? g)) (assoc :ident/unexpandable true)))
+
+;; ── small reads ─────────────────────────────────────────────────────────────
+
+(defn- eid-of [db attr v]
+  (let [ds (into [] (datom/datoms db :avet attr v))]
+    (if (empty? ds) nil (nth (first ds) 0))))
+
+(defn- vals-of [db e attr]
+  (mapv (fn [d] (nth d 2)) (datom/datoms db :eavt e attr)))
+
+(defn- val-of [db e attr]
+  (let [vs (vals-of db e attr)] (if (empty? vs) nil (first vs))))
+
+(defn- holders
+  "Entities whose ref attribute `attr` points at `v` (VAET)."
+  [db v attr]
+  (mapv (fn [d] (nth d 0)) (datom/datoms db :vaet v attr)))
+
+(defn- groups-of-1 [db m]
+  (into [] (mapcat (fn [me] (vals-of db me :member/of)) (holders db m :member/is))))
+
+(defn- members-1 [db g]
+  (into [] (mapcat (fn [me] (vals-of db me :member/is)) (holders db g :member/of))))
+
+(defn- closure
+  "Everything reachable from `start` by `step` (≥1 hop). A node is expanded
+   once, so a membership cycle terminates; `start` is in the result only if a
+   cycle leads back to it."
+  [step start]
+  (loop [frontier [start] seen #{}]
+    (if (empty? frontier) seen
+      (let [nxt (into [] (distinct (remove (fn [x] (contains? seen x)) (mapcat step frontier))))]
+        (recur nxt (into seen nxt))))))
+
+(defn- attr-eids
+  "Entities carrying `attr` (any value)."
+  [db attr]
+  (into #{} (map (fn [d] (nth d 0)) (datom/datoms db :aevt attr))))
+
+(defn- person-info [db e]
+  {:tenant (val-of db e :ident/tenant) :email (val-of db e :ident/email)})
+
+(defn- email-domain [email]
+  (let [ps (String/split email "@")]
+    (if (< (count ps) 2) nil (last ps))))
+
+(defn- audience-covers?
+  "Whether audience identity `a` covers `person` {:tenant :email}.
+     :anyone        every person (an anonymous link reaches anyone holding it)
+     :organization  a person of the SAME tenant as the audience
+     :domain d      a person whose known email's domain is d
+   A person whose tenant/email is unknown is covered by nothing narrower than
+   :anyone — absence of the fact never widens access."
+  [db a person]
+  (let [k (val-of db a :ident/audience)]
+    (cond
+      (= k :anyone) true
+      (= k :organization) (and (some? (:tenant person)) (= (:tenant person) (val-of db a :ident/tenant)))
+      (= k :domain) (and (some? (:email person))
+                         (= (email-domain (:email person)) (val-of db a :ident/domain)))
+      :else false)))
+
+;; ── the source-reads core ───────────────────────────────────────────────────
+
+(defn- grantors
+  "Every identity whose grants `person-or-group` inherits: itself, the groups it
+   is (transitively) member-of, and the audiences covering it when it is a
+   person. `info` is {:tenant :email} (for an identity not in the db)."
+  [db x kind info]
+  (let [ups (if (some? x) (closure (fn [m] (groups-of-1 db m)) x) #{})
+        auds (if (= kind :person)
+               (filter (fn [a] (audience-covers? db a info)) (attr-eids db :ident/audience))
+               [])]
+    (into (into (if (some? x) #{x} #{}) ups) auds)))
+
+(defn- item-grantees [db item]
+  (into #{} (mapcat (fn [a] (vals-of db a :acl/grantee)) (holders db item :acl/item))))
+
+(defn- readable-items [db x]
+  (let [gs (grantors db x (val-of db x :ident/kind) (person-info db x))]
+    (into #{} (mapcat (fn [g] (mapcat (fn [a] (vals-of db a :acl/item)) (holders db g :acl/grantee))) gs))))
+
+(defn- readers-of [db item]
+  (let [persons (delay (into #{} (map (fn [d] (nth d 0))
+                                      (filter (fn [d] (= :person (nth d 2))) (datom/datoms db :aevt :ident/kind)))))]
+    (into #{}
+          (mapcat (fn [g]
+                    (let [kind (val-of db g :ident/kind)]
+                      (cond
+                        (= kind :audience) (filter (fn [p] (audience-covers? db g (person-info db p))) @persons)
+                        (= kind :group) (conj (closure (fn [h] (members-1 db h)) g) g)
+                        :else [g])))
+                  (item-grantees db item)))))
+
+(defn- source-reads-provider [db mode bounds args]
+  (let [x (get bounds :e) i (get bounds :v)]
+    (cond
+      (and (some? x) (some? i))
+        (if (contains? (readable-items db x) i) [[x i]] [])
+      (some? x) (mapv (fn [y] [x y]) (readable-items db x))
+      (some? i) (mapv (fn [p] [p i]) (readers-of db i))
+      :else (into [] (mapcat (fn [it] (map (fn [p] [p it]) (readers-of db it)))
+                             (into #{} (map (fn [d] (nth d 2)) (datom/datoms db :aevt :acl/item))))))))
+
+(defn- member-of-provider [db mode bounds args]
+  (let [x (get bounds :e) g (get bounds :v)
+        ups (fn [m] (closure (fn [y] (groups-of-1 db y)) m))]
+    (cond
+      (and (some? x) (some? g)) (if (contains? (ups x) g) [[x g]] [])
+      (some? x) (mapv (fn [h] [x h]) (ups x))
+      (some? g) (mapv (fn [m] [m g]) (closure (fn [y] (members-1 db y)) g))
+      :else (into [] (mapcat (fn [m] (map (fn [h] [m h]) (ups m)))
+                             (into #{} (map (fn [d] (nth d 2)) (datom/datoms db :aevt :member/is))))))))
+
+(rel/defrelation :~ident/member-of
+  {:arity 2 :modes #{:bf :fb :bb :ff}
+   :extension :derived :maintenance :recompute
+   :reads #{:member/of :member/is}
+   :doc "[?identity ?group]: ?identity is a member of ?group, transitively over :member/is → :member/of (cycle-safe)"
+   :provider member-of-provider})
+
+(rel/defrelation :~acl/source-reads
+  {:arity 2 :modes #{:bf :fb :bb :ff}
+   :extension :derived :maintenance :recompute
+   :reads #{:acl/item :acl/grantee :member/of :member/is
+            :ident/kind :ident/audience :ident/tenant :ident/email :ident/domain}
+   :doc (str "[?identity ?item]: the SOURCE grants ?identity read on ?item — an :acl on ?item whose grantee is "
+             "?identity, a group ?identity is transitively member-of, or an audience covering a person "
+             "(:anyone = everyone; :organization = same tenant; :domain d = email domain d). Definite grants "
+             "only: absence means 'not shown to read', never 'denied' — ask `reads-verdict` for why.")
+   :provider source-reads-provider})
+
+;; ── writes: grants and membership REPLACE ───────────────────────────────────
+
+(defn- merge-grants
+  "One grant per grantee key (a person may be named directly AND by a link):
+   the strongest role wins."
+  [grants]
+  (let [by (reduce (fn [m g]
+                     (let [k (:key (:grantee g))]
+                       (assoc m k (if (contains? m k)
+                                    (assoc (get m k) :role (role-max (:role (get m k)) (:role g)))
+                                    g))))
+                   {} grants)]
+    (into [] (vals by))))
+
+(defn grants-tx
+  "Transaction items that make `item-key`'s ACL EXACTLY `grants`
+   [{:grantee {:key :kind …} :role r}] as of `as-of`: upserts each
+   (item, grantee) by :acl/key and RETRACTS grants no longer listed — a revoked
+   share must disappear. `item-ref` is the item's eid or the transaction's
+   tempid for it (the key cannot be recovered from a tempid, so it is passed
+   too). `complete?` is whether the list is the WHOLE ACL; a grant without a
+   mapped role makes it incomplete (we saw something we could not read)."
+  [db item-key item-ref grants complete? as-of]
+  (let [usable (filter (fn [g] (some? (:role g))) grants)
+        complete? (and (= true complete?) (= (count usable) (count grants)))
+        merged (merge-grants usable)
+        want (into #{} (map (fn [g] [item-key (:key (:grantee g))]) merged))
+        old (if (and (number? item-ref) (pos? item-ref))
+              (mapv (fn [a] [a (val-of db a :acl/key)]) (holders db item-ref :acl/item))
+              [])
+        drops (into [] (keep (fn [[a k]] (when (not (contains? want k)) [:db/retractEntity a])) old))
+        rows (mapcat (fn [g]
+                       (let [id (identity-tx (:grantee g))]
+                         [id {:db/id (fresh-tempid)
+                              :acl/key [item-key (:key (:grantee g))]
+                              :acl/item item-ref
+                              :acl/grantee (:db/id id)
+                              :acl/role (:role g)
+                              :acl/as-of as-of}]))
+                     merged)]
+    (into (into [{:db/id item-ref :acl.item/complete? complete? :acl.item/as-of as-of}] drops)
+          rows)))
+
+(defn members-tx
+  "Transaction items that make group `group-key`'s membership EXACTLY `members`
+   [{:key :kind …}] as of `as-of`, retracting members no longer listed.
+   `complete?` false records that the expansion is partial (a site group
+   Graph cannot expand, a Google group without directory read): the group is
+   then `:group-unresolved` to any check."
+  [db group-key members complete? as-of]
+  (let [ge (eid-of db :ident/key group-key)
+        gid (fresh-tempid)
+        mids (mapv (fn [m] [m (identity-tx m)]) members)
+        want (into #{} (map (fn [[m _]] [group-key (:key m)]) mids))
+        old (if (some? ge)
+              (mapv (fn [e] [e (val-of db e :member/key)]) (holders db ge :member/of))
+              [])
+        drops (into [] (keep (fn [[e k]] (when (not (contains? want k)) [:db/retractEntity e])) old))]
+    (into (into [{:db/id gid :ident/key group-key :ident/kind :group
+                  :member/complete? (= true complete?) :member/as-of as-of}]
+                drops)
+          (mapcat (fn [[m id]]
+                    [id {:db/id (fresh-tempid) :member/key [group-key (:key m)]
+                         :member/of gid :member/is (:db/id id)}])
+                  mids))))
+
+;; ── the check ───────────────────────────────────────────────────────────────
+
+(defn- now-ms [] (erlang/system_time :millisecond))
+
+(defn reads-verdict
+  "May identity `identity-key` read item `item-key`, per the mirrored source ACL?
+     :yes                  a definite grant reaches the identity
+     :no                   the ACL is complete, every grantee group is expanded,
+                           and nothing reaches the identity
+     {:unknown reason}     cannot say — never an allow:
+        :no-acl-data       no ACL was ever fetched for the item
+        :stale             fetched before `(- now max-age-ms)` (opts :max-age-ms,
+                           :now); checked before :yes because a revoke may have
+                           happened since
+        :acl-incomplete    only part of the ACL was visible (non-owner view)
+        :group-unresolved  a grantee group (or a group inside it) was never
+                           fully expanded — and the identity is not granted
+                           by anything else
+   An identity never seen is still covered by tenant-wide audiences (its
+   tenant is in its key) but by no direct grant or group."
+  ([db identity-key item-key] (reads-verdict db identity-key item-key {}))
+  ([db identity-key item-key opts]
+   (let [item (eid-of db :conn/key item-key)
+         as-of (if (some? item) (val-of db item :acl.item/as-of) nil)]
+     (cond
+       (nil? as-of) {:unknown :no-acl-data}
+       (and (some? (get opts :max-age-ms))
+            (< as-of (- (or (get opts :now) (now-ms)) (get opts :max-age-ms))))
+         {:unknown :stale}
+       :else
+         (let [x (eid-of db :ident/key identity-key)
+               kind (if (some? x) (val-of db x :ident/kind) (nth identity-key 2))
+               info (if (some? x) (person-info db x) {:tenant (nth identity-key 1) :email nil})
+               gs (grantors db x kind info)
+               gees (item-grantees db item)]
+           (cond
+             (some (fn [g] (contains? gs g)) gees) :yes
+             (not= true (val-of db item :acl.item/complete?)) {:unknown :acl-incomplete}
+             (some (fn [g]
+                     (and (= :group (val-of db g :ident/kind))
+                          (some (fn [h] (and (= :group (val-of db h :ident/kind))
+                                             (not= true (val-of db h :member/complete?))))
+                                (conj (closure (fn [y] (members-1 db y)) g) g))))
+                   gees)
+               {:unknown :group-unresolved}
+             :else :no))))))
+
+(defn coverage
+  "The docs/21 §5 upper-bound check in provider-neutral form: for every identity
+   in `identity-keys` against every item in `item-keys`,
+     {:within  #{id …}                identities that read EVERY item
+      :exceeds {id #{item …}}         items an identity is definitely NOT granted
+      :unknown {id {item reason}}}    items that could not be decided
+   An identity can appear in :exceeds and :unknown both (a definite breach on
+   one item, an undecided other); it is :within only when every item is :yes.
+   `opts` as `reads-verdict` (:max-age-ms :now)."
+  [db identity-keys item-keys opts]
+  (reduce
+    (fn [acc id]
+      (let [vs (mapv (fn [it] [it (reads-verdict db id it opts)]) item-keys)
+            no (into #{} (keep (fn [[it v]] (when (= v :no) it)) vs))
+            unk (into {} (keep (fn [[it v]] (when (map? v) [it (:unknown v)])) vs))
+            all-yes (every? (fn [[_ v]] (= v :yes)) vs)]
+        (cond-> acc
+          all-yes (update :within conj id)
+          (seq no) (assoc-in [:exceeds id] no)
+          (seq unk) (assoc-in [:unknown id] unk))))
+    {:within #{} :exceeds {} :unknown {}}
+    identity-keys))

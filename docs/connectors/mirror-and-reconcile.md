@@ -137,6 +137,45 @@ and are **out of scope for wave 1**: a root inside a shared drive is refused by
 name at `keep` time rather than half-synced. (Open: one cursor per shared drive vs
 one per account — measure when a consumer asks.)
 
+**M5 · a stale cursor resyncs (Graph).** Graph's delta answers `410 Gone`
+(error `resyncChangesApplyDifferences`, with a `Location` to a fresh full
+enumeration) when a cursor can no longer be continued; a feed reports it as
+`{:error {:status 410 :resync true :location url}}` (or `{:resync true}`).
+`connector.keep` treats it as a state, not an error: run §1.1 again and mark
+`:file/gone` every item the mirror held under the roots that the re-seed no
+longer lists. Upserts by `:conn/key` make the overlap idempotent. The step
+reports `{:ok :resynced :gone n}`.
+
+The stale cursor is **not cleared first**. A resync that fails (throttle, 5xx)
+leaves it in place, so the next step re-enters M5 and still has the `before`
+set to diff against; clearing it would send the next step down the no-cursor
+path with an empty `before`, and the vanished items would never be marked.
+
+**`:gone` is a fact about now, not forever.** Any seed or page that asserts an
+item present and live retracts `:file/gone` (moved back in; re-added after a
+removal; marked gone by a resync while it lived on outside the roots). Within
+one page the LAST report of a key wins (`last-per-key`) — Graph may repeat an
+item, and page-tx judges against the page-start snapshot.
+
+**`:enumerate` — seeding where listing is not complete.** Graph documents that
+paging `children` is not guaranteed complete under concurrent writes; delta is
+the only guaranteed enumeration. A feed MAY therefore provide
+`:enumerate (fn [get from]) → {:ok {:items :cursor}}` (a full tokenless
+`root/delta`, following `nextLink` to the `deltaLink`). When present, M2 and M5
+seed from ONE enumeration of the whole drive: items are kept only if they fall
+in the root closure computed from parent links *within the enumerated set* (M1:
+nothing outside is written, not even names), and the returned deltaLink is
+committed as the cursor in the last transaction (M3). On a 410, `from` is the
+error's `Location`. Drive feeds (no `:enumerate`) are unchanged.
+
+M4 for a root **added to an existing cursor** also enumerates (one drive walk
+per added root event) rather than listing children: same completeness
+guarantee, and the cursor is left where it is — changes since it replay over
+the newer facts idempotently. Residual risk: a *folder arriving* via delta
+still seeds its subtree by `children` listing (an item created in that folder
+during the listing is covered by the delta that created it, which the cursor
+replays — the same overlap argument as M2).
+
 The walk is one `proc.queue` job per account (`:unique [:conn/account]`), so a
 scheduled poll, a "sync now" click and (later) a push notification coalesce into
 one run. Push is a trigger, never a payload: a notification means "there may be
@@ -225,6 +264,18 @@ T2, so the same clause answers for a local directory tree or an S3 prefix
 mirrored with `:file/parents`. `:fb` (root bound → its cone) is the mode sync uses.
 
 ---
+
+### 3.4 · ACL facts under M1 and M3
+
+With `{:acl? true}` the keep also mirrors who may read each kept item
+(`connector.acl`, rights-as-relations.md). **M1:** ACL facts are written by the
+same code path as the item, only for items the closure judgement admitted —
+nothing outside a root gets a grant row, an identity or a membership edge via
+an item. **M3:** an item's grants ride in the item's own transaction and the
+cursor in the last one, so the cursor never advances past ACL facts that are
+not durable. A failed ACL fetch writes nothing for that item (older facts age
+out as `:stale`). Permission-only changes are not in delta: `refresh-acls!`
+re-fetches under a staleness budget.
 
 ## 4 · The reconcile clause — a standing query whose rows are owed work
 

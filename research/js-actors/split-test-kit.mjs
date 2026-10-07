@@ -1,0 +1,257 @@
+// split-test-kit.mjs — reusable helpers for driving a compiled split app end
+// to end, without a browser.
+//
+// Extracted from verify-split.mjs's patterns and parameterized by app name:
+//
+//   startBeam(apps)    `bl serve research/split-beam/serve.bl` for the named
+//                      apps: the BEAM authority + web transport, on a port
+//   startApp(app)      one app on BEAM + base URL + post(json) + an SSE
+//                      collector (`events`) with `until(pred, label)` and
+//                      `snapshotNow()` (the current hello, read from a
+//                      throwaway stream)
+//   spawnClient(app)   the BL client half in a child process exactly as the
+//                      browser Worker feeds it: JSON frames on stdout, stdin
+//                      fed with hello/event/result/unreachable/stop, returning
+//                      `{ frames, tell, next(topic, fromIndex), nextWhere(…), settle(frame), close }`
+//   texts(node)        every string in a view tree
+//   findAll(tree, p)   every view node (array) matching a predicate
+//   attr(node)         a view node's attribute map, or null
+//
+// The client half is JavaScript (host.mjs keeps ONE active BL runtime per
+// process, so each client is its own child process); the server half is BEAM.
+
+import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { createCodec } from './split-codec.mjs';
+
+export const HERE = new URL('./', import.meta.url);
+
+export const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+// A generated artifact under out/, read as text (e.g. 'outline.contract.json').
+export const readOut = (file) => readFileSync(new URL(`out/${file}`, HERE), 'utf8');
+
+// The contract's canonical body encoding: the exact form `digest` hashes.
+export function canonical(v) {
+  if (Array.isArray(v)) return '[' + v.map(canonical).join(',') + ']';
+  if (v && typeof v === 'object')
+    return '{' + Object.keys(v).sort().map(k => JSON.stringify(k) + ':' + canonical(v[k])).join(',') + '}';
+  return JSON.stringify(v);
+}
+
+export const contractDigest = contract =>
+  createHash('sha256').update(canonical((({ digest, ...body }) => body)(contract))).digest('hex');
+
+// A tab id is the client's identity on the wire: its proposals carry
+// `<tab>:<request>` as a nonce, and the hello declares it. It must match the
+// wire's /^[a-z0-9]{8,32}$/.
+export const DEFAULT_TAB = 'kitclient0000001';
+
+// A proposal's nonce: this tab's id and the request number, stable across
+// resends. The server commits a nonce at most once, so a resend is safe even
+// if the first answer was lost.
+export const nonce = (tab, request) => `${tab}:${request}`;
+
+// The child runs the generated client bundle with the same host bridge the
+// browser Worker uses; the app name picks the contract and the bundle, and the
+// tab id is the identity every hello declares.
+const clientSource = (app, tab) => `
+  import * as H from './host.mjs';
+  import { createCodec, encode, frameToBL, helloToBL, presenceToBL } from './split-codec.mjs';
+  import { readFileSync } from 'node:fs';
+  const codec = createCodec(JSON.parse(readFileSync('out/${app}.contract.json', 'utf8')));
+  H.setEmitter((topic, value) => { process.stdout.write(JSON.stringify({ topic, value: encode(value) }) + '\\n'); });
+  process.stdin.setEncoding('utf8');
+  let buf = '';
+  process.stdin.on('data', d => {
+    buf += d;
+    let i;
+    while ((i = buf.indexOf('\\n')) >= 0) {
+      const msg = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1);
+      if (msg.kind === 'hello') H.enqueueData('hello', helloToBL(codec, msg, ${JSON.stringify(tab)}));
+      else if (msg.kind === 'presence') H.enqueueData('presence', presenceToBL(msg));
+      else if (msg.kind === 'event') H.enqueueData('event', H.vec(msg.event.map(x => typeof x === 'string' && x.startsWith(':') ? H.kw(x.slice(1)) : x)));
+      else if (msg.kind === 'asof') {
+        const past = msg.board ? codec.decodeSnapshot(msg.board) : null;
+        H.enqueueData('asof', past && Number.isSafeInteger(msg.revision)
+          ? H.bmap([[H.kw('revision'), msg.revision], [H.kw('board'), past]]) : H.bmap([]));
+      }
+      else if (msg.kind === 'unreachable') H.enqueueData('unreachable', msg.request);
+      else if (msg.kind === 'offline' || msg.kind === 'online') H.enqueueData(msg.kind, '');
+      else if (msg.kind === 'result' || msg.kind === 'snapshot') H.enqueueData(msg.kind, frameToBL(codec, msg.frame));
+      else if (msg.kind === 'stop') H.enqueueData('stop', '');
+    }
+  });
+  await import('./out/${app}-client.mjs');
+`;
+
+// ── the server: the app's authority, natively on BEAM ────────────────────────
+//
+// `startBeam(apps, {port, data})` boots `bl serve research/split-beam/serve.bl`
+// for the named apps (one app → served at `/`) and waits for it to answer.
+// `data` is the directory durable logs live in (null: none). A boot is slow
+// (the whole language comes up), so a verifier starts ONE and reuses it.
+
+const REPO = new URL('../../', HERE);
+let nextPort = 18800 + (process.pid % 400) * 4;
+
+export async function startBeam(apps, { port = nextPort++, data = null, timeoutMs = 600000, env: extra = {} } = {}) {
+  const env = { ...process.env, SPLIT_DATA: data === null ? 'none' : data, ...extra };
+  const child = spawn(new URL('bin/bl', REPO).pathname,
+    ['serve', 'research/split-beam/serve.bl', '--port', String(port), '--', ...apps],
+    { cwd: REPO.pathname, env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+  let log = '';
+  child.stdout.setEncoding('utf8'); child.stderr.setEncoding('utf8');
+  child.stdout.on('data', d => { log += d; }); child.stderr.on('data', d => { log += d; });
+  const exited = new Promise(resolve => child.once('exit', code => resolve(code)));
+  const base = `http://127.0.0.1:${port}`;
+  const probe = apps.length === 1 ? '/api/app' : `/${apps[0]}/api/app`;
+  const start = Date.now();
+  for (;;) {
+    if (child.exitCode !== null) throw new Error('bl serve exited early:\n' + log.slice(-2000));
+    if (Date.now() - start > timeoutMs) { try { process.kill(-child.pid, 'SIGKILL'); } catch {} throw new Error('bl serve never answered:\n' + log.slice(-2000)); }
+    try { const r = await fetch(base + probe); if (r.ok) break; } catch { /* not yet */ }
+    await sleep(250);
+  }
+  const close = async () => {
+    if (child.exitCode !== null) return;
+    try { process.kill(-child.pid, 'SIGTERM'); } catch { /* gone */ }
+    await Promise.race([exited, sleep(5000).then(() => { try { process.kill(-child.pid, 'SIGKILL'); } catch {} })]);
+  };
+  process.once('exit', () => { try { process.kill(-child.pid, 'SIGKILL'); } catch { /* gone */ } });
+  return { port, base, get log() { return log; }, exited, close };
+}
+
+export async function startApp(app, options = {}) {
+  const service = await startBeam([app], options);
+  service.codec = createCodec(JSON.parse(readOut(`${app}.contract.json`)));
+  const base = service.base;
+  const post = async (json) => {
+    const r = await fetch(base + '/api/intent', { method: 'POST',
+      headers: { 'content-type': 'application/json' }, body: JSON.stringify(json) });
+    return { status: r.status, body: await r.json() };
+  };
+
+  const events = [];
+  const sse = await fetch(base + '/api/events');
+  const reader = sse.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  (async () => {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return;
+      buffer += decoder.decode(value, { stream: true });
+      let i;
+      while ((i = buffer.indexOf('\n\n')) >= 0) {
+        const chunk = buffer.slice(0, i); buffer = buffer.slice(i + 2);
+        const ev = /^event: (\w+)\ndata: (.*)$/m.exec(chunk);
+        if (ev) events.push({ type: ev[1], data: JSON.parse(ev[2]) });
+      }
+    }
+  })().catch(() => {});
+
+  const until = async (pred, label, timeoutMs = 5000) => {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) { if (pred()) return; await sleep(10); }
+    throw new Error('timed out waiting for ' + label);
+  };
+
+  // The CURRENT snapshot: open a fresh stream, read its hello, hang up.
+  const snapshotNow = async () => {
+    const r = await fetch(base + '/api/events');
+    const rd = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    try {
+      for (;;) {
+        const { value, done } = await rd.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const m = /^event: hello\ndata: (.*)$/m.exec(buf);
+        if (m) return JSON.parse(m[1]);
+      }
+    } finally { try { await rd.cancel(); } catch { /* already closed */ } }
+    throw new Error('no hello on the events stream');
+  };
+
+  const close = async () => {
+    try { await reader.cancel(); } catch { /* already closed */ }
+    await service.close();
+  };
+
+  return { app, service, codec: service.codec, base, post, events, until, snapshotNow, close };
+}
+
+export function spawnClient(app, { tab = DEFAULT_TAB } = {}) {
+  if (typeof tab !== 'string' || !/^[a-z0-9]{8,32}$/.test(tab))
+    throw new Error('spawnClient: tab must match /^[a-z0-9]{8,32}$/');
+  const child = spawn(process.execPath, ['--input-type=module', '-e', clientSource(app, tab)],
+                      { cwd: HERE.pathname, stdio: ['pipe', 'pipe', 'inherit'] });
+  const frames = [];
+  let buffer = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', d => {
+    buffer += d;
+    let i;
+    while ((i = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, i); buffer = buffer.slice(i + 1);
+      if (line.trim() !== '') frames.push(JSON.parse(line));
+    }
+  });
+
+  const tell = m => child.stdin.write(JSON.stringify(m) + '\n');
+  const next = (topic, fromIndex = 0, timeoutMs = 15000) => nextWhere(topic, fromIndex, () => true, timeoutMs);
+  const nextWhere = async (topic, fromIndex, pred, timeoutMs = 15000) => {
+    const start = Date.now();
+    for (;;) {
+      const hit = frames.slice(fromIndex).find(f => f.topic === topic && pred(f));
+      if (hit) return hit;
+      if (Date.now() - start >= timeoutMs) throw new Error('timed out waiting for client frame ' + topic);
+      await sleep(10);
+    }
+  };
+  const close = async () => {
+    if (child.exitCode !== null) return;
+    try { tell({ kind: 'stop' }); child.stdin.end(); } catch { /* already gone */ }
+    await new Promise(resolve => {
+      const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* gone */ } resolve(); }, 3000);
+      child.once('exit', () => { clearTimeout(timer); resolve(); });
+    });
+  };
+  // Hand the client the answer to its in-flight proposal and return the view
+  // it renders FROM that answer. Views emitted earlier (the one drawn when the
+  // proposal was sent) may still be arriving, so the wait is anchored on the
+  // settle step's trace, which the client emits before re-rendering.
+  const SETTLE_STEPS = new Set(['confirmed', 'rebased', 'server-refused']);
+  const settle = async (frame, timeoutMs = 15000) => {
+    const mark = frames.length;
+    tell({ kind: 'result', frame });
+    const trace = await nextWhere('trace', mark, f => SETTLE_STEPS.has(f.value.step), timeoutMs);
+    return nextWhere('view', frames.indexOf(trace) + 1, () => true, timeoutMs);
+  };
+  return { child, frames, tell, next, nextWhere, settle, close, tab };
+}
+
+// Every string anywhere in a view tree.
+export function texts(node, acc = []) {
+  if (typeof node === 'string') acc.push(node);
+  else if (Array.isArray(node)) for (const n of node) texts(n, acc);
+  return acc;
+}
+
+// Every view node (an array) matching `pred`, depth first.
+export function findAll(tree, pred, acc = []) {
+  if (Array.isArray(tree)) {
+    if (pred(tree)) acc.push(tree);
+    for (const n of tree) findAll(n, pred, acc);
+  }
+  return acc;
+}
+
+// A view node's attribute map: `[:tag {...} ...]` → `{...}`, else null.
+export function attr(node) {
+  return Array.isArray(node) && node[1] !== null && typeof node[1] === 'object' && !Array.isArray(node[1])
+    ? node[1] : null;
+}

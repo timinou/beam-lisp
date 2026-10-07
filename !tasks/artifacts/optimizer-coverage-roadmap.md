@@ -1,5 +1,9 @@
 # Automatic optimizer: remaining coverage and next integration prototypes
 
+## Current plan and status
+
+PLAN-160 promotes the P1 subset (callback facts and private strict map/fold fusion, default and bounded) into the central optimizer; the experimental lexical option is retired and standalone alias rematerialization is refused as unprofitable. The current-source pre-merge promotion is accepted:317sources built without errors,105tests/3680assertions plus strict cold acceptance and150checked normal-source samples. See `optimizer-promotion-delivery.md`; the namespace-table branch integration has separate accepted combined-generation gates recorded in `optimizer-ns-defs-merge-delivery.md` (203tests/4216assertions strict cold, plus actual checkout-root44/560). P2 (callable mode) was measured as a negative result and stays baseline. P3 to Later remain deferred. The reasoning, evidence, counterexamples, promotion gates and review milestones for each deferral are in **`research/optimizer-integration/README.md`** (the revisit ledger); the historical measurements in this file and in `optimizer-prototypes-delivery.md` are retained unchanged. Current design: `docs/compiler/optimizer.bl.md`.
+
 ## Decision
 
 Extend the existing implementation, not individual application namespaces. Every descriptor already passes through `BeamLisp.Optimize/module`; automatic entry coverage is complete, but rewrite eligibility is deliberately narrow. The next useful work is **lexical callback identity and private strict intermediate uses**, followed by a **measured per-traversal callable-mode experiment**. Broader strict composition can follow those facts. Ordinary public arithmetic values, indexed/lazy pipelines, transducers and algebraic traversal elimination need separate obligations; none is authorized by the existing map/fold law alone.

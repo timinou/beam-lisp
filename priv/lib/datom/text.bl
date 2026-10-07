@@ -1,0 +1,315 @@
+;; Durable substring candidate index. Postings share the source transaction's
+;; atomic commit, live in the internal keyspace, and retain history for as-of.
+;; This is a candidate filter, not a ranker: callers verify their text semantics.
+(ns datom.text
+  (:require [datom.db :as db] [datom.index :as index] [datom.store :as store]
+            [datom.schema :as schema] [datom.derived :as derived]
+            [datom.attr-basis :as marks] [data.bounded-cache :as cache]))
+
+(def VERSION 2)
+(def MAX-TEXT-BYTES 1048576)
+(def MAX-QUERY-BYTES 16384)
+(def PREFIX (erlang/list_to_binary (to-list [0 120])))
+(defn- prefixed [key] (erlang/iolist_to_binary (list PREFIX key)))
+(defn- ready-ident [attr] [:datom.text/ready attr])
+(defn- indexed-ident [attr] [:datom.text/indexed attr])
+(defn ready? [database attr]
+  (let [st (db/store-of database) evidence (derived/get-record st (ready-ident attr))]
+    (and (= VERSION (:version evidence))
+         (<= (marks/write-basis-t-for st attr (db/basis-t database)) (:through evidence)))))
+(defn enabled? [database attr]
+  (= true (:db/fulltext (schema/attr-def (db/schema-of database) attr))))
+
+(defn- combining?
+  [cp]
+  (or (and (>= cp 768)   (<= cp 879))    ; U+0300–U+036F combining diacriticals
+      (and (>= cp 1155)  (<= cp 1161))   ; U+0483–U+0489 Cyrillic
+      (and (>= cp 1425)  (<= cp 1469))   ; U+0591–U+05BD Hebrew
+      (and (>= cp 1471)  (<= cp 1479))   ; U+05BF–U+05C7 Hebrew
+      (and (>= cp 1552)  (<= cp 1562))   ; U+0610–U+061A Arabic signs
+      (and (>= cp 1611)  (<= cp 1631))   ; U+064B–U+065F Arabic harakat
+      (= cp 1648)                        ; U+0670 superscript alef
+      (and (>= cp 1750)  (<= cp 1773))   ; U+06D6–U+06ED Quranic marks
+      (and (>= cp 6832)  (<= cp 6911))   ; U+1AB0–U+1AFF extended
+      (and (>= cp 7616)  (<= cp 7679))   ; U+1DC0–U+1DFF supplement
+      (and (>= cp 8400)  (<= cp 8447))   ; U+20D0–U+20FF for symbols
+      (and (>= cp 65056) (<= cp 65071)))) ; U+FE20–U+FE2F half marks
+
+(defn- cps->binary [cps] (unicode/characters_to_binary (to-list (into [] cps))))
+
+(defn fold
+  "`s`, folded for comparison: lower-cased, NFD-decomposed, combining marks and
+   the Arabic tatweel removed. Separators are left alone, so a phrase still
+   matches as a phrase. Public because the multilingual behaviour is asserted
+   directly — Arabic (RTL, harakat, tatweel) and French (accents, combining
+   marks)."
+  [s]
+  (let [cps (to-list (unicode/characters_to_list
+                       (unicode/characters_to_nfd_binary (String/downcase (str (or s ""))))))]
+    (cps->binary (into [] (keep (fn [cp] (if (or (combining? cp) (= cp 1600)) nil cp)) cps)))))
+
+(defn grams
+  "Distinct folded Unicode trigrams. Short strings have no indexed grams."
+  [text]
+  (when (> (erlang/byte_size (str text)) MAX-TEXT-BYTES)
+    (throw (ex-info "Fulltext value exceeds the 1 MiB indexing limit; split it into passages."
+                    {:kind :text-index-budget :max-bytes MAX-TEXT-BYTES})))
+  (let [cps (into [] (to-list (unicode/characters_to_list (fold text))))]
+    (into #{} (map cps->binary (partition 3 1 cps)))))
+
+(defn- word-char?
+  "Whether `cp` belongs to a word. Folded text is ASCII for every cased script;
+   the scripts with no case (Arabic, Hebrew, CJK, kana) survive folding
+   untouched, so anything outside the known separator ranges counts."
+  [cp]
+  (cond
+    (and (>= cp 48) (<= cp 57)) true        ; 0-9
+    (and (>= cp 97) (<= cp 122)) true       ; a-z (folded)
+    (< cp 128) false                        ; other ASCII: space, punctuation
+    (<= cp 191) false                       ; U+00A0–U+00BF NBSP ¡ « » × ÷ º
+    (and (>= cp 8192) (<= cp 8303)) false   ; U+2000–U+206F general punctuation
+    (= cp 1548) false                       ; Arabic comma
+    (= cp 1563) false                       ; Arabic semicolon
+    (= cp 1567) false                       ; Arabic question mark
+    (and (>= cp 1642) (<= cp 1645)) false   ; Arabic %, decimal, thousands, star
+    (= cp 1748) false                       ; Arabic full stop
+    (and (>= cp 12288) (<= cp 12351)) false ; U+3000–U+303F CJK punctuation
+    (and (>= cp 65280) (<= cp 65295)) false ; halfwidth/fullwidth punctuation
+    (and (>= cp 65306) (<= cp 65312)) false
+    (and (>= cp 65339) (<= cp 65344)) false
+    (and (>= cp 65371) (<= cp 65381)) false
+    :else true))
+
+(defn tokens
+  "The folded `s` as a vector of word tokens, splitting on everything
+   `word-char?` rejects. One token per run; punctuation and spaces are
+   separators, not content."
+  [s]
+  (loop [cps (to-list (unicode/characters_to_list (fold s))) cur [] acc []]
+    (if (empty? cps)
+      (if (empty? cur) acc (conj acc (cps->binary cur)))
+      (let [cp (first cps)]
+        (if (word-char? cp)
+          (recur (rest cps) (conj cur cp) acc)
+          (recur (rest cps) [] (if (empty? cur) acc (conj acc (cps->binary cur)))))))))
+
+(defn- index-terms [value]
+  (into (into #{} (map (fn [g] (str "g:" g)) (grams value)))
+        (map (fn [w] (str "w:" w)) (filter (fn [w] (<= (count w) 32)) (tokens value)))))
+
+(defn- posting-facts [s datoms]
+  (reduce (fn [out d]
+            (let [[e a value tx added] d]
+              (if (= true (:db/fulltext (schema/attr-def s a)))
+                (reduce (fn [out term]
+                          (let [k [e a term tx]]
+                            (update out k (fn [old] (conj (or old #{}) added)))))
+                        out (index-terms value)) out))) {} datoms))
+
+(defn- frequency-ident [attr term] [:datom.text/frequency attr term])
+
+(defn- fact-ops [facts]
+  (mapv (fn [kv]
+          (let [[e a term tx] (key kv) d [e a term tx (contains? (val kv) true)]]
+            [:put (prefixed (index/key-for :avet d)) d])) (into [] facts)))
+
+(defn posting-ops
+  "Internal index operations for realized source datoms. A replacement can
+   retract and assert the same gram at one tx: the assertion wins, because
+   the new text still contains it. Source attributes are cardinality-one."
+  [s datoms]
+  (fact-ops (posting-facts s datoms)))
+
+(defn- frequency-ops [st facts]
+  ;; Counts are selectivity hints only; they never justify skipping a probe.
+  ;; Shared grams in a replacement have zero delta, rather than double counting.
+  (let [delta (reduce (fn [m kv]
+                        (let [[_ a term _] (key kv) flags (val kv)
+                              change (cond (= flags #{true false}) 0
+                                           (contains? flags true) 1 :else -1)]
+                          (update m [a term] (fn [n] (+ (or n 0) change)))))
+                      {} facts)]
+    (mapv (fn [kv] (let [[a term] (key kv) ident (frequency-ident a term)
+                        old (derived/get-record st ident)]
+                    (let [n (+ (if (number? old) old 0) (val kv))]
+                      (if (<= n 0) [:delete (derived/record-key ident)]
+                        [:put (derived/record-key ident) n]))))
+          (filter (fn [kv] (not= 0 (val kv))) (into [] delta)))))
+
+(defn commit-ops
+  "Postings and completeness evidence share the source commit. Existing
+   columns require bounded backfill. Evidence follows per-attribute write marks,
+   so disabling indexing or writes from an older runtime invalidate readiness."
+  [st s datoms]
+  (let [facts (posting-facts s datoms)
+        attrs (distinct (map (fn [d] (nth d 1)) datoms))
+        through (reduce max 0 (map (fn [d] (nth d 3)) datoms))]
+    (reduce (fn [ops a]
+              (let [evidence (derived/get-record st (ready-ident a))
+                    enabled (= true (:db/fulltext (schema/attr-def s a)))]
+                (cond
+                  (and evidence (not enabled))
+                    (conj ops [:delete (derived/record-key (ready-ident a))])
+                  (not enabled) ops
+                  (and (= VERSION (:version evidence))
+                       (<= (marks/write-basis-t-for st a 0) (:through evidence)))
+                    (conj ops [:put (derived/record-key (ready-ident a)) {:version VERSION :through through}])
+                  :else
+                    (let [lo (index/key-prefix :aevt a)
+                          p (store/ordered-page st lo nil (index/prefix-end lo) 1 :asc)]
+                      (if (and (:end? p) (empty? (:datoms p)) (not (:refused p)))
+                        (conj ops [:put (derived/record-key (ready-ident a)) {:version VERSION :through through}]) ops)))))
+            (into (into (fact-ops facts) (frequency-ops st facts))
+                  (mapv (fn [a] [:put (derived/record-key (indexed-ident a)) VERSION])
+                        (filter (fn [a] (= true (:db/fulltext (schema/attr-def s a)))) attrs))) attrs)))
+
+(defn excision-ops
+  "Remove private postings when source history is physically excised."
+  [st s raw tx]
+  (let [attrs (distinct (map (fn [d] (nth d 1)) raw))
+        strings (reduce (fn [s a] (if (and (= :db.type/string (schema/value-type s a))
+                                           (not (schema/many? s a))
+                                           (or (= true (:db/fulltext (schema/attr-def s a)))
+                                               (some? (derived/get-record st (indexed-ident a)))))
+                                    (assoc-in s [a :db/fulltext] true) s)) s attrs)
+        facts (posting-facts strings (filter (fn [d] (or (not (string? (nth d 2)))
+                                                        (<= (erlang/byte_size (nth d 2)) MAX-TEXT-BYTES))) raw))
+        ops (into [] (mapcat (fn [kv]
+                                (let [[e a term t] (key kv)]
+                                  (mapv (fn [added] [:delete (prefixed (index/key-for :avet [e a term t added]))])
+                                        [true false]))) facts))
+        ops (into ops (mapv (fn [pair] [:delete (derived/record-key (frequency-ident (first pair) (second pair)))])
+                            (distinct (map (fn [kv] [(nth (key kv) 1) (nth (key kv) 2)]) facts))))]
+    (reduce (fn [ops a]
+              (let [old (derived/get-record st (ready-ident a))]
+                (if (and (= VERSION (:version old))
+                         (<= (marks/write-basis-t-for st a 0) (:through old)))
+                  (conj ops [:put (derived/record-key (ready-ident a)) {:version VERSION :through tx}]) ops)))
+            ops attrs)))
+
+(defn reindex-page!
+  "Backfill one bounded physical page, including history. :after is a
+   provenance-checked opaque token, not a client-selected index position.
+   New source writes maintain postings; old tx keys cannot overwrite them.
+   Completion publishes evidence. Use only with an authorized maintenance DB."
+  [database attr opts]
+  (cache/ready! :datom.text.backfill)
+  (let [st (db/store-of database)
+        context (cache/fingerprint [(store/identity-of st) attr
+                                    (schema/attr-def (db/schema-of database) attr) VERSION])
+        old (when (:after opts) (cache/lookup :datom.text.backfill (:after opts) context))
+        state (:value old) now (erlang/system_time :millisecond)]
+    (cond
+      (not (enabled? database attr)) {:status :refused :reason :not-enabled}
+      (or (not= :current (:filter-mode database)) (:since-t database)
+          (:valid-at database) (:valid-between database) (:query-scope database))
+        {:status :refused :reason :unsupported-view}
+      (nil? context) {:status :refused :reason :opaque-context}
+      (and (:after opts) (or (not (:hit? old)) (<= (:expires state) now)))
+        {:status :refused :reason :invalid-cursor}
+      :else
+        (let [lo (index/key-prefix :aevt attr)
+              p (store/ordered-page st lo (:position state) (index/prefix-end lo)
+                                    (or (:limit opts) 128) :asc (or (:bytes opts) 8388608))]
+          (cond
+            (:refused p) {:status :refused :reason (:refused p)}
+            (:byte-limited? p) {:status :refused :reason :oversized-text}
+            :else
+              (let [ops (conj (posting-ops (db/schema-of database) (:datoms p))
+                              [:put (derived/record-key (indexed-ident attr)) VERSION])
+                    ops (if (:end? p)
+                          (conj ops [:put (derived/record-key (ready-ident attr))
+                                     {:version VERSION :through (marks/write-basis-t-for st attr (db/basis-t database))}]) ops)
+                    token (when-not (:end? p) (crypto/strong_rand_bytes 24))
+                    saved (or (:end? p) (cache/put! :datom.text.backfill token context
+                                                         {:position (:last p) :expires (+ now 300000)}))]
+                (if (not saved) {:status :refused :reason :cursor-capacity}
+                  (do (when (seq ops) (store/-commit st ops))
+                    {:status (if (:end? p) :exact :incomplete)
+                     :after token :rows (count (:datoms p)) :bytes (:bytes p)
+                     :postings (count ops)}))))))))
+
+(defn- rare-gram [st attr value]
+  (first (sort-by (fn [g] (let [n (derived/get-record st (frequency-ident attr (str "g:" g)))]
+                            [(if (number? n) n 0) g])) (grams value))))
+
+(defn- reverse-terms [word]
+  ;; Reverse containment means a complete document word occurs INSIDE the
+  ;; query word. Exact dictionary probes preserve that behavior without
+  ;; broad unions of every trigram posting list. Query words are capped at 32.
+  (let [cps (into [] (to-list (unicode/characters_to_list word))) n (count cps)
+        minimum (if (= (erlang/byte_size word) n) 4 1)]
+    (into #{} (keep (fn [part] (when (>= (erlang/byte_size part) 4) (str "w:" part)))
+                   (for [start (range n) end (range (+ start minimum) (inc n))]
+                     (cps->binary (subvec cps start end)))))))
+
+(defn- probe [database attr term budget]
+  (let [lo (prefixed (index/key-prefix :avet attr term))]
+    (loop [after nil live {} budget budget read 0 seeks 0]
+      (if (some (fn [k] (<= (get budget k) 0)) [:rows :seeks :bytes])
+        {:status :incomplete :rows read :seeks seeks}
+        (let [p (store/ordered-page (db/store-of database) lo after (index/prefix-end lo)
+                                    (min 1024 (:rows budget)) :asc (:bytes budget))
+              n (count (:datoms p))
+              budget (-> budget (update :rows - n) (update :seeks dec)
+                         (update :bytes - (or (:bytes p) 0)))
+              live (reduce (fn [m d] (let [e (nth d 0) tx (nth d 3) old (get m e)]
+                                      (if (and (<= tx (db/basis-t database))
+                                               (or (nil? old) (> tx (first old))
+                                                   (and (= tx (first old)) (nth d 4))))
+                                        (assoc m e [tx (nth d 4)]) m))) live (:datoms p))]
+          (cond
+            (:refused p) {:status :refused :reason (:refused p)}
+            (:byte-limited? p) {:status :incomplete :rows (+ read n) :seeks (inc seeks)}
+            (:end? p) {:status :exact :budget budget :rows (+ read n) :seeks (inc seeks)
+                       :eids (into #{} (keep (fn [kv] (when (second (val kv)) (key kv))) live))}
+            :else (recur (:last p) live budget (+ read n) (inc seeks))))))))
+
+(defn candidates
+  "Superset for folded phrase/substring and >=50% token coverage ranking.
+   Rare-gram phrase/forward probes plus exact reverse-containment word probes
+   avoid corpus-wide false positives. Every candidate still needs verification.
+   Posting budgets bound physical reads; exhaustion yields no partial set.
+   Short phrases, long words, incomplete indexes and unsupported views refuse."
+  [database attr query opts]
+  (let [valid? (and (string? query) (String/valid? query)
+                    (<= (erlang/byte_size query) MAX-QUERY-BYTES))
+        q (when valid? (String/trim (fold query))) qt (when valid? (tokens q))
+        st (db/store-of database)
+        budget (merge {:rows 100000 :seeks 4096 :bytes 16777216} opts)]
+    (cond
+      (not valid?) {:status :refused :reason :invalid-terms}
+      (not (enabled? database attr)) {:status :refused :reason :not-enabled}
+      (not (ready? database attr)) {:status :refused :reason :unindexed}
+      (or (empty? (grams q))
+          (some (fn [w] (and (>= (count w) 4) (empty? (grams w)))) qt))
+        {:status :refused :reason :short-term}
+      (or (> (count qt) 64) (some (fn [w] (> (count w) 32)) qt))
+        {:status :refused :reason :long-term}
+      (or (not= :current (:filter-mode database)) (:since-t database)
+          (:valid-at database) (:valid-between database) (:query-scope database))
+        {:status :refused :reason :unsupported-view}
+      (not (every? (fn [k] (and (erlang/is_integer (get budget k))
+                                (< 0 (get budget k)) (<= (get budget k) 268435456))) [:rows :seeks :bytes]))
+        {:status :refused :reason :invalid-budget}
+      :else
+        (let [phrase (str "g:" (rare-gram st attr q))
+              groups (mapv (fn [w]
+                             (if (< (count w) 4) #{(str "w:" w)}
+                               (conj (reverse-terms w) (str "g:" (rare-gram st attr w))))) qt)
+              terms (into #{phrase} (mapcat identity groups))]
+          (loop [remaining (seq terms) results {} budget budget read 0 seeks 0]
+            (if (empty? remaining)
+              (let [coverage (reduce (fn [counts group]
+                                       (let [ids (into #{} (mapcat (fn [t] (get results t)) group))]
+                                         (reduce (fn [m e] (update m e (fn [n] (inc (or n 0))))) counts ids)))
+                                     {} groups)
+                    required (erlang/div (inc (count qt)) 2)]
+                {:status :exact :rows read :seeks seeks
+                 :eids (into (get results phrase #{})
+                             (keep (fn [kv] (when (>= (val kv) required) (key kv))) coverage))})
+              (let [p (probe database attr (first remaining) budget)]
+                (if (not= :exact (:status p)) (assoc (dissoc p :eids) :reason (or (:reason p) :budget)
+                                                            :rows (+ read (or (:rows p) 0)) :seeks (+ seeks (or (:seeks p) 0)))
+                  (recur (rest remaining) (assoc results (first remaining) (:eids p))
+                         (:budget p) (+ read (:rows p)) (+ seeks (:seeks p)))))))))))

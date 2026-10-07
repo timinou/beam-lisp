@@ -33,20 +33,60 @@ is what makes `--json` pipeable — one JSON object, nothing else. It is also wh
 pipe the caller closed: a command that loses its reader stops, and stops
 without pretending something went wrong.
 
-## The warm daemon
+## The warm VM
 
-The drop's launcher first looks for a **warm `bl daemon` for the caller's tree**
-and forwards the command to it over a Unix socket. A served command returns in
-tens of milliseconds instead of the ~1s a cold VM boot costs. When no daemon is
-up, the launcher cold-boots the release and runs the command there — same
-result, just slower.
+The drop's launcher first looks for a **warm VM for the caller's project** and
+forwards the command to it over a Unix socket. A served command returns in tens
+of milliseconds instead of the ~1s a cold VM boot costs. With no warm VM, the
+launcher cold-boots the release and runs the command there — same result, just
+slower.
 
+Three global flags choose the mode (they may appear anywhere before `--`):
+
+| flag | meaning |
+|---|---|
+| `--cold` | run this command in a fresh VM; never use a warm one |
+| `--warm` | use the warm VM, starting one if none runs |
+| `--root DIR` | act as if the command ran in `DIR`: the project, and so the warm VM, it belongs to |
+| `--share-vm` | use the one VM this build shares between projects |
+| `--own-vm` | use this project's own VM (wins over `--share-vm`) |
+
+A project declares its own default in `env.bl`, and the machine in
+`~/.config/bl/config.bl`, with `:warm "off" | "attach" | "start"`. Precedence:
+flag > `env.bl` > `config.bl` > the built-in default. The default depends on
+whether the project shares its VM (below): a project with its own VM `attach`es —
+it uses a running warm VM and never starts one, because that would be a VM per
+directory — while a project that shares its build's VM `start`s it, because that is
+one process however many projects use it.
+
+### One VM per project, or one shared
+
+By default a project has its own warm VM. A project that has checked it can live
+beside others declares it in `env.bl`:
+
+```clojure
+{:name "notes"
+ :vm "shared"}     ; "own" (the default) | "shared"
 ```
-BL_DAEMON=off    every command cold-boots; no daemon is consulted
-BL_DAEMON=auto   a missing daemon is started detached, then the command is retried once
-```
 
-`bl daemon start`, `stop` and `status` are the lifecycle — see
+Every project on one build that says `"shared"` then uses a single VM, and each
+command finds its project from the directory it runs in (the nearest `env.bl`
+at or above it). `bl realm stop` in such a project closes that project's realm and
+leaves the VM and the other projects running; `bl realm members` lists what a
+project owns, `bl realm restart` closes and reopens it; `bl vm stop` ends the VM itself.
+
+Sharing is a choice because the VM keeps one copy of each namespace: two shared
+projects that both define a namespace named `app` share it. A source checkout is
+never shared. `--share-vm` and `--own-vm` decide for one command; precedence is
+flag > `env.bl` > own.
+
+With `start`, the command that finds no warm VM runs cold, right away, and starts
+a warm VM in the background for the next one. It never waits for the VM. What the
+background VM prints goes to `~/.local/state/beam-lisp/logs/` (read it with
+`bl vm logs`), and a second command that arrives while one is starting does not
+start another.
+
+`bl realm start`, `stop` and `show` are the lifecycle — see
 [03-the-live-loop.md](03-the-live-loop.md) for the reload loop and
 [06-the-warm-daemon.md](06-the-warm-daemon.md) for the whole warm-VM DX: named
 ports, the gateway that resolves the names, and the live dashboard.
@@ -111,7 +151,7 @@ Wayland the window is content-only: the app fills the surface and no GTK
 title/header bar is drawn. On X11 the window manager frames it as usual. The
 window and `--web` alike attach to the tree's running session when one exists,
 and boot one when none does. After updating the REPL on disk, restart an older
-running daemon (`bl daemon stop`, then `bl daemon start`) before reopening the
+running warm VM (`bl realm stop`, then `bl realm start`) before reopening the
 page: its HTTP router remains the version loaded at boot. `bl doctor` reports
 the native backends this host can build.
 
@@ -128,7 +168,7 @@ user=> (map (fn [x] (* x x))
 user=>
 ```
 
-### test · examples · ward · check · lint · fix · ask
+### test · examples · check · lint · fix · ask
 
 #### `bl test [PATH...] [--async] [--json]`
 
@@ -172,26 +212,8 @@ matched.
 
 `--json` keys: `files` (`path`, `status`), `passed`, `skipped`, `failed`, `ok`.
 
-#### `bl ward FILE...`
-
-Run files in isolated, coherence-gated forks. Each file must declare a
-namespace; a file whose definitions do not cohere is reported as incoherent
-rather than run.
-
-```sh
-$ bl ward ns_hello.bl
-ward fork ran
-
-Testing ns-hello
-── ward: warm isolated test run ──
-
-  ✓ ns-hello  0 passed
-
-  1 file(s) passed, 0 failed, 0 incoherent
-  ✓ all green
-```
-
-Exit `0` when every file passed, `1` otherwise.
+`bl ward` is gone — `bl test` runs every file in its own isolated fork by
+default, and `--shared` runs them all in one image.
 
 #### `bl check [PATH...] [--changed] [--update] [--fix] [--json] [--install-hook]`
 
@@ -380,7 +402,7 @@ beam-lisp AOT: up to date
 
 Exit `0` when every source built, `1` when any failed, `2` on a usage error.
 
-### watch · monitor · serve · daemon
+### watch · monitor · serve
 
 #### `bl watch FILE|DIR`
 
@@ -453,40 +475,32 @@ process holds is an error naming the owner, never a silent move.
 ```
 `bandit`, which the release ships.
 
-#### `bl daemon start|stop|status`
+### vm · realm
 
-The warm-VM dev loop, one daemon per tree. `start` becomes the daemon (it
-blocks; the drop's launcher runs it detached); `stop` drains and exits; `status`
-reports a running daemon or says none is running.
+Two nouns, one rule: **`bl realm` is about the project in front of you; `bl vm`
+is about the machine.** Every flag belongs to the shared argv table (see
+[Global flags](#global-flags)). The full command set is in
+[../design/realm/commands.md](../design/realm/commands.md).
 
-```sh
-$ bl daemon status
-bl daemon
-  pid           1812553
-  tree          57461829a20cc2af
-  compiler_key  3ac9ac2ebd0b84e00a2b27f98efd9e0c15834b2348d3ee9522781918bd709ec6
-  build_id      2026.0.0
-  uptime_ms     706826
-  queue_depth   0
-```
+#### `bl vm [--all] [--json]`
 
-`status` exits `0` when a daemon answers, `1` when none is running.
-
-### ports · ui · open · gateway
-
-#### `bl ports`
-
-Every port a session has claimed, name first: the host it answers at, the number
-behind it, the owning tree and its pid. A claim with no name — a port nobody
-declared — still lists, with its loopback address.
+The tree: VMs → realms → routes. Every port a realm has claimed, name first:
+the host it answers at, the number behind it, the VM that owns it and its pid. A
+claim with no name — a port nobody declared — still lists, with its loopback
+address. `--all` adds records whose VM is gone; `--json` prints
+`{vms, attention}`.
 
 ```sh
-$ bl ports
-  ui    http://beam-lisp.test:7777/     → 51337  beam-lisp (pid 1812553)
-  web   http://web.beam-lisp.test:7777/ → 4000   beam-lisp (pid 1812553)
+$ bl vm
+VM               ROLE     BUILD     UP      MEM    STATE
+a238fa91-4821    warm     a238fa91  4h      212M   up
+  blueprint  ui      http://blueprint.test/
+  knowledger ui      http://knowledger.test/
+gateway-3302     gateway  a238fa91  4h      18M    up
+c7704-12         warm     277640b0  2d15h   7.0G   up (old)
 
-  2 name(s) registered, but no gateway answers them:
-      bl gateway start    (one per user; see bl install gateway)
+! 2 name(s) are claimed, and nothing answers them
+    → bl vm start gateway
 ```
 
 The address shows the port when it has to and no port when it does not: the one
@@ -499,7 +513,26 @@ hint above says what is missing.
 The last two lines appear only when names are registered and nothing is
 listening for them. Exit `0`; an empty registry prints one line saying so.
 
-#### `bl open NAME [--open] [--port N]`
+#### `bl vm show ID [--json]` · `bl vm stop ID… | --all [--force]` · `bl vm prune [--dry-run]`
+
+`show` is one VM in full; `stop` asks then TERMs (`--force` adds KILL), and
+never includes the VM the command itself runs in; `prune` removes what dead VMs
+left behind. `ID` is an id, a pid, a unique id prefix, a label, or a build that
+exactly one VM runs — nothing guesses. Exit `1` on no match, ambiguity, or a
+refusal. See [../design/realm/commands.md](../design/realm/commands.md).
+
+#### `bl realm [show] [--json]`
+
+This project's realm: its VM, its routes, its address. `bl realm` defaults to
+`show`.
+
+#### `bl realm start|stop`
+
+Start this project's warm VM explicitly (`start` blocks; the launcher runs it
+detached), or drain the realm and remove its socket. In day-to-day use the
+launcher starts the warm VM on demand, so `start` is rarely typed.
+
+#### `bl realm open NAME [--open] [--port N]`
 
 The address behind a port name — the everyday verb, so nobody reads a number.
 It prints the name and the loopback address it routes to; `--open` hands the
@@ -508,7 +541,7 @@ raw port number. Exit `1` when nothing live holds the name, `2` with no
 argument.
 
 ```sh
-$ bl open web
+$ bl realm open web
 http://web.beam-lisp.test:7777/
   → http://127.0.0.1:4000/
 ```
@@ -517,39 +550,32 @@ One URL, and the port in it is the one that works: with the gateway answering on
 port 80 — itself or through `bl install redirect` — it is
 `http://web.beam-lisp.test/` instead.
 
-#### `bl ui [--open]`
+#### `bl vm ui [--open]`
 
 The session's own address — the page and its `/mcp` endpoint, one URL. Exactly
-`bl open ui`: one implementation, so the terminal and the dashboard cannot
+`bl realm open ui`: one implementation, so the terminal and the dashboard cannot
 disagree about where the session is. Exit `1` when no session is running for
 this tree.
 
-#### `bl gateway [start|stop|status|run]`
+#### `bl vm start|stop gateway`
 
 The one listener that answers NAMES: one per user, holding the port a URL may
 leave out (80 when it can), reading `Host:` and splicing the connection to the
-port that registered that name. With no subcommand it reports what it is doing —
-the port, and every name it routes.
+port that registered that name. `bl vm` lists it with the routes it answers.
 
 ```sh
-$ bl gateway
-bl gateway on 127.0.0.1:80 and [::1]:80   (pid 1900112)
-  port 80: answered — names need no port in the URL
-  beam-lisp.test       → 127.0.0.1:51337  beam-lisp
-  web.beam-lisp.test   → 127.0.0.1:4000   beam-lisp
+bl vm start gateway                # start it (a systemd user unit when installed; detaches otherwise)
+bl vm stop gateway                 # stop the running one
+bl vm start gateway --foreground   # the foreground process the unit execs (blocks)
 ```
 
-The `port 80` line is the one thing a developer cannot read off the rest: it is
-probed, not configured, and when nothing answers there it says
-`not answered — bl install redirect` instead.
+The port the gateway holds is the one thing a developer cannot read off the
+routes: it is probed, not configured, and when nothing answers on 80 the
+listing points at `bl install redirect` instead. `--foreground` blocks, and a
+pinned `--port N` it cannot bind is an error rather than a silent move.
 
-`start` uses the systemd user unit when one is installed and detaches otherwise;
-`stop` stops the running one; `run` is the foreground process the unit execs —
-it blocks, and a pinned `--port N` that cannot be bound is an error rather than
-a silent move.
-
-Exit `0` when the gateway is up; `stop` and `status` exit `1` when none was
-running; `2` on an unknown subcommand.
+Exit `0` when the gateway is up; `stop` exits `1` when none was running; `2` on
+an unknown subcommand.
 
 Port 80 is the only piece that needs root. Two ways to get it, and either one
 ends with every printed address losing its port:
@@ -562,7 +588,7 @@ sudo sysctl --system
 ```
 
 Which one is in force is not configured and not guessed: the gateway probes port
-80 and prints the address that answers. `bl gateway` reports the port it holds.
+80 and prints the address that answers. `bl vm` shows the port it holds.
 
 Names are derived from the tree, so the whole story is in
 [../dev/names.bl.md](../dev/names.bl.md): `<port>.<project>.test` and its
@@ -777,7 +803,7 @@ by something else, not answered) rather than assuming the port is free, and
 
 Report what this host can do: the language, OTP and Elixir, the native tiers
 (`datom_fjall`, `explorer`, `code_embed`, `lazy_memo`, `wry`), the solver, the
-daemon, the search and code paths, the embedding weights (which of the three
+warm VM, the search and code paths, the embedding weights (which of the three
 copies is answering), and the checkout's own markers. Two probes are required —
 the language evaluates, and the LazyMemo fast lane answers. An absent optional
 native is a line in the table, never a crash.
@@ -901,29 +927,50 @@ Flags may appear anywhere before `--`.
 | `--native` | build: also emit native modules |
 | `--install-hook` | check: install the pre-commit hook |
 | `--json` | machine-readable output where a command offers it |
+| `--cold` | run in a fresh VM; never use a warm one |
+| `--warm` | use the warm VM, starting one if none runs |
+| `--root DIR` | the project root the warm VM is keyed on |
+| `--idle SECONDS` | `realm start`: stop the VM after this long unused (default 28800; 0 never) |
+| `--log PATH` | `realm start`: where the VM writes what it prints |
+| `--lines N` | `vm logs`: how many lines to show (default 50) |
+| `--follow` | `vm logs`: keep printing as the VM writes |
 | `-h, --help` | show help |
 | `--version` | print the version |
 | `--` | everything after this goes to the program |
 
 ## Environment variables
 
-| variable | meaning |
-|---|---|
-| `BEAM_LISP_PATH` | colon-separated extra library roots — searched after the cwd and before the shipped tiers |
-| `BEAM_LISP_CODE_PATH` | colon-separated directories of prebuilt AOT beams to add to the VM code path |
-| `BL_DAEMON` | `off` skips the daemon fast path; `auto` starts a missing daemon and retries once |
-| `BL_DAEMON_ROOT` | the tree root the daemon serves (default: the current directory) |
-| `BL_DAEMON_IDLE_SECONDS` | stop an idle daemon after this many seconds; default `28800` (8 hours), `0` disables the timer |
-| `BL_CACHE_DIR` | where the analysis store lives — overrides every tier, relative to the cwd; the model is unaffected, so a CI job can point the store at a scratch volume without moving the weights |
-| `BL_CACHE_MAX_MB` | the store cap in MB, default `512` |
-| `BLANALYSIS_DIR` | one explicit store directory for a single run; `BL_CACHE_DIR` wins over it |
-| `BL_VERSION` | stamps a release build; `bl version` reports it |
-| `BL_USE` | the build to run here, overriding every other rule (`stable`, `latest`, `commit:SHA`, …) |
-| `BL_BUILD=never` | a missing build fails instead of being fetched or built |
-| `BL_AUTOBUILD=off` | git hooks queue no builds |
-| `BL_ALLOW_UNPUSHED_LATEST=1` | the `latest` pre-push guard lets the push through |
-| `BL_DROP_KEEP_DAYS` / `BL_DROP_GRACE_HOURS` | how long an unreferenced build is kept (14 days since last use / 24 h) |
-| `BL_BUILD_TIMEOUT_MIN` | a build step is stopped after this many minutes (45) |
+Every variable `bl` reads, once. A preference belongs in `env.bl`, `~/.config/bl/config.bl` or a flag; a variable is here only as an override, a handoff between the launcher and the VM, a test seam, or a standard one. `test/bl/env_vars_test.bl` diffs this table against what the code reads, so a variable cannot be read without being listed or listed without being read.
+
+| variable | kind | meaning |
+|---|---|---|
+| `BEAM_LISP_PATH` | override | colon-separated extra library roots, searched after the cwd and before the shipped tiers (`env.bl :paths` is the declared form) |
+| `BEAM_LISP_CODE_PATH` | override | colon-separated directories of prebuilt AOT beams to add to the VM code path |
+| `BEAM_LISP_AOT_CACHE` / `BEAM_LISP_AOT_CACHE_DIR` | override | turn the AOT cache off; move it |
+| `BEAM_LISP_AOT_REPAIR` / `BEAM_LISP_AOT_STRICT` | override | whether a stale library beam is repaired in place; whether staleness is an error |
+| `BEAM_LISP_DEV` / `BEAM_LISP_RELOAD` / `BEAM_LISP_IMAGE` | declaration | what a tree says about itself to the reloader and the image builder |
+| `BEAM_LISP_MODEL_DIR` | override | where the embedding model's weights live |
+| `BEAM_LISP_Z3` / `BEAM_LISP_Z3_FORCE` | workaround | z3 provisioning (to be fixed, then deleted) |
+| `BEAM_LISP_NIF_TRACE` | test | trace native calls |
+| `BL_USE` | override | the build to run here, overriding every other rule (`stable`, `latest`, `commit:SHA`, …) |
+| `BL_BUILD` | override | `never`: a missing build fails instead of being fetched or built |
+| `BL_GATEWAY` | override | `off`: a project that claims a name does not start the gateway for it (the one switch for a machine that wants no background process it did not ask for) |
+| `BL_ALLOW_UNPUSHED_LATEST` | override | `1`: the `latest` pre-push guard lets the push through |
+| `BL_DROP_KEEP_DAYS` / `BL_DROP_GRACE_HOURS` | override | how long an unreferenced build is kept (14 days since last use / 24 h) |
+| `BL_BUILD_TIMEOUT_MIN` | override | a build step is stopped after this many minutes (45) |
+| `BL_INSTALL_BIN` | override | where `self-install` puts the launcher |
+| `BL_CACHE_DIR` / `BL_CACHE_MAX_MB` | override | where the analysis store lives (overrides every tier, relative to the cwd) and its cap in MB (512) |
+| `BL_CATALOG_DIR` / `BL_CATALOG_LIB` | override | the component catalog's examples and vocabulary directories (`env.bl :catalog` is the declared form) |
+| `BL_HOTPATCH` | override | hot-patching of a running VM |
+| `BL_INDEX_WORKERS` | override | how many workers the code index uses |
+| `BL_NAMES_SUFFIXES` | override | the host-name suffixes a route may claim |
+| `BL_ORACLE_SESSIONS` | override | where the oracle looks for sessions |
+| `BL_SEED_EBIN` / `BL_SEED_EBIN_FALLBACK` | override | the beam directory `bl seed` reads (`--ebin` is the flag) |
+| `BL_BIN` / `BL_ROOT` / `BL_BUILD_ID` / `BL_BOOT_REEXECED` / `BL_EBIN` | protocol | the launcher's handoff to the VM: which launcher, which tree, which build. Do not set these |
+| `BL_TEST_TIMEOUT` / `BL_TEST_TIMES` / `BL_TEST_UID` / `BL_SELFBUILD_GATE` | test | test-runner seams |
+| `BL_Z3_TIMEOUT` / `BL_Z3_READ_TIMEOUT` | override | the z3 solver's time limits |
+
+`BL_VERSION` is not here: only the release workflow sets it, to stamp `env.bl :app :vsn`; nothing reads it at run time.
 
 ## Where a namespace is found
 

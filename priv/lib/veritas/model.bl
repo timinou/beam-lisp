@@ -398,6 +398,12 @@
 ;; SERIALIZATION. The state lives in ONE agent; every request is one atomic step
 ;; there, so concurrent requests cannot interleave a read-modify-write.
 ;;
+;; BODIES. `application/json` (or none) decodes as JSON; a request sent as
+;; `application/x-www-form-urlencoded` arrives as a string-keyed map of its
+;; fields. A `:response` may instead return `{:status n :raw bytes :content-type s}`
+;; to send bytes untouched. A final `*name` path segment captures the rest of
+;; the path.
+;;
 ;; BAD INPUT is refused before the model sees it: unparseable JSON → 400, a body
 ;; over 1 MiB → 413 (neither is logged). Path params and query values stay
 ;; STRINGS — nothing from the wire becomes an atom.
@@ -421,16 +427,25 @@
 
 (defn- match-path
   "Params ({\"id\" \"12\"}) when `segs` fit `pattern-segs`, else nil. A `:name`
-   segment captures; any other must be equal."
+   segment captures; any other must be equal. A FINAL `*name` segment captures
+   the whole remainder (one or more segments, decoded, joined by \"/\") — for
+   APIs whose resource address is itself a path (`/sites/host:/sites/x`)."
   [pattern-segs segs]
-  (when (= (count pattern-segs) (count segs))
-    (loop [i 0 out {}]
-      (if (= i (count segs)) out
-        (let [ps (nth pattern-segs i) s (nth segs i)]
-          (cond
-            (String/starts_with? ps ":") (recur (+ i 1) (assoc out (subs ps 1) (pct-decode s)))
-            (= ps (pct-decode s)) (recur (+ i 1) out)
-            :else nil))))))
+  (let [np (count pattern-segs)
+        splat? (and (pos? np) (String/starts_with? (nth pattern-segs (- np 1)) "*"))]
+    (when (if splat? (>= (count segs) np) (= np (count segs)))
+      (loop [i 0 out {}]
+        (cond
+          (and splat? (= i (- np 1)))
+            (assoc out (subs (nth pattern-segs i) 1)
+                   (join "/" (map pct-decode (drop i segs))))
+          (= i (count segs)) out
+          :else
+          (let [ps (nth pattern-segs i) s (nth segs i)]
+            (cond
+              (String/starts_with? ps ":") (recur (+ i 1) (assoc out (subs ps 1) (pct-decode s)))
+              (= ps (pct-decode s)) (recur (+ i 1) out)
+              :else nil)))))))
 
 (defn- parse-query [qs]
   (into {}
@@ -462,6 +477,19 @@
 
 (defn- error-body [code message] {:error {:code code :message message}})
 
+(def ^:private REDACTED-HEADERS #{"authorization" "cookie" "x-api-key"})
+
+(defn- redact-headers
+  "Request headers for the log: a credential's PRESENCE stays visible, its value
+   does not — a log is read by people and by test failures, a bearer must not be
+   in either."
+  [h]
+  (into {} (map (fn [[k v]] [k (if (contains? REDACTED-HEADERS (String/downcase (str k))) "<redacted>" v)])
+                (into [] (or h {})))))
+
+(defn- has-header? [hs name]
+  (some (fn [[k _]] (= name (String/downcase (str k)))) (into [] (or hs {}))))
+
 (defn- send-resp
   "Send `{:status :headers :body}` on `conn` (see the serving notes)."
   [conn resp]
@@ -469,12 +497,22 @@
                                                  (str (second kv))))
                      conn (into [] (get resp :headers {})))
         status (get resp :status 200)]
-    (if (nil? (:body resp))
-      (web/json conn status "")
-      (web/json conn status (bl.json/encode (:body resp))))))
+    (cond
+      ;; {:raw bytes :content-type s}: bytes as they are, for a blob download
+      (some? (:raw resp))
+        (erlang/apply ConnMod :send_resp
+          (list (if (has-header? (get resp :headers) "content-type")
+                  conn
+                  (web/resp-header conn "content-type" (get resp :content-type "application/octet-stream")))
+                status (:raw resp)))
+      (nil? (:body resp)) (web/json conn status "")
+      :else (web/json conn status (bl.json/encode (:body resp))))))
 
-(defn- route-candidates
-  "[[name command params] …] for every command whose :request matches, by name."
+(defn- splat-pattern? [r]
+  (let [ps (segments (second r))]
+    (and (pos? (count ps)) (String/starts_with? (last ps) "*"))))
+
+(defn- route-candidates*
   [m method segs]
   (into []
     (keep (fn [nm]
@@ -484,6 +522,15 @@
                 (let [params (match-path (segments (second r)) segs)]
                   (when (some? params) [nm c params])))))
           (sort (keys (:commands m))))))
+
+(defn- route-candidates
+  "[[name command params] …] for every command whose :request matches: exact
+   (non-splat) patterns first, then splat ones, each by name — a catch-all
+   never shadows a specific route, whatever the names sort to."
+  [m method segs]
+  (let [all (route-candidates* m method segs)]
+    (into (into [] (remove (fn [[_ c _]] (splat-pattern? (:request c))) all))
+          (filter (fn [[_ c _]] (splat-pattern? (:request c))) all))))
 
 (defn- serve-step
   "One request against the held {:state :log}: → [response held']. Runs INSIDE
@@ -495,7 +542,7 @@
               [resp {:state st
                      :log (let [l (conj (:log held)
                                         {:method (:method req) :path (:path req) :query (:query req)
-                                         :body (:body req) :status (get resp :status 200) :command nm})]
+                                         :body (:body req) :headers (redact-headers (:headers req)) :status (get resp :status 200) :command nm})]
                             (if (> (count l) LOG-LIMIT) (subvec l (- (count l) LOG-LIMIT)) l))}])]
     (if (empty? cands)
       (out {:status 404 :body (error-body "not_found" (str "no route for " (name (:method req)) " " (:path req)))} nil state)
@@ -520,7 +567,13 @@
     (if (= :too-large (first parsed))
       (send-resp (second parsed) {:status 413 :body (error-body "payload_too_large" "request body over 1 MiB")})
       (let [[_ raw conn2] parsed
-            body (if (= "" raw) {:ok nil} (try {:ok (bl.json/decode raw)} (catch _ {:bad true})))]
+            ;; a form post (OAuth token endpoints) decodes to a string-keyed map;
+            ;; everything else is JSON, as before
+            form? (starts-with? (or (get (req-headers conn2) "content-type") "")
+                                "application/x-www-form-urlencoded")
+            body (cond (= "" raw) {:ok nil}
+                       form? {:ok (parse-query raw)}
+                       :else (try {:ok (bl.json/decode raw)} (catch _ {:bad true})))]
         (if (:bad body)
           (send-resp conn2 {:status 400 :body (error-body "bad_request" "request body is not valid JSON")})
           (let [req {:method (keyword (web/method conn2)) :path (web/path conn2) :params {}
@@ -538,7 +591,7 @@
       :stop    (fn [])             free the port and the state
       :state   (fn [])             the model state right now
       :log     (fn [])             the last 500 requests, oldest first:
-                                   [{:method :path :query :body :status :command}]
+                                   [{:method :path :query :body :headers :status :command}]
       :inject! (fn [name args])    run command `name` against the served state
                                    (a fault toggle, a clock tick…): no HTTP, :run
                                    not called, :pre RESPECTED →

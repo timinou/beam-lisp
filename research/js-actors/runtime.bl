@@ -1,0 +1,3315 @@
+; runtime.bl — the actor runtime, written in beam-lisp.
+;
+; Compiled by research/js-actors/compiler.bl with the SAME ANF→JS backend that
+; compiles application code. Nothing in this file is JavaScript; the only
+; JavaScript it reaches is the host's leaf operations (`host/…`) and the
+; scheduler bridge (`host/run-turn`, `host/park`, `host/wait-until`,
+; `host/now`, `host/state`).
+;
+; Two layers live here.
+;
+;   1. THE PRELUDE. Beam-lisp semantics above the host's leaves: list and
+;      vector walking, map access, equality, string building, keyword/name.
+;      Every `rt-*`/`core-*` name below is defined over `host/…` leaves only,
+;      so the prelude is the bottom of the bootstrap. It also holds the TARGET
+;      EXCEPTION POLICY — what a raise's class and reason mean — so that
+;      compiler.bl maps the
+;      core names the compiler links (Elixir.BeamLisp.Ns.Rt/first,
+;      Elixir.BeamLisp.Ns.Core/inc, …) onto these functions.
+;
+;   2. THE ACTOR RUNTIME. Process registry, runnable queue, mailbox, receive
+;      selection with a scan cursor and a monotonic deadline, timeout wait
+;      registration and wakeups, process LINKS, MONITORS, exit signals and the
+;      one atomic death cleanup, plus the scheduler. All of it is BL data and
+;      BL control flow.
+;
+;   3. NAMES AND THE CALL PROTOCOL. The address table (one name → one live
+;      process, retracted by the same death transaction) and the correlated
+;      `call`/`cast`/`reply`/`stop` verbs over the existing mailbox, exposed to
+;      source as the generic core verbs `call`, `cast`, `stop`, `whereis`,
+;      `register` and `unregister`.
+;
+;   4. TABLES. Shared mutable state that outlives the process that made it: a
+;      BL identity and metadata over one host-native store per table, with
+;      OWNERSHIP (owner death disposes), an HEIR (a transfer instead of a
+;      disposal), access MODES, NAMES and the atomic read-modify-write. The
+;      host contributes storage and bounds only; section 5 states the whole
+;      contract and the subset it deliberately refuses.
+;
+; The host owns exactly one piece of retained state used here — the mutable
+; root `rt.state` (a BL map threaded through `host/state` / `host/set-state`),
+; which is what lets a running process see the scheduler's registry.
+
+; ─────────────────────────────────────────────────────────────────────────────
+; 1. Prelude — semantics over host leaves
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn rt-eqv [a b] (host/eq a b))
+(defn rt-identical? [a b] (host/identical a b))
+(defn rt-hash-key [x] x)
+
+(defn rt-first [xs]
+  (cond
+    (host/is-nil xs) nil
+    (host/is-enil xs) nil
+    (host/is-cons xs) (host/cons-head xs)
+    (host/is-vec xs) (if (host/lt 0 (host/vec-size xs)) (host/vec-el xs 0) nil)
+    (host/is-set xs) (if (host/eq 0 (host/set-size xs)) nil (host/cons-head (host/set-to-list xs)))
+    :else (host/raise (host/str-cat "first: not a sequence: " xs))))
+
+(defn rt-rest [xs]
+  (cond
+    (host/is-nil xs) nil
+    (host/is-enil xs) (host/empty-list)
+    (host/is-cons xs) (host/cons-tail xs)
+    ; a vector's rest is a list of the items after the first, as on BEAM
+    (host/is-vec xs) (if (host/lt 0 (host/vec-size xs)) (host/cons-tail (host/vec-to-list xs)) (host/empty-list))
+    :else (host/raise (host/str-cat "rest: not a sequence: " xs))))
+
+(defn rt-nth [xs i]
+  (cond
+    (host/is-nil xs) nil
+    (host/is-enil xs) nil
+    (host/is-cons xs) (if (host/eq i 0)
+                        (host/cons-head xs)
+                        (rt-nth (host/cons-tail xs) (host/arith "sub" i 1)))
+    (host/is-vec xs) (host/vec-el xs i)
+    :else (host/raise (host/str-cat "nth: not a sequence: " xs))))
+
+(defn rt-count [xs]
+  (cond
+    (host/is-nil xs) 0
+    (host/is-enil xs) 0
+    (host/is-cons xs) (host/arith "add" 1 (rt-count (host/cons-tail xs)))
+    (host/is-vec xs) (host/vec-size xs)
+    (host/is-set xs) (host/set-size xs)
+    (host/is-str xs) (host/str-size xs)
+    (host/is-map xs) (host/map-size xs)
+    :else 0))
+
+(defn rt-codepoints [s] (host/str-codepoints s))
+
+(defn rt-cons [h t] (host/cons h t))
+
+(defn rt-conj [coll x]
+  (cond
+    (host/is-vec coll) (host/vec-append coll x)
+    (host/is-set coll) (host/set-put coll x)
+    (host/is-nil coll) (host/cons x (host/empty-list))
+    (host/is-enil coll) (host/cons x (host/empty-list))
+    (host/is-cons coll) (host/cons x coll)
+    :else (host/raise "conj: unsupported collection")))
+
+; ── sets ─────────────────────────────────────────────────────────────
+; A set is a value like any other: `#{…}` compiles to `Set/new` over the
+; element list, and the operations below are BL over the host's set leaves.
+; Enumeration order is the host's small-map key order — the SAME order
+; `keys`/`vals`/`seq` use — so a set and the map behind it never disagree.
+(defn rt-set-new [xs] (host/set-from-list xs))
+(defn rt-set? [s] (host/is-set s))
+(defn rt-set [xs] (host/set-from-list (rt-seq-list xs)))
+(defn rt-disj [s x] (host/set-remove s x))
+(defn rt-quot [a b] (host/arith "quot" a b))
+(defn rt-mod [a b] (host/arith "mod" a b))
+
+(defn rt-get-impl [m k default]
+  (cond
+    (host/is-nil m) default
+    (host/is-vec m) (if (and (not (host/lt k 0)) (host/lt k (host/vec-size m)))
+                      (host/vec-el m k)
+                      default)
+    (host/is-set m) (if (host/set-has m k) k default)
+    :else (host/map-get m k default)))
+
+(defn rt-get
+  ([m k] (rt-get-impl m k nil))
+  ([m k default] (rt-get-impl m k default)))
+
+(defn rt-assoc [m k v] (host/map-put m k v))
+
+(defn rt-empty? [xs]
+  (cond
+    (host/is-nil xs) true
+    (host/is-enil xs) true
+    (host/is-cons xs) false
+    (host/is-vec xs) (host/eq 0 (host/vec-size xs))
+    (host/is-set xs) (host/eq 0 (host/set-size xs))
+    (host/is-str xs) (host/eq 0 (host/str-size xs))
+    :else false))
+
+(defn rt-seq [xs]
+  (cond
+    (host/is-nil xs) nil
+    (host/is-enil xs) nil
+    (host/is-cons xs) xs
+    (host/is-vec xs) (if (host/eq 0 (host/vec-size xs)) nil (host/vec-to-list xs))
+    (host/is-set xs) (if (host/eq 0 (host/set-size xs)) nil (host/set-to-list xs))
+    (host/is-map xs) (if (host/eq 0 (host/map-size xs)) nil (rt-map-entries (host/map-keys xs) xs (host/empty-list)))
+    :else nil))
+
+(defn rt-next [xs] (rt-seq (rt-rest xs)))
+(defn rt-to-list [xs] (rt-seq xs))
+(defn rt-print-str [x] (host/to-str x))
+(defn rt-join-str [xs acc]
+  (if (host/is-enil xs)
+    acc
+    (rt-join-str (host/cons-tail xs)
+                 (host/str-cat acc (host/to-str (host/cons-head xs))))))
+
+; core/* — the unlinked core names an ordinary program reaches by name. The
+; compiler resolves those to `Env.fetch!("core", …)`, which the emitter mirrors
+; by falling back from the source namespace to `core` at registry lookup.
+
+(defn core-list [xs] xs)
+(defn core-not [x] (if (host/truthy x) false true))
+(defn core-nil? [x] (host/is-nil x))
+(defn core-some? [x] (if (host/is-nil x) false true))
+(defn core-not= [a b] (if (host/eq a b) false true))
+(defn core-inc [x] (host/arith "add" x 1))
+(defn core-dec [x] (host/arith "sub" x 1))
+(defn core-keyword [x]
+  (cond
+    (host/is-kw x) x
+    (host/is-str x) (host/kw x)
+    :else (host/kw (host/to-str x))))
+(defn core-name [x] (if (host/is-kw x) (host/kw-name x) (host/to-str x)))
+(defn core-str [& xs] (rt-join-str xs ""))
+(defn core-print [x] (do (host/write (host/to-str x)) nil))
+(defn core-println [x] (do (host/write (host/to-str x)) nil))
+(defn core-vector [& xs] (host/vec-from-list xs))
+(defn core-hash-map [k v more]
+  (let [m (host/map-put (host/empty-map) k v)]
+    (rt-hash-map-more more m)))
+(defn rt-hash-map-more [more m]
+  (if (host/is-enil more)
+    m
+    (rt-hash-map-more (host/cons-tail (host/cons-tail more))
+                      (host/map-put m (host/cons-head more) (rt-first (host/cons-tail more))))))
+
+; ── collection prelude ────────────────────────────────────────────────────────────
+;
+; The value functions ordinary app code reaches (`mapv`, `filterv`, `reduce`,
+; `into`, `update`, …). Each is BL over the same host leaves as the prelude
+; above, so the JS target carries ONE meaning for them and no JavaScript array
+; method sneaks in. They cover vectors, lists, nil and maps (for `keys`,
+; `dissoc`, `contains?`); anything else raises by name rather than guessing.
+; A higher-order one calls its argument through the ordinary call step, so a
+; function value from BL code is the only thing it can run.
+
+(defn rt-seq-list
+  "xs as a proper BL list: a vector's items, a list itself, nil as empty."
+  [xs]
+  (cond
+    (host/is-nil xs) (host/empty-list)
+    (host/is-enil xs) xs
+    (host/is-cons xs) xs
+    (host/is-vec xs) (host/vec-to-list xs)
+    (host/is-set xs) (host/set-to-list xs)
+    (host/is-map xs) (rt-map-entries (host/map-keys xs) xs (host/empty-list))
+    :else (host/raise (host/str-cat "not a sequence: " (host/describe xs)))))
+
+(defn rt-map-entries [ks m acc]
+  (if (host/is-enil ks)
+    (rt-list-reverse acc (host/empty-list))
+    (rt-map-entries (host/cons-tail ks) m
+                    (host/cons (host/vec-from-list (host/cons (host/cons-head ks)
+                                                              (host/cons (host/map-get m (host/cons-head ks) nil)
+                                                                         (host/empty-list))))
+                               acc))))
+
+(defn rt-list-reverse [xs acc]
+  (if (host/is-enil xs) acc (rt-list-reverse (host/cons-tail xs) (host/cons (host/cons-head xs) acc))))
+
+(defn rt-mapv-1 [f xs acc]
+  (if (host/is-enil xs) acc (rt-mapv-1 f (host/cons-tail xs) (host/vec-append acc (f (host/cons-head xs))))))
+(defn rt-mapv [f xs] (rt-mapv-1 f (rt-seq-list xs) (host/vec-from-list (host/empty-list))))
+
+(defn rt-filterv-1 [f xs acc]
+  (if (host/is-enil xs)
+    acc
+    (rt-filterv-1 f (host/cons-tail xs)
+                  (if (host/truthy (f (host/cons-head xs))) (host/vec-append acc (host/cons-head xs)) acc))))
+(defn rt-filterv [f xs] (rt-filterv-1 f (rt-seq-list xs) (host/vec-from-list (host/empty-list))))
+
+(defn rt-reduce-1 [f acc xs]
+  (if (host/is-enil xs) acc (rt-reduce-1 f (f acc (host/cons-head xs)) (host/cons-tail xs))))
+(defn rt-reduce
+  ([f xs] (let [l (rt-seq-list xs)]
+            (if (host/is-enil l) (f) (rt-reduce-1 f (host/cons-head l) (host/cons-tail l)))))
+  ([f init xs] (rt-reduce-1 f init (rt-seq-list xs))))
+
+(defn rt-some [f xs]
+  (let [l (rt-seq-list xs)]
+    (if (host/is-enil l)
+      nil
+      (let [v (f (host/cons-head l))]
+        (if (host/truthy v) v (rt-some f (host/cons-tail l)))))))
+
+(defn rt-into [to from]
+  (rt-reduce-1 (fn [acc x] (rt-conj acc x)) (if (host/is-nil to) (host/empty-list) to) (rt-seq-list from)))
+
+(defn rt-vec [xs] (host/vec-from-list (rt-seq-list xs)))
+(defn rt-last [xs]
+  (let [l (rt-seq-list xs)]
+    (if (host/is-enil l) nil (if (host/is-enil (host/cons-tail l)) (host/cons-head l) (rt-last (host/cons-tail l))))))
+(defn rt-update
+  ([m k f] (host/map-put m k (f (rt-get m k))))
+  ([m k f a] (host/map-put m k (f (rt-get m k) a))))
+(defn rt-assoc-more [m kvs]
+  (if (host/is-enil kvs)
+    m
+    (rt-assoc-more (host/map-put m (host/cons-head kvs) (rt-first (host/cons-tail kvs)))
+                   (rt-rest (host/cons-tail kvs)))))
+(defn core-assoc [m k v & kvs] (rt-assoc-more (host/map-put m k v) kvs))
+(defn rt-dissoc [m k] (if (host/is-nil m) nil (host/map-remove m k)))
+(defn rt-keys [m] (if (host/eq 0 (host/map-size m)) nil (host/map-keys m)))
+(defn rt-contains? [m k]
+  (cond
+    (host/is-nil m) false
+    (host/is-vec m) (and (host/is-int k) (not (host/lt k 0)) (host/lt k (host/vec-size m)))
+    (host/is-set m) (host/set-has m k)
+    :else (not (host/identical (host/map-get m k :__rt-absent__) :__rt-absent__))))
+(defn rt-subs
+  ([s from] (host/str-slice s from (host/str-size s)))
+  ([s from to] (host/str-slice s from to)))
+(defn rt-max [a b] (if (host/lt a b) b a))
+(defn rt-min [a b] (if (host/lt b a) b a))
+(defn rt-zero? [x] (host/eq x 0))
+(defn rt-pos? [x] (host/lt 0 x))
+(defn rt-neg? [x] (host/lt x 0))
+(defn rt-string? [x] (host/is-str x))
+(defn rt-keyword? [x] (host/is-kw x))
+(defn rt-int? [x] (host/is-int x))
+(defn rt-float? [x] (host/is-float x))
+(defn rt-boolean? [x] (host/is-bool x))
+(defn rt-map? [x] (host/is-map x))
+(defn rt-vector? [x] (host/is-vec x))
+
+; ── ordering: compare, sort, sort-by ────────────────────────────────────────────────────
+;
+; `compare` is BL's total order (BeamLisp.Ns.Rt compare): nil < false < true <
+; numbers < strings < keywords < sequentials, each ordered within its kind —
+; numerically, by code point, by name, element-wise (a list and a vector are
+; one family: `(compare '(1) [1])` is 0). Maps and sets have
+; no order here: BEAM orders them by its own map layout, which this target
+; does not reproduce, so comparing one RAISES rather than guess.
+;
+; `sort` is a faithful port of OTP `lists:sort/2`, which BL's `sort` runs
+; (through `Enum.sort/2`): the SAME comparator calls in the SAME order, so a
+; comparator that is not a strict weak order, or a strict one such as `<` that
+; reverses equal keys, gives the same answer on both targets. A comparator may
+; answer a boolean ("a goes first") or a number (<= 0 means "a goes first").
+
+(defn rt-cmp-rank [x]
+  (cond
+    (host/is-nil x) 0
+    (host/identical x false) 1
+    (host/identical x true) 2
+    (host/is-num x) 3
+    (host/is-str x) 4
+    (host/is-kw x) 6
+    ; one SEQUENTIAL family (main's :sequential-family-is-one-value): a list
+    ; and a vector with equal elements compare 0, as on BEAM
+    (host/is-list x) 70
+    (host/is-vec x) 70
+    :else (host/raise (host/str-cat "compare: no order for " (host/describe x) " on this target"))))
+
+(defn rt-compare-seqs [a b]
+  (cond
+    (host/is-enil a) (if (host/is-enil b) 0 -1)
+    (host/is-enil b) 1
+    :else (let [c (rt-compare (host/cons-head a) (host/cons-head b))]
+            (if (host/eq c 0) (rt-compare-seqs (host/cons-tail a) (host/cons-tail b)) c))))
+
+(defn rt-compare [a b]
+  (if (host/eq a b)
+    0
+    (let [ra (rt-cmp-rank a) rb (rt-cmp-rank b)]
+      (cond
+        (host/lt ra rb) -1
+        (host/lt rb ra) 1
+        (host/eq ra 3) (if (host/lt a b) -1 (if (host/lt b a) 1 0))
+        (host/eq ra 4) (host/str-cmp a b)
+        (host/eq ra 6) (host/str-cmp (host/kw-name a) (host/kw-name b))
+        :else (rt-compare-seqs (rt-seq-list a) (rt-seq-list b))))))
+
+; the comparison functions as VALUES (`(sort > xs)`): two arguments, as BEAM
+; `<` orders the numbers and strings this target has
+(defn core-lt [a b] (host/lt a b))
+(defn core-gt [a b] (host/lt b a))
+(defn core-le [a b] (if (host/lt b a) false true))
+(defn core-ge [a b] (if (host/lt a b) false true))
+(defn core-eq [a b] (host/eq a b))
+
+(defn rt-cmp-le
+  "Does `a` go first? the runtime's comparator_le over `(cmp a b)`."
+  [cmp a b]
+  (let [r (cmp a b)]
+    (cond
+      (host/is-bool r) r
+      (host/is-num r) (if (host/lt 0 r) false true)
+      :else false)))
+
+(defn rt-l1 [a] (host/cons a (host/empty-list)))
+
+; lists:sort/2 — split into ascending/descending runs …
+(defn rt-fsplit-1 [y x f l r rs]
+  (if (host/is-enil l)
+    (rt-rfmergel (host/cons (host/cons y (host/cons x r)) rs) (host/empty-list) f :asc)
+    (let [z (host/cons-head l) l2 (host/cons-tail l)]
+      (cond
+        (f y z) (rt-fsplit-1 z y f l2 (host/cons x r) rs)
+        (f x z) (rt-fsplit-1 y z f l2 (host/cons x r) rs)
+        (host/is-enil r) (rt-fsplit-1 y x f l2 (rt-l1 z) rs)
+        :else (rt-fsplit-1-1 y x f l2 r rs z)))))
+
+(defn rt-fsplit-1-1 [y x f l r rs s]
+  (if (host/is-enil l)
+    (rt-rfmergel (host/cons (rt-l1 s) (host/cons (host/cons y (host/cons x r)) rs)) (host/empty-list) f :asc)
+    (let [z (host/cons-head l) l2 (host/cons-tail l)]
+      (cond
+        (f y z) (rt-fsplit-1-1 z y f l2 (host/cons x r) rs s)
+        (f x z) (rt-fsplit-1-1 y z f l2 (host/cons x r) rs s)
+        (f s z) (rt-fsplit-1 z s f l2 (host/empty-list) (host/cons (host/cons y (host/cons x r)) rs))
+        :else (rt-fsplit-1 s z f l2 (host/empty-list) (host/cons (host/cons y (host/cons x r)) rs))))))
+
+(defn rt-fsplit-2 [y x f l r rs]
+  (if (host/is-enil l)
+    (rt-fmergel (host/cons (host/cons y (host/cons x r)) rs) (host/empty-list) f :desc)
+    (let [z (host/cons-head l) l2 (host/cons-tail l)]
+      (cond
+        (not (f y z)) (rt-fsplit-2 z y f l2 (host/cons x r) rs)
+        (not (f x z)) (rt-fsplit-2 y z f l2 (host/cons x r) rs)
+        (host/is-enil r) (rt-fsplit-2 y x f l2 (rt-l1 z) rs)
+        :else (rt-fsplit-2-1 y x f l2 r rs z)))))
+
+(defn rt-fsplit-2-1 [y x f l r rs s]
+  (if (host/is-enil l)
+    (rt-fmergel (host/cons (rt-l1 s) (host/cons (host/cons y (host/cons x r)) rs)) (host/empty-list) f :desc)
+    (let [z (host/cons-head l) l2 (host/cons-tail l)]
+      (cond
+        (not (f y z)) (rt-fsplit-2-1 z y f l2 (host/cons x r) rs s)
+        (not (f x z)) (rt-fsplit-2-1 y z f l2 (host/cons x r) rs s)
+        (not (f s z)) (rt-fsplit-2 z s f l2 (host/empty-list) (host/cons (host/cons y (host/cons x r)) rs))
+        :else (rt-fsplit-2 s z f l2 (host/empty-list) (host/cons (host/cons y (host/cons x r)) rs))))))
+
+; … then merge the runs pairwise, alternating direction
+(defn rt-fmergel [ls acc f o]
+  (cond
+    (host/is-enil ls) (rt-rfmergel acc (host/empty-list) f o)
+    (host/is-enil (host/cons-tail ls))
+      (if (host/is-enil acc)
+        (host/cons-head ls)
+        (rt-rfmergel (host/cons (rt-list-reverse (host/cons-head ls) (host/empty-list)) acc) (host/empty-list) f o))
+    :else
+      (let [a (host/cons-head ls) b (host/cons-head (host/cons-tail ls)) more (host/cons-tail (host/cons-tail ls))
+            t1 (if (host/eq o :asc) a b)
+            h (if (host/eq o :asc) b a)]
+        (rt-fmergel more (host/cons (rt-fmerge2-1 t1 (host/cons-head h) f (host/cons-tail h) (host/empty-list)) acc) f o))))
+
+(defn rt-rfmergel [ls acc f o]
+  (cond
+    (host/is-enil ls) (rt-fmergel acc (host/empty-list) f o)
+    (host/is-enil (host/cons-tail ls))
+      (rt-fmergel (host/cons (rt-list-reverse (host/cons-head ls) (host/empty-list)) acc) (host/empty-list) f o)
+    :else
+      (let [a (host/cons-head ls) b (host/cons-head (host/cons-tail ls)) more (host/cons-tail (host/cons-tail ls))
+            h (if (host/eq o :asc) a b)
+            t1 (if (host/eq o :asc) b a)]
+        (rt-rfmergel more (host/cons (rt-rfmerge2-1 t1 (host/cons-head h) f (host/cons-tail h) (host/empty-list)) acc) f o))))
+
+(defn rt-fmerge2-1 [l1 h2 f t2 m]
+  (if (host/is-enil l1)
+    (rt-list-reverse t2 (host/cons h2 m))
+    (let [h1 (host/cons-head l1) t1 (host/cons-tail l1)]
+      (if (f h1 h2)
+        (rt-fmerge2-1 t1 h2 f t2 (host/cons h1 m))
+        (rt-fmerge2-2 h1 t1 f t2 (host/cons h2 m))))))
+
+(defn rt-fmerge2-2 [h1 t1 f l2 m]
+  (if (host/is-enil l2)
+    (rt-list-reverse t1 (host/cons h1 m))
+    (let [h2 (host/cons-head l2) t2 (host/cons-tail l2)]
+      (if (f h1 h2)
+        (rt-fmerge2-1 t1 h2 f t2 (host/cons h1 m))
+        (rt-fmerge2-2 h1 t1 f t2 (host/cons h2 m))))))
+
+(defn rt-rfmerge2-1 [l1 h2 f t2 m]
+  (if (host/is-enil l1)
+    (rt-list-reverse t2 (host/cons h2 m))
+    (let [h1 (host/cons-head l1) t1 (host/cons-tail l1)]
+      (if (f h1 h2)
+        (rt-rfmerge2-2 h1 t1 f t2 (host/cons h2 m))
+        (rt-rfmerge2-1 t1 h2 f t2 (host/cons h1 m))))))
+
+(defn rt-rfmerge2-2 [h1 t1 f l2 m]
+  (if (host/is-enil l2)
+    (rt-list-reverse t1 (host/cons h1 m))
+    (let [h2 (host/cons-head l2) t2 (host/cons-tail l2)]
+      (if (f h1 h2)
+        (rt-rfmerge2-2 h1 t1 f t2 (host/cons h2 m))
+        (rt-rfmerge2-1 t1 h2 f t2 (host/cons h1 m))))))
+
+; On this target one arity of a multi-arity defn calling ANOTHER arity by the
+; defn's own name raises "no arity 2 on fn" (observed), so both arities call
+; one single-arity implementation instead.
+(defn rt-sort-impl
+  "`(sort cmp coll)`: always a list, `()` when there is nothing to sort."
+  [cmp coll]
+  (let [_ (if (host/is-map coll) (host/raise "sort: a map has no order on this target") nil)
+        l (rt-seq-list coll)
+        f (fn [a b] (rt-cmp-le cmp a b))]
+    (cond
+      (host/is-enil l) l
+      (host/is-enil (host/cons-tail l)) l
+      :else (let [x (host/cons-head l) y (host/cons-head (host/cons-tail l)) t (host/cons-tail (host/cons-tail l))]
+              (if (f x y)
+                (rt-fsplit-1 y x f t (host/empty-list) (host/empty-list))
+                (rt-fsplit-2 y x f t (host/empty-list) (host/empty-list)))))))
+
+(defn rt-sort
+  ([coll] (rt-sort-impl rt-compare coll))
+  ([cmp coll] (rt-sort-impl cmp coll)))
+
+(defn rt-sort-by
+  "core `sort-by`, clause for clause: a comparator over the KEYS."
+  ([keyfn coll] (rt-sort-impl (fn [x y] (rt-compare (keyfn x) (keyfn y))) coll))
+  ([keyfn cmp coll] (rt-sort-impl (fn [x y] (cmp (keyfn x) (keyfn y))) coll)))
+
+; ── function combinators and the rest of the value prelude ────────────────────────
+;
+; `comp`, `partial`, `juxt`, `complement`, `constantly`, `identity` and
+; `apply`, written clause for clause after priv/boot/core.bl so a function
+; value built from them behaves the same on both targets. They are plain BL:
+; the higher-order call is the ordinary call step, and the split gate's
+; closure analysis follows a function value through them exactly as it does
+; through app code (the runtime is analyzed with the app).
+
+(defn core-identity [x] x)
+(defn rt-apply-list
+  "`(apply f args)` with a finished argument list: ONE dynamic call, the
+   compiler's own `RT/apply_to` step (any arity; the emitter lowers it to a
+   call step over the list, so this never re-enters itself)."
+  [f args]
+  (apply f (rt-seq-list args)))
+(defn rt-list-concat [a b]
+  (if (host/is-enil a) b (host/cons (host/cons-head a) (rt-list-concat (host/cons-tail a) b))))
+(defn rt-spread [xs]
+  (if (host/is-enil (host/cons-tail xs))
+    (rt-seq-list (host/cons-head xs))
+    (host/cons (host/cons-head xs) (rt-spread (host/cons-tail xs)))))
+(defn rt-apply-variadic
+  "RT.apply_variadic/3: `(apply f a … more)` arrives as f, the first
+   argument and a list of the rest, whose LAST element is the seq to spread."
+  [f arg1 rest-list]
+  (rt-apply-list f (rt-spread (host/cons arg1 rest-list))))
+
+(defn core-comp
+  ([] core-identity)
+  ([f] f)
+  ([f g] (fn [& args] (f (rt-apply-list g args))))
+  ([f g h] (fn [& args] (f (g (rt-apply-list h args))))))
+(defn core-comp-more [f g h fs]
+  (let [rf (rt-list-reverse (host/cons f (host/cons g (host/cons h (rt-seq-list fs)))) (host/empty-list))]
+    (fn [& args]
+      (rt-reduce-1 (fn [acc fun] (fun acc)) (rt-apply-list (host/cons-head rf) args) (host/cons-tail rf)))))
+
+(defn core-partial
+  ([f] f)
+  ([f a] (fn [& more] (rt-apply-list f (host/cons a more))))
+  ([f a b] (fn [& more] (rt-apply-list f (host/cons a (host/cons b more)))))
+  ([f a b c] (fn [& more] (rt-apply-list f (host/cons a (host/cons b (host/cons c more)))))))
+(defn core-partial-more [f a b c more]
+  (let [lead (host/cons a (host/cons b (host/cons c (rt-seq-list more))))]
+    (fn [& later] (rt-apply-list f (rt-list-concat lead later)))))
+
+(defn core-juxt
+  ([f] (fn [& args] (host/vec-from-list (host/cons (rt-apply-list f args) (host/empty-list)))))
+  ([f g] (fn [& args] (host/vec-from-list (host/cons (rt-apply-list f args)
+                                                     (host/cons (rt-apply-list g args) (host/empty-list))))))
+  ([f g h] (fn [& args] (host/vec-from-list (host/cons (rt-apply-list f args)
+                                                       (host/cons (rt-apply-list g args)
+                                                                  (host/cons (rt-apply-list h args) (host/empty-list))))))))
+(defn core-juxt-more [f g h fs]
+  (let [all (host/cons f (host/cons g (host/cons h (rt-seq-list fs))))]
+    (fn [& args] (rt-mapv (fn [fun] (rt-apply-list fun args)) all))))
+
+(defn core-complement [f]
+  (fn
+    ([] (core-not (f)))
+    ([x] (core-not (f x)))
+    ([x y] (core-not (f x y)))))
+(defn core-constantly [x] (fn [& _] x))
+
+(defn rt-every? [f xs]
+  (let [l (rt-seq-list xs)]
+    (cond
+      (host/is-enil l) true
+      (host/truthy (f (host/cons-head l))) (rt-every? f (host/cons-tail l))
+      :else false)))
+(defn core-not-any? [f xs] (core-nil? (rt-some f xs)))
+; These answer a LIST, as BEAM's lazy seqs print and compare: `()` when empty.
+(defn rt-as-list [v] (host/vec-to-list v))
+(defn rt-remove [f xs] (rt-as-list (rt-filterv (fn [x] (core-not (f x))) xs)))
+(defn rt-keep [f xs]
+  (rt-as-list (rt-reduce-1 (fn [acc x] (let [v (f x)] (if (host/is-nil v) acc (host/vec-append acc v))))
+                           (host/vec-from-list (host/empty-list)) (rt-seq-list xs))))
+(defn rt-mapcat-v
+  "Ns.Core/mapcat__bl_v: `(mapcat f coll)` arrives as f and a one-item list."
+  [f colls]
+  (if (host/is-enil (host/cons-tail colls))
+    (rt-mapcat f (host/cons-head colls))
+    (host/raise "mapcat: only a single collection is supported")))
+(defn rt-mapcat [f xs]
+  (rt-as-list (rt-reduce-1 (fn [acc x] (rt-reduce-1 (fn [a y] (host/vec-append a y)) acc (rt-seq-list (f x))))
+                           (host/vec-from-list (host/empty-list)) (rt-seq-list xs))))
+(defn rt-group-by [f xs]
+  (rt-reduce-1 (fn [acc x]
+                 (let [k (f x)]
+                   (host/map-put acc k (host/vec-append (rt-get-impl acc k (host/vec-from-list (host/empty-list))) x))))
+               (host/empty-map) (rt-seq-list xs)))
+(defn rt-frequencies [xs]
+  (rt-reduce-1 (fn [acc x] (host/map-put acc x (host/arith "add" 1 (rt-get-impl acc x 0))))
+               (host/empty-map) (rt-seq-list xs)))
+(defn rt-reverse [xs] (rt-list-reverse (rt-seq-list xs) (host/empty-list)))
+(defn rt-second [xs] (rt-first (rt-rest (rt-seq xs))))
+(defn rt-vals [m] (if (host/eq 0 (host/map-size m)) nil (rt-as-list (rt-mapv (fn [k] (host/map-get m k nil)) (host/map-keys m)))))
+(defn rt-get-in [m ks]
+  (rt-reduce-1 (fn [acc k] (rt-get-impl acc k nil)) m (rt-seq-list ks)))
+(defn rt-assoc-in [m ks v]
+  (let [l (rt-seq-list ks) k (host/cons-head l) more (host/cons-tail l)]
+    (if (host/is-enil more)
+      (host/map-put (if (host/is-nil m) (host/empty-map) m) k v)
+      (host/map-put (if (host/is-nil m) (host/empty-map) m) k (rt-assoc-in (rt-get-impl m k nil) more v)))))
+(defn rt-update-in
+  ([m ks f] (rt-assoc-in m ks (f (rt-get-in m ks))))
+  ([m ks f a] (rt-assoc-in m ks (f (rt-get-in m ks) a))))
+(defn rt-select-keys [m ks]
+  (rt-reduce-1 (fn [acc k] (if (rt-contains? m k) (host/map-put acc k (host/map-get m k nil)) acc))
+               (host/empty-map) (rt-seq-list ks)))
+(defn rt-drop
+  "Clojure `(drop n coll)`: the items after the first n, as a list (`()`
+   when nothing is left), like the runtime's `drop_clj`."
+  [n xs]
+  (rt-drop-1 n (rt-seq-list xs)))
+(defn rt-drop-1 [n l]
+  (if (or (host/is-enil l) (not (host/lt 0 n))) l (rt-drop-1 (host/arith "sub" n 1) (host/cons-tail l))))
+(defn rt-take [n xs]
+  (rt-take-1 n (rt-seq-list xs) (host/vec-from-list (host/empty-list))))
+(defn rt-take-1 [n l acc]
+  (if (or (host/is-enil l) (not (host/lt 0 n)))
+    (host/vec-to-list acc)
+    (rt-take-1 (host/arith "sub" n 1) (host/cons-tail l) (host/vec-append acc (host/cons-head l)))))
+(defn rt-range [n] (rt-range-1 0 n (host/vec-from-list (host/empty-list))))
+(defn rt-range-1 [i n acc] (if (host/lt i n) (rt-range-1 (host/arith "add" i 1) n (host/vec-append acc i)) (host/vec-to-list acc)))
+; The arithmetic names as VALUES (`(reduce + xs)`, `(partial * 2)`): the same
+; checked `host/arith` the inline operators use, folded left like core.
+(defn core-add [& xs] (rt-reduce-1 (fn [a b] (host/arith "add" a b)) 0 xs))
+(defn core-mul [& xs] (rt-reduce-1 (fn [a b] (host/arith "mul" a b)) 1 xs))
+(defn core-sub [x & xs]
+  (if (host/is-enil xs) (host/arith "sub" 0 x) (rt-reduce-1 (fn [a b] (host/arith "sub" a b)) x xs)))
+(defn core-max [x & xs] (rt-reduce-1 rt-max x xs))
+(defn core-min [x & xs] (rt-reduce-1 rt-min x xs))
+(defn rt-update-in-v
+  "Ns.Core/update-in__bl_v: `(update-in m ks f a b …)` — the extra
+   arguments arrive as one list."
+  [m ks f more]
+  (rt-assoc-in m ks (rt-apply-list f (host/cons (rt-get-in m ks) more))))
+(defn rt-even? [x] (host/eq 0 (host/arith "rem" x 2)))
+(defn rt-odd? [x] (core-not (rt-even? x)))
+
+; ── target exceptions ───────────────────────────────────────────────────────
+;
+; WHAT A RAISE IS HERE. A JavaScript `throw` carries a HOST ENVELOPE (host.mjs
+; `BLRaise`): a class keyword, a BL reason and a raw stacktrace. The host hands
+; those three fields over (`host/ex-kind`, `host/ex-reason`, `host/ex-trace`)
+; and decides nothing else. Everything below is the target's exception POLICY —
+; what a class means, what `throw` of a value builds, and what an `:error`
+; reason normalizes into. A catch clause compiled by compiler.bl reads exactly
+; these functions: `raise_payload` for `throw`, `Exception.normalize` for the
+; class dispatch, and `ex_data` for a typed catch.
+;
+; THE REPRESENTATION. An exception value is a MAP whose `:__struct__` is a
+; keyword naming its module — the shape a BEAM struct actually has, which is
+; what lets the compiler's own typed-catch test (`is_map ∧ is_map_key(
+; :__struct__) ∧ map_get(:__struct__) =:= Mod`) run unchanged. `BeamLisp.ExInfo`
+; carries `:message` and `:data`; `Elixir.ErlangError` carries `:message` and
+; `:original`.
+;
+; LIMITS, stated rather than papered over:
+;   * There are exactly two exception modules here, `BeamLisp.ExInfo` and
+;     `ErlangError`. There is no Elixir exception catalogue: an arithmetic or
+;     host failure normalizes to `ErlangError` carrying the host's message as
+;     `:original`, NOT to `%ArithmeticError{}` or `%ArgumentError{}`. A typed
+;     `(catch ArithmeticException …)` therefore matches nothing and reraises,
+;     which is what the compiler's fallthrough already says.
+;   * The stacktrace is EMPTY. `:erlang/element(2, __STACKTRACE__)` answers an
+;     empty frame list: there are no BEAM frames on this target and none are
+;     invented. `frames` below is accepted and ignored for that reason.
+;   * `:erlang/exit` is catchable like any other class and, uncaught, ends the
+;     process that raised it. WHAT that death then means — the exit reason, the
+;     links it signals, the monitors it notifies — is the runtime's policy in
+;     section 3 below (`rt-terminate!`), not the host's and not the compiler's.
+;     OTP supervision, shutdown protocols and distribution are still out of
+;     scope: there is no supervisor and no node. A registered NAME (section 4)
+;     is an address in THIS runtime, not a node-wide one.
+;   * `host/struct` builds a JavaScript object, not a map, so a struct built
+;     that way is opaque data to `throw`, not an exception.
+
+(defn rt-exception?
+  "Is `x` a target exception — a map whose `:__struct__` names a module?"
+  [x]
+  (and (host/is-map x) (host/is-kw (host/map-get x :__struct__))))
+
+(defn rt-exception-mod [x] (host/map-get x :__struct__))
+
+(defn rt-exception-of? [x mod]
+  (and (rt-exception? x) (host/eq (rt-exception-mod x) (host/kw mod))))
+
+(defn rt-exinfo? [x] (rt-exception-of? x "Elixir.BeamLisp.ExInfo"))
+
+(defn rt-struct-map
+  "The struct-shaped map that every target exception is."
+  [mod msg key val]
+  (host/map-put (host/map-put (host/map-put (host/empty-map) :__struct__ (host/kw mod))
+                              :message msg)
+                key val))
+
+(defn rt-exinfo [msg data]
+  (rt-struct-map "Elixir.BeamLisp.ExInfo" msg :data data))
+
+(defn rt-erlang-error
+  "The `:error` reason for anything that is not already an exception: the
+   original is preserved, BEAM's prose supplies the message."
+  [reason]
+  (rt-struct-map "Elixir.ErlangError"
+                 (host/str-cat "Erlang error: " (host/describe reason))
+                 :original reason))
+
+(defn exception-normalize
+  "`Exception.normalize/3`, for the classes and reasons this target has.
+
+   `kind` is `:error` in every use the compiler emits — a THROWN payload stays
+   itself and an EXIT becomes `{:exit, reason}` in the ANF's own `case`, before
+   this is ever reached — but the other two arms are implemented so a direct
+   call means the same thing here as there."
+  [kind value frames]
+  (cond
+    (host/eq kind :error)
+      (if (rt-exception? value) value (rt-erlang-error value))
+    (host/eq kind :throw) value
+    :else (host/tup (host/list->array (host/cons (host/kw "exit")
+                                                 (host/cons value (host/empty-list)))))))
+
+(defn exinfo-raise-payload
+  "`throw`: raise a value so a `try` can catch it. An existing exception is
+   raised as-is; a map becomes an ExInfo carrying it as `:data`; anything else
+   becomes an ExInfo with a printed message and no data. The class is `:error`
+   (BEAM's `raise` is), so the payload travels as an exception value and the
+   compiled catch's normalizer passes it through unchanged."
+  [x]
+  (erlang/raise :error
+                (cond
+                  (rt-exception? x) x
+                  (host/is-map x) (rt-exinfo (host/to-str x) x)
+                  :else (rt-exinfo (host/describe x) nil))
+                nil))
+
+(defn exinfo-data [e] (if (rt-exinfo? e) (host/map-get e :data) nil))
+
+(defn exinfo-message
+  "A readable message for any value: a target exception's own `:message`, else
+   the printed form."
+  [e]
+  (if (rt-exception? e)
+    (let [m (host/map-get e :message)]
+      (if (host/is-nil m) (host/describe e) m))
+    (host/describe e)))
+
+(defn exinfo-original
+  "The Erlang original behind an `ErlangError`, nil for anything else — the one
+   answer prose cannot give, since a message renders that original into words."
+  [e]
+  (if (rt-exception-of? e "Elixir.ErlangError") (host/map-get e :original) nil))
+
+(defn core-ex-info [msg data] (rt-exinfo msg data))
+(defn core-ex-data [e] (exinfo-data e))
+(defn core-ex-message [e] (exinfo-message e))
+(defn core-ex-original [e] (exinfo-original e))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; 2. Actor runtime
+; ─────────────────────────────────────────────────────────────────────────────
+;
+; The scheduler's whole world is one BL map living in the host's one mutable
+; root:
+
+
+;   {:next-pid  n                   ; the next incarnation to mint
+;    :runtime   t                   ; this runtime's own identity, in every pid
+;    :procs     {pid -> proc}
+;    :names     {name -> pid}       ; the ADDRESS table (section 4)
+;    :runnable  [pid …]             ; a FIFO VECTOR: `conj` appends, head runs
+;    :next-ref  n                   ; the next monitor/call ref to mint
+;    :monitors  {ref -> entry}      ; runtime-wide, keyed by ref (see section 3)
+;    :input-sink pid|nil}           ; BL chooses the browser input recipient
+;    :tables    {tid -> meta}       ; live tables (section 5), keyed by identity
+;    :table-names {name -> tid}     ; the TABLE-name address table: a separate
+;                                   ; space from `:names`, as BEAM's is
+;    :next-table n                  ; the next table identity to mint
+;
+; A proc is {:pid p :frames <host frame stack> :mailbox [msg …]
+;            :status :runnable|:running|:waiting :wait nil|<deadline-ms>
+;            :links {partner-pid -> true} :trap-exit true|false}
+;
+; The frame stack is the only host-shaped value in a proc: it is the machine's
+; suspended generator stack, handed back by `host/run-turn` and stored as an
+; opaque value, exactly as the design's "one retained mutable root" allows. The
+; pid is a BL vector, not an integer — section 3 says why.
+
+(defn rt-empty-state []
+  (let [st (host/empty-map)]
+    (assoc (assoc (assoc (assoc (assoc (assoc (assoc (assoc (assoc (assoc st :next-pid 0)
+                                                                  :runtime (:runtime (host/state)))
+                                                           :procs (host/empty-map))
+                                                    :names (host/empty-map))
+                                             :runnable (host/vec-from-list (host/empty-list)))
+                                      :next-ref 0)
+                               :input-sink nil)
+                        :tables (host/empty-map))
+                 :table-names (host/empty-map))
+          :next-table 0)))
+
+(defn rt-proc-of [st pid] (get (:procs st) pid))
+(defn rt-put-proc [st pid proc] (assoc st :procs (assoc (:procs st) pid proc)))
+(defn rt-drop-proc [st pid]
+  (let [without-proc (assoc st :procs (host/map-remove (:procs st) pid))]
+    (if (host/eq (:input-sink st) pid)
+      (assoc without-proc :input-sink nil)
+      without-proc)))
+
+; ── critical sections ───────────────────────────────────────────────────────
+;
+; Every function below is a generator the machine can slice: a turn can end
+; between the `host/state` read and the `host/set-state` write of a
+; read-modify-write. `host/critical-enter` / `host/critical-leave` are a
+; generic depth counter with no actor meaning; while the depth is positive the
+; machine DEFERS the slice boundary, so the pair runs to completion against
+; every other process. Nesting is fine, `host/park` is refused inside one, and
+; a failed turn unwinds the depth to what it was on entry (host.mjs `runTurn`).
+
+(defn rt-vec-index
+  "The first index of `x` in vector `v` at or after `i`, or -1."
+  [v x i]
+  (if (host/lt i (host/vec-size v))
+    (if (host/eq (host/vec-el v i) x)
+      i
+      (rt-vec-index v x (host/arith "add" i 1)))
+    -1))
+
+(defn rt-set-proc-field [pid k v]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          proc (rt-proc-of st pid)]
+      ; A process that has already been terminated must not be re-created by a
+      ; field write: `map-put` on a missing key would resurrect a zombie with
+      ; no frames and no mailbox.
+      (if (host/is-nil proc)
+        nil
+        (host/set-state (rt-put-proc st pid (assoc proc k v)))))
+    (host/critical-leave)
+    nil))
+
+(defn rt-requeue! [pid]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          proc (rt-proc-of st pid)]
+      (do
+        (if (nil? proc)
+          nil
+          (if (host/eq (:status proc) :runnable)
+            nil
+            (host/set-state (assoc (rt-put-proc st pid (assoc proc :status :runnable))
+                                   :runnable (conj (:runnable st) pid)))))
+        (host/critical-leave)
+        nil))))
+
+(defn rt-spawn
+  "Start `f` with `args` as a new process; answer its pid — `[:pid runtime
+   incarnation]`, minted here and never reused. The new proc is runnable
+   immediately: its frame stack is built by the host machine. A fresh proc has
+   no links, does not trap exits, and cannot have been linked already."
+  [f args]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          pid (rt-make-pid st (:next-pid st))
+          proc (assoc (assoc (assoc (assoc (assoc (assoc (host/empty-map) :pid pid)
+                                                 :frames (host/make-frames f args))
+                                          :mailbox [])
+                                   :status :runnable)
+                            :wait nil)
+                      :links (host/empty-map))
+          proc2 (assoc proc :trap-exit false)]
+      (do
+        (host/set-state (assoc (assoc (rt-put-proc st pid proc2)
+                                      :next-pid (host/arith "add" (:next-pid st) 1))
+                               :runnable (conj (:runnable st) pid)))
+        (host/critical-leave)
+        pid))))
+
+(defn rt-self [] (host/self))
+
+(defn rt-send
+  "Queue `msg` on the process `to` NAMES; if it is parked in a receive, wake it
+   so it can rescan. Answers the message, or nil when `to` names nothing live.
+
+   `to` is anything `rt-resolve` accepts — a pid of this runtime, or a name
+   (section 4) — so every verb that addresses a process takes the same two
+   address kinds. The diagnostics are the typed half of the address: a value
+   that is not a pid of this runtime, a pid whose incarnation is gone, and a
+   name nobody holds are three different mistakes, and each says which it is.
+   None of them can deliver to a recycled slot, because incarnations are never
+   reused."
+  [to msg]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          pid (rt-resolve st to)
+          ans (cond
+                (not (host/is-nil pid)) (rt-deliver st pid msg)
+                (rt-local-pid? st to)
+                  (do (host/write (host/str-cat "send: no such process " (host/describe to)))
+                      nil)
+                (rt-pid? to)
+                  (do (host/write (host/str-cat "send: not a live pid of this runtime: "
+                                                (host/describe to)))
+                      nil)
+                :else
+                  (do (host/write (host/str-cat "send: no such process " (host/describe to)))
+                      nil))]
+      (do
+        (host/critical-leave)
+        ans))))
+
+(defn rt-drop-mailbox-msg
+  "Remove the message at index `i` from `pid`'s mailbox. Removing BEFORE the
+   selected body runs is what makes the next receive start where the mailbox
+   actually is: skipped messages stay, the consumed one is gone."
+  [pid i]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          proc (rt-proc-of st pid)]
+      (host/set-state (rt-put-proc st pid
+                                   (assoc proc :mailbox (host/vec-remove (:mailbox proc) i)))))
+    (host/critical-leave)
+    nil))
+
+; The adapter holds opaque browser values until BL has registered a sink.
+; Delivery policy and process choice stay here, never in host.mjs.
+(defn rt-register-input!
+  "Register this actor as the browser input sink. Supervised children are
+   refused before an event is accepted: a receive may remove an event just
+   before the child crashes, so restarting that child cannot promise either
+   exactly-once delivery or explicit rejection without an acknowledgement
+   protocol. The long-lived app actor may own the sink instead."
+  []
+  (do
+    (host/critical-enter)
+    (let [pid (host/self)
+          st (host/state)
+          proc (rt-proc-of st pid)
+          supervised (and (not (host/is-nil proc))
+                          (not (host/is-nil (:supervised-by proc))))]
+      (do
+        (if (and (not (nil? pid)) (not supervised))
+          (host/set-state (assoc st :input-sink pid))
+          nil)
+        (host/critical-leave)
+        (cond
+          (nil? pid) (host/raise "browser input registration requires a BL actor")
+          supervised (erlang/raise :error :supervised-input-sink-unsupported nil)
+          :else nil)))))
+
+(defn rt-deliver-inputs [sink batch i]
+  (if (host/lt i (host/vec-size batch))
+    (do
+      (rt-send sink (host/vec-el batch i))
+      (rt-deliver-inputs sink batch (host/arith "add" i 1)))
+    nil))
+
+(defn rt-pump-input []
+  (let [sink (:input-sink (host/state))]
+    (if (and (not (nil? sink)) (host/lt 0 (host/input-size)))
+      (rt-deliver-inputs sink (host/take-input) 0)
+      nil)))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; 3. Process lifecycle — typed pids, links, monitors, exits, death
+; ─────────────────────────────────────────────────────────────────────────────
+;
+; EVERY RULE BELOW IS BL. The host carries a pid as an opaque value it stores
+; and compares; it does not know that two processes can be linked, that a
+; monitor exists, or that a death means anything. `erlang/exit` is a raise with
+; a class, and `host/run-turn` answers the class and the reason of a raise that
+; ended a turn — that is the whole of the host's involvement.
+;
+; These are the target's rules, stated as such and NOT OTP's: no supervision, no
+; distribution, no exit-signal ordering between nodes, and no stacktrace
+; anywhere in a reason. Names are section 4, and a name is an ADDRESS, not
+; `proc.reg`'s attribute relation.
+;
+; A PID IS TYPED: `[:pid <runtime> <incarnation>]`.
+;
+;   * <runtime> identifies the runtime INSTANCE — an id the host ALLOCATES for
+;     each runtime it creates and hands over as the initial state's `:runtime`,
+;     never a clock reading, so two runtimes created in the same instant still
+;     mint disjoint pid spaces and a pid can never name a process in another
+;     runtime by accident;
+;   * <incarnation> is the spawn counter, which is never reused, so a pid whose
+;     incarnation is missing from the registry is provably stale: every
+;     operation that would touch a process can say so instead of reaching
+;     whatever slot happens to share a number.
+;
+; A monitor REF is the same shape with `:ref` for `:pid`. Both are ordinary BL
+; vectors, so the registry and the mailbox treat them as data like any other.
+
+(defn rt-runtime-of [st] (:runtime st))
+
+(defn rt-make-pid [st n] [:pid (rt-runtime-of st) n])
+(defn rt-make-ref [st n] [:ref (rt-runtime-of st) n])
+
+(defn rt-typed?
+  "Is `x` a well-formed `[:tag runtime serial]` handle of this target? The
+   serial is an integer because both counters are, and the runtime component is
+   whatever `rt-empty-state` recorded — this runtime's allocated id."
+  [x tag]
+  (and (host/is-vec x)
+       (host/eq 3 (host/vec-size x))
+       (host/eq tag (host/vec-el x 0))
+       (host/is-int (host/vec-el x 2))))
+
+(defn rt-pid? [x] (rt-typed? x :pid))
+(defn rt-ref? [x] (rt-typed? x :ref))
+
+(defn rt-local-pid?
+  "A pid minted by THIS runtime. A well-formed pid from another runtime is a
+   different answer from a pid whose incarnation is gone, and neither can be
+   confused with a recycled slot — incarnations are never reused."
+  [st x]
+  (and (rt-pid? x) (host/eq (host/vec-el x 1) (rt-runtime-of st))))
+
+; ── links ───────────────────────────────────────────────────────────────────
+;
+; A link is recorded on BOTH processes (`:links` is a map partner -> true), so
+; the cleanup of a dead process is a local read of its own record and never a
+; scan of the registry. A link is erased by the death that used it.
+
+(defn rt-link-count [proc]
+  (if (host/is-nil proc) 0 (host/map-size (:links proc))))
+
+(defn rt-link-add! [pid other]
+  (let [st (host/state)
+        proc (rt-proc-of st pid)]
+    (if (host/is-nil proc)
+      nil
+      (host/set-state (rt-put-proc st pid
+                                   (assoc proc :links (assoc (:links proc) other true)))))))
+
+(defn rt-link-remove! [pid other]
+  (let [st (host/state)
+        proc (rt-proc-of st pid)]
+    (if (host/is-nil proc)
+      nil
+      (host/set-state (rt-put-proc st pid
+                                   (assoc proc :links (host/map-remove (:links proc) other)))))))
+
+(defn rt-link
+  "Link the running process with `pid`, in both directions. Linking to a pid
+   that is not alive fails the CALL with :noproc, which is what
+   `:erlang.link/1` does once the pid no longer names a process."
+  [pid]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          self (rt-self)
+          alive (not (host/is-nil (rt-proc-of st pid)))]
+      (do
+        (if alive
+          (do
+            (rt-link-add! self pid)
+            (rt-link-add! pid self))
+          nil)
+        (host/critical-leave)
+        (if alive
+          pid
+          (erlang/raise :error :noproc nil))))))
+
+(defn rt-unlink
+  "Remove the link in both directions. `:erlang.unlink/1` answers true even
+   when there was no link, and so does this."
+  [pid]
+  (do
+    (host/critical-enter)
+    (rt-link-remove! (rt-self) pid)
+    (rt-link-remove! pid (rt-self))
+    (host/critical-leave)
+    true))
+
+(defn rt-spawn-link
+  "`spawn_link`: the link exists before the child can run, so a child that dies
+   immediately still signals its parent. ONE critical section, because a slice
+   boundary between the spawn and the link would be a lost signal."
+  [f args]
+  (do
+    (host/critical-enter)
+    (let [pid (rt-spawn f args)]
+      (do
+        (rt-link pid)
+        (host/critical-leave)
+        pid))))
+
+(defn rt-spawn-monitor
+  "`spawn_monitor`: spawn and monitor in ONE critical section. Spawning and then
+   monitoring as two steps is legal and NOT equivalent: a scheduler slice can
+   fall between them, the child can run, die — normally or not — and the monitor
+   then answers the DOWN of a process it never watched (:noproc, from the ALREADY
+   DEAD arm of `rt-monitor`). Watching a process from birth is this function.
+   Answers `[pid ref]`."
+  [f args]
+  (do
+    (host/critical-enter)
+    (let [pid (rt-spawn f args)
+          mref (rt-monitor pid)]
+      (do
+        (host/critical-leave)
+        [pid mref]))))
+
+(defn rt-spawn-link-monitor
+  "`spawn` + link + monitor in ONE critical section. A supervisor must own a
+   child's death FROM BIRTH: a slice boundary between the spawn and the link (or
+   the monitor) could let the child run and die unwatched, and the death would
+   then be neither a DOWN the supervisor can restart on nor a link that carries
+   the supervisor's own death to the child. Answers `[pid ref]`."
+  [f args]
+  (do
+    (host/critical-enter)
+    (let [pid (rt-spawn f args)]
+      (do
+        (rt-link pid)
+        (let [mref (rt-monitor pid)]
+          (do
+            (host/critical-leave)
+            [pid mref]))))))
+
+
+; ── monitors ────────────────────────────────────────────────────────────────
+;
+; A monitor is ONE-directional and lives in one runtime-wide table keyed by ref:
+; when the TARGET dies that entry is what names the owner to notify, and when
+; the OWNER dies the entry goes with it. Monitoring a pid that is not alive is
+; not a lost race — the liveness check and the registration are one critical
+; section and no other process can die inside it — so the DOWN is delivered
+; immediately, exactly once, with reason :noproc.
+
+(defn rt-monitors-watching
+  "The refs in `refs` whose entry watches `pid` FROM ANOTHER PROCESS, in table
+   order. A monitor a process holds on ITSELF is not an observer: it dies with
+   its owner, so counting it would let a self-monitoring process report its own
+   abnormal death as watched (see `rt-terminate-live!`)."
+  [mons pid refs acc]
+  (if (empty? refs)
+    acc
+    (let [r (first refs)
+          e (get mons r)]
+      (rt-monitors-watching mons pid (rest refs)
+                            (if (and (host/eq (:to e) pid)
+                                     (not (host/eq (:from e) pid)))
+                              (conj acc r)
+                              acc)))))
+
+(defn rt-monitors-without-owner
+  "The table minus every entry owned by `pid` — a monitor dies with its owner."
+  [mons pid refs acc]
+  (if (empty? refs)
+    acc
+    (let [r (first refs)]
+      (rt-monitors-without-owner mons pid (rest refs)
+                                 (if (host/eq (:from (get mons r)) pid)
+                                   acc
+                                   (assoc acc r (get mons r)))))))
+
+(defn rt-alloc-ref
+  "Mint the next typed ref and the state that records it, as `[ref state']`.
+   Monitors and calls draw from the SAME counter — section 4 says why — so no
+   two live handles in one runtime are ever equal."
+  [st]
+  (let [r (rt-make-ref st (:next-ref st))]
+    [r (assoc st :next-ref (host/arith "add" (:next-ref st) 1))]))
+
+(defn rt-monitor-tag [pid tag]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          from (rt-self)
+          alloc (rt-alloc-ref st)
+          mref (rt-nth alloc 0)
+          st2 (rt-nth alloc 1)
+          alive (not (host/is-nil (rt-proc-of st2 pid)))]
+      (do
+        (if alive
+          (host/set-state (assoc st2 :monitors
+                                 (assoc (:monitors st2) mref
+                                        {:from from :to pid :tag tag})))
+          (host/set-state st2))
+        ; The DOWN for an already-dead target is posted INSIDE this critical
+        ; section: a slice boundary before it would let the caller look for a
+        ; message that has not been sent yet.
+        (if alive
+          nil
+          (rt-send from [:down mref :process pid :noproc]))
+        (host/critical-leave)
+        mref))))
+
+(defn rt-monitor
+  "Monitor `pid` from the running process; answer the ref. A target that is
+   already dead answers a ref and an immediate `[:down ref :process pid :noproc]`,
+   exactly once. To watch a process FROM BIRTH use `rt-spawn-monitor`: spawn and
+   monitor as two calls can be separated by a scheduler slice, and then this
+   legitimately reports :noproc for a child that already ran and died."
+  ([pid] (rt-monitor-tag pid nil))
+  ([pid tag] (rt-monitor-tag pid tag)))
+
+(defn rt-demonitor
+  "Drop a monitor this process owns. Answers true when one was there, false
+   otherwise — the stricter answer is the useful one here."
+  [mref]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          e (get (:monitors st) mref)
+          mine (and (not (host/is-nil e)) (host/eq (:from e) (rt-self)))]
+      (do
+        (if mine
+          (host/set-state (assoc st :monitors (host/map-remove (:monitors st) mref)))
+          nil)
+        (host/critical-leave)
+        (host/truthy mine)))))
+
+; ── exit signals ────────────────────────────────────────────────────────────
+;
+; TWO deliveries, because BEAM gives them different rules:
+;
+;   * an EXPLICIT exit/2 signal (`rt-signal-other`): `:kill` is not trappable and
+;     the target dies with :killed; `:normal` is dropped for a non-trapping
+;     target and a message for a trapping one; every other reason kills a
+;     non-trapping target and messages a trapping one.
+;   * a LINK-carried signal (`rt-signal-link`): its reason is the dead partner's
+;     own exit reason, so a process that died via `exit(:kill)` sends `kill`
+;     (trappable, still `kill`), never `:killed`. `:normal` behaves as above.
+;
+; A process that traps exits turns EVERY signal into the mailbox message
+; [:exit <from> <reason>], `:normal` included. A signal to a pid that is not
+; alive is a no-op: there is no process left to signal and no slot the pid could
+; reach by accident.
+;
+; A signal to the RUNNING process cannot delete the registry entry whose frames
+; are still unwinding. Exit/2 to self raises out of the turn by exit/2's rules
+; (a self `:normal` terminates a non-trapping process); a link-carried signal is
+; DEFERRED until the sender's cleanup is complete and then raised by `rt-exit`.
+; `:erlang/exit/1` is plain: `(erlang/exit r)` dies with reason r.
+
+(defn rt-signal-other
+  "Deliver an EXPLICIT exit/2 signal to a process that is not the running one.
+   Here `:kill` is the untrappable signal: the target dies with :killed, before
+   the trap check and whatever its trap_exit flag says. `:normal` is dropped for
+   a non-trapping target and a message for a trapping one. The caller holds the
+   critical section this runs in. Answers the pending self-signal a cascade may
+   have left for the RUNNING process (see `rt-signal-link`), else nil."
+  [from pid reason]
+  (if (host/eq reason :kill)
+    (rt-terminate! pid :killed nil)
+    (let [proc (rt-proc-of (host/state) pid)]
+      (cond
+        (host/is-nil proc) nil
+        (host/truthy (:trap-exit proc)) (do (rt-send pid [:exit from reason]) nil)
+        (host/eq reason :normal) nil
+        :else (rt-terminate! pid reason nil)))))
+
+(defn rt-signal-link
+  "Deliver a LINK-carried exit signal — the signal a process's death sends to
+   each link partner. It is NOT an explicit signal: there is no untrappable
+   `:kill` here, because the reason is whatever the dead partner died with
+   (`kill` from exit/1 is trappable and stays `kill`; only an explicit exit/2
+   `:kill` produces `:killed`). A trapping partner gets the message even for
+   `:normal`; a non-trapping partner ignores `:normal` and dies with any other
+   reason.
+
+   The RUNNING process is the one case `rt-terminate!` must not touch: its
+   registry entry is what its frames are still unwinding, and deleting it
+   mid-turn would drop later sends and turn a later receive into a raw raise
+   (see `rt-signal-self`). So a signal to the running process is ANSWERED BY THE
+   CALLER instead: this returns `[reason from]`, and `rt-exit` raises it once the
+   enclosing death cleanup has finished, so the cascade stays atomic."
+  [from pid reason]
+  (let [proc (rt-proc-of (host/state) pid)]
+    (cond
+      (host/is-nil proc) nil
+      (host/truthy (:trap-exit proc)) (do (rt-send pid [:exit from reason]) nil)
+      (host/eq reason :normal) nil
+      (host/eq pid (rt-self)) [reason from]
+      :else (rt-terminate! pid reason nil))))
+
+(defn rt-signal-self
+  "Deliver an EXPLICIT exit/2 signal to the running process — `rt-exit` with the
+   running pid. `rt-terminate!` is NOT an option: the turn still owns the frames
+   its registry entry points at, so the signal leaves the turn instead. A raise
+   unwinds through the enclosing critical section, and the machine restores the
+   depth the frame entered with (host.mjs `runTurn`). The rules are exit/2's: an
+   untrappable `:kill` dies with :killed, a trapping process takes every other
+   reason as a message (`:normal` included), and a non-trapping one dies with the
+   signal's reason — a self `:normal` included, which is why the silent-drop rule
+   in the section header is for signals FROM ANOTHER process, not for self."
+  [from reason]
+  (let [proc (rt-proc-of (host/state) (rt-self))]
+    (cond
+      (host/eq reason :kill) (erlang/exit :killed)
+      (and (not (host/is-nil proc)) (host/truthy (:trap-exit proc)))
+        (rt-send (rt-self) [:exit from reason])
+      :else (erlang/exit reason))))
+
+(defn rt-exit
+  "Send `reason` as an exit signal from the running process to `pid`. A pending
+   self-signal carried back by a cascade (`rt-signal-link`) is raised HERE, after
+   the cascade's cleanup has finished, so the running process ends with the
+   reason its link partner's death carried without its registry entry being torn
+   out from under its own frames."
+  [pid reason]
+  (do
+    (host/critical-enter)
+    (let [pending (if (host/eq pid (rt-self))
+                    (do (rt-signal-self (rt-self) reason) nil)
+                    (rt-signal-other (rt-self) pid reason))]
+      (host/critical-leave)
+      (if (host/is-nil pending)
+        nil
+        (erlang/exit (rt-nth pending 0))))))
+
+(defn rt-trap-exit!
+  "Set the running process's trap_exit flag, answering its previous value —
+   `Process.flag(:trap_exit, v)` for this target. It changes what a signal
+   MEANS to this process; it does not change how signals are delivered."
+  [v]
+  (let [prev (host/truthy (:trap-exit (rt-proc-of (host/state) (rt-self))))]
+    (do
+      (rt-set-proc-field (rt-self) :trap-exit (host/truthy v))
+      prev)))
+
+; ── death: one atomic cleanup, exactly-once notifications ───────────────────
+;
+; Every death funnels through `rt-terminate!`: the normal return of a process's
+; entry function, an uncaught raise, an exit signal, and the cascade a linked
+; failure starts. It is the ONLY place a process stops existing, and it is ONE
+; critical section, so a scheduler slice can never observe half a death — an
+; entry gone with its links still live, or a monitor notified twice.
+;
+; The order is fixed and matters:
+;
+;   1. read the dying process's links and every monitor watching it, BEFORE any
+;      mutation. This is also what decides whether the death was observed.
+;   2. remove it from the registry, the runnable queue and the input sink,
+;      retract every NAME it holds, DISPOSE of every TABLE it owns (destroy,
+;      or transfer to the heir it named at creation), and drop the monitors IT
+;      owns (a monitor dies with its owner). A name, a table and a monitor are
+;      all retracted here, in the same indivisible step, because this is the
+;      only place a process stops existing — no monitor and no sweep is needed
+;      for any of them.
+;   3. notify every watcher with exactly one [:down ref :process pid reason],
+;      dropping the entry in the same step, so a second death of the same pid
+;      cannot notify again.
+;   4. exit-signal the links: a trapping partner gets [:exit pid reason] (even
+;      for :normal), a non-trapping partner dies with the reason — except
+;      :normal, which never propagates.
+;   5. drop the links. The partners were read in step 1 and are signalled before
+;      they are detached, so a victim's own record still shows why it is dying.
+;
+; The cascade is RECURSIVE and stays inside the outer critical section, so a
+; linked failure is complete before any other process can look. That is sound
+; here for one reason: this scheduler runs exactly one process at a time, so
+; there is nothing else mid-turn to interleave with.
+;
+; ONE POLICY, STATED PLAINLY: an ABNORMAL death with NO observer (no link, no
+; monitor) is recorded as a runtime error and fails the batch. An abnormal death
+; WITH an observer belongs to that observer: it is reported on stdout and
+; nowhere else. This is the prototype's rule, not OTP's logger, and it is what
+; lets a test crash an actor deliberately without failing the run while an
+; unnoticed crash still fails loudly.
+
+(defn rt-abnormal? [reason] (if (host/eq reason :normal) false true))
+
+(defn rt-death-reason
+  "The exit reason for a turn that ended in a raise. `:exit` carries the reason
+   VERBATIM: `(erlang/exit :boom)` dies with :boom and `(erlang/exit :kill)` with
+   :kill. `kill` is special only as an EXPLICIT exit/2 signal, where the TARGET is
+   killed with :killed (see `rt-signal-other`); a process that merely died with
+   reason `kill` propagates `kill` on its links, trappably. `:error` and `:throw`
+   are TAGGED with their class: BEAM appends a stacktrace there and this target
+   has none, so the class is the honest half of what can be reported."
+  [r]
+  (let [k (:kind r)
+        v (:reason r)]
+    (cond
+      (host/eq k :exit) v
+      (host/eq k :throw) [:nocatch v]
+      :else [:error v])))
+
+(defn rt-forget!
+  "Remove `pid` from the registry, the runnable queue and the input sink. The
+   input sink matters: a process that dies while registered must not keep
+   swallowing browser events."
+  [pid]
+  (do
+    (host/set-state (rt-drop-proc (host/state) pid))
+    (rt-purge-runnable! pid)))
+
+(defn rt-purge-runnable!
+  "Drop EVERY runnable entry for `pid`, not just the first."
+  [pid]
+  (let [st (host/state)
+        i (rt-vec-index (:runnable st) pid 0)]
+    (if (host/lt i 0)
+      nil
+      (do
+        (host/set-state (assoc st :runnable (host/vec-remove (:runnable st) i)))
+        (rt-purge-runnable! pid)))))
+
+(defn rt-drop-monitors-of! [pid]
+  (let [st (host/state)
+        mons (:monitors st)]
+    (host/set-state (assoc st :monitors
+                           (rt-monitors-without-owner mons pid (host/map-keys mons)
+                                                      (host/empty-map))))))
+
+(defn rt-drop-monitor! [mref]
+  (let [st (host/state)]
+    (host/set-state (assoc st :monitors (host/map-remove (:monitors st) mref)))))
+
+(defn rt-notify-monitors!
+  "Post one DOWN per ref and drop the entry in the same step. `refs` was read
+   before the death, so a ref whose entry an earlier cascade step already
+   removed is skipped rather than notified twice. Iterated BY INDEX: the refs
+   are a vector, and `rest` does not walk one."
+  [refs pid reason i]
+  (if (host/lt i (host/vec-size refs))
+    (let [mref (host/vec-el refs i)
+          e (get (:monitors (host/state)) mref)]
+      (do
+        (if (host/is-nil e)
+          nil
+          (do
+            (rt-drop-monitor! mref)
+            (rt-send (:from e) [:down mref :process pid reason])))
+        (rt-notify-monitors! refs pid reason (host/arith "add" i 1))))
+    nil))
+
+; ── rendering a logical source stack ─────────────────────────────────────────
+;
+; An uncaught failure renders its location through the SAME convention as
+; priv/std/errors.bl::render — `file:line:col` — but this module deliberately
+; does NOT depend on errors.bl or diag.bl: the bundle ships the runtime alone
+; and the diagnostic vocabulary is closed. The frames are the host's typed
+; call-site metadata (host.mjs `frameValues`), already innermost-first and
+; bounded; a frame with no source renders EXPLICITLY as <unknown>, never
+; dropped — an honest unknown beats a silently missing frame.
+
+(defn rt-frame-loc [f]
+  (if (and (host/is-str (:file f)) (host/is-int (:line f)))
+    (host/str-cat (:file f) ":" (:line f) ":"
+                  (if (host/is-int (:col f)) (:col f) 1))
+    "<unknown>"))
+
+(defn rt-frame-line [f]
+  (let [nm (:fn f) ar (:arity f)]
+    (host/str-cat "  at " (rt-frame-loc f)
+                  (if (host/is-str nm)
+                    (host/str-cat " in " nm "/" (if (host/is-int ar) ar "?"))
+                    ""))))
+
+(defn rt-render-frames [frames acc]
+  (if (empty? frames)
+    acc
+    (rt-render-frames (rest frames)
+                      (host/str-cat acc "\n" (rt-frame-line (first frames))))))
+
+(defn rt-frames-known?
+  "Whether ANY frame carries a real source position. A failure with none — an
+   injected host generator, a synthetic frame — renders as its bare message."
+  [frames]
+  (if (empty? frames)
+    false
+    (if (and (host/is-str (:file (first frames))) (host/is-int (:line (first frames))))
+      true
+      (rt-frames-known? (rest frames)))))
+
+(defn rt-failure-message
+  "The message an uncaught process failure reports. The host's own text stays the
+   head; the logical source frames are appended ONLY when at least one frame
+   carries a real source position."
+  [r]
+  (let [msg (:message r)
+        frames (:frames r)]
+    (if (and (not (host/is-nil frames)) (rt-frames-known? frames))
+      (host/str-cat (if (host/is-nil msg) "uncaught raise" msg)
+                    (rt-render-frames frames ""))
+      msg)))
+
+(defn rt-report-death
+  "The diagnostic, and the one policy: an abnormal, unobserved death is a run
+   error; an observed one is the observer's business."
+  [pid reason message observed]
+  (if (rt-abnormal? reason)
+    (if observed
+      (host/write (host/str-cat "process " (host/describe pid)
+                                " exited: " (host/describe reason)))
+      (do
+        (host/write (host/str-cat "process " (host/describe pid) " failed: "
+                                  (if (host/is-nil message)
+                                    (host/describe reason)
+                                    message)))
+        (host/record-error (host/str-cat "process " (host/describe pid)
+                                         " died: " (host/describe reason)))))
+    nil))
+
+(defn rt-signal-partners
+  "Exit-signal every live link partner of the process that just died, and answer
+   the FIRST pending self-signal any of them left for the running process (see
+   `rt-signal-link`). Every partner is signalled whatever the answer: the running
+   process's own death is deferred, not the cascade."
+  [from partners reason]
+  (if (empty? partners)
+    nil
+    (let [pending (rt-signal-link from (first partners) reason)
+          rest-pending (rt-signal-partners from (rest partners) reason)]
+      (if (host/is-nil pending) rest-pending pending))))
+
+(defn rt-detach-links! [partners pid]
+  (if (empty? partners)
+    nil
+    (do
+      (rt-link-remove! (first partners) pid)
+      (rt-detach-links! (rest partners) pid))))
+
+(defn rt-terminate-live!
+  "The body of a death, for a pid that IS in the registry. The caller holds the
+   critical section, so all six steps are one indivisible update. Answers the
+   pending self-signal the cascade leaves for the running process, if any."
+  [pid proc reason message]
+  (let [st (host/state)
+        partners (host/map-keys (:links proc))
+        watching (rt-monitors-watching (:monitors st) pid
+                                       (host/map-keys (:monitors st)) [])
+        observed (or (host/lt 0 (host/map-size (:links proc)))
+                     (host/lt 0 (count watching)))]
+    (do
+      (rt-forget! pid)
+      (rt-drop-names-of! pid)
+      (rt-drop-tables-of! pid)
+      (rt-drop-monitors-of! pid)
+      (rt-notify-monitors! watching pid reason 0)
+      (rt-report-death pid reason message observed)
+      (let [pending (rt-signal-partners pid partners reason)]
+        (do
+          (rt-detach-links! partners pid)
+          pending)))))
+
+(defn rt-terminate!
+  "The one chokepoint: end `pid` with `reason`, exactly once. A pid with no
+   registry entry is already dead and is left alone — that is what makes a
+   DOUBLE death (a kill after a kill, a signal to a corpse) harmless and keeps
+   every notification exactly-once. Answers the pending running-process signal
+   its cascade produced, if any."
+  [pid reason message]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          proc (rt-proc-of st pid)
+          pending (if (host/is-nil proc)
+                    nil
+                    (rt-terminate-live! pid proc reason message))]
+      (do
+        (host/critical-leave)
+        pending))))
+
+; ── introspection ───────────────────────────────────────────────────────────
+;
+; Read-only views of the scheduler state, for the regression actors and for
+; anyone reading a failing run. Each is a read of the one retained root inside a
+; turn, and a critical section defers the slice boundary that would let another
+; process change it mid-read, so none of them can show a partial update.
+
+(defn rt-alive? [pid] (not (host/is-nil (rt-proc-of (host/state) pid))))
+(defn rt-proc-count [] (host/map-size (:procs (host/state))))
+(defn rt-runnable-count [] (host/vec-size (:runnable (host/state))))
+(defn rt-monitor-count [] (host/map-size (:monitors (host/state))))
+(defn rt-input-sink [] (:input-sink (host/state)))
+(defn rt-link-count-of [pid] (rt-link-count (rt-proc-of (host/state) pid)))
+
+(defn rt-timer-count
+  "How many LIVE processes are parked on a deadline. A process that died cannot
+   be one: its `:wait` left with its registry entry, so the scheduler can neither
+   sleep for it nor wake it."
+  []
+  (rt-timer-count-1 (host/map-keys (:procs (host/state))) (:procs (host/state)) 0))
+
+(defn rt-timer-count-1 [keys procs n]
+  (if (empty? keys)
+    n
+    (rt-timer-count-1 (rest keys) procs
+                      (if (host/is-nil (:wait (get procs (first keys))))
+                        n
+                        (host/arith "add" n 1)))))
+
+; ── receive ─────────────────────────────────────────────────────────────────
+;
+; The deadline is computed ONCE, on entry, and never reset: a flood of
+; unmatched messages can delay when the timeout *fires* (the queue must still
+; be scanned) but cannot push the deadline out.
+
+(defn rt-deadline-of
+  "The monotonic deadline for a receive timeout. `nil` (no `after` clause) and
+   `:infinity` mean no deadline; a nonnegative integer `ms` means now + ms.
+   Anything else is a source error and raises."
+  [timeout-ms]
+  (cond
+    (host/is-nil timeout-ms) nil
+    (host/is-kw timeout-ms)
+      (if (host/eq (host/kw-name timeout-ms) "infinity")
+        nil
+        (host/raise (host/str-cat "receive: bad timeout "
+                                  (host/describe timeout-ms)
+                                  " (want a nonnegative integer or :infinity)")))
+    (host/is-int timeout-ms)
+      (if (host/lt timeout-ms 0)
+        (host/raise (host/str-cat "receive: bad timeout " timeout-ms
+                                  " (want a nonnegative integer or :infinity)"))
+        (host/arith "add" (host/now) timeout-ms))
+    :else
+      (host/raise (host/str-cat "receive: bad timeout "
+                                (host/describe timeout-ms)
+                                " (want a nonnegative integer or :infinity)"))))
+
+(defn rt-deadline-passed? [dl]
+  (if (host/is-nil dl)
+    false
+    (not (host/lt (host/now) dl))))
+
+(defn rt-scan-from
+  "Offer the messages of the mailbox SNAPSHOT `mb`, from cursor `i`, to the
+   compiled probe `scan`. Answers [:match idx sel] or [:nomatch end] where
+   `end` is the cursor just past the snapshot. `mb` is a BL local, so messages
+   that arrive while the scan is sliced are picked up by the next pass, never
+   by this one: a flood cannot extend a pass."
+  [scan mb i]
+  (if (host/lt i (host/vec-size mb))
+    (let [r (scan (host/vec-el mb i))]
+      (if (host/eq r :nomatch)
+        (rt-scan-from scan mb (host/arith "add" i 1))
+        [:match i r]))
+    [:nomatch i]))
+
+(defn rt-proc-wait!
+  "Register `pid` as waiting until deadline `dl` in ONE critical section, so a
+   send either sees :waiting (and requeues) or sees the message the post-
+   registration rescan finds — it cannot slip between the two fields. A pid
+   that no longer has a process registers nothing at all."
+  [pid dl]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          proc (rt-proc-of st pid)]
+      (if (host/is-nil proc)
+        nil
+        (host/set-state (rt-put-proc st pid
+                                     (assoc (assoc proc :wait dl)
+                                            :status :waiting)))))
+    (host/critical-leave)
+    nil))
+
+(defn rt-proc-resume!
+  "Clear `pid`'s wait, mark it running, and drop any runnable entry a racing
+   send may have appended. One critical section."
+  [pid]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          proc (rt-proc-of st pid)
+          runq (:runnable st)
+          i (rt-vec-index runq pid 0)
+          st2 (if (nil? proc)
+                st
+                (rt-put-proc st pid (assoc (assoc proc :wait nil) :status :running)))
+          st3 (if (host/lt i 0)
+                st2
+                (assoc st2 :runnable (host/vec-remove runq i)))]
+      (host/set-state st3))
+    (host/critical-leave)
+    nil))
+
+(defn rt-receive
+  "The one suspension point of a receive.
+   `scan` is a compiler-generated probe: (fn [msg] -> :nomatch | [:match body-fn]).
+   `after-fn` is the timeout continuation, `timeout-ms` nil | :infinity | ms.
+
+   Selection is message-major (each message is offered to every clause in
+   source order, inside the probe) and each fresh snapshot is scanned from its
+   head, so skipped messages keep their order.
+
+   The mailbox is scanned BEFORE any park, so `after 0` scans what is already
+   queued and times out WITHOUT parking. On every wakeup the queue is rescanned
+   before the timeout is answered, so a message and an expired deadline are
+   ordered message-first — while the fixed deadline keeps a flood of unmatched
+   messages from extending the wait."
+  [scan after-fn timeout-ms]
+  (rt-receive-wait scan after-fn (host/self) (rt-deadline-of timeout-ms) 0))
+
+(defn rt-receive-wait [scan after-fn pid dl i]
+  (let [proc (rt-proc-of (host/state) pid)]
+    (if (host/is-nil proc)
+      ; Defensive: no delivery path terminates the RUNNING process any more — a
+      ; link signal to it is deferred and raised by `rt-exit`, and exit/2 to
+      ; itself leaves the turn by raising. If the entry is gone anyway, the turn
+      ; must NOT park and resurrect a zombie: it ends and reports the raise.
+      (host/raise "receive: the running process no longer exists")
+      (do
+        ; The mailbox is a SNAPSHOT: the compiled probe walks it, and messages
+        ; that arrive while a pass is sliced are seen by the next pass.
+        (let [mb (:mailbox proc)
+              r (rt-scan-from scan mb i)]
+          (if (host/eq (rt-first r) :match)
+            (let [idx (rt-nth r 1)]
+              (do
+                (rt-drop-mailbox-msg pid idx)
+                (rt-nth r 2)))
+            (let [n (rt-nth r 1)]
+              (if (rt-deadline-passed? dl)
+                [:timeout after-fn]
+                (do
+                  ; Registration, recheck and parking form one scheduling transaction.
+                  (host/critical-enter)
+                  (rt-proc-wait! pid dl)
+                  (if (host/lt n (host/vec-size (:mailbox (rt-proc-of (host/state) pid))))
+                    (do
+                      (rt-proc-resume! pid)
+                      (host/critical-leave)
+                      (rt-receive-wait scan after-fn pid dl n))
+                    (do
+                      (host/park-release)
+                      (rt-proc-resume! pid)
+                      (rt-receive-wait scan after-fn pid dl n))))))))))))
+
+(defn rt-min-deadline [procs]
+  (rt-min-deadline-1 (host/map-keys procs) procs nil))
+
+(defn rt-min-deadline-1 [keys procs best]
+  (if (host/is-enil keys)
+    best
+    (let [w (:wait (get procs (first keys)))
+          nxt (if (host/is-nil w)
+                best
+                (if (host/is-nil best) w (if (host/lt w best) w best)))]
+      (rt-min-deadline-1 (rest keys) procs nxt))))
+
+(defn rt-wake-expired [keys procs now]
+  (if (host/is-enil keys)
+    nil
+    (let [pid (first keys)
+          w (:wait (get procs pid))]
+      (do
+        (if (and (not (host/is-nil w)) (not (host/lt now w)))
+          (rt-requeue! pid)
+          nil)
+        (rt-wake-expired (rest keys) procs now)))))
+
+(defn rt-run-pid
+  "Run one bounded turn of `pid`. A parked turn leaves the proc waiting with
+   its frame stack intact; a yielded turn requeues it. Every way a turn can
+   END is a death, and every death goes through `rt-terminate!` — the normal
+   return of the entry function with reason :normal, an uncaught raise with the
+   reason its class implies — so nothing else in the runtime has to remember to
+   drop a process, release its input sink, clean its timer or notify its links."
+  [pid]
+  (let [proc (rt-proc-of (host/state) pid)]
+    (if (nil? proc)
+      :gone
+      (let [r (host/run-turn (:frames proc) 200)
+            status (:status r)]
+        (do
+          (cond
+            (host/eq status :done)
+              (rt-terminate! pid :normal nil)
+            (host/eq status :error)
+              (rt-terminate! pid (rt-death-reason r) (rt-failure-message r))
+            (host/eq status :yield)
+              (rt-requeue! pid)
+            :else nil)
+          :done)))))
+
+(defn rt-run-head-pid [pid]
+  (let [proc (rt-proc-of (host/state) pid)]
+    (if (nil? proc)
+      (rt-run-head)                  ; a stale runnable entry: skip to the next
+      (do
+        (rt-set-proc-field pid :status :running)
+        (host/set-self pid)
+        (let [r (rt-run-pid pid)]
+          (do
+            (host/set-self nil)      ; the scheduler root owns the context again
+            r))))))
+
+(defn rt-pop-runnable! [pid]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          runq (:runnable st)
+          i (rt-vec-index runq pid 0)]
+      (host/set-state (if (host/lt i 0) st (assoc st :runnable (host/vec-remove runq i)))))
+    (host/critical-leave)
+    nil))
+
+(defn rt-run-head
+  "Run the head of the FIFO runnable queue. A pid whose process is gone is
+   skipped, so a dropped process never resurrects a zombie registry entry."
+  []
+  (let [st (host/state)
+        runq (:runnable st)]
+    (if (host/eq 0 (host/vec-size runq))
+      :empty
+      (let [pid (host/vec-el runq 0)]
+        (do
+          (rt-pop-runnable! pid)
+          (rt-run-head-pid pid))))))
+
+(defn rt-clamp [ms] (if (host/lt ms 0) 0 ms))
+
+(defn rt-sched-loop
+  "One scheduler step per iteration, in tail position, so the scheduler itself
+   is stack-safe. Expired timers are woken on EVERY cycle, runnable peers or
+   not, so a busy process cannot hide a timeout. Decides between running a
+   runnable process, sleeping to the earliest deadline, and stopping."
+  []
+  (let [st (do (rt-pump-input) (host/state))
+        procs (:procs st)]
+    (if (host/eq 0 (host/map-size procs))
+      :done
+      (do
+        (rt-wake-expired (host/map-keys procs) procs (host/now))
+        (let [st2 (host/state)
+              procs2 (:procs st2)]
+          (if (host/eq 0 (host/vec-size (:runnable st2)))
+            (let [dl (rt-min-deadline procs2)]
+              (if (host/is-nil dl)
+                (if (host/is-nil (:input-sink st2))
+                  (let [m (host/str-cat "scheduler: "
+                                        (host/str-cat (host/map-size procs2)
+                                                      " process(es) blocked with no deadline"))]
+                    (do
+                      (host/write m)
+                      (host/record-error m)
+                      :done))
+                  (do
+                    (host/wait-input)
+                    (rt-sched-loop)))
+                (do
+                  (host/wait-until (rt-clamp (host/arith "sub" dl (host/now)))
+                                   (not (host/is-nil (:input-sink st2))))
+                  (rt-sched-loop))))
+            (do
+              (rt-run-head)
+              (rt-sched-loop))))))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; 4. Names and the call protocol
+; ─────────────────────────────────────────────────────────────────────────────
+;
+; A NAME is a stable, human-readable address for one live process. It is NOT
+; `proc.reg`'s relation: the registry answers "which processes carry this
+; attribute" and retracts through a monitor, while a name answers "which process
+; IS this" and retracts because the death transaction already knows the dying
+; pid. One is a query, the other an address, and keeping them apart is the
+; point — a name table that could also answer queries would be a second,
+; worse registry.
+;
+; EVERY RULE BELOW IS BL. The whole name table is one immutable BL map in the
+; one retained root (`:names`), so it is retracted inside the SAME critical
+; section that removes the process (`rt-terminate-live!`), never by a monitor
+; and never by a sweep. There is therefore no window in which `whereis` answers
+; a corpse:
+;
+;   * one name → at most one live pid. A second registration is REFUSED, loudly,
+;     with `[:name-taken <name>]` — never a silent overwrite;
+;   * `whereis` answers nil for an absent name; absence is not an error;
+;   * a registration names a pid that is live right now, so a corpse cannot be
+;     registered either;
+;   * a name is a keyword or a string. A pid — a `[:pid …]` vector — is NOT a
+;     name, so the two address spaces cannot collide in one map.
+;
+; A PID AND A NAME ARE THE SAME ADDRESS KIND to every verb: `rt-resolve` is the
+; ONE resolver, and `send`, `call`, `cast` and `stop` all take whatever it
+; accepts. Nothing else in the runtime knows about names.
+;
+; THE CALL PROTOCOL is `call`/`cast`/`reply`/`stop` over the EXISTING mailbox,
+; correlated by a typed ref. It adds no second delivery path: a call is a send,
+; a reply is a send, and the waiting is an ordinary selective `receive` with a
+; deadline fixed on entry.
+;
+;   (call  <pid|name> msg [timeout-ms]) → the reply, or an exit
+;   (cast  <pid|name> msg)              → :ok, immediately
+;   (reply value next-state)            → a lowered defserver clause's answer
+;   (stop  <pid|name> [reason])         → :ok; the server ends with `reason`
+;
+; THE TIMEOUT IS THE CALLER'S DEATH, as on BEAM: an unanswered call exits the
+; caller with `[:timeout <to> <msg> <ms>]`. A call whose target names no live
+; process exits AT ONCE with `[:noproc <to>]`, instead of waiting out a deadline
+; nothing will meet. Both are exit-class raises, so a caller that wants to
+; survive catches them; nothing else about the call is observable. The default
+; timeout is 5000 ms and a call to a target that dies while the caller waits is
+; seen as a timeout, not as :noproc — this protocol has no monitor of its own
+; and does not pretend to (see the limitations in README).
+;
+; A LATE REPLY IS LEFT IN THE MAILBOX, and it cannot answer a later call: the
+; reply is tagged with the ref of the request it answers, and the waiting
+; `receive` matches only its OWN ref — by a GUARD, never by the head of the
+; mailbox. So the next call skips it, and a caller that caught its timeout can
+; still find the stale reply exactly where it landed.
+
+(defn rt-name?
+  "A value this runtime accepts as a name: a keyword or a string. A pid is
+   deliberately not one, so the name table and the pid space stay disjoint."
+  [x]
+  (if (host/is-kw x) true (host/is-str x)))
+
+(defn rt-resolve
+  "The LIVE process `to` names, or nil. A pid of this runtime that is still
+   alive resolves to itself; a name resolves through the name table; anything
+   else — a foreign pid, a dead pid, an unheld name, a value that is neither —
+   answers nil. The ONE resolver behind send, call, cast and stop."
+  [st to]
+  (let [pid (cond
+              (rt-pid? to) (if (host/eq (host/vec-el to 1) (rt-runtime-of st)) to nil)
+              :else (get (:names st) to))]
+    (if (host/is-nil pid)
+      nil
+      (if (host/is-nil (rt-proc-of st pid)) nil pid))))
+
+(defn rt-deliver
+  "Queue `msg` on live `pid`'s mailbox and wake it if it parked in a receive.
+   The delivery half of every send in this file; the caller holds the critical
+   section."
+  [st pid msg]
+  (let [proc (rt-proc-of st pid)]
+    (do
+      (host/set-state (rt-put-proc st pid (assoc proc :mailbox (conj (:mailbox proc) msg))))
+      (if (host/eq (:status proc) :waiting)
+        (rt-requeue! pid)
+        nil)
+      msg)))
+
+(defn rt-deliver-quiet
+  "Deliver to `to` when it resolves to a live process, and do NOTHING when it
+   does not — the reply path, where the recipient is expected to be able to
+   vanish. A reply to a dead caller is not an error and not a diagnostic; it is
+   a message to nobody. Answers what `rt-send` would, without the writing."
+  [to msg]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          pid (rt-resolve st to)]
+      (do
+        (if (host/is-nil pid)
+          nil
+          (rt-deliver st pid msg))
+        (host/critical-leave)
+        (if (host/is-nil pid) nil msg)))))
+
+; ── the name table ──────────────────────────────────────────────────────────
+
+(defn rt-whereis-name
+  "The live pid registered under `name`, or nil. A non-nil answer is always a
+   process that can still receive: retraction happens in the death transaction,
+   so a name cannot outlive its process."
+  [name]
+  (let [st (host/state)
+        pid (get (:names st) name)]
+    (if (host/is-nil pid)
+      nil
+      (if (host/is-nil (rt-proc-of st pid)) nil pid))))
+
+(defn rt-register-name
+  "Register `pid` under `name`; answers true. Raises `[:name-not-a-keyword-or-string v]`,
+   `[:no-such-process pid]` or `[:name-taken name]` — the first registration
+   stands, untouched, because uniqueness is loud."
+  [name pid]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          bad (cond
+                (not (rt-name? name)) [:name-not-a-keyword-or-string name]
+                (host/is-nil (rt-proc-of st pid)) [:no-such-process pid]
+                (not (host/is-nil (get (:names st) name))) [:name-taken name]
+                :else nil)]
+      (do
+        (if (host/is-nil bad)
+          (host/set-state (assoc st :names (assoc (:names st) name pid)))
+          nil)
+        (host/critical-leave)
+        (if (host/is-nil bad) true (erlang/raise :error bad nil))))))
+
+(defn rt-unregister-name
+  "Release `name`. Answers true when a registration was removed and false when
+   there was none — the stricter answer, as `rt-demonitor` is strict."
+  [name]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          held (not (host/is-nil (get (:names st) name)))]
+      (do
+        (if held
+          (host/set-state (assoc st :names (host/map-remove (:names st) name)))
+          nil)
+        (host/critical-leave)
+        (host/truthy held)))))
+
+(defn rt-name-insert
+  "Insert `x` into the sorted list `sorted`, by printed form. The name table is
+   a map, so its key order is the map's; this is the one place an order is
+   chosen, and it is chosen once."
+  [x sorted]
+  (cond
+    (empty? sorted) (list x)
+    (host/lt (host/describe x) (host/describe (first sorted))) (cons x sorted)
+    :else (cons (first sorted) (rt-name-insert x (rest sorted)))))
+
+(defn rt-name-sort [names sorted]
+  (if (empty? names)
+    sorted
+    (rt-name-sort (rest names) (rt-name-insert (first names) sorted))))
+
+(defn rt-registered-names
+  "Every held name, sorted — what a diagnostic, a test or a browser panel reads
+   to see the address table without asking about a specific process."
+  []
+  (rt-name-sort (host/map-keys (:names (host/state))) ()))
+
+(defn rt-forget-name!
+  "Drop one name entry unconditionally. The death path only: the caller already
+   holds the critical section and has established that this name is the dying
+   process's."
+  [name]
+  (host/set-state (assoc (host/state) :names (host/map-remove (:names (host/state)) name))))
+
+(defn rt-drop-names-of-1 [names pid]
+  (if (empty? names)
+    nil
+    (do
+      (if (host/eq (get (:names (host/state)) (first names)) pid)
+        (rt-forget-name! (first names))
+        nil)
+      (rt-drop-names-of-1 (rest names) pid))))
+
+(defn rt-drop-names-of!
+  "Retract EVERY name the dying `pid` holds. This is the whole of name
+   auto-retraction, and it needs no monitor: the one death transaction already
+   knows its own pid, so the retraction is a read of its own record and not a
+   scan for survivors."
+  [pid]
+  (rt-drop-names-of-1 (host/map-keys (:names (host/state))) pid))
+
+; ── the call protocol ───────────────────────────────────────────────────────
+
+(defn rt-new-ref
+  "A fresh typed ref, from the same counter monitors draw on, so a call's ref
+   can never collide with a monitor's."
+  []
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          alloc (rt-alloc-ref st)]
+      (do (host/set-state (rt-nth alloc 1)) (host/critical-leave) (rt-nth alloc 0)))))
+
+(defn rt-reply-to
+  "Answer the call `ref` identifies: post `[:reply ref value]` to the caller.
+   A caller that has since died is a no-op."
+  [to ref value]
+  (rt-deliver-quiet to [:reply ref value]))
+
+(defn rt-cast
+  "Post `[:cast msg]` and answer :ok at once — a cast never blocks and never
+   waits for the target to run a turn. A target that names nothing live is a
+   diagnostic on the way out and still :ok, because the sender's contract does
+   not depend on the receiver's fate."
+  [to msg]
+  (do (rt-send to [:cast msg]) :ok))
+
+(defn rt-call-recv
+  "Wait for the reply that matches `ref`, or answer `[:timeout to msg ms]` at
+   the deadline. The ref is matched by a GUARD and never by position: that is
+   what makes a stale reply in the mailbox invisible to this call."
+  [ref timeout-ms to msg]
+  (receive
+    [:reply r v] :when (= r ref) [:reply v]
+    (after timeout-ms [:timeout to msg timeout-ms])))
+
+(defn rt-call-send
+  "Resolve, mint the request ref and post `[:call ref self msg]` in ONE critical
+   section, so the target cannot die between the lookup and the send. Answers
+   `[:sent ref]`, or `[:noproc to]` when `to` names nothing live right now."
+  [to msg]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          pid (rt-resolve st to)
+          out (if (host/is-nil pid)
+                [:noproc to]
+                (let [alloc (rt-alloc-ref st)
+                      ref (rt-nth alloc 0)
+                      st2 (rt-nth alloc 1)]
+                  (do
+                    (host/set-state st2)
+                    (rt-deliver st2 pid [:call ref (rt-self) msg])
+                    [:sent ref])))]
+      (do (host/critical-leave) out))))
+
+(defn rt-call-with
+  "`rt-call`'s body. A separate defn because a MULTI-ARITY clause that calls its
+   OWN name is resolved by the frontend to that clause's self-application
+   scaffold — a one-arity value — and the JS backend then reports `no arity N`
+   for a call the native path happens to tolerate. A helper keeps both arities
+   literal and both call sites global."
+  [to msg timeout-ms]
+  (let [out (rt-call-send to msg)]
+    (if (host/eq (rt-nth out 0) :noproc)
+      (erlang/exit [:noproc to])
+      (let [r (rt-call-recv (rt-nth out 1) timeout-ms to msg)]
+        (if (host/eq (rt-nth r 0) :reply)
+          (rt-nth r 1)
+          (erlang/exit r))))))
+
+(defn rt-call
+  "A synchronous request over the mailbox: post a tagged request, then wait for
+   the reply that carries THIS request's ref.
+
+   An unanswered call exits the caller with `[:timeout to msg ms]`; a target
+   that names no live process exits at once with `[:noproc to]`. Nothing about
+   the call leaks into the mailbox except a reply, so a caller that catches its
+   timeout is immediately usable again."
+  ([to msg] (rt-call-with to msg 5000))
+  ([to msg timeout-ms] (rt-call-with to msg timeout-ms)))
+
+(defn rt-stop-with [to reason] (do (rt-send to [:stop reason]) :ok))
+
+(defn rt-stop
+  "Ask the target to stop: post `[:stop reason]`, answer :ok. A defserver
+   lowered for this target runs its `terminate` clause and then ends with
+   `reason`; any other process sees an ordinary message."
+  ([to] (rt-stop-with to :normal))
+  ([to reason] (rt-stop-with to reason)))
+
+; ── the generic verbs ───────────────────────────────────────────────────────
+;
+; Source reaches these by their UNQUALIFIED names (`call`, `cast`, `stop`,
+; `whereis`, `register`, `unregister`), the way it reaches `str` or `not`: the
+; compiler's closed ABI maps each core name onto the function below, and the
+; emitter falls back from the source namespace to `core/…`. There is no second,
+; JS-only vocabulary — a bundle spells the same verbs on this target as on BEAM.
+
+(defn core-send ([to msg] (rt-send to msg)))
+(defn core-call ([to msg] (rt-call to msg)) ([to msg timeout-ms] (rt-call to msg timeout-ms)))
+(defn core-cast [to msg] (rt-cast to msg))
+(defn core-stop ([to] (rt-stop to)) ([to reason] (rt-stop to reason)))
+(defn core-whereis [name] (rt-whereis-name name))
+(defn core-register [name pid] (rt-register-name name pid))
+(defn core-unregister [name] (rt-unregister-name name))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; 5. Tables — shared mutable state that outlives the process that made it
+; ─────────────────────────────────────────────────────────────────────────────
+;
+; A TABLE is the one value in this runtime that is MUTATED IN PLACE. Everything
+; else — pids, names, mailboxes, the registry — is a BL value threaded through
+; the retained root, so a write copies. A table cannot be that: `host/map-put`
+; copies the whole underlying map, which makes a map-backed store O(n) per write
+; and quadratic when written in a loop (research/js-actors-future/03 §2.2, and
+; the measured scaling in verify-table-leaves.mjs). So the host keeps one native
+; `Map` per table and updates it in place, and the table's metadata holds an
+; opaque HANDLE to it. That handle is a host object, so no BL value can forge
+; one, and it is bound to the runtime that minted it.
+;
+; THE HOST DECIDES NO POLICY. Its eight leaves (mirrored by compiler.bl's closed
+; ABI) are storage and bounds only: `host/table-new` takes no owner, heir, name
+; or mode, and `host/is-table` answers only "this is a handle" — never whether
+; it is alive or who may write it. Everything that makes a table an ETS table is
+; decided HERE:
+;
+;   * IDENTITY is BL's: `[:table <runtime> <serial>]`, the same typed shape a
+;     pid and a ref have, minted from a counter that is never reused. A BL
+;     service caller receives only the typed table id. This prototype's BL
+;     bundle is TRUSTED: a module can inspect `host/state` and invoke raw
+;     storage leaves, so modes are process-protocol rules, not a sandbox
+;     against hostile BL source. Public table verbs refuse a handle, foreign
+;     id, pid or destroyed id BY NAME (`[:not-a-table v]` /
+;     `[:no-such-table v]`), never by reusing a storage slot.
+;   * OWNERSHIP is the creating process, and a table is part of its owner's
+;     memory: the owner's death disposes of it (I3.1), unless it named an HEIR.
+;   * AN HEIR is a pid named AT CREATION, so there is no window in which a table
+;     exists unheired (proc/table.bl's first rule, applied at the primitive). On
+;     the owner's death the table is TRANSFERRED — same identity, same rows —
+;     and the heir receives `[:ets-transfer <tid> <former-owner> <heir-data>]`.
+;     An heir that is dead, missing, or IS the owner means the table is
+;     DESTROYED, exactly as an unheired table is.
+;   * ACCESS is the BEAM mode: `:private` (owner only), `:protected` (the owner
+;     writes, anyone reads) and `:public` (anyone does both). The check is one
+;     function and one question — READ, WRITE, or the owner-only rule that
+;     `:ets.give_away/3` has whatever the mode says. `table-destroy` asks for a
+;     WRITE, so on a `:public` table ANOTHER PROCESS may destroy it, exactly as
+;     `:ets.delete/1` allows.
+;   * NAMES are unique and LOUD: a second live table with one name is refused
+;     with `[:table-name-taken <name>]` and the first stands, untouched (I3.3).
+;     The table-name space is SEPARATE from the process-name space (section 4),
+;     as BEAM's is: `(whereis :store)` and `(table-whereis :store)` cannot
+;     collide.
+;
+; DEATH CLEANUP IS IN THE ONE DEATH TRANSACTION. `rt-drop-tables-of!` runs
+; inside `rt-terminate-live!`, in the same critical section that already
+; retracts the dying process's names and drops its monitors. No observer can see
+; a table owned by a pid that is no longer in `:procs` (I3.2), and no sweep or
+; monitor is needed to find one. Transfer and disposal share one step
+; (`rt-table-free!`), so a table can never stop existing while its name or its
+; metadata survives it.
+;
+; EVERY OPERATION RUNS INSIDE ONE CRITICAL SECTION. That is what makes an
+; operation atomic with respect to a death and to every other operation, and it
+; is what makes `table-update-counter` an atomic read-modify-write rather than a
+; read and a LATER write that a scheduler slice could land between (I3.4). The
+; one cost is that a long `table-snapshot`/`table-select` defers slice
+; boundaries for as long as its copy takes — the same window `:ets.tab2list`
+; holds a table open on BEAM.
+;
+; WHAT IS DELIBERATELY ABSENT — the portable subset, and its edges:
+;
+;   * TYPES. `:set` only. `ordered_set` would need a total order over BL values
+;     and this target has one only for numbers and strings; `bag` and
+;     `duplicate_bag` store SEVERAL rows per key, and this store is one row per
+;     canonical key. All three are refused at creation by name.
+;   * MATCH SPECS. `table-select` takes ONE shape — one clause (a one-element
+;     list or vector) holding a 2-element pattern vector, each element a
+;     literal or `:_`. Guards, bodies, `$N` variables, several clauses, `:all`
+;     and the `select/3` CONTINUATION are REFUSED (`[:unsupported-match-spec
+;     s]` / `[:unsupported-continuation c]`): a match condition that is
+;     silently ignored answers a wrong question confidently.
+;   * A CURSOR. `table-snapshot` and `table-select` answer a SNAPSHOT; there is
+;     no live traversal and no `foldl` to hold a table open across slices
+;     (I3.5 — a read of a table is a snapshot, and the API says nothing more).
+;   * A BL MAP ALIAS. `host/is-map` is false for a table id and `mapPut` never
+;     sees one: a table is not a value, and a copy-on-write map pretending to be
+;     one is the O(n)-per-write trap this primitive exists to avoid.
+;   * OTHER ETS OPERATIONS — `member`, `insert_new`, `lookup_element`,
+;     `update_element`, `match`, `match_object`, `foldl`, `tab2file` — do not
+;     exist for this target at all, so the closed ABI fails the BUILD that
+;     mentions them rather than the run. That is the strongest refusal there is.
+;
+; The names below are the ONE table vocabulary: every one is a thin policy layer
+; over exactly one `host/table-*` leaf of the same name, and `proc.table`'s
+; lifetime pattern (one owner, one long-lived heir, a reclaim) is expressible
+; with them — the FEAT-052 tests are that pattern, run.
+
+(defn rt-table?
+  "A well-formed table id of this target: `[:table runtime serial]`. A HOST
+   handle is not one — `host/is-table` answers that, and this answer is
+   deliberately narrower, because a handle carries no policy."
+  [x]
+  (rt-typed? x :table))
+
+(defn rt-local-table?
+  "A table id minted by THIS runtime. A well-formed id from another runtime is
+   a different answer from an id whose table is gone, and neither can be
+   confused with a recycled slot — table serials are never reused."
+  [st x]
+  (and (rt-table? x) (host/eq (host/vec-el x 1) (rt-runtime-of st))))
+
+(defn rt-table-resolve
+  "The metadata for the live table `v` names, or the ERROR VALUE to raise:
+   `[:not-a-table v]` for a value that is not a table id of this runtime (a
+   pid, a raw host handle, an id minted elsewhere), `[:no-such-table v]` for a
+   well-formed id that names nothing live. A MAP means success, so one
+   `host/is-map` distinguishes the two without a second flag."
+  [st v]
+  (if (rt-local-table? st v)
+    (let [m (get (:tables st) v)]
+      (if (host/is-nil m) [:no-such-table v] m))
+    [:not-a-table v]))
+
+(defn rt-table-denied
+  "The value an access check raises. It names the NEED, because read, write and
+   ownership are three different answers a `:protected` table gives."
+  [v need m]
+  [:table-access-denied v need (:mode m) (:owner m)])
+
+(defn rt-table-open
+  "Resolve `v` and apply the access rule for `need` — `:read`, `:write`, or
+   `:own` for the owner-only operations. Answers the metadata map when the
+   operation may proceed and the ERROR VALUE otherwise: it never raises, because
+   the caller holds the critical section and must leave it before a raise
+   escapes the operation."
+  [st v need]
+  (let [m (rt-table-resolve st v)]
+    (if (host/is-map m)
+      (let [mode (:mode m)
+            me (rt-self)
+            ok (cond
+                 (host/eq need :own) (host/eq (:owner m) me)
+                 (host/eq mode :public) true
+                 (host/eq (:owner m) me) true
+                 (host/eq need :read) (host/eq mode :protected)
+                 :else false)]
+        (if (host/eq ok true) m (rt-table-denied v need m)))
+      m)))
+
+(defn rt-table-answer
+  "Answer `value`, or raise the failure `rt-table-open` produced. The caller has
+   ALREADY left the critical section, and it must be the caller's OWN frame that
+   left it: `runTurn` restores a frame's ENTRY critical depth when the frame
+   pops, so a `critical-leave` run inside a CALLEE is undone the moment that
+   callee returns — the section would still be open for every later turn.
+   `host/park-release` requires a depth of exactly one, so that mistake is loud
+   but far from where it was made: enter, do the work and leave in ONE frame,
+   and raise here, after the leave."
+  [bad value]
+  (if (host/is-nil bad) value (erlang/raise :error bad nil)))
+
+(defn rt-table-free!
+  "Free ONE table's host storage and forget its metadata and its name. The
+   caller holds the critical section. This is the single disposal step, shared
+   by `table-destroy` and by owner death, so there is no second place a table
+   can stop existing without its name and metadata going with it."
+  [tid m]
+  (let [st (host/state)
+        name (:name m)
+        names (if (host/is-nil name)
+                (:table-names st)
+                (host/map-remove (:table-names st) name))]
+    (do
+      (host/table-destroy (:handle m))
+      (host/set-state (assoc (assoc st :tables (host/map-remove (:tables st) tid))
+                             :table-names names)))))
+
+(defn rt-table-dispose!
+  "Dispose of ONE table whose owner is dying: TRANSFER it to the heir the owner
+   named at creation, or free it. The caller holds the death transaction's
+   critical section, so the new owner and the heir's message are part of the
+   same indivisible update as the owner's removal."
+  [tid m from]
+  (let [st (host/state)
+        heir (:heir m)
+        to (if (host/is-nil heir) nil (rt-resolve st heir))]
+    (if (and (not (host/is-nil to)) (not (host/eq to from)))
+      (do
+        (host/set-state (assoc st :tables
+                               (assoc (:tables st) tid (assoc m :owner to))))
+        (rt-deliver (host/state) to [:ets-transfer tid from (:heir-data m)])
+        true)
+      (do (rt-table-free! tid m) false))))
+
+(defn rt-drop-tables-of-1
+  "Dispose of every one of `tids` that the dying `pid` owns. The registry is
+   re-read each step because disposal mutates it."
+  [tids pid]
+  (if (empty? tids)
+    nil
+    (let [st (host/state)
+          tid (first tids)
+          m (get (:tables st) tid)]
+      (do
+        (if (and (not (host/is-nil m)) (host/eq (:owner m) pid))
+          (rt-table-dispose! tid m pid)
+          nil)
+        (rt-drop-tables-of-1 (rest tids) pid)))))
+
+(defn rt-drop-tables-of!
+  "Every table the dying `pid` owns: transferred to its heir or destroyed. Like
+   the name retraction, this needs no monitor and no sweep — the one death
+   transaction already knows its own pid, so the scan is a read of its own
+   records."
+  [pid]
+  (rt-drop-tables-of-1 (host/map-keys (:tables (host/state))) pid))
+
+(defn rt-make-table [st n] [:table (rt-runtime-of st) n])
+
+(defn rt-table-mode? [m]
+  (or (host/eq m :private) (host/eq m :protected) (host/eq m :public)))
+
+(defn rt-table-check-opts
+  "Why `opts` cannot make a table, or nil. Every check runs BEFORE the handle is
+   minted, so a refused creation leaves the name registry and the host's live
+   set untouched."
+  [st opts]
+  (cond
+    (not (host/is-map opts)) [:table-bad-options opts]
+    (and (not (host/is-nil (:type opts)))
+         (not (host/eq (:type opts) :set)))
+      [:table-unsupported-type (:type opts)]
+    (and (not (host/is-nil (:mode opts)))
+         (not (rt-table-mode? (:mode opts))))
+      [:table-bad-mode (:mode opts)]
+    (and (not (host/is-nil (:name opts)))
+         (not (rt-name? (:name opts))))
+      [:table-name-not-a-keyword-or-string (:name opts)]
+    (and (not (host/is-nil (:name opts)))
+         (not (host/is-nil (get (:table-names st) (:name opts)))))
+      [:table-name-taken (:name opts)]
+    (and (not (host/is-nil (:heir opts)))
+         (not (rt-local-pid? st (:heir opts))))
+      [:table-bad-heir (:heir opts)]
+    :else nil))
+
+(defn rt-table-add
+  "The new state after registering `tid`: its metadata, and its NAME when it has
+   one. The mode defaults to `:protected` — BEAM's default — and is recorded
+   explicitly, so no later check has to re-derive it."
+  [st tid opts]
+  (let [name (:name opts)
+        meta (assoc (assoc (assoc (assoc (assoc (host/empty-map)
+                                                :handle (:handle opts))
+                                         :owner (rt-self))
+                                  :heir (:heir opts))
+                           :heir-data (:heir-data opts))
+                    :mode (if (host/is-nil (:mode opts)) :protected (:mode opts)))
+        names (if (host/is-nil name) (:table-names st) (assoc (:table-names st) name tid))]
+    (assoc (assoc (assoc st :tables (assoc (:tables st) tid (assoc meta :name name)))
+                  :table-names names)
+           :next-table (host/arith "add" (:next-table st) 1))))
+
+(defn table-new
+  "Create a table OWNED BY THE CALLING PROCESS and answer its identity,
+   `[:table runtime serial]`. `opts` is an optional map:
+
+     :type      `:set` — the only type this target has (the default)
+     :mode      `:private` | `:protected` | `:public` (default `:protected`)
+     :name      a keyword or a string, unique among LIVE table names
+     :heir      a pid of this runtime, named AT CREATION
+     :heir-data any value, delivered with the transfer if the owner dies
+
+   Raises `[:table-bad-options o]`, `[:table-unsupported-type t]`,
+   `[:table-bad-mode m]`, `[:table-name-not-a-keyword-or-string n]`,
+   `[:table-name-taken n]` or `[:table-bad-heir h]`."
+  ([] (table-new (host/empty-map)))
+  ([opts]
+   (do
+     (host/critical-enter)
+     (let [st (host/state)
+           bad (rt-table-check-opts st opts)
+           handle (if (host/is-nil bad) (host/table-new) nil)
+           tid (if (host/is-nil bad)
+                 (rt-make-table st (:next-table st))
+                 nil)
+           _ (if (host/is-nil bad)
+               (host/set-state (rt-table-add st tid (assoc opts :handle handle)))
+               nil)]
+       (do
+         (host/critical-leave)
+         (rt-table-answer bad tid))))))
+
+(defn table-whereis
+  "The live table named `name`, or nil. Absence is not an error — `whereis`
+   answers nil for an absent process name and `:ets.whereis/1` answers
+   `:undefined` for an absent table name; this target has ONE absence value, so
+   there is no second vocabulary to compare the wrong way (the hazard
+   proc/table.bl documents at length)."
+  [name]
+  (let [st (host/state)
+        tid (get (:table-names st) name)]
+    (if (host/is-nil tid)
+      nil
+      (if (host/is-nil (get (:tables st) tid)) nil tid))))
+
+(defn table-owner
+  "The pid that owns `tid`, or nil when no such table is live — `:ets.info(t,
+   :owner)`, and the invariant of an owned table, readable by anyone. Lenient on
+   purpose: an unknown or malformed id is an absence, not a raise, so a reader
+   can ask without catching."
+  [tid]
+  (let [m (get (:tables (host/state)) tid)]
+    (if (host/is-nil m) nil (:owner m))))
+
+(defn table-lookup
+  "Every row filed under `k`, as a LIST of `[key value]` rows — `:ets.lookup/2`,
+   including the shape: a `:set` answers one row or none, and a row HOLDING nil
+   is a row, not an absence."
+  [tid k]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          m (rt-table-open st tid :read)
+          bad (if (host/is-map m) nil m)
+          value (if (host/is-nil bad)
+                  (let [row (host/table-lookup (:handle m) k)]
+                    (if (host/is-nil row) (host/empty-list) (list row)))
+                  nil)]
+      (do
+        (host/critical-leave)
+        (rt-table-answer bad value)))))
+
+(defn table-insert
+  "Write the row `[k v]`, answering true. `:ets.insert/2` with one object; this
+   target takes the key and the value as two arguments, because the host leaf
+   does. An existing row for `k` is REPLACED — set semantics."
+  [tid k v]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          m (rt-table-open st tid :write)
+          bad (if (host/is-map m) nil m)
+          value (if (host/is-nil bad) (host/table-insert (:handle m) k v) nil)]
+      (do
+        (host/critical-leave)
+        (rt-table-answer bad value)))))
+
+(defn table-delete
+  "Remove the row under `k`, answering whether a row was removed. Deleting an
+   absent key is a no-op, so a DOUBLE delete is harmless and answers false —
+   where `:ets.delete/2` answers true unconditionally, which is the one thing
+   this shape changes: the answer is the fact, not the form."
+  [tid k]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          m (rt-table-open st tid :write)
+          bad (if (host/is-map m) nil m)
+          value (if (host/is-nil bad) (host/table-delete (:handle m) k) nil)]
+      (do
+        (host/critical-leave)
+        (rt-table-answer bad value)))))
+
+(defn table-size [tid]
+  "The number of rows — `:ets.info(t, :size)`."
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          m (rt-table-open st tid :read)
+          bad (if (host/is-map m) nil m)
+          value (if (host/is-nil bad) (host/table-size (:handle m)) nil)]
+      (do
+        (host/critical-leave)
+        (rt-table-answer bad value)))))
+
+(defn table-snapshot
+  "A COPY of every row, `[key value]`, in insertion order — `:ets.tab2list/1`.
+   A later write does not change the copy, and the table is not held after the
+   call returns (I3.5: a read of a table is a snapshot, not a transaction)."
+  [tid]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          m (rt-table-open st tid :read)
+          bad (if (host/is-map m) nil m)
+          value (if (host/is-nil bad) (host/table-snapshot (:handle m)) nil)]
+      (do
+        (host/critical-leave)
+        (rt-table-answer bad value)))))
+
+(defn rt-table-match?
+  "One pattern element against one row element: `:_` matches anything, and
+   anything else matches by the target's structural equality."
+  [v p]
+  (if (host/eq p :_) true (host/eq v p)))
+
+(defn rt-table-match-row?
+  "A 2-element pattern against a `[key value]` row."
+  [row pat]
+  (and (rt-table-match? (host/tup-el row 0) (host/vec-el pat 0))
+       (rt-table-match? (host/tup-el row 1) (host/vec-el pat 1))))
+
+(defn rt-table-match-var?
+  "A BEAM match-head VARIABLE, `:$1`/`:$2`/…: a keyword whose name begins with
+   `$`. `lt` orders strings, so `\"$\" =< name < \"%\"` is exactly that
+   prefix. A variable BINDS and a body substitutes it, and this target supports
+   neither, so it is refused rather than compared as a literal — which would
+   answer a different question than the caller asked."
+  [x]
+  (and (host/is-kw x)
+       (not (host/lt (host/kw-name x) "$"))
+       (host/lt (host/kw-name x) "%")))
+
+(defn rt-table-pattern-el! [x]
+  (if (rt-table-match-var? x)
+    (erlang/raise :error [:unsupported-match-spec x] nil)
+    x))
+
+(defn rt-table-pattern!
+  "Validate ONE clause and answer its pattern: a 2-element vector. Anything
+   else — a guards/body clause, a bare pattern, a map — is a match spec this
+   target does not have."
+  [clause]
+  (if (and (host/is-vec clause) (host/eq 2 (host/vec-size clause)))
+    (do
+      (rt-table-pattern-el! (host/vec-el clause 0))
+      (rt-table-pattern-el! (host/vec-el clause 1))
+      clause)
+    (erlang/raise :error [:unsupported-match-spec clause] nil)))
+
+(defn rt-table-pattern-of!
+  "Validate a whole match spec and answer its single clause's pattern. The spec
+   is EXACTLY one clause, written as a one-element list or a one-element vector
+   (both are sequences in this language, and a caller may write either); a tuple
+   is refused as a CONTINUATION, which is what `select/3` answers, and anything
+   else is refused as a match spec this target does not have."
+  [spec]
+  (cond
+    (host/is-tup spec) (erlang/raise :error [:unsupported-continuation spec] nil)
+    (host/is-list spec)
+      (cond
+        (host/is-enil spec) (erlang/raise :error [:unsupported-match-spec spec] nil)
+        (host/is-enil (host/cons-tail spec))
+          (rt-table-pattern! (host/cons-head spec))
+        :else (erlang/raise :error [:unsupported-match-spec spec] nil))
+    (host/is-vec spec)
+      (if (host/eq 1 (host/vec-size spec))
+        (rt-table-pattern! (host/vec-el spec 0))
+        (erlang/raise :error [:unsupported-match-spec spec] nil))
+    :else (erlang/raise :error [:unsupported-match-spec spec] nil)))
+
+(defn rt-table-reverse [xs acc]
+  (if (empty? xs) acc (rt-table-reverse (rest xs) (cons (first xs) acc))))
+
+(defn rt-table-select-rows
+  "The rows of `rows` matching `pat`, in the snapshot's order. Built reversed
+   and flipped once, so the answer is O(n) with no quadratic append."
+  [rows pat acc]
+  (if (empty? rows)
+    (rt-table-reverse acc ())
+    (rt-table-select-rows (rest rows) pat
+      (if (rt-table-match-row? (first rows) pat)
+        (cons (first rows) acc)
+        acc))))
+
+(defn table-select
+  "The rows matching a MATCH SPEC, in insertion order — a snapshot, filtered
+   (I3.5). The ONE supported shape is `[[pk pv]]`: one clause (a one-element
+   list or vector), a 2-element pattern vector, each element a literal or `:_`.
+   Everything else is REFUSED — `[:unsupported-match-spec s]` for guards,
+   bodies, several clauses, a non-pattern, or a `$N` variable;
+   `[:unsupported-continuation c]` for the continuation tuple `select/3`
+   answers. A refused spec is a LOUD failure on purpose: a match condition that
+   is silently dropped returns the wrong rows with no sign that anything was
+   ignored."
+  [tid spec]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          m (rt-table-open st tid :read)
+          bad (if (host/is-map m) nil m)
+          value (if (host/is-nil bad)
+                  (rt-table-select-rows (host/table-snapshot (:handle m))
+                                        (rt-table-pattern-of! spec) ())
+                  nil)]
+      (do
+        (host/critical-leave)
+        (rt-table-answer bad value)))))
+
+(defn table-update-counter
+  "Add `delta` to the integer under `k` and answer the NEW value: `:ets.
+   update_counter/3`, and an ATOMIC read-modify-write — the read, the addition
+   and the write are ONE critical section, so a slice boundary cannot land
+   between them and lose an update (I3.4).
+
+   The KEY MUST ALREADY EXIST and hold an integer, exactly as `update_counter/3`
+   requires (measured against OTP: a missing key is a badarg there, and this
+   target refuses it with `[:table-no-such-row tid k]` instead of inventing a
+   row). A row that does not hold an integer raises
+   `[:table-not-an-integer tid k v]`, and a `delta` that is not an integer
+   raises `[:table-bad-counter-delta d]`. It is a counter update, not a general
+   arithmetic operation: an op-list, a default object and a silent zero are all
+   deliberately absent — a counter that quietly starts at 0 is a counter that
+   hides a missing seed."
+  [tid k delta]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          m (rt-table-open st tid :write)
+          bad (cond
+                (not (host/is-map m)) m
+                (not (host/is-int delta)) [:table-bad-counter-delta delta]
+                :else nil)
+          row (if (host/is-nil bad) (host/table-lookup (:handle m) k) nil)
+          bad2 (cond
+                 (not (host/is-nil bad)) bad
+                 (host/is-nil row) [:table-no-such-row tid k]
+                 (not (host/is-int (host/tup-el row 1)))
+                   [:table-not-an-integer tid k (host/tup-el row 1)]
+                 :else nil)
+          cur (if (host/is-nil bad2) (host/tup-el row 1) nil)
+          next (if (host/is-nil bad2) (host/arith "add" cur delta) nil)
+          _ (if (host/is-nil bad2) (host/table-insert (:handle m) k next) nil)]
+      (do
+        (host/critical-leave)
+        (rt-table-answer bad2 next)))))
+
+(defn table-give-away
+  "Hand a table the caller OWNS to `to` — a pid or a name of this runtime — and
+   answer true: `:ets.give_away/3`. The identity and the rows are untouched, the
+   new owner must be LIVE at the moment of the transfer, and NO message is
+   sent: BEAM's `give_away` sends none either, and the recipient is told by the
+   protocol that asked for it (proc/table.bl answers its own caller). The death
+   transfer is the one that carries a message."
+  [tid to]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          m (rt-table-open st tid :own)
+          pid (if (host/is-map m) (rt-resolve st to) nil)
+          bad (cond
+                (not (host/is-map m)) m
+                (host/is-nil pid) [:no-such-process to]
+                :else nil)
+          _ (if (host/is-nil bad)
+              (host/set-state (assoc st :tables
+                                     (assoc (:tables st) tid (assoc m :owner pid))))
+              nil)]
+      (do
+        (host/critical-leave)
+        (rt-table-answer bad true)))))
+
+(defn table-destroy
+  "Destroy a table, answering true: `:ets.delete/1`, and with `delete/1`'s rule
+   — it is a WRITE. On `:private` and `:protected` that is the owner alone; on
+   `:public` it is ANYONE, because a public table is shared mutable state all the
+   way down (measured against OTP: a non-owner's `:ets.delete/1` succeeds on a
+   public table and is refused on the other two). The native storage is freed,
+   the metadata and any NAME it held are removed, and the identity answers
+   `[:no-such-table …]` to every later operation — from any process."
+  [tid]
+  (do
+    (host/critical-enter)
+    (let [st (host/state)
+          m (rt-table-open st tid :write)
+          bad (if (host/is-map m) nil m)
+          _ (if (host/is-nil bad) (rt-table-free! tid m) nil)]
+      (do
+        (host/critical-leave)
+        (rt-table-answer bad true)))))
+
+(defn rt-table-count
+  "How many tables this runtime has live — what a diagnostic, a test or a
+   browser panel reads to see that nothing was left behind by a death."
+  []
+  (host/map-size (:tables (host/state))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; 6. Supervisors — a BL actor that owns child processes
+; ─────────────────────────────────────────────────────────────────────────────
+;
+; A supervisor is an ORDINARY PROCESS on this target. It is spawned like any
+; other actor, it keeps its state in a local BL value, and it speaks the SAME
+; call/cast/stop protocol every other process does. No native module is
+; reached: there is no `Supervisor` here, and a declaration never becomes a BEAM
+; child spec.
+;
+; WHAT A BUNDLE WRITES. `proc.super/defsupervisor` is lowered by compiler.bl,
+; which runs the SHARED pure expander `proc.super/supervisor-plan` and renders
+; its plan to the spec VALUE this file consumes. The declaration
+;
+;   (proc.super/defsupervisor billing
+;     (strategy :one-for-one)
+;     (intensity 3 5000)
+;     (child :acct account 100)
+;     (child :ledger ledger {:restart :transient :shutdown 5000}))
+;
+; binds `billing` to a zero-argument constructor that returns
+;
+;   {:name :billing :strategy :one-for-one :intensity [3 5000]
+;    :children [{:id :acct :kind :server :target account :args [100]
+;                :restart :permanent :shutdown 5000 :type :worker :name nil
+;                :order 0} …]}
+;
+; `:target` is the child's ENTRY FUNCTION (the declared name, resolved to this
+; bundle's global), `:args` are its init arguments, and `:restart` / `:shutdown`
+; / `:type` / `:name` are its options. Start the tree with `(sup-start (billing))`.
+;
+; THE RULES, AND WHOSE THEY ARE. These are THIS TARGET's rules, stated as such
+; and not OTP's:
+;
+;   * a child is SPAWNED, LINKED and MONITORED in one critical section, so its
+;     death can never be lost between birth and observation;
+;   * the supervisor TRAPS EXITS. A child's death reaches it as a monitor DOWN
+;     (the restart decision) and as a link message (drained, not acted on); a
+;     child's failure never kills the supervisor;
+;   * the LINKS matter the other way round: if the supervisor dies abnormally —
+;     an escalation, a bug in its own loop — its links carry that death to every
+;     child, which is what makes a supervisor's failure take its tree with it;
+;   * `:permanent` restarts on every death (a normal return included),
+;     `:transient` only on an abnormal one, `:temporary` never. A child that is
+;     not restarted is left `:stopped` in the tree, never deleted: the child set
+;     is the visible ledger;
+;   * the strategy decides the RESTART SET of a restartable death:
+;     `:one-for-one` the dead child alone, `:rest-for-one` the dead child and
+;     every child declared after it (by `:order`), `:one-for-all` every child.
+;     A restarted sibling is STOPPED with `:shutdown` first, so it is never left
+;     running beside its replacement;
+;   * the intensity window is BOUNDED and REAL: every automatic restart is
+;     charged to a ledger of restart timestamps, the ledger is pruned to the
+;     declared window on every charge and capped, and a restart that would exceed
+;     the maximum ESCALATES — the supervisor stops every child and then dies with
+;     `[:max-restarts-exceeded <strategy> <max> <window-ms>]`. An undeclared
+;     intensity (`nil`) means no limit: the tree never gives up;
+;   * a NAMED child (`:name` in its options) is registered when it starts and
+;     re-registered for every incarnation. The cleanup needs no monitor: the one
+;     death transaction already retracts a dying process's names. A declared
+;     name that is already TAKEN kills the supervisor loudly (`:name-taken`) —
+;     it never starts the child unnamed behind the declaration's back;
+;   * a `:kind :pool` child is REFUSED at build time, never silently started as
+;     something else — the portable subset starts SERVER children;
+;   * STARTUP IS THE SUPERVISOR'S FIRST TURN, and a child that fails there is an
+;     ordinary death: charged to the intensity window, with the child's policy
+;     deciding. A child whose `:target` is not callable kills the supervisor on
+;     that turn instead — a declaration error, loud rather than silent. A spec
+;     child of a kind this target does not start (`:kind` other than `:server`,
+;     which only a hand-written spec can produce) is left `:stopped` in the
+;     ledger and never started.
+;
+; THE ONE OBSERVABILITY RULE. This target fails a run on an ABNORMAL death with
+; NO observer. A supervisor monitors its children, so a child's death is always
+; observed; but the supervisor's OWN abnormal death — an escalation — needs an
+; observer too. Start it with `(sup-start-link …)`, or `(rt-monitor sup)`, or the
+; escalation fails the boot. That is the target's policy, not an accident.
+;
+; WHAT IS DELIBERATELY ABSENT, named so it cannot be mistaken for working:
+;
+;   * POOLS and nested trees. A `(child :workers (pool worker 4))` declaration
+;     is refused by the lowering; there is no sub-supervisor/dispatcher pair.
+;   * `:type` IS RECORDED, NOT ACTED ON. `:worker` and `:supervisor` ride in the
+;     ledger and are enforced nowhere: a declared child is started the same way
+;     either way, and no child may itself be a tree.
+;   * NO DYNAMIC CHILDREN. There is no `start_child`/`delete_child`; the tree is
+;     the declaration, and `sup-restart`/`sup-terminate` act on the children it
+;     declared.
+;   * NO SHUTDOWN PROTOCOL. A child is stopped with an exit signal; there is no
+;     `terminate/2` callback and no ordered shutdown sequence. The tree's wait is
+;     bounded (see `rt-sup-shutdown`) and a child that survives it is killed.
+;   * NO UNBOUNDED WAIT. A child's `:shutdown :infinity` is capped at the default
+;     5000 ms for the TREE's wait: this target will not wait forever.
+;
+; START / STOP / INSPECT — the verbs a bundle uses:
+;
+;   (sup-start spec)        → the supervisor's pid
+;   (sup-start-link spec)   → the same, LINKED to the caller
+;   (sup-children sup)      → the atomic snapshot (`rt-sup-snapshot`'s shape)
+;   (sup-child sup id)      → the live pid of child `id`, or nil
+;   (sup-restart sup id)    → stop child `id` and start it again; :ok
+;   (sup-terminate sup id)  → stop child `id` and leave it stopped; :ok
+;   (stop sup reason)       → graceful stop (see `rt-sup-shutdown`)
+;
+; `sup-children` answers the ledger AS ONE VALUE — name, strategy, intensity, the
+; restarts inside the window, the cumulative count, and every child with its id,
+; recorded pid, liveness, status, policy, kind, order, registered name and
+; restart count. It is taken inside one of the supervisor's turns, so it can
+; never show half a restart.
+
+; ── the spec ────────────────────────────────────────────────────────────────
+
+(defn rt-sup-list
+  "A spec's `:children` as a LIST — the shape every loop below walks with
+   `first`/`rest`. Absent is the empty tree, not an error."
+  [xs]
+  (cond
+    (host/is-nil xs) (host/empty-list)
+    (host/is-vec xs) (host/vec-to-list xs)
+    :else xs))
+
+(defn rt-sup-child-state
+  "One spec child as SUPERVISOR STATE: the declaration plus the runtime fields
+   (`:pid`, `:restarts`, `:status`). Every option is recorded with its default
+   filled in, so the loop never re-derives one and a snapshot always has the
+   same keys. The child's monitor REF is deliberately NOT kept: the DOWN is
+   matched by pid, and the monitor table entry is dropped by the one death
+   transaction — the tree retains no stale ref."
+  [c]
+  {:id (:id c)
+   :kind (get c :kind :server)
+   :target (:target c)
+   :args (get c :args [])
+   :restart (get c :restart :permanent)
+   :shutdown (get c :shutdown 5000)
+   :type (get c :type :worker)
+   :name (get c :name nil)
+   :order (get c :order 0)
+   :pid nil
+   :restarts 0
+   :status :stopped})
+
+(defn rt-sup-build [cs]
+  (if (empty? cs)
+    (host/empty-list)
+    (cons (rt-sup-child-state (first cs)) (rt-sup-build (rest cs)))))
+
+; ── children ────────────────────────────────────────────────────────────────
+
+(defn rt-child-alive? [child]
+  (if (host/is-nil (:pid child))
+    false
+    (rt-alive? (:pid child))))
+
+(defn rt-sup-spawn-one
+  "Start ONE child, mark it as supervised BEFORE it can run, then register
+   its name. Spawn/link/monitor/mark are one critical transaction."
+  [child]
+  (do
+    (host/critical-enter)
+    (let [pid (rt-nth (rt-spawn-link-monitor (:target child) (:args child)) 0)]
+      (do
+        (rt-set-proc-field pid :supervised-by (rt-self))
+        (if (host/is-nil (:name child))
+          nil
+          (rt-register-name (:name child) pid))
+        (host/critical-leave)
+        (assoc (assoc child :pid pid) :status :running)))))
+
+(defn rt-sup-stop-live
+  "Stop a child's live incarnation with `:shutdown` and mark it `:stopped`. The
+   pid is KEPT: the shutdown wait must still be able to watch it die, and the
+   DOWN that follows is then recognised as deliberately stopped — never
+   restarted."
+  [child]
+  (if (rt-child-alive? child)
+    (do (rt-exit (:pid child)
+                   (if (host/eq (:shutdown child) :brutal_kill) :kill :shutdown))
+          (assoc child :status :stopped))
+    (assoc child :status :stopped)))
+
+(defn rt-sup-respawn
+  "A fresh incarnation of `child`: stop whatever is live, start again, and
+   count the restart on the child itself."
+  [child]
+  (assoc (rt-sup-spawn-one (rt-sup-stop-live child))
+         :restarts (host/arith "add" (:restarts child) 1)))
+
+(defn rt-sup-start-all [children]
+  (if (empty? children)
+    (host/empty-list)
+    (let [c (first children)]
+      (cons (if (host/eq (:kind c) :server) (rt-sup-spawn-one c) c)
+            (rt-sup-start-all (rest children))))))
+
+(defn rt-sup-stop-all [children]
+  (if (empty? children)
+    (host/empty-list)
+    (cons (rt-sup-stop-live (first children)) (rt-sup-stop-all (rest children)))))
+
+(defn rt-sup-set
+  "`children` with index `i` replaced by `child`, declaration order preserved."
+  [children i child]
+  (if (empty? children)
+    (host/empty-list)
+    (cons (if (host/eq i 0) child (first children))
+          (rt-sup-set (rest children) (host/arith "sub" i 1) child))))
+
+(defn rt-sup-index [children id]
+  (cond
+    (empty? children) -1
+    (host/eq (:id (first children)) id) 0
+    :else (let [i (rt-sup-index (rest children) id)]
+            (if (host/lt i 0) -1 (host/arith "add" i 1)))))
+
+(defn rt-sup-index-pid [children pid]
+  (cond
+    (host/is-nil pid) -1
+    (empty? children) -1
+    (host/eq (:pid (first children)) pid) 0
+    :else (let [i (rt-sup-index-pid (rest children) pid)]
+            (if (host/lt i 0) -1 (host/arith "add" i 1)))))
+
+; ── the restart set ─────────────────────────────────────────────────────────
+
+(defn rt-sup-idxs-all
+  "The index of every child, in declaration order, as a VECTOR."
+  [children i acc]
+  (if (empty? children)
+    acc
+    (rt-sup-idxs-all (rest children) (host/arith "add" i 1) (conj acc i))))
+
+(defn rt-sup-idxs-order
+  "The index of every child whose `:order` is at least `order` — the
+   `:rest-for-one` set: the dead child and everything declared after it."
+  [children order i acc]
+  (if (empty? children)
+    acc
+    (rt-sup-idxs-order (rest children) order (host/arith "add" i 1)
+                       (if (host/lt (:order (first children)) order)
+                         acc
+                         (conj acc i)))))
+
+(defn rt-sup-idxs-for
+  "The restart set of a restartable death at index `ci`, as a vector of
+   indices."
+  [children ci strategy]
+  (if (host/eq strategy :one-for-all)
+    (rt-sup-idxs-all children 0 [])
+    (if (host/eq strategy :rest-for-one)
+      (rt-sup-idxs-order children (:order (nth children ci)) 0 [])
+      [ci])))
+
+; ── the intensity ledger ────────────────────────────────────────────────────
+
+(defn rt-sup-prune
+  "The ledger without the charges that fell out of the window ending at `now`.
+   An undeclared window (`nil`) prunes nothing: the cap in `rt-sup-restart` is
+   what keeps such a tree's ledger bounded."
+  [ledger now window]
+  (cond
+    (host/is-nil window) ledger
+    (empty? ledger) (host/empty-list)
+    :else
+      (let [t (first ledger)]
+        (if (host/lt (host/arith "sub" now window) t)
+          (cons t (rt-sup-prune (rest ledger) now window))
+          (rt-sup-prune (rest ledger) now window)))))
+
+(defn rt-sup-cap
+  "At most `n` of `ledger`'s newest charges. The ledger is BOUNDED even when no
+   window prunes it, so a long-lived tree retains no unbounded history."
+  [ledger n]
+  (if (host/eq n 0)
+    (host/empty-list)
+    (if (empty? ledger)
+      (host/empty-list)
+      (cons (first ledger) (rt-sup-cap (rest ledger) (host/arith "sub" n 1))))))
+
+(defn rt-sup-window-count [ledger now window]
+  (if (host/is-nil window)
+    (rt-count ledger)
+    (if (empty? ledger)
+      0
+      (host/arith "add"
+                  (if (host/lt (host/arith "sub" now window) (first ledger)) 1 0)
+                  (rt-sup-window-count (rest ledger) now window)))))
+
+; ── the restart decision ────────────────────────────────────────────────────
+
+(defn rt-sup-restart?
+  "Whether the death of `child` with `reason` is restarted, by the child's
+   policy: `:permanent` always, `:transient` only on an abnormal reason,
+   `:temporary` never."
+  [child reason]
+  (let [r (:restart child)]
+    (cond
+      (host/eq r :permanent) true
+      (host/eq r :temporary) false
+      (host/eq r :transient) (not (host/eq reason :normal))
+      :else true)))
+
+(defn rt-sup-apply-idxs
+  "Restart the children at `idxs`, in declaration order, charging ONE restart
+   to the ledger per child. A live incarnation is stopped with `:shutdown`
+   first, so its DOWN belongs to a superseded pid and is ignored. Answers
+   `[children' ledger']`."
+  [children idxs k ledger]
+  (if (host/eq k (host/vec-size idxs))
+    [children ledger]
+    (let [i (host/vec-el idxs k)
+          c (nth children i)]
+      (rt-sup-apply-idxs (rt-sup-set children i (rt-sup-respawn c))
+                         idxs
+                         (host/arith "add" k 1)
+                         (conj ledger (host/now))))))
+
+; ── stop, escalation and graceful shutdown ──────────────────────────────────
+
+(defn rt-sup-force-kill
+  "Kill every surviving child: uncatchable, so a child that traps exits cannot
+   outlive the tree. Every death happens while the supervisor is still alive and
+   observing it."
+  [children]
+  (if (empty? children)
+    nil
+    (let [c (first children)]
+      (do
+        (if (rt-child-alive? c) (rt-exit (:pid c) :kill) nil)
+        (rt-sup-force-kill (rest children))))))
+
+(defn rt-sup-all-down? [children]
+  (cond
+    (empty? children) true
+    (rt-child-alive? (first children)) false
+    :else (rt-sup-all-down? (rest children))))
+
+(defn rt-sup-shutdown-ms-1 [children best]
+  (if (empty? children)
+    best
+    (let [s (:shutdown (first children))
+          v (cond
+              (host/is-nil s) 5000
+              (host/eq s :infinity) 5000
+              (host/eq s :brutal_kill) 0
+              (host/is-int s) s
+              :else 5000)]
+      (rt-sup-shutdown-ms-1 (rest children) (if (host/lt best v) v best)))))
+
+(defn rt-sup-shutdown-ms
+  "The tree's shutdown wait: the LONGEST `:shutdown` among its children, in ms.
+   An undeclared deadline is 5000 (the default), `:infinity` is CAPPED at the
+   same 5000, and a tree with no children waits not at all — this target bounds
+   every wait rather than waiting forever."
+  [children]
+  (rt-sup-shutdown-ms-1 children 0))
+
+(defn rt-sup-await
+  "Wait for the DOWN of every child, at most until `deadline`; then kill whatever
+   survives and end with `reason`. `wait` is the bounded re-check period."
+  [children deadline wait reason]
+  (if (rt-sup-all-down? children)
+    (erlang/exit reason)
+    (if (not (host/lt (host/now) deadline))
+      (do
+        (rt-sup-force-kill children)
+        (erlang/exit reason))
+      (receive
+        [:down _ :process _pid _reason] (rt-sup-await children deadline wait reason)
+        [:exit _pid _reason] (rt-sup-await children deadline wait reason)
+        [:call ref from _msg]
+          (do
+            (rt-reply-to from ref [:stopping reason])
+            (rt-sup-await children deadline wait reason))
+        [:cast _msg] (rt-sup-await children deadline wait reason)
+        (after wait (rt-sup-await children deadline wait reason))))))
+
+(defn rt-sup-shutdown
+  "Graceful stop with a DEADLINE. Every child is stopped with `:shutdown`; the
+   supervisor then waits, for at most `(rt-sup-shutdown-ms children)` ms, for
+   each to die. A child still alive when the deadline passes — one that traps
+   exits, or never reaches its stop — is killed, and the supervisor ends with
+   `reason`. Every child death happens while the supervisor is alive, so a
+   graceful stop never leaves an unobserved death behind."
+  [state reason]
+  (let [children (rt-sup-stop-all (:children state))
+        wait (rt-sup-shutdown-ms children)
+        deadline (host/arith "add" (host/now) wait)]
+    (rt-sup-await children deadline wait reason)))
+
+(defn rt-sup-escalate
+  "The intensity window is exhausted. Stop every child with `:shutdown`, kill
+   whatever survives (a child that traps exits included), and then end the
+   supervisor ABNORMALLY with `[:max-restarts-exceeded strategy max window]` —
+   so an observer sees the escalation, and the tree is already down when the
+   links would otherwise have to carry the death."
+  [state max window]
+  (let [children (rt-sup-stop-all (:children state))]
+    (do
+      (rt-sup-force-kill children)
+      (erlang/exit [:max-restarts-exceeded (:strategy (:spec state)) max window]))))
+
+; ── visibility ──────────────────────────────────────────────────────────────
+
+(defn rt-sup-child-view [c]
+  {:id (:id c)
+   :kind (:kind c)
+   :pid (:pid c)
+   :alive (rt-child-alive? c)
+   :status (:status c)
+   :restart (:restart c)
+   :shutdown (:shutdown c)
+   :type (:type c)
+   :name (:name c)
+   :order (:order c)
+   :restarts (:restarts c)})
+
+(defn rt-sup-views [children]
+  (if (empty? children)
+    (host/empty-list)
+    (cons (rt-sup-child-view (first children)) (rt-sup-views (rest children)))))
+
+(defn rt-sup-snapshot
+  "The tree as ONE value: name, strategy, intensity, the restarts charged inside
+   the current window (or all recorded charges when no window is declared), the
+   cumulative restart count, and every child — id, recorded pid, liveness,
+   status, policy, kind, order, registered name and restart count — in
+   declaration order."
+  [state]
+  (let [spec (:spec state)
+        window (:window-ms state)]
+    {:name (:name spec)
+     :strategy (:strategy spec)
+     :intensity (:intensity spec)
+     :window-ms window
+     :restarts (rt-sup-window-count (:ledger state) (host/now) window)
+     :restart-total (:total state)
+     :children (rt-sup-views (:children state))}))
+
+(defn rt-sup-live-pid [state id]
+  (let [i (rt-sup-index (:children state) id)]
+    (if (host/lt i 0)
+      nil
+      (let [c (nth (:children state) i)]
+        (if (rt-child-alive? c) (:pid c) nil)))))
+
+; ── the loop ────────────────────────────────────────────────────────────────
+
+(defn rt-sup-mark-stopped [state ci]
+  (assoc state :children
+         (rt-sup-set (:children state) ci
+                     (assoc (nth (:children state) ci) :status :stopped))))
+
+(defn rt-sup-on-down
+  "A DOWN for `pid`. A pid no child currently names is a superseded incarnation:
+   its replacement is already running, so it is ignored. A child already marked
+   `:stopped` was stopped deliberately and is never restarted. Otherwise the
+   policy decides."
+  [state pid reason]
+  (let [ci (rt-sup-index-pid (:children state) pid)]
+    (if (host/lt ci 0)
+      (rt-sup-loop state)
+      (let [child (nth (:children state) ci)]
+        (if (host/eq (:status child) :stopped)
+          (rt-sup-loop state)
+          (if (rt-sup-restart? child reason)
+            (rt-sup-restart state ci reason)
+            (rt-sup-loop (rt-sup-mark-stopped state ci))))))))
+
+(defn rt-sup-restart
+  "A restartable death at index `ci`. Prune the ledger to the window, work out
+   the strategy's restart set, and ESCALATE when charging it would exceed the
+   declared maximum. Otherwise apply the set — `rt-sup-apply-idxs` charges ONE
+   restart per child, so the death is charged EXACTLY once. Answers the next
+   loop iteration."
+  [state ci reason]
+  (let [window (:window-ms state)
+        max (:max-restarts state)
+        now (host/now)
+        base (rt-sup-prune (:ledger state) now window)
+        idxs (rt-sup-idxs-for (:children state) ci (:strategy (:spec state)))
+        pending (host/arith "add" (rt-count base) (host/vec-size idxs))]
+    (if (and (not (host/is-nil max)) (host/lt max pending))
+      (rt-sup-escalate state max window)
+      (let [r (rt-sup-apply-idxs (:children state) idxs 0 base)]
+        (rt-sup-loop
+          (assoc (assoc (assoc state :children (rt-nth r 0))
+                        :ledger (rt-sup-cap (rt-nth r 1) 64))
+                 :total (host/arith "add" (:total state) (host/vec-size idxs))))))))
+
+(defn rt-sup-forced-restart
+  "The explicit restart verb. Stop the named child's live incarnation and start
+   it again whether or not its policy would. The restart is NOT charged to the
+   intensity window — it is the operator's act, not a failure — so an operator
+   can restart a child a storm would have escalated on. Answers `[reply state]`."
+  [state id]
+  (let [i (rt-sup-index (:children state) id)]
+    (if (host/lt i 0)
+      [[:error :no-such-child id] state]
+      (let [c (rt-sup-respawn (nth (:children state) i))]
+        [:ok (assoc (assoc state :children (rt-sup-set (:children state) i c))
+                    :total (host/arith "add" (:total state) 1))]))))
+
+(defn rt-sup-forced-stop
+  "The explicit stop verb. Stop the named child and leave it stopped: the tree
+   keeps it as `:stopped` in the ledger and the DOWN that follows is recognised
+   as deliberate, so nothing restarts it. Answers `[reply state]`."
+  [state id]
+  (let [i (rt-sup-index (:children state) id)]
+    (if (host/lt i 0)
+      [[:error :no-such-child id] state]
+      [:ok (assoc state :children
+                  (rt-sup-set (:children state) i
+                              (rt-sup-stop-live (nth (:children state) i))))])))
+
+(defn rt-sup-on-call
+  "One request. The supervisor never crashes on a request it does not know: an
+   unknown op or a malformed message is ANSWERED, with `[:error …]`, so a tree
+   cannot be taken down by a stray message."
+  [state from ref msg]
+  (if (host/is-vec msg)
+    (let [op (nth msg 0)]
+      (cond
+        (host/eq op :children)
+          (do (rt-reply-to from ref (rt-sup-snapshot state)) (rt-sup-loop state))
+        (host/eq op :child)
+          (do (rt-reply-to from ref (rt-sup-live-pid state (nth msg 1)))
+              (rt-sup-loop state))
+        (host/eq op :restart)
+          (let [r (rt-sup-forced-restart state (nth msg 1))]
+            (do (rt-reply-to from ref (rt-nth r 0)) (rt-sup-loop (rt-nth r 1))))
+        (host/eq op :terminate)
+          (let [r (rt-sup-forced-stop state (nth msg 1))]
+            (do (rt-reply-to from ref (rt-nth r 0)) (rt-sup-loop (rt-nth r 1))))
+        :else
+          (do (rt-reply-to from ref [:error :unknown-supervisor-request msg])
+              (rt-sup-loop state))))
+    (do
+      (rt-reply-to from ref [:error :bad-supervisor-request msg])
+      (rt-sup-loop state))))
+
+(defn rt-sup-loop
+  "The supervisor's loop. A DOWN drives a restart; a call answers a request; a
+   link message is drained (`rt-trap-exit!` turns every child death into one as
+   well as into its DOWN); a cast is ignored; a stop begins the graceful stop.
+   The state is a local, so a turn boundary can never show half an update."
+  [state]
+  (receive
+    [:call ref from msg] (rt-sup-on-call state from ref msg)
+    [:down _ :process pid reason] (rt-sup-on-down state pid reason)
+    [:exit _pid _reason] (rt-sup-loop state)
+    [:cast _msg] (rt-sup-loop state)
+    [:stop reason] (rt-sup-shutdown state reason)))
+
+(defn rt-sup-run
+  "The supervisor process. It traps exits FIRST — a child's death must never kill
+   the supervisor — then starts every declared child, then loops. The whole state
+   (`:children` in declaration order and the restart ledger) is one BL value
+   threaded through the loop."
+  [spec]
+  (let [intensity (:intensity spec)]
+    (do
+      (rt-trap-exit! true)
+      (rt-sup-loop
+        {:spec spec
+         :children (rt-sup-start-all (rt-sup-build (rt-sup-list (:children spec))))
+         :ledger (host/empty-list)
+         :max-restarts (if (host/is-nil intensity) nil (nth intensity 0))
+         :window-ms (if (host/is-nil intensity) nil (nth intensity 1))
+         :total 0}))))
+
+; ── the verbs ───────────────────────────────────────────────────────────────
+
+(defn rt-sup-start
+  "Start the supervisor `spec` describes and answer its pid. The caller keeps no
+   link — the tree's links are the ones that matter — so an escalation is not a
+   death signal to the caller (use `rt-sup-start-link` when it should be)."
+  [spec]
+  (rt-spawn rt-sup-run [spec]))
+
+(defn rt-sup-start-link
+  "Start the supervisor LINKED to the caller. This is the way to own the tree's
+   escalation as a death signal rather than an unobserved error."
+  [spec]
+  (rt-spawn-link rt-sup-run [spec]))
+
+(defn rt-sup-children [sup] (rt-call sup [:children]))
+(defn rt-sup-child [sup id] (rt-call sup [:child id]))
+(defn rt-sup-restart! [sup id] (rt-call sup [:restart id]))
+(defn rt-sup-terminate! [sup id] (rt-call sup [:terminate id]))
+
+(defn core-sup-start [spec] (rt-sup-start spec))
+(defn core-sup-start-link [spec] (rt-sup-start-link spec))
+(defn core-sup-children [sup] (rt-sup-children sup))
+(defn core-sup-child [sup id] (rt-sup-child sup id))
+(defn core-sup-restart [sup id] (rt-sup-restart! sup id))
+(defn core-sup-terminate [sup id] (rt-sup-terminate! sup id))
+
+(defn bl-main
+  "The JS driver's entry. `entry` is the application's main fn, bound by the
+   emitted bundle (`js/entry`)."
+  [entry]
+  (do
+    (host/set-state (rt-empty-state))
+    (rt-spawn entry [])
+    (host/set-self nil)
+    (rt-sched-loop)))

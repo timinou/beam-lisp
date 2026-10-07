@@ -17,7 +17,7 @@
 ;   (session/start root)   → {:ok listener}   boot the daemon for `root`
 ;   (session/stop listener)
 ;
-; This is what `bl daemon start` boots (a bl namespace AS the session).
+; This is what `bl realm start` boots (a bl namespace AS the session).
 
 (ns vm.session
   ;; NO [bl.daemon] here, deliberately. `bl.daemon` requires `bl.cli`, and
@@ -39,18 +39,64 @@
             [vm.manager :as mgr] [vm.index :as index] [vm.inspect :as inspect]
             [vm.ports :as ports] [vm.names :as names] [vm.paths :as paths]
             [vm.exec :as exec] [vm.http :as http]
-            [vm.sched :as sched] [vm.spec :as spec]))
+            [vm.sched :as sched] [vm.spec :as spec] [vm.registry :as registry]
+            [vm.idle :as idle] [vm.owner :as owner] [vm.realm :as realm]
+            [vm.gateway :as gw]))
 
 (def PT-ROOT (tuple :vm_session :root))
 (def PT-STARTED (tuple :vm_session :started-at))
+(def PT-RECORD (tuple :vm_session :record))
+(def PT-IDLE (tuple :vm_session :idle))
+
+(defn vm-label
+  "What `bl vm` calls this VM: the project's name for a VM that serves one project,
+   `shared` for the build's shared VM (it serves none in particular, and a blank
+   label is not something a person can type to `bl vm stop`)."
+  [root]
+  (if (nil? root) "shared" (Path/basename root)))
+
+(defn- members-text
+  "What realm `root` owns, one member per line: `<pid> <role> <age-seconds>`. The
+   age is how long the member has been in the realm. The wire is text and the client
+   parses it, so a member list is the same bytes whoever asks."
+  [root]
+  (let [id (:id (vm.spec/read root))
+        now (erlang/system_time :second)]
+    (apply str (map (fn [m] (str (erlang/list_to_binary (erlang/pid_to_list (:pid m))) " " (name (or (:role m) :unknown))
+                                 " " (max 0 (- now (or (:since m) now))) "\n"))
+                    (owner/members id)))))
+
+(defn show-text
+  "What the realm at `root` is, as lines: its alias and key, the shadow chip when it shadows
+   anything, what it shares by hash, and how many members it owns. Empty when it is not open.
+   The console renders the same data (`realm/describe`); the lines are for the terminal."
+  [root]
+  (let [d (realm/describe root)]
+    (if (nil? d)
+      ""
+      (str "realm    " (:alias d) "  (" (:key d) ")\n"
+           (if-let [chip (realm/shadow-chip (:shadows d))] (str "         " chip "\n") "")
+           (apply str (map (fn [[ns h]] (str "uses     " ns "  " h "\n")) (sort (:uses d))))
+           "members  " (:members d) "\n"))))
+
+(defn- shared-status-text
+  "What a shared VM answers to `realm show`: it serves no single project, so it
+   names the realms it has open."
+  []
+  (let [roots (realm/roots)]
+    (str "shared VM  " (count roots) " realm(s)"
+         (apply str (map (fn [r] (str "\n  " r)) roots)))))
 
 (defn- status-text []
-  (inspect/render-text
-    (inspect/model {:root (erlang/apply :persistent_term :get (list PT-ROOT (BeamLisp/cwd)))
-                    :started-at (erlang/apply :persistent_term :get (list PT-STARTED nil))})))
+  (let [root (erlang/apply :persistent_term :get (list PT-ROOT nil))]
+    (if (nil? root)
+      (shared-status-text)
+      (inspect/render-text
+        (inspect/model {:root root
+                        :started-at (erlang/apply :persistent_term :get (list PT-STARTED nil))})))))
 
 (defn- control-handler [frame conn-send]
-  ;; frame = {:control id op} where op ∈ #{:status :stop}
+  ;; frame = {:control id op} where op ∈ #{:status :stop} or {:close root}
   (let [id (elem frame 1)
         op (elem frame 2)]
     (cond
@@ -59,8 +105,28 @@
       ;; renders (vm.inspect), so the two faces cannot disagree.
       (do (conn-send (wire/stdout id 0 (str (status-text) "\n")))
           (conn-send (wire/exit id 0)))
+      (= op :realms)
+      (do (conn-send (wire/stdout id 0 (str (join "\n" (realm/roots)) "\n")))
+          (conn-send (wire/exit id 0)))
+      (and (erlang/is_tuple op) (= :close (elem op 0)))
+      (let [root (elem op 1)]
+        (realm/close root)
+        (conn-send (wire/stdout id 0 (str "bl realm: closed " root "\n")))
+        (conn-send (wire/exit id 0)))
+      (and (erlang/is_tuple op) (= :members (elem op 0)))
+      (do (conn-send (wire/stdout id 0 (members-text (elem op 1))))
+          (conn-send (wire/exit id 0)))
+      (and (erlang/is_tuple op) (= :show (elem op 0)))
+      (do (conn-send (wire/stdout id 0 (show-text (elem op 1))))
+          (conn-send (wire/exit id 0)))
+      (and (erlang/is_tuple op) (= :restart (elem op 0)))
+      (let [root (elem op 1)]
+        (realm/close root)
+        (realm/open root)
+        (conn-send (wire/stdout id 0 (str "bl realm: restarted " root "\n")))
+        (conn-send (wire/exit id 0)))
       (= op :stop)
-      (do (conn-send (wire/stdout id 0 "bl daemon: stopping
+      (do (conn-send (wire/stdout id 0 "bl realm: stopping
 "))
           (conn-send (wire/exit id 0))
           ;; signal the session owner to stop (the caller polls the listener)
@@ -73,6 +139,57 @@
     (control-handler frame conn-send)
     (dispatch-command frame conn-send)))
 
+(defn start-heartbeat
+  "While a request runs, send `id`'s client a heartbeat every `interval-ms`, from a
+   process of its own so a command that blocks (a long test, a compile) cannot
+   starve it. Returns the pid; `stop-heartbeat` ends it. The client reads this as
+   proof the VM is alive and the command merely quiet."
+  [conn-send id interval-ms]
+  (spawn (fn []
+           (loop []
+             (receive
+               :stop :ok
+               (after interval-ms
+                 (do (conn-send (wire/heartbeat id)) (recur))))))))
+
+(defn stop-heartbeat [pid]
+  (erlang/send pid :stop)
+  :ok)
+
+(defn- run-command
+  "Run the command of request `id` in a CHILD of this connection's process and wait
+   for it. Returns the exit code, or `:cancelled` when the client left first.
+
+   The child is what a cancel ends, so this process stays alive to run the request's
+   cleanup (the in-flight count, the heartbeat, the group leader): a process killed
+   from outside skips its `finally`. A cancel ends the command's OWN process, and with
+   it whatever it was blocked in. Processes the command started that outlive it are
+   not touched: a `serve` or a schedule is a realm member on purpose, and ending a
+   realm's members for one request's departure would stop other requests' work in a
+   shared VM."
+  [argv cwd env conn-send id]
+  (let [parent (erlang/self)
+        child (spawn
+                (fn []
+                  (let [r (try
+                            (let [_loaded (BeamLisp.Loader/ensure_loaded "bl.daemon")
+                                  handler (BeamLisp.Env/fetch! "bl.daemon" "handle-in-vm")
+                                  r (handler argv cwd env)]
+                              (if (erlang/is_integer r) r 0))
+                            (catch e
+                              (do (conn-send (wire/stderr id 999999 (str "bl: " (ex-message e) "\n"))) 1)))]
+                    (erlang/send parent [:command-done r]))))]
+    (let [mref (erlang/apply :erlang :monitor (list :process child))]
+      (receive
+        [:command-done code] (do (erlang/apply :erlang :demonitor (list mref (list :flush))) code)
+        :client_gone (do (erlang/apply :erlang :demonitor (list mref (list :flush)))
+                         (erlang/exit child :client_gone)
+                         :cancelled)
+        ; the command's process ended without answering (an exit the try did not see)
+        [:DOWN _r :process _p reason]
+        (do (conn-send (wire/stderr id 999999 (str "bl: the command ended abnormally: " (pr-str reason) "\n")))
+            1)))))
+
 (defn- dispatch-command [frame conn-send]
   ;; frame = {:request id %{argv cwd env …}}
   (let [id (elem frame 1)
@@ -80,52 +197,114 @@
         argv (to-list (:argv m))
         cwd (:cwd m)
         env (or (:env m) {})]
-    ;; run in the caller's process (this per-connection process) with a group
-    ;; leader that turns the command's stdout into :stdout frames on conn.
+    ;; the command's stdout becomes :stdout frames on conn, through a group leader
+    (idle/begin!)
     (let [worker (erlang/self)
           proxy (io/start-with-send conn-send id)
+          beat (start-heartbeat conn-send id wire/HEARTBEAT-MS)
           prev-gl (erlang/group_leader)]
       (erlang/group_leader proxy worker)
       (let [code (try
-                   (let [_loaded (BeamLisp.Loader/ensure_loaded "bl.daemon")
-                         handler (BeamLisp.Env/fetch! "bl.daemon" "handle-in-vm")
-                         r (handler argv cwd env)]
-                     (if (erlang/is_integer r) r 0))
-                   (catch e
-                     (do (conn-send (wire/stderr id 999999 (str "bl: " (ex-message e) "\n"))) 1))
+                   (run-command argv cwd env conn-send id)
                    (finally
+                     (stop-heartbeat beat)
+                     (idle/end!)
                      (erlang/group_leader prev-gl worker)))]
         (io/finish proxy)
-        (conn-send (wire/exit id code))))))
+        (when (not= :cancelled code)
+          (conn-send (wire/exit id code)))))))
 
-(defn start
-  "Boot the pure-bl daemon for `root`: start the global VM manager, then bind the
-   socket and serve requests through it. Returns {:ok listener} | {:error …}."
+(defn- boot-realm-services!
+  "What a daemon runs besides its socket: the manager, the sequencer, and the
+   facts the status read-model reports. Runs only AFTER the socket is ours — a
+   start that lost the race must leave nothing of itself behind.
+
+   A VM started for ONE project (`root`) opens that project's realm now, so its
+   index is warm and its declared schedules fire before the first command: a daemon
+   that sits warm overnight is exactly when a nightly prune should happen. A shared
+   VM (`root` nil) has no project yet; each realm opens on its first request, which
+   is the same `realm/open` call."
   [root]
   (mgr/start)
-  ;; the tree's warm code index owner: build at boot so the first code question
-  ;; (bl ask / bl search / the MCP mount) finds it warm rather than paying for
-  ;; its own conn (see vm.index).
-  (index/start {:root root})
   ;; the reload/intent sequencer (vm.exec): a watch commit and a dashboard intent
   ;; take turns here, never racing a program the daemon is running.
   (exec/start)
-  ;; the tree's DECLARED periodic work (env.bl `:schedules`) — a wheel per
-  ;; project, armed at BOOT for the same reason the index is: a daemon that sits
-  ;; warm overnight is exactly when a nightly prune should happen, and waiting
-  ;; for the first session command means waiting for someone to be awake. The
-  ;; spawn path arms it too (vm.manager/ensure), idempotently, so a tree that is
-  ;; used before it is idle is covered either way.
-  (sched/start-for (spec/read root))
-  ;; remember what this session is, for the status read-model.
-  (erlang/apply :persistent_term :put (list PT-ROOT root))
-  (erlang/apply :persistent_term :put (list PT-STARTED (erlang/system_time :second)))
-  ;; the socket transport (mints the auth token in the endpoints token file).
-  (let [listener (net/listen root request-handler)]
-    ;; the HTTP face on :ui, a view over the same read-model. A failure here does
-    ;; NOT stop the daemon: its job is serving commands, the page is a view.
-    (start-ui root)
-    listener))
+  (when (some? root)
+    (realm/open root)
+    (erlang/apply :persistent_term :put (list PT-ROOT root)))
+  (erlang/apply :persistent_term :put (list PT-STARTED (erlang/system_time :second))))
+
+(defn- busy?
+  "Whether anything besides a running request is using this VM: a route a project
+   holds that someone may open (not the VM's own console — see `idle/OWN-ROUTES`),
+   or work a realm owns (a schedule, a `serve`, a `watch`; not its furniture — see
+   `idle/FURNITURE-ROLES`). Either keeps it alive: a VM that serves a name or runs
+   a job is not idle however quiet your terminal is."
+  []
+  (let [pid (erlang/list_to_integer (erlang/apply :os :getpid (list)))
+        mine (idle/serving-claims (ports/list-claims) pid)
+        vms (mgr/list-vms)]
+    (or (> (count mine) 0)
+        ;; work, not furniture: see `idle/active-members`
+        (some (fn [vm] (> (count (idle/active-members (:id vm))) 0)) (to-list vms)))))
+
+(defn- arm-idle!
+  "Start the idle clock for `limit` seconds and remember its watcher. When it
+   expires the VM stops itself the way `bl realm stop` does: it flips the stop flag
+   the foreground loop is waiting on, so the same drain path runs."
+  [limit]
+  (let [w (idle/start-watcher limit busy?
+            (fn [] (println "bl realm: idle, stopping")
+                   (erlang/apply :persistent_term :put (list (tuple :vm_session :stop) true))))]
+    (when w (erlang/apply :persistent_term :put (list PT-IDLE w)))
+    w))
+
+(defn- release-start-marker!
+  "The launcher wrote `.starting` before it spawned this VM so a second `bl` would
+   not start another. This VM is listening now, so the marker has done its job."
+  [root shared]
+  (let [ep (paths/endpoints root (paths/build-id) shared)]
+    (when (contains? ep :ok) (File/rm (:starting (:ok ep))))))
+
+(defn start
+  "Boot the warm VM for `root`: bind the socket first, and only if it is
+   ours start the services behind it. Returns {:ok listener} | {:error reason};
+   {:error :already-running} means a live daemon answers for this endpoint and
+   NOTHING was started — attach to it. {:error :shared-needs-a-build} means a shared
+   VM was asked of a source checkout (which runs its own sources and is never
+   shared); {:error :no-root} means an own VM was asked with no project. `opts`
+   {:idle seconds :log path :shared bool}:
+   :idle arms the idle clock (0 or absent: the VM stays until stopped); :log is where
+   this VM's output goes, recorded so `bl vm show` and `bl vm logs` can find it;
+   :shared boots the build's SHARED VM, which needs no `root` (pass nil) and opens a
+   realm per request."
+  ([root] (start root {}))
+  ([root opts]
+   ;; the socket first, and the services after: binding is what decides who the
+   ;; daemon is, so a start that loses must not have armed an index and a
+   ;; scheduler it will never serve. The listener accepts at once, but a request
+   ;; that arrives before the services are up waits on the manager like any other.
+   (let [shared (= true (get opts :shared))
+         r (cond
+             (and shared (= (paths/build-id) paths/SRC-BUILD))
+             {:error :shared-needs-a-build}
+             (and (not shared) (nil? root))
+             {:error :no-root}
+             :else (net/listen root request-handler {:shared shared}))]
+     (if (contains? r :ok)
+       (do (boot-realm-services! (if shared nil root))
+           ;; the HTTP face on :ui, a view over the same read-model. A failure
+           ;; here does NOT stop the daemon: its job is serving commands, the
+           ;; page is a view.
+           (start-ui root shared)
+           ;; become visible to the machine: one record, written once. A failure
+           ;; to publish costs `bl vm` a row (the old files still adopt this pid),
+           ;; never the daemon its job.
+           (publish-self! (:ok r) (get opts :log))
+           (release-start-marker! root shared)
+           (arm-idle! (get opts :idle 0))
+           r)
+       r))))
 
 (defn- project-ui-port
   "The tree's declared :ui port, or nil for ephemeral. Reads the SPEC — the
@@ -139,19 +318,48 @@
           (and (map? ui) (erlang/is_integer (get ui :port))) (get ui :port)
           :else nil)))
 
-(defn- start-ui [root]
-  (try
+(defn- start-ui
+  "The dashboard for the project this VM serves. A shared VM serves no single
+   project, and the dashboard's pages read ONE root, so it starts none: a page
+   that answered for the wrong realm would be worse than no page. Per-realm pages
+   under one console are PLAN-158 step 12."
+  [root shared]
+  (when-not shared
+   (try
     (let [want (or (project-ui-port root) 0)
           r (ports/claim "ui" want {:root root :hosts (to-list (names/hosts root "ui"))})]
       (when (contains? r :ok)
+        ;; a name was claimed: make sure something answers it (never blocks, never fails the claim)
+        (gw/ensure-for-claim (names/hosts root "ui"))
         (let [port (:ok r)
-              ep (:ok (paths/endpoints root))
+              ep (:ok (paths/endpoints root (paths/build-id) false))
               token (if (and ep (File/exists? (:token ep))) (File/read! (:token ep)) nil)]
           (http/serve port {:root root :tree-id (paths/tree-id root)
                             :token token :started-at (erlang/system_time :second)}))))
+    (catch e nil))))
+
+(defn- publish-self!
+  "Publish this VM's record and remember it on the listener so `stop` can retract
+   exactly it. A VM is labelled with the project it was started for."
+  [listener log]
+  (try
+    (let [root (erlang/apply :persistent_term :get (list PT-ROOT nil))
+          r (registry/publish! :warm {:label (vm-label root) :log log})]
+      (when (contains? r :ok)
+        (erlang/apply :persistent_term :put (list PT-RECORD (:ok r)))))
     (catch e nil)))
 
 (defn stop
-  "Stop the daemon session's listener."
+  "Stop the daemon session's listener, and leave the registry: a clean stop
+   removes the record, so only a crash ever leaves one for `prune` to find. The
+   realms the session opened end with it (their index owners, wheels and members):
+   a session that stopped listening but left them running would hold a project
+   alive for nothing, and the next session in this process would inherit them."
   [listener]
+  (idle/stop-watcher (erlang/apply :persistent_term :get (list PT-IDLE nil)))
+  (doseq [root (to-list (realm/roots))] (realm/close root))
+  (erlang/apply :persistent_term :erase (list PT-IDLE))
+  (let [rec (erlang/apply :persistent_term :get (list PT-RECORD nil))]
+    (when rec (registry/retract! rec))
+    (erlang/apply :persistent_term :erase (list PT-RECORD)))
   (net/stop listener))

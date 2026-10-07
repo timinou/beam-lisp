@@ -3,14 +3,18 @@
 //
 //   bl hooks install [DIR]   install into the repository at DIR (default: here)
 //   bl hooks remove  [DIR]
+//   bl hooks status  [DIR]   what is out of date, and why
 //   bl hooks run EVENT       what an installed hook calls (internal)
 //
 // Two kinds of repository get hooks:
 //
 //   the beam-lisp checkout   post-commit / post-merge / post-checkout /
-//                            post-rewrite ask for a BACKGROUND build of the
-//                            worktree that fired; one on the source repo's
-//                            `main` also moves `latest`.
+//                            post-rewrite CHECK whether the worktree's newest
+//                            build still matches what a build reads, and print
+//                            a warning when it does not. They never build: a
+//                            build takes minutes and the lock is shared, so the
+//                            decision to pay for one is the person's
+//                            (`bl self-update bleeding-edge`, `bl self-update`).
 //   a project on `latest`    pre-push refuses a push while the local beam-lisp
 //                            `main` has commits `origin/main` does not: the
 //                            project may use them, and nobody else's `latest`
@@ -20,9 +24,9 @@
 // never overwritten: the script calls the old one first (renamed
 // `<name>.pre-bl`), then ours, so installing is additive and reversible.
 //
-// Background work obeys this host's rules (~/.agents/AGENTS.md): a detached
-// child closes fds 3-9 so it cannot hold a direnv pipe open, and nothing relies
-// on `timeout`.
+// A hook starts nothing, so it can hold no descriptor open and hang `direnv`
+// entry (~/.agents/AGENTS.md): it reads a few files, runs two git queries, and
+// exits.
 
 const HOOK_MARK: &str = "# managed by `bl hooks` (PLAN-144)";
 const SOURCE_EVENTS: &[&str] = &["post-commit", "post-merge", "post-checkout", "post-rewrite"];
@@ -94,7 +98,7 @@ fn events_for(top: &Path) -> Vec<&'static str> {
     if source_tree(top).is_some() {
         ev.extend_from_slice(SOURCE_EVENTS);
     }
-    let latest = std::fs::read_to_string(top.join("env.bl"))
+    let latest = std::fs::read_to_string(top.join(PROJECT_FILE))
         .ok()
         .and_then(|t| scan_literal(&t, "bl"))
         .is_some_and(|s| s == "latest");
@@ -128,23 +132,29 @@ pub fn hooks_verb(store: &Store, args: &[String], me: &Path, cwd: &Path) -> Resu
         }
         "run" => {
             let event = args.get(1).map(String::as_str).unwrap_or("");
-            run_hook(store, event, &args[2.min(args.len())..], me, cwd)
+            run_hook(store, event, &args[2.min(args.len())..], cwd)
         }
-        other => Err(format!("bl hooks: unknown `{other}` (install | remove)")),
+        "status" => {
+            let top = source_tree(&target).ok_or("not inside a beam-lisp tree")?;
+            let warnings = stale_report(store, &top);
+            Ok(if warnings.is_empty() { format!("{}: every recorded build matches its inputs", tildify(&top)) } else { warnings.join("\n") })
+        }
+        other => Err(format!("bl hooks: unknown `{other}` (install | remove | status)")),
     }
 }
 
-/// What an installed hook does. Build hooks never fail the git operation that
-/// fired them; the pre-push guard is the only hook that refuses.
-fn run_hook(store: &Store, event: &str, rest: &[String], me: &Path, cwd: &Path) -> Result<String, String> {
+/// What an installed hook does. Hooks never fail the git operation that fired
+/// them and never build; the pre-push guard is the only hook that refuses.
+fn run_hook(store: &Store, event: &str, rest: &[String], cwd: &Path) -> Result<String, String> {
     match event {
         "pre-push" => guard_latest(cwd).map(|_| String::new()),
         // post-checkout's third argument is 1 for a branch switch, 0 for a file
         // checkout: only a branch switch changes what the tree is.
         "post-checkout" if rest.get(2).map(String::as_str) == Some("0") => Ok(String::new()),
         e if SOURCE_EVENTS.contains(&e) => {
-            if let Some(tree) = source_tree(cwd) {
-                request_build(store, &tree, me);
+            let warnings = source_tree(cwd).map(|tree| stale_report(store, &tree)).unwrap_or_default();
+            if !warnings.is_empty() {
+                eprintln!("{}", warnings.join("\n"));
             }
             Ok(String::new())
         }
@@ -152,117 +162,92 @@ fn run_hook(store: &Store, event: &str, rest: &[String], me: &Path, cwd: &Path) 
     }
 }
 
-/// Queue a background build of `tree`: at most one queued per tree; a newer
-/// request while one is running is picked up when it finishes (the builder
-/// re-reads the stamp, so a burst of commits builds once for the last state).
-pub fn request_build(store: &Store, tree: &Path, me: &Path) {
-    if std::env::var("BL_AUTOBUILD").as_deref() == Ok("off") {
-        return;
-    }
-    let queue = store.meta().join("queue");
-    let _ = std::fs::create_dir_all(&queue);
-    let _ = write_atomic(&queue.join(tree_id(tree)), tree.to_string_lossy().as_bytes());
-    spawn_detached(me, &["hooks", "drain"], tree);
-}
+// ── is a build warranted? ───────────────────────────────────────────────────
 
-/// Start `me ARGS` fully detached: its own process group, stdio on /dev/null,
-/// and NO descriptor beyond 0-2. The last part is the one that matters: a
-/// hook runs under git, git runs under whatever started it, and descriptors
-/// that are not close-on-exec ride all the way down (measured: a drainer held
-/// its caller's log and session files as fds 14 and 44). A long-lived child
-/// holding a pipe it inherited is what hangs `direnv` entry on this host
-/// (~/.agents/AGENTS.md), so every one above 2 is closed before exec.
-fn spawn_detached(me: &Path, args: &[&str], cwd: &Path) {
-    let mut cmd = Command::new(me);
-    cmd.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-        // SAFETY: runs in the forked child before exec; it only calls
-        // `close`, which is async-signal-safe, and allocates nothing.
-        unsafe {
-            cmd.pre_exec(|| {
-                close_fds_above_2();
-                Ok(())
-            });
-        }
-    }
-    let _ = cmd.spawn();
-}
-
-#[cfg(unix)]
-extern "C" {
-    fn close(fd: i32) -> i32;
-}
-
-/// Close every descriptor above 2. Called between fork and exec, so it may not
-/// allocate: it walks a fixed range rather than listing `/proc/self/fd`.
-#[cfg(unix)]
-fn close_fds_above_2() {
-    for fd in 3..4096 {
-        // SAFETY: closing a descriptor that is not open returns EBADF, nothing more.
-        unsafe {
-            close(fd);
-        }
+/// Why a recorded build no longer matches the tree, pure. `built` is the commit
+/// the build was made from (None: no build recorded), `changed` whether a build
+/// input differs between that commit and HEAD (None: git could not say, e.g.
+/// the commit is gone). A build is warranted only when its inputs moved: a
+/// commit that touches docs or tests does not make a build stale.
+pub fn staleness(label: &str, built: Option<&str>, head: &str, changed: Option<bool>) -> Option<String> {
+    let short = |c: &str| c.chars().take(8).collect::<String>();
+    match (built, changed) {
+        (None, _) => None, // nothing was ever built here: nothing to be behind
+        (Some(c), _) if c == head => None,
+        (Some(_), Some(false)) => None,
+        (Some(c), Some(true)) => Some(format!("{label} was built from {}; build inputs have changed since ({})", short(c), short(head))),
+        (Some(c), None) => Some(format!("{label} was built from {}, which this repository no longer has", short(c))),
     }
 }
 
-/// `bl hooks drain`: build every queued tree, one at a time, until the queue is
-/// empty. A second drainer finds the build lock held and leaves: the running
-/// one re-reads the queue before it exits.
-pub fn drain(store: &Store, me: &Path) -> Result<String, String> {
-    let queue = store.meta().join("queue");
-    let lock = store.meta().join("locks").join("drain");
-    let _ = std::fs::create_dir_all(lock.parent().unwrap());
-    if std::fs::OpenOptions::new().write(true).create_new(true).open(&lock).is_err() {
-        let holder = std::fs::read_to_string(&lock).ok().and_then(|s| s.trim().parse::<u32>().ok());
-        if holder.is_some_and(|p| Path::new(&format!("/proc/{p}")).exists()) {
-            return Ok("a drainer is already running".to_string());
-        }
-        let _ = std::fs::remove_file(&lock);
-        return drain(store, me);
+/// Whether any build input differs between commit `from` and HEAD of `tree`.
+fn inputs_changed(tree: &Path, from: &str) -> Option<bool> {
+    let mut args = vec!["diff", "--quiet", from, "HEAD", "--"];
+    args.extend(BUILD_INPUTS);
+    let status = git_at(tree).args(&args).stderr(Stdio::null()).status().ok()?;
+    match status.code() {
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        _ => None, // an unknown commit or any other git failure
     }
-    let _ = std::fs::write(&lock, std::process::id().to_string());
-    let mut built = vec![];
-    loop {
-        let next = std::fs::read_dir(&queue)
-            .ok()
-            .and_then(|rd| rd.flatten().find(|e| !e.file_name().to_string_lossy().contains(".tmp-")));
-        let Some(entry) = next else { break };
-        let tree = PathBuf::from(std::fs::read_to_string(entry.path()).unwrap_or_default().trim());
-        let _ = std::fs::remove_file(entry.path());
-        if source_tree(&tree).is_none() {
-            continue;
-        }
-        // `latest` is main's COMMIT, never a working tree: a worktree build is
-        // its bleeding-edge, and it is `latest` too only when it was clean.
-        // Otherwise main's commit is built on its own, exactly as
-        // `bl self-update latest` builds it.
-        let on_main = is_source_main(&tree);
-        match build_tree(store, &tree, me, &[]) {
-            Ok(b) => {
-                built.push(format!("{} → {}", tildify(&tree), b.id));
-                if on_main {
-                    let clean = b.key.as_deref().is_some_and(|k| !k.contains('+'));
-                    let latest = if clean {
-                        store.read(&format!("bleeding-edge/{}", tree_id(&tree)))
-                            .map(|p| store.write("channels/latest", &p).map(|_| b.id.clone()).map_err(|e| e.to_string()))
-                            .unwrap_or_else(|| Err("the build left no pointer".to_string()))
-                    } else {
-                        build_commit(store, &tree, "main", me, &["channels/latest"]).map(|l| l.id)
-                    };
-                    match latest {
-                        Ok(id) => built.push(format!("latest → {id}")),
-                        Err(e) => built.push(format!("latest: {e}")),
-                    }
-                }
-            }
-            Err(e) => built.push(format!("{}: {e}", tildify(&tree))),
-        }
+}
+
+/// The warnings for `tree`: its own newest build, and, for the source
+/// checkout on `main`, the `latest` channel. Empty when nothing is behind.
+/// Uncommitted edits are not reported: they run from source.
+pub fn stale_report(store: &Store, tree: &Path) -> Vec<String> {
+    let Some(head) = git_out(tree, &["rev-parse", "HEAD"]) else { return vec![] };
+    let mut targets = vec![("bleeding-edge", store.bleeding_edge_key(&tree_id(tree)))];
+    if is_source_main(tree) {
+        targets.push(("latest", store.channel_key("latest")));
     }
-    let _ = std::fs::remove_file(&lock);
-    Ok(built.join("\n"))
+    let mut out: Vec<String> = targets
+        .into_iter()
+        .filter_map(|(label, key)| {
+            let built = store.read(&key).and_then(|p| p.get("commit").map(str::to_string)).filter(|c| !c.is_empty());
+            let changed = built.as_deref().and_then(|c| inputs_changed(tree, c));
+            staleness(label, built.as_deref(), &head, changed).map(|w| format!("bl: {w}"))
+        })
+        .collect();
+    if !out.is_empty() {
+        out.push(format!("bl: when it suits you: `bl self-update bleeding-edge` in {}{}", tildify(tree), if is_source_main(tree) { ", then `bl self-update` for latest" } else { "" }));
+    }
+    out
+}
+
+/// The variables git sets for a hook so that git commands inside it act on the
+/// repository that fired it. Exactly `git rev-parse --local-env-vars` (a test
+/// keeps this table equal to what the installed git reports).
+///
+/// They must not reach the drainer: it builds OTHER trees, and with `GIT_DIR`
+/// naming the worktree that committed, every `git -C <tree>` it ran read that
+/// worktree's repository instead. Measured on the real build: a tree at
+/// `9870f1e4` answered `rev-parse HEAD` as `6a67c2a6` (a feature-branch commit
+/// that is not on main) when run under the hook's `GIT_DIR`, and `latest` was
+/// stamped with it.
+const GIT_LOCAL_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// Remove from `cmd` every variable that ties a git command to one repository.
+fn scrub_git_env(cmd: &mut Command) {
+    for var in GIT_LOCAL_ENV {
+        cmd.env_remove(var);
+    }
 }
 
 /// Whether `tree` is the configured source checkout, on `main`.
@@ -291,7 +276,7 @@ pub fn guard_verdict(ahead: Option<u32>, fetched: bool, override_set: bool) -> R
 
 fn guard_latest(cwd: &Path) -> Result<(), String> {
     let top = git_out(cwd, &["rev-parse", "--show-toplevel"]).map(PathBuf::from).unwrap_or_else(|| cwd.to_path_buf());
-    let on_latest = std::fs::read_to_string(top.join("env.bl"))
+    let on_latest = std::fs::read_to_string(top.join(PROJECT_FILE))
         .ok()
         .and_then(|t| scan_literal(&t, "bl"))
         .is_some_and(|s| s == "latest");
@@ -301,9 +286,7 @@ fn guard_latest(cwd: &Path) -> Result<(), String> {
     let Some(src) = source_repo() else {
         return Ok(()); // no local beam-lisp: this machine's latest IS CI's
     };
-    let fetched = Command::new("git")
-        .arg("-C")
-        .arg(&src)
+    let fetched = git_at(&src)
         .args(["fetch", "--quiet", "origin", "main"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -324,6 +307,42 @@ fn guard_latest(cwd: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod hooks_tests {
     use super::*;
+
+    #[test]
+    fn a_git_command_run_from_a_hook_names_its_repository_by_path_alone() {
+        let mut cmd = Command::new("true");
+        scrub_git_env(&mut cmd);
+        let removed: Vec<_> = cmd.get_envs().filter(|(_, v)| v.is_none()).map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+        for var in ["GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_PREFIX", "GIT_COMMON_DIR"] {
+            assert!(removed.iter().any(|r| r == var), "{var} must be removed from a git command run on behalf of a hook");
+        }
+        assert_eq!(removed.len(), GIT_LOCAL_ENV.len());
+    }
+
+    #[test]
+    fn the_scrubbed_list_is_what_git_calls_local() {
+        let Some(out) = Command::new("git").args(["rev-parse", "--local-env-vars"]).output().ok().filter(|o| o.status.success()) else {
+            return; // no git here: nothing to compare against
+        };
+        let theirs = String::from_utf8_lossy(&out.stdout);
+        let missing: Vec<&str> = theirs.lines().map(str::trim).filter(|v| !v.is_empty() && !GIT_LOCAL_ENV.contains(v)).collect();
+        assert!(missing.is_empty(), "git now reports local variables the drainer would inherit: {missing:?}");
+    }
+
+    #[test]
+    fn a_build_is_warranted_only_when_its_inputs_moved() {
+        // no build recorded → nothing to be behind
+        assert_eq!(staleness("latest", None, "bbbbbbbb", None), None);
+        // built from HEAD
+        assert_eq!(staleness("latest", Some("bbbbbbbb"), "bbbbbbbb", Some(true)), None);
+        // HEAD moved but only docs/tests did: the build is still right
+        assert_eq!(staleness("latest", Some("aaaaaaaa"), "bbbbbbbb", Some(false)), None);
+        // an input moved → warn, naming both commits
+        let w = staleness("bleeding-edge", Some("aaaaaaaa11"), "bbbbbbbb22", Some(true)).unwrap();
+        assert!(w.contains("bleeding-edge") && w.contains("aaaaaaaa") && w.contains("bbbbbbbb"), "{w}");
+        // the build's commit is gone (rebase, gc): say so rather than staying silent
+        assert!(staleness("latest", Some("aaaaaaaa"), "bbbbbbbb", None).unwrap().contains("no longer has"));
+    }
 
     #[test]
     fn the_guard_refuses_only_unpushed_main() {

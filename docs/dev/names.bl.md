@@ -18,8 +18,9 @@ registry first, so the app you start is reachable at a name:
     http://web.pulse.test        the app
     http://pulse.test            the session's own page (and its /mcp)
 
-Two verbs close the loop. `bl ports` lists what is claimed, name first. `bl open
-web` prints the address and, with `--open`, hands it to your browser.
+Two verbs close the loop. `bl vm` lists the machine's VMs, realms and routes,
+name first. `bl realm open web` prints the address and, with `--open`, hands it
+to your browser.
 
 ```beam-lisp {:id "require"}
 (ns dev.names-doc
@@ -129,10 +130,10 @@ answers to, because the process holding the port is the one that knows its name:
 
 ## Running the gateway
 
-    bl gateway            is it up, and which names does it answer?
-    bl gateway start      start it now (the unit when installed, else detached)
-    bl gateway stop       stop it
-    bl gateway run        run it in the foreground — what the unit execs
+    bl vm                 is it up, and which names does it answer?
+    bl vm start gateway   start it now (the unit when installed, else detached)
+    bl vm stop gateway    stop it
+    bl vm start gateway --foreground   run it in the foreground — what the unit execs
     bl install gateway    a systemd user unit, so it starts at login
     bl install redirect   make port 80 answer for it (one root step, loopback only)
 

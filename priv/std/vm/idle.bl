@@ -1,0 +1,169 @@
+; vm/idle.bl — when a warm VM has nothing left to do, it leaves.
+;
+; A warm VM exists to make the NEXT command fast. One nobody has used for hours is
+; just memory: on this machine a VM that had been idle for 2½ days held 7 GB. So a
+; warm VM keeps a clock of its own activity and exits when it has been idle for the
+; limit the launcher gave it (`--idle SECONDS`), unless something is still using it.
+;
+; ══ WHAT COUNTS AS USE ══════════════════════════════════════════════════════
+;
+; The VM is busy, and the clock does not run, while ANY of these hold:
+;
+;   a request is running      a command is in flight (`begin!` … `end!`)
+;   a name is claimed         a route this VM serves is held — someone may open it
+;   a realm runs a job        a schedule, a `serve`, or a `watch` is alive
+;
+; Otherwise it is idle, and `idle-for` says for how long, measured from the last
+; moment it stopped being busy. A VM that is busy for a week and then goes quiet
+; leaves a limit later, not a week later: the clock starts when use stops.
+;
+; ══ THE SHAPE ═══════════════════════════════════════════════════════════════
+;
+; `expired?` is a pure function of (limit, now, last-active, busy?) so the rule is
+; tested without a clock. The VM's loop reads the world once per tick and asks it.
+; A limit of 0 means "never": the clock is off, which is what a service manager
+; that owns the VM's lifetime wants.
+;
+;   (idle/begin!)                      a request started
+;   (idle/end!)                        a request finished (stamps the clock)
+;   (idle/running)                     how many requests are running now
+;   (idle/last-active)                 seconds (monotonic) of the last use
+;   (idle/expired? limit now last busy?)  pure: should the VM exit?
+;   (idle/start-watcher limit busy-fn on-expire)  → pid; checks every TICK-S
+
+(ns vm.idle
+  (:require [vm.owner :as owner]))
+
+;; How often the watcher looks. The limit is minutes to hours, so a coarse tick
+;; costs nothing and a fine one wastes wakeups; a VM may overshoot its limit by
+;; up to one tick, never undershoot it.
+(def TICK-S 15)
+
+(def PT-IN-FLIGHT (tuple :vm_idle :in-flight))
+(def PT-LAST (tuple :vm_idle :last-active))
+
+(defn- now-s [] (erlang/div (System/monotonic_time :millisecond) 1000))
+
+(defn last-active
+  "The monotonic second the VM was last in use (started now if never stamped)."
+  []
+  (erlang/apply :persistent_term :get (list PT-LAST (now-s))))
+
+(defn- stamp! [] (erlang/apply :persistent_term :put (list PT-LAST (now-s))))
+
+;; The counter is an `:atomics` cell, and only the cell's REFERENCE is a
+;; persistent_term. The cell must exist exactly once: `persistent_term:put` is
+;; last-writer-wins, so two requests that each found no cell and each made one would
+;; keep separate counts and lose one of them (measured: 64 racing first requests
+;; counted 1, and a VM that is serving looked idle). `ensure-cell!` therefore runs
+;; under a `:global` lock, the one mutual exclusion that is cheap, OTP's own, and
+;; held only for the instant the cell is created; every later call is a plain read.
+(def CELL-LOCK :vm_idle_cell)
+
+(defn ensure-cell!
+  "The in-flight counter's cell, creating it if this is the first ask. Safe to call
+   from any number of processes at once: exactly one cell is ever made."
+  []
+  (let [c (erlang/apply :persistent_term :get (list PT-IN-FLIGHT nil))]
+    (if (some? c)
+      c
+      (do
+        (erlang/apply :global :set_lock (list (tuple CELL-LOCK (erlang/self)) (to-list [(erlang/node)])))
+        (try
+          (let [again (erlang/apply :persistent_term :get (list PT-IN-FLIGHT nil))]
+            (if (some? again)
+              again
+              (let [fresh (erlang/apply :atomics :new (list 1 (to-list [(tuple :signed false)])))]
+                (erlang/apply :persistent_term :put (list PT-IN-FLIGHT fresh))
+                fresh)))
+          (finally
+            (erlang/apply :global :del_lock (list (tuple CELL-LOCK (erlang/self)) (to-list [(erlang/node)])))))))))
+
+(defn- cell [] (ensure-cell!))
+
+(defn begin!
+  "A request started."
+  []
+  (erlang/apply :atomics :add (list (cell) 1 1))
+  (stamp!)
+  :ok)
+
+(defn end!
+  "A request finished: the clock starts from now."
+  []
+  (erlang/apply :atomics :sub (list (cell) 1 1))
+  (stamp!)
+  :ok)
+
+(defn running
+  "Requests running now, from the atomic count."
+  []
+  (let [c (erlang/apply :persistent_term :get (list PT-IN-FLIGHT nil))]
+    (if (nil? c) 0 (erlang/apply :atomics :get (list c 1)))))
+
+(def OWN-ROUTES
+  "Routes a warm VM claims FOR ITSELF, which are not use. Every warm VM serves its
+   own dashboard on `ui`; counting that claim as 'a route someone may open' would
+   make every VM permanently busy and no clock could ever fire (measured: a VM
+   with --idle 45 was still up at 185 s). A project's own routes (`web`, `api`) are
+   different: those are the reason it is running."
+  #{"ui"})
+
+(def FURNITURE-ROLES
+  "Member roles that are part of a realm's furniture, not its work. A realm's code
+   index owner starts with the realm and would otherwise make every realm look
+   busy for as long as it is open, so no VM could ever go idle. A DECLARED
+   schedule is work (a nightly prune must not be cut off), as is anything a
+   project serves, watches or runs."
+  #{:index})
+
+(defn active-members
+  "The processes realm `realm-id` owns that are work: its members except those
+   under a furniture role. One registry query per role, no filtering by hand."
+  [realm-id]
+  (owner/procs-except realm-id FURNITURE-ROLES))
+
+(defn serving-claims
+  "The claims in `claims` that `pid` holds for something other than the VM's own
+   console. Pure: the caller lists the claims."
+  [claims pid]
+  (filter (fn [c] (and (= (get c :pid) pid)
+                       (not (contains? OWN-ROUTES (get c :name)))))
+          claims))
+
+(defn expired?
+  "Whether a VM idle since `last` should exit at `now` (both seconds). `limit` 0
+   means never. A busy VM never expires. Pure."
+  [limit now last busy?]
+  (cond
+    (not (erlang/is_integer limit)) false
+    (<= limit 0) false
+    busy? false
+    :else (>= (- now last) limit)))
+
+(defn start-watcher
+  "Check every TICK-S whether the VM is idle past `limit` seconds, and call
+   `on-expire` once when it is. `busy-fn` answers whether anything else is using
+   the VM (claimed routes, running jobs); in-flight requests are counted here.
+   Returns the watcher pid, or nil when `limit` is 0 (no clock to run)."
+  [limit busy-fn on-expire]
+  (if (or (not (erlang/is_integer limit)) (<= limit 0))
+    nil
+    (do
+      (stamp!)
+      (spawn (fn []
+               (loop []
+                 (receive
+                   :stop :ok
+                   (after (* TICK-S 1000)
+                     (let [busy? (or (> (running) 0) (boolean (busy-fn)))]
+                       ;; use stamps the clock when it STOPS, so a VM that was busy
+                       ;; keeps pushing the deadline out; a quiet one stops here
+                       (when busy? (stamp!))
+                       (if (expired? limit (now-s) (last-active) busy?)
+                         (on-expire)
+                         (recur)))))))))))
+
+(defn stop-watcher [pid]
+  (when pid (erlang/send pid :stop))
+  :ok)

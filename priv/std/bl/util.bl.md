@@ -15,9 +15,9 @@ Two shape-mismatches explain almost everything in this namespace.
   tuple list the Elixir side expects.
 
 - **A command resolves file arguments against the client's cwd.** A standalone
-  `bl` runs in the caller's shell, where the OS cwd is already right. The
-  daemon serves many clients from one VM, so `resolve` reads the cwd the
-  request bound rather than the daemon's own checkout.
+  `bl` runs in the caller's shell, where the OS cwd is already right. A warm VM
+  serves many clients at once, so `resolve` reads the cwd the request bound
+  rather than the warm VM's own checkout.
 
 A THIRD used to be here, and it is worth knowing why it is not: a `[…]` literal
 is a `BeamLisp.Vector` struct and a `#{…}` a `BeamLisp.Set`, and `Jason`
@@ -88,9 +88,9 @@ a keyword list, realized eagerly because `Keyword.get` matches cons cells.
 ## Paths: where a command's files are
 
 `resolve` expands a file argument against the command's cwd. Standalone that is
-the OS cwd, which makes an absolute path an identity. Under the daemon it is
+the OS cwd, which makes an absolute path an identity. Under a warm VM it is
 the client's cwd, so `bl run foo.bl` typed in any terminal finds the file in
-that terminal's tree, not one under the daemon's checkout.
+that terminal's tree, not one under the warm VM's checkout.
 
 `expand-targets` turns the user's PATH arguments into the actual sources: a
 file stays a file when the loader would load it, a directory becomes every
@@ -106,8 +106,8 @@ the user meant.
 
 (defn resolve
   "Expand a file argument against the command's cwd. Standalone this is the OS
-   cwd (identity for an absolute path); under the daemon it is the CLIENT's cwd,
-   so `bl run foo.bl` finds the client's file, not one under the daemon's
+   cwd (identity for an absolute path); under a warm VM it is the CLIENT's cwd,
+   so `bl run foo.bl` finds the client's file, not one under the warm VM's
    checkout. `BeamLisp/cwd` carries the binding."
   [p]
   (Path/expand p (BeamLisp/cwd)))
@@ -300,7 +300,7 @@ carries.
 (defn version
   "The beam-lisp version string, or \"0.0.0-dev\" when no app resource can answer.
 
-   `bl version` runs on the coldest path there is — `BL_DAEMON=off`, in a drop, so
+   `bl version` runs on the coldest path there is — `--cold`, in a drop, so
    the `:beam_lisp` application is often only present as a `.app` on disk and has
    not been STARTED. `application/get_key` answers `:undefined` for an app that is
    merely loadable, which is exactly the drop case that reported `0.0.0-dev` while

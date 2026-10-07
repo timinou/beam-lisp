@@ -1,0 +1,251 @@
+;; Ordered query pages over existing indexes. Closed admission, bounded physical
+;; work, complete retraction groups, and server-held cursor provenance.
+(ns datom.query.page
+  (:require [datom.db :as db] [datom.store :as store] [datom.index :as index]
+            [datom.schema :as schema] [datom.query.parse :as parse]
+            [datom.query.plan :as plan] [datom.cache-validity :as validity]
+            [datom.query.engine :as engine] [datom.query.relation :as relation]
+            [data.bounded-cache :as cache] [datom.compound :as compound]
+            [datom.index-coverage :as coverage]))
+
+(defn- resolve-term [bindings term]
+  (if (parse/variable? term) (get bindings term) term))
+
+(def SAFE-PREDICATES
+  {'= = 'not= not= '< < '<= <= '> > '>= >=})
+
+(defn- bound-term? [bound term]
+  (or (parse/constant? term) (and (parse/variable? term) (contains? bound term))))
+
+(defn- ready-clause? [s bound c]
+  (cond
+    (parse/pattern-clause? c)
+      (and (<= 3 (count c) 4) (bound-term? bound (get c 0))
+           (keyword? (get c 1)) (schema/known? s (get c 1))
+           (not (schema/many? s (get c 1)))
+           (nil? (relation/relation (get c 1))))
+    (parse/predicate-clause? c)
+      (let [form (get c 0)]
+        (and (= 1 (count c)) (contains? SAFE-PREDICATES (first form))
+             (every? (fn [t] (and (not (list? t)) (bound-term? bound t))) (rest form))))
+    :else false))
+
+(defn- functional-plan
+  ;; Each admitted clause yields at most one binding per driving entity. This
+  ;; preserves relation set semantics without an unbounded cross-page seen set.
+  [s bound clauses]
+  (loop [bound bound pending clauses ordered []]
+    (if (empty? pending) {:clauses ordered :bound bound}
+      (when-let [c (first (filter (fn [c] (ready-clause? s bound c)) pending))]
+        (recur (if (parse/pattern-clause? c)
+                 (into bound (filter parse/variable? c)) bound)
+               (vec (remove (fn [x] (= x c)) pending)) (conj ordered c))))))
+
+(defn- descriptor [query database inputs order]
+  (let [p (parse/parse query) forms (parse/input-forms p)
+        where (:where p) [ov direction] order s (db/schema-of database)
+        bindings (zipmap forms inputs)
+        value-plan (first (keep (fn [c]
+                            (when (and (parse/pattern-clause? c) (= ov (nth c 2 nil))
+                                       (not (schema/many? s (get c 1))))
+                              (let [physical (compound/path database where bindings (first c) (get c 1))]
+                                (when (or physical
+                                          (and (schema/indexed? s (get c 1))
+                                               (coverage/complete? (db/store-of database) s (get c 1)
+                                                                   (db/basis-t database))))
+                                  {:ordered c :physical physical})))) where))
+        value-order (:ordered value-plan)
+        entity-order (first (sort-by (fn [c] (if (= :db.type/string (schema/value-type s (get c 1))) 1 0))
+                            (filter (fn [c] (and (parse/pattern-clause? c)
+                             (= ov (get c 0)) (keyword? (get c 1))
+                             (schema/known? s (get c 1))
+                             (not (schema/many? s (get c 1))))) where)))
+        ordered (or value-order entity-order) root (first ordered) attr (get ordered 1)
+        physical (:physical value-plan)
+        components (when physical #{(:scope-attr physical) (:order-attr physical)})
+        ;; A tuple proves component values for its own entity, not assertion
+        ;; transaction IDs or facts about joined entities.
+        covered (and physical (every? (fn [c] (or (not= root (get c 0))
+                                                 (not (contains? components (get c 1)))
+                                                 (= 3 (count c)))) where))
+        bound (into (set forms) [root ov])
+        planned (when ordered (functional-plan s bound where))]
+    (when (and (empty? (parse/validate p)) (= :relation (parse/find-kind p))
+               (every? parse/variable? (:find p)) (empty? (:with p))
+               (<= 1 (count where) 16) (= (count forms) (count inputs))
+               (every? parse/variable? forms) (parse/variable? root) (parse/variable? ov)
+               (some (fn [v] (= root v)) (:find p)) planned
+               (every? (fn [v] (contains? (:bound planned) v)) (:find p))
+               (contains? #{:asc :desc} direction)
+               (= :current (:filter-mode database)) (nil? (:since-t database))
+               (nil? (:valid-at database)) (nil? (:valid-between database)))
+      {:parsed (assoc p :where (:clauses planned)) :root root :order-var ov :attr attr
+       :index (if value-order :avet :aevt) :direction direction
+       :bindings bindings :physical physical :covered covered})))
+
+(defn- complete-attribute [database eid attr budget]
+  (let [s (db/store-of database) lo (index/key-prefix :eavt eid attr)
+        hi (index/prefix-end lo)]
+    (loop [after nil raw [] budget budget]
+      (if (or (<= (:rows budget) 0) (<= (:seeks budget) 0) (<= (:bytes budget) 0))
+        {:incomplete true :budget budget}
+        (let [p (store/ordered-page s lo after hi (min 1024 (:rows budget)) :asc (:bytes budget))
+              budget (-> budget (update :rows - (count (:datoms p))) (update :seeks dec)
+                         (update :bytes - (or (:bytes p) 0)))
+              raw (into raw (:datoms p))]
+          (cond
+            (:refused p) {:refused (:refused p) :budget budget}
+            (:byte-limited? p) {:incomplete true :budget budget}
+            (:end? p) {:datoms (db/filter-datoms database raw) :budget budget}
+            :else (recur (:last p) raw budget)))))))
+
+(defn- evaluate [database spec eid value budget]
+  (let [physical (:physical spec)
+        proof (when (:covered spec) (complete-attribute database eid (:attr physical) budget))
+        current? (or (not (:covered spec))
+                     (some (fn [d] (= [(:scope physical) value] (index/-v d))) (:datoms proof)))
+        initial (when current? (engine/unify-term (:bindings spec) (:root spec) eid))
+        initial (when initial (engine/unify-term initial (:order-var spec)
+                                 (if (= :aevt (:index spec)) eid value)))
+        covered (if (:covered spec) {[eid (:scope-attr physical)] (:scope physical)
+                                     [eid (:order-attr physical)] value} {})]
+    (if (or (:incomplete proof) (:refused proof)) proof
+      (loop [clauses (:where (:parsed spec)) bindings initial read {}
+             budget (or (:budget proof) budget)]
+        (cond
+          (nil? bindings) {:budget budget}
+          (empty? clauses)
+            {:row (mapv (fn [v] (get bindings v)) (:find (:parsed spec))) :budget budget}
+          :else
+            (let [c (first clauses)]
+              (if (parse/predicate-clause? c)
+                (recur (rest clauses) (first (engine/eval-predicate bindings c
+                                               (fn [op] (get SAFE-PREDICATES op)))) read budget)
+                (let [e (resolve-term bindings (get c 0)) a (get c 1) k [e a]]
+                  (if (contains? covered k)
+                    ;; Evaluate restrictions using this entity's certified value.
+                    (recur (rest clauses) (engine/unify-term bindings (get c 2) (get covered k)) read budget)
+                    (let [r (if (contains? read k) {:datoms (get read k) :budget budget}
+                                (complete-attribute database e a budget))]
+                      (if (or (:incomplete r) (:refused r)) r
+                        (recur (rest clauses)
+                               (first (keep (fn [d] (engine/unify-pattern bindings c d)) (:datoms r)))
+                               (assoc read k (:datoms r)) (:budget r)))))))))))))
+
+(defn- save-cursor [context position rows expires]
+  (let [token (crypto/strong_rand_bytes 24)]
+    (when (cache/put! :datom.query.cursors token context
+                     {:position position :rows rows :expires-at expires}) token)))
+
+(defn page
+  "Execute an ordered page of an ordinary query. opts: :order-by [?v :asc|:desc],
+   :limit, optional :after opaque cursor and :budget {:rows :seeks :bytes}.
+   Current admission: projected entity root, indexed value or entity-id order,
+   functional cardinality-one forward joins and safe comparison predicates. Other shapes
+   return :refused. Physical rows AND seeks are bounded; permission conditions
+   run before page admission. :incomplete returns no partial page and a retry
+   cursor retaining accepted rows. Cursor binds exact DB/query/inputs/order and
+   optional :authorization context, with five-minute maximum lifetime."
+  [query database opts inputs]
+  (let [spec (descriptor query database inputs (:order-by opts))
+        limit (or (:limit opts) 50) now (erlang/system_time :millisecond)
+        permission-expiry (:expires-at (:authorization opts))
+        valid-expiry? (or (nil? permission-expiry) (erlang/is_integer permission-expiry))
+        expiry (if valid-expiry? (min (+ now 300000) (or permission-expiry (+ now 300000))) now)
+        _ (when spec
+            (cache/ready! :datom.query.cursors)
+            (cache/ready! :datom.query.pages)
+            (cache/ready! :data.cache.fingerprints))
+        code (when spec (validity/definition-stamp))
+        page-code (when code (BeamLisp.Env/namespace_generations (list "datom.query.page")))
+        context (when (and code page-code)
+                  (cache/fingerprint [(db/view-key database) query inputs (:order-by opts) (:physical spec)
+                                      limit (:authorization opts) code page-code]))
+        valid-token? (or (nil? (:after opts))
+                         (and (erlang/is_binary (:after opts)) (= 24 (erlang/byte_size (:after opts)))))
+        old (when (and (:after opts) valid-token?) (cache/lookup :datom.query.cursors (:after opts) context))
+        state (:value old)
+        budget (merge {:rows 4096 :seeks 4096 :bytes 8388608} (:budget opts))]
+    (cond
+      (not (and (erlang/is_integer limit) (<= 1 limit 1000))) {:status :refused :reason :invalid-limit}
+      (nil? spec) {:status :refused :reason :unsupported-plan}
+      (not (store/ordered-page-capable? (db/store-of database))) {:status :refused :reason :unbounded-substrate}
+      (nil? context) {:status :refused :reason :opaque-context}
+      (not valid-expiry?) {:status :refused :reason :invalid-authorization}
+      (<= expiry now) {:status :refused :reason :expired-authorization}
+      (not (and (erlang/is_integer (:rows budget)) (<= 1 (:rows budget) 100000)
+                (erlang/is_integer (:seeks budget)) (<= 1 (:seeks budget) 100000)
+                (erlang/is_integer (:bytes budget)) (<= 1 (:bytes budget) 268435456)))
+        {:status :refused :reason :invalid-budget}
+      (or (not valid-token?) (and (:after opts) (or (not (:hit? old)) (<= (:expires-at state) now))))
+        {:status :refused :reason :invalid-cursor}
+      :else
+        (let [s (db/store-of database)
+              physical (:physical spec)
+              physical-attr (or (:attr physical) (:attr spec))
+              lo (cond
+                   (and (= :avet (:index spec)) (contains? (:bindings spec) (:order-var spec)))
+                     (index/key-prefix :avet physical-attr
+                       (if physical [(:scope physical) (get (:bindings spec) (:order-var spec))]
+                         (get (:bindings spec) (:order-var spec))))
+                   (and (= :aevt (:index spec)) (contains? (:bindings spec) (:root spec)))
+                     (index/key-prefix :aevt physical-attr (get (:bindings spec) (:root spec)))
+                   :else (or (:lo physical) (index/key-prefix (:index spec) physical-attr)))
+              hi (index/prefix-end lo)
+              expires (min expiry (or (:expires-at state) expiry))
+              page-key [context (:position state) (or (:rows state) [])]
+              retained (cache/lookup :datom.query.pages page-key context)
+              cached (:value retained)
+              stable-code? (fn []
+                             (and (= code (validity/definition-stamp))
+                                  (= page-code (BeamLisp.Env/namespace_generations
+                                                 (list "datom.query.page")))))
+              reuse? (and (:hit? retained) (> (:expires-at cached) now)
+                          (stable-code?))
+              finish (fn [status rows position more?]
+                       (if (<= expires (erlang/system_time :millisecond))
+                         {:status :refused :reason :expired-authorization}
+                         (let [cursor (when more? (save-cursor context position
+                                                              (if (= status :incomplete) rows []) expires))]
+                           (if (and more? (nil? cursor)) {:status :refused :reason :cursor-capacity}
+                             (do
+                               ;; Retain completed data and physical continuation,
+                               ;; never an opaque token that can be evicted. A hit
+                               ;; mints a fresh provenance-checked cursor below.
+                               (when (and (= status :exact) (not reuse?) (stable-code?))
+                                 (cache/put! :datom.query.pages page-key context
+                                   {:rows rows :position position :more? more?
+                                    :expires-at expires}))
+                               {:status status :rows (if (= status :exact) rows [])
+                                :after cursor :more? more?})))))]
+          (if reuse?
+            (finish :exact (:rows cached) (:position cached) (:more? cached))
+          (loop [position (:position state) rows (or (:rows state) []) budget budget]
+            (cond
+              (= limit (count rows)) (finish :exact rows position true)
+              (or (<= (:rows budget) 0) (<= (:seeks budget) 0) (<= (:bytes budget) 0)) (finish :incomplete rows position true)
+              :else
+                (let [p (store/ordered-page s lo position hi 1 (:direction spec) (:bytes budget))
+                      budget (-> budget (update :rows - (count (:datoms p))) (update :seeks dec)
+                                 (update :bytes - (or (:bytes p) 0)))
+                      candidate (first (:datoms p))]
+                  (cond
+                    (:refused p) {:status :refused :reason (:refused p)}
+                    (:byte-limited? p) (finish :incomplete rows position true)
+                    (nil? candidate) (finish :exact rows position false)
+                    :else
+                    (let [eid (index/-e candidate)
+                          stored-value (index/-v candidate)
+                          value (if physical (second stored-value) stored-value)
+                          evaluated (evaluate database spec eid value budget)
+                          prefix (if (= :avet (:index spec))
+                                   (index/key-prefix :avet physical-attr stored-value eid)
+                                   (index/key-prefix :aevt physical-attr eid))
+                          ;; Whole EAVT group proves current visibility. All AVET
+                          ;; versions of this exact [value entity] are redundant.
+                          next (if (= :desc (:direction spec)) prefix (index/prefix-end prefix))]
+                      (cond
+                        (:refused evaluated) {:status :refused :reason (:refused evaluated)}
+                        (:incomplete evaluated) (finish :incomplete rows position true)
+                        :else (recur next (if (:row evaluated) (conj rows (:row evaluated)) rows)
+                                     (:budget evaluated)))))))))))))

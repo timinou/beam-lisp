@@ -54,7 +54,11 @@ The keys a project may declare:
 - `:app` — what the tree IS as an OTP application (`:name :vsn :applications
   :mod`), so a build need not interrogate the running VM about itself.
 - `:build` — which roots hold build sources, where the output goes, which
-  crates are native, how wide to compile.
+  crates are native, how wide to compile, and which sources must NEVER compile.
+  `:exclude` names entry programs that run when they load; paths are relative to
+  the project root (a file matches exactly, a directory matches every source
+  beneath it), they are filtered before the source graph is read, and no flag
+  bypasses them.
 - `:release` — what to assemble, and what must be permanent in it.
 - `:deps` — the libraries the tree requires. The digests a resolution produced
   live in `bl.lock`, not here, so the declaration cannot disagree with itself.

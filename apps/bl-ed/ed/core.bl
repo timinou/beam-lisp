@@ -1,0 +1,275 @@
+; ed/core.bl — editor state and the operations every command is built from.
+;
+; The whole editor is ONE value:
+;
+;   {:text      ed.text text                 the document
+;    :sels      [{:anchor p :head p}…]       Helix selections, never empty
+;    :primary   i                            index of the primary selection
+;    :mode      :normal|:insert|:select|:command|:palette
+;    :pending   [key…]                        a key sequence in progress ("g", "m i")
+;    :count     n|nil                         numeric prefix ("3w")
+;    :struct    {:blocks :outline}            derived from :text (ed.org)
+;    :forms     {cell-from-row forest}        derived, per beam-lisp cell (ed.forms)
+;    :history   {:past [snap…] :future [snap…]}   snapshots = {:text :sels}
+;    :registers {"\"" [strings…]}             yank registers (one string per selection)
+;    :message   s|nil                          the echo area
+;    :minibuf   {:prompt :text :on-submit}   while :mode is :command/:palette
+;    :path      s  :rev n  :saved-text text   the file; dirty = (dirty? ed),
+;                                            derived, never stored
+;    :view      {:top row :height rows}       scroll window, set by the host
+;    :effects   [effect…]}                    for the host to perform, then cleared
+;
+; Every function here is pure: state in, state out. The host renders and
+; feeds events; it never mutates.
+
+(ns ed.core
+  (:require [ed.text :as t]
+            [ed.org :as org]
+            [ed.forms :as forms]))
+
+; ─── construction ───────────────────────────────────────────────────────────
+
+(defn- cell-forests
+  "A forest per beam-lisp cell, keyed by the cell's :from row."
+  [lines bs]
+  (reduce (fn [m b]
+            (if (= :cell (:kind b))
+              (assoc m (:from b) (forms/read-forms lines (:code-from b) (:code-to b)))
+              m))
+          {} bs))
+
+(defn derive-structure
+  "Recompute everything derived from the text, from scratch: the org span
+   partition and outline, and one form forest per beam-lisp cell."
+  [ed]
+  (let [lines (:lines (:text ed))
+        s (org/structure lines)]
+    (assoc ed :struct s :forms (cell-forests lines (:blocks s)))))
+
+(defn- structural-line?
+  "Can editing this line change the org partition? Headings, #+ keyword and
+   block lines, and the blank/non-blank status that ends a results body do;
+   any other prose or code line does not."
+  [l]
+  (let [t (triml l)]
+    (or (blank? t) (starts-with? t "*") (starts-with? t "#"))))
+
+(defn rederive-after-edit
+  "Re-derive structure after an edit that touched rows [r1, r2] of the OLD
+   text and left `delta` more rows than before. The common case — typing
+   inside one prose or code line — changes no line's structural class, so
+   the partition is SHIFTED, not recomputed, and only the cell containing the
+   edit re-reads its forms. Anything else (a heading, a fence, a line count
+   change near a block boundary) falls back to the full derive."
+  [ed old-lines r1 r2 delta]
+  (let [lines (:lines (:text ed))
+        same-shape? (and (= delta 0) (= r1 r2)
+                         (not (structural-line? (nth old-lines r1 "")))
+                         (not (structural-line? (nth lines r1 ""))))]
+    (if (not same-shape?)
+      (derive-structure ed)
+      (let [b (org/block-at (:blocks (:struct ed)) r1)]
+        (if (and (some? b) (= :cell (:kind b)))
+          (assoc-in ed [:forms (:from b)] (forms/read-forms lines (:code-from b) (:code-to b)))
+          ed)))))
+
+(defn dirty?
+  "Does the text differ from the text as loaded or last saved? Derived:
+   undoing back to the saved text makes the file clean again. Persistent
+   vectors share structure, so the common unchanged case is an identity
+   comparison of the line vector."
+  [ed]
+  (let [a (:lines (:text ed)) b (:lines (:saved-text ed))]
+    (not (or (identical? a b) (= a b)))))
+
+(defn new-editor
+  "A fresh editor on string `s` from file `path`."
+  [s path]
+  (derive-structure
+    {:text (t/from-string s) :saved-text (t/from-string s) :sels [{:anchor [0 0] :head [0 0]}] :primary 0
+     :mode :normal :pending [] :count nil
+     :history {:past [] :future []} :registers {} :message nil :minibuf nil
+     :path path :rev 0
+     :view {:top 0 :height 40} :effects []}))
+
+(defn primary [ed] (nth (:sels ed) (:primary ed)))
+(defn cursor [ed] (:head (primary ed)))
+(defn lines [ed] (:lines (:text ed)))
+
+(defn message [ed s] (assoc ed :message s))
+(defn effect [ed e] (update ed :effects conj e))
+
+; ─── selections ─────────────────────────────────────────────────────────────
+
+(defn sel-range
+  "The [from to) a selection covers. Helix selections are INCLUSIVE of the
+   character under the head, so the range ends one grapheme past the later
+   end (clamped at the text end)."
+  [ed {:keys [anchor head]}]
+  (let [a (t/pos-min anchor head) b (t/pos-max anchor head)]
+    [a (or (t/next-pos (:text ed) b) b)]))
+
+(defn map-sels
+  "Apply `f` (sel → sel) to every selection, then clamp them to the text."
+  [ed f]
+  (let [tx (:text ed)]
+    (assoc ed :sels (mapv (fn [s] (let [s2 (f s)] {:anchor (t/clamp tx (:anchor s2)) :head (t/clamp tx (:head s2))}))
+                          (:sels ed)))))
+
+(defn collapse [ed] (map-sels ed (fn [s] {:anchor (:head s) :head (:head s)})))
+
+(defn move-heads
+  "Move every selection's head by `step` (text, pos → pos). With `extend?`
+   the anchor stays (select mode); otherwise it follows (normal mode moves a
+   one-grapheme selection)."
+  [ed step extend?]
+  (map-sels ed (fn [s]
+                 (let [h (or (step (:text ed) (:head s)) (:head s))]
+                   {:anchor (if extend? (:anchor s) h) :head h}))))
+
+(defn merge-overlapping
+  "Merge selections that overlap or touch, keeping order; the primary follows
+   the selection that absorbed it."
+  [ed]
+  (let [indexed (sort-by (fn [[_ s]] (t/pos-min (:anchor s) (:head s))) (map-indexed (fn [i x] [i x]) (:sels ed)))
+        merged (reduce (fn [acc [i s]]
+                         (let [prev (peek acc)]
+                           (if (and (some? prev)
+                                    (t/pos<= (t/pos-min (:anchor s) (:head s)) (t/pos-max (:anchor (:sel prev)) (:head (:sel prev)))))
+                             (conj (pop acc) {:sel {:anchor (t/pos-min (:anchor (:sel prev)) (t/pos-min (:anchor s) (:head s)))
+                                                    :head (t/pos-max (:head (:sel prev)) (t/pos-max (:anchor s) (:head s)))}
+                                              :ids (conj (:ids prev) i)})
+                             (conj acc {:sel s :ids [i]}))))
+                       [] indexed)
+        primary (or (some (fn [[k m]] (if (some (fn [i] (= i (:primary ed))) (:ids m)) k nil))
+                          (map-indexed (fn [i x] [i x]) merged))
+                    0)]
+    (assoc ed :sels (mapv :sel merged) :primary primary)))
+
+; ─── edits ──────────────────────────────────────────────────────────────────
+;
+; An edit is a list of [from to replacement] over the CURRENT text, one per
+; selection. They are applied last-to-first so earlier positions stay valid,
+; and every selection is shifted through every later-applied edit.
+
+(defn snapshot [ed] {:text (:text ed) :sels (:sels ed) :primary (:primary ed)})
+
+(defn push-history
+  "Record the state before an edit. Consecutive inserts in one insert-mode
+   session coalesce into one undo step (`:coalesce` key)."
+  [ed k]
+  (if (and (some? k) (= k (:last-edit ed)))
+    ed
+    (-> ed
+        (update-in [:history :past] conj (snapshot ed))
+        (assoc-in [:history :future] [])
+        (assoc :last-edit k))))
+
+(defn apply-edits
+  "Apply `edits` ([[from to s] …], any order, non-overlapping) to the text.
+   Returns the editor with text replaced, selections shifted, structure
+   re-derived, history recorded. `sel-of` (edit-index, end-pos → sel) decides
+   where each edit's selection ends up."
+  [ed edits sel-of coalesce]
+  (let [ed (push-history ed coalesce)
+        order (sort-by (fn [[i _]] (first (nth edits i))) (fn [a b] (t/pos< b a)) (map-indexed (fn [i x] [i x]) edits))
+        result (reduce (fn [acc [i [a b s]]]
+                         (let [{:keys [text end]} (t/replace-range (:text acc) a b s)
+                               ; shift every END already recorded for edits that come LATER in the text
+                               ends (into {} (map (fn [[j e]] [j (t/shift-pos e a b end)]) (:ends acc)))]
+                           {:text text :ends (assoc ends i end)}))
+                       {:text (:text ed) :ends {}}
+                       order)
+        sels (vec (map-indexed (fn [i _] (sel-of i (get (:ends result) i))) edits))
+        old-lines (:lines (:text ed))
+        ; the rows the edits span in the OLD text, and the change in line count
+        r1 (reduce min (map (fn [[a b _]] (first (t/pos-min a b))) edits))
+        r2 (reduce max (map (fn [[a b _]] (first (t/pos-max a b))) edits))
+        delta (- (count (:lines (:text result))) (count old-lines))]
+    (-> ed
+        (assoc :text (:text result) :sels sels :rev (inc (:rev ed)))
+        (rederive-after-edit old-lines r1 r2 delta)
+        merge-overlapping)))
+
+(defn replace-selections
+  "Replace each selection's range with `(f selected-text i)`; selections end
+   collapsed after the inserted text."
+  [ed f coalesce]
+  (let [edits (vec (map-indexed (fn [i s] (let [[a b] (sel-range ed s)] [a b (f (t/slice (:text ed) a b) i)])) (:sels ed)))]
+    (apply-edits ed edits (fn [_ end] {:anchor end :head end}) coalesce)))
+
+(defn insert-at-heads
+  "Type string `s` at every selection head (insert mode)."
+  [ed s]
+  (let [edits (mapv (fn [sel] [(:head sel) (:head sel) s]) (:sels ed))]
+    (apply-edits ed edits (fn [_ end] {:anchor end :head end}) :insert)))
+
+(defn delete-before-heads
+  "Backspace at every head."
+  [ed]
+  (let [tx (:text ed)
+        edits (vec (keep (fn [sel] (let [p (t/prev-pos tx (:head sel))] (if (nil? p) nil [p (:head sel) ""]))) (:sels ed)))]
+    (if (empty? edits) ed (apply-edits ed edits (fn [i end] {:anchor end :head end}) :insert))))
+
+; ─── undo / redo ────────────────────────────────────────────────────────────
+
+(defn- restore [ed snap]
+  (derive-structure (assoc ed :text (:text snap) :sels (:sels snap) :primary (:primary snap)
+                           :rev (inc (:rev ed)))))
+
+(defn undo [ed]
+  (let [past (get-in ed [:history :past])]
+    (if (empty? past)
+      (message ed "Already at the oldest change")
+      (-> (restore ed (peek past))
+          (assoc-in [:history :past] (pop past))
+          (update-in [:history :future] conj (snapshot ed))
+          (assoc :last-edit nil)))))
+
+(defn redo [ed]
+  (let [fut (get-in ed [:history :future])]
+    (if (empty? fut)
+      (message ed "Already at the newest change")
+      (-> (restore ed (peek fut))
+          (assoc-in [:history :future] (pop fut))
+          (update-in [:history :past] conj (snapshot ed))
+          (assoc :last-edit nil)))))
+
+; ─── structure queries at the cursor ────────────────────────────────────────
+
+(defn block-at-cursor [ed]
+  (org/block-at (:blocks (:struct ed)) (first (cursor ed))))
+
+(defn forest-at-cursor
+  "{:cell span :forest forest} for the beam-lisp cell the cursor is in, or nil."
+  [ed]
+  (let [b (block-at-cursor ed)]
+    (if (and (some? b) (= :cell (:kind b)))
+      {:cell b :forest (get (:forms ed) (:from b))}
+      nil)))
+
+; ─── viewport ───────────────────────────────────────────────────────────────
+
+(defn scroll-to-cursor
+  "Keep the primary head inside the view with a 3-line margin."
+  [ed]
+  (let [r (first (cursor ed))
+        {:keys [top height]} (:view ed)
+        margin (min 3 (quot height 4))
+        top (cond (< r (+ top margin)) (max 0 (- r margin))
+                  (>= r (- (+ top height) margin)) (+ (- r height) margin 1)
+                  :else top)]
+    (assoc-in ed [:view :top] (max 0 top))))
+
+
+(defn replace-text
+  "Take `s` as the whole new text in ONE undoable edit that keeps the cursor,
+   the history, the folds and the session state — how a result written by an
+   evaluation (in the page or on the BEAM) enters the document."
+  [ed s]
+  (if (= s (t/to-string (:text ed)))
+    ed
+    (let [p (:head (primary ed))
+          ed2 (apply-edits ed [[[0 0] (t/doc-end (:text ed)) s]] (fn [_ end] {:anchor end :head end}) nil)
+          q (t/clamp (:text ed2) p)]
+      (scroll-to-cursor (assoc ed2 :sels [{:anchor q :head q}] :primary 0)))))

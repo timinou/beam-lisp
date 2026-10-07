@@ -2,7 +2,7 @@
 
 `bl doctor` answers the first question a machine raises: what can this host
 actually do? A native tier that is absent, a solver binary that is missing, a
-daemon that is not running — each is a fact about the environment,
+realm that is not open — each is a fact about the environment,
 not a defect in the program about to run. The command collects those facts in
 one place, so a user learns them from the tool instead of from a stack trace.
 
@@ -19,7 +19,17 @@ still exits 0.
 
 ```beam-lisp
 (ns bl.doctor
-  (:require [bl.util :as u] [vm.client] [model] [vm.image :as image]))
+  (:require [bl.util :as u] [vm.client] [model] [vm.image :as image] [bl.gateway] [bl.json]
+            ;; `z3` is REQUIRED, not merely named in the probe body. A qualified
+            ;; call to a namespace the header does not require sits outside this
+            ;; namespace's require closure, so the loader's readiness guard
+            ;; (`Loader/ensure_ready`) has nothing to initialize and the call
+            ;; reaches the AOT module directly — measured from a cache-warm
+            ;; `bl doctor` as `undefined var: z3pool/z3-keeper`, a stale `z3pool`
+            ;; beam whose top-level value defs were never interned, while a
+            ;; cache-cold run (every namespace interpreted) passed and a direct
+            ;; `(z3/check (z3/open) …)` in the same VM passed too.
+            [z3]))
 ```
 
 ## A probe never crashes
@@ -74,16 +84,17 @@ small function of its own. `:required` marks the two that must pass.
 ## The probes
 
 The probes read in dependency order: the runtime, the loader's view of the
-disk, the native tiers, the solver, the GUI backend, the daemon, the embedding
+disk, the native tiers, the solver, the GUI backend, the realm, the embedding
 weights, then the checkout's own markers.
 
 `--code-path` directories matter because Mix prunes the VM code path when the
 project loads; `code/get_path` is the honest count of what a program can
 actually load. `search-paths` is the loader's own list of extra roots.
 
-The daemon probe asks the tree's socket whether a warm VM answers for this
-checkout. A daemon that is not running is the normal state of a standalone
-invocation, so it reports `not running` and changes nothing.
+The realm probe asks the tree's socket whether the VM that serves it is up
+(`vm.client/probe`, the same read the launcher's fast path and `bl realm
+start`'s guard use). A realm that is not open is the normal state of a standalone
+invocation, so it reports `not open` and changes nothing.
 
 ```beam-lisp
 (defn probes
@@ -139,12 +150,25 @@ invocation, so it reports `not running` and changes nothing.
      (fn [] (let [ok? (native-tier "(wry/available?)")]
               {:ok ok? :detail (native-line ok?)})))
 
-   (probe "daemon" false
+   (probe "realm" false
      (fn []
        (let [r (vm.client/probe (BeamLisp/cwd))]
          (if (contains? r :ok)
-           {:ok true :detail "running (warm VM for this tree)"}
-           {:ok false :detail (str "not running (" (pr-str (:error r)) ")")}))))
+           {:ok true :detail "open (a warm VM answers for this tree)"}
+           {:ok false :detail (str "not open (" (pr-str (:error r)) ")")}))))
+
+   ;; An installed unit is text a release cannot rewrite. One written by an earlier
+   ;; installer runs a command that no longer exists, so systemd starts nothing at
+   ;; the next login — and nothing would say so until the names stopped answering.
+   (probe "gateway unit" false
+     (fn []
+       (case (bl.gateway/unit-state)
+         :absent  {:ok true :detail "not installed"}
+         :current {:ok true :detail "installed"}
+         :other   {:ok true :detail "installed (edited by hand; not checked)"}
+         :retired {:ok false
+                   :detail (str "runs a command that no longer exists, so it will not start at login"
+                                " — `bl install gateway` rewrites it")})))
 
    (probe "src/" false
      (fn [] (let [ok? (File/dir? (u/resolve "src"))]

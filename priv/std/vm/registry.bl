@@ -1,0 +1,248 @@
+; vm/registry.bl — one record per running bl VM: the machine's truth about itself.
+;
+; ══ THE PROBLEM THIS SOLVES ═════════════════════════════════════════════════
+;
+; A VM used to be described by four unrelated file families under the runtime
+; dir — `.sock`, `.token`, `.meta`, `.pid` — and a fifth thing, the port claim,
+; described the same VM again. They disagree: a crashed VM left a `.sock` with no
+; listener, a clean stop removed three of four files, and only a `/proc` scan
+; could say which pid was a bl node at all. "What is running on this machine?"
+; had no single answer, so nothing could list it, and nothing could stop it.
+;
+; ══ THE RECORD ══════════════════════════════════════════════════════════════
+;
+; One file per VM, `<runtime>/vms/<id>.rec`, holding ONE term:
+;
+;   {:id      "a238fa91-4821"     build + os pid: unique for the life of the VM
+;    :role    :warm | :gateway | :job
+;    :build   "a238fa91"          which code; "src" for a source checkout
+;    :pid     4821                the OS pid
+;    :ticks   129411400           /proc/<pid>/stat field 22: when the pid began
+;    :started 1790000000          wall seconds
+;    :label   "blueprint"         a human word: what this VM is for (optional)
+;    :log     "/…/vm.log"         where its stdout/stderr go, if anyone captured it}
+;
+; Everything that CHANGES (memory, realms, uptime) is read live; the record holds
+; only what is true for the VM's whole life, so it is written once and never
+; rewritten — there is no "update" to race.
+;
+; ══ LIVENESS: A PID IS NOT ENOUGH ═══════════════════════════════════════════
+;
+; "The file is there" proves nothing, and "the pid is alive" proves less: a
+; machine that has been up for a week reuses pids, so a record can name a pid a
+; different program now owns. `:ticks` closes that — the kernel's start time for
+; a pid never repeats for a different process — so a record is LIVE exactly when
+; the pid exists AND began when the record says it did. Where /proc is absent the
+; record is respected rather than swept: refusing to clean up is recoverable,
+; stopping the wrong process is not.
+;
+;   (registry/publish! role opts)  → {:ok record}   this VM becomes visible
+;   (registry/retract! record)     → :ok            a clean stop leaves nothing
+;   (registry/all)                 → [record …]     live records, oldest first
+;   (registry/stale)               → [record …]     records whose VM is gone
+;   (registry/live? record)        → true | false
+;   (registry/memory-kb record)    → n | nil        resident set, read live
+;   (registry/sweep!)              → n              stale records removed
+
+(ns vm.registry
+  (:require [vm.paths :as paths]))
+
+(def DIR-NAME "vms")
+
+(defn- os-pid []
+  (erlang/list_to_integer (erlang/apply :os :getpid (list))))
+
+(defn- ensure-dir
+  "The registry directory, created 0700 beside the other runtime files.
+   {:ok dir} | {:error reason}."
+  []
+  (let [rd (paths/runtime-dir)]
+    (if (contains? rd :ok)
+      (let [dir (str (:ok rd) "/" DIR-NAME)]
+        (File/mkdir_p! dir)
+        (File/chmod dir 448)
+        {:ok dir})
+      rd)))
+
+;; ── reading the kernel ──────────────────────────────────────────────────────
+
+(defn- stat-fields
+  "The fields of /proc/<pid>/stat AFTER the command name, or nil. The name is
+   parenthesised and may itself contain spaces and parentheses, so the split is
+   on the LAST `) ` — the only reliable anchor in that file."
+  [pid]
+  (let [r (try (File/read! (str "/proc/" pid "/stat")) (catch e nil))]
+    (if (erlang/is_binary r)
+      (let [parts (erlang/apply :binary :split (list r ") " (to-list [:global])))
+            tail (erlang/apply :lists :last (list parts))]
+        (to-list (erlang/apply :binary :split (list tail " " (to-list [:global])))))
+      nil)))
+
+(defn start-ticks
+  "The kernel's start time for `pid`, in clock ticks since boot — field 22 of
+   /proc/<pid>/stat — or nil when the pid is gone or /proc is not there. After
+   the command name the first field is `state` (field 3), so field 22 is index
+   19."
+  [pid]
+  (let [f (stat-fields pid)]
+    (if (and f (> (count f) 19))
+      (try (erlang/binary_to_integer (nth f 19)) (catch e nil))
+      nil)))
+
+(defn capture
+  "The first capture group of `pattern` in `text`, as a binary, or nil. Erlang's
+   `:re` directly: the `re-*` forms are not in scope inside `vm.*` namespaces, and
+   this is the one place the machine's /proc parsing needs a regex."
+  [text pattern]
+  (let [m (erlang/apply :re :run
+            (list text pattern (to-list [(tuple :capture (to-list [1]) :binary)])))]
+    (if (and (erlang/is_tuple m) (= :match (elem m 0)))
+      (first (elem m 1))
+      nil)))
+
+(defn- status-kb [s field]
+  (let [v (capture s (str field ":\\s+(\\d+) kB"))]
+    (if v (erlang/binary_to_integer v) 0)))
+
+(defn memory-kb
+  "What the VM actually holds, in KiB: resident PLUS swapped, read live from /proc,
+   or nil. Resident alone lies on a machine with compressed swap — a VM idle for
+   hours can show 8 MB resident while 230 MB of it sits in zram, and a listing that
+   says '8M' tells a person it is free to keep. Swapped memory is still the VM's."
+  [record]
+  (let [s (try (File/read! (str "/proc/" (:pid record) "/status")) (catch e nil))]
+    (if (erlang/is_binary s)
+      (+ (status-kb s "VmRSS") (status-kb s "VmSwap"))
+      nil)))
+
+(defn live?
+  "Whether `record` names a VM that is still running: the pid exists AND, when the
+   record carries start ticks, began when the record says. A row adopted from an
+   old file has no ticks (nil, or 0 where /proc was unreadable), and for those
+   the pid existing is all there is to check. With no /proc the record is
+   respected (see above)."
+  [record]
+  (let [pid (:pid record)
+        ticks (:ticks record)]
+    (cond
+      (not (erlang/is_integer pid)) false
+      (= pid (os-pid)) true
+      (not (File/dir? "/proc")) true
+      (not (File/dir? (str "/proc/" pid))) false
+      (or (nil? ticks) (= 0 ticks)) true
+      :else (= (start-ticks pid) ticks))))
+
+;; ── the record on disk ──────────────────────────────────────────────────────
+
+(defn- safe-id [s]
+  (erlang/apply :re :replace
+    (list (str s) "[^A-Za-z0-9_-]" "_" (to-list [:global (tuple :return :binary)]))))
+
+(defn- file-of [dir id] (str dir "/" (safe-id id) ".rec"))
+
+(defn- shaped?
+  "A record is a map with the identity fields. Anything else on disk — a torn
+   write, a foreign term — is not one, and is swept."
+  [t]
+  (and (map? t)
+       (erlang/is_binary (:id t))
+       (erlang/is_integer (:pid t))
+       (contains? t :build)
+       (contains? t :role)))
+
+(defn- read-record [path]
+  (let [r (try (File/read! path) (catch e nil))]
+    (if (erlang/is_binary r)
+      ;; Our own write, trusted for atoms — but gated on SHAPE, as vm.ports
+      ;; does: a thrown read must not silently empty the machine's inventory.
+      (let [t (try (erlang/binary_to_term r) (catch e nil))]
+        (if (shaped? t) t nil))
+      nil)))
+
+(defn- write-record!
+  "term_to_binary → 0600 tmp → rename, so a reader never sees half a record."
+  [dir record]
+  (let [path (file-of dir (:id record))
+        tmp (str path ".tmp." (erlang/apply :erlang :unique_integer (list (to-list [:positive]))))]
+    (File/write! tmp (erlang/term_to_binary record))
+    (File/chmod tmp 384)
+    (let [r (erlang/apply :file :rename (list (erlang/binary_to_list tmp) (erlang/binary_to_list path)))]
+      (if (= :ok r) :ok (do (File/rm tmp) {:error (tuple :write_record r)})))))
+
+(defn publish!
+  "Make THIS VM visible to the machine. `role` is :warm, :gateway or :job; `opts`
+   may carry :label and :log. Idempotent: a second publish from the same pid
+   rewrites the same record. {:ok record} | {:error reason}."
+  ([role] (publish! role {}))
+  ([role opts]
+   (let [d (ensure-dir)]
+     (if (not (contains? d :ok))
+       d
+       (let [pid (os-pid)
+             build (paths/build-id)
+             record {:id (str build "-" pid)
+                     :role role
+                     :build build
+                     :pid pid
+                     :ticks (or (start-ticks pid) 0)
+                     :started (erlang/system_time :second)
+                     :label (get opts :label)
+                     :log (get opts :log)}
+             w (write-record! (:ok d) record)]
+         (if (= :ok w) {:ok record} w))))))
+
+(defn retract!
+  "Remove `record` — a clean stop leaves nothing behind. Idempotent."
+  [record]
+  (let [d (ensure-dir)]
+    (when (contains? d :ok)
+      (File/rm (file-of (:ok d) (:id record))))
+    :ok))
+
+;; ── reading the machine ─────────────────────────────────────────────────────
+
+(defn- read-all
+  "Every record on disk, with the file it came from: [{:file :record}]. Files that
+   are not records are returned with :record nil so a caller can sweep them."
+  []
+  (let [d (ensure-dir)]
+    (if (not (contains? d :ok))
+      (to-list [])
+      (let [dir (:ok d)
+            lr (erlang/apply :file :list_dir (list (erlang/binary_to_list dir)))]
+        (if (= :ok (elem lr 0))
+          (to-list
+            (keep (fn [nm]
+                    (let [name (erlang/list_to_binary nm)]
+                      ;; temp files from a write in flight are not records yet
+                      (if (String/ends_with? name ".rec")
+                        (let [file (str dir "/" name)]
+                          {:file file :record (read-record file)})
+                        nil)))
+                  (sort (elem lr 1))))
+          (to-list []))))))
+
+(defn all
+  "Every LIVE record, oldest first. A stale record is not returned — and not
+   removed: reading must never mutate, so `bl vm prune --dry-run` can be honest.
+   `sweep!` is the one place records are deleted for being dead."
+  []
+  (to-list
+    (sort-by (fn [r] (:started r))
+             (filter (fn [r] (and r (live? r)))
+                     (map (fn [e] (:record e)) (read-all))))))
+
+(defn stale
+  "Records on disk whose VM is gone, plus files that are not records at all, as
+   [{:file :record}] — what `sweep!` would remove."
+  []
+  (to-list
+    (filter (fn [e] (or (nil? (:record e)) (not (live? (:record e)))))
+            (read-all))))
+
+(defn sweep!
+  "Remove every stale record. Returns how many files went."
+  []
+  (let [dead (stale)]
+    (doseq [e dead] (File/rm (:file e)))
+    (count dead)))

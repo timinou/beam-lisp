@@ -150,7 +150,7 @@ and referenced everywhere.
   The contract is not aspirational: P10 checked the whole datom closure
   — 31 files, 5,789 evidence entries — and reported *zero* warnings
   after three checker bugs it exposed were fixed at their roots
-  (research/p10_scale). The false-positive rate on real code is the
+  (research/archive/p10_scale). The false-positive rate on real code is the
   design's most guarded number.
 ]
 
@@ -236,7 +236,7 @@ quoted rule:
 #verified[
   P3 checked 204 lines of guard-heavy code and a destructuring corpus
   with *zero warnings, hand-audited* (audit table in
-  research/p3_guards/README.md). A synthetic dead clause — a second
+  research/archive/p3_guards/README.md). A synthetic dead clause — a second
   `pos?` branch after an exhaustive first — warns
   `clause unreachable` at its exact position. The audit, not the count,
   is the evidence: zero warnings is only good news when a human agrees
@@ -545,7 +545,7 @@ answer is a split:
   rewrite's: the code navs are selection-only by design.],
 )
 
-The navs live in `research/p12_optics/` with a graduation plan item:
+The navs live in `research/archive/p12_optics/` with a graduation plan item:
 first consumer is termination's `find-recurs`, when it next changes.
 
 = Tradeoffs: what this design gives up

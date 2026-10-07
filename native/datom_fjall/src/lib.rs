@@ -62,6 +62,7 @@ mod atoms {
         delete,
         columns,
         datoms,
+        datoms_reverse = "datoms-reverse",
         pairs,
         // The boolean lane's decoded terms. The trailing underscore is a Rust
         // keyword accident, not part of the atom: without the alias rustler
@@ -570,6 +571,81 @@ struct Row<'a> {
     legacy: Option<&'a [u8]>,
 }
 
+/// Admission only, not a second decoder. Recognize finite uncompressed ETF
+/// before calling the existing BEAM decoder. The bounded envelope helper first
+/// charges and normalizes compression. Functions, references, ports and pids
+/// have no certificate here. This term-tree walk allocates no payload.
+/// https://www.erlang.org/doc/apps/erts/erl_ext_dist.html
+fn finite_etf_charge(bytes: &[u8]) -> Option<usize> {
+    struct Check<'a> { bytes: &'a [u8], pos: usize }
+    impl Check<'_> {
+        fn take(&mut self, n: usize) -> Option<&[u8]> {
+            let end = self.pos.checked_add(n)?;
+            let out = self.bytes.get(self.pos..end)?;
+            self.pos = end;
+            Some(out)
+        }
+        fn byte(&mut self) -> Option<u8> { Some(self.take(1)?[0]) }
+        fn u16(&mut self) -> Option<usize> {
+            Some(u16::from_be_bytes(self.take(2)?.try_into().ok()?) as usize)
+        }
+        fn u32(&mut self) -> Option<usize> {
+            Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?) as usize)
+        }
+        fn terms(&mut self, n: usize, depth: usize) -> Option<()> {
+            // Even NIL uses one byte. A hostile arity cannot create a long loop.
+            if n > self.bytes.len().checked_sub(self.pos)? { return None; }
+            for _ in 0..n { self.term(depth + 1)?; }
+            Some(())
+        }
+        fn term(&mut self, depth: usize) -> Option<()> {
+            if depth > 128 { return None; }
+            match self.byte()? {
+                97 => { self.take(1)?; }                  // SMALL_INTEGER_EXT
+                98 => { self.take(4)?; }                  // INTEGER_EXT
+                70 => { self.take(8)?; }                  // NEW_FLOAT_EXT
+                99 => { self.take(31)?; }                 // FLOAT_EXT
+                106 => {}                                // NIL_EXT
+                100 | 118 | 107 => {                      // atom / utf8 / string
+                    let n = self.u16()?; self.take(n)?;
+                }
+                115 | 119 => {
+                    let n = self.byte()? as usize; self.take(n)?;
+                }
+                109 => { let n = self.u32()?; self.take(n)?; }
+                77 => {                                  // BIT_BINARY_EXT
+                    let n = self.u32()?; let bits = self.byte()?;
+                    if !(1..=8).contains(&bits) { return None; }
+                    self.take(n)?;
+                }
+                104 => { let n = self.byte()? as usize; self.terms(n, depth)?; }
+                105 => { let n = self.u32()?; self.terms(n, depth)?; }
+                116 => { let n = self.u32()?.checked_mul(2)?; self.terms(n, depth)?; }
+                108 => {
+                    let n = self.u32()?; self.terms(n, depth)?;
+                    self.term(depth + 1)?;                // proper or finite tail
+                }
+                110 | 111 => {
+                    let tag = self.bytes[self.pos - 1];
+                    let n = if tag == 110 { self.byte()? as usize } else { self.u32()? };
+                    if self.byte()? > 1 { return None; }
+                    self.take(n)?;
+                }
+                _ => return None,
+            }
+            Some(())
+        }
+    }
+    let mut check = Check { bytes, pos: 0 };
+    if check.byte()? != ETF_VERSION { return None; }
+    check.term(0)?;
+    if check.pos != bytes.len() { return None; }
+    // At least one tag per node; 64x conservatively covers list cells, map/tuple
+    // metadata, boxed numbers and retained input bytes. Fixed row overhead is
+    // charged separately. The byte budget is checked before BEAM allocation.
+    bytes.len().checked_mul(64)
+}
+
 /// Read the datom payload at `val` into its fields by offset.
 ///
 /// Every malformed shape is an ERROR naming the reason: a store that holds an
@@ -697,8 +773,60 @@ impl VectorShape {
 /// exactly like this, so reading a store has always created its atoms: this is
 /// parity with the existing path, not a new exposure. The bytes come from our
 /// own value slot, under our own key space, written by our own writer.
+fn inflate_stored_etf(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    if bytes.len() < 6 || bytes[..2] != [ETF_VERSION, 80] {
+        return Err("invalid compressed ETF header".into());
+    }
+    let size = u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize;
+    let mut inflater = flate2::bufread::ZlibDecoder::new(&bytes[6..]);
+    let mut out = Vec::with_capacity(size.min(65536).saturating_add(1));
+    out.push(ETF_VERSION);
+    // A corrupt length never causes an upfront giant allocation or permits
+    // expansion past its header. This path has the existing trusted-reader
+    // contract; bounded pages still refuse compression before calling it.
+    inflater.by_ref().take(size as u64 + 1).read_to_end(&mut out)
+        .map_err(|e| format!("invalid compressed ETF: {}", e))?;
+    if out.len() != size + 1 || inflater.total_in() as usize != bytes.len() - 6 {
+        return Err("compressed ETF length or stream boundary mismatch".into());
+    }
+    Ok(out)
+}
+
+#[derive(Debug, PartialEq)]
+enum BoundedEtf<'a> {
+    Admitted { charge: usize, payload: std::borrow::Cow<'a, [u8]> },
+    Limited,
+    Opaque,
+}
+
+/// Charge advertised expansion before inflation. Then prove the resulting
+/// finite term tree before any BEAM decode. The normal input remains borrowed.
+fn bounded_finite_etf(bytes: &[u8], available: usize) -> Result<BoundedEtf<'_>, String> {
+    let compressed = bytes.starts_with(&[ETF_VERSION, 80]);
+    let size = if compressed {
+        if bytes.len() < 6 { return Ok(BoundedEtf::Opaque); }
+        (u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize).checked_add(1)
+    } else { Some(bytes.len()) };
+    let Some(charge) = size.and_then(|n| n.checked_mul(64)) else {
+        return Ok(BoundedEtf::Opaque);
+    };
+    if charge > available { return Ok(BoundedEtf::Limited); }
+    let payload = if compressed {
+        std::borrow::Cow::Owned(inflate_stored_etf(bytes)?)
+    } else { std::borrow::Cow::Borrowed(bytes) };
+    if finite_etf_charge(&payload).is_none() { return Ok(BoundedEtf::Opaque); }
+    Ok(BoundedEtf::Admitted { charge, payload })
+}
+
 fn decode_stored<'a>(env: Env<'a>, bytes: &[u8], what: &str) -> NifResult<Term<'a>> {
-    unsafe { env.binary_to_term_trusted(bytes) }
+    // The NIF decoder does not accept this compressed form on the deployed
+    // runtime. Normalize its envelope, then use the very same term decoder.
+    let inflated = if bytes.starts_with(&[ETF_VERSION, 80]) {
+        Some(inflate_stored_etf(bytes).map_err(|e| err(format!("{}: {}", what, e)))?)
+    } else { None };
+    let payload = inflated.as_deref().unwrap_or(bytes);
+    unsafe { env.binary_to_term_trusted(payload) }
         .map(|(term, _)| term)
         .ok_or_else(|| err(format!("{} did not decode", what)))
 }
@@ -920,20 +1048,29 @@ fn fjall_resolve_chunk<'a>(
     after: Option<Binary>,
     stop: Option<Binary>,
     limit: usize,
-    mode: Atom,
+    mode: Term<'a>,
 ) -> NifResult<Term<'a>> {
     use std::ops::Bound;
+    let (mode, byte_budget) = match mode.decode::<Atom>() {
+        Ok(atom) => (atom, None),
+        Err(_) => {
+            let (atom, budget) = mode.decode::<(Atom, usize)>()?;
+            (atom, Some(budget))
+        }
+    };
+    let reverse = mode == atoms::datoms_reverse();
     let lower = match (&start, &after) {
         (Some(b), _) => Bound::Included(b.as_slice().to_vec()),
-        (None, Some(b)) => Bound::Excluded(b.as_slice().to_vec()),
-        (None, None) => Bound::Unbounded,
+        (None, Some(b)) if !reverse => Bound::Excluded(b.as_slice().to_vec()),
+        _ => Bound::Unbounded,
     };
-    let upper = match &stop {
-        Some(b) => Bound::Included(b.as_slice().to_vec()),
-        None => Bound::Unbounded,
+    let upper = match (reverse, &after, &stop) {
+        (true, Some(b), _) => Bound::Excluded(b.as_slice().to_vec()),
+        (_, _, Some(b)) => Bound::Included(b.as_slice().to_vec()),
+        _ => Bound::Unbounded,
     };
     let want_columns = mode == atoms::columns();
-    let want_datoms = mode == atoms::datoms();
+    let want_datoms = mode == atoms::datoms() || reverse;
     let want_pairs = mode == atoms::pairs();
     if !want_columns && !want_datoms && !want_pairs {
         return Err(err("resolve mode must be :datoms, :columns or :pairs"));
@@ -944,18 +1081,68 @@ fn fjall_resolve_chunk<'a>(
     let mut cols = Columns::new();
     let mut last_key: Option<Vec<u8>> = None;
     let shape = VectorShape::new(env)?;
+    let mut charged_bytes = 0usize;
+    let mut byte_limited = false;
+    let mut opaque_value = false;
 
-    for entry in handle.datoms.range((lower, upper)).take(limit) {
+    let range = handle.datoms.range((lower, upper));
+    let entries: Box<dyn Iterator<Item = _>> = if reverse {
+        Box::new(range.rev())
+    } else {
+        Box::new(range)
+    };
+    for entry in entries.take(limit) {
         let (k, v) = entry.map_err(|e| err(e))?;
+        let mut normalized_storage: Option<Vec<u8>> = None;
+        if let Some(budget) = byte_budget {
+            let row = read_row(&v)?;
+            let etf = row.legacy.or_else(|| {
+                if row.v.first() == Some(&LANE_ESC) { Some(&row.v[1..]) } else { None }
+            });
+            let base = 1024usize.saturating_add(k.len()).saturating_add(v.len());
+            let available = budget.saturating_sub(charged_bytes);
+            if base > available {
+                byte_limited = true;
+                break;
+            }
+            let extra = if let Some(bytes) = etf {
+                match bounded_finite_etf(bytes, available - base).map_err(err)? {
+                    BoundedEtf::Limited => { byte_limited = true; break; }
+                    BoundedEtf::Opaque => { opaque_value = true; break; }
+                    BoundedEtf::Admitted { charge, payload } => {
+                        if let std::borrow::Cow::Owned(payload) = payload {
+                            // Keep the normalized finite bytes through decoding:
+                            // a compressed row is inflated exactly once.
+                            normalized_storage = Some(if row.legacy.is_some() {
+                                payload
+                            } else {
+                                let prefix = row.v.as_ptr() as usize - v.as_ptr() as usize;
+                                let mut packed = v[..prefix + 1].to_vec();
+                                packed.extend_from_slice(&payload);
+                                packed
+                            });
+                        }
+                        charge
+                    }
+                }
+            } else if matches!(row.v.first(), Some(&LANE_LONG | &LANE_BOOL | &LANE_STR | &LANE_KW | &LANE_FLOAT)) {
+                0
+            } else {
+                opaque_value = true;
+                break;
+            };
+            charged_bytes += base + extra;
+        }
+        let storage = normalized_storage.as_deref().unwrap_or(&v);
         if want_pairs {
             // The port's `-range` holds ARBITRARY values (counters, blobs and
             // datoms share the keyspace), so this mode must not require a datom
             // shape — that is the `:datoms`/`:columns` contract, not the port's.
             let key = to_binary(env, &k)?.to_term(env);
-            let value = slot_term(env, &v, &shape)?;
+            let value = slot_term(env, storage, &shape)?;
             pairs.push(shape.vector(env, &[key, value])?);
         } else {
-            let row = read_row(&v)?;
+            let row = read_row(storage)?;
             if want_datoms {
                 datoms.push(datom_term(env, &row, &shape)?);
             } else {
@@ -968,6 +1155,9 @@ fn fjall_resolve_chunk<'a>(
     let out = map_new(env);
     let n = if want_columns { cols.n } else if want_datoms { datoms.len() } else { pairs.len() };
     let out = out.map_put("n", n as u64)?;
+    let out = out.map_put("bytes", charged_bytes as u64)?
+        .map_put("byte-limited", byte_limited)?
+        .map_put("opaque-value", opaque_value)?;
     let out = match &last_key {
         Some(k) => out.map_put("last", to_binary(env, k)?)?,
         None => out.map_put("last", atoms::nil().to_term(env))?,
@@ -1499,7 +1689,74 @@ mod tests {
         let _ = fs::remove_dir_all(&b);
         let _ = fs::remove_dir_all(&c);
     }
+    #[test]
+    fn finite_etf_preflight_is_closed_and_charged() {
+        let tuple = [131, 104, 2, 97, 1, 109, 0, 0, 0, 3, b'a', b'b', b'c'];
+        assert_eq!(finite_etf_charge(&tuple), Some(tuple.len() * 64));
+        let map = [131, 116, 0, 0, 0, 1, 119, 1, b'k', 108, 0, 0, 0, 2, 97, 1, 97, 2, 106];
+        assert_eq!(finite_etf_charge(&map), Some(map.len() * 64));
+        for bytes in [&[131, 80, 0, 0, 0, 1][..], &[131, 88][..], &[131, 112][..],
+                      &[131, 109, 255, 255, 255, 255][..], &[131, 105, 255, 255, 255, 255][..],
+                      &[131, 116, 255, 255, 255, 255][..], &[131, 97][..], &[131, 106, 0][..]] {
+            assert_eq!(finite_etf_charge(bytes), None);
+        }
+        for n in 0..tuple.len() { assert_eq!(finite_etf_charge(&tuple[..n]), None); }
+        let mut deep = vec![131];
+        for _ in 0..130 { deep.extend_from_slice(&[104, 1]); }
+        deep.push(106);
+        assert_eq!(finite_etf_charge(&deep), None);
+    }
+
+    #[test]
+    fn compressed_etf_envelope_is_length_checked() {
+        use std::io::Write;
+        let body = [104, 2, 97, 1, 97, 2];
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&body).unwrap();
+        let mut bytes = vec![ETF_VERSION, 80];
+        bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&encoder.finish().unwrap());
+        assert_eq!(inflate_stored_etf(&bytes).unwrap(), [&[ETF_VERSION][..], &body].concat());
+        let mut short = bytes.clone(); short[5] -= 1;
+        assert!(inflate_stored_etf(&short).is_err());
+        let mut long = bytes.clone(); long[5] += 1;
+        assert!(inflate_stored_etf(&long).is_err());
+        let mut trailing = bytes.clone(); trailing.push(0);
+        assert!(inflate_stored_etf(&trailing).is_err());
+        for n in 0..bytes.len() { assert!(inflate_stored_etf(&bytes[..n]).is_err()); }
+    }
+
+    #[test]
+    fn bounded_compression_charges_before_inflate_and_rejects_opaque_terms() {
+        use std::io::Write;
+        fn compress(body: &[u8]) -> Vec<u8> {
+            let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(body).unwrap();
+            let mut out = vec![ETF_VERSION, 80];
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            out.extend_from_slice(&encoder.finish().unwrap());
+            out
+        }
+        let body = [104, 2, 97, 1, 97, 2];
+        let compressed = compress(&body);
+        let plain = [&[ETF_VERSION][..], &body].concat();
+        let charge = plain.len() * 64;
+        assert_eq!(bounded_finite_etf(&compressed, charge - 1).unwrap(), BoundedEtf::Limited);
+        assert_eq!(bounded_finite_etf(&compressed, charge).unwrap(),
+                   BoundedEtf::Admitted { charge, payload: std::borrow::Cow::Owned(plain.clone()) });
+        assert_eq!(bounded_finite_etf(&plain, charge).unwrap(),
+                   BoundedEtf::Admitted { charge, payload: std::borrow::Cow::Borrowed(&plain) });
+        assert_eq!(bounded_finite_etf(&compress(&[112, 0, 0, 0, 0]), 8192).unwrap(), BoundedEtf::Opaque);
+        let mut huge = compressed.clone(); huge[2..6].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(bounded_finite_etf(&huge, 268435456).unwrap(), BoundedEtf::Limited);
+        let mut trailing = compressed.clone(); trailing.push(0);
+        assert!(bounded_finite_etf(&trailing, 8192).is_err());
+        let mut wrong = compressed.clone(); wrong[5] += 1;
+        assert!(bounded_finite_etf(&wrong, 8192).is_err());
+        for n in 0..compressed.len() {
+            assert!(!matches!(bounded_finite_etf(&compressed[..n], 8192), Ok(BoundedEtf::Admitted { .. })));
+        }
+    }
+
 }
-
-
 

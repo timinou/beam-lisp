@@ -410,8 +410,8 @@ The gates themselves:
                   (do
                     (println (str "✓ override applied — " (count nss) " file(s), "
                                   (:note unit) " passed"))
-                    (println "  note: a warm `bl daemon` that already loaded an overridden namespace")
-                    (println "        keeps its image; `bl daemon stop` to reload from source.")
+                    (println "  note: a warm VM that already loaded an overridden namespace")
+                    (println "        keeps its image; `bl realm stop` to reload from source.")
                     0)
                   (do
                     (u/io-err "bl override apply: UNIT verification failed — rolling back (see the test report above)")

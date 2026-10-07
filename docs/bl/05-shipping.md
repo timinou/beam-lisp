@@ -62,8 +62,8 @@ self-build: …/bl  (227 tier sources rebuilt from …/.bl, 141404864 payload by
 The result is a single self-extracting binary carrying ERTS, the native tier
 (the language crates, the solver, Explorer), and the shipped libraries. It runs
 with no Erlang installed. On first run it extracts to a versioned directory and
-installs a launcher; later runs go straight to the payload, and a warm
-`bl daemon` for the tree makes them instant.
+installs a launcher; later runs go straight to the payload, and a warm VM for
+the tree makes them instant.
 
 The escript is not a packaging tier: it is a single BEAM archive that cannot
 carry native artifacts. The release assembly inside `bl self-build` is the
@@ -149,16 +149,16 @@ cargo build --release --manifest-path tooling/drop/Cargo.toml   # the launcher
 
 Each target is built natively on its own runner, because every NIF is compiled
 against that runner's libc and the pinned z3 assets are per-platform. The
-artifact is then smoke-tested the way a user runs it — cold, no daemon, no
+artifact is then smoke-tested the way a user runs it — cold, no warm VM, no
 checkout:
 
 ```sh
-BL_DAEMON=off ./bl version                       # beam-lisp <version>
-BL_DAEMON=off ./bl eval '(+ 1 2)'                # 3
-BL_DAEMON=off ./bl eval '(datom.store-fjall/available?)'    # true
-BL_DAEMON=off ./bl eval '(datom.frame/available?)'          # true
-BL_DAEMON=off ./bl eval '(BeamLisp.LazyMemo/fast_lane_bytes)'  # 65536
-BL_DAEMON=off ./bl eval '(let [p (z3/open)] (z3/check p "(assert true)"))'  # sat
+./bl --cold version                       # beam-lisp <version>
+./bl --cold eval '(+ 1 2)'                # 3
+./bl --cold eval '(datom.store-fjall/available?)'    # true
+./bl --cold eval '(datom.frame/available?)'          # true
+./bl --cold eval '(BeamLisp.LazyMemo/fast_lane_bytes)'  # 65536
+./bl --cold eval '(let [p (z3/open)] (z3/check p "(assert true)"))'  # sat
 ```
 
 Every assertion is a live native surface, so a payload that silently lost its

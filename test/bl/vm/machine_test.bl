@@ -1,0 +1,175 @@
+; machine_test.bl — vm.machine, the machine console.
+;
+; The page is rendered from rows, so most of this needs no server. The guards —
+; Host and token — are what a page that can STOP PROCESSES lives or dies by, so
+; those run against a real listener and a real loopback client.
+
+(ns vm.machine-test
+  (:require [web] [vm.machine :as machine] [vm.http :as http] [vm.registry :as registry]
+            [vm.ports :as ports]))
+
+(def RECV-MS 30000)   ; the dashboard's first render builds the model: ~5 s, measured; a short wait read as a failure
+
+(def TOKEN (erlang/apply :crypto :strong_rand_bytes (list 32)))
+(def HEX (String/downcase (Base/encode16 TOKEN)))
+
+(defn- includes? [s sub] (String/contains? s sub))
+
+;; ── the page, pure ──────────────────────────────────────────────────────────
+
+(def ROW {:id "aaaa1111-10" :role :warm :build "aaaa1111" :pid 10 :state :up :legacy false
+          :self false :uptime-s 4000 :memory-kb 212000
+          :realms [{:name "blueprint" :root "/home/u/blueprint"
+                    :routes [{:name "ui" :url "http://blueprint.test/" :loopback "http://127.0.0.1:1/"}]}]
+          :routes []})
+
+(deftest an-empty-machine-says-one-sentence-and-the-command
+  (let [p (machine/page [] [] TOKEN)]
+    (is (includes? p "No bl VM is running."))
+    (is (includes? p "bl realm start"))
+    (is (not (includes? p "<table")) "no empty table promising rows")))
+
+(deftest status-is-a-word-and-a-mark-never-colour-alone
+  (let [up (machine/page [ROW] [] TOKEN)
+        old (machine/page [(assoc ROW :legacy true)] [] TOKEN)
+        gone (machine/page [(assoc ROW :state :dead)] [] TOKEN)]
+    (is (includes? up "● up"))
+    (is (includes? old "▲ up, unregistered"))
+    (is (includes? gone "✕ gone"))))
+
+(deftest a-realm-row-shows-its-project-and-links-its-route
+  (let [p (machine/page [ROW] [] TOKEN)]
+    (is (includes? p "blueprint"))
+    (is (includes? p "/home/u/blueprint"))
+    (is (includes? p "href=\"http://blueprint.test/\""))))
+
+(defn- stop-buttons
+  "How many Stop BUTTONS the page has. The page's script mentions `data-stop` too
+   (it listens for clicks on one), so the attribute alone cannot be counted — a
+   button is an element that carries it with a value."
+  [html]
+  (dec (count (split html "<button type=\"button\" class=\"quiet\" data-stop=\""))))
+
+(deftest the-running-vm-has-no-stop-button
+  (testing "stopping yourself would cut the answer off"
+    (is (= 0 (stop-buttons (machine/page [(assoc ROW :self true)] [] TOKEN))))
+    (is (= 1 (stop-buttons (machine/page [ROW] [] TOKEN))))
+    (is (includes? (machine/page [ROW] [] TOKEN) "data-stop=\"aaaa1111-10\""))
+    (is (= 0 (stop-buttons (machine/page [(assoc ROW :state :dead)] [] TOKEN)))
+        "a gone VM has nothing to stop")))
+
+(deftest attention-comes-before-the-table-and-carries-its-fix
+  (let [p (machine/page [ROW] [{:kind :dead-records :level :warn :text "2 stale files" :fix "bl vm prune"}] TOKEN)]
+    (is (includes? p "Needs attention"))
+    (is (includes? p "bl vm prune"))
+    (is (< (index-of p "Needs attention") (index-of p "<table")))))
+
+(deftest names-are-escaped-so-a-project-called-script-is-only-text
+  (let [evil (assoc ROW :id "x\"><script>alert(1)</script>"
+                    :realms [{:name "<b>x</b>" :root "/p\"q" :routes []}])
+        p (machine/page [evil] [] TOKEN)]
+    (is (not (includes? p "<script>alert(1)")))
+    (is (includes? p "&lt;script&gt;"))
+    (is (not (includes? p "<b>x</b>")))))
+
+(deftest the-page-follows-the-design-rules-it-states
+  (let [css machine/CSS]
+    (testing "no gradient, glow or side-stripe accent"
+      (is (not (includes? css "gradient")))
+      (is (not (includes? css "box-shadow")))
+      (is (not (includes? css "border-left"))))
+    (testing "reduced motion is honoured and nothing animates layout"
+      (is (includes? css "prefers-reduced-motion"))
+      (is (not (includes? css "transition:width")))
+      (is (not (includes? css "transition:all"))))
+    (testing "dark and light are both defined, from one set of tokens"
+      (is (includes? css "prefers-color-scheme:dark"))
+      (is (includes? css "--s3:1rem")))
+    (testing "keyboard focus is visible"
+      (is (includes? css ":focus-visible")))))
+
+;; ── the Host guard ──────────────────────────────────────────────────────────
+
+(deftest host-ok-accepts-only-names-we-would-publish
+  (is (machine/host-ok? "127.0.0.1:4000"))
+  (is (machine/host-ok? "localhost:7777"))
+  (is (machine/host-ok? "localhost"))
+  (is (machine/host-ok? "[::1]:4000"))
+  (testing "a rebinding name that happens to resolve to loopback is refused"
+    (is (not (machine/host-ok? "evil.example.com")))
+    (is (not (machine/host-ok? "evil.example.com:4000")))
+    (is (not (machine/host-ok? "127.0.0.1.evil.example.com")))
+    (is (not (machine/host-ok? "")))
+    (is (not (machine/host-ok? nil)))))
+
+(deftest a-name-a-live-claim-holds-is-ours
+  (let [root (BeamLisp/cwd)]
+    (ports/claim "mtest" 0 {:root root :hosts ["mtest.machine-test.test"]})
+    (try
+      (is (machine/host-ok? "mtest.machine-test.test"))
+      (is (not (machine/host-ok? "other.machine-test.test")))
+      (finally (ports/release "mtest" {:root root})))))
+
+;; ── over HTTP ───────────────────────────────────────────────────────────────
+
+(defn- request [port method path headers]
+  (let [cs (elem (erlang/apply :gen_tcp :connect
+                   (list (tuple 127 0 0 1) port
+                         (to-list [:binary (tuple :packet :raw) (tuple :active false)]) 3000)) 1)
+        hdr (join "" (map (fn [kv] (str (first kv) ": " (second kv) "\r\n")) headers))]
+    (erlang/apply :gen_tcp :send
+      (list cs (str method " " path " HTTP/1.1\r\n" hdr "content-length: 0\r\nconnection: close\r\n\r\n")))
+    (read-all cs "")))
+
+(defn- read-all [cs acc]
+  (let [r (erlang/apply :gen_tcp :recv (list cs 0 RECV-MS))]
+    (if (and (erlang/is_tuple r) (= :ok (elem r 0))) (read-all cs (str acc (elem r 1))) acc)))
+
+(defn- status-of [resp] (second (split (first (split resp "\r\n")) " ")))
+(defn- body-of [resp] (let [p (split resp "\r\n\r\n")] (if (> (count p) 1) (join "\r\n\r\n" (rest p)) "")))
+
+(def PORT (let [p (+ 25000 (rem (erlang/system_time :millisecond) 3000))]
+            (http/serve p {:root (BeamLisp/cwd) :tree-id "t" :token TOKEN
+                           :started-at (erlang/system_time :second)})
+            (erlang/apply :timer :sleep (list 500))
+            p))
+
+(deftest the-machine-page-and-api-answer-on-loopback
+  (let [page (request PORT "GET" "/machine" [["host" "127.0.0.1"]])
+        api (request PORT "GET" "/api/vms" [["host" "127.0.0.1"]])]
+    (is (= "200" (status-of page)))
+    (is (includes? (body-of page) "Running on this machine"))
+    (is (= "200" (status-of api)))
+    (is (includes? (body-of api) "\"vms\""))))
+
+(deftest a-rebound-host-gets-nothing
+  (testing "the same request under an attacker's name is refused before any data is read"
+    (let [r (request PORT "GET" "/api/vms" [["host" "evil.example.com"]])]
+      (is (= "403" (status-of r)))
+      (is (not (includes? (body-of r) "\"vms\""))))
+    (let [r (request PORT "GET" "/machine" [["host" "evil.example.com"]])]
+      (is (= "403" (status-of r)))
+      (is (not (includes? (body-of r) TOKEN)) "the token must never ride a refused page")
+      (is (not (includes? (body-of r) HEX))))))
+
+(deftest stopping-needs-the-token
+  (testing "no token, wrong token: 403, and nothing is stopped"
+    (is (= "403" (status-of (request PORT "POST" "/api/vms/anything/stop" [["host" "127.0.0.1"]]))))
+    (is (= "403" (status-of (request PORT "POST" "/api/vms/anything/stop"
+                                     [["host" "127.0.0.1"] ["x-bl-token" "wrong"]]))))))
+
+(deftest a-good-token-on-an-unknown-vm-is-a-404-not-a-crash
+  (let [r (request PORT "POST" "/api/vms/no-such-vm-zzz/stop" [["host" "127.0.0.1"] ["x-bl-token" HEX]])]
+    (is (= "404" (status-of r)))))
+
+(deftest a-good-token-under-a-bad-host-is-still-refused
+  (testing "the token proves the page; the host proves the caller is not a rebound origin"
+    (is (= "403" (status-of (request PORT "POST" "/api/vms/x/stop"
+                                     [["host" "evil.example.com"] ["x-bl-token" HEX]]))))))
+
+(deftest the-session-dashboard-still-answers
+  (testing "mounting the machine routes did not shadow the existing router"
+    (is (= "200" (status-of (request PORT "GET" "/" [["host" "127.0.0.1"]]))))
+    (is (= "200" (status-of (request PORT "GET" "/model" [["host" "127.0.0.1"]]))))))
+
+(run-tests)

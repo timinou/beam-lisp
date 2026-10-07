@@ -1,0 +1,366 @@
+; ed/main.bl — the editor's one entry point and its render model.
+;
+; The host (apps/bl-ed/web/host.mjs) owns pixels and input. It calls:
+;
+;   (boot text path)            → editor
+;   (handle ed event)           → editor        event = {:type :key :key "j"}
+;                                                      | {:type :text :text "é"}   (IME / paste)
+;                                                      | {:type :resize :height n}
+;                                                      | {:type :saved :rev n :ok? b :message s}
+;                                                      | {:type :eval-result :id s :text s}
+;                                                      | {:type :click :pos [r c]}
+;   (render ed)                 → view model (plain data, below)
+;   (take-effects ed)           → [editor effects]
+;
+; The view model is what the host draws, already decided by BL: which lines,
+; each line split into styled SEGMENTS (token kinds from the org structure and
+; the form reader), the selections as row/col ranges, the cursor, the mode
+; line, the minibuffer and any overlay. The host does no parsing and no
+; styling decisions — it maps segment kinds to CSS classes.
+
+(ns ed.main
+  (:require [ed.text :as t]
+            [ed.org :as org]
+            [ed.forms :as forms]
+            [ed.core :as c]
+            [ed.commands :as cmds]
+            [ed.keymap :as km]))
+
+; ─── the ed/ API, for the command line ──────────────────────────────────────
+
+(declare handle)
+
+(defn- api
+  "The `ed` namespace the `:` command line sees — name → fn, interned by the
+   host as `ed/<name>` — closed over a cell holding the live editor so
+   `(ed/cmd …)` can change it."
+  [cell]
+  {"state" (fn [] @cell)
+   "text" (fn [] (t/to-string (:text @cell)))
+   "cmd" (fn [cmd-name] (swap! cell km/run-command (keyword cmd-name)) nil)
+   "commands" (fn [] (vec (sort (map name (keys (merge cmds/table (:user-commands @cell)))))))
+   "doc" (fn [cmd-name] (:doc (cmds/lookup @cell (keyword cmd-name))))
+   "bind" (fn [mode seq-str cmd] (swap! cell assoc-in [:user-keys (keyword mode) seq-str] (keyword cmd)) (str seq-str " → " (name cmd)))
+   "defcmd" (fn [cmd-name doc f]
+                 (swap! cell assoc-in [:user-commands (keyword cmd-name)] {:doc doc :run (fn [ed] (let [r (f ed)] (if (map? r) r ed)))})
+                 (str "defined " (name cmd-name)))
+   "insert" (fn [s] (swap! cell c/insert-at-heads s) nil)
+   "goto" (fn [n] (swap! cell (fn [ed] (let [p (t/clamp (:text ed) [(dec n) 0])] (c/scroll-to-cursor (assoc ed :sels [{:anchor p :head p}] :primary 0))))) nil)
+   "find" (fn [needle]
+               (swap! cell (fn [ed]
+                             (let [tx (:text ed)
+                                   hits (vec (mapcat (fn [r]
+                                                       (let [l (t/line tx r)]
+                                                         (loop [from 0 acc []]
+                                                           (let [i (index-of (subs l from) needle)]
+                                                             (if (nil? i) acc
+                                                               (let [c0 (+ from i)]
+                                                                 (recur (+ c0 (max 1 (count needle)))
+                                                                        (conj acc {:anchor [r c0] :head [r (+ c0 (dec (count needle)))]}))))))))
+                                                     (range (t/line-count tx))))]
+                               (if (empty? hits) (c/message ed (str "no match for " (pr-str needle)))
+                                 (c/scroll-to-cursor (assoc ed :sels hits :primary 0 :message (str (count hits) " matches")))))))
+               nil)
+   "outline" (fn [] (mapv (fn [h] [(:level h) (:title h) (inc (:row h))]) (:outline (:struct @cell))))
+   "cells" (fn [] (mapv (fn [b] [(:id b) (inc (:from b))]) (filter (fn [b] (= :cell (:kind b))) (:blocks (:struct @cell)))))})
+
+(defn eval-command
+  "Evaluate the command-line text as REAL Beam Lisp — the self-hosted
+   reader, compiler and macros, running in this page (priv/lib/js/eval.bl) —
+   with the `ed` namespace bound to the live editor API. Returns the editor
+   with the value (or error) in the echo area.
+
+   Evaluation is a host capability (`js/eval-ed`): the editor stays a pure
+   function of its events, and a host without an evaluator answers with an
+   error message instead of a crash."
+  [ed src]
+  (let [cell (atom (assoc ed :mode :normal :minibuf nil))
+        out (try (js/eval-ed src (api cell)) (catch e {:err (ex-message e)}))]
+    (cond
+      (contains? out :err) (c/message @cell (str "error: " (:err out)))
+      :else (c/message @cell (let [s (:text out)] (if (> (count s) 400) (str (subs s 0 400) " …") s))))))
+
+; ─── the palette ────────────────────────────────────────────────────────────
+
+(defn- fuzzy?
+  "Are the graphemes of `q` a subsequence of `s` (case-insensitive)?"
+  [q s]
+  (let [q (lower-case q) s (lower-case s)]
+    (loop [i 0 j 0]
+      (cond (>= i (count q)) true
+            (>= j (count s)) false
+            (= (subs q i (inc i)) (subs s j (inc j))) (recur (inc i) (inc j))
+            :else (recur i (inc j))))))
+
+(defn palette-matches
+  "Commands whose name or doc fuzzy-matches the minibuffer text, as
+   [{:name kw :doc s :keys [seq…]}] — keys looked up in the current keymap."
+  [ed]
+  (let [q (:text (:minibuf ed))
+        km (get (km/keymap-of ed) :normal {})
+        keys-of (fn [n] (vec (sort (keep (fn [[k v]] (if (= v n) k nil)) km))))]
+    (vec (take 12 (sort-by (fn [m] (name (:name m)))
+                           (keep (fn [[n cmd]]
+                                   (if (or (blank? q) (fuzzy? q (name n)) (fuzzy? q (:doc cmd)))
+                                     {:name n :doc (:doc cmd) :keys (keys-of n)} nil))
+                                 (merge cmds/table (:user-commands ed))))))))
+
+(defn- minibuf-key [ed k]
+  (let [mb (:minibuf ed)]
+    (cond
+      (= k "Escape") (assoc ed :mode :normal :minibuf nil)
+      (= k "Backspace") (assoc-in ed [:minibuf :text] (let [s (:text mb)] (if (empty? s) s (subs s 0 (dec (count s))))))
+      (and (= k "ArrowDown") (= :palette (:kind mb))) (update-in ed [:minibuf :sel] (fn [i] (min (inc (or i 0)) (max 0 (dec (count (palette-matches ed)))))))
+      (and (= k "ArrowUp") (= :palette (:kind mb))) (update-in ed [:minibuf :sel] (fn [i] (max 0 (dec (or i 0)))))
+      (and (= k "Enter") (= :search (:kind mb)))
+        (cmds/search-step (assoc ed :mode :normal :minibuf nil :search (:text mb)) 1)
+      (= k "Enter")
+        (if (= :palette (:kind mb))
+          (let [ms (palette-matches ed) m (get ms (or (:sel mb) 0))]
+            (if (nil? m) (assoc ed :mode :normal :minibuf nil)
+              (km/run-command (assoc ed :mode :normal :minibuf nil) (:name m))))
+          (eval-command ed (:text mb)))
+      (= 1 (count k)) (-> ed (assoc-in [:minibuf :text] (str (:text mb) k)) (assoc-in [:minibuf :sel] 0))
+      :else ed)))
+
+; ─── events ─────────────────────────────────────────────────────────────────
+
+(defn- request-placements
+  "Ask the host where each cell may run (the BEAM analyzes the document)."
+  [ed]
+  (c/effect ed {:kind :place :path (:path ed) :text (t/to-string (:text ed))}))
+
+(defn boot [s path] (request-placements (c/new-editor s path)))
+
+(defn handle
+  "Apply one host event to the editor."
+  [ed ev]
+  (let [ty (:type ev)]
+    (cond
+      (= ty :key)
+        (if (contains? #{:command :palette} (:mode ed)) (minibuf-key ed (:key ev)) (km/key-event ed (:key ev)))
+      (= ty :text)
+        (cond
+          (contains? #{:command :palette} (:mode ed)) (assoc-in ed [:minibuf :text] (str (:text (:minibuf ed)) (:text ev)))
+          (= :insert (:mode ed)) (c/insert-at-heads ed (:text ev))
+          ; a paste in normal mode replaces the selections (Helix R)
+          :else (c/replace-selections ed (fn [_ _] (:text ev)) nil))
+      (= ty :resize) (c/scroll-to-cursor (assoc-in ed [:view :height] (max 4 (:height ev))))
+      (= ty :scroll) (assoc-in ed [:view :top] (max 0 (min (:top ev) (dec (t/line-count (:text ed))))))
+      (= ty :click)
+        (let [p (t/clamp (:text ed) (:pos ev))]
+          (assoc ed :sels [{:anchor (if (:extend? ev) (:anchor (c/primary ed)) p) :head p}] :primary 0 :pending []))
+      (= ty :saved)
+        (if (:ok? ev)
+          ; the saved text is the text AT THE SAVED REVISION: if more edits
+          ; landed while the save was in flight, the file is still dirty
+          (-> ed (assoc :saved-text (if (= (:rev ev) (:rev ed)) (:text ed) (:saved-text ed)))
+              (c/message (str "wrote " (:path ed)))
+              ; the saved code may have changed what can run where
+              (request-placements))
+          (c/message ed (str "save failed: " (:message ev))))
+      (= ty :eval-result) (c/message ed (str (:id ev) " ⇒ " (:text ev)))
+      ; the BEAM rewrote result spans: take the new text as ONE undoable edit
+      ; that keeps the cursor, the history, the folds and the session state
+      (= ty :load) (c/replace-text ed (:text ev))
+      ; where each cell may run, from the BEAM's analyzer ({id {:place :why}})
+      (= ty :placements) (assoc ed :placements (:cells ev))
+      :else ed)))
+
+(defn take-effects [ed] [(assoc ed :effects []) (:effects ed)])
+
+; ─── rendering ──────────────────────────────────────────────────────────────
+;
+; A line renders to segments [{:text s :kind k}] with k ∈
+;   :heading-1..6 :todo :done :tag :keyword-line :results :fence :prose
+;   :code :paren-0..5 :string :comment :keyword :number :symbol-def :error
+; Code segments come from the form forest so colours and navigation agree.
+
+(defn- hl-kind [b r]
+  (cond
+    (nil? b) :prose
+    (= :heading (:kind b)) (keyword (str "heading-" (min 6 (:level b))))
+    (= :result (:kind b)) (if (= r (:from b)) :fence :results)
+    (contains? #{:cell :prose-code :block} (:kind b))
+      (if (or (= r (:from b)) (and (not (:open? b)) (= r (dec (:to b))))) :fence :code)
+    :else :prose))
+
+(def ^:private inline-marks
+  "Org emphasis markers and the segment kind each produces."
+  {"=" :verbatim "~" :verbatim "*" :strong "/" :emph})
+
+(defn- boundary? [l i]
+  (or (< i 0) (>= i (count l))
+      (contains? #{" " "\t" "(" ")" "\"" "'" "," "." ";" ":" "-" "!" "?" "{" "}" "[" "]"} (subs l i (inc i)))))
+
+(defn- inline-segments
+  "Split prose line `l` into segments: org emphasis (=x= ~x~ *x* /x/) when the
+   marker sits on a word boundary, [[links]], and plain prose between."
+  [l]
+  (let [n (count l)]
+    (loop [i 0 start 0 out []]
+      (if (>= i n)
+        (if (< start n) (conj out {:text (subs l start) :kind :prose}) out)
+        (let [ch (subs l i (inc i))]
+          (cond
+            (and (= ch "[") (< (inc i) n) (= "[" (subs l (inc i) (+ i 2))))
+              (let [close (index-of (subs l i) "]]")]
+                (if (nil? close) (recur (inc i) start out)
+                  (let [end (+ i close 2)
+                        out (if (< start i) (conj out {:text (subs l start i) :kind :prose}) out)]
+                    (recur end end (conj out {:text (subs l i end) :kind :link})))))
+            (and (contains? inline-marks ch) (boundary? l (dec i)) (< (inc i) n) (not= " " (subs l (inc i) (+ i 2))))
+              (let [close (some (fn [j] (if (and (= ch (subs l j (inc j))) (not= " " (subs l (dec j) j)) (boundary? l (inc j))) j nil))
+                                (range (+ i 2) n))]
+                (if (nil? close) (recur (inc i) start out)
+                  (let [out (if (< start i) (conj out {:text (subs l start i) :kind :prose}) out)]
+                    (recur (inc close) (inc close) (conj out {:text (subs l i (inc close)) :kind (get inline-marks ch)})))))
+            :else (recur (inc i) start out)))))))
+
+(defn- prose-segments
+  "Prose lines: keyword lines (#+TITLE:), list bullets, inline markup."
+  [l kind]
+  (let [t (triml l)
+        lead (- (count l) (count t))]
+    (cond
+      (starts-with? t "#+") [{:text l :kind :keyword-line}]
+      (or (starts-with? t "- ") (starts-with? t "+ "))
+        (into [{:text (subs l 0 (+ lead 1)) :kind :list-bullet}] (inline-segments (subs l (+ lead 1))))
+      :else (inline-segments l))))
+
+(defn- heading-segments
+  "stars · optional TODO keyword · title · optional :tags:"
+  [l b]
+  (let [hk (keyword (str "heading-" (min 6 (:level b))))
+        stars (subs l 0 (:level b))
+        rest (subs l (:level b))
+        todo (if (some? (:todo b)) (upper-case (name (:todo b))) nil)
+        ti (if (some? todo) (index-of rest todo) nil)
+        [pre after] (if (nil? ti) ["" rest] [(subs rest 0 ti) (subs rest (+ ti (count todo)))])
+        tag-i (if (and (seq (:tags b)) (ends-with? (trimr after) ":")) (last-index-of after " :") nil)
+        [title tags] (if (nil? tag-i) [after ""] [(subs after 0 (inc tag-i)) (subs after (inc tag-i))])]
+    (vec (filter (fn [s] (not= "" (:text s)))
+                 [{:text stars :kind :stars}
+                  {:text pre :kind hk}
+                  {:text (or todo "") :kind (if (= :done (:todo b)) :done :todo)}
+                  {:text title :kind hk}
+                  {:text tags :kind :tag}]))))
+
+(defn- code-marks
+  "Per-row column marks from a forest: [{:row :from :to :kind :depth}] for the
+   delimiters and leaves on visible rows."
+  [forest rows]
+  (let [rs (set rows)]
+    (letfn [(walk [nodes depth acc]
+              (reduce (fn [acc n]
+                        (let [[r1 c1] (:from n) [r2 c2] (:to n)
+                              coll? (contains? #{:list :vector :map :set :fn} (:kind n))
+                              bad? (or (= :stray (:kind n)) (:mismatch? n) (and (:open? n) coll?))
+                              open-len (if (contains? #{:set :fn} (:kind n)) 2 1)
+                              acc (cond
+                                    coll? (let [acc (if (contains? rs r1) (conj acc {:row r1 :from c1 :to (+ c1 open-len) :kind (if bad? :error (keyword (str "paren-" (mod depth 6))))}) acc)
+                                                acc (if (and (not (:open? n)) (contains? rs r2)) (conj acc {:row r2 :from (dec c2) :to c2 :kind (if bad? :error (keyword (str "paren-" (mod depth 6))))}) acc)]
+                                            acc)
+                                    (= :stray (:kind n)) (if (contains? rs r1) (conj acc {:row r1 :from c1 :to c2 :kind :error}) acc)
+                                    (contains? #{:string :comment :keyword :number} (:kind n))
+                                      (reduce (fn [a r] (if (contains? rs r)
+                                                          (conj a {:row r :from (if (= r r1) c1 0) :to (if (= r r2) c2 100000) :kind (if (and (= :string (:kind n)) (:open? n)) :error (:kind n))})
+                                                          a))
+                                              acc (range r1 (inc r2)))
+                                    :else acc)]
+                          (walk (:kids n) (if coll? (inc depth) depth) acc)))
+                      acc nodes))]
+      (walk forest 0 []))))
+
+(defn- segments-with-marks
+  "Split line `l` into segments by `marks` (sorted, non-overlapping per row)."
+  [l marks base]
+  (let [n (count l)
+        ms (sort-by :from (filter (fn [m] (< (:from m) n)) marks))]
+    (loop [ms ms at 0 out []]
+      (if (empty? ms)
+        (if (< at n) (conj out {:text (subs l at) :kind base}) out)
+        (let [m (first ms)
+              f (max at (:from m)) to (min n (max f (:to m)))
+              out (if (< at f) (conj out {:text (subs l at f) :kind base}) out)
+              out (if (< f to) (conj out {:text (subs l f to) :kind (:kind m)}) out)]
+          (recur (rest ms) (max at to) out))))))
+
+(defn- visible-rows
+  "The rows to draw: from :top, skipping folded section bodies, :height of them."
+  [ed]
+  (let [n (t/line-count (:text ed))
+        folds (or (:folds ed) #{})
+        ol (:outline (:struct ed))
+        hidden? (fn [r] (some (fn [h] (and (contains? folds (:row h)) (> r (:row h)) (< r (:end h)))) ol))
+        {:keys [top height]} (:view ed)]
+    (loop [r top out []]
+      (if (or (>= r n) (>= (count out) height)) out
+        (recur (inc r) (if (hidden? r) out (conj out r)))))))
+
+(defn render
+  "The view model the host draws."
+  [ed]
+  (let [tx (:text ed)
+        bs (:blocks (:struct ed))
+        rows (visible-rows ed)
+        folds (or (:folds ed) #{})
+        ; only the cells that intersect the visible rows contribute marks
+        r-lo (if (empty? rows) 0 (first rows))
+        r-hi (if (empty? rows) 0 (inc (last rows)))
+        marks (reduce (fn [acc b] (into acc (code-marks (get (:forms ed) (:from b) []) rows)))
+                      [] (filter (fn [b] (= :cell (:kind b))) (org/blocks-in bs r-lo r-hi)))
+        marks-by-row (group-by :row marks)
+        cur-row (first (:head (c/primary ed)))
+        line-view (fn [r]
+                    (let [l (t/line tx r) b (org/block-at bs r) k (hl-kind b r)
+                          blk? (and (some? b) (contains? #{:cell :prose-code :block :result} (:kind b)))]
+                      {:row r
+                       :folded? (contains? folds r)
+                       ; the block band a line belongs to: lets the host draw a
+                       ; cell as ONE full-width card, with rounded first/last rows
+                       :band (if blk? (name (:kind b)) nil)
+                       :band-first? (and blk? (= r (:from b)))
+                       :band-last? (and blk? (= r (dec (:to b))))
+                       ; where a cell runs (system.place, from the BEAM), on its
+                       ; first row: "local" (in the page) | "beam" (+ why)
+                       :place (when (and (= :cell (:kind b)) (= r (:from b)))
+                                (let [p (get (:placements ed) (:id b))]
+                                  (when (some? p) (name (:place p)))))
+                       :place-why (when (and (= :cell (:kind b)) (= r (:from b)))
+                                    (:why (get (:placements ed) (:id b))))
+                       :current? (= r cur-row)
+                       :segments (cond
+                                   (= :heading (:kind b)) (heading-segments l b)
+                                   (= k :code) (if (= :cell (:kind b)) (segments-with-marks l (get marks-by-row r []) :code) [{:text l :kind :code}])
+                                   (= k :prose) (prose-segments l :prose)
+                                   :else [{:text l :kind k}])}))
+        prim (c/primary ed)
+        mb (:minibuf ed)
+        fc (c/forest-at-cursor ed)
+        probs (if (nil? fc) [] (forms/problems (:forest fc)))
+        h (org/heading-at (:outline (:struct ed)) (first (c/cursor ed)))
+        b (c/block-at-cursor ed)]
+    {:lines (mapv line-view rows)
+     :top (:top (:view ed))
+     :total (t/line-count tx)
+     :sels (mapv (fn [s] (let [[a e] (c/sel-range ed s)] {:from a :to e :head (:head s) :primary? (= s prim)})) (:sels ed))
+     :cursor (:head prim)
+     :mode (:mode ed)
+     :status {:path (:path ed) :dirty? (c/dirty? ed) :mode (name (:mode ed))
+              :pos [(inc (first (:head prim))) (inc (second (:head prim)))]
+              :sels (count (:sels ed))
+              :pending (join " " (:pending ed)) :count (:count ed)
+              :section (if (nil? h) nil (:title h))
+              :block (cond (nil? b) nil (= :cell (:kind b)) (str "cell " (:id b)) (= :result (:kind b)) (str "results " (:id b)) (contains? #{:prose-code :block} (:kind b)) (str (:lang b) " block") :else nil)
+              :problems (count probs)}
+     :message (:message ed)
+     :minibuf (if (nil? mb) nil
+                {:prompt (:prompt mb) :text (:text mb) :kind (:kind mb)
+                 :matches (if (= :palette (:kind mb)) (mapv (fn [m] {:name (name (:name m)) :doc (:doc m) :keys (:keys m)}) (palette-matches ed)) [])
+                 :sel (or (:sel mb) 0)})
+     :overlay (cond
+                (= :outline (:overlay ed)) {:kind :outline :items (mapv (fn [h] {:level (:level h) :title (:title h) :row (:row h) :todo (if (some? (:todo h)) (name (:todo h)) nil)}) (:outline (:struct ed)))}
+                (= :help (:overlay ed)) {:kind :help :items (mapv (fn [[k n]] {:keys k :name (name n) :doc (:doc (cmds/lookup ed n))})
+                                                                  (sort-by first (get (km/keymap-of ed) (if (= :insert (:mode ed)) :insert :normal) {})))}
+                :else nil)}))

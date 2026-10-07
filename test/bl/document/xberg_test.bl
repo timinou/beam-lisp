@@ -15,7 +15,21 @@
 ;     "skipped" line instead of a red one that means nothing.
 
 (ns document.xberg-test
-  (:require [document.xberg :as xb]))
+  (:require [document.xberg :as xb]
+            [document.xberg-worker :as xw]
+            [bl.json :as json]))
+
+;; ── document.xberg-worker loads under an EMPTY argv ─────────────────────────
+;
+; The worker file ends with `(main (BeamLisp/argv))`, so the loader runs that
+; ENTRYPOINT the first time a name from it is used. The test runner's argv is
+; inherited by default, and the entrypoint treats its first argument as a
+; request-file path — a runner that named an existing file would have the load
+; open it (and, with XBERG_RUNTIME set, probe the carrier). Bind empty argv for
+; that one initialization, exactly as ward does for examples whose runners also
+; inherit argv (`priv/std/reload/ward.bl`). With no argv the entrypoint answers
+; its own `:request` refusal: no file, no runtime probe, no side effect.
+(BeamLisp/with_argv (list) (fn [] (xw/request-budget {})))
 
 ;; ── reading a native response ───────────────────────────────────────────────
 
@@ -131,6 +145,13 @@
   ; a remote URI is refused, not fetched
   (let [r (xb/extract-path "https://example.invalid/x.pdf" {})]
     (is (= :egress (get-in r [:error :xberg])))))
+
+(deftest path-budget-refusal-precedes-reading-and-engine
+  (let [path (str (System/tmp_dir!) "/xberg-path-budget-" (erlang/unique_integer))]
+    (try
+      (File/write! path "0123456789")
+      (is (= :budget (get-in (xb/extract-path path {:filename "document.txt" :budget {:max-input-bytes 4}}) [:error :xberg])))
+      (finally (File/rm path)))))
 
 (deftest egress-config-is-refused-without-authorisation
   (let [r (xb/extract "x" "x.txt" {:config {:summarization {:model "x"}}})]
@@ -431,3 +452,182 @@
       (is (= :worker (get-in r [:error :xberg])))
       (is (String/contains? (str (get-in r [:error :message])) "nested")))
     (finally (System/delete_env "XBERG_WORKER_CHILD"))))
+
+
+;; ── the pending change: worker budget forwarding + native wire ────────────
+
+(defn- with-env
+  "Run `f` with `k` bound to `v` (deleted when nil), restoring the old value.
+   Env is touched only through this, so a test cannot leak a binding."
+  [k v f]
+  (let [saved (System/get_env k)]
+    (try
+      (if (nil? v) (System/delete_env k) (System/put_env k v))
+      (f)
+      (finally
+        (if (some? saved) (System/put_env k saved) (System/delete_env k))))))
+
+(def MIN-INPUT-BYTES 67108864)   ; the 64 MiB floor `DEFAULTS` carries
+
+(defn- write-worker!
+  "Write an executable fixture worker; return its path. The fixture reads the
+   REQUEST the boundary appends as its LAST argument — not `$1`, because the
+   boundary puts a `--cold` token in front of every worker command, so a
+   fixture that counted positional parameters would index the wrong one."
+  [dir name body]
+  (let [p (Path/join (list dir name))]
+    (File/write! p (str "#!/bin/sh\n" body))
+    (File/chmod! p 493)
+    p))
+
+(defn- budget-recorder
+  "A fixture worker that copies the request it was handed to `log`, then answers
+   the pinned response envelope."
+  [log]
+  (str "req=\"\"\n"
+       "for a in \"$@\"; do req=\"$a\"; done\n"
+       "cp \"$req\" \"" log "\"\n"
+       "printf '%s' '{\"raw\":{\"results\":[]},\"engine\":{\"nif\":\"sha256:budget\"}}'\n"))
+
+(deftest the-worker-envelope-carries-the-callers-explicit-budget
+  ; The request the parent writes for the OS worker must carry the CALLER's
+  ; budget: without it the worker re-derives its own defaults and a deliberately
+  ; capped read silently gets the larger limit. A fixture copies the request the
+  ; worker actually received, so the assertion is over the wire bytes.
+  (let [dir (tmp-dir "budget")
+        log (str dir "/request.json")]
+    (try
+      (let [w (write-worker! dir "budget-worker.sh" (budget-recorder log))
+            r (xb/extract-path (probe-input)
+                               {:isolation :os_worker
+                                :worker {:cmd w}
+                                :filename "original.docx"
+                                :budget {:timeout-ms 12345 :max-output-bytes 4096 :max-concurrent 1}})
+            request (json/decode (File/read! log) {:keys :keyword})
+            b (:budget request)]
+        (is (String/ends_with? (:uri request) ".docx") "a content-addressed path gets an extension-bearing alias")
+        (is (not (File/exists? (subs (:uri request) 7))) "the transport removes its alias after reading")
+        (is (some? (get r :ok)) "the fixture answered the worker protocol")
+        (is (= 12345 (:timeout-ms b)) "the caller's timeout reaches the worker, not the 180 s default")
+        (is (= 4096 (:max-output-bytes b)))
+        (is (= 1 (:max-concurrent b)))
+        (is (= MIN-INPUT-BYTES (:max-input-bytes b)) "a cap the caller left unset falls back to the shared default")
+        (is (= 8388608 (:max-request-bytes b)) "and so does the request-byte cap"))
+      (finally (File/rm_rf! dir)))))
+
+(deftest worker-request-budget-honors-an-explicit-cap
+  ; The worker side of the boundary: `request-budget` merges the parent's
+  ; `:budget` LAST, so an explicit cap can never be overwritten by a derived
+  ; default or an environment fallback.
+  (with-env "KNOWLEDGER_READ_TIMEOUT_SECS" nil
+    (fn []
+      (let [b (xw/request-budget {:config {:extraction_timeout_secs 45}
+                                  :budget {:timeout-ms 5000
+                                           :max-input-bytes 4
+                                           :max-output-bytes 4096
+                                           :max-concurrent 1}})]
+        (is (= 5000 (:timeout-ms b)) "an explicit timeout beats the config-derived default")
+        (is (= 4 (:max-input-bytes b)) "an explicit input cap is kept, even below the floor")
+        (is (= 4096 (:max-output-bytes b)))
+        (is (= 1 (:max-concurrent b)))))))
+
+(deftest worker-request-budget-derives-an-older-parents-limits
+  ; An older parent sent only `:config`. The worker must derive a deadline and
+  ; an upload cap rather than silently reverting to its defaults.
+  (with-env "KNOWLEDGER_READ_TIMEOUT_SECS" nil
+    (fn []
+      ; deadline = (30 + extraction_timeout_secs) seconds
+      (is (= 75000 (:timeout-ms (xw/request-budget {:config {:extraction_timeout_secs 45}}))))
+      (is (= 150000 (:timeout-ms (xw/request-budget {}))) "no config → the 120 s default")
+      (is (= MIN-INPUT-BYTES (:max-input-bytes (xw/request-budget {})))
+          "the derived upload cap is the 64 MiB floor"))))
+
+(deftest worker-request-budget-reads-the-legacy-environment
+  (with-env "KNOWLEDGER_READ_TIMEOUT_SECS" "60"
+    (fn []
+      (with-env "KNOWLEDGER_MAX_UPLOAD_MB" "100"
+        (fn []
+          (is (= 90000 (:timeout-ms (xw/request-budget {}))) "30 s + the env's 60 s")
+          (is (= 104857600 (:max-input-bytes (xw/request-budget {}))) "100 MiB clears the floor")
+          (is (= 75000 (:timeout-ms (xw/request-budget {:config {:extraction_timeout_secs 45}})))
+              "an explicit config still wins over the environment"))))))
+
+(deftest worker-request-budget-keeps-the-64-mib-floor
+  (with-env "KNOWLEDGER_MAX_UPLOAD_MB" "10"
+    (fn []
+      (is (= MIN-INPUT-BYTES (:max-input-bytes (xw/request-budget {})))
+          "a small upload env cannot lower the 64 MiB default floor"))))
+
+(deftest worker-extract-boundary-honors-the-callers-input-cap
+  ; `extract-request` is the worker's OWN boundary: the budget `request-budget`
+  ; derives must reach it, or an explicit cap would not gate the read. A file
+  ; larger than the cap is refused as `:budget` BEFORE any engine/runtime call,
+  ; so the passthrough is observable with no carrier. `extract-request` sets
+  ; XBERG_WORKER_CHILD for the read; the test restores it in `finally`.
+  (let [dir (tmp-dir "xreq")
+        p (Path/join (list dir "doc.txt"))
+        saved (System/get_env "XBERG_WORKER_CHILD")]
+    (try
+      (File/write! p "0123456789")
+      (let [r (xw/extract-request {:kind "uri"
+                                   :uri (str "file://" p)
+                                   :budget {:max-input-bytes 4}})]
+        (is (= :budget (get-in r [:error :xberg]))
+            "the caller's 4-byte cap gates the read at the worker boundary"))
+      (finally
+        (if (some? saved) (System/put_env "XBERG_WORKER_CHILD" saved)
+            (System/delete_env "XBERG_WORKER_CHILD"))
+        (File/rm_rf! dir)))))
+
+(defn- native-struct
+  "A native (Elixir/NIF) struct: an Erlang map tagged `:__struct__` with `tag`.
+   Built with `maps/put` so it is a genuine native map, distinct from a beam-lisp
+   map (`map?`)."
+  [tag fields]
+  (reduce (fn [m kv] (maps/put (first kv) (second kv) m))
+          (maps/put :__struct__ tag (maps/new))
+          fields))
+
+(deftest wire-flattens-a-native-struct-instead-of-inspecting-it
+  ; The bug the native-map branch fixes: a native struct used to fall through to
+  ; `(str v)`, crossing the wire as one inspected string — nested chunk offsets
+  ; gone and a document body spilled as text. It must flatten to its fields.
+  (let [tag (erlang/binary_to_atom "Elixir.Xberg.DocumentNode" :utf8)
+        mode (erlang/binary_to_atom "Elixir.Xberg.Format.Pdf" :utf8)
+        node (native-struct tag
+               [[:content "body"]
+                [:format mode]
+                [:metadata (native-struct tag [[:byte_start 0] [:byte_end 4]])]])]
+    (is (not (map? node)) "a native struct is not a beam-lisp map")
+    (is (erlang/is_map node))
+    (let [w (xw/wire node)
+          md (get w "metadata")]
+      (is (not (string? w)) "a native struct is flattened, never stringified")
+      (is (= "body" (get w "content")))
+      (is (= "Elixir.Xberg.Format.Pdf" (get w "format")) "an atom crosses as its name")
+      (is (= 0 (get md "byte_start")) "a nested field survives at depth")
+      (is (= 4 (get md "byte_end")))
+      (is (not (contains? w "__struct__")) "the struct tag is dropped")
+      (is (not (contains? md "__struct__")) "and dropped at every depth"))))
+
+(deftest wire-preserves-nil-booleans-maps-vectors-and-scalars
+  (let [w (xw/wire {:nothing nil :yes true :no false
+                    :n 42 :f 1.5 :s "text"
+                    :items (list {:n 1} "two")
+                    :nested {:deep {:ok true}}})]
+    (is (nil? (get w "nothing")))
+    (is (= true (get w "yes")))
+    (is (= false (get w "no")))
+    (is (= 42 (get w "n")))
+    (is (= 1.5 (get w "f")))
+    (is (= "text" (get w "s")))
+    (is (= 1 (get (nth (get w "items") 0) "n")) "a map inside a sequence keeps its fields")
+    (is (= "two" (nth (get w "items") 1)))
+    (is (= true (get (get (get w "nested") "deep") "ok")))))
+
+(deftest wire-encodes-an-atom-and-a-tagged-enum-tuple
+  ; Elixir/Rust enum leaves cross as atoms; a 2-tuple tag+payload crosses as
+  ; the `{:__enum__ [tag payload]}` shape the parent's `enum-tag` reads.
+  (let [a (erlang/binary_to_atom "Elixir.Xberg.Format.Native" :utf8)]
+    (is (= "Elixir.Xberg.Format.Native" (xw/wire a))))
+  (is (= {:__enum__ ["group" {"k" 1}]} (xw/wire (tuple :group {:k 1})))))

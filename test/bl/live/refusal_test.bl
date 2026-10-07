@@ -1,0 +1,302 @@
+; test/bl/live/refusal_test.bl — honest refused/noop intent outcomes.
+; Run: bl test test/bl/live/refusal_test.bl
+;
+; A gesture may be DECLINED. Two server-created ways:
+;
+;   - a trusted performer RETURNS {:refused why};
+;   - a writer-run `[:db/fn f …]` THROWS `ex-info` whose data carries
+;     {:intent/outcome {:status :refused :why s}} or {:intent/outcome
+;     {:status :noop}} — the atomic abort, before a single datom is written.
+;
+; Both must be visible non-writing outcomes, must stop the event fold (no
+; "saved" flash, no navigate), must leave the store untouched, and — because
+; they are TERMINAL — must ACK the gesture's durable idempotency key so an
+; offline outbox stops replaying an intent that can never land.
+;
+; What must NOT change: an unrelated exception (a bug, a guard refusal, a
+; malformed marker) still propagates; authorization still runs BEFORE the
+; performer; a denied intent still never ACKs (a re-authorized replay may
+; succeed); nil-tx noop and ordinary commit keep their old contract.
+
+(ns live.refusal.test
+  (:require [live.socket :as s] [datom] [datom.db]))
+
+;; ── a shared world + a view that SHOWS the outcome ──────────────────
+
+(defn- fresh-conn []
+  (datom/connect
+    [{:db/ident :task/slug :db/valueType :db.type/string
+      :db/unique :db.unique/identity}
+     {:db/ident :task/title :db/valueType :db.type/string}]))
+
+(defn- board [db _session locals]
+  (let [rows (sort (datom/q '[:find ?s ?t
+                              :where [?e :task/slug ?s] [?e :task/title ?t]] db))
+        o (:live/outcome locals)]
+    [:div
+     [:ul {:key :rows} (for [r rows] [:li {:key (first r)} (second r)])]
+     (when o [:output {:key :outcome :data-outcome (name (:status o))} (or (:why o) "")])]))
+
+(defn- create-task [_conn payload _principal]
+  [{:db/id -1 :task/slug (:slug payload) :task/title (:title payload)}])
+
+(defn- task-count [conn]
+  (count (datom/q '[:find ?s :where [_ :task/slug ?s]] (datom/db conn))))
+
+(defn- basis [conn] (datom.db/basis-t (datom/db conn)))
+
+;; ── the two server-created decline shapes ───────────────────────────
+
+(defn- refuse-task [_conn _payload _principal]
+  {:refused "dossier verrouillé"})
+
+(defn- noop-task [_conn _payload _principal] nil)
+
+(defn- abort-refused
+  "The writer abort a French-domain app would throw mid-transaction."
+  [_db]
+  (throw (ex-info "refus d'écriture"
+                  {:intent/outcome {:status :refused :why "version périmée"}})))
+
+(defn- abort-noop
+  [_db]
+  (throw (ex-info "déjà appliqué"
+                  {:intent/outcome {:status :noop}})))
+
+(defn- writer-refuse
+  "A tx with ops SURROUNDING the refusing fn — if the abort were not atomic
+   the siblings would reach the store."
+  [_conn _payload _principal]
+  [{:db/id -1 :task/slug "before" :task/title "Before"}
+   [:db/fn abort-refused]
+   {:db/id -2 :task/slug "after" :task/title "After"}])
+
+(defn- writer-noop
+  [_conn _payload _principal]
+  [{:db/id -1 :task/slug "x" :task/title "X"}
+   [:db/fn abort-noop]])
+
+;; ── frame helpers (the socket_test watch harness) ───────────────────
+
+(defn- receive-frame [ms]
+  (receive
+    [:mount html] [:mount html]
+    [:patch ops] [:patch ops]
+    [:denied why] [:denied why]
+    [:ack key] [:ack key]
+    [:style css] [:style css]
+    (after ms :none)))
+
+(defn- drain [ms]
+  (let [f (receive-frame ms)]
+    (if (and (vector? f) (= :style (first f))) (drain ms) f)))
+
+(defn- drain-all []
+  (loop [out []]
+    (let [m (receive-frame 80)]
+      (if (= :none m) out (recur (conj out m))))))
+
+(defn- flush-mailbox []
+  (loop [] (receive _ (recur) (after 0 :ok))))
+
+(defn- heads [frames] (map first frames))
+
+(defn- mount* [opts]
+  (let [st (s/mount (merge {:view board :sink (erlang/self) :locals {}} opts))]
+    (drain 200)   ; mount (+ style)
+    st))
+
+;; ── direct refusal: a performer returns {:refused why} ──────────────
+
+(deftest performer-refusal-is-visible-nonwriting-and-terminal
+  (flush-mailbox)
+  (let [conn (fresh-conn)
+        st (mount* {:shared conn :intents {:post refuse-task}})
+        st2 (s/handle-event st [:intent :post {:ev/id "g1"}] {})
+        o (get-in st2 [:locals :live/outcome])
+        frames (drain-all)]
+    (is (= :denied (:status o)) "refusal reuses the :denied outcome status")
+    (is (= "dossier verrouillé" (:why o)))
+    (is (= 0 (task-count conn)) "a refusal writes nothing")
+    (is (some #(= [:denied "dossier verrouillé"] %) frames) "the client is told why")
+    (is (some #(= [:ack "g1"] %) frames) "a terminal refusal ACKs the durable key")
+    (is (some #(= :patch (first %)) frames) "this viewer re-renders with the outcome")
+    (flush-mailbox)))
+
+;; ── writer refusal: a :db/fn throws the marker; abort is atomic ─────
+
+(deftest writer-refusal-aborts-atomically-and-communicates
+  (flush-mailbox)
+  (let [conn (fresh-conn)
+        before-basis (basis conn)
+        st (mount* {:shared conn :intents {:post writer-refuse}})
+        st2 (s/handle-event st [:intent :post {:ev/id "w1"}] {})
+        o (get-in st2 [:locals :live/outcome])
+        frames (drain-all)]
+    (is (= :denied (:status o)))
+    (is (= "version périmée" (:why o)))
+    (is (= 0 (task-count conn)) "ops surrounding the refusing fn did not write")
+    (is (= before-basis (basis conn)) "no transaction metadata was recorded")
+    (is (some #(= [:denied "version périmée"] %) frames))
+    (is (some #(= [:ack "w1"] %) frames))
+    (flush-mailbox)))
+
+;; ── writer noop: the marker is a terminal non-writing outcome ───────
+
+(deftest writer-noop-is-terminal-and-does-not-record-a-transaction
+  (flush-mailbox)
+  (let [conn (fresh-conn)
+        before-basis (basis conn)
+        st (mount* {:shared conn :intents {:post writer-noop}})
+        st2 (s/handle-event st [:intent :post {:ev/id "n1"}] {})
+        o (get-in st2 [:locals :live/outcome])
+        frames (drain-all)]
+    (is (= :noop (:status o)) "a writer noop is the ordinary :noop outcome")
+    (is (= 0 (task-count conn)) "nothing wrote")
+    (is (= before-basis (basis conn)) "the noop aborts before tx metadata is recorded")
+    (is (some #(= [:ack "n1"] %) frames) "a noop is terminal and ACKed")
+    (is (not (some #(= :denied (first %)) frames)) "a noop is not a denial")
+    (flush-mailbox)))
+
+;; ── nil-tx noop keeps its old contract ──────────────────────────────
+
+(deftest nil-tx-noop-still-renders-and-acks
+  (flush-mailbox)
+  (let [conn (fresh-conn)
+        st (mount* {:shared conn :intents {:post noop-task}})
+        st2 (s/handle-event st [:intent :post {:ev/id "z1"}] {})
+        frames (drain-all)]
+    (is (= :noop (get-in st2 [:locals :live/outcome :status])))
+    (is (= 0 (task-count conn)))
+    (is (some #(= [:ack "z1"] %) frames))
+    (flush-mailbox)))
+
+;; ── unrelated exceptions are NOT swallowed ──────────────────────────
+
+(defn- boom-task [_ _ _] (throw (ex-info "bug" {:code 42})))
+(defn- boom-fn [_db] (throw (ex-info "bug in writer" {:code 43})))
+(defn- boom-writer [_ _ _] [{:db/id -1 :task/slug "q" :task/title "Q"} [:db/fn boom-fn]])
+(defn- malformed-task [_ _ _]
+  (throw (ex-info "malformed" {:intent/outcome {:status :refused}})))
+
+(deftest unrelated-exceptions-propagate-unchanged
+  (let [conn (fresh-conn)
+        st (mount* {:shared conn :intents {:post boom-task}})]
+    (is (thrown? (s/handle-event st [:intent :post {}] {}))
+        "an ex-info that is not a marker is re-raised")
+    (flush-mailbox))
+  (let [conn (fresh-conn)
+        st (mount* {:shared conn :intents {:post boom-writer}})]
+    (is (thrown? (s/handle-event st [:intent :post {}] {}))
+        "a :db/fn bug is not a refusal marker")
+    (is (= 0 (task-count conn)))
+    (flush-mailbox))
+  (let [conn (fresh-conn)
+        st (mount* {:shared conn :intents {:post malformed-task}})]
+    (is (thrown? (s/handle-event st [:intent :post {}] {}))
+        "a :refused without a string :why is not a well-formed marker")
+    (flush-mailbox)))
+
+;; ── auth still runs BEFORE the performer ────────────────────────────
+
+(deftest authorization-refuses-before-the-performer-runs
+  (flush-mailbox)
+  (let [conn (fresh-conn)
+        called (atom false)
+        deny (fn [_ _ _] {:verdict :deny :why "not allowed"})
+        st (mount* {:shared conn
+                    :auth {:principal "ada" :fn deny}
+                    :intents {:post (fn [_ _ _] (reset! called true) nil)}}
+                    )
+        st2 (s/handle-event st [:intent :post {:ev/id "a1"}] {})
+        frames (drain-all)]
+    (is (= false @called) "a denied intent never reaches the performer")
+    (is (= :denied (get-in st2 [:locals :live/outcome :status])))
+    (is (= "not allowed" (get-in st2 [:locals :live/outcome :why])))
+    (is (= 0 (task-count conn)))
+    (is (not (some #(= :ack (first %)) frames))
+        "an auth denial is not terminal: it must NOT ACK")
+    (flush-mailbox)))
+
+;; ── the fold stops on refusal and on noop ───────────────────────────
+
+(deftest a-refusal-stops-the-event-fold
+  (flush-mailbox)
+  (let [conn (fresh-conn)
+        st (mount* {:shared conn :intents {:post refuse-task}})
+        st2 (s/handle-event st [[:intent :post {}] [:navigate "/away"]
+                                [:assign :flash "saved"]] {})]
+    (is (= :denied (get-in st2 [:locals :live/outcome :status])))
+    (is (nil? (get-in st2 [:locals :route])) "no navigate after a refusal")
+    (is (nil? (:flash (:locals st2))) "no success flash after a refusal")
+    (flush-mailbox)))
+
+(deftest a-noop-stops-the-event-fold
+  (flush-mailbox)
+  (let [conn (fresh-conn)
+        st (mount* {:shared conn :intents {:post writer-noop}})
+        st2 (s/handle-event st [[:intent :post {:ev/id "n2"}] [:navigate "/away"]
+                                [:assign :flash "saved"]] {})]
+    (is (= :noop (get-in st2 [:locals :live/outcome :status])))
+    (is (nil? (get-in st2 [:locals :route])))
+    (is (nil? (:flash (:locals st2))))
+    (flush-mailbox)))
+
+;; ── a commit still lets the rest of the fold run (unchanged) ────────
+
+(deftest a-commit-still-lets-the-fold-run
+  (flush-mailbox)
+  (let [conn (fresh-conn)
+        st (mount* {:shared conn :intents {:post create-task}})
+        st2 (s/handle-event
+              st [[:intent :post {:slug "ok" :title "OK"}] [:assign :flash "saved"]] {})]
+    (is (= :committed (get-in st2 [:locals :live/outcome :status])))
+    (is (= "saved" (:flash (:locals st2))))
+    (is (= 1 (task-count conn)))
+    (flush-mailbox)))
+
+;; ── the real server: no death after an expected refusal ─────────────
+
+(s/deflive refusal-socket
+  :view board
+  :intents {:refuse refuse-task :create create-task})
+
+(deftest a-real-socket-survives-a-refusal-and-keeps-serving
+  (flush-mailbox)
+  (let [conn (fresh-conn)
+        sock (start-link refusal-socket {:shared conn :sink (erlang/self)})]
+    (drain-all)  ; mount
+    (call sock [:event [:intent :refuse {:ev/id "srv1"}]])
+    (let [frames (drain-all)]
+      (is (some #(= [:denied "dossier verrouillé"] %) frames))
+      (is (some #(= [:ack "srv1"] %) frames)))
+    ;; the socket is still alive: the very next gesture commits
+    (call sock [:event [:intent :create {:slug "z" :title "Z"}]])
+    (Process/sleep 100)
+    (is (= 1 (task-count conn)) "the socket kept serving after the refusal")
+    (stop sock)
+    (timer/sleep 100)
+    (flush-mailbox)))
+
+;; ── the shared writer stays serialized under concurrent writes ──────
+
+(deftest concurrent-intents-stay-serialized
+  (flush-mailbox)
+  (let [conn (fresh-conn)
+        me (erlang/self)
+        n 6]
+    (loop [i 0]
+      (when (< i n)
+        (let [k i]
+          (erlang/spawn
+            (fn []
+              (datom/transact! conn [{:db/id -1 :task/slug (str "s" k)
+                                      :task/title (str "T" k)}])
+              (erlang/send me [:wrote k]))))
+        (recur (+ i 1))))
+    (loop [i 0]
+      (when (< i n)
+        (receive [:wrote _] :ok (after 5000 :timeout))
+        (recur (+ i 1))))
+    (is (= n (task-count conn)) "every serialized write landed; none overwrote")
+    (flush-mailbox)))

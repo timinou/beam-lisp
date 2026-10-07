@@ -1,0 +1,142 @@
+(ns realm-code-lifetime-test
+  (:require [vm.core :as vmc]))
+
+(defn- vm [key]
+  (vmc/spawn-vm {:id (str "lifetime@" key) :root "/tmp/code-lifetime"
+                 :key key :alias key :decl {:shadow [] :uses {}}}))
+
+(defn- marked [e ns segment f]
+  (BeamLisp.Env/with_env e
+    (fn [] (BeamLisp.Env/put_key (tuple :realm_local ns) segment) (f))))
+
+(defn- fresh-body-in [e ns segment]
+  (marked e ns segment (fn [] (BeamLisp.Emit/fresh_body_module ns))))
+
+(defn- body-module-of [worker]
+  (elem (elem (erlang/process_info worker :current_function) 1) 0))
+
+;; Hold the inventory's critical section and observe both callers ENTERING it.
+;; Trace events, not a quiet timing window, distinguish locked from unlocked code.
+(defn- hold-realm-lock [resource parent]
+  (let [id (tuple resource (erlang/self)) nodes (list (erlang/node))]
+    (erlang/apply :global :set_lock (list id nodes))
+    (erlang/send parent :lock-held)
+    (try
+      (receive :release :ok (after 60000 :timeout))
+      (finally (erlang/apply :global :del_lock (list id nodes))))))
+
+(defn- drain-worker [parent project tag]
+  (receive
+    :begin
+    (let [r (try (vmc/drain project)
+                 (catch e (tuple :error (ex-message e))))]
+      (erlang/send parent (tuple :drained tag r)))
+    (after 60000 :timeout)))
+
+(defn- await-retirement-calls [workers resource]
+  (loop [waiting (set workers)]
+    (if (empty? waiting)
+      :entered
+      (receive
+        [:trace pid :call mfa]
+        (if (and (= :global (elem mfa 0)) (= :trans (elem mfa 1))
+                 (= (tuple resource pid) (first (elem mfa 2))))
+          (recur (disj waiting pid))
+          (recur waiting))
+        [:drained tag result] [:early tag result]
+        (after 30000 :timeout)))))
+
+(deftest a-busy-old-body-is-retained-across-repeated-drain
+  (let [key "leaseproof" ns "lease-holder" segment (str "R" key)
+        project (vm key)
+        f (marked (:env project) ns segment
+            (fn []
+              (BeamLisp.Compiler/eval_string
+                "(ns lease-holder) (defn hold [parent] (erlang/send parent :entered) (receive :release :done))"
+                (BeamLisp.Compiler/new_env "user") "code_lifetime_fixture")
+              (BeamLisp.Env/fetch! ns "hold")))
+        parent (erlang/self)
+        worker (erlang/spawn (fn [] (f parent) (erlang/send parent :finished)))
+        next-env (BeamLisp.Env/fork)]
+    (try
+      (is (= :entered (receive :entered :entered (after 10000 :timeout))))
+      (let [body (body-module-of worker)]
+      (is (String/starts_with? (Atom/to_string body) "Elixir.BeamLisp.Ns.Fn.Rleaseproof."))
+      (vmc/drain project)
+      (is (Process/alive? worker) "teardown does not hard-purge an unowned caller")
+      (is (erlang/check_old_code body))
+      (vmc/drain project)
+      (is (Process/alive? worker) "old-only code remains in the retirement inventory")
+      (is (not= body (fresh-body-in next-env ns segment))
+          "a repeated drain cannot reset numbering while a body is leased")
+      (erlang/send worker :release)
+      (is (= :finished (receive :finished :finished (after 10000 :timeout))))
+      (vmc/drain project)
+      (is (not (erlang/check_old_code body)))
+      (is (= "Elixir.BeamLisp.Ns.Fn.Rleaseproof.M1"
+             (Atom/to_string (fresh-body-in next-env ns segment)))
+          "numbering is reused only after the old code was actually purged"))
+      (finally
+        (when (Process/alive? worker) (erlang/exit worker :kill))
+        (BeamLisp.Env/destroy next-env)))))
+
+(deftest concurrent-same-key-drains-serialize-on-the-realm-lock
+  (let [key "concurrency" ns "concurrency-holder" segment (str "R" key)
+        resource (tuple :vm_retired_modules key)
+        project (vm key)
+        f (marked (:env project) ns segment
+            (fn []
+              (BeamLisp.Compiler/eval_string
+                "(ns concurrency-holder) (defn hold [parent] (erlang/send parent :entered) (receive :release :done))"
+                (BeamLisp.Compiler/new_env "user") "realm_code_lifetime_concurrency")
+              (BeamLisp.Env/fetch! ns "hold")))
+        parent (erlang/self)
+        worker (erlang/spawn (fn [] (f parent) (erlang/send parent :finished)))
+        next-env (BeamLisp.Env/fork)
+        session (erlang/apply :trace :session_create (list :realm_retirement parent (list)))
+        locker (erlang/spawn (fn [] (hold-realm-lock resource parent)))
+        d1 (erlang/spawn (fn [] (drain-worker parent project :one)))
+        d2 (erlang/spawn (fn [] (drain-worker parent project :two)))]
+    (try
+      (is (= :entered (receive :entered :entered (after 30000 :timeout))))
+      (is (= :lock-held (receive :lock-held :lock-held (after 30000 :timeout))))
+      (let [body (body-module-of worker)]
+        (is (String/starts_with? (Atom/to_string body) "Elixir.BeamLisp.Ns.Fn.Rconcurrency."))
+        (is (= 1 (erlang/apply :trace :function
+                   (list session (tuple :global :trans 2) true (list)))))
+        (doseq [pid [d1 d2]]
+          (is (= 1 (erlang/apply :trace :process (list session pid true (list :call)))))
+          (erlang/send pid :begin))
+        (let [entry (await-retirement-calls [d1 d2] resource)]
+          (is (= :entered entry) "both drains enter the SAME retirement lock before completing")
+          (when (= :entered entry)
+            (is (code/is_loaded body) "a held lock prevents retirement, regardless of scheduling speed")
+            (is (not (erlang/check_old_code body)))
+            (is (= [] (persistent_term/get resource [])) "no inventory mutation occurred")
+            (erlang/send locker :release)
+            (let [a (receive [:drained :one r] r (after 30000 :timeout))
+                  b (receive [:drained :two r] r (after 30000 :timeout))]
+              (is (map? a))
+              (is (map? b))
+              (is (erlang/is_integer (:purged a)))
+              (is (erlang/is_integer (:purged b)))
+              (is (Process/alive? worker) "the unowned caller survives both drains")
+              (is (= false (code/is_loaded body)))
+              (is (erlang/check_old_code body))
+              (is (some (fn [m] (= body m)) (persistent_term/get resource []))
+                  "both serialized drains preserve the old-only identity")
+              (is (not= body (fresh-body-in next-env ns segment))
+                  "allocation while a known body is leased cannot reuse its name")
+              (erlang/send worker :release)
+              (is (= :finished (receive :finished :finished (after 30000 :timeout))))
+              (vmc/drain project)
+              (is (not (erlang/check_old_code body)))
+              (is (= [] (persistent_term/get resource [])))
+              (is (= "Elixir.BeamLisp.Ns.Fn.Rconcurrency.M1"
+                     (Atom/to_string (fresh-body-in next-env ns segment))))))))
+      (finally
+        (doseq [pid [worker locker d1 d2]]
+          (when (Process/alive? pid) (erlang/exit pid :kill)))
+        (erlang/apply :trace :session_destroy (list session))
+        (vmc/drain project)
+        (BeamLisp.Env/destroy next-env)))))

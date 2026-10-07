@@ -228,10 +228,31 @@
    anything."
   [ns]
   :when (string? ns)
-  (or (erlang/== ns "core")
-      (BeamLisp.Env/loaded_ns? ns)
-      (Code/ensure_loaded? (BeamLisp.Link/module_for ns))
-      (source_on_path? ns)))
+  (if (or (erlang/== ns "core") (BeamLisp.Env/loaded_ns? ns))
+    true
+    (let [mod (BeamLisp.Link/module_for ns)]
+      ;; A module loaded during this pass overrides an earlier negative source
+      ;; result without waiting for the next pass. This is a local code-table
+      ;; read, not another code-server lookup for every qualified call.
+      (if (erlang/not (erlang/== false (code/is_loaded mod)))
+        true
+        (let [pass (Process/get :bl_declaration_snapshot :undefined)
+              dirs (search_dirs)
+              ;; Relative roots also depend on the current cwd. Absolute roots
+              ;; avoid that file-server request on the compiler's common path.
+              context (if (Enum/all? dirs (fn [d] (erlang/== :absolute (Path/type d))))
+                        (tuple :resolvable dirs ns)
+                        (tuple :resolvable (File/cwd!) dirs ns))
+              hit (if (erlang/== pass :undefined) :undefined (Map/get pass context :undefined))]
+          (if (erlang/not (erlang/== hit :undefined))
+            hit
+            (let [result (or (Code/ensure_loaded? mod) (source_on_path? ns))]
+              (if (or (erlang/== pass :undefined)
+                      (erlang/not (erlang/== false (code/is_loaded mod)))
+                      (erlang/>= (erlang/map_size (Process/get :bl_declaration_snapshot {})) 4096)) nil
+                (Process/put :bl_declaration_snapshot
+                  (Map/put (Process/get :bl_declaration_snapshot {}) context result)))
+              result)))))))
 
 (defn- source_on_path?
   "The same rule `find_file/1` applies: a file serves `ns` only if it DECLARES
@@ -268,11 +289,17 @@
       :else
       (let [dirs (or fixed (Process/get :bl_search_dirs)
                    (erlang/++ (or (Process/get :bl_ambient_dirs) (list (File/cwd!)))
-                              (extra_dirs)))]
+                              (extra_dirs)))
+            caller-env (BeamLisp.Env/env_id)
+            caller-realm (realm_facts)]
         (BeamLisp.Loader.Server/run
           (fn []
             (let [prev (Process/get :bl_search_dirs)
-                  prev_fixed (Process/get :bl_fixed_dirs)]
+                  prev_fixed (Process/get :bl_fixed_dirs)
+                  prev_env (Process/get :bl_load_env)
+                  prev_realm (Process/get :bl_load_realm)]
+              (Process/put :bl_load_env caller-env)
+              (Process/put :bl_load_realm caller-realm)
               (Process/put :bl_search_dirs dirs)
               (if (nil? fixed) (Process/delete :bl_fixed_dirs)
                 (Process/put :bl_fixed_dirs fixed))
@@ -282,10 +309,15 @@
                     (BeamLisp.AOT/with_source_snapshot run)
                     (run)))
                 (finally
-                  (if (nil? prev) (Process/delete :bl_search_dirs)
-                    (Process/put :bl_search_dirs prev))
-                  (if (nil? prev_fixed) (Process/delete :bl_fixed_dirs)
-                    (Process/put :bl_fixed_dirs prev_fixed)))))))))))
+                  (restore-pdict :bl_load_env prev_env)
+                  (restore-pdict :bl_load_realm prev_realm)
+                  (restore-pdict :bl_search_dirs prev)
+                  (restore-pdict :bl_fixed_dirs prev_fixed))))))))))
+
+(defn- restore-pdict
+  "Put `prev` back under `key`, or delete the key when there was none."
+  [key prev]
+  (if (nil? prev) (Process/delete key) (Process/put key prev)))
 
 (defn- ensure_loaded_locked
   "The in-server half of `ensure_loaded/1`: the `:bl_loading` cycle guard, then
@@ -299,7 +331,7 @@
       (Process/put :bl_loading (MapSet/put (Process/get :bl_loading (MapSet/new)) ns))
 
       (try
-        (let [r (BeamLisp.AOT/ensure_loaded ns)]
+        (let [r (if (= :aot (load_route ns)) (BeamLisp.AOT/ensure_loaded ns) :no_module)]
           (cond
             (erlang/== r :loaded) :ok
             (erlang/== r :no_module) (ensure_loaded_source ns)
@@ -339,6 +371,215 @@
 
   :ok)
 
+;; ── who owns a namespace ────────────────────────────────────────────────────
+;;
+;; A namespace name is a claim on a module name, so every namespace has ONE home,
+;; decided by `namespace_home` from five facts (docs/design/realm/namespace-ownership.md):
+;;
+;;   kind      where the file that would serve it lives:
+;;               :tier     under one of the image's tier dirs (std, lib, boot, …)
+;;               :path     under a BEAM_LISP_PATH entry
+;;               :project  anywhere else on the search path (cwd, env.bl :paths, overrides/)
+;;   owned?    a tier ships a namespace of this name
+;;   declared? the realm's env.bl lists it in :shadow, or the file is under its overrides/
+;;   shared?   the realm's env.bl lists it in :uses (verified by hash when the realm opens)
+;;   isolate?  the realm is KEYED: its VM is shared, so its code must not leak
+;;
+;; The homes: :tier (the platform's own, loaded once), :realm (its own module,
+;; named from the realm), :shadow (the same, replacing a tier name, declared),
+;; :shared (loaded once, at :global, hash-checked by vm.realm), :global (no realm:
+;; today's behaviour), :refuse (a named error, never a silent replacement).
+
+(defn- local_homes
+  "The homes whose namespaces load from source into the realm's own env. A zero-arg
+   defn: a pinned module carries no `def`."
+  []
+  (list :realm :shadow :shared))
+
+(defn namespace_home
+  "The home of a namespace from the five facts above. Pure."
+  [kind owned? declared? shared? isolate? in_realm?]
+  (cond
+    (erlang/== kind :tier) :tier
+    (erlang/not owned?)
+      (cond shared? :shared
+            isolate? :realm
+            :else :global)
+    declared? (if isolate? :shadow :global)
+    ; A tier name replaced by a file nobody declared. From BEAM_LISP_PATH, or inside
+    ; any realm, that is refused; a bare `bl run` in a tree keeps loading what the
+    ; tree puts on its own path (that is how a tree develops its own library).
+    (or (erlang/== kind :path) in_realm?) :refuse
+    :else :global))
+
+(defn- realm_facts
+  "What the CALLING env knows about its realm, as a map for the loader server (whose
+   own env is :global): {:key k-or-nil :decl {...}-or-nil}. nil outside any realm."
+  []
+  (let [key (env_row (tuple :realm_key))
+        decl (env_row (tuple :realm_decl))]
+    (if (and (erlang/== nil key) (erlang/== nil decl))
+      nil
+      (maps/put :key key (maps/put :decl decl (maps/new))))))
+
+(defn- env_row
+  "The value of a chain-walking env row, or nil."
+  [k]
+  (let [r (BeamLisp.Env/lookup k)]
+    (if (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+      (erlang/element 2 r)
+      nil)))
+
+(defn- tier_ids
+  "{device, inode} of every tier dir, memoised: the tiers are a constant of the image.
+   Identity, not a string prefix: the launcher reaches a tree's priv through a symlink."
+  []
+  (let [cached (persistent_term/get :bl_tier_ids nil)]
+    (if (erlang/== nil cached)
+      (let [ids (Enum/flat_map (BeamLisp.Tiers/dirs)
+                  (fn [d] (let [id (path_id d)] (if (erlang/== nil id) (list) (list id)))))]
+        (persistent_term/put :bl_tier_ids ids)
+        ids)
+      cached)))
+
+(defn- path_id
+  "{major_device, inode} of `path`, or nil when it cannot be stat'd."
+  [path]
+  (let [st (File/stat path)]
+    (if (and (erlang/is_tuple st) (erlang/== :ok (erlang/element 1 st)))
+      (tuple (erlang/map_get :major_device (erlang/element 2 st))
+             (erlang/map_get :inode (erlang/element 2 st)))
+      nil)))
+
+(defn- under_tier?
+  "Whether `path` lies inside a tier dir: some ancestor directory IS one."
+  [path]
+  (let [ids (tier_ids)]
+    (loop [p (Path/dirname (Path/expand path))]
+      (let [id (path_id p)]
+        (cond
+          (erlang/== nil id) false
+          (list-member? ids id) true
+          (erlang/== p (Path/dirname p)) false
+          :else (recur (Path/dirname p)))))))
+
+(defn- under_dir?
+  "Whether `path` is inside directory `dir` (expanded string prefix)."
+  [path dir]
+  (String/starts_with? (Path/expand path) (erlang/iolist_to_binary (list (Path/expand dir) "/"))))
+
+(defn- file_kind
+  "Where the file that would serve `path`'s namespace lives: :tier, :path or :project."
+  [path]
+  (cond
+    (under_tier? path) :tier
+    (Enum/any? (env_paths) (fn [d] (under_dir? path d))) :path
+    :else :project))
+
+(defn- tier_owns?
+  "Whether a tier ships namespace `ns`: a source file in a tier dir, or a compiled
+   tier module that carries an init (a packaged image may ship beams only)."
+  [ns]
+  (or (Enum/any? (BeamLisp.Tiers/dirs)
+        (fn [d] (Enum/any? (source_relatives ns)
+                  (fn [rel] (File/regular? (Path/join d rel))))))
+      (let [mod (BeamLisp.Emit/base_module_for ns)]
+        (and (Code/ensure_loaded? mod) (erlang/function_exported mod :__bl_init__ 0)))))
+
+(defn- facts_home
+  "`namespace_home` for `ns` served by `path`, in the realm `realm` (or nil)."
+  [ns path realm]
+  (let [kind (file_kind path)
+        decl (if (erlang/== nil realm) nil (maps/get :decl realm nil))
+        key (if (erlang/== nil realm) nil (maps/get :key realm nil))
+        ovr (if (erlang/== nil decl) nil (maps/get :overrides decl nil))]
+    (namespace_home kind
+      (and (erlang/not (erlang/== kind :tier)) (tier_owns? ns))
+      (or (decl_has? decl :shadow ns)
+          (and (erlang/not (erlang/== nil ovr)) (under_dir? path ovr)))
+      (decl_has? decl :uses ns)
+      (erlang/not (erlang/== nil key))
+      (erlang/not (erlang/== nil decl)))))
+
+(defn ns_home
+  "The home of `ns` right now, from the load path and the calling env's realm:
+   `:tier` when no project file serves it. For diagnostics and the console."
+  [ns]
+  (let [path (source_path ns)]
+    (if (erlang/== nil path) :tier (facts_home ns path (realm_facts)))))
+
+(defn- refusal_message
+  "The error for an undeclared replacement of a library namespace: what, where,
+   who owns it, and the line that would make it legal."
+  [ns path]
+  (erlang/iolist_to_binary
+    (list "bl: LOAD REFUSED — " path " would replace the library namespace `" ns "`.\n"
+          "  The library (std, lib, compat) owns that name; a project may replace it only\n"
+          "  inside its own realm, and only when it says so. Either:\n"
+          "    - add the name to :shadow in the project's env.bl:   :shadow [\"" ns "\"]\n"
+          "    - or remove the file (or the BEAM_LISP_PATH entry) that provides it.")))
+
+;; The module-name segment a realm-local namespace sits under. A realm's own and
+;; shadowed namespaces are named from the REALM (R<key>); a shared one is named from
+;; its CONTENT (S<first 12 hex of the declared hash>), so two projects that declare
+;; the same hash name the same module and two that declare different ones cannot clash.
+(defn- shared_prefix [] "S")
+(defn- realm_prefix [] "R")
+(defn- shared_hash_digits [] 12)
+(defn- hash_prefix_len [] 7) ; the length of "sha256:"
+
+(defn- segment_for
+  "The module-name segment for `ns` in `home`, in the realm `realm`."
+  [ns home realm]
+  (if (erlang/== home :shared)
+    (let [h (maps/get ns (maps/get :uses (maps/get :decl realm (maps/new)) (maps/new)) "")]
+      (erlang/iolist_to_binary
+        (list (shared_prefix) (String/slice h (hash_prefix_len) (shared_hash_digits)))))
+    (erlang/iolist_to_binary (list (realm_prefix) (maps/get :key realm)))))
+
+(defn- decl_has?
+  "Whether the realm declaration lists `ns` under `field` (:shadow, a list; :uses, a map)."
+  [decl field ns]
+  (and (erlang/not (erlang/== nil decl))
+       (let [v (maps/get field decl (list))]
+         ; A bl vector is a struct, which is also a map: only a PLAIN map is a keyed
+         ; declaration (:uses); anything else is a sequence of names (:shadow).
+         (if (and (erlang/is_map v) (erlang/not (maps/is_key :__struct__ v)))
+           (maps/is_key ns v)
+           (Enum/any? v (fn [x] (erlang/== x ns)))))))
+
+(defn- would_replace_compiled?
+  "Whether loading `ns` from source would REPLACE a namespace this VM already runs
+   compiled, with different content. Replacing a module that is executing purges it
+   and kills its runner with a bare `killed` (FUP-152), so that is the case to refuse;
+   a copy with the same closure hash is harmless, and a namespace with nothing
+   compiled has nothing to replace."
+  [ns]
+  (let [mod (BeamLisp.Emit/base_module_for ns)]
+    (if (and (Code/ensure_loaded? mod)
+             (erlang/function_exported mod :__bl_provenance__ 0))
+      (let [stamp (erlang/apply mod :__bl_provenance__ (list))]
+        (erlang/not (erlang/== (erlang/element 1 stamp) (BeamLisp.AOT/ns_closure_hash ns))))
+      false)))
+
+(defn- load_route
+  "How `ns` is to be loaded: :aot (the shared AOT-or-source path, published at :global)
+   or :source (from source, into the calling realm's env). Raises the refusal for an
+   undeclared replacement of a library namespace: always for a project file inside a
+   realm (it would publish over the platform's module), and for a BEAM_LISP_PATH file
+   when it would replace a compiled namespace with different content."
+  [ns]
+  (let [path (if (erlang/== :library (BeamLisp.Tiers/tier_of_ns ns)) (source_path ns) nil)]
+    (if (erlang/== nil path)
+      :aot
+      (let [home (facts_home ns path (Process/get :bl_load_realm))]
+        (cond
+          (and (erlang/== home :refuse)
+               (or (erlang/== (file_kind path) :project) (would_replace_compiled? ns)))
+            (erlang/error (Elixir.RuntimeError/exception (refusal_message ns path)))
+          (list-member? (local_homes) home) :source
+          :else :aot)))))
+
 (defn- do_load
   "Evaluate a required file at `:global`, under its own load path, marking the
    ns loaded only AFTER the eval. On failure, print the form attribution and
@@ -350,10 +591,18 @@
     (try
       (with_load_path (Path/dirname path)
         (fn []
-          (BeamLisp.Env/with_env :global
-            (fn []
-              (BeamLisp.Compiler/eval_string content (BeamLisp.Compiler/new_env ns) path)
-              (BeamLisp.Env/mark_loaded ns)))))
+          (let [realm (Process/get :bl_load_realm)
+                key (if (erlang/== nil realm) nil (maps/get :key realm nil))
+                home (if (erlang/== nil key) :global (facts_home ns path realm))
+                local? (list-member? (local_homes) home)
+                target (if local? (Process/get :bl_load_env) :global)]
+            (BeamLisp.Env/with_env target
+              (fn []
+                (if local?
+                  (BeamLisp.Env/put_key (tuple :realm_local ns) (segment_for ns home realm))
+                  nil)
+                (BeamLisp.Compiler/eval_string content (BeamLisp.Compiler/new_env ns) path)
+                (BeamLisp.Env/mark_loaded ns))))))
       (catch e
         (cond
           (erlang/== :error __EXCEPTION_KIND__)

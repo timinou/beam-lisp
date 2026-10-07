@@ -18,4 +18,9 @@ BeamLisp.Bootstrap.install!(System.fetch_env!("BL_COLD_EBIN"), seed_dir: System.
 if Application.get_env(:beam_lisp, :bootstrap_staging, []) != [], do: raise("candidate is not the current generation")
 {:ok, _} = Application.ensure_all_started(:beam_lisp)
 IO.inspect({:cold_candidate, BeamLisp.Optimize.version(), BeamLisp.eval("(+ 1 2)"), BeamLisp.eval("(lists/foldl (fn [x a] (+ a x)) 0 (lists/map (fn [x] (* x 2)) (lists/seq 0 31)))"), BeamLisp.AOTCache.current_compiler_key()})
+if files = System.get_env("BL_COLD_TESTS") do
+  result = BeamLisp.TestRT.run_suite(String.split(files, ","), [])
+  IO.inspect({:cold_test_result, result})
+  if result[:fail] > 0 or result[:error] > 0, do: System.halt(1)
+end
 '

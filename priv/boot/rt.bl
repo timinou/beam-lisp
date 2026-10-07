@@ -680,6 +680,94 @@
 
     :else false))
 
+;; ── callback preparation ───────────────────────────────────────────────────
+; A fold or a lazy map/filter invokes ONE callable once per element. `step`'s
+; generic fallback runs the whole `call-invoke` protocol every time — classify
+; the callable, build an argument list, look up a fixed arm, split a variadic
+; rest list. `call-prepare-callback` moves that decision OUT of the loop: it
+; resolves a NATIVE fun of the fixed arity the call site uses, so the hot path
+; is the BEAM's direct call. It is the ONE shared preparation seam; the reduce
+; walk (`reduce-callback`) and the map/filter entry points all route through it.
+;
+; Preparation is EFFECT-FREE and NONTHROWING. It calls nothing, so an invalid
+; callable still fails only at its first INVOCATION (never on empty input), and
+; a malformed arm keeps its own failure rather than falling through to another.
+
+(defn- call-prepare-generic
+  "The fallback `call-prepare-callback` keeps for a callable it cannot turn into
+   a native arm: a native `n`-arity wrapper around the ORIGINAL `call-invoke`,
+   so the same arguments reach the same protocol and the same failure the
+   unprepared path would raise."
+  [f n]
+  (cond
+    (erlang/== n 1) (fn [x] (call-invoke f (raw-cons x ())))
+    :else (fn [acc x] (call-invoke f (raw-cons acc (raw-cons x ()))))))
+
+(defn- call-prepare-callback
+  "Normalize a callable for a FIXED arity `n` (1 or 2) into a native `n`-arity
+   fun, so a hot call site pays the BEAM's direct call instead of the generic
+   `call-invoke` protocol on every element. Resolved ONCE per traversal:
+
+     · a native fun of arity `n`                      → itself, unchanged;
+     · a well-formed `$blfn` tuple whose valid fixed arm is at `n`
+                                                      → that arm;
+     · a `$blfn` whose eligible variadic arm covers `n` (min ≤ n)
+                                                      → a native adapter that
+                                                        reproduces
+                                                        `invoke-multi`'s exact
+                                                        call: the first `min`
+                                                        arguments then the REST
+                                                        as ONE proper list;
+     · anything else (keyword/map/set/vector/remote/opaque, a wrong arity, or a
+       MALFORMED fixed/variadic descriptor)            → a native wrapper around
+                                                        the ORIGINAL
+                                                        `call-invoke`.
+
+   A present-but-malformed fixed arm is NOT skipped for a variadic one — the
+   wrapper preserves the fixed arm's own failure. The captured value is adapted
+   privately: the registry tuple and the callable's identity are never replaced,
+   so a later rebinding affects future captures, not this one."
+  [f n]
+  (cond
+    (erlang/is_function f n) f
+
+    (and (erlang/is_tuple f)
+         (erlang/== 3 (erlang/tuple_size f))
+         (erlang/== :"$blfn" (erlang/element 1 f)))
+    (let [fixed (erlang/element 2 f)
+          variadic (erlang/element 3 f)]
+      (cond
+        (erlang/== false (erlang/is_map fixed))
+        (call-prepare-generic f n)
+
+        (erlang/is_map_key n fixed)
+        (let [arm (maps/get n fixed)]
+          (cond
+            (erlang/is_function arm n) arm
+            :else (call-prepare-generic f n)))
+
+        (and (erlang/is_tuple variadic)
+             (erlang/== 2 (erlang/tuple_size variadic))
+             (erlang/is_integer (erlang/element 1 variadic))
+             (erlang/>= (erlang/element 1 variadic) 0)
+             (erlang/is_function (erlang/element 2 variadic)
+                                 (erlang/+ (erlang/element 1 variadic) 1))
+             (erlang/>= n (erlang/element 1 variadic)))
+        (let [mn (erlang/element 1 variadic)
+              vf (erlang/element 2 variadic)]
+          (cond
+            (erlang/== n 1)
+            (cond
+              (erlang/== mn 0) (fn [x] (vf (raw-cons x ())))
+              :else (fn [x] (vf x ())))
+            (erlang/== mn 0) (fn [acc x] (vf (raw-cons acc (raw-cons x ()))))
+            (erlang/== mn 1) (fn [acc x] (vf acc (raw-cons x ())))
+            :else (fn [acc x] (vf acc x ()))))
+
+        :else (call-prepare-generic f n)))
+
+    :else (call-prepare-generic f n)))
+
 ;; apply-to: apply with seq argument
 (defn call-apply-to [f args]
   (call-invoke f (seq-to-args args)))
@@ -914,9 +1002,7 @@
 (defn seq-entry
   "A 2-element vector — the shape a map's seq yields (Clojure's MapEntry)."
   [kk v]
-  (maps/put :meta nil
-    (maps/put :items (tuple2 kk v)
-      (maps/put :__struct__ :"Elixir.BeamLisp.Vector" (maps/new)))))
+  (BeamLisp.Vector/new (raw-cons kk (raw-cons v ()))))
 
 (defn- rev [xs] (erlang/apply :lists :reverse (seq-one xs)))
 
@@ -1021,9 +1107,22 @@
       :else ())))
 
 (defn k-next
-  "`(seq (rest x))`: nil when nothing remains."
+  "`(seq (rest x))`: nil when nothing remains.
+
+   A LIST and a VECTOR are answered without the classify-twice walk. The rest
+   of either is a list, whose seq is itself or nil. `(seq v)` of a vector is
+   the vector, so a `(loop [s (seq v)] … (next s))` walk asks this for EVERY
+   step after the first."
   [x]
-  (k-seq (k-rest x)))
+  (cond
+    (erlang/is_list x) (cond (empty-list? x) nil
+                             :else (let [t (erlang/tl x)]
+                                     (cond (erlang/is_list t) (cond (empty-list? t) nil :else t)
+                                           :else (k-seq t))))
+    (struct-of? x :"Elixir.BeamLisp.Vector")
+      (let [t (k-rest (BeamLisp.Vector/to_list x))]
+        (cond (empty-list? t) nil :else t))
+    :else (k-seq (k-rest x))))
 
 (declare k-count)
 
@@ -1206,6 +1305,8 @@
   [x]
   (let [claim (lazy-fold-claim x)]
     (cond
+      ; a vector is already realised: its element list, without a cell walk
+      (struct-of? x :"Elixir.BeamLisp.Vector") (BeamLisp.Vector/to_list x)
       (erlang/== claim nil) (to-list-memo x)
       :else (erlang/element 2 (lazy-fold-claimed x claim (fn [a _] a) nil)))))
 
@@ -1360,11 +1461,13 @@
         (erlang/== mod :"Elixir.BeamLisp.Vector")
         (let [meta (erlang/map_get :meta x)]
           (cond
-            (erlang/== nil meta)
+            (erlang/=/= nil meta) true
+            ; no `:items` field: the JS target's vector (PLAN-163 C2)
+            (erlang/== false (erlang/is_map_key :items x)) (any-meta-in-list? (BeamLisp.Vector/to_list x))
+            :else
             (let [items (erlang/map_get :items x)]
               (cond (dense-items? items) (needs-normalizing? items)
-                    :else false))
-            :else true))
+                    :else false))))
 
         (erlang/== mod :"Elixir.BeamLisp.Set")
         (any-meta-in-list? (BeamLisp.Set/to_list x))
@@ -1397,6 +1500,13 @@
     (let [mod (hash-struct-mod x)]
       (cond
         (erlang/== mod :"Elixir.BeamLisp.Vector")
+        (cond
+          ; no `:items` field: the JS target's vector (PLAN-163 C2) — rebuilt
+          ; from its normalized elements, which also drops the metadata
+          (erlang/== false (erlang/is_map_key :items x))
+          (cond (carries-meta? x) (BeamLisp.Vector/new (k-to-list (map (fn [e] (hash-hash-key e)) (BeamLisp.Vector/to_list x))))
+                :else x)
+          :else
         (let [meta (erlang/map_get :meta x)
               normalized (cond (erlang/== nil meta) x
                                :else (maps/put :meta nil x))
@@ -1409,7 +1519,7 @@
                                                                    (erlang/tuple_to_list items))))
                             normalized)
                   :else normalized)
-            :else normalized))
+            :else normalized)))
 
         (erlang/== mod :"Elixir.BeamLisp.Set")
         (let [members (BeamLisp.Set/to_list x)]
@@ -1509,8 +1619,8 @@
       (let [r (Float/ratio x)]
         (reduce-ratio (erlang/element 1 r) (erlang/element 2 r)))
       (erlang/== kd :decimal)
-      (let [u (erlang/map_get :unscaled x)
-            s (erlang/map_get :scale x)]
+      (let [u (BeamLisp.Decimal/unscaled x)
+            s (BeamLisp.Decimal/scale x)]
         (cond
           (erlang/== s 0) (tuple2 u 1)
           (erlang/< s 0) (tuple2 (erlang/* u (pow10 (erlang/- 0 s))) 1)
@@ -1914,6 +2024,21 @@
    together; `=` asks the stricter question."
   [a b]
   (cond
+    ; THE LEAF FAST PATH. `=` is the most-called predicate in the language —
+    ; `nil?`, `some?`, `not=` and every `(= k (:id e))` reach it — and the
+    ; general answer below costs `unwrap-meta`, `kind` and `family` per side
+    ; (~40 reductions) to say what one term test already knows. Each clause is
+    ; an EXACT correspondence with `k-compare`, never an approximation:
+    ;   * identical terms are distance 0 (k-compare's own first clause; a
+    ;     decimal pair that is =:= is the same value, scale included);
+    ;   * an atom (nil, a boolean, a keyword) is only ever equal to itself or
+    ;     to a `{:meta …}` wrapper of itself — no struct, number, string,
+    ;     list or map shares an atom's family — so an atom against anything
+    ;     but a TUPLE is decided here, and the tuple case (a possible wrapper)
+    ;     defers to the full comparison.
+    (erlang/=:= a b) true
+    (erlang/is_atom a) (cond (erlang/is_tuple b) (erlang/== 0 (k-compare a b)) :else false)
+    (erlang/is_atom b) (cond (erlang/is_tuple a) (erlang/== 0 (k-compare a b)) :else false)
     (and (struct-of? a :"Elixir.BeamLisp.Decimal") (struct-of? b :"Elixir.BeamLisp.Decimal"))
       (erlang/=:= a b)
     :else (erlang/== 0 (k-compare a b))))
@@ -1927,9 +2052,7 @@
 ;; ── helpers ────────────────────────────────────────────────────────────────
 
 (defn- coll-entry [kk v]
-  (maps/put :meta nil
-    (maps/put :items (tuple2 kk v)
-      (maps/put :__struct__ :"Elixir.BeamLisp.Vector" (maps/new)))))
+  (BeamLisp.Vector/new (raw-cons kk (raw-cons v ()))))
 
 (defn- coll-hash-key [k]
   "The hash boundary, asked once: hashing must strip metadata, or `(= a b)` is
@@ -1982,8 +2105,8 @@
   "A `[k v]` map entry as `{k, v}`: a 2-vector, a 2-list or a 2-tuple — or nil."
   [e]
   (cond
-    (and (struct-of? e :"Elixir.BeamLisp.Vector") (erlang/== 2 (erlang/tuple_size (erlang/map_get :items e))))
-      (erlang/map_get :items e)
+    (and (struct-of? e :"Elixir.BeamLisp.Vector") (erlang/== 2 (BeamLisp.Vector/count e)))
+      (tuple2 (BeamLisp.Vector/nth e 0) (BeamLisp.Vector/nth e 1))
     (and (erlang/is_list e) (erlang/=/= e ()) (erlang/is_list (erlang/tl e)) (erlang/=/= (erlang/tl e) ())
          (erlang/== (erlang/tl (erlang/tl e)) ()))
       (tuple2 (erlang/hd e) (erlang/hd (erlang/tl e)))
@@ -2215,11 +2338,18 @@
    `comp` may be a 3-way comparator (returns a number, like `compare`) or a
    boolean predicate (like `<`), which is Clojure's contract for both `sort` and
    `sort-by`."
-  ([coll] (coll-sort (fn [a b] (k-compare a b)) coll))
+  ([coll]
+   (let [xs (k-to-list (k-seq coll))
+         le (fn [a b] (erlang/=< (k-compare a b) 0))]
+     (erlang/apply :lists :sort (raw-cons le (raw-cons xs ())))))
   ([comp coll]
    (let [xs (k-to-list (k-seq coll))
-         le (fn [a b]
-              (comparator-le (call-invoke comp (raw-cons a (raw-cons b ())))))]
+         ; a plain 2-arity fun is called directly: `call-invoke` would build an
+         ; argument list per comparison only to apply the same fun to it
+         le (cond
+              (erlang/is_function comp 2) (fn [a b] (comparator-le (comp a b)))
+              :else (fn [a b]
+                      (comparator-le (call-invoke comp (raw-cons a (raw-cons b ()))))))]
      (erlang/apply :lists :sort (raw-cons le (raw-cons xs ()))))))
 
 
@@ -2459,6 +2589,14 @@
     (erlang/is_function f) (erlang/apply f args)
     :else (call-invoke f args)))
 
+(defn- lazy-invoke1
+  "`(f x)`: `lazy-invoke` of one argument. A 1-arity fun is called directly —
+   no argument list per element in the map/filter chunk walks."
+  [f x]
+  (cond
+    (erlang/is_function f 1) (f x)
+    :else (lazy-invoke f (raw-cons x ()))))
+
 ;; ── seqable: coerce a collection to a seqable form ────────────────────────
 (defn- seqable
   "RT's `seqable/1`: the form the lazy walkers (map, filter, …) consume. A set
@@ -2482,7 +2620,7 @@
 (defn lazy--map [f coll]
   "Map `f` over a collection lazily. The result is a lazy seq that applies `f`
    to each element as it is consumed; forcing only the prefix that is demanded."
-  (lazy-map f (BeamLisp.LazySeq/input (seqable coll))))
+  (lazy-map (call-prepare-callback f 1) (BeamLisp.LazySeq/input (seqable coll))))
 
 (defn- lazy-map [f coll]
   ; The fold recipe folds the SOURCE (a cursor or list, not a memo cell), so a
@@ -2498,34 +2636,38 @@
           :else
           (let [h (erlang/hd cell)
                 t (erlang/tl cell)
-                f-h (lazy-invoke f (lazy-one h))
+                f-h (lazy-invoke1 f h)
                 chunk-size (BeamLisp.LazySeq/chunk_size)
                 result (map-chunk f (raw-cons f-h ()) t (erlang/- chunk-size 1))]
-            (let [elems (erlang/element 1 result)
+            (let [acc (erlang/element 1 result)
                   rest (erlang/element 2 result)]
               (cond
-                (erlang/== nil rest) elems
-                :else (BeamLisp.LazySeq/chain elems
-                         (fn [] (lazy-map f rest)))))))))
+                (erlang/== nil rest) (lists/reverse acc)
+                :else (lists/reverse acc
+                         (BeamLisp.LazySeq/new (fn [] (lazy-map f rest))))))))))
     (fn [rf init]
       (lazy-reduce-source
-        (fn [acc x] (rf acc (lazy-invoke f (lazy-one x))))
+        (fn [acc x] (rf acc (lazy-invoke1 f x)))
         init
         coll))))
 
 (defn- map-chunk [f acc coll n]
   "Collect up to n elements from coll, applying f to each, accumulating in
-   reverse. Returns [elements rest]."
+   REVERSE. Returns [reversed-accumulator rest]; rest is nil when the input
+   ran out. The caller finishes the chunk ONCE (see `lazy-map`):
+   `lists/reverse/1` for an exhausted chunk, `lists/reverse/2` onto the tail
+   node for a continuing one, so an emitted element is consed once instead of
+   twice."
   (cond
-    (erlang/== n 0) (tuple2 (lists/reverse acc) coll)
+    (erlang/== n 0) (tuple2 acc coll)
     :else
     (let [cell (BeamLisp.LazySeq/cell coll)]
       (cond
-        (erlang/== nil cell) (tuple2 (lists/reverse acc) nil)
+        (erlang/== nil cell) (tuple2 acc nil)
         :else
         (let [h (erlang/hd cell)
               t (erlang/tl cell)
-              f-h (lazy-invoke f (lazy-one h))]
+              f-h (lazy-invoke1 f h)]
           (map-chunk f (raw-cons f-h acc) t (erlang/- n 1)))))))
 
 ;; ── map-multi: map over multiple collections ───────────────────────────────
@@ -2580,7 +2722,7 @@
 (defn lazy-filter [pred coll]
   "Filter `coll` with `pred`, lazily. Returns a lazy seq of elements for which
    `pred` returns a truthy value."
-  (lazy-filter* pred (BeamLisp.LazySeq/input (seqable coll))))
+  (lazy-filter* (call-prepare-callback pred 1) (BeamLisp.LazySeq/input (seqable coll))))
 
 (defn- lazy-filter* [pred coll]
   (let [coll (BeamLisp.LazySeq/input coll)]
@@ -2591,7 +2733,7 @@
         (lazy-reduce-source
           (fn [acc x]
             (cond
-              (lazy-invoke pred (lazy-one x)) (rf acc x)
+              (lazy-invoke1 pred x) (rf acc x)
               :else acc))
           init
           coll)))))
@@ -2599,28 +2741,37 @@
 (defn- lazy-filter-realise [pred coll]
   "One cell of `filter`: scan up to `chunk_size` INPUTS (never 'until 32
    matches' — a sparse predicate over an infinite coll must still seal a
-   chunk), looping in place past an all-reject scan so no cell is empty."
+   chunk), looping in place past an all-reject scan so no cell is empty.
+
+   `filter-chunk` hands back a REVERSED accumulator; the chunk is finished
+   ONCE here — `lists/reverse/1` when the input ran out, `lists/reverse/2`
+   onto the tail node otherwise. An all-reject scan (empty accumulator) keeps
+   scanning IN PLACE rather than publishing an empty chunk, and so never
+   allocates the tail until a matching element exists."
   (let [r (filter-chunk pred () coll (BeamLisp.LazySeq/chunk_size))
-        elems (erlang/element 1 r)
+        acc (erlang/element 1 r)
         rest (erlang/element 2 r)]
     (cond
-      (erlang/== nil rest) elems
-      (erlang/== () elems) (lazy-filter-realise pred rest)
-      :else (BeamLisp.LazySeq/chain elems (fn [] (lazy-filter* pred rest))))))
+      (erlang/== nil rest) (lists/reverse acc)
+      (erlang/== () acc) (lazy-filter-realise pred rest)
+      :else (lists/reverse acc
+               (BeamLisp.LazySeq/new (fn [] (lazy-filter* pred rest)))))))
 
 (defn- filter-chunk [pred acc coll n]
-  "Scan up to n INPUT elements, keeping those matching pred (reversed in acc).
-   Returns {elements rest}; rest is nil when the input ran out."
+  "Scan up to n INPUT elements, keeping those matching pred (accumulated in
+   REVERSE). Returns {reversed-accumulator rest}; rest is nil when the input ran
+   out. The caller finishes the chunk once (see `lazy-filter-realise`) and NEVER
+   reverses an empty accumulator onto a tail."
   (cond
-    (erlang/== n 0) (tuple2 (lists/reverse acc) coll)
+    (erlang/== n 0) (tuple2 acc coll)
     :else
     (let [cell (BeamLisp.LazySeq/cell coll)]
       (cond
-        (erlang/== nil cell) (tuple2 (lists/reverse acc) nil)
+        (erlang/== nil cell) (tuple2 acc nil)
         :else
         (let [h (erlang/hd cell)]
           (filter-chunk pred
-                        (cond (lazy-invoke pred (lazy-one h)) (raw-cons h acc) :else acc)
+                        (cond (lazy-invoke1 pred h) (raw-cons h acc) :else acc)
                         (erlang/tl cell) (erlang/- n 1)))))))
 
 ;; ── filter-xform: transducer version of filter ─────────────────────────────
@@ -2787,28 +2938,32 @@
                :else (recur (erlang/+ i 1) acc2)))))))))
 
 (defn- range-chunk [start end_]
-  "Build one chunk of integers (up to chunk_size) with a lazy tail if not exhausted."
+  "Build one chunk of integers (up to chunk_size) with a lazy tail if not
+   exhausted. `range-build` hands back a REVERSED accumulator; the chunk is
+   finished ONCE here — `lists/reverse/1` when the range ran out,
+   `lists/reverse/2` onto the tail node for a continuing chunk."
   (cond
     (erlang/and (erlang/== false (erlang/== end_ nil)) (erlang/>= start end_))
     nil
     :else
     (let [chunk-size (BeamLisp.LazySeq/chunk_size)
           result (range-build start end_ () chunk-size)]
-      (let [elems (erlang/element 1 result)
+      (let [acc (erlang/element 1 result)
             next (erlang/element 2 result)]
         (cond
-          (erlang/== nil next) elems
-          :else (BeamLisp.LazySeq/chain elems
-                   (fn [] (range-chunk next end_))))))))
+          (erlang/== nil next) (lists/reverse acc)
+          :else (lists/reverse acc
+                   (BeamLisp.LazySeq/new (fn [] (range-chunk next end_)))))))))
 
 (defn- range-build [i end_ acc n]
-  "Accumulate integers from i until end_ or chunk is full. Returns [elems next]."
+  "Accumulate integers from i until end_ or chunk is full, in REVERSE. Returns
+   [reversed-accumulator next]."
   (cond
-    (erlang/== n 0) (tuple2 (lists/reverse acc) i)
+    (erlang/== n 0) (tuple2 acc i)
     :else
     (cond
       (erlang/and (erlang/== false (erlang/== end_ nil)) (erlang/>= i end_))
-      (tuple2 (lists/reverse acc) nil)
+      (tuple2 acc nil)
       :else
       (range-build (erlang/+ i 1) end_ (raw-cons i acc) (erlang/- n 1)))))
 
@@ -2985,11 +3140,7 @@
         (erlang/== struct :"Elixir.BeamLisp.Sorted.SortedMap")
         (lists/map (fn [e]
                   (let [k (erlang/element 1 e) v (erlang/element 2 e)]
-                    (maps/put :meta nil
-                      (maps/put :items (tuple2 k v)
-                        (maps/put :__struct__
-                          :"Elixir.BeamLisp.Vector"
-                          (maps/new))))))
+                    (BeamLisp.Vector/new (raw-cons k (raw-cons v ())))))
             entries)
         :else entries))))
 
@@ -3880,7 +4031,17 @@
                   (reduce-reduced? acc2) acc2
                   :else (recur (erlang/+ i 1) acc2))))))))))
 
-(defn- reduce-vector [f acc v]
+(defn- reduce-vector
+  "Fold a vector. The BEAM vector's `:items` (a dense tuple or a `:bl_vec`
+   trie) is walked in place, allocating nothing. A host whose vector keeps
+   its elements elsewhere (the JS target: no `:items` field, PLAN-163 C2)
+   folds the element list `BeamLisp.Vector/to_list` gives — one guard BIF on
+   the BEAM path, the representation owned by the Vector module everywhere."
+  [f acc v]
+  (cond
+    (erlang/== false (erlang/is_map_key :items v))
+    (reduce-tuple-elems f acc (erlang/list_to_tuple (BeamLisp.Vector/to_list v)))
+    :else
   (let [items (erlang/map_get :items v)]
     (cond
       (trie-items? items)
@@ -3891,7 +4052,7 @@
         (cond
           (reduce-reduced? acc1) acc1
           :else (reduce-tuple-elems f acc1 tail)))
-      :else (reduce-tuple-elems f acc items))))
+      :else (reduce-tuple-elems f acc items)))))
 
 (defn- reduce-map
   "Iterate a plain map directly. Entries are the same `[k v]` vectors the seq
@@ -4110,6 +4271,17 @@
         (cond (compat-reduced? acc) (BeamLisp.Refs/deref acc)
               :else acc)))))
 
+(defn reduce-callback
+  "The step callback `(acc x)` as ONE native 2-arity fun, prepared ONCE per
+   traversal — see `call-prepare-callback`. A native 2-arity `f` is returned
+   itself; a fixed `$blfn` arm becomes that arm; an eligible variadic arm
+   becomes a native adapter reproducing `invoke-multi` exactly; anything else
+   is wrapped around the ORIGINAL `call-invoke`. Building it calls nothing, so
+   an invalid `f` still fails only at its first step (never on empty input),
+   and the original failure is preserved."
+  [f]
+  (call-prepare-callback f 2))
+
 (defn k-reduce
   "`(reduce f init coll)`: fold `f` as `(f acc x)` over `coll`, returning the
    accumulator. Dispatch happens once, on the collection's kind; the walk is
@@ -4128,24 +4300,36 @@
    `core/reduced?` rejects) can never halt it. Per element: unwrap, call `f`
    once, THEN ask the live `core/reduced?`; truthy → `BeamLisp.Refs/deref` once
    and return the intrinsic Reduced carrying `{:$reduce_halt payload}`; else
-   re-envelope."
-  ([f init coll] (k-reduce f init coll :kernel))
-  ([f init coll policy]
-   (cond
-     (erlang/== policy :compat)
-     (compat-finish
-       (k-fold (fn [env x]
-                 (let [r (step f (erlang/element 2 env) x)]
-                   (cond
-                     (compat-reduced? r)
-                     (reduce-reduced (tuple :"$reduce_halt" (BeamLisp.Refs/deref r)))
-                     :else (tuple :"$reduce_acc" r))))
-               (tuple :"$reduce_acc" init) coll policy))
-     :else
-     (let [out (k-fold f init coll policy)]
-       (cond
-         (reduce-reduced? out) (unwrap out)
-         :else out)))))
+   re-envelope.
+
+   `mode` (5-arity, explicit, additive; every ordinary call is `:normalized`):
+   `:normalized` selects the callback representation ONCE per traversal with
+   `reduce-callback` and then runs the SAME walks. It is representation
+   mechanics only — the generic wrapper delegates to the same `call-invoke`,
+   creating it never invokes `f`, and the live `reduced?` fetch is untouched.
+   `:baseline` keeps the raw `f` as the differential ORACLE the prototype test
+   compares against; the ordinary arities PREPARE, because
+   `reduce-callback`/`call-prepare-callback` preserve the outcome and the
+   errors exactly while removing the per-element dispatch."
+  ([f init coll] (k-reduce f init coll :kernel :normalized))
+  ([f init coll policy] (k-reduce f init coll policy :normalized))
+  ([f init coll policy mode]
+   (let [cb (cond (erlang/== mode :normalized) (reduce-callback f) :else f)]
+     (cond
+       (erlang/== policy :compat)
+       (compat-finish
+         (k-fold (fn [env x]
+                   (let [r (step cb (erlang/element 2 env) x)]
+                     (cond
+                       (compat-reduced? r)
+                       (reduce-reduced (tuple :"$reduce_halt" (BeamLisp.Refs/deref r)))
+                       :else (tuple :"$reduce_acc" r))))
+                 (tuple :"$reduce_acc" init) coll policy))
+       :else
+       (let [out (k-fold cb init coll policy)]
+         (cond
+           (reduce-reduced? out) (unwrap out)
+           :else out))))))
 
 
 ;; ════ rt.sorted ════════════════════════════════════════════════════════════════
@@ -4211,9 +4395,8 @@
     (fn [e m]
       (cond
         (and (struct-of? e :"Elixir.BeamLisp.Vector")
-             (erlang/== 2 (erlang/tuple_size (erlang/map_get :items e))))
-          (BeamLisp.Sorted/map_put m (erlang/element 1 (erlang/map_get :items e))
-                                     (erlang/element 2 (erlang/map_get :items e)))
+             (erlang/== 2 (BeamLisp.Vector/count e)))
+          (BeamLisp.Sorted/map_put m (BeamLisp.Vector/nth e 0) (BeamLisp.Vector/nth e 1))
         (and (erlang/is_list e) (erlang/=/= e ()) (erlang/is_list (erlang/tl e))
              (erlang/=/= (erlang/tl e) ()) (erlang/== (erlang/tl (erlang/tl e)) ()))
           (BeamLisp.Sorted/map_put m (erlang/hd e) (erlang/hd (erlang/tl e)))
@@ -4501,6 +4684,11 @@
   ([] (print-gensym))
   ([prefix] (print-gensym prefix)))
 (defn str [] (str-0))
+(defn str_v
+  "The LINKED `str`: the call site's arguments as one list, exactly what the
+   variadic clause of `str-0`'s value receives."
+  [args]
+  (map-join "" args (fn [v] (to-str v))))
 
 ; `drop-clj` is the Clojure-ordered `(drop n coll)`, which is the order the
 ; `core` link table binds the name `drop` to; the compiler lowers `:drop`
@@ -4533,6 +4721,19 @@
 (defn map [f coll] (lazy--map f coll))
 (defn map-multi [f c1 rest] (lazy-map-multi f c1 rest))
 (defn filter [pred coll] (lazy-filter pred coll))
+
+(defn core_filter_2?
+  "Whether invocation at arity two selects the runtime's filter intrinsic.
+   Compare actual captures, not an Env name or author-supplied proof marker."
+  [f]
+  (let [intrinsic (erlang/make_fun :Elixir.BeamLisp.Ns.Rt :filter 2)]
+    (cond
+      (erlang/is_function f 2) (erlang/=:= f intrinsic)
+      (and (erlang/is_tuple f) (erlang/== 3 (erlang/tuple_size f))
+           (erlang/== :"$blfn" (erlang/element 1 f))
+           (erlang/is_map (erlang/element 2 f)))
+        (erlang/=:= intrinsic (maps/get 2 (erlang/element 2 f) nil))
+      :else false)))
 (defn take-while [pred coll] (lazy-take-while pred coll))
 (defn drop-while [pred coll] (lazy-drop-while pred coll))
 (defn doall
@@ -4734,13 +4935,17 @@
     ("repeat" :rt {1 :repeat 2 :repeat} nil :both)
     ("cycle" :rt {1 :cycle} nil :both)
     ("concat" :rt {} (0 :concat) :value)
+    ; `str` stays a VALUE (seed-closures puts the multi-fn) and is ALSO linked:
+    ; a bare `(str a b)` compiles to one direct `str_v([a, b])` instead of an
+    ; `Env/fetch!` + `invoke` per call — the most-fetched var of a page render.
+    ("str" :rt {} (0 :str_v) :link)
     ("take" :rt {1 :take_xform 2 :take} nil :both)
     ("drop" :rt {2 :drop_clj} nil :both)
     ("take-while" :rt {2 :take_while} nil :both)
     ("drop-while" :rt {2 :drop_while} nil :both)
     ("doall" :rt {1 :doall} nil :both)
     ("dorun" :rt {1 :dorun} nil :both)
-    ("not" :rt {1 :not_} nil :value)
+    ("not" :rt {1 :not_} nil :both)
     ("even?" :rt {1 :even?} nil :both)
     ("odd?" :rt {1 :odd?} nil :both)
     ("zero?" :rt {1 :zero?} nil :both)

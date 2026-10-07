@@ -12,7 +12,7 @@
 ; ══ WHY A SEPARATE OS PROCESS, NOT A DAEMON NAMESPACE ═══════════════════════
 ;
 ; The gateway holds a privileged-ish port and blocks; it is its own foreground
-; process (`bl gateway run`, or a systemd unit that execs it), discovered by an
+; process (`bl vm start gateway --foreground`, or a systemd unit that execs it), discovered by an
 ; endpoint FILE under the runtime dir. Its liveness is the endpoint owner's
 ; liveness — a crashed gateway leaves a file that the next reader sweeps by pid,
 ; never a false "already running". This is the K10 lesson made concrete: the
@@ -32,7 +32,8 @@
 ;   (gateway/command)           → which `bl` to exec (systemd/detached start)
 
 (ns vm.gateway
-  (:require [vm.paths :as paths] [vm.ports :as ports] [vm.ca :as ca]))
+  (:require [vm.paths :as paths] [vm.ports :as ports] [vm.ca :as ca]
+            [vm.registry :as registry]))
 
 ;; string helpers — core provides these; alias so the proxy logic reads clean
 (defn- s-split [s sep] (split s sep))
@@ -289,7 +290,7 @@
 
 (defn- refusal [host]
   (str "no claim holds \"" host "\" — nothing on this machine answers to that name.\n"
-       "run `bl ports` to see the names that are live.\n"))
+       "run `bl vm` to see the names that are live.\n"))
 
 (defn- ca-opts [host]
   (to-list (concat (to-list (:ok (ca/ssl-opts host))) (list (tuple :active false)))))
@@ -517,6 +518,74 @@
 (defn sysctl-command []
   (str "sudo sysctl -w net.ipv4.ip_unprivileged_port_start=" PREFERRED))
 
+;; ── lazy start: a name nobody can reach starts the thing that reaches it ──────
+;;
+;; A project that claims a NAME (a claim carrying hosts) is asking to be reached by it, and
+;; only the gateway can answer a name. Starting it by hand was a step people forgot, and
+;; `bl vm` then said "names claimed, nothing answers". `ensure-for-claim` starts it, once.
+;; The decision is a pure table (`lazy-start-decision`); the start itself never blocks the
+;; claim and never fails it: a project whose name cannot be served still runs on its port.
+;;
+;; Two projects claiming at the same instant both ask; the gateway refuses a second
+;; instance by itself (`run` names the running one), so racing is harmless and needs no lock.
+
+(defn lazy-start-decision
+  "Whether to start the gateway for a claim, as a keyword:
+     :no-hosts     the claim carries no name, so there is nothing for a gateway to answer
+     :running      one already answers
+     :disabled     the user said never (`BL_GATEWAY=off`, the one switch for a machine that
+                   does not want a background process it did not ask for)
+     :no-launcher  nothing to start it with (no `bl` on PATH and no BL_BIN)
+     :start        start one
+   Facts in, word out; nothing is read or started here."
+  [hosts running? disabled? launcher?]
+  (cond
+    (empty? hosts) :no-hosts
+    running?       :running
+    disabled?      :disabled
+    (not launcher?) :no-launcher
+    :else          :start))
+
+(defn- gateway-disabled? []
+  (= "off" (System/get_env "BL_GATEWAY")))
+
+(def STARTER-KEY (tuple :vm_gateway :starter))
+
+(defn set-starter!
+  "Replace what `ensure-for-claim` does when the decision is :start: `f` is called with the
+   launcher command. nil restores the real one (a detached `bl vm start gateway --foreground`).
+   A seam for tests, so a session that claims a name never launches a real gateway from a test
+   run, and the decision can be observed without a process."
+  [f]
+  (if (nil? f)
+    (erlang/apply :persistent_term :erase (list STARTER-KEY))
+    (erlang/apply :persistent_term :put (list STARTER-KEY f)))
+  :ok)
+
+(defn- detached-start [bin]
+  (try
+    (System/cmd "sh" (to-list ["-c" (str "setsid " bin " vm start gateway --foreground"
+                                         " < /dev/null > " (log-path) " 2>&1 &")]))
+    (catch e nil)))
+
+(defn ensure-for-claim
+  "Start the gateway if a claim carrying `hosts` needs one and none answers. Returns the
+   decision keyword. The start is detached (setsid, output to a log) and not waited for."
+  [hosts]
+  (let [bin (command)
+        d (lazy-start-decision hosts (not (nil? (port))) (gateway-disabled?) (some? bin))]
+    (when (= :start d)
+      ((erlang/apply :persistent_term :get (list STARTER-KEY detached-start)) bin))
+    d))
+
+(defn log-path
+  "Where a detached gateway's output goes: a failure to come up must leave its reason somewhere."
+  []
+  (let [state (or (System/get_env "XDG_STATE_HOME") (str (System/get_env "HOME") "/.local/state"))
+        dir (str state "/beam-lisp")]
+    (File/mkdir_p dir)
+    (str dir "/gateway.log")))
+
 (defn command
   "The command that starts THIS beam-lisp: $BL_BIN, else `bl` on PATH, else nil."
   []
@@ -542,7 +611,7 @@
      (if (and (not= want 0) (contains? (endpoint) :ok))
        (let [ep (:ok (endpoint))]
          {:error (str "a gateway is already up on port " (get ep :port) " (pid " (get ep :pid)
-                      ") — `bl gateway stop` first, or run one on an ephemeral port with --port 0")})
+                      ") — `bl vm stop gateway` first, or run one on an ephemeral port with --port 0")})
        (let [r (if (and (erlang/is_integer want) (> want 0)) (listen-pinned want)
                  (if (= want 0) (bind-all 0) (listen-unpinned)))]
          (if (contains? r :error)
@@ -556,7 +625,11 @@
                (erlang/apply :erlang :unregister (list OWNER)))
              (erlang/register OWNER (erlang/self))
              (erlang/apply :persistent_term :put (list PT-PORT gw-port))
-             (when (not= want 0) (write-endpoint gw-port))
+             (when (not= want 0)
+               (write-endpoint gw-port)
+               ;; the gateway is a VM in its own right (role :gateway): the
+               ;; endpoint file says where it listens, the record says it exists.
+               (try (registry/publish! :gateway {:label "gateway"}) (catch e nil)))
              (println (str "bl gateway on 127.0.0.1:" gw-port))
              (println (str "  names answer here: " (route-summary)))
              (println (str "  pac  http://127.0.0.1:" gw-port "/bl.pac"

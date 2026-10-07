@@ -1,0 +1,107 @@
+;; Aggregate accounting for registered optional-cache owners. The ledger has
+;; VM lifetime, so collector-process death can NEVER reset outstanding credits.
+(ns data.cache-pool)
+
+(def MAX-BYTES (* 256 1024 1024))
+(def MAX-OWNERS 256)
+(def OWNER-CHARGE 4096)
+(def KEY :data.cache-pool/ledger-v1)
+(def NAME :data_cache_pool_collector)
+
+(defn- ledger []
+  (or (persistent_term/get KEY nil)
+      (global/trans (tuple KEY (erlang/self))
+        (fn [] (or (persistent_term/get KEY nil)
+                   (let [cell (atom {:bytes 0 :owners {} :tickets {}})]
+                     (persistent_term/put KEY cell) cell))))))
+
+(defn- drop-owner [state owner]
+  (if-let [held (get-in state [:owners owner])]
+    (let [tickets (:tickets held)
+          bytes (+ OWNER-CHARGE (reduce + 0 (map (fn [token] (:weight (get-in state [:tickets token]))) tickets)))]
+      (-> state (update :bytes - bytes) (update :owners dissoc owner)
+          (update :tickets (fn [all] (reduce dissoc all tickets))))) state))
+
+(defn reap!
+  "Reclaim only owners proved dead. An alive caller timing out is never proof
+   that a message or retained cache value vanished. No query runs on cache hits."
+  []
+  (swap! (ledger) (fn [s] (reduce (fn [st owner] (if (Process/alive? owner) st (drop-owner st owner)))
+                                 s (keys (:owners s)))))
+  :ok)
+
+(defserver collector
+  (init []
+    (erlang/send_after 100 (erlang/self) :collect)
+    (ok {:monitors {}}))
+  (handle-cast [:watch owner] [st]
+    (if (contains? (:monitors st) owner) (noreply st)
+      (if (Process/alive? owner)
+        (noreply (assoc-in st [:monitors owner] (erlang/monitor :process owner)))
+        (do (swap! (ledger) drop-owner owner) (noreply st)))))
+  (handle-info :collect [st]
+    (reap!)
+    (erlang/send_after 100 (erlang/self) :collect)
+    (noreply st))
+  (handle-info [:DOWN ref :process owner reason] [st]
+    (if (= ref (get-in st [:monitors owner]))
+      (do (swap! (ledger) drop-owner owner) (noreply (update st :monitors dissoc owner)))
+      (noreply st))))
+
+(defn ready! []
+  (ledger)
+  (let [existing (Process/whereis NAME)
+        pid (or existing
+                (try (start collector nil {:name NAME}) (catch _ (Process/whereis NAME))))]
+    (when (and pid (nil? existing))
+      ;; Rebuilding monitors is idempotent. Ledger charges survive a collector
+      ;; restart, including a crash after reservation but before notification.
+      (reap!)
+      (doseq [owner (keys (:owners @(ledger)))] (cast pid [:watch owner])))
+    (some? pid)))
+
+(defn register! [owner]
+  (when (and (erlang/is_pid owner) (= (erlang/node owner) (erlang/node)) (Process/alive? owner))
+    (ready!)
+    (let [s (swap! (ledger)
+              (fn [s] (if (or (contains? (:owners s) owner)
+                              (>= (count (:owners s)) MAX-OWNERS)
+                              (> (+ (:bytes s) OWNER-CHARGE) MAX-BYTES)) s
+                        (-> s (update :bytes + OWNER-CHARGE)
+                            (assoc-in [:owners owner] {:tickets #{} :pending nil})))))]
+      (when (contains? (:owners s) owner)
+        (when-let [pid (Process/whereis NAME)] (cast pid [:watch owner]))
+        true))))
+
+(defn reserve! [owner token weight]
+  (when-not (Process/whereis NAME) (ready!))
+  (when (and (erlang/is_integer weight) (> weight 0) (erlang/is_reference token))
+    (let [s (swap! (ledger)
+              (fn [s] (if (and (contains? (:owners s) owner) (nil? (get-in s [:owners owner :pending]))
+                               (not (contains? (:tickets s) token))
+                               (<= (+ (:bytes s) weight) MAX-BYTES))
+                        (-> s (update :bytes + weight)
+                            (assoc-in [:tickets token] {:owner owner :weight weight})
+                            (update-in [:owners owner :tickets] conj token)
+                            (assoc-in [:owners owner :pending] token)) s)))]
+      (= {:owner owner :weight weight} (get-in s [:tickets token])))))
+
+(defn release! [owner token]
+  (swap! (ledger)
+    (fn [s] (let [ticket (get-in s [:tickets token])]
+              (if (and ticket (= owner (:owner ticket)))
+                (cond-> (-> s (update :bytes - (:weight ticket)) (update :tickets dissoc token)
+                            (update-in [:owners owner :tickets] disj token))
+                  (= token (get-in s [:owners owner :pending])) (assoc-in [:owners owner :pending] nil)) s))))
+  :ok)
+
+(defn retain! [owner token]
+  (swap! (ledger) (fn [s] (if (= token (get-in s [:owners owner :pending]))
+                            (assoc-in s [:owners owner :pending] nil) s)))
+  :ok)
+
+(defn pending [owner] (get-in @(ledger) [:owners owner :pending]))
+
+(defn stats []
+  (let [s @(ledger)] {:bytes (:bytes s) :owners (count (:owners s)) :tickets (count (:tickets s))
+                     :limit MAX-BYTES :owner-limit MAX-OWNERS}))

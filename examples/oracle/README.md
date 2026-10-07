@@ -35,7 +35,7 @@ cost* — with the language's view of it in `priv/lib/system/decide.bl`.
 
 ## The examples
 
-| Example | The question it answers | The one thing to watch | Measured headline (this machine, `BL_DAEMON=off`) |
+| Example | The question it answers | The one thing to watch | Measured headline (this machine, `--cold`) |
 | --- | --- | --- | --- |
 | `01-why-unknown.bl` | why "no answer" is not one thing | the two silences: a ceiling (`:timeout` / `:canceled`) says raise it; `:incomplete` says no ceiling will help | `factoring     → :unknown \| why: :canceled \| us: 302449` |
 | `02-blame.bl` | a refused step is a *witness*, not a wall | the polarity: `unsat` = preserved, `sat` = the model IS the counterexample | `step :withdraw → counterexample: amt = 1, balance = 0, balance2 = -1` |
@@ -55,37 +55,37 @@ cost* — with the language's view of it in `priv/lib/system/decide.bl`.
 
 ```sh
 # one example
-BL_DAEMON=off timeout 240 mix bl run examples/oracle/01-why-unknown.bl
-BL_DAEMON=off timeout 240 mix bl run examples/oracle/02-blame.bl
-BL_DAEMON=off timeout 240 mix bl run examples/oracle/03-memo.bl
-BL_DAEMON=off timeout 240 mix bl run examples/oracle/04-ceiling.bl
-BL_DAEMON=off timeout 240 mix bl run examples/oracle/05-sorts.bl
-BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/oracle/07-sessions.bl
-BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/oracle/09-blame.bl
-BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/oracle/08-k-induction.bl
-BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/oracle/11-annotated.bl
-BL_DAEMON=off timeout 240 mix bl run examples/oracle/06-no-strings.bl
-BL_DAEMON=off timeout 600 mix bl run --path priv --path examples examples/oracle/10-corpus.bl
-BL_DAEMON=off timeout 600 mix bl run --path priv --path examples examples/oracle/12-stats.bl
-BL_DAEMON=off timeout 240 mix bl run --path priv --path examples examples/oracle/13-faults.bl
+timeout 240 mix bl --cold run examples/oracle/01-why-unknown.bl
+timeout 240 mix bl --cold run examples/oracle/02-blame.bl
+timeout 240 mix bl --cold run examples/oracle/03-memo.bl
+timeout 240 mix bl --cold run examples/oracle/04-ceiling.bl
+timeout 240 mix bl --cold run examples/oracle/05-sorts.bl
+timeout 240 mix bl --cold run --path priv --path examples examples/oracle/07-sessions.bl
+timeout 240 mix bl --cold run --path priv --path examples examples/oracle/09-blame.bl
+timeout 240 mix bl --cold run --path priv --path examples examples/oracle/08-k-induction.bl
+timeout 240 mix bl --cold run --path priv --path examples examples/oracle/11-annotated.bl
+timeout 240 mix bl --cold run examples/oracle/06-no-strings.bl
+timeout 600 mix bl --cold run --path priv --path examples examples/oracle/10-corpus.bl
+timeout 600 mix bl --cold run --path priv --path examples examples/oracle/12-stats.bl
+timeout 240 mix bl --cold run --path priv --path examples examples/oracle/13-faults.bl
 
 # the same rollup through the CLI (needs a repacked drop: priv/std is AOT'd into it)
 ./bl oracle stats            # five sections: corpus, cost, tiers, undecided, failures
 ./bl oracle stats --dry-run  # ledger-only; skips the ~9 s walk and says which mode ran
 
 # every one of them, isolated and timed by ward
-BL_DAEMON=off timeout 600 mix bl examples examples/oracle/*.bl
+timeout 600 mix bl --cold examples examples/oracle/*.bl
 
 # the lane's tests
-BL_DAEMON=off timeout 1500 mix bl test test/bl/system/oracle_test.bl
+timeout 1500 mix bl --cold test test/bl/system/oracle_test.bl
 #   ✓ system.oracle-test  80 passed
 #   1 file(s) passed, 0 failed, 0 incoherent
 
 # per-layer measurement over 100 obligations
-BL_DAEMON=off timeout 300 mix bl run --path priv --path examples bench/oracle_bench.bl
+timeout 300 mix bl --cold run --path priv --path examples bench/oracle_bench.bl
 ```
 
-- `BL_DAEMON=off` runs in one cold VM — no daemon, no warm pool — so a run is
+- `--cold` runs in one fresh VM — no warm VM, no warm pool — so a run is
   reproducible and its timings are comparable.
 - `--path priv --path examples` is only needed for programs that resolve
   `require`d namespaces from those roots (`bench/oracle_bench.bl` is one).
