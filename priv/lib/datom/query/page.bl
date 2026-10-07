@@ -10,34 +10,62 @@
 (defn- resolve-term [bindings term]
   (if (parse/variable? term) (get bindings term) term))
 
+(def SAFE-PREDICATES
+  {'= = 'not= not= '< < '<= <= '> > '>= >=})
+
+(defn- bound-term? [bound term]
+  (or (parse/constant? term) (and (parse/variable? term) (contains? bound term))))
+
+(defn- ready-clause? [s bound c]
+  (cond
+    (parse/pattern-clause? c)
+      (and (<= 3 (count c) 4) (bound-term? bound (get c 0))
+           (keyword? (get c 1)) (schema/known? s (get c 1))
+           (not (schema/many? s (get c 1)))
+           (nil? (relation/relation (get c 1))))
+    (parse/predicate-clause? c)
+      (let [form (get c 0)]
+        (and (= 1 (count c)) (contains? SAFE-PREDICATES (first form))
+             (every? (fn [t] (and (not (list? t)) (bound-term? bound t))) (rest form))))
+    :else false))
+
+(defn- functional-plan
+  ;; Each admitted clause yields at most one binding per driving entity. This
+  ;; preserves relation set semantics without an unbounded cross-page seen set.
+  [s bound clauses]
+  (loop [bound bound pending clauses ordered []]
+    (if (empty? pending) {:clauses ordered :bound bound}
+      (when-let [c (first (filter (fn [c] (ready-clause? s bound c)) pending))]
+        (recur (if (parse/pattern-clause? c)
+                 (into bound (filter parse/variable? c)) bound)
+               (vec (remove (fn [x] (= x c)) pending)) (conj ordered c))))))
+
 (defn- descriptor [query database inputs order]
   (let [p (parse/parse query) forms (parse/input-forms p)
-        where (:where p) [ov direction] order
-        ordered (first (filterv (fn [c] (and (parse/pattern-clause? c)
-                                           (= ov (nth c 2 nil)))) where))
-        root (first ordered) attr (get ordered 1)
-        s (db/schema-of database)]
+        where (:where p) [ov direction] order s (db/schema-of database)
+        value-order (first (filter (fn [c] (and (parse/pattern-clause? c)
+                            (= ov (nth c 2 nil)) (schema/indexed? s (get c 1))
+                            (not (schema/many? s (get c 1))))) where))
+        entity-order (first (sort-by (fn [c] (if (= :db.type/string (schema/value-type s (get c 1))) 1 0))
+                            (filter (fn [c] (and (parse/pattern-clause? c)
+                             (= ov (get c 0)) (keyword? (get c 1))
+                             (schema/known? s (get c 1))
+                             (not (schema/many? s (get c 1))))) where)))
+        ordered (or value-order entity-order) root (first ordered) attr (get ordered 1)
+        bound (into (set forms) [root ov])
+        planned (when ordered (functional-plan s bound where))]
     (when (and (empty? (parse/validate p)) (= :relation (parse/find-kind p))
-               (every? parse/variable? (:find p))
+               (every? parse/variable? (:find p)) (empty? (:with p))
                (<= 1 (count where) 16) (= (count forms) (count inputs))
-               (every? parse/variable? forms)
-               (parse/variable? root) (parse/variable? ov)
-               ;; Relation pages need an injective projection. Projecting the
-               ;; entity root proves row uniqueness without retaining an
-               ;; unbounded cross-page seen set for arbitrary value projections.
-               (some (fn [v] (= root v)) (:find p))
+               (every? parse/variable? forms) (parse/variable? root) (parse/variable? ov)
+               (some (fn [v] (= root v)) (:find p)) planned
+               (every? (fn [v] (contains? (:bound planned) v)) (:find p))
                (contains? #{:asc :desc} direction)
-               (schema/indexed? s attr) (not (schema/many? s attr))
                (= :current (:filter-mode database)) (nil? (:since-t database))
-               (nil? (:valid-at database)) (nil? (:valid-between database))
-               (every? (fn [c] (and (parse/pattern-clause? c) (<= 3 (count c) 4)
-                                   (= root (get c 0)) (keyword? (get c 1))
-                                   (schema/known? s (get c 1))
-                                   (not (schema/many? s (get c 1)))
-                                   (nil? (relation/relation (get c 1))))) where))
-      {:parsed (assoc p :where (plan/order-clauses (conj (set forms) root) where))
-       :root root :order-var ov :attr attr
-       :direction direction :bindings (zipmap forms inputs)})))
+               (nil? (:valid-at database)) (nil? (:valid-between database)))
+      {:parsed (assoc p :where (:clauses planned)) :root root :order-var ov :attr attr
+       :index (if value-order :avet :aevt) :direction direction
+       :bindings (zipmap forms inputs)})))
 
 (defn- complete-attribute [database eid attr budget]
   (let [s (db/store-of database) lo (index/key-prefix :eavt eid attr)
@@ -57,20 +85,25 @@
 
 (defn- evaluate [database spec eid value budget]
   (let [initial (engine/unify-term (:bindings spec) (:root spec) eid)
-        initial (when initial (engine/unify-term initial (:order-var spec) value))]
+        initial (when initial (engine/unify-term initial (:order-var spec)
+                                 (if (= :aevt (:index spec)) eid value)))]
     (loop [clauses (:where (:parsed spec)) bindings initial read {} budget budget]
       (cond
         (nil? bindings) {:budget budget}
         (empty? clauses)
           {:row (mapv (fn [v] (get bindings v)) (:find (:parsed spec))) :budget budget}
         :else
-          (let [c (first clauses) a (get c 1)
-                r (if (contains? read a) {:datoms (get read a) :budget budget}
-                    (complete-attribute database eid a budget))]
-            (if (or (:incomplete r) (:refused r)) r
-              (recur (rest clauses)
-                     (first (keep (fn [d] (engine/unify-pattern bindings c d)) (:datoms r)))
-                     (assoc read a (:datoms r)) (:budget r))))))))
+          (let [c (first clauses)]
+            (if (parse/predicate-clause? c)
+              (recur (rest clauses) (first (engine/eval-predicate bindings c
+                                             (fn [op] (get SAFE-PREDICATES op)))) read budget)
+              (let [e (resolve-term bindings (get c 0)) a (get c 1) k [e a]
+                    r (if (contains? read k) {:datoms (get read k) :budget budget}
+                          (complete-attribute database e a budget))]
+                (if (or (:incomplete r) (:refused r)) r
+                  (recur (rest clauses)
+                         (first (keep (fn [d] (engine/unify-pattern bindings c d)) (:datoms r)))
+                         (assoc read k (:datoms r)) (:budget r))))))))))
 
 (defn- save-cursor [context position rows expires]
   (let [token (crypto/strong_rand_bytes 24)]
@@ -80,8 +113,8 @@
 (defn page
   "Execute an ordered page of an ordinary query. opts: :order-by [?v :asc|:desc],
    :limit, optional :after opaque cursor and :budget {:rows :seeks :bytes}.
-   Current admission: projected entity root, indexed cardinality-one order and plain patterns on one
-   entity variable (including injected owner/tenant constraints). Other shapes
+   Current admission: projected entity root, indexed value or entity-id order,
+   functional cardinality-one forward joins and safe comparison predicates. Other shapes
    return :refused. Physical rows AND seeks are bounded; permission conditions
    run before page admission. :incomplete returns no partial page and a retry
    cursor retaining accepted rows. Cursor binds exact DB/query/inputs/order and
@@ -120,10 +153,13 @@
       (or (not valid-token?) (and (:after opts) (or (not (:hit? old)) (<= (:expires-at state) now))))
         {:status :refused :reason :invalid-cursor}
       :else
-        (let [s (db/store-of database) lo (if (contains? (:bindings spec) (:order-var spec))
+        (let [s (db/store-of database) lo (if (and (= :avet (:index spec))
+                                                     (contains? (:bindings spec) (:order-var spec)))
                                                     (index/key-prefix :avet (:attr spec)
                                                                       (get (:bindings spec) (:order-var spec)))
-                                                    (index/key-prefix :avet (:attr spec)))
+                                                    (if (and (= :aevt (:index spec)) (contains? (:bindings spec) (:root spec)))
+                                                      (index/key-prefix :aevt (:attr spec) (get (:bindings spec) (:root spec)))
+                                                      (index/key-prefix (:index spec) (:attr spec))))
               hi (index/prefix-end lo)
               expires (min expiry (or (:expires-at state) expiry))
               page-key [context (:position state) (or (:rows state) [])]
@@ -169,7 +205,9 @@
                     :else
                     (let [eid (index/-e candidate) value (index/-v candidate)
                           evaluated (evaluate database spec eid value budget)
-                          prefix (index/key-prefix :avet (:attr spec) value eid)
+                          prefix (if (= :avet (:index spec))
+                                   (index/key-prefix :avet (:attr spec) value eid)
+                                   (index/key-prefix :aevt (:attr spec) eid))
                           ;; Whole EAVT group proves current visibility. All AVET
                           ;; versions of this exact [value entity] are redundant.
                           next (if (= :desc (:direction spec)) prefix (index/prefix-end prefix))]
