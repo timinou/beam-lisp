@@ -79,6 +79,18 @@ export const ENV = {
   put_key: putKey,
   delete_key: deleteKey,
   fetch: (ns, name) => { const r = resolve(ns, name, varRow); return r ? T(OK, r[1]) : ERROR; },
+  fetch_exact: (ns, name) => { const k = varRow(ns, name); return ROWS.has(k) ? T(OK, ROWS.get(k)) : ERROR; },
+  "fetch_exact!": (ns, name) => {
+    if (FETCH_EPOCH !== EPOCH) { FETCHED.clear(); FETCH_EPOCH = EPOCH; }
+    const ck = "exact\u0001" + ns + "\u0001" + name;
+    const hit = FETCHED.get(ck);
+    if (hit !== undefined) return hit.v;
+    const k = varRow(ns, name);
+    if (!ROWS.has(k)) throw new BLError("undefined var: " + ns + "/" + name);
+    const v = ROWS.get(k);
+    FETCHED.set(ck, { v });
+    return v;
+  },
   // rt.bl fetches LIVE vars in its hottest loops (`core/reduced?` per fold
   // step, so a rebinding is honoured). Cached per (ns, name) and dropped on
   // EVERY registry write (EPOCH), so a lookup still answers what the

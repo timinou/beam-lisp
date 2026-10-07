@@ -336,6 +336,12 @@ function G(ns, name) {
   if (v instanceof Tup && v.items[0] === MACRO) return v.items[1];
   return v;
 }
+function GX(ns, name) {
+  const r = ENV.fetch_exact(ns, name);
+  const v = r instanceof Tup ? r.items[1] : moduleDef(ns, name);
+  if (v === undefined) throw new BLError("undefined var: " + ns + "/" + name);
+  return v instanceof Tup && v.items[0] === MACRO ? v.items[1] : v;
+}
 /** `X("mod/fun/arity")`: the compiled namespace function (a `__bl_v` name as
     its `.v`), else the exact leaf — ONE resolution rule, shared with
     host-leaves' `erlang/apply`. No core-table fallback exists. */
@@ -348,7 +354,7 @@ ENV.declare_ns("core");
     (`A.invokeList`, `A.NOT_FOUND`, `A.K_error`, `A.blfnFn`, `A.toArray`); a
     page installs this as its `js/run` host fn: `globalThis.BL_HOST = { run }`
     before importing js.eval's build. */
-export function run(body) { return new Function("R", "A", "G", "X", body)(R, A, G, X); }
+export function run(body) { return new Function("R", "A", "G", "GX", "X", body)(R, A, G, GX, X); }
 
 // ONE table, assembled from its parts with NO silent override: a leaf key
 // defined in two places is a load error naming both. (Two files once both
