@@ -1,0 +1,134 @@
+(ns diagnostics.delivery.test
+  (:require [diagnostics :as diag] [diagnostics.delivery :as delivery]
+            [diagnostics.otp :as otp] [proc.fence :as fence]))
+
+(deftest overload-is-bounded-even-when-writer-blocks
+  (let [parent (erlang/self)
+        c (delivery/open! 2 (fn [_] (erlang/send parent :writing) (Process/sleep 60000)))]
+    (try
+      (is (= :accepted (delivery/submit! c {})))
+      (receive :writing nil (after 2000 (is false)))
+      (is (= :accepted (delivery/submit! c {})))
+      (doseq [_ (range 100)] (is (= :dropped (delivery/submit! c {}))))
+      (is (= 2 (:pending (delivery/stats c))))
+      (is (= 100 (:dropped (delivery/stats c))))
+      (finally (delivery/close! c 0)))))
+
+(deftest writer-failure-is-counted-and-next-record-runs
+  (let [parent (erlang/self) c (delivery/open! 2 (fn [v] (if (= v :bad)
+                                                  (throw (ex-info "secret" {}))
+                                                  (erlang/send parent :written))))]
+    (try
+      (is (= :accepted (delivery/submit! c :bad)))
+      (loop [remaining 100]
+        (when (and (> remaining 0) (= 0 (:failed (delivery/stats c))))
+          (Process/sleep 5) (recur (dec remaining))))
+      (is (= :accepted (delivery/submit! c :good)))
+      (receive :written nil (after 2000 (is false)))
+      (delivery/close! c 1000)
+      (is (= 1 (:failed (delivery/stats c))))
+      (is (= 1 (:written (delivery/stats c))))
+      (is (= 0 (:pending (delivery/stats c))))
+      (finally (delivery/close! c 0)))))
+
+(deftest logger-projects-and-never-runs-report-callbacks
+  (let [called (atom false) token (erlang/make_ref)
+        config {:token token :events {:example/done {:fields {:example/count :count}}}}
+        raw {:level :error :msg (tuple :report {:body "secret"})
+             :meta {:report_cb (fn [_] (reset! called true) "secret") :secret "secret"}}
+        safe (otp/redact-report raw config)]
+    (is (not @called))
+    (is (not (String/contains? (pr-str safe) "secret")))
+    (is (= :diagnostics.otp/report-observed (:diagnostics/event (erlang/element 2 (:msg safe)))))
+    (let [trusted (otp/redact-report
+                    {:msg (tuple :report {:diagnostics/event :example/done :example/count 4 :body "secret"})
+                     :meta {:bl_diagnostics_token token :secret "secret"}} config)
+          record (erlang/element 2 (:msg trusted))
+          line (otp/format-record record (:events config))]
+      (is (= 4 (:example/count record)))
+      (is (not (String/contains? line "secret")))
+      (is (= 4 (get (Jason/decode! (String/trim line)) "example/count")))
+      (is (<= (erlang/byte_size line) 8192)))))
+
+(deftest lazy-fields-and-detached-context
+  (let [calls (atom 0)]
+    (diag/with-options {:sink (fn [_] nil) :min-level :warning}
+      (diag/emit! :diagnostics.span/started #(do (swap! calls inc) {})))
+    (is (= 0 @calls))
+    (diag/with-context {:diagnostics/tenant-id "tenant_a"}
+      (diag/with-linkage-fn {:diagnostics/job-id "job_b"}
+        #(do (is (nil? (:diagnostics/tenant-id (diag/context))))
+             (is (= "job_b" (:diagnostics/job-id (diag/context))))
+             (is (string? (:diagnostics/attempt-id (diag/context))))))
+      (is (= "tenant_a" (:diagnostics/tenant-id (diag/context)))))))
+
+(deftest fence-detaches-late-replies
+  (is (= {:timeout true} (fence/fence {:ms 1 :kill? false} (Process/sleep 30) :late)))
+  (Process/sleep 60)
+  (receive [:fence-ok _ _] (is false "late reply leaked") (after 0 (is true)))
+  (is (thrown? (fence/fence -1 :never))))
+
+(deftest installed-handler-uses-bounded-delivery
+  (let [parent (erlang/self) primary (logger/get_primary_config)
+        c (otp/install! {:writer #(erlang/send parent [:record %]) :capacity 4})]
+    (try
+      (is (otp/ready?))
+      (diag/emit! :diagnostics.span/started {})
+      (receive [:record record] (is (= :diagnostics.span/started (:diagnostics/event record)))
+               (after 2000 (is false "handler did not deliver")))
+      (logger/error "secret")
+      (receive [:record record] (is (= :diagnostics.otp/report-observed (:diagnostics/event record)))
+               (after 2000 (is false "privacy summary did not deliver")))
+      (finally (otp/uninstall! 1000) (logger/set_primary_config primary)))))
+
+(deftest record-size-is-bounded-and-core-identity-survives
+  (let [field-name (apply str (repeat 100 "k"))
+        fields (into {} (map (fn [n] [(keyword "example" (str field-name n)) :id]) (range 24)))
+        span-fields (into {} (map (fn [n] [(keyword "span" (str field-name n)) :id]) (range 24)))
+        events {:example/large {:fields fields} :example/span {:fields span-fields}}
+        record (merge (into {} (map (fn [[k _]] [k (apply str (repeat 96 "v"))]) span-fields))
+                      (into {} (map (fn [[k _]] [k (apply str (repeat 96 "v"))]) fields))
+                      {:diagnostics/event :example/large :diagnostics/span-name :example/span :diagnostics/event-id "event_fixture"
+                       :diagnostics/operation-id "operation_fixture"})
+        line (otp/format-record record events)]
+    (is (<= (erlang/byte_size line) 8192))
+    (is (= true (get (Jason/decode! (String/trim line)) "diagnostics/truncated")))
+    (is (= "event_fixture" (get (Jason/decode! (String/trim line)) "diagnostics/event-id")))
+    (is (= "operation_fixture" (get (Jason/decode! (String/trim line)) "diagnostics/operation-id")))))
+
+(deftest fence-timeout-races-leave-no-replies
+  (doseq [_ (range 40)] (fence/fence {:ms 1 :kill? false} (Process/sleep 1) :finished))
+  (Process/sleep 20)
+  (receive [:fence-ok _ _] (is false "timeout race left a reply") (after 0 (is true))))
+
+(deftest malformed-enums-and-error-kinds-are-omitted
+  (let [payload {:secret (vec (range 10000))} seen (atom [])]
+    (is (= {:diagnostics/error-kind :exception} (diag/safe-error {:kind payload})))
+    (is (= {:diagnostics/error-kind :timeout} (diag/safe-error :timeout)))
+    (diag/with-options {:sink #(swap! seen conj %)
+                        :events {:example/result {:fields {:example/state #{:ok :failed}}}}}
+      (diag/emit! :example/result {:example/state payload})
+      (diag/emit! payload {}))
+    (is (= 1 (count @seen)))
+    (is (nil? (:example/state (first @seen))))))
+
+(deftest runtime-defaults-and-scopes-do-not-cross-environments
+  (let [a (BeamLisp.Env/fork :global) b (BeamLisp.Env/fork :global) seen (atom [])]
+    (try
+      (BeamLisp.Env/with_env a
+        (fn []
+          (diag/configure! {:sink #(swap! seen conj %)})
+          (diag/with-context {:diagnostics/tenant-id "tenant_a"}
+            (diag/emit! :diagnostics.span/started {})
+            (let [captured (diag/capture)]
+              (BeamLisp.Env/with_env b
+                (fn []
+                  (is (= {} (diag/context)))
+                  (diag/emit! :diagnostics.span/started {})
+                  (is (thrown? (diag/with-captured-fn captured (fn [] :never)))))))
+            (is (= "tenant_a" (:diagnostics/tenant-id (diag/context)))))))
+      (is (= 1 (count @seen)))
+      (finally
+        (BeamLisp.Env/with_env a diag/unconfigure!)
+        (BeamLisp.Env/with_env b diag/unconfigure!)
+        (BeamLisp.Env/destroy a) (BeamLisp.Env/destroy b)))))
