@@ -21,7 +21,7 @@
 
 import * as R from "./rt.mjs";
 import * as A from "./abi.mjs";
-import { ENV } from "./env.mjs";
+import { exactCandidates, ENV } from "./env.mjs";
 import { LAZY_LEAVES } from "./lazy.mjs";
 import { HOST_LEAVES, bindTable, registerModule, resolveRemote, mangle } from "./host-leaves.mjs";
 import { LINKS } from "./core-links.mjs";
@@ -338,8 +338,15 @@ function G(ns, name) {
 }
 function GX(ns, name) {
   const r = ENV.fetch_exact(ns, name);
-  const v = r instanceof Tup ? r.items[1] : moduleDef(ns, name);
-  if (v === undefined) throw new BLError("undefined var: " + ns + "/" + name);
+  let v;
+  if (r instanceof Tup) v = r.items[1];
+  else {
+    for (const [n, s] of exactCandidates(ns, name)) {
+      v = moduleDef(n, s);
+      if (v !== undefined) break;
+    }
+    if (v === undefined) throw new BLError("undefined var: " + ns + "/" + name);
+  }
   return v instanceof Tup && v.items[0] === MACRO ? v.items[1] : v;
 }
 /** `X("mod/fun/arity")`: the compiled namespace function (a `__bl_v` name as
