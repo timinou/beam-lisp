@@ -6,6 +6,8 @@
 
 (declare binary-extra)
 (declare key-data)
+(declare ensure-owner)
+(declare publish-entry!)
 
 (defn- key-list [xs depth]
   (loop [xs xs out []]
@@ -89,23 +91,75 @@
       (+ 256 (* 2 (+ (* (erlang/system_info :wordsize) (erts_debug/flat_size entry))
                        (erlang/external_size entry) extra))))))
 
+(defn- digest-data [data]
+  (when-let [weight (footprint data)]
+    (when (<= weight 1048576)
+      {:digest (crypto/hash :sha256 (erlang/term_to_binary data)) :weight weight})))
+
+(defn- fingerprint-code []
+  (try (BeamLisp.Env/namespace_generations
+         (list "core" "sugar" "rt" "data.bounded-cache" "data.cache-budget"))
+       (catch _ nil)))
+
+(defn fingerprint
+  "Compact finite provenance; large repeated immutable inputs reuse their digest
+   and proven charge under this implementation's current generation. Typed
+   normalization still validates each input; small inputs avoid cache machinery."
+  [value]
+  (when-let [data (key-data value 0)]
+    (if (< (erts_debug/flat_size data) 256)
+      (:digest (digest-data data))
+      (let [name :data.cache.fingerprints
+            pid (try (ensure-owner name) (catch _ nil))
+            code (fingerprint-code)
+            revision (when code (key-data code 0))
+            key (when revision (tuple :fingerprint data revision))
+            retained (try (when (and pid key) (ets/lookup_element name key 3)) (catch _ nil))
+            hit (and retained
+                     (= code (fingerprint-code)))
+            result (if hit retained (digest-data data))]
+        (when (and result (not hit) revision
+                   (= code (fingerprint-code)))
+          (when-let [weight (footprint (tuple key :fingerprint result))]
+            (when (budget/admissible? weight)
+              (try (publish-entry! name key :fingerprint result weight) (catch _ false)))))
+        (:digest result)))))
+
+(defn- publish-control! [name gate state]
+  (ets/insert name (tuple :cache-control
+    {:gate gate :stats {:size (count (:entries state)) :bytes (:bytes state)}})))
+
 (defserver owner
   (init [name]
     (ets/new name (list :set :protected :named_table
                        (tuple :read_concurrency true)))
-    (ok {:name name :budget (budget/empty-state)}))
+    (let [gate (atomics/new 1 (list)) state (budget/empty-state)]
+      (publish-control! name gate state)
+      (ok {:name name :gate gate :budget state})))
   ;; put! supplies a charge proven before sending immutable finite data.
   ;; The owner serializes only publication and the pure budget decision.
   (handle-call [:put key revision value weight] [_from st]
-    (let [entry (tuple key revision value)
-          decision (budget/offer (:budget st) key revision weight)]
-      (when (:accepted? decision)
-        (when (:clear? decision) (ets/delete_all_objects (:name st)))
-        (ets/insert (:name st) entry))
+    (let [decision
+          (try
+            (let [entry (tuple key revision value)
+                  decision (budget/offer (:budget st) key revision weight)]
+              (when (:accepted? decision)
+                (doseq [victim (:evict decision)] (ets/delete (:name st) victim))
+                (ets/insert (:name st) entry))
+              (publish-control! (:name st) (:gate st) (:state decision))
+              decision)
+            ;; The caller timing out does NOT release admission: its payload
+            ;; remains queued until this owner actually consumes the request.
+            (finally (atomics/put (:gate st) 1 0)))]
       (reply (:accepted? decision) (assoc st :budget (:state decision)))))
   (handle-call [:clear] [_from st]
-    (ets/delete_all_objects (:name st))
-    (reply :ok (assoc st :budget (budget/empty-state))))
+    ;; Retain the admission/stats row. User keys are typed tuples; metadata
+    ;; uses a raw atom and two fields, so it cannot collide with an entry.
+    (ets/select_delete (:name st) (list (tuple (tuple :_ :_ :_) (list) (list true))))
+    (let [state (budget/empty-state)
+          gate (or (:gate st) (atomics/new 1 (list)))]
+      (publish-control! (:name st) gate state)
+      (reply :ok (assoc st :gate gate :budget state))))
   (handle-call [:stats] [_from st]
     (reply {:size (count (get-in st [:budget :entries]))
             :bytes (get-in st [:budget :bytes])} st)))
@@ -115,6 +169,12 @@
       (try (start owner name {:name name :timeout OWNER-TIMEOUT-MS})
            ;; Racing first touches converge on the registered owner.
            (catch _ (Process/whereis name)))))
+
+(defn ready!
+  "Initialize optional retention before a caller captures code-validity evidence.
+   Failure remains a cache miss; authoritative computation does not depend on it."
+  [name]
+  (try (some? (ensure-owner name)) (catch _ false)))
 
 (defn lookup [name key revision]
   (try
@@ -128,20 +188,25 @@
         {:hit? false}))
     (catch _ {:hit? false})))
 
+(defn- publish-entry! [name key revision value weight]
+  (if-let [pid (ensure-owner name)]
+    (let [control (first (ets/lookup name :cache-control))
+          gate (when control (:gate (erlang/element 2 control)))]
+      (if (and gate (= pid (ets/info name :owner))
+               (= :ok (atomics/compare_exchange gate 1 0 1)))
+        (call pid [:put key revision value weight] OWNER-TIMEOUT-MS)
+        false)) false))
+
 (defn put!
-  "Validate admission before copying data into the owner's mailbox. A busy
-   optional cache cannot impose OTP's default five-second write timeout."
+  "Validate finite admission before copying into the bounded publication queue.
+   A busy optional cache never imposes OTP's default five-second write timeout."
   [name key revision value]
   (try
     (let [key (key-data key 0) revision (key-data revision 0)]
       (if (and key revision)
         (let [weight (footprint (tuple key revision value))]
           (if (budget/admissible? weight)
-            (if-let [pid (ensure-owner name)]
-              (call pid [:put key revision value weight] OWNER-TIMEOUT-MS)
-              false)
-            false))
-        false))
+            (publish-entry! name key revision value weight) false)) false))
     (catch _ false)))
 
 (defn value
@@ -164,5 +229,7 @@
   :ok)
 
 (defn stats [name]
-  (or (try (when-let [pid (Process/whereis name)] (call pid [:stats] OWNER-TIMEOUT-MS))
-           (catch _ nil)) {:size 0 :bytes 0}))
+  (or (try
+        (when-let [control (first (ets/lookup name :cache-control))]
+          (:stats (erlang/element 2 control)))
+        (catch _ nil)) {:size 0 :bytes 0}))

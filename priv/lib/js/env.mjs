@@ -58,6 +58,21 @@ function candidates(ns, name) {
   out.push(["core", plain], ["sugar", plain]);
   return out;
 }
+export function exactCandidates(ns, name) {
+  const out = [], seen = new Set();
+  while (ns !== undefined && !seen.has(ns)) {
+    seen.add(ns); out.push([ns, name]);
+    ns = get(T(kw("refer"), ns, name));
+  }
+  return out;
+}
+function resolveExact(ns, name) {
+  for (const [n, s] of exactCandidates(ns, name)) {
+    const k = varRow(n, s);
+    if (ROWS.has(k)) return [n, ROWS.get(k)];
+  }
+  return null;
+}
 function resolve(ns, name, rowOf) {
   for (const [n, s] of candidates(ns, name)) {
     const kk = rowOf(n, s);
@@ -79,6 +94,18 @@ export const ENV = {
   put_key: putKey,
   delete_key: deleteKey,
   fetch: (ns, name) => { const r = resolve(ns, name, varRow); return r ? T(OK, r[1]) : ERROR; },
+  fetch_exact: (ns, name) => { const r = resolveExact(ns, name); return r ? T(OK, r[1]) : ERROR; },
+  "fetch_exact!": (ns, name) => {
+    if (FETCH_EPOCH !== EPOCH) { FETCHED.clear(); FETCH_EPOCH = EPOCH; }
+    const ck = "exact\u0001" + ns + "\u0001" + name;
+    const hit = FETCHED.get(ck);
+    if (hit !== undefined) return hit.v;
+    const r = resolveExact(ns, name);
+    if (!r) throw new BLError("undefined var: " + ns + "/" + name);
+    const v = r[1];
+    FETCHED.set(ck, { v });
+    return v;
+  },
   // rt.bl fetches LIVE vars in its hottest loops (`core/reduced?` per fold
   // step, so a rebinding is honoured). Cached per (ns, name) and dropped on
   // EVERY registry write (EPOCH), so a lookup still answers what the

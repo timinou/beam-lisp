@@ -8,7 +8,8 @@
                   (budget/empty-state) (range 10000))]
     (is (= 1 (count (:entries s))))
     (is (= 1000 (:bytes s)))
-    (is (= 9999 (get-in s [:entries :one :revision])))))
+    (is (= 9999 (get-in s [:entries :one :revision])))
+    (is (= 1 (queue/len (:order s))))))
 
 (deftest generated-insertions-always-respect-byte-and-count-bounds
   (loop [n 0 s (budget/empty-state)]
@@ -81,7 +82,10 @@
     (doseq [n (range 60)]
       (is (cache/put! NAME n 1 v))
       (is (<= (:bytes (cache/stats NAME)) budget/MAX-BYTES)))
-    (is (< (:size (cache/stats NAME)) 60))))
+    (is (< (:size (cache/stats NAME)) 60))
+    (is (> (:size (cache/stats NAME)) 30))
+    (doseq [n (range 30 60)]
+      (is (= v (:value (cache/lookup NAME n 1)))))))
 
 (deftest computation-errors-propagate-and-opaque-results-only-bypass-cache
   (cache/clear! NAME)
@@ -126,6 +130,123 @@
 (deftest owner-charges-the-validated-immutable-entry
   (cache/clear! NAME)
   (doseq [n (range 50)] (cache/put! NAME n 1 {:row n :data (str n)}))
-  (let [stored (ets/tab2list NAME)]
+  (let [stored (filter (fn [row] (= 3 (erlang/tuple_size row))) (ets/tab2list NAME))]
     (is (= (:bytes (cache/stats NAME))
            (reduce (fn [n entry] (+ n (cache/footprint entry))) 0 stored)))))
+
+(deftest bounded-fingerprints-preserve-typed-provenance
+  (let [a (erlang/make_ref) b (erlang/make_ref)
+        key {:principal "alice" :store a :schema {:version 1}}]
+    (is (= 32 (erlang/byte_size (cache/fingerprint key))))
+    (is (= (cache/fingerprint key) (cache/fingerprint key)))
+    (is (not= (cache/fingerprint key) (cache/fingerprint (assoc key :principal "bob"))))
+    (is (not= (cache/fingerprint key) (cache/fingerprint (assoc key :store b))))
+    (is (not= (cache/fingerprint a)
+              (cache/fingerprint (tuple :reference (erlang/node) (erlang/ref_to_list a)))))
+    (is (not= (cache/fingerprint 1) (cache/fingerprint 1.0)))
+    (is (nil? (cache/fingerprint {:opaque (fn [] nil)})))
+    (is (nil? (cache/fingerprint (binary/copy "x" 1048576))))))
+
+
+(deftest crossing-the-budget-evicts-only-the-required-oldest-entry
+  (let [weight (* 4 1024 1024)
+        full (reduce (fn [s n] (:state (budget/offer s n 1 weight)))
+                     (budget/empty-state) (range 8))
+        decision (budget/offer full 8 1 weight)
+        state (:state decision)]
+    (is (= false (:clear? decision)))
+    (is (= [0] (:evict decision)))
+    (is (= #{1 2 3 4 5 6 7 8} (set (keys (:entries state)))))
+    (is (= budget/MAX-BYTES (:bytes state)))
+    (is (= 8 (queue/len (:order state))))
+    (let [replacement (budget/offer full 0 2 (* 2 weight))]
+      (is (= [1] (:evict replacement)))
+      (is (= 2 (get-in replacement [:state :entries 0 :revision])))
+      (is (= 7 (queue/len (get-in replacement [:state :order])))))))
+
+
+(deftest an-existing-owner-can-adopt-the-new-policy-without-losing-values
+  (let [old {:entries {:warm {:revision 1 :weight 1000}} :bytes 1000}
+        migrated (budget/offer old :new 1 1000)]
+    (is (= [] (:evict migrated)))
+    (is (= #{:warm :new} (set (keys (get-in migrated [:state :entries])))))
+    (is (= 2 (queue/len (get-in migrated [:state :order]))))
+    (is (= 2000 (get-in migrated [:state :bytes])))))
+
+
+(deftest the-count-limit-also-evicts-one-victim-instead-of-clearing-everything
+  (let [full (reduce (fn [s n] (:state (budget/offer s n 1 1)))
+                     (budget/empty-state) (range budget/MAX-ENTRIES))
+        decision (budget/offer full budget/MAX-ENTRIES 1 1)]
+    (is (= [0] (:evict decision)))
+    (is (= budget/MAX-ENTRIES (count (get-in decision [:state :entries]))))
+    (is (= budget/MAX-ENTRIES (queue/len (get-in decision [:state :order]))))
+    (is (contains? (get-in decision [:state :entries]) budget/MAX-ENTRIES))))
+
+(deftest suspended-owner-cannot-accumulate-publication-payloads
+  (let [name :navigation_bounded_publications
+        _ (cache/put! name :existing 1 :cached)
+        pid (Process/whereis name)
+        payload (binary/copy "x" 65536)]
+    (erlang/suspend_process pid)
+    (try
+      (is (not (cache/put! name :pending 1 payload)))
+      (doseq [n (range 100)]
+        (is (not (cache/put! name n 1 payload))))
+      (is (= 1 (second (erlang/process_info pid :message_queue_len))))
+      (is (= {:size 1 :bytes (:bytes (cache/stats name))} (cache/stats name)))
+      (is (= :answer (cache/value name :answer 1 (fn [] :answer))))
+      (is (= 1 (second (erlang/process_info pid :message_queue_len))))
+      (finally (erlang/resume_process pid)))
+    ;; A synchronous clear is ordered behind the queued publication and must
+    ;; retain the gate/stats metadata while deleting all real entries.
+    (cache/clear! name)
+    (is (= {:size 0 :bytes 0} (cache/stats name)))
+    (is (cache/put! name :after-clear 2 :retained))
+    (is (= :retained (:value (cache/lookup name :after-clear 2))))))
+
+(defn fingerprint-reductions [f n]
+  (let [start (second (erlang/process_info (erlang/self) :reductions))]
+    (doseq [_ (range n)] (f))
+    (- (second (erlang/process_info (erlang/self) :reductions)) start)))
+
+(deftest repeated-large-provenance-hashes-avoid-rewalking-retained-footprints
+  (let [schema (into {} (mapv (fn [i] [(str "attribute" i)
+                                      {:type :long :indexed true :cardinality :one :name (str i)}])
+                               (range 128)))
+        context [(erlang/make_ref) schema 42 :current]
+        baseline (fn []
+                   (when-let [data (cache/key-data context 0)]
+                     (when-let [weight (cache/footprint data)]
+                       (when (<= weight 1048576)
+                         (crypto/hash :sha256 (erlang/term_to_binary data))))))
+        optimized (fn [] (cache/fingerprint context))]
+    (is (= (baseline) (optimized)))
+    (is (= 32 (erlang/byte_size (optimized))))
+    (doseq [_ (range 3)] (baseline) (optimized))
+    (let [a (fingerprint-reductions baseline 8) b (fingerprint-reductions optimized 8)]
+      (println "large-provenance-fingerprint-reductions" a b)
+      (is (< b (* a 0.8))))))
+
+(deftest provenance-digest-reuse-is-generation-bound-and-retains-no-new-binary-parent
+  (cache/clear! :data.cache.fingerprints)
+  (let [schema (into {} (mapv (fn [i] [(str "attr" i) {:kind :long :index true}]) (range 96)))
+        small (binary/copy "x" 256)
+        context [schema small]
+        digest (cache/fingerprint context)
+        before (cache/stats :data.cache.fingerprints)
+        parent (binary/copy "x" 16777216)
+        slice (binary/part parent 0 256)]
+    (is (= 32 (erlang/byte_size digest)))
+    (is (= 1 (:size before)))
+    (is (> (binary/referenced_byte_size slice) 1048576))
+    (is (= digest (cache/fingerprint [schema slice])))
+    (is (= before (cache/stats :data.cache.fingerprints)))
+    ;; A value-equal key must not retain the caller's larger binary parent.
+    (is (< (:bytes before) 1048576))
+    (BeamLisp.Env/intern "data.bounded-cache" "__fingerprint_generation_probe" :changed)
+    (is (= digest (cache/fingerprint context)))
+    (is (= 2 (:size (cache/stats :data.cache.fingerprints))))
+    (BeamLisp.Env/intern "core" "__fingerprint_dependency_probe" :changed)
+    (is (= digest (cache/fingerprint context)))
+    (is (= 3 (:size (cache/stats :data.cache.fingerprints))))))
