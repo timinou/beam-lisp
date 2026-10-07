@@ -5,7 +5,8 @@
             [datom.schema :as schema] [datom.query.parse :as parse]
             [datom.query.plan :as plan] [datom.cache-validity :as validity]
             [datom.query.engine :as engine] [datom.query.relation :as relation]
-            [data.bounded-cache :as cache]))
+            [data.bounded-cache :as cache] [datom.compound :as compound]
+            [datom.index-coverage :as coverage]))
 
 (defn- resolve-term [bindings term]
   (if (parse/variable? term) (get bindings term) term))
@@ -43,15 +44,30 @@
 (defn- descriptor [query database inputs order]
   (let [p (parse/parse query) forms (parse/input-forms p)
         where (:where p) [ov direction] order s (db/schema-of database)
-        value-order (first (filter (fn [c] (and (parse/pattern-clause? c)
-                            (= ov (nth c 2 nil)) (schema/indexed? s (get c 1))
-                            (not (schema/many? s (get c 1))))) where))
+        bindings (zipmap forms inputs)
+        value-plan (first (keep (fn [c]
+                            (when (and (parse/pattern-clause? c) (= ov (nth c 2 nil))
+                                       (not (schema/many? s (get c 1))))
+                              (let [physical (compound/path database where bindings (first c) (get c 1))]
+                                (when (or physical
+                                          (and (schema/indexed? s (get c 1))
+                                               (coverage/complete? (db/store-of database) s (get c 1)
+                                                                   (db/basis-t database))))
+                                  {:ordered c :physical physical})))) where))
+        value-order (:ordered value-plan)
         entity-order (first (sort-by (fn [c] (if (= :db.type/string (schema/value-type s (get c 1))) 1 0))
                             (filter (fn [c] (and (parse/pattern-clause? c)
                              (= ov (get c 0)) (keyword? (get c 1))
                              (schema/known? s (get c 1))
                              (not (schema/many? s (get c 1))))) where)))
         ordered (or value-order entity-order) root (first ordered) attr (get ordered 1)
+        physical (:physical value-plan)
+        components (when physical #{(:scope-attr physical) (:order-attr physical)})
+        ;; A tuple proves component values for its own entity, not assertion
+        ;; transaction IDs or facts about joined entities.
+        covered (and physical (every? (fn [c] (or (not= root (get c 0))
+                                                 (not (contains? components (get c 1)))
+                                                 (= 3 (count c)))) where))
         bound (into (set forms) [root ov])
         planned (when ordered (functional-plan s bound where))]
     (when (and (empty? (parse/validate p)) (= :relation (parse/find-kind p))
@@ -65,7 +81,7 @@
                (nil? (:valid-at database)) (nil? (:valid-between database)))
       {:parsed (assoc p :where (:clauses planned)) :root root :order-var ov :attr attr
        :index (if value-order :avet :aevt) :direction direction
-       :bindings (zipmap forms inputs)})))
+       :bindings bindings :physical physical :covered covered})))
 
 (defn- complete-attribute [database eid attr budget]
   (let [s (db/store-of database) lo (index/key-prefix :eavt eid attr)
@@ -84,26 +100,37 @@
             :else (recur (:last p) raw budget)))))))
 
 (defn- evaluate [database spec eid value budget]
-  (let [initial (engine/unify-term (:bindings spec) (:root spec) eid)
+  (let [physical (:physical spec)
+        proof (when (:covered spec) (complete-attribute database eid (:attr physical) budget))
+        current? (or (not (:covered spec))
+                     (some (fn [d] (= [(:scope physical) value] (index/-v d))) (:datoms proof)))
+        initial (when current? (engine/unify-term (:bindings spec) (:root spec) eid))
         initial (when initial (engine/unify-term initial (:order-var spec)
-                                 (if (= :aevt (:index spec)) eid value)))]
-    (loop [clauses (:where (:parsed spec)) bindings initial read {} budget budget]
-      (cond
-        (nil? bindings) {:budget budget}
-        (empty? clauses)
-          {:row (mapv (fn [v] (get bindings v)) (:find (:parsed spec))) :budget budget}
-        :else
-          (let [c (first clauses)]
-            (if (parse/predicate-clause? c)
-              (recur (rest clauses) (first (engine/eval-predicate bindings c
-                                             (fn [op] (get SAFE-PREDICATES op)))) read budget)
-              (let [e (resolve-term bindings (get c 0)) a (get c 1) k [e a]
-                    r (if (contains? read k) {:datoms (get read k) :budget budget}
-                          (complete-attribute database e a budget))]
-                (if (or (:incomplete r) (:refused r)) r
-                  (recur (rest clauses)
-                         (first (keep (fn [d] (engine/unify-pattern bindings c d)) (:datoms r)))
-                         (assoc read k (:datoms r)) (:budget r))))))))))
+                                 (if (= :aevt (:index spec)) eid value)))
+        covered (if (:covered spec) {[eid (:scope-attr physical)] (:scope physical)
+                                     [eid (:order-attr physical)] value} {})]
+    (if (or (:incomplete proof) (:refused proof)) proof
+      (loop [clauses (:where (:parsed spec)) bindings initial read {}
+             budget (or (:budget proof) budget)]
+        (cond
+          (nil? bindings) {:budget budget}
+          (empty? clauses)
+            {:row (mapv (fn [v] (get bindings v)) (:find (:parsed spec))) :budget budget}
+          :else
+            (let [c (first clauses)]
+              (if (parse/predicate-clause? c)
+                (recur (rest clauses) (first (engine/eval-predicate bindings c
+                                               (fn [op] (get SAFE-PREDICATES op)))) read budget)
+                (let [e (resolve-term bindings (get c 0)) a (get c 1) k [e a]]
+                  (if (contains? covered k)
+                    ;; Evaluate restrictions using this entity's certified value.
+                    (recur (rest clauses) (engine/unify-term bindings (get c 2) (get covered k)) read budget)
+                    (let [r (if (contains? read k) {:datoms (get read k) :budget budget}
+                                (complete-attribute database e a budget))]
+                      (if (or (:incomplete r) (:refused r)) r
+                        (recur (rest clauses)
+                               (first (keep (fn [d] (engine/unify-pattern bindings c d)) (:datoms r)))
+                               (assoc read k (:datoms r)) (:budget r)))))))))))))
 
 (defn- save-cursor [context position rows expires]
   (let [token (crypto/strong_rand_bytes 24)]
@@ -132,7 +159,7 @@
         code (when spec (validity/definition-stamp))
         page-code (when code (BeamLisp.Env/namespace_generations (list "datom.query.page")))
         context (when (and code page-code)
-                  (cache/fingerprint [(db/view-key database) query inputs (:order-by opts)
+                  (cache/fingerprint [(db/view-key database) query inputs (:order-by opts) (:physical spec)
                                       limit (:authorization opts) code page-code]))
         valid-token? (or (nil? (:after opts))
                          (and (erlang/is_binary (:after opts)) (= 24 (erlang/byte_size (:after opts)))))
@@ -153,13 +180,17 @@
       (or (not valid-token?) (and (:after opts) (or (not (:hit? old)) (<= (:expires-at state) now))))
         {:status :refused :reason :invalid-cursor}
       :else
-        (let [s (db/store-of database) lo (if (and (= :avet (:index spec))
-                                                     (contains? (:bindings spec) (:order-var spec)))
-                                                    (index/key-prefix :avet (:attr spec)
-                                                                      (get (:bindings spec) (:order-var spec)))
-                                                    (if (and (= :aevt (:index spec)) (contains? (:bindings spec) (:root spec)))
-                                                      (index/key-prefix :aevt (:attr spec) (get (:bindings spec) (:root spec)))
-                                                      (index/key-prefix (:index spec) (:attr spec))))
+        (let [s (db/store-of database)
+              physical (:physical spec)
+              physical-attr (or (:attr physical) (:attr spec))
+              lo (cond
+                   (and (= :avet (:index spec)) (contains? (:bindings spec) (:order-var spec)))
+                     (index/key-prefix :avet physical-attr
+                       (if physical [(:scope physical) (get (:bindings spec) (:order-var spec))]
+                         (get (:bindings spec) (:order-var spec))))
+                   (and (= :aevt (:index spec)) (contains? (:bindings spec) (:root spec)))
+                     (index/key-prefix :aevt physical-attr (get (:bindings spec) (:root spec)))
+                   :else (or (:lo physical) (index/key-prefix (:index spec) physical-attr)))
               hi (index/prefix-end lo)
               expires (min expiry (or (:expires-at state) expiry))
               page-key [context (:position state) (or (:rows state) [])]
@@ -203,11 +234,13 @@
                     (:byte-limited? p) (finish :incomplete rows position true)
                     (nil? candidate) (finish :exact rows position false)
                     :else
-                    (let [eid (index/-e candidate) value (index/-v candidate)
+                    (let [eid (index/-e candidate)
+                          stored-value (index/-v candidate)
+                          value (if physical (second stored-value) stored-value)
                           evaluated (evaluate database spec eid value budget)
                           prefix (if (= :avet (:index spec))
-                                   (index/key-prefix :avet (:attr spec) value eid)
-                                   (index/key-prefix :aevt (:attr spec) eid))
+                                   (index/key-prefix :avet physical-attr stored-value eid)
+                                   (index/key-prefix :aevt physical-attr eid))
                           ;; Whole EAVT group proves current visibility. All AVET
                           ;; versions of this exact [value entity] are redundant.
                           next (if (= :desc (:direction spec)) prefix (index/prefix-end prefix))]

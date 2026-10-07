@@ -1,6 +1,6 @@
 ;; Optional finite-value cache. Computation belongs to callers; one owner only
 ;; publishes entries after charging their complete retained data footprint.
-(ns data.bounded-cache (:require [data.cache-budget :as budget]))
+(ns data.bounded-cache (:require [data.cache-budget :as budget] [data.cache-pool :as pool]))
 
 (def OWNER-TIMEOUT-MS 25)
 
@@ -129,44 +129,99 @@
   (ets/insert name (tuple :cache-control
     {:gate gate :stats {:size (count (:entries state)) :bytes (:bytes state)}})))
 
+(defn- lease-row [gate] (first (ets/lookup gate :lease)))
+(defn- drop-claim! [gate ticket]
+  (ets/select_delete gate (list (tuple (tuple :lease ticket :_ :_ :_) (list) (list true)))))
+(defn- release-pending! [st]
+  (when-let [pending (:pending st)]
+    (erlang/demonitor (:monitor pending) (list :flush))
+    (drop-claim! (:gate st) (:ticket pending))
+    (pool/release! (erlang/self) (:ticket pending)))
+  (assoc st :pending nil))
+
 (defserver owner
   (init [name]
-    (ets/new name (list :set :protected :named_table
-                       (tuple :read_concurrency true)))
-    (let [gate (atomics/new 1 (list)) state (budget/empty-state)]
+    (when-not (pool/register! (erlang/self)) (throw "optional cache aggregate budget exhausted"))
+    (ets/new name (list :set :protected :named_table (tuple :read_concurrency true)))
+    ;; One small claim row gates METADATA before any full value is copied.
+    ;; Owner grants the claim and monitors its sender before acknowledging.
+    (let [gate (ets/new :cache_admission (list :set :public)) state (budget/empty-state)]
       (publish-control! name gate state)
-      (ok {:name name :gate gate :budget state})))
-  ;; put! supplies a charge proven before sending immutable finite data.
-  ;; The owner serializes only publication and the pure budget decision.
-  (handle-call [:put key revision value weight] [_from st]
-    (let [decision
-          (try
-            (let [entry (tuple key revision value)
-                  decision (budget/offer (:budget st) key revision weight)]
-              (when (:accepted? decision)
-                (doseq [victim (:evict decision)] (ets/delete (:name st) victim))
-                (ets/insert (:name st) entry))
-              (publish-control! (:name st) (:gate st) (:state decision))
-              decision)
-            ;; The caller timing out does NOT release admission: its payload
-            ;; remains queued until this owner actually consumes the request.
-            (finally (atomics/put (:gate st) 1 0)))]
-      (reply (:accepted? decision) (assoc st :budget (:state decision)))))
+      ;; The owner rearms exactly one timer AFTER consuming it. A suspended
+      ;; owner therefore holds at most one maintenance message, regardless
+      ;; of elapsed time or collector restarts.
+      (erlang/send_after 100 (erlang/self) :cache-reap)
+      (ok {:name name :gate gate :budget state :pending nil})))
+  (handle-call [:reserve caller ticket weight] [from st]
+    (let [row (lease-row (:gate st))
+          match (and (= caller (erlang/element 1 from)) (nil? (:pending st))
+                     (= row (tuple :lease ticket :claimed caller weight))
+                     (Process/alive? caller) (budget/admissible? weight))]
+      (if match
+        (let [monitor (erlang/monitor :process caller)]
+          (ets/insert (:gate st) (tuple :lease ticket :granted caller weight))
+          (reply true (assoc st :pending {:caller caller :ticket ticket :weight weight :monitor monitor})))
+        (do (drop-claim! (:gate st) ticket) (pool/release! (erlang/self) ticket) (reply false st)))))
+  (handle-call [:put ticket key revision value weight] [from st]
+    (let [pending (:pending st)]
+      (if (and pending (= ticket (:ticket pending)) (= weight (:weight pending))
+               (= (:caller pending) (erlang/element 1 from)))
+        (let [decision (budget/offer (:budget st) key revision weight)
+              old (get-in st [:budget :entries key :lease])]
+          (if (:accepted? decision)
+            (do
+              (doseq [victim (:evict decision)]
+                (ets/delete (:name st) victim)
+                (pool/release! (erlang/self) (get-in st [:budget :entries victim :lease])))
+              (ets/insert (:name st) (tuple key revision value))
+              (pool/retain! (erlang/self) ticket)
+              (when old (pool/release! (erlang/self) old)))
+            (pool/release! (erlang/self) ticket))
+          (let [state (if (:accepted? decision) (assoc-in (:state decision) [:entries key :lease] ticket) (:state decision))]
+            (erlang/demonitor (:monitor pending) (list :flush))
+            (drop-claim! (:gate st) ticket)
+            (publish-control! (:name st) (:gate st) state)
+            (reply (:accepted? decision) (assoc st :budget state :pending nil))))
+        (reply false st))))
+  (handle-cast [:cancel ticket] [st]
+    ;; Sent only after reserve failure, NEVER after a queued put times out.
+    (if (= ticket (get-in st [:pending :ticket]))
+      (noreply (release-pending! st))
+      (do (drop-claim! (:gate st) ticket) (pool/release! (erlang/self) ticket) (noreply st))))
+  (handle-info [:DOWN ref :process caller why] [st]
+    (if (= ref (get-in st [:pending :monitor]))
+      ;; Signals from this sender to this owner preserve order: an already
+      ;; sent put is consumed before its monitor DOWN. Unsent credits release.
+      (noreply (release-pending! st)) (noreply st)))
+  (handle-info :cache-reap [st]
+    (let [row (lease-row (:gate st))
+          claimed (when row (erlang/element 2 row))
+          caller (when row (erlang/element 4 row))
+          credit (pool/pending (erlang/self))]
+      (when (and row (= :claimed (erlang/element 3 row)) (not (Process/alive? caller)))
+        (drop-claim! (:gate st) claimed)
+        (pool/release! (erlang/self) claimed))
+      ;; A killed sender may have reserved after its claim was reaped. The
+      ;; ledger survives that race; an orphan with no grant cannot queue data.
+      (when (and credit (not= credit claimed) (not= credit (get-in st [:pending :ticket])))
+        (pool/release! (erlang/self) credit))
+      (erlang/send_after (if (pool/pending (erlang/self)) 100 1000)
+                         (erlang/self) :cache-reap)
+      (noreply st)))
   (handle-call [:clear] [_from st]
-    ;; Retain the admission/stats row. User keys are typed tuples; metadata
-    ;; uses a raw atom and two fields, so it cannot collide with an entry.
     (ets/select_delete (:name st) (list (tuple (tuple :_ :_ :_) (list) (list true))))
-    (let [state (budget/empty-state)
-          gate (or (:gate st) (atomics/new 1 (list)))]
-      (publish-control! (:name st) gate state)
-      (reply :ok (assoc st :gate gate :budget state))))
+    (doseq [entry (vals (get-in st [:budget :entries]))]
+      (pool/release! (erlang/self) (:lease entry)))
+    (let [state (budget/empty-state)]
+      (publish-control! (:name st) (:gate st) state)
+      (reply :ok (assoc st :budget state))))
   (handle-call [:stats] [_from st]
-    (reply {:size (count (get-in st [:budget :entries]))
-            :bytes (get-in st [:budget :bytes])} st)))
+    (reply {:size (count (get-in st [:budget :entries])) :bytes (get-in st [:budget :bytes])} st)))
 
 (defn- ensure-owner [name]
   (or (Process/whereis name)
-      (try (start owner name {:name name :timeout OWNER-TIMEOUT-MS})
+      (try (pool/ready!)
+           (start owner name {:name name :timeout OWNER-TIMEOUT-MS})
            ;; Racing first touches converge on the registered owner.
            (catch _ (Process/whereis name)))))
 
@@ -190,11 +245,18 @@
 
 (defn- publish-entry! [name key revision value weight]
   (if-let [pid (ensure-owner name)]
-    (let [control (first (ets/lookup name :cache-control))
-          gate (when control (:gate (erlang/element 2 control)))]
+    (let [control (first (ets/lookup name :cache-control)) gate (when control (:gate (erlang/element 2 control)))
+          ticket (erlang/make_ref) caller (erlang/self)]
       (if (and gate (= pid (ets/info name :owner))
-               (= :ok (atomics/compare_exchange gate 1 0 1)))
-        (call pid [:put key revision value weight] OWNER-TIMEOUT-MS)
+               (ets/insert_new gate (tuple :lease ticket :claimed caller weight)))
+        (if (pool/reserve! pid ticket weight)
+          (let [reserved (try (call pid [:reserve caller ticket weight] OWNER-TIMEOUT-MS)
+                              (catch _ false))]
+            (if reserved
+              ;; Timeout here keeps the credit: the value may still be queued.
+              (call pid [:put ticket key revision value weight] OWNER-TIMEOUT-MS)
+              (do (cast pid [:cancel ticket]) false)))
+          (do (drop-claim! gate ticket) false))
         false)) false))
 
 (defn put!
