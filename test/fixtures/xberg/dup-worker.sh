@@ -12,6 +12,8 @@
 # request names, waits until its peer has registered, then proves its OWN input
 # still exists. A shared path shows up as two identical log lines; an unlinked
 # input shows up as a missing file.
+# The boundary prepends --cold before the configured worker arguments.
+[ "${1:-}" != "--cold" ] || shift
 log="$1"
 req="$2"
 printf '%s\n' "$req" >> "$log"
