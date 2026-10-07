@@ -62,6 +62,7 @@ mod atoms {
         delete,
         columns,
         datoms,
+        datoms_reverse = "datoms-reverse",
         pairs,
         // The boolean lane's decoded terms. The trailing underscore is a Rust
         // keyword accident, not part of the atom: without the alias rustler
@@ -923,17 +924,19 @@ fn fjall_resolve_chunk<'a>(
     mode: Atom,
 ) -> NifResult<Term<'a>> {
     use std::ops::Bound;
+    let reverse = mode == atoms::datoms_reverse();
     let lower = match (&start, &after) {
         (Some(b), _) => Bound::Included(b.as_slice().to_vec()),
-        (None, Some(b)) => Bound::Excluded(b.as_slice().to_vec()),
-        (None, None) => Bound::Unbounded,
+        (None, Some(b)) if !reverse => Bound::Excluded(b.as_slice().to_vec()),
+        _ => Bound::Unbounded,
     };
-    let upper = match &stop {
-        Some(b) => Bound::Included(b.as_slice().to_vec()),
-        None => Bound::Unbounded,
+    let upper = match (reverse, &after, &stop) {
+        (true, Some(b), _) => Bound::Excluded(b.as_slice().to_vec()),
+        (_, _, Some(b)) => Bound::Included(b.as_slice().to_vec()),
+        _ => Bound::Unbounded,
     };
     let want_columns = mode == atoms::columns();
-    let want_datoms = mode == atoms::datoms();
+    let want_datoms = mode == atoms::datoms() || reverse;
     let want_pairs = mode == atoms::pairs();
     if !want_columns && !want_datoms && !want_pairs {
         return Err(err("resolve mode must be :datoms, :columns or :pairs"));
@@ -945,7 +948,13 @@ fn fjall_resolve_chunk<'a>(
     let mut last_key: Option<Vec<u8>> = None;
     let shape = VectorShape::new(env)?;
 
-    for entry in handle.datoms.range((lower, upper)).take(limit) {
+    let range = handle.datoms.range((lower, upper));
+    let entries: Box<dyn Iterator<Item = _>> = if reverse {
+        Box::new(range.rev())
+    } else {
+        Box::new(range)
+    };
+    for entry in entries.take(limit) {
         let (k, v) = entry.map_err(|e| err(e))?;
         if want_pairs {
             // The port's `-range` holds ARBITRARY values (counters, blobs and
@@ -1500,6 +1509,5 @@ mod tests {
         let _ = fs::remove_dir_all(&c);
     }
 }
-
 
 
