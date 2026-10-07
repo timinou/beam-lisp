@@ -29,7 +29,7 @@
 ; cache discriminator.
 
 (ns datom.attr-basis
-  (:require [datom.store] [datom.derived]))
+  (:require [datom.store] [datom.derived] [datom.attr-marks :as marks]))
 
 (def ^:private TABLE :datom_attr_basis)
 
@@ -58,6 +58,25 @@
   [store]
   (datom.store/identity-of store))
 
+(defn- publish!
+  "Atomically join markers. Retrying re-reads the entire winning map; no stale
+   writer can replace newer markers or discard an unrelated attribute."
+  [key incoming]
+  (loop []
+    (let [hit (ets/lookup TABLE key)]
+      (if (empty? hit)
+        (let [merged (marks/merge-marks {} incoming)]
+          (if (ets/insert_new TABLE (t2 key merged)) merged (recur)))
+        (let [current (erlang/element 2 (first (to-list hit)))
+              merged (marks/merge-marks current incoming)]
+          (if (= merged current) current
+            ;; Keep the matched key variable in the replacement, as ETS requires.
+            (let [spec (list (tuple (tuple :"$1" :"$2")
+                               (list (tuple :"=:=" :"$1" (tuple :const key))
+                                     (tuple :"=:=" :"$2" (tuple :const current)))
+                               (list (tuple (tuple :"$1" (tuple :const merged))))))]
+              (if (= 1 (ets/select_replace TABLE spec)) merged (recur)))))))))
+
 ;; ── the durable tier ─────────────────────────────────────────────────
 ;;
 ;; The marks above live in ETS, which dies with the process. That is survivable
@@ -67,8 +86,9 @@
 ;; durable artifact exists to avoid is forced by a missing number, not by any
 ;; change to the data.
 ;;
-;; So the marks are kept in the store too, as ONE small record: `{attr → tx}`.
-;; One key, rewritten per commit, INSIDE the transaction it describes (see
+;; Transaction marks are kept in one small record: `{attr → tx}`. Build hints
+;; have a separate record, so readers never overwrite commit authority.
+;; The transaction key is rewritten INSIDE the commit it describes (see
 ;; `record-ops`): a mark written after its data would leave a window where a
 ;; stale column looks valid, and the whole point of a mark is that it cannot lie.
 
@@ -76,9 +96,19 @@
   "The small derived record holding every attribute's last-write transaction."
   [:datom.attr-basis])
 
-(defn- durable-marks
-  [store]
+(def BUILD-IDENT
+  "Build evidence is separate from transactional writes: a reader must never
+   overwrite the authoritative marker record while a commit publishes it."
+  [:datom.attr-basis/build])
+
+(defn- write-marks [store]
   (or (datom.derived/get-record store MARK-IDENT) {}))
+
+(defn- build-marks [store]
+  (or (datom.derived/get-record store BUILD-IDENT) {}))
+
+(defn- durable-marks [store]
+  (marks/merge-marks (write-marks store) (build-marks store)))
 
 (defn- hydrated?
   "Whether this store's marks have already been read from the store in THIS
@@ -104,16 +134,7 @@
       (let [hit (ets/lookup TABLE store)]
         (if (empty? hit) {} (erlang/element 2 (first (to-list hit)))))
       (let [durable (try (durable-marks store) (catch _ {}))
-            cur (let [hit (ets/lookup TABLE store)]
-                  (if (empty? hit) {} (erlang/element 2 (first (to-list hit)))))
-            ; A live mark is never LOWERED by a durable one: the ETS map is the
-            ; same information with more recent writes in it.
-            merged (reduce (fn [m e]
-                             (let [a (get e 0) tx (get e 1)]
-                               (if (and (some? (get m a)) (>= (get m a) tx)) m (assoc m a tx))))
-                           cur
-                           (into [] durable))]
-        (ets/insert TABLE (t2 store merged))
+            merged (publish! store durable)]
         (mark-hydrated! store)
         merged))))
 
@@ -129,17 +150,12 @@
   [store attrs tx]
   (table)
   (let [key (key-of store)
-        cur (let [hit (ets/lookup TABLE key)]
-              (if (empty? hit) {} (erlang/element 2 (first (to-list hit)))))
-        merged (reduce (fn [m a] (assoc m a tx)) cur attrs)]
-    (ets/insert TABLE (t2 key merged))
-    ; The durable half merges against what the STORE holds, not against ETS: on
-    ; a cold process ETS starts empty, and writing only this transaction's attrs
-    ; would erase every other attribute's mark.
+        incoming (reduce (fn [m a] (assoc m a tx)) {} attrs)]
+    (publish! key incoming)
+    ;; Only the connection's transaction writes this record. Reader build
+    ;; notes use BUILD-IDENT and cannot race it back to an earlier map.
     (datom.derived/put-ops MARK-IDENT
-                           (reduce (fn [m a] (assoc m a tx))
-                                   (durable-marks key)
-                                   attrs))))
+      (marks/merge-marks (write-marks key) incoming))))
 
 (defn note!
   "Raise the mark for `attr` to at least `tx`. Called when a cache BUILDS from
@@ -157,18 +173,14 @@
   [store attr tx]
   (table)
   (let [store (key-of store)
-        cur (let [hit (ets/lookup TABLE store)]
-              (if (empty? hit) {} (erlang/element 2 (first (to-list hit)))))
-        known (get cur attr)
-        raised (if (and (some? known) (>= known tx)) cur (assoc cur attr tx))]
-    (when (not= raised cur)
-      (ets/insert TABLE (t2 store raised)))
-    (let [d (durable-marks store)
-          d-known (get d attr)
-          d-raised (if (and (some? d-known) (>= d-known tx)) d (assoc d attr tx))]
-      (when (not= d-raised d)
-        (datom.derived/put-record! store MARK-IDENT d-raised)))
-    (or (get raised attr) tx)))
+        raised (publish! store {attr tx})
+        durable (build-marks store)
+        next (marks/merge-marks durable {attr tx})]
+    (when (not= durable next)
+      (datom.derived/put-record! store BUILD-IDENT next))
+    ;; A concurrent build may lose another build hint on disk, causing only
+    ;; an extra rebuild. It can never lower transactional write evidence.
+    (get raised attr)))
 
 (defn basis-t-for
   "The highest transaction that touched `attr` in `store`, or `fallback`
