@@ -921,9 +921,16 @@ fn fjall_resolve_chunk<'a>(
     after: Option<Binary>,
     stop: Option<Binary>,
     limit: usize,
-    mode: Atom,
+    mode: Term<'a>,
 ) -> NifResult<Term<'a>> {
     use std::ops::Bound;
+    let (mode, byte_budget) = match mode.decode::<Atom>() {
+        Ok(atom) => (atom, None),
+        Err(_) => {
+            let (atom, budget) = mode.decode::<(Atom, usize)>()?;
+            (atom, Some(budget))
+        }
+    };
     let reverse = mode == atoms::datoms_reverse();
     let lower = match (&start, &after) {
         (Some(b), _) => Bound::Included(b.as_slice().to_vec()),
@@ -947,6 +954,9 @@ fn fjall_resolve_chunk<'a>(
     let mut cols = Columns::new();
     let mut last_key: Option<Vec<u8>> = None;
     let shape = VectorShape::new(env)?;
+    let mut charged_bytes = 0usize;
+    let mut byte_limited = false;
+    let mut opaque_value = false;
 
     let range = handle.datoms.range((lower, upper));
     let entries: Box<dyn Iterator<Item = _>> = if reverse {
@@ -956,6 +966,24 @@ fn fjall_resolve_chunk<'a>(
     };
     for entry in entries.take(limit) {
         let (k, v) = entry.map_err(|e| err(e))?;
+        if let Some(budget) = byte_budget {
+            // Before any BEAM allocation: closed primitive datom lanes have
+            // bounded shape overhead. ETF/escape values can contain compressed
+            // or arbitrary terms, so their expansion is not proven here.
+            let row = read_row(&v)?;
+            if row.legacy.is_some()
+                || !matches!(row.v.first(), Some(&LANE_LONG | &LANE_BOOL | &LANE_STR | &LANE_KW | &LANE_FLOAT))
+            {
+                opaque_value = true;
+                break;
+            }
+            let charge = 1024usize.saturating_add(k.len()).saturating_add(v.len());
+            if charge > budget.saturating_sub(charged_bytes) {
+                byte_limited = true;
+                break;
+            }
+            charged_bytes += charge;
+        }
         if want_pairs {
             // The port's `-range` holds ARBITRARY values (counters, blobs and
             // datoms share the keyspace), so this mode must not require a datom
@@ -977,6 +1005,9 @@ fn fjall_resolve_chunk<'a>(
     let out = map_new(env);
     let n = if want_columns { cols.n } else if want_datoms { datoms.len() } else { pairs.len() };
     let out = out.map_put("n", n as u64)?;
+    let out = out.map_put("bytes", charged_bytes as u64)?
+        .map_put("byte-limited", byte_limited)?
+        .map_put("opaque-value", opaque_value)?;
     let out = match &last_key {
         Some(k) => out.map_put("last", to_binary(env, k)?)?,
         None => out.map_put("last", atoms::nil().to_term(env))?,
@@ -1509,5 +1540,4 @@ mod tests {
         let _ = fs::remove_dir_all(&c);
     }
 }
-
 
