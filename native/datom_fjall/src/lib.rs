@@ -571,6 +571,80 @@ struct Row<'a> {
     legacy: Option<&'a [u8]>,
 }
 
+/// Admission only, not a second decoder. Recognize finite uncompressed ETF
+/// before calling the existing BEAM decoder. Compression, functions, references,
+/// ports and pids have no certificate here. No term or payload is allocated.
+/// https://www.erlang.org/doc/apps/erts/erl_ext_dist.html
+fn finite_etf_charge(bytes: &[u8]) -> Option<usize> {
+    struct Check<'a> { bytes: &'a [u8], pos: usize }
+    impl Check<'_> {
+        fn take(&mut self, n: usize) -> Option<&[u8]> {
+            let end = self.pos.checked_add(n)?;
+            let out = self.bytes.get(self.pos..end)?;
+            self.pos = end;
+            Some(out)
+        }
+        fn byte(&mut self) -> Option<u8> { Some(self.take(1)?[0]) }
+        fn u16(&mut self) -> Option<usize> {
+            Some(u16::from_be_bytes(self.take(2)?.try_into().ok()?) as usize)
+        }
+        fn u32(&mut self) -> Option<usize> {
+            Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?) as usize)
+        }
+        fn terms(&mut self, n: usize, depth: usize) -> Option<()> {
+            // Even NIL uses one byte. A hostile arity cannot create a long loop.
+            if n > self.bytes.len().checked_sub(self.pos)? { return None; }
+            for _ in 0..n { self.term(depth + 1)?; }
+            Some(())
+        }
+        fn term(&mut self, depth: usize) -> Option<()> {
+            if depth > 128 { return None; }
+            match self.byte()? {
+                97 => { self.take(1)?; }                  // SMALL_INTEGER_EXT
+                98 => { self.take(4)?; }                  // INTEGER_EXT
+                70 => { self.take(8)?; }                  // NEW_FLOAT_EXT
+                99 => { self.take(31)?; }                 // FLOAT_EXT
+                106 => {}                                // NIL_EXT
+                100 | 118 | 107 => {                      // atom / utf8 / string
+                    let n = self.u16()?; self.take(n)?;
+                }
+                115 | 119 => {
+                    let n = self.byte()? as usize; self.take(n)?;
+                }
+                109 => { let n = self.u32()?; self.take(n)?; }
+                77 => {                                  // BIT_BINARY_EXT
+                    let n = self.u32()?; let bits = self.byte()?;
+                    if !(1..=8).contains(&bits) { return None; }
+                    self.take(n)?;
+                }
+                104 => { let n = self.byte()? as usize; self.terms(n, depth)?; }
+                105 => { let n = self.u32()?; self.terms(n, depth)?; }
+                116 => { let n = self.u32()?.checked_mul(2)?; self.terms(n, depth)?; }
+                108 => {
+                    let n = self.u32()?; self.terms(n, depth)?;
+                    self.term(depth + 1)?;                // proper or finite tail
+                }
+                110 | 111 => {
+                    let tag = self.bytes[self.pos - 1];
+                    let n = if tag == 110 { self.byte()? as usize } else { self.u32()? };
+                    if self.byte()? > 1 { return None; }
+                    self.take(n)?;
+                }
+                _ => return None,
+            }
+            Some(())
+        }
+    }
+    let mut check = Check { bytes, pos: 0 };
+    if check.byte()? != ETF_VERSION { return None; }
+    check.term(0)?;
+    if check.pos != bytes.len() { return None; }
+    // At least one tag per node; 64x conservatively covers list cells, map/tuple
+    // metadata, boxed numbers and retained input bytes. Fixed row overhead is
+    // charged separately. The byte budget is checked before BEAM allocation.
+    bytes.len().checked_mul(64)
+}
+
 /// Read the datom payload at `val` into its fields by offset.
 ///
 /// Every malformed shape is an ERROR naming the reason: a store that holds an
@@ -698,8 +772,34 @@ impl VectorShape {
 /// exactly like this, so reading a store has always created its atoms: this is
 /// parity with the existing path, not a new exposure. The bytes come from our
 /// own value slot, under our own key space, written by our own writer.
+fn inflate_stored_etf(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    if bytes.len() < 6 || bytes[..2] != [ETF_VERSION, 80] {
+        return Err("invalid compressed ETF header".into());
+    }
+    let size = u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize;
+    let mut inflater = flate2::bufread::ZlibDecoder::new(&bytes[6..]);
+    let mut out = Vec::with_capacity(size.min(65536).saturating_add(1));
+    out.push(ETF_VERSION);
+    // A corrupt length never causes an upfront giant allocation or permits
+    // expansion past its header. This path has the existing trusted-reader
+    // contract; bounded pages still refuse compression before calling it.
+    inflater.by_ref().take(size as u64 + 1).read_to_end(&mut out)
+        .map_err(|e| format!("invalid compressed ETF: {}", e))?;
+    if out.len() != size + 1 || inflater.total_in() as usize != bytes.len() - 6 {
+        return Err("compressed ETF length or stream boundary mismatch".into());
+    }
+    Ok(out)
+}
+
 fn decode_stored<'a>(env: Env<'a>, bytes: &[u8], what: &str) -> NifResult<Term<'a>> {
-    unsafe { env.binary_to_term_trusted(bytes) }
+    // The NIF decoder does not accept this compressed form on the deployed
+    // runtime. Normalize its envelope, then use the very same term decoder.
+    let inflated = if bytes.starts_with(&[ETF_VERSION, 80]) {
+        Some(inflate_stored_etf(bytes).map_err(|e| err(format!("{}: {}", what, e)))?)
+    } else { None };
+    let payload = inflated.as_deref().unwrap_or(bytes);
+    unsafe { env.binary_to_term_trusted(payload) }
         .map(|(term, _)| term)
         .ok_or_else(|| err(format!("{} did not decode", what)))
 }
@@ -967,19 +1067,30 @@ fn fjall_resolve_chunk<'a>(
     for entry in entries.take(limit) {
         let (k, v) = entry.map_err(|e| err(e))?;
         if let Some(budget) = byte_budget {
-            // Before any BEAM allocation: closed primitive datom lanes have
-            // bounded shape overhead. ETF/escape values can contain compressed
-            // or arbitrary terms, so their expansion is not proven here.
+            // Preflight before any BEAM allocation. Ordinary old ETF datoms
+            // gain bounded paging without rewriting the store. Unknown expansion
+            // retains the explicit opaque-value refusal.
             let row = read_row(&v)?;
-            if row.legacy.is_some()
-                || !matches!(row.v.first(), Some(&LANE_LONG | &LANE_BOOL | &LANE_STR | &LANE_KW | &LANE_FLOAT))
-            {
+            let etf = row.legacy.or_else(|| {
+                if row.v.first() == Some(&LANE_ESC) { Some(&row.v[1..]) } else { None }
+            });
+            let extra = if let Some(bytes) = etf {
+                bytes.len().checked_mul(64)
+            } else if matches!(row.v.first(), Some(&LANE_LONG | &LANE_BOOL | &LANE_STR | &LANE_KW | &LANE_FLOAT)) {
+                Some(0)
+            } else { None };
+            let Some(extra) = extra else {
                 opaque_value = true;
                 break;
-            }
-            let charge = 1024usize.saturating_add(k.len()).saturating_add(v.len());
+            };
+            let charge = 1024usize.saturating_add(k.len()).saturating_add(v.len()).saturating_add(extra);
             if charge > budget.saturating_sub(charged_bytes) {
                 byte_limited = true;
+                break;
+            }
+            // Reject oversized encodings before even walking their term tree.
+            if etf.is_some_and(|bytes| finite_etf_charge(bytes).is_none()) {
+                opaque_value = true;
                 break;
             }
             charged_bytes += charge;
@@ -1539,5 +1650,42 @@ mod tests {
         let _ = fs::remove_dir_all(&b);
         let _ = fs::remove_dir_all(&c);
     }
+    #[test]
+    fn finite_etf_preflight_is_closed_and_charged() {
+        let tuple = [131, 104, 2, 97, 1, 109, 0, 0, 0, 3, b'a', b'b', b'c'];
+        assert_eq!(finite_etf_charge(&tuple), Some(tuple.len() * 64));
+        let map = [131, 116, 0, 0, 0, 1, 119, 1, b'k', 108, 0, 0, 0, 2, 97, 1, 97, 2, 106];
+        assert_eq!(finite_etf_charge(&map), Some(map.len() * 64));
+        for bytes in [&[131, 80, 0, 0, 0, 1][..], &[131, 88][..], &[131, 112][..],
+                      &[131, 109, 255, 255, 255, 255][..], &[131, 105, 255, 255, 255, 255][..],
+                      &[131, 116, 255, 255, 255, 255][..], &[131, 97][..], &[131, 106, 0][..]] {
+            assert_eq!(finite_etf_charge(bytes), None);
+        }
+        for n in 0..tuple.len() { assert_eq!(finite_etf_charge(&tuple[..n]), None); }
+        let mut deep = vec![131];
+        for _ in 0..130 { deep.extend_from_slice(&[104, 1]); }
+        deep.push(106);
+        assert_eq!(finite_etf_charge(&deep), None);
+    }
+
+    #[test]
+    fn compressed_etf_envelope_is_length_checked() {
+        use std::io::Write;
+        let body = [104, 2, 97, 1, 97, 2];
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&body).unwrap();
+        let mut bytes = vec![ETF_VERSION, 80];
+        bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&encoder.finish().unwrap());
+        assert_eq!(inflate_stored_etf(&bytes).unwrap(), [&[ETF_VERSION][..], &body].concat());
+        let mut short = bytes.clone(); short[5] -= 1;
+        assert!(inflate_stored_etf(&short).is_err());
+        let mut long = bytes.clone(); long[5] += 1;
+        assert!(inflate_stored_etf(&long).is_err());
+        let mut trailing = bytes.clone(); trailing.push(0);
+        assert!(inflate_stored_etf(&trailing).is_err());
+        for n in 0..bytes.len() { assert!(inflate_stored_etf(&bytes[..n]).is_err()); }
+    }
+
 }
 
