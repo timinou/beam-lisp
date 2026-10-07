@@ -1,0 +1,127 @@
+;; Bounded evidence over ACTUAL published IR. This is dependency evidence only;
+;; it does not certify effects, termination, argument domains or read closure.
+(ns system.publication-closure
+ (:require [system.publication :as publication] [system.ir :as ir]
+           [data.bounded-cache :as cache]))
+(def MAX-DEFINITIONS 256)
+(def MAX-NODES 32768)
+(def MAX-BYTES 2097152)
+(def OPS #{:lit :var :global :enil :arith :remote :apply :let :if :do :case
+           :fn :try :recv :tuple :map :cons})
+(defn- refuse [reason] (throw (ex-info "unclosed emitted dependency" {:reason reason})))
+(defn- bounded [state]
+ (when (or (> (:bytes state) MAX-BYTES)
+           (> (count (:definitions state)) MAX-DEFINITIONS)
+           (> (:nodes state) MAX-NODES)) (refuse :evidence-limit))
+ state)
+(defn- put-evidence [state table key value]
+ (if (contains? (get state table) key)
+  (if (= value (get-in state [table key])) state (refuse :unstable-evidence))
+  (let [charge (cache/footprint [key value])]
+   (when (nil? charge) (refuse :opaque-evidence))
+   ;; Charge each distinct retained entry once, with metadata/pending overhead.
+   ;; Never rewalk the whole certificate for every IR node.
+   (bounded (-> state (assoc-in [table key] value)
+                     (update :bytes + charge 512))))))
+(defn- finite-snapshot [snapshot]
+ (when snapshot
+  ;; Generation vectors contain environment refs as identities. Normalize them
+  ;; so retaining evidence never retains the environment resource itself.
+  (assoc snapshot :generation (cache/key-data (:generation snapshot) 0))))
+(defn- definition-valid? [saved]
+ (= saved (finite-snapshot (publication/snapshot (:namespace saved) (:name saved)))))
+(defn- add-definition [state ns name]
+ (let [key [ns name]]
+  (if (contains? (:definitions state) key) state
+   (let [snapshot (finite-snapshot (publication/snapshot ns name))]
+    (when (nil? snapshot) (refuse :unpublished-function))
+    (bounded (update (put-evidence state :definitions key snapshot) :pending conj key))))))
+(defn- value-of [node]
+ (let [result (if (= :exact (:lookup node))
+                (BeamLisp.Env/fetch_exact (:ns node) (:name node))
+                (BeamLisp.Env/fetch (:ns node) (:name node)))]
+  (when (or (not (tuple? result)) (not= :ok (elem result 0))) (refuse :missing-global))
+  (elem result 1)))
+(defn- function-home [node value]
+ ;; Exact/own provider and the two ordinary fallback namespaces are admitted.
+ ;; Other aliases/re-exports decline unless a snapshot proves that actual home.
+ (first (keep (fn [ns]
+                (let [s (publication/snapshot ns (:name node))]
+                 (when (and s (= (tuple :ok value) (BeamLisp.Env/fetch_exact ns (:name node))))
+                  [ns (:name node)])))
+              (if (= :exact (:lookup node)) [(:ns node)] [(:ns node) "core" "sugar"]))))
+(defn- global-edge [state node]
+ (let [value (value-of node)
+       edge [(:ns node) (:name node) (:lookup node)]]
+  (if (erlang/is_function value)
+   (let [home (function-home node value)]
+    (when (nil? home) (refuse :unknown-function-provider))
+    (add-definition (put-evidence state :bindings edge {:function home}) (first home) (second home)))
+   (do
+    ;; key-data alone accepts references as identities; footprint refuses their
+    ;; resource ownership. Both are necessary before retaining a global value.
+    (when (nil? (cache/footprint value)) (refuse :opaque-global-value))
+    (let [identity (cache/key-data value 0)]
+     (when (nil? identity) (refuse :opaque-global-value))
+     (put-evidence state :bindings edge {:value identity}))))))
+(defn- remote-edge [state mod fun]
+ (when (or (not (erlang/is_atom mod)) (not (erlang/is_atom fun))) (refuse :dynamic-remote))
+ (let [home (first (filter (fn [ns] (= mod (BeamLisp.Emit/module_for ns)))
+                          [(:walking-ns state) "core" "sugar"]))
+       bl? (or (erlang/function_exported mod :__bl_ns_defs__ 0)
+               (String/starts_with? (erlang/atom_to_binary mod :utf8) "Elixir.BeamLisp.Ns."))
+       identity (if (= :erlang mod)
+                  [:otp (erlang/system_info :otp_release) (erlang/system_info :version)]
+                  [:beam (erlang/apply mod :module_info (list :md5))])
+       state (put-evidence state :remotes [mod fun] identity)]
+  ;; Local calls lower to remote shim calls, not global nodes. Include their
+  ;; actual helper clauses; a shim MD5 alone cannot close those body edges.
+  (when (and bl? (nil? home)) (refuse :unknown-remote-provider))
+  (if home (add-definition state home (erlang/atom_to_binary fun :utf8)) state)))
+(defn- walk [state node]
+ (when (or (not (ir/node? node)) (not (contains? OPS (:op node)))) (refuse :unknown-ir))
+ (let [state (update state :nodes inc)
+       state (cond
+               (= :global (:op node)) (global-edge state node)
+               (= :remote (:op node)) (remote-edge state (:mod node) (:fun node))
+               (= :arith (:op node)) (remote-edge state :Elixir.BeamLisp.Num (:fun node))
+               :else state)]
+  ;; A caller-supplied function or computed apply target is not a closed call.
+  (when (and (= :apply (:op node))
+             (not (contains? #{:global :fn} (:op (:fn node))))) (refuse :dynamic-apply))
+  (reduce walk (bounded state) (ir/child-nodes node))))
+(defn- walk-definition [state key]
+ (reduce (fn [state entry]
+           (let [clause (elem entry 3)
+                 state (if (:guard clause) (walk state (:guard clause)) state)]
+            (walk state (:body clause))))
+         (assoc state :walking-ns (first key)) (:entries (get (:definitions state) key))))
+(defn- certificate-once
+ "Collect bounded actual body/binding/remote evidence. Unknown providers,
+  dynamic calls, resource values and unknown IR decline. All guards and clauses
+  participate. Conservative global publication epoch refuses unrelated reloads.
+  A positive result is NOT authority for caching, cancellation or native code."
+ [ns name]
+ (try
+  (let [epoch (BeamLisp.Env/publication_epoch)
+        environment (cache/key-data (BeamLisp.Env/chain) 0)
+        initial (add-definition {:definitions {} :bindings {} :remotes {}
+                                 :pending [] :nodes 0 :bytes 4096} ns name)
+        closed (loop [state initial index 0]
+                 (if (= index (count (:pending state))) state
+                  (recur (walk-definition state (nth (:pending state) index)) (inc index))))]
+   (when (and (= epoch (BeamLisp.Env/publication_epoch))
+              environment
+              (every? definition-valid? (vals (:definitions closed))))
+    (let [proof (assoc (dissoc closed :pending :bytes :walking-ns) :version 1 :root [ns name]
+                      :environment environment :epoch epoch)
+          retained (cache/footprint proof)]
+     (when (and retained (<= retained MAX-BYTES)) proof))))
+  (catch _ nil)))
+(defn certificate
+ "Bounded actual dependency evidence; not an effects/read/domain certificate.
+  Retry first-use publication once with entirely fresh evidence."
+ [ns name]
+ (or (certificate-once ns name) (certificate-once ns name)))
+(defn valid? [saved]
+ (and (some? saved) (= saved (certificate (first (:root saved)) (second (:root saved))))))
