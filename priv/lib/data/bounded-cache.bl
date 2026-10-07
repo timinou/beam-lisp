@@ -99,23 +99,41 @@
       (when (<= weight 1048576)
         (crypto/hash :sha256 (erlang/term_to_binary data))))))
 
+(defn- publish-control! [name gate state]
+  (ets/insert name (tuple :cache-control
+    {:gate gate :stats {:size (count (:entries state)) :bytes (:bytes state)}})))
+
 (defserver owner
   (init [name]
     (ets/new name (list :set :protected :named_table
                        (tuple :read_concurrency true)))
-    (ok {:name name :budget (budget/empty-state)}))
+    (let [gate (atomics/new 1 (list)) state (budget/empty-state)]
+      (publish-control! name gate state)
+      (ok {:name name :gate gate :budget state})))
   ;; put! supplies a charge proven before sending immutable finite data.
   ;; The owner serializes only publication and the pure budget decision.
   (handle-call [:put key revision value weight] [_from st]
-    (let [entry (tuple key revision value)
-          decision (budget/offer (:budget st) key revision weight)]
-      (when (:accepted? decision)
-        (doseq [victim (:evict decision)] (ets/delete (:name st) victim))
-        (ets/insert (:name st) entry))
+    (let [decision
+          (try
+            (let [entry (tuple key revision value)
+                  decision (budget/offer (:budget st) key revision weight)]
+              (when (:accepted? decision)
+                (doseq [victim (:evict decision)] (ets/delete (:name st) victim))
+                (ets/insert (:name st) entry))
+              (publish-control! (:name st) (:gate st) (:state decision))
+              decision)
+            ;; The caller timing out does NOT release admission: its payload
+            ;; remains queued until this owner actually consumes the request.
+            (finally (atomics/put (:gate st) 1 0)))]
       (reply (:accepted? decision) (assoc st :budget (:state decision)))))
   (handle-call [:clear] [_from st]
-    (ets/delete_all_objects (:name st))
-    (reply :ok (assoc st :budget (budget/empty-state))))
+    ;; Retain the admission/stats row. User keys are typed tuples; metadata
+    ;; uses a raw atom and two fields, so it cannot collide with an entry.
+    (ets/select_delete (:name st) (list (tuple (tuple :_ :_ :_) (list) (list true))))
+    (let [state (budget/empty-state)
+          gate (or (:gate st) (atomics/new 1 (list)))]
+      (publish-control! (:name st) gate state)
+      (reply :ok (assoc st :gate gate :budget state))))
   (handle-call [:stats] [_from st]
     (reply {:size (count (get-in st [:budget :entries]))
             :bytes (get-in st [:budget :bytes])} st)))
@@ -154,7 +172,14 @@
         (let [weight (footprint (tuple key revision value))]
           (if (budget/admissible? weight)
             (if-let [pid (ensure-owner name)]
-              (call pid [:put key revision value weight] OWNER-TIMEOUT-MS)
+              (let [control (first (ets/lookup name :cache-control))
+                    gate (when control (:gate (erlang/element 2 control)))]
+                ;; Read the gate before checking table ownership. A dead/replaced
+                ;; owner can never reserve the new owner's unrelated gate.
+                (if (and gate (= pid (ets/info name :owner))
+                         (= :ok (atomics/compare_exchange gate 1 0 1)))
+                  (call pid [:put key revision value weight] OWNER-TIMEOUT-MS)
+                  false))
               false)
             false))
         false))
@@ -180,5 +205,7 @@
   :ok)
 
 (defn stats [name]
-  (or (try (when-let [pid (Process/whereis name)] (call pid [:stats] OWNER-TIMEOUT-MS))
-           (catch _ nil)) {:size 0 :bytes 0}))
+  (or (try
+        (when-let [control (first (ets/lookup name :cache-control))]
+          (:stats (erlang/element 2 control)))
+        (catch _ nil)) {:size 0 :bytes 0}))
