@@ -394,7 +394,18 @@ fn run_window(
     builder = if !win.html.is_empty() {
         builder.with_html(&win.html)
     } else {
-        builder.with_url(&win.url)
+        // A window opened on a URL is locked to that URL's origin: a page that
+        // holds the IPC bridge (and, in Foundry, the desktop authority) must not
+        // be navigated, or popped out, to anything else. Inline-html windows
+        // keep the default behaviour.
+        let origin = origin_of(&win.url);
+        builder
+            .with_url(&win.url)
+            .with_navigation_handler(move |next: String| {
+                next == "about:blank"
+                    || matches!((&origin, origin_of(&next)), (Some(o), Some(n)) if *o == n)
+            })
+            .with_new_window_req_handler(|_url, _features| wry::NewWindowResponse::Deny)
     };
 
     // build_gtk on the window's default gtk container is the Wayland-safe path
@@ -556,5 +567,31 @@ mod platform_chrome {
         assert!(!is_wayland_display_type("GdkX11Display"));
         assert!(!is_wayland_display_type("GdkQuartzDisplay"));
         assert!(!is_wayland_display_type(""));
+    }
+}
+
+/// `scheme://host[:port]` of an absolute URL (lower-cased scheme/host), or
+/// None when `url` has no authority. The navigation lock compares these.
+fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url.split_once("://")?;
+    let authority = rest.split(|c| c == '/' || c == '?' || c == '#').next()?;
+    // userinfo is not part of the origin; refuse the confusable `a@b` form.
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    Some(format!("{}://{}", scheme.to_ascii_lowercase(), authority.to_ascii_lowercase()))
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::origin_of;
+
+    #[test]
+    fn origins() {
+        assert_eq!(origin_of("http://127.0.0.1:4788/x?y#z").as_deref(), Some("http://127.0.0.1:4788"));
+        assert_eq!(origin_of("http://127.0.0.1:4788"), origin_of("HTTP://127.0.0.1:4788/a"));
+        assert_ne!(origin_of("http://127.0.0.1:4788"), origin_of("http://127.0.0.1:4789"));
+        assert_eq!(origin_of("http://127.0.0.1:4788@evil.com/"), None);
+        assert_eq!(origin_of("about:blank"), None);
     }
 }

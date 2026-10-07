@@ -524,3 +524,88 @@ beam-lisp 0.1.0
 ```
 
 `bl version --json` prints the whole record.
+
+
+## 16. Nix-built server drop — glibc floor = host
+
+**Why.** A drop built on a rolling-release workstation links that machine's
+glibc. Built on Arch (glibc 2.43), `beam.smp` needs `GLIBC_2.43`; a NixOS 25.05
+server has glibc 2.40 and the VM dies at start with
+`version 'GLIBC_2.43' not found` — found by Foundry's first end-to-end install
+(2026-10-04, Foundry BUG-001). glibc is backward compatible only: a binary runs
+on a glibc **at least** as new as the one it was linked against. So a server drop
+must be linked against a glibc **no newer than the server's**.
+
+**How.** `flake.nix` + `nix/beam.nix` + `nix/bl-drop.nix` build the whole drop
+inside nix, from the **same nixpkgs rev the servers run**
+(`apps/foundry/infra/flake.lock`, nixos-25.05):
+
+| input | source | why |
+|---|---|---|
+| OTP 29.0.1, Elixir 1.20.2 | built from upstream source with the pinned nixpkgs toolchain | 25.05 ships OTP 28 / Elixir 1.18 |
+| Rust NIFs (`native/*` except `wry_webview`) + `tooling/drop` | `rustc`/`cargo` from nixos-unstable, **linked by the pinned gcc + glibc** | rustler needs rustc ≥ 1.91; only the compiler is newer, never the libc |
+| hex deps | `fetchurl` per `bl.lock` digest | offline, reproducible |
+| crates | `importCargoLock` per `Cargo.lock` | offline |
+| z3 4.16.0, explorer 0.12.0 NIF | pinned release artifacts (glibc 2.39 / 2.35 floors) | already below the floor |
+
+`wry_webview` (gtk/webkit) is desktop-only and left out: on a server `wry/*`
+reads as absent.
+
+The last step rewrites every ELF in the payload to the FHS loader
+(`/lib64/ld-linux-x86-64.so.2`) with no RUNPATH, so the drop never depends on
+`/nix/store` paths existing on the target. On NixOS that loader is `nix-ld`'s
+(enabled by Foundry's host module), which resolves libc **from the host** — the
+host's glibc must therefore be ≥ the drop's floor, which is exactly the property
+this build guarantees.
+
+```sh
+nix build .#bl-drop                                  # → result/bl.drop
+tooling/drop/glibc-floor.sh result/bl.drop           # → "2.40  <file>"; must be ≤ the host's
+```
+
+`glibc-floor.sh DROP|DIR` prints the highest `GLIBC_2.N` any ELF needs (and
+which file). On the old workstation drop it prints `2.43  erts-17.0.1/bin/beam.smp`.
+Foundry's release builder enforces the same rule on its own (`release.py build
+--max-glibc`, refusal `runtime-glibc-too-new`), so a too-new drop fails in a
+second instead of at the server's first start.
+
+**Keep the pins in step.** When the servers move to a new nixpkgs
+(`apps/foundry/infra/flake.lock`), move this flake's `nixpkgs` input to the same
+rev (`nix flake lock --override-input nixpkgs github:NixOS/nixpkgs/<rev>`) and
+Foundry's `pinned-host-glibc` constant to that release's glibc.
+
+The workstation drop (`make-drops.sh`, §11) stays the right tool for the
+operator's own machine; a drop that ships to a server comes from this build.
+
+### Lean + always working (split, gates, one command)
+
+`nix/bl-drop.nix` is three derivations, each with a `lib.fileset` source holding
+only what it reads:
+
+| derivation | src | rebuilds when |
+|---|---|---|
+| `drop-tools` (launcher + `drop` pack tool) | `tooling/drop` | the tool changes |
+| `natives` (six server NIFs) | `native/<6 crates>` + their `Cargo.lock`s | a crate changes |
+| `bl-drop` (deps, `bl build`, self-build, ELF retarget) | `bin priv env.bl bl.lock` + `tooling/drop/{src,Cargo.*}` | any `.bl` change |
+
+`bl-drop` compiles no Rust: it takes the launcher/`drop` from `drop-tools`, and a
+`cargo` shim answers `bl build`'s native stage from `natives` (real cargo for
+anything else). OTP/Elixir are separate store paths, never rebuilt by a `.bl`
+change. Measured (this host, loaded): a one-line `.bl` change on the **old**
+single derivation = 54 min buildPhase (every NIF + the launcher recompiled,
+~54 min wall total 3235 s). After the split a `.bl` change should not
+rebuild `natives`/`drop-tools` — by construction of the filesets, NOT yet
+measured: the first split build was stopped before it finished (2026-10-04),
+so neither the split drop nor the gates below have run green yet
+(apps/foundry FUP-016).
+
+Gates (`nix flake check`, also the CI `nix-drop` job): `drop-runs` (the drop
+evaluates `(+ 1 2)` = 3) and `glibc-floor` (≤ 2.40). `tooling/drop/check-pins.sh`
+fails when this flake's nixpkgs ≠ `apps/foundry/infra/flake.lock`'s (it reads a
+sibling repo, so it is a script/CI step, not a sandboxed check).
+`nixpkgs-rust` (unstable) stays: it is the only pinned source of rustc ≥ 1.91
+without adding another input.
+
+One command: `tooling/drop/server-drop.sh` builds `.#bl-drop`, copies it to
+`~/.cache/foundry/drops/bl-nix-<sha8>.drop`, prints `path=` and `sha256=`
+(the Foundry deploy spec `:runtime {:path :sha256}`). Idempotent.

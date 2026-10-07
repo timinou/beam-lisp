@@ -1,0 +1,135 @@
+; OTP's privacy boundary and bounded handler. Unknown reports fail closed.
+(ns diagnostics.otp
+  (:require [diagnostics :as diag] [diagnostics.delivery :as delivery]))
+
+(def CONFIG-KEY :bl_diagnostics_otp)
+(def HANDLER :beam_lisp_diagnostics)
+(def FILTER :beam_lisp_diagnostics_privacy)
+(def MODULE :Elixir.BeamLisp.Ns.Diagnostics.Otp)
+(def REPORT-EVENT :diagnostics.otp/report-observed)
+(def REPORT-SCHEMA {REPORT-EVENT {:level :warning :fields {:diagnostics.otp/report-kind #{:process :supervisor :crash :unknown}
+                                                                       :diagnostics.otp/severity #{:debug :info :notice :warning :error :critical :alert :emergency}}}})
+
+(defn- fallback ([] (fallback :warning)) ([level]
+  {:diagnostics/schema-version 1 :diagnostics/event REPORT-EVENT
+   :diagnostics/level :warning :diagnostics/event-id (diag/new-id)
+   :diagnostics/at (erlang/system_time :millisecond)
+   :diagnostics.otp/severity (if (contains? #{:debug :info :notice :warning :error :critical :alert :emergency} level) level :warning)}))
+
+(defn- report-kind [msg]
+  (try
+    (let [report (when (and (erlang/is_tuple msg) (= 2 (erlang/tuple_size msg))
+                           (= :report (erlang/element 1 msg))) (erlang/element 2 msg))
+          label (when (erlang/is_map report) (maps/get :label report nil))
+          tag (when (and (erlang/is_tuple label) (> (erlang/tuple_size label) 0))
+                (erlang/element 1 label))]
+      (get {:gen_server :process :supervisor :supervisor :proc_lib :crash} tag :unknown))
+    (catch _ :unknown)))
+
+(defn redact-report
+  "Never forwards strings, format args, report callbacks, state or metadata.
+   Only authenticated, schema-projected diagnostics retain their declared fields."
+  [event config]
+  (try
+    (let [msg (maps/get :msg event nil) meta (maps/get :meta event {})
+          trusted? (and (erlang/is_map meta) (:token config)
+                        (= (:token config) (maps/get :bl_diagnostics_token meta nil)))
+          report (when (and trusted? (erlang/is_tuple msg) (= 2 (erlang/tuple_size msg))
+                            (= :report (erlang/element 1 msg))) (erlang/element 2 msg))
+          safe (or (diag/project-record report (:events config)) (assoc (fallback (maps/get :level event :warning)) :diagnostics.otp/report-kind (report-kind msg)))]
+      {:level (:diagnostics.otp/severity safe (:diagnostics/level safe)) :msg (tuple :report safe)
+       :meta {:domain (list :beam_lisp :diagnostics)}})
+    (catch _ {:level :warning :msg (tuple :report (fallback))
+              :meta {:domain (list :beam_lisp :diagnostics)}})))
+
+(defn- wire-key [k] (String/trim_leading (str k) ":"))
+(defn- wire-value [v] (if (keyword? v) (wire-key v) v))
+
+(defn format-record
+  "One valid JSON line, at most 8192 bytes. Reprojects before encoding."
+  [record events]
+  (let [safe (or (diag/project-record record (merge REPORT-SCHEMA events)) (fallback))
+        wire (reduce (fn [m [k v]] (assoc m (wire-key k) (wire-value v))) {} safe)
+        wire (if (:diagnostics.otp/severity safe)
+               (assoc wire "diagnostics/level" (wire-key (:diagnostics.otp/severity safe))) wire)
+        encoded (Jason/encode! wire)]
+    (if (<= (erlang/byte_size encoded) 8191)
+      (str encoded "\n")
+      (str (Jason/encode!
+             (assoc (reduce (fn [m [k v]] (if (String/starts_with? k "diagnostics/")
+                                           (assoc m k v) m)) {} wire)
+                    "diagnostics/truncated" true)) "\n"))))
+
+(def PRIORITY {:debug 7 :info 6 :notice 5 :warning 4 :error 3 :critical 2 :alert 1 :emergency 0})
+
+; OTP handler callbacks run synchronously, but only admit to a bounded channel.
+(defn adding_handler [config] (tuple :ok config))
+(defn changing_config [_ old new] (tuple :ok (merge old new)))
+(defn removing_handler [_] :ok)
+(defn log [event config]
+  (try
+    (let [c (:config config) record (erlang/element 2 (:msg event))]
+      (delivery/submit! (:channel c) record))
+    (catch _ nil))
+  :ok)
+
+(defn sink [record]
+  (let [config (persistent_term/get CONFIG-KEY {})]
+    (if (:channel config)
+      (do (logger/log (:diagnostics/level record :info) record
+                      {:domain (list :beam_lisp :diagnostics)
+                       :bl_diagnostics_token (:token config)}) nil)
+      :dropped)))
+
+(defn stats []
+  (let [c (persistent_term/get CONFIG-KEY {})]
+    (when (:channel c) (delivery/stats (:channel c)))))
+
+(defn ready? []
+  (try
+    (let [c (persistent_term/get CONFIG-KEY {})
+          result (logger/get_handler_config HANDLER)
+          handler (when (= :ok (erlang/element 1 result)) (erlang/element 2 result))]
+      (and (:channel c) (= MODULE (:module handler))
+           (= (:channel c) (get-in handler [:config :channel]))
+           (= (list (tuple FILTER (tuple redact-report c)))
+              (:filters (logger/get_primary_config)))))
+    (catch _ false)))
+
+(defn install!
+  "Install before sensitive work. Owns the VM's logging output configuration.
+   Default writer uses stderr and journal severity prefixes. No report formatting IO
+   occurs on a producer. An optional writer enables deterministic offline checks."
+  [opts]
+  (when (:channel (persistent_term/get CONFIG-KEY {}))
+    (throw (ex-info "diagnostics: handler already installed" {:kind :invalid-config})))
+  (let [events (merge REPORT-SCHEMA (:events opts {})) token (erlang/make_ref)
+        writer (or (:writer opts)
+                   (fn [record]
+                     (IO/write :stderr (str "<" (get PRIORITY (:diagnostics.otp/severity record (:diagnostics/level record)) 4) ">"
+                                            (format-record record events)))))
+        channel (delivery/open! (:capacity opts 256) writer)
+        config {:token token :events events :channel channel}]
+    (try
+      (diag/with-options-fn {:events events :sink sink :min-level (:min-level opts :info)} (fn [] nil))
+      (when-not (= :ok (logger/set_primary_config :filters (list (tuple FILTER (tuple redact-report config)))))
+        (throw (ex-info "diagnostics: privacy filter installation failed" {:kind :invalid-config})))
+      (when-not (= :ok (logger/add_handler HANDLER MODULE {:level :all :config config}))
+        (throw (ex-info "diagnostics: handler installation failed" {:kind :invalid-config})))
+      (persistent_term/put CONFIG-KEY config)
+      (logger/set_primary_config :level :all)
+      (doseq [id (logger/get_handler_ids)] (when (not= id HANDLER) (logger/remove_handler id)))
+      (diag/configure! {:events events :sink sink :min-level (:min-level opts :info)})
+      channel
+      (catch e
+        (logger/remove_handler HANDLER) (logger/remove_primary_filter FILTER)
+        (persistent_term/erase CONFIG-KEY) (delivery/close! channel 0)
+        (throw e)))))
+
+(defn uninstall!
+  "Drain the owned channel and remove this runtime's defaults. For test/host shutdown."
+  [ms]
+  (let [config (persistent_term/get CONFIG-KEY {})]
+    (logger/remove_handler HANDLER) (logger/remove_primary_filter FILTER)
+    (persistent_term/erase CONFIG-KEY) (diag/unconfigure!)
+    (when (:channel config) (delivery/close! (:channel config) ms))))
