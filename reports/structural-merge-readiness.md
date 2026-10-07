@@ -1,3 +1,5 @@
+> Latest authorized refresh: main `0f518fdf` is being merged onto this preparation branch; source clean, floor regenerated from combined source, 21-file compatibility gate / 8,553 assertions pass. Historical snapshot receipts below remain scoped to their own commits. See [main refresh and red repair plan](structural-main-refresh.md).
+
 # Corrected structural merge preparation
 
 ## Scope and provenance
