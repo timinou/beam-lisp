@@ -70,6 +70,12 @@ After verified snapshot commit `53894592`, preparation incorporates main `4ff1a2
 
 The five live files add 556 unique assertions to the selected25-file receipt: **30 selected files, 3,751 passing assertions across split receipts**. The separate final JSON/exception-kind diagnostics add coverage but are not counted in that selected total. Latest first/filter fixture is1,100,808 →90,717 reductions/200 calls,976 →1,208 bytes,46,819 →72,902 caller compilation reductions; preceding fixture table remains explicitly tied to artifact576. These fixture spreads are not an app/UI speed claim. Main is still not merged or deployed by this branch.
 
+## Final native/style snapshot
+
+A final bounded refresh incorporates main `c4b57bc7049e288698604ee3424d716eb9ee2fec`: native JSON persistent-vector encoding/count validation and bounded immutable style declaration reuse. Only that exact main snapshot is claimed verified; later upstream movement needs its own compatibility check. The JSON NIF is rebuilt from this preparation's Rust source with `cargo build --release --locked --jobs 2` in an isolated target directory and staged as an ignored artifact, not copied from a possibly stale installed binary.
+
+`artifact://1598ead9f02e4261/main/bash/588.txt`: native release build succeeds (15.287s,409M peak,0swap), then **6 files/874 assertions/0fail/0incoherent** — native-vectorJSON34, JSON163, loom token20, optimizer174, lifetime32, kernel451. Runtime16.208s,264.7M,0swap. Two new selected files add54 unique assertions: **32 selected files/3,805 passing assertions across split receipts**. The JSON163 diagnostic was already recorded separately and is not counted twice. Main is not merged or deployed.
+
 ## Reproduction
 
 Run checkout `./bin/bl`, not the installed drop, with `BL_DAEMON=off`. Inspect `scripts/bl-mem` before each VM, serialize the runs, and use memory/swap/runtime caps. Corrected host source requires the current coherent seed before test results can certify this image.
