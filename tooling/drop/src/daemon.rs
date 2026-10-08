@@ -1155,7 +1155,8 @@ mod tests {
         let want = std::fs::canonicalize(top.join("a")).unwrap();
         assert_eq!(project_dir(&deep), Some(want.clone()), "from three levels down");
         assert_eq!(project_dir(&top.join("a")), Some(want), "from the root itself");
-        assert_eq!(project_dir(&top), None, "above the project there is none");
+        assert_eq!(project_dir(&top), project_dir(top.parent().unwrap()),
+            "above the fixture, any enclosing developer project remains visible");
         let _ = std::fs::remove_dir_all(&top);
     }
 

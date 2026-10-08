@@ -26,7 +26,7 @@
   (:require [datom.db] [datom.index] [datom.schema] [datom.store] [datom.store-ets]
             [datom.store-overlay] [datom.tx] [datom.broadcast] [datom.attr-basis] [env]
             [datom.blob] [datom.blob-ets] [datom.blob-fs] [datom.blob-overlay]
-            [datom.file] [datom.index-coverage] [datom.text]))
+            [datom.file] [datom.index-coverage] [datom.text] [datom.query.rank-build]))
 
 ;; ── env conveyance (PLAN-047 W1) ─────────────────────────────────────
 ;;
@@ -131,7 +131,7 @@
 ; `blobs` is the bytes port for `:db.type/file` values. Like the writer and
 ; the basis it belongs to the STORE (it lives in the registry cell), so two
 ; connections over one store resolve files through one blob store.
-(defrecord Conn [store schema basis writer subs blobs])
+(defrecord Conn [store schema basis writer subs blobs lifetime])
 
 (declare ensure-schema-coverage-in-writer)
 (declare tuple-backfill-ops)
@@ -234,6 +234,26 @@
     (= requested :tmp) (datom.blob-fs/open :tmp)
     :else requested))
 
+(defn- lifetime-cell [cell]
+  ;; Older registry rows already share a basis atom: preserve that identity.
+  (if (and cell (nil? (:lifetime cell)))
+    (assoc cell :lifetime (atom :open)) cell))
+
+(defn- lifetime-conn [conn]
+  "Adopt the lifetime of an older handle only when its basis identity matches.
+   A stale handle must never adopt a newly opened connection over the same store."
+  (if (:lifetime conn) conn
+    (let [life (agent-get-and-update
+                (registry)
+                (fn [reg]
+                  (let [k (store-key (:store conn)) cell (get reg k)]
+                    (if (and cell (= (:basis conn) (:basis cell)))
+                      (let [current (lifetime-cell cell)]
+                        (->tuple-2 (:lifetime current) (assoc reg k current)))
+                      (->tuple-2 (atom :closed) reg))))
+                30000)]
+      (assoc conn :lifetime life))))
+
 (defn- store-cell
   "The `{:writer pid :basis atom :subs :blobs}` shared by every connection
    over `store`, created once.
@@ -252,14 +272,17 @@
     (registry)
     (fn [reg]
       (let [k (store-key store)
-            hit (get reg k)]
+            hit (lifetime-cell (get reg k))
+            reg (if hit (assoc reg k hit) reg)]
         (if (some? hit)
-          (if (and (some? requested-blobs)
+          (if (not= :open @(:lifetime hit))
+            (->tuple-2 {:error {:reason :connection-closing}} reg)
+           (if (and (some? requested-blobs)
                    (not (= requested-blobs :tmp))
                    (not (= requested-blobs (:blobs hit))))
             (->tuple-2 {:error {:configured (:blobs hit) :requested requested-blobs}} reg)
-            (->tuple-2 hit reg))
-          (let [cell {:writer (start-writer) :basis (atom initial-basis)
+            (->tuple-2 hit reg)))
+          (let [cell {:writer (start-writer) :basis (atom initial-basis) :lifetime (atom :open)
                       :subs (datom.broadcast/new-subs)
                       :blobs (resolve-blobs store requested-blobs)}]
             (->tuple-2 cell (assoc reg k cell))))))
@@ -294,31 +317,30 @@
                       {:reason (erlang/element 2 started)})))))
 
 (defn- ensure-writer
-  "Replace the connection's writer if it has died.
-
-   Serialized through the registry, so two callers noticing the same
-   death do not start two writers — which would silently un-serialize
-   every subsequent write, the exact failure the writer exists to
-   prevent."
+  "Resolve or replace a live writer only while this connection lifetime is open.
+   A released handle cannot recreate a writer or attach to a newer connection."
   [conn]
+  (let [conn (lifetime-conn conn)]
+  (when (not= :open @(:lifetime conn))
+    (throw (ex-info "connection has been released" {:reason :released-connection})))
   (let [current (:writer conn)]
     (if (Process/alive? current)
       current
-      (agent-get-and-update
+      (let [result (agent-get-and-update
         (registry)
         (fn [reg]
-          (let [k (store-key (:store conn))
-                cell (get reg k)]
-            ; Re-check INSIDE the serialized step: another caller may
-            ; have replaced it between our liveness test and here.
-            (if (and (some? cell) (Process/alive? (:writer cell)))
-              (->tuple-2 (:writer cell) reg)
-              (let [fresh (start-writer)
-                    updated (assoc (or cell {:basis (:basis conn) :subs (:subs conn)
-                                             :blobs (:blobs conn)})
-                                   :writer fresh)]
-                (->tuple-2 fresh (assoc reg k updated))))))
-        30000))))
+          (let [k (store-key (:store conn)) cell (get reg k)]
+            (cond
+              (or (not= :open @(:lifetime conn)) (nil? cell)
+                  (not= (:lifetime conn) (:lifetime cell)))
+                (->tuple-2 :released reg)
+              (Process/alive? (:writer cell)) (->tuple-2 (:writer cell) reg)
+              :else (let [fresh (start-writer)]
+                      (->tuple-2 fresh (assoc reg k (assoc cell :writer fresh)))))))
+        30000)]
+        (if (= :released result)
+          (throw (ex-info "connection has been released" {:reason :released-connection}))
+          result))))))
 
 (defn- with-writer
   "Run `f` inside the connection's writer process, one caller at a time.
@@ -437,7 +459,7 @@
          ; view of one database and must share both.
          cell (store-cell store basis (get opts :blobs))
          _ (if (some? (:error cell))
-             (throw (ex-info "blob store already configured for this store; it is chosen once, at setup"
+             (throw (ex-info "connection setup refused; the store is closing or its blob store is already configured"
                              (:error cell)))
              nil)
          conn (->Conn store
@@ -445,7 +467,8 @@
                       (:basis cell)
                       (:writer cell)
                       (:subs cell)
-                      (:blobs cell))]
+                      (:blobs cell)
+                      (:lifetime cell))]
      ; Schema is written as DATOMS as well as held as a map. The map is
      ; what every read consults — it is touched on each datom filter, so
      ; deriving it per read would be a serious regression — but the
@@ -513,20 +536,52 @@
    it removes is the last long-lived reference the database itself
    holds."
   [conn]
-  (let [k (store-key (:store conn))]
+  (when (= (:store conn) (erlang/get :datom.conn/writing-store))
+    (throw (ex-info "cannot release a connection inside its transaction" {:reason :release-in-writer})))
+  (let [conn (lifetime-conn conn)
+        k (store-key (:store conn))
+        owned (agent-get-and-update
+                (registry)
+                (fn [reg]
+                  (let [cell (get reg k)]
+                    (if (and cell (= (:lifetime conn) (:lifetime cell)))
+                      (do (reset! (:lifetime cell) :closing)
+                          (->tuple-2 (select-keys cell [:writer :rank-worker]) reg))
+                      (->tuple-2 nil reg))))
+                30000)
+        worker (:rank-worker owned) writer (:writer owned)]
+    (when (and worker (Process/alive? worker)) (Process/exit worker :shutdown))
+    ;; An unlinked process ignores exit(:normal). Stop the Agent outside the
+    ;; registry action, so a finishing transaction can itself consult registry.
+    (when (and writer (Process/alive? writer))
+      (try (Agent/stop writer :normal 30000)
+           (catch e (when (Process/alive? writer) (throw e)))))
+    ;; Guard keys and profiling wrappers also retain native handles. Retire
+    ;; those owners before allowing a new lifetime over the same store.
+    (when owned
+      (datom.attr-basis/release-store! (:store conn))
+      (let [guards (erlang/whereis GUARD-REGISTRY)]
+        (when (not= :undefined guards)
+          (Agent/update guards (fn [reg] (dissoc reg k)) 30000)
+          ;; Removing a key does not collect the old Agent state or callback.
+          ;; A quiet registry otherwise pins its native resource indefinitely.
+          (erlang/garbage_collect guards)))
+      ;; Optional instrumentation must not load a profiler in ordinary apps.
+      (let [cleanup (BeamLisp.Env/fetch_exact "datom.profile" "release-store!")]
+        (when (and (tuple? cleanup) (= :ok (elem cleanup 0)))
+          (BeamLisp.Ns.Rt/invoke (elem cleanup 1) (list (:store conn))))))
     (agent-get-and-update
       (registry)
       (fn [reg]
         (let [cell (get reg k)]
-          ;; Stop the writer as well. It holds no state — that is why it is
-          ;; neither linked nor supervised — but it is a process, and
-          ;; leaving one per released store behind is the same leak wearing
-          ;; a different hat.
-          (if (and (some? cell) (Process/alive? (:writer cell)))
-            (Process/exit (:writer cell) :normal)
-            nil)
-          (->tuple-2 :ok (dissoc reg k))))
-      30000)))
+          (reset! (:lifetime conn) :closed)
+          (->tuple-2 :ok (if (= (:lifetime conn) (:lifetime cell)) (dissoc reg k) reg))))
+      30000)
+    ;; The synchronous removal above is the ownership boundary. Collect only
+    ;; this idle owner, outside its action and after the writer has drained.
+    ;; Caller-held db values remain valid; no query pays a global GC cost.
+    (erlang/garbage_collect (registry))
+    :ok))
 
 (defn close!
   "Release the registry entry, then tear down what the store and the blob
@@ -740,7 +795,9 @@
         ; it is valid.
         (datom.store/-commit store
           (into ops (into (datom.attr-basis/record-ops store attrs tx)
-                          (datom.text/excision-ops store schema raw tx))))
+                          (concat (datom.text/excision-ops store schema raw tx)
+                                  (datom.query.rank-build/transaction-ops
+                                    (datom.db/db-value store schema (deref (:basis conn))) raw tx false)))))
         ; And the basis advances, because not every cache can ask a
         ; per-attribute question — the rule relations memoise on the basis
         ; alone, and an excision that advanced nothing would leave them
@@ -773,11 +830,15 @@
    value outlived its conn's release)."
   [db]
   (let [store (:store db)
-        cell (get (Agent/get (registry) (fn [m] m)) (store-key store))]
-    (if (nil? cell)
+        cell (agent-get-and-update (registry)
+               (fn [reg]
+                 (let [k (store-key store) cell (lifetime-cell (get reg k))]
+                   (->tuple-2 cell (if cell (assoc reg k cell) reg))))
+               30000)]
+    (if (or (nil? cell) (not= :open @(:lifetime cell)))
       (throw (ex-info "no live connection for this db's store" {:store store}))
       (->Conn store (atom (:schema db)) (:basis cell) (:writer cell)
-              (:subs cell) (:blobs cell)))))
+              (:subs cell) (:blobs cell) (:lifetime cell)))))
 
 (defn conns
   "Every live connection cell in this VM, one map per store:
@@ -1221,7 +1282,8 @@
         (datom.index/write-datoms store schema datoms
           (into (datom.attr-basis/record-ops store attrs tx)
                 (concat (datom.text/commit-ops store schema datoms)
-                        (datom.index-coverage/transaction-ops store schema datoms tx true))))
+                        (datom.index-coverage/transaction-ops store schema datoms tx true)
+                        (datom.query.rank-build/transaction-ops db-before datoms tx true))))
         {:tx tx :tempids (get resolved 1) :tx-datoms datoms}))))
 
 (defn- transact-in-writer
@@ -1311,7 +1373,8 @@
                               (into (datom.attr-basis/record-ops
                                       store (datom.broadcast/changed-attrs datoms) tx)
                                     (concat (datom.text/commit-ops store schema datoms)
-                                            (datom.index-coverage/transaction-ops store schema datoms tx false))))
+                                            (datom.index-coverage/transaction-ops store schema datoms tx false)
+                                            (datom.query.rank-build/transaction-ops db-before datoms tx false))))
     ; A HIGH-WATER MARK like `transact-in-writer`'s, and NOT a `reset!`: two
     ; writers racing can apply theirs in either order for the same result,
     ; while a rewind filters committed datoms out of every later read
@@ -1326,3 +1389,54 @@
       ; commit order exactly as `transact!`'s do.
       (datom.broadcast/publish! (:subs conn) (pubsub-server) report)
       report)))
+
+
+(defn ensure-query-rank!
+  "Internal automatic query-index registration. Runs in the existing source
+   writer; no app schema, count updates or cache keys are required."
+  [conn plan]
+  (datom.query.rank-build/prepare!)
+  (with-writer conn
+    (fn []
+      (let [database (db conn) s (:store conn)
+            id (datom.query.rank-build/ident plan)
+            pending (datom.query.rank-build/start-ops database plan)]
+        (when pending (datom.store/-commit s (:ops pending)))
+        (or (:ident pending)
+            (when (some (fn [existing] (= id existing)) (datom.query.rank-build/registry s)) id))))))
+
+(defn advance-query-rank!
+  "One bounded stage/cleanup step in the source writer. A process may die
+   between calls; the durable checkpoint resumes on the next query."
+  [conn id]
+  (with-writer conn
+    (fn []
+      (let [database (db conn) s (:store conn)
+            ops (or (datom.query.rank-build/step-ops database id)
+                    (datom.query.rank-build/cleanup-ops database id))]
+        (when (seq ops) (datom.store/-commit s ops))
+        (datom.store/-get s (datom.query.rank-index/header-key id))))))
+
+
+(defn claim-query-rank-worker!
+  "Register one finite index builder as owned by the connection. Release stops
+   it before draining the writer; a closed connection cannot acquire a worker."
+  [conn pid]
+  (let [conn (lifetime-conn conn)]
+  (agent-get-and-update
+    (registry)
+    (fn [reg]
+      (let [k (store-key (:store conn)) cell (get reg k)]
+        (if (or (nil? cell) (not= :open @(:lifetime cell))
+                (not= (:lifetime conn) (:lifetime cell))
+                (and (:rank-worker cell) (Process/alive? (:rank-worker cell))))
+          (->tuple-2 false reg)
+          (->tuple-2 true (assoc reg k (assoc cell :rank-worker pid))))))
+    30000)))
+
+(defn query-rank-worker-live?
+  [conn pid]
+  (let [conn (lifetime-conn conn)
+        cell (Agent/get (registry) (fn [reg] (get reg (store-key (:store conn)))))]
+    (and cell (= (:lifetime conn) (:lifetime cell))
+         (= :open @(:lifetime cell)) (= pid (:rank-worker cell)))))

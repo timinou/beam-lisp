@@ -1,0 +1,133 @@
+;; Transactional storage kernel for maintained scoped query membership. Every
+;; mutation returns ops; the source writer must include them in its ONE commit.
+(ns datom.query.rank-index
+ (:require [datom.db :as db] [datom.store :as store] [datom.index :as index]
+           [datom.schema :as schema] [datom.derived :as derived]
+           [datom.attr-basis :as marks] [data.ranked-tree :as rank]
+           [data.bounded-cache :as cache]))
+(def VERSION 1)
+(def MAX-MEMBERS 65536)
+(def MAX-BYTES 33554432)
+(def MAX-ENTITY-ROWS 4096)
+(def MAX-ENTITY-BYTES 1048576)
+(defn definition [plan]
+ (select-keys plan [:version :required :scope :scope-attr :order-attr :schema]))
+(defn header-key [ident] (derived/record-key [:datom.query.rank/header ident]))
+(defn node-key [ident generation id]
+ (derived/record-key [:datom.query.rank/node ident generation id]))
+(defn member-key [ident generation eid]
+ (derived/record-key [:datom.query.rank/member ident generation eid]))
+(defn header [s ident] (store/-get s (header-key ident)))
+(defn context [s h]
+ (assoc (rank/context (fn [id] (store/-get s (node-key (:ident h) (:generation h) id))) (:next h))
+        :members (atom {})))
+(defn fresh [ident plan basis generation]
+ {:version VERSION :ident ident :definition (definition plan) :generation generation
+  :origin basis :through basis :status :building :root nil :next 0 :bytes 0 :members 0})
+(defn covered?
+ "Complete schema and committed-write frontiers. Future roots never certify an
+  old reader; later maintenance cannot hide an earlier missed source write."
+ [s sch h basis]
+ (let [d (:definition h) committed (marks/committed-marks s)]
+  (and (= VERSION (:version h)) (= :complete (:status h))
+       (erlang/is_integer (:origin h)) (erlang/is_integer (:through h))
+       (<= 0 (:origin h) (:through h) basis)
+       (= (:schema d) (select-keys sch (:required d)))
+       (every? (fn [a] (let [t (get committed a (:origin h))]
+                        (and (erlang/is_integer t) (<= 0 t (:through h))))) (:required d)))))
+(defn read-fields
+ "Read one entity's required fields through physically bounded complete groups.
+  Refuse deep history and unsupported substrates; never use a truncated group."
+ [database eid attrs]
+ (let [s (db/store-of database)]
+  (loop [attrs attrs fields {} rows-left MAX-ENTITY-ROWS bytes-left MAX-ENTITY-BYTES]
+   (if (empty? attrs) fields
+    (let [a (first attrs) lo (index/key-prefix :eavt eid a) hi (index/prefix-end lo)
+          r (loop [after nil rows [] remaining rows-left bytes bytes-left]
+             (when (or (<= remaining 0) (<= bytes 0)) (throw {:refused :rank-member-work-limit}))
+             (let [p (store/ordered-page s lo after hi (min 1024 remaining) :asc bytes)
+                   all (into rows (:datoms p)) remaining (- remaining (count (:datoms p)))
+                   bytes (- bytes (or (:bytes p) 0))]
+              (when (or (:refused p) (:byte-limited? p)) (throw {:refused :rank-member-work-limit}))
+              (if (:end? p) {:rows all :remaining remaining :bytes bytes}
+               (recur (:last p) all remaining bytes))))
+          live (into [] (db/filter-datoms database (:rows r)))]
+     (when (> (count live) 1) (throw {:refused :rank-cardinality-violation}))
+     (recur (rest attrs) (if (seq live) (assoc fields a (index/-v (first live))) fields)
+            (:remaining r) (:bytes r)))))))
+(defn membership [h eid fields]
+ (let [d (:definition h) order (:order-attr d)
+       finite (cache/footprint fields)]
+  (when (and finite (<= finite 65536)
+             (every? (fn [a] (contains? fields a)) (:required d))
+             (= (:scope d) (cache/key-data (get fields (:scope-attr d)) 0)))
+   {:key [(if order (get fields order) eid) eid] :eid eid :fields fields :bytes (+ 1024 (* 2 finite))})))
+(defn- member-bytes [m] (or (:bytes m) 0))
+(defn replace-member
+ "Prepare one membership replacement against caller-owned header/context.
+  Missing required fields remove membership; moving scope leaves this tree.
+  No store write occurs until the caller commits the returned ops with source."
+ [s ctx h eid fields]
+ (let [k (member-key (:ident h) (:generation h) eid) pending @(:members ctx)
+       old (if (contains? pending eid) (get pending eid) (store/-get s k))
+       next (membership h eid fields)
+       same? (= old next)
+       same-key? (and old next (= (:key old) (:key next)))
+       root (cond same? (:root h)
+                  same-key? (rank/insert ctx (:root h) (:key next) next)
+                  :else (let [removed (if old (rank/remove ctx (:root h) (:key old)) (:root h))]
+                          (if next (rank/insert ctx removed (:key next) next) removed)))
+       members (+ (:members h) (if next 1 0) (if old -1 0))
+       bytes (+ (:bytes h) (member-bytes next) (- (member-bytes old)))]
+  (when (or (> members MAX-MEMBERS) (> bytes MAX-BYTES)) (throw {:refused :rank-storage-limit}))
+  (swap! (:members ctx) assoc eid next)
+  {:header (assoc h :root root :members members :bytes bytes)
+   :ops (cond same? [] next [[:put k next]] :else [[:delete k]])}))
+(defn publication-ops [ctx h member-ops]
+ (let [delta (rank/changes ctx) h (assoc h :next (:next delta))]
+  (into (conj (vec member-ops) [:put (header-key (:ident h)) h])
+    (concat (map (fn [[id n]] [:put (node-key (:ident h) (:generation h) id) n]) (:new delta))
+            (map (fn [id] [:delete (node-key (:ident h) (:generation h) id)]) (:delete delta))))))
+(defn read-page
+ "Optimistic immutable-node read. Recheck complete header/frontiers afterwards;
+  concurrent retirement, uncovered writes and historical readers decline."
+ [database ident plan offset limit]
+ (try
+  (let [s (db/store-of database) before (header s ident)
+        reads (atom 4092) bytes (atom 7864320)
+        ctx (rank/context
+              (fn [id]
+               (when (neg? (swap! reads dec)) (throw {:refused :rank-page-seek-limit}))
+               (let [node (store/-get s (node-key ident (:generation before) id))
+                     weight (cache/footprint node)]
+                (when (or (nil? weight) (neg? (swap! bytes (fn [left] (- left weight)))))
+                 (throw {:refused :rank-page-byte-limit})) node)) (:next before))]
+   (when (and (= (definition plan) (:definition before))
+              (erlang/is_integer offset) (<= 0 offset)
+              (erlang/is_integer limit) (<= 1 limit 1000)
+              (= :current (:filter-mode database)) (nil? (:since-t database))
+              (nil? (:valid-at database)) (nil? (:valid-between database))
+              (= (store/identity-of s) (store/capability-target s))
+              (covered? s (db/schema-of database) before (db/basis-t database)))
+    (let [values (rank/page ctx (:root before) offset limit (:direction plan))
+          result {:status :exact :total (:members before)
+                  :rows (mapv (fn [m] (mapv (fn [a] (if a (get (:fields m) a) (:eid m))) (:columns plan))) values)}
+          after (header s ident)]
+     (when (and (= before after) (covered? s (db/schema-of database) after (db/basis-t database))) result))))
+  (catch _ nil)))
+(defn read-count
+ "Count membership independently of the index ordering. An ordinary count
+  query can share the page index without maintaining a second tree."
+ [database ident plan]
+ (try
+  (let [s (db/store-of database) before (header s ident)
+        keys [:version :required :scope :scope-attr :schema]
+        value (when (and (= (select-keys (definition plan) keys) (select-keys (:definition before) keys))
+                         (= :current (:filter-mode database)) (nil? (:since-t database))
+                         (nil? (:valid-at database)) (nil? (:valid-between database))
+                         (= (store/identity-of s) (store/capability-target s))
+                         (covered? s (db/schema-of database) before (db/basis-t database)))
+                {:status :exact :value (:members before)})]
+   (when (and value (= before (header s ident))
+              (covered? s (db/schema-of database) before (db/basis-t database))) value))
+  (catch _ nil)))

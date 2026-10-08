@@ -1,0 +1,189 @@
+;; Bounded durable stages. Call these operations only in the store writer;
+;; every batch and its checkpoint share a commit. Normal source writes retain
+;; a bounded dirty-entity set atomically and may abort an index, never the write.
+(ns datom.query.rank-build
+ (:require [datom.query.rank-index :as rank] [datom.db :as db]
+           [datom.index :as index] [datom.store :as store]
+           [datom.derived :as derived] [datom.index-coverage :as coverage]
+           [data.bounded-cache :as cache] [data.ranked-tree :as tree]))
+(def REGISTRY [:datom.query.rank/registry])
+(def MAX-INDEXES 4)
+(def BATCH-ROWS 16)
+(def MAX-DIRTY 256)
+(def NAMESPACES '("datom.conn" "datom.tx" "datom.db" "datom.index" "datom.schema"
+                 "datom.query.rank-index" "datom.query.rank-build" "datom.query.rank-plan"
+                 "data.ranked-tree" "data.bounded-cache" "datom.derived"
+                 "datom.index-coverage" "datom.store" "core" "rt"))
+(defn- vm-stamp []
+ (let [key ::vm-incarnation]
+  (or (persistent_term/get key nil)
+      (global/trans (tuple key (erlang/self))
+       (fn []
+        (or (persistent_term/get key nil)
+            (let [id (crypto/strong_rand_bytes 16)]
+             (persistent_term/put key id) id)))))))
+(defn- code-stamp-once []
+ (try
+  (let [epoch (BeamLisp.Env/publication_epoch)
+        before (BeamLisp.Env/namespace_generations NAMESPACES)
+        bytes (mapv (fn [ns] (erlang/apply (BeamLisp.Emit/module_for ns) :module_info (list :md5))) NAMESPACES)]
+   ;; Generations cover value rebindings as well as emitted functions. The
+   ;; VM incarnation makes this certificate explicitly ephemeral: reopening
+   ;; cannot accidentally accept reused generation numbers from another VM.
+   ;; Durable cross-VM reuse waits for the closed dependency certificate.
+   (when (and before (= epoch (BeamLisp.Env/publication_epoch))
+              (= before (BeamLisp.Env/namespace_generations NAMESPACES)))
+    {:vm (vm-stamp) :epoch epoch :generations before :modules bytes}))
+  (catch _ nil)))
+(defn code-stamp []
+ ;; Reading a first-use binding may initialize its environment. Retry with
+ ;; fresh evidence; never relabel an unstable first snapshot as current.
+ (or (code-stamp-once) (code-stamp-once)))
+(defn prepare!
+ "Materialize dependencies before entering the source writer. Source-only
+  namespaces may be lazy even after require; module_info cannot load BL source."
+ []
+ (doseq [ns NAMESPACES] (BeamLisp.Loader/ensure_loaded ns)))
+(defn registry [s]
+ (let [ids (or (derived/get-record s REGISTRY) [])]
+  (when (and (vector? ids) (<= (count ids) MAX-INDEXES)) ids)))
+(defn ident [plan]
+ (when (cache/footprint (rank/definition plan))
+  (crypto/hash :sha256 (erlang/term_to_binary (rank/definition plan)))))
+(defn scope-value [plan]
+ (let [value (:scope plan)]
+  (when (and (tuple? value) (contains? #{:atom :integer :binary :float} (elem value 0))) (elem value 1))))
+(declare abort-op)
+(defn start-ops [database plan]
+ (let [s (db/store-of database) ids (registry s) id (ident plan) old (when id (rank/header s id))
+       stamp (code-stamp)]
+  (when (and ids id stamp (some? (scope-value plan))
+             (= :current (:filter-mode database)) (nil? (:since-t database))
+             (nil? (:valid-at database)) (nil? (:valid-between database))
+             (= (:schema plan) (select-keys (db/schema-of database) (:required plan)))
+             (store/ordered-page-capable? s)
+             (not (contains? (set ids) id)) (nil? old))
+   (if (>= (count ids) MAX-INDEXES)
+    (let [victim (first ids) h (rank/header s victim)]
+     {:ident victim :ops (when h (abort-op h :rank-capacity-evicted))})
+   (let [scope-attr (:scope-attr plan) basis (db/basis-t database)
+         driving (if (coverage/complete? s (db/schema-of database) scope-attr basis) :avet :aevt)
+         h (assoc (rank/fresh id plan basis (crypto/strong_rand_bytes 16))
+                  :writer-code stamp :driving driving :scope-value (scope-value plan)
+                  :after nil :pending [] :dirty #{} :scan-ended? false)]
+    {:ident id :ops (into (derived/put-ops REGISTRY (conj ids id))
+                         [[:put (rank/header-key id) h]])})))))
+(defn- unchanged? [s sch h basis]
+ (and (= (:writer-code h) (code-stamp))
+      (rank/covered? s sch (assoc h :status :complete) basis)))
+(defn- abort-op [h reason]
+ [[:put (rank/header-key (:ident h)) (assoc h :status :aborted :reason reason :pending [] :dirty #{})]])
+(defn- apply-datoms [fields datoms]
+ (reduce (fn [m d]
+           (if (index/-op d) (assoc m (index/-a d) (index/-v d))
+            (if (= (get m (index/-a d)) (index/-v d)) (dissoc m (index/-a d)) m))) fields datoms))
+(defn transaction-ops
+ "Source writer hook. Every expanded datom is observed, including empty-result
+  insertions and scope transfers. Bulk/excision callers pass trusted? false.
+  Any gap, schema/code drift or bounded-work refusal invalidates permanently."
+ [database datoms tx trusted?]
+ (let [s (db/store-of database) sch (db/schema-of database) ids (registry s)]
+  (vec (mapcat
+   (fn [id]
+    (let [h (rank/header s id) required (set (:required (:definition h)))
+          affected (filterv (fn [d] (contains? required (index/-a d))) datoms)
+          eids (set (mapv index/-e affected))]
+     (when (and (seq affected) (contains? #{:building :complete} (:status h)))
+      (cond
+       (or (not trusted?) (not (unchanged? s sch h (db/basis-t database))))
+         (abort-op h :rank-maintenance-gap)
+       (= :building (:status h))
+         (let [dirty (into (:dirty h) eids)]
+          (if (> (count dirty) MAX-DIRTY) (abort-op h :rank-journal-limit)
+           [[:put (rank/header-key id) (assoc h :dirty dirty :through tx)]]))
+       :else
+        (try
+         (let [ctx (rank/context s h)
+               by-entity (group-by index/-e affected)
+               changed (reduce
+                (fn [state eid]
+                 (let [old (store/-get s (rank/member-key id (:generation h) eid))
+                       fields (or (:fields old) (rank/read-fields database eid (:required (:definition h))))
+                       delta (get by-entity eid)
+                       _ (swap! (:members ctx) assoc eid old)
+                       next (rank/replace-member s ctx (:header state) eid (apply-datoms fields delta))]
+                  {:header (:header next) :ops (into (:ops state) (:ops next))}))
+                {:header h :ops []} eids)]
+          (rank/publication-ops ctx (assoc (:header changed) :through tx) (:ops changed)))
+         (catch e (abort-op h (or (:refused (ex-data e)) :rank-maintenance-refused))))))))
+   (or ids [])))))
+(defn- complete-groups [raw end?]
+ (loop [rows raw current [] groups []]
+  (if (empty? rows) {:groups (if (and end? (seq current)) (conj groups current) groups)
+                     :pending (if end? [] current)}
+   (let [d (first rows)]
+    (if (or (empty? current) (= (index/-e d) (index/-e (first current))))
+     (recur (rest rows) (conj current d) groups)
+     (recur (rest rows) [d] (conj groups current)))))))
+(defn step-ops
+ "One serialized bounded stage batch. Scan a pinned basis, replay the captured
+  dirty roots at the current basis, then publish complete ONLY after replay.
+  Returns nil when not building; errors produce an aborted header, never rows."
+ [database id]
+ (let [s (db/store-of database) h (rank/header s id)]
+  (when (contains? #{:building :complete} (:status h))
+   (if-not (unchanged? s (db/schema-of database) h (db/basis-t database))
+    (abort-op h :rank-build-gap)
+    (if (= :complete (:status h)) nil
+    (try
+     (let [ctx (rank/context s h)
+           snapshot (db/db-value s (db/schema-of database) (:origin h))
+           scan (when-not (:scan-ended? h)
+                  (let [a (:scope-attr (:definition h))
+                        lo (if (= :avet (:driving h)) (index/key-prefix :avet a (:scope-value h))
+                                                         (index/key-prefix :aevt a))
+                        p (store/ordered-page s lo (:after h) (index/prefix-end lo) BATCH-ROWS :asc 1048576)]
+                   (when (or (:refused p) (:byte-limited? p)) (throw {:refused :rank-build-work-limit}))
+                   (let [parts (complete-groups (into (:pending h) (:datoms p)) (:end? p))]
+                    (when (> (count (:pending parts)) rank/MAX-ENTITY-ROWS) (throw {:refused :rank-build-history-limit}))
+                    (assoc parts :last (:last p) :end? (:end? p)))))
+           eids (if scan
+                  (vec (keep (fn [group]
+                         (let [live (into [] (db/filter-datoms snapshot group))]
+                          (when (some (fn [d] (= (:scope-value h) (index/-v d))) live)
+                           (index/-e (first group))))) (:groups scan)))
+                  (vec (take BATCH-ROWS (:dirty h))))
+           view (if scan snapshot database)
+           changed (reduce
+                    (fn [state eid]
+                     (let [fields (rank/read-fields view eid (:required (:definition h)))
+                           next (rank/replace-member s ctx (:header state) eid fields)]
+                      {:header (:header next) :ops (into (:ops state) (:ops next))}))
+                    {:header h :ops []} eids)
+           next (if scan (assoc (:header changed) :after (or (:last scan) (:after h))
+                               :pending (:pending scan) :scan-ended? (:end? scan))
+                         (assoc (:header changed) :dirty (reduce disj (:dirty h) eids)))
+           next (if (and (:scan-ended? next) (empty? (:dirty next)))
+                  (assoc next :status :complete :through (db/basis-t database)) next)]
+      (rank/publication-ops ctx next (:ops changed)))
+     (catch e (abort-op h (or (:refused (ex-data e)) :rank-build-refused)))))))))
+(defn cleanup-ops
+ "Retire an aborted stage in bounded durable steps. The DFS stack is a
+  checkpoint; roots/members are never reactivated after cleanup starts."
+ [database id]
+ (let [s (db/store-of database) h (rank/header s id)]
+  (when (= :aborted (:status h))
+   (let [ctx (rank/context s h)
+         initial (if (contains? h :cleanup) (:cleanup h) (if (:root h) [(:root h)] []))
+         work (loop [todo initial n 0 ops []]
+                (if (or (empty? todo) (>= n BATCH-ROWS)) {:todo todo :ops ops}
+                 (let [id (peek todo) node (tree/node ctx id)
+                       children (filterv some? [(:left node) (:right node)])]
+                  (recur (into (pop todo) children) (inc n)
+                         (into ops [[:delete (rank/node-key (:ident h) (:generation h) id)]
+                                    [:delete (rank/member-key (:ident h) (:generation h) (:eid (:value node)))]])))))
+         last? (empty? (:todo work))]
+    (into (:ops work)
+      (if last? (into (derived/put-ops REGISTRY (filterv (fn [other] (not= other id)) (registry s)))
+                      [[:delete (rank/header-key id)]])
+       [[:put (rank/header-key id) (assoc h :cleanup (:todo work))]]))))))

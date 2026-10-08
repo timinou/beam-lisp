@@ -1,0 +1,132 @@
+(ns datom.corpus-publication-test
+ (:require [datom :as d] [datom.query.corpus :as corpus]
+           [datom.vector :as v] [env]))
+(def S [{:db/ident :vec :db/valueType :db.type/vector}
+        {:db/ident :tag :db/valueType :db.type/string}])
+(defn rows []
+ (filterv (fn [r] (and (= 9 (erlang/tuple_size r)) (tuple? (elem r 0))))
+          (ets/tab2list :datom_corpus_cache)))
+(defn assert-accounting []
+ (let [entries (rows) stats (corpus/stats)]
+  (is (= (count entries) (:columns stats)))
+  (is (= (reduce (fn [n r] (+ n (elem r 2))) 0 entries) (:bytes stats)))
+  (is (>= (:bytes stats) 0))))
+(defn parallel [n f]
+ (let [parent (erlang/self) token (env/capture)
+       children (mapv (fn [i]
+                   (let [pid (erlang/spawn
+                              (fn []
+                               (env/bind token)
+                               (receive [:corpus-go] :ok)
+                               (try (f i) (erlang/send parent [:corpus-result :ok])
+                                    (catch e (erlang/send parent [:corpus-result [:error e]])))))]
+                    [pid (erlang/monitor :process pid)])) (range n))]
+  (try
+   (doseq [c children] (erlang/send (first c) [:corpus-go]))
+   (doseq [_ children]
+    (is (= :ok (receive [:corpus-result result] result (after 30000 :timeout)))))
+   (doseq [_ children]
+    (is (= :normal (receive [:DOWN ref :process pid reason] reason (after 30000 :timeout)))))
+   (finally
+    (doseq [c children]
+     (when (Process/alive? (first c)) (Process/exit (first c) :kill))
+     (erlang/demonitor (second c) (list :flush)))))))
+
+(deftest artifact-promotion-accounts-for-all-retained-artifacts
+ (corpus/forget!)
+ (corpus/set-budget! corpus/DEFAULT-BUDGET)
+ (let [c (d/connect S)]
+  (try
+   (d/transact! c [{:db/id -1 :vec (v/embedding [1.0 0.0])}])
+   (let [db (d/db c)]
+    (is (= 1 (v/resident-count (corpus/resident db :vec))))
+    (assert-accounting)
+    (let [r (first (rows))]
+     (is (some? (elem r 4)))
+     (is (some? (elem r 5)))
+     (is (some? (elem r 6)))))
+   (finally (d/close! c)))))
+
+(deftest simultaneous-builds-and-budget-pressure-preserve-exact-accounting
+ (corpus/forget!)
+ (corpus/set-budget! 8192)
+ (let [c (d/connect S)]
+  (try
+   (d/transact! c (mapv (fn [n] {:db/id (- -1 n) :vec (v/embedding [1.0 0.0])}) (range 20)))
+   (let [db (d/db c)]
+    (parallel 18 (fn [n]
+                  (case (mod n 3)
+                   0 (assert (= 20 (count (corpus/column db :vec))))
+                   1 (assert (= 20 (:n (corpus/packed db :vec))))
+                   2 (assert (= 20 (v/resident-count (corpus/resident db :vec)))))))
+    (assert-accounting)
+    (is (= 1 (:columns (corpus/stats))))
+    (is (<= (:bytes (corpus/stats)) 8192)))
+   (finally (d/close! c) (corpus/set-budget! corpus/DEFAULT-BUDGET)))))
+
+(deftest empty-columns-cannot-escape-the-budget
+ (corpus/forget!)
+ (corpus/set-budget! 1024)
+ (let [cs (mapv (fn [_] (d/connect S)) (range 20))]
+  (try
+   (doseq [c cs] (is (empty? (corpus/column (d/db c) :vec))))
+   (assert-accounting)
+   (is (<= (:bytes (corpus/stats)) 1024))
+   (is (< (:columns (corpus/stats)) 20))
+   (is (> (:evictions (corpus/stats)) 0))
+   (finally (doseq [c cs] (d/close! c)) (corpus/set-budget! corpus/DEFAULT-BUDGET)))))
+
+(deftest caller-exit-does-not-own-global-corpus-lifetime
+ (corpus/forget!)
+ (let [c (d/connect S)]
+  (try
+   (d/transact! c [{:db/id -1 :vec (v/embedding [1.0 0.0])}])
+   (let [owner (erlang/whereis :datom-corpus-cache-owner)]
+    (when (not= :undefined owner) (Agent/stop owner :normal 30000)))
+   (let [db (d/db c)]
+    (parallel 1 (fn [_] (corpus/column db :vec)))
+    (let [owner (ets/info :datom_corpus_cache :owner)]
+     (is (Process/alive? owner))
+     (is (= owner (erlang/whereis :datom-corpus-cache-owner)))
+     (is (not= (erlang/self) owner))
+     (is (= 1 (count (corpus/column db :vec))))))
+   (finally (d/close! c)))))
+
+(deftest retained-old-readers-cannot-displace-newer-published-artifacts
+ (corpus/forget!)
+ (corpus/set-budget! corpus/DEFAULT-BUDGET)
+ (let [c (d/connect S)]
+  (try
+   (d/transact! c [{:db/id -1 :vec (v/embedding [1.0 0.0])}])
+   (let [old (d/db c)]
+    (corpus/resident old :vec)
+    (d/transact! c [{:db/id -2 :vec (v/embedding [0.0 1.0])}])
+    (let [current (d/db c)]
+     (is (= 2 (v/resident-count (corpus/resident current :vec))))
+     (is (= 1 (count (corpus/column old :vec))))
+     (is (= 2 (elem (first (rows)) 7)))
+     (is (= (:basis-t current) (second (elem (first (rows)) 3))))
+     (d/transact! c [{:db/id -3 :tag "unrelated"}])
+     (is (= 2 (v/resident-count (corpus/resident (d/db c) :vec))))
+     (is (= (:basis-t current) (second (elem (first (rows)) 3))))
+     (assert-accounting)))
+   (finally (d/close! c)))))
+
+(deftest simultaneous-stores-evict-without-double-accounting
+ (corpus/forget!)
+ (corpus/set-budget! 4096)
+ (let [cs (mapv (fn [_] (d/connect S)) (range 8))]
+  (try
+   (doseq [c cs]
+    (d/transact! c (mapv (fn [n] {:db/id (- -1 n) :vec (v/embedding [1.0 0.0])}) (range 20))))
+   (let [dbs (mapv d/db cs)]
+    (parallel 32 (fn [n]
+                  (let [db (nth dbs (mod n 8))]
+                   (case (mod (quot n 8) 3)
+                    0 (assert (= 20 (count (corpus/column db :vec))))
+                    1 (assert (= 20 (:n (corpus/packed db :vec))))
+                    2 (assert (= 20 (v/resident-count (corpus/resident db :vec))))))))
+    (assert-accounting)
+    (is (<= (:bytes (corpus/stats)) 4096))
+    (is (> (:evictions (corpus/stats)) 0)))
+   (finally (doseq [c cs] (d/close! c)) (corpus/set-budget! corpus/DEFAULT-BUDGET)))))

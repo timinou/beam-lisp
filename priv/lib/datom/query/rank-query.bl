@@ -1,0 +1,73 @@
+;; Automatic query-index control. No source effect runs in the query process;
+;; one connection-owned worker advances atomic bounded stages through its writer.
+(ns datom.query.rank-query
+ (:require [datom.query.rank-plan :as plan] [datom.query.rank-index :as rank]
+           [datom.query.rank-build :as build] [datom.conn :as conn]
+           [datom.db :as db] [datom.store :as store] [env]
+           [proc.table :as table] [data.bounded-cache :as cache]))
+(def JOBS :datom.query.rank-workers)
+(def MAX-WORKERS 4)
+(def MAX-STEPS 100000)
+(defn- jobs []
+ (table/hold JOBS {:type :set :options [:public :named_table]}) JOBS)
+(defn- run-builder [c p]
+ (loop [step 0 id (conn/ensure-query-rank! c p)]
+  (when (and id (< step MAX-STEPS) (conn/query-rank-worker-live? c (erlang/self)))
+   (let [h (conn/advance-query-rank! c id)]
+    (cond
+     (and h (contains? #{:building :aborted} (:status h)))
+      (do (Process/sleep 1) (recur (inc step) id))
+     (or (nil? h) (not= id (build/ident p)))
+      (do (Process/sleep 1) (recur (inc step) (conn/ensure-query-rank! c p)))
+     :else nil)))))
+(defn request!
+ "Query-side scheduling; source batches run in a connection-owned worker. At most four workers node-wide and one per
+  store. Slot keys contain finite identities, never native store references."
+ [database p]
+ (try
+  (let [s (db/store-of database) key (cache/key-data (store/identity-of s) 0)
+        c (conn/conn-of database) token (env/capture)]
+   (when key
+    (jobs)
+    (global/trans (tuple ::jobs (erlang/self))
+     (fn []
+      (doseq [row (ets/tab2list JOBS)]
+       (when-not (Process/alive? (elem row 1)) (ets/delete_object JOBS row)))
+      (when-not (some (fn [row] (= key (elem row 2))) (ets/tab2list JOBS))
+       (when-let [slot (first (filter (fn [slot] (= [] (into [] (ets/lookup JOBS slot)))) (range MAX-WORKERS)))]
+        (let [pid (erlang/spawn
+                    (fn []
+                     (env/bind token)
+                     (try
+                      (receive [:rank-start] (run-builder c p) (after 5000 nil))
+                      (catch _ nil)
+                      (finally (ets/match_delete JOBS (tuple slot (erlang/self) :_))))))]
+         (if (conn/claim-query-rank-worker! c pid)
+          (do (ets/insert JOBS (tuple slot pid key)) (erlang/send pid [:rank-start]))
+          (Process/exit pid :kill)))))))))
+  (catch _ nil)))
+(defn page-result [query database opts inputs]
+ (when (and (nil? (:after opts)) (contains? opts :offset)
+            ;; Explicit tiny/custom budgets keep the ordinary bounded fallback
+            ;; until rank reads account for every metadata byte and seek.
+            (nil? (:budget opts)))
+  (when-let [p (plan/descriptor query (db/schema-of database) inputs (:order-by opts))]
+   (let [s (db/store-of database) id (build/ident p) h (rank/header s id)
+         stamp (when h (build/code-stamp))
+         result (when (and stamp (= stamp (:writer-code h)))
+                  (rank/read-page database id p (:offset opts) (or (:limit opts) 50)))]
+    (if (and result (= stamp (build/code-stamp))) result
+     (do (request! database p) nil))))))
+(defn count-result [query database inputs]
+ ;; Keep the cheap non-count q path cheap. Other syntaxes use the ordinary engine.
+ (when (and (vector? query) (= :find (first query)) (list? (second query))
+            (= 'count (first (second query))))
+ (when-let [p (plan/descriptor query (db/schema-of database) inputs nil)]
+  (when (= :count (:kind p))
+   (let [s (db/store-of database) stamp (build/code-stamp)]
+    (when stamp
+     (first (keep (fn [id]
+                    (let [h (rank/header s id)
+                          result (when (= stamp (:writer-code h)) (rank/read-count database id p))]
+                     (when (and result (= stamp (build/code-stamp))) result)))
+                  (or (build/registry s) [])))))))))
