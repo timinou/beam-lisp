@@ -1,0 +1,129 @@
+(ns navigation.local-publication-lock-probe-test
+ (:require [veritas.model :as vm]))
+
+;; Local-only candidate, not installed in Env. Every acquisition gets a unique
+;; ticket; cleanup deletes an exact row, so a stale waiter cannot delete a new
+;; owner's lock. Uncontended acquisition/release never contacts a lock server.
+(defn acquire! [table row]
+ (loop []
+  (if (ets/insert_new table row) :acquired
+   (let [current (ets/lookup table (elem row 0))]
+    (when (seq current)
+     (let [owner (elem (first current) 1)]
+      (if (erlang/is_process_alive owner)
+       (Process/sleep 1)
+       (ets/delete_object table (first current)))))
+    (recur)))))
+(defn with-local-lock [table key f]
+ (let [marker (tuple :navigation-local-lock table key)]
+  (if (Process/get marker) (f)
+   (let [row (tuple key (erlang/self) (erlang/make_ref))]
+    (acquire! table row)
+    (Process/put marker true)
+    (try (f)
+     (finally (Process/delete marker) (ets/delete_object table row)))))))
+
+(deftest dead-owner-is-reclaimed-and-reentrant-errors-retain-the-outer-lock
+ (let [table (ets/new :navigation_local_lock (list :public :set))
+       parent (erlang/self)
+       owner (spawn (fn [] (with-local-lock table :scope
+                (fn [] (erlang/send parent :entered)
+                       (receive :release :ok (after 5000 :expired))))))
+       monitor (erlang/monitor :process owner)]
+  (try
+   (is (= :entered (receive :entered :entered (after 5000 :timeout))))
+   (erlang/exit owner :kill)
+   (is (= :killed (receive [:DOWN _ :process _ reason] reason (after 5000 :timeout))))
+   (is (= :recovered (with-local-lock table :scope
+    (fn []
+     (is (= :caught (try (with-local-lock table :scope (fn [] (throw :probe)))
+                          (catch _ :caught))))
+     (is (= 1 (ets/info table :size)))
+     :recovered))))
+   (is (= 0 (ets/info table :size)))
+   (finally (erlang/exit owner :kill) (ets/delete table)))))
+
+(deftest stale-cleanup-does-not-delete-the-new-owner
+ (let [table (ets/new :navigation_local_lock (list :public :set))
+       old (tuple :scope (erlang/self) (erlang/make_ref))
+       new (tuple :scope (erlang/self) (erlang/make_ref))]
+  (try
+   (ets/insert table old)
+   (ets/delete_object table old)
+   (ets/insert table new)
+   (ets/delete_object table old)
+   (is (= (list new) (ets/lookup table :scope)))
+   (finally (ets/delete table)))))
+
+(def INITIAL {:owner :old :old-alive? true :stale? false :new-held? false :lost? false})
+(defn step [s op exact?]
+ (case op
+  :observe (if (= :old (:owner s)) (assoc s :stale? true) s)
+  :old-dies (assoc s :old-alive? false)
+  :reclaim (if (and (= :old (:owner s)) (not (:old-alive? s))) (assoc s :owner nil) s)
+  :new-acquires (if (nil? (:owner s)) (assoc s :owner :new :new-held? true) s)
+  :stale-cleanup (if (and (:stale? s) (not (:old-alive? s)))
+                   (if (or (not exact?) (= :old (:owner s)))
+                    (assoc s :owner nil :lost? (:new-held? s)) s) s)
+  s))
+(defn protocol [exact?]
+ (vm/model "dead-owner cleanup must compare the acquisition ticket"
+  {:state INITIAL :init (fn [] (atom INITIAL))
+   :commands (into {} (map (fn [op]
+    [op {:next (fn [s _] (step s op true))
+         :run (fn [system _] (swap! system step op exact?))}])
+    [:observe :old-dies :reclaim :new-acquires :stale-cleanup]))
+   :invariants {:new-owner-retains-lock (fn [_ system] (not (:lost? @system)))}}))
+(deftest deleting-by-key-is-not-safe-owner-death-recovery
+ (let [bad (vm/check (protocol false) {:seed 53 :histories 1000 :max-len 30})
+       good (vm/check (protocol true) {:seed 53 :histories 1000 :max-len 30})]
+  (is (= :refuted (:modality bad)))
+  (is (= false (:ok (vm/replay (protocol false) (:shrunk bad)))))
+  (is (= :witnessed (:modality good)))
+  (println "local-publication-lock-protocol" {:counterexample (:shrunk bad)
+            :exact-ticket (:modality good)})))
+
+(defn reductions [] (elem (erlang/process_info (erlang/self) :reductions) 1))
+(defn measure [f]
+ (let [before (reductions) start (erlang/monotonic_time :microsecond)]
+  (f)
+  {:caller-reductions (- (reductions) before)
+   :elapsed-us (- (erlang/monotonic_time :microsecond) start)}))
+(deftest balanced-uncontended-mechanics-measurement
+ (let [table (ets/new :navigation_local_lock (list :public :set))
+       resource (tuple :navigation-global-lock (erlang/make_ref))
+       iterations 10000]
+  (try
+   (doseq [round (range 4)
+           implementation (if (even? round) [:global :ets] [:ets :global])]
+    (let [result (measure (fn []
+                   (doseq [_ (range iterations)]
+                    (if (= :global implementation)
+                     (global/trans (tuple resource (erlang/self)) (fn [] :ok) (list (erlang/node)))
+                     (with-local-lock table :scope (fn [] :ok))))))]
+     (println "local-publication-lock-sample"
+      (assoc result :implementation implementation :iterations iterations :round round))))
+   (is (= 0 (ets/info table :size)))
+   (finally (ets/delete table)))))
+
+(deftest concurrent-owners-never-overlap-critical-sections
+ (let [table (ets/new :navigation_local_lock (list :public :set))
+       state (atom {:inside 0 :maximum 0 :completed 0})
+       work (BeamLisp.Env/convey
+             (fn [_]
+              (doseq [_ (range 40)]
+               (with-local-lock table :scope
+                (fn []
+                 (swap! state (fn [s] (assoc s :inside (inc (:inside s))
+                                              :maximum (max (:maximum s) (inc (:inside s))))))
+                 (Process/sleep 1)
+                 (swap! state (fn [s] (assoc s :inside (dec (:inside s))
+                                              :completed (inc (:completed s))))))))))
+       tasks (mapv (fn [_] (Task/async (fn [] (work nil)))) (range 4))]
+  (try
+   (doseq [task tasks] (Task/await task 30000))
+   (is (= {:inside 0 :maximum 1 :completed 160} @state))
+   (is (= 0 (ets/info table :size)))
+   (finally
+    (doseq [task tasks] (Task/shutdown task :brutal_kill))
+    (ets/delete table)))))
