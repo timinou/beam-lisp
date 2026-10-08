@@ -1,0 +1,100 @@
+(ns navigation.native-publication-retirement-protocol-test
+ (:require [veritas.model :as vm]))
+
+;; Model the native-code boundary, separately from atomic metadata publication.
+;; A compile result is inert. Loading it mutates the VM even if later ETS writes
+;; correctly decline. This protocol does NOT make a two-module load crash atomic.
+(def INITIAL {:alive? true :prepared? false :locked? false :loaded? false
+              :late-loads 0 :published? false})
+(defn step [s op fenced?]
+ (case op
+  :prepare (if (:alive? s) (assoc s :prepared? true) s)
+  :enter (if (and (:prepared? s) (:alive? s)) (assoc s :locked? true) s)
+  :destroy (if (and fenced? (:locked? s)) s (assoc s :alive? false))
+  :load (if (and (:prepared? s) (not (:loaded? s))
+                 (or (not fenced?) (and (:locked? s) (:alive? s))))
+          (assoc s :loaded? true :late-loads
+           (+ (:late-loads s) (if (:alive? s) 0 1))) s)
+  :publish (if (and (:loaded? s) (:alive? s) (:locked? s))
+             (assoc s :published? true :locked? false) s)
+  :writer-dies (assoc s :locked? false)
+  s))
+(defn protocol [fenced?]
+ (vm/model "scope retirement must fence native loads, not only metadata rows"
+  {:state INITIAL :init (fn [] (atom INITIAL))
+   :commands (into {} (map (fn [op]
+    [op {:next (fn [s _] (step s op true))
+         :run (fn [system _] (swap! system step op fenced?))}])
+    [:prepare :enter :destroy :load :publish :writer-dies]))
+   :invariants {:no-native-load-after-retirement
+                (fn [_ system] (= 0 (:late-loads @system)))}}))
+(deftest metadata-only-fence-does-not-protect-native-code
+ (let [bad (vm/check (protocol false) {:seed 31 :histories 1000 :max-len 30})
+       good (vm/check (protocol true) {:seed 31 :histories 1000 :max-len 30})]
+  (is (= :refuted (:modality bad)))
+  (is (= false (:ok (vm/replay (protocol false) (:shrunk bad)))))
+  (is (= :witnessed (:modality good)))
+  (println "native-publication-retirement" {:counterexample (:shrunk bad)
+            :short-commit (:modality good)})))
+
+;; Existing actual Env primitive has the required refusal behavior. Integration
+;; must move every native load into that boundary without acquiring other scopes
+;; or running arbitrary initializer callbacks while holding it.
+(deftest retired-scope-never-invokes-the-commit-action
+ (let [scope (BeamLisp.Env/fork) calls (atom 0)]
+  (try
+   (is (= :accepted (BeamLisp.Env/with_scope_commit scope
+                     (fn [] (swap! calls inc) :accepted))))
+   (BeamLisp.Env/destroy scope)
+   (is (= :retired (BeamLisp.Env/with_scope_commit scope
+                    (fn [] (swap! calls inc) :incorrect))))
+   (is (= 1 @calls))
+   (finally (BeamLisp.Env/destroy scope)))))
+
+(defn constant-beam [mod value]
+ (BeamLisp.Emit/compile_descriptor
+  (BeamLisp.Emit/descriptor_for mod
+   (list (BeamLisp.Emit/function_clause :value (BeamLisp.Emit/lit value))))))
+(deftest already-prepared-native-replacement-declines-after-retirement
+ (let [mod (Module/concat :BeamLisp.NativeRetirementProbe
+              (str "P" (System/unique_integer (list :positive))))
+       scope (BeamLisp.Env/fork)
+       initial (constant-beam mod 1)
+       replacement (constant-beam mod 2)]
+  (try
+   (BeamLisp.Emit/load_binary! initial)
+   (let [before (erlang/apply mod :module_info (list :md5))]
+    (BeamLisp.Env/destroy scope)
+    (is (= :retired
+           (try
+            (BeamLisp.Env/with_env scope
+             (fn [] (BeamLisp.Env/publish_binaries! (list replacement) "native-retirement-probe")))
+            :incorrect
+            (catch _ :retired))))
+    (is (= before (erlang/apply mod :module_info (list :md5))))
+    (is (= 1 (erlang/apply mod :value (list)))))
+   (finally
+    (BeamLisp.Env/destroy scope)
+    (code/purge mod)
+    (code/delete mod)))))
+
+
+(deftest prepared-batch-preserves-per-module-filenames
+ (let [suffix (str "P" (System/unique_integer (list :positive)))
+       first-mod (Module/concat :BeamLisp.NativeBatchOne suffix)
+       second-mod (Module/concat :BeamLisp.NativeBatchTwo suffix)
+       first-beam (constant-beam first-mod 11)
+       second-beam (constant-beam second-mod 22)
+       scope (BeamLisp.Env/fork)]
+  (try
+   (is (= :ok (BeamLisp.Env/with_env scope
+                (fn [] (BeamLisp.Env/publish_binaries!
+                         (list (tuple first-beam "native-batch-one")
+                               (tuple second-beam "native-batch-two")))))))
+   (is (= 11 (erlang/apply first-mod :value (list))))
+   (is (= 22 (erlang/apply second-mod :value (list))))
+   (is (= (String/to_charlist "native-batch-one") (code/which first-mod)))
+   (is (= (String/to_charlist "native-batch-two") (code/which second-mod)))
+   (finally
+    (BeamLisp.Env/destroy scope)
+    (doseq [mod [first-mod second-mod]] (code/purge mod) (code/delete mod))))))

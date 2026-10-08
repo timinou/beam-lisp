@@ -1,0 +1,97 @@
+(ns navigation.metadata-publication-protocol-test (:require [veritas.model :as vm]))
+;; Reference is the full-map contract. Readers may observe either completed
+;; generation; no partial map becomes visible after an interrupted writer.
+(def INITIAL {:visible 0 :rows {0 {"a" 0 "b" 0}} :active? false :target 1 :read nil})
+(defn step [s op atomic?]
+ (let [target (:target s)]
+  (case op
+   :begin (if (:active? s) s (assoc s :active? true :target (- 1 (:visible s))))
+   :write-a (if (:active? s)
+              (if atomic? s (assoc-in s [:rows (:visible s) "a"] target)) s)
+   :publish (if (:active? s)
+              (if atomic?
+               (assoc s :rows (assoc (:rows s) target {"a" target "b" target})
+                        :visible target :active? false)
+               (assoc-in (assoc s :active? false) [:rows (:visible s) "b"] target)) s)
+   :writer-dies (assoc s :active? false)
+   :read (if (:active? s) s (assoc s :read (get (:rows s) (:visible s))))
+   s)))
+(defn protocol [atomic?]
+ (vm/model "namespace publication survives writer death"
+  {:state INITIAL :init (fn [] (atom INITIAL))
+   :commands (into {} (map (fn [op]
+    [op {:next (fn [s _] (step s op true))
+         :run (fn [system _] (swap! system step op atomic?))}])
+    [:begin :write-a :publish :writer-dies :read]))
+   :invariants {:whole-table (fn [_ system]
+     (let [seen (:read @system)]
+      (or (nil? seen) (= {"a" 0 "b" 0} seen) (= {"a" 1 "b" 1} seen))))}}))
+(deftest locking-alone-does-not-make-row-replacement-crash-safe
+ (let [bad (vm/check (protocol false) {:seed 23 :histories 500 :max-len 30})
+       good (vm/check (protocol true) {:seed 23 :histories 500 :max-len 30})]
+  (is (= :refuted (:modality bad)))
+  (is (= false (:ok (vm/replay (protocol false) (:shrunk bad)))))
+  (is (= :witnessed (:modality good)))
+  (println "metadata-publication-protocol" {:counterexample (:shrunk bad) :candidate (:modality good)})))
+
+;; Runtime probe of the OTP lock protocol, independent of metadata storage.
+(defn with-lock [resource f]
+ (let [key (tuple :navigation-metadata-lock resource)]
+  (if (= true (erlang/get key)) (f)
+   (global/trans (tuple resource (erlang/self))
+    (fn []
+     (erlang/put key true)
+     (try (f) (finally (erlang/erase key))))))))
+(defn another-requester-can-enter? [resource]
+ (Task/await (Task/async
+  (fn []
+   (let [id (tuple resource (erlang/self))
+         got (global/set_lock id (list (erlang/node)) 0)]
+    (when got (global/del_lock id (list (erlang/node))))
+    got))) 5000))
+(deftest raw-nested-global-trans-releases-outer-lock
+ (let [resource (tuple :metadata-raw-lock (erlang/make_ref))]
+  (global/trans (tuple resource (erlang/self))
+   (fn []
+    (is (= false (another-requester-can-enter? resource)))
+    (global/trans (tuple resource (erlang/self)) (fn [] :inner))
+    (is (= true (another-requester-can-enter? resource)))))))
+(deftest reentrant-wrapper-retains-outer-lock-and-cleans-up-after-error
+ (let [resource (tuple :metadata-guarded-lock (erlang/make_ref))]
+  (with-lock resource
+   (fn []
+    (is (= :inner (with-lock resource (fn [] :inner))))
+    (is (= false (another-requester-can-enter? resource)))
+    (is (= :caught (try (with-lock resource (fn [] (throw :probe))) (catch _ :caught))))
+    (is (= false (another-requester-can-enter? resource)))))
+  (is (= true (another-requester-can-enter? resource)))
+  (is (= :caught (try (with-lock resource (fn [] (throw :probe))) (catch _ :caught))))
+  (is (= true (another-requester-can-enter? resource)))))
+
+(defn visible-table [t]
+ (let [generation (elem (first (ets/lookup t :root)) 1)]
+  (into {} (map (fn [name]
+   [name (elem (first (ets/lookup t (tuple generation name))) 1)]) ["a" "b"]))))
+(deftest actual-ets-batch-publication-survives-kill-at-both-barriers
+ (doseq [phase [:before-batch :after-batch]]
+  (let [t (ets/new :metadata-publication-probe (list :set :public))
+        parent (erlang/self)
+        initial (list (tuple :root 0) (tuple (tuple 0 "a") 0) (tuple (tuple 0 "b") 0))]
+   (try
+    (ets/insert t initial)
+    (let [p (spawn (fn []
+              (erlang/send parent [:barrier :before-batch])
+              (receive :continue :ok (after 5000 (throw :barrier-timeout)))
+              ;; Descriptor and all entries become visible in ONE ETS insert.
+              (ets/insert t (list (tuple :root 1) (tuple (tuple 1 "a") 1) (tuple (tuple 1 "b") 1)))
+              (erlang/send parent [:barrier :after-batch])
+              (receive :continue :ok (after 5000 nil))))
+          monitor (erlang/monitor :process p)]
+     (is (= :before-batch (receive [:barrier at] at (after 5000 :timeout))))
+     (when (= phase :after-batch)
+      (erlang/send p :continue)
+      (is (= :after-batch (receive [:barrier at] at (after 5000 :timeout)))))
+     (erlang/exit p :kill)
+     (is (= :killed (receive [:DOWN _ :process _ reason] reason (after 5000 :timeout))))
+     (is (= (if (= phase :before-batch) {"a" 0 "b" 0} {"a" 1 "b" 1}) (visible-table t))))
+    (finally (ets/delete t))))))

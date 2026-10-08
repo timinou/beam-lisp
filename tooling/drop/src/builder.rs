@@ -524,9 +524,28 @@ pub fn self_update(store: &Store, spec: Option<&str>, me: &Path, cwd: &Path) -> 
             let tmp = store.meta().join("incoming").join(format!("import-{}", std::process::id()));
             let _ = std::fs::create_dir_all(tmp.parent().unwrap());
             std::fs::copy(&p, &tmp).map_err(|e| format!("{}: {e}", p.display()))?;
-            publish_drop(store, &tmp)
+            let id = publish_drop(store, &tmp)?;
+            index_imported_source(store, &id)?;
+            Ok(id)
         }
     }
+}
+
+/// A verified imported build should satisfy the same project commit pin as a
+/// locally built one. Otherwise importing an already sealed runtime triggers
+/// another full compiler/native build on the first ordinary app command.
+/// Dirty source keys remain distinct and never satisfy a clean commit pin.
+fn index_imported_source(store: &Store, id: &str) -> Result<(), String> {
+    let payload = store.payload(id);
+    let Some(key) = build_info_field(&payload, "source-key") else { return Ok(()) };
+    let (commit, diff) = key.split_once('+').map_or((key.as_str(), None), |(c,d)| (c,Some(d)));
+    let hex = |value: &str, len: usize| value.len() == len && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    if !hex(commit, 40) || diff.is_some_and(|d| !hex(d, 12))
+        || build_info_field(&payload, "commit").as_deref() != Some(commit) {
+        return Err("imported build has inconsistent source provenance; no source pointer published".into());
+    }
+    let pointer = Pointer::new(id).with("key", &key).with("commit", commit);
+    store.write(&store.source_key(&key), &pointer).map_err(|e| e.to_string())
 }
 
 // ── installing the launcher ─────────────────────────────────────────────────
@@ -590,6 +609,65 @@ pub fn self_install(me: &Path, args: &[String], cwd: &Path) -> Result<String, St
 #[cfg(test)]
 mod builder_tests {
     use super::*;
+
+    fn source_fixture(label: &str, key: Option<&str>, commit: &str) -> (Store, PathBuf, String) {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("drop-import-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let store = Store { root: root.join("store") };
+        let info = match key {
+            Some(k) => format!("{{:commit \"{commit}\" :source-key \"{k}\"}}"),
+            None => format!("{{:commit \"{commit}\"}}"),
+        };
+        let mut ar = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default()));
+        for (path, body) in [(BUILD_INFO_FILE, info.as_bytes()), (LAUNCHER_REL, b"#!/bin/sh\nexit 0\n".as_slice())] {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(body.len() as u64); h.set_mode(0o755); h.set_cksum();
+            ar.append_data(&mut h, path, body).unwrap();
+        }
+        let bytes = ar.into_inner().unwrap().finish().unwrap();
+        let digest: [u8;32] = sha256_bytes(&bytes).try_into().unwrap();
+        let file = root.join("fixture.drop");
+        let mut out = std::fs::File::create(&file).unwrap();
+        out.write_all(&bytes).unwrap();
+        out.write_all(&encode_trailer(0, bytes.len() as u64, &digest, OS_LINUX, ARCH_X86_64)).unwrap();
+        (store, file, hex(&digest)[..8].to_string())
+    }
+
+    #[test]
+    fn imported_clean_build_satisfies_a_normal_project_commit_pin() {
+        let commit = "1cf72d26294b95444125fbea569a592f1f37c1af";
+        let (store, file, id) = source_fixture("clean", Some(commit), commit);
+        assert_eq!(self_update(&store, Some(&format!("path:{}", file.display())), &file, file.parent().unwrap()).unwrap(), id);
+        let project = file.parent().unwrap().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(PROJECT_FILE), format!("{{:bl \"commit:{commit}\"}}")).unwrap();
+        assert_eq!(resolve_with(&store, &project, None, None).target, Target::Build(id));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn dirty_import_does_not_satisfy_a_clean_pin() {
+        let commit = "1cf72d26294b95444125fbea569a592f1f37c1af";
+        let key = format!("{commit}+ac81415ef986");
+        let (store,file,id) = source_fixture("dirty", Some(&key), commit);
+        assert_eq!(self_update(&store, Some(&format!("path:{}", file.display())), &file, file.parent().unwrap()).unwrap(), id);
+        assert!(store.read(&store.source_key(&key)).is_some());
+        assert!(matches!(lookup(&store, &format!("commit:{commit}"), &mut vec![]), Target::Missing {..}));
+        let _ = std::fs::remove_dir_all(file.parent().unwrap());
+    }
+
+    #[test]
+    fn inconsistent_import_cannot_publish_a_source_pointer() {
+        let commit = "1cf72d26294b95444125fbea569a592f1f37c1af";
+        for (label,key) in [("mismatch", "abcdefabcdefabcdefabcdefabcdefabcdefabcd"), ("escape", "../escape")] {
+            let (store,file,_) = source_fixture(label,Some(key),commit);
+            assert!(self_update(&store, Some(&format!("path:{}", file.display())), &file, file.parent().unwrap()).is_err());
+            assert!(list(&store,SOURCES_DIR).is_empty());
+            let _ = std::fs::remove_dir_all(file.parent().unwrap());
+        }
+    }
 
     #[test]
     fn json_scan_reads_flat_strings() {

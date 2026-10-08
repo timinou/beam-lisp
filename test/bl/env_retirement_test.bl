@@ -1,0 +1,120 @@
+(ns env.retirement-test (:require [env] [veritas.model :as vm]))
+
+(deftest late-registry-updates-do-not-recreate-destroyed-scopes
+ (doseq [op [(fn [] (BeamLisp.Env/mark_loaded "retired.fixture"))
+             (fn [] (BeamLisp.Env/add_search_path "/home/user/.tmp/retired-fixture"))
+             (fn [] (BeamLisp.Env/remove_search_path "/home/user/.tmp/retired-fixture"))
+             (fn [] (BeamLisp.Env/clear_search_paths))]]
+  (let [e (BeamLisp.Env/fork :global (list (tuple :caps (list))))]
+   (try
+    (is (= (MapSet/new) (BeamLisp.Env/caps_of e)))
+    (BeamLisp.Env/destroy e)
+    (BeamLisp.Env/with_env e op)
+    (is (= (MapSet/new) (BeamLisp.Env/caps_of e)))
+    (finally (BeamLisp.Env/destroy e))))))
+
+(deftest late-definition-publication-does-not-recreate-retired-rows
+ (doseq [op [(fn [] (BeamLisp.Env/put_key (tuple "retired.fixture" "value") 42))
+             (fn [] (BeamLisp.Env/mark_ready "retired.fixture"))
+             (fn [] (BeamLisp.Env/put_ns_defs "retired.fixture" {}))
+             (fn [] (BeamLisp.Env/delete_key (tuple "retired.fixture" "value")))]]
+  (let [e (BeamLisp.Env/fork)]
+   (try
+    (BeamLisp.Env/destroy e)
+    (BeamLisp.Env/with_env e op)
+    ;; Include three-field generation/lifetime rows, not only value bindings.
+    (is (empty? (filter (fn [row]
+       (let [k (elem row 0)]
+        (and (tuple? k) (> (erlang/tuple_size k) 0) (= e (elem k 0)))))
+       (ets/tab2list :beam_lisp_vars))))
+    (finally (BeamLisp.Env/destroy e))))))
+
+(deftest destruction-during-per-env-initialization-does-not-publish-an-instance
+ (let [e (BeamLisp.Env/fork) parent (erlang/self)
+       ns "retired.init.fixture"]
+  (try
+   (BeamLisp.Env/with_env e (fn []
+    (BeamLisp.Env/define_per_env ns "value"
+     (fn []
+      (erlang/send parent [:init-entered (erlang/self)])
+      (receive :finish-init 42 (after 5000 :timeout))))))
+   (let [worker (spawn (fn []
+                 (let [result (BeamLisp.Env/with_env e
+                                (fn [] (BeamLisp.Env/fetch_exact ns "value")))]
+                  (erlang/send parent [:init-result result]))))
+         monitor (erlang/monitor :process worker)]
+    (let [owner (receive [:init-entered pid] pid (after 5000 :timeout))]
+     (is (erlang/is_pid owner))
+     (BeamLisp.Env/destroy e)
+     ;; Reply to the actual thunk executor; never assume its registered name.
+     (when (erlang/is_pid owner) (erlang/send owner :finish-init)))
+    (is (= :completed (receive [:init-result _] :completed (after 5000 :timeout))))
+    (is (= :normal (receive [:DOWN _ :process _ reason] reason (after 5000 :timeout))))
+    (is (empty? (filter (fn [row]
+      (let [k (elem row 0)] (and (tuple? k) (> (erlang/tuple_size k) 0) (= e (elem k 0)))))
+      (ets/tab2list :beam_lisp_vars)))))
+   (finally (BeamLisp.Env/destroy e)))))
+
+(defn scope-contender-can-enter? [e]
+ (Task/await (Task/async (fn []
+  (let [row (tuple (tuple :bl_scope_commit_lock :Elixir.BeamLisp.Env e)
+                   (erlang/self) (erlang/make_ref))
+        acquired (ets/insert_new :beam_lisp_vars row)]
+   (when acquired (ets/delete_object :beam_lisp_vars row)) acquired))) 5000))
+(deftest scope-commit-lock-retains-ownership-and-is-never-conveyed
+ (let [e (BeamLisp.Env/fork)]
+  (try
+   (BeamLisp.Env/with_scope_commit e (fn []
+    (is (= false (scope-contender-can-enter? e)))
+    (is (= :nested (BeamLisp.Env/with_scope_commit e (fn [] :nested))))
+    (is (= false (scope-contender-can-enter? e)))
+    (let [action (BeamLisp.Env/convey (fn [_]
+                   (erlang/get (tuple :bl_scope_commit_held :Elixir.BeamLisp.Env e))))]
+     (is (= :undefined (Task/await (Task/async
+                        (fn [] (erlang/apply action (list nil)))) 5000))))))
+   (is (= true (scope-contender-can-enter? e)))
+   (is (= :caught (try (BeamLisp.Env/with_scope_commit e (fn [] (throw :fixture)))
+                      (catch _ :caught))))
+   (is (= true (scope-contender-can-enter? e)))
+   (finally (BeamLisp.Env/destroy e)))))
+
+(def INITIAL {:registered? true :retired? false :caps :restricted})
+(defn step [s op recreate?]
+ (case op
+  :destroy (assoc s :registered? false :retired? true :caps :none)
+  :late-update (if (:registered? s) s
+                 (if recreate? (assoc s :registered? true :caps :all) s))
+  s))
+(defn protocol [recreate?]
+ (vm/model "retired environments cannot regain registry authority"
+  {:state INITIAL :init (fn [] (atom INITIAL))
+   :commands (into {} (map (fn [op]
+     [op {:next (fn [s _] (step s op false))
+          :run (fn [system _] (swap! system step op recreate?))}]) [:destroy :late-update]))
+   :invariants {:closed (fn [_ system]
+     (or (not (:retired? @system))
+         (and (not (:registered? @system)) (= :none (:caps @system)))))}}))
+(deftest stale-updates-have-a-replayable-authority-counterexample
+ (let [bad (vm/check (protocol true) {:seed 23 :histories 500 :max-len 20})
+       good (vm/check (protocol false) {:seed 23 :histories 500 :max-len 20})]
+  (is (= :refuted (:modality bad)))
+  (is (= false (:ok (vm/replay (protocol true) (:shrunk bad)))))
+  (is (= :witnessed (:modality good)))
+  (println "env-retirement-protocol" {:counterexample (:shrunk bad) :fixed (:modality good)})))
+
+(deftest actual-scope-lock-recovers-after-owner-death
+ (let [e (BeamLisp.Env/fork) parent (erlang/self)
+       owner (spawn (fn [] (BeamLisp.Env/with_scope_commit e
+                (fn [] (erlang/send parent :scope-locked)
+                       (receive :release :ok (after 5000 :expired))))))
+       monitor (erlang/monitor :process owner)]
+  (try
+   (is (= :scope-locked (receive :scope-locked :scope-locked (after 5000 :timeout))))
+   (erlang/exit owner :kill)
+   (is (= :killed (receive [:DOWN _ :process _ reason] reason (after 5000 :timeout))))
+   (is (= :recovered (BeamLisp.Env/with_scope_commit e (fn [] :recovered))))
+   (BeamLisp.Env/destroy e)
+   (is (= :retired (BeamLisp.Env/with_scope_commit e (fn [] :incorrect))))
+   (is (= (list) (ets/lookup :beam_lisp_vars
+                   (tuple :bl_scope_commit_lock :Elixir.BeamLisp.Env e))))
+   (finally (erlang/exit owner :kill) (BeamLisp.Env/destroy e)))))
