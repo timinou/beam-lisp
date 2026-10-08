@@ -21,66 +21,109 @@
 (def OWNER :vm-exec)
 (def TABLE :vm_exec_state)
 
-;; ── the published state row (ETS, read WITHOUT a call) ──────────────────────
-;;
-;; A reader must not have to queue behind the very work it is asking about: a
-;; GenServer.call for "are you busy?" would park behind the in-flight capture.
-;; So busy/queued live in a public ETS row the sequencer writes and anyone reads
-;; — the same shape vm.index uses for build progress. A client can tell "idle"
-;; from "queued behind a two-minute intent" without blocking.
+(def PROGRESS :vm-exec-progress)
 
-(defn- ensure-table []
-  (when (= :undefined (erlang/apply :ets :whereis (list TABLE)))
+;; Progress has its own mailbox: it must remain responsive while the sequencer
+;; executes user work. It alone owns/writes the protected ETS snapshot. Tickets
+;; belong to the sequencer, not waiting callers: submitted effectful work drains
+;; even if its caller dies. Sequencer death clears every outstanding ticket.
+(defn- live-order [order tickets]
+  (let [head (erlang/apply :queue :peek (list order))]
+    (if (or (= :empty head) (contains? tickets (elem head 1)))
+      order
+      (live-order (erlang/apply :queue :drop (list order)) tickets))))
+
+(defn- publish [st]
+  (let [tickets (:tickets st)
+        order (live-order (:order st) tickets)
+        head (erlang/apply :queue :peek (list order))
+        frame (when (not= :empty head) (:frame (get tickets (elem head 1))))]
+    (erlang/apply :ets :insert
+      (list TABLE (tuple :state {:busy frame :queued (count tickets)})))
+    (assoc st :order order)))
+
+(defn- forget-ticket [st ref]
+  (publish (assoc st :tickets (dissoc (:tickets st) ref))))
+
+(defserver progress
+  (init [_]
     (erlang/apply :ets :new
-      (list TABLE (to-list [:set :public :named_table (tuple :read_concurrency true)]))))
-  (when (empty? (erlang/apply :ets :lookup (list TABLE :state)))
-    (erlang/apply :ets :insert (list TABLE (tuple :state {:busy nil :queued 0})))))
+      (list TABLE (to-list [:set :protected :named_table (tuple :read_concurrency true)])))
+    (ok (publish {:owner nil :owner-ref nil :tickets {} :order (erlang/apply :queue :new (list))})))
+  (handle-call [:attach pid] [_from st]
+    (when (:owner-ref st) (erlang/demonitor (:owner-ref st) (list :flush)))
+    (reply :ok (publish {:owner pid :owner-ref (erlang/monitor :process pid) :tickets {} :order (erlang/apply :queue :new (list))})))
+  (handle-call [:submit owner kind thunk frame] [from st]
+    (if (= owner (:owner st))
+      (let [ref (erlang/make_ref)
+            next (publish (assoc st :tickets (assoc (:tickets st) ref {:frame frame :from from})
+                                   :order (erlang/apply :queue :in (list ref (:order st)))))]
+        ;; Forward the original reply address. The tracker never waits for user
+        ;; work; the sequencer answers the caller after retiring its ticket.
+        (erlang/send owner (tuple :"$gen_call" from [kind ref thunk]))
+        (noreply next))
+      (reply {:error "sequencer changed before submission"} st)))
+  (handle-call [:leave ref] [_from st]
+    (reply :ok (forget-ticket st ref)))
+  (handle-info [:DOWN ref :process _pid _reason] [st]
+    (if (= ref (:owner-ref st))
+      (do
+        (doseq [ticket (vals (:tickets st))]
+          (GenServer/reply (:from ticket) {:error "sequencer stopped"}))
+        (noreply (publish {:owner nil :owner-ref nil :tickets {} :order (erlang/apply :queue :new (list))})))
+      (noreply st))))
 
-(defn- row [] (elem (first (erlang/apply :ets :lookup (list TABLE :state))) 1))
-(defn- put-row [r] (erlang/apply :ets :insert (list TABLE (tuple :state r))))
+(defn- progress-pid []
+  (or (Process/whereis PROGRESS)
+      (let [p (try (core/start progress nil {:name PROGRESS}) (catch _ nil))]
+        (if (erlang/is_pid p) p (Process/whereis PROGRESS)))))
 
 (defn state
-  "The sequencer's state as DATA, off the ETS row: {:busy nil|{:since_ms :argv
-   :cwd} :queued n}. Never blocks — a reader must not park behind the work."
+  "Nonblocking snapshot. Queued includes running submissions; busy describes
+   the oldest outstanding submission. Observing a cold sequencer creates nothing."
   []
-  (ensure-table)
-  (row))
+  (try
+    (let [rows (erlang/apply :ets :lookup (list TABLE :state))]
+      (if (empty? rows) {:busy nil :queued 0} (elem (first rows) 1)))
+    (catch _ {:busy nil :queued 0})))
 
-(defn- enter [label]
-  (ensure-table)
-  (let [r (row)]
-    (put-row (assoc r :queued (+ 1 (:queued r 0))
-                      :busy (or (:busy r) {:since_ms (erlang/system_time :millisecond)
-                                           :argv (to-list [label]) :cwd (BeamLisp/cwd)})))))
+(defn- submit [owner kind label thunk]
+  (when (= owner (erlang/self))
+    (throw (ex-info "sequencer submission cannot wait on itself" {:kind :invalid-config})))
+  (call PROGRESS [:submit owner kind thunk
+                 {:since_ms (erlang/system_time :millisecond)
+                  :argv (to-list [label]) :cwd (BeamLisp/cwd)}] :infinity))
 
-(defn- leave []
-  (ensure-table)
-  (let [r (row) q (max 0 (- (:queued r 0) 1))]
-    (put-row {:busy (if (> q 0) (:busy r) nil) :queued q})))
+(defn- run-ticket [ticket thunk]
+  (try (run-guarded thunk)
+       (finally (call PROGRESS [:leave ticket]))))
 
 (defserver seq
   (init [_]
+    (call (progress-pid) [:attach (erlang/self)])
     (ok {}))
 
   ;; a reload commit: run on this mailbox so it never interleaves with a
   ;; capture (or another reload) the daemon is running.
-  (handle-call [:run-reload thunk] [_from st]
-    (reply (run-guarded thunk) st))
+  (handle-call [:run-reload ticket thunk] [_from st]
+    (reply (run-ticket ticket thunk) st))
 
   ;; a dashboard intent: swap THIS process's group leader to a StringIO so the
   ;; task's stdout is captured, run it, restore. Capturing needs the swap to
   ;; happen in the process that PRINTS — this one — which is why it lives here.
-  (handle-call [:run-capture thunk] [_from st]
-    (let [io (elem (erlang/apply :"Elixir.StringIO" :open (list "")) 1)
-          prev (erlang/group_leader)]
-      (erlang/group_leader io (erlang/self))
-      (try
-        (let [result (run-guarded thunk)
-              output (elem (erlang/apply :"Elixir.StringIO" :contents (list io)) 1)]
-          (reply {:result result :output output} st))
-        (finally
-          (erlang/group_leader prev (erlang/self))
-          (erlang/apply :"Elixir.StringIO" :close (list io)))))))
+  (handle-call [:run-capture ticket thunk] [_from st]
+    (try
+      (let [io (elem (erlang/apply :"Elixir.StringIO" :open (list "")) 1)
+            prev (erlang/group_leader)]
+        (try
+          (erlang/group_leader io (erlang/self))
+          (let [result (run-guarded thunk)
+                output (elem (erlang/apply :"Elixir.StringIO" :contents (list io)) 1)]
+            (reply {:result result :output output} st))
+          (finally
+            (erlang/group_leader prev (erlang/self))
+            (erlang/apply :"Elixir.StringIO" :close (list io)))))
+      (finally (call PROGRESS [:leave ticket])))))
 
 (defn- run-guarded [thunk]
   (try (thunk)
@@ -91,9 +134,9 @@
 (defn start
   "Boot the sequencer (idempotent by name). Returns its pid."
   []
-  (if (nil? (Process/whereis OWNER))
-    (core/start seq nil {:name OWNER})
-    (Process/whereis OWNER)))
+  (or (Process/whereis OWNER)
+      (let [p (try (core/start seq nil {:name OWNER}) (catch _ nil))]
+        (if (erlang/is_pid p) p (Process/whereis OWNER)))))
 
 (defn- conveyed [thunk]
   ;; Capture at submission, never at sequencer startup. Env restores the worker's
@@ -107,8 +150,7 @@
   [thunk]
   (if (nil? (owner-pid))
     (thunk)
-    (do (enter "reload")
-        (try (call OWNER [:run-reload (conveyed thunk)] :infinity) (finally (leave))))))
+    (submit (owner-pid) :run-reload "reload" (conveyed thunk))))
 
 (defn run-capture
   "Run `thunk` on the sequencer with stdout CAPTURED. Returns {:result … :output
@@ -117,5 +159,4 @@
   [thunk]
   (if (nil? (owner-pid))
     {:result (thunk) :output ""}
-    (do (enter "intent")
-        (try (call OWNER [:run-capture (conveyed thunk)] :infinity) (finally (leave))))))
+    (submit (owner-pid) :run-capture "intent" (conveyed thunk))))
