@@ -8,18 +8,50 @@
 (def JOBS :datom.query.rank-workers)
 (def MAX-WORKERS 4)
 (def MAX-STEPS 100000)
+(def MAX-RUN-MS 300000)
 (defn- jobs []
  (table/hold JOBS {:type :set :options [:public :named_table]}) JOBS)
+(defn- remember-refusal! [c target h]
+ (when (and (= target (:ident h)) (= :rank-storage-limit (:reason h)))
+  (let [database (conn/db c)
+        key (cache/key-data (store/identity-of (db/store-of database)) 0)]
+   (when (and key (:writer-code h))
+    ;; Use the build's certified basis, not a later concurrent source revision.
+    ;; Cache values contain finite identities, never Conn/store/Env handles.
+    (cache/put! build/REFUSALS [key target] (:through h)
+      {:code (cache/key-data (:writer-code h) 0) :reason :rank-storage-limit})))))
+(defn- refused? [database key target]
+ ;; The common no-refusal path must not initialize an optional cache owner.
+ (when (Process/whereis build/REFUSALS)
+  (let [hit (cache/lookup build/REFUSALS [key target] (db/basis-t database))]
+   (when (:hit? hit)
+    (let [stamp (build/code-stamp)]
+     (and stamp (= (:code (:value hit)) (cache/key-data stamp 0))))))))
 (defn- run-builder [c p]
- (loop [step 0 id (conn/ensure-query-rank! c p)]
-  (when (and id (< step MAX-STEPS) (conn/query-rank-worker-live? c (erlang/self)))
-   (let [h (conn/advance-query-rank! c id)]
-    (cond
-     (and h (contains? #{:building :aborted} (:status h)))
-      (do (Process/sleep 1) (recur (inc step) id))
-     (or (nil? h) (not= id (build/ident p)))
-      (do (Process/sleep 1) (recur (inc step) (conn/ensure-query-rank! c p)))
-     :else nil)))))
+ (let [target (build/ident p)
+       deadline (+ (erlang/monotonic_time :millisecond) MAX-RUN-MS)
+       initial-id (conn/ensure-query-rank! c p)
+       initial-header (when initial-id (rank/header (db/store-of (conn/db c)) initial-id))
+       initial-refusal? (and (= target initial-id) (= :aborted (:status initial-header)))]
+  ;; Small aborted stages can disappear in their very first cleanup batch.
+  ;; Retain their refusal before advancing, rather than requiring a later header.
+  (when initial-refusal? (remember-refusal! c target initial-header))
+  (loop [step 0 id initial-id recorded? initial-refusal?]
+   (when (and id (< step MAX-STEPS)
+              (< (erlang/monotonic_time :millisecond) deadline)
+              (conn/query-rank-worker-live? c (erlang/self)))
+    (let [h (conn/advance-query-rank! c id)]
+     (cond
+      (and h (contains? #{:building :aborted} (:status h)))
+       (let [refusing? (and (= target id) (= :aborted (:status h)))]
+        (when (and refusing? (not recorded?)) (remember-refusal! c target h))
+        (Process/sleep 1)
+        (recur (inc step) id (or recorded? refusing?)))
+      ;; Only eviction of ANOTHER target permits continuation. A missing own
+      ;; header means cleanup finished; restarting it here repeats refused work.
+      (not= id target)
+       (do (Process/sleep 1) (recur (inc step) (conn/ensure-query-rank! c p) false))
+      :else nil))))))
 (defn request!
  "Query-side scheduling; source batches run in a connection-owned worker. At most four workers node-wide and one per
   store. Slot keys contain finite identities, never native store references."
@@ -27,7 +59,7 @@
  (try
   (let [s (db/store-of database) key (cache/key-data (store/identity-of s) 0)
         c (conn/conn-of database) token (env/capture)]
-   (when key
+   (when (and key (not (refused? database key (build/ident p))))
     (jobs)
     (global/trans (tuple ::jobs (erlang/self))
      (fn []
