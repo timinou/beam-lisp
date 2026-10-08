@@ -25,7 +25,7 @@ as data. A broken `env.bl` degrades what the tree can do — its tasks, its port
 
 ```beam-lisp silent
 (ns bl.env
-  (:require [bl.util :as u]))
+  (:require [bl.util :as u] [bl.loading :as loading]))
 ```
 
 ## Discovery
@@ -125,6 +125,12 @@ worst kind of configuration bug.
   :watch BOOL}`.
 - `:ports` — name → a port number, or `{:port N}` (`0` = the OS chooses).
 - `:env` — name → value, the environment the tree expects.
+- `:loading` — `{:environment-env "BL_ENV" :development :lazy :production :startup
+  :roots []}`. `bl serve` initializes declared entry dependencies before running
+  the entry in production (`production` or `prod`), and stays lazy otherwise.
+  Change `:environment-env` for an existing application's mode variable. Optional
+  `:roots` adds dynamically selected libraries; never include the entry program.
+  Unsupported policies are errors. See [loading](loading.bl).
 - `:app` — `{:name :vsn :applications :mod}`: what this tree IS as an OTP
   application, so a build need not interrogate the running VM about itself.
 - `:build` — `{:paths :seed :out :native :jobs :ex :exclude}`: which roots hold
@@ -178,7 +184,7 @@ problems reports all three in one pass.
 
 ```beam-lisp silent
 (def known-keys [:name :instance :bl :warm :vm :realm :shadow :uses :paths :tasks :ports
-                 :schedules :env :doc :app :build :release :deps :browser :catalog :foundry])
+                 :schedules :env :loading :doc :app :build :release :deps :browser :catalog :foundry])
 
 ;; How `bl` reaches a warm VM for this tree. The LAUNCHER reads this key (it must
 ;; decide before any VM exists), so the vocabulary lives in
@@ -744,6 +750,10 @@ shape, whatever the file said.
       [(assoc value :observability (assoc o :schema (Path/expand (:schema o) root)
                                            :local-command (Path/expand (:local-command o) root))) []])))
 
+(defn- norm-loading [value]
+  (try [(loading/validate value) []]
+       (catch e [nil [(ex-message e)]])))
+
 (defn normalize
   "The project value as the runtime reads it: `:paths` absolute against `root`,
    tasks and ports keyed by name, `:errors` — every shape problem found, as
@@ -770,6 +780,7 @@ shape, whatever the file said.
         [ports porerr] (norm-ports (:ports m))
         [sched serr]   (norm-schedules (:schedules m))
         [env eerr]     (norm-env (:env m) ":env")
+        [load lerr]    (norm-loading (:loading m))
         [app aerr]     (norm-app (:app m))
         [bld berr]     (norm-build (:build m) root)
         [rel rerr]     (norm-release (:release m) root)
@@ -795,6 +806,7 @@ shape, whatever the file said.
      :ports ports
      :schedules sched
      :env env
+     :loading load
      :app app
      :build bld
      :release rel
@@ -803,7 +815,7 @@ shape, whatever the file said.
      :browser brw
      :catalog cat
      :errors (concat perr nerr ierr blerr werr vmerr rlmerr shderr useserr terr porerr serr eerr aerr berr rerr derr
-                     fnderr brerr cerr
+                     fnderr brerr cerr lerr
                      (map (fn [k] (str "unknown key " k)) (unknown-keys m known-keys)))}))
 
 (defn empty-project
@@ -813,7 +825,7 @@ shape, whatever the file said.
   {:path nil :root root :name nil :instance nil :bl nil :warm nil :vm nil
    :realm nil :shadow [] :uses {} :paths [] :tasks {} :ports {}
    :schedules []
-   :env {} :app nil :build nil :release nil :deps [] :browser nil :catalog nil
+   :env {} :loading loading/DEFAULTS :app nil :build nil :release nil :deps [] :browser nil :catalog nil
    :errors []})
 ```
 
