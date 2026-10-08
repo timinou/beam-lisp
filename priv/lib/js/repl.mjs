@@ -20,6 +20,7 @@
 
 import * as R from "./rt.mjs";
 import * as L from "./leaves.mjs";
+import { installNamespace, requireNamespace } from "./interop.mjs";
 
 const TEXT = R.kw("text"), ERR = R.kw("err");
 
@@ -60,5 +61,5 @@ export async function start(readFile) {
     vm.Env.in_ns("user");
     return R.hashMap(RESULTS, out);
   };
-  return { ...vm, evalWith, evalCells };
+  return { ...vm, evalWith, evalCells, installNamespace, require: requireNamespace };
 }

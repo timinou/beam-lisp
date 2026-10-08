@@ -38,7 +38,9 @@
    tail position — the last thing its enclosing body does — which is where
    `recur` is allowed."
   [ns]
-  {:ns ns :locals {} :recur nil :tail true})
+  (let [grant (BeamLisp.Env/lookup (erlang/list_to_tuple (list :js-interop ns)))]
+    {:ns ns :locals {} :recur nil :tail true :target :beam
+     :js-interop (and (erlang/is_tuple grant) (= true (erlang/element 2 grant)))}))
 
 (defn- author-meta
   "Reader locations describe code, never the value that code evaluates to.
@@ -537,6 +539,27 @@
         :else (do (BeamLisp.Loader/load_provider target)
                   (reject-private! env target sym))))))
 
+(defn- require-js! [env]
+  (when-not (= :js (:target env))
+    (compile-error env "native JavaScript interop requires the JavaScript target"))
+  (when-not (:js-interop env)
+    (compile-error env (str "native JavaScript interop requires (ns ^:js " (:ns env) ")"))))
+
+(defn- js-node [kind args env]
+  (require-js! env)
+  {:op :js :kind kind :args args :ann {}})
+
+(defn- js-path [name env]
+  (let [path (subs name 3)]
+    (when-not (every? (fn [part]
+                         (let [chars (erlang/binary_to_list part)
+                               start? (fn [c] (or (= c 36) (= c 95) (and (>= c 65) (<= c 90)) (and (>= c 97) (<= c 122))))]
+                           (and (seq chars) (start? (first chars))
+                                (every? (fn [c] (or (start? c) (and (>= c 48) (<= c 57)))) (rest chars)))))
+                       (split path "."))
+      (compile-error env (str "invalid JavaScript global path: " name)))
+    path))
+
 (defn- compile-symbol
   "Turn a symbol into the tree that produces its VALUE.
 
@@ -557,6 +580,10 @@
     (local? env name)
       (let [lv (local-var env name)]
         (if (erlang/is_binary lv) (a/var lv) lv))
+    (contains? #{"bl->js" "js->bl"} name)
+      (assoc (js-node :helper (list) env) :helper name)
+    (starts-with? name "js/")
+      (assoc (js-node :global (list) env) :path (js-path name env))
     ; an imported Java class as a VALUE (`(instance? BigDecimal x)`): its
     ; beam-lisp type identity, folded in — the same value `(type x)` answers
     (erlang/is_binary (java-value-class env name))
@@ -900,6 +927,54 @@
            (reverse (map (fn [name arg] (list name arg)) names args))))
   (a/remote module fun args)))
 
+(defn- compile-js-native [payload env]
+  (require-js! env)
+  (let [form (rn/node-form payload) tag (rn/node-tag form)]
+    (cond
+      (= tag :vector) (js-node :array (compile-each-notail (rn/node-items form) env) env)
+      (= tag :map)
+        (let [pairs (rn/node-items form)
+              keys (map (fn [pair]
+                          (let [k (rn/node-form (erlang/element 1 pair))]
+                            (cond (= :keyword (rn/node-tag k)) (rn/node-name k)
+                                  (string? k) k
+                                  :else (compile-error env "#js object keys must be literal keywords or strings")))) pairs)]
+          (when-not (= (count keys) (count (distinct keys)))
+            (compile-error env "duplicate #js object property"))
+          (assoc (js-node :object
+                    (compile-each-notail (map (fn [p] (erlang/element 2 p)) pairs) env) env)
+                 :keys (vec keys)))
+      :else (compile-error env "js/native requires a map or vector"))))
+
+(defn- compile-js-call [name args env]
+  (require-js! env)
+  (cond
+    (= name "js/native")
+      (do (when-not (= 1 (count args)) (compile-error env "js/native expects one literal"))
+          (compile-js-native (first args) env))
+    (= name "set!")
+      (do
+        (when-not (= 2 (count args)) (compile-error env "set! expects a property target and value"))
+        (let [target (compile-node (first args) (notail env))]
+          (when-not (and (= :js (:op target)) (contains? #{:get :index} (:kind target)))
+            (compile-error env "set! requires a JavaScript property target"))
+          (assoc target :kind :set :args (concat (:args target) (list (compile-node (second args) (notail env)))))))
+    (contains? #{"aget" "aset" "bl->js" "js->bl" "js/undefined?"} name)
+      (let [allowed (if (= name "aset") #{3} (if (= name "js->bl") #{1 3} (if (= name "aget") #{2} #{1})))]
+        (when-not (contains? allowed (count args)) (compile-error env (str name " has invalid arity")))
+        (js-node (get {"aget" :index "aset" :set "bl->js" :to-js "js->bl" :to-bl "js/undefined?" :undefined?} name)
+                 (compile-each-notail args env) env))
+    (starts-with? name ".-")
+      (do (when-not (= 1 (count args)) (compile-error env "JavaScript property read expects one receiver"))
+          (assoc (js-node :get (compile-each-notail args env) env) :property (subs name 2)))
+    (starts-with? name ".")
+      (do (when (empty? args) (compile-error env "JavaScript method call requires a receiver"))
+          (assoc (js-node :method (compile-each-notail args env) env) :property (subs name 1)))
+    :else
+      (let [ctor (ends-with? name ".")
+            path (js-path (if ctor (subs name 0 (dec (count name))) name) env)]
+        (assoc (js-node (if ctor :new :call) (compile-each-notail args env) env) :path path))))
+
 (defn- compile-call
   "Turn a call form (head arg ...) into the tree that runs it.
 
@@ -920,8 +995,15 @@
         args (rest items)
         ; call arguments are never in tail position — a recur inside an
         ; argument is an error, so compile them with tail turned off
-        arg-nodes (compile-each-notail args env)
+        name (when (= :symbol (rn/node-tag head)) (rn/node-name head))
+        native? (and (some? name)
+                     (or (= name "js/native") (= name "js/undefined?") (= name "set!")
+                         (and (or (= :js (:target env)) (:js-interop env)) (starts-with? name "."))
+                         (and (:js-interop env) (starts-with? name "js/"))
+                         (and (:js-interop env) (contains? #{"aget" "aset" "bl->js" "js->bl"} name))))
+        arg-nodes (when-not native? (compile-each-notail args env))
         tag (rn/node-tag head)]
+    (if native? (compile-js-call name args env)
     (cond
       ; (7 1) — a literal head that cannot be called at all. The compiler can
       ; READ this head, so the mistake is knowable before the program runs,
@@ -1051,7 +1133,7 @@
 
       ; (expr args) with a compound head — compile it, then call it
       :else
-        (anf-invoke (compile-node head env) arg-nodes))))
+        (anf-invoke (compile-node head env) arg-nodes)))))
 
 ; ─────────────────────────────────────────────────────────────────────────────
 ; The one entry point
@@ -3367,6 +3449,10 @@
    otherwise a no-op — a same-ns def already shadows core here."
   [name-form clauses env]
   (let [name (rn/node-name (rn/node-form name-form))
+        metadata (or (rn/node-pos name-form) {})
+        js? (or (= true (:js metadata))
+                (= :javascript (:interop metadata))
+                (= "javascript" (when (= :keyword (rn/node-tag (:interop metadata))) (rn/node-name (:interop metadata)))))
         clauses (ns-clauses clauses)
         _ (reduce (fn [_ c]
                     (let [h (ns-clause-head c)]
@@ -3442,7 +3528,9 @@
     (a/lett "ns" (a/lit name)
             (a/doo (apply list
                      (concat (list (a/remote mod-env :declare_ns (list nsvar))
-                                   (a/remote mod-env :in_ns (list nsvar)))
+                                   (a/remote mod-env :in_ns (list nsvar))
+                                   (a/remote mod-env :put_key
+                                     (list (a/lit (erlang/list_to_tuple (list :js-interop name))) (a/lit js?))))
                              loads
                              aliases
                              refers
