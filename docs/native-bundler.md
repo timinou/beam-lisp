@@ -609,3 +609,15 @@ without adding another input.
 One command: `tooling/drop/server-drop.sh` builds `.#bl-drop`, copies it to
 `~/.cache/foundry/drops/bl-nix-<sha8>.drop`, prints `path=` and `sha256=`
 (the Foundry deploy spec `:runtime {:path :sha256}`). Idempotent.
+
+### Dedicated service stores
+
+Set `DROP_STORE_ROOT` to an absolute directory to select the native drop store
+independently of application XDG data. The value names the store itself; no
+`drop` suffix is added. Empty, relative, filesystem-root and traversal paths
+are refused. `maintenance directory` reports the selected path.
+
+Use a service-owned directory with restricted permissions, outside durable
+application data. The verifier, application and maintenance tasks share that
+same setting. Payloads are reproducible; application databases and keys belong
+in their declared durable roots. An unset variable retains platform defaults.

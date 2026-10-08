@@ -135,7 +135,27 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 /// First-install location (docs/native-bundler.md §6.2).
+/// A service can keep reproducible drop storage separate from its durable XDG data.
+/// DROP_STORE_ROOT names the store itself (no implicit /drop suffix).
+fn explicit_store_root(value: &std::ffi::OsStr) -> Result<std::path::PathBuf, &'static str> {
+    let path = std::path::PathBuf::from(value);
+    let raw = value.to_string_lossy();
+    if raw.split(['/', '\\']).any(|part| part == ".") || !path.is_absolute() || path.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)) {
+        return Err("DROP_STORE_ROOT must be an absolute path without . or .. components");
+    }
+    if path.parent().is_none() {
+        return Err("DROP_STORE_ROOT must not be a filesystem root");
+    }
+    Ok(path)
+}
+
 pub fn install_dir() -> std::path::PathBuf {
+    if let Some(value) = std::env::var_os("DROP_STORE_ROOT") {
+        return explicit_store_root(&value).unwrap_or_else(|message| {
+            eprintln!("drop: {message}");
+            std::process::exit(2)
+        });
+    }
     if cfg!(target_os = "windows") {
         if let Ok(l) = std::env::var("LOCALAPPDATA") {
             return std::path::PathBuf::from(l).join("drop");
@@ -285,3 +305,18 @@ pub fn make_entry_executable(dir: &std::path::Path, rel: &str) {
 }
 #[cfg(not(unix))]
 pub fn make_entry_executable(_dir: &std::path::Path, _rel: &str) {}
+
+#[cfg(test)]
+mod store_root_tests {
+    use super::explicit_store_root;
+    #[test]
+    fn explicit_store_is_independent_of_xdg_and_has_no_added_suffix() {
+        assert_eq!(explicit_store_root(std::ffi::OsStr::new("/var/cache/app-runtime")).unwrap(), std::path::PathBuf::from("/var/cache/app-runtime"));
+    }
+    #[test]
+    fn explicit_store_rejects_relative_empty_root_and_parent_traversal() {
+        for path in ["", "relative", "/", "/var/cache/../data", "/var/./cache"] {
+            assert!(explicit_store_root(std::ffi::OsStr::new(path)).is_err(), "{path}");
+        }
+    }
+}
