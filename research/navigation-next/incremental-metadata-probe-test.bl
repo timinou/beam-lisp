@@ -1,0 +1,127 @@
+(ns navigation.incremental-metadata-probe-test)
+;; Isolated ETS representation probe, not Env authority. Lock ordering is always
+;; namespace then scope; destruction takes only scope. Production integration
+;; must use Env's real lifetime registry, not retain these test lifetime rows.
+(defn locked [t kind id f]
+ (global/trans (tuple (tuple :metadata-probe t kind id) (erlang/self)) f))
+(defn live? [t scope] (= [(tuple (tuple :live scope) true)] (vec (ets/lookup t (tuple :live scope)))))
+(defn root [t scope ns]
+ (let [rows (ets/lookup t (tuple :root scope ns))]
+  (when (seq rows) (elem (first rows) 1))))
+(defn guarded [t scope ns f]
+ (locked t :namespace ns (fn []
+  (locked t :scope scope (fn [] (if (live? t scope) (f) :retired))))))
+(defn cleanup [t scope ns h]
+ (doseq [row (ets/tab2list t)]
+  (let [k (elem row 0)]
+  (when (and (tuple? k) (= 5 (erlang/tuple_size k)) (= :entry (elem k 0))
+             (= scope (elem k 1)) (= ns (elem k 2))
+             (or (not= (:generation h) (elem k 3)) (= (:pending h) (elem k 4))))
+   (ets/delete t k)))))
+(defn replace! [t scope ns defs]
+ (guarded t scope ns (fn []
+  (let [old (root t scope ns) generation (erlang/unique_integer (list :positive))
+        h {:generation generation :count (count defs) :pending nil}]
+   (cleanup t scope ns old)
+   ;; The descriptor and all replacement rows have one atomic publication.
+   (ets/insert t (Enum/concat (list (tuple (tuple :root scope ns) h))
+     (Enum/map defs (fn [pair]
+       (tuple (tuple :entry scope ns generation (elem pair 0)) (elem pair 1))))))
+   (cleanup t scope ns h)
+   h))))
+(defn cleanup-pending [t scope ns h]
+ (when (:pending h)
+  (ets/delete t (tuple :entry scope ns (:generation h) (:pending h)))))
+(defn put! [t scope ns name value]
+ (guarded t scope ns (fn []
+  (let [h (root t scope ns) k (tuple :entry scope ns (:generation h) name)]
+   (cleanup-pending t scope ns h)
+   (let [present? (seq (ets/lookup t k))
+         next (assoc h :pending nil :count (+ (:count h) (if present? 0 1)))]
+    (ets/insert t (list (tuple k value) (tuple (tuple :root scope ns) next)))
+    next)))))
+(defn remove! [t scope ns name interrupt?]
+ (guarded t scope ns (fn []
+  (let [h (root t scope ns) k (tuple :entry scope ns (:generation h) name)]
+   (cleanup-pending t scope ns h)
+   (let [next (assoc h :pending name :count (- (:count h) (if (seq (ets/lookup t k)) 1 0)))]
+    (ets/insert t (list (tuple k nil) (tuple (tuple :root scope ns) next)))
+    ;; Fault injection leaves an atomically visible tombstone for the next write.
+    (when (not interrupt?) (ets/delete t k))
+    next)))))
+(defn read-own [t scope ns]
+ (guarded t scope ns (fn []
+  (when-let [h (root t scope ns)]
+   (into {} (keep (fn [row]
+    (let [k (elem row 0) value (elem row 1)]
+     (when (and (tuple? k) (= 5 (erlang/tuple_size k)) (= :entry (elem k 0))
+                (= scope (elem k 1)) (= ns (elem k 2))
+                (= (:generation h) (elem k 3)) (some? value))
+      [(elem k 4) value]))) (ets/tab2list t)))))))
+(defn read-chain [t scopes ns]
+ (loop [remaining scopes]
+  (when (seq remaining)
+   (let [own (read-own t (first remaining) ns)]
+    (if (nil? own) (recur (rest remaining)) own)))))
+(defn read-one [t scope ns name]
+ (guarded t scope ns (fn []
+  (when-let [h (root t scope ns)]
+   (let [rows (ets/lookup t (tuple :entry scope ns (:generation h) name))]
+    (when (seq rows) (elem (first rows) 1)))))))
+(defn retire! [t scope]
+ (locked t :scope scope (fn []
+  (ets/insert t (tuple (tuple :live scope) false))
+  (doseq [row (ets/tab2list t)]
+   (let [k (elem row 0)]
+   (when (and (tuple? k) (contains? #{:root :entry} (elem k 0)) (= scope (elem k 1)))
+    (ets/delete t k))))
+  :retired)))
+
+(deftest incremental-representation-preserves-whole-table-shadowing-and-tombstones
+ (let [t (ets/new :incremental-metadata (list :set :public))]
+  (try
+   (ets/insert t (list (tuple (tuple :live :parent) true) (tuple (tuple :live :child) true)))
+   (replace! t :parent "n" {"a" [1] "b" [2]})
+   (is (= {"a" [1] "b" [2]} (read-chain t [:child :parent] "n")))
+   (replace! t :child "n" {})
+   (is (= {} (read-chain t [:child :parent] "n")))
+   (put! t :child "n" "a" [3])
+   (is (= {"a" [3]} (read-chain t [:child :parent] "n")))
+   (is (= [3] (read-one t :child "n" "a")))
+   (is (nil? (read-one t :child "n" "b")))
+   (remove! t :child "n" "a" true)
+   (is (= {} (read-own t :child "n")))
+   (is (= 0 (:count (root t :child "n"))))
+   (put! t :child "n" "a" [4])
+   (is (= 1 (:count (root t :child "n"))))
+   (is (= {"a" [4]} (read-own t :child "n")))
+   (replace! t :child "n" {"z" [5]})
+   (is (= {"z" [5]} (read-own t :child "n")))
+   (is (= 2 (count (filter (fn [row] (let [k (elem row 0)] (and (tuple? k) (= :entry (elem k 0))
+      (= :parent (elem k 1))))) (ets/tab2list t)))))
+   (is (= :retired (retire! t :child)))
+   (is (= :retired (put! t :child "n" "late" [6])))
+   (is (= :retired (replace! t :child "n" {"late" [7]})))
+   (is (= :retired (read-own t :child "n")))
+   (is (= {"a" [1] "b" [2]} (read-own t :parent "n")))
+   (finally (ets/delete t)))))
+
+(deftest writer-death-releases-scope-lock-without-resurrecting-retired-metadata
+ (let [t (ets/new :incremental-metadata-kill (list :set :public)) parent (erlang/self)]
+  (try
+   (ets/insert t (tuple (tuple :live :child) true))
+   (replace! t :child "n" {"a" [1]})
+   (let [writer (spawn (fn []
+                  (guarded t :child "n" (fn []
+                   (erlang/send parent :scope-held)
+                   (receive :never :ok (after 5000 nil))))))
+         monitor (erlang/monitor :process writer)]
+    (is (= :scope-held (receive :scope-held :scope-held (after 5000 :timeout))))
+    (erlang/exit writer :kill)
+    (is (= :killed (receive [:DOWN _ :process _ reason] reason (after 5000 :timeout))))
+    (is (= {"a" [1]} (read-own t :child "n")))
+    (is (= :retired (retire! t :child)))
+    (is (= :retired (put! t :child "n" "late" [2])))
+    (is (empty? (filter (fn [row] (let [k (elem row 0)] (and (tuple? k) (= 5 (erlang/tuple_size k))
+       (= :entry (elem k 0))))) (ets/tab2list t)))))
+   (finally (ets/delete t)))))
