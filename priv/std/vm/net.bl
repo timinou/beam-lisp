@@ -295,18 +295,29 @@
       (if (not= :ok (elem lr 0))
         {:error (elem lr 1)}
         (let [lsock (elem lr 1)]
-          (File/chmod sock-path 384)  ; 0o600
-          (when (not (File/exists? token-path))
-            (File/write! token-path (erlang/apply :crypto :strong_rand_bytes (list 32)))
-            (File/chmod token-path 384))
-          ;; Identity belongs to this bound endpoint. A spawned connection has
-          ;; neither its submitter's OS overlay nor authority to relabel it by
-          ;; rereading mutable ambient BL_BUILD_ID during the handshake.
-          (let [token (File/read! token-path) build (:build paths-map)
-                pid (spawn (fn [] (accept-loop lsock expect token handler build)))]
-            (write-meta! (:meta paths-map) root (:build paths-map))
-            {:ok {:lsock lsock :pid pid :sock-path sock-path
-                  :token-path token-path :meta-path (:meta paths-map)}}))))))
+          (try
+            (File/chmod sock-path 384)  ; 0o600
+            (when (not (File/exists? token-path))
+              (File/write! token-path (erlang/apply :crypto :strong_rand_bytes (list 32)))
+              (File/chmod token-path 384))
+            ;; Publish endpoint metadata before releasing acceptance. Identity
+            ;; and listening-socket lifetime belong to the bound acceptor.
+            (let [token (File/read! token-path) build (:build paths-map)
+                  generation (tuple (erlang/apply :os :getpid (list)) (erlang/make_ref))]
+              (write-meta! (:meta paths-map) root build generation)
+              (let [handed (handoff-connection lsock
+                             (fn [] (accept-loop lsock expect token handler build)))
+                    pid (:ok handed)]
+                (if pid
+                  {:ok {:lsock lsock :pid pid :sock-path sock-path
+                        :token-path token-path :meta-path (:meta paths-map)
+                        :lock-path (:lock paths-map) :generation generation}}
+                  (do (File/rm sock-path) (File/rm (:meta paths-map)) handed))))
+            (catch error
+              (gen_tcp/close lsock)
+              (File/rm sock-path)
+              (File/rm (:meta paths-map))
+              (throw error))))))))
 
 (defn listen
   "Bind the daemon socket for `root` and accept connections, dispatching each
@@ -336,18 +347,17 @@
                (bind-endpoint root expect handler paths-map)))))))))
 
 (defn- write-meta!
-  "Record who serves this socket: the OS pid, the tree, the build, and when it
-   started, as an Erlang term (read back by `read-meta`). Written temp + rename,
-   so a reader never sees half a file."
-  [path root build]
+  "Publish complete endpoint metadata or raise, removing scratch on failure."
+  [path root build generation]
   (let [tmp (str path ".tmp." (erlang/apply :os :getpid (list)))]
-    (File/write! tmp (erlang/term_to_binary
-                       {:pid (erlang/list_to_integer (erlang/apply :os :getpid (list)))
-                        :root root
-                        :build build
-                        :started_at (erlang/system_time :second)}))
-    (File/chmod tmp 384)
-    (erlang/apply :file :rename (list (erlang/binary_to_list tmp) (erlang/binary_to_list path)))))
+    (try
+      (File/write! tmp (erlang/term_to_binary
+                         {:pid (erlang/list_to_integer (erlang/apply :os :getpid (list)))
+                          :root root :build build :generation generation
+                          :started_at (erlang/system_time :second)}))
+      (File/chmod tmp 384)
+      (File/rename! tmp path)
+      (finally (File/rm tmp)))))
 
 (defn read-meta
   "The `.meta` term at `path` ({:pid :root :build :started_at}), or nil when it
@@ -358,11 +368,16 @@
     (if (and (map? term) (contains? term :build) (contains? term :root)) term nil)))
 
 (defn stop
-  "Stop a listener: close the socket (ends the accept loop) and unlink every
-   endpoint file it wrote, so a stopped daemon leaves nothing behind."
+  "Close this listener's port; unlink files only while its generation still
+   owns the endpoint under the same lock that protects binding. Legacy handles
+   lacking ownership evidence close their port and leave reclamation to bind."
   [listener]
   (gen_tcp/close (:lsock listener))
-  (File/rm (:sock-path listener))
-  (when (:token-path listener) (File/rm (:token-path listener)))
-  (when (:meta-path listener) (File/rm (:meta-path listener)))
+  (when (and (:generation listener) (:lock-path listener) (:meta-path listener))
+    (with-start-lock (:lock-path listener)
+      (fn []
+        (when (= (:generation listener) (:generation (read-meta (:meta-path listener))))
+          (File/rm (:sock-path listener))
+          (when (:token-path listener) (File/rm (:token-path listener)))
+          (File/rm (:meta-path listener))))))
   :ok)
