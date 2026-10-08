@@ -142,8 +142,9 @@ server; a program that starts its server and returns parks here forever.
             (let [project (env/project (BeamLisp/cwd))]
               (when (nil? (:loading project))
                 (throw (ex-info "Invalid loading configuration" {:errors (:errors project)})))
-              (loading/prepare! project (u/resolve target)))
-            (BeamLisp/run_file (u/resolve target))))
+              (loading/prepare! project (u/resolve target))
+              (BeamLisp/run_file (u/resolve target))
+              (loading/start-background! project (u/resolve target)))))
         (println (str "bl serve: " target " running — Ctrl+C to stop"))
         ;; where the access log goes, said out loud: a server that logs every
         ;; request must not leave you guessing where the log went (and in
