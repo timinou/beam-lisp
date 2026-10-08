@@ -1,0 +1,11 @@
+import assert from 'node:assert/strict';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
+const out = process.argv[2];
+await import(pathToFileURL(path.join(out, 'ns/native.mjs')));
+const { requireNamespace } = await import(pathToFileURL(path.join(out, 'interop.mjs')));
+const api = requireNamespace('native');
+assert.equal(api.add(2, 3), 5);
+assert.equal(api.add(.5, 1.25), 1.75);
+assert.equal(api.secret, undefined);
+assert.equal(api.obj.x, 12);

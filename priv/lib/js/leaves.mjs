@@ -20,6 +20,7 @@
 // Beam Lisp, compiled here from the same source the BEAM runs.
 
 import * as R from "./rt.mjs";
+import * as J from "./interop.mjs";
 import * as A from "./abi.mjs";
 import { exactCandidates, ENV } from "./env.mjs";
 import { LAZY_LEAVES } from "./lazy.mjs";
@@ -361,7 +362,7 @@ ENV.declare_ns("core");
     (`A.invokeList`, `A.NOT_FOUND`, `A.K_error`, `A.blfnFn`, `A.toArray`); a
     page installs this as its `js/run` host fn: `globalThis.BL_HOST = { run }`
     before importing js.eval's build. */
-export function run(body) { return new Function("R", "A", "G", "GX", "X", body)(R, A, G, GX, X); }
+export function run(body) { return new Function("R", "A", "G", "GX", "X", "J", body)(R, A, G, GX, X, J); }
 
 // ONE table, assembled from its parts with NO silent override: a leaf key
 // defined in two places is a load error naming both. (Two files once both

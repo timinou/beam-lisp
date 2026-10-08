@@ -140,6 +140,9 @@ export const ENV = {
   },
   // a JS page has no capability table: every op is allowed, `caps` is :all
   caps: () => kw("all"),
+  // Shared rt.bl can reference the BEAM command-environment seam. A browser
+  // has no OS environment or subprocess host; never fall through to globals.
+  os_env_call: (fun, args) => { throw new BLError("System/" + (fun.fq ?? fun) + " is unavailable on the JavaScript target"); },
   "caps_allowed?": () => true,
   op_of: () => null,
   "local_var?": (ns, name) => has(T(ns, name)),
