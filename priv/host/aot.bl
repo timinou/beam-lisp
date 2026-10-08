@@ -997,14 +997,14 @@
   "The initializer companion module: `BeamLisp.Ns.Init.<Ns>`."
   [ns]
   (Module/concat
-    (erlang/++ (list :Elixir.BeamLisp.Ns "Init")
+    (erlang/++ (list (BeamLisp.Emit/realm_base ns :Elixir.BeamLisp.Ns.Init))
                (Enum/map (String/split ns ".") (fn [s] (Macro/camelize s))))))
 
 (defn- ns_body_module
   "The single shared body module for a namespace: `BeamLisp.Ns.Body.<Ns>`."
   [ns]
   (Module/concat
-    (erlang/++ (list :Elixir.BeamLisp.Ns "Body")
+    (erlang/++ (list (BeamLisp.Emit/realm_base ns :Elixir.BeamLisp.Ns.Body))
                (Enum/map (String/split ns ".") (fn [s] (Macro/camelize s))))))
 
 (defn- unit_defs
@@ -1356,7 +1356,7 @@
   [ns content closure_key path]
   (let [out (Path/join (Path/join (BeamLisp.AOTCache/dir) "repair")
                        (erlang/iolist_to_binary
-                         (list (BeamLisp.AOTCache/compiler_key) "-" ns "-out-"
+                         (list (BeamLisp.AOTCache/compiler_key) "-" ns "-out-" (os/getpid) "-"
                                (Integer/to_string (System/unique_integer (list :positive))))))]
     (File/mkdir_p! out)
     (try
@@ -1416,6 +1416,94 @@
                                     ; Once evaluation starts, failures propagate. Falling
                                     ; back to interpretation would repeat earlier effects.
                                     (do (BeamLisp.Env/mark_loaded ns) :loaded))))))))))))))))))
+
+(defn- local_expression? [node names]
+  (let [f (unmeta node)]
+    (cond
+      (reg2? f :list)
+      (let [items (elem f 1) head (if (erlang/== (list) items) nil (bare_name (first items)))]
+        (and head
+             (or (lists/member head names)
+                 (lists/member head (list "if" "do" "let" "fn" "quote" "+" "-" "*" "/" "=" "<" ">" "<=" ">="))
+                 (String/contains? head "/"))
+             ;; Only direct host calls have '/' admission; namespace aliases,
+             ;; custom defining/body macros and computed calls keep source loading.
+             (or (erlang/not (String/contains? head "/"))
+                 (let [prefix (first (String/split head "/"))]
+                   (or (Regex/match? (Regex/compile! "^[A-Z]") prefix)
+                       (lists/member prefix (list "erlang" "maps" "lists" "crypto" "binary")))))
+             (Enum/all? (erlang/tl items) (fn [x] (local_expression? x names)))))
+      (or (reg2? f :vector) (reg2? f :map) (reg2? f :set))
+      (Enum/all? (elem f 1) (fn [x] (local_expression? x names)))
+      :else true)))
+
+(defn- local_namespace_tree? [node]
+  (let [f (unmeta node)]
+    (cond
+      (or (reg2? f :list) (reg2? f :vector) (reg2? f :map) (reg2? f :set))
+        (Enum/all? (elem f 1) (fn [x] (local_namespace_tree? x)))
+      (reg2? f :keyword)
+        (erlang/not (lists/member (elem f 1) (list "refer" "refer-clojure" "use" "import")))
+      (reg2? f :symbol)
+        (erlang/not (Regex/match? (Regex/compile! "^[A-Z]") (elem f 1)))
+      :else true)))
+
+(defn local_cacheable_source?
+  "Automatic finite admission for lexical functions and replayable def values.
+   Custom macros, defining forms, aliases and arbitrary top-level effects retain
+   source loading. This is intentionally smaller than the language."
+  [source]
+  (try
+    (let [forms (BeamLisp.Reader/read_all source)
+          names (Enum/flat_map forms
+                  (fn [node]
+                    (let [f (unmeta node)]
+                      (if (and (reg2? f :list) (erlang/>= (erlang/length (elem f 1)) 2)
+                               (lists/member (bare_name (first (elem f 1))) (list "defn" "defn-")))
+                        (list (bare_name (second (elem f 1)))) (list)))))]
+      (and (erlang/not (erlang/== (list) names))
+        (erlang/== 1 (Enum/count forms (fn [f] (erlang/not (erlang/== nil (ns_decl f))))))
+        (Enum/all? forms
+          (fn [node]
+            (let [f (unmeta node)]
+              (and (reg2? f :list) (erlang/>= (erlang/length (elem f 1)) 2)
+                (let [items (elem f 1) head (bare_name (first items))]
+                  (cond
+                    (erlang/== head "ns") (local_namespace_tree? f)
+                    (lists/member head (list "defn" "defn-" "def"))
+                    (Enum/all? (Enum/drop items 2) (fn [x] (local_expression? x names)))
+                    :else false))))))))
+    (catch _ false)))
+
+(defn ensure_loaded_local
+  "Realm-local AOT fast path. Code bytes are keyed by compiler, closure and
+   module home. Values/namespace bindings are replayed in TARGET, never global.
+   Unsupported syntax or declared tier shadows decline BEFORE source effects."
+  [ns target realm content path]
+  (if (and (repair_enabled?) (local_cacheable_source? content)
+           (Enum/empty? (maps/get :shadow (or (maps/get :decl realm nil) (maps/new)) (list))))
+    (let [closure (ns_closure_hash ns)
+          context (BeamLisp.Env/namespace_generations
+                    (list "core" "sugar" "rt" "compiler" "lower" "anf"))
+          context (if (and context
+                         (Enum/all? context (fn [row]
+                           (or (erlang/== :global (elem row 0)) (erlang/== 0 (elem row 2))))))
+                    (Enum/filter context (fn [row] (erlang/== :global (elem row 0)))) nil)]
+      (if (or (erlang/== nil closure) (erlang/== nil context)) :no_module
+        (let [;; Own compiler overrides decline; global compiler generations and
+              ;; the immutable realm identity participate in artifact selection.
+              key (Base/encode16 (crypto/hash :sha256 (erlang/term_to_binary
+                    (tuple :realm_aot_v1 (BeamLisp.Emit/module_for ns) realm context closure)))
+                     (list (tuple :case :lower)))
+              link_dir (Path/join (repair_link_dir ns) key)
+              hit (BeamLisp.AOTCache/fetch (BeamLisp.AOTCache/compiler_key) key link_dir)]
+          (if (erlang/== :miss hit)
+            (compile_and_publish ns content key path)
+            (load_cached_entry ns (elem hit 1)
+              (BeamLisp.AOTCache/entry_dir (BeamLisp.AOTCache/compiler_key) key) link_dir))
+          (BeamLisp.Env/mark_loaded ns)
+          :loaded)))
+    :no_module))
 
 (defn- repair_or_no_module
   "The gate's repair gatekeeper: try to repair a library artifact, else answer
