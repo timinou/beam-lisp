@@ -9,6 +9,7 @@ use std::process::Command;
 include!("common.rs");
 include!("daemon.rs");
 include!("store.rs");
+include!("transport.rs");
 include!("builder.rs");
 include!("hooks.rs");
 
@@ -22,7 +23,7 @@ const EXIT_LAUNCHER_FAILURE: i32 = 126;
 /// send `bl -p lib repl` to the daemon, where it would hold the single worker
 /// forever. `--` is skipped too: everything after it is the program's argv.
 fn verb_index(argv: &[String]) -> Option<usize> {
-    const VALUED: [&str; 8] = [
+    const VALUED: [&str; 12] = [
         "-p",
         "--path",
         "--code-path",
@@ -31,6 +32,10 @@ fn verb_index(argv: &[String]) -> Option<usize> {
         "--tier",
         "--jobs",
         "--port",
+        ROOT_FLAG,
+        LOG_FLAG,
+        IDLE_FLAG,
+        LINES_FLAG,
     ];
     let mut i = 0;
     while i < argv.len() {
@@ -61,19 +66,24 @@ fn verb_of(argv: &[String]) -> Option<String> {
     verb_index(argv).map(|i| argv[i].clone())
 }
 
-/// Is this invocation the REQUEST to start the daemon — `bl daemon start`?
-/// Only the explicit subcommand counts: a bare `bl daemon` is `status`.
-fn daemon_start_requested(argv: &[String]) -> bool {
-    match verb_index(argv) {
-        Some(i) => argv[i] == "daemon" && argv.get(i + 1).map(String::as_str) == Some("start"),
-        None => false,
-    }
-}
+// The start-spelling recognition lives in transport.rs (`start_requested`),
+// beside the `LIFECYCLE_VERBS` it belongs with.
 
 // ── tests: the daemon fast-path's verb detection ────────────────────────────
 #[cfg(test)]
 mod verb_tests {
-    use super::{daemon_start_requested, verb_of};
+    #[test]
+    fn the_launcher_verb_table_is_what_main_answers() {
+        // every verb in the table is dispatched by `verb_of`, and spelled the way the CLI help lists it
+        for v in super::LAUNCHER_VERBS {
+            let argv = vec![v.to_string()];
+            assert_eq!(super::verb_of(&argv).as_deref(), Some(*v), "{v}");
+        }
+        assert_eq!(super::LAUNCHER_VERBS.len(), 5, "adding a verb is a row here, a row in bl.cli/LAUNCHER-VERBS, and a help line");
+        assert!(!super::LAUNCHER_VERBS.contains(&super::VERB_MAINTENANCE), "a drop's verb is not the PATH launcher's");
+    }
+
+    use super::verb_of;
 
     fn v(args: &[&str]) -> Option<String> {
         verb_of(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
@@ -86,6 +96,7 @@ mod verb_tests {
         assert_eq!(v(&["-p", "lib", "repl"]).as_deref(), Some("repl"));
         assert_eq!(v(&["--code-path", "beams", "--json", "ask", "impact"]).as_deref(), Some("ask"));
         assert_eq!(v(&["-o", "out"]).as_deref(), None);
+        assert_eq!(v(&["--root", "/x", "run", "f"]).as_deref(), Some("run"), "--root takes a value");
         assert_eq!(v(&["", "lint"]).as_deref(), Some("lint"));
     }
 
@@ -97,27 +108,19 @@ mod verb_tests {
         assert_eq!(v(&["--"]), None);
     }
 
-    /// `bl daemon start` is the one invocation the launcher answers ITSELF:
-    /// it detaches the VM and returns. Every other daemon word (`status`,
-    /// `stop`, and the bare verb, which means `status`) must still reach the
-    /// release — and a `daemon` that merely appears as an ARGUMENT of another
-    /// verb is not a daemon invocation at all.
+    /// The log/idle/lines flags take a VALUE: a value that looks like a verb must
+    /// not become the verb.
     #[test]
-    fn only_an_explicit_daemon_start_is_the_launchers_own_work() {
-        let ds = |args: &[&str]| {
-            daemon_start_requested(&args.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-        };
-
-        assert!(ds(&["daemon", "start"]));
-        assert!(ds(&["-p", "lib", "daemon", "start"]));
-        assert!(ds(&["--json", "daemon", "start"]));
-
-        assert!(!ds(&["daemon"]), "a bare `bl daemon` is `status`");
-        assert!(!ds(&["daemon", "status"]));
-        assert!(!ds(&["daemon", "stop"]));
-        assert!(!ds(&["run", "daemon", "start"]), "an argument, not the verb");
-        assert!(!ds(&[]));
+    fn the_new_global_flags_are_skipped_by_verb_index() {
+        let a = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(super::verb_index(&a(&["--log", "x", "realm", "start"])), Some(2));
+        assert_eq!(super::verb_index(&a(&["--idle", "30", "run", "f"])), Some(2));
+        assert_eq!(super::verb_index(&a(&["--lines", "50", "run", "f"])), Some(2));
+        assert_eq!(v(&["--log", "x", "realm", "start"]).as_deref(), Some("realm"));
     }
+    // `bl realm start` is the invocation the launcher answers ITSELF; that
+    // recognition is `start_requested` in transport.rs, tested by
+    // `transport_tests::realm_start_is_a_start_request`.
 }
 
 fn fail(msg: &str) -> ! {
@@ -180,6 +183,11 @@ fn hours_env(name: &str, default: u64) -> u64 {
 /// reach.
 const TMP_KEEP_HOURS: u64 = 24;
 
+/// Seconds per hour and per day — the units the windows above are stated in,
+/// named once so no magic number drifts.
+const SECS_PER_HOUR: u64 = 3_600;
+const SECS_PER_DAY: u64 = 86_400;
+
 /// Why a build is kept.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Keep {
@@ -196,7 +204,7 @@ pub enum Keep {
 /// nothing (that is how a deleted worktree's builds become collectable).
 pub fn referenced(store: &Store) -> std::collections::HashMap<String, String> {
     let mut refs = std::collections::HashMap::new();
-    for dir in ["channels", "tags", "bleeding-edge", "sources"] {
+    for &dir in POINTER_DIRS {
         for (name, p) in list(store, dir) {
             let alive = match p.get("root") {
                 Some(root) if dir == "bleeding-edge" || dir == "sources" => Path::new(root).exists(),
@@ -210,19 +218,27 @@ pub fn referenced(store: &Store) -> std::collections::HashMap<String, String> {
     refs
 }
 
-/// Build ids a live daemon serves, from the runtime dir's `<tree>-<build>.sock`.
+/// Build ids a live daemon serves, from a runtime-dir socket name.
 fn daemon_builds() -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     let Some(dir) = runtime_dir() else { return out };
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
-            let n = e.file_name().to_string_lossy().into_owned();
-            if let Some((_, b)) = n.strip_suffix(".sock").and_then(|s| s.rsplit_once('-')) {
+            if let Some(b) = build_from_sock(&e.file_name().to_string_lossy()) {
                 out.insert(b.to_string());
             }
         }
     }
     out
+}
+
+/// The build a daemon socket names: the segment after the LAST '-' before
+/// `.sock`. Generic over both `<endpoint-key>-<build>` names — a tree id and
+/// the shared `warm` key both carry no '-' — so `warm-3ffa4c3a.sock` names
+/// `3ffa4c3a` exactly as `<tree-id>-3ffa4c3a.sock` does. `None` for a legacy
+/// `<tree-id>.sock` (no build) or a non-socket file.
+fn build_from_sock(name: &str) -> Option<&str> {
+    name.strip_suffix(".sock")?.rsplit_once('-').map(|(_, build)| build)
 }
 
 /// Build ids some process runs from: an executable or a mapped file under
@@ -273,7 +289,7 @@ fn touch_used(dir: &Path) {
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
-        .is_some_and(|age| age < std::time::Duration::from_secs(3_600));
+        .is_some_and(|age| age < std::time::Duration::from_secs(SECS_PER_HOUR));
     if !fresh {
         let _ = std::fs::write(&stamp, b"");
     }
@@ -326,10 +342,10 @@ pub fn gc_by_reference(install: &Path, in_use: &str, dry_run: bool) -> Vec<GcRow
         daemons: daemon_builds(),
         running: running_builds(install),
         now: std::time::SystemTime::now(),
-        grace: std::time::Duration::from_secs(hours_env("BL_DROP_GRACE_HOURS", DEFAULT_GRACE_HOURS) * 3_600),
-        recent: std::time::Duration::from_secs(hours_env("BL_DROP_KEEP_DAYS", DEFAULT_RECENT_DAYS) * 86_400),
+        grace: std::time::Duration::from_secs(hours_env("BL_DROP_GRACE_HOURS", DEFAULT_GRACE_HOURS) * SECS_PER_HOUR),
+        recent: std::time::Duration::from_secs(hours_env("BL_DROP_KEEP_DAYS", DEFAULT_RECENT_DAYS) * SECS_PER_DAY),
     };
-    let tmp_window = std::time::Duration::from_secs(TMP_KEEP_HOURS * 3_600);
+    let tmp_window = std::time::Duration::from_secs(TMP_KEEP_HOURS * SECS_PER_HOUR);
 
     let mut rows = vec![];
     let Ok(rd) = std::fs::read_dir(install) else { return rows };
@@ -440,10 +456,10 @@ fn maintenance(argv: &[String], t: &Trailer, sha8: &str) -> ! {
     }
 }
 
-/// Try the warm daemon. Returns `Some(exit_code)` when the command was served
-/// (or lost after send — unknown outcome, exit 1), or `None` to fall back to a
-/// cold `bin/bl` boot. With `BL_DAEMON=auto`, a missing daemon is auto-started
-/// from `bin/bl daemon start` (detached) and retried once.
+/// Try the warm VM: attach when one answers for this tree, and — only under
+/// `Transport::Start` — start one (detached) and retry once. `Some(exit_code)`
+/// when the command was served (or lost after send — unknown outcome, exit 1);
+/// `None` to fall back to a cold `bin/bl` boot.
 
 /// `bl` is THIS executable — the launcher. The release's own `bin/bl` is a
 /// different program with a different command surface (`start`, `daemon`,
@@ -453,8 +469,8 @@ fn maintenance(argv: &[String], t: &Trailer, sha8: &str) -> ! {
 /// instead of looking up `bl` on a PATH where, inside a drop, the first match
 /// can be the release script itself.
 ///
-/// The failure it prevents, seen for real: `bl gateway start` in an installed
-/// drop detached `setsid <payload>/bin/bl gateway run`, and the release script
+/// The failure it prevents, seen for real: `bl vm start gateway` in an installed
+/// drop detached `setsid <payload>/bin/bl vm start gateway --foreground`, and the release script
 /// answered `Usage: bl COMMAND … ERROR: Unknown command gateway`.
 fn self_bl() -> std::path::PathBuf {
     std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bl"))
@@ -470,15 +486,14 @@ fn after_attach(a: Attach) -> Option<i32> {
     match a {
         Attach::Exit(code) => Some(code),
         Attach::LostAfterSend => {
-            eprintln!("bl: daemon connection lost mid-command; outcome unknown");
+            eprintln!("bl: warm VM connection lost mid-command; outcome unknown");
             Some(1)
         }
         Attach::Stalled(secs) => {
             eprintln!(
-                "bl: the daemon has sent nothing for {secs}s, but the connection is still open \
-                 — the command is probably still running, and it is NOT re-run here \
-                 (outcome unknown). Raise BL_DAEMON_READ_TIMEOUT to wait longer, or run it \
-                 cold with BL_DAEMON=off to see it through."
+                "bl: the warm VM has sent nothing — not even its heartbeat — for {secs}s, so it \
+                 is unresponsive. The command may still be running there, and it is NOT re-run \
+                 here (outcome unknown). Run `bl vm` to see it, or `bl vm stop` to end it."
             );
             Some(1)
         }
@@ -486,11 +501,11 @@ fn after_attach(a: Attach) -> Option<i32> {
     }
 }
 
-fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path) -> Option<i32> {
+fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path, t: Transport, shared: bool) -> Option<i32> {
     let cwd = std::env::current_dir().ok()?;
-    let root = resolve_root(&cwd)?;
+    let root = tree_root(&cwd, argv)?;
 
-    match try_attach(&root, argv) {
+    match try_attach(&root, argv, shared) {
         Attach::Exit(code) => Some(code),
         a @ (Attach::LostAfterSend | Attach::Stalled(_)) => after_attach(a),
         Attach::RestartRequired => {
@@ -498,73 +513,77 @@ fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path) -> Option<i32> {
             // Say so: a daemon that vanishes without a word looks like a command
             // that failed for no reason, and the next command pays a cold boot.
             eprintln!(
-                "bl: the daemon for this tree was started from a different build; \
+                "bl: the warm VM for this tree was started from a different build; \
                  stopping it and running this command cold"
             );
-            let _ = std::process::Command::new(bin)
-                .arg("eval")
-                .arg("BeamLisp.Ns.Bl.Cli.main([\"daemon\",\"stop\"])")
-                .env("BL_DAEMON_ROOT", &root)
-                .env("BL_BIN", self_bl())
-                .status();
-            if autostart_enabled() {
-                start_daemon_detached(bin, &root);
-                if wait_ready(&root) {
-                    return match try_attach(&root, argv) {
-                        Attach::Exit(code) => Some(code),
-                        other => after_attach(other),
-                    };
-                }
-            }
-            None
+            stop_daemon(bin, &root);
+            retry_from_warm(bin, &root, argv, t, shared)
         }
-        Attach::Fallback => {
-            if autostart_enabled() {
-                start_daemon_detached(bin, &root);
-                if wait_ready(&root) {
-                    return match try_attach(&root, argv) {
-                        Attach::Exit(code) => Some(code),
-                        other => after_attach(other),
-                    };
-                }
-            }
-            None
-        }
+        Attach::Fallback => retry_from_warm(bin, &root, argv, t, shared),
     }
 }
 
+/// When the transport permits Start, kick off a warm VM and return `None` so
+/// the caller runs THIS command cold, right now. The start is NEVER awaited: a
+/// boot the command did not ask to wait for must not delay it, and a start that
+/// fails costs it nothing. Only the first starter acts — `claim_start` keeps a
+/// second from spawning a duplicate VM for the same endpoint.
 #[cfg(unix)]
-fn autostart_enabled() -> bool {
-    std::env::var("BL_DAEMON").map(|v| v == "auto").unwrap_or(false)
+fn retry_from_warm(bin: &std::path::Path, root: &std::path::Path, _argv: &[String], t: Transport, shared: bool) -> Option<i32> {
+    if t != Transport::Start {
+        return None;
+    }
+    if let Some(ep) = endpoints(root, shared) {
+        if claim_start(&ep.starting, now_secs(), START_GRACE_SECS) {
+            start_daemon_detached(bin, root, &build_id(), shared);
+        }
+    }
+    None
 }
 
-/// Spawn `bin/bl daemon start` fully detached so it outlives this launcher.
+/// Stop the warm VM for `root` by asking the release, which owns the lifecycle.
 #[cfg(unix)]
-fn start_daemon_detached(bin: &std::path::Path, root: &std::path::Path) {
-    use std::process::Stdio;
-    let _ = std::process::Command::new(bin)
-        .arg("eval")
-        .arg("BeamLisp.Ns.Bl.Cli.main([\"daemon\",\"start\"])")
-        .env("BL_DAEMON_ROOT", root)
-        .env("BL_BIN", self_bl())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+fn stop_daemon(bin: &std::path::Path, root: &std::path::Path) {
+    let mut cmd = release_command(bin);
+    cmd.args(warm_stop_argv(root));
+    let _ = cmd.status();
+}
+
+/// A release invocation: `bin/bl eval <CLI_ENTRY> <argv…>`. Trailing args land
+/// in `System.argv()` verbatim — the one handoff both `exec_payload` and the
+/// lifecycle helpers use, so the entry expression is spelled once.
+fn release_command(bin: &std::path::Path) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.arg("eval").arg(CLI_ENTRY).env("BL_BIN", self_bl());
+    cmd
 }
 
 /// Poll for an authenticated-reachable daemon, up to a startup deadline.
 #[cfg(unix)]
-fn wait_ready(root: &std::path::Path) -> bool {
+fn wait_ready(root: &std::path::Path, shared: bool) -> bool {
     for _ in 0..600 {
         // 600 * 200ms = 120s
-        if daemon_ready(root) {
+        if daemon_ready(root, shared) {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
     false
 }
+
+/// The launcher's own verbs, spelled once. They answer questions about WHICH build runs, which only
+/// the launcher knows, so they are handled before any build is resolved or started. `bl help` lists
+/// them, and `test/bl/bl_transport_test.bl` reads this table from the source and pins it equal to the
+/// CLI's list (`bl.cli/LAUNCHER-VERBS`), so the launcher, the help and the docs cannot drift.
+pub const VERB_WHICH: &str = "which";
+pub const VERB_SELF_UPDATE: &str = "self-update";
+pub const VERB_SELF_INSTALL: &str = "self-install";
+pub const VERB_SELF_GC: &str = "self-gc";
+pub const VERB_HOOKS: &str = "hooks";
+pub const VERB_MAINTENANCE: &str = "maintenance"; // a DROP's own verb (it carries the payload)
+
+/// Every verb the PATH launcher answers itself, in the order `bl help` lists them.
+pub const LAUNCHER_VERBS: &[&str] = &[VERB_WHICH, VERB_SELF_UPDATE, VERB_SELF_INSTALL, VERB_SELF_GC, VERB_HOOKS];
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -576,7 +595,7 @@ fn main() {
     match try_read_trailer(&me) {
         Some(t) => {
             let sha8 = sha8_of(&t);
-            if argv.first().map(String::as_str) == Some("maintenance") {
+            if argv.first().map(String::as_str) == Some(VERB_MAINTENANCE) {
                 maintenance(&argv[1..], &t, &sha8);
             }
             run_build(&me, &t, &argv)
@@ -595,12 +614,11 @@ fn resolving_main(me: &std::path::Path, argv: &[String]) -> ! {
     let verb = verb_of(argv);
     let rest: Vec<String> = verb_index(argv).map(|i| argv[i + 1..].to_vec()).unwrap_or_default();
     match verb.as_deref() {
-        Some("which") => which(&store, &cwd, me),
-        Some("self-update") => finish(self_update(&store, rest.first().map(String::as_str), me, &cwd).map_err(bl_err)),
-        Some("self-install") => finish(self_install(me, &rest, &cwd).map_err(bl_err)),
-        Some("self-gc") => finish(self_gc(&rest).map_err(bl_err)),
-        Some("hooks") if rest.first().map(String::as_str) == Some("drain") => finish(drain(&store, me).map_err(bl_err)),
-        Some("hooks") => finish(hooks_verb(&store, &rest, me, &cwd).map_err(bl_err)),
+        Some(VERB_WHICH) => which(&store, &cwd, me),
+        Some(VERB_SELF_UPDATE) => finish(self_update(&store, rest.first().map(String::as_str), me, &cwd).map_err(bl_err)),
+        Some(VERB_SELF_INSTALL) => finish(self_install(me, &rest, &cwd).map_err(bl_err)),
+        Some(VERB_SELF_GC) => finish(self_gc(&rest).map_err(bl_err)),
+        Some(VERB_HOOKS) => finish(hooks_verb(&store, &rest, me, &cwd).map_err(bl_err)),
         _ => {}
     }
 
@@ -637,7 +655,7 @@ fn resolving_main(me: &std::path::Path, argv: &[String]) -> ! {
             run_build(&path, &t, argv)
         }
         Target::SourceMode(root) => {
-            let bin = root.join("bin/bl");
+            let bin = root.join(LAUNCHER_REL);
             let mut cmd = Command::new(&bin);
             cmd.args(argv).env("BL_BIN", me).env_remove("BL_BUILD_ID");
             exec_or_fail(cmd, &bin)
@@ -713,7 +731,7 @@ fn run_build(file: &std::path::Path, t: &Trailer, argv: &[String]) -> ! {
 /// carries `BUILD_INFO.bl` does (one stat); an older one is asked by reading
 /// its `vm.paths` source for `build-id`.
 fn names_its_build(dest: &std::path::Path) -> bool {
-    if dest.join("BUILD_INFO.bl").is_file() {
+    if dest.join(BUILD_INFO_FILE).is_file() {
         return true;
     }
     std::fs::read_dir(dest.join("lib"))
@@ -725,6 +743,38 @@ fn names_its_build(dest: &std::path::Path) -> bool {
             std::fs::read_to_string(e.path().join("priv/std/vm/paths.bl"))
                 .is_ok_and(|t| t.contains("(defn build-id"))
         })
+}
+
+/// What a payload can do is read from its own `vm` sources, the way
+/// `names_its_build` reads an older one: the launcher outlives the payloads it runs.
+const VM_SOURCE_DIR: &str = "priv/std/vm";
+/// The rule a payload carries when its VM can serve many projects. An older payload
+/// binds per-tree sockets only, so a project that asks to share must be given its own
+/// VM there: the shared socket name would be one nobody binds.
+const SHARED_VM_MARKER: &str = "(defn shared?";
+/// The file a payload carries when its warm VM leaves by itself after idling. A VM
+/// started from a payload without it would live until someone stopped it.
+const IDLE_EXIT_FILE: &str = "idle.bl";
+
+/// The text of `priv/std/vm/<file>` in the payload at `dest`, if it has one.
+fn payload_vm_source(dest: &std::path::Path, file: &str) -> Option<String> {
+    std::fs::read_dir(dest.join("lib"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("beam_lisp-"))
+        .find_map(|e| std::fs::read_to_string(e.path().join(VM_SOURCE_DIR).join(file)).ok())
+}
+
+/// Whether the payload at `dest` can host a shared VM.
+fn supports_shared_vm(dest: &std::path::Path) -> bool {
+    payload_vm_source(dest, "paths.bl").is_some_and(|t| t.contains(SHARED_VM_MARKER))
+}
+
+/// Whether the payload at `dest` can be started in the background without leaving a
+/// VM that never ends.
+fn supports_background_start(dest: &std::path::Path) -> bool {
+    payload_vm_source(dest, IDLE_EXIT_FILE).is_some()
 }
 
 fn exec_or_fail(mut cmd: Command, bin: &std::path::Path) -> ! {
@@ -758,71 +808,95 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
     touch_used(dest);
     let argv = argv.to_vec();
 
-    let bin = dest.join(if cfg!(windows) { r"bin\bl.bat" } else { "bin/bl" });
+    let bin = dest.join(if cfg!(windows) { r"bin\bl.bat" } else { LAUNCHER_REL });
 
-    // ── daemon fast-path (unix) ──────────────────────────────────────────────
-    // A warm global daemon serves the command over a socket in ~30ms instead of
-    // a ~1.2s cold VM boot. Skipped only when BL_DAEMON=off and for the `bl
-    // daemon` lifecycle verbs (which must reach the release). Every other verb —
-    // including repl/serve/mcp/gateway and `bl watch` — runs in its own VM
-    // process under the daemon (PLAN-121), so nothing is exiled to a cold VM to
-    // avoid parking a serial worker: there is no serial worker.
+    // ── warm-VM fast path (unix) ────────────────────────────────────────────
+    // A warm VM serves the command over a socket in ~30ms instead of a ~1.2s
+    // cold boot. The transport is DECLARED — `--cold` / `--warm`, the tree's
+    // `env.bl :warm`, the config, then DEFAULT_TRANSPORT — never read from the
+    // environment. Cold skips both this path and the start handoff; lifecycle
+    // verbs (`realm`, `vm`) never attach, because they talk to the VM
+    // themselves. Every other verb — including repl/serve/mcp and
+    // `bl watch` — runs in its own VM process under the warm one (PLAN-121), so
+    // nothing is exiled to a cold VM to avoid parking a serial worker: there is
+    // no serial worker.
     #[cfg(unix)]
     {
-        let mode = std::env::current_dir()
-            .ok()
-            .as_deref()
-            .and_then(resolve_root)
-            .map(|r| daemon_mode(&r))
-            .unwrap_or(DaemonMode::Auto);
-        let off = mode == DaemonMode::Off;
-        let verb = verb_of(&argv);
-        let is_lifecycle = verb.as_deref() == Some("daemon");
-        // PLAN-121/123: NO verb is exiled to a cold VM. A long-lived command
-        // (repl, serve, mcp, gateway, lsp serve) is just a process under its
-        // VM's capped env — the single serial worker it would have parked is
-        // gone. Only `bl daemon` lifecycle verbs still reach the release path.
-
-        // `bl daemon start` is a REQUEST for a daemon, not a command to run
+        let cwd = std::env::current_dir().ok();
+        let root = cwd.as_deref().and_then(|c| tree_root(c, &argv));
+        // Read the project's env.bl ONCE: `--share-vm`/`--own-vm` or the `:vm`
+        // declaration decides the endpoint for this whole invocation (the default
+        // is own). The declaration is read from the nearest env.bl at or above
+        // where the command ran (an explicit --root names that directory instead),
+        // not from the engine-checkout root: a command typed in a subdirectory of
+        // a shared project must still see `:vm "shared"`.
+        let declared_at = match root_override(&argv) {
+            Some(r) => Some(r),
+            None => cwd.as_deref().and_then(project_dir),
+        };
+        let env_bl = declared_at.and_then(|d| std::fs::read_to_string(d.join(PROJECT_FILE)).ok());
+        let shared = shared_for(&argv, env_bl.as_deref()) && supports_shared_vm(dest);
+        // Whether the project shares its VM decides the DEFAULT transport (an own
+        // VM attaches, a shared one starts); anything the user declared still wins.
+        let t = effective_transport(
+            root.as_deref().map(|r| transport(r, &argv, shared)).unwrap_or_else(|| default_transport(shared)),
+            supports_background_start(dest),
+        );
+        let is_lifecycle = verb_of(&argv).as_deref().is_some_and(|v| LIFECYCLE_VERBS.contains(&v));
+        // `bl realm start` is a REQUEST for a warm VM, not a command to run
         // inside one. Exec'd, the release parks in the foreground and dies with
-        // the shell that asked for it — while the verb's own docstring (and
-        // docs/bl/03) says the launcher runs it detached, which is what makes
-        // `bl daemon start && bl run …` mean anything. So detach here and
-        // return: the daemon outlives this process, and the caller learns
-        // whether it actually came up. `BL_DAEMON=off` keeps the old
-        // foreground behavior: ask for no daemon and you get none.
-        if !off && daemon_start_requested(&argv) {
-            let cwd = std::env::current_dir().ok();
-            if let Some(root) = cwd.as_deref().and_then(resolve_root) {
-                if daemon_ready(&root) {
-                    println!("bl: daemon already running for this tree");
-                    std::process::exit(0);
-                }
+        // the shell that asked for it — so detach here and return: the VM
+        // outlives this process, and the caller learns whether it actually came
+        // up.
+        if t != Transport::Cold {
+            if start_requested(&argv) {
+                if let Some(root) = root.as_deref() {
+                    if daemon_ready(root, shared) {
+                        println!("bl: a warm VM is already running for this tree");
+                        std::process::exit(0);
+                    }
 
-                start_daemon_detached(&bin, &root);
+                    // The explicit request goes through the SAME start as the
+                    // automatic one, so it lands in the same log; it claims the
+                    // marker too, so a start already in flight is WAITED for,
+                    // not duplicated. This is the one caller that does wait:
+                    // the user asked for a warm VM and is owed the outcome.
+                    let log = log_path(root, &build_id(), shared);
+                    let claimed = endpoints(root, shared)
+                        .is_some_and(|e| claim_start(&e.starting, now_secs(), START_GRACE_SECS));
+                    if claimed {
+                        start_daemon_detached(&bin, root, &build_id(), shared);
+                    }
 
-                if wait_ready(&root) {
-                    println!("bl: daemon started — commands for this tree are now warm");
-                    std::process::exit(0);
+                    if wait_ready(root, shared) {
+                        println!("bl: warm VM started — commands for this tree are now warm");
+                        std::process::exit(0);
+                    }
+                    match log {
+                        Some(p) => {
+                            eprintln!("bl: the warm VM did not become ready — its log: {}", p.display());
+                            eprintln!("bl: read it with `bl vm logs` once the VM is listed (`bl vm`).");
+                        }
+                        None => eprintln!(
+                            "bl: the warm VM did not become ready (no log path; set XDG_STATE_HOME or HOME)"
+                        ),
+                    }
+                    std::process::exit(1);
                 }
-                eprintln!("bl: daemon did not become ready (see `bl daemon status`)");
-                std::process::exit(1);
             }
-        }
-
-        if !off && !is_lifecycle {
-            if let Some(code) = maybe_attach_daemon(&argv, &bin) {
-                std::process::exit(code);
+            if !is_lifecycle {
+                if let Some(code) = maybe_attach_daemon(&argv, &bin, t, shared) {
+                    std::process::exit(code);
+                }
             }
         }
     }
 
-    let mut cmd = Command::new(&bin);
-    cmd.env("BL_BIN", self_bl());
     // Trailing args after `eval EXPR` land in System.argv() verbatim
     // (verified: bin/bl eval passes "$@" through as erl -extra). A `--`
     // would leak into argv, so it is NOT added here.
-    cmd.arg("eval").arg(CLI_ENTRY).args(&argv);
+    let mut cmd = release_command(&bin);
+    cmd.args(&argv);
     exec_or_fail(cmd, &bin)
 }
 
@@ -832,6 +906,37 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
 mod gc_tests {
     use super::*;
 
+    fn payload_with_paths(tag: &str, paths_bl: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("drop-shared-probe-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let dir = d.join("lib/beam_lisp-0.1.0/priv/std/vm");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("paths.bl"), paths_bl).unwrap();
+        d
+    }
+
+    #[test]
+    fn only_a_payload_whose_vm_idles_out_can_be_started_in_the_background() {
+        let with = payload_with_paths("idle-yes", "(defn build-id [] \"x\")\n");
+        std::fs::write(with.join("lib/beam_lisp-0.1.0/priv/std/vm/idle.bl"), "(ns vm.idle)\n").unwrap();
+        let without = payload_with_paths("idle-no", "(defn build-id [] \"x\")\n");
+        assert!(supports_background_start(&with));
+        assert!(!supports_background_start(&without), "no idle.bl: it would never end");
+        let _ = std::fs::remove_dir_all(&with);
+        let _ = std::fs::remove_dir_all(&without);
+    }
+
+    #[test]
+    fn a_payload_that_can_host_a_shared_vm_says_so_in_its_paths() {
+        let new = payload_with_paths("new", "(defn shared? [root build] false)\n");
+        let old = payload_with_paths("old", "(defn build-id [] \"src\")\n");
+        assert!(supports_shared_vm(&new));
+        assert!(!supports_shared_vm(&old), "an older payload binds per-tree sockets only");
+        assert!(!supports_shared_vm(&std::env::temp_dir().join("drop-no-such-payload")));
+        let _ = std::fs::remove_dir_all(&new);
+        let _ = std::fs::remove_dir_all(&old);
+    }
+
     /// `maintenance meta` names the target; every name parses back to its tags.
     #[test]
     fn target_name_is_the_inverse_of_parse_target() {
@@ -840,6 +945,16 @@ mod gc_tests {
             assert_eq!(target_name(o, a), t);
         }
         assert_eq!(target_name(9, 9), "os9/arch9");
+    }
+
+    /// A daemon socket names its build after the LAST '-', so both the shared
+    /// `warm-<build>` and the per-checkout `<tree-id>-<build>` names parse.
+    #[test]
+    fn a_socket_names_its_build_after_the_last_dash() {
+        assert_eq!(build_from_sock("warm-3ffa4c3a.sock"), Some("3ffa4c3a"));
+        assert_eq!(build_from_sock("57461829a20cc2af-3ffa4c3a.sock"), Some("3ffa4c3a"));
+        assert_eq!(build_from_sock("57461829a20cc2af.sock"), None, "a legacy tree socket names no build");
+        assert_eq!(build_from_sock("warm-3ffa4c3a.token"), None);
     }
 
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -876,8 +991,8 @@ mod gc_tests {
             daemons: ["dddddddd".to_string()].into(),
             running: ["rrrrrrrr".to_string()].into(),
             now: std::time::SystemTime::now(),
-            grace: std::time::Duration::from_secs(24 * 3_600),
-            recent: std::time::Duration::from_secs(14 * 86_400),
+            grace: std::time::Duration::from_secs(24 * SECS_PER_HOUR),
+            recent: std::time::Duration::from_secs(14 * SECS_PER_DAY),
         }
     }
 
@@ -886,7 +1001,7 @@ mod gc_tests {
     #[test]
     fn only_an_unheld_unused_build_goes() {
         let f = facts();
-        let ago = |days: u64| Some(f.now - std::time::Duration::from_secs(days * 86_400));
+        let ago = |days: u64| Some(f.now - std::time::Duration::from_secs(days * SECS_PER_DAY));
         assert_eq!(keep_reason("cccccccc", ago(400), &f), Some(Keep::InUse));
         assert_eq!(keep_reason("pppppppp", ago(400), &f), Some(Keep::Pointed("channels/stable".into())));
         assert_eq!(keep_reason("dddddddd", ago(400), &f), Some(Keep::Daemon));
@@ -904,9 +1019,9 @@ mod gc_tests {
         let store = Store { root: install.clone() };
         let live = install.join("live-wt");
         std::fs::create_dir_all(&live).unwrap();
-        store.write("channels/stable", &Pointer::new("11111111")).unwrap();
-        store.write("bleeding-edge/a", &Pointer::new("22222222").with("root", &live.to_string_lossy())).unwrap();
-        store.write("bleeding-edge/b", &Pointer::new("33333333").with("root", "/no/such/worktree")).unwrap();
+        store.write(&store.channel_key("stable"), &Pointer::new("11111111")).unwrap();
+        store.write(&store.bleeding_edge_key("a"), &Pointer::new("22222222").with("root", &live.to_string_lossy())).unwrap();
+        store.write(&store.bleeding_edge_key("b"), &Pointer::new("33333333").with("root", "/no/such/worktree")).unwrap();
         let refs = referenced(&store);
         assert!(refs.contains_key("11111111"));
         assert!(refs.contains_key("22222222"));
@@ -936,11 +1051,11 @@ mod gc_tests {
         std::fs::write(dest.join("lib/partial.beam"), b"half").unwrap();
         // the finished staging tree
         std::fs::create_dir_all(tmp.join("bin")).unwrap();
-        std::fs::write(tmp.join("bin/bl"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(tmp.join(LAUNCHER_REL), b"#!/bin/sh\n").unwrap();
 
         publish(&tmp, &dest).expect("debris must not be fatal");
 
-        assert!(dest.join("bin/bl").is_file(), "the complete tree is published");
+        assert!(dest.join(LAUNCHER_REL).is_file(), "the complete tree is published");
         assert!(!tmp.exists(), "the staging tree moves, not copies");
         assert!(
             !dest.join("lib/partial.beam").exists(),
@@ -959,14 +1074,14 @@ mod gc_tests {
         let tmp = dir.join("c94bd7eb.tmp-4321");
 
         std::fs::create_dir_all(dest.join("bin")).unwrap();
-        std::fs::write(dest.join("bin/bl"), b"winner\n").unwrap();
+        std::fs::write(dest.join(LAUNCHER_REL), b"winner\n").unwrap();
         std::fs::create_dir_all(tmp.join("bin")).unwrap();
-        std::fs::write(tmp.join("bin/bl"), b"loser\n").unwrap();
+        std::fs::write(tmp.join(LAUNCHER_REL), b"loser\n").unwrap();
 
         publish(&tmp, &dest).expect("losing the race is not failure");
 
         assert_eq!(
-            std::fs::read(dest.join("bin/bl")).unwrap(),
+            std::fs::read(dest.join(LAUNCHER_REL)).unwrap(),
             b"winner\n",
             "the published tree is left exactly as the winner wrote it"
         );

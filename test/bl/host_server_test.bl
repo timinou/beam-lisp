@@ -1,0 +1,890 @@
+; host_server_test.bl — the pinned ABI for `BeamLisp.Server`.
+;
+; `priv/host/server.bl` is ONE pinned source that
+; `BeamLisp.AOT/compile_host_file` compiles at an exact atom with NO compile
+; options (functions-only — no struct to synthesize, no behaviour to record, no
+; macro to export):
+;
+;     :module <atom>   :output_dir <dir>   :file priv/host/server.bl
+;     :source_hash <sha256>   :load? false
+;
+; The running `Elixir.BeamLisp.Server` (still `lib/beam_lisp/server.ex`) is the
+; ground truth, so the suite is DIFFERENTIAL: one corpus of observations runs
+; through a probe compiled from the pinned source and through the live module,
+; and the two answer sets must be equal — values, exception CLASSES and
+; MESSAGES.
+;
+; What each block pins:
+;   * SURFACE — the pinned beam's exports against the live module's: the
+;     sixteen public functions and NOTHING else. The five private helpers
+;     (`convey_arg`, `unwrap`, `server_name`, `gen_opts`, `resolve`) must NOT
+;     escape as exports, because the live module's are private — a pinned
+;     file's top-level defns ARE its exports, which is why the port rebuilds
+;     each helper as a local closure.
+;   * MODULE NAMES — `module_for/2`, the `Module.concat` scheme `defserver`
+;     lowers onto. Binaries, the degenerate separators (`.` itself, `..`, empty
+;     segments), and the two `ArgumentError` segments a non-binary operand
+;     raises ("segment 1" for `ns`, "segment 3" for `name`).
+;   * THE CALLBACK VOCABULARY — `callback/1` clause for clause, `nil` for a name
+;     that is not one, and `callback_order/0`.
+;   * THE RETURN CONSTRUCTORS — all seven, at every arity, INVOKED (the two
+;     modules' funs are different funs, so the shape and the answer are what
+;     can be compared): `ok`, `reply`, `noreply`, `stop`, and the timeout-slot
+;     `ignore`/`hibernate`/`continue`.
+;   * THE ENV CONVEYANCE — `bind_init/1`'s wrap/passthrough, and a bad token
+;     crossing to `Env.bind/1` as the same refusal.
+;   * LIVE SERVERS — isolated registered names (`bl_host_server_*`), over a REAL
+;     `defserver`: a synchronous call, an asynchronous cast observed through
+;     `:sys.get_state`, a call timeout at the `call/3` the caller asked for, a
+;     CRASH whose exact exit reason the caller sees, and `stop`. Each run starts
+;     and STOPS every process it makes.
+;   * CHILD SPECS — the `%{__supervisor__: true}` `defsupervisor` dispatch
+;     delegated to `BeamLisp.Supervisor`, and a defserver started AS a
+;     supervised child through `BeamLisp.Supervisor.server/4` ->
+;     `start_server/3` -> `BeamLisp.Server.start_link/3`.
+;   * NAMES AS VALUES — `resolve/1`'s registry path: a two-element
+;     `BeamLisp.Vector` naming a running registry and a key resolves to the
+;     registered pid; an unstarted registry and a missing key are the two live
+;     `ArgumentError`s; anything else passes through untouched.
+;   * the pinned beam STANDING IN at the production atom, exercised, then the
+;     live beam RESTORED.
+;
+; The observation is normalized on two axes only:
+;   * the PROBE ATOM (`BeamLisp.HostServerProbe` → `BeamLisp.Server`) in a
+;     message, in an atom field and in a `FunctionClauseError`'s `module`;
+;   * PIDS and REFERENCES → `:pid` / `:ref`, and the corpus's own REGISTERED
+;     NAMES (`bl_host_server_*`) → `:bl_host_server_name`, because a fresh
+;     process per run cannot be compared by identity.
+; Everything else compares raw.
+;
+; Nothing here renames, stops or restarts the LIVE process the runtime owns:
+; `BeamLisp.Server` is a FUNCTIONS module, not a process, and every server this
+; suite starts is its own, named `bl_host_server_*`, and stopped before the
+; block that started it returns.
+;
+; Run: bin/bl test test/bl/host_server_test.bl
+
+(ns host.server.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_server_" (erlang/unique_integer (list :positive))))
+
+(defn- src [] (Path/join (BeamLisp/cwd) "priv/host/server.bl"))
+
+(def ^:private probe :Elixir.BeamLisp.HostServerProbe)
+(def ^:private shim :Elixir.BeamLisp.Ns.Host.Server)
+(def ^:private live :Elixir.BeamLisp.Server)
+
+; The two names the corpus registers its servers under. They belong to THIS
+; suite and to no other process, which is what keeps a probe run and a live run
+; — and both of them and the real runtime — out of each other's way.
+(def ^:private child-name :bl_host_server_child)
+(def ^:private reg-name :bl_host_server_registry)
+
+; ── a REAL defserver, so the client verbs are exercised against OTP ──────────
+;
+; `BeamLisp.Server` exists to serve modules like this one: its generated
+; callbacks return the constructors `return_constructors/0` binds, and its
+; client verbs are what an application calls. Every case below starts THIS
+; server, by its own module atom, through whichever module is under test.
+
+(defserver host-server-child
+  (init [arg] (ok {:n 0 :tag arg}))
+  (handle-call :value [_from s] (reply (:n s) s))
+  (handle-call :bump [_from s] (reply (:n s) (assoc s :n (+ 1 (:n s)))))
+  (handle-call :boom [_from s]
+    (erlang/error (Elixir.RuntimeError/exception "kaboom")))
+  (handle-call :slow [_from s] (do (Process/sleep 250) (reply :slow-done s)))
+  (handle-cast :bump [s] (noreply (assoc s :n (+ 1 (:n s)))))
+  (handle-cast :bump2 [s] (noreply (assoc s :n (+ 2 (:n s)))))
+  (handle-info [_msg s] (noreply s)))
+
+; The registry `resolve/1` talks to: a `[:whereis key]` query answers the pid
+; registered under `key`, `nil` when there is none — the two facts the live
+; `resolve/1` distinguishes.
+(defserver host-server-registry
+  (init [_arg] (ok {}))
+  (handle-call [:put k p] [_from s] (reply :ok (assoc s k p)))
+  (handle-call [:whereis k] [_from s] (reply (get s k) s)))
+
+; ── compile and publish the pinned beam ─────────────────────────────────────
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- seed-opts
+  "The EXACT option list the seed's `host-opts` builds for a functions-only host
+   entry: `:module`/`:output_dir`/`:file`/`:source_hash`/`:load? false`."
+  [mod dir]
+  (list (t2 :module mod)
+        (t2 :output_dir dir)
+        (t2 :file (src))
+        (t2 :source_hash (crypto/hash :sha256 (File/read! (src))))
+        (t2 :load? false)))
+
+(defn- compile-at
+  "Compile the pinned source at exact atom `mod`, then publish ONLY the pinned
+   beam: the compile's own load (and the namespace shim it built beside it) is
+   dropped first."
+  [mod dir]
+  (let [res (BeamLisp.AOT/compile_host_file (src) (seed-opts mod dir))
+        path (elem res 1)]
+    (drop! mod)
+    (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+    (drop! shim)
+    mod))
+
+(defn- exports [mod]
+  (Enum/sort (erlang/apply mod :module_info (list :exports))))
+
+(defn- functional-exports
+  "What a pinned beam's surface is measured against: `__info__/1` is generated
+   by the Elixir compiler for every Elixir module and is NOT part of the ABI a
+   pinned (functions-only) port carries."
+  [mod]
+  (Enum/sort (filter (fn [e] (not (erlang/== :__info__ (elem e 0)))) (exports mod))))
+
+; ── normalization ─────────────────────────────────────────────────────────
+
+(defn- name-atom?
+  "A registered name THIS corpus minted — `bl_host_server_*`. The name belongs
+   to the suite, not to the run, so it is normalized rather than compared."
+  [v]
+  (and (erlang/is_atom v)
+       (String/starts_with? (Atom/to_string v) "bl_host_server_")))
+
+(defn- norm-str
+  "The probe atom the pinned emitter names in a message."
+  [s]
+  (String/replace s "BeamLisp.HostServerProbe" "BeamLisp.Server"))
+
+(defn- scrub
+  "The observation with the by-design differences erased: the probe atom becomes
+   the production atom, a registered name becomes `:bl_host_server_name`, a
+   fresh pid `:pid` and a fresh reference `:ref`. The walk is structural — maps
+   and tuples included, structs included — because a crash reason carries a pid,
+   a registered name AND a stacktrace. Maps are walked through the `:maps` BIFs
+   rather than `Enum`, which refuses a struct."
+  [v]
+  (cond
+    (erlang/is_map v)
+    (maps/from_list
+      (Enum/map (maps/to_list v)
+        (fn [pair] (tuple (scrub (elem pair 0)) (scrub (elem pair 1))))))
+
+    (erlang/is_tuple v)
+    (erlang/list_to_tuple (Enum/map (erlang/tuple_to_list v) (fn [x] (scrub x))))
+
+    (erlang/is_list v) (Enum/map v (fn [x] (scrub x)))
+
+    (erlang/== v :"Elixir.BeamLisp.HostServerProbe") :"Elixir.BeamLisp.Server"
+
+    (name-atom? v) :bl_host_server_name
+
+    (erlang/is_pid v) :pid
+
+    (erlang/is_reference v) :ref
+
+    (erlang/is_binary v) (norm-str v)
+
+    :else v))
+
+(defn- obs
+  "`[:ok value]` or `[:caught folded]`, normalized. The BL catch fold IS the
+   class signal: an `:error` binds its exception struct, an `:exit` binds
+   `{:exit, value}`, and a `:throw` stays raw."
+  [thunk]
+  (try (list :ok (scrub (thunk)))
+       (catch e (list :caught (scrub e)))))
+
+; ── the pure ABI corpus ───────────────────────────────────────────────────
+
+(defn- mf-cases
+  "Every `module_for/2` observation, as a LIST of thunks so the side effects run
+   in list order (`Enum/map` is left-to-right; a bare `(list …)` of already-run
+   calls would evaluate right-to-left)."
+  [mod]
+  (list
+    (fn [] (erlang/apply mod :module_for (list "user" "counter")))
+    (fn [] (erlang/apply mod :module_for (list "a.b" "c-d")))
+    (fn [] (erlang/apply mod :module_for (list "" "")))
+    (fn [] (erlang/apply mod :module_for (list "." ".")))
+    (fn [] (erlang/apply mod :module_for (list "a..b" "c")))
+    (fn [] (erlang/apply mod :module_for (list "user" "")))
+    (fn [] (erlang/apply mod :module_for (list "" "x")))
+    (fn [] (erlang/apply mod :module_for (list "x" "y.z")))
+    (fn [] (erlang/apply mod :module_for (list "host.server" "probe-child")))
+    ; NON-BINARY operands: the live `<>` builds a bitstring, so the refusal is
+    ; an ArgumentError naming the SEGMENT (1 for `ns`, 3 for `name`, the "."
+    ; being segment 2) and the offending value — never the iolist refusal a
+    ; shortcut would give, and never a silently different name.
+    (fn [] (erlang/apply mod :module_for (list nil "x")))
+    (fn [] (erlang/apply mod :module_for (list "x" nil)))
+    (fn [] (erlang/apply mod :module_for (list 5 "x")))
+    (fn [] (erlang/apply mod :module_for (list "x" (maps/new))))
+    (fn [] (erlang/apply mod :module_for (list (BeamLisp.Vector/new (list 1 2)) "x")))))
+
+(defn- cb-cases
+  [mod]
+  (list
+    (fn [] (erlang/apply mod :callback (list "init")))
+    (fn [] (erlang/apply mod :callback (list "handle-call")))
+    (fn [] (erlang/apply mod :callback (list "handle-cast")))
+    (fn [] (erlang/apply mod :callback (list "handle-info")))
+    (fn [] (erlang/apply mod :callback (list "handle-continue")))
+    (fn [] (erlang/apply mod :callback (list "terminate")))
+    (fn [] (erlang/apply mod :callback (list "code_change")))
+    (fn [] (erlang/apply mod :callback (list "handle_call")))
+    (fn [] (erlang/apply mod :callback (list "HANDLE-CALL")))
+    (fn [] (erlang/apply mod :callback (list "invariant")))
+    (fn [] (erlang/apply mod :callback (list "")))
+    (fn [] (erlang/apply mod :callback (list :init)))
+    (fn [] (erlang/apply mod :callback (list nil)))
+    (fn [] (erlang/apply mod :callback (list 7)))
+    (fn [] (erlang/apply mod :callback_order (list)))))
+
+(defn- fixed-map
+  "The arity→fn map of a `$blfn` value, checked to be the one the runtime
+   dispatches on: `{:\"$blfn\", fixed, variadic}`."
+  [value]
+  (if (and (erlang/is_tuple value)
+           (erlang/== 3 (erlang/tuple_size value))
+           (erlang/== :"$blfn" (erlang/element 1 value)))
+    (erlang/element 2 value)
+    (erlang/error (Elixir.RuntimeError/exception "not a $blfn"))))
+
+(defn- ctor-shape
+  "One constructor's OBSERVABLE shape: its variadic slot, its sorted arities,
+   and the term it answers for each arity. The funs themselves are different
+   funs in the two modules, so they are DISPATCHED THROUGH — exactly the way
+   `rt/invoke` dispatches — rather than compared."
+  [value]
+  (let [fixed (fixed-map value)
+        arities (Enum/sort (maps/keys fixed))]
+    (list (erlang/element 3 value)
+          arities
+          (Enum/map arities
+            (fn [n]
+              (let [args (if (erlang/== 0 n)
+                           (list)
+                           (Enum/map (range n) (fn [i] (tuple :arg i))))]
+                (erlang/apply (maps/get fixed n) args)))))))
+
+(defn- ctor-cases
+  [mod]
+  (Enum/map
+    (list "ok" "reply" "noreply" "stop" "ignore" "hibernate" "continue")
+    (fn [name]
+      (fn [] (ctor-shape (Map/fetch! (erlang/apply mod :return_constructors (list)) name))))))
+
+(defn- bind-cases
+  [mod]
+  (list
+    (fn [] (erlang/apply mod :bind_init (list :plain)))
+    (fn [] (erlang/apply mod :bind_init (list nil)))
+    (fn [] (erlang/apply mod :bind_init (list (maps/new))))
+    (fn [] (erlang/apply mod :bind_init (list (erlang/list_to_tuple (list :other 1 2)))))
+    (fn [] (erlang/apply mod :bind_init (list (erlang/list_to_tuple (list :"$bl_conveyed_env" 1 2 3)))))
+    ; A REAL token, captured here: the server process begins with an empty
+    ; process dictionary, so the wrap is what carries its world across.
+    (fn [] (erlang/apply mod :bind_init
+              (list (erlang/list_to_tuple
+                      (list :"$bl_conveyed_env" (BeamLisp.Env/capture) :user-arg)))))
+    ; A wrapped token that is NOT a token: the refusal is `Env.bind/1`'s, in
+    ; both modules, and it names the same module.
+    (fn [] (erlang/apply mod :bind_init
+              (list (erlang/list_to_tuple (list :"$bl_conveyed_env" :not-a-token :user-arg)))))))
+
+(defn- pure-cases [mod]
+  (concat (mf-cases mod) (cb-cases mod) (ctor-cases mod) (bind-cases mod)))
+
+(defn- pure-corpus [mod]
+  (Enum/map (pure-cases mod) (fn [th] (obs th))))
+
+; ── live servers: isolated names, caller messages, every process stopped ────
+
+(defn- in-worker
+  "Run `f` in its OWN process with `:trap_exit` set: a crashing gen_server
+   linked to the caller would otherwise take the test process down, and the
+   exit it sends is part of what the caller observes. The worker is a plain
+   `Task`, which conveys NO var environment, so `f` may only call this
+   namespace's own defns (compiled to DIRECT module calls) and read values its
+   closure CAPTURES."
+  [f]
+  (Task/await
+    (Task/async
+      (fn []
+        (Process/flag :trap_exit true)
+        (try (f) (catch e (list :worker-raised (:__struct__ e) (ex-message e))))))
+    30000))
+
+(defn- wait-for
+  "`f` until it answers non-nil, or nil after ~3s. Polling, not sleeping a fixed
+   time: a cast is a message, and a fixed sleep is a flake."
+  [f]
+  (loop [n 0]
+    (let [r (f)]
+      (cond
+        (some? r) r
+        (erlang/> n 300) nil
+        :else (do (Process/sleep 10) (recur (erlang/+ n 1)))))))
+
+(defn- wait-n
+  "Poll a live server's `:n` until it reaches `expected`, or nil."
+  [name expected]
+  (wait-for
+    (fn []
+      (if (erlang/is_pid (Process/whereis name))
+        (let [s (erlang/apply :sys :get_state (list name))]
+          (if (erlang/>= (get s :n) expected) (get s :n) nil))
+        nil))))
+
+(defn- kill!
+  "Release a name the corpus still owns: unlink (the server was started by THIS
+   worker, so an exit would otherwise be a signal) and kill. Idempotent, and
+   the reason every case below can start the next one from a clean name."
+  [name]
+  (let [p (Process/whereis name)]
+    (if (erlang/is_pid p)
+      (do (Process/unlink p) (Process/exit p :kill) (Process/sleep 20) :ok)
+      :ok)))
+
+(defn- opts-for [name] (maps/put :name name (maps/new)))
+
+(defn- sleeper
+  "A zero-arity worker body that outlives the observation, for child specs."
+  [] (fn [] (Process/sleep 60000)))
+
+(defn- caught-of
+  "Run `thunk`, answering `[:caught folded]` — the caller's view of a refusal."
+  [thunk]
+  (try (list :ok (thunk)) (catch e (list :caught e))))
+
+(defn- server-run
+  "The whole live-server corpus for ONE module, as a list of scrubbed
+   observations. `mod` is the module under test, `name`/`reg` the two
+   registered names, and `child`/`registry` the defserver modules to start;
+   every process started here is STOPPED before the next case runs, so the two
+   runs cannot interact and nothing outlives the block."
+  [mod name reg child registry]
+  (let [sync
+        (fn []
+          (let [pid (erlang/apply mod :start_link (list child 7 (opts-for name)))]
+            (try
+              (let [v0 (erlang/apply mod :call (list name :value))
+                    b (erlang/apply mod :call (list name :bump))
+                    c (erlang/apply mod :cast (list name :bump))
+                    n1 (wait-n name 1)
+                    v1 (erlang/apply mod :call (list name :value))
+                    c2 (erlang/apply mod :cast (list name :bump2))
+                    n3 (wait-n name 3)
+                    st (erlang/apply :sys :get_state (list name))
+                    stop (erlang/apply mod :stop (list name))]
+                (list (erlang/is_pid pid) v0 b c n1 v1 c2 n3 st stop
+                      (Process/whereis name)))
+              (finally (kill! name)))))
+
+        ; A start that FAILS at the OTP boundary: the module does not exist, so
+        ; `:gen_server` answers `{:error, …}` and the caller sees the live
+        ; `unwrap/1` RuntimeError rather than a silently-returned tuple.
+        bad-init
+        (fn []
+          (let [m (erlang/apply mod :module_for (list "host.server.test" "no-such-server-module"))]
+            (try
+              (list :started (erlang/apply mod :start_link (list m 1 (opts-for name))))
+              (catch e (list :caught e))
+              (finally (kill! name)))))
+
+        ; THE CRASH: the server dies with its exception and stacktrace, and the
+        ; CALLER sees an exit — not a raise, and not a reply.
+        crash
+        (fn []
+          (let [pid (erlang/apply mod :start_link (list child 1 (opts-for name)))
+                caught (caught-of (fn [] (erlang/apply mod :call (list name :boom))))]
+            (Process/sleep 30)
+            (let [gone (Process/whereis name)]
+              (kill! name)
+              (list (erlang/is_pid pid) caught (nil? gone)))))
+
+        ; `call/3` forwards the caller's timeout: a handler that outlives it
+        ; makes the CALLER exit with `{:timeout, {:gen_server, :call, …}}`, and
+        ; the server itself survives it.
+        timed
+        (fn []
+          (let [pid (erlang/apply mod :start_link (list child 1 (opts-for name)))
+                caught (caught-of (fn [] (erlang/apply mod :call (list name :slow 10))))]
+            (Process/sleep 320)
+            (let [alive (erlang/is_pid (Process/whereis name))
+                  stop (erlang/apply mod :stop (list name))]
+              (list (erlang/is_pid pid) caught alive stop))))
+
+        ; ANONYMOUS: no name in the options, so the only handle is the pid
+        ; `start/2` hands back — and `stop/2` takes it.
+        anon
+        (fn []
+          (let [pid (erlang/apply mod :start (list child :anon))]
+            (try
+              (let [v (erlang/apply mod :call (list pid :value))
+                    stopped (erlang/apply mod :stop (list pid :shutdown))]
+                (list (erlang/is_pid pid) v stopped))
+              (finally
+                (if (erlang/is_pid pid) (Process/exit pid :kill) :ok)))))
+
+        ; A NON-MAP opts is the live `server_name/1`/`gen_opts/1` catch-all: the
+        ; server still starts, anonymously — the options are simply ignored.
+        non-map-opts
+        (fn []
+          (let [pid (erlang/apply mod :start_link (list child 1 (list 1 2 3)))]
+            (try
+              (list (erlang/is_pid pid) (erlang/apply mod :call (list pid :value)))
+              (finally
+                (if (erlang/is_pid pid) (Process/exit pid :kill) :ok)))))
+
+        ; A `:name` whose value is NOT an atom is the live `case`'s
+        ; CaseClauseError — a `case` with no catch-all, refused BEFORE any
+        ; process is spawned.
+        bad-name
+        (fn []
+          (let [o (maps/put :name "a-string" (maps/new))]
+            (caught-of (fn [] (list :started (erlang/apply mod :start_link (list child 1 o)))))))
+
+        ; `%{__supervisor__: true}` is a TREE: delegated to
+        ; `BeamLisp.Supervisor.start_link/1` and answered UNWRAPPED.
+        sup-spec
+        (let [spec {:"__supervisor__" true
+                    :strategy :one-for-one
+                    :children (list (BeamLisp.Supervisor/worker :a (sleeper)))}]
+          (fn []
+            (let [pid (erlang/apply mod :start_link (list spec))]
+              (try
+                (Process/sleep 40)
+                (let [kids (Enum/sort
+                             (Enum/map (Supervisor/which_children pid) (fn [t] (elem t 0))))]
+                  (list (erlang/is_pid pid) kids (Supervisor/stop pid)))
+                (finally
+                  (if (and (erlang/is_pid pid) (Process/alive? pid)) (Supervisor/stop pid) :ok))))))
+
+        ; The SAME spec with an init arg is NOT the tree clause: it falls
+        ; through to the general one and fails at the OTP boundary.
+        sup-spec-extra-arg
+        (let [spec {:"__supervisor__" true :strategy :one-for-one :children (list)}]
+          (fn []
+            (try
+              (list :started (erlang/apply mod :start_link (list spec 7)))
+              (catch e (list :caught e))
+              (finally (kill! name)))))
+
+        ; A defserver as a SUPERVISED CHILD: `BeamLisp.Supervisor.server/4` ->
+        ; `start_server/3` -> `BeamLisp.Server.start_link/3` -> a real OTP child
+        ; under a real supervisor, addressable by its registered name.
+        child-spec
+        (fn []
+          (let [spec (BeamLisp.Supervisor/server :w child 7 (opts-for name))
+                started (Supervisor/start_link (list spec) (list (tuple :strategy :one_for_one)))]
+            (try
+              (Process/sleep 40)
+              (let [sup (elem started 1)
+                    kids (Enum/sort
+                           (Enum/map (Supervisor/which_children sup) (fn [t] (elem t 0))))
+                    v (erlang/apply mod :call (list name :value))
+                    stopped (Supervisor/stop sup)]
+                (list (elem started 0) (erlang/is_pid sup) kids v stopped))
+              (finally (kill! name)))))
+
+        ; A NAME IS A VALUE: a two-element `BeamLisp.Vector` naming a RUNNING
+        ; registry and a key resolves to the pid registered under it — and the
+        ; verbs then act on that pid.
+        registry-call
+        (fn []
+          (let [r (erlang/apply mod :start_link (list registry nil (opts-for reg)))
+                c (erlang/apply mod :start_link (list child 7 (opts-for name)))]
+            (try
+              (erlang/apply mod :call (list reg (BeamLisp.Vector/new (list :put :p c))))
+              (let [v (erlang/apply mod :call (list (BeamLisp.Vector/new (list reg :p)) :value))
+                    direct (erlang/apply mod :call (list c :value))
+                    casted (erlang/apply mod :cast (list (BeamLisp.Vector/new (list reg :p)) :bump))
+                    n1 (wait-n name 1)
+                    stopped (erlang/apply mod :stop (list (BeamLisp.Vector/new (list reg :p))))
+                    ; A registered key with NO pid under it: the live
+                    ; ArgumentError naming the [registry key] pair.
+                    missing (caught-of
+                              (fn []
+                                (erlang/apply mod :call
+                                  (list (BeamLisp.Vector/new (list reg :absent)) :value))))
+                    ; A registry that is not running at all: the OTHER live
+                    ; ArgumentError, naming the registry.
+                    unstarted (caught-of
+                                (fn []
+                                  (erlang/apply mod :call
+                                    (list (BeamLisp.Vector/new
+                                            (list :bl_host_server_no_registry :k))
+                                          :value))))]
+                (list (erlang/is_pid r) v direct casted n1 stopped missing unstarted))
+              (finally
+                (kill! name)
+                (kill! reg)))))
+
+        ; A two-element vector whose first element is NOT an atom is not a
+        ; registry name: `resolve/1` passes it through, so the refusal is
+        ; `:gen_server`'s, not ours.
+        passthrough
+        (fn []
+          (caught-of
+            (fn []
+              (list :called
+                    (erlang/apply mod :call (list (BeamLisp.Vector/new (list "nope" :k)) :value))))))
+
+        ; `cast/2` always answers nil, `stop/2` carries its reason to OTP, and
+        ; the name is released.
+        stop-reason
+        (fn []
+          (let [pid (erlang/apply mod :start_link (list child 1 (opts-for name)))
+                casted (erlang/apply mod :cast (list name :bump2))
+                stopped (erlang/apply mod :stop (list name :shutdown))]
+            (Process/sleep 30)
+            (list (erlang/is_pid pid) casted stopped (Process/whereis name))))]
+
+    (let [o0 (obs sync)
+          o1 (obs bad-init)
+          o2 (obs crash)
+          o3 (obs timed)
+          o4 (obs anon)
+          o5 (obs non-map-opts)
+          o6 (obs bad-name)
+          o7 (obs sup-spec)
+          o8 (obs sup-spec-extra-arg)
+          o9 (obs child-spec)
+          o10 (obs registry-call)
+          o11 (obs passthrough)
+          o12 (obs stop-reason)]
+      (list o0 o1 o2 o3 o4 o5 o6 o7 o8 o9 o10 o11 o12))))
+
+; ── the surface: exactly the live module's public functions ──────────────
+
+(deftest server-pinned-surface-is-the-live-module
+  (testing "exports and the seed option contract, against the live module"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (= :non_existing (erlang/apply :code :which (list shim))))
+
+      (is (erlang/function_exported live :start_link 3) "the production module is loaded")
+
+      ; Every production function remains present at the probe atom, and the
+      ; probe exports NOTHING the live module does not (minus the Elixir-
+      ; generated `__info__/1`, which a pinned functions-only beam never has).
+      (is (= () (filter (fn [e] (not (erlang/function_exported probe (elem e 0) (elem e 1))))
+                        (functional-exports live)))
+          "the pinned beam reproduces every production function")
+      (is (= (functional-exports live) (exports probe))
+          "the pinned export surface equals the live module's minus __info__/1")
+
+      ; The sixteen public functions, by name and arity.
+      (is (erlang/function_exported probe :module_for 2))
+      (is (erlang/function_exported probe :return_constructors 0))
+      (is (erlang/function_exported probe :callback 1))
+      (is (erlang/function_exported probe :callback_order 0))
+      (is (erlang/function_exported probe :bind_init 1))
+      (is (erlang/function_exported probe :start_link 1))
+      (is (erlang/function_exported probe :start_link 2))
+      (is (erlang/function_exported probe :start_link 3))
+      (is (erlang/function_exported probe :start 1))
+      (is (erlang/function_exported probe :start 2))
+      (is (erlang/function_exported probe :start 3))
+      (is (erlang/function_exported probe :call 2))
+      (is (erlang/function_exported probe :call 3))
+      (is (erlang/function_exported probe :cast 2))
+      (is (erlang/function_exported probe :stop 1))
+      (is (erlang/function_exported probe :stop 2))
+
+      ; THE LIVE MODULE'S PRIVATE HELPERS ARE NOT EXPORTS, and a pinned module
+      ; exports exactly its file's top-level defns — so none of them may appear.
+      (is (not (erlang/function_exported probe :convey_arg 1)))
+      (is (not (erlang/function_exported probe :unwrap 1)))
+      (is (not (erlang/function_exported probe :server_name 1)))
+      (is (not (erlang/function_exported probe :gen_opts 1)))
+      (is (not (erlang/function_exported probe :resolve 1)))
+
+      ; FUNCTIONS-ONLY: no `:struct_fields`, so no struct surface; no
+      ; `:behaviour`, so this is not a callback module.
+      (is (not (erlang/function_exported probe :__struct__ 0)))
+      (is (not (erlang/function_exported probe :__struct__ 1)))
+      (is (not (erlang/function_exported probe :__info__ 1)))
+
+      ; The explicit seed option contract.
+      (let [opts (seed-opts probe dir)]
+        (is (= probe (Keyword/fetch! opts :module)))
+        (is (= (src) (Keyword/fetch! opts :file)))
+        (is (= false (Keyword/fetch! opts :load?)))
+        (is (erlang/is_binary (Keyword/fetch! opts :source_hash))))
+
+      ; REPRODUCIBLE: the same source compiled again is the same bytes. The
+      ; seed records a sha256 per host beam and `seed/check` re-derives it, so
+      ; a non-deterministic emitter would make the committed floor
+      ; unverifiable.
+      (let [again (tmp-dir)
+            again-beam (elem (BeamLisp.AOT/compile_host_file (src) (seed-opts probe again)) 1)]
+        (is (= (File/read! (Path/join dir "Elixir.BeamLisp.HostServerProbe.beam"))
+               (File/read! again-beam))
+            "a rebuild of priv/host/server.bl is the same beam")
+        (File/rm_rf! again))
+
+      (File/rm_rf! dir))))
+
+; ── the pure ABI: probe answers == live answers ──────────────────────────
+
+(deftest server-pinned-pure-abi-matches-the-live-module
+  (testing "module names, the callback vocabulary, every constructor and bind_init, observation for observation"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      (let [l (pure-corpus live)
+            p (pure-corpus probe)]
+        (is (= l p) "probe answers equal the live module's on the whole corpus")
+        (doseq [i (range (count l))]
+          (is (= (nth l i) (nth p i))
+              (str "observation " i ": " (pr-str (nth l i)) " vs " (pr-str (nth p i))))))
+
+      ; The module names are pinned EXACTLY, not merely matched: the
+      ; `defserver` scheme, and the degenerate separators.
+      (is (= :"Elixir.BeamLisp.Server.User.Counter"
+             (erlang/apply probe :module_for (list "user" "counter"))))
+      (is (= :"Elixir.BeamLisp.Server.A.B.C-d"
+             (erlang/apply probe :module_for (list "a.b" "c-d"))))
+      (is (= :"Elixir.BeamLisp.Server.."
+             (erlang/apply probe :module_for (list "" ""))))
+
+      ; The non-binary refusals carry the live SEGMENT numbers and the live
+      ; value rendering.
+      (is (= "construction of binary failed: segment 1 of type 'binary': expected a binary but got: nil"
+             (ex-message (nth (obs (fn [] (erlang/apply probe :module_for (list nil "x")))) 1))))
+      (is (= "construction of binary failed: segment 3 of type 'binary': expected a binary but got: nil"
+             (ex-message (nth (obs (fn [] (erlang/apply probe :module_for (list "x" nil)))) 1))))
+
+      ; The callback vocabulary, by name.
+      (is (= (tuple :init 1 :vector) (erlang/apply probe :callback (list "init"))))
+      (is (= (tuple :handle_call 3 :pattern) (erlang/apply probe :callback (list "handle-call"))))
+      (is (= (tuple :handle_cast 2 :pattern) (erlang/apply probe :callback (list "handle-cast"))))
+      (is (= (tuple :handle_info 2 :pattern) (erlang/apply probe :callback (list "handle-info"))))
+      (is (= (tuple :handle_continue 2 :vector) (erlang/apply probe :callback (list "handle-continue"))))
+      (is (= (tuple :terminate 2 :vector) (erlang/apply probe :callback (list "terminate"))))
+      (is (= nil (erlang/apply probe :callback (list "code_change"))))
+      (is (= (list :init :handle_call :handle_cast :handle_info :handle_continue :terminate
+                   :code_change)
+             (erlang/apply probe :callback_order (list))))
+
+      ; THE CONSTRUCTORS, at every arity, INVOKED through the runtime's own
+      ; dispatch: `ignore`/`hibernate` fill the timeout slot and `continue` is
+      ; its `{:continue, term}`.
+      (let [ctors (erlang/apply probe :return_constructors (list))
+            call (fn [name args] (BeamLisp.Ns.Rt/invoke (Map/fetch! ctors name) args))]
+        (is (= (list "continue" "hibernate" "ignore" "noreply" "ok" "reply" "stop")
+               (Enum/sort (maps/keys ctors))))
+        (is (= (tuple :ok :s) (call "ok" (list :s))))
+        (is (= (tuple :ok :s 9) (call "ok" (list :s 9))))
+        (is (= (tuple :reply :r :s) (call "reply" (list :r :s))))
+        (is (= (tuple :reply :r :s 9) (call "reply" (list :r :s 9))))
+        (is (= (tuple :noreply :s) (call "noreply" (list :s))))
+        (is (= (tuple :noreply :s 9) (call "noreply" (list :s 9))))
+        (is (= (tuple :stop :r) (call "stop" (list :r))))
+        (is (= (tuple :stop :r :s) (call "stop" (list :r :s))))
+        (is (= (tuple :stop :r :rep :s) (call "stop" (list :r :rep :s))))
+        (is (= :ignore (call "ignore" (list))))
+        (is (= :hibernate (call "hibernate" (list))))
+        (is (= (tuple :continue :t) (call "continue" (list :t)))))
+
+      ; `bind_init/1` unwraps a conveyed token and passes everything else
+      ; through — pinned here structurally as well as differentially.
+      (is (= :plain (erlang/apply probe :bind_init (list :plain))))
+      (is (= nil (erlang/apply probe :bind_init (list nil))))
+      (is (= :user-arg (erlang/apply probe :bind_init
+                           (list (erlang/list_to_tuple
+                                   (list :"$bl_conveyed_env" (BeamLisp.Env/capture) :user-arg))))))
+
+      (File/rm_rf! dir))))
+
+; ── the live servers: probe answers == live answers ──────────────────────
+
+(deftest server-pinned-live-servers-match-the-live-module
+  (testing "isolated registered names: sync, async, timeout, crash, stop, child specs, registry resolution"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      ; LOCALS, because the worker is a plain Task with no var environment:
+      ; only a captured value crosses that boundary.
+      (let [lx live px probe cn child-name rn reg-name
+            cmod host-server-child rmod host-server-registry
+            l (in-worker (fn [] (server-run lx cn rn cmod rmod)))
+            p (in-worker (fn [] (server-run px cn rn cmod rmod)))]
+        (is (= l p) "probe servers behave exactly like the live module's")
+        (doseq [i (range (count l))]
+          (is (= (nth l i) (nth p i))
+              (str "server observation " i ": " (pr-str (nth l i)) " vs " (pr-str (nth p i))))))
+
+      ; ...and every one of those observations answered the PINNED
+      ; expectations, not merely the same wrong thing. `run` below is the
+      ; corpus produced by the PINNED beam.
+      (let [lx live px probe cn child-name rn reg-name
+            cmod host-server-child rmod host-server-registry
+            run (in-worker (fn [] (server-run px cn rn cmod rmod)))]
+
+        ; start_link + sync call + async cast + state evolution + stop
+        (is (= (list :ok (list true 0 0 nil 2 2 nil 4 {:tag 7 :n 4} nil nil))
+               (nth run 0)))
+
+        ; a start whose module does not exist is the live unwrap RuntimeError
+        (let [bad (nth (nth run 1) 1)]
+          (is (erlang/== :ok (nth (nth run 1) 0)))
+          (is (erlang/== :caught (nth bad 0)))
+          (is (erlang/== :"Elixir.RuntimeError" (maps/get :__struct__ (nth bad 1) nil)))
+          (is (erlang/== true
+                (String/starts_with? (maps/get :message (nth bad 1) "") "server failed to start: "))))
+
+        ; CRASH: the caller exits, the server is gone
+        (let [crash (nth run 2)
+              body (nth crash 1)
+              caught (nth body 1)
+              folded (nth caught 1)
+              reason (elem folded 1)]
+          (is (erlang/== :ok (nth crash 0)))
+          (is (erlang/== true (nth body 0)))
+          (is (erlang/== :caught (nth caught 0)))
+          (is (erlang/== :exit (elem folded 0)))
+          (is (erlang/== :"Elixir.RuntimeError" (maps/get :__struct__ (elem (elem reason 0) 0) nil)))
+          (is (erlang/== :gen_server (elem (elem reason 1) 0)))
+          (is (erlang/== true (nth body 2)) "the crashed server is gone"))
+
+        ; TIMEOUT: call/3 forwards the caller's timeout, the server survives
+        (let [timed (nth run 3)
+              body (nth timed 1)
+              caught (nth body 1)
+              folded (nth caught 1)]
+          (is (erlang/== :ok (nth timed 0)))
+          (is (erlang/== true (nth body 0)))
+          (is (erlang/== :caught (nth caught 0)))
+          (is (erlang/== :exit (elem folded 0)))
+          (is (erlang/== :timeout (elem (elem folded 1) 0)))
+          (is (erlang/== true (nth body 2)))
+          (is (nil? (nth body 3))))
+
+        ; ANONYMOUS + NON-MAP OPTS + the CaseClauseError
+        (is (= (list :ok (list true 0 nil)) (nth run 4)) "an anonymous server is addressed by its pid")
+        (is (= (list :ok (list true 0)) (nth run 5)) "a non-map opts starts anonymously")
+        (is (erlang/== :"Elixir.CaseClauseError"
+                       (maps/get :__struct__ (nth (nth (nth run 6) 1) 1) nil))
+            "a non-atom :name is the live CaseClauseError")
+
+        ; CHILD SPECS
+        (is (= (list :ok (list true (list :a) :ok)) (nth run 7))
+            "the `__supervisor__` spec is delegated to BeamLisp.Supervisor and answered unwrapped")
+        (is (erlang/== :caught (nth (nth (nth run 8) 1) 0))
+            "the same spec WITH an init arg is not the tree clause")
+        (is (= (list :ok (list :ok true (list :w) 0 :ok)) (nth run 9))
+            "a defserver started as a supervised child, addressable by name")
+
+        ; NAMES AS VALUES
+        (let [reg-obs (nth run 10)
+              body (nth reg-obs 1)]
+          (is (erlang/== :ok (nth reg-obs 0)))
+          (is (erlang/== true (nth body 0)))
+          (is (erlang/== 0 (nth body 1)) "a [registry key] vector resolves to the registered pid")
+          (is (erlang/== 0 (nth body 2)) "a bare pid is called directly")
+          (is (erlang/== nil (nth body 3)))
+          (is (erlang/== 1 (nth body 4)))
+          (is (erlang/== nil (nth body 5)))
+          (is (erlang/== :caught (nth (nth body 6) 0)))
+          (is (erlang/== :"Elixir.ArgumentError" (maps/get :__struct__ (nth (nth body 6) 1) nil)))
+          (is (erlang/== :caught (nth (nth body 7) 0)))
+          (is (erlang/== :"Elixir.ArgumentError" (maps/get :__struct__ (nth (nth body 7) 1) nil))))
+
+        (is (erlang/== :caught (nth (nth (nth run 11) 1) 0))
+            "a non-atom registry name passes through to :gen_server")
+
+        (is (= (list :ok (list true nil nil nil)) (nth run 12))
+            "cast/2 answers nil, stop/2 reaches OTP, and the name is released"))
+
+      ; NOTHING LEAKED: the corpus's own names are gone, and the runtime's
+      ; language is still answering.
+      (is (nil? (Process/whereis child-name)))
+      (is (nil? (Process/whereis reg-name)))
+      (is (= 3 (BeamLisp/eval "(+ 1 2)")))
+      (File/rm_rf! dir))))
+
+; ── the pinned beam AT the production atom, restored afterwards ──────────
+
+(deftest server-pinned-beam-stands-in-at-the-production-atom
+  (testing "the production atom serves on the pinned beam, then the live beam returns"
+    (let [dir (tmp-dir)
+          out (str dir "/prod")
+          beam (Path/join out (str live ".beam"))
+          orig-path (erlang/apply :code :which (list live))
+          orig-bin (File/read! (erlang/list_to_binary orig-path))
+          before-pure (pure-corpus live)]
+      (is (not= :non_existing orig-path) "precondition: the live beam is a readable file")
+
+      ; `:load? false` writes the beam at the production atom WITHOUT
+      ; substituting the live module mid-flight.
+      (BeamLisp.AOT/compile_host_file (src) (seed-opts live out))
+      (is (File/exists? beam))
+      (is (= orig-path (erlang/apply :code :which (list live)))
+          "the compile never substituted the production module")
+
+      (try
+        (drop! live)
+        (code/load_binary live (erlang/binary_to_list beam) (File/read! beam))
+        (is (= (erlang/binary_to_list beam) (erlang/apply :code :which (list live)))
+            "the test beam now owns the production atom")
+        (is (erlang/function_exported live :module_for 2))
+
+        ; The pinned beam answers EXACTLY as the live one did at this atom.
+        (is (= before-pure (pure-corpus live)))
+
+        ; THE CODEGEN PATH, ON THE PINNED BEAM. `defserver` lowers through
+        ; `module_for/2`, `callback/1`, `callback_order/0` and
+        ; `return_constructors/0` — all four of which now answer from the TEST
+        ; beam. COMPILING the form proves the port serves the compiler and not
+        ; merely a caller, and the generated module is then started, called and
+        ; stopped through the same beam, so the round trip is real OTP.
+        (let [gen-name "bl-host-server-gen"
+              gen-reg :bl_host_server_gen
+              gen-mod (BeamLisp/eval
+                        (str "(defserver " gen-name
+                             " (init [a] (ok {:n 0 :tag a}))"
+                             " (handle-call :v [_ s] (reply (:n s) s)))"))
+              o (maps/put :name gen-reg (maps/new))]
+          (is (String/starts_with? (Atom/to_string gen-mod) "Elixir.BeamLisp.Server."))
+          (is (String/ends_with? (Atom/to_string gen-mod) "Bl-host-server-gen"))
+          (is (erlang/function_exported gen-mod :init 1))
+          (is (erlang/function_exported gen-mod :handle_call 3))
+          (is (= (list (tuple :behaviour (list :gen_server)))
+                 (filter (fn [a] (erlang/== :behaviour (elem a 0)))
+                         (erlang/apply gen-mod :module_info (list :attributes)))))
+          (let [pid (erlang/apply live :start_link (list gen-mod 7 o))]
+            (try
+              (is (erlang/is_pid pid))
+              (is (= 0 (erlang/apply live :call (list gen-reg :v))))
+              (is (nil? (erlang/apply live :stop (list gen-reg))))
+              (is (nil? (Process/whereis gen-reg)))
+              (finally (kill! gen-reg))))
+          (drop! gen-mod))
+
+        ; ...and a defserver started THROUGH the production atom really is
+        ; OTP's, evolves its state and stops.
+        (let [lx live cn child-name rn reg-name
+              cmod host-server-child rmod host-server-registry
+              run (in-worker (fn [] (server-run lx cn rn cmod rmod)))]
+          (is (= (list :ok (list true 0 0 nil 2 2 nil 4 {:tag 7 :n 4} nil nil))
+                 (nth run 0))))
+
+        ; THE RUNTIME'S LANGUAGE IS UNTOUCHED: this module is functions, so
+        ; swapping the atom swapped no process.
+        (is (= 3 (BeamLisp/eval "(+ 1 2)")))
+        (finally
+          (drop! live)
+          (code/load_binary live orig-path orig-bin)))
+
+      ; RESTORED: the live beam owns the atom and answers again.
+      (is (= orig-path (erlang/apply :code :which (list live))))
+      (is (= before-pure (pure-corpus live)) "the restored live beam answers as before")
+      (is (nil? (Process/whereis child-name)))
+      (File/rm_rf! dir))))

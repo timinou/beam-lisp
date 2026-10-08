@@ -1,0 +1,589 @@
+; priv/lib/js/build.bl — namespaces → ES modules, linked at build time.
+;
+; `(build {:roots ["apps/bl-ed"] :entry "ed.main" :out "out/bl-ed"})` reads the
+; entry namespace, follows its `(:require …)` graph through the roots, compiles
+; every namespace with the BEAM compiler to bl-ANF, emits each as one ES module
+; (js.emit), and writes them under `:out/ns/` beside the runtime (rt.mjs,
+; abi.mjs, leaves.mjs, env.mjs); there is no hand-written core.
+;
+; LINKING. Every `:global {ns name}` is resolved HERE, not at run time:
+;   1. a top-level def of THAT namespace           → its local JS binding
+;   2. a def of a namespace it requires (by alias)  → an import
+;   3. a compiled `core`/`cpp` def or a seeded row  → the compiled module's
+;                                                     export (the registry
+;                                                     rt/seed-core filled,
+;                                                     read through E.fetch!)
+;   4. otherwise                                    → a BUILD ERROR naming the
+;                                                     namespace, name and line
+; There is no hand-written core to link to: core and rt are compiled
+; namespaces like any other (PLAN-163 cutover).
+;
+; HOST FFI. `(js/name args…)` — a :remote with module `js` — calls the host
+; function `name` that the page registers (`H.<name>`). The set of host
+; functions is declared by the app (`:host` in its build config), so an
+; unknown one is a build error too. That keeps the closed-world audit the
+; actor target has, without its allowlist file.
+
+(ns js.build
+  (:require [js.emit :as e]
+            [reader-node :as rn]
+            [system.ir :as ir]))
+
+; ─── reading a namespace ────────────────────────────────────────────────────
+
+(defn- rn-tag [n] (rn/node-tag (rn/node-form n)))
+(defn- rn-items [n] (rn/node-items n))
+(defn- rn-name [n] (rn/node-name (rn/node-form n)))
+(defn- unwrap [n] (rn/node-form n))
+(defn- sym? [n s] (and (= :symbol (rn-tag n)) (or (nil? s) (= s (rn-name n)))))
+(defn- kw-node? [n s] (and (= :keyword (rn-tag n)) (= s (rn-name n))))
+
+(defn ns-path
+  "The `.bl` file for namespace `ns` under one of `roots`, by the loader's own
+   rule (`Loader/source_relatives`): the dotted spelling first, then Clojure's
+   dash→underscore munging — `reader-node` is `reader-node.bl`, `ed.text` is
+   `ed/text.bl`."
+  [roots ns]
+  (let [rels (filter (fn [r] (ends-with? r ".bl")) (BeamLisp.Loader/source_relatives ns))]
+    (first (for [r roots rel rels :let [p (str r "/" rel)] :when (File/regular? p)] p))))
+
+(defn- ns-head
+  "{:ns name :requires [[ns alias]…]} from a file's `(ns …)` form."
+  [forms]
+  (let [h (first forms)]
+    (if (and (= :list (rn-tag h)) (sym? (first (rn-items h)) "ns"))
+      (let [items (rn-items h)
+            name (rn-name (second items))
+            clauses (filter (fn [c] (= :list (rn-tag c))) (rest (rest items)))
+            reqs (mapcat (fn [c]
+                           (let [its (rn-items c)]
+                             (if (kw-node? (first its) "require")
+                               (map (fn [spec]
+                                      (let [s (rn-items spec)
+                                            target (rn-name (first s))
+                                            as-i (index-where s (fn [x] (kw-node? x "as")))]
+                                        [target (if (nil? as-i) target (rn-name (nth s (inc as-i))))]))
+                                    (filter (fn [s] (= :vector (rn-tag s))) (rest its)))
+                               [])))
+                         clauses)]
+        {:ns name :requires (vec reqs)})
+      (throw (ex-info "js.build: a namespace file must start with (ns …)" {:form h})))))
+
+(defn- index-where [xs pred]
+  (loop [i 0 s (seq xs)] (cond (empty? s) nil (pred (first s)) i :else (recur (inc i) (rest s)))))
+
+; ─── top-level forms → definitions ──────────────────────────────────────────
+
+(defn- defn-like? [f] (and (= :list (rn-tag f)) (let [h (first (rn-items f))] (or (sym? h "defn") (sym? h "defn-")))))
+(defn- def-like? [f] (and (= :list (rn-tag f)) (sym? (first (rn-items f)) "def")))
+(defn defmacro? [f] (and (= :list (rn-tag f)) (sym? (first (rn-items f)) "defmacro")))
+(defn- comment-form? [f] (and (= :list (rn-tag f)) (sym? (first (rn-items f)) "comment")))
+(defn- declare-form? [f] (and (= :list (rn-tag f)) (sym? (first (rn-items f)) "declare")))
+
+(defn- strip-doc+attrs
+  "The clause part of `(defn name doc? attrs? clauses…)`."
+  [items]
+  (let [b0 (rest (rest items))
+        b1 (if (and (> (count b0) 1) (erlang/is_binary (unwrap (first b0)))) (rest b0) b0)
+        b2 (if (and (> (count b1) 1) (= :map (rn-tag (first b1)))) (rest b1) b1)]
+    b2))
+
+(defn- wrap-pos [form like]
+  (let [m (rn/node-pos like)]
+    (if (nil? m) form (rn/meta-node form m))))
+
+(defn- last-wins
+  "A name defined twice keeps its LAST definition, at that position: the BEAM
+   interns both and the later `intern` wins (rt.bl defines `sorted-set?` and
+   `sorted-map?` twice). An ES module may export a name only once."
+  [defs]
+  (let [last-at (reduce (fn [m [i d]] (if (some? (:name d)) (assoc m (:name d) i) m))
+                        {} (map-indexed (fn [i d] [i d]) defs))]
+    (vec (keep (fn [[i d]] (when (or (nil? (:name d)) (= i (get last-at (:name d)))) d))
+               (map-indexed (fn [i d] [i d]) defs)))))
+
+(defn- top-defs
+  "Definitions a file contributes, in order: {:name :private? :form :kind}.
+   `defn` → `(fn name clauses…)`; `def` → its init form. Macros run in the
+   BEAM compiler only (they shaped this ANF already), so they emit nothing."
+  [forms]
+  (last-wins
+    (keep (fn [f]
+            (cond
+              (defn-like? f)
+                (let [its (rn-items f)
+                      nm (rn-name (second its))]
+                  {:name nm :kind :fn :private? (sym? (first its) "defn-")
+                   :form (wrap-pos (rn/list-node (cons (rn/sym-node "fn") (cons (second its) (strip-doc+attrs its)))) f)})
+              (def-like? f)
+                (let [its (rn-items f)
+                      nm (rn-name (second its))
+                      body (rest (rest its))
+                      init (if (and (> (count body) 1) (erlang/is_binary (unwrap (first body)))) (second body) (first body))]
+                  {:name nm :kind :val :private? false :form init})
+              (or (defmacro? f) (comment-form? f) (declare-form? f)) nil
+              (and (= :list (rn-tag f)) (sym? (first (rn-items f)) "ns")) nil
+              :else {:name nil :kind :expr :form f}))
+          forms)))
+
+; ─── one namespace ──────────────────────────────────────────────────────────
+
+
+(defn read-forms+text
+  "[[node text]…] for every top-level form of `path`, in order. `text` is the
+   exact source the READER CONSUMED for that form: the stream's remaining
+   charlist before and after `read-next` share a tail, so the consumed prefix
+   is everything up to the `identical?` cell — leading blanks/comments
+   included (harmless to `eval_string`), the form's own end exact even when
+   several forms share a line, or a syntax-quote shrinks the node's end
+   position. No position metadata, no second parser."
+  [path]
+  (loop [st (BeamLisp.Ns.Reader/stream (File/read! path) path) out []]
+    (let [r (BeamLisp.Ns.Reader/read-next st)]
+      (if (= :ok (first r))
+        (let [st2 (nth r 2)
+              stop (get st2 :chars)
+              consumed (loop [c (get st :chars) acc []]
+                         (if (or (empty? c) (identical? c stop)) acc (recur (rest c) (conj acc (first c)))))]
+          (recur st2 (conj out [(second r) (unicode/characters_to_binary (to-list consumed))])))
+        out))))
+
+(defn read-forms [path] (vec (map first (read-forms+text path))))
+
+(defn- node-symbols
+  "Every symbol name appearing anywhere inside reader node `n`."
+  [n]
+  (let [f (rn/node-form n) t (rn/node-tag f)]
+    (cond
+      (= :symbol t) [(rn/node-name f)]
+      (contains? #{:list :vector :map :set} t) (vec (mapcat node-symbols (rn/node-items f)))
+      :else [])))
+
+(defn- macro-helper-forms
+  "The top-level `defn`/`defn-` forms (of `forms`) that the `defmacro`s
+   `mforms` reach, transitively through other defn bodies."
+  [forms mforms]
+  (let [defns (filter defn-like? forms)
+        by-name (into {} (map (fn [f] [(rn-name (second (rn-items f))) f]) defns))]
+    (loop [todo (vec mforms) seen #{} out []]
+      (if (empty? todo)
+        out
+        (let [syms (filter (fn [s] (and (contains? by-name s) (not (contains? seen s)))) (distinct (node-symbols (first todo))))]
+          (recur (vec (concat (rest todo) (map (fn [s] (get by-name s)) syms)))
+                 (into seen syms)
+                 (into out (map (fn [s] (get by-name s)) syms))))))))
+
+
+(defn compile-ns
+  "Compile namespace file `path` to {:ns :requires :defs [{:name :kind :node}]}.
+   The BEAM compiler is given the real namespace, so macros, aliases and
+   refers resolve exactly as they would on BEAM. Each def is interned as a
+   placeholder FIRST so later forms' references to earlier (and forward)
+   names resolve to `:global` of this namespace."
+  [path]
+  (let [texts (read-forms+text path)
+        forms (vec (map first texts))
+        head (ns-head forms)
+        ns (:ns head)
+        ; STAGING (see `build`): this namespace's definitions live in the
+        ; build's private env. Mark it loaded THERE so a name lookup that
+        ; misses (a forward ref in a macro helper, a def-bound name) cannot
+        ; make the loader run the whole namespace — top-level side effects
+        ; included. Per-env: the live VM's loaded set is untouched.
+        _ (BeamLisp.Env/mark_loaded ns)
+        ; evaluate the ns form on BEAM so aliases/requires exist for the compiler
+        _ (BeamLisp.Compiler/eval_string (second (first texts)) (BeamLisp.Compiler/new_env "user") path)
+        defs (top-defs (rest forms))
+        ; a placeholder only where the name is unbound: interning nil over a LIVE
+        ; definition (compiling `core` itself, or any ns this VM already runs)
+        ; would break the very compiler doing the compiling
+        _ (doseq [d defs]
+            (when (and (some? (:name d)) (not (BeamLisp.Env/bound? ns (:name d))))
+              (BeamLisp.Env/intern ns (:name d) nil)))
+        ; the namespace's OWN macros define its compile-time language: each
+
+        ; `defmacro` is defined on the BEAM (its source span, in ITS ns) before
+        ; the forms that use it compile. Not "evaluate the ns": a defmacro runs
+        ; nothing but its own definition.
+        ; A macro body that CALLS a defn of its ns needs that fn on the BEAM at
+        ; expansion time: exactly the defn(s) the macros reach (transitively,
+        ; by symbol), evaluated first, in source order. A defn only DEFINES;
+        ; no other top-level form (def, side-effect expr) is ever run.
+        mforms (filter defmacro? (rest forms))
+        needed (macro-helper-forms (rest forms) mforms)
+        _ (doseq [[f text] (rest texts)
+                  :when (or (defmacro? f) (some (fn [n] (identical? n f)) needed))]
+            (try (BeamLisp.Compiler/eval_string text (BeamLisp.Compiler/new_env ns) path)
+                 (catch ex
+                   (throw (ex-info (str path ": staging " (rn-name (second (rn-items f))) ": " (ex-message ex))
+                                   {:path path :ns ns :form f})))))
+
+        env (BeamLisp.Ns.Compiler/new_env ns)]
+    {:ns ns :path path :requires (:requires head)
+     :defs (vec (map (fn [d]
+                       (assoc d :node
+                         (try (BeamLisp.Ns.Compiler/compile (:form d) env)
+                              (catch ex
+                                (throw (ex-info (str path ": " (or (:name d) "top-level form") ": " (ex-message ex))
+                                                {:path path :name (:name d)}))))))
+                     defs))}))
+
+; ─── linking ────────────────────────────────────────────────────────────────
+
+(def ^:private rt-mod :Elixir.BeamLisp.Ns.Rt)
+
+(def ^:private rt-specific
+  "Runtime functions the compiler calls DIRECTLY in an argument order of their
+   own (priv/boot/rt.bl documents each). They are linked to their compiled rt
+   export/leaf, never to the BL core name that happens to share the word."
+  #{"drop" "drop_clj" "apply_variadic" "apply_to" "map_multi"})
+
+
+(defn rest-fns
+  "#{[mod-name fname arity]}: every VARIADIC function the core link table
+   names, at its rest-list arity (min + 1) — called with the rest packed as
+   one trailing list, like a `__bl_v` clause."
+  [core]
+  (set (keep (fn [nm]
+               (let [l (try (BeamLisp.Env/link "core" nm) (catch e :error))]
+                 (when (and (erlang/is_tuple l) (= :ok (erlang/element 1 l)))
+                   (let [info (erlang/element 2 l) var (erlang/element 3 info)
+                         vf (when (erlang/is_tuple var) (e/atom-text (erlang/element 2 var)))]
+                     ; an `rt:` entry (rt-specific) already takes the rest LIST
+                     ; as its own last parameter: never spread it
+                     (when (and (some? vf) (not (and (= rt-mod (erlang/element 1 info)) (contains? rt-specific vf))))
+                       [(e/atom-text (erlang/element 1 info)) vf (inc (erlang/element 1 var))])))))
+             (concat core ["+" "-" "*" "/" "<" ">" "<=" ">=" "==" "="]))))
+
+(defn remote-link
+  "THE link decision for a remote call `m:f/arity` that is not a built
+   namespace, a stub or a host fn: [:leaf key] (L.LEAVES[key]) or nil
+   (unresolved). There is ONE rule and ONE target: a leaf implements the
+   BEAM primitive at its own arity, with the BEAM's calling convention
+   (a rest arg is ONE trailing list). The static linker (link-ctx) and the
+   eval-time linker (leaves.mjs `X`) both read THIS, so the two cannot drift
+   (PLAN-163 structural fix 1)."
+  [m f arity leaves]
+  (let [lk (str (e/atom-text m) "/" (e/atom-text f) "/" arity)]
+    (if (contains? leaves lk) [:leaf lk] nil)))
+
+(defn core-links-module
+  "ES-module text that seeds a JS page's registry with BEAM's core LINK table
+   (`{:link \"core\" name}` rows, read from this VM's live table), so the
+   compiler running in JS emits the same linked calls the BEAM compiler does
+   (`(+ 1 2)` -> :arith), and `REST_FNS`: the variadic link fns at their
+   rest-list arity - the ONE rest convention the eval-time linker uses too.
+   `leaves` is accepted for the facade call shape but no core-key port is
+   emitted any more: a remote that is not a compiled namespace or leaf is a
+   link error. Schema (documented for abi.mjs/leaves.mjs/boot.mjs):
+     LINKS    [[bl-name, {:mod, :fixed, :var}]]  (registry seed rows)
+     REST_FNS [[mod, fun, arity]]               (rest-list call convention)
+   Generated per build: one source, BEAM's."
+  [core leaves]
+  (let [rows (keep (fn [nm]
+                     (let [l (try (BeamLisp.Env/link "core" nm) (catch e :error))]
+                       (when (and (erlang/is_tuple l) (= :ok (erlang/element 1 l)))
+                         [nm (erlang/element 2 l)])))
+                   (sort (concat core ["+" "-" "*" "/" "<" ">" "<=" ">=" "==" "="])))
+        triple (fn [info]
+                 (let [mod (erlang/element 1 info) fixed (erlang/element 2 info) var (erlang/element 3 info)]
+                   (str "R.tup([R.kw(" (e/js-str (e/atom-text mod)) "), R.hashMap("
+                        (join ", " (map (fn [[a f]] (str a ", R.kw(" (e/js-str (e/atom-text f)) ")")) (sort-by first fixed)))
+                        "), "
+                        (if (nil? var) "null"
+                          (str "R.tup([" (erlang/element 1 var) ", R.kw(" (e/js-str (e/atom-text (erlang/element 2 var))) ")])"))
+                        "])")))]
+    (str "// GENERATED by priv/lib/js/build.bl (core-links-module) - do not edit.\n"
+         "import * as R from \"./rt.mjs\";\n"
+         "export const LINKS = [\n"
+         (join ",\n" (map (fn [[nm info]] (str "  [" (e/js-str nm) ", " (triple info) "]")) rows))
+         "\n];\n"
+         "export const REST_FNS = [\n"
+         (join ",\n" (map (fn [[m f a]] (str "  [" (e/js-str m) ", " (e/js-str f) ", " a "]")) (sort-by str (rest-fns core))))
+         "\n];\n")))
+
+(defn- seed-ref
+  "A seeded core/cpp registry value, read at its use through Env's `fetch!`
+   (the `E_` import) — Env's fetch cache, dropped on EVERY registry write
+   (EPOCH), so a rebind is seen; there is no per-module name cache to go stale.
+
+   A VALUE reference (`arity` nil) is the raw registry value - the `{:$blfn ...}`
+   tuple itself - so `identical?`/`=` hold across namespaces, exactly as on the
+   BEAM. A CALL reference (numeric arity) adapts it to one dispatcher per
+   RAW value (`A.blfnFn` caches by the value, in the ABI), shared by every
+   module; a rebind yields a new raw value (new dispatcher), and an
+   already-captured one is never mutated."
+  [ns nm arity & [exact?]]
+  (let [fetch (str "E_[" (e/js-str (if exact? "fetch_exact!" "fetch!")) "](" (e/js-str ns) ", " (e/js-str nm) ")")]
+    (if (nil? arity) fetch (str "A.blfnFn(" fetch ")"))))
+
+(def ^:private raw-ctors
+  "rt.bl's raw constructors, as the JS expression of the same value. Each is a
+   FUNCTION value (a call site emits `f(args)`; a value use passes it)."
+  {"raw-cons" "R.consRaw" "tuple2" "R.tuple2" "tuple3" "R.tuple3"
+   "empty-list" "R.emptyList" "k-empty-list" "R.emptyList"})
+
+(defn- exact-refer-ns [ns nm table]
+  (loop [ns ns seen #{}]
+    (if (or (contains? seen ns) (contains? (get table ns #{}) nm)) ns
+      (if-let [source (BeamLisp.Env/refer_source ns nm)]
+        (recur source (conj seen ns)) ns))))
+
+(defn link-ctx
+  "The emitter context for namespace `cns`: resolvers for globals and remotes.
+   `table` maps ns -> set of def names; `host` the set of declared host fns;
+   `missing` collects unresolved names. Values and calls both target compiled
+   namespaces (core/cpp/rt/any required ns) or a leaf; the ONE callable ABI is
+   `R.call*/callList` with compiled rt's `call-invoke` as the fallback."
+  [cns table host missing leaves stubs used]
+  (let [aliases (into {} (map (fn [[t a]] [a t]) (:requires cns)))
+        own (get table (:ns cns))
+        resolve (fn [ns nm arity & [exact?]]
+                  (let [ns* (if exact? (exact-refer-ns ns nm table) (get aliases ns ns))]
+                    (cond
+                      ; rt's raw constructors (rt.bl rt.raw: `raw-cons`, `tuple2`,
+                      ; `tuple3`) are spelled with BIF dances because rt.bl may not
+                      ; write a literal; on JS each IS one constructor (PLAN-163 U3)
+                      (and (= ns* "rt") (contains? raw-ctors nm)) (get raw-ctors nm)
+                      (and (= ns* (:ns cns)) (contains? own nm)) (str "d_" (e/mangle nm))
+                      (contains? (get table ns* #{}) nm) (do (swap! used conj ns*) (str "N_" (e/mangle ns*) ".d_" (e/mangle nm)))
+                      ; core's own defn (`inc`, `update`) or rt's (`first`): the
+                      ; compiled namespaces, never a JS core port
+                      (and (not exact?) (contains? (get table "core" #{}) nm)) (do (swap! used conj "core") (str "N_core.d_" (e/mangle nm)))
+                      ; a core/cpp name that is a SEED row (rt.bl
+                      ; seed-rows/seed-closures: `str`, `map`, `+` ...) or a seed
+                      ; closure, not a defn: read from the registry compiled rt
+                      ; filled (rt/seed-core runs when the build loads), exactly
+                      ; as Env.fetch! reads it on the BEAM
+                      (and (contains? #{"core" "cpp"} ns*)
+                           (if exact? (not= :error (BeamLisp.Env/fetch_exact ns* nm)) (BeamLisp.Env/bound? ns* nm))) (seed-ref ns* nm arity exact?)
+                      ; A built namespace also sees core's seeded rows through
+                      ; Env.fetch!'s fallback, including names qualified by a
+                      ; macro template. An unbound name is never a seed.
+                      (and (not exact?) (contains? table ns*)
+                           (BeamLisp.Env/bound? "core" nm)) (seed-ref "core" nm arity)
+                      ; a namespace the build deliberately leaves out (:stub):
+                      ; reaching it at run time is a named error, not a build error
+                      (contains? stubs ns*) (str "STUB(" (e/js-str (str ns* "/" nm)) ")")
+                      :else (do (swap! missing conj [(:ns cns) ns nm]) (str "MISSING(" (e/js-str (str ns "/" nm)) ")")))))
+        ; a namespace the VM already runs is linked by MODULE: the compiler
+        ; emits `Ns.Foo.Bar/f` for its defs instead of a global. Map each
+        ; built namespace's module back to its own JS defs.
+        by-mod (into {} (map (fn [ns] [(BeamLisp.Link/module_for ns) ns]) (keys table)))
+        stub-mods (into {} (map (fn [ns] [(BeamLisp.Link/module_for ns) ns]) stubs))
+        base-name (fn [f] (let [n (e/atom-text f)] (if (ends-with? n "__bl_v") (subs n 0 (- (count n) 6)) n)))
+        remote (fn [m f arity]
+                 (cond
+                   (and (= "rt" (get by-mod m)) (contains? raw-ctors (base-name f)))
+                     (get raw-ctors (base-name f))
+                   (and (contains? by-mod m) (contains? (get table (get by-mod m)) (base-name f)))
+                     (let [ns* (get by-mod m) n (e/mangle (base-name f))
+                           target (if (= ns* (:ns cns)) (str "d_" n) (do (swap! used conj ns*) (str "N_" (e/mangle ns*) ".d_" n)))]
+                       ; `f__bl_v` is the variadic CLAUSE, called with its rest
+                       ; args as ONE list (the BEAM ABI): the dispatcher's `.v`,
+                       ; not the dispatcher (which would wrap that list again)
+                       (if (ends-with? (e/atom-text f) "__bl_v") (str target ".v") target))
+                   (contains? stub-mods m) (str "STUB(" (e/js-str (str (get stub-mods m) "/" (e/atom-text f))) ")")
+                   (= m :js) (let [nm (e/atom-text f)]
+                               (if (contains? host nm) (str "H[" (e/js-str nm) "]")
+                                 (do (swap! missing conj [(:ns cns) "js" nm]) (str "MISSING(" (e/js-str (str "js/" nm)) ")"))))
+                   :else (let [lk (str (e/atom-text m) "/" (e/atom-text f) "/" arity)
+                               [kind key] (remote-link m f arity leaves)]
+                           (cond
+                             (= kind :leaf) (str "L.LEAVES[" (e/js-str key) "]")
+                             ; collected like an unresolved global, so ONE build
+                             ; lists every missing leaf instead of stopping at the first
+                             :else (do (swap! missing conj [(:ns cns) "leaf" lk])
+                                       (str "MISSING(" (e/js-str lk) ")"))))))
+        rt-ref (fn [n] (if (= "rt" (:ns cns)) (str "d_" (e/mangle n))
+                         (do (swap! used conj "rt") (str "N_rt.d_" (e/mangle n)))))]
+    ; ONE callable ABI, always: a call through a non-JS-function value goes to
+    ; compiled rt's own `call-invoke` (the BEAM's calling convention); `apply`
+    ; spreads through rt's `seq-to-args`.
+    {:ns (:ns cns) :resolve resolve :resolve-exact (fn [ns nm arity] (resolve ns nm arity true)) :remote remote :dest nil
+     :invoke (rt-ref "call-invoke") :seq-to-args (rt-ref "seq-to-args")}))
+
+(defn ns-file
+  "The file a compiled namespace is written to, relative to the out dir.
+   Every namespace lives under ns/, so `rt` the NAMESPACE never overwrites
+   rt.mjs the runtime (which keeps its name one level up)."
+  [ns]
+  (str "ns/" ns ".mjs"))
+
+(defn- ns-file-from
+  "The import specifier for namespace `ns` from a sibling compiled module."
+  [ns]
+  (str "./" ns ".mjs"))
+
+(defn emit-ns
+  "One compiled namespace → ES module text. `order` is the build's load order
+   (dependencies first)."
+  [cns table host missing leaves stubs order]
+  (e/reset-state!)
+  (let [used (atom (set (filter (fn [ns] (contains? table ns))
+                                (map first (:requires cns)))))
+        entry? (= (:ns cns) (last order))
+        ctx (link-ctx cns table host missing leaves stubs used)
+        body (mapcat (fn [d]
+                       (let [r (e/emit (:node d) ctx)]
+                         (cond
+                           (= :fn (:kind d))
+                             (concat (:lines r) (list (str "export const d_" (e/mangle (:name d)) " = " (:val r) ";")))
+                           (= :val (:kind d))
+                             (concat (:lines r) (list (str "export const d_" (e/mangle (:name d)) " = " (:val r) ";")))
+                           :else (concat (:lines r) (if (nil? (:val r)) (list) (list (str (:val r) ";")))))))
+                     (:defs cns))
+        ; `function` declarations hoist; consts do not. A def that refers to a
+        ; LATER def must not run before it: emit fn defs as hoisted functions.
+        kws (e/kw-decls)
+        ; exactly the built namespaces this one REFERENCES — by :require or by
+        ; MODULE name (`BeamLisp.Ns.Rt/x`: core calls rt without requiring
+        ; it), recorded while linking the body above. Importing only those
+        ; keeps the module graph the namespace graph: no artificial cycle.
+        ; a namespace that comes LATER in load order (it depends on this one:
+        ; rt is loaded before core, yet rt calls core/tuple) is reached
+        ; through the late-bound module table, not a static import — an ES
+        ; import cycle would let the later module's top-level code run
+        ; against this one's uninitialized bindings (rt ⇄ core)
+        later (set (drop-while (fn [t] (not= t (:ns cns))) order))
+        imports (map (fn [t]
+                       (if (contains? later t)
+                         (str "const N_" (e/mangle t) " = L.lateModule(" (e/js-str t) ");")
+                         (str "import * as N_" (e/mangle t) " from \"" (ns-file-from t) "\";")))
+                     (sort @used))]
+    (str "// GENERATED by priv/lib/js/build.bl from " (:path cns) " — do not edit.\n"
+         "import * as R from \"../rt.mjs\";\n"
+         "import * as A from \"../abi.mjs\";\n"
+         "import { H } from \"../host.mjs\";\n"
+         "import * as L from \"../leaves.mjs\";\n"
+         (join "\n" imports) "\n"
+         "const MISSING = (n) => { throw new R.BLError(\"unresolved \" + n); };\n"
+         "import { ENV as E_ } from \"../env.mjs\";\n"
+         ; `core`'s top level calls seeded names (`str`, `map` …): rt/seed-core
+         ; must have filled the registry first, as the BEAM boot does before
+         ; the prelude loads. ns/seeded.mjs is that step.
+         (if (= "core" (:ns cns)) "import \"./seeded.mjs\";\n" "")
+         (if entry? "import \"./base.mjs\";\n" "")
+         "const STUB = (n) => (...a) => { throw new R.BLError(n + \" is not part of this JS build (a :stub namespace)\"); };\n"
+         (join "\n" kws) "\n\n"
+         (join "\n" body) "\n"
+         ; register this module by namespace AND by BEAM module name, so a
+         ; late-bound reference (above) and `erlang/apply` of a module atom
+         ; (`fun M:F/A`, rt's seed) both find its exports
+         "import * as SELF_ from \"./" (str (:ns cns) ".mjs") "\";\n"
+         "L.registerNamespace(" (e/js-str (:ns cns)) ", " (e/js-str (name (BeamLisp.Link/module_for (:ns cns)))) ", SELF_);\n")))
+
+; ─── the build ──────────────────────────────────────────────────────────────
+
+
+(defn- load-order
+  "Namespaces reachable from `entry` (within `roots`), dependencies first."
+  [roots entries stubs]
+  (loop [todo (vec entries) seen #{} order [] compiled {}]
+    (if (empty? todo)
+      {:order order :compiled compiled}
+      (let [ns (first todo)]
+        (if (contains? seen ns)
+          (recur (rest todo) seen order compiled)
+          (let [path (if (contains? stubs ns) nil (ns-path roots ns))]
+            (if (nil? path)
+              (recur (rest todo) (conj seen ns) order compiled)   ; not ours: core or BEAM-only
+              (let [head (ns-head (read-forms path))
+                    deps (vec (filter (fn [d] (and (not (contains? seen d)) (not (contains? stubs d)) (some? (ns-path roots d))))
+                                      (map first (:requires head))))]
+                (if (empty? (filter (fn [d] (not (contains? (set order) d))) deps))
+                  (let [c (compile-ns path)]
+                    (recur (rest todo) (conj seen ns) (conj order ns) (assoc compiled ns c)))
+                  (recur (concat deps todo) seen order compiled))))))))))
+
+(def ^:private toolchain
+  "The compiler's own namespaces. A library that calls into them by module
+   (clojure.core-ext's `macroexpand-1` → `BeamLisp.Ns.Compiler`) does not pull
+   the whole compiler into a page; a build that WANTS it names it (`--with`,
+   as js.eval does), and otherwise the call is a named unresolved leaf."
+  #{"compiler" "lower" "anf" "reader" "reader-node" "diag" "system.ir" "optimize"})
+
+(defn- module-ns
+  "The namespace a BEAM module atom's text names (`Elixir.BeamLisp.Ns.Clojure.String`
+   → `clojure.string`), or nil when it is not a namespace. `module_for` is
+   lossy in reverse (it only capitalises segments), so the candidate is the
+   lower-cased segment path, CHECKED by mapping it forward again."
+  [mod]
+  (when (starts-with? mod "Elixir.BeamLisp.Ns.")
+    (let [ns (lower-case (subs mod (count "Elixir.BeamLisp.Ns.")))]
+      (when (= mod (erlang/atom_to_binary (BeamLisp.Link/module_for ns))) ns))))
+
+(defn build
+  "Build `entry` and every namespace it requires under `roots` into `out`.
+   opts: {:roots [dirs] :entry ns :out dir :core #{names} :leaves #{keys}
+          :host #{names} :stub [ns] :with [ns]}.
+   `core` is the BEAM seed link-name set (rt.bl seed-rows; the facade reads it
+   from the live registry/link table), used only for the rest-list call
+   convention. There is no hand-written core to link to: core and rt are
+   compiled namespaces under `:with`.
+   Returns {:modules [ns…] :bytes n :sources [path…]}; throws listing EVERY
+   unresolved name."
+  [opts]
+  (let [{:keys [roots entry out core host]} opts
+        leaves (or (:leaves opts) #{})
+        stubs (set (or (:stub opts) []))
+        ; `:with` adds namespaces reached only by MODULE name (no :require):
+        ; the compiler calls `BeamLisp.Ns.Reader/read_string` directly.
+        ; They load BEFORE the entry: they are what the entry reaches by
+        ; module name (rt, core, the clojure prelude), i.e. its dependencies.
+
+        ; The emitter executes system.ir while also compiling it as target
+        ; source. Load the pipeline dependency before staging can mark that
+        ; namespace loaded with target-only placeholders in its private fork.
+        _ (BeamLisp.Loader/ensure_loaded "system.ir")
+        _ (e/set-rest-fns! (rest-fns (vec core)))
+        ; Link, and follow module-name references: a call
+        ; `BeamLisp.Ns.Clojure.String/upper-case` names a NAMESPACE (one whose
+        ; source is under `roots`), which is compiled in like a :require —
+        ; the BEAM would load it on that call. Repeat until nothing new.
+        ; Each discovery attempt stages in a fresh fork: macros, helpers and
+        ; loaded marks cannot affect the live VM or a later build.
+        attempt (fn [entries]
+                  (BeamLisp.Env/isolated
+                    (fn []
+                      (let [{:keys [order compiled]} (load-order roots entries stubs)
+                            table (into {} (map (fn [ns] [ns (set (keep :name (:defs (get compiled ns))))]) order))
+                            missing (atom [])
+                            texts (into {} (map (fn [ns] [ns (emit-ns (get compiled ns) table host missing leaves stubs order)]) order))]
+                        {:order order :compiled compiled :texts texts :missing @missing}))))
+        first-try (attempt (concat (or (:with opts) []) [entry]))
+        {:keys [order compiled texts missing]}
+          (loop [r first-try entries (concat (or (:with opts) []) [entry]) n 0]
+            (let [extra (distinct (keep (fn [[_ kind nm]]
+                                          (when (= kind "leaf")
+                                            (let [ns (module-ns (first (split nm "/")))]
+                                              (when (and (some? ns) (not (contains? (set (:order r)) ns))
+                                                         (not (contains? toolchain ns))
+                                                         (some? (ns-path roots ns)))
+                                                ns))))
+                                        (:missing r)))]
+              (if (or (empty? extra) (> n 8)) r
+                ; a discovered namespace loads BEFORE the entry (it is called by it)
+                (let [entries2 (concat (butlast entries) extra [(last entries)])]
+                  (recur (attempt entries2) entries2 (inc n))))))
+        missing (atom missing)]
+    (when (seq @missing)
+      (throw (ex-info (str "js.build: " (count @missing) " unresolved name(s):\n"
+                           (join "\n" (map (fn [[in ns nm]] (str "  in " in ": " ns "/" nm)) (sort-by str (distinct @missing)))))
+                      {:missing @missing})))
+    (File/mkdir_p! out)
+    (File/mkdir_p! (str out "/ns"))
+    (File/write! (str out "/ns/seeded.mjs")
+                 (str "// GENERATED by priv/lib/js/build.bl — rt's seed-core, before core loads.\n"
+                      "import * as N_rt from \"./rt.mjs\";\n"
+                      "N_rt.d_seed_core();\n"))
+    ; the base namespaces (`:with`: core, the clojure prelude …) are LOADED
+    ; for their effects, as the BEAM boot loads them: clojure.core-ext
+    ; interns `vector` into core when it loads. The entry imports this first.
+    (File/write! (str out "/ns/base.mjs")
+                 (str "// GENERATED by priv/lib/js/build.bl — the base namespaces, loaded in order.\n"
+                      (join "" (map (fn [ns] (str "import \"./" ns ".mjs\";\n"))
+                                    (filter (fn [ns] (contains? (set order) ns)) (or (:with opts) []))))))
+    (doseq [ns order] (File/write! (str out "/" (ns-file ns)) (get texts ns)))
+    {:modules order :bytes (reduce + 0 (map count (vals texts)))
+     :sources (vec (map (fn [ns] (:path (get compiled ns))) order))}))

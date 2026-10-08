@@ -1,0 +1,405 @@
+; host/emit.bl — the pinned HOST MODULE for `Elixir.BeamLisp.Emit`.
+;
+; This file is not a namespace. It is a `.bl` SOURCE that the bootstrap seed
+; compiles with `BeamLisp.AOT/compile_host_file` into ONE exact-named beam
+; (`Elixir.BeamLisp.Emit.beam`) whose top-level `defn`s are plain exported
+; functions — the exact call surface every caller already names at
+; `Elixir.BeamLisp.Emit`, so no caller is renamed. The pinned beam is committed
+; into the floor (`priv/bootstrap/seed/`) and installed by
+; `Bootstrap.install!/1`.
+;
+; WHY A PINNED MODULE AND NOT A NAMESPACE. `Emit` is the canonical ANF module
+; construction every live and AOT namespace emission goes through; it is called
+; by the compiler while the compiler is being built, so it must be loadable
+; BEFORE the compiler is rebuilt. It therefore cannot itself be an AOT-rebuilt
+; `BeamLisp.Ns.*` namespace — that would be the bootstrap circle again. A
+; pinned host beam is a fixed artifact named by the seed manifest, built by one
+; generation and used by the next.
+;
+; ABI PARITY IS THE CONTRACT. Every function below reproduces its Elixir
+; counterpart clause for clause — the same Enum primitives, the same evaluation
+; order, the same return types, the same exception class — so the pinned beam
+; stands in for the module every caller already names, and the port is a no-op
+; at every call site. The shapes that are easy to get subtly wrong and are
+; therefore deliberate:
+;
+;   * `[]`/`%{}` in the Elixir source are a LIST and a MAP, never a bl vector
+;     or a struct. In this file they are written `(list)` and `{}`. A `[]`
+;     literal would be a `BeamLisp.Vector` and would change the emitted term.
+;
+;   * `canonical_pair/1` accepts a Vector, a 2-tuple, or a 2-element LIST, in
+;     that order, and answers a Vector with an Erlang 2-tuple `items` — a
+;     vector small enough to live in the tail, exactly as `Vector.new/1`
+;     builds it. Anything else is a `FunctionClauseError`, as the Elixir
+;     clauses produced.
+;
+;   * a sibling defn is only ever called DIRECTLY. Passing one as a VALUE
+;     (`(Enum/map xs canonical-pair)`) compiles to a var fetch, and the var's
+;     value is a capture of the NAMESPACE shim (`BeamLisp.Ns.Host.Emit`), not
+;     of the pinned atom — so the emitted beam would keep leaning on the very
+;     shim the pinned path exists to avoid, and `descriptor` failed with
+;     `BeamLisp.Ns.Host.Emit."canonical-pair"/1 is undefined` once the shim was
+;     gone. Every cross-call is therefore spelled as a direct call, the closure
+;     wrapping it where a callback is needed.
+;
+;   * `var/1` is an EXPORTED function whose name is also a compiler special
+;     form, so it cannot be called through the ordinary call form. The
+;     implementation lives in `make-var/1`; `var/1` only names it.
+;
+;   * `fixed_variadic/1`, `body_modules/1` and `shim_clauses/1` walk the same
+;     five-field def tuples the compiler interns
+;     (`{kind, fixed-count, fname, clause, body-module}`); every element read
+;     is positional, never destructured through a map (a bl map pattern is a
+;     non-strict destructure, which would bind nil for a shape it did not
+;     check).
+;
+;   * `compile_descriptor/1` returns the SAME `{mod, bytes}` the Core backend
+;     produced; the bytes are the parity proof the tests pin, not a re-encode.
+;
+; `test/bl/emit_test.bl` pins BOTH halves: the pinned ABI's answers and
+; exception classes on deterministic fixtures, and the emitted beams — the
+; `{module, beam}` pairs `descriptor_for` + `compile_descriptor` produce — byte
+; for byte against the live module.
+
+(ns host.emit)
+
+; ── module naming ────────────────────────────────────────────────────────────
+
+(defn realm_of
+  "The module-name segment (R<key> or S<hash>) a loaded namespace sits under, or nil. Realm-local namespaces are
+   recorded in the env that loaded them, so the answer follows the env chain: a
+   process (or a spawned child) bound to that env sees it, every other realm and
+   the :global env do not.
+
+   Asked before the env registry exists (the launcher, a cold boot) and from the
+   :global env, the answer is nil without a lookup: `module_for` is on the compile
+   path, so the common case must cost one process-dictionary read."
+  [ns]
+  (if (or (erlang/== :global (Process/get :bl_env :global))
+          (erlang/== :undefined (ets/whereis :beam_lisp_vars)))
+    nil
+    (let [r (BeamLisp.Env/lookup (tuple :realm_local ns))]
+      (if (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+        (erlang/element 2 r)
+        nil))))
+
+(defn realm_base
+  "`base` for namespace `ns`: `base.<segment>` when `ns` is realm-local (the segment
+   is R<key> for a realm's own or shadowed namespace, S<hash> for a shared one), else `base`.
+   One rule for every generated module family (namespaces, defservers)."
+  [ns base]
+  (let [segment (realm_of ns)]
+    (if (erlang/== nil segment)
+      base
+      (Module/concat base segment))))
+
+(defn base_module_for
+  "The platform's module for `ns`: `BeamLisp.Ns.<CamelCased>`, one alias segment per
+   dot-separated part, whatever realm asks. What a tier namespace is named."
+  [ns]
+  ; The launcher asks this BEFORE rt/core exist. Do not use BL `cons`/`list`
+  ; here: their generated calls go through BeamLisp.Ns.Rt, which is not loaded.
+  (Enum/reduce (String/split ns ".") :"Elixir.BeamLisp.Ns"
+    (fn [segment mod] (Module/concat mod (Macro/camelize segment)))))
+
+(defn module_for
+  "The stable namespace shim module for `ns`: the platform's module, or, for a
+   realm-local namespace, the same name under `R<key>`."
+  [ns]
+  (Enum/reduce (String/split ns ".") (realm_base ns :"Elixir.BeamLisp.Ns")
+    (fn [segment mod] (Module/concat mod (Macro/camelize segment)))))
+
+(defn fresh_body_module
+  "A fresh, immutable body module name for one `defvar`.
+
+   With no namespace: process-unique, `BeamLisp.Ns.Fn.M<n>` for an ever-growing `n`.
+
+   For a namespace that belongs to a realm: `BeamLisp.Ns.Fn.<segment>.M<n>`, where `n`
+   counts up from 1 PER REALM and starts over when the realm closes
+   (`reset_body_sequence/1`). A module name is an atom and atoms are never collected,
+   so a realm that is opened and closed repeatedly must reuse its names rather than mint
+   a new set each time; the segment also lets the realm's close find and delete them."
+  ([]
+   (Module/concat
+     (list :"Elixir.BeamLisp.Ns"
+           "Fn"
+           (str "M" (Integer/to_string (System/unique_integer (list :positive)))))))
+  ([ns]
+   (let [segment (realm_of ns)]
+     (if (erlang/== nil segment)
+       (fresh_body_module)
+       (let [n (atomics/add_get (body_sequence segment) 1 1)]
+         (Module/concat
+           (list :"Elixir.BeamLisp.Ns" "Fn" segment
+                 (erlang/iolist_to_binary (list "M" (Integer/to_string n))))))))))
+
+(defn- body_sequence
+  "The per-realm counter behind `fresh_body_module/1`: an `atomics` ref in
+   `persistent_term`, created once per segment (under a lock, so two first callers
+   cannot each create one and hand out the same name)."
+  [segment]
+  (let [key (tuple :bl_body_sequence segment)
+        existing (persistent_term/get key nil)]
+    (if (erlang/== nil existing)
+      (erlang/apply :global :trans
+        (list (tuple key (erlang/self))
+              (fn []
+                (let [again (persistent_term/get key nil)]
+                  (if (erlang/== nil again)
+                    (let [fresh (atomics/new 1 (list))]
+                      (persistent_term/put key fresh)
+                      fresh)
+                    again)))))
+      existing)))
+
+(defn reset_body_sequence
+  "Start `segment`'s body-module numbering over: the realm closed and its modules are
+   gone, so the next open reuses the same names (and so the same atoms)."
+  [segment]
+  (let [existing (persistent_term/get (tuple :bl_body_sequence segment) nil)]
+    (if (erlang/== nil existing) :ok (do (atomics/put existing 1 0) :ok))))
+
+(defn attach_body_module
+  "Each def tuple with its body module appended as the last field."
+  [new_defs body_mod]
+  (Enum/map new_defs (fn [entry] (Tuple/insert_at entry (erlang/tuple_size entry) body_mod))))
+
+(defn fixed_variadic
+  "The `{fixed, variadic}` link shapes of `new_defs`: `fixed` a list of
+   `{arity, fname}` in source order, `variadic` the one `{min, fname}` (or nil).
+   Non-def noise in the list is skipped, as the Elixir comprehension skipped it."
+  [new_defs]
+  (let [fixed (Enum/map
+                (Enum/filter new_defs
+                  (fn [d] (and (tuple? d)
+                               (= 4 (erlang/tuple_size d))
+                               (= :fixed (elem d 0)))))
+                (fn [d] (tuple (elem d 1) (elem d 2))))
+        variadic (Enum/find_value new_defs
+                   (fn [d]
+                     (when (and (tuple? d)
+                                (= 4 (erlang/tuple_size d))
+                                (= :variadic (elem d 0)))
+                       (tuple (elem d 1) (elem d 2)))))]
+    (tuple fixed variadic)))
+
+(defn body_modules
+  "A map from body module to the clause payloads emitted into it, across every
+   var of `ns_defs`."
+  [ns_defs]
+  (Enum/group_by
+    (Enum/flat_map ns_defs (fn [entry] (elem entry 1)))
+    (fn [d] (elem d 4))
+    (fn [d] (elem d 3))))
+
+
+
+(defn shim_clauses
+  "One forwarding clause per distinct `{fname, arity}`, in first-seen order,
+   each calling `body_mod.fname(arg0, …)`.
+
+   The 2-arity names the NAMESPACE and guards every clause with its readiness
+   (`BeamLisp.Loader/ensure_ready`, one registry read once it is initialized):
+   a shim is what an AOT-baked direct call (`Module.fn(args)`, resolved when
+   the provider happened to be loaded at compile time) lands in — before the
+   namespace's `__bl_init__/0` has replayed its top-level forms — so the guard
+   is what lets a demand-driven require and a statically linked call coexist.
+
+   The 1-arity names no namespace and emits the plain forwarders. That is the
+   shape `Link/defvar` regenerates live (the namespace's own code is running,
+   so it IS initialized) and the shape the pinned ABI tests pin, so it stays
+   byte-for-byte what it has always been."
+  ([ns_defs] (shim_clauses nil ns_defs))
+  ([ns ns_defs]
+   (let [guard-ns (if (or (nil? ns) (erlang/== ns "core") (erlang/== ns "sugar")
+                         (Enum/member? (BeamLisp.Tiers/boot_namespaces) ns))
+                    nil ns)]
+   (Enum/map
+     (Enum/uniq_by
+       (Enum/flat_map ns_defs (fn [entry] (elem entry 1)))
+       (fn [d] (tuple (elem d 2) (clause_arity (elem d 3)))))
+     (fn [d] (shim_clause guard-ns (elem d 2) (clause_arity (elem d 3)) (elem d 4)))))))
+
+(defn- clause_arity
+  "The parameter count of a `:defn-clause` payload; anything else is the
+   compiler-contract breach the Elixir clause raised."
+  [payload]
+  (if (and (erlang/is_map payload) (= :"defn-clause" (get payload :op)))
+    (erlang/length (get payload :params))
+    (erlang/error
+      (Elixir.ArgumentError/exception
+        (str "canonical emitter requires :defn-clause payloads, got: "
+             (Kernel/inspect payload (list (tuple :limit 4))))))))
+
+(defn- shim_clause
+  "The forwarding clause for one `fname`/`arity` into `body_mod`, guarded by
+   `ns`'s readiness when a namespace is named."
+  [ns fname arity body_mod]
+  (let [names (if (zero? arity) (list) (Enum/map (range arity) (fn [i] (str "arg" i))))
+        params (Enum/map names (fn [n] {:pop :pvar :name n}))
+        call (remote body_mod fname (Enum/map names (fn [n] (make-var n))))]
+    {:op :"defn-clause"
+     :fname fname
+     :params params
+     :guard nil
+     :body (if (nil? ns)
+             call
+             (sequence (list (remote :Elixir.BeamLisp.Loader :ensure_ready (list (lit ns)))
+                             call)))
+     :ann {}}))
+
+; Checked rewrites live in optimize.bl. The canonical lowerer calls its
+; module API for every descriptor, including host, AOT, live and eval output.
+; This pinned adapter owns the exact host ABI, not another optimizer.
+
+
+; ── descriptors ──────────────────────────────────────────────────────────────
+
+(defn descriptor
+  "The canonical ANF module descriptor for `name`, with `exports`/`attrs`
+   canonicalized to Vector pairs."
+  ([name clauses exports] (descriptor name clauses exports (list) {}))
+  ([name clauses exports attrs] (descriptor name clauses exports attrs {}))
+  ([name clauses exports attrs ann]
+   (BeamLisp.Ns.Anf/module name
+     clauses
+     (Enum/map exports (fn [pair] (canonical-pair pair)))
+     (Enum/map attrs (fn [pair] (canonical-pair pair)))
+     ann)))
+
+(defn- canonical-pair
+  "A `[left right]` export/attr pair. A Vector passes through; a 2-tuple and a
+   2-element list both become `Vector.new([left, right])`. Any other shape is
+   the `FunctionClauseError` the Elixir clauses raised."
+  [pair]
+  (cond
+    (vector? pair) pair
+    (and (tuple? pair) (= 2 (erlang/tuple_size pair)))
+      (BeamLisp.Vector/new (list (elem pair 0) (elem pair 1)))
+    (proper-list-2? pair)
+      (BeamLisp.Vector/new (list (first pair) (second pair)))
+    :else (erlang/error :function_clause)))
+
+(defn- proper-list-2?
+  "Whether `x` is a proper two-element Erlang list. `length/1` is the check, so
+   an improper cons answers false rather than raising."
+  [x]
+  (try (and (erlang/is_list x) (= 2 (erlang/length x)))
+       (catch _e false)))
+
+(defn descriptor_for
+  "The descriptor for `name` whose exports are exactly its clauses'
+   `{fname, arity}`, deduplicated in first-seen order."
+  ([name clauses] (descriptor_for name clauses (list) {}))
+  ([name clauses attrs] (descriptor_for name clauses attrs {}))
+  ([name clauses attrs ann]
+   (let [exports (Enum/uniq
+                   (Enum/map clauses
+                     (fn [c] (tuple (erlang/map_get :fname c)
+                                    (erlang/length (erlang/map_get :params c))))))]
+     (descriptor name clauses exports attrs ann))))
+
+(defn compile_descriptor
+  "Lower a descriptor to `{module, beam}` through the Core backend, refusing a
+   result that is not an atom-named binary beam.
+
+   The canonical lowerer invokes the single optimize/module API. Host,
+   namespace and live emissions share its checked rules; this adapter retains
+   only the exact module/binary host boundary. The boot source identity covers
+   optimize.bl, so changes rotate the authoritative compiler generation."
+  [descriptor]
+  (let [compiled (BeamLisp.Ns.Lower/descriptor->beam descriptor)]
+    (if (and (tuple? compiled)
+             (= 2 (erlang/tuple_size compiled))
+             (erlang/is_atom (elem compiled 0))
+             (erlang/is_binary (elem compiled 1)))
+      compiled
+      (erlang/error
+        (Elixir.RuntimeError/exception
+          (str "Core module emitter returned invalid result: " (Kernel/inspect compiled)))))))
+
+(defn load_binary!
+  "Publish a compiled `{module, bytes}` beam; the module atom on success,
+   a `RuntimeError` naming the refusal otherwise."
+  ([beam] (load_binary! beam "beam_lisp_generated"))
+  ([beam filename]
+   (if (and (tuple? beam) (= 2 (erlang/tuple_size beam)))
+     (let [mod (elem beam 0)
+           bytes (elem beam 1)
+           result (code/load_binary mod (String/to_charlist filename) bytes)]
+       (cond
+         (and (tuple? result)
+              (= 2 (erlang/tuple_size result))
+              (= :module (elem result 0))
+              (= mod (elem result 1)))
+           mod
+
+         (and (tuple? result)
+              (= 2 (erlang/tuple_size result))
+              (= :error (elem result 0)))
+           (erlang/error
+             (Elixir.RuntimeError/exception
+               (str "cannot publish " (Kernel/inspect mod) ": " (Kernel/inspect (elem result 1)))))
+
+         :else
+           (erlang/error
+             (Elixir.RuntimeError/exception
+               (str "cannot publish " (Kernel/inspect mod) ": " (Kernel/inspect result))))))
+     (erlang/error :function_clause))))
+
+; ── fn values ────────────────────────────────────────────────────────────────
+
+(defn fn_value
+  "The interned value of a defn: a single fixed arity is a bare capture, any
+   other shape is the `{:\"$blfn\", fixed-map, variadic-or-nil}` tag."
+  [mod fixed variadic]
+  (if (and (single-fixed? fixed) (nil? variadic))
+    (let [pair (first fixed)]
+      (Function/capture mod (elem pair 1) (elem pair 0)))
+    (let [fixed_map (Map/new fixed
+                      (fn [pair]
+                        (tuple (elem pair 0)
+                               (Function/capture mod (elem pair 1) (elem pair 0)))))
+          rest (cond
+                 (nil? variadic) nil
+                 (and (tuple? variadic) (= 2 (erlang/tuple_size variadic)))
+                   (tuple (elem variadic 0)
+                          (Function/capture mod (elem variadic 1) (inc (elem variadic 0))))
+                 :else (erlang/error :case_clause))]
+      (tuple :"$blfn" fixed_map rest))))
+
+(defn- single-fixed?
+  "The Elixir head `[{arity, fname}]` matched a one-element list of a 2-tuple."
+  [fixed]
+  (and (erlang/is_list fixed)
+       (= 1 (erlang/length fixed))
+       (tuple? (first fixed))
+       (= 2 (erlang/tuple_size (first fixed)))))
+
+; ── ANF node constructors ────────────────────────────────────────────────────
+
+(defn lit [value] {:op :lit :val value :ann {}})
+
+(defn- make-var [name] {:op :var :name name :ann {}})
+
+(defn var
+  "A local-variable reference node. Named `var`, which is also a compiler
+   special form, so the body delegates rather than recursing through a call the
+   special form would capture."
+  [name]
+  (make-var name))
+
+(defn remote [mod fun args] {:op :remote :mod mod :fun fun :args args :ann {}})
+
+(defn sequence [nodes] {:op :do :stmts nodes :ann {}})
+
+(defn closure
+  "A zero-parameter closure node over `body`."
+  [body]
+  {:op :fn :clauses (list {:pats (list) :guard nil :body body}) :ann {}})
+
+(defn function_clause
+  "A `:defn-clause` definition node."
+  ([fname body] (function_clause fname body (list)))
+  ([fname body params]
+   {:op :"defn-clause" :fname fname :params params :guard nil :body body :ann {}}))

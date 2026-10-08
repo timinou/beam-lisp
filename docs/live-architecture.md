@@ -19,17 +19,18 @@ The one idea, before the diagrams:
 ```
                           priv/lib/live/
   ┌──────────────────────────────────────────────────────────────────┐
-  │  style.bl   design tokens + atomic CSS   ── a brand, as a value    │
-  │  ui.bl      accessible components         ── functions → hiccup     │
+  │  socket.bl  defview · deflive · the loop  ── binds a view to a conn  │
+  │  app.bl     routes · screens · worlds     ── an app, as a value      │
   │  hiccup.bl  hiccup → HTML string          ── the render primitive   │
   │  diff.bl    keyed structural diff → ops   ── the minimal-patch core  │
-  │  socket.bl  defview · deflive · the loop  ── binds a view to a conn  │
+  │  lint.bl    unkeyed list, flagged static  ── the render check        │
   │  client.js  applies ops to the real DOM   ── the browser half        │
   └──────────────────────────────────────────────────────────────────┘
                                 │  rests on
                                 ▼
                           priv/lib/datom/  (the log-structured database)
                           priv/lib/auth.bl (the guard + the authorizer)
+                          priv/lib/loom/   (tokens, box, ui — the design system)
 ```
 
 Nothing in the view layer knows about sockets; nothing in the socket layer

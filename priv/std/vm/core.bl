@@ -46,6 +46,25 @@
   [spec]
   (or (:caps spec) :all))
 
+(def REALM-KEY-ROW :realm_key)
+(def REALM-DECL-ROW :realm_decl)
+
+(defn- mark-realm!
+  "Record, IN the realm's env, whose it is: its key and what its project declares about
+   the namespaces it owns. The loader reads both through the env chain, so they follow
+   the env into every process spawned under it, and are gone with it when it is
+   destroyed. A spec with no key (a test's bare spec) is no realm: nothing is recorded,
+   and its loads behave as before."
+  [e spec]
+  (when (some? (:key spec))
+   ;; Resolve constants before installing realm_key changes name resolution.
+   ;; No namespace lookup should happen in the half-configured new scope.
+   (let [key-row REALM-KEY-ROW decl-row REALM-DECL-ROW]
+    (env/with-env e
+      (fn []
+        (BeamLisp.Env/put_key (tuple key-row) (:key spec))
+        (BeamLisp.Env/put_key (tuple decl-row) (:decl spec)))))))
+
 (defn spawn-vm
   "Materialize a VM from `spec`. Forks a capped env off the warm `:base` (or
    :global), readies the owner registry, and returns the VM value with status
@@ -58,8 +77,16 @@
         e (if (nil? heap)
             (env/fork base {:caps caps})
             (env/fork base {:caps caps :max-heap-words heap}))]
+    (mark-realm! e spec)
     {:id (:id spec)
+     :key (:key spec)
+     :alias (:alias spec)
+     :decl (:decl spec)
      :root (:root spec)
+     ;; the tree's declared periodic work rides on the VM value: the manager arms
+     ;; it from here (`vm.sched/start-for` reads `:schedules`), so a VM that drops
+     ;; the key silently arms nothing
+     :schedules (:schedules spec)
      :base base
      :env e
      :caps caps
@@ -93,13 +120,67 @@
      (fn [] (env/with-env (:env vm)
               (fn [] (osenv/with-env os-env thunk)))))))
 
+(defn- realm-modules
+  "The modules a realm owns: every loaded module named under `BeamLisp.Ns.R<key>.`,
+   `BeamLisp.Ns.Fn.R<key>.` or `BeamLisp.Server.R<key>.` (its own and shadowed namespaces,
+   their per-defn body modules, and their servers). Production emission names a body
+   module `BeamLisp.Ns.Fn.R<key>.M<n>`; there is no `Ns.Body.R`/`Ns.Init.R` family —
+   AOT companion naming and realm replay are still deferred, so nothing scans for it."
+  [key]
+  (let [prefixes [(str "Elixir.BeamLisp.Ns.R" key ".")        ; its namespaces
+                  (str "Elixir.BeamLisp.Ns.Fn.R" key ".")     ; their per-defn body modules
+                  (str "Elixir.BeamLisp.Server.R" key ".")]]  ; its servers
+    (filter (fn [m]
+              (let [n (Atom/to_string m)]
+                (some (fn [p] (String/starts_with? n p)) prefixes)))
+            (map first (code/all_loaded)))))
+
+(defn- retire-module!
+  "Retire code without killing a caller that still executes it. A busy old
+   version keeps its code lease; module publication will refuse a third version.
+   Returns true when the module is fully gone."
+  [mod]
+  (if (code/soft_purge mod)
+    (do (code/delete mod) (code/soft_purge mod))
+    false))
+
+(defn- purge-realm-modules-locked!
+  "The realm's retirement transaction, run with the realm lock held: scan the
+   same-key modules, union in the retained inventory, soft-retire each, then either
+   erase the inventory and reset the body numbering (every lease ended) or write the
+   retained set back. Returns the number retired."
+  [key]
+  (let [inventory (tuple :vm_retired_modules key)
+        ;; Deleted modules with busy old code disappear from code/all_loaded.
+        ;; Retain their identity until soft_purge confirms the lease has ended.
+        mods (vec (distinct (concat (persistent_term/get inventory []) (realm-modules key))))
+        results (mapv (fn [mod] [mod (retire-module! mod)]) mods)
+        retained (mapv first (filterv (fn [entry] (= false (get entry 1))) results))]
+    (if (empty? retained)
+      (do (persistent_term/erase inventory)
+          (BeamLisp.Emit/reset_body_sequence (str "R" key)))
+      (persistent_term/put inventory retained))
+    (- (count mods) (count retained))))
+
+(defn- purge-realm-modules!
+  "Serialize scan, soft retirement, inventory publication and counter reset for
+   one realm. An aborted acquisition mutates nothing; a later drain retries."
+  [key]
+  (let [outcome (erlang/apply :global :trans
+                  (list (tuple (tuple :vm_retired_modules key) (erlang/self))
+                        (fn [] (purge-realm-modules-locked! key))))]
+    (if (= :aborted outcome) 0 outcome)))
+
 (defn drain
-  "Tear `vm` down: kill every process it owns, then destroy its env. Returns
-   {:halted n}. The node and every other VM are untouched."
+  "Tear `vm` down: kill every process it owns, destroy its env, and retire the
+   modules its own namespaces compiled into. A busy body is retained (soft
+   retirement), never hard-purged, and the retirement runs one per-key `:global`
+   transaction, so concurrent drains of the same realm serialize. Returns
+   {:halted n :purged n}. The node and every other VM are untouched."
   [vm]
   (let [r (owner/halt (:id vm))]
     (env/destroy (:env vm))
-    r))
+    (assoc r :purged (if (some? (:key vm)) (purge-realm-modules! (:key vm)) 0))))
 
 (defn uptime-ms
   "How long `vm` has been alive."

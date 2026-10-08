@@ -1,0 +1,159 @@
+; aot_build_key_test.bl — the build gate and the runtime gate must agree on a
+; beam's TOOLCHAIN key, or a codegen edit leaves both sides stuck forever.
+;
+; Ported from the ExUnit `test/beam_lisp/aot_build_key_test.exs`, which ran the
+; build through the test-only Elixir wrapper `BeamLisp.BuildTask`. The calls now
+; go straight to `priv/build/build.bl` (`build/run`) and `priv/build/build-log.bl`
+; (`path-for`, `read-facts`, `replay`) — no interop seam in the path.
+;
+; ── Build-gate regression ────────────────────────────────────────────────
+;
+; `compile.beam_lisp` must recompile a source whose beam was built by a
+; DIFFERENT toolchain — even when the source bytes are unchanged.
+;
+; The bug this locks in: the runtime drift gate (`AOT.stale?/2`) trusts a beam
+; only when BOTH its source-hash AND its `compiler_key` (a hash of the codegen
+; modules + prelude) match the live toolchain. The build task's `up_to_date?/5`,
+; however, used to compare ONLY the source-hash. So after a codegen edit moved
+; `compiler_key`, the two gates disagreed:
+;
+;   * runtime  → key mismatch → REJECT the beam → recompile from source on
+;                EVERY boot (the ~20s startup tax the field hit)
+;   * build    → hash matches → "up to date" → NEVER re-stamp the beam
+;
+; The stale beam was pinned on disk forever; neither side healed. The fix
+; records `compiler_key` in each manifest entry and adds it to the up-to-date
+; test, so a toolchain drift invalidates the entry and an ordinary
+; `mix compile` rebuilds + re-stamps — no `--force` needed. This test forges
+; the drift by rewriting the log's stored tier key and asserts the next
+; (non-force) run rebuilds rather than no-ops.
+;
+; WHERE THE DRIFT IS FORGED MOVED: the build's memory is the fact log now
+; (`build.log` beside the manifest) and the manifest is its projection, so a
+; manifest edit changes nothing at all (pinned below) and the forge has to
+; happen where the memory is. Same property, one layer down.
+;
+; Run: bl test test/bl/aot_build_key_test.bl
+
+(ns aot-build-key.test
+  (:require [build :as b] [build-log :as blog]))
+
+; The AOT fixture set: hello, math, greeter (requires math+hello), and the
+; per-env fixture. The output dir is unique per file load — a leftover from a
+; killed run cannot be adopted, and two suites never share it.
+(def fixture-dir "test/fixtures/aot")
+(def out (str (System/tmp_dir!) "/bl_aot_build_key_"
+              (erlang/unique_integer (list :positive))))
+(def manifest (Path/join out "compile.beam_lisp"))
+
+(defn- clean! [] (File/rm_rf! out))
+
+(defn- sources
+  "Every `.bl` in the fixture set, sorted — the same set `BuildTask.discover`
+   handed `build/run` under `--source-dir`."
+  []
+  (sort (Path/wildcard (Path/join fixture-dir "**/*.bl"))))
+
+(defn- build!
+  "One AOT build of the fixture set. The shared cache is OFF (as in the sibling
+   `build_test.bl` / `build_log_test.bl`), so a `:built` count is a real compile
+   and a cache hit cannot mask a freshness decision."
+  []
+  (System/put_env "BEAM_LISP_AOT_CACHE" "off")
+  (b/run {:sources (sources) :out out :manifest manifest :jobs 1}))
+
+; `BuildTask.run` answered `{:ok, []} | {:noop, []} | {:error, errors}`; the map
+; `build/run` returns carries the same three facts. These name them.
+(defn- ok?   [r] (and (empty? (:errors r)) (pos? (:built r))))
+(defn- noop? [r] (and (empty? (:errors r)) (= 0 (:built r))))
+(defn- why   [r] (str "build errors: " (str (vec (:errors r)))))
+
+(defn- read-manifest [] (b/read-manifest manifest))
+
+(defn- math-source-path
+  "The manifest key for `math.bl` — the source the forge targets."
+  []
+  (first (filter (fn [p] (ends-with? p "math.bl")) (keys (read-manifest)))))
+
+; ── the fact log ─────────────────────────────────────────────────────────────
+; `build-log` is beam-lisp (`priv/build/build-log.bl`) — the ONE definition of
+; the build's memory. `state(log) == replay(read-facts(log))`, spelled where it
+; lives.
+
+(defn- log-path [] (blog/path-for manifest))
+(defn- log-state [] (blog/replay (blog/read-facts (log-path))))
+(defn- recorded-tier [path] (:tier (get (:sources (log-state)) path)))
+
+; The log is TEXT — that is the point of it — so a forge is a string edit, not
+; a rebuild of the structures the reader uses. If the format moves out from
+; under this pattern the test fails loudly rather than passing vacuously.
+(defn- forge-recorded-tier! [path tier]
+  (let [text (File/read! (log-path))
+        pattern (Regex/compile!
+                  (str "(\\[:build/built \"" (Regex/escape path)
+                       "\" \"[0-9a-f]+\" )\"[^\"]*\""))]
+    (is (Regex/match? pattern text)
+        (str "no :build/built fact for " path " in the log"))
+    (File/write! (log-path)
+                 (Regex/replace pattern text (str "\\1\"" tier "\"")
+                                (list (tuple :global false))))))
+
+; ── the tests ────────────────────────────────────────────────────────────────
+
+(deftest warm-build-records-compiler-key-and-noops
+  (clean!)
+  (let [r (build!)] (is (ok? r) (why r)))
+  (let [path (math-source-path)
+        entry (get (read-manifest) path)]
+    ; The entry now carries the toolchain key alongside the source hash.
+    (is (contains? entry :key) "manifest entry must record :key")
+    (is (= (:key entry) (BeamLisp.AOTCache/compiler_key))))
+  ; An unchanged tree with a matching key recompiles nothing.
+  (let [r (build!)] (is (noop? r) (why r))))
+
+(deftest tier-key-drift-forces-rebuild-without-force
+  (clean!)
+  (let [r (build!)] (is (ok? r) (why r)))
+  (let [path (math-source-path)]
+    ; Sanity: a plain second run is a no-op (key + tier both match).
+    (let [r (build!)] (is (noop? r) (why r)))
+
+    ; The manifest is a PROJECTION, so rewriting it changes nothing: the build
+    ; no longer reads it. Worth pinning, because "the manifest is derived" is
+    ; now the shape of the whole build.
+    (let [m (read-manifest)]
+      (b/write-manifest manifest
+                        (assoc m path (assoc (get m path) :key "deadbeef-not-current")))
+      (let [r (build!)] (is (noop? r) (why r))))
+
+    ; Forge the exact desync a codegen edit produces, where the memory is: same
+    ; source bytes, but the recorded fact says the beam came from a toolchain
+    ; whose key is gone. The build must REBUILD, not no-op — the build gate
+    ; agreeing with the runtime gate. This is the whole fix.
+    (forge-recorded-tier! path "deadbeef-not-the-current-compiler-key")
+    (is (not= (recorded-tier path) (BeamLisp.AOTCache/compiler_key)))
+
+    (let [r (build!)] (is (ok? r) (why r)))
+
+    ; And it re-records the live key, so the tree is warm again.
+    (is (= (recorded-tier path) (BeamLisp.AOTCache/compiler_key)))
+    (let [r (build!)] (is (noop? r) (why r)))))
+
+(deftest pre-log-directory-migrates-from-manifest-then-warms
+  (clean!)
+  (let [r (build!)] (is (ok? r) (why r)))
+  (let [path (math-source-path)]
+    ; A build directory written before the log existed: a manifest, no log, and
+    ; an entry in the OLD shape (no :key). The build reads it ONCE — rebuilding
+    ; the source whose tier key it cannot vouch for, re-stamping it — and is
+    ; warm from then on. Safe by construction: a missing tier key can only fail
+    ; the match, never pass it.
+    (File/rm! (log-path))
+    (let [m (read-manifest)]
+      (b/write-manifest manifest
+                        (assoc m path (dissoc (get m path) :key))))
+
+    (let [r (build!)] (is (ok? r) (why r)))
+    (is (= (recorded-tier path) (BeamLisp.AOTCache/compiler_key)))
+    (is (contains? (get (read-manifest) path) :key))
+    (let [r (build!)] (is (noop? r) (why r)))))

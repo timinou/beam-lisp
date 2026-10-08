@@ -99,15 +99,22 @@
 
 (def ^:private CHUNK-BYTES 65536)
 
-;; `File.stream!` with a byte size is a lazy Elixir stream of binaries; it is
-;; realized as a seq here so the consumer sees plain chunks. 64 KiB matches
-;; the BEAM's own file read buffering.
+;; The lazy seq does not own a live descriptor between chunks: consumers may
+;; stop after `take`, or realize it from a different process. Positional reads
+;; keep both early termination and process ownership safe, with bounded memory.
 (extend-protocol datom.blob/BlobStream
   BlobFs
   (-blob-stream [bs sha]
     (let [p (path-for bs sha)]
       (if (= true (File/exists? p))
-        (seq (Enum/to_list (File/stream! p CHUNK-BYTES (to-list []))))
+        ((fn next-chunk [offset]
+           (lazy-seq
+             (let [fd (File/open! p (to-list [:read :binary :raw]))
+                   r (try (erlang/apply :file :pread (list fd offset CHUNK-BYTES))
+                          (finally (File/close fd)))]
+               (cond (= r :eof) nil
+                     (= :ok (elem r 0)) (cons (elem r 1) (next-chunk (+ offset (erlang/byte_size (elem r 1)))))
+                     :else (throw (ex-info "Blob stream read failed" {})))))) 0)
         nil))))
 
 ;; A `:tmp` directory is deleted on close; a named one is durable and kept.
@@ -117,3 +124,31 @@
   (-close [bs]
     (if (:ephemeral? bs) (File/rm_rf! (:dir bs)) nil)
     nil))
+
+
+(extend-protocol datom.blob/BlobImport
+  BlobFs
+  (-blob-import [bs path opts]
+    (let [tmp (str (:dir bs) "/.tmp/import_" (unique-suffix))
+          input (File/open! path (to-list [:read :binary :raw]))
+          output (try (File/open! tmp (to-list [:write :binary :raw]))
+                      (catch e (File/close input) (throw e)))]
+      (try
+        (let [result (loop [hash (crypto/hash_init :sha256) size 0]
+                       (let [r (erlang/apply :file :read (list input 65536))]
+                         (cond
+                           (= r :eof) {:sha (crypto/hash_final hash) :size size}
+                           (= :ok (elem r 0))
+                           (let [bytes (elem r 1) written (erlang/apply :file :write (list output bytes))]
+                             (when (not= :ok written) (throw (ex-info "Blob import write failed" {})))
+                             (recur (crypto/hash_update hash bytes) (+ size (erlang/byte_size bytes))))
+                           :else (throw (ex-info "Blob import read failed" {})))))
+              _ (when (not= :ok (erlang/apply :file :sync (list output)))
+                  (throw (ex-info "Blob import sync failed" {})))
+              _ (File/close output)
+              final (path-for bs (:sha result))]
+          (File/mkdir_p! (Path/dirname final))
+          (if (File/exists? final) (File/rm! tmp) (File/rename! tmp final))
+          (datom.file/->DFile (:sha result) (:size result) (:media-type opts)))
+        (finally (File/close input) (File/close output)
+                 (when (File/exists? tmp) (File/rm tmp)))))))

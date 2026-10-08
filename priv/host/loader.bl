@@ -1,0 +1,1393 @@
+; host/loader.bl — the pinned HOST MODULE for `Elixir.BeamLisp.Loader`.
+;
+; `lib/beam_lisp/loader.ex` resolves a namespace to a file on the load path and
+; evaluates it under its own namespace. It is called from `BeamLisp.Compiler`'s
+; `enable_bl_backend/0` as boot interns the compiler, from `bin/bl`'s cold path,
+; and from `AOT`/`Env` on every require — so it is one of the modules that must
+; exist BEFORE the language exists. This file is the `.bl` port of that module,
+; compiled by `BeamLisp.AOT/compile_host_file` into ONE exact-named beam
+; (`Elixir.BeamLisp.Loader.beam`) whose top-level `defn`s are plain exported
+; functions — the exact call surface every caller already names at
+; `Elixir.BeamLisp.Loader`, so no caller is renamed.
+;
+; (This wave owns source and tests only; the seed entry that points a real atom
+; at this file is written by the wave that deletes `loader.ex`. The module is
+; functions-only: no struct to synthesize, no behaviour to record.)
+;
+; ── WHY A PINNED MODULE AND NOT A NAMESPACE ─────────────────────────────────
+;
+; The loader is the thing that loads namespaces. It is on the boot compiler's
+; critical path (`enable_bl_backend/0` → `Loader.ensure_loaded("compiler")`), so
+; it can never itself be an AOT-rebuilt `BeamLisp.Ns.*` namespace — that is the
+; bootstrap circle again. A pinned host beam is a fixed artifact named by the
+; seed manifest, built by one generation and used by the next.
+;
+; ── THE PRE-BOOT CONSTRAINT, AND WHAT IT FORBIDS HERE ───────────────────────
+;
+; The beam must LOAD and its own functions must RUN in a VM that has booted
+; nothing of the language — before `BeamLisp.Ns.Rt` interned a var and before
+; `BeamLisp.init/0` filled the var table. That forbids four things, and each is
+; avoided by name below:
+;
+;   * No `(str …)`. The language's `str` resolves through `BeamLisp.Env`'s var
+;     registry, an ETS lookup a cold VM has no table for. Concatenation is
+;     `erlang/iolist_to_binary` with `String.Chars/to_string` for the wired
+;     pieces — the raw join, no Env in the path (`priv/host/compile_error.bl`'s
+;     rule, which this file follows).
+;
+;   * No `def`. `compile_host_file` refuses value definitions outright (a
+;     pinned module carries FUNCTIONS), so the byte tables the scanner needs are
+;     zero-arg `defn-`s rather than module attributes, and the membership tests
+;     are explicit byte comparisons rather than a list built per call.
+;
+;   * No bitstring syntax. The reader has no `<<…>>`, so the ns-head scanner —
+;     which is byte-precise in the Elixir original (`<<c, rest::binary>>`) — is
+;     written over a BYTE LIST: one `binary_to_list` at the public entry and
+;     list recursion inside. Every stop condition, every skip, and every error
+;     is the same byte test the binary match was.
+;
+;   * No sibling value passed as a function. A bare top-level name passed as a
+;     VALUE compiles to a namespace-var fetch (the shim the pinned path exists
+;     to avoid); every cross-call here is a direct call, and every callback
+;     handed to `Enum`/`File` is a `fn` literal.
+;
+; ── ABI PARITY IS THE CONTRACT ──────────────────────────────────────────────
+;
+; Every public function of the recalled module is reproduced at its exact name
+; and arity, clause for clause, and every private helper too (the pinned emitter
+; exports `defn-` as well, so the helper set is part of the surface a
+; differential test can diff). The shapes that are easy to get subtly wrong:
+;
+;   * `find_file/1` answers a 3-tuple `{:ok, path, content}`, a 3-tuple
+;     `{:wrong_ns, path, declared}` or `nil`. A pinned `.bl` has no tuple-pattern
+;     match, so callers read it by tag with `erlang/element` — never a map
+;     pattern, which would bind nil for a shape it did not check.
+;
+;   * `take_until/2,3` answers the SAME 2-tuple the Elixir original did. The
+;     `declared_ns/1` scanner hands back a BINARY ns name built with
+;     `List/to_string` (the original's `to_string/1`), not `list_to_binary`, so a
+;     non-ASCII byte answers byte for byte what the original answered. The
+;     scanner's STEP functions (`skip_leading/1`, `take_token/1`, `split_token/2`,
+;     `skip_nested/5`) run over a BYTE LIST, so their tail position is a list, not
+;     a binary — they are private helpers, outside the ABI, and every public
+;     entry point converts at its boundary.
+;
+;   * `load_attribution/4,5` reproduces the live default (`stacktrace \\ nil`) as
+;     an explicit 4-arity clause, and builds its message with the same
+;     `Exception.format/2,3`, the same `"form #{i} of #{total}"` text, and the
+;     same `inspect(…, limit: 30, printable_limit: 400, width: 100)`.
+;
+;   * `do_load/3`'s catch is a `(catch e …)` over the raw class
+;     `__EXCEPTION_KIND__`: only `:error` takes the attribution + re-raise the
+;     live `rescue` took; a `:throw` stays a throw and a `:exit` re-raises as an
+;     exit, because the live `rescue` would have let both pass untouched.
+;
+; Run: bin/bl test test/bl/loader_host_test.bl
+
+(ns host.loader)
+
+; ── byte tables (zero-arg defns: a pinned module carries no `def`) ──────────
+
+(defn- ws?
+  "`c in @ws` — the whitespace set the scanner treats as separator: space, tab,
+   newline, carriage return, comma."
+  [c]
+  (or (erlang/== c 32) (erlang/== c 9) (erlang/== c 10) (erlang/== c 13) (erlang/== c 44)))
+
+(defn- token-end?
+  "`c in @token_end` — the characters that end a symbol token: delimiters,
+   quote/reader-macro prefixes and the whitespace-comma."
+  [c]
+  (or (erlang/== c 40) (erlang/== c 41) (erlang/== c 91) (erlang/== c 93)
+      (erlang/== c 123) (erlang/== c 125) (erlang/== c 34) (erlang/== c 44)
+      (erlang/== c 59) (erlang/== c 39) (erlang/== c 96) (erlang/== c 64)
+      (erlang/== c 35) (erlang/== c 126)))
+
+(defn- doc-ext-list
+  "`@doc_extensions`: the source extensions the loader resolves, in order."
+  []
+  (BeamLisp.Tiers/source_extensions))
+
+(defn- plain-ext-list
+  "`@plain_extensions`: extensions whose bytes ARE the program."
+  []
+  (list ".bl" ".clj" ".cljc"))
+
+(defn- clojure-prelude-list
+  "`@clojure_prelude`: the compat namespaces a `.clj`/`.cljc` source needs
+   interned before it is evaluated."
+  []
+  (list "clojure.core-ext" "clojure.core-more" "clojure.re"))
+
+; ── result-tuple readers ────────────────────────────────────────────────────
+;
+; `find_file/1` answers one of three shapes. Without tuple patterns these are
+; read by tag, exactly as the live `case` did.
+
+(defn- ok-result?
+  "True for the 3-tuple `{:ok, path, content}`."
+  [r]
+  (and (erlang/is_tuple r)
+       (erlang/== 3 (erlang/tuple_size r))
+       (erlang/== :ok (erlang/element 1 r))))
+
+(defn- ok4-result?
+  "True for the 4-tuple `{:ok, i, total, form}` `form_at_fault/3` answers."
+  [r]
+  (and (erlang/is_tuple r)
+       (erlang/== 4 (erlang/tuple_size r))
+       (erlang/== :ok (erlang/element 1 r))))
+
+(defn- wrong-ns-result?
+  "True for the 3-tuple `{:wrong_ns, path, declared}`."
+  [r]
+  (and (erlang/is_tuple r)
+       (erlang/== 3 (erlang/tuple_size r))
+       (erlang/== :wrong_ns (erlang/element 1 r))))
+
+(defn- list-member?
+  "Membership for the short extension lists — the `in` test the live module
+   wrote as a list literal."
+  [xs x]
+  (Enum/any? xs (fn [y] (erlang/== y x))))
+
+; ── the load path ───────────────────────────────────────────────────────────
+
+(defn with_load_path
+  "Evaluate `path` with its directory on the load path, then pop it."
+  [dir fun]
+  (let [fixed (Process/get :bl_fixed_dirs)]
+    (BeamLisp.Env/push_load_path dir)
+    (if (nil? fixed) nil (Process/put :bl_fixed_dirs (cons dir fixed)))
+    (try
+      (fun)
+      (finally
+        (BeamLisp.Env/pop_load_path)
+        (if (nil? fixed) (Process/delete :bl_fixed_dirs)
+          (Process/put :bl_fixed_dirs fixed))))))
+
+(defn source_hash
+  "The provenance hash of `ns`'s source `.bl` on the current search path, or
+   `nil` when no source is findable. `sha256(content) |> Base.encode16()`."
+  [ns]
+  :when (string? ns)
+  (let [r (find_file ns)]
+    (if (ok-result? r)
+      (Base/encode16 (crypto/hash :sha256 (erlang/element 3 r)))
+      nil)))
+
+(defn source_content
+  "The source CONTENT of `ns` on the current search path, or `nil`."
+  [ns]
+  :when (string? ns)
+  (let [r (find_file ns)]
+    (if (ok-result? r) (erlang/element 3 r) nil)))
+
+(defn with_search_dir
+  "Run `fun` with `dir` pinned as the sole ambient search directory, so
+   `find_file/1` / `source_hash/1` resolve sources from there. Restores the prior
+   binding."
+  [dir fun]
+  (let [prev (Process/get :bl_search_dirs)
+        fixed (Process/get :bl_fixed_dirs)]
+    (Process/put :bl_search_dirs (list dir))
+    (Process/put :bl_fixed_dirs (list dir))
+    (try
+      (fun)
+      (finally
+        (if (nil? prev) (Process/delete :bl_search_dirs)
+          (Process/put :bl_search_dirs prev))
+        (if (nil? fixed) (Process/delete :bl_fixed_dirs)
+          (Process/put :bl_fixed_dirs fixed))))))
+
+(defn source_hash_in
+  "`source_hash/1` for `ns` resolved against `dir` alone."
+  [dir ns]
+  (with_search_dir dir (fn [] (source_hash ns))))
+
+(defn with_ambient_dirs
+  "Run `fun` with `dirs` bound as the ambient search roots for every namespace
+   load it triggers, in load order. Restores the prior binding."
+  [dirs fun]
+  :when (list? dirs)
+  (let [prev (Process/get :bl_ambient_dirs)]
+    (Process/put :bl_ambient_dirs dirs)
+
+    (try
+      (fun)
+      (finally
+        (if (nil? prev)
+          (Process/delete :bl_ambient_dirs)
+          (Process/put :bl_ambient_dirs prev))))))
+
+; ── resolvability ───────────────────────────────────────────────────────────
+
+(defn resolvable?
+  "Is `ns` a beam-lisp namespace this loader COULD load — already in the env,
+   compiled AOT, or present as a source file on the search path? Never loads
+   anything."
+  [ns]
+  :when (string? ns)
+  (if (or (erlang/== ns "core") (BeamLisp.Env/loaded_ns? ns))
+    true
+    (let [mod (BeamLisp.Link/module_for ns)]
+      ;; A module loaded during this pass overrides an earlier negative source
+      ;; result without waiting for the next pass. This is a local code-table
+      ;; read, not another code-server lookup for every qualified call.
+      (if (erlang/not (erlang/== false (code/is_loaded mod)))
+        true
+        (let [pass (Process/get :bl_declaration_snapshot :undefined)
+              dirs (search_dirs)
+              ;; Relative roots also depend on the current cwd. Absolute roots
+              ;; avoid that file-server request on the compiler's common path.
+              context (if (Enum/all? dirs (fn [d] (erlang/== :absolute (Path/type d))))
+                        (tuple :resolvable dirs ns)
+                        (tuple :resolvable (File/cwd!) dirs ns))
+              hit (if (erlang/== pass :undefined) :undefined (Map/get pass context :undefined))]
+          (if (erlang/not (erlang/== hit :undefined))
+            hit
+            (let [result (or (Code/ensure_loaded? mod) (source_on_path? ns))]
+              (if (or (erlang/== pass :undefined)
+                      (erlang/not (erlang/== false (code/is_loaded mod)))
+                      (erlang/>= (erlang/map_size (Process/get :bl_declaration_snapshot {})) 4096)) nil
+                (Process/put :bl_declaration_snapshot
+                  (Map/put (Process/get :bl_declaration_snapshot {}) context result)))
+              result)))))))
+
+(defn- source_on_path?
+  "The same rule `find_file/1` applies: a file serves `ns` only if it DECLARES
+   `ns`."
+  [ns]
+  (ok-result? (find_file ns)))
+
+; ── ensure_loaded ───────────────────────────────────────────────────────────
+
+(defn ensure_loaded [ns]
+  :when (string? ns)
+  (ensure_loaded_in ns (Process/get :bl_fixed_dirs)))
+
+(defn- optional_timing
+  "Never invoke optional language code without an enabled sink. A registered
+   AOT function may still have deferred initialization, which itself loads code.
+   Guard discovery and execution against recursive telemetry initialization."
+  []
+  (if (Process/get :bl_loader_timing_active) nil
+    (let [env (erlang/get :bl_env)
+          local (Process/get :bl_diagnostics)
+          state (if (and (erlang/is_map local)
+                         (erlang/== env (Map/get local :environment)))
+                  local (persistent_term/get (tuple :bl_diagnostics_config env) {}))]
+      (when (Map/get state :sink)
+        (Process/put :bl_loader_timing_active true)
+        (try
+          (let [r (BeamLisp.Env/lookup (tuple "diagnostics" "timing-hook"))]
+            (when (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+              (BeamLisp.Ns.Rt/invoke (erlang/element 2 r) (list))))
+          (finally (Process/delete :bl_loader_timing_active)))))))
+
+(defn- ensure_loaded_in
+  "Load `ns` from `<ns>.bl` on the load paths, unless already loaded.
+
+   AOT first: `AOT.ensure_loaded/1` answers `:loaded` for a compiled beam and
+   `:no_module` when nothing is on the code path, so an uncompiled checkout
+   still works through the source branch — slowly, and correctly. All library
+   loads run in the pinned `Loader.Server` process; the ambient search dirs are
+   captured HERE, in the caller, because the caller's env chain does not survive
+   the hop into the server. An explicit fixed context preserves a deferred
+   declaration even if the eventual caller changed its search roots."
+  [ns fixed]
+  :when (string? ns)
+  (let [loading (Process/get :bl_loading (MapSet/new))]
+    (cond
+      (or (erlang/== ns "core") (BeamLisp.Env/loaded_ns? ns))
+      :ok
+
+      (MapSet/member? loading ns)
+      :ok
+
+      :else
+      (let [dirs (or fixed (Process/get :bl_search_dirs)
+                   (erlang/++ (or (Process/get :bl_ambient_dirs) (list (File/cwd!)))
+                              (extra_dirs)))
+            caller-env (BeamLisp.Env/env_id)
+            caller-realm (realm_facts)
+            ;; Optional, already-loaded diagnostics only: never require a
+            ;; telemetry library while bootstrapping that library's loader.
+            timing (optional_timing)
+            timed (fn [phase f]
+                    (if timing
+                      (let [previous (Process/get :bl_loader_timing_active)
+                            previous-ns (Process/get :bl_loader_timing_ns)]
+                        (Process/put :bl_loader_timing_active true)
+                        (Process/put :bl_loader_timing_ns ns)
+                        (try (BeamLisp.Ns.Rt/invoke timing (list phase f))
+                          (finally
+                            (restore-pdict :bl_loader_timing_ns previous-ns)
+                            (restore-pdict :bl_loader_timing_active previous))))
+                      (f)))
+            run-loader (fn [] (BeamLisp.Loader.Server/run
+          (fn []
+            (let [prev (Process/get :bl_search_dirs)
+                  prev_fixed (Process/get :bl_fixed_dirs)
+                  prev_env (Process/get :bl_load_env)
+                  prev_realm (Process/get :bl_load_realm)]
+              (Process/put :bl_load_env caller-env)
+              (Process/put :bl_load_realm caller-realm)
+              (Process/put :bl_search_dirs dirs)
+              (if (nil? fixed) (Process/delete :bl_fixed_dirs)
+                (Process/put :bl_fixed_dirs fixed))
+              (try
+                (timed :loader-worker
+                  (fn []
+                    (let [run (fn [] (with_declaration_snapshot (fn [] (ensure_loaded_locked ns))))]
+                      (if (erlang/function_exported :Elixir.BeamLisp.AOT :with_source_snapshot 1)
+                        (BeamLisp.AOT/with_source_snapshot run)
+                        (run)))))
+                (finally
+                  (restore-pdict :bl_load_env prev_env)
+                  (restore-pdict :bl_load_realm prev_realm)
+                  (restore-pdict :bl_search_dirs prev)
+                  (restore-pdict :bl_fixed_dirs prev_fixed)))))))]
+        (timed :loader-wait run-loader)))))
+
+(defn- restore-pdict
+  "Put `prev` back under `key`, or delete the key when there was none."
+  [key prev]
+  (if (nil? prev) (Process/delete key) (Process/put key prev)))
+
+(defn- ensure_loaded_locked
+  "The in-server half of `ensure_loaded/1`: the `:bl_loading` cycle guard, then
+   AOT-or-source. The guard is deleted on every exit path."
+  [ns]
+  (if (or (erlang/== ns "core")
+          (BeamLisp.Env/loaded_ns? ns)
+          (MapSet/member? (Process/get :bl_loading (MapSet/new)) ns))
+    :ok
+    (do
+      (Process/put :bl_loading (MapSet/put (Process/get :bl_loading (MapSet/new)) ns))
+
+      (try
+        (let [r (if (= :aot (load_route ns)) (BeamLisp.AOT/ensure_loaded ns) :no_module)]
+          (cond
+            (erlang/== r :loaded) :ok
+            (erlang/== r :no_module) (ensure_loaded_source ns)
+            :else
+            (erlang/error (Elixir.CaseClauseError/exception (list (tuple :term r))))))
+        (finally
+          (Process/put :bl_loading
+            (MapSet/delete (Process/get :bl_loading (MapSet/new)) ns)))))))
+
+(defn- ensure_loaded_source
+  "Load `ns` from source. One loader per FILE VM-wide: the lock is keyed on the
+   resolved PATH, not the ns, so a multi-namespace file cannot be compiled twice
+   under two locks. `find_file/1` runs BEFORE the lock; the loser re-checks
+   `loaded_ns?` inside and short-circuits."
+  [ns]
+  (if (BeamLisp.Env/loaded_ns? ns)
+    :ok
+    (let [r (find_file ns)]
+      (if (ok-result? r)
+        (let [path (erlang/element 2 r)
+              content (erlang/element 3 r)]
+          (erlang/apply :global :trans
+            (list (tuple (tuple :bl_load path) (erlang/self))
+                  (fn []
+                    (if (BeamLisp.Env/loaded_ns? ns)
+                      :ok
+                      (do_load ns path content))))))
+        (do_load_miss ns r)))))
+
+(defn- clojure_prelude!
+  "A `.clj`/`.cljc` source is written against clojure.core, not the prelude:
+   intern the compat tier first, once per VM. A `.bl` file pays nothing."
+  [path]
+  (if (list-member? (list ".clj" ".cljc") (Path/extname path))
+    (Enum/each (clojure-prelude-list) (fn [ns] (ensure_loaded ns)))
+    nil)
+
+  :ok)
+
+;; ── who owns a namespace ────────────────────────────────────────────────────
+;;
+;; A namespace name is a claim on a module name, so every namespace has ONE home,
+;; decided by `namespace_home` from five facts (docs/design/realm/namespace-ownership.md):
+;;
+;;   kind      where the file that would serve it lives:
+;;               :tier     under one of the image's tier dirs (std, lib, boot, …)
+;;               :path     under a BEAM_LISP_PATH entry
+;;               :project  anywhere else on the search path (cwd, env.bl :paths, overrides/)
+;;   owned?    a tier ships a namespace of this name
+;;   declared? the realm's env.bl lists it in :shadow, or the file is under its overrides/
+;;   shared?   the realm's env.bl lists it in :uses (verified by hash when the realm opens)
+;;   isolate?  the realm is KEYED: its VM is shared, so its code must not leak
+;;
+;; The homes: :tier (the platform's own, loaded once), :realm (its own module,
+;; named from the realm), :shadow (the same, replacing a tier name, declared),
+;; :shared (loaded once, at :global, hash-checked by vm.realm), :global (no realm:
+;; today's behaviour), :refuse (a named error, never a silent replacement).
+
+(defn- local_homes
+  "The homes whose namespaces load from source into the realm's own env. A zero-arg
+   defn: a pinned module carries no `def`."
+  []
+  (list :realm :shadow :shared))
+
+(defn namespace_home
+  "The home of a namespace from the five facts above. Pure."
+  [kind owned? declared? shared? isolate? in_realm?]
+  (cond
+    (erlang/== kind :tier) :tier
+    (erlang/not owned?)
+      (cond shared? :shared
+            isolate? :realm
+            :else :global)
+    declared? (if isolate? :shadow :global)
+    ; A tier name replaced by a file nobody declared. From BEAM_LISP_PATH, or inside
+    ; any realm, that is refused; a bare `bl run` in a tree keeps loading what the
+    ; tree puts on its own path (that is how a tree develops its own library).
+    (or (erlang/== kind :path) in_realm?) :refuse
+    :else :global))
+
+(defn- realm_facts
+  "What the CALLING env knows about its realm, as a map for the loader server (whose
+   own env is :global): {:key k-or-nil :decl {...}-or-nil}. nil outside any realm."
+  []
+  (let [key (env_row (tuple :realm_key))
+        decl (env_row (tuple :realm_decl))]
+    (if (and (erlang/== nil key) (erlang/== nil decl))
+      nil
+      (maps/put :key key (maps/put :decl decl (maps/new))))))
+
+(defn- env_row
+  "The value of a chain-walking env row, or nil."
+  [k]
+  (let [r (BeamLisp.Env/lookup k)]
+    (if (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+      (erlang/element 2 r)
+      nil)))
+
+(defn- tier_ids
+  "{device, inode} of every tier dir, memoised: the tiers are a constant of the image.
+   Identity, not a string prefix: the launcher reaches a tree's priv through a symlink."
+  []
+  (let [cached (persistent_term/get :bl_tier_ids nil)]
+    (if (erlang/== nil cached)
+      (let [ids (Enum/flat_map (BeamLisp.Tiers/dirs)
+                  (fn [d] (let [id (path_id d)] (if (erlang/== nil id) (list) (list id)))))]
+        (persistent_term/put :bl_tier_ids ids)
+        ids)
+      cached)))
+
+(defn- path_id
+  "{major_device, inode} of `path`, or nil when it cannot be stat'd."
+  [path]
+  (let [st (File/stat path)]
+    (if (and (erlang/is_tuple st) (erlang/== :ok (erlang/element 1 st)))
+      (tuple (erlang/map_get :major_device (erlang/element 2 st))
+             (erlang/map_get :inode (erlang/element 2 st)))
+      nil)))
+
+(defn- under_tier?
+  "Whether `path` lies inside a tier dir: some ancestor directory IS one."
+  [path]
+  (let [ids (tier_ids)]
+    (loop [p (Path/dirname (Path/expand path))]
+      (let [id (path_id p)]
+        (cond
+          (erlang/== nil id) false
+          (list-member? ids id) true
+          (erlang/== p (Path/dirname p)) false
+          :else (recur (Path/dirname p)))))))
+
+(defn- under_dir?
+  "Whether `path` is inside directory `dir` (expanded string prefix)."
+  [path dir]
+  (String/starts_with? (Path/expand path) (erlang/iolist_to_binary (list (Path/expand dir) "/"))))
+
+(defn- file_kind
+  "Where the file that would serve `path`'s namespace lives: :tier, :path or :project."
+  [path]
+  (cond
+    (under_tier? path) :tier
+    (Enum/any? (env_paths) (fn [d] (under_dir? path d))) :path
+    :else :project))
+
+(defn- tier_owns?
+  "Whether a tier ships namespace `ns`: a source file in a tier dir, or a compiled
+   tier module that carries an init (a packaged image may ship beams only)."
+  [ns]
+  (or (Enum/any? (BeamLisp.Tiers/dirs)
+        (fn [d] (Enum/any? (source_relatives ns)
+                  (fn [rel] (File/regular? (Path/join d rel))))))
+      (let [mod (BeamLisp.Emit/base_module_for ns)]
+        (and (Code/ensure_loaded? mod) (erlang/function_exported mod :__bl_init__ 0)))))
+
+(defn- facts_home
+  "`namespace_home` for `ns` served by `path`, in the realm `realm` (or nil)."
+  [ns path realm]
+  (let [kind (file_kind path)
+        decl (if (erlang/== nil realm) nil (maps/get :decl realm nil))
+        key (if (erlang/== nil realm) nil (maps/get :key realm nil))
+        ovr (if (erlang/== nil decl) nil (maps/get :overrides decl nil))]
+    (namespace_home kind
+      (and (erlang/not (erlang/== kind :tier)) (tier_owns? ns))
+      (or (decl_has? decl :shadow ns)
+          (and (erlang/not (erlang/== nil ovr)) (under_dir? path ovr)))
+      (decl_has? decl :uses ns)
+      (erlang/not (erlang/== nil key))
+      (erlang/not (erlang/== nil decl)))))
+
+(defn ns_home
+  "The home of `ns` right now, from the load path and the calling env's realm:
+   `:tier` when no project file serves it. For diagnostics and the console."
+  [ns]
+  (let [path (source_path ns)]
+    (if (erlang/== nil path) :tier (facts_home ns path (realm_facts)))))
+
+(defn- refusal_message
+  "The error for an undeclared replacement of a library namespace: what, where,
+   who owns it, and the line that would make it legal."
+  [ns path]
+  (erlang/iolist_to_binary
+    (list "bl: LOAD REFUSED — " path " would replace the library namespace `" ns "`.\n"
+          "  The library (std, lib, compat) owns that name; a project may replace it only\n"
+          "  inside its own realm, and only when it says so. Either:\n"
+          "    - add the name to :shadow in the project's env.bl:   :shadow [\"" ns "\"]\n"
+          "    - or remove the file (or the BEAM_LISP_PATH entry) that provides it.")))
+
+;; The module-name segment a realm-local namespace sits under. A realm's own and
+;; shadowed namespaces are named from the REALM (R<key>); a shared one is named from
+;; its CONTENT (S<first 12 hex of the declared hash>), so two projects that declare
+;; the same hash name the same module and two that declare different ones cannot clash.
+(defn- shared_prefix [] "S")
+(defn- realm_prefix [] "R")
+(defn- shared_hash_digits [] 12)
+(defn- hash_prefix_len [] 7) ; the length of "sha256:"
+
+(defn- segment_for
+  "The module-name segment for `ns` in `home`, in the realm `realm`."
+  [ns home realm]
+  (if (erlang/== home :shared)
+    (let [h (maps/get ns (maps/get :uses (maps/get :decl realm (maps/new)) (maps/new)) "")]
+      (erlang/iolist_to_binary
+        (list (shared_prefix) (String/slice h (hash_prefix_len) (shared_hash_digits)))))
+    (erlang/iolist_to_binary (list (realm_prefix) (maps/get :key realm)))))
+
+(defn- decl_has?
+  "Whether the realm declaration lists `ns` under `field` (:shadow, a list; :uses, a map)."
+  [decl field ns]
+  (and (erlang/not (erlang/== nil decl))
+       (let [v (maps/get field decl (list))]
+         ; A bl vector is a struct, which is also a map: only a PLAIN map is a keyed
+         ; declaration (:uses); anything else is a sequence of names (:shadow).
+         (if (and (erlang/is_map v) (erlang/not (maps/is_key :__struct__ v)))
+           (maps/is_key ns v)
+           (Enum/any? v (fn [x] (erlang/== x ns)))))))
+
+(defn- would_replace_compiled?
+  "Whether loading `ns` from source would REPLACE a namespace this VM already runs
+   compiled, with different content. Replacing a module that is executing purges it
+   and kills its runner with a bare `killed` (FUP-152), so that is the case to refuse;
+   a copy with the same closure hash is harmless, and a namespace with nothing
+   compiled has nothing to replace."
+  [ns]
+  (let [mod (BeamLisp.Emit/base_module_for ns)]
+    (if (and (Code/ensure_loaded? mod)
+             (erlang/function_exported mod :__bl_provenance__ 0))
+      (let [stamp (erlang/apply mod :__bl_provenance__ (list))]
+        (erlang/not (erlang/== (erlang/element 1 stamp) (BeamLisp.AOT/ns_closure_hash ns))))
+      false)))
+
+(defn- load_route
+  "How `ns` is to be loaded: :aot (the shared AOT-or-source path, published at :global)
+   or :source (from source, into the calling realm's env). Raises the refusal for an
+   undeclared replacement of a library namespace: always for a project file inside a
+   realm (it would publish over the platform's module), and for a BEAM_LISP_PATH file
+   when it would replace a compiled namespace with different content."
+  [ns]
+  (let [path (if (erlang/== :library (BeamLisp.Tiers/tier_of_ns ns)) (source_path ns) nil)]
+    (if (erlang/== nil path)
+      :aot
+      (let [home (facts_home ns path (Process/get :bl_load_realm))]
+        (cond
+          (and (erlang/== home :refuse)
+               (or (erlang/== (file_kind path) :project) (would_replace_compiled? ns)))
+            (erlang/error (Elixir.RuntimeError/exception (refusal_message ns path)))
+          (list-member? (local_homes) home) :source
+          :else :aot)))))
+
+(defn- do_load
+  "Evaluate a required file at `:global`, under its own load path, marking the
+   ns loaded only AFTER the eval. On failure, print the form attribution and
+   re-raise; the requiring namespace is restored on every exit path."
+  [ns path content]
+  (let [prev-ns (BeamLisp.Env/current_ns)]
+    (clojure_prelude! path)
+
+    (try
+      (with_load_path (Path/dirname path)
+        (fn []
+          (let [realm (Process/get :bl_load_realm)
+                key (if (erlang/== nil realm) nil (maps/get :key realm nil))
+                home (if (erlang/== nil key) :global (facts_home ns path realm))
+                local? (list-member? (local_homes) home)
+                target (if local? (Process/get :bl_load_env) :global)]
+            (BeamLisp.Env/with_env target
+              (fn []
+                (if local?
+                  (BeamLisp.Env/put_key (tuple :realm_local ns) (segment_for ns home realm))
+                  nil)
+                (BeamLisp.Compiler/eval_string content (BeamLisp.Compiler/new_env ns) path)
+                (BeamLisp.Env/mark_loaded ns))))))
+      (catch e
+        (cond
+          (erlang/== :error __EXCEPTION_KIND__)
+          (do
+            (IO/puts :stderr (load_attribution ns path content e __STACKTRACE__))
+            (erlang/apply :erlang :raise
+              (list :error (Elixir.Kernel.Utils/raise e) __STACKTRACE__)))
+
+          (erlang/== :throw __EXCEPTION_KIND__)
+          (erlang/apply :erlang :throw (list e))
+
+          :else
+          (erlang/apply :erlang :raise
+            (list :exit (erlang/element 2 e) __STACKTRACE__))))
+      (finally
+        (BeamLisp.Env/in_ns prev-ns)))
+
+    :ok))
+
+; ── attribution: name the file and the form a load failed on ────────────────
+
+(defn load_attribution
+  "The attribution for a file that could not be evaluated: the file, the FORM
+   that failed (index, position, text) and the original failure. Never raises."
+  ([ns path content e]
+   (load_attribution ns path content e nil))
+  ([ns path content e stacktrace]
+   (let [counted (form_at_fault ns path content)
+         where
+         (cond
+           (ok4-result? counted)
+           (let [i (erlang/element 2 counted)
+                 total (erlang/element 3 counted)
+                 form (erlang/element 4 counted)
+                 line (node_line form)
+                 at (if line
+                      (erlang/iolist_to_binary (list path ":" (String.Chars/to_string line)))
+                      path)]
+             (erlang/iolist_to_binary
+               (list "  form " (String.Chars/to_string i) " of "
+                     (String.Chars/to_string total) ", at " at "\n  " (short form))))
+
+           :else
+           "  (the failing form could not be isolated: the source could not be re-read)")
+         failure (if stacktrace
+                   (Elixir.Exception/format :error e stacktrace)
+                   (Elixir.Exception/format :error e))]
+     (erlang/iolist_to_binary
+       (list "bl: LOAD FAILED — " path " (namespace " ns ")\n\n"
+             where "\n\n" failure "\n")))))
+
+(defn- form_at_fault
+  "The form that raises, found by replaying the source. `:unknown` whenever
+   anything about the replay is not certain."
+  [ns path content]
+  (let [forms (read_forms content path)]
+    (if (and (loaded? :Elixir.BeamLisp.Ns.Reader)
+             (loaded? :Elixir.BeamLisp.Ns.Body.Compiler)
+             (erlang/is_list forms))
+      (let [total (erlang/length forms)
+            env (BeamLisp.Ns.Body.Compiler/new_env ns)
+            found
+            (with_load_path (Path/dirname path)
+              (fn []
+                (BeamLisp.Env/with_env :global
+                  (fn []
+                    (Enum/reduce_while
+                      (Enum/with_index forms 1)
+                      :none
+                      (fn [pair _acc]
+                        (let [form (erlang/element 1 pair)
+                              i (erlang/element 2 pair)
+                              env2 (maps/put :ns (BeamLisp.Env/current_ns) env)]
+                          (try
+                            (BeamLisp.Ns.Body.Compiler/eval_form form env2)
+                            (tuple :cont :none)
+                            (catch _e (tuple :halt (tuple :ok i total form)))))))))))]
+        (if (erlang/== :none found) :unknown found))
+      :unknown)))
+
+(defn- read_forms
+  "Read every top-level form, or `nil` when the reader refuses the source."
+  [content path]
+  (try
+    (let [forms (BeamLisp.Ns.Reader/read_string content path)]
+      (if (erlang/is_list forms) forms (Enum/to_list forms)))
+    (catch _e nil)))
+
+(defn- loaded?
+  [mod]
+  (Code/ensure_loaded? mod))
+
+(defn- node_line
+  "A node's position, from the meta wrapper the reader attaches; `nil` when the
+   form carries none."
+  [form]
+  (if (and (erlang/is_tuple form)
+           (erlang/== 3 (erlang/tuple_size form))
+           (erlang/== :meta (erlang/element 1 form))
+           (erlang/is_map (erlang/element 3 form)))
+    (maps/get :line (erlang/element 3 form) nil)
+    nil))
+
+(defn- short
+  "`inspect(form, limit: 30, printable_limit: 400, width: 100)`, or
+   `\"(unprintable)\"` when even that raises."
+  [form]
+  (try
+    (Kernel/inspect form
+      (list (tuple :limit 30) (tuple :printable_limit 400) (tuple :width 100)))
+    (catch _e "(unprintable)")))
+
+(defn- do_load_miss
+  "Nothing to load: name the reason — a same-named file declaring another ns, a
+   namespace that exists only in the registry, or a genuine miss with the search
+   path."
+  [ns miss]
+  (cond
+    (wrong-ns-result? miss)
+    (let [path (erlang/element 2 miss)
+          declared (erlang/element 3 miss)]
+      (if (nil? declared)
+        (erlang/error
+          (RuntimeError/exception
+            (erlang/iolist_to_binary
+              (list "namespace " ns ": " path " exists but declares no (ns …) form "
+                    "(a file's namespace comes from its (ns …), not its name) "
+                    "(searched: " (Kernel/inspect (search_dirs)) ")"))))
+        (erlang/error
+          (RuntimeError/exception
+            (erlang/iolist_to_binary
+              (list "namespace " ns ": " path " declares (ns " declared "), not " ns " "
+                    "(a same-named file cannot serve another namespace) "
+                    "(searched: " (Kernel/inspect (search_dirs)) ")"))))))
+
+    (nil? miss)
+    (if (BeamLisp.Env/ns_exists? ns)
+      :ok
+      (erlang/error
+        (RuntimeError/exception
+          (erlang/iolist_to_binary
+            (list "namespace not found: " ns " (searched: "
+                  (Kernel/inspect (search_dirs)) ")")))))
+
+    :else
+    (erlang/error (Elixir.CaseClauseError/exception (list (tuple :term miss))))))
+
+; ── ns → file ───────────────────────────────────────────────────────────────
+
+(defn source_relatives
+  "The relative source paths a namespace may live at, in resolution order: the
+   dotted spelling first, then Clojure's dash→underscore munging."
+  [ns]
+  (let [base (String/replace ns "." "/")
+        munged (Enum/join
+                 (Enum/map (String/split base "/")
+                   (fn [seg] (String/replace seg "-" "_")))
+                 "/")
+        names (if (erlang/== munged base) (list base) (list base munged))]
+    (Enum/flat_map names
+      (fn [name]
+        (Enum/map (doc-ext-list)
+          (fn [ext] (erlang/iolist_to_binary (list name ext))))))))
+
+(defn source_path
+  "The path a namespace loads from over the load path, or nil."
+  [ns]
+  (Enum/find_value (search_dirs)
+    (fn [dir]
+      (Enum/find_value (source_relatives ns)
+        (fn [rel]
+          (let [path (Path/join dir rel)]
+            (if (File/regular? path) path nil)))))))
+
+(defn- find_file
+  "Search the load paths for a regular source file whose DECLARED ns matches.
+   Returns `{:ok, path, content}` for the first matching file, else the first
+   same-named file whose declared ns differs, else `nil`."
+  ([ns] (find_file ns (search_dirs)))
+  ([ns dirs]
+  (Enum/reduce dirs nil
+    (fn [dir acc]
+      (if (ok-result? acc)
+        acc
+        (Enum/reduce (source_relatives ns) acc
+          (fn [rel acc2]
+            (if (ok-result? acc2)
+              acc2
+              (let [path (Path/join dir rel)]
+                (if (File/regular? path)
+                  (let [raw (File/read! path)
+                        content (doc_content path raw)]
+                    (if (declares? content ns)
+                      (tuple :ok path content)
+                      (if (nil? acc2)
+                        (tuple :wrong_ns path (declared_ns content))
+                        acc2)))
+                  acc2))))))))))
+
+; ── reading source: plain / literate / shebang ──────────────────────────────
+
+(defn read_source
+  "The loadable source at `path`: the bytes themselves for a plain `.bl`, the
+   concatenated code cells for a literate `.bl.md` / `.bl.org`."
+  [path]
+  (doc_content path (File/read! path)))
+
+(defn doc_extensions
+  "The source extensions the loader (and the build) recognise."
+  []
+  (doc-ext-list))
+
+(defn- doc_content
+  [path raw]
+  (let [ext (Path/extname path)]
+    (cond
+      (list-member? (plain-ext-list) ext) (strip_shebang raw)
+      (erlang/== ext ".org") (doc_source raw :org)
+      :else (doc_source raw :md))))
+
+(defn- strip_shebang
+  "Strip a first-line `#!` — replacing it with an EMPTY line, so every
+   subsequent form's line number still points where the author wrote it."
+  [raw]
+  (if (String/starts_with? raw "#!")
+    (let [parts (String/split raw "\n" (list (tuple :parts 2)))]
+      (cond
+        (erlang/== 2 (erlang/length parts))
+        (erlang/iolist_to_binary (list "\n" (nth parts 1)))
+
+        (erlang/== 1 (erlang/length parts))
+        ""
+
+        :else
+        (erlang/error (Elixir.CaseClauseError/exception (list (tuple :term parts))))))
+    raw))
+
+(defn doc_source
+  "The program of a livebook document: every code cell concatenated, in document
+   order. `format` is `:md` for fenced beam-lisp cells or `:org` for
+   `#+begin_src beam-lisp` blocks."
+  [raw format]
+  :when (or (== format :md) (== format :org))
+  (Enum/join
+    (List/flatten
+      (Enum/reverse (collect_doc_cells (String/split raw "\n") format (list))))
+    "\n"))
+
+(defn- collect_doc_cells
+  [lines format acc]
+  (if (empty? lines)
+    acc
+    (let [line (first lines)
+          rest-lines (rest lines)
+          trimmed (String/trim line)
+          open? (if (erlang/== format :md)
+                  (String/starts_with? trimmed "```beam-lisp")
+                  (String/starts_with? trimmed "#+begin_src beam-lisp"))]
+      (if open?
+        (let [closer (if (erlang/== format :md)
+                       (fn [l] (erlang/== "```" (String/trim l)))
+                       (fn [l] (erlang/== "#+end_src" (String/trim l))))
+              taken (take_until rest-lines closer)]
+          (collect_doc_cells (erlang/element 2 taken)
+            format
+            (cons (erlang/element 1 taken) acc)))
+        (collect_doc_cells rest-lines format acc)))))
+
+(defn- take_until
+  ([lines pred]
+   (take_until lines pred (list)))
+  ([lines pred acc]
+   (if (empty? lines)
+     (tuple (Enum/reverse acc) (list))
+     (let [line (first lines)
+           rest-lines (rest lines)]
+       (if (pred line)
+         (tuple (Enum/reverse acc) rest-lines)
+         (take_until rest-lines pred (cons line acc)))))))
+
+; ── declared ns: the ns-head scanner, over a byte list ──────────────────────
+
+(defn- declares?
+  "Whether `content` declares `ns` ANYWHERE — the first form is the wrong
+   question for a literate document."
+  [content ns]
+  (let [lines (String/split content "\n")]
+    (Enum/any?
+      (Enum/with_index lines 0)
+      (fn [pair]
+        (let [line (erlang/element 1 pair)
+              i (erlang/element 2 pair)
+              trimmed (String/trim_leading line)
+              head? (or (erlang/== trimmed "(ns")
+                        (String/starts_with? trimmed "(ns "))
+              tail (Enum/join (Enum/drop lines i) "\n")]
+          (if head? (erlang/== ns (declared_ns tail)) false))))))
+
+(defn declared_ns
+  "The namespace a file declares: the first symbol after its leading `(ns …)`.
+   Leading whitespace and `;` comments are skipped; a file whose first form is
+   not `(ns …)` declares no namespace and returns nil. Metadata is skipped, so
+   `(ns ^{:instr {…}} codebase …)` reads `codebase`."
+  [source]
+  (if (erlang/is_binary source)
+    (let [s (skip_leading (erlang/binary_to_list source))]
+      (if (erlang/is_list s)
+        (if (empty? s)
+          nil
+          (if (erlang/== 40 (first s))
+            (let [rest1 (skip_leading (rest s))
+                  t (take_token rest1)]
+              (if (and (erlang/is_tuple t)
+                       (erlang/== "ns" (erlang/element 1 t)))
+                (let [rest2 (skip_leading (erlang/element 2 t))
+                      rest3 (skip_metadata rest2)
+                      rest4 (skip_leading rest3)
+                      t2 (take_token rest4)]
+                  (if (erlang/is_tuple t2) (erlang/element 1 t2) nil))
+                nil))
+            nil))
+        nil))
+    nil))
+
+(defn- skip_leading
+  "Skip whitespace bytes and `;` line comments; return the tail."
+  [s]
+  (cond
+    (empty? s) s
+    (erlang/== 59 (first s)) (skip_leading (drop-to-newline (rest s)))
+    (ws? (first s)) (skip_leading (rest s))
+    :else s))
+
+(defn- drop-to-newline
+  "The tail after the first newline byte, or the empty list."
+  [xs]
+  (cond
+    (empty? xs) (list)
+    (erlang/== 10 (first xs)) (rest xs)
+    :else (drop-to-newline (rest xs))))
+
+(defn- skip_metadata
+  "`^meta` before a form: a map/vector/list (skipped by matching delimiters,
+   strings respected, nesting counted) or a bare keyword/symbol token. Repeated
+   because metadata stacks."
+  [s]
+  (if (erlang/is_list s)
+    (if (empty? s)
+      s
+      (if (erlang/== 94 (first s))
+        (skip_metadata (skip_one_form (skip_leading (rest s))))
+        s))
+    s))
+
+(defn- skip_one_form
+  "Skip exactly one form: a `{}`/`[]`/`()` aggregate by matching delimiters, or a
+   bare token."
+  [s]
+  (let [c (if (empty? s) nil (first s))
+        close (cond
+                (erlang/== 123 c) 125
+                (erlang/== 91 c) 93
+                (erlang/== 40 c) 41
+                :else nil)]
+    (if (nil? close)
+      (let [t (take_token s)]
+        (if (erlang/is_tuple t) (erlang/element 2 t) s))
+      (skip_nested (rest s) c close 1 false))))
+
+(defn- skip_nested
+  "Scan to the closer of `op` at `depth`, respecting strings and escapes."
+  [s op close depth in_str]
+  (cond
+    (empty? s) (list)
+
+    (erlang/== true in_str)
+    (let [c (first s)
+          r (rest s)]
+      (cond
+        (erlang/== 92 c) (skip_nested (drop_char r) op close depth true)
+        (erlang/== 34 c) (skip_nested r op close depth false)
+        :else (skip_nested r op close depth true)))
+
+    :else
+    (let [c (first s)
+          r (rest s)]
+      (cond
+        (erlang/== 34 c) (skip_nested r op close depth true)
+        (erlang/== 92 c) (skip_nested (drop_char r) op close depth false)
+        (erlang/== c op) (skip_nested r op close (erlang/+ depth 1) false)
+        (and (erlang/== c close) (erlang/== depth 1)) r
+        (erlang/== c close) (skip_nested r op close (erlang/- depth 1) false)
+        :else (skip_nested r op close depth false)))))
+
+(defn- drop_char
+  [s]
+  (if (empty? s) (list) (rest s)))
+
+(defn- take_token
+  "The next symbol token and the tail after it, as `{token-binary, tail}`; nil
+   when the head is whitespace, a delimiter, or empty."
+  [s]
+  (if (empty? s)
+    nil
+    (if (or (token-end? (first s)) (ws? (first s)))
+      nil
+      (split_token s (list)))))
+
+(defn- split_token
+  [s acc]
+  (cond
+    (empty? s)
+    (tuple (List/to_string (Enum/reverse acc)) (list))
+
+    (or (token-end? (first s)) (ws? (first s)))
+    (tuple (List/to_string (Enum/reverse acc)) s)
+
+    :else
+    (split_token (rest s) (cons (first s) acc))))
+
+; ── demand-driven requires ──────────────────────────────────────────────────
+;
+; A `:require` may DECLARE a dependency without initializing it: `(ns a
+; (:require [b :as b']))` records the alias and the namespace's existence and
+; captures the search dirs the declaration was made under, but `b`'s top-level
+; forms do not run until a name from `b` is actually used. The first runtime
+; name lookup that misses (`BeamLisp.Env/fetch/2`, whose miss hook is
+; `load_candidates/1`) or the first DIRECT call into `b` (the guard
+; `ensure_ready/1`, emitted ahead of cross-namespace links) initializes it.
+;
+; A bare (effect-only) `(ns a (:require b))`, a `:refer :all` (whose ns-time
+; snapshot needs the provider's vars present) and the whole preboot tier stay
+; EAGER: the first asks for side effects, the second cannot be snapshotted from
+; an uninitialized provider, and the third has no loader to defer to yet (the
+; boot ladder is load-order driven). Which of the two a spec gets is decided
+; HERE, when the `(ns …)` form runs — never baked in at compile time, so the
+; same source is eager during boot and demand-driven afterwards.
+
+(defn declare_require
+  "Evaluate one `(ns …)` `:require` spec's LOAD.
+
+   `alias`/`refer` say how the spec was written. A spec naming an alias or an
+   explicit refer list is DEFERRED when its target is resolvable — already
+   loaded, compiled AOT, or present as source: its existence is recorded (so
+   the compiler and the runtime resolver can answer names) and its search
+   context captured, and nothing of it runs. A bare (effect-only) spec, a
+   `:refer :all` and everything in the preboot tier load NOW.
+
+   A target that is none of those is loaded anyway, so the loader raises its
+   usual missing/wrong-namespace diagnostic AT THE `(ns …)` FORM."
+  ([target] (declare_require target nil nil))
+  ([target alias refer]
+   :when (string? target)
+   (cond
+     (or (erlang/== "core" target) (BeamLisp.Env/loaded_ns? target)) :ok
+
+     (erlang/not (BeamLisp.Env/seeded?)) (ensure_loaded target)
+
+     (and (erlang/== nil alias)
+          (or (erlang/== nil refer) (erlang/== refer (list)))) (ensure_loaded target)
+
+     (erlang/== :all refer) (ensure_loaded target)
+
+     (resolvable? target)
+       (do
+         (BeamLisp.Env/note_deferred target (search_dirs))
+         (BeamLisp.Env/declare_ns target)
+         :ok)
+
+     :else (ensure_loaded target))))
+
+(defn ensure_deferred
+  "Initialize `target` on demand, under the search dirs its `:require` was
+   declared with — its ORIGINAL search context, not the caller's.
+
+   A no-op when `target` is already usable, and when it was NEVER declared
+   deferred: an explicitly loaded or unrelated namespace is not this
+   function's to load. A load failure propagates and leaves the declaration in
+   place, so the NEXT use retries."
+  [target]
+  :when (string? target)
+  ; The DECLARATION is checked FIRST: it is the common case on the emitted
+  ; guard's path (a namespace that was never declared deferred costs one
+  ; registry read), and only a declared one is worth asking the loader about.
+  (let [dirs (BeamLisp.Env/deferred_dirs target)]
+    (if (erlang/== nil dirs)
+      :ok
+      (if (or (erlang/== "core" target) (BeamLisp.Env/loaded_ns? target))
+        :ok
+        (do
+          (ensure_loaded_in target dirs)
+          :ok)))))
+
+(defn load_candidates
+  "The name-lookup miss hook: try to initialize each candidate `{ns, name}` pair
+   of a FAILED `BeamLisp.Env/fetch`, in order. Only declared deferred requires
+   load, so a genuine miss costs one registry read per candidate."
+  [pairs]
+  (Enum/each pairs (fn [p] (ensure_deferred (erlang/element 1 p))))
+  :ok)
+
+(defn ensure_ready
+  "The readiness guard the compiler emits ahead of a DIRECT call into another
+   namespace: `:ok` when that namespace is already initialized (one cheap
+   registry read), else initialize it when its `:require` declared it deferred.
+
+   Never raises for a namespace that was not declared deferred — the guard can
+   add a load, never a new failure — and never consults the Agent, so it is
+   safe on a hot call path. A direct cold shim entry boots the runtime first."
+  [target]
+  (cond
+    ; A packaged launcher may apply a namespace shim before starting the app.
+    ; Bootstrap through the existing runtime boundary, then initialize the
+    ; applied namespace; there is no declaration to defer in that cold VM.
+    (erlang/== nil (Process/whereis :Elixir.BeamLisp.Env))
+      (do (BeamLisp.AOT/boot) (ensure_loaded target))
+    (BeamLisp.Env/ns_ready? target) :ok
+    :else (ensure_deferred target)))
+
+; ── source metadata: what a namespace's SOURCE declares ─────────────────────
+;
+; The compiler must answer "is this name a MACRO of a provider that has not been
+; initialized?" without initializing the provider: loading it would undo the
+; laziness for every ordinary function a body merely mentions. When the name is
+; not in the registry, the provider's SOURCE answers instead. A name the scan
+; cannot account for is UNKNOWN — another macro may have produced the
+; definition — and the caller falls back to loading, the conservative choice
+; the build tier makes the same way.
+
+(defn- form-unmeta
+  "Strip reader position metadata so the real form is inspected."
+  [form]
+  (if (and (erlang/is_tuple form)
+           (erlang/== 3 (erlang/tuple_size form))
+           (erlang/== :meta (erlang/element 1 form)))
+    (form-unmeta (erlang/element 2 form))
+    form))
+
+(defn- form-head-args
+  "`{head-symbol, args}` for a list form whose head is a symbol, else nil."
+  [form]
+  (let [f (form-unmeta form)]
+    (if (and (erlang/is_tuple f) (erlang/== 2 (erlang/tuple_size f))
+             (erlang/== :list (erlang/element 1 f)))
+      (let [items (erlang/element 2 f)]
+        (if (and (erlang/is_list items) (erlang/not (erlang/== items (list))))
+          (let [h (form-unmeta (erlang/hd items))]
+            (if (and (erlang/is_tuple h) (erlang/== 2 (erlang/tuple_size h))
+                     (erlang/== :symbol (erlang/element 1 h)))
+              (tuple (erlang/element 2 h) (erlang/tl items))
+              nil))
+          nil))
+      nil)))
+
+(defn- form-name
+  "The symbol name in the first position of `args`, or nil."
+  [args]
+  (if (and (erlang/is_list args) (erlang/not (erlang/== args (list))))
+    (let [n (form-unmeta (erlang/hd args))]
+      (if (and (erlang/is_tuple n) (erlang/== 2 (erlang/tuple_size n))
+               (erlang/== :symbol (erlang/element 1 n)))
+        (erlang/element 2 n)
+        nil))
+    nil))
+
+(defn- private-name?
+  "Whether a defining form's RAW name carries `^:private`."
+  [raw]
+  (if (and (erlang/is_tuple raw) (erlang/== 3 (erlang/tuple_size raw))
+           (erlang/== :meta (erlang/element 1 raw)))
+    (let [m (erlang/element 3 raw)]
+      (and (erlang/is_map m) (erlang/== true (maps/get :private m false))))
+    false))
+
+(defn- decl-line
+  "`{name, kind}` for one top-level form, or nil when it defines no name a
+   dependent could reference. `:private` wins over the kind, so a private macro
+   is never offered as a macro."
+  [form]
+  (let [ha (form-head-args form)]
+    (if (erlang/== nil ha)
+      nil
+      (let [head (erlang/element 1 ha)
+            args (erlang/element 2 ha)
+            raw (if (and (erlang/is_list args) (erlang/not (erlang/== args (list))))
+                  (erlang/hd args)
+                  nil)
+            nm (form-name args)]
+        (cond
+          (erlang/== nm nil) nil
+          (erlang/== "defmacro" head) (tuple nm (if (private-name? raw) :private :macro))
+          (erlang/== "defn-" head) (tuple nm :private)
+          (private-name? raw) (tuple nm :private)
+          (erlang/== "def" head)
+            (tuple nm
+              (if (and (erlang/is_tuple raw) (erlang/== 3 (erlang/tuple_size raw))
+                       (erlang/== :meta (elem raw 0)) (erlang/is_map (elem raw 2))
+                       (erlang/== true (maps/get :per-env (elem raw 2) false)))
+                :public ; A per-env descriptor cannot be a macro value.
+                :value))
+          (erlang/== "defn" head) (tuple nm :public)
+          (lists/member head (list "defrecord" "deftype" "defprotocol" "defmulti" "defserver"))
+            (tuple nm :public)
+          :else nil)))))
+
+(defn- source_decls_from
+  "Declarations belonging to ns, not a later namespace sharing its file."
+  [ns content path]
+  (let [forms (read_forms content path)]
+    (if (nil? forms)
+      nil
+      (elem
+        (Enum/reduce forms (tuple nil (maps/new))
+          (fn [form state]
+            (let [ha (form-head-args form)
+                  head (if (nil? ha) nil (elem ha 0))
+                  current (elem state 0)
+                  names (elem state 1)]
+              (cond
+                (erlang/== "ns" head)
+                  (tuple (form-name (elem ha 1)) names)
+                (erlang/== "in-ns" head)
+                  (tuple nil names)
+                (erlang/== ns current)
+                  (let [entry (decl-line form)]
+                    (if (nil? entry) state
+                      (tuple current (maps/put (elem entry 0) (elem entry 1) names))))
+                :else state))))
+        1))))
+
+(defn with_declaration_snapshot
+  "Share declaration resolution within one compiler/load pass. Nested loads
+   inherit the snapshot; the next pass sees edits and newly appearing files."
+  [fun]
+  (if (erlang/== :undefined (Process/get :bl_declaration_snapshot :undefined))
+    (do
+      (Process/put :bl_declaration_snapshot {})
+      (try (fun) (finally (Process/delete :bl_declaration_snapshot))))
+    (fun)))
+
+(defn source_decls
+  "Source-derived macro/privacy metadata. A pass shares resolution; outside a
+   pass every query observes live bytes. Parsing is memoized by path, namespace
+   and content digest, never by mtime or a namespace name alone."
+  [ns]
+  :when (string? ns)
+  (let [dirs (or (BeamLisp.Env/deferred_dirs ns) (search_dirs))
+        context (tuple dirs ns)
+        pass (Process/get :bl_declaration_snapshot :undefined)
+        hit (if (erlang/== pass :undefined) :undefined (Map/get pass context :undefined))]
+    (if (erlang/not (erlang/== hit :undefined))
+      hit
+      (let [prev (Process/get :bl_search_dirs)
+            result
+            (try
+              (Process/put :bl_search_dirs dirs)
+              (let [r (find_file ns dirs)]
+                (if (ok-result? r)
+                  (let [path (Path/expand (elem r 1))
+                        content (elem r 2)
+                        digest (crypto/hash :sha256 content)
+                        key_ (tuple :"$bl_source_decls" path ns)
+                        parsed (Process/get key_ nil)]
+                    (if (and (erlang/is_tuple parsed) (erlang/== digest (elem parsed 0)))
+                      (elem parsed 1)
+                      (let [names (source_decls_from ns content path)]
+                        (Process/put key_ (tuple digest names))
+                        names)))
+                  nil))
+              (finally
+                (if (nil? prev) (Process/delete :bl_search_dirs)
+                  (Process/put :bl_search_dirs prev))))]
+        (if (erlang/not (erlang/== pass :undefined))
+          (Process/put :bl_declaration_snapshot
+            (Map/put (Process/get :bl_declaration_snapshot {}) context result))
+          nil)
+        result))))
+
+(defn source_decl
+  "The kind `provider`'s source declares `member` as (`:macro`, `:public`,
+   `:private`), or nil when the scan cannot account for it. nil means UNKNOWN —
+   a definition another macro produced, or a sourceless provider — and never
+   \"absent\"."
+  [provider member]
+  (let [decls (source_decls provider)]
+    (if (erlang/== nil decls) nil (maps/get member decls nil))))
+
+(defn load_provider
+  "Initialize `provider` for a compile-time probe: under the search dirs its
+   `:require` was declared with when it was declared deferred, else wherever it
+   resolves now."
+  [provider]
+  (if (erlang/== nil (BeamLisp.Env/deferred_dirs provider))
+    (let [mod (BeamLisp.Link/module_for provider)]
+      (if (and (BeamLisp.Env/ns_exists? provider)
+               (nil? (source_path provider))
+               (erlang/not (erlang/function_exported mod :__bl_init__ 0)))
+        :ok ; A source-only REPL namespace already owns its live bindings.
+        (do (ensure_loaded provider) :ok)))
+    (ensure_deferred provider)))
+
+(defn maybe_load_macro
+  "Whether `member` is a macro of `provider`, loading the provider when it is —
+   or when its source cannot be read, the conservative fallback.
+
+   A provider whose source shows `member` as anything else is NOT loaded:
+   asking \"is this call a macro?\" must not initialize every ordinary function
+   the compiler merely mentions."
+  [provider member]
+  (let [kind (source_decl provider member)]
+    (cond
+      (or (erlang/== :macro kind) (erlang/== :value kind))
+        (do (load_provider provider) true)
+
+      (erlang/not (erlang/== nil kind)) false
+
+      (resolvable? provider)
+        (do (load_provider provider) true)
+
+      :else false)))
+
+; ── the search-path stack ───────────────────────────────────────────────────
+
+(defn- search_dirs
+  []
+  (or (Process/get :bl_fixed_dirs)
+      (erlang/++ (erlang/++ (BeamLisp.Env/load_paths) (ambient_dirs)) (BeamLisp.Tiers/dirs))))
+
+(defn- ambient_dirs
+  "The ambient segment: the CALLER's captured roots while a load runs inside
+   `Loader.Server`, else this process's own env configuration."
+  []
+  (let [d (Process/get :bl_search_dirs)]
+    (if (nil? d)
+      (or (Process/get :bl_ambient_dirs)
+          (erlang/++ (list (File/cwd!)) (extra_dirs)))
+      d)))
+
+(defn- extra_dirs
+  "Configured search paths, nearest first: explicitly added before
+   environment-provided."
+  []
+  (erlang/++ (BeamLisp.Env/search_paths) (env_paths)))
+
+(defn- env_paths
+  []
+  (let [s (System/get_env "BEAM_LISP_PATH")]
+    (cond
+      (nil? s) (list)
+      (erlang/== "" s) (list)
+      :else (Enum/map (String/split s ":" (list (tuple :trim true)))
+                      (fn [p] (Path/expand p))))))

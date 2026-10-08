@@ -1,0 +1,205 @@
+; test/bl/leaf_cost_test.bl — the LEAF-COST class: a core operation must cost
+; what its work costs, not what its spelling costs.
+; Run: bl test test/bl/leaf_cost_test.bl
+;
+; THE CLASS. A page render paid ~45% of its time in lazy-seq cells, ~19% in
+; `Env/fetch!` and ~15% in generic dispatch — and almost none of it was work
+; the program asked for. Each came from a leaf that is cheap to WRITE and was
+; expensive to RUN:
+;
+;   `(= k (:id e))`   ~40 reds of unwrap/kind/family to compare two atoms
+;   `(not x)`, `(str …)`  a late-bound var fetch per call (they had no link)
+;   `(tuple a b)`     a `to-list` dispatch over its own rest-args list
+;   `mapv`/`filterv`  a shared lazy node built, walked and thrown away
+;   `some`            a `seq`/`first`/`next` re-classification per element
+;
+; Two halves, both required:
+;   SEMANTICS — every fast path is an exact correspondence with the general
+;     answer, so each one is checked against that answer (or the old spelling)
+;     over the values where a shortcut could go wrong.
+;   BUDGET — reductions are load-independent, so a ceiling per operation is a
+;     real regression gate: anything that reintroduces a cell, a fetch or a
+;     generic dispatch on these paths trips it. Ceilings are ~2x measured.
+
+(ns leaf-cost.test)
+
+(defn- reds [] (erlang/element 2 (erlang/process_info (erlang/self) :reductions)))
+
+(defn- per-call
+  "Reductions per call of `(f)` over `n` calls, after a warm-up."
+  [f]
+  (f) (f)
+  (let [n 2000 r0 (reds)]
+    (loop [i 0] (when (< i n) (f) (recur (inc i))))
+    (quot (- (reds) r0) n)))
+
+;; ── semantics: `=` fast path ─────────────────────────────────────────────
+
+(def ^:private eq-corpus
+  "Values where an atom shortcut could disagree with the order: every atom
+   family member, metadata wrappers of atoms, and each non-atom family."
+  [nil true false :a :b 'a "a" 1 1.0 1M 0 [] () {} #{} [:a] '(:a) {:a 1}
+   (tuple :a) (tuple :meta :a {}) (tuple :meta nil {})])
+
+(deftest eq-agrees-with-the-total-order
+  (doseq [a eq-corpus b eq-corpus]
+    (is (= (= a b) (zero? (compare a b)))
+        (str "(= " (pr-str a) " " (pr-str b) ") disagrees with compare"))))
+
+(deftest eq-atom-against-meta-wrapper-defers-to-the-order
+  ; a reader metadata wrapper of an atom IS that atom under `=`
+  (let [w (tuple :meta :a {:line 1})]
+    (is (= (zero? (compare :a w)) (= :a w)))
+    (is (= (zero? (compare w :a)) (= w :a)))))
+
+(deftest nil-some-not-are-exact
+  (doseq [x eq-corpus]
+    (is (= (nil? x) (BeamLisp.Ns.Rt/eqv x nil)))
+    (is (= (some? x) (not (nil? x))))
+    ; `not` is TRUTHINESS, a term test: a `{:meta nil}` wrapper is `=` to nil
+    ; but is a truthy value, exactly as before this change
+    (is (= (not x) (or (identical? x false) (identical? x nil)))))
+  ; `not` stays a first-class VALUE as well as a linked call
+  (is (= [false true true] (map not [1 nil false]))))
+
+;; ── semantics: str / tuple ───────────────────────────────────────────────
+
+
+;; ── semantics: nil? boundary — metadata wrappers ───────────────────────────
+
+(def ^:private nil?-boundary-corpus
+  "Wrappers and near-wrappers around nil: nested wrappers, a wrapper whose
+   payload is another atom, a non-`:meta` head, and the non-tuple lookalikes.
+   `:meta` is the reader's tag, not any leading atom."
+  [(tuple :meta nil {})
+   (tuple :meta (tuple :meta nil {}) {})
+   (tuple :meta (tuple :meta (tuple :meta nil {}) {}) {})
+   (tuple :meta nil)
+   (tuple :meta false {})
+   (tuple :meta true {})
+   (tuple :meta :a {})
+   (tuple :meta 0 {})
+   (tuple :a)
+   (tuple :foo nil {})
+   (tuple)
+   {:meta nil}
+   [:meta nil]])
+
+(deftest nil?-agrees-with-eqv-on-boundary-wrappers
+  ; a metadata wrapper of nil IS nil under `=`, and nil? must defer to it.
+  ; Only a tuple can be a wrapper; an ordinary tuple, a non-`:meta` head, and
+  ; the map/vector lookalikes stay false.
+  (doseq [x nil?-boundary-corpus]
+    (is (= (nil? x) (BeamLisp.Ns.Rt/eqv x nil)) (pr-str x))))
+
+(deftest metadata-nil-wrapper-is-nil?-but-truthy
+  (let [w (tuple :meta nil {})]
+    (is (nil? w))
+    (is (= nil w) "the wrapper is = to nil")
+    (is (= false (some? w)) "some? complements nil?: it says no")
+    ; truthiness is a TERM test, not `=`: the wrapper is a tuple, so it is
+    ; truthy even though it is = to nil. some? is NOT a truthiness test.
+    (is (= false (not w)))
+    (is (= true (boolean w)))
+    (is (= :truthy (if w :truthy :falsey)))))
+
+(deftest false-wrapper-is-=false-but-truthy
+  (let [w (tuple :meta false {})]
+    (is (= false w))
+    (is (= false (nil? w)))
+    (is (some? w))
+    ; `= false` does not make it FALSEY — the same term-vs-value split
+    (is (= false (not w)))
+    (is (= true (boolean w)))))
+
+(deftest nil?-is-first-class-and-linked
+  (is (= [true true false]
+         (let [p nil?] [(p nil) (p (tuple :meta nil {})) (p 1)])))
+  (is (= [true true false false]
+         (vec (map nil? [nil (tuple :meta nil {}) 1 false])))))
+
+(deftest keep-uses-nil?-and-drops-metadata-nil-wrappers
+  (let [w (tuple :meta nil {})
+        f (fn [x] (if (= x :wrap) w (if (= x :false) false x)))]
+    ; keep drops only nil? results: the wrapper goes, false stays
+    (is (= [:a false :z] (vec (keep f [:a :wrap :false :z])))))
+  (is (= 0 (count (keep (fn [_] (tuple :meta nil {})) [:x :y]))))
+  (is (= [false] (vec (keep (fn [_] false) [:x])))))
+
+(deftest str-linked-call-equals-the-value
+  (let [v str]
+    (doseq [args [[] [nil] ["a" :b 'c 1 1.5 1.50M] [[1 2] {:a 1} '(1)]]]
+      (is (= (apply v args) (apply str args)))))
+  (is (= "" (str)))
+  (is (= "ab" (str "a" "b")))
+  (is (= "1ab" (str 1 :a "b")) "a keyword contributes its name, no colon"))
+
+(deftest tuple-from-call-and-from-apply
+  (is (= [:ok 1] (vec (erlang/tuple_to_list (tuple :ok 1)))))
+  (is (= 0 (erlang/tuple_size (tuple))))
+  (is (= [1 2 3] (vec (erlang/tuple_to_list (apply tuple [1 2 3])))))
+  (is (= [1 2] (vec (erlang/tuple_to_list (apply tuple '(1 2)))))))
+
+;; ── semantics: eager collection ops ──────────────────────────────────────
+
+(def ^:private coll-corpus
+  [nil [] () #{} {} [1 2 3] '(1 2 3) #{1 2} {:a 1 :b 2} (range 5) (map inc [1 2])
+   (vec (range 40)) (apply list (range 40)) "abc"])
+
+(deftest mapv-filterv-equal-their-lazy-spelling
+  (doseq [c coll-corpus]
+    (is (= (vec (map identity c)) (mapv identity c)) (pr-str c))
+    (is (vector? (mapv identity c)))
+    (is (= (vec (filter some? c)) (filterv some? c)) (pr-str c))
+    (is (vector? (filterv some? c)))))
+
+(deftest mapv-filterv-call-order-and-errors
+  (let [seen (atom [])]
+    (mapv (fn [x] (swap! seen conj x) x) [3 1 2])
+    (is (= [3 1 2] @seen) "mapv calls f left to right, once each"))
+  (let [seen (atom [])]
+    (filterv (fn [x] (swap! seen conj x) (odd? x)) [3 2 1])
+    (is (= [3 2 1] @seen) "filterv calls pred left to right, once each"))
+  ; an exception at element k leaves elements after k unvisited
+  (let [seen (atom [])]
+    (is (thrown? (mapv (fn [x] (swap! seen conj x) (if (= x 2) (throw (ex-info "boom" {})) x)) [1 2 3])))
+    (is (= [1 2] @seen)))
+  ; keyword, map and set callables
+  (is (= [1 nil] (mapv :a [{:a 1} {}])))
+  (is (= [{:a 1}] (filterv :a [{:a 1} {}])))
+  (is (= [:x] (filterv #{:x} [:x :y]))))
+
+(deftest some-is-the-first-truthy-and-stops-there
+  (doseq [c coll-corpus]
+    (is (= (first (filter some? (map (fn [x] (when (number? x) x)) (seq c))))
+           (some (fn [x] (when (number? x) x)) c))
+        (pr-str c)))
+  (is (nil? (some identity [])))
+  (is (nil? (some identity nil)))
+  (is (nil? (some identity [nil false])))
+  (is (nil? (some #{false} [false])) "a falsey selector answer is not a hit")
+  (let [seen (atom [])]
+    (is (= :b (some (fn [x] (swap! seen conj x) (when (= x :b) x)) [:a :b :c])))
+    (is (= [:a :b] @seen) "some stops at the first hit"))
+  ; an infinite lazy source still terminates at the first hit
+  (is (= 5 (some (fn [x] (when (= x 5) x)) (range)))))
+
+;; ── budget ───────────────────────────────────────────────────────────────
+
+(def ^:private kinds (mapv (fn [i] {:id (keyword (str "k" i))}) (range 10)))
+
+(deftest leaf-cost-budget
+  (let [k :k7
+        e (first kinds)
+        rows {"(= kw kw)"            [(per-call (fn [] (= k :k8))) 20]
+              "(nil? x)"             [(per-call (fn [] (nil? e))) 25]
+              "(not x)"              [(per-call (fn [] (not e))) 25]
+              "(str a b)"            [(per-call (fn [] (str "a" "b"))) 120]
+              "(tuple a b)"          [(per-call (fn [] (tuple :a e))) 30]
+              "(some p v10)"         [(per-call (fn [] (some (fn [x] (when (= k (:id x)) x)) kinds))) 900]
+              "(filterv p v10)"      [(per-call (fn [] (filterv (fn [x] (= k (:id x))) kinds))) 1000]
+              "(mapv :id v10)"       [(per-call (fn [] (mapv :id kinds))) 1000]}]
+    ; measured before the fix: = 50, nil? 41, str 295, tuple 84,
+    ; some 770, filterv 3754, mapv 3971 (reductions per call)
+    (doseq [[label [got ceiling]] rows]
+      (is (<= got ceiling) (str label " costs " got " reductions, budget " ceiling)))))

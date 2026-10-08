@@ -1,4 +1,4 @@
-; vm/paths.bl — filesystem identity for a bl daemon (ports Daemon.Paths).
+; vm/paths.bl — filesystem identity for a warm VM (ports Daemon.Paths).
 ;
 ; ══ WHAT MOVED HERE (FUP-082 T2/D1) ═════════════════════════════════════════
 ;
@@ -42,11 +42,79 @@
   (erlang/apply :crypto :hash (list :sha256 (canonical root))))
 
 (defn tree-id
-  "The canonical 16-hex tree id for `root` (filenames use this)."
+  "The canonical 16-hex tree id for `root`."
   [root]
   (erlang/apply :string :lowercase
     (list (erlang/apply :binary :part
             (list (erlang/apply :binary :encode_hex (list (fingerprint root))) 0 TREE-ID-LEN)))))
+
+;; ── endpoint identity: which VM answers for a project ───────────────────────
+;;
+;; A VM runs ONE build's code, and by default ONE project's tree: two projects
+;; that define a namespace of the same name must not meet in one node (the first
+;; one loaded would answer for both). A project that has checked it is safe to
+;; share declares `:vm "shared"` in its env.bl (or a command passes `--shared`);
+;; all shared projects on one build then use ONE VM per user, and the realm (the
+;; project) is chosen per request from its cwd. A checkout (build `src`) runs its
+;; OWN sources, so it is always one VM per checkout, shared or not.
+;; The launcher computes the same names (daemon.rs `endpoint_key`,
+;; `hello_fingerprint`, `shared_for`); tests pin the golden strings equal.
+
+(def SHARED-KEY "warm")
+(def SRC-BUILD "src")
+(def VM-KEY :vm)
+(def VM-SPELLINGS {"own" false "shared" true})
+
+(def PROJECT-FILE "env.bl")
+
+(defn- declaration
+  "The trailing map of the data file at `path`, read as DATA and never evaluated
+   (the launcher scans the same file the same way), or nil when the file is absent
+   or does not end in a map."
+  [path]
+  (when (File/regular? path)
+    (try
+      (let [forms (BeamLisp.Compiler/read_all_data (File/read! path))]
+        (when (and (not (empty? forms)) (map? (last forms))) (last forms)))
+      (catch _ nil))))
+
+(defn shared-spelling
+  "Whether an env.bl `:vm` value asks for a shared VM. Only the two spellings in
+   `VM-SPELLINGS` mean anything; any other value is ignored, so prose in the file
+   can never become policy."
+  [v]
+  (get VM-SPELLINGS v false))
+
+(defn shared?
+  "Whether the project at `root` is served by the shared VM of its build: its
+   env.bl says `:vm \"shared\"`, and the build is not a source checkout."
+  [root build]
+  (and (not= build SRC-BUILD)
+       (let [m (declaration (str root "/" PROJECT-FILE))]
+         (and (map? m) (shared-spelling (get m VM-KEY))))))
+
+(defn- served-shared?
+  "Whether `build` run for a `shared` request answers on the shared endpoint: a
+   source build never does."
+  [build shared]
+  (and (= true shared) (not= build SRC-BUILD)))
+
+(defn endpoint-key
+  "The first segment of every endpoint file name: the constant `warm` for the
+   shared VM, else the tree id. `root` is not read for the shared VM, so a VM
+   booted with no project can still name its own endpoint."
+  [root build shared]
+  (if (served-shared? build shared) SHARED-KEY (tree-id root)))
+
+(defn hello-fingerprint
+  "The hello :tree field. An own VM checks the checkout; the shared VM serves
+   every shared project of its user, so it checks only that the client means the
+   shared endpoint. Authority is the 0600 socket plus the token, never this
+   field."
+  [root build shared]
+  (if (served-shared? build shared)
+    (erlang/apply :crypto :hash (list :sha256 SHARED-KEY))
+    (fingerprint root)))
 
 ;; ── the user's real uid (probe once, memoise) ───────────────────────────────
 
@@ -129,35 +197,79 @@
       :else clean)))
 
 (defn endpoints
-  "The endpoint path set for the daemon of `root` RUN BY `build` (default: this
-   VM's `build-id`): {:tree-id :build :sock :token :pid :meta :lock}, every
-   file named `<tree-id>-<build>.<ext>`.
+  "The endpoint path set for the daemon that answers for `root` when run by
+   `build` (default: this VM's `build-id`): {:tree-id :shared :build :sock :token
+   :pid :meta :lock :starting}, every file named `<endpoint-key>-<build>.<ext>`.
 
    The build is part of the name because a daemon runs ONE build's code. Keyed
    by the tree alone, a second build's command reached the first build's VM and
    ran there (measured with two drops in one tree: the warm answer came from
-   the other payload). Two builds in one tree are two daemons.
+   the other payload). Two builds are two daemons. For a drop build the key is
+   shared, so every project of the user reaches the same daemon; for `src` the
+   key is the checkout's tree id.
 
    The Rust launcher computes the same names (daemon.rs `endpoints_for`).
    Fails if the runtime dir cannot be secured or the socket path is too long."
   ([root] (endpoints root (build-id)))
-  ([root build]
+  ([root build] (endpoints root build (shared? root build)))
+  ([root build shared]
    (let [rd (runtime-dir)]
-     (if (nil? (:ok rd))
+     (cond
+       ;; an own endpoint is named by a project: with none (a shared VM was asked of a
+       ;; source build, which is never shared) there is nothing to name
+       (and (nil? root) (not (served-shared? build shared)))
+       {:error :no-root}
+       (nil? (:ok rd))
        rd
+       :else
        (let [dir (:ok rd)
-             id (tree-id root)
+             id (endpoint-key root build shared)
              base (str dir "/" id "-" build)
              sock (str base ".sock")]
          (if (> (erlang/byte_size sock) 100)
            {:error (tuple :socket_path_too_long sock)}
            {:ok {:tree-id id
+                 :shared (served-shared? build shared)
                  :build build
                  :sock sock
                  :token (str base ".token")
                  :pid (str base ".pid")
                  :meta (str base ".meta")
-                 :lock (str base ".start")}}))))))
+                 :lock (str base ".start")
+                 ;; "a VM for this endpoint is being started": written by the
+                 ;; launcher BEFORE it spawns one, removed by the VM once it
+                 ;; listens. A second `bl` in that window sees it and does not
+                 ;; start a second VM. (daemon.rs `endpoints_for` names it too.)
+                 :starting (str base ".starting")}}))))))
+
+;; ── the log: where a VM that has no terminal says what it is doing ───────────
+
+(def STATE-APP-DIR "beam-lisp")
+(def LOG-DIR "logs")
+(def LOG-EXT "log")
+
+(defn log-path-in
+  "The log file for the VM with endpoint `key` run by `build`, under `state-dir`.
+   Pure: the launcher computes the same name (daemon.rs `log_path_in`) and a test
+   pins the two golden strings equal."
+  [state-dir key build]
+  (str state-dir "/" STATE-APP-DIR "/" LOG-DIR "/" key "-" build "." LOG-EXT))
+
+(defn state-dir
+  "$XDG_STATE_HOME when set and non-empty, else $HOME/.local/state."
+  []
+  (let [xdg (System/get_env "XDG_STATE_HOME")]
+    (if (and (string? xdg) (not= xdg ""))
+      xdg
+      (str (System/get_env "HOME") "/.local/state"))))
+
+(defn log-path
+  "Where the VM that answers for `root` run by `build` (default: this VM's)
+   writes its log."
+  ([root] (log-path root (build-id)))
+  ([root build] (log-path root build (shared? root build)))
+  ([root build shared]
+   (log-path-in (state-dir) (endpoint-key root build shared) build)))
 
 ;; ── root resolution ─────────────────────────────────────────────────────────
 
@@ -172,13 +284,17 @@
     :else (find-root (erlang/apply :filename :dirname (list dir)))))
 
 (defn resolve-root
-  "The daemon root for `cwd`: the nearest ancestor that looks like a bl tree.
-   BL_DAEMON_ROOT overrides. Returns {:ok root} | {:error :no-root}."
-  [cwd]
-  (let [override (System/get_env "BL_DAEMON_ROOT")]
-    (if (and (string? override) (not= override ""))
-      {:ok (real-path override)}
-      (find-root (erlang/apply :filename :absname (list cwd))))))
+  "The root a warm VM is keyed on, for `cwd`: the nearest ancestor that looks like
+   a bl tree. Returns {:ok root} | {:error :no-root}.
+
+   `override` (the `--root DIR` argument) wins when given. The root travels as an
+   ARGUMENT, never as ambient state: a process-wide variable is invisible in `ps`
+   and in the command that set it, and it leaks into every child the VM starts."
+  ([cwd] (resolve-root cwd nil))
+  ([cwd override]
+   (if (and (string? override) (not= override ""))
+     {:ok (real-path override)}
+     (find-root (erlang/apply :filename :absname (list cwd))))))
 
 ;; ── the cache tier: where derived beam-lisp state lives (ports Cache) ────────
 ;;

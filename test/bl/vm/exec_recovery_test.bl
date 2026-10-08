@@ -1,0 +1,69 @@
+(ns vm.exec-recovery-test (:require [vm.exec :as exec] [veritas.model :as vm]))
+(defn ready? [attempts]
+ (let [s (exec/state)]
+  (if (and (= true (:complete? s)) (= 0 (:queued s))) true
+   (if (= attempts 0) false (do (Process/sleep 10) (ready? (- attempts 1)))))))
+(deftest progress-owner-death-does-not-stop-accepted-work-or-the-sequencer
+ (let [p (exec/start) parent (erlang/self) effects (atom 0)
+       caller (spawn (fn []
+                (let [result (try
+                   (exec/run-reload (fn []
+                     (erlang/send parent :blocked)
+                     (receive :release :ok (after 5000 (throw :release-timeout)))
+                     (swap! effects inc)
+                     (erlang/send parent :effect-completed)
+                     :done))
+                   (catch _ :interrupted))]
+                  (erlang/send parent [:caller-result result]))))]
+  (try
+   (is (= :blocked (receive :blocked :blocked (after 5000 :timeout))))
+   (let [tracker (Process/whereis :vm-exec-progress)
+         monitor (erlang/monitor :process tracker)]
+    (erlang/exit tracker :kill)
+    (is (= :killed (receive [:DOWN r :process _ reason] :when (= r monitor) reason
+                           (after 5000 :timeout))))
+    (let [snapshot (exec/state)]
+     (is (some? (:busy snapshot)) "missing progress cannot claim the active sequencer is idle")
+     (is (= false (:complete? snapshot))))
+    (let [result (receive [:caller-result value] value (after 5000 :timeout))]
+     (is (= :unknown (:outcome result)) "never report an admission fault as a rolled-back effect")))
+   (erlang/send p :release)
+   (is (= :effect-completed (receive :effect-completed :effect-completed (after 5000 :timeout))))
+   (is (= p (try (exec/run-reload (fn [] (erlang/self))) (catch _ :unavailable))))
+   (is (= 1 @effects) "accepted work drains exactly once without automatic retry")
+   (is (Process/alive? p))
+   (is (ready? 100))
+   (finally
+    (erlang/send p :release)
+    (when (Process/alive? p) (try (GenServer/stop p :normal 30000) (catch _ nil)))
+    (erlang/exit caller :kill)))))
+
+;; Finite protocol evidence complements the real process-kill test above.
+;; Observer status must remain conservative while pre-recovery work drains.
+(def INITIAL {:active? false :observer? true :uncertain? false :reported-idle? true})
+(defn step [s op guarded?]
+ (case op
+  :accept (assoc s :active? true :reported-idle? false)
+  :observer-dies (assoc s :observer? false :uncertain? guarded?
+                        :reported-idle? (not guarded?))
+  :recover (assoc s :observer? true :uncertain? true :reported-idle? false)
+  :drain (assoc s :active? false)
+  :barrier (if (and (:observer? s) (not (:active? s)))
+              (assoc s :uncertain? false :reported-idle? true) s)
+  s))
+(defn protocol [guarded?]
+ (vm/model "lost progress never certifies active work as idle"
+  {:state INITIAL :init (fn [] (atom INITIAL))
+   :commands (into {} (map (fn [op]
+    [op {:next (fn [s _] (step s op true))
+         :run (fn [system _] (swap! system step op guarded?))}])
+    [:accept :observer-dies :recover :drain :barrier]))
+   :invariants {:conservative (fn [_ system]
+     (not (and (:active? @system) (:reported-idle? @system))))}}))
+(deftest observer-loss-has-a-replayable-counterexample
+ (let [bad (vm/check (protocol false) {:seed 23 :histories 500 :max-len 30})
+       good (vm/check (protocol true) {:seed 23 :histories 500 :max-len 30})]
+  (is (= :refuted (:modality bad)))
+  (is (= false (:ok (vm/replay (protocol false) (:shrunk bad)))))
+  (is (= :witnessed (:modality good)))
+  (println "exec-observer-protocol" {:counterexample (:shrunk bad) :candidate (:modality good)})))

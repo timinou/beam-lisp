@@ -1,0 +1,656 @@
+; veritas/model.bl — a stateful system, checked against a model: generated
+; histories, invariants after every step, and the SHORTEST failing story.
+;
+; ── Where this sits ─────────────────────────────────────────────────────────
+;
+; veritas core quantifies over VALUES: ∀ v ∈ gen. pred(v). Most code worth
+; checking has a LIFECYCLE instead — a keep that polls a feed, a queue that
+; claims jobs, a projection that owes and retires. Its bugs live in ORDERS of
+; operations, not in single inputs. This layer makes an order a value: a
+; HISTORY is a vector of commands `[name args]`, histories are generated from a
+; model, and the one verb `check` quantifies over them:
+;
+;     ∀ history ∈ model. every invariant holds after every step,
+;                        and every :eventually holds once the history ends.
+;
+; The verdict is the core's shape — :witnessed / :refuted, :seed, :why, :tried —
+; plus what only a history has: the step it broke at, the invariant it broke,
+; and the SHRUNK history: the fewest commands, with the simplest arguments,
+; that still break it.
+;
+; ── The two states ──────────────────────────────────────────────────────────
+;
+; A model keeps TWO things per history and never confuses them:
+;   state   the MODEL — pure data, what SHOULD be true (`:next` updates it)
+;   sys     the REAL system under test (`:init` builds it, `:run` drives it)
+; An invariant is `(fn [state sys] bool)`: it can check the system alone, the
+; model alone, or that they agree — which is how "the real thing does what
+; the model says" is written.
+;
+; Predicates here are FUNCTIONS, not quoted forms. The quoted-form rule belongs
+; to the symbolic core (a form is what z3 translates); a model reads a LIVE
+; system and is never symbolic, so a closure is the honest representation.
+;
+; ── Generation ──────────────────────────────────────────────────────────────
+;
+; `:args` is `(fn [state rng] [args rng'])` — arguments drawn FROM THE CURRENT
+; STATE (move an item that exists; pick a folder that is mounted). `pick`,
+; `fresh`, `one-of`, `int-in` build such functions. The rng is `:rand`'s
+; explicit state threaded through, so a seed determines every history exactly:
+; `replay` needs nothing but the model and the history, and `check` with the
+; same seed returns the same verdict.
+;
+; `:pre` filters: a command whose precondition fails in the current state is
+; not generated, and during shrinking a candidate history whose preconditions
+; fail on replay is simply not a valid history.
+;
+; ── Served models ───────────────────────────────────────────────────────────
+;
+; The same model, served: `(serve m opts)` binds a loopback HTTP port and answers
+; each request from the model's state, so a model IS a fake service (the whole
+; contract is in the "serving a model" section at the end of this file). A
+; command that declares `:request` is an endpoint; its `args` — for `:pre`,
+; `:next`, `:response` AND for `check`'s generators — are the REQUEST map. One
+; command map, two drivers.
+;
+; ── Honesty ─────────────────────────────────────────────────────────────────
+;
+; A model check SAMPLES histories, so a pass is :witnessed — never :proven —
+; and says how many histories, how long, and which commands actually ran
+; (:coverage). A command that never ran is a hole in the evidence, and the
+; verdict names it rather than letting the count imply it was exercised.
+
+(ns veritas.model
+  (:require [veritas :as v] [core] [web] [bl.json]))
+
+;; ── rng: explicit, seeded, threaded ─────────────────────────────────────────
+
+(defn rng [seed] (rand/seed_s :exsss (+ 1 seed)))
+
+(defn- uniform
+  "An int in [0, n) and the next rng."
+  [n g]
+  (let [r (rand/uniform_s n g)] [(- (erlang/element 1 r) 1) (erlang/element 2 r)]))
+
+;; ── argument generators ─────────────────────────────────────────────────────
+;; An arg generator is `(fn [state rng] → [value rng'])`, or a map
+;; `{:draw that-fn :domain pred :simplest x}` when it can say what values it
+;; produces (then shrinking stays inside its domain).
+
+(defn constant [x] (fn [_ g] [x g]))
+
+(defn one-of
+  "One of `xs`, uniformly. Shrinks toward the FIRST element, never outside the
+   set (a shrunk history must be one the model could generate)."
+  [xs]
+  (let [v (into [] xs)
+        members (into #{} v)]
+    {:draw (fn [_ g] (let [[i g2] (uniform (count v) g)] [(nth v i) g2]))
+     :domain (fn [x] (contains? members x))
+     :simplest (first v)}))
+
+(defn int-in
+  "An int in [lo, hi]. Returned as an ARG-GEN MAP carrying its domain, so
+   shrinking never offers an argument the generator could not have produced (a
+   shrunk history must be a history the model could generate). A map, not a fn
+   with metadata: fns do not carry metadata here (measured: `with-meta` on a fn
+   yields `(meta f)` = nil)."
+  [lo hi]
+  {:draw (fn [_ g] (let [[i g2] (uniform (+ 1 (- hi lo)) g)] [(+ lo i) g2]))
+   :domain (fn [x] (and (int? x) (>= x lo) (<= x hi)))
+   :simplest lo})
+
+(defn- draw
+  "Draw from an arg generator: a bare fn `(fn [state rng])`, or an arg-gen map
+   `{:draw fn :domain pred :simplest x}`."
+  [gen state g]
+  (if (map? gen) ((:draw gen) state g) (gen state g)))
+
+(defn pick
+  "One element of the collection `(f state)`, or nil when it is empty — a
+   command whose args are nil is not generated (see `gen-command`). Carries
+   `:valid` (state, x) so a SHRUNK or replayed history cannot pick something
+   the state never held — a history is only valid if every pick was possible."
+  [f]
+  {:draw (fn [state g]
+           (let [xs (into [] (f state))]
+             (if (empty? xs) [nil g]
+               (let [[i g2] (uniform (count xs) g)] [(nth xs i) g2]))))
+   :valid (fn [state x] (some (fn [y] (= x y)) (f state)))})
+
+(defn fresh
+  "A name not yet in `(f state)`: `prefix` + the next integer. Deterministic, so a
+   replayed history names things the same way."
+  [prefix f]
+  (fn [state g]
+    (let [taken (into #{} (f state))]
+      [(loop [i 0] (let [k (keyword (str prefix i))] (if (contains? taken k) (recur (+ i 1)) k))) g])))
+
+(defn tuple
+  "Several argument generators, drawn in order, as one vector. nil if any is nil.
+   Its domain is the product of the parts' domains (a part with none accepts
+   anything of the right position), so a tuple shrinks coordinate-wise inside
+   each part's domain and keeps its arity."
+  [& gens]
+  (let [gs (into [] gens)]
+    {:draw (fn [state g]
+             (loop [gs gs g g out []]
+               (if (empty? gs) [out g]
+                 (let [[x g2] (draw (first gs) state g)]
+                   (if (nil? x) [nil g2] (recur (rest gs) g2 (conj out x)))))))
+     :domain (fn [x] (and (vector? x) (= (count x) (count gs))
+                          (every? (fn [i] (let [p (:domain (nth gs i))] (or (nil? p) (p (nth x i)))))
+                                  (range 0 (count gs)))))
+     :valid (fn [state x] (and (vector? x) (= (count x) (count gs))
+                               (every? (fn [i] (let [p (:valid (nth gs i))] (or (nil? p) (p state (nth x i)))))
+                                       (range 0 (count gs)))))
+     :coords gs}))
+
+;; ── the model value ─────────────────────────────────────────────────────────
+
+(defn model
+  "A model from a spec map:
+     :state       initial model state (data) or (fn [] data)
+     :init        (fn [] sys) — a FRESH real system per history (optional: a
+                  purely served model has no system)
+     :cleanup     (fn [sys]) — optional, after each history
+     :commands    {name {:args argfn? :pre (fn [state args] bool)?
+                         :next (fn [state args] state')? :run (fn [sys args] sys'|any)?
+                         :request [method path-pattern]? :response (fn [state req] resp)?}}
+                  `:request`/`:response` make a command a SERVED endpoint (see
+                  `serve`); `check` ignores them, and `:run` is then optional.
+     :invariants  {name (fn [state sys] bool)} — after EVERY step
+     :eventually  {name (fn [state sys] bool)} — after the history, following
+                  the optional :settle command (e.g. a final drain)
+     :settle      a command name run once at the end before :eventually
+   `:run` may return a new sys (when the system is a value) or anything else
+   (when it is a process/conn mutated in place) — a map result with key
+   ::sys replaces sys; otherwise sys is kept."
+  [name spec]
+  (assoc spec :name name))
+
+(defmacro defmodel
+  "(defmodel name doc spec) — define a model var."
+  [name doc spec]
+  `(def ~name ~doc (model ~(str name) ~spec)))
+
+(defn- initial-state [m] (let [s (:state m)] (if (fn? s) (s) s)))
+
+;; ── running one history ─────────────────────────────────────────────────────
+
+(defn- run-cmd [m sys state [nm args]]
+  (let [c (get (:commands m) nm)
+        ; a served-only command (:request, no :run) has no system to drive
+        r (if (nil? (:run c)) nil ((:run c) sys args))
+        sys2 (if (and (map? r) (contains? r ::sys)) (::sys r) sys)
+        nx (:next c)]
+    [sys2 (if (nil? nx) state (nx state args))]))
+
+(defn- broken-invariant [m state sys]
+  (core/some (fn [[k f]] (if (try (f state sys) (catch _ false)) nil k))
+             (into [] (:invariants m))))
+
+(defn- pre-ok?
+  "Is `[nm args]` a command the model could issue in `state`? Its generator's
+   :valid (a pick must pick something that exists) AND its :pre."
+  [m state [nm args]]
+  (let [c (get (:commands m) nm)
+        gen (:args c)
+        valid (if (map? gen) (:valid gen) nil)]
+    (and (some? c)
+         (or (nil? valid) (try (valid state args) (catch _ false)))
+         (let [p (:pre c)] (or (nil? p) (try (p state args) (catch _ false)))))))
+
+(defn replay
+  "Run `history` on a fresh system. → {:ok true :steps n :state s} or
+   {:ok false :at i :broke name :kind :invariant|:eventually|:crash|:pre
+    :error e :state s}. Deterministic: the history is the whole input."
+  [m history]
+  (let [sys0 (if (nil? (:init m)) nil ((:init m)))]
+    (try
+      (loop [i 0 sys sys0 state (initial-state m) h (seq history)]
+        (if (empty? h)
+          (let [[sys2 state2] (if (some? (:settle m))
+                                (run-cmd m sys state [(:settle m) nil])
+                                [sys state])
+                bad (core/some (fn [[k f]] (if (try (f state2 sys2) (catch _ false)) nil k))
+                               (into [] (:eventually m)))]
+            (if (nil? bad)
+              {:ok true :steps i :state state2}
+              {:ok false :at i :broke bad :kind :eventually :state state2}))
+          (let [cmd (first h)]
+            (if (not (pre-ok? m state cmd))
+              {:ok false :at i :kind :pre :broke (first cmd) :state state}
+              (let [res (try {:v (run-cmd m sys state cmd)} (catch e {:error e}))]
+                (if (contains? res :error)
+                  {:ok false :at i :kind :crash :broke (first cmd) :error (:error res) :state state}
+                  (let [[sys2 state2] (:v res)
+                        bad (broken-invariant m state2 sys2)]
+                    (if (some? bad)
+                      {:ok false :at i :broke bad :kind :invariant :state state2}
+                      (recur (+ i 1) sys2 state2 (rest h))))))))))
+      (finally (when (some? (:cleanup m)) ((:cleanup m) sys0))))))
+
+;; ── generating one history ──────────────────────────────────────────────────
+
+(defn- gen-command
+  "One command valid in `state`, or nil when none can be generated."
+  [m state g]
+  (let [names (into [] (sort (keys (:commands m))))]
+    (loop [tries 0 g g]
+      (if (>= tries (* 3 (count names))) [nil g]
+        (let [[i g2] (uniform (count names) g)
+              nm (nth names i)
+              c (get (:commands m) nm)
+              [args g3] (if (nil? (:args c)) [::none g2] (draw (:args c) state g2))
+              args (if (= args ::none) nil args)
+              cmd [nm args]]
+          (if (and (not (and (some? (:args c)) (nil? args))) (pre-ok? m state cmd))
+            [cmd g3]
+            (recur (+ tries 1) g3)))))))
+
+(defn- gen-history
+  "A history of up to `max-len` commands, generated against the MODEL state
+   only (the real system is not touched while generating)."
+  [m max-len g]
+  (let [[len g] (uniform (+ 1 max-len) g)]
+    (loop [i 0 state (initial-state m) g g out []]
+      (if (>= i len) [out g]
+        (let [[cmd g2] (gen-command m state g)]
+          (if (nil? cmd) [out g2]
+            (let [c (get (:commands m) (first cmd))
+                  nx (:next c)]
+              (recur (+ i 1) (if (nil? nx) state (nx state (second cmd))) g2 (conj out cmd)))))))))
+
+;; ── shrinking a failing history ─────────────────────────────────────────────
+
+(defn- gen-candidates
+  "Simpler values than `a` that generator `gen` could have produced. A tuple
+   shrinks coordinate-wise through each part; a part with a domain stays in it
+   and offers its :simplest first; a bare fn part gets value-directed
+   candidates (its :pre guards them on replay)."
+  [gen a]
+  (cond
+    (and (some? (:coords gen)) (vector? a))
+      (let [cs (:coords gen)]
+        (mapcat (fn [i] (map (fn [x] (assoc a i x))
+                             (gen-candidates (let [c (nth cs i)] (if (map? c) c nil)) (nth a i))))
+                (range 0 (count a))))
+    :else
+      (let [inside (get gen :domain)
+            simplest (get gen :simplest)
+            cands (concat (if (and (some? simplest) (not= simplest a)) [simplest] [])
+                          (v/shrink-candidates a))]
+        (distinct (if (nil? inside) cands (filter inside cands))))))
+
+(defn- arg-candidates
+  "Simpler args for command `nm`, kept inside its generator's domain when the
+   generator declares one (`int-in` does): candidates outside it are dropped,
+   and the generator's simplest value is offered first. A generator with no
+   domain (a closure over state) gets the value-directed candidates; `:pre`
+   still guards them on replay."
+  [m nm a]
+  (let [gen (:args (get (:commands m) nm))]
+    (gen-candidates (if (map? gen) gen nil) a)))
+
+(defn- history-candidates
+  "Shorter histories first (halves, then each command dropped), then each
+   command's ARGS shrunk in place — shape-preserving: a command stays
+   `[name args]`, so no candidate is malformed."
+  [m h]
+  (let [n (count h)
+        halves (if (> n 1) [(subvec h 0 (quot n 2)) (subvec h (quot n 2))] [])
+        drops (map (fn [i] (into (subvec h 0 i) (subvec h (+ i 1)))) (range 0 n))
+        args (mapcat (fn [i]
+                       (let [[nm a] (nth h i)]
+                         (map (fn [a2] (assoc h i [nm a2])) (arg-candidates m nm a))))
+                     (range 0 n))]
+    (concat halves drops args)))
+
+(defn- same-failure? [m broke h]
+  (let [r (replay m h)]
+    (and (not (:ok r)) (not= :pre (:kind r)) (= broke (:broke r)))))
+
+(defn shrink-history
+  "The shortest, simplest history that still breaks the same invariant.
+   Candidates that violate a precondition on replay are invalid, not failures."
+  [m broke h]
+  (loop [best h fuel 300]
+    (if (<= fuel 0) best
+      (let [nxt (core/some (fn [c] (if (same-failure? m broke c) [c] nil)) (history-candidates m best))]
+        (if (nil? nxt) best (recur (first nxt) (- fuel 1)))))))
+
+;; ── the verb ────────────────────────────────────────────────────────────────
+
+(defn- coverage [hs]
+  (frequencies (map first (apply concat hs))))
+
+(defn check
+  "∀ generated history, every invariant holds after every step and every
+   :eventually after the end. opts {:seed 0 :histories 100 :max-len 30
+   :budget-ms nil}. → a veritas verdict:
+     {:modality :witnessed :engine :model :tried n :seed s :why …
+      :coverage {cmd n} :unexercised [cmd …]}
+     {:modality :refuted :engine :model :witness h :shrunk h' :broke name
+      :kind … :at i :seed s :why …}"
+  ([m] (check m {}))
+  ([m opts]
+   (let [seed (get opts :seed 0)
+         n (get opts :histories 100)
+         max-len (get opts :max-len 30)
+         deadline (if (some? (:budget-ms opts)) (+ (erlang/monotonic_time :millisecond) (:budget-ms opts)) nil)
+         cmd-names (into #{} (keys (:commands m)))]
+     (loop [i 0 g (rng seed) seen []]
+       (let [out-of-time (and (some? deadline) (> (erlang/monotonic_time :millisecond) deadline))]
+         (if (or (>= i n) out-of-time)
+           (let [cov (coverage seen)
+                 missing (into [] (sort (filter (fn [c] (not (contains? cov c))) cmd-names)))]
+             {:modality :witnessed :engine :model :tried i :seed seed
+              :coverage cov :unexercised missing
+              :why (str "sampled " i " histories (max-len " max-len ", seed " seed ")"
+                        (if out-of-time "; stopped at the time budget" "")
+                        (if (empty? missing) "" (str "; never generated: " (join " " (map str missing)))))})
+           (let [[h g2] (gen-history m max-len g)
+                 r (replay m h)]
+             (if (:ok r)
+               (recur (+ i 1) g2 (conj seen h))
+               (let [small (shrink-history m (:broke r) h)
+                     rs (replay m small)]
+                 {:modality :refuted :engine :model :tried (+ i 1) :seed seed
+                  :witness h :shrunk small :broke (:broke r) :kind (:kind r)
+                  :at (:at rs) :error (:error rs)
+                  :why (str "history " (+ i 1) " broke " (:broke r)
+                            " (" (name (:kind r)) "); shrunk from " (count h)
+                            " to " (count small) " commands")})))))))))
+
+;; ── serving a model ─────────────────────────────────────────────────────────
+;;
+;; A model is a state machine; HTTP is a way to drive one. `serve` makes the
+;; model a fake service so a client under test (or a deployment rehearsal) talks
+;; to something that REMEMBERS — create a server, list it, delete it, and the
+;; list agrees — without a second hand-written fake that can drift from the model.
+;;
+;; THE ONE ARGS SHAPE. A command with `:request` takes the REQUEST as its args:
+;;
+;;   {:method :get|:post|…  :path "/servers/12"  :params {"id" "12"}
+;;    :query {"label_selector" "…"}  :body <decoded JSON | nil>  :headers {"k" "v"}}
+;;
+;; (string keys below the top level, header names lowercase). `:pre`, `:next` and
+;; `:response` receive that map, and for `check` the command's `:args` generator
+;; draws a map of the same shape — so the command a client drives over HTTP is
+;; the one `check` shrinks, with no adapter between them. A bare `:request`
+;; method is a keyword; a pattern's `:name` segments capture one path segment.
+;;
+;; ROUTING. A request is matched against commands in SORTED NAME ORDER:
+;;   · no command's [method pattern] matches            → 404 not_found
+;;   · some match, but no matching command's :pre holds → 409 conflict
+;;   · else the FIRST (by name) matching command whose :pre holds runs.
+;; A model that wants its own refusal declares a LATER-named command on the same
+;; route whose :pre is the negation (or always true, as a catch-all).
+;;
+;; WHAT RUNS. :next computes the POST state; :response is `(fn [post-state req])`
+;; — the POST state, because a real API's create answers with the thing it just
+;; made. It returns {:status n :headers {…} :body data}: :status defaults to 200,
+;; a nil :body sends an empty body, any other :body is JSON-encoded. A command
+;; with no :response answers 204. An exception in :pre/:next/:response answers
+;; 500 {:error {:code "model_error"}} and leaves the state unchanged.
+;;
+;; SERIALIZATION. The state lives in ONE agent; every request is one atomic step
+;; there, so concurrent requests cannot interleave a read-modify-write.
+;;
+;; BODIES. `application/json` (or none) decodes as JSON; a request sent as
+;; `application/x-www-form-urlencoded` arrives as a string-keyed map of its
+;; fields. A `:response` may instead return `{:status n :raw bytes :content-type s}`
+;; to send bytes untouched. A final `*name` path segment captures the rest of
+;; the path.
+;;
+;; BAD INPUT is refused before the model sees it: unparseable JSON → 400, a body
+;; over 1 MiB → 413 (neither is logged). Path params and query values stay
+;; STRINGS — nothing from the wire becomes an atom.
+
+(def ^:private MAX-BODY (* 1024 1024))
+(def ^:private LOG-LIMIT 500)
+(def ^:private LOOPBACK (erlang/list_to_tuple (list 127 0 0 1)))
+(def ^:private URIMod (erlang/binary_to_atom "Elixir.URI"))
+(def ^:private ConnMod (erlang/binary_to_atom "Elixir.Plug.Conn"))
+(def ^:private TI (erlang/binary_to_atom "Elixir.ThousandIsland"))
+
+(defn- tuple2 [a b] (erlang/list_to_tuple (list a b)))
+
+(defn- segments [p] (into [] (filter (fn [s] (not= "" s)) (String/split p "/"))))
+
+(defn- pct-decode
+  "Percent-decode one PATH segment ('+' stays '+'); a malformed escape is kept
+   as sent rather than raised — a lookup that misses beats a 500."
+  [s]
+  (try (erlang/apply URIMod :decode (list s)) (catch _ s)))
+
+(defn- match-path
+  "Params ({\"id\" \"12\"}) when `segs` fit `pattern-segs`, else nil. A `:name`
+   segment captures; any other must be equal. A FINAL `*name` segment captures
+   the whole remainder (one or more segments, decoded, joined by \"/\") — for
+   APIs whose resource address is itself a path (`/sites/host:/sites/x`)."
+  [pattern-segs segs]
+  (let [np (count pattern-segs)
+        splat? (and (pos? np) (String/starts_with? (nth pattern-segs (- np 1)) "*"))]
+    (when (if splat? (>= (count segs) np) (= np (count segs)))
+      (loop [i 0 out {}]
+        (cond
+          (and splat? (= i (- np 1)))
+            (assoc out (subs (nth pattern-segs i) 1)
+                   (join "/" (map pct-decode (drop i segs))))
+          (= i (count segs)) out
+          :else
+          (let [ps (nth pattern-segs i) s (nth segs i)]
+            (cond
+              (String/starts_with? ps ":") (recur (+ i 1) (assoc out (subs ps 1) (pct-decode s)))
+              (= ps (pct-decode s)) (recur (+ i 1) out)
+              :else nil)))))))
+
+(defn- parse-query [qs]
+  (into {}
+    (map (fn [pair]
+           (let [kv (String/split pair "=")]
+             [(web/url-decode (first kv)) (web/url-decode (join "=" (rest kv)))]))
+         (filter (fn [s] (not= "" s)) (String/split qs "&")))))
+
+(defn- req-headers [conn]
+  (into {} (map (fn [kv] [(erlang/element 1 kv) (erlang/element 2 kv)])
+                (erlang/map_get :req_headers conn))))
+
+(defn- read-limited
+  "[:ok body conn] or [:too-large conn]: the body read in bounded chunks, so an
+   oversized upload is refused without being buffered whole."
+  [conn]
+  (let [opts (list (tuple2 :length 65536))]
+    (loop [conn conn acc [] size 0]
+      (let [res (erlang/apply ConnMod :read_body (list conn opts))
+            tag (erlang/element 1 res)
+            chunk (erlang/element 2 res)
+            size (+ size (erlang/byte_size chunk))
+            conn2 (erlang/element 3 res)]
+        (cond
+          (> size MAX-BODY) [:too-large conn2]
+          (= tag :ok) [:ok (apply str (conj acc chunk)) conn2]
+          (= tag :more) (recur conn2 (conj acc chunk) size)
+          :else [:ok (apply str acc) conn2])))))
+
+(defn- error-body [code message] {:error {:code code :message message}})
+
+(def ^:private REDACTED-HEADERS #{"authorization" "cookie" "x-api-key"})
+
+(defn- redact-headers
+  "Request headers for the log: a credential's PRESENCE stays visible, its value
+   does not — a log is read by people and by test failures, a bearer must not be
+   in either."
+  [h]
+  (into {} (map (fn [[k v]] [k (if (contains? REDACTED-HEADERS (String/downcase (str k))) "<redacted>" v)])
+                (into [] (or h {})))))
+
+(defn- has-header? [hs name]
+  (some (fn [[k _]] (= name (String/downcase (str k)))) (into [] (or hs {}))))
+
+(defn- send-resp
+  "Send `{:status :headers :body}` on `conn` (see the serving notes)."
+  [conn resp]
+  (let [conn (reduce (fn [c kv] (web/resp-header c (if (keyword? (first kv)) (name (first kv)) (str (first kv)))
+                                                 (str (second kv))))
+                     conn (into [] (get resp :headers {})))
+        status (get resp :status 200)]
+    (cond
+      ;; {:raw bytes :content-type s}: bytes as they are, for a blob download
+      (some? (:raw resp))
+        (erlang/apply ConnMod :send_resp
+          (list (if (has-header? (get resp :headers) "content-type")
+                  conn
+                  (web/resp-header conn "content-type" (get resp :content-type "application/octet-stream")))
+                status (:raw resp)))
+      (nil? (:body resp)) (web/json conn status "")
+      :else (web/json conn status (bl.json/encode (:body resp))))))
+
+(defn- splat-pattern? [r]
+  (let [ps (segments (second r))]
+    (and (pos? (count ps)) (String/starts_with? (last ps) "*"))))
+
+(defn- route-candidates*
+  [m method segs]
+  (into []
+    (keep (fn [nm]
+            (let [c (get (:commands m) nm)
+                  r (:request c)]
+              (when (and (some? r) (= (name (first r)) method))
+                (let [params (match-path (segments (second r)) segs)]
+                  (when (some? params) [nm c params])))))
+          (sort (keys (:commands m))))))
+
+(defn- route-candidates
+  "[[name command params] …] for every command whose :request matches: exact
+   (non-splat) patterns first, then splat ones, each by name — a catch-all
+   never shadows a specific route, whatever the names sort to."
+  [m method segs]
+  (let [all (route-candidates* m method segs)]
+    (into (into [] (remove (fn [[_ c _]] (splat-pattern? (:request c))) all))
+          (filter (fn [[_ c _]] (splat-pattern? (:request c))) all))))
+
+(defn- serve-step
+  "One request against the held {:state :log}: → [response held']. Runs INSIDE
+   the agent, so it is the atomic unit; a throw becomes a 500, never an agent crash."
+  [m req held]
+  (let [state (:state held)
+        cands (route-candidates m (name (:method req)) (segments (:path req)))
+        out (fn [resp nm st]
+              [resp {:state st
+                     :log (let [l (conj (:log held)
+                                        {:method (:method req) :path (:path req) :query (:query req)
+                                         :body (:body req) :headers (redact-headers (:headers req)) :status (get resp :status 200) :command nm})]
+                            (if (> (count l) LOG-LIMIT) (subvec l (- (count l) LOG-LIMIT)) l))}])]
+    (if (empty? cands)
+      (out {:status 404 :body (error-body "not_found" (str "no route for " (name (:method req)) " " (:path req)))} nil state)
+      (try
+        (let [live (core/some (fn [[nm c params]]
+                                (let [r (assoc req :params params)
+                                      p (:pre c)]
+                                  (if (or (nil? p) (p state r)) [nm c r] nil)))
+                              cands)]
+          (if (nil? live)
+            (out {:status 409 :body (error-body "conflict" "no command's precondition holds for this request")} nil state)
+            (let [[nm c r] live
+                  nx (:next c)
+                  post (if (nil? nx) state (nx state r))
+                  resp (if (nil? (:response c)) {:status 204} ((:response c) post r))]
+              (out resp nm post))))
+        (catch e
+          (out {:status 500 :body (error-body "model_error" (str e))} nil state))))))
+
+(defn- handle [m agent conn]
+  (let [parsed (read-limited conn)]
+    (if (= :too-large (first parsed))
+      (send-resp (second parsed) {:status 413 :body (error-body "payload_too_large" "request body over 1 MiB")})
+      (let [[_ raw conn2] parsed
+            ;; a form post (OAuth token endpoints) decodes to a string-keyed map;
+            ;; everything else is JSON, as before
+            form? (starts-with? (or (get (req-headers conn2) "content-type") "")
+                                "application/x-www-form-urlencoded")
+            body (cond (= "" raw) {:ok nil}
+                       form? {:ok (parse-query raw)}
+                       :else (try {:ok (bl.json/decode raw)} (catch _ {:bad true})))]
+        (if (:bad body)
+          (send-resp conn2 {:status 400 :body (error-body "bad_request" "request body is not valid JSON")})
+          (let [req {:method (keyword (web/method conn2)) :path (web/path conn2) :params {}
+                     :query (parse-query (web/query conn2)) :body (:ok body) :headers (req-headers conn2)}
+                resp (Agent/get_and_update agent
+                       (fn [held] (let [[r h] (serve-step m req held)] (tuple2 r h)))
+                       30000)]
+            (send-resp conn2 resp)))))))
+
+(defn serve
+  "Serve model `m` over HTTP on loopback. opts {:port 0 :ip {127,0,0,1}
+   :state initial-state-override}. Port 0 binds an ephemeral port; :port in the
+   result is the one actually bound. →
+     {:url \"http://127.0.0.1:PORT\" :port n
+      :stop    (fn [])             free the port and the state
+      :state   (fn [])             the model state right now
+      :log     (fn [])             the last 500 requests, oldest first:
+                                   [{:method :path :query :body :headers :status :command}]
+      :inject! (fn [name args])    run command `name` against the served state
+                                   (a fault toggle, a clock tick…): no HTTP, :run
+                                   not called, :pre RESPECTED →
+                                   {:ok true :state s} | {:ok false :reason :pre|:unknown}}
+   Linked to the caller. See the section notes for routing and response rules."
+  ([m] (serve m {}))
+  ([m opts]
+   (Application/ensure_all_started :bandit)
+   (let [initial (if (contains? opts :state) (:state opts) (initial-state m))
+         ip (get opts :ip LOOPBACK)
+         agent (erlang/element 2 (Agent/start_link (fn [] {:state initial :log []})))
+         started (web/serve {:port (get opts :port 0) :ip ip :log :off
+                             :plug (fn [conn] (handle m agent conn))})]
+     (when (not= :ok (erlang/element 1 started))
+       (Agent/stop agent)
+       (throw (ex-info "veritas.model/serve: could not bind" {:reason (erlang/element 2 started)})))
+     (let [sup (erlang/element 2 started)
+           bound (erlang/element 2 (erlang/element 2 (erlang/apply TI :listener_info (list sup))))]
+       {:url (str "http://" (join "." (map str (erlang/tuple_to_list ip))) ":" bound)
+        :port bound
+        :stop (fn [] (Supervisor/stop sup) (Agent/stop agent) :ok)
+        :state (fn [] (:state (Agent/get agent (fn [h] h))))
+        :log (fn [] (:log (Agent/get agent (fn [h] h))))
+        :inject! (fn [nm args]
+                   (let [c (get (:commands m) nm)]
+                     (if (nil? c) {:ok false :reason :unknown}
+                       (Agent/get_and_update agent
+                         (fn [held]
+                           (let [st (:state held)]
+                             (if (and (some? (:pre c)) (not ((:pre c) st args)))
+                               (tuple2 {:ok false :reason :pre} held)
+                               (let [st2 (if (nil? (:next c)) st ((:next c) st args))]
+                                 (tuple2 {:ok true :state st2} (assoc held :state st2))))))
+                         30000))))}))))
+
+(defn request
+  "A tiny client for a served model: `(request server :post \"/servers\" body)` →
+   {:status n :body <decoded JSON | nil> :headers {\"name\" \"value\"}}. `body` is
+   JSON-encoded when given; a string body is sent verbatim (to test bad JSON).
+   For tests and rehearsals — any HTTP client works against `:url`."
+  ([server method path] (request server method path nil))
+  ([server method path body]
+   (erlang/apply :application :ensure_all_started (list :inets))
+   (let [url (erlang/binary_to_list (str (:url server) path))
+         payload (cond (string? body) body (nil? body) "" :else (bl.json/encode body))
+         ; :httpc wants a body tuple for methods that carry one, even when empty
+         bodyless (and (nil? body) (contains? #{:get :head :delete :options} method))
+         req (if bodyless
+               (tuple2 url (list))
+               (erlang/list_to_tuple (list url (list) (erlang/binary_to_list "application/json") payload)))
+         r (erlang/apply :httpc :request
+             (list method req (list) (list (tuple2 :body_format :binary))))]
+     (if (not= :ok (erlang/element 1 r))
+       (throw (ex-info "veritas.model/request failed" {:reason (pr-str (erlang/element 2 r))}))
+       (let [resp (erlang/element 2 r)
+             raw (erlang/element 3 resp)]
+         {:status (erlang/element 2 (erlang/element 1 resp))
+          :headers (into {} (map (fn [kv] [(erlang/list_to_binary (erlang/element 1 kv))
+                                           (erlang/list_to_binary (erlang/element 2 kv))])
+                                 (erlang/element 2 resp)))
+          :body (if (= "" raw) nil (bl.json/decode raw))})))))
+

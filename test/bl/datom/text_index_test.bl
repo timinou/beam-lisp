@@ -1,0 +1,117 @@
+(ns datom.text-index-test
+  (:require [datom] [datom.text :as text] [datom.schema :as schema]
+            [datom.store-fjall :as fjall] [datom.conn :as conn] [datom.db :as db] [datom.derived :as derived]))
+(def indexed [{:db/ident :note/text :db/valueType :db.type/string :db/fulltext true}
+              {:db/ident :note/name :db/valueType :db.type/string}])
+(defn ids [d q] (:eids (text/candidates d :note/text q {:rows 10000 :seeks 1000 :bytes 1048576})))
+(deftest text-postings-follow-replacements-retractions-and-old-bases
+  (let [c (datom/connect indexed)
+        r (datom/transact! c [{:db/id -1 :note/text "Liberté et الحرية" :note/name "one"}])
+        e (get (:tempids r) -1) old (datom/db c)]
+    (is (= #{e} (ids old "liberte")))
+    (is (= #{e} (ids old "حرية")))
+    (datom/transact! c [[:db/add e :note/text "New freedom"]])
+    (is (empty? (ids (datom/db c) "liberte")))
+    (is (= #{e} (ids old "liberte")))
+    (is (= #{e} (ids (datom/db c) "freedom")))
+    (datom/transact! c [[:db/retractEntity e]])
+    (is (empty? (ids (datom/db c) "freedom")))))
+(deftest shared-grams-survive-cardinality-one-replacement
+  (let [c (datom/connect indexed) r (datom/transact! c [{:db/id -1 :note/text "same old"}])
+        e (get (:tempids r) -1)]
+    (datom/transact! c [[:db/add e :note/text "same new"]])
+    (is (= #{e} (ids (datom/db c) "same")))))
+(deftest budgets-and-short-terms-decline-without-partial-results
+  (let [c (datom/connect indexed)]
+    (datom/transact! c (mapv (fn [i] {:db/id (- -1 i) :note/text "common word"}) (range 20)))
+    (let [r (text/candidates (datom/db c) :note/text "common" {:rows 1 :seeks 1 :bytes 1024})]
+      (is (= :incomplete (:status r)))
+      (is (nil? (:eids r))))
+    (is (= :short-term (:reason (text/candidates (datom/db c) :note/text "ab" {}))))))
+(deftest enabling-an-index-never-silently-omits-existing-data
+  (let [c (datom/connect [{:db/ident :note/text :db/valueType :db.type/string}])]
+    (datom/transact! c [{:db/id -1 :note/text "legacy freedom"}])
+    (datom/install-schema! c indexed)
+    (is (= :unindexed (:reason (text/candidates (datom/db c) :note/text "freedom" {}))))
+    (loop [after nil n 0]
+      (is (< n 100))
+      (let [r (text/reindex-page! (datom/db c) :note/text {:after after :limit 1})]
+        (is (contains? #{:exact :incomplete} (:status r)))
+        (when (and (:after r) (< n 100)) (recur (:after r) (inc n)))))
+    (is (= 1 (count (ids (datom/db c) "freedom"))))))
+(deftest fulltext-schema-refuses-unsupported-value-types
+  (is (some? (schema/validate-attr-def {:db/ident :bad/text :db/valueType :db.type/long :db/fulltext true})))
+  (is (some? (schema/validate-attr-def {:db/ident :bad/text :db/valueType :db.type/string
+                                     :db/cardinality :db.cardinality/many :db/fulltext true}))))
+
+(deftest internal-postings-survive-durable-reopen-and-are-invisible-to-datalog
+  (let [dir (str "/tmp/bl-text-index-" (erlang/unique_integer (list :positive)))
+        c (datom/connect-with (fjall/open dir) indexed)]
+    (try
+      (datom/transact! c [{:db/id -1 :note/text "durable freedom"}])
+      (let [e (first (ids (datom/db c) "freedom"))
+            facts (datom/q '[:find ?e ?a ?v :where [?e ?a ?v]] (datom/db c))]
+        (is (some? e))
+        (is (= 1 (count (filter (fn [r] (= e (first r))) facts))))
+        (datom/close! c)
+        (let [again (datom/connect-with (fjall/open dir) [])]
+          (try
+            (is (= #{e} (ids (datom/db again) "freedom")))
+            (finally (datom/close! again)))))
+      (finally (datom/close! c) (File/rm_rf! dir)))))
+
+(deftest bulk-load-maintains-postings
+  (let [c (datom/connect indexed)]
+    (datom/load-facts! c [{:db/id 100 :note/text "bulk freedom"}])
+    (is (= #{100} (ids (datom/db c) "freedom")))))
+
+(deftest disabled-index-writes-require-backfill-and-forged-backfill-cursors-refuse
+  (let [c (datom/connect indexed)]
+    (datom/transact! c [{:db/id -1 :note/text "old freedom"}])
+    (datom/install-schema! c [{:db/ident :note/text :db/valueType :db.type/string :db/fulltext false}])
+    (datom/transact! c [{:db/id -2 :note/text "new freedom"}])
+    (datom/install-schema! c indexed)
+    (is (= :unindexed (:reason (text/candidates (datom/db c) :note/text "freedom" {}))))
+    (is (= :invalid-cursor (:reason (text/reindex-page! (datom/db c) :note/text {:after "forged"}))))
+    (is (not (text/ready? (datom/db c) :note/text)))))
+
+(deftest excision-removes-private-postings-and-speculation-never-mutates-the-base
+  (let [c (datom/connect indexed) r (datom/transact! c [{:db/id -1 :note/text "private freedom"}])
+        e (get (:tempids r) -1)
+        hypothetical (datom/with c [[:db/add e :note/text "hypothetical zephyr"]])]
+    (is (empty? (ids (datom/db c) "zephyr")))
+    (is (= :unbounded-substrate (:reason (text/candidates (:db-after hypothetical) :note/text "zephyr" {}))))
+    (datom/excise! c [[:entity e]])
+    (is (empty? (ids (datom/db c) "freedom")))))
+
+(deftest backfill-page-boundaries-preserve-shared-terms-and-retractions
+  (let [c (datom/connect [{:db/ident :note/text :db/valueType :db.type/string}])
+        r (datom/transact! c [{:db/id -1 :note/text "same old"}]) e (get (:tempids r) -1)]
+    (datom/transact! c [[:db/add e :note/text "same new"]])
+    (datom/install-schema! c indexed)
+    (loop [after nil n 0]
+      (let [r (text/reindex-page! (datom/db c) :note/text {:after after :limit 1})]
+        (is (contains? #{:exact :incomplete} (:status r)))
+        (when (:after r) (assert (< n 100)) (recur (:after r) (inc n)))))
+    (is (= #{e} (ids (datom/db c) "same")))
+    (is (empty? (ids (datom/db c) "old")))))
+
+(deftest oversized-indexed-values-refuse-before-source-or-posting-publication
+  (let [c (datom/connect indexed)
+        value (join "" (repeat 1048577 "x"))
+        refused (try (datom/transact! c [{:db/id -1 :note/text value}]) false (catch _ true))]
+    (is refused)
+    (is (empty? (datom/q '[:find ?e :where [?e :note/text _]] (datom/db c))))
+    (datom/transact! c [{:db/id -2 :note/text "small freedom"}])
+    (is (= 1 (count (ids (datom/db c) "freedom"))))))
+
+(deftest excision-erases-term-hints-and-does-not-index-unrelated-large-values
+  (let [c (datom/connect indexed)
+        r (datom/transact! c [{:db/id -1 :note/text "privateword freedom"}
+                             {:db/id -2 :note/name (join "" (repeat 1048577 "x"))}])
+        e (get (:tempids r) -1) plain (get (:tempids r) -2)
+        st (db/store-of (datom/db c))]
+    (is (some? (derived/get-record st [:datom.text/frequency :note/text "w:privateword"])))
+    (datom/excise! c [[:entity e] [:entity plain]])
+    (is (nil? (derived/get-record st [:datom.text/frequency :note/text "w:privateword"])))
+    (is (empty? (datom/q '[:find ?e :where [?e :note/name _]] (datom/db c))))))

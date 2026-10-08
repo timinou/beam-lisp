@@ -1,0 +1,90 @@
+(ns datom.compound-page-test
+  (:require [datom] [datom.conn :as conn] [datom.db :as db] [datom.compound :as compound]
+            [datom.query.page :as page] [datom.query.engine :as engine] [datom.profile :as profile]
+            [datom.store :as store] [datom.store-ets :as ets] [datom.store-fjall :as fjall]
+            [auth.rls :as rls] [data.bounded-cache :as cache]))
+
+(def schema [{:db/ident :p/scope :db/valueType :db.type/string}
+             {:db/ident :p/at :db/valueType :db.type/long :db/index true}
+             {:db/ident :p/owner :db/valueType :db.type/string}
+             {:db/ident :p/order :db/valueType :db.type/tuple :db/tupleAttrs [:p/scope :p/at] :db/index true}])
+(def query '[:find ?e ?at :in $ ?scope :where [?e :p/scope ?scope] [?e :p/at ?at]])
+(defn fixture [s]
+  (let [c (conn/connect-with s schema)]
+    (datom/transact! c (mapv (fn [i] {:db/id (- -1 i) :p/scope "ours" :p/at (quot i 2)
+                                     :p/owner (if (even? i) "alice" "bob")}) (range 12)))
+    c))
+(defn drain [q d scope direction limit]
+  (loop [after nil rows []]
+    (let [r (page/page q d {:order-by ['?at direction] :limit limit :after after} [scope])]
+      (is (= :exact (:status r)))
+      (if (:more? r) (recur (:after r) (into rows (:rows r))) (into rows (:rows r))))))
+
+(deftest typed-prefix-refuses-unproven-shapes
+  (let [sch (conn/schema (fixture (ets/open)))]
+    (is (some? (compound/tuple-prefix sch :p/order ["ours"])))
+    (doseq [values [[] [7] ["ours" 1] nil]] (is (nil? (compound/tuple-prefix sch :p/order values))))))
+
+(deftest cold-scoped-pages-ignore-foreign-growth-on-both-backends
+  (doseq [s [(ets/open) (fjall/open-fresh)]]
+    (let [c (fixture s) watched (profile/watch s)
+          run (fn []
+                (cache/clear! :datom.query.pages)
+                (profile/reset! watched)
+                (let [r (page/page query (assoc (conn/db c) :store watched) {:order-by ['?at :desc] :limit 5} ["ours"])]
+                  {:result r :work (profile/counters watched)}))]
+      (datom/transact! c (mapv (fn [i] {:db/id (- -1000 i) :p/scope "foreign" :p/at (+ 100 i) :p/owner "bob"}) (range 32)))
+      (run)
+      (let [a (run)]
+        (datom/transact! c (mapv (fn [i] {:db/id (- -2000 i) :p/scope "foreign" :p/at (+ 1000 i) :p/owner "bob"}) (range 128)))
+        (let [b (run)]
+          (is (= :exact (get-in b [:result :status])))
+          (is (= (get-in a [:result :rows]) (get-in b [:result :rows])))
+          (is (= (:rows (:work a)) (:rows (:work b))))
+          (is (< (:rows (:work b)) 40))
+          (println "compound-page-physical-work" {:foreign-before 32 :foreign-after 160 :before (:work a) :after (:work b)}))))))
+
+(deftest permissions-ties-updates-and-retractions-match-oracle
+  (let [c (fixture (ets/open)) q (rls/guarded query [(rls/owner-filter '?e :p/owner "alice")])]
+    (doseq [direction [:asc :desc]]
+      (let [oracle (sort-by (fn [r] [(second r) (first r)]) (engine/q-uncached q (conn/db c) "ours"))]
+        (is (= (if (= direction :desc) (vec (reverse oracle)) (vec oracle))
+               (drain q (conn/db c) "ours" direction 2)))))
+    (let [e (first (first (engine/q-uncached query (conn/db c) "ours")))]
+      (datom/transact! c [[:db/add e :p/at 100] [:db/add e :p/scope "foreign"]])
+      (is (= (engine/q-uncached q (conn/db c) "ours") (set (drain q (conn/db c) "ours" :desc 3)))))))
+
+(deftest tuple-proof-never-substitutes-component-assertion-transactions
+  (let [c (fixture (ets/open))
+        e (first (first (engine/q-uncached query (conn/db c) "ours")))
+        old (conn/db c)
+        q '[:find ?e ?at ?tx :in $ ?scope
+            :where [?e :p/scope ?scope ?tx] [?e :p/at ?at]]]
+    (datom/transact! c [[:db/add e :p/at 999]])
+    (doseq [d [old (conn/db c)]]
+      (is (= (engine/q-uncached q d "ours")
+             (set (drain q d "ours" :desc 4)))))
+    (datom/transact! c [[:db/retract e :p/scope "ours"]])
+    (is (= (engine/q-uncached query (conn/db c) "ours")
+           (set (drain query (conn/db c) "ours" :desc 4))))))
+
+(deftest covered-tuple-values-belong-only-to-the-driving-entity
+  (let [c (datom/connect (conj schema {:db/ident :p/peer :db/valueType :db.type/ref}))]
+    (datom/transact! c [{:db/id -1 :p/scope "ours" :p/at 1 :p/peer -2}
+                       {:db/id -2 :p/scope "foreign" :p/at 2 :p/peer -1}
+                       {:db/id -3 :p/scope "ours" :p/at 3 :p/peer -1}])
+    (let [d (datom/db c)]
+      (doseq [scope ["ours" "foreign"]]
+        (let [q [:find '?e '?at :in '$ '?scope
+                 :where ['?e :p/scope '?scope] ['?e :p/at '?at]
+                        ['?e :p/peer '?peer] ['?peer :p/scope scope]]]
+          (is (= (engine/q-uncached q d "ours")
+                 (set (drain q d "ours" :desc 2)))))))))
+
+(deftest certified-compound-order-does-not-require-a-redundant-scalar-index
+  (let [sch (mapv (fn [a] (if (= :p/at (:db/ident a)) (assoc a :db/index false) a)) schema)
+        c (datom/connect sch)]
+    (datom/transact! c [{:db/id -1 :p/scope "ours" :p/at 1}
+                       {:db/id -2 :p/scope "ours" :p/at 2}])
+    (is (= (engine/q-uncached query (datom/db c) "ours")
+           (set (drain query (datom/db c) "ours" :desc 2))))))

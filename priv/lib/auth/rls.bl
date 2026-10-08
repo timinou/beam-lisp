@@ -34,75 +34,423 @@
 ; one, with no extra machinery. A grant scoped to "current only" is
 ; expressible as an ordinary clause on the basis, not a special case here.
 
+;
+; ── Scoping by relation (the agent/MCP path) ─────────────────────────
+;
+; Ownership filters are one clause. A document library is not that simple:
+; per-document read rights are DERIVED (mirrored SharePoint/Drive ACLs,
+; relation `:~acl/source-reads [?identity ?item]`), and the row being
+; scoped (a chunk) reaches the thing the policy talks about (the item key)
+; through a JOIN PATH: chunk → :chunk/src → source → :src/origin → key.
+;
+;   (rls/scope query {:var '?c
+;                     :via [:chunk/src :src/origin]
+;                     :allow {:set allowed-keys}})            ; or
+;                     :allow {:clauses [["alice" :~acl/may-read ?key]]}
+;   ⇒ {:query q' :inputs [extra…]}      (run: (apply datom/q q' db (concat mine extra)))
+;
+; `scope-all` finds the row variables itself, from a policy naming the
+; SCOPED ATTRIBUTES (every attribute that carries document content):
+;
+;   (rls/scope-all query {:attrs {:chunk/text {:path [:chunk/src :src/origin]}
+;                                 :src/title  {:path [:src/origin]}}
+;                         :allow {:set allowed-keys}})
+;   ⇒ {:query :inputs} | {:refused :unscopable :why [...]}
+;
+; DETECTED (⇒ constrained): every variable that is the ENTITY of a data
+; pattern whose attribute is scoped — at top level or inside and/or/not
+; (it must ALSO be bound by a top-level pattern or an :in; otherwise it is
+; local to the negation/disjunction and constraining it would change the
+; query's meaning) — and the entity output of a generating analytic clause
+; (`[(similar-to :chunk/text ?q 10) [?c ?s]]`) naming a scoped attribute.
+; Caveat: such a search takes its top-k BEFORE the filter, so a scoped
+; principal may get < k rows; the rows never include forbidden ones.
+;
+; REFUSED (fail closed, never run): a scoped attribute whose entity is a
+; constant or `_`; an attribute position that is a variable (could read
+; any attribute); a pull whose pattern is `*`, a variable, a map/join, or
+; names a scoped attribute; a function/predicate clause that names a
+; scoped attribute, receives a source (`$`), or is a db-reading op
+; (get-else, get-some, missing?, pull, entity, datoms, q); a `%` rules
+; input unless the policy passes the same `:rules` (which are scanned and
+; must not touch scoped attributes); a scoped entity that exists only
+; inside a negation/disjunction, or is local to an or-join/not-join; a
+; relation whose declared `:reads` include a scoped attribute.
+; NOT detectable: a host function closing over a db and reading scoped
+; attributes from an opaque id. Don't register such functions in queries
+; handed to agents.
+;
+; HYGIENE (FUP-121): every variable a builder introduces is chosen by
+; `fresh`, deterministically, absent from the query — so a filter can never
+; join to, or narrow, the caller's own variables.
+;
+; EFFICIENCY (test/bl/auth/rls_bench_test.bl, 20k chunks/2k sources/1k
+; items, 50% allowed): unscoped 1.2 s · RELATION clause 1.4 s · post-filter
+; 3.5 s · :in set + contains? 9.3 s · [?k ...] collection O(rows×set).
+; ⇒ recommended: `:allow {:clauses […]}` — the datom join does it in one
+; pass, ~1.2× unscoped. The set forms are conveniences (small sets,
+; foreign-service id lists); `memo-allowed` caches a per-principal set
+; keyed [principal basis-t] either way (and is how to feed `:set`).
+
 (ns auth.rls
-  (:require [datom.query.parse :as parse]))
+  (:require [datom.query.parse :as parse]
+            [datom.query.relation :as rel]
+            [datom.db :as db-value]
+            [data.bounded-cache :as cache]
+            [datom]))
+
+;; ── variables & fresh names (FUP-121) ───────────────────────────────
+
+(defn variables
+  "Every variable the query mentions anywhere: :find (incl. pull/agg
+   forms), :in, :with, :where (rules and fn clauses included). The set
+   a filter's own names must avoid."
+  [query]
+  (let [p (parse/parse query)]
+    (into #{} (concat (mapcat parse/all-variables (:find p))
+                      (mapcat parse/all-variables (:in p))
+                      (mapcat parse/all-variables (or (:with p) []))
+                      (mapcat parse/all-variables (:where p))))))
+
+(defn fresh
+  "Fresh variable names for `bases` (a vector of `?syms`), absent from
+   `query` and from each other. A base that is free is kept as is; else
+   `?base-1`, `?base-2`, … Pure + deterministic: a function of (query,
+   bases) only — no counter, no gensym."
+  [query bases]
+  (loop [bs (seq bases) used (variables query) out []]
+    (if (empty? bs)
+      out
+      (let [b (first bs)
+            pick (if (contains? used b)
+                   (loop [n 1]
+                     (let [c (symbol (str b "-" n))]
+                       (if (contains? used c) (recur (+ n 1)) c)))
+                   b)]
+        (recur (rest bs) (conj used pick) (conj out pick))))))
 
 ;; ── the core: splice clauses into a query ───────────────────────────
 
 (defn inject
-  "Return `query` with `extra-clauses` appended to its `:where`.
+  "Return `query` with `extra-clauses` appended to its `:where` (and
+   `extra-in` forms, if any, appended AFTER the caller's `:in`, so the
+   caller's positional inputs keep their positions).
 
-   Accepts either query form (the flat `[:find … :where …]` vector or the
-   `{:find … :where …}` map) and always returns the MAP form, because the
-   map is what a programmatically-assembled query wants and it round-trips
-   through datom's `q` unchanged. Appending (rather than prepending) keeps
-   the caller's clauses first, so the planner still sees the user's most
-   selective clause where it expects it; the scoping clauses narrow the
-   result further, never widen it.
+   Accepts either query form and always returns the MAP form (`:with` is
+   preserved — dropping it would silently change aggregates). Appending
+   keeps the caller's clauses first; the scoping clauses narrow the result
+   further, never widen it.
 
-   Injection is monotonic on results: adding a conjunctive `:where` clause
-   can only REMOVE rows from the answer, never add any. That is the
-   property that makes this safe — an injected filter is incapable of
-   granting access to a row the unfiltered query would not have returned."
-  [query extra-clauses]
-  (let [parsed (parse/parse query)]
-    {:find (:find parsed)
-     :in (:in parsed)
-     :where (into (:where parsed) extra-clauses)}))
+   Injection is monotonic on results: adding a conjunctive TOP-LEVEL
+   `:where` clause can only REMOVE rows. That is what makes this safe —
+   an injected filter cannot grant access to a row the unfiltered query
+   would not have returned."
+  ([query extra-clauses] (inject query extra-clauses []))
+  ([query extra-clauses extra-in]
+   (let [parsed (parse/parse query)
+         base {:find (:find parsed)
+               :in (into (vec (:in parsed)) extra-in)
+               :where (into (:where parsed) extra-clauses)}]
+     (if (seq (:with parsed)) (assoc base :with (:with parsed)) base))))
 
-;; ── deriving the filter for a principal ─────────────────────────────
+;; ── constant filters (bind nothing new ⇒ trivially hygienic) ────────
 
 (defn owner-filter
-  "Clauses that restrict `row-var` to rows owned by `principal` via
-   `owner-attr`.
-
-   e.g. `(owner-filter '?doc :doc/owner \"alice\")` yields
-   `[[?doc :doc/owner \"alice\"]]` — the single clause that, joined into a
-   query binding `?doc`, keeps only Alice's documents. The principal is a
-   CONSTANT here (the bearer's identity, already known), so the clause
-   binds nothing new; it only constrains `?doc`.
-
-   This is the simplest and most common row filter — direct ownership.
-   Richer filters (membership, role, hierarchy) are just more clauses, and
-   `inject` takes any vector of them, so this is a convenience for the
-   ownership case rather than the only shape RLS supports."
+  "Clauses restricting `row-var` to rows owned by `principal` via
+   `owner-attr`: `[[?doc :doc/owner \"alice\"]]`. The principal is a
+   CONSTANT, so the clause binds nothing new."
   [row-var owner-attr principal]
   [[row-var owner-attr principal]])
 
 (defn attribute-filter
-  "Clauses restricting `row-var`'s `attr` to the constant `value`.
-
-   Generalises `owner-filter` to any attribute equality — e.g. limiting
-   rows to a tenant (`[?row :row/tenant \"acme\"]`) or a visibility flag
-   (`[?row :row/public true]`). Composable: several attribute filters in
-   one `inject` call AND together, because conjunctive clauses intersect."
+  "Clauses restricting `row-var`'s `attr` to the constant `value`."
   [row-var attr value]
   [[row-var attr value]])
 
 ;; ── guarded query assembly ──────────────────────────────────────────
 
 (defn guarded
-  "Rewrite `query` for a principal, injecting every clause in `filters`.
+  "Rewrite `query` for a principal, injecting every filter in `filters`.
 
-   `filters` is a vector of clause-vectors (each what `owner-filter` /
-   `attribute-filter` returns); they are concatenated and appended to the
-   query's `:where`. The result is a normal datom query the caller runs
-   with `datom/q` against any db value — the RLS is now IN the query, so
-   there is no separate enforcement step to forget.
-
-   Returning the query (rather than running it) keeps this layer pure and
-   composable: the caller supplies the db and the basis, and can inspect
-   or further-compose the guarded query before executing it — the same
-   'query is a value' property datom rests on."
+   A filter is a clause vector (what `owner-filter` returns) OR a function
+   `(fn [query] clauses)` for filters that introduce variables: it is
+   handed the query-so-far (caller's plus earlier filters), so its fresh
+   names avoid both the caller's variables and the other filters'. The
+   result is a normal datom query to run with `datom/q`."
   [query filters]
-  (inject query (into [] (mapcat (fn [f] f) filters))))
+  (reduce (fn [q f] (inject q (if (fn? f) (f q) f)))
+          (inject query [])
+          filters))
+
+;; ── scope: constrain one row variable through a join path ───────────
+
+(defn- subst [m x]
+  (cond (symbol? x) (get m x x)
+        (list? x) (apply list (mapv (fn [y] (subst m y)) x))
+        (vector? x) (mapv (fn [y] (subst m y)) x)
+        :else x))
+
+(defn- path-clauses
+  "Chain `var` through `path` attrs ending at `key-var`; [] path ⇒ var is
+   the key and `key-var` is ignored (caller handles)."
+  [var path hops key-var]
+  (let [n (count path)]
+    (mapv (fn [i]
+            [(if (= i 0) var (nth hops (- i 1)))
+             (nth path i)
+             (if (= i (- n 1)) key-var (nth hops i))])
+          (range n))))
+
+(defn- scope-parts
+  "Build {:query :inputs} constraining each spec {:var :via} of `specs`
+   with ONE shared allowed-set input (or one clause template per spec)."
+  [query specs allow mode]
+  (let [set? (contains? allow :set)
+        tmpl (get allow :clauses)
+        mode (or mode :contains)
+        coll? (and set? (= mode :collection) (= 1 (count specs)))
+        _ (when (not (or set? tmpl))
+            (throw (ex-info "rls/scope: :allow needs :set or :clauses" {:allow allow})))
+        tvars (if tmpl
+                (into [] (remove (fn [v] (= v '?key)) (distinct (mapcat parse/all-variables tmpl))))
+                [])
+        ;; every name this call introduces, requested in ONE `fresh` pass
+        per (vec (map-indexed
+                   (fn [i sp]
+                     (let [n (count (or (:via sp) []))
+                           sfx (str "-" i)]
+                       {:hops (mapv (fn [j] (symbol (str "?scope-hop" j sfx))) (range (max 0 (- n 1))))
+                        :key (symbol (str "?scope-key" sfx))
+                        :tvs (mapv (fn [t] (symbol (str t sfx))) tvars)}))
+                   specs))
+        bases (vec (concat ['?scope-set]
+                           (mapcat (fn [p] (concat (:hops p) [(:key p)] (:tvs p))) per)))
+        names (fresh query bases)
+        sv (first names)
+        step (fn [[acc names] [sp p]]
+               (let [nh (count (:hops p))
+                     w (+ nh 1 (count (:tvs p)))
+                     mine (subvec names 0 w)
+                     hops (subvec mine 0 nh)
+                     key (nth mine nh)
+                     tn (subvec mine (+ nh 1))
+                     path (vec (or (:via sp) []))
+                     n (count path)
+                     key-var (cond (= n 0) (:var sp) coll? sv :else key)
+                     walk (if (= n 0) [] (path-clauses (:var sp) path hops key-var))
+                     tail (cond
+                            (and coll? (= n 0)) [[(list '= (:var sp) sv)]]
+                            (and set? (not coll?)) [[(list 'contains? sv key-var)]]
+                            set? []
+                            :else (mapv (fn [c] (subst (assoc (zipmap tvars tn) '?key key-var) c)) tmpl))]
+                 [(into acc (into walk tail)) (subvec names w)]))
+        clauses (first (reduce step [[] (subvec names 1)] (mapv (fn [a b] [a b]) specs per)))]
+    {:query (inject query clauses (if set? [(if coll? [sv '...] sv)] []))
+     :inputs (if set? [(if coll? (vec (get allow :set)) (set (get allow :set)))] [])}))
+
+(defn scope
+  "Constrain query variable `:var` so the key reached from it via `:via`
+   (a vector of attributes, default [] = the var itself) is ALLOWED.
+   Returns `{:query q' :inputs [extra…]}`; run with the extras appended
+   to yours: `(apply datom/q (:query s) db (concat mine (:inputs s)))`.
+
+   `:allow` is one of
+     {:set coll}          a precomputed allowed-key set (per principal;
+                          see `memo-allowed`). Becomes ONE extra :in,
+                          after the caller's. `:mode :contains` (default)
+                          binds it as a scalar and filters with a
+                          `contains?` predicate; never multiplies rows.
+                          `:mode :collection` binds `[?k ...]` (ONE
+                          scoped var only). MEASURED (bench test): both
+                          are SLOWER than the relation form — the engine
+                          seeds/evaluates per row (collection ≈ O(rows ×
+                          set): 23 s at 2k chunks/100 keys). Prefer
+                          `:clauses` over a materialised grant relation.
+     {:clauses [clause…]} relation/rule clauses with the placeholder
+                          `?key` for the reached key, e.g.
+                          `[[\"alice\" :~acl/source-reads ?key]]`. Other
+                          template variables are renamed fresh.
+   Every introduced name is fresh (FUP-121). The injected clauses are
+   top-level + conjunctive ⇒ monotone even when the caller uses
+   or/not/or-join. Throws if :var is not a variable of the query."
+  [query {:keys [var via allow mode]}]
+  (when (not (contains? (variables query) var))
+    (throw (ex-info "rls/scope: :var is not a variable of the query" {:var var})))
+  (scope-parts query [{:var var :via via}] allow mode))
+
+;; ── scope-all: find the row variables, fail closed ──────────────────
+
+(def ^:private DB-OPS
+  #{(symbol "get-else") (symbol "get-some") (symbol "missing?") (symbol "pull")
+    (symbol "entity") (symbol "datoms") (symbol "q") (symbol "d/q") (symbol "datom/q")
+    (symbol "attribute") (symbol "ground")})
+
+(defn- kw-attr
+  "Attribute with a reverse-lookup underscore removed."
+  [k]
+  (let [n (name k)]
+    (if (and (> (count n) 1) (= "_" (subs n 0 1)))
+      (keyword (namespace k) (subs n 1))
+      k)))
+
+(defn- scoped-in?
+  "Does any keyword anywhere inside `x` name a scoped attribute?"
+  [attrs x]
+  (cond (keyword? x) (contains? attrs (kw-attr x))
+        (or (vector? x) (list? x)) (boolean (some (fn [y] (scoped-in? attrs y)) x))
+        (map? x) (or (scoped-in? attrs (keys x)) (scoped-in? attrs (vals x)))
+        (set? x) (boolean (some (fn [y] (scoped-in? attrs y)) x))
+        :else false))
+
+(defn- pull-safe? [attrs pat]
+  (and (vector? pat)
+       (every? (fn [a] (and (keyword? a) (not (scoped-in? attrs a)))) pat)))
+
+(defn- find-refusals [attrs find]
+  (vec (keep (fn [f]
+               (when (and (list? f) (= (symbol "pull") (first f)))
+                 (let [pat (last f)]
+                   (when (not (pull-safe? attrs pat))
+                     (str "pull pattern may read scoped attributes: " (pr-str f))))))
+             find)))
+
+(defn- flatten-all [x]
+  (cond (or (vector? x) (list? x) (set? x)) (mapcat flatten-all x)
+        :else [x]))
+
+(defn- scan-clause
+  "Walk one clause. Returns {:ents [[var attr]…] :refs [why…] :bound [vars]}."
+  [attrs clause nested?]
+  (let [clause (parse/normalize-clause clause)]
+    (cond
+      (list? clause)
+        {:ents [] :bound []
+         :refs (if (scoped-in? attrs clause) [(str "rule call names a scoped attribute: " (pr-str clause))] [])}
+      (parse/analytic-clause? clause)
+        (let [call (get clause 0)
+              out (get clause 1)
+              spec (rel/relation (first call))
+              reads (get spec :reads)
+              names-scoped (scoped-in? attrs call)
+              reads-scoped (and reads (boolean (some (fn [a] (contains? attrs a)) reads)))
+              ent (when (vector? out) (first out))]
+          (cond
+            (or names-scoped reads-scoped)
+              (if (parse/variable? ent)
+                {:ents (if names-scoped
+                         (vec (keep (fn [a] (when (and (keyword? a) (contains? attrs a)) [ent a])) call))
+                         (vec (keep (fn [a] (when (contains? attrs a) [ent a])) reads)))
+                 :refs [] :bound (if nested? [] (parse/all-variables out))}
+                {:ents [] :bound []
+                 :refs [(str "analytic clause over scoped attributes without an entity variable: " (pr-str clause))]})
+            :else {:ents [] :refs [] :bound (if nested? [] (parse/all-variables out))}))
+      (parse/predicate-clause? clause)
+        (let [call (get clause 0)
+              op (first call)
+              dbop (or (contains? DB-OPS op) (some (fn [x] (parse/source? x)) call))
+              okfn (and dbop
+                        (contains? #{(symbol "get-else") (symbol "get-some") (symbol "missing?")} op)
+                        (let [a (nth call 2 nil)]
+                          (and (keyword? a) (not (scoped-in? attrs a)))))]
+          {:ents [] :bound (if nested? [] (parse/all-variables (if (> (count clause) 1) (get clause 1) [])))
+           :refs (cond
+                   (scoped-in? attrs clause) [(str "function clause names a scoped attribute: " (pr-str clause))]
+                   (and dbop (not okfn)) [(str "db-reading function clause cannot be proven scope-safe: " (pr-str clause))]
+                   :else [])})
+      (parse/rule-clause? clause)
+        (let [op (get clause 0)
+              subs (if (contains? #{:or-join :not-join} op) (drop 2 clause) (rest clause))
+              rs (mapv (fn [c] (scan-clause attrs c true)) subs)
+              local (if (contains? #{:or-join :not-join} op) [] [])]
+          {:ents (into [] (mapcat :ents rs)) :refs (into [] (mapcat :refs rs))
+           :bound []
+           :nested-ents (into [] (mapcat (fn [r] (concat (:ents r) (:nested-ents r))) rs))})
+      (parse/pattern-clause? clause)
+        (let [e (get clause 0) a (get clause 1) v (nth clause 2 nil)]
+          (cond
+            (parse/variable? a)
+              {:ents [] :bound [] :refs [(str "variable attribute position could read scoped attributes: " (pr-str clause))]}
+            (and (keyword? a) (contains? attrs (kw-attr a)))
+              (if (and (parse/variable? e) (= a (kw-attr a)))
+                {:ents [[e a]] :refs [] :bound (if nested? [] (parse/all-variables clause))}
+                {:ents [] :bound []
+                 :refs [(str "scoped attribute on a non-variable entity (or reverse lookup): " (pr-str clause))]})
+            (and (keyword? v) false) {:ents [] :refs [] :bound []}
+            :else {:ents [] :refs [] :bound (if nested? [] (parse/all-variables clause))}))
+      :else {:ents [] :bound [] :refs [(str "unrecognised clause shape: " (pr-str clause))]})))
+
+(defn scope-all
+  "Scope EVERY row variable of `query` that reads a scoped attribute.
+
+   `policy`: {:attrs {attr {:path [attr…]}}   ; scoped attrs → join path to the key
+              :allow {:set coll} | {:clauses […]}
+              :mode  :contains | :collection
+              :rules rules-data}               ; the `%` input's value, if used
+   Returns `{:query :inputs}` or `{:refused :unscopable :why [string…]}`.
+   Detection and refusal rules are in the ns doc. Deterministic."
+  [query policy]
+  (let [attrs (get policy :attrs)
+        parsed (parse/parse query)
+        scans (mapv (fn [c] (scan-clause attrs c false)) (:where parsed))
+        top-bound (into #{} (concat (parse/all-input-variables parsed)
+                                    (mapcat :bound scans)))
+        ents (vec (distinct (mapcat :ents scans)))
+        nested (vec (distinct (mapcat (fn [s] (concat (:nested-ents s) (:ents s))) scans)))
+        rules-in? (parse/has-rules-input? parsed)
+        why (vec (concat
+                   (mapcat :refs scans)
+                   (find-refusals attrs (:find parsed))
+                   (if (and rules-in? (or (nil? (get policy :rules))
+                                          (scoped-in? attrs (get policy :rules))
+                                          (some (fn [x] (parse/source? x)) (flatten-all (get policy :rules)))))
+                     ["a `%` rules input is not provably scope-safe (pass :rules in the policy; they must not name scoped attributes)"]
+                     [])
+                   (keep (fn [[v a]]
+                           (when (not (contains? top-bound v))
+                             (str "scoped entity " v " (" a ") is bound only inside a negation/disjunction")))
+                         nested)))]
+    (if (seq why)
+      {:refused :unscopable :why why}
+      (let [specs (vec (distinct (mapcat (fn [[v a]]
+                                           (let [path (or (get (get attrs a) :path) [])]
+                                             [{:var v :via path}]))
+                                         ents)))]
+        (if (empty? specs)
+          {:query (inject query []) :inputs []}
+          (scope-parts query specs (get policy :allow) (get policy :mode)))))))
+
+;; ── per-principal allowed sets, memoised by db basis ────────────────
+
+(defn memo-allowed
+  "Memoise `(f principal db)` against its exact database view in bounded ETS.
+   One-argument form is for functions depending only on principal and db.
+   Policies with external inputs pass {:context (fn [principal db] stamp)};
+   stamp includes their immutable inputs/generations and optional :expires-at
+   (Unix milliseconds). Unknown/expired contexts compute without retention.
+   Definition publication invalidates automatically. Context and code are checked
+   again after computation, so a racing policy is not saved."
+  ([f] (memo-allowed f {}))
+  ([f opts]
+   (let [id (erlang/make_ref)
+         context (or (:context opts) (fn [_ _] {}))
+         now (or (:now opts) (fn [] (erlang/system_time :millisecond)))]
+     (fn [principal db]
+       (let [_ (cache/ready! :auth.allowed-cache)
+             code (when (erlang/function_exported :Elixir.BeamLisp.Env :publication_epoch 0)
+                    (BeamLisp.Env/publication_epoch))
+             stamp (context principal db)
+             expiry (:expires-at stamp)
+             valid? (and (erlang/is_integer code) (map? stamp)
+                         (or (nil? expiry)
+                             (and (erlang/is_integer expiry) (< (now) expiry))))
+             key [id principal]
+             revision [(db-value/view-key db) stamp code]
+             hit (when valid? (cache/lookup :auth.allowed-cache key revision))
+             stable? (fn [] (and (= code (BeamLisp.Env/publication_epoch))
+                                (= stamp (context principal db))
+                                (or (nil? expiry) (< (now) expiry))))]
+         (if (and (:hit? hit) (stable?)) (:value hit)
+           (let [v (f principal db)]
+             (when (and valid? (stable?))
+               (cache/put! :auth.allowed-cache key revision v))
+             v)))))))

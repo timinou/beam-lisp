@@ -1,0 +1,86 @@
+(ns datom.conn-lifetime-test
+ (:require [datom :as d] [datom.conn :as conn] [datom.store-ets :as ets-store] [env]))
+(deftest release-ends-one-lifetime-without-affecting-the-next
+ (let [s (ets-store/open) c (d/connect-with s) writer (:writer c)]
+  (try
+   (is (Process/alive? writer))
+   (d/release! c)
+   (is (not (Process/alive? writer)))
+   (is (= :closed @(:lifetime c)))
+   (is (= :released-connection
+          (try (d/transact! c [{:db/id 1 :db/doc "closed"}]) :accepted
+               (catch e (:reason (ex-data e))))))
+   (let [next (d/connect-with s)]
+    (try
+     (d/release! c)
+     (is (Process/alive? (:writer next)))
+     (is (= :open @(:lifetime next)))
+     (is (some? (:tx (d/transact! next [{:db/id 1 :db/doc "open"}]))))
+     (finally (d/release! next))))
+   (finally (d/release! c) (ets-store/close s)))))
+(deftest release-stops-the-replacement-writer
+ (let [s (ets-store/open) c (d/connect-with s)]
+  (try
+   (Process/exit (:writer c) :kill)
+   (loop [n 0] (when (and (< n 100) (Process/alive? (:writer c))) (Process/sleep 1) (recur (inc n))))
+   (d/transact! c [{:db/id 1 :db/doc "replacement"}])
+   (let [live (conn/conn-of (d/db c))]
+    (is (not= (:writer live) (:writer c)))
+    (is (Process/alive? (:writer live)))
+    (d/release! c)
+    (is (not (Process/alive? (:writer live)))))
+   (finally (d/release! c) (ets-store/close s)))))
+
+(deftest release-drains-an-already-running-source-commit
+ (let [s (ets-store/open) c (d/connect-with s) parent (erlang/self) token (env/capture)
+       guard (fn [_] (erlang/send parent [:write-entered])
+                       (receive [:allow-commit] nil (after 5000 [{:timeout true}])))
+       _ (conn/guard! c :drain-test guard)
+       writer (:writer c)
+       tx-worker (erlang/spawn (fn [] (env/bind token)
+                    (erlang/send parent [:write-result (d/transact! c [{:db/id 1 :db/doc "committed"}])])))]
+  (try
+   (is (= :entered (receive [:write-entered] :entered (after 5000 :timeout))))
+   (let [release-worker (erlang/spawn (fn [] (env/bind token) (d/release! c)
+                                       (erlang/send parent [:released])))]
+    (try
+     (loop [n 0] (when (and (< n 1000) (= :open @(:lifetime c))) (Process/sleep 1) (recur (inc n))))
+     (is (= :closing @(:lifetime c)))
+     (is (Process/alive? writer))
+     (is (Process/alive? release-worker))
+     (erlang/send writer [:allow-commit])
+     (is (some? (receive [:write-result r] (:tx r) (after 5000 nil))))
+     (is (= :released (receive [:released] :released (after 5000 :timeout))))
+     (is (not (Process/alive? writer)))
+     (is (= :closed @(:lifetime c)))
+     (let [next (d/connect-with s)]
+      (try (is (= "committed" (:db/doc (d/entity (d/db next) 1))))
+           (finally (d/release! next))))
+     (finally (when (Process/alive? release-worker) (Process/exit release-worker :kill)))))
+   (finally (when (Process/alive? tx-worker) (Process/exit tx-worker :kill))
+            (conn/unguard! c :drain-test) (d/release! c) (ets-store/close s)))))
+
+(deftest pre-upgrade-handles-adopt-only-their-own-lifetime
+ (let [s (ets-store/open) current (d/connect-with s)
+       legacy (dissoc current :lifetime)]
+  (try
+   ;; Simulate the registry row and immutable handle from the old runtime.
+   (Agent/update (erlang/whereis conn/REGISTRY)
+     (fn [reg] (assoc reg s (dissoc (get reg s) :lifetime))))
+   (is (some? (:tx (d/transact! legacy [{:db/id 1 :db/doc "upgraded"}]))))
+   (let [adopted (conn/conn-of (d/db legacy))]
+    (is (= :open @(:lifetime adopted)))
+    (is (= (:basis legacy) (:basis adopted)))
+    (d/release! legacy)
+    (is (= :closed @(:lifetime adopted)))
+    (is (not (Process/alive? (:writer adopted)))))
+   (let [next (d/connect-with s)]
+    (try
+     (d/release! legacy)
+     (is (Process/alive? (:writer next)))
+     (is (= :released-connection
+       (try (d/transact! legacy [{:db/id 1 :db/doc "stale"}]) :accepted
+            (catch e (:reason (ex-data e))))))
+     (is (= "upgraded" (:db/doc (d/entity (d/db next) 1))))
+     (finally (d/release! next))))
+   (finally (d/release! legacy) (ets-store/close s)))))

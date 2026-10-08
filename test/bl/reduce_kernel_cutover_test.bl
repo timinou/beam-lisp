@@ -1,0 +1,461 @@
+; test/bl/reduce_kernel_cutover_test.bl — core/reduce is ONE authoritative walk.
+; Run: bin/bl test test/bl/reduce_kernel_cutover_test.bl
+;
+; PLAN-157 WP3. `core/reduce`'s 3-arity used to be a generic
+; `empty?`/`first`/`rest` loop that re-derived a sequence view per element on
+; vectors and maps — a second, slower implementation of the dispatch the RT
+; representation kernel (`rt/k-reduce`, over `k-fold`) already owns. It now
+; delegates that walk to the kernel for every supported representation and
+; carries the historical public rule at the boundary as a policy (`:compat`),
+; so the two places where the rules differ — a non-lazy improper list tail and a
+; foreign opaque struct — keep the results and errors they always had.
+;
+; This file pins the public contract three ways:
+;
+;   1. DIFFERENTIAL — `(reduce f init coll)` equals `(rt/k-reduce f init coll)`
+;      across every supported representation.
+;   2. EXPLICIT SEMANTICS — the 2-arity zero-arg callback and singleton, initial
+;      and nested Reduced peeling, callback order and early halt, no prefix
+;      replay of lazy producer effects, ordering, and chunk boundaries.
+;   3. HISTORICAL-COMPATIBILITY PARITY — the two cases where the historical
+;      public `core/reduce` and the kernel's representation walk differ, each
+;      pinned in BOTH directions: the public fold reproduces the historical
+;      result/error (and its ordered effects), and the 3-arity kernel default
+;      keeps its own rule. The public rule is the `:compat` policy the 4-arity
+;      `rt/k-reduce` adapter carries:
+;        · an improper list with a NON-lazy tail raised through `empty?` on the
+;          tail after folding the prefix; the kernel stops at the tail;
+;        · a foreign (non-beam-lisp) struct folded one `nil` (from `first`,
+;          which has no opaque clause); the kernel folds the entries `seq`
+;          yields.
+;
+; Reduced semantics: a step returning a Reduced halts the fold immediately (no
+; further callback, no further lazy force) and ONE level is peeled; a nested
+; Reduced therefore remains a Reduced, exactly as before.
+
+(ns reduce.kernel.cutover.test)
+
+(defrecord CutPt [x y])
+
+(defn- err-str
+  "The string of the exception `thunk` raised, or \"\" when it returned."
+  [thunk]
+  (try (do (thunk) "") (catch e (str e))))
+
+;; ── 1. differential parity with the kernel ────────────────────────────────
+
+(deftest reduce-equals-the-kernel-for-every-supported-representation
+  (let [count1 (fn [a _] (inc a))
+        colls [nil
+               () (list 1 2 3)
+               [] [1] [1 2 3] (vec (range 33)) (vec (range 64))
+               (map inc (list 1 2 3)) (range 5)
+               {:a 1 :b 2} (zipmap (range 40) (range 40))
+               #{1 2 3} (sorted-set 3 1 2) (sorted-map :b 2 :a 1)
+               (tuple 1 2 3) "" "abc"
+               (->CutPt 1 2)]]
+    (doseq [coll colls]
+      (is (= (BeamLisp.Ns.Rt/k-reduce count1 0 coll) (reduce count1 0 coll))
+          (str "reduce differs from the kernel for " (pr-str coll))))))
+
+(deftest empty-representations-return-the-init
+  (doseq [coll [nil () [] {} #{} (sorted-map) (sorted-set)
+                "" (tuple) (map inc [])]]
+    (is (= :init (reduce (fn [_ _] :x) :init coll))
+        (str "init not returned for " (pr-str coll)))))
+
+;; ── 2. explicit semantics ─────────────────────────────────────────────────
+
+(deftest two-arity-empty-invokes-f-with-zero-args
+  (let [zt (fn ([] :zero) ([a b] :two))]
+    (is (= :zero (reduce zt [])))
+    (is (= :zero (reduce zt nil)))
+    (is (= :zero (reduce zt ())))
+    (is (= 0 (reduce + [])))))
+
+(deftest two-arity-singleton-is-returned-without-calling-f
+  (let [zt (fn ([] :zero) ([a b] :two))]
+    (is (= 1 (reduce zt [1])) "f is not called for a singleton")
+    (is (= 5 (reduce + [5])))
+    (is (= 7 (reduce zt [(reduced 7)]))
+        "a singleton that is ITSELF Reduced is peeled once")))
+
+(deftest initial-reduced-on-an-empty-source-is-peeled
+  (is (= 9 (reduce + (reduced 9) [])))
+  (is (= 9 (reduce + (reduced 9) nil)))
+  (is (= 9 (reduce + (reduced 9) ()))))
+
+(deftest initial-reduced-on-a-nonempty-source-is-the-step-value
+  ; The fold does NOT short-circuit on an initial Reduced: the first step sees
+  ; it as the accumulator, exactly as before the cutover.
+  (is (= 3 (reduce (fn [a _] a) (reduced 3) [1]))))
+
+(deftest nested-reduced-is-peeled-exactly-one-level
+  (let [r (reduce (fn [a _] (reduced (reduced 5))) 0 [1])]
+    (is (reduced? r))
+    (is (= 5 (unreduced r)))))
+
+(deftest a-halting-step-stops-the-fold
+  (is (= 6 (reduce (fn [a x] (if (> x 3) (reduced a) (+ a x))) 0 [1 2 3 4 5]))))
+
+(deftest callback-order-and-halt-do-not-replay-prefix
+  (let [seen (atom [])]
+    (is (= 3 (reduce (fn [a x]
+                       (swap! seen conj x)
+                       (if (= x 3) (reduced a) (+ a x)))
+                     0 (list 1 2 3 4 5))))
+    (is (= [1 2 3] @seen) "no callback after the halting one")))
+
+(deftest a-halting-fold-forces-a-lazy-producer-once-and-only-once
+  (let [calls (atom 0)
+        s (map (fn [x] (swap! calls inc) x) (range))
+        step (fn [a x] (if (= x 3) (reduced a) (+ a x)))]
+    (is (= 3 (reduce step 0 s)))
+    (is (= 32 @calls) "one producer chunk is realized; no next chunk after the halt")
+    (is (= 3 (reduce step 0 s)))
+    (is (= 32 @calls) "the second fold reads the memo, it does not re-run the producer")))
+
+(deftest ordering-matches-seq-for-every-representation
+  (doseq [coll [(list 1 2 3) [1 2 3] (tuple 1 2 3) (sorted-set 3 1 2)
+                (->CutPt 1 2) (zipmap (range 40) (range 40))]]
+    (is (= (BeamLisp.Ns.Rt/k-reduce conj [] (seq coll))
+           (reduce conj [] coll))
+        (str "reduce order differs from seq for " (pr-str coll))))
+  ; Ordering a hashed set would not give these; a sorted collection must.
+  (is (= [1 2 3] (reduce conj [] (sorted-set 3 1 2))))
+  (is (= [:a :b] (reduce (fn [a e] (conj a (first e))) [] (sorted-map :b 2 :a 1)))))
+
+(deftest chunk-boundaries-31-32-33-63-64-65-are-invisible-to-the-fold
+  (doseq [n [31 32 33 63 64 65]]
+    (let [sum (fn [a x] (+ a x))
+          expected (quot (* n (dec n)) 2)]
+      (is (= expected (reduce sum 0 (vec (range n)))) (str "dense vector " n))
+      (is (= expected (reduce sum 0 (map identity (range n)))) (str "lazy " n)))))
+
+(deftest callable-shapes
+  (is (= 6 (reduce + 0 [1 2 3])) "the variadic arithmetic primitive")
+  (is (= 2 (reduce (fn [& xs] (count xs)) 0 [1 2])) "a tagged variadic bl fn")
+  (is (= 6 (reduce (fn ([a] a) ([a b] (+ a b))) 0 [1 2 3])) "a tagged multi-arity bl fn")
+  (is (= 1 (reduce :a {:a 1} [{:a 10}])) "a keyword as the callable")
+  (is (= [:x] (reduce {:x :y} 0 [[:x]])) "a map as the callable")
+  (is (= (BeamLisp.Ns.Rt/k-reduce #{1 2} 0 [1]) (reduce #{1 2} 0 [1]))
+      "a set as the callable stays exactly what the kernel does"))
+
+(deftest arity-and-error-contract-is-unchanged
+  (is (String/contains? (err-str (fn [] (reduce (fn [x] x) 0 [1 2])))
+                        "BadArityError")
+      "an arity-1 raw fn is still the BEAM's own arity error")
+  (is (String/contains? (err-str (fn [] (reduce [:a :b] 0 [0])))
+                        "ArgumentError")
+      "a vector called with two args is refused the same way")
+  (let [e (err-str (fn [] (reduce + 0 5)))]
+    (is (String/contains? e "FunctionClauseError"))
+    (is (String/contains? e "count")
+        "the historical `empty?` first call keeps the error shaped as `count`, not `seq`"))
+  (is (String/contains? (err-str (fn [] (reduce + 0 (atom 1)))) "ArgumentError")
+      "a reference cell is still not a collection"))
+
+;; ── 3. historical-compatibility parity ────────────────────────────────────
+; The public fold carries the historical rule (`:compat`); the 3-arity kernel
+; default (`:kernel`) keeps its own. Each difference is pinned in BOTH
+; directions, together with the ordered effects the historical loop produced.
+
+(deftest improper-list-with-a-non-list-tail-raises-count-after-the-prefix
+  ; HISTORICAL: the loop folded the prefix, then called `empty?` on the atom
+  ; tail and raised `count`'s FunctionClauseError. `:compat` reproduces it —
+  ; after the prefix, and WITHOUT replaying any element.
+  (let [seen (atom [])
+        step (fn [a x] (swap! seen conj x) (+ a x))
+        e (err-str (fn [] (reduce step 0 (erlang/++ (list 1 2) :tail))))]
+    (is (String/contains? e "FunctionClauseError"))
+    (is (String/contains? e "count")
+        "shaped as the historical `empty?` first call, not the kernel's `seq`")
+    (is (= [1 2] @seen)
+        "the prefix folded once, in order, with no replay on the raise")
+    (is (= 3 (BeamLisp.Ns.Rt/k-reduce + 0 (erlang/++ (list 1 2) :tail)))
+        "the 3-arity kernel default is unchanged: it stops at the tail")))
+
+(deftest a-halting-step-before-an-unknown-tail-never-reaches-the-tail
+  ; A `Reduced` before the tail halts the historical loop, so the tail's
+  ; `empty?` refusal is never taken and no element is replayed.
+  (let [seen (atom [])
+        step (fn [a x] (swap! seen conj x) (if (= x 3) (reduced a) (+ a x)))]
+    (is (= 3 (reduce step 0 (erlang/++ (list 1 2 3 4) :tail))))
+    (is (= [1 2 3] @seen) "no callback past the halt; the tail is never reached")))
+
+(deftest a-supported-collection-tail-still-folds-like-the-historical-loop
+  ; HISTORICAL: the loop's `first`/`rest` view continued INTO a supported
+  ; non-list tail. `:compat` keeps that; `:kernel` stops at the tail.
+  (is (= [1 2 3 4] (reduce conj [] (erlang/++ (list 1 2) (vec [3 4])))))
+  (is (= [1 2] (BeamLisp.Ns.Rt/k-reduce conj [] (erlang/++ (list 1 2) (vec [3 4]))))
+      "the 3-arity kernel default stops at the non-list tail"))
+
+(deftest a-foreign-struct-folds-one-nil-callback-as-it-always-did
+  ; HISTORICAL: `first` has no opaque clause, so the step saw one `nil` and
+  ; `rest` was empty — `(reduce conj [] d)` was `[nil]`, NOT the entries `seq`
+  ; yields. `:compat` keeps that; `:kernel` folds the seq view.
+  (let [d (Date/utc_today)
+        entry-fold (BeamLisp.Ns.Rt/k-reduce (fn [a e] (conj a e)) [] d)]
+    (is (= [nil] (reduce conj [] d))
+        "one callback, with nil — the historical `first` of an opaque struct")
+    (is (= 1 (count (reduce conj [] d))) "exactly ONE callback, not one per field")
+    (is (= (count (seq d)) (count entry-fold))
+        "the kernel default folds the entries `seq` yields")
+    (is (not= entry-fold (reduce conj [] d))
+        "the two rules differ here — that is the whole point")))
+
+(deftest a-zero-field-foreign-struct-calls-back-not-at-all
+  ; The `empty?` guard in `core/reduce` still fronts the root: a foreign struct
+  ; with no fields beyond its tag is empty, so no callback runs.
+  (is (= :init (reduce (fn [_ _] :hit) :init
+                       (maps/put :__struct__ :foreign-opaque-empty (maps/new))))))
+
+(deftest a-lazy-improper-tail-is-folded-and-forced-once
+  (let [forced (atom 0)
+        tail (BeamLisp.LazySeq/new (fn [] (swap! forced inc) (list 3 4)))]
+    (is (= 10 (reduce + 0 (erlang/++ (list 1 2) tail))))
+    (is (= 1 @forced) "the lazy tail is forced exactly once")))
+
+;; ── 4. live `core/reduced?` binding under :compat ─────────────────────────
+; The `:compat` fold must ask the LIVE public predicate, once per step AFTER the
+; callback, and once more at exhaustion; user data the live predicate rejects
+; must never halt the kernel. The reference below is the old explicit loop.
+
+(defn- with-core-reduced?
+  "Run `thunk` with `core/reduced?` interned as `pred`; always restore."
+  [pred thunk]
+  (let [orig (BeamLisp.Env/fetch! "core" "reduced?")]
+    (try (do (BeamLisp.Env/intern "core" "reduced?" pred) (thunk))
+         (finally (BeamLisp.Env/intern "core" "reduced?" orig)))))
+
+(defn- old-loop
+  "Explicit historical semantics over a proper list `xs`: step, ask the live
+   predicate, halt with the dereferenced payload, else final predicate/deref."
+  [f acc xs]
+  (let [p (fn [x] ((BeamLisp.Env/fetch! "core" "reduced?") x))]
+    (loop [acc acc ys xs]
+      (if (empty? ys)
+        (if (p acc) (BeamLisp.Refs/deref acc) acc)
+        (let [a2 (f acc (first ys))]
+          (if (p a2) (BeamLisp.Refs/deref a2) (recur a2 (rest ys))))))))
+
+(defn- run-compat
+  "[result calls-seen] of the :compat fold over `coll`, with predicate `pred`."
+  [pred f init coll]
+  (let [seen (atom [])
+        g (fn [a x] (swap! seen conj x) (f a x))]
+    (with-core-reduced? pred
+      (fn [] (let [r (BeamLisp.Ns.Rt/k-reduce g init coll :compat)] [r @seen])))))
+
+(defn- run-old [pred f init xs]
+  (let [seen (atom [])
+        g (fn [a x] (swap! seen conj x) (f a x))]
+    (with-core-reduced? pred
+      (fn [] (let [r (old-loop g init xs)] [r @seen])))))
+
+(deftest compat-rejected-user-reduced-does-not-halt-the-kernel
+  ; Predicate rejects everything: a returned Reduced is plain data.
+  (let [never (fn [_] false)
+        f (fn [_ x] (reduced x))
+        n (vec (range 40))]
+    (doseq [coll [(list 1 2 3) (vec (range 40)) (vec (range 100)) {:a 1 :b 2}]]
+      (let [xs (seq coll)
+            [r seen] (run-compat never f 0 coll)
+            [r2 seen2] (run-old never f 0 xs)]
+        (is (= (count seen2) (count seen)) "every element still called back")
+        (is (= (unreduced r2) (unreduced r)))
+        (is (reduced? r) "the Reduced is returned as data")))
+    (is (= 40 (count (second (run-compat never f 0 n)))))))
+
+(deftest compat-live-predicate-truthy-derefs-payload-once
+  (let [s (atom 7)
+        pred (fn [x] (= x s))
+        f (fn [a x] (if (= x 2) s x))]
+    (doseq [coll [(list 1 2 3 4) [1 2 3 4] (vec (range 1 70))]]
+      (let [xs (seq coll)
+            [r seen] (run-compat pred f 0 coll)
+            [r2 seen2] (run-old pred f 0 xs)]
+        (is (= r2 r))
+        (is (= 7 r))
+        (is (= seen2 seen) "no callback after the halt")))))
+
+(deftest compat-halt-payload-gets-no-second-peel
+  ; Predicate true only for the OUTER marker; payload deref is a Reduced-looking
+  ; value that must come back untouched (no second predicate/peel).
+  (let [inner (reduced 5)
+        outer (atom inner)
+        pred (fn [x] (= x outer))
+        [r _] (run-compat pred (fn [_ _] outer) 0 [1 2])]
+    (is (= inner r))
+    (is (reduced? inner))))
+
+(deftest compat-callback-rebinding-predicate-midfold-takes-effect-after-the-call
+  ; The step rebinding the predicate is seen by the SAME step's check, because
+  ; the predicate is fetched after f returns.
+  (let [orig (BeamLisp.Env/fetch! "core" "reduced?")
+        s (atom :p)
+        seen (atom [])
+        f (fn [a x]
+            (swap! seen conj x)
+            (if (= x 2) (BeamLisp.Env/intern "core" "reduced?" (fn [v] (= v s))))
+            (if (= x 2) s x))]
+    (try
+      (let [r (BeamLisp.Ns.Rt/k-reduce f 0 (vec (range 1 6)) :compat)]
+        (is (= :p r))
+        (is (= [1 2] @seen)))
+      (finally (BeamLisp.Env/intern "core" "reduced?" orig)))))
+
+(deftest compat-terminal-predicate-rebinding-and-final-deref
+  ; Exhaustion asks the live predicate once more; a predicate that turns true
+  ; only for the final accumulator derefs it.
+  (let [s (atom 9)
+        calls (atom 0)
+        pred (fn [x] (swap! calls inc) (= x s))
+        [r _] (run-compat pred (fn [_ _] s) s [])]
+    (is (= 9 r) "standalone empty: init is asked once")
+    (is (= 1 @calls)))
+  (let [s (atom 9)
+        pred (fn [x] (= x s))
+        [r _] (run-compat pred (fn [a x] a) s [])]
+    (is (= 9 r) "initial acc deref'd at exhaustion")))
+
+(deftest compat-predicate-call-count-is-n-plus-one
+  (let [calls (atom 0)
+        pred (fn [_] (swap! calls inc) false)]
+    (doseq [coll [(list 1 2 3) (vec (range 40)) (vec (range 70)) {:a 1 :b 2}]]
+      (reset! calls 0)
+      (run-compat pred (fn [a _] a) 0 coll)
+      (is (= (inc (count coll)) @calls)))))
+
+(deftest compat-user-tuples-colliding-with-envelope-shapes-are-plain-data
+  (let [never (fn [_] false)
+        f (fn [_ x] (tuple :$reduce_halt x))
+        [r _] (run-compat never f 0 [1 2 3])]
+    (is (= (tuple :$reduce_halt 3) r)))
+  (let [never (fn [_] false)
+        f (fn [_ x] (tuple :$reduce_acc x))
+        [r _] (run-compat never f 0 [1 2 3])]
+    (is (= (tuple :$reduce_acc 3) r))))
+
+(deftest compat-initial-reduced-nonempty-and-early-reduced-before-invalid-tail
+  (let [r (BeamLisp.Ns.Rt/k-reduce (fn [a _] a) (reduced 3) [1] :compat)]
+    (is (= 3 r) "live predicate true at exhaustion peels the initial Reduced"))
+  (is (= 3 (BeamLisp.Ns.Rt/k-reduce
+             (fn [a x] (if (= x 3) (reduced a) (+ a x))) 0
+             (erlang/++ (list 1 2 3 4) :tail) :compat)))
+  (is (String/contains?
+        (err-str (fn [] (BeamLisp.Ns.Rt/k-reduce + 0 (erlang/++ (list 1 2) :tail) :compat)))
+        "count")))
+
+(deftest compat-live-binding-restored
+  (let [orig (BeamLisp.Env/fetch! "core" "reduced?")]
+    (with-core-reduced? (fn [_] false) (fn [] :ok))
+    (is (= orig (BeamLisp.Env/fetch! "core" "reduced?")))))
+
+
+;; ── 5. prepared callback representation ───────────────────────────────────
+; `reduce-callback` now resolves the callable ONCE per traversal to a native
+; 2-arity fun (`call-prepare-callback` in rt.call): a native fn stays itself, a
+; fixed `$blfn` arm is used directly, an eligible variadic arm gets a native
+; adapter reproducing `invoke-multi`'s exact call, and everything else keeps
+; the ORIGINAL `call-invoke` wrapper. Preparation is effect-free and
+; nonthrowing, so an invalid callable still fails only at its first INVOCATION
+; — never on empty input, never while preparing.
+
+(defn- rd-baseline
+  [f init coll policy] (BeamLisp.Ns.Rt/k-reduce f init coll policy :baseline))
+
+(defn- rd-prepared
+  [f init coll policy] (BeamLisp.Ns.Rt/k-reduce f init coll policy :normalized))
+
+(defn- rd-outcome
+  "`[:ok value]` or `[:err message]` — value AND error differential."
+  [thunk]
+  (try [:ok (thunk)] (catch e [:err (str e)])))
+
+(deftest prepared-callbacks-match-baseline-for-every-shape
+  (let [variadic0 (fn [args] (count args))
+        variadic1 (fn [a rest] (tuple a (count rest)))
+        variadic2 (fn [a x rest] (tuple a x (count rest)))
+        callables
+        [["native" (fn [a x] (tuple a x))]
+         ["native-one" (fn [x] x)]
+         ["native-three" (fn [a b c] a)]
+         ["keyword" :k]
+         ["map" {:x :y}]
+         ["plus" +]
+         ["fixed-tuple" (BeamLisp.Ns.Rt/multi-fn {2 (fn [a x] (tuple :fixed a x))})]
+         ["variadic0" (BeamLisp.Ns.Rt/multi-fn {} (tuple 0 variadic0))]
+         ["variadic1" (BeamLisp.Ns.Rt/multi-fn {} (tuple 1 variadic1))]
+         ["variadic2" (BeamLisp.Ns.Rt/multi-fn {} (tuple 2 variadic2))]
+         ["fixed-over-variadic"
+          (BeamLisp.Ns.Rt/multi-fn {2 (fn [a x] (tuple :fixed a x))}
+                                   (tuple 2 (fn [a x rest] (tuple :variadic a x rest))))]
+         ["missing-arm" (BeamLisp.Ns.Rt/multi-fn {1 (fn [a] a)} nil)]
+         ["malformed-fixed" (tuple :"$blfn" {2 7} nil)]
+         ["malformed-variadic" (tuple :"$blfn" {} (tuple 1 7))]
+         ["negative-minimum" (tuple :"$blfn" {} (tuple -1 (fn [a b c] :wrong)))]
+         ["wrong-variadic-arity" (tuple :"$blfn" {} (tuple 0 (fn [a b] :wrong)))]
+         ["malformed-fixed-with-valid-variadic"
+          (tuple :"$blfn" {2 nil} (tuple 0 (fn [xs] :wrong)))]
+         ["variadic-too-high" (tuple :"$blfn" {} (tuple 3 (fn [a b c rest] a)))]
+         ["invalid-int" 7]
+         ["invalid-nil" nil]]
+        colls [nil () [] {} #{} (list 1 2 3) [1 2 3] (vec (range 65))
+               (map inc (list 1 2 3)) (map inc (range 65))]]
+    (doseq [[label f] callables coll colls]
+      (is (= (rd-outcome (fn [] (rd-baseline f 0 coll :kernel)))
+             (rd-outcome (fn [] (rd-prepared f 0 coll :kernel))))
+          (str label " / " (pr-str coll))))))
+
+(deftest prepared-multi-arity-fn-literal-round-trips
+  (let [f (fn ([a] a) ([a b] (+ a b)))]
+    (is (= 6 (rd-baseline f 0 (list 1 2 3) :kernel)))
+    (is (= 6 (rd-prepared f 0 (list 1 2 3) :kernel)))))
+
+(deftest invalid-callables-fail-only-at-the-first-invocation
+  (let [bad [7 nil (atom 1) "s" (fn [x] x) [:a]
+             (BeamLisp.Ns.Rt/multi-fn {1 (fn [a] a)} nil)]]
+    (doseq [f bad empty [nil () [] {} #{} (map inc [])]]
+      (is (= :init (rd-prepared f :init empty :kernel))
+          (str "preparation touched " (pr-str f)))
+      (is (= :init (rd-baseline f :init empty :kernel))))
+    (doseq [f bad]
+      (let [calls (atom 0)
+            s (map (fn [x] (swap! calls inc) x) (range))
+            b (rd-outcome (fn [] (rd-baseline f 0 s :kernel)))
+            after-b @calls
+            p (rd-outcome (fn [] (rd-prepared f 0 s :kernel)))]
+        (is (= b p) (str "lazy failure differs for " (pr-str f)))
+        (is (>= after-b 1) "the first chunk realized before the failure")))))
+
+(deftest keywords-are-valid-binary-callbacks-with-a-default
+  ;; A keyword cannot be an invalid-callback probe over an infinite producer:
+  ;; it returns the current element as its lookup default and never raises.
+  (is (= 1 (:k 0 1)))
+  (is (= 3 (rd-baseline :k 0 (list 1 2 3) :kernel)))
+  (is (= 3 (rd-prepared :k 0 (list 1 2 3) :kernel))))
+
+(deftest prepared-variadic-adapters-reproduce-invoke-multi-exactly
+  ;; min0 sees (acc x); min1 sees acc and (x); min2 sees acc, x and ().
+  (is (= [7 8] (rd-prepared (BeamLisp.Ns.Rt/multi-fn {} (tuple 0 (fn [args] args))) 7 [8] :kernel)))
+  (is (= [7 [8]] (rd-prepared (BeamLisp.Ns.Rt/multi-fn {} (tuple 1 (fn [a rest] [a rest]))) 7 [8] :kernel)))
+  (is (= [7 8 []] (rd-prepared (BeamLisp.Ns.Rt/multi-fn {} (tuple 2 (fn [a x rest] [a x rest]))) 7 [8] :kernel))))
+
+(deftest prepared-plus-keeps-the-original-numeric-op-and-errors
+  (is (= 4.0 (rd-prepared + 0 [1.5 2.5] :kernel)))
+  (is (erlang/== (rd-prepared + 0 [(* -1.0 0.0) (* -1.0 0.0)] :kernel) (* -1.0 0.0))
+      "signed zero is preserved by the original +, not substituted")
+  (is (= 9007199254740993 (rd-prepared + 0 [9007199254740992 1] :kernel)))
+  (is (= 6 (rd-prepared + 0 [1 2 3] :kernel)))
+  (is (= (rd-outcome (fn [] (rd-baseline + 0 ["a" 1] :kernel)))
+         (rd-outcome (fn [] (rd-prepared + 0 ["a" 1] :kernel))))
+      "a nonnumeric + argument fails the same way"))
+
+(deftest prepared-unary-callbacks-in-map-and-filter
+  (is (= [2 4 6] (vec (map (fn [x] (* 2 x)) [1 2 3]))))
+  (is (= [2 4 6] (vec (map (BeamLisp.Ns.Rt/multi-fn {1 (fn [x] (* 2 x))}) [1 2 3]))))
+  (is (= [2 4 6] (vec (map (BeamLisp.Ns.Rt/multi-fn {} (tuple 0 (fn [args] (* 2 (first args))))) [1 2 3]))))
+  (is (= [2 4 6] (vec (map (BeamLisp.Ns.Rt/multi-fn {} (tuple 1 (fn [x rest] (* 2 x)))) [1 2 3]))))
+  (is (= [{:k 1} {:k 2}] (vec (filter :k [{:k 1} {} {:k 2}]))))
+  (is (= [1 3] (vec (filter (BeamLisp.Ns.Rt/multi-fn {1 (fn [x] (odd? x))}) [1 2 3])))))

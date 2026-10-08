@@ -6,10 +6,10 @@ hand it to the port that registered it. That something is the gateway — one
 process per USER, because it holds the one port a URL is allowed to leave out.
 
 ```
-bl gateway            is it up, and which names does it answer?
-bl gateway start      start it (the systemd unit when installed, detached otherwise)
-bl gateway stop       stop the running one
-bl gateway run        run it in the foreground — what the unit execs
+bl vm                  is it up, and which names does it answer?
+bl vm start gateway    start it (the systemd unit when installed, detached otherwise)
+bl vm stop gateway     stop the running one
+bl vm start gateway --foreground   run it in the foreground — what the unit execs
 bl install gateway    the systemd unit, so it starts at login
 bl install redirect   make port 80 answer for it — the portless address, one root step
 ```
@@ -41,6 +41,42 @@ It is read, never trusted — a file whose process is gone is swept on sight, so
   (let [cfg (or (System/get_env "XDG_CONFIG_HOME") (str (System/get_env "HOME") "/.config"))]
     (str cfg "/systemd/user/" unit-name ".service")))
 
+(def UNIT-EXEC-ARGS
+  "The words the unit's `ExecStart` runs after the executable. One definition:
+   `bl install gateway` writes it, and `bl doctor` checks an installed unit
+   against it."
+  ["vm" "start" "gateway" "--foreground"])
+
+(def RETIRED-UNIT-EXEC-ARGS
+  "What earlier installers wrote after the executable. A unit holding one of these
+   starts `bl` with a command that no longer exists, so the gateway does not come
+   up at the next login. The list is closed: no new entry is ever added, because
+   nothing new writes one."
+  [["gateway" "run"]])
+
+(defn unit-exec-args
+  "The words after the executable in the unit's `ExecStart=` line at `path`, or
+   nil when there is no unit or no such line."
+  [path]
+  (when (File/regular? path)
+    (let [line (first (filter (fn [l] (String/starts_with? l "ExecStart="))
+                              (String/split (File/read! path) "\n")))]
+      (when line
+        (vec (rest (filter (fn [w] (not= "" w))
+                           (String/split (subs line (count "ExecStart=")) " "))))))))
+
+(defn unit-state
+  "Whether the installed unit will start the gateway: :absent, :current, :retired
+   (it runs a command that no longer exists) or :other (a hand-edited unit; not ours
+   to judge)."
+  []
+  (let [args (unit-exec-args (unit-path))]
+    (cond
+      (nil? args) :absent
+      (= args UNIT-EXEC-ARGS) :current
+      (some (fn [r] (= r (vec (take (count r) args)))) RETIRED-UNIT-EXEC-ARGS) :retired
+      :else :other)))
+
 (defn endpoint
   "The live gateway's pid and port as a map, or nil. {:ok %{…}} | :error from
    the Elixir side, unwrapped here so a verb reads one shape."
@@ -62,20 +98,20 @@ It is read, never trusted — a file whose process is gone is swept on sight, so
 ## The verbs
 
 `status` answers with the port, the pid and every name it routes — the same
-registry `bl ports` prints, seen from the other end.
+registry `bl vm` prints, seen from the other end.
 
 ```beam-lisp
-(defn run-status
-  "`bl gateway` — the running gateway and the names it answers. Exit 1 when none
+(defn status
+  "The running gateway and the names it answers. Exit 1 when none
    is running, because a question about a missing service is a failure to the
    shell that asked it."
   [_args _st]
   (if (not (running?))
     (do
-      (println "bl gateway: not running")
+      (println "bl vm: gateway not running")
       (println (if (installed?)
-                 "  it is installed but stopped — bl gateway start"
-                 "  bl gateway start       start it now (detached)"))
+                 "  it is installed but stopped — bl vm start gateway"
+                 "  bl vm start gateway    start it now (detached)"))
 
       (println "  bl install gateway     keep it running across logins")
       1)
@@ -110,7 +146,7 @@ command the unit would run, so both paths start the same process.
 (defn- wait-up
   "Poll until the gateway answers, up to ~60s. Returns true when it is up.
 
-   A COLD drop boot is what sets the budget: starting `bl gateway run` pays for
+   A COLD drop boot is what sets the budget: starting `bl vm start gateway --foreground` pays for
    the whole substrate (AOT, the native tier, priv/), measured at ~20s on this
    machine the first time and ~1s warm. A five-second budget reported a healthy
    gateway as a failure — and the gateway then came up anyway, which is worse
@@ -132,63 +168,63 @@ command the unit would run, so both paths start the same process.
     (str dir "/gateway.log")))
 
 (defn- detach
-  "Start `bl gateway run` as an orphan of this process. `setsid` gives it its own
+  "Start `bl vm start gateway --foreground` as an orphan of this process. `setsid` gives it its own
    session so no terminal teardown can reach it, stdin comes from nowhere, and
    its output goes to a log file rather than nowhere. The gateway's own endpoint
    file is still how it is found again — it needs no parent watching it."
   []
   (let [bin (vm.gateway/command)]
     (if (nil? bin)
-      (do (u/io-err "bl gateway: no `bl` on PATH — run `bl gateway run` from a checkout, or set BL_BIN")
+      (do (u/io-err "bl vm: no `bl` on PATH — run `bl vm start gateway --foreground` from a checkout, or set BL_BIN")
           nil)
       (System/cmd "sh"
-                  (u/to-list ["-c" (str "setsid " bin " gateway run < /dev/null > " (log-file)
+                  (u/to-list ["-c" (str "setsid " bin " vm start gateway --foreground < /dev/null > " (log-file)
                                        " 2>&1 &")])))))
 
-(defn run-start
-  "`bl gateway start` — the unit when one is installed, else a detached run.
+(defn start
+  "Start the gateway: the unit when one is installed, else a detached run.
    Returns 0 once the gateway answers, 1 when it does not."
   [_args _st]
   (cond
     (running?)
-    (do (println (str "bl gateway: already running on port " (port-of))) 0)
+    (do (println (str "bl vm: gateway already running on port " (port-of))) 0)
 
     (and (installed?) (systemctl?))
     (do
       (System/cmd "systemctl" (u/to-list ["--user" "start" unit-name]))
       (if (wait-up 120)
-        (do (println (str "bl gateway: up on " (port-of) " (systemd)")) 0)
-        (do (u/io-err "bl gateway: systemctl --user start did not bring it up (systemctl --user status bl-gateway)") 1)))
+        (do (println (str "bl vm: gateway up on " (port-of) " (systemd)")) 0)
+        (do (u/io-err "bl vm: gateway systemctl --user start did not bring it up (systemctl --user status bl-gateway)") 1)))
 
     :else
     (do
       (detach)
-      (println "bl gateway: starting… (a cold start takes a few seconds)")
+      (println "bl vm: gateway starting… (a cold start takes a few seconds)")
       (if (wait-up 120)
-        (do (println (str "bl gateway: up on " (port-of))) 0)
-        (do (u/io-err (str "bl gateway: did not come up — " (log-file) " says why")) 1)))))
+        (do (println (str "bl vm: gateway up on " (port-of))) 0)
+        (do (u/io-err (str "bl vm: gateway did not come up — " (log-file) " says why")) 1)))))
 ```
 
 `stop` asks systemd when systemd owns it, and signals the process otherwise.
-Either way the endpoint file is gone when it returns, so `bl gateway` agrees
+Either way the endpoint file is gone when it returns, so `bl vm` agrees
 with reality immediately after.
 
 ```beam-lisp
-(defn run-stop
-  "`bl gateway stop` — stop the running gateway. Returns 0 when it is down,
+(defn stop
+  "Stop the running gateway. Returns 0 when it is down,
    1 when none was running."
   [_args _st]
   (if (not (running?))
-    (do (println "bl gateway: not running") 1)
+    (do (println "bl vm: gateway not running") 1)
     (do
       (if (and (installed?) (systemctl?))
         (System/cmd "systemctl" (u/to-list ["--user" "stop" unit-name]))
         (vm.gateway/stop))
-      (println "bl gateway: stopped")
+      (println "bl vm: gateway stopped")
       0)))
 ```
 
-`run` is the foreground form: it blocks until interrupted, which is exactly
+`serve` is the foreground form: it blocks until interrupted, which is exactly
 what a systemd `Type=simple` service wants.
 
 ```beam-lisp
@@ -202,24 +238,12 @@ what a systemd `Type=simple` service wants.
     (and (map? r) (string? (:error r))) (:error r)
     :else (pr-str r)))
 
-(defn run-run
-  "`bl gateway run [--port N]` — the gateway in the foreground. A pinned port
+(defn serve
+  "The gateway in the foreground (`bl vm start gateway --foreground [--port N]`). A pinned port
    that cannot be bound is an error, never a silent move."
   [_args st]
   (let [r (vm.gateway/run {:port (:port st)})]
-    (u/io-err (str "bl gateway: " (refusal r)))
+    (u/io-err (str "bl vm: gateway " (refusal r)))
     1))
 ```
 
-```beam-lisp
-(defn run
-  "`bl gateway [start|stop|status|run]` — the listener that answers names."
-  [args st]
-  (let [sub (or (first args) "status")]
-    (cond
-      (= sub "status") (run-status args st)
-      (= sub "start") (run-start args st)
-      (= sub "stop") (run-stop args st)
-      (= sub "run") (run-run args st)
-      :else (u/usage-error (str "bl gateway: unknown subcommand \"" sub "\" (start|stop|status|run)")))))
-```

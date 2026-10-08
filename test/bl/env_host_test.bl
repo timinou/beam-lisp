@@ -1,0 +1,451 @@
+; host_env_test.bl — the pinned `BeamLisp.Env` ABI, diffed against the live
+; module and driven at the production atom in an isolated VM.
+;
+; `priv/host/env.bl` is the `.bl` port of `lib/beam_lisp/env.ex`, compiled by
+; `compile_host_file` into ONE exact-named beam (`Elixir.BeamLisp.Env.beam`).
+; Nothing here replaces the live module in THIS VM: the source is compiled at
+; its OWN probe atom, the namespace shim beside it is dropped, and the pinned
+; beam is loaded ALONE — so a leftover shim reference would be `undef` here.
+; It is compiled ONCE per run (`pinned!`), because the source is large.
+;
+; WHY TWO KINDS OF TEST. The registry's environment functions (`fork`,
+; `with_env`, `caps_of`, `env_state`, `loaded_ns?`, `search_paths`, …) talk to
+; the Agent NAMED BY `own-module` — the live `BeamLisp.Env` here. A probe atom
+; has no such Agent, and the probe cannot start one: it would create a second
+; `:beam_lisp_vars` named table, which already exists. So the IN-PROCESS tests
+; own exactly what needs no Agent — the export surface, `child_spec/1`, the key
+; plumbing, and every registry/namespace view that reads the SHARED
+; `:beam_lisp_vars` table and the process dictionary. The AGENT-DEPENDENT
+; semantics are exercised in a fresh CHILD VM where the pinned beam takes the
+; production atom and IS the registry.
+;
+; Run: bin/bl test test/bl/env_host_test.bl
+
+(ns host.env.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_env_" (System/system_time :millisecond)
+       "_" (erlang/unique_integer (list :positive))))
+
+(defn- env-source [] (Path/join (BeamLisp/cwd) "priv/host/env.bl"))
+
+(def ^:private probe :Elixir.BeamLisp.HostEnvProbe)
+(def ^:private shim :Elixir.BeamLisp.Ns.Host.Env)
+(def ^:private live :Elixir.BeamLisp.Env)
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- load-pinned [mod path]
+  (do (drop! mod)
+      (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+      mod))
+
+; Compile `mod` from the host source and publish ONLY the pinned beam: the
+; compile's own load (and the namespace shim it built beside it) is dropped.
+(defn- compile-pinned [mod dir]
+  (let [res (BeamLisp.AOT/compile_host_file (env-source)
+              (list (t2 :module mod) (t2 :output_dir dir) (t2 :load? false)))]
+    (load-pinned mod (elem res 1))
+    (drop! shim)
+    mod))
+
+(def ^:private probe-dir (tmp-dir))
+
+; Compile the probe ONCE per run; every in-process test then reads the same
+; loaded beam (the compile is the expensive part of this suite). The
+; `function_exported` check makes a stale beam left in a recycled tmp dir
+; harmless — the module, not the file, is what the tests need.
+(defn- pinned! []
+  (if (and (File/exists? (Path/join probe-dir "Elixir.BeamLisp.HostEnvProbe.beam"))
+           (erlang/function_exported probe :delete_key 1))
+    probe
+    (compile-pinned probe probe-dir)))
+
+(defn- exports [mod] (Enum/sort (erlang/apply mod :module_info (list :exports))))
+
+(defn- functional-exports [mod]
+  (filter (fn [e] (not (erlang/== :__info__ (elem e 0)))) (exports mod)))
+
+; A raise is a VALUE too: `[:value v]` or `[:raise Class message]`, so a corpus
+; can compare calls that may or may not raise, CLASS included.
+(defn- answer [f]
+  (try (list :value (f))
+       (catch e (list :raise (get e :__struct__) (Elixir.Exception/message e)))))
+
+(defn- o [mod name args] (answer (fn [] (erlang/apply mod name args))))
+
+(defn- raised? [r] (erlang/== :raise (first r)))
+
+(defn- raised-class [r] (second r))
+
+; ── the export surface ────────────────────────────────────────────────────
+
+(deftest env-pinned-export-surface-serves-every-live-export
+  (testing "the pinned beam is a superset of the live module, minus __info__/1"
+    (pinned!)
+    ; The compile's namespace shim is dropped: the pinned beam must answer with
+    ; NO shim behind it, so a leftover shim reference would be `undef` here.
+    (drop! shim)
+    (drop! shim)
+    (is (= (tuple :global :a 1) (erlang/apply probe :pfx (list :global (tuple :a 1))))
+        "the pinned beam answers with the shim gone")
+    ; The production registry module this port stands in for is loaded.
+    (is (erlang/function_exported live :start_link 1) "the live registry is loaded")
+    (is (erlang/function_exported live :child_spec 1) "use Agent contributes child_spec/1")
+    ; Every export the live module serves, the pinned beam serves.
+    (is (every? (fn [e] (erlang/function_exported probe (elem e 0) (elem e 1)))
+                (functional-exports live))
+        "all live exports are reproduced")
+    ; A pinned beam has no Elixir-generated introspection export.
+    (is (not (erlang/function_exported probe :__info__ 1)))
+    ; The full live arity set, by name and arity, is present too.
+    (is (erlang/function_exported probe :fork 0))
+    (is (erlang/function_exported probe :fork 1))
+    (is (erlang/function_exported probe :fork 2))
+    (is (erlang/function_exported probe :caps_allowed? 1))
+    (is (erlang/function_exported probe :caps_allowed? 2))
+    (is (erlang/function_exported probe :isolated 1))
+    (is (erlang/function_exported probe :isolated 2))))
+
+; ── child_spec/1: the generated Agent spec ────────────────────────────────
+
+(deftest env-pinned-child-spec-is-the-generated-agent-spec
+  (testing "child_spec/1 names THIS module as id and start, for any init arg"
+    (pinned!)
+    ; The live module's generated spec, unchanged.
+    (let [ls (erlang/apply live :child_spec (list (list)))]
+      (is (= (list :id :start) (Enum/sort (Map/keys ls))))
+      (is (erlang/== live (erlang/map_get :id ls)))
+      (is (erlang/== (tuple live :start_link (list (list))) (erlang/map_get :start ls))))
+    ; The pinned spec has the same shape and carries its own atom.
+    (doseq [arg (list (list) :x 42)]
+      (let [ps (erlang/apply probe :child_spec (list arg))]
+        (is (= (list :id :start) (Enum/sort (Map/keys ps))))
+        (is (erlang/== probe (erlang/map_get :id ps)))
+        (is (erlang/== (tuple probe :start_link (list arg)) (erlang/map_get :start ps))
+            (str "start carries the init arg " (pr-str arg)))))))
+
+; ── key plumbing ──────────────────────────────────────────────────────────
+
+(deftest env-pinned-key-shapes-match-the-live-module
+  (testing "pfx/key answer identically, and a bad key raises the same class"
+    (pinned!)
+    (doseq [k (list :trace :x (tuple :ns "core") (tuple :per_env_instance "a" "b")
+                    (tuple :meta "a" "b") (tuple :link "a" "b"))]
+      (is (= (o live :pfx (list :global k)) (o probe :pfx (list :global k)))
+          (str "pfx parity for " (pr-str k))))
+    (let [e (tuple :env (erlang/make_ref))]
+      (is (= (o live :pfx (list e (tuple :a 1))) (o probe :pfx (list e (tuple :a 1))))
+          "a tuple env id prefixes the same way"))
+    ; A key that is neither tuple nor atom is the same FunctionClauseError.
+    (is (raised? (o live :pfx (list :global (list 1 2)))))
+    (is (raised? (o probe :pfx (list :global (list 1 2)))))
+    (is (= (raised-class (o live :pfx (list :global (list 1 2))))
+           (raised-class (o probe :pfx (list :global (list 1 2)))))
+        "same exception class")))
+
+; ── the registry over the SHARED table ────────────────────────────────────
+
+(deftest env-pinned-registry-round-trips-on-the-shared-table
+  (testing "intern/fetch/peek/bound?/lookup behave, and the live module reads the same rows"
+    (pinned!)
+    (let [ns "hostenv.probe"]
+      (try
+        (is (= 5 (erlang/apply probe :intern (list ns "x" 5))))
+        (is (= (tuple :ok 5) (erlang/apply probe :fetch (list ns "x"))))
+        (is (= 5 (erlang/apply probe :fetch! (list ns "x"))))
+        (is (= (tuple :ok 5) (erlang/apply probe :peek (list ns "x"))))
+        (is (erlang/apply probe :bound? (list ns "x")))
+        (is (erlang/apply probe :member? (list (tuple ns "x"))))
+        (is (erlang/apply probe :local_var? (list ns "x")))
+        (is (= (tuple :ok 5) (erlang/apply probe :lookup_own (list (tuple ns "x")))))
+        ; The live module reads the SAME rows: one table, one key shape.
+        (is (= (tuple :ok 5) (erlang/apply live :lookup (list (tuple ns "x")))))
+        ; match_own returns the bound name, per the shared shape.
+        (is (= (list (list "x")) (erlang/apply probe :match_own (list (tuple (tuple ns :"$1") :_)))))
+        (is (= (erlang/apply live :match_own (list (tuple (tuple ns :"$1") :_)))
+               (erlang/apply probe :match_own (list (tuple (tuple ns :"$1") :_)))))
+        ; A key that is neither tuple nor atom is the same refusal.
+        (is (= (raised-class (o live :match (list (list 1 2))))
+               (raised-class (o probe :match (list (list 1 2))))))
+        ; delete_key removes the current env's row and nothing else.
+        (erlang/apply probe :delete_key (list (tuple ns "x")))
+        (is (= :error (erlang/apply probe :lookup (list (tuple ns "x")))))
+        (is (not (erlang/apply probe :bound? (list ns "x"))))
+        (finally
+          (erlang/apply probe :delete_key (list (tuple ns "x"))))))))
+
+; ── namespace resolution ──────────────────────────────────────────────────
+
+(deftest env-pinned-resolution-matches-the-live-module
+  (testing "alias, refer, import, excludes, merged meta, doc_string, public_names"
+    (pinned!)
+    (let [ns "hostenv.res"
+          target "hostenv.res.target"]
+      (try
+        (erlang/apply probe :intern (list target "foo" 42))
+        (erlang/apply probe :add_alias (list ns "t" target))
+        (is (= target (erlang/apply probe :alias_target (list ns "t"))))
+        (is (= (tuple :ok 42) (erlang/apply probe :fetch (list ns "t/foo"))))
+        (is (= (tuple :ok 42) (erlang/apply live :fetch (list ns "t/foo")))
+            "the live module resolves through the SAME alias row")
+
+        (erlang/apply probe :intern (list target "bar" 7))
+        (erlang/apply probe :add_refer (list ns "bar" target))
+        (is (= (tuple :ok 7) (erlang/apply probe :fetch (list ns "bar"))))
+        (is (= target (erlang/apply probe :refer_source (list ns "bar"))))
+        (is (= (o live :refer_source (list ns "bar"))
+               (o probe :refer_source (list ns "bar"))))
+
+        (erlang/apply probe :add_import (list ns "Foo" "pkg.Foo"))
+        (is (= "pkg.Foo" (erlang/apply probe :import_target (list ns "Foo"))))
+        (erlang/apply probe :add_core_excludes (list ns (list "map")))
+        (is (= (list "map") (erlang/apply probe :core_excludes (list ns))))
+
+        ; Metadata MERGES: a doc-only write keeps a private flag set earlier.
+        (erlang/apply probe :put_meta (list target "foo" (maps/put :doc "D" (maps/new))))
+        (erlang/apply probe :put_meta (list target "foo" (maps/put :private true (maps/new))))
+        (is (= (tuple :ok (maps/put :doc "D" (maps/put :private true (maps/new))))
+               (erlang/apply probe :meta (list target "foo"))))
+        (is (= (maps/put :ns target
+                 (maps/put :name "foo" (maps/put :doc "D" (maps/new))))
+               (erlang/apply probe :doc_string (list ns "t/foo"))))
+        ; public_names filters private vars, the UNION over the env chain.
+        (is (not (Enum/member? (erlang/apply probe :public_names (list target)) "foo")))
+        (is (Enum/member? (erlang/apply probe :public_names (list target)) "bar"))
+
+        (finally
+          (doseq [k (list (tuple target "foo") (tuple target "bar")
+                          (tuple :alias ns "t") (tuple :refer ns "bar")
+                          (tuple :import ns "Foo") (tuple :refer_clojure_exclude ns)
+                          (tuple :meta target "foo"))]
+            (erlang/apply probe :delete_key (list k))))))))
+
+; ── ns views (Agent-free) ─────────────────────────────────────────────────
+
+(deftest env-pinned-namespace-views
+  (testing "explain, namespaces, ns_exists?, own_names, ns_defs, undefine_var"
+    (pinned!)
+    (let [ns "hostenv.nsview"]
+      (try
+        (erlang/apply probe :intern (list ns "z" 1))
+        (erlang/apply probe :declare_ns (list "hostenv.empty"))
+        (is (erlang/apply probe :ns_exists? (list ns)))
+        (is (erlang/apply probe :ns_exists? (list "hostenv.empty")) "a declared ns exists with no vars")
+        (is (not (erlang/apply probe :ns_exists? (list "hostenv.nope"))))
+        (is (= (list "z") (erlang/apply probe :own_names (list ns))))
+        ; explain: the hit is `:normal`, and every other chain entry is absent.
+        (let [rows (erlang/apply probe :explain (list ns "z"))]
+          (is (Enum/any? rows (fn [r] (and (erlang/== ns (erlang/map_get :ns r))
+                                           (erlang/== "z" (erlang/map_get :name r))
+                                           (erlang/== true (erlang/map_get :found r))
+                                           (erlang/== :normal (erlang/map_get :kind r))))))
+          (is (Enum/any? rows (fn [r] (erlang/== false (erlang/map_get :found r))))))
+        ; ns_defs defaults to an empty map and round-trips.
+        (is (= (maps/new) (erlang/apply probe :ns_defs (list "hostenv.nodfns"))))
+        (erlang/apply probe :put_ns_defs
+          (list ns (maps/put "z" (list (tuple :fixed 0 "z" nil :mod)) (maps/new))))
+        (is (= (maps/put "z" (list (tuple :fixed 0 "z" nil :mod)) (maps/new))
+               (erlang/apply probe :ns_defs (list ns))))
+        ; undefine_var drops the value, the link and the ns_defs entry.
+        (erlang/apply probe :undefine_var (list ns "z"))
+        (is (not (erlang/apply probe :bound? (list ns "z"))))
+        (is (= (maps/new) (erlang/apply probe :ns_defs (list ns))))
+        (finally
+          (doseq [k (list (tuple ns "z") (tuple :ns ns) (tuple :ns "hostenv.empty")
+                          (tuple :ns_defs ns) (tuple :link ns "z"))]
+            (erlang/apply probe :delete_key (list k))))))))
+
+; ── `^:per-env`: peek is non-materializing ────────────────────────────────
+
+(deftest env-pinned-per-env-peek-is-non-materializing
+  (testing "define_per_env interns a descriptor peek returns without running its init"
+    (pinned!)
+    (let [ns "hostenv.perenv"]
+      (try
+        (erlang/apply probe :define_per_env (list ns "cell" (fn [] (erlang/make_ref))))
+        (let [r (erlang/apply probe :peek (list ns "cell"))]
+          (is (erlang/== :ok (elem r 0)))
+          (is (erlang/== :"Elixir.BeamLisp.Env.PerEnvDef"
+                         (erlang/map_get :__struct__ (elem r 1))))
+          (is (erlang/is_function (erlang/map_get :init (elem r 1)) 0)))
+        (is (erlang/apply probe :bound? (list ns "cell")))
+        ; explain reports the DESCRIPTOR's kind (not a materialized instance).
+        (is (Enum/any? (erlang/apply probe :explain (list ns "cell"))
+                       (fn [row] (erlang/== :per_env_definition (erlang/map_get :kind row)))))
+        (finally
+          (erlang/apply probe :delete_key (list (tuple ns "cell"))))))))
+
+; ── the boot + environment semantics: a fresh VM at the production atom ───
+
+(defn- child-code-args
+  "This VM's whole code path as `-pa` args, with `pinned` LAST so it lands
+   FIRST: `-pa` PREPENDS, so the last one named wins."
+  [pinned]
+  (concat (mapcat (fn [p] (list "-pa" (erlang/list_to_binary p))) (code/get_path))
+          (list "-pa" pinned)))
+
+(defn- boot-script []
+  (str
+    "IO.puts(\"which=\" <> List.to_string(:code.which(BeamLisp.Env)))\n"
+    "IO.puts(\"rt-before=\" <> inspect(:erlang.module_loaded(BeamLisp.Ns.Rt)))\n"
+    "{:ok, pid} = BeamLisp.Env.start_link([])\n"
+    "IO.puts(\"started=\" <> inspect(is_pid(pid)))\n"
+    "IO.puts(\"named=\" <> inspect(Process.whereis(BeamLisp.Env) == pid))\n"
+    "IO.puts(\"rt-after=\" <> inspect(:erlang.module_loaded(BeamLisp.Ns.Rt)))\n"
+    "IO.puts(\"spec=\" <> inspect(BeamLisp.Env.child_spec([])))\n"
+    "IO.puts(\"rt-after-spec=\" <> inspect(:erlang.module_loaded(BeamLisp.Ns.Rt)))\n"
+    "IO.puts(\"env-id=\" <> inspect(BeamLisp.Env.env_id()))\n"
+    "IO.puts(\"chain=\" <> inspect(BeamLisp.Env.chain()))\n"
+    "BeamLisp.Env.intern(\"hostenv.boot\", \"v\", 41)\n"
+    "IO.puts(\"fetch=\" <> inspect(BeamLisp.Env.fetch(\"hostenv.boot\", \"v\")))\n"
+    "IO.puts(\"pfx=\" <> inspect(BeamLisp.Env.pfx(:global, {:a, 1})))\n"
+    "IO.puts(\"seeded=\" <> inspect(BeamLisp.Env.seeded?()))\n"
+    "# The language boots ON TOP of the pinned registry (the app's own order).\n"
+    "{:ok, _} = BeamLisp.Loader.Server.start_link([])\n"
+    "BeamLisp.init()\n"
+    "IO.puts(\"booted=\" <> inspect(BeamLisp.Env.seeded?()))\n"
+    "IO.puts(\"eval=\" <> inspect(BeamLisp.eval(\"(+ 40 2)\")))\n"
+    "# The language's own loads may leave this process on a stale env; the\n"
+    "# registry semantics below belong to `:global`.\n"
+    "BeamLisp.Env.attach(:global)\n"
+    "IO.puts(\"env-id2=\" <> inspect(BeamLisp.Env.env_id()))\n"
+    "IO.puts(\"chain2=\" <> inspect(BeamLisp.Env.chain()))\n"
+    "IO.puts(\"ns-ok=\" <> inspect(is_list(BeamLisp.Env.namespaces()) and length(BeamLisp.Env.namespaces()) > 0))\n"
+    "# Isolation: a fork's write is invisible to the base.\n"
+    "env = BeamLisp.Env.fork()\n"
+    "BeamLisp.Env.with_env(env, fn -> BeamLisp.Env.intern(\"hostenv.child\", \"y\", 1) end)\n"
+    "IO.puts(\"child-write=\" <> inspect(BeamLisp.Env.with_env(env, fn -> BeamLisp.Env.fetch(\"hostenv.child\", \"y\") end)))\n"
+    "IO.puts(\"base-isolated=\" <> inspect(BeamLisp.Env.lookup({\"hostenv.child\", \"y\"}) == :error))\n"
+    "BeamLisp.Env.destroy(env)\n"
+    "IO.puts(\"destroyed=\" <> inspect(BeamLisp.Env.lookup({\"hostenv.child\", \"y\"}) == :error))\n"
+    "# Caps only narrow.\n"
+    "e2 = BeamLisp.Env.fork(:global, caps: [Elixir.File])\n"
+    "IO.puts(\"cap-file=\" <> inspect(BeamLisp.Env.with_env(e2, fn -> BeamLisp.Env.caps_allowed?(Elixir.File) end)))\n"
+    "IO.puts(\"cap-system=\" <> inspect(BeamLisp.Env.with_env(e2, fn -> BeamLisp.Env.caps_allowed?(Elixir.System) end)))\n"
+    "gc = BeamLisp.Env.with_env(e2, fn -> BeamLisp.Env.fork(e2, caps: [Elixir.File, Elixir.System]) end)\n"
+    "IO.puts(\"cap-grandchild=\" <> inspect(BeamLisp.Env.with_env(gc, fn -> BeamLisp.Env.caps_allowed?(Elixir.System) end)))\n"
+    "BeamLisp.Env.destroy(gc)\n"
+    "BeamLisp.Env.destroy(e2)\n"
+    "# Heap narrows the same way.\n"
+    "e3 = BeamLisp.Env.fork(:global, max_heap_words: 100)\n"
+    "IO.puts(\"heap=\" <> inspect(BeamLisp.Env.heap_of(e3)))\n"
+    "g3 = BeamLisp.Env.fork(e3, max_heap_words: 50)\n"
+    "IO.puts(\"heap-narrow=\" <> inspect(BeamLisp.Env.heap_of(g3)))\n"
+    "BeamLisp.Env.destroy(g3)\n"
+    "BeamLisp.Env.destroy(e3)\n"
+    "# The loaded set.\n"
+    "IO.puts(\"loaded-before=\" <> inspect(BeamLisp.Env.loaded_ns?(\"hostenv.loaded\")))\n"
+    "BeamLisp.Env.mark_loaded(\"hostenv.loaded\")\n"
+    "IO.puts(\"loaded-after=\" <> inspect(BeamLisp.Env.loaded_ns?(\"hostenv.loaded\")))\n"
+    "# Load paths are a fork-local stack.\n"
+    "ep = BeamLisp.Env.fork()\n"
+    "BeamLisp.Env.with_env(ep, fn -> BeamLisp.Env.push_load_path(\"/tmp/hostenv-a\") end)\n"
+    "BeamLisp.Env.with_env(ep, fn -> BeamLisp.Env.push_load_path(\"/tmp/hostenv-b\") end)\n"
+    "IO.puts(\"paths=\" <> inspect(BeamLisp.Env.with_env(ep, fn -> BeamLisp.Env.load_paths() end)))\n"
+    "# then a `^:per-env` def materializes once per env.\n"
+    "BeamLisp.eval(\"(ns hostenv.perenv) (def ^:per-env cell (System/unique_integer))\")\n"
+    "BeamLisp.Env.attach(:global)\n"
+    "IO.puts(\"peek=\" <> inspect(BeamLisp.Env.peek(\"hostenv.perenv\", \"cell\")))\n"
+    "IO.puts(\"bound=\" <> inspect(BeamLisp.Env.bound?(\"hostenv.perenv\", \"cell\")))\n"
+    "IO.puts(\"lookup=\" <> inspect(BeamLisp.Env.lookup({\"hostenv.perenv\", \"cell\"})))\n"
+    "IO.puts(\"fetchx=\" <> inspect(BeamLisp.Env.fetch(\"hostenv.perenv\", \"cell\")))\n"
+    "parent = self()\n"
+    "spawn(fn ->\n"
+    "  BeamLisp.Env.attach(:global)\n"
+    "  r = try do\n"
+    "    a = BeamLisp.Env.fetch!(\"hostenv.perenv\", \"cell\")\n"
+    "    b = BeamLisp.Env.fetch!(\"hostenv.perenv\", \"cell\")\n"
+    "    e4 = BeamLisp.Env.fork()\n"
+    "    v = BeamLisp.Env.with_env(e4, fn -> BeamLisp.Env.fetch!(\"hostenv.perenv\", \"cell\") end)\n"
+    "    BeamLisp.Env.destroy(e4)\n"
+    "    {:ok, a === b, v !== a, elem(BeamLisp.Env.fetch(\"hostenv.perenv\", \"cell\"), 0)}\n"
+    "  rescue\n"
+    "    e -> {:err, Exception.message(e)}\n"
+    "  end\n"
+    "  send(parent, {:perenv, r})\n"
+    "end)\n"
+    "r = receive do {:perenv, x} -> x after 20000 -> :timeout end\n"
+    "IO.puts(\"perenv=\" <> inspect(r))\n"
+    "IO.puts(\"ok\")\n"))
+
+(deftest env-pinned-boots-and-serves-the-registry-in-an-isolated-vm
+  (testing "a fresh child VM resolves the pinned beam, starts without Rt, and runs the environment semantics"
+    (let [dir (tmp-dir)
+          out (str dir "/boot")
+          script (Path/join dir "boot.exs")
+          beam (Path/join out "Elixir.BeamLisp.Env.beam")]
+      ; The pinned beam AT the production atom, written here, never loaded here.
+      (BeamLisp.AOT/compile_host_file (env-source)
+        (list (t2 :module live) (t2 :output_dir out) (t2 :load? false)))
+      (is (File/exists? beam))
+      (File/write! script (boot-script))
+      (let [r (System/cmd "elixir"
+                          (to-list (concat (child-code-args out) (list script)))
+                          (to-list [(tuple :stderr_to_stdout true)]))
+            text (elem r 0)]
+        (is (zero? (elem r 1)) (str "the child VM exited " (elem r 1) ":\n" text))
+        ; THE REPLACEMENT: the code server resolves the registry to the pinned beam.
+        (is (includes? text (str "which=" beam)) text)
+        ; THE WHOLE POINT: the registry starts and answers with NO runtime.
+        (is (includes? text "rt-before=false") text)
+        (is (includes? text "started=true") text)
+        (is (includes? text "named=true") text)
+        (is (includes? text "rt-after=false") text)
+        ; child_spec/1 is the OTHER pre-boot entry: OTP asks for it first.
+        (is (includes? text "rt-after-spec=false") text)
+        (is (includes? text "env-id=:global") text)
+        (is (includes? text "chain=[:global]") text)
+        (is (includes? text "fetch={:ok, 41}") text)
+        (is (includes? text "pfx={:global, :a, 1}") text)
+        (is (includes? text "spec=%{id: BeamLisp.Env, start: {BeamLisp.Env, :start_link, [[]]}}") text)
+        (is (includes? text "seeded=false") text)
+        ; Environment semantics on the pinned registry.
+        (is (includes? text "child-write={:ok, 1}") text)
+        (is (includes? text "base-isolated=true") text)
+        (is (includes? text "destroyed=true") text)
+        (is (includes? text "cap-file=true") text)
+        (is (includes? text "cap-system=false") text)
+        (is (includes? text "cap-grandchild=false") text)
+        (is (includes? text "heap=100") text)
+        (is (includes? text "heap-narrow=50") text)
+        (is (includes? text "loaded-before=false") text)
+        (is (includes? text "loaded-after=true") text)
+        (is (includes? text "paths=[\"/tmp/hostenv-b\", \"/tmp/hostenv-a\"]") text)
+        ; The language boots on it, then the registry answers on `:global`.
+        (is (includes? text "booted=true") text)
+        (is (includes? text "eval=42") text)
+        (is (includes? text "env-id2=:global") text)
+        (is (includes? text "chain2=[:global]") text)
+        (is (includes? text "ns-ok=true") text)
+        (is (includes? text "perenv={:ok, true, true, :ok}") text)
+        (is (includes? text "BeamLisp.Env.PerEnvDef") text)
+        (is (includes? text "ok") text))
+      (File/rm_rf! dir))))
+
+(run-tests)
+
+(deftest environment-getters-work-before-core-or-runtime-are-loaded
+ (pinned!)
+ (let [script (str "mod = Elixir.BeamLisp.HostEnvProbe\n"
+                   "false = :code.is_loaded(:\"Elixir.BeamLisp.Ns.Core\")\n"
+                   "false = :code.is_loaded(:\"Elixir.BeamLisp.Ns.Rt\")\n"
+                   "key = \"BL_PREBOOT_ABSENT_\" <> to_string(:os.getpid())\n"
+                   "nil = mod.os_get_env(key)\n"
+                   "\"default\" = mod.os_get_env(key, \"default\")\n"
+                   "true = is_map(mod.os_get_env())\n"
+                   ":error = mod.os_fetch_env(key)\n"
+                   "{\"\", 0} = mod.os_cmd(\"/bin/true\", [])\n"
+                   "{\"\", 0} = mod.os_shell(\"exit 0\")\n"
+                   "Process.put(:\"bl-osenv-overlay\", %{key => \"overlay\"})\n"
+                   "\"overlay\" = mod.os_get_env(key)\n"
+                   "false = :code.is_loaded(:\"Elixir.BeamLisp.Ns.Core\")\n"
+                   "false = :code.is_loaded(:\"Elixir.BeamLisp.Ns.Rt\")\n"
+                   "IO.puts(\"preboot-env-ok\")\n")
+       result (System/cmd "elixir" (list "-pa" probe-dir "-e" script)
+                         (list (t2 :stderr_to_stdout true)))]
+  (is (= 0 (elem result 1)) (elem result 0))
+  (is (String/contains? (elem result 0) "preboot-env-ok"))))

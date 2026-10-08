@@ -1,0 +1,460 @@
+; ed/commands.bl — the command table: every action the editor can take, by name.
+;
+; A command is {:doc "…" :run (fn [ed] ed')}. Keys never call functions
+; directly: a keymap maps a key SEQUENCE to a command NAME, and `dispatch`
+; looks the name up here. So everything a key can do, `:` / the palette can
+; do too, `describe-key` can explain, and a user can rebind or redefine — the
+; Lisp-machine property: the editor is a table of named functions over one
+; value, and the table itself is data.
+;
+; Commands apply to EVERY selection (Helix). A numeric prefix (`3w`) repeats
+; the command; it is read from `(:count ed)` and cleared after the command.
+
+(ns ed.commands
+  (:require [ed.text :as t]
+            [ed.org :as org]
+            [ed.forms :as forms]
+            [ed.core :as c]
+            [ed.motion :as m]
+            [bl.doc.spans :as spans]))
+
+; ─── helpers to define commands ─────────────────────────────────────────────
+
+(defn- times [ed f]
+  (let [n (or (:count ed) 1)]
+    (loop [i 0 e ed] (if (< i n) (recur (inc i) (f e)) e))))
+
+(defn- step-move
+  "A command moving every head with `(f text pos)`; extends in select mode."
+  [f]
+  (fn [ed] (times ed (fn [e] (c/move-heads e f (= :select (:mode e)))))))
+
+(defn- step-select
+  "Like `step-move` but Helix-style: the motion SELECTS what it moved over
+   (normal-mode `w` selects the word), extending in select mode."
+  [f]
+  (fn [ed]
+    (times ed (fn [e]
+                (c/map-sels e (fn [s]
+                                (let [h (or (f (:text e) (:head s)) (:head s))]
+                                  {:anchor (if (= :select (:mode e)) (:anchor s) (:head s)) :head h})))))))
+
+(defn- struct-move
+  "A motion over the derived org structure: (f struct pos) → pos|nil."
+  [f cue]
+  (fn [ed]
+    (let [p (f (:struct ed) (c/cursor ed))]
+      (if (nil? p)
+        (c/message ed cue)
+        (-> ed (c/map-sels (fn [_] {:anchor p :head p})) (assoc :sels [{:anchor p :head p}] :primary 0))))))
+
+(defn- form-move
+  "A structural form motion inside a beam-lisp cell: selects the target form."
+  [dir]
+  (fn [ed]
+    (let [fc (c/forest-at-cursor ed)]
+      (if (nil? fc)
+        (c/message ed "Not in a beam-lisp cell")
+        (let [forest (:forest fc)
+              s (c/primary ed)
+              ; the CURRENT form is the one the selection covers, else the one under the head
+              cur (or (forms/path-at forest (:anchor s)) (forms/path-at forest (:head s)))
+              {:keys [path cue]} (if (nil? cur)
+                                   {:path (if (seq (forms/navigable forest)) [0] nil) :cue ""}
+                                   (forms/motion forest cur dir))
+              node (if (nil? path) nil (forms/node-at forest path))]
+          (if (nil? node)
+            (c/message ed (or cue "No form here"))
+            (-> ed
+                (assoc :sels [{:anchor (:from node) :head (or (t/prev-pos (:text ed) (:to node)) (:from node))}] :primary 0)
+                (c/message (if (= "" cue) nil cue)))))))))
+
+(defn- select-form-under
+  "Select the smallest form under the cursor (the form-first `Esc` → Explore)."
+  [ed]
+  (let [fc (c/forest-at-cursor ed)]
+    (if (nil? fc)
+      (c/message ed "Not in a beam-lisp cell")
+      (let [path (forms/path-at (:forest fc) (c/cursor ed))
+            node (if (nil? path) nil (forms/node-at (:forest fc) path))]
+        (if (nil? node)
+          (c/message ed "No form under the cursor")
+          (assoc ed :sels [{:anchor (:from node) :head (or (t/prev-pos (:text ed) (:to node)) (:from node))}] :primary 0))))))
+
+(defn- select-enclosing
+  "Select the enclosing collection — `inner?` excludes its delimiters (mi( / ma()."
+  [inner?]
+  (fn [ed]
+    (let [fc (c/forest-at-cursor ed)]
+      (if (nil? fc)
+        (c/message ed "Not in a beam-lisp cell")
+        (let [path (forms/enclosing (:forest fc) (c/cursor ed))
+              node (if (nil? path) nil (forms/node-at (:forest fc) path))
+              tx (:text ed)]
+          (cond
+            (nil? node) (c/message ed "No enclosing form")
+            inner? (let [a (t/next-pos tx (if (contains? #{:set :fn} (:kind node)) (t/next-pos tx (:from node)) (:from node)))
+                         b (t/prev-pos tx (t/prev-pos tx (:to node)))]
+                     (assoc ed :sels [{:anchor a :head (if (t/pos< b a) a b)}] :primary 0))
+            :else (assoc ed :sels [{:anchor (:from node) :head (t/prev-pos tx (:to node))}] :primary 0)))))))
+
+(defn- select-section
+  "Select the org section (heading + body) the cursor is in."
+  [ed]
+  (let [h (org/heading-at (:outline (:struct ed)) (first (c/cursor ed)))]
+    (if (nil? h)
+      (c/message ed "Not in a section")
+      (let [end-row (dec (:end h))]
+        (assoc ed :sels [{:anchor [(:row h) 0] :head [end-row (max 0 (dec (t/line-len (:text ed) end-row)))]}] :primary 0)))))
+
+(defn- select-cell
+  "Select the code of the beam-lisp cell (or block) the cursor is in."
+  [ed]
+  (let [b (c/block-at-cursor ed)]
+    (if (or (nil? b) (nil? (:code-from b)))
+      (c/message ed "Not in a block")
+      (let [last-row (dec (:code-to b))]
+        (if (< last-row (:code-from b))
+          (c/message ed "Empty block")
+          (assoc ed :sels [{:anchor [(:code-from b) 0] :head [last-row (max 0 (dec (t/line-len (:text ed) last-row)))]}] :primary 0))))))
+
+(defn- select-line [ed]
+  (times ed (fn [e]
+              (c/map-sels e (fn [s]
+                              (let [[ar _] (t/pos-min (:anchor s) (:head s)) [hr _] (t/pos-max (:anchor s) (:head s))
+                                    full? (and (= [ar 0] (t/pos-min (:anchor s) (:head s)))
+                                               (= (second (:head s)) (max 0 (dec (t/line-len (:text e) hr)))))
+                                    hr (if (and full? (< hr (dec (t/line-count (:text e))))) (inc hr) hr)]
+                                {:anchor [ar 0] :head [hr (max 0 (dec (t/line-len (:text e) hr)))]}))))))
+
+; ─── edit commands ──────────────────────────────────────────────────────────
+
+(defn- yank [ed]
+  (let [texts (mapv (fn [s] (let [[a b] (c/sel-range ed s)] (t/slice (:text ed) a b))) (:sels ed))]
+    (-> ed (assoc-in [:registers "\""] texts)
+        (c/effect {:kind :clipboard-write :text (join "\n" texts)})
+        (c/message (str "yanked " (count texts) " selection" (if (= 1 (count texts)) "" "s"))))))
+
+(defn- delete-sel [ed]
+  (let [ed (yank ed)]
+    (c/replace-selections ed (fn [_ _] "") nil)))
+
+(defn- change-sel [ed]
+  (assoc (delete-sel ed) :mode :insert))
+
+(defn- paste [after?]
+  (fn [ed]
+    (let [reg (get-in ed [:registers "\""] [])]
+      (if (empty? reg)
+        (c/message ed "Register is empty")
+        (let [edits (vec (map-indexed (fn [i s]
+                                        (let [[a b] (c/sel-range ed s)
+                                              p (if after? b a)]
+                                          [p p (nth reg (mod i (count reg)))]))
+                                      (:sels ed)))]
+          (c/apply-edits ed edits (fn [_ end] {:anchor end :head end}) nil))))))
+
+(defn- open-line [below?]
+  (fn [ed]
+    (let [edits (mapv (fn [s] (let [r (first (:head s))
+                                    indent (let [l (t/line (:text ed) r)] (subs l 0 (count (take-while (fn [ch] (= ch " ")) (map str l)))))]
+                                (if below?
+                                  [[r (t/line-len (:text ed) r)] [r (t/line-len (:text ed) r)] (str "\n" indent)]
+                                  [[r 0] [r 0] (str indent "\n")])))
+                      (:sels ed))]
+      (-> ed
+          (c/apply-edits edits (fn [_ end] (if below? {:anchor end :head end} {:anchor [(dec (first end)) (second end)] :head [(dec (first end)) (second end)]})) nil)
+          (assoc :mode :insert)))))
+
+(defn- indent-sel [dir]
+  (fn [ed]
+    (let [rows (distinct (mapcat (fn [s] (range (first (t/pos-min (:anchor s) (:head s))) (inc (first (t/pos-max (:anchor s) (:head s)))))) (:sels ed)))
+          edits (vec (keep (fn [r]
+                             (if (pos? dir)
+                               [[r 0] [r 0] "  "]
+                               (let [l (t/line (:text ed) r)
+                                     n (min 2 (count (take-while (fn [ch] (= ch " ")) (map str l))))]
+                                 (if (zero? n) nil [[r 0] [r n] ""]))))
+                           rows))]
+      (if (empty? edits) ed
+        (let [sels (:sels ed)]
+          (assoc (c/apply-edits ed edits (fn [i end] {:anchor end :head end}) nil) :sels sels))))))
+
+(defn- toggle-comment [ed]
+  (let [rows (distinct (mapcat (fn [s] (range (first (t/pos-min (:anchor s) (:head s))) (inc (first (t/pos-max (:anchor s) (:head s)))))) (:sels ed)))
+        all? (every? (fn [r] (starts-with? (triml (t/line (:text ed) r)) ";")) rows)
+        edits (vec (keep (fn [r]
+                           (let [l (t/line (:text ed) r)
+                                 lead (count (take-while (fn [ch] (= ch " ")) (map str l)))]
+                             (if all?
+                               (let [rest (subs l lead)
+                                     n (if (starts-with? rest "; ") 2 1)]
+                                 [[r lead] [r (+ lead n)] ""])
+                               [[r lead] [r lead] "; "])))
+                         rows))
+        sels (:sels ed)]
+    (assoc (c/apply-edits ed edits (fn [_ end] {:anchor end :head end}) nil) :sels sels)))
+
+; ─── structural edits (paredit-style) inside beam-lisp cells ───────────────
+
+(defn- with-current-form [ed f]
+  (let [fc (c/forest-at-cursor ed)]
+    (if (nil? fc)
+      (c/message ed "Not in a beam-lisp cell")
+      (let [path (forms/path-at (:forest fc) (c/cursor ed))]
+        (if (nil? path) (c/message ed "No form under the cursor") (f fc path))))))
+
+(defn- raise-form
+  "Replace the enclosing form with the form under the cursor."
+  [ed]
+  (with-current-form ed
+    (fn [fc path]
+      (if (= 1 (count path))
+        (c/message ed "Already a top-level form")
+        (let [node (forms/node-at (:forest fc) path)
+              parent (forms/node-at (:forest fc) (pop path))
+              s (t/slice (:text ed) (:from node) (:to node))]
+          (c/apply-edits ed [[(:from parent) (:to parent) s]] (fn [_ end] {:anchor (:from parent) :head (:from parent)}) nil))))))
+
+(defn- wrap-form [open close]
+  (fn [ed]
+    (with-current-form ed
+      (fn [fc path]
+        (let [node (forms/node-at (:forest fc) path)
+              s (t/slice (:text ed) (:from node) (:to node))]
+          (-> ed
+              (c/apply-edits [[(:from node) (:to node) (str open s close)]]
+                             (fn [_ _] (let [p (t/next-pos (:text ed) (:from node))] {:anchor p :head p})) nil)
+              (assoc :mode :insert)))))))
+
+(defn- splice-form
+  "Remove the delimiters of the enclosing collection, keeping its contents."
+  [ed]
+  (let [fc (c/forest-at-cursor ed)]
+    (if (nil? fc)
+      (c/message ed "Not in a beam-lisp cell")
+      (let [path (forms/enclosing (:forest fc) (c/cursor ed))
+            node (if (nil? path) nil (forms/node-at (:forest fc) path))
+            tx (:text ed)]
+        (if (nil? node)
+          (c/message ed "No enclosing form")
+          (let [open-end (if (contains? #{:set :fn} (:kind node)) (t/next-pos tx (t/next-pos tx (:from node))) (t/next-pos tx (:from node)))
+                close-start (t/prev-pos tx (:to node))]
+            (c/apply-edits ed [[close-start (:to node) ""] [(:from node) open-end ""]]
+                           (fn [_ end] {:anchor end :head end}) nil)))))))
+
+; ─── modes ──────────────────────────────────────────────────────────────────
+
+(defn- enter-insert [where]
+  (fn [ed]
+    (let [ed (case where
+               :before (c/map-sels ed (fn [s] (let [p (t/pos-min (:anchor s) (:head s))] {:anchor p :head p})))
+               :after (c/map-sels ed (fn [s] (let [p (or (t/next-pos (:text ed) (t/pos-max (:anchor s) (:head s))) (t/pos-max (:anchor s) (:head s)))] {:anchor p :head p})))
+               :line-start (c/move-heads ed m/first-nonblank false)
+               :line-end (c/map-sels ed (fn [s] (let [r (first (:head s))] {:anchor [r (t/line-len (:text ed) r)] :head [r (t/line-len (:text ed) r)]})))
+               ed)]
+      (assoc ed :mode :insert :last-edit nil))))
+
+(defn- exit-insert [ed]
+  (-> ed (assoc :mode :normal :last-edit nil)
+      (c/map-sels (fn [s] (let [p (or (m/left (:text ed) (:head s)) (:head s))] {:anchor p :head p})))))
+
+; ─── documents ──────────────────────────────────────────────────────────────
+
+(defn- save [ed]
+  (-> ed
+      (c/effect {:kind :save :path (:path ed) :text (t/to-string (:text ed)) :rev (:rev ed)})
+      (c/message (str "saving " (:path ed) "…"))))
+
+(defn- fold-toggle
+  "Toggle folding of the section under the cursor (a VIEW property: the text is unchanged)."
+  [ed]
+  (let [h (org/heading-at (:outline (:struct ed)) (first (c/cursor ed)))]
+    (if (nil? h)
+      (c/message ed "Not in a section")
+      (update-in ed [:folds] (fn [f] (let [f (or f #{})] (if (contains? f (:row h)) (disj f (:row h)) (conj f (:row h)))))))))
+
+(defn- local-cells-upto
+  "The cells to run in the page for evaluating `b`: every local cell from the
+   start of the document through `b`, in order (a cell sees the defs above it,
+   exactly as the BEAM runner evaluates a document), as [{:id :code}]."
+  [ed b]
+  (let [lines (:lines (:text ed))]
+    (vec (keep (fn [x]
+                 (when (and (= :cell (:kind x)) (<= (:from x) (:from b)))
+                   {:id (:id x) :code (join "\n" (subvec lines (:code-from x) (:code-to x)))}))
+               (:blocks (:struct ed))))))
+
+(defn- eval-cell-request
+  "Evaluate the cell under the cursor and write its #+RESULTS.
+
+   WHERE it runs is the analyzer's answer (system.place over the document,
+   held in :placements): a LOCAL cell — pure and terminating — runs right
+   here, in the page, through the in-page Beam Lisp (`js/eval-cells`), and its
+   result is written into the text at once; a BEAM cell, or any cell before a
+   placement is known, is an EFFECT the host performs on the BEAM (bl.doc's
+   runner). Either way the result lands through bl.doc.spans/write-results."
+  [ed]
+  (let [b (c/block-at-cursor ed)
+        pl (get (:placements ed) (:id b))]
+    (cond
+      (or (nil? b) (not= :cell (:kind b))) (c/message ed "Not in a beam-lisp cell")
+      (= :local (:place pl))
+        (let [out (try (js/eval-cells (local-cells-upto ed b)) (catch e {:err (ex-message e)}))]
+          (if (contains? out :err)
+            (c/message ed (str "error: " (:err out)))
+            (let [v (get (:results out) (:id b) "")
+                  new-lines (spans/write-results (:lines (:text ed)) :org {(:id b) v})
+                  ed2 (c/replace-text ed (join "\n" new-lines))]
+              (c/message ed2 (str (:id b) " ⇒ " v "   (in the page)")))))
+      :else
+        (-> ed (c/effect {:kind :eval-cell :path (:path ed) :id (:id b) :text (t/to-string (:text ed)) :rev (:rev ed)})
+            (c/message (str "evaluating " (:id b) " on the BEAM"
+                            (if (some? (:why pl)) (str " — " (:why pl)) "") "…"))))))
+
+; ─── search ───
+;
+; `/` opens the minibuffer in :search; Enter selects the next match after the
+; cursor and remembers the needle; `n` / `N` repeat forward / backward; `*`
+; searches for the word under the cursor. Matching is literal and
+; case-insensitive unless the needle contains an uppercase letter (Helix
+; smart-case). Wraps around the document with a message saying so.
+
+(defn- smart-case-hit?
+  [hay needle]
+  (if (= needle (lower-case needle))
+    (index-of (lower-case hay) needle)
+    (index-of hay needle)))
+
+(defn- matches-in-line
+  "Grapheme columns of every match of `needle` in line `l`."
+  [l needle]
+  (loop [from 0 acc []]
+    (if (> from (count l))
+      acc
+      (let [i (smart-case-hit? (subs l from) needle)]
+        (if (nil? i) acc
+          (let [c (+ from i)] (recur (+ c (max 1 (count needle))) (conj acc c))))))))
+
+(defn find-match
+  "The next (dir 1) or previous (dir -1) match of `needle` from `p`, wrapping.
+   {:at [r c] :wrapped? bool} or nil."
+  [tx p needle dir]
+  (if (blank? needle)
+    nil
+    (let [n (t/line-count tx)
+          [pr pc] p
+          rows (if (pos? dir)
+                 (concat (range pr n) (range 0 (inc pr)))
+                 (concat (reverse (range (inc pr))) (reverse (range pr n))))]
+      (some (fn [[k r]]
+              (let [cols (matches-in-line (t/line tx r) needle)
+                    wrapped? (or (and (pos? dir) (< r pr)) (and (neg? dir) (> r pr)) (and (= r pr) (> k 0)))
+                    pick (if (pos? dir)
+                           (some (fn [c] (if (or (not= r pr) wrapped? (> c pc)) c nil)) cols)
+                           (last (filter (fn [c] (or (not= r pr) wrapped? (< c pc))) cols)))]
+                (if (nil? pick) nil {:at [r pick] :wrapped? wrapped?})))
+            (map-indexed (fn [k r] [k r]) rows)))))
+
+(defn search-step
+  "Select the next/previous match of the remembered needle."
+  [ed dir]
+  (let [needle (:search ed)
+        s (c/primary ed)
+        ; forward steps from the selection's END, backward from its START, so
+        ; the match already selected is never found again
+        from (if (pos? dir) (t/pos-max (:anchor s) (:head s)) (t/pos-min (:anchor s) (:head s)))
+        hit (find-match (:text ed) from needle dir)]
+    (cond
+      (blank? needle) (c/message ed "No search yet — press / to search")
+      (nil? hit) (c/message ed (str "Not found: " needle))
+      :else (let [[r c0] (:at hit)
+                  p2 [r (+ c0 (max 0 (dec (count needle))))]]
+              (-> ed (assoc :sels [{:anchor [r c0] :head p2}] :primary 0)
+                  (c/message (if (:wrapped? hit) (str "search wrapped: " needle) nil)))))))
+
+(defn- word-under-cursor [ed]
+  (let [tx (:text ed) [r c] (c/cursor ed) l (t/line tx r)
+        word? (fn [i] (and (>= i 0) (< i (count l)) (= :word (t/char-class (subs l i (inc i))))))
+        a (loop [i c] (if (word? (dec i)) (recur (dec i)) i))
+        b (loop [i c] (if (word? i) (recur (inc i)) i))]
+    (if (< a b) (subs l a b) nil)))
+
+; ─── the table ──────────────────────────────────────────────────────────────
+
+(def table
+  {:move-left {:doc "Move left one character." :run (step-move m/left)}
+   :move-right {:doc "Move right one character." :run (step-move m/right)}
+   :move-up {:doc "Move up one line." :run (fn [ed] (times ed (fn [e] (c/move-heads e (fn [tx p] (m/up tx p nil)) (= :select (:mode e))))))}
+   :move-down {:doc "Move down one line." :run (fn [ed] (times ed (fn [e] (c/move-heads e (fn [tx p] (m/down tx p nil)) (= :select (:mode e))))))}
+   :word-next {:doc "Select to the start of the next word." :run (step-select (fn [tx p] (m/word-next tx p false)))}
+   :word-prev {:doc "Select back to the start of the previous word." :run (step-select (fn [tx p] (m/word-prev tx p false)))}
+   :word-end {:doc "Select to the end of the word." :run (step-select (fn [tx p] (m/word-end tx p false)))}
+   :WORD-next {:doc "Select to the next WORD (whitespace-separated)." :run (step-select (fn [tx p] (m/word-next tx p true)))}
+   :WORD-prev {:doc "Select back to the previous WORD." :run (step-select (fn [tx p] (m/word-prev tx p true)))}
+   :WORD-end {:doc "Select to the end of the WORD." :run (step-select (fn [tx p] (m/word-end tx p true)))}
+   :line-start {:doc "Go to the start of the line." :run (step-move m/line-start)}
+   :line-end {:doc "Go to the end of the line." :run (step-move m/line-end)}
+   :first-nonblank {:doc "Go to the first non-blank character." :run (step-move m/first-nonblank)}
+   :doc-start {:doc "Go to the first line." :run (step-move m/doc-start)}
+   :doc-end {:doc "Go to the last line." :run (step-move m/doc-end)}
+   :match-delim {:doc "Jump to the matching delimiter." :run (fn [ed] (let [fc (c/forest-at-cursor ed)] (if (nil? fc) (c/message ed "Not in a beam-lisp cell") (c/move-heads ed (fn [tx p] (m/matching-delim tx p (:forest fc))) (= :select (:mode ed))))))}
+   :heading-next {:doc "Go to the next heading." :run (struct-move m/heading-next "No later heading")}
+   :heading-prev {:doc "Go to the previous heading." :run (struct-move m/heading-prev "No earlier heading")}
+   :heading-parent {:doc "Go to the parent heading." :run (struct-move m/heading-parent "No parent heading")}
+   :block-next {:doc "Go to the next source block." :run (struct-move m/block-next "No later block")}
+   :block-prev {:doc "Go to the previous source block." :run (struct-move m/block-prev "No earlier block")}
+   :form-down {:doc "Form motion: first child, else next sibling." :run (form-move :down)}
+   :form-up {:doc "Form motion: parent, else next top-level form." :run (form-move :up)}
+   :form-prev {:doc "Form motion: previous sibling, climbing." :run (form-move :prev)}
+   :form-next {:doc "Form motion: next sibling, climbing." :run (form-move :next)}
+   :select-form {:doc "Select the form under the cursor." :run select-form-under}
+   :select-inner {:doc "Select inside the enclosing form (mi)." :run (select-enclosing true)}
+   :select-around {:doc "Select the enclosing form with delimiters (ma)." :run (select-enclosing false)}
+   :select-section {:doc "Select the org section under the cursor." :run select-section}
+   :select-cell {:doc "Select the code of the block under the cursor." :run select-cell}
+   :select-line {:doc "Select the line; repeat to extend." :run select-line}
+   :select-all {:doc "Select the whole document." :run (fn [ed] (assoc ed :sels [{:anchor [0 0] :head (t/doc-end (:text ed))}] :primary 0))}
+   :collapse {:doc "Collapse selections to their heads." :run c/collapse}
+   :keep-primary {:doc "Keep only the primary selection." :run (fn [ed] (assoc ed :sels [(c/primary ed)] :primary 0))}
+   :add-cursor-below {:doc "Add a cursor on the next line." :run (fn [ed] (let [p (m/down (:text ed) (:head (last (:sels ed))) nil)] (assoc ed :sels (conj (:sels ed) {:anchor p :head p}) :primary (count (:sels ed)))))}
+   :flip {:doc "Swap the anchor and head of each selection." :run (fn [ed] (c/map-sels ed (fn [s] {:anchor (:head s) :head (:anchor s)})))}
+   :insert {:doc "Insert before the selection." :run (enter-insert :before)}
+   :append {:doc "Insert after the selection." :run (enter-insert :after)}
+   :insert-line-start {:doc "Insert at the first non-blank." :run (enter-insert :line-start)}
+   :append-line-end {:doc "Insert at the end of the line." :run (enter-insert :line-end)}
+   :open-below {:doc "Open a new line below." :run (open-line true)}
+   :open-above {:doc "Open a new line above." :run (open-line false)}
+   :exit-insert {:doc "Return to normal mode." :run exit-insert}
+   :select-mode {:doc "Toggle select (extend) mode." :run (fn [ed] (assoc ed :mode (if (= :select (:mode ed)) :normal :select)))}
+   :delete {:doc "Delete the selection (yanking it)." :run delete-sel}
+   :change {:doc "Delete the selection and insert." :run change-sel}
+   :yank {:doc "Yank the selection." :run yank}
+   :paste-after {:doc "Paste after the selection." :run (paste true)}
+   :paste-before {:doc "Paste before the selection." :run (paste false)}
+   :undo {:doc "Undo." :run c/undo}
+   :redo {:doc "Redo." :run c/redo}
+   :indent {:doc "Indent the selected lines." :run (indent-sel 1)}
+   :dedent {:doc "Dedent the selected lines." :run (indent-sel -1)}
+   :toggle-comment {:doc "Toggle ; comments on the selected lines." :run toggle-comment}
+   :raise {:doc "Raise the form under the cursor over its parent." :run raise-form}
+   :wrap-round {:doc "Wrap the form in ( )." :run (wrap-form "(" ")")}
+   :wrap-square {:doc "Wrap the form in [ ]." :run (wrap-form "[" "]")}
+   :wrap-curly {:doc "Wrap the form in { }." :run (wrap-form "{" "}")}
+   :splice {:doc "Remove the enclosing delimiters." :run splice-form}
+   :save {:doc "Write the file." :run save}
+   :fold-toggle {:doc "Fold or unfold the section." :run fold-toggle}
+   :eval-cell {:doc "Evaluate the cell on the BEAM and write #+RESULTS." :run eval-cell-request}
+   :search {:doc "Search forward (smart-case, literal)." :run (fn [ed] (assoc ed :mode :command :minibuf {:prompt "/" :text "" :kind :search}))}
+   :search-next {:doc "Select the next match." :run (fn [ed] (times ed (fn [e] (search-step e 1))))}
+   :search-prev {:doc "Select the previous match." :run (fn [ed] (times ed (fn [e] (search-step e -1))))}
+   :search-word {:doc "Search for the word under the cursor." :run (fn [ed] (let [w (word-under-cursor ed)] (if (nil? w) (c/message ed "No word under the cursor") (search-step (assoc ed :search w) 1))))}
+   :command-line {:doc "Evaluate a Beam Lisp form against the editor (:)." :run (fn [ed] (assoc ed :mode :command :minibuf {:prompt ":" :text "" :kind :eval}))}
+   :palette {:doc "Run any command by name (M-x)." :run (fn [ed] (assoc ed :mode :palette :minibuf {:prompt "M-x " :text "" :kind :palette :sel 0}))}
+   :describe-key {:doc "Show which command a key runs." :run (fn [ed] (assoc ed :describe-next true :message "Describe key: press a key…"))}
+   :help {:doc "Show the keymap for the current mode." :run (fn [ed] (assoc ed :overlay :help))}
+   :outline {:doc "Show the document outline." :run (fn [ed] (assoc ed :overlay (if (= :outline (:overlay ed)) nil :outline)))}
+   :close-overlay {:doc "Close the overlay / clear the message." :run (fn [ed] (assoc ed :overlay nil :message nil :pending []))}})
+
+(defn lookup [ed name]
+  (get (merge table (:user-commands ed)) name))

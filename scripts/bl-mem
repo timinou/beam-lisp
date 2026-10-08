@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""bl-mem — what every running beam-lisp VM costs, in one table.
+
+    scripts/bl-mem              table, biggest first
+    scripts/bl-mem --json       the same rows as JSON (for scripts)
+    scripts/bl-mem --watch 2    redraw every 2 seconds
+
+Read straight from /proc: no VM is started to measure VMs, no network, no
+dependencies beyond python3's stdlib. The same machine state prints the same
+table — rows sort by (RSS + swap) descending, then pid.
+
+Columns
+  PID    OS process id
+  KIND   serve | run | test | self-build | build | daemon | watch | mcp | eval | other
+         (the first word after the `--` that ends the BEAM's own flags)
+  AGE    wall time since the VM started
+  RSS    resident now (pages in RAM)
+  SWAP   paged out to swap/zram. A long-lived daemon is mostly invisible in RSS
+         because the kernel evicted it: judge it by RSS + SWAP, i.e. TOTAL
+  PEAK   VmHWM, the highest RSS the VM ever reached
+  TOTAL  RSS + SWAP, the footprint the VM really owns
+  WHAT   the command's arguments, then ` @ <cwd>` when the cwd is not the args' own
+
+A VM is "beam-lisp" when its command line enters BeamLisp.Launcher.main or
+BeamLisp.Ns.Bl.Cli.main. Rows flagged `!` are old (>= 1h) and own >= 512 MB: the
+ones to restart.
+"""
+import json
+import os
+import re
+import shutil
+import sys
+import time
+
+ENTRY = re.compile(r"BeamLisp\.(Launcher\.main|Ns\.Bl\.Cli\.main)")
+KINDS = {
+    "serve": "serve", "run": "run", "test": "test", "self-build": "self-build",
+    "build": "build", "watch": "watch", "mcp": "mcp", "eval": "eval",
+    "daemon": "daemon", "repl": "repl", "check": "check", "ask": "ask",
+}
+OLD_S = 3600
+BIG_KB = 512 * 1024
+CLK = os.sysconf("SC_CLK_TCK")
+
+
+def kv_kb(path, keys):
+    """`Key:   123 kB` lines of a /proc file → {key: kB}."""
+    out = dict.fromkeys(keys, 0)
+    try:
+        with open(path) as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                if k in out:
+                    out[k] = int(v.split()[0])
+    except OSError:
+        pass
+    return out
+
+
+def cmdline(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().decode("utf-8", "replace").split("\0")[:-1]
+    except OSError:
+        return None
+
+
+def start_age_s(pid, boot_s):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            # field 22 (starttime), counted after the `)` that closes comm
+            rest = f.read().rsplit(")", 1)[1].split()
+        return max(0, int(boot_s - int(rest[19]) / CLK))
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def uptime_s():
+    with open("/proc/uptime") as f:
+        return float(f.read().split()[0])
+
+
+def kind_and_args(argv):
+    """The words after the `--` that closes the BEAM's `-e/--eval` entry form."""
+    for i, a in enumerate(argv):
+        if ENTRY.search(a):
+            tail = argv[i + 1:]
+            if tail and tail[0] == "--":
+                tail = tail[1:]
+            # `-e Mod.main() -- run x` and `--eval Mod.main(["daemon","start"]) --`
+            m = re.search(r'main\(\[(.*)\]\)', a)
+            if m and not tail:
+                tail = [w.strip('" ') for w in m.group(1).split(",") if w.strip()]
+            words = [w for w in tail if not w.startswith("--cold")]
+            for w in words:
+                if w in KINDS:
+                    return KINDS[w], " ".join(tail)
+            return "other", " ".join(tail)
+    return None, ""
+
+
+def collect():
+    boot = uptime_s()
+    rows = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        argv = cmdline(pid)
+        if not argv or not any(ENTRY.search(a) for a in argv):
+            continue
+        kind, what = kind_and_args(argv)
+        st = kv_kb(f"/proc/{pid}/status", ("VmRSS", "VmSwap", "VmHWM"))
+        sm = kv_kb(f"/proc/{pid}/smaps_rollup", ("Pss", "Anonymous"))
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            cwd = "?"
+        rows.append({
+            "pid": pid, "kind": kind, "age_s": start_age_s(pid, boot),
+            "rss_kb": st["VmRSS"], "swap_kb": st["VmSwap"], "peak_kb": st["VmHWM"],
+            "pss_kb": sm["Pss"], "total_kb": st["VmRSS"] + st["VmSwap"],
+            "what": what, "cwd": cwd,
+        })
+    rows.sort(key=lambda r: (-r["total_kb"], r["pid"]))
+    for r in rows:
+        r["stale"] = r["age_s"] >= OLD_S and r["total_kb"] >= BIG_KB
+    return rows
+
+
+def meminfo():
+    m = kv_kb("/proc/meminfo", ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"))
+    return m
+
+
+def mb(kb):
+    return f"{kb / 1024:,.0f}M"
+
+
+def age(s):
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if d:
+        return f"{d}d{h:02d}h"
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m{s:02d}s"
+
+
+def render(rows, width):
+    mi = meminfo()
+    out = []
+    swap_used = mi["SwapTotal"] - mi["SwapFree"]
+    out.append(
+        f"machine  RAM avail {mb(mi['MemAvailable'])} / {mb(mi['MemTotal'])}"
+        f"   swap used {mb(swap_used)} / {mb(mi['SwapTotal'])}")
+    out.append("")
+    head = f"  {'PID':>8} {'KIND':<10} {'AGE':>7} {'RSS':>7} {'SWAP':>8} {'PEAK':>7} {'TOTAL':>8}  WHAT"
+    out.append(head)
+    room = max(20, width - len(head) + 4)
+    for r in rows:
+        what = r["what"]
+        if r["cwd"] not in what:
+            what = f"{what} @ {r['cwd']}"
+        if len(what) > room:
+            what = what[: room - 1] + "…"
+        flag = "!" if r["stale"] else " "
+        out.append(
+            f"{flag} {r['pid']:>8} {(r['kind'] or '?'):<10} {age(r['age_s']):>7}"
+            f" {mb(r['rss_kb']):>7} {mb(r['swap_kb']):>8} {mb(r['peak_kb']):>7}"
+            f" {mb(r['total_kb']):>8}  {what}")
+    if not rows:
+        out.append("  (no beam-lisp VMs running)")
+    out.append("")
+    by = {}
+    for r in rows:
+        k = by.setdefault(r["kind"] or "?", [0, 0, 0])
+        k[0] += 1
+        k[1] += r["rss_kb"]
+        k[2] += r["swap_kb"]
+    out.append(
+        f"total    {len(rows)} VMs   RSS {mb(sum(r['rss_kb'] for r in rows))}"
+        f"   swap {mb(sum(r['swap_kb'] for r in rows))}"
+        f"   pss {mb(sum(r['pss_kb'] for r in rows))}")
+    if by:
+        out.append("by kind  " + "   ".join(
+            f"{k} ×{n} ({mb(rs)} + {mb(sw)} swap)"
+            for k, (n, rs, sw) in sorted(by.items(), key=lambda kv: (-(kv[1][1] + kv[1][2]), kv[0]))))
+    stale = [r for r in rows if r["stale"]]
+    if stale:
+        out.append(f"!        {len(stale)} VM(s) older than 1h owning >= 512M: "
+                   + " ".join(str(r["pid"]) for r in stale)
+                   + f"   (kill {' '.join(str(r['pid']) for r in stale)})")
+    return "\n".join(out)
+
+
+def main(argv):
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+    watch = None
+    if "--watch" in argv:
+        i = argv.index("--watch")
+        watch = float(argv[i + 1]) if i + 1 < len(argv) else 2.0
+    as_json = "--json" in argv
+    while True:
+        rows = collect()
+        if as_json:
+            print(json.dumps({"meminfo_kb": meminfo(), "vms": rows}, indent=1))
+        else:
+            text = render(rows, shutil.get_terminal_size((140, 24)).columns)
+            if watch:
+                sys.stdout.write("\x1b[H\x1b[2J")
+            print(text)
+        if not watch:
+            return 0
+        sys.stdout.flush()
+        time.sleep(watch)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

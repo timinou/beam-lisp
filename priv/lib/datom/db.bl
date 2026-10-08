@@ -64,20 +64,32 @@
 (defn schema-of [db] (:schema db))
 (defn store-of [db] (:store db))
 
+(defn view-key
+  "Identity of the complete immutable read view. Behavioral wrappers remain
+   distinct; transparent decorators share their substrate. Cache owners must
+   normalize resource identities rather than retain this key indefinitely."
+  [db]
+  (let [s (store-of db) target (datom.store/capability-target s)
+        identity (datom.store/identity-of s)]
+    [identity (when (not= target identity) target)
+     (basis-t db) (schema-of db) (:filter-mode db) (:since-t db)
+     (:valid-at db) (:valid-between db)]))
+
 ;; ── visibility ──────────────────────────────────────────────────────
 
-(defn- within-basis?
-  "Whether a datom was recorded at or before this value's basis."
-  [db d]
-  (<= (datom.index/-tx d) (basis-t db)))
+(defn- keep-where
+  "The elements of `coll` satisfying `pred`, as a vector. A kernel fold, not
+   `filterv`: core `reduce`/`filterv` consult the live `core/reduced?` PER
+   ELEMENT (~190 reductions each, measured), which on a scan of tens of
+   thousands of datoms is the whole read tax. `k-reduce` never does."
+  [pred coll]
+  (BeamLisp.Ns.Rt/k-reduce (fn [acc d] (if (pred d) (conj acc d) acc)) [] coll))
 
-(defn- retraction-key
-  "The identity of the FACT a datom is about: `[e a v]`.
-
-   Assertions and retractions of the same fact share this key, which is
-   what lets a single pass pair them up."
-  [d]
-  [(datom.index/-e d) (datom.index/-a d) (datom.index/-v d)])
+;; COST NOTE for everything per-row below. On this runtime a call to a
+;; top-level function (`datom.index/-tx`, a `defn-` in this ns, core `not`,
+;; `some?`, `=`) costs ~170-220 reductions: an env var fetch per call. A host
+;; BIF (`erlang/=:=`, `erlang/is_integer`), a `get`, and a CLOSURE call are 5-30.
+;; So per-row logic is inlined or lives in closures built once per read.
 
 (def FILTER-STATS
   "Which path `filter-datoms` took, counted: `{:fast n :indexed n}`. A
@@ -95,31 +107,52 @@
    when facts are true, not itself a time-travelled fact."
   [db tx]
   (let [ds (datom.index/scan (store-of db) :eavt tx)
-        from (reduce (fn [acc d] (if (= :db.valid/from (datom.index/-a d)) (datom.index/-v d) acc)) nil ds)
-        to (reduce (fn [acc d] (if (= :db.valid/to (datom.index/-a d)) (datom.index/-v d) acc)) nil ds)]
+        from (reduce (fn [acc d] (if (= :db.valid/from (get d 1)) (get d 2) acc)) nil ds)
+        to (reduce (fn [acc d] (if (= :db.valid/to (get d 1)) (get d 2) acc)) nil ds)]
     [(or from 0) (or to VALID-FOREVER)]))
 
-(defn- index-retractions
-  "The retractions in `ds` as a `[e a v] → tx` map, for pairing against
-   assertions. Only ever called with retractions (the caller splits first), so
-   nothing here asks each row what it is."
-  [db retracts]
-  (reduce (fn [acc d]
-            (if (within-basis? db d)
-              (let [k (retraction-key d)
-                    tx (datom.index/-tx d)
-                    known (get acc k)]
-                (if (and (some? known) (>= known tx)) acc (assoc acc k tx)))
-              acc))
-          {}
-          retracts))
+(defn- retraction-index
+  "The retractions in `retracts` paired against assertions, as a closure
+   `(later? d tx)`: whether datom `d`'s `[e a v]` fact was retracted at or
+   after `tx`. Only ever handed retractions (the caller splits first).
 
-(defn- later-retraction?
-  "Whether a `[e a v]` fact was retracted at or after `tx` — the check that
-   pairs an assertion with the retraction that un-asserted it."
-  [retractions d tx]
-  (let [r (get retractions (retraction-key d))]
-    (or (nil? r) (< r tx))))
+   Facts live in an Erlang map keyed by an `{e, a, v}` TUPLE when `v` is an
+   integer/string/keyword (identical terms ⇔ equal values), else by a bl
+   vector in a second bl map (floats 1 vs 1.0, composites). The tuple path is
+   the one that matters: no vector build, no k-eqv/k-compare per probe."
+  [db retracts]
+  (let [bt (basis-t db)
+        simple? (fn [v] (or (erlang/is_integer v) (erlang/is_binary v) (erlang/is_atom v)))
+        idx (BeamLisp.Ns.Rt/k-reduce
+              (fn [acc d]
+                (if (<= (get d 3) bt)
+                  (let [v (get d 2) tx (get d 3)]
+                    (if (simple? v)
+                      (let [k (erlang/list_to_tuple (list (get d 0) (get d 1) v))
+                            known (maps/get k acc nil)]
+                        (if (and (erlang/=/= known nil) (>= known tx)) acc (maps/put k tx acc)))
+                      (let [k [(get d 0) (get d 1) v]
+                            cm (maps/get :composite acc {})
+                            known (get cm k)]
+                        (if (and (erlang/=/= known nil) (>= known tx))
+                          acc
+                          (maps/put :composite (assoc cm k tx) acc)))))
+                  acc))
+              (maps/new)
+              retracts)
+        composite (maps/get :composite idx {})]
+    (fn [d tx]
+      (let [v (get d 2)
+            r (if (simple? v)
+                (maps/get (erlang/list_to_tuple (list (get d 0) (get d 1) v)) idx nil)
+                (get composite [(get d 0) (get d 1) v]))]
+        (or (erlang/=:= r nil) (< r tx))))))
+
+(defn- no-retraction?
+  "Whether `ds` holds nothing but assertions — one kernel fold, short of
+   materialising anything."
+  [ds]
+  (BeamLisp.Ns.Rt/k-reduce (fn [ok d] (and ok (erlang/=:= true (get d 4)))) true ds))
 
 (defn filter-datoms
   "Apply this value's filter to a scan result, in ONE pass over the candidates
@@ -150,8 +183,8 @@
       ; no valid-time bound: transaction-time filtering only, as before.
       (if (= (:filter-mode db) :history)
         (do (swap! FILTER-STATS (fn [m] (assoc m :history (inc (get m :history 0)))))
-            (filterv (fn [d] (let [tx (datom.index/-tx d)]
-                               (and (<= tx bt) (or (nil? st) (> tx st)))))
+            (keep-where (fn [d] (let [tx (get d 3)]
+                               (and (<= tx bt) (or (erlang/=:= st nil) (> tx st)))))
                      candidates))
         ; THE common case: a scan that holds no retraction at all. Then every
         ; visible datom is an assertion that nothing has un-asserted, and the
@@ -159,19 +192,19 @@
         ; for basis visibility. The pairing pass runs only when owed, and then
         ; only over the retractions (a 64 708-row column with one retraction in
         ; it pays for that one).
-        (if (every? datom.index/assertion? candidates)
+        (if (no-retraction? candidates)
           (do (swap! FILTER-STATS (fn [m] (assoc m :fast (inc (get m :fast 0)))))
-              (filterv (fn [d] (let [tx (datom.index/-tx d)]
-                                 (and (<= tx bt) (or (nil? st) (> tx st)))))
+              (keep-where (fn [d] (let [tx (get d 3)]
+                                 (and (<= tx bt) (or (erlang/=:= st nil) (> tx st)))))
                        candidates))
           (do (swap! FILTER-STATS (fn [m] (assoc m :indexed (inc (get m :indexed 0)))))
-              (let [retractions (index-retractions
-                                  db (filterv datom.index/retraction? candidates))]
-                (filterv (fn [d] (let [tx (datom.index/-tx d)]
+              (let [later? (retraction-index
+                                  db (keep-where (fn [d] (erlang/=/= true (get d 4))) candidates))]
+                (keep-where (fn [d] (let [tx (get d 3)]
                                    (and (<= tx bt)
-                                        (or (nil? st) (> tx st))
-                                        (datom.index/assertion? d)
-                                        (later-retraction? retractions d tx))))
+                                        (or (erlang/=:= st nil) (> tx st))
+                                        (erlang/=:= true (get d 4))
+                                        (later? d tx))))
                          candidates)))))
       ; A valid-time bound changes the ORDER: valid-time is filtered FIRST, then
       ; transaction-time supersession is computed AMONG the surviving datoms.
@@ -187,34 +220,34 @@
                             (let [w (tx-valid-window db tx)]
                               (swap! cache assoc tx w) w))))
             keep-window (fn [d]
-                          (let [w (window-of (datom.index/-tx d))]
+                          (let [w (window-of (get d 3))]
                             (if (some? va)
                               (and (<= (get w 0) va) (< va (get w 1)))
                               (let [a (get vb 0) b (get vb 1)]
                                 (and (< (get w 0) b) (> (get w 1) a))))))
-            visible-tx (fn [tx] (and (<= tx bt) (or (nil? st) (> tx st))))
-            in-valid (filterv keep-window candidates)]
+            visible-tx (fn [tx] (and (<= tx bt) (or (erlang/=:= st nil) (> tx st))))
+            in-valid (keep-where keep-window candidates)]
         (cond
           ; a RANGE (valid-between) is history-like: a fact valid anywhere in the
           ; range belongs in the answer, so cardinality-one supersession must NOT
           ; collapse two values that were each true at different points. Keep every
           ; visible assertion in the range (basis/since still apply).
           (some? vb)
-            (filterv (fn [d] (and (visible-tx (datom.index/-tx d))
-                                  (datom.index/assertion? d)))
+            (keep-where (fn [d] (and (visible-tx (get d 3))
+                                  (erlang/=:= true (get d 4))))
                      in-valid)
           (= (:filter-mode db) :history)
-            (filterv (fn [d] (visible-tx (datom.index/-tx d))) in-valid)
+            (keep-where (fn [d] (visible-tx (get d 3))) in-valid)
           ; a POINT (valid-at) is a single world-state: supersede within the slice.
           :else
-            (if (every? datom.index/assertion? in-valid)
-              (filterv (fn [d] (visible-tx (datom.index/-tx d))) in-valid)
-              (let [retractions (index-retractions
-                                  db (filterv datom.index/retraction? in-valid))]
-                (filterv (fn [d] (let [tx (datom.index/-tx d)]
+            (if (no-retraction? in-valid)
+              (keep-where (fn [d] (visible-tx (get d 3))) in-valid)
+              (let [later? (retraction-index
+                                  db (keep-where (fn [d] (erlang/=/= true (get d 4))) in-valid))]
+                (keep-where (fn [d] (let [tx (get d 3)]
                                    (and (visible-tx tx)
-                                        (datom.index/assertion? d)
-                                        (later-retraction? retractions d tx))))
+                                        (erlang/=:= true (get d 4))
+                                        (later? d tx))))
                          in-valid))))))))
 
 ;; ── reading ─────────────────────────────────────────────────────────

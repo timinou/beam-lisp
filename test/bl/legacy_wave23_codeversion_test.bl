@@ -1,0 +1,205 @@
+; legacy_wave23_codeversion_test.bl — wave 23's code-version guarantee, in
+; beam-lisp, replacing test/beam_lisp/wave23_codeversion_test.exs.
+;
+; Stored closures must survive namespace redefinition. Every `defn` regenerates
+; the namespace module, and the BEAM keeps exactly two versions of a module —
+; loading a third purges the oldest. If a fn's body (and the closures it
+; creates) lived in the regenerated module, a closure stored in a `def` would
+; become a BadFunctionError once enough later `defn`s had churned the module.
+; The fix moves each defn's real code into an immutable body module and leaves
+; only thin shims in the namespace module, so closures keep pointing at code
+; that is never purged.
+;
+; These tests pin that guarantee, plus the two properties it must not trade
+; away: call sites still link to the namespace module directly, and hot code
+; replacement still works.
+;
+; PARITY MAPPING — one `deftest` per ExUnit `test`, same order:
+;
+;   "a stored closure survives three later defns (the original repro)"
+;       → stored-closure-survives-three-later-defns
+;   "a closure survives ten or more subsequent defns"
+;       → stored-closure-survives-ten-or-more-later-defns
+;   "a closure survives redefining the fn that made it"
+;       → stored-closure-survives-redefining-the-fn-that-made-it
+;   "a closure from a multi-arity fn survives later defns"
+;       → stored-closure-from-a-multi-arity-fn-survives
+;   "a closure from a variadic fn survives later defns"
+;       → stored-closure-from-a-variadic-fn-survives
+;   "call sites still link to the namespace module, not a body module"
+;       → call-sites-still-link-to-the-namespace-module
+;   "an existing closure sees a redefined fn (hot code replacement)"
+;       → existing-closure-sees-a-redefined-fn
+;   "a running process observes a redefinition mid-flight"
+;       → running-process-observes-a-redefinition-mid-flight
+;
+; Every `assert` becomes one `is`; the same assertion count as the original.
+;
+; ADAPTATIONS. Three ExUnit details do not cross verbatim:
+;
+;   * `setup`/`on_exit`. Ward runs a file's tests in ONE process with no
+;     per-test setup, and `Env.current_ns` is process-global — so a test that
+;     ran `(ns …)` would leak into the next. Each test restores the prior
+;     namespace via `restoring-ns`, which is the isolation ExUnit's fresh test
+;     process gave for free.
+;   * `ExUnit.CaptureIO.capture_io` → `capture-out`, a StringIO group leader:
+;     BL `println` writes through `IO.puts`, so the two repro lines are read
+;     back exactly as the original read them.
+;   * `BeamLisp.Ns.Fn`, `BeamLisp.Loader.Server` and friends are bare module
+;     NAMES as values, which BL resolves as vars — the port spells them as the
+;     literal atoms they are (`:"Elixir.BeamLisp.Ns.Fn"`). `Env.link/2` returns
+;     the same `{:ok, {module, fixed, variadic}}` tuple the original destructured
+;     with `erlang/element`.
+;
+; Run: bin/bl test test/bl/legacy_wave23_codeversion_test.bl
+
+(ns legacy.wave23.codeversion-test)
+
+(defn- eval-ns
+  "The suite's `eval/2`: `BeamLisp.init()`, `Env.in_ns(ns)`, then
+   `Compiler.eval_string(source, Compiler.new_env(ns))`."
+  [ns source]
+  (BeamLisp/init)
+  (BeamLisp.Env/in_ns ns)
+  (BeamLisp.Compiler/eval_string source (BeamLisp.Compiler/new_env ns)))
+
+(defn- restoring-ns
+  "Run `f`, then put the current namespace back exactly where it was — the
+   per-test isolation ExUnit's fresh process gave for free."
+  [f]
+  (let [prev (BeamLisp.Env/current_ns)]
+    (try
+      (f)
+      (finally (BeamLisp.Env/in_ns prev)))))
+
+(defn- capture-out
+  "Run `f` with the group leader bound to a StringIO and return everything it
+   printed — the ExUnit `capture_io`."
+  [f]
+  (let [io (erlang/element 2 (StringIO/open ""))
+        prev (Process/group_leader)]
+    (erlang/group_leader io (erlang/self))
+    (try
+      (do (f) (erlang/element 2 (StringIO/contents io)))
+      (finally
+        (do (erlang/group_leader prev (erlang/self))
+            (StringIO/close io))))))
+
+(defn- saw-until
+  "Wait up to `ms` for a `[:saw v]` message whose value is `want`, discarding
+   any others — the ExUnit `assert_receive {:saw, \"v2\"}`, which scans the
+   mailbox for a MATCH rather than taking the oldest message. The looping
+   process keeps sending `v1` for a few iterations after the redefinition, so
+   the oldest message is not the interesting one."
+  [want ms]
+  (let [deadline (+ (System/monotonic_time :millisecond) ms)
+        step
+        (fn step []
+          (let [left (- deadline (System/monotonic_time :millisecond))]
+            (if (<= left 0)
+              :timed-out
+              (let [got (receive [:saw v] v (after left :no-message))]
+                (cond
+                  (erlang/== got :no-message) :timed-out
+                  (erlang/== got want) want
+                  :else (step))))))]
+    (step)))
+
+; ── stored closures survive the regenerated namespace module ─────────────
+
+(deftest stored-closure-survives-three-later-defns
+  ; the original repro: the closure is printed immediately and after three
+  ; later defns, and the stored value itself is still 6.
+  (restoring-ns
+    (fn []
+      (let [out
+            (capture-out
+              (fn []
+                (eval-ns "w23repro"
+                  "(ns w23repro) (defn mk [n] (fn [x] (+ x n))) (def add5 (mk 5)) (println (str \"immediately: \" (add5 1))) (defn other [] 1) (defn other2 [] 2) (defn other3 [] 3) (println (str \"after more defns: \" (add5 1)))")))]
+        (is (includes? out "immediately: 6"))
+        (is (includes? out "after more defns: 6"))
+        (is (= 6 (eval-ns "w23repro" "(add5 1)")))))))
+
+(deftest stored-closure-survives-ten-or-more-later-defns
+  (restoring-ns
+    (fn []
+      (is (= 8
+             (eval-ns "w23many"
+               "(ns w23many) (defn mk [n] (fn [x] (+ x n))) (def add7 (mk 7)) (defn d1 [] 1) (defn d2 [] 2) (defn d3 [] 3) (defn d4 [] 4) (defn d5 [] 5) (defn d6 [] 6) (defn d7 [] 7) (defn d8 [] 8) (defn d9 [] 9) (defn d10 [] 10) (add7 1)"))))))
+
+(deftest stored-closure-survives-redefining-the-fn-that-made-it
+  ; redefining `mk` three times would purge the version that produced the
+  ; stored closure if its code lived in the regenerated module.
+  (restoring-ns
+    (fn []
+      (is (= 4
+             (eval-ns "w23redef"
+               "(ns w23redef) (defn mk [n] (fn [x] (+ x n))) (def add3 (mk 3)) (defn mk [n] (fn [x] (+ x n 1000))) (defn mk [n] (fn [x] (+ x n 2000))) (defn mk [n] (fn [x] (+ x n 3000))) (add3 1)"))))))
+
+(deftest stored-closure-from-a-multi-arity-fn-survives
+  (restoring-ns
+    (fn []
+      (is (= 11
+             (eval-ns "w23arity"
+               "(ns w23arity) (defn mk [n] (fn [x] (+ x n))) (defn mk [n m] (fn [x] (+ x n m))) (def add10 (mk 4 6)) (defn f1 [] 1) (defn f2 [] 2) (defn f3 [] 3) (add10 1)"))))))
+
+(deftest stored-closure-from-a-variadic-fn-survives
+  (restoring-ns
+    (fn []
+      (is (= 16
+             (eval-ns "w23vari"
+               "(ns w23vari) (defn vmk [& ns] (fn [x] (reduce + x ns))) (def sum (vmk 1 2 3)) (defn g1 [] 1) (defn g2 [] 2) (defn g3 [] 3) (sum 10)"))))))
+
+; ── the two properties the fix must not trade away ──────────────────────
+
+(deftest call-sites-still-link-to-the-namespace-module
+  (restoring-ns
+    (fn []
+      (eval-ns "w23link" "(ns w23link) (defn f [x] (+ x 1))")
+      (let [r (BeamLisp.Env/link "w23link" "f")]
+        (is (= :ok (erlang/element 1 r)))
+        (let [mod (erlang/element 1 (erlang/element 2 r))]
+          ; the link metadata must name the namespace module (so call sites
+          ; emit `BeamLisp.Ns.<Ns>.f(...)` directly), not an opaque body module.
+          (is (erlang/== mod (BeamLisp.Link/module_for "w23link")))
+          (is (not (erlang/== mod :"Elixir.BeamLisp.Ns.Fn")))
+          (is (= 2 (erlang/apply mod :f (list 1)))))))))
+
+(deftest existing-closure-sees-a-redefined-fn
+  ; hot code replacement: the pre-existing `caller` closure was built before
+  ; the redefinition; its call to `report` must resolve to the new code.
+  (restoring-ns
+    (fn []
+      (eval-ns "w23hot" "(ns w23hot) (defn report [] \"v1\") (def caller (fn [] (report)))")
+      (is (= "v1" (eval-ns "w23hot" "(caller)")))
+      (eval-ns "w23hot" "(defn report [] \"v2\")")
+      (is (= "v2" (eval-ns "w23hot" "(caller)"))))))
+
+(deftest running-process-observes-a-redefinition-mid-flight
+  ; `Env.current_ns` is a single global Agent, so a looping process that
+  ; evaluates source would fight every other test for it. Call the linked fn
+  ; directly — that is what a real long-running process does, and it is the
+  ; path hot-swap has to work on.
+  (restoring-ns
+    (fn []
+      (eval-ns "w23hotloop" "(ns w23hotloop) (defn version [] \"v1\")")
+      (let [r (BeamLisp.Env/link "w23hotloop" "version")
+            mod (erlang/element 1 (erlang/element 2 r))
+            fname (get (erlang/element 2 (erlang/element 2 r)) 0)
+            test-pid (erlang/self)
+            looper
+            (erlang/spawn
+              (fn []
+                (Enum/each (range 120)
+                  (fn [_]
+                    (erlang/send test-pid [:saw (erlang/apply mod fname (list))])
+                    (Process/sleep 10)))))]
+        (is (= "v1" (saw-until "v1" 2000))
+            "the process sees v1 before the redefinition")
+        (eval-ns "w23hotloop" "(defn version [] \"v2\")")
+        ; the SAME process, never restarted, must start seeing the new
+        ; definition. Only the code moved; its in-flight state is untouched.
+        (is (= "v2" (saw-until "v2" 3000))
+            "the same process sees the new definition")
+        (Process/exit looper :kill)))))

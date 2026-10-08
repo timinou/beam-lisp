@@ -1,0 +1,115 @@
+(ns data.cache-pool-test
+  (:require [data.cache-pool :as pool] [data.bounded-cache :as cache]))
+
+(defn wait-for [f]
+  (loop [n 0]
+    (cond (f) true (>= n 1000) false :else (do (Process/sleep 2) (recur (inc n))))))
+
+(deftest aggregate-ledger-is-bounded-and-releases-are-idempotent
+  (let [owner (spawn (fn [] (receive :stop :ok (after 5000 nil))))]
+    (is (pool/register! owner))
+    (let [before (pool/stats) ticket (erlang/make_ref)
+          capacity (- pool/MAX-BYTES (:bytes before))]
+      (is (pool/reserve! owner ticket capacity))
+      (is (= pool/MAX-BYTES (:bytes (pool/stats))))
+      (is (not (pool/reserve! owner (erlang/make_ref) 1)))
+      (pool/release! (erlang/self) ticket)
+      (is (= pool/MAX-BYTES (:bytes (pool/stats))))
+      (pool/release! owner ticket)
+      (pool/release! owner ticket)
+      (is (= before (pool/stats))))
+    (erlang/exit owner :kill)
+    (pool/reap!)
+    (is (< (:bytes (pool/stats)) pool/MAX-BYTES))))
+
+(deftest collector-restart-does-not-forget-live-owner-credit
+  (let [owner (spawn (fn [] (receive :stop :ok (after 5000 nil)))) ticket (erlang/make_ref)]
+    (pool/register! owner)
+    (pool/reserve! owner ticket 10000)
+    (let [before (pool/stats) pid (Process/whereis pool/NAME) ref (erlang/monitor :process pid)]
+      (erlang/exit pid :kill)
+      (receive [:DOWN r :process dead why] (is (= ref r)) (after 5000 (assert false "collector did not stop")))
+      (pool/ready!)
+      (is (= before (pool/stats))))
+    (erlang/exit owner :kill)
+    (pool/reap!)))
+
+(deftest dead-caller-before-enqueue-cannot-wedge-owner-admission
+  (let [name :cache_pool_unsent_test parent (erlang/self)]
+    (is (wait-for (fn [] (cache/ready! name))))
+    (let [owner (Process/whereis name)
+          caller (spawn (fn []
+                          (let [ticket (erlang/make_ref)]
+                            (let [gate (:gate (erlang/element 2 (first (ets/lookup name :cache-control))))]
+                              (ets/insert_new gate (tuple :lease ticket :claimed (erlang/self) 1000))
+                              (pool/reserve! owner ticket 1000)
+                              (call owner [:reserve (erlang/self) ticket 1000] 1000))
+                            (erlang/send parent :reservation-ready)
+                            (receive :stop :ok (after 5000 nil)))))]
+      (receive :reservation-ready :ok (after 5000 (assert false "reservation missing")))
+      (erlang/exit caller :kill)
+      (is (wait-for (fn [] (cache/put! name :after 1 "new"))))
+      (is (= "new" (:value (cache/lookup name :after 1))))
+      (cache/clear! name))))
+
+(deftest queued-value-remains-charged-after-caller-timeout-and-death
+  (let [name :cache_pool_queued_test parent (erlang/self)
+        key (cache/key-data :key 0) rev (cache/key-data 1 0) value (binary/copy "x" 200000)
+        weight (cache/footprint (tuple key rev value))]
+    (is (wait-for (fn [] (cache/ready! name))))
+    (let [owner (Process/whereis name) before (:bytes (pool/stats))
+          caller (spawn (fn []
+                          (let [ticket (erlang/make_ref)]
+                            (let [gate (:gate (erlang/element 2 (first (ets/lookup name :cache-control))))]
+                              (ets/insert_new gate (tuple :lease ticket :claimed (erlang/self) weight))
+                              (pool/reserve! owner ticket weight)
+                              (call owner [:reserve (erlang/self) ticket weight] 1000))
+                            (erlang/send parent :queued-reservation-ready)
+                            (receive :publish
+                              (do (try (call owner [:put ticket key rev value weight] 5) (catch _ nil))
+                                  (erlang/send parent :queued-call-timed-out))
+                              (after 5000 nil)))))]
+      (receive :queued-reservation-ready :ok (after 5000 (assert false "reservation missing")))
+      (sys/suspend owner)
+      (erlang/send caller :publish)
+      (receive :queued-call-timed-out :ok (after 5000 (assert false "queued call did not time out")))
+      (is (= (+ before weight) (:bytes (pool/stats))))
+      (sys/resume owner)
+      (is (wait-for (fn [] (:hit? (cache/lookup name :key 1)))))
+      (is (= (+ before weight) (:bytes (pool/stats))))
+      (cache/clear! name)
+      (is (= before (:bytes (pool/stats)))))))
+
+(deftest dead-caller-before-metadata-send-is-reclaimed-without-owner-restart
+  (let [name :cache_pool_unsent_metadata parent (erlang/self)]
+    (is (wait-for (fn [] (cache/ready! name))))
+    (let [owner (Process/whereis name)
+          gate (:gate (erlang/element 2 (first (ets/lookup name :cache-control))))
+          before (pool/stats)
+          caller (spawn (fn []
+                          (let [ticket (erlang/make_ref)]
+                            (ets/insert_new gate (tuple :lease ticket :claimed (erlang/self) 1000))
+                            (pool/reserve! owner ticket 1000)
+                            (erlang/send parent :unsent-metadata-ready)
+                            (receive :stop :ok (after 5000 nil)))))]
+      (receive :unsent-metadata-ready :ok (after 5000 (assert false "claim missing")))
+      (erlang/exit caller :kill)
+      (is (wait-for (fn [] (nil? (pool/pending owner)))))
+      (is (= before (pool/stats)))
+      (is (cache/put! name :new 1 "new"))
+      (cache/clear! name))))
+
+(deftest maintenance-wakeups-stay-bounded-during-long-owner-suspension
+  (let [name :cache_pool_suspended_maintenance]
+    (is (wait-for (fn [] (cache/ready! name))))
+    (let [owner (Process/whereis name)]
+      (erlang/suspend_process owner)
+      (try
+        (cache/put! name :pending 1 "value")
+        ;; Six former collector ticks accumulated six notifications. The
+        ;; owner-owned timer can contribute exactly one queued message.
+        (Process/sleep 650)
+        (is (<= (second (erlang/process_info owner :message_queue_len)) 3))
+        (finally (erlang/resume_process owner)))
+      (is (wait-for (fn [] (cache/put! name :after 1 "value"))))
+      (cache/clear! name))))

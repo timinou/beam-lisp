@@ -1,0 +1,217 @@
+(ns datom.query-reuse-test
+  (:require [datom] [datom.db :as dbv] [datom.profile :as profile]
+            [datom.query.engine :as engine] [data.bounded-cache :as cache]
+            [datom.cache-validity :as validity]))
+
+(def schema [{:db/ident :p/name :db/valueType :db.type/string}
+             {:db/ident :p/group :db/valueType :db.type/string}
+             {:db/ident :p/log :db/valueType :db.type/string}
+             {:db/ident :p/empty :db/valueType :db.type/string}])
+(def query '[:find ?e ?n :in $ ?g :where [?e :p/group ?g] [?e :p/name ?n]])
+(defn fixture []
+  (let [c (datom/connect schema)]
+    (datom/transact! c (mapv (fn [i] {:db/id (- -1 i) :p/name (str i) :p/group "g"}) (range 64)))
+    c))
+
+(deftest ordinary-query-reuses-across-unrelated-writes
+  (cache/clear! :datom.query.results)
+  (let [c (fixture) d (datom/db c) watch (profile/watch (dbv/store-of d))
+        pd (assoc d :store watch)
+        baseline (engine/q-uncached query pd "g")
+        first (datom/q query pd "g")]
+    (is (= baseline first))
+    ;; First use learns the work hint; next use captures both-side evidence.
+    (is (= first (datom/q query pd "g")))
+    ;; Owner initialization can publish dependencies; warm under its final stamp.
+    (is (= first (datom/q query pd "g")))
+    (profile/reset! watch)
+    (is (= first (datom/q query pd "g")))
+    (is (= 0 (:rows (profile/counters watch))))
+    (datom/transact! c [{:db/id -1 :p/log "unrelated"}])
+    (profile/reset! watch)
+    (is (= first (datom/q query (assoc (datom/db c) :store watch) "g")))
+    (is (= 0 (:rows (profile/counters watch))))
+    (datom/transact! c [{:db/id -1 :p/name "new" :p/group "g"}])
+    (profile/reset! watch)
+    (let [current (assoc (datom/db c) :store watch) result (datom/q query current "g")]
+      (is (= result (engine/q-uncached query current "g")))
+      (is (> (:rows (profile/counters watch)) 0)))))
+
+(deftest inputs-and-stores-are-isolated
+  (let [a (fixture) b (fixture) da (datom/db a) db (datom/db b)]
+    (is (= 64 (count (datom/q query da "g"))))
+    (is (= #{} (datom/q query da "other")))
+    (datom/transact! b [{:db/id -1 :p/group "g" :p/name "only-b"}])
+    (is (= 65 (count (datom/q query (datom/db b) "g"))))
+    (is (= 64 (count (datom/q query da "g"))))))
+
+(deftest empty-pattern-insertion-and-historical-reader
+  (let [c (fixture) old (datom/db c)
+        q '[:find ?n :where [?e :p/name ?n] [?e :p/empty "yes"]]]
+    (is (= #{} (datom/q q old)))
+    (datom/transact! c [{:db/id -1 :p/name "inserted" :p/empty "yes"}])
+    (is (= #{["inserted"]} (datom/q q (datom/db c))))
+    (is (= #{} (datom/q q old)))))
+
+(defn reductions [f n]
+  (let [start (erlang/element 2 (erlang/process_info (erlang/self) :reductions))]
+    (doseq [_ (range n)] (f))
+    (- (erlang/element 2 (erlang/process_info (erlang/self) :reductions)) start)))
+
+(deftest cache-admission-keeps-cheap-queries-cheap
+  (let [d (datom/db (fixture))
+        cheap '[:find ?n :in $ ?n :where [?e :p/name ?n] [?e :p/group "g"]]
+        base (fn [] (engine/q-uncached cheap d "1"))
+        ordinary (fn [] (datom/q cheap d "1"))]
+    (doseq [_ (range 10)] (base) (ordinary))
+    (let [a (reductions base 50) b (reductions ordinary 50)]
+      (println "cheap-query-reductions" a b)
+      (is (< b (* a 1.25))))))
+
+(deftest reused-nontrivial-joins-reduce-runtime-work
+  (let [d (datom/db (fixture))
+        base (fn [] (engine/q-uncached query d "g"))
+        ordinary (fn [] (datom/q query d "g"))]
+    (doseq [_ (range 10)] (base) (ordinary))
+    (let [a (reductions base 20) b (reductions ordinary 20)]
+      (println "reused-query-reductions" a b)
+      (is (< b (* a 0.8))))))
+
+(deftest definition-publication-invalidates-existing-results
+  (let [d (datom/db (fixture)) watch (profile/watch (dbv/store-of d))
+        pd (assoc d :store watch)]
+    (datom/q query pd "g") (datom/q query pd "g")
+    (profile/reset! watch)
+    (datom/q query pd "g")
+    (is (= 0 (:rows (profile/counters watch))))
+    (let [before (validity/definition-stamp)]
+      (BeamLisp.Env/intern "datom.query.agg" "__generation_test" :yes)
+      (is (not= before (validity/definition-stamp))))
+    (let [before (validity/definition-stamp)]
+      (BeamLisp.Env/intern "datom.value-codec" "__generation_test" :yes)
+      (is (not= before (validity/definition-stamp))))
+    (profile/reset! watch)
+    (is (= 64 (count (datom/q query pd "g"))))
+    (is (> (:rows (profile/counters watch)) 0))))
+
+(deftest counts-and-find-shapes-reuse-their-generated-dependencies
+  (let [c (fixture) d (datom/db c) watch (profile/watch (dbv/store-of d))
+        pd (assoc d :store watch)
+        queries ['[:find (count ?e) . :where [?e :p/group "g"]]
+                 '[:find [?n ...] :where [?e :p/name ?n]]
+                 '[:find [(count ?e)] :where [?e :p/group "g"]]]]
+    (doseq [q queries]
+      (is (= (engine/q-uncached q pd) (datom/q q pd)))
+      (datom/q q pd)
+      (profile/reset! watch)
+      (is (= (datom/q q pd) (datom/q q pd)))
+      (is (= 0 (:rows (profile/counters watch)))))
+    ;; Loading other find shapes may publish definitions. Warm the count under
+    ;; the final code stamp before isolating an unrelated database write.
+    (datom/q (first queries) pd)
+    (datom/q (first queries) pd)
+    (datom/transact! c [{:db/id -1 :p/log "irrelevant"}])
+    (let [next (assoc (datom/db c) :store watch)]
+      (profile/reset! watch)
+      (is (= 64 (datom/q (first queries) next)))
+      (is (= 0 (:rows (profile/counters watch)))))
+    (datom/transact! c [{:db/id -1 :p/group "g"}])
+    (is (= 65 (datom/q (first queries) (datom/db c))))))
+
+(deftest concrete-collection-inputs-reuse-batched-entity-reads
+  (let [c (fixture) d (datom/db c) watch (profile/watch (dbv/store-of d))
+        pd (assoc d :store watch)
+        q '[:find ?e ?n :in $ [?e ...] :where [?e :p/name ?n]]
+        ids (mapv first (engine/q-uncached '[:find ?e :where [?e :p/name ?n]] pd))
+        oracle (engine/q-uncached q pd ids)]
+    (is (= oracle (datom/q q pd ids)))
+    (datom/q q pd ids)
+    (profile/reset! watch)
+    (is (= oracle (datom/q q pd ids)))
+    (is (= 0 (:rows (profile/counters watch))))
+    (is (= #{} (datom/q q pd [])))
+    (is (= (engine/q-uncached q pd (take 10 ids)) (datom/q q pd (take 10 ids))))
+    (is (= oracle (datom/q q pd (into () ids))))
+    (datom/transact! c [{:db/id -1 :p/log "unrelated-to-batch"}])
+    (let [next (assoc (datom/db c) :store watch)]
+      (profile/reset! watch)
+      (is (= oracle (datom/q q next ids)))
+      (is (= 0 (:rows (profile/counters watch)))))
+    (datom/transact! c [[:db/add (first ids) :p/name "changed-in-batch"]])
+    (let [next (assoc (datom/db c) :store watch)]
+      (profile/reset! watch)
+      (let [got (datom/q q next ids)]
+        (is (> (:rows (profile/counters watch)) 0))
+        (is (not= oracle got))
+        (is (= got (engine/q-uncached q next ids)))))))
+
+(deftest sparse-and-empty-batches-learn-from-actual-input-work
+  (let [d (datom/db (fixture)) watch (profile/watch (dbv/store-of d))
+        pd (assoc d :store watch)
+        q '[:find ?e ?v :in $ [?e ...] :where [?e :p/empty ?v]]
+        ids (mapv first (engine/q-uncached '[:find ?e :where [?e :p/name ?n]] pd))]
+    (is (= #{} (datom/q q pd ids)))
+    (datom/q q pd ids)
+    (profile/reset! watch)
+    (is (= #{} (datom/q q pd ids)))
+    (is (= 0 (:rows (profile/counters watch))))))
+
+(deftest code-publication-during-lookup-invalidates-a-retained-model-result
+  (let [d (datom/db (fixture)) watch (profile/watch (dbv/store-of d))
+        pd (assoc d :store watch) armed (atom false) observed (atom false)
+        original (BeamLisp.Env/fetch! "data.bounded-cache" "lookup")]
+    (try
+      (BeamLisp.Env/intern "data.bounded-cache" "lookup"
+        (fn [name key revision]
+          (let [hit (original name key revision)]
+            (when (and @armed (= name :datom.query.results))
+              (reset! armed false)
+              (reset! observed (:hit? hit))
+              (BeamLisp.Env/intern "datom.query.agg" "__racing_model_generation" :changed))
+            hit)))
+      (datom/q query pd "g") (datom/q query pd "g")
+      (profile/reset! watch)
+      (datom/q query pd "g")
+      (is (= 0 (:rows (profile/counters watch))))
+      (reset! armed true)
+      (is (= 64 (count (datom/q query pd "g"))))
+      (is @observed)
+      (is (> (:rows (profile/counters watch)) 0))
+      (finally (BeamLisp.Env/intern "data.bounded-cache" "lookup" original)))))
+
+
+(def COLD-BARRIER (atom nil))
+(defn cold-aggregate-barrier [elements]
+ (let [state @COLD-BARRIER
+       result (erlang/apply (:body state) (:fname state) (list elements))]
+  (when @(:armed state)
+   (reset! (:armed state) false)
+   (BeamLisp.Env/intern "datom.query.agg" "__cold_admission_reload" :changed))
+  result))
+
+(deftest publication-during-first-computation-refuses-result-admission
+ (cache/clear! :datom.query.results)
+ (cache/ready! :datom.query.results)
+ (let [c (fixture) database (datom/db c) watch (profile/watch (dbv/store-of database))
+       pd (assoc database :store watch)
+       q '[:find ?cold-e ?cold-n :in $ ?cold-g
+           :where [?cold-e :p/group ?cold-g] [?cold-e :p/name ?cold-n]]
+       original (get (BeamLisp.Env/ns_defs "datom.query.agg") "has-aggregates?")
+       entry (first original) armed (atom true)]
+  (try
+   ;; Replace actual emitted code. Interning a value cannot intercept a static
+   ;; shim edge; retain the OLD body module to avoid remote-handle recursion.
+   (reset! COLD-BARRIER {:body (elem entry 4) :fname (elem entry 2) :armed armed})
+   (BeamLisp.Compiler/eval_string
+    "(ns datom.query.agg) (defn has-aggregates? [elements] (datom.query-reuse-test/cold-aggregate-barrier elements))")
+   (is (= 64 (count (datom/q q pd "g"))))
+   (is (not @armed) "the code-publication barrier actually ran")
+   (profile/reset! watch)
+   (is (= 64 (count (datom/q q pd "g"))))
+   (is (> (:rows (profile/counters watch)) 0)
+       "first result cannot borrow a post-execution code generation")
+   (finally
+    (BeamLisp.Link/defvar "datom.query.agg" "has-aggregates?"
+     (apply list (map (fn [e] (tuple (elem e 0) (elem e 1) (elem e 2) (elem e 3))) original)))
+    (reset! COLD-BARRIER nil)
+    (datom/close! c)))))

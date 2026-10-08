@@ -1,0 +1,406 @@
+; host/multi.bl — the pinned HOST MODULE for `Elixir.BeamLisp.Multi`.
+;
+; `lib/beam_lisp/multi.ex` is the runtime engine for OPEN DISPATCH: multimethods
+; and protocols. Both live as ordinary keys in `BeamLisp.Env`'s `:beam_lisp_vars`
+; ETS table, so a var and the table behind it are the same store; the OPEN part
+; is that entries can be added, replaced or extended after the fact — exactly
+; what open dispatch promises. This file is the `.bl` port of that module,
+; compiled by `BeamLisp.AOT/compile_host_file` into ONE exact-named beam whose
+; export surface is the live module's, datum for datum.
+;
+; (This wave owns source and tests only; the seed entry that points the real
+; atom at this file is written by the wave that deletes `multi.ex`. That entry
+; needs NO compile option — the module is FUNCTIONS-ONLY: no struct to
+; synthesize, no behaviour to record, no macro to export.)
+;
+; WHAT THE MODULE OWES, clause for clause:
+;
+;   * `type_of/1` — the ONE type tag every protocol dispatch keys on. Builtin
+;     value kinds map to keywords, a struct maps to its module, a deftype
+;     instance and a reify instance map to their own tag atoms, and everything
+;     else falls to :tuple/:pid/:reference. ORDER is the ABI: `is_boolean`
+;     before `is_atom` and `nil` before `is_atom`, the Vector and LazySeq tags
+;     before the generic struct clause, and the tagged tuples before the
+;     bare-tuple one — so a reordered clause would silently answer a different
+;     tag than the live module for a value that matches two of them.
+;
+;   * `is_bl_map/1`, INLINED. The live module's map clause is guarded by
+;     `BeamLisp.Guards.is_bl_map/1`, a `defguard` — a COMPILE-TIME macro that
+;     emits `is_map(x) and not is_struct(x)`. A pinned `.bl` parameter pattern
+;     compiles to a body-level match, so the guard becomes an explicit boolean
+;     and the macro expands by hand: `is_struct/1` is
+;     `is_map(x) and is_map_key(:__struct__, x) and is_atom(map_get(:__struct__, x))`
+;     (a NON-atom `:__struct__` tag is not a struct), so "a beam-lisp map" is
+;     `is_map(x) and not that`. Without the inline the clause would swallow
+;     every struct — the exact bug the guard exists to name.
+;
+;   * multimethods — `define_multi/3` interns the multi var as a `$blfn` whose
+;     variadic slot (`{0, f}`) hands the whole args list to `dispatch/3`, so any
+;     arity reaches the dispatch fn; re-defining reuses the existing method
+;     table (CLJ-1351) and only swaps the dispatch fn. `add_method/4` keys the
+;     table by `normalize_key/1` (a Vector normalizes to `{:"bl-vector", items}`
+;     so structurally-equal values hit one entry). `dispatch/3` applies the
+;     dispatch fn through `BeamLisp.Ns.Rt.invoke/2`, tries the exact key, then
+;     Clojure's `isa?` dispatch over the registered keys, then the `:default`
+;     method, and raises the live `RuntimeError` when none answers.
+;     `method_keys/2` answers the registered keys or `[]`.
+;
+;   * hierarchies — `derive/3`, `parents/2`, `ancestors/2` (a local recursive
+;     `walk` carrying a per-walk `seen` set and an accumulating set, exactly the
+;     private `walk_ancestors/3`), `isa?/3` and `underive/3`, all on the
+;     `{:hierarchy, ns}` table.
+;
+;   * protocols — `define_protocol/3` interns the descriptor var AND each method
+;     as a `$blfn` that re-enters `dispatch_protocol/4`; `extend_type/4` refuses
+;     an incomplete extension (all declared methods or none, the same list the
+;     refusal names) and writes one row per method under the
+;     `{{:protocol, ns, name, method}, tag}` key; `dispatch_protocol/4`
+;     dispatches on `type_of/1` of the first argument and raises the live
+;     `RuntimeError` when the type has no row; `satisfies?/3` asks the SAME
+;     question, keyed the same way, so the predicate cannot disagree with the
+;     call it guards — and it requires EVERY method, matching `extend_type/4`'s
+;     own refusal to register a partial one.
+;
+; GUARDS AND CLAUSE HEADS BECOME BODY CHECKS. Every guard (the
+; `is_map_key(h, child)` on `underive`, the `%{methods: …}` pattern on
+; `define_multi`) and every multi-clause dispatch is written as an explicit
+; `if`/`cond` on the same values. `{…}` in a pinned source is a MAP, never a
+; tuple, so every composite table key is built with `tuple`, and a stored list
+; default is `(list …)` — the RAW Erlang list `Enum` reads, never a bl vector.
+;
+; NO TOP-LEVEL HELPERS. A pinned module's export surface IS the file's top-level
+; defns (`defn-` is NOT privatized on this path), and the live module's helpers
+; (`multi!`, `no_method_error`, `walk_ancestors`, `protocol!`) are not exports.
+; Every helper is therefore a LOCAL closure, rebuilt inside the public fn that
+; needs it, so `module_info(:exports)` of this beam is `module_info(:exports)` of
+; the live module minus the Elixir-generated `__info__/1`.
+;
+; RUNTIME-TIER, NOT BOOT-TIER. Every caller runs after `BeamLisp.init/0` has
+; interned the prelude — `priv/std/multi.bl`'s wrappers thread `Env.current_ns`
+; into `derive`/`isa?`/`parents`/`ancestors`/`underive`/`type_of`/`method_keys`;
+; `priv/boot/core.bl`'s `type`/`instance?` call `type_of`; and
+; `priv/boot/compiler.bl` emits `BeamLisp.Multi.extend_type(...)` calls into
+; every module that implements a protocol. So host modules (`BeamLisp.Env`,
+; `BeamLisp.Ns.Rt`, `BeamLisp.Vector`) are called directly, and no `str` var is
+; used: the two places the live module binds its message builds it with `str`,
+; which needs no var table.
+;
+; Run: bin/bl test test/bl/host_multi_test.bl
+
+(ns host.multi)
+
+(defn type_of
+  "The one type tag every protocol dispatch keys on. Builtin value kinds map to
+   keywords; Elixir structs map to their module (so interop structs are
+   first-class extensible types); a deftype instance maps to the module in its
+   tag and a reify instance to its per-evaluation reference. Returns an atom (a
+   module, a reference, or one of the keyword tags)."
+  [v]
+  (let [has-tag (and (erlang/is_map v) (erlang/is_map_key :__struct__ v))
+        st (if has-tag (erlang/map_get :__struct__ v) nil)
+        tagged-struct? (and has-tag (erlang/is_atom st))
+        ; A deftype instance is a tagged tuple carrying its module; it must
+        ; dispatch as that type, so this precedes the bare-tuple clause.
+        deftype? (and (erlang/is_tuple v)
+                      (erlang/== 3 (erlang/tuple_size v))
+                      (erlang/== :bl_deftype (erlang/element 1 v))
+                      (erlang/is_atom (erlang/element 2 v)))
+        ; A reify instance is the same tagged-tuple family, but its tag is a
+        ; per-evaluation reference (a reify has no name to back a module atom) —
+        ; dispatch still keys on it exactly like a module tag.
+        reify? (and (erlang/is_tuple v)
+                    (erlang/== 3 (erlang/tuple_size v))
+                    (erlang/== :bl_reify (erlang/element 1 v))
+                    (erlang/is_reference (erlang/element 2 v)))]
+    (cond
+      (erlang/is_integer v) :integer
+      (erlang/is_float v) :float
+      (erlang/is_binary v) :binary
+      (erlang/is_boolean v) :boolean
+      (erlang/== nil v) :nil
+      (erlang/is_atom v) :keyword
+      (erlang/is_list v) :list
+      (erlang/== :"Elixir.BeamLisp.Vector" st) :vector
+      (erlang/== :"Elixir.BeamLisp.LazySeq" st) :seq
+      ; `%{__struct__: mod} when is_atom(mod)`.
+      tagged-struct? st
+      ; `is_bl_map/1`, inlined: a plain map — a map that carries no atom
+      ; `:__struct__` tag (a NON-atom tag is a plain map, as the guard answers).
+      (erlang/is_map v) :map
+      (erlang/is_function v) :fn
+      deftype? (erlang/element 2 v)
+      reify? (erlang/element 2 v)
+      (erlang/is_tuple v) :tuple
+      (erlang/is_pid v) :pid
+      (erlang/is_reference v) :reference
+      ; NO CATCH-ALL, exactly as the live module: a value outside every clause
+      ; (a PORT, a non-binary bitstring) is the live `FunctionClauseError` —
+      ; module, function and arity — named with THIS beam's own atom (read from
+      ; a fun literal compiled into this file, the `seq_cursor.bl` idiom), so a
+      ; probe compile names the probe atom.
+      :else
+      (let [own (erlang/element 2 (erlang/fun_info (fn [] nil) :module))]
+        (erlang/error
+          (Elixir.FunctionClauseError/exception
+            (list (tuple :module own)
+                  (tuple :function :type_of)
+                  (tuple :arity 1))))))))
+
+(defn normalize_key
+  "Normalize a dispatch value to a stable method-table key: a `BeamLisp.Vector`
+   becomes `{:\"bl-vector\", items}`, so two structurally-equal vectors hit the
+   same entry regardless of how they were built; everything else is itself."
+  [v]
+  (if (and (erlang/is_map v)
+           (erlang/is_map_key :__struct__ v)
+           (erlang/== :"Elixir.BeamLisp.Vector" (erlang/map_get :__struct__ v)))
+    (tuple :"bl-vector" (Enum/to_list v))
+    v))
+
+(defn define_multi
+  "Define (or redefine) a multimethod. Interns `name` in `ns` as a callable
+   whose call applies `dispatch_fn` to all args and runs the matching method.
+
+   Mirroring Clojure (CLJ-1351), re-defining an existing multimethod reuses its
+   method table and only swaps the dispatch fn — the other methods survive, and
+   the fork shadows while the base is untouched."
+  [ns name dispatch_fn]
+  (let [r (BeamLisp.Env/lookup (tuple :multi ns name))
+        ; Chain-visible merge base: `{:ok, %{methods: methods}}` reuses the
+        ; ANCESTOR's table; the `:error` atom starts empty. A row that IS
+        ; `{:ok, _}` but not a map carrying `:methods` is the live `case`'s
+        ; NO-MATCH — a `CaseClauseError` over the whole lookup value — never a
+        ; silent empty table: `Env.put_key` accepts any row, so the edge is
+        ; reachable, and the live class AND message are part of the ABI.
+        ok? (and (tuple? r) (erlang/== :ok (erlang/element 1 r)))
+        row (if ok? (erlang/element 2 r) nil)
+        methods (cond
+                  (and ok? (erlang/is_map row) (erlang/is_map_key :methods row))
+                  (Map/get row :methods)
+                  ok?
+                  (erlang/error
+                    (Elixir.CaseClauseError/exception (list (tuple :term r))))
+                  :else (maps/new))]
+    (BeamLisp.Env/put_key (tuple :multi ns name)
+      (maps/put :methods methods (maps/put :dispatch dispatch_fn (maps/new))))
+    ; `rt/invoke` spreads call args over the fn's parameters (apply/2), so a
+    ; fixed-arity closure would only ever see one arg. A tagged variadic value
+    ; ({min, f} with min 0) makes `rt/invoke` hand the fn the whole args list
+    ; instead, so any arity reaches `dispatch/3`. The ns/name it closes over are
+    ; stable per multi, so re-definition simply re-interns a fresh value over
+    ; the same key.
+    (BeamLisp.Env/intern ns name
+      (tuple :"$blfn" (maps/new) (tuple 0 (fn [args] (dispatch ns name args)))))))
+
+(defn add_method
+  "Add or replace the method for `dispatch_val` on the multi `ns/name`. The
+   method table is keyed by `normalize_key/1`. Returns `method_fn`."
+  [ns name dispatch_val method_fn]
+  (let [r (BeamLisp.Env/lookup (tuple :multi ns name))]
+    (if (and (tuple? r) (erlang/== :ok (erlang/element 1 r)))
+      (let [entry (erlang/element 2 r)
+            ; `entry.methods` — a raw field read, so a malformed row raises the
+            ; live `BadMapError`/`KeyError` here rather than reading a nil.
+            cur (erlang/map_get :methods entry)
+            methods (Map/put cur (normalize_key dispatch_val) method_fn)]
+        (BeamLisp.Env/put_key (tuple :multi ns name) (Map/put entry :methods methods))
+        method_fn)
+      (erlang/error
+        (Elixir.RuntimeError/exception
+          (str "No multimethod named " ns "/" name " — defmulti it before adding methods"))))))
+
+(defn method_keys
+  "The dispatch keys registered for multimethod `ns`/`name` right now, or `[]`
+   when no such multimethod exists. Used by the reload migration verifier to
+   fuse SOURCE methods (verifiable from text) with RUNTIME-added ones (keys
+   only, no source body) so a dispatch table extended by `add_method/4` is
+   enumerated, not silently missed — the source-absent keys are :approximate."
+  [ns name]
+  (let [r (BeamLisp.Env/lookup (tuple :multi ns name))]
+    (if (and (tuple? r) (erlang/== :ok (erlang/element 1 r)))
+      (Map/keys (erlang/map_get :methods (erlang/element 2 r)))
+      (list))))
+
+(defn dispatch
+  "Run a multimethod: apply its dispatch fn to `args`, look up the method by the
+   normalized result, falling back to the `:default` method when there is one.
+   No match and no default raises a clear error naming the multi and the
+   dispatch value."
+  [ns name args]
+  (let [r (BeamLisp.Env/lookup (tuple :multi ns name))]
+    (if (and (tuple? r) (erlang/== :ok (erlang/element 1 r)))
+      (let [entry (erlang/element 2 r)
+            ; live reads `entry.dispatch` FIRST (to compute the key), then
+            ; `entry.methods`, so a malformed row's error names the FIRST
+            ; missing field. Both are raw reads: a nil/number entry is the live
+            ; `BadMapError`, a map missing the key the live `KeyError` — never
+            ; a silent nil from a lenient `Map.get`.
+            dispatch_fn (erlang/map_get :dispatch entry)
+            key (normalize_key (BeamLisp.Ns.Rt/invoke dispatch_fn args))
+            methods (erlang/map_get :methods entry)
+            found (Map/fetch methods key)]
+        (if (and (tuple? found) (erlang/== :ok (erlang/element 1 found)))
+          (BeamLisp.Ns.Rt/invoke (erlang/element 2 found) args)
+          ; Clojure's `isa?` dispatch: a dispatch value derived from a
+          ; registered method key still hits that method, before the `:default`
+          ; fallback. A `nil` hit is the live `case`'s `nil` branch — the
+          ; `:default` lookup — because `Enum.find/2` answers nil for a match
+          ; whose key IS nil.
+          (let [hit (Enum/find (Map/keys methods) (fn [k] (isa? ns key k)))]
+            (cond
+              (some? hit) (BeamLisp.Ns.Rt/invoke (Map/fetch! methods hit) args)
+              (Map/has_key? methods :default)
+              (BeamLisp.Ns.Rt/invoke (Map/fetch! methods :default) args)
+              :else
+              (erlang/error
+                (Elixir.RuntimeError/exception
+                  (str "No method in multimethod " ns "/" name
+                       " for dispatch value: " (Kernel/inspect key))))))))
+      (erlang/error
+        (Elixir.RuntimeError/exception
+          (str "No multimethod named " ns "/" name " — defmulti it before adding methods"))))))
+
+(defn derive
+  "Record `child` as derived from `parent` in ns's hierarchy. Returns true."
+  [ns child parent]
+  (let [r (BeamLisp.Env/lookup (tuple :hierarchy ns))
+        h (if (and (tuple? r) (erlang/== :ok (erlang/element 1 r)))
+            (erlang/element 2 r)
+            (maps/new))
+        ; `Map.update(h, child, [parent], &[parent | reject(&1, == parent)])`:
+        ; the parent is prepended, an exact duplicate already in the list is
+        ; dropped, and a child seen for the first time gets a one-element list.
+        h2 (Map/update h child (list parent)
+              (fn [cur] (cons parent (Enum/reject cur (fn [p] (erlang/== p parent))))))]
+    (BeamLisp.Env/put_key (tuple :hierarchy ns) h2)
+    true))
+
+(defn parents
+  "Direct parents of `x` in ns's hierarchy."
+  [ns x]
+  (let [r (BeamLisp.Env/lookup (tuple :hierarchy ns))]
+    (if (and (tuple? r) (erlang/== :ok (erlang/element 1 r)))
+      (Map/get (erlang/element 2 r) x (list))
+      (list))))
+
+(defn ancestors
+  "All transitive ancestors of `x` in ns's hierarchy. Built by the local
+   recursive `walk` — the private `walk_ancestors/3` folded in, with its
+   per-walk `seen` set and its accumulating result set."
+  [ns x]
+  (let [walk (fn walk [hns hx seen]
+               (let [ps (parents hns hx)]
+                 (Enum/reduce ps (MapSet/new)
+                   (fn [p acc]
+                     (if (or (MapSet/member? seen p) (MapSet/member? acc p))
+                       acc
+                       (MapSet/union acc
+                         (MapSet/put (walk hns p (MapSet/put seen hx)) p)))))))]
+    (walk ns x (MapSet/new))))
+
+(defn isa?
+  "True when `x` is `y` or transitively derived from `y` in ns's hierarchy —
+   the relation a multimethod consults after an exact dispatch-value match
+   fails (Clojure's `isa?` dispatch semantics)."
+  [ns x y]
+  (if (erlang/== x y)
+    true
+    (Enum/any? (ancestors ns x) (fn [a] (erlang/== a y)))))
+
+(defn underive
+  "Remove `child`'s derivation from `parent` in ns's hierarchy. Returns false."
+  [ns child parent]
+  ; `{:ok, h} when is_map_key(h, child)` — a hierarchy that has no entry for
+  ; `child` writes nothing (the live `_ -> :ok` catch-all); one that does
+  ; rewrites the child's parent list, deleting the key when it empties.
+  (let [r (BeamLisp.Env/lookup (tuple :hierarchy ns))]
+    (when (and (tuple? r)
+               (erlang/== :ok (erlang/element 1 r))
+               (erlang/is_map (erlang/element 2 r))
+               (erlang/is_map_key child (erlang/element 2 r)))
+      (let [h (erlang/element 2 r)
+            rest (Enum/reject (Map/get h child) (fn [p] (erlang/== p parent)))]
+        (BeamLisp.Env/put_key (tuple :hierarchy ns)
+          (if (empty? rest) (Map/delete h child) (Map/put h child rest))))))
+  false)
+
+(defn define_protocol
+  "Define a protocol: intern `name` in `ns` as a descriptor var, and intern each
+   method as a callable var that dispatches on the type tag of its first
+   argument (via `type_of/1`). Returns the list of interned method values, one
+   per name — the `for` comprehension's result, in declaration order."
+  [ns name method_names]
+  (BeamLisp.Env/put_key (tuple :protocol ns name)
+    (maps/put :methods method_names (maps/new)))
+  (BeamLisp.Env/intern ns name (tuple :"$protocol" ns name method_names))
+  (Enum/map method_names
+    (fn [method]
+      (BeamLisp.Env/intern ns method
+        (tuple :"$blfn" (maps/new)
+               (tuple 0 (fn [args] (dispatch_protocol ns name method args))))))))
+
+(defn extend_type
+  "Extend `type_tag` with implementations of a protocol's methods. `impls` maps
+   method name => fn. Adding a method that already exists for the type replaces
+   it; other types' entries are untouched. Returns `:ok`.
+
+   Every method the protocol declares must be covered, else a later call
+   silently misses; catch that at extension time."
+  [ns protocol type_tag impls]
+  (let [prior (BeamLisp.Env/lookup (tuple :protocol ns protocol))
+        ; An extension is a real use of its protocol, not an unused alias.
+        ; Keep live in-memory protocols and the existing missing-protocol
+        ; refusal; initialize a resolvable deferred provider only on a miss.
+        r (if (and (erlang/== :error prior) (BeamLisp.Loader/resolvable? ns))
+            (do (BeamLisp.Loader/load_provider ns)
+                (BeamLisp.Env/lookup (tuple :protocol ns protocol)))
+            prior)
+        proto (if (and (tuple? r) (erlang/== :ok (erlang/element 1 r)))
+                (erlang/element 2 r)
+                (erlang/error
+                  (Elixir.RuntimeError/exception
+                    (str "No protocol named " ns "/" protocol " — defprotocol it before extending"))))
+        missing (Enum/reject (Map/get proto :methods) (fn [m] (Map/has_key? impls m)))]
+    (if (not (empty? missing))
+      (erlang/error
+        (Elixir.RuntimeError/exception
+          (str "extend-type " ns "/" protocol " for " (Kernel/inspect type_tag)
+               " is missing methods: " (Kernel/inspect missing))))
+      (do
+        (Enum/each impls
+          (fn [pair]
+            (BeamLisp.Env/put_key
+              (tuple (tuple :protocol ns protocol (erlang/element 1 pair)) type_tag)
+              (erlang/element 2 pair))))
+        :ok))))
+
+(defn dispatch_protocol
+  "Dispatch a protocol method on the first argument's type tag."
+  [ns protocol method args]
+  (let [tag (type_of (erlang/hd args))
+        r (BeamLisp.Env/lookup (tuple (tuple :protocol ns protocol method) tag))]
+    (if (and (tuple? r) (erlang/== :ok (erlang/element 1 r)))
+      (BeamLisp.Ns.Rt/invoke (erlang/element 2 r) args)
+      (erlang/error
+        (Elixir.RuntimeError/exception
+          (str "No implementation of method " method " of protocol " ns "/" protocol
+               " for type " (Kernel/inspect tag)))))))
+
+(defn satisfies?
+  "True when `value`'s type has an implementation of every method of protocol
+   `ns`/`protocol`.
+
+   Asks the SAME question `dispatch_protocol/4` answers, keyed the same way, so
+   the predicate cannot disagree with the call it guards. Every method must be
+   present, not merely one: a partial extension satisfies nothing, matching
+   `extend_type/4`'s own refusal to register an incomplete one."
+  [ns protocol value]
+  (let [r (BeamLisp.Env/lookup (tuple :protocol ns protocol))]
+    (if (and (tuple? r) (erlang/== :ok (erlang/element 1 r)))
+      (let [methods (Map/get (erlang/element 2 r) :methods)
+            tag (type_of value)]
+        (and (not (empty? methods))
+             (Enum/all? methods
+               (fn [method]
+                 (BeamLisp.Env/member? (tuple (tuple :protocol ns protocol method) tag))))))
+      false)))

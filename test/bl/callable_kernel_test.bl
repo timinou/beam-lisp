@@ -1,0 +1,200 @@
+; callable_kernel_test.bl — the call protocol's plain-BEAM-fn fast path.
+;
+; `rt.call/call-invoke` is the runtime's one entry point for `(f …)`: it is
+; asked to call a value with an argument LIST and must decide what the value is.
+; The overwhelmingly common answer is a plain BEAM fn, and for a fn the whole
+; classifier is unnecessary — a term is a fun exactly when `erlang:is_function`
+; says so, which is the same question `kind-kind`'s `:fn` clause answers after
+; nine container/scalar tests. So a plain fn is answered first, by
+; `is_function`, and only every OTHER value pays for `kind-kind`.
+;
+; This suite pins two things a fast path can quietly break:
+;
+;   1. SEMANTIC AND ERROR PARITY. A plain fn still applies with its arguments;
+;      the wrong arity is still the BEAM's own `BadArityError`; an improper
+;      argument list still raises BEFORE the fn runs (the eager `length(args)`
+;      validation is preserved); a raising/throwing fn still propagates; and
+;      every non-fn — external fun, `$blfn`, remote handle under the caps gate,
+;      keyword, map, vector, set, struct — takes exactly the protocol it did
+;      before, because only the fn clause moved.
+;
+;   2. THE CLASSIFIER IS ACTUALLY SKIPPED. A `:erlang.trace_pattern` count of
+;      `BeamLisp.Ns.Rt.kind-kind/1` calls made by this process shows ZERO during
+;      a plain-fn invocation and a POSITIVE count for a non-fn (keyword, map,
+;      `$blfn`). The positive controls are what make the zero trustworthy: a
+;      probe that never matches would also read zero, so a calibrated direct
+;      call (`kind-kind/1` once) and the non-fn cases prove it is live.
+;
+; HOW THE COUNT IS TAKEN, AND WHY NOT cprof
+;
+; Same technique as `compiler_retention_port_test`: the `:call` trace flag is
+; set on the TEST process alone, so a concurrent `bl test --async` file cannot
+; inflate the count, and the single global pattern table is restored in a
+; `finally`. `cprof` is VM-global and pulls its own tracing modules in; this
+; probe needs neither.
+;
+; The traced thunk must contain ONLY the invocation, with the target fn and the
+; argument list as INLINE literals. Reading a global var inside the traced
+; window itself calls `kind-kind` (BL var resolution goes through the runtime),
+; which would swamp the signal; a self-contained thunk isolates the invoke.
+;
+; Run: bl test test/bl/callable_kernel_test.bl
+
+(ns callable-kernel.test
+  (:require [env]))
+
+; ── the trace probe ─────────────────────────────────────────────────────────
+
+(defn- drain
+  "Count `:call` trace messages until `:finish`, then report the total."
+  [parent counts]
+  (receive
+    [:trace _pid _kind _mfa] (drain parent (inc counts))
+    :finish (erlang/send parent (tuple :done counts))
+    _ (drain parent counts)))
+
+(defn- kind-kind-calls
+  "How many times THIS process calls `BeamLisp.Ns.Rt.kind-kind/1` while `thunk`
+   runs. `kind-kind` is called through the `BeamLisp.Ns.Rt` facade — the body
+   module reaches it by a remote call — so the facade `'kind-kind'/1` is the
+   pattern to trace."
+  [thunk]
+  (let [parent (erlang/self)
+        tracer (erlang/spawn (fn [] (drain parent 0)))
+        pattern (tuple :"Elixir.BeamLisp.Ns.Rt" :kind-kind 1)]
+    (erlang/trace_pattern pattern true (list))
+    (erlang/trace (erlang/self) true (list :call (tuple :tracer tracer)))
+    (try
+      (erlang/apply thunk (quote ()))
+      (finally
+        (erlang/trace (erlang/self) false (list :call))
+        (erlang/trace_pattern pattern false (list))
+        ; Wait until every trace message has reached the tracer, so `:finish`
+        ; can never overtake a counted call.
+        (erlang/trace_delivered (erlang/self))
+        (receive [:trace_delivered _ref _] nil (after 5000 nil))
+        (erlang/send tracer :finish)))
+    (receive [:done n] n (after 5000 -1))))
+
+; ── fixtures ────────────────────────────────────────────────────────────────
+
+(def add-one (fn [x] (+ x 1)))
+(def zero-fn (fn [] :zero))
+(def multi-2 (fn ([] 0) ([a] a)))
+(def throws (fn [] (erlang/error (Elixir.ArgumentError/exception "boom"))))
+(def errors (fn [] (erlang/error :kaboom)))
+(def exits (fn [] (erlang/exit :bye)))
+
+; ── the fast path: a plain fn ───────────────────────────────────────────────
+
+(deftest a-plain-fn-applies-with-its-arguments
+  (is (= 42 (BeamLisp.Ns.Rt/invoke add-one (list 41))))
+  (is (= :zero (BeamLisp.Ns.Rt/invoke zero-fn (quote ()))))
+  (is (= :zero (BeamLisp.Ns.Rt/invoke zero-fn (list)))))
+
+(deftest a-plain-fn-keeps-the-beams-own-arity-refusal
+  ; `erlang:apply/2` is still the applier, so the BEAM names both arities.
+  (is (thrown-with-msg? "with arity 1 called with 2 arguments"
+        (BeamLisp.Ns.Rt/invoke add-one (list 1 2))))
+  (is (thrown-with-msg? "with arity 0 called with 1 argument"
+        (BeamLisp.Ns.Rt/invoke zero-fn (list 1)))))
+
+(deftest an-improper-argument-list-still-raises-before-the-fn-runs
+  ; The eager `length(args)` is preserved: `[41 | 42]` is a list spine, and
+  ; `length/1` refuses it — the fn is never entered. If the count moved into
+  ; the non-fn branch, this would instead reach `apply` and raise a different
+  ; error, so the message pins WHICH validation ran.
+  (let [improper (erlang/++ (list 41) 42)]
+    (is (thrown? (BeamLisp.Ns.Rt/invoke add-one improper)))
+    (is (thrown-with-msg? "not a list" (BeamLisp.Ns.Rt/invoke add-one improper)))))
+
+(deftest a-raising-or-throwing-fn-propagates-unchanged
+  (is (thrown-with-msg? "boom" (BeamLisp.Ns.Rt/invoke throws (quote ()))))
+  (is (thrown? (BeamLisp.Ns.Rt/invoke errors (quote ()))))
+  (is (thrown? (BeamLisp.Ns.Rt/invoke exits (quote ())))))
+
+; ── the classifier is skipped for a fn, and only for a fn ───────────────────
+
+(deftest the-trace-probe-is-calibrated
+  ; One direct call to the traced function reads one. Without this the zeros
+  ; below would be consistent with a pattern that never matches.
+  (is (= 1 (kind-kind-calls (fn [] (BeamLisp.Ns.Rt/kind-kind :x))))))
+
+(deftest a-plain-fn-invocation-never-consults-the-classifier
+  (is (erlang/is_function add-one))
+  (is (zero? (kind-kind-calls (fn [] (BeamLisp.Ns.Rt/invoke (fn [x] x) (list 41)))))
+      "a plain closure is answered by is_function, so kind-kind never runs")
+  (is (zero? (kind-kind-calls (fn [] (BeamLisp.Ns.Rt/invoke (fn [] :x) (list)))))
+      "a zero-arity plain fn is answered the same way"))
+
+(deftest every-non-fn-still-consults-the-classifier
+  (testing "keyword, map and $blfn each reach kind-kind exactly as before"
+    (is (pos? (kind-kind-calls (fn [] (BeamLisp.Ns.Rt/invoke :a (list {:a 1})))))
+        "a keyword is a function of maps: classified, then applied")
+    (is (pos? (kind-kind-calls (fn [] (BeamLisp.Ns.Rt/invoke {:a 1} (list :a)))))
+        "a plain map is a function of its keys: classified")
+    (is (pos? (kind-kind-calls (fn [] (BeamLisp.Ns.Rt/invoke (fn ([] 0) ([a] a)) (list 7)))))
+        "$blfn is a tagged tuple, not a fun: classified")))
+
+(deftest an-external-fn-takes-the-fast-path-too
+  ; An EXTERNAL fun (`fun M:F/A`, what a linked `defn` value is) is a function
+  ; to `is_function` just like a closure, so it is answered without the
+  ; classifier; `BeamLisp.Env/fetch!` hands back such a value.
+  (let [external (BeamLisp.Env/fetch! "core" "first")]
+    (is (erlang/is_function external))
+    (is (= 1 (BeamLisp.Ns.Rt/invoke external (list (list 1 2)))))))
+
+; ── every other callable still uses its own clause ──────────────────────────
+
+(deftest a-multi-fn-dispatches-by-arity-as-before
+  (is (= 0 (BeamLisp.Ns.Rt/invoke multi-2 (quote ()))))
+  (is (= 7 (BeamLisp.Ns.Rt/invoke multi-2 (list 7))))
+  (is (= :blfn (BeamLisp.Ns.Rt/kind multi-2)))
+  (is (thrown-with-msg? "a fn of 0/1 arguments"
+        (BeamLisp.Ns.Rt/invoke multi-2 (list 1 2 3)))))
+
+(deftest a-keyword-map-vector-and-set-are-callable-as-before
+  (is (= 1 (BeamLisp.Ns.Rt/invoke :a (list {:a 1}))))
+  (is (= 1 (BeamLisp.Ns.Rt/invoke {:a 1} (list :a))))
+  (is (= :none (BeamLisp.Ns.Rt/invoke {:a 1} (list :b :none))))
+  (is (= 20 (BeamLisp.Ns.Rt/invoke [10 20] (list 1))))
+  (is (= 2 (BeamLisp.Ns.Rt/invoke (set [1 2]) (list 2))))
+  (is (nil? (BeamLisp.Ns.Rt/invoke (set [1 2]) (list 3))))
+  (is (= :d (BeamLisp.Ns.Rt/invoke (set [1 2]) (list 9 :d)))))
+
+(deftest a-shadowing-struct-is-refused-the-call-protocol-it-always-was
+  ; A Decimal is its own kind, not a map, so it is not callable.
+  (is (= :decimal (BeamLisp.Ns.Rt/kind (BeamLisp.Decimal/from_float 1.0))))
+  (is (thrown-with-msg? "is not a function"
+        (BeamLisp.Ns.Rt/invoke (BeamLisp.Decimal/from_float 1.0) (list)))))
+
+; ── the capability gate is untouched ────────────────────────────────────────
+
+(deftest a-remote-handle-is-gated-and-still-classified
+  (let [handle (BeamLisp.Ns.Rt/remote_fun :Elixir.String :upcase)]
+    (is (= :remote (BeamLisp.Ns.Rt/kind handle)))
+    (is (= "HI" (BeamLisp.Ns.Rt/invoke handle (list "hi"))))))
+
+(deftest a-remote-handle-created-at-global-cannot-fire-in-a-capped-env
+  ; The runtime half of the capability gate: the CALLING env's grants decide,
+  ; a handle made at `:global` carries no authority. Unchanged by the fast
+  ; path, which only moves the fn clause.
+  (let [handle (BeamLisp.Ns.Rt/remote_fun :Elixir.String :upcase)]
+    (is (thrown-with-msg? "module String is not granted"
+          (env/isolated (env/fork :global {:caps []})
+            (fn [] (BeamLisp.Ns.Rt/invoke handle (list "hi"))))))))
+
+; ── a callable value is used once per call, never cached ────────────────────
+
+(deftest a-callable-value-is-not-cached-across-invocations
+  (let [inc1 (fn [x] (+ x 1))
+        plus100 (fn [x] (+ x 100))]
+    (is (= 2 (BeamLisp.Ns.Rt/invoke inc1 (list 1))))
+    (is (= 101 (BeamLisp.Ns.Rt/invoke plus100 (list 1))))
+    (is (= 3 (BeamLisp.Ns.Rt/invoke inc1 (list 2))))))
+
+(deftest a-var-is-resolved-at-call-time
+  ; Rebinding a var between two calls is visible to the second: nothing in the
+  ; fast path caches the callable.
+  (is (= 1 (env/eval "(def ck-live (fn [] 1)) (ck-live)")))
+  (is (= 2 (env/eval "(def ck-live (fn [] 2)) (ck-live)"))))

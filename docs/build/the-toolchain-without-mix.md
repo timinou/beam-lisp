@@ -24,9 +24,10 @@ path is reachable through `bl self-build`, which reproduces a drop from inside
 one.
 
 `bl build` with no arguments builds what the tree **declared**: `:build` in
-`env.bl` names the roots, the output directory, the width, whether the tree has
-natives, and the substrate's `:ex` root and excludes. A flag still wins, and a
-PATH argument still means what it meant.
+`env.bl` names the roots, output directory, width, native crates, and an
+optional `:ex` stage. This tree's `lib/` root contains no `.ex` source, so
+that stage has no repository Elixir code to compile. A flag still wins, and
+a PATH argument still means what it meant.
 
 ## `env.bl` declares, state lives outside the tree
 

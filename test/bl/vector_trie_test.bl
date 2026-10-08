@@ -1,0 +1,295 @@
+; vector_trie_test.bl — `BeamLisp.Vector`, in beam-lisp itself.
+;
+; Ported from the ExUnit `test/beam_lisp/vector_trie_test.exs`: every case there
+; is here, grouped the same way, and the original is gone once this suite is green.
+;
+; WHAT IS BEING PINNED. `BeamLisp.Vector` is a persistent 32-way bit-partitioned
+; trie in Clojure's PersistentVector shape, with a tail buffer that makes append
+; amortized O(1) and indexed reads/writes O(log32 n). Small vectors (≤ 32) store
+; their elements directly as a tuple — the shape the compiler produces for vector
+; literals — and only grow into a trie past the tail. Four properties carry the
+; weight, and each fails differently:
+;
+;   * ORDER / EQUALITY — `to_list` at every boundary, and a raw compiler literal
+;     reading through the same API as a `new`-built one;
+;   * the TRIE BOUNDARY — the tail→trie flush (31 → 33) and the shift overflow
+;     past 1056, where a wrong split silently drops or duplicates elements;
+;   * PERSISTENCE — an old version must not change when a new one is built;
+;   * the COLLECTION PROTOCOL — `Enumerable`, and the error paths (out-of-range
+;     `assoc` raises the live `ArgumentError`, `nth` past the end is lenient).
+;
+; PARITY with the existing native BL suite. `test/bl/host_vector_test.bl` (186
+; assertions) is the DIFFERENTIAL of `priv/host/vector*.bl` against the seeded
+; `BeamLisp.Vector` beams — the trie boundary, `nth`/`assoc` bounds, metadata,
+; and the `Enumerable` protocol are all proven there as "the two agree". This
+; suite pins the absolute answers (the agreed value is the RIGHT one), the
+; persistence story the differential reads only in snapshots, and the exact
+; error class + message.
+;
+; Run: bin/bl test test/bl/vector_trie_test.bl
+
+(ns vector-trie.test)
+
+; ── helpers ────────────────────────────────────────────────────────────────
+
+(defn- indices [n] (to-list (range n)))
+
+; Every size at which the backing representation changes shape: the empty and
+; singleton tails, the 31/32/33 tail→trie flush, the 63/64/65 node split, the
+; 1023/1024/1025 node growth, the 1056/1057 shift overflow, and one deep-trie
+; stress size. The ExUnit corpus also carried 100 000; that is a stress REPEAT
+; of the same transitions, so it is exercised by the bench at the end instead
+; of in every boundary walk — the size a contended gate can afford.
+(def boundaries [0 1 31 32 33 63 64 65 1023 1024 1025 1056 1057 32769])
+
+; A raw, compiler-shaped vector: `%BeamLisp.Vector{items: <tuple>}` with no
+; trie wrapper. Built here so a literal over 32 elements can be driven through
+; the public API the same way `Vector/new` output is.
+(defn- raw-tuple-vector [items]
+  (maps/put :__struct__ :"Elixir.BeamLisp.Vector"
+    (maps/put :items (erlang/list_to_tuple items)
+      (maps/put :meta nil (maps/new)))))
+
+(defn- refuses? [class needle f]
+  (try
+    (do (f) false)
+    (catch e
+      (and (erlang/== class (erlang/map_get :__struct__ e))
+           (includes? (str (ex-message e)) needle)))))
+
+; ── construction ───────────────────────────────────────────────────────────
+
+(deftest new-0-and-new-1-build-the-empty-and-singleton-vectors
+  (is (= (BeamLisp.Vector/new) (BeamLisp.Vector/new (list))))
+  (is (= (BeamLisp.Vector/count (BeamLisp.Vector/new)) 0))
+  (is (= (BeamLisp.Vector/count (BeamLisp.Vector/new (list 1))) 1)))
+
+(deftest new-equals-the-compilers-tuple-backed-literal-for-small-vectors
+  ; the compiler builds a literal as `%Vector{items: {…}}`; a small `new`
+  ; produces exactly that shape, so the two are interchangeable values
+  (is (= (maps/get :items (BeamLisp.Vector/new (list 1 2 3)))
+         (erlang/list_to_tuple (list 1 2 3))))
+  (is (= (BeamLisp.Vector/new (list 1 2 3)) [1 2 3])))
+
+(deftest new-preserves-element-order-and-count-at-every-boundary
+  (doseq [n boundaries]
+    (let [expected (indices n)
+          v (BeamLisp.Vector/new expected)]
+      (is (= (BeamLisp.Vector/count v) n) (str "count at n=" n))
+      (is (= (BeamLisp.Vector/to_list v) expected) (str "contents at n=" n)))))
+
+; ── conj appends in amortized O(1) ─────────────────────────────────────────
+
+; Fold 0..n by repeated conj, checking at EVERY step that the new vector reads
+; back the element just appended and reports the new count. Returns [ok v].
+(defn- conj-check [n]
+  (loop [i 0 v (BeamLisp.Vector/new) ok true]
+    (if (= i n)
+      [ok v]
+      (let [v2 (BeamLisp.Vector/conj v i)]
+        (recur (inc i) v2
+               (and ok
+                    (= (BeamLisp.Vector/nth v2 i) i)
+                    (= (BeamLisp.Vector/count v2) (inc i))))))))
+
+(deftest conj-builds-0..n-asserting-each-step
+  (doseq [n boundaries]
+    (let [[ok v] (conj-check n)]
+      (is ok (str "conj step wrong at n=" n))
+      (is (= (BeamLisp.Vector/to_list v) (indices n)) (str "built contents at n=" n)))))
+
+(deftest conj-matches-clojure-semantics-on-lists
+  ; vector conj appends; (conj '(1 2) 3) prepends — handled in RT, here we only
+  ; assert the vector side keeps appending.
+  (is (= (BeamLisp.Vector/to_list (BeamLisp.Vector/conj (BeamLisp.Vector/new (list 1 2)) 3))
+         (list 1 2 3))))
+
+; ── persistence ────────────────────────────────────────────────────────────
+
+(deftest the-old-vector-is-unchanged-after-conj
+  (let [v (BeamLisp.Vector/new (list 1 2 3))
+        v2 (BeamLisp.Vector/conj v 4)]
+    (is (= (BeamLisp.Vector/to_list v) (list 1 2 3)))
+    (is (= (BeamLisp.Vector/to_list v2) (list 1 2 3 4)))))
+
+(deftest the-old-vector-is-unchanged-after-assoc
+  (let [v (BeamLisp.Vector/new (list 1 2 3))
+        v2 (BeamLisp.Vector/assoc v 0 :x)]
+    (is (= (BeamLisp.Vector/to_list v) (list 1 2 3)))
+    (is (= (BeamLisp.Vector/nth v2 0) :x))
+    (is (= (BeamLisp.Vector/to_list v2) (list :x 2 3)))))
+
+(deftest many-versions-coexist-and-each-stays-correct
+  (let [versions (loop [i 0 acc (list (BeamLisp.Vector/new))]
+                   (if (= i 300)
+                     acc
+                     (recur (inc i) (cons (BeamLisp.Vector/conj (first acc) i) acc))))
+        rev (reverse versions)]
+    ; every version from 0..299 is still intact and correct
+    (doseq [i (range 300)]
+      (let [v (Enum/at rev i)]
+        (is (= (BeamLisp.Vector/count v) i) (str "version " i " count"))
+        (is (= (BeamLisp.Vector/to_list v) (indices i)) (str "version " i " contents"))))))
+
+(deftest persistence-holds-across-the-tail-to-trie-flush-boundary
+  ; build 40 elements, snapshot at 31 (before the flush), keep conjing
+  (let [base (reduce (fn [acc i] (BeamLisp.Vector/conj acc i)) (BeamLisp.Vector/new) (range 31))
+        snapshot31 base
+        grown (reduce (fn [acc i] (BeamLisp.Vector/conj acc i)) base (range 31 40))]
+    (is (= (BeamLisp.Vector/count snapshot31) 31))
+    (is (= (BeamLisp.Vector/to_list snapshot31) (indices 31)))
+    (is (= (BeamLisp.Vector/to_list grown) (indices 40)))))
+
+(deftest deep-tree-persistence-snapshots-before-and-after-a-shift-overflow
+  ; the shift overflows at cnt just past 1056; snapshot just before
+  (let [before (reduce (fn [acc i] (BeamLisp.Vector/conj acc i)) (BeamLisp.Vector/new) (range 1056))
+        snap before
+        grown (reduce (fn [acc i] (BeamLisp.Vector/conj acc i)) before (range 1056 2001))]
+    (is (= (BeamLisp.Vector/count snap) 1056))
+    (is (= (BeamLisp.Vector/to_list snap) (indices 1056)))
+    (is (= (BeamLisp.Vector/to_list grown) (indices 2001)))))
+
+; ── nth ────────────────────────────────────────────────────────────────────
+
+(deftest indexed-access-returns-the-right-element-at-boundaries
+  (doseq [n boundaries]
+    (let [v (BeamLisp.Vector/new (indices n))]
+      (is (every? (fn [i] (= (BeamLisp.Vector/nth v i) i)) (indices n))
+          (str "nth at n=" n)))))
+
+(deftest out-of-range-and-negative-are-lenient-like-before
+  (let [v (BeamLisp.Vector/new (list 1 2 3))]
+    (is (= (BeamLisp.Vector/nth v 3) nil))
+    (is (= (BeamLisp.Vector/nth v -1) nil))
+    (is (= (BeamLisp.Vector/nth v 100) nil))
+    (is (= (BeamLisp.Vector/nth (BeamLisp.Vector/new) 0) nil))))
+
+(deftest a-compiler-built-literal-raw-tuple-over-32-elements-works-through-the-api
+  ; the compiler builds vector literals as %Vector{items: big-tuple}; those have
+  ; no trie wrapper and must still read/conj/assoc correctly
+  (let [raw (raw-tuple-vector (indices 41))]
+    (is (= (BeamLisp.Vector/count raw) 41))
+    (is (= (BeamLisp.Vector/nth raw 0) 0))
+    (is (= (BeamLisp.Vector/nth raw 40) 40))
+    (is (= (BeamLisp.Vector/nth raw 41) nil))
+    (is (= (BeamLisp.Vector/to_list raw) (indices 41)))
+    (let [grown (BeamLisp.Vector/conj raw 41)]
+      (is (= (BeamLisp.Vector/count grown) 42))
+      (is (= (BeamLisp.Vector/to_list grown) (indices 42)))
+      ; the raw 33+ tuple converts to a trie once it crosses 32
+      (is (= (BeamLisp.Vector/nth grown 40) 40)))
+    (let [edited (BeamLisp.Vector/assoc raw 20 :raw)]
+      (is (= (BeamLisp.Vector/nth raw 20) 20))
+      (is (= (BeamLisp.Vector/nth edited 20) :raw))
+      (is (= (BeamLisp.Vector/count edited) 41)))))
+
+(deftest nil-is-a-valid-stored-element
+  (let [v (BeamLisp.Vector/new (list nil 1 nil))]
+    (is (= (BeamLisp.Vector/nth v 0) nil))
+    (is (= (BeamLisp.Vector/nth v 1) 1))
+    (is (= (BeamLisp.Vector/nth v 2) nil))
+    (is (= (BeamLisp.Vector/count v) 3))))
+
+; ── assoc ──────────────────────────────────────────────────────────────────
+
+(deftest replace-at-an-index-keeps-other-elements
+  (let [v (BeamLisp.Vector/new (indices 100))
+        v2 (BeamLisp.Vector/assoc v 42 :deep)]
+    (is (= (BeamLisp.Vector/nth v 42) 42))
+    (is (= (BeamLisp.Vector/nth v2 42) :deep))
+    (is (= (BeamLisp.Vector/nth v2 41) 41))
+    (is (= (BeamLisp.Vector/nth v2 43) 43))
+    (is (= (BeamLisp.Vector/count v2) 100))))
+
+(deftest assoc-at-index-equal-to-count-behaves-as-conj
+  (let [v (BeamLisp.Vector/new (list 1 2 3))]
+    (is (= (BeamLisp.Vector/assoc v 3 4) (BeamLisp.Vector/conj v 4))))
+  (let [big (BeamLisp.Vector/new (indices 100))]
+    (is (= (BeamLisp.Vector/assoc big 100 :end) (BeamLisp.Vector/conj big :end)))
+    (is (= (BeamLisp.Vector/nth (BeamLisp.Vector/assoc big 100 :end) 100) :end))))
+
+(deftest assoc-out-of-range-raises
+  (let [v (BeamLisp.Vector/new (list 1 2 3))]
+    (is (refuses? :Elixir.ArgumentError "out of bounds"
+          (fn [] (BeamLisp.Vector/assoc v 4 :x)))))
+  (let [big (BeamLisp.Vector/new (indices 100))]
+    (is (refuses? :Elixir.ArgumentError "out of bounds"
+          (fn [] (BeamLisp.Vector/assoc big 101 :x))))))
+
+(deftest assoc-into-the-tail-region-of-a-trie-works
+  (let [v (BeamLisp.Vector/new (indices 1000))
+        v2 (BeamLisp.Vector/assoc v 990 :t)]
+    (is (= (Enum/at (BeamLisp.Vector/to_list v) 990) 990))
+    (is (= (BeamLisp.Vector/nth v2 990) :t))
+    (is (= (BeamLisp.Vector/count v2) 1000))))
+
+; ── first / rest / drop ────────────────────────────────────────────────────
+
+(deftest first-is-the-head-nil-on-empty
+  (is (= (BeamLisp.Vector/first (BeamLisp.Vector/new (list 1 2))) 1))
+  (is (= (BeamLisp.Vector/first (BeamLisp.Vector/new)) nil)))
+
+(deftest rest-drops-the-head-and-returns-a-list-empty-stays-empty
+  (is (= (BeamLisp.Vector/rest (BeamLisp.Vector/new (list 1 2 3))) (list 2 3)))
+  (is (= (BeamLisp.Vector/rest (BeamLisp.Vector/new (list 1))) ()))
+  (is (= (BeamLisp.Vector/rest (BeamLisp.Vector/new)) ())))
+
+(deftest rest-over-the-trie-path
+  (let [v (BeamLisp.Vector/new (indices 100))]
+    (is (= (BeamLisp.Vector/rest v) (to-list (range 1 100))))
+    (is (= (BeamLisp.Vector/rest (BeamLisp.Vector/new (list 1))) ()))))
+
+(deftest drop-returns-a-list
+  (is (= (BeamLisp.Vector/drop (BeamLisp.Vector/new (list 1 2 3)) 1) (list 2 3)))
+  (is (= (BeamLisp.Vector/drop (BeamLisp.Vector/new (indices 100)) 90) (to-list (range 90 100)))))
+
+; ── Enumerable interop ─────────────────────────────────────────────────────
+
+(deftest enum-works-over-small-and-trie-backed-vectors
+  (let [small (BeamLisp.Vector/new (list 1 2 3))]
+    (is (= (Enum/to_list small) (list 1 2 3)))
+    (is (= (Enum/count small) 3))
+    (is (Enum/member? small 2))
+    (is (not (Enum/member? small 9)))
+    (is (= (Enum/sum small) 6)))
+  (let [big (BeamLisp.Vector/new (indices 10000))]
+    (is (= (Enum/count big) 10000))
+    (is (= (Enum/sum big) (reduce (fn [a b] (+ a b)) 0 (range 10000))))
+    (is (Enum/member? big 9999))
+    (is (= (Enum/to_list big) (indices 10000)))))
+
+(deftest reduce-is-a-chunked-walk-not-nth-in-a-loop
+  (let [big (BeamLisp.Vector/new (indices 10000))]
+    (is (= (reduce (fn [acc x] (+ acc x)) 0 big) 49995000))))
+
+(deftest count-is-o-1
+  (let [v (BeamLisp.Vector/new (indices 10000))]
+    (is (= (BeamLisp.Vector/count v) 10000))))
+
+; ── vectors are not lists ──────────────────────────────────────────────────
+
+(deftest the-struct-name-is-stable-and-pattern-matchable
+  (let [v (BeamLisp.Vector/conj (BeamLisp.Vector/new (list 1)) 2)]
+    (is (erlang/== :Elixir.BeamLisp.Vector (erlang/map_get :__struct__ v)))
+    (is (not (list? v)))
+    (is (= (BeamLisp.Vector/to_list v) (list 1 2)))))
+
+; ── benchmark (the ExUnit `@tag :bench` case) ───────────────────────────────
+; 100k conj build, then 100k scattered reads, crossing the root-overflow depth
+; the boundary walks above stop short of. The `.exs` seeded `:rand`; a fixed
+; modular scatter keeps the read order deterministic without pulling in the RNG
+; — the property under test (every read returns a real element from the deep
+; trie) is the same.
+
+(deftest benchmark-100k-conj-build-and-100k-reads
+  ; Eager on purpose: a lazy read seq is O(n²) to force through this runtime's
+  ; seq cursor, which measures the cursor rather than the vector.
+  (let [n 100000
+        v (reduce (fn [acc i] (BeamLisp.Vector/conj acc i)) (BeamLisp.Vector/new) (range n))
+        missing (reduce (fn [acc i]
+                          (if (nil? (BeamLisp.Vector/nth v (mod (* i 7919) n)))
+                            (inc acc)
+                            acc))
+                        0 (range n))]
+    (is (= (BeamLisp.Vector/count v) n))
+    (is (= missing 0))))

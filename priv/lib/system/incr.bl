@@ -87,14 +87,85 @@
 
 (defn body-hash
   "A content hash of a fn body's STRUCTURE, position- AND rename-independent.
-   Same proof ⇒ same hash ⇒ cache hit. Two bodies that differ only in
+   Same normalized proof ⇒ same hash; hits still require full identity equality. Two bodies that differ only in
    whitespace, comments, or gensym'd variable names hash identically."
   [body]
   (erlang/phash2 (alpha-rename (atom {}) (strip-ann body))))
 
+; ── every clause, not just the first ─────────────────────────────────────
+;
+; `analyze/fn-bodies` hands back `{:params :body :clauses [{:params :body} …]}`.
+; A multi-arity/multi-clause defn summarises over ALL its clauses, so its cache
+; key must too: hashing only the first body would let an edit in a later arity
+; reuse a stale summary. `<top>` and legacy first-body maps carry no :clauses;
+; they normalise to the one clause they hold, so external first-body input
+; stays accepted.
+
+(defn clauses-of
+  "Every `{:params :body}` clause of a fn-bodies entry `d`, in order. A
+   single-body entry (`<top>`, a legacy `{:params :body}` map) yields the one
+   clause it carries."
+  [d]
+  (if (seq (:clauses d)) (:clauses d) [{:params (:params d) :body (:body d)}]))
+
+(defn fn-identity
+  "Normalized identity of a fn-bodies entry `d`: EVERY clause's body, with its
+   arity, in order. A `body-hash` over the first clause alone misses an edit in
+   a later arity — the stale summary would be reused over a changed body — and
+   omits the arity, so a later clause could be conflated with an earlier one."
+  [d]
+  (into []
+      (map (fn [c]
+             ; Bind canonical parameter identities BEFORE walking uses. First-use
+             ; renaming alone conflates (f [a b] a) with (f [a b] b).
+             (let [bindings (into {} (map-indexed (fn [i p] [p (str "p" i)]) (:params c)))]
+               [(count (:params c))
+                (alpha-rename (atom bindings) (strip-ann (:body c)))]))
+           (clauses-of d))))
+
+(defn fn-hash
+  "A lookup hint for normalized structure; hash equality is NEVER authority."
+  [d]
+  (erlang/phash2 (fn-identity d)))
+
+(defn evidence-generation []
+  (try (BeamLisp.Env/namespace_generations
+         (list "core" "sugar" "rt" "compiler" "body" "anf" "lower" "reader"
+               "typed" "system.ir" "system.summary" "system.footprint"
+               "system.analyze" "system.incr" "termination"))
+       (catch _ nil)))
+
+(defn- flow-names [d]
+  ;; Alpha-equivalent summaries may contain concrete [:flow var] keys. Those
+  ;; keys can only be reused with the same binding names, not a renamed IR.
+  (into #{} (filter (fn [k] (and (vector? k) (= :flow (first k))))
+                    (mapcat (fn [cl] (summary/calls-in (:body cl))) (clauses-of d)))))
+
+(defn- join-summaries
+  "Union two clause summaries, the same join system.analyze performs for a
+   multi-clause fn: footprint joins on the mode lattice; terminates is the
+   CONJUNCTION (a fn halts only if every clause halts); returns and calls are
+   unions — a later clause can never read as an absence."
+  [a b]
+  (cond
+    (nil? a) b
+    (nil? b) a
+    :else {:footprint  (fp/join-fp (:footprint a) (:footprint b))
+           :terminates (and (:terminates a) (:terminates b))
+           :returns    (into (:returns a) (:returns b))
+           :calls      (into (:calls a) (:calls b))}))
+
+(defn- summarize-fn
+  "The fn's summary as the union over ALL its clauses — the reading
+   system.analyze makes, so a multi-arity fn's cached summary covers every
+   arity."
+  [known fp-resolve d]
+  (reduce (fn [acc c] (join-summaries acc (summary/summarize known fp-resolve (:body c))))
+          nil (clauses-of d)))
+
 ; ── the incremental analyzer ──────────────────────────────────────────────
 ;
-; A cache is {fn-name → {:hash h :summary s}}. `analyze-incremental` takes the
+; A cache is {fn-name → {:hash h :identity identity :flow-names flows :generation generation :summary s}}. `analyze-incremental` takes the
 ; previous cache and new source; for each fn it hashes the body and reuses the
 ; cached summary on a hit, recomputing only on a miss. It returns the new
 ; summaries AND a report of which fns were hits vs misses — the proof that an
@@ -111,22 +182,25 @@
    that makes that fixpoint cheap."
   [cache src]
   (let [bodies (analyze/fn-bodies src)
-        known {}]
+        known {} generation (evidence-generation)]
     (reduce
       (fn [acc [name d]]
-        (let [h (body-hash (:body d))
-              cached (get cache name)]
-          (if (and cached (= (:hash cached) h))
+        (let [identity (fn-identity d) h (erlang/phash2 identity)
+              flows (flow-names d) cached (get cache name)]
+          (if (and generation cached (= (:hash cached) h)
+                   (= (:identity cached) identity) (= (:flow-names cached) flows)
+                   (= (:generation cached) generation))
             ; cache hit — reuse the summary, no proof work
             (-> acc
                 (assoc-in [:summaries name] (:summary cached))
                 (assoc-in [:cache name] cached)
                 (update :hits conj name))
             ; miss — recompute this fn's summary
-            (let [s (summary/summarize known fp/no-resolver (:body d))]
+            (let [s (summarize-fn known fp/no-resolver d)]
               (-> acc
                   (assoc-in [:summaries name] s)
-                  (assoc-in [:cache name] {:hash h :summary s})
+                  (assoc-in [:cache name] {:hash h :identity identity :flow-names flows
+                                          :generation generation :summary s})
                   (update :misses conj name))))))
       {:summaries {} :cache {} :hits [] :misses []}
       (into [] bodies))))
@@ -170,3 +244,40 @@
   [summaries misses]
   (dependents (reverse-graph (analyze/call-graph summaries)) misses))
 
+
+(defn analyze-program
+  "Collision-safe whole-program incremental closure. Reuses raw round summaries
+   only outside the transitive dirty cone in BOTH old and new dependency graphs.
+   Deletions, function values and changed flow/shadowing evidence are covered.
+   Compilation/flow and latent closure still run; :hits counts reused function
+   round summaries, not skipped parsing or a fully incremental compiler."
+  [cache src]
+  (let [program (analyze/prepare-program src) bodies (:bodies program)
+        identities (into {} (map (fn [[n d]] [n (fn-identity d)]) bodies))
+        generation (evidence-generation)
+        valid (and generation (= :whole-program-v1 (:kind cache))
+                   (= generation (:generation cache)))
+        old-identities (if valid (:identities cache) {})
+        removed (set (filter (fn [n] (not (contains? identities n))) (keys old-identities)))
+        changed (set (filter (fn [n] (not= (get identities n) (get old-identities n))) (keys identities)))
+        graph (analyze/dependency-graph program)
+        evidence-changed (or (not valid)
+                             (not= (set (filter fp/pure-value-globals (:shadowed program)))
+                                   (set (filter fp/pure-value-globals (:shadowed cache))))
+                             (not= (:flow program) (:flow cache)))
+        graph-changed (set (filter (fn [n] (not= (get graph n) (get (:graph cache) n))) (keys graph)))
+        seeds (if evidence-changed (set (keys identities)) (into (into changed removed) graph-changed))
+        old-dirty (dependents (reverse-graph (or (:graph cache) {})) seeds)
+        dirty (dependents (reverse-graph graph) old-dirty)
+        result (analyze/analyze-prepared program (if valid (:locals cache) {}) dirty)
+        after (evidence-generation)
+        stable (and generation (= generation after))
+        next-cache (when stable {:kind :whole-program-v1 :generation generation :identities identities
+                                :graph graph :flow (:flow program) :shadowed (:shadowed program)
+                                :locals (:locals result)})]
+    {:summaries (:summaries result) :cache (or next-cache {}) :dirty dirty :removed removed
+     :hits (vec (sort (filter (fn [n] (not (contains? dirty n))) (keys bodies))))
+     :misses (vec (sort (filter (fn [n] (contains? dirty n)) (keys bodies))))
+     :rounds (:rounds result)
+     :summaries-evaluated (* (:rounds result) (count (filter (fn [n] (contains? dirty n)) (keys bodies))))
+     :stable? stable}))

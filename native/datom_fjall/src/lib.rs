@@ -42,8 +42,11 @@
 
 use rustler::{Atom, Binary, Encoder, Env, Error, NifResult, OwnedBinary, Resource, ResourceArc, Term};
 use rustler::types::map::map_new;
+use std::collections::HashMap;
+use std::fs::{self, File, TryLockError};
 use std::io::Write;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 
@@ -59,6 +62,7 @@ mod atoms {
         delete,
         columns,
         datoms,
+        datoms_reverse = "datoms-reverse",
         pairs,
         // The boolean lane's decoded terms. The trailing underscore is a Rust
         // keyword accident, not part of the atom: without the alias rustler
@@ -89,6 +93,14 @@ mod atoms {
         journal_bytes,
         disk_bytes,
         partitions,
+        // The tag `fjall_open` refuses with when the store's directory is
+        // already held by an exclusive OS lock. It is what makes that refusal
+        // a TYPED answer — `{:error, {:already_open, path}}` — and therefore
+        // distinguishable from every `err()` reply, which is a binary
+        // describing an I/O or engine failure. "Another process owns this
+        // store" is not "this store is broken", and a caller has to be able
+        // to tell them apart.
+        already_open,
     }
 }
 
@@ -101,7 +113,158 @@ mod atoms {
 pub(crate) struct DbHandle {
     pub(crate) keyspace: Keyspace,
     pub(crate) datoms: PartitionHandle,
-    pub(crate) lock: Mutex<()>,
+    /// Serializes `-cas` and each write batch. SHARED, because two handles over
+    /// one store directory are two views of ONE engine: the lock that makes a
+    /// read-modify-write atomic belongs to the store, not to whichever handle
+    /// happened to open it.
+    pub(crate) lock: Arc<Mutex<()>>,
+    /// The exclusive ownership of this store's directory. Declared LAST so it
+    /// drops after this handle's own `keyspace`/`datoms`/`lock` clones. Holding
+    /// the flock THROUGH the engine's teardown is not this ordering's job: it
+    /// lives inside `StoreClaim`, whose `engine` field precedes its `_lock`
+    /// (see RELEASE ORDER there).
+    _claim: Arc<StoreClaim>,
+}
+
+/// The one open engine over a store directory, shared by every handle in this
+/// image that opens that directory.
+struct StoreEngine {
+    keyspace: Keyspace,
+    datoms: PartitionHandle,
+    lock: Arc<Mutex<()>>,
+}
+
+/// The process-wide claim on ONE canonical store directory.
+///
+/// WHY THIS EXISTS. fjall takes no lock of its own, so two OS processes
+/// opening one keyspace directory write the same segment files: a CORRUPTION,
+/// not a slower read. The datom layer already serialises writers WITHIN a
+/// process (`datom.conn`'s single-transactor registry), but nothing stopped a
+/// second process — a store root is a directory a user can point two `bl
+/// serve`s at, and a stale owner is indistinguishable from an absent one until
+/// the segment files are already interleaved.
+///
+/// WHAT IT IS. A directory-level `flock(2)` — the standard exclusive OS lock,
+/// taken through `std::fs::File::try_lock` — held for as long as the handle
+/// that took it. There is no lock FILE, so there is nothing to leave behind
+/// and no PID to compare: the kernel drops the lock when the fd closes, which
+/// is either the resource's drop (a normal close) or the process's death (a
+/// crash, a SIGKILL). No stale-lock heuristic exists to get wrong.
+///
+/// Because the lock is on the INODE, a symlink, a relative path or a `..`
+/// alias reaches the same lock. The path is `canonicalize`d before the claim
+/// so that the registry below agrees with the kernel about which directory is
+/// which — one identity for the map, the flock and the engine.
+///
+/// Reuse inside one PROCESS is not refused, and does not open a second engine.
+/// `datom.conn`'s own semantics let a store be opened more than once in one
+/// image (a probe handle, a reconnect), and the honest reading is that those
+/// are two VIEWS of one store — so a same-process open joins this claim and
+/// shares this engine. (A second `flock` on a fresh fd would be refused even
+/// here: the lock belongs to the open file description, not to the process, so
+/// the registry is what makes the distinction the kernel cannot make.)
+///
+/// RELEASE ORDER — the reason these two fields are in this order. Rust drops a
+/// struct's fields in DECLARATION order, and the order that is correct here is
+/// `engine` FIRST and `_lock` LAST. Engine teardown is not a no-op: fjall's
+/// `Keyspace` drop stops and JOINS its background flush/compaction threads
+/// (which may be mid-flush, writing segment files) and its journal drop
+/// persists with `PersistMode::SyncAll`. Releasing the flock first leaves the
+/// directory unowned for exactly that window — the corruption this type exists
+/// to prevent, reopened at the one moment a second owner is most likely to
+/// appear (the old one's shutdown). The unit test at the foot of this file
+/// pins the order against THIS declaration: it builds the same `StoreClaim<E>`
+/// production declares, with a recording engine, so swapping the two fields
+/// fails a test rather than only a comment.
+///
+/// `E` is that engine — `StoreEngine` in production, the recording stand-in in
+/// the test. The parameter exists so the order under test is the real type's
+/// release order, not a copy of it kept in sync by hand.
+struct StoreClaim<E = StoreEngine> {
+    /// The one engine over this directory, shared by every handle that joins
+    /// this claim. Declared FIRST so it drops FIRST — see RELEASE ORDER above.
+    engine: E,
+    /// The fd whose `flock` IS the ownership. Dropping this claim — the LAST
+    /// `Arc` — closes it and releases the lock, so it is declared LAST: the
+    /// directory stays ours until the engine over it is gone.
+    _lock: File,
+}
+
+/// Canonical path → a WEAK claim. Weak, not strong, so the registry never
+/// keeps a store alive: an entry dies with its last handle, and THAT death is
+/// what releases the flock, while a dead `Weak` left behind is simply a miss
+/// on the next open. A dead entry is PRUNED, not merely tolerated: every
+/// `claim_store` retains only the live entries under this same lock before it
+/// looks one up, so the map is bounded by the stores actually open rather than
+/// by every store the process has ever opened (the codebase cache opens one
+/// scratch store per namespace and content hash, and a per-request store would
+/// otherwise grow this map for the life of the process).
+fn claims() -> &'static Mutex<HashMap<PathBuf, Weak<StoreClaim>>> {
+    static CLAIMS: OnceLock<Mutex<HashMap<PathBuf, Weak<StoreClaim>>>> = OnceLock::new();
+    CLAIMS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Why a store could not be claimed.
+enum ClaimError {
+    /// The directory exists and someone else owns it — another process, or a
+    /// lock that outlived the handle that took it.
+    Held(PathBuf),
+    /// The path could not be created, canonicalized, or opened.
+    Io(std::io::Error),
+    /// The directory is ours, but the engine over it would not open.
+    Engine(fjall::Error),
+}
+
+/// Take (or join) the exclusive claim on `path`'s directory, opening the one
+/// engine if this is the first handle for it.
+///
+/// The claim and its engine are created under ONE lock, before any caller can
+/// see either: a same-process open of the same directory must join this claim
+/// rather than take a `flock` of its own, which the OS would refuse — the lock
+/// is on the open file description, so a second fd in the SAME process is a
+/// second owner as far as the kernel is concerned.
+///
+/// The claim is taken BEFORE the engine opens: two processes racing to create
+/// the same store must not both reach `Config::open`, or the loser has already
+/// begun writing segments it must not touch. A flock taken and then abandoned
+/// by a failed open is released when its `File` drops.
+fn claim_store(path: &Path) -> Result<Arc<StoreClaim>, ClaimError> {
+    // The directory must exist to be canonicalized and opened. fjall creates
+    // it too, later, when it is already ours.
+    fs::create_dir_all(path).map_err(ClaimError::Io)?;
+    // Collapse symlinks, relative paths and trailing separators to the one
+    // real directory, so the map keys the same way the kernel's flock does.
+    let canon = fs::canonicalize(path).map_err(ClaimError::Io)?;
+    let mut claims = claims().lock().unwrap_or_else(|e| e.into_inner());
+    // A DEAD entry is a MISS, not a claim — but it is not left to rot either.
+    // Dropping the dead ones here (we hold the lock, so the sweep is free)
+    // bounds the registry by the stores that are open rather than by every
+    // store ever opened, and it runs BEFORE the lookup so the entry consulted
+    // below is either live or absent.
+    claims.retain(|_, w| w.strong_count() > 0);
+    if let Some(claim) = claims.get(&canon).and_then(Weak::upgrade) {
+        return Ok(claim);
+    }
+    let dir = File::open(&canon).map_err(ClaimError::Io)?;
+    match dir.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return Err(ClaimError::Held(canon)),
+        Err(TryLockError::Error(e)) => return Err(ClaimError::Io(e)),
+    }
+    let keyspace = Config::new(&canon).open().map_err(ClaimError::Engine)?;
+    let datoms = keyspace
+        .open_partition("datoms", PartitionCreateOptions::default())
+        .map_err(ClaimError::Engine)?;
+    let claim = Arc::new(StoreClaim {
+        _lock: dir,
+        engine: StoreEngine {
+            keyspace,
+            datoms,
+            lock: Arc::new(Mutex::new(())),
+        },
+    });
+    claims.insert(canon, Arc::downgrade(&claim));
+    Ok(claim)
 }
 
 #[rustler::resource_impl]
@@ -123,18 +286,70 @@ fn to_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Binary<'a>> {
 /// An empty database and a missing partition are the same thing to every
 /// caller above, so the partition is created eagerly: a read against a
 /// brand-new database sees an empty partition, never a "no such partition".
+///
+/// EXCLUSIVE OWNERSHIP FIRST. The claim (`StoreClaim`) is taken before the
+/// engine is opened and is held until this handle drops, so a second OS process
+/// is refused a store that is already being written. The refusal is TYPED —
+/// `{:error, {:already_open, canonical-path}}` — and not the binary `err()` an
+/// I/O failure carries: "another process owns this store" is a different answer
+/// from "this store is broken", and the caller must be able to choose between
+/// them. A claim taken and then abandoned by a failed open is released when its
+/// `File` drops.
+///
+/// A SECOND handle for the same directory in the SAME process JOINS the claim
+/// and shares its engine and write lock, so it is a view of one store rather
+/// than a second LSM instance over the same segment files.
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_open<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
-    let keyspace = Config::new(&path).open().map_err(|e| err(e))?;
-    let datoms = keyspace
-        .open_partition("datoms", PartitionCreateOptions::default())
-        .map_err(|e| err(e))?;
+    let claim = match claim_store(Path::new(&path)) {
+        Ok(claim) => claim,
+        Err(ClaimError::Held(canon)) => {
+            return Err(Error::Term(Box::new((
+                atoms::already_open(),
+                canon.to_string_lossy().into_owned(),
+            ))))
+        }
+        Err(ClaimError::Io(e)) => return Err(err(e)),
+        Err(ClaimError::Engine(e)) => return Err(err(e)),
+    };
     let arc = ResourceArc::new(DbHandle {
-        keyspace,
-        datoms,
-        lock: Mutex::new(()),
+        keyspace: claim.engine.keyspace.clone(),
+        datoms: claim.engine.datoms.clone(),
+        lock: claim.engine.lock.clone(),
+        _claim: claim,
     });
     Ok(arc.encode(env))
+}
+
+/// `fjall_canonical_path`: the ONE directory a store path REFERS TO — the
+/// identity the claim's flock, the registry and the engine are all keyed by.
+///
+/// WHY IT IS A NIF. This is a realpath question and bl's `File` surface has no
+/// realpath: `fs::canonicalize` collapses a symlink, a `..`, a trailing
+/// separator and a relative path onto the one real directory, which is what
+/// lets the claim agree with the kernel (the flock is on the inode) about
+/// which directory a store IS.
+///
+/// WHY IT IS EXPOSED. The claim already canonicalizes for the flock; the bl
+/// layer derives TWO more things from a store's path — the record's `:path`
+/// and the blob sibling `<path>.blobs` — and after this commit a same-process
+/// open through an alias is no longer refused, it JOINS the claim. If the
+/// record kept the caller's spelling, those two spellings would share one datom
+/// log and yet write their bytes to two different sibling directories, so a
+/// datom read through the alias would name a blob only the other spelling can
+/// find. Asking the same canonicalization native here is what makes `:path`,
+/// the blob dir, the engine and the flock one identity.
+///
+/// Creates the directory first, exactly as `fjall-open` does, so a brand-new
+/// store canonicalizes rather than failing. Returns the canonical path, or
+/// `{:error, reason}` — the same shape every other native failure takes — so a
+/// caller handles it the way it already handles a `fjall-open` failure.
+#[rustler::nif]
+fn fjall_canonical_path<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
+    let p = Path::new(&path);
+    fs::create_dir_all(p).map_err(|e| err(e))?;
+    let canon = fs::canonicalize(p).map_err(|e| err(e))?;
+    Ok(to_binary(env, canon.to_string_lossy().as_bytes())?.to_term(env))
 }
 
 /// `-get`: the value at `key`, or `nil`.
@@ -356,6 +571,81 @@ struct Row<'a> {
     legacy: Option<&'a [u8]>,
 }
 
+/// Admission only, not a second decoder. Recognize finite uncompressed ETF
+/// before calling the existing BEAM decoder. The bounded envelope helper first
+/// charges and normalizes compression. Functions, references, ports and pids
+/// have no certificate here. This term-tree walk allocates no payload.
+/// https://www.erlang.org/doc/apps/erts/erl_ext_dist.html
+fn finite_etf_charge(bytes: &[u8]) -> Option<usize> {
+    struct Check<'a> { bytes: &'a [u8], pos: usize }
+    impl Check<'_> {
+        fn take(&mut self, n: usize) -> Option<&[u8]> {
+            let end = self.pos.checked_add(n)?;
+            let out = self.bytes.get(self.pos..end)?;
+            self.pos = end;
+            Some(out)
+        }
+        fn byte(&mut self) -> Option<u8> { Some(self.take(1)?[0]) }
+        fn u16(&mut self) -> Option<usize> {
+            Some(u16::from_be_bytes(self.take(2)?.try_into().ok()?) as usize)
+        }
+        fn u32(&mut self) -> Option<usize> {
+            Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?) as usize)
+        }
+        fn terms(&mut self, n: usize, depth: usize) -> Option<()> {
+            // Even NIL uses one byte. A hostile arity cannot create a long loop.
+            if n > self.bytes.len().checked_sub(self.pos)? { return None; }
+            for _ in 0..n { self.term(depth + 1)?; }
+            Some(())
+        }
+        fn term(&mut self, depth: usize) -> Option<()> {
+            if depth > 128 { return None; }
+            match self.byte()? {
+                97 => { self.take(1)?; }                  // SMALL_INTEGER_EXT
+                98 => { self.take(4)?; }                  // INTEGER_EXT
+                70 => { self.take(8)?; }                  // NEW_FLOAT_EXT
+                99 => { self.take(31)?; }                 // FLOAT_EXT
+                106 => {}                                // NIL_EXT
+                100 | 118 | 107 => {                      // atom / utf8 / string
+                    let n = self.u16()?; self.take(n)?;
+                }
+                115 | 119 => {
+                    let n = self.byte()? as usize; self.take(n)?;
+                }
+                109 => { let n = self.u32()?; self.take(n)?; }
+                77 => {                                  // BIT_BINARY_EXT
+                    let n = self.u32()?; let bits = self.byte()?;
+                    if !(1..=8).contains(&bits) { return None; }
+                    self.take(n)?;
+                }
+                104 => { let n = self.byte()? as usize; self.terms(n, depth)?; }
+                105 => { let n = self.u32()?; self.terms(n, depth)?; }
+                116 => { let n = self.u32()?.checked_mul(2)?; self.terms(n, depth)?; }
+                108 => {
+                    let n = self.u32()?; self.terms(n, depth)?;
+                    self.term(depth + 1)?;                // proper or finite tail
+                }
+                110 | 111 => {
+                    let tag = self.bytes[self.pos - 1];
+                    let n = if tag == 110 { self.byte()? as usize } else { self.u32()? };
+                    if self.byte()? > 1 { return None; }
+                    self.take(n)?;
+                }
+                _ => return None,
+            }
+            Some(())
+        }
+    }
+    let mut check = Check { bytes, pos: 0 };
+    if check.byte()? != ETF_VERSION { return None; }
+    check.term(0)?;
+    if check.pos != bytes.len() { return None; }
+    // At least one tag per node; 64x conservatively covers list cells, map/tuple
+    // metadata, boxed numbers and retained input bytes. Fixed row overhead is
+    // charged separately. The byte budget is checked before BEAM allocation.
+    bytes.len().checked_mul(64)
+}
+
 /// Read the datom payload at `val` into its fields by offset.
 ///
 /// Every malformed shape is an ERROR naming the reason: a store that holds an
@@ -483,8 +773,60 @@ impl VectorShape {
 /// exactly like this, so reading a store has always created its atoms: this is
 /// parity with the existing path, not a new exposure. The bytes come from our
 /// own value slot, under our own key space, written by our own writer.
+fn inflate_stored_etf(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    if bytes.len() < 6 || bytes[..2] != [ETF_VERSION, 80] {
+        return Err("invalid compressed ETF header".into());
+    }
+    let size = u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize;
+    let mut inflater = flate2::bufread::ZlibDecoder::new(&bytes[6..]);
+    let mut out = Vec::with_capacity(size.min(65536).saturating_add(1));
+    out.push(ETF_VERSION);
+    // A corrupt length never causes an upfront giant allocation or permits
+    // expansion past its header. This path has the existing trusted-reader
+    // contract; bounded pages still refuse compression before calling it.
+    inflater.by_ref().take(size as u64 + 1).read_to_end(&mut out)
+        .map_err(|e| format!("invalid compressed ETF: {}", e))?;
+    if out.len() != size + 1 || inflater.total_in() as usize != bytes.len() - 6 {
+        return Err("compressed ETF length or stream boundary mismatch".into());
+    }
+    Ok(out)
+}
+
+#[derive(Debug, PartialEq)]
+enum BoundedEtf<'a> {
+    Admitted { charge: usize, payload: std::borrow::Cow<'a, [u8]> },
+    Limited,
+    Opaque,
+}
+
+/// Charge advertised expansion before inflation. Then prove the resulting
+/// finite term tree before any BEAM decode. The normal input remains borrowed.
+fn bounded_finite_etf(bytes: &[u8], available: usize) -> Result<BoundedEtf<'_>, String> {
+    let compressed = bytes.starts_with(&[ETF_VERSION, 80]);
+    let size = if compressed {
+        if bytes.len() < 6 { return Ok(BoundedEtf::Opaque); }
+        (u32::from_be_bytes(bytes[2..6].try_into().unwrap()) as usize).checked_add(1)
+    } else { Some(bytes.len()) };
+    let Some(charge) = size.and_then(|n| n.checked_mul(64)) else {
+        return Ok(BoundedEtf::Opaque);
+    };
+    if charge > available { return Ok(BoundedEtf::Limited); }
+    let payload = if compressed {
+        std::borrow::Cow::Owned(inflate_stored_etf(bytes)?)
+    } else { std::borrow::Cow::Borrowed(bytes) };
+    if finite_etf_charge(&payload).is_none() { return Ok(BoundedEtf::Opaque); }
+    Ok(BoundedEtf::Admitted { charge, payload })
+}
+
 fn decode_stored<'a>(env: Env<'a>, bytes: &[u8], what: &str) -> NifResult<Term<'a>> {
-    unsafe { env.binary_to_term_trusted(bytes) }
+    // The NIF decoder does not accept this compressed form on the deployed
+    // runtime. Normalize its envelope, then use the very same term decoder.
+    let inflated = if bytes.starts_with(&[ETF_VERSION, 80]) {
+        Some(inflate_stored_etf(bytes).map_err(|e| err(format!("{}: {}", what, e)))?)
+    } else { None };
+    let payload = inflated.as_deref().unwrap_or(bytes);
+    unsafe { env.binary_to_term_trusted(payload) }
         .map(|(term, _)| term)
         .ok_or_else(|| err(format!("{} did not decode", what)))
 }
@@ -706,20 +1048,29 @@ fn fjall_resolve_chunk<'a>(
     after: Option<Binary>,
     stop: Option<Binary>,
     limit: usize,
-    mode: Atom,
+    mode: Term<'a>,
 ) -> NifResult<Term<'a>> {
     use std::ops::Bound;
+    let (mode, byte_budget) = match mode.decode::<Atom>() {
+        Ok(atom) => (atom, None),
+        Err(_) => {
+            let (atom, budget) = mode.decode::<(Atom, usize)>()?;
+            (atom, Some(budget))
+        }
+    };
+    let reverse = mode == atoms::datoms_reverse();
     let lower = match (&start, &after) {
         (Some(b), _) => Bound::Included(b.as_slice().to_vec()),
-        (None, Some(b)) => Bound::Excluded(b.as_slice().to_vec()),
-        (None, None) => Bound::Unbounded,
+        (None, Some(b)) if !reverse => Bound::Excluded(b.as_slice().to_vec()),
+        _ => Bound::Unbounded,
     };
-    let upper = match &stop {
-        Some(b) => Bound::Included(b.as_slice().to_vec()),
-        None => Bound::Unbounded,
+    let upper = match (reverse, &after, &stop) {
+        (true, Some(b), _) => Bound::Excluded(b.as_slice().to_vec()),
+        (_, _, Some(b)) => Bound::Included(b.as_slice().to_vec()),
+        _ => Bound::Unbounded,
     };
     let want_columns = mode == atoms::columns();
-    let want_datoms = mode == atoms::datoms();
+    let want_datoms = mode == atoms::datoms() || reverse;
     let want_pairs = mode == atoms::pairs();
     if !want_columns && !want_datoms && !want_pairs {
         return Err(err("resolve mode must be :datoms, :columns or :pairs"));
@@ -730,18 +1081,68 @@ fn fjall_resolve_chunk<'a>(
     let mut cols = Columns::new();
     let mut last_key: Option<Vec<u8>> = None;
     let shape = VectorShape::new(env)?;
+    let mut charged_bytes = 0usize;
+    let mut byte_limited = false;
+    let mut opaque_value = false;
 
-    for entry in handle.datoms.range((lower, upper)).take(limit) {
+    let range = handle.datoms.range((lower, upper));
+    let entries: Box<dyn Iterator<Item = _>> = if reverse {
+        Box::new(range.rev())
+    } else {
+        Box::new(range)
+    };
+    for entry in entries.take(limit) {
         let (k, v) = entry.map_err(|e| err(e))?;
+        let mut normalized_storage: Option<Vec<u8>> = None;
+        if let Some(budget) = byte_budget {
+            let row = read_row(&v)?;
+            let etf = row.legacy.or_else(|| {
+                if row.v.first() == Some(&LANE_ESC) { Some(&row.v[1..]) } else { None }
+            });
+            let base = 1024usize.saturating_add(k.len()).saturating_add(v.len());
+            let available = budget.saturating_sub(charged_bytes);
+            if base > available {
+                byte_limited = true;
+                break;
+            }
+            let extra = if let Some(bytes) = etf {
+                match bounded_finite_etf(bytes, available - base).map_err(err)? {
+                    BoundedEtf::Limited => { byte_limited = true; break; }
+                    BoundedEtf::Opaque => { opaque_value = true; break; }
+                    BoundedEtf::Admitted { charge, payload } => {
+                        if let std::borrow::Cow::Owned(payload) = payload {
+                            // Keep the normalized finite bytes through decoding:
+                            // a compressed row is inflated exactly once.
+                            normalized_storage = Some(if row.legacy.is_some() {
+                                payload
+                            } else {
+                                let prefix = row.v.as_ptr() as usize - v.as_ptr() as usize;
+                                let mut packed = v[..prefix + 1].to_vec();
+                                packed.extend_from_slice(&payload);
+                                packed
+                            });
+                        }
+                        charge
+                    }
+                }
+            } else if matches!(row.v.first(), Some(&LANE_LONG | &LANE_BOOL | &LANE_STR | &LANE_KW | &LANE_FLOAT)) {
+                0
+            } else {
+                opaque_value = true;
+                break;
+            };
+            charged_bytes += base + extra;
+        }
+        let storage = normalized_storage.as_deref().unwrap_or(&v);
         if want_pairs {
             // The port's `-range` holds ARBITRARY values (counters, blobs and
             // datoms share the keyspace), so this mode must not require a datom
             // shape — that is the `:datoms`/`:columns` contract, not the port's.
             let key = to_binary(env, &k)?.to_term(env);
-            let value = slot_term(env, &v, &shape)?;
+            let value = slot_term(env, storage, &shape)?;
             pairs.push(shape.vector(env, &[key, value])?);
         } else {
-            let row = read_row(&v)?;
+            let row = read_row(storage)?;
             if want_datoms {
                 datoms.push(datom_term(env, &row, &shape)?);
             } else {
@@ -754,6 +1155,9 @@ fn fjall_resolve_chunk<'a>(
     let out = map_new(env);
     let n = if want_columns { cols.n } else if want_datoms { datoms.len() } else { pairs.len() };
     let out = out.map_put("n", n as u64)?;
+    let out = out.map_put("bytes", charged_bytes as u64)?
+        .map_put("byte-limited", byte_limited)?
+        .map_put("opaque-value", opaque_value)?;
     let out = match &last_key {
         Some(k) => out.map_put("last", to_binary(env, k)?)?,
         None => out.map_put("last", atoms::nil().to_term(env))?,
@@ -1172,5 +1576,187 @@ fn __nif_loaded__() -> bool {
 
 rustler::init!("Elixir.BeamLisp.Native.Datom.StoreFjall");
 
+// ══ the claim's release order and registry lifetime, pinned ══════════
+//
+// The correctness argument for `StoreClaim`'s field order is at its definition.
+// These tests hold it to that argument. They build the SAME generic declaration
+// production builds — only the engine type is swapped for a recorder — so they
+// observe the real release order, and they drive `claim_store` itself, so the
+// pruning is the behaviour of the function that takes claims, not a restatement
+// of `retain`.
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A fresh, unique directory under the system temp dir, created, so a test
+    /// never inherits a store (or its flock) from a previous run.
+    fn tmp_dir(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "datom-fjall-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create the temp store dir");
+        dir
+    }
+
+    /// An engine whose whole job is to look, at the instant it drops, at
+    /// whether the claim's flock is still held.
+    struct ProbeEngine {
+        dir: PathBuf,
+        held_at_drop: Rc<Cell<Option<bool>>>,
+    }
+
+    impl Drop for ProbeEngine {
+        fn drop(&mut self) {
+            // A second `open` + `try_lock` in THIS process is a second OPEN
+            // FILE DESCRIPTION, so it conflicts with the claim's flock exactly
+            // as another process's would — a flock belongs to the description,
+            // not to the process. `WouldBlock` therefore means the directory is
+            // still ours, which can only be true if `_lock` drops AFTER this
+            // field does.
+            let probe = File::open(&self.dir).expect("reopen the store dir to probe it");
+            let still_ours = matches!(probe.try_lock(), Err(TryLockError::WouldBlock));
+            self.held_at_drop.set(Some(still_ours));
+        }
+    }
+
+    /// The field order in `StoreClaim` IS the release order (Rust drops a
+    /// struct's fields in declaration order), and this asserts it on the same
+    /// generic type production uses — only the engine is swapped, so swapping
+    /// the two fields fails HERE rather than only in a doc comment.
+    #[test]
+    fn the_flock_outlives_the_engine() {
+        let dir = tmp_dir("droporder");
+        let lock = File::open(&dir).expect("open the claim's lock fd");
+        lock.try_lock().expect("the claim takes the flock");
+        let held_at_drop = Rc::new(Cell::new(None));
+        let claim = StoreClaim {
+            engine: ProbeEngine { dir: dir.clone(), held_at_drop: held_at_drop.clone() },
+            _lock: lock,
+        };
+
+        assert_eq!(held_at_drop.get(), None, "the engine is alive until the claim drops");
+        drop(claim);
+        assert_eq!(
+            held_at_drop.get(),
+            Some(true),
+            "the engine must tear down while the store is STILL flocked — \
+             `engine` must be declared before `_lock` in StoreClaim"
+        );
+
+        // ... and the flock is gone once the whole claim has dropped, so the
+        // ordering does not turn ownership into a leak.
+        let after = File::open(&dir).expect("reopen after the claim dropped");
+        assert!(after.try_lock().is_ok(), "the flock is released with the claim");
+        drop(after);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A claim that has DIED must not linger in the registry: every
+    /// `claim_store` retains only live entries, so the map is bounded by the
+    /// stores actually open rather than by every store ever opened.
+    #[test]
+    fn the_registry_prunes_dead_claims() {
+        let a = tmp_dir("prune-a");
+        let b = tmp_dir("prune-b");
+        drop(claim_store(&a).unwrap_or_else(|_| panic!("claim a")));
+        drop(claim_store(&b).unwrap_or_else(|_| panic!("claim b")));
+
+        // Claiming a THIRD store is what gets the sweep to run; the two dead
+        // entries must not survive it.
+        let c = tmp_dir("prune-c");
+        let live = claim_store(&c).unwrap_or_else(|_| panic!("claim c"));
+
+        let reg = claims().lock().unwrap_or_else(|e| e.into_inner());
+        let canon_a = fs::canonicalize(&a).expect("canon a");
+        let canon_b = fs::canonicalize(&b).expect("canon b");
+        let canon_c = fs::canonicalize(&c).expect("canon c");
+        assert!(!reg.contains_key(&canon_a), "a dead claim is pruned from the registry");
+        assert!(!reg.contains_key(&canon_b), "a dead claim is pruned from the registry");
+        assert!(reg.contains_key(&canon_c), "the live claim stays registered");
+        drop(reg);
+
+        drop(live);
+        let _ = fs::remove_dir_all(&a);
+        let _ = fs::remove_dir_all(&b);
+        let _ = fs::remove_dir_all(&c);
+    }
+    #[test]
+    fn finite_etf_preflight_is_closed_and_charged() {
+        let tuple = [131, 104, 2, 97, 1, 109, 0, 0, 0, 3, b'a', b'b', b'c'];
+        assert_eq!(finite_etf_charge(&tuple), Some(tuple.len() * 64));
+        let map = [131, 116, 0, 0, 0, 1, 119, 1, b'k', 108, 0, 0, 0, 2, 97, 1, 97, 2, 106];
+        assert_eq!(finite_etf_charge(&map), Some(map.len() * 64));
+        for bytes in [&[131, 80, 0, 0, 0, 1][..], &[131, 88][..], &[131, 112][..],
+                      &[131, 109, 255, 255, 255, 255][..], &[131, 105, 255, 255, 255, 255][..],
+                      &[131, 116, 255, 255, 255, 255][..], &[131, 97][..], &[131, 106, 0][..]] {
+            assert_eq!(finite_etf_charge(bytes), None);
+        }
+        for n in 0..tuple.len() { assert_eq!(finite_etf_charge(&tuple[..n]), None); }
+        let mut deep = vec![131];
+        for _ in 0..130 { deep.extend_from_slice(&[104, 1]); }
+        deep.push(106);
+        assert_eq!(finite_etf_charge(&deep), None);
+    }
+
+    #[test]
+    fn compressed_etf_envelope_is_length_checked() {
+        use std::io::Write;
+        let body = [104, 2, 97, 1, 97, 2];
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&body).unwrap();
+        let mut bytes = vec![ETF_VERSION, 80];
+        bytes.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(&encoder.finish().unwrap());
+        assert_eq!(inflate_stored_etf(&bytes).unwrap(), [&[ETF_VERSION][..], &body].concat());
+        let mut short = bytes.clone(); short[5] -= 1;
+        assert!(inflate_stored_etf(&short).is_err());
+        let mut long = bytes.clone(); long[5] += 1;
+        assert!(inflate_stored_etf(&long).is_err());
+        let mut trailing = bytes.clone(); trailing.push(0);
+        assert!(inflate_stored_etf(&trailing).is_err());
+        for n in 0..bytes.len() { assert!(inflate_stored_etf(&bytes[..n]).is_err()); }
+    }
+
+    #[test]
+    fn bounded_compression_charges_before_inflate_and_rejects_opaque_terms() {
+        use std::io::Write;
+        fn compress(body: &[u8]) -> Vec<u8> {
+            let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(body).unwrap();
+            let mut out = vec![ETF_VERSION, 80];
+            out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            out.extend_from_slice(&encoder.finish().unwrap());
+            out
+        }
+        let body = [104, 2, 97, 1, 97, 2];
+        let compressed = compress(&body);
+        let plain = [&[ETF_VERSION][..], &body].concat();
+        let charge = plain.len() * 64;
+        assert_eq!(bounded_finite_etf(&compressed, charge - 1).unwrap(), BoundedEtf::Limited);
+        assert_eq!(bounded_finite_etf(&compressed, charge).unwrap(),
+                   BoundedEtf::Admitted { charge, payload: std::borrow::Cow::Owned(plain.clone()) });
+        assert_eq!(bounded_finite_etf(&plain, charge).unwrap(),
+                   BoundedEtf::Admitted { charge, payload: std::borrow::Cow::Borrowed(&plain) });
+        assert_eq!(bounded_finite_etf(&compress(&[112, 0, 0, 0, 0]), 8192).unwrap(), BoundedEtf::Opaque);
+        let mut huge = compressed.clone(); huge[2..6].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(bounded_finite_etf(&huge, 268435456).unwrap(), BoundedEtf::Limited);
+        let mut trailing = compressed.clone(); trailing.push(0);
+        assert!(bounded_finite_etf(&trailing, 8192).is_err());
+        let mut wrong = compressed.clone(); wrong[5] += 1;
+        assert!(bounded_finite_etf(&wrong, 8192).is_err());
+        for n in 0..compressed.len() {
+            assert!(!matches!(bounded_finite_etf(&compressed[..n], 8192), Ok(BoundedEtf::Admitted { .. })));
+        }
+    }
+
+}
 

@@ -1,0 +1,133 @@
+; generation_semantics_test.bl — compiler semantics that a generation's source
+; depends on, ported from test/beam_lisp/generation_semantics_test.exs.
+;
+; These were the ExUnit suite that pinned the language behaviours a live
+; generation relies on: call-position local/global dispatch, fixed/variadic
+; arity dispatch, guard vocabulary, try/catch/finally, macro expansion order,
+; `declare`, and closure retention across global redefinitions. The ExUnit
+; harness reached them through the Elixir `BeamLisp.Compiler` façade
+; (`eval_string` into a `Compiler.new_env(ns)`); here they are exercised
+; through the runtime's own `env/eval`, each in a fresh source namespace inside
+; an isolated fork — the direct `.bl` equivalent of "a new env per eval".
+;
+; Fidelity notes:
+;   • per-test fresh source ns: `ev` builds a unique `gen.semantic.srcN` ns on
+;     every call (the ExUnit `System.unique_integer` ns). Fresh, so the local
+;     `pick`/`retained`/`already` defs of one eval never leak into the next.
+;   • isolation: the eval runs inside `env/isolated`, so the `(ns …)` switch it
+;     performs is contained — no global namespace cleanup is owed and no
+;     generated ns can shadow this suite or a sibling's.
+;   • the source is prefixed with `(ns <fresh>)` exactly as the ExUnit helper
+;     did, so line numbers in a compile diagnostic stay the source's own
+;     (a guard on the second source line is diagnosable as `line 2:`).
+;   • error classes are preserved by TYPED catch: RuntimeError (missing
+;     global), BadArityError (wrong-arity local, no fallback), and
+;     BeamLisp.CompileError (side-effecting guard).
+;
+; Run: bl test test/bl/generation_semantics_test.bl
+;
+; NB the ns is unique to this suite (`generation-semantics.test`): a ward run
+; shares one VM, and a namespace collision would merge suites.
+
+(ns generation-semantics.test
+  (:require [env]))
+
+; ── helpers ────────────────────────────────────────────────────────────────
+
+(defn- fresh-src-ns
+  "A uniquely-named SOURCE namespace per evaluation, so repeated runs and
+   sibling evals never collide. Distinct from the suite's own ns."
+  []
+  (str "gen.semantic.src" (erlang/unique_integer (list :positive))))
+
+(defn- ev
+  "Evaluate `src` in a fresh source ns inside an isolated fork — the direct
+   equivalent of the ExUnit `eval_string(src, new_env(ns))` helper. Returns the
+   value of `src`'s last form; the fork is destroyed on the way out."
+  [src]
+  (env/isolated
+    (fn []
+      (env/eval (str "(ns " (fresh-src-ns) ")\n" src)))))
+
+; ── call position preserves callability-based local/global dispatch ─────────
+
+(deftest callable-local-of-matching-arity-wins-over-linked-global
+  (is (= [:local 1]
+         (ev "(defn pick [x] [:global x]) (let [pick (fn [x] [:local x])] (pick 1))"))))
+
+(deftest non-callable-local-and-wrong-arity-local-fall-back-to-linked-global
+  (is (= [:global 1]
+         (ev "(defn pick [x] [:global x]) (let [pick 7] (pick 1))"))
+      "a non-callable local falls back to the linked global")
+  (is (= [:global 1]
+         (ev "(defn pick [x] [:global x]) (let [pick (fn [x y] [:local x y])] (pick 1))"))
+      "a wrong-arity local falls back to the linked global"))
+
+(deftest missing-global-calls-fail-including-an-uncallable-local-with-no-fallback
+  (let [e (try
+            (do (ev "(missing-generation-global 1)") nil)
+            (catch RuntimeError ex ex))]
+    (is (some? e) "a call to an undefined global raises RuntimeError")
+    (is (includes? (str (ex-message e)) "undefined var")
+        (str "the message names the missing global: " (ex-message e))))
+
+  (let [e (try
+            (do (ev "(let [only-local (fn [x y] (+ x y))] (only-local 1))") nil)
+            (catch BadArityError ex ex))]
+    (is (some? e) "an uncallable local with no fallback raises BadArityError")))
+
+; ── arity dispatch ─────────────────────────────────────────────────────────
+
+(deftest fixed-and-variadic-clauses-dispatch-by-argument-count
+  (is (= [[:fixed 1] [:variadic 1 '(2 3)]]
+         (ev "(defn collect ([x] [:fixed x]) ([x & xs] [:variadic x xs])) [(collect 1) (collect 1 2 3)]"))))
+
+; ── guard vocabulary ───────────────────────────────────────────────────────
+
+(deftest guards-run-legal-predicates-and-reject-calls-outside-the-guard-vocabulary
+  (is (= [:integer :other]
+         (ev "(defn classify ([x] :when (int? x) :integer) ([_] :other)) [(classify 1) (classify :x)]")))
+
+  (let [e (try
+            (do (ev "(defn classify ([x] :when (println x) :bad) ([_] :other))") nil)
+            (catch BeamLisp.CompileError ex ex))]
+    (is (some? e) "a side-effecting call in a guard is a compile error")
+    (let [msg (str (ex-message e))]
+      (is (includes? msg "not allowed in a guard")
+          (str "the rejection names the guard vocabulary: " msg))
+      (is (includes? msg "line 2:")
+          (str "the rejection carries the source location: " msg)))))
+
+; ── try / catch / finally ──────────────────────────────────────────────────
+
+(deftest typed-and-untyped-catches-reraising-and-finally-effects-are-observable
+  (is (= ":x" (ev "(try (throw :x) (catch e (ex-message e)))"))
+      "an untyped catch reads the thrown value")
+  (is (= :typed (ev "(try (throw :x) (catch BeamLisp.ExInfo e :typed))"))
+      "a typed catch matches the thrown BeamLisp.ExInfo")
+
+  (erlang/erase :generation-finally)
+  (let [e (try
+            (do (ev "(try (throw :again) (catch e (throw e)) (finally (erlang/put :generation-finally true)))") nil)
+            (catch BeamLisp.ExInfo ex ex))]
+    (is (some? e) "the rethrown throw propagates as BeamLisp.ExInfo")
+    (is (= true (erlang/get :generation-finally)) "the finally ran before the throw propagated")))
+
+; ── macro expansion order ──────────────────────────────────────────────────
+
+(deftest macro-bodies-expand-in-source-order
+  (is (= [1 2]
+         (ev "(def counter (atom 0)) (defmacro tick [] (swap! counter inc)) (defn f ([_] (tick)) ([_ _] (tick))) [(f 1) (f 1 2)]"))))
+
+; ── declare ────────────────────────────────────────────────────────────────
+
+(deftest declare-after-def-preserves-the-value
+  (is (= 42 (ev "(def already 42) (declare already) already"))))
+
+; ── closure retention ──────────────────────────────────────────────────────
+
+(deftest a-retained-closure-survives-three-global-redefinitions
+  (is (= [1 4]
+         (ev (str "(defn current [] (fn [] 1)) (def retained (current))"
+                  " (defn current [] (fn [] 2)) (defn current [] (fn [] 3))"
+                  " (defn current [] (fn [] 4)) [(retained) ((current))]")))))

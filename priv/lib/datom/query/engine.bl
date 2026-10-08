@@ -38,6 +38,8 @@
 (ns datom.query.engine
   (:require [datom.db] [datom.index] [datom.store] [datom.query.agg] [datom.query.parse]
             [datom.query.plan] [datom.schema] [datom.query.analytic]
+            [data.bounded-cache :as cache-data] [data.cache-ring :as cache-ring]
+            [datom.cache-validity :as validity] [datom.query.relation :as relation]
             [datom.query.rules]))
 
 ;; ── unification ─────────────────────────────────────────────────────
@@ -916,8 +918,12 @@
   "Distinct query forms the plan memo holds. Past this the oldest go.
    1 024 covers every literal query an application has; a program that
    templates values INTO the form (rather than binding them through `:in`)
-   churns through it harmlessly."
+   churns through it harmlessly. Entries also have a retained-data bound."
   1024)
+
+(def PLAN-CACHE-ENTRY-MAX
+  "Maximum charged retained bytes per query plan (1024 entries: <=64 MiB)."
+  65536)
 
 (def ^:private PLAN-CACHE
   "`{query-form → {:parsed :planned :in-forms}}` plus an insertion ring.
@@ -930,7 +936,9 @@
   "`{:size :hits :misses}` — for tests and `datom/explain`."
   []
   (let [c (deref PLAN-CACHE)]
-    {:size (count (:entries c)) :hits (:hits c) :misses (:misses c)}))
+    {:size (count (:entries c)) :hits (:hits c) :misses (:misses c)
+     :declined (or (:declined c) 0) :largest-entry-bytes (or (:largest-entry-bytes c) 0)
+     :max-entry-bytes PLAN-CACHE-ENTRY-MAX}))
 
 (defn- prepare
   "The parsed, validated and planned form of `query`, from the memo when
@@ -949,37 +957,20 @@
           (let [entry {:parsed parsed
                        :planned (datom.query.plan/plan parsed)
                        :in-forms (datom.query.parse/input-forms parsed)}]
-            (swap! PLAN-CACHE
-                   (fn [c]
-                     (let [order (conj (:order c) query)
-                           entries (assoc (:entries c) query entry)
-                           over (- (count order) PLAN-CACHE-MAX)]
-                       (if (> over 0)
-                         (let [gone (subvec order 0 over)]
-                           {:entries (reduce dissoc entries gone)
-                            :order (subvec order over)
-                            :hits (:hits c) :misses (+ 1 (:misses c))})
-                         {:entries entries :order order
-                          :hits (:hits c) :misses (+ 1 (:misses c))}))))
+            (let [charge (cache-data/footprint (tuple query entry))]
+              (swap! PLAN-CACHE
+                     (fn [c]
+                       (let [next (update (cache-ring/offer c query entry charge
+                                                            PLAN-CACHE-ENTRY-MAX PLAN-CACHE-MAX)
+                                          :misses inc)]
+                         (assoc next
+                           :largest-entry-bytes (max (or (:largest-entry-bytes c) 0) (or charge 0))
+                           :declined (+ (or (:declined c) 0)
+                                        (if (or (nil? charge) (> charge PLAN-CACHE-ENTRY-MAX)) 1 0)))))))
             entry))))))
 
-(defn q
-  "Run `query` against `db` with optional `inputs`.
-
-   Returns a SET of result tuples — a set because datalog answers a
-   question about what is true, and the same answer arriving by two
-   derivations is one answer. This is also why `q` returns a beam-lisp
-   set rather than a vector: the semantics ARE set semantics, and the
-   language already has the type. A SET has no order of its own, so the result
-   ORDER is unspecified: callers that need a stable order sort it themselves."
-  [query db & inputs]
-  ; Populate the relation catalog before ANY clause is classified. Namespace
-  ; bodies load lazily, so the built-in computed relations (similar-to,
-  ; community, …) are not registered merely because engine :requires analytic;
-  ; this forces analytic's body to run once. Idempotent and cheap.
-  (datom.query.analytic/ensure-registered!)
-  (let [prepared (prepare query)
-        parsed (:parsed prepared)]
+(defn- execute-prepared [prepared db inputs]
+  (let [parsed (:parsed prepared)]
     (do
       (let [; `input-forms` includes the `%` rules source, so arguments line
             ; up positionally; `binding-forms` (variables only) is what
@@ -1059,8 +1050,85 @@
                      (into [] (datom.query.agg/aggregate elements bindings (or (:with parsed) [])))
                      (mapv (fn [b] (mapv (fn [v] (get b v)) (datom.query.parse/find-variables parsed)))
                            bindings))]
-          (cond
-            (= kind :scalar) (if (empty? rows) nil (get (first rows) 0))
-            (= kind :collection) (into [] (distinct (mapv (fn [r] (get r 0)) rows)))
-            (= kind :tuple) (if (empty? rows) nil (first rows))
-            :else (set rows)))))))
+          {:value (cond
+                    (= kind :scalar) (if (empty? rows) nil (get (first rows) 0))
+                    (= kind :collection) (into [] (distinct (mapv (fn [r] (get r 0)) rows)))
+                    (= kind :tuple) (if (empty? rows) nil (first rows))
+                    :else (set rows))
+           :work (max (count bindings) (count initial))})))))
+
+(defn- plain-read-attrs [parsed]
+  ;; This is a closed execution subset, not an assertion about arbitrary code.
+  ;; No arbitrary functions, computed relations, rules, pull or raw DB escape.
+  ;; Built-in aggregate folds are engine-owned and bind the same dependencies.
+  (let [clauses (:where parsed)
+        kind (datom.query.parse/find-kind parsed)
+        elements (cond (= kind :scalar) [(first (:find parsed))]
+                       (= kind :collection) [(first (first (:find parsed)))]
+                       (= kind :tuple) (first (:find parsed))
+                       :else (:find parsed))]
+    (when (and (<= 1 (count clauses) 64)
+               (every? (fn [x] (or (datom.query.parse/variable? x)
+                                  (datom.query.agg/aggregate-form? x))) elements)
+               (every? (fn [f] (or (datom.query.parse/variable? f)
+                                  (datom.query.parse/collection-binding? f)))
+                       (datom.query.parse/input-forms parsed))
+               (every? (fn [c]
+                         (and (datom.query.parse/pattern-clause? c)
+                              (<= 3 (count c) 4)
+                              (keyword? (get c 1))
+                              (nil? (relation/relation (get c 1))))) clauses))
+      (vec (distinct (mapv (fn [c] (get c 1)) clauses))))))
+
+(defn- finite-cache-inputs? [parsed supplied]
+  ;; Collection input semantics are owned by bind-inputs; cache only concrete
+  ;; finite vectors/lists. Lazy/external input producers keep authoritative reads.
+  (let [forms (datom.query.parse/input-forms parsed)]
+    (and (= (count forms) (count supplied))
+         (every? (fn [pair]
+                   (or (datom.query.parse/variable? (first pair))
+                       (and (datom.query.parse/collection-binding? (first pair))
+                            (or (vector? (second pair)) (erlang/is_list (second pair))))))
+                 (mapv (fn [form value] [form value]) forms supplied)))))
+
+(defn q-uncached
+  "Authoritative execution for profiling/parity checks, without result reuse."
+  [query db & inputs]
+  (datom.query.analytic/ensure-registered!)
+  (:value (execute-prepared (prepare query) db inputs)))
+
+(defn q
+  "Ordinary queries automatically reuse supported, nontrivial pattern joins.
+   Unknown code and temporal views retain authoritative execution."
+  [query db & inputs]
+  (datom.query.analytic/ensure-registered!)
+  (let [prepared (prepare query)
+        collector (erlang/get TRACE-KEY)
+        tracing? (and (some? collector) (not= :undefined collector))
+        attrs (when (and (not tracing?) (:result-cache? prepared)
+                         (finite-cache-inputs? (:parsed prepared) inputs))
+                (plain-read-attrs (:parsed prepared)))
+        stamp (when attrs (validity/read-stamp db attrs))
+        key (when stamp [::result (datom.db/view-key (assoc db :basis-t 0)) query inputs])
+        hit (when stamp (cache-data/lookup :datom.query.results key stamp))]
+    ;; Lookup is not a transaction with code publication. Recheck evidence
+    ;; before returning a retained model result; a racing reload must miss.
+    (if (and (:hit? hit) (= stamp (validity/read-stamp db attrs))) (:value hit)
+      (let [executed (execute-prepared prepared db inputs) result (:value executed)]
+        ;; Small and unsupported queries never pay retained-key normalization.
+        ;; Learn only from actual work; the hint is bounded by the plan ring.
+        (when (and (not tracing?) (>= (:work executed) 32)
+                   (finite-cache-inputs? (:parsed prepared) inputs))
+          (when-let [attrs (or attrs (plain-read-attrs (:parsed prepared)))]
+            (swap! PLAN-CACHE (fn [c]
+                               (if (get (:entries c) query)
+                                 (assoc-in c [:entries query :result-cache?] true) c)))
+            ;; First use learns the work hint only. Retention requires
+            ;; evidence from BEFORE execution, including empty reads and code.
+            (when stamp
+              ;; Owner initialization may publish code; compare afterwards.
+              (cache-data/ready! :datom.query.results)
+              (when-let [after (validity/read-stamp db attrs)]
+                (when (= stamp after)
+                  (cache-data/put! :datom.query.results key after result))))))
+        result))))

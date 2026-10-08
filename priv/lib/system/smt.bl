@@ -67,12 +67,10 @@
   "The z3 sort NAME for a tagset, or :unknown. Scalar theories only; a compound
    or ambiguous tagset is :unknown so the caller keeps it untranslatable."
   [tags]
-  (cond
-    (contains? tags :int)    "Int"
-    (contains? tags :float)  "Real"
-    (contains? tags :bool)   "Bool"
-    (contains? tags :string) "String"
-    :else :unknown))
+  ;; A tagset is a union, not an ordered preference list. Choosing the first
+  ;; scalar present silently drops the other possible runtime values.
+  (get {#{:int} "Int" #{:float} "Real" #{:bool} "Bool" #{:string} "String"}
+       tags :unknown))
 
 (defn value-tags
   "The tag-lattice tagset of a parsed literal VALUE node. Delegates scalar
@@ -106,12 +104,16 @@
 
 ; [mod fun] → SMT operator symbol, for the ops the compiler resolves to a clean
 ; remote. `and`/`or`/`=>` are absent — they lower to short-circuit :let/:if,
-; reconstructed by `scaffold`. `div`/`not`/`=<`(the `<=` spelling)/`str*` arrive
-; as RT/invoke and are handled in the call dispatch.
+; reconstructed by `scaffold`. `not` is LINKED in the rt table, so a bare
+; `(not X)` lowers to a resolved [rt :not_] remote, NOT to RT/invoke — without
+; the row below every predicate containing a negation is :untranslatable. `div`
+; /`=<`(the `<=` spelling)/`str*` still arrive as RT/invoke and are handled in
+; the call dispatch; `not` keeps that invoke path too, for an unlinked arity.
 (def op-table
   {[:erlang :+] '+ [:erlang :-] '- [:erlang :*] '*
    [:erlang :>] '> [:erlang :<] '< [:erlang :>=] '>= [:erlang :=<] '<=
    [:erlang :==] '= [:erlang :=:=] '=
+   [rt :not_] 'not
    [rt :eqv] '= [:Elixir.BeamLisp.Ns.Core :mod] 'mod})
 
 ; truncated division from z3's Euclidean div/mod (see the quot/rem note below).
@@ -139,7 +141,7 @@
 (defn- len-name [c] (symbol (str c "_len")))
 
 (defn- coll-var? [ctx node]
-  (and (= :global (:op node)) (contains? (:colls ctx) (:name node))))
+  (and (= :global (:op node)) (contains? (:colls ctx) (ir/global-key node))))
 
 ; ── the short-circuit reconstruction: :let scaffold → and/or/=> ───────────
 ;
@@ -177,7 +179,9 @@
     (if (= :cons (:op n)) (recur (:tail n) (conj acc (:head n))) acc)))
 
 ; primitives that arrive as RT/invoke (:global name) — the ops the compiler
-; leaves as a var apply rather than a resolved remote.
+; leaves as a var apply rather than a resolved remote. `not` is normally LINKED
+; (see op-table), so this row covers only an unlinked arity; `div`/`=<`/`str*`
+; still reach here on the ordinary path.
 (def invoke-desugar
   {"div"           (fn [as] (list 'div (first as) (second as)))
    "not"           (fn [as] (list 'not (first as)))
@@ -189,11 +193,84 @@
    "str-suffix?"   (fn [as] (apply list 'str.suffixof as))})
 
 (defn- global-name [node]
-  (and (= :global (:op node)) (:name node)))
+  (and (= :global (:op node)) (not= :exact (:lookup node)) (:name node)))
 
 (defn- t-args [ctx nodes]
   (let [ts (map (fn [n] (translate-node ctx n)) nodes)]
     (if (some untranslatable? ts) :untranslatable ts)))
+
+; ── clause selection: WHICH clause a call runs ─────────────────────────
+;
+; A helper reached by INLINING must be the clause THIS call runs. `fn-bodies`
+; carries every clause, but its :params/:body are the FIRST one — right only for
+; a single-clause fn. Selecting the clause by the call's arity against the
+; SOURCE clause shapes (the ANF list renames params and drops the `&`, so it
+; cannot tell a variadic clause from a fixed one of the same printed length) is
+; what keeps a 2-ary call from being translated as the 1-ary body — and what
+; makes a call no single clause fits an honest :untranslatable, never a proof.
+
+(defn- source-clause-shapes
+  "For each top-level defn/defn- of `src`, its clauses' SOURCE shapes in order:
+   {:arity n :variadic bool :guarded bool}. :arity counts FIXED params (a `&`
+   rest binding is not one), :variadic marks a `&` clause, :guarded a `:when`."
+  [src]
+  (let [shapes (fn [clauses]
+                 (into []
+                   (map (fn [c]
+                          (let [names (into [] (map (fn [p] (typed/node-name (typed/node-form p)))
+                                                    (:params c)))
+                                amp (loop [i 0]
+                                      (cond (= i (count names)) nil
+                                            (= "&" (nth names i)) i
+                                            :else (recur (inc i))))]
+                            {:arity (if (some? amp) amp (count names))
+                             :variadic (some? amp)
+                             :guarded (some? (:guard c))})))
+                   clauses))]
+    (reduce
+      (fn [m form]
+        (try
+          (let [f (typed/node-form form)]
+            (if (not (and (= :list (typed/node-tag f))
+                          (contains? #{"defn" "defn-"}
+                                     (typed/node-name (typed/node-form (first (typed/node-items f)))))))
+              m
+              (let [its (into [] (typed/node-items f))
+                    nm (typed/node-name (typed/node-form (second its)))]
+                (assoc m nm (shapes (nth (typed/defn-clauses its) 2))))))
+          (catch _e m)))
+      {}
+      (try (BeamLisp.Reader/read_string src) (catch _e [])))))
+
+(defn- clause-for
+  "The one ANF clause of `d` a call with `argc` actuals runs, or nil when no
+   SINGLE clause is soundly selectable: the source shapes are absent or do not
+   line up with the compiled clauses, the fn has a variadic clause, no clause
+   has this arity, several do (a guarded/duplicate group), or the one that does
+   is guarded. nil ⇒ the caller refuses (:untranslatable) rather than
+   translating another arity's — or a guarded — body as if it were this call's."
+  [sig d argc]
+  (let [anf (if (seq (:clauses d))
+              (:clauses d)
+              [{:params (:params d) :body (:body d)}])]
+    (when (and (some? sig)
+               (= (count sig) (count anf))
+               (not (some (fn [s] (if (:variadic s) true nil)) sig)))
+      (let [hits (filter (fn [pair] (= argc (:arity (second pair))))
+                         (map-indexed (fn [i s] [i s]) sig))]
+        (when (and (= 1 (count hits))
+                   (not (:guarded (second (first hits)))))
+          (nth anf (first (first hits))))))))
+
+(defn- inline-call [ctx f actuals]
+  (let [cl (clause-for (get (:sigs ctx) f) (get (:bodies ctx) f) (count actuals))
+        ts (t-args ctx actuals)]
+    (if (or (nil? cl) (untranslatable? ts) (contains? (or (:inlining ctx) #{}) f))
+      :untranslatable
+      (let [benv (reduce (fn [m [p a]] (assoc m p a))
+                         (:env ctx) (map (fn [p a] [p a]) (:params cl) ts))]
+        (translate-node (assoc ctx :env benv :inlining (conj (or (:inlining ctx) #{}) f))
+                        (:body cl))))))
 
 (defn- t-invoke
   "An (RT/invoke (:global f) argcons) call: payload accessor, nth, primitive
@@ -216,7 +293,7 @@
       (nil? f) :untranslatable
       ; nth over a positional tuple var: (nth p 0) → p_0
       (and (= f "nth") (= 2 (count actuals))
-           (= :global (:op (first actuals)))
+           (and (= :global (:op (first actuals))) (not= :exact (:lookup (first actuals))))
            (= :lit (:op (second actuals))) (int? (:val (second actuals))))
         (symbol (str (:name (first actuals)) "_" (:val (second actuals))))
       ; primitive desugar
@@ -229,13 +306,11 @@
       (get (:funs ctx) f)
         (let [ts (t-args ctx actuals)]
           (if (untranslatable? ts) :untranslatable (apply list (symbol f) ts)))
-      ; pure-helper inline
+      ; pure-helper inline — the clause THIS call's arity runs. :params/:body
+      ; are the FIRST clause only; using them for a different arity is a false
+      ; proof, so an unselectable call refuses (see clause-for).
       (and (contains? (:bodies ctx) f) ((:pure? ctx) f))
-        (let [d (get (:bodies ctx) f)
-              params (:params d)
-              benv (reduce (fn [m [p a]] (assoc m p (translate-node ctx a)))
-                           (:env ctx) (map (fn [p a] [p a]) params actuals))]
-          (translate-node (assoc ctx :env benv) (:body d)))
+        (inline-call ctx f actuals)
       :else :untranslatable)))
 
 ; collection-length ops keyed by :fun (mod-agnostic — RT or Core). First arg is
@@ -264,7 +339,7 @@
                 v (get (:variants ctx) k)
                 actuals (if (>= (count iargs) 2) (cons->args (second iargs)) [])
                 arg (first actuals)]
-            (if (and (map? v) (:ctor v) (= :global (:op arg)))
+            (if (and (map? v) (:ctor v) (= :global (:op arg)) (not= :exact (:lookup arg)))
               (list (list '_ 'is (symbol (:ctor v))) (symbol (:name arg)))
               :untranslatable))
           :untranslatable))
@@ -283,6 +358,12 @@
         (let [ts (t-args ctx args)]
           (if (untranslatable? ts) :untranslatable (apply list (symbol (name fun)) ts)))
       (and (= (:mod node) rt) (= fun :invoke)) (t-invoke ctx node)
+      ; Repeated analysis can leave a declared helper in the compiler's module
+      ; environment, so its next call is resolved directly. Only the analysis
+      ; module's own source-defined helpers share the dynamic inline boundary.
+      (and (= (:mod node) :Elixir.BeamLisp.Ns.System.Smt)
+           (contains? (:bodies ctx) (name fun)) ((:pure? ctx) (name fun)))
+        (inline-call ctx (name fun) args)
       ; collection length (mod-agnostic, only when a coll var is present)
       (and (not (empty? (:colls ctx)))
            (contains? #{:count :conj :rest :pop :next :empty?} fun)
@@ -314,7 +395,7 @@
                   (= fun :dec) (list '- a 1))))
       ; nth over a positional tuple var (also reachable as a resolved remote)
       (and (= fun :nth) (= 2 (count args))
-           (= :global (:op (first args)))
+           (and (= :global (:op (first args))) (not= :exact (:lookup (first args))))
            (= :lit (:op (second args))) (int? (:val (second args))))
         (symbol (str (:name (first args)) "_" (:val (second args))))
       ; op-table (arithmetic/relational)
@@ -326,10 +407,11 @@
 
 (defn translate-node
   "bl-ANF node → an SMT formula (a quoted s-expr) or :untranslatable, under
-   `ctx` {:env :variants :colls :bodies :pure?}. env maps a var/param name to an
+   `ctx` {:env :variants :colls :bodies :sigs :pure?}. env maps a var/param name to an
    already-translated formula (inlining); variants maps an enum tag string to
    its z3 constructor entry; colls is the set of length-abstracted var names;
-   bodies/pure? gate pure-helper inlining."
+   bodies/sigs/pure? gate pure-helper inlining (sigs are the SOURCE clause
+   shapes that let a call select the clause its arity runs)."
   [ctx node]
   (cond
     (not (ir/node? node)) :untranslatable
@@ -345,6 +427,7 @@
           (string? v) v
           :else :untranslatable))
     (= :var (:op node)) (get (:env ctx) (:name node) (symbol (:name node)))
+    (and (= :global (:op node)) (= :exact (:lookup node))) :untranslatable
     (= :global (:op node))
       (let [nm (:name node)]
         (if (contains? (:colls ctx) nm) (len-name nm)
@@ -392,9 +475,10 @@
   ([vars variants colls prog-src]
    (let [summaries (if prog-src (analyze/analyze prog-src) {})
          bodies (if prog-src (into {} (analyze/fn-bodies prog-src)) {})
+         sigs (if prog-src (source-clause-shapes prog-src) {})
          pure? (fn [nm] (empty? (:footprint (get summaries nm {:footprint {:x 1}}))))]
      {:env (reduce (fn [m v] (assoc m v (symbol v))) {} (into [] vars))
-      :variants variants :colls colls :bodies bodies :pure? pure?})))
+      :variants variants :colls colls :bodies bodies :sigs sigs :pure? pure?})))
 
 (defn- ->anf-src
   "Compile a SOURCE string to bl-ANF (read, then compile the first form)."
@@ -595,17 +679,25 @@
   "Lower a defn SOURCE to (define-fun name ((p Sort)…) Ret body) over `ret-sort`
    (all params share it — the arithmetic common case), via the ANF descriptor.
    Folds guarded clauses to nested ite. :untranslatable when the body leaves the
-   fragment. The returned form is a z3 prelude: assert a law over (name …)."
+   fragment, OR when the clauses do not share ONE arity (an overload) or the
+   source params do not line up with the compiled ones (a `&` rest clause) — a
+   single (define-fun …) has one signature, so no single body is the whole name.
+   The returned form is a z3 prelude: assert a law over (name …)."
   [defn-src ret-sort]
   (let [anf (->anf-src defn-src)
         clauses (descriptor-clauses anf)]
     (if (nil? clauses) :untranslatable
       (let [cls (into [] clauses)
-            cps (source-param-names defn-src)
-            body-smt (fold-clauses cps cls)]
-        (if (untranslatable? body-smt) :untranslatable
-          ; eager lists: a form is data, never a half-realized thunk
-          (apply list 'define-fun (symbol (:val (nth (:args anf) 1)))
-                 (apply list (map (fn [p] (list (symbol p) (symbol ret-sort))) cps))
-                 (symbol ret-sort)
-                 (list body-smt)))))))
+            parts (map clause-parts cls)
+            ref (count (:params (first parts)))
+            cps (source-param-names defn-src)]
+        (if (or (not= ref (count cps))
+                (some (fn [p] (not= ref (count (:params p)))) parts))
+          :untranslatable
+          (let [body-smt (fold-clauses cps cls)]
+            (if (untranslatable? body-smt) :untranslatable
+              ; eager lists: a form is data, never a half-realized thunk
+              (apply list 'define-fun (symbol (:val (nth (:args anf) 1)))
+                     (apply list (map (fn [p] (list (symbol p) (symbol ret-sort))) cps))
+                     (symbol ret-sort)
+                     (list body-smt)))))))))

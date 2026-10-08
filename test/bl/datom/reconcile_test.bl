@@ -1,0 +1,222 @@
+; test/bl/datom/reconcile_test.bl — the executor end to end: a fake Drive, the
+; keep, a projection, and a modelled library (content-addressed sources with
+; origins). Fixed cases for each rule, then a model with crashes (gate G2).
+
+(ns datom.reconcile-test
+  (:require [datom] [files] [datom.projection :as pj] [datom.reconcile :as rc]
+            [connector.keep :as keep] [connector.google.gdrive :as gdrive]
+            [connector.google.fake-drive :as fd] [veritas.model :as vm]))
+
+(files/register-under!)
+
+(def NS "sub-1")
+(defn k [id] [:gdrive NS id])
+
+(def MOUNT-SCHEMA
+  [{:db/ident :mount/id    :db/valueType :db.type/string :db/unique :db.unique/identity}
+   {:db/ident :mount/root  :db/valueType :db.type/ref}
+   {:db/ident :mount/state :db/valueType :db.type/keyword}])
+
+(def DOC
+  (pj/projection :test/doc
+    {:active   '[[?scope :mount/state :active]]
+     :member   '[[?scope :mount/root ?r] [?src :~file/live-under ?r]
+                 [:not [?src :file/folder? true]]]
+     :revision '[[?src :file/rev ?rev]]}))
+
+;; ── a modelled library: source = hash, origins = remote keys ────────────────
+
+(defn- library [] (atom {:sources {} :applies 0}))
+
+(defn- live-hashes [lib]
+  (into #{} (keep (fn [[h s]] (if (seq (:origins s)) h nil)) (into [] (:sources @lib)))))
+
+(defn- apply-fn
+  "Ingest: read the fake's bytes (unsupported when the name ends .xlsb),
+   upsert the source by hash, add the origin, and drop the origin from the
+   previous source when the bytes changed. `crash` (an atom) makes the NEXT
+   apply throw after the target was written — L4's crash window."
+  [drive lib crash]
+  (fn [row prev]
+    (let [id (nth (:src-key row) 2)
+          it (get-in @drive [:items id])]
+      (cond
+        (ends-with? (or (:name it) "") ".xlsb") {:skip :unsupported-type}
+        :else
+          (let [h (str "h-" (erlang/phash2 (:content it) 100000000))]
+            (swap! lib (fn [l] (-> l (update-in [:sources h :origins] (fnil conj #{}) (:src-key row))
+                                     (update :applies inc))))
+            (when (and (some? prev) (not= prev h))
+              (swap! lib update-in [:sources prev :origins] disj (:src-key row)))
+            (when @crash (reset! crash false) (throw "crash after target, before record"))
+            {:target h})))))
+
+(defn- retire-fn
+  "Drop this origin from EVERY source that holds it — not only `target`: a
+   retired :pending intent may name no target (or an older one) while the
+   crashed apply wrote a newer one."
+  [lib]
+  (fn [row target]
+    (swap! lib update :sources
+           (fn [ss] (into {} (map (fn [[h s]] [h (update s :origins disj (:src-key row))]) (into [] ss)))))))
+
+(defn- world []
+  (let [d (fd/make {:page-size 3})
+        _ (fd/add! d "r" {:name "R" :parent "root" :folder? true})
+        _ (fd/add! d "out" {:name "OUT" :parent "root" :folder? true})
+        c (datom/connect (into (into (keep/full-schema) pj/schema) MOUNT-SCHEMA))
+        kp {:conn c :feed (gdrive/feed NS) :get (fd/get-fn d) :roots (fn [_] [(k "r")])}]
+    (keep/step! kp)
+    (datom/transact! c [{:db/id -1 :mount/id "m1" :mount/state :active
+                         :mount/root (nth (first (into [] (datom/datoms (datom/db c) :avet :conn/key (k "r")))) 0)}])
+    (let [lib (library) crash (atom false)
+          scope (first (first (into [] (datom/q '[:find ?m :where [?m :mount/id "m1"]] (datom/db c)))))]
+      {:drive d :kp kp :conn c :lib lib :crash crash :scope scope
+       :opts {:scope-key "m1" :apply (apply-fn d lib crash) :retire (retire-fn lib) :concurrency 3}})))
+
+(defn- sync! [w] (keep/step! (:kp w)) (rc/drain! (:conn w) DOC (:scope w) (:opts w)))
+
+(defn- expected-hashes
+  "What the library SHOULD hold: the hash of every live file under r that is
+   not unsupported — plus, for an unsupported file, its last good hash if any
+   (L: skipped keeps the target)."
+  [w]
+  (into #{} (keep (fn [id] (let [it (get-in @(:drive w) [:items id])]
+                             (if (or (starts-with? (or (:mime it) "") "application/vnd.google-apps.folder")
+                                     (ends-with? (or (:name it) "") ".xlsb"))
+                               nil
+                               (str "h-" (erlang/phash2 (:content it) 100000000)))))
+                  (fd/visible-under (:drive w) "r"))))
+
+;; ── fixed cases ─────────────────────────────────────────────────────────────
+
+(deftest files-become-sources-and-identical-bytes-are-one
+  (let [w (world) d (:drive w)]
+    (fd/add! d "a" {:name "a.md" :parent "r" :content "same"})
+    (fd/add! d "b" {:name "b.md" :parent "r" :content "same"})
+    (fd/add! d "c" {:name "c.pdf" :parent "r" :content "other"})
+    (let [r (sync! w)]
+      (is (= 3 (:applied r)))
+      (is (= 2 (count (live-hashes (:lib w))))))
+    (is (= 0 (:applied (sync! w))) "a second drain applies nothing")))
+
+(deftest an-edit-moves-the-origin-and-a-removal-retires-it
+  (let [w (world) d (:drive w)]
+    (fd/add! d "a" {:name "a.md" :parent "r" :content "v1"})
+    (sync! w)
+    (fd/edit! d "a" "v2")
+    (sync! w)
+    (is (= (expected-hashes w) (live-hashes (:lib w))))
+    (fd/move! d "a" "out")
+    (let [r (sync! w)] (is (= 1 (:retired r))))
+    (is (empty? (live-hashes (:lib w))))))
+
+(deftest an-unsupported-revision-is-skipped-by-name-and-keeps-the-last-good
+  (let [w (world) d (:drive w)]
+    (fd/add! d "x" {:name "x.md" :parent "r" :content "good"})
+    (sync! w)
+    (fd/rename! d "x" "x.xlsb")
+    (fd/edit! d "x" "binary")
+    (let [r (sync! w)]
+      (is (= 1 (:skipped r)))
+      (is (= 1 (count (live-hashes (:lib w)))) "the last good content stays"))
+    (is (= 0 (:skipped (sync! w))) "a skip answers its revision: not retried")))
+
+(deftest a-transient-failure-records-nothing-and-is-retried
+  (let [w (world) d (:drive w)
+        boom (atom true)
+        opts (assoc (:opts w) :apply (let [f (:apply (:opts w))]
+                                       (fn [row prev] (if @boom (throw "network down") (f row prev)))))]
+    (fd/add! d "a" {:name "a.md" :parent "r" :content "v1"})
+    (keep/step! (:kp w))
+    (let [r (rc/drain! (:conn w) DOC (:scope w) opts)]
+      (is (= 1 (:failed r)))
+      (is (= 1 (:owed-left r)))
+      (is (includes? (str (:error (first (:errors r)))) "network down")))
+    (reset! boom false)
+    (is (= 1 (:applied (rc/drain! (:conn w) DOC (:scope w) opts))))))
+
+(deftest g2-a-crash-between-target-and-record-converges-with-one-record
+  (let [w (world) d (:drive w)]
+    (fd/add! d "a" {:name "a.md" :parent "r" :content "v1"})
+    (reset! (:crash w) true)
+    (let [r (sync! w)] (is (= 1 (:failed r))))
+    (let [r (sync! w)] (is (= 1 (:applied r))))
+    (is (= 1 (count (live-hashes (:lib w)))))
+    (is (= 1 (get (pj/counts DOC (datom/db (:conn w)) (:scope w)) :applied)))))
+
+(deftest a-paused-scope-retires-nothing-and-owes-nothing
+  (let [w (world) d (:drive w)]
+    (fd/add! d "a" {:name "a.md" :parent "r" :content "v1"})
+    (sync! w)
+    (datom/transact! (:conn w) [[:db/add (:scope w) :mount/state :paused]])
+    (fd/move! d "a" "out")
+    (fd/add! d "b" {:name "b.md" :parent "r" :content "v2"})
+    (keep/step! (:kp w))
+    (let [r (rc/drain! (:conn w) DOC (:scope w) (assoc (:opts w) :paused? true))]
+      (is (= 0 (:retired r)))
+      (is (= 0 (:applied r))))
+    (is (= 1 (count (live-hashes (:lib w)))) "a's content is still there while paused")))
+
+(deftest a-limit-makes-progress-in-visible-steps
+  (let [w (world) d (:drive w)]
+    (doseq [i (range 0 7)] (fd/add! d (str "f" i) {:name (str "f" i ".md") :parent "r" :content (str i)}))
+    (keep/step! (:kp w))
+    (let [r (rc/drain! (:conn w) DOC (:scope w) (assoc (:opts w) :limit 3))]
+      (is (= 3 (:applied r)))
+      (is (= 4 (:owed-left r))))
+    (is (= 4 (:owed (rc/status (datom/db (:conn w)) DOC (:scope w) []))))))
+
+;; ── the model: every order of edits, syncs and crashes ──────────────────────
+
+(def IDS ["a" "b" "c" "d"])
+
+(def sync-model
+  (vm/model "drive-sync"
+    {:state {:made #{}}
+     :init world
+     :commands
+     {:add    {:args (vm/tuple (vm/one-of IDS) (vm/one-of ["r" "out"]) (vm/one-of ["x" "y" "z"]))
+               :pre  (fn [s [id _ _]] (not (contains? (:made s) id)))
+               :next (fn [s [id _ _]] (update s :made conj id))
+               :run  (fn [w [id p c]] (fd/add! (:drive w) id {:name (str id ".md") :parent p :content c}))}
+      :edit   {:args (vm/tuple (vm/pick (fn [s] (sort (:made s)))) (vm/one-of ["x" "y" "z" "w"]))
+               :run  (fn [w [id c]] (fd/edit! (:drive w) id c))}
+      :move   {:args (vm/tuple (vm/pick (fn [s] (sort (:made s)))) (vm/one-of ["r" "out"]))
+               :run  (fn [w [id p]] (fd/move! (:drive w) id p))}
+      :xlsb   {:args (vm/pick (fn [s] (sort (:made s))))
+               :run  (fn [w id] (fd/rename! (:drive w) id (str id ".xlsb")))}
+      :trash  {:args (vm/pick (fn [s] (sort (:made s))))
+               :run  (fn [w id] (fd/trash! (:drive w) id))}
+      :untrash {:args (vm/pick (fn [s] (sort (:made s))))
+                :run  (fn [w id] (fd/untrash! (:drive w) id))}
+      :crash  {:run  (fn [w _] (reset! (:crash w) true))}
+      :sync   {:run  (fn [w _] (sync! w))}}
+     :settle :sync
+     :invariants
+     {:no-orphan-origin
+      ;; an origin is only ever held by a hash its file really has now or had
+      ;; as its last applied revision — never by a file that left
+      (fn [_ w] (let [held (into #{} (mapcat (fn [[_ s]] (:origins s)) (into [] (:sources @(:lib w)))))]
+                  (every? (fn [key] (some? (get-in @(:drive w) [:items (nth key 2)]))) held)))}
+     :eventually
+     {:library-equals-drive
+      ;; after a final sync (twice: a crash in the settle leaves one owed row)
+      (fn [_ w] (sync! w)
+                (let [exp (expected-hashes w)
+                      got (live-hashes (:lib w))]
+                  ;; an .xlsb file keeps its last good hash when it had one
+                  (and (every? (fn [h] (contains? got h)) exp)
+                       (every? (fn [h] (or (contains? exp h)
+                                           (some (fn [id] (let [it (get-in @(:drive w) [:items id])]
+                                                            (ends-with? (or (:name it) "") ".xlsb")))
+                                                 (fd/visible-under (:drive w) "r"))))
+                               got))))}}))
+
+(deftest the-library-converges-to-drive-over-every-generated-history
+  (let [r (vm/check sync-model {:seed 5 :histories 120 :max-len 16 :budget-ms 120000})]
+    (when (= :refuted (:modality r))
+      (println "  shrunk:" (pr-str (:shrunk r)) "broke:" (:broke r) (:kind r) (:error r)))
+    (println (str "  model: " (:why r)))
+    (is (= :witnessed (:modality r)))
+    (is (= [] (:unexercised r)))))

@@ -1,0 +1,412 @@
+; host_transient_test.bl — the pinned ABI for `BeamLisp.Transient`.
+;
+; `priv/host/transient.bl` is ONE pinned source that
+; `BeamLisp.AOT/compile_host_file` compiles at an exact atom with NO compile
+; options (functions-only — a transient is a tagged tuple, never a struct):
+;
+;     :module <atom>   :output_dir <dir>   :file priv/host/transient.bl
+;     :source_hash <sha256>   :load? false
+;
+; The running `Elixir.BeamLisp.Transient` (still `lib/beam_lisp/transient.ex`)
+; is the ground truth, so the suite is DIFFERENTIAL: one corpus of observations
+; runs through a probe compiled from the pinned source and through the live
+; module, and the two answer sets must be equal — values, exception CLASSES and
+; MESSAGES.
+;
+; The observation is normalized on two axes only:
+;   * the PROBE ATOM in a message (`BeamLisp.TransientProbe` → `BeamLisp.Transient`),
+;     because the pinned emitter names the module it was compiled into;
+;   * REFERENCES → `:ref`, because a transient handle carries a fresh
+;     `make_ref()` key per creation and the two runs cannot share one.
+; Everything else compares raw: the Vector/Set values both runs build come from
+; the SAME live collection modules, so they are equal structs.
+;
+; What each block pins:
+;   * `transient/1` — Vector/Set/record/plain-map construction; a reference
+;     struct and every non-collection raise the live `ArgumentError`, message for
+;     message (`inspect` included);
+;   * `conj!/1` (the reduce completion passthrough) and `conj!/2` over vectors,
+;     sets and maps — including both `[k v]` entry shapes (`BeamLisp.Vector`
+;     2-tuple items and a plain 2-list) and the map-entry `ArgumentError`;
+;   * `assoc!/3`, `dissoc!/2`, `get/3` — read/write/read-through, and the
+;     `FunctionClauseError` for a non-map transient;
+;   * `persistent!/1` — the frozen Vector/Set/map, the one-way door, and the
+;     forged/no-slot tuple;
+;   * `hash_map/3` / `hash_map_empty/0` — even rest, later pairs win, the odd
+;     `ArgumentError` and the non-list `FunctionClauseError`;
+;   * the process-local state — a handle sent to another process finds NO slot
+;     there, and the creator's transient is untouched;
+;   * `persistent!` DELETES the dictionary slot (no process-dictionary leak);
+;   * the pinned beam STANDING IN at the production atom, exercised, then the
+;     live beam RESTORED.
+;
+; Run: bin/bl test test/bl/host_transient_test.bl
+
+(ns host.transient.test)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_host_transient_" (erlang/unique_integer (list :positive))))
+
+(defn- src [] (Path/join (BeamLisp/cwd) "priv/host/transient.bl"))
+
+(def ^:private probe :Elixir.BeamLisp.TransientProbe)
+(def ^:private shim :Elixir.BeamLisp.Ns.Host.Transient)
+(def ^:private live :Elixir.BeamLisp.Transient)
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- seed-opts
+  "The EXACT option list the seed's `host-opts` builds for a functions-only host
+   entry: `:module`/`:output_dir`/`:file`/`:source_hash`/`:load? false`."
+  [mod dir]
+  (list (t2 :module mod)
+        (t2 :output_dir dir)
+        (t2 :file (src))
+        (t2 :source_hash (crypto/hash :sha256 (File/read! (src))))
+        (t2 :load? false)))
+
+(defn- compile-at
+  "Compile the pinned source at exact atom `mod`, then publish ONLY the pinned
+   beam: the compile's own load (and the namespace shim it built beside it) is
+   dropped first."
+  [mod dir]
+  (let [res (BeamLisp.AOT/compile_host_file (src) (seed-opts mod dir))
+        path (elem res 1)]
+    (drop! mod)
+    (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+    (drop! shim)
+    mod))
+
+; ── normalization: the probe names ITS own atom, and keys are fresh refs ──
+
+(defn- norm-str
+  "The probe atom the pinned emitter names in a message. A fresh `make_ref()` key
+   is a fifth axis only if a message `inspect`s a forged handle; the corpus keeps
+   those messages keyed by a NON-reference, so no reference reaches a string."
+  [s]
+  (String/replace s "BeamLisp.TransientProbe" "BeamLisp.Transient"))
+
+(defn- scrub
+  "The observation value with the two by-design differences erased: a reference
+   becomes `:ref` (fresh per creation) and the probe atom in a binary becomes the
+   production atom. Maps are left alone — the values under test carry no refs."
+  [v]
+  (let [scrub-each (fn [coll] (Enum/map coll (fn [y] (scrub y))))]
+    (cond
+      (erlang/is_reference v) :ref
+      (erlang/is_binary v) (norm-str v)
+      (erlang/is_list v) (scrub-each v)
+      (erlang/is_tuple v) (erlang/list_to_tuple (scrub-each (erlang/tuple_to_list v)))
+      :else v)))
+
+(defn- obs
+  "`[:ok value]` or `[:raise class message]`, normalized."
+  [thunk]
+  (try (list :ok (scrub (thunk)))
+       (catch e (list :raise (:__struct__ e) (norm-str (ex-message e))))))
+
+; ── the differential corpus ───────────────────────────────────────────────
+
+(defn- vec-of [xs] (BeamLisp.Vector/new xs))
+(defn- set-of [xs] (erlang/apply :Elixir.BeamLisp.Set :new (list xs)))
+
+(defn- tv
+  "A forged transient handle of `kind` whose key names no live slot."
+  [kind]
+  (tuple :"$transient" kind (erlang/make_ref)))
+
+(defn- cases
+  "Every public-ABI observation, as a LIST of thunks so the side effects run in
+   list order (`Enum/map` is left-to-right; a bare `(list …)` of already-run
+   calls would not be, since beam-lisp evaluates call arguments right-to-left).
+   Each thunk is self-contained: it builds its own transient, so the corpus is
+   reproducible in either module's run."
+  [mod]
+  (list
+    ; ── transient/1 : construction, then persist ─────────────────────
+    (fn [] (erlang/apply mod :transient (list (vec-of (list)))))
+    (fn [] (erlang/apply mod :transient (list (vec-of (list 7 8 9)))))
+    (fn [] (erlang/apply mod :transient (list {})))
+    (fn [] (erlang/apply mod :transient (list {:a 1 :b 2})))
+    (fn [] (erlang/apply mod :transient (list (set-of (list 1 2 2 3)))))
+    (fn [] (erlang/apply mod :transient (list (erlang/apply :Elixir.BeamLisp.Delay :__struct__ (list)))))
+    ; a plain map whose `:__struct__` is a BINARY is not a struct → a map transient
+    (fn [] (erlang/apply mod :transient (list {:__struct__ "s" :a 1})))
+    ; ── transient/1 : non-collections raise the live ArgumentError ───
+    (fn [] (erlang/apply mod :transient (list 5)))
+    (fn [] (erlang/apply mod :transient (list nil)))
+    (fn [] (erlang/apply mod :transient (list "str")))
+    (fn [] (erlang/apply mod :transient (list true)))
+    (fn [] (erlang/apply mod :transient (list :kw)))
+    (fn [] (erlang/apply mod :transient (list (list 1 2))))
+    (fn [] (erlang/apply mod :transient (list (tuple :a :b))))
+    ; ── transient/1 : a REFERENCE struct raises (never a map transient) ─
+    (fn [] (erlang/apply mod :transient (list (erlang/apply :Elixir.BeamLisp.Atom :__struct__ (list)))))
+    (fn [] (erlang/apply mod :transient (list (erlang/apply :Elixir.BeamLisp.Volatile :__struct__ (list)))))
+    (fn [] (erlang/apply mod :transient (list (erlang/apply :Elixir.BeamLisp.Promise :__struct__ (list)))))
+    (fn [] (erlang/apply mod :transient (list (erlang/apply :Elixir.BeamLisp.Future :__struct__ (list)))))
+    (fn [] (erlang/apply mod :transient (list (erlang/apply :Elixir.BeamLisp.Reduced :__struct__ (list)))))
+
+    ; ── vector transient : build equals the persistent build ─────────
+    (fn [] (let [t (erlang/apply mod :transient (list (vec-of (list 1 2))))]
+             (erlang/apply mod :persistent! (list t))))
+    (fn [] (let [t (erlang/apply mod :transient (list (vec-of (list))))
+                  a (erlang/apply mod :conj! (list t 1))
+                  b (erlang/apply mod :conj! (list a 2))
+                  c (erlang/apply mod :conj! (list b 3))]
+             (erlang/apply mod :persistent! (list c))))
+    (fn [] (let [t (erlang/apply mod :transient (list (vec-of (list))))]
+             (BeamLisp.Vector/count
+               (erlang/apply mod :persistent!
+                 (list (reduce (fn [acc i] (erlang/apply mod :conj! (list acc i))) t (range 40)))))))
+    ; conj!/1 is a passthrough over ANY value
+    (fn [] (let [t (erlang/apply mod :transient (list (vec-of (list 1))))]
+             (erlang/apply mod :conj! (list t))))
+    (fn [] (erlang/apply mod :conj! (list 5)))
+
+    ; ── set transient ────────────────────────────────────────────────
+    (fn [] (let [t (erlang/apply mod :transient (list (set-of (list 1 2))))
+                  a (erlang/apply mod :conj! (list t 3))]
+             (erlang/apply mod :persistent! (list a))))
+    (fn [] (let [t (erlang/apply mod :transient (list (set-of (list 1 2))))
+                  a (erlang/apply mod :conj! (list t 2))]  ; idempotent
+             (erlang/apply :Elixir.BeamLisp.Set :count (list (erlang/apply mod :persistent! (list a))))))
+    (fn [] (let [t (erlang/apply mod :transient (list (set-of (list 1))))]
+             (erlang/apply mod :conj! (list t))))
+
+    ; ── map transient : both `[k v]` entry shapes ────────────────────
+    (fn [] (let [t (erlang/apply mod :transient (list {}))
+                  a (erlang/apply mod :conj! (list t (vec-of (list :k 7))))]
+             (erlang/apply mod :persistent! (list a))))
+    (fn [] (let [t (erlang/apply mod :transient (list {}))
+                  a (erlang/apply mod :conj! (list t (list :j 8)))]
+             (erlang/apply mod :persistent! (list a))))
+    (fn [] (let [t (erlang/apply mod :transient (list {:a 1}))]
+             (erlang/apply mod :get (list t :a 0))))
+    (fn [] (let [t (erlang/apply mod :transient (list {:a 1}))]
+             (erlang/apply mod :get (list t :zz :dv))))
+    (fn [] (let [t (erlang/apply mod :transient (list {:a 1}))
+                  a (erlang/apply mod :assoc! (list t :b 2))
+                  d (erlang/apply mod :dissoc! (list a :a))]
+             (erlang/apply mod :persistent! (list d))))
+
+    ; ── conj!/2 on a map transient : the map-entry ArgumentError ─────
+    (fn [] (let [t (erlang/apply mod :transient (list {}))]
+             (erlang/apply mod :conj! (list t 5))))
+    (fn [] (let [t (erlang/apply mod :transient (list {}))]
+             (erlang/apply mod :conj! (list t (vec-of (list :a :b :c))))))
+    (fn [] (let [t (erlang/apply mod :transient (list {}))]
+             (erlang/apply mod :conj! (list t (vec-of (list 1 2 3))))))
+    (fn [] (let [t (erlang/apply mod :transient (list {}))]
+             (erlang/apply mod :conj! (list t (vec-of (to-list (range 40)))))))
+    (fn [] (let [t (erlang/apply mod :transient (list {}))]
+             (erlang/apply mod :conj! (list t (set-of (list 1 2))))))
+    (fn [] (let [t (erlang/apply mod :transient (list {}))]
+             (erlang/apply mod :conj! (list t {:x 1}))))
+    ; a bad entry is reported WITHOUT consulting the state, even after persist
+    (fn [] (let [t (erlang/apply mod :transient (list {:a 1}))]
+             (erlang/apply mod :persistent! (list t))
+             (erlang/apply mod :conj! (list t 5))))
+    ; a VALID entry on a persisted transient consults the state and raises
+    (fn [] (let [t (erlang/apply mod :transient (list {:a 1}))]
+             (erlang/apply mod :persistent! (list t))
+             (erlang/apply mod :conj! (list t (list :k 1)))))
+
+    ; ── the one-way door ─────────────────────────────────────────────
+    (fn [] (let [t (erlang/apply mod :transient (list (vec-of (list 1))))]
+             (erlang/apply mod :persistent! (list t))
+             (erlang/apply mod :conj! (list t 2))))
+    (fn [] (let [t (erlang/apply mod :transient (list {:a 1}))]
+             (erlang/apply mod :persistent! (list t))
+             (erlang/apply mod :assoc! (list t :b 2))))
+    (fn [] (let [t (erlang/apply mod :transient (list {:a 1}))]
+             (erlang/apply mod :persistent! (list t))
+             (erlang/apply mod :dissoc! (list t :a))))
+    (fn [] (let [t (erlang/apply mod :transient (list {:a 1}))]
+             (erlang/apply mod :persistent! (list t))
+             (erlang/apply mod :get (list t :a 0))))
+    (fn [] (let [t (erlang/apply mod :transient (list (vec-of (list 1))))]
+             (erlang/apply mod :persistent! (list t))
+             (erlang/apply mod :persistent! (list t))))
+
+    ; ── persistent!/1 : the frozen values, and misuse ────────────────
+    (fn [] (erlang/apply mod :persistent! (list (erlang/apply mod :transient (list (vec-of (list 1 2 3)))))))
+    (fn [] (erlang/apply mod :persistent! (list (erlang/apply mod :transient (list {:x 1 :y 2})))))
+    (fn [] (erlang/apply :Elixir.BeamLisp.Set :to_list
+             (list (erlang/apply mod :persistent!
+                     (list (erlang/apply mod :transient (list (set-of (list 1 2 3)))))))))
+    (fn [] (erlang/apply mod :persistent! (list 5)))
+    (fn [] (erlang/apply mod :persistent! (list nil)))
+    (fn [] (erlang/apply mod :persistent! (list (tuple :a :b))))
+    (fn [] (erlang/apply mod :persistent! (list (tuple :"$transient" :vector))))
+    (fn [] (erlang/apply mod :persistent! (list (list :"$transient" :vector :forged))))
+    (fn [] (erlang/apply mod :persistent! (list (tv :bogus))))
+    (fn [] (erlang/apply mod :persistent! (list (tuple :other :vector :forged))))
+
+    ; ── malformed handles → FunctionClauseError / state ArgumentError ─
+    (fn [] (erlang/apply mod :conj! (list (tuple :x :y :z) 1)))
+    (fn [] (erlang/apply mod :conj! (list 5 1)))
+    (fn [] (erlang/apply mod :conj! (list (list :"$transient" :vector :forged) 1)))
+    (fn [] (erlang/apply mod :conj! (list (tv :bogus) 1)))
+    (fn [] (erlang/apply mod :conj! (list (tv :vector) 1)))
+    (fn [] (erlang/apply mod :conj! (list (tv :set) 1)))
+    (fn [] (erlang/apply mod :conj! (list (tv :map) 5)))
+    (fn [] (erlang/apply mod :assoc! (list 5 :a 1)))
+    (fn [] (erlang/apply mod :assoc! (list (tv :vector) :a 1)))
+    (fn [] (erlang/apply mod :dissoc! (list 5 :a)))
+    (fn [] (erlang/apply mod :dissoc! (list (tv :set) :a)))
+    (fn [] (erlang/apply mod :get (list (tv :vector) :a 0)))
+    (fn [] (erlang/apply mod :get (list 5 :a 0)))
+    (fn [] (let [t (erlang/apply mod :transient (list (set-of (list 1))))]
+             (erlang/apply mod :get (list t :a 0))))
+    (fn [] (let [t (erlang/apply mod :transient (list (vec-of (list 1))))]
+             (erlang/apply mod :assoc! (list t :a 1))))
+
+    ; ── hash_map/3, hash_map_empty/0 ─────────────────────────────────
+    (fn [] (erlang/apply mod :hash_map_empty (list)))
+    (fn [] (erlang/apply mod :hash_map (list :a 1 (list))))
+    (fn [] (erlang/apply mod :hash_map (list :a 1 (list :b 2))))
+    (fn [] (erlang/apply mod :hash_map (list :a 1 (list :b 2 :c 3))))
+    (fn [] (erlang/apply mod :hash_map (list :a 1 (list :a 2))))
+    (fn [] (erlang/apply mod :hash_map (list :a 1 (list :b))))
+    (fn [] (erlang/apply mod :hash_map (list :a 1 (list :b 2 :c))))
+    (fn [] (erlang/apply mod :hash_map (list :a 1 5)))
+    (fn [] (erlang/apply mod :hash_map (list :a 1 (vec-of (list :b 2)))))
+    (fn [] (erlang/apply mod :persistent! (list (erlang/apply mod :transient (list (erlang/apply mod :hash_map_empty (list)))))))))
+
+(defn- corpus [mod]
+  (Enum/map (cases mod) (fn [th] (obs th))))
+
+; ── the differential: probe answers == live answers ──────────────────────
+
+(deftest transient-pinned-matches-the-live-module
+  (testing "the pinned source answers exactly as the live module does"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (= :non_existing (erlang/apply :code :which (list shim))))
+      (let [l (corpus live)
+            p (corpus probe)]
+        (is (= l p) "probe answers equal the live module's on the whole corpus")
+        (doseq [i (range (count l))]
+          (is (= (nth l i) (nth p i)) (str "observation " i " " (nth l i) " vs " (nth p i)))))
+      (File/rm_rf! dir))))
+
+; ── the pinned surface: functions-only, no synthesized struct ────────────
+
+(deftest transient-pinned-export-surface
+  (testing "the pinned beam serves the live ABI and no struct surface"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      ; Both production and probe are pinned functions-only beams. Their
+      ; exported ABI, including the emitter's helper exports, is identical.
+      (is (= (Enum/sort (erlang/apply live :module_info (list :exports)))
+             (Enum/sort (erlang/apply probe :module_info (list :exports)))))
+      (is (erlang/function_exported probe :transient 1))
+      (is (erlang/function_exported probe :conj! 1))
+      (is (erlang/function_exported probe :conj! 2))
+      (is (erlang/function_exported probe :assoc! 3))
+      (is (erlang/function_exported probe :dissoc! 2))
+      (is (erlang/function_exported probe :persistent! 1))
+      (is (erlang/function_exported probe :get 3))
+      (is (erlang/function_exported probe :hash_map 3))
+      (is (erlang/function_exported probe :hash_map_empty 0))
+      ; the pinned emitter exports `defn-` helpers too (the family shape)
+      (is (erlang/function_exported probe :"self-mod" 0))
+      (is (erlang/function_exported probe :"struct-like?" 1))
+      (is (erlang/function_exported probe :"tags?" 2))
+      (is (erlang/function_exported probe :"bl-map?" 1))
+      (is (erlang/function_exported probe :"ref-tag?" 1))
+      (is (erlang/function_exported probe :"transient-tuple?" 2))
+      (is (erlang/function_exported probe :"alive-kind?" 2))
+      (is (erlang/function_exported probe :"alive-inner" 2))
+      (is (erlang/function_exported probe :"vector-entry?" 1))
+      (is (erlang/function_exported probe :"two-list?" 1))
+      (is (erlang/function_exported probe :"function-clause!" 2))
+      (is (erlang/function_exported probe :state 1))
+      (is (erlang/function_exported probe :put_state 2))
+      (is (erlang/function_exported probe :map_transient 1))
+      ; FUNCTIONS-ONLY: `:struct_fields` was not forwarded, so no struct surface.
+      (is (not (erlang/function_exported probe :__struct__ 0)))
+      (is (not (erlang/function_exported probe :__struct__ 1)))
+      (is (not (erlang/function_exported probe :__info__ 1)))
+      ; the explicit seed option contract
+      (let [opts (seed-opts probe dir)]
+        (is (= probe (Keyword/fetch! opts :module)))
+        (is (= (src) (Keyword/fetch! opts :file)))
+        (is (= false (Keyword/fetch! opts :load?)))
+        (is (erlang/is_binary (Keyword/fetch! opts :source_hash))))
+      (File/rm_rf! dir))))
+
+; ── the process-local state: another process sees NO slot ────────────────
+
+(deftest transient-state-is-process-local
+  (testing "a handle sent to another process finds no dictionary slot"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      ; the SAME handle, the SAME VM — a DIFFERENT process. The state lives in the
+      ; creator's dictionary, so the worker finds no slot and raises. `p`/`t` are
+      ; LOCALS: a Task process carries the closure's values, not this file's
+      ; namespace, so the closure reaches only remote calls.
+      (let [p probe
+            t (erlang/apply p :transient (list (vec-of (list 1 2))))
+            r (Task/await
+                (Task/async
+                  (fn []
+                    (try (do (erlang/apply p :conj! (list t 9)) :no-raise)
+                         (catch e (list (:__struct__ e) (Elixir.Exception/message e))))))
+                5000)]
+        (is (= (list :Elixir.ArgumentError "operation on an already-persisted transient") r))
+        ; the CREATOR's transient is untouched: it still builds [1 2 3].
+        (is (= [1 2 3]
+               (let [a (erlang/apply p :conj! (list t 3))]
+                 (erlang/apply p :persistent! (list a))))))
+      (File/rm_rf! dir))))
+
+; ── persistent! deletes the dictionary slot (no leak) ────────────────────
+
+(deftest transient-persistent-deletes-the-slot
+  (testing "persistent! removes the process-dictionary slot"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      (let [t (erlang/apply probe :transient (list (vec-of (list 1 2))))
+            key (erlang/element 3 t)]
+        (is (some? (Process/get key)))
+        (erlang/apply probe :persistent! (list t))
+        (is (nil? (Process/get key))))
+      (File/rm_rf! dir))))
+
+; ── the pinned beam AT the production atom, saved and restored ───────────
+
+(deftest transient-pinned-beam-stands-in-at-the-production-atom
+  (testing "the production atom serves and raises on the pinned beam, then the live beam returns"
+    (let [dir (tmp-dir)
+          out (str dir "/prod")
+          beam (Path/join out (str live ".beam"))
+          orig-path (erlang/apply :code :which (list live))
+          orig-bin (File/read! (erlang/list_to_binary orig-path))
+          before (corpus live)]
+      (is (not= :non_existing orig-path) "precondition: the live beam is a readable file")
+      (BeamLisp.AOT/compile_host_file (src) (seed-opts live out))
+      (is (File/exists? beam))
+      (try
+        (drop! live)
+        (code/load_binary live (erlang/binary_to_list beam) (File/read! beam))
+        ; the pinned beam answers EXACTLY as the live one did at this atom,
+        ; observation for observation.
+        (is (= before (corpus live)))
+        (is (= [1 2 3]
+               (let [t (erlang/apply live :transient (list (vec-of (list 1 2))))]
+                 (erlang/apply live :persistent! (list (erlang/apply live :conj! (list t 3)))))))
+        (is (= "no function clause matching in BeamLisp.Transient.conj!/2"
+               (try (erlang/apply live :conj! (list 5 1)) nil (catch e (ex-message e)))))
+        (finally
+          (drop! live)
+          (code/load_binary live orig-path orig-bin)))
+      ; RESTORED: the live beam owns the atom and answers again.
+      (is (= orig-path (erlang/apply :code :which (list live))))
+      (is (= before (corpus live)) "the restored live beam answers as before")
+      (File/rm_rf! dir))))

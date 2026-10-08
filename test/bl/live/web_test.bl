@@ -5,13 +5,102 @@
 ; every callback to bl functions. These tests pin that a bl handler's
 ; ergonomic returns ([:ok s] · [:push msgs s] · [:stop r s]) lower to the exact
 ; WebSock tuples, and that hyphenated handler keys (:handle-in) resolve.
+;
+; THE ADAPTER UNDER TEST IS BUILT HERE, AT ITS OWN EXACT ATOM, from
+; `priv/host/web_socket.bl`. The committed seed beam at
+; `Elixir.BeamLisp.WebSocket` is one GENERATION of that source and a generation
+; can lag it — when this test was written it did, and the lagging beam failed at
+; `init`: it reached a helper through a `host.web-socket` namespace VAR, which
+; exists only in a VM that compiled the source, so the adapter worked in the
+; compiler's VM and nowhere else. Compiling the pinned source at the EXACT atom
+; and loading it OVER the seed tests the contract the seed is regenerated from,
+; on the image a fresh boot has: no namespace shim, and no `host.web-socket`
+; vars. The seeded beam is saved first and RESTORED in a `finally`, so a run
+; leaves the live atom exactly as it found it.
+;
+; Run: bin/bl test test/bl/live/web_test.bl
 
 (ns live.web.test)
 
 (def ^:private Adapter (erlang/binary_to_atom "Elixir.BeamLisp.WebSocket"))
+(def ^:private shim :Elixir.BeamLisp.Ns.Host.WebSocket)
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- host-source [] (Path/join (BeamLisp/cwd) "priv/host/web_socket.bl"))
+
+(defn- tmp-dir []
+  (str (System/tmp_dir!) "/bl_live_ws_" (erlang/unique_integer (list :positive))))
+
 (defn- wrap [handlers state] (erlang/apply Adapter :wrap (list handlers state)))
 (defn- init [w] (erlang/apply Adapter :init (list w)))
 (defn- handle-in [frame w] (erlang/apply Adapter :handle_in (list frame w)))
+
+(defn- drop! [mod] (do (code/purge mod) (code/delete mod) :ok))
+
+;; A var read, normalized so a raise is a value: [:value v] | [:raise Class].
+(defn- fetch-var [ns name]
+  (try (tuple :value (BeamLisp.Env/fetch! ns name))
+       (catch e (tuple :raise (:__struct__ e)))))
+
+(defn- drop-ns-vars!
+  "Remove EVERY `host.web-socket` definition the pinned compile interned while it
+   evaled the source. A fresh boot has none, and a helper that reached its
+   neighbour through one must not be excused by this VM either."
+  []
+  (doseq [name (maps/keys (BeamLisp.Env/ns_defs "host.web-socket"))]
+    (BeamLisp.Env/undefine_var "host.web-socket" name)))
+
+(defn- ns-snapshot
+  "The namespace's whole binding set, so the scoped removal above can be undone:
+   `undefine_var` drops the value, its LINK and its `ns_defs` row, and restoring
+   fewer than all three would leave a namespace that looks present and is not."
+  [ns]
+  (let [defs (BeamLisp.Env/ns_defs ns)]
+    (tuple defs
+           (Enum/map (maps/keys defs)
+                     (fn [name]
+                       (tuple name
+                              (BeamLisp.Env/fetch! ns name)
+                              (BeamLisp.Env/link ns name)))))))
+
+(defn- restore-ns! [ns snap]
+  (doseq [e (erlang/element 2 snap)]
+    (let [name (erlang/element 1 e)
+          value (erlang/element 2 e)
+          link (erlang/element 3 e)]
+      (BeamLisp.Env/intern ns name value)
+      (if (nil? link) :ok (BeamLisp.Env/put_link ns name link))))
+  (BeamLisp.Env/put_ns_defs ns (erlang/element 1 snap))
+  :ok)
+
+(defn- with-pinned-adapter
+  "Run `f` with the pinned source compiled at `Adapter`'s EXACT atom and loaded
+   over the seed: `:load? false` writes the beam without loading it, so the shim
+   the compile builds beside it never reaches the code path, and the
+   `host.web-socket` vars it interns are dropped. The seed beam is saved first
+   and restored whatever `f` does."
+  [f]
+  (let [dir (tmp-dir)
+        orig-path (erlang/apply :code :which (list Adapter))
+        orig-bin (if (erlang/is_list orig-path)
+                   (File/read! (erlang/list_to_binary orig-path))
+                   nil)
+        res (BeamLisp.AOT/compile_host_file (host-source)
+              (list (t2 :module Adapter) (t2 :output_dir dir) (t2 :load? false)))
+        path (nth res 1)
+        snap (ns-snapshot "host.web-socket")]
+    (try
+      (do (drop! Adapter)
+          (drop! shim)
+          (code/load_binary Adapter (erlang/binary_to_list path) (File/read! path))
+          (drop-ns-vars!)
+          (f))
+      (finally
+        (restore-ns! "host.web-socket" snap)
+        (drop! Adapter)
+        (if orig-bin (code/load_binary Adapter orig-path orig-bin) :ok)
+        (File/rm_rf! dir)))))
 
 ;; a text frame as WebSock delivers it: {payload, [opcode: :text]}
 (defn- text-frame [s]
@@ -21,40 +110,85 @@
 ;; ── init returns a push ──────────────────────────────────────────────
 
 (deftest init-push-lowers-to-websock-tuple
-  (let [handlers {:init (fn [s] [:push [[:text "hi"]] s])}
-        w (wrap handlers nil)
-        r (init w)]
-    ; {:push, [{:text, "hi"}], wrap}
-    (is (= :push (erlang/element 1 r)))
-    (is (= (erlang/list_to_tuple (list :text "hi"))
-           (first (erlang/element 2 r))))))
+  (with-pinned-adapter
+    (fn []
+      (let [handlers {:init (fn [s] [:push [[:text "hi"]] s])}
+            w (wrap handlers nil)
+            r (init w)]
+        ; {:push, [{:text, "hi"}], wrap}
+        (is (= :push (erlang/element 1 r)))
+        (is (= (erlang/list_to_tuple (list :text "hi"))
+               (first (erlang/element 2 r)))))
+
+      ; TWO messages take the `Enum/map` lane — the mapper that must be a CALL on
+      ; this module, never a `host.web-socket` var lookup.
+      (let [handlers {:init (fn [s] [:push [[:text "a"] [:ping "p"]] s])}
+            r (init (wrap handlers nil))]
+        (is (= :push (erlang/element 1 r)))
+        (is (= (list (erlang/list_to_tuple (list :text "a"))
+                     (erlang/list_to_tuple (list :ping "p")))
+               (erlang/element 2 r))))
+
+      ; ... and the adapter stands ALONE: no shim module, no namespace vars.
+      (is (= :non_existing (erlang/apply :code :which (list shim))))
+      (is (= 0 (erlang/map_size (BeamLisp.Env/ns_defs "host.web-socket")))))))
 
 ;; ── handle-in (hyphenated key!) echoes ───────────────────────────────
 
 (deftest handle-in-key-resolves-and-echoes
-  ; the whole reason `wrap` normalizes keys: :handle-in crosses as a string
-  (let [handlers {:handle-in (fn [frame s]
-                               [:push [[:text (str "echo:" (nth frame 1))]] s])}
-        w (wrap handlers nil)
-        r (handle-in (text-frame "yo") w)]
-    (is (= :push (erlang/element 1 r)))
-    (is (= (erlang/list_to_tuple (list :text "echo:yo"))
-           (first (erlang/element 2 r))))))
+  (with-pinned-adapter
+    (fn []
+      ; the whole reason `wrap` normalizes keys: :handle-in crosses as a string
+      (let [handlers {:handle-in (fn [frame s]
+                                   [:push [[:text (str "echo:" (nth frame 1))]] s])}
+            w (wrap handlers nil)
+            r (handle-in (text-frame "yo") w)]
+        (is (= :push (erlang/element 1 r)))
+        (is (= (erlang/list_to_tuple (list :text "echo:yo"))
+               (first (erlang/element 2 r)))))
+
+      ; two outbound messages — the map lane again, this time through handle_in
+      (let [handlers {:handle-in (fn [frame s] [:push [[:text "one"] [:text "two"]] s])}
+            r (handle-in (text-frame "x") (wrap handlers nil))]
+        (is (= 2 (erlang/length (erlang/element 2 r))))
+        (is (= (erlang/list_to_tuple (list :text "one"))
+               (first (erlang/element 2 r))))))))
 
 ;; ── :ok return keeps the connection, updates state ───────────────────
 
 (deftest ok-return-updates-state
-  (let [handlers {:handle-in (fn [frame s] [:ok (+ s 1)])}
-        w (wrap handlers 0)
-        r (handle-in (text-frame "x") w)]
-    (is (= :ok (erlang/element 1 r)))
-    ; the wrap's :state field advanced to 1
-    (is (= 1 (erlang/map_get :state (erlang/element 2 r))))))
+  (with-pinned-adapter
+    (fn []
+      (let [handlers {:handle-in (fn [frame s] [:ok (+ s 1)])}
+            w (wrap handlers 0)
+            r (handle-in (text-frame "x") w)]
+        (is (= :ok (erlang/element 1 r)))
+        ; the wrap's :state field advanced to 1
+        (is (= 1 (erlang/map_get :state (erlang/element 2 r))))))))
 
 ;; ── a missing optional callback is a no-op (stays connected) ─────────
 
 (deftest missing-callback-is-ok
-  (let [w (wrap {} 42)
-        r (handle-in (text-frame "anything") w)]
-    (is (= :ok (erlang/element 1 r)))
-    (is (= 42 (erlang/map_get :state (erlang/element 2 r))))))
+  (with-pinned-adapter
+    (fn []
+      (let [w (wrap {} 42)
+            r (handle-in (text-frame "anything") w)]
+        (is (= :ok (erlang/element 1 r)))
+        (is (= 42 (erlang/map_get :state (erlang/element 2 r)))))
+
+      ; and a state that is not the wrap is refused at the exact atom too
+      (is (= :Elixir.FunctionClauseError
+             (try (do (init 42) :no-raise)
+                  (catch e (:__struct__ e))))))))
+
+;; ── the scoped removal is undone ─────────────────────────────────────
+
+(deftest pinned-run-restores-the-namespace-it-removed
+  (testing "the compile's own bindings are back after a scoped run"
+    ; `with-pinned-adapter` interns `host.web-socket` when it compiles the
+    ; source, then REMOVES every binding for the duration of the body. If the
+    ; removal were not undone, the namespace would be EMPTY here and a later
+    ; file in the same image would find the adapter's helpers dangling.
+    (with-pinned-adapter (fn [] :ok))
+    (is (erlang/> (erlang/map_size (BeamLisp.Env/ns_defs "host.web-socket")) 0))
+    (is (= :value (erlang/element 1 (fetch-var "host.web-socket" "normalize-msg"))))))

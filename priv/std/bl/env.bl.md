@@ -25,7 +25,7 @@ as data. A broken `env.bl` degrades what the tree can do — its tasks, its port
 
 ```beam-lisp silent
 (ns bl.env
-  (:require [bl.util :as u]))
+  (:require [bl.util :as u] [bl.loading :as loading]))
 ```
 
 ## Discovery
@@ -125,14 +125,41 @@ worst kind of configuration bug.
   :watch BOOL}`.
 - `:ports` — name → a port number, or `{:port N}` (`0` = the OS chooses).
 - `:env` — name → value, the environment the tree expects.
+- `:loading` — `{:environment-env "BL_ENV" :development :lazy :production :startup
+  :roots []}`. `bl serve` initializes declared entry dependencies before running
+  the entry in production (`production` or `prod`), and stays lazy otherwise.
+  Change `:environment-env` for an existing application's mode variable. Optional
+  `:roots` adds dynamically selected libraries; never include the entry program.
+  Unsupported policies are errors. See [loading](loading.bl).
 - `:app` — `{:name :vsn :applications :mod}`: what this tree IS as an OTP
   application, so a build need not interrogate the running VM about itself.
-- `:build` — `{:paths :seed :out :native :jobs :ex}`: which roots hold build
-  sources, where the output goes, which crates are native, how wide to compile.
-  `:ex :exclude` holds paths RELATIVE TO `:ex :root`, since that is what they are
-  matched against.
+- `:build` — `{:paths :seed :out :native :jobs :ex :exclude}`: which roots hold
+  build sources, where the output goes, which crates are native, how wide to
+  compile, and which sources must NEVER be compiled. `:exclude` holds paths
+  RELATIVE TO THE PROJECT ROOT (the env.bl's directory, like every other path
+  here): each names a FILE (matched exactly) or a DIRECTORY (every source
+  beneath it — the separator is what makes `src/foo` miss `src/foobar`).
+  Excluded sources are entry programs that bind listeners, open ports or touch
+  devices when they load (FUP-015): the build filters them out BEFORE the
+  source graph is read, planned or compiled, so they never evaluate and never
+  emit a beam, and an exclusion cannot be bypassed by `--force`. A compiled
+  source that REQUIRES an excluded one is refused with an actionable error
+  rather than secretly loading it; an excluded source a previous build emitted
+  is pruned with its beams. `:ex :exclude` is the SUBSTRATE stage's exclusion
+  and holds paths RELATIVE TO `:ex :root`, since that is what they are matched
+  against.
 - `:release` — `{:name :vsn :output :permanent :include :cookie :env}`: what to
   assemble, and what must be permanent in it.
+- `:realm` — a string: the human alias of this project's realm (URLs, `bl realm`,
+  the console). Absent, the project directory's name is used.
+- `:shadow` — `["ns" …]`: library namespaces (std, lib, compat) this project
+  REPLACES within its own realm. A project file whose name a library owns is
+  refused unless the name is listed here; every other realm keeps the library's
+  version. See `docs/design/realm/namespace-ownership.md`.
+- `:uses` — `{"ns" {:path "dir" :hash "sha256:…"} …}`: source shared with other
+  projects, by content. Two projects declaring the same hash share one module;
+  different hashes cannot clash. (`:deps` is different: external libraries,
+  resolved into `bl.lock`.)
 - `:deps` — `[{:name :vsn} …]`: what this tree requires. The digests a
   resolution produced live in `bl.lock`, not here, so the declaration cannot
   disagree with itself.
@@ -162,8 +189,18 @@ per thing it could not. `normalize` collects them, so a file with three
 problems reports all three in one pass.
 
 ```beam-lisp silent
-(def known-keys [:name :instance :bl :paths :tasks :ports :schedules :env :doc
-                 :app :build :release :deps :browser :catalog :android])
+(def known-keys [:name :instance :bl :warm :vm :realm :shadow :uses :paths :tasks :ports
+                 :schedules :env :loading :doc :app :build :release :deps :browser :catalog :foundry :android])
+
+;; How `bl` reaches a warm VM for this tree. The LAUNCHER reads this key (it must
+;; decide before any VM exists), so the vocabulary lives in
+;; tooling/drop/src/transport.rs; a test keeps the two lists equal.
+(def warm-modes ["off" "attach" "start"])
+
+;; Which VM serves this project: its own (the default) or the one its build shares
+;; with every project that asks. The LAUNCHER reads it, before any VM exists
+;; (transport.rs VM_SPELLINGS); vm.paths/VM-SPELLINGS is the VM's copy.
+(def vm-modes ["own" "shared"])
 
 (defn- unknown-keys
   "The keys of `m` that nothing declares."
@@ -427,6 +464,10 @@ problems reports all three in one pass.
             [native nerr] (norm-strings (:native v) ":build :native" root)
             [seed serr]   (norm-opt-string (:seed v) ":build :seed" root)
             [out oerr]    (norm-opt-string (:out v) ":build :out" root)
+            ; Sources never compiled: entry programs that bind listeners on
+            ; load. A FILE matches exactly; a DIRECTORY matches every source
+            ; beneath it (the separator makes `src/foo` miss `src/foobar`).
+            [xcl xerr]    (norm-strings (:exclude v) ":build :exclude" root)
             jobs          (:jobs v)
             jerr          (if (or (nil? jobs) (erlang/is_integer jobs)) []
                               [":build :jobs must be a number"])
@@ -441,14 +482,15 @@ problems reports all three in one pass.
                   [{:root r :exclude x}
                    (concat rerr xerr
                            (unknown-errs ex [:root :exclude] ":build :ex"))]))
-            errs (concat perr nerr serr oerr jerr exerr
-                         (unknown-errs v [:paths :seed :out :native :jobs :ex] ":build"))]
+            errs (concat perr nerr serr oerr jerr xerr exerr
+                         (unknown-errs v [:paths :seed :out :native :jobs :ex :exclude] ":build"))]
         [(if (empty? errs)
            {:paths paths
             :seed seed
             :out out
             :native native
             :jobs (or jobs 1)
+            :exclude xcl
             :ex exv}
            nil)
          errs])))
@@ -517,6 +559,76 @@ problems reports all three in one pass.
             :abi (or (:abi v) "x86_64")}
            []]
           [nil errs]))))
+
+(def NAME-CHARS "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+(def HEX-CHARS "0123456789abcdef")
+(def HASH-PREFIX "sha256:")
+(def HASH-DIGITS 64)
+
+(defn- all-in?
+  "Whether every character of `s` is one of the characters of `allowed`."
+  [s allowed]
+  (every? (fn [c] (String/contains? allowed (str c))) (seq s)))
+
+(defn- name-ok?
+  "A URL- and file-safe name: non-empty, starts alphanumeric, then letters, digits, . _ -."
+  [v]
+  (and (string? v) (not (empty? v))
+       (all-in? v NAME-CHARS)
+       (not (String/contains? "._-" (subs v 0 1)))))
+
+(defn- hash-ok?
+  "`sha256:` followed by exactly 64 lowercase hex digits."
+  [v]
+  (and (string? v)
+       (String/starts_with? v HASH-PREFIX)
+       (= HASH-DIGITS (count (subs v (count HASH-PREFIX))))
+       (all-in? (subs v (count HASH-PREFIX)) HEX-CHARS)))
+
+(defn- norm-realm
+  "`:realm` — the realm's alias: a name safe in a URL and a file name."
+  [v]
+  (cond
+    (nil? v) [nil []]
+    (name-ok? v) [v []]
+    :else [nil [":realm must be a name of letters, digits, . _ - (starting with a letter or digit)"]]))
+
+(defn- norm-shadow
+  "`:shadow` — the library namespaces this project replaces in its realm: a vector
+   of namespace strings. That each names a namespace a library owns is checked by
+   the loader (it alone knows the tiers); here only the shape."
+  [v]
+  (cond
+    (nil? v) [[] []]
+    (not (vector? v)) [[] [":shadow must be a vector of namespace strings"]]
+    (not (every? string? v)) [[] [":shadow entries must be namespace strings"]]
+    :else [(vec (distinct v)) []]))
+
+(defn- norm-uses
+  "`:uses` — source shared with other projects, by content: a map of namespace
+   string -> {:path :hash}. The hash is what makes two projects' declarations the
+   same module, so it is required and must have its one shape."
+  [v]
+  (cond
+    (nil? v) [{} []]
+    (not (map? v)) [{} [":uses must be a map of namespace -> {:path :hash}"]]
+    :else
+      (reduce
+        (fn [acc [ns d]]
+          (let [errs (if (map? d)
+                       (concat
+                         (if (string? ns) [] [":uses keys are namespace strings"])
+                         (if (string? (:path d)) [] [(str ":uses " (pr-str ns) " needs :path, a string")])
+                         (if (hash-ok? (:hash d))
+                           []
+                           [(str ":uses " (pr-str ns) " needs :hash as sha256:<64 hex>")])
+                         (unknown-errs d [:path :hash] (str ":uses " (pr-str ns))))
+                       [(str ":uses " (pr-str ns) " must be a map")])]
+            (if (empty? errs)
+              [(assoc (nth acc 0) ns {:path (:path d) :hash (:hash d)}) (nth acc 1)]
+              [(nth acc 0) (concat (nth acc 1) errs)])))
+        [{} []]
+        v)))
 
 (defn- norm-deps
   "`:deps` — the libraries this tree requires, as a list of `{:name :vsn}`. A
@@ -629,11 +741,49 @@ problems reports all three in one pass.
          errs])))
 ```
 
+```bl-result norm-app
+&BeamLisp.Ns.Bl.Env."norm-browser"/1
+```
+
 `normalize` assembles the value the runtime holds. It is total too: `:errors` is
 a list, `:paths` is a list, `:tasks` and `:ports` are maps — always the right
 shape, whatever the file said.
 
 ```beam-lisp silent
+(defn- norm-foundry
+  "Foundry discovery is data, never a hook. Paths stay inside the source tree."
+  [value root]
+  (let [o (:observability value)
+        relative? (fn [p] (and (string? p) (not= "" p)
+                               (not (String/starts_with? p "/"))
+                               (not (some #(= ".." %) (String/split p "/")))))
+        errs (cond
+               (nil? value) []
+               (not (map? value)) [":foundry must be a map"]
+               (not (map? o)) [":foundry :observability must be a map"]
+               :else (concat
+                 (unknown-errs value [:observability] ":foundry")
+                 (unknown-errs o [:version :transport :schema :local-command :window-lines
+                                :max-record-bytes :domains :identity :content] ":foundry :observability")
+                 (when (not= 1 (:version o)) [":foundry :version must be 1"])
+                 (when (not= :journald (:transport o)) [":foundry :transport must be :journald"])
+                 (when (not (relative? (:schema o))) [":foundry :schema must be a relative source path"])
+                 (when (not (relative? (:local-command o))) [":foundry :local-command must be a relative source path"])
+                 (when (not (and (erlang/is_integer (:window-lines o)) (<= 1 (:window-lines o) 500)))
+                   [":foundry :window-lines must be 1..500"])
+                 (when (not= 8192 (:max-record-bytes o)) [":foundry :max-record-bytes must be 8192"])
+                 (when (not= :keyed-handles (:identity o)) [":foundry :identity must be :keyed-handles"])
+                 (when (not= :excluded (:content o)) [":foundry :content must be :excluded"])
+                 (when (not (and (vector? (:domains o)) (<= (count (:domains o)) 32)
+                                 (every? keyword? (:domains o)))) [":foundry :domains must be at most 32 keywords"])))]
+    (if (or (nil? value) (seq errs)) [nil errs]
+      [(assoc value :observability (assoc o :schema (Path/expand (:schema o) root)
+                                           :local-command (Path/expand (:local-command o) root))) []])))
+
+(defn- norm-loading [value]
+  (try [(loading/validate value) []]
+       (catch e [nil [(ex-message e)]])))
+
 (defn normalize
   "The project value as the runtime reads it: `:paths` absolute against `root`,
    tasks and ports keyed by name, `:errors` — every shape problem found, as
@@ -646,14 +796,29 @@ shape, whatever the file said.
         ierr           (if (or (nil? inst) (string? inst)) [] [":instance must be a string"])
         blspec         (:bl m)
         blerr          (if (or (nil? blspec) (string? blspec)) [] [":bl must be a string, e.g. \"latest\""])
+        warmspec       (:warm m)
+        warm-ok?       (some (fn [w] (= w warmspec)) warm-modes)
+        werr           (if (or (nil? warmspec) warm-ok?)
+                         []
+                         [(str ":warm must be one of " (pr-str warm-modes))])
+        vmspec         (:vm m)
+        vm-ok?         (some (fn [w] (= w vmspec)) vm-modes)
+        vmerr          (if (or (nil? vmspec) vm-ok?)
+                         []
+                         [(str ":vm must be one of " (pr-str vm-modes))])
         [tasks terr]   (norm-tasks (:tasks m) root)
         [ports porerr] (norm-ports (:ports m))
         [sched serr]   (norm-schedules (:schedules m))
         [env eerr]     (norm-env (:env m) ":env")
+        [load lerr]    (norm-loading (:loading m))
         [app aerr]     (norm-app (:app m))
         [bld berr]     (norm-build (:build m) root)
         [rel rerr]     (norm-release (:release m) root)
+        [realm rlmerr] (norm-realm (:realm m))
+        [shadow shderr] (norm-shadow (:shadow m))
+        [uses useserr] (norm-uses (:uses m))
         [deps derr]    (norm-deps (:deps m))
+        [fnd fnderr]   (norm-foundry (:foundry m) root)
         [brw brerr]    (norm-browser (:browser m))
         [cat cerr]     (norm-catalog (:catalog m) root)
         [andr anderr]  (norm-android (:android m))]
@@ -662,29 +827,37 @@ shape, whatever the file said.
      :name (if (string? nm) nm nil)
      :instance (if (string? inst) inst nil)
      :bl (if (string? blspec) blspec nil)
+     :warm (if warm-ok? warmspec nil)
+     :vm (if vm-ok? vmspec nil)
+     :realm realm
+     :shadow shadow
+     :uses uses
      :paths paths
      :tasks tasks
      :ports ports
      :schedules sched
      :env env
+     :loading load
      :app app
      :build bld
      :release rel
      :deps deps
+     :foundry fnd
      :browser brw
      :catalog cat
      :android andr
-     :errors (concat perr nerr ierr blerr terr porerr serr eerr aerr berr rerr derr
-                     brerr cerr anderr
+     :errors (concat perr nerr ierr blerr werr vmerr rlmerr shderr useserr terr porerr serr eerr aerr berr rerr derr
+                     fnderr brerr cerr lerr anderr
                      (map (fn [k] (str "unknown key " k)) (unknown-keys m known-keys)))}))
 
 (defn empty-project
   "A tree with no env.bl: a project value with nothing declared. Not a special
    case — every accessor reads it the same way it reads a declared one."
   [root]
-  {:path nil :root root :name nil :instance nil :bl nil :paths [] :tasks {} :ports {}
+  {:path nil :root root :name nil :instance nil :bl nil :warm nil :vm nil
+   :realm nil :shadow [] :uses {} :paths [] :tasks {} :ports {}
    :schedules []
-   :env {} :app nil :build nil :release nil :deps [] :browser nil :catalog nil :android nil
+   :env {} :loading loading/DEFAULTS :app nil :build nil :release nil :deps [] :browser nil :catalog nil :android nil
    :errors []})
 ```
 

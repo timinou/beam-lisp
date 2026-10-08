@@ -109,7 +109,8 @@
             [datom.store-ets :as store-ets]
             [proc.server :refer [extend-clause!]]
             [proc.table :as table]
-            [proc.tick :as tick]))
+            [proc.tick :as tick]
+            [diagnostics :as diag]))
 
 ;; ── the declaration, and its refusals ───────────────────────────────────
 
@@ -284,8 +285,10 @@
    ;; the job's own facts, as ONE value. `:db.type/term` rather than one
    ;; attribute per payload key: the queue cannot know a caller's attributes, and
    ;; a schema it invented for them would make every job kind a schema change.
+   {:db/ident :job/diagnostic-context :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
    {:db/ident :job/payload :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
    {:db/ident :job/result :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
+   {:db/ident :job/last-failure :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
    {:db/ident :job/last-error :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
    {:db/ident :job/finished-at :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
    {:db/ident :queue/key :db/valueType :db.type/string :db/cardinality :db.cardinality/one
@@ -534,7 +537,8 @@
                          :job/at at
                          :job/enqueued-at now
                          :job/attempts 0
-                         :job/payload job}
+                         :job/payload job
+                         :job/diagnostic-context (merge (diag/context) {:diagnostics/job-id (diag/new-id)})}
                         (if (some? ticket) {:job/ticket ticket} {})
                         (if (some? pk) {:job/partition pk} {}))
              ;; The row ASSERTS the ticket (so the tempid UPSERTS onto a job that
@@ -915,6 +919,11 @@
   (let [payload (:job/payload j)]
     (if (map? payload) (merge payload j) j)))
 
+(defn- emit-entry! [entry event fields]
+  (if-let [captured (:diagnostics entry)]
+    (diag/with-captured-fn captured #(diag/emit! event fields))
+    (diag/emit! event fields)))
+
 (defn- launch!
   "Claim `job` and start its body on its OWN process. Returns the running entry,
    or nil when another claimer took it first.
@@ -937,13 +946,15 @@
             e (:db/id claimed)
             token (:job/owner claimed)
             body (:perform q)
-            me (erlang/self)]
+            me (erlang/self)
+            captured (diag/with-linkage-fn (:job/diagnostic-context claimed {}) diag/capture)]
         (spawn (fn []
                  (let [out (try
-                             {:ok (body (job-map claimed))}
-                             (catch err {:error (error-text err)}))]
+                             {:ok (diag/with-captured-fn captured #(body (job-map claimed)))}
+                             (catch err {:error (error-text err) :failure (diag/safe-error err)}))]
                    (erlang/send me (tuple :bl-queue/finished ref out)))))
-        {:ref ref
+        (emit-entry! {:diagnostics captured} :proc.queue/claimed {:proc.queue/attempt (:job/attempts claimed)})
+        {:ref ref :diagnostics captured
          :e e
          :token token
          :attempts (:job/attempts claimed)
@@ -976,10 +987,12 @@
           ;; work fell into. `:job/finished-at` is written on THIS arm as well as
           ;; on the success one, because it is the ONE attribute `prune!` ages a
           ;; terminal job by: a `:failed` row without it could never be reaped.
-          (with-ticket [[:db/add e :job/state :failed]
+          (with-ticket [[:db/add e :job/last-failure (diag/safe-error {:kind (get-in out [:failure :diagnostics/error-kind])})]
+                        [:db/add e :job/state :failed]
                         [:db/add e :job/last-error err]
                         [:db/add e :job/finished-at now]])
-          (with-ticket [[:db/add e :job/state :queued]
+          (with-ticket [[:db/add e :job/last-failure (diag/safe-error {:kind (get-in out [:failure :diagnostics/error-kind])})]
+                        [:db/add e :job/state :queued]
                         [:db/add e :job/at (+ now (backoff-ms (:retry decl) attempts))]
                         [:db/add e :job/last-error err]]))))))
 
@@ -1008,7 +1021,12 @@
     (if (nil? (get (:running q) ref))
       st
       (do
-        (settle! st (get (:running q) ref) out)
+        (let [entry (get (:running q) ref)
+              settlement (settle! st entry out)]
+          (emit-entry! entry :proc.queue/settled
+            (merge (:failure out {}) {:proc.queue/settlement settlement
+                                     :proc.queue/outcome (if (contains? out :ok) :returned :raised)
+                                     :proc.queue/attempt (:attempts entry)})))
         (assoc st :queue (assoc q :running (dissoc (:running q) ref)))))))
 
 (defn run-due
@@ -1036,6 +1054,9 @@
                                 (let [lu (:lease-until (second entry))]
                                   (and (some? lu) (<= lu now))))
                               (:running q0)))
+        _ (doseq [[ref entry] (:running q0)]
+            (when-not (contains? live ref)
+              (emit-entry! entry :proc.queue/claim-expired {:proc.queue/attempt (:attempts entry)})))
         st (assoc st :queue (assoc q0 :running live))
         room (- (:concurrency (:decl q0)) (count live))
         busy (busy-partitions live)

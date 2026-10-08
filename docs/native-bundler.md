@@ -128,7 +128,7 @@ magic check) and fails loudly on a host-only payload — the classic
 3. **Versioned payload dir**: `<install>/<sha8>/` — extraction is atomic
    (`.tmp` + rename). A payload dir is removed only when nothing holds it
    (see §15, *Cleaning up*): a VM execs helper binaries (`inet_gethost`,
-   `erl_child_setup`) out of its own erts dir, lazily, and a daemon runs from
+   `erl_child_setup`) out of its own erts dir, lazily, and a warm VM runs from
    its tree for its whole life, so deleting a tree some process runs from kills
    it with `Can not execute …/erts-*/bin/inet_gethost : enoent`.
 4. **Exec**:
@@ -252,31 +252,31 @@ Two release-integration findings baked into the design:
    a `--` separator LEAKS into argv (verified empirically), so the launcher
    does not add one.
 
-## 12. The warm daemon — a ~instant dev loop
+## 12. The warm VM — a ~instant dev loop
 
 A drop's launcher does more than extract-and-exec: before it cold-boots the
-release VM (~1s), it looks for a **warm `bl daemon`** for the caller's tree and
+release VM (~1s), it looks for a **warm VM** for the caller's tree and
 forwards the command to it over a Unix socket. A served command returns in
 ~20ms instead of ~1s. The escript path costs ~30s per invocation (it cold-loads
-its whole archive every time) and cannot load NIFs at all — the daemon+drop
+its whole archive every time) and cannot load NIFs at all — the warm-VM + drop
 pair is strictly better, so the escript is deprecated.
 
-### One daemon per tree and build
+### One warm VM per tree and build
 
-A daemon runs ONE build's code for ONE tree, so it is named by both. The tree
+A warm VM runs ONE build's code for ONE tree, so it is named by both. The tree
 key is the first 16 hex of `sha256(realpath(root))`; the build is `BL_BUILD_ID`
 — the payload's sha8, which the launcher sets, or `src` for a checkout run
 through `bin/bl`. Its endpoints live under `$XDG_RUNTIME_DIR/beam_lisp/` (a
 `0700` dir): `<tree>-<build>.sock` (the `AF_UNIX` stream socket, `0600`),
 `<tree>-<build>.token` (a 256-bit secret), and `<tree>-<build>.meta` (pid, root,
-build, start time). Two builds used in one tree are two daemons, side by side;
-`daemon stop` removes all three files. The socket's existence is discovery; an
+build, start time). Two builds used in one tree are two warm VMs, side by side;
+`bl realm stop` removes all three files. The socket's existence is discovery; an
 **authenticated hello** (constant-time token compare + matching tree
 fingerprint + the build the client expects) is authority.
 
 ### The wire
 
-Frames are length-prefixed (`{packet, 4}`) Erlang terms (ETF). The daemon
+Frames are length-prefixed (`{packet, 4}`) Erlang terms (ETF). The warm VM
 decodes with `binary_to_term(bin, [:safe])` and then a total, allowlisted schema
 check — a malformed or oversized frame is refused, never executed. A client
 `hello` (`tree`, `token`, `build`) gets `ready` or a `reject` (`unauthorized` ·
@@ -286,19 +286,19 @@ check — a malformed or oversized frame is refused, never executed. A client
 
 ### A VM per project, a process per request
 
-The daemon holds a **warm VM per project** and runs each command as its own
-process under that VM. Per request it forks a fresh env, binds the client's
+One warm VM serves one project; each command runs as its own process under
+it. Per request the warm VM forks a fresh env, binds the client's
 roots and cwd/argv, overlays the client's environment *process-locally* (never
 the node-global table), and routes stdout through a per-request group-leader
 proxy — so N concurrent commands are N processes, never a queue, and one
 command's env never leaks into the next. Two `bl run`s from two terminals run at
 once. Only the reload/intent **sequencer** takes turns: a save's stage→commit
 and a dashboard-launched task ride one sequencer so they are ordered against
-each other, never racing a program the daemon is running.
+each other, never racing a program the warm VM is running.
 
 ### Staleness is a restart, never a hot-swap
 
-The daemon freezes the compiler key it booted with. When the checkout changes
+The warm VM freezes the compiler key it booted with. When the checkout changes
 under it (the live key moves) or a client presents a different key, it refuses
 work with `restart_required`: a stale VM never serves: it is stopped and a fresh
 one loads a single coherent image. Mixing old loaded code with new sources is
@@ -307,15 +307,20 @@ the one thing a warm VM must not do.
 ### Using it
 
 ```
-bl daemon start     # become the daemon (blocks; the launcher runs it detached)
-bl daemon status    # a live daemon's pid, tree, build, compiler key, uptime
-bl daemon stop      # drain and exit; the socket is removed
+bl realm start      # start this project's warm VM (blocks; the launcher runs it detached)
+bl realm show       # the realm's VM: pid, tree, build, compiler key, uptime
+bl realm stop       # drain this project's realm and remove the socket
 
-BL_DAEMON=off       # every command cold-boots, no daemon
-BL_DAEMON=auto      # a missing daemon is auto-started, then attached
+--cold              # run this command in a fresh VM; never use a warm one
+--warm              # use the warm VM, starting one if none runs
+--root DIR          # the project root the warm VM is keyed on
 ```
 
-The fallback is total: no daemon (or `BL_DAEMON=off`) means each `bl` is an
+A project declares its default in `env.bl` (or `~/.config/bl/config.bl`) with
+`:warm "off" | "attach" | "start"` — flag beats `env.bl` beats `config.bl`
+beats the built-in `attach`.
+
+The fallback is total: no warm VM (or `--cold`) means each `bl` is an
 ordinary cold boot — correct, just slower. A command is never silently retried
 after its request frame is sent, because side effects may already have happened;
 a lost connection there is an unknown outcome (exit 1), not a re-run.
@@ -374,7 +379,7 @@ the macOS legs compile it to an empty cdylib and `wry/*` reads as ABSENT
 (§5, and the `defnative` doctrine). The Linux legs install
 `libgtk-3-dev libwebkit2gtk-4.1-dev libgtk-layer-shell-dev` first.
 
-The smoke step runs the artifact the way a user does — cold, no daemon, no
+The smoke step runs the artifact the way a user does — cold, no warm VM, no
 checkout — and asserts a live native surface of each tier: the language, a
 Rust NIF (`datom.store-fjall/available?`), Explorer (`datom.frame/available?`),
 the `lazy_memo` runtime, and the z3 port (`z3/check` → `sat`). A payload that
@@ -392,7 +397,7 @@ is what `bl self-update latest` fetches on a machine with no beam-lisp checkout.
 ## 15. One `bl` on PATH, many builds behind it
 
 `~/.local/bin/bl` is the launcher with NO payload. On every call it decides
-which build runs here, then runs it exactly as that drop would (daemon
+which build runs here, then runs it exactly as that drop would (warm-VM
 fast-path included). The decision is `bl which`:
 
 ```
@@ -464,16 +469,28 @@ Every write is temp + rename. At most one build runs on the machine at a time
 ```
 bl self-install [--source DIR]   put the launcher at ~/.local/bin/bl; record where beam-lisp lives
 bl self-update [NAME]            fetch or build NAME (default: stable, then latest)
-bl hooks install [DIR]           automatic builds / the latest guard, for the repo at DIR
+bl hooks install [DIR]           the staleness warnings / the latest guard, for the repo at DIR
+bl hooks status [DIR]            which recorded build no longer matches its inputs
 bl self-gc [--dry-run]           what the store holds, and why each build stays
 ```
 
 `bl hooks install` in a beam-lisp checkout adds `post-commit`, `post-merge`,
-`post-checkout` and `post-rewrite` to the hooks every worktree shares. Each
-queues the worktree that fired and starts one detached builder, which builds
-queued trees one at a time; a build of the `:source` checkout on `main` also
-moves `latest`. Uncommitted work never waits for a build: it runs from source.
-`BL_AUTOBUILD=off` stops the builds.
+`post-checkout` and `post-rewrite` to the hooks every worktree shares. Each is
+a check, not a build: it compares the commit the worktree's newest build was
+made from with HEAD, over the build inputs only, and prints one warning when an
+input moved:
+
+```
+bl: bleeding-edge was built from 06d5255d; build inputs have changed since (efdfb7e6)
+bl: when it suits you: `bl self-update bleeding-edge` in ~/code/beam-lisp, then `bl self-update` for latest
+```
+
+On the `:source` checkout's `main` the same check covers `latest`. A commit that
+only touches docs or tests warns nothing. The check is two git queries and
+reads no tree, so a commit or a merge costs no more than it did without hooks.
+Nothing is queued and nothing runs afterwards: a build takes minutes and holds
+the machine's one build lock, so you start it. Uncommitted work never waits for
+a build: it runs from source.
 
 In a project whose `env.bl` says `:bl "latest"`, `bl hooks install` adds a
 `pre-push` guard. When the local beam-lisp `main` has commits `origin/main` does
@@ -487,7 +504,7 @@ and called first. `bl hooks remove` puts them back.
 ### Cleaning up
 
 A payload dir stays while anything holds it: it is the build being run, a
-pointer names it (a channel, a tag, or a worktree that still exists), a daemon
+pointer names it (a channel, a tag, or a worktree that still exists), a warm VM
 serves it, a process runs from it, or it was used in the last
 `BL_DROP_KEEP_DAYS` (14) days. Anything else is removed after
 `BL_DROP_GRACE_HOURS` (24). The launcher sweeps after each first extraction;
@@ -508,3 +525,99 @@ beam-lisp 0.1.0
 
 `bl version --json` prints the whole record.
 
+
+## 16. Nix-built server drop — glibc floor = host
+
+**Why.** A drop built on a rolling-release workstation links that machine's
+glibc. Built on Arch (glibc 2.43), `beam.smp` needs `GLIBC_2.43`; a NixOS 25.05
+server has glibc 2.40 and the VM dies at start with
+`version 'GLIBC_2.43' not found` — found by Foundry's first end-to-end install
+(2026-10-04, Foundry BUG-001). glibc is backward compatible only: a binary runs
+on a glibc **at least** as new as the one it was linked against. So a server drop
+must be linked against a glibc **no newer than the server's**.
+
+**How.** `flake.nix` + `nix/beam.nix` + `nix/bl-drop.nix` build the whole drop
+inside nix, from the **same nixpkgs rev the servers run**
+(`apps/foundry/infra/flake.lock`, nixos-25.05):
+
+| input | source | why |
+|---|---|---|
+| OTP 29.0.1, Elixir 1.20.2 | built from upstream source with the pinned nixpkgs toolchain | 25.05 ships OTP 28 / Elixir 1.18 |
+| Rust NIFs (`native/*` except `wry_webview`) + `tooling/drop` | `rustc`/`cargo` from nixos-unstable, **linked by the pinned gcc + glibc** | rustler needs rustc ≥ 1.91; only the compiler is newer, never the libc |
+| hex deps | `fetchurl` per `bl.lock` digest | offline, reproducible |
+| crates | `importCargoLock` per `Cargo.lock` | offline |
+| z3 4.16.0, explorer 0.12.0 NIF | pinned release artifacts (glibc 2.39 / 2.35 floors) | already below the floor |
+
+`wry_webview` (gtk/webkit) is desktop-only and left out: on a server `wry/*`
+reads as absent.
+
+The last step rewrites every ELF in the payload to the FHS loader
+(`/lib64/ld-linux-x86-64.so.2`) with no RUNPATH, so the drop never depends on
+`/nix/store` paths existing on the target. On NixOS that loader is `nix-ld`'s
+(enabled by Foundry's host module), which resolves libc **from the host** — the
+host's glibc must therefore be ≥ the drop's floor, which is exactly the property
+this build guarantees.
+
+```sh
+nix build .#bl-drop                                  # → result/bl.drop
+tooling/drop/glibc-floor.sh result/bl.drop           # → "2.40  <file>"; must be ≤ the host's
+```
+
+`glibc-floor.sh DROP|DIR` prints the highest `GLIBC_2.N` any ELF needs (and
+which file). On the old workstation drop it prints `2.43  erts-17.0.1/bin/beam.smp`.
+Foundry's release builder enforces the same rule on its own (`release.py build
+--max-glibc`, refusal `runtime-glibc-too-new`), so a too-new drop fails in a
+second instead of at the server's first start.
+
+**Keep the pins in step.** When the servers move to a new nixpkgs
+(`apps/foundry/infra/flake.lock`), move this flake's `nixpkgs` input to the same
+rev (`nix flake lock --override-input nixpkgs github:NixOS/nixpkgs/<rev>`) and
+Foundry's `pinned-host-glibc` constant to that release's glibc.
+
+The workstation drop (`make-drops.sh`, §11) stays the right tool for the
+operator's own machine; a drop that ships to a server comes from this build.
+
+### Lean + always working (split, gates, one command)
+
+`nix/bl-drop.nix` is three derivations, each with a `lib.fileset` source holding
+only what it reads:
+
+| derivation | src | rebuilds when |
+|---|---|---|
+| `drop-tools` (launcher + `drop` pack tool) | `tooling/drop` | the tool changes |
+| `natives` (six server NIFs) | `native/<6 crates>` + their `Cargo.lock`s | a crate changes |
+| `bl-drop` (deps, `bl build`, self-build, ELF retarget) | `bin priv env.bl bl.lock` + `tooling/drop/{src,Cargo.*}` | any `.bl` change |
+
+`bl-drop` compiles no Rust: it takes the launcher/`drop` from `drop-tools`, and a
+`cargo` shim answers `bl build`'s native stage from `natives` (real cargo for
+anything else). OTP/Elixir are separate store paths, never rebuilt by a `.bl`
+change. Measured (this host, loaded): a one-line `.bl` change on the **old**
+single derivation = 54 min buildPhase (every NIF + the launcher recompiled,
+~54 min wall total 3235 s). After the split a `.bl` change should not
+rebuild `natives`/`drop-tools` — by construction of the filesets, NOT yet
+measured: the first split build was stopped before it finished (2026-10-04),
+so neither the split drop nor the gates below have run green yet
+(apps/foundry FUP-016).
+
+Gates (`nix flake check`, also the CI `nix-drop` job): `drop-runs` (the drop
+evaluates `(+ 1 2)` = 3) and `glibc-floor` (≤ 2.40). `tooling/drop/check-pins.sh`
+fails when this flake's nixpkgs ≠ `apps/foundry/infra/flake.lock`'s (it reads a
+sibling repo, so it is a script/CI step, not a sandboxed check).
+`nixpkgs-rust` (unstable) stays: it is the only pinned source of rustc ≥ 1.91
+without adding another input.
+
+One command: `tooling/drop/server-drop.sh` builds `.#bl-drop`, copies it to
+`~/.cache/foundry/drops/bl-nix-<sha8>.drop`, prints `path=` and `sha256=`
+(the Foundry deploy spec `:runtime {:path :sha256}`). Idempotent.
+
+### Dedicated service stores
+
+Set `DROP_STORE_ROOT` to an absolute directory to select the native drop store
+independently of application XDG data. The value names the store itself; no
+`drop` suffix is added. Empty, relative, filesystem-root and traversal paths
+are refused. `maintenance directory` reports the selected path.
+
+Use a service-owned directory with restricted permissions, outside durable
+application data. The verifier, application and maintenance tasks share that
+same setting. Payloads are reproducible; application databases and keys belong
+in their declared durable roots. An unset variable retains platform defaults.

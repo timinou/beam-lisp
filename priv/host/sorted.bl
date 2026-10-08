@@ -1,0 +1,418 @@
+; host/sorted.bl — the pinned HOST MODULE for `Elixir.BeamLisp.Sorted`.
+;
+; `BeamLisp.Sorted` is beam-lisp's ORDERED collection pair: `SortedMap` and
+; `SortedSet`, keyed in the language's `compare` order and backed by OTP's
+; `:gb_trees`. It is the substrate the EAV/datalog index rides on: a covering
+; index is an order-preserving key encoding plus a range scan, and
+; `subseq_entries`/`rsubseq_entries` ARE that scan.
+;
+; This file is the `.bl` port of `lib/beam_lisp/sorted.ex`'s `BeamLisp.Sorted`
+; half, compiled by `BeamLisp.AOT/compile_host_file` into ONE exact-named beam.
+; The two struct atoms the Elixir file also defined (`SortedMap`, `SortedSet`,
+; the shapes that carry the `:tree`) are pinned beside it by
+; `priv/host/sorted_map.bl` and `priv/host/sorted_set.bl`.
+;
+; THE STRUCT IS BUILT BY HAND, never by calling a synthesized `__struct__/1`.
+; The tag is the PRODUCTION atom, hard-coded, and that is deliberate rather than
+; sloppy: unlike `Vector`/`Set` — whose struct module IS the module their
+; functions live in, so `self-mod` names the tag — `Sorted`'s functions live in
+; a DIFFERENT module from the structs they build. `rt.bl` classifies a value by
+; comparing its `:__struct__` against the literal atoms
+; `Elixir.BeamLisp.Sorted.SortedMap`/`SortedSet` (`kind`/`literal-struct-kind`),
+; so a tag read from `self-mod` at a probe atom would be a strand the runtime
+; could not recognise. The atoms ARE the contract.
+;
+; ORDER IS THE LANGUAGE'S, not Erlang's. `:gb_trees` compares with `<`/`>`,
+; Erlang term order; `encode_key/1` projects `rt/compare`'s order into a term
+; whose native comparison agrees, and the tree is keyed by that projection. The
+; rank table MIRRORS `family-rank` (`priv/boot/rt.bl`) — the language's one
+; authority — rather than restating an order of its own:
+;
+;   nil=0  false=1  true=2  number=3  binary=4  symbol=5  keyword=6
+;   collection=7  other=8
+;
+; within a rank the payload is chosen so Erlang's own comparison gives the
+; answer `rt/compare` would: numbers compare numerically (ints and floats share
+; rank 3, so `1 < 1.5 < 2` across kinds), text compares by code point, and
+; sequences compare element-wise on ENCODED elements — which is what makes a
+; proper prefix sort before its extensions.
+;
+; THERE ARE HELPER FUNCTIONS HERE. A pinned module exports exactly its file's
+; defns, so the `defn-` helpers below are exports of this beam while the
+; recalled `sorted.ex` kept them private. That is the ONE deliberate divergence
+; from the live export surface, and it is the same one `priv/host/vector.bl`
+; records: the PUBLIC ABI — the 25 functions `rt.bl`, `core.bl` and the compiler
+; call, plus the struct atoms pinned beside this file — is the contract, and it
+; is exact. The ONE live export this beam cannot carry is Elixir's `__info__/1`
+; — the pinned emitter emits that only where `:struct_fields` synthesizes a
+; struct surface, and no runtime caller touches it. `test/bl/host_sorted_test.bl`
+; asserts the live export set is this beam's PLUS that one name, that the rest
+; of the difference is exactly the helpers above, and that the beam names
+; `BeamLisp.Env` nowhere (no pre-core var lookup can be reached from here).
+;
+; Run: bin/bl test test/bl/host_sorted_test.bl
+
+(ns host.sorted)
+
+; ── module-exact self reference, and the refusals ─────────────────────────
+
+(defn- self-mod
+  "The atom THIS source was compiled into, read from a fun literal compiled into
+   this file — module-exact, so the same source serves the production atom in
+   the seed and a probe atom under test without naming either."
+  []
+  (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+
+(defn- function-clause!
+  "The `FunctionClauseError` an unmatched clause head raised, named with THIS
+   module's own atom so a probe compile reports the probe atom. `ex-message`
+   renders it as `no function clause matching in <module>.<fn>/<arity>`, the
+   same text the live `%__MODULE__{}` clause heads produced."
+  [fname arity]
+  (erlang/error
+    (Elixir.FunctionClauseError/exception
+      (erlang/tuple_to_list
+        (tuple (tuple :module (self-mod))
+               (tuple :function fname)
+               (tuple :arity arity))))))
+
+; ── the value gates ───────────────────────────────────────────────────────
+;
+; A struct IS a map on the BEAM, so membership in the sorted family is decided
+; by the `:__struct__` tag — never by field presence, which would accept a
+; plain map that merely happens to carry a `:tree` key.
+
+(defn- tagged?
+  "A map whose atom `:__struct__` tag is `mod`. Tag dispatch, not shape
+   dispatch: a plain map with a `:tree` key is NOT a sorted map."
+  [x mod]
+  (and (erlang/is_map x)
+       (erlang/is_map_key :__struct__ x)
+       (erlang/== mod (erlang/map_get :__struct__ x))))
+
+(defn- sorted-map?
+  "A `%SortedMap{}` value, whoever built it."
+  [x]
+  (tagged? x :"Elixir.BeamLisp.Sorted.SortedMap"))
+
+(defn- sorted-set?
+  "A `%SortedSet{}` value, whoever built it."
+  [x]
+  (tagged? x :"Elixir.BeamLisp.Sorted.SortedSet"))
+
+(defn- sorted-any?
+  "Either half of the sorted family — what `subseq`/`first_key`/`last_key`
+   accept."
+  [x]
+  (or (sorted-map? x) (sorted-set? x)))
+
+(defn- lazy-seq?
+  "A `%LazySeq{}` — the tail shape `RT.cons/2` legitimately leaves on a list."
+  [x]
+  (tagged? x :"Elixir.BeamLisp.LazySeq"))
+
+(defn- tree-of
+  "The `:gb_trees` backing of a sorted collection. A non-collection is the live
+   `tree/1` refusal, named the same way the recalled private clause did."
+  [coll]
+  (if (sorted-any? coll)
+    (erlang/map_get :tree coll)
+    (function-clause! :tree 1)))
+
+; ── key encoding ─────────────────────────────────────────────────────────
+
+(defn- encode-seq
+  "A sequence encodes to a LIST of encoded elements, so Erlang compares it
+   element-wise and a proper prefix sorts before its extensions (a raw tuple
+   would not: Erlang orders tuples by ARITY first). `Enum.map/2` would crash on
+   the improper `[head | %LazySeq{}]` tails `RT.cons/2` legitimately produces, so
+   the walk is explicit: a lazy tail is realised, any other improper tail is
+   encoded as a final element rather than raising. A key that CRASHES on insert
+   would fail a whole transaction for a value the language considers legal."
+  [s]
+  (cond
+    (erlang/== s ()) ()
+    (erlang/is_list s)
+    (let [h (erlang/hd s)
+          t (erlang/tl s)]
+      (cond
+        (erlang/is_list t) (cons (encode_key h) (encode-seq t))
+        (lazy-seq? t) (cons (encode_key h) (encode-seq (BeamLisp.LazySeq/to_list t)))
+        :else (list (encode_key h) (encode_key t))))
+    :else (list (encode_key s))))
+
+(defn encode_key
+  "Encode `key` so its native Erlang order matches `BeamLisp.Ns.Rt/compare`.
+   Ranks mirror `family-rank` (`priv/boot/rt.bl`) exactly; within a rank the
+   payload is chosen so Erlang's own comparison gives the answer `rt/compare`
+   would. Collections share rank 7 and encode to a list, so a vector and a list
+   with equal contents encode identically — matching `rt/compare`, which
+   normalises both through `seq` before walking them."
+  [k]
+  (cond
+    (erlang/== nil k) (tuple 0 nil)
+    (erlang/== false k) (tuple 1 false)
+    (erlang/== true k) (tuple 2 true)
+    (erlang/is_number k) (tuple 3 k)
+    (erlang/is_binary k) (tuple 4 k)
+    (and (erlang/is_tuple k)
+         (erlang/== 2 (erlang/tuple_size k))
+         (erlang/== :symbol (erlang/element 1 k)))
+    (tuple 5 (erlang/element 2 k))
+    (erlang/is_atom k) (tuple 6 (erlang/atom_to_binary k :utf8))
+    (tagged? k :"Elixir.BeamLisp.Vector") (tuple 7 (encode-seq (BeamLisp.Vector/to_list k)))
+    (tagged? k :"Elixir.BeamLisp.Set") (tuple 7 (encode-seq (BeamLisp.Set/to_list k)))
+    (sorted-set? k) (tuple 7 (encode-seq (set_to_list k)))
+    (sorted-map? k) (tuple 7 (encode-seq (map_to_list k)))
+    (erlang/is_list k) (tuple 7 (encode-seq k))
+    (erlang/is_tuple k) (tuple 7 (encode-seq (erlang/tuple_to_list k)))
+    :else (tuple 8 k)))
+
+; ── construction ─────────────────────────────────────────────────────────
+
+(defn map_new
+  "The empty sorted map, or a sorted map of an enumerable of `{k, v}` pairs."
+  ([]
+   (maps/put :tree (erlang/apply :gb_trees :empty (list))
+     (maps/put :__struct__ :"Elixir.BeamLisp.Sorted.SortedMap" (maps/new))))
+  ([pairs]
+   (Enum/reduce pairs (map_new)
+     (fn [pair acc]
+       (if (and (erlang/is_tuple pair) (erlang/== 2 (erlang/tuple_size pair)))
+         (map_put acc (erlang/element 1 pair) (erlang/element 2 pair))
+         (erlang/error :function_clause))))))
+
+(defn set_new
+  "The empty sorted set, or the sorted set of the distinct elements of `enum`."
+  ([]
+   (maps/put :tree (erlang/apply :gb_trees :empty (list))
+     (maps/put :__struct__ :"Elixir.BeamLisp.Sorted.SortedSet" (maps/new))))
+  ([enum]
+   (Enum/reduce enum (set_new) (fn [x acc] (set_add acc x)))))
+
+; ── sorted map ops ───────────────────────────────────────────────────────
+
+(defn map_put
+  "Map with `k` associated to `v` (replaces an equal key)."
+  [m k v]
+  (if (sorted-map? m)
+    (maps/put :tree
+      (erlang/apply :gb_trees :enter
+        (list (encode_key k) (tuple k v) (erlang/map_get :tree m)))
+      m)
+    (function-clause! :map_put 3)))
+
+(defn map_get
+  "Value for `k`, or `default` when absent."
+  ([m k] (map_get m k nil))
+  ([m k default]
+   (if (sorted-map? m)
+     (let [r (erlang/apply :gb_trees :lookup
+               (list (encode_key k) (erlang/map_get :tree m)))]
+       (if (erlang/== :none r)
+         default
+         (erlang/element 2 (erlang/element 2 r))))
+     (function-clause! :map_get 3))))
+
+(defn map_has_key?
+  "Whether `k` is present."
+  [m k]
+  (if (sorted-map? m)
+    (erlang/apply :gb_trees :is_defined
+      (list (encode_key k) (erlang/map_get :tree m)))
+    (function-clause! :map_has_key? 2)))
+
+(defn map_delete
+  "Map with `k` removed (idempotent)."
+  [m k]
+  (if (sorted-map? m)
+    (let [ek (encode_key k)
+          t (erlang/map_get :tree m)]
+      (if (erlang/apply :gb_trees :is_defined (list ek t))
+        (maps/put :tree (erlang/apply :gb_trees :delete (list ek t)) m)
+        m))
+    (function-clause! :map_delete 2)))
+
+(defn map_count
+  "Number of entries."
+  [m]
+  (if (sorted-map? m)
+    (erlang/apply :gb_trees :size (list (erlang/map_get :tree m)))
+    (function-clause! :map_count 1)))
+
+(defn map_to_list
+  "Entries as a list of `{k, v}`, in key order."
+  [m]
+  (if (sorted-map? m)
+    (erlang/apply :gb_trees :values (list (erlang/map_get :tree m)))
+    (function-clause! :map_to_list 1)))
+
+(defn map_keys
+  "Keys in order."
+  [m]
+  (if (sorted-map? m)
+    (Enum/map (map_to_list m) (fn [e] (erlang/element 1 e)))
+    (function-clause! :map_keys 1)))
+
+(defn map_vals
+  "Values in key order."
+  [m]
+  (if (sorted-map? m)
+    (Enum/map (map_to_list m) (fn [e] (erlang/element 2 e)))
+    (function-clause! :map_vals 1)))
+
+; ── sorted set ops ───────────────────────────────────────────────────────
+
+(defn set_add
+  "Set with `x` added (idempotent)."
+  [s x]
+  (if (sorted-set? s)
+    (maps/put :tree
+      (erlang/apply :gb_trees :enter
+        (list (encode_key x) (tuple x nil) (erlang/map_get :tree s)))
+      s)
+    (function-clause! :set_add 2)))
+
+(defn set_del
+  "Set with `x` removed (idempotent)."
+  [s x]
+  (if (sorted-set? s)
+    (let [ek (encode_key x)
+          t (erlang/map_get :tree s)]
+      (if (erlang/apply :gb_trees :is_defined (list ek t))
+        (maps/put :tree (erlang/apply :gb_trees :delete (list ek t)) s)
+        s))
+    (function-clause! :set_del 2)))
+
+(defn set_member?
+  "Membership test."
+  [s x]
+  (if (sorted-set? s)
+    (erlang/apply :gb_trees :is_defined
+      (list (encode_key x) (erlang/map_get :tree s)))
+    (function-clause! :set_member? 2)))
+
+(defn set_count
+  "Cardinality."
+  [s]
+  (if (sorted-set? s)
+    (erlang/apply :gb_trees :size (list (erlang/map_get :tree s)))
+    (function-clause! :set_count 1)))
+
+(defn set_to_list
+  "Members in order."
+  [s]
+  (if (sorted-set? s)
+    (Enum/map (erlang/apply :gb_trees :values (list (erlang/map_get :tree s)))
+      (fn [kv] (erlang/element 1 kv)))
+    (function-clause! :set_to_list 1)))
+
+; ── ordered access (the point of the module) ─────────────────────────────
+
+(defn- smallest-kv
+  "The stored `{k, v}` at the tree's smallest key, or nil when empty."
+  [coll]
+  (let [t (tree-of coll)]
+    (if (erlang/== 0 (erlang/apply :gb_trees :size (list t)))
+      nil
+      (erlang/element 2 (erlang/apply :gb_trees :smallest (list t))))))
+
+(defn- largest-kv
+  "The stored `{k, v}` at the tree's largest key, or nil when empty."
+  [coll]
+  (let [t (tree-of coll)]
+    (if (erlang/== 0 (erlang/apply :gb_trees :size (list t)))
+      nil
+      (erlang/element 2 (erlang/apply :gb_trees :largest (list t))))))
+
+(defn first_key
+  "First (smallest) key/member, or nil when empty."
+  [coll]
+  (if (sorted-any? coll)
+    (let [kv (smallest-kv coll)]
+      (if (erlang/== nil kv) nil (erlang/element 1 kv)))
+    (function-clause! :first_key 1)))
+
+(defn first_entry
+  "First entry `{k, v}` of a sorted map, or nil when empty."
+  [coll]
+  (if (sorted-map? coll)
+    (smallest-kv coll)
+    (function-clause! :first_entry 1)))
+
+(defn last_key
+  "Last (largest) key/member, or nil when empty."
+  [coll]
+  (if (sorted-any? coll)
+    (let [kv (largest-kv coll)]
+      (if (erlang/== nil kv) nil (erlang/element 1 kv)))
+    (function-clause! :last_key 1)))
+
+(defn last_entry
+  "Last entry `{k, v}` of a sorted map, or nil when empty."
+  [coll]
+  (if (sorted-map? coll)
+    (largest-kv coll)
+    (function-clause! :last_entry 1)))
+
+(defn- take-while-le
+  "Collect iterator entries whose ENCODED key is `=< stop`, in ascending order.
+   `:unbounded` accepts everything. Accumulates reversed, then reverses once, so
+   the walk is tail-recursive."
+  [iter stop acc]
+  (let [n (erlang/apply :gb_trees :next (list iter))]
+    (if (erlang/== :none n)
+      (Enum/reverse acc)
+      (let [ek (erlang/element 1 n)
+            kv (erlang/element 2 n)
+            rest (erlang/element 3 n)]
+        (if (or (erlang/== :unbounded stop) (erlang/=< ek stop))
+          (take-while-le rest stop (cons kv acc))
+          (Enum/reverse acc))))))
+
+(defn- stop_encoded
+  "An end bound as the term the tree compares against: `:unbounded`, or the
+   encoded key of a `{:bound, key}` pair."
+  [stop]
+  (if (erlang/== :unbounded stop)
+    :unbounded
+    (if (and (erlang/is_tuple stop) (erlang/== 2 (erlang/tuple_size stop)))
+      (encode_key (erlang/element 2 stop))
+      ; the recalled private clause refused anything else; same class, same name
+      (function-clause! :stop_encoded 1))))
+
+(defn subseq_entries
+  "Ascending entries whose key satisfies the bound, as `{k, v}` pairs.
+
+   Bounds are `{:bound, key}` (inclusive) or `:unbounded`. The TAGGED form
+   matters: a bare sentinel atom would be indistinguishable from a user key of
+   the same value, so `(subseq s :unbounded :unbounded)` could not scan for the
+   legal keyword `:unbounded`. Callers at the RT boundary translate `nil` into
+   `:unbounded` and every other value into `{:bound, k}`, so no user value can
+   forge the sentinel.
+
+   The walk begins at `iterator_from/2`, so a scan over a narrow range does NOT
+   traverse the keys below it — the property index scanning depends on."
+  [coll start stop]
+  (let [t (tree-of coll)
+        iter (if (erlang/== :unbounded start)
+               (erlang/apply :gb_trees :iterator (list t))
+               (if (and (erlang/is_tuple start) (erlang/== 2 (erlang/tuple_size start)))
+                 (erlang/apply :gb_trees :iterator_from
+                   (list (encode_key (erlang/element 2 start)) t))
+                 ; a `case` over the two shapes, whose miss is the live
+                 ; `CaseClauseError` — a bound is `{:bound, k}` or `:unbounded`,
+                 ; never anything else.
+                 (erlang/error
+                   (Elixir.CaseClauseError/exception (list (tuple :term start))))))]
+    (take-while-le iter (stop_encoded stop) ())))
+
+(defn rsubseq_entries
+  "Descending entries whose key satisfies the bound, as `{k, v}` pairs.
+
+   `:gb_trees` has no reverse iterator, so this walks the ascending range and
+   reverses it. The range is bounded first, so the cost is proportional to the
+   RESULT size, not the tree size. A native descending iterator would save the
+   reversal only."
+  [coll start stop]
+  (Enum/reverse (subseq_entries coll start stop)))

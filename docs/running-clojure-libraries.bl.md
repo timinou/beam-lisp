@@ -54,7 +54,7 @@ surprise — with the list of what exists in the message:
 against `BigDecimal` with `.multiply`, `.divide … RoundingMode/DOWN`,
 `.movePointRight`, `.longValue`. Every one of those maps onto
 `decimal/…`, whose answers are pinned row-by-row to what
-`java.math.BigDecimal` prints (`test/beam_lisp/decimal_oracle_test.exs`,
+`java.math.BigDecimal` prints (`test/bl/decimal_oracle_port_test.bl`,
 1051 rows). So the split is cent-exact here for the same reason it is on
 the JVM.
 
@@ -101,7 +101,7 @@ is advice to a JVM compiler; it is read and dropped.
 - **The manifest is closed and measured.** It holds what an accounting
   kernel's `:clj` lane actually calls (49 instance methods, 15 classes).
   A new class means a new row, its beam-lisp fn, and a JVM-captured oracle
-  row in `test/beam_lisp/java_oracle_test.exs` — no row without an oracle.
+  row in `test/bl/java_oracle_port_test.bl` — no row without an oracle.
 - **`java.util.Date` is an integer** of epoch milliseconds — the same value
   the `datom` database stores for `:db.type/instant`, so a library's dates
   and the database's transaction times compare with no adapter.

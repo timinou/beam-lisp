@@ -79,7 +79,7 @@
 
 (ns datom
   (:require [datom.conn] [datom.db] [datom.index] [datom.pull]
-            [datom.query.agg] [datom.query.engine] [datom.query.parse]
+            [datom.query.agg] [datom.query.engine] [datom.query.parse] [datom.query.page] [datom.query.rank-query]
             [datom.explain]
             [datom.schema] [datom.store] [datom.store-ets] [datom.time]
             [datom.tx] [datom.migrate]
@@ -323,8 +323,22 @@
    value's basis.
 
    The low-level read. `index` is `:eavt`, `:aevt`, `:avet` or `:vaet`;
-   components bind a prefix of that index's sort order."
+   components bind a prefix of that index's sort order.
+
+   `:avet` exists only for attributes that maintain it (`:db/index`, unique or
+   ref — `datom.schema/indexed?`). An `:avet` read of any OTHER attribute used
+   to answer an empty seq, indistinguishable from \"no entity has this value\" —
+   a consumer measured it as a lookup that silently never matched. It now
+   raises, naming the attribute and the two honest alternatives."
   [db index & components]
+  (when (and (= index :avet) (seq components))
+    (let [attr (first components)
+          sch (datom.db/schema-of db)]
+      (when (and (keyword? attr) (some? (datom.schema/attr-def sch attr))
+                 (not (datom.schema/indexed? sch attr)))
+        (throw (str "datom/datoms :avet " attr " — this attribute keeps no AVET "
+                    "index, so the read would silently answer nothing. Mark it "
+                    ":db/index true, or read :aevt " attr " and filter by value.")))))
   (apply datom.db/datoms db index components))
 
 (defn attribute-page
@@ -499,6 +513,27 @@
 
 ;; ── querying ────────────────────────────────────────────────────────
 
+(defn query-context
+  "A query handle applying `scope` to every ordinary q/from query. scope takes
+   query data and returns {:query :inputs}, optionally :release, or a named
+   :refused result. This handle is for queries; it is not a raw database value."
+  [database scope]
+  {:query-db database :query-scope scope})
+
+(defn- run-scoped [query context inputs run]
+  (let [scoped ((:query-scope context) query)]
+    (try
+      (if (:refused scoped)
+        (throw (ex-info "query policy refused execution" scoped))
+        (run (:query scoped) (:query-db context) (concat inputs (:inputs scoped))))
+      (finally (when-let [release (:release scoped)] (release))))))
+
+(defn- execute-query [query database inputs]
+ (let [ranked (when (and (vector? query) (= :find (first query))
+                          (list? (second query)) (= 'count (first (second query))))
+                (try (datom.query.rank-query/count-result query database inputs) (catch _ nil)))]
+  (if ranked (:value ranked) (apply datom.query.engine/q query database (or inputs '())))))
+
 (defn q
   "Run a datalog `query` against `db`, with optional inputs.
 
@@ -527,7 +562,46 @@
    its own, so the result ORDER is unspecified: callers that need a stable
    order sort it themselves."
   [query db & inputs]
-  (apply datom.query.engine/q query db (or inputs '())))
+  (if (:query-scope db)
+    (run-scoped query db inputs execute-query)
+    (execute-query query db inputs)))
+
+(defn q-page
+  "Ordered bounded query page, with the same automatic scope and cleanup as q.
+   See datom.query.page/page for admitted plans, budgets and cursor outcomes."
+  [query db opts & inputs]
+  (if (:query-scope db)
+    (run-scoped query db inputs (fn [q d args] (datom.query.page/page q d opts args)))
+    (datom.query.page/page query db opts inputs)))
+
+(defn- query-window [query database opts inputs]
+ (let [offset (or (:offset opts) 0) limit (or (:limit opts) 50)
+       expiry (:expires-at (:authorization opts)) now (erlang/system_time :millisecond)]
+  (cond
+   (not (and (erlang/is_integer offset) (<= 0 offset))) {:status :refused :reason :invalid-offset}
+   (not (and (erlang/is_integer limit) (<= 1 limit 1000))) {:status :refused :reason :invalid-limit}
+   (some? (:after opts)) {:status :refused :reason :invalid-cursor}
+   (and (some? expiry) (not (erlang/is_integer expiry))) {:status :refused :reason :invalid-authorization}
+   (and expiry (<= expiry now)) {:status :refused :reason :expired-authorization}
+   :else
+    (let [ranked (try (datom.query.rank-query/page-result query database (assoc opts :offset offset) inputs)
+                      (catch _ nil))
+          result (or ranked (if (zero? offset) (datom.query.page/page query database opts inputs)
+                               {:status :refused :reason :rank-not-ready}))]
+     (if (and expiry (<= expiry (erlang/system_time :millisecond)))
+      {:status :refused :reason :expired-authorization}
+      result)))))
+
+(defn q-window
+ "Numeric window of an ordinary authorization-rewritten query. The runtime
+  automatically builds bounded scoped membership and maintains it in the writer.
+  Cold offset zero uses ordered q-page; cold deep windows refuse :rank-not-ready
+  for caller fallback. Exact windows retain no cursor history. Explicit budgets
+  use the ordinary bounded path until all rank metadata accounting is available."
+ [query database opts & inputs]
+ (if (:query-scope database)
+  (run-scoped query database inputs (fn [q d args] (query-window q d opts args)))
+  (query-window query database opts inputs)))
 
 (defn explain
   "Explain a query's plan: the clause order, the index each clause reads,
@@ -865,3 +939,10 @@
 ;; a whole file into forms before evaluating any of them — a same-file
 ;; registration would lose the race to the first `#d` literal in a requiring
 ;; file. That is the self-hosted analogue of the old Elixir hardcoded default.
+
+
+(defn put-file-path!
+  "Stream a local file into the connection's blob tier, returning an at-rest
+   descriptor. Unsupported tiers fail explicitly; no whole-file fallback."
+  ([conn path] (put-file-path! conn path {}))
+  ([conn path opts] (datom.blob/import-file! (:blobs conn) path opts)))

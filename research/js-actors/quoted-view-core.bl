@@ -1,0 +1,431 @@
+; quoted-view-core.bl — a BL-authored evaluator of DATA-form view vectors.
+;
+; WHAT THIS IS, IN ONE SENTENCE. One Loom-like accessible view (card / heading /
+; button / text / field) is written as DATA — a vector whose head is a keyword —
+; and this file is the closed evaluator for that data, plus the pure validator
+; for the ONE data request the view can raise, `[:intent :increment]`.
+;
+; WHY IT IS ITS OWN FILE. This is the shared PURE core. The future frontend
+; Worker bundle and backend Node bundle each compile `runtime + core + app`, and
+; the demo bundle compiles `runtime + core + quoted-view`; the evaluator is
+; therefore defined ONCE and never forked. The bundle-specific `main` and its
+; test harness live in the APP source, not here — an app adds no rule.
+;
+; WHY DATA AND NOT A QUOTED LITERAL. The bl-ANF vocabulary this backend emits
+; from has no quoted composite: a source `'(…)` or a quoted vector in value
+; position would need a literal op the ANF does not have, and adding one would
+; mean a general `quote`/`eval` path this prototype deliberately refuses. So a
+; view form is SELF-EVALUATING DATA: an ordinary vector literal, built by
+; ordinary BL code, headed by a keyword. The evaluator below is that vector's
+; MEANING — a closed grammar of ops, never a symbol table. Nothing here resolves
+; a symbol, a module or a host global: an op is compared against `qv-ops`, an
+; attribute key against the per-op key list, a field against `qv-fields`, and an
+; intent against `qv-intents`. A form that names anything else is REFUSED with a
+; typed reason and renders nothing.
+;
+; FAIL CLOSED. `qv-refuse` RAISES a `quoted-view refused` ExInfo whose `:data` is
+; `{:refused <reason>}`. Both public entries (`qv-render`, `qv-intent-apply`)
+; wrap their whole body in ONE `try`, so the FIRST violation aborts the render
+; and the answer is a typed `[:refused <reason>]`. A partially rendered view is
+; therefore unrepresentable: no path returns text after a refusal. Unexpected
+; runtime failures propagate so that tests and callers cannot mistake bugs for
+; ordinary input refusals.
+;
+; THE OUTPUT IS A FIXED WHITELIST TEMPLATE MESSAGE. Every tag in the rendered
+; message is a STRING LITERAL chosen by keyword dispatch — no op name is ever
+; interpolated as markup — and every dynamic value is written through
+; `host/describe`, which quotes and escapes it, so no value can break the frame.
+; This is a minimal fixed template, NOT loom.ui and NOT a DOM: there is no
+; browser write here, no CSS, no event wiring, and no live view. Field values
+; come from an IMMUTABLE env map handed in by the caller, never read from a host.
+;
+; WHAT IS DELIBERATELY ABSENT, named so it cannot be mistaken for working:
+;
+;   * NO STRING/CHAR PRIMITIVE, so no lexical sanitisation. The checked ABI's
+;     whole string surface is `host/str-cat`, `host/str-size`, `host/describe`
+;     and `host/to-str` — no substring, no character index — so a value cannot
+;     be scanned for markup here. Values are instead BOUNDED (per-string and
+;     total length) and QUOTED by `describe`. Lexical content safety is stated
+;     as a gap, not claimed.
+;   * NO EVAL, NO HOST POLICY, NO ARBITRARY QUOTED CALL. There is no `eval`, no
+;     lookup of a function by name, and no path from a data form to a BL function.
+;   * NO CROSS-PROCESS OR LIVE VIEW. These are pure functions over data: they do
+;     not touch a socket, a table, a process or the DOM.
+;
+; NOTE ON TRUST. The actor prototype this file belongs to runs in a Worker and is
+; NOT a backend security boundary. The refusals below are a closed GRAMMAR
+; (fail-closed parsing of data), not an authorization boundary: the
+; `[:unauthorized …]` answer demonstrates explicit server-side principal
+; plumbing, and does not claim that a browser-supplied principal is trustworthy.
+
+; ─────────────────────────────────────────────────────────────────────────────
+; 1. The closed grammar, and the bounds
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn qv-ops
+  "The ONLY view ops this evaluator knows, in a fixed order. A form whose head
+   keyword is absent from this vector is `[:unknown-op …]` — never ignored, never
+   passed through."
+  [] [:card :heading :button :text :field])
+
+(defn qv-fields
+  "The ONLY env keys `[:field …]` may read. A field outside this vector is
+   `[:unknown-field …]`: the view cannot reach into the caller's env for anything
+   the grammar did not name."
+  [] [:title :unread :owner])
+
+(defn qv-wire-contract
+  "One declaration of the view's wire seam. The backend advertises this
+   descriptor at boot; the page must match it before enabling a live intent.
+   The server retains its independent principal grant and state authority."
+  [] {:schema 1 :op :increment :field :unread
+      :version-chars 16 :payload-chars 16})
+
+(defn qv-intents
+  "The only intent the view may declare, derived from the wire contract."
+  [] [(:op (qv-wire-contract))])
+
+(defn qv-max-depth [] 6)        ; deepest allowed node depth (root is 0)
+(defn qv-max-nodes [] 64)       ; total nodes in one view
+(defn qv-max-attr-text [] 64)   ; characters in one attribute/field value
+(defn qv-max-text [] 96)        ; characters of text in the whole view
+(defn qv-max-payload [] (:payload-chars (qv-wire-contract)))
+(defn qv-max-version-wire [] (:version-chars (qv-wire-contract)))
+
+(defn qv-member?
+  "Whether `x` is one of the elements of vector `xs` — the membership test the
+   closed grammar is built from. No sets: the checked ABI has no set literal, so
+   a vector and `host/eq` are the whole vocabulary."
+  [x xs]
+  (loop [i 0]
+    (if (host/lt i (host/vec-size xs))
+      (if (host/eq x (host/vec-el xs i)) true (recur (inc i)))
+      false)))
+
+(defn qv-refuse
+  "Refuse the form being evaluated. Raising is the fail-closed half: the one
+   `try` in each public entry turns this into a typed `[:refused reason]` and
+   discards every partial rendering accumulated so far."
+  [reason]
+  (throw (ex-info "quoted-view refused the form" {:refused reason})))
+
+(defn qv-guard
+  "Run `thunk` under the one catch. `[:ok value]` on success; `[:refused reason]`
+   for a `qv-refuse`. Unexpected failures propagate for diagnosis."
+  [thunk]
+  (try
+    [:ok (thunk)]
+    (catch e
+      (let [reason (:refused (ex-data e))]
+        (if (host/is-nil reason) (throw e) [:refused reason])))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; 2. Attribute and arity checks
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn qv-exact-arity
+  "A node that takes no children must have exactly `[op arg]`. Extra elements
+   are refused rather than ignored: a silently dropped child is a form the
+   author meant but the renderer did not honour."
+  [form n]
+  (if (host/eq n (host/vec-size form))
+    true
+    (qv-refuse [:malformed-arity (host/vec-el form 0) (host/vec-size form)])))
+
+(defn qv-attributes
+  "The attribute map at index 1 of `form`, or a refusal. Every op that carries
+   attributes goes through this, so `[:heading \"not-a-map\"]` is a typed refusal
+   and never a `host/map-get` on a string."
+  [form]
+  (let [attrs (host/vec-el form 1)]
+    (if (host/is-map attrs)
+      attrs
+      (qv-refuse [:malformed-attributes (host/vec-el form 0)]))))
+
+(defn qv-check-keys
+  "Every key of `attrs` must be in `allowed`. An attribute the grammar does not
+   name — an `:href`, an `:onclick`, an inline style — is refused BY NAME, which
+   is the whole point of a closed attribute grammar."
+  [attrs allowed]
+  (loop [ks (host/map-keys attrs)]
+    (if (empty? ks)
+      true
+      (let [k (first ks)]
+        (if (qv-member? k allowed)
+          (recur (rest ks))
+          (qv-refuse [:unknown-attribute k]))))))
+
+(defn qv-required-string
+  "The string under `k`, or a refusal. Missing, non-string and over-long are
+   three DIFFERENT reasons, because they are three different author mistakes."
+  [attrs k]
+  (let [v (host/map-get attrs k nil)]
+    (cond
+      (host/is-nil v) (qv-refuse [:missing-attribute k])
+      (not (host/is-str v)) (qv-refuse [:attribute-not-a-string k])
+      (host/lt (qv-max-attr-text) (host/str-size v)) (qv-refuse [:oversized-attribute k])
+      :else v)))
+
+(defn qv-rest-forms
+  "The child forms of `form` (index 2 onward) as a vector."
+  [form]
+  (loop [i 2 acc []]
+    (if (host/lt i (host/vec-size form))
+      (recur (inc i) (conj acc (host/vec-el form i)))
+      acc)))
+
+(defn qv-intent-shape!
+  "`req` must be exactly `[:intent <keyword>]`. The head is a literal keyword the
+   grammar fixes; the op is NOT yet checked against the grant list — that is the
+   caller's next step, so the two refusals stay distinguishable."
+  [req]
+  (do
+    (if (not (host/is-vec req)) (qv-refuse [:malformed-intent]) nil)
+    (if (not (host/eq 2 (host/vec-size req))) (qv-refuse [:malformed-intent]) nil)
+    (if (not (host/eq :intent (host/vec-el req 0))) (qv-refuse [:malformed-intent]) nil)
+    (if (not (host/is-kw (host/vec-el req 1))) (qv-refuse [:malformed-intent]) nil)
+    true))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; 3. The evaluator — one template per whitelisted op
+;
+; Every branch returns `{:text … :nodes … :chars …}`: the rendered fragment, the
+; running node count and the running text length. `qv-node` checks both bounds
+; once, after the branch returns, so a bound cannot be forgotten in one branch.
+; Children are evaluated BEFORE the parent's fragment is assembled, so the first
+; violating node in document order is the one that refuses.
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn qv-children
+  "Render `forms` (a card's children, a VECTOR) from index `i`, joined by a
+   single space. The text length is carried across siblings, so the total-text
+   bound is over the whole view. Index-driven on purpose: this target's `rest`
+   walks a list or a cons, not a vector, so a vector is walked by index."
+  [forms i env depth n c]
+  (if (host/lt i (host/vec-size forms))
+    (let [r (qv-node (host/vec-el forms i) env (inc depth) n c)
+          more (qv-children forms (inc i) env depth (:nodes r) (:chars r))]
+      {:text (if (host/eq 0 (host/str-size (:text more)))
+               (:text r)
+               (host/str-cat (:text r) " " (:text more)))
+       :nodes (:nodes more)
+       :chars (:chars more)})
+    {:text "" :nodes n :chars c}))
+
+(defn qv-card
+  "`[:card {:id \"…\"} child…]`. `:id` is optional and defaults to `_`. The tag,
+   the parens and the braces are literals; only the quoted id and the children
+   are dynamic."
+  [attrs form env depth n c]
+  (do
+    (qv-check-keys attrs [:id])
+    (let [id (if (host/is-nil (host/map-get attrs :id nil))
+               "_"
+               (qv-required-string attrs :id))
+          r (qv-children (qv-rest-forms form) 0 env depth n c)]
+      {:text (host/str-cat "card(" (host/describe id) "){" (:text r) "}")
+       :nodes (:nodes r)
+       :chars (:chars r)})))
+
+(defn qv-heading
+  "`[:heading {:level 1..6 :text \"…\"}]` — no children."
+  [attrs form n c]
+  (do
+    (qv-exact-arity form 2)
+    (qv-check-keys attrs [:level :text])
+    (let [level (host/map-get attrs :level nil)]
+      (do
+        (if (not (host/is-int level)) (qv-refuse [:attribute-not-an-integer :level]) nil)
+        (if (or (host/lt level 1) (host/lt 6 level))
+          (qv-refuse [:level-out-of-range level])
+          nil)
+        (let [text (qv-required-string attrs :text)]
+          {:text (host/str-cat "heading(" level "," (host/describe text) ")")
+           :nodes n
+           :chars (host/arith "add" c (host/str-size text))})))))
+
+(defn qv-text
+  "`[:text \"…\"]` — a literal paragraph, no attributes, no children."
+  [arg form n c]
+  (do
+    (qv-exact-arity form 2)
+    (if (not (host/is-str arg)) (qv-refuse [:malformed-text]) nil)
+    (if (host/lt (qv-max-attr-text) (host/str-size arg))
+      (qv-refuse [:oversized-text (host/str-size arg)])
+      nil)
+    {:text (host/str-cat "text(" (host/describe arg) ")")
+     :nodes n
+     :chars (host/arith "add" c (host/str-size arg))}))
+
+(defn qv-field
+  "`[:field :unread]` — a restricted lookup into the IMMUTABLE `env` passed in by
+   the caller. Three separate refusals: the field name is outside the grammar, the
+   env has no such value, or the value is not a bounded string — and a non-string
+   value is unsafe precisely because it could carry structure into the message."
+  [arg form env n c]
+  (do
+    (qv-exact-arity form 2)
+    (if (not (host/is-kw arg)) (qv-refuse [:malformed-field]) nil)
+    (if (not (qv-member? arg (qv-fields))) (qv-refuse [:unknown-field arg]) nil)
+    (let [v (host/map-get env arg nil)]
+      (do
+        (if (host/is-nil v) (qv-refuse [:missing-field arg]) nil)
+        (if (not (host/is-str v)) (qv-refuse [:unsafe-field arg]) nil)
+        (if (host/lt (qv-max-attr-text) (host/str-size v))
+          (qv-refuse [:unsafe-field arg])
+          nil)
+        {:text (host/str-cat "field(" (name arg) "=" (host/describe v) ")")
+         :nodes n
+         :chars (host/arith "add" c (host/str-size v))}))))
+
+(defn qv-button
+  "`[:button {:label \"…\" :intent [:intent :increment]}]` — no children. The
+   rendered intent is the KEYWORD NAME of an allowlisted op, never a string the
+   author supplied, so the template cannot carry arbitrary text as an action."
+  [attrs form n c]
+  (do
+    (qv-exact-arity form 2)
+    (qv-check-keys attrs [:label :intent])
+    (let [label (qv-required-string attrs :label)
+          req (host/map-get attrs :intent nil)]
+      (do
+        (if (host/is-nil req) (qv-refuse [:missing-attribute :intent]) nil)
+        (qv-intent-shape! req)
+        (let [op (host/vec-el req 1)]
+          (do
+            (if (not (qv-member? op (qv-intents))) (qv-refuse [:unknown-intent op]) nil)
+            {:text (host/str-cat "button(" (host/describe label) "," (name op) ")")
+             :nodes n
+             :chars (host/arith "add" c (host/str-size label))}))))))
+
+(defn qv-node
+  "One view form. Shape checks first (depth, vector, head keyword, known op),
+   then the arity of the op, then the node budget, then the op's own branch, then
+   the total-text budget. The order is the refusal order a caller can rely on."
+  [form env depth n c]
+  (do
+    (if (host/lt (qv-max-depth) depth) (qv-refuse [:too-deep depth]) nil)
+    (if (not (host/is-vec form)) (qv-refuse [:not-a-form]) nil)
+    (if (host/lt (host/vec-size form) 1) (qv-refuse [:not-a-form]) nil)
+    (let [op (host/vec-el form 0)]
+      (do
+        (if (not (host/is-kw op)) (qv-refuse [:not-an-op]) nil)
+        (if (not (qv-member? op (qv-ops))) (qv-refuse [:unknown-op op]) nil)
+        (if (host/lt (host/vec-size form) 2) (qv-refuse [:malformed-arity op 1]) nil)
+        (let [n1 (inc n)]
+          (do
+            (if (host/lt (qv-max-nodes) n1) (qv-refuse [:too-many-nodes n1]) nil)
+            (let [arg (host/vec-el form 1)
+                  r (cond
+                      (host/eq op :card) (qv-card (qv-attributes form) form env depth n1 c)
+                      (host/eq op :heading) (qv-heading (qv-attributes form) form n1 c)
+                      (host/eq op :button) (qv-button (qv-attributes form) form n1 c)
+                      (host/eq op :text) (qv-text arg form n1 c)
+                      :else (qv-field arg form env n1 c))]
+              (if (host/lt (qv-max-text) (:chars r))
+                (qv-refuse [:too-much-text (:chars r)])
+                r))))))))
+
+(defn qv-render
+  "The public view entry. `env` is the caller's immutable field map; `form` is
+   self-evaluating data. Answers `[:ok <template message>]` or
+   `[:refused <reason>]` — there is no third answer."
+  [env form]
+  (qv-guard (fn [] (host/str-cat "view{" (:text (qv-node form env 0 0 0)) "}"))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; 4. The intent request — pure validation and evolution
+;
+; The view's ONE request is the data `[:intent :increment]`. `qv-intent-apply` is
+; PURE: the server-side principal, the server-side principal→intent GRANT map and
+; the EXPECTED version are all explicit arguments, so nothing is read from a host,
+; a process or a session global. It answers `[:ok {:intent <op> :version <next>}]`
+; or `[:refused <reason>]` — TYPED values, so no caller parses a decision out of a
+; string. The caller (an actor, not this file) is what would apply a live state
+; change; this file only decides.
+;
+; THE CHECK ORDER is part of the contract, because a request can violate several
+; rules at once and only one answer comes back:
+;
+;   1. shape      — a vector of 2 or 3 elements whose head is `:intent`
+;   2. principal  — must be a key of the explicit grant map (else unauthorized)
+;   3. op         — a keyword on that principal's granted intent list
+;   4. payload    — the OPTIONAL third element: a bounded string
+;   5. version    — must be a nonnegative exact integer below the JS safe limit,
+;                  then equal the explicit expected version (stale is refused)
+;
+; A refusal names WHY: `[:malformed-request]`, `[:unauthorized p]`,
+; `[:malformed-intent]`, `[:unknown-intent op]`, `[:oversized-request n]`,
+; `[:malformed-version]`, `[:stale-version v expected]`, `[:version-exhausted]`.
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn qv-payload-ok?
+  "The optional third element: a string no longer than `qv-max-payload`. A
+   non-string payload is malformed; an over-long one is oversized, so a caller
+   can tell 'wrong kind' from 'too big'."
+  [x]
+  (cond
+    (not (host/is-str x)) (qv-refuse [:malformed-request])
+    (host/lt (qv-max-payload) (host/str-size x))
+      (qv-refuse [:oversized-request (host/str-size x)])
+    :else true))
+
+(defn qv-intent-apply
+  "Validate and evolve ONE data request. `principal` is the server-side session
+   principal; `grants` is the server-side principal→intent map (a principal that
+   is not a key is unauthorized, and an intent outside its list is unknown);
+   `expected` is the version the server believes is current; `version` is the
+   version the request carries. All four are ARGUMENTS — the evaluator reads no
+   session global, so a caller cannot get a decision out of this function with
+   values it did not supply."
+  [req principal grants expected version]
+  (qv-guard
+    (fn []
+      (let [size (if (host/is-vec req) (host/vec-size req) 0)]
+        (do
+          (if (not (host/is-vec req)) (qv-refuse [:malformed-request]) nil)
+          (if (or (host/lt size 2) (host/lt 3 size)) (qv-refuse [:malformed-request]) nil)
+          (if (not (host/eq :intent (host/vec-el req 0))) (qv-refuse [:malformed-request]) nil)
+          (let [allowed (host/map-get grants principal nil)]
+            (do
+              (if (host/is-nil allowed) (qv-refuse [:unauthorized principal]) nil)
+              (let [op (host/vec-el req 1)]
+                (do
+                  (if (not (host/is-kw op)) (qv-refuse [:malformed-intent]) nil)
+                  (if (not (qv-member? op allowed)) (qv-refuse [:unknown-intent op]) nil)
+                  (if (host/eq 3 size) (qv-payload-ok? (host/vec-el req 2)) nil)
+                  (if (or (not (host/is-int version)) (host/lt version 0))
+                    (qv-refuse [:malformed-version])
+                    nil)
+                  (if (not (host/eq version expected))
+                    (qv-refuse [:stale-version version expected])
+                    nil)
+                  (if (host/eq version 9007199254740991)
+                    (qv-refuse [:version-exhausted])
+                    nil)
+                  {:intent op :version (inc version)})))))))))
+
+(defn qv-intent-apply-wire
+  "The browser TRANSPORT adapter for `qv-intent-apply`. The request version
+   arrives as the wire STRING a browser sent, and this target has no digit
+   access — no substring, no character index — so the wire is resolved by EXACT
+   canonical equality with `(host/to-str expected)` and never re-parsed. The
+   helper first offers the request to `qv-intent-apply` with `expected` as the
+   version, so shape, principal, op and payload refusals keep exactly the shared
+   function's order; only when that answers `[:ok …]` is the wire itself judged:
+   the canonical form passes the shared answer through, and any other string
+   (leading zero, sign, fraction, exponent, a different value) is
+   `[:refused [:stale-version wire expected]]`. A non-string wire is
+   `[:malformed-version]`; a wire past `qv-max-version-wire` is
+   `[:oversized-request n]`. Nothing is ever converted to a number here, so a
+   non-canonical wire cannot silently round."
+  [req principal grants expected wire]
+  (let [shape (qv-intent-apply req principal grants expected expected)]
+    (if (host/eq :refused (host/vec-el shape 0))
+      shape
+      (cond
+        (not (host/is-str wire)) [:refused [:malformed-version]]
+        (host/lt (qv-max-version-wire) (host/str-size wire))
+          [:refused [:oversized-request (host/str-size wire)]]
+        (host/eq wire (host/to-str expected)) shape
+        :else [:refused [:stale-version wire expected]]))))

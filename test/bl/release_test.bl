@@ -27,7 +27,7 @@
 ; Run: bin/bl test test/bl/release_test.bl
 
 (ns release.test
-  (:require [release :as rel]))
+  (:require [release :as rel] [z3-asset :as z3]))
 
 (def out (Path/join (System/tmp_dir!) "beam_lisp_release_tree"))
 
@@ -43,6 +43,32 @@
             result (do (File/rm_rf! out) (rel/assemble value out))]
         (reset! tree-state {:value value :result result})
         @tree-state)))
+
+(deftest bundled-erl-has-a-relocatable-clean-default-boot
+  (let [{:keys [value result]} (tree!)
+        moved (str out "-relocated-" (System/unique_integer (list :positive)))
+        script (str "io:format(\"root=~s~n\", [code:root_dir()]), "
+                    "io:format(\"app_started=~p~n\", [lists:keymember(beam_lisp, 1, application:which_applications())]), "
+                    "io:format(\"env_available=~p~n\", [code:which('Elixir.BeamLisp.Env') =/= non_existing]), halt().")
+        run (fn [root]
+              (System/cmd (Path/join (list root (str "erts-" (:vsn (:erts value))) "bin" "erl"))
+                (to-list ["-noshell" "-eval" script]) (list (tuple :stderr_to_stdout true))))]
+    (is (= true (:ok? result)))
+    (is (File/exists? (Path/join out "bin/start.boot")))
+    (is (not (includes? (File/read! (Path/join out "bin/start.script")) "$RELEASE_LIB")))
+    (let [r (run out)]
+      (is (= 0 (elem r 1)) (elem r 0))
+      (is (includes? (elem r 0) (str "root=" out)))
+      (is (includes? (elem r 0) "app_started=false"))
+      (is (includes? (elem r 0) "env_available=true")))
+    (File/rename! out moved)
+    (try
+      (let [r (run moved)]
+        (is (= 0 (elem r 1)) (elem r 0))
+        (is (includes? (elem r 0) (str "root=" moved)))
+        (is (includes? (elem r 0) "app_started=false"))
+        (is (includes? (elem r 0) "env_available=true")))
+      (finally (File/rename! moved out)))))
 
 ; ── the value ──────────────────────────────────────────────────────────────
 
@@ -213,7 +239,16 @@
         (is (not= :symlink (:type (File/lstat! priv)))
             "priv is a symlink, not a directory of sources")
         (is (File/exists? (Path/join (list priv "boot" "compiler.bl")))
-            "the release must carry the language's own sources")))))
+            "the release must carry the language's own sources")
+
+        ; The solver payload rides in the same `priv`, copied wholesale. A valid
+        ; bundle is preserved — the executable AND the shared library it links —
+        ; which is what makes the assembled drop able to answer `z3` at all.
+        (is (File/exists? (z3/solver-bin priv))
+            "the assembled drop must carry the pinned solver executable")
+        (is (File/exists? (Path/join (Path/join (Path/join priv "z3") "bin")
+                                     (z3/companion-lib)))
+            "…and the shared library beside it")))))
 
 (deftest the-gate-the-tree-boots-and-the-language-runs-in-it
   (let [r (:result (tree!))
@@ -230,9 +265,11 @@
 
     ; …and the LANGUAGE runs in it, through a launcher that generated every
     ; piece of the tree itself (the same invocation W0's hand-assembled probe
-    ; used, where all of it came from a shipped payload).
+    ; used, where all of it came from a shipped payload). The host launcher
+    ; also supports a source assembly whose CLI has not been installed into ebin;
+    ; a transient cached namespace module is not a required release entry point.
     (let [c (System/cmd launcher
-                        (to-list ["eval" "BeamLisp.Ns.Bl.Cli.main([\"eval\",\"(+ 40 2)\"])"])
+                        (to-list ["eval" "BeamLisp.Launcher.main()" "eval" "(+ 40 2)"])
                         (to-list [(tuple :stderr_to_stdout true)]))]
       (is (= 0 (elem c 1)) (str "language eval exited " (elem c 1) ":\n" (elem c 0)))
       (is (includes? (elem c 0) "42") (str "language eval printed: " (elem c 0))))
@@ -241,3 +278,160 @@
                         (to-list [(tuple :stderr_to_stdout true)]))]
       (is (= 0 (elem c 1)))
       (is (includes? (elem c 0) "beam_lisp")))))
+
+; ── the solver preflight ───────────────────────────────────────────────────
+;
+; The assembly copies the owning app's `priv` wholesale, and the pinned solver
+; at `priv/z3` is gitignored — so a tree that never ran `bl install z3` used to
+; assemble "successfully" and ship without it. These pin the guard that closed
+; that hole. Every fixture is a SYNTHETIC app directory: no real z3 is renamed,
+; removed or run, and the acceptance never needs one.
+
+(def preflight-root (Path/join (System/tmp_dir!) "beam_lisp_solver_preflight"))
+
+(defn- make-app!
+  "A fresh synthetic SOURCE app dir with an empty `priv/`."
+  [name]
+  (let [dir (Path/join preflight-root name)]
+    (File/rm_rf! dir)
+    (File/mkdir_p! (Path/join dir "priv"))
+    dir))
+
+(defn- solver-dir-of [app-dir] (Path/join (Path/join app-dir "priv") "z3"))
+(defn- solver-bin-of [app-dir] (z3/solver-bin (Path/join app-dir "priv")))
+(defn- solver-lib-of [app-dir]
+  (Path/join (solver-dir-of app-dir) (Path/join "bin" (z3/companion-lib))))
+
+(defn- put-bin!
+  "Write the platform's solver executable: `content` bytes at `mode` (493 =
+   0755, 420 = 0644)."
+  [app-dir content mode]
+  (let [p (solver-bin-of app-dir)]
+    (File/mkdir_p! (Path/dirname p))
+    (File/write! p content)
+    (File/chmod! p mode)
+    p))
+
+(defn- put-lib!
+  "Write the shared library beside the executable."
+  [app-dir]
+  (let [p (solver-lib-of app-dir)]
+    (File/mkdir_p! (Path/dirname p))
+    (File/write! p "ELF")
+    p))
+
+(defn- solver-value
+  "A synthetic release value whose root IS the solver-owning app."
+  [app-dir]
+  {:name "beam_lisp"
+   :vsn "0.1.0"
+   :erts {:vsn "test" :dir app-dir}
+   :apps [{:app :beam_lisp :vsn "0.1.0" :dir app-dir}]})
+
+(defn- unrelated-value
+  "A synthetic release value that carries no solver-owning app at all."
+  [app-dir]
+  {:name "thing"
+   :vsn "1.0.0"
+   :erts {:vsn "test" :dir app-dir}
+   :apps [{:app :thing :vsn "1.0.0" :dir app-dir}]})
+
+(deftest the-solver-preflight-accepts-a-complete-bundle
+  (let [app (make-app! "valid")]
+    (put-bin! app "fake-z3-bytes" 493)
+    (put-lib! app)
+    (let [r (z3/preflight (Path/join app "priv"))]
+      (is (= true (:ok? r)))
+      (is (= (solver-bin-of app) (:path r)))
+      (is (File/exists? (:lib r))))))
+
+(deftest the-solver-preflight-refuses-an-absent-payload-and-names-the-source
+  (let [app (make-app! "absent")
+        r (rel/check-solver (solver-value app))]
+    (is (= false (:ok? r)))
+    (is (= true (:checked r)))
+    (is (= "bl install z3" (:remedy r)))
+    (let [e (first (:errors r))]
+      (is (includes? e "bl install z3") "the failure carries its remedy")
+      (is (includes? e app) "the failure carries the ACTUAL source path"))))
+
+(deftest the-solver-preflight-refuses-a-broken-payload
+  ; no executable at all (the payload dir exists, the binary does not)
+  (let [app (make-app! "no-exe")]
+    (File/mkdir_p! (Path/dirname (solver-bin-of app)))
+    (let [r (rel/check-solver (solver-value app))]
+      (is (= false (:ok? r)))
+      (is (includes? (first (:errors r)) "no executable"))))
+
+  ; present, but not executable
+  (let [app (make-app! "not-exec")]
+    (put-bin! app "fake-z3" 420)
+    (put-lib! app)
+    (let [r (rel/check-solver (solver-value app))]
+      (is (= false (:ok? r)))
+      (is (includes? (first (:errors r)) "not executable"))))
+
+  ; present and executable, but EMPTY
+  (let [app (make-app! "empty")]
+    (put-bin! app "" 493)
+    (put-lib! app)
+    (let [r (rel/check-solver (solver-value app))]
+      (is (= false (:ok? r)))
+      (is (includes? (first (:errors r)) "empty"))))
+
+  ; executable present, but the accompanying shared library is missing
+  (let [app (make-app! "no-lib")]
+    (put-bin! app "fake-z3" 493)
+    (let [r (rel/check-solver (solver-value app))]
+      (is (= false (:ok? r)))
+      (is (includes? (first (:errors r)) "shared library")))))
+
+(deftest the-preflight-reads-the-release-sources-own-app-dir
+  ; A valid bundle in a SYNTHETIC app dir passes, and the path it reports is
+  ; the fixture's — proof the guard consults the value's source app dir, not
+  ; the ambient checkout.
+  (let [app (make-app! "source-dir")]
+    (put-bin! app "fake-z3" 493)
+    (put-lib! app)
+    (let [r (rel/check-solver (solver-value app))]
+      (is (= true (:ok? r)))
+      (is (= (solver-bin-of app) (:path r)))
+      (is (includes? (:path r) app)))))
+
+(deftest an-unrelated-release-demands-no-solver
+  (let [app (make-app! "unrelated")
+        r (rel/check-solver (unrelated-value app))]
+    (is (= true (:ok? r)))
+    (is (= false (:checked r)) "no solver-owning app -> nothing to check")))
+
+(deftest an-explicit-optional-declaration-makes-absence-intentional
+  (let [app (make-app! "optional")
+        v (solver-value app)]
+    ; declared on the release value
+    (let [r (rel/check-solver (assoc v :optional [:z3]))]
+      (is (= true (:ok? r)))
+      (is (= true (:checked r)))
+      (is (= false (:required r))))
+    ; declared in the assembler's opts
+    (let [r (rel/check-solver v {:optional [:z3]})]
+      (is (= true (:ok? r)))
+      (is (= false (:required r))))
+    ; a declaration never excuses a PRESENT but broken payload
+    (put-bin! app "" 493)
+    (put-lib! app)
+    (let [r (rel/check-solver v {:optional [:z3]})]
+      (is (= false (:ok? r))))))
+
+(deftest a-refused-assembly-writes-no-half-tree
+  (let [app (make-app! "refuse")
+        out (Path/join preflight-root "refuse-tree")]
+    (File/rm_rf! out)
+    (let [r (rel/assemble (solver-value app) out)]
+      (is (= false (:ok? r)))
+      (is (= 0 (:apps r)))
+      (is (pos? (count (:errors r))))
+      (is (includes? (first (:errors r)) "bl install z3"))
+      ; the preflight runs before a byte is written
+      (is (= false (File/exists? (Path/join out "bin"))))
+      (is (= false (File/exists? (Path/join out "lib"))))
+      (is (= false (File/exists? (Path/join out "releases")))))))

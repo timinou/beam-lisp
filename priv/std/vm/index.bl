@@ -1,6 +1,6 @@
-; vm/index.bl — the tree's warm code index owner (ports Daemon.IndexWorker).
+; vm/index.bl — one warm code-index owner PER REALM (ports Daemon.IndexWorker).
 ;
-; ══ WHY THIS PROCESS EXISTS ═════════════════════════════════════════════════
+; ══ WHY A PROCESS, AND WHY ONE PER REALM ════════════════════════════════════
 ;
 ; A datom conn's store is an ETS table, and an ETS table lives exactly as long
 ; as the process that created it. That single fact is why every code question
@@ -8,47 +8,88 @@
 ; built one, and each died with the command. The fix is OWNERSHIP, not caching:
 ; a source's analysis is a pure function of its bytes (already cached to disk
 ; per file); what was missing was a process to HOLD the assembled conn between
-; questions. This is that process — node-registered, one per daemon.
+; questions.
 ;
-; Every door asks `code.index/ensure`, which runs its build thunk ON THIS OWNER
-; when it exists (`run`), so the conn's tables outlive the answer and the next
-; question finds them warm.
+; A warm VM serves MANY realms — one daemon, one node, every checkout a realm
+; with its own root and its own code (PLAN-158). ONE node-global owner could
+; only ever hold ONE tree's conn, so a question about realm B was answered from
+; realm A's tables: a wrong answer wearing the costume of a warm one. So the
+; owner is PER REALM, keyed by the realm's canonical root (its tree id): one
+; owner, one conn, one progress row for each root, and a question can only ever
+; reach the owner of the root it asked about.
 ;
-; ══ WHAT IT OWNS ════════════════════════════════════════════════════════════
+; ══ WHAT AN OWNER OWNS ═════════════════════════════════════════════════════
 ;
-;   · the conn the last build produced (handed back so a caller can reuse it);
-;   · a PUBLIC ETS row describing the build — phase, files done, file in flight,
-;     duration — which the dashboard renders so a background build is VISIBLE
-;     rather than minutes of silence. The row is ETS, not a call, on purpose:
-;     reading progress must never queue behind the build it reports on.
+;   · the conn the last build for ITS root produced (handed back so a caller
+;     can reuse it);
+;   · one row in the PUBLIC progress table, keyed by root — phase, files done,
+;     file in flight, duration — which the dashboard renders so a background
+;     build is VISIBLE rather than minutes of silence. The row is ETS, not a
+;     call, on purpose: reading progress must never queue behind the build it
+;     reports on.
 ;
-; ══ SERIALIZATION ═══════════════════════════════════════════════════════════
+; ══ THE OWNER REGISTRY ═════════════════════════════════════════════════════
 ;
-; Requests serialize on the owner — the honest shape of the resource: one index,
-; one owner, one build at a time. A `run` that arrives mid-build waits, then
-; finds a warm index (the build it waited for is the one it wanted).
+; Owners are found through a registry server keyed by the realm key. It is also
+; the ONLY place an owner is started, which is what makes start idempotent
+; under a race: a server serializes its calls, so two callers arriving at once
+; get the one owner rather than two. The registry monitors every owner, so an
+; owner killed by a realm halt (or a crash) clears its registry entry AND its
+; progress row with no sweeper.
 ;
-;   (index/start root)         → boot the owner + a background build at boot
-;   (index/run thunk)          → run thunk ON the owner; its result
-;   (index/progress)           → the build's state, off ETS (never blocks)
-;   (index/progress! frame)    → record one progress frame (the build's writer)
-;   (index/ensure-building)    → kick a background build (idempotent)
-;   (index/built)              → the conn the last build produced, or nil
+; It is a hand-written relation, not `proc.reg`'s `(registry (keys :root))`
+; clause, because the SAME monitor must also clear the owner's ETS progress row
+; on `:DOWN`, and `proc.server` merges every clause's down-handler into ONE
+; `handle-info [:DOWN …]` clause (a second one in the body is unreachable). The
+; entry and the row go together here for the same reason they exist together:
+; a row for a realm whose owner is gone is a lie the pane would render.
+;
+;   (index/start-for root realm-id) → boot/return this root's owner, adopted
+;                                      into `realm-id` (halting the realm kills it)
+;   (index/stop-for root)           → stop it (idempotent; unknown root: no-op)
+;   (index/owner-pid root)          → pid | nil
+;   (index/run root thunk)          → run thunk ON that owner; its result
+;   (index/progress root)           → the build's state, off ETS (never blocks)
+;   (index/progress! root frame)    → record one progress frame (the build's writer)
+;   (index/ensure-building root)    → kick a background build (idempotent)
+;   (index/built root)              → the conn the last build produced, or nil
+;   (index/refresh-scheduled occ)   → the periodic refresh, for (:root occ)
+;
+; Every door asks `code.index/ensure`, which runs its build thunk ON the owner
+; of the root the question is about (`run`), so the conn's tables outlive the
+; answer and the next question about that realm finds them warm — and a
+; question about another realm never does.
 
 (ns vm.index
-  (:require [vm.core :as vmc]))
+  (:require [core] [env] [vm.owner :as owner] [vm.paths :as paths]))
 
-(def OWNER :vm-index)
-(def TABLE :bl_index_progress)
+(def OWNERS :vm-index-owners)
+(def PROGRESS :bl_index_progress)
 
-;; ── the public progress row (ETS, read without blocking) ────────────────────
+;; ── the realm key: the canonical identity of a root ─────────────────────────
+
+(defn- realm-key
+  "The key an owner, its progress row and its registry entry share: the root's
+   canonical identity — its tree id (sha256 of the real path, the same id the
+   daemon filenames and the cache use). Hashing the canonical path means two
+   spellings of one checkout (a symlink, a trailing slash) reach ONE owner, and
+   two checkouts never collide. A non-path root (a test's number) is kept as
+   its string, so a build that cannot resolve its root still has a key."
+  [root]
+  (if (erlang/is_binary root)
+    (paths/tree-id root)
+    (str root)))
+
+;; ── the public progress table (ETS, read without blocking) ──────────────────
+
+(defn- table-up? []
+  (not= :undefined (erlang/apply :ets :whereis (list PROGRESS))))
+
+(defn- new-table! []
+  (erlang/apply :ets :new
+    (list PROGRESS (to-list [:set :public :named_table (tuple :read_concurrency true)]))))
 
 (defn- cold [] {:phase :cold :done 0 :total 0 :file nil})
-
-(defn- ensure-table []
-  (when (= :undefined (erlang/apply :ets :whereis (list TABLE)))
-    (erlang/apply :ets :new
-      (list TABLE (to-list [:set :public :named_table (tuple :read_concurrency true)])))))
 
 (defn- get0 [f k] (or (get f k) 0))
 
@@ -64,59 +105,33 @@
       :else (assoc f :at now))))
 
 (defn progress
-  "The build's current state as a map, off the ETS row. Never blocks and never
+  "The build state for `root` as a map, off the ETS row. Never blocks and never
    queues: `run` does, and a pane that waits for the build it is reporting on
-   could not report on it."
-  []
-  (ensure-table)
-  (let [r (erlang/apply :ets :lookup (list TABLE :progress))]
-    (if (and (erlang/is_list r) (not (empty? r)))
-      (elem (first r) 1)
-      (cold))))
+   could not report on it. A root with no owner has no row and reads cold."
+  [root]
+  (if (table-up?)
+    (let [r (erlang/apply :ets :lookup (list PROGRESS (realm-key root)))]
+      (if (and (erlang/is_list r) (not (empty? r)))
+        (elem (first r) 1)
+        (cold)))
+    (cold)))
 
 (defn progress!
-  "Record one progress frame, as `code.index` reported it. Total on purpose: a
-   build must never fail because the UI could not be told, so a frame this does
-   not understand is still stored. A non-map (a Vector/Set carrying :__struct__)
-   is not a frame at all and is ignored."
-  [frame]
-  (ensure-table)
-  (when (and (map? frame) (not (contains? frame :__struct__)))
-    (erlang/apply :ets :insert (list TABLE (tuple :progress (row frame)))))
+  "Record one progress frame for `root`, as `code.index` reported it. Total on
+   purpose: a build must never fail because the UI could not be told, so a frame
+   this does not understand is still stored. A non-map (a Vector/Set carrying
+   :__struct__) is not a frame at all and is ignored. The table is owned by the
+   registry, so a frame written before any owner exists has nowhere to live and
+   is dropped rather than creating a table in a process that would die with it."
+  [root frame]
+  (when (and (table-up?) (map? frame) (not (contains? frame :__struct__)))
+    (erlang/apply :ets :insert
+      (list PROGRESS (tuple (realm-key root) (row frame)))))
   :ok)
 
-;; ── the owner process ───────────────────────────────────────────────────────
-
-(defserver owner
-  (init [opts]
-    (ensure-table)
-    (erlang/apply :ets :insert (list TABLE (tuple :progress (cold))))
-    ;; A build at BOOT, not on the first question — the point of a warm session
-    ;; is that the work happened before anyone asked. Deferred through the
-    ;; mailbox so init stays instant and the listener is bound before the tree
-    ;; is read. `:build false` is for a test that owns the process for one
-    ;; assertion and must not index a real tree behind its back.
-    (when (get opts :build true) (erlang/send (erlang/self) [:build]))
-    (ok {:root (or (get opts :root) (BeamLisp/cwd)) :built nil}))
-
-  ;; run the caller's thunk HERE, so whatever it builds is owned by this process
-  (handle-call [:run thunk] [_from st]
-    (reply (thunk) st))
-
-  (handle-call [:built] [_from st]
-    (reply (:built st) st))
-
-  ;; which tree this owner serves — the fact a scheduled refresh has to check
-  ;; before it acts, since one owner serves one tree
-  (handle-call [:root] [_from st]
-    (reply (:root st) st))
-
-  (handle-cast [:build] [st]
-    (erlang/send (erlang/self) [:build])
-    (noreply st))
-
-  (handle-info [:build] [st]
-    (noreply (assoc st :built (do-build (:root st))))))
+(defn- clear-progress! [key]
+  (when (table-up?) (erlang/apply :ets :delete (list PROGRESS key)))
+  :ok)
 
 ;; ── the build ───────────────────────────────────────────────────────────────
 
@@ -141,7 +156,7 @@
    :done 0 :total 0})
 
 (defn- do-build [root]
-  (progress! {:phase :building :done 0 :total 0 :file nil})
+  (progress! root {:phase :building :done 0 :total 0 :file nil})
   (try
     (do (BeamLisp.Loader/ensure_loaded "code.index")
         (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "code.index" "ensure-tree") (to-list [root])))
@@ -149,72 +164,160 @@
       ; The file in flight is the build's own last progress row (`:building`
       ; carries it); it is the path a reader needs when the cause does not name
       ; one, and the root is the fallback when nothing was in flight yet.
-      (progress! (error-frame "code.index/ensure-tree" root (:file (progress)) (ex-message e)))
+      (progress! root (error-frame "code.index/ensure-tree" root (:file (progress root)) (ex-message e)))
       nil)))
+
+;; ── the owner: one per realm ────────────────────────────────────────────────
+
+(defserver realm-owner
+  (init [opts]
+    ;; A build at BOOT, not on the first question — the point of a warm session
+    ;; is that the work happened before anyone asked. Deferred through the
+    ;; mailbox so init stays instant and the listener is bound before the tree
+    ;; is read.
+    (when (get opts :build true) (erlang/send (erlang/self) [:build]))
+    (ok {:root (get opts :root) :built nil}))
+
+  ;; run the caller's thunk HERE, so whatever it builds is owned by this process
+  (handle-call [:run thunk] [_from st]
+    (reply (thunk) st))
+
+  (handle-call [:built] [_from st]
+    (reply (:built st) st))
+
+  (handle-cast [:build] [st]
+    (erlang/send (erlang/self) [:build])
+    (noreply st))
+
+  (handle-info [:build] [st]
+    (noreply (assoc st :built (do-build (:root st))))))
+
+;; ── the registry: who owns which realm, and the ONLY place an owner starts ──
+
+(defserver owners
+  (init [_]
+    (when-not (table-up?) (new-table!))
+    (ok {:by-root {} :root-of {}}))
+
+  ;; ATOMIC check-and-start: a server serializes its calls, so two racing
+  ;; callers cannot both miss and both spawn. Returns the ONE owner for `key`,
+  ;; spawning it (and adopting it into `realm`) only when none lives.
+  (handle-call [:ensure key root realm build] [_from st]
+    (let [cur (get (:by-root st) key)]
+      (if (and (erlang/is_pid cur) (erlang/is_process_alive cur))
+        (reply cur st)
+        (let [pid (core/start realm-owner {:root root :build build})]
+          (owner/adopt realm :index pid)
+          (erlang/monitor :process pid)
+          (reply pid {:by-root (assoc (:by-root st) key pid)
+                      :root-of (assoc (:root-of st) pid key)})))))
+
+  (handle-call [:owner key] [_from st]
+    (let [cur (get (:by-root st) key)]
+      (reply (if (and (erlang/is_pid cur) (erlang/is_process_alive cur)) cur nil) st)))
+
+  (handle-call [:stop key] [_from st]
+    (let [cur (get (:by-root st) key)]
+      (if (erlang/is_pid cur)
+        (do (erlang/exit cur :kill)
+            (clear-progress! key)
+            (reply :stopped {:by-root (dissoc (:by-root st) key)
+                             :root-of (dissoc (:root-of st) cur)}))
+        (reply :none st))))
+
+  ;; An owner died — killed by a realm halt, by `stop-for`, or by a crash. Its
+  ;; registry entry retracts itself and its progress row goes with it, so no
+  ;; reader ever sees a row for a realm whose owner is gone.
+  (handle-info [:DOWN _ref :process pid _reason] [st]
+    (let [key (get (:root-of st) pid)]
+      (if (some? key)
+        (do (clear-progress! key)
+            (noreply {:by-root (dissoc (:by-root st) key)
+                      :root-of (dissoc (:root-of st) pid)}))
+        (noreply st)))))
+
+(defn- owners-server
+  "The registry pid, started if it is not yet up. Two callers racing the FIRST
+   start can both reach here; `Server.start` names it, so the loser catches the
+   already-started and adopts the winner rather than starting a second."
+  []
+  (let [p (Process/whereis OWNERS)]
+    (if (erlang/is_pid p)
+      p
+      (let [r (try (core/start owners nil {:name OWNERS}) (catch e nil))]
+        (if (erlang/is_pid r) r (Process/whereis OWNERS))))))
 
 ;; ── public API ──────────────────────────────────────────────────────────────
 
 (defn owner-pid
-  "The index owner in THIS VM, or nil."
-  []
-  (Process/whereis OWNER))
+  "The index owner for `root` in THIS VM, or nil. Never starts anything: a
+   process with no owner for its root runs its own build in place (see `run`)."
+  [root]
+  (if (nil? (Process/whereis OWNERS))
+    nil
+    (call OWNERS [:owner (realm-key root)])))
 
-(defn start
-  "Boot the tree's index owner (idempotent by name). `opts`: {:root … :build …}.
-   Kicks a background build at boot unless :build false. Returns its pid."
-  ([] (start {}))
-  ([opts]
-   (if (nil? (Process/whereis OWNER))
-     (vmc/start owner opts {:name OWNER})
-     (Process/whereis OWNER))))
+(defn start-for
+  "Boot THIS ROOT's index owner, adopt it into `realm-id` (so halting the realm
+   kills it), and answer its pid. Idempotent and race-safe per root: concurrent
+   callers get the one owner. A background build runs at boot unless `opts`
+   carries `:build false` (a test that owns the process for one assertion and
+   must not index a real tree behind its back)."
+  ([root realm-id] (start-for root realm-id {}))
+  ([root realm-id opts]
+   (owners-server)
+   (call OWNERS [:ensure (realm-key root) root realm-id (get opts :build true)])))
+
+(defn stop-for
+  "Stop `root`'s owner and forget it. Idempotent: an unknown root is a no-op.
+   The registry's monitor clears the progress row as the owner goes."
+  [root]
+  (if (nil? (Process/whereis OWNERS))
+    :none
+    (call OWNERS [:stop (realm-key root)])))
 
 (defn run
-  "Run `thunk` on the index owner, so whatever it builds is owned by a process
-   that outlives this command. With no owner (or if we ARE the owner) run here."
-  [thunk]
-  (let [p (owner-pid)]
+  "Run `thunk` on `root`'s owner, so whatever it builds is owned by a process
+   that outlives this command. With no owner for that root (or if we ARE the
+   owner) run here."
+  [root thunk]
+  (let [p (owner-pid root)]
     (if (or (nil? p) (= p (erlang/self)))
       (thunk)
       ;; :infinity — a first build on a cold tree is minutes; a caller that wants
       ;; to watch reads progress meanwhile (never queues behind the build).
-      (call OWNER [:run thunk] :infinity))))
+      (let [action (env/convey (fn [_] (thunk)))]
+        (call p [:run (fn [] (action nil))] :infinity)))))
 
 (defn ensure-building
-  "Kick a background build now (idempotent — a build mid-flight is joined, and
-   then HITS because the bytes have not moved). No-op with no owner."
-  []
-  (when (owner-pid) (cast OWNER [:build])))
+  "Kick a background build of `root` now (idempotent — a build mid-flight is
+   joined, and then HITS because the bytes have not moved). No-op with no owner."
+  [root]
+  (let [p (owner-pid root)]
+    (when (erlang/is_pid p) (cast p [:build]))))
 
 (defn built
-  "The conn the last build produced, or nil: {:conn :key :stats …}."
-  []
-  (when (owner-pid) (call OWNER [:built])))
+  "The conn `root`'s last build produced, or nil: {:conn :key :stats …}."
+  [root]
+  (let [p (owner-pid root)]
+    (when (erlang/is_pid p) (call p [:built]))))
 
-;; ── the scheduled form ──────────────────────────────────────────────────
-
-(defn root-of
-  "Which tree this owner serves, or nil when there is no owner."
-  []
-  (when (owner-pid) (call OWNER [:root])))
+;; ── the scheduled form ──────────────────────────────────────────────────────
 
 (defn refresh-scheduled
   "The periodic index refresh, as a project file declares it.
 
-   A daemon is warm for days, and its index is a function of bytes it read once.
-   Anything that moves the tree underneath it — a checkout, a pull, a branch
-   switch, an editor writing outside the watcher — leaves every answer about a
-   tree that is no longer there. Re-asking is cheap: `ensure-tree` HITs on every
-   file whose bytes have not moved, so the cost is a walk of the tree's files,
-   not a re-analysis of them.
+   A daemon is warm for days, and an index is a function of bytes it read once.
+   Anything that moves a tree underneath its owner — a checkout, a pull, a
+   branch switch, an editor writing outside the watcher — leaves every answer
+   about a tree that is no longer there. The declaration names the root it is
+   for, so the refresh goes to THAT root's owner, or says there is none; a
+   declaration from a tree with no owner is not silently answered from another.
 
-   ONE owner serves ONE tree (`:vm-index` is node-global), so a declaration from
-   a different tree is answered with the mismatch rather than quietly refreshing
-   the wrong index. A schedule that lies about what it did is worse than none,
-   and the mismatch is a fact about the owner rather than about the declaration."
+   Re-asking is cheap: `ensure-tree` HITs on every file whose bytes have not
+   moved, so the cost is a walk of the tree's files, not a re-analysis of them."
   [occ]
-  (let [p (owner-pid)
-        want (get occ :root)]
-    (cond
-      (nil? p) {:refreshed false :why :no-owner}
-      (not= want (root-of)) {:refreshed false :why :other-tree :owner-root (root-of)}
-      :else (do (ensure-building) {:refreshed true :root want}))))
+  (let [root (get occ :root)]
+    (if (nil? (owner-pid root))
+      {:refreshed false :why :no-owner}
+      (do (ensure-building root) {:refreshed true :root root}))))

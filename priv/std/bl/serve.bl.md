@@ -16,7 +16,7 @@ The post-`--` arguments reach the program through `BeamLisp/argv`, exactly as
 
 ```beam-lisp
 (ns bl.serve
-  (:require [bl.env :as env] [bl.util :as u] [vm.names] [vm.ports]))
+  (:require [bl.env :as env] [bl.util :as u] [bl.loading :as loading] [vm.names] [vm.ports]))
 ```
 
 ## The port
@@ -138,7 +138,12 @@ server; a program that starts its server and returns parks here forever.
       (reset! pretty-override (:pretty_log st))
       (try
         (BeamLisp/with_argv (u/to-list (or (:dd st) []))
-          (fn [] (BeamLisp/run_file (u/resolve target))))
+          (fn []
+            (let [project (env/project (BeamLisp/cwd))]
+              (when (nil? (:loading project))
+                (throw (ex-info "Invalid loading configuration" {:errors (:errors project)})))
+              (loading/prepare! project (u/resolve target)))
+            (BeamLisp/run_file (u/resolve target))))
         (println (str "bl serve: " target " running — Ctrl+C to stop"))
         ;; where the access log goes, said out loud: a server that logs every
         ;; request must not leave you guessing where the log went (and in

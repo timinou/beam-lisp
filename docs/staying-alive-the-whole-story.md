@@ -74,7 +74,7 @@ The BEAM already ships world-class observability — but look at its *shape*:
 - **`:sys`** — poke a process for its state (`:sys.get_state`).
 - **`:dbg` / `recon`** (Fred Hébert's production toolkit) — attach a tracer to watch messages fly.
 - **`telemetry`** — emit events for external collectors.
-- **Phoenix LiveDashboard** — the modern web view.
+- **LiveDashboard** — the modern web view.
 
 Every one of these is **external and read-only**: a separate tool, looking *at* a runtime that is itself opaque — a black box with inspection ports drilled in. You observe the system; the system does not observe *itself*.
 

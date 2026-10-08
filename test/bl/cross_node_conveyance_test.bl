@@ -1,0 +1,200 @@
+; cross_node_conveyance_test.bl — SPIKE: cross-node capability conveyance.
+;
+; Can a capability ceiling cross a Distributed-Erlang node boundary, so a
+; remote spawn on node B runs under the caller's caps — not B's :global?
+;
+; Finding, in three tests:
+;   1. Naive env-token conveyance FAILS CLOSED across nodes (correct): an
+;      env-ref is node-local; env/bind re-derives caps from B's OWN registry,
+;      so a smuggled token grants ZERO caps on B.
+;   2. The right vehicle is the BISCUIT token: ship it, authorize+fork on B.
+;      Authority arrives as signed data, re-materializes as a local capped env.
+;   3. Deny crosses too: a forged token forks nothing on B.
+;
+; The peer node IS the subject: the tests start a REAL Distributed-Erlang node
+; via `:peer` and drive it with `:erpc`. ONE node serves all three findings —
+; started on first need, stopped once by the last test — so a run spends one
+; node's startup, not three, and this file closes exactly the node it spawned.
+; The names carry a unique suffix, so a node left over from a killed run can
+; never collide with a new one.
+
+(ns cross-node.conveyance.test
+  (:require [auth] [env]))
+
+;; Elixir host modules as VALUES (a bare `BeamLisp` in argument position is the
+;; symbol, not the module atom): the peers are driven over `:erpc`, whose module
+;; argument must be an atom.
+(def ^:private BL (erlang/binary_to_atom "Elixir.BeamLisp"))
+(def ^:private BLEnv (erlang/binary_to_atom "Elixir.BeamLisp.Env"))
+(def ^:private BLLoader (erlang/binary_to_atom "Elixir.BeamLisp.Loader"))
+(def ^:private App (erlang/binary_to_atom "Elixir.Application"))
+(def ^:private StringM (erlang/binary_to_atom "Elixir.String"))
+
+;; ── the node boundary ────────────────────────────────────────────────
+
+(defn- uniq [] (erlang/unique_integer (list :positive)))
+
+(defn- ensure-kernel!
+  "Make THIS node distributed, once. A uniquely-named node, so it is never
+   confused with — and never blocked by — a leftover from an earlier run."
+  []
+  (when (not (erlang/apply :erlang :is_alive (list)))
+    (erlang/apply :net_kernel :start
+      (list (list (erlang/binary_to_atom (str "blspike_primary_" (uniq) "@127.0.0.1"))
+                  :longnames)))))
+
+(defn- erpc [nd mod fun args]
+  (erlang/apply :erpc :call (list nd mod fun args)))
+
+(defn- start-peer!
+  "A real erlang node B, sharing this VM's cookie so the two may talk."
+  []
+  (let [cookie (erlang/apply :erlang :get_cookie (list))
+        res (erlang/apply :peer :start_link
+              (list {:name (erlang/binary_to_atom (str "blspike_exec_" (uniq)))
+                     :host (erlang/binary_to_list "127.0.0.1")
+                     :args (list (erlang/binary_to_list "-setcookie")
+                                 (erlang/atom_to_list cookie))}))]
+    {:peer (erlang/element 2 res) :node (erlang/element 3 res)}))
+
+(defn- prepare!
+  "Give B the SAME code path and image this VM runs: Elixir's ebin, the app, the
+   boot search paths, and the two namespaces the probe needs."
+  [nd]
+  (erpc nd :code :add_pathsz (list (erlang/apply :code :get_path (list))))
+  (erpc nd App :ensure_all_started (list :beam_lisp))
+  (erpc nd BL :init (list))
+  (erpc nd BLEnv :add_search_path (list "priv"))
+  (erpc nd BLLoader :ensure_loaded (list "auth"))
+  (erpc nd BLLoader :ensure_loaded (list "env")))
+
+;; The one executor node this file uses. Held in an atom because the tests share
+;; it: ward runs every `deftest` in one file process, and there is no setup hook
+;; to hang a per-file fixture on.
+(def ^:private executor (atom nil))
+
+(defn- executor-node
+  "Node B, started and prepared on first need, reused by every test."
+  []
+  (or (deref executor)
+      (let [p (start-peer!)]
+        (prepare! (:node p))
+        (reset! executor p)
+        p)))
+
+(defn- close-executor!
+  "Stop the node this file spawned — the only node it touches."
+  []
+  (let [p (deref executor)]
+    (when (some? p)
+      (erlang/apply :peer :stop (list (:peer p)))
+      (reset! executor nil))))
+
+(defn- on-b
+  "Run `f` with the executor node's name, starting it if this is the first test."
+  [f]
+  (ensure-kernel!)
+  (f (:node (executor-node))))
+
+;; ── source strings for the two ends (issued here, executed on B) ─────
+
+(defn- issuer-src
+  "A root keypair + a Biscuit token signed by it, encoded for the wire."
+  []
+  (str "(ns spike.issuer (:require [auth]))\n"
+       "(let [root (auth/keypair)\n"
+       "      token (auth/issue root [[\"user\" \"worker-7\"]\n"
+       "                              [\"right\" \"Elixir.String\" \"call\"]])]\n"
+       "  {:root-pub (Base/url_encode64 (auth/public root))\n"
+       "   :token    (auth/encode-base64 token)})"))
+
+(defn- exec-src
+  "On B: re-materialize the token as a LOCAL capped env (authorize+fork), then
+   show the grant runs, the ungranted is denied at COMPILE time, and the cap set
+   reflects exactly the right."
+  [root-b64 token-b64]
+  (str "(ns spike.exec (:require [auth] [env]))\n"
+       "(let [root-pub (Base/url_decode64! \"" root-b64 "\")\n"
+       "      token    (auth/decode-base64 \"" token-b64 "\")\n"
+       "      ctx      (auth/context {:policies [(auth/allow [])]})\n"
+       "      forked   (auth/sandbox-fork root-pub token ctx :global)]\n"
+       "  (if (contains? forked :ok)\n"
+       "    (env/with-env (:ok forked)\n"
+       "      (fn []\n"
+       "        {:granted (env/eval \"(ns b.ok) (String/upcase \\\"hi from B\\\")\")\n"
+       "         :denied  (try (env/eval \"(ns b.no) (File/read \\\"/etc/passwd\\\")\")\n"
+       "                       (catch _ :denied-at-COMPILE-time))\n"
+       "         :caps    (env/allowed? \"Elixir.String\")\n"
+       "         :file?   (env/allowed? \"Elixir.File\")}))\n"
+       "    {:error (:reason (:error forked))}))"))
+
+(defn- forger-src
+  "A token signed by a DIFFERENT key than the root the executor trusts."
+  []
+  (str "(ns spike.issuer2 (:require [auth]))\n"
+       "(let [real   (auth/keypair)\n"
+       "      forger (auth/keypair)\n"
+       "      token  (auth/issue forger [[\"right\" \"Elixir.File\" \"write\"]])]\n"
+       "  {:root-pub (Base/url_encode64 (auth/public real))\n"
+       "   :token    (auth/encode-base64 token)})"))
+
+(defn- forged-verdict-src
+  "On B: the forged token must fork NOTHING, and say so."
+  [root-b64 token-b64]
+  (str "(ns spike.exec (:require [auth] [env]))\n"
+       "(let [root-pub (Base/url_decode64! \"" root-b64 "\")\n"
+       "      token    (auth/decode-base64 \"" token-b64 "\")\n"
+       "      ctx      (auth/context {:policies [(auth/allow [])]})\n"
+       "      forked   (auth/sandbox-fork root-pub token ctx :global)]\n"
+       "  {:forked? (contains? forked :ok)\n"
+       "   :verdict (if (contains? forked :error) (:verdict (:error forked)) :allow)})"))
+
+;; ── tests ────────────────────────────────────────────────────────────
+
+(deftest naive-env-token-fails-closed-across-nodes
+  (on-b
+    (fn [nd]
+      (let [tok (env/with-env (env/fork :global {:caps ["Elixir.String"]})
+                              (fn [] (env/capture)))]
+        (is (erlang/is_reference (erlang/element 2 (:env tok)))
+            "a capture token names THIS node's env by reference")
+        (is (MapSet/member? (:caps tok) StringM)
+            "and carries the granted cap locally")
+        (let [derived (erpc nd BLEnv :caps_of (list (:env tok)))]
+          (is (= (MapSet/new) derived)
+              "an env-ref from another node must derive ZERO caps on B (fail closed)"))))))
+
+(deftest biscuit-token-conveys-the-ceiling
+  (on-b
+    (fn [nd]
+      (let [issued (BeamLisp/eval (issuer-src))
+            root-b64 (:root-pub issued)
+            token-b64 (:token issued)]
+        (is (string? root-b64))
+        (is (string? token-b64))
+        (let [result (erpc nd BL :eval (list (exec-src root-b64 token-b64)))]
+          (is (= "HI FROM B" (:granted result))
+              "the granted cap runs on B")
+          (is (= :denied-at-COMPILE-time (:denied result))
+              "the UNgranted cap is refused before it can run")
+          (is (= true (:caps result)))
+          (is (= false (:file? result))))))))
+
+(deftest forged-token-forks-nothing
+  (on-b
+    (fn [nd]
+      (let [issued (BeamLisp/eval (forger-src))
+            root-b64 (:root-pub issued)
+            token-b64 (:token issued)
+            result (erpc nd BL :eval (list (forged-verdict-src root-b64 token-b64)))]
+        (is (= false (:forked? result))
+            "a forged token must fork NO env on B")
+        (is (= :deny (:verdict result)))))))
+
+;; Teardown: registered LAST, so ward runs it after the three findings. ward has
+;; no per-file fixture hook, and a node left running is a node this file failed
+;; to close — so closing it is itself an assertion.
+(deftest the-file-closes-the-node-it-spawned
+  (close-executor!)
+  (is (nil? (deref executor))
+      "the executor node this file spawned is stopped"))

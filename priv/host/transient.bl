@@ -1,0 +1,354 @@
+; host/transient.bl — the pinned HOST MODULE for `Elixir.BeamLisp.Transient`.
+;
+; Clojure transients: a mutable-inside-a-scope view of a persistent collection,
+; used to build bulk results without paying per-element path-copying. This file
+; is the `.bl` port of `lib/beam_lisp/transient.ex`, compiled by
+; `BeamLisp.AOT/compile_host_file` into ONE exact-named beam. It is
+; FUNCTIONS-ONLY — no `:struct_fields`, no `:behaviour`: a transient is a TAGGED
+; TUPLE `{:"$transient", kind, key}`, never a struct.
+;
+; (This wave owns source and tests only; the seed entry that points a real atom
+; at this file is written by the wave that deletes `transient.ex`.)
+;
+; BEAM VALUES ARE IMMUTABLE, so "mutable" here is a process-local fiction: the
+; live state lives in the CALLER's process dictionary under a unique
+; `make_ref()` key, and every operation re-reads it. `persistent!` freezes the
+; state into a persistent collection and deletes the slot, so any further use
+; raises — Clojure's one-way door. Because the state is process-local, a handle
+; sent to another process finds no slot there: `state/1` raises the
+; already-persisted ArgumentError, which is exactly Clojure's "transients must
+; not escape the scope they were built in".
+;
+; WHAT THE MODULE OWES. The public ABI is the live module's, clause for clause:
+;
+;   * `transient/1` — a Vector into a `{:vec, reversed-list}` accumulator (so
+;     `conj!` prepends O(1) and `persistent!` rebuilds the trie once), a Set
+;     into a `{:set, s}`, any OTHER struct (a record is a user-facing map) and
+;     any plain map into a `{:map, m}`. A REFERENCE struct (Atom/Volatile/
+;     Promise/Future/Reduced) RAISES, and so does anything that is neither a
+;     struct nor a plain map — the two live `ArgumentError`s, message for
+;     message, `inspect` included.
+;
+;   * `conj!/1` — the reduce completion arity: a passthrough, never a mutation.
+;   * `conj!/2` — append to a vector/set transient, or add a `[k v]` ENTRY to a
+;     map transient. An entry arrives either as a `BeamLisp.Vector` whose
+;     `:items` is a 2-tuple (what `seq`/`find` yield over a map) or as a plain
+;     2-element list; anything else on a map transient is the live
+;     `ArgumentError` ("needs a [k v] entry"), raised WITHOUT consulting the
+;     state (so a persisted map transient + a bad entry still reports the entry,
+;     as it did live).
+;
+;   * `assoc!/3`, `dissoc!/2`, `get/3` — map-transient read/write/read-through,
+;     each re-reading live state.
+;
+;   * `persistent!/1` — delete the slot and freeze: Vector for `:vector`, the
+;     Set struct for `:set`, the map for `:map`. A second call, or a forged tuple
+;     with no matching live slot, is the `ArgumentError` "persistent! on an
+;     already-persisted transient"; a non-transient is "persistent! expected a
+;     transient, got …".
+;
+;   * `hash_map/3`, `hash_map_empty/0` — the variadic constructor (even rest,
+;     later pairs win) and the empty map.
+;
+; GUARDS BECOME RUNTIME CHECKS. The live module imports the compile-time guard
+; macros `BeamLisp.Guards.is_bl_map/1` (a map that is NOT a struct) and
+; `is_ref_type/1` (a reference struct). A pinned file has no `defguard`/`import`
+; of another module's macros, so the SAME predicates are written here as plain
+; functions — `bl_map?` and `ref_tag?` — called from clause bodies. The callers
+; are unaffected: the check runs one step later, and every clause answers as it
+; did.
+;
+; THE TAG IS MATCHED EXACTLY, WITHOUT A TUPLE PATTERN. beam-lisp binding patterns
+; accept a symbol, a vector, or a map — not a literal tuple — and guards cannot
+; call `erlang:element/2`. So a clause that means `{:"$transient", kind, key}`
+; is written as a `tuple?`/`tuple_size`/tag check in the body (`transient_tuple?`)
+; and the fall-through raises the SAME `FunctionClauseError` the live clause head
+; raised, built with THIS module's own atom (read from a fun literal, the
+; `seq_cursor.bl` idiom) so a probe compile names the probe atom.
+;
+; There is NO helper that reads a tagged collection's backing field by keyword.
+; `maps/get` needs no struct head, so a Vector's `:items` is read without
+; dispatching through the tag being read.
+;
+; Run: bin/bl test test/bl/host_transient_test.bl
+
+(ns host.transient)
+
+; ── predicates (the runtime face of the live guard macros) ───────────────
+
+(defn- self-mod
+  "The atom THIS source was compiled into, read from a fun literal compiled into
+   this file — module-exact, so the same source serves production and probe
+   without naming either."
+  []
+  (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+
+(defn- struct-like?
+  "Elixir's `is_struct/1`: a map carrying an atom `:__struct__` tag. A binary tag
+   is NOT a struct, and neither is a bare map."
+  [x]
+  (and (erlang/is_map x)
+       (erlang/is_map_key :__struct__ x)
+       (erlang/is_atom (erlang/map_get :__struct__ x))))
+
+(defn- tags?
+  "`is_struct(x, tag)`: `x` is a struct whose `:__struct__` is exactly `tag`."
+  [x tag]
+  (and (struct-like? x) (erlang/== tag (erlang/map_get :__struct__ x))))
+
+(defn- bl-map?
+  "The live `is_bl_map/1`: a plain map — a map that is NOT a struct."
+  [x]
+  (and (erlang/is_map x) (erlang/not (struct-like? x))))
+
+(defn- ref-tag?
+  "The live `is_ref_type/1`: a reference struct — the types that hold a value
+   behind an indirection, plus the `Reduced` reduce sentinel. None is a
+   collection."
+  [x]
+  (and (struct-like? x)
+       (Enum/member? (list :Elixir.BeamLisp.Atom
+                           :Elixir.BeamLisp.Volatile
+                           :Elixir.BeamLisp.Promise
+                           :Elixir.BeamLisp.Future
+                           :Elixir.BeamLisp.Reduced)
+                     (erlang/map_get :__struct__ x))))
+
+(defn- transient-tuple?
+  "A 3-tuple whose first element is the transient tag and whose second is `kind`.
+   The literal-tuple binding pattern the live clause heads used, written as a
+   runtime test — a 3-element LIST is not a transient, exactly as it was not
+   one live."
+  [t kind]
+  (and (erlang/is_tuple t)
+       (erlang/== 3 (erlang/tuple_size t))
+       (erlang/== :"$transient" (erlang/element 1 t))
+       (erlang/== kind (erlang/element 2 t))))
+
+(defn- alive-kind?
+  "Whether `st` is the live state `{:alive, {kind, _}}`."
+  [st kind]
+  (and (erlang/is_tuple st)
+       (erlang/== 2 (erlang/tuple_size st))
+       (erlang/== :alive (erlang/element 1 st))
+       (erlang/is_tuple (erlang/element 2 st))
+       (erlang/== 2 (erlang/tuple_size (erlang/element 2 st)))
+       (erlang/== kind (erlang/element 1 (erlang/element 2 st)))))
+
+(defn- alive-inner
+  "The payload `{kind, x}`'s second element, for a state the caller expects to be
+   `{:alive, {kind, _}}`. A state of another shape is the `CaseClauseError` the
+   live `case state(key)` raised."
+  [st kind]
+  (if (alive-kind? st kind)
+    (erlang/element 2 (erlang/element 2 st))
+    (erlang/error (Elixir.CaseClauseError/exception (list (tuple :term st))))))
+
+(defn- vector-entry?
+  "A `BeamLisp.Vector` whose `:items` is a 2-tuple — the `[k v]` map entry
+   `seq`/`find` yield (a larger vector's trie items is a 5-tuple, so it does not
+   match, exactly as it did not match `%Vector{items: {k, v}}`)."
+  [x]
+  (and (tags? x :Elixir.BeamLisp.Vector)
+       (let [items (maps/get :items x)]
+         (and (erlang/is_tuple items) (erlang/== 2 (erlang/tuple_size items))))))
+
+(defn- two-list?
+  "A plain 2-element Erlang list — the other `[k v]` entry shape."
+  [x]
+  (and (erlang/is_list x) (erlang/== 2 (erlang/length x))))
+
+(defn- function-clause!
+  "The `FunctionClauseError` an unmatched clause head raised, named with THIS
+   module's own atom so a probe compile reports the probe atom."
+  [fname arity]
+  (erlang/error
+    (Elixir.FunctionClauseError/exception
+      (list (tuple :module (self-mod))
+            (tuple :function fname)
+            (tuple :arity arity)))))
+
+; ── process-local state ───────────────────────────────────────────────────
+
+(defn- state
+  "The live state under `key`, or the `ArgumentError` a use after `persistent!`
+   (or in another process) raises. `process-dictionary` is process-local by
+   construction, which is what makes the transient single-process."
+  [key]
+  (let [v (Process/get key)]
+    (if (erlang/== v nil)
+      (erlang/error
+        (Elixir.ArgumentError/exception "operation on an already-persisted transient"))
+      v)))
+
+(defn- put_state
+  [key st]
+  (Process/put key st))
+
+(defn- map_transient
+  [m]
+  (let [key (erlang/make_ref)]
+    (put_state key (tuple :alive (tuple :map m)))
+    (tuple :"$transient" :map key)))
+
+; ── the public ABI ────────────────────────────────────────────────────────
+
+(defn transient
+  "`(transient coll)` — vector or map into a transient view. A Set (matched
+   before the `is_bl_map` case: a set is a struct, and a struct is a map) and
+   any struct that is not a reference become map/set transients; a reference
+   struct and every non-collection raise."
+  [m]
+  (cond
+    (tags? m :Elixir.BeamLisp.Vector)
+    (let [key (erlang/make_ref)]
+      (put_state key (tuple :alive (tuple :vec (Enum/reverse (BeamLisp.Vector/to_list m)))))
+      (tuple :"$transient" :vector key))
+
+    (tags? m :Elixir.BeamLisp.Set)
+    (let [key (erlang/make_ref)]
+      (put_state key (tuple :alive (tuple :set m)))
+      (tuple :"$transient" :set key))
+
+    (ref-tag? m)
+    (erlang/error
+      (Elixir.ArgumentError/exception
+        (str "transient not supported for " (Kernel/inspect m) " ("
+             (Kernel/inspect (erlang/map_get :__struct__ m))
+             " is a reference, not a collection)")))
+
+    (struct-like? m)
+    (map_transient m)
+
+    (bl-map? m)
+    (map_transient m)
+
+    :else
+    (erlang/error
+      (Elixir.ArgumentError/exception
+        (str "transient not supported for " (Kernel/inspect m) " (only vectors and maps)")))))
+
+(defn conj!
+  "`(conj! t)` — the reducing-fn completion arity: a passthrough, never a
+   mutation (the take-nth/take transducers delegate `([result] (rf result))` to
+   their rf, and `into` runs `(transduce xform conj! …)`). `(conj! t x)` —
+   append to a vector/set transient, or add an entry to a map transient."
+  ([t] t)
+  ([t x]
+   (cond
+     (transient-tuple? t :vector)
+     (let [key (erlang/element 3 t)
+           rev (alive-inner (state key) :vec)]
+       (put_state key (tuple :alive (tuple :vec (cons x rev))))
+       (tuple :"$transient" :vector key))
+
+     (transient-tuple? t :set)
+     (let [key (erlang/element 3 t)
+           s (alive-inner (state key) :set)]
+       (put_state key (tuple :alive (tuple :set (BeamLisp.Set/add s x))))
+       (tuple :"$transient" :set key))
+
+     (transient-tuple? t :map)
+     (let [key (erlang/element 3 t)]
+       (cond
+         (vector-entry? x)
+         (let [items (maps/get :items x)
+               m (alive-inner (state key) :map)]
+           (put_state key (tuple :alive (tuple :map (maps/put (erlang/element 1 items) (erlang/element 2 items) m))))
+           (tuple :"$transient" :map key))
+
+         (two-list? x)
+         (let [m (alive-inner (state key) :map)]
+           (put_state key (tuple :alive (tuple :map (maps/put (erlang/hd x) (erlang/hd (erlang/tl x)) m))))
+           (tuple :"$transient" :map key))
+
+         :else
+         (erlang/error
+           (Elixir.ArgumentError/exception
+             (str "conj! on a transient map needs a [k v] entry, got: "
+                  (Kernel/inspect x))))))
+
+     :else
+     (function-clause! :conj! 2))))
+
+(defn assoc!
+  "`(assoc! t k v)` — set a transient map entry."
+  [t k v]
+  (if (transient-tuple? t :map)
+    (let [key (erlang/element 3 t)
+          m (alive-inner (state key) :map)]
+      (put_state key (tuple :alive (tuple :map (maps/put k v m))))
+      (tuple :"$transient" :map key))
+    (function-clause! :assoc! 3)))
+
+(defn dissoc!
+  "`(dissoc! t k)` — remove a transient map entry."
+  [t k]
+  (if (transient-tuple? t :map)
+    (let [key (erlang/element 3 t)
+          m (alive-inner (state key) :map)]
+      (put_state key (tuple :alive (tuple :map (Map/delete m k))))
+      (tuple :"$transient" :map key))
+    (function-clause! :dissoc! 2)))
+
+(defn persistent!
+  "`(persistent! t)` — freeze the transient and invalidate it. The slot is
+   DELETED before the freeze, so the one-way door closes whether or not the
+   freeze succeeds."
+  [t]
+  (if (and (erlang/is_tuple t)
+           (erlang/== 3 (erlang/tuple_size t))
+           (erlang/== :"$transient" (erlang/element 1 t)))
+    (let [kind (erlang/element 2 t)
+          key (erlang/element 3 t)
+          deleted (Process/delete key)]
+      (cond
+        (and (erlang/== :vector kind) (alive-kind? deleted :vec))
+        (BeamLisp.Vector/new (Enum/reverse (alive-inner deleted :vec)))
+
+        (and (erlang/== :set kind) (alive-kind? deleted :set))
+        (alive-inner deleted :set)
+
+        (and (erlang/== :map kind) (alive-kind? deleted :map))
+        (alive-inner deleted :map)
+
+        :else
+        (erlang/error
+          (Elixir.ArgumentError/exception "persistent! on an already-persisted transient"))))
+    (erlang/error
+      (Elixir.ArgumentError/exception
+        (str "persistent! expected a transient, got " (Kernel/inspect t))))))
+
+(defn get
+  "`(get t k default)` on a transient map — read-through to live state."
+  [t k default]
+  (if (transient-tuple? t :map)
+    (let [key (erlang/element 3 t)
+          st (state key)]
+      (if (alive-kind? st :map)
+        (Map/get (alive-inner st :map) k default)
+        (erlang/error
+          (Elixir.ArgumentError/exception "get on an already-persisted transient"))))
+    (function-clause! :get 3)))
+
+(defn hash_map
+  "`(hash-map k v …)` — variadic constructor (even number of forms). The rest
+   list is the forms AFTER the first pair; an odd count is the live
+   `ArgumentError`, a non-list rest the live `FunctionClauseError`."
+  [k v rest]
+  (if (erlang/is_list rest)
+    (if (erlang/== 0 (rem (erlang/length rest) 2))
+      (Enum/reduce
+        (Enum/chunk_every rest 2)
+        (maps/put k v (maps/new))
+        (fn [[pk pv] acc] (maps/put pk pv acc)))
+      (erlang/error
+        (Elixir.ArgumentError/exception
+          (str "hash-map requires an even number of forms, got "
+               (+ 2 (erlang/length rest))))))
+    (function-clause! :hash_map 3)))
+
+(defn hash_map_empty
+  "`(hash-map)` — the empty map."
+  []
+  (maps/new))

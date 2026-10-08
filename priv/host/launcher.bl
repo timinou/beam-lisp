@@ -1,0 +1,437 @@
+; host/launcher.bl — the pinned HOST MODULE for `Elixir.BeamLisp.Launcher`.
+;
+; This file is not a namespace. It is a `.bl` SOURCE that the bootstrap seed
+; compiles with `BeamLisp.AOT/compile_host_file` into ONE exact-named beam
+; (`Elixir.BeamLisp.Launcher.beam`) whose top-level `defn`s are plain exported
+; functions. It is the `.bl` port of the Elixir boot program that `bin/bl`
+; used to feed to `elixir -e` — the program that installed the pinned hosts,
+; judged whether the boot tier in `build/` was this tree's generation,
+; rebuilt it in a CHILD VM when it was not, re-exec'd `bin/bl` under
+; `BL_BOOT_REEXECED`, started the application (or the language alone for
+; `deps`), ensured the native crates, and finally dispatched `bl.cli`
+; `run-argv`.
+;
+; The ports live per step: the host install/manifest/floor are
+; `Elixir.BeamLisp.Bootstrap`, the toolchain key is
+; `Elixir.BeamLisp.AOTCache`, the beam provenance is `Elixir.BeamLisp.AOT`,
+; the boot-tier membership is `Elixir.BeamLisp.Tiers`, and the search path,
+; var table and loader are `Elixir.BeamLisp.Env` / `Elixir.BeamLisp.Loader`.
+; What was left in `bin/bl` was the SEQUENCE — and this module is it.
+;
+; ── WHY A PINNED MODULE AND NOT A NAMESPACE ─────────────────────────────────
+;
+; The launcher runs FIRST: before `install_hosts!/1`, before the floor is
+; staged, before a single `BeamLisp.Ns.*` beam is loadable on a cold tree. It
+; is invoked from a trampoline (`elixir -e 'BeamLisp.Launcher.main()' -- …`,
+; or an Erlang/Elixir entry point that calls `main/0` or `main/1`), so it
+; cannot be an AOT-rebuilt namespace: a namespace's own function bodies resolve
+; their siblings through the var table the launcher has not filled yet. A
+; pinned host beam is a fixed artifact named by the seed manifest, built by one
+; generation and used by the next.
+;
+; ── THE PREBOOT CONSTRAINT: NO Rt, NO core ──────────────────────────────────
+;
+; Everything on the launcher's path runs with nothing on the code path but
+; Elixir/OTP, the pinned host leaves, and this beam. `BeamLisp.Ns.Rt` is not
+; loaded and `core`'s vars are not interned — they are interned BY the boot
+; this module enables. So the file is written in the surface the BEAM itself
+; provides, exactly as `priv/host/aot_cache.bl` documents it:
+;
+;   * `erlang/*` BIFs — `apply`, `element`, `tuple_size`, `is_*`, `==`, `hd`,
+;     `++`, `list_to_binary`, `integer_to_binary`, `function_exported`, … —
+;     are remote calls to `:erlang`, free of any runtime;
+;   * `lst`/`tup`/`bcat` build a list, a tuple and a binary from BIFs alone,
+;     which is why they exist instead of `(list …)`, `(tuple …)` and `str`
+;     (each of those lowers to a `BeamLisp.Ns.Core` call — measured);
+;   * `Enum`, `Map`, `Keyword`, `Path`, `File`, `System`, `String`, `IO`,
+;     `Code`, `Module`, `Macro`, `List` are host modules: Elixir/OTP, on the
+;     path in any `elixir` VM, and the same modules the Elixir twin called;
+;   * `cond`/`if`/`when`/`and`/`or`/`do` are MACROS — they expand at compile
+;     time into `if`/`let`, which emit nothing at runtime;
+;   * `case`, `(list …)`, `(tuple …)`, `str`, `nil?`, `{…}` map literals,
+;     vector literals, destructuring, `for`/`doseq` and CALLING A LOCALLY-BOUND
+;     FN are all AVOIDED: each emits a `BeamLisp.Ns.Core`/`Ns.Rt`/`Env`
+;     reference (measured per-construct against the emitted atom table). The
+;     seam calls below are therefore `call0/1/2/3`, which reach a function
+;     VALUE through `erlang/apply` alone.
+;
+; `test/bl/launcher_host_test.bl` proves this twice: it asserts the emitted
+; beam carries no `Elixir.BeamLisp.Ns.Core` atom, and it runs the preboot
+; decisions in a fresh `elixir` child whose ONLY added code path entry is that
+; beam — asserting `BeamLisp.Ns.Rt`, `BeamLisp.Ns.Core` and `BeamLisp.Env` are
+; never loaded by them.
+;
+; ── THE SEAMS ───────────────────────────────────────────────────────────────
+;
+; The flow is effectful at its edges — the filesystem, the environment, two
+; child processes, `System.halt`, and the language it boots. `boot/2` takes an
+; optional map that overrides those edges; `default_seam/1` supplies the real
+; implementation for every key. `main/1` passes an empty map, so production
+; behaviour is the default one. The seams exist so the DECISIONS — which verb
+; may boot without the application, whether the tier is current, which child
+; command runs, which exit code is taken — are provable without booting the
+; language or terminating a VM.
+;
+; ── THE CHILD REBUILD ───────────────────────────────────────────────────────
+;
+; A stale tier is rebuilt in a CHILD VM because this parent must not boot the
+; language itself: `ensure_all_started` starts `BeamLisp.Env`, and a pre-booted
+; Env makes the application fail to start (`{:already_started,
+; #PID<0.99.0>}`). The child's program is the one-line trampoline
+; `BeamLisp.Launcher.rebuild_tier()` — the rebuild itself is `rebuild_tier/0`
+; below, passed the ebin as `argv[0]`. It cannot run in the parent's VM for the
+; reason the Elixir twin recorded: the parent already loaded modules from the
+; OLD floor while judging the tier, and starting the application on a
+; partially-reloaded image assembles a VM from two generations.
+;
+; (This wave owns source and test only; the seed entry that points the real
+; atom at this file, the `bin/bl` cutover to `main/0`, and the deletion of the
+; heredoc are the integrating wave's. The port is judged by its focused test,
+; which compiles it at a probe atom and drives the flow through its seams.)
+;
+; Run: bin/bl test test/bl/launcher_host_test.bl
+
+(ns host.launcher)
+
+; ── the preboot constructors (BIFs alone; see the header) ───────────────────
+
+(defn- lst
+  "A plain list of the arguments. A rest argument IS a list, so this compiles
+   to argument collection and nothing else — no `BeamLisp.Ns.Core` reference,
+   which is what a bare `(list …)` would emit."
+  [& xs] xs)
+
+(defn- tup
+  "A tuple of the arguments, built the way Erlang builds one. Replaces
+   `(tuple …)`, which lowers to a `BeamLisp.Ns.Core` call."
+  [& xs] (erlang/list_to_tuple xs))
+
+(defn- bcat
+  "A binary from the arguments (an iolist). Stands in for `str`/`Kernel.<>`,
+   both of which compile to a runtime call."
+  [& xs] (erlang/list_to_binary xs))
+
+; ── reaching a function VALUE without the runtime ───────────────────────────
+;
+; `(f x)` where `f` is a local binding lowers to `BeamLisp.Ns.Rt.invoke`, which
+; is `undef` before the floor boots. `erlang/apply` is a BIF and takes a fun
+; directly, so every seam call goes through these four.
+
+(defn- call0 [f] (erlang/apply f (lst)))
+(defn- call1 [f a] (erlang/apply f (lst a)))
+(defn- call2 [f a b] (erlang/apply f (lst a b)))
+(defn- call3 [f a b c] (erlang/apply f (lst a b c)))
+
+; ── the decisions (pure; no host module, no language) ───────────────────────
+
+(defn provisioning_argv?
+  "Whether `argv` is the one verb allowed to boot WITHOUT the application.
+   `deps` installs the libraries the application needs, so requiring them to
+   be present would be circular (measured on an empty cache:
+   `{:error, {:x509, {~c\"no such file or directory\", ~c\"x509.app\"}}}`). The
+   verb is matched at FIRST position only — `bl version deps` is not it."
+  [argv]
+  (erlang/== (Enum/take argv 1) (lst "deps")))
+
+(defn tier_module
+  "The module atom a boot namespace's beam is emitted at: `BeamLisp.Ns.` joined
+   with the CAMELIZED dot segments of `ns`. This is the Elixir twin's
+   `Module.concat([BeamLisp.Ns | Enum.map(String.split(ns, \".\"),
+   &Macro.camelize/1)])`, and it is spelled here rather than asked of
+   `BeamLisp.Link/module_for` on purpose: this verdict runs before `rt`/`core`
+   load, and a previous-generation `Link` may use runtime helpers unavailable
+   until the floor boots. Kebab segments are preserved: the live tree's module
+   IS `Elixir.BeamLisp.Ns.Reader-node`."
+  [ns]
+  (Module/concat
+    (erlang/++ (lst :"Elixir.BeamLisp.Ns")
+               (Enum/map (String/split ns ".") (fn [part] (Macro/camelize part))))))
+
+(defn provenance_key
+  "The compiler key a beam's provenance carries, or nil when it carries none.
+   `{hash, key}` is what `AOT.beam_provenance/1` answers; the `%{key: key}`
+   clause keeps the older map shape answerable. An unanswerable question is not
+   a yes."
+  [p]
+  (cond
+    (erlang/is_map p) (Map/get p :key)
+
+    (and (erlang/is_tuple p)
+         (erlang/== 2 (erlang/tuple_size p))
+         (erlang/is_binary (erlang/element 2 p)))
+      (erlang/element 2 p)
+
+    :else nil))
+
+(defn tier_current?
+  "Whether EVERY `{ns, provenance}` pair in `pairs` was compiled by `key_now`.
+   One generation is the whole question: a tier that is half this tree and half
+   the previous one is the state that produced this tree's worst failure, so a
+   single mismatch is `false`."
+  [pairs key_now]
+  (Enum/all? pairs (fn [pair] (erlang/== key_now (provenance_key (erlang/element 2 pair))))))
+
+(defn tier_verdict
+  "The tier verdict the launcher acts on. A tree with no committed seed has
+   nothing to compare against and is served as-is; with a seed, an unanswerable
+   provenance question (`can_judge?` false — e.g. an older `AOT` without
+   `beam_provenance/1`) is NOT a yes, so the tier rebuilds. That is always the
+   safe direction."
+  [manifest can_judge? pairs key_now]
+  (or (erlang/== nil manifest)
+      (and can_judge? (tier_current? pairs key_now))))
+
+; ── the seams ───────────────────────────────────────────────────────────────
+
+(defn default_seam
+  "The real implementation of seam `k` — the effectful edge `boot/2` calls by
+   default. Every branch builds a fun with host modules and BIFs only."
+  [k]
+  (cond
+    (erlang/== k :get_env) (fn [name] (System/get_env name))
+    (erlang/== k :stderr) (fn [msg] (IO/puts :stderr msg))
+    (erlang/== k :halt) (fn [code] (System/halt code))
+    (erlang/== k :cmd) (fn [exe args opts] (System/cmd exe args opts))
+    (erlang/== k :code_path) (fn [] (code/get_path))
+    (erlang/== k :find_executable) (fn [name] (System/find_executable name))
+    (erlang/== k :install_hosts) (fn [ebin] (BeamLisp.Bootstrap/install_hosts! ebin))
+    (erlang/== k :manifest) (fn [] (BeamLisp.Bootstrap/manifest))
+    (erlang/== k :key_now) (fn [] (BeamLisp.AOTCache/current_compiler_key))
+    (erlang/== k :provenance) (fn [mod] (BeamLisp.AOT/beam_provenance mod))
+    (erlang/== k :boot_namespaces) (fn [] (BeamLisp.Tiers/boot_namespaces))
+    (erlang/== k :start_app) (fn [] (Application/ensure_all_started :beam_lisp))
+    (erlang/== k :load_app) (fn [] (Application/load :beam_lisp))
+    (erlang/== k :aot_boot) (fn [] (BeamLisp.AOT/boot))
+    (erlang/== k :ensure_loaded) (fn [ns] (BeamLisp.Loader/ensure_loaded ns))
+    (erlang/== k :fetch) (fn [ns name] (BeamLisp.Env/fetch! ns name))
+    (erlang/== k :invoke) (fn [f args] (BeamLisp.Ns.Rt/invoke f args))
+
+    :else
+      (fn [& _args]
+        (erlang/error
+          (Elixir.RuntimeError/exception "unknown launcher seam")))))
+
+(defn- seam [seams k] (Map/get seams k (default_seam k)))
+
+; ── the preboot steps ───────────────────────────────────────────────────────
+
+(defn boot_ebin
+  "Where the beams are: `BL_EBIN` when the launcher was given one (the image
+   directory `bin/bl` builds), else `build/` under the working directory."
+  [seams]
+  (or (call1 (seam seams :get_env) "BL_EBIN") (Path/expand "build")))
+
+(defn boot_root
+  "The TREE root the boot-tier rebuild reads its sources from. It is not the
+   ebin's parent under a release layout, so `BL_ROOT` is consulted first — the
+   variable `bin/bl` exports for exactly this question."
+  [seams ebin]
+  (or (call1 (seam seams :get_env) "BL_ROOT") (Path/dirname ebin)))
+
+(defn path_string
+  "A code-path entry as a string. `:code.get_path/0` answers charlists, and a
+   seam may hand over binaries: accept both rather than pin the seam to one."
+  [p]
+  (if (erlang/is_binary p) p (List/to_string p)))
+
+(defn child_pa
+  "This VM's whole code path as `-pa` args for the child VM. Every path is
+   named because the child stages the floor and then builds the tier from the
+   tree: the same code path the parent booted on is the one the rebuild needs."
+  [paths]
+  ; `-pa` prepends. Reverse the parent's priority-ordered code path so the
+  ; child sees the SAME winning beam when a pinned override precedes build/.
+  (Enum/flat_map (Enum/reverse paths) (fn [p] (lst "-pa" (path_string p)))))
+
+(defn build_program
+  "The child VM's program, as Elixir source: the trampoline to the rebuild
+   below. Passing a NAME, never a program body, is what keeps a quote in the
+   rebuild from truncating a shell-quoted boot program — the trap the `bin/bl`
+   heredoc records."
+  []
+  "BeamLisp.Launcher.rebuild_tier()")
+
+(defn build_sources
+  "The boot-tier sources, in the order the Elixir twin listed them: the flat
+   `priv/boot/*.bl` run, the std multi-file prelude it requires, and the
+   literate `.bl.md` / `.bl.org` sources."
+  [root]
+  (erlang/++
+    (Path/wildcard (Path/join root "priv/boot/*.bl"))
+    (erlang/++
+      (Path/wildcard (Path/join root "priv/std/multi.bl"))
+      (erlang/++
+        (Path/wildcard (Path/join root "priv/boot/*.bl.md"))
+        (Path/wildcard (Path/join root "priv/boot/*.bl.org"))))))
+
+(defn build_args
+  "The argument map `build/run` takes, key for key as the Elixir twin built it.
+   `:log` streams the child's progress lines to stderr.
+
+   `:scope :scoped` because this child owns a SUBSET: `build_sources` is
+   `priv/boot/` plus the std prelude it requires, compiled into the SAME ebin
+   the whole tree builds into. An authoritative full run handed a boot-only
+   list would read every recorded source it was not handed as deleted, and
+   drop the library's records and beams — the boot self-heal would demolish
+   the build it is healing. Scoped says exactly what this child means: prune
+   nothing it was not handed."
+  [ebin root]
+  (Map/put
+    (Map/put
+      (Map/put
+        (Map/put
+          (Map/put
+            (Map/put
+              (Map/put (Map/new) :sources (build_sources root))
+              :out ebin)
+            :manifest (Path/join ebin ".beam_lisp/compile.beam_lisp"))
+          :force? false)
+        :jobs nil)
+      :log (fn [msg] (IO/puts :stderr msg)))
+    :scope :scoped))
+
+(defn rebuild_tier
+  "The CHILD VM's entry: stage the floor, boot the language, and compile the
+   boot tier into `argv[0]` AS A UNIT. `Bootstrap.install!/1` runs here and not
+   in the parent on purpose — installing the floor loads the seed's init beams
+   and starts `BeamLisp.Env`, harmless in a VM that will only build and exit and
+   fatal in the parent, which must start the application on the rebuilt tier
+   with a fresh VM."
+  []
+  (let [ebin (erlang/hd (System/argv))
+        root (or (System/get_env "BL_ROOT") (Path/dirname ebin))]
+    (BeamLisp.Bootstrap/install! ebin)
+    (BeamLisp.AOT/boot)
+    (BeamLisp.Env/add_search_path (Path/join root "priv/boot"))
+    (BeamLisp.Env/add_search_path (Path/join root "priv/std"))
+    (BeamLisp.Loader/ensure_loaded "build")
+    (let [run (BeamLisp.Env/fetch! "build" "run")
+          result (BeamLisp.Ns.Rt/invoke run (lst (build_args ebin root)))
+          errors (Map/get result :errors)]
+      (if (erlang/== 0 (Enum/count errors))
+        result
+        (do
+          (Enum/each errors (fn [message] (IO/puts :stderr message)))
+          (System/halt 70))))))
+
+; ── the stages ──────────────────────────────────────────────────────────────
+
+(defn rebuild_step!
+  "A tier that is stale or mixed generations ends the road for every verb, so it
+   is rebuilt BEFORE the application interns it. Self-limiting: the rebuild
+   writes the ebin, so the next run's verdict finds a current destination and
+   this costs a tier build once per boot-source edit, nothing on a warm tree.
+   A re-exec runs `bin/bl` with `BL_BOOT_REEXECED=1`, and a second stale verdict
+   after a rebuild REFUSES rather than restarting forever."
+  [argv seams ebin root]
+  (call1 (seam seams :stderr)
+         "bl: the boot tier in build/ is not this tree's generation; rebuilding it as a unit")
+  (let [child
+        (call3 (seam seams :cmd)
+               (call1 (seam seams :find_executable) "elixir")
+               (erlang/++ (child_pa (call0 (seam seams :code_path)))
+                          (lst "-e" (build_program) "--" ebin))
+               (lst (tup :stderr_to_stdout true)
+                    (tup :into (IO/stream :stderr :line))))
+        status (erlang/element 2 child)]
+    (cond
+      (erlang/not (erlang/== 0 status))
+        (do
+          (call1 (seam seams :stderr)
+                 (bcat "bl: the boot tier does not rebuild from source (exit "
+                       (erlang/integer_to_binary status) "); this image is unusable"))
+          (call1 (seam seams :halt) 70))
+
+      (erlang/== "1" (call1 (seam seams :get_env) "BL_BOOT_REEXECED"))
+        (do
+          (call1 (seam seams :stderr)
+                 "bl: boot tier is still stale after a rebuild; refusing another restart")
+          (call1 (seam seams :halt) 70))
+
+      :else
+        (let [again
+              (call3 (seam seams :cmd)
+                     (Path/join root "bin/bl")
+                     argv
+                     (lst (tup :env (lst (tup "BL_BOOT_REEXECED" "1")))
+                          (tup :stderr_to_stdout true)
+                          (tup :into (IO/stream :stdio :line))))]
+          (call1 (seam seams :halt) (erlang/element 2 again))))))
+
+(defn dispatch!
+  "The last step: load `bl.cli` and run it on `argv`. Its return value IS the
+   process exit code, so the CLI's own failures stay the CLI's."
+  [argv seams]
+  (call1 (seam seams :ensure_loaded) "bl.cli")
+  (let [run (call2 (seam seams :fetch) "bl.cli" "run-argv")]
+    (call1 (seam seams :halt) (call2 (seam seams :invoke) run (lst argv)))))
+
+(defn start_app!
+  "Start the application and finish the boot. A machine with no libraries
+   cannot start it, and one command has to work on exactly such a machine: the
+   provisioning verb boots the LANGUAGE without the application (`AOT.boot/0`
+   starts `Env` and `Loader.Server` and seeds core) while every other verb
+   refuses to run on a half-started image and SAYS SO, with the reason. Once the
+   application is up, every `defnative` crate's cdylib is brought current — the
+   committed `.so` served the app boot's own LazySeq, this rebuilds only a crate
+   whose Rust source changed (`~1ms` when all current; cargo absent reports and
+   continues)."
+  [argv seams]
+  (let [result (call0 (seam seams :start_app))]
+    (cond
+      (erlang/== :ok (erlang/element 1 result))
+        (do
+          (call1 (seam seams :ensure_loaded) "vm.native")
+          (call2 (seam seams :invoke)
+                 (call2 (seam seams :fetch) "vm.native" "build-all!")
+                 (lst))
+          (dispatch! argv seams))
+
+      (provisioning_argv? argv)
+        (do
+          (call0 (seam seams :load_app))
+          (call1 (seam seams :stderr)
+                 (bcat "bl: the application did not start (" (Kernel/inspect result)
+                       "); running " (erlang/hd argv)
+                       " anyway, because it installs what the application needs"))
+          (call0 (seam seams :aot_boot))
+          (dispatch! argv seams))
+
+      :else
+        (do
+          (call1 (seam seams :stderr)
+                 (bcat "bl: the application did not start: " (Kernel/inspect result)))
+          (call1 (seam seams :stderr)
+                 "bl: this image is not usable as-is; `bl build --force` rebuilds it, and `bl doctor` says what it is")
+          (call1 (seam seams :halt) 70)))))
+
+; ── the entry ───────────────────────────────────────────────────────────────
+
+(defn boot
+  "The launcher, for `argv`, with `seams` overriding the effectful edges
+   (`main/1` passes an empty map). The order is the whole contract: the pinned
+   host ABI is installed BEFORE the tier is judged (the verdict reads beam
+   provenance), the tier is rebuilt AS A UNIT before the application interns it,
+   and the application is started (or the language alone, for `deps`) before
+   `bl.cli` is loaded."
+  [argv seams]
+  (let [ebin (boot_ebin seams)
+        root (boot_root seams ebin)]
+    (call1 (seam seams :install_hosts) ebin)
+    (let [manifest (call0 (seam seams :manifest))
+          key_now (call0 (seam seams :key_now))
+          namespaces (call0 (seam seams :boot_namespaces))
+          pairs (Enum/map namespaces
+                  (fn [ns] (tup ns (call1 (seam seams :provenance) (tier_module ns)))))
+          can_judge? (and (Code/ensure_loaded? :"Elixir.BeamLisp.AOT")
+                          (erlang/function_exported :"Elixir.BeamLisp.AOT" :beam_provenance 1))]
+      (if (tier_verdict manifest can_judge? pairs key_now)
+        (start_app! argv seams)
+        (rebuild_step! argv seams ebin root)))))
+
+(defn main
+  "The trampoline entry. `main/0` is this VM's own argv; `main/1` takes an
+   explicit one. Both run the flow with the REAL seams — the override map is
+   the test's door, not a production one."
+  ([] (main (System/argv)))
+  ([argv] (boot argv (Map/new))))

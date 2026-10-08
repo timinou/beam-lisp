@@ -1,0 +1,415 @@
+; vm/inventory.bl — everything bl is running on this machine, as one tree.
+;
+; ══ ONE QUESTION, ANSWERED ONCE ═════════════════════════════════════════════
+;
+; "What is running?" used to be five files describing one VM five ways. This is
+; the join. It reads, never writes (except `stop!` and `prune!`, which say so),
+; and returns plain data that the terminal (`bl vm`), the page (`/api/vms`) and a
+; test all render — they cannot disagree because none of them owns the truth.
+;
+;   VM  (an OS process)           registry record   ← the truth, once published
+;    └ realm  (a project, alive)  .meta + claims    ← derived from outside a VM
+;       └ route  (a name → port)  claim file
+;
+; ══ WHY IT ALSO READS THE OLD FILES ═════════════════════════════════════════
+;
+; A VM that started before the registry existed has no record. Listing only
+; records would make every running daemon invisible the day this ships, which is
+; the opposite of "see everything". So a live `.meta` (the daemon's own sidecar),
+; a live port claim, and the gateway's endpoint each ADOPT their pid as a VM row,
+; marked `:legacy` — it appears, it can be stopped, and it becomes a normal row
+; the next time that VM starts. The registry is the destination; this is the road.
+;
+; ══ WHAT A REALM IS, FROM OUTSIDE ═══════════════════════════════════════════
+;
+; Inside a VM the manager's table is authoritative. From outside, a realm is a
+; project root that a VM's `.meta` or a claim names — enough to list and to
+; stop, and exactly as much as the files say. Asking the VM itself (a `:realms`
+; control frame) is the planned upgrade; this view never claims more than it read.
+;
+;   (inv/rows opts)        → [row …]    opts {:all true} keeps dead records
+;   (inv/attention rows)   → [{:kind :level :text :fix} …]
+;   (inv/resolve rows q)   → {:ok row} | {:error reason}
+;   (inv/stop! row opts)   → {:ok how} | {:error reason}
+;   (inv/prune! opts)      → {:removed [paths] :dry-run bool}
+
+(ns vm.inventory
+  (:require [vm.registry :as registry] [vm.paths :as paths] [vm.net :as net]
+            [vm.ports :as ports] [vm.gateway :as gateway]))
+
+;; ── small readers ───────────────────────────────────────────────────────────
+
+(defn- os-pid [] (erlang/list_to_integer (erlang/apply :os :getpid (list))))
+
+(defn- now [] (erlang/system_time :second))
+
+(defn- boot-time
+  "Wall seconds at which the kernel booted (/proc/stat btime), or nil."
+  []
+  (let [s (try (File/read! "/proc/stat") (catch e nil))]
+    (if (erlang/is_binary s)
+      (let [v (registry/capture s "btime (\\d+)")]
+        (if v (erlang/binary_to_integer v) nil))
+      nil)))
+
+(defn- cmdline [pid]
+  (let [s (try (File/read! (str "/proc/" pid "/cmdline")) (catch e nil))]
+    (if (erlang/is_binary s)
+      (erlang/apply :binary :replace (list s (erlang/list_to_binary (list 0)) " " (to-list [:global])))
+      "")))
+
+(defn- build-of-pid
+  "The drop build a process runs from, read off its command line
+   (`…/drop/<sha8>/erts-…/beam.smp`), else \"unknown\". A VM adopted without a
+   record has no other witness for its build."
+  [pid]
+  (or (registry/capture (cmdline pid) "/drop/([0-9a-f]{8})/") "unknown"))
+
+(defn- bl-vm-process?
+  "Whether `pid` looks like a BEAM node. The last gate before a signal is sent to
+   a pid that came from a record without start ticks (an adopted legacy row):
+   never signal something that is not a beam.smp."
+  [pid]
+  (String/contains? (cmdline pid) "beam.smp"))
+
+(defn- started-of [pid ticks]
+  (let [bt (boot-time)]
+    (if (and bt (erlang/is_integer ticks) (> ticks 0))
+      (+ bt (erlang/div ticks 100))
+      nil)))
+
+;; ── sources ─────────────────────────────────────────────────────────────────
+
+(defn- runtime-files
+  "Names in the runtime dir ending `ext` — [{:file :base}], or []."
+  [ext]
+  (let [rd (paths/runtime-dir)]
+    (if (not (contains? rd :ok))
+      (to-list [])
+      (let [dir (:ok rd)
+            lr (erlang/apply :file :list_dir (list (erlang/binary_to_list dir)))]
+        (if (= :ok (elem lr 0))
+          (to-list
+            (keep (fn [nm]
+                    (let [n (erlang/list_to_binary nm)]
+                      (if (String/ends_with? n ext)
+                        {:file (str dir "/" n)
+                         :base (String/slice n 0 (- (count n) (count ext)))}
+                        nil)))
+                  (sort (elem lr 1))))
+          (to-list []))))))
+
+(defn- metas
+  "Every readable, LIVE `.meta`: [{:pid :root :build :started :base :file}]."
+  []
+  (to-list
+    (keep (fn [e]
+            (let [m (net/read-meta (:file e))]
+              (if (and m (registry/live? {:pid (:pid m) :ticks nil}))
+                {:pid (:pid m) :root (:root m) :build (:build m)
+                 :started (:started_at m) :base (:base e) :file (:file e)}
+                nil)))
+          (runtime-files ".meta"))))
+
+(defn- record->row [r]
+  {:id (:id r) :role (:role r) :build (:build r) :pid (:pid r)
+   :ticks (:ticks r) :started (:started r) :label (:label r) :log (:log r)
+   :legacy false :roots (to-list [])})
+
+(defn- adopt
+  "A row for a live pid that has no record."
+  [pid role build started label]
+  (let [ticks (registry/start-ticks pid)
+        build (or build (build-of-pid pid))]
+    {:id (str build "-" pid) :role role :build build :pid pid :ticks ticks
+     :started (or started (started-of pid ticks)) :label label :log nil
+     :legacy true :roots (to-list [])}))
+
+(defn- with-root [row root]
+  (if (and (some? root) (not (some (fn [r] (= r root)) (:roots row))))
+    (assoc row :roots (to-list (concat (:roots row) (list root))))
+    row))
+
+(defn- by-pid [rows pid] (first (filter (fn [r] (= (:pid r) pid)) rows)))
+
+(defn- replace-row [rows row]
+  (to-list (map (fn [r] (if (= (:pid r) (:pid row)) row r)) rows)))
+
+(defn- adopt-into
+  "`rows` plus a row for `pid` unless one exists; returns the rows."
+  [rows pid make]
+  (cond (not (erlang/is_integer pid)) rows
+        (some? (by-pid rows pid)) rows
+        (not (registry/live? {:pid pid :ticks nil})) rows
+        :else (to-list (concat rows (list (make))))))
+
+;; ── the join ────────────────────────────────────────────────────────────────
+
+(defn- route-of [claim live]
+  (let [hosts (get claim :hosts (to-list []))
+        loop (str "http://127.0.0.1:" (get claim :port) "/")]
+    {:name (get claim :name) :port (get claim :port) :pid (get claim :pid)
+     :root (get claim :root) :hosts hosts :pinned (get claim :pinned)
+     :url (if (empty? hosts)
+            loop
+            (gateway/url (first hosts) (get live :port) (get live :fronted)))
+     :loopback loop}))
+
+(defn- base-rows
+  "Records first, then everything that proves a pid is a bl VM but has no record."
+  [claims]
+  (let [recs (to-list (map record->row (registry/all)))
+        ms (metas)
+        gw (gateway/endpoint)
+        r1 (reduce (fn [rows m]
+                     (adopt-into rows (:pid m)
+                                 (fn [] (adopt (:pid m) :warm (:build m) (:started m) nil))))
+                   recs ms)
+        r2 (if (contains? gw :ok)
+             (adopt-into r1 (get (:ok gw) :pid)
+                         (fn [] (adopt (get (:ok gw) :pid) :gateway nil
+                                       (get (:ok gw) :started-at) "gateway")))
+             r1)]
+    (reduce (fn [rows c]
+              (adopt-into rows (get c :pid)
+                          (fn [] (adopt (get c :pid) :warm nil nil nil))))
+            r2 claims)))
+
+(defn- ask-realms
+  "The roots the shared VM of `build` has open, asked of the VM itself, or an empty
+   list. Resolved by name for the reason `ask-to-stop` is: `vm.client` cannot be
+   required from here without closing the cycle client → session → http → machine →
+   this namespace."
+  [build]
+  (BeamLisp.Loader/ensure_loaded "vm.client")
+  (or ((BeamLisp.Env/fetch! "vm.client" "realms") build) (to-list [])))
+
+(defn- shared-vm-roots
+  "The realms a SHARED VM holds, for its row. A shared VM names no project in its
+   `.meta` or its claims (it serves none in particular), so the only truth is the
+   VM's own table, read over its socket. Every other row, and a shared VM that is
+   not answering, adds nothing. A VM never asks itself: it would wait on its own
+   request."
+  [row]
+  (if (and (= :warm (:role row)) (= "shared" (:label row)) (not= (:pid row) (os-pid)))
+    (try (ask-realms (:build row)) (catch e (to-list [])))
+    (to-list [])))
+
+(defn- realm-name [root] (Path/basename root))
+
+(defn- realm-of [root routes]
+  {:name (realm-name root) :root root
+   :routes (to-list (filter (fn [rt] (= (:root rt) root)) routes))})
+
+(defn- finish
+  "Attach what a row's pid owns: its roots (from .meta and claims), its routes,
+   its live memory and age."
+  [row ms routes]
+  (let [pid (:pid row)
+        row (reduce (fn [r m] (if (= (:pid m) pid) (with-root r (:root m)) r)) row ms)
+        mine (filter (fn [rt] (= (:pid rt) pid)) routes)
+        row (reduce (fn [r rt] (with-root r (:root rt))) row mine)
+        row (reduce (fn [r root] (with-root r root)) row (shared-vm-roots row))
+        started (:started row)]
+    (assoc row
+           :memory-kb (registry/memory-kb row)
+           :uptime-s (if started (max 0 (- (now) started)) nil)
+           :self (= pid (os-pid))
+           :state :up
+           :realms (to-list (map (fn [root] (realm-of root mine)) (:roots row)))
+           :routes (to-list mine))))
+
+(defn- dead-row [e]
+  (let [r (:record e)]
+    (if r
+      (assoc (record->row r) :state :dead :realms (to-list []) :routes (to-list [])
+             :memory-kb nil :uptime-s nil :self false)
+      nil)))
+
+(def ROLE-ORDER {:gateway 0 :warm 1 :job 2})
+
+(defn rows
+  "Every VM on the machine, gateway first then warm VMs, oldest first. Each row:
+   {:id :role :build :pid :started :uptime-s :memory-kb :label :legacy :self
+    :state :realms [{:name :root :routes}] :routes [route]}. `opts` {:all true}
+   adds records whose VM is gone, as :state :dead."
+  ([] (rows {}))
+  ([opts]
+   (let [live (gateway/live)
+         claims (ports/list-claims)
+         routes (to-list (map (fn [c] (route-of c live)) claims))
+         ms (metas)
+         up (to-list (map (fn [r] (finish r ms routes)) (base-rows claims)))
+         dead (if (:all opts)
+                (to-list (keep dead-row (registry/stale)))
+                (to-list []))]
+     (to-list
+       (sort-by (fn [r] [(get ROLE-ORDER (:role r) 9) (or (:started r) 0)])
+                (concat up dead))))))
+
+;; ── attention: only concrete problems, each with its fix ────────────────────
+
+(defn attention
+  "What needs a human, as [{:kind :level :text :fix}]. Each entry is a fact the
+   machine can state and a command that resolves it; there is no 'health score'."
+  [rows]
+  (let [gw? (some (fn [r] (and (= :gateway (:role r)) (= :up (:state r)))) rows)
+        named (count (filter (fn [rt] (not (empty? (:hosts rt))))
+                             (mapcat (fn [r] (:routes r)) rows)))
+        dead (count (registry/stale))
+        legacy (count (filter (fn [r] (and (:legacy r) (= :up (:state r)))) rows))
+        mine (paths/build-id)
+        other (filter (fn [r] (and (= :warm (:role r)) (= :up (:state r))
+                                   (not= (:build r) mine) (not= (:build r) "unknown")
+                                   (not= mine "src")))
+                      rows)]
+    (to-list
+      (concat
+        (if (and (not gw?) (> named 0))
+          (list {:kind :gateway-down :level :warn
+                 :text (str named " name(s) are claimed, and nothing answers them")
+                 :fix "bl vm start gateway"})
+          (list))
+        (if (> dead 0)
+          (list {:kind :dead-records :level :warn
+                 :text (str dead " stale file(s) from VMs that are gone")
+                 :fix "bl vm prune"})
+          (list))
+        (map (fn [r] {:kind :other-build :level :note
+                      :text (str (:id r) " runs build " (:build r) "; this command runs " mine)
+                      :fix (str "bl vm stop " (:id r))})
+             other)
+        (if (> legacy 0)
+          (list {:kind :legacy :level :note
+                 :text (str legacy " VM(s) started before the registry; they are listed from their old files")
+                 :fix "restart them to register"})
+          (list))))))
+
+;; ── choosing a VM by what a human types ─────────────────────────────────────
+
+(defn resolve
+  "The one row `q` names: an exact id, a pid, a unique id prefix, a label, or a
+   build that exactly one VM runs. {:ok row} | {:error reason}. An ambiguous query
+   is an error that lists the candidates — stopping the wrong VM is not
+   recoverable, so a guess is never taken."
+  [rows q]
+  (let [q (str q)
+        exact (filter (fn [r] (or (= (:id r) q) (= (str (:pid r)) q))) rows)
+        hits (if (seq exact)
+               exact
+               (let [pre (filter (fn [r] (String/starts_with? (:id r) q)) rows)
+                     lab (filter (fn [r] (= (:label r) q)) rows)
+                     bld (filter (fn [r] (= (:build r) q)) rows)]
+                 (cond (seq pre) pre (seq lab) lab :else bld)))]
+    (cond
+      (= 1 (count hits)) {:ok (first hits)}
+      (empty? hits) {:error (tuple :no-such-vm q)}
+      :else {:error (tuple :ambiguous q (to-list (map (fn [r] (:id r)) hits)))})))
+
+;; ── stopping ────────────────────────────────────────────────────────────────
+
+(defn- wait-gone
+  "Poll until `row`'s process is gone, up to `ms`. true when it is."
+  [row ms]
+  (loop [t ms]
+    (cond (not (registry/live? row)) true
+          (<= t 0) false
+          :else (do (erlang/apply :timer :sleep (list 100)) (recur (- t 100))))))
+
+(defn- signal! [pid sig]
+  (erlang/apply :os :cmd (list (erlang/binary_to_list (str "kill -" sig " " pid)))))
+
+(defn- may-signal?
+  "A record carries start ticks, which prove the pid is still the VM that wrote
+   it. An adopted row does not, so the command line must say it is a beam."
+  [row]
+  (if (some? (:ticks row))
+    (registry/live? row)
+    (and (registry/live? row) (bl-vm-process? (:pid row)))))
+
+(defn- ask-to-stop
+  "Ask the VM of `root` run by `build` to drain. `vm.client` is resolved by name
+   HERE, not required at the top: client requires session, session requires http,
+   http mounts the machine console, and the console requires THIS namespace — a
+   require cycle the ahead-of-time build refuses (source mode loads lazily and
+   hides it). The one call that needs the client pays for the lookup."
+  [root build]
+  (BeamLisp.Loader/ensure_loaded "vm.client")
+  ((BeamLisp.Env/fetch! "vm.client" "request-stop") root build))
+
+(defn stop!
+  "Stop one VM, gently first.
+
+   1. A warm VM is asked through its own control socket, once per root it serves
+      — the VM drains its realms and removes its own files.
+   2. Anything still running gets SIGTERM, when the record (or the command line)
+      proves the pid is a bl node.
+   3. Only with `:force` does it get SIGKILL.
+
+   Never stops the VM it is running inside: that would cut the command off
+   mid-answer. {:ok :asked | :terminated | :killed | :gone} | {:error reason}."
+  [row opts]
+  (cond
+    (:self row)
+    {:error (tuple :self "this command is running inside that VM — run it with --cold")}
+
+    (not (registry/live? row)) {:ok :gone}
+
+    :else
+    (do
+      (when (= :warm (:role row))
+        (doseq [root (:roots row)]
+          (try (ask-to-stop root (:build row)) (catch e nil))))
+      (cond
+        (wait-gone row 8000) {:ok :asked}
+
+        (not (may-signal? row))
+        {:error (tuple :refuse "the pid is not provably a bl VM; not signalling it")}
+
+        :else
+        (do (signal! (:pid row) "TERM")
+            (cond
+              (wait-gone row 5000) {:ok :terminated}
+              (:force opts) (do (signal! (:pid row) "KILL")
+                                (if (wait-gone row 3000)
+                                  {:ok :killed}
+                                  {:error :still-running}))
+              :else {:error :still-running}))))))
+
+;; ── pruning ─────────────────────────────────────────────────────────────────
+
+(defn- endpoint-groups
+  "The daemon files grouped by base name (`<tree>-<build>`): each group is the
+   set of `.sock .token .meta .pid` that one daemon wrote."
+  []
+  (let [exts [".sock" ".token" ".meta" ".pid"]
+        all (mapcat (fn [ext]
+                      (map (fn [e] {:ext ext :file (:file e) :base (:base e)})
+                           (runtime-files ext)))
+                    exts)]
+    (to-list (vals (group-by :base all)))))
+
+(defn- group-dead?
+  "A daemon's files are dead when its socket is confirmed dead AND its meta (if any)
+   names no live pid. Both, so a daemon mid-start is never swept."
+  [files]
+  (let [sock (first (filter (fn [f] (= ".sock" (:ext f))) files))
+        meta (first (filter (fn [f] (= ".meta" (:ext f))) files))
+        m (if meta (net/read-meta (:file meta)) nil)
+        pid-live (and m (registry/live? {:pid (:pid m) :ticks nil}))]
+    (and (not pid-live)
+         (or (nil? sock) (= :dead (net/probe (:file sock)))))))
+
+(defn prune!
+  "Remove what belongs to VMs that are gone: stale registry records, and the
+   `.sock/.token/.meta/.pid` of daemons that accept nobody. `opts` {:dry-run true}
+   lists and removes nothing. Port claims are swept by `vm.ports` as they are
+   read, so they need no pass here. {:removed [path …] :dry-run bool}"
+  [opts]
+  (let [stale (map (fn [e] (:file e)) (registry/stale))
+        dead (mapcat (fn [files] (map (fn [f] (:file f)) files))
+                     (filter group-dead? (endpoint-groups)))
+        all (to-list (distinct (concat stale dead)))]
+    (when (not (:dry-run opts))
+      (doseq [f all] (File/rm f)))
+    {:removed all :dry-run (boolean (:dry-run opts))}))

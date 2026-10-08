@@ -1,0 +1,182 @@
+(ns env.incremental-metadata-test (:require [veritas.model :as vm]))
+(def NS "metadata.integration.fixture")
+(defn entries-for [e ns]
+ (filter (fn [row]
+   (let [k (elem row 0)]
+    (and (tuple? k) (= 5 (erlang/tuple_size k)) (= e (elem k 0))
+         (= :ns_definition (elem k 1)) (= ns (elem k 2)))))
+   (ets/tab2list :beam_lisp_vars)))
+(deftest incremental-entries-preserve-parent-shadowing-nil-values-and-counts
+ (let [parent (BeamLisp.Env/fork) child (BeamLisp.Env/fork parent) namespace NS]
+  (try
+   (BeamLisp.Env/with_env parent (fn [] (BeamLisp.Env/put_ns_defs NS {"a" [1] "b" nil})))
+   (BeamLisp.Env/with_env child (fn []
+    (is (= {"a" [1] "b" nil} (BeamLisp.Env/ns_defs NS)))
+    (is (= 2 (BeamLisp.Env/ns_definition_count NS)))
+    (BeamLisp.Env/put_ns_definition NS "a" [2])
+    (is (= {"a" [2] "b" nil} (BeamLisp.Env/ns_defs NS)))
+    (is (= [2] (BeamLisp.Env/ns_definition NS "a")))
+    (is (nil? (BeamLisp.Env/ns_definition NS "missing")))
+    (is (= 2 (BeamLisp.Env/ns_definition_count NS)))
+    (BeamLisp.Env/delete_ns_definition NS "a")
+    (is (= {"b" nil} (BeamLisp.Env/ns_defs NS)))
+    (is (= 1 (BeamLisp.Env/ns_definition_count NS)))
+    (BeamLisp.Env/delete_ns_definition NS "b")
+    (is (= {} (BeamLisp.Env/ns_defs NS)))
+    (is (= 0 (BeamLisp.Env/ns_definition_count NS)))
+    (BeamLisp.Env/put_ns_definition NS "z" [3])
+    (is (= {"z" [3]} (BeamLisp.Env/ns_defs NS)))
+    (BeamLisp.Env/put_ns_defs NS {"replacement" [4]})
+    (is (= {"replacement" [4]} (BeamLisp.Env/ns_defs NS)))
+    (is (= 1 (count (entries-for child NS))))))
+   (BeamLisp.Env/with_env parent (fn []
+    (is (= {"a" [1] "b" nil} (BeamLisp.Env/ns_defs NS)))))
+   (BeamLisp.Env/destroy child)
+   (is (empty? (entries-for child NS)))
+   (is (= :retired (BeamLisp.Env/with_env child
+      (fn [] (BeamLisp.Env/put_ns_definition namespace "late" [5])))))
+   (is (empty? (entries-for child NS)))
+   (finally (BeamLisp.Env/destroy child) (BeamLisp.Env/destroy parent)))))
+
+(deftest full-replacement-readers-never-assemble-mixed-generations
+ (let [e (BeamLisp.Env/fork)]
+  (try
+   (BeamLisp.Env/with_env e (fn [] (BeamLisp.Env/put_ns_defs NS {"a" 0 "b" 0})))
+   (let [writer (Task/async (fn [] (BeamLisp.Env/with_env e (fn []
+                  (doseq [n (range 40)] (BeamLisp.Env/put_ns_defs NS {"a" n "b" n}))))))
+         reader (Task/async (fn [] (BeamLisp.Env/with_env e (fn []
+                  (every? (fn [_]
+                    (let [defs (BeamLisp.Env/ns_defs NS)]
+                     (and (= 2 (count defs)) (= (get defs "a") (get defs "b"))))) (range 80))))))]
+    (is (Task/await reader 30000))
+    (Task/await writer 30000))
+   (is (= 2 (count (entries-for e NS))))
+   (finally (BeamLisp.Env/destroy e)))))
+
+(deftest aot-literal-descriptors-remain-lazy-and-detach-in-each-live-scope
+ (let [dir (str (System/tmp_dir!) "/metadata-literal-" (erlang/unique_integer (list :positive)))
+       source (str dir "/literal.bl") mod :Elixir.BeamLisp.MetadataLiteralProbe
+       a (BeamLisp.Env/fork) b (BeamLisp.Env/fork)]
+  (try
+   (File/mkdir_p! dir)
+   (File/write! source "(defn __bl_ns_defs__ [] {\"a\" nil \"b\" 42})")
+   (let [beam (BeamLisp.AOT/compile_host_file source
+                 (list (tuple :module mod) (tuple :output_dir dir) (tuple :load? false)))]
+    (code/load_binary mod (erlang/binary_to_list (elem beam 1)) (File/read! (elem beam 1))))
+   (doseq [e [a b]]
+    (BeamLisp.Env/with_env e (fn []
+     (BeamLisp.Env/put_ns_defs NS (tuple :"$beam" mod))
+     (is (= (tuple :ok (tuple :"$beam" mod)) (BeamLisp.Env/lookup_own (tuple :ns_defs NS))))
+     (is (empty? (entries-for e NS)))
+     (is (= {"a" nil "b" 42} (BeamLisp.Env/ns_defs NS)))
+     (is (= 42 (BeamLisp.Env/ns_definition NS "b"))))))
+   (BeamLisp.Env/unlink_ns_defs NS)
+   (code/soft_purge mod) (code/delete mod)
+   (doseq [e [a b]]
+    (BeamLisp.Env/with_env e (fn []
+     (is (= {"a" nil "b" 42} (BeamLisp.Env/ns_defs NS)))
+     (is (= 42 (BeamLisp.Env/ns_definition NS "b")))
+     (is (= 2 (BeamLisp.Env/ns_definition_count NS)))
+     (is (= 2 (count (entries-for e NS)))))))
+   (finally
+    (BeamLisp.Env/destroy a) (BeamLisp.Env/destroy b)
+    (code/soft_purge mod) (code/delete mod) (File/rm_rf! dir)))))
+
+(deftest killed-boundary-writers-release-locks-and-next-mutation-reclaims-rows
+ ;; Construct exact durable ETS boundary states inside the real publication
+ ;; locks, then kill their owner. This tests recovery without production hooks;
+ ;; it does not claim instruction-level fault injection into every native call.
+ (doseq [phase [:unpublished-generation :published-generation :tombstone]]
+  (let [e (BeamLisp.Env/fork) namespace "metadata.killed.fixture" parent (erlang/self)]
+   (try
+    (BeamLisp.Env/with_env e (fn []
+     (BeamLisp.Env/put_ns_defs namespace {"a" 1 "b" 2})))
+    (let [worker (spawn (fn []
+                   (BeamLisp.Env/with_env e (fn []
+                    (BeamLisp.Env/with_namespace_lock namespace (fn []
+                     (BeamLisp.Env/with_scope_commit e (fn []
+                      (let [root (tuple e :ns_defs namespace)
+                            descriptor (elem (BeamLisp.Env/lookup_own (tuple :ns_defs namespace)) 1)
+                            old-generation (elem descriptor 1)
+                            generation (erlang/unique_integer (list :positive))
+                            key (fn [g name] (tuple e :ns_definition namespace g name))]
+                       (case phase
+                        :unpublished-generation
+                        (ets/insert :beam_lisp_vars
+                         (tuple (key generation "orphan") (tuple :definition 9)))
+                        :published-generation
+                        (ets/insert :beam_lisp_vars
+                         (list (tuple root (tuple :"$definitions" generation 1 nil))
+                               (tuple (key generation "new") (tuple :definition 3))))
+                        :tombstone
+                        (ets/insert :beam_lisp_vars
+                         (list (tuple root (tuple :"$definitions" old-generation 1 "a"))
+                               (tuple (key old-generation "a") :"$deleted"))))
+                       (erlang/send parent [:boundary (erlang/self)])
+                       (receive :never :unexpected (after 10000 :timeout)))))))))))
+          monitor (erlang/monitor :process worker)]
+     (is (= worker (receive [:boundary pid] pid (after 5000 :timeout))))
+     (erlang/exit worker :kill)
+     (is (= :killed (receive [:DOWN _ :process _ reason] reason (after 5000 :timeout)))))
+    (BeamLisp.Env/with_env e (fn []
+     (let [expected (case phase :unpublished-generation {"a" 1 "b" 2}
+                           :published-generation {"new" 3} :tombstone {"b" 2})]
+      (is (= expected (BeamLisp.Env/ns_defs namespace)))
+      (is (= (count expected) (BeamLisp.Env/ns_definition_count namespace)))
+      (if (= phase :tombstone)
+       (do (BeamLisp.Env/put_ns_definition namespace "a" 4)
+           (is (= {"a" 4 "b" 2} (BeamLisp.Env/ns_defs namespace)))
+           (is (= 2 (count (entries-for e namespace)))))
+       (do (BeamLisp.Env/put_ns_defs namespace expected)
+           (is (= expected (BeamLisp.Env/ns_defs namespace)))
+           (is (= (count expected) (count (entries-for e namespace)))))))))
+    (finally (BeamLisp.Env/destroy e))))))
+
+(defn reference-step [state op]
+ (if (:retired? state) state
+  (case op
+   :put-a (update state :defs assoc "a" nil)
+   :put-b (update state :defs assoc "b" [1])
+   :delete-a (update state :defs dissoc "a")
+   :delete-b (update state :defs dissoc "b")
+   :replace (assoc state :defs {"a" [2] "b" nil})
+   :empty (assoc state :defs {})
+   :retire {:retired? true :defs {}} state)))
+(defn exercise-command [e namespace op]
+ (if (= :retire op) (BeamLisp.Env/destroy e)
+  (BeamLisp.Env/with_env e (fn []
+   (case op
+    :put-a (BeamLisp.Env/put_ns_definition namespace "a" nil)
+    :put-b (BeamLisp.Env/put_ns_definition namespace "b" [1])
+    :delete-a (BeamLisp.Env/delete_ns_definition namespace "a")
+    :delete-b (BeamLisp.Env/delete_ns_definition namespace "b")
+    :replace (BeamLisp.Env/put_ns_defs namespace {"a" [2] "b" nil})
+    :empty (BeamLisp.Env/put_ns_defs namespace {}) nil)))))
+(deftest generated-real-env-histories-match-full-map-semantics
+ (let [namespace "metadata.model.fixture"
+       model (vm/model "incremental metadata agrees with whole-map API"
+        {:state {:retired? false :defs {}}
+         :init (fn []
+           (let [e (BeamLisp.Env/fork)]
+            (BeamLisp.Env/with_env e (fn [] (BeamLisp.Env/put_ns_defs namespace {}))) e))
+         :cleanup (fn [e] (BeamLisp.Env/destroy e))
+         :commands (into {} (map (fn [op]
+          [op {:next (fn [state _] (reference-step state op))
+               :run (fn [e _] (exercise-command e namespace op))}])
+          [:put-a :put-b :delete-a :delete-b :replace :empty :retire]))
+         :invariants {:whole-table (fn [state e]
+           (BeamLisp.Env/with_env e (fn []
+            (and (= (:defs state) (BeamLisp.Env/ns_defs namespace))
+                 (= (count (:defs state)) (BeamLisp.Env/ns_definition_count namespace))
+                 (= (get (:defs state) "a") (BeamLisp.Env/ns_definition namespace "a"))
+                 (= (get (:defs state) "b") (BeamLisp.Env/ns_definition namespace "b"))))))}})
+       broken (assoc-in model [:commands :replace :run]
+                (fn [e _] (BeamLisp.Env/with_env e
+                  (fn [] (BeamLisp.Env/put_ns_definition namespace "a" [2])))))
+       negative (vm/check broken {:seed 23 :histories 500 :max-len 20})
+       result (vm/check model {:seed 23 :histories 500 :max-len 20})]
+  (is (= :refuted (:modality negative)))
+  (is (= false (:ok (vm/replay broken (:shrunk negative)))))
+  (is (= :witnessed (:modality result)))
+  (println "incremental-metadata-real-model"
+    {:candidate (select-keys result [:modality :coverage]) :negative (:shrunk negative)})))

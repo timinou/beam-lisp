@@ -13,6 +13,20 @@ pub const TRAILER_LEN: usize = 8 + 8 + 32 + 1 + 1 + 2 + 4;
 /// "apps not started" in eval mode is irrelevant.
 pub const CLI_ENTRY: &str = "BeamLisp.Ns.Bl.Cli.main(System.argv())";
 
+/// The layout names shared by the launcher, the packer, and the store. One
+/// spelling each, so a rename cannot drift between the two that read them.
+#[allow(dead_code)] // pack.rs includes this file but does not use them all
+pub const PROJECT_FILE: &str = "env.bl";
+/// The release entry script, relative to a payload or payload tree.
+#[allow(dead_code)]
+pub const LAUNCHER_REL: &str = "bin/bl";
+/// A file every beam-lisp tree root has; the launcher walks up to find it.
+#[allow(dead_code)]
+pub const TREE_MARKER: &str = "priv/boot/core.bl";
+/// A payload's printed build facts; the launcher reads one field from it.
+#[allow(dead_code)]
+pub const BUILD_INFO_FILE: &str = "BUILD_INFO.bl";
+
 pub const OS_LINUX: u8 = 0;
 pub const OS_DARWIN: u8 = 1;
 pub const OS_WINDOWS: u8 = 2;
@@ -121,7 +135,27 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 /// First-install location (docs/native-bundler.md §6.2).
+/// A service can keep reproducible drop storage separate from its durable XDG data.
+/// DROP_STORE_ROOT names the store itself (no implicit /drop suffix).
+fn explicit_store_root(value: &std::ffi::OsStr) -> Result<std::path::PathBuf, &'static str> {
+    let path = std::path::PathBuf::from(value);
+    let raw = value.to_string_lossy();
+    if raw.split(['/', '\\']).any(|part| part == ".") || !path.is_absolute() || path.components().any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir)) {
+        return Err("DROP_STORE_ROOT must be an absolute path without . or .. components");
+    }
+    if path.parent().is_none() {
+        return Err("DROP_STORE_ROOT must not be a filesystem root");
+    }
+    Ok(path)
+}
+
 pub fn install_dir() -> std::path::PathBuf {
+    if let Some(value) = std::env::var_os("DROP_STORE_ROOT") {
+        return explicit_store_root(&value).unwrap_or_else(|message| {
+            eprintln!("drop: {message}");
+            std::process::exit(2)
+        });
+    }
     if cfg!(target_os = "windows") {
         if let Ok(l) = std::env::var("LOCALAPPDATA") {
             return std::path::PathBuf::from(l).join("drop");
@@ -173,7 +207,7 @@ pub fn safe_path(base: &std::path::Path, rel: &std::path::Path) -> std::io::Resu
 pub fn extract_tar_gz(payload: &[u8], dest: &std::path::Path) -> std::io::Result<()> {
     // Stage under a name only THIS process owns. Two `bl` invocations extract
     // the same version more easily than it looks — an editor opening two
-    // workspaces, `bl daemon start` beside a `bl run`, two jobs on one
+    // workspaces, `bl realm start` beside a `bl run`, two jobs on one
     // machine — and a SHARED staging path makes them delete each other's work
     // mid-unpack (observed: "failed to unpack … into <dir>.tmp/…", and
     // "Directory not empty" when the loser's rename met the winner's tree).
@@ -204,7 +238,7 @@ fn unpack_into(payload: &[u8], tmp: &std::path::Path) -> std::io::Result<()> {
         }
         e.unpack(&out)?;
     }
-    make_entry_executable(tmp, "bin/bl");
+    make_entry_executable(tmp, LAUNCHER_REL);
     Ok(())
 }
 
@@ -271,3 +305,18 @@ pub fn make_entry_executable(dir: &std::path::Path, rel: &str) {
 }
 #[cfg(not(unix))]
 pub fn make_entry_executable(_dir: &std::path::Path, _rel: &str) {}
+
+#[cfg(test)]
+mod store_root_tests {
+    use super::explicit_store_root;
+    #[test]
+    fn explicit_store_is_independent_of_xdg_and_has_no_added_suffix() {
+        assert_eq!(explicit_store_root(std::ffi::OsStr::new("/var/cache/app-runtime")).unwrap(), std::path::PathBuf::from("/var/cache/app-runtime"));
+    }
+    #[test]
+    fn explicit_store_rejects_relative_empty_root_and_parent_traversal() {
+        for path in ["", "relative", "/", "/var/cache/../data", "/var/./cache"] {
+            assert!(explicit_store_root(std::ffi::OsStr::new(path)).is_err(), "{path}");
+        }
+    }
+}

@@ -1,0 +1,501 @@
+; host/reload_watcher.bl — the pinned HOST MODULE for `Elixir.BeamLisp.ReloadWatcher`.
+;
+; `lib/beam_lisp/reload_watcher.ex` is the dev-only live-reload watcher: it turns
+; a `.bl` file save into a staged edit on the reload bundle and commits it, so
+; editing a source file updates the running image coherently, with no restart.
+; This file is the `.bl` port of that module, compiled by
+; `BeamLisp.AOT/compile_host_file` into ONE exact-named beam whose export surface
+; is the live module's.
+;
+;   (This wave owns source and tests only; the seed entry that points the real
+;   atom at this file is written by the wave that deletes `reload_watcher.ex`.
+;   That entry carries `:behaviour :"Elixir.GenServer"` — the live beam records
+;   `-behaviour(GenServer)` because `use GenServer` does — and nothing else: the
+;   module is functions-only, with no struct to synthesize and no macro to
+;   export.)
+;
+; WHAT THE MODULE OWES, clause for clause:
+;
+;   * `use GenServer` contributes `child_spec/1` plus the default
+;     `handle_cast/2` and `code_change/3` callbacks. None of those is written in
+;     the live module, so the port reproduces the macro's own output byte for
+;     byte rather than inventing a shape: `child_spec/1` normalizes the
+;     macro's map through `Supervisor.child_spec/2`; `handle_cast/2` raises the
+;     macro's `RuntimeError` naming the process; `code_change/3` answers
+;     `{:ok, state}`.
+;
+;   * THE PROCESS API. `start_link/1` names the server, `drain/1` is the
+;     synchronous settle point (`:drain` flushes what the quiet window still
+;     holds and answers the last commit), and `sync/2` waits for real file
+;     events to arrive — counting them, never sleeping a fixed time — then
+;     drains. `wait_for_events/3` is private in the live module, so it is a
+;     local `loop` inside `sync/2`, not a top-level defn: a pinned file's
+;     top-level defns ARE its exports, and the live module's private helpers
+;     must not escape.
+;
+;   * THE QUIET WINDOW is NOT this module's. A save is many filesystem events;
+;     folding them into one commit is `proc.tick`'s debounce, owned by a
+;     beam-lisp `defserver` in the `reload` namespace (`priv/std/reload.bl`,
+;     `watch-debounce`). The watcher starts ONE owner per watcher, forwards
+;     every event to it, and applies what it holds when the owner answers
+;     `:flush_pending`. A failure to start an owner is REPORTED and the save is
+;     applied at once — a tree that reloads a little too eagerly is a bug, a
+;     tree whose saves never load is a broken tool.
+;
+;   * THE MONITOR. The owner is not linked; the watcher monitors it. If it
+;     dies, the held paths are applied NOW (nothing may be stranded) and the
+;     pid is dropped so the next event starts a fresh owner. The `:DOWN` match
+;     is on the monitored ref, so an unrelated `:DOWN` falls through to the
+;     catch-all — exactly as the live clause does.
+;
+;   * WHAT A SAVE APPLIES. `handle_bl_change/2` stages the file's SOURCE — a
+;     plain `.bl` is itself, a literate `.bl.md`/`.bl.org` is recomposed to its
+;     program cells (`BeamLisp.Loader.doc_source/2`), prose never entering the
+;     bundle — and hands it to the injected `:apply` (`(source, path, commit?) ->
+;     status`), the seam a host with its own ordering injects. A path that no
+;     longer exists is DELETED: `flush/1` reports `:removed` instead of staging
+;     nothing, because the namespace stays loaded and the watch log should say
+;     what happened. Every result reaches `:on_result` tagged with its path and
+;     normalized to a map, so a renderer always has ONE shape.
+;
+;   * `apply_change/3` is the reload integration WITHOUT the filesystem: stage
+;     the source, then (when `commit?`) commit it, so the static coherence pass
+;     applies the edit or HOLDS it with the old code serving. It is public in
+;     the live module and is the seam the FS watcher itself rides.
+;
+; NO TOP-LEVEL HELPERS. A pinned module's export surface IS the file's top-level
+; defns (`defn-` is NOT privatized on this path), and the live module's private
+; helpers are not exports — the surface test pins that. Every helper
+; (`wait_for_events`, `defer`, `arm`, `start_debounce`, `stop`, `flush`,
+; `notify`, `handle_bl_change`, `watches?`, `file_source`, `escape_bl_string`)
+; is therefore a LOCAL closure, rebuilt inside the public fn that needs it, so
+; `module_info(:exports)` of this beam is the live module's minus the
+; Elixir-generated `__info__/1`.
+;
+; RUNTIME-TIER, NOT BOOT-TIER. Every caller is dev tooling that runs after
+; `BeamLisp.init/0` has interned the prelude, but this beam is still a host leaf,
+; so the port follows the `priv/host/server.bl` rule and never concatenates with
+; `str` (which resolves through the language's var registry): binaries are built
+; with `erlang/iolist_to_binary`, and maps with `maps/put`/`maps/get`.
+;
+; Run: bin/bl test test/bl/host_reload_watcher_test.bl
+
+(ns host.reload_watcher)
+
+; ── the process API ──────────────────────────────────────────────────────────
+
+(defn start_link
+  "Start a watcher. Options: `:dirs` (required), `:name` (default this
+   module), `:auto_commit`, `:on_result`, `:apply`, `:quiet_ms`. The name is
+   resolved BEFORE the OTP start boundary and travels as `name: name`, the very
+   keyword the live `GenServer.start_link/3` was handed."
+  [opts]
+  (let [own (erlang/element 2 (erlang/fun_info (fn [] nil) :module))
+        name (Keyword/get opts :name own)]
+    (GenServer/start_link own opts (list (tuple :name name)))))
+
+(defn drain
+  "Block until the watcher has processed every filesystem event delivered up to
+   now, then return the last commit status (or `:idle`). The live default
+   argument is `__MODULE__`, reached here through the module's own atom so
+   `drain/0` and `drain/1` answer identically."
+  ([] (drain (erlang/element 2 (erlang/fun_info (fn [] nil) :module))))
+  ([name] (GenServer/call name :drain)))
+
+(defn sync
+  "Wait up to `:timeout` ms (default 2000) for at least `:events` more file
+   events (default 1) than the watcher had when called, then drain. The wait is
+   a `loop`, not a `defn`, so no private helper escapes as an export: it polls
+   the real event count every 10ms, exactly as the live recursive helper does,
+   and answers `:timeout` when the budget is spent rather than flaking on a
+   fixed sleep."
+  ([] (sync (erlang/element 2 (erlang/fun_info (fn [] nil) :module)) (list)))
+  ([name] (sync name (list)))
+  ([name opts]
+   (let [wait (fn [nm target budget]
+                (loop [t budget]
+                  (cond
+                    (erlang/=< t 0) :timeout
+                    (erlang/>= (GenServer/call nm :event_count) target) :ok
+                    :else (do (Process/sleep 10) (recur (erlang/- t 10))))))
+         n (Keyword/get opts :events 1)
+         timeout (Keyword/get opts :timeout 2000)
+         base (GenServer/call name :event_count)]
+     (wait name (erlang/+ base n) timeout)
+     (drain name))))
+
+; ── the OTP callbacks `use GenServer` generates ──────────────────────────────
+
+(defn child_spec
+  "The `child_spec/1` `use GenServer` generates, clause for clause: a map whose
+   `id` is this module and whose `start` is `{this module, :start_link,
+   [init_arg]}`, normalized by `Supervisor.child_spec/2` with the macro's empty
+   option list."
+  [init_arg]
+  (let [own (erlang/element 2 (erlang/fun_info (fn [] nil) :module))]
+    (Supervisor/child_spec
+      (maps/put :start (tuple own :start_link (list init_arg))
+        (maps/put :id own (maps/new)))
+      (list))))
+
+(defn handle_cast
+  "The `handle_cast/2` default `use GenServer` generates. `:erlang.phash2(1, 1)`
+   is always `0`, so the reachable branch is the raise; the `{:stop, {:bad_cast,
+   msg}, state}` branch exists so Dialyzer sees a non-local return. The message
+   is the macro's, byte for byte, with the same registered-name-or-pid
+   `inspect`."
+  [msg state]
+  (let [info (Process/info (erlang/self) :registered_name)
+        proc (cond
+               (and (erlang/is_tuple info)
+                    (erlang/== 2 (erlang/tuple_size info))
+                    (erlang/== () (erlang/element 2 info)))
+                 (erlang/self)
+
+               (and (erlang/is_tuple info) (erlang/== 2 (erlang/tuple_size info)))
+                 (erlang/element 2 info)
+
+               ; the live `case` has NO catch-all; a live `self()` always
+               ; answers a 2-tuple, so this branch is the shape, not a path.
+               :else
+                 (erlang/error
+                   (Elixir.CaseClauseError/exception (list (tuple :term info)))))]
+    (if (erlang/== 0 (erlang/phash2 1 1))
+      (erlang/error
+        (Elixir.RuntimeError/exception
+          (erlang/iolist_to_binary
+            (list "attempted to cast GenServer "
+                  (Kernel/inspect proc)
+                  " but no handle_cast/2 clause was provided"))))
+      (tuple :stop (tuple :bad_cast msg) state))))
+
+(defn code_change
+  "The `code_change/3` default `use GenServer` generates."
+  [_old state _extra]
+  (tuple :ok state))
+
+; ── the server ───────────────────────────────────────────────────────────────
+
+(defn init
+  "Start the bl-side quiet-window owner, then the linked FileSystem worker, and
+   build the watcher state. An owner that cannot start STOPS the watcher: with
+   no quiet window there is no way to act on a save, and watching a tree while
+   dropping every edit silently is worse than not watching.
+
+   The `:apply` default is a local closure CALLING `apply_change/3` — a call in
+   head position, which the emitter re-points at this module. The live
+   `&apply_change/3` capture is a value-position lowering a pinned beam cannot
+   carry, and the injected seam is a 3-arg fn either way."
+  [opts]
+  (let [dirs (Keyword/fetch! opts :dirs)
+        quiet_ms (Keyword/get opts :quiet_ms 50)
+        start_debounce
+        (fn [q]
+          (try
+            (do
+              (BeamLisp.Loader/ensure_loaded "reload")
+              (tuple :ok
+                (BeamLisp.Ns.Rt/invoke
+                  (BeamLisp.Env/fetch! "reload" "watch-debounce-start")
+                  (list q))))
+            (catch e
+              (if (erlang/== :error __EXCEPTION_KIND__)
+                (tuple :error (Elixir.Exception/message e))
+                (erlang/apply :erlang :raise
+                  (list __EXCEPTION_KIND__
+                        (if (erlang/== :exit __EXCEPTION_KIND__) (erlang/element 2 e) e)
+                        __STACKTRACE__))))))
+        started (start_debounce quiet_ms)]
+    (if (erlang/== :ok (erlang/element 1 started))
+      (let [debounce (erlang/element 2 started)
+            fsr (FileSystem/start_link (list (tuple :dirs dirs)))]
+        (if (erlang/== :ok (erlang/element 1 fsr))
+          (let [fs (erlang/element 2 fsr)]
+            (FileSystem/subscribe fs)
+            (tuple :ok
+              {:fs fs
+               :auto_commit (Keyword/get opts :auto_commit true)
+               :on_result (Keyword/get opts :on_result)
+               :apply (Keyword/get opts :apply (fn [s p c] (apply_change s p c)))
+               :event_count 0
+               :last :idle
+               :pending (maps/new)
+               :debounce debounce
+               :debounce_ref (Process/monitor debounce)
+               :debounce_warned false
+               :quiet_ms quiet_ms}))
+          (erlang/error (Elixir.MatchError/exception (list (tuple :term fsr))))))
+      (tuple :stop (erlang/element 2 started)))))
+
+(defn handle_call
+  "The synchronous controls. `:event_count` answers how many file events the
+   watcher has OBSERVED (watched or not — the count is the test barrier's, not
+   the filter's). `:drain` is a barrier: flush whatever the quiet window is
+   still holding, then answer the settled image's last status. Because events
+   and the flush are handled synchronously in this server's mailbox, by the time
+   a `:drain` call is processed every event ahead of it has run.
+
+   A message that is neither is the live module's `FunctionClauseError` (its
+   `handle_call/3` has exactly two clauses), raised by hand because a `cond`
+   would otherwise answer a `CaseClauseError`."
+  [msg _from state]
+  (let [file_source
+        (fn [path]
+          (let [raw (File/read! path)]
+            (cond
+              (String/ends_with? path ".bl.md") (BeamLisp.Loader/doc_source raw :md)
+              (String/ends_with? path ".bl.org") (BeamLisp.Loader/doc_source raw :org)
+              :else raw)))
+        notify
+        (fn [result path st]
+          (let [tagged
+                (if (erlang/is_map result)
+                  (if (erlang/is_map_key :path result)
+                    result
+                    (maps/put :path path result))
+                  {:path path
+                   :status :error
+                   :errors (list {:kind :error :msg (Kernel/inspect result)})})
+                cb (maps/get :on_result st)]
+            (if (erlang/== nil cb) nil (erlang/apply cb (list tagged)))
+            (maps/put :last tagged st)))
+        handle_bl_change
+        (fn [path st]
+          (let [result (erlang/apply (maps/get :apply st)
+                           (list (file_source path) path (maps/get :auto_commit st)))]
+            (notify result path st)))
+        flush
+        (fn [st]
+          (Enum/reduce (maps/get :pending st) (maps/put :pending (maps/new) st)
+            (fn [pair acc]
+              (let [path (erlang/element 1 pair)]
+                (if (File/regular? path)
+                  (handle_bl_change path acc)
+                  (notify {:status :removed :applied (list) :errors (list)} path acc))))))]
+    (cond
+      (erlang/== :event_count msg) (tuple :reply (maps/get :event_count state) state)
+
+      (erlang/== :drain msg)
+      (let [st (flush state)]
+        (tuple :reply (maps/get :last st) st))
+
+      :else
+      (erlang/error
+        (Elixir.FunctionClauseError/exception
+          (list (tuple :module (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+                (tuple :function :handle_call)
+                (tuple :arity 3)))))))
+
+(defn handle_info
+  "Every asynchronous message the watcher may receive, in the live clause
+   order: a file event for a watched path RECORDS the path and resets the quiet
+   window; `:flush_pending` applies the settled paths; a file event for an
+   UNWATCHED path still counts but is otherwise ignored; the monitor's `:DOWN`
+   flushes what the dead owner held; anything else is ignored.
+
+   The state match is on the watcher's OWN FileSystem pid (a synthetic event
+   from another sender is not accepted) and, for `:DOWN`, on the monitored ref.
+   `flush`, `notify`, `handle_bl_change`, `file_source`, `watches?`, `defer`,
+   `arm` and `start_debounce` are local closures — the live module's private
+   helpers, rebuilt where they are used rather than exported."
+  [msg state]
+  (let [file_source
+        (fn [path]
+          (let [raw (File/read! path)]
+            (cond
+              (String/ends_with? path ".bl.md") (BeamLisp.Loader/doc_source raw :md)
+              (String/ends_with? path ".bl.org") (BeamLisp.Loader/doc_source raw :org)
+              :else raw)))
+        notify
+        (fn [result path st]
+          (let [tagged
+                (if (erlang/is_map result)
+                  (if (erlang/is_map_key :path result)
+                    result
+                    (maps/put :path path result))
+                  {:path path
+                   :status :error
+                   :errors (list {:kind :error :msg (Kernel/inspect result)})})
+                cb (maps/get :on_result st)]
+            (if (erlang/== nil cb) nil (erlang/apply cb (list tagged)))
+            (maps/put :last tagged st)))
+        handle_bl_change
+        (fn [path st]
+          (let [result (erlang/apply (maps/get :apply st)
+                           (list (file_source path) path (maps/get :auto_commit st)))]
+            (notify result path st)))
+        flush
+        (fn [st]
+          (Enum/reduce (maps/get :pending st) (maps/put :pending (maps/new) st)
+            (fn [pair acc]
+              (let [path (erlang/element 1 pair)]
+                (if (File/regular? path)
+                  (handle_bl_change path acc)
+                  (notify {:status :removed :applied (list) :errors (list)} path acc))))))
+        ; `Logger.warning/1` is a MACRO in this Elixir (`require Logger` in the
+        ; live module), so a pinned beam cannot call it. The expansion is
+        ; reproduced by hand, exactly as the macro emits it:
+        ;
+        ;     case Logger.__should_log__(:warning, __MODULE__) do
+        ;       nil -> :ok
+        ;       level -> Logger.__do_log__(level, msg, %{}, %{})
+        ;     end
+        ;
+        ; The module argument is this module's own atom, which is what
+        ; `__MODULE__` answers at the live call sites.
+        warn
+        (fn [m]
+          (let [own (erlang/element 2 (erlang/fun_info (fn [] nil) :module))
+                lvl (Logger/__should_log__ :warning own)]
+            (if (erlang/== nil lvl) :ok (Logger/__do_log__ lvl m (maps/new) (maps/new)))))
+        start_debounce
+        (fn [q]
+          (try
+            (do
+              (BeamLisp.Loader/ensure_loaded "reload")
+              (tuple :ok
+                (BeamLisp.Ns.Rt/invoke
+                  (BeamLisp.Env/fetch! "reload" "watch-debounce-start")
+                  (list q))))
+            (catch e
+              (if (erlang/== :error __EXCEPTION_KIND__)
+                (tuple :error (Elixir.Exception/message e))
+                (erlang/apply :erlang :raise
+                  (list __EXCEPTION_KIND__
+                        (if (erlang/== :exit __EXCEPTION_KIND__) (erlang/element 2 e) e)
+                        __STACKTRACE__))))))
+        arm
+        (fn [st]
+          (let [pid (maps/get :debounce st)]
+            (if (erlang/is_pid pid)
+              (do (erlang/send pid (tuple :"reload/activity" (erlang/self))) (tuple :ok st))
+              (let [r (start_debounce (maps/get :quiet_ms st))]
+                (if (erlang/== :ok (erlang/element 1 r))
+                  (let [p (erlang/element 2 r)]
+                    (erlang/send p (tuple :"reload/activity" (erlang/self)))
+                    (tuple :ok
+                      (maps/put :debounce_warned false
+                        (maps/put :debounce_ref (Process/monitor p)
+                          (maps/put :debounce p st)))))
+                  (do
+                    (if (erlang/== false (maps/get :debounce_warned st))
+                      (warn
+                        (erlang/iolist_to_binary
+                          (list "reload watcher: no quiet-window owner ("
+                                (erlang/element 2 r)
+                                "); applying each save as it arrives")))
+                      nil)
+                    (tuple :unavailable
+                      (maps/put :debounce_warned true
+                        (maps/put :debounce_ref nil (maps/put :debounce nil st))))))))))
+        watches?
+        (fn [path] (String/ends_with? path (list ".bl" ".bl.md" ".bl.org" ".clj" ".cljc")))
+        defer
+        (fn [path st]
+          (let [r (arm (maps/put :pending (maps/put path true (maps/get :pending st)) st))]
+            (if (erlang/== :ok (erlang/element 1 r))
+              (erlang/element 2 r)
+              (flush (erlang/element 2 r)))))]
+    (cond
+      ; {:file_event, fs, {path, events}} — from OUR filesystem process only.
+      (and (erlang/is_tuple msg)
+           (erlang/== 3 (erlang/tuple_size msg))
+           (erlang/== :file_event (erlang/element 1 msg))
+           (erlang/== (maps/get :fs state) (erlang/element 2 msg))
+           (erlang/is_tuple (erlang/element 3 msg))
+           (erlang/== 2 (erlang/tuple_size (erlang/element 3 msg))))
+      (let [path (erlang/element 1 (erlang/element 3 msg))
+            st (maps/put :event_count (erlang/+ 1 (maps/get :event_count state)) state)]
+        (if (watches? path)
+          (tuple :noreply (defer path st))
+          (tuple :noreply st)))
+
+      (erlang/== :flush_pending msg)
+      (tuple :noreply (flush state))
+
+      ; {:file_event, fs, :stop} — the backend stopped; nothing to do.
+      (and (erlang/is_tuple msg)
+           (erlang/== 3 (erlang/tuple_size msg))
+           (erlang/== :file_event (erlang/element 1 msg))
+           (erlang/== (maps/get :fs state) (erlang/element 2 msg)))
+      (tuple :noreply state)
+
+      ; the quiet-window owner died: apply what it held, drop the pid.
+      (and (erlang/is_tuple msg)
+           (erlang/== 5 (erlang/tuple_size msg))
+           (erlang/== :DOWN (erlang/element 1 msg))
+           (erlang/== (maps/get :debounce_ref state) (erlang/element 2 msg))
+           (erlang/== :process (erlang/element 3 msg)))
+      (do
+        (warn
+          (erlang/iolist_to_binary
+            (list "reload watcher: quiet-window owner exited ("
+                  (Kernel/inspect (erlang/element 5 msg))
+                  "); flushing held paths")))
+        (tuple :noreply
+          (flush
+            (maps/put :debounce_warned false
+              (maps/put :debounce_ref nil (maps/put :debounce nil state))))))
+
+      :else (tuple :noreply state))))
+
+(defn terminate
+  "Stop the linked FileSystem worker so its `inotifywait` port does not leak
+   across tests, and the bl-side quiet-window owner, which is NOT linked to us:
+   leave it and it would keep a wake armed for a watcher that no longer exists.
+   `stop/1` is a local closure — private in the live module, rebuilt here — and
+   mirrors its clauses: a non-pid is a no-op, a dead pid is a no-op, and a
+   failure to stop is swallowed."
+  [_reason state]
+  (let [stop
+        (fn [pid]
+          (if (erlang/is_pid pid)
+            (do
+              (if (Process/alive? pid)
+                (try (GenServer/stop pid :normal 500)
+                     (catch e :ok))
+                nil)
+              :ok)
+            :ok))]
+    (stop (maps/get :fs state))
+    (stop (maps/get :debounce state))
+    :ok))
+
+; ── the reload integration, without the filesystem ───────────────────────────
+
+(defn apply_change
+  "Apply one source change through the reload loop and return the commit status
+   — the exact reload integration a file save drives, WITHOUT the filesystem.
+   Stage `source` into the bundle, then (when `commit?`) commit it: the static
+   coherence pass applies the edit or HOLDS it with the old code serving.
+   `label` is only used for a warning on error.
+
+   The source is embedded in an `(reload/stage \"…\")` form after escaping
+   backslashes and quotes — newlines are legal inside a bl string and pass
+   through — and that binary is built with `erlang/iolist_to_binary`, never
+   `str` (which resolves through the language's var registry)."
+  ([source] (apply_change source "<source>" true))
+  ([source label] (apply_change source label true))
+  ([source label commit?]
+   (let [own (erlang/element 2 (erlang/fun_info (fn [] nil) :module))
+         warn (fn [m]
+                (let [lvl (Logger/__should_log__ :warning own)]
+                  (if (erlang/== nil lvl) :ok (Logger/__do_log__ lvl m (maps/new) (maps/new)))))
+         escape (fn [s] (String/replace (String/replace s "\\" "\\\\") "\"" "\\\""))
+         escaped (escape source)]
+     (try
+       (BeamLisp/eval
+         (erlang/iolist_to_binary
+           (list "(reload/apply-change \"" escaped "\" "
+                 (if commit? "true" "false") ")")))
+       (catch e
+         (if (erlang/== :error __EXCEPTION_KIND__)
+           (do
+             (warn
+               (erlang/iolist_to_binary
+                 (list "reload watcher: " label ": " (Elixir.Exception/message e))))
+             (tuple :error (Elixir.Exception/message e)))
+           (erlang/apply :erlang :raise
+             (list __EXCEPTION_KIND__
+                   (if (erlang/== :exit __EXCEPTION_KIND__) (erlang/element 2 e) e)
+                   __STACKTRACE__))))))))

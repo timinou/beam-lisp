@@ -1,0 +1,465 @@
+; host/vector.bl — the pinned HOST MODULE for `Elixir.BeamLisp.Vector`.
+;
+; `BeamLisp.Vector` is beam-lisp's persistent vector: a 32-way bit-partitioned
+; trie in Clojure's PersistentVector shape (`cnt`/`shift`/`root`/`tail`), whose
+; tail buffer makes append amortized O(1) and indexed reads/writes O(log32 n).
+; A vector small enough to fit the tail (≤ 32 elements) stores its elements
+; directly as a tuple — exactly the shape the compiler produces for vector
+; literals, so `%Vector{items: {...}}` construction and receive-pattern
+; matching keep working untouched. Larger vectors store the trie
+; `{:bl_vec, cnt, shift, root, tail}`.
+;
+; This file is the `.bl` port of `lib/beam_lisp/vector.ex`, compiled by
+; `BeamLisp.AOT/compile_host_file` into ONE exact-named beam whose
+; `__struct__/0,1` pair and `__info__/1` are SYNTHESIZED by the `:struct_fields`
+; option (`[items: {}, meta: nil]`) — no `defstruct`, no Elixir source.
+;
+; BOOT-SAFE BY CONSTRUCTION. The compiler and `rt.bl` reach `BeamLisp.Vector`
+; while the boot tier is still being interned, so this module may depend on
+; NOTHING that is itself interned later. The allowed surface is exactly the
+; Erlang runtime and the Elixir standard library — `:erlang` BIFs, and
+; `Elixir.List`/`Elixir.Tuple`/`Elixir.Enum`/`Elixir.String.Chars` plus the two
+; exception structs. NOT allowed, and deliberately absent: any beam-lisp
+; namespace. A name THIS file does not define cannot be fetched in a fresh VM:
+; `str`/`concat` lower to `Env.fetch!` var lookups, and the CORE constructors
+; and functions (`list`, `tuple`, `quot`, `nil?`) lower to calls into
+; `BeamLisp.Ns.Core` — itself a boot namespace, so depending on it while it is
+; being interned is circular. (Sibling calls to names THIS file defines are
+; re-pointed at the pinned atom by the emitter, so those are fine.) Every
+; list and tuple below is therefore built from `:erlang` primitives
+; (`make_tuple`/`setelement`/`tuple_to_list`/`list_to_tuple`), never `(list …)`
+; or `(tuple …)` — the same rule `priv/host/set.bl` (also boot-referenced) holds
+; to. `test/bl/host_vector_test.bl` proves it: the beam makes NO `Env.fetch!`
+; call, and both a fresh VM with no application boot and this VM with every
+; `host.vector` var deleted drive it.
+;
+; THE STRUCT IS BUILT BY HAND, never by calling the synthesized `__struct__/1`.
+; A pinned file cannot name it: an unqualified `__struct__` is not a unit defn,
+; so the compiler lowers it to a var lookup. And the tag must be whatever module
+; the file was compiled INTO — at `BeamLisp.Vector` it builds
+; `%BeamLisp.Vector{}`, at a probe atom that atom's struct. `self-mod` reads its
+; own module from a fun literal compiled into this file
+; (`erlang/fun_info(F, module)`), the module-exact idiom `priv/host/set.bl`,
+; `priv/host/seq_cursor.bl` and `priv/host/delay.bl` use, so a probe compile
+; answers that beam's own atom with no hard-coded one.
+;
+; KEYS ARE READ BY FIELD, NEVER BY TAG-DISPATCH. `maps/get` needs no struct
+; head, so a vector tagged for the production module and one tagged for a probe
+; atom are read identically. `vector-struct?` is the gate — a struct whose tag
+; is EITHER this beam's own module OR the production `Elixir.BeamLisp.Vector` —
+; so the pinned functions answer both the value they built and the value the
+; seed's production beam built, while a plain map, a list, an integer or a
+; foreign struct is refused with the SAME `FunctionClauseError` the live
+; `%__MODULE__{}` clause heads raised. Keyword invocation on a tagged
+; collection would route the read back through this module's own lookup, which
+; is the recursion the Set port had to avoid; the same rule holds here.
+;
+; METADATA (`:meta`) is carried, never compared: `conj`/`assoc` thread it
+; through, `count`/`nth`/`to_list` ignore it. Equality and hashing live in
+; `rt.bl` (`hash-hash-key` strips `:meta`; `eqv` walks elements), so this module
+; only has to preserve the field.
+;
+; THERE ARE HELPER FUNCTIONS HERE, and that is the ONE deliberate divergence
+; from the live export surface: a pinned module exports exactly its file's
+; defns plus the synthesized constructor pair, so the trie helpers below are
+; exports too. Set and SeqCursor have none because their live modules had none;
+; a persistent vector cannot be written without them. The reference `vector.ex`
+; keeps them private, so a reader comparing `module_info(:exports)` datum for
+; datum will see the helpers on this beam and not on the `.ex` — the PUBLIC ABI
+; (`new/0,1` `count/1` `nth/2` `first/1` `rest/1` `conj/2` `assoc/3` `drop/2`
+; `to_list/1` plus the struct pair) is the contract, and it is exact.
+;
+; Run: bin/bl test test/bl/host_vector_test.bl
+
+(ns host.vector)
+
+; ── module-exact self reference ───────────────────────────────────────────
+
+(defn- self-mod
+  "The atom THIS source was compiled into, read from a fun literal compiled into
+   this file — module-exact, so the same source serves the production atom in
+   the seed and a probe atom under test without naming either."
+  []
+  (erlang/element 2 (erlang/fun_info (fn [] nil) :module)))
+
+(defn- function-clause!
+  "The `FunctionClauseError` an unmatched clause head raised, named with THIS
+   module's own atom so a probe compile reports the probe atom. `ex-message`
+   renders it as `no function clause matching in <module>.<fn>/<arity>`, the
+   same text the live `%__MODULE__{}` clause heads produced."
+  [fname arity]
+  (erlang/error
+    (Elixir.FunctionClauseError/exception
+      (erlang/tuple_to_list
+        (tup3 (tup2 :module (self-mod))
+              (tup2 :function fname)
+              (tup2 :arity arity))))))
+
+(defn- raise-argument
+  "The `ArgumentError` an out-of-bounds `assoc` raised, message and class."
+  [msg]
+  (erlang/error (Elixir.ArgumentError/exception msg)))
+
+(defn- index-str
+  "`String.Chars.to_string/1` — the rendering `#{i}` produced in the live bounds
+   message. A remote call into Elixir's `String.Chars`, never the beam-lisp `str`
+   var (a pinned beam's own namespace vars are absent from a fresh VM)."
+  [i]
+  (String.Chars/to_string i))
+
+; ── tuple/list construction from `:erlang` primitives only ───────────────
+;
+; beam-lisp's `(tuple …)`/`(list …)` are `BeamLisp.Ns.Core` calls, and Core is
+; a boot namespace this module may not depend on. These build the same data out
+; of `make_tuple`/`setelement`/`tuple_to_list`/`list_to_tuple`.
+
+(defn- tup2 [a b]
+  (erlang/setelement 2 (erlang/setelement 1 (erlang/make_tuple 2 :undefined) a) b))
+
+(defn- tup3 [a b c]
+  (erlang/setelement 3
+    (erlang/setelement 2
+      (erlang/setelement 1 (erlang/make_tuple 3 :undefined) a) b) c))
+
+(defn- tup4 [a b c d]
+  (erlang/setelement 4
+    (erlang/setelement 3
+      (erlang/setelement 2
+        (erlang/setelement 1 (erlang/make_tuple 4 :undefined) a) b) c) d))
+
+(defn- tup5 [a b c d e]
+  (erlang/setelement 5
+    (erlang/setelement 4
+      (erlang/setelement 3
+        (erlang/setelement 2
+          (erlang/setelement 1 (erlang/make_tuple 5 :undefined) a) b) c) d) e))
+
+(defn- singleton [x]
+  (erlang/setelement 1 (erlang/make_tuple 1 :undefined) x))
+
+(defn- bcat
+  "Concatenate a tuple of IO-data into one binary"
+  [parts]
+  (erlang/iolist_to_binary (erlang/tuple_to_list parts)))
+
+(defn- cat2
+  "`a ++ b` for two lists, without the beam-lisp `concat` var."
+  [a b]
+  (Enum/concat (erlang/tuple_to_list (tup2 a b))))
+
+(defn- empty-tuple
+  "`{}` — the empty tuple, spelled without a map literal (`{}` reads as an empty
+   MAP in beam-lisp)."
+  []
+  (erlang/list_to_tuple ()))
+
+; ── the value gate: a vector struct, tagged for production or for this beam ──
+
+(defn- vector-struct?
+  "`%__MODULE__{}`-shaped input: a map whose atom `:__struct__` tag is THIS
+   beam's module or the production `Elixir.BeamLisp.Vector`. The two-atom gate is
+   what lets the SAME source accept the value it built (probe-tagged) and the
+   value the seed's production beam built, while refusing a plain map, a list or
+   a foreign struct exactly as the live clause heads did. Fields are then read
+   with `maps/get`, which never dispatches through the tag."
+  [v]
+  (if (erlang/is_map v)
+    (if (erlang/is_map_key :__struct__ v)
+      (let [tag (erlang/map_get :__struct__ v)]
+        (or (erlang/== tag (self-mod))
+            (erlang/== tag :"Elixir.BeamLisp.Vector")))
+      false)
+    false))
+
+(defn- struct-of
+  "The vector struct `{items, meta}`, tagged with THIS beam's module — the shape
+   the synthesized `__struct__/1` would build, assembled without naming it."
+  [items meta]
+  (maps/put :__struct__ (self-mod)
+    (maps/put :items items
+      (maps/put :meta meta (maps/new)))))
+
+; ── the trie tag test and node construction ──────────────────────────────
+
+(defn- trie?
+  "The tag test from `vector.ex`: a 5-tuple `{:bl_vec, cnt, shift, root, tail}`
+   whose `cnt` is an integer above the 32-element small-vector bound, so an
+   ordinary 5-element vector that happens to start with the tag is not a trie."
+  [items]
+  (and (erlang/is_tuple items)
+       (erlang/== 5 (erlang/tuple_size items))
+       (erlang/== :bl_vec (erlang/element 1 items))
+       (erlang/is_integer (erlang/element 2 items))
+       (erlang/> (erlang/element 2 items) 32)))
+
+(defn- trie-node
+  "A trie `{:bl_vec, cnt, shift, root, tail}`."
+  [cnt shift root tail]
+  (tup5 :bl_vec cnt shift root tail))
+
+(defn- empty-node
+  "A fresh 32-slot trie node, every child nil."
+  []
+  (erlang/list_to_tuple (List/duplicate nil 32)))
+
+(defn- build-trie
+  "Fold a list into a trie by repeated `trie-conj` — the constructor the live
+   `build_trie/1` used for an input longer than the tail."
+  [items]
+  (Enum/reduce items
+    (trie-node 0 5 (empty-tuple) (empty-tuple))
+    (fn [x acc] (trie-conj acc x))))
+
+; ── the internal leaves: trie navigation ─────────────────────────────────
+
+(defn- descend
+  "The leaf holding element `i`: walk the index's 5-bit chunks from the root
+   down to a leaf (`node` at `level`; a leaf is `level` 0)."
+  [node level i]
+  (if (erlang/== level 0)
+    node
+    (descend
+      (erlang/element (erlang/+ 1 (erlang/band (erlang/bsr i level) 31)) node)
+      (erlang/- level 5)
+      i)))
+
+(defn- array-for
+  "The tuple holding element `i` of a trie: the tail buffer for the last partial
+   leaf, otherwise the leaf reached by descending the index."
+  [items i]
+  (let [cnt (erlang/element 2 items)
+        shift (erlang/element 3 items)
+        root (erlang/element 4 items)
+        tail (erlang/element 5 items)]
+    (if (erlang/>= i (erlang/- cnt (erlang/tuple_size tail)))
+      tail
+      (descend root shift i))))
+
+(defn- new-path
+  "A chain of `level`-deep single-child nodes wrapping `node` — Clojure's
+   `newPath`, used when a leaf moves into a deeper level."
+  [level node]
+  (if (erlang/== level 0)
+    node
+    (erlang/setelement 1 (empty-node) (new-path (erlang/- level 5) node))))
+
+(defn- normalize-root
+  "`{}` becomes a fresh empty node; anything else is already a node."
+  [root]
+  (if (erlang/== 0 (erlang/tuple_size root)) (empty-node) root))
+
+(defn- push-tail
+  "Place a full `tail_node` at the index's slot, creating intermediate nodes."
+  [node level cnt tail-node]
+  (let [sub (erlang/band (erlang/bsr (erlang/- cnt 1) level) 31)]
+    (if (erlang/== level 5)
+      (erlang/setelement (erlang/+ 1 sub) node tail-node)
+      (let [child (erlang/element (erlang/+ 1 sub) node)
+            new-child (if (erlang/== child nil)
+                        (new-path (erlang/- level 5) tail-node)
+                        (push-tail child (erlang/- level 5) cnt tail-node))]
+        (erlang/setelement (erlang/+ 1 sub) node new-child)))))
+
+(defn- flush-tail
+  "A full tail buffer becomes a leaf: either spliced into `root` (same shift),
+   or the root grows one level when the previous depth is saturated."
+  [root shift cnt tail]
+  (if (erlang/> (erlang/bsr cnt 5) (erlang/bsl 1 shift))
+    (tup2
+      (erlang/setelement 2 (erlang/setelement 1 (empty-node) root) (new-path shift tail))
+      (erlang/+ shift 5))
+    (tup2 (push-tail (normalize-root root) shift cnt tail) shift)))
+
+(defn- trie-conj
+  "Append `x` to a trie: grow the tail, or flush it and start a fresh `{x}`."
+  [items x]
+  (let [cnt (erlang/element 2 items)
+        shift (erlang/element 3 items)
+        root (erlang/element 4 items)
+        tail (erlang/element 5 items)
+        tail-len (erlang/tuple_size tail)]
+    (if (erlang/< tail-len 32)
+      (trie-node (erlang/+ cnt 1) shift root (Tuple/insert_at tail tail-len x))
+      (let [flushed (flush-tail root shift cnt tail)]
+        (trie-node (erlang/+ cnt 1)
+                   (erlang/element 2 flushed)
+                   (erlang/element 1 flushed)
+                   (singleton x))))))
+
+(defn- do-assoc-node
+  "Path-copying write into the trie node at `level`."
+  [node level i x]
+  (if (erlang/== level 0)
+    (erlang/setelement (erlang/+ 1 (erlang/band i 31)) node x)
+    (let [sub (erlang/band (erlang/bsr i level) 31)]
+      (erlang/setelement (erlang/+ 1 sub) node
+        (do-assoc-node (erlang/element (erlang/+ 1 sub) node) (erlang/- level 5) i x)))))
+
+(defn- do-assoc
+  "Replace element `i` of a trie: the tail buffer, or a path-copied node."
+  [items i x]
+  (let [cnt (erlang/element 2 items)
+        shift (erlang/element 3 items)
+        root (erlang/element 4 items)
+        tail (erlang/element 5 items)
+        tailoff (erlang/- cnt (erlang/tuple_size tail))]
+    (if (erlang/>= i tailoff)
+      (trie-node cnt shift root
+                 (erlang/setelement (erlang/+ 1 (erlang/- i tailoff)) tail x))
+      (trie-node cnt shift (do-assoc-node root shift i x) tail))))
+
+; ── the internal leaves: reading out ─────────────────────────────────────
+
+(defn- leaves-to-list
+  "Every element of a node's subtree, in order. `depth` is the node levels from
+   `node` to a leaf; nil children (unused slots) contribute nothing."
+  [node depth]
+  (if (erlang/== depth 0)
+    (erlang/tuple_to_list node)
+    (Enum/flat_map (erlang/tuple_to_list node)
+      (fn [child]
+        (if (erlang/== child nil) () (leaves-to-list child (erlang/- depth 1)))))))
+
+(defn- trie-to-list
+  "Walk the leaves in order (a chunked descent, never nth-in-a-loop), then
+   append the tail."
+  [items]
+  (cat2
+    (leaves-to-list (erlang/element 4 items) (erlang/div (erlang/element 3 items) 5))
+    (erlang/tuple_to_list (erlang/element 5 items))))
+
+(defn- to-list-of
+  "The elements of an `:items` payload: the small tuple, or the trie's walk."
+  [items]
+  (if (trie? items) (trie-to-list items) (erlang/tuple_to_list items)))
+
+(defn- conj-items
+  "Append `x` to an `:items` payload, growing a full small tuple into a trie."
+  [items x]
+  (if (trie? items)
+    (trie-conj items x)
+    (if (erlang/< (erlang/tuple_size items) 32)
+      (Tuple/insert_at items (erlang/tuple_size items) x)
+      (trie-conj (build-trie (erlang/tuple_to_list items)) x))))
+
+(defn- tl-or-empty
+  "`tl/1`, but an empty list answers the empty list."
+  [l]
+  (if (and (erlang/is_list l) (erlang/=/= l ())) (erlang/tl l) ()))
+
+(defn- nth-index
+  "Element `i` of an `:items` payload, or nil when `i` is out of range. The
+   caller has already established `0 <= i`."
+  [items i]
+  (if (trie? items)
+    (if (erlang/< i (erlang/element 2 items))
+      (erlang/element (erlang/+ 1 (erlang/band i 31)) (array-for items i))
+      nil)
+    (if (erlang/< i (erlang/tuple_size items))
+      (erlang/element (erlang/+ 1 i) items)
+      nil)))
+
+; ── the public ABI ────────────────────────────────────────────────────────
+
+(defn new
+  "The vector of `items` (a list), or the empty vector. An input of at most 32
+   elements becomes a tail tuple; anything longer is folded into a trie. A
+   non-list is the `FunctionClauseError` the live `when is_list(items)` guard
+   raised."
+  ([]
+   (struct-of (empty-tuple) nil))
+  ([items]
+   :when (list? items)
+   (if (erlang/=< (erlang/length items) 32)
+     (struct-of (erlang/list_to_tuple items) nil)
+     (struct-of (build-trie items) nil))))
+
+(defn count
+  "The element count — the tail tuple's size, or the trie's `cnt`."
+  [v]
+  (if (vector-struct? v)
+    (let [items (maps/get :items v)]
+      (if (trie? items) (erlang/element 2 items) (erlang/tuple_size items)))
+    (function-clause! :count 1)))
+
+(defn nth
+  "Element `i`, or nil when `i` is negative, not an integer, or out of range.
+   A non-vector is the `FunctionClauseError` the live clause heads raised."
+  [v i]
+  (if (vector-struct? v)
+    (if (and (erlang/is_integer i) (erlang/>= i 0))
+      (nth-index (maps/get :items v) i)
+      nil)
+    (function-clause! :nth 2)))
+
+(defn first
+  "Element 0, or nil when empty."
+  [v]
+  (if (vector-struct? v)
+    (nth-index (maps/get :items v) 0)
+    (function-clause! :first 1)))
+
+(defn rest
+  "The elements after the first, as a LIST — empty when the vector is empty.
+   `vector.ex` implemented this as `to_list/1 |> tl_or_empty/1`."
+  [v]
+  (if (vector-struct? v)
+    (tl-or-empty (to-list-of (maps/get :items v)))
+    (function-clause! :rest 1)))
+
+(defn conj
+  "Clojure `conj`: append, amortized O(1) via the tail buffer. Metadata survives
+   `conj`/`assoc`, as in Clojure: metadata belongs to the value and is carried
+   by operations that return a vector of the same logical thing."
+  [v x]
+  (if (vector-struct? v)
+    (struct-of (conj-items (maps/get :items v) x) (maps/get :meta v))
+    (function-clause! :conj 2)))
+
+(defn- assoc-index
+  "`assoc` for a vector and a non-negative integer index: replace in place,
+   append at `count`, and raise the live bounds error beyond it."
+  [v i x]
+  (let [items (maps/get :items v)
+        m (maps/get :meta v)]
+    (if (trie? items)
+      (let [cnt (erlang/element 2 items)]
+        (cond
+          (erlang/< i cnt) (struct-of (do-assoc items i x) m)
+          (erlang/== i cnt) (struct-of (trie-conj items x) m)
+          :else (raise-argument
+                  (bcat (tup5 "assoc index " (index-str i)
+                              " out of bounds (count " (index-str cnt) ")")))))
+      (let [n (erlang/tuple_size items)]
+        (cond
+          (erlang/< i n) (struct-of (erlang/setelement (erlang/+ 1 i) items x) m)
+          (erlang/== i n) (struct-of (conj-items items x) m)
+          :else (raise-argument
+                  (bcat (tup5 "assoc index " (index-str i)
+                              " out of bounds (count " (index-str n) ")"))))))))
+
+(defn assoc
+  "Clojure `assocN`: replace at `i`; `i == count` appends like `conj`. A
+   negative or non-integer index is the live `ArgumentError`; a non-vector is
+   the live `FunctionClauseError`."
+  [v i x]
+  (if (vector-struct? v)
+    (if (and (erlang/is_integer i) (erlang/>= i 0))
+      (assoc-index v i x)
+      (raise-argument (bcat (tup3 "assoc index " (index-str i) " out of bounds"))))
+    (function-clause! :assoc 3)))
+
+(defn drop
+  "The vector's elements after the first `n`, as a LIST — the live
+   `to_list/1 |> Enum.drop(n)`."
+  [v n]
+  (if (vector-struct? v)
+    (Enum/drop (to-list-of (maps/get :items v)) n)
+    (function-clause! :drop 2)))
+
+(defn to_list
+  "Every element, in order, as an Erlang list."
+  [v]
+  (if (vector-struct? v)
+    (to-list-of (maps/get :items v))
+    (function-clause! :to_list 1)))

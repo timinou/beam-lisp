@@ -1,0 +1,598 @@
+; pinned_kernel_lowering_test.bl — the pinned-kernel lowering inside `Emit`.
+;
+; `priv/host/emit.bl` is the ONE place a bl-ANF descriptor becomes a beam. The
+; pass that runs there is deliberately narrow, and this suite pins BOTH what it
+; changes and what it must leave alone.
+;
+; WHAT IT CHANGES (two rewrites):
+;
+;   * `(erlang/list_to_tuple L)`, with `L` a list the emitter can SEE THROUGH
+;     (a literal cons chain, or the core `list` rest-collector call whose body
+;     IS its rest argument), becomes a direct tuple. The proof is the BEAM: the
+;     lowered code carries the `{}` term and calls NEITHER
+;     `BeamLisp.Ns.Core.list__bl_v` NOR `erlang:list_to_tuple`, where the
+;     un-lowered reference beam calls both. Both beams come from
+;     `priv/host/emit.bl` compiled as a probe, so the comparison is between two
+;     real emissions of the same source, not a source pattern.
+;
+;   * the module-exact self-read `(erlang/element 2 (erlang/fun_info (fn []
+;     nil) :module))` becomes the module the descriptor emits, as a LITERAL:
+;     the emission has no `make_fun3`, no `fun_info` and no `element`, and two
+;     probes compiled at DIFFERENT atoms each answer their own atom. It fires
+;     only for a closure literal compiled into the emitting module — a
+;     `fun_info` of a variable, or of a scaffold whose returned body is not
+;     itself a `:fn`, still reaches the BIF.
+;
+; WHAT IT MUST NOT CHANGE — cut deliberately, each pinned below:
+;
+;   * the `Core.list`/`Core.tuple` helper calls themselves: a rebinding or a hot
+;     reload of `Core` can replace them, so `(tuple 1 2 3)` and `(list 1 2 3)`
+;     keep their namespace calls;
+;   * the self-application scaffold and immediate applications: no β-reduction
+;     and no dead-binding drop, so `((fn [x] x) 9)` still answers 9 and a
+;     scaffold returning something other than a closure still raises;
+;   * `element(2.0, …)`: the index must be the integer `2` exactly.
+;
+; EVALUATION ORDER, EFFECTS AND EXCEPTIONS ARE UNCHANGED. The tuple rewrite is
+; gated on operands that cannot be observed; a `:struct` operand is NOT plain
+; (it lowers to a remote `Mod.__struct__/1` call that can raise), so a list
+; carrying one keeps its machinery and its error, in its written key order.
+;
+; Run: bin/bl test test/bl/pinned_kernel_lowering_test.bl
+
+(ns pinned-kernel-lowering.test)
+
+(defn- t2 [a b] (erlang/list_to_tuple (list a b)))
+
+(def ^:private probe :Elixir.PinnedKernelProbe)
+(def ^:private ctr (atom 0))
+(defn- uniq-mod [stem]
+  (erlang/binary_to_atom (str "Elixir.Pklow." stem "." (swap! ctr inc))))
+(def ^:private dir (str (System/tmp_dir!) "/bl_pinned_kernel_" (erlang/unique_integer (list :positive))))
+
+(def ^:private probe-box (atom nil))
+
+(defn- probe-mod
+  "`priv/host/emit.bl` compiled into its own probe atom and loaded, once — the
+   real pinned emitter's source under test.
+
+   Compiled LAZILY from a test body on purpose: `compile_host_file` processes
+   the file's `(ns host.emit)` form, so doing it while this suite's own file is
+   still loading would attribute the suite's tests to that namespace instead of
+   this one."
+  []
+  (or @probe-box
+      (let [m (do (File/mkdir_p! dir)
+                  (elem (BeamLisp.AOT/compile_host_file
+                          (Path/join (BeamLisp/cwd) "priv/host/emit.bl")
+                          (list (t2 :module probe) (t2 :output_dir (str dir "/probe"))
+                                (t2 :load? true)))
+                        0))]
+        (reset! probe-box m)
+        m)))
+
+; ── fixture compilation ─────────────────────────────────────────────
+
+(defn- descriptor-of
+  "The descriptor for `mod`: one `run` clause of `params` around `src`.
+   `locals` names the parameters the compiler must see as BOUND locals, so a
+   fixture can take an argument without the compiler resolving it as a global."
+  ([mod src params] (descriptor-of mod src params {}))
+  ([mod src params locals]
+  (let [env (assoc (assoc (BeamLisp.Compiler/new_env "pkl") :ns "pkl") :locals locals)
+        node (BeamLisp.Compiler/compile (BeamLisp.Reader/read_one src) env)]
+    (erlang/apply (probe-mod) :descriptor_for
+      (list mod (list {:op :"defn-clause" :fname :run :params params :guard nil
+                       :body node :ann {}}))))))
+
+(defn- lowered
+  "`{mod beam}` for `src` through the pinned emitter — the lowering runs."
+  ([stem src params] (lowered stem src params {}))
+  ([stem src params locals]
+   (erlang/apply (probe-mod) :compile_descriptor
+     (list (descriptor-of (uniq-mod stem) src params locals)))))
+
+(defn- reference
+  "`{mod beam}` for the SAME `src` straight through the Core backend — no
+   pinned-kernel lowering."
+  ([stem src params] (reference stem src params {}))
+  ([stem src params locals]
+   (BeamLisp.Ns.Lower/descriptor->beam (descriptor-of (uniq-mod stem) src params locals) {:enabled? false})))
+
+; Hand-built ANF fixtures. Two of the reviewer's cases need a shape the
+; compiler never emits (a self-application scaffold whose returned body is NOT
+; a `:fn`) or that must carry a `:struct` node the compiler would only build
+; from a record literal, so they are spelled here over the same canonical ANF
+; grammar `anf.bl` validates.
+
+(defn- anf-var [n] {:op :var :name n :ann {}})
+(defn- anf-lit [v] {:op :lit :val v :ann {}})
+(defn- anf-remote [m f args] {:op :remote :mod m :fun f :args args :ann {}})
+(defn- anf-cons [h t] {:op :cons :head h :tail t :ann {}})
+(defn- anf-enil [] {:op :enil :ann {}})
+(defn- anf-fn [pats body] {:op :fn :clauses (list {:pats pats :guard nil :body body}) :ann {}})
+(defn- anf-let [n init body] {:op :let :name n :init init :body body :ann {}})
+(defn- anf-apply [f args] {:op :apply :fn f :args args :ann {}})
+(defn- anf-struct [mod fields] {:op :struct :mod mod :fields fields :ann {}})
+
+(defn- self-apply-of
+  "`let s = (fn [s] INNER) in (s s)` — the exact scaffold shape, with an
+   arbitrary `inner`, so a test can hand it a body that is not a `:fn`."
+  [inner]
+  (anf-let "s" (anf-fn (list {:pop :pvar :name "s"}) inner)
+    (anf-apply (anf-var "s") (list (anf-var "s")))))
+
+(defn- self-read-of
+  "`(erlang/element 2 (erlang/fun_info FN :module))` over a hand-built `FN`."
+  [fn-node]
+  (anf-remote :erlang :element
+    (list (anf-lit 2) (anf-remote :erlang :fun_info (list fn-node (anf-lit :module))))))
+
+(defn- descriptor-of-node [mod body params]
+  (erlang/apply (probe-mod) :descriptor_for
+    (list mod (list {:op :"defn-clause" :fname :run :params params :guard nil
+                     :body body :ann {}}))))
+
+(defn- lowered-node [stem body params]
+  (erlang/apply (probe-mod) :compile_descriptor
+    (list (descriptor-of-node (uniq-mod stem) body params))))
+
+(defn- reference-node [stem body params]
+  (BeamLisp.Ns.Lower/descriptor->beam (descriptor-of-node (uniq-mod stem) body params)))
+
+; ── beam loading and inspection ──────────────────────────────────────
+
+(defn- load-beam! [beam tag]
+  (let [path (str dir "/" tag ".beam")]
+    (File/write! path (elem beam 1))
+    (code/load_binary (elem beam 0) (erlang/binary_to_list path) (elem beam 1))
+    path))
+
+(defn- run-beam
+  "The `run` answer of a freshly loaded beam."
+  ([beam tag] (run-beam beam tag (list)))
+  ([beam tag args]
+   (load-beam! beam tag)
+   (erlang/apply (elem beam 0) :run args)))
+
+(defn- observe
+  "`{:value v}` or `{:raise Class message}` — a raise is comparable too."
+  ([beam tag] (observe beam tag (list)))
+  ([beam tag args]
+   (load-beam! beam tag)
+   (try (tuple :value (erlang/apply (elem beam 0) :run args))
+        (catch e (tuple :raise (type e) (ex-message e))))))
+
+(defn- fns-of [path]
+  (erlang/element 6 (erlang/apply :beam_disasm :file (list (erlang/binary_to_list path)))))
+
+(defn- insns-of [path fname ar]
+  (erlang/element 5
+    (first (Enum/filter (fns-of path)
+             (fn [f] (and (erlang/== :function (erlang/element 1 f))
+                          (erlang/== fname (erlang/element 2 f))
+                          (erlang/== ar (erlang/element 3 f))))))))
+
+(defn- calls-of
+  "Every `{Module, function, arity}` the named function calls."
+  [path fname ar]
+  (Enum/reduce (insns-of path fname ar) (list)
+    (fn [ins acc]
+      (if (and (erlang/is_tuple ins)
+               (or (erlang/== :call_ext (erlang/element 1 ins))
+                   (erlang/== :call_ext_only (erlang/element 1 ins))
+                   (erlang/== :call_ext_last (erlang/element 1 ins))))
+        (let [ext (erlang/element 3 ins)]
+          (if (and (erlang/is_tuple ext) (erlang/== :extfunc (erlang/element 1 ext)))
+            (cons (tuple (erlang/element 2 ext) (erlang/element 3 ext) (erlang/element 4 ext)) acc)
+            acc))
+        acc))))
+
+(defn- calls-the
+  "Every call of `mod.fun` made by the named function `fname/ar`."
+  [path fname ar mod fun]
+  (Enum/filter (calls-of path fname ar)
+    (fn [c] (and (erlang/== mod (elem c 0))
+                 (erlang/== fun (elem c 1))))))
+
+(def ^:private machinery
+  "The calls a `list_to_tuple` of a compiler-built list no longer needs."
+  (list (tuple :Elixir.BeamLisp.Ns.Core :list__bl_v 1)
+        (tuple :Elixir.BeamLisp.Ns.Core :tuple__bl_v 1)
+        (tuple :erlang :list_to_tuple 1)))
+
+(defn- machinery-calls [path fname ar]
+  (Enum/filter (calls-of path fname ar) (fn [c] (Enum/member? machinery c))))
+
+(defn- count-op [path fname ar op]
+  (Enum/reduce (insns-of path fname ar) 0
+    (fn [ins acc]
+      (if (and (erlang/is_tuple ins) (erlang/== op (erlang/element 1 ins))) (+ acc 1) acc))))
+
+(defn- literal-moves
+  "Every literal the named function moves into a register."
+  [path fname ar]
+  (Enum/reduce (insns-of path fname ar) (list)
+    (fn [ins acc]
+      (if (and (erlang/is_tuple ins)
+               (erlang/== :move (erlang/element 1 ins))
+               (erlang/is_tuple (erlang/element 2 ins))
+               (erlang/== :literal (erlang/element 1 (erlang/element 2 ins))))
+        (cons (erlang/element 2 (erlang/element 2 ins)) acc)
+        acc))))
+
+(defn- bif-count
+  "How many times the named function executes the BIF `op`."
+  [path fname ar op]
+  (Enum/reduce (insns-of path fname ar) 0
+    (fn [ins acc]
+      (if (and (erlang/is_tuple ins)
+               (erlang/== :bif (erlang/element 1 ins))
+               (erlang/== op (erlang/element 2 ins)))
+        (+ acc 1) acc))))
+
+(defn- atom-moves
+  "Every atom the named function moves into a register."
+  [path fname ar]
+  (Enum/reduce (insns-of path fname ar) (list)
+    (fn [ins acc]
+      (if (and (erlang/is_tuple ins)
+               (erlang/== :move (erlang/element 1 ins))
+               (erlang/is_tuple (erlang/element 2 ins))
+               (erlang/== :atom (erlang/element 1 (erlang/element 2 ins))))
+        (cons (erlang/element 2 (erlang/element 2 ins)) acc)
+        acc))))
+
+(defn- self-call-count
+  "How many times the named function calls one of its OWN anonymous closures —
+   the self-application scaffold's indirect call."
+  [path fname ar]
+  (let [mod (erlang/element 2 (erlang/apply :beam_disasm :file (list (erlang/binary_to_list path))))]
+    (Enum/reduce (insns-of path fname ar) 0
+      (fn [ins acc]
+        (if (erlang/not (erlang/is_tuple ins))
+          acc
+          (let [op (erlang/element 1 ins)]
+            (if (and (or (erlang/== :call op) (erlang/== :call_only op) (erlang/== :call_last op))
+                     (> (erlang/tuple_size ins) 2)
+                     (erlang/is_tuple (erlang/element 3 ins))
+                     (erlang/== mod (erlang/element 1 (erlang/element 3 ins)))
+                     (erlang/is_atom (erlang/element 2 (erlang/element 3 ins))))
+              (+ acc 1)
+              acc)))))))
+
+; ── the pure corpus ─────────────────────────────────────────────────
+
+(def ^:private tuple-corpus
+  "`{tag src expected}` — every operand is a literal, so the tuple rewrite
+   applies and the answer is known exactly."
+  (list (list "empty" "(erlang/list_to_tuple (list))" (erlang/list_to_tuple (list)))
+        (list "singleton" "(erlang/list_to_tuple (list 7))" (erlang/list_to_tuple (list 7)))
+        (list "three" "(erlang/list_to_tuple (list 1 2 3))" (erlang/list_to_tuple (list 1 2 3)))
+        (list "nested" "(erlang/list_to_tuple (list (erlang/list_to_tuple (list 1 2)) 3))"
+              (erlang/list_to_tuple (list (erlang/list_to_tuple (list 1 2)) 3)))
+        (list "mixed" "(erlang/list_to_tuple (list :ok 1.5 true))"
+              (erlang/list_to_tuple (list :ok 1.5 true)))))
+
+(deftest list-to-tuple-of-a-known-list-loses-the-cons-chain-and-the-tuple-machinery
+  (testing "the emitted code carries the term, not a cons chain plus list_to_tuple"
+    (doseq [[tag _src expected] tuple-corpus]
+      ; A source-level (list ...) is reloadable, not an immutable constructor.
+      ; This fixture supplies the canonical ANF cons chain directly.
+      (let [elems (erlang/tuple_to_list expected)
+            body (anf-remote :erlang :list_to_tuple
+                   (list (lists/foldr (fn [x tail] (anf-cons (anf-lit x) tail))
+                                     (anf-enil) elems)))
+            low-path (load-beam! (lowered-node tag body (list)) (str tag "-l"))
+            ref-path (load-beam! (reference-node tag body (list)) (str tag "-r"))]
+        (is (= (list) (machinery-calls low-path :run 0))
+            (str tag ": the lowered beam still calls the tuple machinery"))
+        (is (= (list) (machinery-calls ref-path :run 0))
+            (str tag ": immutable tuple folding already belongs to the backend"))
+        (is (not= (list) (literal-moves low-path :run 0))
+            (str tag ": no tuple literal was moved"))))))
+
+(deftest list-to-tuple-of-a-known-list-answers-the-same-value
+  (testing "value parity against the un-lowered backend, and the exact term"
+    (doseq [[tag src expected] tuple-corpus]
+      (let [low (lowered tag src (list))]
+        (is (= expected (run-beam low (str tag "-v"))) tag)))))
+
+(deftest a-list-with-an-operand-the-emitter-cannot-see-through-keeps-the-bif
+  (testing "one impure operand keeps the machinery in BOTH beams"
+    (let [src "(let [a (atom (list))] (erlang/list_to_tuple (list (swap! a conj :a) (swap! a conj :b))) (deref a))"
+          low (lowered "impureltt" src (list))
+          ref (reference "impureltt" src (list))
+          low-path (load-beam! low "impureltt-l")]
+      (is (not= (list) (machinery-calls low-path :run 0))
+          "an observably-positioned operand must keep the tuple machinery")
+      (is (= (list :a :b) (run-beam low "impureltt-v")))
+      (is (erlang/== (run-beam low "impureltt-v2") (run-beam ref "impureltt-rv")))))
+  (testing "a dynamic list keeps the BIF"
+    (let [src "(erlang/list_to_tuple xs)"
+          params (list {:pop :pvar :name "xs"})
+          low (lowered "dynamic" src params {"xs" "xs"})
+          low-path (load-beam! low "dynamic-l")]
+      (is (= 1 (erlang/length (calls-the low-path :run 1 :erlang :list_to_tuple))))
+      (is (= (erlang/list_to_tuple (list 1 2 3))
+             (erlang/apply (elem low 0) :run (list (list 1 2 3))))))))
+
+; ── the module-exact self-read ───────────────────────────────────────
+
+(def ^:private self-read "(erlang/element 2 (erlang/fun_info (fn [] nil) :module))")
+
+(deftest the-self-read-becomes-the-emitted-module-at-compile-time
+  (testing "no closure, no fun_info, no element — and the answer is THIS module"
+    (let [low (lowered "identity" self-read (list))
+          ref (reference "identity" self-read (list))
+          low-path (load-beam! low "identity-l")
+          ref-path (load-beam! ref "identity-r")]
+      (is (= (list) (calls-the low-path :run 0 :erlang :fun_info)))
+      (is (= 0 (bif-count low-path :run 0 :element)))
+      (is (= 0 (count-op low-path :run 0 :make_fun3))
+          "no closure is allocated for the self-read any more")
+      (is (not= (list) (calls-the ref-path :run 0 :erlang :fun_info))
+          "the reference still asks the BIF, or this check is vacuous")
+      (is (not= 0 (bif-count ref-path :run 0 :element))
+          "the reference still runs the BIF, or this check is vacuous")
+      (is (Enum/member? (atom-moves low-path :run 0) (elem low 0))
+          "the module atom must be a LITERAL in the emission")
+      (is (= (elem low 0) (run-beam low "identity-v"))
+          "the self-read answers the module it was compiled into"))))
+
+(deftest the-self-read-retargets-to-the-atom-it-is-compiled-at
+  (testing "two probes, two atoms, each answering itself"
+    (let [a (lowered "ret-a" self-read (list))
+          b (lowered "ret-b" self-read (list))]
+      (is (erlang/not (erlang/== (elem a 0) (elem b 0))))
+      (is (= (elem a 0) (run-beam a "ret-a-v")))
+      (is (= (elem b 0) (run-beam b "ret-b-v"))))))
+
+(deftest a-foreign-fun-still-answers-through-the-bif
+  (testing "fun_info of a variable is a question about ANOTHER fun"
+    (let [src "(erlang/element 2 (erlang/fun_info f :module))"
+          params (list {:pop :pvar :name "f"})
+          low (lowered "foreign" src params {"f" "f"})
+          low-path (load-beam! low "foreign-l")
+          foreign (fn [] nil)]
+      (is (= 1 (erlang/length (calls-the low-path :run 1 :erlang :fun_info)))
+          "the BIF must survive for a non-literal fun")
+      (is (= (erlang/element 2 (erlang/fun_info foreign :module))
+             (erlang/apply (elem low 0) :run (list foreign)))
+          "the answer is the FOREIGN fun's module, never the emitter's"))))
+
+; ── the reviewer's minimal cases ─────────────────────────────────────
+
+(deftest a-non-integer-index-is-left-to-the-bif
+  (testing "element(2.0, …) is a badarg the user observes, not a rewrite"
+    (let [src "(erlang/element 2.0 (erlang/fun_info (fn [] nil) :module))"
+          low (lowered "floatidx" src (list))
+          ref (reference "floatidx" src (list))
+          low-path (load-beam! low "floatidx-l")
+          low-obs (observe low "floatidx-o")]
+      (is (= 1 (erlang/length (calls-the low-path :run 0 :erlang :fun_info)))
+          "the self-read must NOT be lowered for a 2.0 index")
+      (is (erlang/== :raise (elem low-obs 0)) "element/2 with a float index is a badarg")
+      (is (erlang/== low-obs (observe ref "floatidx-ro"))))))
+
+(deftest core-tuple-and-list-calls-are-left-to-their-namespace
+  (testing "(tuple …) and (list …) are namespace calls a hot reload can replace"
+    (let [tup (lowered "keeptuple" "(tuple 1 2 3)" (list))
+          tup-path (load-beam! tup "keeptuple-l")
+          lst (lowered "keeplist" "(erlang/length (list 1 2 3))" (list))
+          lst-path (load-beam! lst "keeplist-l")]
+      (is (not= (list) (calls-the tup-path :run 0 :Elixir.BeamLisp.Ns.Core :tuple__bl_v))
+          "the core tuple call must survive: a late redefinition of Core.tuple takes effect")
+      (is (not= (list) (calls-the lst-path :run 0 :Elixir.BeamLisp.Ns.Core :list__bl_v))
+          "the core list call must survive: a late redefinition of Core.list takes effect")
+      (is (= (erlang/list_to_tuple (list 1 2 3)) (run-beam tup "keeptuple-v")))
+      (is (= 3 (run-beam lst "keeplist-v"))))))
+
+(deftest an-immediate-application-and-its-shadowing-still-answer
+  (testing "the β-redex case is no longer rewritten; the answer is still 9"
+    (doseq [[tag src] (list (list "beta" "((fn [x] x) 9)")
+                            (list "shadow" "(let [x 9] ((fn [x] x) x))"))]
+      (let [low (lowered tag src (list))
+            ref (reference tag src (list))]
+        (is (= 9 (run-beam low (str tag "-v"))) tag)
+        (is (erlang/== (run-beam low (str tag "-v2")) (run-beam ref (str tag "-rv"))) tag)))))
+
+(deftest a-scaffold-that-does-not-return-a-closure-keeps-the-bif
+  (testing "let s = (fn [s] f) in (s s) values a FOREIGN fun, not this module"
+    (let [body (self-read-of (self-apply-of (anf-var "f")))
+          params (list {:pop :pvar :name "f"})
+          low (lowered-node "nonfna" body params)
+          ref (reference-node "nonfna" body params)
+          low-path (load-beam! low "nonfna-l")
+          foreign (fn [] nil)]
+      (is (= 1 (erlang/length (calls-the low-path :run 1 :erlang :fun_info)))
+          "the BIF must survive a scaffold whose returned body is not a :fn")
+      (is (= (erlang/element 2 (erlang/fun_info foreign :module))
+             (erlang/apply (elem low 0) :run (list foreign)))
+          "the answer is the FOREIGN fun's module, never the emitter's")
+      (is (erlang/== (observe low "nonfna-o" (list foreign))
+                     (observe ref "nonfna-ro" (list foreign))))))
+  (testing "let s = (fn [s] 42) in (s s) is not a fun: fun_info raises"
+    (let [body (self-read-of (self-apply-of (anf-lit 42)))
+          low (lowered-node "nonfnb" body (list))
+          ref (reference-node "nonfnb" body (list))
+          low-path (load-beam! low "nonfnb-l")
+          low-obs (observe low "nonfnb-o")]
+      (is (= 1 (erlang/length (calls-the low-path :run 0 :erlang :fun_info)))
+          "the BIF must survive a scaffold that does not return a closure")
+      (is (erlang/== :raise (elem low-obs 0)) "fun_info of a non-fun is a badarg")
+      (is (erlang/== low-obs (observe ref "nonfnb-ro"))))))
+
+(deftest an-invalid-struct-operand-keeps-the-machinery-and-the-key-order
+  (testing "a :struct operand is not plain: the list keeps its machinery"
+    (let [struct-node (anf-struct :Elixir.BeamLisp.Vector
+                        (list (list (anf-lit :nope) (anf-lit 1))))
+          body (anf-remote :erlang :list_to_tuple
+                 (list (anf-cons struct-node (anf-enil))))
+          low (lowered-node "structgate" body (list))
+          ref (reference-node "structgate" body (list))
+          low-path (load-beam! low "structgate-l")]
+      (is (not= (list) (machinery-calls low-path :run 0))
+          "a :struct operand must keep the cons chain, the rest-collector and the BIF")
+      (is (erlang/== (observe low "structgate-o") (observe ref "structgate-ro")))))
+  (testing "the WRITTEN key order decides which missing key the constructor names"
+    (let [body-of (fn [fields]
+                    (anf-remote :erlang :list_to_tuple
+                      (list (anf-cons (anf-struct :Elixir.BeamLisp.Vector fields) (anf-enil)))))
+          nope-first (body-of (list (list (anf-lit :nope) (anf-lit 1))
+                                    (list (anf-lit :also-nope) (anf-lit 2))))
+          other-first (body-of (list (list (anf-lit :also-nope) (anf-lit 1))
+                                     (list (anf-lit :nope) (anf-lit 2))))
+          obs1 (observe (lowered-node "structkey1" nope-first (list)) "structkey1-o")
+          obs2 (observe (lowered-node "structkey2" other-first (list)) "structkey2-o")]
+      (is (erlang/== :raise (elem obs1 0)) "an undeclared struct key raises")
+      (is (String/contains? (elem obs1 2) "nope") "the FIRST written key is the one named")
+      (is (erlang/not (String/contains? (elem obs1 2) "also-nope"))
+          "the later key must not be the one reported")
+      (is (String/contains? (elem obs2 2) "also-nope") "reordering the keys changes which key is named")
+      (is (erlang/not (erlang/== (elem obs1 2) (elem obs2 2)))))))
+
+(deftest a-non-descriptor-is-refused-by-the-validator-not-this-pass
+  (testing "compile_descriptor(:not-a-descriptor) is refused exactly as the backend refuses it"
+    (let [low-err (try (do (erlang/apply (probe-mod) :compile_descriptor (list :not-a-descriptor)) nil)
+                       (catch e e))
+          ref-err (try (do (BeamLisp.Ns.Lower/descriptor->beam :not-a-descriptor) nil)
+                       (catch e e))]
+      (is (some? low-err) "a bare atom is not a descriptor")
+      (is (erlang/== (ex-message low-err) (ex-message ref-err))
+          "the pass must not change the backend's diagnostic")))
+  (testing "an empty map reaches the validator's own located refusal"
+    (let [err (try (do (erlang/apply (probe-mod) :compile_descriptor (list {})) nil)
+                   (catch e e))]
+      (is (some? err) "an empty map is not a descriptor either")
+      (is (String/contains? (ex-message err) "descriptor has missing or unknown fields")
+          "the message is the canonical descriptor validator's, not this pass's"))))
+
+; ── the self-application scaffold (no longer dropped) ────────────────
+
+(deftest a-non-recursive-closure-keeps-its-scaffold
+  (testing "the dead-binding drop is gone: the emitted call count is unchanged"
+    (let [src "(fn [x] (erlang/tuple_size x))"
+          low (lowered "closure" src (list))
+          ref (reference "closure" src (list))
+          low-path (load-beam! low "closure-l")
+          ref-path (load-beam! ref "closure-r")]
+      (is (= (self-call-count ref-path :run 0) (self-call-count low-path :run 0))
+          "the scaffold is left exactly as the compiler spelled it")
+      (is (= 3 (erlang/apply (run-beam low "closure-v") (list (erlang/list_to_tuple (list 1 2 3)))))
+          "the closure still computes the same answer"))))
+
+(deftest a-recursive-loop-keeps-its-scaffold
+  (testing "recur still re-enters through self-application, unchanged"
+    (let [src "(loop [i 0 acc 0] (if (erlang/< i 5) (recur (erlang/+ i 1) (erlang/+ acc i)) acc))"
+          low (lowered "loop" src (list))
+          ref (reference "loop" src (list))
+          low-path (load-beam! low "loop-l")
+          ref-path (load-beam! ref "loop-r")]
+      (is (= (self-call-count ref-path :run 0) (self-call-count low-path :run 0))
+          "a scaffold that NAMES self must not be touched")
+      (is (= 10 (run-beam low "loop-v"))))))
+
+; ── order, effects and exceptions ────────────────────────────────────
+
+(def ^:private order-corpus
+  "`{tag src sequence}` — side-effecting fixtures whose OBSERVED order is the
+   contract. The sequence is asserted EXPLICITLY so a reordering emission is
+   caught, not merely compared to another possibly-reordered beam."
+  (list
+    (list "tup-effects"
+          "(let [a (atom (list))] (tuple (do (swap! a conj :a) 1) (do (swap! a conj :b) 2) (do (swap! a conj :c) 3)) (deref a))"
+          (list :c :b :a))
+    (list "list-effects"
+          "(let [a (atom (list))] (list (do (swap! a conj :a) 1) (do (swap! a conj :b) 2)) (deref a))"
+          (list :b :a))
+    (list "ltt-effects"
+          "(let [a (atom (list))] (erlang/list_to_tuple (list (swap! a conj :a) (swap! a conj :b))) (deref a))"
+          (list :a :b))
+    (list "ltt-effects3"
+          "(let [a (atom (list))] (erlang/list_to_tuple (list (swap! a conj :a) (swap! a conj :b) (swap! a conj :c))) (deref a))"
+          (list :a :b :c))
+    (list "self-read-first"
+          (str "(let [a (atom (list))] (tuple " self-read " (do (swap! a conj :x) 1)) (deref a))")
+          (list :x))
+    (list "self-read-last"
+          (str "(let [a (atom (list))] (tuple (do (swap! a conj :x) 1) " self-read ") (deref a))")
+          (list :x))
+    (list "immediate-apply"
+          "(let [a (atom (list))] ((fn [x y] (swap! a conj :called)) (swap! a conj :a) (swap! a conj :b)) (deref a))"
+          (list :called :a :b))
+    (list "apply-through-list"
+          "(let [a (atom (list))] (erlang/apply (fn [x y] (swap! a conj :called)) (list (swap! a conj :a) (swap! a conj :b))) (deref a))"
+          (list :called :a :b))))
+
+(deftest effect-order-is-observed-and-unchanged
+  (testing "the lowered beam observes exactly the reference sequence"
+    (doseq [[tag src sequence] order-corpus]
+      (let [low (lowered tag src (list))
+            ref (reference tag src (list))]
+        (load-beam! low (str tag "-l"))
+        (load-beam! ref (str tag "-r"))
+        (let [low-v (erlang/apply (elem low 0) :run (list))
+              ref-v (erlang/apply (elem ref 0) :run (list))]
+          (is (= (tuple :value sequence) (tuple :value low-v))
+              (str tag ": the lowered observation moved"))
+          (is (erlang/== low-v ref-v) (str tag ": lowered and reference disagree")))))))
+
+(deftest exceptions-and-shadowing-are-unchanged
+  (testing "the same fixture answers or raises identically either way"
+    (doseq [[tag src params locals args] (list
+            (list "badarg-int" "(erlang/list_to_tuple xs)" (list {:pop :pvar :name "xs"}) {"xs" "xs"} (list 42))
+            (list "badarg-bin" "(erlang/list_to_tuple xs)" (list {:pop :pvar :name "xs"}) {"xs" "xs"} (list "nope"))
+            (list "shadow-list"
+                  "(let [list (fn [& xs] :shadowed)] (erlang/list_to_tuple (list 1 2)))" (list) {} (list))
+            (list "shadow-tuple"
+                  "(let [tuple (fn [& xs] :nope)] (tuple 1 2))" (list) {} (list)))]
+      (let [low (lowered (str tag "L") src params locals)
+            ref (reference (str tag "R") src params locals)]
+        (is (erlang/== (observe low (str tag "-l") args) (observe ref (str tag "-r") args))
+            tag)))))
+
+; ── visit count: the pass is linear, not quadratic ──────────────────
+
+(defn- drain
+  "Count `:call` trace messages until `:finish`, then report the total."
+  [parent counts]
+  (receive
+    [:trace _pid _kind _mfa] (drain parent (inc counts))
+    :finish (erlang/send parent (tuple :done counts))
+    _ (drain parent counts)))
+
+(defn- probe-calls
+  "How many calls into the PROBE MODULE this process makes while `thunk` runs —
+   the pass's visit count, with the Core backend (a different module) excluded."
+  [thunk]
+  (let [parent (erlang/self)
+        tracer (erlang/spawn (fn [] (drain parent 0)))
+        pattern (tuple (probe-mod) :_ :_)]
+    (erlang/trace_pattern pattern true (list :local))
+    (erlang/trace (erlang/self) true (list :call (tuple :tracer tracer)))
+    (try
+      (thunk)
+      (finally
+        (erlang/trace (erlang/self) false (list :call))
+        (erlang/trace_pattern pattern false (list :local))
+        (erlang/trace_delivered (erlang/self))
+        (receive [:trace_delivered _ref _] nil (after 5000 nil))
+        (erlang/send tracer :finish)))
+    (receive [:done n] n (after 5000 -1))))
+
+(defn- nested-fn-src
+  "`(fn [] (fn [] … 1))`, `depth` levels deep — no level names its own self, so
+   every level is a scaffold the removed dead-binding drop used to rescan."
+  [depth]
+  (Enum/reduce (range depth) "1" (fn [_ acc] (str "(fn [] " acc ")"))))
+
+(deftest deep-non-recursive-closures-are-visited-once
+  (testing "4x the nesting must cost ~2x the visits, never ~4x"
+    (probe-mod)
+    (let [c40 (probe-calls (fn [] (lowered "deep40" (nested-fn-src 40) (list))))
+          c80 (probe-calls (fn [] (lowered "deep80" (nested-fn-src 80) (list))))]
+      (is (> c40 0) "the probe really ran")
+      (is (< c80 (* 3 (max c40 50)))
+          (str "40 nested closures visited " c40 " times, 80 -> " c80
+               "; a single pass is ~2x, the removed body rescan was ~4x")))))

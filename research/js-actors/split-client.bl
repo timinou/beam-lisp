@@ -1,0 +1,316 @@
+; split-client.bl — the BROWSER half of every `split/defapp` app.
+;
+; Generic, like the BEAM authority (priv/lib/split/core.bl): it names no app function. The build compiles
+; it with the app's client closure (only what the view, the local reducer, the
+; shared checks and the predictions reach) and a generated glue file that
+; supplies
+;
+;   (split-contract) (split-digest)
+;   (split-client-init)          the app's :client :init
+;   (split-client-view b l s)    the app's :view — the whole screen as data
+;   (split-client-on l e)        the app's :on — {:local l' :intent [op args]?}
+;   (split-check op b a)         the intent's shared :check
+;   (split-predict op b a)       the intent's :predict (the board it expects),
+;                                or nil for an intent that declares none
+;   (split-agrees? op p c)       does the confirmed board `c` agree with the
+;                                prediction `p`? The intent's :agrees?, or `=`
+;                                — an app whose prediction cannot know a
+;                                server-chosen value (a new id) says what
+;                                "the same" means
+;
+; WHAT THIS ACTOR OWNS: the last CONFIRMED board (only ever a board the server
+; sent, newer and of the declared snapshot type), this tab's local state, and
+; the sync record the view reads. It never invents a confirmed board.
+;
+; WHAT THE VIEW SEES: the confirmed board with every pending intent's
+; PREDICTION applied in order — so an edit shows at once, before the server
+; has answered. `sync` carries `:confirmed` (the board the server last
+; confirmed), `:pending` (each with `:state` :queued or :sent), `:link`
+; (:up/:down), `:note` and `:revision`, so a view can mark what is not yet
+; confirmed. A prediction is a guess: when the server refuses, the intent
+; leaves `:pending` and its prediction simply stops being applied (the row
+; slides back); when the server's board differs from the prediction, the
+; server's wins and the step is reported as `:diverged`.
+;
+; ONE UI EVENT:
+;   1. the app's :on reduces it — typing and filtering stop here;
+;   2. an intent is checked (wire type, shared :check against the board this
+;      tab SHOWS) — a refusal keeps the previous local state and shows
+;      `{:where :client :reason …}`;
+;   3. otherwise it joins the QUEUE.
+;
+; THE QUEUE sends one intent at a time, oldest first, and only while the link
+; is up. Just before sending, the head is checked again against the confirmed
+; board — every intent before it has resolved, so that is the board the
+; server will check. Each proposal carries a NONCE (this tab's id and the
+; request number), stable across resends: the server commits a nonce at most
+; once, so an intent whose answer was lost can be sent again safely.
+;
+;   ok               the head leaves the queue; the next one is sent
+;   stale-revision   another tab committed first: adopt the newer board, and
+;                    the head is checked and sent again (a bounded rebase)
+;   refused          the head leaves the queue; its local change is undone
+;                    unless the user has typed since; the reason is shown
+;   no answer        the link is down: the head goes back to :queued; new
+;                    intents keep queuing, shown at once; `:online` sends
+;                    them, in order
+;
+; WHO AND WHAT HAPPENED (apps with :people / :history). `sync` also carries
+; `:me` (the signed-in person, or nil: a read-only viewer), `:people` (the
+; roster), `:online` (who has the app open), `:recent` (the activity feed, the
+; server's words for the last commits) and `:history` ({:undo entry :redo
+; entry}: what undo/redo would do next). All of it arrives from the server;
+; the browser decides none of it.
+;
+; VIEW AS OF (apps with :history). `[:browser :asof {:revision k :board b}]`
+; — a past board the server kept — makes the view render `b`, read-only, with
+; `sync :asof k`; any intent proposed meanwhile is refused here
+; (`:viewing-history`). `:asof` with no board returns to the live board.
+;
+; Every step is also emitted as a `:trace` value so the page can show where it
+; ran.
+
+(defn split-max-pending [] 32)
+(defn split-max-tries [] 3)
+
+(defn split-note [where reason] {:where where :reason reason})
+
+(defn split-predicted
+  "The board this tab shows: `board` with every pending prediction applied in
+   order. An intent with no :predict, or whose prediction would not be a
+   well-typed snapshot, changes nothing."
+  [contract board pending]
+  (reduce (fn [b p]
+            (let [nb (split-predict (:op p) b (:args p))]
+              (if (and (some? nb) (wire-snapshot-ok? contract nb)) nb b)))
+          board pending))
+
+(defn split-frame-sync
+  "The server-owned parts of `sync` a frame may carry: the activity feed and
+   the undo/redo summary. A frame without them leaves them as they were."
+  [sync frame]
+  (assoc sync
+         :recent (if (contains? frame :recent) (:recent frame) (:recent sync))
+         :history (if (contains? frame :history) (:history frame) (:history sync))))
+
+(defn split-render [contract board local sync]
+  (let [past (:asof-board sync)]
+    (host/emit :view {:revision (:revision sync)
+                      :tree (split-client-view (if (some? past) past (split-predicted contract board (:pending sync)))
+                                               local (dissoc (assoc sync :confirmed board) :asof-board))})))
+
+(defn split-adopt
+  "The newer of two confirmed boards: the incoming one only if its revision
+   advances and it satisfies the snapshot type."
+  [contract board revision incoming-board incoming-revision]
+  (if (and (int? incoming-revision) (< revision incoming-revision)
+           (wire-snapshot-ok? contract incoming-board))
+    [incoming-board incoming-revision]
+    [board revision]))
+
+(defn split-restore
+  "The local state after intent `p` finally fails. The event that proposed it
+   also moved the local state (a submit clears the draft); that move is undone
+   ONLY if nothing happened since — newer typing is never overwritten."
+  [local p]
+  (if (and (some? (:after p)) (= local (:after p))) (:before p) local))
+
+(defn split-enqueue
+  "Check one intent against the board this tab shows and queue it. Answers
+   `[:queued sync']`, or `[:refused reason]` when it never joins the queue.
+   `before`/`after` are the local states around the event (`split-restore`)."
+  [contract board sync op args before after]
+  (let [shown (split-predicted contract board (:pending sync))
+        problem (cond
+                  (nil? (wire-intent contract op)) :unknown-intent
+                  (not (wire-args-ok? contract op args)) :malformed-args
+                  (<= (split-max-pending) (count (:pending sync))) :too-many-pending
+                  :else (split-check op shown args))]
+    (if (some? problem)
+      [:refused problem]
+      (let [req (inc (:next-request sync))]
+        [:queued (assoc sync :next-request req :note nil
+                             :pending (conj (:pending sync)
+                                            {:request req :op op :args args :tries 0 :state :queued
+                                             :before before :after after}))]))))
+
+(defn split-pump
+  "Send the head of the queue if the link is up and nothing is in flight.
+   A head the confirmed board no longer allows is dropped (its local change
+   undone) and the next one is tried. Answers `[local sync]`."
+  [contract board local sync]
+  (let [pending (:pending sync)
+        head (first pending)]
+    (if (or (nil? head) (= :down (:link sync)) (= :sent (:state head)))
+      [local sync]
+      (let [problem (split-check (:op head) board (:args head))]
+        (if (some? problem)
+          (do
+            (host/emit :trace {:step :rebase-refused :op (:op head) :reason problem})
+            (split-pump contract board (split-restore local head)
+                        (assoc sync :pending (vec (rest pending)) :note (split-note :client problem))))
+          (let [proposal {:request (:request head) :revision (:revision sync) :digest (split-digest)
+                          :nonce (str (:tab sync) ":" (:request head)) :op (:op head) :args (:args head)}]
+            (do
+              (host/emit :propose proposal)
+              (host/emit :trace {:step :proposed :op (:op head) :request (:request head)
+                                 :revision (:revision sync) :retry (< 0 (:tries head))})
+              [local (assoc sync :pending (into [(assoc head :state :sent :sent-board board
+                                                              :sent-revision (:revision sync))]
+                                                (rest pending)))])))))))
+
+(defn split-settle
+  "One answer for the in-flight head: `[board local sync]` after it."
+  [contract board local sync res]
+  (let [head (first (:pending sync))
+        adopted (split-adopt contract board (:revision sync) (:board res) (:revision res))
+        b (first adopted)
+        s0 (assoc sync :revision (nth adopted 1))
+        others (vec (rest (:pending sync)))]
+    (cond
+      (= true (:ok res))
+        (let [expected (split-predict (:op head) (:sent-board head) (:args head))
+              ; only a commit right on top of the board it was predicted
+              ; from is comparable; a duplicate answer carries no commit
+              diverged (and (some? expected) (not (= true (:duplicate res)))
+                            (= (:revision res) (inc (:sent-revision head)))
+                            (not (split-agrees? (:op head) expected (:board res))))]
+          (do
+            (host/emit :trace {:step :confirmed :op (:op head) :request (:request head)
+                               :revision (:revision res) :duplicate (= true (:duplicate res))})
+            (if diverged (host/emit :trace {:step :diverged :op (:op head) :request (:request head)}) nil)
+            (let [r (split-pump contract b local
+                                (assoc s0 :pending others
+                                          :note (if diverged (split-note :adjusted (:op head)) (:note s0))))]
+              [b (first r) (nth r 1)])))
+      (and (= :stale-revision (:reason res)) (< (:tries head) (split-max-tries)))
+        ; another tab won the race: the same intent, checked again on the
+        ; newer board, goes out again
+        (do
+          (host/emit :trace {:step :rebased :op (:op head) :revision (nth adopted 1)})
+          (let [r (split-pump contract b local
+                              (assoc s0 :pending (into [(assoc head :state :queued :tries (inc (:tries head)))]
+                                                       others)))]
+            [b (first r) (nth r 1)]))
+      :else
+        (do
+          (host/emit :trace {:step :server-refused :op (:op head) :reason (:reason res)})
+          (let [r (split-pump contract b (split-restore local head)
+                              (assoc s0 :pending others :note (split-note :server (:reason res))))]
+            [b (first r) (nth r 1)])))))
+
+(defn split-in-flight? [sync request]
+  (let [head (first (:pending sync))]
+    (and (some? head) (= :sent (:state head)) (= request (:request head)))))
+
+(defn split-client-main []
+  (let [contract (split-contract)]
+    (rt-register-input!)
+    (host/emit :ready {:digest (split-digest)})
+    (receive
+      [:browser :hello hello]
+        (cond
+          (not (and (map? hello) (= (split-digest) (:digest hello)) (string? (:tab hello))))
+            (host/emit :fatal {:reason :contract-mismatch})
+          (not (wire-snapshot-ok? contract (:board hello)))
+            (host/emit :fatal {:reason :bad-snapshot})
+          :else
+            (let [local0 (split-client-init)
+                  sync0 {:pending [] :note nil :revision (:revision hello) :next-request 0
+                         :link :up :tab (:tab hello)
+                         :me (:me hello) :people (or (:people hello) []) :online []
+                         :recent (or (:recent hello) []) :history (or (:history hello) {})}]
+              (do
+                (split-render contract (:board hello) local0 sync0)
+                (loop [board (:board hello) local local0 sync sync0]
+                  (receive
+                    [:browser :event event]
+                      (let [out (split-client-on local event)
+                            next-local (:local out)
+                            intent (:intent out)]
+                        (if (nil? intent)
+                          (do
+                            (host/emit :trace {:step :local :event (first event)})
+                            (split-render contract board next-local sync)
+                            (recur board next-local sync))
+                          (let [op (first intent)
+                                r (if (some? (:asof sync)) [:refused :viewing-history]
+                                    (split-enqueue contract board sync op (nth intent 1) local next-local))]
+                            (if (= :refused (first r))
+                              (let [s (assoc sync :note (split-note :client (nth r 1)))]
+                                (do
+                                  (host/emit :trace {:step :client-refused :op op :reason (nth r 1)})
+                                  (split-render contract board local s)
+                                  (recur board local s)))
+                              (let [q (nth r 1)
+                                    _ (if (= :down (:link q))
+                                        (host/emit :trace {:step :queued :op op :count (count (:pending q))})
+                                        nil)
+                                    p (split-pump contract board next-local q)]
+                                (do
+                                  (split-render contract board (first p) (nth p 1))
+                                  (recur board (first p) (nth p 1))))))))
+                    [:browser :snapshot snap]
+                      (let [adopted (split-adopt contract board (:revision sync) (:board snap) (:revision snap))
+                            s (assoc (if (= (:revision sync) (nth adopted 1)) sync (split-frame-sync sync snap))
+                                     :revision (nth adopted 1))]
+                        (do
+                          (if (= (:revision sync) (nth adopted 1))
+                            nil
+                            (host/emit :trace {:step :snapshot :revision (nth adopted 1) :op (:op snap)}))
+                          (split-render contract (first adopted) local s)
+                          (recur (first adopted) local s)))
+                    [:browser :result res]
+                      (if (not (split-in-flight? sync (:request res)))
+                        (recur board local sync)
+                        (let [r (split-settle contract board local
+                                              (if (< (:revision sync) (:revision res)) (split-frame-sync sync res) sync)
+                                              res)]
+                          (do
+                            (split-render contract (first r) (nth r 1) (nth r 2))
+                            (recur (first r) (nth r 1) (nth r 2)))))
+                    [:browser :unreachable request]
+                      ; no authoritative answer: never assumed committed. The
+                      ; intent waits at the head of the queue for the link;
+                      ; its nonce makes the resend safe if it DID commit.
+                      (if (not (split-in-flight? sync request))
+                        (recur board local sync)
+                        (let [head (first (:pending sync))
+                              s (assoc sync :link :down :note (split-note :link :offline)
+                                            :pending (into [(assoc head :state :queued)] (rest (:pending sync))))]
+                          (do
+                            (host/emit :trace {:step :queued :op (:op head) :count (count (:pending s))})
+                            (split-render contract board local s)
+                            (recur board local s))))
+                    [:browser :asof q]
+                      (let [s (if (and (map? q) (int? (:revision q)) (wire-snapshot-ok? contract (:board q)))
+                                (assoc sync :asof (:revision q) :asof-board (:board q) :note nil)
+                                (dissoc (dissoc sync :asof) :asof-board))]
+                        (do
+                          (host/emit :trace {:step :asof :revision (:asof s)})
+                          (split-render contract board local s)
+                          (recur board local s)))
+                    [:browser :presence p]
+                      (let [s (assoc sync :online (or (:people p) []))]
+                        (do
+                          (split-render contract board local s)
+                          (recur board local s)))
+                    [:browser :offline _]
+                      (let [s (assoc sync :link :down)]
+                        (do
+                          (split-render contract board local s)
+                          (recur board local s)))
+                    [:browser :online _]
+                      (let [s0 (assoc sync :link :up
+                                           :note (if (= :link (:where (:note sync))) nil (:note sync)))
+                            p (split-pump contract board local s0)]
+                        (do
+                          (host/emit :trace {:step :online :count (count (:pending s0))})
+                          (split-render contract board (first p) (nth p 1))
+                          (recur board (first p) (nth p 1))))
+                    [:browser :stop _]
+                      (host/emit :stopped {})
+                    [:browser _topic _payload]
+                      (recur board local sync))))))
+      [:browser :stop _]
+        (host/emit :stopped {}))))

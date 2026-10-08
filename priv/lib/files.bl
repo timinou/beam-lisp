@@ -1,51 +1,175 @@
+; files.bl — the FILE domain: a schema for remote files kept as facts, the folder
+; closure as a derived relation, and the computed relation that asks providers.
+;
+; ── The division of labour (docs/connectors/entities-and-projections.md §1) ─
+;
+;   :~file/files     COMPUTED  [?f]        which files providers list NOW
+;   :~file/under     DERIVED   [?f ?root]  transitive folder membership over the
+;                                          MIRROR (facts a keep wrote)
+;   :file/*          FACTS                 name, parent, revision, … on the entity
+;
+; A computed relation carries IDENTITY only (rule R1): attributes are datoms,
+; read with ordinary clauses or pull, so a new field never changes a relation's
+; arity. Browsing a folder is `connector.google.gdrive/children` (a call that
+; writes nothing); keeping is mirrored (R2, connector.keep).
+;
+; Identity is `[provider namespace remote-id]` (§2): the namespace is where the
+; provider guarantees uniqueness, never "the account that saw it".
+
 (ns files
-  (:require [datom.query.relation]
+  (:require [datom] [datom.db] [datom.query.relation]
             [connector :as conn]
-            [connector.google.gdrive]))
+            [connector.google.gdrive :as gdrive]))
 
-;; ── the domain, beside the service ───────────────────────────────────
-;
-; `:file/*` is already owned by `datom.file` (the DFile half). This module adds
-; the RELATION over it, so a query can reach a synced file the same way it
-; reaches a local one. The attributes live there and not here on purpose: a
-; file that arrived over HTTP and one that arrived on disk must be THE SAME
-; ENTITIES, and they cannot be if their schemas are two.
-;
-; The projection each provider promises is `[entity name when]` — the minimum
-; that makes a file findable. Content, size and checksum are what a mirror adds
-; when it has the bytes; a listing does not.
+(def providers [gdrive/spec])
 
-(def providers [connector.google.gdrive/spec])
+;; ── the mirror schema ───────────────────────────────────────────────────────
+
+(def schema
+  "The facts a keep writes about a remote file or folder. `:file/parent` is ONE
+   ref: Drive now allows a single parent, and a legacy multi-parent file is
+   narrowed to its first by the feed."
+  [{:db/ident :conn/key       :db/valueType :db.type/term :db/unique :db.unique/identity}
+   {:db/ident :file/name      :db/valueType :db.type/string}
+   {:db/ident :file/parent    :db/valueType :db.type/ref :db/index true}
+   {:db/ident :file/folder?   :db/valueType :db.type/boolean}
+   {:db/ident :file/mime      :db/valueType :db.type/string}
+   {:db/ident :file/rev       :db/valueType :db.type/string}
+   {:db/ident :file/size      :db/valueType :db.type/long}
+   {:db/ident :file/modified  :db/valueType :db.type/long}
+   {:db/ident :file/md5       :db/valueType :db.type/string}
+   {:db/ident :file/trashed   :db/valueType :db.type/boolean}
+   {:db/ident :file/gone      :db/valueType :db.type/boolean}])
+
+(def under-rules
+  "The folder closure as datalog rules — the portable form, usable inside any
+   query as `(under ?f ?root)` by passing these as `%`."
+  '[[(under ?f ?r) [?f :file/parent ?r]]
+    [(under ?f ?r) [?f :file/parent ?p] (under ?p ?r)]])
+
+(defn- dead? [db e]
+  (or (seq (into [] (datom/datoms db :eavt e :file/trashed)))
+      (seq (into [] (datom/datoms db :eavt e :file/gone)))))
+
+(defn descendants
+  "Every entity under folder `root` in `db`, as a vector of eids — a
+   breadth-first walk of the `:file/parent` VAET index, ONE store request per
+   LEVEL (`datoms-many` over the whole frontier). Measured on a 5 000-node,
+   depth-10 tree: ~0.7 s, against ~3.3 s for the recursive-rule fixpoint — the
+   fixpoint re-derives joins per iteration, while a closure over one ref
+   attribute is exactly a frontier walk. Cycles (a corrupt mirror) terminate:
+   a node is expanded once.
+
+   `live?` true PRUNES: a trashed or gone node is neither returned nor walked
+   into, so nothing under a trashed folder counts — what a reader of the
+   folder sees. false is the STRUCTURAL closure a keep needs (children of a
+   trashed folder are still kept, and reappear on untrash)."
+  ([db root] (descendants db root false))
+  ([db root live?]
+   ;; one EAGER reduce per level: a lazy filter/remove chain over the growing
+   ;; seen-set measured ~5x slower here than the scan it filters
+   (loop [frontier [root] seen #{root} out []]
+     (if (empty? frontier) out
+       (let [[seen2 kids]
+             (reduce (fn [[sn ks] d]
+                       (let [k (nth d 0)]
+                         (if (or (contains? sn k) (and live? (dead? db k))) [(conj sn k) ks]
+                           [(conj sn k) (conj ks k)])))
+                     [seen []]
+                     (datom.db/datoms-many db :vaet (mapv (fn [p] [p :file/parent]) frontier)))]
+         (recur kids seen2 (into out kids)))))))
+
+(defn ancestors
+  "The folders above entity `f`, nearest first — one EAVT read per level."
+  [db f]
+  (loop [x f seen #{f} out []]
+    (let [p (let [ds (into [] (datom/datoms db :eavt x :file/parent))]
+              (if (empty? ds) nil (nth (first ds) 2)))]
+      (if (or (nil? p) (contains? seen p)) out
+        (recur p (conj seen p) (conj out p))))))
+
+(defn- provider
+  "`:~file/under` / `:~file/live-under` in the mode the query demanded:
+   `bounds` = {:e file :v root}.
+     :fb  root bound → every descendant  [?f root]   (the sync question)
+     :bf  file bound → every ancestor    [file ?r]
+     :bb  both       → probe via the (short) ancestor chain
+     :ff  neither    → the whole closure, via the rules (structural only)
+   `live?` prunes trashed/gone nodes (and, for :bf/:bb, stops at the first
+   dead ancestor: a file inside a trashed folder is under nothing live)."
+  [live?]
+  (fn [db mode bounds args]
+    (let [f (get bounds :e) r (get bounds :v)
+          anc (fn [x] (let [as (ancestors db x)]
+                        (if (not live?) as
+                          (if (dead? db x) []
+                            (into [] (take-while (fn [a] (not (dead? db a))) as))))))]
+      (cond
+        (and (some? f) (some? r)) (if (some (fn [a] (= a r)) (anc f)) [[f r]] [])
+        (some? r) (mapv (fn [x] [x r]) (descendants db r live?))
+        (some? f) (mapv (fn [x] [f x]) (anc f))
+        ;; NEITHER bound: the planner may place this clause before the one
+        ;; that binds its root (measured: `[?s :mount/root ?r] [?f
+        ;; :~file/live-under ?r]` reached the provider with both slots free).
+        ;; Every entity with a parent, paired with its ancestors — through
+        ;; `anc`, so the live variant prunes here too. The rule fixpoint that
+        ;; stood here ignored `live?` and let a trashed file count as live
+        ;; (found by the drive-sync model, shrunk to [add, trash]).
+        :else
+          (into [] (mapcat (fn [d] (let [x (nth d 0)] (map (fn [a] [x a]) (anc x))))
+                           (datom/datoms db :aevt :file/parent)))))))
+
+(defn register-under!
+  "Register `:~file/under` (structural) and `:~file/live-under` (pruning
+   trashed/gone) over the mirror. Idempotent. `:reads` names every attribute an
+   answer depends on, so a datom/watch on a query using either fires on a
+   parent-only move or a folder being trashed (BUG-100's lesson)."
+  []
+  (datom.query.relation/register-relation! :~file/under
+    {:arity 2 :modes #{:bf :fb :bb :ff} :extension :derived
+     :maintenance :recompute
+     :reads #{:file/parent}
+     :doc "transitive folder membership over mirrored :file/parent facts"
+     :provider (provider false)})
+  (datom.query.relation/register-relation! :~file/live-under
+    {:arity 2 :modes #{:bf :fb :bb} :extension :derived
+     :maintenance :recompute
+     :reads #{:file/parent :file/trashed :file/gone}
+     :doc "membership a reader sees: :~file/under pruned at trashed or gone nodes"
+     :provider (provider true)}))
+
+;; ── computed: what providers list right now ─────────────────────────────────
 
 (def DEFAULT-LIMIT
-  "How many files a bare query may pull — the same ceiling as `msg`, for the
-   same reason: an unbound relation that fetches everything looks identical to
-   one that fetches nothing, and only one of them costs a quota."
+  "How many files a bare query may pull — an unbound relation that fetches
+   everything looks identical to one that fetches nothing, and only one of them
+   costs a quota."
   20)
 
-(defn- fetch-all [aspect opts]
-  (let [cs (conn/connections-for aspect)
+(defn- fetch-all [opts]
+  (let [cs (conn/connections-for :~file/files)
         opts (if (nil? (get opts :limit)) (assoc opts :limit DEFAULT-LIMIT) opts)]
-    (if (empty? cs)
-      []
-      (vec (mapcat
-             (fn [c]
-               (if (= :gdrive (:id (:spec c)))
-                 (let [r (connector.google.gdrive/fetch c opts)]
-                   (if (= :error (first (keys r))) [] (get r :ok)))
-                 []))
-             (to-list cs))))))
+    (vec (mapcat
+           (fn [c]
+             (if (= :gdrive (:id (:spec c)))
+               (let [r (gdrive/fetch c opts)]
+                 (if (= :error (first (keys r))) [] (get r :ok)))
+               []))
+           (to-list cs)))))
 
 (defn register!
-  "Register `:~file/files`. Idempotent. Call before the first query — a
-   function rather than a top-level call, for the reason `msg/register!` gives:
-   an AOT-compiled namespace does not re-run its top-level effects on load."
+  "Register `:~file/files` — `[?f]`, the entity keys of the files every
+   provisioned drive lists — and `:~file/under`. Names, times and sizes are
+   ATTRIBUTES: read them from a mirror, or call `gdrive/fetch` for the maps.
+   Idempotent; call before the first query (an AOT namespace does not re-run
+   top-level effects)."
   []
   (datom.query.relation/register-relation!
     :~file/files
-    {:arity 3
-     :modes #{:bf}
+    {:arity 1
+     :modes #{:ff :bf}
      :maintenance :recompute
-     :doc "files from every provisioned drive connection, as [entity name when]"
+     :doc "files from every provisioned drive connection, as [entity-key]"
      :provider (fn [db mode bounds args]
-                 (fetch-all :~file/files {}))}))
+                 (mapv (fn [f] [(:key f)]) (fetch-all {})))})
+  (register-under!))

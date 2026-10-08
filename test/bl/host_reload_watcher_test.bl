@@ -1,0 +1,839 @@
+; host_reload_watcher_test.bl — the pinned reload watcher, diffed against the live
+; module.
+;
+; `priv/host/reload_watcher.bl` is the `.bl` port of
+; `lib/beam_lisp/reload_watcher.ex`, compiled by `BeamLisp.AOT/compile_host_file`
+; into the exact atom `Elixir.BeamLisp.ReloadWatcher` — functions-only, carrying
+; `-behaviour(GenServer)` because the live module `use`s GenServer.
+;
+; Nothing here replaces the live module in the warm VM: the source is compiled at
+; its OWN probe atom, the namespace shim beside it is dropped, and the pinned
+; beam is loaded ALONE — so a leftover shim reference would be `undef`. The live
+; module is the ground truth, and every observation runs through BOTH.
+;
+; What each block pins:
+;
+;   * THE SURFACE — the pinned beam's exports against the live module's: the
+;     GenServer API (`start_link/1`, `init/1`, `handle_call/3`, `handle_info/2`,
+;     `handle_cast/2`, `code_change/3`, `terminate/2`, `child_spec/1`), the
+;     public controls (`drain/0,1`, `sync/0,1,2`) and the reload seam
+;     (`apply_change/1,2,3`), and NOTHING else. The private helpers
+;     (`wait_for_events`, `defer`, `arm`, `start_debounce`, `stop`, `flush`,
+;     `notify`, `handle_bl_change`, `watches?`, `file_source`, `escape_bl_string`)
+;     must NOT escape as exports, because the live module's are private — a
+;     pinned file's top-level defns ARE its exports, which is why the port
+;     rebuilds each helper as a local closure. The `-behaviour` attribute and
+;     the seed option contract are pinned too, and a rebuild must be the same
+;     bytes (the seed records a sha256 per host beam).
+;
+;   * THE CALLBACKS, DIRECTLY. `handle_call/3`, `handle_info/2`, `terminate/2`,
+;     `code_change/3`, `handle_cast/2` and `child_spec/1` are invoked on a
+;     FABRICATED state, so each branch is exercised exactly: the watched-suffix
+;     filter, the own-FileSystem-pid match, the flush of a held path, a deleted
+;     path reported `:removed`, the monitor-ref `:DOWN`, and the ref mismatch
+;     that must fall through to the catch-all. Function-clause refusals are
+;     compared as folded values (class and message).
+;
+;   * THE LIVE SERVER. Both modules are started as REAL GenServers — isolated
+;     registered names of THIS suite's own (`bl_host_rw_*`) — over an EMPTY
+;     watched directory, with the files they observe written in a SIBLING
+;     directory, so the real inotify backend cannot add an event the corpus did
+;     not send. Synthetic `{:file_event, fs, …}` messages carry the watcher's
+;     OWN fs pid (the handler accepts no other sender), so a save's multiplicity
+;     is exact: a five-event burst applies ONCE, an unwatched suffix never
+;     applies, a deleted file reports `:removed` once, and killing the quiet-
+;     window owner flushes what it held. `drain/1` is the barrier; `sync/2`
+;     waits for a real event to arrive and then drains; the state's keys and
+;     scrubbed values are compared observation for observation. Every process
+;     started here is stopped before the block returns.
+;
+;   * THE RELOAD DISPATCH. `apply_change/3` drives the same stage→commit a save
+;     runs: a coherent edit lands, an incoherent one is HELD with the old code
+;     serving, `commit? false` stages without applying, and an explicit commit
+;     applies it. Live and probe answer the same status maps and leave the same
+;     image.
+;
+;   * THE PRODUCTION ATOM. The pinned beam is loaded AT `BeamLisp.ReloadWatcher`,
+;     exercised (server + dispatch), and the live beam is restored.
+;
+;   * AN ISOLATED CHILD VM, REAL INOTIFY. A fresh VM boots the application,
+;     resolves the pinned beam from a scratch ebin, and drives BOTH modules over
+;     a REAL watched directory: an editor-style truncate+write pair is folded
+;     into ONE flush, and an unwatched suffix is never applied. The child owns
+;     its temp directory and its own FileSystem ports, so no editor or user
+;     watcher is involved; the timing bound is generous because inotify backend
+;     warmup is an OS fact, not reload logic.
+;
+; The observation is normalized on two axes only: the PROBE ATOM → the live atom
+; (in a message, an atom field and a `FunctionClauseError`'s `module`), and PIDS
+; / REFERENCES / FUNS → `:pid` / `:ref` / `[:fun arity]`, because a fresh process
+; per run cannot be compared by identity.
+;
+; Run: bin/bl test test/bl/host_reload_watcher_test.bl
+
+(ns host.reload_watcher.test
+  (:require [reload]))
+
+(defn- t2 [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- tmp-dir []
+  (let [d (str (System/tmp_dir) "/bl_host_rw_" (erlang/unique_integer (list :positive)))]
+    (File/mkdir_p! d)
+    d))
+
+(defn- src [] (Path/join (BeamLisp/cwd) "priv/host/reload_watcher.bl"))
+
+(def ^:private probe :Elixir.BeamLisp.HostReloadWatcherProbe)
+(def ^:private shim :Elixir.BeamLisp.Ns.Host.ReloadWatcher)
+(def ^:private live :Elixir.BeamLisp.ReloadWatcher)
+
+; The registered names THIS suite mints. They belong to the suite and to no
+; other process, which is what keeps a probe run and a live run — and both of
+; them and any real watcher — out of each other's way.
+(def ^:private live-name :bl_host_rw_live)
+(def ^:private probe-name :bl_host_rw_probe)
+
+; ── compile and publish the pinned beam ─────────────────────────────────────
+
+(defn- drop! [mod]
+  (do (code/purge mod) (code/delete mod) :ok))
+
+(defn- seed-opts
+  "The option list the seed's `host-opts` builds for this host entry:
+   `:module`/`:output_dir`/`:file`/`:source_hash`/`:behaviour`/`:load? false`."
+  [mod dir]
+  (list (t2 :module mod)
+        (t2 :output_dir dir)
+        (t2 :file (src))
+        (t2 :source_hash (crypto/hash :sha256 (File/read! (src))))
+        (t2 :behaviour :"Elixir.GenServer")
+        (t2 :load? false)))
+
+(defn- compile-at
+  "Compile the pinned source at exact atom `mod`, then publish ONLY the pinned
+   beam: the compile's own load (and the namespace shim it built beside it) is
+   dropped first, so every call below runs against the pinned code alone."
+  [mod dir]
+  (let [res (BeamLisp.AOT/compile_host_file (src) (seed-opts mod dir))
+        path (erlang/element 2 res)]
+    (drop! mod)
+    (code/load_binary mod (erlang/binary_to_list path) (File/read! path))
+    (drop! shim)
+    mod))
+
+(defn- exports [mod]
+  (Enum/sort (erlang/apply mod :module_info (list :exports))))
+
+(defn- functional-exports
+  "What a pinned beam's surface is measured against: `__info__/1` is generated
+   by the Elixir compiler for every Elixir module and is NOT part of the ABI a
+   pinned (functions-only) port carries."
+  [mod]
+  (Enum/sort (filter (fn [e] (not (erlang/== :__info__ (erlang/element 1 e)))) (exports mod))))
+
+; ── normalization ─────────────────────────────────────────────────────────
+
+(defn- norm
+  "The observation with the by-design differences erased: the probe atom becomes
+   the production atom, a fresh pid `:pid`, a fresh reference `:ref` and a fun
+   `[:fun arity]` (the two modules' funs are different funs). The walk is
+   structural — maps, tuples and lists included — because a state map carries a
+   pid, a ref and two closures at once."
+  [v]
+  (cond
+    (erlang/is_pid v) :pid
+    (erlang/is_reference v) :ref
+    (erlang/is_function v) (tuple :fun (erlang/fun_info v :arity))
+    (erlang/== v probe) live
+    (erlang/is_map v)
+    (maps/from_list
+      (Enum/map (maps/to_list v)
+        (fn [pair] (tuple (norm (erlang/element 1 pair)) (norm (erlang/element 2 pair))))))
+    (erlang/is_tuple v)
+    (erlang/list_to_tuple (Enum/map (erlang/tuple_to_list v) (fn [x] (norm x))))
+    (erlang/is_list v) (Enum/map v (fn [x] (norm x)))
+    (erlang/is_binary v)
+    (String/replace
+      (String/replace
+        (String/replace v "BeamLisp.HostReloadWatcherProbe" "BeamLisp.ReloadWatcher")
+        "hrwl." "hrw.")
+      "hrwp." "hrw.")
+    (erlang/is_atom v)
+    (let [s (Atom/to_string v)]
+      (cond
+        (String/starts_with? s "hrwl.") (String/to_atom (String/replace s "hrwl." "hrw."))
+        (String/starts_with? s "hrwp.") (String/to_atom (String/replace s "hrwp." "hrw."))
+        :else v))
+    :else v))
+
+(defn- obs
+  "`[:ok value]` or `[:caught folded]`, normalized. The BL catch fold IS the
+   class signal: an `:error` binds its exception struct, an `:exit` binds
+   `{:exit, value}`, and a `:throw` stays raw."
+  [thunk]
+  (try [:ok (norm (thunk))]
+       (catch e [:caught (norm e)])))
+
+(defn- behaviour-attr
+  "The `-behaviour` attribute's value for `mod`, normalized to a LIST: Elixir
+   collects them (`[GenServer]`), a pinned host records the bare atom
+   (`GenServer`). `nil` when the module carries no such attribute."
+  [mod]
+  (let [v (first (map (fn [a] (erlang/element 2 a))
+                      (filter (fn [a] (erlang/== :behaviour (erlang/element 1 a)))
+                              (erlang/apply mod :module_info (list :attributes)))))]
+    (cond
+      (erlang/== nil v) nil
+      (erlang/is_list v) v
+      :else (list v))))
+
+(defn- state-of [name] (erlang/apply :sys :get_state (list name)))
+(defn- event-count [name] (erlang/apply :gen_server :call (list name :event_count)))
+
+(defn- bump
+  "Deliver ONE synthetic `{:file_event, fs, {path, events}}` from the watcher's
+   OWN filesystem process. The handler only accepts its own fs pid, so the
+   sender cannot be faked."
+  [name path event]
+  (let [fs (maps/get :fs (state-of name))]
+    (erlang/send name (tuple :file_event fs (tuple path (list event))))))
+
+(defn- burst [name path]
+  (doseq [ev (list :created :modified :modified :attrib :closed)]
+    (bump name path ev)))
+
+(defn- collect
+  "Drain this process's mailbox, answering the `:applied` and `:result`
+   notifications the injected seams sent, in arrival order.
+
+   ONE pass, because a `receive` that knew only one tag would consume the other
+   tag's messages through its catch-all and report them missing. The catch-all
+   additionally discards this suite's own junk (activity pings, monitor
+   `:DOWN`s) so a later receive is never blocked."
+  []
+  (loop [applied [] results []]
+    (receive
+      m (cond
+          (and (erlang/is_tuple m)
+               (erlang/== 2 (erlang/tuple_size m))
+               (erlang/== :applied (erlang/element 1 m)))
+          (recur (conj applied (erlang/element 2 m)) results)
+
+          (and (erlang/is_tuple m)
+               (erlang/== 2 (erlang/tuple_size m))
+               (erlang/== :result (erlang/element 1 m)))
+          (recur applied (conj results (erlang/element 2 m)))
+
+          :else (recur applied results))
+      (after 0 {:applied applied :result results}))))
+
+(defn- collect-tag
+  "Drain the mailbox of `[tag value]` pairs, answering the tagged values in
+   arrival order."
+  [tag]
+  (loop [acc []]
+    (receive
+      m (if (and (erlang/is_tuple m)
+                 (erlang/== 2 (erlang/tuple_size m))
+                 (erlang/== tag (erlang/element 1 m)))
+          (recur (conj acc (erlang/element 2 m)))
+          (recur acc))
+      (after 0 acc))))
+
+; ── the direct callback corpus: fabricated state, exact branches ─────────
+
+(defn- cb-state
+  "A fabricated watcher state for direct callback calls. `owner` is what
+   `:debounce` holds (the calling process, or `nil`), `ref` what
+   `:debounce_ref` holds; `apply-fn` records an apply."
+  [apply-fn owner ref]
+  {:fs :fsSENTINEL
+   :auto_commit false
+   :on_result nil
+   :apply apply-fn
+   :event_count 0
+   :last :idle
+   :pending (maps/new)
+   :debounce owner
+   :debounce_ref ref
+   :debounce_warned false
+   :quiet_ms 30})
+
+(defn- cb-corpus
+  "Every direct-callback observation for ONE module, in a fixed order. `real` is
+   a path that EXISTS on disk (so a flush applies it) and `gone` one that does
+   not (so a flush reports `:removed`)."
+  [mod real gone]
+  (let [me (erlang/self)
+        rec (fn [_s _p _c] (erlang/send me (tuple :cb-applied :x)) {:status :applied :applied (list) :errors (list)})
+        st (cb-state rec me :refSENT)
+        watched (tuple :file_event :fsSENTINEL (tuple real (list :modified)))
+        ignored (tuple :file_event :fsSENTINEL (tuple "/tmp/cb/ignored.txt" (list :modified)))
+        foreign (tuple :file_event :otherFs (tuple real (list :modified)))
+        stop (tuple :file_event :fsSENTINEL :stop)
+        down (tuple :DOWN :refSENT :process me :killed)
+        down-other (tuple :DOWN :otherRef :process me :killed)]
+    (list
+      ; handle_call
+      (obs (fn [] (erlang/apply mod :handle_call (list :event_count nil (assoc st :event_count 7)))))
+      (obs (fn [] (erlang/apply mod :handle_call (list :drain nil (assoc st :pending (maps/put real true (maps/new)))))))
+      (obs (fn [] (erlang/apply mod :handle_call (list :bogus nil st))))
+      ; handle_info — a watched path is recorded, the count rises, the owner is pinged
+      (obs (fn [] (erlang/apply mod :handle_info (list watched st))))
+      ; an ignored suffix is counted but never recorded
+      (obs (fn [] (erlang/apply mod :handle_info (list ignored st))))
+      ; a foreign filesystem pid is not ours -> catch-all
+      (obs (fn [] (erlang/apply mod :handle_info (list foreign st))))
+      ; the backend stopping is a no-op
+      (obs (fn [] (erlang/apply mod :handle_info (list stop st))))
+      ; a held path flushes on :flush_pending
+      (obs (fn [] (erlang/apply mod :handle_info (list :flush_pending (assoc st :pending (maps/put real true (maps/new)))))))
+      ; a DELETED path flushes as :removed
+      (obs (fn [] (erlang/apply mod :handle_info (list :flush_pending (assoc st :pending (maps/put gone true (maps/new)))))))
+      ; the owner's DOWN flushes and drops the pid + ref
+      (obs (fn [] (erlang/apply mod :handle_info (list down (assoc st :pending (maps/put real true (maps/new)))))))
+      ; another ref's DOWN falls through to the catch-all
+      (obs (fn [] (erlang/apply mod :handle_info (list down-other st))))
+      ; anything else is ignored
+      (obs (fn [] (erlang/apply mod :handle_info (list :whatever st))))
+      ; the generated defaults
+      (obs (fn [] (erlang/apply mod :code_change (list :old :st :extra))))
+      (obs (fn [] (erlang/apply mod :handle_cast (list :msg :st))))
+      ; terminate with no children is a no-op
+      (obs (fn [] (erlang/apply mod :terminate (list :normal st))))
+      ; child_spec
+      (obs (fn [] (erlang/apply mod :child_spec (list :arg)))))))
+
+; ── the live GenServer corpus ────────────────────────────────────────────
+
+(defn- server-opts [name watch-dir apply-fn on-result]
+  (list (t2 :dirs (list watch-dir))
+        (t2 :name name)
+        (t2 :apply apply-fn)
+        (t2 :on_result on-result)
+        (t2 :quiet_ms 300)))
+
+(defn- server-run
+  "The whole live-server corpus for ONE module. `watch-dir` is EMPTY and never
+   touched (so the real inotify backend contributes nothing); the files live in
+   `files-dir`. Every process started here is STOPPED before the block returns."
+  [mod name watch-dir files-dir]
+  (let [me (erlang/self)
+        applyf (fn [_s p _c]
+                 (erlang/send me (tuple :applied p))
+                 {:status :applied :applied (list) :errors (list)})
+        onres (fn [r] (erlang/send me (tuple :result r)))
+        f1 (Path/join files-dir "rf1.bl")
+        f2 (Path/join files-dir "rf2.txt")
+        f3 (Path/join files-dir "rf3.bl")]
+    (File/write! f1 "(ns rt.one)\n(defn v [] 1)\n")
+    (File/write! f2 "plain text, never watched")
+    (File/write! f3 "(ns rt.three)\n(defn v [] 3)\n")
+    (let [started (erlang/apply mod :start_link (list (server-opts name watch-dir applyf onres)))]
+      (let [idle (erlang/apply mod :drain (list name))
+            st-keys (Enum/sort (maps/keys (state-of name)))
+            st-pinned (norm (state-of name))
+            _ (burst name f1)
+            drain1 (erlang/apply mod :drain (list name))
+            m1 (collect)
+            applied1 (maps/get :applied m1)
+            res1 (maps/get :result m1)
+            ec1 (event-count name)
+            ; an unwatched suffix is counted, never applied
+            _ (bump name f2 :modified)
+            _ (erlang/apply mod :drain (list name))
+            m2 (collect)
+            applied2 (maps/get :applied m2)
+            ec2 (event-count name)
+            ; a deleted file reports :removed, once
+            _ (File/rm! f1)
+            _ (bump name f1 :attrib)
+            _ (bump name f1 :deleted)
+            _ (erlang/apply mod :drain (list name))
+            m3 (collect)
+            removed (maps/get :result m3)
+            applied3 (maps/get :applied m3)
+            ; the quiet-window owner dies: what it held is applied NOW
+            _ (bump name f3 :modified)
+            _ (Process/sleep 40)
+            _ (erlang/exit (maps/get :debounce (state-of name)) :kill)
+            _ (Process/sleep 250)
+            applied4 (maps/get :applied (collect))
+            after-down (norm (state-of name))
+            ; sync/2 waits for a real event and then drains
+            sync-task (Task/async
+                        (fn []
+                          (erlang/apply mod :sync
+                            (list name (list (t2 :events 1) (t2 :timeout 4000))))))
+            _ (Process/sleep 120)
+            _ (bump name f3 :modified)
+            synced (norm (Task/await sync-task 6000))
+            _ (collect)
+            ; stop: capture the children first, then stop the server through OTP,
+            ; whose terminate callback is what stops them.
+            fs-pid (maps/get :fs (state-of name))
+            db-pid (maps/get :debounce (state-of name))]
+        (let [stopped (erlang/apply :gen_server :stop (list name :normal 2000))
+              _ (Process/sleep 100)
+              fs-dead (erlang/== false (Process/alive? fs-pid))
+              db-dead (erlang/== false (Process/alive? db-pid))]
+          (list (norm started)
+                idle st-keys st-pinned
+                drain1 applied1 res1 ec1
+                applied2 ec2
+                removed applied3
+                applied4 after-down
+                synced
+                stopped fs-dead db-dead))))))
+
+; ── the reload dispatch corpus ───────────────────────────────────────────
+
+(defn- reload-corpus
+  "The reload dispatch corpus for ONE module. `p` prefixes the namespaces so the
+   two runs cannot observe each other's interned vars: a committed reload
+   interns its vars in the image, while `reload/abort` clears only the STAGED
+   bundle. `norm` folds the prefixes back to one name before comparison."
+  [mod p]
+  (reload/abort)
+  (let [one (str p ".one")
+        two (str p ".two")
+        a (obs (fn [] (erlang/apply mod :apply_change (list (str "(ns " one ")\n(defn v [] :first)\n")))))
+        v1 (obs (fn [] (BeamLisp/eval (str "(" one "/v)"))))
+        b (obs (fn [] (erlang/apply mod :apply_change (list (str "(ns " one ")\n(defn v [] :second)\n") "label"))))
+        v2 (obs (fn [] (BeamLisp/eval (str "(" one "/v)"))))
+        staged (obs (fn [] (erlang/apply mod :apply_change
+                           (list (str "(ns " two ")\n(defn w [] 9)\n") "label" false))))
+        v4 (obs (fn [] (BeamLisp/eval (str "(" two "/w)"))))
+        committed (obs (fn [] (reload/commit)))
+        v5 (obs (fn [] (BeamLisp/eval (str "(" two "/w)"))))
+        held (obs (fn [] (erlang/apply mod :apply_change
+                            (list (str "(ns " one ")\n(defn v [] (nothing-defined-here))\n") "label" true))))
+        v3 (obs (fn [] (BeamLisp/eval (str "(" one "/v)"))))]
+    (reload/abort)
+    (list a v1 b v2 staged v4 committed v5 held v3)))
+
+; ── a cold child VM: real inotify, its own temp directory ────────────────
+
+(defn- child-code-args
+  "This VM's whole code path as `-pa` args, with `pinned` LAST so it lands
+   FIRST: `-pa` PREPENDS, so the last one named wins."
+  [pinned]
+  (concat (mapcat (fn [p] (list "-pa" (erlang/list_to_binary p))) (code/get_path))
+          (list "-pa" pinned)))
+
+(defn- boot-script
+  "The child VM's program, as Elixir source. Every line it prints is read back
+   as an assertion: for EACH module (the live one and the pinned one), an
+   editor-style truncate+write save is folded into exactly ONE flush, and a save
+   of an unwatched suffix never applies. The child owns its temp directory and
+   its FileSystem ports; the parent VM watches nothing."
+  []
+  (str
+    "watch = System.fetch_env!(\"BL_RW_WATCH_DIR\")\n"
+    "probe_dir = System.fetch_env!(\"BL_RW_PROBE_DIR\")\n"
+    "{:ok, _} = Application.ensure_all_started(:beam_lisp)\n"
+    "Code.append_path(probe_dir)\n"
+    "{:module, _} = Code.ensure_loaded(BeamLisp.HostReloadWatcherProbe)\n"
+    "run = fn tag, mod ->\n"
+    "  name = String.to_atom(\"bl_rw_child_\" <> tag)\n"
+    "  apply = fn _src, path, _commit ->\n"
+    "    IO.puts(\"applied:\" <> tag <> \":\" <> Path.basename(path))\n"
+    "    %{status: :applied, applied: [], errors: []}\n"
+    "  end\n"
+    "  {:ok, pid} = mod.start_link(dirs: [watch], name: name, apply: apply, quiet_ms: 120)\n"
+    "  warm = Path.join(watch, \"warm_\" <> tag <> \".bl\")\n"
+    "  save = Path.join(watch, \"save_\" <> tag <> \".bl\")\n"
+    "  ignored = Path.join(watch, \"ignored_\" <> tag <> \".txt\")\n"
+    "  File.write!(warm, \"warm\\n\")\n"
+    "  Process.sleep(2000)\n"
+    "  File.write!(save, \"\")\n"
+    "  File.write!(save, \"(ns child_\" <> tag <> \")\\n\")\n"
+    "  File.write!(ignored, \"not watched\\n\")\n"
+    "  Process.sleep(1200)\n"
+    "  GenServer.stop(pid, :normal, 1000)\n"
+    "  IO.puts(\"done:\" <> tag)\n"
+    "end\n"
+    "run.(\"live\", BeamLisp.ReloadWatcher)\n"
+    "run.(\"probe\", BeamLisp.HostReloadWatcherProbe)\n"
+    "IO.puts(\"ok\")\n"))
+
+(defn- count-lines [text want]
+  (count (filter (fn [l] (erlang/== l want)) (String/split text "\n"))))
+
+; ── the surface: exactly the live module's public functions ──────────────
+
+(deftest reload-watcher-pinned-surface-is-the-live-module
+  (testing "exports, behaviour and the seed option contract, against the live module"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      ; NO SHIM: the compile's namespace shim is gone; the pinned beam answers.
+      (is (= :non_existing (erlang/apply :code :which (list shim))))
+
+      ; the production module must be LOADED for its surface to be readable
+      (code/ensure_loaded live)
+      (is (erlang/function_exported live :start_link 1) "the production module is loaded")
+
+      ; Every production function remains present at the probe atom, and the
+      ; probe exports NOTHING the live module does not (minus `__info__/1`,
+      ; which a pinned functions-only beam never has).
+      (is (= (list) (filter (fn [e] (not (erlang/function_exported probe (erlang/element 1 e) (erlang/element 2 e))))
+                        (functional-exports live)))
+          "the pinned beam reproduces every production function")
+      (is (= (functional-exports live) (exports probe))
+          "the pinned export surface equals the live module's minus __info__/1")
+
+      ; The GenServer API, the public controls and the reload seam, by name.
+      (is (erlang/function_exported probe :start_link 1))
+      (is (erlang/function_exported probe :child_spec 1))
+      (is (erlang/function_exported probe :init 1))
+      (is (erlang/function_exported probe :handle_call 3))
+      (is (erlang/function_exported probe :handle_info 2))
+      (is (erlang/function_exported probe :handle_cast 2))
+      (is (erlang/function_exported probe :code_change 3))
+      (is (erlang/function_exported probe :terminate 2))
+      (is (erlang/function_exported probe :drain 0))
+      (is (erlang/function_exported probe :drain 1))
+      (is (erlang/function_exported probe :sync 0))
+      (is (erlang/function_exported probe :sync 1))
+      (is (erlang/function_exported probe :sync 2))
+      (is (erlang/function_exported probe :apply_change 1))
+      (is (erlang/function_exported probe :apply_change 2))
+      (is (erlang/function_exported probe :apply_change 3))
+
+      ; THE LIVE MODULE'S PRIVATE HELPERS ARE NOT EXPORTS, and a pinned module
+      ; exports exactly its file's top-level defns — so none of them may appear.
+      (is (not (erlang/function_exported probe :wait_for_events 3)))
+      (is (not (erlang/function_exported probe :defer 2)))
+      (is (not (erlang/function_exported probe :arm 1)))
+      (is (not (erlang/function_exported probe :start_debounce 1)))
+      (is (not (erlang/function_exported probe :stop 1)))
+      (is (not (erlang/function_exported probe :flush 1)))
+      (is (not (erlang/function_exported probe :notify 3)))
+      (is (not (erlang/function_exported probe :handle_bl_change 2)))
+      (is (not (erlang/function_exported probe :watches? 1)))
+      (is (not (erlang/function_exported probe :file_source 1)))
+      (is (not (erlang/function_exported probe :escape_bl_string 1)))
+
+      ; FUNCTIONS-ONLY: no struct surface.
+      (is (not (erlang/function_exported probe :__struct__ 0)))
+      (is (not (erlang/function_exported probe :__struct__ 1)))
+      (is (not (erlang/function_exported probe :__info__ 1)))
+
+      ; THE BEHAVIOUR: the live beam records `-behaviour(GenServer)` because
+      ; `use GenServer` does, and the pinned entry carries it as `:behaviour`.
+      ; Elixir collects the attribute as `[GenServer]`; a pinned host records
+      ; the bare atom, so `behaviour-attr` normalizes both to a list.
+      (is (= (list :"Elixir.GenServer") (behaviour-attr probe)))
+      (is (= (behaviour-attr live) (behaviour-attr probe))
+          "the pinned beam is judgeable as a GenServer exactly as the live one is")
+
+      ; The explicit seed option contract.
+      (let [opts (seed-opts probe dir)]
+        (is (= probe (Keyword/fetch! opts :module)))
+        (is (= (src) (Keyword/fetch! opts :file)))
+        (is (= false (Keyword/fetch! opts :load?)))
+        (is (= :"Elixir.GenServer" (Keyword/fetch! opts :behaviour)))
+        (is (erlang/is_binary (Keyword/fetch! opts :source_hash))))
+
+      ; REPRODUCIBLE: the same source compiled again is the same bytes.
+      (let [again (tmp-dir)
+            again-beam (erlang/element 2 (BeamLisp.AOT/compile_host_file (src) (seed-opts probe again)))]
+        (is (= (File/read! (Path/join dir "Elixir.BeamLisp.HostReloadWatcherProbe.beam"))
+               (File/read! again-beam))
+            "a rebuild of priv/host/reload_watcher.bl is the same beam")
+        (File/rm_rf! again))
+
+      (File/rm_rf! dir))))
+
+; ── the callbacks, directly ──────────────────────────────────────────────
+
+(deftest reload-watcher-pinned-callbacks-match-the-live-module
+  (testing "handle_call/handle_info/terminate/code_change/handle_cast/child_spec on a fabricated state"
+    (let [dir (tmp-dir)
+          real (Path/join dir "real.bl")
+          gone (Path/join dir "gone.bl")]
+      (compile-at probe dir)
+      (File/write! real "(ns cb.real)\n(defn v [] 1)\n")
+      (let [l (cb-corpus live real gone)
+            p (cb-corpus probe real gone)]
+        (is (= l p) "probe callbacks equal the live module's on the whole corpus")
+        (doseq [i (range (count l))]
+          (is (= (nth l i) (nth p i))
+              (str "callback observation " i ": " (pr-str (nth l i)) " vs " (pr-str (nth p i))))))
+
+      ; ...and each observation answers the PINNED expectation, not merely the
+      ; same wrong thing.
+
+      ; a watched path is RECORDED, the count rises, and the armed owner is
+      ; pinged; an ignored suffix is COUNTED but never recorded.
+      (let [st (cb-state (fn [_ _ _] nil) (erlang/self) :refSENT)
+            w (erlang/apply probe :handle_info (list (tuple :file_event :fsSENTINEL (tuple real (list :modified))) st))
+            ws (erlang/element 2 w)
+            i (erlang/apply probe :handle_info (list (tuple :file_event :fsSENTINEL (tuple "/tmp/cb/x.txt" (list :modified))) st))
+            is- (erlang/element 2 i)]
+        (is (erlang/== :noreply (erlang/element 1 w)))
+        (is (erlang/== 1 (maps/get :event_count ws)))
+        (is (erlang/== true (maps/get real (maps/get :pending ws))) "a watched path is pending")
+        (is (some (fn [p] (erlang/== p (erlang/self))) (collect-tag :"reload/activity"))
+            "the armed owner was pinged")
+        (is (erlang/== :noreply (erlang/element 1 i)))
+        (is (erlang/== 1 (maps/get :event_count is-)))
+        (is (= (maps/new) (maps/get :pending is-)) "an unwatched suffix is never pending"))
+
+      ; a foreign filesystem pid is not ours: the catch-all leaves the state alone
+      (let [st (cb-state (fn [_ _ _] nil) (erlang/self) :refSENT)
+            r (erlang/apply probe :handle_info (list (tuple :file_event :otherFs (tuple real (list :modified))) st))]
+        (is (= (tuple :noreply st) r) "a foreign fs event is ignored"))
+
+      ; :drain flushes the held path, empties the pending set and replies the
+      ; settled status
+      (let [st (cb-state (fn [_ _ _] {:status :applied :applied (list) :errors (list)}) (erlang/self) :refSENT)
+            st1 (assoc st :pending (maps/put real true (maps/new)))
+            r (erlang/apply probe :handle_call (list :drain nil st1))
+            st2 (erlang/element 3 r)]
+        (is (erlang/== :reply (erlang/element 1 r)))
+        (is (= (maps/new) (maps/get :pending st2)) "the pending set is emptied")
+        (is (erlang/== :applied (maps/get :status (nth r 1))) "the flush's status is the reply")
+        (is (erlang/== real (maps/get :path (nth r 1)))))
+
+      ; :event_count replies the fabricated count, state untouched
+      (let [st (assoc (cb-state (fn [_ _ _] nil) (erlang/self) :refSENT) :event_count 7)
+            r (erlang/apply probe :handle_call (list :event_count nil st))]
+        (is (= (tuple :reply 7 st) r)))
+
+      ; an unknown call is the live FunctionClauseError, naming this module
+      (let [r (obs (fn [] (erlang/apply probe :handle_call (list :bogus nil (cb-state (fn [_ _ _] nil) (erlang/self) :refSENT)))))]
+        (is (erlang/== :caught (nth r 0)))
+        (is (erlang/== :"Elixir.FunctionClauseError" (maps/get :__struct__ (nth r 1) nil)))
+        (is (erlang/== live (maps/get :module (nth r 1) nil))))
+
+      ; a DELETED path flushes as :removed, tagged with its path, nothing staged
+      (let [me (erlang/self)
+            onres (fn [r] (erlang/send me (tuple :cb-result r)))
+            st (cb-state (fn [_ _ _] nil) me :refSENT)
+            st1 (assoc (assoc st :on_result onres) :pending (maps/put gone true (maps/new)))]
+        (erlang/apply probe :handle_info (list :flush_pending st1))
+        (let [results (collect-tag :cb-result)]
+          (is (= 1 (count results)))
+          (is (erlang/== :removed (maps/get :status (nth results 0))))
+          (is (erlang/== gone (maps/get :path (nth results 0))))
+          (is (= (list) (maps/get :applied (nth results 0))))))
+
+      ; the owner's DOWN flushes its held paths and drops the pid + ref
+      (let [st (cb-state (fn [_ _ _] nil) (erlang/self) :refSENT)
+            st1 (assoc st :pending (maps/put gone true (maps/new)))
+            r (erlang/apply probe :handle_info (list (tuple :DOWN :refSENT :process (erlang/self) :killed) st1))
+            st2 (erlang/element 2 r)]
+        (is (erlang/== :noreply (erlang/element 1 r)))
+        (is (erlang/== nil (maps/get :debounce st2)))
+        (is (erlang/== nil (maps/get :debounce_ref st2)))
+        (is (= (maps/new) (maps/get :pending st2)) "the dead owner's paths were flushed"))
+
+      ; another ref's DOWN falls through to the catch-all, state untouched
+      (let [st (cb-state (fn [_ _ _] nil) (erlang/self) :refSENT)
+            r (erlang/apply probe :handle_info (list (tuple :DOWN :otherRef :process (erlang/self) :killed) st))]
+        (is (= (tuple :noreply st) r)))
+
+      ; code_change answers {:ok, state}; anything else is ignored
+      (is (= [:ok (tuple :ok :st)] (obs (fn [] (erlang/apply probe :code_change (list :old :st :extra))))))
+      (is (= (tuple :noreply :st) (erlang/apply probe :handle_info (list :whatever :st))))
+
+      ; terminate with no children is a no-op
+      (is (erlang/== :ok (erlang/apply probe :terminate (list :normal (cb-state (fn [_ _ _] nil) nil nil)))))
+
+      ; the default handle_cast raises the macro's RuntimeError
+      (let [r (obs (fn [] (erlang/apply probe :handle_cast (list :msg :st))))]
+        (is (erlang/== :caught (nth r 0)))
+        (is (erlang/== :"Elixir.RuntimeError" (maps/get :__struct__ (nth r 1) nil)))
+        (is (erlang/== true (String/ends_with? (maps/get :message (nth r 1) "")
+                                               "but no handle_cast/2 clause was provided"))))
+
+      ; child_spec names THIS module and starts it through start_link/1
+      (let [cs (erlang/apply probe :child_spec (list :arg))]
+        (is (erlang/== live (norm (maps/get :id cs))) "child_spec's id is this module")
+        (is (= (tuple live :start_link (list :arg)) (norm (maps/get :start cs)))))
+
+      (File/rm_rf! dir))))
+
+; ── the live servers: probe answers == live answers ──────────────────────
+
+(deftest reload-watcher-pinned-live-servers-match-the-live-module
+  (testing "real GenServers on synthetic events: debounce coalescing, suffix filter, :removed, :DOWN, drain, sync, stop"
+    (let [dir (tmp-dir)
+          watch (Path/join dir "watch")
+          files (Path/join dir "files")]
+      (File/mkdir_p! watch)
+      (File/mkdir_p! files)
+      (compile-at probe dir)
+      (let [l (server-run live live-name watch files)
+            p (server-run probe probe-name watch files)]
+        (is (= l p) "probe servers behave exactly like the live module's")
+        (doseq [i (range (count l))]
+          (is (= (nth l i) (nth p i))
+              (str "server observation " i ": " (pr-str (nth l i)) " vs " (pr-str (nth p i))))))
+      (File/rm_rf! dir))))
+
+(deftest reload-watcher-pinned-live-server-answers-the-pinned-expectations
+  (testing "the pinned run's observations, read one by one"
+    (let [dir (tmp-dir)
+          watch (Path/join dir "watch")
+          files (Path/join dir "files")]
+      (File/mkdir_p! watch)
+      (File/mkdir_p! files)
+      (compile-at probe dir)
+      (let [run (server-run probe probe-name watch files)
+            f1 (Path/join files "rf1.bl")
+            f3 (Path/join files "rf3.bl")]
+        ; start + an idle drain + the state's key set
+        (is (erlang/== :ok (erlang/element 1 (nth run 0))))
+        (is (erlang/== :pid (erlang/element 2 (nth run 0))))
+        (is (erlang/== :idle (nth run 1)) "an untouched watcher settles to :idle")
+        (is (= (list :apply :auto_commit :debounce :debounce_ref :debounce_warned :event_count
+                     :fs :last :on_result :pending :quiet_ms)
+               (nth run 2))
+            "the state carries the live module's keys")
+
+        ; 5 events, ONE apply, and the path is the settled one
+        (is (= [f1] (nth run 5)) "a five-event burst applies exactly once")
+        (is (erlang/== 5 (nth run 7)) "every event is counted")
+        (is (= [(nth run 4)] (nth run 6))
+            "the drain answers the settled status the subscriber saw")
+        (is (erlang/== f1 (maps/get :path (nth run 4))) "…tagged with the saved path")
+
+        ; an unwatched suffix: counted, never applied
+        (is (= [] (nth run 8)) "a .txt save is never applied")
+        (is (erlang/== 6 (nth run 9)))
+
+        ; a deleted file: :removed once, nothing staged
+        (is (= [{:status :removed :path f1 :applied (list) :errors (list)}] (nth run 10)))
+        (is (= [] (nth run 11)))
+
+        ; the dead owner's held path was applied
+        (is (= [f3] (nth run 12)))
+        (is (erlang/== nil (maps/get :debounce (nth run 13))))
+        (is (erlang/== nil (maps/get :debounce_ref (nth run 13))))
+        (is (= (maps/new) (maps/get :pending (nth run 13))))
+
+        ; sync waited for the event and drained
+        (is (erlang/== :applied (maps/get :status (nth run 14))))
+        (is (erlang/== f3 (maps/get :path (nth run 14))))
+
+        ; terminate is :ok, and BOTH children are gone
+        (is (erlang/== :ok (nth run 15)))
+        (is (erlang/== true (nth run 16)) "the FileSystem worker was stopped")
+        (is (erlang/== true (nth run 17)) "the quiet-window owner was stopped")
+        (is (nil? (Process/whereis probe-name)) "the watcher itself is gone"))
+      (File/rm_rf! dir))))
+
+; ── the reload dispatch: probe answers == live answers ───────────────────
+
+(deftest reload-watcher-pinned-reload-dispatch-matches-the-live-module
+  (testing "apply_change/1,2,3 stage, commit, hold and defer identically"
+    (let [dir (tmp-dir)]
+      (compile-at probe dir)
+      (let [l (reload-corpus live "hrwl")
+            p (reload-corpus probe "hrwp")]
+        (is (= l p) "probe dispatch answers equal the live module's")
+        (doseq [i (range (count l))]
+          (is (= (nth l i) (nth p i))
+              (str "dispatch observation " i ": " (pr-str (nth l i)) " vs " (pr-str (nth p i))))))
+
+      ; the pinned run's own readings
+      (let [run (reload-corpus probe "hrwe")]
+        (is (erlang/== :applied (maps/get :status (nth (nth run 0) 1))) "a coherent edit lands")
+        (is (erlang/== :first (nth (nth run 1) 1)))
+        (is (erlang/== :second (nth (nth run 3) 1)) "a second edit swaps the running fn")
+        (is (erlang/== :staged (maps/get :status (nth (nth run 4) 1))) "commit? false stages")
+        (is (erlang/== :caught (nth (nth run 5) 0)) "the staged ns is not live yet")
+        (is (erlang/== :applied (maps/get :status (nth (nth run 6) 1))) "an explicit commit applies it")
+        (is (erlang/== 9 (nth (nth run 7) 1)))
+        (is (erlang/== :held (maps/get :status (nth (nth run 8) 1))) "an incoherent edit is HELD")
+        (is (erlang/== :second (nth (nth run 9) 1)) "old code serves through the hold"))
+      (File/rm_rf! dir))))
+
+; ── the pinned beam AT the production atom, restored afterwards ──────────
+
+(deftest reload-watcher-pinned-beam-stands-in-at-the-production-atom
+  (testing "the production atom serves on the pinned beam, then the live beam returns"
+    (let [dir (tmp-dir)
+          out (str dir "/prod")
+          beam (Path/join out (str live ".beam"))
+          orig-path (erlang/apply :code :which (list live))
+          orig-bin (File/read! (erlang/list_to_binary orig-path))]
+      (is (not= :non_existing orig-path) "precondition: the live beam is a readable file")
+
+      ; `:load? false` writes the beam at the production atom WITHOUT
+      ; substituting the live module mid-flight.
+      (BeamLisp.AOT/compile_host_file (src) (seed-opts live out))
+      (is (File/exists? beam))
+      (is (= orig-path (erlang/apply :code :which (list live)))
+          "the compile never substituted the production module")
+
+      (try
+        (drop! live)
+        (code/load_binary live (erlang/binary_to_list beam) (File/read! beam))
+        (is (= (erlang/binary_to_list beam) (erlang/apply :code :which (list live)))
+            "the test beam now owns the production atom")
+        (is (erlang/function_exported live :handle_info 2))
+
+        ; THE DISPATCH, ON THE PINNED BEAM.
+        (is (erlang/== :applied (maps/get :status (nth (nth (reload-corpus live "hrws") 0) 1))))
+
+        ; A REAL SERVER, ON THE PINNED BEAM.
+        (let [watch (Path/join dir "watch")
+              files (Path/join dir "files")
+              f1 (Path/join files "rf1.bl")]
+          (File/mkdir_p! watch)
+          (File/mkdir_p! files)
+          (let [run (server-run live live-name watch files)]
+            (is (erlang/== :ok (erlang/element 1 (nth run 0))))
+            (is (= [f1] (nth run 5)) "the pinned beam applies a burst once")
+            (is (erlang/== true (nth run 16)))
+            (is (erlang/== true (nth run 17)))))
+
+        (finally
+          (drop! live)
+          (code/load_binary live orig-path orig-bin)))
+
+      ; RESTORED: the live beam owns the atom and answers again.
+      (is (= orig-path (erlang/apply :code :which (list live))))
+      (is (erlang/== :applied (maps/get :status (nth (nth (reload-corpus live "hrws") 0) 1))))
+      (is (nil? (Process/whereis live-name)))
+      (File/rm_rf! dir))))
+
+; ── an isolated child VM, real inotify ───────────────────────────────────
+
+(deftest reload-watcher-pinned-watches-real-files-in-an-isolated-child-vm
+  (testing "an editor-style save is folded into ONE flush; an unwatched suffix never applies"
+    (let [dir (tmp-dir)
+          out (str dir "/pinned")
+          watch (Path/join dir "watch")
+          script (Path/join dir "boot.exs")]
+      (File/mkdir_p! out)
+      (File/mkdir_p! watch)
+      ; The pinned beam AT the probe atom, written here, never loaded here.
+      (BeamLisp.AOT/compile_host_file (src) (seed-opts probe out))
+      (File/write! script (boot-script))
+
+      (let [r (System/cmd "elixir"
+                          (to-list (concat (child-code-args out) (list script)))
+                          (to-list [(tuple :stderr_to_stdout true)
+                                    (tuple :env (list (tuple "BL_RW_WATCH_DIR" watch)
+                                                      (tuple "BL_RW_PROBE_DIR" out)))]))
+            text (erlang/element 1 r)]
+        (is (zero? (erlang/element 2 r)) (str "the child VM exited " (erlang/element 2 r) ":\n" text))
+
+        ; BOTH modules, and each folded its truncate+write save into ONE flush.
+        (is (erlang/== 1 (count-lines text "applied:live:save_live.bl")) text)
+        (is (erlang/== 1 (count-lines text "applied:probe:save_probe.bl")) text)
+
+        ; The unwatched suffix was never applied by either.
+        (is (erlang/== 0 (count-lines text "applied:live:ignored_live.txt")) text)
+        (is (erlang/== 0 (count-lines text "applied:probe:ignored_probe.txt")) text)
+
+        ; Both runs finished cleanly.
+        (is (erlang/== 1 (count-lines text "done:live")) text)
+        (is (erlang/== 1 (count-lines text "done:probe")) text)
+        (is (erlang/== 1 (count-lines text "ok")) text))
+
+      (File/rm_rf! dir))))

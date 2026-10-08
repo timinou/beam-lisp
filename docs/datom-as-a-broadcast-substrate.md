@@ -5,8 +5,8 @@ semantic vector search compose into **live, filtered, per-principal
 subscriptions over datom** — and why the result is *stronger* than the raw
 message-passing it is built on.
 
-> Status: design. Precedes any code. The invariants in §7 are the reviewable
-> contract; the plan items (PLAN-044, PLAN-045) carry the build.
+> Status: L2 shipped (`datom/broadcast.bl`), L3 shipped (`datom/watch.bl`).
+> The invariants in §7 are the reviewable contract.
 
 ---
 
@@ -72,13 +72,15 @@ register the same key, `Registry.dispatch` fans out with a user callback. It is
 
 ### 1.3 Phoenix — cluster pub/sub and replicated presence
 
-Phoenix is a dependency here (`phoenix_pubsub ~> 2.1`; `SpellWeb.PubSub` is
-**already in the supervision tree**), and the repo **already uses this exact
-pattern** in `lib/beam_lisp/spell/server.ex`.
+Phoenix is a dependency here (`phoenix_pubsub ~> 2.1`), and the cross-node path
+is already wired: `datom/broadcast.bl` publishes to a configured
+`Phoenix.PubSub` server, whose name `datom/conn.bl` resolves from
+`Application.get_env(:beam_lisp, :datom_pubsub)`. A store with no web stack has
+none, and the local path runs unchanged.
 
 | Phoenix | adds | beam-lisp | in-tree |
 |---|---|---|---|
-| **`Phoenix.PubSub`** | topic pub/sub **across the cluster** (`:pg` adapter, or Redis) | `(Phoenix.PubSub/subscribe srv topic)` · `(Phoenix.PubSub/broadcast srv topic msg)` | ✓ (Elixir side, `spell/server.ex`) |
+| **`Phoenix.PubSub`** | topic pub/sub **across the cluster** (`:pg` adapter, or Redis) | `(Phoenix.PubSub/subscribe srv topic)` · `(Phoenix.PubSub/broadcast srv topic msg)` | ✓ (`datom/broadcast.bl`) |
 | `broadcast_from` / `local_broadcast` | exclude self / this-node-only | `(Phoenix.PubSub/broadcast_from srv self topic msg)` | — |
 | **`Phoenix.Presence`** / `Phoenix.Tracker` | a **CRDT** of who/what is where, cluster-replicated (AP, converges) | `(Phoenix.Presence/track …)` · `(Phoenix.Presence/list topic)` | — |
 
@@ -224,11 +226,11 @@ interest — because all three are datalog clauses over one db value.**
 ## 5. The architecture
 
 ```
- L4  Presence / ownership           pid-as-entity (07 §4) ⊕ Phoenix.Presence CRDT / :global
+ L4  Presence / ownership           pid-as-entity (07 §4) ⊕ a presence CRDT (e.g. Phoenix.Presence) / :global
        └─ "which node owns shard S", "who is online" — replicated STATE, AP or CP per use
  L3  Live queries / subscriptions   datom/watch, datom/listen!   (the tx-report-queue, as PUSH)
        └─ interest = auth/guard clauses (T0/T1/T2) matched by engine's unify-pattern
- L2  Transaction-report broadcast   publish-report!   (:pg local · Phoenix.PubSub cluster)
+ L2  Transaction-report broadcast   publish!   (local subscriber map · Phoenix.PubSub cluster)
        └─ THE new primitive. Ordered because the writer is single. Payload = DELTA by default, basis by knob (§6).
  L1  Single writer per store        conn.bl writer process        ← serialization = correctness
        └─ vertical scaling: reads are lock-free VALUES; only writes queue
@@ -263,8 +265,8 @@ sends *after* commit, off the hot path — it never blocks the writer (§7.4).
 ### 5.3 Transport picks its rung by blast radius (L2 only)
 
 - same node → `pg/get_members` + `send` (native, µs)
-- cross-node, same cluster → `Phoenix.PubSub/broadcast` (its `:pg` adapter is
-  already the default; `SpellWeb.PubSub` already runs)
+- cross-node, same cluster → `Phoenix.PubSub/broadcast` to the configured
+  `:datom_pubsub` server (its `:pg` adapter is the default)
 - across clusters / regions → swap the PubSub adapter (Redis) — **zero code
   change above L2**, because L2 only knows *"publish to topic."*
 
@@ -289,8 +291,8 @@ asking)* and a writer knows only its own half. That is correct and this design
 keeps it absolutely.
 
 But FEAT-016 also chose **moment** (basis-only) for its own payload — and that
-choice is **context-specific, not a general law.** Its subscriber is a LiveView
-*page*, whose only useful subscriber-agnostic delta *is* a re-rendered board —
+choice is **context-specific, not a general law.** Its subscriber is a live page,
+whose only useful subscriber-agnostic delta *is* a re-rendered board —
 which is itself a projection. So for a page there is nothing smaller than
 "re-derive," and basis-only is right. For a **datom subscriber**, `:tx-datoms`
 *is* the subscriber-agnostic delta: the store already produced it, the writer
@@ -307,7 +309,7 @@ to impose.
   the common case and it costs the reader no store access.
 - **Basis-only is a KNOB, not the default** (`{:payload :basis}`). Use it when the
   write is large, or when the subscriber is a store-replica / complex-view
-  consumer that will re-derive from `as-of` anyway — the LiveView case FEAT-016
+  consumer that will re-derive from `as-of` anyway — the page case FEAT-016
   was written for. Then the reader does `basis → (as-of db basis) → run interest`.
 - **Shared-identical-view fan-out gets a PROJECTOR** (§8.1): a *subscriber* that
   computes one projection once and re-broadcasts it to N identical viewers. It is
@@ -348,7 +350,7 @@ file so this doc is the spec for how live rendering actually works in beam-lisp.
 
 | case | who projects | for whom | payload it consumes | example |
 |---|---|---|---|---|
-| **A** per-socket binding | the LiveView / view-server process | one viewer | `:basis` | `10-reactive-socket.bl` |
+| **A** per-socket binding | the socket / view-server process (`live.socket`) | one viewer | `:basis` | `10-reactive-socket.bl` |
 | **B** shared materialized view | a `defserver` subscriber | N identical viewers | `:tx-datoms` (T0) | `06-projector.bl` |
 | **C** diff / patch binding | a `defserver` subscriber | one principal-group | `:tx-datoms` (delta) | `11-reactive-diff.bl` |
 | **D** derived state | *the writer, as a FACT* (tx-fn) | everyone | — (it's a datom) | `12-derived-fact.bl` |
@@ -356,9 +358,9 @@ file so this doc is the spec for how live rendering actually works in beam-lisp.
 | ~~writer projection~~ | ~~commit path~~ | ~~—~~ | — | **forbidden** (1–3 above) |
 
 **Case A — per-socket reactive binding.** The canonical frontend case, and where
-`:basis` is *optimal*, not arcane: a LiveView re-renders its whole assign map and
-Phoenix diffs the DOM, so "reader re-projects from a coordinate" is exactly what
-a page already does. This is the shape `lib/beam_lisp/spell/server.ex` runs
+`:basis` is *optimal*, not arcane: a live socket re-renders its whole view and
+`live.diff` ships a minimal patch, so "reader re-projects from a coordinate" is
+exactly what a page already does. This is the shape `live/socket.bl` runs
 today. The projection is per-principal because the *socket process* holds who is
 asking — the guard clause the writer never had.
 
@@ -375,8 +377,8 @@ asking — the guard clause the writer never had.
     [state]
     (let [db   (datom/as-of (datom/db CONN) basis)     ; coordinate → value
           rows (datom/q (:q state) db)]                ; the per-viewer projection
-      (Phoenix.PubSub/broadcast SpellWeb.PubSub
-        (str "socket:" (:id state)) [:render rows])    ; → LiveView assign → DOM diff
+      (Phoenix.PubSub/broadcast pubsub
+        (str "socket:" (:id state)) [:render rows])    ; → re-render → DOM diff
       (noreply state))))
 ```
 
@@ -409,7 +411,7 @@ the pre-filter cheap (recompute only if this commit *could* touch the answer).
       (let [next (set (datom/q (:q state) (datom/db CONN)))
             d    (diff (:answer state) next)]
         (when (or (seq (:added d)) (seq (:removed d)))
-          (Phoenix.PubSub/broadcast SpellWeb.PubSub
+          (Phoenix.PubSub/broadcast pubsub
             (str "feed:" (:principal state)) [:patch d]))   ; the reactive binding
         (noreply (assoc state :answer next)))
       (noreply state))))
@@ -468,7 +470,7 @@ stream*. Each invariant below is testable and is the actual acceptance bar.
 
 ### The five invariants L2/L3 must hold
 
-1. **Report order = commit order.** Guaranteed *iff* `publish-report!` runs
+1. **Report order = commit order.** Guaranteed *iff* `publish!` runs
    inside the writer's serialized step (it does). Inherit the ordering from the
    single writer; do not reinvent it.
 2. **No broadcast on a failed or speculative tx.** `with` (speculative,
@@ -499,7 +501,7 @@ delta-by-default, and transport-pluggable:
 ;; priv/lib/datom/conn.bl — one new seam, inside the writer, after a real commit.
 ;; DEFAULT payload is the DELTA (§6). Same-node always gets it; cross-node gets
 ;; it too unless a subscriber asked for :basis.
-(defn- publish-report! [conn report]
+(defn- publish! [conn report]
   (let [topic (report-topic (:store conn))
         delta [:datom/tx (datom/basis-t (:db-after report))  ; basis, for gap-detect
                          (:tx-datoms report)]]                ; the delta itself
@@ -523,7 +525,7 @@ delta-by-default, and transport-pluggable:
 ```
 
 Consumer side is a plain `receive` or a `defserver handle-info` — the shape
-`spell/server.ex` already uses for `spell/changed`. The default path reads the
+`live.socket` already uses for `[:datom/changed …]`. The default path reads the
 **delta**, never touching the store:
 
 ```clojure
@@ -562,7 +564,7 @@ materializes, opt-in, at L3.
           board (datom/q '[:find ?player (sum ?p)
                            :where [?player :score/points ?p]] db)]
       ;; computed ONCE; every identical viewer gets the finished board
-      (Phoenix.PubSub/broadcast SpellWeb.PubSub "leaderboard" [:board board])
+      (Phoenix.PubSub/broadcast pubsub "leaderboard" [:board board])
       (noreply db))))
 ```
 
@@ -585,7 +587,7 @@ projection); public shared views should.
 | `datom/vector.bl` `similar-to` bound mode | a **semantic** changefeed for free |
 | `datom/datalog.bl` `dl-eval-incremental` | the substrate for true T2 view maintenance |
 | `store.bl` 6-method port → Hobbes | **horizontal** scaling lives below L0 |
-| `spell/server.ex` `Phoenix.PubSub` + FEAT-016 | the cluster transport, and the *writer-never-projects* rule (§6) |
+| `datom/broadcast.bl` + `conn.bl` `pubsub-server` | the cluster transport; the *writer-never-projects* rule (§6) |
 | `examples/datom/07`,`08` | pid-as-entity, db-value-as-state — the L4 shape |
 
 Nothing here is a new subsystem. datom does not need to *become* a message bus;
@@ -601,5 +603,5 @@ made observable, with the filter and the security it already had.
 - `priv/lib/datom/query/engine.bl` — `unify-pattern`, the matcher this reuses
 - `priv/lib/datom/vector.bl`, `examples/semantic/03`,`10` — similarity as a filtering clause
 - `docs/the-application-is-a-value.md` — FEAT-016, *broadcast the moment, never the projection*
-- `lib/beam_lisp/spell/server.ex` — `Phoenix.PubSub` subscribe/broadcast, already in the tree
+- `priv/lib/datom/broadcast.bl` — local `publish!`, plus the opt-in `Phoenix.PubSub` cross-node path
 - PLAN-033 (Hobbes substrate), PLAN-044 (L2 broadcast) / PLAN-045 (L3 filtered watch)

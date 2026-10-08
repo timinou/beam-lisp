@@ -1,0 +1,266 @@
+; diagnostics — scoped, schema-projected execution events.
+(ns diagnostics)
+
+(def STATE-KEY :bl_diagnostics)
+(def ^:private ID-PATTERN (Regex/compile! "^[A-Za-z0-9_-]{1,96}$"))
+(def ^:private NAMESPACE-PATTERN (Regex/compile! "^[A-Za-z_][A-Za-z0-9_.-]{0,95}$"))
+(def ERROR-KINDS #{:timeout :billing :rate-limited :transport :server
+                           :client :cancelled :stale :unauthorized :exception
+                           :policy :scheduler :no-key :bad-response :truncated
+                           :context-budget :queue-full})
+(def ^:private CONTEXT-KEYS #{:diagnostics/operation-id :diagnostics/attempt-id
+                             :diagnostics/tenant-id :diagnostics/library-id
+                             :diagnostics/source-id :diagnostics/release-id
+                             :diagnostics/request-id :diagnostics/job-id
+                             :diagnostics/trace-id :diagnostics/boot-id})
+
+(defn safe-error
+  "A bounded category. Never renders an exception, message, args or state."
+  [e]
+  (let [data (when (erlang/is_map e) (maps/get :data e nil))
+        k (cond
+            (erlang/is_map e) (maps/get :kind e (when (erlang/is_map data) (maps/get :kind data nil)))
+            (keyword? e) e
+            (and (erlang/is_tuple e) (> (erlang/tuple_size e) 0)) (erlang/element 1 e)
+            :else nil)]
+    {:diagnostics/error-kind (if (and (keyword? k) (contains? ERROR-KINDS k)) k :exception)}))
+
+
+(defn- valid-field? [type value]
+  (cond
+    (= type :count) (and (erlang/is_integer value) (>= value 0) (<= value 9007199254740991))
+    (= type :flag) (or (= value true) (= value false))
+    (= type :id) (and (string? value) (<= (erlang/byte_size value) 96) (Regex/match? ID-PATTERN value))
+    (= type :namespace) (and (string? value) (<= (erlang/byte_size value) 96)
+                             (Regex/match? NAMESPACE-PATTERN value))
+    (set? type) (and (keyword? value) (contains? type value))
+    :else false))
+
+(defn- event-name? [event]
+  (and (keyword? event) (some? (namespace event)) (<= (count (str event)) 128)))
+
+(defn- project [schema fields]
+  (reduce (fn [out [k type]]
+            (let [v (when (map? fields) (get fields k))]
+              (if (valid-field? type v) (assoc out k v) out)))
+          {} (take 24 schema)))
+
+(defn- runtime-key [] (tuple :bl_diagnostics_config (erlang/get :bl_env)))
+(defn- state []
+  (let [v (erlang/get STATE-KEY)]
+    (if (and (map? v) (= (:environment v) (erlang/get :bl_env)))
+      v (persistent_term/get (runtime-key) {}))))
+
+(defn new-id
+  "Generate an execution handle without incorporating caller data."
+  [] (str "d_" (erlang/system_time :nanosecond) "_"
+          (erlang/unique_integer (list :positive :monotonic))))
+
+(def ^:private LEVELS {:debug 0 :info 1 :notice 2 :warning 3 :error 4 :critical 5})
+(declare BUILTIN-EVENTS)
+(defn enabled? [event]
+  (let [st (state) spec (when (event-name? event) (get (:events st BUILTIN-EVENTS) event))]
+    (and (:sink st) spec
+         (>= (get LEVELS (:level spec :info) 1) (get LEVELS (:min-level st :debug) 0)))))
+
+(defn context [] (get (state) :context {}))
+(defn loss-count [] (let [c (:loss (state))] (if c @c 0)))
+(defn- lost! [] (when-let [c (:loss (state))] (swap! c inc)) nil)
+
+(def BUILTIN-EVENTS
+  {:runtime.phase/completed {:level :debug :fields {:runtime.phase/namespace :namespace
+                                                     :runtime.phase/name #{:loader-wait :loader-worker}
+                                                     :runtime.phase/duration-us :count
+                                                     :runtime.phase/reductions :count}}
+   :live.phase/completed {:level :debug :fields {:live.phase/name #{:worlds :screen :view :realize :diff :styles :html :serialize}
+                                                  :live.phase/duration-us :count
+                                                  :live.phase/reductions :count}}
+   :diagnostics.span/started {:level :info :fields {}}
+   :diagnostics.span/ended
+   {:level :info :fields {:diagnostics/outcome #{:returned :raised}
+                         :diagnostics/duration-ms :count
+                         :diagnostics/error-kind ERROR-KINDS}}
+   :proc.fence/completed {:level :info :fields {:proc.fence/outcome #{:returned :crashed :timed-out}
+                                              :proc.fence/duration-ms :count
+                                              :proc.fence/kill-requested? :flag
+                                              :diagnostics/error-kind ERROR-KINDS}}
+   :proc.queue/claimed {:level :info :fields {:proc.queue/attempt :count}}
+   :proc.queue/settled {:level :info :fields {:proc.queue/settlement #{:settled :lost :gone}
+                                           :proc.queue/outcome #{:returned :raised}
+                                           :proc.queue/attempt :count
+                                           :diagnostics/error-kind ERROR-KINDS}}
+   :proc.queue/claim-expired {:level :warning :fields {:proc.queue/attempt :count}}
+   :proc.pipeline/failed {:level :warning :fields {:diagnostics/error-kind ERROR-KINDS}}
+   :proc.tick/failed {:level :warning :fields {:proc.tick/failure-count :count
+                                              :diagnostics/error-kind ERROR-KINDS}}})
+
+(defn emit!
+  "Project a declared event into bounded safe fields; sink failure is counted.
+   Context and event declarations come from trusted code. Returns nil."
+  [event fields]
+  (try
+    (let [st (state) spec (when (event-name? event) (get (:events st BUILTIN-EVENTS) event)) sink (:sink st)]
+      (when (and sink (or (nil? spec) (enabled? event)))
+        (if (nil? spec)
+          (lost!)
+          (let [record (merge (:context st {})
+                              (get-in st [:span :fields] {})
+                              (project (:fields spec) (if (fn? fields) (fields) fields))
+                              {:diagnostics/event-id (new-id)
+                               :diagnostics/schema-version 1
+                               :diagnostics/event event
+                               :diagnostics/level (:level spec :info)
+                               :diagnostics/at (erlang/system_time :millisecond)})
+                record (if-let [span (:span st)]
+                         (merge record {:diagnostics/span-id (:id span)
+                                        :diagnostics/span-name (:name span)}
+                                (when (:parent span) {:diagnostics/parent-span-id (:parent span)}))
+                         record)]
+            (try (when (= :dropped (sink record)) (lost!)) (catch _ (lost!)))))))
+    (catch _ (lost!)))
+  nil)
+
+(defn with-options-fn
+  "Run f with a trusted bounded schema and capture/OTP sink; restore in finally."
+  [opts f]
+  (when (or (not (map? opts))
+            (some #(not (contains? #{:sink :events :min-level} %)) (keys opts))
+            (and (contains? opts :sink) (some? (:sink opts)) (not (fn? (:sink opts))))
+            (not (contains? LEVELS (:min-level opts :debug))))
+    (throw (ex-info "diagnostics: invalid options" {:kind :invalid-config})))
+  (when (> (count (merge (:events (state) {}) (:events opts {}))) (+ 64 (count BUILTIN-EVENTS)))
+    (throw (ex-info "diagnostics: bounded event registry exceeded" {:kind :invalid-config})))
+  (doseq [[event spec] (:events opts {})]
+    (when (or (not (keyword? event)) (nil? (namespace event)) (contains? BUILTIN-EVENTS event)
+              (> (count (str event)) 128) (> (count (:fields spec {})) 24)
+              (not (contains? #{:debug :info :notice :warning :error :critical} (:level spec :info)))
+              (some (fn [[k type]] (or (not (keyword? k)) (nil? (namespace k)) (> (count (str k)) 128)
+                                     (contains? CONTEXT-KEYS k)
+                                     (= "diagnostics" (namespace k))
+                                     (not (or (contains? #{:count :flag :id :namespace} type)
+                                              (and (set? type) (<= (count type) 32)
+                                                   (every? (fn [v] (and (keyword? v) (<= (count (str v)) 64))) type))))))
+                    (:fields spec {})))
+      (throw (ex-info "diagnostics: invalid event schema" {:kind :invalid-config}))))
+  (let [previous (erlang/get STATE-KEY)
+        st (state)]
+    (erlang/put STATE-KEY (merge st (select-keys opts [:sink :min-level]) {:events (merge BUILTIN-EVENTS (:events st {}) (:events opts {}))
+                                       :environment (erlang/get :bl_env) :context (:context st {}) :loss (or (:loss st) (atom 0))}))
+    (try (f) (finally (if (= previous :undefined) (erlang/erase STATE-KEY)
+                         (erlang/put STATE-KEY previous))))))
+
+(defmacro with-options [opts & body]
+  `(diagnostics/with-options-fn ~opts (fn [] ~@body)))
+
+(defn with-context-fn [ctx f]
+  (let [previous (erlang/get STATE-KEY)
+        st (state)
+        allowed (reduce (fn [m k] (assoc m k :id)) {} CONTEXT-KEYS)]
+    (erlang/put STATE-KEY (assoc st :environment (erlang/get :bl_env) :context (merge (:context st {}) (project allowed ctx))))
+    (try (f) (finally (if (= previous :undefined) (erlang/erase STATE-KEY)
+                         (erlang/put STATE-KEY previous))))))
+
+(defmacro with-context [ctx & body]
+  `(diagnostics/with-context-fn ~ctx (fn [] ~@body)))
+
+(defn with-span-fn
+  "Time one invocation. Return/raise is mechanical, not a claim of publication."
+  [span-name fields f]
+  (when (or (not (keyword? span-name)) (nil? (namespace span-name))
+            (> (count (str span-name)) 128))
+    (throw (ex-info "diagnostics: a span name is a bounded qualified keyword" {:kind :invalid-config})))
+  (let [previous (erlang/get STATE-KEY) st (state)
+        span {:id (str "span_" (erlang/unique_integer (list :positive :monotonic)))
+              :name span-name :parent (get-in st [:span :id])
+              :fields (project (:fields (get (:events st) span-name)) fields)}
+        start (erlang/monotonic_time :millisecond)]
+    (erlang/put STATE-KEY (assoc st :environment (erlang/get :bl_env) :span span))
+    (try
+      (emit! :diagnostics.span/started fields)
+      (try
+        (let [result (f)]
+          (emit! :diagnostics.span/ended {:diagnostics/outcome :returned
+                                        :diagnostics/duration-ms (- (erlang/monotonic_time :millisecond) start)})
+          result)
+        (catch e
+          (emit! :diagnostics.span/ended (merge (safe-error e) {:diagnostics/outcome :raised
+                                      :diagnostics/duration-ms (- (erlang/monotonic_time :millisecond) start)}))
+          (throw e)))
+      (finally (if (= previous :undefined) (erlang/erase STATE-KEY)
+                   (erlang/put STATE-KEY previous))))))
+
+(defmacro with-span [span-name fields & body]
+  `(diagnostics/with-span-fn ~span-name ~fields (fn [] ~@body)))
+
+(defn configure!
+  "Install trusted defaults in this runtime environment. Scoped overrides remain local."
+  [opts]
+  (with-options-fn opts
+    #(persistent_term/put (runtime-key)
+       (assoc (state) :context {:diagnostics/boot-id
+                                (or (:diagnostics/boot-id (context)) (new-id))})))
+  nil)
+
+(defn unconfigure! [] (persistent_term/erase (runtime-key)) nil)
+
+(defn capture
+  "Capture only registered diagnostics state, never the whole process dictionary."
+  [] (assoc (state) :environment (erlang/get :bl_env)))
+
+(defn with-captured-fn [captured f]
+  (when (or (not (map? captured)) (not= (:environment captured) (erlang/get :bl_env)))
+    (throw (ex-info "diagnostics: captured scope belongs to another environment" {:kind :invalid-config})))
+  (let [previous (erlang/get STATE-KEY)]
+    (erlang/put STATE-KEY captured)
+    (try (f) (finally (if (= previous :undefined) (erlang/erase STATE-KEY)
+                         (erlang/put STATE-KEY previous))))))
+
+(defn with-linkage-fn
+  "Start detached work with projected durable linkage and fresh execution IDs.
+   Clears the previous tenant and span rather than merging unrelated executions."
+  [linkage f]
+  (with-captured-fn (dissoc (assoc (capture) :context
+                              (select-keys (context) [:diagnostics/boot-id :diagnostics/release-id])) :span)
+    #(with-context-fn (merge linkage {:diagnostics/attempt-id (new-id)
+                                     :diagnostics/trace-id (new-id)}) f)))
+
+(defn project-record
+  "Revalidate a record at an external logging boundary; never copy arbitrary keys."
+  [record events]
+  (when (map? record)
+    (let [event (:diagnostics/event record) spec (when (event-name? event) (get (merge BUILTIN-EVENTS events) event))
+          span-name (:diagnostics/span-name record)
+          span-spec (when (event-name? span-name) (get (merge BUILTIN-EVENTS events) span-name))
+          context-schema (reduce #(assoc %1 %2 :id) {} CONTEXT-KEYS)]
+      (when spec
+        (merge (project context-schema record)
+               (project (:fields span-spec) record)
+               (project (:fields spec) record)
+               (project {:diagnostics/event-id :id :diagnostics/span-id :id
+                         :diagnostics/parent-span-id :id :diagnostics/at :count} record)
+               (when span-spec {:diagnostics/span-name span-name})
+               {:diagnostics/schema-version 1 :diagnostics/event event
+                :diagnostics/level (:level spec :info)})))))
+
+
+(defn timing-hook
+  "An opt-in loader timing callback. Carry diagnostics alone across the worker
+   boundary; library publication keeps its existing Env/capability ownership.
+   Rebase the diagnostic scope to that executing Env and restore it in finally."
+  []
+  (when (enabled? :runtime.phase/completed)
+    (let [captured (capture)]
+      (fn [phase f]
+        (let [previous (erlang/get STATE-KEY)
+              start (erlang/monotonic_time :microsecond)
+              reductions (elem (erlang/process_info (erlang/self) :reductions) 1)]
+          (erlang/put STATE-KEY (assoc captured :environment (erlang/get :bl_env)))
+          (try (f)
+            (finally
+              (emit! :runtime.phase/completed
+                {:runtime.phase/name phase
+                 :runtime.phase/namespace (erlang/get :bl_loader_timing_ns)
+                 :runtime.phase/duration-us (- (erlang/monotonic_time :microsecond) start)
+                 :runtime.phase/reductions (- (elem (erlang/process_info (erlang/self) :reductions) 1) reductions)})
+              (if (= previous :undefined) (erlang/erase STATE-KEY)
+                  (erlang/put STATE-KEY previous)))))))))

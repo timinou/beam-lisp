@@ -1,0 +1,58 @@
+# Repository Elixir-source reachability audit — 2026-09-28 checkpoint
+
+## Current inventory
+
+After the `e8403489` host cutover (inventory rechecked in this session), the non-ignored repository contains **5 `.ex`** files and **113 `.exs`** files. The `.exs` distribution is `test/` 90, `research/` 9, `!tasks/` 6, `scripts/` 5, and one each in `config/`, `examples/`, and `priv/`. This is **not** the requested zero-source state. The `test/support/beam_lisp_test.ex` helper has already been replaced by a seeded BL host; no repository `.ex` files remain outside the five production substrate modules below.
+
+The earlier dependency sweep checked 1,165 authored files under `lib/`, `priv/`, `test/`, `bin/`, `config/`, `native/`, `scripts/`, `examples/`, `bench/`, `tooling/`, and `editors/`, as well as the two extensionless launch scripts and `env.bl`. It traced literal calls, dynamically constructed module atoms, OTP callbacks and child specs, seed-manifest host leaves, compile-time macros, protocol implementations, and test entry points. `projects/**` was checked for the earlier four candidate modules, with no references found. This is a conservative static reachability audit, not a proof of unreachability in external consumers.
+
+## Definitive *in-repository* deletion finding
+
+**None of the remaining five `.ex` files is unused.** An import-only scan would be wrong: the cold launcher, OTP application callback, dynamic namespace loader, and seeded host/compiler paths invoke these modules even when no explicit `import` names them.
+
+| Remaining source | Observed root / dependency | Gate before removal |
+| --- | --- | --- |
+| `lib/beam_lisp/aot_cache.ex` | `bin/bl` computes the live compiler key; `BeamLisp.AOT`, build and seed use cache/provenance operations. Compiler-pinned host-source mappings are part of the key contract. | BL exact-atom replacement must work **before** bootstrap verdicts and hash all migrated codegen leaves; edit a codegen source in a scratch tree to prove key rotation, then rebuild tier and seed. |
+| `lib/beam_lisp/aot.ex` | `BeamLisp.init/0` and the launcher load/build the boot tier; `seed.bl` calls the pinned host compiler, and tests compile probes through it. | Port descriptor compilation, bootstrap-tier install, macro/struct attributes, diagnostics and provenance together; cold checkout and seed fixpoint required. |
+| `lib/beam_lisp/bootstrap.ex` | `bin/bl` calls `install_hosts!` before the tier verdict and `install!` to enforce the committed seed manifest. | BL replacement must be staged by `bin/bl-stage-hosts` before `elixirc` and operate without preloaded `Ns.Rt`; corrupt-host and same-key SHA freshness cases must remain covered. |
+| `lib/beam_lisp/loader.ex` | Runtime `require`, `BeamLisp.run_file/1`, and app bootstrap resolve and load namespaces; `Loader.Server` is an OTP child. | Preserve dynamic namespace load, source/beam preference, path semantics, diagnostics and concurrent loader ownership under cold boot. |
+| `lib/beam_lisp/env.ex` | OTP application starts the registry; reader/compiler/linker, all pinned host leaves and test isolation use its var table. | Preserve ETS/Agent ownership, namespace resolution, process-local bindings and seeded state; it is the lowest pre-boot dependency and cannot call `Ns.Rt` before that tier loads. |
+
+The earlier apparent candidates were **not deleted as unused**: `DevChange`, `AnfInterpreter`, `Sandbox` and `ExUnitCase` were ported with their public/test contracts and seeded at their exact atoms. `DevChange` is a loadable public dev namespace; `AnfInterpreter` is the live ANF oracle; `Sandbox` and `ExUnitCase` are public test APIs. Their absence from a CLI import list never justified losing coverage.
+
+## Dynamic reachability edges
+
+- `env.bl` declares the `BeamLisp.Application` OTP callback. It starts `BeamLisp.Env` and `BeamLisp.Loader.Server`, then calls `BeamLisp.init/0`; the application and root API are already committed BL host beams, but the Env implementation remains Elixir.
+- `bin/bl-stage-hosts` verifies and stages exact manifest-listed host beams **before** `elixirc`. `Bootstrap.install_hosts!` establishes SHA authority before tier-key comparison. A stale boot tier rebuilds as a unit and re-executes in a fresh VM.
+- `AOT` dynamically builds `BeamLisp.Ns.Init.*`/`Body.*`; runtime `Record` and `Server` factories synthesize additional module atoms. `defimpl`, compile-time guard macros, and OTP callbacks are dependency edges without ordinary function-call imports.
+- A warm VM can retain a deleted Elixir beam or compiler namespace var. A scratch checkout with no `build/` is the decisive source-removal gate, followed by `bin/bl seed --check` and focused behavior tests.
+
+## Verification status and limits
+
+Completed cutovers through `e8403489` were committed in proved waves. The root API, native memo and ExUnit helper waves passed `bin/bl build --force`, `bin/bl seed --check`, focused BL suites, and scratch-tree cold boot. All orchestrated builds/tests used `systemd-run --user --scope` with explicit `MemoryMax` and `MemorySwapMax`; no unrelated `.local/!journal/todos/*` files were staged. The full repository test suite, migration of all 113 `.exs` files, release-image inspection, and final zero-source inventory **have not been completed**. Do not claim a definitive *externally unused* module list from this static audit: downstream users may load public namespaces by name.
+
+## Transitive closure of the 113 `.exs` files
+
+The inventory is **89** `test/beam_lisp/*_test.exs` suites, **1** `test/test_helper.exs`, **1** `priv/bootstrap/seed/manifest.exs`, **1** `config/config.exs`, **1** `examples/executor/demo.exs`, **6** `!tasks/artifacts/*.exs` gates, **9** `research/**/*.exs` probes, and **5** `scripts/*.exs` developer/benchmark scripts. These add to 113. A file's lack of an `import` edge does not mean it is not an entry point.
+
+| Root or group | Dependency direction and dependent-only files | Disposition |
+| --- | --- | --- |
+| `bin/bl test` → 89 ExUnit suites | `priv/std/bl/test.bl.md` `exs-under` discovers `*_test.exs` under `test/beam_lisp/`; `run-exunit` loads `test/test_helper.exs` first. The helper starts ExUnit and loads `vm.hotpatch`. Thus the helper is **dependent-only on the ExUnit branch** and can go *after* the last suite ports. Do **not** remove the independent `vm.hotpatch` BL namespace: BL tests use it too. | Port assertions to BL by file; run old and new gates before each deletion. A basename check found only **1 direct-named** and **6 `host_`-named** BL suites for the 89 old files; names are not coverage proof. The other **82 have no exact-name counterpart**, though some behavior is covered under different names. Never delete the 89 wholesale. |
+| `bin/bl-stage-hosts` + `BeamLisp.Bootstrap.read_manifest!` → `priv/bootstrap/seed/manifest.exs` | The stage helper evaluates this Elixir data file, Bootstrap evaluates it again, and seed provenance tests check its hashes and host inventory. It is a **production root**, independent of ExUnit and the remaining `.ex` source files. | Replace the manifest format and **both** readers atomically, preserve SHA validation and cold pre-`elixirc` staging, regenerate the floor, then remove `.exs`. |
+| `config/config.exs` | No in-repository launcher or Mix entrypoint loads it (`mix.exs` is absent). `priv/build/release.bl` separately emits the `logger` stderr setting into the release config; `priv/lib/web.bl` mentions this file in a comment. | Candidate redundant source, **not** an established memory consumer. Before deletion, verify direct `bin/bl` JSON/stdout and release logger behavior, then update the stale web comment. External Mix consumers remain unverified. |
+| `examples/executor/demo.exs` | No in-repository caller; its header directs a manual `mix run`, while this tree no longer ships `mix.exs`. No BL demo counterpart exists. | Manual example, not a runtime dependency. Port or explicitly retire the example and its usage instructions; deleting it alone loses documentation. |
+| Six `!tasks/artifacts/*.exs` | Historical manually invoked gates. `canonical-upgrade-gate.exs` is explicitly cited by FEAT-037, FEAT-038 and PLAN-091 notes; `compiler-retention-probe.exs` is cited in `docs/compiler/finite-data.bl.org`. The other four have no currently observed in-repository executable caller, but are verification artifacts. | Preserve provenance or port each gate before removing; historical plan prose is a reproducibility edge, not a live boot root. Do not misclassify these as required by default `bl test`. |
+| Nine `research/**/*.exs` | READMEs under `p13a_smt`, `p13d_rule_proofs`, `selfbuild`, `sh0_seed` and `sh13_cutover` give manual commands. `research/selfbuild/p5_handbuilt_release.sh` directly evaluates `gen_start_boot.exs`; `research/rt-cutover/oracle.bl` cites `rt-flat/diff_exports.exs` as a historical differential. | Research/reproduction roots, not normal boot code. Port scripts **with** their README commands. If retiring the self-build experiment, retire/update the `p5_handbuilt_release.sh → gen_start_boot.exs` chain together. |
+| Five `scripts/*.exs` | Manual benchmark/corpus tools. `docs/memory-policy/07-streaming-without-the-heap.bl.md` cites results from `memocell_prototypes.exs` and `memocell_cas_breakdown.exs`; `freeze_anf_corpus.exs` is self-documented but has no observed active caller. | Port runnable tools or explicitly archive benchmark provenance and change the cited reproduction instructions. They are not processes resident in memory when idle. |
+
+### Fixture closure: do not delete the shared leaf
+
+`test/fixtures/aot/` is **actively shared** by BL AOT, sandbox and per-env suites. `test/fixtures/anf_canonical_corpus/` is read by `test/bl/anf_direct_emit_test.bl`. Neither becomes dead when an ExUnit suite is removed. In contrast, the older `test/fixtures/anf_corpus/` has **no observed current in-repository reader**; it is a candidate obsolete fixture set, subject to checking external historical consumers. The compatibility fixtures under `test/fixtures/jank/` and `specter/` need per-file reader mapping, not blanket removal. These fixture files are on disk, not resident application memory.
+
+## Memory relief observed this session
+
+`/tmp` is a **tmpfs**, not ordinary disk. Twenty-one cold-boot scratch copies created by this migration were confirmed to have no live process cwd/command references, then removed. Their allocated file blocks totaled about **2.99 GiB**; `/tmp` usage fell from **16 GiB to 13 GiB** and swap from **78 GiB to 73 GiB** across the cleanup (the swap change includes concurrent system activity, so it is not an exact per-directory attribution). No user app, other agent's `/tmp/cold2`, or project working file was removed.
+
+At measurement, swap was nearly full: `/dev/zram0` 49.7/49.8 GB and disk swap 34.2/36.5 GB, despite about 13 GiB RAM available. Per-process `VmSwap` identified large potential relief only if **the user confirms those sessions are idle**: Ghostty ≈8.6 GiB, `better-ccflare` ≈8.0 GiB, Android emulator ≈4.1 GiB, and 31 Bun processes ≈15.1 GiB in aggregate; BEAM VMs ≈5.8 GiB. These are not all ours. Closing unused terminal tabs, stale agent sessions or the idle emulator is preferable to killing active work. Never run `swapoff -a` with tens of GiB swapped and only ~13 GiB available RAM; it risks an out-of-memory failure. `drop_caches` would reclaim file cache, not these anonymous swapped process pages.
+
+The safe immediate cleanup is complete. Further memory release requires selecting *which live processes* may be stopped or restarted; no other process was terminated without authorization.

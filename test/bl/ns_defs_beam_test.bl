@@ -1,0 +1,280 @@
+; ns_defs_beam_test.bl — an AOT namespace's def table is read from its beam.
+;
+; The shim beam carries the table as a literal (`__bl_ns_defs__/0`). The init
+; replay used to COPY it into ETS (`put_ns_defs`): a second copy of every AST, and
+; a whole-namespace copy onto the caller's heap on every `ns_defs` read. Now init
+; stores a `{:"$beam", Mod}` reference (`link_ns_defs`) and `ns_defs/1` asks the
+; beam. Live changes use a constant descriptor and separate definition rows;
+; the full-map API remains compatible without copying the whole table per def.
+;
+; What this pins:
+;   1. the shim exports `__bl_ns_defs__/0` and its answer equals what the old
+;      `put_ns_defs` stored, key for key;
+;   2. after init the ETS row is a REFERENCE (a few words), not the table;
+;   3. `ns_defs/1` through the reference equals the beam's table, and its other
+;      readers (`callers_of`, `namespaces`) still see the namespace;
+;   4. a live `defvar` on an AOT namespace keeps every earlier def and adds the new
+;      one, and `undefine_var` removes one — the reference becomes an overlay and
+;      the replaced shim is not asked for a table it no longer has;
+;   5. `destroy/1` of a forked env drops its overlay and leaves the beam's table.
+;
+; Run: bin/bl test test/bl/ns_defs_beam_test.bl
+
+(ns ns-defs-beam.test)
+
+(def ^:private SHIM :"Elixir.BeamLisp.Ns.NsDefsBeamFixture")
+(def ^:private NS "ns_defs_beam_fixture")
+
+(defn- purge! [m] (code/purge m) (code/delete m))
+
+(defn- ets-row
+  "The raw `ns_defs` row of the CURRENT env. Ward runs a file in a fork, so the row
+   is under that fork's id, never `:global`."
+  [ns]
+  (let [r (erlang/apply :ets :lookup (list :beam_lisp_vars (tuple (BeamLisp.Env/env_id) :ns_defs ns)))]
+    (if (empty? r) nil (erlang/element 2 (first r)))))
+
+(defn- incremental-row? [ns]
+  (let [row (ets-row ns)]
+    (and (tuple? row) (= 4 (erlang/tuple_size row))
+         (= :"$definitions" (elem row 0))
+         (= (count (BeamLisp.Env/ns_defs ns)) (elem row 2)))))
+
+(defn- flat-bytes [x] (* 8 (erlang/apply :erts_debug :flat_size (list x))))
+
+(defn- with-fixture
+  "Compile the fixture to a temp dir, init it, run `f`, and remove every trace."
+  [f]
+  (let [dir (str (System/tmp_dir!) "/bl_ns_defs_beam_" (erlang/unique_integer (list :positive)))
+        source #|(ns ns_defs_beam_fixture)
+(defn alpha [x] (+ x 1))
+(defn beta ([a] a) ([a b] (+ a b)))
+(defn gamma [& xs] (count xs))
+|]
+    (try
+      (BeamLisp.AOT/compile_source source (list (tuple :output_dir dir)))
+      (erlang/apply SHIM :__bl_init__ (list))
+      (f dir)
+      (finally
+        (purge! SHIM)
+        (purge! :"Elixir.BeamLisp.Ns.Body.NsDefsBeamFixture")
+        (BeamLisp.Env/delete_key (tuple :ns_defs NS))
+        (File/rm_rf! dir)))))
+
+(deftest the-shim-carries-its-def-table
+  (with-fixture
+    (fn [_]
+      (is (erlang/function_exported SHIM :__bl_ns_defs__ 0) "the shim exports the table")
+      (let [t (erlang/apply SHIM :__bl_ns_defs__ (list))]
+        (is (map? t))
+        (is (= #{"alpha" "beta" "gamma"} (set (keys t))))
+        (is (= 2 (count (get t "beta"))) "a two-clause defn keeps both clauses")))))
+
+(deftest init-stores-a-reference-not-the-table
+  (with-fixture
+    (fn [_]
+      (let [row (ets-row NS)]
+        (is (= (tuple :"$beam" SHIM) row) "the ETS row names the beam")
+        (is (< (flat-bytes row) 64) "and is a few words, not the AST")))))
+
+(deftest ns-defs-reads-through-the-reference
+  (with-fixture
+    (fn [_]
+      (is (= (erlang/apply SHIM :__bl_ns_defs__ (list)) (BeamLisp.Env/ns_defs NS)))
+      (is (some #(= NS %) (BeamLisp.Env/namespaces)) "namespaces/0 still finds it by key")
+      (is (= {} (BeamLisp.Env/ns_defs "ns_defs_beam_never_defined"))
+          "an unknown namespace is still the empty map"))))
+
+(deftest a-live-defvar-extends-an-aot-namespace
+  (with-fixture
+    (fn [_]
+      (let [before (BeamLisp.Env/ns_defs NS)
+            clause {:op :defn-clause :fname :delta :params (list {:pop :pvar :name "x"})
+                    :guard nil :body {:op :var :name "x" :ann {}} :ann {}}]
+        (BeamLisp.Link/defvar NS "delta" (list (tuple :fixed 1 :delta clause)))
+        (let [after (BeamLisp.Env/ns_defs NS)]
+          (is (incremental-row? NS) "the reference became a counted entry descriptor")
+          (is (= #{"alpha" "beta" "gamma" "delta"} (set (keys after)))
+              "every earlier def survived the shim being replaced")
+          (is (= (get before "beta") (get after "beta")) "and unchanged")
+          (is (= 7 (erlang/apply SHIM :delta (list 7))) "the new def answers through the shim")
+          (is (= 3 (erlang/apply SHIM :beta (list 1 2))) "so does an old one"))))))
+
+(deftest undefine-removes-one-def-from-a-referenced-table
+  (with-fixture
+    (fn [_]
+      (BeamLisp.Env/undefine_var NS "gamma")
+      (is (= #{"alpha" "beta"} (set (keys (BeamLisp.Env/ns_defs NS)))))
+      (is (incremental-row? NS)))))
+
+; ──────────────────────────────────────────────────────────────────────────
+; ORIGINAL SIX TESTS: reference, init storage, readthrough, defvar, undefine, fork
+; ──────────────────────────────────────────────────────────────────────────
+
+(deftest a-forked-env-overlay-is-dropped-with-the-env
+  (with-fixture
+    (fn [_]
+      (let [env (BeamLisp.Env/fork)
+            base (BeamLisp.Env/ns_defs NS)]
+        (BeamLisp.Env/with_env env
+          (fn []
+            (BeamLisp.Env/put_ns_defs NS (assoc base "scratch" (list)))
+            (is (contains? (BeamLisp.Env/ns_defs NS) "scratch"))))
+        (BeamLisp.Env/destroy env)
+        (is (= base (BeamLisp.Env/ns_defs NS)) "the table under the fork is the beam's")
+        (is (= (tuple :"$beam" SHIM) (ets-row NS)))))))
+
+
+; Namespace-table lifetime regressions use real publication and isolated envs.
+(defn- identity-clause [name]
+  {:op :defn-clause :fname name :params (list {:pop :pvar :name "x"})
+   :guard nil :body {:op :var :name "x" :ann {}} :ann {}})
+(defn- add-identity! [ns name]
+  (BeamLisp.Link/defvar ns (Atom/to_string name)
+    (list (tuple :fixed 1 name (identity-clause name)))))
+
+(deftest defvar-materializes-all-references-without-changing-other-env-tables
+  (with-fixture
+    (fn [_]
+      (let [base (BeamLisp.Env/ns_defs NS)
+            child (BeamLisp.Env/fork)
+            sibling-ref (BeamLisp.Env/fork)
+            sibling-map (BeamLisp.Env/fork)
+            overlay (assoc base "scratch" (list))]
+        (try
+          (BeamLisp.Env/with_env sibling-ref (fn [] (BeamLisp.Env/link_ns_defs NS SHIM)))
+          (BeamLisp.Env/with_env sibling-map (fn [] (BeamLisp.Env/put_ns_defs NS overlay)))
+          (BeamLisp.Env/with_env child
+            (fn []
+              (is (= base (BeamLisp.Env/ns_defs NS)))
+              (add-identity! NS :delta)
+              (is (= #{"alpha" "beta" "gamma" "delta"} (set (keys (BeamLisp.Env/ns_defs NS)))))
+              (is (= 7 (erlang/apply SHIM :delta (list 7))))
+              (is (= 3 (erlang/apply SHIM :beta (list 1 2))))
+              (is (not (erlang/function_exported SHIM :__bl_ns_defs__ 0)))))
+          (is (incremental-row? NS) "parent reference materializes before shim replacement")
+          (is (= base (BeamLisp.Env/ns_defs NS)))
+          (BeamLisp.Env/with_env sibling-ref
+            (fn [] (is (incremental-row? NS)) (is (= base (BeamLisp.Env/ns_defs NS)))))
+          (BeamLisp.Env/with_env sibling-map
+            (fn [] (is (= overlay (BeamLisp.Env/ns_defs NS)))))
+          (BeamLisp.Env/destroy child)
+          (is (= base (BeamLisp.Env/ns_defs NS)))
+          (BeamLisp.Env/with_env sibling-ref
+            (fn [] (is (= base (BeamLisp.Env/ns_defs NS)))))
+          (finally
+            (BeamLisp.Env/destroy child)
+            (BeamLisp.Env/destroy sibling-ref)
+            (BeamLisp.Env/destroy sibling-map)))))))
+
+(deftest child-undefine-and-later-defvar-preserve-removal
+  (with-fixture
+    (fn [_]
+      (let [base (BeamLisp.Env/ns_defs NS) child (BeamLisp.Env/fork)]
+        (try
+          (BeamLisp.Env/with_env child
+            (fn []
+              (BeamLisp.Env/undefine_var NS "gamma")
+              (is (= #{"alpha" "beta"} (set (keys (BeamLisp.Env/ns_defs NS)))))
+              (add-identity! NS :delta)
+              (is (= #{"alpha" "beta" "delta"} (set (keys (BeamLisp.Env/ns_defs NS)))))))
+          (is (= base (BeamLisp.Env/ns_defs NS)))
+          (finally (BeamLisp.Env/destroy child)))))))
+
+(deftest empty-child-overlay-shadows-parent-reference
+  (with-fixture
+    (fn [_]
+      (let [base (BeamLisp.Env/ns_defs NS) child (BeamLisp.Env/fork)]
+        (try
+          (BeamLisp.Env/with_env child
+            (fn []
+              (BeamLisp.Env/put_ns_defs NS {})
+              (is (= {} (BeamLisp.Env/ns_defs NS)))
+              (add-identity! NS :delta)
+              (is (= #{"delta"} (set (keys (BeamLisp.Env/ns_defs NS)))))))
+          (is (= base (BeamLisp.Env/ns_defs NS)))
+          (finally (BeamLisp.Env/destroy child)))))))
+
+(deftest callers-of-survives-reference-to-overlay-publication
+  (with-fixture
+    (fn [_]
+      (let [ns "ns_defs_beam_caller"
+            mod (BeamLisp.Emit/module_for ns)
+            dir (str (System/tmp_dir!) "/bl_ns_defs_caller_" (erlang/unique_integer (list :positive)))
+            source "(ns ns_defs_beam_caller) (defn target [] (ns_defs_beam_fixture/alpha 5)) (defn unrelated [] (erlang/length '(1 2)))"
+            expected (tuple ns "target")]
+        (try
+          (BeamLisp.AOT/compile_source source (list (tuple :output_dir dir)))
+          (erlang/apply mod :__bl_init__ (list))
+          (let [before (BeamLisp.Env/callers_of NS "alpha")]
+            (is (some (fn [x] (= expected x)) before))
+            (is (not (some (fn [x] (= (tuple ns "unrelated") x)) before)))
+            (add-identity! NS :delta)
+            (is (= (set before) (set (BeamLisp.Env/callers_of NS "alpha")))))
+          (finally
+            (BeamLisp.Env/undefine_var ns "target")
+            (BeamLisp.Env/undefine_var ns "unrelated")
+            (BeamLisp.Env/delete_key (tuple :ns_defs ns))
+            (purge! mod)
+            (purge! :Elixir.BeamLisp.Ns.Body.NsDefsBeamCaller)
+            (File/rm_rf! dir)))))))
+
+(deftest source-loaded-definitions-use-incremental-entry-descriptors
+  (let [ns "ns_defs_beam_source" mod (BeamLisp.Emit/module_for ns) child (BeamLisp.Env/fork)]
+    (try
+      (BeamLisp/eval "(ns ns_defs_beam_source) (defn manual [x] x)")
+      (let [base (BeamLisp.Env/ns_defs ns)]
+        (is (incremental-row? ns))
+        (is (contains? base "manual"))
+        (BeamLisp.Env/with_env child (fn [] (is (= base (BeamLisp.Env/ns_defs ns))))))
+      (finally
+        (BeamLisp.Env/destroy child)
+        (BeamLisp.Env/undefine_var ns "manual")
+        (BeamLisp.Env/delete_key (tuple :ns_defs ns))
+        (purge! mod)))))
+
+(deftest uninitialized-and-missing-export-references-resolve-empty
+  (doseq [mod [:Elixir.NsDefsBeamAbsent :erlang]]
+    (try
+      (BeamLisp.Env/link_ns_defs "ns_defs_beam_missing" mod)
+      (is (= {} (BeamLisp.Env/ns_defs "ns_defs_beam_missing")))
+      (finally (BeamLisp.Env/delete_key (tuple :ns_defs "ns_defs_beam_missing"))))))
+
+(deftest cold-initializer-self-defvar-keeps-declarations-and-live-overlay
+  (let [ns "ns_defs_beam_cold"
+        mod (BeamLisp.Emit/module_for ns)
+        dir (str (System/tmp_dir!) "/bl_ns_defs_cold_" (erlang/unique_integer (list :positive)))
+        seen (atom 0)
+        source "(ns ns_defs_beam_cold) (defn alpha [x] (+ x 1)) (def boot (do (swap! (BeamLisp.Env/fetch! \"ns_defs_beam_probe\" \"seen\") (fn [n] (+ n 1))) (BeamLisp/eval \"(ns ns_defs_beam_cold) (defn late [x] (+ x 10))\") :ready))"]
+    (try
+      (BeamLisp.Env/intern "ns_defs_beam_probe" "seen" seen)
+      (BeamLisp.AOT/compile_source source (list (tuple :output_dir dir)))
+      ; Keep the writer's exact module identities; no filename-derived guesses.
+      (let [images (map (fn [path]
+                         (let [bytes (File/read! path)]
+                           (tuple (Keyword/get (beam_lib/info bytes) :module) path bytes)))
+                       (Path/wildcard (str dir "/*.beam")))]
+        (doseq [name ["alpha" "late" "boot"]] (BeamLisp.Env/undefine_var ns name))
+        (BeamLisp.Env/delete_key (tuple :ns_defs ns))
+        (doseq [image images] (purge! (elem image 0)))
+        (doseq [image images]
+          (is (= (tuple :module (elem image 0))
+                 (code/load_binary (elem image 0) (String/to_charlist (elem image 1)) (elem image 2)))))
+        (reset! seen 0)
+        (erlang/apply mod :__bl_init__ (list))
+        (is (= 1 @seen) "one initializer execution during this cold replay")
+        (is (= :ready (BeamLisp.Env/fetch! ns "boot")))
+        (is (contains? (BeamLisp.Env/ns_defs ns) "alpha"))
+        (is (contains? (BeamLisp.Env/ns_defs ns) "late"))
+        (is (incremental-row? ns) "self-defvar preserves the counted live table")
+        (is (= 4 (erlang/apply mod :alpha (list 3))))
+        (is (= 13 (erlang/apply mod :late (list 3))))
+        (doseq [image images] (purge! (elem image 0))))
+      (finally
+        (doseq [name ["alpha" "late" "boot"]] (BeamLisp.Env/undefine_var ns name))
+        (BeamLisp.Env/delete_key (tuple :ns_defs ns))
+        (BeamLisp.Env/undefine_var "ns_defs_beam_probe" "seen")
+        (purge! mod)
+        (File/rm_rf! dir)))))
+
+(run-tests)

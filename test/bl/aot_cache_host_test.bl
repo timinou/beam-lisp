@@ -1,0 +1,732 @@
+; aot_cache_host_test.bl — the pinned `Elixir.BeamLisp.AOTCache` host leaf: the
+; exact ABI, the compiler-key provenance, and the ISOLATED PREBOOT PROOF.
+;
+; `priv/host/aot_cache.bl` is compiled by `BeamLisp.AOT/compile-host-file` into
+; ONE exact-named beam (`Elixir.BeamLisp.AOTCache.beam`) whose top-level
+; `defn`s are the call surface every caller already names. `AOTCache` is the
+; module asked for the TOOLCHAIN KEY BEFORE rt/core exist — `bin/bl`'s boot
+; program calls `current_compiler_key/0` to judge the boot tier, and
+; `Bootstrap.install!/1` calls `compiler_key/0`/`build_key/0` to judge the floor,
+; both before `BeamLisp.init/0`. So this suite judges the four things that make
+; the pin sound:
+;
+;   1. THE EXPORTED ABI is the recalled public surface plus the private
+;      helpers, which the pinned emitter also exports (`defn-` included) — the
+;      one divergence every pinned port carries. The list is written down once,
+;      so a new accidental export fails loudly.
+;
+;   2. THE ANSWERS ARE THE LIVE MODULE'S, question for question, over the
+;      PUBLIC surface — including the two tier keys, the tier routing, the
+;      closure key and the refusals. A fresh compile of the source at a PROBE
+;      atom is compared to `Elixir.BeamLisp.AOTCache` under a normaliser that
+;      makes a raise a value, so a divergence in the exception class counts too.
+;
+;   3. THE TOOLCHAIN KEY IS PRESERVED TO THE BYTE — provenance and SHA. The test
+;      recomputes `compute_compiler_key/0` from the documented rule
+;      (`@codegen_modules` sources in order, the pinned `priv/host/<leaf>.bl`
+;      leaves by name, the `priv/boot/` + `priv/self/` tier, the runtime triple,
+;      NUL-joined sha256) and requires production's public key to equal it, so
+;      the port cannot silently stop hashing a source. It also pins the
+;      `@codegen_modules` membership: `AOTCache` is NOT a hashed input.
+;
+;   4. THE EMITTED BEAM RUNS AT PREBOOT. That is the property the pin exists
+;      for and the one a same-VM differential cannot see: the compiler that
+;      produced the probe has `BeamLisp.Ns.Rt` and all of `core` loaded, so a
+;      call that secretly went through the runtime would pass every test above.
+;      So the source is compiled at the PROBE atom, `load? false`; its atom
+;      table is checked for `Elixir.BeamLisp.Ns.Rt`/`Ns.Core`/`BeamLisp.Env`;
+;      and a fresh `elixir` child with ONLY that dir (and the pinned `Tiers`
+;      beside it) on the code path computes the toolchain key and calls the
+;      routing surface, asserting `BeamLisp.Ns.Rt`/`Ns.Core` are not loaded
+;      before or after and that the key is exactly the tree's.
+;
+; The cache is GLOBAL by default, so every test that touches it pins
+; `BEAM_LISP_AOT_CACHE_DIR` to a per-test temp root and restores the
+; environment afterwards.
+;
+; Run: bin/bl test test/bl/aot_cache_host_test.bl
+
+(ns aot-cache-host.test)
+
+(def ^:private PROBE :Elixir.BeamLisp.AotCacheProbe)
+(def ^:private LIVE :Elixir.BeamLisp.AOTCache)
+
+(defn- t [k v] (erlang/list_to_tuple (list k v)))
+(defn- pair [k v] (erlang/list_to_tuple (list k v)))
+
+(defn- root
+  "The checkout the test judges: `BL_ROOT` (the launcher's export, and what the
+   pinned source anchors its codegen roots on) with the process cwd as fallback."
+  []
+  (let [r (System/get_env "BL_ROOT")]
+    (cond (nil? r) (BeamLisp/cwd) :else r)))
+
+(defn- probe-source [] (Path/join (root) "priv/host/aot_cache.bl"))
+
+(defn- exports [mod] (erlang/apply mod :module_info (list :exports)))
+
+(defn- attr [mod key]
+  (some (fn [a] (when (= key (erlang/element 1 a)) (erlang/element 2 a)))
+        (erlang/apply mod :module_info (list :attributes))))
+
+(defn- ensure-probe!
+  "The pinned `AOTCache`, compiled from `priv/host/aot_cache.bl` at `PROBE` with
+   `load? false`, then loaded here. Compiled once per VM."
+  []
+  (if (not= false (erlang/apply :code :is_loaded (list PROBE)))
+    PROBE
+    (let [out (str (System/tmp_dir!) "/bl_aot_cache_probe_"
+                   (erlang/unique_integer (list :positive)))
+          result (BeamLisp.AOT/compile_host_file (probe-source)
+                   (list (t :module PROBE) (t :output_dir out) (t :load? false)))
+          path (erlang/element 2 result)]
+      (code/purge PROBE)
+      (code/delete PROBE)
+      (code/load_binary PROBE (erlang/binary_to_list path) (File/read! path))
+      PROBE)))
+
+(defn- with-cache-dir
+  "Run `f` with a fresh per-test cache root in `BEAM_LISP_AOT_CACHE_DIR`,
+   restoring the previous value (unset stays unset) and removing the temp root."
+  [f]
+  (let [tag (erlang/unique_integer (list :positive))
+        cache (str (System/tmp_dir!) "/bl_aot_cache_host_" tag)
+        prev (System/get_env "BEAM_LISP_AOT_CACHE_DIR")]
+    (System/put_env "BEAM_LISP_AOT_CACHE_DIR" cache)
+    (try
+      (f cache)
+      (finally
+        (if (nil? prev)
+          (System/delete_env "BEAM_LISP_AOT_CACHE_DIR")
+          (System/put_env "BEAM_LISP_AOT_CACHE_DIR" prev))
+        (File/rm_rf! cache)))))
+
+(defn- sha256-hex [data]
+  (String/downcase (Base/encode16 (crypto/hash :sha256 data))))
+
+(defn- hash-parts
+  "`AOTCache.hash_parts/1` — sha256 over the parts joined by a NUL byte."
+  [parts]
+  (sha256-hex (IO/iodata_to_binary (Enum/intersperse parts 0))))
+
+; ── 1. the ABI, written down once ───────────────────────────────────────────
+
+(def ^:private EXPECTED-EXPORTS
+  "Every export of the pinned port: the recalled PUBLIC surface plus the private
+   helpers the pinned emitter also exports (`defn-` is not private on this
+   path). `module_info/0,1` is on every BEAM module. The variadic helper names
+   carry the emitter's `__bl_v` suffix."
+  (list
+    (t :aot_backend 0)
+    (t :bake_codegen_digest 1)
+    (t :baked_codegen_digest 0)
+    (t :baked_codegen_sources_path 0)
+    (t :"bcat__bl_v" 1)
+    (t :beam_file 1)
+    (t :build_key 0)
+    (t :build_key_pt 0)
+    (t :build_source_contents 0)
+    (t :cache_environment 1)
+    (t :cleanup_obsolete_generations 1)
+    (t :cleanup_obsolete_generations 2)
+    (t :closure_key 3)
+    (t :closure_walk 3)
+    (t :codegen_modules 0)
+    (t :codegen_part 0)
+    (t :codegen_source_path 1)
+    (t :codegen_source_roots 0)
+    (t :compiler_key 0)
+    (t :compute_build_key 0)
+    (t :compute_compiler_key 0)
+    (t :copy 2)
+    (t :current_build_key 0)
+    (t :current_compiler_key 0)
+    (t :dir 0)
+    (t :"enabled?" 0)
+    (t :enabled_off_env 0)
+    (t :ensure_module_loaded 2)
+    (t :entry_dir 2)
+    (t :fetch 3)
+    (t :gc_defaults 0)
+    (t :gc_last_sweep_pt 0)
+    (t :gc_options 1)
+    (t :generation_info 2)
+    (t :hash_parts 1)
+    (t :key_for_ns 1)
+    (t :key_for_source 1)
+    (t :key_for_source 2)
+    (t :key_for_tier 1)
+    (t :legacy_codegen_beam_bytes 0)
+    (t :link_beams 3)
+    (t :live_codegen_digest 0)
+    (t :"lst__bl_v" 1)
+    (t :maybe_cleanup_obsolete_generations 1)
+    (t :module_info 0)
+    (t :module_info 1)
+    (t :non_negative_integer 2)
+    (t :pinned_host_source 1)
+    (t :positive_integer 2)
+    (t :reset_cleanup_throttle 0)
+    (t :reset_compiler_key 0)
+    (t :reset_keys 0)
+    (t :run_init_modules 2)
+    (t :safe_term 1)
+    (t :self_mod 0)
+    (t :store 4)
+    (t :temp_path 1)
+    (t :toolchain_key_pt 0)
+    (t :toolchain_source_contents 0)
+    (t :"tup__bl_v" 1)
+    (t :"valid_beam?" 3)
+    (t :"valid_compiler_key?" 1)
+    (t :valid_entry 1)))
+
+(def ^:private PUBLIC
+  "The recalled public surface, exactly — a subset of `EXPECTED-EXPORTS`, and
+   the part a caller names."
+  (list
+    (t :aot_backend 0) (t :build_key 0) (t :cleanup_obsolete_generations 1)
+    (t :cleanup_obsolete_generations 2) (t :closure_key 3) (t :compiler_key 0)
+    (t :current_build_key 0) (t :current_compiler_key 0) (t :dir 0)
+    (t :"enabled?" 0) (t :enabled_off_env 0) (t :fetch 3) (t :key_for_ns 1)
+    (t :key_for_source 1) (t :key_for_source 2) (t :key_for_tier 1)
+    (t :reset_cleanup_throttle 0) (t :reset_compiler_key 0) (t :reset_keys 0)
+    (t :run_init_modules 2) (t :store 4)))
+
+(deftest the-pinned-aot-cache-exports-exactly-the-pinned-abi
+  (let [m (ensure-probe!)
+        got (Enum/sort (exports m))
+        want (Enum/sort EXPECTED-EXPORTS)]
+    (is (= want got)
+        (str "the pinned emitter exports every top-level defn it compiles; got "
+             (pr-str got)))
+    (is (every? (fn [e] (Enum/member? got e)) PUBLIC)
+        "every public function the callers name is still exported")
+    (is (not (some (fn [e] (includes? (Atom/to_string (first e)) ".")) got))
+        "no generation-ladder (`Elixir.BeamLisp.Ns.*`) export leaked in")))
+
+(deftest the-pinned-module-is-a-deterministic-function-of-its-source
+  (let [out (str (System/tmp_dir!) "/bl_aot_cache_repro_"
+                 (erlang/unique_integer (list :positive)))]
+    (let [build (fn []
+                  (erlang/element 2
+                    (BeamLisp.AOT/compile_host_file (probe-source)
+                      (list (t :module :Elixir.BeamLisp.AotCacheRepro)
+                            (t :output_dir out) (t :load? false)))))]
+      (is (= (File/read! (build)) (File/read! (build)))
+          "the pinned emitter is deterministic, so a committed seed beam can be
+           re-derived from this source and judged by its digest"))))
+
+; ── 2. the differential against the live module ─────────────────────────────
+
+(defn- answer
+  "The whole answer of `mod` applied to `name`/`args`: `[:value v]` or
+   `[:raise Class message]`, so a divergence in the exception CLASS is a
+   failure too."
+  [mod name args]
+  (try [:value (erlang/apply mod name args)]
+       (catch e [:raise (Map/get e :__struct__) (ex-message e)])))
+
+(defn- same-answer? [a b q]
+  (= (answer a (first q) (second q)) (answer b (first q) (second q))))
+
+(defn- corpus
+  "Questions the public surface answers without side effects, on both modules.
+   The keys are compared as VALUES (they must be equal), so a port that stopped
+   hashing a source diverges here."
+  []
+  (let [priv (Path/join (root) "priv")
+        deps {"a.bl" (list "b.bl") "b.bl" (list)}
+        hashes-a {"a.bl" "1" "b.bl" "2" "c.bl" "9"}
+        hashes-b {"a.bl" "1" "b.bl" "3" "c.bl" "9"}]
+    (list
+      (list :"enabled?" (list))
+      (list :enabled_off_env (list))
+      (list :dir (list))
+      (list :aot_backend (list))
+      (list :compiler_key (list))
+      (list :current_compiler_key (list))
+      (list :build_key (list))
+      (list :current_build_key (list))
+      (list :key_for_tier (list :build))
+      (list :key_for_tier (list :library))
+      (list :key_for_tier (list :boot))
+      (list :key_for_ns (list "core"))
+      (list :key_for_ns (list "compiler"))
+      (list :key_for_ns (list "reader-node"))
+      (list :key_for_ns (list "build"))
+      (list :key_for_ns (list "build-plan"))
+      (list :key_for_ns (list "datom"))
+      (list :key_for_source (list (Path/join priv "boot/core.bl")))
+      (list :key_for_source (list (Path/join priv "build/build.bl")))
+      (list :key_for_source (list (Path/join priv "std/errors.bl")))
+      (list :key_for_source (list (Path/join priv "boot/core.bl") priv))
+      (list :key_for_source (list (Path/join priv "build/build.bl") priv))
+      (list :closure_key (list "/nonexistent/x.bl" {} {"/nonexistent/x.bl" "h"}))
+      (list :closure_key (list "a.bl" deps hashes-a))
+      (list :closure_key (list "a.bl" deps hashes-b))
+      (list :closure_key (list "c.bl" deps hashes-a))
+      (list :closure_key (list "c.bl" deps hashes-b)))))
+
+(deftest the-pinned-aot-cache-answers-every-question-as-the-live-module-does
+  (with-cache-dir
+    (fn [_]
+      (let [probe (ensure-probe!)
+            mismatches (Enum/filter (corpus) (fn [q] (not (same-answer? probe LIVE q))))]
+        (is (= [] (vec (Enum/map mismatches first)))
+            (str "a fresh compile of priv/host/aot_cache.bl answers the corpus "
+                 "exactly as the live BeamLisp.AOTCache does; divergent "
+                 "questions listed by name"))
+        (is (pos? (count (corpus))) "the corpus is not empty")))))
+
+(deftest tier-routing-and-the-arity-defaults-are-the-recalled-ones
+  (with-cache-dir
+    (fn [_]
+      (let [m (ensure-probe!)
+            priv (Path/join (root) "priv")
+            ck (erlang/apply m :compiler_key (list))
+            bk (erlang/apply m :build_key (list))]
+        (is (= bk (erlang/apply m :key_for_tier (list :build))))
+        (is (= bk (erlang/apply m :key_for_source
+                    (list (Path/join (BeamLisp.Tiers/priv_root) "build/build.bl"))))
+            "the default root is the running runtime's priv directory")
+        (is (= bk (erlang/apply m :key_for_source (list (Path/join priv "build/build.bl") priv)))
+            "an explicitly rooted checkout build source uses the DRIVER key")
+        (is (= ck (erlang/apply m :key_for_source (list (Path/join priv "boot/core.bl"))))
+            "a codegen source is stamped with the codegen key")
+        (is (= ck (erlang/apply m :key_for_source (list (Path/join priv "boot/core.bl") priv)))
+            "the two-arity form takes an explicit root")
+        (is (= ck (erlang/apply m :key_for_ns (list "core"))))
+        (is (= bk (erlang/apply m :key_for_ns (list "build-plan"))))))))
+
+; ── 3. the compiler key: provenance and SHA, preserved ──────────────────────
+
+(defn- codegen-modules
+  "`@codegen_modules` in order, paired with the source its bytes MUST come from:
+   a pinned host leaf from `priv/host/<leaf>.bl`."
+  []
+  (list (list :Elixir.BeamLisp.AOT "priv/host/aot.bl")
+        (list :Elixir.BeamLisp.AtomGuard "priv/host/atom_guard.bl")
+        (list :Elixir.BeamLisp.CompilerData "priv/host/compiler_data.bl")
+        (list :Elixir.BeamLisp.Record "priv/host/record.bl")
+        (list :Elixir.BeamLisp.Emit "priv/host/emit.bl")
+        (list :Elixir.BeamLisp.Optimize "priv/host/optimize.bl")
+        (list :Elixir.BeamLisp.Link "priv/host/link.bl")
+        (list :Elixir.BeamLisp.Tiers "priv/host/tiers.bl")))
+
+(defn- live-codegen-digest []
+  (hash-parts
+    (concat (list "codegen")
+            (mapcat (fn [m] (list (File/read! (Path/join (root) (second m)))
+                                  (str (first m))))
+                    (codegen-modules)))))
+
+(defn- toolchain-source-contents []
+  (let [boot (Path/wildcard (Path/join (BeamLisp.Tiers/boot_dir) "**/*.bl"))
+        self (Path/wildcard (Path/join (BeamLisp.Tiers/priv_root) "self/**/*.bl"))]
+    (map File/read! (sort (concat boot self)))))
+
+(defn- predicted-key []
+  (hash-parts
+    (concat (list (str "elixir:" (System/version))
+                  (str "otp:" (erlang/list_to_binary (erlang/system_info :otp_release)))
+                  (str "aot_backend:" (BeamLisp.AOTCache/aot_backend))
+                  (str "codegen-source:" (live-codegen-digest)))
+            (toolchain-source-contents))))
+
+(deftest the-toolchain-key-is-the-key-of-the-live-codegen-sources
+  (with-cache-dir
+    (fn [_]
+      (let [probe (ensure-probe!)
+            predicted (predicted-key)]
+        (is (= predicted (erlang/apply probe :current_compiler_key (list)))
+            "the pinned key must equal the key of the LIVE codegen sources,
+             computed by the documented rule — provenance and SHA preserved")
+        (is (= predicted (BeamLisp.AOTCache/current_compiler_key))
+            "and the live Elixir module agrees, so the port is a drop-in")
+        (is (= 64 (erlang/byte_size predicted)))))))
+
+(deftest the-baked-digest-is-the-live-digest-so-a-drop-is-not-born-stale
+  (let [path (Path/join (BeamLisp.Tiers/priv_root) "codegen.sources")
+        original (when (File/exists? path) (File/read! path))]
+    (try
+      (let [probe (ensure-probe!)
+            _ (erlang/apply probe :current_compiler_key (list))
+            baked (String/trim (File/read! path))]
+        (is (Regex/match? (Regex/compile! "^[0-9a-f]{64}$") baked)
+            "the baked digest must be the shape the drop's fallback accepts")
+        (is (= (live-codegen-digest) baked)
+            "a drop computing its key from the baked digest must get this key"))
+      (finally
+        (if (nil? original) (File/rm path) (File/write! path original))))))
+
+(deftest the-codegen-module-list-is-the-recalled-one-and-excludes-aotcache
+  (let [probe (ensure-probe!)
+        from-port (erlang/apply probe :codegen_modules (list))
+        from-source (map first (codegen-modules))]
+    (is (= from-source from-port)
+        "the hashed members are `@codegen_modules`, in order")
+    (is (not (Enum/member? from-port :Elixir.BeamLisp.AOTCache))
+        "AOTCache is NOT a hashed input — the key cannot hash the module that computes it")
+    (let [src (File/read! (Path/join (root) "priv/host/aot_cache.bl"))
+          block (-> src (String/split "(defn- codegen_modules") second
+                        (String/split "(defn- pinned_host_source") first)]
+      (is (not (includes? block ":Elixir.BeamLisp.AOTCache"))
+          "the pinned host source must exclude its own key computer")
+      (doseq [m from-source]
+        (is (includes? block (str ":" m))
+            (str m " must still be a member of codegen_modules"))))))
+
+(deftest every-codegen-module-resolves-to-the-source-the-rule-names
+  (let [probe (ensure-probe!)]
+    (doseq [m (codegen-modules)]
+      (let [mod (first m)
+            rel (second m)
+            path (erlang/apply probe :codegen_source_path (list mod))]
+        (is (String/ends_with? path rel)
+            (str mod " must resolve to " rel ", got " path))
+        (is (File/exists? path) (str rel " must exist — the digest names it"))))))
+
+(deftest the-legacy-beam-bytes-fallback-is-the-pre-bug-048-rule
+  (let [probe (ensure-probe!)
+        expected (filter (fn [x] (erlang/is_binary x))
+                   (map (fn [m]
+                          (let [r (erlang/apply :code :get_object_code (list m))]
+                            (cond
+                              (and (erlang/is_tuple r) (= 3 (erlang/tuple_size r))
+                                   (= m (erlang/element 1 r)))
+                              (erlang/element 2 r)
+                              :else nil)))
+                        (map first (codegen-modules))))]
+    (is (= expected (erlang/apply probe :legacy_codegen_beam_bytes (list)))
+        "the kept pre-BUG-048 branch hashes the same beam bytes the live rule did")))
+
+; ── 4. the cache layout, store/fetch/cleanup ────────────────────────────────
+
+(defn- fake-mod [] :Elixir.BeamLisp.HostCacheFixture)
+
+(defn- beam-name [mod] (str mod ".beam"))
+
+(deftest cache-entry-keys-cannot-escape-the-cache-root
+  (with-cache-dir
+    (fn [_]
+      (let [m (ensure-probe!)]
+        (is (thrown-with-msg? "safe path components"
+              (erlang/apply m :store (list ".." "entry" (System/tmp_dir!) '()))))
+        (is (thrown-with-msg? "safe path components"
+              (erlang/apply m :fetch (list ".." "entry" (System/tmp_dir!)))))))))
+
+(deftest a-symlinked-generation-is-refused
+  (with-cache-dir
+    (fn [cache]
+      (let [m (ensure-probe!)
+            key (String/duplicate "d" 64)
+            target (str (System/tmp_dir!) "/bl_aot_cache_sym_"
+                        (erlang/unique_integer (list :positive)))]
+        (File/mkdir_p! target)
+        (File/mkdir_p! cache)
+        (File/ln_s! target (Path/join cache key))
+        (is (thrown-with-msg? "cannot be a symlink"
+              (erlang/apply m :store (list key "entry" (System/tmp_dir!) '()))))
+        (File/rm_rf! target)))))
+
+(deftest the-port-and-the-live-module-publish-one-cache-layout
+  (with-cache-dir
+    (fn [_]
+      (let [m (ensure-probe!)
+            tag (erlang/unique_integer (list :positive))
+            src (str (System/tmp_dir!) "/bl_aot_cache_xsrc_" tag)
+            out-a (str (System/tmp_dir!) "/bl_aot_cache_xout_a_" tag)
+            out-b (str (System/tmp_dir!) "/bl_aot_cache_xout_b_" tag)
+            mod (fake-mod)
+            bytes (crypto/strong_rand_bytes 48)]
+        (File/mkdir_p! src)
+        (File/write! (Path/join src (beam-name mod)) bytes)
+        ; the LIVE module publishes; the PORT reads
+        (is (= :ok (BeamLisp.AOTCache/store "livekey" "closure" src (list mod))))
+        (let [res (erlang/apply m :fetch (list "livekey" "closure" out-a))]
+          (is (= :ok (elem res 0)))
+          (is (= (list mod) (elem res 1)))
+          (is (= bytes (File/read! (Path/join out-a (beam-name mod))))))
+        ; the PORT publishes; the LIVE module reads
+        (is (= :ok (erlang/apply m :store (list "portkey" "closure" src (list mod)))))
+        (let [res (BeamLisp.AOTCache/fetch "portkey" "closure" out-b)]
+          (is (= :ok (elem res 0)))
+          (is (= (list mod) (elem res 1)))
+          (is (= bytes (File/read! (Path/join out-b (beam-name mod))))))
+        (File/rm_rf! src)
+        (File/rm_rf! out-a)
+        (File/rm_rf! out-b)))))
+
+(deftest store-and-fetch-round-trip-modules-and-beam-bytes
+  (with-cache-dir
+    (fn [_]
+      (let [m (ensure-probe!)
+            tag (erlang/unique_integer (list :positive))
+            src (str (System/tmp_dir!) "/bl_aot_cache_src_" tag)
+            out (str (System/tmp_dir!) "/bl_aot_cache_out_" tag)
+            mod (fake-mod)
+            bytes (crypto/strong_rand_bytes 64)]
+        (File/mkdir_p! src)
+        (File/write! (Path/join src (beam-name mod)) bytes)
+        (is (= :ok (erlang/apply m :store (list "key" "closure" src (list mod)))))
+        (let [res (erlang/apply m :fetch (list "key" "closure" out))]
+          (is (= :ok (elem res 0)))
+          (is (= (list mod) (elem res 1))))
+        (is (= bytes (File/read! (Path/join out (beam-name mod))))
+            "the fetched beam is byte-identical to the stored one")
+        (is (File/exists? (Path/join (Path/join (Path/join (erlang/apply m :dir (list)) "key")
+                                                "closure")
+                                     "manifest.term"))
+            "the entry carries the v2 manifest")
+        (is (= :miss (erlang/apply m :fetch (list "key" "never-stored" out))))
+        (File/rm_rf! src)
+        (File/rm_rf! out)))))
+
+(deftest a-damaged-or-legacy-entry-is-a-miss
+  (with-cache-dir
+    (fn [cache]
+      (let [m (ensure-probe!)
+            tag (erlang/unique_integer (list :positive))
+            src (str (System/tmp_dir!) "/bl_aot_cache_dmg_src_" tag)
+            out (str (System/tmp_dir!) "/bl_aot_cache_dmg_out_" tag)
+            mod (fake-mod)
+            entry (Path/join (Path/join cache "integrity") "entry")]
+        (File/mkdir_p! src)
+        (File/write! (Path/join src (beam-name mod)) "original")
+        (is (= :ok (erlang/apply m :store (list "integrity" "entry" src (list mod)))))
+        ; corrupt one beam: the manifest's digest no longer matches
+        (File/write! (Path/join entry (beam-name mod)) "corrupt")
+        (is (= :miss (erlang/apply m :fetch (list "integrity" "entry" out))))
+        ; a legacy manifest (no version/digests) is on-disk input, never trusted
+        (File/write! (Path/join entry "manifest.term")
+                     (erlang/term_to_binary {:modules (list mod)}))
+        (is (= :miss (erlang/apply m :fetch (list "integrity" "entry" out))))
+        (File/rm_rf! src)
+        (File/rm_rf! out)))))
+
+(deftest cleanup-keeps-the-active-generation-and-deletes-the-obsolete
+  (with-cache-dir
+    (fn [cache]
+      (let [m (ensure-probe!)
+            active (String/duplicate "a" 64)
+            old1 (String/duplicate "b" 64)
+            old2 (String/duplicate "c" 64)]
+        (File/mkdir_p! (Path/join cache active))
+        (File/mkdir_p! (Path/join cache old1))
+        (File/mkdir_p! (Path/join cache old2))
+        (File/mkdir_p! (Path/join cache "not-a-key"))
+        (let [res (erlang/apply m :cleanup_obsolete_generations
+                    (list active (list (t :keep_generations 1) (t :max_delete 4))))]
+          (is (= 2 (erlang/tuple_size res)))
+          (is (= :ok (elem res 0)))
+          (is (Enum/member? (elem res 1) old1))
+          (is (Enum/member? (elem res 1) old2)))
+        (is (File/dir? (Path/join cache active)) "the active generation is retained")
+        (is (File/dir? (Path/join cache "not-a-key"))
+            "only sha256-named generations are candidates")
+        (is (not (File/dir? (Path/join cache old1))))
+        (is (not (File/dir? (Path/join cache old2))))
+        (is (= :ok
+               (elem (erlang/apply m :cleanup_obsolete_generations (list active)) 0)))))))
+
+(deftest closure-key-moves-with-a-dependencys-content-and-only-then
+  (with-cache-dir
+    (fn [_]
+      (let [m (ensure-probe!)
+            deps {"a.bl" (list "b.bl") "b.bl" (list)}
+            hashes-a {"a.bl" "1" "b.bl" "2" "c.bl" "9"}
+            hashes-b {"a.bl" "1" "b.bl" "3" "c.bl" "9"}]
+        (is (not= (erlang/apply m :closure_key (list "a.bl" deps hashes-a))
+                  (erlang/apply m :closure_key (list "a.bl" deps hashes-b))))
+        (is (= (erlang/apply m :closure_key (list "c.bl" deps hashes-a))
+               (erlang/apply m :closure_key (list "c.bl" deps hashes-b)))
+            "a source that does not depend on b.bl is unaffected")))))
+
+(deftest run-init-modules-invokes-bl-init-on-shims-only
+  (with-cache-dir
+    (fn [_]
+      (let [m (ensure-probe!)
+            n (erlang/unique_integer (list :positive))
+            shim (str "Elixir.BeamLisp.Ns.Spike" n)
+            companion (str "Elixir.BeamLisp.Ns.Init.Spike" n)
+            shim-mod (erlang/binary_to_atom shim :utf8)
+            companion-mod (erlang/binary_to_atom companion :utf8)]
+        (Code/compile_string
+          (str "defmodule " shim " do\n  def __bl_init__, do: send(self(), :init_ran)\nend\n"))
+        (Code/compile_string
+          (str "defmodule " companion " do\n  def __bl_init_values__, do: :ok\nend\n"))
+        (is (= :ok (erlang/apply m :run_init_modules
+                      (list (list companion-mod shim-mod) (System/tmp_dir!)))))
+        (is (receive :init_ran true (after 200 false))
+            "run_init_modules must call __bl_init__/0 on the shim")))))
+
+; ── 5. the environment surface ──────────────────────────────────────────────
+
+(deftest cache-participation-and-location-honour-their-environment
+  (let [prev-off (System/get_env "BEAM_LISP_AOT_CACHE")]
+    (with-cache-dir
+      (fn [cache]
+        (let [m (ensure-probe!)]
+          (is (= cache (erlang/apply m :dir (list))))
+          (is (erlang/apply m :"enabled?" (list)))
+          (is (= "BEAM_LISP_AOT_CACHE" (erlang/apply m :enabled_off_env (list))))
+          (doseq [v (list "off" "0" "false")]
+            (System/put_env "BEAM_LISP_AOT_CACHE" v)
+            (is (not (erlang/apply m :"enabled?" (list))) (str "off for " v)))
+          (System/delete_env "BEAM_LISP_AOT_CACHE")
+          (is (erlang/apply m :"enabled?" (list))))
+        (if (nil? prev-off)
+          (System/delete_env "BEAM_LISP_AOT_CACHE")
+          (System/put_env "BEAM_LISP_AOT_CACHE" prev-off))))))
+
+(deftest an-unsupported-backend-is-refused-by-name
+  (let [m (ensure-probe!)
+        prev (Application/get_env :beam_lisp :aot_backend)]
+    (try
+      (Application/put_env :beam_lisp :aot_backend :elixir)
+        (is (= :Elixir.ArgumentError
+               (try (erlang/apply m :aot_backend (list))
+                    :returned
+                    (catch e (Map/get e :__struct__)))))
+        (erlang/apply m :reset_keys (list))
+        (is (= :Elixir.ArgumentError
+               (try (erlang/apply m :current_compiler_key (list))
+                    :returned
+                    (catch e (Map/get e :__struct__)))))
+        (Application/put_env :beam_lisp :aot_backend :core)
+        (erlang/apply m :reset_keys (list))
+        (is (= :core (erlang/apply m :aot_backend (list))))
+        (is (= (BeamLisp.AOTCache/current_compiler_key)
+               (erlang/apply m :compiler_key (list))))
+      (finally
+        (if (nil? prev)
+          (Application/delete_env :beam_lisp :aot_backend)
+          (Application/put_env :beam_lisp :aot_backend prev))))))
+
+(deftest reset-keys-drops-both-memos
+  (with-cache-dir
+    (fn [_]
+      (let [m (ensure-probe!)]
+        (is (= (erlang/apply m :compiler_key (list))
+               (erlang/apply m :compiler_key (list))))
+        (is (= :ok (erlang/apply m :reset_keys (list))))
+        (is (= (erlang/apply m :current_compiler_key (list))
+               (erlang/apply m :compiler_key (list))))))))
+
+; ── 6. the isolated preboot proof ───────────────────────────────────────────
+
+(defn- beam-atoms [path]
+  (let [r (erlang/apply :beam_lib :chunks (list (erlang/binary_to_list path) (list :atoms)))]
+    (Enum/map (erlang/element 2 (first (erlang/element 2 (erlang/element 2 r))))
+              (fn [a] (erlang/element 2 a)))))
+
+(defn- runtime-atoms []
+  (list :"Elixir.BeamLisp.Ns.Core" :"Elixir.BeamLisp.Ns.Rt"
+        :"Elixir.BeamLisp.Env" :"Elixir.BeamLisp.Vector"))
+
+(deftest the-pinned-beam-does-not-name-the-runtime-it-must-not-call
+  (let [out (str (System/tmp_dir!) "/bl_aot_cache_atoms_"
+                 (erlang/unique_integer (list :positive)))
+        result (BeamLisp.AOT/compile_host_file (probe-source)
+                 (list (t :module :Elixir.BeamLisp.AotCacheAtoms) (t :output_dir out)
+                       (t :load? false)))
+        atoms (beam-atoms (erlang/element 2 result))]
+    (is (pos? (count atoms)) "the emitted beam was read back")
+    (doseq [a (runtime-atoms)]
+      (is (not (Enum/member? atoms a))
+          (str "the pinned beam never mentions " a
+               " — no core/Rt convenience leaked into the preboot path")))
+    (File/rm_rf! out)))
+
+(defn- tiers-beam-path []
+  (erlang/list_to_binary (code/which :Elixir.BeamLisp.Tiers)))
+
+(defn- preboot-script []
+  (str
+    "mod = Elixir.BeamLisp.AotCacheProbe\n"
+    "{:module, ^mod} = :code.ensure_loaded(mod)\n"
+    "IO.puts(\"loaded_from=\" <> to_string(:code.which(mod)))\n"
+    "IO.puts(\"rt_before=\" <> to_string(:code.is_loaded(:\"Elixir.BeamLisp.Ns.Rt\")))\n"
+    "IO.puts(\"core_before=\" <> to_string(:code.is_loaded(:\"Elixir.BeamLisp.Ns.Core\")))\n"
+    "IO.puts(\"key=\" <> mod.current_compiler_key())\n"
+    "IO.puts(\"build_key=\" <> mod.build_key())\n"
+    "IO.puts(\"ns_core=\" <> mod.key_for_ns(\"core\"))\n"
+    "IO.puts(\"ns_build=\" <> mod.key_for_ns(\"build-plan\"))\n"
+    "IO.puts(\"src_build=\" <> mod.key_for_source(Path.join([BeamLisp.Tiers.priv_root(), \"build\", \"build.bl\"])))\n"
+    "checkout_priv = Path.join(System.get_env(\"BL_ROOT\") || System.cwd(), \"priv\")\n"
+    "IO.puts(\"src_build_explicit=\" <> mod.key_for_source(Path.join([checkout_priv, \"build\", \"build.bl\"]), checkout_priv))\n"
+    "IO.puts(\"dir=\" <> mod.dir())\n"
+    "IO.puts(\"backend=\" <> to_string(mod.aot_backend()))\n"
+    "IO.puts(\"enabled=\" <> to_string(mod.enabled?()))\n"
+    "IO.puts(\"closure=\" <> mod.closure_key(\"a.bl\", %{\"a.bl\" => [\"b.bl\"], \"b.bl\" => []}, %{\"a.bl\" => \"1\", \"b.bl\" => \"2\"}))\n"
+    "IO.puts(\"fetch=\" <> to_string(mod.fetch(\"k\", \"c\", System.tmp_dir!())))\n"
+    "IO.puts(\"rt_after=\" <> to_string(:code.is_loaded(:\"Elixir.BeamLisp.Ns.Rt\")))\n"
+    "IO.puts(\"core_after=\" <> to_string(:code.is_loaded(:\"Elixir.BeamLisp.Ns.Core\")))\n"
+    "Process.put(:\"bl-osenv-overlay\", %{\"BEAM_LISP_AOT_CACHE\" => \"off\", \"BEAM_LISP_AOT_CACHE_DIR\" => \"overlay-cache\"})\n"
+    "false = mod.enabled?()\n"
+    "\"overlay-cache\" = mod.dir()\n"
+    "false = :code.is_loaded(:\"Elixir.BeamLisp.Env\")\n"
+    "false = :code.is_loaded(:\"Elixir.BeamLisp.Ns.Core\")\n"
+    "IO.puts(\"standalone-overlay-ok\")\n"))
+
+(deftest a-fresh-elixir-runs-the-candidate-beam-with-no-runtime-loaded
+  (with-cache-dir
+    (fn [_]
+      (let [dir (str (System/tmp_dir!) "/bl_aot_cache_preboot_"
+                     (erlang/unique_integer (list :positive)))
+            _ (File/mkdir_p! dir)
+            _ (BeamLisp.AOT/compile_host_file (probe-source)
+                (list (t :module PROBE) (t :output_dir dir) (t :load? false)))
+            _ (File/cp! (tiers-beam-path) (Path/join dir "Elixir.BeamLisp.Tiers.beam"))
+            r (System/cmd "elixir" (to-list ["-pa" dir "-e" (preboot-script)])
+                (to-list [(tuple :cd (root)) (tuple :stderr_to_stdout true)]))
+            text (elem r 0)
+            ck (BeamLisp.AOTCache/current_compiler_key)
+            bk (BeamLisp.AOTCache/current_build_key)]
+        (is (= 0 (elem r 1)) (str "the child VM exited " (elem r 1) ":\n" text))
+        (testing "nothing but Elixir/OTP, the pinned Tiers and the candidate beam"
+          (is (includes? text (str "loaded_from=" dir "/Elixir.BeamLisp.AotCacheProbe.beam"))
+              "the child loaded the CANDIDATE beam, not a repo ebin")
+          (is (includes? text "rt_before=false"))
+          (is (includes? text "core_before=false")))
+        (testing "the preboot answers are the tree's"
+          (is (includes? text (str "key=" ck))
+              "the child computed this toolchain's key with no runtime loaded")
+          (is (includes? text (str "build_key=" bk)))
+          (is (includes? text (str "ns_core=" ck)))
+          (is (includes? text (str "ns_build=" bk)))
+          (is (includes? text (str "src_build=" bk)))
+          (is (includes? text (str "src_build_explicit=" bk)))
+          (is (includes? text (str "dir=" (BeamLisp.AOTCache/dir))))
+          (is (includes? text "backend=core"))
+          (is (includes? text "enabled=true"))
+          (is (includes? text (str "closure="
+                                   (BeamLisp.AOTCache/closure_key
+                                     "a.bl" {"a.bl" (list "b.bl") "b.bl" (list)}
+                                     {"a.bl" "1" "b.bl" "2"}))))
+          (is (includes? text "fetch=miss")))
+        (testing "no call dragged the runtime in"
+          (is (includes? text "rt_after=false"))
+          (is (includes? text "core_after=false")))
+        (File/rm_rf! dir)))))
+
+(deftest staging-paths-are-distinct-across-fresh-vms-before-runtime-boot
+  (let [dir (str (System/tmp_dir!) "/bl_aot_cache_cross_vm_" (erlang/unique_integer (list :positive)))
+        script (str "mod = Elixir.BeamLisp.AotCacheProbe\n"
+                    "a = mod.temp_path(\"entry\")\n"
+                    "b = mod.temp_path(\"entry\")\n"
+                    "true = String.starts_with?(a, \"entry.tmp-\" <> to_string(:os.getpid()) <> \"-\")\n"
+                    "false = a == b\n"
+                    "false = :code.is_loaded(:\"Elixir.BeamLisp.Ns.Rt\")\n"
+                    "IO.puts(a)\n")]
+    (try
+      (File/mkdir_p! dir)
+      (BeamLisp.AOT/compile_host_file (probe-source)
+        (list (t :module PROBE) (t :output_dir dir) (t :load? false)))
+      (let [a (System/cmd "elixir" (list "-pa" dir "-e" script) (list (t :stderr_to_stdout true)))
+            b (System/cmd "elixir" (list "-pa" dir "-e" script) (list (t :stderr_to_stdout true)))]
+        (is (= 0 (elem a 1)) (elem a 0))
+        (is (= 0 (elem b 1)) (elem b 0))
+        (is (not= (elem a 0) (elem b 0)) "independent VMs cannot write the same staging path"))
+      (finally (File/rm_rf! dir)))))

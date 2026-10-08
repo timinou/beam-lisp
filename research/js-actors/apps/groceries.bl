@@ -1,0 +1,281 @@
+; apps/groceries.bl — a shared shopping list, ONE BL file.
+;
+; What this app shows (PLAN-149 track 3): edits that land INSTANTLY and survive
+; a bad connection. Every intent declares a `:predict` — the list it expects
+; the server to produce — and the browser shows that prediction at once, before
+; any answer. Two people shop from the same list:
+;
+;   * tick, add, change a quantity: the row updates in the same frame, marked
+;     "saving" until the server confirms;
+;   * the server REFUSES (someone else already bought the last one; the list is
+;     full): the row slides back and the reason shows;
+;   * the server DECIDES differently (it merges a duplicate into the existing
+;     row): the server's answer replaces the prediction, and the step says so;
+;   * the signal drops in the shop: keep ticking — every edit is shown and
+;     QUEUED, and when the connection returns the queue goes out in order, each
+;     intent checked again against the list as it is then. A resend never
+;     double-applies: each proposal carries a nonce the server commits once.
+;
+; The predictions are ordinary BL that runs in BOTH halves' terms: the build
+; places each `:predict` in the browser only if it passes the same three
+; oracles as the view (no effect, proven termination, no host call).
+
+; ─────────────────────────────────────────────────────────────────────────────
+; The model the server owns
+; ─────────────────────────────────────────────────────────────────────────────
+
+(ns groceries (:require [split]))
+
+(defn item [id name qty aisle got]
+  {:id id :name name :qty qty :aisle aisle :got got})
+
+(defn initial-list []
+  {:items [(item 1 "Oat milk" 2 :dairy false)
+           (item 2 "Sourdough loaf" 1 :bakery true)
+           (item 3 "Bananas" 6 :produce false)
+           (item 4 "Cherry tomatoes" 1 :produce false)
+           (item 5 "Greek yogurt" 1 :dairy false)
+           (item 6 "Coffee beans" 1 :pantry false)
+           (item 7 "Olive oil" 1 :pantry true)]
+   :next-id 8})
+
+(defn aisles []
+  [{:key :produce :label "Produce" :icon "🥬"}
+   {:key :bakery :label "Bakery" :icon "🥖"}
+   {:key :dairy :label "Dairy & eggs" :icon "🥛"}
+   {:key :pantry :label "Pantry" :icon "🫙"}
+   {:key :other :label "Everything else" :icon "🛒"}])
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Shared — checks and predictions, the same code in both halves
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn max-items [] 40)
+
+(defn find-item [items id] (some (fn [it] (if (= id (:id it)) it nil)) items))
+
+(defn find-named [items name] (some (fn [it] (if (= name (:name it)) it nil)) items))
+
+(defn known-aisle? [a] (some? (some (fn [x] (if (= a (:key x)) x nil)) (aisles))))
+
+(defn add-problem [lst args]
+  (cond
+    (= 0 (count (:name args))) :empty-name
+    (not (known-aisle? (:aisle args))) :unknown-aisle
+    (and (nil? (find-named (:items lst) (:name args))) (<= (max-items) (count (:items lst)))) :list-full
+    :else nil))
+
+(defn tick-problem [lst args]
+  (let [it (find-item (:items lst) (:id args))]
+    (cond
+      (nil? it) :no-such-item
+      (= (:got it) (:got args)) :already-so
+      :else nil)))
+
+(defn qty-problem [lst args]
+  (let [it (find-item (:items lst) (:id args))]
+    (cond
+      (nil? it) :no-such-item
+      (< (+ (:qty it) (:delta args)) 1) :at-least-one
+      (< 99 (+ (:qty it) (:delta args))) :too-many
+      :else nil)))
+
+(defn exists-problem [lst args]
+  (if (nil? (find-item (:items lst) (:id args))) :no-such-item nil))
+
+(defn clear-problem [lst _args]
+  (if (some? (some (fn [it] (if (:got it) it nil)) (:items lst))) nil :nothing-in-the-basket))
+
+; The browser's guess of each result. The id of a NEW item is the server's to
+; give; the prediction shows the row under a provisional id (0), which the
+; confirmed list replaces.
+
+(defn with-item [items id f]
+  (mapv (fn [it] (if (= id (:id it)) (f it) it)) items))
+
+(defn predict-add [lst args]
+  (assoc lst :items (conj (:items lst) (item 0 (:name args) 1 (:aisle args) false))))
+
+(defn predict-tick [lst args]
+  (assoc lst :items (with-item (:items lst) (:id args) (fn [it] (assoc it :got (:got args))))))
+
+(defn predict-qty [lst args]
+  (assoc lst :items (with-item (:items lst) (:id args) (fn [it] (assoc it :qty (+ (:qty it) (:delta args)))))))
+
+(defn same-but-ids?
+  "An add was predicted right when the lists agree on everything but the new
+   row's server-chosen id: same rows, same order, same names and counts."
+  [predicted confirmed]
+  (and (= (count (:items predicted)) (count (:items confirmed)))
+       (= (mapv (fn [it] (dissoc it :id)) (:items predicted))
+          (mapv (fn [it] (dissoc it :id)) (:items confirmed)))))
+
+(defn predict-remove [lst args]
+  (assoc lst :items (filterv (fn [it] (not (= (:id args) (:id it)))) (:items lst))))
+
+(defn predict-clear [lst _args]
+  (assoc lst :items (filterv (fn [it] (not (:got it))) (:items lst))))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Server-only — the authority's own decisions
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn add-item
+  "Adding a name already on the list does not duplicate it: the server bumps
+   the existing row's quantity and un-ticks it. The browser predicted a new
+   row; the confirmed list shows the merge (and the timeline says so)."
+  [lst args]
+  (let [same (find-named (:items lst) (:name args))]
+    (if (some? same)
+      (assoc lst :items (with-item (:items lst) (:id same)
+                                   (fn [it] (assoc it :qty (min 99 (inc (:qty it))) :got false))))
+      (let [id (:next-id lst)]
+        (assoc lst :items (conj (:items lst) (item id (:name args) 1 (:aisle args) false))
+                   :next-id (inc id))))))
+
+(defn tick-item [lst args] (predict-tick lst args))
+(defn change-qty [lst args] (predict-qty lst args))
+(defn remove-item [lst args] (predict-remove lst args))
+(defn clear-basket [lst args] (predict-clear lst args))
+
+; ─────────────────────────────────────────────────────────────────────────────
+; Client-only — this tab
+; ─────────────────────────────────────────────────────────────────────────────
+
+(defn initial-local [] {:draft "" :aisle :produce :hide-got false})
+
+(defn on-event [local event]
+  (let [kind (first event)]
+    (cond
+      (= kind :draft) {:local (assoc local :draft (nth event 1))}
+      (= kind :aisle) {:local (assoc local :aisle (nth event 1))}
+      (= kind :hide-got) {:local (assoc local :hide-got (not (:hide-got local)))}
+      (= kind :add) {:local (assoc local :draft "")
+                     :intent [:add-item {:name (:draft local) :aisle (:aisle local)}]}
+      (= kind :tick) {:local local :intent [:tick-item {:id (nth event 1) :got (nth event 2)}]}
+      (= kind :more) {:local local :intent [:change-qty {:id (nth event 1) :delta 1}]}
+      (= kind :less) {:local local :intent [:change-qty {:id (nth event 1) :delta -1}]}
+      (= kind :remove) {:local local :intent [:remove-item {:id (nth event 1)}]}
+      (= kind :clear) {:local local :intent [:clear-basket {}]}
+      :else {:local local})))
+
+(defn touched-ids
+  "The ids a pending intent is about: those rows show \"saving\"."
+  [pending]
+  (filterv some? (mapv (fn [p] (:id (:args p))) pending)))
+
+(defn member? [xs x] (some? (some (fn [y] (if (= x y) y nil)) xs)))
+
+(defn pending-names [pending]
+  (filterv some? (mapv (fn [p] (if (= :add-item (:op p)) (:name (:args p)) nil)) pending)))
+
+(defn item-row [it busy queued]
+  [:li {:key (str "i" (:id it) (if (= 0 (:id it)) (:name it) ""))
+        :class (str "row" (if (:got it) " got" "") (if busy " busy" ""))}
+   [:button {:class "tick" :aria-pressed (:got it) :aria-label (str (if (:got it) "Put back " "Got ") (:name it))
+             :on-click [:tick (:id it) (not (:got it))]}
+    (if (:got it) "✓" "")]
+   [:span {:class "name"} (:name it)]
+   [:span {:class "qty"}
+    [:button {:class "step" :aria-label (str "One less " (:name it)) :disabled (<= (:qty it) 1)
+              :on-click [:less (:id it)]} "−"]
+    [:span {:class "n"} (str (:qty it))]
+    [:button {:class "step" :aria-label (str "One more " (:name it)) :on-click [:more (:id it)]} "+"]]
+   (cond
+     (and busy queued) [:small {:class "state queued"} "waiting"]
+     busy [:small {:class "state"} "saving"]
+     :else [:button {:class "drop" :aria-label (str "Remove " (:name it)) :on-click [:remove (:id it)]} "✕"])])
+
+(defn aisle-block [a items busy-ids queued hide-got]
+  (let [mine (filterv (fn [it] (and (= (:key a) (:aisle it)) (not (and hide-got (:got it))))) items)]
+    (if (empty? mine)
+      ""
+      [:section {:key (str "a" (name (:key a))) :class "aisle"}
+       [:h3 {} [:span {:class "icon"} (:icon a)] (:label a)
+        [:small {} (str (count (filterv (fn [it] (not (:got it))) mine)) " to get")]]
+       [:ul {:class "rows"}
+        (mapv (fn [it] (item-row it (or (= 0 (:id it)) (member? busy-ids (:id it))) queued)) mine)]])))
+
+(defn reason-text
+  "What a refusal means, in words."
+  [reason]
+  (get {:already-so "someone already did that." :no-such-item "that item is gone from the list."
+        :at-least-one "a quantity can't go below one." :too-many "that's more than 99."
+        :list-full "the list is full (40 items)." :empty-name "type a name first."
+        :nothing-in-the-basket "nothing is in the basket yet." :unknown-aisle "pick an aisle."
+        :stale-revision "the list changed — try again."}
+       reason (name reason)))
+
+(defn note-banner [note]
+  (cond
+    (nil? note) ""
+    (= :adjusted (:where note))
+      [:p {:class "note adjusted"} [:strong {} "The server adjusted that: "]
+       "it already had that item, so it raised the quantity instead of adding a row."]
+    :else
+      [:p {:class (str "note " (name (:where note)))}
+       [:strong {} (cond
+                     (= :client (:where note)) "Not applied — "
+                     (= :server (:where note)) "The server said no — "
+                     :else "Offline: ")]
+       (cond
+         (= :offline (:reason note)) "your edits are kept and will be sent when you're back."
+         :else (reason-text (:reason note)))]))
+
+(defn sync-bar [sync]
+  (let [n (count (:pending sync))]
+    (cond
+      (and (= :down (:link sync)) (< 0 n))
+        [:div {:class "sync off"} [:span {:class "dot"} ""] (str "Offline · " n " change" (if (= 1 n) "" "s") " waiting")]
+      (= :down (:link sync)) [:div {:class "sync off"} [:span {:class "dot"} ""] "Offline · changes will wait"]
+      (< 0 n) [:div {:class "sync busy"} [:span {:class "dot"} ""] (str "Saving " n "…")]
+      :else [:div {:class "sync ok"} [:span {:class "dot"} ""] "All changes saved"])))
+
+(defn list-view [lst local sync]
+  (let [items (:items lst)
+        busy (touched-ids (:pending sync))
+        queued (= :down (:link sync))
+        left (count (filterv (fn [it] (not (:got it))) items))
+        got (- (count items) left)]
+    [:section {:class "groceries"}
+     [:header {:class "head"}
+      [:div {}
+       [:h1 {} "Groceries"]
+       [:p {:class "sub"} (if (= 0 left) "Everything's in the basket 🎉" (str left " to get · " got " in the basket"))]]
+      (sync-bar sync)]
+     (note-banner (:note sync))
+     [:div {:class "composer"}
+      [:input {:type "text" :value (:draft local) :maxlength 32 :placeholder "Add an item…"
+               :aria-label "Item name" :on-input [:draft] :on-enter [:add]}]
+      [:nav {:class "aisle-pick" :aria-label "Aisle"}
+       (mapv (fn [a] [:button {:class (if (= (:key a) (:aisle local)) "pick on" "pick")
+                              :title (:label a) :aria-pressed (= (:key a) (:aisle local))
+                              :on-click [:aisle (:key a)]} (:icon a)])
+             (aisles))]
+      [:button {:class "add" :on-click [:add]} "Add"]]
+     (mapv (fn [a] (aisle-block a items busy queued (:hide-got local))) (aisles))
+     [:footer {:class "foot"}
+      [:button {:class "ghost" :aria-pressed (:hide-got local) :on-click [:hide-got]}
+       (if (:hide-got local) "Show basket" "Hide basket")]
+      [:button {:class "ghost" :disabled (= 0 got) :on-click [:clear]} "Clear basket"]
+      [:small {} (str "rev " (:revision sync))]]]))
+
+; ─────────────────────────────────────────────────────────────────────────────
+
+(split/defapp groceries
+  {:wire {:item [:record {:id [:int 0 9999] :name [:text 1 32] :qty [:int 1 99]
+                          :aisle :aisle :got :bool}]
+          :aisle [:one-of :produce :bakery :dairy :pantry :other]
+          :basket [:record {:items [:list 40 :item]}]}
+   :server {:init initial-list :snapshot :basket}
+   :client {:init initial-local :view list-view :on on-event}
+   :intents {:add-item {:params {:name [:text 1 32] :aisle :aisle}
+                        :check add-problem :predict predict-add :agrees? same-but-ids? :apply add-item}
+             :tick-item {:params {:id [:int 1 9999] :got :bool}
+                         :check tick-problem :predict predict-tick :apply tick-item}
+             :change-qty {:params {:id [:int 1 9999] :delta [:int -1 1]}
+                          :check qty-problem :predict predict-qty :apply change-qty}
+             :remove-item {:params {:id [:int 1 9999]}
+                           :check exists-problem :predict predict-remove :apply remove-item}
+             :clear-basket {:params {}
+                            :check clear-problem :predict predict-clear :apply clear-basket}}})

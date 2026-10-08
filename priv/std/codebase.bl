@@ -55,6 +55,21 @@
    ;; with depth ≥ 1 is one request per row of the enclosing collection: the
    ;; N+1 class, answered by `bl ask nplus1` as a query over these facts.
    {:db/ident :call/loop-depth :db/valueType :db.type/long :db/index true}
+   ;; NAMESPACE-QUALIFIED call identity. `:fn/name`/`:call/callee` are written
+   ;; FROM ONE SOURCE (`main`, `double`), so an edge to another namespace stops
+   ;; at the border — the callee is a string no source ever writes as a caller.
+   ;; These three columns mint the identity that crosses it: `:fn/qualified` is
+   ;; `"ns/name"` for every definition, and a call carries the qualified CALLER
+   ;; plus — when the source's `:require`/`:as`/`:refer` header can name it — the
+   ;; qualified CALLEE. The raw spelling stays in `:call/callee`; the canonical
+   ;; name travels beside it (see `reachable-qualified` / `dependency-cone`).
+   {:db/ident :fn/qualified      :db/valueType :db.type/string :db/index true}
+   {:db/ident :call/caller-qualified :db/valueType :db.type/string :db/index true}
+   {:db/ident :call/callee-qualified :db/valueType :db.type/string :db/index true}
+   ;; call-path loop cost (see `loop-context`): the syntactic loop depth plus
+   ;; the depth of the local call path that reaches the caller.
+   {:db/ident :call/effective-loop-depth :db/valueType :db.type/long :db/index true}
+   {:db/ident :call/cost-coverage :db/valueType :db.type/string :db/index true}
    ;; require edges (the namespace graph as facts): one entity per edge, so a
    ;; cycle in the static `:require` graph is a QUERY over the same store —
    ;; answered by sg/cycles (require-cycles below), never by loading a
@@ -87,10 +102,10 @@
   (some? (index-of s "/")))
 
 (def FACTS-VERSION
-  "The version of the fact SCHEMA these indexers emit. Part of every cache
-   key beside the source hash: a source that has not changed still needs
-   re-reading when the facts it yields have gained a column."
-  "facts-2")
+  "The version of the fact schema OR call-edge meaning these indexers emit.
+   Part of every cache key beside the source hash: unchanged source still needs
+   re-indexing when fact columns or call classification change."
+  "facts-6")
 
 ;; The N+1 vocabulary lives in ONE home (`datalog-shape`, which both this
 ;; namespace and `deodorant` read), and this is the door to it.
@@ -274,11 +289,38 @@
       (= tag :list)
         (let [items (node-items node)
               head  (node-form (first items))]
-          (if (not (= :symbol (node-tag head)))
-            (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth))
-                    [acc next-id] items)
+          (cond
+            ; (:k m) is a keyword LOOKUP — a literal key read on a value, no
+            ; call target at all — so it contributes no call fact; its argument
+            ; is still walked for the calls inside it.
+            (= :keyword (node-tag head))
+              (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth))
+                      [acc next-id] (rest items))
+            (not (= :symbol (node-tag head)))
+            ; ((chooser) x) is an APPLICATION, not just a nested expression.
+            ; Record its unknown target before walking the head/arguments, so
+            ; a dependency cone cannot call an unindexed dynamic invoke pure.
+            (let [p (node-pos node)
+                  line (if (nil? p) (if (nil? hint) 0 (:line hint)) (:line p))
+                  fact {:db/id next-id :call/caller caller
+                        :call/callee "<dynamic>" :call/arity (count (rest items))
+                        :call/line line :call/loop-depth depth}]
+              (reduce (fn [[a i] sub] (walk-calls-at caller ns-str sub a i hint depth))
+                      [(conj acc fact) (+ next-id 1)] items))
+            :else
             (let [hname (node-name head)
-                  loop? (contains? (get (vocab) :loops) hname)
+                  foreign-index (get {"Enum/map" 1 "Enum/each" 1
+                                      "Elixir.Enum/map" 1 "Elixir.Enum/each" 1
+                                      "Enum/reduce" (- (count (rest items)) 1)
+                                      "Elixir.Enum/reduce" (- (count (rest items)) 1)
+                                      "lists/map" 0 "lists/foldl" 0 "lists/foldr" 0}
+                                     hname)
+                  loop? (or (contains? (get (vocab) :loops) hname) (some? foreign-index))
+                  callback-arity (cond
+                                   (contains? #{"reduce" "reductions" "Enum/reduce" "Elixir.Enum/reduce"
+                                                "lists/foldl" "lists/foldr"} hname) 2
+                                   (contains? #{"map" "mapv" "mapcat"} hname) (- (count (rest items)) 1)
+                                   :else 1)
                   ; Which arguments run per element. `for`/`doseq`: the BODY
                   ; (everything after the binding vector). The `map` family:
                   ; the FUNCTION (first arg) — the collection argument is
@@ -286,12 +328,24 @@
                   per-element? (fn [k]
                                  (cond
                                    (not loop?) false
+                                   (some? foreign-index) (= k foreign-index)
                                    (contains? #{"for" "doseq"} hname) (>= k 1)
                                    :else (= k 0)))
                   rec-children (fn [a i]
                                  (reduce (fn [[a2 i2] [k sub]]
-                                           (walk-calls-at caller ns-str sub a2 i2 hint
-                                                          (if (per-element? k) (+ depth 1) depth)))
+                                           (let [inner-depth (if (per-element? k) (+ depth 1) depth)
+                                                 f (node-form sub)]
+                                             (if (and (per-element? k)
+                                                      (not (contains? #{"for" "doseq"} hname))
+                                                      (= :symbol (node-tag f)))
+                                               (let [p (node-pos sub)]
+                                                 [(conj a2 {:db/id i2 :call/caller caller
+                                                            :call/callee (node-name f)
+                                                            :call/arity callback-arity
+                                                            :call/line (if p (:line p) 0)
+                                                            :call/loop-depth inner-depth})
+                                                  (inc i2)])
+                                               (walk-calls-at caller ns-str sub a2 i2 hint inner-depth))))
                                          [a i] (map-indexed (fn [k x] [k x]) (rest items))))]
               (cond
                 ; a loop head is walked as WRITTEN, never through its
@@ -373,6 +427,7 @@
             (fn [[facts i] [arity cs]]
               [(conj facts
                      {:db/id i :fn/name name :fn/ns ns-str
+                      :fn/qualified (str ns-str "/" name)
                       :fn/arity arity :fn/line line
                       :fn/variadic (if (variadic? (:params (first cs))) true false)})
                (+ i 1)])
@@ -393,6 +448,7 @@
         [ret-facts fid2]
           (reduce (fn [[facts i] t]
                     [(conj facts {:db/id i :fn/name name :fn/ns ns-str
+                                  :fn/qualified (str ns-str "/" name)
                                   :fn/ret-tag (str t) :fn/ret-source ret-src})
                      (+ i 1)])
                   [[] fid] ret-tags)
@@ -456,12 +512,206 @@
         (if (nil? n) nil (node-name (node-form n))))
       nil)))
 
+;; --- alias-aware call identity -----------------------------------------------------
+;;
+;; A call written `alias/name`, or a bare `name` this source `:refer`s or DEFINES,
+;; names a DEFINITION — but the fact recorded only the spelling, so a call across a
+;; namespace border never joined the entity it named and the call graph stopped at
+;; the border. The source's OWN ns header is the one authority for what a spelling
+;; means (the same `:require`/`:as`/`:refer` table `source-graph` derives and the
+;; compiler resolves through), so the canonical target is computed from it here, at
+;; index time. The RAW spelling stays in `:call/callee` — `system.arity` reads the
+;; head AS WRITTEN — and the canonical name travels beside it.
+;;
+;; Only what the header can name is attributed. A bare name this source neither
+;; defines nor `:refer`s is core, a `:refer :all` import, or a dynamic call: left
+;; unattributed, which the cone reports as explicit evidence rather than a claim.
+
+(defn- pattern-names
+  "Every symbol a binding PATTERN introduces, per `typed/bind-pattern` — so the
+   two agree on destructuring (vector, map, `:keys`, `:as`)."
+  [pat]
+  (set (keys (typed/bind-pattern {} pat nil))))
+
+(def ^:private binding-heads
+  "Forms that introduce local bindings. A `:refer`red or locally defined name is
+   only canonicalized when it is NOT among the names these bind: a shadowing
+   `let`/param makes the call DYNAMIC, and a dynamic call is not a static edge."
+  #{"fn" "fn*" "defn" "defn-" "let" "loop" "for" "doseq" "when-let" "if-let"
+    "when-some" "if-some" "letfn" "catch" "receive" "defmethod" "extend-type"
+    "extend-protocol" "defprotocol" "reify" "defrecord" "deftype" "defserver"})
+
+(defn- fn-params-names
+  "Names a `fn`/`defn` clause shape binds: the params vector, or every
+   `([params] …)` arity list. Scanning STOPS at the params, so a body's own call
+   `(helper [q])` is never mistaken for a parameter list."
+  [nodes]
+  (let [nodes (drop-while (fn [n]
+                            (let [t (node-tag (node-form n))]
+                              (or (= :symbol t) (= :scalar t))))
+                          nodes)]
+    (if (empty? nodes)
+      #{}
+      (let [h (first nodes)]
+        (if (= :vector (node-tag (node-form h)))
+          (pattern-names (node-form h))
+          (reduce (fn [s n]
+                    (let [p (first (node-items (node-form n)))]
+                      (if (and (some? p) (= :vector (node-tag (node-form p))))
+                        (into s (pattern-names (node-form p))) s)))
+                  #{} nodes))))))
+
+(defn- method-spec-names
+  "Names bound by `(name [params] body…)` method specs — `extend-type`, `reify`,
+   `defprotocol`, `defrecord`, … — the first vector among a spec list's first two
+   items; a bare vector is a record's field list."
+  [nodes]
+  (reduce (fn [s n]
+            (let [t (node-tag (node-form n))]
+              (cond
+                (= :vector t) (into s (pattern-names (node-form n)))
+                (= :list t)
+                  (reduce (fn [s2 x]
+                            (if (= :vector (node-tag (node-form x)))
+                              (into s2 (pattern-names (node-form x))) s2))
+                          s (take 2 (node-items (node-form n))))
+                :else s)))
+          #{} nodes))
+
+(defn- receive-bound-names
+  "A receive is pattern [optional :when guard] body per clause, followed by
+   optional (after ms body). Its pattern locals can shadow a referenced fn.
+   A malformed tail remains conservative: never attribute a name bound by a
+   pattern to a static namespace call."
+  [forms]
+  (loop [fs forms bound #{}]
+    (if (empty? fs)
+      bound
+      (let [pattern (first fs)
+            f (node-form pattern)
+            items (if (= :list (node-tag f)) (node-items f) [])
+            after? (and (not (empty? items)) (form-sym? (first items) "after"))]
+        (if after?
+          (recur (rest fs) bound)
+          (let [tail (rest fs)
+                guarded? (and (not (empty? tail))
+                              (= :keyword (node-tag (node-form (first tail))))
+                              (= "when" (node-name (node-form (first tail)))))
+                body-and-more (if guarded? (drop 2 tail) tail)]
+            (recur (rest body-and-more)
+                   (into bound (pattern-names f)))))))))
+
+(defn- form-bound-names
+  "Every symbol bound by a binding form under `node`. An OVER-approximation is
+   the safe direction: a name wrongly thought bound is only left unattributed,
+   never falsely attributed to a namespace that shares its spelling."
+  [node]
+  (let [f (node-form node) t (node-tag f)]
+    (cond
+      (= :list t)
+        (let [items (node-items f)
+              h (first items)
+              hn (if (and (some? h) (= :symbol (node-tag (node-form h))))
+                   (node-name (node-form h)) nil)
+              here (cond
+                     (or (nil? hn) (not (contains? binding-heads hn))) #{}
+                     (= "catch" hn) (pattern-names (nth items 2 nil))
+                     (= "receive" hn) (receive-bound-names (rest items))
+                     (= "letfn" hn)
+                       (let [v (second items)]
+                         (if (and (some? v) (= :vector (node-tag (node-form v))))
+                           (reduce (fn [s spec]
+                                     (let [its (node-items (node-form spec))
+                                           hd (first its)]
+                                       (into (into s (if (and (some? hd)
+                                                              (= :symbol (node-tag (node-form hd))))
+                                                       #{(node-name (node-form hd))} #{}))
+                                             (fn-params-names (rest its)))))
+                                   #{} (node-items (node-form v)))
+                           #{}))
+                     (contains? #{"let" "loop" "for" "doseq" "when-let" "if-let"
+                                  "when-some" "if-some"} hn)
+                       (let [v (second items)]
+                         (if (and (some? v) (= :vector (node-tag (node-form v))))
+                           (pattern-names (node-form v)) #{}))
+                     (contains? #{"fn" "fn*" "defn" "defn-"} hn)
+                       (fn-params-names (rest items))
+                     :else (method-spec-names (rest items)))]
+          (reduce (fn [s x] (into s (form-bound-names x))) here items))
+      (contains? #{:vector :set} t)
+        (reduce (fn [s x] (into s (form-bound-names x))) #{} (node-items f))
+      (= :map t)
+        (reduce (fn [s pair]
+                  (into (into s (form-bound-names (first (erlang/tuple_to_list pair))))
+                        (form-bound-names (second (erlang/tuple_to_list pair)))))
+                #{} (node-items f))
+      :else #{})))
+
+(defn- bound-by-caller
+  "`{caller-name #{bound …}}`: the names bound where each caller's calls live. A
+   `defn`'s calls are judged against ITS OWN params and nested `let`/`loop`/…, so
+   a shadowing `let` in one function never hides a `:refer` in another. Calls in
+   a non-`defn` top-level form — `extend-type`/`defmethod`/`defserver` bodies —
+   are reported under `<top>`, so every such form's bindings pool there; a coarse
+   bucket is the safe direction (a name wrongly thought bound is only left
+   unattributed)."
+  [forms]
+  (reduce (fn [m form]
+            (let [n (or (defn-form form) "<top>")]
+              (assoc m n (into (get m n #{}) (form-bound-names form)))))
+          {} forms))
+
+(defn- qualified-callee
+  "The fully-qualified name `written` denotes in this source, or nil when the
+   header cannot say:
+     alias/name   → target/name   the prefix is a required ns or an `:as` alias
+     name         → ns/name       this source DEFINES it
+     name         → target/name   this source `:refer`s it from target
+   A bare name that is BOUND anywhere in the source is left unattributed — a
+   `let`/param may shadow it, and a dynamic call is not a static edge. A
+   qualified prefix the header does not name (interop, an unrequired ns) is left
+   unattributed too: guessing would be a false positive the gate must not inherit."
+  [aliases refers locals bound ns-str written]
+  (let [s (binary/split written "/")]
+    (if (= 2 (erlang/length s))
+      (let [prefix (erlang/hd s)
+            nme (erlang/hd (erlang/tl s))]
+        (if (maps/is_key prefix aliases)
+          (str (maps/get prefix aliases) "/" nme)
+          nil))
+      (if (contains? bound written)
+        nil
+        (cond
+          (contains? locals written) (str ns-str "/" written)
+          (maps/is_key written refers) (str (maps/get written refers) "/" written)
+          :else nil)))))
+
 (defn index-forms
-  "All facts from a seq of top-level reader forms: {:fn :calls :instr}."
-  [sigs ns-str forms]
+  "All facts from a seq of top-level reader forms: {:fn :calls :instr}.
+
+   Every call carries TWO names. `:call/callee` is the head AS WRITTEN (what
+   `system.arity` resolves); `:call/callee-qualified` — added only when the
+   source's ns header can name the target — is the `ns/name` of the definition
+   it denotes, and `:call/caller-qualified` names the caller in that same space.
+   Together they are the edge that crosses a namespace border
+   (`reachable-qualified`, `dependency-cone`)."
+  ([sigs ns-str forms] (index-forms sigs ns-str forms nil))
+  ([sigs ns-str forms header]
+  (let [h (or header [nil nil (maps/new) (maps/new) nil])
+        aliases (nth h 2)
+        refers (nth h 3)
+        locals (set (keep defn-form forms))
+        bound-of (bound-by-caller forms)
+        annotate (fn [c]
+                   (let [cq (qualified-callee aliases refers locals
+                                              (get bound-of (:call/caller c) #{})
+                                              ns-str (:call/callee c))
+                         c2 (assoc c :call/caller-qualified
+                                   (str ns-str "/" (:call/caller c)))]
+                     (if (some? cq) (assoc c2 :call/callee-qualified cq) c2)))]
   (loop [fs forms fid 1000 cid 100000 iid 500000 fn-acc [] call-acc [] instr-acc []]
     (if (empty? fs)
-      {:fn fn-acc :calls call-acc :instr instr-acc}
+      {:fn fn-acc :calls (mapv annotate call-acc) :instr instr-acc}
       (let [form (first fs)
             f (node-form form)
             defd (defn-form form)]
@@ -483,7 +733,54 @@
                         nil)]
             (recur (rest fs) fid cid2 (if (nil? ifact) iid (+ iid 1))
                    fn-acc (concat call-acc cf)
-                   (if (nil? ifact) instr-acc (concat instr-acc [ifact])))))))))
+                   (if (nil? ifact) instr-acc (concat instr-acc [ifact])))))))))))
+
+(defn- graph-reachable [graph roots]
+  (loop [seen #{} todo (into [] roots)]
+    (if (empty? todo) seen
+      (let [n (first todo)]
+        (if (contains? seen n)
+          (recur seen (rest todo))
+          (recur (conj seen n) (concat (rest todo) (get graph n #{}))))))))
+
+(defn loop-context
+  "Add potential local call-path loop depths to indexed facts.
+   Syntactic depths stay unchanged. Recursive contexts make no finite-depth
+   claim; callers outside this source remain outside the analysis."
+  [ns-str facts]
+  (let [names (set (map :fn/name (:fn facts)))
+        local (fn [s]
+                (cond
+                  (contains? names s) s
+                  (and (string? s) (String/starts_with? s (str ns-str "/")))
+                    (let [n (String/replace_prefix s (str ns-str "/") "")]
+                      (when (contains? names n) n))
+                  :else nil))
+        edges (keep (fn [c]
+                      (let [to (local (:call/callee c))]
+                        (when to [(:call/caller c) to (get c :call/loop-depth 0)])))
+                    (:calls facts))
+        graph (reduce (fn [g [from to _]] (update g from (fn [xs] (conj (or xs #{}) to))))
+                      {} edges)
+        recursive (set (filter (fn [n]
+                                 (contains? (graph-reachable graph (get graph n #{})) n))
+                               names))
+        unknown (graph-reachable graph recursive)
+        depths (loop [n (count names) ds {}]
+                 (if (= n 0) ds
+                   (let [next (reduce (fn [d [from to w]]
+                                        (assoc d to (max (get d to 0) (+ (get ds from 0) w))))
+                                      ds edges)]
+                     (if (= next ds) ds (recur (dec n) next)))))]
+    (assoc facts :calls
+      (mapv (fn [c]
+              (let [caller (:call/caller c)]
+                (if (contains? unknown caller)
+                  (assoc (dissoc c :call/effective-loop-depth) :call/cost-coverage "recursive")
+                  (assoc c :call/cost-coverage "local-context"
+                           :call/effective-loop-depth
+                           (+ (get depths caller 0) (get c :call/loop-depth 0))))))
+            (:calls facts)))))
 
 (defn index-source
   "Source text → {:fn […] :calls […] :instr […] :requires […]}.
@@ -497,7 +794,7 @@
   (when-not (string? src)
     (throw (ex-info "codebase/index-source: source is not a string"
                     {:ns ns-str :source src})))
-  (assoc (index-forms sigs ns-str (BeamLisp.Reader/read_string src))
+  (assoc (loop-context ns-str (index-forms sigs ns-str (BeamLisp.Reader/read_string src) (sg/header* src)))
          :requires (requires-facts ns-str src)))
 
 (defn connect-codebase
@@ -622,7 +919,8 @@
 
 (defn manifest-key
   "The identity of a corpus's analysis: the model that read it, and each
-   source's content hash, IN ORDER.
+   source's content hash, IN ORDER, and this indexer's FACTS-VERSION. A
+   persisted corpus from an older fact schema is never merged as fresh rows.
 
    Order is part of the key rather than an accident of the file system: `index!`
    gives source `i` the id band `(offset-for i)`, so the same files in another
@@ -632,7 +930,7 @@
    `entries` is `[[ns-string sha] …]`."
   [model-id entries]
   (sha256-hex
-    (str model-id "|"
+    (str model-id "|" FACTS-VERSION "|"
          (join ";" (map (fn [e] (str (get e 0) " " (get e 1))) (to-list entries))))))
 
 (defn manifest-path
@@ -772,7 +1070,7 @@
    it, and the fill did not run — or `:filled`."
   ([sigs ns-str src] (analyze-cached sigs ns-str src {}))
   ([sigs ns-str src opts]
-  (let [sha (sha256-hex src)
+  (let [sha (sha256-hex (str FACTS-VERSION "\n" src))
         columns (:columns opts [])
         ; The store follows the SOURCES, not the shell that invoked the command:
         ; a corpus in another tree cannot scatter its stores into the cwd.
@@ -840,6 +1138,14 @@
   '[[(calls-r ?to ?from) [?c :call/caller ?from] [?c :call/callee ?to]]
     [(reaches-r ?b ?a) (calls-r ?b ?a)]
     [(reaches-r ?b ?a) (calls-r ?b ?x) (reaches-r ?x ?a)]])
+; The RESOLVED call graph walks on the namespace-qualified identity
+; `:fn/qualified` mints (`reachable-qualified`, below). REACH chains on the bare
+; names ONE source writes (`main` → `double`), so an edge to another namespace
+; names a callee no source ever writes as a caller and the chain stops at the
+; border; the qualified graph — `app.view/render` → `lib.data/format-row` →
+; `lib.data/label` — continues into the callee's OWN calls. It is walked in bl,
+; not as a datalog rule set: a dependency question must answer in any Env, and
+; the native rules kernel is not always loaded (measured: `:nif_not_loaded`).
 
 ; The two "whole-codebase" questions are each ONE pass over calls joined against
 ; ONE pass over definitions, with the join done as set lookups in beam-lisp. A
@@ -880,22 +1186,30 @@
    sorted by caller then line.
 
    The N+1 CLASS as a question over facts: every `:call/*` row whose callee
-   is a datom read and whose `:call/loop-depth` is ≥ 1 is one store request
-   per row of the enclosing collection. deodorant's `datalog/n+1-read` smell
+   is a datom read with syntactic or inherited loop depth ≥ 1 may issue one
+   store request per row. Inherited context covers local helpers; recursive
+   and external call contexts remain partial rather than a finite cost proof. deodorant's `datalog/n+1-read` smell
    reports the same sites file by file at lint time; this is the whole-corpus
    view, answerable from the indexed store in milliseconds."
   [db]
-  (let [{:keys [reads callee-name]} (vocab)]
-    (sort (into []
-      (filter (fn [row] (contains? reads (callee-name (nth (vec row) 1))))
-            (datom/q '[:find ?caller ?callee ?line ?d
-                       :where
-                       [?c :call/loop-depth ?d]
-                       [(>= ?d 1)]
-                       [?c :call/caller ?caller]
-                       [?c :call/callee ?callee]
-                       [?c :call/line ?line]]
-                     db))))))
+  (let [{:keys [reads callee-name]} (vocab)
+        rows (concat
+               (datom/q '[:find ?caller ?callee ?line ?d :where
+                          [?c :call/loop-depth ?d] [(>= ?d 1)]
+                          [?c :call/caller ?caller] [?c :call/callee ?callee]
+                          [?c :call/line ?line]] db)
+               (datom/q '[:find ?caller ?callee ?line ?d :where
+                          [?c :call/effective-loop-depth ?d] [(>= ?d 1)]
+                          [?c :call/caller ?caller] [?c :call/callee ?callee]
+                          [?c :call/line ?line]] db))
+        sites (reduce (fn [m row]
+                        (let [[caller callee line depth] (vec row)
+                              k [caller callee line]
+                              old (get m k)]
+                          (if (contains? reads (callee-name callee))
+                            (assoc m k [caller callee line (max depth (if old (nth old 3) 0))])
+                            m))) {} rows)]
+    (sort (vals sites))))
 
 (defn arity-mismatches
   "Calls whose callee is defined but never at the called arity
@@ -1013,6 +1327,81 @@
   (sort (into []
     (datom/q '[:find ?who :in $ ?name :where [?who :~reaches ?name]]
              db name))))
+(defn reachable-qualified
+  "Every fully-qualified fn transitively reachable FROM `from` over the RESOLVED
+   call graph — the cross-namespace counterpart of `reachable`, keyed by
+   `:fn/qualified` (`\"ns/name\"`). An edge with no resolved target (core,
+   interop, `:refer :all`, a shadowed or dynamic call) is absent here;
+   `dependency-cone` reports those as named evidence."
+  [db from]
+  (let [edges (reduce (fn [m r]
+                        (let [f (get r 0) t (get r 1)]
+                          (update m f (fn [s] (conj (or s #{}) t)))))
+                      {}
+                      (datom/q '[:find ?from ?to
+                                 :where
+                                 [?c :call/caller-qualified ?from]
+                                 [?c :call/callee-qualified ?to]] db))]
+    (sort (vec
+      (loop [frontier (vec (get edges from #{}))
+             seen (into #{from} (get edges from #{}))]
+        (if (empty? frontier)
+          (disj seen from)
+          (let [fresh (reduce (fn [acc n]
+                                (reduce (fn [a t] (if (contains? seen t) a (conj a t)))
+                                        acc (get edges n #{})))
+                              #{} frontier)]
+            (recur (vec fresh) (into seen fresh)))))))))
+
+(defn dependency-cone
+  "Fail-closed dependency evidence for the fully-qualified fn `root` (`ns/name`,
+   the identity `:fn/qualified` mints): its whole transitive call cone, every
+   edge marked with whether it resolved to an indexed definition.
+
+   `{:root :reached :calls :complete}`
+     :reached   every qualified name in the cone, `root` included
+     :calls     one row per call site whose caller is in the cone:
+                {:caller :callee :callee-qualified :line :status}
+                :defined    the canonical target IS an indexed definition
+                :undefined  a canonical target is NOT defined in this corpus
+                :unresolved no canonical target exists (core, interop,
+                            `:refer :all`, a shadowed name, a dynamic call)
+     :root-defined whether the requested function itself was indexed
+     :complete  true only when root is indexed AND every call is :defined
+
+   `:complete false` is the honest answer for a cone that leaves the indexed
+   corpus: the missing evidence is in `:calls`, one named site at a time, and a
+   placement gate must refuse rather than treat the resolved part as the whole."
+  [db root]
+  (let [reached (reachable-qualified db root)
+        nodes (into #{root} reached)
+        defined (into #{} (map (fn [r] (get r 0)))
+                      (datom/q '[:find ?q :where [?d :fn/qualified ?q]] db))
+        cqs (reduce (fn [m r] (assoc m (get r 0) (get r 1)))
+                    {} (datom/q '[:find ?c ?q :where [?c :call/callee-qualified ?q]] db))
+        rows (datom/q '[:find ?c ?caller ?callee ?line
+                        :where
+                        [?c :call/caller-qualified ?caller]
+                        [?c :call/callee ?callee]
+                        [?c :call/line ?line]] db)
+        classified
+          (into []
+            (map (fn [r]
+                  (let [e (get r 0) caller (get r 1) callee (get r 2) line (get r 3)
+                        cq (get cqs e)
+                        status (cond
+                                 (nil? cq) :unresolved
+                                 (contains? defined cq) :defined
+                                 :else :undefined)]
+                    {:caller caller :callee callee
+                     :callee-qualified cq :line line :status status})))
+            (filter (fn [r] (contains? nodes (get r 1))) rows))]
+    {:root root
+     :root-defined (contains? defined root)
+     :reached (vec (sort nodes))
+     :calls classified
+     :complete (and (contains? defined root)
+                    (every? (fn [c] (= :defined (:status c))) classified))}))
 
 (defn find-by-type
   "Fns whose return MAY include `tag` (string, e.g. \"string\") — L10."

@@ -95,6 +95,6 @@ systemd-analyze security beam-lisp-node   # aim: exposure ≤ 2.0
 systemctl cat beam-lisp-node              # confirm the drop-ins you think you have
 ```
 
-The interop gate's deny-corpus (`test/beam_lisp/caps_test.exs`,
+The interop gate's deny-corpus (`test/bl/caps_port_test.bl`,
 `test/bl/auth_caps_test.bl`) proves the in-VM layer; this unit is the
 belt under it. Neither substitutes for the other.

@@ -1,0 +1,346 @@
+; host/z3_port.bl — the pinned HOST MODULE for `Elixir.BeamLisp.Z3Port`.
+;
+; The z3 port driver: beam-lisp code builds SMT-LIB text, and this module owns
+; the subprocess protocol — open/close, the read deadlines, the framing that
+; finds an answer among z3's chatter, the `(echo …)` sync marker, and the
+; check-sat sanitizer. This is the `.bl` port of `lib/beam_lisp/z3_port.ex`,
+; compiled FUNCTIONS-ONLY by `BeamLisp.AOT/compile_host_file` into
+; `Elixir.BeamLisp.Z3Port.beam`; its callers are `priv/lib/z3.bl` and
+; `priv/std/z3pool.bl`.
+;
+; ABI parity is the contract: the same answers, the same value shapes, the same
+; exceptions, and the same wire bytes to the child process. The one deliberate
+; deviation is recorded at `read_answer/2`: a beam-lisp pattern cannot PIN a
+; bound port, so every receive names the port with a `:when` guard (a port is a
+; clause-local parameter, and the guard can see it) — the same selective
+; receive the Elixir `^port` gave, without pin syntax.
+;
+; The driver is FUNCTIONS, not a process, and that is deliberate: ports deliver
+; their replies to the mailbox of the process that OWNS them, so whoever owns
+; the port must be whoever calls these functions. Called from a beam-lisp
+; `defserver` (see priv/std/z3pool.bl), that is structural serialization — a
+; gen_server answers one call at a time — with no lock anywhere.
+;
+; Run: bin/bl test test/bl/host_z3_port_test.bl
+
+(ns host.z3_port)
+
+; TWO CONSTANTS the Elixir source held as module attributes are INLINED here,
+; because a pinned host module is FUNCTIONS-ONLY: `compile_host_file` refuses
+; value definitions, and a helper defn would widen the export surface beyond
+; the source's own defns.
+;
+;   @default_read_timeout 20000 — the port's read deadline, the BACKSTOP, not the
+;     policy. The pool arms z3's OWN ceiling (priv/std/z3pool.bl,
+;     `z3-timeout-ms`) at every lease, so a hard query is answered `unknown` by
+;     the solver and never reaches this. This one fires when z3 ignores its own
+;     ceiling, when the port is driven directly (the tests do), or when a caller
+;     arms a ceiling ABOVE it — so a caller who wants to wait longer than this
+;     for one answer must move this too, with BL_Z3_READ_TIMEOUT. A raise here is
+;     a real bug, and the honest report.
+;   @marker "~~bl-ok~~" — z3 answers `(echo "…")` with the string alone
+;     (verified against the pinned binary), which makes it a reliable sync
+;     marker: a command is acknowledged on its own terms, instead of hoping the
+;     next check-sat surfaces its error.
+
+(defn env_ms
+  "A positive integer from the environment, or `default`.
+
+   ONE rule for every bound in this path: a missing, non-numeric or non-positive
+   value falls back rather than disarming the deadline it exists to enforce."
+  [name default]
+  (let [raw (System/get_env name)]
+    (if (nil? raw)
+      default
+      (let [parsed (Integer/parse raw)]
+        (if (and (erlang/is_tuple parsed)
+                 (erlang/== 2 (erlang/tuple_size parsed))
+                 (erlang/is_integer (erlang/element 1 parsed))
+                 (erlang/== "" (erlang/element 2 parsed))
+                 (erlang/> (erlang/element 1 parsed) 0))
+          (erlang/element 1 parsed)
+          default)))))
+
+(defn read_timeout
+  "How long a single read from z3 may take, in ms.
+
+   `BL_Z3_READ_TIMEOUT` moves it; a missing, non-numeric or non-positive value
+   falls back to the default rather than disarming the read."
+  []
+  (env_ms "BL_Z3_READ_TIMEOUT" 20000))
+
+(defn open
+  "Start z3 and return its port."
+  []
+  (let [r (open_port)]
+    (if (erlang/== :ok (erlang/element 1 r))
+      (erlang/element 2 r)
+      (erlang/error (Elixir.RuntimeError/exception (erlang/element 2 r))))))
+
+(defn close
+  [port]
+  (when (alive? port) (Port/close port))
+  :ok)
+
+(defn open_port
+  "Start a z3 process. Called ONLY by the owner (`BeamLisp.Z3.Solver`), which
+   keeps the port for its whole life and serializes every conversation on it.
+
+   The solver is resolved at EXACTLY one place — `priv/z3/bin/z3`, the pinned
+   binary fetched by `bl install z3` — never the PATH: what proves your rules is
+   the artifact the repo pinned, not whatever a shell happens to resolve. The
+   error names the remedy when it is absent."
+  []
+  (let [exe (resolve_exe)]
+    (if (nil? exe)
+      (tuple :error (missing_solver_message))
+      (tuple :ok (erlang/open_port
+                   (erlang/list_to_tuple (list :spawn_executable exe))
+                   (list :binary :stream :use_stdio
+                         (erlang/list_to_tuple (list :args (list "-in")))))))))
+
+(defn- missing_solver_message
+  []
+  (str "bundled z3 not found. Looked (in order) at:\n"
+       (Enum/join (Enum/map (candidate_paths) (fn [p] (str "  - " p))) "\n")
+       "\nrun: bl install z3   (or set BEAM_LISP_Z3=/path/to/z3)"))
+
+(defn alive?
+  "True while the solver process behind `port` is reachable.
+
+   A port dies with the process that OPENED it, so a memoized port can outlive
+   its owner — the server that answered the first query. A caller that caches a
+   port must ask this before reusing it: `Port.command/2` on a closed port
+   raises badarg, which reaches the client as a bare `ArgumentError: argument
+   error`."
+  [port]
+  (and (erlang/is_port port) (not (nil? (Port/info port)))))
+
+(defn- resolve_exe
+  "The pinned z3 artifact across packaging tiers — never the system PATH."
+  []
+  (Enum/find (candidate_paths) (fn [p] (File/exists? p))))
+
+(defn- candidate_paths
+  "Three candidates, first that exists wins:
+     1. BEAM_LISP_Z3 env — an explicit pin (release/CI points it at its artifact)
+     2. :code.priv_dir/z3/bin/z3 — the mix / OTP-release layout, where priv_dir
+        is a real directory the fetch task populated
+     3. <cwd>/priv/z3/bin/z3 — the ESCRIPT tier: `bl` is a single archive file,
+        so priv_dir resolves to a pseudo-path INSIDE it that can hold no 34MB
+        NIF; the pinned binary still lives in the checkout's priv/, and `bl` is
+        run from the repo root. This is a repo artifact, not a PATH lookup.
+   All three name the SAME pinned binary the repo controls.
+
+   priv uses Tiers.priv_root/0, NOT :code.priv_dir: inside an escript the code
+   path answers with a path INSIDE the archive, which is not a directory on
+   disk — Tiers.priv_root falls back to the checkout's priv/, the truth there as
+   everywhere else."
+  []
+  (let [exe (if (erlang/== :win32 (erlang/element 1 (os/type))) "z3.exe" "z3")
+        env (System/get_env "BEAM_LISP_Z3")
+        priv (Path/join (list (BeamLisp.Tiers/priv_root) "z3" "bin" exe))
+        cwd (Path/join (list (File/cwd!) "priv" "z3" "bin" exe))]
+    (Enum/uniq (concat (if env (list env) (list)) (list priv cwd)))))
+
+(defn check
+  "Reset, assert `smt`, check-sat. Returns `%{status:, model:}` where status is
+   \"sat\" | \"unsat\" | \"unknown\" | \"error\"; model is the `(get-model)` text
+   when `model?: true` and status is \"sat\".
+
+   RUNS IN THE PORT'S OWNER: the reads below arrive in the caller's mailbox, so
+   the owner is the only process that may call this."
+  ([port smt] (raw_check port smt false))
+  ([port smt model?] (raw_check port smt model?)))
+
+(defn raw_reason
+  "`unknown` means the question was not decided, and the two ways that happens
+   want OPPOSITE responses: a CEILING (`timeout` / `canceled`) says raise it or
+   simplify the query; an INCOMPLETE THEORY says no ceiling will help, and the
+   obligation has to stay undecided rather than be retried harder.
+
+   One extra round trip, on the undecided path only. The reply is the RAW z3
+   string here; naming it is the language's job (`oracle/verdict`)."
+  [port status rest]
+  (if (erlang/== status "unknown")
+    (do (Port/command port "(get-info :reason-unknown)\n")
+        (extract_reason (read_sexp port rest)))
+    nil))
+
+(defn- extract_reason
+  "`(:reason-unknown \"timeout\")` → \"timeout\"; `(:reason-unknown \"\")` → nil;
+   any other shape → nil, because a caller that cannot read the reason must not
+   be handed a guess."
+  [text]
+  (let [m (Regex/run (Regex/compile! "^\\(:reason-unknown\\s+(.*)\\)$" "s")
+                     (String/trim (or text "")))]
+    (if (and (erlang/is_list m) (erlang/== 2 (erlang/length m)))
+      (let [inner (String/trim_trailing
+                    (String/trim_leading (String/trim (Enum/at m 1)) "\"")
+                    "\"")]
+        (if (erlang/== inner "") nil inner))
+      nil)))
+
+(defn raw_check
+  "The protocol itself. Runs in the OWNER process only."
+  ([port smt] (raw_check port smt false))
+  ([port smt model?]
+   ;; A caller-supplied (check-sat) would make z3 answer TWICE and desync the
+   ;; reader by one answer for every later query on this port — a silent,
+   ;; alternating sat/unsat that looks like a solver bug. Strip it: this
+   ;; function owns the check.
+   (let [smt (Regex/replace (Regex/compile! "^\\s*\\(check-sat\\)\\s*$" "m") smt "")
+         _ (Port/command port (str "(reset)\n" smt "(check-sat)\n"))
+         ans (read_answer port "")]
+     (if (erlang/== "sat" (erlang/element 1 ans))
+       (if model?
+         (do (Port/command port "(get-model)\n")
+             {:status "sat" :model (read_sexp port (erlang/element 2 ans))})
+         {:status "sat" :model nil})
+       {:status (erlang/element 1 ans)
+        :model nil
+        :why (raw_reason port (erlang/element 1 ans) (erlang/element 2 ans))}))))
+
+(defn raw_command
+  "Send SMT-LIB and wait for z3 to ACKNOWLEDGE it. Anything z3 prints before the
+   marker is returned as `:output`; an `(error …)` line comes back as
+   `%{ok: false}` rather than desynchronizing the reader."
+  [port smt]
+  (Port/command port (str smt "\n(echo \"~~bl-ok~~\")\n"))
+  (let [r (read_until_marker port "" "")]
+    (if (erlang/== :marker (erlang/element 1 r))
+      {:ok true :output (erlang/element 2 r)}
+      {:ok false :error (erlang/element 2 r) :output (erlang/element 3 r)})))
+
+(defn raw_check_here3
+  "The same check, positional — beam-lisp callers pass `(assume core? model?)`
+   and never have to marshal a map across the boundary."
+  [port assume core? model?]
+  (raw_check_here port {:assume assume :core? core? :model? model?}))
+
+(defn raw_check_here
+  "check-sat in the CURRENT solver state — no reset, so assertions accumulate and
+   `push`/`pop` scope them. Options: `:assume` (SMT-LIB literals checked with
+   `check-sat-assuming`), `:core?` (return the unsat core — assertions must be
+   named and the script must set `:produce-unsat-cores`), `:model?` (return the
+   model on sat)."
+  [port opts]
+  (let [assume (or (:assume opts) (list))
+        check (if (erlang/== assume (list))
+                "(check-sat)\n"
+                (str "(check-sat-assuming (" (Enum/join assume " ") "))\n"))
+        _ (Port/command port check)
+        ans (read_answer port "")]
+    (cond
+      (erlang/== "unsat" (erlang/element 1 ans))
+      (if (:core? opts)
+        (do (Port/command port "(get-unsat-core)\n")
+            {:status "unsat" :core (read_sexp port (erlang/element 2 ans))})
+        {:status "unsat" :core nil})
+
+      (erlang/== "sat" (erlang/element 1 ans))
+      (if (:model? opts)
+        (do (Port/command port "(get-model)\n")
+            {:status "sat" :core nil :model (read_sexp port (erlang/element 2 ans))})
+        {:status "sat" :core nil})
+
+      :else
+      {:status (erlang/element 1 ans)
+       :core nil
+       :why (raw_reason port (erlang/element 1 ans) (erlang/element 2 ans))})))
+
+(defn raw_scoped
+  "One SCOPED question: push, assert the script, check-sat, [get-model], pop —
+   all inside one call, against the solver state the caller's conversation
+   already built. The prelude is therefore sent once per conversation instead of
+   once per question.
+
+   `(get-model)` runs BEFORE the pop — the model of a popped scope is gone — and
+   `pop` prints nothing, so the reply stream stays exactly one status (+ model)."
+  ([port smt] (raw_scoped port smt false))
+  ([port smt model?]
+   (Port/command port (str "(push 1)\n" smt "\n(check-sat)\n"))
+   (let [ans (read_answer port "")]
+     (cond
+       (erlang/== "unsat" (erlang/element 1 ans))
+       (do (Port/command port "(pop 1)\n")
+           {:status "unsat" :core nil :model nil})
+
+       (erlang/== "sat" (erlang/element 1 ans))
+       (let [model (if model?
+                     (do (Port/command port "(get-model)\n")
+                         (read_sexp port (erlang/element 2 ans)))
+                     nil)]
+         (Port/command port "(pop 1)\n")
+         {:status "sat" :core nil :model model})
+
+       :else
+       (let [why (raw_reason port (erlang/element 1 ans) (erlang/element 2 ans))]
+         (Port/command port "(pop 1)\n")
+         {:status (erlang/element 1 ans) :core nil :model nil :why why})))))
+
+(defn- read_until_marker
+  [port acc out]
+  (let [lines (String/split acc "\n")]
+    (cond
+      (Enum/member? lines "~~bl-ok~~")
+      (tuple :marker out)
+
+      (Enum/any? lines (fn [l] (String/starts_with? l "(error")))
+      (tuple :error (Enum/find lines (fn [l] (String/starts_with? l "(error"))) out)
+
+      :else
+      (receive
+        [p [:data data]] :when (== p port)
+        (let [acc2 (str acc data)
+              keep (Enum/join
+                     (Enum/reject (String/split acc2 "\n")
+                                  (fn [l] (or (erlang/== l "") (erlang/== l "~~bl-ok~~"))))
+                     "\n")]
+          (read_until_marker port acc2 keep))
+        (after (read_timeout)
+          (tuple :error "timeout waiting for z3 to acknowledge" out))))))
+
+(defn- read_answer
+  "Read until a status LINE appears, returning `{status, rest}`.
+
+   DEVIATION FROM THE ELIXIR SOURCE, recorded here: `receive {^port, {:data, …}}`
+   pins the port in the message pattern; a beam-lisp pattern cannot pin a bound
+   value, so the clause matches the SHAPE and names the port with a `:when`
+   guard — `(== p port)`, where `port` is this function's own parameter and so is
+   visible to the guard. The BEAM therefore still takes only THIS port's data
+   and leaves every other message (a `$gen_call`, an `{:EXIT, …}`) queued, which
+   is exactly what the pinned pattern did."
+  [port acc]
+  (receive
+    [p [:data data]] :when (== p port)
+    (let [acc2 (str acc data)
+          lines (String/split acc2 "\n")
+          idx (Enum/find_index lines
+                (fn [l] (Enum/member? (list "sat" "unsat" "unknown" "error") l)))]
+      (if (nil? idx)
+        (read_answer port acc2)
+        (tuple (Enum/at lines idx)
+               (Enum/join (Enum/drop lines (erlang/+ idx 1)) "\n"))))
+    (after (read_timeout)
+      (erlang/error (Elixir.RuntimeError/exception
+                      (str "z3 timeout (acc: " (Kernel/inspect acc) ")"))))))
+
+(defn- read_sexp
+  [port acc]
+  (if (and (erlang/> (String/length acc) 3) (balanced? acc))
+    acc
+    (receive
+      [p [:data data]] :when (== p port)
+      (read_sexp port (str acc data))
+      (after (read_timeout) acc))))
+
+(defn- balanced?
+  [s]
+  (erlang/== 0
+    (Enum/reduce (String/graphemes s) 0
+      (fn [ch n]
+        (cond
+          (erlang/== ch "(") (erlang/+ n 1)
+          (erlang/== ch ")") (erlang/- n 1)
+          :else n)))))

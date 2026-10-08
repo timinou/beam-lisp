@@ -10,6 +10,14 @@
 ; ── Contract ────────────────────────────────────────────────────────────────
 ;
 ;   (run {:sources [paths]              every source: .bl, .bl.md, .bl.org
+;         :exclude [paths]               sources this run must NEVER compile:
+;                                        entry programs whose top-level forms
+;                                        run on load. A path is a FILE (exact)
+;                                        or a DIRECTORY (everything beneath
+;                                        it); nil = no exclusion. See
+;                                        "Source selection" below.
+;         :scope :full | :scoped         is :sources the WHOLE inventory?
+;                                       (default :full; see "What a run OWNS")
 ;         :out "dir"                     where beams go
 ;         :manifest "path"               the manifest file (default <out>/compile.beam_lisp)
 ;         :log-path "path"               the fact log (default build.log beside the manifest)
@@ -19,6 +27,40 @@
 ;         :jobs n                        parallel width per wave
 ;         :log (fn [msg])                progress lines (nil = silent)})
 ;   → {:built n :errors [msg …] :manifest {path → entry}}
+;
+; ── What a run OWNS ─────────────────────────────────────────────────────────
+;
+; `:sources` means one of two things, and the difference is DESTRUCTIVE.
+;
+; FULL (`:scope :full`, the default): the list is the tree's WHOLE source
+; inventory, so a path the log still records and the list does not name has
+; genuinely left the build — a deleted file — and the run drops its facts and
+; deletes its beams. This is what `bl build` and `mix compile.beam_lisp` mean,
+; and it is the only way a removed source ever leaves the manifest.
+;
+; SCOPED (`:scope :scoped`): the list is a SUBSET the caller is rebuilding —
+; the boot-tier self-heal compiles `priv/boot/` and its std prelude into the
+; ebin the whole tree shares, and hands over nothing else. For it, "not
+; supplied" cannot be told apart from "deleted", so the run prunes NOTHING:
+; every record and beam the log holds that the list does not name is left
+; exactly as it was found. Dropping the records while leaving the beams (or the
+; reverse) would make the log and the ebin disagree — a log that has forgotten
+; a module whose beam still loads.
+;
+; The substrate stage is not scoped by this: it walks `:ex`'s own root, so the
+; walk IS that root's inventory and a `.ex` file it no longer sees is a deleted
+; file. Scoping is a statement about `:sources`, never about a tree walk.
+;
+; What scoped gives up, said plainly: a scoped run cannot notice a source that
+; left ITS OWN scope, because absence from a subset is not evidence. A deleted
+; boot source's record and beam therefore outlive it until an authoritative
+; full run — `bl build` — prunes them. That is the honest price of not being
+; allowed to read "not supplied" as "deleted", and it is bounded: the boot
+; tier's verdict is provenance on `Tiers/boot_namespaces`, so an orphan beam
+; is never mistaken for a current one.
+;
+; An unrecognised `:scope` is not a licence to destroy: it is reported in
+; `:errors` and answered as scoped. A typo must not delete a build.
 ;
 ; ── Where the build's memory lives ──────────────────────────────────────────
 ;
@@ -191,19 +233,22 @@
    linked, so it surfaces as the build's own failure — `build-one` already
    catches compile errors into a result, so a crash here is a real bug."
   [n f xs]
-  (let [me (erlang/self)]
+  (let [me (erlang/self)
+        ; CONVEYED IN THE PARENT, THEN SPAWNED. `convey` captures the CALLER's
+        ; process dictionary — env id, chain, ns, caps, heap — and a freshly
+        ; spawned worker's pdict is empty, so a token made INSIDE the worker
+        ; names `:global`: the ns/alias binding is gone (the settle-retry once
+        ; died as `function Thread.sleep/1 is undefined`) AND a fork's search
+        ; roots go with it, so the emitter folded `sibling:?` into every
+        ; closure key and the beam's stamp never matched the gate's live key.
+        ; The token made HERE, where the caller's bindings are live, carries
+        ; both into the worker; `bind/1` re-derives caps from the env.
+        cf (BeamLisp.Env/convey f)]
     (apply concat
       (map (fn [chunk]
              (let [refs (mapv (fn [x]
                                 (let [ref (erlang/make_ref)]
-                                  ; CONVEYED, not merely spawned: a worker's env
-                                  ; does not cross a process boundary on its own,
-                                  ; and a worker that resolves at `:global` has no
-                                  ; module caps — which is how the retry below
-                                  ; turned into `function Thread.sleep/1 is
-                                  ; undefined (module Thread is not available)`
-                                  ; instead of building anything.
-                                  (erlang/spawn_link (fn [] (erlang/send me (erlang/list_to_tuple (list ref ((BeamLisp.Env/convey f) x))))))
+                                  (erlang/spawn_link (fn [] (erlang/send me (erlang/list_to_tuple (list ref (cf x))))))
                                   ref))
                               chunk)]
                (mapv (fn [ref] (receive [r v] :when (= r ref) v)) refs)))
@@ -317,7 +362,7 @@
                   (let [tkey (source-key root path)
                         cache-key (when cache? tkey)]
                     (build-one path (get (:key p) path) tkey cache-key
-                      (when cache-key (BeamLisp.AOTCache/closure_key path (:deps p) hashes)) out log))) paths)]
+                      (when cache-key (get (:key p) path)) out log))) paths)]
     (fold-results st results out log-path)))
 
 (defn- build-ordinary [waves jobs st p todo? cache? hashes out log-path log root]
@@ -659,8 +704,107 @@
         acc
         (recur (rest cs) (native-one acc (first cs) root log))))))
 
-(defn run [opts]
-  (let [sources (vec (:sources opts)) out (:out opts) force? (= true (:force? opts))
+; ── source selection: what a run is allowed to compile ──────────────────────
+;
+; A project may declare `:exclude` — sources this build must NEVER compile:
+; ENTRY programs whose top-level forms bind listeners, open ports or touch
+; devices when they load (FUP-015). Selection happens against `:sources` BEFORE
+; the source graph is read, planned or compiled, so an excluded source is never
+; parsed into a node, never evaluated by the compiler and never emits a beam.
+;
+; An entry names a FILE (matched exactly) or a DIRECTORY (every source BENEATH
+; it). The directory test is on the path SEPARATOR, so `src/foo` excludes
+; `src/foo/…` and never `src/foobar`. Paths are absolute by the time they get
+; here: `bl.env` resolves `:build :exclude` against the PROJECT root, so
+; selection never reads the ambient cwd.
+
+(defn- without-trailing-sep
+  "`p` without a trailing `/`; a bare `/` is left alone."
+  [p]
+  (if (and (> (count p) 1) (String/ends_with? p "/"))
+    (String/slice p 0 (- (count p) 1))
+    p))
+
+(defn path-excluded?
+  "Does `source` fall under one of `excludes`? An entry matches `source`
+   EXACTLY, or as a directory prefix closed by `/` — so `src/foo` never
+   matches `src/foobar`."
+  [source excludes]
+  (some (fn [e]
+          ; An EMPTY entry must not match every path (`starts_with? s "/"`
+          ; would, for absolute sources). Absence is the way to say nothing.
+          (if (empty? e)
+            false
+            (let [e (without-trailing-sep e)]
+              (or (= source e)
+                  (String/starts_with? source (str e "/"))))))
+        excludes))
+
+(defn select-sources
+  "The sources a run may compile: `sources` minus everything `excludes` names.
+   An empty exclusion returns the sources unchanged, so a build that declares
+   none behaves exactly as it did before exclusion existed."
+  [sources excludes]
+  (vec (remove (fn [p] (path-excluded? p excludes)) sources)))
+
+(defn- excluded-namespaces
+  "The namespace each excluded source declares, read (never evaluated) through
+   the same plan reader the build uses. A malformed excluded file contributes
+   nothing: it cannot be a resolved dependency."
+  [excluded]
+  (vec (filter (fn [n] (some? n))
+               (map (fn [p]
+                      (try (:ns (plan/node-from p (BeamLisp.Loader/read_source p)))
+                           (catch _e nil)))
+                    excluded))))
+
+(defn- excluded-require-errors
+  "Included `nodes` that require an excluded namespace. The compiler LOADS a
+   required namespace while building its requirer — eagerly for a bare
+   `:require`, on first macro use otherwise — which would evaluate the excluded
+   entry against the very rule that excluded it. Refuse instead, naming the
+   edge and the remedy."
+  [nodes excluded-ns]
+  (vec (mapcat (fn [node]
+                 (map (fn [r]
+                        (str "beam-lisp AOT: " (:path node) " requires " r
+                             ", which is excluded from this build;"
+                             " an excluded source is never evaluated —"
+                             " remove the require or the exclusion"))
+                      (filter (fn [r] (contains? excluded-ns r)) (:reqs node))))
+               nodes)))
+
+(defn run
+  "One build. `opts` is the contract at the top of this file; `:scope` decides
+   whether `:sources` is the whole inventory (`:full`, the default — what it
+   does not name is pruned) or a subset this run owns (`:scoped` — nothing is
+   pruned, see \"What a run OWNS\"). An unreadable scope is reported and
+   answered as scoped."
+  [opts]
+  (let [excl (vec (or (:exclude opts) []))
+        ; WHAT THIS RUN COMPILES. The project's exclusions are applied to the
+        ; INVENTORY first: an excluded path is not read, not planned, not
+        ; compiled — and, because it is absent from `keep` below, a source the
+        ; log recorded before it was excluded is PRUNED with its beams. Entry
+        ; programs never run during AOT and never linger as an old generation.
+        all-sources (vec (:sources opts))
+        excluded (vec (filter (fn [p] (path-excluded? p excl)) all-sources))
+        sources (select-sources all-sources excl)
+        ; An exclusion that leaves NOTHING to build is a contradiction, not a
+        ; clean run: report it, and do NOT prune — a `:full` run would read
+        ; every recorded source as deleted and wipe the manifest.
+        all-excluded? (and (not (empty? all-sources)) (not (empty? excl)) (empty? sources))
+        out (:out opts) force? (= true (:force? opts))
+        ; WHAT THIS RUN OWNS. `:full` is the default because it is what every
+        ; existing caller means; only an explicit `:scoped` — or a scope we
+        ; cannot read, which is reported and answered conservatively — turns
+        ; pruning off. A typo must not delete a build.
+        scope (:scope opts)
+        [prune? scope-errors] (cond
+                                (or (nil? scope) (= :full scope)) [true []]
+                                (= :scoped scope) [false []]
+                                :else [false [(str "beam-lisp AOT: unknown :scope " scope
+                                                  " (want :full or :scoped); nothing was pruned")]])
         root (:root opts)
         jobs (or (:jobs opts) (erlang/system_info :schedulers_online)) log (:log opts)
         mpath (or (:manifest opts) (manifest-path out))
@@ -679,6 +823,23 @@
                                       (catch e [:error (str "beam-lisp AOT: " path ": " (ex-message e))]))) sources)
         read-errors (vec (map second (filter (fn [r] (= :error (first r))) read-results)))
         p (plan/plan (map second (filter (fn [r] (= :ok (first r))) read-results)))
+        ; AN EXCLUDED SOURCE MUST NOT BE REACHED THROUGH A REQUIRE. The
+        ; compiler loads a required namespace while building its requirer,
+        ; which would EVALUATE the entry this exclusion exists to keep out of
+        ; the build. Learn the excluded namespaces by READING their headers
+        ; (never evaluating them), then refuse every included source that
+        ; requires one and keep that source out of the build entirely.
+        excl-ns (set (excluded-namespaces excluded))
+        refuse-errors (excluded-require-errors (:order p) excl-ns)
+        ; Transitive: a source whose require-CLOSURE reaches an excluded ns
+        ; would load it through its dependency chain, so it is refused too.
+        refused (set (map (fn [node] (:path node))
+                          (filter (fn [node]
+                                    (let [ns (:ns node)
+                                          members (if (nil? ns) (:reqs node)
+                                                      (get (:closure p) ns []))]
+                                      (some (fn [r] (contains? excl-ns r)) members)))
+                                  (:order p))))
         ; A require cycle has no satisfying order, and a cold AOT load of one
         ; is BUG-064's silent cross-process deadlock — so it is a named,
         ; fatal error HERE, at build time, not a hang in somebody's drop.
@@ -690,7 +851,10 @@
                                     " (resolve that namespace by name at the point of use)"))
                              (:cycles p)))
         part (partition-plan p) hashes (into {} (map (fn [n] [(:path n) (:hash n)]) (:order p)))
-        todo? (fn [state path] (or force? (not (blog/fresh? state path (get (:key p) path) (source-key root path) out))))
+        ; A refused source is never compiled, even under `:force?` — force
+        ; rebuilds, it does not run entry programs the project excluded.
+        todo? (fn [state path] (and (not (contains? refused path))
+                                    (or force? (not (blog/fresh? state path (get (:key p) path) (source-key root path) out)))))
         total (count (filter (fn [n] (todo? state0 (:path n))) (:order p)))]
     (when (and log (pos? total)) (log (str "beam-lisp AOT: building " total " source(s)")))
     ; the run fact goes down BEFORE the first source, and into the state with
@@ -699,7 +863,10 @@
     (blog/append! lpath [started])
     (let [tc-paths (set (map :path (:toolchain part)))
           initial {:state (blog/apply-facts state0 [started]) :built 0 :toolchain-paths tc-paths
-                   :errors (vec (concat read-errors cyc-errors (:errors part)))}
+                   :errors (vec (concat read-errors cyc-errors (:errors part) scope-errors refuse-errors
+                                        (if all-excluded?
+                                          ["beam-lisp AOT: :exclude left no sources to build; check :build :exclude"]
+                                          [])))}
           ; toolchain sources build only from a clean slate: a barrier error (a
           ; toolchain source requiring an ordinary one) or an unreadable
           ; toolchain source means the compiler or its driver is unsound, so
@@ -713,7 +880,13 @@
                   (build-ordinary (:ordinary-waves part) jobs built p todo? cache? hashes out lpath log root) built)
           keep (set sources)
           st0 (:state final)
-          gone (vec (remove (fn [path] (contains? keep path)) (keys (:sources st0))))
+          ; SCOPED runs prune nothing (see "What a run OWNS"): a source the
+          ; caller did not hand over is not evidence that its file is gone.
+          ; The DROP FACTS and the beam deletions come from this one list, so
+          ; the log, the manifest and the ebin cannot disagree about a source.
+          gone (if (and prune? (not all-excluded?))
+                 (vec (remove (fn [path] (contains? keep path)) (keys (:sources st0))))
+                 [])
           ; the beams to remove are read BEFORE the drop facts land
           gone-beams (vec (map (fn [path] (get-in st0 [:sources path :modules] [])) gone))
           st (if (pos? (count gone))

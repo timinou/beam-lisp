@@ -1,0 +1,291 @@
+; document/xberg-worker.bl — the SHIPPED OS worker: one extraction, one process.
+;
+; ── what this is, and what it is not ────────────────────────────────────────
+;
+; `document.xberg/:isolation :os_worker` launches this program so a runaway
+; native read can be stopped for real (SIGKILL to the process group) instead of
+; merely abandoned on a dirty scheduler. This file is the other half of that
+; contract — the program the parent actually starts, shipped, not a fixture.
+;
+; It is NOT a second normalizer. The parent hands it a request file and reads a
+; response; the response is the engine's OWN raw extraction response,
+; JSON-encoded, plus the identity of the engine that produced it. Everything
+; that decides what a document MEANS lives in `document.xberg` and
+; `librarium.reader` and runs on BOTH sides identically — which is why a fake
+; worker and this one produce the same artifact semantics.
+;
+;   argv    one path: the REQUEST json file. `bl run worker.bl -- /tmp/req.json`
+;   stdout  one RESPONSE json object, then newline. Exit 0 even for a refusal —
+;           a refusal is a response the parent can read (`__worker_error__`).
+;
+; Two request kinds share that one shape:
+;   {:kind "uri"  :uri "file://…" :config {…}}   read one document
+;   {:kind "caps"}                               the capability handshake
+;
+; ── the carrier: explicit, and never named by the request ───────────────────
+;
+; The pinned Xberg artifact is loaded from `XBERG_RUNTIME`, an explicit BUILD
+; LIB directory (`…/xberg_rt/_build/prod/lib`). The request may name a DOCUMENT
+; and a config; it may never name a native artifact to load. That is the whole
+; point of a boundary: an uploaded document must not be able to choose the code
+; that reads it.
+;
+; ── why no shell shim ───────────────────────────────────────────────────────
+;
+; The carrier is put on `code` path HERE, in Lisp, from that one validated
+; directory. A generated shell wrapper was the alternative; it is not needed,
+; and the rule it would have been allowed under — "only Elixir package loading"
+; — is exactly the rule this file keeps by doing it itself.
+
+(ns document.xberg-worker
+  (:require [document.xberg :as xb]
+            [bl.json :as json]))
+
+(def RUNTIME-ENV "XBERG_RUNTIME")
+
+;; ── the runtime directory ───────────────────────────────────────────────────
+
+(defn- carrier-ebin?
+  "A build lib dir is a CARRIER only when it actually holds the engine. Asking
+   for the app beam AND its JSON dep is not ceremony: `:code.priv_dir(:xberg)`
+   must resolve for the NIF to be found, and a directory that merely exists must
+   not be mistaken for the pinned artifact."
+  [rt]
+  (and (File/exists? (Path/join (list rt "xberg" "ebin" "Elixir.Xberg.beam")))
+       (File/exists? (Path/join (list rt "jason" "ebin" "Elixir.Jason.beam")))
+       (File/exists? (Path/join (list rt "rustler_precompiled" "ebin")))))
+
+(defn runtime-status
+  "`{:ok dir}` | `{:error {:reason :unset|:missing|:not-a-carrier :path …}}`.
+   Absence and invalidity are DIFFERENT answers, because the remedy differs."
+  []
+  (let [d (System/get_env RUNTIME-ENV)]
+    (cond
+      (or (nil? d) (= "" d)) {:error {:reason :unset}}
+      (not (File/exists? d)) {:error {:reason :missing :path d}}
+      (not (carrier-ebin? d)) {:error {:reason :not-a-carrier :path d}}
+      :else {:ok (Path/expand d)})))
+
+(defn- ebin-dirs [rt]
+  (into [] (map (fn [e] (Path/join (list rt e "ebin"))))
+        (filter (fn [e] (File/exists? (Path/join (list rt e "ebin"))))
+                (to-list (File/ls! rt)))))
+
+(defn load-runtime!
+  "Put the carrier on the code path and start it. Returns `:ok` or
+   `{:error message}`. Loading is idempotent, so a caller may retry.
+
+   The dirs cross as CHARLISTS: on this OTP a binary dir is accepted by
+   `code:add_pathsa/1` and then silently NOT added (measured — the path never
+   appears in `code:get_path/0` and `application:load/1` reports `no such file`
+   for an app sitting in it). The explicit conversion is the difference between
+   a loaded carrier and a refusal that looks like a missing file."
+  [rt]
+  (erlang/apply :code :add_pathsa
+                (list (to-list (map (fn [d] (erlang/binary_to_list d)) (ebin-dirs rt)))))
+  ;; `application:load/1`, NOT `ensure_all_started/1`: the carrier ships the
+  ;; engine and its compile-time deps, and `jason`/`rustler` list `decimal` and
+  ;; `eex` — apps the CARRIER does not hold and a drop's VM does not have on its
+  ;; path. Asking to START the tree makes a loadable carrier fail on an app it
+  ;; never calls. Loading is what `code:priv_dir(:xberg)` — and so the NIF
+  ;; lookup — actually needs; the call is the proof.
+  (try (erlang/apply :application :load (list :xberg)) (catch _ :ok))
+  (if (erlang/== true (xb/available?))
+    :ok
+    {:error (str "the carrier at " rt " loaded but the binding is not callable"
+                 " (no libxberg_nif … .so under xberg/priv/native?)")}))
+
+;; ── the wire form: the engine's own shapes, spelled for JSON ────────
+;
+; The engine answers with Elixir structs (`%Xberg.DocumentNode{}`) and Rust
+; enums as tagged 2-tuples (`{:group, %{…}}`). JSON has neither, and `bl.json`
+; cannot walk a struct it has no encoder for. So the response is flattened HERE,
+; in Lisp, once: a struct becomes its fields (minus `:__struct__`), a tagged
+; tuple becomes `{"__enum__": [tag, payload]}` — the object `document.xberg/
+; enum-tag` already reads — and a keyword crosses as its name. No field is
+; renamed and no value is decided: this is spelling, not meaning, and the
+; parent's own `field`/`enum-tag`/`results` accessors read it unchanged.
+
+(defn- key-name [k]
+  (cond
+    (keyword? k) (name k)
+    (string? k) k
+    (erlang/is_atom k) (erlang/atom_to_binary k)
+    :else (str k)))
+
+(defn wire [v]
+  (cond
+    (nil? v) nil
+    (or (string? v) (number? v) (erlang/== true v) (erlang/== false v)) v
+    (erlang/is_tuple v)
+    (let [parts (into [] (map wire) (erlang/tuple_to_list v))]
+      (if (erlang/== 2 (erlang/tuple_size v))
+        {:__enum__ parts}
+        parts))
+    (keyword? v) (name v)
+    (map? v) (reduce (fn [acc k]
+                       (if (erlang/== "__struct__" (key-name k))
+                         acc
+                         (assoc acc (key-name k) (wire (get v k)))))
+                     {} (keys v))
+    ;; Elixir NIF structs are native maps, not Lisp maps. Stringifying them
+    ;; drops nested chunk offsets and can leak inspected document bodies.
+    (erlang/is_map v)
+    (reduce (fn [acc pair]
+              (let [k (key-name (erlang/element 1 pair))]
+                (if (= "__struct__" k) acc
+                  (assoc acc k (wire (erlang/element 2 pair))))))
+            {} (maps/to_list v))
+    (erlang/is_atom v) (erlang/atom_to_binary v)
+    (or (vector? v) (list? v) (set? v)) (into [] (map wire) (to-list v))
+    :else (str v)))
+
+;; ── request / response ──────────────────────────────────────────────────────
+
+(defn- werr
+  "The refusal envelope. A key no engine response has, so the parent reads it as
+   an error without a second wire format for the success case."
+  [kind message detail]
+  {:__worker_error__ (merge {:xberg kind :message message :worker "document.xberg-worker"} detail)})
+
+(defn- file->path
+  "A `file://` URI from the parent, or a bare path. Anything with another scheme
+   is refused: this process reads LOCAL documents only."
+  [uri]
+  (let [u (str uri)]
+    (cond
+      (String/starts_with? u "file://") (subs u 7)
+      (String/contains? u "://") nil
+      :else u)))
+
+(defn- decode-request [path]
+  (try
+    (let [m (json/decode (File/read! path) {:keys :keyword})]
+      (if (map? m)
+        {:ok m}
+        {:error (werr :request "the request must be a JSON object" {})}))
+    (catch e
+      {:error (werr :request (str "the request could not be read: " (try (get e :message) (catch _ "parse error")))
+                    {:path path})})))
+
+;; ── the one behavior: read the document, say what the engine said ───────────
+
+(defn- positive-env [key fallback]
+  (try (let [n (erlang/binary_to_integer (or (System/get_env key) ""))]
+         (if (pos? n) n fallback))
+       (catch _ fallback)))
+
+(defn request-budget
+  "Honor the parent's bounded limits. Older parents sent only config: derive
+   their deadline and upload cap rather than silently reverting to 180s/64MiB."
+  [req]
+  (merge {:timeout-ms (* 1000 (+ 30 (or (get-in req [:config :extraction_timeout_secs])
+                                      (positive-env "KNOWLEDGER_READ_TIMEOUT_SECS" 120))))
+          :max-input-bytes (max 67108864 (* 1048576 (positive-env "KNOWLEDGER_MAX_UPLOAD_MB" 25)))}
+         (select-keys (or (:budget req) {})
+                      [:timeout-ms :max-input-bytes :max-output-bytes :max-request-bytes :max-concurrent])))
+
+(defn extract-request
+  "Run the request through the SAME boundary the parent uses, pinned to
+   `:in_process` (THIS process IS the isolation). Returns the `{:ok result}` or
+   `{:error …}` that `document.xberg/extract-path` returns."
+  [req]
+  (let [p (file->path (or (get req :uri) (get req :path) ""))]
+    (cond
+      (nil? p) {:error (merge {:xberg :egress} {:message "the worker reads local file:// inputs only"})}
+      :else
+      (do
+        ;; THIS process IS the isolation. Mark it so the boundary can never
+        ;; default to `:os_worker` here and spawn a nested copy of this worker
+        ;; (the parent sets the same variable in this process's environment; a
+        ;; worker started by hand is covered by this line).
+        (System/put_env "XBERG_WORKER_CHILD" "1")
+        (xb/extract-path p
+                         {:config (get req :config)
+                          :budget (request-budget req)
+                          :isolation :in_process
+                          :require-languages (get req :languages)
+                          :allow-degraded? (get req :allow-degraded? false)
+                          :allow-egress? false})))))
+
+(defn caps-response
+  "The CAPABILITY HANDSHAKE: what THIS worker's carrier can actually read, plus
+   the engine identity the parent mints artifact ids from. Asked for with a
+   request `{:kind \"caps\"}`, and answered from the same boundary the parent
+   would use in-process — so the parent never has to guess a format list for a
+   deployment whose binding lives only here.
+
+   Nothing is read from a document: this is the registry and the host probe, and
+   a refusal is the same typed `werr` envelope every other failure uses."
+  [req]
+  (let [c (xb/capabilities {:config (get req :config) :refresh true})]
+    (if (contains? c :error)
+      (werr :capability
+            (or (get-in c [:error :message]) "the capability probe failed")
+            (get c :error))
+      {:caps (get c :ok)})))
+
+(defn response
+  "The response map for `argv`. Always a map — never a raise — so the parent
+   gets a typed answer even when nothing could run."
+  [argv]
+  (let [rp (first (to-list argv))]
+    (cond
+      (nil? rp)
+      (werr :request "the worker needs one argument: the request JSON file path" {})
+
+      (not (File/exists? (str rp)))
+      (werr :request (str "no such request file: " rp) {:path (str rp)})
+
+      :else
+      (let [rt (runtime-status)]
+        (if (contains? rt :error)
+          (let [e (get rt :error)]
+            (werr :runtime
+                  (cond
+                    (= :unset (:reason e))
+                    (str RUNTIME-ENV " is unset: name the pinned Xberg build lib dir"
+                         " (…/xberg_rt/_build/prod/lib, the one holding xberg/ebin);"
+                         " the worker will not guess a native artifact to load")
+                    (= :missing (:reason e))
+                    (str RUNTIME-ENV " names a directory that does not exist: " (:path e))
+                    :else
+                    (str RUNTIME-ENV " is not an Xberg carrier (no xberg/ebin + jason/ebin): " (:path e)))
+                  {:path (:path e)}))
+          (let [req (decode-request (str rp))]
+            (if (contains? req :error)
+              (get req :error)
+              (let [loaded (load-runtime! (get rt :ok))]
+                (if (contains? loaded :error)
+                  (werr :runtime (get loaded :error) {:runtime (get rt :ok)})
+                  (let [reqm (get req :ok)]
+                    (if (erlang/== "caps" (str (get reqm :kind)))
+                      (caps-response reqm)
+                      (let [r (try (extract-request reqm)
+                                   (catch e {:error {:xberg :call
+                                                     :message (str "worker extraction failed: "
+                                                                   (try (get e :message) (catch _ "unknown")))}}))]
+                        (if (contains? r :ok)
+                          (let [res (get r :ok)]
+                            {:raw (get res :raw)
+                             :engine (get res :engine)
+                             :configHash (get res :config-hash)
+                             :transport :json
+                             :isolation :os_worker
+                             :durationMs (get res :duration-ms)
+                             :input (get res :input)})
+                          {:__worker_error__ (merge {:xberg (or (get-in r [:error :xberg]) :call)
+                                                     :message (get-in r [:error :message])
+                                                     :worker "document.xberg-worker"}
+                                                    (get r :error))})))))))))))))
+
+;; ── the entrypoint ──────────────────────────────────────────────────────────
+;
+; The LAST form's value is what `bl run` prints — so `main` returns the response
+; AS A JSON STRING and prints nothing itself: one writer, one line, and a
+; refusal is the same shape as a success on the wire.
+
+(defn main [argv]
+  (json/encode (wire (response argv))))
+
+(main (BeamLisp/argv))

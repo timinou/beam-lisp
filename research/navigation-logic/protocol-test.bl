@@ -1,0 +1,96 @@
+(ns research.navigation.protocol-test
+  (:require [veritas.model :as vm] [veritas.ledger :as ledger] [datom] [z3]))
+
+;; Abstract protocols: these exercise actual Veritas and Datalog APIs, but do
+;; not simulate fsync or claim that a real backend already implements them.
+(def recovery-start {:durable false :copied 0 :target 3 :covered false :visible false})
+(defn ready? [s] (and (:durable s) (:covered s) (= (:copied s) (:target s))))
+(defn recovery-step [s op unsafe]
+  (case op
+    :schema (assoc s :durable true)
+    :copy (update s :copied (fn [n] (min (:target s) (inc n))))
+    :certificate (assoc s :covered (= (:copied s) (:target s)))
+    :reopen (assoc s :visible (if unsafe (:durable s) (ready? s)))
+    :new-schema (assoc s :copied 0 :covered false :visible false)
+    s))
+(defn recovery-model [unsafe]
+  (vm/model "index coverage recovery"
+    {:state recovery-start :init (fn [] (atom recovery-start))
+     :commands (into {} (map (fn [op] [op {:next (fn [s _] (recovery-step s op false))
+                                          :run (fn [sys _] (swap! sys recovery-step op unsafe))}])
+                            [:schema :copy :certificate :reopen :new-schema]))
+     :invariants {:covered-before-visible (fn [_ sys] (or (not (:visible @sys)) (ready? @sys)))}}))
+
+(def budget-start {:queue [] :accounted 0})
+(defn physical [s] (reduce + 0 (:queue s)))
+(defn publish [s w unsafe]
+  (let [charged (if unsafe (:accounted s) (physical s))]
+    (if (<= (+ charged w) 10)
+      (-> s (update :queue conj w) (update :accounted + w)) s)))
+(defn budget-model [unsafe]
+  (vm/model "queued bytes survive caller timeout"
+    {:state budget-start :init (fn [] (atom budget-start))
+     :commands {:publish {:args (vm/int-in 1 10)
+                          :next (fn [s w] (publish s w false))
+                          :run (fn [sys w] (swap! sys publish w unsafe))}
+                :timeout {:next (fn [s _] s)
+                          :run (fn [sys _] (when unsafe (swap! sys assoc :accounted 0)))}
+                :owner-dead {:next (fn [_ _] budget-start)
+                             :run (fn [sys _] (reset! sys budget-start))}
+                :consume {:next (fn [_ _] budget-start)
+                          :run (fn [sys _] (reset! sys budget-start))}}
+     :invariants {:physical-bound (fn [_ sys] (<= (physical @sys) 10))}}))
+
+(deftest veritas-finds-recovery-and-timeout-counterexamples
+  (let [l (ledger/open nil)]
+    (doseq [[name factory] [["recovery" recovery-model] ["budget" budget-model]]]
+      (let [bad (vm/check (factory true) {:seed 17 :histories 250 :max-len 20})
+            good (vm/check (factory false) {:seed 17 :histories 250 :max-len 20})]
+        (is (= :refuted (:modality bad)))
+        (is (= false (:ok (vm/replay (factory true) (:shrunk bad)))))
+        (is (= :witnessed (:modality good)))
+        (is (= 250 (:tried good)))
+        (is (= [] (:unexercised good)))
+        (ledger/record! l bad {:claim (str name " unsafe protocol") :by "navigation prototype"})
+        (ledger/record! l good {:claim (str name " guarded protocol sampled histories") :by "navigation prototype"})
+        (println "PROTOTYPE histories" {:area name :unsafe (:modality bad) :trace (:shrunk bad)
+                                        :safe (:modality good) :histories (:tried good) :coverage (:coverage good)})))
+    (is (= 4 (count (ledger/all l))))))
+
+(deftest datalog-reclamation-policy-keeps-queued-live-owner-charge
+  (let [c (datom/connect [{:db/ident :lease/caller-alive :db/valueType :db.type/boolean}
+                          {:db/ident :lease/owner-alive :db/valueType :db.type/boolean}
+                          {:db/ident :lease/enqueued :db/valueType :db.type/boolean}
+                          {:db/ident :lease/charge :db/valueType :db.type/long}])]
+    (datom/transact! c [{:db/id -1 :lease/caller-alive false :lease/owner-alive true :lease/enqueued true :lease/charge 6}
+                       {:db/id -2 :lease/caller-alive false :lease/owner-alive true :lease/enqueued false :lease/charge 3}
+                       {:db/id -3 :lease/caller-alive false :lease/owner-alive false :lease/enqueued true :lease/charge 4}])
+    (let [db (datom/db c)
+          pending (datom/q '[:find ?charge :where [?e :lease/caller-alive false]
+                            [?e :lease/owner-alive true] [?e :lease/enqueued true] [?e :lease/charge ?charge]] db)
+          reserved (datom/q '[:find ?charge :where [?e :lease/caller-alive false]
+                             [?e :lease/enqueued false] [?e :lease/charge ?charge]] db)
+          dead (datom/q '[:find ?charge :where [?e :lease/owner-alive false] [?e :lease/charge ?charge]] db)]
+      (is (= #{[6]} (set pending)))
+      (is (= #{[3]} (set reserved)))
+      (is (= #{[4]} (set dead)))
+      (println "PROTOTYPE reclamation-policy" {:keep pending :dead-caller-unsent reserved :dead-owner dead}))))
+
+(deftest smt-checks-restricted-universal-safety-obligations
+  ;; Explicit scalar formulas, emitted through the authoritative SMT printer.
+  ;; UNSAT proves only these stated arithmetic/Boolean obligations.
+  (let [coverage [(list 'declare-const 'durable 'Bool) (list 'declare-const 'covered 'Bool)
+                  (list 'declare-const 'copied 'Int) (list 'declare-const 'target 'Int)]
+        bad-recover (z3/check nil (conj coverage '(assert (and durable (not (and covered (= copied target)))))))
+        good-recover (z3/check nil (conj coverage '(assert (and (and durable covered (= copied target)) (not (and covered (= copied target)))))))
+        budget [(list 'declare-const 'queued 'Int) (list 'declare-const 'charge 'Int)
+                (list 'declare-const 'weight 'Int) (list 'declare-const 'limit 'Int)
+                '(assert (and (>= queued 0) (> weight 0) (> limit 0) (<= queued limit)))]
+        bad-budget (z3/check nil (conj budget '(assert (and (= charge 0) (<= (+ charge weight) limit) (> (+ queued weight) limit)))))
+        good-budget (z3/check nil (conj budget '(assert (and (= charge queued) (<= (+ charge weight) limit) (> (+ queued weight) limit)))))]
+    (is (= :sat (:status bad-recover)))
+    (is (= :unsat (:status good-recover)))
+    (is (= :sat (:status bad-budget)))
+    (is (= :unsat (:status good-budget)))
+    (println "PROTOTYPE symbolic" {:unsafe-recovery (:status bad-recover) :guarded-recovery (:status good-recover)
+                                   :unsafe-budget (:status bad-budget) :guarded-budget (:status good-budget)})))

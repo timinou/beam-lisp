@@ -156,7 +156,9 @@
     use: 1, symbol: 1, marker: 1, filter: 1, image: 1
   };
   function render(node, svg) {
-    if (node === null || node === undefined) return document.createTextNode("");
+    // live.diff/splice-children drops nil: an empty fragment preserves those
+    // child indices, whereas an empty text node shifts every later patch.
+    if (node === null || node === undefined) return document.createDocumentFragment();
     if (typeof node === "string" || typeof node === "number") {
       return document.createTextNode(String(node));
     }
@@ -176,14 +178,17 @@
     for (const k in attrs) {
       setAttr(el, k, attrs[k]);
     }
-    for (const child of rest) {
-      // a nested array of children (a spliced seq) flattens
-      if (Array.isArray(child) && typeof child[0] !== "string") {
-        for (const c of child) el.appendChild(render(c, inSvg));
-      } else {
-        el.appendChild(render(child, inSvg));
+    // a nested array of children (a spliced seq) flattens — at ANY depth, as
+    // hiccup->html and diff's splice-children do: a seq of seqs (a `& body`
+    // rest-arg handed on as one child) used to reach render() as a "tag" that
+    // was an array, createElementNS threw, and the whole patch was dropped
+    const appendKids = (kids) => {
+      for (const child of kids) {
+        if (Array.isArray(child) && typeof child[0] !== "string") appendKids(child);
+        else el.appendChild(render(child, inSvg));
       }
-    }
+    };
+    appendKids(rest);
     return el;
   }
 
@@ -238,12 +243,11 @@
   // ── apply one op ──────────────────────────────────────────────────────
   // ── apply one patch (a list of ops) ───────────────────────────────────
   // The server's reference (diff.bl apply-ops) applies ALL structural ops
-  // first — grouped by parent path, deepest parents first — and only then
-  // the deep ops, whose paths index the REBUILT tree. Applying in raw wire
-  // order patches pre-move nodes: a keyed list whose reconcile moves a child
-  // would set attributes/text on whatever sat at that index BEFORE the move.
-  // Grouping here is the exact mirror: within a parent, wire order already
-  // is removes → placements (anchor-fill); across parents, deepest first.
+  // first — grouped by parent path, SHALLOWEST parents first — and only then
+  // the deep ops, whose paths index the REBUILT tree. Every path under a list
+  // indexes that list's NEW children, so an inner parent is addressable only
+  // after its outer list is rebuilt (deepest-first patched the row one late).
+  // Within a parent, wire order already is removes → placements (anchor-fill).
   const STRUCTURAL = { remove: 1, "remove-at": 1, insert: 1, move: 1 };
   function applyPatch(root, ops) {
     const structural = [];
@@ -256,7 +260,7 @@
       byPath.get(k).push(op);
     }
     const paths = Array.from(byPath.keys()).sort(
-      (a, b) => JSON.parse(b).length - JSON.parse(a).length);
+      (a, b) => JSON.parse(a).length - JSON.parse(b).length);
     for (const p of paths) for (const op of byPath.get(p)) applyOp(root, op);
     for (const op of deep) applyOp(root, op);
   }

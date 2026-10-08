@@ -1,0 +1,119 @@
+(ns diagnostics.test
+  (:require [diagnostics :as diag] [proc.fence :as fence] [proc.tick :as tick] [proc.queue :as queue] [datom :as datom]))
+
+(def EVENTS
+  {:example.reader/published {:level :info :fields {:reader/chunks :count}}
+   :example.reader/read {:level :info :fields {:reader/pages :count}}})
+
+(deftest events-project-data-and-protect-identity
+  (let [seen (atom [])]
+    (diag/with-options {:sink #(swap! seen conj %) :events EVENTS}
+      (diag/with-context {:diagnostics/operation-id "op_fixture"
+                          :diagnostics/tenant-id "tenant_fixture" :private/text "secret"}
+        (diag/emit! :example.reader/published {:reader/chunks 4 :private/text "secret"
+                                             :diagnostics/tenant-id "forged"})
+        (diag/emit! :example.reader/published {:reader/chunks "secret"})
+        (diag/emit! :unknown/event {:body "secret"})
+        (is (= 1 (diag/loss-count)))))
+    (is (= 2 (count @seen)))
+    (is (= 4 (:reader/chunks (first @seen))))
+    (is (= "tenant_fixture" (:diagnostics/tenant-id (first @seen))))
+    (is (nil? (:reader/chunks (second @seen))))
+    (is (not (String/contains? (pr-str @seen) "secret")))
+    (is (= {} (diag/context)))))
+
+(deftest spans-preserve-values-and-nesting
+  (let [seen (atom []) called (atom 0)]
+    (diag/with-options {:sink #(swap! seen conj %) :events EVENTS}
+      (is (= 42 (diag/with-span :example.reader/read {:reader/pages 2}
+                  (swap! called inc)
+                  (diag/with-span-fn :example.reader/read {} #(+ 40 2)))))
+      (is (= 1 @called)))
+    (is (= 4 (count @seen)))
+    (is (= (:diagnostics/span-id (first @seen))
+           (:diagnostics/parent-span-id (second @seen))))
+    (is (= 2 (:reader/pages (first @seen))))
+    (is (= :returned (:diagnostics/outcome (last @seen))))))
+
+(deftest exceptions-and-sinks-never-leak-or-mask-body-results
+  (let [seen (atom []) caught (atom nil)]
+    (diag/with-options {:sink #(swap! seen conj %)}
+      (diag/with-context {:diagnostics/operation-id "outer"}
+        (try (diag/with-context {:diagnostics/operation-id "inner"}
+               (diag/with-span :example.reader/read {} (throw (ex-info "secret" {:kind :billing}))))
+             (catch e (reset! caught e)))
+        (is (= "outer" (:diagnostics/operation-id (diag/context))))))
+    (is (= "secret" (:message @caught)))
+    (is (= :billing (:diagnostics/error-kind (last @seen))))
+    (is (not (String/contains? (pr-str @seen) "secret"))))
+  (diag/with-options {:sink (fn [_] (throw (ex-info "sink secret" {})))}
+    (is (= 9 (diag/with-span :example.reader/read {} 9)))
+    (is (= 2 (diag/loss-count)))))
+
+(deftest spawn-and-future-convey-only-the-registered-context
+  (diag/with-options {:sink (fn [_] nil)}
+    (diag/with-context {:diagnostics/operation-id "op_child"}
+      (erlang/put :private_fixture "secret")
+      (try
+        (is (= "op_child" (:diagnostics/operation-id @(future (diag/context)))))
+        (let [parent (erlang/self)]
+          (spawn #(erlang/send parent [:child (diag/context) (erlang/get :private_fixture)]))
+          (receive [:child ctx other]
+            (do (is (= "op_child" (:diagnostics/operation-id ctx))) (is (= :undefined other)))
+            (after 2000 (is false "child did not reply"))))
+        (finally (erlang/erase :private_fixture))))))
+
+(deftest proc-events-and-safe-tick-errors
+  (let [seen (atom [])]
+    (diag/with-options { :min-level :info :sink #(swap! seen conj %)}
+      (is (= {:ok 7} (fence/fence 500 7)))
+      (is (= {:timeout true} (fence/fence 10 (Process/sleep 1000))))
+      (tick/tick-failed! :fixture (ex-info "Bearer secret" {:kind :transport}))
+      (is (= {:diagnostics/error-kind :transport} (tick/tick-last-failure :fixture)))
+      (is (String/contains? (tick/tick-last-error :fixture) "Bearer secret")))
+    (is (= [:proc.fence/completed :proc.fence/completed :proc.tick/failed]
+           (mapv :diagnostics/event @seen)))
+    (is (= true (:proc.fence/kill-requested? (second @seen))))
+    (is (not (String/contains? (pr-str @seen) "secret")))))
+
+(deftest invalid-schemas-refuse-before-body
+  (is (thrown? (diag/with-options {:events {:unqualified {:fields {}}}} :ok)))
+  (is (thrown? (diag/with-options {:events {:example/event {:fields {:private/body :string}}}} :ok)))
+  (is (thrown? (diag/with-options {:events {:example/event {:fields {:diagnostics/tenant-id :id}}}} :ok))))
+
+(deftest queue-projects-failure-and-reports-settlement
+  (let [seen (atom []) srv :diagnostics-test-queue
+        decl (queue/normalise-decl {:of :example/read :lease 1 :retry {:max 1}})
+        c (queue/conn srv)]
+    (datom/transact! c [{:db/id -1 :queue/key (name srv) :queue/decl decl}])
+    (let [j (queue/enqueue! srv {:example/input "secret"} {:at 1000})
+          st {:queue {:server srv :decl decl :clock (fn [] 1000)
+                      :perform (fn [_] (throw (ex-info "secret" {:kind :transport}))) :running {}}}]
+      (diag/with-options { :min-level :info :sink #(swap! seen conj %)}
+        (let [running (queue/run-due st)]
+          (receive [:bl-queue/finished ref out]
+            (let [settled (queue/settle running ref out)]
+              (is (= {} (get-in settled [:queue :running])))
+              (is (= {:diagnostics/error-kind :transport}
+                     (:job/last-failure (datom/entity (datom/db c) (:db/id j)))))
+              (queue/run-due (assoc-in settled [:queue :running]
+                              {:fixture {:attempts 1 :lease-until 999}})))
+            (after 2000 (is false "queue worker did not reply")))))
+      (is (= [:proc.queue/claimed :proc.queue/settled :proc.queue/claim-expired]
+             (mapv :diagnostics/event @seen)))
+      (is (= :settled (:proc.queue/settlement (second @seen))))
+      (is (not (String/contains? (pr-str @seen) "secret"))))))
+
+(deftest namespace-fields-are-bounded-without-widening-operation-identifiers
+  (let [seen (atom [])
+        names ["datom.query.rank-build" "/secret/path" "name@example.com" "a:b" (String/duplicate "x" 97)]]
+    (diag/with-options {:sink #(swap! seen conj %)}
+      (diag/with-context {:diagnostics/operation-id "dotted.operation"}
+        (doseq [ns names]
+          (diag/emit! :runtime.phase/completed
+            {:runtime.phase/name :loader-worker :runtime.phase/namespace ns
+             :runtime.phase/duration-us 0 :runtime.phase/reductions 0}))))
+    (is (= 5 (count @seen)))
+    (is (= "datom.query.rank-build" (:runtime.phase/namespace (first @seen))))
+    (is (every? (fn [e] (nil? (:runtime.phase/namespace e))) (rest @seen)))
+    (is (every? (fn [e] (nil? (:diagnostics/operation-id e))) @seen))))

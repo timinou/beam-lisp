@@ -1,0 +1,529 @@
+; connector/keep.bl — keep a remote TREE as facts: the part of a provider's
+; change feed that falls under a set of roots, and nothing else.
+;
+; Design: docs/connectors/mirror-and-reconcile.md (M1–M4, amended 2026-09-28).
+;
+; ── The laws ────────────────────────────────────────────────────────────────
+;
+;   M1  the mirror is the CLOSURE of its roots. An item outside every root is
+;       never written — not its name, not its id. A change is judged against
+;       the mirror + the change's own parent before anything is transacted.
+;   M2  cursor FIRST. With no cursor, the start token is read BEFORE the roots
+;       are seeded, so a change made during the seed is replayed afterwards
+;       (idempotent writes make the overlap harmless).
+;   M3  commit LAST. The new cursor is written in the SAME transaction as the
+;       last page's facts; a crash mid-walk re-reads from the old cursor.
+;   M5  a STALE cursor (the feed answers {:error {:status 410}} or
+;       {:resync true}) is not an error: the cursor is cleared and M2 runs
+;       again — start token, then re-seed every root (idempotent by :conn/key).
+;       Whatever the mirror holds under a root that the re-seed no longer lists
+;       is marked :file/gone, so a resync neither duplicates nor orphans.
+;   M4  a folder that ARRIVES under a root is seeded (its subtree listed), and a
+;       root added since the last step is seeded before paging.
+;
+; Removal is a fact, never a deletion: `removed` → :file/gone, trashed →
+; :file/trashed. Moving OUT of every root keeps the entity (its parent now
+; points outside, or is cleared) so a projection sees it as stale — the
+; mirror records what happened; consumers decide what that means.
+;
+; ── Shape ───────────────────────────────────────────────────────────────────
+;
+; `(step! k)` does one bounded unit of work and returns a report map. A keep is
+; `{:conn datom-conn :feed feed :get (fn [url]) :roots (fn [db] [key …])}`; the
+; feed is provider data (connector.google.gdrive/feed). Nothing here names a
+; provider — a Graph feed is the same keep.
+
+(ns connector.keep
+  (:require [datom] [files] [connector.acl :as acl]))
+
+(def schema
+  "The keep's own facts: one cursor + bookkeeping per feed, one seeded mark per
+   root (so a root is seeded exactly once, and re-seeded only when asked)."
+  [{:db/ident :feed/key       :db/valueType :db.type/term :db/unique :db.unique/identity}
+   {:db/ident :feed/cursor    :db/valueType :db.type/string}
+   {:db/ident :feed/stepped-at :db/valueType :db.type/long}
+   {:db/ident :feed/error     :db/valueType :db.type/string}
+   {:db/ident :feed/error-at  :db/valueType :db.type/long}
+   {:db/ident :root/seeded    :db/valueType :db.type/term :db/unique :db.unique/identity}])
+
+(defn full-schema
+  "The mirror schema; `{:acl? true}` adds connector.acl's identity/membership/ACL facts."
+  ([] (full-schema nil))
+  ([opts] (into (into (into [] files/schema) schema) (if (= true (:acl? opts)) acl/schema []))))
+
+(defn- now [] (erlang/system_time :millisecond))
+(defn feed-key [feed] [(:provider feed) (:namespace feed)])
+
+(defn- eid [db k]
+  (let [ds (into [] (datom/datoms db :avet :conn/key k))]
+    (if (empty? ds) nil (nth (first ds) 0))))
+
+(defn cursor [db feed]
+  (let [r (into [] (datom/q '[:find ?c :in $ ?k :where [?f :feed/key ?k] [?f :feed/cursor ?c]] db (feed-key feed)))]
+    (if (empty? r) nil (first (first r)))))
+
+(defn- seeded? [db root]
+  (seq (into [] (datom/datoms db :avet :root/seeded root))))
+
+;; ── item → transaction ──────────────────────────────────────────────────────
+
+(def ^:private CURSOR-TEMPID
+  "The feed entity's tempid when it rides in a page transaction — far below any
+   id `tempids` allocates for items."
+  -1000000000)
+
+(defn- tempids
+  "A per-transaction allocator: key → the entity's eid when it exists, else a
+   stable NEGATIVE tempid for this transaction (datom tempids are negative
+   ints; a key seen twice in one transaction gets the same one, and a
+   `:conn/key` upsert resolves it onto an existing entity)."
+  [db]
+  (let [m (atom {})]
+    (fn [k]
+      (or (eid db k)
+          (get @m k)
+          (let [t (- -1 (count @m))] (swap! m assoc k t) t)))))
+
+(defn- item-tx
+  "The facts for one item; `ref` is the transaction's key → id allocator."
+  [ref item parent-ref]
+  (cond-> {:db/id (ref (:key item))
+           :conn/key (:key item)
+           :file/name (or (:name item) "")
+           :file/folder? (= true (:folder? item))}
+    (some? (:mime item)) (assoc :file/mime (:mime item))
+    (some? (:rev item)) (assoc :file/rev (:rev item))
+    (some? (:size item)) (assoc :file/size (:size item))
+    (some? (:modified item)) (assoc :file/modified (:modified item))
+    (some? (:md5 item)) (assoc :file/md5 (:md5 item))
+    (some? parent-ref) (assoc :file/parent parent-ref)))
+
+(defn- flags-tx
+  "Flags for an item asserted PRESENT and live. Trashed is set AND cleared
+   (untrash). Gone is cleared too: a seed or a page that lists the item again
+   is the provider saying it is back (moved back in, re-added after a removal,
+   or marked gone by an M5 resync while it lived on outside the roots) — a
+   `gone` that could only ever be set would hide it from `live-under` forever."
+  [db ref item]
+  (let [e (eid db (:key item))
+        has? (fn [attr] (and (some? e) (seq (into [] (datom/datoms db :eavt e attr)))))]
+    (into (cond
+            (:trashed item) [[:db/add (ref (:key item)) :file/trashed true]]
+            (has? :file/trashed) [[:db/retract e :file/trashed true]]
+            :else [])
+          (if (has? :file/gone) [[:db/retract e :file/gone true]] []))))
+
+;; ── ACL facts (docs/connectors/rights-as-relations.md §6) ───────────────────
+;
+; Enabled by `:acl? true` on the keep AND a feed that has `:acl`. ACL facts ride
+; in the SAME transaction as the item's own facts, so:
+;   M1  they exist only for items the page/seed already judged inside the closure
+;       — the helper is called from the branch that writes the item, nowhere else;
+;   M3  every transaction of a page/chunk carries its items' ACLs, and the cursor
+;       rides in the LAST one: no cursor advance happens before the ACL facts of
+;       everything it covers are durable (a crash re-reads from the old cursor).
+; A failed `:acl` fetch writes NOTHING for that item (its older facts keep their
+; older :acl.item/as-of, which `reads-verdict` can age out as :stale) and is
+; counted in the step's report as :acl-errors — never swallowed, never an allow.
+; Group membership is fetched at most once per group per step (the ctx cache)
+; and written in the first transaction that references the group.
+
+(defn- acl-on? [k] (and (= true (:acl? k)) (some? (:acl (:feed k)))))
+
+(defn- with-ctx
+  "A keep value carrying this step's ACL context (as-of stamp, group cache, error count)."
+  [k]
+  (assoc k :acl-ctx {:as-of (now) :groups (atom #{}) :errors (atom 0)}))
+
+(defn- acl-tx
+  "ACL (+ first-seen group membership) facts for `item` as transaction items;
+   [] when ACLs are off or the fetch failed."
+  [k db ref item]
+  (if (not (acl-on? k)) []
+    (let [ctx (:acl-ctx k) as-of (:as-of ctx)
+          r ((:acl (:feed k)) (:get k) (:key item))]
+      (if (contains? r :error)
+        (do (swap! (:errors ctx) inc) [])
+        (let [grants (:grants (:ok r))
+              groups (into [] (distinct (keep (fn [g] (let [x (:grantee g)]
+                                                         (when (and (some? x) (= :group (:kind x))) (:key x))))
+                                              grants)))
+              fresh (into [] (remove (fn [gk] (contains? @(:groups ctx) gk)) groups))
+              mem (mapcat (fn [gk]
+                            (swap! (:groups ctx) conj gk)
+                            (let [m (if (some? (:members (:feed k))) ((:members (:feed k)) (:get k) gk) {:error :no-members-feed})]
+                              (if (contains? m :error)
+                                (do (swap! (:errors ctx) inc)
+                                    (acl/members-tx db gk [] false as-of))
+                                (acl/members-tx db gk (:members (:ok m)) (:complete? (:ok m)) as-of))))
+                          fresh)]
+          (into (acl/grants-tx db (:key item) (ref (:key item)) (:grants (:ok r)) (:complete? (:ok r)) as-of)
+                mem))))))
+
+;; ── the root closure (M1) ───────────────────────────────────────────────────
+
+(defn- closure-keys
+  "Every key currently inside some root: the roots themselves plus the mirror's
+   descendants of each. Computed once per page — the membership test for every
+   change in it."
+  [db roots]
+  (let [root-eids (keep (fn [r] (eid db r)) roots)
+        desc (mapcat (fn [re] (files/descendants db re)) root-eids)
+        eid->key (fn [e] (let [ds (into [] (datom/datoms db :eavt e :conn/key))]
+                           (if (empty? ds) nil (nth (first ds) 2))))]
+    (into (into #{} roots) (keep eid->key desc))))
+
+;; ── seeding (M4) ────────────────────────────────────────────────────────────
+
+(defn- list-children [k parent-key]
+  (loop [page nil out []]
+    (let [r ((:children (:feed k)) (:get k) parent-key page)]
+      (if (contains? r :error) r
+        (let [out (into out (:items (:ok r)))]
+          (if (nil? (:next (:ok r))) {:ok out} (recur (:next (:ok r)) out)))))))
+
+(defn- seed-tx
+  "Transactions for `root` and its whole subtree (BFS over children listings).
+   Returns {:ok [tx …] :items n} or {:error …}. Folders are expanded; a folder
+   is listed once even if it appears twice."
+  [k root-key root-item]
+  (let [db (datom/db (:conn k))]
+    (loop [frontier [root-key] seen #{root-key}
+           txs [(let [ref (tempids db)] (into (into [(item-tx ref root-item nil)] (flags-tx db ref root-item))
+                                        (acl-tx k db ref root-item)))] n 1]
+      (if (empty? frontier) {:ok txs :items n}
+        (let [pk (first frontier)
+              r (list-children k pk)]
+          (if (contains? r :error) r
+            (let [kids (remove (fn [i] (contains? seen (:key i))) (:ok r))
+                  ;; parent + children in ONE transaction: the parent is
+                  ;; re-asserted by key so its tempid resolves whether or not
+                  ;; an earlier transaction of this seed has committed it
+                  ref (tempids (datom/db (:conn k)))
+                  tx (if (empty? kids) []
+                       (into [{:db/id (ref pk) :conn/key pk}]
+                             (mapcat (fn [i] (into (into [(item-tx ref i (ref pk))] (flags-tx db ref i))
+                                                    (acl-tx k db ref i)))
+                                     kids)))
+                  folders (map :key (filter :folder? kids))]
+              (recur (into (into [] (rest frontier)) folders)
+                     (into seen (map :key kids))
+                     (if (empty? tx) txs (conj txs tx))
+                     (+ n (count kids))))))))))
+
+(defn- listed-keys
+  "Every key a seed's transactions assert — what the provider still lists."
+  [txs]
+  (into #{} (keep (fn [e] (when (map? e) (get e :conn/key))) (apply concat txs))))
+
+(defn- seed-root! [k root-key]
+  (let [it ((:item (:feed k)) (:get k) root-key)]
+    (cond
+      (contains? it :error) {:error (:error it) :root root-key}
+      (not (:folder? (:ok it))) {:error :root-not-a-folder :root root-key}
+      :else
+        (let [r (seed-tx k root-key (:ok it))]
+          (if (contains? r :error) (assoc r :root root-key)
+            (do (doseq [tx (:ok r)] (datom/transact! (:conn k) tx))
+                (datom/transact! (:conn k) [{:db/id -1 :root/seeded root-key}])
+                {:ok (:items r) :listed (listed-keys (:ok r))}))))))
+
+;; ── one page of changes ─────────────────────────────────────────────────────
+
+(defn- last-per-key
+  "A provider may report one item several times in a page; the LAST report is
+   the truth. page-tx judges every change against the page-START snapshot, so
+   without this [live, removed] would keep the item live and [removed, live]
+   would keep it gone."
+  [items]
+  (let [out (loop [xs (reverse items) seen #{} out []]
+              (if (empty? xs) out
+                (let [i (first xs)]
+                  (if (contains? seen (:key i))
+                    (recur (rest xs) seen out)
+                    (recur (rest xs) (conj seen (:key i)) (conj out i))))))]
+    (into [] (reverse out))))
+
+(defn- page-tx
+  "The facts one change page contributes, M1-filtered. A change is kept when
+   its key is already inside the closure (an update, a move out, a removal) or
+   its NEW parent is (a move in, a create). Returns {:tx [...] :arrived [folder
+   keys that arrived and need seeding] :kept n :dropped n}."
+  [k db closure items]
+  (let [pk (:parent-key (:feed k))
+        ref (tempids db)]
+    (reduce
+      (fn [acc it]
+        (let [inside (contains? closure (:key it))
+              parent (if (:removed it) nil (pk it))
+              lands (and (some? parent) (contains? closure parent))]
+          (cond
+            (:removed it)
+              (if (and inside (some? (eid db (:key it))))
+                (-> acc (update :tx conj [:db/add (eid db (:key it)) :file/gone true])
+                        (update :kept inc))
+                (update acc :dropped inc))
+            lands
+              (-> acc
+                  (update :tx into (into (into [{:db/id (ref parent) :conn/key parent}
+                                                (item-tx ref it (ref parent))]
+                                               (flags-tx db ref it))
+                                         (acl-tx k db ref it)))
+                  (update :arrived (fn [a] (if (and (:folder? it) (not inside)) (conj a (:key it)) a)))
+                  (update :kept inc))
+            inside
+              ;; moved OUT (or its parent is unknown): keep the entity, detach it
+              (let [e (eid db (:key it))
+                    olds (into [] (datom/datoms db :eavt e :file/parent))]
+                (-> acc
+                    (update :tx into (into (mapv (fn [d] [:db/retract e :file/parent (nth d 2)]) olds)
+                                           (flags-tx db ref it)))
+                    (update :kept inc)))
+            :else (update acc :dropped inc))))
+      {:tx [] :arrived [] :kept 0 :dropped 0}
+      (last-per-key items))))
+
+(defn- record-error! [k msg]
+  (datom/transact! (:conn k) [{:db/id -1 :feed/key (feed-key (:feed k))
+                               :feed/error (str msg) :feed/error-at (now)}]))
+
+(defn- stale-cursor?
+  "M5's trigger: a feed says its cursor can no longer be continued."
+  [r]
+  (let [e (:error r)]
+    (or (= true (:resync r)) (and (map? e) (or (= 410 (:status e)) (= true (:resync e)))))))
+
+;; ── enumeration seeding (feeds with :enumerate) ─────────────────────────────
+;
+; A feed that can ENUMERATE (`:enumerate (fn [get from]) → {:ok {:items :cursor}}`)
+; is one whose children listings are not guaranteed complete under concurrent
+; writes but whose change feed is (Graph). Its seed is ONE full enumeration of
+; the drive: keep the items inside the root closure, drop everything else
+; unwritten (M1), commit the enumeration's own cursor with the last facts (M3).
+
+(defn- chunk [xs n]
+  (loop [xs xs out []]
+    (if (empty? xs) out (recur (drop n xs) (conj out (into [] (take n xs)))))))
+
+(defn- closure-items
+  "The enumerated items inside the closure of `root-keys`, found by walking
+   parent links WITHIN the enumeration (parents first). Roots themselves are
+   not returned — they come from `:item`, with no parent."
+  [pk root-keys items]
+  (let [items (last-per-key items)
+        idx (group-by pk items)]
+    (loop [frontier (into [] root-keys) seen (into #{} root-keys) out []]
+      (if (empty? frontier) out
+        (let [kids (into [] (remove (fn [i] (contains? seen (:key i)))
+                                    (mapcat (fn [p] (get idx p [])) frontier)))]
+          (recur (mapv :key kids) (into seen (map :key kids)) (into out kids)))))))
+
+(defn- root-items
+  "[[root-key item] …] fetched live, or {:error …}: a root must be a folder."
+  [k root-keys]
+  (loop [rs (into [] root-keys) out []]
+    (if (empty? rs) {:ok out}
+      (let [it ((:item (:feed k)) (:get k) (first rs))]
+        (cond
+          (contains? it :error) {:error (:error it) :root (first rs)}
+          (not (:folder? (:ok it))) {:error :root-not-a-folder :root (first rs)}
+          :else (recur (rest rs) (conj out [(first rs) (:ok it)])))))))
+
+(defn- write-closure!
+  "Transact the root items, then `kept` in chunks; `extra` (fn [db] → tx items)
+   rides in the LAST transaction — where the cursor and seeded marks go (M3)."
+  [k root-entries kept extra]
+  (let [c (:conn k) pk (:parent-key (:feed k))]
+    (doseq [[_ it] root-entries]
+      (let [db (datom/db c) ref (tempids db)]
+        (datom/transact! c (into (into [(item-tx ref it nil)] (flags-tx db ref it)) (acl-tx k db ref it)))))
+    (let [chunks (if (empty? kept) [[]] (chunk kept 500))
+          lastix (- (count chunks) 1)]
+      (loop [i 0]
+        (when (<= i lastix)
+          (let [db (datom/db c) ref (tempids db)
+                body (into [] (mapcat (fn [it] (let [p (pk it)]
+                                                 (into (into [{:db/id (ref p) :conn/key p} (item-tx ref it (ref p))]
+                                                             (flags-tx db ref it))
+                                                       (acl-tx k db ref it))))
+                                      (nth chunks i)))
+                tx (if (= i lastix) (into body (extra db)) body)]
+            (when (seq tx) (datom/transact! c tx))
+            (recur (+ i 1))))))))
+
+(defn- enumerate-seed!
+  "One enumeration seeds `targets` (a subset of `roots`). opts
+   {:commit? write the enumeration's cursor  :resync? mark vanished gone
+    :from the enumeration's start (a 410's Location) or nil}."
+  [k roots targets {:keys [commit? resync? from]}]
+  (let [c (:conn k) feed (:feed k) fk (feed-key feed)
+        before (if resync? (closure-keys (datom/db c) roots) #{})
+        en ((:enumerate feed) (:get k) from)]
+    (if (contains? en :error) (do (record-error! k (:error en)) en)
+      (let [rs (root-items k targets)]
+        (if (contains? rs :error) (do (record-error! k (:error rs)) rs)
+          (let [kept (closure-items (:parent-key feed) targets (:items (:ok en)))
+                listed (into (into #{} roots) (map :key kept))
+                cursor (:cursor (:ok en))
+                lost (atom 0)
+                extra (fn [db]
+                        (let [gone (if resync?
+                                     (into [] (keep (fn [key] (when (not (contains? listed key)) (eid db key))) before))
+                                     [])]
+                          (reset! lost (count gone))
+                          (into (into (mapv (fn [e] [:db/add e :file/gone true]) gone)
+                                      (map-indexed (fn [i rk] {:db/id (- CURSOR-TEMPID (+ 1 i)) :root/seeded rk}) targets))
+                                (if commit?
+                                  [{:db/id CURSOR-TEMPID :feed/key fk :feed/cursor cursor :feed/stepped-at (now)}]
+                                  []))))]
+            (write-closure! k (:ok rs) kept extra)
+            {:ok (if resync? :resynced :seeded)
+             :items (+ (count targets) (count kept)) :gone @lost :cursor cursor}))))))
+
+(defn- take-cursor-and-seed!
+  "M2 as one act. A feed with :enumerate seeds from one full enumeration (the
+   cursor is its deltaLink, committed with the last facts). Otherwise: the start
+   token FIRST, then every root seeded by listing, then the cursor committed.
+   `resync?` additionally marks :file/gone whatever the mirror held under a root
+   that the re-seed no longer lists (M5). `from` is a 410's Location, if any.
+   A failure anywhere leaves the old cursor in place — a stale one re-enters M5
+   on the next step; clearing it first would lose the gone-marking for good."
+  [k roots resync? from]
+  (if (some? (:enumerate (:feed k)))
+    (enumerate-seed! k roots roots {:commit? true :resync? resync? :from from})
+    (let [c (:conn k) feed (:feed k) fk (feed-key feed)
+          before (if resync? (closure-keys (datom/db c) roots) #{})
+          st ((:start-token feed) (:get k))]
+      (if (contains? st :error) (do (record-error! k (:error st)) st)
+        (let [seeds (map (fn [r] (seed-root! k r)) roots)
+              bad (first (filter (fn [s] (contains? s :error)) seeds))]
+          (if (some? bad) (do (record-error! k (:error bad)) bad)
+            (let [listed (into #{} (mapcat :listed seeds))
+                  db (datom/db c)
+                  lost (if resync?
+                         (into [] (keep (fn [key] (when (and (not (contains? listed key))
+                                                             (not (contains? (into #{} roots) key)))
+                                                    (eid db key)))
+                                        before))
+                         [])]
+              (when (seq lost)
+                (datom/transact! c (mapv (fn [e] [:db/add e :file/gone true]) lost)))
+              (datom/transact! c [{:db/id -1 :feed/key fk :feed/cursor (:ok st) :feed/stepped-at (now)}])
+              {:ok (if resync? :resynced :seeded)
+               :items (reduce + 0 (map :ok seeds)) :gone (count lost) :cursor (:ok st)})))))))
+
+(declare step-inner!)
+
+(defn step!
+  "One unit of keeping. Returns
+     {:ok :seeded|:paged|:idle :items n :dropped n :pages n :cursor c}
+     {:error reason …}  (recorded on the feed entity; the cursor is untouched)
+   With `:acl? true` on the keep (and a feed `:acl`) the item facts carry their
+   source ACLs too (see \"ACL facts\" above) and the report gains :acl-errors."
+  [k]
+  (let [k (with-ctx k)
+        r (step-inner! k)]
+    (if (and (acl-on? k) (map? r) (contains? r :ok))
+      (assoc r :acl-errors @(:errors (:acl-ctx k)))
+      r)))
+
+(defn- step-inner!
+  [k]
+  (let [c (:conn k) feed (:feed k) fk (feed-key feed)
+        db (datom/db c)
+        roots (into [] ((:roots k) db))
+        unseeded (filter (fn [r] (not (seeded? db r))) roots)
+        cur (cursor db feed)]
+    (cond
+      ;; M2: no cursor → take the start token FIRST, then seed, then commit it
+      (nil? cur) (take-cursor-and-seed! k roots false nil)
+      ;; M4: a root added since the last step
+      (seq unseeded)
+        (if (some? (:enumerate feed))
+          ;; enumerate again rather than list: the same completeness guarantee,
+          ;; at the cost of one drive walk per added root. The cursor is NOT
+          ;; advanced — changes since it replay over the (newer) facts harmlessly.
+          (let [r (enumerate-seed! k roots unseeded {:commit? false :resync? false :from nil})]
+            (if (contains? r :error) r (assoc r :cursor cur)))
+        (let [seeds (map (fn [r] (seed-root! k r)) unseeded)
+              bad (first (filter (fn [s] (contains? s :error)) seeds))]
+          (if (some? bad) (do (record-error! k (:error bad)) bad)
+            {:ok :seeded :items (reduce + 0 (map :ok seeds)) :cursor cur})))
+      ;; page the feed; commit the cursor with the LAST page (M3)
+      :else
+        (loop [token cur pages 0 kept 0 dropped 0]
+          (let [r ((:changes feed) (:get k) token)]
+            (if (contains? r :error)
+              (if (stale-cursor? r)
+                (take-cursor-and-seed! k roots true (get-in r [:error :location]))
+                (do (record-error! k (:error r)) (assoc r :pages pages)))
+              (let [db (datom/db c)
+                    page (page-tx k db (closure-keys db roots) (:items (:ok r)))
+                    last? (nil? (:next (:ok r)))
+                    tx (if last?
+                         ;; its OWN tempid: the page's allocator hands out -1,
+                         ;; -2, … and a shared -1 would merge the cursor into
+                         ;; the first new file (found by keep-model, shrunk to 4 steps)
+                         (conj (:tx page) {:db/id CURSOR-TEMPID :feed/key fk :feed/cursor (:cursor (:ok r))
+                                           :feed/stepped-at (now)})
+                         (:tx page))]
+                (when (seq tx) (datom/transact! c tx))
+                ;; M4: folders that arrived bring their subtree
+                (doseq [fk2 (:arrived page)]
+                  (let [s (seed-tx k fk2 (first (filter (fn [i] (= fk2 (:key i))) (:items (:ok r)))))]
+                    (when (contains? s :ok) (doseq [t (rest (:ok s))] (datom/transact! c t)))))
+                (if last?
+                  {:ok (if (= 0 (+ kept (:kept page))) :idle :paged)
+                   :items (+ kept (:kept page)) :dropped (+ dropped (:dropped page))
+                   :pages (+ 1 pages) :cursor (:cursor (:ok r))}
+                  (recur (:next (:ok r)) (+ 1 pages) (+ kept (:kept page)) (+ dropped (:dropped page)))))))))))
+
+(defn status
+  "What a console shows for a feed: cursor, last step, last error, roots and
+   how many of each were seeded, mirrored item count. A query, no process."
+  [db feed roots]
+  (let [fk (feed-key feed)
+        f (into [] (datom/q '[:find ?e :in $ ?k :where [?e :feed/key ?k]] db fk))
+        m (if (empty? f) {} (datom/pull db [:feed/cursor :feed/stepped-at :feed/error :feed/error-at] (first (first f))))]
+    {:feed fk
+     :cursor (:feed/cursor m)
+     :stepped-at (:feed/stepped-at m)
+     :error (:feed/error m)
+     :error-at (:feed/error-at m)
+     :roots (mapv (fn [r] {:root r :seeded (boolean (seeded? db r))
+                           :items (let [e (eid db r)] (if (nil? e) 0 (count (files/descendants db e))))})
+                  roots)}))
+
+;; ── the sweep: permission-only changes are not in delta ─────────────────────
+
+(defn refresh-acls!
+  "Re-fetch the ACL of every LIVE item under the roots whose ACL facts are older
+   than `:older-than-ms` (default 0 = all), writing in chunks of 100 items.
+   Why: Graph's delta does not report permission-only changes without
+   deltashowsharingchanges, and Drive's changes feed does not either (doc §1),
+   so a share/unshare is invisible to `step!` until the item changes. This is
+   the bounded-staleness half of the design: run it on a schedule, and
+   `reads-verdict` ages anything older than its budget to :stale.
+   opts {:older-than-ms n :now ms}. → {:refreshed n :skipped n :errors n} |
+   {:error :acl-disabled}. M1 holds by construction: only keys inside the roots'
+   live closure are fetched or written."
+  [k opts]
+  (if (not (acl-on? k)) {:error :acl-disabled}
+    (let [k (with-ctx k) c (:conn k)
+          now-ms (or (:now opts) (now))
+          cutoff (- now-ms (or (:older-than-ms opts) 0))
+          db0 (datom/db c)
+          roots (into [] ((:roots k) db0))
+          live-eids (into #{} (mapcat (fn [r] (let [re (eid db0 r)]
+                                                (if (nil? re) [] (into [re] (files/descendants db0 re true)))))
+                                      roots))
+          key-of (fn [e] (let [ds (into [] (datom/datoms db0 :eavt e :conn/key))] (if (empty? ds) nil (nth (first ds) 2))))
+          as-of-of (fn [e] (let [ds (into [] (datom/datoms db0 :eavt e :acl.item/as-of))] (if (empty? ds) nil (nth (first ds) 2))))
+          todo (into [] (keep (fn [e] (let [a (as-of-of e)] (when (or (nil? a) (<= a cutoff)) (key-of e)))) (sort live-eids)))
+          before @(:errors (:acl-ctx k))]
+      (doseq [ch (chunk todo 100)]
+        (let [db (datom/db c) ref (tempids db)
+              tx (into [] (mapcat (fn [ik] (acl-tx k db ref {:key ik})) ch))]
+          (when (seq tx) (datom/transact! c tx))))
+      {:refreshed (- (count todo) (- @(:errors (:acl-ctx k)) before)) :skipped (- (count live-eids) (count todo))
+       :errors @(:errors (:acl-ctx k))})))

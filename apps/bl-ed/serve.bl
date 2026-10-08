@@ -1,0 +1,150 @@
+; apps/bl-ed/serve.bl — the BEAM half of bl-ed: files and evaluation.
+;
+;   bl run apps/bl-ed/serve.bl                 → http://127.0.0.1:8790/
+;   BLED_PORT=… BLED_ROOT=dir bl run apps/bl-ed/serve.bl
+;   open  http://127.0.0.1:8790/?file=docs/tools/02-lsp.bl.org
+;
+; The editor itself runs in the browser (Beam Lisp compiled by the JS sync
+; profile, apps/bl-ed/web/out). This server does what a browser must not:
+;
+;   GET  /                      the page, the theme, the compiled modules
+;   GET  /api/file?path=p       a .bl.org / .bl.md under BLED_ROOT
+;   POST /api/save {path text}  write it (refuses paths outside BLED_ROOT
+;                               and anything but .bl.org / .bl.md)
+;   POST /api/place {path text}  where each cell may run (system.place): a
+;                               pure, terminating cell is "local" (the page
+;                               evaluates it); anything else "beam", why named
+;   POST /api/eval {path id text}  run the document's cells THROUGH bl.doc —
+;                               the same runner `bl doc run` uses — and answer
+;                               the new text (with #+RESULTS written) plus the
+;                               one cell's result string. Trusted code, as
+;                               `bl doc run` is; bound to loopback.
+;
+; The answer to eval is the WHOLE document text: result spans are owned by
+; bl.doc (`write-results`), and the editor reloads them rather than guessing
+; where a result goes.
+
+(ns bl-ed.serve
+  (:require [web :as w] [bl.doc :as doc] [bl.json :as json] [system.place :as pl]))
+
+(def root (Path/expand (or (System/get_env "BLED_ROOT") ".")))
+(def web-dir (Path/expand "apps/bl-ed/web"))
+(def port (let [s (System/get_env "BLED_PORT")] (if (blank? s) 8790 (erlang/binary_to_integer s))))
+
+(defn- doc-path?
+  "Is `p` a .bl.org/.bl.md file inside `root` (after resolving `..`)?"
+  [p]
+  (let [abs (Path/expand p root)]
+    (and (or (ends-with? abs ".bl.org") (ends-with? abs ".bl.md"))
+         (starts-with? abs (str root "/")))))
+
+(defn- abs-of [p] (Path/expand p root))
+
+(def ^:private types
+  {"html" "text/html; charset=utf-8" "css" "text/css; charset=utf-8"
+   "mjs" "text/javascript; charset=utf-8" "js" "text/javascript; charset=utf-8"
+   "org" "text/plain; charset=utf-8" "svg" "image/svg+xml"})
+
+(defn- static [conn rel]
+  (let [abs (Path/expand rel web-dir)
+        ext (last (split abs "."))]
+    (if (and (starts-with? abs (str web-dir "/")) (File/regular? abs))
+      (-> conn (w/resp-header "cache-control" "no-store")
+          (w/bytes (get types ext "application/octet-stream") (File/read! abs)))
+      (w/text conn 404 "not found"))))
+
+(defn- body-json
+  "[decoded-body conn] — respond on the RETURNED conn (web/read-body*)."
+  [conn]
+  (let [[body c] (w/read-body* conn)] [(json/decode body) c]))
+
+(defn- query-param
+  "One query-string parameter, URL-decoded."
+  [conn k]
+  (some (fn [pair]
+          (let [[a b] (split pair "=")]
+            (if (= a k) (w/url-decode (or b "")) nil)))
+        (split (or (w/query conn) "") "&")))
+
+(defn- api-file [conn]
+  (let [p (query-param conn "path")]
+    (if (and (some? p) (doc-path? p) (File/regular? (abs-of p)))
+      (w/text conn 200 (File/read! (abs-of p)))
+      (w/text conn 404 (str "no such document: " p)))))
+
+(defn- api-save [conn]
+  (let [[b conn] (body-json conn) p (get b "path") t (get b "text")]
+    (cond
+      (not (doc-path? p)) (w/json conn 403 {:ok false :message (str "refusing to write " p)})
+      (not (string? t)) (w/json conn 400 {:ok false :message "no text"})
+      :else (do (File/write! (abs-of p) t)
+                (w/json conn 200 {:ok true :path p :bytes (count t)})))))
+
+(defn- api-eval [conn]
+  (let [[b conn] (body-json conn) p (get b "path") id (get b "id") t (get b "text")]
+    (if (not (doc-path? p))
+      (w/json conn 403 {:ok false :message (str "refusing to evaluate " p)})
+      (let [sl (doc/slice-text t (doc/format-of p))]
+        (if (contains? sl :error)
+          (w/json conn 200 {:ok false :message (str "line " (get-in sl [:error :line]) ": " (get-in sl [:error :why]))})
+          (let [d (assoc (:ok sl) :path (abs-of p))
+                r (doc/run-doc d)
+                ; write back ONLY the asked cell's result: the others may hold
+                ; results the page computed (local cells), which a BEAM run of
+                ; the whole document must not overwrite with its own printing
+                text (doc/write-results d (select-keys (:results r) [id]))]
+            (w/json conn 200 {:ok true :text text :result (get (:results r) id "")
+                              :errors (vec (:errors r))})))))))
+
+(defn- cell-forms
+  "The top-level forms of one cell's code, each as its own source text
+   (sliced by the reader's span over the code's codepoints)."
+  [code]
+  (let [cps (unicode/characters_to_list code)]
+    (vec (keep (fn [f]
+                 (let [pos (BeamLisp.Ns.Reader-node/node-pos f)]
+                   (when (some? (get pos :end-offset))
+                     (unicode/characters_to_binary
+                       (lists/sublist cps (inc (get pos :offset)) (- (get pos :end-offset) (get pos :offset)))))))
+               (BeamLisp.Ns.Reader/read_string code "cell")))))
+
+(defn- place-json [p]
+  (if (= :local (:place p))
+    {:place "local"}
+    {:place "beam" :why (let [w (:why p)]
+                          (str (name (:reason w))
+                               (if (:form w) (str " in " (:form w)) "")
+                               (if (:via w) (str " (through " (:via w) ")") "")
+                               (if (:detail w) (str ": " (:detail w)) "")))}))
+
+(defn- api-place
+  "POST /api/place {path text} → {:ok true :cells {id {:place :why?}}}: where
+   each cell may run (system.place over the whole document). The editor
+   evaluates local cells in the page; the rest go to /api/eval."
+  [conn]
+  (let [[b conn] (body-json conn) p (get b "path") t (get b "text")]
+    (if (not (doc-path? p))
+      (w/json conn 403 {:ok false :message (str "refusing to place " p)})
+      (let [sl (doc/slice-text t (doc/format-of p))]
+        (if (contains? sl :error)
+          (w/json conn 200 {:ok false :message (str "line " (get-in sl [:error :line]) ": " (get-in sl [:error :why]))})
+          (let [cells (mapv (fn [c] {:id (:id c) :forms (cell-forms (doc/cell-source c))}) (doc/cells (:ok sl)))
+                ps (try {:ok (pl/cell-placements cells)} (catch e {:err (ex-message e)}))]
+            (if (contains? ps :err)
+              (w/json conn 200 {:ok false :message (:err ps)})
+              (w/json conn 200 {:ok true :cells (into {} (map (fn [[id pl]] [id (place-json pl)]) (:ok ps)))}))))))))
+
+(defn router [conn]
+  (let [m (upper-case (str (w/method conn))) p (w/path conn)]
+    (cond
+      (and (= m "GET") (= p "/")) (static conn "index.html")
+      (and (= m "GET") (= p "/api/file")) (api-file conn)
+      (and (= m "POST") (= p "/api/save")) (api-save conn)
+      (and (= m "POST") (= p "/api/eval")) (api-eval conn)
+      (and (= m "POST") (= p "/api/place")) (api-place conn)
+      (= m "GET") (static conn (subs p 1))
+      :else (w/text conn 405 "method not allowed"))))
+
+(w/serve {:port port :plug router :ip (erlang/list_to_tuple (list 127 0 0 1))})
+(println (str "bl-ed: http://127.0.0.1:" port "/   (documents under " root ")"))
+(receive (_ nil))

@@ -1,0 +1,443 @@
+; test/bl/incremental_aot_test.bl — incremental invalidation, pinned end to end.
+;
+; Two properties are asserted, because they are two halves of one requirement
+; ("do not re-do work an edit did not invalidate") and either alone is useless:
+;
+;   1. THE KEY MOVES FOR EXACTLY THE RIGHT REASON. A freshness key is the
+;      interface closure of a namespace (`build-plan`), so editing a required
+;      dependency's function BODY leaves the consumer's key — and therefore its
+;      artifact — alone, while an INTERFACE change (a new name, an arity, a
+;      macro body) moves it, with or without a change to the root's own bytes.
+;      The decision is taken over CONTENT: a same-size, same-mtime edit is
+;      visible, and a name resolved under another root is another key.
+;
+;   2. A STALE LIBRARY ARTIFACT IS REPAIRED ONCE. The runtime drift gate
+;      compiles it from live source, publishes the beams to the AOT cache under
+;      the live closure key, and loads them; a second VM LINKS the published
+;      beams and replays `__bl_init__/0` WITHOUT evaluating source. A
+;      namespace's top-level effects therefore happen exactly once per VM.
+;
+; ── Where each property is pinned ───────────────────────────────────────────
+;
+;   build-plan's key semantics   in memory (`key-for` takes its resolver as an
+;                                argument) and through the real closure hash
+;   artifact reuse               the production build driver, twice: the second
+;                                run must rebuild only the edited leaf
+;   repair + reuse               the production loader, plus two child VMs
+;
+; ── Running it against a checkout whose host source is newer than the floor ──
+;
+; `AOT.ensure_loaded/1` is a PINNED HOST module (`priv/host/aot.bl`). A checkout
+; that has edited that source but has not regenerated `build/` and
+; `priv/bootstrap/seed/` yet still RUNS the old host, so the repair half of this
+; file cannot pass there. Two environment variables let the file be exercised
+; against current source in exactly that state; both are no-ops on a coherent
+; image, where they are left unset:
+;
+;   BL_AOT_TEST_KEY=<hex>  pin `AOTCache.compiler_key/0` for every VM the test
+;                          starts, so the boot tier in `build/` is trusted even
+;                          though the live codegen digest has moved. Set it to
+;                          the key the INSTALLED image was built with.
+;   BL_AOT_TEST_HOST=1     the CHILD VMs reload `priv/host/aot.bl` into
+;                          `Elixir.BeamLisp.AOT` before they ask anything. The
+;                          parent half needs the same reload, which only a
+;                          harness can do (see below) — a BL test cannot replace
+;                          the module it is running under.
+;
+; Recipe (checkout with an edited `priv/host/aot.bl`, before `bl build && bl
+; seed`). `KEY` is the key the installed image was built with:
+;
+;   KEY=$(elixir -pa build -e 'Code.ensure_loaded(BeamLisp.AOTCache); IO.write(BeamLisp.AOTCache.compiler_key())')
+;   BL_AOT_TEST_KEY=$KEY BL_AOT_TEST_HOST=1 bl test test/bl/incremental_aot_test.bl
+;   …where the harness reloads the host in the parent first, i.e.
+;   `BeamLisp.AOT.compile_host_file("priv/host/aot.bl",
+;      [module: BeamLisp.AOT, output_dir: tmp, load?: true])`.
+;
+; On a coherent image (`bl build && bl seed` has run): plain
+; `bl test test/bl/incremental_aot_test.bl`.
+
+(ns incremental-aot.test
+  (:require [build :as b] [build-plan :as bp]))
+
+; ── the fixture tree ────────────────────────────────────────────────────────
+
+(def tmp (Path/join (System/tmp_dir!) "beam_lisp_incremental_aot"))
+(def src-dir (Path/join tmp "src"))
+(def out-dir (Path/join tmp "out"))
+(def cache-dir (Path/join tmp "cache"))
+(def mark-dir (Path/join tmp "marks"))
+(def manifest-path (Path/join out-dir "compile.beam_lisp"))
+
+(defn- fresh!
+  "A clean fixture tree whose output is on the code path."
+  []
+  (File/rm_rf! tmp)
+  (File/mkdir_p! (Path/join src-dir "inc"))
+  (File/mkdir_p! mark-dir)
+  (Code/append_path out-dir)
+  :ok)
+
+(defn- cleanup! [] (File/rm_rf! tmp))
+
+(defn- source-path
+  "Where the loader looks for `ns` under the fixture root."
+  [ns]
+  (Path/join src-dir (erlang/iolist_to_binary (list (String/replace ns "." "/") ".bl"))))
+
+(defn- write-ns!
+  "Write `ns`'s source to the fixture root. Answers the path."
+  [ns content]
+  (let [path (source-path ns)]
+    (File/write! path content)
+    path))
+
+(defn- lines
+  "How many non-empty lines a mark file holds — how many times an effect ran."
+  [p]
+  (if (File/exists? p)
+    (erlang/length (Enum/reject (String/split (File/read! p) "\n") (fn [s] (erlang/== s ""))))
+    0))
+
+(defn- with-ambient
+  "Run `f` with `src-dir` as the loader's only ambient search root, so a LOAD
+   (not just a key computation) resolves the fixture. This is the same hook the
+   loader's own callers use: `ensure_loaded/1` captures the ambient roots in the
+   CALLER's process and carries them into the pinned server."
+  [f]
+  (BeamLisp.Loader/with_ambient_dirs (list src-dir) f))
+
+; ── 1. the key moves only with the interface ────────────────────────────────
+;
+; In memory first: `key-for` takes its resolver as an argument, so these pin
+; build-plan's SEMANTICS with no disk and no cache in the way. The file-level
+; assertions below pin the same property through the real loader and driver.
+
+(defn- key-of
+  "`key-for` for `ns`, resolved over `srcs` (a map ns → source), through the
+   same content-keyed node memo the runtime gate hands it."
+  [srcs ns]
+  (let [memo (BeamLisp.Env/fetch! "build-plan" "memo-node")]
+    (bp/key-for ns (fn [n] (get srcs n)) nil memo)))
+
+(def leaf-body-1 "(ns inc.dep)\n(defn f [] 1)\n")
+(def leaf-body-2 "(ns inc.dep)\n(defn f [] 111)\n")
+(def leaf-iface  "(ns inc.dep)\n(defn f [] 1)\n(defn g [] 2)\n")
+(def leaf-macro-1 "(ns inc.dep)\n(defmacro m [x] x)\n")
+(def leaf-macro-2 "(ns inc.dep)\n(defmacro m [x] (list x))\n")
+(def consumer "(ns inc.use (:require [inc.dep :as d]))\n(defn run [] (d/f))\n")
+
+(deftest a-dependency-body-edit-leaves-the-consumer-key-alone
+  (let [before (key-of {"inc.dep" leaf-body-1 "inc.use" consumer} "inc.use")
+        after  (key-of {"inc.dep" leaf-body-2 "inc.use" consumer} "inc.use")
+        dep-before (key-of {"inc.dep" leaf-body-1 "inc.use" consumer} "inc.dep")
+        dep-after  (key-of {"inc.dep" leaf-body-2 "inc.use" consumer} "inc.dep")]
+    (is (string? before) "the consumer keys")
+    (is (= before after)
+        "a covered dependency's BODY is invisible to the consumer's bytes")
+    (is (not= dep-before dep-after)
+        "…but the dependency itself is invalidated (its own content line)")))
+
+(deftest an-interface-change-invalidates-the-consumer
+  (let [before (key-of {"inc.dep" leaf-body-1 "inc.use" consumer} "inc.use")
+        after  (key-of {"inc.dep" leaf-iface  "inc.use" consumer} "inc.use")]
+    (is (not= before after) "a new name in the dependency moves the consumer")))
+
+(deftest a-macro-body-change-invalidates-the-consumer
+  (let [before (key-of {"inc.dep" leaf-macro-1 "inc.use" consumer} "inc.use")
+        after  (key-of {"inc.dep" leaf-macro-2 "inc.use" consumer} "inc.use")]
+    (is (not= before after)
+        "a macro's body IS its interface: the expansion is inlined into callers")))
+
+(deftest an-edit-to-the-root-alone-also-moves-its-key
+  (let [before (key-of {"inc.dep" leaf-body-1 "inc.use" consumer} "inc.use")
+        after  (key-of {"inc.dep" leaf-body-1 "inc.use"
+                        "(ns inc.use (:require [inc.dep :as d]))\n(defn run [] (d/f))\n(defn extra [] :x)\n"} "inc.use")]
+    (is (not= before after))))
+
+; ── 2. the artifact is reusable when the key is ─────────────────────────────
+;
+; The acceptance form, through the production driver: build a two-file closure,
+; edit ONLY the leaf's body, build again. The leaf is rebuilt; the consumer is
+; not — its key is unchanged, so its fact is fresh and its beam is untouched.
+
+(def dep-src (source-path "inc.dep"))
+(def use-src (source-path "inc.use"))
+
+(defn- build-sources!
+  "Run the production build over `paths`. `clean?` first strips the manifest,
+   log and beams, so the run is a real cold compile; a SECOND run must NOT
+   clean, or every source would look fresh-less and rebuild."
+  [clean? paths]
+  (when clean? (b/clean out-dir manifest-path))
+  (BeamLisp.Env/add_search_path src-dir)
+  (try
+    (b/run {:sources paths :out out-dir :manifest manifest-path :jobs 1})
+    (finally (BeamLisp.Env/remove_search_path src-dir))))
+
+(deftest a-body-edit-rebuilds-the-leaf-and-reuses-the-consumer
+  (fresh!)
+  (try
+    (System/put_env "BEAM_LISP_AOT_CACHE" "off")
+    (write-ns! "inc.dep" leaf-body-1)
+    (write-ns! "inc.use" consumer)
+    (let [first-run (build-sources! true (list dep-src use-src))]
+      (is (= [] (:errors first-run)) (pr-str (:errors first-run)))
+      (is (= 2 (:built first-run)) "both sources compiled cold")
+      (write-ns! "inc.dep" leaf-body-2)
+      (let [second-run (build-sources! false (list dep-src use-src))]
+        (is (= [] (:errors second-run)) (pr-str (:errors second-run)))
+        (is (= 1 (:built second-run))
+            "only the edited leaf rebuilt: the consumer's interface key was unchanged")))
+    (finally
+      (System/delete_env "BEAM_LISP_AOT_CACHE")
+      (cleanup!))))
+
+; ── 3. the decision is over CONTENT, never a stat ───────────────────────────
+;
+; Two DIFFERENT sources of the SAME LENGTH, the second written so that it keeps
+; the first's mtime. A gate that trusted `(size, mtime)` would call them equal;
+; the closure hash reads the bytes, so the key moves.
+
+(def body-a "(ns inc.dep)\n(defn f [] :aaaa)\n")
+(def body-b "(ns inc.dep)\n(defn f [] :bbbb)\n")
+
+(deftest a-same-size-same-mtime-edit-is-visible
+  (fresh!)
+  (try
+    (is (= (erlang/byte_size body-a) (erlang/byte_size body-b))
+        "precondition: the two sources are the same length")
+    (let [path (write-ns! "inc.dep" body-a)
+          before (BeamLisp.Loader/with_search_dir src-dir
+                   (fn [] (BeamLisp.AOT/ns_closure_hash "inc.dep")))
+          original (File/stat! path (list (tuple :time :posix)))]
+      (File/write! path body-b)
+      (File/touch path (erlang/map_get :mtime original))
+      (let [edited (File/stat! path (list (tuple :time :posix)))]
+        (is (= (erlang/map_get :size original) (erlang/map_get :size edited))
+            "precondition: size unchanged")
+        (is (= (erlang/map_get :mtime original) (erlang/map_get :mtime edited))
+            "precondition: mtime unchanged"))
+      (let [after (BeamLisp.Loader/with_search_dir src-dir
+                    (fn [] (BeamLisp.AOT/ns_closure_hash "inc.dep")))]
+        (is (string? before))
+        (is (not= before after)
+            "the key is folded from bytes even when the stat says nothing changed")))
+    (finally (cleanup!))))
+
+; ── 4. cycles, missing requires, and resolution isolation ───────────────────
+
+(deftest a-require-cycle-terminates-and-every-node-is-keyed
+  (let [srcs {"inc.a" "(ns inc.a (:require [inc.b]))\n(defn f [] 1)\n"
+              "inc.b" "(ns inc.b (:require [inc.a]))\n(defn g [] 2)\n"}
+        ka (key-of srcs "inc.a")
+        kb (key-of srcs "inc.b")]
+    (is (string? ka))
+    (is (string? kb))
+    (is (= ka (key-of srcs "inc.a")) "stable across calls")))
+
+(deftest a-missing-require-is-keyed-and-moves-when-it-appears
+  (let [needy "(ns inc.a (:require [inc.gone :as g]))\n(defn f [] 1)\n"
+        before (key-of {"inc.a" needy} "inc.a")
+        after  (key-of {"inc.a" needy "inc.gone" "(ns inc.gone)\n(defn z [] 0)\n"} "inc.a")]
+    (is (string? before) "an unresolvable require still keys: it contributes `inc.gone:?`")
+    (is (not= before after) "…so a require that STARTS resolving is a change")))
+
+(deftest a-multi-namespace-file-answers-each-of-its-namespaces
+  (let [multi "(ns inc.one)\n(defn a [] 1)\n(ns inc.two (:require [inc.one :as o]))\n(defn b [] (o/a))\n"
+        memo (BeamLisp.Env/fetch! "build-plan" "memo-node")
+        one (BeamLisp.Ns.Rt/invoke memo (list "inc.one" multi))
+        two (BeamLisp.Ns.Rt/invoke memo (list "inc.two" multi))]
+    (is (= [] (Enum/to_list (:reqs one))))
+    (is (= ["inc.one"] (Enum/to_list (:reqs two)))
+        "each name gets the header ITS form declares")))
+
+(deftest the-same-name-under-another-root-is-another-key
+  (let [a "(ns inc.iso)\n(defn f [] :a)\n"
+        b "(ns inc.iso)\n(defn f [] :b)\n"
+        ka (key-of {"inc.iso" a} "inc.iso")
+        kb (key-of {"inc.iso" b} "inc.iso")]
+    (is (not= ka kb) "no cross-context contamination: the bytes decide")
+    (is (= ka (key-of {"inc.iso" a} "inc.iso")) "and both directions are stable")))
+
+; ── 3b. a validation pass reads a shared member ONCE ──────────────────────
+;
+; Two namespaces that require the same leaf: outside a pass each validation
+; re-reads the leaf (the per-call cache cannot see the other call), while
+; inside a pass it is read once. A mid-pass edit is the observable: if the
+; second validation re-read it, it WOULD see the edit.
+
+(deftest a-validation-pass-reads-a-shared-member-once
+  (fresh!)
+  (try
+    (let [leaf (write-ns! "inc.leaf" "(ns inc.leaf)\n(defn f [] 1)\n")]
+      (write-ns! "inc.left" "(ns inc.left (:require [inc.leaf :as l]))\n(defn a [] (l/f))\n")
+      (BeamLisp.Loader/with_search_dir src-dir
+        (fn []
+          (let [pass (BeamLisp.AOT/with_source_snapshot
+                       (fn []
+                         (let [first-key (BeamLisp.AOT/ns_closure_hash "inc.left")]
+                           ; the edit lands inside the pass
+                           (File/write! leaf "(ns inc.leaf)\n(defn f [] 1)\n(defn g [] 2)\n")
+                           (tuple first-key (BeamLisp.AOT/ns_closure_hash "inc.left")))))]
+            (is (= (elem pass 0) (elem pass 1))
+                "the pass read the shared member once: a mid-pass edit is invisible")
+            (is (not= (elem pass 0) (BeamLisp.AOT/ns_closure_hash "inc.left"))
+                "…and the NEXT pass re-reads, so the edit is not lost")))))
+    (finally (cleanup!))))
+
+; This fixture lives outside the SDK tiers. Loader ownership rules correctly
+; refuse replacing its existing global beam with different project source.
+; Exercise the public AOT repair boundary directly; loader ownership/refusal is
+; covered separately. Do not weaken runtime namespace ownership for a fixture.
+;
+; ── 5. repair: once, published, reused ─────────────────────────────────────
+;
+; The F1 shape. `build/` holds a library beam that no longer matches the source,
+; and the loader used to interpret that source on every boot — no message, no
+; write-back. The gate now compiles it once, publishes it to the AOT cache under
+; the live closure key, and a later VM links that entry instead of reading
+; source.
+;
+; The fixture carries TWO observable effects, and the split IS the proof: a BARE
+; top-level form runs only when the source is EVALUATED (the compile path),
+; while a `def` initializer ALSO replays through `__bl_init__/0` (the link
+; path). So `bare = 1` for the rest of the run is "source evaluated exactly
+; once", and `init` counting up by one per VM is the link path doing its job.
+
+(defn- rep-source
+  "The repair fixture at `version`: a bare effect and a `def` effect, each
+   appending to `marks/`."
+  [version added?]
+  (let [bare "(erlang/apply :file :write_file (list (Path/join (System/get_env \"REP_MARK\") \"bare.log\") \"x\\n\" (list :append)))"
+        init "(def marker (erlang/apply :file :write_file (list (Path/join (System/get_env \"REP_MARK\") \"init.log\") \"x\\n\" (list :append))))"]
+    (str "(ns inc.rep)\n"
+         "(defn probe [] " version ")\n"
+         (if added? "(defn added [] :new)\n" "")
+         bare "\n" init "\n")))
+
+(defn- bare-count [] (lines (Path/join mark-dir "bare.log")))
+(defn- init-count [] (lines (Path/join mark-dir "init.log")))
+
+(defn- build-rep!
+  "Build the repair fixture COLD with the shared cache OFF, so the gate's first
+   call is a real cache miss. The build's own compile is not what the counters
+   measure, so they are cleared afterwards."
+  [source]
+  (write-ns! "inc.rep" source)
+  (System/put_env "REP_MARK" mark-dir)
+  (System/put_env "BEAM_LISP_AOT_CACHE" "off")
+  (let [r (build-sources! true (list (source-path "inc.rep")))]
+    (System/delete_env "BEAM_LISP_AOT_CACHE")
+    (File/rm_rf! mark-dir)
+    (File/mkdir_p! mark-dir)
+    r))
+
+(defn- drop-load-state!
+  "Forget the fixture module in THIS VM, so the gate is asked afresh and has to
+   read the beam on the code path (which is the one the build left behind)."
+  [ns]
+  (let [mod (BeamLisp.Link/module_for ns)]
+    (code/purge mod)
+    (code/delete mod))
+  :ok)
+
+(deftest a-stale-library-is-repaired-once-and-not-re-evaluated
+  (fresh!)
+  (try
+    (System/put_env "BEAM_LISP_AOT_CACHE_DIR" cache-dir)
+    (let [r (build-rep! (rep-source ":v1" false))]
+      (is (= [] (:errors r)) (pr-str (:errors r)))
+      (is (= 1 (:built r))))
+    ; the source moves; the beam on the code path is v1 and now stale
+    (write-ns! "inc.rep" (rep-source ":v2" true))
+    (drop-load-state! "inc.rep")
+    (let [r (with-ambient (fn [] (BeamLisp.AOT/ensure_loaded "inc.rep")))]
+      (is (= :loaded r))
+      (is (= 1 (bare-count)) "source evaluated exactly ONCE")
+      (is (= 1 (init-count)) "and `__bl_init__` was NOT replayed on top of it")
+      (is (= :v2 (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "inc.rep" "probe") (list))))
+      (is (= :new (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "inc.rep" "added") (list)))))
+    (let [r (with-ambient (fn [] (BeamLisp.AOT/ensure_loaded "inc.rep")))]
+      (is (= :loaded r) "idempotent")
+      (is (= 1 (bare-count)))
+      (is (= 1 (init-count)) "nothing replayed once the namespace is loaded"))
+    (finally
+      (System/delete_env "BEAM_LISP_AOT_CACHE_DIR")
+      (cleanup!))))
+
+; ── 6. a fresh child reuses the published artifact ──────────────────────────
+
+(defn- child-script
+  "The child program: boot the language, honour the two current-source variables,
+   then load the fixture through the PRODUCTION AOT repair boundary, and print what happened."
+  []
+  (str "Code.append_path(" (pr-str out-dir) ")\n"
+       "IO.puts(\"env_key=\" <> inspect(System.get_env(\"BL_AOT_TEST_KEY\")))\n"
+       "case System.get_env(\"BL_AOT_TEST_KEY\") do\n"
+       "  nil -> :ok\n"
+       "  key -> :persistent_term.put({BeamLisp.AOTCache, :toolchain_key}, key)\n"
+       "end\n"
+       "Application.load(:beam_lisp)\n"
+       "{:ok, _} = BeamLisp.Env.start_link([])\n"
+       "{:ok, _} = BeamLisp.Loader.Server.start_link([])\n"
+       "IO.puts(\"key=\" <> inspect(BeamLisp.AOTCache.compiler_key()))\n"
+       "BeamLisp.init()\n"
+       "if System.get_env(\"BL_AOT_TEST_HOST\") == \"1\" do\n"
+       "  dir = Path.join(System.tmp_dir!(), \"bl_aot_test_host\")\n"
+       "  File.mkdir_p!(dir)\n"
+       "  BeamLisp.AOT.compile_host_file(\"priv/host/aot.bl\",\n"
+       "    [module: BeamLisp.AOT, output_dir: dir, load?: true])\n"
+       "end\n"
+       "r = BeamLisp.Loader.with_ambient_dirs([" (pr-str src-dir) "],\n"
+       "      fn -> BeamLisp.AOT.ensure_loaded(\"inc.rep\") end)\n"
+       "IO.puts(\"load=\" <> inspect(r))\n"
+       "IO.puts(\"probe=\" <> inspect(BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!(\"inc.rep\", \"probe\"), [])))\n"
+       "IO.puts(\"added=\" <> inspect(BeamLisp.Ns.Rt.invoke(BeamLisp.Env.fetch!(\"inc.rep\", \"added\"), [])))\n"
+       "marks = fn p -> case File.read(p) do {:ok, s} -> length(String.split(s, \"\\n\", trim: true)); _ -> 0 end end\n"
+       "IO.puts(\"bare=\" <> inspect(marks.(" (pr-str (Path/join mark-dir "bare.log")) ")))\n"
+       "IO.puts(\"init=\" <> inspect(marks.(" (pr-str (Path/join mark-dir "init.log")) ")))\n"))
+
+(defn- run-child!
+  "Run one child VM; returns its merged output. Every expected key must be in it."
+  []
+  (let [code-dir (Path/dirname
+                   (erlang/list_to_binary
+                     (code/which (erlang/binary_to_atom "Elixir.BeamLisp" :utf8))))
+        r (System/cmd "elixir"
+              (to-list ["-pa" code-dir "-pa" out-dir "-e" (child-script)])
+              (to-list [(tuple :stderr_to_stdout true)
+                        (tuple :env
+                          (to-list [(tuple "BEAM_LISP_PATH" src-dir)
+                                    (tuple "REP_MARK" mark-dir)
+                                    (tuple "BEAM_LISP_AOT_CACHE_DIR" cache-dir)
+                                    (tuple "BL_AOT_TEST_KEY" (or (System/get_env "BL_AOT_TEST_KEY") ""))
+                                    (tuple "BL_AOT_TEST_HOST" (or (System/get_env "BL_AOT_TEST_HOST") ""))]))]))]
+    (is (= 0 (elem r 1)) (str "child VM exited " (elem r 1) ":\n" (elem r 0)))
+    (elem r 0)))
+
+(deftest a-fresh-child-reuses-the-published-artifact
+  (fresh!)
+  (try
+    (System/put_env "BEAM_LISP_AOT_CACHE_DIR" cache-dir)
+    (let [r (build-rep! (rep-source ":v1" false))]
+      (is (= [] (:errors r)) (pr-str (:errors r)))
+      (is (= 1 (:built r))))
+    (write-ns! "inc.rep" (rep-source ":v2" true))
+    (drop-load-state! "inc.rep")
+    ; child 1: a real cache MISS — compiled once, published, effects once
+    (let [text (run-child!)]
+      (is (includes? text "load=:loaded") text)
+      (is (includes? text "probe=:v2") text)
+      (is (includes? text "added=:new") text)
+      (is (includes? text "bare=1") text)
+      (is (includes? text "init=1") text))
+    ; child 2: a cache HIT — linked and replayed, source untouched
+    (let [text (run-child!)]
+      (is (includes? text "load=:loaded") text)
+      (is (includes? text "probe=:v2") text)
+      (is (includes? text "bare=1")
+          (str "child 2 must NOT evaluate the source; got:\n" text))
+      (is (includes? text "init=2") (str "child 2 must replay the initializer; got:\n" text)))
+    (finally
+      (System/delete_env "BEAM_LISP_AOT_CACHE_DIR")
+      (cleanup!))))

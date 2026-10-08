@@ -85,3 +85,137 @@
         now-rows (set (datom/q alice-q db))]
     (is (= #{["Alice One"] ["Alice Two"]} now-rows))))
 
+
+;; ═══ FUP-121 hygiene + relation scoping ═════════════════════════════
+
+(def lib-conn
+  (datom/connect
+    [{:db/ident :src/origin :db/valueType :db.type/string}
+     {:db/ident :src/title :db/valueType :db.type/string}
+     {:db/ident :chunk/src :db/valueType :db.type/ref}
+     {:db/ident :chunk/text :db/valueType :db.type/string}
+     {:db/ident :m/acct :db/valueType :db.type/string}
+     {:db/ident :grant/who :db/valueType :db.type/string}
+     {:db/ident :grant/key :db/valueType :db.type/string}]))
+
+(datom/transact! lib-conn
+  [{:db/id -1 :src/origin "k1" :src/title "S1"}
+   {:db/id -2 :src/origin "k2" :src/title "S2"}
+   {:db/id -3 :chunk/src -1 :chunk/text "ok-1"}
+   {:db/id -4 :chunk/src -1 :chunk/text "ok-2"}
+   {:db/id -5 :chunk/src -2 :chunk/text "secret"}
+   {:db/id -6 :grant/who "alice" :grant/key "k1"}])
+
+(def ldb (datom/db lib-conn))
+(def allowed #{"k1"})
+(def pol {:attrs {:chunk/text {:path [:chunk/src :src/origin]}
+                  :src/title {:path [:src/origin]}}
+          :allow {:set allowed}})
+(defn- run [r & more] (set (apply datom/q (:query r) ldb (concat more (:inputs r)))))
+
+(deftest fresh-avoids-query-vars-and-is-deterministic
+  (let [q '[:find ?a :in $ ?acct :where [?a :x ?acct]]]
+    (is (= '[?a-1 ?acct-1 ?b] (rls/fresh q '[?a ?acct ?b])))
+    (is (= (rls/fresh q '[?a ?acct]) (rls/fresh q '[?a ?acct])))))
+
+(deftest guarded-fn-filter-is-hygienic
+  ;; the filter wants ?a/?acct, the caller already uses both
+  (let [c (datom/connect [{:db/ident :conn/principal :db/valueType :db.type/string}
+                          {:db/ident :conn/account-id :db/valueType :db.type/string}
+                          {:db/ident :row/acct :db/valueType :db.type/string}
+                          {:db/ident :row/at :db/valueType :db.type/string}])
+        _ (datom/transact! c [{:db/id -1 :conn/principal "p" :conn/account-id "A"}
+                              {:db/id -2 :row/acct "A" :row/at "x"}
+                              {:db/id -3 :row/acct "B" :row/at "y"}])
+        q '[:find ?at :where [?a :row/at ?at] [?a :row/acct ?acct]]
+        flt (fn [query]
+              (let [[a acct] (rls/fresh query '[?a ?acct])]
+                [[a :conn/principal "p"] [a :conn/account-id acct] ['?a :row/acct acct]]))
+        g (rls/guarded q [flt])]
+    (is (= #{["x"]} (set (datom/q g (datom/db c)))))
+    (is (= g (rls/guarded q [flt])))
+    (is (= (:where (rls/inject q [])) (take 2 (:where g))))))
+
+(deftest scope-set-and-relation-agree
+  (let [s (rls/scope '[:find ?t :where [?c :chunk/text ?t]]
+                     {:var '?c :via [:chunk/src :src/origin] :allow {:set allowed}})
+        s2 (rls/scope '[:find ?t :where [?c :chunk/text ?t]]
+                      {:var '?c :via [:chunk/src :src/origin] :allow {:set allowed} :mode :collection})
+        r (rls/scope '[:find ?t :where [?c :chunk/text ?t]]
+                     {:var '?c :via [:chunk/src :src/origin]
+                      :allow {:clauses [['?g :grant/who "alice"] ['?g :grant/key '?key]]}})]
+    (is (= #{["ok-1"] ["ok-2"]} (run s)))
+    (is (= (run s) (run s2)))
+    (is (= 1 (count (:inputs s))))
+    (is (= (:query s) (:query (rls/scope '[:find ?t :where [?c :chunk/text ?t]]
+                                         {:var '?c :via [:chunk/src :src/origin] :allow {:set allowed}}))))
+    (is (= (run s) (run r)) "relation clause = set")))
+
+(deftest scope-with-existing-in-forms-and-collisions
+  (let [q '[:find ?t :in $ [?want ...] ?scope-set
+            :where [?c :chunk/text ?t] [?c :chunk/src ?s] [?s :src/title ?want]]
+        s (rls/scope q {:var '?c :via [:chunk/src :src/origin] :allow {:set allowed}})]
+    (is (= #{["ok-1"] ["ok-2"]} (run s ["S1" "S2"] :unused)))
+    (is (= #{} (run (rls/scope q {:var '?c :via [:chunk/src :src/origin] :allow {:set #{"zz"}}}) ["S1" "S2"] :unused)))))
+
+(deftest scope-with-or-not-stays-monotone
+  (let [q '[:find ?t :where [?c :chunk/text ?t] [:or [?c :chunk/text "secret"] [?c :chunk/text "ok-1"]] [:not [?c :chunk/text "ok-2"]]]
+        s (rls/scope q {:var '?c :via [:chunk/src :src/origin] :allow {:set allowed}})]
+    (is (= #{["ok-1"]} (run s)))))
+
+(deftest scope-all-constrains-every-content-var
+  (let [q '[:find ?t2 :where [?c1 :chunk/text ?t1] [?c2 :chunk/text ?t2] [?c1 :chunk/src ?s]]
+        r (rls/scope-all q pol)]
+    (is (= #{["ok-1"] ["ok-2"]} (run r)))
+    (is (not (contains? (run r) ["secret"])))
+    ;; the second var alone is what leaks if only ?c1 were scoped
+    (is (= 3 (count (filterv (fn [c] (= :chunk/src (nth c 1))) (:where (:query r))))))
+    (is (= (:query r) (:query (rls/scope-all q pol))))))
+
+(deftest scope-all-nothing-scoped-is-unchanged
+  (let [r (rls/scope-all '[:find ?s :where [?s :m/acct ?a]] pol)]
+    (is (= [] (:inputs r)))))
+
+(deftest scope-all-refuses-undetectable
+  (doseq [q ['[:find (pull ?e [*]) :where [?e :src/origin _]]
+             '[:find (pull ?e [:chunk/text]) :where [?e :src/origin _]]
+             '[:find ?t :where [1 :chunk/text ?t]]
+             '[:find ?t :where [_ :chunk/text ?t]]
+             '[:find ?t :where [?e :src/origin _] [(get-else $ ?e :chunk/text "") ?t]]
+             '[:find ?a :where [?e ?a ?v]]
+             '[:find ?t :where [?e :src/origin _] [(f ?e :chunk/text) ?t]]
+             '[:find ?t :where [?x :src/origin _] [:not [?c :chunk/text ?t]]]]]
+    (let [r (rls/scope-all q pol)]
+      (is (= :unscopable (:refused r)) (pr-str q))
+      (is (seq (:why r))))))
+
+(deftest owner-and-attribute-filters-unchanged
+  (is (= [['?d :doc/owner "a"]] (rls/owner-filter '?d :doc/owner "a")))
+  (is (= [['?d :doc/t "x"]] (rls/attribute-filter '?d :doc/t "x"))))
+
+(deftest memo-allowed-keys-by-principal-and-basis
+  (let [n (atom 0)
+        f (rls/memo-allowed (fn [p db] (swap! n inc) #{p}))]
+    (f "a" ldb) (f "a" ldb) (f "b" ldb)
+    (is (= 2 (deref n)))
+    (datom/transact! lib-conn [{:db/id -1 :src/title "S3"}])
+    (f "a" (datom/db lib-conn))
+    (is (= 3 (deref n)))))
+
+;; monotonicity property: fixed-seed generated filters over the library
+(deftest guarded-is-subset-of-unguarded-200-cases
+  (let [qs ['[:find ?t :where [?c :chunk/text ?t]]
+            '[:find ?t :where [?c :chunk/text ?t] [?c :chunk/src ?s]]
+            '[:find ?t :where [?c :chunk/text ?t] [:not [?c :chunk/text "ok-2"]]]]
+        keys* ["k1" "k2" "k3"]
+        ok (loop [i 0 seed 12345 good true]
+             (if (>= i 200)
+               good
+               (let [seed (mod (+ (* seed 1103515245) 12345) 2147483648)
+                     q (nth qs (mod (quot seed 7) 3))
+                     allow (into #{} (filter (fn [k] (= 0 (mod (quot seed (+ 3 (count k) (mod seed 5))) 2))) keys*))
+                     s (rls/scope q {:var '?c :via [:chunk/src :src/origin] :allow {:set allow}})
+                     base (set (datom/q q (datom/db lib-conn)))
+                     got (set (apply datom/q (:query s) (datom/db lib-conn) (:inputs s)))]
+                 (recur (+ i 1) seed (and good (every? (fn [r] (contains? base r)) got))))))]
+    (is ok)))
