@@ -21,7 +21,7 @@
 ;   (net/answering? sock-path)  → true | false   does anything accept there?
 ;   (net/stop listener)         → :ok
 ;
-; ══ ONE DAEMON PER ENDPOINT, EXACTLY ════════════════════════════════════════
+; ══ ENDPOINT ADMISSION ══════════════════════════════════════════════════════
 ;
 ; A unix socket is a FILE, and binding over a file that exists is not an error
 ; here: `listen` used to unlink the path and bind, so a second start for the
@@ -33,10 +33,11 @@
 ;     held for milliseconds, so two starters take turns instead of racing;
 ;   • inside the lock the existing path is PROBED, not trusted: something that
 ;     accepts is a live daemon (→ :already-running); something that refuses is
-;     the leftover of a crash and is reclaimed.
+;     the leftover of a crash and is reclaimed. Other probe failures preserve it.
 ;
-; A lock whose holder died inside its millisecond section is recovered by age
-; (LOCK-STALE-MS), so a crash can delay a start but never wedge it.
+; Age recovery (LOCK-STALE-MS) bounds ordinary crash delays, but cannot
+; distinguish a dead holder from a paused live holder. Serialization therefore
+; assumes no live holder pauses beyond that age; an OS-owned lease is pending.
 
 (ns vm.net
   (:require [vm.wire :as wire] [vm.paths :as paths]))
@@ -66,22 +67,31 @@
 ;; How long a starter waits for another starter's bind to finish, how often it
 ;; looks, and how old a lock must be before its holder is presumed dead. The wait
 ;; is generous (a bind takes milliseconds; a loaded host stretches it), the stale
-;; age is longer than any honest hold.
+;; age is an operational recovery heuristic, not proof that its holder died.
 (def LOCK-WAIT-MS 5000)
 (def LOCK-POLL-MS 25)
 (def LOCK-STALE-MS 15000)
 (def PROBE-TIMEOUT-MS 500)
 
-(defn answering?
-  "Whether anything accepts connections at the unix socket `sock-path`. A refused
-   connect is the honest proof a socket is dead: the file's existence proves
-   nothing, because a crashed daemon leaves it behind."
+(defn probe
+  "Observe an endpoint without treating uncertainty as permission to remove it.
+   :live | :dead | {:unknown reason}. Only absence or connection refusal proves
+   death. Timeout, permissions, resource pressure and malformed paths are unknown."
   [sock-path]
-  (let [r (gen_tcp/connect (tuple :local (erlang/binary_to_list sock-path)) 0
-            (connect-opts) PROBE-TIMEOUT-MS)]
-    (if (= :ok (elem r 0))
-      (do (gen_tcp/close (elem r 1)) true)
-      false)))
+  (try
+    (let [r (gen_tcp/connect (tuple :local (erlang/binary_to_list sock-path)) 0
+              (connect-opts) PROBE-TIMEOUT-MS)]
+      (cond
+        (= :ok (elem r 0)) (do (gen_tcp/close (elem r 1)) :live)
+        (contains? #{:enoent :econnrefused} (elem r 1)) :dead
+        :else {:unknown (elem r 1)}))
+    (catch e {:unknown :probe-exception})))
+
+(defn answering?
+  "Whether a probe confirms a live listener. False includes unknown results;
+   use `probe` when deciding whether an endpoint may be reclaimed."
+  [sock-path]
+  (= :live (probe sock-path)))
 
 ;; ── the start lock ──────────────────────────────────────────────────────────
 
@@ -114,7 +124,8 @@
 
 (defn- acquire-lock
   "Take the start lock, waiting up to LOCK-WAIT-MS. A lock older than
-   LOCK-STALE-MS belonged to a starter that died mid-bind and is removed."
+   LOCK-STALE-MS is presumed abandoned and removed. A paused live holder is
+   indistinguishable here; see PLAN-endpoint-probe-authority.org."
   [path]
   (let [deadline (+ (now-ms) LOCK-WAIT-MS)]
     (loop []
@@ -342,9 +353,11 @@
              expect (paths/hello-fingerprint root build shared)]
          (with-start-lock (:lock paths-map)
            (fn []
-             (if (answering? (:sock paths-map))
-               {:error :already-running}
-               (bind-endpoint root expect handler paths-map)))))))))
+             (let [state (probe (:sock paths-map))]
+               (cond
+                 (= :live state) {:error :already-running}
+                 (= :dead state) (bind-endpoint root expect handler paths-map)
+                 :else {:error (tuple :endpoint-probe-unknown (:unknown state))})))))))))
 
 (defn- write-meta!
   "Publish complete endpoint metadata or raise, removing scratch on failure."
