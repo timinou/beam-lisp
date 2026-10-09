@@ -31,6 +31,10 @@
             [proc.super :as psuper]
             [codebase :as cb]
             [system.analyze :as an]
+            [system.js :as native]
+            [system.ir :as ir]
+            [js.emit :as sync]
+            [js.build :as jsbuild]
             [datom]
             ; the wire grammar both halves run; the build checks declarations
             ; against the SAME depth bound the authority enforces
@@ -715,6 +719,28 @@
           {:lines (list) :temps []}
           nodes))
 
+ ; Native links are a build-time closed manifest, never a runtime name service.
+(defn native-links [] (let [v (erlang/get :js-actors-native-links)] (if (= v :undefined) {} v)))
+(defn native-link [node]
+  (when (= :global (:op node)) (get (native-links) (str (:ns node) "/" (:name node)))))
+(defn native-name [key] (str "N_" (jsname key)))
+(defn native-call [callee args ctx]
+  ; Ordinary JS call: no frame, call step, encoding, or return-value conversion.
+  (let [ar (emit-args-temps args ctx) t (fresh-tmp)]
+    {:lines (concat (:lines ar) (list (str "const " t " = " callee "(" (join-str (:temps ar) ", ") ");")))
+     :val t}))
+(defn emit-native [node ctx]
+  (when (:guard ctx) (throw (ex-info "js-actors: native JS is not a guard operation" {})))
+  (let [r (sync/emit-native node
+            (assoc ctx :dest nil :native-tmp fresh-tmp
+              :native-args (fn [nodes ctx]
+                             (let [r (emit-args-temps nodes ctx)]
+                               {:lines (:lines r) :vals (:temps r)}))))
+        t (fresh-tmp)]
+    ; The actor destination convention requires effects in :lines, including
+    ; discarded do statements and finally bodies. Never leave a call in :val.
+    {:lines (concat (:lines r) (list (str "const " t " = " (:val r) ";"))) :val t}))
+
 (defn emit-remote
   "A `:remote` in value position. `RT/invoke` and `RT/apply_to` are the
    dynamic-call forms: both become a call step whose callee is the EVALUATED
@@ -726,6 +752,12 @@
       nil)
     (if (or (and (= m mod-rt) (= f :invoke))
             (and (= m mod-rt) (= f :apply_to)))
+      (if (and (= f :invoke) (native-link (first args)))
+        (let [link (native-link (first args))
+              nodes (ir/cons-args (second args))]
+          (when-not (contains? (:arities link) (count nodes))
+            (throw (ex-info "js-actors: wrong native import arity" {:node node})))
+          (native-call (native-name (str (:ns (first args)) "/" (:name (first args)))) nodes ctx))
       (let [fr (emit (first args) (assoc ctx :tail false))
             lr (emit (second args) (assoc ctx :tail false))
             ft (fresh-tmp) lt (fresh-tmp)
@@ -741,7 +773,7 @@
                         (:lines lr)
                         (list (str "const " lt " = " (:val lr) ";"))
                         (:lines st))
-         :val (:val st)})
+         :val (:val st)}))
       (let [ar (emit-args-temps args ctx)
             sr (src-js node ctx (call-kind ctx "direct"))
             st (step-call ctx (callee-js m f) (arglist-js (:temps ar)) sr)]
@@ -1243,7 +1275,9 @@
       (= op :var) {:lines (list) :val (jsname (:name node))}
       (= op :global)
         {:lines (list)
-         :val (str "H.ref(rt," (js-str (:ns node)) "," (js-str (:name node)) ")")}
+         :val (if (native-link node) (native-name (str (:ns node) "/" (:name node)))
+                (str "H.ref(rt," (js-str (:ns node)) "," (js-str (:name node)) ")"))}
+      (= op :js) (emit-native node ctx)
       (= op :remote) (emit-remote node ctx)
       (= op :arith) (emit-arith node ctx)
       (= op :apply) (emit-apply node ctx)
@@ -1296,7 +1330,8 @@
     :else (contains? remote-map (remote-key m f))))
 
 (defn global-ok? [ns name defined]
-  (or (and (= ns "js") (or (contains? defined name) (contains? core-map name)))
+  (or (contains? (native-links) (str ns "/" name))
+      (and (= ns "js") (or (contains? defined name) (contains? core-map name)))
       (contains? core-map name)))
 
 (defn audit! [refs defined]
@@ -1741,7 +1776,7 @@
   [form ns]
   {:name (defn-name form)
    :node (BeamLisp.Ns.Compiler/compile (defn->fn-form form)
-                                       (BeamLisp.Ns.Compiler/new_env ns))})
+                                       (assoc (BeamLisp.Ns.Compiler/new_env ns) :target :js))})
 
 (defn compile-top-form
   "Compile ONE top-level reader form into the definitions it contributes.
@@ -1771,10 +1806,31 @@
 (defn compile-source
   "Compile one source file to a vector of {:name name :node node} definitions."
   [path ns]
-  (reduce
-    (fn [acc form] (into acc (compile-top-form form ns path)))
-    []
-    (read-file-forms path)))
+  (let [_ (println (str "js-actors: compiling " path))
+        texts (jsbuild/read-forms+text path)
+        head (first (first texts))
+        source-ns (if (ns-form? head) (n-name (second (n-items head))) ns)
+        _ (when (ns-form? head)
+            ; Only the namespace declaration, never application initialization.
+            (BeamLisp.Compiler/eval_string (second (first texts)) (BeamLisp.Compiler/new_env "user") path))
+        env (BeamLisp.Ns.Compiler/new_env source-ns)
+        normalize (fn normalize [v]
+                    (cond
+                      (erlang/is_map v) (reduce (fn [m k]
+                                                 (assoc m k (if (and (= k :ns) (= :global (:op v)) (= source-ns (:ns v))) ns
+                                                              (normalize (maps/get k v))))) {} (maps/keys v))
+                      (erlang/is_list v) (to-list (map normalize v))
+                      (erlang/is_tuple v) (erlang/list_to_tuple (to-list (map normalize (erlang/tuple_to_list v))))
+                      :else v))
+        defs (reduce (fn [acc [form text]] (into acc (compile-top-form form source-ns path))) [] texts)]
+    (vec (map (fn [d]
+                (let [node (:node d) refs (refs-of [node])]
+                  (when (and (not (:js-interop env))
+                             (some (fn [r] (and (= :global (first r))
+                                               (contains? (native-links) (str (nth r 1) "/" (nth r 2))))) refs))
+                    (throw (ex-info "js-actors: native imports require (ns ^:js ...)" {:path path})))
+                  (assoc d :node (let [checked (if (:js-interop env) (native/check! node) node)]
+                                   (if (= source-ns ns) checked (normalize checked)))))) defs))))
 
 (defn stamp-def-name
   "Stamp a compiled def node with the SOURCE name of its real function. The
@@ -2259,6 +2315,11 @@
         js (str "// GENERATED by research/js-actors/compiler.bl — do not edit.\n"
                 "// Sources: " (join-str sources " ") "\n"
                 "import * as H from \"../host.mjs\";\n\n"
+                (when (some (fn [d] (some (fn walk [n] (or (= :js (:op n)) (some walk (ir/child-nodes n)))) [(:node d)])) defs)
+                  "import * as J from \"../native.mjs\";\n")
+                (apply str (map (fn [[key spec]]
+                                 (str "import {" (:export spec) " as " (native-name key) "} from " (js-str (:path spec)) ";\n"))
+                               (sort (vec (native-links)))))
                 "for (const name of " (arglist-js (map js-str (to-list host-names))) ") {\n"
                 "  if (!H.hostNames().includes(name)) throw new Error('missing host leaf: ' + name);\n}\n"
                 "for (const name of " (arglist-js (map js-str (to-list erlang-names))) ") {\n"
@@ -2293,14 +2354,26 @@
    visible to the app that uses it and the allowlist audit sees the whole
    bundle."
   ([dir app output] (build-one dir app output []))
-  ([dir app output extras]
+  ([dir app output extras] (build-one dir app output extras {}))
+  ([dir app output extras opts]
+   (let [prior (erlang/get :js-actors-native-links)
+         links (or (:native-links opts) {})]
+     (doseq [[key spec] links]
+       (when-not (and (string? key) (string? (:path spec))
+                      (re-matches #"[A-Za-z_$][A-Za-z0-9_$]*" (:export spec))
+                      (set? (:arities spec)) (not (empty? (:arities spec)))
+                      (every? (fn [n] (and (erlang/is_integer n) (>= n 0))) (:arities spec)))
+         (throw (ex-info "js-actors: invalid native link manifest" {:key key}))))
+     (erlang/put :js-actors-native-links links)
+     (try
    (let [sources (into [(str dir "/runtime.bl")]
                        (concat (map (fn [extra] (str dir "/" extra)) extras)
                                [(str dir "/" app)]))
          ; one bundle = one compilation unit: ANF local names start over
          _ (BeamLisp.Ns.Compiler/reset-fresh!)
          defs (reduce (fn [acc p] (concat acc (compile-source p "js"))) [] sources)]
-     (write-bundle! dir output sources defs))))
+     (write-bundle! dir output sources defs))
+       (finally (erlang/put :js-actors-native-links prior))))))
 
 ; The FIRST build-time auto-placement candidate is deliberately smaller than
 ; "pure BL": a closed chain of nullary defns whose bodies are a literal string
