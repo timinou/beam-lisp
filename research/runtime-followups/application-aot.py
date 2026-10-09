@@ -40,12 +40,17 @@ try:
  # Producer directory is not used by relocated consumers.
  package=OUT/'package';manifest={str(p.relative_to(package)):hashlib.sha256(p.read_bytes()).hexdigest() for p in package.rglob('*.beam')}
  assert manifest
- (package/'manifest.json').write_text(json.dumps({'compiler':build['records'][0]['compiler'],'files':manifest},indent=2)+'\n')
+ expected_compiler=build['records'][0]['compiler']
+ if not args.reuse:
+  (package/'manifest.json').write_text(json.dumps({'compiler':expected_compiler,'files':manifest},indent=2)+'\n')
  relocated=OUT/'relocated';shutil.copytree(package,relocated);shutil.rmtree(package);shutil.move(relocated,package)
  def validate():
-  declared=json.loads((package/'manifest.json').read_text())['files'];actual={str(p.relative_to(package)):hashlib.sha256(p.read_bytes()).hexdigest() for p in package.rglob('*.beam')}
-  return declared==actual
- assert validate();beam=next(package.rglob('*.beam'));raw=beam.read_bytes();beam.write_bytes(raw+b'tamper');assert not validate();beam.write_bytes(raw);assert validate()
+  release=json.loads((package/'manifest.json').read_text());declared=release['files'];actual={str(p.relative_to(package)):hashlib.sha256(p.read_bytes()).hexdigest() for p in package.rglob('*.beam')}
+  return release['compiler']==expected_compiler and declared==actual
+ assert validate()
+ original_manifest=(package/'manifest.json').read_text();wrong=json.loads(original_manifest);wrong['compiler']='wrong-compiler'
+ (package/'manifest.json').write_text(json.dumps(wrong));assert not validate();(package/'manifest.json').write_text(original_manifest)
+ beam=next(package.rglob('*.beam'));raw=beam.read_bytes();beam.write_bytes(raw+b'tamper');assert not validate();beam.write_bytes(raw);assert validate()
  samples=[]
  for i,mode in enumerate(([args.baseline,'artifact','artifact',args.baseline]*((args.samples+1)//2))[:args.samples*2]):
   assert validate();sample=run(mode,i+1);samples.append(sample);print(mode,sample['records'][0],flush=True)
@@ -53,7 +58,7 @@ try:
  for mode in [args.baseline,'artifact']:
   ss=[s for s in samples if s['mode']==mode]
   med[mode]={'load_us':statistics.median(s['records'][0]['us'] for s in ss),'reductions':statistics.median(s['records'][0]['reductions'] for s in ss),'process_seconds':statistics.median(s['process_seconds'] for s in ss)}
- result={'status':'passed','sdk':'24db70e9','app_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=args.app,text=True).strip(),'scope':'16 real Knowledger date/i18n libraries plus two generated fixture namespaces, not full app/server startup','build':build,'samples':samples,'medians':med,'package_beams':len(manifest),'package_bytes':sum(p.stat().st_size for p in package.rglob('*') if p.is_file()),'checks':['relocated package','source-free strict artifact load','target-environment value','initializer once after repeated require','byte tamper rejected before launch','unchanged build compiles zero'],'cache':'fresh VM, existing SDK cache; source control explicitly disables AOT repair (compilation baseline), artifact is source-free; shared filesystem cache may warm'}
+ result={'status':'passed','sdk':'24db70e9','app_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=args.app,text=True).strip(),'scope':'16 real Knowledger date/i18n libraries plus two generated fixture namespaces, not full app/server startup','build':build,'samples':samples,'medians':med,'package_beams':len(manifest),'package_bytes':sum(p.stat().st_size for p in package.rglob('*') if p.is_file()),'checks':['relocated package','source-free strict artifact load','target-environment value','initializer once after repeated require','byte tamper rejected before launch','compiler manifest mismatch rejected before launch','unchanged build compiles zero'],'cache':f'baseline={args.baseline}; source disables repair; current-cold has a fresh artifact cache; current-warm reuses cache; artifact is source-free; shared filesystem cache may warm'}
  (OUT/f'results-{args.baseline}.json').write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result['medians']),flush=True)
 except BaseException as exc:
  (OUT/'failure.json').write_text(json.dumps({'status':'failed','error':repr(exc)},indent=2)+'\n');raise
