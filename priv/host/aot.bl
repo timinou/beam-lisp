@@ -1545,6 +1545,16 @@
     (erlang/error (tuple :unloaded_package_compiler module)))
   (tuple module (erlang/apply module :module_info (list :md5))))
 
+(defn- package_callable_module [module]
+  ;; Core/Rt generated shims add exports as applications define functions.
+  ;; Their fixed compiler-support captures target canonical body functions;
+  ;; bind that implementation rather than unrelated shim export additions.
+  ;; Arbitrary raw code:load_binary shim overrides are outside this contract.
+  (cond
+    (erlang/== module :Elixir.BeamLisp.Ns.Core) :Elixir.BeamLisp.Ns.Body.Core
+    (erlang/== module :Elixir.BeamLisp.Ns.Rt) :Elixir.BeamLisp.Ns.Body.Rt
+    :else module))
+
 (defn- portable_package_terms
   ([values depth budget] (portable_package_terms values depth budget false))
   ([values depth budget rt-operator?]
@@ -1577,7 +1587,7 @@
             name (elem (erlang/fun_info value :name) 1)
             arity (elem (erlang/fun_info value :arity) 1)]
         (if (erlang/== :external type)
-          (tuple (tuple :external_function (package_module_identity module) name arity) remaining)
+          (tuple (tuple :external_function (package_module_identity (package_callable_module module)) name arity) remaining)
           ;; RT seeds variadic arithmetic/comparison operators as local
           ;; closures, sometimes capturing another RT operator. This narrow
           ;; context binds their actual compiled lambda identity and recursively
@@ -1642,13 +1652,164 @@
           result (portable_package_terms values 0 budget)]
       (tuple (tuple ns (elem result 0)) (elem result 1)))))
 
+(defn- package_support_index [names]
+  ;; Only canonical boot namespaces are compiler support. Index function
+  ;; identities, not complete Core/Rt tables or mutable shim export lists.
+  (Enum/reduce names {:functions {} :definitions {} :modules {}}
+    (fn [ns acc]
+      (let [defs (BeamLisp.Env/ns_defs ns)
+            body (Module/concat (list :Elixir.BeamLisp.Ns.Body (Macro/camelize ns)))
+            shim (BeamLisp.Emit/base_module_for ns)]
+        (when (erlang/> (erlang/map_size defs) 2048)
+          (erlang/error :package_support_definition_bound))
+        (Enum/reduce defs
+          (assoc acc :modules (maps/put body ns (maps/put shim ns (:modules acc))))
+          (fn [pair out]
+            (let [name (elem pair 0) entries (elem pair 1) key (tuple ns name)]
+              (when (erlang/not (erlang/is_list entries))
+                (erlang/error :unsupported_package_support_definition))
+              (Enum/reduce entries
+                (assoc out :definitions (maps/put key entries (:definitions out)))
+                (fn [entry result]
+                  (when (erlang/not (and (erlang/is_tuple entry) (erlang/>= (erlang/tuple_size entry) 4)
+                                        (erlang/is_map (elem entry 3))
+                                        (erlang/== :defn-clause (maps/get :op (elem entry 3) nil))))
+                    (erlang/error :unsupported_package_support_entry))
+                  (let [fname (elem entry 2)]
+                    (assoc result :functions
+                      (maps/put (tuple body fname) key
+                        (maps/put (tuple shim fname) key (:functions result))))))))))))))
+
+(defn- package_support_enqueue [state key]
+  (if (maps/is_key key (:seen state)) state
+    (do
+      (when (erlang/>= (erlang/map_size (:seen state)) 4096)
+        (erlang/error :package_support_work_bound))
+      (assoc state :seen (maps/put key true (:seen state))
+                   :todo (erlang/++ (list key) (:todo state))))))
+
+(defn- package_support_callable [state index module name]
+  (let [key (maps/get (tuple module name) (:functions index) nil)
+        ns (maps/get module (:modules index) nil)]
+    (cond
+      key (package_support_enqueue state key)
+      ns (erlang/error (tuple :unknown_package_support_function ns name))
+      ;; Unknown compiled namespace closures may hide arbitrary Env fetches.
+      (String/starts_with? (Atom/to_string module) "Elixir.BeamLisp.Ns.")
+        (erlang/error :unknown_package_support_namespace)
+      :else state)))
+
+(defn- package_support_captures [value state index depth]
+  (when (or (erlang/> depth 64) (erlang/=< (:nodes state) 0))
+    (erlang/error :package_support_walk_bound))
+  (let [next (assoc state :nodes (erlang/- (:nodes state) 1))]
+    (cond
+      (erlang/is_function value)
+        (let [module (elem (erlang/fun_info value :module) 1)
+              name (elem (erlang/fun_info value :name) 1)
+              type (elem (erlang/fun_info value :type) 1)]
+          (if (erlang/== type :external)
+            (package_support_callable next index module name)
+            ;; Normalization has already restricted local closures to RT.
+            (Enum/reduce (elem (erlang/fun_info value :env) 1)
+              (package_support_enqueue
+                (package_support_enqueue next (tuple "rt" "seed-closures"))
+                (tuple "rt" "chain-of"))
+              (fn [v acc] (package_support_captures v acc index (erlang/+ depth 1))))))
+      (erlang/is_tuple value)
+        (Enum/reduce (erlang/tuple_to_list value) next
+          (fn [v acc] (package_support_captures v acc index (erlang/+ depth 1))))
+      (erlang/is_list value)
+        (Enum/reduce value next
+          (fn [v acc] (package_support_captures v acc index (erlang/+ depth 1))))
+      (erlang/is_map value)
+        (Enum/reduce (maps/to_list value) next
+          (fn [v acc] (package_support_captures v acc index (erlang/+ depth 1))))
+      :else next)))
+
+(defn- package_support_global [node state index]
+  (let [ns (maps/get :ns node) name (maps/get :name node)
+        exact? (erlang/== :exact (maps/get :lookup node nil))
+        key (tuple ns name exact?)]
+    (if (maps/is_key key (:fetches state)) state
+      (let [parts (String/split name "/" (list (tuple :parts 2)))
+            prefix (erlang/hd parts)
+            ;; These declarations determine precisely this compiled fetch.
+            ;; Missing declarations are evidence too: a new refer must change
+            ;; the stamp even when the fetched value happens to be equal.
+            declarations (if exact? (list)
+              (list (BeamLisp.Env/lookup (tuple :alias ns prefix))
+                    (BeamLisp.Env/lookup (tuple :refer ns name))))
+            found (if exact? (BeamLisp.Env/lookup (tuple ns name))
+                    (BeamLisp.Env/peek ns name))]
+        (when (erlang/== :error found)
+          (erlang/error (tuple :missing_package_support_value ns name)))
+        (when (erlang/>= (erlang/map_size (:fetches state)) 8192)
+          (erlang/error :package_support_fetch_bound))
+        (let [evidence (portable_package_terms (list declarations found) 0 (:values state) true)
+              next (assoc state :values (elem evidence 1)
+                         :fetches (maps/put key (elem evidence 0) (:fetches state)))]
+          (package_support_captures (elem found 1) next index 0))))))
+
+(defn- package_support_walk [node state index depth]
+  (when (or (erlang/> depth 256) (erlang/=< (:nodes state) 0))
+    (erlang/error :package_support_walk_bound))
+  (let [next (assoc state :nodes (erlang/- (:nodes state) 1))]
+    (cond
+      ;; Quoted payloads and source annotations are data, not executable nodes.
+      (and (erlang/is_map node)
+        (or (erlang/== :lit (maps/get :op node nil))
+            (erlang/== :plit (maps/get :pop node nil)))) next
+      (erlang/is_map node)
+        (let [with-global (if (erlang/== :global (maps/get :op node nil))
+                            (package_support_global node next index) next)
+              with-call (if (erlang/== :remote (maps/get :op node nil))
+                          (package_support_callable with-global index (maps/get :mod node) (maps/get :fun node))
+                          with-global)]
+          (Enum/reduce (maps/values (maps/remove :ann node)) with-call
+            (fn [v acc] (package_support_walk v acc index (erlang/+ depth 1)))))
+      (erlang/is_list node)
+        (Enum/reduce node next
+          (fn [v acc] (package_support_walk v acc index (erlang/+ depth 1))))
+      (erlang/is_tuple node)
+        (Enum/reduce (erlang/tuple_to_list node) next
+          (fn [v acc] (package_support_walk v acc index (erlang/+ depth 1))))
+      :else next)))
+
+(defn- package_support_drain [state index]
+  (if (erlang/== (list) (:todo state)) state
+    (let [key (erlang/hd (:todo state))
+          entries (maps/get key (:definitions index) nil)]
+      (when (erlang/== nil entries)
+        (erlang/error :missing_package_support_definition))
+      (let [ns (elem key 0)
+            body (Module/concat (list :Elixir.BeamLisp.Ns.Body (Macro/camelize ns)))
+            next (assoc state :todo (erlang/tl (:todo state))
+                         :code (maps/put body (package_module_identity body) (:code state)))
+            walked (Enum/reduce entries next
+                     (fn [entry acc] (package_support_walk (elem entry 3) acc index 0)))]
+        (package_support_drain walked index)))))
+
+(defn- package_support_projection [stages names budget]
+  (let [index (package_support_index names)
+        initial {:todo (list) :seen {} :fetches {} :code {} :nodes 1000000 :values budget}
+        seeded (Enum/reduce stages initial
+                 (fn [ns state]
+                   (Enum/reduce (maps/keys (BeamLisp.Env/ns_defs ns)) state
+                     (fn [name acc] (package_support_enqueue acc (tuple ns name))))))
+        result (package_support_drain seeded index)]
+    (tuple (tuple :compiler_support
+                   (Enum/sort (maps/to_list (:fetches result)))
+                   (Enum/sort (maps/to_list (:code result)))) (:values result))))
+
 (defn local_package_authority
   "Portable closed compiler authority for realm release artifacts. Bind actual
    callable/value definitions and installed code, not generation counters or
    mutable Core shim exports. Unsupported live overrides decline."
   []
   (try
-    (let [names (list "core" "sugar" "rt" "compiler" "lower" "anf")
+    (let [names (list "core" "sugar" "rt" "compiler" "lower" "anf" "reader-node" "diag" "reader")
+          epoch (BeamLisp.Env/publication_epoch)
           before (BeamLisp.Env/namespace_generations names)]
       (when (and before (Enum/all? before (fn [row]
                         (or (erlang/== :global (elem row 0)) (erlang/== 0 (elem row 2))))))
@@ -1671,10 +1832,12 @@
                               (when (or (erlang/== :error found) (erlang/== :error link))
                                 (erlang/error :missing_package_core_operator))
                               (tuple n (elem found 1) (elem link 1)))))
-              normalized_ops (portable_package_terms operators 0 (elem bindings 1) true)]
-          (when (erlang/== before (BeamLisp.Env/namespace_generations names))
+              normalized_ops (portable_package_terms operators 0 (elem bindings 1) true)
+              support (package_support_projection stages names (elem normalized_ops 1))]
+          (when (and (erlang/== epoch (BeamLisp.Env/publication_epoch))
+                     (erlang/== before (BeamLisp.Env/namespace_generations names)))
             (Base/encode16 (crypto/hash :sha256 (erlang/term_to_binary
-                             (tuple :realm_package_compiler_v2 code (elem bindings 0) (elem normalized_ops 0))))
+                             (tuple :realm_package_compiler_v3 code (elem bindings 0) (elem normalized_ops 0) (elem support 0))))
                (list (tuple :case :lower)))))))
     (catch _ nil)))
 
