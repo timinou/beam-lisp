@@ -91,3 +91,24 @@ promote the actor backend to the ordinary build's sole execution model.
 
 `native-module-test.bl` checks normal-build emission, source privacy, export
 mangling, fixed/variadic contracts, and staging without application initialization.
+
+### Canonical values and artifact identity
+
+Actor frames now reuse `priv/lib/js/rt.mjs` keywords, lists, tuples,
+vector tries, persistent HAMT maps and sets. Map updates share tree nodes;
+they no longer clone the whole table. Mutable actor tables remain distinct,
+runtime-bound host handles with explicit destruction and capacity limits.
+Record adapters use canonical maps tagged with `:__struct__`.
+
+When packaging the host, call `write-runtime! source-dir output-dir value-url`.
+The URL must name the **same module** imported by the frontend's compiled
+modules. Copying `rt.mjs` into an actor-specific directory creates separate
+keyword caches and classes and breaks identity. For Pelagic's existing layout,
+the host at `pkg/pelagic/actor/host.mjs` binds `../../../out/rt.mjs`.
+The source-tree host uses the source-tree canonical runtime; the research HTTP
+server explicitly serves its two runtime dependencies.
+
+This migration does not yet unify callable dispatch, numeric float boxing,
+compiled core/prelude ownership, or the two lowering entrypoints. Those remain
+tracked consolidation work. Native JS objects retain identity and native JS
+numbers remain native at the explicit interop boundary.

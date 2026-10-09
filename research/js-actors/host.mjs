@@ -5,8 +5,7 @@
 // OWNERSHIP SPLIT (the point of the prototype; see README.md):
 //
 //   THIS FILE owns exactly four things, none of which is actor policy:
-//     1. the value representation (keyword / list / tuple / vector / map /
-//        record) and leaf operations over it,
+//     1. adapters to the canonical JS value runtime and host leaf operations,
 //     2. the machine that drives compiled BL generators — the control ABI
 //        (call / tail / park / host-wait) and its frame stack. A turn that died
 //        REPORTS the thrown value's class and reason; what a reason then means
@@ -29,27 +28,13 @@
 
 // ── values ───────────────────────────────────────────────────────────────────
 
-/** A keyword. Interned so identity and equality agree for the same name. */
-export class KW {
-  constructor(n) { this.n = n; }
-  toString() { return ":" + this.n; }
-}
-
-const kwCache = new Map();
-export function kw(n) {
-  let k = kwCache.get(n);
-  if (k === undefined) { k = new KW(n); kwCache.set(n, k); }
-  return k;
-}
+// One value implementation for both direct calls and actor frames. The actor
+// machine owns control; it does not own a competing scalar/list/tuple model.
+import * as V from '../../priv/lib/js/rt.mjs';
+export const KW=V.Kw,kw=V.kw;
 export function isKw(x) { return x instanceof KW; }
-export function kwName(x) { return x.n; }
-
-/** A cons cell. A beam-lisp list is a chain of these ending in ENIL. */
-export class Cons {
-  constructor(h, t) { this.h = h; this.t = t; }
-}
-/** The empty list — distinct from `nil`, which is `null`. */
-export const ENIL = Object.freeze({ __enil: true });
+export function kwName(x) { return x.fq; }
+export const Cons=V.Cons,ENIL=V.EMPTY;
 export function isEnil(x) { return x === ENIL; }
 export function isCons(x) { return x instanceof Cons; }
 export function cons(h, t) { return new Cons(h, t); }
@@ -81,9 +66,7 @@ export function listToArray(l) {
 }
 
 /** A data tuple (Erlang tuple). */
-export class T {
-  constructor(items) { this.items = items; }
-}
+export const T=V.Tup;
 export function tup(items) { return new T(items); }
 export function isTup(x) { return x instanceof T; }
 export function tupEl(x, i) { return x.items[i]; }
@@ -91,101 +74,62 @@ export function tupSize(x) { return x.items.length; }
 
 /** A record / struct: `%Mod{...}` and, notably, a beam-lisp Vector. */
 export function struct(mod, fields) {
-  const o = { __struct: mod };
-  for (const k of Object.keys(fields)) o[k] = fields[k];
-  return o;
+  if (mod === VECTOR_MOD) return vecFromArray(fields.items.items);
+  let m = V.EMPTY_MAP.assoc(kw("__struct__"), kw(mod));
+  for (const [k,v] of Object.entries(fields)) m = m.assoc(kw(k),v);
+  return m;
 }
-export function isStruct(x) { return !!x && typeof x === "object" && typeof x.__struct === "string"; }
-export function structMod(x) { return x.__struct; }
-export function structField(x, name) { return x[name]; }
+export function isStruct(x) { return isVec(x) || (x instanceof V.HMap && x.get(kw("__struct__")) instanceof KW); }
+export function structMod(x) { return isVec(x) ? VECTOR_MOD : kwName(x.get(kw("__struct__"))); }
+export function structField(x, name) { return isVec(x) && name === "items" ? tup(vecItems(x)) : x.get(kw(name)); }
 
 export const VECTOR_MOD = "Elixir.BeamLisp.Vector";
-export function isVec(x) { return isStruct(x) && x.__struct === VECTOR_MOD; }
-export function vecFromArray(items) { return struct(VECTOR_MOD, { items: new T(items) }); }
+export function isVec(x) { return x instanceof V.Vec; }
+export function vecFromArray(items) { return V.vecFromArray(items); }
 export function vec(items) { return vecFromArray(items); }
-export function vecItems(x) { return x.items.items; }
-export function vecSize(x) { return x.items.items.length; }
-export function vecEl(x, i) { return x.items.items[i]; }
-export function vecAppend(v, x) { return vecFromArray(vecItems(v).concat([x])); }
+export function vecItems(x) { return x.toArray(); }
+export function vecSize(x) { return x.cnt; }
+export function vecEl(x, i) { return x.nth(i); }
+export function vecAppend(v, x) { return v.conj(x); }
 export function vecRemove(v, i) { return vecFromArray(vecItems(v).filter((_, k) => k !== i)); }
 export function vecToList(v) { return listFromArray(vecItems(v)); }
 export function vecFromList(l) { return vecFromArray(listToArray(l)); }
 
 export const SET_MOD = "Elixir.BeamLisp.Set";
-/** A beam-lisp set: an element table filed under `hashKey`, exactly like a
- *  `BMap`'s keys, so membership and equality are the target's existing
- *  structural ones and two equal elements are one member. Enumeration order is
- *  BEAM's small-map key order (`keyOrder`), the same order `mapKeys` uses. */
-export class BSet {
-  constructor(m) { this.m = m; }
-}
-export function bset(elems) {
-  const m = new Map();
-  for (const e of elems) m.set(hashKey(e), e);
-  return new BSet(m);
-}
+/** Canonical persistent set; enumeration retains the measured actor order. */
+export const BSet = V.HSet;
+export function bset(elems) { let s = V.EMPTY_SET; for (const e of elems) s = s.conj(e); return s; }
 export function isSet(x) { return x instanceof BSet; }
 export function setFromList(l) { return bset(listToArray(l)); }
-export function setHas(s, x) { return s instanceof BSet && s.m.has(hashKey(x)); }
-export function setPut(s, x) {
-  const m = new Map(s instanceof BSet ? s.m : []);
-  m.set(hashKey(x), x);
-  return new BSet(m);
-}
-export function setRemove(s, x) {
-  const m = new Map(s instanceof BSet ? s.m : []);
-  m.delete(hashKey(x));
-  return new BSet(m);
-}
-export function setSize(s) { return s instanceof BSet ? s.m.size : 0; }
-export function setElements(s) { return s instanceof BSet ? [...s.m.values()].sort(keyOrder) : []; }
+export function setHas(s, x) { return isSet(s) && s.has(x); }
+export function setPut(s, x) { return (isSet(s) ? s : V.EMPTY_SET).conj(x); }
+export function setRemove(s, x) { return (isSet(s) ? s : V.EMPTY_SET).disj(x); }
+export function setSize(s) { return isSet(s) ? s.cnt : 0; }
+export function setElements(s) { return isSet(s) ? [...s].sort(keyOrder) : []; }
 export function setToList(s) { return listFromArray(setElements(s)); }
 
-/** A beam-lisp map. Keys are canonical strings so structural equality is a
- *  string compare, exactly as `RT.hash_key/1` makes BEAM map keys canonical. */
-export class BMap {
-  constructor(m) { this.m = m; }
-}
-export function bmap(pairs) {
-  const m = new Map();
-  for (const p of pairs) m.set(hashKey(p[0]), p);
-  return new BMap(m);
-}
+/** Canonical persistent HAMT. Actor frames and direct modules share values. */
+export const BMap = V.HMap;
+export function bmap(pairs) { let m = V.EMPTY_MAP; for (const [k,v] of pairs) m = m.assoc(k,v); return m; }
 export function isBMap(x) { return x instanceof BMap; }
 export function isMap(x) { return isBMap(x); }
-export function mapHas(m, k) { return m instanceof BMap && m.m.has(hashKey(k)); }
-export function mapGet(m, k, dflt) {
-  if (m === null || m === undefined) return dflt === undefined ? null : dflt;
-  if (m instanceof BMap) {
-    const e = m.m.get(hashKey(k));
-    return e === undefined ? (dflt === undefined ? null : dflt) : e[1];
-  }
-  if (isStruct(m)) { const v = m[kwName(k)]; return v === undefined ? (dflt === undefined ? null : dflt) : v; }
-  return dflt === undefined ? null : dflt;
+export function mapHas(m, k) { return isBMap(m) && m.has(k); }
+export function mapGet(m, k, dflt = null) {
+  if (isBMap(m)) return m.get(k, dflt);
+
+  return dflt;
 }
-export function mapPut(m, k, v) {
-  const out = m instanceof BMap ? new BMap(new Map(m.m)) : new BMap(new Map());
-  out.m.set(hashKey(k), [k, v]);
-  return out;
-}
-export function mapKeys(m) {
-  // Enumerate in BEAM's small-map key order (`keyOrder`), the ONE ordering
-  // maps and sets share: `keys`, `vals`, map `seq`, printing and `reduce`.
-  return listFromArray(m instanceof BMap ? [...m.m.values()].map(p => p[0]).sort(keyOrder) : []);
-}
-export function mapRemove(m, k) {
-  const out = m instanceof BMap ? new BMap(new Map(m.m)) : new BMap(new Map());
-  out.m.delete(hashKey(k));
-  return out;
-}
-export function emptyMap() { return new BMap(new Map()); }
-export function mapSize(m) { return m instanceof BMap ? m.m.size : 0; }
+export function mapPut(m, k, v) { return (isBMap(m) ? m : V.EMPTY_MAP).assoc(k,v); }
+export function mapKeys(m) { return listFromArray(isBMap(m) ? [...m].map(p => p[0]).sort(keyOrder) : []); }
+export function mapRemove(m, k) { return (isBMap(m) ? m : V.EMPTY_MAP).dissoc(k); }
+export function emptyMap() { return V.EMPTY_MAP; }
+export function mapSize(m) { return isBMap(m) ? m.cnt : 0; }
 
 // ── mutable tables (host storage primitive) ─────────────────────────────────
 //
 // A TABLE is SHARED MUTABLE state: the host keeps ONE native `Map` and updates
 // it IN PLACE, so a row write is amortized O(1) in the table's size — unlike
-// `mapPut`, which copies the whole map and answers a NEW value. That difference
+// `mapPut`, which shares persistent HAMT nodes and answers a NEW value. That difference
 // is the reason this primitive exists, and the reason a table is NOT a BL map
 // and has no alias to one: `is-map` is false for a handle, and `mapPut` never
 // sees one.
@@ -339,7 +283,7 @@ export function keyOrder(a, b) {
     case 1: {                                     // atom
       const fa = atomRank(a), fb = atomRank(b);
       if (fa !== fb) return fa < fb ? -1 : 1;
-      if (isKw(a) && isKw(b)) return strCmp(a.n, b.n);
+      if (isKw(a) && isKw(b)) return strCmp(kwName(a), kwName(b));
       return 0;
     }
     case 2: return cmpItems(a.items, b.items);    // tuple
@@ -393,7 +337,7 @@ function cmpMapish(a, b) {
 function mapishEntries(x) {
   if (x instanceof BSet) return setElements(x).map(e => [e, null]);
   if (isVec(x)) return vecItems(x).map((e, i) => [i, e]);
-  if (x instanceof BMap) return [...x.m.values()].map(p => p).sort((p, q) => keyOrder(p[0], q[0]));
+  if (x instanceof BMap) return [...x].sort((p, q) => keyOrder(p[0], q[0]));
   return Object.keys(x).filter(k => k !== "__struct").sort().map(k => [x[k], null]);
 }
 export function hashKey(x) {
@@ -408,20 +352,16 @@ export function hashKey(x) {
   // range normalizes back to a Number (see `arith`).
   if (t === "bigint") return "n:" + x;
   if (t === "string") return "s" + x.length + ":" + x;
-  if (x instanceof KW) return "k" + x.n.length + ":" + x.n;
+  if (x instanceof KW) return "k" + kwName(x).length + ":" + kwName(x);
   if (x === ENIL) return "l:()";
   if (x instanceof Cons) return enc("l", [hashKey(x.h), hashKey(x.t)]);
   if (x instanceof T) return enc("t", x.items.map(hashKey));
-  if (isStruct(x)) {
-    if (isVec(x)) return enc("v", vecItems(x).map(hashKey));
-    const keys = Object.keys(x).filter(k => k !== "__struct").sort();
-    return enc("r", [x.__struct].concat(keys.flatMap(k => [k, hashKey(x[k])])));
-  }
+  if (isVec(x)) return enc("v", vecItems(x).map(hashKey));
   if (x instanceof BMap) {
-    const keys = [...x.m.keys()].sort();
-    return enc("m", keys.flatMap(k => [k, hashKey(x.m.get(k)[1])]));
+    const entries = [...x].map(([k,v]) => [hashKey(k), hashKey(v)]).sort((a,b) => strCmp(a[0],b[0]));
+    return enc("m", entries.flat());
   }
-  if (x instanceof BSet) return enc("s", [...x.m.keys()].sort());
+  if (x instanceof BSet) return enc("s", [...x].map(hashKey).sort());
   if (typeof x === "function" || x.__blfn) return "f:" + (x.__id ||= ++idCounter);
   return "o:" + (x.__id ||= ++idCounter);
 }
@@ -432,37 +372,12 @@ let idCounter = 0;
 // identity allocation only — no actor policy.
 let runtimeIdCounter = 0;
 
-// `=` treats a proper list and a vector as ONE sequential family, as BEAM does
-// (:sequential-family-is-one-value: `(= [1 2] '(1 2))`). Map KEYS do not:
-// on BEAM `(get {[1 2] :v} '(1 2))` is nil, so `hashKey` keeps the two apart
-// and only equality normalizes (order-parity "sequential-family" pins both).
-function eqKey(x) {
-  if (x instanceof Cons || x === ENIL) {
-    const items = [];
-    let c = x;
-    while (c instanceof Cons) { items.push(eqKey(c.h)); c = c.t; }
-    if (c === ENIL) return enc("v", items);
-    return enc("l", items.concat([eqKey(c)]));
-  }
-  if (isVec(x)) return enc("v", vecItems(x).map(eqKey));
-  if (x instanceof T) return enc("t", x.items.map(eqKey));
-  if (x instanceof BMap) {
-    const keys = [...x.m.keys()].sort();
-    return enc("m", keys.flatMap(k => [k, eqKey(x.m.get(k)[1])]));
-  }
-  if (x instanceof BSet) return enc("s", [...x.m.keys()].sort());
-  return hashKey(x);
-}
-export function eq(a, b) {
-  if (a === b) return true;
-  if (a === null || a === undefined || b === null || b === undefined) return a === b;
-  return eqKey(a) === eqKey(b);
-}
+// Language equality is owned by the canonical runtime, including numeric,
+// sequential-family, improper-list and collection rules. The injective codec
+// above is only for bounded mutable host-table keys.
+export const eq = V.eqv;
 
-// Strings order by CODE POINT, which is the byte order of their UTF-8 form —
-// the order BEAM compares binaries in. JavaScript's own `<` compares UTF-16
-// code units, which puts U+1F600 before U+FF5E; this does not.
-export function strCmp(a, b) {
+function strCmp(a, b) {
   if (typeof a !== "string" || typeof b !== "string")
     throw new Error("string order needs two strings, got " + describe(a) + " and " + describe(b));
   const n = Math.min(a.length, b.length);
@@ -482,12 +397,12 @@ export function lt(a, b) {
 
 export function describe(x) {
   if (x === null || x === undefined) return "nil";
-  if (x instanceof KW) return ":" + x.n;
+  if (x instanceof KW) return ":" + kwName(x);
   if (x instanceof Cons || x === ENIL) { try { return "(" + listToArray(x).map(describe).join(" ") + ")"; } catch (_) { return "(improper list)"; } }
   if (x instanceof T) return "{" + x.items.map(describe).join(", ") + "}";
   if (isVec(x)) return "[" + vecItems(x).map(describe).join(" ") + "]";
   if (x instanceof BSet) return "#{" + setElements(x).map(describe).join(" ") + "}";
-  if (isStruct(x)) return "#" + x.__struct + "{}";
+  if (isStruct(x)) return "#" + structMod(x) + "{}";
   // `mapKeys` answers a BL LIST (it is the language's own `keys`), so it has to
   // be walked with `listToArray` before JavaScript's `.map` sees an array.
   if (x instanceof BMap) return "{" + listToArray(mapKeys(x)).map(k => describe(k) + " " + describe(mapGet(x, k))).join(", ") + "}";
@@ -506,7 +421,7 @@ export function toStr(x) {
   if (x === null || x === undefined) return "nil";
   if (x === true) return "true";
   if (x === false) return "false";
-  if (x instanceof KW) return x.n;
+  if (x instanceof KW) return kwName(x);
   if (typeof x === "number" || typeof x === "bigint") return String(x);
   return describe(x);
 }
@@ -579,7 +494,7 @@ export function arith(op, a, b) {
 // ── control steps ────────────────────────────────────────────────────────────
 //
 // A step is a HOST object, never a BL value: a BL map is a `BMap`, a BL tuple
-// is a `T`, a record is a `{__struct}`. A user value that "looks like" a step
+// is a `T`, a record is a canonical map with a `:__struct__` tag. A user value that "looks like" a step
 // therefore stays data, as the design requires.
 
 export class Step {
@@ -690,7 +605,7 @@ function rawReason(x) {
  *  the reason's own `:message` over its printed form. */
 export function exceptionText(e) {
   if (!isRaise(e)) return String((e && e.stack) || e);
-  const kind = isKw(e.kind) ? e.kind.n : String(e.kind);
+  const kind = isKw(e.kind) ? kwName(e.kind) : String(e.kind);
   return "(" + kind + ") " + describeReason(e.reason);
 }
 function describeReason(reason) {
@@ -721,7 +636,7 @@ export function resolveCallee(f, args) {
     }
     throw new Error("no arity " + arity + " on fn " + (f.name || "?"));
   }
-  if (isTup(f) && f.items.length === 3 && isKw(f.items[0]) && f.items[0].n === "$blfn") {
+  if (isTup(f) && f.items.length === 3 && isKw(f.items[0]) && kwName(f.items[0]) === "$blfn") {
     const fixed = f.items[1]; // a BL map arity → fn
     const hit = mapGet(fixed, arity);
     if (hit !== null && hit !== undefined) return resolveCallee(hit, args);
@@ -1240,8 +1155,8 @@ export const RT_HOST = {
   write: (rt, s) => { rt.out(toStr(s)); return null; },
   emit: (rt, topic, value) => {
     if (!isKw(topic)) throw new Error("host/emit: topic must be a keyword");
-    if (emitSink === null) throw new Error("host/emit: no transport installed for :" + topic.n);
-    emitSink(topic.n, value);
+    if (emitSink === null) throw new Error("host/emit: no transport installed for :" + kwName(topic));
+    emitSink(kwName(topic), value);
     return null;
   },
   raise: (rt, msg) => { throw new Error(toStr(msg)); },
@@ -1366,12 +1281,11 @@ export const ERLANG = {
       throw new Error(":erlang.element/2 index " + i + " is outside a " + t.items.length + "-tuple");
     return t.items[i - 1];
   },
-  "is_map_key": (k, m) => m instanceof BMap && m.m.has(hashKey(k)),
+  "is_map_key": (k, m) => mapHas(m, k),
   "map_get": (k, m) => {
     if (!(m instanceof BMap)) throw new Error(":erlang.map_get/2 needs a map, got " + describe(m));
-    const e = m.m.get(hashKey(k));
-    if (e === undefined) throw new Error(":erlang.map_get/2: no key " + describe(k));
-    return e[1];
+    if (!m.has(k)) throw new Error(":erlang.map_get/2: no key " + describe(k));
+    return m.get(k);
   },
 };
 

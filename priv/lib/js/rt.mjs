@@ -432,7 +432,7 @@ export function hashOf(x) {
   if (x === null || x === undefined) return 0;
   switch (typeof x) {
     case "number": return numHash(x);
-    case "bigint": return strHash(x.toString());
+    case "bigint": return Number(BigInt.asIntN(32, x)) ^ Number(BigInt.asIntN(32, x / 4294967296n));
     case "string": return strHash(x);
     case "boolean": return x ? 1231 : 1237;
     case "function": return fnId(x);
@@ -536,7 +536,8 @@ export function eqv(a, b) {
     if (o instanceof Flt) return Number(d.plain()) === o.v;
     return decCmp(d, o) === 0;
   }
-  if (isNumV(a)) return isNumV(b) && Number(numOf(a)) === Number(numOf(b)) && (typeof a !== "bigint" || typeof b !== "bigint" || a === b);
+  // JS numeric equality compares BigInt/Number without rounding the BigInt.
+  if (isNumV(a)) return isNumV(b) && numOf(a) == numOf(b); // eslint-disable-line eqeqeq
   const ta = typeof a;
   if (ta !== "object" || typeof b !== "object") return false;
   if (isSeqColl(a)) return isSeqColl(b) && seqEqv(a, b, eqv);
@@ -549,6 +550,16 @@ export function eqv(a, b) {
 function isSeqColl(x) { return x instanceof Vec || x instanceof Cons || x === EMPTY; }
 function isNumV(x) { return typeof x === "number" || typeof x === "bigint" || x instanceof Flt; }
 function seqEqv(a, b, eq) {
+  // Improper lists include their tail in the value; iteration alone loses it.
+  if ((a instanceof Cons && a.n < 0) || (b instanceof Cons && b.n < 0)) {
+    if (!(a instanceof Cons) || !(b instanceof Cons)) return false;
+    let p = a, q = b;
+    while (p instanceof Cons && q instanceof Cons) {
+      if (!eq(p.h, q.h)) return false;
+      p = p.t; q = q.t;
+    }
+    return !(p instanceof Cons) && !(q instanceof Cons) && eq(p,q);
+  }
   const ia = iter(a), ib = iter(b);
   for (;;) {
     const x = ia.next(), y = ib.next();
