@@ -177,6 +177,12 @@ worst kind of configuration bug.
   measured from those two directories, never declared — coverage, the gap, the
   token escapes, the unlabelled inputs. See [tooling/catalog](../../priv/lib/tooling/catalog.bl)
   and the session dashboard's Catalog pane.
+- `:android` — `{:app :ns :id :label :abi}`: this tree is an Android app.
+  `:app` is its OTP application name (lowercase, underscores), `:ns` the
+  namespace whose `navigation`/`on-start` boot it (default `<app>.app`), `:id`
+  the Android application id (default `org.beamlisp.<app>`), `:label` the
+  launcher name, `:abi` the one ABI built (default `x86_64`, the emulator's).
+  See [android](android.bl.md).
 
 Every normalizer is total: it returns what it understood plus one error string
 per thing it could not. `normalize` collects them, so a file with three
@@ -184,7 +190,7 @@ problems reports all three in one pass.
 
 ```beam-lisp silent
 (def known-keys [:name :instance :bl :warm :vm :realm :shadow :uses :paths :tasks :ports
-                 :schedules :env :loading :doc :app :build :release :deps :browser :catalog :foundry])
+                 :schedules :env :loading :doc :app :build :release :deps :browser :catalog :foundry :android])
 
 ;; How `bl` reaches a warm VM for this tree. The LAUNCHER reads this key (it must
 ;; decide before any VM exists), so the vocabulary lives in
@@ -530,6 +536,30 @@ problems reports all three in one pass.
            nil)
          errs])))
 
+(defn- norm-android
+  "`:android` — an Android app. `:app` is required; everything else defaults
+   from it, so the smallest declaration is `{:app \"people\"}`."
+  [v]
+  (cond
+    (nil? v) [nil []]
+    (not (map? v)) [nil [":android must be a map"]]
+    :else
+      (let [app (:app v)
+            errs (concat
+                   (if (string? app) [] [":android needs :app, a string"])
+                   (keep (fn [k] (when (and (some? (get v k)) (not (string? (get v k))))
+                                   (str ":android " k " must be a string")))
+                         [:ns :id :label :abi])
+                   (unknown-errs v [:app :ns :id :label :abi] ":android"))]
+        (if (empty? errs)
+          [{:app app
+            :ns (or (:ns v) (str app ".app"))
+            :id (or (:id v) (str "org.beamlisp." app))
+            :label (:label v)
+            :abi (or (:abi v) "x86_64")}
+           []]
+          [nil errs]))))
+
 (def NAME-CHARS "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 (def HEX-CHARS "0123456789abcdef")
 (def HASH-PREFIX "sha256:")
@@ -828,7 +858,8 @@ shape, whatever the file said.
         [deps derr]    (norm-deps (:deps m))
         [fnd fnderr]   (norm-foundry (:foundry m) root)
         [brw brerr]    (norm-browser (:browser m))
-        [cat cerr]     (norm-catalog (:catalog m) root)]
+        [cat cerr]     (norm-catalog (:catalog m) root)
+        [andr anderr]  (norm-android (:android m))]
     {:path path
      :root root
      :name (if (string? nm) nm nil)
@@ -852,8 +883,9 @@ shape, whatever the file said.
      :foundry fnd
      :browser brw
      :catalog cat
+     :android andr
      :errors (concat perr nerr ierr blerr werr vmerr rlmerr shderr useserr terr porerr serr eerr aerr berr rerr derr
-                     fnderr brerr cerr lerr
+                     fnderr brerr cerr lerr anderr
                      (map (fn [k] (str "unknown key " k)) (unknown-keys m known-keys)))}))
 
 (defn empty-project
@@ -863,7 +895,7 @@ shape, whatever the file said.
   {:path nil :root root :name nil :instance nil :bl nil :warm nil :vm nil
    :realm nil :shadow [] :uses {} :paths [] :tasks {} :ports {}
    :schedules []
-   :env {} :loading loading/DEFAULTS :app nil :build nil :release nil :deps [] :browser nil :catalog nil
+   :env {} :loading loading/DEFAULTS :app nil :build nil :release nil :deps [] :browser nil :catalog nil :android nil
    :errors []})
 ```
 

@@ -1,0 +1,193 @@
+(ns android.loom
+  "A loom view as a phone screen. The page is loom — the same components, the
+   same `:on-click [:inc]` events, the same view and reducer a desktop window
+   or a web page takes — painted in the phone's WebView:
+
+     (ns people.board
+       (:require [android.loom :refer [defloom]] [loom.ui :as ui]))
+
+     (defn view [n] (ui/button {:on-click [:inc]} (str \"taps: \" n)))
+     (defn on-event [n ev] (if (= ev [:inc]) (+ n 1) n))
+
+     (defloom {:title \"Board\" :init (fn [_params] 0) :view view :on-event on-event})
+
+   `defloom` makes the namespace a mob screen (put it AFTER the fns it names).
+   Spec keys:
+     :view      (fn [state] → loom hiccup)                        REQUIRED
+     :on-event  (fn [state ev] → state)
+     :init      (fn [params] → state) — runs once, at mount (subscribe here)
+     :state     the initial state, when there is no :init
+     :title     the page title
+
+   EVERY message the screen gets goes through `on-event`: a tap on the page
+   arrives as the term the view wrote, and anything else sent to the screen —
+   an `android.events` delivery like `[:android :notify/posted n]`, an
+   `(emit! ev)` from the desk — arrives as itself. One reducer, one state.
+
+   The transport is mob's WebView. Down, the new frame goes as one line of
+   JavaScript (`webview_eval_js`); up, the page's `bl.send` posts through
+   `MobNative.postMessage`. Both cross JNI as modified UTF-8, so both
+   directions travel as ASCII with `\\uXXXX` escapes and an emoji survives.
+   The first frame travels as a `data:` URL; when the page is recreated (the
+   WebView came back after the activity did) it announces itself and gets
+   the CURRENT frame. A link the page opens leaves in the system browser.
+
+   `js` reads the live page from anywhere — a test on the desk included:
+     (android.loom/js \"document.querySelector('button').textContent\")"
+  (:require [loom.surface :as surface]
+            [android.screen]
+            [android.app :as app]
+            [android.ui :as ui]
+            [android.jvm :as jvm]))
+
+;; ── the page's end of the seam ──────────────────────────────────────────
+;;
+;; `bl.send(string)` for the hook. JNI hands the string over as modified UTF-8,
+;; so every non-ASCII UTF-16 unit is escaped first: the payload is JSON, and
+;; non-ASCII can only sit inside its string literals, where `\uXXXX` means the
+;; same thing.
+
+(def shim
+  (str "window.bl={send:function(s){MobNative.postMessage(String(s).replace("
+       "/[\\u0080-\\uffff]/g,function(c){return '\\\\u'+('000'+c.charCodeAt(0).toString(16)).slice(-4);}));}};"))
+
+(defn data-url
+  "An HTML document as a `data:` URL (mob's WebView only loads URLs)."
+  [html]
+  (str "data:text/html;charset=utf-8;base64," (base64/encode html)))
+
+(defn page-url
+  "The first-paint URL for `spec` showing `state`."
+  [spec state]
+  (data-url (surface/document (surface/frame (:view spec) state)
+                              {:title (or (:title spec) "beam-lisp") :shim shim})))
+
+;; ── the pure core: a message in, the new loom state and what to do out ──
+;;
+;; A screen's loom assigns are `{:state s :url u :pending {id pid}}`. `react`
+;; answers each message with those assigns updated and a list of actions:
+;;   [:eval js]            run js in the page
+;;   [:reply pid id res]   a probe came back: tell whoever asked
+;;   [:open url]           the page tried to leave: open url in the browser
+
+(defn init
+  "The loom assigns a screen mounts with."
+  [spec params]
+  (let [s (if (:init spec) ((:init spec) params) (:state spec))]
+    {:state s :url (page-url spec s) :pending {}}))
+
+(defn- fold [spec lm ev]
+  (let [[s js] (surface/step (:view spec) (or (:on-event spec) (fn [s _] s)) (:state lm) ev)]
+    [(assoc lm :state s) (if js [[:eval js]] [])]))
+
+(defn- webview-message? [msg kind]
+  (and (erlang/is_tuple msg) (= 3 (erlang/tuple_size msg))
+       (= :webview (erlang/element 1 msg)) (= kind (erlang/element 2 msg))))
+
+(defn- probe? [msg]
+  (and (erlang/is_tuple msg) (= 4 (erlang/tuple_size msg))
+       (= :loom_probe (erlang/element 1 msg))))
+
+(defn react
+  "`[lm' actions]` for message `msg` on loom assigns `lm`."
+  [spec lm msg]
+  (cond
+    (webview-message? msg :message)
+    (let [ev (surface/parse-event (erlang/element 3 msg))
+          r (surface/reserved ev)]
+      (case (first r)
+        :ready [lm [[:eval (surface/repaint-js (:view spec) (:state lm))]]]
+        :height [lm []]
+        :reply (let [id (nth r 1) from (get (:pending lm) id)]
+                 [(assoc lm :pending (dissoc (:pending lm) id))
+                  (if from [[:reply from id (nth r 2)]] [])])
+        (fold spec lm ev)))
+
+    (webview-message? msg :blocked) [lm [[:open (erlang/element 3 msg)]]]
+
+    (probe? msg)
+    (let [from (erlang/element 2 msg) id (erlang/element 3 msg)]
+      [(assoc lm :pending (assoc (:pending lm) id from))
+       [[:eval (surface/probe-js id (erlang/element 4 msg))]]])
+
+    :else (fold spec lm msg)))
+
+;; ── the host: mob callbacks that carry the actions out ──────────────────
+
+(defn- eval-js! [js] (mob_nif/webview_eval_js (surface/ascii js)))
+
+(defn open-url!
+  "Open `url` outside the app (the browser, or whichever app owns the link)."
+  [url]
+  (let [uri (jvm/static "android.net.Uri" :parse url)
+        i (jvm/new "android.content.Intent" "android.intent.action.VIEW" uri)]
+    (jvm/call i :add-flags 268435456) ; FLAG_ACTIVITY_NEW_TASK
+    (jvm/call (jvm/ctx) :start-activity i)
+    (jvm/release i uri)
+    :ok))
+
+(defn- run! [action]
+  (case (first action)
+    :eval (eval-js! (nth action 1))
+    :reply (erlang/send (nth action 1) [:loom/reply (nth action 2) (nth action 3)])
+    :open (try (open-url! (nth action 1)) (catch _ nil))
+    nil))
+
+(defn mount
+  "mob's `mount` for a loom screen."
+  [spec params socket]
+  (tuple :ok (app/assign socket :loom (init spec params))))
+
+(defn render
+  "mob's `render` for a loom screen: one WebView, its URL fixed at mount (the
+   page updates itself; a new URL would reload it)."
+  [assigns]
+  (ui/el :web-view {:url (:url (:loom assigns)) :allow "data:" :show-url false}))
+
+(defn handle-info
+  "mob's `handle_info` for a loom screen."
+  [spec msg socket]
+  (let [[lm actions] (react spec (:loom (app/assigns socket)) msg)]
+    (doseq [a actions] (run! a))
+    (tuple :noreply (app/assign socket :loom lm))))
+
+(defmacro defloom
+  "Make this namespace a mob screen that shows a loom view (see the ns doc)."
+  [spec]
+  `(do
+     (android.screen/defscreen {})
+     (defn ~'mount [~'params ~'_session ~'socket] (android.loom/mount ~spec ~'params ~'socket))
+     (defn ~'render [~'assigns] (android.loom/render ~'assigns))
+     (defn ~'handle_info [~'msg ~'socket] (android.loom/handle-info ~spec ~'msg ~'socket))))
+
+;; ── from anywhere: the desk, a test, another process ────────────────────
+
+(defn emit!
+  "Fold `ev` into the loom screen in front, as if the page had sent it."
+  [ev]
+  (erlang/send :mob_screen ev)
+  :ok)
+
+(defn js
+  "Evaluate JavaScript expression `expr` in the page of the loom screen in
+   front and return its value (JSON data: strings, numbers, vectors, string-keyed
+   maps). Throws `{:android/error :loom-js}` when it throws in the page, and
+   `{:android/error :loom-timeout}` when no page answers within `ms` (default
+   5000)."
+  ([expr] (js expr 5000))
+  ([expr ms]
+   (let [id (erlang/unique_integer (list :positive))]
+     (erlang/send :mob_screen (tuple :loom_probe (erlang/self) id expr))
+     ;; `receive` rebinds: `got` is compared, not matched, so a stale reply
+     ;; for an earlier probe that timed out stays in the mailbox
+     (receive
+       [:loom/reply got res] :when (= got id)
+       (if (contains? res "err")
+         (throw (ex-info (str "in the page: " (get res "err")) {:android/error :loom-js :expr expr}))
+         (get res "ok"))
+       (after ms (throw (ex-info "no loom page answered" {:android/error :loom-timeout :expr expr})))))))
+
+(defn state
+  "The state of the loom screen in front."
+  []
+  (:state (:loom (app/assigns (Mob.Screen/get_socket (erlang/whereis :mob_screen))))))
