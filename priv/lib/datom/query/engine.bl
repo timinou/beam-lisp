@@ -40,7 +40,8 @@
             [datom.query.plan] [datom.schema] [datom.query.analytic]
             [data.bounded-cache :as cache-data] [data.cache-ring :as cache-ring]
             [datom.cache-validity :as validity] [datom.query.relation :as relation]
-            [datom.query.rules]))
+            [datom.query.rules] [datom.query.read-plan :as read-plan]
+            [datom.query.rank-demand :as rank-demand]))
 
 ;; ── unification ─────────────────────────────────────────────────────
 
@@ -178,6 +179,10 @@
                    (if (nil? b) [] [b])))
                rows)))
 
+(defn- note-scan-work! [rows]
+  (when-let [work (Process/get :datom_query_scan_work)]
+    (Process/put :datom_query_scan_work (+ work rows))))
+
 (defn eval-pattern
   "Every extension of `bindings` under which `clause` holds.
 
@@ -192,6 +197,7 @@
           index (get selection 0)
           components (get selection 1)
           candidates (apply datom.db/datoms db index components)]
+      (note-scan-work! (count candidates))
       (filterv some? (mapv (fn [d] (unify-pattern bindings clause d)) candidates)))))
 
 (defn- call-form
@@ -480,6 +486,9 @@
 (defn trace-off! [] (erlang/put TRACE-KEY nil) :off)
 
 (defn- record-scan! [fact]
+  ;; Actual execution work matters even when negation returns an empty answer.
+  ;; This ephemeral counter is independent of opt-in profiling and never conveyed.
+  (note-scan-work! (:candidates fact))
   (let [c (erlang/get TRACE-KEY)]
     (when (and (some? c) (not= :undefined c))
       (swap! c (fn [v] (conj v fact))))
@@ -956,7 +965,8 @@
           (throw (ex-info "invalid query" {:problems problems}))
           (let [entry {:parsed parsed
                        :planned (datom.query.plan/plan parsed)
-                       :in-forms (datom.query.parse/input-forms parsed)}]
+                       :in-forms (datom.query.parse/input-forms parsed)
+                       :result-cache? false :rank-watch? false}]
             (let [charge (cache-data/footprint (tuple query entry))]
               (swap! PLAN-CACHE
                      (fn [c]
@@ -969,7 +979,16 @@
                                         (if (or (nil? charge) (> charge PLAN-CACHE-ENTRY-MAX)) 1 0)))))))
             entry))))))
 
-(defn- execute-prepared [prepared db inputs]
+(defn watch-rank-query!
+  "Mark a bounded prepared plan for optional fallback telemetry. Ordinary cheap
+   query forms never normalize store/retained keys for index economics."
+  [query]
+  (prepare query)
+  (swap! PLAN-CACHE (fn [c]
+    (if (get (:entries c) query) (assoc-in c [:entries query :rank-watch?] true) c)))
+  :ok)
+
+(defn- execute-prepared* [prepared db inputs]
   (let [parsed (:parsed prepared)]
     (do
       (let [; `input-forms` includes the `%` rules source, so arguments line
@@ -1057,7 +1076,22 @@
                     :else (set rows))
            :work (max (count bindings) (count initial))})))))
 
-(defn- plain-read-attrs [parsed]
+(defn- execute-prepared [prepared database inputs]
+  (let [previous (Process/get :datom_query_scan_work)]
+    (Process/put :datom_query_scan_work 0)
+    (try
+      (let [result (execute-prepared* prepared database inputs)]
+        (if (or (nil? (:value result))
+                (and (or (sequential? (:value result)) (set? (:value result))
+                         (map? (:value result)))
+                     (empty? (:value result))))
+          (assoc result :work (max (:work result) (Process/get :datom_query_scan_work)))
+          result))
+      (finally
+        (if previous (Process/put :datom_query_scan_work previous)
+          (Process/delete :datom_query_scan_work))))))
+
+(defn- flat-read-attrs [parsed]
   ;; This is a closed execution subset, not an assertion about arbitrary code.
   ;; No arbitrary functions, computed relations, rules, pull or raw DB escape.
   ;; Built-in aggregate folds are engine-owned and bind the same dependencies.
@@ -1079,6 +1113,9 @@
                               (keyword? (get c 1))
                               (nil? (relation/relation (get c 1))))) clauses))
       (vec (distinct (mapv (fn [c] (get c 1)) clauses))))))
+
+(defn- plain-read-attrs [parsed]
+  (or (flat-read-attrs parsed) (read-plan/attributes parsed)))
 
 (defn- finite-cache-inputs? [parsed supplied]
   ;; Collection input semantics are owned by bind-inputs; cache only concrete
@@ -1114,7 +1151,16 @@
     ;; Lookup is not a transaction with code publication. Recheck evidence
     ;; before returning a retained model result; a racing reload must miss.
     (if (and (:hit? hit) (= stamp (validity/read-stamp db attrs))) (:value hit)
-      (let [executed (execute-prepared prepared db inputs) result (:value executed)]
+      (let [watch? (and (:rank-watch? prepared) (Process/whereis :datom.query.rank-demand))
+            started (when watch? (erlang/monotonic_time :microsecond))
+            executed (execute-prepared prepared db inputs) result (:value executed)]
+        (when watch?
+          (rank-demand/record-scan!
+            (cache-data/key-data (datom.store/identity-of (datom.db/store-of db)) 0)
+            query inputs {:elapsed-us (- (erlang/monotonic_time :microsecond) started)
+                          :rows (cond (nil? result) 0
+                                      (or (sequential? result) (set? result) (map? result)) (count result)
+                                      :else 1) :basis (datom.db/basis-t db)}))
         ;; Small and unsupported queries never pay retained-key normalization.
         ;; Learn only from actual work; the hint is bounded by the plan ring.
         (when (and (not tracing?) (>= (:work executed) 32)
