@@ -1,0 +1,666 @@
+; research/structural/bounded_test.bl — the assurance for the candidate-
+; restricted / budgeted / ordered-page prototype in
+; research/structural/bounded.bl.
+;
+; Run (one VM; the module ns is research.structural.bounded at repo root):
+;
+;   BEAM_LISP_Z3=/usr/bin/z3 ./bin/bl test research/structural/bounded_test.bl \
+;       -p research/structural
+;
+; What each section proves:
+;
+;   1. LOGIC (veritas, finite exhaustive).
+;      a. the authorized ranked walk equals the full authorized-sort oracle;
+;      b. the page walk over an ORDERED list equals the oracle (real: a
+;         mis-ordered input refutes it);
+;      c. a budgeted walk is exact-and-equal-to-oracle, or non-exact with NO
+;         hits — never a partial ranking presented as the answer.
+;   2. NEGATIVE CONTROL (veritas exists + a real store). The naive fixed 6*k
+;      global overfetch then post-filter disagrees with the oracle, and the miss
+;      is exhibited on a live datom store.
+;   3. SYMBOLIC OBLIGATION (z3). The rank comparator is asymmetric.
+;   4. DATOM PARITY + STORE COUNTS, with metrics that SEPARATE posting rows
+;      read, candidates ranked, and candidates examined.
+;   5. WORK BUDGET. Sparse ACL + budget exhaustion returns :refused/:incomplete
+;      with NO hits, not an exact-looking empty/k page.
+;   6. CURSOR PROVENANCE. A cursor carries store/basis/query/principal/order; a
+;      mismatched basis or principal is REFUSED rather than resumed.
+;   7. ORDERED SINGLE-TERM PAGE. `:post/rank` orders a term's postings by
+;      (score desc, eid asc); the page reads them in bounded pages through
+;      `PageScan`. On a substrate without `PageScan` the same call is honest
+;      (`:bounded? false`) and the budget cannot be fooled.
+;
+; The execution RESULTS here are UNRUN in this authoring environment; the
+; orchestrator runs the command above.
+
+(ns research.structural.bounded-test
+  (:require [research.structural.bounded :as b]
+            [datom]
+            [datom.profile :as prof]
+            [datom.store-ets]
+            [datom.store-fjall]
+            [veritas :as v]
+            [z3]
+            [smt]
+            [oracle]))
+
+; ═══════════════════════════════════════════════════════════════════════
+; FIXTURE — a real datom store with a lexical posting index + sparse ACL
+; ═══════════════════════════════════════════════════════════════════════
+
+(def schema
+  [{:db/ident :doc/text      :db/valueType :db.type/string}
+   {:db/ident :doc/live      :db/valueType :db.type/boolean}
+   {:db/ident :doc/public    :db/valueType :db.type/boolean}
+   {:db/ident :doc/reader    :db/valueType :db.type/ref
+                             :db/cardinality :db.cardinality/many}
+   {:db/ident :post/term     :db/valueType :db.type/string :db/index true}
+   {:db/ident :post/rank     :db/valueType :db.type/string :db/index true}
+   {:db/ident :post/doc      :db/valueType :db.type/ref}
+   {:db/ident :post/tf       :db/valueType :db.type/long}
+   {:db/ident :principal/name :db/valueType :db.type/string}])
+
+(defn- connect-fixture []
+  (datom/connect-with (datom.store-ets/open) schema))
+
+; P = -100, Q = -101.
+(defn- principal-tx []
+  [{:db/id -100 :principal/name "P"}
+   {:db/id -101 :principal/name "Q"}])
+
+(defn- base-docs
+  "Six documents. Only `:doc/live`/`:doc/reader`/`:doc/public` differ; scores
+   live on the postings' `:post/tf`. Docs -1/-2 tie at 50 (identity tie-break);
+   -2 is denied to P; -6 is a soft tombstone."
+  []
+  [{:id -1 :text "cat" :tf 50 :readers [-100] :live true}
+   {:id -2 :text "cat" :tf 50 :readers [-101] :live true}
+   {:id -3 :text "cat" :tf 10 :readers [-100] :live true}
+   {:id -4 :text "dog" :tf 100 :readers [-100] :live true}
+   {:id -5 :text "cat" :tf 5  :readers [] :public true :live true}
+   {:id -6 :text "cat" :tf 1  :readers [-100] :live false}])
+
+(defn- base-conn []
+  (let [conn (connect-fixture)
+        rep (datom/transact! conn
+                             (into (principal-tx)
+                                   (mapcat b/index-doc-tx (base-docs))))]
+    {:conn conn
+     :db (datom/db conn)
+     :ids (:tempids rep)
+     :p (get (:tempids rep) -100)
+     :q (get (:tempids rep) -101)}))
+
+(defn- rank-index! [conn]
+  (datom/transact! conn (b/rank-index-tx (datom/db conn))))
+
+(defn- ranked-conn
+  "`base-conn` plus the derived `:post/rank` order index."
+  []
+  (let [base (base-conn)]
+    (rank-index! (:conn base))
+    (assoc base :db (datom/db (:conn base)))))
+
+(defn- cat-conn
+  "Base fixture plus `n` unrelated `\"filler\"` documents, to show the
+   candidate path's work does not grow with the corpus."
+  [n]
+  (let [conn (connect-fixture)
+        fillers (mapv (fn [i] {:id (- 0 (+ 200 i)) :text "filler" :tf 1
+                              :readers [-100] :live true})
+                      (range n))
+        rep (datom/transact! conn
+                             (into (principal-tx)
+                                   (mapcat b/index-doc-tx (into (base-docs) fillers))))]
+    {:conn conn :db (datom/db conn) :p (get (:tempids rep) -100)}))
+
+(defn- overfetch-conn
+  "The negative-control fixture: six HIGH-score documents denied to P, then one
+   LOW-score document P may read. A fixed 6*k global window reaches only the
+   denied six."
+  []
+  (let [conn (connect-fixture)
+        denied (mapv (fn [i] {:id (- 0 (+ 10 i)) :text "cat" :tf 100
+                              :readers [-101] :live true})
+                     (range 6))
+        allowed {:id -30 :text "cat" :tf 1 :readers [-100] :live true}
+        rep (datom/transact! conn
+                             (into (principal-tx)
+                                   (mapcat b/index-doc-tx (conj denied allowed))))]
+    {:conn conn :db (datom/db conn) :p (get (:tempids rep) -100)
+     :ids (:tempids rep)}))
+
+(defn- overfetch-ranked []
+  (let [base (overfetch-conn)]
+    (rank-index! (:conn base))
+    (assoc base :db (datom/db (:conn base)))))
+
+(defn- eids-of [hits] (mapv (fn [h] (:eid h)) hits))
+
+(defn- page-all
+  "Walk `page-topk-db` from the start within ONE pinned db value, concatenating
+   hit vectors until the walk reports no more candidates."
+  [db principal terms page-size]
+  (loop [after nil acc []]
+    (let [pg (b/page-topk-db db principal terms after page-size)
+          hits (get pg :hits)]
+      (if (or (= :refused (get pg :status)) (not (get pg :more?)))
+        (into acc hits)
+        (recur (get pg :cursor) (into acc hits))))))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 1. LOGIC PARITY — veritas, finite exhaustive
+; ═══════════════════════════════════════════════════════════════════════
+
+(def scenarios
+  [; empty candidate set
+   {:docs [] :k 2}
+   ; a single permitted doc
+   {:docs [{:eid 1 :score 5 :readable true :live true}] :k 1}
+   ; identity tie-break, both orders of presentation
+   {:docs [{:eid 1 :score 5 :readable true :live true}
+           {:eid 2 :score 5 :readable true :live true}] :k 2}
+   {:docs [{:eid 2 :score 5 :readable true :live true}
+           {:eid 1 :score 5 :readable true :live true}] :k 2}
+   ; sparse ACL: a denied doc ranked ABOVE a permitted one
+   {:docs [{:eid 1 :score 9 :readable false :live true}
+           {:eid 2 :score 1 :readable true :live true}] :k 1}
+   ; tombstone: a dead doc ranked above a live permitted one
+   {:docs [{:eid 1 :score 9 :readable true :live false}
+           {:eid 2 :score 1 :readable true :live true}] :k 1}
+   ; no readable result at all
+   {:docs [{:eid 1 :score 9 :readable false :live true}
+           {:eid 2 :score 8 :readable false :live false}] :k 2}
+   ; the negative-control shape: six denied high scores, one permitted low
+   {:docs [{:eid 1 :score 100 :readable false :live true}
+           {:eid 2 :score 100 :readable false :live true}
+           {:eid 3 :score 100 :readable false :live true}
+           {:eid 4 :score 100 :readable false :live true}
+           {:eid 5 :score 100 :readable false :live true}
+           {:eid 6 :score 100 :readable false :live true}
+           {:eid 7 :score 1 :readable true :live true}]
+    :k 1 :overfetch 6}])
+
+(def budget-scenarios
+  "The same domain crossed with the budgets that should sometimes refuse/
+   incomplete: nil (no budget), 0, 1, 2, 3, 100."
+  (mapcat (fn [s]
+            (mapv (fn [bud] (assoc s :exam-budget bud))
+                  [nil 0 1 2 3 100]))
+          scenarios))
+
+(deftest indexed-walk-equals-oracle-over-finite-scenario-domain
+  (let [r (v/for-all nil "s" (apply v/one-of scenarios)
+                     '(research.structural.bounded/parity-holds? s))]
+    (is (= :proven (:modality r))
+        "every scenario in the declared finite domain agrees; exhaustion is the proof")
+    (is (= :enumerate (:engine r)) "the finite domain was EXHAUSTED, not sampled")))
+
+(deftest ordered-page-walk-equals-oracle-over-finite-scenario-domain
+  (let [r (v/for-all nil "s" (apply v/one-of scenarios)
+                     '(research.structural.bounded/ordered-page-parity? s))]
+    (is (= :proven (:modality r))
+        "an ordered page equals the oracle when the supplied order IS the rank order")
+    (is (= :enumerate (:engine r)))))
+
+(deftest budgeted-walk-is-exact-or-empty-over-finite-domain
+  (let [r (v/for-all nil "s" (apply v/one-of budget-scenarios)
+                     '(research.structural.bounded/budget-walk-is-exact-or-empty? s))]
+    (is (= :proven (:modality r))
+        "a budgeted walk is exact-and-equal-to-oracle, or carries no hits")
+    (is (= :enumerate (:engine r))
+        "the budget axis is exhausted over the declared finite domain")))
+
+(deftest fixed-overfetch-is-refuted-with-a-witness
+  (let [r (v/exists nil "s" (apply v/one-of scenarios)
+                    '(research.structural.bounded/overfetch-misses? s))]
+    (is (= :proven (:modality r))
+        "a disagreeing scenario EXISTS in the finite domain")
+    (is (= :enumerate (:engine r)))
+    (is (not (nil? (:witness r))) "veritas hands back the offending scenario")))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 2. SYMBOLIC OBLIGATION — z3 proves the comparator law over unbounded Int
+; ═══════════════════════════════════════════════════════════════════════
+;
+; The tie-break makes (score desc, eid asc) a STRICT order; the load-bearing
+; half is asymmetry. A tuple of four unbounded ints makes the domain infinite,
+; so only the symbolic rung can prove it.
+
+(deftest rank-order-is-asymmetric-symbolically
+  ;; Direct SMT keeps the four integer axes genuinely unbounded. Unsupported
+  ;; tuple projection in a huge finite generator must not trigger enumeration.
+  (let [decls (mapv (fn [i] (smt/declare-const (str "q_" i) "Int")) (range 4))
+        violation '(and
+                     (or (> q_0 q_1) (and (= q_0 q_1) (< q_2 q_3)))
+                     (or (> q_1 q_0) (and (= q_1 q_0) (< q_3 q_2))))
+        r (z3/check nil (conj decls (smt/assert violation)))]
+    (is (oracle/proven? r) "no asymmetric-order violation exists over unbounded integers")
+    (is (= :unsat (:status r)))))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 3. DATOM PARITY — the real index path equals the real oracle
+; ═══════════════════════════════════════════════════════════════════════
+
+(deftest datom-candidate-path-equals-oracle
+  (let [{:db db :p p :ids ids} (base-conn)
+        ix (b/indexed-topk-db db p ["cat"] 2)
+        or (b/oracle-topk-db db p ["cat"] 2)
+        d1 (get ids -1)
+        d3 (get ids -3)]
+    (is (= :exact (:status ix)))
+    (is (= (:hits ix) (:hits or)) "candidate path == full authorized sort")
+    (is (= (:total ix) (:total or)))
+    (is (= [d1 d3] (eids-of (:hits ix)))
+        "denied doc -2 (score 50) sits between -1 and -3 and is skipped, not consumed")
+    (is (= 2 (count (:hits ix))))
+    (is (= 3 (:total ix)) "total counts ALL permitted matches, not the page")
+    (is (> (:total ix) (count (:hits ix))) "total != page length")))
+
+(deftest tie-break-is-identity-ascending-and-stable
+  (let [conn (connect-fixture)
+        rep (datom/transact! conn
+                             (into (principal-tx)
+                                   (mapcat b/index-doc-tx
+                                           [{:id -11 :text "cat" :tf 5
+                                             :readers [-100] :live true}
+                                            {:id -12 :text "cat" :tf 5
+                                             :readers [-100] :live true}])))
+        p (get (:tempids rep) -100)
+        db (datom/db conn)
+        ix (b/indexed-topk-db db p ["cat"] 2)]
+    (is (= 2 (count (:hits ix))) "both equal-score docs are permitted and returned")
+    (is (< (:eid (get (:hits ix) 0)) (:eid (get (:hits ix) 1)))
+        "equal scores order by ascending entity id")
+    (is (= (:hits ix) (:hits (b/indexed-topk-db db p ["cat"] 2)))
+        "the order is deterministic across calls")))
+
+(deftest no-readable-result-is-empty-with-zero-total
+  (let [{:db db :q q} (base-conn)
+        ix (b/indexed-topk-db db q ["dog"] 5)]
+    (is (= :exact (:status ix)))
+    (is (= [] (:hits ix)))
+    (is (= 0 (:total ix)) "no permitted match is zero, not an error")
+    (is (= 1 (:candidates ix)) "the candidate still matched; authorization removed it")))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 4. STORE-BOUNDARY WORK — the metrics separate the three counters
+; ═══════════════════════════════════════════════════════════════════════
+
+(deftest candidate-path-reads-fewer-store-rows-than-the-oracle
+  (let [{:db db :p p} (base-conn)
+        pdb (prof/db db)
+        before-ix (prof/totals)
+        ix (b/indexed-topk-db pdb p ["cat"] 2)
+        d-ix (prof/delta before-ix)
+        before-or (prof/totals)
+        or (b/oracle-topk-db pdb p ["cat"] 2)
+        d-or (prof/delta before-or)]
+    (is (= (:hits ix) (:hits or)))
+    (is (> (get d-ix :rows) 0) "the measurement is not a zero dressed as a metric")
+    (is (< (get d-ix :rows) (get d-or :rows))
+        "candidate path reads fewer store rows than the corpus-wide oracle")
+    (is (<= (get d-ix :reads) (get d-or :reads))
+        "and no more store REQUESTS")))
+
+(deftest candidate-work-is-independent-of-unrelated-corpus-size
+  (let [small (cat-conn 0)
+        large (cat-conn 40)
+        pdb-s (prof/db (:db small))
+        pdb-l (prof/db (:db large))
+        bs (prof/totals)
+        ixs (b/indexed-topk-db pdb-s (:p small) ["cat"] 2)
+        ds (prof/delta bs)
+        bl (prof/totals)
+        ixl (b/indexed-topk-db pdb-l (:p large) ["cat"] 2)
+        dl (prof/delta bl)
+        bo (prof/totals)
+        _orl (b/oracle-topk-db pdb-l (:p large) ["cat"] 2)
+        dorl (prof/delta bo)]
+    (is (= (:hits ixs) (:hits ixl)) "same answer at both corpus sizes")
+    (is (= (get ds :rows) (get dl :rows))
+        "candidate rows unchanged by 40 unrelated documents")
+    (is (< (get dl :rows) (get dorl :rows))
+        "while the corpus-wide oracle grows with them")))
+
+(deftest page-bounds-examined-not-postings-or-ranking
+  ; The correction this test encodes: the candidate POSTING read and the SORT
+  ; cover the whole candidate set; only the authorization walk stops early.
+  (let [{:db db :p p} (base-conn)
+        pg (b/page-topk-db db p ["cat"] nil 2)]
+    (is (= :exact (:status pg)))
+    (is (= 2 (count (:hits pg))))
+    ; 5 cat postings exist; the page ranks all 5, then examines -1 (permitted),
+    ; -2 (denied) and -3 (permitted, the k-th) and stops.
+    (is (= 5 (:posting-rows pg)) "the whole candidate POSTING set was read")
+    (is (= 5 (:ranked pg)) "the whole candidate set was ranked")
+    (is (< (:examined pg) (:ranked pg))
+        "but only the authorization walk is bounded")
+    (is (= 3 (:examined pg))
+        "-1 permitted, -2 denied, -3 permitted, then stop at k=2")))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 5. WORK BUDGET — honest refusal/incomplete, never a partial page
+; ═══════════════════════════════════════════════════════════════════════
+
+(deftest budget-refuses-before-reading-when-known-rows-exceed-it
+  (let [{:db db :p p} (base-conn)
+        r (b/budgeted-topk-db db p ["cat"] 2 {:max-posting-rows 2})]
+    (is (= :refused (:status r))
+        "the known 5 posting rows exceed a budget of 2")
+    (is (= :posting-budget-exhausted (:reason r)))
+    (is (= [] (:hits r)) "a refusal carries NO hits — not an exact-looking empty")
+    (is (= 0 (:posting-rows r)) "and it did not read the postings")
+    ; the key count stopped at budget+1, so this is an honest LOWER BOUND
+    (is (= 3 (:required-posting-rows-at-least r)))
+    (is (nil? (:required-posting-rows r))
+        "a capped count is not presented as an exact required row count")))
+
+(deftest sparse-acl-budget-exhaustion-is-incomplete-not-exact-empty
+  ; Six denied docs rank above the one permitted doc. A budget that cannot
+  ; reach the permitted row must say so, not return the exact empty page a
+  ; caller would read as "no results".
+  (let [{:db db :p p} (overfetch-ranked)
+        r (b/ordered-topk-page db p "cat" 1 {:max-posting-rows 3})
+        full (b/ordered-topk-page db p "cat" 1 {:max-posting-rows 1000})]
+    (is (contains? #{:incomplete :refused} (:status r))
+        "the budget stops the walk before the permitted row is reached")
+    (is (= [] (:hits r)) "an incomplete verdict carries no partial ranking")
+    (is (not (nil? (:resume r))) "and a cursor to resume with")
+    (is (= :exact (:status full)))
+    (is (= 1 (count (:hits full))) "at a sufficient budget the permitted row is found")
+    (is (not= [] (:hits full)))))
+
+(deftest non-positive-k-is-exact-empty
+  (let [{:db db :p p} (base-conn)]
+    (is (= :exact (:status (b/budgeted-topk-db db p ["cat"] 0 {}))))
+    (is (= [] (:hits (b/budgeted-topk-db db p ["cat"] 0 {}))))
+    (is (= [] (:hits (b/indexed-topk-db db p ["cat"] -1))))
+    (is (= [] (:hits (b/page-topk-db db p ["cat"] nil 0))))))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 6. PINNED BASIS, REVOCATION, TOMBSTONE, CURSOR PROVENANCE
+; ═══════════════════════════════════════════════════════════════════════
+
+(deftest pinned-basis-survives-revocation
+  (let [{:conn conn :db db0 :p p :ids ids} (base-conn)
+        before (b/indexed-topk-db db0 p ["cat"] 2)
+        t0 (datom/basis-t db0)
+        d1 (get ids -1)
+        _ (datom/transact! conn [[:db/retract d1 :doc/reader p]])
+        db1 (datom/db conn)
+        after0 (b/indexed-topk-db db0 p ["cat"] 2)
+        after1 (b/indexed-topk-db db1 p ["cat"] 2)]
+    (is (= before after0) "the held db value is pinned to its basis, t0")
+    (is (= t0 (datom/basis-t db0)) "basis t is stable on the value")
+    (is (= [d1 (get ids -3)] (eids-of (:hits before))))
+    (is (not (some (fn [h] (= d1 (:eid h))) (:hits after1)))
+        "the revoked reader entry removes the doc from the new basis")
+    (is (= 3 (:total before)))
+    (is (= 2 (:total after1)))))
+
+(deftest soft-tombstone-is-not-a-hit
+  (let [{:db db :p p :ids ids} (base-conn)
+        ix (b/indexed-topk-db db p ["cat"] 10)
+        or (b/oracle-topk-db db p ["cat"] 10)
+        d6 (get ids -6)]
+    (is (= (:hits ix) (:hits or)))
+    (is (not (some (fn [h] (= d6 (:eid h))) (:hits ix)))
+        "a live=false doc is a candidate but never a hit")
+    (is (= 5 (:candidates ix)) "it is still counted as a candidate match")))
+
+(deftest cursor-carries-store-basis-query-principal-and-order
+  (let [{:db db :p p} (base-conn)
+        pg (b/page-topk-db db p ["cat"] nil 1)
+        c (get pg :cursor)]
+    (is (= :ranked-topk (:cursor/kind c)))
+    (is (not (nil? (:cursor/store c))))
+    (is (= (datom/basis-t db) (:cursor/basis c)))
+    (is (= ["cat"] (:cursor/query c)))
+    (is (= p (:cursor/principal c)))
+    (is (= :score-desc-eid-asc (:cursor/order c)))))
+
+(deftest cursor-replayed-against-a-newer-basis-is-refused
+  (let [{:conn conn :db db0 :p p :ids ids} (base-conn)
+        pg1 (b/page-topk-db db0 p ["cat"] nil 1)
+        cur (get pg1 :cursor)
+        d1 (get ids -1)
+        _ (datom/transact! conn [[:db/retract d1 :doc/reader p]])
+        db1 (datom/db conn)
+        pg2 (b/page-topk-db db1 p ["cat"] cur 2)]
+    (is (= [d1] (eids-of (:hits pg1))))
+    (is (= :refused (:status pg2))
+        "an old-basis cursor is not resumed on a new basis")
+    (is (= :cursor-mismatch (:reason pg2)))
+    (is (= [] (:hits pg2)) "no rows are resurrected or skipped under the refusal")))
+
+(deftest cursor-replayed-with-a-different-principal-is-refused
+  (let [{:db db :p p} (base-conn)
+        pg1 (b/page-topk-db db p ["cat"] nil 1)
+        cur (get pg1 :cursor)
+        pg2 (b/page-topk-db db -101 ["cat"] cur 2)]
+    (is (= :refused (:status pg2)))
+    (is (= [] (:hits pg2)))))
+
+(deftest cursor-replayed-with-a-different-query-is-refused
+  (let [{:db db :p p} (base-conn)
+        pg1 (b/page-topk-db db p ["cat"] nil 1)
+        cur (get pg1 :cursor)
+        pg2 (b/page-topk-db db p ["dog"] cur 2)]
+    (is (= :refused (:status pg2)))
+    (is (= [] (:hits pg2)))))
+
+(deftest cursor-shape-not-a-bare-eid-score-pair
+  ; An [eid score] pair is no longer an admissible cursor.
+  (let [{:db db :p p :ids ids} (base-conn)
+        bare [(get ids -1) 50]
+        pg (b/page-topk-db db p ["cat"] bare 2)]
+    (is (= :refused (:status pg)))
+    (is (= [] (:hits pg)))))
+
+(deftest cursor-pages-concatenate-to-the-full-result
+  (let [{:db db :p p} (base-conn)
+        full (b/indexed-topk-db db p ["cat"] 10)
+        walked (page-all db p ["cat"] 1)]
+    (is (= (eids-of (:hits full)) (eids-of walked))
+        "concatenated single-row pages reproduce the full ordered result")
+    (is (= 3 (count walked)))))
+
+(deftest index-maintenance-updates-the-candidate-set
+  (let [conn (connect-fixture)
+        rep1 (datom/transact! conn
+                              (into (principal-tx)
+                                    (mapcat b/index-doc-tx
+                                            [{:id -1 :text "cat" :tf 5
+                                              :readers [-100] :live true}])))
+        p (get (:tempids rep1) -100)
+        db0 (datom/db conn)]
+    (is (= 1 (count (b/postings-for-term db0 "cat"))))
+    (let [rep2 (datom/transact! conn (b/index-doc-tx
+                                       {:id -2 :text "cat" :tf 7
+                                        :readers [p] :live true}))
+          d2 (get (:tempids rep2) -2)
+          db1 (datom/db conn)]
+      (is (= 2 (count (b/postings-for-term db1 "cat"))))
+      (is (= 2 (count (:hits (b/indexed-topk-db db1 p ["cat"] 10)))))
+      (b/retract-doc! conn d2)
+      (let [db2 (datom/db conn)
+            ix (b/indexed-topk-db db2 p ["cat"] 10)
+            or (b/oracle-topk-db db2 p ["cat"] 10)]
+        (is (= 1 (count (b/postings-for-term db2 "cat")))
+            "retirement removes the document's postings with it")
+        (is (= (:hits ix) (:hits or)))
+        (is (= 1 (count (:hits ix))))))))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 7. THE ORDERED SINGLE-TERM POSTING PAGE
+; ═══════════════════════════════════════════════════════════════════════
+
+(deftest posting-page-reads-rank-order
+  (let [{:db db :ids ids} (ranked-conn)
+        pg (b/posting-page db "cat" nil 3)
+        docs (mapv (fn [d] (get (datom/entity db (datom/datom-e d)) :post/doc))
+                   (:datoms pg))]
+    (is (= [(get ids -1) (get ids -2) (get ids -3)] docs)
+        "the first page is the top of the (score desc, eid asc) order")
+    (is (= (b/page-capable? db) (:bounded? pg)))))
+
+(deftest ordered-pages-concatenate-in-rank-order
+  (let [{:db db} (ranked-conn)
+        p1 (b/posting-page db "cat" nil 2)
+        p2 (b/posting-page db "cat" (get p1 :next) 2)
+        p3 (b/posting-page db "cat" (get p2 :next) 2)
+        all (into (into (:datoms p1) (:datoms p2)) (:datoms p3))
+        ranks (mapv (fn [d] (:post/rank (datom/entity db (datom/datom-e d)))) all)]
+    (is (= 5 (count all)) "all five cat postings, paged")
+    (is (= ranks (sort ranks)) "the concatenation is in lexicographic rank order")))
+
+(deftest ordered-topk-page-equals-oracle-for-a-single-term
+  (let [{:db db :p p} (ranked-conn)
+        page (b/ordered-topk-page db p "cat" 2 {:max-posting-rows 1000})
+        or (b/oracle-topk-db db p ["cat"] 2)]
+    (is (= :exact (:status page)))
+    (is (= (:hits page) (:hits or))
+        "the bounded ordered walk equals the full authorized sort")))
+
+(deftest ordered-topk-page-refuses-a-mismatched-cursor
+  (let [{:conn conn :db db0 :p p :ids ids} (ranked-conn)
+        pg1 (b/ordered-topk-page db0 p "cat" 1 {:max-posting-rows 1000})
+        cur (get pg1 :cursor)
+        _ (datom/transact! conn [[:db/retract (get ids -1) :doc/reader p]])
+        db1 (datom/db conn)
+        pg2 (b/ordered-topk-page db1 p "cat" 1 {:cursor cur :max-posting-rows 10})]
+    (is (= :refused (:status pg2)))
+    (is (= [] (:hits pg2)))))
+
+(deftest ordered-page-is-bounded-only-where-the-substrate-pages
+  (let [{:db db :p p} (ranked-conn)
+        page (b/ordered-topk-page db p "cat" 2 {:max-posting-rows 1000})]
+    (is (= (b/page-capable? db) (:bounded? page))
+        "the verdict reports the substrate's real paging capability")))
+
+(deftest ordered-bounded-first-page-on-a-paging-substrate
+  ; The genuinely-bounded fixture: on a substrate that implements `PageScan`
+  ; (fjall), the first page reads only O(page) posting rows. On ETS the read is
+  ; the documented materialize-the-range fallback and the test records that.
+  (println "bounded-spike: native PageScan available" (datom.store-fjall/available?))
+  (if (datom.store-fjall/available?)
+    (let [conn (datom/connect-with (datom.store-fjall/open-fresh) schema)]
+      (try
+        (let [rep (datom/transact! conn
+                                   (into (principal-tx)
+                                         (mapcat b/index-doc-tx (base-docs))))
+              _ (rank-index! conn)
+              p (get (:tempids rep) -100)
+              db (datom/db conn)
+              pg (b/posting-page db "cat" nil 2)
+              page (b/ordered-topk-page db p "cat" 1 {:max-posting-rows 1000})]
+          (is (b/page-capable? db) "fjall implements PageScan")
+          (is (:bounded? pg))
+          (is (= 2 (:page-rows pg)) "the page returned two rows")
+          (is (= 2 (:rows pg)) "and READ only those two posting rows")
+          (is (= :exact (:status page)))
+          (is (= 1 (count (:hits page)))))
+        (finally (datom/close! conn))))
+    (is true "fjall absent: the genuinely-bounded path is not exercisable here")))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 8. NEGATIVE CONTROL AGAINST A REAL STORE
+; ═══════════════════════════════════════════════════════════════════════
+
+(deftest overfetch-misses-the-permitted-doc-on-a-real-index
+  (let [{:db db :p p} (overfetch-conn)
+        naive (b/fixed-overfetch-db db p ["cat"] 1 6)
+        ix (b/indexed-topk-db db p ["cat"] 1)
+        or (b/oracle-topk-db db p ["cat"] 1)]
+    (is (= [] (:hits naive))
+        "6*k global overfetch then post-filter: the six denied docs fill the window")
+    (is (= 1 (count (:hits ix))) "the authorized ranked walk reaches the permitted doc")
+    (is (= (:hits ix) (:hits or)) "and agrees with the oracle")))
+
+(deftest physical-page-boundaries-do-not-resurrect-retracted-ranks
+  (let [{:keys [conn db]} (ranked-conn)
+        posting (first (b/postings-for-term db "cat"))
+        rank (:post/rank (datom/entity db posting))
+        _ (datom/transact! conn [[:db/retract posting :post/rank rank]])
+        current (datom/db conn)
+        visible (loop [after nil out []]
+                  (let [page (b/posting-page current "cat" after 1)
+                        next-out (into out (:datoms page))]
+                    (if (:more? page)
+                      (recur (:next page) next-out)
+                      next-out)))]
+    (is (not (some (fn [d] (= posting (datom/datom-e d))) visible))
+        "an assertion is not live merely because its retraction is on another physical page")
+    (is (some (fn [d] (= posting (datom/datom-e d)))
+              (loop [after nil out []]
+                (let [page (b/posting-page db "cat" after 1)
+                      next-out (into out (:datoms page))]
+                  (if (:more? page) (recur (:next page) next-out) next-out))))
+        "the same assertion remains visible at the pinned pre-retraction basis")))
+
+
+(deftest ordered-hit-pages-do-not-skip-unexamined-physical-rows
+  (let [{:keys [db p]} (ranked-conn)
+        expected (:hits (b/oracle-topk-db db p ["cat"] 100))
+        actual (loop [cursor nil out [] rounds 0]
+                 (let [page (b/ordered-topk-page db p "cat" 1
+                                               {:cursor cursor :max-posting-rows 1000})
+                       next-out (into out (:hits page))]
+                   (is (= :exact (:status page)))
+                   (is (< rounds 20) "cursor pages must advance")
+                   (if (and (:more? page) (< rounds 20))
+                     (recur (:cursor page) next-out (inc rounds))
+                     next-out)))]
+    (is (= expected actual)
+        "a physical page cursor must not discard candidates never examined for a hit")))
+
+(deftest incomplete-retry-retains-the-original-ranking-position
+  (let [{:keys [db p]} (ranked-conn)
+        partial (b/ordered-topk-page db p "cat" 2 {:max-posting-rows 1})
+        retry (b/ordered-topk-page db p "cat" 2
+                                  {:cursor (:resume partial) :max-posting-rows 1000})]
+    (is (contains? #{:incomplete :refused} (:status partial)))
+    (is (= [] (:hits partial)))
+    (is (= :exact (:status retry)))
+    (is (= (:hits (b/oracle-topk-db db p ["cat"] 2)) (:hits retry))
+        "hidden partial hits must not disappear when retrying with a larger budget")))
+
+(deftest zero-hit-request-does-not-invent-a-total
+  (let [{:keys [db p]} (base-conn)]
+    (is (nil? (:total (b/indexed-topk-db db p ["cat"] 0))))
+    (is (nil? (:total (b/budgeted-topk-db db p ["cat"] 0 {}))))))
+
+
+(deftest bounded-requests-refuse-wide-ets-fallback-before-reading-rows
+  (let [store (prof/watch (datom.store-ets/open))
+        conn (datom/connect-with store schema)]
+    (try
+      (let [rep (datom/transact! conn (into (principal-tx) (mapcat b/index-doc-tx (base-docs))))
+            _ (rank-index! conn)
+            before (:rows (prof/counters store))
+            r (b/ordered-topk-page (datom/db conn) (get (:tempids rep) -100) "cat" 1
+                                  {:max-posting-rows 1})
+            after (:rows (prof/counters store))]
+        (is (= :refused (:status r)))
+        (is (= :posting-budget-exhausted (:reason r)))
+        (is (= 0 (- after before)) "Count admission does not materialize the wide range")
+        (is (= 0 (:posting-rows r))))
+      (finally (datom/close! conn)))))
+
+(deftest rank-encoding-declares-its-domain-and-separates-term-prefixes
+  (is (thrown? (b/posting-rank-value "cat" 0 1)))
+  (is (thrown? (b/posting-rank-value "cat" 1000000000001 1)))
+  (is (thrown? (b/posting-rank-value "cat" 1 10000000000000)))
+  (is (thrown? (b/index-doc-tx {:id -1 :text "cat" :tf 0 :live true})))
+  (let [conn (connect-fixture)]
+    (try
+      (datom/transact! conn
+        (mapcat b/index-doc-tx [{:id -1 :text "a" :tf 2 :public true :live true}
+                              {:id -2 :text "a~|~other" :tf 100 :public true :live true}]))
+      (rank-index! conn)
+      (let [page (b/ordered-topk-page (datom/db conn) :viewer "a" 10 {:max-posting-rows 1000})]
+        (is (= :exact (:status page)))
+        (is (= 1 (count (:hits page))) "separator bytes inside another term cannot match the query prefix")
+        (is (= 2 (:score (first (:hits page))))))
+      (finally (datom/close! conn)))))

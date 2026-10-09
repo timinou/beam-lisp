@@ -1,0 +1,945 @@
+; research/structural/bounded.bl — candidate-RESTRICTED authorized top-k over a
+; datom lexical posting index, with an explicit work-budget contract, a
+; provenance-bearing cursor, and a genuinely PAGED ordered-posting read for the
+; single-term case.
+;
+; ── The proposition (PLAN-165 audit, opportunity 6) ──────────────────────
+;
+; Knowledger's lexical fallback (`search-one`) ranks the corpus, over-fetches a
+; FIXED `6*k` window and only THEN applies rights. Two costs fall out of that
+; shape:
+;
+;   1. WORK — the lexical scan reads :chunk/text across the whole corpus, so a
+;      query costs O(corpus) even when its terms are selective.
+;   2. CORRECTNESS — a fixed global overfetch followed by a post-filter can
+;      return FEWER than k permitted rows while permitted rows sit just below
+;      the window. The audit calls this out explicitly: "search-one:526-530
+;      overfetches 6*k then applies rights, so it can return fewer than k
+;      despite allowed rows lower in ranking."
+;
+; ── What this spike actually establishes (READ THIS BEFORE QUOTING IT) ───
+;
+; The candidate path is POSTING-RESTRICTED, not page-bounded. Precisely:
+;
+;   • `candidate-scores` reads EVERY posting row for every query term
+;     (sum_t df(t) rows) and materializes a score for EVERY matching document.
+;   • `ranked-score-pairs` SORTS that whole scored candidate set.
+;   • only the final authorization walk (`walk-authorized` / `walk-page`)
+;     stops at k permitted rows.
+;
+; So a first "page" is NOT O(page): the posting read and the ranking are
+; O(Σ df(terms)) and O(c log c). What the page bounds is the ACL entity reads
+; after ranking, and `page-topk-db` never scans `:doc/text` — that is the whole
+; of the old claim. An earlier revision of this file claimed the page "never
+; walks the whole candidate set"; that was WRONG and is corrected here.
+;
+; A genuinely page-bounded top-k needs a posting index ORDERED BY RANK plus a
+; paged read. This file provides exactly that for a SINGLE TERM:
+;
+;   • `:post/rank` is a second indexed string attribute whose value encodes
+;     (term, score DESC, doc-eid ASC) in lexicographic order, so an AVET prefix
+;     read on `:post/rank` yields a term's postings already in rank order.
+;   • `posting-page` reads that prefix in bounded pages through the store's
+;     `PageScan` capability (`datom.store/page-datoms`).
+;   • `ordered-topk-page` walks those pages, applying the authorization gate
+;     DURING the walk, and stops once k permitted rows are found, so its first
+;     page reads O(page + denied) posting rows — on a substrate that actually
+;     implements `PageScan` (fjall / durable). On the in-memory ETS substrate
+;     `page-datoms` documents a materialize-the-range fallback, so the same call
+;     is honest-but-unbounded there; the return carries `:bounded?` so no caller
+;     can read the ETS path as bounded.
+;
+; General MULTIKEY scoring (several query terms summed) has no ordered index
+; here. It is a POSTING-WIDE fallback: under a budget it either completes
+; exactly or REFUSES/incompletes — it never presents a partial ranking as the
+; answer. See `budgeted-topk-db`.
+;
+; ── The work-budget / honesty contract ──────────────────────────────────
+;
+; Every verdict carries `:status`:
+;
+;   :exact       the returned `:hits` ARE the true top-k. `:total` present.
+;   :incomplete  the budget stopped the work before the rank order was known.
+;                `:hits` is [] on purpose — a partial ranking is NOT an answer.
+;                A `:resume` cursor and the real counters are returned instead.
+;   :refused     the work was declined up front (budget cannot cover the known
+;                posting rows, or a cursor did not match this db/query/principal).
+;                `:hits` is [].
+;
+; "unknown is never proven": no code path here returns `:exact` unless every
+; candidate was ranked and every permitted row up to k was seen.
+;
+; ── Cursor provenance ───────────────────────────────────────────────────
+;
+; A cursor is NOT `[eid score]`. It carries the store identity, the basis, the
+; query/term, the principal, and the order identity. `page-topk-db` and
+; `ordered-topk-page` REJECT a cursor whose provenance does not match the db
+; value they are given, instead of trusting the caller to have pinned it. A
+; caller that holds one `datom/db` VALUE pages freely against it (basis stable);
+; a caller that re-derives the db after a write must start over, which is the
+; fail-closed choice: an old-basis cursor replayed on a new basis can resurrect
+; a revoked row or skip one.
+;
+; ── What is verified, and by what ───────────────────────────────────────
+;
+; `bounded_test.bl` uses the existing logic module `veritas`:
+;   • finite EXHAUSTION: the authorized ranked walk equals the full
+;     authorized-sort oracle over a declared finite scenario domain;
+;   • finite EXHAUSTION: a budgeted walk is either exact-and-equal-to-oracle, or
+;     non-exact with NO hits — never a partial ranking presented as the answer;
+;   • finite EXHAUSTION (negative control): the naive fixed-overfetch design
+;     disagrees with the oracle, and veritas returns the witness;
+;   • a z3 SYMBOLIC obligation for the rank comparator's asymmetry.
+; The datom-backed path is checked against the datom-backed oracle, and the
+; store boundary is counted (`datom.profile`), with metrics that separate
+; POSTING rows read, RANKED candidates, and EXAMINED candidates. The datom path
+; is tested, not proved.
+;
+; ── Production seam (see bounded.md) ────────────────────────────────────
+;
+; The ordered posting attribute (`:post/rank`) is the schema seam. It is a
+; DERIVED projection of `:post/term` + `:post/tf` + `:post/doc`; maintain it
+; with the existing derived/projection machinery, not a parallel cache. The
+; genuinely-bounded single-term page needs a substrate that implements
+; `datom.store/PageScan`; the general multikey path stays a posting-wide
+; fallback behind the budget contract until an ordered multi-term index exists.
+
+(ns research.structural.bounded
+  (:require [datom]
+            [datom.db]
+            [datom.index]
+            [datom.store]))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 1. THE PURE KERNEL — the ranking/authorization decision as data
+; ═══════════════════════════════════════════════════════════════════════
+;
+; A "scenario" is a pure description of a candidate set:
+;   {:docs [{:eid int :score int :readable bool :live bool} …]
+;    :k    int
+;    :overfetch int}   ; only the naive control reads it
+;
+; Splitting the decision from the store is what lets veritas exhaust a finite
+; domain: the same comparator, the same gate, the same walk the datom path
+; uses, over literal inputs. The datom path below is the same computation
+; with the store supplying candidates and metadata.
+
+(defn- rank-key
+  "The total order's sort key: score DESCENDING, then eid ASCENDING. The eid
+   component is the identity tie-break — two docs with equal score never swap
+   between calls or between pages."
+  [pair]
+  [(- 0 (get pair 1)) (get pair 0)])
+
+(defn- doc-rank-key
+  "`rank-key` over a scenario doc record."
+  [d]
+  [(- 0 (get d :score)) (get d :eid)])
+
+(defn- permitted?
+  "The authorization predicate in one place: LIVE and READABLE. Sparse ACLs are
+   simply `:readable false` on most rows; a tombstone is `:live false`."
+  [d]
+  (and (get d :live) (get d :readable)))
+
+(defn oracle-topk-pure
+  "THE ORACLE: consider every document, keep the permitted ones, order by
+   (score desc, eid asc), take k. The exhaustive-sort reference the bounded
+   path must reproduce exactly."
+  [s]
+  (let [docs (get s :docs)
+        k (get s :k)
+        permitted (filter permitted? docs)
+        ranked (sort-by doc-rank-key permitted)]
+    (vec (take k (map (fn [d] (get d :eid)) ranked)))))
+
+(defn ranked-walk-pure
+  "THE SOUND DESIGN: rank EVERY candidate (permitted or not), then WALK in
+   ranked order, keeping the first k that are permitted. It continues PAST a
+   denied candidate, so a permitted document below it is never missed. This is
+   the kernel the datom path realizes."
+  [s]
+  (let [docs (get s :docs)
+        k (get s :k)
+        ranked (sort-by doc-rank-key docs)]
+    (loop [rs ranked kept []]
+      (if (or (= k (count kept)) (empty? rs))
+        kept
+        (let [d (first rs)]
+          (recur (rest rs)
+                 (if (permitted? d) (conj kept (get d :eid)) kept)))))))
+
+(defn ordered-walk-pure
+  "THE PAGE-BOUNDED DESIGN, as a kernel: walk `ordered` — document records
+   ALREADY in rank order, which is what the ordered posting index supplies —
+   and keep the first k permitted, reporting how many were examined and whether
+   the list was exhausted. It TRUSTS the supplied order, so the parity law over
+   it is NOT a tautology: feed it an out-of-order list and it diverges from the
+   oracle."
+  [ordered k]
+  (loop [rs ordered kept [] seen 0]
+    (if (or (= k (count kept)) (empty? rs))
+      {:hits (vec (map (fn [d] (get d :eid)) kept))
+       :examined seen
+       :more? (not (empty? rs))}
+      (let [d (first rs)]
+        (recur (rest rs)
+               (if (permitted? d) (conj kept d) kept)
+               (+ seen 1))))))
+
+(defn ordered-page-parity?
+  "The law linking the page-bounded walk to the oracle: WHEN the supplied order
+   is the rank order, the k-row page equals the oracle. Two independently
+   written functions are compared, and a mis-ordered input refutes the law, so
+   this is a real property rather than a restatement."
+  [s]
+  (= (oracle-topk-pure s)
+     (get (ordered-walk-pure (sort-by doc-rank-key (get s :docs)) (get s :k)) :hits)))
+
+(defn fixed-overfetch-pure
+  "THE NAIVE WRONG DESIGN, kept as the negative control: rank every candidate
+   globally (NO authorization), take the top `k * overfetch`, and only THEN
+   filter permitted and take k. A permitted row ranked below the window is
+   silently dropped — the existing `search-one` bug, isolated."
+  [s]
+  (let [docs (get s :docs)
+        k (get s :k)
+        of (get s :overfetch 6)
+        ranked (sort-by doc-rank-key docs)
+        window (take (* k of) ranked)
+        permitted (filter permitted? window)]
+    (vec (take k (map (fn [d] (get d :eid)) permitted)))))
+
+(defn parity-holds?
+  "The positive law, as a predicate the logic module can quantify over: the
+   authorized ranked walk agrees with the full authorized-sort oracle."
+  [s]
+  (= (oracle-topk-pure s) (ranked-walk-pure s)))
+
+(defn overfetch-misses?
+  "The negative law: the naive fixed-overfetch control DISAGREES with the
+   oracle on `s`. `veritas/exists` over a finite domain returns the first such
+   scenario as a witness."
+  [s]
+  (not= (oracle-topk-pure s) (fixed-overfetch-pure s)))
+
+(defn walk-with-budget-pure
+  "THE BUDGET KERNEL: walk the ranked candidates applying the gate, but stop
+   once `:exam-budget` candidates have been examined. If k permitted were found
+   (or the candidates ran out) the verdict is `:exact` and the hits ARE the
+   oracle's; if the budget stopped it first, the verdict is `:incomplete` and
+   the hits are [] — the invariant that a partial ranking is never an answer."
+  [s]
+  (let [ranked (sort-by doc-rank-key (get s :docs))
+        k (get s :k)
+        budget (get s :exam-budget)]
+    (loop [rs ranked kept [] seen 0]
+      (cond
+        (= k (count kept)) {:status :exact :hits (vec (map (fn [d] (get d :eid)) kept)) :examined seen}
+        (empty? rs) {:status :exact :hits (vec (map (fn [d] (get d :eid)) kept)) :examined seen}
+        (and (not (nil? budget)) (>= seen budget)) {:status :incomplete :hits [] :examined seen}
+        :else (let [d (first rs)]
+                (recur (rest rs)
+                       (if (permitted? d) (conj kept d) kept)
+                       (+ seen 1)))))))
+
+(defn budget-walk-is-exact-or-empty?
+  "THE HONESTY LAW: a budgeted walk is EXACT only when it equals the oracle, and
+   non-exact verdicts carry NO hits. A bug that leaked a partial ranking as
+   `:exact`, or attached hits to an `:incomplete`, refutes this."
+  [s]
+  (let [r (walk-with-budget-pure s)]
+    (if (= :exact (get r :status))
+      (= (get r :hits) (oracle-topk-pure s))
+      (= [] (get r :hits)))))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 2. THE DATOM-BACKED CANDIDATE PATH
+; ═══════════════════════════════════════════════════════════════════════
+;
+; Schema this spike expects (the production index schema seam):
+;
+;   :doc/text    string        ; the corpus row's text (any value column)
+;   :doc/live    boolean       ; soft tombstone (hard retraction also works)
+;   :doc/public  boolean       ; readable by every principal
+;   :doc/reader  ref  many     ; the sparse ACL: principals who may read it
+;   :post/term   string, INDEX ; the lexical posting key — AVET prefix read
+;   :post/doc    ref           ; posting -> document (AVET + VAET maintained)
+;   :post/tf     long          ; the posting's rank contribution
+;   :post/rank   string, INDEX ; DERIVED rank-ordered key (ordered page only)
+;
+; A posting is a separate entity so that `:post/term` can be indexed: that
+; index is the candidate-restriction primitive. `:post/rank` is a second,
+; derived index; it is what makes a SINGLE-TERM page genuinely bounded.
+
+(defn postings-for-term
+  "The posting entities whose term is exactly `term`, read through the AVET
+   index on `:post/term`. One bounded store read of `df(term)` rows — NOT a
+   corpus scan, but NOT a page: the whole posting set for the term is read.
+   This is the candidate-restriction primitive."
+  [db term]
+  (map datom/datom-e (datom/datoms db :avet :post/term term)))
+
+(defn all-doc-eids
+  "Every document entity, by the full AEVT column read of `:doc/text`. This is
+   the ORACLE's read — deliberately corpus-wide, the cost the candidate path
+   avoids."
+  [db]
+  (distinct (map datom/datom-e (datom/datoms db :aevt :doc/text))))
+
+(defn all-posting-eids
+  "Every posting entity, by the full AEVT column read of `:post/term`. The read
+   the rank-index projection walks (a derived build, not a query path)."
+  [db]
+  (distinct (map datom/datom-e (datom/datoms db :aevt :post/term))))
+
+(defn doc-score-db
+  "`doc`'s summed `:post/tf` over the postings whose term is in `terms`, by
+   reading the document's postings through the AVET index on `:post/doc`. A
+   corpus-wide oracle read: every doc pays its own posting count."
+  [db doc terms]
+  (let [tset (set terms)]
+    (reduce
+      (fn [acc p]
+        (let [e (datom/entity db p)]
+          (if (contains? tset (:post/term e))
+            (+ acc (or (:post/tf e) 0))
+            acc)))
+      0
+      (map datom/datom-e (datom/datoms db :avet :post/doc doc)))))
+
+(defn authorized?
+  "The store-side authorization gate: LIVE and (PUBLIC or READER contains
+   `principal`). Read through `datom/entity`, one bounded EAVT read of the
+   document's own datoms. Sparse ACLs are a vector that simply lacks the
+   principal; revocation is the absence of a `:doc/reader` datom. Fail-closed:
+   an unknown principal is not public and not in the reader set."
+  [db principal doc]
+  (let [e (datom/entity db doc)]
+    (and (= true (:doc/live e))
+         (or (= true (:doc/public e))
+             (if (some (fn [r] (= principal r)) (:doc/reader e)) true false)))))
+
+(defn- candidate-scores-counted
+  "`candidate-scores` WITH a real counter: returns
+   `{:scores {doc-eid → summed tf} :posting-rows n}` where `n` is the number of
+   posting rows actually materialized (Σ df over the query terms). The counter
+   is the store read, not a relabelling of the sort."
+  [db terms]
+  (reduce
+    (fn [acc term]
+      (reduce
+        (fn [acc2 p]
+          (let [e (datom/entity db p)
+                d (:post/doc e)
+                tf (or (:post/tf e) 0)
+                scores (get acc2 :scores)]
+            {:scores (assoc scores d (+ (or (get scores d) 0) tf))
+             :posting-rows (+ (get acc2 :posting-rows) 1)}))
+        acc
+        (postings-for-term db term)))
+    {:scores {} :posting-rows 0}
+    terms))
+
+(defn candidate-scores
+  "`{doc-eid → summed tf}` over the postings for `terms` ONLY. Reads
+   `sum_t df(t)` posting rows plus one entity read per posting; never touches a
+   document outside the posting set and never scans `:doc/text`. NB: this
+   materializes the WHOLE candidate set — it is posting-restricted, not
+   page-bounded."
+  [db terms]
+  (get (candidate-scores-counted db terms) :scores))
+
+(defn ranked-score-pairs
+  "A candidate score map as an ordered `[doc-eid score]` list, by
+   (score desc, eid asc). `keys` order is unspecified, so the sort is what
+   makes the result deterministic — the stable-rank requirement. NB: this sorts
+   the WHOLE scored candidate set; there is no partial order to stop early on."
+  [scores]
+  (sort-by rank-key
+           (mapv (fn [d] [d (get scores d)]) (keys scores))))
+
+(defn- hits->maps
+  "[doc score] pairs as result maps."
+  [pairs]
+  (vec (map (fn [p] {:eid (get p 0) :score (get p 1)}) pairs)))
+
+(defn oracle-topk-db
+  "THE FULL AUTHORIZED-SORT ORACLE over the store: enumerate EVERY document
+   (AEVT on :doc/text), score each by its own postings, keep the permitted,
+   order by (score desc, eid asc), take k. Corpus-wide by construction — the
+   read the candidate path exists to avoid, and the reference it must equal."
+  [db principal terms k]
+  (let [docs (all-doc-eids db)
+        tset (set terms)
+        scored (filterv (fn [p] (> (get p 1) 0))
+                        (mapv (fn [d] [d (doc-score-db db d tset)]) docs))
+        permitted (filterv (fn [p] (authorized? db principal (get p 0))) scored)
+        ranked (sort-by rank-key permitted)]
+    {:status :exact
+     :hits (hits->maps (take k ranked))
+     :total (count permitted)
+     :candidates (count scored)
+     :posting-rows nil
+     :ranked (count scored)
+     :examined (count scored)}))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 3. CURSOR PROVENANCE
+; ═══════════════════════════════════════════════════════════════════════
+;
+; A cursor records WHAT IT IS A POSITION IN: the store, the basis it was taken
+; at, the query/term and principal it was ranked for, and the order identity.
+; Resuming against a different db value, a different query, or a different
+; principal is a REFUSAL, not a silent best-effort.
+
+(defn store-identity
+  "The store a db value reads, through any transparent wrapper. Used as the
+   cursor's store component; `=` compares records structurally, and two dbs
+   over the same connection share the one store."
+  [db]
+  (datom.store/identity-of (datom.db/store-of db)))
+
+(def order-identity-score-desc-eid-asc :score-desc-eid-asc)
+(def order-identity-post-rank :post-rank-score-desc-eid-asc)
+
+(defn ranked-cursor
+  "A provenance cursor for `page-topk-db`: position `pos` (`[eid score]`,
+   exclusive) in the (score desc, eid asc) order, for a given store/basis/query/
+   principal."
+  [db principal terms pos]
+  {:cursor/kind :ranked-topk
+   :cursor/store (store-identity db)
+   :cursor/basis (datom/basis-t db)
+   :cursor/query (vec terms)
+   :cursor/principal principal
+   :cursor/order order-identity-score-desc-eid-asc
+   :cursor/after pos})
+
+(defn ranked-cursor-ok?
+  "Whether `c` is a valid `page-topk-db` cursor for THIS db value, query and
+   principal. False for nil or any provenance mismatch."
+  [db principal terms c]
+  (and (map? c)
+       (not (nil? (get c :cursor/kind)))
+       (= (get c :cursor/kind) :ranked-topk)
+       (= (:cursor/store c) (store-identity db))
+       (= (:cursor/basis c) (datom/basis-t db))
+       (= (:cursor/query c) (vec terms))
+       (= (:cursor/principal c) principal)
+       (= (:cursor/order c) order-identity-score-desc-eid-asc)))
+
+(defn- walk-authorized
+  "Walk ranked `[doc score]` pairs applying the gate per candidate; collect the
+   first `k` permitted AND count every permitted row seen (the total). A denied
+   candidate advances the walk without consuming a hit. Examines EVERY candidate
+   (the total needs it); this is the authoritative exact path."
+  [db principal ranked k]
+  (loop [rs ranked kept [] total 0 examined 0]
+    (if (empty? rs)
+      {:hits kept :total total :examined examined}
+      (let [p (first rs)]
+        (if (authorized? db principal (get p 0))
+          (recur (rest rs)
+                 (if (< (count kept) k) (conj kept p) kept)
+                 (+ total 1)
+                 (+ examined 1))
+          (recur (rest rs) kept total (+ examined 1)))))))
+
+(defn indexed-topk-db
+  "The EXACT authorized top-k over the posting index.
+
+   Returns `{:status :exact :hits [{:eid :score} …] :total n :candidates c
+   :posting-rows r :ranked m :examined e}`:
+     :hits          the first `k` PERMITTED candidates in (score desc, eid asc)
+     :total         how many candidates are permitted (NOT the page length)
+     :candidates    how many documents matched a query term at all
+     :posting-rows  posting rows materialized by `candidate-scores`
+     :ranked        candidates that entered the sort (== :candidates)
+     :examined      ranked candidates the authorization walk visited
+
+   This path visits EVERY candidate to report an honest `:total`; it is exact
+   and, by construction, posting-wide rather than page-bounded."
+  [db principal terms k]
+  (if (<= k 0)
+    {:status :exact :hits [] :total nil :candidates 0 :posting-rows 0 :ranked 0
+     :examined 0 :note :non-positive-k}
+    (let [scored (candidate-scores-counted db terms)
+          scores (get scored :scores)
+          ranked (ranked-score-pairs scores)
+          r (walk-authorized db principal ranked k)]
+      {:status :exact
+       :hits (hits->maps (get r :hits))
+       :total (get r :total)
+       :candidates (count scores)
+       :posting-rows (get scored :posting-rows)
+       :ranked (count scores)
+       :examined (get r :examined)})))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 4. BOUNDED PAGES — how far the page actually bounds work
+; ═══════════════════════════════════════════════════════════════════════
+
+(defn- rank-less?
+  "Does rank `a` come strictly before rank `b` in the total order? `a` and `b`
+   are `[eid score]` pairs; used to resume a page after its cursor."
+  [a b]
+  (let [sa (get a 1) sb (get b 1)]
+    (or (> sa sb) (and (= sa sb) (< (get a 0) (get b 0))))))
+
+(defn- walk-page
+  "Walk ranked `[doc score]` pairs applying the gate, stopping the moment `k`
+   permitted rows are collected. Reports the last pair EXAMINED as the resume
+   position, so resumption is exact even when the last candidate was denied.
+   `:more?` says whether candidates remained unexamined. NB: `ranked` was
+   ALREADY fully materialized and sorted by the caller — this walk only bounds
+   the authorization reads, not the ranking."
+  [db principal ranked k]
+  (loop [rs ranked kept [] scanned 0 last nil]
+    (if (or (= k (count kept)) (empty? rs))
+      {:hits kept :cursor last :scanned scanned :more? (not (empty? rs))}
+      (let [p (first rs)]
+        (recur (rest rs)
+               (if (authorized? db principal (get p 0)) (conj kept p) kept)
+               (+ scanned 1)
+               p)))))
+
+(defn page-topk-db
+  "ONE page of the authorized ranked result after provenance cursor `after` (a
+   `ranked-cursor` map, or nil for the first page). Returns
+   `{:status :exact|:refused :hits … :cursor … :more? bool :scanned n
+     :candidates c :ranked m :posting-rows r :examined e}`.
+
+   BOUNDS: the authorization walk stops at k permitted rows, so the ACL entity
+   reads follow `page`; the candidate POSTING read and the SORT are still
+   O(Σ df(terms) + c log c). Do NOT read a first page as O(page).
+
+   A cursor whose provenance (store, basis, query, principal, order) does not
+   match this db value is REFUSED — `:reason :cursor-mismatch` — rather than
+   resumed on an assumption. There is no `:total` here: the page did not walk
+   the whole candidate set."
+  [db principal terms after k]
+  (if (and (not (nil? after)) (not (ranked-cursor-ok? db principal terms after)))
+    {:status :refused :reason :cursor-mismatch :hits [] :cursor nil :more? false
+     :scanned 0 :candidates 0 :ranked 0 :posting-rows 0 :examined 0}
+    (if (<= k 0)
+      {:status :exact :hits [] :cursor nil :more? false :scanned 0
+       :candidates 0 :ranked 0 :posting-rows 0 :examined 0 :note :non-positive-k}
+      (let [scored (candidate-scores-counted db terms)
+            scores (get scored :scores)
+            ranked (ranked-score-pairs scores)
+            pos (get after :cursor/after)
+            ordered (if (nil? pos)
+                      ranked
+                      (filterv (fn [p] (rank-less? pos p)) ranked))
+            r (walk-page db principal ordered k)]
+        {:status :exact
+         :hits (hits->maps (get r :hits))
+         :cursor (if (get r :more?)
+                   (ranked-cursor db principal terms (get r :cursor))
+                   nil)
+         :more? (get r :more?)
+         :scanned (get r :scanned)
+         :examined (get r :scanned)
+         :candidates (count scores)
+         :ranked (count scores)
+         :posting-rows (get scored :posting-rows)}))))
+
+(defn fixed-overfetch-db
+  "THE NAIVE CONTROL on the real index: rank candidates globally with NO
+   authorization, take the top `k * overfetch`, THEN filter permitted. Exists so
+   the test can exhibit the miss against a live datom store — and so the bug is
+   a named, removable design rather than a shape someone re-introduces."
+  [db principal terms k overfetch]
+  (let [scores (candidate-scores db terms)
+        ranked (ranked-score-pairs scores)
+        window (take (* k overfetch) ranked)
+        permitted (filterv (fn [p] (authorized? db principal (get p 0))) window)]
+    {:hits (hits->maps (take k permitted))}))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 5. THE WORK-BUDGET CONTRACT
+; ═══════════════════════════════════════════════════════════════════════
+;
+; The multikey path cannot page its posting read (there is no ordered multi-term
+; index), so a budget is enforced by ADMISSION: count the posting rows the query
+; needs (through the store's bounded key count when it has one) and refuse
+; before reading if the budget cannot cover them. When the substrate cannot
+; count, the read proceeds and the budget is checked after; either way the
+; verdict is exact or it carries no hits.
+
+(defn posting-df
+  "The number of posting rows for `term`: `{:count n :capped bool}` from the
+   store's bounded key count, or nil when the substrate cannot count without
+   reading. `limit` bounds the count when the caller only cares about a ceiling."
+  ([db term] (posting-df db term nil))
+  ([db term limit]
+   (let [store (datom.db/store-of db)]
+     (if (datom.store/count-capable? store)
+       (let [lo (datom.index/key-prefix :avet :post/term term)
+             hi (datom.index/prefix-end lo)
+             r (datom.store/count-range store lo hi (or limit 1073741824))]
+         r)
+       nil))))
+
+(defn- known-posting-rows
+  "The summed known df for `terms` as `{:rows n :capped bool}`, or nil when any
+   term's df is unknown. `:capped` true means `:rows` is a LOWER BOUND (the key
+   count stopped at `limit`). Walks `count-range` per term, so it is itself a
+   bounded per-term key count."
+  [db terms limit]
+  (loop [ts terms acc 0 capped false]
+    (if (empty? ts)
+      {:rows acc :capped capped}
+      (let [r (posting-df db (first ts) limit)]
+        (if (nil? r)
+          nil
+          (recur (rest ts) (+ acc (get r :count)) (or capped (get r :capped))))))))
+
+(defn- verdict-from-scores
+  "The shared exact/incomplete verdict once the posting read has happened.
+   `scored` is the `candidate-scores-counted` result; the budget is re-checked against
+   the real posting-row counter, so a substrate that could not count ahead of
+   the read still cannot present a partial ranking as exact."
+  [db principal terms k budget scored]
+  (if (and (not (nil? budget)) (> (get scored :posting-rows) budget))
+    {:status :incomplete :reason :posting-budget-exhausted-after-read
+     :hits [] :total nil :candidates (count (get scored :scores))
+     :posting-rows (get scored :posting-rows) :ranked 0 :examined 0
+     :budget budget :resume (ranked-cursor db principal terms nil)}
+    (let [scores (get scored :scores)
+          ranked (ranked-score-pairs scores)
+          r (walk-authorized db principal ranked k)]
+      {:status :exact
+       :hits (hits->maps (get r :hits))
+       :total (get r :total)
+       :candidates (count scores)
+       :posting-rows (get scored :posting-rows)
+       :ranked (count scores)
+       :examined (get r :examined)
+       :budget budget})))
+
+(defn budgeted-topk-db
+  "The EXACT-or-REFUSED authorized top-k under a posting-row budget.
+
+   `opts` may hold `:max-posting-rows n`. Verdicts:
+     :exact      `:hits`/`:total` are the true answer (budget not exceeded);
+     :refused    the KNOWN posting rows exceed the budget — declined before the
+                 read, `:hits []`, `:required-posting-rows` names the cost;
+     :incomplete the substrate could not count ahead of the read and the read
+                 exceeded the budget — `:hits []`, `:resume` is a provenance
+                 cursor for a retry at a higher budget.
+
+   Never returns a partial ranking as `:exact`. A non-positive k is `:exact`
+   with no hits."
+  [db principal terms k opts]
+  (let [budget (get opts :max-posting-rows)]
+    (cond
+      (<= k 0)
+      {:status :exact :hits [] :total nil :candidates 0 :posting-rows 0
+       :ranked 0 :examined 0 :budget budget :note :non-positive-k}
+
+      (nil? budget)
+      (verdict-from-scores db principal terms k nil (candidate-scores-counted db terms))
+
+      :else
+      (let [known (known-posting-rows db terms (inc budget))]
+        (if (and (not (nil? known)) (> (get known :rows) budget))
+          {:status :refused :reason :posting-budget-exhausted
+           :hits [] :total nil :candidates nil
+           :posting-rows 0 :ranked 0 :examined 0
+           :required-posting-rows (if (get known :capped) nil (get known :rows))
+           :required-posting-rows-at-least (get known :rows)
+           :budget budget
+           :resume (ranked-cursor db principal terms nil)}
+          (verdict-from-scores db principal terms k budget (candidate-scores-counted db terms)))))))
+; ═══════════════════════════════════════════════════════════════════════
+; 6. THE ORDERED SINGLE-TERM POSTING PAGE (genuinely bounded)
+; ═══════════════════════════════════════════════════════════════════════
+; `:post/rank` encodes (term, score DESC, doc-eid ASC) so that a lexicographic
+; AVET prefix read on the term yields the postings ALREADY in rank order, and
+; `datom.store/page-datoms` reads that prefix in bounded pages. This is the one
+; path in this file whose first page reads O(page + denied) POSTING rows — and
+; only on a substrate that implements `datom.store/PageScan`. On ETS the
+; documented `scan-via-range-page` fallback materializes the whole prefix, so
+; `:bounded?` is false there and callers can tell.
+
+(def ^:private rank-sep "~|~")
+(def ^:private rank-field 13)
+(def ^:private ordered-page-size 64)
+
+(defn- fixed
+  "`x` left-zero-padded to `n` characters, so lexicographic order is numeric
+   order. A loop, not `format`/`repeat`, to stay within the kernel's affordances."
+  [n x]
+  (let [s (str x)]
+    (loop [i (- n (count s)) out ""]
+      (if (<= i 0) (str out s) (recur (- i 1) (str out "0"))))))
+
+(defn posting-rank-value
+  "The `:post/rank` value for a posting: `term` + separator + inverted score
+   (fixed width, so DESCENDING) + doc eid (fixed width, ascending). Within one
+   term prefix, lexicographic order is exactly (score desc, doc-eid asc)."
+  [term tf eid]
+  (when (or (not (erlang/is_binary term))
+            (not (erlang/is_integer tf)) (< tf 1) (> tf 1000000000000)
+            (not (erlang/is_integer eid)) (< eid 0) (>= eid 10000000000000))
+    (throw (ex-info "rank value outside the declared fixed-width domain" {:term term :tf tf :eid eid})))
+  (str (erlang/byte_size term) ":" term rank-sep
+       (fixed rank-field (- 1000000000000 tf)) (fixed rank-field eid)))
+
+(defn- rank-prefix [term] (str (erlang/byte_size term) ":" term rank-sep))
+
+(defn rank-index-tx
+  "Transaction data writing `:post/rank` for every posting, from the REAL doc
+   eids. This is the derived-projection pass a production pipeline would run
+   through the existing derived/reconcile machinery: it needs the postings to
+   exist first (so eids are known), which is why it is a second pass rather than
+   part of `index-doc-tx`."
+  [db]
+  (mapv
+    (fn [p]
+      (let [e (datom/entity db p)]
+        {:db/id p
+         :post/rank (posting-rank-value (:post/term e) (:post/tf e) (:post/doc e))}))
+    (all-posting-eids db)))
+
+(defn- string-prefix-key
+  "A store-key prefix matching every AVET entry whose STRING value starts with
+   `s`. `datom.index/key-prefix` encodes the string with a trailing 0x00
+   terminator, and that terminator is not a byte-prefix of a longer value — so
+   it is dropped, leaving `index-tag + attr + TAG-STR + escaped(s)`, which IS a
+   proper prefix. (String encoding is order-preserving raw UTF-8 with 0x00
+   escaped as 0x00 0xFF, so the prefix is exact even when `s` contains NUL.)"
+  [index attr s]
+  (let [full (datom.index/key-prefix index attr s)]
+    (erlang/binary_part full 0 (- (erlang/byte_size full) 1))))
+
+(defn page-capable?
+  "Whether this db value's substrate implements the bounded `PageScan` read.
+   Asked of the CAPABILITY target, so a transparent profiler does not answer for
+   a substrate that lacks it. False on the ETS development substrate."
+  [db]
+  (satisfies? datom.store/PageScan (datom.store/capability-target (datom.db/store-of db))))
+
+(defn posting-page
+  "One bounded page of `term`'s postings IN RANK ORDER, read from the
+   `:post/rank` AVET prefix. Returns
+   `{:datoms […] :next key :more? bool :rows n :visible v :bounded? bool}`:
+     :page-rows  rows the page RETURNED;
+     :rows       rows the store actually READ — the page size when the
+                 substrate pages, the whole term's posting count when it fell
+                 back, so a budget cannot be fooled by a wide fallback;
+     :visible    posting datoms visible in this db value's basis;
+     :bounded? whether the read used the substrate's `PageScan` (false ⇒ the
+               documented materialize-the-range fallback).
+   `after` is a raw store key (exclusive) or nil to start at the term prefix."
+  [db term after limit]
+  (let [store (datom.db/store-of db)
+        lo (string-prefix-key :avet :post/rank (rank-prefix term))
+        hi (datom.index/prefix-end lo)
+        start (if (nil? after) lo nil)
+        res (datom.store/page-datoms store start after hi limit)
+        raw (get res :datoms)
+        ;; A physical page can split an assertion from its later retraction.
+        ;; filter-datoms requires a complete candidate scope for pairing; resolve
+        ;; visibility through each posting's complete EAVT attribute instead.
+        visible (filterv
+                  (fn [d]
+                    (and (datom/datom-added? d)
+                         (some (fn [current] (= current d))
+                               (datom/datoms db :eavt (datom/datom-e d) :post/rank))))
+                  raw)]
+    {:datoms (vec visible)
+     :next (get res :last)
+     :more? (not (get res :end?))
+     :page-rows (count raw)
+     :rows (if (page-capable? db)
+             (count raw)
+             ; the fallback materialized the whole prefix; report that, not the
+             ; page it returned, so the budget counter cannot be fooled
+             (get (datom.store/count-range store lo hi 1073741824) :count))
+     :visible (count visible)
+     :bounded? (page-capable? db)}))
+
+(defn ordered-cursor
+  "Provenance cursor for `ordered-topk-page`: a raw `:post/rank` key (exclusive)
+   bound to store/basis/term/principal/order."
+  [db principal term after]
+  {:cursor/kind :ordered-posting
+   :cursor/store (store-identity db)
+   :cursor/basis (datom/basis-t db)
+   :cursor/term term
+   :cursor/principal principal
+   :cursor/order order-identity-post-rank
+   :cursor/after after})
+
+(defn ordered-cursor-ok?
+  [db principal term c]
+  (and (map? c)
+       (not (nil? (get c :cursor/kind)))
+       (= (get c :cursor/kind) :ordered-posting)
+       (= (:cursor/store c) (store-identity db))
+       (= (:cursor/basis c) (datom/basis-t db))
+       (= (:cursor/term c) term)
+       (= (:cursor/principal c) principal)
+       (= (:cursor/order c) order-identity-post-rank)))
+
+(defn- ordered-admission
+  "A finite budget cannot admit an unbounded range fallback without a bounded
+   Count proving the complete physical rank prefix fits. Unknown refuses."
+  [db term budget bounded?]
+  (when (and (some? budget) (not bounded?))
+    (let [store (datom.db/store-of db)]
+      (if (not (datom.store/count-capable? store))
+        {:status :refused :reason :unbounded-substrate :hits [] :more? true
+         :posting-rows 0 :examined 0 :permitted-seen 0 :bounded? false}
+        (let [lo (string-prefix-key :avet :post/rank (rank-prefix term))
+              hi (datom.index/prefix-end lo)
+              need (datom.store/count-range store lo hi (inc budget))]
+          (when (> (:count need) budget)
+            {:status :refused :reason :posting-budget-exhausted :hits [] :more? true
+             :posting-rows 0 :examined 0 :permitted-seen 0 :bounded? false
+             :required-posting-rows-at-least (:count need)}))))))
+
+(defn ordered-topk-page
+  "ONE genuinely bounded page of `term`'s authorized top-k, walked in `:post/rank`
+   order. `opts` may hold `:cursor` (an `ordered-cursor`) and `:max-posting-rows`.
+
+   Reads posting rows in pages no larger than the remaining budget, applies the
+   authorization gate as it goes, and stops at k permitted rows. Verdicts:
+     :exact      hits are the true top-k for this term (budget not hit);
+     :incomplete the budget ran out before k was found — `:hits []` and a
+                 `:resume` cursor, never a partial ranking;
+     :refused    the cursor's provenance does not match this db/term/principal.
+   `:bounded?` is false when the substrate fell back to materializing the range,
+   so the caller can tell a genuinely bounded page from a correct-but-wide one.
+   A non-positive k is `:exact` with no hits."
+  [db principal term k opts]
+  (let [budget (get opts :max-posting-rows)
+        cursor (get opts :cursor)
+        bounded? (page-capable? db)]
+    (cond
+      (<= k 0)
+      {:status :exact :hits [] :cursor nil :more? false :posting-rows 0
+       :examined 0 :permitted-seen 0 :bounded? bounded? :note :non-positive-k}
+
+      (and (not (nil? cursor)) (not (ordered-cursor-ok? db principal term cursor)))
+      {:status :refused :reason :cursor-mismatch :hits [] :cursor nil :more? false
+       :posting-rows 0 :examined 0 :permitted-seen 0 :bounded? bounded?}
+
+      (or (not (erlang/is_binary term))
+          (and (some? budget) (or (not (erlang/is_integer budget)) (< budget 0))))
+      {:status :refused :reason :invalid-query-budget :hits [] :cursor nil
+       :posting-rows 0 :examined 0 :bounded? bounded?}
+
+      :else
+      (let [admission (ordered-admission db term budget bounded?)]
+        (if admission
+          (assoc admission :resume (ordered-cursor db principal term (get cursor :cursor/after)))
+          (loop [after (get cursor :cursor/after nil) kept [] rows 0 examined 0]
+        (if (and (not (nil? budget)) (>= rows budget))
+          (if (= k (count kept))
+            {:status :exact :hits (vec kept) :cursor nil :more? false
+             :posting-rows rows :examined examined :permitted-seen (count kept) :bounded? bounded?}
+            {:status :incomplete :reason :posting-budget-exhausted
+             :hits [] :resume (ordered-cursor db principal term (get cursor :cursor/after)) :more? true
+             :posting-rows rows :examined examined :permitted-seen (count kept) :bounded? bounded?})
+          ;; Never fetch more visible candidates than the remaining hit slots.
+          ;; Otherwise returning the store's end-of-page cursor would skip
+          ;; unexamined candidates from the same physical page.
+          (let [limit (max 1 (min ordered-page-size (- k (count kept))
+                                   (if (nil? budget) ordered-page-size (- budget rows))))
+                pg (posting-page db term after limit)
+                ds (get pg :datoms)
+                raw (get pg :rows)
+                step (reduce
+                       (fn [acc d]
+                         (if (>= (count (get acc :kept)) k)
+                           acc
+                           (let [p (datom/datom-e d)
+                                 e (datom/entity db p)
+                                 doc (:post/doc e)
+                                 score (:post/tf e)]
+                             (if (authorized? db principal doc)
+                               {:kept (conj (get acc :kept) {:eid doc :score score})
+                                :examined (+ (get acc :examined) 1)}
+                               {:kept (get acc :kept)
+                                :examined (+ (get acc :examined) 1)}))))
+                       {:kept kept :examined examined}
+                       ds)
+                kept2 (get step :kept)
+                examined2 (get step :examined)
+                rows2 (+ rows raw)]
+            (cond
+              (and (not (nil? budget)) (> rows2 budget))
+              {:status :incomplete :reason :substrate-budget-exceeded
+               :hits [] :resume (ordered-cursor db principal term (get cursor :cursor/after))
+               :more? true :posting-rows rows2 :examined examined2
+               :permitted-seen (count kept2) :bounded? (get pg :bounded?)}
+
+              (>= (count kept2) k)
+              {:status :exact :hits (vec kept2)
+               :cursor (ordered-cursor db principal term (get pg :next))
+               :more? (get pg :more?)
+               :posting-rows rows2 :examined examined2
+               :permitted-seen (count kept2) :bounded? (get pg :bounded?)}
+
+              (not (get pg :more?))
+              {:status :exact :hits (vec kept2) :cursor nil :more? false
+               :posting-rows rows2 :examined examined2
+               :permitted-seen (count kept2) :bounded? (get pg :bounded?)}
+
+              :else
+              (recur (get pg :next) kept2 rows2 examined2))))))))))
+
+; ═══════════════════════════════════════════════════════════════════════
+; 7. INDEX MAINTENANCE — a small prototype of the posting lifecycle
+; ═══════════════════════════════════════════════════════════════════════
+;
+; The candidate path is only as good as the postings. These two primitives are
+; the maintenance seam a real pipeline would drive from the derived/projection
+; machinery: one transaction to add a document and its postings, one to retire a
+; document and its postings together (so a tombstone cannot leave a dangling
+; posting that still matches). `:post/rank` is a SECOND, derived pass
+; (`rank-index-tx`) because it keys on the real doc eid.
+
+(defn posting-tx
+  "The posting rows for document record `d`
+   ({:id :text :tf …}): one posting per whitespace-separated term. Posting ids
+   are derived from the document's tempid, so they are unique within a fixture
+   and never collide with document or principal tempids."
+  [d]
+  (when (or (not (erlang/is_integer (:tf d))) (< (:tf d) 1) (> (:tf d) 1000000000000))
+    (throw (ex-info "posting frequency outside the declared positive domain" {:tf (:tf d)})))
+  (map-indexed
+    (fn [i w]
+      {:db/id (- (* (:id d) 100000) i)
+       :post/term w
+       :post/doc (:id d)
+       :post/tf (:tf d)})
+    (String/split (:text d) " ")))
+
+(defn index-doc-tx
+  "Transaction data adding one document and its postings. `:live` is always
+   written (so the gate has an explicit value); `:public`/`:readers` only when
+   supplied. Does NOT write `:post/rank`; run `rank-index-tx` after the docs
+   exist."
+  [d]
+  (into [{:db/id (:id d) :doc/text (:text d) :doc/live (:live d)}]
+        (concat
+          (if (:public d) [{:db/id (:id d) :doc/public true}] [])
+          (if (seq (:readers d)) [{:db/id (:id d) :doc/reader (:readers d)}] [])
+          (posting-tx d))))
+
+(defn retract-doc!
+  "Retire a document AND its postings atomically: reads the document's postings
+   through the AVET index on `:post/doc`, then retracts every posting and the
+   document in one transaction. After this the candidate path can neither match
+   the document by a stale posting nor authorize it."
+  [conn doc-id]
+  (let [db (datom/db conn)
+        ps (mapv datom/datom-e (datom/datoms db :avet :post/doc doc-id))]
+    (datom/transact! conn
+                     (into (mapv (fn [p] [:db/retractEntity p]) ps)
+                           [[:db/retractEntity doc-id]]))))

@@ -1,0 +1,501 @@
+; research/structural/realm.bl — realm-local AOT cache adapter (FUP-155, step 1).
+;
+; ── WHAT THIS SPIKE IS ──────────────────────────────────────────────────────
+;
+; FUP-155 measured that realm-local namespaces are compiled from source on
+; EVERY load, in every process and every realm, because the shared AOT repair
+; publishes at :global. The design chosen for the first step (smaller than the
+; cross-realm beam rename) is:
+;
+;     key := (compiler-key, resolved-dependency-closure, realm segment)
+;     compile the namespace INSIDE the realm's env so the emitted modules
+;     already carry R<key>/S<hash>;  next load of the same closure in the same
+;     segment fetches the beams and replays __bl_init__ in the realm's env.
+;
+; This module is an ADAPTER, not the production loader: it drives the EXISTING
+; machinery — ``BeamLisp.AOTCache`` (closure_key / entry_dir / store / fetch /
+; run_init_modules / hash_parts), ``BeamLisp.Emit`` (module_for / descriptor_for
+; / compile_descriptor / the ANF node constructors) and ``BeamLisp.Env`` (fork /
+; with_env / put_key / lookup) — and adds only the segment fold and the
+; per-env init. Nothing here is wired into the loader; the production diff is
+; listed in realm.md.
+;
+; ── THE CONTRACT, CLAUSE FOR CLAUSE (see realm_test.bl) ─────────────────────
+;
+;  (a) executable candidate  `build!` compiles a REAL BEAM module (through the
+;      pinned Emit surface and the Core lowerer — the same construction live and
+;      AOT namespaces go through) or loads it from the cache.
+;  (b) baseline oracle       the module's baked `who/0` is the identity oracle;
+;      the fetched beam bytes are checked against the stored entry.
+;  (c) positive invariants   `check-logic` (veritas, finite exhaustive) and
+;      `smt-key-obligations` (z3) prove key separation and the lifecycle bound.
+;  (d) negative control      the segment-blind key is shown to collide, both as
+;      a veritas witness and as a z3 model, and executably at the cache.
+;  (e) work experiment       `count-of` / `counters-map`: compiles vs cache
+;      loads vs inits, so the reduction is measured, not asserted.
+;  (f) scope notes           realm.md.
+;  (g) sequential boundary   `build!` binds a namespace to ONE entry per open
+;      generation; a changed entry REFUSES (reload unsupported, races
+;      unsupported). A changed closure is observed after close + reopen.
+;
+; ── PROOF BOUNDARY ──────────────────────────────────────────────────────────
+;
+; The logic tools prove the KEY ALGEBRA and the LIFECYCLE MODEL, not the cache
+; implementation. The runtime BEAM test proves the cache implementation. A
+; solver `:unknown` is NEVER read as proven — the tests assert the exact
+; modality/status, so an undecided obligation fails loudly.
+
+(ns research.structural.realm
+  (:require [veritas :as v]
+            [z3]
+            [smt :as smtlib]))
+
+; ═════════════════════════════════════════════════════════════════════════
+; the realm segment rule — mirrors priv/host/loader.bl's segment_for/3
+; ═════════════════════════════════════════════════════════════════════════
+
+(def REALM-PREFIX "R")
+(def SHARED-PREFIX "S")
+(def SHARED-DIGITS 12)
+(def HASH-PREFIX-LEN 7)                        ; the length of "sha256:"
+
+(defn realm-segment
+  "The module-name segment a realm's own (or shadowed) namespace sits under:
+   R<key>, exactly as `BeamLisp.Emit/realm_of` resolves and `Loader/segment_for`
+   builds it. `key` is the realm's identity key."
+  [key]
+  (str REALM-PREFIX key))
+
+(defn shared-segment
+  "The module-name segment a declared-shared namespace sits under: S<first 12
+   hex of the declared hash>. The hash is the realm's ``:uses`` declaration."
+  [declared-hash]
+  (str SHARED-PREFIX (String/slice declared-hash HASH-PREFIX-LEN SHARED-DIGITS)))
+
+; ═════════════════════════════════════════════════════════════════════════
+; the key — compiler + resolved dependency closure + realm segment
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn sha256-hex
+  "A content hash string, by the SAME NUL-joined sha256 rule every AOTCache key
+   uses (`AOTCache/hash_parts/1`). Used for the fixture's source bytes."
+  [bytes]
+  (BeamLisp.AOTCache/hash_parts (list bytes)))
+
+(defn closure-key-of
+  "The resolved dependency-closure key, straight from the existing
+   `BeamLisp.AOTCache/closure_key`: `path` + its content hash plus every
+   transitive `:require` target within the source set. A macro provider's bytes
+   are part of the closure, so editing the provider moves this key."
+  [path deps hashes]
+  (BeamLisp.AOTCache/closure_key path deps hashes))
+
+(defn naive-key
+  "The deliberately WRONG design: the key omits the realm segment. Two realms
+   with the same closure then collide. Kept executable so the negative control
+   is a witness, not a sentence."
+  [closure-key]
+  closure-key)
+
+(defn entry-key
+  "The cache's closure-key SLOT for a realm entry: the resolved dependency
+   closure and the realm segment, folded by the cache's own NUL-joined sha256.
+   The compiler key rides in the cache's first slot, so the address is
+   (compiler-key, entry-key) — exactly the contract."
+  [closure-key segment]
+  (BeamLisp.AOTCache/hash_parts (list closure-key segment)))
+
+; ═════════════════════════════════════════════════════════════════════════
+; counters — the observable work experiment (e)
+; ═════════════════════════════════════════════════════════════════════════
+
+(def COUNTER-COMPILE 1)
+(def COUNTER-LOAD 2)
+(def COUNTER-INIT 3)
+(def COUNTER-OPEN 4)
+
+(defn- counter-ref []
+  (let [k (tuple :research.structural.realm :counters)
+        existing (persistent_term/get k nil)]
+    (if (nil? existing)
+      (let [fresh (atomics/new 4 (list))]
+        (persistent_term/put k fresh)
+        fresh)
+      existing)))
+
+(defn reset-counters!
+  "Zero every counter. Called by the hermetic test wrapper."
+  []
+  (let [ref (counter-ref)]
+    (atomics/put ref COUNTER-COMPILE 0)
+    (atomics/put ref COUNTER-LOAD 0)
+    (atomics/put ref COUNTER-INIT 0)
+    (atomics/put ref COUNTER-OPEN 0)
+    :ok))
+
+(defn count-of [idx] (atomics/get (counter-ref) idx))
+(defn- bump! [idx] (atomics/add_get (counter-ref) idx 1))
+
+(defn compile-count [] (count-of COUNTER-COMPILE))
+(defn load-count [] (count-of COUNTER-LOAD))
+(defn init-count [] (count-of COUNTER-INIT))
+(defn open-count [] (count-of COUNTER-OPEN))
+
+(defn counters-map
+  "The work experiment as data: how many entries were compiled, served from
+   cache, initialized, and how many realm generations were opened."
+  []
+  {:compile (compile-count) :load (load-count)
+   :init (init-count) :open (open-count)})
+
+; ═════════════════════════════════════════════════════════════════════════
+; realm lifecycle — open once, one entry per namespace per generation,
+; close purges. SEQUENTIAL CONTRACT: `init-once!` binds a namespace to exactly
+; one entry-key in an open generation; a changed entry within that generation
+; REFUSES (reload unsupported, races unsupported). A changed closure is
+; observed in a fresh generation (close + reopen); the cache entry survives.
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn- registry []
+  (if (erlang/== :undefined (ets/whereis :research_realm_lifecycle))
+    (do (ets/new :research_realm_lifecycle (list :named_table :set :public))
+        :research_realm_lifecycle)
+    :research_realm_lifecycle))
+
+(defn init-key
+  "The env key a realm module's `__bl_init__/0` writes its baked value under.
+   An atom, because `BeamLisp.Env/put_key` prefixes only atoms and tuples."
+  [ns]
+  (keyword (str "bl-spike-init-" ns)))
+
+(defn- require-open!
+  "The open context for `realm-id`, or a loud refusal — no silent init of a
+   closed realm. The registry row is `{realm-id, ctx}`; `ctx` is element 1 of
+   the row under the 0-based `elem` (Erlang `element/2` is 1-based)."
+  [realm-id]
+  (let [rows (ets/lookup (registry) realm-id)]
+    (if (erlang/== 0 (erlang/length rows))
+      (erlang/error
+        (Elixir.RuntimeError/exception
+          (str "realm is not open: " realm-id)))
+      (elem (erlang/hd rows) 1))))
+
+(defn open-realm!
+  "Open `realm-id` under `key`, or return the already-open context UNCHANGED —
+   idempotent, so a second open of the same generation does not start a second
+   lifecycle. Returns {:realm :key :segment :env :entries}."
+  [realm-id key]
+  (let [t (registry)
+        rows (ets/lookup t realm-id)]
+    (if (erlang/> (erlang/length rows) 0)
+      (let [ctx (elem (erlang/hd rows) 1)]
+        (when (not= key (:key ctx))
+          (throw (ex-info "an open realm cannot change its identity key" {:realm realm-id})))
+        ctx)
+      (let [_ (when (some (fn [row] (= key (:key (elem row 1)))) (ets/tab2list t))
+                (throw (ex-info "an active realm segment has one owner" {:realm realm-id :key key})))
+            env (BeamLisp.Env/fork :global)
+            ctx {:realm realm-id :key key :segment (realm-segment key)
+                 :env env :entries {}}]
+        (ets/insert t (tuple realm-id ctx))
+        (bump! COUNTER-OPEN)
+        ctx))))
+
+(defn- purge-modules!
+  "Drop the realm's loaded modules from the code server, so a close does not
+   retain them and a reopen can reload them."
+  [mods]
+  (Enum/each mods
+    (fn [m]
+      (try (code/delete m) (catch _e nil))
+      (try (code/purge m) (catch _e nil))))
+  :ok)
+
+(defn close-realm!
+  "Close `realm-id`: purge its loaded modules, destroy its env, reset its
+   body-module numbering (so a reopen reuses the same atom names rather than
+   minting new ones), and forget the generation. Idempotent."
+  [realm-id]
+  (let [t (registry)
+        rows (ets/lookup t realm-id)]
+    (if (erlang/== 0 (erlang/length rows))
+      :ok
+      (let [ctx (elem (erlang/hd rows) 1)]
+        (purge-modules! (get ctx :initialized-mods (list)))
+        (BeamLisp.Env/destroy (get ctx :env))
+        (BeamLisp.Emit/reset_body_sequence (get ctx :segment))
+        (ets/delete t realm-id)
+        :ok))))
+
+; ═════════════════════════════════════════════════════════════════════════
+; the executable candidate — compile a real module, or load the cached one
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn- compile-module!
+  "Compile a REAL BEAM module for `ns` under `segment`, baking `value` as the
+   exported `who/0` result and an `__bl_init__/0` that writes `value` into the
+   CURRENT (realm) env under `init-key`. Uses the pinned Emit surface and the
+   Core lowerer — no hand-built beam, no cached scalar pretending to be AOT."
+  [ns segment value env]
+  (let [mod (BeamLisp.Env/with_env env
+              (fn []
+                (BeamLisp.Env/put_key (tuple :realm_local ns) segment)
+                (BeamLisp.Emit/module_for ns)))
+        clauses (list
+                  (BeamLisp.Emit/function_clause :who (BeamLisp.Emit/lit value) (list))
+                  (BeamLisp.Emit/function_clause :__bl_init__
+                    (BeamLisp.Emit/sequence
+                      (list (BeamLisp.Emit/remote :Elixir.BeamLisp.Env :put_key
+                              (list (BeamLisp.Emit/lit (init-key ns))
+                                    (BeamLisp.Emit/lit value)))))
+                    (list)))
+        descriptor (BeamLisp.Emit/descriptor_for mod clauses (list) {})]
+    (BeamLisp.Emit/compile_descriptor descriptor)))
+
+(defn- write-beam!
+  "Materialize a compiled {module, bytes} in `dir`, the layout `store/4` wants."
+  [dir mod bytes]
+  (File/mkdir_p! dir)
+  (File/write! (Path/join dir (str mod ".beam")) bytes)
+  :ok)
+
+(defn- bound-entry
+  "The entry-key `ns` is bound to in the open generation, or nil."
+  [realm-id ns]
+  (let [ctx (elem (erlang/hd (ets/lookup (registry) realm-id)) 1)]
+    (get (get ctx :entries {}) ns)))
+
+(defn- check-entry!
+  "Refuse a second entry for `ns` in one open generation, BEFORE any compile,
+   store or load — a refused `build!` has no side effect. Reload is unsupported
+   (the adapter's sequential boundary); a changed closure is observed after
+   close + reopen."
+  [realm-id ns entry-key]
+  (let [prior (bound-entry realm-id ns)]
+    (if (and (some? prior) (erlang/not (erlang/== prior entry-key)))
+      (erlang/error
+        (Elixir.RuntimeError/exception
+          (str "realm " realm-id " already initialized " ns " from entry "
+               prior "; reloading a changed entry in one open generation is "
+               "unsupported - close and reopen the realm")))
+      :ok)))
+
+(defn- init-once!
+  "Replay the entry's `__bl_init__/0` in the realm env, at most once per
+   (generation, entry-key), and bind `ns` to that entry. `check-entry!` has
+   already refused a changed entry for this namespace; a same-entry call is a
+   no-op."
+  [realm-id env ns entry-key modules dir]
+  (let [t (registry)
+        ctx (elem (erlang/hd (ets/lookup t realm-id)) 1)
+        entries (get ctx :entries {})]
+    (if (some? (get entries ns))
+      :already
+      (do
+        (BeamLisp.Env/with_env env
+          (fn [] (BeamLisp.AOTCache/run_init_modules modules dir)))
+        (bump! COUNTER-INIT)
+        (ets/insert t (tuple realm-id
+                             (assoc ctx
+                                    :entries (assoc entries ns entry-key)
+                                    :initialized-mods (into (get ctx :initialized-mods (list)) modules))))
+        :initialized))))
+
+(defn build!
+  "Compile-or-load ONE realm entry. `realm-id` must be open.
+   `spec` keys: :ns :value :closure-key :compiler-key :dir.
+   Returns {:status :compiled|:reused :module :modules :entry-key :segment
+            :closure-key}. A store/fetch failure degrades to a compile, never to
+   a wrong module: `AOTCache/fetch` answers :miss for an absent, damaged or
+   partial entry."
+  [realm-id spec]
+  (let [ctx (require-open! realm-id)
+        env (get ctx :env)
+        segment (get ctx :segment)
+        ns (get spec :ns)
+        compiler (get spec :compiler-key)
+        closure (get spec :closure-key)
+        dir (get spec :dir)
+        rkey (entry-key closure segment)
+        identity [compiler rkey]
+        hit (do (check-entry! realm-id ns identity)
+                (BeamLisp.Env/with_env env
+                  (fn [] (BeamLisp.Env/put_key (tuple :realm_local ns) segment)))
+                (BeamLisp.AOTCache/fetch compiler rkey dir))]
+    (if (erlang/== :miss hit)
+      (let [compiled (compile-module! ns segment (get spec :value) env)
+            mod (elem compiled 0)
+            bytes (elem compiled 1)]
+        (bump! COUNTER-COMPILE)
+        (write-beam! dir mod bytes)
+        (BeamLisp.AOTCache/store compiler rkey dir (list mod))
+        (init-once! realm-id env ns identity (list mod) dir)
+        {:status :compiled :module mod :modules (list mod)
+         :entry-key rkey :segment segment :closure-key closure})
+      (let [modules (elem hit 1)]
+        (bump! COUNTER-LOAD)
+        (init-once! realm-id env ns identity modules dir)
+        {:status :reused :module (first modules) :modules modules
+         :entry-key rkey :segment segment :closure-key closure}))))
+
+(defn local-value
+  "The value `ns`'s init wrote into realm `realm-id`'s own env, or nil. Reads
+   through the env chain under that env, so two realms cannot see each other."
+  [realm-id ns]
+  (let [ctx (require-open! realm-id)]
+    (BeamLisp.Env/with_env (get ctx :env)
+      (fn []
+        (let [hit (BeamLisp.Env/lookup (init-key ns))]
+          (if (and (erlang/is_tuple hit) (erlang/== :ok (elem hit 0)))
+            (elem hit 1)
+            nil))))))
+
+; ═════════════════════════════════════════════════════════════════════════
+; (c)(d) the logic — veritas finite exhaustive + z3 symbolic obligations
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn- key-domain
+  "Every (compiler closure segment compiler' closure' segment') over a declared
+   2×2×2×2×2×2 domain — 64 pairs, each a 6-vector. Finite and declared, so
+   veritas answers by EXHAUSTION (engine :enumerate), not sampling."
+  []
+  (into [] (for [c [0 1] cl [0 1] s [0 1]
+                 c2 [0 1] cl2 [0 1] s2 [0 1]]
+             [c cl s c2 cl2 s2])))
+
+(defn- event-domain
+  "Every 3-event trace over {1 open, 2 close, 3 init} — 27 traces."
+  []
+  (into [] (for [a [1 2 3] b [1 2 3] c [1 2 3]] [a b c])))
+
+(defn- sep-pred
+  "∀ pairs: equal composite key ⇒ equal components. The arithmetic key
+   c*100 + cl*10 + s is the injective stand-in for the hashed entry-key."
+  []
+  '(if (= (+ (* v_0 100) (* v_1 10) v_2)
+          (+ (* v_3 100) (* v_4 10) v_5))
+       (and (= v_0 v_3) (= v_1 v_4) (= v_2 v_5))
+       true))
+
+(defn- naive-collision-pred
+  "∃ pairs: DIFFERENT segments, EQUAL segment-blind key. The witness is the
+   breach a key that omits the segment admits."
+  []
+  '(and (not (= v_2 v_5))
+        (= (+ (* v_0 100) (* v_1 10))
+           (+ (* v_3 100) (* v_4 10)))))
+
+(defn- naive-refute-pred
+  "∀ pairs: equal segment-blind key ⇒ equal segments. FALSE — the ∀ refutes and
+   shrinks to a witness."
+  []
+  '(if (= (+ (* v_0 100) (* v_1 10))
+          (+ (* v_3 100) (* v_4 10)))
+       (= v_2 v_5)
+       true))
+
+(defn- lifecycle-safe-pred
+  "∀ traces: over the CORRECT executor a realm generation is initialized AT
+   MOST ONCE. State is `(open, inits)` and the counter is NEVER clamped: `init`
+   increments only when the realm is open AND this generation has not yet
+   initialized; `open` starts a generation (inits reset), `close` ends one, and
+   `init` in a closed realm is a no-op. The invariant is proven from the
+   transition relation over all 27 event traces — not asserted by construction
+   — and `(or (= inits 0) (= open 1))` pins an init to an OPEN generation."
+  []
+  '(let [o0 0 i0 0
+         o1 (if (= v_0 1) 1 (if (= v_0 2) 0 o0))
+         i1 (if (= v_0 1) 0
+              (if (= v_0 2) 0
+                  (if (and (= v_0 3) (= o0 1) (= i0 0)) (+ i0 1) i0)))
+         o2 (if (= v_1 1) 1 (if (= v_1 2) 0 o1))
+         i2 (if (= v_1 1) 0
+              (if (= v_1 2) 0
+                  (if (and (= v_1 3) (= o1 1) (= i1 0)) (+ i1 1) i1)))
+         o3 (if (= v_2 1) 1 (if (= v_2 2) 0 o2))
+         i3 (if (= v_2 1) 0
+              (if (= v_2 2) 0
+                  (if (and (= v_2 3) (= o2 1) (= i2 0)) (+ i2 1) i2)))]
+     (and (<= i1 1) (<= i2 1) (<= i3 1)
+          (or (= i1 0) (= o1 1))
+          (or (= i2 0) (= o2 1))
+          (or (= i3 0) (= o3 1)))))
+
+(defn- naive-lifecycle-pred
+  "∃ traces: a NAIVE executor that increments on EVERY `init` while open
+   reaches two inits in one generation. This is the counterexample the correct
+   rule's `(= inits 0)` guard forbids; the witness trace is open·init·init."
+  []
+  '(let [o0 0 c0 0
+         o1 (if (= v_0 1) 1 (if (= v_0 2) 0 o0))
+         c1 (if (= v_0 1) 0
+              (if (= v_0 2) 0
+                  (if (and (= v_0 3) (= o0 1)) (+ c0 1) c0)))
+         o2 (if (= v_1 1) 1 (if (= v_1 2) 0 o1))
+         c2 (if (= v_1 1) 0
+              (if (= v_1 2) 0
+                  (if (and (= v_1 3) (= o1 1)) (+ c1 1) c1)))
+         o3 (if (= v_2 1) 1 (if (= v_2 2) 0 o2))
+         c3 (if (= v_2 1) 0
+              (if (= v_2 2) 0
+                  (if (and (= v_2 3) (= o2 1)) (+ c2 1) c2)))]
+     (or (>= c1 2) (>= c2 2) (>= c3 2))))
+
+(defn check-logic
+  "Every veritas check, as data. `with-solver` leases a solver from the
+   supervised z3 pool for the batch; the lease is released in `z3pool`'s own
+   `finally` (there is no raw port for a caller to hold — priv/std/z3pool.bl).
+   Each verdict carries its own modality: :proven by :enumerate IS a proof,
+   :witnessed is not."
+  []
+  (v/with-solver
+    (fn [port]
+      {:key-separation  (v/for-all port "v" (apply v/one-of (key-domain)) (sep-pred))
+       :naive-collision (v/exists  port "v" (apply v/one-of (key-domain)) (naive-collision-pred))
+       :naive-refuted   (v/for-all port "v" (apply v/one-of (key-domain)) (naive-refute-pred))
+       :lifecycle-safe  (v/for-all port "v" (apply v/one-of (event-domain)) (lifecycle-safe-pred))
+       :naive-lifecycle (v/exists  port "v" (apply v/one-of (event-domain)) (naive-lifecycle-pred))})))
+
+; ── the symbolic half ───────────────────────────────────────────────────────
+
+(defn- const-range
+  "`declare-const <name> Int` + the 0..1 bound, as SMT-LIB commands."
+  [name]
+  (list (smtlib/declare-const name "Int")
+        (smtlib/assert (list 'and (list '>= (symbol name) 0) (list '<= (symbol name) 1)))))
+
+(defn- key-separation-cmds
+  "The negation of the separation theorem over the component bounds. :unsat
+   proves it; a model would refute it. `P and not Q` (the negation of `P => Q`),
+   written without `=>` so nothing depends on a non-core symbol."
+  []
+  (erlang/++
+    (erlang/++ (const-range "c1") (erlang/++ (const-range "cl1") (const-range "s1")))
+    (erlang/++
+      (erlang/++ (const-range "c2") (erlang/++ (const-range "cl2") (const-range "s2")))
+      (list (smtlib/assert
+              '(and (= (+ (* c1 100) (* cl1 10) s1)
+                       (+ (* c2 100) (* cl2 10) s2))
+                    (not (and (= c1 c2) (= cl1 cl2) (= s1 s2)))))))))
+
+(defn- naive-collision-cmds
+  "The segment-blind key's collision, asserted SATISFIABLE: a model names two
+   distinct segments the naive key cannot tell apart."
+  []
+  (erlang/++
+    (erlang/++ (const-range "c1") (erlang/++ (const-range "cl1") (const-range "s1")))
+    (erlang/++
+      (erlang/++ (const-range "c2") (erlang/++ (const-range "cl2") (const-range "s2")))
+      (list (smtlib/assert
+              '(and (not (= s1 s2))
+                    (= (+ (* c1 100) (* cl1 10))
+                       (+ (* c2 100) (* cl2 10)))))))))
+
+(defn smt-key-obligations
+  "z3 symbolic obligations on the key. `z3/check` leases a pool member per call
+   and returns it when the call answers (priv/std/z3pool.bl), so opening no raw
+   port leaves nothing to close. A returned :unknown is NOT a proof — the test
+   asserts the exact :unsat/:sat, so an undecided solver fails loudly."
+  []
+  {:separation (:status (z3/check nil (key-separation-cmds)))
+   :naive-collision (:status (z3/check nil (naive-collision-cmds)))})
