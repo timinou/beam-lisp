@@ -2,9 +2,11 @@
 //! Linux display support is explicit; a browser never runs with --no-sandbox.
 use fs2::FileExt;
 use serde_json::{json, Value};
+#[cfg(feature = "x11")]
+use std::io::{BufRead, BufReader};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, Read, Write},
     net::TcpStream,
     os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
@@ -49,6 +51,7 @@ fn log_file(root: &Path, name: &str) -> Result<File> {
 }
 // Xauthority uses length-prefixed big-endian fields. FamilyWild is valid for
 // local clients; the server reads the cookie before selecting its display.
+#[cfg(feature = "x11")]
 fn authority(path: &Path, display: &str, cookie: &[u8]) -> Result<()> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&65535u16.to_be_bytes());
@@ -80,11 +83,23 @@ fn spawn(
         .stderr(log)
         .process_group(0);
     if let Some(d) = display {
-        cmd.env("DISPLAY", d)
-            .env("XDG_SESSION_TYPE", "x11")
-            .env_remove("WAYLAND_DISPLAY")
-            .env_remove("NIXOS_OZONE_WL")
-            .env("XAUTHORITY", root.join("client.auth"));
+        if d.starts_with("wayland-") {
+            cmd.env("WAYLAND_DISPLAY", d)
+                .env("XDG_RUNTIME_DIR", root)
+                .env("XDG_SESSION_TYPE", "wayland")
+                .env_remove("DISPLAY")
+                .env_remove("XAUTHORITY")
+                .env_remove("SWAYSOCK")
+                .env("WLR_BACKENDS", "headless")
+                .env("WLR_LIBINPUT_NO_DEVICES", "1")
+                .env("WLR_RENDERER", "pixman");
+        } else {
+            cmd.env("DISPLAY", d)
+                .env("XDG_SESSION_TYPE", "x11")
+                .env_remove("WAYLAND_DISPLAY")
+                .env_remove("NIXOS_OZONE_WL")
+                .env("XAUTHORITY", root.join("client.auth"));
+        }
     }
     // Helpers die if this port is killed, including SIGKILL. Process groups are
     // also reaped on normal EOF; no detached browser or display survives.
@@ -198,7 +213,157 @@ impl Drop for Session {
         self.reap();
     }
 }
+#[cfg(feature = "x11")]
+fn start_x11(
+    v: &Value,
+    runtime: &Path,
+    socket: &Path,
+    width: u64,
+    height: u64,
+    s: &mut Session,
+) -> Result<String> {
+    // Xvfb selects and locks a free display itself, avoiding display-number races.
+    let mut cookie = [0u8; 16];
+    getrandom::fill(&mut cookie).map_err(err)?;
+    authority(&runtime.join("server.auth"), "", &cookie)?;
+    let display_file = runtime.join("display");
+    let _ = fs::remove_file(&display_file);
+    let mut cmd = Command::new(field(v, "xvfb")?);
+    cmd.args([
+        "-displayfd",
+        "1",
+        "-screen",
+        "0",
+        &format!("{width}x{height}x24"),
+        "-nolisten",
+        "tcp",
+        "-auth",
+        runtime
+            .join("server.auth")
+            .to_str()
+            .ok_or("invalid runtime path")?,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(log_file(runtime, "display.log")?)
+    .process_group(0);
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+    let mut x = cmd.spawn().map_err(|e| format!("cannot start Xvfb: {e}"))?;
+    let out = x.stdout.take().unwrap();
+    s.children.push(x);
+    // Bound startup even if an executable doesn't implement -displayfd.
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(out).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let number = rx
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| "display startup timed out")?;
+    let n: u32 = number
+        .trim()
+        .parse()
+        .map_err(|_| "display failed to start")?;
+    authority(&runtime.join("client.auth"), &n.to_string(), &cookie)?;
+    let display = format!(":{n}");
+    s.children.push(spawn(
+        field(v, "vnc")?,
+        &[
+            "-display".into(),
+            display.clone(),
+            "-unixsock".into(),
+            socket.to_string_lossy().into_owned(),
+            "-rfbport".into(),
+            "0".into(),
+            "-nopw".into(),
+            "-forever".into(),
+            "-shared".into(),
+            "-quiet".into(),
+            "-xkb".into(),
+        ],
+        Some(&display),
+        runtime,
+        "vnc.log",
+    )?);
+    Ok(display)
+}
+
+fn start_wayland(
+    v: &Value,
+    runtime: &Path,
+    socket: &Path,
+    width: u64,
+    height: u64,
+    s: &mut Session,
+) -> Result<String> {
+    // Never attach to or modify the user's compositor. All sockets are private.
+    let config = runtime.join("sway.conf");
+    fs::write(&config, format!("xwayland disable\noutput HEADLESS-1 mode {width}x{height}\nseat seat0 fallback true\ndefault_border none\ndefault_floating_border none\n" )).map_err(err)?;
+    s.children.push(spawn(
+        field(v, "compositor")?,
+        &["--config".into(), config.to_string_lossy().into_owned()],
+        Some("wayland-private"),
+        runtime,
+        "display.log",
+    )?);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let display = loop {
+        if s.children[0].try_wait().map_err(err)?.is_some() {
+            return Err("Wayland compositor exited; inspect private runtime logs".into());
+        }
+        let found = fs::read_dir(runtime)
+            .map_err(err)?
+            .filter_map(|e| e.ok())
+            .find(|e| {
+                use std::os::unix::fs::FileTypeExt;
+                e.file_name().to_string_lossy().starts_with("wayland-")
+                    && e.file_type().map(|t| t.is_socket()).unwrap_or(false)
+            });
+        if let Some(e) = found {
+            break e.file_name().to_string_lossy().into_owned();
+        }
+        if Instant::now() > deadline {
+            return Err("Wayland compositor startup timed out".into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    // Explicit config avoids inheriting a user's VNC authentication/listener policy.
+    let vnc_config = runtime.join("wayvnc.conf");
+    fs::write(&vnc_config, "enable_auth=false\n").map_err(err)?;
+    s.children.push(spawn(
+        field(v, "vnc")?,
+        &[
+            "--config".into(),
+            vnc_config.to_string_lossy().into_owned(),
+            "--unix-socket".into(),
+            "--max-fps=30".into(),
+            socket.to_string_lossy().into_owned(),
+        ],
+        Some(&display),
+        runtime,
+        "vnc.log",
+    )?);
+    Ok(display)
+}
+
 fn launch(v: &Value) -> Result<Session> {
+    if std::env::var("BL_BROWSER_ENABLED").as_deref() == Ok("0") {
+        return Err("native browser is disabled (BL_BROWSER_ENABLED=0)".into());
+    }
+    let backend = v["displayBackend"].as_str().unwrap_or("wayland");
+    if !["wayland", "x11"].contains(&backend) {
+        return Err("choose wayland or x11 displayBackend".into());
+    }
+    if backend == "x11" && !cfg!(feature = "x11") {
+        return Err("X11 support was not built; explicitly enable the x11 feature".into());
+    }
+
     let profile = PathBuf::from(field(v, "profile")?);
     let runtime = PathBuf::from(field(v, "runtime")?);
     private_dir(&profile)?;
@@ -232,85 +397,30 @@ fn launch(v: &Value) -> Result<Session> {
     if !(640..=4096).contains(&width) || !(480..=2160).contains(&height) {
         return Err("invalid display dimensions".into());
     }
-    // Xvfb selects and locks a free display itself, avoiding display-number races.
-    let mut cookie = [0u8; 16];
-    getrandom::fill(&mut cookie).map_err(err)?;
-    authority(&runtime.join("server.auth"), "", &cookie)?;
-    let display_file = runtime.join("display");
-    let _ = fs::remove_file(&display_file);
-    let mut cmd = Command::new(field(v, "xvfb")?);
-    cmd.args([
-        "-displayfd",
-        "1",
-        "-screen",
-        "0",
-        &format!("{width}x{height}x24"),
-        "-nolisten",
-        "tcp",
-        "-auth",
-        runtime
-            .join("server.auth")
-            .to_str()
-            .ok_or("invalid runtime path")?,
-    ])
-    .stdin(Stdio::null())
-    .stdout(Stdio::piped())
-    .stderr(log_file(&runtime, "display.log")?)
-    .process_group(0);
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-            Ok(())
-        });
-    }
-    let mut x = cmd.spawn().map_err(|e| format!("cannot start Xvfb: {e}"))?;
-    let out = x.stdout.take().unwrap();
-    s.children.push(x);
-    // Bound startup even if an executable doesn't implement -displayfd.
-    let (tx, rx) = std::sync::mpsc::channel();
-    thread::spawn(move || {
-        let mut line = String::new();
-        let _ = BufReader::new(out).read_line(&mut line);
-        let _ = tx.send(line);
-    });
-    let number = rx
-        .recv_timeout(Duration::from_secs(10))
-        .map_err(|_| "display startup timed out")?;
-    let n: u32 = number
-        .trim()
-        .parse()
-        .map_err(|_| "display failed to start")?;
-    authority(&runtime.join("client.auth"), &n.to_string(), &cookie)?;
-    let display = format!(":{n}");
     let socket = runtime.join("vnc.sock");
     if socket.as_os_str().len() > 100 {
         return Err("runtime path too long for Unix socket".into());
     }
     let _ = fs::remove_file(&socket);
-    s.children.push(spawn(
-        field(v, "vnc")?,
-        &[
-            "-display".into(),
-            display.clone(),
-            "-unixsock".into(),
-            socket.to_string_lossy().into_owned(),
-            "-rfbport".into(),
-            "0".into(),
-            "-nopw".into(),
-            "-forever".into(),
-            "-shared".into(),
-            "-quiet".into(),
-            "-xkb".into(),
-        ],
-        Some(&display),
-        &runtime,
-        "vnc.log",
-    )?);
+    let display = match backend {
+        "wayland" => start_wayland(v, &runtime, &socket, width, height, &mut s)?,
+        "x11" => {
+            #[cfg(feature = "x11")]
+            {
+                start_x11(v, &runtime, &socket, width, height, &mut s)?
+            }
+            #[cfg(not(feature = "x11"))]
+            {
+                return Err("X11 support was not built; explicitly enable the x11 feature".into());
+            }
+        }
+        _ => unreachable!(),
+    };
     let mut args = vec![
         format!("--user-data-dir={}", profile.display()),
         "--remote-debugging-port=0".into(),
         "--remote-debugging-address=127.0.0.1".into(),
-        "--ozone-platform=x11".into(),
+        format!("--ozone-platform={backend}"),
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
         "--restore-last-session".into(),
@@ -353,7 +463,7 @@ fn launch(v: &Value) -> Result<Session> {
                                 .map_err(err)?;
                         }
                         s.ws = Some(ws);
-                        s.info = json!({"pid":s.children.last().unwrap().id(),"cdp":format!("http://127.0.0.1:{port}"),"vncSocket":socket,"display":display,"profile":profile});
+                        s.info = json!({"pid":s.children.last().unwrap().id(),"cdp":format!("http://127.0.0.1:{port}"),"vncSocket":socket,"display":display,"displayBackend":backend,"profile":profile});
                         return Ok(s);
                     }
                 }
@@ -413,7 +523,9 @@ fn main() {
             }
         };
         let result: Result<Value> = (|| match field(&value, "op")? {
-            "ping" => Ok(json!({"protocol":1,"backend":"native","platform":"linux"})),
+            "ping" => Ok(
+                json!({"protocol":1,"backend":"native","platform":"linux","displayBackends":if cfg!(feature="x11") {vec!["wayland","x11"]} else {vec!["wayland"]}}),
+            ),
             "launch" => {
                 if session.is_some() {
                     return Err("already launched".into());
@@ -498,6 +610,15 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "x11"))]
+    #[test]
+    fn x11_is_rejected_without_the_explicit_feature() {
+        // No paths are supplied: rejection must precede filesystem/process IO.
+        assert!(launch(&json!({"displayBackend":"x11"}))
+            .err()
+            .unwrap()
+            .contains("X11 support was not built"));
+    }
     #[test]
     fn framing_roundtrip() {
         let v = json!({"hello":"é\n世界"});
