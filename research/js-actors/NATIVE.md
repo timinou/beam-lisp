@@ -255,3 +255,21 @@ forward references, just as for system.ir. Otherwise a cold build that includes
 js.pattern can mark the namespace loaded with nil placeholders and prevent the
 running emitter from loading it. Warm fixture tests conceal that failure. The
 cold CLI regression now explicitly includes both shared dependencies.
+
+Namespace lookup while compiling
+--------------------------------
+
+Repeated absence checks previously scanned the environment table. The native BL
+host now caches at most 128 namespace answers per process, bounded to 512-byte
+names and 32 chain entries. A hit requires unchanged namespace/wide publication
+generations and live environments, with no writer in flight. Failed certification
+uses the original scan; no negative TTL or permanent loaded-name shortcut exists.
+
+`test/bl/env_namespace_cache_test.bl` compares a separately compiled pinned probe
+with the unchanged live host. It checks variable/declaration mutation, inherited
+reads, fork restoration, destruction, bulk deletion, an overlapping publisher and
+cache bounds. `BL_ENV_CACHE_REPORT=/tmp/cache.json ./bin/bl --cold test
+test/bl/env_namespace_cache_test.bl` retains seven 100-call samples. One loaded
+compiler VM measured median 45,335 versus 204 microseconds per 100 absent-name
+queries (about 222 times faster), and about 251 times fewer reductions. This is
+lookup evidence, not an end-to-end startup/build latency claim.
