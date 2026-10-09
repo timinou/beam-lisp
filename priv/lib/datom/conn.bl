@@ -131,10 +131,22 @@
 ; `blobs` is the bytes port for `:db.type/file` values. Like the writer and
 ; the basis it belongs to the STORE (it lives in the registry cell), so two
 ; connections over one store resolve files through one blob store.
+;; schema/basis atoms are writer state shared by all handles. :snapshot is an
+;; extension field containing the complete immutable Db exposed to readers.
+;; Private schema connections omit it, so speculative work cannot publish.
 (defrecord Conn [store schema basis writer subs blobs lifetime])
 
 (declare ensure-schema-coverage-in-writer)
 (declare tuple-backfill-ops)
+(declare install-schema!)
+(declare sync-schema!)
+
+(defn- publish-view! [conn]
+  ;; A prospective schema connection has no publication cell. Its writes may
+  ;; advance the internal counter, but readers retain the last complete view
+  ;; until coverage and schema installation have both succeeded.
+  (when-let [view (:snapshot conn)]
+    (reset! view (datom.db/db-value (:store conn) @(:schema conn) @(:basis conn) (:blobs conn)))))
 
 ;; ── the cross-node PubSub resolver ──────────────────────────────────
 ;;
@@ -149,6 +161,14 @@
   []
   (let [name (Application/get_env :beam_lisp :datom_pubsub)]
     (if (nil? name) nil {:server name})))
+
+(defn- publish-report! [conn report]
+  (if-let [pending (:pending-reports conn)]
+    (swap! pending conj report)
+    (datom.broadcast/publish! (:subs conn) (pubsub-server) report)))
+
+(defn- flush-reports! [conn pending]
+  (doseq [report @pending] (publish-report! conn report)))
 
 ;; ── the single writer ───────────────────────────────────────────────
 ;;
@@ -267,12 +287,15 @@
    connection with no opinion inherits it, and a later connection asking
    for a DIFFERENT one is refused. Bytes must have one home per database;
    a second tier would silently split the files between two places."
-  [store initial-basis requested-blobs]
+  [store initial-basis initial-schema requested-blobs]
   (agent-get-and-update
     (registry)
     (fn [reg]
       (let [k (store-key store)
             hit (lifetime-cell (get reg k))
+            hit (if (and hit (nil? (:schema hit)))
+                  (assoc hit :schema (atom initial-schema)
+                    :snapshot (atom (datom.db/db-value store initial-schema @(:basis hit) (:blobs hit)))) hit)
             reg (if hit (assoc reg k hit) reg)]
         (if (some? hit)
           (if (not= :open @(:lifetime hit))
@@ -282,9 +305,13 @@
                    (not (= requested-blobs (:blobs hit))))
             (->tuple-2 {:error {:configured (:blobs hit) :requested requested-blobs}} reg)
             (->tuple-2 hit reg)))
-          (let [cell {:writer (start-writer) :basis (atom initial-basis) :lifetime (atom :open)
+          (let [blobs (resolve-blobs store requested-blobs)
+                cell {:writer (start-writer) :basis (atom initial-basis)
+                      :schema (atom initial-schema)
+                      :snapshot (atom (datom.db/db-value store initial-schema initial-basis blobs))
+                      :lifetime (atom :open)
                       :subs (datom.broadcast/new-subs)
-                      :blobs (resolve-blobs store requested-blobs)}]
+                      :blobs blobs}]
             (->tuple-2 cell (assoc reg k cell))))))
     30000))
 
@@ -457,18 +484,18 @@
          ; The writer and the basis belong to the STORE, not to this
          ; connection: a second connection over the same store is another
          ; view of one database and must share both.
-         cell (store-cell store basis (get opts :blobs))
+         cell (store-cell store basis base (get opts :blobs))
          _ (if (some? (:error cell))
              (throw (ex-info "connection setup refused; the store is closing or its blob store is already configured"
                              (:error cell)))
              nil)
-         conn (->Conn store
-                      (atom (datom.schema/install-all base schema-defs))
+         conn (assoc (->Conn store
+                      (:schema cell)
                       (:basis cell)
                       (:writer cell)
                       (:subs cell)
                       (:blobs cell)
-                      (:lifetime cell))]
+                      (:lifetime cell)) :snapshot (:snapshot cell))]
      ; Schema is written as DATOMS as well as held as a map. The map is
      ; what every read consults — it is touched on each datom filter, so
      ; deriving it per read would be a serious regression — but the
@@ -483,11 +510,9 @@
      (let [fresh (filterv (fn [d] (nil? (get recovered (get d :db/ident)))) schema-defs)]
        (if (empty? fresh)
          conn
-         (do (transact! conn (into [] (mapcat (fn [d]
-                                                (datom.schema/definition-datoms
-                                                  (next-entity-id store) d))
-                                              fresh)))
-             conn)))
+         (do (install-schema! conn fresh) conn)))
+     (let [existing (filterv (fn [d] (contains? recovered (:db/ident d))) schema-defs)]
+       (when (seq existing) (sync-schema! conn existing)))
      ;; Older runtimes omitted tuple components from schema datoms. When the
      ;; caller supplies the authoritative definition, persist that missing
      ;; metadata once so future opens need no schema repetition. Never infer
@@ -614,8 +639,8 @@
 (defn db
   "The current database VALUE. O(1) — it captures a basis, not data."
   [conn]
-  (datom.db/db-value (:store conn) (deref (:schema conn)) (deref (:basis conn))
-                     (:blobs conn)))
+  (if-let [snapshot (:snapshot conn)] @snapshot
+    (datom.db/db-value (:store conn) @(:schema conn) @(:basis conn) (:blobs conn))))
 
 ;; ── files ───────────────────────────────────────────────────────────────────
 ;;
@@ -703,9 +728,9 @@
         {:swept (count orphans) :kept (- (count held) (count orphans))}))))
 
 (defn schema
-  "The connection's current schema map."
+  "The connection's published schema map."
   [conn]
-  (deref (:schema conn)))
+  (:schema (db conn)))
 
 (def BRANCH-REGISTRY :datom-branch-registry)
 
@@ -805,7 +830,8 @@
         ; per-attribute question — the rule relations memoise on the basis
         ; alone, and an excision that advanced nothing would leave them
         ; describing rows that no longer exist anywhere.
-        (swap! (:basis conn) (fn [cur] (max cur tx)))))
+        (swap! (:basis conn) (fn [cur] (max cur tx)))
+        (publish-view! conn)))
     (count raw)))
 
 (defn excise!
@@ -840,8 +866,8 @@
                30000)]
     (if (or (nil? cell) (not= :open @(:lifetime cell)))
       (throw (ex-info "no live connection for this db's store" {:store store}))
-      (->Conn store (atom (:schema db)) (:basis cell) (:writer cell)
-              (:subs cell) (:blobs cell) (:lifetime cell)))))
+      (assoc (->Conn store (:schema cell) (:basis cell) (:writer cell)
+              (:subs cell) (:blobs cell) (:lifetime cell)) :snapshot (:snapshot cell)))))
 
 (defn conns
   "Every live connection cell in this VM, one map per store:
@@ -972,7 +998,8 @@
 
 (defn- sync-schema-map-in-writer [conn defs]
   (let [before (deref (:schema conn)) after (datom.schema/install-all before defs)
-        shadow (assoc conn :schema (atom after))
+        pending (atom [])
+        shadow (assoc (dissoc conn :snapshot) :schema (atom after) :pending-reports pending)
         tuples (tuple-backfill-ops shadow after)]
     (backfill-newly-indexed! (:store conn) before after (deref (:basis conn)) defs)
     (when (seq tuples) (transact! shadow tuples))
@@ -982,11 +1009,14 @@
         (when (seq (datom.schema/tuple-attrs after (:db/ident d)))
           (datom.index-coverage/mark-derived! (:store conn) after (:db/ident d) (deref (:basis conn))))))
     (reset! (:schema conn) after)
+    (publish-view! conn)
+    (flush-reports! conn pending)
     conn))
 
 (defn- install-schema-in-writer [conn defs]
   (let [before (deref (:schema conn)) after (datom.schema/install-all before defs)
-        shadow (assoc conn :schema (atom after))
+        pending (atom [])
+        shadow (assoc (dissoc conn :snapshot) :schema (atom after) :pending-reports pending)
         tuples (tuple-backfill-ops shadow after)]
     (backfill-newly-indexed! (:store conn) before after (deref (:basis conn)) defs)
     ;; Prospective schema belongs to a private view until the atomic schema +
@@ -1001,6 +1031,8 @@
         (when (seq (datom.schema/tuple-attrs after (:db/ident d)))
           (datom.index-coverage/mark-derived! (:store conn) after (:db/ident d) (deref (:basis conn))))))
     (reset! (:schema conn) after)
+    (publish-view! conn)
+    (flush-reports! conn pending)
     conn))
 
 (defn transact!
@@ -1322,6 +1354,7 @@
     ; high-water mark is monotone and idempotent: two writers racing
     ; can apply theirs in either order for the same result.
     (swap! (:basis conn) (fn [cur] (max cur tx)))
+    (publish-view! conn)
     ; NB: the per-attribute marks were already recorded, IN the transaction's own
     ; commit — see `run-tx-pipeline`. Recording them here would be a second
     ; commit, and a window in which the data is durable and the mark is not.
@@ -1336,7 +1369,7 @@
       ; transaction never broadcasts (invariant 2). The fan-out is cheap
       ; non-blocking `send`s, so a slow subscriber cannot stall the writer
       ; (invariant 4).
-      (datom.broadcast/publish! (:subs conn) (pubsub-server) report)
+      (publish-report! conn report)
       report)))
 
 ;; ── the bulk fact load ──────────────────────────────────────────────
@@ -1383,6 +1416,7 @@
     ; while a rewind filters committed datoms out of every later read
     ; (BUG-022).
     (swap! (:basis conn) (fn [cur] (max cur tx)))
+    (publish-view! conn)
     (let [report {:db-before db-before
                   :db-after (db conn)
                   :tx tx
@@ -1390,7 +1424,7 @@
                   :tx-datoms datoms}]
       ; After the basis advances and inside the writer, so reports leave in
       ; commit order exactly as `transact!`'s do.
-      (datom.broadcast/publish! (:subs conn) (pubsub-server) report)
+      (publish-report! conn report)
       report)))
 
 
