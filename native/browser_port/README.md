@@ -32,7 +32,8 @@ A malformed frame closes the helper; a malformed JSON command returns an error.
 
 Only one helper can own a profile: an OS file lock spans the browser lifetime.
 Chromium writes its normal user-data directory; `.bl-saved` acknowledges a clean
-close. Normal stdin EOF also closes and saves. An abrupt crash leaves the profile
+close. Normal stdin EOF also closes and saves; the Beam Lisp `close` function explicitly
+requests a stop before closing its port. An abrupt crash leaves the profile
 for Chromium recovery; it does not acknowledge a new save. Consumers must never
 turn uncertain closure into a successful save. No live JS heap survives restart.
 
