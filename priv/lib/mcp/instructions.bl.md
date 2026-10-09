@@ -16,7 +16,8 @@ Six attributes describe an instruction fragment — they live in
 codebase/SCHEMA, because the indexer itself emits them: any namespace can
 carry an instruction COLOCATED with the code it describes,
 
-```beam-lisp
+<!-- Illustrative metadata syntax, not an executable namespace of this library. -->
+```clojure
 (ns ^{:instr {:for "mcp" :kind :usage :order 25
               :title "Reachability: bind the target"
               :text "…"}}
