@@ -260,6 +260,7 @@ export function subvec(v, from, to) {
 // a vector are different keys).
 
 const NOT_FOUND = { nf: true };
+export const PATTERN_MISSING = NOT_FOUND;
 
 class BNode {   // bitmap-indexed: arr = [k0, v0, k1, v1, ...]; a key slot of NODE_MARK holds a sub-node in v
   constructor(bitmap, arr) { this.bitmap = bitmap; this.arr = arr; }
@@ -807,6 +808,20 @@ export function strOf(x) {
 
 export class Atom {
   constructor(v) { this.v = v; this.watches = null; }
+}
+
+// Canonical structural view used by checked pattern lowering. A missing field
+// is distinct from a present nil; literal patterns use exact keyEq, not BL `=`.
+export const VECTOR_MOD = "Elixir.BeamLisp.Vector";
+export function isStruct(x) { return x instanceof Vec || (x instanceof HMap && x.get(kw("__struct__")) instanceof Kw); }
+export function structMod(x) { return x instanceof Vec ? VECTOR_MOD : x instanceof HMap ? (x.get(kw("__struct__"))?.fq ?? null) : null; }
+export function structHasField(x, name) { return x instanceof Vec ? name === "items" : x instanceof HMap && x.has(kw(name)); }
+export function structField(x, name) { return x instanceof Vec && name === "items" ? tup(x.toArray()) : x instanceof HMap ? x.get(kw(name)) : null; }
+export function struct(mod, fields) {
+  if (mod === VECTOR_MOD) return vecFromArray(fields.items.items);
+  let result = EMPTY_MAP.assoc(kw("__struct__"), kw(mod));
+  for (const [key, value] of Object.entries(fields)) result = result.assoc(kw(key), value);
+  return result;
 }
 
 // ─── truthiness ─────────────────────────────────────────────────────────────

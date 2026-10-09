@@ -76,17 +76,9 @@ export function tupEl(x, i) { return x.items[i]; }
 export function tupSize(x) { return x.items.length; }
 
 /** A record / struct: `%Mod{...}` and, notably, a beam-lisp Vector. */
-export function struct(mod, fields) {
-  if (mod === VECTOR_MOD) return vecFromArray(fields.items.items);
-  let m = V.EMPTY_MAP.assoc(kw("__struct__"), kw(mod));
-  for (const [k,v] of Object.entries(fields)) m = m.assoc(kw(k),v);
-  return m;
-}
-export function isStruct(x) { return isVec(x) || (x instanceof V.HMap && x.get(kw("__struct__")) instanceof KW); }
-export function structMod(x) { return isVec(x) ? VECTOR_MOD : kwName(x.get(kw("__struct__"))); }
-export function structField(x, name) { return isVec(x) && name === "items" ? tup(vecItems(x)) : x.get(kw(name)); }
+export const struct=V.struct,isStruct=V.isStruct,structMod=V.structMod,structField=V.structField;
+export const VECTOR_MOD=V.VECTOR_MOD;
 
-export const VECTOR_MOD = "Elixir.BeamLisp.Vector";
 export function isVec(x) { return x instanceof V.Vec; }
 export function vecFromArray(items) { return V.vecFromArray(items); }
 export function vec(items) { return vecFromArray(items); }
