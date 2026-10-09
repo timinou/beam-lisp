@@ -158,3 +158,22 @@ This ownership change does not finish ordinary lowering migration. The legacy
 actor collection prelude and direct emitter still require consolidation against
 the common compiled core and actor control. They remain explicit roadmap items;
 removing them before their consumers migrate would break existing semantics.
+
+Shared checked patterns and reader vocabulary
+---------------------------------------------
+
+`js.pattern/lines` owns binding-pattern traversal for both current emitters.
+It uses canonical `rt.mjs` structural views, strict term equality for literals,
+and one map lookup with a missing sentinel. A missing record field cannot
+match a present nil. This does not change `case`: that language macro uses
+BL numerical/sequential equality rather than binding-pattern semantics.
+
+Actor compilation now uses `reader-node` for nodes/spans and `js.emit` for
+injective identifiers and Unicode-safe strings. There is no second mangler
+or byte-oriented string escape implementation. `Rt/str_v` has a temporary
+packed-rest ABI adapter to the existing BL join kernel; it is not another
+string algorithm, and disappears with the compiled-core migration.
+
+Validation: 51 focused runtime/native/pattern checks; 461 actor checks under
+default, 17-step and 41-step budgets, plus scheduler hardening; the ordinary
+compiler's eight BEAM/JS differential groups are identical after a fresh build.
