@@ -1,0 +1,447 @@
+; research/structural/lookup_test.bl — the executable evidence for PLAN-166 Q3.
+;
+; Run: ./bin/bl --cold test -p . research/structural/lookup_test.bl
+;
+; What is pinned, and how:
+;
+;   1. POSITIVE SEMANTIC PARITY. A traversal-local cache resolves a callable
+;      exactly as `Env.fetch/2` would, across rebinding, undefinition, a chain
+;      switch, and mid-fold self-rebinding by the callback itself.
+;   2. NEGATIVE CONTROLS (expected counterexamples, not failures). The frozen
+;      "cache once" design and an epoch-only guard each produce a runtime
+;      witness that differs from the live oracle, plus a finite veritas
+;      `:refuted` verdict with the same shape of witness.
+;   3. COST. An unchanged traversal collapses authoritative fetches from N to a
+;      bounded 2-3 (asserted); process reductions for cached vs baseline are
+;      REPORTED, not asserted — the baseline's `Env.fetch/2` is itself
+;      memoized, so the cached path is not guaranteed to win on reductions. A
+;      traversal whose binding changes every step refetches every step and
+;      stays correct.
+;   4. LOGIC. Finite exhaustive veritas properties over a 3-step, 3-mode
+;      trajectory space (54 trajectories) prove guarded parity, and refute the
+;      two wrong designs — over a declared finite domain, `:engine :enumerate`,
+;      no solver. Two symbolic z3 obligations are attempted as a bonus; an
+;      `unknown` or unavailable solver is NEVER read as a proof.
+;   5. SCOPE. Every runtime test runs in a CHILD of the current env, never at
+;      `:global`: the research namespaces are interned into the ambient env, so
+;      a switch to `:global` drops every `research.structural.lookup` binding
+;      (`undefined var …/new-cache`). The child inherits the current chain, so
+;      the module registry stays resolvable; its fixtures are isolated to the
+;      child and the child is destroyed in `finally`.
+;
+; The proof MODEL lives in lookup.bl. This file exercises the real runtime
+; against it; the finite ∀ is over the model, the executable tests are the
+; runtime evidence. The boundary between them is an axiom of `env.bl` (every
+; mutation bumps the epoch; `current_epoch` is that counter), stated in notes.
+
+(ns research.structural.lookup-test
+  (:require [research.structural.lookup :as lk]
+            [veritas :as v]
+            [z3]
+            [smt]
+            [oracle]))
+
+(defn- in-forked-env
+  "Run `f` in a fresh CHILD of the CURRENT env, destroyed afterwards.
+
+   Why not `with_env :global`: the research namespaces are interned into the env
+   the test file was loaded under, not `:global`. Switching to `:global` drops
+   every one of their bindings, so the first `lk/…` call dies with `undefined
+   var: research.structural.lookup/new-cache`. A fork inherits the whole current
+   chain, so the module registry stays resolvable; vars the test interns land in
+   the child and are erased with it (isolation, not a shared `:global` scratch).
+   The fork is destroyed in `finally`, so a failing assertion cannot leak an
+   env."
+  [f]
+  (let [env (BeamLisp.Env/fork)]
+    (try
+      (BeamLisp.Env/with_env env (fn [] (f)))
+      (finally (BeamLisp.Env/destroy env)))))
+
+;; ── the finite trajectory generator and the three predicates ───────────────
+;
+; A trajectory is (mode0 mode1 mode2 b0). The predicate names are the tuple's
+; positional coordinates: v_0 v_1 v_2 are the modes, v_3 the initial binding.
+; The guarded predicate simulates FOUR lookups (prime + one per mode): cache
+; identity is `(epoch, chain)`; `:rebind` flips the binding and advances the
+; epoch; `:switch` flips the chain AND the binding, epoch unchanged.
+
+(def tuple-gen
+  (v/tuple-of (v/one-of :stable :rebind :switch)
+              (v/one-of :stable :rebind :switch)
+              (v/one-of :stable :rebind :switch)
+              (v/int-of 0 1)))
+
+(def guarded-pred
+  '(let [b0 v_3
+         b1 (if (= v_0 :rebind) (- 1 b0) (if (= v_0 :switch) (- 1 b0) b0))
+         e1 (if (= v_0 :rebind) 1 0)
+         c1 (if (= v_0 :switch) 1 0)
+         b2 (if (= v_1 :rebind) (- 1 b1) (if (= v_1 :switch) (- 1 b1) b1))
+         e2 (if (= v_1 :rebind) (+ e1 1) e1)
+         c2 (if (= v_1 :switch) (- 1 c1) c1)
+         b3 (if (= v_2 :rebind) (- 1 b2) (if (= v_2 :switch) (- 1 b2) b2))
+         e3 (if (= v_2 :rebind) (+ e2 1) e2)
+         c3 (if (= v_2 :switch) (- 1 c2) c2)
+         r0 b0
+         hit1 (and (= 0 e1) (= 0 c1))
+         r1 (if hit1 r0 b1)
+         hit2 (and (= e1 e2) (= c1 c2))
+         r2 (if hit2 r1 b2)
+         hit3 (and (= e2 e3) (= c2 c3))
+         r3 (if hit3 r2 b3)]
+     (and (= r0 b0) (= r1 b1) (= r2 b2) (= r3 b3))))
+
+(def frozen-pred
+  '(let [b0 v_3
+         b1 (if (= v_0 :rebind) (- 1 b0) (if (= v_0 :switch) (- 1 b0) b0))
+         b2 (if (= v_1 :rebind) (- 1 b1) (if (= v_1 :switch) (- 1 b1) b1))
+         b3 (if (= v_2 :rebind) (- 1 b2) (if (= v_2 :switch) (- 1 b2) b2))
+         r0 b0 r1 r0 r2 r0 r3 r0]
+     (and (= r0 b0) (= r1 b1) (= r2 b2) (= r3 b3))))
+
+(def epoch-only-pred
+  '(let [b0 v_3
+         b1 (if (= v_0 :rebind) (- 1 b0) (if (= v_0 :switch) (- 1 b0) b0))
+         e1 (if (= v_0 :rebind) 1 0)
+         c1 (if (= v_0 :switch) 1 0)
+         b2 (if (= v_1 :rebind) (- 1 b1) (if (= v_1 :switch) (- 1 b1) b1))
+         e2 (if (= v_1 :rebind) (+ e1 1) e1)
+         c2 (if (= v_1 :switch) (- 1 c1) c1)
+         r0 b0
+         hit1 (= 0 e1)
+         r1 (if hit1 r0 b1)
+         hit2 (= e1 e2)
+         r2 (if hit2 r1 b2)]
+     (and (= r0 b0) (= r1 b1) (= r2 b2))))
+
+;; ── 1. positive semantic parity ────────────────────────────────────────────
+
+(deftest guarded-parity-across-rebind-and-undefine
+  (in-forked-env
+    (fn []
+      (BeamLisp.Env/intern "lk.t" "v" :a)
+      (let [c (lk/new-cache "lk.t" "v")]
+        (is (= (BeamLisp.Env/fetch "lk.t" "v") (lk/deref! c)))
+        (is (= (BeamLisp.Env/fetch "lk.t" "v") (lk/deref! c))
+            "the second deref is a hit and still matches the oracle")
+        (BeamLisp.Env/intern "lk.t" "v" :b)
+        (is (= (BeamLisp.Env/fetch "lk.t" "v") (lk/deref! c))
+            "a rebind bumps the epoch; the next deref must observe it")
+        (BeamLisp.Env/undefine_var "lk.t" "v")
+        (is (= (BeamLisp.Env/fetch "lk.t" "v") (lk/deref! c)))
+        (is (= :error (lk/deref! c))
+            "an unbound var is :error, exactly as Env.fetch/2")
+        (lk/destroy-cache c)))))
+
+(deftest midfold-parity-when-the-callback-rebinds-itself
+  (in-forked-env
+    (fn []
+      (let [coll (list 1 2 3 4)
+            ; The first invocation rebinds the very var the traversal resolves.
+            rebind-once (fn [acc _]
+                          (if (erlang/== acc 0)
+                            (do (BeamLisp.Env/intern "lk.t" "step"
+                                  (fn [a _] (+ a 10)))
+                                acc)
+                            acc))
+            c (lk/new-cache "lk.t" "step")]
+        (BeamLisp.Env/intern "lk.t" "step" rebind-once)
+        (let [r (loop [acc 0 xs coll i 0 same true]
+                  (if (empty? xs)
+                    {:acc acc :steps i :same same}
+                    (let [cached (lk/deref! c)
+                          live (BeamLisp.Env/fetch "lk.t" "step")
+                          f (erlang/element 2 cached)]
+                      (recur (lk/invoke2 f acc (first xs)) (rest xs) (+ i 1)
+                             (and same (= cached live))))))]
+          (is (:same r) "cached resolution equalled the live oracle at every element")
+          (is (= 4 (:steps r)))
+          ; after the self-rebind, the +10 fn is what is resolved
+          (is (= 30 (:acc r))
+              "the rebind mid-traversal switched the reducing fn after element 1")
+          (lk/destroy-cache c))))))
+
+(deftest guarded-parity-across-env-chain-switch
+  (in-forked-env
+    (fn []
+      (BeamLisp.Env/intern "lk.t" "shadow" :base)
+      (let [child (BeamLisp.Env/fork)]
+        (try
+          (BeamLisp.Env/with_env child
+            (fn [] (BeamLisp.Env/intern "lk.t" "shadow" :child)))
+          ; The shadow already exists, so the epoch does NOT change on the
+          ; switch: only the chain differs. This is the case epoch-alone misses.
+          (let [c (lk/new-cache "lk.t" "shadow")]
+            (try
+              (is (= (tuple :ok :base) (lk/deref! c)))
+              (BeamLisp.Env/with_env child
+                (fn []
+                  (is (= (tuple :ok :child) (BeamLisp.Env/fetch "lk.t" "shadow")))
+                  (is (= (tuple :ok :child) (lk/deref! c))
+                      "a chain change forces a refresh even at an unchanged epoch")))
+              (is (= (tuple :ok :base) (lk/deref! c)))
+              (finally (lk/destroy-cache c))))
+          (finally (BeamLisp.Env/destroy child)))))))
+
+(deftest predicate-that-rebinds-itself-is-observed
+  (in-forked-env
+    (fn []
+      ; A predicate resolved through the cache rebinds its OWN var the first
+      ; time it holds; the next resolution must observe the replacement.
+      (let [p1 (fn [x]
+                 (if (erlang/== x 1)
+                   (do (BeamLisp.Env/intern "lk.t" "pred" (fn [_] true)) false)
+                   false))
+            c (lk/new-cache "lk.t" "pred")]
+        (BeamLisp.Env/intern "lk.t" "pred" p1)
+        (let [r0 (lk/deref! c)
+              _ (is (= false (BeamLisp.Ns.Rt/invoke (erlang/element 2 r0) (list 1)))
+                    "p1 rebinds the predicate mid-call and returns false")
+              live (BeamLisp.Env/fetch "lk.t" "pred")
+              r1 (lk/deref! c)]
+          (is (not= r0 live) "the live var changed mid-callback")
+          (is (= live r1) "the next cached resolution observes the self-rebind")
+          (is (= true (BeamLisp.Ns.Rt/invoke (erlang/element 2 r1) (list 0))))
+          (lk/destroy-cache c))))))
+
+(deftest empty-traversal-and-terminal-deref
+  (in-forked-env
+    (fn []
+      (BeamLisp.Env/intern "lk.t" "term" (fn [a _] a))
+      (let [c (lk/new-cache "lk.t" "term")
+            r (lk/fold-cached c () :init)]
+        (is (= :init (:result r)))
+        (is (= 0 (:steps r)))
+        (is (= 0 (:fetches (lk/stats c))) "no element, no resolution")
+        ; a terminal rebind is still observed by the final deref
+        (BeamLisp.Env/intern "lk.t" "term" :now-a-value)
+        (is (= (BeamLisp.Env/fetch "lk.t" "term") (lk/deref! c)))
+        (lk/destroy-cache c)))))
+
+;; ── 2. negative controls (expected witnesses) ──────────────────────────────
+
+(deftest negative-frozen-lookup-serves-a-stale-binding
+  (in-forked-env
+    (fn []
+      (BeamLisp.Env/intern "lk.t" "frozen" :old)
+      (let [cell (atom {:fresh false :value nil})
+            frozen (fn []
+                     (let [s (deref cell)]
+                       (if (:fresh s)
+                         (:value s)
+                         (let [v (BeamLisp.Env/fetch "lk.t" "frozen")]
+                           (reset! cell {:fresh true :value v})
+                           v))))]
+        (is (= (tuple :ok :old) (frozen)))
+        (BeamLisp.Env/intern "lk.t" "frozen" :new)
+        (is (= (tuple :ok :old) (frozen)) "the frozen cache returns the stale binding")
+        (is (not= (BeamLisp.Env/fetch "lk.t" "frozen") (frozen))
+            "…and differs from the live oracle — the witness")
+        (is (= (tuple :ok :new) (BeamLisp.Env/fetch "lk.t" "frozen")))))))
+
+(deftest negative-epoch-only-lookup-misses-a-chain-switch
+  (in-forked-env
+    (fn []
+      ; This control is only meaningful with the authoritative counter; assert
+      ; it rather than silently skipping. An absent counter is a loud failure.
+      (is (lk/epoch-api?)
+          "the epoch-only negative control needs the authoritative counter")
+      (BeamLisp.Env/intern "lk.t" "eo" :base)
+      (let [child (BeamLisp.Env/fork)]
+        (try
+          (BeamLisp.Env/with_env child
+            (fn [] (BeamLisp.Env/intern "lk.t" "eo" :child)))
+          (let [cell (atom {:fresh false :value nil :epoch nil})
+                eo (fn []
+                     (let [s (deref cell)
+                           e (lk/current-epoch)]
+                       (if (and (:fresh s) (erlang/== (:epoch s) e))
+                         (:value s)
+                         (let [v (BeamLisp.Env/fetch "lk.t" "eo")]
+                           (reset! cell {:fresh true :value v :epoch e})
+                           v))))]
+            (is (= (tuple :ok :base) (eo)))
+            (BeamLisp.Env/with_env child
+              (fn []
+                (is (= (tuple :ok :child) (BeamLisp.Env/fetch "lk.t" "eo")))
+                (is (= (tuple :ok :base) (eo))
+                    "epoch-only guard serves the base binding in the child chain — the witness"))))
+          (finally (BeamLisp.Env/destroy child)))))))
+
+;; ── 3. cost: authoritative fetch count and process reductions ──────────────
+
+; `lk/report` owns and destroys its caches; the test reads its metrics map.
+
+(deftest unchanged-traversal-collapses-authoritative-fetches
+  (in-forked-env
+    (fn []
+      (let [n 4000
+            coll (Enum/to_list (range n))
+            step (fn [a x] (+ a x))]
+        (BeamLisp.Env/intern "lk.t" "sum" step)
+        (let [m (lk/report "lk.t" "sum" coll 0 5)]
+          (is (:agrees m) "the cached fold equals the authoritative baseline")
+          (is (= (/ (* n (- n 1)) 2) (:result m)))
+          (is (= n (:steps m)))
+          (is (lk/epoch-api?)
+              "the fetch-collapse claim needs the exported epoch counter")
+          (is (<= (:fetches m) 3)
+              "a stable traversal makes a bounded number of authoritative fetches")
+          (is (>= (:fetches m) 1)
+              "the first deref always fetches authoritatively")
+          ; Reductions are REPORTED, never asserted `<=`: the baseline resolves
+          ; through an already-memoized `Env/fetch/2`, so the cached path can
+          ; legitimately lose on reductions while winning on authoritative
+          ; fetches. Record the number; do not edit it into a pass.
+          (is (pos? (:cached-reductions m)))
+          (is (pos? (:baseline-reductions m)))
+          (println "lookup-cost" m))))))
+
+(deftest frequently-changed-traversal-refetches-and-stays-correct
+  (in-forked-env
+    (fn []
+      (let [n 200
+            coll (Enum/to_list (range n))
+            step (fn [a x] (+ a x))
+            c (lk/new-cache "lk.t" "mut")]
+        (try
+          (let [r (loop [acc 0 xs coll i 0 same true]
+                    (if (empty? xs)
+                      {:acc acc :steps i :same same}
+                      (let [_ (BeamLisp.Env/intern "lk.t" "mut" step)
+                            cached (lk/deref! c)
+                            live (BeamLisp.Env/fetch "lk.t" "mut")
+                            f (erlang/element 2 cached)]
+                        (recur (lk/invoke2 f acc (first xs)) (rest xs) (+ i 1)
+                               (and same (= cached live))))))]
+            (is (:same r))
+            (is (= n (:steps r)))
+            (is (>= (:fetches (lk/stats c)) (- n 1))
+                "a binding written every step forces a refresh every step"))
+          (finally (lk/destroy-cache c)))))))
+
+; `report` must not leave a cache behind. Slots are process-dictionary maps
+; carrying our counters; count them around the probe.
+
+(defn- live-caches []
+  (count
+    (filter (fn [pair]
+              (let [v (erlang/element 2 pair)]
+                (and (erlang/is_map v)
+                     (some? (:refreshes v))
+                     (some? (:fetches v))
+                     (some? (:ns v)))))
+            (erlang/element 2 (erlang/process_info (erlang/self) :dictionary)))))
+
+(deftest report-destroys-every-cache-it-creates
+  (in-forked-env
+    (fn []
+      (BeamLisp.Env/intern "lk.t" "leak" (fn [a _] a))
+      (is (= 0 (live-caches)) "no traversal-local slot before the probe")
+      (lk/report "lk.t" "leak" (Enum/to_list (range 40)) 0 2)
+      (is (= 0 (live-caches))
+          "report must destroy every traversal-local cache it created"))))
+
+(deftest error-timing-invalidates-before-refresh
+  (in-forked-env
+    (fn []
+      (BeamLisp.Env/intern "lk.t" "err" :x)
+      (let [c (lk/new-cache "lk.t" "err")]
+        (is (= (tuple :ok :x) (lk/deref! c)))
+        ; A non-binary name makes the authoritative fetch RAISE.
+        (let [bad (lk/new-cache "lk.t" 42)]
+          (try
+            (is (thrown? (lk/deref! bad)))
+            (is (not (:fresh (lk/state bad)))
+                "the slot is invalidated before the raising fetch; no stale hit survives")
+            (finally (lk/destroy-cache bad))))
+        (BeamLisp.Env/undefine_var "lk.t" "err")
+        (is (= :error (lk/deref! c)))
+        (lk/destroy-cache c)))))
+
+;; ── 4. logic: finite exhaustive veritas + honest symbolic ──────────────────
+
+(deftest logic-guarded-parity-is-finite-exhaustive-proven
+  (let [r (v/for-all nil "v" tuple-gen guarded-pred)]
+    (is (= :proven (:modality r))
+        "a finite, declared domain makes exhaustion a real ∀")
+    (is (= :enumerate (:engine r)))
+    (is (= 54 (:tried r)))))
+
+(deftest logic-the-frozen-design-is-refuted-with-a-witness
+  (let [r (v/for-all nil "v" tuple-gen frozen-pred)]
+    (is (= :refuted (:modality r)))
+    (is (= :enumerate (:engine r)))
+    (is (some? (:witness r)))
+    (is (= false (v/holds? "v" frozen-pred (:witness r)))
+        "the witness is a concrete trajectory the plain evaluator also refutes")))
+
+(deftest logic-the-epoch-only-guard-is-refuted-by-a-chain-switch
+  (let [r (v/for-all nil "v" tuple-gen epoch-only-pred)]
+    (is (= :refuted (:modality r)))
+    (is (some? (:witness r)))
+    (is (= false (v/holds? "v" epoch-only-pred (:witness r))))))
+
+; The symbolic obligations use an UNBOUNDED integer epoch. They are soft: the
+; guarded statement IS proven under the explicit write axiom, and the unguarded
+; one IS refuted — but only when the solver answers. A solver that is missing
+; or returns unknown yields a witnessed/unknown verdict, and the test records
+; that as UNVERIFIED rather than reading it as a proof.
+
+(def guarded-smt-pred
+  ; (=> axiom (=> hit (= cb wb)))  with  axiom := (=> (= ce we) (= cb wb))
+  '(or (not (or (not (= w_0 w_3)) (= w_2 w_5)))
+       (or (not (and (= w_0 w_3) (= w_1 w_4))) (= w_2 w_5))))
+
+(def unguarded-smt-pred
+  ; the same conclusion without the write axiom — falsifiable.
+  '(or (not (and (= w_0 w_3) (= w_1 w_4))) (= w_2 w_5)))
+
+(deftest logic-symbolic-obligations-are-honest-about-the-solver
+  ;; An Int declaration is unbounded. A million-element finite generator with
+  ;; a nil solver instead attempts exhaustive enumeration of its Cartesian
+  ;; product; that is neither a symbolic proof nor a bounded experiment.
+  (let [decls (mapv (fn [i] (smt/declare-const (str "w_" i) "Int")) (range 6))
+        guarded (z3/check nil (conj decls (smt/assert (list 'not guarded-smt-pred))))
+        unguarded (z3/check-model nil (conj decls (smt/assert (list 'not unguarded-smt-pred))))]
+    (is (oracle/proven? guarded) "the explicit stamp axiom establishes the modeled guard")
+    (is (oracle/refuted? unguarded) "without the stamp axiom the solver supplies a counterexample")
+    (is (some? (:model unguarded)))))
+
+;; ── 5. the model itself, cross-checked without veritas ─────────────────────
+;
+; veritas is the primary instrument; this replays the same 54 trajectories
+; through the compiled pure model in lookup.bl, so a divergence between the
+; model the proof used and the model the module ships is caught.
+
+(defn- guarded-trajectory-ok? [t]
+  (let [m0 (get t 0) m1 (get t 1) m2 (get t 2) b0 (get t 3)
+        w0 {:binding b0 :epoch 0 :chain 0}
+        r0 (lk/model-step {:fresh false} w0)
+        w1 (lk/world-step w0 m0)
+        r1 (lk/model-step (:state r0) w1)
+        w2 (lk/world-step w1 m1)
+        r2 (lk/model-step (:state r1) w2)
+        w3 (lk/world-step w2 m2)
+        r3 (lk/model-step (:state r2) w3)]
+    (and (= (:binding w0) (:value r0))
+         (= (:binding w1) (:value r1))
+         (= (:binding w2) (:value r2))
+         (= (:binding w3) (:value r3)))))
+
+(deftest pure-model-cross-check-over-the-same-trajectory-space
+  (let [ts (v/samples tuple-gen 64)]
+    (is (= 54 (count ts)))
+    (is (every? guarded-trajectory-ok? ts))))
+
+; REQUIRED INVARIANT, not informational: the fast path needs the pinned beam
+; to export `current_epoch/0`. If this fails the counter is missing from the
+; running image, and the fetch-collapse claim cannot be made — so it fails
+; loudly here rather than being skipped. `deref!` would still return correct
+; values (always-refresh), so parity itself is unaffected.
+(deftest env-epoch-observable-is-present
+  (is (lk/epoch-api?)
+      "the pinned Env beam must export current_epoch/0 for the fast path"))
+
+; Executed by the bl test runner after all tests are registered.

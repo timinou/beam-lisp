@@ -1,0 +1,346 @@
+; research/structural/lookup.bl — a traversal-local, epoch-guarded callable cache.
+;
+; ── The question (PLAN-166 Q3) ──────────────────────────────────────────────
+;
+; A traversal that resolves the SAME callable — a reducing fn, a predicate, a
+; comparator — once per element pays an authoritative `Env.fetch/2` per element.
+; Can it reuse the resolved callable while the environment is unchanged, and
+; still observe the same rebinding, provider-initialization, error and terminal
+; behavior as a late lookup?
+;
+; This module is that reuse, scoped to one traversal and guarded under the
+; registry's complete-write-stamp axiom. audit-bulk-delete probes that axiom;
+; the model is not a certificate for every exposed low-level Env mutator.
+; It owns no registry and adds no second source of truth. Every refresh goes through the real `Env.fetch/2`;
+; a hit only skips that call when the environment it cached against is provably
+; still current.
+;
+; ── The real Env observables it reads ───────────────────────────────────────
+;
+; `Elixir.BeamLisp.Env` already owns the invalidation signal: ONE global atomics
+; epoch (`epoch_ref`), advanced by canonical key writes/deletion/destroy, plus
+; a known coverage gap: match_delete_own does not advance it (BUG-115). Also,
+; the process-local `chain/0`. `Env.fetch/2`'s own memo is keyed by
+; `{chain, ns, name}` and validated by the epoch; this cache is the same
+; contract one level closer to the traversal.
+;
+; The pinned host beam has NO private surface (see `priv/host/env.bl` and
+; `priv/host/refs.bl`: `defn-` is not privatized on the pinned path), so
+; `BeamLisp.Env/current_epoch/0` is exported and callable. That is the ONLY
+; reason this module needs no change to `env.bl`. `epoch-api?/0` probes that
+; export at runtime; if a build ever privatizes it, the cache degrades to
+; "always refresh" — correct, just slow — never to a stale hit.
+;
+; ── Why not the atomics read ALONE (the chain check) ────────────────────────
+;
+; The modeled epoch advances on supported WRITES, NOT a pure env SWITCH.
+; Complete mutation coverage is a separate production prerequisite:
+; `with_env`/`bind`/`attach` change the process chain without bumping it. Two
+; envs in one chain can bind the same `{ns, name}` to different values (a fork's
+; shadow, interned before a base re-def), so `(epoch, chain)` is the identity
+; that must match — not the epoch alone. The `:switch` mode in the proof model
+; is exactly that case, and it is a negative control for an epoch-only guard.
+;
+; ── Proof scope ─────────────────────────────────────────────────────────────
+;
+; The pure transition functions at the bottom (`world-step`, `model-step`,
+; `model-step-frozen`) are the MODEL. `lookup_test.bl` discharges three finite
+; exhaustive veritas properties over a 3-step, 3-mode trajectory space
+; (54 trajectories, `:engine :enumerate` — a real ∀, no solver) and two
+; symbolic obligations (an unbounded-integer z3 query; honest `:unknown` when
+; the solver declines). The model proves: a hit — epoch AND chain equal since
+; refresh — returns the world binding, so each lookup equals the live oracle.
+; What it does NOT prove (the model/runtime boundary): that the REAL runtime
+; actually bumps the epoch on every mutation and that `current_epoch` is the
+; same counter `fetch/2` reads. That is an axiom of `env.bl`, checked here only
+; by the executable parity tests, not proven.
+;
+; Run: ./bin/bl --cold test -p . research/structural/lookup_test.bl
+
+(ns research.structural.lookup)
+
+; ── the real Env observables ───────────────────────────────────────────────
+
+(defn epoch-api?
+  "Whether the pinned Env beam exports the epoch counter `current_epoch/0`.
+   `erlang/function_exported/3` is FALSE for an unloaded module, so a cold
+   worker would read `false` even though the running image exports the counter.
+   When the module is not already loaded the probe forces it onto the code
+   server (`Code/ensure_loaded?`, the guard `BeamLisp.AOT` uses), guarded so a
+   capability-refused or unavailable `Code` degrades to the conservative false.
+   True on every build where the pinned emitter walks `defn-` (the documented
+   behaviour); false degrades `deref!` to an always-refresh cache."
+  []
+  (let [mod :"Elixir.BeamLisp.Env"]
+    ; A loaded module answers immediately; only an UNLOADED one needs the
+    ; forced load, and that call is guarded so a capability-refused or
+    ; unavailable `Code` degrades to the conservative false (always-refresh).
+    (or (erlang/function_exported mod :current_epoch 0)
+        (try
+          (and (Code/ensure_loaded? mod)
+               (erlang/function_exported mod :current_epoch 0))
+          (catch _e false)))))
+
+(defn current-epoch
+  "The Env registry epoch, or 0 when the pinned beam does not export it. Public
+   so tests can witness the epoch-only negative control with the SAME counter."
+  []
+  (if (epoch-api?) (BeamLisp.Env/current_epoch) 0))
+
+(defn- current-chain [] (BeamLisp.Env/chain))
+
+; ── the traversal-local cell ────────────────────────────────────────────────
+;
+; One process-dictionary slot per traversal, keyed by a fresh ref. Process-local
+; by construction (a traversal does not cross processes), so this is not a
+; second registry: no Agent, no ETS table, no cross-process visibility. The
+; slot is erased with `destroy-cache` when the traversal ends.
+
+(defn new-cache
+  "Start a traversal-local cache for `ns/name`. Returns an opaque handle (a
+   ref). No authoritative fetch happens until the first `deref!`."
+  [ns name]
+  (let [k (erlang/make_ref)]
+    (Process/put k {:ns ns :name name :api (epoch-api?)
+                    :epoch nil :chain nil :value nil :fresh false
+                    :misses 0 :refreshes 0 :fetches 0})
+    k))
+
+(defn destroy-cache
+  "Forget a traversal-local cache. Idempotent."
+  [k]
+  (Process/delete k)
+  :ok)
+
+(defn state
+  "The raw slot map, for tests and instrumentation (never on a hot path)."
+  [k]
+  (Process/get k))
+
+(defn stats
+  "The counters a run accumulated: `:fetches` is the number of AUTHORITATIVE
+   `Env.fetch/2` calls this cache made; `:misses`/`:refreshes` each miss and each
+   completed store. Hits = steps − fetches."
+  [k]
+  (let [s (Process/get k)]
+    {:misses (:misses s) :refreshes (:refreshes s) :fetches (:fetches s)}))
+
+(defn- ok-result? [v]
+  (and (erlang/is_tuple v)
+       (erlang/== 2 (erlang/tuple_size v))
+       (erlang/== :ok (erlang/element 1 v))))
+
+(defn deref!
+  "Resolve `ns/name` through the traversal-local cache, returning exactly the
+   `{:ok value}` / `:error` shape of `Env.fetch/2`.
+
+   HIT  — the cached environment identity `(epoch, chain)` still matches: return
+          the cached result, no authoritative fetch, no mutation.
+   MISS — otherwise refresh: INVALIDATE the slot, call the authoritative
+          `Env.fetch/2`, and re-store only if the epoch and chain were stable
+          ACROSS the call. A loader that initializes a provider (or a concurrent
+          writer) bumps the epoch mid-fetch, so the unstable case stores
+          `:fresh false` and the next deref refetches. If the fetch RAISES, the
+          pre-fetch invalidation has already landed: the old binding can never
+          be served afterwards."
+  [k]
+  (let [s (Process/get k)
+        api (:api s)
+        e0 (if api (BeamLisp.Env/current_epoch) 0)
+        ch0 (current-chain)]
+    (if (and api (:fresh s)
+             (erlang/== (:epoch s) e0)
+             (erlang/== (:chain s) ch0))
+      (:value s)
+      (let [s1 (assoc (assoc s :fresh false) :misses (+ (:misses s) 1))]
+        ; Invalidate BEFORE fetching: a raise must not leave a servable stale
+        ; binding behind.
+        (Process/put k s1)
+        (let [value (BeamLisp.Env/fetch (:ns s1) (:name s1))
+              e1 (if api (BeamLisp.Env/current_epoch) 0)
+              ch1 (current-chain)
+              stable (and api (erlang/== e0 e1) (erlang/== ch0 ch1))]
+          (Process/put k (assoc s1
+                           :value value :epoch e1 :chain ch1 :fresh stable
+                           :refreshes (+ (:refreshes s1) 1)
+                           :fetches (+ (:fetches s1) 1)))
+          value)))))
+
+(defn invoke2
+  "Invoke a two-argument callable: a raw arity-2 Erlang fun (the shape a
+   single-clause BL `(fn [a b] …)` compiles to) directly; anything else through
+   the runtime's general invoker. Public so tests invoke a resolved callable the
+   same way `fold-cached` does."
+  [f a b]
+  (if (erlang/is_function f 2)
+    (erlang/apply f (list a b))
+    (BeamLisp.Ns.Rt/invoke f (list a b))))
+
+(defn fold-cached
+  "Fold `coll` with the callable resolved through `cache` on every element.
+   Parity (the test asserts it) is with the same fold resolving through
+   `Env.fetch!/2` each step. `:missing true` when the var is unbound, which is
+   the `:error` a bare `Env.fetch/2` returns."
+  [cache coll init]
+  (loop [acc init xs coll steps 0]
+    (if (empty? xs)
+      {:result acc :steps steps}
+      (let [v (deref! cache)]
+        (if (ok-result? v)
+          (recur (invoke2 (erlang/element 2 v) acc (first xs)) (rest xs) (+ steps 1))
+          {:result acc :steps steps :missing true})))))
+
+; ═════════════════════════════════════════════════════════════════════════
+; METRICS — the reusable probe the orchestrator driver calls
+; ═════════════════════════════════════════════════════════════════════════
+;
+; Process reductions are a ROUGH proxy, not a verdict. The baseline resolves
+; through `Env/fetch/2`, which is ITSELF memoized (epoch + per-process cache),
+; so the cached path is not guaranteed to beat it on reductions even where it
+; collapses authoritative fetches. `report` STATES the measurement; it does not
+; edit the numbers into a pass.
+
+(defn- reductions []
+  (erlang/element 2 (erlang/process_info (erlang/self) :reductions)))
+
+(defn- best-reductions
+  "Best-of-`n` is the MINIMUM: one noisy run cannot inflate the measurement."
+  [n f]
+  (loop [i 0 best nil]
+    (if (>= i n)
+      best
+      (let [b0 (reductions)
+            _ (f)
+            d (- (reductions) b0)]
+        (recur (+ i 1) (if (or (nil? best) (< d best)) d best))))))
+
+(defn report
+  "Canonical cost probe for the orchestrator driver. Runs one unchanged
+   traversal of `coll` two ways — resolving the callable at `ns/name` through
+   `Env.fetch/2` per element (baseline) and through a traversal-local cache
+   (`fold-cached`) — and returns a stable metrics map.
+
+   `report` OWNS and DESTROYS every cache it creates (a `try`/`finally`), so a
+   caller cannot leak a process-dictionary slot. Reductions are best-of-N (the
+   minimum).
+
+   Keys: `:result` `:steps` `:fetches` `:misses` `:refreshes`
+   `:cached-reductions` `:baseline-reductions` `:best-of` `:epoch-api?`
+   `:reduction-ratio` (cached/baseline, nil when baseline is 0) `:agrees`.
+
+   Invariant the caller asserts: with `epoch-api?` true, `:fetches` is 1-3 for
+   an unchanged traversal. The reduction counts are REPORTED, not asserted."
+  ([ns name coll init] (report ns name coll init 5))
+  ([ns name coll init best-of]
+   (let [baseline (fn []
+                    (loop [acc init xs coll]
+                      (if (empty? xs)
+                        acc
+                        (let [v (erlang/element 2 (BeamLisp.Env/fetch ns name))]
+                          (recur (invoke2 v acc (first xs)) (rest xs))))))
+         cached (fn []
+                  (let [c (new-cache ns name)]
+                    (try
+                      (let [r (fold-cached c coll init)]
+                        (assoc r :stats (stats c)))
+                      (finally (destroy-cache c)))))
+         base-result (baseline)
+         run (cached)
+         b (best-reductions best-of baseline)
+         k (best-reductions best-of
+             (fn []
+               (let [c (new-cache ns name)]
+                 (try
+                   (fold-cached c coll init)
+                   (finally (destroy-cache c))))))]
+     {:result (:result run)
+      :steps (:steps run)
+      :fetches (:fetches (:stats run))
+      :misses (:misses (:stats run))
+      :refreshes (:refreshes (:stats run))
+      :cached-reductions k
+      :baseline-reductions b
+      :best-of best-of
+      :epoch-api? (epoch-api?)
+      :reduction-ratio (if (and b (> b 0)) (/ k b) nil)
+      :agrees (erlang/== base-result (:result run))})))
+
+; ═════════════════════════════════════════════════════════════════════════
+; PURE MODEL — the proof object (no Env, no pdict, no mutation)
+; ═════════════════════════════════════════════════════════════════════════
+;
+; A world is `{:binding b :epoch e :chain c}`. Three modes move it:
+;
+;   :stable  nothing changes.
+;   :rebind  a write in the same env: binding flips AND epoch advances.
+;   :switch  a pure env switch to a chain that binds the name differently:
+;            chain flips and binding flips, epoch UNCHANGED. This is the case
+;            an epoch-only guard gets wrong.
+;
+; A cache is `{:fresh bool :binding b :epoch e :chain c}`: `:fresh` says a
+; value was stored and against which environment it was stored.
+
+(defn world-step
+  "Apply a mode to a world. `:switch` flips the binding too, modelling a
+   pre-existing shadow in the other chain (which is why epoch alone is not
+   enough)."
+  [world mode]
+  (cond
+    (erlang/== mode :rebind)
+    (assoc (assoc world :binding (- 1 (:binding world))) :epoch (+ (:epoch world) 1))
+
+    (erlang/== mode :switch)
+    (assoc (assoc world :chain (- 1 (:chain world))) :binding (- 1 (:binding world)))
+
+    :else world))
+
+(defn model-step
+  "One guarded lookup as a pure transition. Returns `{:value v :state state'}`.
+   A fresh cache whose `(epoch, chain)` still matches the world returns its
+   binding; otherwise it refreshes from the world."
+  [state world]
+  (if (and (:fresh state)
+           (erlang/== (:epoch state) (:epoch world))
+           (erlang/== (:chain state) (:chain world)))
+    {:value (:binding state) :state state}
+    {:value (:binding world)
+     :state {:fresh true :binding (:binding world)
+             :epoch (:epoch world) :chain (:chain world)}}))
+
+(defn model-step-frozen
+  "The NAIVE design as a pure model: prime once, then never revalidate. Kept as
+   the explicit wrong design the negative control witnesses."
+  [state world]
+  (if (:fresh state)
+    {:value (:binding state) :state state}
+    {:value (:binding world)
+     :state {:fresh true :binding (:binding world)
+             :epoch (:epoch world) :chain (:chain world)}}))
+
+(defn audit-bulk-delete
+  "Probe a lower-level mutation against the stamp axiom in a disposable env.
+   This is diagnostic evidence, not a production-safe optimization certificate."
+  []
+  (let [env (BeamLisp.Env/fork (BeamLisp.Env/env_id))]
+    (try
+      (BeamLisp.Env/with_env env
+        (fn []
+          (let [ns (str "research.structural.bulk-probe-" (erlang/unique_integer (list :positive)))
+                name "value"]
+            (BeamLisp.Env/intern ns name :before)
+            (let [cache (new-cache ns name)]
+              (try
+                (let [prime (deref! cache)
+                      e0 (current-epoch)
+                      _ (BeamLisp.Env/match_delete_own (tuple (tuple ns name) :_))
+                      e1 (current-epoch)
+                      raw (BeamLisp.Env/lookup (tuple ns name))
+                      cached (deref! cache)
+                      baseline (BeamLisp.Env/fetch ns name)]
+                  {:raw-missing? (= :error raw)
+                   :epoch-advanced? (not= e0 e1)
+                   :cached-agrees-with-raw? (= cached raw)
+                   :baseline-agrees-with-raw? (= baseline raw)
+                   :cached-prior-binding? (= prime cached)})
+                (finally (destroy-cache cache)))))))
+      (finally (BeamLisp.Env/destroy env)))))

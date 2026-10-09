@@ -1,0 +1,361 @@
+; realm_test.bl — the realm-local AOT cache adapter's assurance (FUP-155, step 1).
+;
+; Run (orchestrator, one VM):
+;   ./bin/bl test research/structural/realm_test.bl
+;
+; The load-bearing claims, each a deftest:
+;   1. a REAL BEAM compiles once, then the same entry is served from cache
+;      (compile-count 1, load-count 1) and the module executes;
+;   2. the key separates bytes, dependencies (a macro provider's hash), the
+;      compiler and the realm segment — each difference a miss; the closure key
+;      is compared at ONE fixture path so only CONTENT moves it;
+;   3. two realm envs hold their own init state; the global env never sees it;
+;   4. a corrupted beam and a partial publish are refused (:miss) and the
+;      adapter falls back to a fresh compile;
+;   5. a realm generation initializes once, close purges its module, and a
+;      reopen initializes once more with a stable segment identity;
+;   6. veritas finite-exhaustive key-separation + lifecycle invariants, and the
+;      z3 symbolic obligations, hold — with the segment-blind key's collision
+;      witnessed by BOTH engines.
+;
+; THE SEQUENTIAL BOUNDARY: within one open generation a namespace binds to ONE
+; entry-key; a `build!` with a different entry REFUSES before any side effect
+; (reload unsupported, races unsupported). A changed closure is observed after
+; close + reopen (test 2).
+;
+; Every execution result below is UNRUN: the orchestrator runs it. Nothing here
+; mutates production; the temp cache and work dirs are removed afterwards.
+
+(ns research.structural.realm-test
+  (:require [research.structural.realm :as r]))
+
+; ── hermetic harness ───────────────────────────────────────────────────────
+
+(defn- restore-env [k v]
+  (if (nil? v) (System/delete_env k) (System/put_env k v)))
+
+(defn- with-hermetic
+  "Run `f` with a FRESH per-test cache root (BEAM_LISP_AOT_CACHE_DIR) and work
+   dir; reset the counters; restore the environment and remove everything
+   afterwards. Mirrors test/bl/aot_cache_test.bl's harness."
+  [f]
+  (let [tag (erlang/unique_integer (list :positive))
+        cache-dir (str (System/tmp_dir!) "/bl_realm_spike_cache_" tag)
+        work (str (System/tmp_dir!) "/bl_realm_spike_work_" tag)
+        prev-dir (System/get_env "BEAM_LISP_AOT_CACHE_DIR")]
+    (System/put_env "BEAM_LISP_AOT_CACHE_DIR" cache-dir)
+    (File/mkdir_p! work)
+    (r/reset-counters!)
+    (try
+      (f {:cache-dir cache-dir :work work})
+      (finally
+        (restore-env "BEAM_LISP_AOT_CACHE_DIR" prev-dir)
+        (File/rm_rf! work)
+        (File/rm_rf! cache-dir)))))
+
+(defn- uid [] (str (erlang/unique_integer (list :positive))))
+
+(defn- refusal
+  "Run `f`; nil when it returns, the exception message when it raises."
+  [f]
+  (try (do (f) nil) (catch e (ex-message e))))
+
+(defn- write-fixture
+  "Write a namespace source and a provider (macro) source under `dir`, and
+   return the `{:path :deps :hashes}` triple the existing `AOTCache/closure_key`
+   consumes. The provider is a declared dependency of the namespace, so its
+   bytes are part of the resolved closure. ONE `dir` reused across calls keeps
+   the PATH fixed, so only CONTENT can move the closure key."
+  [dir ns-name value prov-name prov-value]
+  (let [p (Path/join dir "ns.bl")
+        pp (Path/join dir "provider.bl")]
+    (File/mkdir_p! dir)
+    (File/write! p (str "(ns " ns-name ")\n(defn who [] " (pr-str value) ")\n"))
+    (File/write! pp (str "(ns " prov-name ")\n(defmacro tag [] " (pr-str prov-value) ")\n"))
+    {:path p
+     :deps {p [pp] pp []}
+     :hashes {p (r/sha256-hex (File/read! p))
+              pp (r/sha256-hex (File/read! pp))}}))
+
+(defn- closure-of [fx]
+  (r/closure-key-of (:path fx) (:deps fx) (:hashes fx)))
+
+(defn- spec-for [fx ns value compiler dir]
+  {:ns ns :value value :closure-key (closure-of fx)
+   :compiler-key compiler :dir dir})
+
+; ═══ 1. real BEAM, compiled once, then a cache hit ══════════════════════════
+
+(deftest a-real-beam-compiles-once-then-serves-from-cache
+  (with-hermetic
+    (fn [{:keys [work]}]
+      (let [rid (str "ra-" (uid))
+            ns "spike.realm.ns"
+            fx (write-fixture (Path/join work "one") ns "A" "spike.realm.prov" "A")
+            spec (spec-for fx ns "A" "spikeCompiler" (Path/join work "out-a"))]
+        (r/open-realm! rid (str "k" (uid)))
+        (try
+          (let [c0 (r/counters-map)
+                t0 (System/monotonic_time :microsecond)
+                first (r/build! rid spec)
+                t1 (System/monotonic_time :microsecond)
+                c1 (r/counters-map)
+                second (r/build! rid (assoc spec :dir (Path/join work "out-b")))
+                t2 (System/monotonic_time :microsecond)
+                c2 (r/counters-map)]
+            (println "realm-spike: compile-us" (- t1 t0)
+                     "load-us" (- t2 t1)
+                     "counters" (r/counters-map))
+            (testing "the first build compiles a real module and initializes it"
+              (is (= {:compile 0 :load 0 :init 0 :open 1} c0))
+              (is (= :compiled (:status first)))
+              (is (= {:compile 1 :load 0 :init 1 :open 1} c1)
+                  "one compile, no load, one init, one open")
+              (let [mod (:module first)]
+                (is (erlang/is_atom mod))
+                (is (erlang/function_exported mod :who 0) "a real BEAM exports who/0")
+                (is (= "A" (erlang/apply mod :who (list))) "the module runs")))
+            (testing "the second build is a cache hit, not a second compile or init"
+              (is (= :reused (:status second)))
+              (is (= {:compile 1 :load 1 :init 1 :open 1} c2)
+                  "a hit never recompiles or re-inits")
+              (is (= (:module first) (:module second)))
+              (is (File/exists? (Path/join (Path/join work "out-b")
+                                           (str (:module second) ".beam")))
+                  "fetch materialized the cached beam into the fresh dir")))
+          (finally (r/close-realm! rid)))))))
+
+; ═══ 2. the key separates bytes, deps, compiler and segment ════════════════
+
+(deftest keys-separate-bytes-deps-compiler-and-segment
+  (with-hermetic
+    (fn [{:keys [work]}]
+      (let [ns "spike.realm.ns"
+            fx-dir (Path/join work "fx")          ; ONE path: only CONTENT varies
+            rid (str "rb-" (uid))
+            key (str "kb" (uid))
+            rid2 (str "rc-" (uid))
+            key2 (str "kc" (uid))
+            fa (write-fixture fx-dir ns "A" "spike.realm.prov" "A")
+            base (closure-of fa)
+            fp (write-fixture fx-dir ns "A" "spike.realm.prov" "B")
+            changed-provider (closure-of fp)
+            fb (write-fixture fx-dir ns "B" "spike.realm.prov" "A")
+            changed-bytes (closure-of fb)
+            spec (spec-for fa ns "A" "spikeCompiler" (Path/join work "o1"))]
+        (testing "the closure key is sensitive to CONTENT at one fixed path"
+          (is (not= base changed-bytes) "ns bytes move the closure key")
+          (is (not= base changed-provider) "provider bytes move the closure key")
+          (is (not= changed-bytes changed-provider)
+              "each content change is its own closure"))
+        (testing "the correct entry key separates segments; the naive key does not"
+          (is (not= (r/entry-key base "Ra") (r/entry-key base "Rb")))
+          (is (= (r/naive-key base) (r/naive-key base))
+              "segment-blind by construction — the wrong design"))
+        (r/open-realm! rid key)
+        (r/open-realm! rid2 key2)
+        (try
+          (let [a (r/build! rid spec)
+                d (r/build! rid2 spec)]
+            (testing "two realms compile; the segment names different modules"
+              (is (= :compiled (:status a)))
+              (is (= :compiled (:status d)) "different segment (realm) miss")
+              (is (= "A" (erlang/apply (:module a) :who (list))) "a runs A immediately")
+              (is (not= (:module a) (:module d)) "segments name different modules"))
+
+            (testing "executable negative control: a segment-blind key serves A to B"
+              (is (= :ok (BeamLisp.AOTCache/store "spikeCompiler" (r/naive-key base)
+                                                 (get spec :dir) (list (:module a)))))
+              (let [hit (BeamLisp.AOTCache/fetch "spikeCompiler" (r/naive-key base)
+                                                 (Path/join work "naive-out"))]
+                (is (= :ok (elem hit 0)))
+                (is (= (:module a) (first (elem hit 1)))
+                    "realm B is served realm A's module under a segment-blind key")
+                (is (= "A" (erlang/apply (first (elem hit 1)) :who (list)))
+                    "and it is A's code, not a realm-B compilation")))
+
+            (testing "same generation, changed entry: reload is refused, side-effect free"
+              (is (String/contains?
+                    (str (refusal (fn [] (r/build! rid (assoc spec :value "B"
+                                                             :closure-key changed-bytes
+                                                             :dir (Path/join work "o2"))))))
+                    "reloading a changed entry"))
+              (is (not (File/exists? (Path/join (Path/join work "o2")
+                                               (str (:module a) ".beam"))))
+                  "the refused build! wrote no beam"))
+
+            ; the changed closure is observed in a FRESH generation, same segment
+            (r/close-realm! rid)
+            (r/open-realm! rid key)
+            (let [b (r/build! rid (assoc spec :value "B" :closure-key changed-bytes
+                                         :dir (Path/join work "o2")))]
+              (is (= :compiled (:status b)) "different bytes miss in a fresh generation")
+              (is (= "B" (erlang/apply (:module b) :who (list))) "b runs B immediately"))
+
+            (r/close-realm! rid)
+            (r/open-realm! rid key)
+            (let [c (r/build! rid (assoc spec :compiler-key "spikeCompiler2"
+                                         :dir (Path/join work "o3")))]
+              (is (= :compiled (:status c)) "different compiler miss")))
+          (finally
+            (r/close-realm! rid)
+            (r/close-realm! rid2)))))))
+
+; ═══ 3. two realm envs, isolated init ══════════════════════════════════════
+
+(deftest two-realm-envs-see-their-own-init
+  (with-hermetic
+    (fn [{:keys [work]}]
+      (let [na (str "ra-" (uid)) nb (str "rb-" (uid))
+            ns "spike.realm.ns"
+            fa (write-fixture (Path/join work "a") ns "A" "spike.realm.prov" "A")
+            fb (write-fixture (Path/join work "b") ns "B" "spike.realm.prov" "B")
+            speca (spec-for fa ns "A" "spikeCompiler" (Path/join work "oa"))
+            specb (spec-for fb ns "B" "spikeCompiler" (Path/join work "ob"))]
+        (r/open-realm! na (str "ka" (uid)))
+        (r/open-realm! nb (str "kb" (uid)))
+        (try
+          (r/build! na speca)
+          (r/build! nb specb)
+          (is (= "A" (r/local-value na ns)) "realm A's env holds A")
+          (is (= "B" (r/local-value nb ns)) "realm B's env holds B")
+          (is (erlang/== :error (BeamLisp.Env/lookup (r/init-key ns)))
+              "the global env never received a realm init")
+          (finally
+            (r/close-realm! na)
+            (r/close-realm! nb)))))))
+
+; ═══ 4. corruption and partial publish refuse, and fall back ══════════════
+
+(deftest corrupt-and-partial-entries-refuse-and-fall-back
+  (with-hermetic
+    (fn [{:keys [work]}]
+      (let [rid (str "rc-" (uid))
+            ns "spike.realm.ns"
+            fx (write-fixture (Path/join work "c") ns "C" "spike.realm.prov" "C")
+            spec (spec-for fx ns "C" "spikeCompiler" (Path/join work "c1"))
+            ctx (r/open-realm! rid (str "kc" (uid)))
+            first (r/build! rid spec)]
+        (try
+          (is (= :compiled (:status first)))
+          (let [rkey (r/entry-key (:closure-key spec) (:segment ctx))
+                entry (BeamLisp.AOTCache/entry_dir "spikeCompiler" rkey)
+                beam (Path/join entry (str (:module first) ".beam"))]
+            (testing "a corrupted beam is refused, not linked"
+              (File/write! beam "corrupt")
+              (is (= :miss (BeamLisp.AOTCache/fetch "spikeCompiler" rkey
+                                                   (Path/join work "probe"))))
+              (is (= :compiled (:status (r/build! rid (assoc spec :dir (Path/join work "c2")))))
+                  "the adapter falls back to a fresh compile")
+              (is (= "C" (erlang/apply (:module first) :who (list)))))
+            (testing "a partial publish (no manifest) is a miss"
+              (File/rm (Path/join entry "manifest.term"))
+              (is (= :miss (BeamLisp.AOTCache/fetch "spikeCompiler" rkey
+                                                   (Path/join work "probe2"))))
+              (is (= :compiled (:status (r/build! rid (assoc spec :dir (Path/join work "c3"))))))))
+          (finally (r/close-realm! rid)))))))
+
+; ═══ 5. lifecycle: open once, init once, close purges, reopen once ═════════
+
+(deftest reopen-initializes-once-and-close-purges
+  (with-hermetic
+    (fn [{:keys [work]}]
+      (let [rid (str "rl-" (uid))
+            key (str "kl" (uid))
+            ns "spike.realm.ns"
+            fx (write-fixture (Path/join work "l") ns "L" "spike.realm.prov" "L")
+            spec (spec-for fx ns "L" "spikeCompiler" (Path/join work "l1"))]
+        (r/open-realm! rid key)
+        (try
+          (let [first (r/build! rid spec)
+                again (r/build! rid (assoc spec :dir (Path/join work "l2")))]
+            (is (= :compiled (:status first)))
+            (is (= 1 (r/init-count)) "one init for the open generation")
+            (is (= :reused (:status again)))
+            (is (= 1 (r/init-count)) "a hit in the same generation does not re-init")
+            (r/close-realm! rid)
+            (is (erlang/not (erlang/is_list (code/which (:module first))))
+                "close purged the realm's module from the code server")
+            (let [ctx2 (r/open-realm! rid key)
+                  third (r/build! rid (assoc spec :dir (Path/join work "l3")))]
+              (is (some? ctx2))
+              (is (= :reused (:status third)) "the cache entry survives the realm close")
+              (is (= 2 (r/init-count)) "reopen initializes once")
+              (is (= (:module first) (:module third))
+                  "segment identity (the atom) is stable across reopen — no atom growth")
+              (r/close-realm! rid)
+              ; a second full lifecycle must reuse the SAME atom and init once more
+              (r/open-realm! rid key)
+              (let [fourth (r/build! rid (assoc spec :dir (Path/join work "l4")))]
+                (is (= :reused (:status fourth)))
+                (is (= 3 (r/init-count)) "each open generation initializes once")
+                (is (= (:module first) (:module fourth))
+                    "repeated open/close neither grows the atom nor changes identity")
+                (is (= 3 (r/open-count)) "three generations were opened")
+                (r/close-realm! rid))))
+          (finally (r/close-realm! rid)))))))
+
+; ═══ 6. logic: veritas finite exhaustive + z3 symbolic ════════════════════
+
+(deftest logic-key-separation-and-lifecycle-invariants
+  (let [verdicts (r/check-logic)
+        smt (r/smt-key-obligations)]
+    (testing "veritas, finite exhaustive (engine :enumerate is a proof)"
+      (is (= :proven (:modality (:key-separation verdicts)))
+          "the composite key is injective over the declared 2^6 key domain")
+      (is (= :enumerate (:engine (:key-separation verdicts)))
+          "answered by exhaustion, not sampling")
+      (is (= :proven (:modality (:lifecycle-safe verdicts)))
+          "the real (open, inits) transition relation initializes a generation at most once")
+      (is (= :enumerate (:engine (:lifecycle-safe verdicts)))))
+
+    (testing "adversarial negative control: the segment-blind key collides"
+      (is (= :proven (:modality (:naive-collision verdicts))))
+      (is (some? (:witness (:naive-collision verdicts)))
+          "a witness pair: distinct segments, equal naive key")
+      (is (= :refuted (:modality (:naive-refuted verdicts)))
+          "the ∀ claim that the naive key separates is false")
+      (is (= :proven (:modality (:naive-lifecycle verdicts))))
+      (is (some? (:witness (:naive-lifecycle verdicts)))
+          "a witness trace: a naive lifecycle reaches two inits in one generation")
+      (is (= [1 3 3] (:witness (:naive-lifecycle verdicts)))
+          "the witness is exactly open·init·init"))
+
+    (testing "z3 symbolic obligations"
+      (is (= :unsat (:separation smt))
+          "key separation is proven for the component bounds")
+      (is (= :sat (:naive-collision smt))
+          "the segment-blind key has a model — a machine-checked witness")
+      (is (not= :unknown (:separation smt))
+          "an undecided solver is never read as proven")
+      (is (not= :unknown (:naive-collision smt))))))
+
+; Executed by the bl test runner after all tests are registered.
+
+(deftest compiler-and-realm-identity-cannot-change-inside-an-open-generation
+  (with-hermetic
+    (fn [{:keys [work]}]
+      (let [rid (str "identity-" (uid)) key (str "key-" (uid))
+            ns "spike.realm.identity"
+            fx (write-fixture (Path/join work "identity") ns "I" "spike.realm.prov" "I")
+            spec (spec-for fx ns "I" "compiler-one" (Path/join work "out"))]
+        (r/open-realm! rid key)
+        (try
+          (let [first (r/build! rid spec)]
+            (is (thrown? (r/open-realm! rid (str key "-different"))))
+            (is (thrown? (r/open-realm! (str rid "-alias") key))
+                "two independent live realms cannot overwrite the same segment's modules")
+            (is (thrown? (r/build! rid (assoc spec :compiler-key "compiler-two"))))
+            (is (= 1 (r/compile-count)))
+            (is (= "I" (r/local-value rid ns)))
+            (r/close-realm! rid)
+            (is (= false (erlang/check_old_code (:module first)))
+                "delete must precede purge so closing also removes old code")
+            (let [ctx (r/open-realm! rid key)
+                  hit (r/build! rid (assoc spec :dir (Path/join work "hit")))]
+              (is (= :reused (:status hit)))
+              (is (= (:module hit)
+                     (BeamLisp.Env/with_env (:env ctx)
+                       (fn [] (BeamLisp.Emit/module_for ns))))
+                  "cache replay restores the realm-local namespace marker")))
+          (finally (r/close-realm! rid)))))))

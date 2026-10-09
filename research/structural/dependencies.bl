@@ -1,0 +1,519 @@
+; research/structural/dependencies.bl — dependency certificates for a projection
+; cache, and relevance for a queued live commit batch.
+;
+; PLAN-165 proposition A (see !tasks/plans/PLAN-165): dependency-aware
+; invalidation must be REUSABLE and SOUND, extending the existing datom
+; facilities rather than growing a parallel app cache. This module is the
+; research prototype: it does not change production, and nothing here is wired
+; into a default.
+;
+; ── The two questions ────────────────────────────────────────────────────
+;
+; 1. PROJECTION CACHE. May a derived projection reuse its answer?
+;      Reuse  ⇔ a certificate captured at build time is still equal to the
+;               certificate the CURRENT world would capture, AND the
+;               certificate is COMPLETE (every dependency is a known,
+;               fully-read kind), AND no authorization source has expired.
+;      Unknown, incomplete, expired, cross-store ⇒ RECOMPUTE.
+;
+; 2. LIVE RELEVANCE. May a live socket skip a render for an observed commit?
+;      Render ⇔ the certificate is incomplete/unknown, OR ANY commit in the
+;               QUEUED batch is relevant, OR the batch is empty.
+;    The last clauses are load-bearing. `live.socket/commit-queued?` coalesces
+;    a burst by letting the LAST commit render for all of them — sound only
+;    because the last commit's handler renders unconditionally. Once relevance
+;    can SKIP a render, checking only the LAST commit can strand an earlier
+;    relevant commit. Candidate checks the WHOLE batch.
+;
+; ── Where the dependencies come from ─────────────────────────────────────
+;
+; A certificate is captured from an EXPLICIT, SUPPORTED READ DSL — the read
+; plan a projection's author declares. It is never inferred from arbitrary
+; code, and never accepted from a caller's bare attribute list as if that
+; were a proof. A descriptor outside the DSL (an inferred read, an
+; unclassifiable clause) makes the certificate INCOMPLETE, and an incomplete
+; certificate can never justify reuse or a skipped render. This is the
+; `datom.watch/ALWAYS-RELEVANT` discipline, lifted to a cache key.
+;
+; Each token reuses the real datom affordance it names:
+;   :attr      datom.attr-basis/basis-t-for   (per-attribute write mark)
+;   :empty     datom.attr-basis/basis-t-for   (a NEGATIVE read, recorded as
+;                                              a mark; a later write moves it)
+;   :basis     datom/db basis-t               (whole-basis observation)
+;   :store     datom.store/identity-of        (the store a mark is against)
+;   :acl       a declared expiry              (exact, not a minute bucket)
+;   :provider  a declared nested read plan    (a computed relation's reads)
+;
+; ── Model vs runtime ─────────────────────────────────────────────────────
+;
+; The veritas/z3 proofs in the test establish an ABSTRACT theorem over a
+; bounded boolean/state domain: the design's relevance and recompute
+; predicates catch every declared change facet, while the naive attrs-only /
+; last-commit-only predicates do not. They say nothing about the runtime cost
+; of `basis-t-for` or the correctness of an application's declared plan; the
+; tests measure the latter with a store counter and assert the former is only
+; claimed over the stated domain.
+
+; ── Hardening pass (independent review findings) ────────────────────────
+;
+; 1. PLAN IDENTITY. `project` reuses only when the cache holds a `:projected`
+;    certificate whose descriptor SET equals the plan built from the requested
+;    attrs/neg-attrs. A cache built for a different projection is rebuilt.
+; 2. RECURSIVE VALIDITY. `usable?`/`commit-relevant?` walk provider tokens
+;    recursively, so an expired NESTED ACL, a NESTED :whole token, or a nested
+;    unsound plan refuses reuse and makes commits relevant.
+; 3. MALFORMED PLANS/CERTIFICATES. `descriptor-sound?` validates every field a
+;    kind requires; `reads-sound?` rejects non-sequential/empty/nested-unsound
+;    plans. `cert-integrity?` checks a certificate STRUCTURALLY against its own
+;    captured plan (sound non-empty plan, one token per descriptor, token kinds
+;    match). A malformed certificate never throws and never justifies reuse.
+; 4. BOUNDARY, NOT FORGERY-PROOFING. The NONCE separates a captured certificate
+;    from a map assembled without one; it is NOT a signature and IS readable in
+;    the returned certificate. Reuse rests on canonical plan identity +
+;    structural integrity + token equality, never on unforgeability. A payload
+;    that has MUTATED a held certificate is outside the trusted boundary.
+; 5. HISTORICAL / RACING READS. `datom.attr-basis/basis-t-for` answers the
+;    store's LATEST write whatever db value the caller holds. A planned mark
+;    ABOVE the certificate's pinned basis means the rows are historical or a
+;    write interleaved capture: the certificate is declared :stale?/:unsound
+;    and can never be cached, so historical rows are never republished under
+;    current marks. Standalone `capture` is DECLARATION-ONLY (no rows read);
+;    only `project` builds a real-read certificate. There is NO automatic
+;    inference of an arbitrary function's reads.
+; 6. :store TOKEN. It names an IDENTITY, not a version: a same-store commit is
+;    treated as relevant (conservative), a different-store commit is not.
+
+(ns research.structural.dependencies
+  (:require [datom] [datom.db] [datom.store] [datom.attr-basis]))
+
+; ═════════════════════════════════════════════════════════════════════════
+; 1. THE READ DSL — explicit, supported, closed
+; ═════════════════════════════════════════════════════════════════════════
+
+(def sound-kinds
+  "The descriptor kinds a certificate may be built from. Anything else is an
+   inferred or unsupported read and makes the certificate INCOMPLETE."
+  #{:store :attr :empty :basis :acl :provider})
+
+(defn store-read
+  "A read of the store's IDENTITY. A projection that spans stores declares one
+   per store (or relies on the store id embedded in every attr token)."
+  [] {:kind :store})
+
+(defn attr-read
+  "A positive read of attribute `a`: the projection returned rows for it."
+  [a] {:kind :attr :attr a})
+
+(defn empty-read
+  "A NEGATIVE read of attribute `a`: the projection ASKED and found no rows.
+   It must be declared explicitly. A design that infers dependencies from the
+   rows it got back never sees this, so a later insert is invisible to it —
+   the empty-read counterexample."
+  [a] {:kind :empty :attr a})
+
+(defn basis-read
+  "A whole-basis observation: the projection read something whose meaning is
+   the basis itself (a `since`/`as-of`/count window). Any commit invalidates."
+  [] {:kind :basis})
+
+(defn acl-read
+  "An authorization source: `key` names it, `expiry` is the EXACT millisecond
+   it stops being valid, `attrs` the attributes it is derived from (so a commit
+   touching them is relevant). Reads the same kind of datasource the app's
+   rights layer does; the certificate only records the validity window."
+  [key expiry attrs] {:kind :acl :key key :expiry expiry :attrs (set attrs)})
+
+(defn provider-read
+  "A computed-relation / provider dependency, declared as the nested read plan
+   the relation actually performs (the analogue of `:reads` on
+   datom.query.relation). Undeclared ⇒ the caller must say so explicitly with
+   `inferred-read`, and the certificate is then incomplete."
+  [id reads] {:kind :provider :id id :reads (into [] reads)})
+
+(defn inferred-read
+  "A read the DSL cannot name — arbitrary caller code, an unclassifiable
+   clause, a variable attribute. It is RECORDED (so an audit can see it) but
+   it makes the certificate incomplete, so the design fails closed."
+  [src] {:kind :infer :src src})
+
+(defn- descriptor-sound?
+  "A single descriptor is sound iff it names a supported kind AND carries every
+   field that kind requires, correctly typed. A partial descriptor (an :attr
+   with no :attr, an :acl with a missing/non-integer expiry, a :provider with a
+   non-sequential nested plan) is NOT sound — the plan fails closed instead of
+   producing a token from a missing field."
+  [d]
+  (let [k (when (map? d) (get d :kind))]
+    (and (contains? sound-kinds k)
+         (cond
+           (= k :store) true
+           (= k :basis) true
+           (or (= k :attr) (= k :empty)) (keyword? (get d :attr))
+           (= k :acl) (and (some? (get d :key))
+                           (int? (get d :expiry))
+                           (set? (get d :attrs)))
+           (= k :provider) (and (some? (get d :id))
+                                (sequential? (get d :reads)))
+           :else false))))
+
+(defn reads-sound?
+  "A read plan is sound iff it is a NON-EMPTY sequence of individually sound
+   descriptors AND every provider's nested plan is itself sound. One unsupported
+   or malformed descriptor anywhere makes the WHOLE plan unsound — a partial
+   dependency set would silently justify reuse for the part it missed. A nil or
+   non-sequential plan is unsound (never silently empty)."
+  [reads]
+  (and (sequential? reads)
+       (not (empty? reads))
+       (every? (fn [d]
+                 (if (and (map? d) (= :provider (get d :kind)))
+                   (and (descriptor-sound? d) (reads-sound? (get d :reads)))
+                   (descriptor-sound? d)))
+               reads)))
+
+; ═════════════════════════════════════════════════════════════════════════
+; 2. THE CERTIFICATE — captured from a declared read plan
+; ═════════════════════════════════════════════════════════════════════════
+
+(def ^:private CAPTURE-SOURCE
+  "The provenance tag `capture-with-pinned` writes for a certificate that is
+   both COMPLETE and NOT stale. `usable?` requires it as one of several fields;
+   it is a provenance marker, NOT a signature."
+  :capture)
+
+(def ^:private NONCE
+  "A per-process reference attached by `capture-with-pinned`. It distinguishes a
+   certificate BUILT by capture from a map merely SPELLING the fields — a map
+   assembled without a certificate carries no nonce. It is NOT unforgeable: the
+   nonce is visible in every returned certificate, so a caller holding one can
+   copy it and mutate fields. That caller is OUTSIDE the trusted boundary (a
+   certificate is trusted only as produced, unmutated, in-process); reuse rests
+   on canonical plan identity + structural integrity + token equality, never on
+   this reference being secret."
+  (erlang/make_ref))
+
+(defn- provider-token? [t]
+  (and (vector? t) (= :provider (get t 0))))
+
+(defn- token-tree
+  "Every token reachable from a token collection, parents first, descending
+   into a :provider token's nested set. Malformed entries are leaves."
+  [tokens]
+  (letfn [(walk [t]
+            (if (and (provider-token? t) (coll? (get t 3)))
+              (cons t (mapcat walk (into [] (get t 3))))
+              [t]))]
+    (into [] (mapcat walk (into [] (if (coll? tokens) tokens []))))))
+
+(defn- whole-token? [t]
+  (and (vector? t) (= :whole (get t 0))))
+
+(defn- acl-expired?
+  [t now]
+  (and (vector? t)
+       (= :acl (get t 0))
+       (int? (get t 3))
+       (>= now (get t 3))))
+
+(defn- mark-token? [t]
+  (and (vector? t) (or (= :attr (get t 0)) (= :empty (get t 0)))))
+
+(defn- token-kind-of [t]
+  (if (vector? t) (get t 0) :malformed))
+
+(defn- read-kind-of [d]
+  (if (map? d) (get d :kind) :malformed))
+
+(defn token-of
+  "One dependency descriptor → its current token. `pinned` is the basis the
+   projection was built at; it is the FALLBACK for an attribute with no write
+   mark, so an unwritten attribute keeps the SAME token across checks (and a
+   write to it moves the mark above `pinned`, breaking equality)."
+  [store db pinned d]
+  (let [sid (datom.store/identity-of store)
+        kind (get d :kind)]
+    (cond
+      (= kind :store)    [:store sid]
+      (= kind :attr)     [:attr sid (get d :attr) (datom.attr-basis/basis-t-for store (get d :attr) pinned)]
+      (= kind :empty)    [:empty sid (get d :attr) (datom.attr-basis/basis-t-for store (get d :attr) pinned)]
+      (= kind :basis)    [:basis (datom/basis-t db)]
+      (= kind :acl)      [:acl sid (get d :key) (get d :expiry) (set (get d :attrs))]
+      (= kind :provider) [:provider sid (get d :id)
+                          (set (map (fn [x] (token-of store db pinned x)) (get d :reads)))]
+      ; unsupported / inferred: a whole-world token, deliberately opaque
+      :else              [:whole (erlang/phash2 (pr-str d))])))
+
+(defn- capture-with-pinned
+  "Capture a certificate from `reads` pinned at `pinned`.
+
+   Two independent refusals fold into `:complete? false`:
+     - the plan is UNSOUND (`reads-sound?`), or
+     - a planned attribute's write mark lies ABOVE `pinned` (`:stale?`), i.e.
+       the store holds writes the db snapshot does not — an unsupported
+       HISTORICAL read, or a write that interleaved capture.
+   Either makes the certificate unable to justify reuse, so a historical read
+   can never be republished under current marks."
+  [store db reads pinned]
+  (if (reads-sound? reads)
+    (let [rs (into [] reads)
+          tokens (set (map (fn [d] (token-of store db pinned d)) rs))
+          stale (some? (some (fn [t] (and (mark-token? t)
+                                          (int? (get t 3))
+                                          (> (get t 3) pinned)))
+                             (token-tree tokens)))]
+      {:cert/source (if stale :unsound CAPTURE-SOURCE)
+       :cert/mode :declared
+       :nonce NONCE
+       :reads rs
+       :pinned pinned
+       :complete? (not stale)
+       :stale? stale
+       :tokens tokens})
+    {:cert/source :unsound
+     :cert/mode :declared
+     :nonce NONCE
+     :reads (if (sequential? reads) (into [] reads) reads)
+     :pinned pinned
+     :complete? false
+     :stale? false
+     :tokens #{[:whole :unsound]}}))
+
+(defn capture
+  "A DECLARATION-ONLY certificate from the EXPLICIT read plan `reads`, pinned
+   at the db's current basis. It reads NO rows: it records the plan's tokens.
+   It is not evidence that any view actually performed these reads. Only
+   `project` produces a real-read certificate by construction — there is no
+   automatic inference of an arbitrary function's reads."
+  [store db reads]
+  (capture-with-pinned store db reads (datom/basis-t db)))
+
+(defn recheck
+  "Re-read the SAME plan against the current world, using the certificate's
+   own PINNED basis (not the db's). Two rechecks of one certificate then
+   differ only when a real dependency moved — which is the reuse test. Any
+   planned mark above the pinned basis makes the recheck stale/unsound."
+  [store db cert]
+  (capture-with-pinned store db (:reads cert) (:pinned cert)))
+
+(defn- cert-integrity?
+  "Canonical STRUCTURAL integrity against the certificate's own captured plan:
+   the plan is a non-empty, sound sequence; the token collection holds exactly
+   one token per top-level descriptor; and each token's kind matches its
+   descriptor's kind. This rejects naive hand-built or mutated maps and any
+   malformed token set. It is a consistency check, NOT authenticity — it does
+   not prove the tokens were read from a store, nor defend a caller who already
+   holds a nonce."
+  [cert]
+  (let [reads (:reads cert)
+        toks (:tokens cert)]
+    (and (map? cert)
+         (vector? reads)
+         (not (empty? reads))
+         (reads-sound? reads)
+         (coll? toks)
+         (let [tv (into [] toks)]
+           (and (= (count tv) (count reads))
+                (= (frequencies (map token-kind-of tv))
+                   (frequencies (map read-kind-of reads))))))))
+
+(defn usable?
+  "Could this certificate justify reuse, before comparing it to a fresh
+   reading? Requires: the capture provenance tag and nonce, a complete claim,
+   canonical structural integrity, no :whole token (top-level OR nested in a
+   provider) and no expired ACL (top-level OR nested). A malformed certificate
+   answers false and never throws."
+  [cert now]
+  (and (map? cert)
+       (= CAPTURE-SOURCE (:cert/source cert))
+       (= NONCE (:nonce cert))
+       (= true (:complete? cert))
+       (cert-integrity? cert)
+       (not (some whole-token? (token-tree (:tokens cert))))
+       (not (some (fn [t] (acl-expired? t now)) (token-tree (:tokens cert))))))
+
+(defn reusable?
+  "May `new` (a `recheck` of `old`) reuse `old`'s answer? Both must be usable
+   and their token sets must be EQUAL. Unknown/incomplete/expired/cross-store
+   all fail here."
+  [old new now]
+  (and (usable? old now) (usable? new now) (= (:tokens old) (:tokens new))))
+
+(defn changed-facets
+  "The dependency FACETS that differ between `old` and a `recheck` `new`, as a
+   set drawn from `#{:store :attr :empty :basis :acl :provider}`; an expired
+   ACL also yields `:acl`. This is the executable mirror of the boolean tuple
+   the logic proofs quantify over."
+  [old new now]
+  (let [os (:tokens old)
+        nset (:tokens new)
+        by-kind (fn [s k] (set (filter (fn [t] (= k (get t 0))) (into [] s))))
+        diff (filter (fn [k] (not= (by-kind os k) (by-kind nset k)))
+                     [:store :attr :empty :basis :acl :provider])
+        expired (some (fn [t] (acl-expired? t now)) (token-tree nset))]
+    (set (concat diff (if expired [:acl] [])))))
+
+(defn recompute?
+  "The CANDIDATE's decision: recompute iff the certificate is not reusable.
+   Never reuses on unknown."
+  [old new now]
+  (not (reusable? old new now)))
+
+(defn naive-recompute?
+  "The NAIVE attrs-only design: recompute only when an ATTRIBUTE token moved.
+   Ignores store identity, negative reads, ACL expiry, provider footprints and
+   basis observations — the facets the logic proofs show it drops."
+  [old new now]
+  (contains? (changed-facets old new now) :attr))
+
+(defn naive-reads
+  "The NAIVE read plan: the positive attribute reads only. Drops the negative
+   (`:empty`) reads, which is exactly what a rows-inferred dependency set
+   does. Kept so the test can show it reuses a stale answer."
+  [reads]
+  (into [] (remove (fn [d] (= :empty (get d :kind))) reads)))
+
+; ═════════════════════════════════════════════════════════════════════════
+; 3. PROJECTION CACHE — reuse is opt-in to a complete certificate
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn gather-columns
+  "A concrete MULTI-COLUMN projection: read each attribute's whole column and
+   fold it to `{eid {attr value}}`. The read count this costs is measurable at
+   the store (see the test's counter oracle)."
+  [db attrs]
+  (reduce (fn [acc a]
+            (reduce (fn [m d]
+                      (assoc-in m [(datom/datom-e d) a] (datom/datom-v d)))
+                    acc
+                    (datom.db/attr-datoms db a)))
+          {}
+          attrs))
+
+(defn- plan-key
+  "Canonical identity of a read plan: the SET of its descriptors, so attribute
+   order does not defeat the comparison while a genuinely different plan does."
+  [reads]
+  (set (into [] (if (sequential? reads) reads []))))
+
+(defn- project-cert
+  "Mark a certificate as produced by a projection that ACTUALLY read its
+   columns (as opposed to a declaration-only `capture`). `project` reuses only
+   a `:projected` certificate."
+  [cert]
+  (assoc cert :cert/mode :projected :cert/real-reads? true))
+
+(defn project
+  "Build or reuse a multi-column projection. `cache` is `{:rows :cert}` or nil;
+   `attrs` the positive columns; `neg-attrs` the columns declared as NEGATIVE
+   reads (asked, expected empty). Returns `{:rows :reused? :cert}`.
+
+   Reuse requires EXACT PLAN IDENTITY: the cached certificate must be
+   `:projected` and its descriptor set must equal the plan built from the
+   requested `attrs`/`neg-attrs`. A cache for a different projection is rebuilt.
+
+   On a reuse, NO column is read — the caller pays only the certificate check.
+   On a rebuild, the plan is re-pinned at the current basis."
+  [cache store db attrs neg-attrs now]
+  (let [reads (into (mapv attr-read attrs) (mapv empty-read neg-attrs))
+        cached (when (map? cache) (:cert cache))
+        same-plan? (and (map? cached)
+                        (= :projected (:cert/mode cached))
+                        (= (plan-key (:reads cached)) (plan-key reads)))]
+    (if (nil? cache)
+      {:rows (into [] (vals (gather-columns db attrs)))
+       :reused? false
+       :cert (project-cert (capture-with-pinned store db reads (datom/basis-t db)))}
+      (let [checked (when same-plan? (recheck store db cached))]
+        (if (and same-plan? (reusable? cached checked now))
+          {:rows (:rows cache) :reused? true :cert (project-cert checked)}
+          {:rows (into [] (vals (gather-columns db attrs)))
+           :reused? false
+           :cert (project-cert (capture-with-pinned store db reads (datom/basis-t db)))})))))
+
+; ═════════════════════════════════════════════════════════════════════════
+; 4. LIVE RELEVANCE — a queued batch, not just the last commit
+; ═════════════════════════════════════════════════════════════════════════
+
+(defn commit
+  "A commit as the live socket would hand it over: the STORE it landed on (the
+   identity is taken HERE, so it can never disagree with a token's store), the
+   attributes it touched, its tx. `attrs` nil means UNKNOWN (an unreadable
+   payload) and is treated as always relevant."
+  [store attrs tx]
+  {:sid (datom.store/identity-of store)
+   :attrs (if (nil? attrs) nil (set attrs))
+   :tx tx})
+
+(defn unknown-commit
+  "A commit whose touched attributes could not be read. Unknown ⇒ relevant."
+  [store tx]
+  {:sid (datom.store/identity-of store) :attrs nil :unknown? true :tx tx})
+
+(defn- token-relevant?
+  "Could `commit` move this token? An attr/empty token is relevant when the
+   commit landed on the SAME store and touched the attribute; a basis or whole
+   token is always relevant; an ACL token is relevant when a commit on its
+   store touched one of its source attributes; a provider token descends into
+   its nested plan. A :store token names an IDENTITY, not a version, so it can
+   never MOVE — but a same-store commit is nevertheless treated as relevant
+   (a deliberate conservative choice: the plan declared a store read), while a
+   commit on another store is definitely irrelevant. Anything else fails closed."
+  [tok c]
+  (let [kind (if (vector? tok) (get tok 0) :unknown)]
+    (cond
+      (= kind :basis) true
+      (= kind :whole) true
+      (= kind :store) (= (get tok 1) (:sid c))
+      (or (= kind :attr) (= kind :empty))
+        (and (= (get tok 1) (:sid c)) (contains? (:attrs c) (get tok 2)))
+      (= kind :acl)
+        (and (= (get tok 1) (:sid c))
+             (coll? (get tok 4))
+             (some (fn [a] (if (contains? (:attrs c) a) true nil))
+                   (into [] (get tok 4))))
+      (= kind :provider)
+        (and (coll? (get tok 3))
+             (some (fn [t] (if (token-relevant? t c) true nil))
+                   (into [] (get tok 3))))
+      :else true)))
+
+(defn commit-relevant?
+  "Is one commit relevant to `cert`? Unknown commit, unknown attrs, a
+   malformed/incomplete/unknown certificate, a stale certificate, a :whole
+   token, or any token it can move ⇒ true. A commit on a store the certificate
+   does not read moves nothing ⇒ false."
+  [cert c]
+  (or (not (map? cert))
+      (not (= CAPTURE-SOURCE (:cert/source cert)))
+      (not (= true (:complete? cert)))
+      (not (cert-integrity? cert))
+      (= true (:stale? cert))
+      (some whole-token? (token-tree (:tokens cert)))
+      (= true (:unknown? c))
+      (nil? (:attrs c))
+      (nil? (:sid c))
+      (some? (some (fn [t] (if (token-relevant? t c) true nil)) (token-tree (:tokens cert))))))
+
+(defn relevant-commits
+  "The commits in `commits` that are relevant to `cert` — for diagnostics."
+  [cert commits]
+  (into [] (filter (fn [c] (commit-relevant? cert c)) commits)))
+
+(defn batch-required?
+  "The CANDIDATE: render iff the certificate is unusable, the batch is empty,
+   or ANY queued commit is relevant. Checking the whole batch is what keeps a
+   relevant commit followed by an irrelevant one from being stranded."
+  [cert commits now]
+  (or (not (usable? cert now))
+      (empty? commits)
+      (some? (some (fn [c] (if (commit-relevant? cert c) true nil)) commits))))
+
+(defn naive-last-required?
+  "The NAIVE relevance design: consult only the LAST queued commit. Correct
+   ONLY while every commit renders unconditionally; once relevance may skip,
+   `[relevant irrelevant]` correctly answers false here and strands the
+   relevant commit."
+  [cert commits now]
+  (or (not (usable? cert now))
+      (empty? commits)
+      (commit-relevant? cert (last commits))))
