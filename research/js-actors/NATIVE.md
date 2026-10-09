@@ -198,6 +198,34 @@ namespace builds still require their real `ns` declaration.
 
 `staging-test.bl` compiles an initializer that would throw if accidentally run,
 checks definition order and isolation, and builds a transitive macro-helper /
-forward-reference fixture. `staging.test.mjs` executes its actor output. This
-staging consolidation still does not add actor value definitions or migrate
-the ordinary emitter, evaluator, or collection prelude. Those are later gates.
+forward-reference fixture. `staging.test.mjs` executes its actor output. The ordinary emitter, evaluator and collection prelude remain later migration
+gates; shared staging alone does not replace them.
+
+Common definitions and actor initialization
+-------------------------------------------
+
+`js.build/definition-values` and `compile-prepared` now own definition extraction
+and ANF compilation for both consumers. Actor server/supervisor declarations
+expand into ordinary definition forms before that pass; the actor compiler no
+longer maintains a separate defn-only compilation path. `def`, comments,
+declarations and top-level expressions therefore follow the common rules.
+
+The actor initializer binds function exports and their runtime aliases first,
+then runs value/effect initializers in source order through the same frame
+machine. This supports forward function calls from initializers. Initialization
+yields to host tasks at the machine budget rather than allowing a hundred
+million uninterrupted frame transitions. Receiving during module initialization
+still has no actor owner/resumer and is refused; the namespace-actor lifecycle
+migration must resolve that before general actor module startup is complete.
+
+Global and alias lookup distinguish a bound native `undefined` from an absent
+key. Pruning conservatively retains modules with value/effect initializers; it
+never drops an initializer just because no export references its result.
+Effect-aware initializer reachability is a later optimization.
+
+Cold validation covers native link/refusal fixtures, staged macros, source-ordered
+initializers, forward calls, native undefined, server/supervisor lowering, 55
+focused JS checks, 461 actor checks at each of three budgets, hardening, and
+eight ordinary BEAM/JS differential groups. These changes consolidate source
+preparation and definition compilation; qualified namespace linking and common
+core/control/evaluator migration remain required before profile unification.

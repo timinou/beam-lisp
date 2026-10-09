@@ -1622,40 +1622,25 @@
          (with-pos (BeamLisp.Ns.Reader/read_one (pr-str f)) (n-pos form)))
        (lower-defsupervisor form)))
 
-(defn compile-defn-form
-  "One `defn` reader form as a compiled definition. Every form this backend
-   accepts reaches ANF the same way: through `defn->fn-form`, so a top-level
-   definition needs no Env/Link machinery."
-  [form ns]
-  {:name (defn-name form)
-   :node (BeamLisp.Ns.Compiler/compile (defn->fn-form form)
-                                       (assoc (BeamLisp.Ns.Compiler/new_env ns) :target :js))})
+(defn runtime-forms
+  "Expand actor declarations into ordinary definition forms. All other source
+   forms use the common namespace definition compiler, including value defs."
+  [forms ns path]
+  (vec (mapcat (fn [form]
+                (cond
+                  (defserver-form? form) (lower-defserver-forms form ns)
+                  (defsupervisor-form? form) (lower-defsupervisor-forms form ns)
+                  :else [form])) forms)))
 
 (defn compile-top-form
-  "Compile ONE top-level reader form into the definitions it contributes.
-
-   A `defn` is one definition; a `proc/defserver` DECLARATION is two — its
-   entry defn and its server loop — because the clause surface a bundle writes
-   is `proc.server`'s and the target only renders it. Anything else is refused:
-   this backend has no value-defs, no namespace side effects and no top-level
-   expressions, which is the honest scope of the prototype."
+  "Compatibility entrypoint for declaration fixtures, using common lowering."
   [form ns path]
-  (cond
-    (defn-form? form) [(compile-defn-form form ns)]
-    ; a shared library file names its BEAM namespace; this target has one
-    ; namespace per bundle, so the head contributes nothing here
-    (ns-form? form) []
-    (jsbuild/defmacro? form) []
-    (defserver-form? form) (vec (map (fn [f] (compile-defn-form f ns))
-                                     (lower-defserver-forms form ns)))
-    (defsupervisor-form? form) (vec (map (fn [f] (compile-defn-form f ns))
-                                         (lower-defsupervisor-forms form ns)))
-    :else
-      (throw (ex-info (str "js-actors: " path ": every top-level form must be a"
-                           " defn, a proc/defserver or a proc.super/defsupervisor"
-                           " declaration; got a "
-                           (str (n-tag form)) " form")
-                      {:path path :tag (n-tag form)}))))
+  (:defs (jsbuild/compile-prepared
+    {:path path :ns ns :env (assoc (BeamLisp.Ns.Compiler/new_env ns) :target :js)
+     :defs (jsbuild/definition-values (runtime-forms [form] ns path))}
+    {:check-node identity})))
+
+(defn compile-defn-form [form ns] (first (compile-top-form form ns "<definition>")))
 
 (defn native-import-call?
   "The native logic module asks the target which statically linked calls use
@@ -1674,7 +1659,7 @@
   (BeamLisp.Env/isolated (fn []
   (let [_ (println (str "js-actors: compiling " path))
         prepared (jsbuild/prepare-ns path
-                   {:fallback-ns ns
+                   {:fallback-ns ns :expand-top runtime-forms
                     :after-ns (fn [_]
                       ; A provider's ns declaration may populate this fork.
                       ; Mask afterward, never changing the parent bindings.
@@ -1687,12 +1672,12 @@
                       ; but their BEAM links are not JavaScript runtime links.
                       (doseq [definition (:defs staged) :when (:name definition)]
                         (BeamLisp.Env/put_link (:ns staged) (:name definition) (tuple :erlang {} nil))))})
-        texts (:texts prepared) source-ns (:ns prepared) env (:env prepared)
+        source-ns (:ns prepared) env (:env prepared)
         normalize (fn [node]
                     (ir/rewrite (fn [n]
                                   (if (and (= :global (:op n)) (= source-ns (:ns n)))
                                     (assoc n :ns ns) n)) node))
-        defs (reduce (fn [acc [form text]] (into acc (compile-top-form form source-ns path))) [] texts)]
+        defs (:defs (jsbuild/compile-prepared prepared {:check-node identity}))]
     (vec (map (fn [d]
                 (let [node (:node d) refs (refs-of [node])]
                   (when (and (not (:js-interop env))
@@ -1746,28 +1731,6 @@
           node))
     :else node))
 
-(defn emit-init
-  "The bundle's `__init` generator: one `H.def` per compiled definition. It is
-   a generator rather than straight-line code because a single-arity `fn`
-   compiles to the compiler's self-application scaffold, whose value needs the
-   machine to be applied."
-  [defs]
-  (let [proofs (:proofs (suspension/analyze
-                         (into {} (map (fn [d] [(:name d) (:node d)]) defs))
-                         suspension-resolver))
-        lines (mapcat
-                (fn [d]
-                  (let [r (emit (stamp-def-name (:node d) (str (:name d))) {:tail false :sync-proofs proofs})
-                        t (fresh-tmp)]
-                    (concat (:lines r)
-                            (list (str "const " t " = " (:val r) ";"))
-                            (list (str "H.def(rt, " (js-str (str "js/" (:name d))) ", " t ");")))))
-                defs)]
-    (str "H.def(rt, \"js/__init\", H.blFn(\"__init\", new Map([[0, function*(rt, args) {\n"
-         (apply str lines)
-         "return null;\n"
-         "}]]), null));")))
-
 (defn alias-lines [defined]
   (concat
     (map (fn [k] (str "H.defAlias(rt, " (js-str k) ", "
@@ -1776,6 +1739,29 @@
     (map (fn [k] (str "H.defAlias(rt, " (js-str (str "core/" k)) ", "
                       (js-str (str "js/" (get core-map k))) ");"))
          (filter (fn [k] (contains? defined (get core-map k))) (keys core-map)))))
+
+(defn emit-init
+  "Initialize function exports first, then source-ordered values/effects in the
+   same actor frame machine. Bind common-core aliases before initializer calls."
+  [defs]
+  (let [proofs (:proofs (suspension/analyze
+                         (into {} (map (fn [d] [(:name d) (:node d)]) defs))
+                         suspension-resolver))
+        emit-definition (fn [d]
+                          (let [r (emit (stamp-def-name (:node d) (str (:name d))) {:tail false :sync-proofs proofs})
+                                t (fresh-tmp)]
+                            (concat (:lines r)
+                                    (list (str "const " t " = " (:val r) ";"))
+                                    (list (if (:name d)
+                                            (str "H.def(rt, " (js-str (str "js/" (:name d))) ", " t ");")
+                                            (str "void " t ";"))))))
+        lines (concat (mapcat emit-definition (filter (fn [d] (= :fn (:kind d))) defs))
+                      (alias-lines (into {} (map (fn [d] [(:name d) true]) defs)))
+                      (mapcat emit-definition (filter (fn [d] (not= :fn (:kind d))) defs)))]
+    (str "H.def(rt, \"js/__init\", H.blFn(\"__init\", new Map([[0, function*(rt, args) {\n"
+         (apply str lines)
+         "return null;\n"
+         "}]]), null));")))
 
 (defn compile-one [src]
   (BeamLisp.Ns.Compiler/compile (BeamLisp.Ns.Reader/read_one src)
@@ -1878,7 +1864,6 @@
                 "const rt = H.newRuntime();\n\n"
                 (emit-init defs) "\n"
                 "await H.init(rt);\n\n"
-                (apply str (map (fn [l] (str l "\n")) (alias-lines defined)))
                 "\nH.def(rt, \"js/entry\", H.ref(rt, \"js\", \"main\"));\n"
                 "await H.boot(rt);\n")
         sites (num-sites)
@@ -1901,6 +1886,8 @@
    support. A reachable host/ref can name arbitrary globals, so its opaque edge
    retains the entire bundle. No effect inference or suspension rewrite."
   [defs roots]
+  (if (some (fn [d] (contains? #{:val :expr} (:kind d))) defs)
+    defs
   (let [table (into {} (map (fn [d] [(:name d) d]) defs))
         edge (fn [r]
                (if (= :remote (first r))
@@ -1925,7 +1912,7 @@
                 (contains? seen name) (recur (vec (rest todo)) seen)
                 :else (do (when-not (contains? table name)
                   (throw (ex-info "js-actors: missing pruning root/dependency" {:name name})))
-                (recur (into (vec (rest todo)) (get edges name #{})) (conj seen name)))))))))
+                (recur (into (vec (rest todo)) (get edges name #{})) (conj seen name))))))))))
 
 (defn native-manifest-links
   "Read compiler-produced module contracts. Relative paths are rooted at the

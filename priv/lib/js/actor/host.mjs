@@ -976,7 +976,7 @@ function splitNs(k) { return k.slice(0, k.lastIndexOf("/")); }
 function splitName(k) { return k.slice(k.lastIndexOf("/") + 1); }
 export function defAlias(rt, key, targetKey) {
   const v = rt.globals.get(targetKey);
-  if (v === undefined) throw new Error("alias target not defined: " + targetKey);
+  if (!rt.globals.has(targetKey)) throw new Error("alias target not defined: " + targetKey);
   rt.globals.set(key, v);
   return v;
 }
@@ -984,11 +984,11 @@ export function defAlias(rt, key, targetKey) {
 /** Resolve a global, with the same fallback beam-lisp's `Env.fetch!` has:
  *  a name bound in the current namespace, else the same name in `core`. */
 export function ref(rt, ns, name) {
-  const direct = rt.globals.get(ns + "/" + name);
-  if (direct !== undefined) return direct;
+  const key = ns + "/" + name;
+  if (rt.globals.has(key)) return rt.globals.get(key);
   if (ns !== "core") {
-    const c = rt.globals.get("core/" + name);
-    if (c !== undefined) return c;
+    const fallback = "core/" + name;
+    if (rt.globals.has(fallback)) return rt.globals.get(fallback);
   }
   throw new Error("unresolved global " + ns + "/" + name);
 }
@@ -1308,9 +1308,11 @@ export async function init(rt) {
   const initFn = rt.globals.get("js/__init");
   if (initFn === undefined) return;
   const frames = [resolveCallee(initFn, [])(rt, [])];
-  const r = runTurn(rt, frames, 100000000);
-  const st = resultStatus(r);
-  if (st !== "done") {
+  for (;;) {
+    const r = runTurn(rt, frames, rt.budget);
+    const st = resultStatus(r);
+    if (st === "done") return resultValue(r);
+    if (st === "yield") { await yieldToHostTasks(); continue; }
     rt.out("js-actors: bundle init failed (" + st + ")"
            + (st === "error" ? ": " + resultMessage(r) : ""));
     if (globalThis.process) globalThis.process.exitCode = 1;
