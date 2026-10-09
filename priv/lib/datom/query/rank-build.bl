@@ -8,6 +8,12 @@
            [data.bounded-cache :as cache] [data.ranked-tree :as tree]))
 (def REGISTRY [:datom.query.rank/registry])
 (def MAX-INDEXES 4)
+(def RETIRED [:datom.query.rank/retired])
+(def COOLDOWN-MS 300000)
+(defn cooling? [s id]
+ (some (fn [record] (and (= id (:ident record))
+                         (< (erlang/system_time :millisecond) (:until record))))
+       (or (derived/get-record s RETIRED) [])))
 (def BATCH-ROWS 16)
 (def TURN-TARGET-US 20000)
 (defn turn-rows [sample]
@@ -74,7 +80,7 @@
 (defn scope-value [plan]
  (let [value (:scope plan)]
   (when (and (tuple? value) (contains? #{:atom :integer :binary :float} (elem value 0))) (elem value 1))))
-(declare abort-op)
+(declare abort-op cleanup-ops)
 (defn start-ops [database plan]
  (let [s (db/store-of database) ids (registry s) id (ident plan) old (when id (rank/header s id))
        stamp (code-stamp)]
@@ -83,7 +89,7 @@
              (nil? (:valid-at database)) (nil? (:valid-between database))
              (= (:schema plan) (select-keys (db/schema-of database) (:required plan)))
              (store/ordered-page-capable? s)
-             (not (contains? (set ids) id)) (nil? old))
+             (not (contains? (set ids) id)) (nil? old) (not (cooling? s id)))
    (if (>= (count ids) MAX-INDEXES)
     (let [victim (first ids) h (rank/header s victim)]
      {:ident victim :ops (when h (abort-op h :rank-capacity-evicted))})
@@ -108,13 +114,20 @@
   insertions and scope transfers. Bulk/excision callers pass trusted? false.
   Any gap, schema/code drift or bounded-work refusal invalidates permanently."
  [database datoms tx trusted?]
- (let [s (db/store-of database) sch (db/schema-of database) ids (registry s)]
+ (let [s (db/store-of database) sch (db/schema-of database) ids (registry s)
+       cleanup-id (first (filter (fn [id] (= :aborted (:status (rank/header s id)))) ids))]
   (vec (mapcat
    (fn [id]
     (let [h (rank/header s id) required (set (:required (:definition h)))
           affected (filterv (fn [d] (contains? required (index/-a d))) datoms)
-          eids (set (mapv index/-e affected))]
-     (when (and (seq affected) (contains? #{:building :complete} (:status h)))
+          eids (set (mapv index/-e affected))
+          _ (when (and (seq affected) (= :complete (:status h))
+                       (vector? (Process/get :datom_rank_maintenance)))
+              (Process/put :datom_rank_maintenance
+                (conj (Process/get :datom_rank_maintenance) [id (:generation h)])))]
+     (if (= :aborted (:status h))
+      (when (= id cleanup-id) (cleanup-ops database id))
+      (when (and (seq affected) (contains? #{:building :complete} (:status h)))
       (cond
        (or (not trusted?) (not (unchanged? s sch h (db/basis-t database))))
          (abort-op h :rank-maintenance-gap)
@@ -136,7 +149,7 @@
                   {:header (:header next) :ops (into (:ops state) (:ops next))}))
                 {:header h :ops []} eids)]
           (rank/publication-ops ctx (assoc (:header changed) :through tx) (:ops changed)))
-         (catch e (abort-op h (or (:refused (ex-data e)) :rank-maintenance-refused))))))))
+         (catch e (abort-op h (or (:refused (ex-data e)) :rank-maintenance-refused)))))))))
    (or ids [])))))
 (defn- complete-groups [raw end?]
  (loop [rows raw current [] groups []]
@@ -211,3 +224,19 @@
       (if last? (into (derived/put-ops REGISTRY (filterv (fn [other] (not= other id)) (registry s)))
                       [[:delete (rank/header-key id)]])
        [[:put (rank/header-key id) (assoc h :cleanup (:todo work))]]))))))
+
+(defn retire-ops
+ "Policy may request retirement; only the writer's exact live generation can
+  revoke read authority. Header invalidation and bounded durable cooldown share
+  one commit. No telemetry is trusted as source/query correctness evidence."
+ [database id generation]
+ (let [s (db/store-of database) h (rank/header s id)]
+  (when (and (= :complete (:status h)) (= generation (:generation h)))
+   (let [now (erlang/system_time :millisecond)
+         recent (filterv (fn [record] (and (not= id (:ident record))
+                                          (< now (:until record))))
+                         (or (derived/get-record s RETIRED) []))
+         bounded (vec (take MAX-INDEXES recent))]
+    (into (abort-op h :rank-unprofitable)
+      (derived/put-ops RETIRED
+        (conj bounded {:ident id :until (+ now COOLDOWN-MS)})))))))
