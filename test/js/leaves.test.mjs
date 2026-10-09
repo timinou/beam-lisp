@@ -183,3 +183,27 @@ test("output propagates sink errors without substituting another printer", () =>
   try { assert.throws(() => IO["io/format/2"]("~ts~n", R.list("x")), e => e === error); }
   finally { bindOutput(null); }
 });
+
+
+test("String segmentation fast paths preserve CRLF and Unicode grapheme slicing", async () => {
+  const {STRING} = await import("../../priv/lib/js/host-leaves.mjs");
+  const slice = STRING["Elixir.String/slice/3"], length = STRING["Elixir.String/length/1"];
+  for (const text of ["ASCII", "a\r\nb", "e\u0301👍🏽z", "🇫🇷👨‍👩‍👧‍👦x"]) {
+    const gs = Array.from(new Intl.Segmenter(undefined, {granularity:"grapheme"}).segment(text), x => x.segment);
+    assert.equal(length(text), gs.length);
+    for (let start=-gs.length;start<=gs.length;start++) for(let n=0;n<=gs.length;n++) {
+      assert.equal(slice(text,start,n),gs.slice(start,start+n).join(""));
+      assert.equal(slice(text,start,n),gs.slice(start,start+n).join(""));
+    }
+  }
+  for(let i=0;i<300;i++) length("e\u0301"+i);
+  assert.equal(slice("e\u0301👍🏽z",0,2),"e\u0301👍🏽");
+});
+
+test("reversing Unicode cannot mutate cached segmentation", async () => {
+  const {STRING,REGEX} = await import("../../priv/lib/js/host-leaves.mjs");
+  const s="a💧é";
+  assert.equal(REGEX["Elixir.String/reverse/1"](s),"é💧a");
+  assert.equal(REGEX["Elixir.String/reverse/1"](s),"é💧a");
+  assert.equal(STRING["Elixir.String/slice/3"](s,0,2),"a💧");
+});

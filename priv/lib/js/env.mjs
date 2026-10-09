@@ -39,6 +39,15 @@ const keyPart = (x) => (x instanceof Kw ? ":" + x.fq : typeof x === "string" ? "
 
 export function putKey(k, v) { ROWS.set(key(k), v); EPOCH++; return OK; }
 export function deleteKey(k) { ROWS.delete(key(k)); EPOCH++; return OK; }
+/** Drop every var/link/alias/meta row owned by one ephemeral namespace. */
+export function dropNamespace(ns) {
+  const own = "s" + ns;
+  for (const k of ROWS.keys()) {
+    const parts = k.split("\u0001");
+    if (parts[0] === own || (parts[0].startsWith(":") && parts[1] === own)) ROWS.delete(k);
+  }
+  EPOCH++;
+}
 export function lookup(k) { const kk = key(k); return ROWS.has(kk) ? T(OK, ROWS.get(kk)) : ERROR; }
 const get = (k) => ROWS.get(key(k));
 const has = (k) => ROWS.has(key(k));

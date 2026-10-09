@@ -20,12 +20,13 @@
 
 import * as R from "./rt.mjs";
 import * as L from "./leaves.mjs";
+import { H } from "./host.mjs";
 import { installNamespace, requireNamespace } from "./interop.mjs";
 
 const TEXT = R.kw("text"), ERR = R.kw("err");
 
 export async function start(readFile) {
-  globalThis.BL_HOST = Object.assign(globalThis.BL_HOST || {}, { run: L.run });
+  globalThis.BL_HOST = Object.assign(H, globalThis.BL_HOST || {}, { run: L.run });
   const B = await import("./boot.mjs");
   const vm = await B.boot(readFile);
   const evalWith = (src, ns, bindings) => {
