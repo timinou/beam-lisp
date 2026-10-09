@@ -229,3 +229,19 @@ focused JS checks, 461 actor checks at each of three budgets, hardening, and
 eight ordinary BEAM/JS differential groups. These changes consolidate source
 preparation and definition compilation; qualified namespace linking and common
 core/control/evaluator migration remain required before profile unification.
+
+Canonical-core pressure test
+----------------------------
+
+`common-core-audit.bl` compiles the actual `priv/boot/rt.bl` and `core.bl`
+through actor source preparation and inventories checked IR operations, remote
+contracts and nonlocal globals. It writes `out/common-core-audit.json`. The
+current inventory contains 458 rt functions and 152 core functions plus three
+values and one expression. Every remote call has a provider classification in the
+existing actor allowlist, canonical primitive table or compiled rt/core providers.
+The actor allowlist classification checks names; it does not add an arity proof.
+
+This is a migration audit, not an execution benchmark or parity claim. The
+qualified linker must prefer compiled namespace definitions before primitives;
+packed-rest call conventions, lazy thunk forcing/ownership and higher-order
+callback contracts must pass before replacing the actor collection prelude.
