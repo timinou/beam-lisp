@@ -1,0 +1,188 @@
+(ns async.code-ownership-test
+ (:require [anf :as a] [lower :as lower] [proc.callback :as callback]))
+
+(defn descriptor [module value]
+ (a/module module
+  (list {:op :defn-clause :fname :run :params (list) :guard nil
+         :body (a/lit value) :ann {}}
+        {:op :defn-clause :fname :factory :params (list) :guard nil
+         :body (a/fnn (list (a/clause (list) nil (a/lit value)))) :ann {}})
+  (list [:run 0] [:factory 0]) (list)))
+(defn wait-dead [pid]
+ (let [ref (erlang/monitor :process pid)]
+  (receive [:DOWN r :process _ _] :when (= r ref) true
+   (after 10000 (do (erlang/demonitor ref (list :flush)) false)))))
+
+(deftest retained-local-closure-survives-reload-and-unregister-is-final
+ (let [mod :bl_registered_local_callback]
+  (lower/reload-descriptor! (descriptor mod 1))
+  (let [f (erlang/apply mod :factory (list)) registration (callback/register! f)]
+   (try
+    (is (= (list mod) (BeamLisp.Env/callback_modules f)))
+    (lower/reload-descriptor! (descriptor mod 2))
+    (is (= 1 (callback/invoke! registration [])) "old local closure keeps its generation")
+    (is (= 2 (erlang/apply mod :run (list))))
+    (is (try (lower/reload-descriptor! (descriptor mod 3)) false (catch _ true)))
+    (is (not (BeamLisp.Env/retire_module! mod)))
+    (callback/unregister! registration)
+    (is (= :cancelled (callback/invoke! registration [])))
+    (callback/unregister! registration)
+    (lower/reload-descriptor! (descriptor mod 3))
+    (is (= 3 (erlang/apply mod :run (list))))
+    (finally (callback/unregister! registration) (BeamLisp.Env/retire_module! mod))))))
+
+(deftest transfer-invalidates-stale-handle-without-releasing-new-owner
+ (let [mod :bl_transferred_callback parent (erlang/self)]
+  (lower/reload-descriptor! (descriptor mod 8))
+  (let [registration (callback/register! (erlang/make_fun mod :run 0))
+        worker (erlang/spawn
+                 (fn [] (receive [:registration accepted]
+                           (do (erlang/send parent [:accepted (callback/invoke! accepted [])])
+                               (receive :release (callback/unregister! accepted))))))
+        accepted (callback/transfer! registration worker)]
+   (try
+    (callback/unregister! registration)
+    (is (= :cancelled (callback/invoke! registration [])))
+    (is (not (BeamLisp.Env/retire_module! mod)))
+    (erlang/send worker [:registration accepted])
+    (is (= 8 (receive [:accepted value] value (after 10000 :timeout))))
+    (erlang/send worker :release)
+    (is (wait-dead worker))
+    (is (BeamLisp.Env/retire_module! mod))
+    (finally (when (Process/alive? worker) (erlang/exit worker :kill))
+             (callback/unregister! accepted) (BeamLisp.Env/retire_module! mod))))))
+
+(deftest accepted-invocations-drain-after-unregister
+ (let [mod :bl_draining_callback parent (erlang/self)]
+  (lower/reload-descriptor! (descriptor mod 42))
+  (let [registration (callback/register!
+                      (fn [] (erlang/send parent :entered)
+                        (receive :finish (erlang/apply mod :run (list)))) (list mod))
+        worker (erlang/spawn (fn [] (erlang/send parent [:result (callback/invoke! registration [])])))]
+   (try
+    (is (= :entered (receive :entered :entered (after 10000 :timeout))))
+    (callback/unregister! registration)
+    (is (not (BeamLisp.Env/retire_module! mod)))
+    (is (= :cancelled (callback/invoke! registration [])))
+    (erlang/send worker :finish)
+    (is (= 42 (receive [:result value] value (after 10000 :timeout))))
+    (is (wait-dead worker))
+    (is (BeamLisp.Env/retire_module! mod))
+    (finally (when (Process/alive? worker) (erlang/exit worker :kill))
+             (callback/unregister! registration) (BeamLisp.Env/retire_module! mod))))))
+
+(deftest dead-queued-owner-declines-and-reclaims-registration
+ (let [mod :bl_dead_registered_callback parent (erlang/self)]
+  (lower/reload-descriptor! (descriptor mod 9))
+  (let [owner (erlang/spawn
+                (fn [] (erlang/send parent [:registration
+                         (callback/register! (erlang/make_fun mod :run 0))])
+                       (receive :never nil)))
+        registration (receive [:registration r] r (after 10000 nil))]
+   (try
+    (is (some? registration))
+    (erlang/exit owner :kill)
+    (is (wait-dead owner))
+    (is (= :cancelled (callback/invoke! registration [])))
+    (is (= :cancelled (callback/transfer! registration (erlang/self))))
+    (is (BeamLisp.Env/retire_module! mod))
+    (finally (when (Process/alive? owner) (erlang/exit owner :kill))
+             (when registration (callback/unregister! registration))
+             (BeamLisp.Env/retire_module! mod))))))
+
+(deftest plain-spawn-transfers-extra-code-and-survives-submitter-death
+ (let [mod :bl_async_owned_callback parent (erlang/self)]
+  (lower/reload-descriptor! (descriptor mod 17))
+  (let [submitter (erlang/spawn
+                    (fn [] (let [worker (BeamLisp.Refs/spawn_owned
+                                          (fn [] (erlang/send parent [:running (erlang/self)])
+                                            (receive :finish
+                                              (erlang/send parent [:value (erlang/apply mod :run (list))])))
+                                          :plain (list mod))]
+                             (erlang/send parent [:worker worker])
+                             (receive :never nil))))
+        worker (receive [:worker p] p (after 10000 nil))]
+   (try
+    (is (erlang/is_pid worker))
+    (is (= worker (receive [:running p] p (after 10000 nil))))
+    (erlang/exit submitter :kill)
+    (is (wait-dead submitter))
+    (is (not (BeamLisp.Env/retire_module! mod)))
+    (erlang/send worker :finish)
+    (is (= 17 (receive [:value v] v (after 10000 :timeout))))
+    (is (wait-dead worker))
+    (is (BeamLisp.Env/retire_module! mod))
+    (finally (when (Process/alive? submitter) (erlang/exit submitter :kill))
+             (when (and worker (Process/alive? worker)) (erlang/exit worker :kill))
+             (BeamLisp.Env/retire_module! mod))))))
+
+(deftest exceptions-release-execution-lease-and-registry-has-no-normal-leak
+ (let [mod :bl_exception_registered_callback before (ets/info :beam_lisp_code_leases :size)]
+  (lower/reload-descriptor! (descriptor mod 1))
+  (let [registration (callback/register! (fn [] (throw (ex-info "callback failed" {}))) (list mod))]
+   (try
+    (is (try (callback/invoke! registration []) false (catch _ true)))
+    (callback/unregister! registration)
+    (is (= before (ets/info :beam_lisp_code_leases :size)))
+    (is (BeamLisp.Env/retire_module! mod))
+    (finally (callback/unregister! registration) (BeamLisp.Env/retire_module! mod))))))
+
+(deftest callable-descriptors-only-inspect-direct-function-arms
+ (let [f (fn [x] x) module (elem (erlang/fun_info f :module) 1)]
+  (is (= (list module) (BeamLisp.Env/callback_modules (tuple :"$blfn" {1 f} nil))))
+  (is (try (BeamLisp.Env/callback_modules (tuple :"$blfn" {1 [:hidden f]} nil)) false (catch _ true)))
+  (is (try (BeamLisp.Env/callback_modules {:hidden f}) false (catch _ true)))))
+
+(deftest lease-capacity-is-exact-and-dead-owners-are-reclaimed
+ (let [mod :bl_capacity_callback parent (erlang/self)]
+  (lower/reload-descriptor! (descriptor mod 1))
+  (let [remaining (- 65536 (ets/info :beam_lisp_code_leases :size))
+        ticket (erlang/make_ref)
+        rows (Enum/map (Enum/to_list (Range/new 1 remaining))
+               (fn [i] (tuple (tuple mod parent (tuple ticket i)) true)))]
+   (try
+    (ets/insert :beam_lisp_code_leases rows)
+    (is (= 65536 (ets/info :beam_lisp_code_leases :size)))
+    (is (try (BeamLisp.Env/retain_code! (list mod)) false (catch _ true)))
+    (is (= 65536 (ets/info :beam_lisp_code_leases :size)) "failed admission inserts nothing")
+    (finally (Enum/each rows #(ets/delete_object :beam_lisp_code_leases %))))
+   (let [dead (erlang/spawn (fn [] nil))]
+    (is (wait-dead dead))
+    (let [stale (Enum/map rows (fn [row]
+                  (tuple (tuple :bl_capacity_dead_rows dead (elem (elem row 0) 2)) true)))]
+     (try
+      (ets/insert :beam_lisp_code_leases stale)
+      (let [handle (BeamLisp.Env/retain_code! (list mod))]
+       (BeamLisp.Env/release_code! handle)
+       (is (BeamLisp.Env/retire_module! mod)))
+      (finally (Enum/each stale #(ets/delete_object :beam_lisp_code_leases %))
+               (BeamLisp.Env/retire_module! mod))))))))
+
+(deftest unpublished-worker-exits-when-submitter-died-before-start
+ (let [parent (erlang/self) dead (erlang/spawn (fn [] nil))]
+  (is (wait-dead dead))
+  (let [token (BeamLisp.Env/capture)
+        worker (erlang/spawn
+                 (fn [] (BeamLisp.Refs/await_owned_start dead token
+                          (fn [] (erlang/send parent :unexpected-execution)))))]
+   (try
+    (is (wait-dead worker))
+    (is (= :not-executed (receive :unexpected-execution :executed (after 0 :not-executed))))
+    (finally (when (Process/alive? worker) (erlang/exit worker :kill)))))))
+
+(deftest future-cancellation-reclaims-transferred-executable-ownership
+ (let [parent (erlang/self)
+       f (fn [] (erlang/send parent :future-running) (receive :never nil))
+       mod (elem (erlang/fun_info f :module) 1)
+       future (BeamLisp.Refs/future_exec f)
+       pid (erlang/map_get :pid (erlang/map_get :task future))]
+  (try
+   (is (= :future-running (receive :future-running :future-running (after 10000 :timeout))))
+   (is (not (empty? (ets/match_object :beam_lisp_code_leases
+                       (tuple (tuple mod pid :_) true)))))
+   (is (BeamLisp.Refs/future_cancel future))
+   (is (wait-dead pid))
+   (BeamLisp.Env/with_code_lease (list mod) (fn [] nil))
+   (is (empty? (ets/match_object :beam_lisp_code_leases
+                  (tuple (tuple mod pid :_) true))))
+   (finally (when (Process/alive? pid) (BeamLisp.Refs/future_cancel future))))))
