@@ -139,8 +139,8 @@ impl Session {
         let mut clean = false;
         if let Some(browser) = self.children.last_mut() {
             while Instant::now() < deadline {
-                if browser.try_wait().map_err(err)?.is_some() {
-                    clean = requested;
+                if let Some(status) = browser.try_wait().map_err(err)? {
+                    clean = requested && status.success();
                     break;
                 }
                 thread::sleep(Duration::from_millis(50));
