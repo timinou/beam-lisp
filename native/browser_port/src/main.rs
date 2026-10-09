@@ -47,6 +47,24 @@ fn log_file(root: &Path, name: &str) -> Result<File> {
         .open(root.join(name))
         .map_err(err)
 }
+// Xauthority uses length-prefixed big-endian fields. FamilyWild is valid for
+// local clients; the server reads the cookie before selecting its display.
+fn authority(path: &Path, display: &str, cookie: &[u8]) -> Result<()> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&65535u16.to_be_bytes());
+    for field in [&[][..], display.as_bytes(), b"MIT-MAGIC-COOKIE-1", cookie] {
+        bytes.extend_from_slice(&(field.len() as u16).to_be_bytes());
+        bytes.extend_from_slice(field);
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(err)?;
+    file.write_all(&bytes).map_err(err)
+}
 fn spawn(
     exe: &str,
     args: &[String],
@@ -65,7 +83,8 @@ fn spawn(
         cmd.env("DISPLAY", d)
             .env("XDG_SESSION_TYPE", "x11")
             .env_remove("WAYLAND_DISPLAY")
-            .env_remove("NIXOS_OZONE_WL");
+            .env_remove("NIXOS_OZONE_WL")
+            .env("XAUTHORITY", root.join("client.auth"));
     }
     // Helpers die if this port is killed, including SIGKILL. Process groups are
     // also reaped on normal EOF; no detached browser or display survives.
@@ -214,6 +233,9 @@ fn launch(v: &Value) -> Result<Session> {
         return Err("invalid display dimensions".into());
     }
     // Xvfb selects and locks a free display itself, avoiding display-number races.
+    let mut cookie = [0u8; 16];
+    getrandom::fill(&mut cookie).map_err(err)?;
+    authority(&runtime.join("server.auth"), "", &cookie)?;
     let display_file = runtime.join("display");
     let _ = fs::remove_file(&display_file);
     let mut cmd = Command::new(field(v, "xvfb")?);
@@ -225,7 +247,11 @@ fn launch(v: &Value) -> Result<Session> {
         &format!("{width}x{height}x24"),
         "-nolisten",
         "tcp",
-        "-ac",
+        "-auth",
+        runtime
+            .join("server.auth")
+            .to_str()
+            .ok_or("invalid runtime path")?,
     ])
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
@@ -254,6 +280,7 @@ fn launch(v: &Value) -> Result<Session> {
         .trim()
         .parse()
         .map_err(|_| "display failed to start")?;
+    authority(&runtime.join("client.auth"), &n.to_string(), &cookie)?;
     let display = format!(":{n}");
     let socket = runtime.join("vnc.sock");
     if socket.as_os_str().len() > 100 {
