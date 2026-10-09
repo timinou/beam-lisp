@@ -17,6 +17,7 @@ f=SOURCE/'followups/fixture';f.mkdir(parents=True)
 def limit():resource.setrlimit(resource.RLIMIT_AS,(8*1024**3,8*1024**3))
 def run(mode,number):
  mark=OUT/f'{mode}-{number}.mark';env=os.environ.copy();env.pop('BL_USE',None)
+ (neutral/'env.bl').write_text('{:bl \"build:24db70e9\" :env {\"BL_DAEMON\" \"off\"} :paths '+ ('['+json.dumps(str(SOURCE))+']' if mode!='artifact' else '[]')+'}\n')
  env.update(TMPDIR=str(OUT),FOLLOWUP_MODE=mode,FOLLOWUP_ROOT=str(OUT),FOLLOWUP_VALUE=f'target-{number}',FOLLOWUP_MARK=str(mark),BEAM_LISP_AOT_STRICT='1' if mode=='artifact' else '0')
  logfile=OUT/f'{mode}-{number}.log';started=time.monotonic()
  with logfile.open('w') as log:
