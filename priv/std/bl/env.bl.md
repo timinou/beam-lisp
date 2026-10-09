@@ -720,7 +720,7 @@ a list, `:paths` is a list, `:tasks` and `:ports` are maps — always the right
 shape, whatever the file said.
 
 ```beam-lisp silent
-(defn- norm-foundry
+(defn- norm-foundry-observability
   "Foundry discovery is data, never a hook. Paths stay inside the source tree."
   [value root]
   (let [o (:observability value)
@@ -749,6 +749,44 @@ shape, whatever the file said.
     (if (or (nil? value) (seq errs)) [nil errs]
       [(assoc value :observability (assoc o :schema (Path/expand (:schema o) root)
                                            :local-command (Path/expand (:local-command o) root))) []])))
+
+(defn- norm-foundry-application
+  "Application requirements are values; Foundry owns operational execution."
+  [a]
+  (let [relative? (fn [p] (and (string? p) (not= "" p)
+                              (not (String/starts_with? p "/"))
+                              (not (some #{"" "." ".."} (String/split p "/")))))
+        requirements (:requirements a) entries (:entrypoints a)
+        errors (cond
+                 (not (map? a)) [":foundry :application must be a map"]
+                 :else (concat
+                   (unknown-errs a [:version :requirements :entrypoints :data-version] ":foundry :application")
+                   (when (not= 1 (:version a)) [":foundry :application :version must be 1"])
+                   (when-not (and (vector? requirements) (<= (count requirements) 128)
+                                 (every? (fn [v] (and (string? v) (not= "" v) (<= (count v) 160))) requirements))
+                     [":foundry :application :requirements must contain at most 128 namespace names"])
+                   (when-not (and (map? entries) (<= (count entries) 32)
+                                 (every? keyword? (keys entries)) (every? relative? (vals entries)))
+                     [":foundry :application :entrypoints must map at most 32 keyword roles to relative source paths"])
+                   (when-not (and (erlang/is_integer (:data-version a)) (<= 1 (:data-version a) 2147483647))
+                     [":foundry :application :data-version must be a positive version integer"])))]
+    [a errors]))
+
+(defn- norm-foundry [value root]
+  (cond
+    (nil? value) [nil []]
+    (not (map? value)) [nil [":foundry must be a map"]]
+    :else
+      (let [unknown (unknown-errs value [:observability :application] ":foundry")
+            o (when (contains? value :observability)
+                (norm-foundry-observability (select-keys value [:observability]) root))
+            a (when (contains? value :application)
+                (norm-foundry-application (:application value)))
+            errors (concat unknown (second o) (second a))]
+        (if (seq errors) [nil errors]
+          [(cond-> {}
+             o (assoc :observability (:observability (first o)))
+             a (assoc :application (first a))) []]))))
 
 (defn- norm-loading [value]
   (try [(loading/validate value) []]
@@ -860,4 +898,20 @@ the tree has one at all.
           :else
           (assoc (empty-project root) :path path
                  :errors [(str "env.bl: the last form must be a map, got " (pr-str v))]))))))
+```
+
+## Foundry application discovery
+
+`:foundry :application` is a versioned data contract for application requirements,
+entrypoint roles and persistent data version. Paths remain relative to the
+committed application root so sealed releases remain relocatable. It does not
+contain orchestration or callable hooks; full BL `.foundry.bl` definitions consume
+this value and compose Foundry-provided DevOps capabilities. Observability remains
+independent and backwards compatible.
+
+```beam-lisp silent
+;; Shape example (not an executable deployment):
+;; {:foundry {:application {:version 1 :requirements ["datom"]
+;;                         :entrypoints {:main "src/example/main.bl"}
+;;                         :data-version 1}}}
 ```
