@@ -177,3 +177,27 @@ string algorithm, and disappears with the compiled-core migration.
 Validation: 51 focused runtime/native/pattern checks; 461 actor checks under
 default, 17-step and 41-step budgets, plus scheduler hardening; the ordinary
 compiler's eight BEAM/JS differential groups are identical after a fresh build.
+
+Shared namespace staging
+------------------------
+
+Both lowering paths call `js.build/prepare-ns`. It marks the namespace loaded
+in the caller's private environment, installs aliases/requires, interns forward
+placeholders, defines macros and their statically reached helper functions, and
+returns the target compiler environment. Application `def` initializers and
+top-level effects are compiled data at this stage; they are never evaluated to
+discover exports. `defn-value-form` supplies the same function name, clauses,
+doc/attribute handling and source span to both consumers.
+
+Actor staging masks linked native providers after namespace setup, then masks
+its own runtime links after macro-helper staging. The helpers' compiled BEAM
+implementations remain available to expansion. Their BEAM links must not escape
+into JavaScript runtime calls. Both masks belong to the isolated build env.
+A headerless actor fragment supplies an explicit fallback namespace; ordinary
+namespace builds still require their real `ns` declaration.
+
+`staging-test.bl` compiles an initializer that would throw if accidentally run,
+checks definition order and isolation, and builds a transitive macro-helper /
+forward-reference fixture. `staging.test.mjs` executes its actor output. This
+staging consolidation still does not add actor value definitions or migrate
+the ordinary emitter, evaluator, or collection prelude. Those are later gates.
