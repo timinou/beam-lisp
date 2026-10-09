@@ -37,3 +37,92 @@
 - `bin/bl self-build` produced `/tmp/bl-lazy-drop-1592` (70.3 MB). The compound itself ran `version` and evaluated the lazy vector. The assembled app contains **zero** `.ex`/`.exs`; all **66** app ebin host BEAM hashes match the packaged seed manifest, and no `Elixir.BeamLisp.RT.beam` forwarding alias is present.
 - Same-host benchmark evidence at `n=2000`: integrated map-indexed **20/36 ms** (n/2n), keep-indexed **10/40 ms**, distinct **33/56 ms**; baseline source-free run produced **13,467/56,807 ms**, **7,884/26,032 ms**, **27,075/105,426 ms** respectively, then timed out before the other cases. These are observations under changing load/swap, **not** a claimed general speedup factor. The independent native BL n→4n scaling gate passed; a full baseline benchmark did not finish.
 - **Not claimed:** the monolithic repository suite. Its pre-integration 3600s run timed out midway and reported several unclassified failures. FUP-132 owns broad-suite classification and a current-`main` release-image rerun that includes unrelated concurrent commits. Historical branch PLAN-151 numbers are not substituted for those gates.
+
+## Worktree re-audit — 2026-10-09
+
+Reviewed `perf/lazy-engine` at `5340975e` against main `407a87d7`, then merged
+`mobile` as `78bef8d3`. The lazy branch's 26 ancestry-only commits do **not**
+mean its implementation is missing: `13659b7d` selectively ported the feature,
+and merge `801ebbbc` is an ancestor of current main. Main subsequently repaired
+the implementation in `9a48e5bd` and optimized capture walks in `0794a447`.
+
+| Original feature | Current disposition |
+| --- | --- |
+| One input-bounded chunk engine, indexed producers, nested `for` flattening | Present in `priv/boot/core.bl`; the producer/scaling tests retain sparse infinite-input and chunk-boundary coverage. All original core/compiler definition names remain. |
+| Fold recipes for runtime producers | Present in `priv/boot/rt.bl` and `priv/host/lazy_seq.bl`. The old `lazy-recipe` / `lazy-fold-pending` helpers were replaced by `lazy-fold-claim` / `lazy-fold-claimed`, taking ownership before effects. |
+| No per-element memo allocation | Retained for trusted full count/materialization consumers. Arbitrary reducers deliberately keep shared chunks: restoring a halted recipe to pending would repeat the producer's effects on the next consumer. Current fold tests check this prefix/replay contract, concurrent readers and bounded chunk allocation. |
+| Versioned memo cells and recipes stored on the cell | Present in the pinned BL hosts and native crate. Current main also has atomic retained/reserved budget admission, constant-size tag/version peeks and terminal publication refusal. |
+| Native `Seen` for linear `distinct` | `native/lazy_memo/src/seen.rs` is byte-identical to the old branch. The producer still computes fallible keys before batch admission. |
+| Cycle collection and cell-backed reference family | Present. The integration added optional collector thread-start fallback; main preserves bounded-future heap enforcement and the shared reference-struct source. |
+| Catch class/reason/stack replay | Present with persistent frame lists rather than an ephemeral stack token. |
+| Tests, bench and tail-capture lint | Producer tests are unchanged from the branch; fold/scaling coverage has been extended. The old combined host tests were adapted into current host-specific suites. The lazy scaling benchmark and `lazy/tail-capture` lint are present. |
+
+The definition inventory found no removed BL definition names in the original
+core/compiler, lazy/memo/Refs/cursor hosts or deodorant, except the two replaced
+RT fold helpers above. No original native function names are absent. This
+inventory is a completeness aid; the behavioral source review and regression
+gates are the evidence for the retained contracts.
+
+`perf/lazy-w2`'s older unchecked fold path is superseded by this implementation;
+its zero-cell arbitrary-reducer optimization must not replace the shared-prefix
+path. `perf/lazy-w3`'s benchmark is also already represented in main. These
+branches are historical proposals, not additional features to merge blindly.
+
+**Decision:** keep current main's implementation. No lazy runtime transplant,
+generated seed merge, obsolete Elixir source restoration or synthetic ancestry
+merge is needed. Keep the old worktree as provenance; no branch deletion or
+reset was performed.
+
+Fresh validation on the merged tree is recorded below. Runs use systemd memory
+and runtime ceilings; no full-suite or device acceptance is implied.
+
+- Native: `cargo test --offline --locked` in `native/lazy_memo`: **29 passed,
+  0 failed**; 35 s service runtime, 693.5 MiB peak memory, 3.6 MiB peak swap.
+- Initial BL attempt (`bl-mobile-lazy-review.service`) hit its 1800 s runtime
+  ceiling during the LazySeq host tests. It first rebuilt the entire boot tier
+  (approximately 20 minutes), then refreshed libraries and reached the host
+  suites. Peak memory was 316 MiB and peak swap 301.7 MiB. The shutdown-time ETS
+  error followed systemd's SIGTERM; this incomplete attempt is **not** a green
+  test result or evidence of a LazySeq defect. Its processes were stopped by
+  the service ceiling. Validation resumed serially against the prepared image
+  in `bl-mobile-lazy-final.service`, capped at 1200 s / 8 GiB RAM / 2 GiB swap.
+- Completed continuation: **22 files passed, 1 failed, 0 incoherent**; 14m40.718s
+  service runtime, 440.9 MiB peak memory and 240.2 MiB peak swap. All producer,
+  fold, LazyMemo/LazySeq host, cycle, scaling, budget, Refs/heap, SeqCursor and
+  catch-raw files passed. Android events/Loom/UI, shared surface/desktop,
+  environment, dependencies/compilation/lock, CLI and Hiccup checks passed.
+- `aot_drift_test.bl` recorded **16 positive assertions, 3 failures**. All three
+  failures belong to the existing
+  `dev-a-fresh-vm-with-a-stale-beam-auto-heals-the-added-var-exists` case: the
+  child exits 1 with `LOAD REFUSED` because its source would replace the
+  library namespace `drift.fixture` without a declared realm shadow. That case
+  is byte-identical to pre-mobile main `407a87d7`, and the same baseline failure
+  is documented in mobile commit `e404814c`. Mobile's new
+  `source-free-runtime-never-asks-the-planner-for-a-closure-key` case **passed**,
+  as did the other in-process drift checks. No loader guard was weakened and
+  this combined run is not claimed as entirely green.
+- The continuation started at `78bef8d3`. Main advanced concurrently through
+  the Foundry configuration commits `7da0b932` / `6c88ad14` and browser commit
+  `cb485ab3`; those changes were preserved. No reviewed boot, host, native lazy,
+  Android or shared-surface sources changed in that interval. This was a live
+  checkout run, not certification of an immutable image containing every
+  concurrent change. No device, full-suite or fresh universal speedup claim is
+  made. All processes started for this review have exited.
+
+Completed BL command (from the repository root):
+
+```sh
+systemd-run --user --collect --wait --working-directory="$PWD" \
+  --property=MemoryMax=8G --property=MemorySwapMax=2G \
+  --property=RuntimeMaxSec=1200 --setenv=BL_TEST_TIMES=1 \
+  --setenv=BL_TEST_TIMEOUT=600 ./bin/bl test \
+  test/bl/android/events_test.bl test/bl/android/loom_test.bl test/bl/android/ui_test.bl \
+  test/bl/loom/surface_test.bl test/bl/loom/desktop_test.bl test/bl/env_test.bl \
+  test/bl/deps_test.bl test/bl/deps_compile_test.bl test/bl/system/cli_test.bl \
+  test/bl/lazy_producers_test.bl test/bl/lazy_fold_test.bl \
+  test/bl/host_lazy_memo_test.bl test/bl/host_lazy_seq_test.bl \
+  test/bl/ref_cycles_test.bl test/bl/lazy_scaling_test.bl test/bl/lazy_budget_test.bl \
+  test/bl/host_refs_test.bl test/bl/host_refs_heap_test.bl test/bl/host_seq_cursor_test.bl \
+  test/bl/catch_raw_test.bl test/bl/live/hiccup_test.bl test/bl/deps_lock_test.bl \
+  test/bl/aot_drift_test.bl
+```
