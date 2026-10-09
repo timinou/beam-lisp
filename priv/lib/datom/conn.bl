@@ -26,7 +26,7 @@
   (:require [datom.db] [datom.index] [datom.schema] [datom.store] [datom.store-ets]
             [datom.store-overlay] [datom.tx] [datom.broadcast] [datom.attr-basis] [env]
             [datom.blob] [datom.blob-ets] [datom.blob-fs] [datom.blob-overlay]
-            [datom.file] [datom.index-coverage] [datom.text] [datom.query.rank-build] [datom.query.rank-demand] [data.bounded-cache]))
+            [datom.file] [datom.index-coverage] [datom.text] [datom.query.rank-build] [datom.query.rank-demand] [data.bounded-cache] [proc.admission :as admission]))
 
 ;; ── env conveyance (PLAN-047 W1) ─────────────────────────────────────
 ;;
@@ -428,29 +428,40 @@
     (f)
     (with-writer-call conn f)))
 
+(defn- writer-operation [conn f]
+  (let [prior (erlang/put :datom.conn/writing-store (:store conn))]
+    (try [:ok (f)]
+      (catch e [:raised e])
+      (finally
+        (if (= :undefined prior)
+          (erlang/erase :datom.conn/writing-store)
+          (erlang/put :datom.conn/writing-store prior))))))
+
 (defn- with-writer-call
   [conn f]
-  (let [; The record's `:writer` field is immutable, so a replacement
-        ; started after a death is NOT visible there. Resolving the live
-        ; pid here is what makes recovery actually take effect — without
-        ; it `ensure-writer` started a fresh process that nothing ever
-        ; called, and every write still failed against the dead one.
-        pid (ensure-writer conn)
-        outcome (agent-get-and-update
-                  pid
-                  (fn [state]
-                    (let [prior (erlang/put :datom.conn/writing-store (:store conn))
-                          r (try [:ok (f)]
-                                 (catch e [:raised e])
-                                 (finally
-                                   (if (= :undefined prior)
-                                     (erlang/erase :datom.conn/writing-store)
-                                     (erlang/put :datom.conn/writing-store prior))))]
-                      (erlang/list_to_tuple (to-list [r state]))))
-                  30000)]
-    (if (= :ok (first outcome))
-      (second outcome)
-      (throw (second outcome)))))
+  (let [request (admission/token (erlang/self) 30000)
+        parent (Process/get :bl_admission)
+        ;; Protect both the queued wrapper and the supplied physical callback.
+        modules (list (elem (erlang/fun_info f :module) 1)
+                      (elem (erlang/fun_info (fn [] nil) :module) 1))]
+    (BeamLisp.Env/with_code_lease modules
+      (fn []
+        ;; Resolve the current writer, not the immutable record's stale PID.
+        (let [pid (ensure-writer conn)
+              outcome (agent-get-and-update pid
+                        (fn [state]
+                          (let [r (try
+                                    (let [accepted (BeamLisp.Env/with_code_lease modules
+                                                     (fn [] (admission/run request parent
+                                                              (fn [] (writer-operation conn f)))))]
+                                      (if (= :cancelled accepted)
+                                        [:raised (ex-info "Queued store operation was cancelled before admission"
+                                                   {:kind :admission-cancelled :operation :datom-writer})]
+                                        accepted))
+                                    (catch e [:raised e]))]
+                            (erlang/list_to_tuple (to-list [r state]))))
+                        30000)]
+          (if (= :ok (first outcome)) (second outcome) (throw (second outcome))))))))
 
 (defn connect-with
   "Open a connection over an EXISTING store.
