@@ -102,3 +102,20 @@ test('native boundaries reject unconverted collections and preserve symbol prope
 test('the shared runtime OS environment seam is explicitly unavailable in JS', () => {
   assert.throws(() => ENV.os_env_call(R.kw('get_env'), R.list('HOME')), /System\/get_env is unavailable/);
 });
+
+test('ephemeral namespace release removes vars, aliases, metadata and live public exports', async()=>{
+ const R=await import('../../priv/lib/js/rt.mjs');
+ const J=await import('../../priv/lib/js/interop.mjs');
+ reset();
+ const ns='ephemeral.scope';ENV.declare_ns(ns);ENV.intern(ns,'value',4);
+ ENV.intern(ns+'.other','value',9);ENV.add_alias(ns,'x','core');
+ ENV.put_key(new R.Tup([R.kw('meta'),ns,'value']),R.EMPTY_MAP);
+ J.publishLive(ns,'value');assert.equal(J.requireNamespace(ns).value,4);
+ J.releaseNamespace(ns);
+ assert.equal(ENV['ns_exists?'](ns),false);
+ assert.throws(()=>ENV['fetch!'](ns,'value'),/undefined var/);
+ assert.throws(()=>J.requireNamespace(ns),/public JS interface/);
+ assert.equal(ENV.lookup(new R.Tup([R.kw('alias'),ns,'x'])),R.kw('error'));
+ assert.equal(ENV.lookup(new R.Tup([R.kw('meta'),ns,'value'])),R.kw('error'));
+ assert.equal(ENV['fetch!'](ns+'.other','value'),9);
+});

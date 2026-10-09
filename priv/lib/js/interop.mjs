@@ -1,7 +1,7 @@
 // Native JavaScript values, public BL APIs and optional owned host namespaces.
 // This is an API/lifetime boundary, not a sandbox for untrusted JavaScript.
 import * as R from './rt.mjs';
-import { ENV, lookup, deleteKey } from './env.mjs';
+import { ENV, lookup, deleteKey, dropNamespace } from './env.mjs';
 
 const row = (...xs) => new R.Tup(xs);
 const exists = key => lookup(key) instanceof R.Tup;
@@ -185,4 +185,10 @@ export function convertToJS(value) {
 export function convertToBL(...args) {
   if (args.length !== 1 && args.length !== 3) throw new TypeError('js->bl expects one or three arguments');
   return jsToBL(...args);
+}
+
+/** Release a request's namespace, including its live public export getters. */
+export function releaseNamespace(name) {
+  dropNamespace(name);
+  publicNamespaces.delete(name);
 }

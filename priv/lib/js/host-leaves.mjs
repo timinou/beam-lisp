@@ -256,7 +256,26 @@ export const LISTS = {
 // ─── Elixir String (graphemes, as the BEAM) ─────────────────────────────────
 
 const SEG = typeof Intl !== "undefined" && Intl.Segmenter ? new Intl.Segmenter(undefined, { granularity: "grapheme" }) : null;
-const graphemes = (s) => (SEG ? [...SEG.segment(s)].map((g) => g.segment) : [...s]);
+const ASCII_NO_CRLF = /^[\x00-\x7f]*$/;
+const asciiUnits = s => ASCII_NO_CRLF.test(s) && !s.includes("\r\n");
+// Immutable, bounded by both entry count and retained UTF-16 units. Ordinary
+// String calls benefit automatically; edits cannot grow a process-wide cache.
+const GRAPHEMES = new Map();
+let retainedUnits = 0;
+const graphemes = (s) => {
+  if (asciiUnits(s)) return [...s];
+  const hit = GRAPHEMES.get(s);
+  if (hit) { GRAPHEMES.delete(s); GRAPHEMES.set(s, hit); return hit; }
+  const result = Object.freeze(SEG ? Array.from(SEG.segment(s), g => g.segment) : [...s]);
+  if (s.length <= 8192) {
+    while (GRAPHEMES.size >= 256 || retainedUnits + s.length > 131072) {
+      const first = GRAPHEMES.keys().next().value;
+      retainedUnits -= first.length; GRAPHEMES.delete(first);
+    }
+    GRAPHEMES.set(s, result); retainedUnits += s.length;
+  }
+  return result;
+};
 Z.bindEnumerableCell((x) => {
   const xs = x instanceof HMap ? x.entries().map(([k, v]) => T(k, v))
     : typeof x === "string" ? graphemes(x) : null;
@@ -264,8 +283,7 @@ Z.bindEnumerableCell((x) => {
 });
 /** Grapheme count. An all-ASCII string other than one holding "\r\n" (one
     grapheme on the BEAM) has one grapheme per code unit — no segmenter. */
-const ASCII_NO_CRLF = /^[\x00-\x7f]*$/;
-const graphemeLength = (s) => (ASCII_NO_CRLF.test(s) && !s.includes("\r\n") ? s.length : graphemes(s).length);
+const graphemeLength = (s) => (asciiUnits(s) ? s.length : graphemes(s).length);
 // Elixir's `String.trim` family strips Unicode whitespace
 const WS = "[\\s\\u0085\\u180e]";
 export const STRING = {
@@ -281,7 +299,7 @@ export const STRING = {
   },
   "Elixir.String/graphemes/1": (s) => L(graphemes(s)),
   "Elixir.String/length/1": graphemeLength,
-  "Elixir.String/slice/3": (s, start, len) => graphemes(s).slice(start, start + len).join(""),
+  "Elixir.String/slice/3": (s, start, len) => asciiUnits(s) ? s.slice(start, start + len) : graphemes(s).slice(start, start + len).join(""),
   "Elixir.String/replace/3": (s, a, b) => s.split(a).join(b),
   "Elixir.String/trim/1": (s) => s.replace(new RegExp("^" + WS + "+|" + WS + "+$", "g"), ""),
   "Elixir.String/trim_leading/1": (s) => s.replace(new RegExp("^" + WS + "+"), ""),
@@ -325,7 +343,7 @@ export const REGEX = {
     if (pat instanceof Regex) return repl(pat, s, rep, g);
     return g ? s.split(pat).join(rep) : s.replace(pat, () => rep);
   },
-  "Elixir.String/reverse/1": (s) => graphemes(s).reverse().join(""),
+  "Elixir.String/reverse/1": (s) => graphemes(s).slice().reverse().join(""),
   "Elixir.String/to_charlist/1": (s) => L([...s].map((c) => c.codePointAt(0))),
   "Elixir.List/to_string/1": (l) => iolist(l),
   "erlang/list_to_binary/1": (l) => iolist(l),
