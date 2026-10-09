@@ -23,7 +23,8 @@ The build API has a fifth options argument:
 
 ```clojure
 (build-one directory "prepare.bl" "prepare.mjs" []
-  {:native-links {"app.kernel/compute"
+  {:prune true
+   :native-links {"app.kernel/compute"
                   {:path "../../out/app.kernel.mjs"
                    :export "d_compute" :arities #{1}}}})
 ```
@@ -55,3 +56,14 @@ bin/bl run -p research/js-actors research/js-actors/native-test.bl
 node research/js-actors/native-fixture.test.mjs
 node --test research/js-actors/native-values.test.mjs
 ```
+
+With `:prune true`, the emitter keeps only ANF-reachable definitions from `main`,
+`bl-main` and optional `:roots`. Function values count as edges; hidden receive
+support counts as an edge. The complete source is reference-audited first, so
+unreachable code cannot hide a forbidden host reference. A reachable dynamic
+`host/ref` disables pruning and preserves the whole bundle. Aliases are emitted
+only for retained targets. Native import arities and known missing `#js` arguments
+are checked by `system.js` before pruning, including lexical let-bound values.
+Native argument checks are omitted only for proved raw values; unknown values
+keep checks. Actor-profile result wrapping is eliminated because native values
+already have the profile's representation. Neither optimization changes syntax.
