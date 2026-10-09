@@ -19,6 +19,7 @@ def run(mode,number):
  mark=OUT/f'{mode}-{number}.mark';mark.unlink(missing_ok=True);env=os.environ.copy();env.pop('BL_USE',None)
  (neutral/'env.bl').write_text('{:bl \"build:24db70e9\" :env {\"BL_DAEMON\" \"off\"} :paths '+ ('['+json.dumps(str(SOURCE))+']' if mode!='artifact' else '[]')+'}\n')
  env.update(TMPDIR=str(OUT),FOLLOWUP_MODE=mode,FOLLOWUP_ROOT=str(OUT),FOLLOWUP_VALUE=f'target-{number}',FOLLOWUP_MARK=str(mark),BEAM_LISP_AOT_STRICT='1' if mode=='artifact' else '0',BEAM_LISP_AOT_REPAIR='off' if mode=='source' else 'on')
+ if mode=='artifact':env['FOLLOWUP_COMPILER']=expected_compiler
  if mode=='current-cold':env['BEAM_LISP_AOT_CACHE_DIR']=tempfile.mkdtemp(prefix='cold-artifacts-',dir=OUT)
  logfile=OUT/f'{args.baseline}-{mode}-{number}.log';started=time.monotonic()
  with logfile.open('w') as log:
