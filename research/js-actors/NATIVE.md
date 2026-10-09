@@ -155,3 +155,35 @@ scope. This is necessary for reproducible builds, not a new user-facing API.
 
 `native-test.bl` builds the numeric and callback fixtures; their Node tests then
 exercise emitted code, alongside the lower-level callback and conversion tests.
+
+### Library ownership and package builds
+
+`js.actor` is now the library compiler. Its shipped runtime lives under
+`priv/lib/js/actor/`: `runtime.bl` owns scheduling policy; `host.mjs` owns the
+frame engine and host leaves; `native.mjs` binds the shared value boundary.
+Research `compiler.bl` contains fixtures and placement experiments and requires
+this library. Research host modules are compatibility re-exports, and the
+research scheduler source is a symlink to the canonical BL source.
+
+A package build requires the library directly:
+
+```clojure
+(ns my.build (:require [js.actor :as actors]))
+(actors/build-one scratch "prepare.bl" "prepare.mjs" []
+  {:prune true :native-manifest (str frontend "/native-modules.json")
+               :native-base "../../../../out"})
+(actors/link-runtime! package-actor-dir "../../../out/actor")
+```
+
+The ordinary frontend build publishes its single engine at `out/actor/`.
+`link-runtime!` writes re-exports to that engine, preserving module identity
+and the shared canonical `out/rt.mjs`. It does not create another runtime.
+`write-runtime!` remains available for standalone deployments that explicitly
+supply a canonical value-module URL. The old three-argument form delegates to
+the shipped implementation, so a research compatibility file cannot accidentally
+be packaged as an engine.
+
+This ownership change does not finish ordinary lowering migration. The legacy
+actor collection prelude and direct emitter still require consolidation against
+the common compiled core and actor control. They remain explicit roadmap items;
+removing them before their consumers migrate would break existing semantics.
