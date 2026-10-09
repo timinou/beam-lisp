@@ -53,6 +53,7 @@ def main():
  for line in args.log.read_text().splitlines():
   match=pattern.match(line)
   if match:latest[match[1]]=match.groups()
+ if not latest:raise ValueError('no build facts parsed; refusing vacuous audit')
  checked=[];mismatches=[];unstamped=[]
  for path,key,compiler,modules,cached in latest.values():
   for mod in re.findall(r'"([^"]+)"',modules):
@@ -61,6 +62,6 @@ def main():
    row=dict(path=path,module=mod,expected_source=key,actual_source=attrs['bl_source_hash'],expected_compiler=compiler,actual_compiler=attrs.get('bl_compiler_key'),cached=cached=='true')
    checked.append(row)
    if attrs['bl_source_hash'] not in (key,[key]) or attrs.get('bl_compiler_key') not in (compiler,[compiler]):mismatches.append(row)
- print(json.dumps(dict(scope='Artifact stamps against recorded build facts only; not live source or strict execution validation.',checked=len(checked),mismatches=mismatches,unstamped_count=len(unstamped)),indent=2))
+ print(json.dumps(dict(scope='Artifact stamps against recorded build facts only; not live source or strict execution validation.',source_facts=len(latest),checked=len(checked),mismatches=mismatches,unstamped_count=len(unstamped)),indent=2))
 
 if __name__=='__main__':main()
