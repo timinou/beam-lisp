@@ -117,10 +117,22 @@
        (compile_source (BeamLisp.Loader/read_source path)
                        (Keyword/put_new opts :file path))))))
 
+(defn- isolated_definition_collection [action]
+  ;; Emission itself links canonical tables. It must not contribute publications
+  ;; to an outer unit's collector after load_unit has finished collecting names.
+  (let [previous (Process/get :bl_definition_collector)]
+    (Process/delete :bl_definition_collector)
+    (try (action)
+      (finally (if previous (Process/put :bl_definition_collector previous)
+                 (Process/delete :bl_definition_collector))))))
+
 (defn compile_source
   "Like `compile_file/2` but for an in-memory source string."
   ([source] (compile_source source (list)))
   ([source opts]
+   (isolated_definition_collection (fn [] (compile_source_unit source opts)))))
+
+(defn- compile_source_unit [source opts]
    (let [output_dir (or (Keyword/get opts :output_dir nil) (default_output_dir))
          unit (load_unit source opts)
          defined (elem unit 0)
@@ -144,13 +156,16 @@
                      (erlang/++ (Map/keys defined) (Map/keys value_defs))))
          (fn [ns] (BeamLisp.Env/mark_loaded ns)))
        nil)
-     beams)))
+     beams))
 
 (defn compile_host_file
   "Compile ONE `.bl` file into ONE BEAM module at an EXACT caller-given atom.
    The PINNED-MODULE (host ABI) path. Returns `{module, beam_path}`."
   ([path] (compile_host_file path (list)))
   ([path opts]
+   (isolated_definition_collection (fn [] (compile_host_file_unit path opts)))))
+
+(defn- compile_host_file_unit [path opts]
    (let [module (Keyword/fetch! opts :module)]
      (validate_host_module! module)
      (let [output_dir (Keyword/fetch! opts :output_dir)
@@ -212,7 +227,7 @@
                              (if load?
                                (BeamLisp.Emit/load_binary! compiled (or file "beam_lisp_host"))
                                nil)
-                             (write_beam mod beam output_dir))))))))))))))))
+                             (write_beam mod beam output_dir)))))))))))))))
 
 ; `nil`/`true`/`false` are atoms but not modules, and `module_info` is the
 ; introspection pair every module already carries.
@@ -547,7 +562,10 @@
           (if (nil? declared)
             (do (BeamLisp.Compiler/prelink_defn form ns) ns)
             declared))))
-    (let [acc (Enum/reduce forms (tuple {} (MapSet/new) {})
+    (let [previous (Process/get :bl_definition_collector)]
+      (Process/put :bl_definition_collector {:env (BeamLisp.Env/env_id) :names {}})
+      (try
+       (let [acc (Enum/reduce forms (tuple {} (MapSet/new) {})
                 (fn [form a]
                   (let [vdefs (elem a 0)
                         nss (elem a 1)
@@ -562,7 +580,14 @@
       ; (BUG-112): one shim rebuild per namespace for the whole unit
       (when (erlang/function_exported :Elixir.BeamLisp.Link :settle 0)
         (BeamLisp.Link/settle))
-      (tuple defined (elem acc 0) (elem acc 1) (elem acc 2) file))))
+      (let [executed (Map/get (Process/get :bl_definition_collector) :names {})
+            owned (MapSet/union (elem acc 1) (MapSet/new (Map/keys (elem acc 2))))
+            names (Map/merge defined (Map/take executed (MapSet/to_list owned))
+                    (fn [_ lexical observed] (MapSet/union lexical observed)))]
+        (tuple names (elem acc 0) (elem acc 1) (elem acc 2) file)))
+       (finally
+        (if previous (Process/put :bl_definition_collector previous)
+          (Process/delete :bl_definition_collector)))))))
 
 (defn- unit_defns
   "The fn definitions THIS UNIT made, per namespace: the names a top-level
@@ -1008,16 +1033,11 @@
                (Enum/map (String/split ns ".") (fn [s] (Macro/camelize s))))))
 
 (defn- unit_defs
-  "This unit's defs, told apart from the VM registry's by their body module: a
-   defn this unit evaluated was installed into a FRESH body module; one
-   inherited from a loaded beam still names that beam's shared body."
+  "Project this unit's published names, including macro-generated definitions.
+   Never scan inherited tables or infer ownership from body module naming."
   [ns names]
-  (let [shared (ns_body_module ns)]
-    (Map/new
-      (Enum/filter (BeamLisp.Env/ns_defs ns)
-        (fn [pair]
-          (or (and (erlang/not (erlang/== nil names)) (MapSet/member? names (elem pair 0)))
-              (Enum/any? (elem pair 1) (fn [d] (erlang/=/= shared (elem d 4))))))))))
+  (BeamLisp.Env/selected_ns_definitions ns
+    (if names (MapSet/to_list names) (list))))
 
 (defn- stabilise_body_modules
   "Rewrite every var's body module to a SINGLE deterministic body module shared
@@ -1450,13 +1470,53 @@
         (erlang/not (Regex/match? (Regex/compile! "^[A-Z]") (elem f 1)))
       :else true)))
 
+(defn- admission_head [node]
+  (let [f (unmeta node)]
+    (when (and (reg2? f :list) (erlang/not (erlang/== (list) (elem f 1))))
+      (bare_name (first (elem f 1))))))
+
+(defn- static_local_definers
+  "Recognize literal zero-argument defining macros without executing expansion.
+   Only a quoted single defn/def is admitted, only at top level. Unknown macro
+   bodies/calls remain source-only; ordinary body macros are never guessed pure."
+  [forms]
+  (let [reserved (list "ns" "def" "defn" "defn-" "defmacro" "if" "do" "let" "fn" "quote"
+                       "+" "-" "*" "/" "=" "<" ">" "<=" ">=")
+        definitions (Enum/filter forms (fn [f] (erlang/== "defmacro" (admission_head (unmeta f)))))
+        macros (Enum/reduce definitions (maps/new)
+          (fn [node acc]
+            (let [items (elem (unmeta node) 1) name (when (erlang/== 4 (erlang/length items))
+                                                              (bare_name (second items)))
+                  params (when name (unmeta (Enum/at items 2)))
+                  body (when name (unmeta (Enum/at items 3)))
+                  quoted (when (and (reg2? body :list) (erlang/== 2 (erlang/length (elem body 1)))
+                                    (erlang/== "quote" (bare_name (first (elem body 1)))))
+                           (second (elem body 1)))
+                  head (when quoted (admission_head (unmeta quoted)))]
+              (if (and name (erlang/not (lists/member name reserved))
+                       (erlang/not (String/contains? name "/")) (erlang/not (maps/is_key name acc))
+                       (reg2? params :vector) (erlang/== (list) (elem params 1))
+                       (lists/member head (list "defn" "defn-" "def")))
+                (maps/put name quoted acc)
+                (erlang/error :unsupported_static_definer))))) ]
+    (Enum/flat_map forms
+      (fn [node]
+        (let [f (unmeta node) head (admission_head f)]
+          (cond
+            (erlang/== head "defmacro") (list)
+            (maps/is_key head macros)
+              (if (erlang/== 1 (erlang/length (elem f 1))) (list (maps/get head macros))
+                (erlang/error :unsupported_static_definer_call))
+            :else (list node)))))))
+
 (defn local_cacheable_source?
   "Automatic finite admission for lexical functions and replayable def values.
-   Custom macros, defining forms, aliases and arbitrary top-level effects retain
+   Literal local zero-argument defining macros are structurally certified.
+   Other macros, defining forms, aliases and arbitrary top-level effects retain
    source loading. This is intentionally smaller than the language."
   [source]
   (try
-    (let [forms (BeamLisp.Reader/read_all source)
+    (let [forms (static_local_definers (BeamLisp.Reader/read_all source))
           names (Enum/flat_map forms
                   (fn [node]
                     (let [f (unmeta node)]
