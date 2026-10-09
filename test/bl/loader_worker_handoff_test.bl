@@ -1,0 +1,96 @@
+(ns loader.worker-handoff-test)
+
+(def ^:private probe :Elixir.BeamLisp.LoaderHandoffProbe)
+(defn- call [name & args] (erlang/apply probe name (to-list args)))
+(defn- setup []
+  (let [dir (Path/join (System/tmp_dir!) (str "loader-handoff-" (erlang/unique_integer (list :positive))))]
+    (File/mkdir_p! dir)
+    (BeamLisp.AOT/compile_host_file (Path/join (BeamLisp/cwd) "priv/host/loader_server.bl")
+      (list (tuple :module probe) (tuple :output_dir dir) (tuple :load? true)
+            (tuple :behaviour :Elixir.GenServer)))
+    dir))
+(defn- cleanup [dir agents]
+  (doseq [agent agents] (when (Process/alive? agent) (Agent/stop agent)))
+  (when (Process/whereis probe) (GenServer/stop probe))
+  (code/soft_purge probe) (code/delete probe)
+  (File/rm_rf! dir))
+(defn- agent-call [agent f]
+  (call :worker_call (fn [delegate] (Agent/get_and_update agent (delegate f) 2000))))
+
+(deftest causal-loads-run-in-the-real-loader-and-preserve-partial-state
+  (let [dir (setup) agent (elem (Agent/start (fn [] :state)) 1)]
+    (try
+      (is (= [:done true true true]
+        (call :run (fn []
+          (Process/put :handoff-partial :visible)
+          (let [owner (erlang/self)
+                result (agent-call agent (fn [state]
+                  (let [worker (erlang/self)
+                        nested (call :run (fn []
+                          [(= owner (erlang/self)) (call :in_server?)
+                           (= :visible (Process/get :handoff-partial))]))]
+                    (tuple (into [:done] nested) state))))]
+            (Process/delete :handoff-partial)
+            result)))))
+      (is (nil? (Agent/get agent (fn [_] (Process/get :bl_loader_dependency)))))
+      (is (nil? (Agent/get agent (fn [_] (Process/get :bl_in_loader_server)))))
+      (finally (cleanup dir [agent])))))
+
+(deftest worker-callback-failure-restores-context-and-server-survives
+  (let [dir (setup) agent (elem (Agent/start (fn [] :state)) 1)]
+    (try
+      ;; Keep the Agent healthy exactly as datom.conn does: return the raised
+      ;; outcome as data, then raise in the owning caller.
+      (is (= :caught (call :run (fn []
+        (agent-call agent (fn [state]
+          (tuple (try (call :run (fn [] (throw :sentinel))) :missed
+                    (catch _ :caught)) state)))))))
+      (is (= :healthy (call :run (fn [] :healthy))))
+      (is (nil? (Agent/get agent (fn [_] (Process/get :bl_loader_dependency)))))
+      (is (= :direct (agent-call agent (fn [state] (tuple :direct state)))))
+      (finally (cleanup dir [agent])))))
+
+(deftest nested-worker-handoffs-remain-causal
+  (let [dir (setup) a (elem (Agent/start (fn [] :a)) 1)
+        b (elem (Agent/start (fn [] :b)) 1)]
+    (try
+      (is (= :nested
+        (call :run (fn []
+          (agent-call a (fn [state]
+            (tuple (call :run (fn []
+              (agent-call b (fn [inner]
+                (tuple (call :run (fn [] :nested)) inner))))) state)))))))
+      (finally (cleanup dir [a b])))))
+
+(deftest unrelated-loads-stay-queued-until-initializer-completes
+  (let [dir (setup) agent (elem (Agent/start (fn [] :state)) 1)
+        parent (erlang/self) ticket (erlang/make_ref)]
+    (try
+      (erlang/spawn (fn []
+        (let [result (call :run (fn []
+          (agent-call agent (fn [state]
+            (erlang/send parent (tuple :worker-ready ticket (erlang/self)))
+            (receive [:release ref] :when (= ref ticket) :ok)
+            (tuple (call :run (fn [] :causal)) state)))))]
+          (erlang/send parent (tuple :completed ticket result)))))
+      (let [worker (receive [:worker-ready ref pid] :when (= ref ticket) pid
+                     (after 5000 nil))]
+        (is (erlang/is_pid worker))
+        (erlang/spawn (fn [] (call :run (fn [] (erlang/send parent (tuple :unrelated ticket))))))
+        (is (= :queued (receive [:unrelated ref] :when (= ref ticket) :escaped
+                         (after 50 :queued))))
+        (erlang/send worker (tuple :release ticket))
+        (is (= :causal (receive [:completed ref result] :when (= ref ticket) result
+                         (after 5000 :timeout))))
+        (is (= :ran (receive [:unrelated ref] :when (= ref ticket) :ran
+                       (after 5000 :timeout)))))
+      (finally (cleanup dir [agent])))))
+
+(deftest expired-delegation-refuses-instead-of-waiting-forever
+  (let [dir (setup) agent (elem (Agent/start (fn [] nil)) 1)]
+    (try
+      (let [retained (call :run (fn []
+                       (call :worker_call (fn [delegate] (delegate (fn [_] (call :run (fn [] :bad))))))))]
+        (is (= :closed (try (retained nil) :missed (catch _ :closed)))))
+      (is (= :healthy (call :run (fn [] :healthy))))
+      (finally (cleanup dir [agent])))))

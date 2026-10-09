@@ -181,6 +181,97 @@
   []
   (erlang/== true (Process/get :bl_in_loader_server)))
 
+(defn- outcome [fun]
+  (try (tuple :ok (erlang/apply fun (list)))
+    (catch e
+      (cond
+        (erlang/== :throw __EXCEPTION_KIND__) (tuple :thrown e)
+        (erlang/== :error __EXCEPTION_KIND__) (tuple :raised e __STACKTRACE__)
+        :else (tuple :exited (erlang/element 2 e) __STACKTRACE__)))))
+
+(defn- unwrap [reply]
+  (case (erlang/element 1 reply)
+    :ok (erlang/element 2 reply)
+    :thrown (erlang/throw (erlang/element 2 reply))
+    :raised (erlang/raise :error (erlang/element 2 reply) (erlang/element 3 reply))
+    :exited (erlang/raise :exit (erlang/element 2 reply) (erlang/element 3 reply))))
+
+(defn- bind_dependency [session fun]
+  (fn [arg]
+    (let [previous (Process/get :bl_loader_dependency)]
+      (Process/put :bl_loader_dependency session)
+      (try (erlang/apply fun (list arg))
+        (finally
+          (if (erlang/== nil previous) (Process/delete :bl_loader_dependency)
+            (Process/put :bl_loader_dependency previous)))))))
+
+(defn- dependency_call [session fun]
+  (let [owner (erlang/element 1 session)
+        proxy (erlang/element 2 session)
+        ticket (erlang/element 3 session)
+        reply (erlang/make_ref)
+        owner_monitor (erlang/monitor :process owner)
+        proxy_monitor (erlang/monitor :process proxy)]
+    (try
+      (erlang/send owner (tuple :bl_loader_dependency ticket (erlang/self) reply fun))
+      (receive
+        [:bl_loader_dependency_reply ref result] :when (erlang/== ref reply)
+          (unwrap result)
+        [:DOWN ref :process _pid reason]
+          :when (or (erlang/== ref owner_monitor) (erlang/== ref proxy_monitor))
+          (erlang/error (tuple :loader_dependency_closed reason)))
+      (finally
+        (erlang/demonitor owner_monitor (list :flush))
+        (erlang/demonitor proxy_monitor (list :flush))))))
+
+(defn- await_worker [ticket monitor]
+  ;; Selective receive leaves unrelated GenServer calls queued. Only this
+  ;; synchronous handoff's descendants can ask the real loader to run code.
+  (receive
+    [:bl_loader_dependency ref caller reply fun] :when (erlang/== ref ticket)
+      (do (erlang/send caller (tuple :bl_loader_dependency_reply reply (outcome fun)))
+          (await_worker ticket monitor))
+    [:bl_loader_worker ref result] :when (erlang/== ref ticket)
+      (do (erlang/demonitor monitor (list :flush)) (unwrap result))
+    [:DOWN ref :process _pid reason] :when (erlang/== ref monitor)
+      (erlang/error (tuple :loader_worker_closed reason))))
+
+(defn worker_call
+  "Run a synchronous worker call without a loader dependency cycle.
+   `call` receives a callback wrapper; apply it to the callback submitted to
+   the worker. Outside initialization this is an ordinary direct call. During
+   initialization only that callback's causal nested loads are serviced, in
+   the real loader process. Retaining the wrapper after the call is invalid."
+  [call]
+  (if (in_server?)
+    (let [owner (erlang/self)
+          context (BeamLisp.Env/capture)
+          ticket (erlang/make_ref)
+          spawned (erlang/spawn_monitor
+            (fn []
+              (let [proxy (erlang/self)
+                    session (tuple owner proxy ticket)]
+                (BeamLisp.Env/bind context)
+                (Process/put :bl_loader_dependency session)
+                ;; A monitor guardian also handles a normal owner exit. The
+                ;; accepted Agent action drains independently of its waiter.
+                (erlang/spawn
+                  (fn []
+                    (let [om (erlang/monitor :process owner)
+                          pm (erlang/monitor :process proxy)]
+                      (receive
+                        [:DOWN ref :process _pid _reason] :when (erlang/== ref om)
+                          (erlang/exit proxy :kill)
+                        [:DOWN ref :process _pid _reason] :when (erlang/== ref pm) :ok))))
+                (erlang/send owner (tuple :bl_loader_worker ticket
+                  (outcome (fn [] (erlang/apply call
+                    (list (fn [callback] (bind_dependency session callback)))))))))))]
+      (await_worker ticket (erlang/element 2 spawned)))
+    (let [session (Process/get :bl_loader_dependency)]
+      (erlang/apply call (list (if session
+        (fn [callback] (bind_dependency session callback))
+        (fn [callback] callback)))))))
+
 (defn run
   "Run `fun` in the loader process, inline when the caller is already INSIDE it.
 
@@ -238,8 +329,14 @@
                              (erlang/apply fun (list))))
                     :cancelled)))
               reply (BeamLisp.Env/with_code_lease modules
-                      (fn [] (GenServer/call own
-                        (tuple :run (fn [] (erlang/apply action (list nil)))) :infinity)))]
+                      (fn []
+                        (let [session (Process/get :bl_loader_dependency)
+                              run_action (fn [] (erlang/apply action (list nil)))]
+                          (if session
+                            ;; dependency_call unwraps for the worker; retain
+                            ;; run/1's ordinary reply classification below.
+                            (outcome (fn [] (dependency_call session run_action)))
+                            (GenServer/call own (tuple :run run_action) :infinity)))))]
           (cond
             (and (erlang/is_tuple reply)
                  (erlang/== 2 (erlang/tuple_size reply))
@@ -258,6 +355,11 @@
                  (erlang/== 2 (erlang/tuple_size reply))
                  (erlang/== :thrown (erlang/element 1 reply)))
               (erlang/apply :erlang :throw (list (erlang/element 2 reply)))
+
+            (and (erlang/is_tuple reply)
+                 (erlang/== 3 (erlang/tuple_size reply))
+                 (erlang/== :exited (erlang/element 1 reply)))
+              (erlang/raise :exit (erlang/element 2 reply) (erlang/element 3 reply))
 
             :else
               (erlang/error
