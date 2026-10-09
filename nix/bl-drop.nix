@@ -1,7 +1,7 @@
 # The self-contained `bl` drop, built entirely inside nix (no network, no Mix).
 #
 # It runs the same sequence as .github/workflows/release.yml's linux leg
-# (deps -> bl build -> z3 -> bl self-build), with every input pinned and fetched
+# (deps -> bl build -> bl seed/check -> z3 -> bl self-build), with every input pinned and fetched
 # by nix: hex tarballs (bl.lock digests), crates (Cargo.lock, vendored), the
 # pinned z3 zip and explorer's precompiled NIF. The toolchain (OTP 29, Elixir
 # 1.20, rustc, gcc) comes from the pinned nixpkgs, so every ELF the drop carries
@@ -189,6 +189,12 @@ let
       ./bin/bl deps verify
       ./bin/bl deps compile
       ./bin/bl build --force
+      # Pinned host leaves are loaded from the bootstrap floor, not repaired
+      # from priv/host on demand. Recompile that floor from this revision so
+      # native fixes cannot silently ship as source beside older executable
+      # host bytes. The next launcher stages and checks the regenerated floor.
+      ./bin/bl seed --ebin build
+      ./bin/bl seed --check
 
       # pinned z3, laid out as `bl install z3` leaves it
       unzip -q ${z3} -d $TMPDIR/z3
