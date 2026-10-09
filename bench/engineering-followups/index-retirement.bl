@@ -1,0 +1,63 @@
+(ns bench.engineering-followups.index-retirement
+ (:require [bench.runtime-integration.common :as c] [datom :as d] [datom.db :as db]
+           [datom.conn :as conn] [datom.query.engine :as engine]
+           [datom.store-fjall :as fjall] [datom.store :as store]
+           [datom.query.rank-plan :as plan] [datom.query.rank-index :as rank]
+           [datom.query.rank-query :as pages] [datom.query.rank-demand :as demand]
+           [data.bounded-cache :as cache]))
+(def schema [{:db/ident :item/scope :db/valueType :db.type/ref}
+             {:db/ident :item/order :db/valueType :db.type/long}
+             {:db/ident :item/name :db/valueType :db.type/string}])
+(def query '[:find ?e ?at ?name :in $ ?scope :where [?e :item/scope ?scope]
+             [?e :item/order ?at] [?e :item/name ?name]])
+(defn writes [connection label]
+ (c/measure (fn []
+  (doseq [i (range 1 11)]
+   (d/transact! connection [{:db/id i :item/name (str label i)}])) 10)))
+(defn run []
+ (let [root (str (System/tmp_dir!) "/index-retirement-" (erlang/unique_integer (list :positive)))
+       s (fjall/open root) connection (d/connect-with s schema)]
+  (try
+   (d/transact! connection
+     (mapv (fn [i] {:db/id i :item/scope 7 :item/order i :item/name (str i)}) (range 1 101)))
+   (c/emit :retirement-baseline-writes (writes connection "baseline-"))
+   (let [database (d/db connection)
+         descriptor (plan/descriptor query (db/schema-of database) [7] ['?at :asc])
+         id (conn/ensure-query-rank! connection descriptor)
+         built (c/measure (fn []
+          (loop [steps 0]
+           (c/need "bounded construction" (< steps 1000))
+           (let [h (conn/advance-query-rank! connection id)]
+            (if (= :building (:status h)) (recur (inc steps))
+             (do (c/need "complete index" (= :complete (:status h))) (inc steps)))))))
+         key (cache/key-data (store/identity-of s) 0)]
+    (c/emit :retirement-build built)
+    (engine/watch-rank-query! query)
+    (demand/watch! key query [7] id)
+    (doseq [_ (range 5)] (d/q query (d/db connection) 7))
+    (doseq [variant [:ordinary :indexed :indexed :ordinary :ordinary :indexed :indexed :ordinary]]
+     (c/emit :retirement-read
+      (assoc (c/measure (fn []
+       (doseq [_ (range 10)]
+        (let [database (d/db connection)
+              expected (subvec (vec (sort-by second (d/q query database 7))) 90 100)
+              rows (if (= :ordinary variant) expected
+                      (:rows (pages/page-result query database
+                               {:offset 90 :limit 10 :order-by ['?at :asc]} [7])))]
+         (c/need "actual page parity" (= expected rows)))) 10)) :variant variant)))
+    (c/emit :retirement-maintained-writes (writes connection "maintained-"))
+    ;; Real grace, never override production policy constants for this receipt.
+    (Process/sleep (+ demand/RETIRE-MIN-MS 100))
+    (c/emit :retirement-trigger-writes (writes connection "trigger-"))
+    (c/need "automatic loss retirement" (= :aborted (:status (rank/header s id))))
+    (let [cleanup (c/measure (fn []
+                   (loop [n 0]
+                    (c/need "bounded reclamation" (< n 200))
+                    (if (rank/header s id)
+                     (do (d/transact! connection [{:db/id 1 :item/name (str "cleanup-" n)}])
+                         (recur (inc n))) n))))]
+     (c/emit :retirement-cleanup cleanup))
+    (c/need "cooldown prevents immediate rebuild" (nil? (conn/ensure-query-rank! connection descriptor)))
+    (c/need "authoritative result parity after retirement" (= 100 (count (d/q query (d/db connection) 7))))
+    (c/emit :retirement-after-writes (writes connection "retired-")))
+   (finally (d/close! connection) (File/rm_rf! root)))))
