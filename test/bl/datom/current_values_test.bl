@@ -1,0 +1,177 @@
+(ns datom.current-values.test
+  (:require [datom.current :as current] [datom.tx :as tx] [datom.index :as index]
+            [datom.conn :as conn] [datom.db :as db] [datom.time :as time]
+            [datom.derived :as derived] [datom.attr-basis :as basis]
+            [datom.store :as store] [datom.store-fjall :as fjall] [datom.store-ets :as ets-store]))
+
+(defrecord CountingStore [inner rows]
+  store/Store
+  (-get [s k] (store/-get (:inner s) k))
+  (-range [s lo hi]
+    (let [ds (store/-range (:inner s) lo hi)]
+      (swap! (:rows s) + (count ds)) ds))
+  (-put [s k v] (store/-put (:inner s) k v) s)
+  (-delete [s k] (store/-delete (:inner s) k) s)
+  (-update [s k f] (let [[_ v] (store/-update (:inner s) k f)] [s v]))
+  (-commit [s ops] (store/-commit (:inner s) ops) s))
+
+(defn- fixture []
+  (conn/connect [{:db/ident :account/value :db/valueType :db.type/long}
+                 {:db/ident :account/tag :db/valueType :db.type/string
+                  :db/cardinality :db.cardinality/many}]))
+
+(deftest legacy-account-history-is-adopted-once-then-writes-do-not-scan-it
+  ;; Minimal reproduction of HERA: one cardinality-one accounting field,
+  ;; 55k historical datoms. Seed the log in one commit, without 27k slow writes.
+  (let [c (fixture) rows (atom 0) s (->CountingStore (:store c) rows)
+        history (into [[9000 :account/value 0 100 true]]
+                  (mapcat (fn [n] [[9000 :account/value (dec n) (+ 100 n) false]
+                                  [9000 :account/value n (+ 100 n) true]]) (range 1 27712)))]
+    (try
+      (index/write-datoms s @(:schema c) history)
+      (reset! rows 0)
+      (is (= [27711] (current/values s 9000 :account/value)))
+      (is (= 55423 @rows) "legacy adoption sees the complete old history")
+      (let [ds [[9000 :account/value 27711 40000 false]
+                [9000 :account/value 27712 40000 true]]]
+        (index/write-datoms s @(:schema c) ds
+          (into (current/transaction-ops s ds 40000)
+                (basis/record-ops s #{:account/value} 40000))))
+      (reset! rows 0)
+      (is (= [27712] (tx/current-values s 9000 :account/value [])))
+      (is (= [27713] (tx/current-values s 9000 :account/value
+                       [[9000 :account/value 27712 40001 false]
+                        [9000 :account/value 27713 40001 true]])))
+      (is (zero? @rows) "hot updates must not read any historical datoms")
+      ;; An older writer advances the committed attribute marker without a
+      ;; projection. Existing projections must be rejected, including on reopen.
+      (index/write-datoms s @(:schema c)
+        [[9000 :account/value 27712 40002 false] [9000 :account/value 7 40002 true]]
+        (basis/record-ops s #{:account/value} 40002))
+      (is (= [7] (current/values s 9000 :account/value)))
+      (finally (conn/close! c)))))
+
+(deftest projection-preserves-snapshots-cas-retractions-and-intra-transaction-order
+  (let [c (fixture)]
+    (try
+      (conn/transact! c [[:db/add 9000 :account/value 1] [:db/add 9000 :account/tag "a"]])
+      (let [before (conn/db c)]
+        (conn/transact! c [[:db/add 9000 :account/value 2] [:db/add 9000 :account/value 3]
+                           [:db/retract 9000 :account/tag "a"] [:db/add 9000 :account/tag "b"]])
+        (is (= [3] (current/values (:store c) 9000 :account/value)))
+        (is (= ["b"] (current/values (:store c) 9000 :account/tag)))
+        (is (= 1 (:account/value (db/entity before 9000))))
+        (conn/transact! c [[:db/cas 9000 :account/value 3 4]])
+        (is (= 4 (:account/value (db/entity (conn/db c) 9000))))
+        (let [spec (conn/with c [[:db/add 9000 :account/value 8]])]
+          (is (= 8 (:account/value (db/entity (:db-after spec) 9000))))
+          (is (= [4] (current/values (:store c) 9000 :account/value))))
+        (conn/transact! c [[:db/retractEntity 9000]])
+        (is (= [] (current/values (:store c) 9000 :account/value)))
+        (conn/transact! c [[:db/add 9000 :account/value 1]])
+        (is (= [1] (current/values (:store c) 9000 :account/value))))
+      (finally (conn/close! c)))))
+
+(deftest an-epoch-survives-other-entities-updating-the-same-attribute
+  (let [c (fixture)]
+    (try
+      (conn/transact! c [[:db/add 9000 :account/value 1]])
+      (let [epoch (:epoch (derived/get-record (:store c) [:datom.current/pair 9000 :account/value]))]
+        (conn/transact! c [[:db/add 9001 :account/value 2]])
+        (is (= epoch (:epoch (derived/get-record (:store c) [:datom.current/attribute :account/value]))))
+        (is (= [1] (current/values (:store c) 9000 :account/value))))
+      (finally (conn/close! c)))))
+
+(defrecord RefusingStore [inner refuse]
+  store/Store
+  (-get [s k] (store/-get (:inner s) k))
+  (-range [s lo hi] (store/-range (:inner s) lo hi))
+  (-put [s k v] (store/-put (:inner s) k v) s)
+  (-delete [s k] (store/-delete (:inner s) k) s)
+  (-update [s k f] (let [[_ v] (store/-update (:inner s) k f)] [s v]))
+  (-commit [s ops]
+    (when @(:refuse s) (throw (ex-info "injected commit refusal" {})))
+    (store/-commit (:inner s) ops) s))
+
+(deftest a-refused-commit-cannot-publish-a-new-current-value
+  (let [refuse (atom false) s (->RefusingStore (ets-store/open) refuse)
+        c (conn/connect-with s [{:db/ident :account/value :db/valueType :db.type/long}])]
+    (try
+      (conn/transact! c [[:db/add 9000 :account/value 1]])
+      (reset! refuse true)
+      (is (= :refused (try (conn/transact! c [[:db/add 9000 :account/value 2]]) :accepted
+                           (catch _ :refused))))
+      (is (= [1] (current/values s 9000 :account/value)))
+      (reset! refuse false)
+      (conn/transact! c [[:db/cas 9000 :account/value 1 3]])
+      (is (= [3] (current/values s 9000 :account/value)))
+      (finally (conn/close! c)))))
+
+(deftest a-fjall-reopen-keeps-both-history-and-its-current-projection
+  (let [path (store/fresh-path ".current-values-test")
+        schema [{:db/ident :account/value :db/valueType :db.type/long}]
+        s (fjall/open path) c (conn/connect-with s schema)]
+    (try
+      (conn/transact! c [[:db/add 9000 :account/value 1]])
+      (conn/transact! c [[:db/add 9000 :account/value 2]])
+      (finally (conn/release! c) (store/close s)))
+    (let [s2 (fjall/open path) rows (atom 0) measured (->CountingStore s2 rows)
+          c2 (conn/connect-with measured schema)]
+      (try
+        (reset! rows 0)
+        (is (= [2] (tx/current-values measured 9000 :account/value [])))
+        (is (zero? @rows) "reopen does not replay history")
+        (is (= 3 (count (index/scan measured :eavt 9000 :account/value))))
+        (finally (conn/release! c2) (store/close s2) (File/rm_rf! path))))))
+
+(deftest excision-erases-the-projection-with-its-history
+  (let [c (fixture)]
+    (try
+      (conn/transact! c [[:db/add 9000 :account/value 1] [:db/add 9001 :account/value 2]])
+      (conn/excise! c [[:entity 9000]])
+      (is (nil? (derived/get-record (:store c) [:datom.current/pair 9000 :account/value])))
+      (is (= [] (current/values (:store c) 9000 :account/value)))
+      (is (= [2] (current/values (:store c) 9001 :account/value)))
+      (conn/transact! c [[:db/add 9000 :account/value 3]])
+      (is (= [3] (current/values (:store c) 9000 :account/value)))
+      (finally (conn/close! c)))))
+
+(deftest projected-point-reads-refuse-older-and-specialized-views
+  (let [c (fixture)]
+    (try
+      (conn/transact! c [[:db/add 9000 :account/value 1]])
+      (let [before (conn/db c)]
+        (is (= {:values [1]} (current/projected-values before 9000 :account/value)))
+        (conn/transact! c [[:db/add 9000 :account/value 2]])
+        (is (nil? (current/projected-values before 9000 :account/value)))
+        (is (= 1 (:account/value (db/entity before 9000))))
+        (is (= {:values [2]} (current/projected-values (conn/db c) 9000 :account/value)))
+        (is (nil? (current/projected-values (assoc (conn/db c) :filter-mode :history) 9000 :account/value)))
+        (is (nil? (current/projected-values (assoc (conn/db c) :since-t 0) 9000 :account/value)))
+        (is (nil? (current/projected-values (assoc (conn/db c) :valid-at 1) 9000 :account/value))))
+      (finally (conn/close! c)))))
+
+(defrecord RacingStore [inner hook]
+  store/Store
+  (-get [s k]
+    (let [v (store/-get (:inner s) k)]
+      (when (and (= k (derived/record-key [:datom.attr-basis])) @(:hook s))
+        (let [f @(:hook s)] (reset! (:hook s) nil) (f)))
+      v))
+  (-range [s lo hi] (store/-range (:inner s) lo hi))
+  (-put [s k v] (store/-put (:inner s) k v) s)
+  (-delete [s k] (store/-delete (:inner s) k) s)
+  (-update [s k f] (let [[_ v] (store/-update (:inner s) k f)] [s v]))
+  (-commit [s ops] (store/-commit (:inner s) ops) s))
+
+(deftest a-commit-between-marker-and-projection-read-cannot-leak-into-a-snapshot
+  (let [hook (atom nil) s (->RacingStore (ets-store/open) hook)
+        c (conn/connect-with s [{:db/ident :account/value :db/valueType :db.type/long}])]
+    (try
+      (conn/transact! c [[:db/add 9000 :account/value 1]])
+      (let [before (conn/db c)]
+        (reset! hook (fn [] (conn/transact! c [[:db/add 9000 :account/value 2]])))
+        (is (nil? (current/projected-values before 9000 :account/value)))
+        (is (= 1 (:account/value (db/entity before 9000))))
+        (is (= {:values [2]} (current/projected-values (conn/db c) 9000 :account/value))))
+      (finally (conn/close! c)))))
