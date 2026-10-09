@@ -6,10 +6,13 @@ rows=[]
 for file in a.logs:
  for line in file.read_text().splitlines():
   if line.startswith('FOLLOWUP_JSON '):
-   row=json.loads(line.split('FOLLOWUP_JSON ',1)[1]);row['log']=file.name;rows.append(row)
+   row=json.loads(line.split('FOLLOWUP_JSON ',1)[1])
+   if 'area' not in row or 'data' not in row:continue # AOT has its own result schema
+   row['log']=file.name;rows.append(row)
 groups=collections.defaultdict(list); realm_warmup=True
 for row in rows:
  area,d=row['area'],row['data']
+ if row['log']=='realm-probe.log':continue # diagnostic compile trace, not timed ABBA trials
  if area=='realm' and realm_warmup:
   realm_warmup=False;continue
  if 'variant' in d:
