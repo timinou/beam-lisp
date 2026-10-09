@@ -245,3 +245,13 @@ This is a migration audit, not an execution benchmark or parity claim. The
 qualified linker must prefer compiled namespace definitions before primitives;
 packed-rest call conventions, lazy thunk forcing/ownership and higher-order
 callback contracts must pass before replacing the actor collection prelude.
+
+Self-hosted build dependency ownership
+------------------------------------
+
+The common pattern traversal is part of the running compiler as well as source
+for the browser compiler. Load its BEAM implementation before staging target
+forward references, just as for system.ir. Otherwise a cold build that includes
+js.pattern can mark the namespace loaded with nil placeholders and prevent the
+running emitter from loading it. Warm fixture tests conceal that failure. The
+cold CLI regression now explicitly includes both shared dependencies.
