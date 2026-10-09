@@ -67,3 +67,27 @@ are checked by `system.js` before pruning, including lexical let-bound values.
 Native argument checks are omitted only for proved raw values; unknown values
 keep checks. Actor-profile result wrapping is eliminated because native values
 already have the profile's representation. Neither optimization changes syntax.
+
+
+The ordinary namespace build now emits `native-modules.json` from the same checked
+ANF that emits its modules. Public callable export names and fixed/variadic arities
+are compiler-owned; private values and unknown callable shapes are excluded.
+Callable shape recognition lives in `system.ir`, shared by the emitters and linker.
+The actor builder consumes it with:
+
+```clojure
+{:native-manifest "/build/out/native-modules.json"
+ :native-base "../../../out"
+ :prune true}
+```
+
+Only annotated namespaces are native link candidates. The actor emitter imports
+only references retained in its bundle, so a manifest does not eagerly load every
+exported module. A native-only call still imports the native boundary helpers even
+when the app contains no explicit JS expression. `:native-links` remains a closed
+foreign-function fixture/compatibility entrypoint during migration; packages should
+consume the compiler manifest. This step does not yet unify collection values or
+promote the actor backend to the ordinary build's sole execution model.
+
+`native-module-test.bl` checks normal-build emission, source privacy, export
+mangling, fixed/variadic contracts, and staging without application initialization.
