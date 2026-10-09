@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real compiler/loader prototype. Fresh VMs; source/artifact ABBA; home scratch."""
 import argparse,hashlib,json,os,pathlib,resource,shutil,signal,statistics,subprocess,tempfile,time
-P=argparse.ArgumentParser();P.add_argument('--app',type=pathlib.Path,required=True);P.add_argument('--samples',type=int,default=4);P.add_argument('--reuse',type=pathlib.Path);args=P.parse_args()
+P=argparse.ArgumentParser();P.add_argument('--app',type=pathlib.Path,required=True);P.add_argument('--samples',type=int,default=4);P.add_argument('--reuse',type=pathlib.Path);P.add_argument('--baseline',choices=['source','current-cold','current-warm'],default='source');args=P.parse_args()
 HERE=pathlib.Path(__file__).resolve().parent
 OUT=args.reuse or pathlib.Path(tempfile.mkdtemp(prefix='application-aot-',dir=pathlib.Path.home()/'tmp'))
 SOURCE=OUT/'source';SOURCE.mkdir(exist_ok=True);neutral=OUT/'neutral';neutral.mkdir(exist_ok=True)
@@ -19,7 +19,8 @@ def run(mode,number):
  mark=OUT/f'{mode}-{number}.mark';mark.unlink(missing_ok=True);env=os.environ.copy();env.pop('BL_USE',None)
  (neutral/'env.bl').write_text('{:bl \"build:24db70e9\" :env {\"BL_DAEMON\" \"off\"} :paths '+ ('['+json.dumps(str(SOURCE))+']' if mode!='artifact' else '[]')+'}\n')
  env.update(TMPDIR=str(OUT),FOLLOWUP_MODE=mode,FOLLOWUP_ROOT=str(OUT),FOLLOWUP_VALUE=f'target-{number}',FOLLOWUP_MARK=str(mark),BEAM_LISP_AOT_STRICT='1' if mode=='artifact' else '0',BEAM_LISP_AOT_REPAIR='off' if mode=='source' else 'on')
- logfile=OUT/f'{mode}-{number}.log';started=time.monotonic()
+ if mode=='current-cold':env['BEAM_LISP_AOT_CACHE_DIR']=tempfile.mkdtemp(prefix='cold-artifacts-',dir=OUT)
+ logfile=OUT/f'{args.baseline}-{mode}-{number}.log';started=time.monotonic()
  with logfile.open('w') as log:
   proc=subprocess.Popen(['bl','run',str(HERE/'application-aot.bl')],cwd=neutral,env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True,preexec_fn=limit)
   try:code=proc.wait(timeout=600)
@@ -46,13 +47,13 @@ try:
   return declared==actual
  assert validate();beam=next(package.rglob('*.beam'));raw=beam.read_bytes();beam.write_bytes(raw+b'tamper');assert not validate();beam.write_bytes(raw);assert validate()
  samples=[]
- for i,mode in enumerate((['source','artifact','artifact','source']*((args.samples+1)//2))[:args.samples*2]):
+ for i,mode in enumerate(([args.baseline,'artifact','artifact',args.baseline]*((args.samples+1)//2))[:args.samples*2]):
   assert validate();sample=run(mode,i+1);samples.append(sample);print(mode,sample['records'][0],flush=True)
  med={}
- for mode in ['source','artifact']:
+ for mode in [args.baseline,'artifact']:
   ss=[s for s in samples if s['mode']==mode]
   med[mode]={'load_us':statistics.median(s['records'][0]['us'] for s in ss),'reductions':statistics.median(s['records'][0]['reductions'] for s in ss),'process_seconds':statistics.median(s['process_seconds'] for s in ss)}
  result={'status':'passed','sdk':'24db70e9','app_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=args.app,text=True).strip(),'scope':'16 real Knowledger date/i18n libraries plus two generated fixture namespaces, not full app/server startup','build':build,'samples':samples,'medians':med,'package_beams':len(manifest),'package_bytes':sum(p.stat().st_size for p in package.rglob('*') if p.is_file()),'checks':['relocated package','source-free strict artifact load','target-environment value','initializer once after repeated require','byte tamper rejected before launch','unchanged build compiles zero'],'cache':'fresh VM, existing SDK cache; source control explicitly disables AOT repair (compilation baseline), artifact is source-free; shared filesystem cache may warm'}
- (OUT/'results.json').write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result['medians']),flush=True)
+ (OUT/f'results-{args.baseline}.json').write_text(json.dumps(result,indent=2)+'\n');print(json.dumps(result['medians']),flush=True)
 except BaseException as exc:
  (OUT/'failure.json').write_text(json.dumps({'status':'failed','error':repr(exc)},indent=2)+'\n');raise
