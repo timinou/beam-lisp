@@ -1727,27 +1727,67 @@
           (fn [v acc] (package_support_captures v acc index (erlang/+ depth 1))))
       :else next)))
 
+(defn- package_support_exact_candidates [ns name seen]
+  (when (erlang/> (erlang/length seen) 64)
+    (erlang/error :package_support_resolution_bound))
+  (if (lists/member ns seen) {:pairs (list) :declarations (list) :names (list)}
+    (let [declaration (BeamLisp.Env/lookup (tuple :refer ns name))
+          source (if (erlang/== :error declaration) nil (elem declaration 1))
+          tail (if source (package_support_exact_candidates source name (erlang/++ (list ns) seen))
+                 {:pairs (list) :declarations (list) :names (list)})]
+      {:pairs (erlang/++ (list (tuple ns name)) (:pairs tail))
+       :declarations (erlang/++ (list (tuple ns name declaration)) (:declarations tail))
+       :names (erlang/++ (list ns) (:names tail))})))
+
+(defn- package_support_candidate_value [pairs]
+  ;; Match fetch's env-first candidate precedence without materializing a
+  ;; per-env descriptor or demand-loading an undeclared compiler dependency.
+  (Enum/find_value (BeamLisp.Env/chain) :error
+    (fn [env]
+      (Enum/find_value pairs nil
+        (fn [pair]
+          (let [row (ets/lookup :beam_lisp_vars (BeamLisp.Env/pfx env pair))]
+            (when (erlang/not (erlang/== (list) row))
+              (tuple :ok (elem (erlang/hd row) 1)))))))))
+
+(defn- package_support_resolution [ns name exact?]
+  (if exact?
+    (let [result (package_support_exact_candidates ns name (list))]
+      (assoc result :found (package_support_candidate_value (:pairs result))))
+    (let [parts (String/split name "/" (list (tuple :parts 2)))
+          prefix (erlang/hd parts)
+          alias (BeamLisp.Env/lookup (tuple :alias ns prefix))
+          refer (BeamLisp.Env/lookup (tuple :refer ns name))
+          names (if (and (erlang/== 2 (erlang/length parts)) (erlang/=/= "" prefix))
+                  (list (if (erlang/== :error alias) prefix (elem alias 1)))
+                  (erlang/++ (list ns "core" "sugar")
+                    (if (erlang/== :error refer) (list) (list (elem refer 1)))))]
+      {:found (BeamLisp.Env/peek ns name)
+       :names (erlang/++ (list ns) names)
+       :declarations (list alias refer)})))
+
 (defn- package_support_global [node state index]
   (let [ns (maps/get :ns node) name (maps/get :name node)
         exact? (erlang/== :exact (maps/get :lookup node nil))
         key (tuple ns name exact?)]
     (if (maps/is_key key (:fetches state)) state
-      (let [parts (String/split name "/" (list (tuple :parts 2)))
-            prefix (erlang/hd parts)
-            ;; These declarations determine precisely this compiled fetch.
-            ;; Missing declarations are evidence too: a new refer must change
-            ;; the stamp even when the fetched value happens to be equal.
-            declarations (if exact? (list)
-              (list (BeamLisp.Env/lookup (tuple :alias ns prefix))
-                    (BeamLisp.Env/lookup (tuple :refer ns name))))
-            found (if exact? (BeamLisp.Env/lookup (tuple ns name))
-                    (BeamLisp.Env/peek ns name))]
+      (let [resolution (package_support_resolution ns name exact?)
+            declarations (:declarations resolution)
+            found (:found resolution)
+            names (Enum/reduce (:names resolution) (:names state)
+                    (fn [candidate acc]
+                      (when (erlang/not (and (erlang/is_binary candidate)
+                                            (erlang/=< (erlang/byte_size candidate) 512)))
+                        (erlang/error :unsupported_package_support_namespace))
+                      (when (erlang/>= (erlang/map_size acc) 128)
+                        (erlang/error :package_support_namespace_bound))
+                      (maps/put candidate true acc)))]
         (when (erlang/== :error found)
           (erlang/error (tuple :missing_package_support_value ns name)))
         (when (erlang/>= (erlang/map_size (:fetches state)) 8192)
           (erlang/error :package_support_fetch_bound))
         (let [evidence (portable_package_terms (list declarations found) 0 (:values state) true)
-              next (assoc state :values (elem evidence 1)
+              next (assoc state :values (elem evidence 1) :names names
                          :fetches (maps/put key (elem evidence 0) (:fetches state)))]
           (package_support_captures (elem found 1) next index 0))))))
 
@@ -1792,7 +1832,8 @@
 
 (defn- package_support_projection [stages names budget]
   (let [index (package_support_index names)
-        initial {:todo (list) :seen {} :fetches {} :code {} :nodes 1000000 :values budget}
+        initial {:todo (list) :seen {} :fetches {} :code {} :nodes 1000000 :values budget
+                 :names (Map/new names (fn [ns] (tuple ns true)))}
         seeded (Enum/reduce stages initial
                  (fn [ns state]
                    (Enum/reduce (maps/keys (BeamLisp.Env/ns_defs ns)) state
@@ -1800,9 +1841,74 @@
         result (package_support_drain seeded index)]
     (tuple (tuple :compiler_support
                    (Enum/sort (maps/to_list (:fetches result)))
-                   (Enum/sort (maps/to_list (:code result)))) (:values result))))
+                   (Enum/sort (maps/to_list (:code result)))) (:values result)
+           (Enum/sort (maps/keys (:names result))))))
+
+(defn- package_authority_add_fingerprint [row acc]
+  (let [module (elem row 0) md5 (elem row 1) old (maps/get module acc nil)]
+    (when (and old (erlang/=/= old md5))
+      (erlang/error :incoherent_package_compiler_code))
+    (when (erlang/>= (erlang/map_size acc) 256)
+      (erlang/error :package_compiler_module_bound))
+    (maps/put module md5 acc)))
+
+(defn- package_authority_capture_fingerprints [node acc]
+  ;; Input is already normalized and bounded. Callable tags are generated by
+  ;; the normalizer; literal tuples have a distinct :tuple wrapper.
+  (cond
+    (erlang/is_tuple node)
+      (if (and (erlang/> (erlang/tuple_size node) 1)
+               (or (erlang/== :external_function (elem node 0))
+                   (erlang/== :rt_operator_closure (elem node 0))))
+        (Enum/reduce (erlang/tuple_to_list node)
+          (package_authority_add_fingerprint (elem node 1) acc)
+          (fn [v out] (package_authority_capture_fingerprints v out)))
+        (Enum/reduce (erlang/tuple_to_list node) acc
+          (fn [v out] (package_authority_capture_fingerprints v out))))
+    (erlang/is_list node)
+      (Enum/reduce node acc (fn [v out] (package_authority_capture_fingerprints v out)))
+    :else acc))
+
+(defn- package_authority_fingerprints [code bindings operators support]
+  (let [base (Enum/reduce code {} (fn [row out] (package_authority_add_fingerprint row out)))
+        body (Enum/reduce (elem (elem support 0) 2) base
+               (fn [row out] (package_authority_add_fingerprint (elem row 1) out)))
+        all (package_authority_capture_fingerprints
+              (tuple (elem bindings 0) (elem operators 0) (elem support 0)) body)]
+    (Enum/sort (maps/to_list all))))
+
+(defn- package_authority_memo_valid? [memo]
+  (and (erlang/== (:env memo) (BeamLisp.Env/env_id))
+       (let [before (BeamLisp.Env/namespace_generations (:names memo))
+             first-code (Enum/map (:fingerprints memo)
+                          (fn [row] (package_module_identity (elem row 0))))
+             after (BeamLisp.Env/namespace_generations (:names memo))
+             last-code (Enum/map (:fingerprints memo)
+                         (fn [row] (package_module_identity (elem row 0))))]
+         (and before (erlang/== before (:generations memo))
+              (erlang/== before after)
+              (erlang/== first-code (:fingerprints memo))
+              (erlang/== first-code last-code)))))
 
 (defn local_package_authority
+  "Portable compiler certificate with one bounded last-entry process memo.
+   Hits bind exact closed namespace/lifetime and actual executable evidence;
+   unrelated application initialization does not traverse compiler metadata."
+  []
+  (let [key (tuple (elem (erlang/fun_info (fn [] nil) :module) 1) :package_authority_memo)]
+    (try
+      (let [memo (Process/get key nil)
+            hit (when memo
+                  (BeamLisp.Env/with_module_locks
+                    (Enum/map (:fingerprints memo) (fn [row] (elem row 0)))
+                    (fn [] (when (package_authority_memo_valid? memo) (:authority memo)))))]
+        (if hit hit
+          (do (Process/delete key)
+            (let [fresh (uncached_package_authority)]
+              (when fresh (Process/put key fresh) (:authority fresh))))))
+      (catch _ (Process/delete key) nil))))
+
+(defn- uncached_package_authority
   "Portable closed compiler authority for realm release artifacts. Bind actual
    callable/value definitions and installed code, not generation counters or
    mutable Core shim exports. Unsupported live overrides decline."
@@ -1836,9 +1942,21 @@
               support (package_support_projection stages names (elem normalized_ops 1))]
           (when (and (erlang/== epoch (BeamLisp.Env/publication_epoch))
                      (erlang/== before (BeamLisp.Env/namespace_generations names)))
-            (Base/encode16 (crypto/hash :sha256 (erlang/term_to_binary
-                             (tuple :realm_package_compiler_v3 code (elem bindings 0) (elem normalized_ops 0) (elem support 0))))
-               (list (tuple :case :lower)))))))
+            (let [authority (Base/encode16 (crypto/hash :sha256 (erlang/term_to_binary
+                                (tuple :realm_package_compiler_v3 code (elem bindings 0) (elem normalized_ops 0) (elem support 0))))
+                              (list (tuple :case :lower)))
+                  fingerprints (package_authority_fingerprints code bindings normalized_ops support)
+                  closed-names (elem support 2)
+                  generations (BeamLisp.Env/namespace_generations closed-names)
+                  memo {:env (BeamLisp.Env/env_id) :names closed-names :generations generations
+                        :fingerprints fingerprints :authority authority}]
+              ;; Metadata traversal takes namespace locks, so it stays outside
+              ;; physical fences. Under fences only reread finite evidence.
+              (BeamLisp.Env/with_module_locks (Enum/map fingerprints (fn [row] (elem row 0)))
+                (fn []
+                  (when (and generations (erlang/== epoch (BeamLisp.Env/publication_epoch))
+                             (package_authority_memo_valid? memo))
+                    memo))))))))
     (catch _ nil)))
 
 (defn- load_package_local
