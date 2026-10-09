@@ -41,3 +41,19 @@ users of the library running inside the worker.
 The runtime's `interop.mjs` also exports `releaseNamespace(name)` for ephemeral
 live evaluation. It removes that namespace's vars, aliases, metadata, links and
 public JS interface while invalidating namespace lookup caches.
+
+`js.frame` schedules browser work against animation callbacks with a one-period
+timer fallback. Both clocks are cancelled when either fires. The opaque
+AbortController handle works across the native BL/JS boundary:
+
+```clojure
+(ns ^:js app.graphics (:require [js.frame :as frame]))
+(defn draw-later [draw] (frame/request draw))
+; (frame/cancel handle) cancels both callbacks.
+```
+
+Use this inside a rendering worker when its document can block animation
+callbacks. Each request fires at most once and owns two bounded clock callbacks.
+The callback receives a monotonic performance timestamp. Browser timers and
+compositors still depend on available CPU/GPU service; deadline measurements
+belong alongside CPU submission cost and display cadence.
