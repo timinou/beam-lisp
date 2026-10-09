@@ -3,6 +3,8 @@
 import argparse,json,math,pathlib,re,statistics
 p=argparse.ArgumentParser();p.add_argument('log',type=pathlib.Path);args=p.parse_args()
 lines=args.log.read_text().splitlines();out={}
+meta=[json.loads(x.removeprefix('RUNTIME_META ')) for x in lines if x.startswith('RUNTIME_META ')]
+if meta:out['runtime']=meta[-1]
 raw=[json.loads(x.removeprefix('RUNTIME_JSON ')) for x in lines if x.startswith('RUNTIME_JSON ')]
 for size in (128,2048):
  data=[r['data'] for r in raw if r['area']=='metadata' and r['data']['inherited']==size]
