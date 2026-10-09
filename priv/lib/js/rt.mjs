@@ -689,7 +689,7 @@ export function add(a, b) {
   if (typeof a === "number" && typeof b === "number") { const r = a + b; if (r <= MAX && r >= MIN) return r; return norm(BigInt(a) + BigInt(b)); }
   if (isDec(a) || isDec(b)) return decArith("+", a, b);
   needNum("+", a, b);
-  if (a instanceof Flt || b instanceof Flt) return new Flt(numOf(a) + Number(numOf(b)));
+  if (a instanceof Flt || b instanceof Flt) return new Flt(Number(numOf(a)) + Number(numOf(b)));
   return norm(BigInt(a) + BigInt(b));
 }
 export function sub(a, b) {
@@ -730,7 +730,7 @@ export function gt(a, b) { if (typeof a === "number" && typeof b === "number") r
 export function le(a, b) { if (typeof a === "number" && typeof b === "number") return a <= b; if (isDec(a) || isDec(b)) return decCmp(a, b) <= 0; needNum("<=", a, b); return numOf(a) <= numOf(b); }
 export function ge(a, b) { if (typeof a === "number" && typeof b === "number") return a >= b; if (isDec(a) || isDec(b)) return decCmp(a, b) >= 0; needNum(">=", a, b); return numOf(a) >= numOf(b); }
 /** `==`: numeric equality across int/float (BEAM `==`). */
-export function numEq(a, b) { needNum("==", a, b); return Number(numOf(a)) === Number(numOf(b)) || a == b; } // eslint-disable-line eqeqeq
+export function numEq(a, b) { needNum("==", a, b); return numOf(a) == numOf(b); } // eslint-disable-line eqeqeq
 export function isInt(x) { return typeof x === "number" || typeof x === "bigint"; }
 export function isFloat(x) { return x instanceof Flt; }
 export function isNumber(x) { return isInt(x) || x instanceof Flt; }
@@ -823,7 +823,7 @@ export function erlEq(a, b) {
     if (typeof a === "number" && typeof b === "number") return a === b;
     if (!isNumber(a) || !isNumber(b)) return false;
   }
-  if (isNumber(a) && isNumber(b)) return (typeof a === "bigint" || typeof b === "bigint") && !(a instanceof Flt) && !(b instanceof Flt) ? BigInt(a) === BigInt(b) : Number(numv(a)) === Number(numv(b));
+  if (isNumber(a) && isNumber(b)) return numv(a) == numv(b); // eslint-disable-line eqeqeq
   if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
   if (a instanceof Tup) return b instanceof Tup && a.items.length === b.items.length && a.items.every((x, i) => erlEq(x, b.items[i]));
   if (a instanceof Cons || a === EMPTY) {

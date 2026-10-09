@@ -5,7 +5,7 @@ import * as J from './native.mjs';
 test('native values retain identity, floats and undefined',()=>{
  const value={x:[1.25,undefined]};
  assert.equal(J.argument(value),value);assert.equal(J.result(value),value);
- assert.equal(J.result(1.25),1.25);assert.equal(J.result(undefined),undefined);
+ assert.equal(J.result(1.25).v,1.25);assert.equal(J.result(undefined),undefined);
  const fn=x=>x;assert.equal(J.argument(fn),fn);assert.equal(J.result(fn),fn);
 });
 test('BL values require explicit conversion and actor callbacks fail clearly',()=>{

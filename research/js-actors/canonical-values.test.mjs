@@ -35,3 +35,31 @@ test('canonical equality keeps exact numbers and improper-list tails',()=>{
  assert.equal(H.eq(H.cons(1,2),H.cons(1,2)),true);
  assert.equal(H.mapGet(H.bmap([[H.cons(1,2),'tail']]),H.cons(1,3)),null);
 });
+
+test('actor numeric operations retain canonical float and decimal identity',()=>{
+ const x=H.arith('div',8,2);
+ assert.ok(x instanceof R.Flt);assert.equal(x.v,4);
+ assert.equal(H.isFloat(x),true);assert.equal(H.isInt(x),false);
+ assert.equal(H.eq(x,4),true);assert.equal(H.identical(x,4),false);
+ assert.equal(H.mapGet(H.bmap([[x,'float'],[4,'int']]),R.flt(4)),'float');
+ assert.equal(H.mapGet(H.bmap([[x,'float'],[4,'int']]),4),'int');
+ assert.equal(H.arith('add',9007199254740993n,R.flt(.25)).v,9007199254740992);
+ assert.equal(H.arith('add',R.dec(15,1),1).plain(),'2.5');
+ assert.throws(()=>H.arith('add',R.dec(15,1),R.flt(.25)),/float cannot enter decimal/);
+});
+
+test('all canonical numeric equality leaves agree with BEAM beyond the safe band',()=>{
+ const a=9007199254740993n,b=R.flt(9007199254740992);
+ assert.equal(R.eqv(a,b),false);assert.equal(R.erlEq(a,b),false);assert.equal(R.numEq(a,b),false);
+ assert.equal(H.erlangRef('==')(a,b),false);
+ assert.equal(H.erlangRef('=:=')(R.flt(4),4),false);
+ assert.equal(H.erlangRef('==')(R.flt(4),4),true);
+});
+
+test('host table key identity never mutates foreign or frozen objects',()=>{
+ for(const value of [Object.freeze({x:1}),Object.freeze(()=>1)]){
+  const before=Reflect.ownKeys(value),key=H.hashKey(value);
+  assert.equal(H.hashKey(value),key);assert.deepEqual(Reflect.ownKeys(value),before);
+  assert.notEqual(H.hashKey(Object.freeze({x:1})),key);
+ }
+});

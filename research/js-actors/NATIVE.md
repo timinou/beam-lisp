@@ -108,7 +108,17 @@ the host at `pkg/pelagic/actor/host.mjs` binds `../../../out/rt.mjs`.
 The source-tree host uses the source-tree canonical runtime; the research HTTP
 server explicitly serves its two runtime dependencies.
 
-This migration does not yet unify callable dispatch, numeric float boxing,
-compiled core/prelude ownership, or the two lowering entrypoints. Those remain
+Canonical arithmetic and literal lowering now also preserve float identity and
+exact decimals. This migration does not yet unify callable dispatch, compiled
+core/prelude ownership, or the two lowering entrypoints. Those remain
 tracked consolidation work. Native JS objects retain identity and native JS
 numbers remain native at the explicit interop boundary.
+
+
+The actor compiler delegates literals to `js.emit/lit-js`, arithmetic to the
+canonical runtime, and reference traversal/namespace rewriting to `system.ir`.
+Literal data and annotations are opaque: a quoted map containing `:op :global`
+is data, not a dependency. `system.suspension` provides a conservative,
+annotation-independent fixed point for the next checked callback integration;
+synchronous is separate from pure, and creating a closure is separate from
+executing its body. Unknown callees fail closed.

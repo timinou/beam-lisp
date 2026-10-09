@@ -17,7 +17,7 @@
 ;   * any `:remote` outside the checked ABI allowlist (`host/…`, `erlang/…`,
 ;     and a closed map of core names onto the BL prelude).
 ;   * any `:global` that neither the sources define nor the prelude provides.
-;   * unsupported literal values (a literal tuple/list in value position).
+;   * literals outside the canonical JS value contract.
 ;
 ; The allowlist is deliberately a static table rather than a discovery
 ; mechanism: a closed set that says NO to everything else is the only version
@@ -164,25 +164,8 @@
     (str "t" n)))
 
 (defn lit-js [v]
-  (cond
-    (= v nil) "null"
-    (= v true) "true"
-    (= v false) "false"
-    (erlang/is_integer v)
-      ; a safe integer is a JS Number; a larger one is a BigInt (the host's
-      ; exact integer; host.mjs normalizes every result back to a Number when
-      ; it fits). The numeric gate's `num-fold` refuses any unsafe literal, so
-      ; no raw-Number fast path can ever see one: it stays on checked H.arith.
-      (if (and (>= v -9007199254740991) (<= v 9007199254740991))
-        (str v)
-        (str "(" v "n)"))
-    (erlang/is_float v) (str v)
-    (erlang/is_binary v) (js-str v)
-    (erlang/is_atom v) (str "H.kw(" (js-str (str v)) ")")
-    :else (throw (ex-info (str "js-actors: unsupported literal " (pr-str v)
-                               " — the JS backend carries numbers, strings, keywords,"
-                               " booleans and nil only")
-                          {:value v}))))
+  (sync/lit-js v {:runtime "H.values"
+                  :keyword (fn [k] (str "H.kw(" (js-str (str k)) ")"))}))
 
 (def mod-rt (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Rt"))
 (def mod-core (erlang/binary_to_atom "Elixir.BeamLisp.Ns.Core"))
@@ -734,12 +717,12 @@
   (when (:guard ctx) (throw (ex-info "js-actors: native JS is not a guard operation" {})))
   (let [r (sync/emit-native node
             (assoc ctx :dest nil :native-tmp fresh-tmp
-              ; This profile already represents native numbers/functions raw.
-              :native-result (fn [v] v)
+              ; Numeric boxes cross through the canonical native boundary.
+              :native-result (fn [v] (str "J.result(" v ")"))
               :native-argument (fn [v n]
                                  (let [tags (native/value-tags n {})]
                                    (if (and (not (and (= :js (:op n)) (= :new (:kind n))))
-                                            (every? (fn [t] (contains? #{:number :string :bool :nil :js-object} t)) tags))
+                                            (every? (fn [t] (contains? #{:string :bool :nil :js-object} t)) tags))
                                      v (str "J.argument(" v ")"))))
               :native-args (fn [nodes ctx]
                              (let [r (emit-args-temps nodes ctx)]
@@ -763,7 +746,7 @@
       (if (and (= f :invoke) (native-link (first args)))
         (let [link (native-link (first args))
               nodes (ir/cons-args (second args))]
-          (when-not (contains? (:arities link) (count nodes))
+          (when-not (ir/accepts-arity? link (count nodes))
             (throw (ex-info "js-actors: wrong native import arity" {:node node})))
           (native-call (native-name (str (:ns (first args)) "/" (:name (first args)))) nodes ctx))
       (let [fr (emit (first args) (assoc ctx :tail false))
@@ -1307,23 +1290,13 @@
 ; Reference audit — the fail-closed half of the ABI
 ; ─────────────────────────────────────────────────────────────────────────────
 
-(defn walk-refs [x acc]
-  (cond
-    (erlang/is_map x)
-      (let [acc2 (cond
-                   (not (contains? x :op)) acc
-                   (= (:op x) :remote) (conj acc [:remote (:mod x) (:fun x)])
-                   (= (:op x) :global) (conj acc [:global (:ns x) (:name x)])
-                   :else acc)]
-        ; `maps/get`, never BL `get`: a BL vector IS an Erlang map (a struct
-        ; whose `:items` is a tuple), and BL `get` on a vector indexes by
-        ; position, so `(get v :items)` is nil. With `get`, every reference
-        ; written inside a vector literal — `[:a (anything x)]` — escaped the
-        ; audit.
-        (reduce (fn [a k] (walk-refs (maps/get k x) a)) acc2 (maps/keys x)))
-    (erlang/is_list x) (reduce (fn [a y] (walk-refs y a)) acc x)
-    (erlang/is_tuple x) (reduce (fn [a y] (walk-refs y a)) acc (erlang/tuple_to_list x))
-    :else acc))
+(defn walk-refs [node acc]
+  (if (not (ir/node? node)) acc
+    (let [own (cond
+                (= :remote (:op node)) (conj acc [:remote (:mod node) (:fun node)])
+                (= :global (:op node)) (conj acc [:global (:ns node) (:name node)])
+                :else acc)]
+      (reduce (fn [refs child] (walk-refs child refs)) own (ir/child-nodes node)))))
 
 (defn refs-of [nodes]
   (reduce (fn [acc n] (walk-refs n acc)) [] nodes))
@@ -1818,9 +1791,7 @@
   (when (and (= :remote (:op node)) (= mod-rt (:mod node)) (= :invoke (:fun node)))
     (when-let [link (native-link (first (:args node)))]
       (let [args (second (:args node))]
-        (when (or (ir/cons-tail args) (not (or (contains? (:arities link) (count (ir/cons-args args)))
-                                           (and (some? (:variadic-min link))
-                                                (>= (count (ir/cons-args args)) (:variadic-min link))))))
+        (when (or (ir/cons-tail args) (not (ir/accepts-arity? link (count (ir/cons-args args)))))
           (throw (ex-info "js-actors: wrong native import arity" {:node node})))
         true))))
 
@@ -1835,14 +1806,10 @@
             ; Only the namespace declaration, never application initialization.
             (BeamLisp.Compiler/eval_string (second (first texts)) (BeamLisp.Compiler/new_env "user") path))
         env (BeamLisp.Ns.Compiler/new_env source-ns)
-        normalize (fn normalize [v]
-                    (cond
-                      (erlang/is_map v) (reduce (fn [m k]
-                                                 (assoc m k (if (and (= k :ns) (= :global (:op v)) (= source-ns (:ns v))) ns
-                                                              (normalize (maps/get k v))))) {} (maps/keys v))
-                      (erlang/is_list v) (to-list (map normalize v))
-                      (erlang/is_tuple v) (erlang/list_to_tuple (to-list (map normalize (erlang/tuple_to_list v))))
-                      :else v))
+        normalize (fn [node]
+                    (ir/rewrite (fn [n]
+                                  (if (and (= :global (:op n)) (= source-ns (:ns n)))
+                                    (assoc n :ns ns) n)) node))
         defs (reduce (fn [acc [form text]] (into acc (compile-top-form form source-ns path))) [] texts)]
     (vec (map (fn [d]
                 (let [node (:node d) refs (refs-of [node])]

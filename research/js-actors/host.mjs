@@ -31,6 +31,9 @@
 // One value implementation for both direct calls and actor frames. The actor
 // machine owns control; it does not own a competing scalar/list/tuple model.
 import * as V from '../../priv/lib/js/rt.mjs';
+export {V as values};
+export const Flt=V.Flt, Dec=V.Dec, flt=V.flt, dec=V.dec;
+export const numberValue=V.toNumber;
 export const KW=V.Kw,kw=V.kw;
 export function isKw(x) { return x instanceof KW; }
 export function kwName(x) { return x.fq; }
@@ -238,12 +241,12 @@ export function tableSnapshot(rt, h) {
 
 export function isNil(x) { return x === null || x === undefined; }
 export function isInt(x) { return typeof x === "bigint" || (typeof x === "number" && Number.isInteger(x)); }
-export function isFloat(x) { return typeof x === "number" && !Number.isInteger(x); }
-export function isNum(x) { return typeof x === "number" || typeof x === "bigint"; }
+export function isFloat(x) { return x instanceof Flt || (typeof x === "number" && !Number.isInteger(x)); }
+export function isNum(x) { return typeof x === "number" || typeof x === "bigint" || x instanceof Flt || x instanceof Dec; }
 export function isStr(x) { return typeof x === "string"; }
 export function isBool(x) { return x === true || x === false; }
 export function isFn(x) { return !!x && x.__blfn === true; }
-export function identical(a, b) { return a === b; }
+export const identical = V.keyEq;
 export function truthy(x) { return x !== null && x !== undefined && x !== false; }
 
 /** Canonical structural key. Equality for every data value is this compare;
@@ -278,7 +281,8 @@ export function keyOrder(a, b) {
     case 0: {                                     // number: ints before floats
       const ai = isInt(a), bi = isInt(b);
       if (ai !== bi) return ai ? -1 : 1;
-      return a < b ? -1 : a > b ? 1 : 0;
+      const av = a instanceof Flt ? a.v : a, bv = b instanceof Flt ? b.v : b;
+      return av < bv ? -1 : av > bv ? 1 : 0;
     }
     case 1: {                                     // atom
       const fa = atomRank(a), fb = atomRank(b);
@@ -294,7 +298,7 @@ export function keyOrder(a, b) {
   }
 }
 function keyRank(x) {
-  if (typeof x === "number" || typeof x === "bigint") return 0;
+  if (isNum(x)) return 0;
   if (isKw(x) || x === null || x === true || x === false) return 1;
   if (x instanceof T) return 2;
   if (x instanceof BMap || x instanceof BSet || isVec(x) || isStruct(x)) return 3;
@@ -344,6 +348,8 @@ export function hashKey(x) {
   if (x === null || x === undefined) return "nil";
   if (x === true) return "b:1";
   if (x === false) return "b:0";
+  if (x instanceof Flt) return "f:" + x.v;
+  if (x instanceof Dec) return "d:" + x.u + ":" + x.s;
   const t = typeof x;
   if (t === "number") return "n:" + (Object.is(x, -0) ? 0 : x);
   // A BigInt is an exact integer beyond the safe range. Its canonical form is
@@ -362,10 +368,16 @@ export function hashKey(x) {
     return enc("m", entries.flat());
   }
   if (x instanceof BSet) return enc("s", [...x].map(hashKey).sort());
-  if (typeof x === "function" || x.__blfn) return "f:" + (x.__id ||= ++idCounter);
-  return "o:" + (x.__id ||= ++idCounter);
+  if (typeof x === "function" || x.__blfn) return "f:" + opaqueId(x);
+  return "o:" + opaqueId(x);
 }
+const opaqueIds = new WeakMap();
 let idCounter = 0;
+function opaqueId(value) {
+  let id = opaqueIds.get(value);
+  if (id === undefined) { id = ++idCounter; opaqueIds.set(value,id); }
+  return id;
+}
 // Runtime identities are ALLOCATED, never read from a clock: two runtimes in the
 // same process get disjoint ids even if they are created in the same instant,
 // so `[:pid runtime serial]` can never name a process in another runtime. Thin
@@ -390,12 +402,13 @@ function strCmp(a, b) {
 }
 
 export function lt(a, b) {
-  if (isNum(a) && isNum(b)) return a < b;
+  if (isNum(a) && isNum(b)) return V.lt(canonicalNumber(a),canonicalNumber(b));
   if (typeof a === "string" && typeof b === "string") return strCmp(a, b) < 0;
   throw new Error("`<` needs two numbers or two strings, got " + describe(a) + " and " + describe(b));
 }
 
 export function describe(x) {
+  if (x instanceof Flt || x instanceof Dec) return V.printStr(x);
   if (x === null || x === undefined) return "nil";
   if (x instanceof KW) return ":" + kwName(x);
   if (x instanceof Cons || x === ENIL) { try { return "(" + listToArray(x).map(describe).join(" ") + ")"; } catch (_) { return "(improper list)"; } }
@@ -422,71 +435,24 @@ export function toStr(x) {
   if (x === true) return "true";
   if (x === false) return "false";
   if (x instanceof KW) return kwName(x);
-  if (typeof x === "number" || typeof x === "bigint") return String(x);
+  if (isNum(x)) return x instanceof Flt ? String(x.v) : x instanceof Dec ? x.plain() : String(x);
   return describe(x);
 }
 
 // ── arithmetic ───────────────────────────────────────────────────────────────
 
-// Integers are EXACT across the whole range: a value that fits the safe range
-// is a JS Number, anything larger is a BigInt, and a result that fits back is
-// normalized to a Number — ONE canonical form, so equality and hashing agree
-// (`hashKey`). A float operand makes the operation IEEE-754 double arithmetic
-// (the receive deadline clock is a float, so this path is load-bearing) and a
-// BigInt is converted to a Number at that boundary, as BEAM's float contagion
-// does. `quot`/`rem`/`mod` are integer-only, as on BEAM.
-function exactBig(x) { return typeof x === "bigint" ? x : BigInt(x); }
-function normInt(x) {
-  return (x >= -9007199254740991n && x <= 9007199254740991n) ? Number(x) : x;
-}
-function isExactInt(x) {
-  return typeof x === "bigint" || (typeof x === "number" && Number.isSafeInteger(x));
-}
-
+// Canonical BL arithmetic owns promotion, float identity and exact decimals.
+// Raw fractional JS numbers are normalized only when entering a BL numeric op.
+function canonicalNumber(x) { return typeof x === "number" && !Number.isSafeInteger(x) ? V.flt(x) : x; }
+const numericOps = {add:V.add, sub:V.sub, mul:V.mul, div:V.div, quot:V.quot, rem:V.rem, mod:V.mod};
 export function arith(op, a, b) {
-  switch (op) {
-    case "add": case "sub": case "mul": {
-      if (!isNum(a) || !isNum(b))
-        throw new Error("[" + op + "] needs two numbers, got " + describe(a) + " and " + describe(b));
-      if (isExactInt(a) && isExactInt(b)) {
-        // The hot path stays in Number arithmetic while the result is safe;
-        // only a result that leaves the safe range promotes to BigInt.
-        if (typeof a === "number" && typeof b === "number") {
-          const r = op === "add" ? a + b : op === "sub" ? a - b : a * b;
-          if (Number.isSafeInteger(r)) return r === 0 ? 0 : r;   // -0 is just 0
-        }
-        const x = exactBig(a), y = exactBig(b);
-        return normInt(op === "add" ? x + y : op === "sub" ? x - y : x * y);
-      }
-      const x = Number(a), y = Number(b);
-      return op === "add" ? x + y : op === "sub" ? x - y : x * y;
-    }
-    case "quot": case "rem": case "mod": {
-      if (!isNum(a) || !isNum(b))
-        throw new Error("[" + op + "] needs two numbers, got " + describe(a) + " and " + describe(b));
-      if (!isExactInt(a) || !isExactInt(b))
-        throw new Error("[" + op + "] needs two integers, got " + describe(a) + " and " + describe(b));
-      const x = exactBig(a), y = exactBig(b);
-      if (y === 0n)
-        throw new Error(op === "rem" ? "rem by zero" : op === "mod" ? "mod by zero" : "divide by zero");
-      if (op === "quot") return normInt(x / y);          // truncates toward zero
-      if (op === "rem") return normInt(x % y);           // sign of the dividend
-      const m = x % y;
-      return normInt(((m % y) + y) % y);                  // mod: sign of the divisor
-    }
-    case "div": {
-      if (!isNum(a) || !isNum(b))
-        throw new Error("[div] needs two numbers, got " + describe(a) + " and " + describe(b));
-      if (b === 0 || b === 0n) throw new Error("divide by zero");
-      // BEAM `/` answers a FLOAT (`(/ 8 2)` is 4.0); this target has one Number
-      // type, so the answer is the double quotient of the operands.
-      return Number(a) / Number(b);
-    }
-    case "lt": return lt(a, b);
-    case "gt": return lt(b, a);
-    case "le": return !lt(b, a);
-    case "ge": return !lt(a, b);
-    case "num_eq": return eq(a, b);
+  if (Object.hasOwn(numericOps,op)) return numericOps[op](canonicalNumber(a),canonicalNumber(b));
+  switch(op) {
+    case "lt": return lt(a,b);
+    case "gt": return lt(b,a);
+    case "le": return !lt(b,a);
+    case "ge": return !lt(a,b);
+    case "num_eq": return eq(a,b);
     default: throw new Error("unknown arithmetic op " + op);
   }
 }
@@ -958,7 +924,7 @@ export function waitForInput(rt, ms, inputEnabled = true) {
     // Timer APIs truncate fractional milliseconds. Round UP so a timed BL
     // receive cannot wake before its monotonic deadline and immediately sleep
     // again for the missing fraction (the scheduler still owns the deadline).
-    if (ms !== null) timer = setTimeout(wake, Math.ceil(Math.max(0, ms)));
+    if (ms !== null) timer = setTimeout(wake, Math.ceil(Math.max(0, numberValue(ms))));
     // Recheck only when BL has enabled ingress: no event is lost between the
     // pump and waiter registration, while pre-registration input remains queued.
     if (inputEnabled && rt.inbox.length > 0) wake();
@@ -1138,7 +1104,7 @@ export const RT_HOST = {
     rt.criticalDepth = 0;
     return new Step("park");
   },
-  "wait-until": (rt, ms, inputEnabled = false) => new Step("host-wait", { ms: ms < 0 ? 0 : ms, inputEnabled }),
+  "wait-until": (rt, ms, inputEnabled = false) => new Step("host-wait", { ms: Math.max(0, numberValue(ms)), inputEnabled }),
   "wait-input": () => new Step("host-wait", { ms: null, inputEnabled: true }),
   "input-size": (rt) => rt.inbox.length,
   "take-input": (rt) => vecFromArray(rt.inbox.splice(0)),
@@ -1225,10 +1191,10 @@ export function erlangNames() { return Object.keys(ERLANG); }
 // ── :erlang bif table (`erlang/…` in guards, and any raw bif call) ───────────
 
 export const ERLANG = {
-  "==": eq,
-  "/=": (a, b) => !eq(a, b),
-  "=:=": eq,
-  "=/=": (a, b) => !eq(a, b),
+  "==": V.erlEq,
+  "/=": (a, b) => !V.erlEq(a, b),
+  "=:=": V.keyEq,
+  "=/=": (a, b) => !V.keyEq(a, b),
   "<": lt,
   ">": (a, b) => lt(b, a),
   "=<": (a, b) => !lt(b, a),
@@ -1254,7 +1220,7 @@ export const ERLANG = {
   "is_map": isBMap,
   "tuple_size": tupSize,
   "map_size": mapSize,
-  "abs": (x) => (typeof x === "bigint" ? (x < 0n ? -x : x) : Math.abs(x)),
+  "abs": (x) => x instanceof Flt ? flt(Math.abs(x.v)) : (typeof x === "bigint" ? (x < 0n ? -x : x) : Math.abs(x)),
   "length": (l) => listToArray(l).length,
   "self": () => null,
   // ── raising, and the two halves of an exception's shape ────────────────────

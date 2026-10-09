@@ -2,13 +2,15 @@
 // transport, callback scheduler, or second value runtime at this boundary.
 import * as H from './host.mjs';
 export function argument(value) {
+  if(value instanceof H.Flt)return value.v;
+  if(value instanceof H.Dec)throw new TypeError("JS interop: decimal needs explicit conversion");
   if (H.isVec(value) || H.isBMap(value) || H.isSet(value) || H.isList(value))
     throw new TypeError('JS interop: BL collection needs #js or bl->js');
   if (H.isFn(value) || H.isTup(value))
     throw new TypeError('JS interop: actor functions cannot be synchronous JS callbacks');
   return value;
 }
-export const result = value => value;
+export const result = value => typeof value === "number" && !Number.isSafeInteger(value) ? H.flt(value) : value;
 export const propertyKey = value => {
   const key=argument(value);
   if(typeof key!=='string' && typeof key!=='number' && typeof key!=='symbol')
@@ -49,7 +51,7 @@ export function jsToBL(value,...options){
   }
   const seen=new WeakSet();
   function convert(x){
-    if(x===null||typeof x!=='object')return x;
+    if(x===null||typeof x!=='object')return result(x);
     if(seen.has(x))throw new TypeError('js->bl: cyclic value');
     seen.add(x);
     try{
