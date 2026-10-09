@@ -84,7 +84,7 @@
 (defn defn-form? [n]
   (and (= :list (n-tag n))
        (let [its (n-items n)]
-         (and (not (empty? its)) (form-sym? (first its) "defn")))))
+         (and (not (empty? its)) (or (form-sym? (first its) "defn") (form-sym? (first its) "defn-"))))))
 
 (defn defn-name [n] (n-name (second (n-items n))))
 
@@ -733,6 +733,13 @@
   (when (:guard ctx) (throw (ex-info "js-actors: native JS is not a guard operation" {})))
   (let [r (sync/emit-native node
             (assoc ctx :dest nil :native-tmp fresh-tmp
+              ; This profile already represents native numbers/functions raw.
+              :native-result (fn [v] v)
+              :native-argument (fn [v n]
+                                 (let [tags (native/value-tags n {})]
+                                   (if (and (not (and (= :js (:op n)) (= :new (:kind n))))
+                                            (every? (fn [t] (contains? #{:number :string :bool :nil :js-object} t)) tags))
+                                     v (str "J.argument(" v ")"))))
               :native-args (fn [nodes ctx]
                              (let [r (emit-args-temps nodes ctx)]
                                {:lines (:lines r) :vals (:temps r)}))))
@@ -1803,6 +1810,17 @@
                            (str (n-tag form)) " form")
                       {:path path :tag (n-tag form)}))))
 
+(defn native-import-call?
+  "The native logic module asks the target which statically linked calls use
+   its native ABI. Arity checks run before pruning, even for dead definitions."
+  [node]
+  (when (and (= :remote (:op node)) (= mod-rt (:mod node)) (= :invoke (:fun node)))
+    (when-let [link (native-link (first (:args node)))]
+      (let [args (second (:args node))]
+        (when (or (ir/cons-tail args) (not (contains? (:arities link) (count (ir/cons-args args)))))
+          (throw (ex-info "js-actors: wrong native import arity" {:node node})))
+        true))))
+
 (defn compile-source
   "Compile one source file to a vector of {:name name :node node} definitions."
   [path ns]
@@ -1829,7 +1847,7 @@
                              (some (fn [r] (and (= :global (first r))
                                                (contains? (native-links) (str (nth r 1) "/" (nth r 2))))) refs))
                     (throw (ex-info "js-actors: native imports require (ns ^:js ...)" {:path path})))
-                  (assoc d :node (let [checked (if (:js-interop env) (native/check! node) node)]
+                  (assoc d :node (let [checked (if (:js-interop env) (native/check! node {:native-call? native-import-call?}) node)]
                                    (if (= source-ns ns) checked (normalize checked)))))) defs))))
 
 (defn stamp-def-name
@@ -1895,14 +1913,14 @@
          "return null;\n"
          "}]]), null));")))
 
-(defn alias-lines []
+(defn alias-lines [defined]
   (concat
     (map (fn [k] (str "H.defAlias(rt, " (js-str k) ", "
                       (js-str (str "js/" (get remote-map k))) ");"))
-         (keys remote-map))
+         (filter (fn [k] (contains? defined (get remote-map k))) (keys remote-map)))
     (map (fn [k] (str "H.defAlias(rt, " (js-str (str "core/" k)) ", "
                       (js-str (str "js/" (get core-map k))) ");"))
-         (keys core-map))))
+         (filter (fn [k] (contains? defined (get core-map k))) (keys core-map)))))
 
 (defn compile-one [src]
   (BeamLisp.Ns.Compiler/compile (BeamLisp.Ns.Reader/read_one src)
@@ -2327,7 +2345,7 @@
                 "const rt = H.newRuntime();\n\n"
                 (emit-init defs) "\n"
                 "await H.init(rt);\n\n"
-                (apply str (map (fn [l] (str l "\n")) (alias-lines)))
+                (apply str (map (fn [l] (str l "\n")) (alias-lines defined)))
                 "\nH.def(rt, \"js/entry\", H.ref(rt, \"js\", \"main\"));\n"
                 "await H.boot(rt);\n")
         sites (num-sites)
@@ -2344,6 +2362,37 @@
     (println (str "js-actors: numeric gate — " raw " raw-Number site(s) with witness, "
                   checked " checked H.arith site(s) -> " out-dir "/numeric-gate." output ".json"))
     {:defs (count defs) :bytes (erlang/byte_size js)}))
+
+(defn prune-defs
+  "Closed ANF reference reachability. Includes function VALUES and hidden receive
+   support. A reachable host/ref can name arbitrary globals, so its opaque edge
+   retains the entire bundle. No effect inference or suspension rewrite."
+  [defs roots]
+  (let [table (into {} (map (fn [d] [(:name d) d]) defs))
+        edge (fn [r]
+               (if (= :remote (first r))
+                 (if (and (= mod-host (nth r 1)) (= :ref (nth r 2))) :dynamic-registry
+                   (get remote-map (remote-key (nth r 1) (nth r 2))))
+                 (when (= :global (first r))
+                   (let [ns (nth r 1) name (nth r 2)]
+                     (cond (contains? (native-links) (str ns "/" name)) nil
+                           (and (= ns "js") (contains? table name)) name
+                           (contains? core-map name) (get core-map name)
+                           :else nil)))))
+        edges (into {} (map (fn [d]
+                              [(:name d)
+                               (set (concat (keep edge (refs-of [(:node d)]))
+                                      (when (some (fn walk [n] (or (= :recv (:op n)) (some walk (ir/child-nodes n)))) [(:node d)])
+                                        ["rt-receive"])))]) defs))]
+    (loop [todo (vec roots) seen #{}]
+      (if (empty? todo)
+        (vec (filter (fn [d] (contains? seen (:name d))) defs))
+        (let [name (first todo)]
+          (cond (= name :dynamic-registry) defs
+                (contains? seen name) (recur (vec (rest todo)) seen)
+                :else (do (when-not (contains? table name)
+                  (throw (ex-info "js-actors: missing pruning root/dependency" {:name name})))
+                (recur (into (vec (rest todo)) (get edges name #{})) (conj seen name)))))))))
 
 (defn build-one
   "Compile one bundle from the shared runtime, any EXTRA sources, then the
@@ -2371,8 +2420,12 @@
                                [(str dir "/" app)]))
          ; one bundle = one compilation unit: ANF local names start over
          _ (BeamLisp.Ns.Compiler/reset-fresh!)
-         defs (reduce (fn [acc p] (concat acc (compile-source p "js"))) [] sources)]
-     (write-bundle! dir output sources defs))
+         defs (reduce (fn [acc p] (concat acc (compile-source p "js"))) [] sources)
+         ; Audit the WHOLE source before pruning, including unreachable code.
+         _ (audit! (refs-of (map :node defs)) (into {} (map (fn [d] [(:name d) true]) defs)))
+         retained (if (:prune opts) (prune-defs defs (into ["main" "bl-main"] (or (:roots opts) []))) defs)]
+     (when (:prune opts) (println (str "js-actors: retained " (count retained) "/" (count defs) " definitions")))
+     (write-bundle! dir output sources retained))
        (finally (erlang/put :js-actors-native-links prior))))))
 
 ; The FIRST build-time auto-placement candidate is deliberately smaller than
