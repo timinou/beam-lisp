@@ -174,7 +174,7 @@ function withMetaColl(x, m) {
   // and changing metadata never repeats an effect or forks the node.
   if (x instanceof Z.LazySeq) return Z.withMeta(x, m);
   if (x instanceof R.Cons) { const c = new R.Cons(x.h, x.t); c.meta = m; return c; }
-  if (typeof x === "function") { const f = (...a) => x(...a); f.meta = m; return f; }
+  if (typeof x === "function") { const f = (...a) => x(...a); f.meta = m; return R.inheritCallable(f, x); }
   throw new R.BLError("with-meta: " + R.printStr(x) + " cannot carry metadata");
 }
 export function with_meta(x, m) { return withMetaColl(x, m); }

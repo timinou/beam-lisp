@@ -245,7 +245,7 @@ export function isFloat(x) { return x instanceof Flt || (typeof x === "number" &
 export function isNum(x) { return typeof x === "number" || typeof x === "bigint" || x instanceof Flt || x instanceof Dec; }
 export function isStr(x) { return typeof x === "string"; }
 export function isBool(x) { return x === true || x === false; }
-export function isFn(x) { return !!x && x.__blfn === true; }
+export function isFn(x) { return !!x && V.callableTarget(x).__blfn === true; }
 export const identical = V.keyEq;
 export function truthy(x) { return x !== null && x !== undefined && x !== false; }
 
@@ -281,6 +281,7 @@ export function keyOrder(a, b) {
     case 0: {                                     // number: ints before floats
       const ai = isInt(a), bi = isInt(b);
       if (ai !== bi) return ai ? -1 : 1;
+      if (a instanceof Dec || b instanceof Dec) return V.compare(canonicalNumber(a), canonicalNumber(b));
       const av = a instanceof Flt ? a.v : a, bv = b instanceof Flt ? b.v : b;
       return av < bv ? -1 : av > bv ? 1 : 0;
     }
@@ -590,6 +591,7 @@ function describeReason(reason) {
 
 /** Resolve a callee to a generator factory, or null when it is a native fn. */
 export function resolveCallee(f, args) {
+  f = V.callableTarget(f);
   const arity = args.length;
   if (f && f.__blfn === true) {
     const a = f.arities.get(arity);
@@ -643,8 +645,11 @@ export function invokeNative(rt, f, args) {
  *
  *  The frame array is mutated in place and handed back so a suspended
  *  process is a value the BL scheduler can store in its registry. */
-export function runTurn(rt, frames, budget) {
+export function runTurn(rt, frames, budget, hardLimit = false, rawResult = false) {
   let steps = 0;
+  // Callback completion stays inside the host. Build a BL result map only
+  // when returning to the BL scheduler; execution remains this same machine.
+  const resultFor = (status, frames, extra) => rawResult ? {status, ...extra} : mkResult(status, frames, extra);
   // The critical depth this turn entered with. A turn that dies restores it, so
   // a raise that unwinds past a `critical-enter` cannot strand the depth.
   const cd0 = rt.criticalDepth || 0;
@@ -684,7 +689,8 @@ export function runTurn(rt, frames, budget) {
     // keeps IT — that is the preserved location. A raw JavaScript error has
     // none, so the stack captured at the first escaping throw is used.
     const framesOut = raisedFrameList(thrown) || capturedFrames || frameValues(frames);
-    return finish(mkResult("error", frames, {
+    return finish(resultFor("error", frames, {
+      exception: [thrown],
       message: exceptionText(thrown),
       kind: exKind(thrown),
       reason: exReason(thrown),
@@ -698,10 +704,10 @@ export function runTurn(rt, frames, budget) {
     // A bounded slice normally ends here. While a critical section is open the
     // boundary is DEFERRED: splitting a read-modify-write of `rt.state` across
     // a slice would let another process mutate the same root underneath it.
-    if (steps >= budget && (rt.criticalDepth || 0) === 0) return finish(mkResult("yield", frames, {}));
+    if (steps >= budget && (hardLimit || (rt.criticalDepth || 0) === 0)) return finish(resultFor("yield", frames, {}));
     if (frames.length === 0) {
       if (pending.t === "throw") return die(pending.v);
-      return finish(mkResult("done", frames, { value: pending.v }));
+      return finish(resultFor("done", frames, { value: pending.v }));
     }
     const g = frames[frames.length - 1];
     let res;
@@ -744,8 +750,8 @@ export function runTurn(rt, frames, budget) {
     let step = res.value;
     while (true) {
       if (!isStep(step)) { pending = { t: "value", v: step }; break; }
-      if (step.k === "park") return finish(mkResult("park", frames, {}));
-      if (step.k === "host-wait") return finish(mkResult("host-wait", frames, { ms: step.ms, inputEnabled: step.inputEnabled }));
+      if (step.k === "park") return finish(resultFor("park", frames, {}));
+      if (step.k === "host-wait") return finish(resultFor("host-wait", frames, { ms: step.ms, inputEnabled: step.inputEnabled }));
       if (step.k === "call" || step.k === "tail") {
         // A failure in resolution or in a native leaf is a THROW TO THE CALLER,
         // not an instant process death: the frame above this step is the one
@@ -806,6 +812,7 @@ function mkResult(status, frames, extra) {
     [kw("value"), extra.value === undefined ? null : extra.value],
     [kw("ms"), extra.ms === undefined ? null : extra.ms],
     [kw("input-enabled"), extra.inputEnabled === true],
+    [kw("exception"), extra.exception === undefined ? null : extra.exception],
     [kw("message"), extra.message === undefined ? null : extra.message],
     // The uncaught value that ended the turn, as its class and its reason. nil
     // for every status a raise did not produce.
@@ -996,8 +1003,56 @@ export function ref(rt, ns, name) {
 
 // ── BL function construction ─────────────────────────────────────────────────
 
-export function blFn(name, arities, variadic) {
-  return { __blfn: true, name, arities, variadic: variadic || null };
+// A callable uses the SAME generator machine for actor turns and checked host
+// callbacks. Evidence belongs to the compiler, never to authored metadata.
+const synchronousCallables = new WeakMap();
+export function blFn(name, arities, variadic, rt = null, synchronous = false) {
+  const fn = function (...args) { return invokeSynchronous(fn, args); };
+  Object.defineProperties(fn, {
+    name: {value: name}, __blfn: {value: true},
+    arities: {value: arities}, variadic: {value: variadic || null},
+  });
+  if (rt && synchronous === true) synchronousCallables.set(fn, rt);
+  return fn;
+}
+function callbackRuntime(fn) {
+  fn = V.callableTarget(fn);
+  if (isFn(fn)) return synchronousCallables.get(fn) || null;
+  if (isTup(fn) && fn.items.length === 3 && fn.items[0] === kw("$blfn")) {
+    let rt = null;
+    const accept = f => {
+      const owner = callbackRuntime(f);
+      if (!owner || (rt && owner !== rt)) return false;
+      rt = owner; return true;
+    };
+    for (const key of listToArray(mapKeys(fn.items[1])))
+      if (!accept(mapGet(fn.items[1], key))) return null;
+    if (isTup(fn.items[2]) && !accept(tupEl(fn.items[2], 1))) return null;
+    return rt;
+  }
+  return null;
+}
+export function isSynchronousCallable(fn) { return callbackRuntime(fn) !== null; }
+export function invokeSynchronous(fn, args, budget = 100000) {
+  const rt = callbackRuntime(fn);
+  if (!rt) throw new TypeError("JS interop: callback is not proven non-suspending; use an actor event entrypoint");
+  const factory = resolveCallee(fn, args);
+  const depth = rt.criticalDepth || 0;
+  try {
+    const frames = [factory(rt, args)];
+    const result = runTurn(rt, frames, budget, true, true);
+    const status = result.status;
+    if (status === "done") return result.value;
+    if (status === "error") throw result.exception[0];
+    const error = new Error("JS interop: synchronous callback exceeded its turn budget or attempted suspension");
+    // Inject cancellation at the actual suspension point so ordinary finally
+    // blocks can release resources. Cleanup gets a bounded reserve of its own;
+    // a callback that catches cancellation cannot retain a continuation.
+    frames.__pending = {t: "throw", v: error};
+    const cleanup = runTurn(rt, frames, Math.max(100, Math.min(budget, 10000)), true, true);
+    if (cleanup.status === "error") throw cleanup.exception[0];
+    throw error;
+  } finally { rt.criticalDepth = depth; }
 }
 
 // ── host intrinsics (`host/…` in BL) ─────────────────────────────────────────

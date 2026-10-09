@@ -106,12 +106,12 @@ modules. Copying `rt.mjs` into an actor-specific directory creates separate
 keyword caches and classes and breaks identity. For Pelagic's existing layout,
 the host at `pkg/pelagic/actor/host.mjs` binds `../../../out/rt.mjs`.
 The source-tree host uses the source-tree canonical runtime; the research HTTP
-server explicitly serves its two runtime dependencies.
+server explicitly serves the canonical runtime dependencies.
 
 Canonical arithmetic and literal lowering now also preserve float identity and
-exact decimals. This migration does not yet unify callable dispatch, compiled
-core/prelude ownership, or the two lowering entrypoints. Those remain
-tracked consolidation work. Native JS objects retain identity and native JS
+exact decimals. Checked actor callables can now enter the canonical callable ABI; compiled
+core/prelude ownership and the two lowering entrypoints remain tracked
+consolidation work. Native JS objects retain identity and native JS
 numbers remain native at the explicit interop boundary.
 
 
@@ -119,6 +119,39 @@ The actor compiler delegates literals to `js.emit/lit-js`, arithmetic to the
 canonical runtime, and reference traversal/namespace rewriting to `system.ir`.
 Literal data and annotations are opaque: a quoted map containing `:op :global`
 is data, not a dependency. `system.suspension` provides a conservative,
-annotation-independent fixed point for the next checked callback integration;
+annotation-independent fixed point for checked callback integration;
 synchronous is separate from pure, and creating a closure is separate from
 executing its body. Unknown callees fail closed.
+
+### Checked callbacks enter the same machine
+
+`system.suspension` inspects checked ANF, every arity arm and reachable calls.
+Creating a closure is synchronous; executing a `receive` is not. Unknown dynamic
+calls fail closed, and an authored annotation cannot establish a proof. The actor
+emitter attaches the resulting evidence to its callable, not to a second compiled
+body. A JavaScript callback enters `runTurn` with that same generator factory.
+Captured values, arity dispatch, nested calls and thrown values retain their BL
+semantics. Actor-state operations also require an actor event entrypoint: an
+external host callback has no actor identity to borrow. An unproved callback
+needs that entrypoint instead.
+
+The synchronous entry has a hard 100,000-machine-step limit, including inside a
+critical section. This bounds machine execution, not wall time inside an opaque
+native function. Cancellation is thrown at the suspension point with a separate bounded cleanup
+reserve for finalizers. Failure restores critical depth and never schedules an
+abandoned continuation. Synchronous proof is neither a purity nor a termination proof.
+
+`priv/lib/js/native-values.mjs` now owns conversion for both entrypoints. Its only
+execution hooks are callable dispatch, collection realization and callback proof
+validation. Decimal conversion, float boxing, cyclic values, prototype-safe object
+construction, lazy/set/tuple refusal and native function round trips therefore
+have one implementation. `write-runtime!` includes this shared source in packaged
+actor artifacts. The ordinary build includes it beside `interop.mjs`.
+
+Compilation runs in an isolated registry scope and masks ambient BEAM links for
+manifest-owned native exports. A warm compiler VM must generate the same native
+import as a cold one, without initializing or changing the provider in its parent
+scope. This is necessary for reproducible builds, not a new user-facing API.
+
+`native-test.bl` builds the numeric and callback fixtures; their Node tests then
+exercise emitted code, alongside the lower-level callback and conversion tests.

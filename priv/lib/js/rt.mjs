@@ -943,3 +943,12 @@ export function length(l) {
   if (l instanceof Cons && l.n >= 0) return l.n;
   return bad("length", l);
 }
+
+// Metadata wrappers retain the execution identity of a callable. This does not
+// alter language equality or expose actor policy in the canonical value leaves.
+const callableTargets = new WeakMap();
+export function callableTarget(fn) { return callableTargets.get(fn) || fn; }
+export function inheritCallable(wrapper, source) {
+  callableTargets.set(wrapper, callableTarget(source));
+  return wrapper;
+}
