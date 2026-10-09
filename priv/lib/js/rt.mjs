@@ -967,3 +967,23 @@ export function inheritCallable(wrapper, source) {
   callableTargets.set(wrapper, callableTarget(source));
   return wrapper;
 }
+
+// The compiler's multi-arity VALUE contract, shared by direct calls and frames.
+// This selects an arm and packs rest once; execution belongs to its caller.
+const DISPATCH_MISSING = {};
+export function isMultiCallable(f) {
+  return f instanceof Tup && f.items.length === 3 && f.items[0] === kw("$blfn");
+}
+export function selectCallable(f, args) {
+  f = callableTarget(f);
+  if (!isMultiCallable(f)) return null;
+  const fixed = f.items[1], variadic = f.items[2];
+  const hit = fixed instanceof HMap ? fixed.get(args.length, DISPATCH_MISSING) : DISPATCH_MISSING;
+  if (hit !== DISPATCH_MISSING) return {callee: hit, args};
+  if (variadic instanceof Tup) {
+    const min = variadic.items[0];
+    if (args.length >= min) return {callee: variadic.items[1],
+      args: args.slice(0, min).concat([listFromArray(args.slice(min))])};
+  }
+  throw new BLError("wrong number of args (" + args.length + ") passed to a multi-arity fn");
+}

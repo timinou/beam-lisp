@@ -273,3 +273,21 @@ test/bl/env_namespace_cache_test.bl` retains seven 100-call samples. One loaded
 compiler VM measured median 45,335 versus 204 microseconds per 100 absent-name
 queries (about 222 times faster), and about 251 times fewer reductions. This is
 lookup evidence, not an end-to-end startup/build latency claim.
+
+One multi-arity value contract
+-----------------------------
+
+Canonical `$blfn` arm selection and variadic rest packing now live in the shared
+value ABI. Ordinary invocation and actor frames both consume that decision. A
+fixed arm wins by presence, including a present nil arm, and rest is packed once.
+Previously an ordinary linked function selected inside a multi-arity value
+returned no frame factory and the actor engine tried to invoke the whole tuple.
+
+A selected frame arm stays direct, preserving constant-space tail calls; a native
+arm uses the existing machine call step. Its continuation stays alive across
+host parking, including at the root. Metadata wrappers preserve callable targets
+and thrown values retain identity. Seven contract checks include one-step turn
+boundaries, mixed native/frame arms, nested dispatch, nil arms, 10,000 tail calls
+and a parked root. All 66 focused checks and 461 actor checks at default/17/41
+budgets plus hardening pass. This consolidates function dispatch, not the pending
+common-core collection-callable or lazy-forcing migration.

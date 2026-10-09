@@ -596,22 +596,17 @@ export function resolveCallee(f, args) {
     }
     throw new Error("no arity " + arity + " on fn " + (f.name || "?"));
   }
-  if (isTup(f) && f.items.length === 3 && isKw(f.items[0]) && kwName(f.items[0]) === "$blfn") {
-    const fixed = f.items[1]; // a BL map arity → fn
-    const hit = mapGet(fixed, arity);
-    if (hit !== null && hit !== undefined) return resolveCallee(hit, args);
-    const variadic = f.items[2];
-    if (isTup(variadic)) {
-      const min = tupEl(variadic, 0);
-      const fn = tupEl(variadic, 1);
-      if (arity >= min) {
-        return (rt, as) => {
-          const packed = as.slice(0, min).concat([listFromArray(as.slice(min))]);
-          return resolveCallee(fn, packed)(rt, packed);
-        };
-      }
-    }
-    throw new Error("no arity " + arity + " on $blfn");
+  const selected = V.selectCallable(f, args);
+  if (selected) {
+    const factory = resolveCallee(selected.callee, selected.args);
+    // Keep frame arms direct, including tail recursion. Only packing a rest
+    // argument needs an adapter; there is no extra continuation to accumulate.
+    if (factory) return selected.args === args ? factory : (rt, _args) => factory(rt, selected.args);
+    // A linked native arm uses an ordinary call step. Keep its continuation
+    // while a host control leaf parks, even when this is the root frame.
+    return function* (rt, _args) {
+      return yield new Step("call", {f: selected.callee, args: selected.args});
+    };
   }
   return null;
 }

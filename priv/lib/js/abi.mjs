@@ -72,18 +72,11 @@ export const K_error = R.kw("error");
 // rest as ONE list (the BEAM ABI). `blfnFn` resolves each fixed arity once so a
 // call is a length switch plus a direct call, not a map lookup and two spreads.
 
-const BLFN = R.kw("$blfn");
-const isBlfn = (f) => f instanceof R.Tup && f.items.length === 3 && f.items[0] === BLFN;
+const isBlfn = R.isMultiCallable;
 
 function invokeBlfn(f, args) {
-  const fixed = f.items[1], v = f.items[2];
-  const g = fixed instanceof R.HMap ? fixed.get(args.length, NF) : NF;
-  if (g !== NF) return invoke(g, ...args);
-  if (v instanceof R.Tup) {
-    const mn = v.items[0];
-    if (args.length >= mn) return invoke(v.items[1], ...args.slice(0, mn), R.listFromArray(args.slice(mn)));
-  }
-  throw new R.BLError("wrong number of args (" + args.length + ") passed to a multi-arity fn");
+  const selected = R.selectCallable(f, args);
+  return invoke(selected.callee, ...selected.args);
 }
 
 /** A `{:$blfn …}` multi-fn value as ONE JS function, resolved once and cached
