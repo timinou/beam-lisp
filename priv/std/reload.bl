@@ -76,7 +76,7 @@
             ; the quiet window a file save needs is `proc.tick`'s debounce; the
             ; clause is resolved at EXPANSION, so the namespace that registers it
             ; must be loaded first (see `watch-debounce` below).
-            [proc.server :as ps] [proc.tick]))
+            [proc.server :as ps] [proc.tick] [proc.evolve :as evolve]))
 
 ;; ── the bundle: staged edits since the last coherent image ──────────────
 
@@ -100,6 +100,15 @@
                   :journal [] :requires {} :graph {} :generation {}}))
 
 (def journal-limit 200)
+(def live-generations (atom {}))
+
+(defn- with-change-lock [f]
+ (let [held (Process/get :reload/change-lock)]
+  (if held (f)
+   (global/trans (tuple :reload-image-change (erlang/self))
+    (fn []
+     (Process/put :reload/change-lock true)
+     (try (f) (finally (Process/delete :reload/change-lock))))))))
 
 ;; ── the commit target: WHERE a coherent bundle is made live ──────────────
 ;;
@@ -268,11 +277,11 @@
 
 ;; ── staging ─────────────────────────────────────────────────────────────
 
-(defn stage
+(defn- stage-unlocked
   "Buffer an edit into the pending bundle. Does NOT touch the live image — the
    edit becomes visible only on a coherent `commit`. `ns` may be given, else it
    is read from the source's `(ns …)` form. Returns the bundle status map."
-  ([src] (stage (declared-ns src) src))
+  ([src] (stage-unlocked (declared-ns src) src))
   ([ns src]
    (when (nil? ns)
      (throw (ex-info "reload/stage: source declares no (ns …); pass ns explicitly"
@@ -284,7 +293,7 @@
                 (assoc :status :staged))))
    (status)))
 
-(defn attach
+(defn- attach-unlocked
   "Bind a message-migration spec (reload.migrate) to the current bundle. A
    bundle that changes a live process's message contract is incoherent until a
    migration is attached — the migration is what fulfils the in-flight messages
@@ -293,7 +302,7 @@
   (swap! state (fn [s] (assoc s :migration migration)))
   (status))
 
-(defn abort
+(defn- abort-unlocked
   "Discard the pending bundle without touching the live image. The JOURNAL is
    preserved — abort discards uncommitted intent, not the record of what already
    happened."
@@ -316,6 +325,12 @@
      :migration (some? (:migration s))
      :errors  (:errors s)
      :applied (:applied s)}))
+
+(defn stage
+ ([src] (with-change-lock (fn [] (stage-unlocked src))))
+ ([ns src] (with-change-lock (fn [] (stage-unlocked ns src)))))
+(defn attach [migration] (with-change-lock (fn [] (attach-unlocked migration))))
+(defn abort [] (with-change-lock abort-unlocked))
 
 ;; ── coherence pass (STATIC — never evaluates the bundle) ─────────────────
 
@@ -555,7 +570,13 @@
    migration (Wave 3), not here."
   [staged]
   (let [defs (bundle-defs staged)]
-    (vec (concat (mapcat (fn [pair]
+    (vec (concat
+          (keep (fn [[ns _]]
+                  (when-let [owner (get @live-generations ns)]
+                    (when (Process/alive? owner)
+                      {:kind :immutable-generation :ns ns
+                       :msg "Live generation namespace is immutable; activate a fresh generation."}))) staged)
+          (mapcat (fn [pair]
                            (let [ns (first pair) src (second pair)]
                              (concat (dangling-errors defs ns src)
                                      (promise-errors defs ns src)
@@ -618,7 +639,7 @@
                                            (let [[_ reqs] (sg/header (second pair))]
                                              (vec reqs)))))))))))
 
-(defn commit
+(defn- commit-unlocked
   "Prove the whole pending bundle coherent (statically); on success apply it
    to the target image; otherwise HOLD it — old code keeps serving, the
    errors are returned, and the bundle stays staged for the next edit to complete.
@@ -655,7 +676,10 @@
   "The coherence-and-apply half of commit, once the prod policy has allowed a
    mutation. Split out so the policy gate reads as one clear cond in `commit`."
   [s staged]
-  (let [errors (coherence staged)
+  (let [errors (into (coherence staged)
+                   (when (:migration s)
+                     [{:kind :message-migration
+                       :msg "Attached message specifications are previews, not runtime delivery. Use reload/activate! with a proc.evolve owner."}]))
         nses   (vec (keys (:staged s)))]
     (if (seq errors)
       (do
@@ -677,6 +701,8 @@
         (journal! {:event :applied :nses nses
                    :migration (some? (:migration s))})
         (status)))))
+
+(defn commit [] (with-change-lock commit-unlocked))
 
 (defn- print-errors
   "Render a held bundle's errors — one line per reason, so a developer sees the
@@ -1124,3 +1150,65 @@
         (erlang/apply :erlang :raise
           (list kind (if (= kind :exit) (elem error 1) error) (elem result 3))))
       result)))
+
+
+;; Production generation activation: prepare unreachable code, then one FIFO
+;; owner switch. Existing namespaces are never overwritten by this operation.
+(defn- generation-errors [sources]
+ (vec
+  (mapcat
+   (fn [[ns src]]
+    (concat
+     (when (or (not (string? ns)) (not= ns (declared-ns src)))
+      [{:kind :namespace-mismatch :ns ns}])
+     (when (BeamLisp.Env/loaded_ns? ns)
+      [{:kind :existing-generation :ns ns}])
+     (keep (fn [node]
+             (let [form (typed/node-form node)
+                   head (when (= :list (typed/node-tag form))
+                          (typed/node-name (first (typed/node-items form))))]
+              (when-not (contains? #{"ns" "defn" "defn-"} head)
+               {:kind :effectful-generation :ns ns :form head})))
+           (BeamLisp.Reader/read_string src)))) sources)))
+
+(defn activate!
+ "Prepare fresh immutable generation namespaces while the old process serves,
+  then switch one proc.evolve owner through its FIFO upgrade. Candidate supplies
+  :digest, :sources {namespace source}, :resolve (fn [] -> evolution spec).
+  Definitions must be ns/defn only; old namespaces and top-level effects refuse.
+  Resolver is trusted artifact code, never transport source. An unsuccessful
+  prepare may retain unreachable definitions; retry with a fresh namespace.
+  Handler migrations must remain compatible with data expanded before activation.
+  This is one process publication, not a transaction across unrelated actors."
+ [pid expected candidate]
+ (with-change-lock
+  (fn []
+   (env/with-env (commit-target)
+    (fn []
+   (if-not (reload-enabled?)
+    {:status :held :reason :reload-disabled}
+    (let [current (evolve/status pid)]
+     (cond
+      (= (:digest candidate) (:digest current))
+       {:status :already-applied :version (:version current)}
+      (not= expected (:version current)) {:status :stale :version (:version current)}
+      :else
+       (try
+        (let [sources (:sources candidate)
+              _ (when-not (and (map? sources) (seq sources) (string? (:digest candidate)) (:resolve candidate))
+                  (throw (ex-info "Generation candidate is incomplete" {:kind :invalid-candidate})))
+              errors (into (generation-errors sources) (coherence (vec sources)))]
+         (if (seq errors)
+          {:status :blocked :errors errors}
+          (do
+           (apply-bundle! (vec sources))
+           (let [spec (env/with-env (commit-target) (:resolve candidate))]
+            (when-not (= (:digest candidate) (:digest spec))
+             (throw (ex-info "Resolved generation identity differs from candidate" {:kind :identity-conflict})))
+            (let [result (evolve/upgrade! pid expected spec)]
+             (when (contains? #{:applied :already-applied} (:status result))
+              (swap! live-generations (fn [m] (reduce (fn [a ns] (assoc a ns pid)) m (keys sources)))))
+             (journal! {:event :generation-activation :status (:status result)
+                        :nses (vec (keys sources)) :version (:version result)})
+             result)))))
+        (catch e {:status :blocked :reason (or (:kind (ex-data e)) :preparation-failed)}))))))))))

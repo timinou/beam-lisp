@@ -1,0 +1,131 @@
+; Stable process identity, versioned messages and atomic handler/state evolution.
+; Upgrade callbacks are pure and short. External effects belong to durable jobs.
+(ns proc.evolve
+ (:require [proc.server :as ps] [proc.callback :as cb] [proc.fence :as fence] [core]))
+
+(defn- valid-version? [v] (and (erlang/is_integer v) (> v 0)))
+(defn- validate! [spec]
+ (when-not (and (valid-version? (:version spec)) (string? (:digest spec))
+                (not (empty? (:digest spec))) (:handler spec) (:check-state spec) (:accept? spec))
+  (throw (ex-info "Evolution requires version, digest, handler and state/message predicates" {:kind :invalid-evolution}))))
+
+(defn- retain! [spec]
+ (let [held (atom [])]
+  (try
+   (reduce (fn [m k]
+             (if-let [f (get spec k)]
+              (let [r (cb/register! f (:modules spec []))]
+               (swap! held conj r) (assoc m k r)) m))
+           (select-keys spec [:version :digest])
+           [:handler :check-state :accept? :migrate-state :upcast])
+   (catch e (doseq [r @held] (cb/unregister! r)) (throw e)))))
+
+(defn- release! [held]
+ (doseq [k [:handler :check-state :accept? :migrate-state :upcast]]
+  (when-let [r (get held k)] (cb/unregister! r))))
+
+(defn- invoke [held k args] (cb/invoke! (get held k) args))
+(defn- valid-state! [held state]
+ (when-not (= true (invoke held :check-state [state]))
+  (throw (ex-info "Evolution state invariant refused" {:kind :invalid-state})))
+ state)
+
+(defn- adapt [st version message]
+ (loop [v version msg message]
+  (cond
+   (= v (get-in st [:current :version])) msg
+   (not (valid-version? v)) (throw (ex-info "Invalid message version" {:kind :unsupported-version}))
+   :else (if-let [edge (get (:adapters st) v)]
+           (recur (:to edge) (cb/invoke! (:callback edge) [msg]))
+           (throw (ex-info "No message upgrade path" {:kind :unsupported-version}))))))
+
+(defn- dispatch [st version message]
+ (try
+  (let [held (:current st) msg (adapt st version message)]
+   (when-not (= true (invoke held :accept? [msg]))
+    (throw (ex-info "Message outside current contract" {:kind :invalid-message})))
+   (let [result (invoke held :handler [msg (:value st)])]
+    (when-not (and (map? result) (contains? result :reply) (contains? result :state))
+     (throw (ex-info "Handler must return reply and state" {:kind :invalid-result})))
+    (valid-state! held (:state result))
+    [(:reply result) (assoc st :value (:state result))]))
+  (catch e [{:status :refused :kind (or (:kind (ex-data e)) :handler-failed)} st])))
+
+(defn- upgrade [st expected spec]
+ (let [current (:current st)]
+  (cond
+   (and (= (:version spec) (:version current)) (= (:digest spec) (:digest current)))
+    [{:status :already-applied :version (:version current)} st]
+   (not= expected (:version current)) [{:status :stale :version (:version current)} st]
+   (and (valid-version? (:version spec)) (<= (:version spec) (:version current)))
+    [{:status :identity-conflict :version (:version current)} st]
+   (>= (count (:adapters st)) (:history-limit st)) [{:status :history-full} st]
+   :else
+    (let [next (atom nil)]
+     (try
+      (validate! spec)
+      (when-not (and (:upcast spec) (:migrate-state spec))
+       (throw (ex-info "Upgrade requires explicit state and message migrations" {:kind :missing-migration})))
+      (reset! next (retain! spec))
+      (let [prepared (fence/fence-fn (:upgrade-ms st)
+                        (fn [] (valid-state! @next (invoke @next :migrate-state [(:value st)]))))
+            _ (when-not (contains? prepared :ok)
+                (throw (ex-info "State migration failed or exceeded budget" {:kind :migration-deadline})))
+            value (:ok prepared)
+            edge {:to (:version spec) :callback (:upcast @next)}
+            installed (dissoc @next :migrate-state :upcast)
+            after (assoc st :current installed :value value
+                           :adapters (assoc (:adapters st) (:version current) edge))]
+       ;; No callback after releasing the old registration may reject publication.
+       (cb/unregister! (:migrate-state @next))
+       (release! current)
+       [{:status :applied :version (:version spec)} after])
+      (catch e
+       (when @next (release! @next))
+       [{:status :refused :kind (or (:kind (ex-data e)) :migration-failed)} st]))))))
+
+(defn- initial-state [opts]
+  (validate! (:spec opts))
+  (let [limit (:history-limit opts 32) budget (:upgrade-ms opts 250)]
+   (when-not (and (erlang/is_integer budget) (> budget 0) (<= budget 30000))
+    (throw (ex-info "Evolution migration budget must be 1..30000ms" {:kind :invalid-evolution})))
+   (when-not (and (erlang/is_integer limit) (> limit 0) (<= limit 1024))
+    (throw (ex-info "Evolution history must be bounded" {:kind :invalid-evolution})))
+   (let [held (retain! (:spec opts))]
+    (try (valid-state! held (:state opts))
+         {:current held :value (:state opts) :adapters {} :history-limit limit :upgrade-ms budget}
+         (catch e (release! held) (throw e))))))
+
+(ps/defserver owner
+ (init [opts] (ok (initial-state opts)))
+ (handle-call [:proc.evolve/call version message] [_ st]
+  (let [[value after] (dispatch st version message)] (reply value after)))
+ (handle-call [:proc.evolve/upgrade expected spec] [_ st]
+  (let [[value after] (upgrade st expected spec)] (reply value after)))
+ (handle-call [:proc.evolve/status] [_ st]
+  (reply {:version (get-in st [:current :version]) :digest (get-in st [:current :digest])
+          :legacy-versions (vec (sort (keys (:adapters st)))) :pid (erlang/self)} st))
+ (terminate [_ st]
+  (release! (:current st))
+  (doseq [edge (vals (:adapters st))] (cb/unregister! (:callback edge)))
+  :ok))
+
+(defn start!
+ "Start one stable owner. Spec supplies :version/:digest, :handler (msg,state ->
+  {:reply r :state s}), :accept? and :check-state. Native callbacks are retained
+  under this owner's lifetime. Declare captured executable dependencies :modules."
+ ([spec state] (start! spec state {}))
+ ([spec state opts]
+  (core/start owner {:spec spec :state state :history-limit (:history-limit opts 32) :upgrade-ms (:upgrade-ms opts 250)}
+                    (dissoc opts :history-limit :upgrade-ms))))
+(defn call!
+ "Version travels with the request, including queued calls from old clients."
+ ([pid version message] (call! pid version message 5000))
+ ([pid version message timeout] (GenServer/call pid [:proc.evolve/call version message] timeout)))
+(defn upgrade!
+ "FIFO publication of handler+state in the existing process. Requests keep their
+  version and upcast lazily on delivery; no mailbox drain/rewrite or PID swap.
+  A refused migration keeps old state/handler. Timeout means outcome unknown."
+ ([pid expected spec] (upgrade! pid expected spec 5000))
+ ([pid expected spec timeout] (GenServer/call pid [:proc.evolve/upgrade expected spec] timeout)))
+(defn status [pid] (GenServer/call pid [:proc.evolve/status]))
