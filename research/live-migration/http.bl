@@ -1,0 +1,81 @@
+(ns research.live-migration.http
+ (:require [reload] [proc.evolve :as ev] [web] [datom :as d] [datom.migrate :as migrate]
+           [datom.store-fjall :as fjall] [proc.server :as ps] [core]))
+;; The driver supplies a production-policy env.bl in its private application root.
+(reload/set-enabled! nil)
+(def initial
+ {:version 1 :digest "http-v1" :accept? (fn [m] (= :inc m))
+  :check-state (fn [s] (and (erlang/is_integer s) (>= s 0)))
+  :handler (fn [_ s] {:reply (inc s) :state (inc s)})})
+(def service (ev/start! initial 0))
+(def control (d/connect-with (fjall/open (str (System/get_env "LIVE_MIGRATION_ROOT") "/data"))
+                [{:db/ident :item/id :db/valueType :db.type/long :db/unique :db.unique/identity}
+                 {:db/ident :traffic/id :db/valueType :db.type/long :db/unique :db.unique/identity}]))
+(d/transact! control (mapv (fn [n] {:db/id (- 0 (+ n 1)) :item/id n}) (range 500)))
+(def digest (join "" (repeat 64 "a")))
+(def n "http.generation.v2")
+(def candidate
+ {:digest "http-v2"
+  :sources {n (str "(ns " n ") (defn handle [msg state] {:reply (+ state msg) :state (+ state msg)})")}
+  :resolve (fn [] {:version 2 :digest "http-v2" :handler (BeamLisp.Env/fetch! n "handle")
+                   :accept? (fn [m] (erlang/is_integer m))
+                   :check-state (fn [s] (and (erlang/is_integer s) (>= s 0)))
+                   :migrate-state identity :upcast (fn [m] (if (= :inc m) 1 m))})})
+(def backfill-state (atom {:status :idle :steps 0 :max-step-ms 0}))
+(def backfill-spec
+ {:migration/id :http/backfill :migration/digest digest :migration/grows []
+  :migration/checks [{:check :predicate :id :coverage
+   :fn (fn [db] (empty? (d/q '[:find ?e :where [?e :item/id _] [:not [?e :item/ready true]]] db)))}]})
+(defn batch [db]
+ (let [rows (vec (take 20 (d/q '[:find ?e :where [?e :item/id _] [:not [?e :item/ready true]]] db)))]
+  [(mapv (fn [r] [:db/add (first r) :item/ready true]) rows) (= 20 (count rows))]))
+(defn prepared-batch []
+ ;; Costly selection uses an immutable reader snapshot outside the writer.
+ ;; Only the selected entity IDs are rechecked in the committing writer turn.
+ (let [ids (mapv first (take 20 (d/q
+                '[:find ?e :where [?e :item/id _] [:not [?e :item/ready true]]] (d/db control))))]
+  (fn [db]
+   (let [rows (d/q '[:find ?e :in $ [?e ...] :where [?e :item/id _] [:not [?e :item/ready true]]] db ids)]
+    [(mapv (fn [r] [:db/add (first r) :item/ready true]) rows) (= 20 (count rows))]))))
+(defn initialize-backfill [] (erlang/send (erlang/self) :step) {})
+(ps/defserver backfill-worker
+ (init [_] (ok (initialize-backfill)))
+ (handle-info :step [st]
+  (try
+   (let [before (erlang/monotonic_time :millisecond)
+         r (migrate/step! control backfill-spec
+             (if (= "prepared" (System/get_env "LIVE_MIGRATION_SELECTION")) (prepared-batch) batch))
+         elapsed (- (erlang/monotonic_time :millisecond) before)]
+    (swap! backfill-state (fn [s] (-> s (assoc :status (:status r)) (update :steps inc)
+                                    (update :max-step-ms max elapsed))))
+    (when (= :progress (:status r)) (Process/send_after (erlang/self) :step 1))
+    (noreply st))
+   (catch e (reset! backfill-state {:status :failed :kind (str e)}) (noreply st)))))
+(defn backfill! []
+ (migrate/apply! control {:migration/id :http/expand :migration/digest digest
+                         :migration/grows [{:db/ident :item/ready :db/valueType :db.type/boolean}]})
+ (reset! backfill-state {:status :started :steps 0 :max-step-ms 0})
+ (core/start backfill-worker {})
+ {:status :started})
+(defn router [conn]
+ (web/route conn
+  [:get "/health"] (web/json conn {:status "ok" :pid (System/get_pid) :owner (str service)
+                                    :version (:version (ev/status service)) :image (reload/image-kind)
+                                    :reload (reload/reload-enabled?) :dev-env (System/get_env "BEAM_LISP_DEV") :image-env (System/get_env "BEAM_LISP_IMAGE")
+                                    :backfill @backfill-state
+                                    :durable-writes (count (d/q '[:find ?id :where [_ :traffic/id ?id]] (d/db control)))
+                                    :ready-rows (count (d/q '[:find ?e :where [?e :item/ready true]] (d/db control)))})
+  [:get "/work"] (let [n (ev/call! service 1 :inc)]
+                    (d/transact! control [{:db/id -1 :traffic/id n}])
+                    (web/json conn {:count n
+                      :rows (count (d/q '[:find ?e :where [?e :item/id _]] (d/db control)))}))
+  [:post "/upgrade"] (web/json conn {:status (name (:status (reload/activate! service 1 candidate)))})
+  [:post "/backfill"] (web/json conn {:status (name (:status (backfill!)))})
+  [:post "/refuse"] (web/json conn {:status (name (:status (ev/upgrade! service 2
+                     {:version 3 :digest "bad-v3" :accept? (fn [_] true)
+                      :check-state (fn [_] false) :handler (fn [_ s] {:reply 0 :state s})
+                      :migrate-state identity :upcast identity})))})
+  :else (web/text conn 404 "not found")))
+(do
+    (web/serve {:port (erlang/binary_to_integer (System/get_env "LIVE_MIGRATION_PORT"))
+             :ip (tuple 127 0 0 1) :plug router :log :off}))
