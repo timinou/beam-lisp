@@ -50,6 +50,7 @@
 ;   [[:db/cas e :job/state :queued :running]   ; only if it is STILL queued
 ;    [:db/add e :job/lease-until …]
 ;    [:db/add e :job/owner token]
+;    [:db/add e :job/attempt-id token]
 ;    [:db/add e :job/attempts n]]
 ;
 ; The read that decides "is it still :queued?" happens INSIDE the connection's
@@ -106,24 +107,26 @@
 
 (ns proc.queue
   (:require [datom :as datom]
+            [datom.conn :as dc]
             [datom.store-ets :as store-ets]
             [proc.server :refer [extend-clause!]]
             [proc.table :as table]
             [proc.tick :as tick]
+            [proc.fence :as fence]
             [diagnostics :as diag]))
 
 ;; ── the declaration, and its refusals ───────────────────────────────────
 
-(def KNOWN-DECL-OPTS [:of :concurrency :retry :unique :lease :partition])
+(def KNOWN-DECL-OPTS [:of :concurrency :retry :unique :lease :partition :protocol :generation])
 
-(def KNOWN-CLAUSE-OPTS [:of :concurrency :retry :unique :lease :partition
-                        :clock :server])
+(def KNOWN-CLAUSE-OPTS [:of :concurrency :retry :unique :lease :partition :protocol :generation
+                        :clock :server :contract])
 
 (def KNOWN-RETRY-OPTS [:max :backoff :base :max-delay :jitter])
 
 (def KNOWN-BACKOFF [:exponential :constant])
 
-(def KNOWN-ENQUEUE-OPTS [:in :at])
+(def KNOWN-ENQUEUE-OPTS [:in :at :protocol :generation :source-id :parent-id])
 
 (defn- known? [k ks] (some (fn [x] (= x k)) ks))
 
@@ -222,7 +225,14 @@
       (when-not (keyword? k)
         (throw (ex-info (str "queue: every :partition key must be a keyword — got " (str k))
                         {:key k}))))
+    (when-not (positive-int? (:protocol d 1))
+      (throw (ex-info "queue: :protocol must be a positive integer" {:kind :invalid-protocol})))
+    (when (and (some? (:generation d))
+               (not (and (string? (:generation d)) (not (empty? (:generation d))))))
+      (throw (ex-info "queue: :generation must be a nonempty string" {:kind :invalid-generation})))
     {:of of
+     :protocol (:protocol d 1)
+     :generation (:generation d)
      :concurrency concurrency
      :lease lease
      :unique (vec unique)
@@ -263,7 +273,17 @@
 ;; query language, and `(proc.queue/conn :larder)` is the whole door.
 
 (def SCHEMA
-  [{:db/ident :job/of :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one}
+  [{:db/ident :job/id :db/valueType :db.type/string :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
+   {:db/ident :job/source-id :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
+   {:db/ident :job/parent-id :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :job/protocol :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :job/generation :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :job/retry-base :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :queue/fenced-through :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :job/attempt-id :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :queue/fenced-protocols :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
+   {:db/ident :job/of :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one}
    {:db/ident :job/server :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
    {:db/ident :job/state :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one
     :db/index true}
@@ -324,6 +344,74 @@
       (let [c (datom/connect-with (store-ets/adopt (ensure-store! srv)) SCHEMA)]
         (erlang/apply :persistent_term :put (list (conn-key srv) c))
         c)))
+
+(defn attach-store!
+  "Bind a queue to an existing dedicated persistent Datom connection BEFORE its
+   first use. The connection owner supplies opening/closing and single-writer
+   authority. Default ETS queues survive process death, not VM death. Bind the
+   same persistent store at boot to resume jobs across VM/deployment restarts.
+   Refuse replacement or sharing one queue store with a different queue."
+  [srv c]
+  (let [existing (erlang/apply :persistent_term :get (list (conn-key srv) nil))]
+    (when (and existing (not= existing c))
+      (throw (ex-info "Queue connection already bound" {:kind :store-already-bound :server srv})))
+    (dc/serialized! c
+      (fn []
+        (datom/install-schema! c SCHEMA)
+        (when (some (fn [row] (not= (name srv) (first row)))
+                    (datom/q '[:find ?key :where [_ :queue/key ?key]] (datom/db c)))
+          (throw (ex-info "Queue requires its own connection/store" {:kind :shared-queue-store})))
+        (datom/transact! c [{:db/id -1 :queue/key (name srv)}])
+        (erlang/apply :persistent_term :put (list (conn-key srv) c))))
+    c))
+
+(defn- identity-token []
+  (Base/encode16 (erlang/apply :crypto :strong_rand_bytes (list 24))))
+
+(defn- fenced-protocols [c srv]
+  (:queue/fenced-protocols (datom/pull (datom/db c) '[*] [:queue/key (name srv)]) #{}))
+
+(defn fence-protocol!
+  "Durably close admissions for a protocol. Existing jobs remain readable and
+   executable. This fence is monotone and survives declaration updates/restarts."
+  [srv protocol]
+  (when-not (positive-int? protocol)
+    (throw (ex-info "Invalid protocol fence" {:kind :invalid-protocol})))
+  (let [c (conn srv)]
+    (dc/serialized! c
+      (fn []
+        (datom/transact! c [{:db/id -1 :queue/key (name srv)
+          :queue/fenced-protocols (conj (fenced-protocols c srv) protocol)}])
+        {:status :fenced :protocol protocol}))))
+
+(defn fence-through!
+  "Close the complete protocol prefix through version in one durable writer
+   turn. Bounds are numeric; a version jump does not allocate a giant set."
+  [srv version]
+  (when-not (positive-int? version)
+    (throw (ex-info "Invalid protocol fence" {:kind :invalid-protocol})))
+  (let [c (conn srv)]
+    (dc/serialized! c
+      (fn []
+        (let [row (datom/pull (datom/db c) '[*] [:queue/key (name srv)])]
+          (datom/transact! c [{:db/id -1 :queue/key (name srv)
+            :queue/fenced-through (max version (:queue/fenced-through row 0))}])
+          {:status :fenced :through version})))))
+
+(defn protocol-inventory
+  "Read retained dependencies without a running queue. Failed/held/unknown jobs
+   still depend on their protocol; only done/cancelled jobs release it. Legacy
+   jobs without metadata use protocol 1. Counts do not imply a retirement proof
+   until admissions have been fenced."
+  [srv]
+  (let [c (conn srv) db (datom/db c)
+        rows (datom/q '[:find ?e ?s :where [?e :job/state ?s]] db)]
+    {:fenced (vec (sort (fenced-protocols c srv)))
+     :fenced-through (:queue/fenced-through (datom/pull db '[*] [:queue/key (name srv)]) 0)
+     :protocols (reduce (fn [m row]
+                    (if (contains? #{:done :cancelled} (second row)) m
+                      (let [j (datom/entity db (first row)) p (:job/protocol j 1)]
+                        (update m p (fn [n] (inc (or n 0))))))) {} rows)}))
 
 (defn store-live?
   "Whether this queue's store exists right now. Public for the same reason
@@ -526,11 +614,25 @@
                               " it")
                          {:server srv})))
        (validate-payload! d job)
-       (let [now (tick/wall-ms)
+       (dc/serialized! c (fn []
+       (let [protocol (:protocol opts (:protocol d 1))
+             generation (:generation opts (:generation d))
+             _ (when-not (positive-int? protocol)
+                 (throw (ex-info "Invalid enqueue protocol" {:kind :invalid-protocol})))
+             _ (when (and generation (not (and (string? generation) (not (empty? generation)))))
+                 (throw (ex-info "Invalid enqueue generation" {:kind :invalid-generation})))
+             _ (when (or (contains? (fenced-protocols c srv) protocol)
+                           (<= protocol (:queue/fenced-through (datom/pull (datom/db c) '[*] [:queue/key (name srv)]) 0)))
+                 (throw (ex-info "Queue protocol admissions are fenced" {:kind :protocol-fenced :protocol protocol})))
+             id (identity-token)
+             now (tick/wall-ms)
              at (due-at now opts)
              ticket (ticket-for d job)
              pk (partition-key d job)
              row (merge {:db/id -1
+                         :job/id id
+                         :job/source-id (:source-id opts (or ticket id))
+                         :job/protocol protocol
                          :job/of (:of d)
                          :job/server (name srv)
                          :job/state :queued
@@ -539,6 +641,8 @@
                          :job/attempts 0
                          :job/payload job
                          :job/diagnostic-context (merge (diag/context) {:diagnostics/job-id (diag/new-id)})}
+                        (if generation {:job/generation generation} {})
+                        (if (:parent-id opts) {:job/parent-id (:parent-id opts)} {})
                         (if (some? ticket) {:job/ticket ticket} {})
                         (if (some? pk) {:job/partition pk} {}))
              ;; The row ASSERTS the ticket (so the tempid UPSERTS onto a job that
@@ -556,7 +660,7 @@
                       (includes? (error-text err) "compare-and-swap"))
                (let [j (find-by-ticket c ticket)]
                  (if (some? j) (assoc j :job/created false) (throw err)))
-               (throw err)))))))))
+               (throw err)))))))))))
 
 ;; ── stats: a query, not a counter ───────────────────────────────────────
 
@@ -612,11 +716,16 @@
     (cond
       (= s :queued)
         [[:db/cas e :job/state :queued :running]
+         [:db/cas e :job/attempts (:job/attempts job) (inc attempts)]
          [:db/add e :job/lease-until (+ now lease-ms)]
          [:db/add e :job/owner token]
+         [:db/add e :job/attempt-id token]
          [:db/add e :job/attempts (inc attempts)]]
       (and (= s :running) (or (nil? lease) (<= lease now)))
-        [[:db/cas e :job/lease-until lease (+ now lease-ms)]
+        [[:db/cas e :job/state :running :running]
+         [:db/cas e :job/owner (:job/owner job) token]
+         [:db/cas e :job/lease-until lease (+ now lease-ms)]
+         [:db/add e :job/attempt-id token]
          [:db/add e :job/owner token]
          [:db/add e :job/attempts (inc attempts)]]
       :else nil)))
@@ -645,8 +754,7 @@
         ;; a value no other claim can produce: the VM's monotonic counter beside
         ;; the clock, so a token that survives in a store across a restart still
         ;; cannot collide with a fresh one.
-        token (str (erlang/system_time :millisecond) "-"
-                   (erlang/apply :erlang :unique_integer (list (list :positive))))
+        token (identity-token)
         tx (claim-tx job now lease-ms token)]
     (when (some? tx)
       (try
@@ -654,6 +762,48 @@
         (datom/entity (datom/db c) e)
         (catch err
           (if (lose-race? err) nil (throw err)))))))
+
+(defn commit-attempt!
+  "Publish database effects only while this claimed attempt still owns its
+   unexpired lease. Executes in the QUEUE store's writer; tx must target this
+   same connection. External effects need their own provider idempotency and
+   uncertain-outcome reconciliation. Returns a refusal without executing tx
+   when an old worker lost ownership."
+  [srv claimed tx]
+  (let [c (conn srv)]
+    (dc/serialized! c
+      (fn []
+        (let [now (tick/wall-ms) j (datom/entity (datom/db c) (:db/id claimed))]
+          (if (and j (= :running (:job/state j))
+                   (= (:job/owner claimed) (:job/owner j))
+                   (= (:job/attempt-id claimed) (:job/attempt-id j))
+                   (some? (:job/owner claimed)) (> (:job/lease-until j 0) now))
+            {:status :committed :report (datom/transact! c tx)}
+            {:status :refused :kind :stale-attempt}))))))
+
+(defn retry!
+  "Explicitly retry a failed/held job IN PLACE, preserving source/protocol,
+   generation and stable job ID. A new attempt budget starts without resetting
+   the lifetime attempt counter. Existing admitted work may drain after a
+   protocol fence. No deployment implicitly retries failures or holds."
+  [srv id]
+  (let [c (conn srv)]
+    (dc/serialized! c
+      (fn []
+        (let [j (datom/entity (datom/db c) id) d (declaration srv)]
+          (when-not (contains? #{:failed :held} (:job/state j))
+            (throw (ex-info "Only failed or held jobs may be retried" {:kind :not-retryable :state (:job/state j)})))
+          (let [ticket (ticket-for d (:job/payload j))
+                other (when ticket (find-by-ticket c ticket))]
+            (when (and other (not= id (:db/id other)))
+              (throw (ex-info "Outstanding work already holds retry ticket" {:kind :duplicate-retry})))
+            (datom/transact! c (vec (concat
+              [[:db/cas id :job/state (:job/state j) :queued]
+               [:db/add id :job/retry-base (:job/attempts j 0)]
+               [:db/add id :job/at (tick/wall-ms)]]
+              (if (:job/finished-at j) [[:db/retract id :job/finished-at (:job/finished-at j)]] [])
+              (if ticket [[:db/add id :job/ticket ticket]] []))))
+            (datom/entity (datom/db c) id)))))))
 
 ;; ── cancelling work that has not begun, and reaping what has ────────────
 ;;
@@ -924,6 +1074,25 @@
     (diag/with-captured-fn captured #(diag/emit! event fields))
     (diag/emit! event fields)))
 
+(defn- prepare-payload [q job]
+  (let [target (get-in q [:decl :protocol] 1) contract (:contract q {})]
+    (loop [version (:job/protocol job 1) payload (:job/payload job) seen #{}]
+      (cond
+        (= version target)
+          (if (or (nil? (:accept? contract)) (= true ((:accept? contract) payload)))
+            {:payload payload :protocol target}
+            (throw (ex-info "Queue payload violates current protocol" {:kind :invalid-message})))
+        (contains? seen version)
+          (throw (ex-info "Cyclic queue protocol adapters" {:kind :invalid-adapter}))
+        :else
+          (if-let [edge (get (:adapters contract) version)]
+            (let [next ((:upcast edge) payload)]
+              (when-not (and (positive-int? (:to edge)) (> (:to edge) version)
+                            (= true ((:accept? edge) next)))
+                (throw (ex-info "Queue adapter violated its contract" {:kind :invalid-adapter})))
+              (recur (:to edge) next (conj seen version)))
+            (throw (ex-info "No queue payload upgrade path" {:kind :unsupported-version})))))))
+
 (defn- launch!
   "Claim `job` and start its body on its OWN process. Returns the running entry,
    or nil when another claimer took it first.
@@ -940,7 +1109,9 @@
         c (conn (:server q))
         now ((:clock q))
         decl (:decl q)
-        claimed (claim! c job now (* 1000 (:lease decl)))]
+        prepared (let [r (fence/fence-fn 250 (fn [] (prepare-payload q job)))]
+                   (:ok r))
+        claimed (when prepared (claim! c job now (* 1000 (:lease decl))))]
     (when (some? claimed)
       (let [ref (erlang/make_ref)
             e (:db/id claimed)
@@ -950,7 +1121,9 @@
             captured (diag/with-linkage-fn (:job/diagnostic-context claimed {}) diag/capture)]
         (BeamLisp.Refs/spawn_owned (fn []
                  (let [out (try
-                             {:ok (diag/with-captured-fn captured #(body (job-map claimed)))}
+                             {:ok (diag/with-captured-fn captured #(body (assoc (job-map (assoc claimed :job/payload (:payload prepared)))
+                                                   :job/execution-protocol (:protocol prepared)
+                                                   :job/execution-generation (:generation decl))))}
                              (catch err {:error (error-text err) :failure (diag/safe-error err)}))]
                    (erlang/send me (tuple :bl-queue/finished ref out))))
           :plain (BeamLisp.Env/callback_modules body))
@@ -982,7 +1155,7 @@
                     [:db/add e :job/result (:ok out)]
                     [:db/add e :job/finished-at now]])
       (let [err (str (:error out))]
-        (if (>= attempts (:max (:retry decl)))
+        (if (>= (- attempts (:job/retry-base job 0)) (:max (:retry decl)))
           ;; EXHAUSTED, and the job is KEPT: :failed is a state a human reads,
           ;; which is the whole difference between a retry ceiling and a hole the
           ;; work fell into. `:job/finished-at` is written on THIS arm as well as
@@ -1082,16 +1255,33 @@
 
 (defn- perform-key [srv] (tuple :bl.queue/perform (name srv)))
 
+(defn- validate-contract! [contract]
+  (when-not (and (map? contract)
+                (every? (fn [k] (contains? #{:accept? :adapters} k)) (keys contract))
+                (or (nil? (:accept? contract)) (erlang/is_function (:accept? contract) 1))
+                (or (nil? (:adapters contract)) (map? (:adapters contract))))
+    (throw (ex-info "Invalid queue protocol contract" {:kind :invalid-protocol})))
+  (doseq [[from edge] (:adapters contract)]
+    (when-not (and (positive-int? from) (positive-int? (:to edge)) (> (:to edge) from)
+                  (erlang/is_function (:upcast edge) 1) (erlang/is_function (:accept? edge) 1))
+      (throw (ex-info "Adapters require increasing versions and unary upcast/accept callbacks" {:kind :invalid-adapter}))))
+  contract)
+
 (defn register-perform!
   "Stage this process's perform callback for its immediately following init.
    Retain before publication; queue process death releases the lifetime lease
    through Env's dead-owner reclamation. No global callback registry survives a
    stopped/restarted queue, or collides across environments using one name."
-  [srv f]
-  (let [lease (BeamLisp.Env/retain_code! (BeamLisp.Env/callback_modules f))
-        previous (Process/put (perform-key srv) {:perform f :lease lease})]
+  ([srv f] (register-perform! srv f {}))
+  ([srv f contract]
+  (validate-contract! contract)
+  (let [lease (BeamLisp.Env/retain_code! (concat (BeamLisp.Env/callback_modules f)
+                 (mapcat (fn [g] (BeamLisp.Env/callback_modules g))
+                   (concat (if (:accept? contract) [(:accept? contract)] [])
+                     (mapcat (fn [edge] [(:upcast edge) (:accept? edge)]) (vals (:adapters contract)))))))
+        previous (Process/put (perform-key srv) {:perform f :contract contract :lease lease})]
     (when previous (BeamLisp.Env/release_code! (:lease previous)))
-    f))
+    f)))
 
 (defn- perform-registration [srv] (Process/delete (perform-key srv)))
 
@@ -1102,11 +1292,13 @@
    The declaration is written to the store HERE, at boot. That is what lets
    `enqueue!` be a store write with no process to ask, and it is why a queue
    must be started once before it can be enqueued into."
-  [srv decl clock]
+  ([srv decl clock] (init-state srv decl clock {}))
+  ([srv decl clock contract]
   (announce! srv)
   (ensure-store! srv)
   (let [d (normalise-decl decl)
         registration (perform-registration srv)
+        contract (validate-contract! (merge (:contract registration) contract))
         body (:perform registration)
         _ (when (nil? body)
             (throw (ex-info (str "queue: \"" (name srv) "\" declares no (perform [job] …) —"
@@ -1116,7 +1308,12 @@
         lease (try
                 (BeamLisp.Env/retain_code!
                   (concat (BeamLisp.Env/callback_modules body)
-                          (BeamLisp.Env/callback_modules clock)))
+                          (BeamLisp.Env/callback_modules clock)
+                          (mapcat (fn [edge] (concat (BeamLisp.Env/callback_modules (:upcast edge))
+                                                   (BeamLisp.Env/callback_modules (:accept? edge))))
+                                  (vals (:adapters contract)))
+                          (if-let [accept (:accept? contract)]
+                            (BeamLisp.Env/callback_modules accept) [])))
                 (catch e (do (BeamLisp.Env/release_code! (:lease registration)) (throw e))))]
     (BeamLisp.Env/release_code! (:lease registration))
     (try
@@ -1125,9 +1322,10 @@
                :decl d
                :clock clock
                :perform body
+               :contract contract
                :perform-lease lease
                :running {}}}
-      (catch e (do (BeamLisp.Env/release_code! lease) (throw e))))))
+      (catch e (do (BeamLisp.Env/release_code! lease) (throw e)))))))
 
 (defn arm-first
   "The prelude: subscribe THIS process to its store, and arm the wake for work
@@ -1172,7 +1370,7 @@
                   (get opts :server)
                   (list 'quote (:name ctx)))]
         {:prelude [`(proc.queue/arm-first ~srv ~clock)]
-         :init `(proc.queue/init-state ~srv ~decl ~clock)
+         :init `(proc.queue/init-state ~srv ~decl ~clock ~(:contract opts {}))
          :clauses
          [`(handle-info [:bl-queue/wake] [st#]
              (noreply (proc.queue/run-due st#)))

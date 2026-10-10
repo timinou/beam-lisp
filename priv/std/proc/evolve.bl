@@ -1,7 +1,7 @@
 ; Stable process identity, versioned messages and atomic handler/state evolution.
 ; Upgrade callbacks are pure and short. External effects belong to durable jobs.
 (ns proc.evolve
- (:require [proc.server :as ps] [proc.callback :as cb] [proc.fence :as fence] [core]))
+ (:require [proc.server :as ps] [proc.callback :as cb] [proc.fence :as fence] [proc.queue :as queue] [core]))
 
 (defn- valid-version? [v] (and (erlang/is_integer v) (> v 0)))
 (defn- validate! [spec]
@@ -84,6 +84,52 @@
        (when @next (release! @next))
        [{:status :refused :kind (or (:kind (ex-data e)) :migration-failed)} st]))))))
 
+(defn- valid-client-version? [st version]
+  (and (valid-version? version)
+       (or (= version (get-in st [:current :version])) (contains? (:adapters st) version))))
+
+(defn- acquire [st version]
+  (cond
+    (not (:managed st)) [{:status :refused :kind :unmanaged-owner} st]
+    (not (valid-client-version? st version)) [{:status :refused :kind :unsupported-version} st]
+    (or (contains? (:fenced st) version) (<= version (:fenced-through st 0))) [{:status :refused :kind :version-fenced} st]
+    :else (let [token (erlang/make_ref)]
+            [{:status :acquired :token token :version version}
+             (assoc-in st [:clients token] version)])))
+
+(defn- bind-queue [st srv]
+  (cond
+    (not (:managed st)) [{:status :refused :kind :unmanaged-owner} st]
+    (nil? (queue/declaration srv)) [{:status :refused :kind :undeclared-queue} st]
+    (> (:retired-through st 0) 0) [{:status :refused :kind :inventory-sealed} st]
+    :else [{:status :bound :queue srv} (update st :queues conj srv)]))
+
+(defn- retirement [st expected through]
+  (cond
+    (not (:managed st)) [{:status :refused :kind :unmanaged-owner} st]
+    (not= expected (get-in st [:current :version])) [{:status :stale} st]
+    (not (and (valid-version? through) (< through expected)))
+      [{:status :refused :kind :invalid-retirement} st]
+    :else
+      (let [versions (vec (filter (fn [v] (<= v through)) (keys (:adapters st))))
+            ;; Close both producer paths BEFORE inspecting dependencies. These
+            ;; monotone gates remain closed when retirement waits or crashes.
+            after (assoc st :fenced-through (max through (:fenced-through st 0)))
+            _ (doseq [srv (:queues st)] (queue/fence-through! srv through))
+            live (count (filter (fn [v] (<= v through)) (vals (:clients st))))
+            durable (reduce (fn [n srv]
+                       (+ n (reduce (fn [sum entry]
+                              (if (<= (first entry) through) (+ sum (second entry)) sum))
+                            0 (:protocols (queue/protocol-inventory srv))))) 0 (:queues st))]
+        (if (or (> live 0) (> durable 0))
+          [{:status :waiting :live live :durable durable :through through} after]
+          (do
+            (doseq [v versions]
+              (cb/unregister! (get-in st [:adapters v :callback])))
+            [{:status :retired :versions (vec (sort versions)) :through through}
+             (assoc after :adapters (apply dissoc (:adapters st) versions)
+                          :retired-through (max through (:retired-through st 0)))])))))
+
 (defn- initial-state [opts]
   (validate! (:spec opts))
   (let [limit (:history-limit opts 32) budget (:upgrade-ms opts 250)]
@@ -93,18 +139,39 @@
     (throw (ex-info "Evolution history must be bounded" {:kind :invalid-evolution})))
    (let [held (retain! (:spec opts))]
     (try (valid-state! held (:state opts))
-         {:current held :value (:state opts) :adapters {} :history-limit limit :upgrade-ms budget}
+         {:current held :value (:state opts) :adapters {} :history-limit limit :upgrade-ms budget
+          :managed (:managed opts false) :clients {} :queues #{} :fenced #{} :fenced-through 0 :retired-through 0}
          (catch e (release! held) (throw e))))))
 
 (ps/defserver owner
  (init [opts] (ok (initial-state opts)))
  (handle-call [:proc.evolve/call version message] [_ st]
-  (let [[value after] (dispatch st version message)] (reply value after)))
+  (if (:managed st)
+    (reply {:status :refused :kind :managed-client-required} st)
+    (let [[value after] (dispatch st version message)] (reply value after))))
  (handle-call [:proc.evolve/upgrade expected spec] [_ st]
   (let [[value after] (upgrade st expected spec)] (reply value after)))
+ (handle-call [:proc.evolve/acquire version] [_ st]
+  (let [[value after] (acquire st version)] (reply value after)))
+ (handle-call [:proc.evolve/client token message] [_ st]
+  (if-let [version (get (:clients st) token)]
+    (let [[value after] (dispatch st version message)] (reply value after))
+    (reply {:status :refused :kind :unknown-client} st)))
+ (handle-call [:proc.evolve/release token] [_ st]
+  (reply {:status :released} (update st :clients dissoc token)))
+ (handle-call [:proc.evolve/fence version] [_ st]
+  (if (and (:managed st) (valid-version? version))
+    (reply {:status :fenced :version version} (update st :fenced conj version))
+    (reply {:status :refused :kind :invalid-fence} st)))
+ (handle-call [:proc.evolve/bind-queue srv] [_ st]
+  (let [[value after] (bind-queue st srv)] (reply value after)))
+ (handle-call [:proc.evolve/retire expected through] [_ st]
+  (let [[value after] (retirement st expected through)] (reply value after)))
  (handle-call [:proc.evolve/status] [_ st]
   (reply {:version (get-in st [:current :version]) :digest (get-in st [:current :digest])
-          :legacy-versions (vec (sort (keys (:adapters st)))) :pid (erlang/self)} st))
+          :legacy-versions (vec (sort (keys (:adapters st))))
+          :managed (:managed st) :clients (count (:clients st))
+          :queues (vec (:queues st)) :fenced-versions (vec (sort (:fenced st))) :fenced-through (:fenced-through st) :pid (erlang/self)} st))
  (terminate [_ st]
   (release! (:current st))
   (doseq [edge (vals (:adapters st))] (cb/unregister! (:callback edge)))
@@ -116,8 +183,8 @@
   under this owner's lifetime. Declare captured executable dependencies :modules."
  ([spec state] (start! spec state {}))
  ([spec state opts]
-  (core/start owner {:spec spec :state state :history-limit (:history-limit opts 32) :upgrade-ms (:upgrade-ms opts 250)}
-                    (dissoc opts :history-limit :upgrade-ms))))
+  (core/start owner {:spec spec :state state :history-limit (:history-limit opts 32) :upgrade-ms (:upgrade-ms opts 250) :managed (:managed opts false)}
+                    (dissoc opts :history-limit :upgrade-ms :managed))))
 (defn call!
  "Version travels with the request, including queued calls from old clients."
  ([pid version message] (call! pid version message 5000))
@@ -129,3 +196,30 @@
  ([pid expected spec] (upgrade! pid expected spec 5000))
  ([pid expected spec timeout] (GenServer/call pid [:proc.evolve/upgrade expected spec] timeout)))
 (defn status [pid] (GenServer/call pid [:proc.evolve/status]))
+
+(defn acquire-client!
+ "Acquire an old/new protocol dependency from a managed owner. A token stays
+  counted until explicitly released; process death does not prove a durable
+  sender has stopped. Managed owners refuse raw call! to close bypasses."
+ [pid version] (GenServer/call pid [:proc.evolve/acquire version]))
+(defn call-client!
+ ([pid token message] (call-client! pid token message 5000))
+ ([pid token message timeout] (GenServer/call pid [:proc.evolve/client token message] timeout)))
+(defn release-client! [pid token] (GenServer/call pid [:proc.evolve/release token]))
+(defn fence-version!
+ "Close new client acquisitions; already accepted clients may drain."
+ [pid version] (GenServer/call pid [:proc.evolve/fence version]))
+(defn bind-queue!
+ "Register a durable protocol dependency before retirement begins. Queue
+  protocol numbers must name this owner's message protocol. Registrations are
+  monotone, cannot be removed and are sealed after successful retirement. The
+  framework must register every managed producer; unmanaged owners cannot
+  retire adapters. Queue store must be rebound before its owner starts."
+ [pid srv] (GenServer/call pid [:proc.evolve/bind-queue srv]))
+(defn retire!
+ "Retire the contiguous legacy prefix through a version only after closing
+  admissions and observing zero live client and registered durable dependency.
+  This is scoped to this managed owner/inventory, never a whole-program proof.
+  Failed and held jobs block retirement. Waiting keeps admissions fenced.
+  No caller-supplied boolean or arbitrary callback can authorize collection."
+ [pid expected through] (GenServer/call pid [:proc.evolve/retire expected through] 30000))

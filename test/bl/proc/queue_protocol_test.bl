@@ -1,0 +1,118 @@
+(ns proc.queue-protocol-test
+ (:require [proc :as proc] [proc.queue :as q] [datom :as d] [datom.conn :as dc]
+           [datom.store-map :as sm] [proc.evolve :as ev]))
+
+(proc/defserver protocol-q
+ (queue {:of :test/work :protocol 2 :generation "release-b"
+         :contract {:accept? (fn [p] (and (map? p) (contains? p :test/value)))
+                    :adapters {1 {:to 2 :upcast (fn [p] {:test/value (:test/old p)})
+                                  :accept? (fn [p] (contains? p :test/value))}}}})
+ (perform [job] {:value (:test/value job) :protocol (:job/execution-protocol job)
+                 :original (:job/protocol job) :source (:job/source-id job)}))
+(proc/defserver protocol-manual-q
+ (queue {:of :test/manual :protocol 1 :generation "release-a" :retry {:max 2}})
+ (perform [job] (:test/value job)))
+
+(defn wait-job [srv id state]
+ (loop [n 0]
+  (let [j (d/entity (d/db (q/conn srv)) id)]
+   (cond (= state (:job/state j)) j
+         (> n 500) nil
+         :else (do (Process/sleep 10) (recur (inc n)))))))
+(defn boot-stop [server]
+ (let [p (start server nil {})] (stop p)))
+
+(deftest automatic-metadata-and-old-payload-adaptation
+ (boot-stop protocol-q)
+ (let [j (q/enqueue! :protocol-q {:test/old 42} {:protocol 1 :generation "release-a" :source-id [:doc "a"]})
+       p (start protocol-q nil {})]
+  (try
+   (let [done (wait-job :protocol-q (:db/id j) :done)]
+    (is (string? (:job/id done)))
+    (is (string? (:job/attempt-id done)))
+    (is (= (:job/id j) (:job/id done)))
+    (is (= "release-a" (:job/generation done)))
+    (is (= {:value 42 :protocol 2 :original 1 :source [:doc "a"]} (:job/result done))))
+   (finally (stop p)))))
+
+(deftest stale-snapshots-cannot-resurrect-settled-jobs
+ (boot-stop protocol-manual-q)
+ (let [j (q/enqueue! :protocol-manual-q {:test/value 1}) c (q/conn :protocol-manual-q)
+       old (q/claim! c j 1000 1000)]
+  (d/transact! c [[:db/add (:db/id j) :job/state :done]
+                 [:db/retract (:db/id j) :job/owner (:job/owner old)]])
+  (is (nil? (q/claim! c old 2001 1000)))
+  (is (= :done (:job/state (d/entity (d/db c) (:db/id j)))))))
+
+(deftest old-attempt-cannot-publish-after-reclaim-or-expiry
+ (boot-stop protocol-manual-q)
+ (let [j (q/enqueue! :protocol-manual-q {:test/value 2}) c (q/conn :protocol-manual-q)
+       now (erlang/system_time :millisecond)
+       a (q/claim! c j now 1)]
+  (Process/sleep 5)
+  (let [b (q/claim! c (d/entity (d/db c) (:db/id j)) (erlang/system_time :millisecond) 60000)]
+   (is (= :refused (:status (q/commit-attempt! :protocol-manual-q a [[:db/add (:db/id j) :job/result :wrong]]))))
+   (is (= :committed (:status (q/commit-attempt! :protocol-manual-q b [[:db/add (:db/id j) :job/result :right]]))))
+   (is (= :right (:job/result (d/entity (d/db c) (:db/id j)))))
+   (is (not= (:job/attempt-id a) (:job/attempt-id b)))
+   (is (= (:job/id a) (:job/id b))))))
+
+(deftest failed-retry-preserves-identity-and-protocol-after-admission-fence
+ (let [srv :protocol-retry-q c (dc/connect-with (sm/open) [])]
+  (q/attach-store! srv c)
+  (d/transact! c [{:db/id -1 :queue/key (name srv)
+                  :queue/decl (assoc (q/normalise-decl {:of :test/retry}) :server (name srv))}])
+ (let [j (q/enqueue! srv {:test/value 3} {:source-id "source-3"})]
+  (d/transact! c [[:db/add (:db/id j) :job/state :failed]
+                 [:db/add (:db/id j) :job/attempts 2]
+                 [:db/add (:db/id j) :job/finished-at 100]])
+  (q/fence-through! srv 1)
+  (is (> (get-in (q/protocol-inventory srv) [:protocols 1] 0) 0))
+  (let [retried (q/retry! srv (:db/id j))]
+   (is (= (:job/id j) (:job/id retried)))
+   (is (= "source-3" (:job/source-id retried)))
+   (is (= 1 (:job/protocol retried)))
+   (is (= 2 (:job/attempts retried)))
+   (is (= 2 (:job/retry-base retried)))
+   (is (nil? (:job/finished-at retried))))
+  (is (= :protocol-fenced
+         (try (q/enqueue! srv {:test/value 4}) nil
+              (catch e (:kind (ex-data e)))))))))
+
+(deftest queue-metadata-reconstructs-from-datoms
+ (let [srv :persistent-protocol-q c (dc/connect-with (sm/open) [])]
+  (q/attach-store! srv c)
+  (d/transact! c [{:db/id -1 :queue/key (name srv)
+                  :queue/decl (assoc (q/normalise-decl {:of :test/persist :protocol 3 :generation "g3"}) :server (name srv))}])
+  (let [j (q/enqueue! srv {:test/value 5} {:source-id "document-5"})
+        claim (q/claim! c j (erlang/system_time :millisecond) 60000)
+        recovered (dc/connect-with (:store c) [])
+        again (d/pull (d/db recovered) '[*] [:job/id (:job/id j)])]
+   (is (= (:job/source-id claim) (:job/source-id again)))
+   (is (= (:job/attempt-id claim) (:job/attempt-id again)))
+   (is (= 3 (:job/protocol again)))
+   (is (= "g3" (:job/generation again)))
+   (is (= :store-already-bound (try (q/attach-store! srv (dc/connect-with (sm/open) [])) nil (catch e (:kind (ex-data e)))))))))
+
+(deftest managed-retirement-observes-durable-failures-and-closes-producers
+ (let [srv :retirement-proof-q c (dc/connect-with (sm/open) [])
+       base {:version 1 :digest "m1" :accept? (fn [_] true)
+             :check-state (fn [_] true) :handler (fn [m s] {:reply m :state s})}
+       p (ev/start! base nil {:managed true})]
+  (try
+   (q/attach-store! srv c)
+   (d/transact! c [{:db/id -1 :queue/key (name srv)
+                   :queue/decl (assoc (q/normalise-decl {:of :test/retirement}) :server (name srv))}])
+   (let [j (q/enqueue! srv {:test/value 9})]
+    (is (= :bound (:status (ev/bind-queue! p srv))))
+    (ev/upgrade! p 1 (assoc base :version 2 :digest "m2" :migrate-state (fn [s] s) :upcast (fn [m] m)))
+    (let [waiting (ev/retire! p 2 1)]
+     (is (= :waiting (:status waiting)))
+     (is (= 1 (:durable waiting))))
+    (is (= 1 (:fenced-through (q/protocol-inventory srv))))
+    (d/transact! c [[:db/add (:db/id j) :job/state :failed]])
+    (is (= :waiting (:status (ev/retire! p 2 1))) "failed work retains the adapter")
+    (d/transact! c [[:db/add (:db/id j) :job/state :cancelled]])
+    (is (= :retired (:status (ev/retire! p 2 1))))
+    (is (= :inventory-sealed (:kind (ev/bind-queue! p srv)))))
+   (finally (GenServer/stop p)))))
