@@ -31,3 +31,17 @@ deadline, then forcibly ends remaining members. Slow or stuck cleanup is therefo
 not guaranteed to flush; explicit `stop!` waits without that drain deadline.
 Cleanup must not call back into the realm manager while it is draining.
 Route leases remain a separate gate.
+
+Reproduce the real launcher regression (with a locally installed build):
+
+```sh
+cargo build --manifest-path tooling/drop/Cargo.toml --bin drop-launcher
+python3 tooling/drop/tests/persistent-transport.py \
+  --launcher /path/to/drop-launcher --build 04805c33
+```
+
+The harness uses private runtime/state directories, asserts that the first
+returned command's OS VM remains alive and that a second command uses it, and
+stops its daemon. On 2026-10-10 this passed against release 04805c33 with the new
+launcher: 23,462 ms first boot and 131 ms second dispatch. Runtime service tests
+are separate; this older release does not contain `vm.service`.
