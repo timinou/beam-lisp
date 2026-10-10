@@ -1,0 +1,158 @@
+(ns proc.transition-test
+ (:require [proc.queue-runtime :as runtime] [proc.transition :as transition]
+           [proc.queue :as q] [proc.evolve :as evolve]
+           [datom :as d] [datom.conn :as dc] [datom.store-map :as sm]))
+
+(defn under [digest srv protocol action]
+ (let [previous (Process/get :bl_generation)]
+  (try (Process/put :bl_generation {:digest digest :protocols {(name srv) {:protocol protocol :generation digest}} :modules (vec (BeamLisp.Env/callback_modules action))})
+       (action)
+       (finally (Process/put :bl_generation previous)))))
+(defn wait-state [srv id target]
+ (loop [n 0]
+  (let [job (d/entity (d/db (q/conn srv)) id)]
+   (cond (= target (:job/state job)) job
+         (> n 500) nil
+         :else (do (Process/sleep 10) (recur (inc n)))))))
+(defn prepare-handler [srv digest protocol perform]
+ (under digest srv protocol
+  #(runtime/prepare srv {:declaration {:of :test/runtime :protocol protocol :concurrency 2 :unique [:test/id]}
+                         :perform perform})))
+
+(deftest shared-owner-keeps-exact-old-worker-context-while-new-jobs-run
+ (let [srv :live-runtime-q gate (atom false) began (atom false)
+       c (dc/connect-with (sm/open) [])
+       old (prepare-handler srv "runtime-old" 1
+             (fn [job]
+              (reset! began true)
+              (loop [] (when-not @gate (Process/sleep 5) (recur)))
+              {:value (:test/value job) :generation (:digest (Process/get :bl_generation))}))
+       new (prepare-handler srv "runtime-new" 1
+             (fn [job] {:value (:test/value job) :generation (:digest (Process/get :bl_generation))}))]
+  (q/attach-store! srv c)
+  (let [pid (runtime/start! old)]
+   (try
+    (let [a (q/enqueue! srv {:test/id "old" :test/value 1})]
+     (loop [n 0] (when (and (not @began) (< n 500)) (Process/sleep 5) (recur (inc n))))
+     (is (= true @began))
+     (is (= :applied (:status (runtime/activate! srv "runtime-old" new))))
+     (is (= :already-applied (:status (runtime/activate! srv "runtime-old" new))))
+     (let [b (q/enqueue! srv {:test/id "new" :test/value 2}) done (wait-state srv (:db/id b) :done)]
+      (is (= {:value 2 :generation "runtime-new"} (:job/result done))))
+     (is (= :waiting (:status (runtime/retire! srv "runtime-old"))))
+     (reset! gate true)
+     (let [done (wait-state srv (:db/id a) :done)]
+      (is (= {:value 1 :generation "runtime-old"} (:job/result done))))
+     (is (= :retired (:status (runtime/retire! srv "runtime-old"))))
+     (is (= ["runtime-new"] (:retained (runtime/status srv))))
+     (is (= :generation-fenced
+            (try (q/enqueue! srv {:test/id "late"} {:generation "runtime-old"}) nil
+                 (catch e (:kind (ex-data e)))))))
+    (finally (reset! gate true) (stop pid))))))
+
+(deftest sealed-transition-adopts-explicitly-and-preserves-failures
+ (let [srv :plan-runtime-q c (dc/connect-with (sm/open) [])
+       old (prepare-handler srv "plan-old" 1 (fn [job] (:test/value job)))]
+  (q/attach-store! srv c)
+  (let [pid (runtime/start! old)]
+   (try
+    (let [a (q/enqueue! srv {:test/id "a" :test/value 3} {:in [60 :seconds]})
+          b (q/enqueue! srv {:test/id "b" :test/value 4} {:in [60 :seconds]})]
+     (d/transact! c [[:db/add (:db/id b) :job/state :failed] [:db/add (:db/id b) :job/finished-at 1]])
+     (let [plan (under "plan-new" srv 2
+                 #(transition/prepare!
+                   {:previous-generation "plan-old" :queues {srv {:declaration {:of :test/runtime :protocol 2 :unique [:test/id]}
+                                   :perform (fn [job] (:test/converted job))
+                                   :adoption {:digest "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                                              :protocol 2 :upcast (fn [p] (assoc p :test/converted (:test/value p)))
+                                              :accept? (fn [p] (contains? p :test/converted))}}}}))]
+      (try
+       (is (= :applied (:status (transition/activate! plan))))
+       (is (= :applied (:status (transition/activate! plan))))
+       (is (= :waiting (:status (transition/retire! plan))))
+       (is (= 1 (count (:results (transition/adopt! plan 1)))))
+       (is (= 1 (count (:results (transition/adopt! plan 1)))))
+       (is (= "plan-old" (:job/generation (d/entity (d/db c) (:db/id a)))))
+       (is (= "plan-new" (:job/required-generation (d/entity (d/db c) (:db/id a)))))
+       (is (= :failed (:job/state (d/entity (d/db c) (:db/id b)))))
+       (is (= :retired (:status (transition/retire! plan))))
+       (finally (transition/close! plan)))))
+    (finally (stop pid))))))
+
+(deftest queue-shape-changes-and-rollback-refuse
+ (let [srv :shape-runtime-q c (dc/connect-with (sm/open) [])
+       old (prepare-handler srv "shape-old" 1 (fn [_] :ok))]
+  (q/attach-store! srv c)
+  (let [pid (runtime/start! old)]
+   (try
+    (let [changed (under "shape-new" srv 1
+                    #(runtime/prepare srv {:declaration {:of :test/runtime :unique [:test/other]}
+                                            :perform (fn [_] :ok)}))]
+     (is (= :queue-identity-migration-required (:kind (runtime/activate! srv "shape-old" changed))))
+     (is (= "shape-old" (:generation (runtime/status srv)))))
+    (finally (stop pid))))))
+
+
+(deftest managed-owner-transition-replays-and-waits-for-native-clients
+ (let [base {:version 1 :digest "owner-old" :accept? (fn [_] true) :check-state (fn [_] true)
+             :handler (fn [message state] {:reply message :state state})}
+       owner (evolve/start! base nil {:managed true})
+       next (assoc base :version 2 :digest "owner-new" :migrate-state (fn [s] s) :upcast (fn [m] m))
+       factory (fn [] (transition/prepare! {:owners {:domain {:pid owner :expected 1 :spec next}}}))
+       plan (under "owner-new" :unused-owner-queue 1 factory)
+       client (evolve/acquire-client! owner 1)]
+  (try
+   (is (= :applied (:status (transition/activate! plan))))
+   (is (= :waiting (:status (transition/retire! plan))))
+   (evolve/release-client! owner (:token client))
+   (is (= :retired (:status (transition/retire! plan))))
+   (transition/close! plan)
+   (let [recovery (under "owner-new" :unused-owner-queue 1 factory)]
+    (try
+     (is (= :applied (:status (transition/activate! recovery))))
+     (is (= :retired (:status (transition/retire! recovery))))
+     (finally (transition/close! recovery))))
+   (finally (transition/close! plan) (GenServer/stop owner)))))
+
+(deftest restoration-chooses-durable-primary-and-promotes-retained-target
+ (let [srv :restored-runtime-q c (dc/connect-with (sm/open) [])
+       old (prepare-handler srv "restored-old" 1 (fn [job] (:test/value job)))
+       new (prepare-handler srv "restored-new" 2 (fn [job] (:test/value job)))]
+  (q/attach-store! srv c)
+  (let [pid (runtime/start! old)
+        pending (q/enqueue! srv {:test/id "before-restart" :test/value 7} {:in [60 :seconds]})]
+   (stop pid)
+   (is (= :restart-generation-mismatch
+          (try (runtime/start! new) nil (catch e (:kind (ex-data e))))))
+   (let [stage (runtime/restore! srv "restored-new" [old new])
+         replacement (runtime/start! new)]
+    (try
+     (is (= "restored-old" (:generation (runtime/status srv))))
+     (is (= #{"restored-old" "restored-new"} (set (:retained (runtime/status srv)))))
+     (is (= :applied (:status (runtime/activate! srv "restored-old" new))))
+     (is (= :waiting (:status (runtime/retire! srv "restored-old"))))
+     (is (= :adopted (:status
+       (q/adopt-generation! srv (:db/id pending) "restored-old" "restored-new"
+        {:digest "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+         :protocol 2 :upcast (fn [p] p) :accept? (fn [p] (contains? p :test/value))}))))
+     (is (= :retired (:status (runtime/retire! srv "restored-old"))))
+     (let [job (q/enqueue! srv {:test/id "after-restart" :test/value 8})
+           done (wait-state srv (:db/id job) :done)]
+      (is (= 8 (:job/result done)))
+      (is (= "restored-new" (:job/generation done))))
+     (finally (runtime/release-restoration! stage) (stop replacement)))))))
+
+(deftest clocks-and-protocols-cannot-regress-during-publication
+ (let [srv :strict-runtime-q c (dc/connect-with (sm/open) [])
+       old (prepare-handler srv "strict-old" 2 (fn [_] :ok))
+       clock-change (under "strict-clock" srv 2
+                      #(runtime/prepare srv {:declaration {:of :test/runtime :protocol 2 :concurrency 2 :unique [:test/id]}
+                                              :clock (fn [] (erlang/system_time :millisecond))
+                                              :perform (fn [_] :ok)}))
+       regression (prepare-handler srv "strict-regression" 1 (fn [_] :ok))]
+  (q/attach-store! srv c)
+  (let [pid (runtime/start! old)]
+   (try
+    (is (= :clock-migration-required (:kind (runtime/activate! srv "strict-old" clock-change))))
+    (is (= :protocol-regression (:kind (runtime/activate! srv "strict-old" regression))))
+    (finally (stop pid))))))

@@ -1,0 +1,50 @@
+; Run sequentially using scripts/validate-queue-provider-restart. Intent is
+; fsynced, provider accepts, response is lost, VM exits without graceful close.
+(ns queue.provider-restart
+ (:require [proc.queue :as q] [datom :as d] [datom.conn :as dc]
+           [datom.store :as ds] [datom.store-fjall :as fjall]))
+(defn ensure! [predicate message]
+ (when-not predicate (throw (ex-info message {:kind :acceptance-failed}))))
+(let [path (System/get_env "BL_QUEUE_RESTART_PATH") phase (System/get_env "BL_QUEUE_RESTART_PHASE")
+      srv :restart-provider-q c (dc/connect-with (fjall/open (str path "/jobs")) [])]
+ (q/attach-store! srv c)
+ (if (= phase "submit")
+  (do
+   (d/transact! c [{:db/id -1 :queue/key (name srv)
+                  :queue/decl (assoc (q/normalise-decl {:of :test/restart :generation "before-release"}) :server (name srv))}])
+   (let [job (q/enqueue! srv {:test/document "persistent-job"} {:source-id [:document "persistent-job"]})
+         claimed (q/claim! c job (erlang/system_time :millisecond) 60000)
+         effect (q/begin-effect! srv claimed :provider-upload)]
+    (ensure! (= :submit (:status effect)) "Fresh provider intent must authorize one submit")
+    (ensure! (= :stable (:durability effect)) "Fjall intent must sync before provider acceptance")
+    ; External provider ledger: one accepted request, deliberately no receipt in queue.
+    (File/write! (str path "/provider-accepted") (:effect-id effect))
+    (File/write! (str path "/job-id") (:job/id job))
+    (d/transact! c [[:db/add (:db/id job) :job/lease-until 1]])
+    (ds/sync! (:store c))
+    (println {:phase :submitted :checkpoint :intent :provider-submissions 1 :durability :stable})
+    (erlang/halt 73)))
+  (let [before (first (map #(d/entity (d/db c) (first %))
+                       (d/q '[:find ?e :where [?e :job/state :running]] (d/db c))))
+        _ (ensure! before "Running job must survive abrupt VM exit")
+        claimed (q/claim! c before (erlang/system_time :millisecond) 60000)
+        effect (q/begin-effect! srv claimed :provider-upload)
+        accepted (File/read! (str path "/provider-accepted"))]
+   (ensure! (= (File/read! (str path "/job-id")) (:job/id claimed)) "Stable job identity must survive VM exit")
+   (ensure! (= [:document "persistent-job"] (:job/source-id claimed)) "Source identity must survive VM exit")
+   (ensure! (= "before-release" (:job/generation claimed)) "Producer generation must survive VM exit")
+   (ensure! (= 1 (:job/protocol claimed)) "Payload protocol must survive VM exit")
+   (ensure! (not= (:job/attempt-id before) (:job/attempt-id claimed)) "Recovered claim must fence old attempt")
+   (ensure! (= :refused (:status (q/record-effect! srv before :provider-upload :complete {}))) "Old worker must not acknowledge provider")
+   (ensure! (= :reconcile (:status effect)) "Lost accepted response must not authorize resubmission")
+   (ensure! (= accepted (:effect-id effect)) "Provider lookup must retain stable idempotency identity")
+   (ensure! (= :stable (:durability effect)) "Recovered provider checkpoint must sync")
+   (q/reconcile-effect! srv claimed :provider-upload :complete {:provider-id accepted})
+   (let [state {:queue {:server srv :decl (q/declaration srv) :clock (fn [] (erlang/system_time :millisecond))
+                        :running {:recovered {:e (:db/id claimed) :token (:job/owner claimed) :attempts (:job/attempts claimed)}}}}]
+    (q/settle state :recovered {:ok :reconciled}))
+   (ds/sync! (:store c))
+   (ensure! (= :done (:job/state (d/entity (d/db c) (:db/id claimed)))) "Recovered provider job must finish")
+   (ensure! (= {} (:required-generations (q/generation-inventory srv))) "Completed receipt must release durable generation obligation")
+   (println {:phase :recovered :assertions 12 :provider-submissions 1 :job :done :old-attempt :fenced})
+   (dc/close! c))))
