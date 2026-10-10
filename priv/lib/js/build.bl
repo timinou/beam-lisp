@@ -29,7 +29,8 @@
             [reader-node :as rn]
             [system.ir :as ir]
             [system.js :as native]
-            [bl.json :as json]))
+            [bl.json :as json]
+            [js.cache :as cache] [proc.admission :as admission]))
 
 ; ─── reading a namespace ────────────────────────────────────────────────────
 
@@ -147,8 +148,9 @@
    included (harmless to `eval_string`), the form's own end exact even when
    several forms share a line, or a syntax-quote shrinks the node's end
    position. No position metadata, no second parser."
-  [path]
-  (loop [st (BeamLisp.Ns.Reader/stream (File/read! path) path) out []]
+  ([path] (read-forms+text path (File/read! path)))
+  ([path source]
+  (loop [st (BeamLisp.Ns.Reader/stream source path) out []]
     (let [r (BeamLisp.Ns.Reader/read-next st)]
       (if (= :ok (first r))
         (let [st2 (nth r 2)
@@ -156,7 +158,7 @@
               consumed (loop [c (get st :chars) acc []]
                          (if (or (empty? c) (identical? c stop)) acc (recur (rest c) (conj acc (first c)))))]
           (recur st2 (conj out [(second r) (unicode/characters_to_binary (to-list consumed))])))
-        out))))
+        out)))))
 
 (defn read-forms [path] (vec (map first (read-forms+text path))))
 
@@ -192,7 +194,8 @@
    :fallback-ns supports headerless actor fragments during migration."
   ([path] (prepare-ns path {}))
   ([path options]
-  (let [texts (read-forms+text path)
+  (admission/check!)
+  (let [source (File/read! path) texts (read-forms+text path source)
         forms (vec (map first texts))
         has-head? (and (= :list (rn-tag (first forms))) (sym? (first (rn-items (first forms))) "ns"))
         head (if has-head? (ns-head forms)
@@ -210,6 +213,7 @@
         _ (when has-head? (BeamLisp.Compiler/eval_string (second (first texts)) (BeamLisp.Compiler/new_env "user") path))
         _ (when-let [after (:after-ns options)] (after ns))
         defs (definition-values (if-let [expand (:expand-top options)] (expand body ns path) body))
+        cache-eligible? (every? (fn [d] (and (:name d) (not (BeamLisp.Env/bound? ns (:name d))))) defs)
         ; a placeholder only where the name is unbound: interning nil over a LIVE
         ; definition (compiling `core` itself, or any ns this VM already runs)
         ; would break the very compiler doing the compiling
@@ -237,24 +241,34 @@
         _ (when-let [after (:after-staging options)] (after {:ns ns :defs defs}))
         env (assoc (BeamLisp.Ns.Compiler/new_env ns) :target :js)]
     {:ns ns :path path :requires (:requires head) :js-interop? (:js-interop env)
-     :texts texts :env env :defs defs})))
+     :texts texts :source source
+     :source-sha256 (Base/encode16 (crypto/hash :sha256 source) (list (tuple :case :lower)))
+     :env env :defs defs :cache-eligible? cache-eligible?})))
 
 (defn compile-prepared
-  "Compile prepared definitions through one compiler/error path. A target can
-   supply :check-node to validate its linked ABI against the same checked ANF."
+  "Compile through one checked ANF path. Certified lexical source may reuse
+   immutable ANF; custom checks and unsupported source retain compilation."
   ([prepared] (compile-prepared prepared {}))
   ([prepared options]
   (let [env (:env prepared) path (:path prepared)
         check (or (:check-node options)
-                  (if (:js-interop env) native/check! identity))]
-    (assoc (dissoc prepared :texts :env) :defs
-      (vec (map (fn [d]
-                  (assoc d :node
-                    (try (check (BeamLisp.Ns.Compiler/compile (:form d) env))
-                         (catch ex
-                           (throw (ex-info (str path ": " (or (:name d) "top-level form") ": " (ex-message ex))
-                                           {:path path :name (:name d)}))))))
-                (:defs prepared)))))))
+                  (if (:js-interop env) native/check! identity))
+        key (cache/key-for prepared options)
+        cached (cache/fetch key)]
+   (cache/note! (if cached :hits (if key :misses :declined)))
+   (if cached
+    (assoc (update cached :defs (fn [defs] (mapv (fn [d] (update d :node check)) defs)))
+           :cache-status :hit :cache-key key)
+    (let [compiled (assoc (dissoc prepared :texts :env :source :cache-eligible?) :defs
+       (vec (map (fn [d]
+                   (admission/check!)
+                   (assoc d :node
+                     (try (check (BeamLisp.Ns.Compiler/compile (:form d) env))
+                          (catch ex
+                            (throw (ex-info (str path ": " (or (:name d) "top-level form") ": " (ex-message ex))
+                                            {:path path :name (:name d)}))))))
+                 (:defs prepared))))]
+      (assoc (cache/store! (when (= key (cache/key-for prepared options)) key) compiled) :cache-status (if key :miss :declined) :cache-key key))))))
 
 (defn compile-ns
   "Compile staged namespace definitions to the common checked ANF."
@@ -416,8 +430,10 @@
         ; a namespace the VM already runs is linked by MODULE: the compiler
         ; emits `Ns.Foo.Bar/f` for its defs instead of a global. Map each
         ; built namespace's module back to its own JS defs.
-        by-mod (into {} (map (fn [ns] [(BeamLisp.Link/module_for ns) ns]) (keys table)))
-        stub-mods (into {} (map (fn [ns] [(BeamLisp.Link/module_for ns) ns]) stubs))
+        by-mod (into {} (mapcat (fn [ns] [[(BeamLisp.Link/module_for ns) ns]
+                                            [(BeamLisp.Emit/base_module_for ns) ns]]) (keys table)))
+        stub-mods (into {} (mapcat (fn [ns] [[(BeamLisp.Link/module_for ns) ns]
+                                               [(BeamLisp.Emit/base_module_for ns) ns]]) stubs))
         base-name (fn [f] (let [n (e/atom-text f)] (if (ends-with? n "__bl_v") (subs n 0 (- (count n) 6)) n)))
         remote (fn [m f arity]
                  (cond
@@ -466,6 +482,7 @@
   "One compiled namespace → ES module text. `order` is the build's load order
    (dependencies first)."
   [cns table host missing leaves stubs order]
+  (admission/check!)
   (e/reset-state!)
   (let [used (atom (set (filter (fn [ns] (contains? table ns))
                                 (map first (:requires cns)))))
@@ -498,6 +515,8 @@
                          (str "const N_" (e/mangle t) " = L.lateModule(" (e/js-str t) ");")
                          (str "import * as N_" (e/mangle t) " from \"" (ns-file-from t) "\";")))
                      (sort @used))]
+    (Process/put :bl_js_link_dependencies
+      (assoc (or (Process/get :bl_js_link_dependencies) {}) (:ns cns) (vec (sort @used))))
     (str "// GENERATED by priv/lib/js/build.bl from " (:path cns) " — do not edit.\n"
          "import * as R from \"../rt.mjs\";\n"
          "import * as A from \"../abi.mjs\";\n"
@@ -576,6 +595,8 @@
    unresolved name."
   [opts]
   (let [{:keys [roots entry out core host]} opts
+        _ (cache/reset-stats!)
+        _ (Process/put :bl_js_link_dependencies {})
         leaves (or (:leaves opts) #{})
         stubs (set (or (:stub opts) []))
         ; `:with` adds namespaces reached only by MODULE name (no :require):
@@ -630,6 +651,7 @@
       (throw (ex-info (str "js.build: " (count @missing) " unresolved name(s):\n"
                            (join "\n" (map (fn [[in ns nm]] (str "  in " in ": " ns "/" nm)) (sort-by str (distinct @missing)))))
                       {:missing @missing})))
+    (admission/check!)
     (File/mkdir_p! out)
     (File/mkdir_p! (str out "/ns"))
     (File/write! (str out "/ns/seeded.mjs")
@@ -645,6 +667,21 @@
                                     (filter (fn [ns] (contains? (set order) ns)) (or (:with opts) []))))))
     (File/write! (str out "/native-modules.json")
                  (json/encode {"version" 1 "modules" (into {} (map (fn [ns] [ns (native-module-metadata (get compiled ns))]) order))}))
+    (File/write! (str out "/dependencies.json")
+      (json/encode
+       {:schema "bl.js.dependencies" :version 1
+        :compiler (BeamLisp.AOTCache/compiler_key)
+        :entry entry :roots (vec roots) :with (vec (or (:with opts) []))
+        :host (vec (sort host)) :leaves (vec (sort leaves)) :stubs (vec (sort stubs))
+        :cache (cache/stats)
+        :namespaces (into {} (map (fn [ns]
+          (let [unit (get compiled ns)]
+           [ns {:path (:path unit)
+                :source-sha256 (:source-sha256 unit)
+                :requires (mapv first (:requires unit))
+                :linked (get (Process/get :bl_js_link_dependencies) ns [])
+                :cache-status (:cache-status unit) :cache-key (:cache-key unit)}])) order))}))
     (doseq [ns order] (File/write! (str out "/" (ns-file ns)) (get texts ns)))
     {:modules order :bytes (reduce + 0 (map count (vals texts)))
+     :cache (cache/stats)
      :sources (vec (map (fn [ns] (:path (get compiled ns))) order))}))
