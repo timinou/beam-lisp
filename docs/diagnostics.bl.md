@@ -143,3 +143,15 @@ this only through an authenticated operator control plane, never public input.
 at a trusted `/run/` path whose parent the service manager provisions. This
 worker operates independently of Logger delivery; failed publication leaves a
 stale file. Consumers must distinguish stale samples from healthy channels.
+
+`credential/refresh-completed` reports the actual renewal boundary: a finite
+provider, numeric status, returned/failed/raised outcome, recovery category and
+elapsed milliseconds. Credential values and provider bodies remain excluded.
+Connection/client/integration/run handles are optional reserved context IDs.
+
+`diagnostics.health/start!` starts a VM-owned supervisor for a single periodic
+publisher, returning its PID; `stop!` stops that supervisor. Samples include
+channel capacity, boot/release identity and projection counters. The health
+file is independent of Logger, atomically replaced and mode 0600 in a
+service-provisioned private directory. A failed write leaves an old sample;
+consumers must check sample age instead of interpreting it as current health.
