@@ -123,7 +123,9 @@ worst kind of configuration bug.
   The language itself only checks that it is a string.
 - `:tasks` — name → a file to run, or `{:run FILE :doc STRING :paths […]
   :watch BOOL :service BOOL :args [STRING…]}`. Task args precede invocation args.
-- `:ports` — name → a port number, or `{:port N}` (`0` = the OS chooses).
+- `:ports` — name → a port number, or `{:port N :routes {HOST "/path"}}`
+  (`0` = the OS chooses). Routes are optional local landing paths; applications
+  claim those hostnames and serve their own root redirects through the gateway.
 - `:env` — name → value, the environment the tree expects.
 - `:loading` — `{:environment-env "BL_ENV" :development :lazy :production :startup
   :roots []}`. `bl serve` initializes declared entry dependencies before running
@@ -298,6 +300,24 @@ problems reports all three in one pass.
       (keys v))
     :else [{} [":tasks must be a map of name → task"]]))
 
+(defn- route-target? [target]
+ (and (string? target) (String/starts_with? target "/")
+      (not (String/starts_with? target "//"))
+      (every? (fn [c] (and (> c 32) (not= c 127) (not= c 92))) (String/to_charlist target))))
+(defn- norm-port-routes [routes]
+ (if (nil? routes) [{} []]
+  (if (and (map? routes)
+           (every? (fn [[host target]]
+                     (and (string? host)
+                          (<= (count host) 253)
+                          (every? (fn [label]
+                                    (and (<= 1 (count label) 63)
+                                      (Regex/match? (Regex/compile! "^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$") label)))
+                                  (String/split host "."))
+                          (route-target? target))) routes)
+           (= (count routes) (count (set (map (fn [host] (String/downcase host)) (keys routes))))))
+   [(into {} (map (fn [[host target]] [(String/downcase host) target]) routes)) []]
+   [{} ["port :routes must map distinct hostnames to local /paths"]])))
 (defn- norm-ports [v]
   (cond
     (nil? v) [{} []]
@@ -305,14 +325,16 @@ problems reports all three in one pass.
     (reduce
       (fn [acc k]
         (let [spec (get v k)
-              known (cond
-                      (erlang/is_integer spec) {:port spec}
-                      (map? spec)     {:port (or (:port spec) 0)}
-                      :else           nil)]
-          (if (nil? known)
-            [(nth acc 0) (conj (nth acc 1)
-                               (str "port \"" k "\" must be a number or {:port N}"))]
-            [(assoc (nth acc 0) (key-name k) known) (nth acc 1)])))
+              port (if (map? spec) (if (contains? spec :port) (:port spec) 0) spec)
+              [routes route-errors] (norm-port-routes (when (map? spec) (:routes spec)))
+              valid? (and (erlang/is_integer port) (<= 0 port 65535))
+              errors (concat route-errors
+                       (when-not valid? [(str "port \"" k "\" must be 0..65535 or {:port N}")]))]
+          [(if (and valid? (empty? route-errors))
+             (assoc (nth acc 0) (key-name k)
+               (if (seq routes) {:port port :routes routes} {:port port}))
+             (nth acc 0))
+           (concat (nth acc 1) errors)]))
       [{} []]
       (keys v))
     :else [{} [":ports must be a map of name → port"]]))
