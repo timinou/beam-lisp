@@ -1,5 +1,5 @@
 ; diagnostics — scoped, schema-projected execution events.
-(ns diagnostics)
+(ns diagnostics (:require [diagnostics.code :as code]))
 
 (def STATE-KEY :bl_diagnostics)
 (def ^:private ID-PATTERN (Regex/compile! "^[A-Za-z0-9_-]{1,96}$"))
@@ -39,10 +39,13 @@
 (defn- event-name? [event]
   (and (keyword? event) (some? (namespace event)) (<= (count (str event)) 128)))
 
+(declare health!)
+
 (defn- project [schema fields]
   (reduce (fn [out [k type]]
             (let [v (when (map? fields) (get fields k))]
-              (if (valid-field? type v) (assoc out k v) out)))
+              (if (valid-field? type v) (assoc out k v)
+                (do (when (some? v) (health! :invalid-field)) out))))
           {} (take 24 schema)))
 
 (defn- runtime-key [] (tuple :bl_diagnostics_config (erlang/get :bl_env)))
@@ -65,10 +68,17 @@
 
 (defn context [] (get (state) :context {}))
 (defn loss-count [] (let [c (:loss (state))] (if c @c 0)))
-(defn- lost! [] (when-let [c (:loss (state))] (swap! c inc)) nil)
+(defn health [] (if-let [c (:health (state))] @c {}))
+(defn health! [kind]
+  (when (contains? #{:unknown-event :invalid-field :truncated :sink-failure} kind)
+    (when-let [c (:health (state))] (swap! c update kind (fnil inc 0)))) nil)
+(defn- lost! [kind]
+  (health! kind)
+  (when-let [c (:loss (state))] (swap! c inc)) nil)
 
 (def BUILTIN-EVENTS
-  {:live.navigation/completed
+  {:diagnostics.code/frame {:level :warning :fields {:code/site-id :id :code/frame :count :code/arity :count :code/line :count}}
+   :live.navigation/completed
    {:level :info :fields {:live.navigation/duration-us :count :live.navigation/reductions :count
                          :live.navigation/mailbox-count :count :live.navigation/queue-us :count :live.navigation/outcome #{:returned :raised}
                          :live.navigation/worlds-us :count :live.navigation/screen-us :count
@@ -109,7 +119,7 @@
     (let [st (state) spec (when (event-name? event) (get (:events st BUILTIN-EVENTS) event)) sink (:sink st)]
       (when (and sink (or (nil? spec) (enabled? event)))
         (if (nil? spec)
-          (lost!)
+          (lost! :unknown-event)
           (let [record (merge (:context st {})
                               (get-in st [:span :fields] {})
                               (project (:fields spec) (if (fn? fields) (fields) fields))
@@ -123,8 +133,8 @@
                                         :diagnostics/span-name (:name span)}
                                 (when (:parent span) {:diagnostics/parent-span-id (:parent span)}))
                          record)]
-            (try (when (= :dropped (sink record)) (lost!)) (catch _ (lost!)))))))
-    (catch _ (lost!)))
+            (try (when (= :dropped (sink record)) (lost! :sink-failure)) (catch _ (lost! :sink-failure)))))))
+    (catch _ (lost! :sink-failure)))
   nil)
 
 (defn with-options-fn
@@ -135,7 +145,7 @@
             (and (contains? opts :sink) (some? (:sink opts)) (not (fn? (:sink opts))))
             (not (contains? LEVELS (:min-level opts :debug))))
     (throw (ex-info "diagnostics: invalid options" {:kind :invalid-config})))
-  (when (> (count (merge (:events (state) {}) (:events opts {}))) (+ 64 (count BUILTIN-EVENTS)))
+  (when (> (count (apply dissoc (merge (:events (state) {}) (:events opts {})) (keys BUILTIN-EVENTS))) 256)
     (throw (ex-info "diagnostics: bounded event registry exceeded" {:kind :invalid-config})))
   (doseq [[event spec] (:events opts {})]
     (when (or (not (keyword? event)) (nil? (namespace event)) (contains? BUILTIN-EVENTS event)
@@ -145,14 +155,14 @@
                                      (contains? CONTEXT-KEYS k)
                                      (= "diagnostics" (namespace k))
                                      (not (or (contains? #{:count :flag :id :namespace} type)
-                                              (and (set? type) (<= (count type) 32)
+                                              (and (set? type) (<= (count type) 128)
                                                    (every? (fn [v] (and (keyword? v) (<= (count (str v)) 64))) type))))))
                     (:fields spec {})))
       (throw (ex-info "diagnostics: invalid event schema" {:kind :invalid-config}))))
   (let [previous (erlang/get STATE-KEY)
         st (state)]
     (erlang/put STATE-KEY (merge st (select-keys opts [:sink :min-level]) {:events (merge BUILTIN-EVENTS (:events st {}) (:events opts {}))
-                                       :environment (erlang/get :bl_env) :context (:context st {}) :loss (or (:loss st) (atom 0))}))
+                                       :environment (erlang/get :bl_env) :context (:context st {}) :loss (or (:loss st) (atom 0)) :health (or (:health st) (atom {}))}))
     (try (f) (finally (if (= previous :undefined) (erlang/erase STATE-KEY)
                          (erlang/put STATE-KEY previous))))))
 
@@ -163,7 +173,7 @@
   (let [previous (erlang/get STATE-KEY)
         st (state)
         allowed (reduce (fn [m k] (assoc m k :id)) {} CONTEXT-KEYS)]
-    (erlang/put STATE-KEY (assoc st :environment (erlang/get :bl_env) :context (merge (:context st {}) (project allowed ctx))))
+    (erlang/put STATE-KEY (assoc st :environment (erlang/get :bl_env) :context (merge (apply dissoc (:context st {}) (filter #(and (contains? allowed %) (nil? (get ctx %))) (keys ctx))) (project allowed ctx))))
     (try (f) (finally (if (= previous :undefined) (erlang/erase STATE-KEY)
                          (erlang/put STATE-KEY previous))))))
 
@@ -190,6 +200,7 @@
                                         :diagnostics/duration-ms (- (erlang/monotonic_time :millisecond) start)})
           result)
         (catch e
+          (doseq [frame (code/stack __STACKTRACE__)] (emit! :diagnostics.code/frame frame))
           (emit! :diagnostics.span/ended (merge (safe-error e) {:diagnostics/outcome :raised
                                       :diagnostics/duration-ms (- (erlang/monotonic_time :millisecond) start)}))
           (throw e)))
@@ -244,7 +255,8 @@
                (project (:fields span-spec) record)
                (project (:fields spec) record)
                (project {:diagnostics/event-id :id :diagnostics/span-id :id
-                         :diagnostics/parent-span-id :id :diagnostics/at :count} record)
+                         :diagnostics/parent-span-id :id :diagnostics/at :count
+                         :diagnostics/truncated :flag} record)
                (when span-spec {:diagnostics/span-name span-name})
                {:diagnostics/schema-version 1 :diagnostics/event event
                 :diagnostics/level (:level spec :info)})))))

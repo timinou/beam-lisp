@@ -122,3 +122,24 @@ with `diagnostics/truncated=true`.
 records independently of logging. `loss-count` counts local projection and sink
 failures; delivery statistics also expose downstream loss. Diagnostics are lossy;
 audit receipts and recovery state belong in durable storage.
+
+Application registries accept 256 events and 128 keyword enum members. Fields
+remain limited to 24 and JSON records to 8 KiB. `diagnostics/health` exposes
+finite counters for unknown events, invalid non-nil fields, sink failure and
+truncation. Optional absent fields and disabled events are not losses.
+
+Trusted nested context may explicitly clear a context key with nil. Detached
+work still uses `with-linkage-fn` to mint fresh trace/attempt IDs.
+
+`diagnostics.code/configure!` accepts a trusted release catalog keyed by existing
+module/function spellings. `stack` projects at most eight frames to catalog site
+handles, arity and catalog line; it never emits arguments or unknown paths.
+`with-operation-fn` registers a local execution handle for its dynamic lifetime;
+`sample` resolves that handle internally and takes at most three snapshots over
+four seconds. It accepts no PID and reads no dictionaries or messages. Expose
+this only through an authenticated operator control plane, never public input.
+
+`diagnostics.health/start!` can publish a private atomic sample every 15 seconds
+at a trusted `/run/` path whose parent the service manager provisions. This
+worker operates independently of Logger delivery; failed publication leaves a
+stale file. Consumers must distinguish stale samples from healthy channels.
