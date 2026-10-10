@@ -52,8 +52,9 @@ dirty-I/O scheduler. That is a host tuning choice, not a language requirement.
 The compiler builds `runtime.bl` with `test.bl` into `out/bundle.mjs`, with
 `demo.bl` into `out/demo.mjs`, with `super-demo.bl` into
 `out/super-demo.mjs`, and with `trace-demo.bl` into `out/trace-demo.mjs`.
-All four import `../host.mjs`; deploy them with that
-relative layout. Numeric decision reports are generated beside each bundle
+All four import the `../host.mjs` compatibility entrypoint. Serve the repository
+root for source demos; deploy artifacts through `js.actor/write-runtime!` with the
+canonical value module. Numeric decision reports are generated beside each bundle
 under `out/numeric-gate.*.json`. No BEAM process is involved when Node or the
 browser executes any bundle.
 
@@ -62,10 +63,10 @@ browser executes any bundle.
 After building:
 
 ```sh
-python3 -m http.server 8765 --bind 127.0.0.1 --directory research/js-actors
+python3 -m http.server 8765 --bind 127.0.0.1 --directory .
 ```
 
-Open <http://127.0.0.1:8765/browser.html>. The page launches a module Worker,
+Open <http://127.0.0.1:8765/research/js-actors/browser.html>. The page launches a module Worker,
 imports the generated bundle, records the acceptance output and checks that
 Worker timer callbacks ran during execution. A timeout, Worker error, assertion
 failure or missing success marker fails the page. The structured result is also
@@ -74,7 +75,7 @@ are required for this harness.
 
 ### See an actor receive browser events
 
-Open <http://127.0.0.1:8765/demo.html> using the same HTTP server. The page
+Open <http://127.0.0.1:8765/research/js-actors/demo.html> using the same HTTP server. The page
 shows a status badge, a visible browser/BL event log, a text field and **Send to
 BL actor** / **Stop actor** buttons. It first sends one input before runtime
 creation. After BL reports ready, it sends one while another BL actor has a
@@ -100,7 +101,7 @@ Stop, pre-registration timed sleep and normal/crashing sink cleanup;
 
 ### See BL supervision and recovery in the browser
 
-Open <http://127.0.0.1:8765/super-demo.html> after the same build and HTTP
+Open <http://127.0.0.1:8765/research/js-actors/super-demo.html> after the same build and HTTP
 server. `super-demo.bl` declares one tree with `proc.super/defsupervisor`, starts
 it as a BL actor and prints its own `sup-children` ledger. The page sends one
 automatic **Crash child** event after BL reports ready. Its log shows the
@@ -125,7 +126,7 @@ not invent that promise. The long-lived application actor owns the demo sink.
 
 ### See a logical BL source trace in the browser
 
-Open <http://127.0.0.1:8765/trace-demo.html>. `trace-demo.bl` deliberately
+Open <http://127.0.0.1:8765/research/js-actors/trace-demo.html>. `trace-demo.bl` deliberately
 raises in a BL actor; its module Worker forwards the BL runtime's diagnostic
 and then ends with the *expected* failure. The browser tool observed
 `research/js-actors/trace-demo.bl:5:3 in trace-demo-leaf/0` and marked the

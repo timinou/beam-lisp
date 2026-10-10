@@ -1,6 +1,6 @@
-# Native operations inside actor namespaces
+# Native operations and compiled BL links inside actor namespaces
 
-This checked compiler prototype accepts the existing native namespace annotation:
+The library `js.actor` accepts the existing namespace shorthand:
 
 ```clojure
 (ns ^:js app.prepare (:require [app.kernel :as kernel]))
@@ -8,62 +8,286 @@ This checked compiler prototype accepts the existing native namespace annotation
   (receive
     [:job caller input]
       (let [output (kernel/compute input)]
-        (.postMessage js/self #js {:op "result" :output output})
+        (.postMessage js/self #js {:op "result" :output (bl->js output)})
         (rt-send caller [:done]))))
 ```
 
-`kernel/compute` links to a synchronous, already compiled BL export. The actor
-calls the ES import directly, with unchanged arguments and result. There is no
-`host/emit` round trip, encoding, Promise, callback dispatch or actor call frame
-on that edge. Local actor messages can carry native references without copying.
-Native object identity survives a send/receive in the same realm. Workers still
-have their explicit cross-thread structured-clone boundary.
+Two different edges have different value contracts:
 
-The build API has a fifth options argument:
+- A compiled BL import such as `kernel/compute` takes canonical BL values and
+  returns them unchanged. Its checked module manifest declares the BL ABI.
+  Collections, exact decimals, float identity and native references can cross
+  that call without conversion, copying, encoding, promises or actor frames.
+- An actual JavaScript operation such as `.postMessage` uses the shared native
+  boundary. Known BL collections require `#js` or `bl->js`, and exact decimal
+  conversion requires an explicit policy. `system.js/check!` reports known
+  mistakes during compilation; `js.emit/emit-native` owns evaluation order.
+
+Local actor messages retain references in the same realm. Workers have their
+explicit structured-clone boundary. An actor callback can enter JavaScript only
+when its checked body is non-suspending; it still runs through the same frame
+machine. Calling a compiled BL helper directly has no callback entry overhead.
+
+## Build contracts
+
+Use the manifest emitted by the ordinary frontend build:
 
 ```clojure
-(build-one directory "prepare.bl" "prepare.mjs" []
-  {:prune true
-   :native-links {"app.kernel/compute"
-                  {:path "../../out/app.kernel.mjs"
-                   :export "d_compute" :arities #{1}}}})
+(ns build.prepare (:require [js.actor :as actors]))
+(actors/build-one directory "prepare.bl" "prepare.mjs" []
+  {:prune true :native-manifest (str frontend "/native-modules.json")
+               :native-base "../../../../out"})
+(actors/link-runtime! package-actor-dir "../../../out/actor")
 ```
 
-The manifest is build configuration, not another source namespace declaration.
-Use a source provider declaring the public export, as with ordinary BL requires.
-Only annotated source files may use native links. The canonical reader/compiler
-own annotation, privacy, aliases and native ANF. `system.js/check!` rejects known
-BL collections crossing native JS operations without `#js` or `bl->js`.
-`js.emit/emit-native` owns JS evaluation order in both profiles.
+The canonical compiler owns namespace declarations, aliases, privacy, callable
+shapes and native ANF. `js.build/native-module-metadata` derives public mangled
+exports, fixed arities and variadic minimums from that checked compilation.
+Application initialization is not evaluated to discover exports. Native-enabled
+providers are bounded by the manifest; imports are emitted only for retained
+references. Arity checks run before pruning, including dead definitions.
 
-The host's `native.mjs` owns the actor profile's value checks and explicit
-`bl->js`/`js->bl` conversions. Native objects and primitive numbers are unchanged.
-The sync profile's BL collection representation is different from the actor
-profile's: linked helpers must use native JS arguments/results, not silently pass
-profile-specific BL collections. This is a native ABI link, not a claim that both
-BL collection ABIs have been unified. A suspending actor function cannot be a
-synchronous JS callback; it fails clearly. Native synchronous callbacks can be
-passed directly. Ordinary actor calls still use the existing generator machine.
+`:native-links` remains a fixture/legacy adapter. Such explicit links default to
+the JavaScript ABI; `:abi :bl` explicitly declares canonical BL values. They
+cannot override manifest-owned exports. Production packages should consume the
+compiler manifest instead of maintaining export tables.
 
-The regular `js/build!` sync profile still refuses `receive`. This integration
-lives in the checked actor compiler; promotion to the normal package linker is a
-separate step. No new scheduler or reader was introduced.
+`native-module-test.bl` checks manifest emission, privacy, mangling, fixed and
+variadic arities, warm/cold linking, parent isolation and value-module packaging.
+`linked-values.bl` exercises canonical collection, decimal and float identity
+through direct and indirect imported calls. JavaScript-only import checks retain
+missing-`#js` diagnostics.
 
-Run the focused build/refusal checks in one capped BL VM:
+The ordinary editor lowering still refuses `receive`. Promoting actor execution
+to every ordinary module, sharing the compiled core and migrating the live
+evaluator remain explicit consolidation work; the shared native-expression
+emitter, values, contracts and runtime ownership are the verified foundations.
 
+### Canonical values and artifact identity
+
+Actor frames now reuse `priv/lib/js/rt.mjs` keywords, lists, tuples,
+vector tries, persistent HAMT maps and sets. Map updates share tree nodes;
+they no longer clone the whole table. Mutable actor tables remain distinct,
+runtime-bound host handles with explicit destruction and capacity limits.
+Record adapters use canonical maps tagged with `:__struct__`.
+
+When packaging the host, call `write-runtime! source-dir output-dir value-url`.
+The URL must name the **same module** imported by the frontend's compiled
+modules. Copying `rt.mjs` into an actor-specific directory creates separate
+keyword caches and classes and breaks identity. For Pelagic's existing layout,
+the host at `pkg/pelagic/actor/host.mjs` binds `../../../out/rt.mjs`.
+The source-tree host uses the source-tree canonical runtime; the research HTTP
+server explicitly serves the canonical runtime dependencies.
+
+Canonical arithmetic and literal lowering now also preserve float identity and
+exact decimals. Checked actor callables can now enter the canonical callable ABI; compiled
+core/prelude ownership and the two lowering entrypoints remain tracked
+consolidation work. Native JS objects retain identity and native JS
+numbers remain native at the explicit interop boundary.
+
+
+The actor compiler delegates literals to `js.emit/lit-js`, arithmetic to the
+canonical runtime, and reference traversal/namespace rewriting to `system.ir`.
+Literal data and annotations are opaque: a quoted map containing `:op :global`
+is data, not a dependency. `system.suspension` provides a conservative,
+annotation-independent fixed point for checked callback integration;
+synchronous is separate from pure, and creating a closure is separate from
+executing its body. Unknown callees fail closed.
+
+### Checked callbacks enter the same machine
+
+`system.suspension` inspects checked ANF, every arity arm and reachable calls.
+Creating a closure is synchronous; executing a `receive` is not. Unknown dynamic
+calls fail closed, and an authored annotation cannot establish a proof. The actor
+emitter attaches the resulting evidence to its callable, not to a second compiled
+body. A JavaScript callback enters `runTurn` with that same generator factory.
+Captured values, arity dispatch, nested calls and thrown values retain their BL
+semantics. Actor-state operations also require an actor event entrypoint: an
+external host callback has no actor identity to borrow. An unproved callback
+needs that entrypoint instead.
+
+The synchronous entry has a hard 100,000-machine-step limit, including inside a
+critical section. This bounds machine execution, not wall time inside an opaque
+native function. Cancellation is thrown at the suspension point with a separate bounded cleanup
+reserve for finalizers. Failure restores critical depth and never schedules an
+abandoned continuation. Synchronous proof is neither a purity nor a termination proof.
+
+`priv/lib/js/native-values.mjs` now owns conversion for both entrypoints. Its only
+execution hooks are callable dispatch, collection realization and callback proof
+validation. Decimal conversion, float boxing, cyclic values, prototype-safe object
+construction, lazy/set/tuple refusal and native function round trips therefore
+have one implementation. `write-runtime!` includes this shared source in packaged
+actor artifacts. The ordinary build includes it beside `interop.mjs`.
+
+Compilation runs in an isolated registry scope and masks ambient BEAM links for
+manifest-owned native exports. A warm compiler VM must generate the same native
+import as a cold one, without initializing or changing the provider in its parent
+scope. This is necessary for reproducible builds, not a new user-facing API.
+
+`native-test.bl` builds the numeric and callback fixtures; their Node tests then
+exercise emitted code, alongside the lower-level callback and conversion tests.
+
+### Library ownership and package builds
+
+`js.actor` is now the library compiler. Its shipped runtime lives under
+`priv/lib/js/actor/`: `runtime.bl` owns scheduling policy; `host.mjs` owns the
+frame engine and host leaves; `native.mjs` binds the shared value boundary.
+Research `compiler.bl` contains fixtures and placement experiments and requires
+this library. Research host modules are compatibility re-exports, and the
+research scheduler source is a symlink to the canonical BL source.
+
+A package build requires the library directly:
+
+```clojure
+(ns my.build (:require [js.actor :as actors]))
+(actors/build-one scratch "prepare.bl" "prepare.mjs" []
+  {:prune true :native-manifest (str frontend "/native-modules.json")
+               :native-base "../../../../out"})
+(actors/link-runtime! package-actor-dir "../../../out/actor")
 ```
-bin/bl run -p research/js-actors research/js-actors/native-test.bl
-node research/js-actors/native-fixture.test.mjs
-node --test research/js-actors/native-values.test.mjs
-```
 
-With `:prune true`, the emitter keeps only ANF-reachable definitions from `main`,
-`bl-main` and optional `:roots`. Function values count as edges; hidden receive
-support counts as an edge. The complete source is reference-audited first, so
-unreachable code cannot hide a forbidden host reference. A reachable dynamic
-`host/ref` disables pruning and preserves the whole bundle. Aliases are emitted
-only for retained targets. Native import arities and known missing `#js` arguments
-are checked by `system.js` before pruning, including lexical let-bound values.
-Native argument checks are omitted only for proved raw values; unknown values
-keep checks. Actor-profile result wrapping is eliminated because native values
-already have the profile's representation. Neither optimization changes syntax.
+The ordinary frontend build publishes its single engine at `out/actor/`.
+`link-runtime!` writes re-exports to that engine, preserving module identity
+and the shared canonical `out/rt.mjs`. It does not create another runtime.
+`write-runtime!` remains available for standalone deployments that explicitly
+supply a canonical value-module URL. The old three-argument form delegates to
+the shipped implementation, so a research compatibility file cannot accidentally
+be packaged as an engine.
+
+This ownership change does not finish ordinary lowering migration. The legacy
+actor collection prelude and direct emitter still require consolidation against
+the common compiled core and actor control. They remain explicit roadmap items;
+removing them before their consumers migrate would break existing semantics.
+
+Shared checked patterns and reader vocabulary
+---------------------------------------------
+
+`js.pattern/lines` owns binding-pattern traversal for both current emitters.
+It uses canonical `rt.mjs` structural views, strict term equality for literals,
+and one map lookup with a missing sentinel. A missing record field cannot
+match a present nil. This does not change `case`: that language macro uses
+BL numerical/sequential equality rather than binding-pattern semantics.
+
+Actor compilation now uses `reader-node` for nodes/spans and `js.emit` for
+injective identifiers and Unicode-safe strings. There is no second mangler
+or byte-oriented string escape implementation. `Rt/str_v` has a temporary
+packed-rest ABI adapter to the existing BL join kernel; it is not another
+string algorithm, and disappears with the compiled-core migration.
+
+Validation: 51 focused runtime/native/pattern checks; 461 actor checks under
+default, 17-step and 41-step budgets, plus scheduler hardening; the ordinary
+compiler's eight BEAM/JS differential groups are identical after a fresh build.
+
+Shared namespace staging
+------------------------
+
+Both lowering paths call `js.build/prepare-ns`. It marks the namespace loaded
+in the caller's private environment, installs aliases/requires, interns forward
+placeholders, defines macros and their statically reached helper functions, and
+returns the target compiler environment. Application `def` initializers and
+top-level effects are compiled data at this stage; they are never evaluated to
+discover exports. `defn-value-form` supplies the same function name, clauses,
+doc/attribute handling and source span to both consumers.
+
+Actor staging masks linked native providers after namespace setup, then masks
+its own runtime links after macro-helper staging. The helpers' compiled BEAM
+implementations remain available to expansion. Their BEAM links must not escape
+into JavaScript runtime calls. Both masks belong to the isolated build env.
+A headerless actor fragment supplies an explicit fallback namespace; ordinary
+namespace builds still require their real `ns` declaration.
+
+`staging-test.bl` compiles an initializer that would throw if accidentally run,
+checks definition order and isolation, and builds a transitive macro-helper /
+forward-reference fixture. `staging.test.mjs` executes its actor output. The ordinary emitter, evaluator and collection prelude remain later migration
+gates; shared staging alone does not replace them.
+
+Common definitions and actor initialization
+-------------------------------------------
+
+`js.build/definition-values` and `compile-prepared` now own definition extraction
+and ANF compilation for both consumers. Actor server/supervisor declarations
+expand into ordinary definition forms before that pass; the actor compiler no
+longer maintains a separate defn-only compilation path. `def`, comments,
+declarations and top-level expressions therefore follow the common rules.
+
+The actor initializer binds function exports and their runtime aliases first,
+then runs value/effect initializers in source order through the same frame
+machine. This supports forward function calls from initializers. Initialization
+yields to host tasks at the machine budget rather than allowing a hundred
+million uninterrupted frame transitions. Receiving during module initialization
+still has no actor owner/resumer and is refused; the namespace-actor lifecycle
+migration must resolve that before general actor module startup is complete.
+
+Global and alias lookup distinguish a bound native `undefined` from an absent
+key. Pruning conservatively retains modules with value/effect initializers; it
+never drops an initializer just because no export references its result.
+Effect-aware initializer reachability is a later optimization.
+
+Cold validation covers native link/refusal fixtures, staged macros, source-ordered
+initializers, forward calls, native undefined, server/supervisor lowering, 55
+focused JS checks, 461 actor checks at each of three budgets, hardening, and
+eight ordinary BEAM/JS differential groups. These changes consolidate source
+preparation and definition compilation; qualified namespace linking and common
+core/control/evaluator migration remain required before profile unification.
+
+Canonical-core pressure test
+----------------------------
+
+`common-core-audit.bl` compiles the actual `priv/boot/rt.bl` and `core.bl`
+through actor source preparation and inventories checked IR operations, remote
+contracts and nonlocal globals. It writes `out/common-core-audit.json`. The
+current inventory contains 458 rt functions and 152 core functions plus three
+values and one expression. Every remote call has a provider classification in the
+existing actor allowlist, canonical primitive table or compiled rt/core providers.
+The actor allowlist classification checks names; it does not add an arity proof.
+
+This is a migration audit, not an execution benchmark or parity claim. The
+qualified linker must prefer compiled namespace definitions before primitives;
+packed-rest call conventions, lazy thunk forcing/ownership and higher-order
+callback contracts must pass before replacing the actor collection prelude.
+
+Self-hosted build dependency ownership
+------------------------------------
+
+The common pattern traversal is part of the running compiler as well as source
+for the browser compiler. Load its BEAM implementation before staging target
+forward references, just as for system.ir. Otherwise a cold build that includes
+js.pattern can mark the namespace loaded with nil placeholders and prevent the
+running emitter from loading it. Warm fixture tests conceal that failure. The
+cold CLI regression now explicitly includes both shared dependencies.
+
+Namespace lookup while compiling
+--------------------------------
+
+Repeated absence checks previously scanned the environment table. The native BL
+host now caches at most 128 namespace answers per process, bounded to 512-byte
+names and 32 chain entries. A hit requires unchanged namespace/wide publication
+generations and live environments, with no writer in flight. Failed certification
+uses the original scan; no negative TTL or permanent loaded-name shortcut exists.
+
+`test/bl/env_namespace_cache_test.bl` compares a separately compiled pinned probe
+with the unchanged live host. It checks variable/declaration mutation, inherited
+reads, fork restoration, destruction, bulk deletion, an overlapping publisher and
+cache bounds. `BL_ENV_CACHE_REPORT=/tmp/cache.json ./bin/bl --cold test
+test/bl/env_namespace_cache_test.bl` retains seven 100-call samples. One loaded
+compiler VM measured median 45,335 versus 204 microseconds per 100 absent-name
+queries (about 222 times faster), and about 251 times fewer reductions. This is
+lookup evidence, not an end-to-end startup/build latency claim.
+
+One multi-arity value contract
+-----------------------------
+
+Canonical `$blfn` arm selection and variadic rest packing now live in the shared
+value ABI. Ordinary invocation and actor frames both consume that decision. A
+fixed arm wins by presence, including a present nil arm, and rest is packed once.
+Previously an ordinary linked function selected inside a multi-arity value
+returned no frame factory and the actor engine tried to invoke the whole tuple.
+
+A selected frame arm stays direct, preserving constant-space tail calls; a native
+arm uses the existing machine call step. Its continuation stays alive across
+host parking, including at the root. Metadata wrappers preserve callable targets
+and thrown values retain identity. Seven contract checks include one-step turn
+boundaries, mixed native/frame arms, nested dispatch, nil arms, 10,000 tail calls
+and a parked root. All 66 focused checks and 461 actor checks at default/17/41
+budgets plus hardening pass. This consolidates function dispatch, not the pending
+common-core collection-callable or lazy-forcing migration.

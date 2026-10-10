@@ -1,8 +1,8 @@
 ; One startup policy for every bl serve application, not an application cache.
 (ns bl.loading
-  (:require [source-graph :as graph] [build-plan :as plan]))
+  (:require [source-graph :as graph] [build-plan :as plan] [proc.admission :as admission]))
 
-(def DEFAULTS {:environment-env "BL_ENV" :development :lazy :production :startup :roots []})
+(def DEFAULTS {:environment-env "BL_ENV" :development :lazy :production :startup :roots [] :package-env nil})
 
 (defn validate
   "Pure configuration check. Unknown keys and unsupported modes fail closed."
@@ -15,6 +15,7 @@
     (let [p (merge DEFAULTS c)]
       (when (not (and (string? (:environment-env p)) (not= "" (:environment-env p))
                       (contains? #{:lazy :async} (:development p)) (= :startup (:production p))
+                      (or (nil? (:package-env p)) (and (string? (:package-env p)) (not= "" (:package-env p))))
                       (vector? (:roots p))
                       (every? (fn [n] (and (string? n) (not= "" n))) (:roots p))))
         (throw (ex-info "Invalid :loading policy: development :lazy/:async, production :startup"
@@ -32,8 +33,7 @@
    parts and parts already parsed by another pass avoid reparsing function
    bodies. A different source or requested namespace cannot reuse a header."
   [n source]
-  (let [node (plan/memo-node n source)]
-    (when (= n (:ns node)) [n (:reqs node)])))
+  (when-let [header (plan/header-for n source)] (vec header)))
 
 (defn dependencies
   [n]
@@ -60,6 +60,12 @@
 (defn- reductions [] (elem (erlang/process_info (erlang/self) :reductions) 1))
 (defn- now [] (erlang/monotonic_time :microsecond))
 
+(defn- admitted! [namespace result]
+  (when (= :cancelled result)
+    (throw (ex-info "Startup library admission was cancelled"
+                    {:kind :loading-cancelled :namespace namespace})))
+  result)
+
 (defn prepare-measured
   "Injected barrier with phase receipts. Detail is opt-in and bounded to the
    slowest 20 libraries; aggregate counters do not retain source or values."
@@ -77,7 +83,7 @@
             discovered (now)
             slowest (reduce (fn [rows n]
                        (let [t (now) r (reductions)]
-                         (load! n)
+                         (admitted! n (load! n))
                          (if detail?
                            (vec (take 20 (sort-by (fn [row] (- (:elapsed-us row)))
                              (conj rows {:namespace n :elapsed-us (- (now) t)
@@ -94,6 +100,21 @@
   (select-keys (prepare-measured policy environment entry-source dependencies load! false)
                [:mode :namespaces]))
 
+(defn- prepare-package! [policy root entry detail?]
+ (BeamLisp.Loader/ensure_loaded "application.package")
+ (let [start (now) before (reductions)
+       manifest (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "application.package" "install!")
+                  (list root (BeamLisp.Loader/read_source entry) (:roots policy)))
+       verified (now)
+       load-package (fn []
+                      (doseq [n (:namespaces manifest)] (admitted! n (BeamLisp.Loader/ensure_loaded n)))
+                      {:mode :startup :namespaces (count (:namespaces manifest))
+                       :package root :discovery-us (- verified start)
+                       :loading-us (- (now) verified) :reductions (- (reductions) before)})
+       result (if (= 2 (:format manifest)) (load-package)
+                 (BeamLisp.Loader/with_search_dir (str root "/source") load-package))]
+  result))
+
 (defn prepare!
   "Apply project policy. A production pass shares evidence only inside the
    owning loader session; a later pass always rereads live sources."
@@ -101,9 +122,13 @@
   (let [policy (validate (:loading project)) environment (System/get_env (:environment-env policy))
         detail? (= "1" (System/get_env "BL_STARTUP_PROFILE"))
         start (now)
-        run (fn [] (prepare-measured policy environment
+        package-path (when (and (= :startup (mode policy environment)) (:package-env policy))
+                       (System/get_env (:package-env policy)))
+        run (fn [] (if package-path
+                    (prepare-package! policy (Path/expand package-path (or (:root project) (BeamLisp/cwd))) entry detail?)
+                    (prepare-measured policy environment
                      (fn [] (BeamLisp.Loader/read_source entry))
-                     dependencies (fn [n] (BeamLisp.Loader/ensure_loaded n)) detail?))
+                     dependencies (fn [n] (BeamLisp.Loader/ensure_loaded n)) detail?)))
         result (if (= :startup (mode policy environment))
                  (BeamLisp.Loader/with_loading_session run) (run))]
     (when (= :startup (:mode result))
@@ -121,7 +146,7 @@
         environment (System/get_env (:environment-env policy))]
     (when (= :async (mode policy environment))
       (let [owner (erlang/self)
-            deadline (+ (erlang/monotonic_time :millisecond) 300000)
+            request (admission/token owner 300000)
             dirs (or (Process/get :bl_fixed_dirs) (Process/get :bl_search_dirs)
                      (Process/get :bl_ambient_dirs) (list (BeamLisp/cwd)))
             action (BeamLisp.Env/convey
@@ -131,10 +156,10 @@
                                       (fn [] (prepare-measured policy "production"
                                          (fn [] (BeamLisp.Loader/read_source entry)) dependencies
                                          (fn [n]
-                                           (when (or (not (Process/alive? owner))
-                                                     (> (erlang/monotonic_time :millisecond) deadline))
+                                           (when (not (admission/live? request))
                                              (throw (ex-info "Development warm-up owner/budget ended" {})))
-                                           (BeamLisp.Loader/ensure_loaded n) (Process/sleep 1)) false)))]
+                                           (admitted! n (admission/with-request request (fn [] (BeamLisp.Loader/ensure_loaded n))))
+                                           (Process/sleep 1)) false)))]
                            (println (str "Development warm-up complete: " (:namespaces result) " namespaces")))
                          (catch e
                            (println (str "Development warm-up failed: " (ex-message e)))))))]

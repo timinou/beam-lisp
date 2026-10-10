@@ -26,7 +26,7 @@
   (:require [datom.current] [datom.db] [datom.index] [datom.schema] [datom.store] [datom.store-ets]
             [datom.store-overlay] [datom.tx] [datom.broadcast] [datom.attr-basis] [env]
             [datom.blob] [datom.blob-ets] [datom.blob-fs] [datom.blob-overlay]
-            [datom.file] [datom.index-coverage] [datom.text] [datom.query.rank-build]))
+            [datom.file] [datom.index-coverage] [datom.text] [datom.query.rank-build] [datom.query.rank-demand] [data.bounded-cache] [proc.admission :as admission]))
 
 ;; ── env conveyance (PLAN-047 W1) ─────────────────────────────────────
 ;;
@@ -47,7 +47,8 @@
 (defn- agent-get-and-update
   "Agent/get_and_update with the caller's env conveyed into the action fn."
   [agent f timeout]
-  (Agent/get_and_update agent (env/convey f) timeout))
+  (BeamLisp.Loader.Server/worker_call
+    (fn [delegate] (Agent/get_and_update agent (delegate f) timeout))))
 
 ;; ── id allocation ───────────────────────────────────────────────────
 ;;
@@ -428,29 +429,40 @@
     (f)
     (with-writer-call conn f)))
 
+(defn- writer-operation [conn f]
+  (let [prior (erlang/put :datom.conn/writing-store (:store conn))]
+    (try [:ok (f)]
+      (catch e [:raised e])
+      (finally
+        (if (= :undefined prior)
+          (erlang/erase :datom.conn/writing-store)
+          (erlang/put :datom.conn/writing-store prior))))))
+
 (defn- with-writer-call
   [conn f]
-  (let [; The record's `:writer` field is immutable, so a replacement
-        ; started after a death is NOT visible there. Resolving the live
-        ; pid here is what makes recovery actually take effect — without
-        ; it `ensure-writer` started a fresh process that nothing ever
-        ; called, and every write still failed against the dead one.
-        pid (ensure-writer conn)
-        outcome (agent-get-and-update
-                  pid
-                  (fn [state]
-                    (let [prior (erlang/put :datom.conn/writing-store (:store conn))
-                          r (try [:ok (f)]
-                                 (catch e [:raised e])
-                                 (finally
-                                   (if (= :undefined prior)
-                                     (erlang/erase :datom.conn/writing-store)
-                                     (erlang/put :datom.conn/writing-store prior))))]
-                      (erlang/list_to_tuple (to-list [r state]))))
-                  30000)]
-    (if (= :ok (first outcome))
-      (second outcome)
-      (throw (second outcome)))))
+  (let [request (admission/token (erlang/self) 30000)
+        parent (Process/get :bl_admission)
+        ;; Protect both the queued wrapper and the supplied physical callback.
+        modules (list (elem (erlang/fun_info f :module) 1)
+                      (elem (erlang/fun_info (fn [] nil) :module) 1))]
+    (BeamLisp.Env/with_code_lease modules
+      (fn []
+        ;; Resolve the current writer, not the immutable record's stale PID.
+        (let [pid (ensure-writer conn)
+              outcome (agent-get-and-update pid
+                        (fn [state]
+                          (let [r (try
+                                    (let [accepted (BeamLisp.Env/with_code_lease modules
+                                                     (fn [] (admission/run request parent
+                                                              (fn [] (writer-operation conn f)))))]
+                                      (if (= :cancelled accepted)
+                                        [:raised (ex-info "Queued store operation was cancelled before admission"
+                                                   {:kind :admission-cancelled :operation :datom-writer})]
+                                        accepted))
+                                    (catch e [:raised e]))]
+                            (erlang/list_to_tuple (to-list [r state]))))
+                        30000)]
+          (if (= :ok (first outcome)) (second outcome) (throw (second outcome))))))))
 
 (defn connect-with
   "Open a connection over an EXISTING store.
@@ -1060,6 +1072,7 @@
     (flush-reports! conn pending)
     conn))
 
+(declare retire-query-rank!)
 (defn transact!
   "Record `tx-data`, returning a transaction report.
 
@@ -1078,7 +1091,32 @@
    connection's writer process, one at a time. Readers are unaffected
    and never block."
   [conn tx-data]
-  (with-writer conn (fn [] (transact-in-writer conn tx-data))))
+  (let [result (with-writer conn
+                 (fn []
+                  (Process/put :datom_rank_maintenance [])
+                  (Process/put :datom_rank_maintenance_store (:store conn))
+                  (Process/put :datom_rank_prepare_us 0)
+                  (Process/put :datom_rank_commit_us 0)
+                  (try
+                   (let [report (transact-in-writer conn tx-data)]
+                    {:report report :maintenance (vec (set (Process/get :datom_rank_maintenance [])))
+                     :elapsed-us (+ (Process/get :datom_rank_prepare_us 0)
+                                    (Process/get :datom_rank_commit_us 0))})
+                   (finally
+                    (doseq [key [:datom_rank_maintenance :datom_rank_maintenance_store
+                                 :datom_rank_prepare_us :datom_rank_commit_us]]
+                     (Process/delete key))))))]
+    ;; Real commit has completed. Optional measurement and policy cannot reject
+    ;; the transaction, and no cache actor is invoked inside the source writer.
+    (try
+     (when (seq (:maintenance result))
+      (let [key (data.bounded-cache/key-data (datom.store/identity-of (:store conn)) 0)]
+       (doseq [[id generation] (:maintenance result)]
+        (when (datom.query.rank-demand/record-cost! key id generation
+                {:kind :write :elapsed-us (:elapsed-us result)})
+         (retire-query-rank! conn id generation)))))
+     (catch _ nil))
+    (:report result)))
 (defn load-facts!
   "Bulk-load `tx-data` — transaction data whose facts are ALREADY new in
    this conn — returning the same report `transact!` returns.
@@ -1475,13 +1513,38 @@
   "One bounded stage/cleanup step in the source writer. A process may die
    between calls; the durable checkpoint resumes on the next query."
   [conn id]
-  (with-writer conn
+  (let [result (with-writer conn
     (fn []
-      (let [database (db conn) s (:store conn)
+      (let [started (erlang/monotonic_time :microsecond)
+            _ (Process/put :datom_rank_turn_entities 0)
+            database (db conn) s (:store conn)
+            before (datom.store/-get s (datom.query.rank-index/header-key id))
             ops (or (datom.query.rank-build/step-ops database id)
-                    (datom.query.rank-build/cleanup-ops database id))]
-        (when (seq ops) (datom.store/-commit s ops))
-        (datom.store/-get s (datom.query.rank-index/header-key id))))))
+                    (datom.query.rank-build/cleanup-ops database id))
+            _ (when (seq ops) (datom.store/-commit s ops))
+            elapsed (max 1 (- (erlang/monotonic_time :microsecond) started))
+            header (datom.store/-get s (datom.query.rank-index/header-key id))
+            costs (or (Process/get :datom_rank_build_costs) {})
+            accumulated (+ (or (get costs id) 0) elapsed)
+            building? (= :building (:status before))
+            completed? (and building? (= :complete (:status header)))]
+        (when (seq ops)
+          (Process/put :datom_rank_writer_turn
+            (datom.query.rank-build/observe-turn
+              (Process/get :datom_rank_writer_turn)
+              (Process/get :datom_rank_turn_entities 0) elapsed)))
+        ;; At most the finite durable registry size is retained by this writer.
+        (Process/put :datom_rank_build_costs
+          (if (and building? (= :building (:status header)))
+            (assoc (select-keys costs (or (datom.query.rank-build/registry s) [])) id accumulated)
+            (dissoc costs id)))
+        {:header header :cost (when completed? accumulated)})))]
+    ;; Optional telemetry publication stays OUTSIDE the source writer.
+    (when (:cost result)
+      (datom.query.rank-demand/record-build!
+        (data.bounded-cache/key-data (datom.store/identity-of (:store conn)) 0)
+        id (:cost result) (:members (:header result))))
+    (:header result)))
 
 
 (defn claim-query-rank-worker!
@@ -1506,3 +1569,15 @@
         cell (Agent/get (registry) (fn [reg] (get reg (store-key (:store conn)))))]
     (and cell (= (:lifetime conn) (:lifetime cell))
          (= :open @(:lifetime cell)) (= pid (:rank-worker cell)))))
+
+(defn retire-query-rank! [conn id generation]
+ (let [retired? (with-writer conn
+                  (fn []
+                   (let [ops (datom.query.rank-build/retire-ops (db conn) id generation)]
+                    (when (seq ops) (datom.store/-commit (:store conn) ops) true))))]
+  (when retired?
+   (try
+    (datom.query.rank-demand/retired!
+      (data.bounded-cache/key-data (datom.store/identity-of (:store conn)) 0) id)
+    (catch _ nil)))
+  retired?))

@@ -225,9 +225,8 @@ function perOp(tableSize, ops) {
   leaf(rA, 'table-destroy')(th);
   return { lookup: bestLook, insert: bestIns };
 }
-// The contrast: `mapPut` copies the whole map, so its per-op cost grows with
-// size. The base map is built by the `bmap` constructor (O(n)), not by repeated
-// `mapPut` (O(n^2)), so the SAME sizes as the table can be measured.
+// Persistent updates share the canonical HAMT; measure changed values so
+// unchanged-value reuse cannot hide a whole-map copy regression.
 function mapPutPerOp(mapSize, ops) {
   const pairs = [];
   for (let i = 0; i < mapSize; i++) pairs.push([i, i]);
@@ -235,7 +234,7 @@ function mapPutPerOp(mapSize, ops) {
   let best = Infinity;
   for (let pass = 0; pass < 3; pass++) {
     const t0 = now();
-    for (let i = 0; i < ops; i++) m = H.mapPut(m, i % mapSize, i);
+    for (let i = 0; i < ops; i++) m = H.mapPut(m, i % mapSize, pass * ops + i + mapSize);
     best = Math.min(best, (now() - t0) / ops);
   }
   return best;
@@ -256,7 +255,7 @@ const mpSmall = mapPutPerOp(MP_SMALL, 300);
 const mpLarge = mapPutPerOp(MP_LARGE, 300);
 const mpRatio = mpLarge / mpSmall;
 console.log(`MEASURE mapPut per-op (ms): size ${MP_SMALL}=${mpSmall.toFixed(4)} size ${MP_LARGE}=${mpLarge.toFixed(4)} ratio=${mpRatio.toFixed(2)}x`);
-assert.ok(mpRatio > 4, `mapPut should still clone per write (ratio ${mpRatio.toFixed(2)}x) — the contrast is the point`);
-console.log('PASS table scaling: flat lookup/write per-op vs mapPut\'s growing copy cost');
+assert.ok(mpRatio < 8, `persistent map update grew ${mpRatio.toFixed(2)}x at 16x size — whole-map copying returned`);
+console.log('PASS table scaling: bounded mutable table and persistent HAMT updates');
 
 console.log(`TABLE-LEAVES PASS — ABI: ${LEAVES.map(n => 'host/' + n).join(', ')}`);

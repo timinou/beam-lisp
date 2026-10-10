@@ -8,11 +8,30 @@
            [data.bounded-cache :as cache] [data.ranked-tree :as tree]))
 (def REGISTRY [:datom.query.rank/registry])
 (def MAX-INDEXES 4)
+(def RETIRED [:datom.query.rank/retired])
+(def COOLDOWN-MS 300000)
+(defn cooling? [s id]
+ (some (fn [record] (and (= id (:ident record))
+                         (< (erlang/system_time :millisecond) (:until record))))
+       (or (derived/get-record s RETIRED) [])))
 (def BATCH-ROWS 16)
-(defn batch-rows [_definition]
- ;; Native-store benchmarks reject wider turns: more rows amplified tree updates
- ;; and increased writer occupancy. Keep the measured bounded default.
- BATCH-ROWS)
+(def TURN-TARGET-US 20000)
+(defn turn-rows [sample]
+ ;; Forecast next occupancy from the whole previous writer turn, including
+ ;; commit. A single entity/store call is atomic and cannot be preempted: this
+ ;; is adaptive admission, not a hard real-time wall-clock guarantee.
+ (if (and (map? sample) (erlang/is_integer (:rows sample)) (< 0 (:rows sample))
+          (erlang/is_integer (:elapsed-us sample)) (< 0 (:elapsed-us sample)))
+   (max 1 (min BATCH-ROWS (quot (* TURN-TARGET-US (:rows sample)) (:elapsed-us sample))))
+   1))
+(defn batch-rows [_definition] (turn-rows (Process/get :datom_rank_writer_turn)))
+(defn observe-turn [previous rows elapsed-us]
+ ;; Empty scan/checkpoint turns are not evidence that entity construction is
+ ;; cheap. Retain the largest observed cost per entity for this writer lifetime.
+ (let [cost (if (> rows 0) (quot (+ elapsed-us rows -1) rows) 0)
+       peak (max (or (:us-per-row previous) 0) cost)]
+  (if (> peak 0) {:rows 1 :elapsed-us peak :us-per-row peak}
+    {:rows 0 :elapsed-us (max 1 elapsed-us) :us-per-row 0})))
 (def MAX-DIRTY 256)
 (def REFUSALS :datom.query.rank-refusals)
 (def NAMESPACES '("datom.conn" "datom.tx" "datom.db" "datom.index" "datom.schema"
@@ -61,7 +80,7 @@
 (defn scope-value [plan]
  (let [value (:scope plan)]
   (when (and (tuple? value) (contains? #{:atom :integer :binary :float} (elem value 0))) (elem value 1))))
-(declare abort-op)
+(declare abort-op cleanup-ops)
 (defn start-ops [database plan]
  (let [s (db/store-of database) ids (registry s) id (ident plan) old (when id (rank/header s id))
        stamp (code-stamp)]
@@ -70,7 +89,7 @@
              (nil? (:valid-at database)) (nil? (:valid-between database))
              (= (:schema plan) (select-keys (db/schema-of database) (:required plan)))
              (store/ordered-page-capable? s)
-             (not (contains? (set ids) id)) (nil? old))
+             (not (contains? (set ids) id)) (nil? old) (not (cooling? s id)))
    (if (>= (count ids) MAX-INDEXES)
     (let [victim (first ids) h (rank/header s victim)]
      {:ident victim :ops (when h (abort-op h :rank-capacity-evicted))})
@@ -90,18 +109,26 @@
  (reduce (fn [m d]
            (if (index/-op d) (assoc m (index/-a d) (index/-v d))
             (if (= (get m (index/-a d)) (index/-v d)) (dissoc m (index/-a d)) m))) fields datoms))
-(defn transaction-ops
+(defn- transaction-ops*
  "Source writer hook. Every expanded datom is observed, including empty-result
   insertions and scope transfers. Bulk/excision callers pass trusted? false.
   Any gap, schema/code drift or bounded-work refusal invalidates permanently."
  [database datoms tx trusted?]
- (let [s (db/store-of database) sch (db/schema-of database) ids (registry s)]
+ (let [s (db/store-of database) sch (db/schema-of database) ids (registry s)
+       cleanup-id (first (filter (fn [id] (= :aborted (:status (rank/header s id)))) ids))]
   (vec (mapcat
    (fn [id]
     (let [h (rank/header s id) required (set (:required (:definition h)))
           affected (filterv (fn [d] (contains? required (index/-a d))) datoms)
-          eids (set (mapv index/-e affected))]
-     (when (and (seq affected) (contains? #{:building :complete} (:status h)))
+          eids (set (mapv index/-e affected))
+          _ (when (and (seq affected) (= :complete (:status h))
+                       (identical? s (Process/get :datom_rank_maintenance_store))
+                       (vector? (Process/get :datom_rank_maintenance)))
+              (Process/put :datom_rank_maintenance
+                (conj (Process/get :datom_rank_maintenance) [id (:generation h)])))]
+     (if (= :aborted (:status h))
+      (when (= id cleanup-id) (cleanup-ops database id))
+      (when (and (seq affected) (contains? #{:building :complete} (:status h)))
       (cond
        (or (not trusted?) (not (unchanged? s sch h (db/basis-t database))))
          (abort-op h :rank-maintenance-gap)
@@ -123,8 +150,17 @@
                   {:header (:header next) :ops (into (:ops state) (:ops next))}))
                 {:header h :ops []} eids)]
           (rank/publication-ops ctx (assoc (:header changed) :through tx) (:ops changed)))
-         (catch e (abort-op h (or (:refused (ex-data e)) :rank-maintenance-refused))))))))
+         (catch e (abort-op h (or (:refused (ex-data e)) :rank-maintenance-refused)))))))))
    (or ids [])))))
+(defn transaction-ops [database datoms tx trusted?]
+ (let [measured? (identical? (db/store-of database) (Process/get :datom_rank_maintenance_store))
+       started (when measured? (erlang/monotonic_time :microsecond))
+       ops (transaction-ops* database datoms tx trusted?)]
+  (when (and measured? (seq (Process/get :datom_rank_maintenance)))
+   (Process/put :datom_rank_prepare_us
+     (+ (Process/get :datom_rank_prepare_us 0)
+        (- (erlang/monotonic_time :microsecond) started))))
+  ops))
 (defn- complete-groups [raw end?]
  (loop [rows raw current [] groups []]
   (if (empty? rows) {:groups (if (and end? (seq current)) (conj groups current) groups)
@@ -161,6 +197,7 @@
                           (when (some (fn [d] (= (:scope-value h) (index/-v d))) live)
                            (index/-e (first group))))) (:groups scan)))
                   (vec (take (batch-rows (:definition h)) (:dirty h))))
+           _ (Process/put :datom_rank_turn_entities (count eids))
            view (if scan snapshot database)
            changed (reduce
                     (fn [state eid]
@@ -184,14 +221,32 @@
    (let [ctx (rank/context s h)
          initial (if (contains? h :cleanup) (:cleanup h) (if (:root h) [(:root h)] []))
          work (loop [todo initial n 0 ops []]
-                (if (or (empty? todo) (>= n BATCH-ROWS)) {:todo todo :ops ops}
+                (if (or (empty? todo) (>= n (batch-rows {}))) {:todo todo :ops ops}
                  (let [id (peek todo) node (tree/node ctx id)
                        children (filterv some? [(:left node) (:right node)])]
                   (recur (into (pop todo) children) (inc n)
                          (into ops [[:delete (rank/node-key (:ident h) (:generation h) id)]
                                     [:delete (rank/member-key (:ident h) (:generation h) (:eid (:value node)))]])))))
+         _ (Process/put :datom_rank_turn_entities
+             (quot (count (:ops work)) 2))
          last? (empty? (:todo work))]
     (into (:ops work)
       (if last? (into (derived/put-ops REGISTRY (filterv (fn [other] (not= other id)) (registry s)))
                       [[:delete (rank/header-key id)]])
        [[:put (rank/header-key id) (assoc h :cleanup (:todo work))]]))))))
+
+(defn retire-ops
+ "Policy may request retirement; only the writer's exact live generation can
+  revoke read authority. Header invalidation and bounded durable cooldown share
+  one commit. No telemetry is trusted as source/query correctness evidence."
+ [database id generation]
+ (let [s (db/store-of database) h (rank/header s id)]
+  (when (and (= :complete (:status h)) (= generation (:generation h)))
+   (let [now (erlang/system_time :millisecond)
+         recent (filterv (fn [record] (and (not= id (:ident record))
+                                          (< now (:until record))))
+                         (or (derived/get-record s RETIRED) []))
+         bounded (subvec recent (max 0 (- (count recent) MAX-INDEXES)) (count recent))]
+    (into (abort-op h :rank-unprofitable)
+      (derived/put-ops RETIRED
+        (conj bounded {:ident id :until (+ now COOLDOWN-MS)})))))))

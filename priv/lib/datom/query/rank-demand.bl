@@ -1,29 +1,160 @@
-;; Disposable demand evidence, never correctness authority. A one-off page
-;; should not buy a durable index and its continuing write-maintenance cost.
+;; Disposable measured demand, never query correctness authority. Construction
+;; spends only after repeated expensive fallback work has paid a conservative
+;; forecast. Forecasts are policy estimates, NOT guaranteed wall-time bounds.
 (ns datom.query.rank-demand
-  (:require [data.bounded-cache :as cache]))
+ (:require [data.bounded-cache :as cache]))
 (def CACHE :datom.query.rank-demand)
 (def MIN-REQUESTS 3)
 (def WINDOW-MS 300000)
+;; Native Fjall control: 1000-member construction ~36.6s; indexed page ~7ms.
+;; Start conservatively. These are admission forecasts, not portable benchmark
+;; claims. Observed cheap/cache-hit queries pay no construction demand.
+(def BUILD-US-PER-ROW 50000)
+(def PAGE-US 10000)
+(def WRITE-US 50000)
+(def RETIRE-MIN-MS 30000)
+(def RETIRE-MIN-WRITES 3)
+(def COOLDOWN-MS 300000)
+(defn build-rate [elapsed-us rows]
+ (when (and (erlang/is_integer elapsed-us) (< 0 elapsed-us)
+            (erlang/is_integer rows) (< 0 rows))
+  (max 1 (quot (+ elapsed-us rows -1) rows))))
+(defn record-build!
+ "Completed, commit-inclusive construction calibrates this store/definition.
+  Keep peak observed cost; optional retention failure preserves the forecast."
+ [store-key definition elapsed-us rows]
+ (try
+  (when-let [rate (build-rate elapsed-us rows)]
+   (when (and store-key definition)
+    (let [key [::build-cost store-key definition]]
+     (global/trans (tuple [::build-cost key] (erlang/self))
+      (fn []
+       (let [old (cache/lookup CACHE key :v2)]
+        (cache/put! CACHE key :v2 (max (or (:value old) 0) rate))))))))
+  (catch _ nil)))
+(defn policy-cost [value fallback]
+ (if (and (erlang/is_integer value) (<= 0 value 1000000000)) value fallback))
 (defn decision
-  "Pure bounded demand transition. Expiration is fixed by the first request;
-   occasional requests cannot keep a candidate alive forever."
-  [previous now]
-  (let [live? (and previous (< now (:expires-at previous)))
-        requests (min MIN-REQUESTS (inc (if live? (:requests previous) 0)))]
-    {:requests requests :expires-at (if live? (:expires-at previous) (+ now WINDOW-MS))
-     :build? (>= requests MIN-REQUESTS)}))
-(defn observe!
-  "Finite store/definition identities only. Missing cache capacity declines
-   speculative construction; ordinary queries remain authoritative."
-  [store-key definition]
-  (try
-    (when (and store-key definition)
-      (cache/ready! CACHE)
-      (let [key [store-key definition]]
-        (= true (global/trans (tuple [::demand key] (erlang/self))
-          (fn []
-            (let [old (cache/lookup CACHE key :v1)
-                  next (decision (:value old) (erlang/monotonic_time :millisecond))]
-              (and (cache/put! CACHE key :v1 next) (:build? next))))))))
-    (catch _ false)))
+ "Pure transition from ACTUAL fallback execution. Expiration is fixed at the
+  first sample. Unknown/malformed cost declines; writes debit expected benefit."
+ [previous now sample]
+ (let [live? (and previous (< now (:expires-at previous)))
+       previous (if live? previous {:requests 0 :paid-us 0 :rows 0 :writes 0
+                                   :expires-at (+ now WINDOW-MS)})
+       valid? (and (map? sample) (erlang/is_integer (:elapsed-us sample))
+                   (<= 0 (:elapsed-us sample) 1000000000)
+                   (erlang/is_integer (:rows sample)) (<= 0 (:rows sample) 65536)
+                   (erlang/is_integer (:basis sample)) (<= 0 (:basis sample)))
+       writes (if (and valid? (:basis previous)) (max 0 (- (:basis sample) (:basis previous))) 0)
+       next (if valid?
+              (-> previous (update :requests (fn [n] (min 1000000 (inc n))))
+                  (update :paid-us (fn [n] (min 1000000000000 (+ n (if (>= (:requests previous) 2) (max 0 (- (:elapsed-us sample) (policy-cost (:page-us sample) PAGE-US))) 0)))))
+                  (update :rows max (:rows sample)) (update :writes + writes)
+                  (assoc :basis (:basis sample))) previous)
+       measured (:build-us-per-row sample)
+       build-rate (if (and (erlang/is_integer measured) (< 0 measured)) measured BUILD-US-PER-ROW)
+       forecast (+ (* (:rows next) build-rate) (* (:writes next) (policy-cost (:write-us sample) WRITE-US)))]
+  (assoc next :forecast-us forecast
+              :build? (and valid? (>= (:requests next) MIN-REQUESTS)
+                           (> (:rows next) 0) (>= (:paid-us next) (* 2 forecast))))))
+(defn watch!
+ "Register a bounded fallback query identity; no store handles retained."
+ [store-key query inputs definition]
+ (try
+  (when (and store-key definition)
+   (cache/ready! CACHE)
+   (cache/put! CACHE [::query store-key query inputs] :v2 definition))
+  (catch _ nil)))
+(defn record-scan!
+ "Called only for authoritative execution of a watched query. Result-cache
+  hits do not masquerade as expensive scans. All telemetry may be discarded."
+ [store-key query inputs sample]
+ (try
+  (when (Process/whereis CACHE)
+   (let [watch (cache/lookup CACHE [::query store-key query inputs] :v2)]
+    (when (:hit? watch)
+     (let [key [store-key (:value watch)]]
+      (global/trans (tuple [::demand key] (erlang/self))
+       (fn []
+        (let [old (cache/lookup CACHE key :v2)
+              cost (cache/lookup CACHE [::build-cost store-key (:value watch)] :v2)
+              measured (cache/lookup CACHE [::cost store-key (:value watch)] :v2)
+              sample (merge sample (select-keys (:value measured) [:page-us :write-us]))
+              sample (if (:hit? cost) (assoc sample :build-us-per-row (:value cost)) sample)
+              next (decision (:value old) (erlang/monotonic_time :millisecond) sample)]
+         (cache/put! CACHE key :v2 next))))))))
+  (catch _ nil)))
+(declare cooling?)
+(defn observe! [store-key definition]
+ (try
+  (when (and store-key definition (Process/whereis CACHE))
+   (let [hit (cache/lookup CACHE [store-key definition] :v2)
+         value (:value hit)]
+    (and (not (cooling? store-key definition)) (:hit? hit) (< (erlang/monotonic_time :millisecond) (:expires-at value))
+         (= true (:build? value)))))
+  (catch _ false)))
+
+;; Economics is disposable policy. It never certifies rows or authorizes writes.
+(defn economics [previous now sample]
+ (let [live? (and previous (< now (:expires-at previous)))
+       old (if live? previous {:started now :expires-at (+ now WINDOW-MS)
+                              :writes 0 :maintenance-us 0 :saved-us 0})
+       old (if (some? (:ordinary-us sample)) (assoc old :ordinary-us (:ordinary-us sample)) old)
+       elapsed (:elapsed-us sample)
+       valid? (and (erlang/is_integer elapsed) (<= 0 elapsed 1000000000))
+       next (if-not valid? old
+              (case (:kind sample)
+               :ordinary (assoc old :ordinary-us (min (or (:ordinary-us old) elapsed) elapsed))
+               :page (-> old (assoc :page-us (max (or (:page-us old) 0) elapsed))
+                         (update :saved-us (fn [v] (min 1000000000000
+                           (+ v (max 0 (- (or (:ordinary-us old) 0) elapsed)))))))
+               :write (-> old (update :writes (fn [v] (min 1000000 (inc v))))
+                          (update :maintenance-us (fn [v] (min 1000000000000 (+ v elapsed))))
+                          (assoc :write-us (max (or (:write-us old) 0) elapsed)))
+               old))]
+  (assoc next :retire? (and (>= (- now (:started next)) RETIRE-MIN-MS)
+                            (>= (:writes next) RETIRE-MIN-WRITES)
+                            (> (:maintenance-us next) (* 2 (:saved-us next)))))))
+(defn record-cost! [store-key definition generation sample]
+ (try
+  (when (and store-key definition)
+   (cache/ready! CACHE)
+   (let [key [::economics store-key definition generation]
+         now (erlang/monotonic_time :millisecond)]
+    (global/trans (tuple [::economics key] (erlang/self))
+     (fn []
+      (let [old (cache/lookup CACHE key :v2)
+            ordinary (cache/lookup CACHE [::ordinary store-key definition] :v2)
+            sample (if (and (:hit? ordinary) (< now (:expires-at (:value ordinary))))
+                     (assoc sample :ordinary-us (:us (:value ordinary))) sample)
+            next (economics (:value old) now sample)]
+       (cache/put! CACHE key :v2 next)
+       (cache/put! CACHE [::cost store-key definition] :v2
+         (select-keys next [:page-us :write-us]))
+       (:retire? next))))))
+  (catch _ false)))
+(defn record-ordinary! [store-key query inputs elapsed-us]
+ (try
+  (when (Process/whereis CACHE)
+   (let [watch (cache/lookup CACHE [::query store-key query inputs] :v2)]
+    (when (and (:hit? watch) (erlang/is_integer elapsed-us) (<= 0 elapsed-us 1000000000))
+     (let [key [::ordinary store-key (:value watch)]]
+      (global/trans (tuple [::ordinary key] (erlang/self))
+       (fn []
+        (let [old (:value (cache/lookup CACHE key :v2))
+              now (erlang/monotonic_time :millisecond)
+              live? (and old (< now (:expires-at old)))]
+         (cache/put! CACHE key :v2
+           {:us (min (if live? (:us old) elapsed-us) elapsed-us)
+            :expires-at (if live? (:expires-at old) (+ now WINDOW-MS))}))))))))
+  (catch _ nil)))
+(defn cooling? [store-key definition]
+ (try
+  (when (Process/whereis CACHE)
+   (let [hit (cache/lookup CACHE [::cooldown store-key definition] :v2)]
+    (and (:hit? hit) (< (erlang/monotonic_time :millisecond) (:value hit)))))
+  (catch _ false)))
+(defn retired! [store-key definition]
+ (try (cache/put! CACHE [::cooldown store-key definition] :v2
+        (+ (erlang/monotonic_time :millisecond) COOLDOWN-MS))
+      (catch _ nil)))

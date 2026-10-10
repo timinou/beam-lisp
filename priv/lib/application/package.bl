@@ -1,0 +1,264 @@
+;; Release-time application closure, with source fallback for non-replayable
+;; top-level forms. The entry program is never evaluated by the packager.
+(ns application.package
+ (:require [source-graph :as graph] [build-plan :as plan] [os.lease :as lease]))
+(def FORMAT 1)
+(defn- digest [bytes] (Base/encode16 (crypto/hash :sha256 bytes) (list (tuple :case :lower))))
+(defn- native-identity []
+ (into {} (map (fn [path] [(Path/basename path) (digest (File/read! path))])
+              (sort (Path/wildcard (str (BeamLisp.Tiers/priv_root) "/native/*.so"))))))
+(defn runtime-identity []
+ {:compiler (BeamLisp.AOTCache/compiler_key) :erts (erlang/list_to_binary (erlang/system_info :version))
+  :elixir (System/version) :native (native-identity)
+  ;; Only exact pinned host modules belong here. Core/Rt are namespace shims:
+  ;; loading the test prelude, for example, adds core exports and re-emits its
+  ;; shim without changing the compiler ABI. Boot source/codegen identity is
+  ;; already bound by :compiler; accidental producer dispatch state is not a
+  ;; release identity and cannot be required of a fresh consumer.
+  :hosts (mapv (fn [module] [module (erlang/apply module :module_info (list :md5))])
+           [:Elixir.BeamLisp.Env :Elixir.BeamLisp.Loader :Elixir.BeamLisp.Loader.Server
+            :Elixir.BeamLisp.AOT :Elixir.BeamLisp.AOTCache :Elixir.BeamLisp.Emit
+            :Elixir.BeamLisp.Link])})
+(defn- compiler-authority []
+ ;; A canonical forwarding shim can be loaded before its body. Load only these
+ ;; SDK-owned companions; arbitrary supplied callable modules still decline.
+ (doseq [n ["sugar" "compiler" "lower" "anf"]]
+  (let [module (Module/concat (list :Elixir.BeamLisp.Ns.Body (Macro/camelize n)))]
+   (when (not (Code/ensure_loaded? module))
+    (throw (ex-info "Canonical package compiler body unavailable" {:module module})))))
+ (BeamLisp.AOT/local_package_authority))
+(defn replayable?
+ "Share the runtime loader's whole-unit replay authority."
+ [source]
+ (BeamLisp.Loader/replayable_source? source))
+(defn- namespace? [n]
+ (and (string? n) (not= "" n)
+      (not (String/contains? n "/")) (not (String/contains? n "\\"))
+      (every? (fn [part] (not= "" part)) (String/split n "."))))
+(defn closure
+ "Discover actual live source bytes once, refusing dependencies on the entry."
+ [entry-source extra-roots]
+ (let [[entry roots] (graph/header entry-source)]
+  (when (not (namespace? entry)) (throw (ex-info "Application entry has no valid namespace" {})))
+  (loop [pending (seq (concat roots extra-roots)) units {}]
+   (if (empty? pending) units
+    (let [n (first pending)]
+     (when (not (namespace? n)) (throw (ex-info "Invalid application dependency namespace" {:namespace n})))
+     (when (and (not (contains? units n)) (>= (count units) 10000))
+      (throw (ex-info "Application dependency closure exceeds package bound" {:limit 10000})))
+     (when (= n entry) (throw (ex-info "Application dependency reaches executable entry" {:namespace n})))
+     (if (contains? units n) (recur (rest pending) units)
+      (let [source (BeamLisp.Loader/source_content n)
+            [declared deps] (when source (plan/header-for n source))]
+       (when (not= n declared) (throw (ex-info "Application dependency source unavailable" {:namespace n})))
+       (recur (concat deps (rest pending))
+        (assoc units n {:source source :requires (vec deps) :artifact? (replayable? source)})))))))))
+(defn- inventory [root]
+ (let [paths (Path/wildcard (str root "/**/*") (list (tuple :match_dot true)))]
+  (reduce (fn [files path]
+            (let [kind (:type (File/lstat! path)) relative (Path/relative_to path root)]
+             (cond
+              (= :symlink kind) (throw (ex-info "Application package contains a symlink" {:path relative}))
+              (= :regular kind) (if (= "manifest.term" relative) files
+                                  (assoc files relative (digest (File/read! path))))
+              (= :directory kind) files
+              :else (throw (ex-info "Application package contains a special file" {:path relative})))))
+          {} paths)))
+(defn- source-path [n] (str "source/" (String/replace n "." "/") ".bl"))
+(defn- shape? [m]
+ (let [names (:namespaces m) artifacts (:artifacts m) fallback (:source-fallback m)]
+  (and (vector? names) (<= (count names) 10000) (every? namespace? names)
+       (= names (vec (sort (distinct names))))
+       (vector? artifacts) (vector? fallback)
+       (= names (vec (sort (concat artifacts fallback))))
+       (empty? (filter (fn [n] (contains? (set artifacts) n)) fallback))
+       (string? (:entry-hash m)) (vector? (:roots m)) (every? namespace? (:roots m))
+       (map? (:files m))
+       (every? (fn [n] (string? (get (:files m) (source-path n)))) names))))
+(defn verify!
+ "Check exact bytes and SDK/native identity BEFORE any application initializer.
+  Release authenticity is supplied by deployment; this manifest is not a signature."
+ [root]
+ (let [manifest (erlang/binary_to_term (File/read! (str root "/manifest.term")) (list :safe))
+       actual (runtime-identity)]
+  (when (and (map? manifest) (not= actual (:runtime manifest)))
+   (let [fields (filterv (fn [key] (not= (get actual key) (get (:runtime manifest) key))) (keys actual))
+         modules (when (contains? (set fields) :hosts)
+                   (mapv first (remove (set (:hosts (:runtime manifest))) (:hosts actual))))]
+    (throw (ex-info (str "Application package runtime identity mismatch: " (pr-str fields)
+                        " modules=" (pr-str modules))
+                    {:kind :application-package :fields fields}))))
+  (when (not (and (map? manifest) (contains? #{1 2} (:format manifest))
+                 (= actual (:runtime manifest))
+                 (shape? manifest) (= (:files manifest) (inventory root))))
+   (throw (ex-info "Application package identity or inventory mismatch" {:kind :application-package})))
+  (when (and (= 2 (:format manifest)) (not (realm-manifest? manifest)))
+    (throw (ex-info "Invalid realm package authority" {:kind :application-package-realm})))
+  manifest))
+(defn- realm-manifest? [m]
+ (and (map? (:realm m)) (string? (:key (:realm m))) (map? (:decl (:realm m)))
+      (map? (:homes m)) (= (set (:namespaces m)) (set (keys (:homes m))))
+      (map? (:closures m)) (= (set (:namespaces m)) (set (keys (:closures m))))
+      (every? string? (vals (:closures m)))
+      (string? (:compiler-authority m)) (map? (:local-modules m))
+      (= (set (:artifacts m)) (set (keys (:local-modules m))))
+      (every? (fn [[n context]]
+                (and (contains? #{:tier :realm :shadow :shared} (:home context))
+                     (if (= :tier (:home context)) (nil? (:segment context))
+                       (and (string? (:segment context))
+                            (= (:segment context)
+                               (if (= :shared (:home context))
+                                 (when-let [hash (get (:uses (:decl (:realm m))) n)] (str "S" (subs hash 7 19)))
+                                 (str "R" (:key (:realm m))))))))) (:homes m))
+      (every? (fn [[n names]]
+                (and (vector? names) (<= 1 (count names) 3) (= (count names) (count (distinct names)))
+                     (every? (fn [name]
+                       (and (string? name)
+                            (let [base (erlang/atom_to_binary (BeamLisp.Emit/base_module_for n) :utf8)
+                                  suffix (subs base (count "Elixir.BeamLisp.Ns."))
+                                  segment (:segment (get (:homes m) n))]
+                              (contains? #{(str "Elixir.BeamLisp.Ns." segment "." suffix)
+                                           (str "Elixir.BeamLisp.Ns.Body." segment "." suffix)
+                                           (str "Elixir.BeamLisp.Ns.Init." segment "." suffix)} name))
+                            (string? (get (:files m) (str "ebin/" name ".beam")))) ) names)))
+              (:local-modules m))))
+
+(defn- realm-compile! [units ebin homes]
+ ;; Physical homes are bound for the complete closure before compilation; a
+ ;; forward reference must never accidentally name the VM-global provider.
+ (doseq [[n context] homes]
+  (when (:segment context) (BeamLisp.Env/put_key (tuple :realm_local n) (:segment context))))
+ (reduce (fn [result [n unit]]
+           (if (not (:artifact? unit)) result
+            (let [path (BeamLisp.Loader/source_path n)
+                  emitted (BeamLisp.AOT/compile_source (:source unit)
+                            (list (tuple :file path) (tuple :output_dir ebin)))
+                  modules (mapv (fn [[module _]] (erlang/atom_to_binary module :utf8)) emitted)]
+             (when (empty? modules)
+               (throw (ex-info "Realm package compilation emitted no namespace" {:namespace n})))
+             (-> result (update :built inc) (assoc-in [:modules n] modules)))))
+         {:built 0 :modules {}} (sort-by first units)))
+
+(defn- build-unit!
+ "Create a new immutable package directory. Compile supported library units;
+  retain sources for all units so unsupported top-level effects replay normally.
+  Existing destinations are refused. Build in an isolated release environment."
+ [entry out roots]
+ (BeamLisp.Loader/ensure_loaded "build")
+ (when (File/exists? out) (throw (ex-info "Application package already exists" {:path out})))
+ (let [entry-source (BeamLisp.Loader/read_source entry)
+       realm (BeamLisp.Loader/realm_context)
+       original (closure entry-source roots)
+       homes (when realm (into {} (map (fn [[n _]] [n (BeamLisp.Loader/namespace_context n)]) original)))
+       authority (when realm (compiler-authority))
+       _ (when (and realm (nil? authority))
+           (throw (ex-info "Realm compiler authority is not packageable" {:kind :application-package-realm})))
+       units (if realm
+               (into {} (map (fn [[n unit]]
+                 [n (assoc unit :artifact? (and (:segment (get homes n))
+                    (empty? (:shadow (:decl realm)))
+                    (BeamLisp.AOT/local_cacheable_source? (:source unit))))]) original)) original)
+       closures (when realm (into {} (map (fn [[n _]] [n (BeamLisp.AOT/ns_closure_hash n)]) units)))
+       stage (str out ".building-" (Base/encode16 (crypto/strong_rand_bytes 16) (list (tuple :case :lower))))
+       ;; Exclusive creation precedes cleanup ownership. A crashed producer
+       ;; cannot leave files that a later VM silently includes in its release.
+       _ (File/mkdir! stage)
+       source-root (str stage "/source") ebin (str stage "/ebin")]
+  (try
+   (File/mkdir_p! source-root) (File/mkdir_p! ebin)
+   (let [sources (mapv (fn [[n unit]]
+                        (let [path (str source-root "/" (String/replace n "." "/") ".bl")]
+                         (File/mkdir_p! (Path/dirname path)) (File/write! path (:source unit))
+                         (when (:artifact? unit) path))) (sort-by first units))
+         result (if realm (realm-compile! units ebin homes)
+                   (BeamLisp.Loader/with_search_dir source-root
+                    (fn [] (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "build" "run")
+                      (list {:sources (filterv some? sources) :out ebin :jobs 1})))))
+         _ (when realm
+             (when (not= authority (compiler-authority))
+               (throw (ex-info "Realm compiler changed while packaging" {})))
+             (doseq [[n unit] units]
+               (when (or (not= (:source unit) (BeamLisp.Loader/source_content n))
+                         (not= (get closures n) (BeamLisp.AOT/ns_closure_hash n))
+                         (not= (get homes n) (BeamLisp.Loader/namespace_context n)))
+                 (throw (ex-info "Realm provider changed while packaging" {:namespace n})))))
+         manifest {:format (if realm 2 FORMAT) :runtime (runtime-identity)
+                   :entry-hash (digest entry-source) :roots (vec (sort (distinct roots)))
+                   :namespaces (vec (sort (keys units)))
+                   :artifacts (vec (sort (map first (filter (fn [[_ u]] (:artifact? u)) units))))
+                   :source-fallback (vec (sort (map first (remove (fn [[_ u]] (:artifact? u)) units))))}]
+    (let [manifest (if realm
+                     (assoc manifest :realm realm :homes homes :closures closures
+                            :compiler-authority authority :local-modules (:modules result)) manifest)]
+    (when (seq (:errors result)) (throw (ex-info "Application package compilation failed" result)))
+    ;; Build bookkeeping is not needed at runtime and is not shipped.
+    (doseq [path (Path/wildcard (str ebin "/*"))]
+     (when (not (String/ends_with? path ".beam")) (File/rm! path)))
+    (File/write! (str stage "/manifest.term")
+     (erlang/term_to_binary (assoc manifest :files (inventory stage))))
+    (verify! stage)
+    (when (File/exists? out) (throw (ex-info "Application package destination changed" {:path out})))
+    (File/rename! stage out)
+    (assoc manifest :path out :built (:built result))))
+   (finally (File/rm_rf stage)))))
+(defn build!
+ "Build under an OS-owned publication lease. Existing destinations are refused;
+  compilation uses a disposable namespace environment. Application compile-time
+  effects may execute: invoke this in a release build, never a serving VM."
+ [entry out roots]
+ (let [out (Path/expand out) _ (File/mkdir_p! (Path/dirname out))
+       owned (lease/acquire! (str out ".package.lock"))]
+  (when (nil? (:ok owned)) (throw (ex-info "Application package output busy/unavailable" owned)))
+  (try
+   (let [environment (BeamLisp.Env/fork)]
+    (try (BeamLisp.Env/with_env environment (fn [] (build-unit! entry out roots)))
+     (finally (BeamLisp.Env/destroy environment))))
+   (finally (lease/release! (:ok owned))))))
+(defn install!
+ "Verify release authority and live source drift before placing artifacts on
+  the code path. Returns the manifest; initialization stays with the loader."
+ [root entry-source roots]
+ (let [root (Path/expand root) manifest (verify! root)
+       realm (BeamLisp.Loader/realm_context)]
+  (when (if realm (not (and (= 2 (:format manifest)) (= realm (:realm manifest))))
+             (not= 1 (:format manifest)))
+    (throw (ex-info "Application package realm identity mismatch" {:kind :application-package-realm})))
+  (when (not (and (= (:entry-hash manifest) (digest entry-source))
+                 (= (:roots manifest) (vec (sort (distinct roots))))))
+   (throw (ex-info "Application package entry/root mismatch" {:kind :application-package})))
+  (doseq [n (:namespaces manifest)]
+   (let [live (BeamLisp.Loader/source_content n)
+         packaged (str root "/source/" (String/replace n "." "/") ".bl")]
+    (when (and live (not= (digest live) (digest (File/read! packaged))))
+     (throw (ex-info "Application package live source drift" {:namespace n})))))
+  (if realm
+   (do
+    (when (not= (:compiler-authority manifest) (compiler-authority))
+     (throw (ex-info "Realm package compiler authority mismatch" {:kind :application-package-realm})))
+    ;; Validate the complete live resolution snapshot before publishing ANY
+    ;; package provider. Missing local source is supplied by the immutable copy.
+    (doseq [[n context] (:homes manifest)]
+      (let [live (BeamLisp.Loader/source_content n)]
+       (when (and (:segment context) (BeamLisp.Env/loaded_ns? n)
+                  (nil? (BeamLisp.Loader/package_provider n)))
+         (throw (ex-info "Realm package must precede namespace initialization" {:namespace n})))
+       (when (and live (not= context (BeamLisp.Loader/namespace_context n)))
+        (throw (ex-info "Realm package namespace home mismatch" {:namespace n})))
+       (when (and live (not= (get (:closures manifest) n) (BeamLisp.AOT/ns_closure_hash n)))
+        (throw (ex-info "Realm package dependency closure mismatch" {:namespace n})))))
+    (let [published (BeamLisp.Env/with_scope_commit (BeamLisp.Env/env_id)
+      (fn []
+       (doseq [[n context] (:homes manifest)]
+        (when (:segment context)
+         (BeamLisp.Env/put_key (tuple :application_package_provider n)
+          {:realm realm :context context :path (str root "/" (source-path n))
+           :source-hash (get (:files manifest) (source-path n))
+           :closure (get (:closures manifest) n) :compiler-authority (:compiler-authority manifest)
+           :ebin (str root "/ebin") :modules (get (:local-modules manifest) n)
+           :beam-hashes (into {} (map (fn [name] [(str name ".beam") (get (:files manifest) (str "ebin/" name ".beam"))])
+                                     (get (:local-modules manifest) n)))})))
+       :ok))]
+     (when (= :retired published) (throw (ex-info "Realm retired during package installation" {})))))
+   (when (not= true (Code/prepend_path (str root "/ebin")))
+    (throw (ex-info "Application package code directory unavailable" {:kind :application-package}))))
+  manifest))

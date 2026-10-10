@@ -1,0 +1,84 @@
+(ns datom.writer-admission-test
+ (:require [datom :as d] [datom.conn :as conn] [proc.admission :as admission]))
+(def schema [{:db/ident :queue/value :db/valueType :db.type/string}])
+(defn spawn-bound [action]
+ (let [token (BeamLisp.Env/capture)]
+  (erlang/spawn (fn [] (BeamLisp.Env/bind token) (action)))))
+(defn await-queued [pid]
+ (loop [left 3000]
+  (cond
+   (> (elem (erlang/process_info pid :message_queue_len) 1) 0) :queued
+   (= 0 left) (throw (ex-info "writer fixture never queued" {}))
+   :else (do (Process/sleep 5) (recur (dec left))))))
+(defn kill-and-wait [pid]
+ (let [ref (erlang/monitor :process pid)]
+  (Process/exit pid :kill)
+  (assert (= :dead (receive [:DOWN received :process _ _] :when (= ref received)
+                    :dead (after 10000 :timeout))))))
+(defn with-blocked-writer [action]
+ (let [c (d/connect schema) pid (:writer c) parent (erlang/self)
+       released (atom false)
+       release (fn [] (when (not @released) (reset! released true) (erlang/send pid :release-writer)))]
+  (Agent/cast pid (fn [state]
+                    (erlang/send parent :writer-blocked)
+                    (receive :release-writer state (after 30000 state))))
+  (try
+   (assert (= :blocked (receive :writer-blocked :blocked (after 10000 :timeout))))
+   (action c pid release)
+   (finally (release) (Agent/get pid (fn [_] :drained) 30000) (d/close! c)))))
+
+(deftest dead-queued-callers-never-transact
+ (with-blocked-writer
+  (fn [c pid release]
+   (let [basis (:basis-t (d/db c))
+         caller (spawn-bound (fn [] (d/transact! c [{:db/id 42 :queue/value "dead"}])))]
+    (try
+     (await-queued pid)
+     (kill-and-wait caller)
+     (release)
+     (is (= :healthy (Agent/get pid (fn [_] :healthy) 30000)))
+     (is (= basis (:basis-t (d/db c))))
+     (is (= #{} (d/q '[:find ?e :where [?e :queue/value "dead"]] (d/db c))))
+     (finally (when (Process/alive? caller) (kill-and-wait caller))))))))
+
+(deftest inherited-budget-expiration-refuses-a-live-queued-caller
+ (with-blocked-writer
+  (fn [c pid release]
+   (let [parent (erlang/self)
+         caller (spawn-bound (fn []
+                  (admission/with-request (admission/token (erlang/self) 1000)
+                   (fn []
+                    (erlang/send parent
+                     [:writer-result (try (d/transact! c [{:db/id 43 :queue/value "expired"}])
+                                       :unexpected (catch e (:kind (ex-data e))))])))))]
+    (try
+     (await-queued pid)
+     (Process/sleep 1100)
+     (release)
+     (is (= :admission-cancelled
+            (receive [:writer-result result] result (after 10000 :timeout))))
+     (is (= #{} (d/q '[:find ?e :where [?e :queue/value "expired"]] (d/db c))))
+     (is (map? (d/transact! c [{:db/id 44 :queue/value "healthy"}])))
+     (finally (when (Process/alive? caller) (kill-and-wait caller))))))))
+
+(deftest accepted-writer-holds-its-own-code-lease-and-drains-after-owner-death
+ (let [c (d/connect schema) parent (erlang/self) finished (atom false)
+       _ (conn/guard! c :admission-test
+           (fn [_]
+             (erlang/send parent [:writer-admitted (Process/get :bl_admission)])
+             (receive :finish-writer nil (after 30000 nil))))
+       caller (spawn-bound (fn []
+                (admission/with-request (admission/token (erlang/self) 60000)
+                 (fn [] (d/transact! c [{:db/id 45 :queue/value "committed"}])))))]
+  (try
+   (is (= nil (receive [:writer-admitted context] context (after 10000 :timeout))))
+   (is (seq (ets/match_object :beam_lisp_code_leases (tuple (tuple :_ (:writer c) :_) true))))
+   (kill-and-wait caller)
+   (erlang/send (:writer c) :finish-writer) (reset! finished true)
+   (is (= :healthy (Agent/get (:writer c) (fn [_] :healthy) 30000)))
+   (is (= #{[45]} (d/q '[:find ?e :where [?e :queue/value "committed"]] (d/db c))))
+   (finally
+    (when (Process/alive? caller) (kill-and-wait caller))
+    (when (not @finished) (erlang/send (:writer c) :finish-writer))
+    (Agent/get (:writer c) (fn [_] :drained) 30000)
+    (d/close! c)))))

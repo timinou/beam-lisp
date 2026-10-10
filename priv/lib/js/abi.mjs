@@ -72,18 +72,11 @@ export const K_error = R.kw("error");
 // rest as ONE list (the BEAM ABI). `blfnFn` resolves each fixed arity once so a
 // call is a length switch plus a direct call, not a map lookup and two spreads.
 
-const BLFN = R.kw("$blfn");
-const isBlfn = (f) => f instanceof R.Tup && f.items.length === 3 && f.items[0] === BLFN;
+const isBlfn = R.isMultiCallable;
 
 function invokeBlfn(f, args) {
-  const fixed = f.items[1], v = f.items[2];
-  const g = fixed instanceof R.HMap ? fixed.get(args.length, NF) : NF;
-  if (g !== NF) return invoke(g, ...args);
-  if (v instanceof R.Tup) {
-    const mn = v.items[0];
-    if (args.length >= mn) return invoke(v.items[1], ...args.slice(0, mn), R.listFromArray(args.slice(mn)));
-  }
-  throw new R.BLError("wrong number of args (" + args.length + ") passed to a multi-arity fn");
+  const selected = R.selectCallable(f, args);
+  return invoke(selected.callee, ...selected.args);
 }
 
 /** A `{:$blfn …}` multi-fn value as ONE JS function, resolved once and cached
@@ -174,7 +167,7 @@ function withMetaColl(x, m) {
   // and changing metadata never repeats an effect or forks the node.
   if (x instanceof Z.LazySeq) return Z.withMeta(x, m);
   if (x instanceof R.Cons) { const c = new R.Cons(x.h, x.t); c.meta = m; return c; }
-  if (typeof x === "function") { const f = (...a) => x(...a); f.meta = m; return f; }
+  if (typeof x === "function") { const f = (...a) => x(...a); f.meta = m; return R.inheritCallable(f, x); }
   throw new R.BLError("with-meta: " + R.printStr(x) + " cannot carry metadata");
 }
 export function with_meta(x, m) { return withMetaColl(x, m); }

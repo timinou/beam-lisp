@@ -39,15 +39,15 @@ ok('big quot', H.arith('quot', 9007199254740993n, 7) === 1286742750677284);
 ok('big rem', H.arith('rem', -9007199254740993n, 7) === -5);
 ok('big mod', H.arith('mod', -9007199254740993n, 7) === 2);
 assert.throws(() => H.arith('mod', 1, 0), /mod by zero/); checks++;
-assert.throws(() => H.arith('quot', 1, 0), /divide by zero/); checks++;
-assert.throws(() => H.arith('rem', 7.5, 2), /needs two integers/); checks++;
+assert.throws(() => H.arith('quot', 1, 0), /quot by zero/); checks++;
+assert.throws(() => H.arith('rem', 7.5, 2), /needs integers/); checks++;
 
 // ── division is a float; a BigInt operand becomes one (float contagion) ───────
 
-ok('div of ints is the double quotient', H.arith('div', 8, 2) === 4 && H.arith('div', 7, 2) === 3.5);
-ok('div of a BigInt is a float', H.arith('div', 9007199254740993n, 1) === 9007199254740992);
-ok('float contagion converts a BigInt to a Number', isNum(H.arith('add', 9007199254740993n, 0.25)) && H.arith('add', 9007199254740993n, 0.25) === 9007199254740992);
-ok('float contagion with a fraction', H.arith('sub', 9007199254740993n, 0.5) === 9007199254740991.5);
+ok('div of ints is the double quotient', H.arith('div', 8, 2) instanceof H.Flt && H.arith('div', 8, 2).v === 4 && H.arith('div', 7, 2).v === 3.5);
+ok('div of a BigInt is a float', H.arith('div', 9007199254740993n, 1).v === 9007199254740992);
+ok('float contagion converts a BigInt to a Number', H.isFloat(H.arith('add', 9007199254740993n, 0.25)) && H.arith('add', 9007199254740993n, 0.25).v === 9007199254740992);
+ok('float contagion with a fraction', H.arith('sub', 9007199254740993n, 0.5).v === 9007199254740991.5);
 
 // ── hashing and equality across the Number/BigInt boundary ───────────────────
 

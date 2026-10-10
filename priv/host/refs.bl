@@ -398,48 +398,76 @@
 
 ; ── futures ───────────────────────────────────────────────────────────────
 
+(defn- await_owned_start
+  "A start barrier closes the publication gap: the parent acquires before
+   spawning, transfers under Env's module fence, then publishes the handle.
+   Parent death before publication cannot leave an orphan waiting forever."
+  [parent token thunk_fn]
+  (let [ref (erlang/monitor :process parent)]
+    (receive
+      [:bl_owned_start handle]
+      (do (erlang/demonitor ref (list :flush))
+          (try
+            (BeamLisp.Env/bind token)
+            (apply_heap_bound)
+            (thunk_fn)
+            (finally (BeamLisp.Env/release_code! handle))))
+      [:DOWN observed :process _ _]
+      (if (erlang/== ref observed) :cancelled
+        (erlang/error :unexpected_start_monitor)))))
+
+(defn- publish_owned_start [handle pid]
+  (let [accepted (BeamLisp.Env/transfer_code! handle pid)]
+    (if (erlang/== :cancelled accepted)
+      (do (erlang/exit pid :kill) :cancelled)
+      (do (erlang/send pid (tuple :bl_owned_start accepted)) :ok))))
+
 (defn future_exec
-  "A `BeamLisp.Future` over a thunk already running in a `Task`. The task
-   INHERITS the caller's env binding: pdict does not propagate across spawn, and
-   a future that landed in `:global` would silently escape its test's isolated
-   env (PLAN-046 L2)."
+  "An env-conveying Task with executable ownership acquired before spawning.
+   Task link/cancellation semantics remain unchanged. Accepted execution holds
+   the thunk's physical module until completion, even across reload."
   [thunk_fn]
-  (let [token (BeamLisp.Env/capture)
-        bounded? (erlang/not (erlang/== nil (BeamLisp.Env/max_heap)))
-        task (Task/async
-               (fn []
-                 ; Wait until the caller has unlinked a bounded task. A hard
-                 ; heap kill before that handshake could kill the caller too.
-                 (receive [:bl_future_start] :ok)
-                 (BeamLisp.Env/bind token)
-                 (apply_heap_bound)
-                 (thunk_fn)))]
-    (when bounded? (Process/unlink (erlang/map_get :pid task)))
-    (erlang/send (erlang/map_get :pid task)
-                 (erlang/list_to_tuple (list :bl_future_start)))
-    (maps/put :__struct__ :"Elixir.BeamLisp.Future"
-      (maps/put :task task (maps/new)))))
+  (let [token (BeamLisp.Env/capture) parent (erlang/self)
+        handle (BeamLisp.Env/retain_code!
+                 (list (erlang/element 2 (erlang/fun_info thunk_fn :module))
+                       (erlang/element 2 (erlang/fun_info (fn [] nil) :module))))
+        bounded? (erlang/not (erlang/== nil (BeamLisp.Env/max_heap)))]
+    (try
+      (let [task (Task/async (fn [] (await_owned_start parent token thunk_fn)))]
+        (when bounded? (Process/unlink (erlang/map_get :pid task)))
+        (publish_owned_start handle (erlang/map_get :pid task))
+        (maps/put :__struct__ :"Elixir.BeamLisp.Future"
+          (maps/put :task task (maps/new))))
+      (finally (BeamLisp.Env/release_code! handle)))))
+
+(defn spawn_owned
+  "Env-conveying process with explicit extra physical module dependencies.
+   Runtime boundaries retaining another callback list that callback's module
+   here; arbitrary values hidden inside closures are not traced."
+  [thunk_fn kind modules]
+  (let [token (BeamLisp.Env/capture) parent (erlang/self)
+        modules (erlang/++ modules
+                  (list (erlang/element 2 (erlang/fun_info thunk_fn :module))
+                        (erlang/element 2 (erlang/fun_info (fn [] nil) :module))))
+        handle (BeamLisp.Env/retain_code! modules)
+        wrapped (fn [] (await_owned_start parent token thunk_fn))]
+    (try
+      (let [result (cond
+                     (erlang/== :plain kind) (erlang/spawn wrapped)
+                     (erlang/== :link kind) (erlang/spawn_link wrapped)
+                     (erlang/== :monitor kind) (erlang/spawn_monitor wrapped)
+                     :else (erlang/error (Elixir.CaseClauseError/exception (list (tuple :term kind)))))
+            pid (if (erlang/== :monitor kind) (erlang/element 1 result) result)]
+        (publish_owned_start handle pid)
+        result)
+      (finally (BeamLisp.Env/release_code! handle)))))
 
 (defn spawn_exec
-  "A raw process that INHERITS the spawning env — the same binding-conveyance
-   `future_exec/1` and `promise/0` use. Raw `:erlang.spawn` starts a child with
-   an EMPTY process dict, so the child resolves its vars and caps at `:global`;
-   capturing the token here and binding it first makes `spawn` env-transparent.
-   `kind` is `:plain | :link | :monitor`, mirroring the three `:erlang.spawn*`
-   shapes; `:monitor` returns a `{pid, ref}` tuple as Erlang does."
+  "Spawn with env conveyance and automatic executable lifetime transfer.
+   Plain accepted children survive caller death; linked children retain OTP's
+   link semantics. Monitor returns the same {pid, ref} shape as Erlang."
   ([thunk_fn] (spawn_exec thunk_fn :plain))
-  ([thunk_fn kind]
-   (let [token (BeamLisp.Env/capture)
-         wrapped (fn []
-                   (BeamLisp.Env/bind token)
-                   (apply_heap_bound)
-                   (thunk_fn))]
-     (cond
-       (erlang/== :plain kind) (erlang/spawn wrapped)
-       (erlang/== :link kind) (erlang/spawn_link wrapped)
-       (erlang/== :monitor kind) (erlang/spawn_monitor wrapped)
-       :else
-       (erlang/error (Elixir.CaseClauseError/exception (list (tuple :term kind))))))))
+  ([thunk_fn kind] (spawn_owned thunk_fn kind (list))))
 
 (defn future?
   "True for a future — a map tagged with the `BeamLisp.Future` struct."

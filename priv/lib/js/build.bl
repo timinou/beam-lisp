@@ -28,7 +28,8 @@
   (:require [js.emit :as e]
             [reader-node :as rn]
             [system.ir :as ir]
-            [system.js :as native]))
+            [system.js :as native]
+            [bl.json :as json]))
 
 ; ─── reading a namespace ────────────────────────────────────────────────────
 
@@ -103,7 +104,15 @@
     (vec (keep (fn [[i d]] (when (or (nil? (:name d)) (= i (get last-at (:name d)))) d))
                (map-indexed (fn [i d] [i d]) defs)))))
 
-(defn- top-defs
+(defn defn-value-form
+  "A definition's function value with its original name/span and clauses.
+   Docstrings and attribute maps are declaration data, not runtime arguments."
+  [form]
+  (let [items (rn-items form)]
+    (wrap-pos (rn/list-node (cons (rn/sym-node "fn")
+                              (cons (second items) (strip-doc+attrs items)))) form)))
+
+(defn definition-values
   "Definitions a file contributes, in order: {:name :private? :form :kind}.
    `defn` → `(fn name clauses…)`; `def` → its init form. Macros run in the
    BEAM compiler only (they shaped this ANF already), so they emit nothing."
@@ -115,7 +124,7 @@
                 (let [its (rn-items f)
                       nm (rn-name (second its))]
                   {:name nm :kind :fn :private? (or (sym? (first its) "defn-") (= true (:private (rn/node-pos (second its)))))
-                   :form (wrap-pos (rn/list-node (cons (rn/sym-node "fn") (cons (second its) (strip-doc+attrs its)))) f)})
+                   :form (defn-value-form f)})
               (def-like? f)
                 (let [its (rn-items f)
                       nm (rn-name (second its))
@@ -175,16 +184,21 @@
                  (into out (map (fn [s] (get by-name s)) syms))))))))
 
 
-(defn compile-ns
-  "Compile namespace file `path` to {:ns :requires :defs [{:name :kind :node}]}.
-   The BEAM compiler is given the real namespace, so macros, aliases and
-   refers resolve exactly as they would on BEAM. Each def is interned as a
-   placeholder FIRST so later forms' references to earlier (and forward)
-   names resolve to `:global` of this namespace."
-  [path]
+(defn prepare-ns
+  "One namespace staging path for JavaScript lowering. Defines only macros and
+   their statically referenced helpers, never application initializers. Caller
+   owns Env isolation. :after-ns installs target links inside that isolation;
+   :after-staging masks compile-time helper links before runtime lowering;
+   :fallback-ns supports headerless actor fragments during migration."
+  ([path] (prepare-ns path {}))
+  ([path options]
   (let [texts (read-forms+text path)
         forms (vec (map first texts))
-        head (ns-head forms)
+        has-head? (and (= :list (rn-tag (first forms))) (sym? (first (rn-items (first forms))) "ns"))
+        head (if has-head? (ns-head forms)
+                 (if-let [fallback (:fallback-ns options)] {:ns fallback :requires []}
+                   (ns-head forms)))
+        body (if has-head? (vec (rest forms)) forms)
         ns (:ns head)
         ; STAGING (see `build`): this namespace's definitions live in the
         ; build's private env. Mark it loaded THERE so a name lookup that
@@ -193,8 +207,9 @@
         ; included. Per-env: the live VM's loaded set is untouched.
         _ (BeamLisp.Env/mark_loaded ns)
         ; evaluate the ns form on BEAM so aliases/requires exist for the compiler
-        _ (BeamLisp.Compiler/eval_string (second (first texts)) (BeamLisp.Compiler/new_env "user") path)
-        defs (top-defs (rest forms))
+        _ (when has-head? (BeamLisp.Compiler/eval_string (second (first texts)) (BeamLisp.Compiler/new_env "user") path))
+        _ (when-let [after (:after-ns options)] (after ns))
+        defs (definition-values (if-let [expand (:expand-top options)] (expand body ns path) body))
         ; a placeholder only where the name is unbound: interning nil over a LIVE
         ; definition (compiling `core` itself, or any ns this VM already runs)
         ; would break the very compiler doing the compiling
@@ -210,27 +225,57 @@
         ; expansion time: exactly the defn(s) the macros reach (transitively,
         ; by symbol), evaluated first, in source order. A defn only DEFINES;
         ; no other top-level form (def, side-effect expr) is ever run.
-        mforms (filter defmacro? (rest forms))
-        needed (macro-helper-forms (rest forms) mforms)
-        _ (doseq [[f text] (rest texts)
+        mforms (filter defmacro? body)
+        needed (macro-helper-forms body mforms)
+        _ (doseq [[f text] (if has-head? (rest texts) texts)
                   :when (or (defmacro? f) (some (fn [n] (identical? n f)) needed))]
             (try (BeamLisp.Compiler/eval_string text (BeamLisp.Compiler/new_env ns) path)
                  (catch ex
                    (throw (ex-info (str path ": staging " (rn-name (second (rn-items f))) ": " (ex-message ex))
                                    {:path path :ns ns :form f})))))
 
+        _ (when-let [after (:after-staging options)] (after {:ns ns :defs defs}))
         env (assoc (BeamLisp.Ns.Compiler/new_env ns) :target :js)]
-    {:ns ns :path path :requires (:requires head)
-     :defs (vec (map (fn [d]
-                       (assoc d :node
-                         (try (let [node (BeamLisp.Ns.Compiler/compile (:form d) env)]
-                                (if (:js-interop env) (native/check! node) node))
-                              (catch ex
-                                (throw (ex-info (str path ": " (or (:name d) "top-level form") ": " (ex-message ex))
-                                                {:path path :name (:name d)}))))))
-                     defs))}))
+    {:ns ns :path path :requires (:requires head) :js-interop? (:js-interop env)
+     :texts texts :env env :defs defs})))
+
+(defn compile-prepared
+  "Compile prepared definitions through one compiler/error path. A target can
+   supply :check-node to validate its linked ABI against the same checked ANF."
+  ([prepared] (compile-prepared prepared {}))
+  ([prepared options]
+  (let [env (:env prepared) path (:path prepared)
+        check (or (:check-node options)
+                  (if (:js-interop env) native/check! identity))]
+    (assoc (dissoc prepared :texts :env) :defs
+      (vec (map (fn [d]
+                  (assoc d :node
+                    (try (check (BeamLisp.Ns.Compiler/compile (:form d) env))
+                         (catch ex
+                           (throw (ex-info (str path ": " (or (:name d) "top-level form") ": " (ex-message ex))
+                                           {:path path :name (:name d)}))))))
+                (:defs prepared)))))))
+
+(defn compile-ns
+  "Compile staged namespace definitions to the common checked ANF."
+  [path]
+  (compile-prepared (prepare-ns path)))
 
 ; ─── linking ────────────────────────────────────────────────────────────────
+
+(defn native-module-metadata
+  "Link facts from the same checked compilation that emits the module. No
+   application evaluation, source signature parser, or package export table."
+  [compiled]
+  {"abi" "bl"
+   "native" (boolean (:js-interop? compiled))
+   "exports" (into {} (keep (fn [d]
+                             (when (and (:name d) (not (:private? d)))
+                               (when-let [shape (ir/function-shape (:node d))]
+                                 [(:name d) {"export" (str "d_" (e/mangle (:name d)))
+                                             "arities" (vec (sort (:arities shape)))
+                                             "variadic-min" (:variadic-min shape)}])))
+                           (:defs compiled)))})
 
 (def ^:private rt-mod :Elixir.BeamLisp.Ns.Rt)
 
@@ -542,6 +587,10 @@
         ; source. Load the pipeline dependency before staging can mark that
         ; namespace loaded with target-only placeholders in its private fork.
         _ (BeamLisp.Loader/ensure_loaded "system.ir")
+        ; Shared patterns are also executed by this emitter while their source
+        ; is staged for the browser compiler. Preserve the live implementation
+        ; before target-only forward placeholders can shadow lazy loading.
+        _ (BeamLisp.Loader/ensure_loaded "js.pattern")
         _ (e/set-rest-fns! (rest-fns (vec core)))
         ; Link, and follow module-name references: a call
         ; `BeamLisp.Ns.Clojure.String/upper-case` names a NAMESPACE (one whose
@@ -590,6 +639,8 @@
                  (str "// GENERATED by priv/lib/js/build.bl — the base namespaces, loaded in order.\n"
                       (join "" (map (fn [ns] (str "import \"./" ns ".mjs\";\n"))
                                     (filter (fn [ns] (contains? (set order) ns)) (or (:with opts) []))))))
+    (File/write! (str out "/native-modules.json")
+                 (json/encode {"version" 1 "modules" (into {} (map (fn [ns] [ns (native-module-metadata (get compiled ns))]) order))}))
     (doseq [ns order] (File/write! (str out "/" (ns-file ns)) (get texts ns)))
     {:modules order :bytes (reduce + 0 (map count (vals texts)))
      :sources (vec (map (fn [ns] (:path (get compiled ns))) order))}))
