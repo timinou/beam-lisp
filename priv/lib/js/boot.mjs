@@ -25,8 +25,9 @@ import * as R from "./rt.mjs";
 import { ENV } from "./env.mjs";
 import { REST_FNS } from "./core-links.mjs";
 import { mangle } from "./host-leaves.mjs";
-// the compiled base, loaded first so a `provided` check sees its exports; the
-// entry (js.eval) imports base.mjs, so the whole base is ready on first import
+// Boot is also consumed as a library inside union builds, where js.eval is
+// not the entry. Initialize the declared base explicitly before source macros.
+import "./ns/base.mjs";
 import * as E from "./ns/js.eval.mjs";
 import * as Rd from "./ns/reader.mjs";
 import * as CompiledCore from "./ns/core.mjs";
