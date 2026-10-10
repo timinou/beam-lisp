@@ -195,7 +195,7 @@ problems reports all three in one pass.
 ;; How `bl` reaches a warm VM for this tree. The LAUNCHER reads this key (it must
 ;; decide before any VM exists), so the vocabulary lives in
 ;; tooling/drop/src/transport.rs; a test keeps the two lists equal.
-(def warm-modes ["off" "attach" "start"])
+(def warm-modes ["off" "attach" "start" "require"])
 
 ;; Which VM serves this project: its own (the default) or the one its build shares
 ;; with every project that asks. The LAUNCHER reads it, before any VM exists
@@ -257,23 +257,26 @@ problems reports all three in one pass.
     :else [[] [(str what " must be a list of strings")]]))
 
 (defn- norm-task
-  "One task entry → {:run FILE :doc STRING :paths [DIR…] :watch BOOL}, plus its
+  "One task entry → {:run FILE :doc STRING :paths [DIR…] :watch BOOL :service BOOL}, plus its
    errors. A bare string is the common case: the file to run."
   [name spec root]
   (let [what (str "task \"" name "\"")]
     (cond
       (string? spec)
-      [{:run (Path/expand spec root) :doc nil :paths [] :watch false} []]
+      [{:run (Path/expand spec root) :doc nil :paths [] :watch false :service false} []]
 
       (map? spec)
       (let [run (:run spec)
             [paths perr] (norm-strings (:paths spec) (str what " :paths") root)
+            service (:service spec)
+            serr (if (or (nil? service) (= true service) (= false service)) []
+                   [(str what " :service must be a boolean")])
             doc (:doc spec)
             derr (if (or (nil? doc) (string? doc)) [] [(str what " :doc must be a string")])]
         (if (string? run)
-          [{:run (Path/expand run root) :doc doc :paths paths :watch (or (:watch spec) false)}
-           (concat perr derr)]
-          [nil (concat [(str what " needs :run, a file to run")] perr derr)]))
+          [{:run (Path/expand run root) :doc doc :paths paths :watch (or (:watch spec) false) :service (= true service)}
+           (concat perr derr serr)]
+          [nil (concat [(str what " needs :run, a file to run")] perr derr serr)]))
 
       :else
       [nil [(str what " must be a file name or a map")]])))

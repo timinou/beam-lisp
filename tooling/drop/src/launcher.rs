@@ -529,14 +529,24 @@ fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path, t: Transport, sha
 /// fails costs it nothing. Only the first starter acts — `claim_start` keeps a
 /// second from spawning a duplicate VM for the same endpoint.
 #[cfg(unix)]
-fn retry_from_warm(bin: &std::path::Path, root: &std::path::Path, _argv: &[String], t: Transport, shared: bool) -> Option<i32> {
-    if t != Transport::Start {
+fn retry_from_warm(bin: &std::path::Path, root: &std::path::Path, argv: &[String], t: Transport, shared: bool) -> Option<i32> {
+    if t != Transport::Start && t != Transport::Require {
         return None;
     }
     if let Some(ep) = endpoints(root, shared) {
         if claim_start(&ep.starting, now_secs(), START_GRACE_SECS) {
             start_daemon_detached(bin, root, &build_id(), shared);
         }
+    }
+    if t == Transport::Require {
+        if !wait_ready(root, shared) {
+            eprintln!("bl: required warm VM did not become ready; service was not run (see `bl vm logs`)");
+            return Some(1);
+        }
+        return Some(after_attach(try_attach(root, argv, shared)).unwrap_or_else(|| {
+            eprintln!("bl: required warm VM unavailable; service was not run cold");
+            1
+        }));
     }
     None
 }
@@ -838,10 +848,13 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
         let shared = shared_for(&argv, env_bl.as_deref()) && supports_shared_vm(dest);
         // Whether the project shares its VM decides the DEFAULT transport (an own
         // VM attaches, a shared one starts); anything the user declared still wins.
-        let t = effective_transport(
+        let mut t = effective_transport(
             root.as_deref().map(|r| transport(r, &argv, shared)).unwrap_or_else(|| default_transport(shared)),
             supports_background_start(dest),
         );
+        if t != Transport::Cold && service_requested(&argv, env_bl.as_deref()) {
+            t = Transport::Require;
+        }
         let is_lifecycle = verb_of(&argv).as_deref().is_some_and(|v| LIFECYCLE_VERBS.contains(&v));
         // `bl realm start` is a REQUEST for a warm VM, not a command to run
         // inside one. Exec'd, the release parks in the foreground and dies with
@@ -885,6 +898,10 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
                 }
             }
             if !is_lifecycle {
+                if t == Transport::Require && (!supports_background_start(dest) || root.is_none()) {
+                    eprintln!("bl: required warm transport needs a project root and a persistent-VM capable release");
+                    std::process::exit(1);
+                }
                 if let Some(code) = maybe_attach_daemon(&argv, &bin, t, shared) {
                     std::process::exit(code);
                 }

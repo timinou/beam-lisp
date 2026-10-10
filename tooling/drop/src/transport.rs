@@ -46,6 +46,8 @@ pub enum Transport {
     /// did not ask to wait for must not slow the command that hinted at it, and
     /// a start that fails costs this command nothing.
     Start,
+    /// Require a persistent owner: start, await readiness and attach; never fall back cold.
+    Require,
 }
 
 /// The transport when nothing says otherwise and the project has its OWN VM.
@@ -85,6 +87,7 @@ pub const WARM_SPELLINGS: &[(&str, Transport)] = &[
     ("off", Transport::Cold),
     ("attach", Transport::Attach),
     ("start", Transport::Start),
+    ("require", Transport::Require),
 ];
 
 /// The declaration key for VM sharing: `:vm "…"` in `env.bl`, read by
@@ -95,6 +98,7 @@ pub const VM_KEY: &str = "vm";
 /// not in this table is ignored: prose must not become policy.
 pub const VM_SPELLINGS: &[(&str, bool)] = &[("own", false), ("shared", true)];
 
+/// `--warm-required` waits for a persistent owner and refuses cold fallback.
 /// Boolean flag; force a shared VM for this invocation.
 pub const SHARED_FLAG: &str = "--share-vm";
 /// Boolean flag; force this project's own VM. Beats `SHARED_FLAG`.
@@ -173,12 +177,65 @@ pub fn declared_transport(argv: &[String], tree_text: Option<&str>, config_text:
     if flag_present(argv, COLD_FLAG) {
         return Some(Transport::Cold);
     }
+    if flag_present(argv, "--warm-required") {
+        return Some(Transport::Require);
+    }
     if flag_present(argv, WARM_FLAG) {
         return Some(Transport::Start);
     }
     [tree_text, config_text]
         .into_iter()
         .find_map(|text| text.and_then(|t| scan_literal(t, WARM_KEY)).and_then(|v| warm_spelling(&v)))
+}
+
+/// Read only literal task service metadata. Balance collections and skip strings
+/// and comments so prose, another task or a nested map cannot change transport.
+fn service_task(text: &str, task: &str) -> bool {
+    let mut tokens = Vec::<(usize, String)>::new();
+    let mut chars = text.chars().peekable();
+    let mut depth = 0usize;
+    while let Some(c) = chars.next() {
+        match c {
+            ';' => { while chars.next().is_some_and(|c| c != '\n') {} }
+            '"' => {
+                let mut value = String::new();
+                while let Some(c) = chars.next() {
+                    if c == '"' { break; }
+                    if c == '\\' {
+                        if let Some(c) = chars.next() { value.push(c); }
+                    } else { value.push(c); }
+                }
+                tokens.push((depth, format!("\"{value}\"")));
+            }
+            '{' | '[' | '(' => { tokens.push((depth, c.to_string())); depth += 1; }
+            '}' | ']' | ')' => { depth = depth.saturating_sub(1); tokens.push((depth, c.to_string())); }
+            c if c.is_whitespace() || c == ',' => {}
+            _ => {
+                let mut value = c.to_string();
+                while chars.peek().is_some_and(|c| !c.is_whitespace() && !"{}[]();,\"".contains(*c)) {
+                    value.push(chars.next().unwrap());
+                }
+                tokens.push((depth, value));
+            }
+        }
+    }
+    let Some(i) = tokens.windows(2).position(|w| w[0] == (1, ":tasks".into()) && w[1] == (1, "{".into())) else { return false; };
+    let names = [format!("\"{task}\""), format!(":{task}")];
+    for j in i + 2..tokens.len().saturating_sub(1) {
+        if tokens[j].0 < 2 { break; }
+        if tokens[j].0 == 2 && names.contains(&tokens[j].1) && tokens[j + 1] == (2, "{".into()) {
+            for w in tokens[j + 2..].windows(2) {
+                if w[0].0 < 3 { break; }
+                if w[0] == (3, ":service".into()) { return w[1] == (3, "true".into()); }
+            }
+            return false;
+        }
+    }
+    false
+}
+
+pub fn service_requested(argv: &[String], text: Option<&str>) -> bool {
+    verb_of(argv).is_some_and(|task| text.is_some_and(|t| service_task(t, &task)))
 }
 
 /// The transport for `root` under `argv`: the thin reader that loads the tree's
@@ -269,6 +326,28 @@ fn words(list: &[&str]) -> Vec<String> {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+
+    #[test]
+    fn only_the_selected_literal_service_task_requires_an_owner() {
+        let text = r#"{:tasks {"build" {:run "build.bl"}
+          :dev {:run "dev.bl" :service true :doc "ignore ; :service false"}
+          "other" {:service false :nested {:service true}}}}"#;
+        assert!(service_requested(&a(&["dev"]), Some(text)));
+        assert!(!service_requested(&a(&["build"]), Some(text)));
+        assert!(!service_requested(&a(&["other"]), Some(text)));
+        assert!(!service_requested(&a(&["missing"]), Some(text)));
+        assert!(!service_requested(&a(&["dev"]), Some("{:tasks {;; :dev {:service true}\n}}")));
+    }
+
+    #[test]
+    fn persistent_transport_is_explicit_and_cold_still_wins() {
+        assert_eq!(transport_from(&[], Some(":warm \"require\""), None), Transport::Require);
+        assert_eq!(transport_from(&a(&["--warm-required"]), None, None), Transport::Require);
+        assert_eq!(transport_from(&a(&["--cold", "--warm-required"]), None, None), Transport::Cold);
+        assert_eq!(transport_from(&a(&["run", "--", "--warm-required"]), None, None), DEFAULT_TRANSPORT);
+        // Required ownership must never be downgraded into a cold fallback.
+        assert_eq!(effective_transport(Transport::Require, false), Transport::Require);
+    }
 
     #[test]
     fn a_declaration_beats_the_default_for_a_shared_project_too() {
