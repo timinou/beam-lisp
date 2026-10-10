@@ -26,5 +26,8 @@ storage mode and compatible backend/frontend revisions. Do not put secrets in it
 
 `vm.service/stop!` calls the service's cleanup callback and waits for its owner
 to exit. Cleanup must stop listeners and work before closing durable storage.
-Currently realm drain still uses forced member teardown: graceful service stop
-must precede realm close. Route leases and bounded shutdown remain separate gates.
+Realm drain first asks all service owners to clean up, with one shared five-second
+deadline, then forcibly ends remaining members. Slow or stuck cleanup is therefore
+not guaranteed to flush; explicit `stop!` waits without that drain deadline.
+Cleanup must not call back into the realm manager while it is draining.
+Route leases remain a separate gate.
