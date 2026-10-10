@@ -158,78 +158,65 @@
       (some? secs) (* 1000 secs)
       :else DEFAULT-WORKER-BOUND-MS)))
 
+(defn- evaluate-file [scope src ns warns]
+  (env/with-env scope
+    (fn []
+      (reload/with-target scope
+        (fn []
+          (try
+            (BeamLisp.TestRT/declarations (fn [] (env/eval src)))
+            (let [result (BeamLisp.TestRT/run_ns ns)
+                  totals {:tests (:tests result) :pass (:pass result)
+                          :fail (:fail result) :error (:error result)}
+                  failures (filter #(contains? #{:fail :error} (:type %)) (:reports result))
+                  failed? (not (and (= 0 (:fail totals)) (= 0 (:error totals))))]
+              {:ns ns :status (if failed? :failed :passed) :totals totals
+               :reports (vec failures) :repair (when failed? (diagnose-processes src))
+               :warnings warns})
+            (catch e
+              {:ns ns :status :incoherent :warnings warns
+               :errors [{:kind :load-crash
+                         :msg (str "crashed while loading: " (ex-message e))}]})))))))
+
 (defn run-file
-  "Run one test file's SOURCE in a fresh isolated fork of `base` IN A SEPARATE
-   WORKER PROCESS with a clean mailbox. Returns a result map: {:ns ns :status
-   :passed|:failed|:incoherent :totals {…} :warnings [...] :errors [...]}.
-
-   MAILBOX HYGIENE (BUG-041): Each test file runs in its own erlang/spawn'd
-   worker process, NOT in the daemon executor GenServer. This ensures test
-   `receive` calls cannot observe daemon protocol messages ({:\"$gen_call\", ...},
-   {:run, port, ...}). The worker binds the forked env, runs the test, and sends
-   the result back.
-
-   The coherence pass is ADVISORY here, not a gate. reload's coherence checker is
-   tuned for whole-namespace top-level defs; a test file legitimately binds
-   locals (`let`/destructuring) it does not scope-track, so a hard reject would
-   false-flag valid files. Instead its findings ride along as `:warnings`, and
-   the file RUNS — a genuine dangling reference then surfaces as a real
-   load-crash or test error, caught by the fork's try/catch. Safety comes from
-   ISOLATION + crash-containment (structural), with coherence as a helpful
-   heads-up (heuristic). A file with no `(ns …)` is the one true reject: without
-   a namespace it cannot be run or reported coherently."
+  "Run a source file in a fresh fork and an owned monitored worker with a clean
+   mailbox. Coherence findings are advisory warnings. Results are correlated by
+   exact PID; fatal exits are reported immediately, rather than waiting for the
+   timeout. The caller owns the isolated scope so even an uncatchable worker
+   death cannot leak its scope. Timeout kills and awaits that exact worker.
+   Native executable ownership and explicit environment conveyance are retained."
   [base src]
   (let [ns (ns-of src)]
     (if (nil? ns)
-      {:ns nil :status :incoherent
-       :errors [(missing-namespace-error src)]}
-      (let [warns (check-source ns src)
-            ; The worker starts in a FRESH process, whose pdict — and therefore
-            ; whose env — is empty, so the parent's env crosses as a token and
-            ; is re-bound there before anything else runs.
-            env-token (env/capture)
-            me (erlang/self)
-            worker (erlang/spawn
-                     (fn []
-                       (env/bind env-token)
-                       (let [result
-                             (env/isolated base
-                               (fn []
-                                 (reload/with-target (env/current)
-                                   (fn []
-                                     (try
-                                       (do
-                                         (BeamLisp.TestRT/declarations (fn [] (env/eval src)))
-                                         (let [result (BeamLisp.TestRT/run_ns ns)
-                                               totals  {:tests (:tests result) :pass (:pass result)
-                                                        :fail (:fail result) :error (:error result)}
-                                               failures (filter (fn [r] (contains? #{:fail :error} (:type r)))
-                                                                (:reports result))
-                                               failed? (not (and (= 0 (:fail totals)) (= 0 (:error totals))))]
-                                           {:ns ns
-                                            :status (if failed? :failed :passed)
-                                            :totals totals
-                                            :reports (vec failures)
-                                            :repair (if failed? (diagnose-processes src) nil)
-                                            :warnings warns}))
-                                       (catch e
-                                         {:ns ns :status :incoherent :warnings warns
-                                          :errors [{:kind :load-crash
-                                                    :msg (str "crashed while loading: " (ex-message e))}]}))))))]
-                             ; The result goes back to the parent — the only process
-                             ; that can report it — and the worker then exits.
-                             (erlang/send me [:ward-result (erlang/self) result]))))]
-        ; Wait for the worker's result. The bound must cover a SLOW file on a
-        ; contended machine (a mount+index test under a warming daemon measured
-        ; past 60s), not a healthy one — a hang still reports, just later. A
-        ; timed-out worker is killed: left running it would keep mutating the
-        ; shared image after its result was already given up on.
-        (receive
-          [:ward-result _wpid r] r
-          (after (worker-bound-ms ns)
-            (do (erlang/exit worker :kill)
+      {:ns nil :status :incoherent :errors [(missing-namespace-error src)]}
+      (let [warns (check-source ns src) scope (env/fork base)
+            env-token (env/capture) me (erlang/self) bound (worker-bound-ms ns)]
+        (try
+          (let [started (BeamLisp.Refs/spawn_owned
+                          (fn []
+                            (env/bind env-token)
+                            (let [result (evaluate-file scope src ns warns)]
+                              (erlang/send me [:ward-result (erlang/self) result])))
+                          :monitor (list))
+                worker (elem started 0) monitor (elem started 1)]
+            (receive
+              [:ward-result observed r] :when (= observed worker)
+                (do (erlang/demonitor monitor (list :flush)) r)
+              [:DOWN observed :process pid reason] :when (and (= observed monitor) (= pid worker))
                 {:ns ns :status :incoherent :warnings warns
-                 :errors [{:kind :timeout :msg "test worker timed out"}]})))))))
+                 :errors [{:kind :worker-exit
+                           :msg (str "test worker exited before reporting: " (pr-str reason))}]}
+              (after bound
+                (do
+                  (erlang/exit worker :kill)
+                  (receive
+                    [:DOWN observed :process pid _] :when (and (= observed monitor) (= pid worker)) :ok)
+                  ;; A result sent just before the deadline may precede DOWN.
+                  ;; Flush only this worker's result; foreign mailbox data stays.
+                  (receive [:ward-result observed _] :when (= observed worker) :ok (after 0 nil))
+                  {:ns ns :status :incoherent :warnings warns
+                   :errors [{:kind :timeout :msg "test worker timed out"}]}))))
+          (finally (env/destroy scope)))))))
 
 ;; ── run a suite of files ──────────────────────────────────────
 
