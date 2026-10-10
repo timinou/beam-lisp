@@ -1,0 +1,61 @@
+(ns research.runtime-followups.lifetimes (:require [research.runtime-followups.common :as c]))
+(defn queue-run [guard?]
+ (let [me (erlang/self) ref (erlang/make_ref)
+       worker (erlang/spawn (fn []
+        (receive :start
+         (loop [i 0 done 0 skipped 0 live-checksum 0]
+          (if (= i 100) (erlang/send me [ref {:done done :skipped skipped :live-checksum live-checksum}])
+           (receive [:job owner live?]
+            (if (and guard? (not (erlang/is_process_alive owner)))
+             (recur (inc i) done (inc skipped) live-checksum)
+             (let [value (reduce + (range 10000))]
+              (recur (inc i) (inc done) skipped (if live? (+ live-checksum value) live-checksum))))))))))]
+  (doseq [i (range 100)]
+   (if (< i 90)
+    (let [owner (erlang/spawn (fn [] (receive :stop :ok))) monitor (erlang/monitor :process owner)]
+     (erlang/send worker [:job owner false]) (erlang/exit owner :kill)
+     (receive [:DOWN r _ _ _] :when (= r monitor) nil))
+    (erlang/send worker [:job me true])))
+  (c/measure (fn [] (erlang/send worker :start)
+    (receive [r result] :when (= r ref) result (after 30000 (throw :queue-timeout)))))))
+(defn run []
+ (doseq [variant (if (System/get_env "FOLLOWUP_LIFETIME_CONTROLS") [] c/schedule)]
+  (let [sample (queue-run (= variant :candidate))]
+   (c/need "live callers retain identical work" (= 499950000 (:live-checksum (:value sample))))
+   (c/need "dead work declined at admission" (= (if (= variant :candidate) 90 0) (:skipped (:value sample))))
+   (c/emit :cancellation (assoc sample :variant variant))))
+ ;; Once accepted, a mutation drains even after requester death.
+ (let [me (erlang/self) commits (atomics/new 1 (list))
+       owner (erlang/spawn (fn [] (receive :stop :ok))) monitor (erlang/monitor :process owner)
+       worker (erlang/spawn (fn [] (erlang/send me :accepted)
+         (receive :continue (do (atomics/add_get commits 1 1) (erlang/send me :drained)))))]
+  (receive :accepted :ok (after 5000 (throw :accept-timeout)))
+  (erlang/exit owner :kill)
+  (receive [:DOWN r _ _ _] :when (= r monitor) nil)
+  (erlang/send worker :continue)
+  (receive :drained :ok (after 5000 (throw :drain-timeout)))
+  (c/need "accepted mutation drains after requester death" (= 1 (atomics/get commits 1)))
+  (c/emit :accepted-owner-death {:commits 1 :requester-alive (erlang/is_process_alive owner)}))
+ ;; Actual old-code execution must survive a retirement attempt.
+ (let [me (erlang/self) mod :Elixir.Followups.CodeLease]
+  (Code/compile_string "defmodule Followups.CodeLease do\n def hold(p) do send(p, :entered); receive do :release -> :old end end\n def version, do: 1\nend")
+  (let [pid (erlang/spawn (fn [] (erlang/send me [:completed (erlang/apply mod :hold (list me))])))
+        monitor (erlang/monitor :process pid)]
+   (receive :entered :ok (after 5000 (throw :entry-timeout)))
+   (Code/compile_string "defmodule Followups.CodeLease do\n def hold(_), do: :new\n def version, do: 2\nend")
+   (c/need "active old code blocks soft purge" (not (code/soft_purge mod)))
+   (c/need "retirement does not kill admitted work" (erlang/is_process_alive pid))
+   (erlang/send pid :release)
+   (receive [:completed value] (c/need "old generation completed" (= :old value)) (after 5000 (throw :completion-timeout)))
+   (receive [:DOWN r _ _ _] :when (= r monitor) nil)
+   (c/need "new calls use new generation" (= 2 (erlang/apply mod :version (list))))
+   (c/need "completed old code retires" (code/soft_purge mod))
+   (c/emit :code-lifetime {:active-retirement :declined :accepted-work :drained :new-generation 2})))
+ (let [leases (atomics/new 1 (list))]
+  (doseq [variant (if (System/get_env "FOLLOWUP_LIFETIME_CONTROLS") [] c/schedule)]
+   (let [sample (c/measure (fn []
+      (doseq [_ (range 10000)]
+       (when (= variant :candidate) (atomics/add_get leases 1 1) (atomics/sub_get leases 1 1)))
+      (atomics/get leases 1)))]
+    (c/need "all leases released" (= 0 (:value sample)))
+    (c/emit :lease-overhead (assoc sample :variant variant :operations 10000))))))
