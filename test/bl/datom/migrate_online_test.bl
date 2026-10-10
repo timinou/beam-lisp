@@ -1,0 +1,68 @@
+(ns datom.migrate-online-test
+ (:require [datom :as d] [datom.conn :as c] [datom.migrate :as m]))
+(def schema [{:db/ident :item/id :db/valueType :db.type/string :db/unique :db.unique/identity}
+             {:db/ident :item/n :db/valueType :db.type/long}])
+(def digest-a (join "" (repeat 64 "a")))
+(def digest-b (join "" (repeat 64 "b")))
+(defn spec [id]
+ {:migration/id id :migration/digest digest-a :migration/grows [] :migration/checks []})
+
+(deftest immutable-migration-identity-and-stale-plan
+ (let [conn (d/connect schema) migration (spec :online/identity)
+       basis (d/basis-t (d/db conn))]
+  (d/transact! conn [{:db/id -1 :item/id "one" :item/n 1}])
+  (is (= :stale (:status (m/apply! conn migration {:expected-basis basis}))))
+  (is (not (m/applied? (d/db conn) migration)))
+  (is (= :applied (:status (m/apply! conn migration))))
+  (let [after (d/basis-t (d/db conn))]
+   (is (= :already-applied (:status (m/apply! conn migration))))
+   (is (= after (d/basis-t (d/db conn))))
+   (is (= :identity-conflict (:status (m/apply! conn (assoc migration :migration/digest digest-b)))))
+   (is (= :identity-conflict (:status (m/plan-with conn (assoc migration :migration/digest digest-b)))))
+   (is (= after (d/basis-t (d/db conn)))))))
+
+(deftest application-invariants-refuse-bad-data
+ (let [conn (d/connect schema)
+       check {:check :predicate :id :nonnegative
+              :fn (fn [db] (every? (fn [row] (>= (first row) 0))
+                             (d/q '[:find ?n :where [_ :item/n ?n]] db)))}
+       migration (assoc (spec :online/check) :migration/checks [check])]
+  (d/transact! conn [{:db/id -1 :item/id "bad" :item/n -1}])
+  (is (= :blocked (:status (m/apply! conn migration))))
+  (is (not (m/applied? (d/db conn) migration)))
+  (let [fixed (assoc migration :migration/fn
+                (fn [db] (mapv (fn [row] [:db/add (first row) :item/n 0])
+                             (d/q '[:find ?e :where [?e :item/n -1]] db))))]
+   (is (= :clean (:status (m/plan-with conn fixed))))
+   (is (= :applied (:status (m/apply! conn fixed))))
+   (is (= [[0]] (into [] (d/q '[:find ?n :where [_ :item/n ?n]] (d/db conn))))))))
+
+(deftest writer-turn-keeps-reads-serving-and-orders-competing-writes
+ (let [conn (d/connect schema) parent (erlang/self)
+       migration (assoc (spec :online/race) :migration/fn
+                   (fn [db]
+                    (erlang/send parent [:inside (erlang/self)])
+                    (receive :continue nil (after 5000 (throw (ex-info "test barrier" {}))))
+                    [{:db/id -1 :item/id "migrated" :item/n 1}]))
+       runner (spawn (fn [] (erlang/send parent [:migration (m/apply! conn migration)])))]
+  (let [writer (receive [:inside pid] pid (after 5000 nil))]
+   (is (erlang/is_pid writer))
+   (is (= [] (into [] (d/q '[:find ?id :where [_ :item/id ?id]] (d/db conn)))))
+   (spawn (fn [] (d/transact! conn [{:db/id -1 :item/id "traffic" :item/n 2}])
+                    (erlang/send parent :traffic-completed)))
+   (is (= :queued (receive :traffic-completed :premature (after 20 :queued))))
+   (erlang/send writer :continue)
+   (is (= :applied (:status (receive [:migration r] r (after 5000 nil)))))
+   (is (= :done (receive :traffic-completed :done (after 5000 nil))))
+   (is (= #{"migrated" "traffic"}
+          (set (map first (d/q '[:find ?id :where [_ :item/id ?id]] (d/db conn)))))))))
+
+(deftest batched-migration-detects-no-progress-and-reuses-ledger
+ (let [conn (d/connect schema) migration (spec :online/batched)]
+  (is (try (m/apply-batched! conn migration (fn [_] [[] true])) false (catch _ true)))
+  (is (not (m/applied? (d/db conn) migration)))
+  (is (= :applied (:status (m/apply-batched! conn migration (fn [_] [[] false])))))
+  (is (= :already-applied (:status (m/apply-batched! conn migration
+                (fn [_] (throw (ex-info "must not run" {})))))))
+  (is (= :identity-conflict (:status (m/apply-batched! conn
+                (assoc migration :migration/digest digest-b) (fn [_] [[] false])))))))
