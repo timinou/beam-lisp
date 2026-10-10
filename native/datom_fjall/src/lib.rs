@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, TryLockError};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 
@@ -185,22 +185,70 @@ struct StoreClaim<E = StoreEngine> {
     /// this claim. Declared FIRST so it drops FIRST — see RELEASE ORDER above.
     engine: E,
     /// The fd whose `flock` IS the ownership. Dropping this claim — the LAST
-    /// `Arc` — closes it and releases the lock, so it is declared LAST: the
+    /// `Arc` — closes it and releases the lock, so it follows the engine: the
     /// directory stays ours until the engine over it is gone.
     _lock: File,
+    /// Rust drops fields in order: signal ONLY after engine and flock teardown.
+    _retirement: RetirementSignal,
 }
 
-/// Canonical path → a WEAK claim. Weak, not strong, so the registry never
+#[derive(Default)]
+struct Retirement {
+    complete: Mutex<bool>,
+    changed: Condvar,
+}
+impl Retirement {
+    fn complete(&self) -> bool {
+        *self.complete.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn wait(&self) {
+        let mut complete = self.complete.lock().unwrap_or_else(|e| e.into_inner());
+        while !*complete {
+            complete = self.changed.wait(complete).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+struct RetirementSignal(Arc<Retirement>);
+impl Drop for RetirementSignal {
+    fn drop(&mut self) {
+        *self.0.complete.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.0.changed.notify_all();
+    }
+}
+struct ClaimEntry<E = StoreEngine> {
+    claim: Weak<StoreClaim<E>>,
+    retirement: Arc<Retirement>,
+}
+// An Arc's weak reference stops upgrading BEFORE its destructor finishes.
+// Preserve this third state instead of mistaking our own retiring flock for a
+// different OS owner. The wait is performed outside the registry mutex.
+enum ExistingClaim<E> {
+    Live(Arc<StoreClaim<E>>),
+    Retiring(Arc<Retirement>),
+    Missing,
+}
+fn existing_claim<E>(registry: &mut HashMap<PathBuf, ClaimEntry<E>>, path: &Path) -> ExistingClaim<E> {
+    registry.retain(|_, entry| entry.claim.strong_count() > 0 || !entry.retirement.complete());
+    match registry.get(path) {
+        Some(entry) => match entry.claim.upgrade() {
+            Some(claim) => ExistingClaim::Live(claim),
+            None => ExistingClaim::Retiring(entry.retirement.clone()),
+        },
+        None => ExistingClaim::Missing,
+    }
+}
+
+/// Canonical path → a WEAK claim and retirement latch. Weak, not strong, so the registry never
 /// keeps a store alive: an entry dies with its last handle, and THAT death is
 /// what releases the flock, while a dead `Weak` left behind is simply a miss
-/// on the next open. A dead entry is PRUNED, not merely tolerated: every
-/// `claim_store` retains only the live entries under this same lock before it
+/// after teardown. A fully retired entry is PRUNED, not merely tolerated: every
+/// `claim_store` retains only live or still-retiring entries under this same lock before it
 /// looks one up, so the map is bounded by the stores actually open rather than
 /// by every store the process has ever opened (the codebase cache opens one
 /// scratch store per namespace and content hash, and a per-request store would
 /// otherwise grow this map for the life of the process).
-fn claims() -> &'static Mutex<HashMap<PathBuf, Weak<StoreClaim>>> {
-    static CLAIMS: OnceLock<Mutex<HashMap<PathBuf, Weak<StoreClaim>>>> = OnceLock::new();
+fn claims() -> &'static Mutex<HashMap<PathBuf, ClaimEntry>> {
+    static CLAIMS: OnceLock<Mutex<HashMap<PathBuf, ClaimEntry>>> = OnceLock::new();
     CLAIMS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -235,36 +283,40 @@ fn claim_store(path: &Path) -> Result<Arc<StoreClaim>, ClaimError> {
     // Collapse symlinks, relative paths and trailing separators to the one
     // real directory, so the map keys the same way the kernel's flock does.
     let canon = fs::canonicalize(path).map_err(ClaimError::Io)?;
-    let mut claims = claims().lock().unwrap_or_else(|e| e.into_inner());
-    // A DEAD entry is a MISS, not a claim — but it is not left to rot either.
-    // Dropping the dead ones here (we hold the lock, so the sweep is free)
-    // bounds the registry by the stores that are open rather than by every
-    // store ever opened, and it runs BEFORE the lookup so the entry consulted
-    // below is either live or absent.
-    claims.retain(|_, w| w.strong_count() > 0);
-    if let Some(claim) = claims.get(&canon).and_then(Weak::upgrade) {
+    loop {
+        let mut claims = claims().lock().unwrap_or_else(|e| e.into_inner());
+        match existing_claim(&mut claims, &canon) {
+            ExistingClaim::Live(claim) => return Ok(claim),
+            ExistingClaim::Retiring(retirement) => {
+                drop(claims);
+                retirement.wait();
+                continue;
+            }
+            ExistingClaim::Missing => {}
+        }
+        let dir = File::open(&canon).map_err(ClaimError::Io)?;
+        match dir.try_lock() {
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => return Err(ClaimError::Held(canon)),
+            Err(TryLockError::Error(e)) => return Err(ClaimError::Io(e)),
+        }
+        let keyspace = Config::new(&canon).open().map_err(ClaimError::Engine)?;
+        let datoms = keyspace
+            .open_partition("datoms", PartitionCreateOptions::default())
+            .map_err(ClaimError::Engine)?;
+        let retirement = Arc::new(Retirement::default());
+        let claim = Arc::new(StoreClaim {
+            _lock: dir,
+            _retirement: RetirementSignal(retirement.clone()),
+            engine: StoreEngine {
+                keyspace,
+                datoms,
+                lock: Arc::new(Mutex::new(())),
+            },
+        });
+        claims.insert(canon.clone(), ClaimEntry { claim: Arc::downgrade(&claim), retirement });
         return Ok(claim);
     }
-    let dir = File::open(&canon).map_err(ClaimError::Io)?;
-    match dir.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return Err(ClaimError::Held(canon)),
-        Err(TryLockError::Error(e)) => return Err(ClaimError::Io(e)),
-    }
-    let keyspace = Config::new(&canon).open().map_err(ClaimError::Engine)?;
-    let datoms = keyspace
-        .open_partition("datoms", PartitionCreateOptions::default())
-        .map_err(ClaimError::Engine)?;
-    let claim = Arc::new(StoreClaim {
-        _lock: dir,
-        engine: StoreEngine {
-            keyspace,
-            datoms,
-            lock: Arc::new(Mutex::new(())),
-        },
-    });
-    claims.insert(canon, Arc::downgrade(&claim));
-    Ok(claim)
 }
 
 #[rustler::resource_impl]
@@ -1641,6 +1693,7 @@ mod tests {
         let claim = StoreClaim {
             engine: ProbeEngine { dir: dir.clone(), held_at_drop: held_at_drop.clone() },
             _lock: lock,
+            _retirement: RetirementSignal(Arc::new(Retirement::default())),
         };
 
         assert_eq!(held_at_drop.get(), None, "the engine is alive until the claim drops");
@@ -1688,6 +1741,61 @@ mod tests {
         let _ = fs::remove_dir_all(&a);
         let _ = fs::remove_dir_all(&b);
         let _ = fs::remove_dir_all(&c);
+    }
+    /// Last Arc death and completed engine teardown are different states. Hold
+    /// a real flock inside a deliberately blocked destructor and prove the
+    /// production lookup returns a retirement wait, never a missing claim.
+    #[test]
+    fn reopening_waits_for_our_retiring_engine_before_taking_the_flock() {
+        use std::sync::mpsc;
+        struct BlockedEngine {
+            entered: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl Drop for BlockedEngine {
+            fn drop(&mut self) {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+            }
+        }
+        let dir = tmp_dir("retiring-reopen");
+        let lock = File::open(&dir).unwrap();
+        lock.try_lock().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let retirement = Arc::new(Retirement::default());
+        let claim = Arc::new(StoreClaim {
+            engine: BlockedEngine { entered: entered_tx, release: Mutex::new(release_rx) },
+            _lock: lock,
+            _retirement: RetirementSignal(retirement.clone()),
+        });
+        let mut registry = HashMap::new();
+        registry.insert(dir.clone(), ClaimEntry { claim: Arc::downgrade(&claim), retirement });
+        let dropping = std::thread::spawn(move || drop(claim));
+        entered_rx.recv().unwrap(); // Last Arc is dead; engine and flock live.
+        let wait = match existing_claim(&mut registry, &dir) {
+            ExistingClaim::Retiring(wait) => wait,
+            _ => panic!("a dead Weak with a live flock must remain retiring"),
+        };
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let next_dir = dir.clone();
+        let reopening = std::thread::spawn(move || {
+            waiting_tx.send(()).unwrap();
+            wait.wait();
+            let next = File::open(next_dir).unwrap();
+            next.try_lock().expect("the latch must signal after flock release");
+            opened_tx.send(()).unwrap();
+        });
+        waiting_rx.recv().unwrap();
+        assert!(matches!(opened_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        release_tx.send(()).unwrap();
+        dropping.join().unwrap();
+        opened_rx.recv().unwrap();
+        reopening.join().unwrap();
+        assert!(matches!(existing_claim(&mut registry, &dir), ExistingClaim::Missing));
+        assert!(registry.is_empty(), "fully retired entries must be pruned");
+        fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn finite_etf_preflight_is_closed_and_charged() {
