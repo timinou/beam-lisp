@@ -1,0 +1,170 @@
+(ns reload.generation-test
+ (:require [reload.generation :as gen] [env] [reload]))
+
+(defn sources [value]
+ {"generation.leaf" (str "(ns generation.leaf)\n(defn value [] " value ")")
+  "generation.middle" "(ns generation.middle (:require [generation.leaf :as leaf]))\n(defn value [] (leaf/value))"
+  "generation.router"
+  (str "(ns generation.router (:require [generation.middle :as mid] [generation.leaf]"
+       " [reload.generation :as gen] [env]))\n"
+       "; héllo generation.leaf/value is a comment, not code\n"
+       "(defn render [] [(mid/value) (generation.leaf/value) (gen/resource :assets) \"héllo\"])\n"
+       "(defn retain [] (gen/capture!))\n"
+       "(defn conveyed [] (env/convey (fn [_] (gen/resource :assets))))\n"
+       "(defn block [parent] (erlang/send parent :entered) (receive :continue (render)))")})
+
+(defn options [value]
+ {:sources (sources value) :roots ["generation.router"]
+  :stable-namespaces #{"reload.generation" "env"} :native-modules #{"erlang"}
+  :resources {:assets (str "release-" value)}})
+
+(defn refused [f] (try (f) nil (catch e (:kind (ex-data e)))))
+
+(defn dispose [slot generation]
+ (when slot (gen/close! slot (:digest generation)))
+ (gen/retire! generation)
+ (reload/set-enabled! nil))
+
+(deftest deterministic-closure-and-identity
+ (let [a (gen/plan (options 1)) b (gen/plan (options 1))]
+  (is (= (:digest a) (:digest b)))
+  (is (= ["generation.leaf" "generation.middle" "generation.router"] (:order a)))
+  (is (not= (:digest a) (:digest (gen/plan (options 2)))))
+  (is (not= (:digest a) (:digest (gen/plan (assoc (options 1) :resources {:assets "other"})))))))
+
+(deftest structural-rewrite-preserves-trivia-and-qualified-calls
+ (let [plan (gen/plan (options 1)) name (get (:mapping plan) "generation.router")
+       source (get (:sources plan) name)]
+  (is (String/contains? source "; héllo generation.leaf/value is a comment, not code"))
+  (is (String/contains? source (str "(" (get (:mapping plan) "generation.leaf") "/value)")))
+  (is (String/contains? source "(mid/value)"))
+  (is (String/contains? source "\"héllo\""))))
+
+(deftest unsealed-and-dynamic-dependencies-refuse-before-compilation
+ (is (= :unsealed-dependency
+        (refused #(gen/plan (update (options 1) :sources dissoc "generation.leaf")))))
+ (is (= :undeclared-dependency
+        (refused #(gen/plan {:sources {"unsafe" "(ns unsafe) (defn run [] (other/code))"}}))))
+ (is (= :dynamic-code-dependency
+        (refused #(gen/plan {:sources {"unsafe" "(ns unsafe (:require [env :as e])) (defn run [] (e/eval \"1\"))"}
+                             :stable-namespaces #{"env"}}))))
+ (is (= :dynamic-code-dependency
+        (refused #(gen/plan {:sources {"unsafe" "(ns unsafe) (defn run [m f a] (erlang/apply m f a))"}
+                             :native-modules #{"erlang"}}))))
+ (is (= :effectful-generation
+        (refused #(gen/plan {:sources {"unsafe" "(ns unsafe) (def state (atom 0))"}}))))
+ (is (= :unmanaged-generation-producer
+        (refused #(gen/plan {:sources {"unsafe" "(ns unsafe) (defn run [f] (erlang/spawn f))"}
+                             :native-modules #{"erlang"}}))))
+ (is (= :unmanaged-generation-producer
+        (refused #(gen/plan {:sources {"unsafe" "(ns unsafe) (defn run [p m] (Process/send_after p m 10))"}
+                             :native-modules #{"Process"}}))))
+ (is (= :unmanaged-generation-producer
+        (refused #(gen/plan {:sources {"unsafe" "(ns unsafe (:require [web :as http])) (defn run [h] (http/serve h))"}
+                             :stable-namespaces #{"web"}}))))
+ (is (= :invalid-generation
+        (refused #(gen/plan (assoc (options 1) :resources {:callback (fn [] 1)})))))
+ (is (= :identity-conflict
+        (refused #(gen/plan (assoc (options 1) :digest "different"))))))
+
+(deftest cycles-refuse-and-quoted-symbols-remain-data
+ (is (= :require-cycle
+        (refused #(gen/plan {:sources {"a" "(ns a (:require [b])) (defn run [] 1)"
+                                       "b" "(ns b (:require [a])) (defn run [] 2)"}}))))
+ (let [p (gen/plan {:sources {"quoted" "(ns quoted) (defn run [] 'unknown/value)"}})]
+  (is (String/contains? (first (vals (:sources p))) "'unknown/value"))))
+
+(deftest independent-transitive-generations-and-compare-publication
+ (let [one (gen/prepare! (options 1)) two (gen/prepare! (options 2)) slot (gen/slot)]
+  (try
+   (reload/set-enabled! true)
+   (is (= :applied (:status (gen/publish! slot nil one))))
+   (is (= [1 1 "release-1" "héllo"] (gen/call! slot "generation.router/render" [])))
+   (is (= :stale (:status (gen/publish! slot "wrong" two))))
+   (is (= [1 1 "release-1" "héllo"] (gen/call! slot "generation.router/render" [])))
+   (is (= :applied (:status (gen/publish! slot (:digest one) two))))
+   (is (= [2 2 "release-2" "héllo"] (gen/call! slot "generation.router/render" [])))
+   (is (= :already-applied (:status (gen/publish! slot (:digest one) two))))
+   (is (= :retired (:status (gen/retire! one))))
+   (is (= :unsealed-entrypoint (refused #(gen/call! slot "other/render" []))))
+   (is (= :missing-entrypoint (refused #(gen/call! slot "generation.router/identity" []))))
+   (finally (dispose slot two) (gen/retire! one)))))
+
+(deftest retained-old-callback-keeps-complete-graph-and-resources
+ (let [one (gen/prepare! (options 10)) two (gen/prepare! (options 11)) slot (gen/slot)]
+  (try
+   (reload/set-enabled! true)
+   (gen/publish! slot nil one)
+   (let [registration (gen/call! slot "generation.router/retain" [])]
+    (try
+     (gen/publish! slot (:digest one) two)
+     (is (= :waiting (:status (gen/retire! one))))
+     (is (= 1 (:registrations (gen/evidence one))))
+     (is (= [10 10 "release-10" "héllo"] (gen/run! registration "generation.router/render" [])))
+     (gen/release! registration)
+     (is (= :cancelled (gen/run! registration "generation.router/render" [])))
+     (is (= :retired (:status (gen/retire! one))))
+     (finally (gen/release! registration))))
+   (finally (dispose slot two) (gen/retire! one)))))
+
+(deftest blocked-old-request-does-not-block-publication-or-new-requests
+ (let [one (gen/prepare! (options 20)) two (gen/prepare! (options 21)) slot (gen/slot)
+       parent (erlang/self) worker (atom nil)]
+  (try
+   (reload/set-enabled! true)
+   (gen/publish! slot nil one)
+   (reset! worker (erlang/spawn
+                   (fn [] (erlang/send parent [:result (gen/call! slot "generation.router/block" [parent])]))))
+   (is (= :entered (receive :entered :entered (after 5000 :timeout))))
+   (is (= :applied (:status (gen/publish! slot (:digest one) two))))
+   (is (= [21 21 "release-21" "héllo"] (gen/call! slot "generation.router/render" [])))
+   (is (= :waiting (:status (gen/retire! one))))
+   (erlang/send @worker :continue)
+   (is (= [20 20 "release-20" "héllo"] (receive [:result value] value (after 5000 :timeout))))
+   (finally
+    (when @worker (erlang/send @worker :continue))
+    (dispose slot two) (gen/retire! one)))))
+
+(deftest native-convey-preserves-generation-context-and-restores-worker
+ (let [generation (gen/prepare! (options 30)) slot (gen/slot)]
+  (try
+   (reload/set-enabled! true)
+   (gen/publish! slot nil generation)
+   (let [callback (gen/call! slot "generation.router/conveyed" []) previous (gen/current)]
+    (is (= "release-30" (callback nil)))
+    (is (= previous (gen/current))))
+   (is (= :waiting (:status (gen/retire! generation))))
+   (finally (dispose slot generation)))))
+
+(deftest sealed-namespace-remains-immutable-and-production-policy-is-preserved
+ (let [generation (gen/prepare! (options 35)) slot (gen/slot)
+       fresh (get (:mapping generation) "generation.leaf")]
+  (try
+   (reload/set-enabled! false)
+   (is (= {:status :held :reason :reload-disabled} (gen/publish! slot nil generation)))
+   (reload/set-enabled! true)
+   (reload/stage fresh (str "(ns " fresh ") (defn value [] 999)"))
+   (is (= :held (:status (reload/commit))))
+   (is (some #(= :immutable-generation (:kind %)) (:errors (reload/status))))
+   (is (= :applied (:status (gen/publish! slot nil generation))))
+   (is (= [35 35 "release-35" "héllo"] (gen/call! slot "generation.router/render" [])))
+   (finally (reload/abort) (dispose slot generation)))))
+
+(deftest message-protocol-inventory-is-sealed-and-generation-stamped
+ (let [first-plan (gen/plan (assoc (options 36) :protocols {"imports" 1}))
+       second-plan (gen/plan (assoc (options 36) :protocols {"imports" {:protocol 2}}))]
+  (is (not= (:digest first-plan) (:digest second-plan)))
+  (is (= {:protocol 1 :generation (:digest first-plan)}
+         (get (:protocols first-plan) "imports")))
+  (is (= :invalid-protocol-inventory
+         (refused #(gen/plan (assoc (options 36) :protocols {"imports" 0})))))))
+
+(deftest planning-handle-cannot-smuggle-edited-source
+ (let [p (gen/plan (options 40))
+       altered (assoc p :sources {"evil" "(ns evil) (println :should-never-run)"})
+       generation (gen/prepare! altered) slot (gen/slot)]
+  (try
+   (reload/set-enabled! true)
+   (gen/publish! slot nil generation)
+   (is (= [40 40 "release-40" "héllo"] (gen/call! slot "generation.router/render" [])))
+   (finally (dispose slot generation)))))

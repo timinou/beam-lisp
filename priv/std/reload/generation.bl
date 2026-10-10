@@ -1,0 +1,485 @@
+; Immutable application graphs, independent request leases and resource context.
+; Stable namespaces/native modules are an explicit trusted runtime boundary.
+; This is not a source sandbox or an atomic publication across process owners.
+(ns reload.generation
+ (:require [env] [source-graph :as graph] [reader-node :as rn]
+           [reader :as reader] [reload]))
+
+(def ^:private prepared (atom {}))
+(def ^:private forbidden
+ #{"eval" "resolve" "ns-resolve" "find-var" "load-file" "load-string"
+   "require" "in-ns" "intern" "alter-var-root" "with-redefs" "syntax-quote"
+   "var" "erlang/apply" "erlang/make_fun" "code/load_binary"})
+
+(defn- refuse! [kind data]
+ (throw (ex-info "Immutable generation refused" (assoc data :kind kind))))
+
+(defn- data-only? [value]
+ (cond
+  (or (nil? value) (string? value) (number? value) (erlang/is_atom value)) true
+  (map? value) (every? (fn [[k v]] (and (data-only? k) (data-only? v))) value)
+  (or (vector? value) (list? value) (set? value)) (every? data-only? value)
+  :else false))
+
+(defn- normalize-protocols [input]
+ (when-not (map? input) (refuse! :invalid-protocol-inventory {}))
+ (into {}
+  (map (fn [[server spec]]
+         (let [version (if (map? spec) (:protocol spec) spec)]
+          (when-not (and (or (string? server) (keyword? server))
+                        (int? version) (pos? version))
+           (refuse! :invalid-protocol-inventory {:server server}))
+          [server version])) input)))
+
+(defn- children [node]
+ (let [n (rn/node-form node) tag (rn/node-tag n)]
+  (cond
+   (contains? #{:list :vector :set} tag) (rn/node-items n)
+   (= :map tag) (mapcat (fn [pair] [(elem pair 0) (elem pair 1)]) (rn/node-items n))
+   :else [])))
+
+(defn- name-of [node]
+ (let [n (rn/node-form node)] (when (= :symbol (rn/node-tag n)) (rn/node-name n))))
+
+(defn- head-of [node] (name-of (first (children node))))
+
+(defn- executable-symbols [node]
+ ;; Quoted symbols are application data. Syntax quote is deliberately refused:
+ ;; macro-generated late namespace resolution needs a compiler-level seal.
+ (if (= "quote" (head-of node)) []
+  (concat (when-let [name (name-of node)] [[node name]])
+          (mapcat executable-symbols (children node)))))
+
+(defn- unmanaged-producer? [namespace name]
+ (or
+  (and (contains? #{"erlang" ":erlang"} namespace)
+       (or (String/starts_with? name "spawn") (contains? #{"send_after" "start_timer"} name)))
+  (and (= "Process" namespace) (contains? #{"spawn" "send_after"} name))
+  (and (contains? #{"Task" "Agent" "GenServer" "Supervisor" "DynamicSupervisor"} namespace)
+       (or (String/starts_with? name "start") (String/starts_with? name "async")))
+  (and (= "web" namespace) (= "serve" name))
+  (and (= "proc" namespace) (contains? #{"spawn" "spawn-link" "spawn-monitor" "async"} name))
+  (and (= "proc.tick" namespace) (contains? #{"watch" "debounce" "interval" "after"} name))))
+
+(defn- check-source! [name source stable native sources]
+ (when-not (and (string? source) (<= (erlang/byte_size source) 524288))
+  (refuse! :invalid-source {:namespace name}))
+ (let [forms (BeamLisp.Reader/read_string source)
+       header (graph/header* source)
+       aliases (nth header 2)
+       required (set (second header))]
+  (when-not (and (= name (first header)) (= "ns" (head-of (first forms)))
+                (= 1 (count (filter #(= "ns" (head-of %)) forms))))
+   (refuse! :namespace-mismatch {:namespace name}))
+  (doseq [form forms]
+   (when-not (contains? #{"ns" "defn" "defn-"} (head-of form))
+    (refuse! :effectful-generation {:namespace name :form (head-of form)})))
+  (let [definitions (map #(name-of (second (children %))) (rest forms))]
+   (when (not= (count definitions) (count (distinct definitions)))
+    (refuse! :duplicate-definition {:namespace name})))
+  (doseq [dependency required]
+   (when-not (or (contains? sources dependency) (contains? stable dependency))
+    (refuse! :unsealed-dependency {:namespace name :dependency dependency})))
+  (doseq [[node symbol] (mapcat executable-symbols (rest forms))]
+   (let [parts (String/split symbol "/") prefix (first parts)
+         base (last parts) resolved (get aliases prefix prefix)]
+    (when (unmanaged-producer? resolved base)
+     (refuse! :unmanaged-generation-producer {:namespace name :symbol symbol}))
+    (when (or (or (contains? forbidden symbol) (contains? forbidden (str resolved "/" base)))
+              (and (contains? forbidden base)
+                   (or (= 1 (count parts)) (contains? #{"core" "env" "reload" "compiler"} resolved)))
+              (String/starts_with? resolved "BeamLisp.")
+              (String/starts_with? resolved "Elixir.BeamLisp."))
+     (refuse! :dynamic-code-dependency {:namespace name :symbol symbol}))
+    (when (and (= 2 (count parts))
+               (not (or (= name prefix) (contains? aliases prefix)
+                        (contains? native prefix))))
+     ;; Every namespace reference must be declared, including direct qualified
+     ;; calls. No fallback to a globally loaded app namespace or host guess.
+     (refuse! :undeclared-dependency {:namespace name :symbol symbol}))))
+  forms))
+
+(declare rewrite-fragment)
+
+(defn- rewrite-token [text node mapping mode]
+ (let [form (rn/node-form node) tag (rn/node-tag form)]
+  (cond
+   (= :symbol tag)
+    (let [name (rn/node-name form) parts (String/split name "/")]
+     (if (contains? #{:target :require} mode) (get mapping name text)
+      (if (and (= mode :code) (= 2 (count parts)) (get mapping (first parts)))
+       (str (get mapping (first parts)) "/" (second parts)) text)))
+   (contains? #{:list :vector :map :set} tag)
+    (if (= "quote" (head-of node)) text
+     (let [opening (cond (= :set tag) "#{" (= :list tag) "(" (= :vector tag) "[" :else "{")
+           closing (cond (= :list tag) ")" (= :vector tag) "]" :else "}")]
+      ;; Reader-prefix expansion and anonymous-fn desugaring do not have a
+      ;; collection-shaped source span. Refuse rather than rewrite guessed text.
+      (when-not (and (String/starts_with? text opening) (String/ends_with? text closing))
+       (refuse! :unsupported-reader-expansion {}))
+      (let [inner (String/slice text (String/length opening)
+                    (- (String/length text) (String/length opening) 1))
+            child-mode (cond
+                         (= mode :header) :header-items
+                         (= mode :clause) (if (= :keyword (rn/node-tag (rn/node-form (first (children node)))))
+                                           (if (= "require" (rn/node-name (rn/node-form (first (children node)))))
+                                            :require-items :data) :data)
+                         (= mode :require) :require-spec
+                         :else mode)]
+       (str opening (rewrite-fragment inner mapping child-mode) closing))))
+   :else text)))
+
+(defn- rewrite-fragment [source mapping mode]
+ ;; read-next-string provides the original token/collection text and the next
+ ;; native reader cursor. This recovers leaf spans without a second lexer; leaf
+ ;; symbols deliberately carry no metadata in the public reader contract.
+ (let [size (String/length source)]
+  (loop [stream (reader/stream source nil) index 0 edits []]
+   (let [next (reader/read-next-string stream)]
+    (if (= :eof (first next))
+     (let [points (vec (String/codepoints source))]
+      (apply str
+      (reduce (fn [out edit]
+                (vec (concat (subvec out 0 (:start edit))
+                             (String/codepoints (:text edit)) (subvec out (:end edit)))))
+              points (reverse edits))))
+     (let [node (second next) text (nth next 2) after (nth next 3)
+           end (- size (erlang/length (:chars after))) start (- end (String/length text))
+           token-mode (cond
+                        (= mode :header-items) (cond (= index 1) :target (> index 1) :clause :data)
+                        (= mode :require-items) (if (= index 0) :data :require)
+                        (= mode :require-spec) (if (= index 0) :target :data)
+                        (= mode :require) :target
+                        :else mode)
+           replacement (rewrite-token text node mapping token-mode)]
+      (recur after (inc index)
+       (if (= text replacement) edits (conj edits {:start start :end end :text replacement})))))))))
+
+(defn- rewrite-source [source forms mapping]
+ ;; Process each top-level form using the same stream, with ns as a special
+ ;; declarative context; generic code rewrites qualified executable symbols.
+ (let [size (String/length source)]
+  (loop [stream (reader/stream source nil) edits []]
+   (let [next (reader/read-next-string stream)]
+    (if (= :eof (first next))
+     (let [points (vec (String/codepoints source))]
+      (apply str
+      (reduce (fn [out edit]
+                (vec (concat (subvec out 0 (:start edit))
+                             (String/codepoints (:text edit)) (subvec out (:end edit)))))
+              points (reverse edits))))
+     (let [node (second next) text (nth next 2) after (nth next 3)
+           end (- size (erlang/length (:chars after))) start (- end (String/length text))
+           replacement (rewrite-token text node mapping (if (= "ns" (head-of node)) :header :code))]
+      (recur after (conj edits {:start start :end end :text replacement}))))))))
+
+(defn- dependency-order [roots requires]
+ (let [seen (atom #{}) result (atom [])]
+  (letfn [(visit [name]
+            (when-not (contains? @seen name)
+             (swap! seen conj name)
+             (doseq [dependency (sort (requires name))] (visit dependency))
+             (swap! result conj name)))]
+   (doseq [root (sort roots)] (visit root)) @result)))
+
+(defn plan
+ "Pure generation plan. :sources is the complete managed source map; :roots
+  defaults to its keys. :stable-namespaces and :native-modules explicitly name
+  the fixed trusted runtime boundary. :resources is immutable generation data.
+  Only ns/defn/defn- source is accepted; mutable globals, macros, dynamic code
+  lookup and undeclared namespace calls refuse before evaluation. The artifact
+  builder must independently seal/authorize this plan before prepare!."
+ [opts]
+ (let [sources (:sources opts) roots (or (:roots opts) (keys sources))
+       stable (set (:stable-namespaces opts)) native (set (:native-modules opts))
+       resources (or (:resources opts) {})
+       protocols (normalize-protocols (or (:protocols opts) {}))]
+  (when-not (and (map? sources) (seq sources) (seq roots) (<= (count sources) 1024)
+                (every? #(contains? sources %) roots) (map? resources) (data-only? resources)
+                (every? #(and (string? %) (Regex/match? #"^[a-zA-Z][a-zA-Z0-9_.-]*$" %))
+                        (keys sources)))
+   (refuse! :invalid-generation {}))
+  (let [parsed (into {} (map (fn [[name source]]
+                              [name (check-source! name source stable native sources)]) sources))
+        requires (fn [name] (filter #(contains? sources %) (second (graph/header (get sources name)))))
+        cycles (graph/cycles roots requires)]
+   (when (seq cycles) (refuse! :require-cycle {:cycles cycles}))
+   (let [order (dependency-order roots requires)
+         selected (select-keys sources order)
+         digest (sha256-hex (erlang/term_to_binary
+                  [1 (vec (sort-by first selected)) (vec (sort stable)) (vec (sort native)) resources protocols]
+                  (list :deterministic)))
+         mapping (into {} (map (fn [name] [name (str "sealed.g" digest (when (:instance opts) (str ".i" (:instance opts))) "." name)]) order))]
+    (when (and (:digest opts) (not= digest (:digest opts)))
+     (refuse! :identity-conflict {:expected (:digest opts) :actual digest}))
+    {:input opts :digest digest :mapping mapping :order order :resources resources
+     :protocols (into {} (map (fn [[server version]]
+                               [server {:protocol version :generation digest}]) protocols))
+     :stable-namespaces stable :native-modules native
+     :sources (into {} (map (fn [name]
+                             [(get mapping name) (rewrite-source (get selected name) (get parsed name) mapping)]) order))}))))
+
+(defn project-plan
+ "Discover managed source closure through the native loader; no application
+  function manifest. :entrypoint is namespace/function. Fixed runtime requires
+  stop at :stable-namespaces. This reads source only and executes no app forms."
+ [opts]
+ (let [entry (:entrypoint opts) parts (when (string? entry) (String/split entry "/"))
+       stable (set (:stable-namespaces opts))]
+  (when-not (= 2 (count parts)) (refuse! :invalid-entrypoint {}))
+  (loop [todo [(first parts)] sources {}]
+   (if (empty? todo)
+    (assoc (plan (assoc opts :sources sources :roots [(first parts)])) :entrypoint entry)
+    (let [name (first todo)]
+     (if (or (contains? sources name) (contains? stable name))
+      (recur (rest todo) sources)
+      (do
+       (when (>= (count sources) 1024) (refuse! :generation-capacity {}))
+       (let [source (try (BeamLisp.Loader/source_content name) (catch _ nil))]
+        (when-not (string? source) (refuse! :missing-source {:namespace name}))
+        (recur (concat (rest todo) (second (graph/header source))) (assoc sources name source))))))))))
+
+(defn- with-lock [key action] (BeamLisp.Env/with_namespace_lock (tuple :sealed-generation key) action))
+
+(defn- namespace-modules [name]
+ (cons (BeamLisp.Emit/module_for name)
+       (keys (BeamLisp.Emit/body_modules (BeamLisp.Env/ns_defs name)))))
+
+(defn- check-compiled! [planned]
+ ;; Inspect the compiler's actual ANF too: a trusted macro must not inject a
+ ;; late reference to an unversioned app namespace after source rewriting.
+ (let [names (set (concat (vals (:mapping planned)) (:stable-namespaces planned) ["core" "sugar"]))
+       modules (set (mapcat namespace-modules names))]
+  (letfn [(walk [node]
+            (cond
+             (map? node)
+              (do
+               (when (and (= :global (:op node)) (not (contains? names (:ns node))))
+                (refuse! :unsealed-compiled-dependency {:namespace (:ns node)}))
+               (when (and (= :remote (:op node)) (erlang/is_atom (:mod node))
+                          (String/starts_with? (erlang/atom_to_binary (:mod node) :utf8)
+                                               "Elixir.BeamLisp.Ns.")
+                          (not (contains? modules (:mod node))))
+                (refuse! :unsealed-compiled-dependency {:module (:mod node)}))
+               (when-not (= :lit (:op node)) (doseq [child (vals node)] (walk child))))
+             (erlang/is_tuple node) (doseq [child (erlang/tuple_to_list node)] (walk child))
+             (or (list? node) (vector? node)) (doseq [child node] (walk child))))]
+   (doseq [name (vals (:mapping planned))
+           [_ entries] (BeamLisp.Env/ns_defs name)
+           entry entries]
+    (walk (elem entry 3))))))
+
+(defn prepare!
+ "Compile a validated plan into fresh names in a dedicated environment. Reuses
+  an identical prepared graph in the same parent env. Returns an opaque runtime
+  handle. No handler becomes reachable through a serving slot until publish!."
+ [proposal]
+ (let [input (or (:input proposal) proposal)
+       validated (plan input)
+       key [(env/current) (:digest validated)]]
+  (with-lock key
+   (fn []
+    (or (get @prepared key)
+     (let [planned (plan (assoc input :instance (str (erlang/unique_integer (list :positive)))))
+           scope (env/fork) generation
+           (try
+            (env/with-env scope
+             (fn []
+              (let [errors (reload/coherence (vec (:sources planned)))]
+               (when (seq errors) (refuse! :incoherent-generation {:errors errors})))
+              (doseq [name (vals (:mapping planned))] (BeamLisp.Env/declare_ns name))
+              (doseq [name (:order planned)]
+               (let [fresh (get (:mapping planned) name)]
+                (env/eval (get (:sources planned) fresh))
+                (BeamLisp.Env/mark_loaded fresh)))
+              (BeamLisp.Link/settle)
+              (check-compiled! planned)
+              (let [modules (vec (distinct (mapcat
+                             namespace-modules
+                             (vals (:mapping planned)))))]
+               {:digest (:digest planned) :mapping (:mapping planned) :scope scope
+                :context (assoc (env/capture) :generation nil) :resources (:resources planned) :modules modules
+                :protocols (:protocols planned)
+                :state (atom {:retired false :tickets {} :slots #{}}) :cache-key key})))
+            (catch error
+             (try
+              (env/with-env scope
+               (fn []
+                (doseq [module (mapcat namespace-modules (vals (:mapping planned)))]
+                 (BeamLisp.Env/retire_module! module))))
+              (finally (env/destroy scope)))
+             (throw error)))]
+      ;; Ordinary development reload must never overwrite prepared providers.
+      (swap! reload/live-generations
+       (fn [m] (reduce (fn [a name] (assoc a name :sealed)) m (vals (:mapping planned)))))
+      (swap! prepared assoc key generation)
+      generation))))))
+
+(defn prepare-project! [opts] (prepare! (project-plan opts)))
+
+(defn- acquire! [generation]
+ (with-lock (:cache-key generation)
+  (fn []
+   (when (:retired @(:state generation)) (refuse! :retired-generation {}))
+   (let [ticket (BeamLisp.Env/retain_code! (to-list (:modules generation)))]
+    (swap! (:state generation) assoc-in [:tickets ticket] (erlang/self)) ticket))))
+
+(defn- release-ticket! [generation ticket]
+ (with-lock (:cache-key generation)
+  (fn [] (BeamLisp.Env/release_code! ticket)
+         (swap! (:state generation) update :tickets dissoc ticket) :ok)))
+
+(defn slot
+ "A stable serving indirection. Admission/publication share a short lock;
+  handlers execute concurrently outside it. One slot may serve many listeners."
+ [] {:id (erlang/make_ref) :current (atom nil)})
+
+(defn publish!
+ "Compare-and-publish one serving slot. expected is nil or the current digest.
+  Not a multi-owner transaction. Durable activation intent belongs upstream."
+ [slot expected generation]
+ (with-lock (:id slot)
+  (fn []
+   (let [old @(:current slot)]
+    (cond
+     (not (reload/reload-enabled?)) {:status :held :reason :reload-disabled}
+     (= (:digest old) (:digest generation)) {:status :already-applied :digest (:digest old)}
+     (not= expected (:digest old)) {:status :stale :digest (:digest old)}
+     :else
+      (do
+       (with-lock (:cache-key generation)
+        (fn []
+         (when (:retired @(:state generation)) (refuse! :retired-generation {}))
+         (swap! (:state generation) update :slots conj (:id slot))
+         (reset! (:current slot) generation)))
+       (when old (with-lock (:cache-key old)
+                   (fn [] (swap! (:state old) update :slots disj (:id slot)))))
+       {:status :applied :digest (:digest generation)}))))))
+
+(defn current
+ "Selected generation identity/resources in this execution, or nil outside it."
+ [] (Process/get :bl_generation))
+
+(defn close!
+ "Stop new admissions during listener shutdown. Existing request/callback
+  leases remain valid. Compare-and-close prevents shutting down a newer slot."
+ [slot expected]
+ (with-lock (:id slot)
+  (fn []
+   (let [old @(:current slot)]
+    (if (not= expected (:digest old)) {:status :stale :digest (:digest old)}
+     (do
+      (reset! (:current slot) nil)
+      (when old (with-lock (:cache-key old)
+                  (fn [] (swap! (:state old) update :slots disj (:id slot)))))
+      {:status :closed}))))))
+
+(defn resource
+ "Read a sealed resource/config value. Missing context/key refuses; never
+  falls through to a newer release's mutable global configuration."
+ [key]
+ (let [context (current)]
+  (when-not (and context (contains? (:resources context) key))
+   (refuse! :missing-generation-resource {:resource key}))
+  (get (:resources context) key)))
+
+(defn- execute [generation action]
+ (let [previous (env/capture)]
+  (try
+   (env/bind (:context generation))
+   (Process/put :bl_generation generation)
+   (action)
+   (finally (env/bind previous)))))
+
+(defn- invoke-entry [generation entry args]
+ (let [parts (String/split entry "/") name (get (:mapping generation) (first parts))]
+  (when-not (and name (= 2 (count parts))) (refuse! :unsealed-entrypoint {:entrypoint entry}))
+  (let [result (BeamLisp.Env/fetch_exact name (second parts))]
+   (when-not (and (erlang/is_tuple result) (= :ok (elem result 0)))
+    (refuse! :missing-entrypoint {:entrypoint entry}))
+   (apply (elem result 1) args))))
+
+(defn call!
+ "Admit a request against exactly one generation, pin its whole physical graph
+  and context, then execute outside publication locks. Finally releases on error."
+ [slot entry args]
+ (let [[generation ticket]
+       (with-lock (:id slot)
+        (fn []
+         (let [generation @(:current slot)]
+          (when-not generation (refuse! :unavailable-generation {}))
+          [generation (acquire! generation)])))]
+  (try (execute generation #(invoke-entry generation entry args))
+       (finally (release-ticket! generation ticket)))))
+
+(defn capture!
+ "Retain the current generation for delayed work. Registration blocks
+  retirement until release!; run! adds a separate executing native code lease.
+  Transfer the native ticket when handing lifetime ownership to another process."
+ []
+ (let [generation (current)]
+  (when-not generation (refuse! :missing-generation-context {}))
+  {:generation generation :ticket (acquire! generation)}))
+
+(defn run!
+ "Invoke an entrypoint under a retained registration, or :cancelled after
+  release/owner death. Does not serialize independent callback executions."
+ [registration entry args]
+ (let [generation (:generation registration)]
+  (BeamLisp.Env/run_code! (:ticket registration)
+   (fn []
+    (let [ticket (acquire! generation)]
+     (try (execute generation (fn [] (invoke-entry generation entry args)))
+          (finally (release-ticket! generation ticket))))))))
+
+(defn release! [registration]
+ (release-ticket! (:generation registration) (:ticket registration)))
+
+(defn transfer!
+ "Transfer a retained callback's lifetime to the accepting local worker.
+  The old handle becomes cancelled. Dead workers return :cancelled."
+ [registration owner]
+ (let [generation (:generation registration) ticket (:ticket registration)]
+  (with-lock (:cache-key generation)
+   (fn []
+    (let [next (BeamLisp.Env/transfer_code! ticket owner)]
+     (if (= :cancelled next) :cancelled
+      (do (swap! (:state generation)
+            (fn [state] (-> state (update :tickets dissoc ticket)
+                                 (assoc-in [:tickets next] owner))))
+          {:generation generation :ticket next})))))))
+
+(defn evidence
+ "Live managed obligations. Dead registration owners are pruned. A registered
+  callback and an executing request both prevent retirement."
+ [generation]
+ (with-lock (:cache-key generation)
+  (fn []
+   (swap! (:state generation) update :tickets
+    (fn [tickets] (into {} (filter (fn [[_ owner]] (erlang/is_process_alive owner)) tickets))))
+   (let [state @(:state generation)]
+    {:digest (:digest generation) :retired (:retired state)
+     :serving-slots (count (:slots state)) :registrations (count (:tickets state))
+     :modules (count (:modules generation))}))))
+
+(defn retire!
+ "Retire an unserved graph with no retained registrations. Native soft
+  retirement still checks actual executing code leases. Unknown obligations
+  outside this managed graph must be ruled out by the deployment coordinator."
+ [generation]
+ (with-lock (:cache-key generation)
+  (fn []
+   (let [status (evidence generation)]
+    (cond
+     (:retired status) {:status :already-retired}
+     (or (pos? (:serving-slots status)) (pos? (:registrations status)))
+      (assoc status :status :waiting)
+     :else
+      (if (every? (fn [module] (= true (BeamLisp.Env/retire_module! module))) (:modules generation))
+       (do (swap! (:state generation) assoc :retired true)
+           (env/destroy (:scope generation))
+           (swap! prepared dissoc (:cache-key generation))
+           (swap! reload/live-generations
+            (fn [m] (reduce dissoc m (vals (:mapping generation)))))
+           {:status :retired})
+       {:status :waiting :reason :executing-code}))))))
