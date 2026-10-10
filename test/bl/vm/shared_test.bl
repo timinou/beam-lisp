@@ -1,0 +1,105 @@
+; Run after staging the edited Loader host; default seed intentionally stays pinned.
+(ns vm.shared-test (:require [vm.shared :as shared] [vm.core :as vmc] [env :as env]))
+(defn- scratch [] (str (System/tmp_dir!) "/bl-shared-" (System/pid) "-" (System/unique_integer (list :positive))))
+(defn- write-source [root source]
+ (File/mkdir_p! (str root "/shared"))
+ (File/write! (str root "/shared/math.bl") source))
+(defn- key-for [root] (str "Shared" (Base/encode16 (crypto/hash :sha256 root) (list (tuple :case :lower)))))
+(defn- spec [root library hash]
+ {:id root :root root :key (key-for root) :uses-paths {"shared.math" library}
+  :decl {:shadow [] :uses {"shared.math" hash}}})
+(defn- hash-at [library]
+ (BeamLisp.Loader/with_load_path library (fn [] (shared/hash-of "shared.math"))))
+(defn- refused? [action]
+ (try (action) false (catch _ true)))
+(defn- exercise [vm]
+ (vmc/run vm (fn []
+  (BeamLisp.Loader/ensure_loaded "shared.math")
+  [(BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "shared.math" "plus") (list 2))
+   (str (BeamLisp.Link/module_for "shared.math"))])))
+(deftest finite-shared-code-resolves-its-declared-path-and-keeps-full-content-identity
+ (let [root (scratch) library (str root "/library") source "(ns shared.math) (defn plus [x] (+ x 1))"]
+  (try
+   (write-source library source)
+   (let [hash (hash-at library)
+         a (vmc/spawn-vm (spec (str root "/a") library hash))
+         b (vmc/spawn-vm (spec (str root "/b") library hash))]
+    (try
+     (is (= 71 (count hash)))
+     (let [av (exercise a) bv (exercise b)]
+      (is (= 3 (first av)))
+      (is (= av bv))
+      (is (String/contains? (second av) (str "S" (subs hash 7))))
+      (vmc/drain a)
+      (is (= bv (exercise b)) "Closing one realm preserves the other shared consumer"))
+     (finally (vmc/drain a) (vmc/drain b))))
+   (finally (File/rm_rf! root)))))
+(deftest false-and-stale-hashes-refuse-before-sharing
+ (let [root (scratch) library (str root "/library") source "(ns shared.math) (defn plus [x] (+ x 1))"]
+  (try
+   (write-source library source)
+   (let [hash (hash-at library) wrong (str (subs hash 0 19) (String/duplicate "0" 52))]
+    (is (refused? (fn [] (vmc/spawn-vm (spec (str root "/false") library wrong)))))
+    (write-source library "(ns shared.math) (defn plus [x] (+ x 2))")
+    (is (refused? (fn [] (vmc/spawn-vm (spec (str root "/stale") library hash))))))
+   (finally (File/rm_rf! root)))))
+(deftest shared-source-admission-does-not-inherit-realm-host-capabilities
+ (is (shared/shareable-source? "(ns shared.math) (defn plus [x] (+ x 1))"))
+ (is (not (shared/shareable-source? "(ns shared.math) (def state (atom 0)) (defn plus [x] (+ x 1))")))
+ (is (not (shared/shareable-source? "(ns shared.math) (defn read [] (File/read! \"secret\"))")))
+ (is (not (shared/shareable-source? "(ns shared.math) (defn leak [] (BeamLisp.Ns.Private/read))"))))
+(deftest shared-closures-refuse-ordinary-project-dependencies
+ (let [root (scratch) library (str root "/library")]
+  (try
+   (write-source library "(ns shared.math (:require [private.data])) (defn plus [x] (+ x 1))")
+   (File/mkdir_p! (str library "/private"))
+   (File/write! (str library "/private/data.bl") "(ns private.data) (defn hidden [] 1)")
+   (let [hash (hash-at library)]
+    (is (refused? (fn [] (BeamLisp.Loader/with_load_path library
+       (fn [] (vmc/spawn-vm (spec (str root "/realm") library hash))))))))
+   (finally (File/rm_rf! root)))))
+(deftest dependency-edits-invalidate-the-root-closure-even-with-a-new-dependency-hash
+ (let [root (scratch) library (str root "/library")]
+  (try
+   (write-source library "(ns shared.math (:require [shared.dep])) (defn plus [x] (+ x 1))")
+   (File/write! (str library "/shared/dep.bl") "(ns shared.dep) (defn value [] 1)")
+   (let [hash (hash-at library)]
+    (File/write! (str library "/shared/dep.bl") "(ns shared.dep) (defn value [] 2)")
+    (let [dep-hash (BeamLisp.Loader/with_load_path library (fn [] (shared/hash-of "shared.dep")))
+          config (-> (spec (str root "/changed") library hash)
+                     (assoc-in [:decl :uses "shared.dep"] dep-hash)
+                     (assoc-in [:uses-paths "shared.dep"] library))]
+     (is (refused? (fn [] (vmc/spawn-vm config))))))
+   (finally (File/rm_rf! root)))))
+(deftest stateful-code-retains-ordinary-realm-local-loading
+ ;; Sharing is optional: removing :uses must preserve the complete language.
+ (let [root (scratch) library (str root "/library")]
+  (try
+   (write-source library "(ns shared.math) (def state (atom 0)) (defn plus [x] (+ x 1))")
+   (let [a (vmc/spawn-vm {:id (str root "/a") :key (key-for (str root "/a")) :decl {:uses {} :shadow []}})
+         b (vmc/spawn-vm {:id (str root "/b") :key (key-for (str root "/b")) :decl {:uses {} :shadow []}})
+         state (fn [vm] (vmc/run vm (fn [] (BeamLisp.Loader/with_load_path library
+                           (fn [] (BeamLisp.Loader/ensure_loaded "shared.math")
+                                  (BeamLisp.Env/fetch! "shared.math" "state"))))))]
+    (try
+     (let [av (state a) bv (state b)]
+      (swap! av inc)
+      (is (= 1 @av)) (is (= 0 @bv)))
+     (finally (vmc/drain a) (vmc/drain b))))
+   (finally (File/rm_rf! root)))))
+(deftest a-changed-compiler-context-cannot-keep-the-original-shared-authority
+ (let [root (scratch) library (str root "/library") e (env/fork)]
+  (try
+   (write-source library "(ns shared.math) (defn plus [x] (+ x 1))")
+   (let [hash (hash-at library)]
+    (env/with-env e
+     (fn []
+      (BeamLisp.Env/intern "core" "+" (fn [a b] a))
+      (is (refused? (fn [] (vmc/spawn-vm (assoc (spec (str root "/changed-context") library hash) :base e))))))))
+   (finally (env/destroy e) (File/rm_rf! root)))))
+
+(deftest shared-source-cannot-capture-ambient-values
+ (is (not (shared/shareable-source? "(ns shared.math) (def alias eval) (defn plus [x] (+ x 1))")))
+ (is (not (shared/shareable-source? "(ns shared.math) (defn leak [] secret)")))
+ (is (not (shared/shareable-source? "(ns shared.math) (defn leak [x] (let [v secret] (+ x v)))")))
+ (is (shared/shareable-source? "(ns shared.math) (def offset 2) (defn plus [x] (let [v (+ x offset)] (+ v 1)))")))

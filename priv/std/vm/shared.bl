@@ -1,0 +1,150 @@
+; Shared-code admission is source authority, not a user supplied module label.
+(ns vm.shared (:require [build-plan :as plan] [source-graph :as graph]))
+(def FORMAT "bl-shared-1")
+(def MAX-NAMESPACES 256)
+(def MAX-BYTES 8388608)
+(defn- fail [reason namespace]
+ (throw (ex-info "Shared namespace admission refused" {:reason reason :namespace namespace})))
+(defn- digest [bytes]
+ (Base/encode16 (crypto/hash :sha256 bytes) (list (tuple :case :lower))))
+(defn- snapshot-roots [roots]
+ (loop [pending roots units {} bytes 0]
+  (if (empty? pending) units
+   (let [n (first pending)]
+    (if (contains? units n) (recur (rest pending) units bytes)
+     (let [source (BeamLisp.Loader/source_content n)
+           header (when source (plan/header-for n source))
+           size (+ bytes (if source (erlang/byte_size source) 0))]
+      (when-not (= n (first header)) (fail :missing-source n))
+      (when (or (>= (count units) MAX-NAMESPACES) (> size MAX-BYTES)) (fail :closure-bound n))
+      (recur (concat (second header) (rest pending))
+       (assoc units n {:source source :requires (vec (second header)) :hash (digest source)}) size)))))))
+(defn snapshot
+ "Read a bounded exact transitive source closure without evaluating its code."
+ [namespace] (snapshot-roots [namespace]))
+(defn- compiler-authority []
+ ;; Use the same authority as application.package; never another compiler key.
+ (doseq [n ["sugar" "compiler" "lower" "anf"]]
+  (when-not (Code/ensure_loaded? (Module/concat (list :Elixir.BeamLisp.Ns.Body (Macro/camelize n))))
+   (fail :compiler-body-unavailable n)))
+ (or (BeamLisp.AOT/local_package_authority) (fail :compiler-authority-unavailable nil)))
+(defn- closure-key [namespace units authority]
+ (let [names (graph/closure namespace (fn [n] (:requires (get units n))))]
+  (str "sha256:" (graph/hash-lines
+   (to-list (concat [FORMAT (BeamLisp.AOTCache/compiler_key) authority]
+    (map (fn [n] (str n ":" (:hash (get units n)))) (sort names))))))))
+(defn hash-of
+ "Declared :uses hash: exact source closure plus the canonical compiler authority.
+  Resolve sources in their intended context before calling this helper."
+ [namespace]
+ (closure-key namespace (snapshot namespace) (compiler-authority)))
+(defn- qualified-reference? [node]
+ ;; The AOT finite subset permits direct host calls. Shared code has a narrower
+ ;; authority: lexical arithmetic, literal data and local functions only. A
+ ;; host call compiled under one realm's caps must not bypass another's caps.
+ (cond
+  (tuple? node)
+   (or (and (>= (erlang/tuple_size node) 2) (= :symbol (elem node 0))
+            (string? (elem node 1))
+            (or (and (not= "/" (elem node 1)) (String/contains? (elem node 1) "/"))
+                (String/contains? (elem node 1) "BeamLisp.Ns.")))
+       (some qualified-reference? (erlang/tuple_to_list node)))
+  (list? node) (some qualified-reference? node)
+  :else false))
+(defn- tagged? [node tag]
+ (and (tuple? node) (= 2 (erlang/tuple_size node)) (= tag (elem node 0))))
+(defn- symbol-name [node] (when (tagged? node :symbol) (elem node 1)))
+(def SAFE-OPS #{"+" "-" "*" "/" "=" "<" ">" "<=" ">="})
+(def RESERVED (into SAFE-OPS ["ns" "def" "defn" "defn-" "fn" "let" "if" "do" "quote" "&"]))
+(defn- literal? [node]
+ (cond
+  (or (tagged? node :vector) (tagged? node :map) (tagged? node :set))
+   (every? literal? (elem node 1))
+  (tagged? node :symbol) (contains? #{"nil" "true" "false"} (elem node 1))
+  (tagged? node :list)
+   (let [items (elem node 1)]
+    (and (= 2 (count items)) (= "quote" (symbol-name (first items)))))
+  (tuple? node) (contains? #{:integer :float :string :keyword :boolean :nil :char} (elem node 0))
+  :else (or (nil? node) (number? node) (string? node) (boolean? node))))
+(declare lexical?)
+(defn- function-body? [items scope]
+ (let [params (first items) names (when (tagged? params :vector) (map symbol-name (elem params 1)))]
+  (and names (every? (fn [n] (and n (not (contains? RESERVED n)))) names)
+       (= (count names) (count (set names)))
+       (seq (rest items))
+       (every? (fn [body] (lexical? body (into scope names))) (rest items)))))
+(defn- let-body? [items scope]
+ (let [bindings (first items)]
+  (and (tagged? bindings :vector)
+   (loop [remaining (elem bindings 1) locals scope]
+    (if (empty? remaining)
+     (and (seq (rest items)) (every? (fn [body] (lexical? body locals)) (rest items)))
+     (let [name (symbol-name (first remaining))]
+      (and (>= (count remaining) 2) name (not (contains? RESERVED name))
+       (lexical? (second remaining) locals)
+       (recur (drop 2 remaining) (conj locals name)))))))))
+(defn- lexical? [node scope]
+ (cond
+  (tagged? node :symbol) (contains? scope (elem node 1))
+  (or (tagged? node :vector) (tagged? node :map) (tagged? node :set))
+   (every? (fn [value] (lexical? value scope)) (elem node 1))
+  (tagged? node :list)
+   (let [items (elem node 1) head (symbol-name (first items)) args (rest items)]
+    (cond
+     (= head "quote") (= 1 (count args))
+     (= head "fn") (function-body? args scope)
+     (= head "let") (let-body? args scope)
+     (or (contains? SAFE-OPS head) (contains? scope head) (contains? #{"if" "do"} head))
+      (every? (fn [value] (lexical? value scope)) args)
+     :else false))
+  :else (literal? node)))
+(defn shareable-source?
+ "Finite lexical functions and immutable literal definitions. Every free symbol
+  must belong to this source; ambient values, metadata and macros are refused.
+  Unsupported code remains fully available through ordinary realm-local loading."
+ [source]
+ (try
+  (let [forms (BeamLisp.Reader/read_all source)
+        definitions (filter (fn [f] (and (tagged? f :list)
+                           (contains? #{"def" "defn" "defn-"} (symbol-name (first (elem f 1)))))) forms)
+        names (map (fn [f] (symbol-name (second (elem f 1)))) definitions)
+        scope (into #{"nil" "true" "false"} names)]
+   (and (BeamLisp.AOT/local_cacheable_source? source)
+    (not (qualified-reference? forms))
+    (every? (fn [n] (and n (not (contains? RESERVED n)))) names)
+    (= (count names) (count (set names)))
+    (every? (fn [f]
+     (and (tagged? f :list)
+      (let [items (elem f 1) head (symbol-name (first items)) body (drop 2 items)]
+       (cond
+        (= head "ns") true
+        (= head "def") (and (= 1 (count body)) (literal? (first body)))
+        (contains? #{"defn" "defn-"} head)
+         (function-body? (if (string? (first body)) (rest body) body) scope)
+        :else false)))) forms)))
+  (catch _ false)))
+(defn- admit-units! [declaration units]
+ (when (seq (:shadow declaration)) (fail :shadow-context nil))
+ (let [authority (compiler-authority)]
+  (doseq [[n unit] units]
+   (let [home (:home (BeamLisp.Loader/namespace_context n))]
+    (when (and (= :tier home) (contains? (:uses declaration) n)) (fail :tier-declaration n))
+    (when-not (= :tier home)
+     (when-not (and (= :shared home) (contains? (:uses declaration) n)) (fail :realm-reference n))
+     (when-not (shareable-source? (:source unit)) (fail :dynamic-shared-source n))
+     (let [expected (get (:uses declaration) n) actual (closure-key n units authority)]
+      (when-not (= expected actual)
+       (throw (ex-info "Shared source hash mismatch; recompute with vm.shared/hash-of"
+                {:reason :hash-mismatch :namespace n :expected expected :actual actual})))))))
+  :ok))
+(defn admit-declaration!
+ "Verify a realm's complete declaration once, with one bounded source snapshot."
+ [declaration]
+ (admit-units! declaration (snapshot-roots (keys (:uses declaration)))))
+(defn admit!
+ "Verify a source load immediately before publication, including transitive
+  hashes and the exact bytes already read by the loader. No source is evaluated."
+ [namespace declaration expected-source]
+ (let [units (snapshot namespace)]
+  (when-not (= expected-source (:source (get units namespace))) (fail :source-changed namespace))
+  (admit-units! declaration units)))
