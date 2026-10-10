@@ -107,7 +107,12 @@ export const LEAVES = {
     const b = new TextEncoder().encode(s); return list(Array.from(b));
   },
   "erlang/byte_size/1": (s) => new TextEncoder().encode(s).length,
-  "erlang/binary_part/3": (s, start, len) => new TextDecoder().decode(new TextEncoder().encode(s).subarray(start, start + len)),
+  "erlang/binary_part/3": (s, start, len) => lateModule("js.binary").d_part(s, start, len),
+  // Algorithms live in BL; these are only canonical leaf dispatch adapters.
+  "binary/at/2": (s, offset) => lateModule("js.binary").d_at(s, offset),
+  "binary/part/3": (s, start, len) => lateModule("js.binary").d_part(s, start, len),
+  "binary/match/2": (s, pattern) => lateModule("js.binary").d_match(s, pattern),
+  "binary/matches/2": (s, pattern) => lateModule("js.binary").d_matches(s, pattern),
   "erlang/map_size/1": (m) => m.cnt,
   "erlang/trunc/1": (x) => (x instanceof R.Flt ? Math.trunc(x.v) : x),
   "erlang/length/1": (l) => arr(l).length,
