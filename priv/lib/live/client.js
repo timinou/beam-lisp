@@ -720,7 +720,54 @@
     return el === top ? path : null;
   }
 
-  window.Live = { connect: connect, applyOp: applyOp, render: render,
+  // Browser-only capability: never relay clipboard values into the event outbox.
+  async function copy(button) {
+    var value = button.getAttribute("data-copy") || "";
+    var label = button.querySelector(".kn-lab, [data-copy-label]");
+    var original = label ? label.textContent : "";
+    var ticket = {}; button.__copyTicket = ticket;
+    try {
+      if (!navigator.clipboard || !navigator.clipboard.writeText) throw Error("clipboard unavailable");
+      await navigator.clipboard.writeText(value);
+      if (!button.isConnected || button.__copyTicket !== ticket || button.getAttribute("data-copy") !== value) return;
+      if (label) label.textContent = button.getAttribute("data-copy-success") || "Copied";
+      button.setAttribute("aria-live", "polite");
+      setTimeout(function () {
+        if (button.isConnected && button.__copyTicket === ticket && label) label.textContent = original;
+      }, 1800);
+    } catch (_e) {
+      if (!button.isConnected || button.__copyTicket !== ticket || button.getAttribute("data-copy") !== value) return;
+      // Prefer the visible, server-rendered field. Never insert unmanaged
+      // children into a live tree: they would shift subsequent patch paths.
+      var scope = button.closest("[data-copy-scope]") || button.parentNode;
+      var field = Array.prototype.find.call(scope.querySelectorAll("input[readonly], textarea[readonly]"),
+        function (candidate) { return candidate.value === value; });
+      if (!field) {
+        var dialog = document.createElement("dialog");
+        dialog.style.cssText = "max-width:90vw;width:38em;box-sizing:border-box";
+        var heading = document.createElement("p");
+        heading.textContent = button.getAttribute("data-copy-failure") || "Select and copy manually";
+        field = document.createElement("textarea"); field.readOnly = true;
+        field.setAttribute("data-copy-fallback", "");
+        field.style.cssText = "display:block;width:100%;min-height:8em;box-sizing:border-box";
+        var close = document.createElement("button"); close.type = "button";
+        close.textContent = "×";
+        close.setAttribute("aria-label", button.getAttribute("data-copy-close") || "Close");
+        close.onclick = function () { dialog.close(); };
+        dialog.append(heading, field, close);
+        dialog.addEventListener("close", function () { dialog.remove(); });
+        document.body.appendChild(dialog);
+        dialog.showModal();
+      }
+      field.value = value;
+      field.setAttribute("aria-label", button.getAttribute("data-copy-failure") || "Select and copy manually");
+      field.focus(); field.select();
+      if (label) label.textContent = field.getAttribute("aria-label");
+      button.setAttribute("aria-live", "polite");
+    }
+  }
+
+  window.Live = { copy: copy, connect: connect, applyOp: applyOp, render: render,
                   at: at, pathOf: pathOf, ws: null, root: null };
   var Live = window.Live;
 })();

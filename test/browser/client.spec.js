@@ -191,3 +191,52 @@ test("an inserted subtree with a seq of seqs renders every child", async ({
     expect(canonical(got), `nested step ${i + 1}`).toBe(canonical(step.html));
   }
 });
+
+test("clipboard confirms only after resolution and offers manual copy on denial", async ({ page }) => {
+  await page.setContent('<div><button data-copy="original" data-copy-success="Copié" data-copy-failure="Copiez le texte"><span class="kn-lab">Copier</span></button></div>');
+  await page.addScriptTag({ content: clientJs });
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: {
+      writeText: () => new Promise(resolve => { window.resolveCopy = resolve; })
+    }});
+    Live.copy(document.querySelector("button"));
+  });
+  await expect(page.locator("button")).toHaveText("Copier");
+  await page.evaluate(() => window.resolveCopy());
+  await expect(page.locator("button")).toHaveText("Copié");
+  await page.evaluate(() => {
+    navigator.clipboard.writeText = () => Promise.reject(Error("denied"));
+    return Live.copy(document.querySelector("button"));
+  });
+  await expect(page.locator("textarea[data-copy-fallback]")).toHaveValue("original");
+  await expect(page.locator("button[data-copy]")).toHaveText("Copiez le texte");
+  expect(await page.locator("textarea").evaluate(el => el.selectionEnd - el.selectionStart)).toBe(8);
+  await page.getByRole("button", {name:"Close", exact:true}).click();
+  await expect(page.locator("dialog")).toHaveCount(0);
+});
+
+test("a delayed clipboard promise cannot relabel a replaced row", async ({ page }) => {
+  await page.setContent('<div><button data-copy="old" data-copy-success="Copied"><span class="kn-lab">Copy</span></button></div>');
+  await page.addScriptTag({ content: clientJs });
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: {
+      writeText: () => new Promise(resolve => { window.resolveCopy = resolve; })
+    }});
+    Live.copy(document.querySelector("button"));
+    document.querySelector("button").setAttribute("data-copy", "new");
+    window.resolveCopy();
+  });
+  await expect(page.locator("button")).toHaveText("Copy");
+});
+
+test("clipboard denial selects an existing field without changing live child paths", async ({ page }) => {
+  await page.setContent('<div id="live-root"><div data-copy-scope><input readonly value="original"><div><button data-copy="original"><span class="kn-lab">Copy</span></button></div></div></div>');
+  await page.addScriptTag({content:clientJs});
+  await page.evaluate(async () => {
+    Object.defineProperty(navigator, "clipboard", {configurable:true, value:{writeText:() => Promise.reject(Error("denied"))}});
+    await Live.copy(document.querySelector("button"));
+  });
+  await expect(page.locator("dialog")).toHaveCount(0);
+  expect(await page.locator("input").evaluate(el => [el.selectionStart,el.selectionEnd])).toEqual([0,8]);
+  expect(await page.evaluate(() => Live.pathOf(document.getElementById("live-root"),document.querySelector("button")))).toEqual([1,0]);
+});
