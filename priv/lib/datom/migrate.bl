@@ -56,7 +56,7 @@
 ; that wrote it, because it IS that transaction's datom.
 
 (ns datom.migrate
-  (:require [datom.conn] [datom.db] [datom.query.engine] [datom.schema]))
+  (:require [datom.conn] [datom.db] [datom.index] [datom.query.engine] [datom.schema]))
 
 ;; ── the migration ledger attribute ──────────────────────────────────
 
@@ -74,10 +74,17 @@
   {:db/ident :migration/digest :db/valueType :db.type/string
    :db/cardinality :db.cardinality/one})
 
+(def START-ATTR
+  "A partial backfill reserves its identity before its first data commit.
+   Separate from :migration/id: a started migration is never reported complete."
+  {:db/ident :migration/started-id :db/valueType :db.type/keyword
+   :db/cardinality :db.cardinality/one :db/unique :db.unique/identity})
+
 (defn- ledger-installed?
   [conn]
   (and (datom.schema/known? (datom.conn/schema conn) :migration/id)
-       (datom.schema/known? (datom.conn/schema conn) :migration/digest)))
+       (datom.schema/known? (datom.conn/schema conn) :migration/digest)
+       (datom.schema/known? (datom.conn/schema conn) :migration/started-id)))
 
 (defn- ensure-ledger!
   "Install the ledger attribute if this connection has never seen it.
@@ -85,7 +92,7 @@
   [conn]
   (if (ledger-installed? conn)
     conn
-    (datom.conn/install-schema! conn [LEDGER-ATTR DIGEST-ATTR])))
+    (datom.conn/install-schema! conn [LEDGER-ATTR DIGEST-ATTR START-ATTR])))
 
 ;; ── reading the ledger ──────────────────────────────────────────────
 
@@ -103,14 +110,31 @@
   [db migration]
   (contains? (applied-ids db) (get migration :migration/id)))
 
+(defn- recorded-digest [db attr id]
+  (first (first (datom.query.engine/q
+     [:find '?digest :in '$ '?id :where ['?m attr '?id] ['?m :migration/digest '?digest]] db id))))
+
+(defn- started? [db migration]
+  (and (datom.schema/known? (datom.db/schema-of db) :migration/started-id)
+       (seq (datom.query.engine/q
+              '[:find ?m :in $ ?id :where [?m :migration/started-id ?id]] db (:migration/id migration)))))
+
 (defn- identity-status [db migration]
-  (when (applied? db migration)
-    (let [wanted (:migration/digest migration)
-          held (when (datom.schema/known? (datom.db/schema-of db) :migration/digest)
-                 (first (first (datom.query.engine/q
-                   '[:find ?digest :in $ ?id :where [?m :migration/id ?id] [?m :migration/digest ?digest]]
-                   db (:migration/id migration)))))]
-      (if (and wanted (not= wanted held)) :identity-conflict :already-applied))))
+  (let [wanted (:migration/digest migration) id (:migration/id migration)]
+   (cond
+    (applied? db migration)
+      (if (and wanted (not= wanted (recorded-digest db :migration/id id)))
+        :identity-conflict :already-applied)
+    (and (started? db migration) wanted
+         (not= wanted (recorded-digest db :migration/started-id id))) :identity-conflict
+    :else nil)))
+
+(defn- reserve! [conn migration]
+  (ensure-ledger! conn)
+  (when-not (started? (datom.conn/db conn) migration)
+   (datom.conn/transact! conn
+     [(cond-> {:db/id -2 :migration/started-id (:migration/id migration)}
+        (:migration/digest migration) (assoc :migration/digest (:migration/digest migration)))])))
 
 (defn- validate-spec! [migration]
   (when-not (keyword? (:migration/id migration))
@@ -385,22 +409,49 @@
 
 ;; ── batched remediation, for migrations too large for one commit ────
 
+(defn capabilities []
+  #{:serialized-decisions :immutable-digests :basis-bound :transaction-policy :online-steps :partial-identity})
+
+(defn step!
+  "Perform ONE bounded resumable backfill step. batch-fn is pure and returns
+   [tx-data more?]. Partial progress lives in data, never an in-memory cursor.
+   Final remediation/schema/ledger share the last writer turn. :allow-tx? checks
+   each batch and final commit; :expected-basis is checked before this step."
+  ([conn migration batch-fn] (step! conn migration batch-fn {}))
+  ([conn migration batch-fn opts]
+   (validate-spec! migration)
+   (datom.conn/serialized! conn
+    (fn []
+     (let [db (datom.conn/db conn) identity (identity-status db migration)]
+      (cond
+       identity (apply! conn migration)
+       (and (some? (:expected-basis opts))
+            (not= (:expected-basis opts) (datom.db/basis-t db)))
+        {:id (:migration/id migration) :status :stale :basis (datom.db/basis-t db)}
+       :else
+        (let [[tx-data more?] (batch-fn db)
+              speculative (when (seq tx-data) (datom.conn/with conn tx-data))]
+         (when (and more?
+                    (or (empty? tx-data)
+                        (empty? (remove (fn [d] (= :db/txInstant (datom.index/-a d)))
+                                        (:tx-datoms speculative)))))
+          (throw (ex-info "Migration batch made no progress" {:kind :migration-no-progress})))
+         (if (and speculative (:allow-tx? opts)
+                  (not= true ((:allow-tx? opts) speculative)))
+          {:id (:migration/id migration) :status :blocked :reason :transaction-policy}
+          (do
+           ;; Bind recovery identity BEFORE partial data can become durable.
+           (when (seq tx-data) (reserve! conn migration))
+           (let [report (when (seq tx-data) (datom.conn/transact! conn tx-data))]
+            (if more?
+             {:id (:migration/id migration) :status :progress :tx (:tx report)}
+             (apply! conn migration (dissoc opts :expected-basis)))))))))))))
+
 (defn apply-batched!
-  "Idempotent batches each take one writer turn, allowing traffic between them.
-   Ledger commits only after checks pass. batch-fn returns [tx-data more?] and
-   must converge and be pure; schema tightening belongs in the final apply!."
+  "Run resumable steps until complete. Every step yields the store writer.
+   For background integration use step! from a supervised proc worker instead
+   of keeping a request waiting for the entire backfill."
   [conn migration batch-fn]
-  (validate-spec! migration)
   (loop []
-   (let [step (datom.conn/serialized! conn
-                (fn []
-                 (if-let [identity (identity-status (datom.conn/db conn) migration)]
-                   {:id (:migration/id migration) :status identity}
-                   (let [[tx-data more?] (batch-fn (datom.conn/db conn))]
-                    (when (and more? (empty? tx-data))
-                     (throw (ex-info "Migration batch made no progress" {:kind :migration-no-progress})))
-                    (when (seq tx-data) (datom.conn/transact! conn tx-data))
-                    {:more? more?}))))]
-    (cond (:status step) step
-          (:more? step) (recur)
-          :else (apply! conn migration)))))
+   (let [r (step! conn migration batch-fn)]
+    (if (= :progress (:status r)) (recur) r))))
