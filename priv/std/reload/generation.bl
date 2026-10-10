@@ -241,6 +241,31 @@
 
 (defn- with-lock [key action] (BeamLisp.Env/with_namespace_lock (tuple :sealed-generation key) action))
 
+(defn capacity
+ "Node-lifetime admission budget, including failed prepares. BEAM atoms cannot
+  be collected; reaching this bound requires a runtime handover. Retirement
+  does not replenish it. Two-argument form is the pure admission decision."
+ ([] (capacity (erlang/apply :persistent_term :get
+                 (list :bl_sealed_generation_budget {:preparations 0 :namespaces 0})) 0))
+ ([used namespaces]
+  (assoc used :preparation-limit 256 :namespace-limit 4096
+    :status (if (and (< (:preparations used 0) 256)
+                     (<= (+ (:namespaces used 0) namespaces) 4096))
+              :available :runtime-handover-required))))
+
+(defn- reserve-capacity! [namespaces]
+ (with-lock :node-lifetime-capacity
+  (fn []
+   (let [used (erlang/apply :persistent_term :get
+                (list :bl_sealed_generation_budget {:preparations 0 :namespaces 0}))
+         decision (capacity used namespaces)]
+    (when (or (not= :available (:status decision))
+              (< (- (erlang/system_info :atom_limit) (erlang/system_info :atom_count)) 65536))
+     (refuse! :runtime-handover-required {:capacity decision}))
+    (erlang/apply :persistent_term :put
+      (list :bl_sealed_generation_budget
+        {:preparations (inc (:preparations used 0)) :namespaces (+ (:namespaces used 0) namespaces)}))))))
+
 (defn- namespace-modules [name]
  (cons (BeamLisp.Emit/module_for name)
        (keys (BeamLisp.Emit/body_modules (BeamLisp.Env/ns_defs name)))))
@@ -280,7 +305,8 @@
   (with-lock key
    (fn []
     (or (get @prepared key)
-     (let [planned (plan (assoc input :instance (str (erlang/unique_integer (list :positive)))))
+     (let [_ (reserve-capacity! (count (:order validated)))
+           planned (plan (assoc input :instance (str (erlang/unique_integer (list :positive)))))
            scope (env/fork) generation
            (try
             (env/with-env scope
@@ -412,6 +438,25 @@
   (try (execute generation #(invoke-entry generation entry args))
        (finally (release-ticket! generation ticket)))))
 
+(defn with!
+ "Trusted framework execution against a prepared graph, without publication.
+  Keeps returned domain callbacks safe only while action runs; delayed users
+  must capture! a registration. The caller cannot replace serving policy."
+ [generation action]
+ (let [ticket (acquire! generation)]
+  (try (execute generation action)
+       (finally (release-ticket! generation ticket)))))
+
+(defn invoke!
+ "Invoke sealed candidate code before publication with full graph/context."
+ [generation entry args]
+ (with! generation #(invoke-entry generation entry args)))
+
+(defn selected
+ "Snapshot serving identity under its admission lock."
+ [slot]
+ (with-lock (:id slot) #(some-> @(:current slot) :digest)))
+
 (defn capture!
  "Retain the current generation for delayed work. Registration blocks
   retirement until release!; run! adds a separate executing native code lease.
@@ -475,7 +520,7 @@
      (or (pos? (:serving-slots status)) (pos? (:registrations status)))
       (assoc status :status :waiting)
      :else
-      (if (every? (fn [module] (= true (BeamLisp.Env/retire_module! module))) (:modules generation))
+      (if (= true (BeamLisp.Env/retire_modules! (to-list (:modules generation))))
        (do (swap! (:state generation) assoc :retired true)
            (env/destroy (:scope generation))
            (swap! prepared dissoc (:cache-key generation))
@@ -483,3 +528,14 @@
             (fn [m] (reduce dissoc m (vals (:mapping generation)))))
            {:status :retired})
        {:status :waiting :reason :executing-code}))))))
+
+(defn with-retirement-fence!
+ "Hold graph admission while a trusted coordinator checks durable producer
+  fences and retires it. No action runs while serving or managed users remain.
+  Native retire! must still succeed before authorizing destructive changes."
+ [generation action]
+ (with-lock (:cache-key generation)
+  (fn []
+   (let [status (evidence generation)]
+    (if (or (pos? (:serving-slots status)) (pos? (:registrations status)))
+     (assoc status :status :waiting) (action))))))
