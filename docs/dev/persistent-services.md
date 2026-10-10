@@ -45,3 +45,14 @@ returned command's OS VM remains alive and that a second command uses it, and
 stops its daemon. On 2026-10-10 this passed against release 04805c33 with the new
 launcher: 23,462 ms first boot and 131 ms second dispatch. Runtime service tests
 are separate; this older release does not contain `vm.service`.
+
+`vm.ports/claim` accepts `:service true`. The route's descriptor lease belongs
+to the calling service process; its death makes the route disappear even while
+the shared VM stays alive. Successful acquisition returns `:generation` beside
+`:ok`; pass that generation to `release`. A stale cleanup cannot remove a new
+route. Legacy root-scoped claims keep their old return shape and require explicit
+release. All participating claim/release writers use an OS admission lease, and
+duplicate hostnames are rejected with `:host_taken`. Moving an existing claim
+requires release first. The port bind is still a probe: listener startup must
+handle a real bind failure and release its claim. Unsupported lease acquisition
+refuses ownership. Route reads fail closed if a lease cannot be inspected.

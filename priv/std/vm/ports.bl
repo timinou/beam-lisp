@@ -35,7 +35,7 @@
 ; claim, anything else is swept. (The gateway edge learned this the hard way.)
 
 (ns vm.ports
-  (:require [vm.paths :as paths]))
+  (:require [vm.paths :as paths] [os.lease :as lease]))
 
 ;; ── shape helpers ───────────────────────────────────────────────────────────
 
@@ -82,7 +82,15 @@
     (File/dir? "/proc") (File/dir? (str "/proc/" pid))
     :else true))
 
-(defn- alive? [claim] (alive-pid? (get claim :pid)))
+(defn- alive? [claim]
+  (and (alive-pid? (get claim :pid))
+       (if-let [path (:lease-path claim)]
+         ;; A helper descriptor follows the service owner, even while its OS VM
+         ;; stays alive. A foreign VM can check the same descriptor lease.
+         (let [r (lease/acquire! path)]
+           (if-let [l (:ok r)] (do (lease/release! l) false)
+             true))
+         true)))
 
 ;; ── the ports dir ───────────────────────────────────────────────────────────
 
@@ -132,6 +140,13 @@
     (let [r (erlang/apply :file :rename (list (erlang/binary_to_list tmp) (erlang/binary_to_list path)))]
       (if (= :ok r) :ok (do (File/rm tmp) {:error (tuple :write_claim r)})))))
 
+(defn- locked [dir action]
+  (let [deadline (+ (System/monotonic_time :millisecond) 5000)]
+    (loop []
+      (let [r (lease/with-lease (str dir "/.admission.lock") action)]
+        (if (and (= :busy (:error r)) (< (System/monotonic_time :millisecond) deadline))
+          (do (Process/sleep 10) (recur)) r)))))
+
 ;; ── binding probe ───────────────────────────────────────────────────────────
 
 (defn- probe
@@ -168,7 +183,7 @@
     (cond
       (nil? claim) (to-list [])
       (alive? claim) (to-list [claim])
-      :else (do (File/rm path) (to-list [])))))
+      :else (to-list []))))
 
 (defn list-claims
   "Every live claim, oldest name first. Stale claims (owner gone) are swept as
@@ -181,7 +196,8 @@
         (if (= :ok (elem lr 0))
           (to-list
             (mapcat (fn [nm] (read-live (str dir "/" (erlang/list_to_binary nm))))
-                    (sort (elem lr 1))))
+                    (filter (fn [nm] (not (starts-with? (erlang/list_to_binary nm) ".")))
+                            (sort (elem lr 1)))))
           (to-list [])))
       (to-list []))))
 
@@ -215,18 +231,20 @@
 
 ;; ── claiming ────────────────────────────────────────────────────────────────
 
-(defn- held-here [dir name want root pid]
+(defn- held-here [dir name want root pid owner]
   (let [claim (read-claim (str dir "/" (file-name name want root)))]
     (cond
       (nil? claim) :free
       ;; Several project realms can share this OS pid. Idempotence belongs to
       ;; the claiming root as well; another realm must not inherit its claim.
-      (and (= (get claim :pid) pid) (= (get claim :root) root))
-        {:ok (get claim :port)}
+      (and (alive? claim) (= (get claim :pid) pid) (= (get claim :root) root)
+           (= owner (:owner claim)))
+        (if (:generation claim) {:ok (:port claim) :generation (:generation claim)}
+          {:ok (:port claim)})
       (alive? claim) {:held claim}
       :else :free)))
 
-(defn- take-port [dir name want root pid hosts]
+(defn- take-port [dir name want root pid hosts owner]
   (let [b (bindable want)]
     (cond
       (contains? b :ok)
@@ -234,6 +252,9 @@
               ;; keys match Daemon.Ports EXACTLY (:tree_id, :claimed_at) so any
               ;; reader — the live Elixir gateway during transition, vm.gateway
               ;; after — agrees on one on-disk shape.
+              generation (when owner (Base/encode16 (crypto/strong_rand_bytes 16) (list (tuple :case :lower))))
+              lease-path (when owner (str dir "/.owner-" (file-name name want root)))
+              held (when owner (lease/acquire! lease-path))
               claim {:name (to-str name)
                      :port port
                      :pinned (not= want 0)
@@ -241,9 +262,16 @@
                      :tree_id (paths/tree-id root)
                      :root root
                      :pid pid
-                     :claimed_at (erlang/system_time :second)}]
-          (let [w (write-claim dir (file-name name want root) claim)]
-            (if (= :ok w) {:ok port} w)))
+                     :claimed_at (erlang/system_time :second)}
+              claim (if owner (assoc claim :owner owner :generation generation :lease-path lease-path) claim)]
+          (if (and owner (not (:ok held))) held
+            (let [w (write-claim dir (file-name name want root) claim)]
+              (if (= :ok w)
+                (if owner
+                  (do (erlang/put (tuple :vm-port-lease generation) (:ok held))
+                      {:ok port :generation generation})
+                  {:ok port})
+                (do (when (:ok held) (lease/release! (:ok held))) w)))))
       (= :eaddrinuse (:error b))
         {:error (tuple :port_busy want (holder want))}
       :else {:error (:error b)})))
@@ -253,23 +281,33 @@
    port. `opts` = {:root … :pid … :hosts […]}. Returns {:ok port} or {:error
    reason} where reason is {:taken claim} (another session holds the name) or
    {:port_busy port claim} (the wanted number is in use). Re-claiming a name
-   this process already holds keeps its port — idempotent."
+   this process already holds keeps its port — idempotent. :service true binds
+   the claim to this BEAM process via an OS descriptor lease and returns
+   :generation; pass that generation to release. Hostnames are exclusive across
+   participating OS processes. The bind probe is not a socket reservation."
   ([name want] (claim name want {}))
   ([name want opts]
    (let [root (or (get opts :root) (BeamLisp/cwd))
          pid (normalize-pid (get opts :pid))
          hosts (normalize-hosts (get opts :hosts))
+         owner (when (:service opts) (erlang/self))
          d (ports-dir)]
      (if (contains? d :ok)
-       (let [dir (:ok d)
-             h (held-here dir name want root pid)]
-         (cond
-           ;; this session already holds the NAME with an ephemeral port
-           (and (contains? h :ok) (= want 0)) {:ok (:ok h)}
-           (and (contains? h :ok) (= (:ok h) want)) {:ok want}
-           (contains? h :ok) (take-port dir name want root pid hosts)  ; move it
-           (contains? h :held) {:error (tuple :taken (:held h))}
-           :else (take-port dir name want root pid hosts)))
+       (let [dir (:ok d)]
+         (locked dir
+          (fn []
+           (let [h (held-here dir name want root pid owner)
+                 conflict (first (filter
+                   (fn [c]
+                     (and (not (and (= root (:root c)) (= (to-str name) (:name c)) (= pid (:pid c))))
+                          (some (fn [host] (some (fn [existing] (= host existing)) (:hosts c))) hosts)))
+                   (list-claims)))]
+            (cond
+              conflict {:error (tuple :host_taken conflict)}
+              (and (contains? h :ok) (or (= want 0) (= (:ok h) want))) h
+              (contains? h :ok) {:error (tuple :release_before_move name)}
+              (contains? h :held) {:error (tuple :taken (:held h))}
+              :else (take-port dir name want root pid hosts owner))))))
        d))))
 
 (defn release
@@ -282,8 +320,14 @@
          d (ports-dir)]
      (when (contains? d :ok)
        (let [dir (:ok d)]
-         (doseq [key (list (file-name name 0 root) (file-name name 1 root))]
+        (locked dir
+         (fn []
+          (doseq [key (list (file-name name 0 root) (file-name name 1 root))]
            (let [claim (read-claim (str dir "/" key))]
-             (when (and claim (= (get claim :root) root))
-               (File/rm (str dir "/" key)))))))
+            (when (and claim (= (:root claim) root)
+                       (or (nil? (:generation claim))
+                           (= (:generation claim) (:generation opts))))
+             (File/rm (str dir "/" key))
+             (when-let [held (erlang/erase (tuple :vm-port-lease (:generation claim)))]
+              (when (map? held) (lease/release! held))))))))))
      :ok)))
