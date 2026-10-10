@@ -1,6 +1,6 @@
 (ns proc.queue-protocol-test
  (:require [proc :as proc] [proc.queue :as q] [datom :as d] [datom.conn :as dc]
-           [datom.store-map :as sm] [proc.evolve :as ev]))
+           [datom.store-map :as sm] [datom.store :as ds] [proc.evolve :as ev]))
 
 (proc/defserver protocol-q
  (queue {:of :test/work :protocol 2 :generation "release-b"
@@ -25,8 +25,12 @@
 (deftest automatic-metadata-and-old-payload-adaptation
  (boot-stop protocol-q)
  (let [j (q/enqueue! :protocol-q {:test/old 42} {:protocol 1 :generation "release-a" :source-id [:doc "a"]})
+       adoption (q/adopt-generation! :protocol-q (:db/id j) "release-a" "release-b"
+                  {:digest "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                   :protocol 1 :upcast (fn [p] p) :accept? (fn [p] (contains? p :test/old))})
        p (start protocol-q nil {})]
   (try
+   (is (= :adopted (:status adoption)))
    (let [done (wait-job :protocol-q (:db/id j) :done)]
     (is (string? (:job/id done)))
     (is (string? (:job/attempt-id done)))
@@ -116,3 +120,209 @@
     (is (= :retired (:status (ev/retire! p 2 1))))
     (is (= :inventory-sealed (:kind (ev/bind-queue! p srv)))))
    (finally (GenServer/stop p)))))
+
+(def submissions (atom 0))
+(def lookups (atom 0))
+(proc/defserver provider-q
+ (queue {:of :test/provider :retry {:max 5} :unique [:test/value]})
+ (perform [job]
+  (let [effect (q/begin-effect! :provider-q job :submit)]
+   (if (= :submit (:status effect))
+    (do (swap! submissions inc)
+        (q/record-effect! :provider-q job :submit :uncertain {:reason :lost-response})
+        (throw (ex-info "Provider accepted, response was lost" {:kind :provider-unknown})))
+    (do (swap! lookups inc)
+        (q/reconcile-effect! :provider-q job :submit :complete {:provider-id "accepted-1"})
+        :reconciled)))))
+
+(deftest uncertain-submissions-are-held-and-reconciled-without-resubmission
+ (reset! submissions 0) (reset! lookups 0)
+ (let [p (start provider-q nil {}) j (q/enqueue! :provider-q {:test/value 10})]
+  (try
+   (is (some? (wait-job :provider-q (:db/id j) :held)))
+   (is (= 1 @submissions))
+   (is (= :uncertain (get-in (q/effects :provider-q (:db/id j)) [:submit :state])))
+   (let [again (q/enqueue! :provider-q {:test/value 10})]
+    (is (= false (:job/created again)))
+    (is (= (:job/id j) (:job/id again))))
+   (q/retry! :provider-q (:db/id j))
+   (is (some? (wait-job :provider-q (:db/id j) :done)))
+   (is (= 1 @submissions))
+   (is (= 1 @lookups))
+   (is (= :complete (get-in (q/effects :provider-q (:db/id j)) [:submit :state])))
+   (finally (stop p)))))
+
+(deftest provider-intents-survive-attempt-reclaim-and-need-explicit-absence
+ (let [srv :effect-fences-q c (dc/connect-with (sm/open) [])]
+  (q/attach-store! srv c)
+  (d/transact! c [{:db/id -1 :queue/key (name srv)
+                  :queue/decl (assoc (q/normalise-decl {:of :test/effect}) :server (name srv))}])
+  (let [j (q/enqueue! srv {:test/value 11}) now (erlang/system_time :millisecond)
+        a (q/claim! c j now 60000) first (q/begin-effect! srv a :upload)]
+   (is (= :submit (:status first)))
+   (d/transact! c [[:db/add (:db/id j) :job/lease-until (- (erlang/system_time :millisecond) 1)]])
+   (let [b (q/claim! c (d/entity (d/db c) (:db/id j)) (erlang/system_time :millisecond) 60000)]
+    (is (= :stale-attempt (:kind (q/record-effect! srv a :upload :complete {}))))
+    (is (= :reconcile (:status (q/begin-effect! srv b :upload))))
+    (q/reconcile-effect! srv b :upload :absent {:provider-id "lookup-absent"})
+    (let [next (q/begin-effect! srv b :upload)]
+     (is (= :submit (:status next)))
+     (is (= (:effect-id first) (:effect-id next))))
+    (q/record-effect! srv b :upload :complete {:provider-id "upload-done"})
+    (is (= :complete (:status (q/begin-effect! srv b :upload))))))))
+
+(deftest sealed-producer-context-prevents-current-declaration-mislabeling
+ (let [srv :sealed-producer-q c (dc/connect-with (sm/open) []) prior (Process/get :bl_generation)]
+  (q/attach-store! srv c)
+  (d/transact! c [{:db/id -1 :queue/key (name srv)
+                  :queue/decl (assoc (q/normalise-decl {:of :test/sealed :protocol 2 :generation "new"}) :server (name srv))}])
+  (try
+   (Process/put :bl_generation {:digest "old" :protocols {"sealed-producer-q" {:protocol 1 :generation "old"}}})
+   (let [j (q/enqueue! srv {:test/old 12})]
+    (is (= 1 (:job/protocol j)))
+    (is (= "old" (:job/generation j))))
+   (is (= :generation-conflict
+          (try (q/enqueue! srv {:test/old 12} {:generation "new"}) nil (catch e (:kind (ex-data e))))))
+   (Process/put :bl_generation {:digest "unmapped" :protocols {}})
+   (is (= :undeclared-queue-protocol
+          (try (q/enqueue! srv {:test/old 13}) nil (catch e (:kind (ex-data e))))))
+   (is (= :undeclared-queue-protocol
+          (try (q/enqueue! srv {:test/old 14} {:protocol 1}) nil (catch e (:kind (ex-data e))))))
+   (finally (Process/put :bl_generation prior)))))
+
+(deftest retry-and-prune-share-one-writer-decision
+ (let [srv :retry-prune-q c (dc/connect-with (sm/open) [])]
+  (q/attach-store! srv c)
+  (d/transact! c [{:db/id -1 :queue/key (name srv)
+                  :queue/decl (assoc (q/normalise-decl {:of :test/race}) :server (name srv))}])
+  (doseq [n (range 20)]
+   (let [j (q/enqueue! srv {:test/value n})]
+    (d/transact! c [[:db/add (:db/id j) :job/state :failed]
+                   [:db/add (:db/id j) :job/finished-at 1]])
+    (let [retry (Task/async (fn [] (try (q/retry! srv (:db/id j)) (catch _ nil))))
+          prune (Task/async (fn [] (q/prune! srv 2)))
+          result (Task/await retry)]
+     (Task/await prune)
+     (when result
+      (is (= :queued (:job/state (d/entity (d/db c) (:db/id j))))
+          "a successful retry cannot be deleted by an older terminal snapshot")))))))
+
+(deftest legacy-claims-gain-stable-metadata-before-execution
+ (let [srv :legacy-metadata-q c (dc/connect-with (sm/open) [])]
+  (q/attach-store! srv c)
+  (let [report (d/transact! c [{:db/id -1 :job/of :test/legacy :job/server (name srv)
+                               :job/state :queued :job/attempts 0 :job/at 1
+                               :job/payload {:test/value 15}}])
+        j (d/entity (d/db c) (get (:tempids report) -1))
+        claimed (q/claim! c j (erlang/system_time :millisecond) 60000)]
+   (is (string? (:job/id claimed)))
+   (is (= (:job/id claimed) (:job/source-id claimed)))
+   (is (= 1 (:job/protocol claimed)))
+   (is (string? (:job/attempt-id claimed))))))
+
+(deftest required-generation-and-producer-fences-are-independent-of-protocol
+ (let [srv :generation-fences-q c (dc/connect-with (sm/open) [])
+       migration {:digest "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                  :protocol 1 :upcast (fn [p] p) :accept? (fn [p] (contains? p :test/value))}]
+  (q/attach-store! srv c)
+  (d/transact! c [{:db/id -1 :queue/key (name srv)
+                  :queue/decl (assoc (q/normalise-decl {:of :test/generation :generation "new"}) :server (name srv))}])
+  (let [j (q/enqueue! srv {:test/value 16} {:generation "old"})]
+   (is (= {"old" 1} (:required-generations (q/generation-inventory srv))))
+   (q/fence-generation! srv "old")
+   (is (= :generation-fenced
+          (try (q/enqueue! srv {:test/value 17} {:generation "old"}) nil (catch e (:kind (ex-data e))))))
+   (is (= 1 (:job/protocol (q/enqueue! srv {:test/value 18}))))
+   (is (= :adopted (:status (q/adopt-generation! srv (:db/id j) "old" "new" migration))))
+   (is (= :already-applied (:status (q/adopt-generation! srv (:db/id j) "old" "new" migration))))
+   (is (= 2 (get-in (q/generation-inventory srv) [:required-generations "new"])))
+   (is (= 1 (get-in (q/generation-inventory srv) [:generations "old"])))
+   (is (= ["old"] (:fenced-generations (q/generation-inventory srv)))))))
+
+(deftest backoff-retries-retain-the-outstanding-uniqueness-window
+ (let [srv :retry-ticket-q c (dc/connect-with (sm/open) [])
+       decl (q/normalise-decl {:of :test/ticket :unique [:test/value]
+                              :retry {:max 3 :base 60000}})]
+  (q/attach-store! srv c)
+  (d/transact! c [{:db/id -1 :queue/key (name srv) :queue/decl (assoc decl :server (name srv))}])
+  (let [j (q/enqueue! srv {:test/value 19}) now (erlang/system_time :millisecond)
+        claimed (q/claim! c j now 60000)
+        state {:queue {:server srv :decl decl :clock (fn [] now)
+                       :running {:one {:e (:db/id j) :token (:job/owner claimed) :attempts 1}}}}]
+   (q/settle state :one {:error "transient"})
+   (let [again (q/enqueue! srv {:test/value 19})]
+    (is (= :queued (:job/state again)))
+    (is (= false (:job/created again)))
+    (is (= (:job/id j) (:job/id again)))))))
+
+(deftest terminal-checkpoints-still-block-collection-and-pruning
+ (let [srv :terminal-effect-q c (dc/connect-with (sm/open) [])]
+  (q/attach-store! srv c)
+  (d/transact! c [{:db/id -1 :queue/key (name srv)
+                  :queue/decl (assoc (q/normalise-decl {:of :test/terminal-effect :generation "old"}) :server (name srv))}])
+  (let [j (q/enqueue! srv {:test/value 20})]
+   (d/transact! c [[:db/add (:db/id j) :job/state :cancelled]
+                  [:db/add (:db/id j) :job/finished-at 1]
+                  [:db/add (:db/id j) :job/effects {:upload {:state :uncertain :effect-id "retained"}}]])
+   (is (= 1 (get-in (q/generation-inventory srv) [:required-generations "old"])))
+   (is (= 0 (:removed (q/prune! srv 2))))
+   (is (some? (d/entity (d/db c) (:db/id j)))))))
+
+; Test-only capability spy: asserts boundary ordering, not disk durability.
+(defrecord SyncSpy [base syncs failing observer])
+(extend-type SyncSpy
+ ds/Store
+ (-get [s k] (ds/-get (:base s) k))
+ (-range [s lo hi] (ds/-range (:base s) lo hi))
+ (-put [s k v] (ds/-put (:base s) k v) s)
+ (-delete [s k] (ds/-delete (:base s) k) s)
+ (-update [s k f] (let [[_ value] (ds/-update (:base s) k f)] [s value]))
+ (-commit [s ops] (ds/-commit (:base s) ops) s))
+(extend-type SyncSpy
+ ds/Durable
+ (-sync [s]
+  (swap! (:syncs s) conj ((deref (:observer s))))
+  (when @(:failing s) (throw (ex-info "Simulated sync refusal" {:kind :sync-refused})))
+  :ok))
+
+(deftest provider-intent-and-retirement-fences-sync-before-success
+ (let [srv :sync-checkpoint-q observed (atom []) failing (atom false) observer (atom (fn [] nil))
+       c (dc/connect-with (->SyncSpy (sm/open) observed failing observer) [])]
+  (q/attach-store! srv c)
+  (d/transact! c [{:db/id -1 :queue/key (name srv)
+                  :queue/decl (assoc (q/normalise-decl {:of :test/sync :generation "old"}) :server (name srv))}])
+  (let [j (q/enqueue! srv {:test/value 21})
+        claimed (q/claim! c j (erlang/system_time :millisecond) 60000)]
+   (reset! observer (fn [] (get-in (q/effects srv (:db/id j)) [:submit :state])))
+   (let [begun (q/begin-effect! srv claimed :submit)]
+    (is (= :submit (:status begun)))
+    (is (= :stable (:durability begun)))
+    (is (= [:intent] @observed)))
+   (reset! failing true)
+   (is (= :sync-refused (try (q/record-effect! srv claimed :submit :uncertain {}) nil
+                            (catch e (:kind (ex-data e))))))
+   (is (= :sync-refused (try (q/begin-effect! srv claimed :submit) nil
+                            (catch e (:kind (ex-data e))))))
+   (reset! failing false)
+   (is (= :reconcile (:status (q/begin-effect! srv claimed :submit))))
+   (let [before (count @observed) fenced (q/fence-generation! srv "old")]
+    (is (= :stable (:durability fenced)))
+    (is (= (inc before) (count @observed)))))))
+
+
+(deftest stale-prepared-snapshot-cannot-claim-after-adoption
+ (let [srv :adoption-claim-race-q c (dc/connect-with (sm/open) [])
+       migration {:digest "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                  :protocol 1 :upcast (fn [p] (assoc p :test/migrated true))
+                  :accept? (fn [p] (= true (:test/migrated p)))}]
+  (q/attach-store! srv c)
+  (d/transact! c [{:db/id -1 :queue/key (name srv)
+                  :queue/decl (assoc (q/normalise-decl {:of :test/adoption-race :generation "old"}) :server (name srv))}])
+  (let [before (q/enqueue! srv {:test/value 22})]
+   (is (= :adopted (:status (q/adopt-generation! srv (:db/id before) "old" "new" migration))))
+   (is (nil? (q/claim! c before (erlang/system_time :millisecond) 60000)))
+   (let [current (d/entity (d/db c) (:db/id before))]
+    (is (= :queued (:job/state current)))
+    (is (= "new" (:job/required-generation current)))
+    (is (= true (:test/migrated (:job/adopted-payload current))))
+    (is (some? (q/claim! c current (erlang/system_time :millisecond) 60000)))))))

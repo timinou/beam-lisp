@@ -108,6 +108,7 @@
 (ns proc.queue
   (:require [datom :as datom]
             [datom.conn :as dc]
+            [datom.store :as ds]
             [datom.store-ets :as store-ets]
             [proc.server :refer [extend-clause!]]
             [proc.table :as table]
@@ -278,8 +279,13 @@
    {:db/ident :job/source-id :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
    {:db/ident :job/parent-id :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
    {:db/ident :job/protocol :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/index true}
+   {:db/ident :job/required-generation :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :job/adoption :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
+   {:db/ident :job/adopted-payload :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
    {:db/ident :job/generation :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+   {:db/ident :job/effects :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
    {:db/ident :job/retry-base :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+   {:db/ident :queue/fenced-generations :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
    {:db/ident :queue/fenced-through :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
    {:db/ident :job/attempt-id :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
    {:db/ident :queue/fenced-protocols :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
@@ -368,6 +374,13 @@
 (defn- identity-token []
   (Base/encode16 (erlang/apply :crypto :strong_rand_bytes (list 24))))
 
+(defn- sync-checkpoint!
+  "Critical decisions require stable-storage sync before authorizing an external
+   effect or code collection. Development memory fixtures report volatility."
+  [c]
+  (if (ds/durable? (:store c))
+    (do (ds/sync! (:store c)) :stable) :volatile))
+
 (defn- fenced-protocols [c srv]
   (:queue/fenced-protocols (datom/pull (datom/db c) '[*] [:queue/key (name srv)]) #{}))
 
@@ -382,7 +395,7 @@
       (fn []
         (datom/transact! c [{:db/id -1 :queue/key (name srv)
           :queue/fenced-protocols (conj (fenced-protocols c srv) protocol)}])
-        {:status :fenced :protocol protocol}))))
+        {:status :fenced :protocol protocol :durability (sync-checkpoint! c)}))))
 
 (defn fence-through!
   "Close the complete protocol prefix through version in one durable writer
@@ -396,28 +409,100 @@
         (let [row (datom/pull (datom/db c) '[*] [:queue/key (name srv)])]
           (datom/transact! c [{:db/id -1 :queue/key (name srv)
             :queue/fenced-through (max version (:queue/fenced-through row 0))}])
-          {:status :fenced :through version})))))
+          {:status :fenced :through version :durability (sync-checkpoint! c)})))))
 
+(defn fence-generation!
+  "Monotone durable producer admission fence for one exact generation. Same
+   payload protocol in a newer generation remains admissible. Accepted old work
+   may finish or be explicitly adopted; closure is not proof it has drained."
+  [srv digest]
+  (when-not (and (string? digest) (not (empty? digest)))
+    (throw (ex-info "Generation fence requires a nonempty identity" {:kind :invalid-generation})))
+  (let [c (conn srv)]
+    (dc/serialized! c
+      (fn []
+        (let [row (datom/pull (datom/db c) '[*] [:queue/key (name srv)])]
+          (datom/transact! c [{:db/id -1 :queue/key (name srv)
+            :queue/fenced-generations (conj (:queue/fenced-generations row #{}) digest)}])
+          {:status :fenced :generation digest :durability (sync-checkpoint! c)})))))
+
+(declare effect-pending?)
 (defn protocol-inventory
-  "Read retained dependencies without a running queue. Failed/held/unknown jobs
-   still depend on their protocol; only done/cancelled jobs release it. Legacy
-   jobs without metadata use protocol 1. Counts do not imply a retirement proof
-   until admissions have been fenced."
+  "Read retained protocol and generation dependencies from ONE snapshot.
+   Failed/held/unknown jobs and incomplete provider effects remain dependencies.
+   :generations retains producer provenance; :required-generations describes
+   dispatch requirements after explicitly receipted adoption. Legacy protocol 1
+   jobs without a generation are counted under :unversioned-generations."
   [srv]
   (let [c (conn srv) db (datom/db c)
-        rows (datom/q '[:find ?e ?s :where [?e :job/state ?s]] db)]
-    {:fenced (vec (sort (fenced-protocols c srv)))
-     :fenced-through (:queue/fenced-through (datom/pull db '[*] [:queue/key (name srv)]) 0)
-     :protocols (reduce (fn [m row]
-                    (if (contains? #{:done :cancelled} (second row)) m
-                      (let [j (datom/entity db (first row)) p (:job/protocol j 1)]
-                        (update m p (fn [n] (inc (or n 0))))))) {} rows)}))
+        row (datom/pull db '[*] [:queue/key (name srv)])
+        live (remove (fn [r] (contains? #{:done :cancelled} (second r)))
+                     (datom/q '[:find ?e ?s :where [?e :job/state ?s]] db))
+        ;; Do not pull every historical completed job. Only terminal rows with
+        ;; checkpoints can retain a provider dependency; query that sparse fact.
+        terminal-effects (filter (fn [r]
+                             (and (contains? #{:done :cancelled} (second r))
+                                  (effect-pending? {:job/effects (nth r 2)})))
+                           (datom/q '[:find ?e ?s ?effects
+                                      :where [?e :job/effects ?effects]
+                                             [?e :job/state ?s]] db))
+        jobs (map (fn [r] (datom/entity db (first r))) (concat live terminal-effects))
+        bump (fn [m key] (update m key (fn [n] (inc (or n 0)))))
+        counted (reduce (fn [m j]
+                   (let [original (:job/generation j)
+                         required (:job/required-generation j original)]
+                     (cond-> (-> m
+                                   (update :protocols (fn [p] (bump p (get-in j [:job/adoption :protocol] (:job/protocol j 1)))))
+                                   (update :producer-protocols (fn [p] (bump p (:job/protocol j 1)))))
+                       original (update :generations (fn [g] (bump g original)))
+                       required (update :required-generations (fn [g] (bump g required)))
+                       (nil? original) (update :unversioned-generations inc))))
+                  {:protocols {} :producer-protocols {} :generations {} :required-generations {} :unversioned-generations 0} jobs)]
+    (assoc counted :fenced (vec (sort (:queue/fenced-protocols row #{})))
+                   :fenced-generations (vec (sort (:queue/fenced-generations row #{})))
+                   :fenced-through (:queue/fenced-through row 0))))
+
+(defn generation-inventory [srv]
+ (select-keys (protocol-inventory srv) [:generations :required-generations :unversioned-generations :fenced-generations]))
+
+(declare declaration)
+(defn registered-queues
+  "Discover existing native queue connection registrations. No process or
+   duplicate catalogue is authoritative. Undeclared read-only registrations
+   are omitted. Failed reads remain explicit blockers for release inventory."
+  []
+  (vec (keep (fn [entry]
+         (let [key (elem entry 0)]
+           (when (and (erlang/is_tuple key) (= 2 (erlang/tuple_size key))
+                      (= :bl-queue-conn (elem key 0)))
+             (let [srv (keyword (elem key 1))]
+               (try
+                 (when-let [d (declaration srv)]
+                   {:server srv :declaration d :inventory (protocol-inventory srv)
+                    :store (let [store (ds/identity-of (:store (conn srv)))]
+                             (if (:path store) {:kind :file :identity (:path store)}
+                               {:kind :memory :identity (name srv)}))})
+                 (catch _ {:server srv :status :unavailable}))))))
+        (erlang/apply :persistent_term :get (list)))))
+
+(defn declarations
+  "Read native queue producer contracts for sealed release inventory. A failed
+   store read is explicit :unavailable; never treated as an empty dependency."
+  []
+  (into {} (map (fn [row]
+           [(name (:server row))
+            (if (= :unavailable (:status row)) {:status :unavailable}
+              {:protocol (get-in row [:declaration :protocol] 1)
+               :generation (get-in row [:declaration :generation])
+               :store (:store row) :inventory (:inventory row)})])
+         (registered-queues))))
 
 (defn store-live?
   "Whether this queue's store exists right now. Public for the same reason
    `proc.table/owner` is: a test and a pane both want to ask."
   [srv]
-  (table/live? (store-name srv)))
+  (if-let [c (erlang/apply :persistent_term :get (list (conn-key srv) nil))]
+    (ds/alive? (:store c)) (table/live? (store-name srv))))
 
 (defn store-owner
   "The pid that owns this queue's store, or nil. The invariant, readable."
@@ -607,7 +692,8 @@
                               (join " " (map (fn [x] (str x)) KNOWN-ENQUEUE-OPTS)))
                          {:option k :opts opts}))))
      (let [c (conn srv)
-           d (declaration srv)]
+           d (declaration srv)
+           context (Process/get :bl_generation)]
        (when (nil? d)
          (throw (ex-info (str "queue: no declaration for \"" (name srv) "\" in the"
                               " store — start the queue once before enqueueing into"
@@ -615,8 +701,18 @@
                          {:server srv})))
        (validate-payload! d job)
        (dc/serialized! c (fn []
-       (let [protocol (:protocol opts (:protocol d 1))
-             generation (:generation opts (:generation d))
+       (let [sealed? (and (map? context) (:digest context))
+             producer (or (get (:protocols context) (name srv))
+                          (get (:protocols context) (keyword (name srv))))
+             producer-version (if (map? producer) (:protocol producer) producer)
+             _ (when (and sealed? (nil? producer-version))
+                 (throw (ex-info "Sealed generation has no queue producer contract"
+                                 {:kind :undeclared-queue-protocol :server srv})))
+             _ (when (and sealed? (:generation opts) (not= (:digest context) (:generation opts)))
+                 (throw (ex-info "Queue generation override conflicts with executing generation"
+                                 {:kind :generation-conflict :server srv})))
+             protocol (:protocol opts (or producer-version (:protocol d 1)))
+             generation (:generation opts (or (:digest context) (:generation d)))
              _ (when-not (positive-int? protocol)
                  (throw (ex-info "Invalid enqueue protocol" {:kind :invalid-protocol})))
              _ (when (and generation (not (and (string? generation) (not (empty? generation)))))
@@ -624,6 +720,10 @@
              _ (when (or (contains? (fenced-protocols c srv) protocol)
                            (<= protocol (:queue/fenced-through (datom/pull (datom/db c) '[*] [:queue/key (name srv)]) 0)))
                  (throw (ex-info "Queue protocol admissions are fenced" {:kind :protocol-fenced :protocol protocol})))
+             _ (when (and generation (contains? (:queue/fenced-generations
+                          (datom/pull (datom/db c) '[*] [:queue/key (name srv)]) #{}) generation))
+                 (throw (ex-info "Queue generation admissions are fenced"
+                                 {:kind :generation-fenced :generation generation})))
              id (identity-token)
              now (tick/wall-ms)
              at (due-at now opts)
@@ -641,7 +741,7 @@
                          :job/attempts 0
                          :job/payload job
                          :job/diagnostic-context (merge (diag/context) {:diagnostics/job-id (diag/new-id)})}
-                        (if generation {:job/generation generation} {})
+                        (if generation {:job/generation generation :job/required-generation generation} {})
                         (if (:parent-id opts) {:job/parent-id (:parent-id opts)} {})
                         (if (some? ticket) {:job/ticket ticket} {})
                         (if (some? pk) {:job/partition pk} {}))
@@ -693,6 +793,7 @@
     {:queued (of :queued)
      :running (of :running)
      :done (of :done)
+     :held (of :held)
      :failed (of :failed)
      :cancelled (of :cancelled)
      :overdue overdue
@@ -751,35 +852,176 @@
    to exercise it without a running queue."
   [c job now lease-ms]
   (let [e (:db/id job)
-        ;; a value no other claim can produce: the VM's monotonic counter beside
-        ;; the clock, so a token that survives in a store across a restart still
-        ;; cannot collide with a fresh one.
+        ;; A cryptographic token remains distinct across VM restarts; clocks and
+        ;; monotonic counters alone can collide with persisted old owners.
         token (identity-token)
-        tx (claim-tx job now lease-ms token)]
+        base (claim-tx job now lease-ms token)
+        id (or (:job/id job) (identity-token))
+        tx (when base (vec (concat base
+             (if (:job/id job) [] [[:db/add e :job/id id]])
+             (if (:job/source-id job) [] [[:db/add e :job/source-id (or (:job/ticket job) id)]])
+             (if (:job/protocol job) [] [[:db/add e :job/protocol 1]]))))]
     (when (some? tx)
-      (try
-        (datom/transact! c tx)
-        (datom/entity (datom/db c) e)
-        (catch err
-          (if (lose-race? err) nil (throw err)))))))
+      (dc/serialized! c
+        (fn []
+          ;; Preparation ran before this writer turn. An adoption must not slip
+          ;; between prepared payload and claim, including A -> B -> A receipts.
+          (let [current (datom/entity (datom/db c) e)
+                fields [:job/required-generation :job/adoption :job/adopted-payload]]
+            (when (= (select-keys current fields) (select-keys job fields))
+              (try
+                (datom/transact! c tx)
+                (datom/entity (datom/db c) e)
+                (catch err
+                  (if (lose-race? err) nil (throw err)))))))))))
+
+(defn- owns-attempt? [job claimed now]
+  (and job (= :running (:job/state job))
+       (= (:job/owner claimed) (:job/owner job))
+       (= (:job/attempt-id claimed) (:job/attempt-id job))
+       (some? (:job/owner claimed)) (> (:job/lease-until job 0) now)))
 
 (defn commit-attempt!
   "Publish database effects only while this claimed attempt still owns its
    unexpired lease. Executes in the QUEUE store's writer; tx must target this
    same connection. External effects need their own provider idempotency and
-   uncertain-outcome reconciliation. Returns a refusal without executing tx
+   uncertain-outcome reconciliation. This reports a journal commit, not fsync;
+   critical provider checkpoints use explicit sync. Returns a refusal without executing tx
    when an old worker lost ownership."
   [srv claimed tx]
   (let [c (conn srv)]
     (dc/serialized! c
       (fn []
         (let [now (tick/wall-ms) j (datom/entity (datom/db c) (:db/id claimed))]
-          (if (and j (= :running (:job/state j))
-                   (= (:job/owner claimed) (:job/owner j))
-                   (= (:job/attempt-id claimed) (:job/attempt-id j))
-                   (some? (:job/owner claimed)) (> (:job/lease-until j 0) now))
+          (if (owns-attempt? j claimed now)
             {:status :committed :report (datom/transact! c tx)}
             {:status :refused :kind :stale-attempt}))))))
+
+(defn- effect-pending? [job]
+  (some (fn [effect] (not= :complete (:state effect))) (vals (:job/effects job))))
+
+(defn- effect-transition!
+  [srv claimed step transition]
+  (when-not (or (keyword? step) (and (string? step) (> (count step) 0) (<= (count step) 128)))
+    (throw (ex-info "Effect step must be a keyword or short nonempty string" {:kind :invalid-effect})))
+  (let [c (conn srv)]
+    (dc/serialized! c
+      (fn []
+        (let [job (datom/entity (datom/db c) (:db/id claimed))]
+          (if-not (owns-attempt? job claimed (tick/wall-ms))
+            {:status :refused :kind :stale-attempt}
+            (let [[result effect] (transition (get (:job/effects job) step) job)]
+              (when effect
+                (datom/transact! c [[:db/add (:db/id claimed) :job/effects
+                                    (assoc (:job/effects job {}) step effect)]]))
+              (assoc result :durability (sync-checkpoint! c)))))))))
+
+(defn begin-effect!
+  "Persist intent BEFORE provider submission. Returns :submit only for a fresh
+   intent or an explicit provider-confirmed absence; repeated/unknown intents
+   return :reconcile. Use the stable effect-id as provider idempotency key.
+   A lost response never authorizes automatic resubmission."
+  [srv claimed step]
+  (effect-transition! srv claimed step
+    (fn [prior job]
+      (let [id (or (:effect-id prior)
+                   (Base/encode16 (erlang/apply :crypto :hash
+                     (list :sha256 (erlang/term_to_binary [(:job/id job) step])))))]
+        (cond
+          (= :complete (:state prior)) [{:status :complete :effect prior} nil]
+          (or (nil? prior) (= :absent (:state prior)))
+            (let [effect {:state :intent :effect-id id :attempt-id (:job/attempt-id claimed)}]
+              [{:status :submit :effect-id id} effect])
+          :else [{:status :reconcile :effect prior :effect-id id} nil])))))
+
+(defn record-effect!
+  "Record a provider receipt or uncertain response under the current attempt.
+   :submitted/:uncertain require subsequent reconciliation; :complete releases
+   the checkpoint. Receipts are bounded durable data, not emitted as UI/logs."
+  [srv claimed step state receipt]
+  (when-not (and (contains? #{:submitted :uncertain :complete} state) (map? receipt)
+                (<= (erlang/byte_size (erlang/term_to_binary receipt)) 65536))
+    (throw (ex-info "Invalid bounded provider receipt" {:kind :invalid-effect})))
+  (effect-transition! srv claimed step
+    (fn [prior _]
+      (when-not prior (throw (ex-info "Provider effect requires prior durable intent" {:kind :missing-effect-intent})))
+      (when (and (= :complete (:state prior)) (not= :complete state))
+        (throw (ex-info "Completed provider effects cannot regress" {:kind :effect-regression})))
+      (let [next (assoc prior :state state :receipt receipt :recorded-by (:job/attempt-id claimed))]
+        [{:status :recorded :effect next} next]))))
+
+(defn reconcile-effect!
+  "Persist the result of an explicit provider lookup. :absent is the only
+   transition that permits another submission; :submitted/:complete retain
+   provider receipts. The caller must actually reconcile using the effect-id,
+   never infer absence merely from a timeout or deployment revision."
+  [srv claimed step outcome receipt]
+  (when-not (and (contains? #{:absent :submitted :complete} outcome) (map? receipt)
+                (<= (erlang/byte_size (erlang/term_to_binary receipt)) 65536))
+    (throw (ex-info "Invalid provider reconciliation" {:kind :invalid-effect})))
+  (effect-transition! srv claimed step
+    (fn [prior _]
+      (when-not prior (throw (ex-info "Reconciliation needs prior intent" {:kind :missing-effect-intent})))
+      (when (and (= :complete (:state prior)) (not= :complete outcome))
+        (throw (ex-info "Completed provider effects cannot regress" {:kind :effect-regression})))
+      (let [next (assoc prior :state outcome :receipt receipt :recorded-by (:job/attempt-id claimed))]
+        [{:status :reconciled :effect next} next]))))
+
+(defn effects
+  "Read durable provider checkpoints with the queue stopped."
+  [srv id] (:job/effects (datom/entity (datom/db (conn srv)) id) {}))
+
+(defn adopt-generation!
+  "Explicit sealed payload migration for non-running retained work. Original
+   producer generation/protocol/payload stay unchanged. Persist converted payload,
+   target dispatch generation and exact migration digest together in the writer.
+   Pure upcast/check callbacks run outside the writer under a bounded fence.
+   No pending provider effect may be reinterpreted by a code adoption."
+  [srv id expected-generation target-generation spec]
+  (when-not (and (string? expected-generation) (string? target-generation)
+                (not (empty? target-generation)) (positive-int? (:protocol spec))
+                (string? (:digest spec)) (= 64 (count (:digest spec)))
+                (every? (fn [ch] (includes? "0123456789abcdefABCDEF" ch)) (String/graphemes (:digest spec)))
+                (erlang/is_function (:upcast spec) 1) (erlang/is_function (:accept? spec) 1))
+    (throw (ex-info "Generation adoption requires sealed identity and payload contract" {:kind :invalid-adoption})))
+  (let [c (conn srv) before (datom/entity (datom/db c) id)
+        prior (:job/adoption before)
+        already? (and (= target-generation (:job/required-generation before))
+                      (= expected-generation (:from prior))
+                      (= (:protocol spec) (:protocol prior))
+                      (= (:digest spec) (:digest prior)))]
+    (if already?
+      (dc/serialized! c
+        (fn []
+          (if (= prior (:job/adoption (datom/entity (datom/db c) id)))
+            {:status :already-applied :adoption prior :durability (sync-checkpoint! c)}
+            {:status :refused :kind :stale-adoption})))
+      (let [prepared (fence/fence-fn 250
+                       (fn [] (let [payload ((:upcast spec) (:job/adopted-payload before (:job/payload before)))]
+                                (when-not (= true ((:accept? spec) payload))
+                                  (throw (ex-info "Adopted payload violates target contract" {:kind :invalid-message})))
+                                payload)))]
+        (if-not (contains? prepared :ok) {:status :refused :kind :invalid-adoption-payload}
+          (dc/serialized! c
+            (fn []
+              (let [job (datom/entity (datom/db c) id)
+                    source (:job/required-generation job (:job/generation job))
+                    receipt {:digest (:digest spec) :from expected-generation :to target-generation
+                             :protocol (:protocol spec)}]
+                (cond
+                  (or (nil? job) (not= source expected-generation) (not= job before))
+                    {:status :refused :kind :stale-adoption}
+                  (not (contains? #{:queued :failed :held} (:job/state job)))
+                    {:status :refused :kind :active-or-terminal-job}
+                  (effect-pending? job) {:status :refused :kind :provider-effect-pending}
+                  (contains? (:queue/fenced-generations
+                    (datom/pull (datom/db c) '[*] [:queue/key (name srv)]) #{}) target-generation)
+                    {:status :refused :kind :generation-fenced}
+                  :else
+                    (do (datom/transact! c [[:db/add id :job/required-generation target-generation]
+                                           [:db/add id :job/adopted-payload (:ok prepared)]
+                                           [:db/add id :job/adoption receipt]])
+                        {:status :adopted :adoption receipt :durability (sync-checkpoint! c)}))))))))))
 
 (defn retry!
   "Explicitly retry a failed/held job IN PLACE, preserving source/protocol,
@@ -801,6 +1043,7 @@
               [[:db/cas id :job/state (:job/state j) :queued]
                [:db/add id :job/retry-base (:job/attempts j 0)]
                [:db/add id :job/at (tick/wall-ms)]]
+              (if (:job/owner j) [[:db/retract id :job/owner (:job/owner j)]] [])
               (if (:job/finished-at j) [[:db/retract id :job/finished-at (:job/finished-at j)]] [])
               (if ticket [[:db/add id :job/ticket ticket]] []))))
             (datom/entity (datom/db c) id)))))))
@@ -934,10 +1177,12 @@
   (when-not (erlang/is_integer cutoff)
     (throw (ex-info (str "queue: prune! takes an epoch-ms cutoff — got " (str cutoff))
                     {:server srv :cutoff cutoff})))
-  (let [c (conn srv)
-        d (datom/db c)
+  (let [c (conn srv)]
+   (dc/serialized! c (fn []
+    (let [d (datom/db c)
         doomed (vec (filter (fn [row]
                               (and (contains? TERMINAL-STATES (second row))
+                                   (not (effect-pending? (datom/entity d (first row))))
                                    (<= (nth row 2) cutoff)))
                             (datom/q '[:find ?e ?s ?fin
                                        :where [?e :job/state ?s]
@@ -952,7 +1197,7 @@
                              (assoc m (second row) (inc (get m (second row) 0))))
                            {}
                            doomed)
-         :ids (vec (map first doomed))}))))
+         :ids (vec (map first doomed))})))))))
 
 ;; ── the loop ────────────────────────────────────────────────────────────
 ;;
@@ -1076,7 +1321,8 @@
 
 (defn- prepare-payload [q job]
   (let [target (get-in q [:decl :protocol] 1) contract (:contract q {})]
-    (loop [version (:job/protocol job 1) payload (:job/payload job) seen #{}]
+    (loop [version (get-in job [:job/adoption :protocol] (:job/protocol job 1))
+           payload (:job/adopted-payload job (:job/payload job)) seen #{}]
       (cond
         (= version target)
           (if (or (nil? (:accept? contract)) (= true ((:accept? contract) payload)))
@@ -1109,8 +1355,13 @@
         c (conn (:server q))
         now ((:clock q))
         decl (:decl q)
-        prepared (let [r (fence/fence-fn 250 (fn [] (prepare-payload q job)))]
-                   (:ok r))
+        required (:job/required-generation job (:job/generation job))
+        generation-compatible? (or (nil? required) (= required (:generation decl)))
+        prepared (when generation-compatible?
+                   (if (and (= (get-in job [:job/adoption :protocol] (:job/protocol job 1)) (:protocol decl 1))
+                          (nil? (get-in q [:contract :accept?])))
+                   {:payload (:job/adopted-payload job (:job/payload job)) :protocol (:protocol decl 1)}
+                   (let [r (fence/fence-fn 250 (fn [] (prepare-payload q job)))] (:ok r))))
         claimed (when prepared (claim! c job now (* 1000 (:lease decl))))]
     (when (some? claimed)
       (let [ref (erlang/make_ref)
@@ -1150,6 +1401,9 @@
         ticket (when (some? (:job/ticket job))
                  [[:db/retract e :job/ticket (:job/ticket job)]])
         with-ticket (fn [ops] (vec (concat guard ops ticket)))]
+    (if (effect-pending? job)
+      (vec (concat guard [[:db/add e :job/state :held]
+                         [:db/add e :job/last-error "Provider effect requires reconciliation"]]))
     (if (contains? out :ok)
       (with-ticket [[:db/add e :job/state :done]
                     [:db/add e :job/result (:ok out)]
@@ -1165,27 +1419,22 @@
                         [:db/add e :job/state :failed]
                         [:db/add e :job/last-error err]
                         [:db/add e :job/finished-at now]])
-          (with-ticket [[:db/add e :job/last-failure (diag/safe-error {:kind (get-in out [:failure :diagnostics/error-kind])})]
+          (vec (concat guard [[:db/add e :job/last-failure (diag/safe-error {:kind (get-in out [:failure :diagnostics/error-kind])})]
                         [:db/add e :job/state :queued]
                         [:db/add e :job/at (+ now (backoff-ms (:retry decl) attempts))]
-                        [:db/add e :job/last-error err]]))))))
+                        [:db/add e :job/last-error err]]))))))))
 
 (defn- settle!
   [st entry out]
-  (let [q (:queue st)
-        c (conn (:server q))
-        now ((:clock q))
-        e (:e entry)
-        decl (:decl q)
-        job (datom/entity (datom/db c) e)]
-    (if (nil? job)
-      :gone
-      (let [tx (outcome-tx e job (:token entry) out now decl (:attempts entry))]
-        (try
-          (datom/transact! c tx)
-          :settled
-          (catch err
-            (if (lose-race? err) :lost (throw err))))))))
+  (let [q (:queue st) c (conn (:server q))]
+    (dc/serialized! c
+      (fn []
+        (let [now ((:clock q)) e (:e entry) decl (:decl q)
+              job (datom/entity (datom/db c) e)]
+          (if (nil? job) :gone
+            (let [tx (outcome-tx e job (:token entry) out now decl (:attempts entry))]
+              (try (datom/transact! c tx) :settled
+                   (catch err (if (lose-race? err) :lost (throw err)))))))))))
 
 (defn settle
   "Record one worker's outcome and stop tracking it. A ref this process is not
@@ -1295,8 +1544,12 @@
   ([srv decl clock] (init-state srv decl clock {}))
   ([srv decl clock contract]
   (announce! srv)
-  (ensure-store! srv)
-  (let [d (normalise-decl decl)
+  (let [context (Process/get :bl_generation)
+        declared (normalise-decl decl)
+        _ (when (and (:digest context) (:generation declared)
+                     (not= (:digest context) (:generation declared)))
+            (throw (ex-info "Queue generation conflicts with executing sealed code" {:kind :generation-conflict})))
+        d (assoc declared :generation (or (:digest context) (:generation declared)))
         registration (perform-registration srv)
         contract (validate-contract! (merge (:contract registration) contract))
         body (:perform registration)
