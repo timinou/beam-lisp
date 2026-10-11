@@ -26,6 +26,12 @@ if [ -f "$target" ]; then
 fi
 
 best=0.0; bestfile="(no dynamic glibc ELF)"
+# The executable launcher is outside the payload and may have a higher floor.
+# Inspect it too: checking only unpacked files can approve an unstartable drop.
+if [ -f "$target" ]; then
+  v=$(readelf -V --wide "$target" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' | sed 's/GLIBC_//' | sort -t. -k2 -n | tail -1)
+  if [ -n "$v" ]; then best=$v; bestfile="(launcher)"; fi
+fi
 # every regular file whose first bytes are the ELF magic
 for f in $(find "$dir" -type f -size +0); do
   [ "$(head -c4 "$f" | od -An -c | tr -d ' \n')" = '177ELF' ] || continue
