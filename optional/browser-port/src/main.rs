@@ -15,6 +15,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tungstenite::{connect, stream::MaybeTlsStream, Message, WebSocket};
+mod recording;
 type Result<T> = std::result::Result<T, String>;
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 fn err(e: impl std::fmt::Display) -> String {
@@ -121,6 +122,8 @@ struct Session {
     ws: Option<WebSocket<MaybeTlsStream<TcpStream>>>,
     seq: u64,
     info: Value,
+    address: String,
+    recording: Option<recording::Recording>,
 }
 impl Session {
     fn cdp(&mut self, method: &str, params: Value, session_id: Option<&str>) -> Result<Value> {
@@ -147,6 +150,10 @@ impl Session {
         }
     }
     fn stop(&mut self) -> Result<Value> {
+        // Finalize media before closing the target that supplies its frames.
+        if let Some(recording) = self.recording.take() {
+            recording.stop()?;
+        }
         // Browser.close flushes the actual profile (cookies, preferences, tabs).
         let requested = self.cdp("Browser.close", json!({}), None).is_ok();
         self.ws = None;
@@ -180,6 +187,9 @@ impl Session {
         Ok(json!({"saved":true}))
     }
     fn reap(&mut self) {
+        if let Some(recording) = self.recording.take() {
+            let _ = recording.stop();
+        }
         for c in self.children.iter_mut().rev() {
             if c.try_wait().ok().flatten().is_none() {
                 unsafe {
@@ -389,6 +399,8 @@ fn launch(v: &Value) -> Result<Session> {
         ws: None,
         seq: 0,
         info: Value::Null,
+        address: String::new(),
+        recording: None,
     };
     let (width, height) = (
         v["width"].as_u64().unwrap_or(1280),
@@ -463,6 +475,7 @@ fn launch(v: &Value) -> Result<Session> {
                                 .map_err(err)?;
                         }
                         s.ws = Some(ws);
+                        s.address = address;
                         s.info = json!({"pid":s.children.last().unwrap().id(),"cdp":format!("http://127.0.0.1:{port}"),"vncSocket":socket,"display":display,"displayBackend":backend,"profile":profile});
                         return Ok(s);
                     }
@@ -552,6 +565,30 @@ fn main() {
                     .unwrap_or(json!({})),
                 value["sessionId"].as_str(),
             ),
+            "record-start" => {
+                let s = session.as_mut().ok_or("not launched")?;
+                if s.recording.is_some() {
+                    return Err("already recording".into());
+                }
+                let recording = recording::Recording::start(&s.address, &value, &s.runtime)?;
+                let info = recording.info();
+                s.recording = Some(recording);
+                Ok(info)
+            }
+            "record-info" => Ok(session
+                .as_ref()
+                .ok_or("not launched")?
+                .recording
+                .as_ref()
+                .ok_or("not recording")?
+                .info()),
+            "record-stop" => session
+                .as_mut()
+                .ok_or("not launched")?
+                .recording
+                .take()
+                .ok_or("not recording")?
+                .stop(),
             "forget" => {
                 let profile = PathBuf::from(field(&value, "profile")?);
                 if !profile.is_absolute()

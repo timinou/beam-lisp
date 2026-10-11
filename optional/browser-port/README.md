@@ -62,6 +62,17 @@ error. Diagnostics stay in private runtime files, not protocol stdout.
 - `info` checks all owned processes.
 - `cdp` takes Chromium's `method`, optional `params` and flattened `sessionId`.
   Unmatched events are consumed; this is not an event subscription API.
+- `record-start` takes `targetId`, a new absolute MP4 `path`, even viewport
+  `width`/`height`, `fps` (1–60, default 30) and an explicit `ffmpeg` executable.
+  A separate native CDP connection continuously consumes and acknowledges
+  `Page.screencastFrame` events, including while the caller waits. A bounded
+  latest-frame buffer feeds a wall-clock-paced encoder. Static content holds
+  its real duration. No `Page.captureScreenshot` polling is involved.
+- `record-info` reports elapsed capture time and actual incoming frame count;
+  `record-stop` finalizes the movie and records frame timestamps/metadata in
+  `.frames.jsonl` and capture statistics in `.recording.json`. Partial media
+  stays unpublished as `.pending.mp4`. Stop/EOF also finalize an active take;
+  abrupt helper death cannot acknowledge a completed movie.
 - `stop` requests `Browser.close`, waits for a successful browser exit, reaps
   display/stream process groups, and acknowledges `saved` only on clean closure.
 - `forget` deletes only a marked managed profile after acquiring its writer lock;
@@ -136,6 +147,14 @@ Run the headed integration with `BL_BROWSER_PORT`, `CHROMIUM`, `SWAY` and
 ```sh
 ./bin/bl test -p optional/browser-port/bl optional/browser-port/test/film_test.bl
 ```
+
+`page/record!`, `recording`, and `stop-recording!` expose the native continuous
+recorder separately from `screenshot!`. `show-cursor!` opts into a visible
+pointer driven only by trusted browser pointer/drag events: screencasts omit
+the OS pointer. `drag!` dispatches real CDP input over elapsed time; it does not
+dispatch synthetic DOM drag events or manufacture a film-only pointer path.
+`optional/browser-port/test/recording_test.bl` verifies animated frames arrive
+without scenario actions/screenshots, trusted drag input, and a decodable movie.
 
 ## Demo tests
 
