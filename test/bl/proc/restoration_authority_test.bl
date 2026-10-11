@@ -1,0 +1,69 @@
+(ns proc.restoration-authority-test
+ (:require [proc.queue :as q] [proc.queue-runtime :as runtime]
+           [datom.conn :as dc] [datom.store-map :as sm]))
+
+(defn handler [srv digest]
+ (runtime/prepare srv {:declaration {:of :test/restoration :generation digest}
+                       :perform (fn [_] :ok)}))
+(defn result-kind [f] (try (f) (catch e (:kind (ex-data e)))))
+
+(deftest competing-stagers-have-one-authority-and-stale-cleanup-is-harmless
+ (let [srv :stage-competing qh (handler srv "stage-v1") parent (erlang/self)
+       workers (mapv (fn [_]
+                       (erlang/spawn (fn []
+                         (let [result (result-kind #(runtime/restore! srv "stage-v1" [qh]))]
+                          (erlang/send parent [:stage-result (erlang/self) result])
+                          (receive [:release] :ok))))) (range 2))
+       results (mapv (fn [_] (receive [:stage-result pid result] [pid result])) (range 2))
+       winner (first (filter #(map? (second %)) results))
+       old (second winner)]
+  (try
+   (is (= 1 (count (filter #(map? (second %)) results))))
+   (is (= [:restoration-already-bound] (mapv second (filter #(not (map? (second %))) results))))
+   (runtime/release-restoration! old)
+   (let [new (runtime/restore! srv "stage-v1" [qh])]
+    (try
+     (runtime/release-restoration! old)
+     (is (= :restoration-already-bound (result-kind #(runtime/restore! srv "stage-v1" [qh]))))
+     (finally (runtime/release-restoration! new))))
+   (finally (doseq [pid workers] (erlang/send pid [:release]))))))
+
+(deftest dead-stager-can-be-reclaimed-without-erasing-replacement
+ (let [srv :stage-dead qh (handler srv "dead-v1") parent (erlang/self)
+       pid (erlang/spawn (fn [] (erlang/send parent [:dead-stage (runtime/restore! srv "dead-v1" [qh])])) )
+       old (receive [:dead-stage token] token)]
+  (loop [] (when (Process/alive? pid) (Process/sleep 1) (recur)))
+  (let [replacement (runtime/restore! srv "dead-v1" [qh])]
+   (try
+    (is (not= (:ticket old) (:ticket replacement)))
+    (runtime/release-restoration! old)
+    (is (= :restoration-already-bound (result-kind #(runtime/restore! srv "dead-v1" [qh]))))
+    (finally (runtime/release-restoration! replacement))))))
+
+(defn in-app [app action]
+ (let [before (Process/get :bl_generation)]
+  (try (Process/put :bl_generation {:application-id app}) (action)
+       (finally (Process/put :bl_generation before)))))
+
+(deftest application-queue-identities-are-pinned-and-never-fall-back
+ (let [a (in-app "alpha" #(handler :imports "a-v1"))
+       b (in-app "beta" #(handler :imports "b-v1"))
+       ca (dc/connect-with (sm/open) []) cb (dc/connect-with (sm/open) [])]
+  (is (= :imports (q/resolve-server :imports)))
+  (is (= :blq.alpha__imports (:server a)))
+  (is (= :blq.beta__imports (:server b)))
+  (is (= "imports" (q/logical-name (:server a))))
+  (is (= "alpha" (q/application-id (:server a))))
+  (is (= :queue-application-mismatch (in-app "alpha" #(result-kind (fn [] (q/conn (:server b)))))))
+  (q/attach-store! (:server a) ca) (q/attach-store! (:server b) cb)
+  (let [pa (runtime/start! a) pb (runtime/start! b)]
+   (try
+    (is (not= pa pb))
+    (is (= ca (in-app "alpha" #(q/conn :imports))))
+    (is (= cb (in-app "beta" #(q/conn :imports))))
+    (is (= "a-v1" (:generation (runtime/status (:server a)))))
+    (is (= "b-v1" (:generation (runtime/status (:server b)))))
+    (is (= #{:blq.alpha__imports} (in-app "alpha" #(set (map :server (q/registered-queues))))))
+    (is (= :stopped (:status (runtime/stop! (:server a)))))
+    (is (= "b-v1" (:generation (runtime/status (:server b)))))
+    (finally (runtime/stop! (:server a)) (runtime/stop! (:server b)))))))

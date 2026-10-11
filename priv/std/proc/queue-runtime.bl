@@ -5,11 +5,11 @@
            [datom :as d] [datom.conn :as dc] [datom.store :as ds] [core]))
 
 (defn- refuse [kind] (throw (ex-info "Queue runtime transition refused" {:kind kind})))
-(defn- registry-key [srv] (tuple :bl-queue-runtime (name srv)))
-(defn- restoration-key [srv] (tuple :bl-queue-restoration (name srv)))
+(defn- registry-key [srv] (tuple :bl-queue-runtime (q/server-name srv)))
+(defn- restoration-key [srv] (tuple :bl-queue-restoration (q/server-name srv)))
 (defn- context-protocol [context srv]
- (let [p (or (get (:protocols context) (name srv))
-             (get (:protocols context) (keyword (name srv))))]
+ (let [p (or (get (:protocols context) (q/logical-name srv))
+             (get (:protocols context) (keyword (q/logical-name srv))))]
   (if (map? p) (:protocol p) p)))
 
 (defn prepare
@@ -18,7 +18,8 @@
   resolution occurs during publication. Explicit callback modules retain wrapper
   dependencies, and the current generation's entire physical graph is retained."
  [srv spec]
- (let [context (Process/get :bl_generation)
+ (let [srv (q/resolve-server srv)
+       context (Process/get :bl_generation)
        declared (q/normalise-decl (:declaration spec))
        generation (or (:digest context) (:generation declared))
        decl (assoc declared :generation generation)
@@ -91,7 +92,7 @@
      [{:status :already-applied :generation target :durability (sync (q/conn srv))} st]
      [{:status :refused :kind :identity-conflict} st])
    (not= expected now) [{:status :refused :kind :stale-generation} st]
-   (not= (name srv) (name (:server handler))) [{:status :refused :kind :wrong-queue} st]
+   (not= (q/server-name srv) (q/server-name (:server handler))) [{:status :refused :kind :wrong-queue} st]
    (not= (fixed-shape (:decl current)) (fixed-shape (:decl handler)))
     [{:status :refused :kind :queue-identity-migration-required} st]
    (not= (:clock current) (:clock handler))
@@ -110,8 +111,8 @@
                          (fn []
                           (when (contains? (:fenced-generations (q/generation-inventory srv)) target)
                            (refuse :generation-fenced))
-                          (d/transact! c [{:db/id -1 :queue/key (name srv)
-                              :queue/decl (assoc (:decl handler) :server (name srv))}])
+                          (d/transact! c [{:db/id -1 :queue/key (q/server-name srv)
+                              :queue/decl (assoc (:decl handler) :server (q/server-name srv))}])
                           (sync c)))
             after (assoc st :queue
                     (merge current (select-keys installed [:decl :perform :clock :contract :environment])
@@ -188,61 +189,75 @@
 (defn- owner-pid [srv]
  (when-not (ready? srv) (refuse :owner-transition-authority-required))
  (Process/whereis (q/op-name srv)))
+(defn- with-restoration [srv action]
+ (BeamLisp.Env/with_generation_lock (tuple :queue-restoration (q/server-name srv)) action))
+(defn- stage [srv]
+ (let [token (erlang/apply :persistent_term :get (list (restoration-key srv) nil))]
+  (if (and token (not (Process/alive? (:owner token))))
+   (do
+    (erlang/apply :persistent_term :erase (list (restoration-key srv)))
+    (BeamLisp.Env/release_code! (:lease token))
+    nil)
+   token)))
+
 (defn restore!
- "Stage directly prepared old/candidate handlers before the selected sealed
-  initializer starts queues. The live activation journal supplies target identity;
-  callbacks are prepared under their own immutable generations. Startup chooses
-  the actual durable declaration and restores every required generation. A live
-  native code lease protects staging until the owner acquires independent leases."
+ "Stage sealed handlers under this queue's native admission authority. Competing
+  stagers serialize; a dead stager's exact lease is reclaimed on the next turn.
+  Startup consumption and stale cleanup use the same per-queue authority."
  [srv target handlers]
- (when (or (q/serving? srv)
-           (erlang/apply :persistent_term :get (list (restoration-key srv) nil)))
-  (refuse :restoration-already-bound))
- (let [by-generation (into {} (map (fn [handler]
-                              (when-not (= (name srv) (name (:server handler))) (refuse :wrong-queue))
-                              [(get-in handler [:decl :generation]) handler]) handlers))
-       _ (when-not (and (= (count handlers) (count by-generation))
-                         (contains? by-generation target)) (refuse :invalid-restoration-inventory))
-       _ (when-not (apply = (map #(fixed-shape (:decl %)) handlers)) (refuse :queue-identity-migration-required))
-       lease (BeamLisp.Env/retain_code! (to-list (distinct (mapcat :modules handlers))))
-       token {:server srv :target target :handlers by-generation :lease lease}]
-  (erlang/apply :persistent_term :put (list (restoration-key srv) token))
-  token))
+ (let [srv (q/resolve-server srv)]
+  (with-restoration srv
+   (fn []
+    (when (or (q/serving? srv) (stage srv)) (refuse :restoration-already-bound))
+    (let [by-generation (into {} (map (fn [handler]
+                                  (when-not (= (q/server-name srv) (q/server-name (:server handler))) (refuse :wrong-queue))
+                                  [(get-in handler [:decl :generation]) handler]) handlers))
+          _ (when-not (and (= (count handlers) (count by-generation))
+                            (contains? by-generation target)) (refuse :invalid-restoration-inventory))
+          _ (when-not (apply = (map #(fixed-shape (:decl %)) handlers)) (refuse :queue-identity-migration-required))
+          lease (BeamLisp.Env/retain_code! (to-list (distinct (mapcat :modules handlers))))
+          token {:server srv :target target :handlers by-generation :lease lease
+                 :owner (erlang/self) :ticket (erlang/make_ref)}]
+     (erlang/apply :persistent_term :put (list (restoration-key srv) token))
+     token)))))
 
 (defn release-restoration!
- "Release an exact unconsumed restoration stage. Stale cleanup cannot remove
-  a newer stage. Published queue owners hold independent callback leases."
+ "Release only the exact unconsumed stage under its queue authority. Cleanup
+  cannot remove a newer stage; live owners have independent callback leases."
  [token]
- (when (= token (erlang/apply :persistent_term :get (list (restoration-key (:server token)) nil)))
-  (erlang/apply :persistent_term :erase (list (restoration-key (:server token)))))
- (BeamLisp.Env/release_code! (:lease token))
- :released)
+ (with-restoration (:server token)
+  (fn []
+   (when (= token (erlang/apply :persistent_term :get (list (restoration-key (:server token)) nil)))
+    (erlang/apply :persistent_term :erase (list (restoration-key (:server token))))
+    (BeamLisp.Env/release_code! (:lease token)))
+   :released)))
 
 (defn start!
- "Start the shared native queue scaffold. Attach the persistent store first.
-  A staged restoration automatically chooses the journaled current declaration
-  and restores handlers required by accepted jobs before candidate publication."
+ "Consume restoration and start the native owner in one per-queue admission
+  turn. A failed start retains the stage for recovery while its stager lives."
  ([handler] (start! handler {}))
  ([handler opts]
-  (let [srv (:server handler)
-        stage (erlang/apply :persistent_term :get (list (restoration-key srv) nil))
-        start-owner (fn []
-          (let [current (:generation (q/declaration srv) (get-in handler [:decl :generation]))
-                by-generation (if stage (:handlers stage)
-                               (into {(get-in handler [:decl :generation]) handler}
-                                 (map (fn [h] [(get-in h [:decl :generation]) h]) (:retained opts []))))
-                chosen (get by-generation current)
-                _ (when-not chosen (refuse :restart-generation-mismatch))
-                retained (vec (vals (dissoc by-generation current)))]
-           (core/start owner {:handler chosen :retained retained} (dissoc opts :retained))))]
-   (if stage
-    (do
-     (when-not (= (:target stage) (get-in handler [:decl :generation])) (refuse :restoration-target-mismatch))
-     (let [pid (BeamLisp.Env/run_code! (:lease stage) start-owner)]
-      (when (= :cancelled pid) (refuse :expired-restoration-lease))
-      (release-restoration! stage)
-      pid))
-    (start-owner)))))
+  (let [srv (:server handler)]
+   (with-restoration srv
+    (fn []
+     (let [staged (stage srv)
+           start-owner (fn []
+             (let [current (:generation (q/declaration srv) (get-in handler [:decl :generation]))
+                   by-generation (if staged (:handlers staged)
+                                  (into {(get-in handler [:decl :generation]) handler}
+                                    (map (fn [h] [(get-in h [:decl :generation]) h]) (:retained opts []))))
+                   chosen (get by-generation current)
+                   _ (when-not chosen (refuse :restart-generation-mismatch))
+                   retained (vec (vals (dissoc by-generation current)))]
+              (core/start owner {:handler chosen :retained retained} (dissoc opts :retained))))]
+      (if staged
+       (do
+        (when-not (= (:target staged) (get-in handler [:decl :generation])) (refuse :restoration-target-mismatch))
+        (let [pid (BeamLisp.Env/run_code! (:lease staged) start-owner)]
+         (when (= :cancelled pid) (refuse :expired-restoration-lease))
+         (release-restoration! staged)
+         pid))
+       (start-owner))))))))
 (defn activate! [srv expected handler]
  (GenServer/call (owner-pid srv) [:proc.queue-runtime/activate expected handler] 30000))
 (defn retire! [srv generation]
