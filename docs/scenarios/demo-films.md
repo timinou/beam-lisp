@@ -8,13 +8,13 @@ run; write the film's narration for the people watching it.
 (def demo
   (film/from-run run
     [{:id "review" :source "/absolute/evidence/review.png"
-      :title "Compare the source and the document"
-      :say "Find the amount that needs your attention."
+      :title "Comparer la source et le document"
+      :say "Repérez le montant qui demande votre attention."
       :camera [{:at 0 :zoom 1 :x 0.5 :y 0.5}
                {:at 2 :zoom 1.4 :x 0.8 :y 0.4}]
       :cursor [{:at 0 :x 0.5 :y 0.5}
                {:at 1 :x 0.8 :y 0.4 :click true}]}]
-    {:title "Review a document" :voice "aura-2-hector-fr" :language "fr"}))
+    {:title "Relire un document" :voice "aura-2-hector-fr" :language "fr"}))
 (film/export! demo "/absolute/demo" {:env-file "/private/project/.env"})
 ```
 
