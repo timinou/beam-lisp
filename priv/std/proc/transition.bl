@@ -2,7 +2,7 @@
 ; belong to the deployment coordinator; native owners remain authoritative.
 (ns proc.transition
  (:require [proc.queue-runtime :as runtime] [proc.queue :as queue]
-           [proc.evolve :as evolve] [proc.fence :as fence] [datom.conn :as dc] [datom :as d]))
+           [proc.evolve :as evolve] [proc.fence :as fence] [datom.conn :as dc] [datom :as d] [datom.db :as db] [datom.attr-basis :as ab]))
 
 (defn- refuse [kind] (throw (ex-info "Process transition refused" {:kind kind})))
 (defn prepare!
@@ -13,6 +13,8 @@
   migration {:digest :protocol :upcast :accept?}. No failed jobs are retried.
   The coordinator reconstructs this plan from the sealed artifact after restart."
  [spec]
+ (when (> (+ (count (:queues spec {})) (count (:owners spec {}))) 128)
+  (refuse :transition-inventory-too-large))
  (let [generation (Process/get :bl_generation) digest (:digest generation)
        _ (when-not (and (string? digest) (seq digest)) (refuse :sealed-generation-required))
        queues (into {} (map (fn [[srv descriptor]]
@@ -53,21 +55,32 @@
   {:generation digest :queues queues :owners owners :lease lease :closed (atom false)}))
 
 (defn- live! [plan] (when @(:closed plan) (refuse :closed-transition)))
+(defn- inventory-proof [c database]
+ ;; These are committed WRITE markers, never reader hints/in-flight markers.
+ ;; Journal-only writes on a shared store must not invalidate queue pagination.
+ (let [attrs (mapv :db/ident queue/SCHEMA)]
+  {:inventory-marks (select-keys (ab/committed-marks (:store c)) attrs)
+   :schema-digest (erlang/apply :crypto :hash (list :sha256 (erlang/term_to_binary (select-keys (db/schema-of database) attrs) (list :deterministic))))}))
+(defn- same-inventory? [receipt proof]
+ (and (= (:inventory-marks receipt) (:inventory-marks proof))
+      (= (:schema-digest receipt) (:schema-digest proof))))
 (defn- queue-validation [srv entry opts]
+ (let [authority (runtime/rehearse! srv (:expected entry) (:handler entry))]
+ (when-not (= :ready (:status authority)) (refuse (:kind authority :stale-runtime-authority)))
  (if-not (:adoption entry)
-  {:status :valid :scope :retained-old-handler :validated 0}
+  {:status :valid :scope :retained-old-handler :validated 0 :scanned 1}
   (let [c (queue/conn srv) cursor (get (:after opts {}) srv)
         snapshot (dc/serialized! c
                    (fn []
-                    (let [db (d/db c) basis (d/basis-t db)]
-                     (when (and cursor (not= (:basis cursor) basis)) (refuse :stale-validation-inventory))
+                    (let [db (d/db c) basis (d/basis-t db) proof (inventory-proof c db)]
+                     (when (and cursor (not (same-inventory? cursor proof))) (refuse :stale-validation-inventory))
                      (let [page (d/attribute-page db :job/state (:after-eid cursor) (:limit opts 100))]
-                      {:basis basis :after-eid (:after-eid page) :more? (:more? page) :scanned (count (:datoms page))
+                      (merge proof {:basis basis :after-eid (:after-eid page) :more? (:more? page) :scanned (count (:datoms page))
                        :jobs (vec (keep (fn [datom]
                                          (let [job (d/entity db (d/datom-e datom))]
                                           (when (and (nil? (queue/adoption-blocker job))
                                                      (= (:expected entry) (:job/required-generation job (:job/generation job)))) job)))
-                                       (:datoms page)))}))))
+                                       (:datoms page)))})))))
         prior (BeamLisp.Env/capture)
         result (try
                 (BeamLisp.Env/bind (get-in entry [:handler :environment]))
@@ -85,30 +98,80 @@
                 (finally (BeamLisp.Env/bind prior)))]
    (if-not (contains? result :ok)
     {:status :refused :kind (if (:timeout result) :rehearsal-deadline :invalid-adoption-payload)}
-    {:status (if (:more? snapshot) :more :valid) :scope :observed-queue-basis
-     :basis (:basis snapshot) :after-eid (:after-eid snapshot) :more? (:more? snapshot)
-     :validated (count (:jobs snapshot)) :preserved (- (:scanned snapshot) (count (:jobs snapshot))) :jobs (mapv :job/id (:jobs snapshot))}))))
+    {:status (if (:more? snapshot) :more :valid) :scope :observed-queue-inventory
+     :basis (:basis snapshot) :inventory-marks (:inventory-marks snapshot) :schema-digest (:schema-digest snapshot) :after-eid (:after-eid snapshot) :more? (:more? snapshot)
+     :validated (count (:jobs snapshot)) :scanned (:scanned snapshot) :preserved (- (:scanned snapshot) (count (:jobs snapshot))) :jobs (mapv :job/id (:jobs snapshot))})))))
 
 (defn validate!
- "Bounded prepublication rehearsal of actual historical payloads and current
-  owner state. Queue continuation cursors bind to a basis and refuse when writes
-  change it. :valid proves only observed inventory/revisions; future producers
-  still require native protocol admission and the retained exact old handler."
+ "Globally bounded rehearsal: :limit total scanned groups/owner callbacks,
+  :ms total callback-work deadline; FIFO writer/actor admission waits may exceed
+  that deadline. :previous persists queue/owner proofs and a fair task cursor.
+  Metadata traversal is capped at 128 registered participants. :after queue
+  cursors remain supported. :valid covers observed inventory/revisions only;
+  recheck! before publication, retain old handlers for future producer work."
  ([plan] (validate! plan {}))
  ([plan opts]
   (live! plan)
   (when-not (and (erlang/is_integer (:limit opts 100)) (<= 1 (:limit opts 100) 1000)
                 (erlang/is_integer (:ms opts 250)) (<= 1 (:ms opts 250) 30000))
    (refuse :invalid-rehearsal))
-  (let [queues (into {} (map (fn [[srv entry]]
-                            [srv (try (queue-validation srv entry opts)
-                                   (catch e {:status :refused :kind (or (:kind (ex-data e)) :rehearsal-failed)}))]) (:queues plan)))
-        owners (into {} (map (fn [[id entry]]
-                            [id (evolve/rehearse! (:pid entry) (:expected entry) (:spec entry) (:ms opts 250))]) (:owners plan)))
-        rows (concat (vals queues) (vals owners))]
-   {:status (cond (some #(= :refused (:status %)) rows) :refused
-                  (some #(= :more (:status %)) rows) :more :else :valid)
-    :scope :observed-inventory :generation (:generation plan) :queues queues :owners owners})))
+  (let [previous (:previous opts)
+        _ (when (and previous (not= (:generation plan) (:generation previous))) (refuse :invalid-validation-receipt))
+        tasks (vec (concat (map (fn [[id entry]] [:queue id entry]) (sort-by #(str (first %)) (:queues plan)))
+                           (map (fn [[id entry]] [:owner id entry]) (sort-by #(str (first %)) (:owners plan)))))
+        n (count tasks) started (erlang/monotonic_time :millisecond)
+        initial-queues (:queues previous (:after opts {})) initial-owners (:owners previous {})]
+   (loop [visited 0 cursor (if (zero? n) 0 (mod (:cursor previous 0) n))
+          left (:limit opts 100) queues initial-queues owners initial-owners
+          turn {:scanned 0 :validated 0 :preserved 0 :owners 0}]
+    (let [remaining (- (:ms opts 250) (- (erlang/monotonic_time :millisecond) started))]
+     (if (or (= visited n) (zero? left) (<= remaining 0))
+      (let [rows (concat (vals queues) (vals owners)) complete? (= n (+ (count queues) (count owners)))]
+       {:status (cond (some #(= :refused (:status %)) rows) :refused
+                      (and complete? (every? #(= :valid (:status %)) rows)) :valid :else :more)
+        :scope :observed-inventory :generation (:generation plan) :queues queues :owners owners
+        :cursor cursor :turn turn :elapsed-ms (- (erlang/monotonic_time :millisecond) started)})
+      (let [[kind id entry] (nth tasks cursor) rows (if (= kind :queue) queues owners)
+            prior (get rows id) next-cursor (mod (inc cursor) n)]
+       (if (= :valid (:status prior))
+        (recur (inc visited) next-cursor left queues owners turn)
+        (let [row (try
+                    (if (= kind :queue)
+                     (queue-validation id entry {:limit left :ms remaining :after queues})
+                     (evolve/rehearse! (:pid entry) (:expected entry) (:spec entry) remaining))
+                    (catch e {:status :refused :kind (or (:kind (ex-data e)) :rehearsal-failed)}))
+              cost (if (= kind :queue) (max 1 (:scanned row 0)) 1)
+              after-turn (if (= kind :queue)
+                           (-> turn (update :scanned + cost) (update :validated + (:validated row 0))
+                                    (update :preserved + (:preserved row 0))) (update turn :owners inc))]
+         (recur (inc visited) next-cursor (max 0 (- left cost))
+                (if (= kind :queue) (assoc queues id row) queues)
+                (if (= kind :owner) (assoc owners id row) owners) after-turn))))))))))
+
+(defn recheck!
+ "Recheck a completed observed-inventory receipt under native queue writers and
+  owner FIFO authority. Does not rerun candidate callbacks or admit future work.
+  A stale receipt requires fresh bounded validation before publication intent."
+ [plan receipt]
+ (live! plan)
+ (when-not (and (= :valid (:status receipt)) (= (:generation plan) (:generation receipt)))
+  (refuse :invalid-validation-receipt))
+ (let [queues (into {} (map (fn [[srv entry]]
+                     [srv (if-not (and (runtime/ready? srv)
+                                       (= :ready (:status (runtime/rehearse! srv (:expected entry) (:handler entry)))))
+                       {:status :stale}
+                       (if-not (:adoption entry) {:status :current}
+                       (dc/serialized! (queue/conn srv)
+                        (fn []
+                         (let [c (queue/conn srv) proof (inventory-proof c (d/db c))]
+                          {:status (if (same-inventory? (get-in receipt [:queues srv]) proof) :current :stale)})))))]) (:queues plan)))
+       owners (into {} (map (fn [[id entry]]
+                     [id (if-not (evolve/owner? (:pid entry)) {:status :stale}
+                       (let [state (evolve/status (:pid entry)) observed (get-in receipt [:owners id])]
+                        {:status (if (and (= (:version state) (:version observed))
+                                          (= (:revision state 0) (:revision observed))) :current :stale)}))]) (:owners plan)))
+       current? (every? #(= :current (:status %)) (concat (vals queues) (vals owners)))]
+  {:status (if current? :current :stale) :generation (:generation plan) :queues queues :owners owners}))
 
 (defn activate!
  "FIFO publication inside each native owner, idempotent across partial batches.

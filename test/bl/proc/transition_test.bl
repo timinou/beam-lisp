@@ -178,8 +178,25 @@
        (is (= 2 (get-in full [:queues srv :validated])))
        (is (= before (d/basis-t (d/db c))))
        (is (= "rehearsal-old" (:generation (runtime/status srv)))))
+      (d/install-schema! c [{:db/ident :journal/turn :db/valueType :db.type/long}])
       (let [page (transition/validate! plan {:limit 1}) cursor (get-in page [:queues srv])]
        (is (= :more (:status page)))
+       (d/transact! c [{:db/id -1 :journal/turn 1}])
+       (let [continued (transition/validate! plan {:limit 100 :after {srv cursor}})]
+        (is (= :valid (:status continued)))
+        (is (= :current (:status (transition/recheck! plan continued))))
+        (d/transact! c [{:db/id -1 :journal/turn 2}])
+        (is (= :current (:status (transition/recheck! plan continued))))
+        (let [job (first (d/q '[:find ?e :where [?e :job/id]] (d/db c)))]
+         (d/transact! c [[:db/add (first job) :job/payload {:test/id "changed" :test/value 3}]]))
+        (is (= :stale (:status (transition/recheck! plan continued))))
+        (let [fresh (transition/validate! plan)
+              id (first (first (d/q '[:find ?e :where [?e :job/id]] (d/db c))))]
+         (d/transact! c [[:db/add id :job/effects {:submit {:state :intent}}]])
+         (is (= :stale (:status (transition/recheck! plan fresh)))))
+        (let [fresh (transition/validate! plan)]
+         (q/fence-generation! srv "never-admitted-generation")
+         (is (= :stale (:status (transition/recheck! plan fresh))))))
        (q/enqueue! srv {:test/id "c" :test/value 2} {:in [60 :seconds]})
        (let [changed (transition/validate! plan {:limit 1 :after {srv cursor}})]
         (is (= :refused (:status changed)))
@@ -225,3 +242,53 @@
        (is (= "provider-old" (:job/required-generation (d/entity (d/db c) (:db/id uncertain)))))
        (finally (transition/close! plan)))))
     (finally (runtime/stop! srv))))))
+
+(deftest rehearsal-budget-is-global-fair-and-does-not-repeat-owner-migrations
+ (let [servers [:budget-runtime-a :budget-runtime-b]
+       owners (mapv (fn [srv]
+                      (q/attach-store! srv (dc/connect-with (sm/open) []))
+                      (runtime/start! (prepare-handler srv "budget-old" 1 (fn [_] :ok)))) servers)
+       migrated (atom 0) converted (atom 0)
+       base {:version 1 :digest "budget-old" :accept? (fn [_] true) :check-state (fn [_] true)
+             :handler (fn [_ state] {:reply :ok :state state})}
+       owner (evolve/start! base {:value 1} {:managed true})
+       previous (Process/get :bl_generation)
+       plan (try
+              (Process/put :bl_generation {:digest "budget-new" :modules []
+                :protocols (into {} (map (fn [srv] [(name srv) {:protocol 2 :generation "budget-new"}]) servers))})
+              (transition/prepare! {:previous-generation "budget-old"
+               :queues (into {} (map (fn [srv]
+                  [srv {:declaration {:of :test/runtime :protocol 2 :concurrency 2 :unique [:test/id]}
+                        :perform (fn [_] :ok)
+                        :adoption {:digest "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                                   :protocol 2 :upcast (fn [p] (swap! converted inc) p) :accept? (fn [_] true)}}]) servers))
+               :owners {:counter {:pid owner :expected 1
+                         :spec (assoc base :version 2 :digest "budget-new"
+                                 :migrate-state (fn [s] (swap! migrated inc) s) :upcast (fn [m] m))}}})
+              (finally (Process/put :bl_generation previous)))]
+  (try
+   (doseq [srv servers i (range 2)]
+    (q/enqueue! srv {:test/id (str i) :test/value i} {:in [600 :seconds]}))
+   (let [page-one (transition/validate! plan {:limit 1})
+         page-two (transition/validate! plan {:limit 1 :previous page-one})]
+    (is (= :more (:status page-one)))
+    (is (= 1 (count (:queues page-one))))
+    (is (= 1 (get-in page-one [:turn :scanned])))
+    (is (= 2 (count (:queues page-two))))
+    (let [done (loop [prior page-two n 0]
+                 (if (or (= :valid (:status prior)) (> n 8)) prior
+                  (let [next (transition/validate! plan {:limit 1 :previous prior})]
+                   (is (<= (+ (get-in next [:turn :scanned]) (get-in next [:turn :owners])) 1))
+                   (recur next (inc n)))))]
+     (is (= :valid (:status done)))
+     (is (= 4 @converted))
+     (is (= 1 @migrated))
+     (is (= :current (:status (transition/recheck! plan done))))
+     (let [third (prepare-handler (first servers) "budget-third" 3 (fn [_] :ok))]
+      (is (= :applied (:status (runtime/activate! (first servers) "budget-old" third))))
+      (is (= :stale (:status (transition/recheck! plan done)))))))
+   (is (= :transition-inventory-too-large
+          (try (transition/prepare! {:owners (zipmap (range 129) (repeat 129 {}))}) nil
+           (catch e (:kind (ex-data e))))))
+   (finally (transition/close! plan) (GenServer/stop owner)
+    (doseq [srv servers] (runtime/stop! srv))))))
