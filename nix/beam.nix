@@ -1,18 +1,24 @@
-# OTP 29 + Elixir 1.20 on the pinned nixpkgs' toolchain (glibc of the pin).
+# Keep the pinned OTP/Elixir sources, using the current nixpkgs builders.
+# The private beamLib and packagesWith APIs were removed upstream.
 { pkgs, otp-src, elixir-src }:
 let
-  erlang0 = pkgs.beam.beamLib.callErlang
-    ({ mkDerivation }: mkDerivation {
-      version = "29.0.1";
-      src = otp-src;
-    })
-    { parallelBuild = true; wxSupport = false; systemdSupport = false; };
-  # no man/html docs in a server drop
-  erlang = erlang0.overrideAttrs (_: { installTargets = [ "install" ]; });
-  elixir = (pkgs.beam.packagesWith erlang).elixir_1_18.override {
-    version = "1.20.2";
-    src = elixir-src;
-    minimumOTPVersion = "27";
+  erlangBuilder = import (pkgs.path + "/pkgs/development/interpreters/erlang/generic-builder.nix") {
+    version = "29.0.1";
+    wxSupport = false;
+    systemdSupport = false;
   };
+  erlang = (pkgs.callPackage erlangBuilder { }).overrideAttrs (_: {
+    src = otp-src;
+    installTargets = [ "install" ];
+  });
+  elixirBuilder = import (pkgs.path + "/pkgs/development/interpreters/elixir/generic-builder.nix") {
+    version = "1.20.2";
+    hash = null;
+    minimumOTPVersion = "27";
+    maximumOTPVersion = "29";
+  };
+  elixir = (pkgs.callPackage elixirBuilder { inherit erlang; debugInfo = true; }).overrideAttrs (_: {
+    src = elixir-src;
+  });
 in
 { inherit erlang elixir; }
