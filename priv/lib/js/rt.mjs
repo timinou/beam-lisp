@@ -640,6 +640,8 @@ export function strCmp(a, b) {
 /** A BL raise: `(throw (ex-info msg data))` or a runtime error. */
 export class BLError extends Error {
   constructor(message, data, cause) { super(message); this.data = data === undefined ? null : data; this.blCause = cause || null; }
+  get blStruct() { return this.blType || kw("Elixir.BeamLisp.ExInfo"); }
+  get blFields() { return {message:this.message,data:this.data,cause:this.blCause,original:this.blOriginal ?? null}; }
 }
 
 // ─── exact arithmetic ───────────────────────────────────────────────────────

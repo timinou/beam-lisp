@@ -22,4 +22,7 @@ export function* call(f,args,invoke,src=null,tail=false){
 }
 export function* callList(f,args,invoke,src=null,tail=false){return yield* call(f,H.listToArray(args),invoke,src,tail);}
 
-export function bind(runtime){return {fn:(name,arity,body,synchronous=false)=>fn(name,arity,body,runtime,synchronous),multi:(...args)=>multi(...args,runtime),call,callList};}
+export const exceptionKind=H.exKind,exceptionTrace=H.exTrace;
+export function exceptionValue(error){return H.isRaise(error)?error.reason:error;}
+
+export function bind(runtime){return {fn:(name,arity,body,synchronous=false)=>fn(name,arity,body,runtime,synchronous),multi:(...args)=>multi(...args,runtime),call,callList,exceptionKind,exceptionValue,exceptionTrace};}
