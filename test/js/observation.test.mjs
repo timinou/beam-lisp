@@ -33,10 +33,10 @@ test('peer reports expire and never grant action authority',async()=>{
 
 test('local reports bound UTF-8 bytes and isolate cyclic projections',()=>{
  const hub=O.d_hub(),cycle={};cycle.self=cycle;
- const rows=[hub.register('unicode',()=>({text:'😀'.repeat(1500)}),{}),
+ const rows=[hub.register('unicode',()=>({text:'😀'.repeat(30000)}),{}),
              hub.register('cyclic',()=>cycle,{})];
  const reader=hub.reader(),snapshot=reader.sample()[0];
- assert.equal(snapshot.resources[0].error,'Observation exceeds resource byte limit');
+ assert.equal(snapshot.resources[0].error,'Observation exceeds report byte budget');
  assert.equal(snapshot.resources[1].error,'Observation failed');
  assert.ok(new TextEncoder().encode(JSON.stringify(snapshot)).byteLength<131072);
  for(const row of rows)row.dispose();reader.dispose();
@@ -44,7 +44,7 @@ test('local reports bound UTF-8 bytes and isolate cyclic projections',()=>{
 test('malformed and oversized peer reports cannot enter the reader',async()=>{
  const hub=O.d_hub(),reader=hub.reader();
  const channel=new BroadcastChannel('bl.runtime.observations.v1');
- channel.postMessage(null);
+ channel.postMessage(null);channel.postMessage(undefined);channel.postMessage(0);
  channel.postMessage({type:'snapshot',value:{schema:'bl.runtime.observation.v1',session:'foreign',resources:[{text:'😀'.repeat(40000)}]}});
  await sleep(50);
  assert.equal(reader.sample().filter(r=>r.remote).length,0);
@@ -64,4 +64,21 @@ test('subscriptions own their timer and reader and honor inactive views',async()
  await sleep(10);assert.equal(calls,0);active=true;
  await sleep(270);assert.equal(calls,1);
  dispose();dispose();await sleep(270);assert.equal(calls,1);
+});
+
+test('one large resource is allowed while aggregate reports remain bounded',()=>{
+ const hub=O.d_hub(),rows=Array.from({length:32},(_,i)=>hub.register('fixture',()=>({text:'x'.repeat(50000),i}),{}));
+ const reader=hub.reader(),snapshot=reader.sample()[0];
+ assert.equal(snapshot.resources[0].data.text.length,50000);
+ assert.ok(snapshot.resources.slice(1).every(r=>r.error));
+ assert.ok(new TextEncoder().encode(JSON.stringify(snapshot)).byteLength<131072);
+ for(const row of rows)row.dispose();reader.dispose();
+});
+
+test('a projection that replaces its registration cannot extend the current snapshot',()=>{
+ const hub=O.d_hub(),reader=hub.reader();let registration,reads=0;
+ const read=()=>{reads++;registration.dispose();registration=hub.register('replacement',read,{});return {reads};};
+ registration=hub.register('initial',read,{});
+ try{const snapshot=reader.sample()[0];assert.equal(reads,1);assert.equal(snapshot.resources.length,1);}
+ finally{registration.dispose();reader.dispose();}
 });
