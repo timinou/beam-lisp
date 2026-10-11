@@ -71,6 +71,12 @@ state/screenshot monitor. Keep a separate original run when attaching an edited
 film clock. Cross-origin media with a caption track needs CORS response headers
 from its media server.
 
+For local evidence, `scenario.film.http/serve-file` accepts a caller-authorized
+path and MIME type and serves it through Plug's file transport. It supports
+browser byte-range seeking, suffix requests, HEAD and unsatisfiable-range 416
+responses. Keep path authorization and CORS in the host. Movies can then seek
+without copying the complete file into the BEAM heap for every request.
+
 For an existing JSON edit, run the same worker directly:
 
 ```sh
