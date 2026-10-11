@@ -110,6 +110,10 @@ def speech(text, voice, path):
     key = os.environ.get('DEEPGRAM_API_KEY')
     if not key:
         raise ValueError('Set DEEPGRAM_API_KEY or provide local scene audio')
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', key):
+        # HTTP libraries include rejected header values in some exceptions.
+        # Refuse malformed credentials before constructing an HTTP request.
+        raise ValueError('DEEPGRAM_API_KEY must contain a single ASCII token')
     query = urllib.parse.urlencode({'model': voice, 'encoding': 'linear16',
                                    'container': 'wav', 'sample_rate': 48000})
     request = urllib.request.Request('https://api.deepgram.com/v1/speak?' + query,

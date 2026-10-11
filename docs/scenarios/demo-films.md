@@ -63,6 +63,14 @@ subtitle intervals, final movie hash, and the original run's verdicts. A film
 is an edited presentation; its cursor gestures and camera are editorial
 annotations. The referenced scenario remains the authority for behavior.
 
+Scenario Runner plays a run's `:media {:src … :captions … :language …}` in its
+program monitor. Each step's `:t` is its position in that media. Clicking a
+timeline step seeks the existing player; its play button and space bar control
+video playback. A film starts at its first step. A run without media keeps the
+state/screenshot monitor. Keep a separate original run when attaching an edited
+film clock. Cross-origin media with a caption track needs CORS response headers
+from its media server.
+
 For an existing JSON edit, run the same worker directly:
 
 ```sh

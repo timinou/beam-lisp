@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location('film', ROOT/'priv/lib/scenario/film/render.py')
@@ -13,6 +14,14 @@ spec.loader.exec_module(film)
 
 
 class FilmTest(unittest.TestCase):
+    def test_malformed_credentials_never_reach_http_diagnostics(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.dict('os.environ', {'DEEPGRAM_API_KEY':'private-token\nSECOND-PRIVATE-TOKEN'}):
+                with self.assertRaises(ValueError) as result:
+                    film.speech('Bonjour', 'aura-2-hector-fr', Path(root)/'voice.wav')
+                self.assertNotIn('private-token', str(result.exception))
+                self.assertNotIn('SECOND-PRIVATE-TOKEN', str(result.exception))
+
     def test_captions_keep_french_amounts_together(self):
         text = 'Ici, la facture indique 75 000 dirhams. Le projet n’en reprend que 15 000 : l’écart est visible.'
         lines = film.caption_lines(text)
