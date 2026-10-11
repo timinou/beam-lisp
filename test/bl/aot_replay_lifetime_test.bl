@@ -1,0 +1,74 @@
+(ns aot.replay-lifetime-test (:require [env] [anf :as a] [lower :as lower]))
+
+(defn scratch []
+ (let [p (str (System/tmp_dir!) "/aot-replay-lifetime-" (erlang/unique_integer (list :positive)))]
+  (File/mkdir_p! p) p))
+
+(defn write-unit! [out module body]
+ (let [beam (BeamLisp.Emit/compile_descriptor
+              (BeamLisp.Emit/descriptor_for module
+                (list (BeamLisp.Emit/function_clause :__bl_init__ body))))]
+  (File/write! (str out "/" (erlang/atom_to_binary module :utf8) ".beam") (elem beam 1))))
+
+(deftest replay-once-per-exact-artifact-and-consuming-environment
+ (let [out (scratch) module :bl_cache_replay_identity
+       first-env (env/fork) second-env (env/fork)
+       body (fn [tag]
+         (a/remote :Elixir.BeamLisp.Env :intern
+          (list (a/lit "replay.identity") (a/lit "value")
+            (a/tup (list (a/lit tag) (a/remote :erlang :unique_integer (list (a/lit (list :positive)))))))))]
+  (try
+   (write-unit! out module (body :old))
+   (env/with-env first-env
+    (fn []
+     (BeamLisp.AOTCache/run_init_modules (list module) out)
+     (let [original (BeamLisp.Env/fetch_exact! "replay.identity" "value")]
+      (BeamLisp.AOTCache/run_init_modules (list module) out)
+      (is (= original (BeamLisp.Env/fetch_exact! "replay.identity" "value")))
+      (env/with-env second-env
+       (fn []
+        (BeamLisp.AOTCache/run_init_modules (list module) out)
+        (is (not= original (BeamLisp.Env/fetch_exact! "replay.identity" "value"))))))
+     (write-unit! out module (body :new))
+     (BeamLisp.AOTCache/run_init_modules (list module) out)
+     (is (= :new (elem (BeamLisp.Env/fetch_exact! "replay.identity" "value") 0)))))
+   (finally (env/destroy first-env) (env/destroy second-env)
+            (BeamLisp.Env/retire_module! module) (File/rm_rf! out)))))
+
+(deftest partially-failed-replay-never-reexecutes-effects-in-the-same-scope
+ (let [out (scratch) module :bl_cache_replay_failure scope (env/fork) me (erlang/self)]
+  (try
+   (write-unit! out module
+    (a/doo (list (a/remote :erlang :send (list (a/remote :erlang :self (list)) (a/lit :replay-attempt)))
+                 (a/remote :erlang :error (list (a/lit :initializer-failed))))))
+   (env/with-env scope
+    (fn []
+     (is (try (BeamLisp.AOTCache/run_init_modules (list module) out) false (catch _ true)))
+     (is (= :replay-attempt (receive :replay-attempt :replay-attempt (after 1000 :timeout))))
+     (is (try (BeamLisp.AOTCache/run_init_modules (list module) out) false (catch _ true)))
+     (is (= :none (receive :replay-attempt :replayed (after 0 :none))))))
+   (finally (env/destroy scope) (BeamLisp.Env/retire_module! module) (File/rm_rf! out)))))
+
+(deftest third-publication-refuses-unleased-executing-old-code-without-killing-worker
+ (let [module :bl_unleased_old_generation parent (erlang/self)
+       descriptor (fn [body]
+         (a/module module (list {:op :defn-clause :fname :run :params (list) :guard nil :body body :ann {}})
+                   (list [:run 0]) (list)))
+       blocked (a/doo (list
+                 (a/remote :erlang :send (list (a/remote :erlang :list_to_pid (list (a/lit (erlang/pid_to_list parent)))) (a/lit :entered-old-code)))
+                 (a/recv (list (a/clause (list (a/plit :finish)) nil (a/lit :finished))) nil nil)))
+       worker (atom nil)]
+  (try
+   (lower/reload-descriptor! (descriptor blocked))
+   (reset! worker (erlang/spawn (fn [] (erlang/send parent [:worker-result (erlang/apply module :run (list))]))))
+   (is (= :entered-old-code (receive :entered-old-code :entered-old-code (after 10000 :timeout))))
+   (lower/reload-descriptor! (descriptor (a/lit :second)))
+   (is (try (lower/reload-descriptor! (descriptor (a/lit :third))) false (catch _ true)))
+   (is (Process/alive? @worker))
+   (is (= :second (erlang/apply module :run (list))))
+   (erlang/send @worker :finish)
+   (is (= :finished (receive [:worker-result value] value (after 10000 :timeout))))
+   (lower/reload-descriptor! (descriptor (a/lit :third)))
+   (is (= :third (erlang/apply module :run (list))))
+   (finally (when (and @worker (Process/alive? @worker)) (erlang/exit @worker :kill))
+            (BeamLisp.Env/retire_module! module)))))

@@ -874,36 +874,53 @@
 ; ── internals ──────────────────────────────────────────────────────────────
 
 (defn run_init_modules
-  "Reproduce a fresh compile's runtime side effects for a cache hit. Compiling a
-   source evaluates its forms, which interns value defs into the live VM's
-   `BeamLisp.Env`; a fetch links beams without evaluating, so same-VM consumers
-   see `undefined var` unless the namespace's init runs. `__bl_init__/0` lives
-   on the namespace SHIM module; match on the export, not the name. Idempotent
-   per the AOT contract."
+  "Replay a fetched unit once per environment and exact artifact. Physical code
+   publication uses native lease/soft-purge fences. Reentrant or partially failed
+   initialization refuses; a fresh environment is the retry boundary."
   [modules compile_path]
-  (Enum/each modules (fn [mod] (ensure_module_loaded mod compile_path)))
-  (Enum/each
-    (Enum/filter modules (fn [mod] (erlang/function_exported mod :__bl_init__ 0)))
-    (fn [mod] (erlang/apply mod :__bl_init__ '())))
-  :ok)
+  (let [ordered (Enum/sort modules) key (tup :aot_replay ordered)
+        fingerprint (Enum/map ordered (fn [mod]
+          (let [path (Path/join compile_path (beam_file mod)) read (File/read path)]
+            (if (erlang/== :ok (erlang/element 1 read))
+              (tup mod (crypto/hash :sha256 (erlang/element 2 read)))
+              (tup mod (erlang/apply mod :module_info (lst :md5)))))))
+        identity (fn [] (Enum/map ordered (fn [mod]
+                         (tup mod (erlang/apply mod :module_info (lst :md5))))))]
+    (BeamLisp.Env/with_namespace_lock (tup :aot_replay (tup (BeamLisp.Env/env_id) ordered))
+      (fn []
+        (let [found (BeamLisp.Env/lookup_own key)
+              previous (if (erlang/== :error found) nil (erlang/element 2 found))]
+          (cond
+            (and previous (erlang/== :ready (Map/get previous :status))
+                 (erlang/== fingerprint (Map/get previous :fingerprint))
+                 (erlang/== (identity) (Map/get previous :installed))) :ok
+            (and previous (erlang/not (erlang/== :ready (Map/get previous :status))))
+            (erlang/error (tup :aot_replay_incomplete ordered))
+            :else
+            (do
+              (BeamLisp.Env/put_key key (Map/new (lst (tup :status :initializing))))
+              (try
+                (Enum/each modules (fn [mod] (ensure_module_loaded mod compile_path)))
+                (Enum/each
+                  (Enum/filter modules (fn [mod] (erlang/function_exported mod :__bl_init__ 0)))
+                  (fn [mod] (erlang/apply mod :__bl_init__ '())))
+                (BeamLisp.Env/put_key key (Map/new (lst (tup :status :ready)
+                   (tup :fingerprint fingerprint) (tup :installed (identity)))))
+                :ok
+                (catch error
+                  (BeamLisp.Env/put_key key (Map/new (lst (tup :status :failed))))
+                  (erlang/error error))))))))))
 
 (defn- ensure_module_loaded
-  "Load `mod` from `compile_path` when the code server does not already have it,
-   so a fetched beam is the live code."
+  "Publish the artifact's exact bytes through native physical ownership fences.
+   A loaded same-named module is not proof it matches this cache entry."
   [mod compile_path]
-  (let [loaded (Code/ensure_loaded mod)]
-    (cond
-      (and (erlang/is_tuple loaded)
-           (erlang/== 2 (erlang/tuple_size loaded))
-           (erlang/== :module (erlang/element 1 loaded)))
-      (tup :module mod)
-      :else
-      (let [beam (Path/join compile_path (beam_file mod))
-            r (File/read beam)]
-        (cond
-          (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
-          (code/load_binary mod (erlang/binary_to_list beam) (erlang/element 2 r))
-          :else nil)))))
+  (let [beam (Path/join compile_path (beam_file mod)) read (File/read beam)]
+    (if (erlang/== :ok (erlang/element 1 read))
+      (do (BeamLisp.Env/publish_binaries! (lst (tup mod (erlang/element 2 read))) beam)
+          (tup :module mod))
+      (if (erlang/module_loaded mod) (tup :module mod)
+        (erlang/error (tup :missing_aot_replay_module mod))))))
 
 (defn- entry_dir
   "The directory an entry lives in: `<dir>/<compiler-key>/<closure-key>`, with
