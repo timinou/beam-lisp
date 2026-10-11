@@ -33,3 +33,9 @@ test('tail calls retain a bounded frame stack',()=>{
 test('protected calls preserve catch semantics across frames',()=>{
  assert.equal(F.d_guarded_return(()=>{throw new Error('expected');}),'caught expected');
 });
+test('compiler-derived callback evidence stays on the same callable',()=>{
+ assert.equal(H.isSynchronousCallable(F.d_identity_leaf),true);
+ assert.equal(H.invokeSynchronous(F.d_identity_leaf,[42]),42);
+ assert.equal(H.isSynchronousCallable(F.d_guarded_return),false);
+ assert.throws(()=>H.invokeSynchronous(F.d_guarded_return,[()=>42]),/not proven/);
+});
