@@ -1,0 +1,87 @@
+; Transient private work over ordinary proc servers/processes. No durable queue,
+; retry engine or second scheduler. Cancellation rejects obsolete output; work
+; that performs accepted shared effects belongs to proc.admission/queue instead.
+(ns proc.work (:require [proc.server] [proc.callback :as callback] [runtime.observation :as observation]))
+(defn- now [] (erlang/monotonic_time :millisecond))
+(defn- trim [state]
+ (assoc state :jobs (into {} (map (fn [j] [(:id j) j])
+  (observation/retain-history (sort-by (fn [j] (- (:ordinal j))) (vals (:jobs state))) (:history state))))))
+(defn- checkpoint []
+ (receive :work-cancel (throw (ex-info "Private work cancelled" {:kind :cancelled})) (after 0 :ok)))
+(defn- execute [controller id registration]
+ (try
+  (checkpoint)
+  (callback/invoke! registration [{:checkpoint checkpoint :progress
+    (fn [value]
+     (let [at (now) previous (Process/get :bl-work-progress-at)]
+      (when (and (number? value) (or (nil? previous) (>= (- at previous) 50)))
+       (Process/put :bl-work-progress-at at)
+       (erlang/send controller [:work-progress id value]))))}])
+  (erlang/send controller [:work-finished id :done])
+  (catch error (erlang/send controller [:work-finished id (if (= :cancelled (:kind (ex-data error))) :cancelled :failed)]))
+  (finally (callback/unregister! registration))))
+(defn- finished [state id status]
+ (if-let [job (get-in state [:jobs id])]
+  (if (observation/active? job)
+   (do
+    (when (:cancel-timer job) (erlang/cancel_timer (:cancel-timer job)))
+    (assoc-in state [:jobs id]
+    (assoc (dissoc job :cancel-timer) :status (if (= :cancelling (:status job)) :cancelled status)
+               :finished (now) :cancel-ms (when (:cancel-at job) (- (now) (:cancel-at job)))))) state) state))
+(defn- initial-state [opts]
+ (let [active (:max-active opts 4) history (:history opts 32)]
+  (when-not (and (int? active) (<= 1 active 128) (int? history) (<= active history 128))
+   (throw (ex-info "Work limits require 1 <= active <= history <= 128" {})))
+  {:jobs {} :max-active active :history history}))
+(proc.server/defserver work-owner
+ (init [opts] (Process/flag :trap_exit true) (ok (initial-state opts)))
+ (handle-call [:submit metadata registration] [_from state]
+  (if (>= (count (filter observation/active? (vals (:jobs state)))) (:max-active state))
+   (do (callback/unregister! registration)
+       (reply {:ok false :message "Work capacity exhausted"} state))
+   (let [id (pr-str (erlang/make_ref)) controller (erlang/self)
+         pid (spawn-link (fn [] (receive [:work-run retained] (execute controller id retained))))
+         retained (callback/transfer! registration pid)
+         job (merge (select-keys metadata [:title :source :generation])
+              {:id id :pid pid :ref (erlang/monitor :process pid) :status :running :started (now) :ordinal (erlang/unique_integer (list :monotonic :positive)) :progress 0})]
+    (erlang/send pid [:work-run retained])
+    (reply {:id id} (trim (assoc-in state [:jobs id] job))))))
+ (handle-call [:cancel id] [_from state]
+  (let [job (get-in state [:jobs id])]
+   (if (observation/active? job)
+    (let [timer (if (= :running (:status job))
+                  (do (erlang/send (:pid job) :work-cancel)
+                      (erlang/send_after 1000 (erlang/self) [:work-force-cancel id]))
+                  (:cancel-timer job))]
+     (reply {:id id :accepted true}
+      (update-in state [:jobs id]
+       (fn [j] (assoc j :status :cancelling :cancel-timer timer
+                        :cancel-at (or (:cancel-at j) (now)))))))
+    (reply {:ok false :message "Work is no longer active"} state))))
+ (handle-call [:snapshot] [_from state]
+  (reply (mapv (fn [job] (-> job (dissoc :pid :ref :ordinal :cancel-timer)
+          (assoc :elapsed-ms (- (or (:finished job) (now)) (:started job)))))
+          (sort-by (fn [j] (- (:ordinal j))) (vals (:jobs state)))) state))
+ (handle-info [:work-progress id value] [state]
+  (noreply (if (and (observation/active? (get-in state [:jobs id])) (number? value))
+            (assoc-in state [:jobs id :progress] value) state)))
+ (handle-info [:work-finished id status] [state] (noreply (finished state id status)))
+ (handle-info [:work-force-cancel id] [state]
+  (let [job (get-in state [:jobs id])]
+   (when (= :cancelling (:status job)) (erlang/exit (:pid job) :kill))
+   (noreply state)))
+ (handle-info [:DOWN ref :process _pid _reason] [state]
+  (noreply (reduce (fn [s [id job]] (if (= ref (:ref job)) (finished s id :failed) s)) state (:jobs state))))
+ (handle-info _ [state] (noreply state))
+ (terminate [_reason state]
+  (doseq [job (vals (:jobs state))]
+   (when (and (observation/active? job) (Process/alive? (:pid job))) (erlang/exit (:pid job) :kill))) :ok))
+(defn start! ([] (start! {})) ([opts] (core/start work-owner opts {})))
+(defn submit! [owner metadata action]
+ (let [registration (callback/register! action)
+       retained (callback/transfer! registration owner)]
+  (if (= :cancelled retained) {:ok false :message "Work owner unavailable"}
+   (call owner [:submit metadata retained]))))
+(defn cancel! [owner id] (call owner [:cancel id]))
+(defn snapshot [owner] (call owner [:snapshot]))
+(defn stop! [owner] (when owner (core/stop owner)) :ok)
