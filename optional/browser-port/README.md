@@ -136,3 +136,12 @@ Run the headed integration with `BL_BROWSER_PORT`, `CHROMIUM`, `SWAY` and
 ```sh
 ./bin/bl test -p optional/browser-port/bl optional/browser-port/test/film_test.bl
 ```
+
+## Demo tests
+
+`scenario.demo` combines normal scenario events with narrated scenes in one
+source. `browser.film/owned-world` opens a page at execution time and provides
+cleanup after successful runs and failed actions. Each `defdemo` is registered
+with the ordinary test engine; tests capture evidence, and `BL_DEMO_EXPORT=1`
+also produces a film. See [the executable two-demo literate file](../../examples/scenario/browser-demos.bl.org)
+and [the demo API](../../docs/scenarios/demo-films.md).

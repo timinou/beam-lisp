@@ -1,0 +1,224 @@
+(ns scenario.demo
+  (:require [scenario :as scenario] [scenario.runner.adapt :as adapt]
+            [scenario.film :as film] [scenario.film.http :as media]
+            [scenario.runner.app :as runner] [live.app :as live]
+            [clojure.edn :as edn] [web] [interop]))
+
+(defn scene
+  "Annotate ordinary scenario events with their client presentation. Works
+   inside scenario/scenario, including pattern expansions; adds no events."
+  [id opts & events]
+  (let [id (name id)
+        events (:steps (scenario/scenario id {} events))]
+    (when (or (empty? id) (empty? events))
+      (throw (ex-info "A demo scene needs a name and events" {:scene id})))
+    (when (not (or (:say opts) (:audio opts)))
+      (throw (ex-info "A demo scene needs narration or local audio" {:scene id})))
+    (mapv (fn [event i]
+            (when (:scenario.demo/scene (meta event))
+              (throw (ex-info "Demo scenes cannot nest" {:scene id})))
+            (with-meta event (assoc (meta event) :scenario.demo/scene {:id id :opts opts :first? (= i 0)})))
+          events (range (count events)))))
+
+(defn- groups [scen]
+  (reduce (fn [groups i]
+            (let [annotation (:scenario.demo/scene (meta (nth (:steps scen) i)))]
+              (if (nil? annotation) groups
+                (if (and (not (:first? annotation)) (= (:id annotation) (:id (last groups)))
+                         (= i (:end (last groups))))
+                  (update groups (dec (count groups)) assoc :end (inc i))
+                  (do
+                    (when (some (fn [g] (= (:id annotation) (:id g))) groups)
+                      (throw (ex-info "Scene names must be unique and contiguous" {:scene (:id annotation)})))
+                    (conj groups (assoc annotation :start (inc i) :end (inc i))))))))
+          [] (range (count (:steps scen)))))
+
+(defn- frame [run i]
+  (get-in run [:steps (dec i) :basis :frame]))
+
+(defn- edit-scene [run group]
+  (let [{:keys [id opts start end]} group
+        spacing (or (:step-seconds opts) 0.6)
+        _ (when (or (not (number? spacing)) (<= spacing 0))
+            (throw (ex-info "step-seconds must be positive" {:scene id})))
+        indices (vec (range start (inc end)))
+        _ (when (not (contains? #{:sequence :end} (get opts :capture :sequence)))
+            (throw (ex-info "capture must be :sequence or :end" {:scene id})))
+        sequence? (= :sequence (get opts :capture :sequence))
+        before? (and sequence? (> start 1))
+        at (fn [i] (if sequence? (* spacing (+ (- i start) (if before? 1 0))) 0))
+        shots (when sequence?
+                (into (if before? [{:at 0 :source (frame run (dec start))}] [])
+                      (map (fn [i] {:at (at i) :source (frame run i)}) indices)))
+        direction (get opts :cursor (if sequence? :captured []))
+        captured (when (= :captured direction)
+                   (vec (keep (fn [i]
+                     (let [step (nth (:steps run) (dec i))
+                           gesture (get-in step [:basis :gesture])]
+                       (when (and gesture (= :click (get-in step [:trace :action 2 0])))
+                         {:at (max 0 (- (at i) 0.15))
+                          :x (:x gesture) :y (:y gesture) :click true}))) indices)))
+        cursor (if (= :captured direction) captured direction)
+        marks (mapv (fn [i] {:step i :at (at i)}) indices)
+        base (merge (dissoc opts :capture :step-seconds :cursor)
+                    {:id id :source (frame run end) :step-marks marks})
+        base (if (or (:source opts) (:shots opts)) (merge base (select-keys opts [:source :shots]))
+                 (if sequence? (assoc base :shots shots) base))
+        base (if (seq cursor) (assoc base :cursor cursor) base)
+        last-time (apply max 0 (concat (map :at (:shots base)) (map :at cursor)
+                                      (map :at (:camera base)) (map :at marks)))]
+    (assoc base :duration (max (or (:duration opts) 0) (+ last-time 0.25)))))
+
+(defn plan
+  "Resolve inline scenes against captured evidence. Stable scene names and
+   local step marks replace handwritten frame numbers and registration maps."
+  [scen run opts]
+  (film/from-run run (mapv (fn [g] (edit-scene run g)) (groups scen)) opts))
+
+(defn presentation
+  "Attach an exported film clock without changing the original run or claims.
+   url maps an export-relative filename to a host URL."
+  [run manifest url]
+  (let [marks (vec (mapcat (fn [scene]
+                           (map (fn [mark] {:step (get mark "step")
+                                           :t (+ (get scene "offset") (get mark "at"))})
+                                (get scene "step-marks" []))) (get manifest "scenes")))
+        exact (into {} (map (fn [mark] [(:step mark) (:t mark)]) marks))
+        steps (reduce (fn [acc step]
+                        (conj acc (assoc step :t (get exact (:i step) (or (:t (last acc)) 0)))))
+                      [] (:steps run))]
+    (assoc run :steps steps :duration-ms (* 1000 (get manifest "duration"))
+           :media {:kind :video :src (url "demo.mp4") :captions (url "subtitles.vtt")
+                   :language (get manifest "language") :marks marks})))
+
+(defn- write-value! [path value]
+  (File/write! (str path ".edn") (pr-str value))
+  (File/write! (str path ".json") (interop/->json value)))
+
+(defn- snapshot [value]
+  ;; Predicates belong to the source test. Save their verdict and a marker,
+  ;; never an executable closure in the portable evidence value.
+  (cond
+    (fn? value) {:kind :function}
+    (map? value) (into {} (map (fn [[k v]] [k (snapshot v)]) value))
+    (sequential? value) (mapv snapshot value)
+    :else value))
+
+(defn- execute! [opts scen]
+  (let [id (or (:id opts) (throw (ex-info "A demo needs an id" {})))
+        _ (when (or (empty? id) (String/contains? id "/") (String/contains? id "\\") (= id ".."))
+            (throw (ex-info "Demo id must be a single path component" {})))
+        out (Path/expand (or (:output opts) (str "!tasks/evidence/demos/" (:namespace opts "demo") "/" id)))
+        context {:id id :output out :frames (str out "/frames")}
+        _ (groups scen)
+        _ (File/mkdir_p! out)
+        world (if (map? (:world opts)) (:world opts) ((:world opts) context))
+        result (try (scenario/run-world scen world)
+                    (finally (when (:dispose! world) ((:dispose! world)))))
+        run (snapshot (adapt/of-scenario result {:id id :title (:title opts) :tags (:tags opts)}))
+        _ (write-value! (str out "/run") run)
+        _ (write-value! (str out "/suite") (adapt/suite (or (:title opts) (:name scen)) [run]))
+        value (plan scen run (:film opts {}))
+        _ (File/write! (str out "/film.json") (interop/->json value))
+        export? (get opts :export? (= "1" (System/get_env "BL_DEMO_EXPORT")))
+        _ (when (and export? (or (not (:ok result)) (not (contains? #{:witnessed :proven} (:verdict run)))))
+            (throw (ex-info "A failed demo was captured; client export requires a passing scenario" {:output out})))
+        manifest (when export? (film/export! value (str out "/film") (:export opts {})))
+        playback (when manifest
+                   (presentation run manifest (or (:media-url opts) (fn [file] (str "film/" file)))))
+        _ (when playback (write-value! (str out "/presentation") playback))
+        suite (adapt/suite (or (:title opts) (:name scen)) [(or playback run)])
+        _ (write-value! (str out "/suite") suite)]
+    {:ok (:ok result) :run run :film value :manifest manifest :presentation playback :output out}))
+
+(defn run!
+  "Execute a normal scenario and derive its film from inline scene metadata.
+   :world is a world or (fn [context] world). :with-fixture wraps execution.
+   Test runs capture only; BL_DEMO_EXPORT=1 or :export? true also renders."
+  [opts scen]
+  (if (:with-fixture opts) ((:with-fixture opts) (fn [] (execute! opts scen)))
+    (execute! opts scen)))
+
+(defn check!
+  "Run a demo through the ordinary test reporter, one assertion per property."
+  [ns opts scen]
+  (let [result (run! opts scen)
+        properties (concat (get-in result [:run :claims]) (get-in result [:run :stretches]))]
+    (doseq [property properties]
+      (BeamLisp.TestRT/record ns (if (contains? #{:proven :witnessed} (:verdict property)) :pass :fail)
+        :demo (:msg property) :witnessed (:verdict property)))
+    (when (empty? properties)
+      (BeamLisp.TestRT/record ns (if (:ok result) :pass :fail) :demo "Scenario completes" true (:ok result)))
+    result))
+
+(defmacro defdemo
+  "A demo is an ordinary registered test. Options and fixture setup execute
+   only when the test runs; several demos can share helpers in one source."
+  [test-name opts scen]
+  `(do
+     (BeamLisp.TestRT/register_test ~(BeamLisp.Env/current_ns) ~(BeamLisp.TestRT/sym_name test-name)
+       (fn [] (scenario.demo/check! ~(BeamLisp.Env/current_ns)
+                (merge {:id ~(BeamLisp.TestRT/sym_name test-name) :namespace ~(BeamLisp.Env/current_ns)} ~opts)
+                ~scen)))
+     nil))
+
+(defn run-tests!
+  "Run this source's ordinary registered tests under bl run. During bl test
+   declaration, leave execution to the test command. Failures raise."
+  [ns]
+  (when (not (BeamLisp.TestRT/declaring?))
+    (let [result (BeamLisp.TestRT/run_ns ns)]
+      (BeamLisp.TestRT/print_summary result)
+      (when (> (+ (:fail result) (:error result)) 0)
+        (throw (ex-info "Demo tests failed" result)))
+      result)))
+
+(defn- asset-url [root path]
+  (str "/demo-assets/" (Path/relative_to (Path/expand path) root)))
+
+(defn load-suite
+  "Load all captured demo tests under directory into the ordinary runner.
+   Resolve screenshots and movie URLs at display time, on the same origin."
+  [directory title]
+  (let [root (Path/expand directory)
+        files (if (File/exists? (str root "/suite.edn")) [(str root "/suite.edn")]
+                  (Path/wildcard (str root "/*/suite.edn")))
+        runs (mapcat (fn [file]
+                       (let [dir (Path/dirname file)]
+                         (map (fn [run]
+                                (-> (if (:media run)
+                                      (assoc run :media (merge (:media run)
+                                        {:src (asset-url root (str dir "/film/demo.mp4"))
+                                         :captions (asset-url root (str dir "/film/subtitles.vtt"))})) run)
+                                    (update :steps (fn [steps]
+                                      (mapv (fn [step]
+                                        (if-let [frame (get-in step [:basis :frame])]
+                                          (let [screen (str "<!doctype html><html><body style='margin:0'><img style='width:100%;height:100vh;object-fit:contain' src='"
+                                                            (asset-url root frame) "'></body></html>")]
+                                            (assoc step :screen screen :screens {(:actor step) screen})) step)) steps)))))
+                              (:runs (edn/read-string (File/read! file)))))) files)]
+    (adapt/suite title runs)))
+
+(defn serve!
+  "Browse every demo in directory, including range-seekable movies, on one
+   loopback port (default 4163). Returns a live.app handle for stop!."
+  ([directory] (serve! directory {}))
+  ([directory opts]
+   (let [root (Path/expand directory)
+         assets (into {} (map (fn [file] [(asset-url root file) file])
+                             (Path/wildcard (str root "/**/*.{png,mp4,vtt,webm}"))))]
+     (runner/set-suite! (load-suite root (or (:title opts) "Demo scenarios")))
+     (live/serve (runner/app-value)
+       {:port (or (:port opts) 4163) :ip (tuple 127 0 0 1) :log (get opts :log :off)
+        :around (fn [handler conn]
+                  (if-let [file (get assets (web/path conn))]
+                    (if (contains? #{"get" "head"} (web/method conn))
+                      (media/serve-file conn file
+                        (cond (String/ends_with? file ".mp4") "video/mp4"
+                              (String/ends_with? file ".webm") "video/webm"
+                              (String/ends_with? file ".vtt") "text/vtt; charset=utf-8"
+                              :else "image/png"))
+                      (web/text conn 405 "method not allowed"))
+                    (handler conn)))}))))
+
+(defn stop! "Stop a demo gallery and release its owned resources." [handle] (live/stop! handle))

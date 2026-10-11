@@ -1,5 +1,88 @@
 # Make a demo from a scenario
 
+Write a demo alongside its end-to-end assertions in one `.bl`, `.bl.org` or
+`.bl.md` source. One file can declare several independent demo tests and share
+ordinary functions for setup. `scenario.demo/defdemo` registers each with the
+existing test engine; `scene` annotates ordinary scenario events with their
+client presentation.
+
+```clojure
+(ns project.demos
+  (:require [scenario :as s] [scenario.demo :as demo]
+            [browser.film :as browser] [browser.page :as page]))
+
+(defn options []
+  {:world (fn [{:keys [frames]}]
+            (browser/owned-world :viewer (browser-options) frames))
+   :film {:voice "aura-2-hector-fr" :language "fr"}
+   :export {:env-file ".env"}})
+
+(demo/defdemo save-a-document (options)
+  (s/scenario "Enregistrer un document" {:viewer {}}
+    [(s/does :viewer [:navigate "http://127.0.0.1:4000/"])
+     (s/does :viewer [:wait "!!document.querySelector('#save')"])
+     (demo/scene :save
+       {:title "Enregistrer votre document"
+        :say "Enregistrez votre document. Votre travail est conservé."
+        :camera [{:at 0 :zoom 1} {:at 2 :zoom 1.4 :x 0.8 :y 0.7}]}
+       (s/does :viewer [:click "#save"])
+       (s/sees :viewer (fn [p _] (= "Enregistré" (page/evaluate! p "document.querySelector('#status').textContent")))
+         "The saved document is confirmed"))]))
+
+(demo/run-tests! "project.demos")
+```
+
+`browser-options` supplies your browser runtime, viewport and isolated profile;
+the executable [two-demo literate example](../../examples/scenario/browser-demos.bl.org)
+includes that setup. Importing or declaring a demo starts no browser or speech
+request. Use `bl -p optional/browser-port/bl test project/demos.bl.org` for
+ordinary tests with captured evidence. `BL_DEMO_EXPORT=1` also renders one
+movie per demo. `bl run` executes the same tests through `demo/run-tests!`;
+inside the test command that call leaves execution to the normal test driver.
+
+Scenes keep scenario semantics: the same events, witnesses, patterns and
+assertions run through `scenario/run-world`. Scene names are unique within a
+demo. Events outside scenes are asserted setup. Scenes select captured frames
+and real clicks automatically, with an initial before-state when available.
+`:step-seconds` controls their presentation spacing (default 0.6 seconds).
+`:capture :end` holds the final observed state. `:cursor []` hides the pointer;
+an explicit keyframe vector overrides its captured track. The camera, subtitle,
+local audio and other film options below also work inline. Visual tracks and
+step marks extend a scene's minimum duration; speech can extend it further.
+
+The world may be an ordinary map or `(fn [context] world)`, with context
+`{:id :output :frames}`. A custom world supplies captured image paths through
+its `:basis :frame`, or a scene supplies `:source`/`:shots`. The optional native
+`browser/owned-world` acquires its page when execution starts. Its `:dispose!`
+hook is called in `finally`, including after an action exception. The existing
+caller-owned `browser/world` remains available. `:with-fixture (fn [run] …)`
+wraps execution with a project's fixture setup and cleanup.
+
+Outputs default to `!tasks/evidence/demos/<namespace>/<test-name>/`; `:output`
+overrides the directory. `run.edn`/`run.json` retain normalized observations,
+with executable predicates represented by markers and their actual verdicts
+preserved. The library derives `film.json`, measured presentation marks and
+`suite.edn`; these are generated artifacts. `demo/run!` returns their values
+for ordinary `deftest` integration, while `defdemo` reports each claim through
+the existing assertion reporter. Refuted or unverified runs remain available
+for inspection and cannot produce a client export.
+
+`demo/serve!` opens all generated demo tests below a directory in the standard
+runner, with screenshots, movies and captions on one loopback origin:
+
+```clojure
+(def gallery (demo/serve! "!tasks/evidence/demos/project.demos" {:port 4163}))
+;; Later:
+(demo/stop! gallery)
+```
+
+It resolves artifact URLs when opening the gallery and serves only registered
+media files, with byte-range seeking. Each exported step's film time comes
+from its scene; no separate registration script or hand-maintained frame map
+is needed.
+
+## Direct film authoring
+
 `scenario.film` authors a film as data. Keep the scenario's assertions in its
 run; write the film's narration for the people watching it.
 
