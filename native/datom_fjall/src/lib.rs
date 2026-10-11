@@ -50,6 +50,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode};
 
+mod checkpoint;
 mod keycodec;
 use keycodec::KeyVal;
 
@@ -111,6 +112,7 @@ mod atoms {
 /// read and its write. fjall serialises its own writes, but the read in one
 /// operation and the write in another could still straddle without this.
 pub(crate) struct DbHandle {
+    path: PathBuf,
     pub(crate) keyspace: Keyspace,
     pub(crate) datoms: PartitionHandle,
     /// Serializes `-cas` and each write batch. SHARED, because two handles over
@@ -365,6 +367,7 @@ fn fjall_open<'a>(env: Env<'a>, path: String) -> NifResult<Term<'a>> {
         Err(ClaimError::Engine(e)) => return Err(err(e)),
     };
     let arc = ResourceArc::new(DbHandle {
+        path: fs::canonicalize(&path).map_err(err)?,
         keyspace: claim.engine.keyspace.clone(),
         datoms: claim.engine.datoms.clone(),
         lock: claim.engine.lock.clone(),
