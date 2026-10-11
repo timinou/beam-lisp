@@ -32,8 +32,10 @@ client presentation.
 (demo/run-tests! "project.demos")
 ```
 
-`browser-options` supplies your browser runtime, viewport and isolated profile;
-the executable [two-demo literate example](../../examples/scenario/browser-demos.bl.org)
+`browser-options` supplies your browser runtime and viewport; `owned-world`
+defaults to short temporary profile/runtime directories and cleans them up.
+Explicit paths remain available for caller-managed persistent profiles.
+The executable [two-demo literate example](../../examples/scenario/browser-demos.bl.org)
 includes that setup. Importing or declaring a demo starts no browser or speech
 request. Use `bl -p optional/browser-port/bl test project/demos.bl.org` for
 ordinary tests with captured evidence. `BL_DEMO_EXPORT=1` also renders one
