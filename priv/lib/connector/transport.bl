@@ -1,0 +1,82 @@
+; Provider-neutral bounded HTTP. Redirects and implicit retries are disabled:
+; callers decide credential audience and whether a write may be repeated.
+(ns connector.transport (:require [bl.json :as json]))
+
+(defn headers-map [xs]
+  (into {} (map (fn [p] [(String/downcase (erlang/list_to_binary (elem p 0)))
+                         (erlang/iolist_to_binary (elem p 1))]) (to-list xs))))
+(defn form [values]
+  (join "&" (map (fn [[k v]] (str (URI/encode_www_form (str k)) "=" (URI/encode_www_form (str v)))) values)))
+(defn multipart [parts]
+  (let [boundary (str "bl-" (String/downcase (Base/encode16 (crypto/strong_rand_bytes 16))))
+        clean (fn [s] (String/replace (String/replace (str s) "\r" "") "\n" ""))
+        body (apply str (concat
+               (map (fn [{:keys [name filename content-type bytes]}]
+                      (str "--" boundary "\r\nContent-Disposition: form-data; name=\""
+                        (String/replace (clean name) "\"" "") "\""
+                        (when filename (str "; filename=\"" (String/replace (clean filename) "\"" "") "\""))
+                        "\r\n" (when content-type (str "Content-Type: " (clean content-type) "\r\n"))
+                        "\r\n" bytes "\r\n")) parts)
+               [(str "--" boundary "--\r\n")]))]
+    {:content-type (str "multipart/form-data; boundary=" boundary) :bytes body}))
+
+(defn- finish [status headers bytes decode]
+  (let [body (if (= decode :json)
+               (if (= "" bytes) nil (try (json/decode bytes) (catch _ ::malformed))) bytes)]
+    (if (= body ::malformed)
+      {:status status :headers headers :error :invalid-json :outcome :uncertain}
+      {:status status :headers headers :body body
+       :outcome (cond (and (>= status 200) (< status 300)) :accepted
+                      (>= status 500) :uncertain :else :rejected)})))
+
+(defn- receive-response [id limit decode deadline chunks size headers handler]
+  (let [remaining (max 1 (- deadline (erlang/monotonic_time :millisecond)))]
+    (receive
+      [:http [rid :stream_start hs pid]] :when (= rid id)
+      (let [h (headers-map hs) declared (try (String/to_integer (get h "content-length" "0")) (catch _ 0))]
+        (if (> declared limit)
+          (do (httpc/cancel_request id) {:status 0 :error :too-large :outcome :uncertain})
+          (do (httpc/stream_next pid) (receive-response id limit decode deadline chunks size h pid))))
+      [:http [rid :stream chunk]] :when (= rid id)
+      (let [total (+ size (erlang/byte_size chunk))]
+        (if (> total limit)
+          (do (httpc/cancel_request id) {:status 0 :error :too-large :outcome :uncertain})
+          (do (httpc/stream_next handler)
+              (receive-response id limit decode deadline (conj chunks chunk) total headers handler))))
+      [:http [rid :stream_end hs]] :when (= rid id)
+      (finish (if (get headers "content-range") 206 200) (merge headers (headers-map hs)) (apply str chunks) decode)
+      [:http [rid [:error reason]]] :when (= rid id)
+      {:status 0 :error (if (or (= :body_too_big reason)
+                                 (and (erlang/is_tuple reason) (= :body_too_long (elem reason 0)))) :too-large :transport) :outcome :uncertain}
+      [:http [rid response]] :when (= rid id)
+      (let [status (elem (elem response 0) 1) bytes (elem response 2)]
+        (if (> (erlang/byte_size bytes) limit)
+          {:status status :error :too-large :outcome :uncertain}
+          (finish status (headers-map (elem response 1)) bytes decode)))
+      (after remaining
+        (httpc/cancel_request id)
+        {:status 0 :error :timeout :outcome :uncertain}))))
+
+(defn request!
+  "One request; never follows redirects or retries effects. Returns bounded data.
+   Run from an I/O worker, since httpc stream messages belong to the caller."
+  [{:keys [method url headers body encoding decode timeout-ms max-bytes]
+    :or {method :get headers {} encoding :json decode :json timeout-ms 10000 max-bytes 1048576}}]
+  (Application/ensure_all_started :ssl) (Application/ensure_all_started :inets)
+  (try
+    (let [payload (case encoding :form {:bytes (form body) :content-type "application/x-www-form-urlencoded"}
+                                 :multipart (multipart body)
+                                 :bytes {:bytes body :content-type (get headers "content-type" "application/octet-stream")}
+                                 {:bytes (json/encode body) :content-type "application/json"})
+          hs (to-list (map (fn [[k v]] (tuple (String/to_charlist k) (String/to_charlist v))) (dissoc headers "content-type")))
+          req (if (and (nil? body) (contains? #{:get :head :delete} method))
+                (tuple (String/to_charlist url) hs)
+                (tuple (String/to_charlist url) hs (String/to_charlist (:content-type payload)) (:bytes payload)))
+          r (httpc/request method req
+              (list (tuple :timeout timeout-ms) (tuple :autoredirect false) (tuple :autoretry 0)
+                    (tuple :ssl (httpc/ssl_verify_host_options true)))
+              (list (tuple :sync false) (tuple :stream (tuple :self :once)) (tuple :max_body_size max-bytes)))]
+      (if (= :ok (elem r 0))
+        (receive-response (elem r 1) max-bytes decode (+ (erlang/monotonic_time :millisecond) timeout-ms) [] 0 {} nil)
+        {:status 0 :error :transport :outcome :uncertain}))
+    (catch _ {:status 0 :error :transport :outcome :uncertain})))

@@ -133,7 +133,7 @@ fn make_binary<'a>(env: Env<'a>, bytes: &[u8]) -> NifResult<Term<'a>> {
 
 /// A bl Vector: an Erlang map with a `__struct__` key whose `items` is a TUPLE.
 ///
-/// This is the one cross-language shape duplicated from `lib/beam_lisp/vector.ex`.
+/// This is the cross-language shape of `priv/host/vector.bl`.
 /// It is a contract, so it is written once, here, and named.
 fn make_vector<'a>(
     env: Env<'a>,
@@ -143,8 +143,8 @@ fn make_vector<'a>(
     vec_mod: Atom,
 ) -> NifResult<Term<'a>> {
     let tuple = make_tuple(env, &items);
-    let keys = [struct_k.to_term(env), items_k.to_term(env)];
-    let vals = [vec_mod.to_term(env), tuple];
+    let keys = [struct_k.to_term(env), items_k.to_term(env), Atom::from_str(env, "meta")?.to_term(env)];
+    let vals = [vec_mod.to_term(env), tuple, rustler::types::atom::nil().to_term(env)];
     // ONE call for the whole struct, instead of two `map_put`s that each copy the map.
     Term::map_from_term_arrays(env, &keys, &vals)
 }
