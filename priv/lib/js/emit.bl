@@ -1,12 +1,6 @@
-; priv/lib/js/emit.bl — Beam Lisp → JavaScript, the SYNC profile.
-;
-; One BL namespace becomes one ES module. Every top-level `defn` becomes a JS
-; function, every call a JS call, every `loop`/`recur` a labelled `for(;;)`.
-; There is no scheduler, no mailbox and no step machine: this profile is for
-; code that RUNS TO COMPLETION in response to an event — an editor's command,
-; a view, a parser — which is most UI code. (The actor profile in
-; research/js-actors keeps the generator machine for code that must be
-; preempted; PLAN-161 D2.)
+; priv/lib/js/emit.bl — one Beam Lisp → JavaScript actor-frame backend.
+; Ordinary modules and process kernels share control frames and compiled BL semantics.
+; Guards and native ABI leaves remain synchronous checked boundaries.
 ;
 ; ── Pipeline ──────────────────────────────────────────────────────────────
 ;
@@ -115,7 +109,7 @@
 (def ^:private st-key :js_emit_state)
 
 (defn reset-state! []
-  (erlang/put st-key {:n 0 :kws {} :kw-order []}))
+  (erlang/put st-key {:n 0 :kws {} :kw-order [] :sites {} :site-order []}))
 
 (defn- st [] (erlang/get st-key))
 (defn- st! [m] (erlang/put st-key m))
@@ -142,7 +136,8 @@
 (defn kw-decls
   "The const declarations for every keyword the module interned, in first-use order."
   []
-  (map (fn [[id fq]] (str "const " id " = R.kw(" (js-str fq) ");")) (:kw-order (st))))
+  (concat (map (fn [[id fq]] (str "const " id " = R.kw(" (js-str fq) ");")) (:kw-order (st)))
+          (map (fn [[id value]] (str "const " id " = Object.freeze(" value ");")) (:site-order (st)))))
 
 ; ─── literals ───────────────────────────────────────────────────────────────
 
@@ -246,7 +241,7 @@
   [callee-js args ctx]
   (finish {:lines (:lines args) :val (str callee-js "(" (join ", " (:vals args)) ")")} ctx))
 
-(defn- call-source [ctx]
+(defn- call-source-value [ctx]
   (let [a (:call-source ctx)
         scalar (fn [value] (if (nil? value) "null" (str value)))
         string (fn [value] (if (nil? value) "null" (js-str value)))]
@@ -255,6 +250,13 @@
          ",fn:" (string (:source-fn ctx)) ",arity:" (scalar (:source-arity ctx))
          ",call:" (js-str (if (= [:return] (:dest ctx)) "tail" "direct"))
          ",internal:" (if (and (:file a) (ends-with? (:file a) "/actor/runtime.bl")) "true" "false") "}")))
+(defn- call-source [ctx]
+  (let [value (call-source-value ctx) s (st)]
+    (if-let [id (get (:sites s) value)] id
+      (let [id (str "S_" (count (:sites s)))]
+        (st! (assoc s :sites (assoc (:sites s) value id)
+                      :site-order (conj (:site-order s) [id value])))
+        id))))
 (defn- call-evidence [ctx]
   (str ", " (call-source ctx) (if (= [:return] (:dest ctx)) ", true" "")))
 
@@ -516,18 +518,16 @@
         params (vec (map (fn [i] (str "a" i)) (range arity)))
         target (or (:self-target ctx) jsname)
         ctx2 (assoc ctx :source-fn (:fn-label ctx) :source-arity arity :fn-label nil
-                    :actor (:actor-profile ctx) :dest [:return] :loop nil :self-target nil
+                    :actor true :dest [:return] :loop nil :self-target nil
                     :self-arities (if (some? (:self-target ctx)) (:self-arities ctx) #{arity})
                     :self-js target
                     :selves (if (nil? self) (:selves ctx) (assoc (or (:selves ctx) {}) self target)))
         body (concat (mapcat (fn [cl] (clause-lines cl params ctx2)) cls)
                      (list (str "throw new R.BLError(\"no matching clause for " (js-escape (or (:fn-label ctx) jsname))
                                 " with \" + [" (join ", " (map (fn [p] (str "R.printStr(" p ")")) params)) "].join(\" \"));")))]
-    (if (:actor-profile ctx)
-      (str "(()=>{const " jsname " = C.fn(" (js-str (or (:fn-label ctx) jsname)) ", " arity
+    (str "(()=>{const " jsname " = C.fn(" (js-str (or (:fn-label ctx) jsname)) ", " arity
            ", function*(rt, args){" (join "" (map (fn [i] (str "const " (nth params i) "=args[" i "];")) (range arity)))
-           (join "\n" body) "});return " jsname ";})()")
-      (str "function " jsname "(" (join ", " params) ") {\n" (join "\n" body) "\n}"))))
+           (join "\n" body) "});return " jsname ";})()")))
 
 (defn- fn-value
   "A bare fn value (a scaffold or a raw :fn): {:lines :val} where :val names
@@ -562,21 +562,10 @@
         lines (concat
                 (map (fn [[n r]] (str "const " nm "_" n " = " (:val r) ";")) arms)
                 (if (nil? v) (list) (list (str "const " nm "_v = " (:val (second v)) ";"))))
-        dispatch (str "function " nm "(...args) {\n"
-                      (join "\n" (map (fn [[n _]] (str "if (args.length === " n ") return " nm "_" n "(...args);")) arms))
-                      "\n"
-                      (if (nil? v) ""
-                        (str "if (args.length >= " (first v) ") return " nm "_v(...args.slice(0, " (first v) "), args.length > " (first v) " ? R.listFromArray(args, " (first v) ") : R.EMPTY);\n"))
-                      "throw new R.BLError(\"wrong number of args (\" + args.length + \")\");\n}")]
-    ; the variadic clause rides on the dispatcher as `.v`: a BEAM-ABI caller
-    ; (`ns/f__bl_v`, the rest args already ONE list) calls it directly
-    (finish {:lines (concat lines
-              (if (:actor-profile ctx)
-                [(str "const " nm " = C.multi(" (js-str nm) ", new Map(["
+        dispatch [(str "const " nm " = C.multi(" (js-str nm) ", new Map(["
                   (join "," (map (fn [[n _]] (str "[" n "," nm "_" n "]")) arms)) "]), "
-                  (if v (str (first v) ", " nm "_v") "null, null") ");")]
-                (concat [dispatch] (if (nil? v) [] [(str nm ".v = " nm "_v;")]))))
-             :val nm} ctx)))
+                  (if v (str (first v) ", " nm "_v") "null, null") ");")]]
+    (finish {:lines (concat lines dispatch) :val nm} ctx)))
 
 ; ─── loops ──────────────────────────────────────────────────────────────────
 

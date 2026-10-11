@@ -1,743 +1,7 @@
-; runtime.bl — the actor runtime, written in beam-lisp.
-;
-; Compiled by research/js-actors/compiler.bl with the SAME ANF→JS backend that
-; compiles application code. Nothing in this file is JavaScript; the only
-; JavaScript it reaches is the host's leaf operations (`host/…`) and the
-; scheduler bridge (`host/run-turn`, `host/park`, `host/wait-until`,
-; `host/now`, `host/state`).
-;
-; Two layers live here.
-;
-;   1. THE PRELUDE. Beam-lisp semantics above the host's leaves: list and
-;      vector walking, map access, equality, string building, keyword/name.
-;      Every `rt-*`/`core-*` name below is defined over `host/…` leaves only,
-;      so the prelude is the bottom of the bootstrap. It also holds the TARGET
-;      EXCEPTION POLICY — what a raise's class and reason mean — so that
-;      compiler.bl maps the
-;      core names the compiler links (Elixir.BeamLisp.Ns.Rt/first,
-;      Elixir.BeamLisp.Ns.Core/inc, …) onto these functions.
-;
-;   2. THE ACTOR RUNTIME. Process registry, runnable queue, mailbox, receive
-;      selection with a scan cursor and a monotonic deadline, timeout wait
-;      registration and wakeups, process LINKS, MONITORS, exit signals and the
-;      one atomic death cleanup, plus the scheduler. All of it is BL data and
-;      BL control flow.
-;
-;   3. NAMES AND THE CALL PROTOCOL. The address table (one name → one live
-;      process, retracted by the same death transaction) and the correlated
-;      `call`/`cast`/`reply`/`stop` verbs over the existing mailbox, exposed to
-;      source as the generic core verbs `call`, `cast`, `stop`, `whereis`,
-;      `register` and `unregister`.
-;
-;   4. TABLES. Shared mutable state that outlives the process that made it: a
-;      BL identity and metadata over one host-native store per table, with
-;      OWNERSHIP (owner death disposes), an HEIR (a transfer instead of a
-;      disposal), access MODES, NAMES and the atomic read-modify-write. The
-;      host contributes storage and bounds only; section 5 states the whole
-;      contract and the subset it deliberately refuses.
-;
-; The host owns exactly one piece of retained state used here — the mutable
-; root `rt.state` (a BL map threaded through `host/state` / `host/set-state`),
-; which is what lets a running process see the scheduler's registry.
+; Canonical BL actor policy. Collection, numeric, callable and exception
+; semantics link to the ordinary compiled core/rt graph through js.build.
+; Only process/mailbox/table/supervisor policy and irreducible host leaves live here.
 
-; ─────────────────────────────────────────────────────────────────────────────
-; 1. Prelude — semantics over host leaves
-; ─────────────────────────────────────────────────────────────────────────────
-
-(defn rt-eqv [a b] (host/eq a b))
-(defn rt-identical? [a b] (host/identical a b))
-(defn rt-hash-key [x] x)
-
-(defn rt-first [xs]
-  (cond
-    (host/is-nil xs) nil
-    (host/is-enil xs) nil
-    (host/is-cons xs) (host/cons-head xs)
-    (host/is-vec xs) (if (host/lt 0 (host/vec-size xs)) (host/vec-el xs 0) nil)
-    (host/is-set xs) (if (host/eq 0 (host/set-size xs)) nil (host/cons-head (host/set-to-list xs)))
-    :else (host/raise (host/str-cat "first: not a sequence: " xs))))
-
-(defn rt-rest [xs]
-  (cond
-    (host/is-nil xs) nil
-    (host/is-enil xs) (host/empty-list)
-    (host/is-cons xs) (host/cons-tail xs)
-    ; a vector's rest is a list of the items after the first, as on BEAM
-    (host/is-vec xs) (if (host/lt 0 (host/vec-size xs)) (host/cons-tail (host/vec-to-list xs)) (host/empty-list))
-    :else (host/raise (host/str-cat "rest: not a sequence: " xs))))
-
-(defn rt-nth [xs i]
-  (cond
-    (host/is-nil xs) nil
-    (host/is-enil xs) nil
-    (host/is-cons xs) (if (host/eq i 0)
-                        (host/cons-head xs)
-                        (rt-nth (host/cons-tail xs) (host/arith "sub" i 1)))
-    (host/is-vec xs) (host/vec-el xs i)
-    :else (host/raise (host/str-cat "nth: not a sequence: " xs))))
-
-(defn rt-count [xs]
-  (cond
-    (host/is-nil xs) 0
-    (host/is-enil xs) 0
-    (host/is-cons xs) (host/arith "add" 1 (rt-count (host/cons-tail xs)))
-    (host/is-vec xs) (host/vec-size xs)
-    (host/is-set xs) (host/set-size xs)
-    (host/is-str xs) (host/str-size xs)
-    (host/is-map xs) (host/map-size xs)
-    :else 0))
-
-(defn rt-codepoints [s] (host/str-codepoints s))
-
-(defn rt-cons [h t] (host/cons h t))
-
-(defn rt-conj [coll x]
-  (cond
-    (host/is-vec coll) (host/vec-append coll x)
-    (host/is-set coll) (host/set-put coll x)
-    (host/is-nil coll) (host/cons x (host/empty-list))
-    (host/is-enil coll) (host/cons x (host/empty-list))
-    (host/is-cons coll) (host/cons x coll)
-    :else (host/raise "conj: unsupported collection")))
-
-; ── sets ─────────────────────────────────────────────────────────────
-; A set is a value like any other: `#{…}` compiles to `Set/new` over the
-; element list, and the operations below are BL over the host's set leaves.
-; Enumeration order is the host's small-map key order — the SAME order
-; `keys`/`vals`/`seq` use — so a set and the map behind it never disagree.
-(defn rt-set-new [xs] (host/set-from-list xs))
-(defn rt-set? [s] (host/is-set s))
-(defn rt-set [xs] (host/set-from-list (rt-seq-list xs)))
-(defn rt-disj [s x] (host/set-remove s x))
-(defn rt-quot [a b] (host/arith "quot" a b))
-(defn rt-mod [a b] (host/arith "mod" a b))
-
-(defn rt-get-impl [m k default]
-  (cond
-    (host/is-nil m) default
-    (host/is-vec m) (if (and (not (host/lt k 0)) (host/lt k (host/vec-size m)))
-                      (host/vec-el m k)
-                      default)
-    (host/is-set m) (if (host/set-has m k) k default)
-    :else (host/map-get m k default)))
-
-(defn rt-get
-  ([m k] (rt-get-impl m k nil))
-  ([m k default] (rt-get-impl m k default)))
-
-(defn rt-assoc [m k v] (host/map-put m k v))
-
-(defn rt-empty? [xs]
-  (cond
-    (host/is-nil xs) true
-    (host/is-enil xs) true
-    (host/is-cons xs) false
-    (host/is-vec xs) (host/eq 0 (host/vec-size xs))
-    (host/is-set xs) (host/eq 0 (host/set-size xs))
-    (host/is-str xs) (host/eq 0 (host/str-size xs))
-    :else false))
-
-(defn rt-seq [xs]
-  (cond
-    (host/is-nil xs) nil
-    (host/is-enil xs) nil
-    (host/is-cons xs) xs
-    (host/is-vec xs) (if (host/eq 0 (host/vec-size xs)) nil (host/vec-to-list xs))
-    (host/is-set xs) (if (host/eq 0 (host/set-size xs)) nil (host/set-to-list xs))
-    (host/is-map xs) (if (host/eq 0 (host/map-size xs)) nil (rt-map-entries (host/map-keys xs) xs (host/empty-list)))
-    :else nil))
-
-(defn rt-next [xs] (rt-seq (rt-rest xs)))
-(defn rt-to-list [xs] (rt-seq xs))
-(defn rt-print-str [x] (host/to-str x))
-(defn rt-join-str [xs acc]
-  (if (host/is-enil xs)
-    acc
-    (rt-join-str (host/cons-tail xs)
-                 (host/str-cat acc (host/to-str (host/cons-head xs))))))
-
-; core/* — the unlinked core names an ordinary program reaches by name. The
-; compiler resolves those to `Env.fetch!("core", …)`, which the emitter mirrors
-; by falling back from the source namespace to `core` at registry lookup.
-
-(defn core-list [xs] xs)
-(defn core-not [x] (if (host/truthy x) false true))
-(defn core-nil? [x] (host/is-nil x))
-(defn core-some? [x] (if (host/is-nil x) false true))
-(defn core-not= [a b] (if (host/eq a b) false true))
-(defn core-inc [x] (host/arith "add" x 1))
-(defn core-dec [x] (host/arith "sub" x 1))
-(defn core-keyword [x]
-  (cond
-    (host/is-kw x) x
-    (host/is-str x) (host/kw x)
-    :else (host/kw (host/to-str x))))
-(defn core-name [x] (if (host/is-kw x) (host/kw-name x) (host/to-str x)))
-(defn core-str [& xs] (rt-join-str xs ""))
-(defn core-print [x] (do (host/write (host/to-str x)) nil))
-(defn core-println [x] (do (host/write (host/to-str x)) nil))
-(defn core-vector [& xs] (host/vec-from-list xs))
-(defn core-hash-map [k v more]
-  (let [m (host/map-put (host/empty-map) k v)]
-    (rt-hash-map-more more m)))
-(defn rt-hash-map-more [more m]
-  (if (host/is-enil more)
-    m
-    (rt-hash-map-more (host/cons-tail (host/cons-tail more))
-                      (host/map-put m (host/cons-head more) (rt-first (host/cons-tail more))))))
-
-; ── collection prelude ────────────────────────────────────────────────────────────
-;
-; The value functions ordinary app code reaches (`mapv`, `filterv`, `reduce`,
-; `into`, `update`, …). Each is BL over the same host leaves as the prelude
-; above, so the JS target carries ONE meaning for them and no JavaScript array
-; method sneaks in. They cover vectors, lists, nil and maps (for `keys`,
-; `dissoc`, `contains?`); anything else raises by name rather than guessing.
-; A higher-order one calls its argument through the ordinary call step, so a
-; function value from BL code is the only thing it can run.
-
-(defn rt-seq-list
-  "xs as a proper BL list: a vector's items, a list itself, nil as empty."
-  [xs]
-  (cond
-    (host/is-nil xs) (host/empty-list)
-    (host/is-enil xs) xs
-    (host/is-cons xs) xs
-    (host/is-vec xs) (host/vec-to-list xs)
-    (host/is-set xs) (host/set-to-list xs)
-    (host/is-map xs) (rt-map-entries (host/map-keys xs) xs (host/empty-list))
-    :else (host/raise (host/str-cat "not a sequence: " (host/describe xs)))))
-
-(defn rt-map-entries [ks m acc]
-  (if (host/is-enil ks)
-    (rt-list-reverse acc (host/empty-list))
-    (rt-map-entries (host/cons-tail ks) m
-                    (host/cons (host/vec-from-list (host/cons (host/cons-head ks)
-                                                              (host/cons (host/map-get m (host/cons-head ks) nil)
-                                                                         (host/empty-list))))
-                               acc))))
-
-(defn rt-list-reverse [xs acc]
-  (if (host/is-enil xs) acc (rt-list-reverse (host/cons-tail xs) (host/cons (host/cons-head xs) acc))))
-
-(defn rt-mapv-1 [f xs acc]
-  (if (host/is-enil xs) acc (rt-mapv-1 f (host/cons-tail xs) (host/vec-append acc (f (host/cons-head xs))))))
-(defn rt-mapv [f xs] (rt-mapv-1 f (rt-seq-list xs) (host/vec-from-list (host/empty-list))))
-
-(defn rt-filterv-1 [f xs acc]
-  (if (host/is-enil xs)
-    acc
-    (rt-filterv-1 f (host/cons-tail xs)
-                  (if (host/truthy (f (host/cons-head xs))) (host/vec-append acc (host/cons-head xs)) acc))))
-(defn rt-filterv [f xs] (rt-filterv-1 f (rt-seq-list xs) (host/vec-from-list (host/empty-list))))
-
-(defn rt-reduce-1 [f acc xs]
-  (if (host/is-enil xs) acc (rt-reduce-1 f (f acc (host/cons-head xs)) (host/cons-tail xs))))
-(defn rt-reduce
-  ([f xs] (let [l (rt-seq-list xs)]
-            (if (host/is-enil l) (f) (rt-reduce-1 f (host/cons-head l) (host/cons-tail l)))))
-  ([f init xs] (rt-reduce-1 f init (rt-seq-list xs))))
-
-(defn rt-some [f xs]
-  (let [l (rt-seq-list xs)]
-    (if (host/is-enil l)
-      nil
-      (let [v (f (host/cons-head l))]
-        (if (host/truthy v) v (rt-some f (host/cons-tail l)))))))
-
-(defn rt-into [to from]
-  (rt-reduce-1 (fn [acc x] (rt-conj acc x)) (if (host/is-nil to) (host/empty-list) to) (rt-seq-list from)))
-
-(defn rt-vec [xs] (host/vec-from-list (rt-seq-list xs)))
-(defn rt-last [xs]
-  (let [l (rt-seq-list xs)]
-    (if (host/is-enil l) nil (if (host/is-enil (host/cons-tail l)) (host/cons-head l) (rt-last (host/cons-tail l))))))
-(defn rt-update
-  ([m k f] (host/map-put m k (f (rt-get m k))))
-  ([m k f a] (host/map-put m k (f (rt-get m k) a))))
-(defn rt-assoc-more [m kvs]
-  (if (host/is-enil kvs)
-    m
-    (rt-assoc-more (host/map-put m (host/cons-head kvs) (rt-first (host/cons-tail kvs)))
-                   (rt-rest (host/cons-tail kvs)))))
-(defn core-assoc [m k v & kvs] (rt-assoc-more (host/map-put m k v) kvs))
-(defn rt-dissoc [m k] (if (host/is-nil m) nil (host/map-remove m k)))
-(defn rt-keys [m] (if (host/eq 0 (host/map-size m)) nil (host/map-keys m)))
-(defn rt-contains? [m k]
-  (cond
-    (host/is-nil m) false
-    (host/is-vec m) (and (host/is-int k) (not (host/lt k 0)) (host/lt k (host/vec-size m)))
-    (host/is-set m) (host/set-has m k)
-    :else (not (host/identical (host/map-get m k :__rt-absent__) :__rt-absent__))))
-(defn rt-subs
-  ([s from] (host/str-slice s from (host/str-size s)))
-  ([s from to] (host/str-slice s from to)))
-(defn rt-max [a b] (if (host/lt a b) b a))
-(defn rt-min [a b] (if (host/lt b a) b a))
-(defn rt-zero? [x] (host/eq x 0))
-(defn rt-pos? [x] (host/lt 0 x))
-(defn rt-neg? [x] (host/lt x 0))
-(defn rt-string? [x] (host/is-str x))
-(defn rt-keyword? [x] (host/is-kw x))
-(defn rt-int? [x] (host/is-int x))
-(defn rt-float? [x] (host/is-float x))
-(defn rt-boolean? [x] (host/is-bool x))
-(defn rt-map? [x] (host/is-map x))
-(defn rt-vector? [x] (host/is-vec x))
-
-; ── ordering: compare, sort, sort-by ────────────────────────────────────────────────────
-;
-; `compare` is BL's total order (BeamLisp.Ns.Rt compare): nil < false < true <
-; numbers < strings < keywords < sequentials, each ordered within its kind —
-; numerically, by code point, by name, element-wise (a list and a vector are
-; one family: `(compare '(1) [1])` is 0). Maps and sets have
-; no order here: BEAM orders them by its own map layout, which this target
-; does not reproduce, so comparing one RAISES rather than guess.
-;
-; `sort` is a faithful port of OTP `lists:sort/2`, which BL's `sort` runs
-; (through `Enum.sort/2`): the SAME comparator calls in the SAME order, so a
-; comparator that is not a strict weak order, or a strict one such as `<` that
-; reverses equal keys, gives the same answer on both targets. A comparator may
-; answer a boolean ("a goes first") or a number (<= 0 means "a goes first").
-
-(defn rt-cmp-rank [x]
-  (cond
-    (host/is-nil x) 0
-    (host/identical x false) 1
-    (host/identical x true) 2
-    (host/is-num x) 3
-    (host/is-str x) 4
-    (host/is-kw x) 6
-    ; one SEQUENTIAL family (main's :sequential-family-is-one-value): a list
-    ; and a vector with equal elements compare 0, as on BEAM
-    (host/is-list x) 70
-    (host/is-vec x) 70
-    :else (host/raise (host/str-cat "compare: no order for " (host/describe x) " on this target"))))
-
-(defn rt-compare-seqs [a b]
-  (cond
-    (host/is-enil a) (if (host/is-enil b) 0 -1)
-    (host/is-enil b) 1
-    :else (let [c (rt-compare (host/cons-head a) (host/cons-head b))]
-            (if (host/eq c 0) (rt-compare-seqs (host/cons-tail a) (host/cons-tail b)) c))))
-
-(defn rt-compare [a b]
-  (if (host/eq a b)
-    0
-    (let [ra (rt-cmp-rank a) rb (rt-cmp-rank b)]
-      (cond
-        (host/lt ra rb) -1
-        (host/lt rb ra) 1
-        (host/eq ra 3) (if (host/lt a b) -1 (if (host/lt b a) 1 0))
-        (host/eq ra 4) (host/str-cmp a b)
-        (host/eq ra 6) (host/str-cmp (host/kw-name a) (host/kw-name b))
-        :else (rt-compare-seqs (rt-seq-list a) (rt-seq-list b))))))
-
-; the comparison functions as VALUES (`(sort > xs)`): two arguments, as BEAM
-; `<` orders the numbers and strings this target has
-(defn core-lt [a b] (host/lt a b))
-(defn core-gt [a b] (host/lt b a))
-(defn core-le [a b] (if (host/lt b a) false true))
-(defn core-ge [a b] (if (host/lt a b) false true))
-(defn core-eq [a b] (host/eq a b))
-
-(defn rt-cmp-le
-  "Does `a` go first? the runtime's comparator_le over `(cmp a b)`."
-  [cmp a b]
-  (let [r (cmp a b)]
-    (cond
-      (host/is-bool r) r
-      (host/is-num r) (if (host/lt 0 r) false true)
-      :else false)))
-
-(defn rt-l1 [a] (host/cons a (host/empty-list)))
-
-; lists:sort/2 — split into ascending/descending runs …
-(defn rt-fsplit-1 [y x f l r rs]
-  (if (host/is-enil l)
-    (rt-rfmergel (host/cons (host/cons y (host/cons x r)) rs) (host/empty-list) f :asc)
-    (let [z (host/cons-head l) l2 (host/cons-tail l)]
-      (cond
-        (f y z) (rt-fsplit-1 z y f l2 (host/cons x r) rs)
-        (f x z) (rt-fsplit-1 y z f l2 (host/cons x r) rs)
-        (host/is-enil r) (rt-fsplit-1 y x f l2 (rt-l1 z) rs)
-        :else (rt-fsplit-1-1 y x f l2 r rs z)))))
-
-(defn rt-fsplit-1-1 [y x f l r rs s]
-  (if (host/is-enil l)
-    (rt-rfmergel (host/cons (rt-l1 s) (host/cons (host/cons y (host/cons x r)) rs)) (host/empty-list) f :asc)
-    (let [z (host/cons-head l) l2 (host/cons-tail l)]
-      (cond
-        (f y z) (rt-fsplit-1-1 z y f l2 (host/cons x r) rs s)
-        (f x z) (rt-fsplit-1-1 y z f l2 (host/cons x r) rs s)
-        (f s z) (rt-fsplit-1 z s f l2 (host/empty-list) (host/cons (host/cons y (host/cons x r)) rs))
-        :else (rt-fsplit-1 s z f l2 (host/empty-list) (host/cons (host/cons y (host/cons x r)) rs))))))
-
-(defn rt-fsplit-2 [y x f l r rs]
-  (if (host/is-enil l)
-    (rt-fmergel (host/cons (host/cons y (host/cons x r)) rs) (host/empty-list) f :desc)
-    (let [z (host/cons-head l) l2 (host/cons-tail l)]
-      (cond
-        (not (f y z)) (rt-fsplit-2 z y f l2 (host/cons x r) rs)
-        (not (f x z)) (rt-fsplit-2 y z f l2 (host/cons x r) rs)
-        (host/is-enil r) (rt-fsplit-2 y x f l2 (rt-l1 z) rs)
-        :else (rt-fsplit-2-1 y x f l2 r rs z)))))
-
-(defn rt-fsplit-2-1 [y x f l r rs s]
-  (if (host/is-enil l)
-    (rt-fmergel (host/cons (rt-l1 s) (host/cons (host/cons y (host/cons x r)) rs)) (host/empty-list) f :desc)
-    (let [z (host/cons-head l) l2 (host/cons-tail l)]
-      (cond
-        (not (f y z)) (rt-fsplit-2-1 z y f l2 (host/cons x r) rs s)
-        (not (f x z)) (rt-fsplit-2-1 y z f l2 (host/cons x r) rs s)
-        (not (f s z)) (rt-fsplit-2 z s f l2 (host/empty-list) (host/cons (host/cons y (host/cons x r)) rs))
-        :else (rt-fsplit-2 s z f l2 (host/empty-list) (host/cons (host/cons y (host/cons x r)) rs))))))
-
-; … then merge the runs pairwise, alternating direction
-(defn rt-fmergel [ls acc f o]
-  (cond
-    (host/is-enil ls) (rt-rfmergel acc (host/empty-list) f o)
-    (host/is-enil (host/cons-tail ls))
-      (if (host/is-enil acc)
-        (host/cons-head ls)
-        (rt-rfmergel (host/cons (rt-list-reverse (host/cons-head ls) (host/empty-list)) acc) (host/empty-list) f o))
-    :else
-      (let [a (host/cons-head ls) b (host/cons-head (host/cons-tail ls)) more (host/cons-tail (host/cons-tail ls))
-            t1 (if (host/eq o :asc) a b)
-            h (if (host/eq o :asc) b a)]
-        (rt-fmergel more (host/cons (rt-fmerge2-1 t1 (host/cons-head h) f (host/cons-tail h) (host/empty-list)) acc) f o))))
-
-(defn rt-rfmergel [ls acc f o]
-  (cond
-    (host/is-enil ls) (rt-fmergel acc (host/empty-list) f o)
-    (host/is-enil (host/cons-tail ls))
-      (rt-fmergel (host/cons (rt-list-reverse (host/cons-head ls) (host/empty-list)) acc) (host/empty-list) f o)
-    :else
-      (let [a (host/cons-head ls) b (host/cons-head (host/cons-tail ls)) more (host/cons-tail (host/cons-tail ls))
-            h (if (host/eq o :asc) a b)
-            t1 (if (host/eq o :asc) b a)]
-        (rt-rfmergel more (host/cons (rt-rfmerge2-1 t1 (host/cons-head h) f (host/cons-tail h) (host/empty-list)) acc) f o))))
-
-(defn rt-fmerge2-1 [l1 h2 f t2 m]
-  (if (host/is-enil l1)
-    (rt-list-reverse t2 (host/cons h2 m))
-    (let [h1 (host/cons-head l1) t1 (host/cons-tail l1)]
-      (if (f h1 h2)
-        (rt-fmerge2-1 t1 h2 f t2 (host/cons h1 m))
-        (rt-fmerge2-2 h1 t1 f t2 (host/cons h2 m))))))
-
-(defn rt-fmerge2-2 [h1 t1 f l2 m]
-  (if (host/is-enil l2)
-    (rt-list-reverse t1 (host/cons h1 m))
-    (let [h2 (host/cons-head l2) t2 (host/cons-tail l2)]
-      (if (f h1 h2)
-        (rt-fmerge2-1 t1 h2 f t2 (host/cons h1 m))
-        (rt-fmerge2-2 h1 t1 f t2 (host/cons h2 m))))))
-
-(defn rt-rfmerge2-1 [l1 h2 f t2 m]
-  (if (host/is-enil l1)
-    (rt-list-reverse t2 (host/cons h2 m))
-    (let [h1 (host/cons-head l1) t1 (host/cons-tail l1)]
-      (if (f h1 h2)
-        (rt-rfmerge2-2 h1 t1 f t2 (host/cons h2 m))
-        (rt-rfmerge2-1 t1 h2 f t2 (host/cons h1 m))))))
-
-(defn rt-rfmerge2-2 [h1 t1 f l2 m]
-  (if (host/is-enil l2)
-    (rt-list-reverse t1 (host/cons h1 m))
-    (let [h2 (host/cons-head l2) t2 (host/cons-tail l2)]
-      (if (f h1 h2)
-        (rt-rfmerge2-2 h1 t1 f t2 (host/cons h2 m))
-        (rt-rfmerge2-1 t1 h2 f t2 (host/cons h1 m))))))
-
-; On this target one arity of a multi-arity defn calling ANOTHER arity by the
-; defn's own name raises "no arity 2 on fn" (observed), so both arities call
-; one single-arity implementation instead.
-(defn rt-sort-impl
-  "`(sort cmp coll)`: always a list, `()` when there is nothing to sort."
-  [cmp coll]
-  (let [_ (if (host/is-map coll) (host/raise "sort: a map has no order on this target") nil)
-        l (rt-seq-list coll)
-        f (fn [a b] (rt-cmp-le cmp a b))]
-    (cond
-      (host/is-enil l) l
-      (host/is-enil (host/cons-tail l)) l
-      :else (let [x (host/cons-head l) y (host/cons-head (host/cons-tail l)) t (host/cons-tail (host/cons-tail l))]
-              (if (f x y)
-                (rt-fsplit-1 y x f t (host/empty-list) (host/empty-list))
-                (rt-fsplit-2 y x f t (host/empty-list) (host/empty-list)))))))
-
-(defn rt-sort
-  ([coll] (rt-sort-impl rt-compare coll))
-  ([cmp coll] (rt-sort-impl cmp coll)))
-
-(defn rt-sort-by
-  "core `sort-by`, clause for clause: a comparator over the KEYS."
-  ([keyfn coll] (rt-sort-impl (fn [x y] (rt-compare (keyfn x) (keyfn y))) coll))
-  ([keyfn cmp coll] (rt-sort-impl (fn [x y] (cmp (keyfn x) (keyfn y))) coll)))
-
-; ── function combinators and the rest of the value prelude ────────────────────────
-;
-; `comp`, `partial`, `juxt`, `complement`, `constantly`, `identity` and
-; `apply`, written clause for clause after priv/boot/core.bl so a function
-; value built from them behaves the same on both targets. They are plain BL:
-; the higher-order call is the ordinary call step, and the split gate's
-; closure analysis follows a function value through them exactly as it does
-; through app code (the runtime is analyzed with the app).
-
-(defn core-identity [x] x)
-(defn rt-apply-list
-  "`(apply f args)` with a finished argument list: ONE dynamic call, the
-   compiler's own `RT/apply_to` step (any arity; the emitter lowers it to a
-   call step over the list, so this never re-enters itself)."
-  [f args]
-  (apply f (rt-seq-list args)))
-(defn rt-list-concat [a b]
-  (if (host/is-enil a) b (host/cons (host/cons-head a) (rt-list-concat (host/cons-tail a) b))))
-(defn rt-spread [xs]
-  (if (host/is-enil (host/cons-tail xs))
-    (rt-seq-list (host/cons-head xs))
-    (host/cons (host/cons-head xs) (rt-spread (host/cons-tail xs)))))
-(defn rt-apply-variadic
-  "RT.apply_variadic/3: `(apply f a … more)` arrives as f, the first
-   argument and a list of the rest, whose LAST element is the seq to spread."
-  [f arg1 rest-list]
-  (rt-apply-list f (rt-spread (host/cons arg1 rest-list))))
-
-(defn core-comp
-  ([] core-identity)
-  ([f] f)
-  ([f g] (fn [& args] (f (rt-apply-list g args))))
-  ([f g h] (fn [& args] (f (g (rt-apply-list h args))))))
-(defn core-comp-more [f g h fs]
-  (let [rf (rt-list-reverse (host/cons f (host/cons g (host/cons h (rt-seq-list fs)))) (host/empty-list))]
-    (fn [& args]
-      (rt-reduce-1 (fn [acc fun] (fun acc)) (rt-apply-list (host/cons-head rf) args) (host/cons-tail rf)))))
-
-(defn core-partial
-  ([f] f)
-  ([f a] (fn [& more] (rt-apply-list f (host/cons a more))))
-  ([f a b] (fn [& more] (rt-apply-list f (host/cons a (host/cons b more)))))
-  ([f a b c] (fn [& more] (rt-apply-list f (host/cons a (host/cons b (host/cons c more)))))))
-(defn core-partial-more [f a b c more]
-  (let [lead (host/cons a (host/cons b (host/cons c (rt-seq-list more))))]
-    (fn [& later] (rt-apply-list f (rt-list-concat lead later)))))
-
-(defn core-juxt
-  ([f] (fn [& args] (host/vec-from-list (host/cons (rt-apply-list f args) (host/empty-list)))))
-  ([f g] (fn [& args] (host/vec-from-list (host/cons (rt-apply-list f args)
-                                                     (host/cons (rt-apply-list g args) (host/empty-list))))))
-  ([f g h] (fn [& args] (host/vec-from-list (host/cons (rt-apply-list f args)
-                                                       (host/cons (rt-apply-list g args)
-                                                                  (host/cons (rt-apply-list h args) (host/empty-list))))))))
-(defn core-juxt-more [f g h fs]
-  (let [all (host/cons f (host/cons g (host/cons h (rt-seq-list fs))))]
-    (fn [& args] (rt-mapv (fn [fun] (rt-apply-list fun args)) all))))
-
-(defn core-complement [f]
-  (fn
-    ([] (core-not (f)))
-    ([x] (core-not (f x)))
-    ([x y] (core-not (f x y)))))
-(defn core-constantly [x] (fn [& _] x))
-
-(defn rt-every? [f xs]
-  (let [l (rt-seq-list xs)]
-    (cond
-      (host/is-enil l) true
-      (host/truthy (f (host/cons-head l))) (rt-every? f (host/cons-tail l))
-      :else false)))
-(defn core-not-any? [f xs] (core-nil? (rt-some f xs)))
-; These answer a LIST, as BEAM's lazy seqs print and compare: `()` when empty.
-(defn rt-as-list [v] (host/vec-to-list v))
-(defn rt-remove [f xs] (rt-as-list (rt-filterv (fn [x] (core-not (f x))) xs)))
-(defn rt-keep [f xs]
-  (rt-as-list (rt-reduce-1 (fn [acc x] (let [v (f x)] (if (host/is-nil v) acc (host/vec-append acc v))))
-                           (host/vec-from-list (host/empty-list)) (rt-seq-list xs))))
-(defn rt-mapcat-v
-  "Ns.Core/mapcat__bl_v: `(mapcat f coll)` arrives as f and a one-item list."
-  [f colls]
-  (if (host/is-enil (host/cons-tail colls))
-    (rt-mapcat f (host/cons-head colls))
-    (host/raise "mapcat: only a single collection is supported")))
-(defn rt-mapcat [f xs]
-  (rt-as-list (rt-reduce-1 (fn [acc x] (rt-reduce-1 (fn [a y] (host/vec-append a y)) acc (rt-seq-list (f x))))
-                           (host/vec-from-list (host/empty-list)) (rt-seq-list xs))))
-(defn rt-group-by [f xs]
-  (rt-reduce-1 (fn [acc x]
-                 (let [k (f x)]
-                   (host/map-put acc k (host/vec-append (rt-get-impl acc k (host/vec-from-list (host/empty-list))) x))))
-               (host/empty-map) (rt-seq-list xs)))
-(defn rt-frequencies [xs]
-  (rt-reduce-1 (fn [acc x] (host/map-put acc x (host/arith "add" 1 (rt-get-impl acc x 0))))
-               (host/empty-map) (rt-seq-list xs)))
-(defn rt-reverse [xs] (rt-list-reverse (rt-seq-list xs) (host/empty-list)))
-(defn rt-second [xs] (rt-first (rt-rest (rt-seq xs))))
-(defn rt-vals [m] (if (host/eq 0 (host/map-size m)) nil (rt-as-list (rt-mapv (fn [k] (host/map-get m k nil)) (host/map-keys m)))))
-(defn rt-get-in [m ks]
-  (rt-reduce-1 (fn [acc k] (rt-get-impl acc k nil)) m (rt-seq-list ks)))
-(defn rt-assoc-in [m ks v]
-  (let [l (rt-seq-list ks) k (host/cons-head l) more (host/cons-tail l)]
-    (if (host/is-enil more)
-      (host/map-put (if (host/is-nil m) (host/empty-map) m) k v)
-      (host/map-put (if (host/is-nil m) (host/empty-map) m) k (rt-assoc-in (rt-get-impl m k nil) more v)))))
-(defn rt-update-in
-  ([m ks f] (rt-assoc-in m ks (f (rt-get-in m ks))))
-  ([m ks f a] (rt-assoc-in m ks (f (rt-get-in m ks) a))))
-(defn rt-select-keys [m ks]
-  (rt-reduce-1 (fn [acc k] (if (rt-contains? m k) (host/map-put acc k (host/map-get m k nil)) acc))
-               (host/empty-map) (rt-seq-list ks)))
-(defn rt-drop
-  "Clojure `(drop n coll)`: the items after the first n, as a list (`()`
-   when nothing is left), like the runtime's `drop_clj`."
-  [n xs]
-  (rt-drop-1 n (rt-seq-list xs)))
-(defn rt-drop-1 [n l]
-  (if (or (host/is-enil l) (not (host/lt 0 n))) l (rt-drop-1 (host/arith "sub" n 1) (host/cons-tail l))))
-(defn rt-take [n xs]
-  (rt-take-1 n (rt-seq-list xs) (host/vec-from-list (host/empty-list))))
-(defn rt-take-1 [n l acc]
-  (if (or (host/is-enil l) (not (host/lt 0 n)))
-    (host/vec-to-list acc)
-    (rt-take-1 (host/arith "sub" n 1) (host/cons-tail l) (host/vec-append acc (host/cons-head l)))))
-(defn rt-range [n] (rt-range-1 0 n (host/vec-from-list (host/empty-list))))
-(defn rt-range-1 [i n acc] (if (host/lt i n) (rt-range-1 (host/arith "add" i 1) n (host/vec-append acc i)) (host/vec-to-list acc)))
-; The arithmetic names as VALUES (`(reduce + xs)`, `(partial * 2)`): the same
-; checked `host/arith` the inline operators use, folded left like core.
-(defn core-add [& xs] (rt-reduce-1 (fn [a b] (host/arith "add" a b)) 0 xs))
-(defn core-mul [& xs] (rt-reduce-1 (fn [a b] (host/arith "mul" a b)) 1 xs))
-(defn core-sub [x & xs]
-  (if (host/is-enil xs) (host/arith "sub" 0 x) (rt-reduce-1 (fn [a b] (host/arith "sub" a b)) x xs)))
-(defn core-max [x & xs] (rt-reduce-1 rt-max x xs))
-(defn core-min [x & xs] (rt-reduce-1 rt-min x xs))
-(defn rt-update-in-v
-  "Ns.Core/update-in__bl_v: `(update-in m ks f a b …)` — the extra
-   arguments arrive as one list."
-  [m ks f more]
-  (rt-assoc-in m ks (rt-apply-list f (host/cons (rt-get-in m ks) more))))
-(defn rt-even? [x] (host/eq 0 (host/arith "rem" x 2)))
-(defn rt-odd? [x] (core-not (rt-even? x)))
-
-; ── target exceptions ───────────────────────────────────────────────────────
-;
-; WHAT A RAISE IS HERE. A JavaScript `throw` carries a HOST ENVELOPE (host.mjs
-; `BLRaise`): a class keyword, a BL reason and a raw stacktrace. The host hands
-; those three fields over (`host/ex-kind`, `host/ex-reason`, `host/ex-trace`)
-; and decides nothing else. Everything below is the target's exception POLICY —
-; what a class means, what `throw` of a value builds, and what an `:error`
-; reason normalizes into. A catch clause compiled by compiler.bl reads exactly
-; these functions: `raise_payload` for `throw`, `Exception.normalize` for the
-; class dispatch, and `ex_data` for a typed catch.
-;
-; THE REPRESENTATION. An exception value is a MAP whose `:__struct__` is a
-; keyword naming its module — the shape a BEAM struct actually has, which is
-; what lets the compiler's own typed-catch test (`is_map ∧ is_map_key(
-; :__struct__) ∧ map_get(:__struct__) =:= Mod`) run unchanged. `BeamLisp.ExInfo`
-; carries `:message` and `:data`; `Elixir.ErlangError` carries `:message` and
-; `:original`.
-;
-; LIMITS, stated rather than papered over:
-;   * There are exactly two exception modules here, `BeamLisp.ExInfo` and
-;     `ErlangError`. There is no Elixir exception catalogue: an arithmetic or
-;     host failure normalizes to `ErlangError` carrying the host's message as
-;     `:original`, NOT to `%ArithmeticError{}` or `%ArgumentError{}`. A typed
-;     `(catch ArithmeticException …)` therefore matches nothing and reraises,
-;     which is what the compiler's fallthrough already says.
-;   * The stacktrace is EMPTY. `:erlang/element(2, __STACKTRACE__)` answers an
-;     empty frame list: there are no BEAM frames on this target and none are
-;     invented. `frames` below is accepted and ignored for that reason.
-;   * `:erlang/exit` is catchable like any other class and, uncaught, ends the
-;     process that raised it. WHAT that death then means — the exit reason, the
-;     links it signals, the monitors it notifies — is the runtime's policy in
-;     section 3 below (`rt-terminate!`), not the host's and not the compiler's.
-;     OTP supervision, shutdown protocols and distribution are still out of
-;     scope: there is no supervisor and no node. A registered NAME (section 4)
-;     is an address in THIS runtime, not a node-wide one.
-;   * `host/struct` builds a JavaScript object, not a map, so a struct built
-;     that way is opaque data to `throw`, not an exception.
-
-(defn rt-exception?
-  "Is `x` a target exception — a map whose `:__struct__` names a module?"
-  [x]
-  (and (host/is-map x) (host/is-kw (host/map-get x :__struct__))))
-
-(defn rt-exception-mod [x] (host/map-get x :__struct__))
-
-(defn rt-exception-of? [x mod]
-  (and (rt-exception? x) (host/eq (rt-exception-mod x) (host/kw mod))))
-
-(defn rt-exinfo? [x] (rt-exception-of? x "Elixir.BeamLisp.ExInfo"))
-
-(defn rt-struct-map
-  "The struct-shaped map that every target exception is."
-  [mod msg key val]
-  (host/map-put (host/map-put (host/map-put (host/empty-map) :__struct__ (host/kw mod))
-                              :message msg)
-                key val))
-
-(defn rt-exinfo [msg data]
-  (rt-struct-map "Elixir.BeamLisp.ExInfo" msg :data data))
-
-(defn rt-erlang-error
-  "The `:error` reason for anything that is not already an exception: the
-   original is preserved, BEAM's prose supplies the message."
-  [reason]
-  (rt-struct-map "Elixir.ErlangError"
-                 (host/str-cat "Erlang error: " (host/describe reason))
-                 :original reason))
-
-(defn exception-normalize
-  "`Exception.normalize/3`, for the classes and reasons this target has.
-
-   `kind` is `:error` in every use the compiler emits — a THROWN payload stays
-   itself and an EXIT becomes `{:exit, reason}` in the ANF's own `case`, before
-   this is ever reached — but the other two arms are implemented so a direct
-   call means the same thing here as there."
-  [kind value frames]
-  (cond
-    (host/eq kind :error)
-      (if (rt-exception? value) value (rt-erlang-error value))
-    (host/eq kind :throw) value
-    :else (host/tup (host/list->array (host/cons (host/kw "exit")
-                                                 (host/cons value (host/empty-list)))))))
-
-(defn exinfo-raise-payload
-  "`throw`: raise a value so a `try` can catch it. An existing exception is
-   raised as-is; a map becomes an ExInfo carrying it as `:data`; anything else
-   becomes an ExInfo with a printed message and no data. The class is `:error`
-   (BEAM's `raise` is), so the payload travels as an exception value and the
-   compiled catch's normalizer passes it through unchanged."
-  [x]
-  (erlang/raise :error
-                (cond
-                  (rt-exception? x) x
-                  (host/is-map x) (rt-exinfo (host/to-str x) x)
-                  :else (rt-exinfo (host/describe x) nil))
-                nil))
-
-(defn exinfo-data [e] (if (rt-exinfo? e) (host/map-get e :data) nil))
-
-(defn exinfo-message
-  "A readable message for any value: a target exception's own `:message`, else
-   the printed form."
-  [e]
-  (if (rt-exception? e)
-    (let [m (host/map-get e :message)]
-      (if (host/is-nil m) (host/describe e) m))
-    (host/describe e)))
-
-(defn exinfo-original
-  "The Erlang original behind an `ErlangError`, nil for anything else — the one
-   answer prose cannot give, since a message renders that original into words."
-  [e]
-  (if (rt-exception-of? e "Elixir.ErlangError") (host/map-get e :original) nil))
-
-(defn core-ex-info [msg data] (rt-exinfo msg data))
-(defn core-ex-data [e] (exinfo-data e))
-(defn core-ex-message [e] (exinfo-message e))
-(defn core-ex-original [e] (exinfo-original e))
-
-; ─────────────────────────────────────────────────────────────────────────────
 ; 2. Actor runtime
 ; ─────────────────────────────────────────────────────────────────────────────
 ;
@@ -1170,8 +434,8 @@
     (let [st (host/state)
           from (rt-self)
           alloc (rt-alloc-ref st)
-          mref (rt-nth alloc 0)
-          st2 (rt-nth alloc 1)
+          mref (nth alloc 0)
+          st2 (nth alloc 1)
           alive (not (host/is-nil (rt-proc-of st2 pid)))]
       (do
         (if alive
@@ -1310,7 +574,7 @@
       (host/critical-leave)
       (if (host/is-nil pending)
         nil
-        (erlang/exit (rt-nth pending 0))))))
+        (erlang/exit (nth pending 0))))))
 
 (defn rt-trap-exit!
   "Set the running process's trap_exit flag, answering its previous value —
@@ -1737,12 +1001,12 @@
         ; that arrive while a pass is sliced are seen by the next pass.
         (let [mb (:mailbox proc)
               r (rt-scan-from scan mb i)]
-          (if (host/eq (rt-first r) :match)
-            (let [idx (rt-nth r 1)]
+          (if (host/eq (first r) :match)
+            (let [idx (nth r 1)]
               (do
                 (rt-drop-mailbox-msg pid idx)
-                (rt-nth r 2)))
-            (let [n (rt-nth r 1)]
+                (nth r 2)))
+            (let [n (nth r 1)]
               (if (rt-deadline-passed? dl)
                 [:timeout after-fn]
                 (do
@@ -2086,7 +1350,7 @@
     (host/critical-enter)
     (let [st (host/state)
           alloc (rt-alloc-ref st)]
-      (do (host/set-state (rt-nth alloc 1)) (host/critical-leave) (rt-nth alloc 0)))))
+      (do (host/set-state (nth alloc 1)) (host/critical-leave) (nth alloc 0)))))
 
 (defn rt-reply-to
   "Answer the call `ref` identifies: post `[:reply ref value]` to the caller.
@@ -2123,8 +1387,8 @@
           out (if (host/is-nil pid)
                 [:noproc to]
                 (let [alloc (rt-alloc-ref st)
-                      ref (rt-nth alloc 0)
-                      st2 (rt-nth alloc 1)]
+                      ref (nth alloc 0)
+                      st2 (nth alloc 1)]
                   (do
                     (host/set-state st2)
                     (rt-deliver st2 pid [:call ref (rt-self) msg])
@@ -2139,11 +1403,11 @@
    literal and both call sites global."
   [to msg timeout-ms]
   (let [out (rt-call-send to msg)]
-    (if (host/eq (rt-nth out 0) :noproc)
+    (if (host/eq (nth out 0) :noproc)
       (erlang/exit [:noproc to])
-      (let [r (rt-call-recv (rt-nth out 1) timeout-ms to msg)]
-        (if (host/eq (rt-nth r 0) :reply)
-          (rt-nth r 1)
+      (let [r (rt-call-recv (nth out 1) timeout-ms to msg)]
+        (if (host/eq (nth r 0) :reply)
+          (nth r 1)
           (erlang/exit r))))))
 
 (defn rt-call
@@ -2915,7 +2179,7 @@
   [child]
   (do
     (host/critical-enter)
-    (let [pid (rt-nth (rt-spawn-link-monitor (:target child) (:args child)) 0)]
+    (let [pid (nth (rt-spawn-link-monitor (:target child) (:args child)) 0)]
       (do
         (rt-set-proc-field pid :supervised-by (rt-self))
         (if (host/is-nil (:name child))
@@ -3036,7 +2300,7 @@
 
 (defn rt-sup-window-count [ledger now window]
   (if (host/is-nil window)
-    (rt-count ledger)
+    (count ledger)
     (if (empty? ledger)
       0
       (host/arith "add"
@@ -3236,13 +2500,13 @@
         now (host/now)
         base (rt-sup-prune (:ledger state) now window)
         idxs (rt-sup-idxs-for (:children state) ci (:strategy (:spec state)))
-        pending (host/arith "add" (rt-count base) (host/vec-size idxs))]
+        pending (host/arith "add" (count base) (host/vec-size idxs))]
     (if (and (not (host/is-nil max)) (host/lt max pending))
       (rt-sup-escalate state max window)
       (let [r (rt-sup-apply-idxs (:children state) idxs 0 base)]
         (rt-sup-loop
-          (assoc (assoc (assoc state :children (rt-nth r 0))
-                        :ledger (rt-sup-cap (rt-nth r 1) 64))
+          (assoc (assoc (assoc state :children (nth r 0))
+                        :ledger (rt-sup-cap (nth r 1) 64))
                  :total (host/arith "add" (:total state) (host/vec-size idxs))))))))
 
 (defn rt-sup-forced-restart
@@ -3285,10 +2549,10 @@
               (rt-sup-loop state))
         (host/eq op :restart)
           (let [r (rt-sup-forced-restart state (nth msg 1))]
-            (do (rt-reply-to from ref (rt-nth r 0)) (rt-sup-loop (rt-nth r 1))))
+            (do (rt-reply-to from ref (nth r 0)) (rt-sup-loop (nth r 1))))
         (host/eq op :terminate)
           (let [r (rt-sup-forced-stop state (nth msg 1))]
-            (do (rt-reply-to from ref (rt-nth r 0)) (rt-sup-loop (rt-nth r 1))))
+            (do (rt-reply-to from ref (nth r 0)) (rt-sup-loop (nth r 1))))
         :else
           (do (rt-reply-to from ref [:error :unknown-supervisor-request msg])
               (rt-sup-loop state))))
