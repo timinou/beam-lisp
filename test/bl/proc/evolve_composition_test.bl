@@ -1,0 +1,95 @@
+(ns proc.evolve-composition-test
+ (:require [proc.server :as ps] [proc.evolve :as ev] [proc.callback :as cb] [core]))
+
+(defn spec [version]
+ {:version version :digest (str "composed-" version)
+  :accept? (fn [m] (contains? #{:inc :read} m))
+  :check-state (fn [s] (and (map? s) (erlang/is_integer (:count s))))
+  :handler (fn [m s] (let [n (if (= :inc m) (inc (:count s)) (:count s))]
+                      {:reply n :state (assoc s :count n)}))
+  :migrate-state (fn [s] s) :upcast (fn [m] m)})
+
+(ps/defserver composed
+ (evolve {:spec (:spec start-opts) :state (:borrowed start-opts) :managed true})
+ (init [opts] (ok {:custom 10 :cleaned (:cleaned opts) :throw? (:throw? opts)}))
+ (handle-call [:custom-inc] [_ st] (reply (:custom st) (update st :custom inc)))
+ (handle-call [:custom-read] [_ st] (reply (:custom st) st))
+ (terminate [_ st]
+  (reset! (:cleaned st) (cb/invoke! (get-in st [:evolve :current :handler]) [:read (get-in st [:evolve :value])]))
+  (when (:throw? st) (throw (ex-info "custom cleanup failure" {:kind :custom-cleanup-failed})))
+  :ok))
+
+(deftest explicit-evolution-composes-with-custom-owner-state-and-cleanup
+ (let [cleaned (atom nil) borrowed {:count 0 :resource :borrowed}
+       p (core/start composed {:spec (spec 1) :borrowed borrowed :cleaned cleaned})
+       lease (:token (ev/acquire-client! p 1))]
+  (try
+   (is (ev/owner? p))
+   (is (:managed (ev/owner-evidence p)))
+   (is (nil? (ev/owner-evidence (erlang/self))))
+   (is (= 10 (GenServer/call p [:custom-inc])))
+   (is (= 1 (ev/call-client! p lease :inc)))
+   (is (= :managed-client-required (:kind (ev/call! p 1 :inc))))
+   (is (= :applied (:status (ev/upgrade! p 1 (spec 2)))))
+   (is (= p (:pid (ev/status p))))
+   (is (= 11 (GenServer/call p [:custom-read])))
+   (is (= 2 (ev/call-client! p lease :inc)))
+   (is (= :waiting (:status (ev/retire! p 2 1))))
+   (ev/release-client! p lease)
+   (is (= :retired (:status (ev/retire! p 2 1))))
+   (let [held (get-in (erlang/apply :sys :get_state (list p)) [:evolve :current :handler])]
+    (GenServer/stop p)
+    (is (= {:reply 2 :state {:count 2 :resource :borrowed}} @cleaned))
+    (is (= :cancelled (cb/invoke! held [:read borrowed])))
+    (is (not (ev/owner? p))))
+   (finally (when (Process/alive? p) (GenServer/stop p))))))
+
+(deftest framework-termination-runs-after-throwing-custom-cleanup
+ (let [before (Process/flag :trap_exit true) cleaned (atom nil)
+       p (core/start composed {:spec (spec 1) :borrowed {:count 3} :cleaned cleaned :throw? true})
+       held (get-in (erlang/apply :sys :get_state (list p)) [:evolve :current :handler])]
+  (try
+   (try (GenServer/stop p) (catch _ nil))
+   (is (= {:reply 3 :state {:count 3}} @cleaned))
+   (is (= :cancelled (cb/invoke! held [:read {:count 3}])))
+   (finally (Process/flag :trap_exit before)))))
+
+(deftest multiple-contribution-finalizers-compose-without-shadowing
+ (let [vocab {:one (fn [_ _] {:terminate ['close-one]})
+              :two (fn [_ _] {:terminate ['close-two]})}
+       p (ps/clause-plan {:name 'demo :clauses '((one) (two) (terminate [why st] (custom why st)))
+                         :vocabulary vocab :native-heads #{"terminate"}})
+       form (:terminate-clause p)]
+  (is (= 1 (count (filter #(= 'terminate (first %)) (:body p)))))
+  (is (= ['close-one 'close-two] (:terminate p)))
+  (is (= '(terminate [terminate-reason terminate-state]
+           (try (apply (fn [why st] (custom why st)) [terminate-reason terminate-state])
+            (finally (try (close-two terminate-reason terminate-state)
+                      (finally (try (close-one terminate-reason terminate-state) (finally nil))))))) form))))
+
+(defn under-generation [digest action]
+ (let [previous (Process/get :bl_generation)]
+  (try (Process/put :bl_generation {:digest digest :modules []}) (action)
+   (finally (Process/put :bl_generation previous)))))
+(deftest upgraded-callbacks-convey-candidate-generation-and-rehearsal-does-not-publish
+ (let [base {:version 1 :digest "context-old" :accept? (fn [_] true) :check-state (fn [_] true)
+             :handler (fn [_ state] {:reply (:digest (Process/get :bl_generation)) :state state})}
+       p (under-generation "context-old" #(ev/start! base {:borrowed :connection}))
+       candidate (under-generation "context-new"
+                   #(ev/prepare-spec (assoc base :version 2 :digest "context-new"
+                                       :migrate-state (fn [s] s) :upcast (fn [m] m))))]
+  (try
+   (is (= "context-old" (ev/call! p 1 :read)))
+   (let [before (ev/status p) rehearsal (ev/rehearse! p 1 candidate)]
+    (is (= :valid (:status rehearsal)))
+    (is (= (:revision before) (:revision rehearsal)))
+    (is (= before (ev/status p))))
+   (is (= :applied (:status (ev/upgrade! p 1 candidate))))
+   (is (= "context-new" (ev/call! p 2 :read)))
+   (is (= "context-new" (ev/call! p 1 :read)))
+   (is (= :valid (:status (ev/rehearse! p 1 candidate))))
+   (let [bad (assoc candidate :version 3 :digest "context-bad" :check-state (fn [_] false))
+         before (ev/status p)]
+    (is (= :refused (:status (ev/rehearse! p 2 bad))))
+    (is (= before (ev/status p))))
+   (finally (GenServer/stop p)))))

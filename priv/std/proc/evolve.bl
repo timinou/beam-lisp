@@ -1,7 +1,7 @@
 ; Stable process identity, versioned messages and atomic handler/state evolution.
 ; Upgrade callbacks are pure and short. External effects belong to durable jobs.
 (ns proc.evolve
- (:require [proc.server :as ps] [proc.callback :as cb] [proc.fence :as fence] [proc.queue :as queue] [core]))
+ (:require [proc.server :as ps] [proc.callback :as cb] [proc.fence :as fence] [proc.queue :as queue] [datom.conn :as dc] [core]))
 
 (defn- valid-version? [v] (and (erlang/is_integer v) (> v 0)))
 (defn- validate! [spec]
@@ -9,16 +9,26 @@
                 (not (empty? (:digest spec))) (:handler spec) (:check-state spec) (:accept? spec))
   (throw (ex-info "Evolution requires version, digest, handler and state/message predicates" {:kind :invalid-evolution}))))
 
+(defn prepare-spec
+ "Pin callback execution context before crossing into an older owner. Prepared
+  specs can be replayed outside the candidate context without alias resolution."
+ [spec]
+ (if (:environment spec) spec
+  (assoc spec :environment (BeamLisp.Env/capture)
+    :modules (vec (distinct (concat (:modules spec []) (:modules (Process/get :bl_generation) [])))))))
+
 (defn- retain! [spec]
- (let [held (atom [])]
+ (let [held (atom []) previous (BeamLisp.Env/capture)]
   (try
+   (when (:environment spec) (BeamLisp.Env/bind (:environment spec)))
    (reduce (fn [m k]
              (if-let [f (get spec k)]
               (let [r (cb/register! f (:modules spec []))]
                (swap! held conj r) (assoc m k r)) m))
            (select-keys spec [:version :digest])
            [:handler :check-state :accept? :migrate-state :upcast])
-   (catch e (doseq [r @held] (cb/unregister! r)) (throw e)))))
+   (catch e (doseq [r @held] (cb/unregister! r)) (throw e))
+   (finally (BeamLisp.Env/bind previous)))))
 
 (defn- release! [held]
  (doseq [k [:handler :check-state :accept? :migrate-state :upcast]]
@@ -26,7 +36,7 @@
 
 (defn- invoke [held k args] (cb/invoke! (get held k) args))
 (defn- valid-state! [held state]
- (when-not (= true (invoke held :check-state [state]))
+ (when-not (= true (dc/observing #(invoke held :check-state [state])))
   (throw (ex-info "Evolution state invariant refused" {:kind :invalid-state})))
  state)
 
@@ -36,19 +46,19 @@
    (= v (get-in st [:current :version])) msg
    (not (valid-version? v)) (throw (ex-info "Invalid message version" {:kind :unsupported-version}))
    :else (if-let [edge (get (:adapters st) v)]
-           (recur (:to edge) (cb/invoke! (:callback edge) [msg]))
+           (recur (:to edge) (dc/observing #(cb/invoke! (:callback edge) [msg])))
            (throw (ex-info "No message upgrade path" {:kind :unsupported-version}))))))
 
 (defn- dispatch [st version message]
  (try
   (let [held (:current st) msg (adapt st version message)]
-   (when-not (= true (invoke held :accept? [msg]))
+   (when-not (= true (dc/observing #(invoke held :accept? [msg])))
     (throw (ex-info "Message outside current contract" {:kind :invalid-message})))
    (let [result (invoke held :handler [msg (:value st)])]
     (when-not (and (map? result) (contains? result :reply) (contains? result :state))
      (throw (ex-info "Handler must return reply and state" {:kind :invalid-result})))
     (valid-state! held (:state result))
-    [(:reply result) (assoc st :value (:state result))]))
+    [(:reply result) (assoc st :value (:state result) :revision (inc (:revision st 0)))]))
   (catch e [{:status :refused :kind (or (:kind (ex-data e)) :handler-failed)} st])))
 
 (defn- upgrade [st expected spec]
@@ -68,13 +78,13 @@
        (throw (ex-info "Upgrade requires explicit state and message migrations" {:kind :missing-migration})))
       (reset! next (retain! spec))
       (let [prepared (fence/fence-fn (:upgrade-ms st)
-                        (fn [] (valid-state! @next (invoke @next :migrate-state [(:value st)]))))
+                        (fn [] (dc/observing #(valid-state! @next (invoke @next :migrate-state [(:value st)])))))
             _ (when-not (contains? prepared :ok)
                 (throw (ex-info "State migration failed or exceeded budget" {:kind :migration-deadline})))
             value (:ok prepared)
             edge {:to (:version spec) :callback (:upcast @next)}
             installed (dissoc @next :migrate-state :upcast)
-            after (assoc st :current installed :value value
+            after (assoc st :current installed :value value :revision (inc (:revision st 0))
                            :adapters (assoc (:adapters st) (:version current) edge))]
        ;; No callback after releasing the old registration may reject publication.
        (cb/unregister! (:migrate-state @next))
@@ -131,6 +141,17 @@
              (assoc after :adapters (apply dissoc (:adapters st) versions)
                           :retired-through (max through (:retired-through st 0)))])))))
 
+(defn owner-evidence
+ "Read native versioned-owner registration without sending an unsupported
+  message to an arbitrary actor. Dead PID registrations are exact-ticket pruned."
+ [pid]
+ (let [rows (ets/lookup :beam_lisp_vars (tuple :bl-evolve-owner pid))]
+  (when (seq rows)
+   (let [row (first rows)]
+    (if (Process/alive? pid) (elem row 1)
+     (do (ets/delete_object :beam_lisp_vars row) nil))))))
+(defn owner? [pid] (some? (owner-evidence pid)))
+
 (defn- initial-state [opts]
   (validate! (:spec opts))
   (let [limit (:history-limit opts 32) budget (:upgrade-ms opts 250)]
@@ -138,45 +159,109 @@
     (throw (ex-info "Evolution migration budget must be 1..30000ms" {:kind :invalid-evolution})))
    (when-not (and (erlang/is_integer limit) (> limit 0) (<= limit 1024))
     (throw (ex-info "Evolution history must be bounded" {:kind :invalid-evolution})))
-   (let [held (retain! (:spec opts))]
+   (let [spec (prepare-spec (:spec opts))
+         held (retain! spec)]
     (try (valid-state! held (:state opts))
-         {:current held :value (:state opts) :adapters {} :history-limit limit :upgrade-ms budget
-          :managed (:managed opts false) :clients {} :queues #{} :fenced #{} :fenced-through 0 :retired-through 0}
+         (let [ticket (erlang/make_ref) evidence {:pid (erlang/self) :ticket ticket
+                                                 :managed (:managed opts false) :kind :proc.evolve}]
+          (when (owner? (erlang/self))
+           (throw (ex-info "Owner already has an evolution slice" {:kind :duplicate-evolution})))
+          (ets/insert :beam_lisp_vars (tuple (tuple :bl-evolve-owner (erlang/self)) evidence))
+          {:current held :value (:state opts) :adapters {} :history-limit limit :upgrade-ms budget
+           :owner-evidence evidence :revision 0
+           :managed (:managed opts false) :clients {} :queues #{} :fenced #{} :fenced-through 0 :retired-through 0})
          (catch e (release! held) (throw e))))))
+
+(defn- rehearsal [st expected spec budget]
+ (cond
+  (and (= (:version spec) (get-in st [:current :version])) (= (:digest spec) (get-in st [:current :digest])))
+   [{:status :valid :scope :already-current :version (:version spec) :revision (:revision st 0)} st]
+  (not= expected (get-in st [:current :version])) [{:status :refused :kind :stale-version} st]
+  :else (let [held (atom nil)]
+   (try
+    (validate! spec)
+    (when-not (and (erlang/is_function (:migrate-state spec) 1)
+                  (erlang/is_integer budget) (pos? budget) (<= budget 30000))
+     (throw (ex-info "Invalid rehearsal contract" {:kind :invalid-rehearsal})))
+    (reset! held (retain! spec))
+    (let [result (fence/fence-fn budget
+                   #(dc/observing (fn [] (valid-state! @held (invoke @held :migrate-state [(:value st)])))))]
+     [(if (contains? result :ok)
+       {:status :valid :scope :current-owner-state :version expected :revision (:revision st 0)
+        :candidate-version (:version spec) :candidate-digest (:digest spec)}
+       {:status :refused :kind (if (:timeout result) :rehearsal-deadline :state-migration-refused)}) st])
+    (catch e [{:status :refused :kind (or (:kind (ex-data e)) :rehearsal-failed)} st])
+    (finally (when @held (release! @held)))))))
+
+(defn message-step
+ "Shared versioned-owner engine, used by standalone and composed owners."
+ [st message]
+ (case (first message)
+  :proc.evolve/call
+   (if (:managed st) [{:status :refused :kind :managed-client-required} st]
+    (dispatch st (nth message 1) (nth message 2)))
+  :proc.evolve/upgrade (upgrade st (nth message 1) (nth message 2))
+  :proc.evolve/rehearse (rehearsal st (nth message 1) (nth message 2) (nth message 3))
+  :proc.evolve/acquire (acquire st (nth message 1))
+  :proc.evolve/client
+   (if-let [version (get (:clients st) (nth message 1))]
+    (dispatch st version (nth message 2))
+    [{:status :refused :kind :unknown-client} st])
+  :proc.evolve/release [{:status :released} (update st :clients dissoc (nth message 1))]
+  :proc.evolve/fence
+   (let [version (nth message 1)]
+    (if (and (:managed st) (valid-version? version))
+     [{:status :fenced :version version} (update st :fenced conj version)]
+     [{:status :refused :kind :invalid-fence} st]))
+  :proc.evolve/bind-queue (bind-queue st (nth message 1))
+  :proc.evolve/retire (retirement st (nth message 1) (nth message 2))
+  :proc.evolve/status
+   [{:version (get-in st [:current :version]) :digest (get-in st [:current :digest])
+     :legacy-versions (vec (sort (keys (:adapters st)))) :revision (:revision st 0)
+     :managed (:managed st) :clients (count (:clients st))
+     :queues (vec (:queues st)) :fenced-versions (vec (sort (:fenced st)))
+     :fenced-through (:fenced-through st) :pid (erlang/self)} st]
+  [{:status :refused :kind :unknown-evolution-message} st]))
+
+(defn close-state! [st]
+ (when (:owner-evidence st)
+  (ets/delete_object :beam_lisp_vars (tuple (tuple :bl-evolve-owner (get-in st [:owner-evidence :pid])) (:owner-evidence st))))
+ (release! (:current st))
+ (doseq [edge (vals (:adapters st))] (cb/unregister! (:callback edge)))
+ :ok)
+(defn composed-state [opts]
+ {:evolve (initial-state opts)})
+(defn composed-step [st message]
+ (let [[value after] (message-step (:evolve st) message)]
+  [value (assoc st :evolve after)]))
+(defn composed-close! [_ st] (close-state! (:evolve st)))
+
+(defn evolution-clause
+ "Explicit managed domain slice in an existing actor. No PID replacement,
+  store ownership inference or interception of arbitrary custom messages."
+ [clause _]
+ (when-not (= 2 (count clause))
+  (throw (ex-info "evolve expects one owner options map" {:kind :invalid-evolution-clause})))
+ (let [patterns '[[:proc.evolve/call version message] [:proc.evolve/upgrade expected spec]
+                  [:proc.evolve/rehearse expected spec budget]
+                  [:proc.evolve/acquire version] [:proc.evolve/client token message]
+                  [:proc.evolve/release token] [:proc.evolve/fence version]
+                  [:proc.evolve/bind-queue srv] [:proc.evolve/retire expected through]
+                  [:proc.evolve/status]]]
+  {:init (list 'proc.evolve/composed-state (second clause))
+   :terminate ['proc.evolve/composed-close!]
+   :clauses (mapv (fn [pattern]
+                    (list 'handle-call pattern '[_ evolution-state]
+                      (list 'let ['[evolution-result evolution-after]
+                                   (list 'proc.evolve/composed-step 'evolution-state pattern)]
+                        '(reply evolution-result evolution-after)))) patterns)}))
+(ps/extend-clause! :evolve evolution-clause)
 
 (ps/defserver owner
  (init [opts] (ok (initial-state opts)))
- (handle-call [:proc.evolve/call version message] [_ st]
-  (if (:managed st)
-    (reply {:status :refused :kind :managed-client-required} st)
-    (let [[value after] (dispatch st version message)] (reply value after))))
- (handle-call [:proc.evolve/upgrade expected spec] [_ st]
-  (let [[value after] (upgrade st expected spec)] (reply value after)))
- (handle-call [:proc.evolve/acquire version] [_ st]
-  (let [[value after] (acquire st version)] (reply value after)))
- (handle-call [:proc.evolve/client token message] [_ st]
-  (if-let [version (get (:clients st) token)]
-    (let [[value after] (dispatch st version message)] (reply value after))
-    (reply {:status :refused :kind :unknown-client} st)))
- (handle-call [:proc.evolve/release token] [_ st]
-  (reply {:status :released} (update st :clients dissoc token)))
- (handle-call [:proc.evolve/fence version] [_ st]
-  (if (and (:managed st) (valid-version? version))
-    (reply {:status :fenced :version version} (update st :fenced conj version))
-    (reply {:status :refused :kind :invalid-fence} st)))
- (handle-call [:proc.evolve/bind-queue srv] [_ st]
-  (let [[value after] (bind-queue st srv)] (reply value after)))
- (handle-call [:proc.evolve/retire expected through] [_ st]
-  (let [[value after] (retirement st expected through)] (reply value after)))
- (handle-call [:proc.evolve/status] [_ st]
-  (reply {:version (get-in st [:current :version]) :digest (get-in st [:current :digest])
-          :legacy-versions (vec (sort (keys (:adapters st))))
-          :managed (:managed st) :clients (count (:clients st))
-          :queues (vec (:queues st)) :fenced-versions (vec (sort (:fenced st))) :fenced-through (:fenced-through st) :pid (erlang/self)} st))
- (terminate [_ st]
-  (release! (:current st))
-  (doseq [edge (vals (:adapters st))] (cb/unregister! (:callback edge)))
-  :ok))
+ (handle-call message [_ st]
+  (let [[value after] (message-step st message)] (reply value after)))
+ (terminate [_ st] (close-state! st)))
 
 (defn start!
  "Start one stable owner. Spec supplies :version/:digest, :handler (msg,state ->
@@ -195,7 +280,14 @@
   version and upcast lazily on delivery; no mailbox drain/rewrite or PID swap.
   A refused migration keeps old state/handler. Timeout means outcome unknown."
  ([pid expected spec] (upgrade! pid expected spec 5000))
- ([pid expected spec timeout] (GenServer/call pid [:proc.evolve/upgrade expected spec] timeout)))
+ ([pid expected spec timeout] (GenServer/call pid [:proc.evolve/upgrade expected (prepare-spec spec)] timeout)))
+(defn rehearse!
+ "Bounded read-only Datom/state migration rehearsal. Receipt covers this exact
+  owner revision only; future requests may change it. No handler is published."
+ ([pid expected spec] (rehearse! pid expected spec 250))
+ ([pid expected spec budget]
+  (when-not (owner? pid) (throw (ex-info "Owner rehearsal requires native authority" {:kind :owner-transition-authority-required})))
+  (GenServer/call pid [:proc.evolve/rehearse expected (prepare-spec spec) budget] (+ budget 1000))))
 (defn status [pid] (GenServer/call pid [:proc.evolve/status]))
 
 (defn acquire-client!
