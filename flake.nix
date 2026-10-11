@@ -1,22 +1,22 @@
 # flake.nix — the self-contained `bl` drop, built entirely by nix.
 #
 # Why: a drop built on a rolling-release workstation links that machine's glibc
-# (a different glibc), and a NixOS 25.05 host (glibc 2.44) cannot run it. Building the
+# and may need a newer glibc than the server provides. Building the
 # drop with the TARGET HOST's nixpkgs makes the drop's glibc floor <= the host's.
 # docs/native-bundler.md "Nix-built server drop — glibc floor = host".
 #
-# nixpkgs is pinned to the SAME rev as apps/foundry/infra/flake.lock (the pinned host nixpkgs).
+# nixpkgs is pinned to the SAME rev as ../foundry/infra/flake.lock.
 # Keep the two in step: `nix flake lock --override-input nixpkgs <rev>`.
 {
   description = "beam-lisp: nix-built self-contained bl drop (glibc floor = host)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/6510408d147d8c5e6d76043e899e9251756f6a75";
-    # the pinned host nixpkgs ships rustc 1.86; rustler 0.38 needs >= 1.91. Only the Rust
-    # TOOLCHAIN comes from here; every link step still uses the pinned gcc + glibc.
+    # The host pin now supplies a sufficiently recent Rust toolchain too.
+    # Keep this name for the build interface, without a second libc/toolchain pin.
     nixpkgs-rust.follows = "nixpkgs";
-    # the pinned host nixpkgs ships OTP 28 / Elixir 1.18; the language needs OTP 29 / Elixir 1.20.
-    # Both are built with the PINNED nixpkgs' toolchain, so their glibc is the pin's.
+    # Keep the language's tested OTP/Elixir versions independent of nixpkgs defaults.
+    # Both are built with the host pin's toolchain and glibc.
     otp-src = { url = "github:erlang/otp/OTP-29.0.1"; flake = false; };
     elixir-src = { url = "github:elixir-lang/elixir/v1.20.2"; flake = false; };
   };
