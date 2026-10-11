@@ -82,3 +82,25 @@ test('a projection that replaces its registration cannot extend the current snap
  try{const snapshot=reader.sample()[0];assert.equal(reads,1);assert.equal(snapshot.resources.length,1);}
  finally{registration.dispose();reader.dispose();}
 });
+
+test('subscription changes bound backlog, count coalescing and resynchronize',async()=>{
+ let release,calls=0,active=true;const deliveries=[];
+ const disposeResource=O.d_observe_package('changing',()=>({value:calls}),{});
+ const dispose=O.d_subscribe((rows,meta)=>{calls++;deliveries.push({rows,meta});if(calls===1)return new Promise(resolve=>release=resolve);active=false;},{interval:250,active:()=>active});
+ try {
+  await sleep(30);assert.equal(calls,1);assert.equal(deliveries[0].meta.changes[0].reset,true);
+  await sleep(530);assert.equal(calls,1);
+  release();for(let i=0;i<40&&calls<2;i++)await sleep(50);assert.equal(calls,2);
+  assert.ok(deliveries[1].meta.coalesced>=1);
+  assert.equal(deliveries[1].meta.changes[0].reset,false);
+  assert.equal(deliveries[1].meta.changes[0].upsert[0].data.value,1);
+ }finally{dispose();disposeResource();}
+});
+test('callback failure disposes owned subscriptions and late rejection is inert',async()=>{
+ let failures=0;
+ const disposals=Array.from({length:32},()=>O.d_subscribe(()=>{throw Error('consumer failure')},{interval:250,onError:()=>failures++}));
+ await sleep(30);assert.equal(failures,32);
+ const reader=O.d_observations();reader.dispose();for(const dispose of disposals)dispose();
+ let reject;const dispose=O.d_subscribe(()=>new Promise((_,fail)=>reject=fail),{interval:250,onError:()=>failures++});
+ await sleep(20);dispose();reject(Error('late'));await sleep(20);assert.equal(failures,32);
+});
