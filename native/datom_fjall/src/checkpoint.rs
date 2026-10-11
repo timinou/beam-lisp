@@ -3,14 +3,14 @@
 //! export after releasing it. The exact source claim stays pinned, never reopened.
 use super::{err, DbHandle, StoreClaim};
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle, PersistMode, Snapshot};
-use rustler::{Atom, Encoder, Env, NifResult, Resource, ResourceArc, Term};
+use rustler::{Atom, Encoder, NifResult, Resource, ResourceArc, Term, LocalPid, OwnedEnv};
 use std::fs::{self, File};
 use std::io::Write;
 use std::ops::Bound::{Excluded, Unbounded};
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::{AtomicU64, Ordering}, Arc, Mutex};
+use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex};
 
-mod atoms { rustler::atoms! { released, aborted, published } }
+mod atoms { rustler::atoms! { released, aborted, published, accepted, error } }
 static NEXT_STAGE: AtomicU64 = AtomicU64::new(1);
 
 struct Capture {
@@ -55,7 +55,7 @@ impl Drop for Export {
         if !self.published { let _ = fs::remove_dir_all(&self.stage); }
     }
 }
-struct Artifact(Mutex<Option<Export>>);
+struct Artifact(Mutex<Option<Export>>, AtomicBool);
 #[rustler::resource_impl]
 impl Resource for Artifact {}
 impl Drop for Artifact {
@@ -121,7 +121,7 @@ fn begin(capture: Arc<Capture>, destination: &Path) -> Result<Export, String> {
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_checkpoint_begin(cursor: ResourceArc<Cursor>, destination: String) -> NifResult<ResourceArc<Artifact>> {
     let capture = cursor.0.lock().map_err(err)?.as_ref().cloned().ok_or_else(|| err("checkpoint cursor released"))?;
-    Ok(ResourceArc::new(Artifact(Mutex::new(Some(begin(capture, Path::new(&destination)).map_err(err)?)))))
+    Ok(ResourceArc::new(Artifact(Mutex::new(Some(begin(capture, Path::new(&destination)).map_err(err)?)), AtomicBool::new(false))))
 }
 
 fn step(export: &mut Export, rows: usize, max_bytes: usize) -> Result<(bool, u64, u64, u64), String> {
@@ -162,7 +162,8 @@ fn step(export: &mut Export, rows: usize, max_bytes: usize) -> Result<(bool, u64
 }
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_checkpoint_step(artifact: ResourceArc<Artifact>, rows: usize, max_bytes: usize) -> NifResult<(bool, u64, u64, u64)> {
-    let mut state = artifact.0.lock().map_err(err)?;
+    if artifact.1.load(Ordering::Acquire) { return Err(err("checkpoint finalization in progress")); }
+    let mut state = artifact.0.try_lock().map_err(|_| err("checkpoint operation in progress"))?;
     step(state.as_mut().ok_or_else(|| err("checkpoint aborted"))?, rows, max_bytes).map_err(err)
 }
 
@@ -219,17 +220,41 @@ fn hex_path(path: &Path) -> String {
     for byte in path.to_string_lossy().as_bytes() { let _ = write!(out, "{byte:02x}"); }
     out
 }
-#[rustler::nif(schedule = "DirtyIo")]
-fn fjall_checkpoint_finish<'a>(env: Env<'a>, artifact: ResourceArc<Artifact>) -> NifResult<Term<'a>> {
-    let mut state = artifact.0.lock().map_err(err)?;
-    let export = state.as_mut().ok_or_else(|| err("checkpoint aborted"))?;
-    finish(export).map_err(err)?;
-    Ok((export.destination.to_string_lossy().into_owned(), export.source.to_string_lossy().into_owned(),
-        export.sequence, export.entries, export.bytes).encode(env))
+// Final sync/tree publication is deliberately NOT a DirtyIo task: a runtime
+// with one dirty-I/O scheduler must still service unrelated source writes.
+#[rustler::nif]
+fn fjall_checkpoint_finish(artifact: ResourceArc<Artifact>, recipient: LocalPid, tag: Term) -> NifResult<Atom> {
+    artifact.1.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| err("checkpoint finalization in progress"))?;
+    let mut message_env = OwnedEnv::new();
+    let saved_tag = message_env.save(tag);
+    let worker_artifact = artifact.clone();
+    let spawned = std::thread::Builder::new().name("datom-checkpoint-finalize".into()).spawn(move || {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut state = worker_artifact.0.lock().map_err(|e| e.to_string())?;
+            let export = state.as_mut().ok_or("checkpoint aborted")?;
+            finish(export)?;
+            Ok::<_, String>((export.destination.to_string_lossy().into_owned(),
+                export.source.to_string_lossy().into_owned(), export.sequence, export.entries, export.bytes))
+        })).unwrap_or_else(|_| Err("checkpoint finalizer panicked; inspect destination before retry".into()));
+        worker_artifact.1.store(false, Ordering::Release);
+        // A dead caller does not cancel an accepted publication or delete its artifact.
+        let _ = message_env.send_and_clear(&recipient, |env| {
+            let reply = match result { Ok(receipt) => receipt.encode(env),
+                Err(reason) => (atoms::error(), reason).encode(env) };
+            (saved_tag.load(env), reply).encode(env)
+        });
+    });
+    if let Err(reason) = spawned {
+        artifact.1.store(false, Ordering::Release);
+        return Err(err(reason.to_string()));
+    }
+    Ok(atoms::accepted())
 }
 #[rustler::nif(schedule = "DirtyIo")]
 fn fjall_checkpoint_abort(artifact: ResourceArc<Artifact>) -> NifResult<Atom> {
-    let mut state = artifact.0.lock().map_err(err)?;
+    if artifact.1.load(Ordering::Acquire) { return Err(err("checkpoint finalization in progress")); }
+    let mut state = artifact.0.try_lock().map_err(|_| err("checkpoint operation in progress"))?;
     if state.as_ref().is_some_and(|e| e.published) { return Ok(atoms::published()); }
     state.take();
     Ok(atoms::aborted())
