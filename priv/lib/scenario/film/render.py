@@ -14,7 +14,6 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-import textwrap
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -153,6 +152,24 @@ def subtitles(rows, path, vtt=False):
     Path(path).write_text('\n'.join(parts), encoding='utf-8')
 
 
+def caption_lines(text, width=70):
+    # Keep French digit groups intact and favor sentence boundaries. Balanced
+    # lines read more calmly than filling the first line to its last column.
+    text = re.sub(r'(?<=\d) (?=\d{3}\b)', '\u00a0', text)
+    if len(text) <= width:
+        return text
+    words = text.split(' ')
+    candidates = []
+    for i in range(1, len(words)):
+        a, b = ' '.join(words[:i]), ' '.join(words[i:])
+        if max(len(a), len(b)) <= width:
+            penalty = abs(len(a)-len(b)) - (22 if a[-1] in '.!?;:' else 0)
+            candidates.append((penalty, a+'\n'+b))
+    if not candidates:
+        raise ValueError('Narration passage is too long: split it into scenes (two subtitle lines maximum)')
+    return min(candidates)[1]
+
+
 def interpolate(points, field, t, default):
     if not points:
         return default
@@ -263,9 +280,7 @@ def render_scene(scene, timing, audio, work, film):
     # Limit line width, preserving punctuation and French accents. No word
     # disappears early: the COMPLETE cue covers the COMPLETE audio interval.
     text = scene.get('subtitle', scene.get('say', ''))
-    wrapped = '\n'.join(textwrap.wrap(text, width=70))
-    if len(wrapped.splitlines()) > 2:
-        raise ValueError('Narration passage is too long: split it into scenes (two subtitle lines maximum)')
+    wrapped = caption_lines(text)
     fs = max(18, round(h * .031))
     safe_text = wrapped.replace('\\', '\\e').replace('{', '\\{').replace('}', '\\}').replace('\n', '\\N')
     end = timestamp(timing['subtitle_end'], True)[1:-1]

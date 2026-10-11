@@ -13,6 +13,14 @@ spec.loader.exec_module(film)
 
 
 class FilmTest(unittest.TestCase):
+    def test_captions_keep_french_amounts_together(self):
+        text = 'Ici, la facture indique 75 000 dirhams. Le projet n’en reprend que 15 000 : l’écart est visible.'
+        lines = film.caption_lines(text)
+        self.assertIn('75\u00a0000', lines)
+        self.assertIn('15\u00a0000', lines)
+        self.assertEqual(2, len(lines.splitlines()))
+        self.assertTrue(lines.splitlines()[0].endswith('.'))
+
     def test_subtitle_covers_measured_speech_even_when_visual_hint_is_short(self):
         for audio in [.001, 1.017, 10.333, 62.811]:
             t = film.schedule({'duration': .1, 'lead': .7, 'tail': 0}, audio, 30)
@@ -34,26 +42,27 @@ class FilmTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 film.validate({'version': 1, 'id': 'demo', 'scenes': scenes})
 
-    def test_real_two_scene_export_keeps_audio_cues_and_video_frames(self):
+    def test_real_mixed_media_export_keeps_audio_cues_and_video_frames(self):
         with tempfile.TemporaryDirectory(prefix='film smoke ') as folder:
             root = Path(folder)
-            source, audio = root/'source.png', root/'voice.wav'
+            source, audio, video = root/'source.png', root/'voice.wav', root/'source.mp4'
             film.run(['ffmpeg','-loglevel','error','-y','-f','lavfi','-i','color=c=white:s=640x480','-frames:v','1','-threads','1',source])
             film.run(['ffmpeg','-loglevel','error','-y','-f','lavfi','-i','sine=frequency=440:duration=1.017','-ar','48000',audio])
+            film.run(['ffmpeg','-loglevel','error','-y','-f','lavfi','-i','testsrc2=size=640x480:rate=10:duration=0.6','-c:v','libx264','-threads','1',video])
             scene = {'id':'first','source':str(source),'audio':str(audio), 'say':'Un écran clair. Une décision simple.',
                      'camera':[{'at':0,'zoom':1},{'at':1,'zoom':1.3,'x':.7}],
                      'cursor':[{'at':0,'x':.2,'y':.4},{'at':.6,'x':.7,'y':.5,'click':True}]}
             value = {'version':1,'id':'smoke','width':640,'height':480,'fps':10,
-                     'run':{'verdict':'unknown'}, 'scenes':[scene,{**scene,'id':'second','shots':[{'at':0,'source':str(source)}, {'at':.5,'source':str(source)}]}]}
+                     'run':{'verdict':'unknown'}, 'scenes':[scene,{**scene,'id':'second','shots':[{'at':0,'source':str(source)}, {'at':.5,'source':str(source)}]}, {**scene,'id':'third','source':str(video),'source_start':.1,'speed':2}]}
             result = film.export(value, root/'out')
             self.assertEqual('unknown', result['run']['verdict'])
-            self.assertEqual(2, len(result['scenes']))
+            self.assertEqual(3, len(result['scenes']))
             info = film.probe(root/'out/demo.mp4')
             self.assertEqual(['video','audio','subtitle'], [s['codec_type'] for s in info['streams'][:3]])
             for row in result['scenes']:
                 self.assertGreaterEqual(row['subtitle_end'], row['audio_end'])
             self.assertLess(abs(result['encoded_duration']-result['duration']), .1)
-            self.assertEqual(2, (root/'out/subtitles.srt').read_text().count('-->'))
+            self.assertEqual(3, (root/'out/subtitles.srt').read_text().count('-->'))
             self.assertTrue((root/'out/subtitles.vtt').read_text().startswith('WEBVTT'))
 
 
