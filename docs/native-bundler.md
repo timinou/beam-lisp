@@ -573,7 +573,7 @@ Foundry's release builder enforces the same rule on its own (`release.py build
 second instead of at the server's first start.
 
 **Keep the pins in step.** When the servers move to a new nixpkgs
-(`apps/foundry/infra/flake.lock`), move this flake's `nixpkgs` input to the same
+(`../foundry/infra/flake.lock`, or the legacy embedded path), move this flake's `nixpkgs` input to the same
 rev (`nix flake lock --override-input nixpkgs github:NixOS/nixpkgs/<rev>`) and
 Foundry's `pinned-host-glibc` constant to that release's glibc.
 
@@ -602,16 +602,24 @@ a release gate so a source revision cannot silently package older host fixes.
 anything else). OTP/Elixir are separate store paths, never rebuilt by a `.bl`
 change. Measured (this host, loaded): a one-line `.bl` change on the **old**
 single derivation = 54 min buildPhase (every NIF + the launcher recompiled,
-~54 min wall total 3235 s). After the split a `.bl` change should not
-rebuild `natives`/`drop-tools` — by construction of the filesets, NOT yet
-measured: the first split build was stopped before it finished (2026-10-04),
-so neither the split drop nor the gates below have run green yet
-(apps/foundry FUP-016).
+~54 min wall total 3235 s). The first split build was stopped on 2026-10-04. The clean pinned build from
+`5f762d83db98f61760dfd9ce53c5a38cced12730` completed on 2026-10-11:
+21m19s elapsed with native derivations reused, a fresh 396-source self-build,
+and both Nix gates green. This is a completed build measurement; it does not
+measure every possible cache state.
+
+Its payload build ID is `f13b5c47`; complete drop SHA-256 is
+`293b937acc7a1c61ce1b39839cd2071cedddfcfc2fd7405a1fdc127ff794d186`.
+All 29 ELFs, including the launcher, were inspected: launcher floor 2.39,
+payload floor 2.44, FHS interpreter and no Nix-store RPATH. The installed SDK
+smoke and 390 diagnostics, credential, HTTP MCP and measurement assertions
+passed from outside the source checkout.
 
 Gates (`nix flake check`, also the CI `nix-drop` job): `drop-runs` (the drop
 evaluates `(+ 1 2)` = 3) and `glibc-floor` (≤ 2.44). `tooling/drop/check-pins.sh`
-fails when this flake's nixpkgs ≠ `apps/foundry/infra/flake.lock`'s (it reads a
-sibling repo, so it is a script/CI step, not a sandboxed check).
+fails when this flake's nixpkgs differs from the sibling Foundry host pin
+(`../foundry/infra/flake.lock`, with legacy embedded-path fallback). It reads
+a sibling repo, so it is a script/CI step, not a sandboxed check.
 `nixpkgs-rust` follows `nixpkgs`; the compiler and linker now share one pin.
 
 One command: `tooling/drop/server-drop.sh` builds `.#bl-drop`, copies it to
