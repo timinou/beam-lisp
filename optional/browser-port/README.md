@@ -116,9 +116,23 @@ viewer authorization, input gating, off-mode lazy imports and editor proof.
 
 ## Scenario runner integration seam
 
-A native backend can implement `scenario/run-world`'s existing world map with
-one supervised port owner per actor/browser. Use dedicated profiles and explicit
-CDP target/session IDs. Feed `scenario.runner.adapt`'s existing run/evidence
-contract and retain witnessed/refuted/unknown verdicts. Two-actor localhost
-convergence, failure artifacts and cleanup are the first follow-up. Event
-subscriptions, recording and editor presentation remain separate work.
+`browser.page` wraps explicit native launch, navigation, awaited JavaScript,
+bounded predicates, real CDP clicks, text input and PNG capture. It keeps the
+flattened target/session ID on the owned page. Close each page in `finally`.
+`click!` returns normalized content coordinates and retains the real gesture
+for a film's cursor track. These namespaces are opt-in, like `browser.port`.
+
+`browser.film/world` adapts one already-owned page to `scenario/run-world`.
+Acts are `[:navigate url]`, `[:click selector]`, `[:fill selector text]`,
+`[:eval script]` and `[:wait predicate]`. Claims receive `(page, ctx)` and
+produce witnessed/refuted verdicts; each basis records a real PNG and its last
+click. Feed the result to `scenario.runner.adapt` and author a presentation with
+`scenario.film` (see `docs/scenarios/demo-films.md`). The world captures state
+screens; it does not claim continuous video or multi-actor convergence.
+
+Run the headed integration with `BL_BROWSER_PORT`, `CHROMIUM`, `SWAY` and
+`WAYVNC` set to explicit executables:
+
+```sh
+./bin/bl test -p optional/browser-port/bl optional/browser-port/test/film_test.bl
+```
