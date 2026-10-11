@@ -106,8 +106,7 @@
      (is (= #{:fast true false nil} (:flags (second old))))
      (is (= [1 "héllo"] (:items (second old))))))
    (finally (dispose slot two) (gen/retire! one))))
- (is (= :effectful-generation
-        (refused #(gen/plan {:sources {"bad" "(ns bad) (def x (+ 1 2))"}}))))
+ (is (some? (:digest (gen/plan {:sources {"bad" "(ns bad) (def x (+ 1 2))"}}))))
  (is (= :effectful-generation
         (refused #(gen/plan {:sources {"bad" "(ns bad) (def x {:nested [(atom 0)]})"}}))))
  (is (= :duplicate-definition
@@ -286,3 +285,81 @@
    (finally
     (doseq [pid @workers] (when (Process/alive? pid) (erlang/exit pid :kill)))
     (dispose slot two) (gen/retire! one)))))
+
+(deftest resource-and-source-lifetime-budgets-are-bounded-before-serialization
+ (let [base {:sources {"budget" "(ns budget) (defn run [] 1)"}}
+       deep (reduce (fn [v _] [v]) 0 (range 70))]
+  (is (= :invalid-generation (refused #(gen/plan (assoc base :resources {:deep deep})))))
+  (is (= :invalid-generation (refused #(gen/plan (assoc base :resources {:bytes (String/duplicate "x" 4194304)})))))
+  (is (= :runtime-handover-required (:status (gen/capacity {:source-bytes 134217728} 1 1))))
+  (is (= :available (:status (gen/capacity {:source-bytes 134217727} 1 1))))
+  (is (= :invalid-protocol-inventory (refused #(gen/plan (assoc base :protocols {(String/duplicate "x" 129) 1})))))))
+
+(deftest immutable-callback-values-regex-and-definition-macros-are-compiler-checked
+ (env/eval "(ns generation.macros) (defmacro screen [name args & body] (list* 'defn name args body)) (defmacro unsafe [name] (list 'def name (list 'atom 0)))")
+ (let [options (fn [n]
+                {:sources {"computed"
+                 (str "(ns computed (:require [generation.macros :as view])) "
+                      "(defn increment [x] (+ x " n ")) "
+                      "(def callbacks {:run increment :inline (fn [x] (+ x " n "))}) "
+                      "(def pattern #\"^hello$\") (def arithmetic (+ 1 2)) "
+                      "(view/screen screen [x] [((:run callbacks) x) ((:inline callbacks) x) arithmetic])")}
+                 :stable-namespaces #{"generation.macros"}})
+       old (gen/prepare! (options 1)) fresh (gen/prepare! (options 2))]
+  (try
+   (is (= [4 4 3] (gen/invoke! old "computed/screen" [3])))
+   (is (= [5 5 3] (gen/invoke! fresh "computed/screen" [3])))
+   (is (some #(String/starts_with? (erlang/atom_to_binary % :utf8) "Elixir.BeamLisp.Eval.") (:modules old)))
+   (is (= :effectful-generation
+          (refused #(gen/prepare! {:sources {"unsafe-macro" "(ns unsafe-macro (:require [generation.macros :as view])) (view/unsafe state)"}
+                                  :stable-namespaces #{"generation.macros"}}))))
+   (is (= :effectful-generation
+          (refused #(gen/prepare! {:sources {"unsafe-call" "(ns unsafe-call) (println :must-not-run)"}}))))
+   (finally (gen/retire! old) (gen/retire! fresh)))))
+
+(deftest initializer-owned-runtime-handles-are-generation-specific-and-write-once
+ (let [options {:application-id "second-app" :stable-namespaces #{"reload.generation"}
+                :sources {"runtime.handles" "(ns runtime.handles (:require [reload.generation :as gen])) (defn init [state] (gen/bind-runtime! {:state state})) (defn read [] [(gen/runtime-resource :state) (:application-id (gen/current))])"}}
+       old (gen/prepare! options) fresh (gen/prepare! (assoc options :resources {:version 2}))]
+  (try
+   (is (= :bound (gen/invoke! old "runtime.handles/init" ["old"])))
+   (is (= :bound (gen/invoke! fresh "runtime.handles/init" ["new"])))
+   (is (= ["old" "second-app"] (gen/invoke! old "runtime.handles/read" [])))
+   (is (= ["new" "second-app"] (gen/invoke! fresh "runtime.handles/read" [])))
+   (is (= :runtime-binding-conflict (refused #(gen/invoke! old "runtime.handles/init" ["replace"]))))
+   (is (= :missing-runtime-resource (refused #(gen/runtime-resource :state))))
+   (is (not= (:digest (gen/plan options)) (:digest (gen/plan (assoc options :application-id "third-app")))))
+   (is (= :invalid-generation (refused #(gen/plan (assoc options :application-id "../other")))))
+   (finally (gen/retire! old) (gen/retire! fresh)))))
+
+(deftest native-declared-owner-and-supervisor-hold-the-entire-sealed-graph
+ (let [generation (gen/prepare!
+                   {:application-id "owners" :resources {:version :old}
+                    :stable-namespaces #{"reload.generation" "proc.super"}
+                    :sources {"owned.application"
+                     "(ns owned.application (:require [reload.generation :as gen] [proc.super :as super])) (defserver owner (init [_] (ok nil)) (handle-call :value [_ state] (reply (gen/resource :version) state))) (super/defsupervisor tree (child :owner owner nil)) (defn init [] (start-link tree))"}})
+       owner (gen/invoke! generation "owned.application/init" [])
+       child (elem (first (Supervisor/which_children owner)) 1)]
+  (try
+   (is (= :old (GenServer/call child :value)))
+   (is (= :supervisor (:kind (gen/owner-evidence owner))))
+   (is (= :server (:kind (gen/owner-evidence child))))
+   (is (= (:digest generation) (:generation (gen/owner-evidence child))))
+   (is (= :waiting (:status (gen/retire! generation))))
+   (Supervisor/stop owner)
+   (is (nil? (gen/owner-evidence child)))
+   (is (= :retired (:status (gen/retire! generation))))
+   (finally (when (Process/alive? owner) (Supervisor/stop owner)) (gen/retire! generation)))))
+
+(deftest runtime-inheritance-requires-the-original-live-owner
+ (let [options {:application-id "inherit" :sources {"inherit.test" "(ns inherit.test (:require [reload.generation :as gen])) (defn init [v] (gen/bind-runtime! {:state v})) (defn read [] (gen/runtime-resource :state))"}
+                :stable-namespaces #{"reload.generation"}}
+       old (gen/prepare! options) fresh (gen/prepare! (assoc options :resources {:version 2}))]
+  (try
+   (gen/invoke! old "inherit.test/init" ["shared"])
+   (is (= :inherited (gen/inherit-runtime! fresh old)))
+   (is (= :already-bound (gen/inherit-runtime! fresh old)))
+   (is (= "shared" (gen/invoke! fresh "inherit.test/read" [])))
+   (is (= :runtime-inheritance-refused
+       (Task/await (Task/async #(refused (fn [] (gen/inherit-runtime! fresh old)))) 5000)))
+   (finally (gen/retire! old) (gen/retire! fresh)))))
