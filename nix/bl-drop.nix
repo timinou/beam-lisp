@@ -143,6 +143,14 @@ let
     sha256 = "4315e0dcc03fdd48e4861c5ea02ccf3e65a0a7a2646fad0c57367d1c6eb68114";
   };
 
+  # The SDK's terminal seam is also a Rustler precompiled dependency. Seed its
+  # locked-package checksum explicitly: an ordinary derivation must not need
+  # Rustler to reach GitHub during `bl deps compile`.
+  ratatuiNif = pkgs.fetchurl {
+    url = "https://github.com/mcass19/ex_ratatui/releases/download/v0.13.0/libex_ratatui-v0.13.0-nif-2.17-x86_64-unknown-linux-gnu.so.tar.gz";
+    sha256 = "95a23a060aadc58adea3fefd724dc7bb8ad4aead3152fac0ee62f130fe510320";
+  };
+
   # The checkout, as the build needs it. wry_webview (gtk/webkit, desktop only)
   # is left out: a server drop does not carry it, and `wry/*` reads as ABSENT.
   src = lib.fileset.toSource {
@@ -174,6 +182,7 @@ let
       mkdir -p $HOME $XDG_CACHE_HOME/beam_lisp $RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH
 
       cp ${explorerNif} $RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH/libexplorer-v0.12.0-nif-2.15-x86_64-unknown-linux-gnu.so.tar.gz
+      cp ${ratatuiNif} $RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH/libex_ratatui-v0.13.0-nif-2.17-x86_64-unknown-linux-gnu.so.tar.gz
       cp -r ${hexStore} $XDG_CACHE_HOME/beam_lisp/lib
       chmod -R u+w $XDG_CACHE_HOME/beam_lisp/lib
 

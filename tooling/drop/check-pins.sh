@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # check-pins.sh — the build's nixpkgs must be the rev the servers run.
 #
-# beam-lisp/flake.nix pins `nixpkgs` by rev; apps/foundry/infra/flake.lock pins the
+# beam-lisp/flake.nix pins `nixpkgs` by rev; ../foundry/infra/flake.lock pins the
 # servers' nixpkgs. The drop's glibc floor is only "<= the host" while they agree
 # (docs/native-bundler.md §16). Exits 1 on drift, 2 when a pin cannot be read.
 #
@@ -10,7 +10,14 @@
 set -eu
 here=$(CDPATH='' cd "$(dirname "$0")/../.." && pwd -P)
 flake_nix=${FLAKE_NIX:-$here/flake.nix}
-lock=${FOUNDRY_LOCK:-$here/apps/foundry/infra/flake.lock}
+if [ -n "${FOUNDRY_LOCK:-}" ]; then
+  lock=$FOUNDRY_LOCK
+elif [ -f "$here/../foundry/infra/flake.lock" ]; then
+  lock=$here/../foundry/infra/flake.lock
+else
+  # Older combined checkouts still keep Foundry under apps/.
+  lock=$here/apps/foundry/infra/flake.lock
+fi
 
 mine=$(sed -n 's|^ *nixpkgs\.url *= *"github:NixOS/nixpkgs/\([0-9a-f]\{40\}\)";.*|\1|p' "$flake_nix")
 [ -n "$mine" ] || { echo "check-pins: no 40-hex nixpkgs rev in $flake_nix" >&2; exit 2; }
