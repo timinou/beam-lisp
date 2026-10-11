@@ -79,9 +79,11 @@ def validate(value):
             raise ValueError('Every scene requires a local source')
         if not scene.get('say') and not scene.get('audio'):
             raise ValueError('Every scene requires narration text or a local audio file')
-        for key in ['lead', 'tail', 'duration', 'source_start']:
+        for key in ['lead', 'tail', 'duration', 'source_start', 'source_end']:
             if key in scene:
                 finite(scene[key], key)
+        if 'source_end' in scene and scene['source_end'] <= scene.get('source_start', 0):
+            raise ValueError('Video source_end must follow source_start')
         finite(scene.get('speed', 1), 'speed', .1, 8)
         last_shot = -1
         for shot in scene.get('shots', []):
@@ -261,7 +263,8 @@ def render_scene(scene, timing, audio, work, film):
     left = f'max(0,min(iw-iw/zoom,{ox}+{fitw}*({cx})-iw/zoom/2))'
     upper = f'max(0,min(ih-ih/zoom,{oy}+{fith}*({cy})-ih/zoom/2))'
     speed = scene.get('speed', 1)
-    filters = [f'[0:v]setpts=(PTS-STARTPTS)/{speed},fps={fps},scale={w}:{stage}:force_original_aspect_ratio=decrease,pad={w}:{stage}:(ow-iw)/2:(oh-ih)/2:color={bg},tpad=stop_mode=clone:stop_duration={timing["duration"]},zoompan=z=\'{z}\':x=\'{left}\':y=\'{upper}\':d=1:s={w}x{stage}:fps={fps},pad={w}:{h}:0:{top}:color={bg}[base]']
+    trim = f'trim=duration={scene["source_end"]-scene.get("source_start",0)},' if 'source_end' in scene else ''
+    filters = [f'[0:v]{trim}setpts=(PTS-STARTPTS)/{speed},fps={fps},scale={w}:{stage}:force_original_aspect_ratio=decrease,pad={w}:{stage}:(ow-iw)/2:(oh-ih)/2:color={bg},tpad=stop_mode=clone:stop_duration={timing["duration"]},zoompan=z=\'{z}\':x=\'{left}\':y=\'{upper}\':d=1:s={w}x{stage}:fps={fps},pad={w}:{h}:0:{top}:color={bg}[base]']
     current = 'base'
     if cursor:
         zt = expression(camera, 'zoom', 't', 1)

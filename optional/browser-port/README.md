@@ -156,6 +156,13 @@ dispatch synthetic DOM drag events or manufacture a film-only pointer path.
 `optional/browser-port/test/recording_test.bl` verifies animated frames arrive
 without scenario actions/screenshots, trusted drag input, and a decodable movie.
 
+`browser.film/owned-worlds` opens independent actors, records each continuously,
+and aligns their native takes into one horizontal video. Use ordered
+`[[:actor page-options] ...]`, equal viewport heights, and narrated scenes with
+`:capture :video`. `:basis :frames` retains reference PNGs separately;
+`:basis :video` supplies the continuous source and measured elapsed time. See
+the demo film documentation and `test/multiscreen_test.bl` for the contract.
+
 ## Demo tests
 
 `scenario.demo` combines normal scenario events with narrated scenes in one

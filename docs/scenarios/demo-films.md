@@ -83,6 +83,39 @@ media files, with byte-range seeking. Each exported step's film time comes
 from its scene; no separate registration script or hand-maintained frame map
 is needed.
 
+## Continuous native video and several screens
+
+Screenshots are reference observations, not a substitute for a motion take.
+For continuous video, opt into `browser.film/owned-worlds` and `:capture :video`:
+
+```clojure
+{:world (fn [{:keys [frames]}]
+          (browser/owned-worlds [[:planner (browser-options)]
+                                 [:observer (browser-options)]] frames {:fps 30}))}
+
+(demo/scene :move {:capture :video :say "Examinez le déplacement avant de confirmer."}
+  (s/does :planner [:drag "#source" "#target" 1800])
+  (s/does :planner [:pause 1000])
+  (s/sees :observer unchanged? "Preview has not changed the observer"))
+```
+
+Each actor has its own native browser/profile and continuously encoded frame
+stream. Recording runs independently of actions, assertions and reference PNGs.
+The world aligns the streams at one measured epoch and produces a horizontal
+multiscreen video; viewports must have equal heights. Actors are an ordered
+vector so screen order is stable. All ports/encoders are cleaned up on failures.
+`[:drag source target duration-ms]` sends trusted CDP input. The optional visible
+pointer follows actual trusted input events; it is already in the source video,
+so video scenes never add an editorial pointer.
+
+Video scenes derive `source_start`, `source_end`, duration and step marks from
+recorded elapsed times. `:step-seconds` only controls screenshot presentations;
+it cannot change a video take's timing. A scene excludes footage after its end
+observation, then holds that observed state if speech lasts longer. This prevents
+a later confirmation from appearing while narration still explains a preview.
+The original uncut video, each actor's take, native frame timing/statistics, and
+the separate reference PNGs remain available alongside the scenario run.
+
 ## Direct film authoring
 
 `scenario.film` authors a film as data. Keep the scenario's assertions in its

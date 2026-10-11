@@ -47,9 +47,27 @@ class FilmTest(unittest.TestCase):
     def test_rejects_duplicate_ids_nonfinite_timing_and_inverted_keys(self):
         scene = {'id': 'a', 'source': 'a.png', 'say': 'Bonjour'}
         for scenes in [[scene, scene], [{**scene, 'duration': float('nan')}],
-                       [{**scene, 'camera': [{'at': 2}, {'at': 1}]}]]:
+                       [{**scene, 'camera': [{'at': 2}, {'at': 1}]}],
+                       [{**scene, 'source_start': 2, 'source_end': 1}]]:
             with self.assertRaises(ValueError):
                 film.validate({'version': 1, 'id': 'demo', 'scenes': scenes})
+
+    def test_scene_boundary_freezes_observed_state_without_revealing_future_actions(self):
+        with tempfile.TemporaryDirectory(prefix='film boundary ') as folder:
+            root = Path(folder)
+            source, audio = root/'continuous.mp4', root/'voice.wav'
+            film.run(['ffmpeg','-loglevel','error','-y','-f','lavfi','-i','color=red:s=640x480:r=10:d=0.5',
+                      '-f','lavfi','-i','color=blue:s=640x480:r=10:d=0.5',
+                      '-filter_complex','[0:v][1:v]concat=n=2:v=1:a=0[out]','-map','[out]',
+                      '-c:v','libx264','-threads','1',source])
+            film.run(['ffmpeg','-loglevel','error','-y','-f','lavfi','-i','sine=duration=1','-ar','48000',audio])
+            film.export({'version':1,'id':'boundary','width':640,'height':480,'fps':10,
+                         'scenes':[{'id':'review','source':str(source),'source_start':0,'source_end':0.4,
+                                    'audio':str(audio),'say':'Examinez avant de confirmer.'}]},root/'out')
+            pixel = subprocess.run(['ffmpeg','-loglevel','error','-ss','0.8','-i',str(root/'out/demo.mp4'),
+                                    '-frames:v','1','-vf','crop=2:2:320:240','-pix_fmt','rgb24','-f','rawvideo','-'],
+                                   check=True,capture_output=True).stdout
+            self.assertGreater(pixel[0],pixel[2]+100)  # Still red; future blue was excluded.
 
     def test_real_mixed_media_export_keeps_audio_cues_and_video_frames(self):
         with tempfile.TemporaryDirectory(prefix='film smoke ') as folder:
