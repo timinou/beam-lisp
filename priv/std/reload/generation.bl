@@ -111,7 +111,7 @@
        (not (contains? #{"def" "defmacro" "defsupervisor" "do" "let" "atom"} head))))))
 
 (defn- check-source! [name source stable native sources]
- (when-not (and (string? source) (<= (erlang/byte_size source) 524288))
+ (when-not (and (string? source) (<= (erlang/byte_size source) 1048576))
   (refuse! :invalid-source {:namespace name}))
  (let [forms (BeamLisp.Reader/read_string source)
        header (graph/header* source)
@@ -134,7 +134,8 @@
          base (last parts) resolved (get aliases prefix prefix)]
     (when (unmanaged-producer? resolved base)
      (refuse! :unmanaged-generation-producer {:namespace name :symbol symbol}))
-    (when (or (or (contains? forbidden symbol) (contains? forbidden (str resolved "/" base)))
+    (when (or (= "persistent_term" resolved)
+              (or (contains? forbidden symbol) (contains? forbidden (str resolved "/" base)))
               (and (contains? forbidden base)
                    (or (= 1 (count parts)) (contains? #{"core" "env" "reload" "compiler"} resolved)))
               (String/starts_with? resolved "BeamLisp.")
@@ -158,6 +159,11 @@
      (if (contains? #{:target :require} mode) (get mapping name text)
       (if (and (= mode :code) (= 2 (count parts)) (get mapping (first parts)))
        (str (get mapping (first parts)) "/" (second parts)) text)))
+   (and (= :list tag) (= "deref" (head-of node))
+        (= 2 (count (children node))) (String/starts_with? text "@"))
+    ;; The reader emits (deref operand), while the source span starts with @.
+    ;; Keep that reader syntax and recursively seal only its actual operand.
+    (str "@" (rewrite-fragment (String/slice text 1 (String/length text)) mapping mode))
    (contains? #{:list :vector :map :set} tag)
     (if (= "quote" (head-of node)) text
      (let [opening (cond (= :set tag) "#{" (= :list tag) "(" (= :vector tag) "[" :else "{")
@@ -333,6 +339,33 @@
  (cons (BeamLisp.Emit/module_for name)
        (keys (BeamLisp.Emit/body_modules (BeamLisp.Env/ns_defs name)))))
 
+(defn- native-hazard-symbol? [module name]
+ (let [namespace (String/replace_prefix module "Elixir." "")]
+  (or (unmanaged-producer? namespace name)
+      (= namespace "persistent_term")
+      (contains? #{"BeamLisp.Env" "BeamLisp.Compiler" "BeamLisp.AOT"
+                   "BeamLisp.AOTCache" "BeamLisp.Emit" "BeamLisp.Link" "BeamLisp.Bootstrap"} namespace)
+      (and (= namespace "BeamLisp") (contains? #{"eval" "eval_string" "load_file"} name))
+      (and (= namespace "erlang") (contains? #{"apply" "make_fun"} name))
+      (and (= namespace "code") (contains? #{"load_binary" "load_file" "delete" "purge" "soft_purge"} name)))))
+
+(defn- native-hazard? [module function]
+ (native-hazard-symbol? (erlang/atom_to_binary module :utf8)
+                        (erlang/atom_to_binary function :utf8)))
+
+(defn- check-expanded-source! [name form]
+ ;; Rt/invoke is legitimate compiler lowering for closure/keyword calls. Reject
+ ;; explicit reflective source, including trusted macro output, before lowering.
+ ;; Audited macros may emit native constructors such as Supervisor/server; the
+ ;; initializer/descriptor ANF proof below checks their actual executable shape.
+ (doseq [[_ symbol] (executable-symbols form)]
+  (let [parts (String/split symbol "/") namespace (first parts) function (last parts)]
+   (when (and (= 2 (count parts))
+              (or (native-hazard-symbol? namespace function)
+                  (and (= "BeamLisp.Ns.Rt" (String/replace_prefix namespace "Elixir." ""))
+                       (= "invoke" function))))
+    (refuse! :unmanaged-compiled-producer {:namespace name :symbol symbol})))))
+
 (defn- check-anf! [planned expression]
  ;; Inspect the compiler's actual ANF too: a trusted macro must not inject a
  ;; late reference to an unversioned app namespace after source rewriting.
@@ -345,11 +378,13 @@
                (when (and (= :global (:op node)) (not (contains? names (:ns node))))
                 (refuse! :unsealed-compiled-dependency {:namespace (:ns node)}))
                (when (and (= :remote (:op node)) (erlang/is_atom (:mod node))
-                          (or (unmanaged-producer? (erlang/atom_to_binary (:mod node) :utf8)
-                                                   (erlang/atom_to_binary (:fun node) :utf8))
-                              (and (= :erlang (:mod node))
-                                   (contains? #{:apply :make_fun} (:fun node)))))
+                          (native-hazard? (:mod node) (:fun node)))
                 (refuse! :unmanaged-compiled-producer {:module (:mod node) :function (:fun node)}))
+               (when (and (= :remote (:op node)) (= :Elixir.BeamLisp.Loader (:mod node))
+                          (not (and (= :ensure_ready (:fun node)) (= 1 (count (:args node)))
+                                    (= :lit (:op (first (:args node))))
+                                    (contains? names (:val (first (:args node)))))))
+                (refuse! :unsealed-compiled-dependency {:module (:mod node) :function (:fun node)}))
                (when (and (= :remote (:op node)) (erlang/is_atom (:mod node))
                           (String/starts_with? (erlang/atom_to_binary (:mod node) :utf8)
                                                "Elixir.BeamLisp.Ns.")
@@ -426,6 +461,7 @@
            (let [head (head-of form) items (children form)]
             (if (contains? #{"defn" "defn-" "def" "defserver"} head)
              (let [definition (name-of (second items))]
+              (check-expanded-source! name form)
               (when (or (nil? definition) (contains? @seen definition))
                (refuse! :duplicate-definition {:namespace name :definition definition}))
               (swap! seen conj definition)
@@ -616,6 +652,13 @@
       (if (and (= (erlang/self) (:owner previous)) (= bindings (:values previous))) :already-bound
        (refuse! :runtime-binding-conflict {}))
       (do (swap! (:state generation) assoc :runtime {:owner (erlang/self) :values bindings}) :bound)))))))
+
+(defn runtime-bound?
+ "Whether this graph has initializer bindings whose original owner is alive.
+  Does not expose handles, authorize inheritance or acquire a serving lease."
+ [generation]
+ (let [state @(:state generation) runtime (:runtime state)]
+  (boolean (and runtime (not (:retired state)) (Process/alive? (:owner runtime))))))
 
 (defn inherit-runtime!
  "Explicitly share initializer-owned handles with an unpublished candidate.
