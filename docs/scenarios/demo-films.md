@@ -40,6 +40,13 @@ covers the complete speech interval and reading tail. Keep each passage short
 enough for two subtitle lines. `:subtitle` can spell out an abbreviation or
 display a number differently from `:say`.
 
+A scene can instead carry `:shots [{:at 0 :source "before.png"}
+{:at 1.8 :source "after.png"}]`. These held state captures must share viewport
+dimensions. Times start at zero and increase within the measured scene. Use
+the last real click coordinates from the capture to author a cursor gesture;
+change to the observed result screen just after that click. Each shot's source
+hash is retained separately in the manifest.
+
 Camera and cursor coordinates are normalized to the original source image:
 `0,0` is its top left; `1,1` its bottom right. `:at` is local scene time. Camera
 keys accept zoom 1–4 and a center `:x/:y`; the crop stays inside the contained

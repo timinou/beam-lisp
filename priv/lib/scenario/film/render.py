@@ -76,7 +76,7 @@ def validate(value):
         if not isinstance(scene.get('id'), str) or scene['id'] in ids:
             raise ValueError('Scene ids must be unique strings')
         ids.add(scene['id'])
-        if not scene.get('source'):
+        if not scene.get('source') and not scene.get('shots'):
             raise ValueError('Every scene requires a local source')
         if not scene.get('say') and not scene.get('audio'):
             raise ValueError('Every scene requires narration text or a local audio file')
@@ -84,6 +84,12 @@ def validate(value):
             if key in scene:
                 finite(scene[key], key)
         finite(scene.get('speed', 1), 'speed', .1, 8)
+        last_shot = -1
+        for shot in scene.get('shots', []):
+            t = finite(shot['at'], 'shot time')
+            if t <= last_shot or (last_shot == -1 and t != 0) or not shot.get('source'):
+                raise ValueError('Shots require local sources and increasing times starting at zero')
+            last_shot = t
         for track in ['camera', 'cursor']:
             last = -1
             for point in scene.get(track, []):
@@ -205,7 +211,22 @@ def render_scene(scene, timing, audio, work, film):
     ox, oy = (w - fitw) / 2, (stage - fith) / 2
     is_image = source.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp']
     inputs = ['-loop', '1', '-framerate', str(fps)] if is_image else ['-ss', str(scene.get('source_start', 0))]
-    args = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-threads', '2', *inputs, '-i', source, '-i', audio]
+    if scene.get('shots'):
+        # Held state captures preserve real before/after screens while an
+        # authored cursor makes the demonstrated action easy to follow.
+        shot_list, lines = work/'shots.txt', []
+        for i, shot in enumerate(scene['shots']):
+            next_at = scene['shots'][i+1]['at'] if i+1 < len(scene['shots']) else timing['duration']
+            if next_at <= shot['at']:
+                raise ValueError('A shot starts after the scene ends')
+            path = str(Path(shot['source']).resolve()).replace("'", "'\\''")
+            lines += [f"file '{path}'", f"duration {next_at-shot['at']}"]
+        lines.append(lines[-2])
+        shot_list.write_text('\n'.join(lines))
+        inputs, source_input = ['-f', 'concat', '-safe', '0'], shot_list
+    else:
+        source_input = source
+    args = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-threads', '2', *inputs, '-i', source_input, '-i', audio]
     cursor = scene.get('cursor', [])
     if cursor:
         for asset in cursor_assets(work):
@@ -283,6 +304,8 @@ def export(film, out):
     scenes, cues, offset, clips = [], [], 0, []
     for index, authored in enumerate(film['scenes']):
         scene = dict(authored)
+        if scene.get('shots'):
+            scene['source'] = scene['shots'][0]['source']
         source = Path(scene['source']).resolve()
         if not source.is_file():
             raise ValueError(f'Missing source for scene {scene["id"]}')
@@ -300,6 +323,8 @@ def export(film, out):
         clips.append(render_scene(scene, timing, audio, work, film))
         record = {**scene, **timing, 'offset': offset, 'source': str(source), 'source_sha256': digest(source),
                   'audio': str(audio), 'audio_sha256': digest(audio), 'provider': provider}
+        if scene.get('shots'):
+            record['shots'] = [{**shot, 'source_sha256': digest(shot['source'])} for shot in scene['shots']]
         scenes.append(record)
         cues.append((offset + timing['subtitle_start'], offset + timing['subtitle_end'], scene.get('subtitle', scene.get('say', ''))))
         offset += timing['duration']

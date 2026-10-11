@@ -44,7 +44,7 @@ class FilmTest(unittest.TestCase):
                      'camera':[{'at':0,'zoom':1},{'at':1,'zoom':1.3,'x':.7}],
                      'cursor':[{'at':0,'x':.2,'y':.4},{'at':.6,'x':.7,'y':.5,'click':True}]}
             value = {'version':1,'id':'smoke','width':640,'height':480,'fps':10,
-                     'run':{'verdict':'unknown'}, 'scenes':[scene,{**scene,'id':'second','source_start':0}]}
+                     'run':{'verdict':'unknown'}, 'scenes':[scene,{**scene,'id':'second','shots':[{'at':0,'source':str(source)}, {'at':.5,'source':str(source)}]}]}
             result = film.export(value, root/'out')
             self.assertEqual('unknown', result['run']['verdict'])
             self.assertEqual(2, len(result['scenes']))
