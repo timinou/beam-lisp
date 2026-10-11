@@ -925,7 +925,7 @@ export function waitForInput(rt, ms, inputEnabled = true) {
   });
 }
 
-export function newRuntime() {
+export function newRuntime({input = true} = {}) {
   const runtimeId = (runtimeIdCounter += 1);
   const rt = {
     globals: new Map(),
@@ -957,11 +957,11 @@ export function newRuntime() {
     errors: 0,
     // High-water mark of the generator frame stack, for a stack-safety test.
     maxFrames: 0,
-    inbox: earlyInputs.splice(0),
+    inbox: input ? earlyInputs.splice(0) : [],
     inputWake: null,
     out: (s) => { console.log(s); },
   };
-  activeRuntime = rt;
+  if (input) activeRuntime = rt;
   return rt;
 }
 
@@ -993,8 +993,8 @@ export function ref(rt, ns, name) {
 // A callable uses the SAME generator machine for actor turns and checked host
 // callbacks. Evidence belongs to the compiler, never to authored metadata.
 const synchronousCallables = new WeakMap();
-export function blFn(name, arities, variadic, rt = null, synchronous = false) {
-  const fn = function (...args) { return invokeSynchronous(fn, args); };
+export function blFn(name, arities, variadic, rt = null, synchronous = false, entry = null) {
+  const fn = function (...args) { return entry ? entry(fn, args) : invokeSynchronous(fn, args); };
   Object.defineProperties(fn, {
     name: {value: name}, __blfn: {value: true},
     arities: {value: arities}, variadic: {value: variadic || null},
@@ -1023,6 +1023,12 @@ export function isSynchronousCallable(fn) { return callbackRuntime(fn) !== null;
 export function invokeSynchronous(fn, args, budget = 100000) {
   const rt = callbackRuntime(fn);
   if (!rt) throw new TypeError("JS interop: callback is not proven non-suspending; use an actor event entrypoint");
+  return invokeImmediate(fn, args, rt, budget);
+}
+// Host result boundaries drive the same frame machine. Unlike the explicitly
+// proven callback API, ordinary module entries may contain dynamic callees:
+// actual suspension is refused, never relabelled as compiler evidence.
+export function invokeImmediate(fn, args, rt, budget = 100000) {
   const factory = resolveCallee(fn, args);
   const depth = rt.criticalDepth || 0;
   try {
