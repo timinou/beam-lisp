@@ -12,6 +12,7 @@ try{await import(pathToFileURL(root+'/out/observation-bench.mjs'));}finally{cons
 if(!result)throw Error('No actor snapshot measurements returned');
 const samples=result.samples.slice(20).sort((a,b)=>a-b);
 console.log(JSON.stringify({kind:result.kind,actors:result.actors,rows:result.rows,
- samples:samples.length,units:'ms',p50:samples[Math.floor(samples.length*.50)],
+ samples:samples.length,units:'ms',warmupReads:20,node:process.version,
+ rawSamplesMs:result.samples.slice(20),p50:samples[Math.floor(samples.length*.50)],
  p95:samples[Math.floor(samples.length*.95)],p99:samples[Math.floor(samples.length*.99)],
  max:samples.at(-1),scope:'in-actor read only; excludes conversion, DOM and audio output'},null,2));
