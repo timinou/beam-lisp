@@ -1,0 +1,147 @@
+; Characterization/prototype only. No production contract inference is installed.
+(ns research.reload-contract-boundary-test
+ (:require [system.model :as model] [reload.migrate :as preview] [js.actor :as actor] [z3]
+           [proc.evolve :as evolve] [datom :as d] [datom.migrate :as migrate]))
+
+(def source
+ "(defserver amount-owner
+    (init [] (ok 0))
+    (handle-call [:amount n] [_ state] :when (and (int? n) (> n 0))
+      (reply :accepted (+ state n))))")
+
+(defn clauses []
+ (filterv #(not= :init (:label %))
+  (model/transitions (first (BeamLisp.Reader/read_string source)))))
+
+(defn compile-matcher!
+ ([] (compile-matcher! :before-parameters))
+ ([position]
+ ; Reuse the compiler's actual server-pattern/guard semantics. Replacing bodies
+ ; is safe only for this finite message-only fixture. Stateful guards, arbitrary
+ ; predicates, captures and protocol system messages require a compiler-owned IR
+ ; implementation, not this source-string prototype.
+ (let [name (str "contract_matcher_" (System/unique_integer (list :positive)))
+       body (join " " (map (fn [clause]
+           (str "(handle-call " (:pattern clause)
+                (when (and (:guard clause) (= position :before-parameters))
+                 (str " :when " (:guard clause)))
+                " [_ state]"
+                (when (and (:guard clause) (= position :after-parameters))
+                 (str " :when " (:guard clause)))
+                " (reply true state))")) (clauses)))
+       compiled (BeamLisp/eval
+         (str "(defserver " name " (init [] (ok nil)) " body
+              " (handle-call _ [_ state] (reply false state)))"))]
+  (core/start compiled))))
+
+(deftest native-matcher-reused-from-handler-without-handwritten-accept-predicate
+ (let [p (compile-matcher!)]
+  (try
+   (is (= true (GenServer/call p [:amount 3])))
+   (doseq [bad [[:amount "3"] [:amount nil] [:amount 0] [:amount -1]
+                [:amount] [:amount 3 4] [:other 3] {:amount 3} nil]]
+    (is (= false (GenServer/call p bad)) (str "Invalid request: " (pr-str bad))))
+   (is (= true (GenServer/call p [:amount 1])))
+   (finally (GenServer/stop p)))))
+
+(deftest characterize-native-analysis-guard-position-disagreement
+ ; Known upstream gap, not a desired contract. Native compilation currently
+ ; treats the post-parameter :when/guard as ordinary body expressions, although
+ ; system.model extracts it as an enforcing guard. Do not advertise inference
+ ; before compiler/model/backend agreement is fixed and this probe is inverted.
+ (let [p (compile-matcher! :after-parameters)]
+  (try
+   (is (= true (GenServer/call p [:amount 0])))
+   (is (= true (GenServer/call p [:amount "wrong"])))
+   (finally (GenServer/stop p)))))
+
+(deftest characterize-javascript-server-guard-lowering-gap
+ (let [before '(handle-call [:amount n] :when (int? n) [_ state] (reply true state))
+       after '(handle-call [:amount n] [_ state] :when (int? n) (reply true state))]
+  (is (try (actor/lower-arm before 'loop 'current 'ref "prototype") false (catch _ true)))
+  (let [arm (actor/lower-arm after 'loop 'current 'ref "prototype")]
+   (is (= 2 (count arm)))
+   (is (includes? (pr-str (second arm)) ":when")))))
+
+(deftest dispatch-label-coverage-alone-does-not-establish-message-shape
+ (let [node (first (BeamLisp.Reader/read_string source))]
+  (is (preview/lands-on-arm? node :amount))
+  (is (= "[:amount n]" (:pattern (first (clauses)))))
+  (is (= "(and (int? n) (> n 0))" (:guard (first (clauses)))))))
+
+(deftest current-manual-contract-can-let-invalid-values-reach-handler-effects
+ (let [entries (atom 0)
+       p (evolve/start!
+          {:version 1 :digest "weak-contract"
+           :accept? (fn [m] (and (map? m) (contains? m :amount)))
+           :check-state int?
+           :handler (fn [m state]
+                      (swap! entries inc)
+                      (let [next (+ state (:amount m))]
+                       {:reply next :state next}))} 0)]
+  (try
+   (let [before (evolve/status p) result (evolve/call! p 1 {:amount "wrong"})]
+    (is (= :refused (:status result)))
+    (is (= :handler-failed (:kind result)))
+    (is (= 1 @entries))
+    (is (= before (evolve/status p))))
+   (finally (GenServer/stop p)))))
+
+(deftest state-rehearsal-does-not-certify-message-adapter-output
+ (let [entries (atom 0)
+       base {:version 1 :digest "shape-old" :accept? int? :check-state int?
+             :handler (fn [m state] (swap! entries inc) {:reply m :state state})}
+       p (evolve/start! base 0)
+       candidate (assoc base :version 2 :digest "shape-new"
+                    :migrate-state identity :upcast (fn [_] "wrong"))]
+  (try
+   (is (= :valid (:status (evolve/rehearse! p 1 candidate))))
+   (is (= :applied (:status (evolve/upgrade! p 1 candidate))))
+   (is (= :invalid-message (:kind (evolve/call! p 1 3))))
+   (is (= 0 @entries))
+   (is (= 2 (:version (evolve/status p))))
+   (finally (GenServer/stop p)))))
+
+(deftest old-request-adaptation-does-not-preserve-old-reply-shape-automatically
+ (let [base {:version 1 :digest "reply-old" :accept? int? :check-state int?
+             :handler (fn [m state] {:reply m :state state})}
+       p (evolve/start! base 0)
+       candidate (assoc base :version 2 :digest "reply-new"
+                   :migrate-state identity :upcast identity
+                   :handler (fn [m state] {:reply {:value m} :state state}))]
+  (try
+   (is (= 3 (evolve/call! p 1 3)))
+   (is (= :applied (:status (evolve/upgrade! p 1 candidate))))
+   (is (= {:value 3} (evolve/call! p 1 3)))
+   (is (= 2 (:version (evolve/status p))))
+   (finally (GenServer/stop p)))))
+
+(deftest declared-smt-model-is-not-bound-to-runtime-migration-function
+ (let [port (z3/open)
+       spec (preview/migration
+             {:strategy :reroute :decls "(declare-const b1 Int)\n"
+              :v1 "b1" :migrate "b1" :fn (fn [_] "wrong-shape")})
+       handler (first (BeamLisp.Reader/read_string
+                  "(defserver noop (handle-call [:read] [_ state] (reply :ok state)))"))]
+  (let [result (preview/verify-migration port spec handler)]
+    (is (= true (:verified result)))
+    (is (= :declared-smt-expression (:proof-scope result)))
+    (is (= "wrong-shape" (preview/reroute-message spec 1))))))
+
+(deftest schema-declaration-needs-automatic-historical-check-derivation
+ (let [c (d/connect [{:db/ident :item/id :db/valueType :db.type/string
+                      :db/unique :db.unique/identity}
+                     {:db/ident :item/name :db/valueType :db.type/string}])
+       spec {:migration/id :review/unique-name
+             :migration/grows [{:db/ident :item/name :db/valueType :db.type/string
+                                :db/unique :db.unique/identity}]}]
+  (try
+   (d/transact! c [{:db/id -1 :item/id "a" :item/name "duplicate"}
+                   {:db/id -2 :item/id "b" :item/name "duplicate"}])
+   ; No apply: this probe only previews an isolated in-memory database.
+   (is (= :clean (:status (migrate/plan-with c spec))))
+   (let [checked (assoc spec :migration/checks [{:check :unique :attr :item/name}])]
+    (is (= :breaking (:status (migrate/plan-with c checked))))
+    (is (= 1 (count (:breaking (migrate/plan-with c checked))))))
+   (is (= 2 (count (d/q '[:find ?e :where [?e :item/name "duplicate"]] (d/db c)))))
+   (finally (d/close! c)))))
