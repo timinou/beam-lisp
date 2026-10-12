@@ -1,0 +1,228 @@
+; Pure, conservative specialization. This is not native-call authorization.
+; The generation compiler must check every resulting target before compilation.
+(ns reload.static-call (:require [reader] [reader-node :as rn]))
+
+(defn- form [node] (rn/node-form node))
+(defn- tag [node] (rn/node-tag (form node)))
+(defn- label [node]
+ (when (contains? #{:symbol :keyword} (tag node)) (rn/node-name (form node))))
+(defn- children [node]
+ (case (tag node)
+  :map (mapcat (fn [pair] [(elem pair 0) (elem pair 1)]) (rn/node-items node))
+  :list (rn/node-items node)
+  :vector (rn/node-items node)
+  :set (rn/node-items node)
+  []))
+(defn- head [node] (when (= :list (tag node)) (label (first (children node)))))
+(defn- push [stack nodes]
+ ;; Boolean/budget walks need no source order. Prepend without re-copying the
+ ;; remaining worklist for every scalar in a wide collection.
+ (reduce (fn [remaining node] (cons node remaining)) stack nodes))
+
+(defn- points [source] (vec (unicode/characters_to_list source)))
+(defn- text [characters] (unicode/characters_to_binary (to-list characters)))
+(defn- slice [source start end] (text (subvec (points source) start end)))
+
+(defn- tokens [source]
+  (loop [stream (reader/stream source nil) result []]
+   (let [next (reader/read-next-string stream)]
+    (if (= :eof (first next)) result
+     (let [fragment (nth next 2) after (nth next 3)
+           ;; Native stream positions count codepoints, not grapheme clusters.
+           end (elem (:pos after) 3)
+           start (- end (count (points fragment)))]
+      (recur after (conj result {:node (second next) :text fragment :start start :end end})))))))
+
+(defn- bounded! [nodes]
+ (loop [todo (push (list) (map (fn [node] [node 0]) nodes)) left 100000]
+  (when (seq todo)
+   (let [[node depth] (first todo) nested (children node)]
+    (when (or (zero? left) (> depth 32) (> (count nested) left))
+     (throw (ex-info "Static call analysis budget exceeded" {:kind :static-call-analysis-budget})))
+    (recur (push (rest todo) (map (fn [child] [child (inc depth)]) nested)) (dec left))))))
+
+(defn- definition-of-list? [nodes]
+ (loop [todo nodes]
+  (if (empty? todo) false
+   (let [node (first todo)]
+    (if (and (contains? #{"def" "defn" "defn-" "defmacro"} (head node))
+             (= "list" (label (second (children node))))) true
+     (recur (push (rest todo) (children node))))))))
+
+(defn- non-head-list? [node]
+ (loop [todo [[node false]]]
+  (if (empty? todo) false
+   (let [[node head?] (first todo)]
+    (if (and (= :symbol (tag node)) (= "list" (label node)) (not head?)) true
+     (recur (push (rest todo) (map-indexed (fn [index child] [child (and (= :list (tag node)) (zero? index))])
+                                  (children node)))))))))
+
+(defn- unsafe-header? [node]
+ (loop [todo (children node)]
+  (if (empty? todo) false
+   (let [node (first todo) name (label node)]
+    (if (or (and (= :keyword (tag node)) (contains? #{"refer" "rename" "refer-clojure" "import"} name))
+            (and (= :symbol (tag node)) (contains? #{"list" "erlang"} name))) true
+     (recur (push (rest todo) (children node))))))))
+
+(defn- header-symbols [headers]
+ (loop [todo headers result #{}]
+  (if (empty? todo) result
+   (let [node (first todo)]
+    (recur (push (rest todo) (children node))
+           (if (= :symbol (tag node)) (conj result (label node)) result))))))
+
+(defn- unknown-initializer? [node]
+ (loop [todo [node]]
+  (if (empty? todo) false
+   (let [node (first todo) call (head node)]
+    (cond
+     (contains? #{"fn" "fn*" "quote" "syntax-quote"} call) (recur (rest todo))
+     (and (= :list (tag node))
+          (not (contains? #{"if" "do" "throw" "let" "let*" "loop" "loop*" "recur" "list" "erlang/apply"} call))) true
+     :else (recur (push (rest todo) (children node))))))))
+
+(defn- unchanged [source] {:text source :targets [] :rewrites 0})
+(defn- edits [source changes]
+ (let [original (points source) size (count original)]
+  (loop [remaining (sort-by :start changes) cursor 0 chunks []]
+   (if (empty? remaining)
+    (text (mapcat identity (conj chunks (subvec original cursor size))))
+    (let [edit (first remaining) start (:start edit) end (:end edit)]
+     (when-not (<= cursor start end size)
+      (throw (ex-info "Overlapping static call source spans" {:kind :invalid-static-call-span})))
+     (recur (rest remaining) end (conj (conj chunks (subvec original cursor start)) (points (:text edit)))))))))
+(defn- replace-token [token replacement]
+ {:start (:start token) :end (:end token) :text replacement})
+(defn- offset [token amount]
+ (assoc token :start (+ amount (:start token)) :end (+ amount (:end token))))
+
+(defn- native-module [node]
+ (when (= :keyword (tag node))
+  (let [name (label node)]
+   (cond
+    (Regex/match? #"^[a-z][a-z0-9_]*$" name) name
+    (Regex/match? #"^Elixir[.][A-Z][A-Za-z0-9_]*([.][A-Z][A-Za-z0-9_]*)*$" name)
+      (String/replace_prefix name "Elixir." "")
+    :else nil))))
+(defn- native-function [node]
+ (when (and (= :keyword (tag node)) (Regex/match? #"^[a-z_][A-Za-z0-9_!?]*$" (label node))) (label node)))
+
+(defn- ambiguous-target? [nodes namespace-prefixes]
+ (loop [todo nodes]
+  (if (empty? todo) false
+   (let [node (first todo)]
+    (if (and (= "erlang/apply" (head node))
+             (contains? namespace-prefixes (native-module (second (children node))))) true
+     (recur (push (rest todo) (children node))))))))
+
+(declare rewrite-token)
+
+(defn- apply-results [source results]
+  {:text (edits source (keep (fn [[token result]]
+                               (when (not= (:text token) (:text result)) (replace-token token (:text result)))) results))
+   :targets (vec (mapcat (fn [[_ result]] (:targets result)) results))
+   :rewrites (reduce + 0 (map (fn [[_ result]] (:rewrites result)) results))})
+
+(defn- rewrite-selected [source selected]
+ (apply-results source (mapv (fn [token] [token (rewrite-token token)]) selected)))
+
+(defn- collection-tokens [source opening]
+ (let [size (count (points source))]
+  (mapv #(offset % opening) (tokens (slice source opening (dec size))))))
+
+(defn- rewrite-bindings [token]
+ (let [source (:text token) items (collection-tokens source 1)]
+  (if (= 1 (mod (count items) 2)) (unchanged source)
+   (rewrite-selected source (keep-indexed (fn [index item] (when (= 1 (mod index 2)) item)) items)))))
+
+(defn- rewrite-intrinsic [source kind items]
+ (cond
+  (contains? #{"defn" "defn-" "fn" "fn*"} kind)
+   (let [skip (if (contains? #{"defn" "defn-"} kind) 2 1)
+         tail (drop skip items)
+         argument (first (drop-while #(contains? #{:scalar :symbol :map} (tag (:node %))) tail))]
+    ;; A multi-arity clause is not an ordinary call; leave its whole form alone.
+    (if (and argument (= :vector (tag (:node argument))))
+     (rewrite-selected source (drop-while #(<= (:start %) (:start argument)) items))
+     (unchanged source)))
+  (= "def" kind)
+   (if (<= 3 (count items) 4) (rewrite-selected source [(last items)]) (unchanged source))
+  (contains? #{"let" "let*" "loop" "loop*"} kind)
+   (let [bindings (second items)]
+    (if (not= :vector (tag (:node bindings))) (unchanged source)
+     (apply-results source (cons [bindings (rewrite-bindings bindings)]
+                                (map (fn [token] [token (rewrite-token token)]) (drop 2 items))))))
+  :else (rewrite-selected source (rest items))))
+
+(defn- specialize-apply [source items]
+ (let [module (native-module (:node (nth items 1)))
+       function (native-function (:node (nth items 2)))
+       arguments (nth items 3) argument-source (:text arguments)]
+  (if-not (and module function (= :list (tag (:node arguments)))
+               (= "list" (head (:node arguments))) (String/starts_with? argument-source "("))
+   (unchanged source)
+   (let [argument-items (collection-tokens argument-source 1)
+         offset-args (mapv #(offset % (:start arguments)) argument-items)
+         nested (mapv (fn [token] [token (rewrite-token token)]) (rest offset-args))
+         target {:module module :function function :arity (dec (count argument-items))}
+         changes (concat [(replace-token (first items) (str module "/" function))
+                          (replace-token (nth items 1) "") (replace-token (nth items 2) "")
+                          {:start (:start arguments) :end (inc (:start arguments)) :text ""}
+                          (replace-token (first offset-args) "")
+                          {:start (dec (:end arguments)) :end (:end arguments) :text ""}]
+                         (keep (fn [[token result]] (when (not= (:text token) (:text result)) (replace-token token (:text result)))) nested))]
+    {:text (edits source changes)
+     :targets (vec (cons target (mapcat (fn [[_ result]] (:targets result)) nested)))
+     :rewrites (inc (reduce + 0 (map (fn [[_ result]] (:rewrites result)) nested)))}))))
+
+(defn- rewrite-token [token]
+ (let [source (:text token) node (:node token) kind (tag node) call (head node)]
+  (cond
+   (and (= :list kind) (String/starts_with? source "("))
+    (let [items (collection-tokens source 1)]
+     (cond
+      (and (= "erlang/apply" call) (= 4 (count items))) (specialize-apply source items)
+      (contains? #{"defn" "defn-" "def" "fn" "fn*" "if" "do" "throw" "let" "let*" "loop" "loop*" "recur"} call)
+       (rewrite-intrinsic source call items)
+      :else (unchanged source)))
+   (and (contains? #{:vector :map :set} kind)
+        (String/starts_with? source (case kind :vector "[" :map "{" :set "#{")))
+    (rewrite-selected source (collection-tokens source (if (= kind :set) 2 1)))
+   :else (unchanged source))))
+
+(defn specialize
+ "Return original :source, separate :compile-source and exact string target
+  inventory. No evaluation, namespace mutation or native-target interning.
+  Caller supplies all graph/runtime BL :namespace-prefixes and must authorize
+  targets and reject hidden global definitions in final compiler ANF. Compile-
+  time macros remain the existing trusted compiler boundary, not a sandbox.
+  Unsupported macro/binding contexts remain byte-for-byte unchanged."
+ ([source] (specialize source {}))
+ ([source options]
+ (when-not (and (string? source) (<= (erlang/byte_size source) 1048576))
+  (throw (ex-info "Invalid static call source" {:kind :invalid-source})))
+ (let [items (tokens source) nodes (mapv :node items)
+       _ (bounded! nodes)
+       headers (filter #(= "ns" (head %)) nodes)
+       prefixes (into (header-symbols headers) (:namespace-prefixes options #{}))
+       disabled (or (not= 1 (count headers)) (unsafe-header? (first headers))
+                    (definition-of-list? nodes)
+                    (ambiguous-target? nodes prefixes)
+                    (some #(not (contains? #{"ns" "def" "defn" "defn-"} (head %))) nodes)
+                    (some #(and (= "def" (head %)) (unknown-initializer? (last (children %)))) nodes))
+       results (if disabled []
+                 (mapv (fn [token]
+                         (if (or (= "ns" (head (:node token))) (non-head-list? (:node token)))
+                          [token (unchanged (:text token))]
+                          [token (try (rewrite-token token)
+                                   (catch error
+                                    (throw (ex-info "Static call rewrite refused"
+                                             {:kind :static-call-rewrite-refused
+                                              :reason (or (:kind (ex-data error)) :unsupported-rewrite-context)
+                                              :cause (ex-message error)}))))])) items))]
+  {:source source
+   :compile-source (edits source (keep (fn [[token result]]
+                                        (when (not= (:text token) (:text result)) (replace-token token (:text result)))) results))
+   :targets (vec (mapcat (fn [[_ result]] (:targets result)) results))
+   :rewrites (reduce + 0 (map (fn [[_ result]] (:rewrites result)) results))})))
