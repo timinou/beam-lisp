@@ -109,6 +109,7 @@
   (:require [datom :as datom]
             [datom.conn :as dc]
             [datom.store :as ds]
+            [datom.schema :as schema]
             [datom.store-ets :as store-ets]
             [proc.server :refer [extend-clause!]]
             [proc.table :as table]
@@ -319,7 +320,8 @@
    {:db/ident :job/finished-at :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
    {:db/ident :queue/key :db/valueType :db.type/string :db/cardinality :db.cardinality/one
     :db/unique :db.unique/identity}
-   {:db/ident :queue/decl :db/valueType :db.type/term :db/cardinality :db.cardinality/one}])
+   {:db/ident :queue/decl :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
+   {:db/ident :queue/identity-receipt :db/valueType :db.type/term :db/cardinality :db.cardinality/one}])
 
 (defn logical-name [srv]
   (let [value (name (if (string? srv) (keyword srv) srv))]
@@ -436,6 +438,164 @@
   (if (ds/durable? (:store c))
     (do (ds/sync! (:store c)) :stable) :volatile))
 
+(defn- identity-refuse [kind]
+  (throw (ex-info "Queue identity conversion refused" {:kind kind})))
+
+(defn- raw-queue-binding [srv]
+  ;; Deliberately bypass generation name resolution: legacy means EXACTLY legacy.
+  (erlang/apply :persistent_term :get (list (tuple :bl-queue-conn srv) nil)))
+
+(defn- identity-owner-stopped! [srv]
+  (when (Process/whereis (keyword "bl-queue" srv))
+    (identity-refuse :queue-owner-running)))
+
+(defn- identity-authority! [c path]
+  (when-not (and (= path (:path (ds/identity-of (:store c))))
+                (ds/durable? (:store c)) (:lifetime c) (= :open @(:lifetime c)))
+    (identity-refuse :queue-store-authority-required))
+  (let [registered (dc/registered-at path)]
+    (when-not (and (= (:lifetime registered) (:lifetime c))
+                  (= (ds/identity-of (:store registered)) (ds/identity-of (:store c))))
+      (identity-refuse :queue-store-authority-required))))
+
+(defn- bounded-identity-column [db attr limit]
+  (let [page (datom/attribute-page db attr nil (inc limit))]
+    (when (or (:more? page) (> (count (:datoms page)) limit))
+      (identity-refuse :queue-identity-inventory-too-large))
+    (:datoms page)))
+
+(defn- with-identity-authority [names action]
+  ;; Same order as runtime start: restoration admission before store binding.
+  (BeamLisp.Env/with_generation_lock (tuple :queue-restoration (first names))
+   (fn []
+    (BeamLisp.Env/with_generation_lock (tuple :queue-restoration (last names))
+     (fn []
+      (doseq [srv names]
+        (when (erlang/apply :persistent_term :get (list (tuple :bl-queue-restoration srv) nil))
+          (identity-refuse :restoration-already-bound)))
+      (action))))))
+
+(defn migrate-identity!
+  "Explicit stopped-owner legacy -> application-scoped conversion of a dedicated
+   durable queue. Caller closes the OLD registered connection, reopens the SAME
+   canonical store, then passes that fresh connection and exact :store-path,
+   :legacy-key, :application-id and :generation. :max-jobs defaults512, max1024.
+   Old producer lifetimes stay closed; captured claims/attempts stay fenced.
+   No retry, protocol adoption, owner start or product auto-conversion occurs.
+   One bounded writer transaction preserves every fact except queue/job naming,
+   records an exact idempotent receipt, then fsyncs before target registration.
+   A sync error is uncertain: retry this same conversion to reconcile its receipt."
+  [c opts]
+  (let [legacy (:legacy-key opts) app (:application-id opts) generation (:generation opts)
+        path (:store-path opts) limit (:max-jobs opts 512) context (Process/get :bl_generation)]
+    (when-not (and (map? opts)
+                  (every? #{:legacy-key :application-id :generation :store-path :max-jobs} (keys opts))
+                  (string? legacy) (Regex/match? #"^[a-z][a-z0-9._-]{0,63}$" legacy)
+                  (not (String/starts_with? legacy "blq."))
+                  (string? generation) (Regex/match? #"^[a-f0-9]{64}$" generation)
+                  (string? path) (<= (erlang/byte_size path) 1024)
+                  (String/starts_with? path "/") (= path (Path/expand path))
+                  (erlang/is_integer limit) (<= 1 limit 1024))
+      (identity-refuse :invalid-queue-identity-conversion))
+    (let [target (name (scoped-server app legacy))
+          names (sort [legacy target])
+          contract {:version 1 :from legacy :to target :application-id app
+                    :generation generation :store path}
+          migration-id (Base/encode16 (erlang/apply :crypto :hash
+                         (list :sha256 (erlang/term_to_binary contract (list :deterministic)))))]
+      (when (and context (or (not= app (:application-id context))
+                             (not= generation (:digest context))))
+        (identity-refuse :queue-generation-mismatch))
+      (with-identity-authority names
+       (fn []
+        (BeamLisp.Env/with_generation_lock (tuple :queue-store (first names))
+       (fn []
+        (BeamLisp.Env/with_generation_lock (tuple :queue-store (last names))
+         (fn []
+          (identity-owner-stopped! legacy) (identity-owner-stopped! target)
+          (identity-authority! c path)
+          (let [bound (raw-queue-binding target)]
+            (when (and bound (not= bound c)
+                       (not (and (:lifetime bound) (= :closed @(:lifetime bound))
+                                 (= path (:path (ds/identity-of (:store bound)))))))
+              (identity-refuse :store-already-bound)))
+          (dc/serialized! c
+           (fn []
+            (identity-authority! c path)
+            (identity-owner-stopped! legacy) (identity-owner-stopped! target)
+            (when-let [old (raw-queue-binding legacy)]
+              (when-not (and (:lifetime old) (= :closed @(:lifetime old))
+                             (= path (:path (ds/identity-of (:store old)))))
+                (identity-refuse :legacy-queue-lifetime-open)))
+            (let [db (datom/db c)
+                  rows (bounded-identity-column db :queue/key 2)
+                  row (when (= 1 (count rows)) (datom/entity db (datom/datom-e (first rows))))
+                  receipt (:queue/identity-receipt row)]
+              (when-not row (identity-refuse :shared-queue-store))
+              (if (= target (:queue/key row))
+                (when-not (and receipt (= contract (select-keys receipt (keys contract)))
+                              (= (set (keys receipt)) (into (set (keys contract)) [:migration-id :jobs :basis-before]))
+                              (erlang/is_integer (:jobs receipt)) (<= 0 (:jobs receipt) 1024)
+                              (erlang/is_integer (:basis-before receipt))
+                              (= migration-id (:migration-id receipt))
+                              (or (raw-queue-binding legacy) (= c (raw-queue-binding target))))
+                  (identity-refuse :queue-identity-receipt-mismatch))
+                (do
+                  (when-not (= legacy (:queue/key row)) (identity-refuse :shared-queue-store))
+                  ;; A string naming a file is not migration authority. The exact
+                  ;; old queue registration must still prove its CLOSED lifetime.
+                  (let [old (raw-queue-binding legacy)]
+                    (when-not (and old (:lifetime old) (= :closed @(:lifetime old))
+                                   (= path (:path (ds/identity-of (:store old)))))
+                      (identity-refuse :legacy-queue-lifetime-open)))
+                  (when receipt (identity-refuse :queue-identity-receipt-mismatch))
+                  (let [allowed (into (set (keys schema/BUILT-IN)) (map :db/ident SCHEMA))]
+                    (when-not (every? allowed (keys @(:schema c)))
+                      (identity-refuse :shared-queue-store)))
+                  (let [servers (bounded-identity-column db :job/server limit)
+                        states (bounded-identity-column db :job/state limit)
+                        ids (bounded-identity-column db :job/id limit)
+                        entities (set (map datom/datom-e servers))
+                        declaration (:queue/decl row)]
+                    (when-not (and (every? #(= legacy (datom/datom-v %)) servers)
+                                   (= entities (set (map datom/datom-e states)))
+                                   (= entities (set (map datom/datom-e ids)))
+                                   (or (nil? declaration) (and (map? declaration)
+                                     (= legacy (:server declaration))
+                                     (<= (erlang/byte_size (erlang/term_to_binary declaration)) 16384))))
+                      (identity-refuse :shared-queue-store))
+                    ;; All expected refusals precede even the optional schema add.
+                    (let [accepted (assoc contract :migration-id migration-id
+                                          :jobs (count entities) :basis-before (datom/basis-t db))
+                          tx (into [[:db/add (:db/id row) :queue/key target]
+                                    [:db/add (:db/id row) :queue/identity-receipt accepted]]
+                               (map (fn [e] [:db/add e :job/server target]) entities))]
+                      (when (> (erlang/byte_size (erlang/term_to_binary accepted)) 4096)
+                        (identity-refuse :queue-identity-receipt-too-large))
+                      (datom/install-schema! c SCHEMA)
+                      (datom/transact! c (if declaration
+                         (conj tx [:db/add (:db/id row) :queue/decl (assoc declaration :server target)]) tx))))))
+              (let [accepted (:queue/identity-receipt
+                               (datom/entity (datom/db c) (:db/id row)))]
+                (sync-checkpoint! c)
+                ;; Parent holds both registration locks. Calling attach-store!
+                ;; here would acquire them from the different writer PID.
+                (erlang/apply :persistent_term :put (list (tuple :bl-queue-conn target) c))
+                (when-let [old (raw-queue-binding legacy)]
+                  (erlang/apply :persistent_term :put
+                    (list (tuple :bl-queue-conn legacy) (assoc old :queue/retired-identity accepted))))
+                (assoc accepted :durability :stable))))))))))))))
+
+(defn- retired-identity-binding? [srv bound]
+  ;; A closed lifetime alone is not proof that durable work moved. Only the
+  ;; exact fsynced conversion receipt plus its still-bound target removes an
+  ;; obsolete alias from inventory; the target remains independently checked.
+  (let [receipt (:queue/retired-identity bound) target (raw-queue-binding (:to receipt))]
+    (and receipt (:lifetime bound) (= :closed @(:lifetime bound))
+         (= 1 (:version receipt)) (= srv (:from receipt))
+         (= (:store receipt) (:path (ds/identity-of (:store bound))))
+         target (= (:store receipt) (:path (ds/identity-of (:store target)))))))
+
 (defn- fenced-protocols [c srv]
   (:queue/fenced-protocols (datom/pull (datom/db c) '[*] [:queue/key (server-name srv)]) #{}))
 
@@ -533,7 +693,8 @@
   (vec (keep (fn [entry]
          (let [key (elem entry 0)]
            (when (and (erlang/is_tuple key) (= 2 (erlang/tuple_size key))
-                      (= :bl-queue-conn (elem key 0)))
+                      (= :bl-queue-conn (elem key 0))
+                      (not (retired-identity-binding? (elem key 1) (elem entry 1))))
              (let [srv (keyword (elem key 1))
                    app (:application-id (Process/get :bl_generation))
                    scoped (when app (name (scoped-server app (logical-name srv))))]
@@ -929,7 +1090,7 @@
           ;; Preparation ran before this writer turn. An adoption must not slip
           ;; between prepared payload and claim, including A -> B -> A receipts.
           (let [current (datom/entity (datom/db c) e)
-                fields [:job/required-generation :job/adoption :job/adopted-payload]]
+                fields [:job/server :job/required-generation :job/adoption :job/adopted-payload]]
             (when (= (select-keys current fields) (select-keys job fields))
               (try
                 (datom/transact! c tx)
@@ -939,6 +1100,7 @@
 
 (defn- owns-attempt? [job claimed now]
   (and job (= :running (:job/state job))
+       (= (:job/server claimed) (:job/server job))
        (= (:job/owner claimed) (:job/owner job))
        (= (:job/attempt-id claimed) (:job/attempt-id job))
        (some? (:job/owner claimed)) (> (:job/lease-until job 0) now)))

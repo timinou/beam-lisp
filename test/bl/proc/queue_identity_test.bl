@@ -1,0 +1,125 @@
+(ns proc.queue-identity-test
+ (:require [proc.queue :as q] [datom :as d] [datom.conn :as dc]
+           [datom.store :as ds] [datom.store-fjall :as fjall]))
+(def digest "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+(def other-digest "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+(defn fixture [srv]
+ (let [path (ds/fresh-path ".queue-identity.fjall") c (dc/connect-with (fjall/open path) [])]
+  (q/attach-store! srv c)
+  (d/transact! c [{:db/id -1 :queue/key (name srv)
+                  :queue/decl (assoc (q/normalise-decl {:of :test/identity :protocol 2 :generation digest
+                                  :unique [:test/value] :partition [:test/group]}) :server (name srv))}])
+  {:path path :old c :srv srv}))
+(defn options [f]
+ {:legacy-key (name (:srv f)) :application-id "identity-app" :generation digest :store-path (:path f)})
+(defn reopen [f]
+ (dc/close! (:old f))
+ (dc/connect-with (fjall/open (:path f)) []))
+(defn kind [f] (try (f) nil (catch e (:kind (ex-data e)))))
+(defn unchanged-refusal [c expected f]
+ (let [basis (d/basis-t (d/db c)) schema @(:schema c)]
+  (is (= expected (kind f)))
+  (is (= basis (d/basis-t (d/db c))))
+  (is (= schema @(:schema c)))))
+
+(deftest identity-conversion-preserves-work-and-fences-old-lifetimes-and-snapshots
+ (let [f (fixture :identity-preserve-q) old (:old f)
+       queued (q/enqueue! (:srv f) {:test/value 1 :test/group "g"} {:source-id [:document 1]})
+       second (q/enqueue! (:srv f) {:test/value 2 :test/group "g"} {:source-id [:document 2]})
+       claimed (q/claim! old second (erlang/system_time :millisecond) 60000)]
+  (q/begin-effect! (:srv f) claimed :provider)
+  (q/record-effect! (:srv f) claimed :provider :submitted {:remote-id "accepted-2"})
+  (q/fence-generation! (:srv f) other-digest)
+  (q/fence-protocol! (:srv f) 1)
+  (q/fence-through! (:srv f) 1)
+  (let [before-queued (d/entity (d/db old) (:db/id queued))
+        before-running (d/entity (d/db old) (:db/id second))
+        before-queue (d/pull (d/db old) '[*] [:queue/key (name (:srv f))])
+        old-db (d/db old)
+        c (reopen f) target (q/scoped-server "identity-app" (:srv f))
+        before-basis (d/basis-t (d/db c)) receipt (q/migrate-identity! c (options f))]
+   (try
+    (is (= :stable (:durability receipt))) (is (= 1 (:version receipt)))
+    (is (= 2 (:jobs receipt))) (is (= before-basis (:basis-before receipt)))
+    (is (= (:path f) (:store receipt)))
+    (is (= (name (:srv f)) (:from receipt))) (is (= (name target) (:to receipt)))
+    (is (= c (q/conn target)))
+    (let [inventory (q/registered-queues)]
+      (is (not (some #(= (:srv f) (:server %)) inventory)))
+      (is (some #(= target (:server %)) inventory)))
+    (is (= (dissoc before-queued :job/server)
+           (dissoc (d/entity (d/db c) (:db/id queued)) :job/server)))
+    (is (= (dissoc before-running :job/server)
+           (dissoc (d/entity (d/db c) (:db/id second)) :job/server)))
+    (is (= (name target) (:job/server (d/entity (d/db c) (:db/id queued)))))
+    (let [after-queue (d/pull (d/db c) '[*] [:queue/key (name target)])]
+     (is (= (select-keys before-queue [:queue/fenced-generations :queue/fenced-protocols :queue/fenced-through])
+            (select-keys after-queue [:queue/fenced-generations :queue/fenced-protocols :queue/fenced-through])))
+     (is (= (assoc (:queue/decl before-queue) :server (name target)) (:queue/decl after-queue))))
+    (is (= :released-connection
+           (try (q/enqueue! (:srv f) {:test/value 3 :test/group "g"}) nil (catch e (:reason (ex-data e))))))
+    (is (= (name (:srv f)) (:job/server (d/entity old-db (:db/id queued)))))
+    (is (nil? (q/claim! c (d/entity old-db (:db/id queued)) (erlang/system_time :millisecond) 60000)))
+    (is (= :stale-attempt (:kind (q/commit-attempt! target claimed
+                         [[:db/add (:db/id second) :job/result :wrong]]))))
+    (is (= :stale-attempt (:kind (q/record-effect! target claimed :provider :submitted {:remote-id "wrong"}))))
+    (is (= before-running (assoc (d/entity (d/db c) (:db/id second)) :job/server (name (:srv f)))))
+    (let [basis (d/basis-t (d/db c))]
+     (is (= receipt (q/migrate-identity! c (options f))))
+     (is (= basis (d/basis-t (d/db c)))))
+    (dc/close! c)
+    (let [again (dc/connect-with (fjall/open (:path f)) [])]
+     (try
+      (is (= receipt (q/migrate-identity! again (options f))))
+      (is (= again (q/conn target)))
+      (is (= (:job/id queued) (:job/id (d/entity (d/db again) (:db/id queued)))))
+      (unchanged-refusal again :queue-identity-receipt-mismatch
+                         #(q/migrate-identity! again (assoc (options f) :generation other-digest)))
+      (finally (dc/close! again))))
+    (finally (dc/close! c))))))
+
+(deftest identity-conversion-requires-closed-exact-registered-legacy-authority
+ (let [f (fixture :identity-authority-q) old (:old f)]
+  (unchanged-refusal old :legacy-queue-lifetime-open #(q/migrate-identity! old (options f)))
+  (let [c (reopen f) other (dc/connect-with (fjall/open-fresh) [])]
+   (try
+    (unchanged-refusal c :queue-store-authority-required
+                       #(q/migrate-identity! c (assoc (options f) :store-path (:path (:store other)))))
+    (unchanged-refusal c :queue-store-authority-required
+                       #(q/migrate-identity! other (options f)))
+    (erlang/register (keyword "bl-queue" (name (:srv f))) (erlang/self))
+    (try (unchanged-refusal c :queue-owner-running #(q/migrate-identity! c (options f)))
+     (finally (erlang/unregister (keyword "bl-queue" (name (:srv f))))))
+    (let [previous (Process/put :bl_generation {:application-id "other-app" :digest digest})]
+     (try (unchanged-refusal c :queue-generation-mismatch #(q/migrate-identity! c (options f)))
+      (finally (if previous (Process/put :bl_generation previous) (Process/delete :bl_generation)))))
+    (unchanged-refusal c :invalid-queue-identity-conversion
+                       #(q/migrate-identity! c (assoc (options f) :max-jobs 1025)))
+    (unchanged-refusal c :invalid-queue-identity-conversion
+                       #(q/migrate-identity! c (assoc (options f) :legacy-key "other/imports")))
+    (finally (dc/close! c) (dc/close! other))))))
+
+(deftest identity-conversion-refuses-bounded-or-shared-inventory-without-mutations
+ (let [f (fixture :identity-bound-q)]
+  (q/enqueue! (:srv f) {:test/value 10 :test/group "g"}) (q/enqueue! (:srv f) {:test/value 11 :test/group "g"})
+  (let [c (reopen f)]
+   (try
+    (unchanged-refusal c :queue-identity-inventory-too-large
+                       #(q/migrate-identity! c (assoc (options f) :max-jobs 1)))
+    (d/transact! c [{:db/id -1 :queue/key "another-queue"}])
+    (unchanged-refusal c :shared-queue-store #(q/migrate-identity! c (options f)))
+    (finally (dc/close! c)))))
+ (let [f (fixture :identity-shared-schema-q) c (reopen f)]
+  (try
+   (d/install-schema! c [{:db/ident :business/value :db/valueType :db.type/string}])
+   (unchanged-refusal c :shared-queue-store #(q/migrate-identity! c (options f)))
+   (finally (dc/close! c)))))
+
+(deftest absent-legacy-binding-is-never-operator-authority
+ (let [path (ds/fresh-path ".unbound-queue.fjall") c (dc/connect-with (fjall/open path) q/SCHEMA)]
+  (try
+   (d/transact! c [{:db/id -1 :queue/key "unbound-legacy"}])
+   (unchanged-refusal c :legacy-queue-lifetime-open
+    #(q/migrate-identity! c {:legacy-key "unbound-legacy" :application-id "identity-app"
+                            :generation digest :store-path path}))
+   (finally (dc/close! c)))))
