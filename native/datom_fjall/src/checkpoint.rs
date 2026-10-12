@@ -260,6 +260,44 @@ fn fjall_checkpoint_abort(artifact: ResourceArc<Artifact>) -> NifResult<Atom> {
     Ok(atoms::aborted())
 }
 
+// Complete bundle publication shares the checkpoint durability boundary. This
+// API accepts only private sibling staging; it never opens a source database.
+fn publish_directory(stage: &Path, destination: &Path) -> Result<String, String> {
+    let stage_real = fs::canonicalize(stage).map_err(|e| e.to_string())?;
+    if stage_real != stage || !stage.symlink_metadata().map_err(|e| e.to_string())?.is_dir() {
+        return Err("publication staging must be an exact canonical directory".into());
+    }
+    let parent = fs::canonicalize(destination.parent().ok_or("destination needs parent")?)
+        .map_err(|e| e.to_string())?;
+    let leaf = destination.file_name().ok_or("destination needs filename")?;
+    if parent.join(leaf) != destination || stage.parent() != Some(parent.as_path()) || stage == destination {
+        return Err("publication requires distinct canonical siblings".into());
+    }
+    if destination.symlink_metadata().is_ok() { return Err("publication destination exists".into()); }
+    let guard = File::open(stage).map_err(|e| e.to_string())?;
+    guard.try_lock().map_err(|e| e.to_string())?;
+    sync_tree(stage).map_err(|e| e.to_string())?;
+    publish_no_clobber(stage, destination).map_err(|e| e.to_string())?;
+    // If this fails, preserve the already-visible destination for reconciliation.
+    File::open(&parent).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
+    Ok(destination.to_string_lossy().into_owned())
+}
+#[rustler::nif]
+fn fjall_publish_directory(stage: String, destination: String, recipient: LocalPid, tag: Term) -> NifResult<Atom> {
+    let mut message_env = OwnedEnv::new();
+    let saved_tag = message_env.save(tag);
+    std::thread::Builder::new().name("datom-bundle-publish".into()).spawn(move || {
+        let result = std::panic::catch_unwind(|| publish_directory(Path::new(&stage), Path::new(&destination)))
+            .unwrap_or_else(|_| Err("bundle publication panicked; inspect destination".into()));
+        let _ = message_env.send_and_clear(&recipient, |env| {
+            let reply = match result { Ok(path) => path.encode(env),
+                Err(reason) => (atoms::error(), reason).encode(env) };
+            (saved_tag.load(env), reply).encode(env)
+        });
+    }).map_err(err)?;
+    Ok(atoms::accepted())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,4 +386,29 @@ mod tests {
         assert!(begin(cursor, &existing).is_err());
         assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 2);
     }
+    #[test]
+    fn complete_bundle_publication_is_durable_distinct_and_never_clobbers() {
+        let root = Fixture::new();
+        let stage = root.0.as_path().join("stage"); let destination = root.0.as_path().join("published");
+        fs::create_dir(&stage).unwrap(); fs::write(stage.join("manifest.json"), b"verified").unwrap();
+        assert!(publish_directory(&stage, &stage).is_err());
+        publish_directory(&stage, &destination).unwrap();
+        assert_eq!(fs::read(destination.join("manifest.json")).unwrap(), b"verified");
+        fs::create_dir(&stage).unwrap(); fs::write(stage.join("other"), b"new").unwrap();
+        assert!(publish_directory(&stage, &destination).is_err());
+        assert!(stage.join("other").exists());
+        assert_eq!(fs::read(destination.join("manifest.json")).unwrap(), b"verified");
+    }
+    #[cfg(unix)]
+    #[test]
+    fn bundle_publication_refuses_symlinks_and_non_sibling_destination() {
+        let root = Fixture::new(); let stage = root.0.as_path().join("stage");
+        fs::create_dir(&stage).unwrap();
+        std::os::unix::fs::symlink("/dev/null", stage.join("link")).unwrap();
+        assert!(publish_directory(&stage, &root.0.as_path().join("published")).is_err());
+        fs::remove_file(stage.join("link")).unwrap();
+        fs::create_dir(root.0.as_path().join("nested")).unwrap();
+        assert!(publish_directory(&stage, &root.0.as_path().join("nested/published")).is_err());
+    }
+
 }
