@@ -28,4 +28,6 @@ export function exceptionValue(error){return H.isRaise(error)?error.reason:error
 
 export function fn(name,arity,body,synchronous=false){return makeFn(name,arity,body,moduleRuntime,synchronous);}
 
-export function bind(runtime){return {fn:(name,arity,body,synchronous=false)=>makeFn(name,arity,body,runtime,synchronous),multi:(...args)=>multi(...args,runtime),call,callList,exceptionKind,exceptionValue,exceptionTrace};}
+export function receive(runtime){return H.ref(runtime,"js","rt-receive");}
+
+export function bind(runtime){return {fn:(name,arity,body,synchronous=false)=>makeFn(name,arity,body,runtime,synchronous),multi:(...args)=>multi(...args,runtime),call,callList,receive,exceptionKind,exceptionValue,exceptionTrace};}

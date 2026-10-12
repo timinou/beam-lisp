@@ -6,6 +6,7 @@ test('linked BL calls retain canonical collections, decimals and float identity'
  try{await import('./out/linked-values.mjs');}finally{console.log=original;}
  assert.deepEqual(seen,[{same:true,indirect:true,vector:true,decimal:true,float:true}]);
  const source=await readFile(new URL('./out/linked-values.mjs',import.meta.url),'utf8');
- assert.match(source,/N_[A-Za-z0-9_$]+\(t\d+\)/);
+ assert.match(source,/C\.call\(N_[A-Za-z0-9_$]+, \[v_/);
+ assert.doesNotMatch(source,/args\.map\(J\.argument\)/);
  assert.doesNotMatch(source,/k:'call', f: N_/);
 });
