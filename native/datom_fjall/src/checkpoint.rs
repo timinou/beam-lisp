@@ -167,15 +167,62 @@ fn fjall_checkpoint_step(artifact: ResourceArc<Artifact>, rows: usize, max_bytes
     step(state.as_mut().ok_or_else(|| err("checkpoint aborted"))?, rows, max_bytes).map_err(err)
 }
 
-fn sync_tree(path: &Path) -> std::io::Result<()> {
-    for entry in fs::read_dir(path)? {
-        let entry = entry?;
-        let kind = entry.file_type()?;
-        if kind.is_dir() { sync_tree(&entry.path())?; }
-        else if kind.is_file() { File::open(entry.path())?.sync_all()?; }
-        else { return Err(std::io::Error::other("unexpected non-file in checkpoint")); }
+#[cfg(target_os = "linux")]
+fn sync_tree_handle(path: &Path, directory: &File) -> std::io::Result<()> {
+    sync_tree_handle_depth(path, directory, 0)
+}
+#[cfg(target_os = "linux")]
+fn sync_tree_handle_depth(path: &Path, directory: &File, depth: usize) -> std::io::Result<()> {
+    if depth > 256 { return Err(std::io::Error::other("directory sync nesting limit")); }
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    fn same(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+        a.dev() == b.dev() && a.ino() == b.ino() && a.file_type() == b.file_type()
     }
-    File::open(path)?.sync_all()
+    let expected = directory.metadata()?;
+    if !expected.is_dir() || !same(&expected, &fs::symlink_metadata(path)?) {
+        return Err(std::io::Error::other("directory identity changed during sync"));
+    }
+    // Enumerate the opened directory, not a path that can be rebound. Child
+    // opens are relative to that same fd and never follow a symlink or FIFO.
+    let pinned = PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()));
+    for entry in fs::read_dir(&pinned)? {
+        let entry = entry?;
+        let metadata = fs::symlink_metadata(entry.path())?;
+        if !metadata.is_file() && !metadata.is_dir() {
+            return Err(std::io::Error::other("unexpected non-file in checkpoint"));
+        }
+        let name = std::ffi::CString::new(entry.file_name().as_bytes())?;
+        let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK
+            | if metadata.is_dir() { libc::O_DIRECTORY } else { 0 };
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 { return Err(std::io::Error::last_os_error()); }
+        let child = unsafe { File::from_raw_fd(fd) };
+        if !same(&metadata, &child.metadata()?) {
+            return Err(std::io::Error::other("entry identity changed during sync"));
+        }
+        if metadata.is_dir() { sync_tree_handle_depth(&entry.path(), &child, depth + 1)?; }
+        else { child.sync_all()?; }
+        if !same(&metadata, &fs::symlink_metadata(entry.path())?) {
+            return Err(std::io::Error::other("entry identity changed during sync"));
+        }
+    }
+    directory.sync_all()?;
+    if !same(&expected, &fs::symlink_metadata(path)?) {
+        return Err(std::io::Error::other("directory identity changed during sync"));
+    }
+    Ok(())
+}
+fn sync_tree(path: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let directory = fs::OpenOptions::new().read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC).open(path)?;
+        sync_tree_handle(path, &directory)
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = path; Err(std::io::Error::other("safe directory sync requires Linux")) }
 }
 #[cfg(target_os = "linux")]
 fn publish_no_clobber(stage: &Path, destination: &Path) -> std::io::Result<()> {
@@ -274,13 +321,49 @@ fn publish_directory(stage: &Path, destination: &Path) -> Result<String, String>
         return Err("publication requires distinct canonical siblings".into());
     }
     if destination.symlink_metadata().is_ok() { return Err("publication destination exists".into()); }
-    let guard = File::open(stage).map_err(|e| e.to_string())?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let guard = fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC).open(stage).map_err(|e| e.to_string())?;
     guard.try_lock().map_err(|e| e.to_string())?;
     sync_tree(stage).map_err(|e| e.to_string())?;
     publish_no_clobber(stage, destination).map_err(|e| e.to_string())?;
     // If this fails, preserve the already-visible destination for reconciliation.
     File::open(&parent).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
     Ok(destination.to_string_lossy().into_owned())
+}
+// Explicitly finish the stable-storage boundary when a publication reply was
+// lost. Verification alone proves visibility, not parent-directory durability.
+fn sync_directory(path: &Path) -> Result<String, String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).ok_or("directory sync needs a parent")?;
+    let canonical = fs::canonicalize(path).map_err(|e| e.to_string())?;
+    if canonical != path { return Err("directory sync requires an exact canonical path".into()); }
+    let guard = fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC).open(path).map_err(|e| e.to_string())?;
+    guard.try_lock().map_err(|e| e.to_string())?;
+    let before = guard.metadata().map_err(|e| e.to_string())?;
+    if !before.is_dir() { return Err("directory sync requires a directory".into()); }
+    sync_tree(path).map_err(|e| e.to_string())?;
+    File::open(parent).and_then(|f| f.sync_all()).map_err(|e| e.to_string())?;
+    let after = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+    if before.dev() != after.dev() || before.ino() != after.ino() || !after.is_dir() {
+        return Err("directory identity changed during sync".into());
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+#[rustler::nif]
+fn fjall_sync_directory(path: String, recipient: LocalPid, tag: Term) -> NifResult<Atom> {
+    let mut message_env = OwnedEnv::new(); let saved_tag = message_env.save(tag);
+    std::thread::Builder::new().name("datom-bundle-sync".into()).spawn(move || {
+        let result = std::panic::catch_unwind(|| sync_directory(Path::new(&path)))
+            .unwrap_or_else(|_| Err("bundle sync panicked; inspect directory".into()));
+        let _ = message_env.send_and_clear(&recipient, |env| {
+            let reply = match result { Ok(path) => path.encode(env),
+                Err(reason) => (atoms::error(), reason).encode(env) };
+            (saved_tag.load(env), reply).encode(env)
+        });
+    }).map_err(err)?;
+    Ok(atoms::accepted())
 }
 #[rustler::nif]
 fn fjall_publish_directory(stage: String, destination: String, recipient: LocalPid, tag: Term) -> NifResult<Atom> {
@@ -409,6 +492,23 @@ mod tests {
         fs::remove_file(stage.join("link")).unwrap();
         fs::create_dir(root.0.as_path().join("nested")).unwrap();
         assert!(publish_directory(&stage, &root.0.as_path().join("nested/published")).is_err());
+    }
+
+    #[test]
+    fn reconcile_sync_requires_regular_exact_tree_and_detects_replaced_identity() {
+        let root = Fixture::new(); let path = root.0.join("artifact");
+        fs::create_dir(&path).unwrap(); fs::write(path.join("manifest"), b"receipt").unwrap();
+        assert_eq!(sync_directory(&path).unwrap(), path.to_string_lossy());
+        assert!(sync_directory(Path::new("/")).is_err());
+        assert!(sync_directory(&path.join("manifest")).is_err());
+        #[cfg(target_os = "linux")]
+        {
+            let opened = File::open(&path).unwrap();
+            fs::rename(&path, root.0.join("prior")).unwrap(); fs::create_dir(&path).unwrap();
+            assert!(sync_tree_handle(&path, &opened).is_err());
+            std::os::unix::fs::symlink("/dev/null", path.join("foreign")).unwrap();
+            assert!(sync_directory(&path).is_err());
+        }
     }
 
 }
