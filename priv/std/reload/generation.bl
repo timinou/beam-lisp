@@ -97,7 +97,10 @@
    (contains? #{:scalar :keyword :symbol} tag) true
    (contains? #{:vector :map :set} tag) (every? immutable-form-candidate? (children form))
    (= :list tag) (or (contains? #{"quote" "fn" "fn*"} head)
-                   (and (contains? #{"+" "-" "*" "/" "merge" "set" "vector" "list" "re-pattern" "clojure.re/re-pattern"} head)
+                   ;; Named factories are proved from compiler ANF before any
+                   ;; initializer runs. Keep obvious mutable constructors out
+                   ;; of even the structural plan; unknown calls are not trusted.
+                   (and head (not (contains? #{"atom" "ref" "agent" "volatile!"} head))
                         (every? immutable-form-candidate? (rest (children form)))))
    :else false)))
 
@@ -164,12 +167,16 @@
     ;; The reader emits (deref operand), while the source span starts with @.
     ;; Keep that reader syntax and recursively seal only its actual operand.
     (str "@" (rewrite-fragment (String/slice text 1 (String/length text)) mapping mode))
+   (and (= :list tag) (String/starts_with? text "#("))
+    ;; Anonymous fn reader syntax owns generated parameter names. Preserve the
+    ;; prefix and seal its original body rather than reconstructing expansion.
+    (str "#" (rewrite-fragment (String/slice text 1 (String/length text)) mapping mode))
    (contains? #{:list :vector :map :set} tag)
     (if (= "quote" (head-of node)) text
      (let [opening (cond (= :set tag) "#{" (= :list tag) "(" (= :vector tag) "[" :else "{")
            closing (cond (= :list tag) ")" (= :vector tag) "]" :else "}")]
-      ;; Reader-prefix expansion and anonymous-fn desugaring do not have a
-      ;; collection-shaped source span. Refuse rather than rewrite guessed text.
+      ;; Unsupported reader prefixes do not have a collection-shaped source
+      ;; span. Refuse rather than rewrite guessed text.
       (when-not (or (String/starts_with? text "#\"")
                     (and (String/starts_with? text opening) (String/ends_with? text closing)))
        (refuse! :unsupported-reader-expansion {}))
@@ -285,25 +292,54 @@
      :sources (into {} (map (fn [name]
                              [(get mapping name) (rewrite-source (get selected name) (get parsed name) mapping)]) order))}))))
 
+(defn- physical-source-path [path]
+ ;; The checkout launcher exposes SDK priv through a symlink, while project
+ ;; load paths name its physical tree. Resolve every component, including an
+ ;; escaping source symlink; a spelling alone must not grant runtime stability.
+ (when (and (string? path) (File/exists? path))
+  (loop [parts (rest (Path/split (Path/expand path))) current "/" links 0 steps 0]
+   (when (and (<= links 32) (< steps 512))
+    (if (empty? parts) current
+     (let [next (Path/join current (first parts)) link (File/read_link next)]
+      (if (= :ok (elem link 0))
+       (recur (concat (rest (Path/split (Path/expand (elem link 1) current))) (rest parts))
+              "/" (inc links) (inc steps))
+       (recur (rest parts) next links (inc steps)))))))))
+
+(defn fixed-runtime-namespace?
+ "Whether this loader's selected source is inside its fixed SDK priv image.
+  This checks source location, never a namespace prefix. The release builder
+  must independently authorize/seal that runtime; this is not code attestation."
+ [name]
+ (let [path (physical-source-path (BeamLisp.Loader/source_path name))
+       root (physical-source-path (BeamLisp.Tiers/priv_root))]
+  (and (string? path) (string? root) (String/starts_with? path (str root "/")))))
+
 (defn project-plan
  "Discover managed source closure through the native loader; no application
   function manifest. :entrypoint is namespace/function. Fixed runtime requires
-  stop at :stable-namespaces. This reads source only and executes no app forms."
+  stop at :stable-namespaces. :fixed-runtime true also derives that boundary
+  from the selected SDK source paths. The artifact builder must seal/authorize
+  the runtime independently. This reads source only and executes no app forms."
  [opts]
  (let [entry (:entrypoint opts) parts (when (string? entry) (String/split entry "/"))
        stable (set (:stable-namespaces opts))]
   (when-not (= 2 (count parts)) (refuse! :invalid-entrypoint {}))
-  (loop [todo [(first parts)] sources {}]
+  (loop [todo [(first parts)] sources {} boundary stable]
    (if (empty? todo)
-    (assoc (plan (assoc opts :sources sources :roots [(first parts)])) :entrypoint entry)
+    (assoc (plan (assoc opts :sources sources :roots [(first parts)] :stable-namespaces boundary)) :entrypoint entry)
     (let [name (first todo)]
-     (if (or (contains? sources name) (contains? stable name))
-      (recur (rest todo) sources)
-      (do
-       (when (>= (count sources) 1024) (refuse! :generation-capacity {}))
-       (let [source (try (BeamLisp.Loader/source_content name) (catch _ nil))]
-        (when-not (string? source) (refuse! :missing-source {:namespace name}))
-        (recur (concat (rest todo) (second (graph/header source))) (assoc sources name source))))))))))
+     (cond
+      (or (contains? sources name) (contains? boundary name))
+       (recur (rest todo) sources boundary)
+      (and (:fixed-runtime opts) (fixed-runtime-namespace? name))
+       (recur (rest todo) sources (conj boundary name))
+      :else
+       (do
+        (when (>= (count sources) 1024) (refuse! :generation-capacity {}))
+        (let [source (try (BeamLisp.Loader/source_content name) (catch _ nil))]
+         (when-not (string? source) (refuse! :missing-source {:namespace name}))
+         (recur (concat (rest todo) (second (graph/header source))) (assoc sources name source) boundary)))))))))
 
 (defn- with-lock [key action] (BeamLisp.Env/with_generation_lock (tuple :sealed-generation key) action))
 
@@ -406,41 +442,88 @@
    [:Elixir.BeamLisp.Vector :new] [:Elixir.BeamLisp.Set :new]
    [:Elixir.BeamLisp.Ns.Rt :hash_key] [:Elixir.BeamLisp.Ns.Clojure.Re :re-pattern]
    [:Elixir.BeamLisp.Ns.Core :merge__bl_v] [:Elixir.BeamLisp.Ns.Core :set]
-   [:Elixir.BeamLisp.Ns.Core :vector__bl_v] [:Elixir.BeamLisp.Ns.Core :list__bl_v]})
+   [:Elixir.BeamLisp.Ns.Core :vector__bl_v] [:Elixir.BeamLisp.Ns.Core :list__bl_v]
+   [:Elixir.BeamLisp.Ns.Core :str__bl_v] [:Elixir.Regex :compile!]})
 
-(defn- immutable-anf? [node]
- ;; Closures delay their bodies; check-anf! separately audits those bodies' graph
- ;; references. The compiler's fn self-wrapper is a let(fn, apply(var)), which
- ;; constructs a closure rather than running user code.
- (letfn [(safe [n functions]
-          (if-not (map? n) false
-           (case (:op n)
-            :lit true :enil true
-            :global (let [found (BeamLisp.Env/fetch (:ns n) (:name n))]
-                      (and (erlang/is_tuple found) (= :ok (elem found 0))
-                           (or (bounded-data? (elem found 1))
-                               (try (BeamLisp.Env/callback_modules (elem found 1)) true
-                                    (catch _ false)))))
-            :var (contains? functions (:name n))
-            :fn true
-            :let (and (safe (:init n) functions)
-                   (safe (:body n) (if (= :fn (:op (:init n))) (conj functions (:name n)) functions)))
-            :apply (and (= :var (:op (:fn n))) (contains? functions (:name (:fn n)))
-                        (every? #(safe % functions) (:args n)))
-            :map (every? #(every? (fn [v] (safe v functions)) %) (:pairs n))
-            :cons (and (safe (:head n) functions) (safe (:tail n) functions))
-            :tuple (every? #(safe % functions) (:elems n))
-            :struct (and (= :Elixir.BeamLisp.Vector (:mod n))
-                         (every? #(every? (fn [v] (safe v functions)) %) (:fields n)))
-            :arith (every? #(safe % functions) (:args n))
-            :remote (and (contains? immutable-remotes [(:mod n) (:fun n)])
-                         (every? #(safe % functions) (:args n)))
-            :do (every? #(or (safe % functions)
-                             (and (= :remote (:op %)) (= :Elixir.BeamLisp.Loader (:mod %))
-                                  (= :ensure_ready (:fun %))
-                                  (= "clojure.re" (:val (first (:args %)))))) (:stmts n))
-            false)))]
-  (safe node #{})))
+(defn- record-factory! [targets namespace definition]
+ ;; Incremental per-definition index: do not materialize/rescan the whole
+ ;; product graph for each literal constant or callback map initializer.
+ (let [shim (BeamLisp.Emit/module_for namespace)
+       entries (BeamLisp.Env/ns_definition namespace definition)]
+  (doseq [entry entries]
+   (let [clause (elem entry 3) fname (elem entry 2) arity (count (:params clause))
+         body-module (when (> (erlang/tuple_size entry) 4) (elem entry 4))]
+    (when (and (= :fixed (elem entry 0)) (= :defn-clause (:op clause)))
+     (doseq [module (distinct (filter some? [shim body-module]))]
+      (swap! targets update [module fname arity] (fnil conj []) clause)))))))
+
+(defn- immutable-anf? [planned node targets]
+ ;; Prove the finite executable construction path, not a function's delayed
+ ;; callback body. Only exact compiled functions in this sealed graph may be
+ ;; followed. Unknown/native calls, dynamic callees and recursive factories
+ ;; refuse; no callback is executed to discover whether it happens to be pure.
+ (let [ready-names (set (concat (vals (:mapping planned)) (:stable-namespaces planned)
+                               ["core" "sugar" "rt" "clojure.re"]))
+       remaining (atom 8192)]
+  (letfn [(budget! [depth]
+            (when (or (> depth 32) (neg? (swap! remaining dec)))
+             (refuse! :initializer-analysis-budget {})))
+          (clause-safe? [clause bindings active depth]
+            ;; Named defn parameters are compiler-normalized plain variables.
+            ;; Anonymous destructuring is lowered into its body and audited too.
+            (let [params (or (:params clause) (:pats clause))]
+             (and (every? #(= :pvar (:pop %)) params)
+                  (let [locals (reduce (fn [out param] (assoc out (:name param) :immutable)) bindings params)]
+                   (and (or (nil? (:guard clause)) (safe (:guard clause) locals active (inc depth)))
+                        (safe (:body clause) locals active (inc depth)))))))
+          (call-local? [callee arguments bindings active depth]
+            (let [value (when (= :var (:op callee)) (get bindings (:name callee)))
+                  closure (cond (= :fn (:op callee)) {:node callee :bindings bindings}
+                                (map? value) value :else nil)
+                  clauses (when closure (filter #(= (count arguments) (count (:pats %)))
+                                                 (:clauses (:node closure))))]
+             (and (seq clauses) (every? #(safe % bindings active (inc depth)) arguments)
+                  (every? #(clause-safe? % (:bindings closure) active (inc depth)) clauses))))
+          (safe [n bindings active depth]
+           (budget! depth)
+           (if-not (map? n) false
+            (case (:op n)
+             :lit true :enil true
+             :global (let [found (BeamLisp.Env/fetch (:ns n) (:name n))]
+                       (and (erlang/is_tuple found) (= :ok (elem found 0))
+                            (or (bounded-data? (elem found 1))
+                                (try (BeamLisp.Env/callback_modules (elem found 1)) true (catch _ false)))))
+             :var (contains? bindings (:name n))
+             :fn true
+             :let (and (safe (:init n) bindings active (inc depth))
+                    (safe (:body n)
+                      (assoc bindings (:name n) (if (= :fn (:op (:init n)))
+                                                 {:node (:init n) :bindings bindings} :immutable))
+                      active (inc depth)))
+             :apply (call-local? (:fn n) (:args n) bindings active depth)
+             :if (every? #(safe % bindings active (inc depth)) [(:test n) (:then n) (:else n)])
+             :map (every? #(every? (fn [v] (safe v bindings active (inc depth))) %) (:pairs n))
+             :cons (and (safe (:head n) bindings active (inc depth)) (safe (:tail n) bindings active (inc depth)))
+             :tuple (every? #(safe % bindings active (inc depth)) (:elems n))
+             :struct (and (= :Elixir.BeamLisp.Vector (:mod n))
+                          (every? #(every? (fn [v] (safe v bindings active (inc depth))) %) (:fields n)))
+             :arith (every? #(safe % bindings active (inc depth)) (:args n))
+             :remote
+              (let [target [(:mod n) (:fun n) (count (:args n))] clause (get targets target)]
+               (cond
+                (contains? immutable-remotes [(:mod n) (:fun n)])
+                 (every? #(safe % bindings active (inc depth)) (:args n))
+                (and (= :Elixir.BeamLisp.Loader (:mod n)) (= :ensure_ready (:fun n))
+                     (= 1 (count (:args n))) (= :lit (:op (first (:args n)))))
+                 (contains? ready-names (:val (first (:args n))))
+                clause
+                 (and (not (contains? active target))
+                      (every? #(safe % bindings active (inc depth)) (:args n))
+                      (every? #(clause-safe? % {} (conj active target) (inc depth)) clause))
+                :else false))
+             :do (every? #(safe % bindings active (inc depth)) (:stmts n))
+             false)))]
+   (safe node {} #{} 0))))
 
 (defn- executable-values [value]
  ;; Include compiler eval companions retained by callback-valued defs. Ignoring
@@ -453,7 +536,7 @@
   (or (vector? value) (list? value) (set? value)) (mapcat executable-values value)
   :else []))
 
-(defn- evaluate-definitions! [planned name source value-modules]
+(defn- evaluate-definitions! [planned name source value-modules factory-targets]
  (let [forms (BeamLisp.Reader/read_string source) seen (atom #{}) env (BeamLisp.Compiler/new_env name)]
   (BeamLisp.Compiler/eval_form (first forms) env)
   (letfn [(definition! [form depth]
@@ -468,7 +551,7 @@
               (when (= head "def")
                (let [initializer (BeamLisp.Compiler/compile (last items) env)]
                 (check-anf! planned initializer)
-                (when-not (immutable-anf? initializer)
+                (when-not (immutable-anf? planned initializer @factory-targets)
                  (refuse! :effectful-generation {:namespace name :definition definition}))))
               (when (= head "defserver")
                (let [compiled (BeamLisp.Compiler/compile form env)
@@ -478,6 +561,7 @@
                  (refuse! :unmanaged-owner-descriptor {:namespace name}))
                 (doseq [clause (:clauses descriptor)] (check-anf! planned (:body clause)))))
               (let [value (BeamLisp.Compiler/eval_form form env)]
+               (when (contains? #{"defn" "defn-"} head) (record-factory! factory-targets name definition))
                (when (= head "defserver") (swap! value-modules conj value))
                (when (= head "def")
                 (swap! value-modules into (filter #(String/starts_with? (erlang/atom_to_binary % :utf8)
@@ -503,7 +587,7 @@
     (or (get @prepared key)
      (let [_ (reserve-capacity! (count (:order validated)) (:source-bytes validated))
            planned (plan (assoc input :instance (str (erlang/unique_integer (list :positive)))))
-           scope (env/fork) value-modules (atom #{}) generation
+           scope (env/fork) value-modules (atom #{}) factory-targets (atom {}) generation
            (try
             (env/with-env scope
              (fn []
@@ -518,7 +602,7 @@
               (doseq [name (vals (:mapping planned))] (BeamLisp.Env/declare_ns name))
               (doseq [name (:order planned)]
                (let [fresh (get (:mapping planned) name)]
-                (evaluate-definitions! planned fresh (get (:sources planned) fresh) value-modules)
+                (evaluate-definitions! planned fresh (get (:sources planned) fresh) value-modules factory-targets)
                 (BeamLisp.Env/mark_loaded fresh)))
               (BeamLisp.Link/settle)
               (check-compiled! planned)
@@ -610,6 +694,20 @@
   (when-not (and context (contains? (:resources context) key))
    (refuse! :missing-generation-resource {:resource key}))
   (get (:resources context) key)))
+
+(defn resource-path
+ "Resolve a relative asset/configuration path inside a sealed absolute resource
+  root. Never reads ambient cwd/env or accepts traversal/absolute input. The
+  release builder remains responsible for complete asset manifest coverage."
+ [key relative]
+ (let [root (resource key)]
+  (when-not (and (string? root) (= root (Path/expand root))
+                (string? relative) (not= "" relative)
+                (not (String/starts_with? relative "/"))
+                (not (String/contains? relative "\\"))
+                (every? #(not (contains? #{"" "." ".."} %)) (String/split relative "/")))
+   (refuse! :invalid-resource-path {:resource key :path relative}))
+  (Path/join root relative)))
 
 (defn- bounded-handles? [bindings]
  (loop [todo [bindings] remaining 100000]

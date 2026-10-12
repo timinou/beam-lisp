@@ -1,0 +1,114 @@
+(ns reload.initializer-factory-test
+ (:require [reload.generation :as generation] [env]))
+
+(defn- refused [action]
+ (try (action) nil (catch error (:kind (ex-data error)))))
+
+(defn- options [step]
+ {:sources
+  {"factory.helpers"
+   (str "(ns factory.helpers) "
+        "(defn- handler [offset] (let [amount (+ offset " step ")] (fn [value] (+ value amount)))) "
+        "(defn performers [deps] {:run (handler 3) :later (fn [] (:value deps))})")
+   "factory.router"
+   (str "(ns factory.router (:require [factory.helpers :as helpers])) "
+        "(def handlers (merge (helpers/performers {:value " step "}) {:literal (fn [] :ok)})) "
+        "(defn run [value] [((:run handlers) value) ((:later handlers)) ((:literal handlers))])")}})
+
+(deftest sealed-factories-preserve-transitive-callback-generation
+ (let [old (generation/prepare! (options 1)) fresh (generation/prepare! (options 2))]
+  (try
+   (is (= [14 1 :ok] (generation/invoke! old "factory.router/run" [10])))
+   (is (= [15 2 :ok] (generation/invoke! fresh "factory.router/run" [10])))
+   (is (not= (:digest old) (:digest fresh)))
+   (is (some #(String/starts_with? (erlang/atom_to_binary % :utf8) "Elixir.BeamLisp.Eval.") (:modules old)))
+   (finally (generation/retire! old) (generation/retire! fresh)))))
+
+(deftest unknown-effectful-recursive-and-dynamic-factories-never-run
+ (let [path (str (System/get_env "HOME") "/tmp/initializer-must-not-run-"
+                 (erlang/unique_integer (list :positive)))
+       refuse-source (fn [body]
+                       (refused #(generation/prepare!
+                         {:sources {"factory.refuse" (str "(ns factory.refuse) " body)}
+                          :native-modules #{"File"}})))]
+  (try
+   (is (= :effectful-generation
+        (refuse-source (str "(defn make [] (File/write! " (pr-str path) " \"unsafe\") (fn [] 1)) (def value (make))"))))
+   (is (not (File/exists? path)))
+   (is (= :effectful-generation (refuse-source "(defn make [] (make)) (def value (make))")))
+   (is (= :effectful-generation (refuse-source "(defn make [f] (f)) (def value (make (fn [] 1)))")))
+   (is (= :effectful-generation
+        (refuse-source (str "(defn make ([x] :when x (fn [] 1)) ([x] (File/write! "
+                            (pr-str path) " \"unsafe\"))) (def value (make true))"))))
+   (is (not (File/exists? path)))
+   (finally (when (File/exists? path) (File/rm! path))))))
+
+(deftest factory-analysis-does-not-follow-untracked-runtime-functions
+ (env/eval "(ns factory.external) (defn make [] (fn [] :outside))")
+ (is (= :effectful-generation
+       (refused #(generation/prepare!
+         {:stable-namespaces #{"factory.external"}
+          :sources {"factory.external-caller"
+                    "(ns factory.external-caller (:require [factory.external :as external])) (def callback (external/make))"}})))))
+
+(deftest factory-analysis-has-a-finite-depth-budget
+ (let [source (str "(ns factory.deep) (defn step0 [] (fn [] 0)) "
+                   (apply str (map (fn [index] (str "(defn step" index " [] (step" (dec index) ")) ")) (range 1 41)))
+                   "(def callback (step40))")]
+  (is (= :initializer-analysis-budget
+        (refused #(generation/prepare! {:sources {"factory.deep" source}}))))))
+
+(deftest initializer-local-closures-are-audited-when-invoked
+ (is (= :effectful-generation
+       (refused #(generation/prepare!
+         {:sources {"factory.local"
+                    "(ns factory.local) (def value (let [f (fn [] (atom 0))] (f)))"}}))))
+ (let [graph (generation/prepare!
+              {:sources {"factory.local-safe"
+                         "(ns factory.local-safe) (defn make [flag] (if flag (fn [] :yes) (fn [] :no))) (def handler (make true)) (defn run [] (handler))"}})]
+  (try (is (= :yes (generation/invoke! graph "factory.local-safe/run" [])))
+   (finally (generation/retire! graph)))))
+
+(deftest fixed-runtime-discovery-follows-source-location
+ (let [root (str (System/get_env "HOME") "/tmp/generation-source-"
+                 (erlang/unique_integer (list :positive)))]
+  (File/mkdir_p! (str root "/generation"))
+  (File/write! (str root "/generation/discovered.bl")
+    "(ns generation.discovered (:require [live.app :as app])) (app/defscreen run [] :ready)")
+  (BeamLisp.Env/push_load_path root)
+  (try
+   (let [plan (generation/project-plan {:entrypoint "generation.discovered/run" :fixed-runtime true})
+         graph (generation/prepare! plan)]
+    (try
+     (is (= ["generation.discovered"] (:order plan)))
+     (is (contains? (:stable-namespaces plan) "live.app"))
+     (is (not (generation/fixed-runtime-namespace? "generation.discovered")))
+     (is (= :ready (generation/invoke! graph "generation.discovered/run" [])))
+     (finally (generation/retire! graph))))
+   (finally (BeamLisp.Env/pop_load_path) (File/rm_rf! root)))))
+
+(deftest anonymous-reader-body-seals-qualified-dependencies
+ (let [opts (fn [step]
+              {:sources {"factory.reader-leaf" (str "(ns factory.reader-leaf) (defn add [x] (+ x " step "))")
+                         "factory.reader-root"
+                         "(ns factory.reader-root (:require [factory.reader-leaf])) (def callback #(factory.reader-leaf/add %)) (defn run [x] (callback x))"}})
+       old (generation/prepare! (opts 1)) fresh (generation/prepare! (opts 2))]
+  (try
+   (is (= 4 (generation/invoke! old "factory.reader-root/run" [3])))
+   (is (= 5 (generation/invoke! fresh "factory.reader-root/run" [3])))
+   (finally (generation/retire! old) (generation/retire! fresh)))))
+
+(deftest resource-path-is-selected-release-local-and-refuses-traversal
+ (let [opts (fn [root]
+              {:resources {:artifact-root root}
+               :stable-namespaces #{"reload.generation"}
+               :sources {"factory.assets"
+                         "(ns factory.assets (:require [reload.generation :as generation])) (defn path [relative] (generation/resource-path :artifact-root relative))"}})
+       old (generation/prepare! (opts "/releases/old"))
+       fresh (generation/prepare! (opts "/releases/new"))]
+  (try
+   (is (= "/releases/old/app/fonts/font.woff2" (generation/invoke! old "factory.assets/path" ["app/fonts/font.woff2"])))
+   (is (= "/releases/new/app/fonts/font.woff2" (generation/invoke! fresh "factory.assets/path" ["app/fonts/font.woff2"])))
+   (doseq [path ["../secret" "/etc/passwd" "app//file" "app/./file" "app/../file" "app\\file" ""]]
+    (is (= :invalid-resource-path (refused #(generation/invoke! old "factory.assets/path" [path])))))
+   (finally (generation/retire! old) (generation/retire! fresh)))))
