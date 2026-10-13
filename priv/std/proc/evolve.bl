@@ -91,6 +91,23 @@
      (assoc st :value (:state result) :revision (inc (:revision st 0)))]))
   (catch e [{:status :refused :kind (or (:kind (ex-data e)) :handler-failed)} st])))
 
+(defn- forget-preparation [st]
+ (when-let [p (:preparation st)] (release! (:held p)))
+ (dissoc st :preparation))
+
+(defn- install-prepared [st held value]
+ (let [current (:current st)
+       edge {:to (:version held) :callback (:upcast held)
+             :downcast (:downcast held) :downcast-arity (:downcast-arity held)
+             :reply-check (:check-reply current) :reply-arity (:reply-arity current)}
+       installed (dissoc held :migrate-state :upcast :downcast :downcast-arity)
+       after (assoc st :current installed :value value :revision (inc (:revision st 0))
+                      :adapters (assoc (:adapters st) (:version current) edge))]
+  ;; Transfer registrations only after all fallible validation has finished.
+  (cb/unregister! (:migrate-state held))
+  (release! (dissoc current :check-reply))
+  after))
+
 (defn- upgrade [st expected spec]
  (let [current (:current st)]
   (cond
@@ -109,22 +126,61 @@
                         (fn [] (dc/observing #(valid-state! @next (invoke @next :migrate-state [(:value st)])))))
             _ (when-not (contains? prepared :ok)
                 (throw (ex-info "State migration failed or exceeded budget" {:kind :migration-deadline})))
-            value (:ok prepared)
-            edge {:to (:version spec) :callback (:upcast @next)
-                  :downcast (:downcast @next) :downcast-arity (:downcast-arity @next)
-                  :reply-check (:check-reply current) :reply-arity (:reply-arity current)}
-            installed (dissoc @next :migrate-state :upcast :downcast :downcast-arity)
-            after (assoc st :current installed :value value :revision (inc (:revision st 0))
-                           :adapters (assoc (:adapters st) (:version current) edge))]
-       ;; No callback after releasing the old registration may reject publication.
-       (cb/unregister! (:migrate-state @next))
-       ;; Transfer the old reply check to its version edge until old clients
-       ;; and durable dependencies have drained. Everything else is obsolete.
-       (release! (dissoc current :check-reply))
+            after (install-prepared st @next (:ok prepared))
+            after (forget-preparation after)]
        [{:status :applied :version (:version spec)} after])
       (catch e
        (when @next (release! @next))
        [{:status :refused :kind (or (:kind (ex-data e)) :migration-failed)} st]))))))
+
+(defn- stage-upgrade [st expected spec samples]
+ (cond
+  (not= expected (get-in st [:current :version])) [{:status :refused :kind :stale-version} st]
+  (not (and (valid-version? (:version spec)) (> (:version spec) expected)))
+   [{:status :refused :kind :identity-conflict} st]
+  (>= (count (:adapters st)) (:history-limit st)) [{:status :refused :kind :history-full} st]
+  (not (and (vector? samples) (<= (count samples) 256)
+             (every? #(and (map? %) (valid-version? (:version %)) (contains? % :message)) samples)))
+   [{:status :refused :kind :invalid-message-samples} st]
+  :else
+   (let [held (atom nil)]
+    (try
+     (validate-migrations! (:current st) spec)
+     (reset! held (retain! spec))
+     (let [result (fence/fence-fn (:upgrade-ms st)
+                    #(dc/observing
+                      (fn []
+                       (doseq [sample samples]
+                        (let [message (:message (adapt st (:version sample) (:message sample)))]
+                         (when-not (and (= true (invoke (:current st) :accept? [message]))
+                                         (= true (invoke @held :accept? [(invoke @held :upcast [message])])))
+                          (throw (ex-info "Observed message migration refused" {:kind :invalid-message})))))
+                       (valid-state! @held (invoke @held :migrate-state [(:value st)])))))]
+      (if-not (contains? result :ok)
+       (do (release! @held)
+           [{:status :refused :kind (if (:timeout result) :rehearsal-deadline :candidate-refused)} st])
+       (let [ticket (erlang/make_ref)
+             preparation {:ticket ticket :held @held :value (:ok result)
+                          :expected expected :revision (:revision st 0)}]
+        [{:status :prepared :ticket ticket :version (:version spec) :digest (:digest spec)
+          :revision (:revision st 0) :messages (count samples) :scope :sampled-owner-state}
+         (assoc (forget-preparation st) :preparation preparation)])))
+     (catch e
+      (when @held (release! @held))
+      [{:status :refused :kind (or (:kind (ex-data e)) :candidate-refused)} st])))))
+
+(defn- commit-upgrade [st ticket]
+ (let [p (:preparation st) prior (:publication st)]
+  (cond
+   (and (= ticket (:ticket prior)) (= (:version prior) (get-in st [:current :version])))
+    [{:status :already-applied :version (:version prior) :revision (:revision prior)} st]
+   (or (nil? p) (not= ticket (:ticket p))) [{:status :refused :kind :unknown-preparation} st]
+   (or (not= (:expected p) (get-in st [:current :version])) (not= (:revision p) (:revision st 0)))
+    [{:status :refused :kind :stale-preparation} (forget-preparation st)]
+   :else
+    (let [after (install-prepared (dissoc st :preparation) (:held p) (:value p))
+          receipt {:ticket ticket :version (get-in after [:current :version]) :revision (:revision after)}]
+     [(assoc (dissoc receipt :ticket) :status :applied) (assoc after :publication receipt)]))))
 
 (defn- valid-client-version? [st version]
   (and (valid-version? version)
@@ -241,6 +297,12 @@
    (if (:managed st) [{:status :refused :kind :managed-client-required} st]
     (dispatch st (nth message 1) (nth message 2)))
   :proc.evolve/upgrade (upgrade st (nth message 1) (nth message 2))
+  :proc.evolve/prepare (stage-upgrade st (nth message 1) (nth message 2) (nth message 3))
+  :proc.evolve/commit (commit-upgrade st (nth message 1))
+  :proc.evolve/cancel
+   (if (= (nth message 1) (get-in st [:preparation :ticket]))
+    [{:status :cancelled} (forget-preparation st)]
+    [{:status :refused :kind :unknown-preparation} st])
   :proc.evolve/rehearse (rehearsal st (nth message 1) (nth message 2) (nth message 3))
   :proc.evolve/acquire (acquire st (nth message 1))
   :proc.evolve/client
@@ -259,12 +321,14 @@
    [{:version (get-in st [:current :version]) :digest (get-in st [:current :digest])
      :legacy-versions (vec (sort (keys (:adapters st)))) :revision (:revision st 0)
      :reply-contract? (some? (get-in st [:current :check-reply]))
+     :prepared? (some? (:preparation st))
      :managed (:managed st) :clients (count (:clients st))
      :queues (vec (:queues st)) :fenced-versions (vec (sort (:fenced st)))
      :fenced-through (:fenced-through st) :pid (erlang/self)} st]
   [{:status :refused :kind :unknown-evolution-message} st]))
 
 (defn close-state! [st]
+ (forget-preparation st)
  (owners/unregister! (:inventory st))
  (when (:owner-evidence st)
   (ets/delete_object :beam_lisp_vars (tuple (tuple :bl-evolve-owner (get-in st [:owner-evidence :pid])) (:owner-evidence st))))
@@ -286,6 +350,8 @@
   (throw (ex-info "evolve expects one owner options map" {:kind :invalid-evolution-clause})))
  (let [patterns '[[:proc.evolve/call version message] [:proc.evolve/upgrade expected spec]
                   [:proc.evolve/rehearse expected spec budget]
+                  [:proc.evolve/prepare expected spec samples]
+                  [:proc.evolve/commit ticket] [:proc.evolve/cancel ticket]
                   [:proc.evolve/acquire version] [:proc.evolve/client token message]
                   [:proc.evolve/release token] [:proc.evolve/fence version]
                   [:proc.evolve/bind-queue srv] [:proc.evolve/retire expected through]
@@ -338,6 +404,25 @@
   (when-not (owner? pid) (throw (ex-info "Owner rehearsal requires native authority" {:kind :owner-transition-authority-required})))
   (GenServer/call pid [:proc.evolve/rehearse expected (prepare-spec spec) budget] (+ budget 1000))))
 (defn status [pid] (GenServer/call pid [:proc.evolve/status]))
+
+(defn prepare-upgrade!
+ "Retain one exact candidate and rehearse pure state/message conversions in a
+  bounded turn. Samples are [{:version n :message m}], at most 256; no handler
+  body runs. The opaque owner-local ticket binds the actual retained callbacks
+  and this actor revision, not a caller-chosen digest alone. Replacing/cancelling
+  releases the prior preparation. Scope is sampled owner state, not all future
+  messages or external database invariants. Native IO purity is a contract."
+ ([pid expected spec] (prepare-upgrade! pid expected spec []))
+ ([pid expected spec samples]
+  (when-not (owner? pid) (throw (ex-info "Preparation requires native owner authority" {:kind :owner-transition-authority-required})))
+  (GenServer/call pid [:proc.evolve/prepare expected (prepare-spec spec) samples] 31000)))
+(defn commit-upgrade!
+ "FIFO compare-and-publish the exact prepared candidate. Any intervening
+  successful domain call invalidates the preparation; no old state is restored.
+  Repeating the last committed ticket reconciles a lost reply. Timeout remains
+  outcome unknown. Tickets are VM-local, not durable upgrade receipts."
+ [pid ticket] (GenServer/call pid [:proc.evolve/commit ticket]))
+(defn cancel-upgrade! [pid ticket] (GenServer/call pid [:proc.evolve/cancel ticket]))
 
 (defn acquire-client!
  "Acquire an old/new protocol dependency from a managed owner. A token stays
