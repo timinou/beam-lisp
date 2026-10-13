@@ -1,0 +1,232 @@
+; Application-partitioned physical membership. Env owns the tables; this
+; supervised collector owns monitors. Reads never enumerate other applications.
+(ns proc.owner-registry)
+
+(def INDEX :beam_lisp_owner_index)
+(def META :beam_lisp_owner_revisions)
+(def NAME :beam_lisp_owner_registry)
+(defn- fail [kind] (throw (ex-info "Owner inventory refused" {:kind kind})))
+(defn- valid-app? [id] (and (string? id) (<= 1 (erlang/byte_size id) 128)))
+(defn- counter [app]
+ (let [key (tuple :application app)]
+  (ets/insert_new META (tuple key 0 0)) key))
+(defn- revision [app]
+ (let [rows (ets/lookup META (tuple :application app))]
+  (if (seq rows) [(elem (first rows) 1) (elem (first rows) 2)] [0 0])))
+(defn- mutate! [app delta action]
+ (let [key (counter app)]
+  (ets/update_counter META key (list (tuple 2 1) (tuple 3 delta)))
+  (try (action) (finally (ets/update_counter META key (tuple 2 1))))))
+(defn- watch [st entry]
+ (let [pid (:pid entry) prior (get-in st [:pids pid]) ref (or (:ref prior) (Process/monitor pid))]
+  (-> st (assoc-in [:refs ref] pid)
+      (assoc-in [:pids pid] {:ref ref :application-id (:application-id entry)
+                            :roles (assoc (:roles prior {}) (:key entry) (:ticket entry))}))))
+(defn- forget [st entry]
+ (let [pid (:pid entry) prior (get-in st [:pids pid]) roles (dissoc (:roles prior) (:key entry))]
+  (if (seq roles) (assoc-in st [:pids pid :roles] roles)
+   (do (Process/demonitor (:ref prior) (list :flush))
+       (-> st (update :pids dissoc pid) (update :refs dissoc (:ref prior)))))))
+(defn- handle-of [entry]
+ (select-keys entry [:key :ticket :pid :application-id :kind :proof-id]))
+(defn- closed-key [entry] (tuple :closed (:ticket entry)))
+(defn- closed? [entry] (seq (ets/lookup META (closed-key entry))))
+(defn- valid-entry? [entry]
+ (and (map? entry) (valid-app? (:application-id entry))
+      (erlang/is_pid (:pid entry)) (= (erlang/node) (erlang/node (:pid entry)))
+      (contains? #{:server :supervisor :evolve :queue} (:kind entry))
+      (= (:key entry) (tuple (:application-id entry) (:pid entry) (:kind entry)))
+      (erlang/is_reference (:ticket entry)) (erlang/is_reference (:proof-id entry))))
+(defn- caller-owns? [from entry]
+ (and (tuple? from) (= 2 (erlang/tuple_size from))
+      (= (elem from 0) (:pid entry))))
+(defn- prune-dead-native! [entry]
+ ; Reclaim known native evidence by exact object/ticket, without a shared-table
+ ; sweep or arbitrary actor RPC. Accepted workers have independent code leases.
+ (when-not (Process/alive? (:pid entry))
+  (let [kind (:kind entry)
+        key (when (contains? #{:server :supervisor :evolve} kind)
+              (tuple (if (= kind :evolve) :bl-evolve-owner :bl_generation_owner) (:pid entry)))
+        row (when key (first (ets/lookup :beam_lisp_vars key))) evidence (when row (elem row 1))
+        lease (:lease evidence)]
+   (when (and evidence
+              (if (= kind :evolve) (= (:proof-id entry) (:ticket evidence))
+                (and (tuple? lease) (= 3 (erlang/tuple_size lease))
+                     (= (:pid entry) (elem lease 1)) (= (:proof-id entry) (elem lease 2)))))
+    (when lease (BeamLisp.Env/release_code! lease))
+    (ets/delete_object :beam_lisp_vars row)))))
+
+(defn- initial []
+ (let [env (Process/whereis :Elixir.BeamLisp.Env)
+       latched (erlang/apply :persistent_term :get (list :bl_owner_registry_environment nil))
+       _ (when (and latched (not= latched env)) (fail :owner-environment-replaced))
+       _ (erlang/apply :persistent_term :put (list :bl_owner_registry_environment env))
+       header {:epoch (erlang/make_ref) :pid (erlang/self) :environment env :ready false}
+       _ (ets/insert META (tuple :registry header))
+       _ (doseq [row (ets/tab2list META)]
+           (when (and (tuple? (elem row 0)) (= :application (elem (elem row 0) 0)))
+            (ets/insert META (tuple (elem row 0) (* 2 (inc (erlang/div (elem row 1) 2))) 0))))
+       st (reduce (fn [state row]
+                    (let [entry (elem row 1) app (:application-id entry)]
+                     (if (and (Process/alive? (:pid entry)) (not (closed? entry)))
+                      (do (ets/update_counter META (counter app) (tuple 3 1)) (watch state entry))
+                      (do (prune-dead-native! entry) (ets/delete_object INDEX row) (ets/delete META (closed-key entry)) state))))
+                  {:pids {} :refs {}} (ets/tab2list INDEX))]
+  ; A crash after deleting an index row may leave its close receipt behind.
+  (doseq [row (ets/tab2list META)]
+   (let [key (elem row 0)]
+    (when (and (tuple? key) (= :closed (elem key 0)))
+     (let [handle (elem row 1) current (first (ets/lookup INDEX (:key handle)))]
+      (when-not (and current (= (:ticket handle) (:ticket (elem current 1)))) (ets/delete_object META row))))))
+  (ets/insert META (tuple :registry (assoc header :ready true))) st))
+
+(defn- registration [st entry]
+ (let [key (:key entry) prior (first (ets/lookup INDEX key))
+       owner (get-in st [:pids (:pid entry)])]
+  (cond
+   (not (Process/alive? (:pid entry))) [{:status :refused :kind :owner-exited} st]
+   (and owner (not= (:application-id owner) (:application-id entry)))
+    [{:status :refused :kind :owner-application-conflict} st]
+   (and prior (closed? (elem prior 1))) [{:status :refused :kind :owner-role-closing} st]
+   prior (if (= (dissoc entry :ticket) (dissoc (elem prior 1) :ticket))
+           [{:status :registered :handle (handle-of (elem prior 1))} st]
+           [{:status :refused :kind :duplicate-owner-role} st])
+   :else
+    (let [after (watch st entry)]
+     (mutate! (:application-id entry) 1 #(ets/insert INDEX (tuple key entry)))
+     [{:status :registered :handle (handle-of entry)} after]))))
+(defn- unregistration [st handle]
+ (let [row (first (ets/lookup INDEX (:key handle))) entry (when row (elem row 1))]
+  (if-not (and entry (= (handle-of entry) handle))
+   (do (ets/delete META (closed-key handle)) [{:status :absent} st])
+   (do (mutate! (:application-id entry) -1 #(ets/delete_object INDEX row))
+       (ets/delete META (closed-key entry))
+       [{:status :removed} (forget st entry)]))))
+(defn- departed [st ref pid]
+ (if-not (and (= pid (get-in st [:refs ref])) (not (Process/alive? pid))) st
+  (let [owned (get-in st [:pids pid]) roles (:roles owned)
+        rows (vec (keep (fn [[key ticket]]
+                         (let [row (first (ets/lookup INDEX key))]
+                          (when (and row (= ticket (:ticket (elem row 1)))) row))) roles))]
+   (doseq [row rows] (prune-dead-native! (elem row 1)))
+   (mutate! (:application-id owned) (- (count rows))
+     #(doseq [row rows] (ets/delete_object INDEX row) (ets/delete META (closed-key (elem row 1)))))
+   (-> st (update :pids dissoc pid) (update :refs dissoc ref)))))
+
+(defserver registry
+ (init [_] (ok (initial)))
+ (handle-call [:register entry] [from st]
+  (if-not (and (valid-entry? entry) (or (caller-owns? from entry) (= :supervisor (:kind entry))))
+   (reply {:status :refused :kind :invalid-owner-registration} st)
+   (let [[result after] (registration st entry)] (reply result after))))
+ (handle-call [:unregister handle] [from st]
+  (if-not (and (valid-entry? handle) (caller-owns? from handle))
+   (reply {:status :refused :kind :wrong-owner} st)
+   (let [[result after] (unregistration st handle)] (reply result after))))
+ (handle-call _ [_ st] (reply {:status :refused :kind :unknown-owner-registry-message} st))
+ (handle-info [:DOWN ref :process pid _] [st] (noreply (departed st ref pid)))
+ (handle-info _ [st] (noreply st))
+ (terminate [_ _]
+  (when-let [row (first (ets/lookup META :registry))]
+   (when (= (erlang/self) (:pid (elem row 1)))
+    (ets/insert META (tuple :registry (assoc (elem row 1) :ready false)))))))
+
+(defn start-child! []
+ (let [result (Supervisor/start_child :Elixir.BeamLisp.Supervisor
+               {:id NAME :start (tuple :gen_server :start_link (list (tuple :local NAME) registry nil (list)))
+                :restart :permanent :type :worker :modules (list registry)})]
+  (when-not (or (= :ok (elem result 0))
+                (and (= :error (elem result 0)) (tuple? (elem result 1))
+                     (= :already_started (elem (elem result 1) 0))))
+   (throw (ex-info "Owner registry startup failed" {:kind :owner-registry-unavailable :reason result})))
+  result))
+
+(defn register!
+ "Internal lifecycle adapter. Capture app scope from the bound generation and
+  verify the native code lease before admitting a role. Registration confers no
+  stop/migration authority. Other-PID registration is restricted to supervisors."
+ [pid kind lease attrs proof-id]
+ (let [generation (Process/get :bl_generation) app (:application-id generation)
+       modules (when (and (tuple? lease) (= 3 (erlang/tuple_size lease))) (set (elem lease 0)))]
+  (when app
+   (when-not (and (valid-app? app)
+                  (or (nil? (:digest generation)) (and (string? (:digest generation)) (seq (:digest generation))))
+                  (erlang/is_pid pid) (= (erlang/node) (erlang/node pid))
+                  (or (= pid (erlang/self)) (= kind :supervisor))
+                  (contains? #{:server :supervisor :evolve :queue} kind)
+                  (tuple? lease) (= 3 (erlang/tuple_size lease)) (= pid (elem lease 1))
+                  (erlang/is_reference proof-id)
+                  (every? #(contains? modules %) (:modules generation [])))
+    (fail :invalid-owner-registration))
+   (let [entry (merge (select-keys attrs [:module :reference :managed])
+                 {:key (tuple app pid kind) :pid pid :kind kind :application-id app
+                  :origin-generation (:digest generation) :ticket (erlang/make_ref) :proof-id proof-id})
+         result (BeamLisp.Env/run_code! lease #(GenServer/call NAME [:register entry]))]
+    (when (= :cancelled result) (fail :expired-owner-code-lease))
+    (when-not (= :registered (:status result)) (fail (:kind result :owner-registry-unavailable)))
+    (:handle result)))))
+(defn unregister! [handle]
+ (when handle
+  (when-not (valid-entry? handle) (fail :invalid-owner-handle))
+  (when-not (= (erlang/self) (:pid handle)) (fail :wrong-owner))
+  (let [row (first (ets/lookup INDEX (:key handle)))]
+   (if-not (and row (= (:ticket handle) (:ticket (elem row 1)))) {:status :absent}
+    (do
+     (when-not (= (handle-of (elem row 1)) handle) (fail :invalid-owner-handle))
+     ; Env owns this exact-ticket close receipt. Recovery must remove the role
+     ; even when its process survives and the collector dies before replying.
+     (ets/insert META (tuple (closed-key handle) handle))
+     (try (GenServer/call NAME [:unregister handle] 1000)
+       (catch _ {:status :pending})))))))
+
+(defn- header []
+ (when (not= :undefined (ets/info META))
+ (when-let [row (first (ets/lookup META :registry))]
+  (let [h (elem row 1)]
+   (when (and (:ready h) (= (:pid h) (Process/whereis NAME))
+              (= (:environment h) (Process/whereis :Elixir.BeamLisp.Env))) h)))))
+(defn- in-app? [key app]
+ (and (tuple? key) (= 3 (erlang/tuple_size key)) (= app (elem key 0))))
+(defn page
+ "Bounded app-local ordered scan. Seqlock/registry incarnation changes refuse
+  stale cursors. Counts include all registered roles, not all possible producers.
+  Dead owners refuse until monitor cleanup catches up. No callbacks/RPCs run."
+ [app after limit]
+ (when-not (and (valid-app? app) (erlang/is_integer limit) (<= 1 limit 1000)) (fail :invalid-inventory-page))
+ (let [h (header) [rev total] (if h (revision app) [0 0])]
+  (cond
+   (nil? h) {:status :unavailable :kind :owner-registry-unavailable}
+   (not (zero? (erlang/rem rev 2))) {:status :stale :kind :inventory-changing}
+   (and after (not (and (= app (:application-id after)) (= (:epoch h) (:epoch after))
+                        (= rev (:revision after)) (in-app? (:after after) app))))
+    {:status :stale :kind :stale-inventory-cursor}
+   :else
+    (loop [key (ets/next INDEX (if after (:after after) (tuple app 0 0))) rows [] last-key nil dead? false]
+     (if (or (not (in-app? key app)) (= limit (count rows)))
+      (let [now (header) current (revision app) more? (in-app? key app)
+            receipt {:application-id app :epoch (:epoch h) :revision rev :total total
+                     :registrations (mapv #(select-keys % [:key :ticket :proof-id]) rows)}]
+       (if-not (and (= h now) (= [rev total] current) (not dead?))
+        {:status :stale :kind (if dead? :owner-exited :inventory-changing)}
+        {:status (if more? :more :valid) :participants rows :scanned (count rows)
+         :receipt receipt :cursor (when more? (assoc receipt :after last-key :registrations []))}))
+      (let [row (first (ets/lookup INDEX key)) entry (when row (elem row 1))]
+       (if-not entry {:status :stale :kind :inventory-changing}
+        (recur (ets/next INDEX key) (conj rows entry) key
+          (or dead? (closed? entry) (not (Process/alive? (:pid entry))))))))))))
+(defn recheck!
+ "Validate a COMPLETE observed-index receipt, including distinct native tickets
+  and current PID liveness. This is not whole-program or future-admission proof."
+ [receipt]
+ (let [h (header) app (:application-id receipt) regs (:registrations receipt)
+       [rev total] (if h (revision app) [0 0])
+       valid? (and h (valid-app? app) (= (:epoch h) (:epoch receipt))
+                   (zero? (erlang/rem rev 2)) (= rev (:revision receipt))
+                   (= total (:total receipt)) (= total (count regs))
+                   (= total (count (set (map :key regs))))
+                   (every? (fn [r]
+                             (let [row (first (ets/lookup INDEX (:key r))) e (when row (elem row 1))]
+                              (and e (in-app? (:key r) app) (= (:ticket r) (:ticket e))
+                                   (= (:proof-id r) (:proof-id e)) (not (closed? e)) (Process/alive? (:pid e))))) regs)
+                   (= h (header)) (= [rev total] (revision app)))]
+  {:status (if valid? :current :stale) :scope :observed-owner-index}))

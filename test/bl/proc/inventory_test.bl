@@ -1,0 +1,101 @@
+(ns proc.inventory-test
+ (:require [proc.inventory :as inventory] [proc.owner-registry :as owners]
+           [reload.generation :as gen] [proc.evolve :as ev]
+           [proc.queue :as q] [proc.queue-runtime :as runtime]
+           [datom.conn :as dc] [datom.store-map :as sm]))
+
+(defn- fixture [app]
+ (gen/prepare!
+  {:application-id app :protocols {:imports 1}
+   :stable-namespaces #{"proc.super" "proc.evolve" "proc.queue-runtime"}
+   :sources {"inventory.fixture"
+    (str "(ns inventory.fixture (:require [proc.super :as sup] [proc.evolve :as ev] [proc.queue-runtime :as queue])) "
+         "(defserver actor (init [_] (ok 0)) (handle-call :read [_ state] (reply state state))) "
+         "(sup/defsupervisor tree (child :actor actor nil)) "
+         "(defn server [] (start-link actor)) (defn supervisor [] (start-link tree)) "
+         "(defn evolving [] (ev/start! {:version 1 :digest \"initial\" :accept? (fn [_] true) "
+         " :check-state (fn [_] true) :handler (fn [msg state] {:reply msg :state state})} 0 {:managed true})) "
+         "(defn handler [] (queue/prepare :imports {:declaration {:of :inventory/work :protocol 1} :perform (fn [_] :ok)}))")}}))
+(defn- collect-after-exit [app]
+ (loop [left 100]
+  (let [result (inventory/snapshot app 2 100)]
+   (if (or (zero? left) (and (= :valid (:status result)) (empty? (:participants result)))) result
+    (do (Process/sleep 5) (recur (dec left)))))))
+
+(deftest physical-owners-register-automatically-and-native-authority-is-joined
+ (let [app "inventory-native" generation (fixture app)
+       server (gen/invoke! generation "inventory.fixture/server" [])
+       supervisor (gen/invoke! generation "inventory.fixture/supervisor" [])
+       evolving (gen/invoke! generation "inventory.fixture/evolving" [])
+       handler (gen/invoke! generation "inventory.fixture/handler" [])
+       conn (dc/connect-with (sm/open) [])
+       _ (q/attach-store! (:server handler) conn)
+       queue (runtime/start! handler)]
+  (try
+   (let [result (inventory/snapshot app 2 100) receipt (:receipt result)
+         participants (:participants result)]
+    (is (= :valid (:status result)))
+    (is (= 5 (count participants)))
+    (is (= 5 (:scanned result)))
+    (is (= #{:server :supervisor :evolve :queue} (set (map :kind participants))))
+    (is (= #{server supervisor evolving queue}
+           (set (map :pid (filter #(not (and (= :server (:kind %)) (not= server (:pid %)))) participants)))))
+    (is (= #{:retained-drain :managed-evolution-slice :queue-handler-transition} (set (map :capability participants))))
+    (is (every? #(= app (:application-id %)) participants))
+    (is (every? #(= (:digest generation) (:origin-generation %)) participants))
+    (is (every? #(not-any? (fn [k] (contains? % k)) [:ticket :proof-id :lease :invoke :environment]) participants))
+    (is (= :current (:status (inventory/recheck! receipt))))
+    (is (= :inventory-budget-exceeded (:kind (inventory/snapshot app 2 4))))
+    (let [client (:token (ev/acquire-client! evolving 1))]
+     (is (= :hello (ev/call-client! evolving client :hello)))
+     (ev/release-client! evolving client))
+    (GenServer/stop server)
+    (is (= :stale (:status (inventory/recheck! receipt)))))
+   (finally
+    (when (Process/alive? server) (GenServer/stop server))
+    (Supervisor/stop supervisor) (GenServer/stop evolving)
+    (runtime/stop! (:server handler)) (dc/close! conn)
+    (is (= [] (:participants (collect-after-exit app))))
+    (is (= :retired (:status (gen/retire! generation))))))))
+
+(deftest identical-logical-owners-in-two-apps-never-overlap
+ (let [a (fixture "inventory-alpha") b (fixture "inventory-beta")
+       ha (gen/invoke! a "inventory.fixture/handler" []) hb (gen/invoke! b "inventory.fixture/handler" [])
+       ca (dc/connect-with (sm/open) []) cb (dc/connect-with (sm/open) [])]
+  (q/attach-store! (:server ha) ca) (q/attach-store! (:server hb) cb)
+  (let [pa (runtime/start! ha) pb (runtime/start! hb)]
+   (try
+    (is (not= (:server ha) (:server hb)))
+    (is (= [pa] (mapv :pid (:participants (inventory/snapshot "inventory-alpha")))))
+    (is (= [pb] (mapv :pid (:participants (inventory/snapshot "inventory-beta")))))
+    (is (= "inventory-alpha" (:application-id (runtime/owner-evidence (:server ha)))))
+    (is (= "inventory-beta" (:application-id (runtime/owner-evidence (:server hb)))))
+    (finally
+     (runtime/stop! (:server ha)) (runtime/stop! (:server hb))
+     (dc/close! ca) (dc/close! cb) (gen/retire! a) (gen/retire! b))))))
+
+(deftest stale-native-component-authority-refuses-an-otherwise-current-index
+ (let [generation (fixture "inventory-authority") pid (gen/invoke! generation "inventory.fixture/evolving" [])
+       result (inventory/snapshot "inventory-authority")
+       key (tuple :bl-evolve-owner pid) row (first (ets/lookup :beam_lisp_vars key))]
+  (try
+   (is (= :valid (:status result)))
+   (ets/insert :beam_lisp_vars (tuple key (assoc (elem row 1) :ticket (erlang/make_ref))))
+   (is (= :current (:status (owners/recheck! (:receipt result)))))
+   (is (= :owner-authority-changed (:kind (inventory/recheck! (:receipt result)))))
+   (is (= :owner-authority-changed (:kind (inventory/snapshot "inventory-authority"))))
+   (finally (ets/insert :beam_lisp_vars row) (GenServer/stop pid) (gen/retire! generation)))))
+
+(deftest dead-owner-monitor-reclaims-exact-native-evidence-and-graph-lease
+ (let [app "inventory-dead-native" generation (fixture app)
+       pid (gen/invoke! generation "inventory.fixture/server" [])
+       key (tuple :bl_generation_owner pid)
+       lease (:lease (elem (first (ets/lookup :beam_lisp_vars key)) 1))]
+  (try
+   (erlang/unlink pid)
+   (Process/exit pid :kill)
+   (is (= [] (:participants (collect-after-exit app))))
+   (is (= [] (vec (ets/lookup :beam_lisp_vars key))))
+   (is (= :cancelled (BeamLisp.Env/run_code! lease (fn [] :unexpected))))
+   (is (= :retired (:status (gen/retire! generation))))
+   (finally (when (Process/alive? pid) (GenServer/stop pid)) (gen/retire! generation)))))

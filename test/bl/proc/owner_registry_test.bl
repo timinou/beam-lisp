@@ -1,0 +1,147 @@
+(ns proc.owner-registry-test
+ (:require [proc.owner-registry :as owners]))
+
+(defn- worker-loop [lease handle]
+ (receive
+  [:execute from ref f]
+   (do (erlang/send from (tuple ref (try (f lease handle) (catch e {:error (:kind (ex-data e))}))))
+       (worker-loop lease handle))
+  :stop (do (owners/unregister! handle) (BeamLisp.Env/release_code! lease) :ok)))
+(defn- start-owner [app]
+ (let [parent (erlang/self) ref (erlang/make_ref) context (BeamLisp.Env/capture)
+       pid (erlang/spawn
+             (fn []
+              (BeamLisp.Env/bind context)
+              (let [module (elem (erlang/fun_info (fn [] nil) :module) 1)
+                    _ (Process/put :bl_generation {:application-id app :digest "test-generation" :modules [module]})
+                    lease (BeamLisp.Env/retain_code! (list module))
+                    handle (owners/register! (erlang/self) :server lease {:module module} (elem lease 2))]
+               (erlang/send parent (tuple ref handle))
+               (worker-loop lease handle))))]
+  {:pid pid :handle (receive [r handle] :when (= r ref) handle (after 5000 (throw (ex-info "Test owner did not start" {}))))}))
+(defn- execute [owner f]
+ (let [ref (erlang/make_ref)]
+  (erlang/send (:pid owner) [:execute (erlang/self) ref f])
+  (receive [r result] :when (= r ref) result (after 5000 :timeout))))
+(defn- stop-owner [owner]
+ (let [pid (:pid owner) ref (Process/monitor pid)]
+  (erlang/send pid :stop)
+  (receive [:DOWN r :process _ _] :when (= r ref) :ok (after 5000 :timeout))))
+(defn- await-total [app total]
+ (loop [left 100]
+  (let [page (owners/page app nil 1000)]
+   (if (or (and (= :valid (:status page)) (= total (get-in page [:receipt :total]))) (zero? left)) page
+    (do (Process/sleep 5) (recur (dec left)))))))
+
+(deftest registry-is-supervised-and-tables-survive-collector-incarnations
+ (let [app "registry-recovery" a (start-owner app) b (start-owner app)
+       before (owners/page app nil 1) collector (Process/whereis owners/NAME)
+       env (Process/whereis :Elixir.BeamLisp.Env)]
+  (try
+   (is (= env (ets/info owners/INDEX :owner)))
+   (is (= env (ets/info owners/META :owner)))
+   (is (= :more (:status before)))
+   (Process/exit collector :kill)
+   (loop [left 100]
+    (when (and (pos? left) (or (= collector (Process/whereis owners/NAME))
+                              (nil? (Process/whereis owners/NAME))))
+     (Process/sleep 5) (recur (dec left))))
+   (let [after (await-total app 2)]
+    (is (= :valid (:status after)))
+    (is (= 2 (count (:participants after))))
+    (is (not= collector (Process/whereis owners/NAME)))
+    (is (not= (get-in before [:receipt :epoch]) (get-in after [:receipt :epoch])))
+    (is (= :stale (:status (owners/page app (:cursor before) 1))))
+    (is (= :current (:status (owners/recheck! (:receipt after)))))
+    (Process/exit (:pid a) :kill)
+    (is (= 1 (count (:participants (await-total app 1))))))
+   (finally (stop-owner a) (stop-owner b)))))
+
+(deftest bounded-app-local-pages-and-complete-native-receipts
+ (let [app "registry-pages" own (mapv (fn [_] (start-owner app)) (range 5))
+       other (mapv (fn [_] (start-owner "registry-unrelated")) (range 20))]
+  (try
+   (let [first-page (owners/page app nil 2)
+         second-page (owners/page app (:cursor first-page) 2)
+         last-page (owners/page app (:cursor second-page) 2)
+         receipt (assoc (:receipt last-page) :registrations
+                    (vec (mapcat #(get-in % [:receipt :registrations]) [first-page second-page last-page])))]
+    (is (= [:more :more :valid] (mapv :status [first-page second-page last-page])))
+    (is (= [2 2 1] (mapv :scanned [first-page second-page last-page])))
+    (is (= 5 (get-in first-page [:receipt :total])))
+    (is (every? #(= app (:application-id %)) (mapcat :participants [first-page second-page last-page])))
+    (is (= :stale (:status (owners/recheck! (:receipt first-page)))))
+    (is (= :current (:status (owners/recheck! receipt))))
+    (is (= :stale (:status (owners/recheck! (update receipt :registrations pop)))))
+    (is (= :stale (:status (owners/recheck! (assoc receipt :registrations (vec (repeat 5 (first (:registrations receipt)))))))))
+    (is (= :stale (:status (owners/recheck! (assoc-in receipt [:registrations 0 :proof-id] (erlang/make_ref))))))
+    (is (= :stale (:status (owners/page "registry-unrelated" (:cursor first-page) 2))))
+    (is (= :invalid-inventory-page (try (owners/page app nil 0) nil (catch e (:kind (ex-data e))))))
+    (is (= :invalid-inventory-page (try (owners/page app nil 1001) nil (catch e (:kind (ex-data e))))))
+    (let [joined (start-owner app)]
+     (try
+      (is (= :stale (:status (owners/recheck! receipt))))
+      (is (= :stale (:status (owners/page app (:cursor first-page) 2))))
+      (finally (stop-owner joined)))))
+   (is (= [] (:participants (owners/page "registry-empty" nil 1))))
+   (is (= :current (:status (owners/recheck! (:receipt (owners/page "registry-empty" nil 1))))))
+   (finally (doseq [o (concat own other)] (stop-owner o))))))
+
+(deftest exact-registration-tickets-and-native-owner-authority
+ (let [app "registry-tickets" owner (start-owner app) old (:handle owner)]
+  (try
+   (is (= old (execute owner (fn [lease _]
+                              (owners/register! (erlang/self) :server lease {:module (first (elem lease 0))} (elem lease 2))))))
+   (is (= :wrong-owner (try (owners/unregister! old) nil (catch e (:kind (ex-data e))))))
+   (is (= :wrong-owner (:kind (GenServer/call owners/NAME [:unregister old]))))
+   (doseq [bad [nil {} {:pid :not-a-pid} {:pid (:pid owner) :kind :server}]]
+    (is (= :invalid-owner-registration (:kind (GenServer/call owners/NAME [:register bad])))))
+   (is (= :unknown-owner-registry-message (:kind (GenServer/call owners/NAME [:wrong-shape]))))
+   (is (= :invalid-owner-handle (:error (execute owner (fn [_ handle] (owners/unregister! (dissoc handle :proof-id)))))))
+   (is (= :invalid-owner-handle (:error (execute owner (fn [_ handle] (owners/unregister! (assoc handle :proof-id (erlang/make_ref))))))))
+   (is (= :current (:status (owners/recheck! (:receipt (owners/page app nil 1))))))
+   (is (= :expired-owner-code-lease
+          (:error (execute owner (fn [lease _]
+                                   (owners/register! (erlang/self) :server
+                                     (tuple (elem lease 0) (erlang/self) (erlang/make_ref)) {} (elem lease 2)))))))
+   (is (= :owner-application-conflict
+          (:error (execute owner (fn [lease _]
+                                   (let [prior (Process/get :bl_generation)]
+                                    (try
+                                     (Process/put :bl_generation (assoc prior :application-id "registry-wrong-app"))
+                                     (owners/register! (erlang/self) :server lease {} (elem lease 2))
+                                     (finally (Process/put :bl_generation prior)))))))))
+   (let [collector (Process/whereis owners/NAME) state (erlang/apply :sys :get_state (list collector))
+         ref (get-in state [:pids (:pid owner) :ref])]
+    (is (erlang/is_reference ref))
+    (erlang/send collector (tuple :DOWN ref :process (:pid owner) :spoofed))
+    (erlang/apply :sys :get_state (list collector))
+    (is (= 1 (get-in (owners/page app nil 1) [:receipt :total]))))
+   (let [receipt (:receipt (owners/page app nil 1))
+         replacement (execute owner (fn [lease handle]
+                                      (owners/unregister! handle)
+                                      (owners/register! (erlang/self) :server lease {:module (first (elem lease 0))} (elem lease 2))))]
+    (is (not= (:ticket old) (:ticket replacement)))
+    (is (= :absent (:status (execute owner (fn [_ handle] (owners/unregister! handle))))))
+    (is (= :stale (:status (owners/recheck! receipt))))
+    (is (= :current (:status (owners/recheck! (:receipt (owners/page app nil 1)))))))
+   (finally (stop-owner owner)))))
+
+(deftest closing-a-role-survives-collector-failure-with-the-owner-still-alive
+ (let [app "registry-close-recovery" owner (start-owner app)
+       before (:receipt (owners/page app nil 1)) collector (Process/whereis owners/NAME)]
+  (try
+   (erlang/apply :sys :suspend (list collector))
+   (is (= :pending (:status (execute owner (fn [_ handle] (owners/unregister! handle))))))
+   (is (Process/alive? (:pid owner)))
+   (is (= :stale (:status (owners/recheck! before))))
+   (is (= :stale (:status (owners/page app nil 1))))
+   (Process/exit collector :kill)
+   (let [after (await-total app 0)]
+    (is (= :valid (:status after)))
+    (is (= [] (:participants after)))
+    (is (= :current (:status (owners/recheck! (:receipt after)))))
+    (is (Process/alive? (:pid owner))))
+   (finally
+    (when (Process/alive? collector) (erlang/apply :sys :resume (list collector)))
+    (stop-owner owner)))))
