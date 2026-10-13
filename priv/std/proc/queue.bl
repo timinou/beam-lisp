@@ -128,7 +128,7 @@
 
 (def KNOWN-BACKOFF [:exponential :constant])
 
-(def KNOWN-ENQUEUE-OPTS [:in :at :protocol :generation :source-id :parent-id])
+(def KNOWN-ENQUEUE-OPTS [:in :at :protocol :generation :source-id :parent-id :enrollment-key])
 
 (defn- known? [k ks] (some (fn [x] (= x k)) ks))
 
@@ -278,6 +278,8 @@
   [{:db/ident :job/id :db/valueType :db.type/string :db/cardinality :db.cardinality/one
     :db/unique :db.unique/identity}
    {:db/ident :job/source-id :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
+   {:db/ident :job/enrollment :db/valueType :db.type/term :db/cardinality :db.cardinality/one
+    :db/unique :db.unique/identity}
    {:db/ident :job/parent-id :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
    {:db/ident :job/protocol :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/index true}
    {:db/ident :job/required-generation :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
@@ -393,11 +395,15 @@
               (erlang/apply :persistent_term :put (list (conn-key srv) c))
               c))))))
 
-(defn- closed-file-rebind? [srv old current]
+(defn- closed-file-rebind? [srv old current opts]
   (let [old-path (:path (ds/identity-of (:store old)))
         current-path (:path (ds/identity-of (:store current)))]
     (and (:lifetime old) (= :closed @(:lifetime old))
-         (string? old-path) (= old-path current-path)
+         (string? old-path) (string? current-path)
+         (or (= old-path current-path)
+             (and (= old-path (:relocate-from opts))
+                  (= #{[(server-name srv)]}
+                     (datom/q '[:find ?key :where [_ :queue/key ?key]] (datom/db current)))))
          (nil? (Process/whereis (keyword "bl-queue" (server-name srv)))))))
 
 (defn attach-store!
@@ -407,18 +413,26 @@
    same persistent store at boot to resume jobs across VM/deployment restarts.
    Refuse live replacement or sharing a store with a different queue. A closed
    connection may rebind only to the same canonical file store while its queue
-   owner is dead; the old native lifetime fence prevents stale writer revival."
-  [srv c]
+   owner is dead; the old native lifetime fence prevents stale writer revival.
+   Explicit {:relocate-from <canonical-old-path>} also permits an offline
+   restored journal naming this same queue to move after that closed owner is
+   dead. The operator must verify its backup before calling; this is not a
+   cross-VM lease or a backup-integrity verifier. Default behavior is unchanged."
+  ([srv c] (attach-store! srv c {}))
+  ([srv c opts]
+  (when-not (and (map? opts) (every? #{:relocate-from} (keys opts))
+                (or (not (contains? opts :relocate-from)) (string? (:relocate-from opts))))
+    (throw (ex-info "Invalid queue store relocation options" {:kind :invalid-store-relocation})))
   (BeamLisp.Env/with_generation_lock (tuple :queue-store (server-name srv))
    (fn []
     (let [existing (erlang/apply :persistent_term :get (list (conn-key srv) nil))]
-    (when (and existing (not= existing c) (not (closed-file-rebind? srv existing c)))
+    (when (and existing (not= existing c) (not (closed-file-rebind? srv existing c opts)))
       (throw (ex-info "Queue connection already bound" {:kind :store-already-bound :server srv})))
     (dc/serialized! c
       (fn []
         ;; Recheck inside the replacement writer, after any competing attach.
         (let [bound (erlang/apply :persistent_term :get (list (conn-key srv) nil))]
-          (when (and bound (not= bound c) (not (closed-file-rebind? srv bound c)))
+          (when (and bound (not= bound c) (not (closed-file-rebind? srv bound c opts)))
             (throw (ex-info "Queue connection already bound" {:kind :store-already-bound :server srv}))))
         (datom/install-schema! c SCHEMA)
         (when (some (fn [row] (not= (server-name srv) (first row)))
@@ -426,7 +440,7 @@
           (throw (ex-info "Queue requires its own connection/store" {:kind :shared-queue-store})))
         (datom/transact! c [{:db/id -1 :queue/key (server-name srv)}])
         (erlang/apply :persistent_term :put (list (conn-key srv) c))))
-    c))))
+    c)))))
 
 (defn- identity-token []
   (Base/encode16 (erlang/apply :crypto :strong_rand_bytes (list 24))))
@@ -889,7 +903,12 @@
    included).
 
    Options: `{:at <epoch-ms>}` for an absolute due, `{:in [N UNIT]}` for a
-   delay; neither means NOW.
+   delay; neither means NOW. Optional `:enrollment-key` identifies one durable
+   enrollment across settlement/restart while its job record is retained. It
+   is scoped by server and refuses a different payload/protocol. Unlike the
+   outstanding-job ticket, settlement never retracts this identity. Explicit
+   pruning of the job ends its retention; provider/domain journals must still
+   guard effects independently.
 
    A DUPLICATE INSIDE THE WINDOW IS A NO-OP RETURNING THE EXISTING JOB. The
    window is the job's own life as an OUTSTANDING job — `:queued` or
@@ -947,6 +966,12 @@
              _ (when (and generation (contains? (:queue/fenced-generations admissions #{}) generation))
                  (throw (ex-info "Queue generation admissions are fenced"
                                  {:kind :generation-fenced :generation generation})))
+             enrollment (when (contains? opts :enrollment-key)
+                          (let [key (:enrollment-key opts)]
+                            (when (or (nil? key) (> (erlang/byte_size (erlang/term_to_binary key)) 4096))
+                              (throw (ex-info "Enrollment key must be nonnil and bounded" {:kind :invalid-enrollment-key})))
+                            [(server-name srv) key]))
+             existing (when enrollment (datom/entity (datom/db c) [:job/enrollment enrollment]))
              id (identity-token)
              now (tick/wall-ms)
              at (due-at now opts)
@@ -964,6 +989,7 @@
                          :job/attempts 0
                          :job/payload job
                          :job/diagnostic-context (merge (diag/context) {:diagnostics/job-id (diag/new-id)})}
+                        (if enrollment {:job/enrollment enrollment} {})
                         (if generation {:job/generation generation :job/required-generation generation} {})
                         (if (:parent-id opts) {:job/parent-id (:parent-id opts)} {})
                         (if (some? ticket) {:job/ticket ticket} {})
@@ -974,6 +1000,12 @@
              tx (if (some? ticket)
                   [row [:db/cas -1 :job/ticket nil ticket]]
                   [row])]
+         (if existing
+           (do
+             (when-not (and (= job (:job/payload existing)) (= protocol (:job/protocol existing)))
+               (throw (ex-info "Enrollment identity already names a different payload or protocol"
+                        {:kind :enrollment-conflict :server srv})))
+             (assoc existing :job/created false))
          (try
            (let [report (datom/transact! c tx)
                  e (get (:tempids report) -1)]
@@ -982,8 +1014,12 @@
              (if (and (some? ticket)
                       (includes? (error-text err) "compare-and-swap"))
                (let [j (find-by-ticket c ticket)]
-                 (if (some? j) (assoc j :job/created false) (throw err)))
-               (throw err)))))))))))
+                 (if (some? j)
+                   (do (when (and enrollment (not= enrollment (:job/enrollment j)))
+                         (throw (ex-info "Outstanding ticket belongs to a different enrollment"
+                                  {:kind :enrollment-conflict :server srv})))
+                       (assoc j :job/created false)) (throw err)))
+               (throw err))))))))))))
 
 ;; ── stats: a query, not a counter ───────────────────────────────────────
 
