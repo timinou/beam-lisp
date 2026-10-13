@@ -142,7 +142,10 @@
   (when (and (:migration/digest migration)
              (not (and (string? (:migration/digest migration))
                        (Regex/match? (Regex/compile! "^[a-f0-9]{64}$") (:migration/digest migration)))))
-    (throw (ex-info "Migration digest must identify sealed implementation bytes" {:kind :invalid-migration}))))
+    (throw (ex-info "Migration digest must identify sealed implementation bytes" {:kind :invalid-migration})))
+  (doseq [definition (:migration/grows migration [])]
+   (when-let [problem (datom.schema/validate-attr-def definition)]
+    (throw (ex-info "Invalid migration schema declaration" (assoc problem :kind :invalid-migration))))))
 
 ;; ── invariant checks: violations derived from data, as data ─────────
 ;;
@@ -155,41 +158,71 @@
   [db attr]
   (into [] (datom.query.engine/q [:find '?e '?v :where ['?e attr '?v]] db)))
 
+(defn- unique-violations [attr rows]
+  (let [by-v (group-by (fn [t] (get t 1)) rows)]
+    (filterv some?
+      (mapv (fn [entry]
+              (let [grp (val entry)]
+                (when (> (count grp) 1)
+                  {:check :unique :attr attr :value (key entry)
+                   :entities (mapv (fn [t] (get t 0)) grp)})))
+            (seq by-v)))))
+
 (defn check-unique
   "Violations of a uniqueness invariant on `attr`: any value held by more
    than one entity."
   [db attr]
-  (let [by-v (group-by (fn [t] (get t 1)) (rows-e-v db attr))]
+  (unique-violations attr (rows-e-v db attr)))
+
+(defn- cardinality-violations [attr rows]
+  (let [by-e (group-by (fn [t] (get t 0)) rows)]
     (filterv some?
       (mapv (fn [entry]
               (let [grp (val entry)]
-                (if (> (count grp) 1)
-                  {:check :unique :attr attr :value (key entry)
-                   :entities (mapv (fn [t] (get t 0)) grp)}
-                  nil)))
-            (seq by-v)))))
+                (when (> (count grp) 1)
+                  {:check :cardinality-one :attr attr :entity (key entry)
+                   :values (mapv (fn [t] (get t 1)) grp)})))
+            (seq by-e)))))
 
 (defn check-cardinality-one
   "Violations of a cardinality-one invariant on `attr`: any entity holding
    more than one value."
   [db attr]
-  (let [by-e (group-by (fn [t] (get t 0)) (rows-e-v db attr))]
-    (filterv some?
-      (mapv (fn [entry]
-              (let [grp (val entry)]
-                (if (> (count grp) 1)
-                  {:check :cardinality-one :attr attr :entity (key entry)
-                   :values (mapv (fn [t] (get t 1)) grp)}
-                  nil)))
-            (seq by-e)))))
+  (cardinality-violations attr (rows-e-v db attr)))
+
+(defn schema-checks
+  "Derive historical checks from the actual requested schema, without repeated
+   application predicates. Uses schema's existing validation/type semantics.
+   A changed derived tuple requires a full prospective-schema preview; refuse
+   that unsupported transition instead of validating an empty new attribute."
+  [db migration]
+  (let [before (datom.db/schema-of db)
+        after (datom.schema/install-all before (:migration/grows migration []))]
+   (vec (mapcat
+     (fn [attr]
+       (let [definition (get after attr) old (get before attr)]
+        (concat
+         (when (and (seq (:db/tupleAttrs definition))
+                    (not= (:db/tupleAttrs definition) (:db/tupleAttrs old)))
+          [{:check :derived-schema :attr attr :reason :prospective-tuple-preview-required}])
+         (when (datom.schema/unique? after attr) [{:check :unique :attr attr}])
+         (when-not (datom.schema/many? after attr) [{:check :cardinality-one :attr attr}])
+         (when-let [t (datom.schema/value-type after attr)] [{:check :value-type :attr attr :expected t}]))))
+     (distinct (map :db/ident (:migration/grows migration [])))))))
 
 (defn- run-check
   "Run one check spec against `db`, returning its violations."
-  [db spec]
+  [db spec rows]
   (let [kind (get spec :check) attr (get spec :attr)]
     (cond
-      (= kind :unique) (check-unique db attr)
-      (= kind :cardinality-one) (check-cardinality-one db attr)
+      (= kind :unique) (unique-violations attr rows)
+      (= kind :cardinality-one) (cardinality-violations attr rows)
+      (= kind :value-type)
+        (filterv some? (mapv (fn [row]
+          (when-let [problem (datom.schema/validate-value
+                              {attr {:db/ident attr :db/valueType (:expected spec)}} attr (get row 1))]
+           (assoc problem :check :value-type :entity (get row 0)))) rows))
+      (= kind :derived-schema) [spec]
       (= kind :predicate)
         (let [r ((get spec :fn) db)]
           (cond (nil? r) [] (= true r) [] (= false r) [{:check :predicate :id (:id spec)}]
@@ -200,8 +233,10 @@
 (defn- check-all
   "Every violation of `migration`'s checks against `db`, flattened."
   [db migration]
-  (into [] (mapcat (fn [spec] (run-check db spec))
-                   (get migration :migration/checks []))))
+  (let [checks (vec (distinct (concat (get migration :migration/checks []) (schema-checks db migration))))
+        attrs (distinct (keep #(when (contains? #{:unique :cardinality-one :value-type} (:check %)) (:attr %)) checks))
+        rows (into {} (map (fn [attr] [attr (rows-e-v db attr)]) attrs))]
+   (into [] (mapcat (fn [spec] (run-check db spec (get rows (:attr spec)))) checks))))
 
 ;; ── remediation ─────────────────────────────────────────────────────
 
@@ -410,7 +445,8 @@
 ;; ── batched remediation, for migrations too large for one commit ────
 
 (defn capabilities []
-  #{:serialized-decisions :immutable-digests :basis-bound :transaction-policy :online-steps :partial-identity})
+  #{:serialized-decisions :immutable-digests :basis-bound :transaction-policy :online-steps :partial-identity
+    :inferred-schema-checks :shared-attribute-scans})
 
 (defn step!
   "Perform ONE bounded resumable backfill step. batch-fn is pure and returns
