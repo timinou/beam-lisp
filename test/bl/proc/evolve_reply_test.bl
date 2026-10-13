@@ -1,0 +1,159 @@
+(ns proc.evolve-reply-test (:require [proc.evolve :as ev]))
+
+(defn first-spec []
+ {:version 1 :digest "reply-v1" :accept? int? :check-state int? :check-reply int?
+  :handler (fn [m s] {:reply m :state (+ m s)})})
+(defn second-spec []
+ {:version 2 :digest "reply-v2" :accept? int? :check-state int?
+  :check-reply (fn [r] (and (map? r) (int? (:value r))))
+  :migrate-state identity :upcast identity :downcast (fn [r] (:value r))
+  :handler (fn [m s] {:reply {:value m} :state (+ m s)})})
+(defn third-spec []
+ {:version 3 :digest "reply-v3" :accept? int? :check-state int?
+  :check-reply (fn [r] (and (vector? r) (= 1 (count r)) (int? (first r))))
+  :migrate-state identity :upcast identity :downcast (fn [r] {:value (first r)})
+  :handler (fn [m s] {:reply [m] :state (+ m s)})})
+
+(deftest old-and-new-callers-keep-their-reply-contracts-through-multiple-upgrades
+ (let [p (ev/start! (first-spec) 0)]
+  (try
+   (is (= 3 (ev/call! p 1 3)))
+   (is (= :applied (:status (ev/upgrade! p 1 (second-spec)))))
+   (is (= 4 (ev/call! p 1 4)))
+   (is (= {:value 5} (ev/call! p 2 5)))
+   (is (= :applied (:status (ev/upgrade! p 2 (third-spec)))))
+   (is (= 6 (ev/call! p 1 6)))
+   (is (= {:value 7} (ev/call! p 2 7)))
+   (is (= [8] (ev/call! p 3 8)))
+   (is (= [1 2] (:legacy-versions (ev/status p))))
+   (is (:reply-contract? (ev/status p)))
+   (finally (GenServer/stop p)))))
+
+(deftest queued-old-requests-get-old-replies-after-fifo-publication
+ (let [p (ev/start! (first-spec) 0) parent (erlang/self)
+       publication (erlang/alias) request (erlang/alias)]
+  (try
+   (erlang/send p (tuple :"$gen_call" (tuple parent publication)
+                         [:proc.evolve/upgrade 1 (second-spec)]))
+   (erlang/send p (tuple :"$gen_call" (tuple parent request)
+                         [:proc.evolve/call 1 6]))
+   (is (= :applied (:status (receive [tag r] :when (= tag publication) r (after 5000 nil)))))
+   (is (= 6 (receive [tag r] :when (= tag request) r (after 5000 nil))))
+   (is (= p (:pid (ev/status p))))
+   (finally (erlang/unalias publication) (erlang/unalias request) (GenServer/stop p)))))
+
+(defn under-generation [digest action]
+ (let [previous (Process/get :bl_generation)]
+  (try (Process/put :bl_generation {:digest digest :modules []}) (action)
+   (finally (Process/put :bl_generation previous)))))
+
+(deftest retained-reply-checks-and-conversions-use-their-original-code-context
+ (let [base (assoc (first-spec) :check-reply
+              (fn [r] (and (= "reply-old" (:digest (Process/get :bl_generation))) (int? r))))
+       p (under-generation "reply-old" #(ev/start! base 0))
+       candidate (under-generation "reply-new"
+                  #(ev/prepare-spec
+                    (assoc (second-spec)
+                      :check-reply (fn [r] (and (= "reply-new" (:digest (Process/get :bl_generation))) (map? r)))
+                      :downcast (fn [r] (if (= "reply-new" (:digest (Process/get :bl_generation))) (:value r) "wrong-context")))))]
+  (try
+   (is (= :applied (:status (ev/upgrade! p 1 candidate))))
+   (is (= 4 (ev/call! p 1 4)))
+   (is (= {:value 5} (ev/call! p 2 5)))
+   (finally (GenServer/stop p)))))
+
+(deftest missing-reply-migration-is-refused-before-rehearsal-and-publication
+ (let [p (ev/start! (first-spec) 0) candidate (dissoc (second-spec) :downcast)]
+  (try
+   (let [before (ev/status p)]
+    (is (= :missing-reply-migration (:kind (ev/rehearse! p 1 candidate))))
+    (is (= :missing-reply-migration (:kind (ev/upgrade! p 1 candidate))))
+    (is (= before (ev/status p))))
+   (is (= 2 (ev/call! p 1 2)))
+   (finally (GenServer/stop p)))))
+
+(deftest wrong-current-and-adapted-replies-never-escape-as-success
+ (let [p (ev/start! (first-spec) 0)]
+  (try
+   (is (= :applied (:status (ev/upgrade! p 1 (assoc (second-spec) :downcast (fn [_] "wrong"))))))
+   (let [before (ev/status p)]
+    (is (= :invalid-reply (:kind (ev/call! p 1 4))))
+    (is (= before (ev/status p))))
+   (is (= {:value 2} (ev/call! p 2 2)))
+   (is (= :applied (:status (ev/upgrade! p 2
+                  (assoc (third-spec) :handler (fn [_ s] {:reply "wrong" :state (inc s)}))))))
+   (let [before (ev/status p)]
+    (is (= :invalid-reply (:kind (ev/call! p 3 5))))
+    (is (= :invalid-reply (:kind (ev/call! p 1 5))))
+    (is (= before (ev/status p))))
+   (finally (GenServer/stop p)))))
+
+(deftest reply-conversion-failure-is-distinct-and-keeps-the-owner-current
+ (let [p (ev/start! (first-spec) 0)]
+  (try
+   (ev/upgrade! p 1 (assoc (second-spec) :downcast (fn [_] (throw (ex-info "private detail" {})))))
+   (let [before (ev/status p)]
+    (is (= {:status :refused :kind :reply-migration-failed} (ev/call! p 1 4)))
+    (is (= before (ev/status p))))
+   (is (= {:value 2} (ev/call! p 2 2)))
+   (finally (GenServer/stop p)))))
+
+(deftest reply-checks-and-conversions-remain-until-managed-clients-drain
+ (let [p (ev/start! (first-spec) 0 {:managed true}) token (:token (ev/acquire-client! p 1))]
+  (try
+   (ev/upgrade! p 1 (second-spec))
+   (ev/upgrade! p 2 (third-spec))
+   (is (= 6 (ev/call-client! p token 6)))
+   (is (= :waiting (:status (ev/retire! p 3 2))))
+   (is (= 7 (ev/call-client! p token 7)))
+   (ev/release-client! p token)
+   (is (= :retired (:status (ev/retire! p 3 2))))
+   (is (= [] (:legacy-versions (ev/status p))))
+   (is (= :unknown-client (:kind (ev/call-client! p token 1))))
+   (let [current (:token (ev/acquire-client! p 3))]
+    (is (= [8] (ev/call-client! p current 8)))
+    (ev/release-client! p current))
+   (finally (GenServer/stop p)))))
+
+(deftest invalid-reply-callbacks-refuse-during-spec-validation
+ (doseq [[key f] [[:check-reply true] [:downcast (fn [_ _ _] nil)]]]
+  (is (try (ev/start! (assoc (first-spec) key f) 0) false
+        (catch e (= :invalid-evolution (:kind (ex-data e))))))))
+
+(deftest absent-reply-options-can-be-explicit-nil
+ (let [p (ev/start! (assoc (first-spec) :check-reply nil :downcast nil) 0)]
+  (try
+   (is (not (:reply-contract? (ev/status p))))
+   (is (= 3 (ev/call! p 1 3)))
+   (finally (GenServer/stop p)))))
+
+(deftest reply-contracts-and-conversions-can-depend-on-the-original-request
+ (let [base {:version 1 :digest "request-dependent-v1" :accept? keyword? :check-state int?
+             :check-reply (fn [r request] (if (= request :read) (int? r) (= true r)))
+             :handler (fn [request s] {:reply (if (= request :read) s true)
+                                      :state (if (= request :read) s (inc s))})}
+       next {:version 2 :digest "request-dependent-v2" :accept? map? :check-state int?
+             :check-reply (fn [r request] (and (map? r) (contains? request :operation) (int? (:value r))))
+             :migrate-state identity :upcast (fn [request] {:operation request})
+             :downcast (fn [r request] (if (= request :read) (:value r) true))
+             :handler (fn [request s] {:reply {:value s}
+                                      :state (if (= (:operation request) :read) s (inc s))})}
+       p (ev/start! base 0)]
+  (try
+   (is (= :applied (:status (ev/upgrade! p 1 next))))
+   (is (= 0 (ev/call! p 1 :read)))
+   (is (= true (ev/call! p 1 :save)))
+   (is (= 1 (ev/call! p 1 :read)))
+   (is (= {:value 1} (ev/call! p 2 {:operation :read})))
+   (finally (GenServer/stop p)))))
+
+(deftest runtime-reply-validation-does-not-claim-to-undo-handler-effects
+ (let [effects (atom 0)
+       p (ev/start! (assoc (first-spec) :handler
+                    (fn [_ s] (swap! effects inc) {:reply "wrong" :state (inc s)})) 0)]
+  (try
+   (let [before (ev/status p)]
+    (is (= :invalid-reply (:kind (ev/call! p 1 4))))
+    (is (= before (ev/status p)))
+    (is (= 1 @effects)))
+   (finally (GenServer/stop p)))))

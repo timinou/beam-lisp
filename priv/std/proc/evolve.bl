@@ -7,7 +7,17 @@
 (defn- validate! [spec]
  (when-not (and (valid-version? (:version spec)) (string? (:digest spec))
                 (not (empty? (:digest spec))) (:handler spec) (:check-state spec) (:accept? spec))
-  (throw (ex-info "Evolution requires version, digest, handler and state/message predicates" {:kind :invalid-evolution}))))
+  (throw (ex-info "Evolution requires version, digest, handler and state/message predicates" {:kind :invalid-evolution})))
+ (doseq [k [:check-reply :downcast]]
+  (when (and (some? (get spec k)) (not (or (erlang/is_function (get spec k) 1) (erlang/is_function (get spec k) 2))))
+   (throw (ex-info "Reply contracts and migrations take reply, optionally original request" {:kind :invalid-evolution :callback k})))))
+
+(defn- validate-migrations! [current spec]
+ (validate! spec)
+ (when-not (and (erlang/is_function (:upcast spec) 1) (erlang/is_function (:migrate-state spec) 1))
+  (throw (ex-info "Upgrade requires state and message migrations of arity one" {:kind :missing-migration})))
+ (when (and (:check-reply current) (nil? (:downcast spec)))
+  (throw (ex-info "Checked old clients require an explicit reply migration" {:kind :missing-reply-migration}))))
 
 (defn prepare-spec
  "Pin callback execution context before crossing into an older owner. Prepared
@@ -25,13 +35,15 @@
              (if-let [f (get spec k)]
               (let [r (cb/register! f (:modules spec []))]
                (swap! held conj r) (assoc m k r)) m))
-           (select-keys spec [:version :digest])
-           [:handler :check-state :accept? :migrate-state :upcast])
+           (assoc (select-keys spec [:version :digest])
+                  :reply-arity (if (erlang/is_function (:check-reply spec) 2) 2 1)
+                  :downcast-arity (if (erlang/is_function (:downcast spec) 2) 2 1))
+           [:handler :check-state :accept? :migrate-state :upcast :check-reply :downcast])
    (catch e (doseq [r @held] (cb/unregister! r)) (throw e))
    (finally (BeamLisp.Env/bind previous)))))
 
 (defn- release! [held]
- (doseq [k [:handler :check-state :accept? :migrate-state :upcast]]
+ (doseq [k [:handler :check-state :accept? :migrate-state :upcast :check-reply :downcast]]
   (when-let [r (get held k)] (cb/unregister! r))))
 
 (defn- invoke [held k args] (cb/invoke! (get held k) args))
@@ -41,24 +53,42 @@
  state)
 
 (defn- adapt [st version message]
- (loop [v version msg message]
+ (loop [v version msg message replies (list)]
   (cond
-   (= v (get-in st [:current :version])) msg
+   (= v (get-in st [:current :version])) {:message msg :replies replies}
    (not (valid-version? v)) (throw (ex-info "Invalid message version" {:kind :unsupported-version}))
    :else (if-let [edge (get (:adapters st) v)]
-           (recur (:to edge) (dc/observing #(cb/invoke! (:callback edge) [msg])))
+           (recur (:to edge) (dc/observing #(cb/invoke! (:callback edge) [msg]))
+                  (if (or (:downcast edge) (:reply-check edge)) (cons (assoc edge :request msg) replies) replies))
            (throw (ex-info "No message upgrade path" {:kind :unsupported-version}))))))
+
+(defn- checked-reply [registration arity request value]
+ (when (and registration (not= true (try (dc/observing #(cb/invoke! registration (if (= arity 2) [value request] [value]))) (catch _ false))))
+  (throw (ex-info "Reply outside client contract" {:kind :invalid-reply})))
+ value)
+
+(defn- adapt-reply [edges reply]
+ (reduce (fn [value edge]
+           (checked-reply (:reply-check edge) (:reply-arity edge) (:request edge)
+            (if-let [f (:downcast edge)]
+             (try (dc/observing #(cb/invoke! f (if (= 2 (:downcast-arity edge)) [value (:request edge)] [value])))
+              (catch _ (throw (ex-info "Reply migration failed" {:kind :reply-migration-failed})))) value))) reply edges))
+
+(defn- release-edge! [edge]
+ (doseq [k [:callback :downcast :reply-check]]
+  (when-let [r (get edge k)] (cb/unregister! r))))
 
 (defn- dispatch [st version message]
  (try
-  (let [held (:current st) msg (adapt st version message)]
+  (let [held (:current st) adapted (adapt st version message) msg (:message adapted)]
    (when-not (= true (dc/observing #(invoke held :accept? [msg])))
     (throw (ex-info "Message outside current contract" {:kind :invalid-message})))
    (let [result (invoke held :handler [msg (:value st)])]
     (when-not (and (map? result) (contains? result :reply) (contains? result :state))
      (throw (ex-info "Handler must return reply and state" {:kind :invalid-result})))
     (valid-state! held (:state result))
-    [(:reply result) (assoc st :value (:state result) :revision (inc (:revision st 0)))]))
+    [(adapt-reply (:replies adapted) (checked-reply (:check-reply held) (:reply-arity held) msg (:reply result)))
+     (assoc st :value (:state result) :revision (inc (:revision st 0)))]))
   (catch e [{:status :refused :kind (or (:kind (ex-data e)) :handler-failed)} st])))
 
 (defn- upgrade [st expected spec]
@@ -73,22 +103,24 @@
    :else
     (let [next (atom nil)]
      (try
-      (validate! spec)
-      (when-not (and (:upcast spec) (:migrate-state spec))
-       (throw (ex-info "Upgrade requires explicit state and message migrations" {:kind :missing-migration})))
+      (validate-migrations! current spec)
       (reset! next (retain! spec))
       (let [prepared (fence/fence-fn (:upgrade-ms st)
                         (fn [] (dc/observing #(valid-state! @next (invoke @next :migrate-state [(:value st)])))))
             _ (when-not (contains? prepared :ok)
                 (throw (ex-info "State migration failed or exceeded budget" {:kind :migration-deadline})))
             value (:ok prepared)
-            edge {:to (:version spec) :callback (:upcast @next)}
-            installed (dissoc @next :migrate-state :upcast)
+            edge {:to (:version spec) :callback (:upcast @next)
+                  :downcast (:downcast @next) :downcast-arity (:downcast-arity @next)
+                  :reply-check (:check-reply current) :reply-arity (:reply-arity current)}
+            installed (dissoc @next :migrate-state :upcast :downcast :downcast-arity)
             after (assoc st :current installed :value value :revision (inc (:revision st 0))
                            :adapters (assoc (:adapters st) (:version current) edge))]
        ;; No callback after releasing the old registration may reject publication.
        (cb/unregister! (:migrate-state @next))
-       (release! current)
+       ;; Transfer the old reply check to its version edge until old clients
+       ;; and durable dependencies have drained. Everything else is obsolete.
+       (release! (dissoc current :check-reply))
        [{:status :applied :version (:version spec)} after])
       (catch e
        (when @next (release! @next))
@@ -136,7 +168,7 @@
           [{:status :waiting :live live :durable durable :through through} after]
           (do
             (doseq [v versions]
-              (cb/unregister! (get-in st [:adapters v :callback])))
+              (release-edge! (get (:adapters st) v)))
             [{:status :retired :versions (vec (sort versions)) :through through}
              (assoc after :adapters (apply dissoc (:adapters st) versions)
                           :retired-through (max through (:retired-through st 0)))])))))
@@ -179,7 +211,7 @@
   (not= expected (get-in st [:current :version])) [{:status :refused :kind :stale-version} st]
   :else (let [held (atom nil)]
    (try
-    (validate! spec)
+    (validate-migrations! (:current st) spec)
     (when-not (and (erlang/is_function (:migrate-state spec) 1)
                   (erlang/is_integer budget) (pos? budget) (<= budget 30000))
      (throw (ex-info "Invalid rehearsal contract" {:kind :invalid-rehearsal})))
@@ -218,6 +250,7 @@
   :proc.evolve/status
    [{:version (get-in st [:current :version]) :digest (get-in st [:current :digest])
      :legacy-versions (vec (sort (keys (:adapters st)))) :revision (:revision st 0)
+     :reply-contract? (some? (get-in st [:current :check-reply]))
      :managed (:managed st) :clients (count (:clients st))
      :queues (vec (:queues st)) :fenced-versions (vec (sort (:fenced st)))
      :fenced-through (:fenced-through st) :pid (erlang/self)} st]
@@ -227,7 +260,7 @@
  (when (:owner-evidence st)
   (ets/delete_object :beam_lisp_vars (tuple (tuple :bl-evolve-owner (get-in st [:owner-evidence :pid])) (:owner-evidence st))))
  (release! (:current st))
- (doseq [edge (vals (:adapters st))] (cb/unregister! (:callback edge)))
+ (doseq [edge (vals (:adapters st))] (release-edge! edge))
  :ok)
 (defn composed-state [opts]
  {:evolve (initial-state opts)})
@@ -265,10 +298,16 @@
 
 (defn start!
  "Start one stable owner. Spec supplies :version/:digest, :handler (msg,state ->
-  {:reply r :state s}), :accept? and :check-state. Native callbacks are retained
+  {:reply r :state s}), :accept? and :check-state. Optional :check-reply validates
+  this version's replies; later upgrades must supply :downcast to checked old
+  clients. Both reply callbacks take reply, optionally original request as a
+  second argument for request-dependent reply shapes. This runtime defense is
+  not a static compatibility proof and cannot
+  undo effects already performed by a handler. Native callbacks are retained
   under this owner's lifetime. Declare captured executable dependencies :modules."
  ([spec state] (start! spec state {}))
  ([spec state opts]
+  (validate! spec)
   (core/start owner {:spec spec :state state :history-limit (:history-limit opts 32) :upgrade-ms (:upgrade-ms opts 250) :managed (:managed opts false)}
                     (dissoc opts :history-limit :upgrade-ms :managed))))
 (defn call!
@@ -277,7 +316,8 @@
  ([pid version message timeout] (GenServer/call pid [:proc.evolve/call version message] timeout)))
 (defn upgrade!
  "FIFO publication of handler+state in the existing process. Requests keep their
-  version and upcast lazily on delivery; no mailbox drain/rewrite or PID swap.
+  version and upcast lazily on delivery; replies downcast through the reverse
+  path and satisfy every retained client contract. No mailbox rewrite or PID swap.
   A refused migration keeps old state/handler. Timeout means outcome unknown."
  ([pid expected spec] (upgrade! pid expected spec 5000))
  ([pid expected spec timeout] (GenServer/call pid [:proc.evolve/upgrade expected (prepare-spec spec)] timeout)))
