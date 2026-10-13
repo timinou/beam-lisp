@@ -199,3 +199,23 @@ stop replaying it:
   client payload as an outcome.
 - **Unrelated exceptions are not swallowed.** Only the two well-formed marker
   shapes convert; everything else re-raises.
+
+## Input projection acknowledgements
+
+A typed input's HTML attribute and displayed value can diverge: after editing,
+`setAttribute("value", …)` alone does not reset its native value. Updating that
+property on every older server echo would instead erase newer keystrokes.
+
+A mount now advertises `{"input-ack": true}` as its optional third field. The
+client gives each relayed input/change event a `live/input-id`, protects that
+field while its inputs are pending, and synchronizes its native value/checked
+selection from the rendered model after `[:input-ack id]`. The socket projects
+before acknowledging; an older input whose projection is coalesced is still
+acknowledged. Each field has its own pending count, and IME composition defers
+property synchronization until composition ends. Transport metadata is stripped
+before an authorizer or performer sees the business payload.
+
+This acknowledgement concerns session-local input projection. It is not a
+business decision, a persisted receipt, or the durable outbox's `[:ack id]`.
+Older clients ignore the mount's extra field; a new client talking to a server
+without that feature keeps the previous attribute-only editing behavior.
