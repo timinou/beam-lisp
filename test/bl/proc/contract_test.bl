@@ -1,0 +1,109 @@
+(ns proc.contract-test (:require [proc.contract :as contract] [proc.server :as ps]
+                                [veritas.model :as vm]))
+
+(defserver guarded
+ (init [observer] (Process/put :contract-observer observer) (ok 3))
+ (handle-call [:take n] [_ balance] :when (and (int? n) (> n 0) (<= n balance))
+  (erlang/send (Process/get :contract-observer) :entered)
+  (reply :taken (- balance n)))
+ (handle-cast {:amount n} [balance] :when (and (int? n) (> n 0))
+  (erlang/send (Process/get :contract-observer) :entered) (noreply (+ balance n)))
+ (handle-info [:notice value] [balance] :when (string? value)
+  (erlang/send (Process/get :contract-observer) :entered) (noreply balance)))
+
+(ps/extend-clause! :contract-probe
+ (fn [_ _] {:clauses '[(handle-call [:contributed n] [_ state] :when (int? n) (reply n state))]}))
+(ps/defserver contributed
+ (init [_] (ok nil))
+ (contract-probe))
+
+(defserver sender-guarded
+ (init [_] (ok nil))
+ (handle-call :read [sender state] :when (= sender :trusted) (reply :ok state)))
+
+(deftest sender-bindings-and-malformed-declarations-are-explicit
+ (let [c (contract/snapshot sender-guarded)]
+  (is (contract/admit? c :call :read :trusted nil))
+  (is (not (contract/admit? c :call :read :other nil)))
+  (is (not (contract/admit? c :call :read nil))))
+ (is (try (BeamLisp/eval "(defserver invalid_contract (frobnicate [] nil))") false
+       (catch e (includes? (ex-message e) "Unknown defserver callback: frobnicate"))))
+ (doseq [guard ["(not false true)" "(int?)" "(int? n n)" "(< n)" "(nil? n n)"]]
+  (is (try (BeamLisp/eval (str "(defserver invalid_guard (init [_] (ok 0)) (handle-call [:take n] [_ s] :when " guard " (reply n s)))")) false
+        (catch e (includes? (ex-message e) "expects")))))
+ (is (= :ok (BeamLisp/eval "((fn ([x] :when (and) :ok) ([_] :wrong)) 1)")))
+ (is (= :ok (BeamLisp/eval "((fn ([x] :when (or) :wrong) ([_] :ok)) 1)"))))
+
+(deftest native-compiler-emits-canonical-boundaries-without-bodies
+ (let [c (contract/snapshot guarded)]
+  (is (= 1 (:version c)))
+  (is (= :beam (:target c)))
+  (is (= :callback-admission (:scope c)))
+  (is (= 32 (count (:code-id c))))
+  (is (= #{:call :cast :info :continue} (set (keys (:callbacks c)))))
+  (is (not (includes? (pr-str c) ":entered")))
+  (is (not (includes? (pr-str c) "send")))
+  (is (seq (get-in c [:callbacks :call :clauses])))
+  (is (every? #(not (contains? % :body)) (get-in c [:callbacks :call :clauses])))))
+
+(deftest checks-use-state-and-real-patterns-with-no-business-effects
+ (let [c (contract/snapshot guarded)]
+  (doseq [state (range 4) value [-1 nil "wrong" 0 1 2 3 4]]
+   (is (= (and (int? value) (> value 0) (<= value state))
+          (contract/admit? c :call [:take value] state))))
+  (doseq [bad [nil :take [:take] [:take 1 2] [:other 1] {:take 1}]]
+   (is (not (contract/admit? c :call bad 3))))
+  (is (contract/admit? c :cast {:amount 2 :extra :open-map} 3))
+  (is (not (contract/admit? c :cast {:amount "wrong"} 3)))
+  (is (not (contract/admit? c :cast {} 3)))
+  (is (contract/admit? c :info [:notice "ok"] 3))
+  (is (not (contract/admit? c :info [:notice 42] 3)))
+  (is (not (contract/admit? c :info :implicitly-ignored 3)))
+  (is (not (contract/admit? c :continue :anything 3)))
+  (is (= :quiet (receive :entered :effect (after 0 :quiet))))))
+
+(deftest contributed-clauses-are-included-after-expansion
+ (let [c (contract/snapshot contributed)]
+  (is (contract/admit? c :call [:contributed 4] nil))
+  (is (not (contract/admit? c :call [:contributed "wrong"] nil)))
+  (is (not (contract/admit? c :call :missing nil)))))
+
+(deftest receipts-refuse-after-any-code-change-even-if-input-shape-is-unchanged
+ (let [module (BeamLisp/eval "(defserver contract_replacement (init [_] (ok 0)) (handle-call :read [_ s] (reply :before s)))")
+       c (contract/snapshot module)]
+  (is (contract/admit? c :call :read 0))
+  (BeamLisp/eval "(defserver contract_replacement (init [_] (ok 0)) (handle-call :read [_ s] (reply :after s)))")
+  (is (= :stale-code (:kind (contract/check c :call :read nil 0))))
+  (is (contract/admit? (contract/snapshot module) :call :read 0))))
+
+(deftest missing-and-unknown-contracts-refuse
+ (is (nil? (contract/snapshot :Elixir.String)))
+ (is (= :missing-contract (:kind (contract/check nil :call :read nil 0))))
+ (is (= :unknown-callback (:kind (contract/check (contract/snapshot guarded) :other :read nil 0)))))
+
+(deftest generated-admission-agrees-with-native-dispatch-through-histories
+ (let [c (contract/snapshot guarded)
+       machine (vm/model "compiled callback admission"
+        {:state 3 :init #(atom {:balance 3 :agrees true})
+         :commands
+         {:take {:args (vm/int-in -2 5)
+                 :next (fn [balance n] (if (and (> n 0) (<= n balance)) (- balance n) balance))
+                 :run (fn [sys n]
+                  (let [balance (:balance @sys)
+                        predicted (contract/admit? c :call [:take n] balance)
+                        actual (try
+                                 (Process/put :contract-observer (erlang/self))
+                                 (let [result (erlang/apply guarded :handle_call (list [:take n] nil balance))]
+                                  {:accepted true :balance (elem result 2)})
+                                 (catch _ {:accepted false :balance balance})
+                                 (finally (Process/delete :contract-observer)))
+                        effect? (= :effect (receive :entered :effect (after 0 :quiet)))]
+                   (reset! sys {:balance (:balance actual)
+                                :agrees (and (:agrees @sys) (= predicted (:accepted actual))
+                                             (= predicted effect?))})))}}
+         :invariants {:same-dispatch (fn [balance sys]
+                                      (and (:agrees @sys) (= balance (:balance @sys))))}})
+       result (vm/check machine {:seed 1337 :histories 100 :max-len 20})]
+  (is (= :witnessed (:modality result)))
+  (is (= 100 (:tried result)))
+  (is (pos? (get (:coverage result) :take 0)))))
