@@ -21,6 +21,14 @@ impossible input. Neither folds nor gaps choose an instant implicitly.
 seconds, `:dst?` and `:designation`. `local-parts` adds `:parts` and `:instant`.
 `civil-text` renders a civil-axis coordinate for minute or second input.
 
+`instants-in zone from to` maps a civil interval to all its ordered, disjoint
+instant windows. It keeps both occurrences of a repeated hour and no instants
+from a skipped hour. This is the shared relation for working-hour patterns and
+local day boundaries: a civil day may contain 23 or 25 elapsed hours. Unknown
+coverage returns `:unknown` for the interval, and a valid fully skipped interval
+returns `{:status :known :windows []}`. Coordinates use the same seconds axis;
+the supplied zone decides their civil meaning.
+
 The reader supports version 1–4 POSIX-timescale transition tables and fixed
 POSIX footers. Recurring POSIX footers are currently unmodelled: conversion at
 or beyond their final table transition returns `:unknown`. Empty future rules
