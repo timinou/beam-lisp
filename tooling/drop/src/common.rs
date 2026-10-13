@@ -9,9 +9,9 @@ pub const TRAILER_LEN: usize = 8 + 8 + 32 + 1 + 1 + 2 + 4;
 
 /// Eval-mode entry handed to the release's `bin/bl eval`.
 /// Trailing args land in System.argv() verbatim (a `--` would leak into argv —
-/// verified empirically); AOT.boot/0 starts the substrate on demand, so
-/// "apps not started" in eval mode is irrelevant.
-pub const CLI_ENTRY: &str = "BeamLisp.Ns.Bl.Cli.main(System.argv())";
+/// verified empirically). The CLI entry starts the supervised application using
+/// the native launcher's shared policy; eval-mode releases start no apps for it.
+pub const CLI_ENTRY: &str = "BeamLisp.Launcher.start_app!(System.argv(), %{})";
 
 /// The layout names shared by the launcher, the packer, and the store. One
 /// spelling each, so a rename cannot drift between the two that read them.

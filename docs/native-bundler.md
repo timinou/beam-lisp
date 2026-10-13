@@ -132,12 +132,14 @@ magic check) and fails loudly on a host-only payload — the classic
    its tree for its whole life, so deleting a tree some process runs from kills
    it with `Can not execute …/erts-*/bin/inet_gethost : enoent`.
 4. **Exec**:
-   * unix: `execve("<install>/<sha8>/bin/bl", ["bl", "eval", ENTRY, "--", …argv])`
-     where `ENTRY = BeamLisp.Ns.Bl.Cli.main(System.argv())`
+   * unix: `execve("<install>/<sha8>/bin/bl", ["bl", "eval", ENTRY, …argv])`
+     where `ENTRY = BeamLisp.Launcher.start_app!(System.argv(), %{})`
    * windows: `CreateProcess` on `bin\bl.bat` with the same arguments
    * `eval` mode loads all release code paths → `priv_dir(:beam_lisp)` resolves →
-     z3/native/explorer all findable; `AOT.boot/0` starts the substrate on demand,
-     so "apps not started" in eval mode is irrelevant.
+     z3/native/explorer all findable. The pinned host starts the supervised
+     application before entering a Lisp namespace, sharing source-launcher
+     startup, provisioning fallback and dispatch. A namespace shim can boot Env
+     before its body; entering it first would leave runtime services unsupervised.
 5. **Exit codes**: launcher forwards the child's exit status verbatim;
    126/127 reserved for launcher failures (extraction failed / payload corrupt).
 6. **Signals**: unix launcher `execve`s (same pid), so Ctrl+C reaches the VM
@@ -224,7 +226,7 @@ surface; host-target drops are fully green including all NIFs.
   semantics), appended to the launcher, trailer written. Two packs of the same
   release are **byte-identical** (verified).
 * `drop-launcher` — validate → extract (zip-slip-guarded, atomic `.tmp` + rename)
-  → GC old versions → `execve bin/bl eval BeamLisp.Ns.Bl.Cli.main(System.argv()) …`.
+  → GC old versions → `execve bin/bl eval BeamLisp.Launcher.start_app!(System.argv(), %{}) …`.
   `maintenance directory|meta|uninstall` handled pre-extraction.
 
 Acceptance results (full tier: lang + datom crates + z3 + explorer):
@@ -245,9 +247,8 @@ Two release-integration findings baked into the design:
 1. **`mix release` strips beams by default**, which re-stamps every module —
    the AOT drift gate (`aot.ex stale?/2`) then rightly refuses them and every
    AOT namespace falls back to source recompilation. The `bl` release sets
-   `strip_beams: false`, and `cli.bl main` still pairs
-   `AOT.ensure_loaded` → `Loader.ensure_loaded` on `:no_module` as the loader
-   docstring prescribes. Defense in depth, both paths verified.
+   `strip_beams: false`; native startup delegates namespace loading to the
+   existing Loader/AOT freshness path after application supervision is ready.
 2. Trailing args after `bin/bl eval EXPR` land in `System.argv()` verbatim —
    a `--` separator LEAKS into argv (verified empirically), so the launcher
    does not add one.
