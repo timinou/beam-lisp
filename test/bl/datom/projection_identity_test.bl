@@ -1,0 +1,68 @@
+(ns datom.projection-identity-test
+ (:require [datom :as d] [datom.projection :as pj] [datom.reconcile :as rc]
+           [proc.reconcile :as pr] [proc.queue :as q] [proc.queue-runtime :as qr]))
+(def SCHEMA
+ [{:db/ident :scope/id :db/valueType :db.type/string :db/unique :db.unique/identity}
+  {:db/ident :scope/enabled :db/valueType :db.type/boolean}
+  {:db/ident :item/id :db/valueType :db.type/term :db/unique :db.unique/identity}
+  {:db/ident :item/scope :db/valueType :db.type/ref}
+  {:db/ident :item/rev :db/valueType :db.type/string}
+  {:db/ident :item/live :db/valueType :db.type/boolean}
+  {:db/ident :item/label :db/valueType :db.type/string}])
+(def spec {:source-key :item/id :active '[[?scope :scope/enabled true]]
+ :member '[[?scope :scope/id _] [?src :item/scope ?scope] [?src :item/live true]]
+ :revision '[[?src :item/rev ?rev]]})
+(def P (pj/projection :test/domain-identity spec))
+(defn world []
+ (let [c (d/connect (into SCHEMA pj/schema))
+       report (d/transact! c [{:db/id -1 :scope/id "hotel" :scope/enabled true}
+                              {:db/id -2 :item/id [:pms "hotel" "booking:001"] :item/scope -1 :item/rev "r1" :item/live true :item/label "Display label"}])]
+  {:conn c :scope (get (:tempids report) -1) :src (get (:tempids report) -2)}))
+(deftest domain-identity-drives-native-apply-revision-and-retirement
+ (let [{:keys [conn scope src]} (world) calls (atom []) retired (atom [])
+       opts {:scope-key "hotel" :concurrency 1
+             :apply (fn [row _] (swap! calls conj (:src-key row)) {:target "work"})
+             :retire (fn [row target] (swap! retired conj [(:src-key row) target]))}]
+  (try
+   (is (= [:pms "hotel" "booking:001"] (:src-key (rc/owed-row (d/db conn) P "hotel" scope src "r1"))))
+   (rc/drain! conn P scope opts)
+   (is (= [[:pms "hotel" "booking:001"]] @calls))
+   (is (empty? (pj/owed P (d/db conn) [] scope)))
+   (d/transact! conn [[:db/add src :item/rev "r2"]])
+   (rc/drain! conn P scope opts)
+   (is (= 2 (count @calls)))
+   (d/transact! conn [[:db/add src :item/live false]])
+   (rc/drain! conn P scope opts)
+   (is (= [[[:pms "hotel" "booking:001"] "work"]] @retired))
+   (finally (d/close! conn)))))
+(deftest configured-source-identities-must-be-native-identity-attributes
+ (let [{:keys [conn scope src]} (world)]
+  (try
+   (is (try (rc/owed-row (d/db conn) (pj/projection :test/not-an-identity (assoc spec :source-key :item/label)) "hotel" scope src "r1") false (catch _ true)))
+   (is (try (pj/projection :test/invalid-key (assoc spec :source-key "item/id")) false (catch _ true)))
+   (finally (d/close! conn)))))
+(deftest withdrawing-an-identity-retires-its-original-published-target
+ (let [{:keys [conn scope src]} (world) retired (atom [])
+       opts {:scope-key "hotel" :concurrency 1 :apply (fn [_ _] {:target "original-work"})
+             :retire (fn [row target] (swap! retired conj [(:src-key row) target]))}]
+  (try
+   (rc/drain! conn P scope opts)
+   (d/transact! conn [[:db/retract src :item/id [:pms "hotel" "booking:001"]]])
+   (rc/drain! conn P scope opts)
+   (is (= [[[:pms "hotel" "booking:001"] "original-work"]] @retired))
+   (finally (d/close! conn)))))
+(deftest queued-reconciliation-rejudges-the-configured-identity
+ (let [{:keys [conn scope]} (world) srv :domain-identity-queued
+       qc (d/connect []) calls (atom [])
+       cfg {:projection P :conn-fn (fn [_] conn) :scope-fn (fn [_ _] [[scope "hotel"]])
+            :rules [] :limit 10 :watch? false :apply (fn [row _] (swap! calls conj (:src-key row)) {:target "queued-work"})
+            :retire (fn [_ _] nil)}]
+  (q/attach-store! srv qc) (pr/register! srv cfg)
+  (let [handler (qr/prepare srv {:declaration {:of :test/domain-identity :generation "identity-v1"}
+                                :perform (fn [job] (pr/perform! srv job))})
+        pid (qr/start! handler)]
+   (try
+    (pr/pump! srv)
+    (loop [n 0] (when (and (empty? @calls) (< n 1000)) (Process/sleep 5) (recur (inc n))))
+    (is (= [[:pms "hotel" "booking:001"]] @calls))
+    (finally (qr/stop! srv) (pr/unwatch-all! srv) (d/close! conn) (d/close! qc))))))
