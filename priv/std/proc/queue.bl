@@ -1105,6 +1105,14 @@
        (= (:job/attempt-id claimed) (:job/attempt-id job))
        (some? (:job/owner claimed)) (> (:job/lease-until job 0) now)))
 
+(defn- attempt-clock [srv]
+  ;; Claims and checkpoints share the queue worker's supplied clock. A virtual
+  ;; epoch is neither a perpetually expired past lease nor a permanent future
+  ;; lease. Manually claimed callers retain the historical wall-clock default.
+  ;; Capture the function before entering a Datom writer's different process;
+  ;; evaluate it inside that writer so lease validity uses the commit instant.
+  (or (Process/get (tuple :bl-queue/attempt-clock (server-name srv))) tick/wall-ms))
+
 (defn commit-attempt!
   "Publish database effects only while this claimed attempt still owns its
    unexpired lease. Executes in the QUEUE store's writer; tx must target this
@@ -1113,10 +1121,10 @@
    critical provider checkpoints use explicit sync. Returns a refusal without executing tx
    when an old worker lost ownership."
   [srv claimed tx]
-  (let [c (conn srv)]
+  (let [c (conn srv) clock (attempt-clock srv)]
     (dc/serialized! c
       (fn []
-        (let [now (tick/wall-ms) j (datom/entity (datom/db c) (:db/id claimed))]
+        (let [now (clock) j (datom/entity (datom/db c) (:db/id claimed))]
           (if (owns-attempt? j claimed now)
             {:status :committed :report (datom/transact! c tx)}
             {:status :refused :kind :stale-attempt}))))))
@@ -1128,11 +1136,11 @@
   [srv claimed step transition]
   (when-not (or (keyword? step) (and (string? step) (> (count step) 0) (<= (count step) 128)))
     (throw (ex-info "Effect step must be a keyword or short nonempty string" {:kind :invalid-effect})))
-  (let [c (conn srv)]
+  (let [c (conn srv) clock (attempt-clock srv)]
     (dc/serialized! c
       (fn []
         (let [job (datom/entity (datom/db c) (:db/id claimed))]
-          (if-not (owns-attempt? job claimed (tick/wall-ms))
+          (if-not (owns-attempt? job claimed (clock))
             {:status :refused :kind :stale-attempt}
             (let [[result effect] (transition (get (:job/effects job) step) job)]
               (when effect
@@ -1606,18 +1614,20 @@
             captured (diag/with-linkage-fn (:job/diagnostic-context claimed {}) diag/capture)]
         (BeamLisp.Refs/spawn_owned (fn []
                  (when (:environment q) (BeamLisp.Env/bind (:environment q)))
+                 (Process/put (tuple :bl-queue/attempt-clock (server-name (:server q))) (:clock q))
                  (let [out (try
                              {:ok (diag/with-captured-fn captured #(body (assoc (job-map (assoc claimed :job/payload (:payload prepared)))
                                                    :job/execution-protocol (:protocol prepared)
                                                    :job/execution-generation (:generation decl))))}
                              (catch err {:error (error-text err) :failure (diag/safe-error err)}))]
                    (erlang/send me (tuple :bl-queue/finished ref out))))
-          :plain (to-list (concat (:modules q []) (BeamLisp.Env/callback_modules body))))
+          :plain (to-list (concat (:modules q []) (BeamLisp.Env/callback_modules body)
+                                  (BeamLisp.Env/callback_modules (:clock q)))))
         (emit-entry! {:diagnostics captured} :proc.queue/claimed {:proc.queue/attempt (:job/attempts claimed)})
         {:ref ref :diagnostics captured
          :e e
          :token token
-         :decl decl :generation (:generation decl)
+         :decl decl :generation (:generation decl) :clock (:clock q)
          :attempts (:job/attempts claimed)
          ;; the deadline this CLAIM will be judged by. Kept here as well as in
          ;; the store, because this process must know when its own claim stops
@@ -1665,12 +1675,15 @@
   (let [q (:queue st) c (conn (:server q))]
     (dc/serialized! c
       (fn []
-        (let [now ((:clock q)) e (:e entry) decl (:decl entry (:decl q))
+        (let [now ((:clock entry (:clock q))) e (:e entry) decl (:decl entry (:decl q))
               job (datom/entity (datom/db c) e)]
           (if (nil? job) :gone
+            (if-not (owns-attempt? job {:job/server (server-name (:server q))
+                                       :job/owner (:token entry) :job/attempt-id (:token entry)} now)
+              :expired-or-lost
             (let [tx (outcome-tx e job (:token entry) out now decl (:attempts entry))]
               (try (datom/transact! c tx) :settled
-                   (catch err (if (lose-race? err) :lost (throw err)))))))))))
+                   (catch err (if (lose-race? err) :lost (throw err))))))))))))
 
 (defn settle
   "Record one worker's outcome and stop tracking it. A ref this process is not

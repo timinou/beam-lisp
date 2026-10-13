@@ -1,0 +1,61 @@
+(ns proc.queue-clock-checkpoint-test
+ (:require [proc :as proc] [proc.queue :as q] [datom :as d] [datom.conn :as dc] [datom.store-map :as sm]))
+(def logical-now (atom 1000))
+(def release-worker (atom false))
+(def observed (atom nil))
+(defn run-job [job]
+
+  (reset! observed {:ready true :pid (erlang/self)})
+  (loop [] (when-not @release-worker (Process/sleep 1) (recur)))
+  (when (:test/expire? job) (swap! logical-now + 60001))
+  (let [effect (q/begin-effect! (:job/server job) job :provider)
+        publication (q/commit-attempt! (:job/server job) job [[:db/add (:db/id job) :job/result :authorized]])]
+   (when (= :submit (:status effect)) (q/record-effect! (:job/server job) job :provider :complete {:ok true}))
+   (reset! observed {:effect effect :publication publication :job (:db/id job) :pid (erlang/self)}))
+  (Process/sleep 30000))
+(proc/defserver checkpoint-past-clock-q
+ (queue {:of :test/checkpoint-clock :clock (fn [] @logical-now) :lease 60 :retry {:max 1}})
+ (handle-call :barrier [_from state] (reply :barrier state))
+ (perform [job] (run-job job)))
+(proc/defserver checkpoint-future-clock-q
+ (queue {:of :test/checkpoint-clock :clock (fn [] @logical-now) :lease 60 :retry {:max 1}})
+ (handle-call :barrier [_from state] (reply :barrier state))
+ (perform [job] (run-job job)))
+(defn await-observation [key]
+ (loop [n 0]
+  (cond (contains? @observed key) @observed
+        (> n 1000) (throw (ex-info "Queue clock observation timed out" {}))
+        :else (do (Process/sleep 5) (recur (inc n))))))
+(defn exercise [server srv now expire?]
+ (reset! logical-now now) (reset! release-worker false) (reset! observed nil)
+ (let [p (start server nil {})]
+  (try
+   (q/enqueue! srv {:test/expire? expire?} {:at now})
+   (await-observation :ready)
+   (is (= :barrier (call p :barrier)))
+   (reset! release-worker true)
+   (await-observation :effect)
+   (finally
+    (when-let [pid (:pid @observed)] (Process/exit pid :kill))
+    (stop p)))))
+(deftest checkpoint-and-publication-use-the-worker-logical-clock
+ (let [result (exercise checkpoint-past-clock-q :checkpoint-past-clock-q 1000 false)]
+  (is (= :submit (get-in result [:effect :status])))
+  (is (= :committed (get-in result [:publication :status])))
+  (is (= :complete (get-in (q/effects :checkpoint-past-clock-q (:job result)) [:provider :state])))))
+(deftest future-logical-clock-does-not-authorize-an-expired-attempt
+ (let [result (exercise checkpoint-future-clock-q :checkpoint-future-clock-q (+ (erlang/system_time :millisecond) 86400000) true)]
+  (is (= :refused (get-in result [:effect :status])))
+  (is (= :refused (get-in result [:publication :status])))
+  (is (empty? (q/effects :checkpoint-future-clock-q (:job result))))))
+(deftest settlement-cannot-publish-after-the-supplied-clock-lease-expires
+ (let [srv :expired-settlement-clock-q c (dc/connect-with (sm/open) []) now 1000]
+  (q/attach-store! srv c)
+  (d/transact! c [{:db/id -1 :queue/key (name srv)
+                  :queue/decl (assoc (q/normalise-decl {:of :test/expired-settlement}) :server (name srv))}])
+  (let [job (q/enqueue! srv {:test/value 1} {:at now}) claimed (q/claim! c job now 1000)
+        ref (erlang/make_ref) entry {:e (:db/id claimed) :token (:job/owner claimed) :attempts 1 :decl (q/normalise-decl {:of :test/expired-settlement})}
+        state {:queue {:server srv :clock (fn [] 2001) :running {ref entry}}}]
+   (q/settle state ref {:ok :too-late})
+   (is (= :running (:job/state (d/entity (d/db c) (:db/id job)))))
+   (is (nil? (:job/result (d/entity (d/db c) (:db/id job))))))))
