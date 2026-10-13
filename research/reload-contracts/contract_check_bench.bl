@@ -1,0 +1,76 @@
+; Measure the cost of generated safety, including code size and compilation.
+; No server is started; callback bodies are not executed.
+(ns research.contract-check-bench
+ (:require [compiler :as c] [lower :as lower] [proc.contract :as contract]
+           [anf :as a] [system.tier :as tier] [bl.json :as json]))
+
+(def source
+ "(defserver boundary_bench (init [_] (ok 3))
+    (handle-call [:take n] [_ balance] :when (and (int? n) (> n 0) (<= n balance))
+      (reply :taken (- balance n))))")
+(def helpers #{:__bl_contract__ :__bl_accept_call__ :__bl_accept_cast__ :__bl_accept_info__ :__bl_accept_continue__})
+(defn timed [action]
+ (let [start (System/monotonic_time :microsecond) value (action)]
+  [(- (System/monotonic_time :microsecond) start) value]))
+(defn samples [values]
+ (let [s (vec (sort values)) n (dec (count s))]
+  {:samples-us values :p50-us (nth s (erlang/div n 2)) :p95-us (nth s (erlang/div (* n 95) 100))}))
+(defn repeat-check [n action]
+ (loop [i n]
+  (when (pos? i)
+   (when-not (action) (throw (ex-info "Benchmark contract unexpectedly refused" {})))
+   (recur (dec i)))))
+
+(defn identity-counterexamples []
+ (when-let [path (System/get_env "BL_TIER_BASELINE")]
+  (BeamLisp.Env/with_ns (BeamLisp.Env/current_ns)
+   #(BeamLisp/eval (String/replace (File/read! path) "(ns system.tier\n" "(ns system.tier-contract-baseline\n")))
+  (let [old (BeamLisp.Env/fetch! "system.tier-contract-baseline" "alpha=")
+        record (a/structt :Elixir.FirstRecord (list [(a/lit :value) (a/lit 1)]))
+        frames (a/remote :erlang :raise (list (a/lit :error) (a/lit :badarg) a/enil))
+        cases [[:record-module record (assoc record :mod :Elixir.OtherRecord)]
+               [:exception-stack frames (assoc frames :stack-format :raw)]]
+        result (mapv (fn [[kind one other]] {:case kind :baseline (old one other) :current (tier/alpha= one other)}) cases)]
+   (when-not (every? #(and (= true (:baseline %)) (= false (:current %))) result)
+    (throw (ex-info "Native identity counterexample did not reproduce" {:result result})))
+   result)))
+
+(let [output (System/get_env "BL_CONTRACT_COST_OUTPUT")
+      _ (when-not output (throw (ex-info "Set BL_CONTRACT_COST_OUTPUT" {})))
+      node (c/compile-node (first (BeamLisp.Reader/read_string source)) (c/new-env "research.contract-check-bench"))
+      full (:val (first (:args (first (:stmts node)))))
+      baseline (-> full
+                  (update :clauses #(to-list (remove (fn [cl] (contains? helpers (:fname cl))) %)))
+                  (update :exports #(to-list (remove (fn [entry] (contains? helpers (first entry))) %))))
+      old (atom []) current (atom []) direct (atom []) checked (atom [])
+      module (BeamLisp/eval source) receipt (contract/snapshot module)
+      iterations 1000 identity-results (identity-counterexamples)]
+ (when-not (and (= :module (:op full)) receipt
+                 (= 5 (- (count (:exports full)) (count (:exports baseline)))))
+  (throw (ex-info "Benchmark requires five compiler-generated contract exports" {})))
+ (doseq [_ (range 2)] (lower/descriptor->beam baseline) (lower/descriptor->beam full))
+ (doseq [i (range 12)]
+  (if (zero? (erlang/rem i 2))
+   (do (swap! old conj (first (timed #(lower/descriptor->beam baseline))))
+       (swap! current conj (first (timed #(lower/descriptor->beam full)))))
+   (do (swap! current conj (first (timed #(lower/descriptor->beam full))))
+       (swap! old conj (first (timed #(lower/descriptor->beam baseline)))))))
+ (let [fast #(erlang/apply module :__bl_accept_call__ (list [:take 1] nil 3))
+       guarded #(contract/admit? receipt :call [:take 1] 3)]
+  (doseq [_ (range 2)] (repeat-check iterations fast) (repeat-check iterations guarded))
+  (doseq [i (range 12)]
+   (if (zero? (erlang/rem i 2))
+    (do (swap! direct conj (first (timed #(repeat-check iterations fast))))
+        (swap! checked conj (first (timed #(repeat-check iterations guarded)))))
+    (do (swap! checked conj (first (timed #(repeat-check iterations guarded))))
+        (swap! direct conj (first (timed #(repeat-check iterations fast))))))))
+ (let [result {:fixture "one state-dependent callback; valid BL vector; no business execution"
+               :compile {:baseline (samples @old) :generated (samples @current)
+                         :baseline-bytes (erlang/byte_size (elem (lower/descriptor->beam baseline) 1))
+                         :generated-bytes (erlang/byte_size (elem (lower/descriptor->beam full) 1))}
+               :admission {:iterations-per-sample iterations :direct-helper (samples @direct) :identity-checked-api (samples @checked)}
+               :order "paired alternating" :warmup-per-path 2
+               :identity-counterexamples identity-results
+               :scope "incremental safety cost; baseline removes only generated helpers from the same canonical descriptor; no page/startup speedup claim"}]
+  (File/write! output (json/encode result))
+  (println (json/encode result))))
