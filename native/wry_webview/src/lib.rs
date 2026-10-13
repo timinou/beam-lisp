@@ -108,6 +108,18 @@ struct WebViewHandle {
     join: Mutex<Option<JoinHandle<()>>>,
 }
 
+impl WebViewHandle {
+    fn is_closed(&self) -> bool {
+        // Tao's GTK sources can retain a channel receiver after run_return.
+        // A successful proxy send alone does not establish a live window.
+        // close holds this mutex while joining; never block a normal NIF on it.
+        match self.join.try_lock() {
+            Ok(join) => join.as_ref().map(JoinHandle::is_finished).unwrap_or(true),
+            Err(_) => true,
+        }
+    }
+}
+
 // A NIF return crosses a `catch_unwind`, which demands `RefUnwindSafe`.
 // `EventLoopProxy` only sends `UserEvent`s across the boundary and the join
 // handle is `Option`-guarded, so there is no shared mutable state a panic
@@ -118,7 +130,7 @@ impl std::panic::RefUnwindSafe for WebViewHandle {}
 impl Resource for WebViewHandle {}
 
 fn err(msg: impl std::fmt::Display) -> Error {
-    Error::Term(Box::new(format!("{}", msg)))
+    Error::RaiseTerm(Box::new(format!("{}", msg)))
 }
 
 /// The GDK display type of a Wayland client. Named once so the platform rule
@@ -497,6 +509,9 @@ fn run_window(
 /// surface as an error rather than a silent no-op.
 #[rustler::nif]
 fn webview_eval(handle: ResourceArc<WebViewHandle>, js: String) -> NifResult<bool> {
+    if handle.is_closed() {
+        return Err(err("window is closed"));
+    }
     handle
         .proxy
         .send_event(UserEvent::Eval(js))
@@ -514,6 +529,9 @@ fn webview_resize(
     width: f64,
     height: f64,
 ) -> NifResult<bool> {
+    if handle.is_closed() {
+        return Err(err("window is closed"));
+    }
     handle
         .proxy
         .send_event(UserEvent::Resize(width, height))
