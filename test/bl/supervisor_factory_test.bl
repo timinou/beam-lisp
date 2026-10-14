@@ -1,0 +1,134 @@
+(ns supervisor-factory-test
+ (:require [proc.super :as super] [reload.generation :as generation]))
+
+(def PROBE :Elixir.BeamLisp.SupervisorFactoryProbe)
+
+(defserver child
+ (init [args]
+  (when-let [observer (:observer args)] (erlang/send observer :child-started))
+  (ok args))
+ (handle-call :args [_from state] (reply state state)))
+
+(defn- await [pred]
+ (let [until (+ (erlang/monotonic_time :millisecond) 10000)]
+  (loop []
+   (cond (pred) true
+         (> (erlang/monotonic_time :millisecond) until) false
+         :else (do (Process/sleep 5) (recur))))))
+
+(defn- compile-probe! [directory]
+ (let [source (Path/join (erlang/list_to_binary (code/priv_dir :beam_lisp)) "host/supervisor.bl")
+       token (BeamLisp.Env/capture)]
+  (File/mkdir_p! directory)
+  (try
+   (let [result (BeamLisp.AOT/compile_host_file source
+                  (list (tuple :module PROBE) (tuple :output_dir directory)
+                    (tuple :source_hash (crypto/hash :sha256 (File/read! source))) (tuple :load? false)))
+         path (elem result 1)]
+    (code/load_binary PROBE (erlang/binary_to_list path) (File/read! path)))
+   (finally (BeamLisp.Env/bind token)))))
+
+(defn- start-probe [spec] (erlang/apply PROBE :start_link (list spec)))
+(defn- probe-child [args] (erlang/apply PROBE :server (list :child child args)))
+(defn- refusal [spec]
+ (try (let [pid (start-probe spec)] (Supervisor/stop pid) nil)
+  (catch error (or (:original error) (:__struct__ error) :refused))))
+
+(deftest native-factory-refuses-ambiguous-forged-and-invalid-specs-before-children
+ (let [directory (str (System/get_env "HOME") "/tmp/bl-supervisor-factory-"
+                     (erlang/unique_integer (list :positive)))
+       invocations (atom 0) parent (erlang/self)]
+  (try
+   (compile-probe! directory)
+   (let [factory (fn [] (swap! invocations inc) (list (probe-child {:observer parent})))
+         spec {:strategy :one-for-one :children-factory factory}
+         baseline (ets/info :beam_lisp_code_leases :size)]
+    (is (= :ambiguous_supervisor_children (refusal (assoc spec :children (list)))))
+    (is (= 0 @invocations))
+    (doseq [forged [nil :wrong (fn [_] nil)
+                    (tuple :"$blfn" {0 (fn [_] nil)} nil)
+                    (tuple :"$blfn" {0 (fn [] (list)) 1 (fn [_] (list))} nil)
+                    (tuple :"$blfn" {0 (fn [] (list))} (tuple 0 (fn [_] nil)))
+                    (tuple :"$blmacro" {0 (fn [] (list))} nil)
+                    (tuple :remote :Elixir.System :get_env)]]
+     (is (= :invalid_supervisor_children_factory
+          (refusal (assoc spec :children-factory forged)))))
+    (is (= 0 @invocations))
+    (is (some? (refusal (assoc spec :children-factory
+                          (fn [] (swap! invocations inc) :not-a-child-list)))))
+    (is (= 1 @invocations))
+    ;; A later malformed child is found before the earlier valid child starts.
+    (is (some? (refusal (assoc spec :children-factory
+                          (fn [] (swap! invocations inc)
+                            (list (probe-child {:observer parent}) :malformed-child))))))
+    (is (= 2 @invocations))
+    (is (= false (receive :child-started true (after 0 false))))
+    (is (= baseline (ets/info :beam_lisp_code_leases :size)))
+    (let [before (Process/get :bl_generation)]
+     (is (some? (refusal (assoc spec :children-factory
+                           (fn [] (Process/put :bl_generation {:unexpected :context})
+                             (throw (ex-info "synthetic factory failure" {})))))))
+     (is (= before (Process/get :bl_generation))))
+    (let [sup (start-probe spec)]
+     (try
+      (is (= 3 @invocations))
+      (is (= true (receive :child-started true (after 5000 false))))
+      (is (= {:observer parent} (call (super/child-of sup :child) :args)))
+      (is (> (ets/info :beam_lisp_code_leases :size) baseline))
+      (finally (Supervisor/stop sup)))))
+   (finally (code/purge PROBE) (code/delete PROBE) (File/rm_rf! directory)))))
+
+(defn- factory-event []
+ (receive [:factory-evaluated value] value (after 0 :none)))
+
+(deftest ordinary-declaration-prepares-without-effects-and-configures-once-at-owner-start
+ (let [previous (System/get_env "BL_SUPERVISOR_FACTORY_TEST")
+       observer-before (Process/get :factory-observer)
+       source (str "(ns supervisor.factory.app (:require [proc.super :as super])) "
+               "(defserver child (init [args] (ok args)) "
+               "(handle-call :args [_from state] (reply state state))) "
+               "(defn args [] (let [value (System/get_env \"BL_SUPERVISOR_FACTORY_TEST\")] "
+               "(when-let [observer (Process/get :factory-observer)] "
+               "(erlang/send observer [:factory-evaluated value])) {:value value})) "
+               "(super/defsupervisor tree (child :child child (args) {})) "
+               "(defn spec [] tree)")
+       graph (atom nil) supervisor (atom nil)]
+  (try
+   (Process/put :factory-observer (erlang/self))
+   (System/put_env "BL_SUPERVISOR_FACTORY_TEST" "prepare")
+   (reset! graph (try (generation/prepare! {:application-id "supervisor-factory-app"
+                                     :stable-namespaces #{"proc.super"}
+                                     :native-modules #{"System" "Process" "erlang"}
+                                     :sources {"supervisor.factory.app" source}})
+                    (catch error (println [:supervisor-factory-refused (ex-data error)]) (throw error))))
+   (is (= :none (factory-event)))
+   (let [spec (generation/invoke! @graph "supervisor.factory.app/spec" [])]
+    (is (contains? spec :children-factory))
+    (is (not (contains? spec :children)))
+    (reset! supervisor
+      (generation/with! @graph
+        (fn []
+          ;; Configure the selected application's captured overlay at the start
+          ;; boundary. A parent overlay change must not leak into another scope.
+          (System/put_env "BL_SUPERVISOR_FACTORY_TEST" "owner-start")
+          (start-link spec))))
+    (is (= "owner-start" (factory-event)))
+    (is (= :none (factory-event)))
+    (let [pid (super/child-of @supervisor :child)]
+     (is (= {:value "owner-start"} (call pid :args)))
+     (System/put_env "BL_SUPERVISOR_FACTORY_TEST" "after-start")
+     (Process/exit pid :kill)
+     (is (await #(not= pid (super/child-of @supervisor :child))))
+     (is (= {:value "owner-start"} (call (super/child-of @supervisor :child) :args)))
+     (is (= :none (factory-event))))
+    (is (= :waiting (:status (generation/retire! @graph))))
+    (Supervisor/stop @supervisor)
+    (reset! supervisor nil)
+    (is (await #(= :retired (:status (generation/retire! @graph))))))
+   (finally
+    (when @supervisor (Supervisor/stop @supervisor))
+    (when @graph (generation/retire! @graph))
+    (if previous (System/put_env "BL_SUPERVISOR_FACTORY_TEST" previous)
+      (System/delete_env "BL_SUPERVISOR_FACTORY_TEST"))
+    (if observer-before (Process/put :factory-observer observer-before)
+      (Process/delete :factory-observer))))))
