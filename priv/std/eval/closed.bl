@@ -1,0 +1,473 @@
+; Interpret a documented expression subset, never inherited compiled code.
+; All callable values are worker-owned interpreter capabilities. Native host
+; functions are reachable only through the explicit approved operation table.
+(ns eval.closed
+ (:require [eval.closed-syntax :as syntax] [reader-node :as rn]
+           [data.first-order :as data] [proc.fence :as fence]
+           [datom.query.functions :as query-functions]))
+
+(def ^:private DEFAULTS
+ {:timeout-ms 20000 :max-steps 1000000 :max-output-bytes 65536
+  :max-heap-words 16777216 :max-data-nodes 16384 :max-data-bytes 1048576
+  :max-capabilities 65536 :max-regexes 64})
+
+(defn- fail! [kind detail]
+ (throw (ex-info "Closed expression stopped" {:kind kind :detail detail})))
+(defn- failure
+ ;; Error data is untrusted too. Never call Exception.message/Inspect or a
+ ;; protocol on a thrown value, and never return arbitrary host ex-data.
+ [error fallback]
+ (let [raw (ex-data error) info (if (erlang/is_map raw) raw {})
+       kind (maps/get :kind info nil) detail (maps/get :detail info nil)
+       message (when (erlang/is_map error) (maps/get :message error nil))
+       tag (when (erlang/is_map error) (maps/get :__struct__ error nil))]
+  {:kind (if (and (erlang/is_atom kind) (not (erlang/== nil kind))) kind fallback)
+   :detail (cond
+             (erlang/is_binary detail) (String/slice detail 0 1024)
+             (or (erlang/is_atom detail) (and (erlang/is_number detail) (<= (erlang/external_size detail) 1024)))
+              (if (erlang/== nil detail)
+               (if (erlang/is_binary message) (String/slice message 0 1024)
+                {:exception (if (erlang/is_atom tag) tag :unknown)}) detail)
+             :else :opaque-error-detail)}))
+
+(defn- truthy? [value] (and (not (erlang/== nil value)) (not (erlang/== false value))))
+
+(defn- options! [options]
+ (when-not (and (erlang/is_map options) (not (erlang/is_map_key :__struct__ options)))
+  (fail! :invalid-policy nil))
+ (let [policy (merge DEFAULTS options) operations (get policy :operations {})]
+  (when-not (and (map? operations)
+                 (every? (fn [[name op]]
+                           (and (string? name) (<= (erlang/byte_size name) 256)
+                                (not (contains? syntax/PURE-NAMES (syntax/canonical-name name)))
+                                (or (fn? op) (and (map? op) (fn? (:fn op)))))) operations)
+                 (or (nil? (:before-worker policy)) (fn? (:before-worker policy)))
+                 (every? (fn [name] (let [n (get policy name)] (and (int? n) (pos? n))))
+                          [:timeout-ms :max-steps :max-output-bytes :max-heap-words :max-data-nodes :max-data-bytes :max-capabilities :max-regexes]))
+   (fail! :invalid-policy nil))
+  (assoc policy :operations operations)))
+
+(defn check
+ "Preflight the supported expression subset. Unknown names/definitions/native
+  interop/macros refuse throughout the tree; quote remains inert source data."
+ ([source] (check source {}))
+ ([source options]
+  (try
+   (let [policy (options! options)]
+    (syntax/forms! source (keys (:operations policy))) {:status :ready})
+   (catch e (let [diagnostic (failure e :reader-error)]
+              {:status :refused :reasons [(:detail diagnostic)] :kind (:kind diagnostic)})))))
+
+(defn- worker-get [key] (Process/get (tuple :closed-expression-state key)))
+(defn- worker-put! [key value]
+ (Process/put (tuple :closed-expression-state key) value) value)
+(defn- worker-update! [key f & arguments]
+ (worker-put! key (apply f (worker-get key) arguments)))
+
+(defn- interpret! [forms policy operation-state]
+ ;; Single-worker state belongs on this process's heap. Native mutable cells
+ ;; copy retained terms outside max_heap_size and can form closure/cell cycles.
+ (do
+  (doseq [[key value] {:steps 0 :output "" :capabilities {} :named {} :regexes 0}]
+   (worker-put! key value))
+  (letfn [(step! [] (when (> (worker-update! :steps inc) (:max-steps policy)) (fail! :step-limit nil)))
+          (cap [kind payload]
+            (when (>= (count (worker-get :capabilities)) (:max-capabilities policy)) (fail! :capability-limit nil))
+            (when (and (= :regex kind) (> (worker-update! :regexes inc) (:max-regexes policy))) (fail! :regex-limit nil))
+            (let [id (erlang/make_ref)]
+             (worker-update! :capabilities assoc id (assoc payload :kind kind)) (tuple :closed-expression id)))
+          (named-cap [kind name]
+            (or (get (worker-get :named) [kind name])
+                (let [value (cap kind {:name name})] (worker-update! :named assoc [kind name] value) value)))
+          (descriptor [value]
+            (when (and (erlang/is_tuple value) (= 2 (erlang/tuple_size value))
+                       (erlang/== :closed-expression (elem value 0)) (erlang/is_reference (elem value 1)))
+             (or (get (worker-get :capabilities) (elem value 1)) (fail! :foreign-capability nil))))
+          (first-order! [value]
+            (data/check! value {:max-nodes (:max-data-nodes policy) :max-bytes (:max-data-bytes policy)}))
+          (map-key! [key]
+            (when (erlang/== :__struct__ key) (fail! :foreign-struct nil)) key)
+          (emit! [text]
+            (when (> (+ (erlang/byte_size (worker-get :output)) (erlang/byte_size text)) (:max-output-bytes policy))
+             (fail! :output-limit nil))
+            (worker-update! :output str text) nil)
+          (sequence-cap [f] (cap :sequence {:pull f :state :pending}))
+          (sequence-of [value]
+            (let [d (descriptor value)]
+             (cond
+              (and d (= :sequence (:kind d))) value
+              d (fail! :expected-sequence (:kind d))
+              (erlang/== nil value) nil
+              (erlang/is_list value)
+               (when-not (erlang/== (list) value)
+                (sequence-cap (fn [] [(erlang/hd value) (erlang/tl value)])))
+              (vector? value) (sequence-of (BeamLisp.Vector/to_list value))
+              (set? value) (sequence-of (BeamLisp.Set/to_list value))
+              (and (erlang/is_map value) (not (erlang/is_map_key :__struct__ value)))
+               (sequence-of (mapv (fn [[k v]] [k v]) value))
+              (string? value) (sequence-of (String/codepoints value))
+              :else (fail! :expected-sequence nil))))
+          (pull [value]
+            (step!)
+            (when-let [s (sequence-of value)]
+             (let [d (descriptor s)]
+              (case (:state d)
+               :realized (:value d)
+               :forcing (fail! :recursive-sequence nil)
+               (do (worker-update! :capabilities assoc-in [(elem s 1) :state] :forcing)
+                   (let [value ((:pull d))]
+                    (worker-update! :capabilities update (elem s 1) assoc :state :realized :value value) value))))))
+          (realize [value]
+            (loop [s value acc []]
+             (when (> (count acc) (:max-data-nodes policy)) (fail! :collection-limit nil))
+             (if-let [next (pull s)] (recur (second next) (conj acc (first next))) acc)))
+          (export [value depth]
+            (step!)
+            (when (> depth 64) (fail! :data-depth nil))
+            (if-let [d (descriptor value)]
+             (if (= :sequence (:kind d)) (to-list (mapv #(export % (inc depth)) (realize value)))
+              (fail! :opaque-result (:kind d)))
+             (cond
+              (vector? value) (mapv #(export % (inc depth)) value)
+              (set? value) (BeamLisp.Set/new (to-list (mapv #(export % (inc depth)) (BeamLisp.Set/to_list value))))
+              (erlang/is_list value) (to-list (mapv #(export % (inc depth)) value))
+              (and (erlang/is_map value) (not (erlang/is_map_key :__struct__ value)))
+               (into {} (map (fn [[k v]] [(map-key! (export k (inc depth))) (export v (inc depth))]) value))
+              :else value)))
+          (printed [value readable?]
+            (let [v (first-order! (export value 0))
+                  text (if (and (not readable?) (string? v)) v (BeamLisp.Ns.Rt/print_str v))]
+             (when (> (erlang/byte_size text) (:max-output-bytes policy)) (fail! :output-limit nil)) text))
+          (quoted [node]
+            (step!)
+            (let [form (rn/node-form node) items (syntax/children node)]
+             (case (rn/node-tag form)
+              :scalar form :keyword (syntax/keyword-value (rn/node-name form))
+              :symbol (tuple :symbol (rn/node-name form))
+              :list (to-list (mapv quoted items))
+              :vector (mapv quoted items)
+              :set (BeamLisp.Set/new (to-list (mapv quoted items)))
+              :map (into {} (map (fn [pair] [(map-key! (quoted (elem pair 0))) (quoted (elem pair 1))])
+                                   (rn/node-items form)))
+              (fail! :reader-form (rn/node-tag form)))))
+          (body [nodes locals]
+            (reduce (fn [_ node] (evaluate node locals)) nil nodes))
+          (bind-arguments [parameters arguments locals]
+            (let [fixed (:fixed parameters) size (count fixed) rest-name (:rest parameters)]
+             (when-not (if rest-name (>= (count arguments) size) (= (count arguments) size))
+              (fail! :arity :function))
+             (cond-> (into locals (map (fn [name value] [name value]) fixed (take size arguments)))
+               rest-name (assoc rest-name (to-list (drop size arguments))))))
+          (invoke [function arguments]
+            (step!)
+            (if-let [d (descriptor function)]
+             (case (:kind d)
+              :primitive (primitive (:name d) arguments)
+              :host
+               (let [name (:name d) entry (get (:operations policy) name)
+                     f (if (map? entry) (:fn entry) entry)
+                     read? (and (map? entry) (erlang/== :read (:effect entry)))
+                     data-arguments (mapv #(first-order! (export % 0)) arguments)
+                     previous @operation-state]
+                ;; A safe intermediate write result is not a delivered cell
+                ;; result. Preserve the last unknown operation through a later
+                ;; read/pure tail failure or lost final reply; never auto-replay.
+                (when (or (not read?) (nil? previous) (erlang/== :read (:effect previous)))
+                 (reset! operation-state {:operation name :effect (if read? :read :unknown) :status :submitted}))
+                (let [result (query-functions/with-only #(apply f data-arguments))]
+                 (first-order! result)
+                 (if read?
+                  (when (erlang/== :read (:effect @operation-state)) (reset! operation-state nil))
+                  (reset! operation-state {:operation name :effect :unknown :status :result-verified}))
+                 result))
+              :closure
+               (loop [arguments arguments]
+                (let [result (body (:body d) (bind-arguments (:parameters d) arguments (:locals d)))
+                      control (descriptor result)]
+                 (if (= :recur (:kind control)) (recur (:arguments control)) result)))
+              :composed
+               (case (:operator d)
+                :constantly (first (:arguments d))
+                :partial (invoke (first (:arguments d)) (into (vec (rest (:arguments d))) arguments))
+                :complement (not (truthy? (invoke (first (:arguments d)) arguments)))
+                :comp (let [functions (reverse (:arguments d))]
+                        (if (empty? functions) (do (when-not (= 1 (count arguments)) (fail! :arity :comp)) (first arguments))
+                         (reduce (fn [value f] (invoke f [value])) (invoke (first functions) arguments) (rest functions)))))
+              (fail! :not-callable (:kind d)))
+             (cond
+              (keyword? function) (do (when-not (contains? #{1 2} (count arguments)) (fail! :arity :keyword))
+                                     (BeamLisp.Ns.Rt/get (first arguments) function (second arguments)))
+              (map? function) (do (when-not (contains? #{1 2} (count arguments)) (fail! :arity :map))
+                                 (BeamLisp.Ns.Rt/get function (first arguments) (second arguments)))
+              (vector? function) (do (when-not (= 1 (count arguments)) (fail! :arity :vector))
+                                    (BeamLisp.Vector/nth function (first arguments)))
+              (set? function) (do (when-not (= 1 (count arguments)) (fail! :arity :set))
+                                 (when (BeamLisp.Set/member? function (first arguments)) (first arguments)))
+              :else (fail! :not-callable nil))))
+          (lazy-map [function value]
+            (sequence-cap (fn []
+                            (when-let [next (pull value)]
+                             [(invoke function [(first next)]) (lazy-map function (second next))]))))
+          (lazy-filter [function value keep?]
+            (sequence-cap (fn []
+                            (loop [s value]
+                             (when-let [next (pull s)]
+                              (if (= keep? (truthy? (invoke function [(first next)])))
+                               [(first next) (lazy-filter function (second next) keep?)]
+                               (recur (second next))))))))
+          (lazy-keep [function value]
+            (sequence-cap (fn []
+                            (loop [s value]
+                             (when-let [next (pull s)]
+                              (let [value (invoke function [(first next)])]
+                               (if (nil? value) (recur (second next))
+                                [value (lazy-keep function (second next))])))))))
+          (lazy-iterate [function value]
+            (sequence-cap (fn []
+                            [value (sequence-cap (fn [] (pull (lazy-iterate function (invoke function [value])))))])))
+          (lazy-take [n value]
+            (when (pos? n)
+             (sequence-cap (fn []
+                             (when-let [next (pull value)]
+                              [(first next) (lazy-take (dec n) (second next))])))))
+          (lazy-drop [n value]
+            (sequence-cap (fn []
+                            (loop [n n s value]
+                             (let [next (pull s)]
+                              (when next (if (pos? n) (recur (dec n) (second next)) next)))))))
+          (lazy-concat [values]
+            (sequence-cap (fn []
+                            (loop [remaining values]
+                             (when (seq remaining)
+                              (if-let [next (pull (first remaining))]
+                               [(first next) (lazy-concat (cons (second next) (rest remaining)))]
+                               (recur (rest remaining))))))))
+          (lazy-range [start end increment]
+            (when (or (nil? end) (if (pos? increment) (< start end) (> start end)))
+             (sequence-cap (fn [] [start (lazy-range (+ start increment) end increment)]))))
+          (regex [value]
+            (if-let [d (descriptor value)]
+             (if (= :regex (:kind d)) (:pattern d) (fail! :expected-regex nil))
+             (do (when-not (string? value) (fail! :expected-regex nil)) (Regex/compile! value))))
+          (match-shape [result]
+            (cond (nil? result) nil (= 1 (count result)) (first result) :else (vec result)))
+          (number! [value]
+            (when-not (and (erlang/is_number value) (<= (erlang/external_size value) 1024))
+             (fail! :numeric-limit nil)) value)
+          (arity! [arguments choices]
+            (when-not (contains? choices (count arguments)) (fail! :arity nil)))
+          (format-text [template arguments]
+            (when-not (string? template) (fail! :format nil))
+            (loop [chars (String/codepoints template) args arguments result ""]
+             (when (> (erlang/byte_size result) (:max-output-bytes policy)) (fail! :output-limit nil))
+             (if (empty? chars)
+              (do (when (seq args) (fail! :arity :format)) result)
+              (if (not= "%" (first chars)) (recur (rest chars) args (str result (first chars)))
+               (let [directive (second chars)]
+                (cond
+                 (= "%" directive) (recur (drop 2 chars) args (str result "%"))
+                 (contains? #{"s" "d"} directive)
+                  (do (when (empty? args) (fail! :arity :format))
+                      (let [text (if (= "s" directive) (printed (first args) false)
+                                   (do (when-not (erlang/is_integer (first args)) (fail! :format :integer-required))
+                                       (erlang/integer_to_binary (first args))))]
+                       (recur (drop 2 chars) (rest args) (str result text))))
+                 :else (fail! :unsupported-format directive)))))))
+          (primitive [name args]
+            (step!)
+            (let [a (first args) b (second args) c (nth args 2 nil)]
+             (case name
+              "+" (reduce (fn [x y] (number! (erlang/+ (number! x) (number! y)))) 0 args)
+              "*" (reduce (fn [x y] (number! (erlang/* (number! x) (number! y)))) 1 args)
+              "-" (do (when (empty? args) (fail! :arity name))
+                       (if (= 1 (count args)) (number! (erlang/- (number! a)))
+                        (reduce (fn [x y] (number! (erlang/- (number! x) (number! y)))) a (rest args))))
+              "/" (do (when (empty? args) (fail! :arity name))
+                       (reduce (fn [x y] (number! (erlang// (number! x) (number! y))))
+                               (if (= 1 (count args)) 1 a) (if (= 1 (count args)) args (rest args))))
+              "inc" (do (arity! args #{1}) (number! (erlang/+ (number! a) 1)))
+              "dec" (do (arity! args #{1}) (number! (erlang/- (number! a) 1)))
+              "quot" (do (arity! args #{2}) (erlang/div (number! a) (number! b)))
+              "rem" (do (arity! args #{2}) (erlang/rem (number! a) (number! b)))
+              "mod" (do (arity! args #{2}) (mod (number! a) (number! b)))
+              "abs" (do (arity! args #{1}) (erlang/abs (number! a)))
+              "min" (reduce min args) "max" (reduce max args)
+              "=" (every? #(= (first-order! (export a 0)) (first-order! (export % 0))) (rest args))
+              "not=" (not (primitive "=" args))
+              "<" (every? (fn [[x y]] (< x y)) (partition 2 1 args))
+              "<=" (every? (fn [[x y]] (<= x y)) (partition 2 1 args))
+              ">" (every? (fn [[x y]] (> x y)) (partition 2 1 args))
+              ">=" (every? (fn [[x y]] (>= x y)) (partition 2 1 args))
+              "not" (not (truthy? a)) "boolean" (truthy? a)
+              "nil?" (erlang/== nil a) "some?" (not (erlang/== nil a))
+              "true?" (erlang/== true a) "false?" (erlang/== false a)
+              "number?" (erlang/is_number a) "int?" (erlang/is_integer a) "string?" (erlang/is_binary a)
+              "keyword?" (keyword? a) "symbol?" (symbol? a) "vector?" (vector? a)
+              "map?" (map? a) "list?" (erlang/is_list a)
+              "coll?" (boolean (or (= :sequence (:kind (descriptor a))) (coll? a)))
+              "fn?" (contains? #{:primitive :host :closure :composed} (:kind (descriptor a)))
+              "identity" a
+              "constantly" (do (arity! args #{1}) (cap :composed {:operator :constantly :arguments args}))
+              "partial" (do (when (empty? args) (fail! :arity name)) (cap :composed {:operator :partial :arguments args}))
+              "complement" (do (arity! args #{1}) (cap :composed {:operator :complement :arguments args}))
+              "comp" (cap :composed {:operator :comp :arguments args})
+              "vector" (vec args) "list" (to-list args)
+              "hash-map" (do (when (odd? (count args)) (fail! :arity name))
+                             (into {} (map (fn [[k v]] [(map-key! k) v]) (partition 2 args))))
+              "hash-set" (BeamLisp.Set/new (to-list args))
+              "get" (do (arity! args #{2 3}) (when (descriptor a) (fail! :opaque-lookup nil))
+                        (BeamLisp.Ns.Rt/get a b c))
+              "get-in" (reduce (fn [out key] (primitive "get" [out key c])) a (realize b))
+              "assoc" (do (when (or (< (count args) 3) (even? (count args))) (fail! :arity name))
+                          (reduce (fn [out [k v]] (BeamLisp.Ns.Rt/assoc out (map-key! k) v)) a (partition 2 (rest args))))
+              "dissoc" (reduce (fn [out k] (dissoc out k)) a (rest args))
+              "conj" (reduce (fn [out item] (BeamLisp.Ns.Rt/conj out item)) a (rest args))
+              "contains?" (do (arity! args #{2}) (when (descriptor a) (fail! :opaque-lookup nil))
+                               (contains? a b))
+              "keys" (to-list (keys a)) "vals" (to-list (vals a))
+              "select-keys" (select-keys a (realize b)) "merge" (apply merge args)
+              "count" (count (realize a))
+              "first" (first (pull a)) "second" (first (pull (second (pull a))))
+              "last" (last (realize a))
+              "nth" (do (arity! args #{2 3}) (nth (realize (lazy-take (inc b) a)) b c))
+              "rest" (or (second (pull a)) (list)) "next" (let [tail (second (pull a))] (when (pull tail) tail))
+              "seq" (when (pull a) (sequence-of a)) "empty?" (nil? (pull a))
+              "map" (do (arity! args #{2}) (lazy-map a b))
+              "mapv" (vec (realize (lazy-map a b)))
+              "filter" (do (arity! args #{2}) (lazy-filter a b true))
+              "filterv" (vec (realize (lazy-filter a b true)))
+              "remove" (lazy-filter a b false)
+              "keep" (do (arity! args #{2}) (lazy-keep a b))
+              "take" (do (arity! args #{2}) (lazy-take (number! a) b))
+              "drop" (do (arity! args #{2}) (lazy-drop (number! a) b))
+              "concat" (lazy-concat args)
+              "range" (do (when (> (count args) 3) (fail! :arity name))
+                          (let [start (if (< (count args) 2) 0 a) end (if (= 1 (count args)) a b)
+                                increment (or c 1)]
+                           (when (= 0 increment) (fail! :invalid-range nil)) (lazy-range start end increment)))
+              "repeat" (if (= 1 (count args)) (sequence-cap (fn [] [a (primitive "repeat" args)]))
+                         (lazy-take a (primitive "repeat" [b])))
+              "iterate" (do (arity! args #{2}) (lazy-iterate a b))
+              "reduce" (do (arity! args #{2 3})
+                            (let [initial (if (= 2 (count args)) (pull b) [b c])]
+                             (if (nil? initial) (invoke a [])
+                              (loop [result (first initial) remaining (second initial)]
+                               (if-let [next (pull remaining)] (recur (invoke a [result (first next)]) (second next)) result)))))
+              "into" (reduce (fn [out item] (BeamLisp.Ns.Rt/conj out item)) a (realize b))
+              "vec" (vec (realize a)) "set" (BeamLisp.Set/new (to-list (realize a)))
+              "reverse" (to-list (reverse (realize a))) "sort" (to-list (sort (mapv #(first-order! (export % 0)) (realize a))))
+              "sort-by" (to-list (mapv second (sort-by first (mapv (fn [item] [(first-order! (export (invoke a [item]) 0)) item]) (realize b)))))
+              "group-by" (reduce (fn [out item] (let [k (map-key! (invoke a [item]))] (assoc out k (conj (get out k []) item)))) {} (realize b))
+              "frequencies" (reduce (fn [out item] (let [key (map-key! item)] (assoc out key (inc (get out key 0))))) {} (realize a))
+              "some" (loop [remaining b] (when-let [next (pull remaining)]
+                                           (let [result (invoke a [(first next)])] (if (truthy? result) result (recur (second next))))))
+              "every?" (loop [remaining b] (if-let [next (pull remaining)]
+                                            (if (truthy? (invoke a [(first next)])) (recur (second next)) false) true))
+              "apply" (do (when (< (count args) 2) (fail! :arity name))
+                          (invoke a (into (vec (butlast (rest args))) (realize (last args)))))
+              "str" (apply str (mapv #(if (erlang/== nil %) "" (printed % false)) args))
+              "format" (do (when (empty? args) (fail! :arity name)) (format-text a (rest args)))
+              "pr-str" (join " " (mapv #(printed % true) args))
+              "println" (emit! (str (join " " (mapv #(printed % false) args)) "\n"))
+              "print" (emit! (join " " (mapv #(printed % false) args)))
+              "name" (do (arity! args #{1})
+                         (when-not (or (keyword? a) (symbol? a) (string? a)) (fail! :expected-name nil)) (name a))
+              "namespace" (do (arity! args #{1})
+                              (when-not (or (keyword? a) (symbol? a)) (fail! :expected-name nil)) (namespace a))
+              "keyword" (do (arity! args #{1}) (syntax/keyword-value a))
+              "symbol" (do (arity! args #{1}) (when-not (string? a) (fail! :symbol nil)) (tuple :symbol a))
+              "subs" (do (arity! args #{2 3}) (if c (subs a b c) (subs a b)))
+              "re-pattern" (do (arity! args #{1}) (cap :regex {:pattern (regex a)}))
+              "re-find" (do (arity! args #{2}) (match-shape (Regex/run (regex a) b)))
+              "re-matches" (do (arity! args #{2}) (let [result (Regex/run (regex a) b)]
+                                                    (when (= b (first result)) (match-shape result))))
+              "re-seq" (do (arity! args #{2}) (sequence-of (mapv match-shape (Regex/scan (regex a) b))))
+              "str/upper-case" (String/upcase a) "str/lower-case" (String/downcase a) "str/trim" (String/trim a)
+              "str/includes?" (String/contains? a b) "str/starts-with?" (String/starts_with? a b) "str/ends-with?" (String/ends_with? a b)
+              "str/replace" (if-let [d (descriptor b)]
+                              (do (when-not (= :regex (:kind d)) (fail! :expected-regex nil)) (Regex/replace (:pattern d) a c))
+                              (String/replace a b c))
+              "str/split" (if-let [d (descriptor b)]
+                            (do (when-not (= :regex (:kind d)) (fail! :expected-regex nil)) (vec (Regex/split (:pattern d) a)))
+                            (vec (String/split a b)))
+              "str/join" (if (= 1 (count args)) (join "" (mapv #(printed % false) (realize a)))
+                           (join a (mapv #(printed % false) (realize b))))
+              (fail! :unsupported-operation name))))
+          (evaluate [node locals]
+            (step!)
+            (let [form (rn/node-form node) tag (rn/node-tag form) items (vec (syntax/children node)) call (syntax/head node)]
+             (case tag
+              :scalar form :keyword (syntax/keyword-value (rn/node-name form))
+              :symbol (let [name (rn/node-name form) canonical (syntax/canonical-name name)]
+                        (cond (contains? locals name) (get locals name)
+                              (contains? (:operations policy) name) (named-cap :host name)
+                              (contains? syntax/PURE-NAMES canonical) (named-cap :primitive canonical)
+                              :else (fail! :unknown-name name)))
+              :vector (mapv #(evaluate % locals) items)
+              :set (BeamLisp.Set/new (to-list (mapv #(evaluate % locals) items)))
+              :map (into {} (map (fn [pair] [(map-key! (evaluate (elem pair 0) locals)) (evaluate (elem pair 1) locals)]) (rn/node-items form)))
+              :list
+               (case call
+                "quote" (quoted (second items))
+                "fn" (let [named? (= :symbol (rn/node-tag (rn/node-form (second items)))) at (if named? 2 1)
+                           value (cap :closure {:parameters (syntax/parameter-names (get items at)) :body (subvec items (inc at)) :locals locals})]
+                       (when named? (worker-update! :capabilities update (elem value 1) update :locals assoc (syntax/label (second items)) value)) value)
+                "let" (let [bindings (vec (syntax/children (second items)))
+                            scope (reduce (fn [scope [name value]] (assoc scope (syntax/label name) (evaluate value scope))) locals (partition 2 bindings))]
+                        (body (subvec items 2) scope))
+                "loop" (let [bindings (vec (syntax/children (second items))) names (mapv syntax/label (map first (partition 2 bindings)))
+                             scope (reduce (fn [scope [name value]] (assoc scope (syntax/label name) (evaluate value scope))) locals (partition 2 bindings))]
+                         (loop [scope scope]
+                          (let [result (body (subvec items 2) scope) control (descriptor result)]
+                           (if (= :recur (:kind control)) (recur (into scope (map (fn [name value] [name value]) names (:arguments control)))) result))))
+                "recur" (cap :recur {:arguments (mapv #(evaluate % locals) (rest items))})
+                "if" (if (truthy? (evaluate (second items) locals)) (evaluate (get items 2) locals)
+                        (when (= 4 (count items)) (evaluate (get items 3) locals)))
+                "do" (body (rest items) locals)
+                "and" (loop [remaining (rest items) result true]
+                         (if (empty? remaining) result
+                          (let [value (evaluate (first remaining) locals)] (if (truthy? value) (recur (rest remaining) value) value))))
+                "or" (loop [remaining (rest items)]
+                        (when (seq remaining) (let [value (evaluate (first remaining) locals)]
+                                               (if (truthy? value) value (recur (rest remaining))))))
+                "when" (when (truthy? (evaluate (second items) locals)) (body (subvec items 2) locals))
+                "when-not" (when-not (truthy? (evaluate (second items) locals)) (body (subvec items 2) locals))
+                (if (empty? items) (list)
+                 (invoke (evaluate (first items) locals) (mapv #(evaluate % locals) (rest items)))))
+              (fail! :reader-form tag))))]
+   (try
+    (let [value (first-order! (export (body forms {}) 0)) text (printed value true)]
+     {:status :ok :value value :printed text :stdout (worker-get :output) :steps (worker-get :steps)})
+    (catch e
+     (let [inflight @operation-state]
+      (if (and inflight (not= :read (:effect inflight)))
+       {:status :operation-uncertain :operation (:operation inflight) :stdout (worker-get :output) :steps (worker-get :steps)}
+       (merge {:status :error :stdout (worker-get :output) :printed "" :steps (worker-get :steps)} (failure e :evaluation-error)))))))))
+
+(defn run
+ "Run interpreted expressions in one managed, deadline/heap-bounded worker.
+  :operations is the sole host authority; :before-worker binds trusted context.
+  There is no source compilation, namespace creation, inherited IO or macros.
+  Timeout during an unknown/effectful operation reports uncertainty, not proof
+  of cancellation. Unsupported syntax and unknown names refuse before effects."
+ ([source] (run source {}))
+ ([source options]
+  (try
+   (let [policy (options! options) operation-state (atom nil)
+         ;; Preflight before the caller's binder or any approved host operation.
+         forms (syntax/forms! source (keys (:operations policy)))
+         outcome (fence/fence-fn (:timeout-ms policy)
+                   (fn []
+                    (erlang/process_flag :max_heap_size {:size (:max-heap-words policy) :kill true :error_logger false :include_shared_binaries true})
+                    (when-let [bind (:before-worker policy)] (bind))
+                    (try (interpret! forms policy operation-state)
+                         (catch e (merge {:status :error :stdout "" :printed ""} (failure e :evaluation-error))))))]
+    (cond (:ok outcome) (:ok outcome)
+          (:timeout outcome) (if (and @operation-state (not= :read (:effect @operation-state)))
+                               {:status :operation-uncertain :operation (:operation @operation-state)}
+                               {:status :timeout})
+          :else (if (and @operation-state (not= :read (:effect @operation-state)))
+                  {:status :operation-uncertain :operation (:operation @operation-state)}
+                  {:status :error :kind :worker-exit})))
+   (catch e (let [diagnostic (failure e :reader-error)]
+              {:status :refused :kind (:kind diagnostic) :reasons [(:detail diagnostic)]})))))

@@ -1,0 +1,146 @@
+; Closed reader-node vocabulary. This module never expands a macro or resolves
+; a var, and reading a keyword does not authorize interning a new native atom.
+(ns eval.closed-syntax (:require [reader] [reader-node :as rn]))
+
+(def PURE-NAMES
+ #{"+" "-" "*" "/" "inc" "dec" "quot" "rem" "mod" "abs" "min" "max"
+   "=" "not=" "<" "<=" ">" ">=" "not" "nil?" "some?" "true?" "false?" "boolean"
+   "number?" "int?" "string?" "keyword?" "symbol?" "vector?" "map?" "list?" "coll?" "fn?"
+   "identity" "constantly" "comp" "partial" "complement"
+   "str" "pr-str" "format" "println" "print" "name" "namespace" "keyword" "symbol"
+   "vector" "list" "hash-map" "hash-set" "get" "get-in" "assoc" "dissoc" "conj" "contains?"
+   "keys" "vals" "select-keys" "merge" "count" "first" "second" "last" "nth" "rest" "next" "seq" "empty?"
+   "map" "mapv" "filter" "filterv" "remove" "keep" "take" "drop" "concat" "range" "repeat" "iterate"
+   "reduce" "into" "vec" "set" "reverse" "sort" "sort-by" "group-by" "frequencies" "some" "every?" "apply"
+   "re-pattern" "re-find" "re-matches" "re-seq"
+   "str/replace" "str/split" "str/join" "str/upper-case" "str/lower-case" "str/trim"
+   "str/includes?" "str/starts-with?" "str/ends-with?" "subs"})
+
+(defn canonical-name [name]
+ (cond
+  (String/starts_with? name "clojure.string/") (str "str/" (String/replace_prefix name "clojure.string/" ""))
+  (String/starts_with? name "clojure.re/") (String/replace_prefix name "clojure.re/" "")
+  (String/starts_with? name "clojure.core/") (String/replace_prefix name "clojure.core/" "")
+  :else name))
+
+(defn children [node]
+ (let [form (rn/node-form node)]
+  (case (rn/node-tag form)
+   :list (rn/node-items form) :vector (rn/node-items form) :set (rn/node-items form)
+   :map (mapcat (fn [pair] [(elem pair 0) (elem pair 1)]) (rn/node-items form)) [])))
+(defn label [node]
+ (let [form (rn/node-form node)]
+  (when (contains? #{:symbol :keyword} (rn/node-tag form)) (rn/node-name form))))
+(defn- literal-map! [node]
+ (when (= :map (rn/node-tag (rn/node-form node)))
+  (doseq [pair (rn/node-items (rn/node-form node))]
+   (let [key (rn/node-form (elem pair 0))]
+    (when (and (= :keyword (rn/node-tag key)) (= "__struct__" (rn/node-name key)))
+     (refuse! :foreign-struct nil))))))
+
+(defn head [node]
+ (when (= :list (rn/node-tag (rn/node-form node))) (label (first (children node)))))
+
+(defn refuse! [kind detail]
+ (throw (ex-info "Closed expression refused" {:kind kind :detail detail})))
+
+(defn keyword-value [name]
+ (try (erlang/binary_to_existing_atom name :utf8)
+      (catch _ (refuse! :unknown-keyword name))))
+
+(defn- source-budget! [source]
+ (when-not (and (string? source) (<= (erlang/byte_size source) 65536))
+  (refuse! :source-limit 65536))
+ ;; Bound nesting before recursive reader allocation. Strings/comments are
+ ;; inert here; the reader remains responsible for exact delimiter matching.
+ (loop [chars (String/codepoints source) depth 0 mode :code escaped false]
+  (when (seq chars)
+   (let [c (first chars)]
+    (cond
+     (= mode :comment) (recur (rest chars) depth (if (= c "\n") :code :comment) false)
+     (= mode :string) (recur (rest chars) depth (if (and (= c "\"") (not escaped)) :code :string)
+                                       (and (= c "\\") (not escaped)))
+     (= c ";") (recur (rest chars) depth :comment false)
+     (= c "\"") (recur (rest chars) depth :string false)
+     (contains? #{"(" "[" "{"} c) (do (when (>= depth 64) (refuse! :tree-depth 64))
+                                      (recur (rest chars) (inc depth) :code false))
+     (contains? #{")" "]" "}"} c) (recur (rest chars) (dec depth) :code false)
+     :else (recur (rest chars) depth :code false))))))
+
+(defn parameter-names [node]
+ (when-not (= :vector (rn/node-tag (rn/node-form node))) (refuse! :parameters :vector-required))
+ (let [names (mapv label (children node)) amp (first (keep-indexed #(when (= "&" %2) %1) names))]
+  (when-not (and (every? #(and (string? %) (not (String/contains? % "/"))) names)
+                (= (count names) (count (distinct names)))
+                (or (nil? amp) (= amp (- (count names) 2)))) (refuse! :parameters :simple-distinct-names))
+  {:fixed (if amp (subvec names 0 amp) names) :rest (when amp (last names))}))
+
+(defn forms!
+ "Validate every executable name before effects. Quote is inert data; lexical
+  variables can shadow ordinary spellings without borrowing an ambient var."
+ [source operation-names]
+ (source-budget! source)
+ (let [forms (vec (reader/read-string source nil)) remaining (atom 8192)
+       names (into PURE-NAMES operation-names)]
+  (letfn [(budget! [depth]
+            (when (or (> depth 64) (neg? (swap! remaining dec))) (refuse! :tree-limit 8192)))
+          (quoted! [node depth]
+            (budget! depth)
+            (literal-map! node)
+            (let [form (rn/node-form node) tag (rn/node-tag form)]
+             (when-not (contains? #{:scalar :keyword :symbol :list :vector :map :set} tag)
+              (refuse! :reader-form tag))
+             (when (= :keyword tag) (keyword-value (rn/node-name form)))
+             (doseq [child (children node)] (quoted! child (inc depth)))))
+          (body! [nodes locals recur-arity depth tail?]
+            (doseq [[index node] (map-indexed (fn [index node] [index node]) nodes)]
+             (walk node locals recur-arity (inc depth) (and tail? (= index (dec (count nodes)))))))
+          (bindings! [node body locals recur-arity depth tail? loop?]
+            (when-not (= :vector (rn/node-tag (rn/node-form node))) (refuse! :bindings :vector-required))
+            (let [items (vec (children node))]
+             (when (odd? (count items)) (refuse! :bindings :pairs-required))
+             (loop [remaining items scope locals]
+              (if (empty? remaining) (body! body scope (if loop? (quot (count items) 2) recur-arity) depth tail?)
+               (let [name (label (first remaining))]
+                (when-not (and (= :symbol (rn/node-tag (rn/node-form (first remaining)))) name
+                               (not (String/contains? name "/"))) (refuse! :bindings :simple-name-required))
+                (walk (second remaining) scope recur-arity (inc depth) false)
+                (recur (subvec remaining 2) (conj scope name)))))))
+          (walk [node locals recur-arity depth tail?]
+            (budget! depth)
+            (literal-map! node)
+            (let [form (rn/node-form node) tag (rn/node-tag form) items (vec (children node)) call (head node)]
+             (case tag
+              :scalar nil
+              :keyword (keyword-value (rn/node-name form))
+              :symbol (let [name (rn/node-name form)]
+                        (when-not (or (contains? locals name) (contains? names (canonical-name name)))
+                         (refuse! :unknown-name name)))
+              :list
+               (case call
+                "quote" (do (when-not (= 2 (count items)) (refuse! :arity :quote)) (quoted! (second items) (inc depth)))
+                "fn" (let [named? (= :symbol (rn/node-tag (rn/node-form (second items))))
+                           name (when named? (label (second items)))
+                           at (if named? 2 1) parameters (parameter-names (get items at))
+                           scope (into locals (concat (:fixed parameters) (when (:rest parameters) [(:rest parameters)]) (when name [name])))]
+                       (body! (subvec items (inc at)) scope (when-not (:rest parameters) (count (:fixed parameters))) depth true))
+                "let" (bindings! (second items) (subvec items 2) locals recur-arity depth tail? false)
+                "loop" (bindings! (second items) (subvec items 2) locals recur-arity depth true true)
+                "recur" (do (when-not (and tail? (some? recur-arity) (= recur-arity (dec (count items))))
+                              (refuse! :misplaced-recur nil))
+                             (body! (rest items) locals recur-arity depth false))
+                "if" (do (when-not (contains? #{3 4} (count items)) (refuse! :arity :if))
+                          (walk (second items) locals recur-arity (inc depth) false)
+                          (doseq [branch (subvec items 2)]
+                           (walk branch locals recur-arity (inc depth) tail?)))
+                "do" (body! (rest items) locals recur-arity depth tail?)
+                "and" (body! (rest items) locals recur-arity depth tail?)
+                "or" (body! (rest items) locals recur-arity depth tail?)
+                "when" (do (walk (second items) locals recur-arity (inc depth) false)
+                            (body! (subvec items 2) locals recur-arity depth tail?))
+                "when-not" (do (walk (second items) locals recur-arity (inc depth) false)
+                                (body! (subvec items 2) locals recur-arity depth tail?))
+                (body! items locals recur-arity depth false))
+              (if (contains? #{:vector :map :set} tag)
+               (body! items locals recur-arity depth false) (refuse! :reader-form tag)))))]
+   (body! forms #{} nil 0 false) forms)))
