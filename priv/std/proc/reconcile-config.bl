@@ -1,0 +1,122 @@
+; Owner-bound executable resources,not a mutable development catalogue.
+(ns proc.reconcile-config
+ (:require [proc.callback :as callback] [proc.lifetime :as lifetime]
+           [proc.queue :as queue] [reload.declaration :as declaration]
+           [reload.registry-data :as data] [reload.generation :as generation]))
+
+(def ^:private registrations (atom {}))
+(def ^:private receipts (atom {}))
+(def ^:private EXECUTION :proc.reconcile-config/execution)
+(defn- fail! [kind] (throw (ex-info "Reconciliation configuration refused" {:kind kind})))
+(defn- key-of [srv] (queue/server-name srv))
+(defn- locked [key action]
+ (BeamLisp.Env/with_generation_lock (tuple :proc.reconcile-config key) action))
+
+(defn resource-key
+ "Timers/history/watches belong to the admitted registration,not its replacement."
+ [srv]
+ (let [key (key-of srv) context (Process/get EXECUTION)
+       ticket (if (= key (:key context)) (:ticket context)
+                  (:ticket (get @registrations key)))]
+  (if ticket (tuple key ticket) key)))
+
+(defn registered? [srv] (contains? @registrations (key-of srv)))
+
+(defn available?
+ "A live registration,or a receipt whose factory belongs to the selected graph."
+ [srv]
+ (or (registered? srv)
+     (when (declaration/managed?)
+      (some? (declaration/lookup :reconcile (:descriptor (get @receipts (key-of srv))))))))
+
+(defn with-resources!
+ "Fence local resource creation against exact owner cleanup. An accepted task
+  may finish effects after owner death,but cannot install a new orphan watch."
+ [srv action]
+ (let [key (key-of srv) context (Process/get EXECUTION)
+       entry (if (= key (:key context)) context (get @registrations key))]
+  (if-let [state (:state entry)]
+   (locked key (fn []
+                (when (or (:closed @state) (not (Process/alive? (:owner @state))))
+                 (fail! :released-reconcile-owner))
+                (action)))
+   (action))))
+
+(defn- in-registration [key ticket state action]
+ (let [previous (Process/get EXECUTION)]
+  (try
+   (Process/put EXECUTION {:key key :ticket ticket :state state})
+   (action)
+   (finally (if previous (Process/put EXECUTION previous) (Process/delete EXECUTION))))))
+
+(defn register!
+ "Instantiate an exact declared factory only at owner start. Retain before
+  publication;an unpublished candidate never replaces a live owner's meaning.
+  Cleanup and accepted invocation have independent,explicit code leases."
+ ([srv descriptor policy dispatch cleanup]
+  (register! srv descriptor policy {} dispatch cleanup))
+ ([srv descriptor policy start-context dispatch cleanup]
+ (let [srv (queue/resolve-server srv) key (key-of srv) owner (erlang/self)
+       ticket (erlang/make_ref) state (atom {:closed false :owner owner})
+       factory (:provider (declaration/lookup :reconcile descriptor))]
+  (when-not (and (declaration/managed?) (fn? factory)) (fail! :missing-reconcile-declaration))
+  (when-not (queue/application-id srv) (fail! :missing-reconcile-application))
+  (data/entry "reconcile-policy" {:metadata policy})
+  (when-not (generation/runtime-value? start-context) (fail! :executable-reconcile-start-context))
+  (locked key
+   (fn []
+    (when-let [before (get @registrations key)]
+     (when (Process/alive? (:owner before)) (fail! :reconcile-owner-already-live)))
+    (when (and (not (contains? @receipts key)) (>= (count @receipts) 4096))
+     (fail! :reconcile-receipt-capacity))
+    (let [cfg (factory srv policy start-context)
+          _ (dispatch cfg :validate [])
+          registration (callback/register!
+                        (fn [operation args]
+                         (when (and (= :arm operation) (not= owner (erlang/self)))
+                          (fail! :wrong-reconcile-owner))
+                         (in-registration key ticket state #(dispatch cfg operation args))))
+          disposal (try
+                     (lifetime/register! owner
+                      (fn []
+                       (locked key
+                        (fn []
+                         (reset! state {:closed true :owner owner})
+                         (callback/unregister! registration)
+                         ;; Exact resource cleanup may run after a replacement.
+                         (cleanup (tuple key ticket))
+                         (when (= ticket (:ticket (get @registrations key)))
+                          (swap! registrations dissoc key))))))
+                     (catch error (callback/unregister! registration) (throw error)))
+          entry {:ticket ticket :owner owner :state state :registration registration :lifetime disposal}]
+     (try
+      (swap! receipts assoc key {:descriptor descriptor :policy policy :start-context start-context})
+      (swap! registrations assoc key entry)
+      {:status :registered :owner owner :ticket ticket}
+      (catch error
+       (callback/unregister! registration)
+       (throw error)))))))))
+
+(defn capture
+ "Capture one exact owner registration for a delayed queue performer."
+ [srv]
+ (or (:registration (get @registrations (key-of srv)))
+     (fail! :missing-reconcile-owner)))
+
+(defn invoke-registration! [registration operation args]
+ (let [result (callback/invoke! registration [operation args])]
+  (when (= :cancelled result) (fail! :released-reconcile-owner))
+  result))
+
+(defn invoke!
+ "Use a live owner,or reconstruct read-only status against the caller's exact
+  selected graph from bounded nonexecutable receipts. No development fallback."
+ [srv operation args dispatch]
+ (let [key (key-of srv)]
+  (if-let [entry (get @registrations key)]
+   (invoke-registration! (:registration entry) operation args)
+   (let [{:keys [descriptor policy start-context]} (get @receipts key)
+         factory (when (and (= :status operation) (declaration/managed?))
+                   (:provider (declaration/lookup :reconcile descriptor)))]
+    (when-not (fn? factory) (fail! :missing-reconcile-owner))
+    (dispatch (factory (queue/resolve-server srv) policy start-context) operation args)))))
