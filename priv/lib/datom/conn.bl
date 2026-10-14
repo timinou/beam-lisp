@@ -26,7 +26,7 @@
   (:require [datom.current] [datom.db] [datom.index] [datom.schema] [datom.store] [datom.store-ets]
             [datom.store-overlay] [datom.tx] [datom.broadcast] [datom.attr-basis] [env]
             [datom.blob] [datom.blob-ets] [datom.blob-fs] [datom.blob-overlay]
-            [datom.file] [datom.index-coverage] [datom.text] [datom.query.rank-build] [datom.query.rank-demand] [data.bounded-cache] [proc.admission :as admission]))
+            [datom.file] [datom.index-coverage] [datom.text] [datom.query.rank-build] [datom.query.rank-demand] [data.bounded-cache] [proc.admission :as admission] [reload.declaration :as declaration] [reload.execution :as execution] [proc.callback :as callback]))
 
 ;; ── env conveyance (PLAN-047 W1) ─────────────────────────────────────
 ;;
@@ -45,10 +45,20 @@
 ;; the same unique value twice.
 
 (defn- agent-get-and-update
-  "Agent/get_and_update with the caller's env conveyed into the action fn."
+  "Convey the caller's environment and keep rejected decisions out of Agent
+   crash semantics. An action returns {answer,next-state};an exception returns
+   its original error with unchanged Agent state,then raises in the caller."
   [agent f timeout]
-  (BeamLisp.Loader.Server/worker_call
-    (fn [delegate] (Agent/get_and_update agent (delegate f) timeout))))
+  (let [result (BeamLisp.Loader.Server/worker_call
+                 (fn [delegate]
+                  (Agent/get_and_update agent
+                   (delegate
+                    (fn [state]
+                     (try
+                      (let [decision (f state)]
+                       (tuple [:ok (elem decision 0)] (elem decision 1)))
+                      (catch error (tuple [:raised error] state))))) timeout)))]
+   (if (= :ok (first result)) (second result) (throw (second result)))))
 
 ;; ── id allocation ───────────────────────────────────────────────────
 ;;
@@ -305,6 +315,9 @@
    for a DIFFERENT one is refused. Bytes must have one home per database;
    a second tier would silently split the files between two places."
   [store initial-basis initial-schema requested-blobs]
+  (let [graph (execution/current)
+        creator (when (execution/owned?)
+                  (select-keys graph [:application-id :scope :digest]))]
   (agent-get-and-update
     (registry)
     (fn [reg]
@@ -329,11 +342,11 @@
                       :schema (atom initial-schema)
                       :schema-publication (atom nil)
                       :snapshot (atom (datom.db/db-value store initial-schema initial-basis blobs))
-                      :lifetime (atom :open)
+                      :lifetime (atom :open) :guard-creator creator
                       :subs (datom.broadcast/new-subs)
                       :blobs blobs}]
             (->tuple-2 cell (assoc reg k cell))))))
-    30000))
+    30000)))
 
 (defn- store-key
   "An identity for a store, stable across the connections that share it.
@@ -407,6 +420,30 @@
                  (erlang/erase :datom.conn/observing)
                  (erlang/put :datom.conn/observing previous))))))
 
+(defn- guard-entries [store]
+ (let [pid (erlang/whereis GUARD-REGISTRY)]
+  (if (= :undefined pid) {}
+   (Agent/get pid (fn [entries] (get entries (store-key store) {})) 30000))))
+(defn- guard-fail! [kind] (throw (ex-info "Transaction guard ownership refused" {:kind kind})))
+(defn- managed-guard? [entry] (and (map? entry) (= :managed-guard (:kind entry))))
+(defn- guards-for [conn]
+ (let [entries (guard-entries (:store conn)) managed? (declaration/managed?)
+       application (:application-id (Process/get :bl_generation))]
+  (mapv
+   (fn [[name entry]]
+    (if (managed-guard? entry)
+     (do
+      (when-not managed? (guard-fail! :managed-guard-context-required))
+      (when-not (= application (:application-id entry)) (guard-fail! :guard-application-mismatch))
+      (when-not (= (:lifetime conn) (:lifetime entry)) (guard-fail! :stale-guard-resource))
+      (when-not (= name (:guard-id entry)) (guard-fail! :invalid-store-guard-registration))
+      (or (:provider (declaration/lookup :guard name)) (guard-fail! :missing-guard-declaration)))
+     (do
+      (when managed? (guard-fail! :legacy-guard-adoption-required))
+      (when-not (fn? entry) (guard-fail! :invalid-store-guard-registration))
+      entry))) entries)))
+
+
 (defn- with-writer
   "Run `f` inside the connection's writer process, one caller at a time.
 
@@ -420,6 +457,8 @@
    hide a deadlock as a hang."
   [conn f]
   (writable-context!)
+  ;; Policy ownership is checked before enqueue and again inside the writer.
+  (guards-for conn)
   ; A dead writer must not disable the connection FOREVER. It holds no
   ; state — that is why it is neither linked nor supervised — so a
   ; replacement is as good as the original, and the alternative is that
@@ -485,7 +524,7 @@
 
 (defn- writer-operation [conn f]
   (let [prior (erlang/put :datom.conn/writing-store (:store conn))]
-    (try [:ok (f)]
+    (try (guards-for conn) [:ok (f)]
       (catch e [:raised e])
       (finally
         (if (= :undefined prior)
@@ -638,6 +677,61 @@
       (throw (ex-info "Managed store is not uniquely open in this VM" {:kind :store-not-ready})))
     (first matches)))
 
+(defn register-observer!
+ "Admit an exact observer ticket before listen/ready. Called by the observer;
+  its retained SDK drain registration must be live and owned by this process.
+  Admission and close share the actual connection-lifetime Agent fence."
+ [conn drain-registration]
+ (let [conn (lifetime-conn conn) owner (erlang/self) ticket (erlang/make_ref)
+       lease (:lease drain-registration) key (store-key (:store conn))]
+  (when-not (and (tuple? lease) (= 3 (erlang/tuple_size lease))
+                 (= owner (elem lease 1)) (callback/active? drain-registration))
+   (throw (ex-info "Observer drain must be retained by its actual process"
+                   {:kind :invalid-observer-registration})))
+  (agent-get-and-update (registry)
+   (fn [entries]
+    (let [cell (get entries key)]
+     (when-not (and cell (= (:lifetime conn) (:lifetime cell)) (= :open @(:lifetime cell)))
+      (throw (ex-info "Observer requires an open connection lifetime" {:kind :connection-closing})))
+     (let [live (into {} (filter (fn [[pid _]] (Process/alive? pid)) (:observers cell {})))]
+      (when (contains? live owner)
+       (throw (ex-info "Observer already registered for this lifetime" {:kind :observer-already-registered})))
+      (when (>= (count live) 4096)
+       (throw (ex-info "Connection observer capacity exhausted" {:kind :connection-observer-capacity})))
+      (tuple ticket (assoc entries key
+                     (assoc cell :observers
+                      (assoc live owner {:token ticket :drain drain-registration}))))))) 30000)))
+
+(defn unregister-observer!
+ "Release only this process's exact ticket. Closing is permitted so watch
+  finally cleanup can complete while release! waits outside the Agent."
+ [conn token]
+ (let [conn (lifetime-conn conn) owner (erlang/self) key (store-key (:store conn))]
+  (agent-get-and-update (registry)
+   (fn [entries]
+    (let [cell (get entries key) before (get-in cell [:observers owner])]
+     (tuple :released
+      (if (and cell (= (:lifetime conn) (:lifetime cell)) (= token (:token before)))
+       (assoc entries key (update cell :observers dissoc owner)) entries)))) 30000)))
+
+(defn- drain-observer! [pid observer]
+ (let [watch (Process/monitor pid)]
+  (try
+   (when (Process/alive? pid)
+    ;; Cancellation alone is not completion. Finally cleanup can release its
+    ;; stop ticket just before exit;only the exact monitor DOWN proves drain.
+    (callback/invoke! (:drain observer) [5000]))
+   (receive
+    [:DOWN seen :process stopped _] :when (and (= seen watch) (= stopped pid)) :drained
+    (after 5000
+     (throw (ex-info "Connection observer has not drained"
+                     {:kind :connection-observers-draining :observer pid}))))
+   (catch error
+    (if (= :connection-observers-draining (:kind (ex-data error))) (throw error)
+     (throw (ex-info "Connection observer drain is incomplete"
+                     {:kind :connection-observers-draining :observer pid :cause (ex-data error)}))))
+   (finally (Process/demonitor watch (list :flush))))))
+
 (defn release!
   "Forget everything the registry holds for this connection's store.
 
@@ -673,18 +767,25 @@
   (when (= (:store conn) (erlang/get :datom.conn/writing-store))
     (throw (ex-info "cannot release a connection inside its transaction" {:reason :release-in-writer})))
   (let [conn (lifetime-conn conn)
-        k (store-key (:store conn))
+        k (store-key (:store conn)) releaser (erlang/self)
         owned (agent-get-and-update
                 (registry)
                 (fn [reg]
                   (let [cell (get reg k)]
                     (if (and cell (= (:lifetime conn) (:lifetime cell)))
-                      (do (reset! (:lifetime cell) :closing)
-                          (->tuple-2 (select-keys cell [:writer :rank-worker]) reg))
+                      (do
+                          (when (contains? (:observers cell {}) releaser)
+                            (throw (ex-info "An observer cannot close its own observed connection"
+                                            {:kind :release-from-observer})))
+                          (reset! (:lifetime cell) :closing)
+                          (->tuple-2 (select-keys cell [:writer :rank-worker :observers]) reg))
                       (->tuple-2 nil reg))))
                 30000)
         worker (:rank-worker owned) writer (:writer owned)]
     (when (and worker (Process/alive? worker)) (Process/exit worker :shutdown))
+    ;; No observer is stopped while holding the registry Agent. A failed drain
+    ;; leaves this exact lifetime closing,its handles intact,and may be retried.
+    (doseq [[pid observer] (:observers owned)] (drain-observer! pid observer))
     ;; An unlinked process ignores exit(:normal). Stop the Agent outside the
     ;; registry action, so a finishing transaction can itself consult registry.
     (when (and writer (Process/alive? writer))
@@ -1269,7 +1370,9 @@
    hand-written transaction against one conn serialise against each
    other."
   [conn tx-data]
-  (with-writer conn (fn [] (load-facts-in-writer conn tx-data))))
+  (with-writer conn (fn [] (if (seq (guards-for conn))
+                           (transact-in-writer conn tx-data)
+                           (load-facts-in-writer conn tx-data)))))
 
 (defn with
   "Speculatively apply `tx-data` and return the report that WOULD result,
@@ -1317,64 +1420,110 @@
 ;; database the transaction would produce, and refusing it means nothing was
 ;; written. datahike's `datahike.tx-preds/register-tx-pred!` projects onto this.
 
-(defn guard!
-  "Register `pred` under `name` as a writer-run transaction guard on `conn`'s
-   store. `pred` is `(fn [report] -> nil | problems)`; a non-nil `problems`
-   aborts any transaction with `ex-info \"transaction refused\"`. Idempotent per
-   `[store name]`. Returns the store key."
-  [conn name pred]
-  (register-store-guard! (store-key (:store conn)) name pred))
+(defn- guard-resource! [conn]
+ (let [conn (lifetime-conn conn)
+       cell (Agent/get (registry) (fn [entries] (get entries (store-key (:store conn)))) 30000)]
+  (when-not (and cell (= (:lifetime conn) (:lifetime cell)) (= :open @(:lifetime cell)))
+   (guard-fail! :invalid-guard-resource))
+  [conn (:guard-creator cell)]))
 
-(defn unguard!
-  "Remove the guard registered under `name` on `conn`'s store."
-  [conn name]
-  (unregister-store-guard! (store-key (:store conn)) name))
+(defn register-declared-guard!
+ "Fixed SDK residual for the ordinary guard! API. The store remains a runtime
+  owner resource;only application/id/lifetime data enter its association table.
+  Each admitted writer resolves its own exact immutable guard declaration."
+ [conn name]
+ (when-not (declaration/managed?) (guard-fail! :managed-guard-context-required))
+ (let [application (:application-id (Process/get :bl_generation))
+       validated (guard-resource! conn) conn (first validated) creator (second validated)
+       selected (select-keys (execution/current) [:application-id :scope :digest])
+       key (store-key (:store conn))
+       entry {:kind :managed-guard :application-id application :guard-id name
+              :lifetime (:lifetime conn) :ticket (erlang/make_ref)}]
+  (when-not (and (string? application) (seq application)) (guard-fail! :missing-guard-application))
+  (when-not (:provider (declaration/lookup :guard name)) (guard-fail! :missing-guard-declaration))
+  (with-writer conn
+   (fn []
+    (agent-get-and-update (guard-registry)
+     (fn [all]
+      (let [entries (get all key {}) before (get entries name)]
+       (doseq [[_ value] entries]
+        (when-not (managed-guard? value) (guard-fail! :legacy-guard-adoption-required))
+        (when-not (= application (:application-id value)) (guard-fail! :guard-application-mismatch)))
+       (when (and (nil? before) (not= creator selected))
+        (guard-fail! :guard-resource-adoption-required))
+       (when (and before (not= (dissoc before :ticket) (dissoc entry :ticket)))
+        (guard-fail! :guard-owner-handover-required))
+       (tuple key (assoc all key (assoc entries name (or before entry)))))) 30000)))))
+
+(defn guard!
+ "Register a writer-run predicate. Managed literal named/closed callbacks are
+  automatically compiler-owned declarations;runtime dynamic registration refuses."
+ [conn name pred]
+ (declaration/require-development!)
+ (register-store-guard! (store-key (:store conn)) name pred))
+
+(defn unguard! [conn name]
+ (declaration/require-development!)
+ (unregister-store-guard! (store-key (:store conn)) name))
+
+(defn guard-owner
+ "Nonexecutable exact owner receipt for explicit lifecycle handover/removal."
+ [conn name]
+ (let [entry (get (guard-entries (:store conn)) name)] (when (managed-guard? entry) entry)))
+
+(defn remove-declared-guard!
+ "Explicit owner/data contract. Ordinary unguard! cannot erase managed policy;
+  its exact current receipt and a graph owning the guard declaration are needed."
+ [conn name expected]
+ (when-not (declaration/managed?) (guard-fail! :managed-guard-context-required))
+ (let [conn (first (guard-resource! conn)) application (:application-id (Process/get :bl_generation))
+       key (store-key (:store conn))]
+  (when-not (and (managed-guard? expected) (= name (:guard-id expected))
+                 (= application (:application-id expected)) (= (:lifetime conn) (:lifetime expected))
+                 (:provider (declaration/lookup :guard name)))
+   (guard-fail! :invalid-guard-owner-receipt))
+  (with-writer conn
+   (fn []
+    (agent-get-and-update (guard-registry)
+     (fn [all]
+      (let [entries (get all key {})]
+       (when-not (= expected (get entries name)) (guard-fail! :stale-guard-owner-receipt))
+       (let [next (dissoc entries name)]
+        (tuple :removed (if (empty? next) (dissoc all key) (assoc all key next)))))) 30000)))))
 
 (defn register-store-guard!
-  "Register `pred` as a guard on `store-k` (the store key, or any stable
-   per-store identity a shim supplies). datahike's `register-tx-pred!` keys by a
-   store id and registers ONE predicate; passing `:default` for `name` matches
-   that single-predicate shape while `guard!` allows several by name."
-  ([store-k pred] (register-store-guard! store-k :default pred))
-  ([store-k name pred]
-   (agent-get-and-update
-     (guard-registry)
-     (fn [reg]
-       (let [cur (get reg store-k {})]
-         (->tuple-2 store-k (assoc reg store-k (assoc cur name pred)))))
-     30000)))
+ ([store-k pred] (register-store-guard! store-k :default pred))
+ ([store-k name pred]
+  (declaration/require-development!)
+  (when-not (fn? pred) (guard-fail! :invalid-store-guard-registration))
+  (agent-get-and-update (guard-registry)
+   (fn [all]
+    (let [entries (get all store-k {})]
+     (when (some managed-guard? (vals entries)) (guard-fail! :managed-guard-context-required))
+     (tuple store-k (assoc all store-k (assoc entries name pred))))) 30000)))
 
 (defn unregister-store-guard!
-  "Remove a guard on `store-k`. With no `name`, removes the `:default` one."
-  ([store-k] (unregister-store-guard! store-k :default))
-  ([store-k name]
-   (agent-get-and-update
-     (guard-registry)
-     (fn [reg]
-       (let [cur (get reg store-k {})]
-         (->tuple-2 :ok (assoc reg store-k (dissoc cur name)))))
-     30000)))
+ ([store-k] (unregister-store-guard! store-k :default))
+ ([store-k name]
+  (declaration/require-development!)
+  (agent-get-and-update (guard-registry)
+   (fn [all]
+    (let [entries (get all store-k {})]
+     (when (some managed-guard? (vals entries)) (guard-fail! :managed-guard-context-required))
+     (tuple :ok (assoc all store-k (dissoc entries name))))) 30000)))
 
-(defn- guards-for
-  "The guard predicates registered on `store`, as a list, or `()`."
-  [store]
-  (let [reg (Agent/get (guard-registry) (fn [m] m))]
-    (vals (get reg (store-key store) {}))))
+(defn- run-guards! [conn report guards]
+ (reduce (fn [_ pred]
+           (let [problems (observing #(pred report))]
+            (when-not (nil? problems) (throw (ex-info "transaction refused" {:problems problems})))))
+         nil guards))
 
-(defn- run-guards!
-  "Run every guard on `conn`'s store over `report`. The FIRST guard whose result
-   is non-nil aborts with `ex-info \"transaction refused\"` carrying its problems;
-   all pass ⇒ nil. Called inside the writer, before the real commit."
-  [conn report]
-  (let [gs (guards-for (:store conn))]
-    (reduce (fn [_ pred]
-              (let [problems (pred report)]
-                (if (nil? problems)
-                  nil
-                  (throw (ex-info "transaction refused" {:problems problems})))))
-            nil gs)))
+(declare with-expanded-in-writer run-expanded-tx-pipeline)
 
-(defn- with-in-writer
+(defn- with-in-writer [conn tx-data]
+ (with-expanded-in-writer conn (datom.tx/expand-tx-fns (db conn) tx-data)))
+
+(defn- with-expanded-in-writer
   "The body of `with`, already inside the writer process. Mirrors
    `transact-in-writer`, but commits into an overlay and advances no
    basis: the speculative db-after reads at the overlay's fresh tx over a
@@ -1385,7 +1534,7 @@
         ; Bytes are speculative too: a staged file lands in a blob overlay
         ; the real blob store never sees, and db-after resolves through it.
         blob-overlay (datom.blob-overlay/open (:blobs conn))
-        result (run-tx-pipeline overlay blob-overlay (deref (:schema conn)) db-before tx-data)
+        result (run-expanded-tx-pipeline overlay blob-overlay (deref (:schema conn)) db-before tx-data)
         tx (get result :tx)]
     {:db-before db-before
      :db-after (datom.db/db-value overlay (deref (:schema conn)) tx blob-overlay)
@@ -1393,7 +1542,10 @@
      :tempids (get result :tempids)
      :tx-datoms (get result :tx-datoms)}))
 
-(defn- run-tx-pipeline
+(defn- run-tx-pipeline [store blobs schema db-before tx-data]
+ (run-expanded-tx-pipeline store blobs schema db-before (datom.tx/expand-tx-fns db-before tx-data)))
+
+(defn- run-expanded-tx-pipeline
   "The pure transaction pipeline over a store: expand, resolve tempids,
    expand store-ops, validate, allocate a tx id, realize and WRITE the
    datoms. Returns `{:tx :tempids :tx-datoms}`.
@@ -1409,12 +1561,7 @@
    `store` is committed to. For `transact!` that is the connection's real
    store; for `with` it is an overlay whose base is never touched."
   [store blobs schema db-before tx-data]
-  (let [; Transaction functions run FIRST, against the before-value, and
-        ; splice their output into the transaction data. Everything after
-        ; this line sees a flat tx-data with no :db/fn forms left — so a
-        ; tx-fn's datoms are resolved, validated and committed exactly
-        ; like hand-written ones, atomically with them.
-        expanded-tx-data (datom.tx/expand-tx-fns db-before tx-data)
+  (let [expanded-tx-data tx-data
         ops (datom.tx/expand schema expanded-tx-data)
         ; `:db/retractEntity` and `:db/cas` are questions about current
         ; state, so they expand AFTER tempid resolution (their entity is
@@ -1490,16 +1637,13 @@
    a unit. It is correct because exactly one process runs it at a time."
   [conn tx-data]
   (check-schema-publication! conn)
-  (let [; Guards run over the fully-resolved report BEFORE the real commit. When
-        ; any are registered, a speculative `with` builds the exact `:db-after`
-        ; and `:tx-datoms` the transaction would produce (over an overlay that
-        ; never touches the real store), the guards inspect it, and only if they
-        ; all pass does the real pipeline run. A refusal throws before a single
-        ; datom reaches the store — the whole point of a writer-run predicate.
-        _ (when (seq (guards-for (:store conn)))
-            (run-guards! conn (with-in-writer conn tx-data)))
+  (let [guards (guards-for conn)
         db-before (db conn)
-        result (run-tx-pipeline (:store conn) (:blobs conn) (deref (:schema conn)) db-before tx-data)
+        expanded (when (seq guards) (datom.tx/expand-tx-fns db-before tx-data))
+        _ (when (seq guards) (run-guards! conn (with-expanded-in-writer conn expanded) guards))
+        result (if (seq guards)
+                 (run-expanded-tx-pipeline (:store conn) (:blobs conn) (deref (:schema conn)) db-before expanded)
+                 (run-tx-pipeline (:store conn) (:blobs conn) (deref (:schema conn)) db-before tx-data))
         tx (get result :tx)]
     ; The basis is a HIGH-WATER MARK, not a variable. A bare `reset!`
     ; let a slower transaction with a LOWER id land last and rewind

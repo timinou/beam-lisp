@@ -1,0 +1,135 @@
+; Real conn/writer registration and guarded commit;no app adapter or manifest.
+(ns reload.guard-declaration-test
+ (:require [reload.generation :as g] [reload.execution :as execution] [env] [datom] [datom.conn :as conn] [datom.db :as db]))
+(defn- kind [f] (try (f) nil (catch e (:kind (ex-data e)))))
+(defn- options [application ceiling anonymous?]
+ (let [predicate (str "(fn [report] (when (> (or (:test/value (d/entity (:db-after report) 1)) 0) " ceiling
+                      ") {:ceiling " ceiling "}))")]
+  {:application-id application :stable-namespaces #{"datom" "datom.conn"}
+   :sources {"owned.guard"
+    (str "(ns owned.guard (:require [datom :as d] [datom.conn :as conn])) "
+         "(defn predicate [report] (when (> (or (:test/value (d/entity (:db-after report) 1)) 0) " ceiling
+         ") {:ceiling " ceiling "})) "
+         "(defn install! [c] (conn/guard! c :test/policy " (if anonymous? predicate "predicate") ")) "
+         (when-not anonymous? "(defn counted-install! [c counter] (conn/guard! (do (swap! counter inc) c) :test/policy predicate)) ")
+         "(defn write! [c value] (d/transact! c [[:db/add 1 :test/value value]])) "
+         "(defn counted-write! [c counter value] (d/transact! c [[:db/fn (fn [db] (swap! counter inc) [[:db/add 1 :test/value value]])]])) "
+         "(defn bulk! [c value] (d/load-facts! c [{:db/id 1 :test/value value}]))")}}))
+(defn- connection [] (datom/connect [{:db/ident :test/value :db/valueType :db.type/long}]))
+(defn- value-at [c] (db/attr-value (datom/db c) 1 :test/value))
+
+(deftest ordinary-guard-api-preserves-store-binding-and-resolves-exact-code
+ (let [old (g/prepare! (options "guard-owned-a" 10 false))
+       next (g/prepare! (options "guard-owned-a" 100 true))
+       other (g/prepare! (options "guard-owned-b" 20 false))
+       c (g/with! old #(connection)) b (g/with! other #(connection)) counter (atom 0) registry-pid (atom nil)]
+  (try
+   (g/invoke! old "owned.guard/install!" [c])
+   (g/invoke! other "owned.guard/install!" [b])
+   (reset! registry-pid (erlang/whereis :datom-guard-registry))
+   (let [before (conn/guard-owner c :test/policy)]
+    (is (g/runtime-value? before))
+    (g/invoke! next "owned.guard/install!" [c])
+    (is (= before (conn/guard-owner c :test/policy))))
+   (g/invoke! old "owned.guard/counted-install!" [c counter])
+   (is (= 1 @counter))
+   (reset! counter 0)
+   (g/invoke! old "owned.guard/counted-write!" [c counter 5])
+   (is (= 1 @counter))
+   (is (= 5 (value-at c)))
+   (g/invoke! next "owned.guard/write!" [c 50])
+   (is (= 50 (value-at c)))
+   (reset! counter 0)
+   (is (thrown? (g/invoke! old "owned.guard/counted-write!" [c counter 60])))
+   (is (= 1 @counter))
+   (is (= 50 (value-at c)))
+   (is (= :guard-application-mismatch (kind #(g/invoke! other "owned.guard/write!" [c 1]))))
+   (reset! counter 0)
+   (is (= :managed-guard-context-required
+          (kind #(datom/transact! c [[:db/fn (fn [_] (swap! counter inc) [[:db/add 1 :test/value 1]])]]))))
+   (is (zero? @counter))
+   (is (= 50 (value-at c)))
+   (is (= :managed-guard-context-required (kind #(conn/unguard! c :test/policy))))
+   (is (= :immutable-declaration-required (kind #(g/with! old (fn [] (conn/unguard! c :test/policy))))))
+   (is (= :managed-guard-context-required
+          (kind #(conn/register-store-guard! (:store c) :replacement (fn [_] nil)))))
+   (is (= @registry-pid (erlang/whereis :datom-guard-registry)))
+   (is (some? (conn/guard-owner c :test/policy)))
+   (is (some? (conn/guard-owner b :test/policy)))
+   (is (thrown? (g/invoke! old "owned.guard/bulk!" [c 80])))
+   (is (= 50 (value-at c)))
+   (g/invoke! other "owned.guard/write!" [b 15])
+   (is (= 15 (value-at b)))
+   (let [receipt (conn/guard-owner c :test/policy)]
+    (is (= :removed (g/with! next #(conn/remove-declared-guard! c :test/policy receipt))))
+    (is (= :guard-resource-adoption-required
+           (kind #(g/invoke! next "owned.guard/install!" [c]))))
+    ;; Explicit removal does not silently transfer the original creation proof.
+    ;; Its creating graph may rebind;the old ticket still cannot remove it.
+    (g/invoke! old "owned.guard/install!" [c])
+    (is (not= receipt (conn/guard-owner c :test/policy)))
+    (is (= :stale-guard-owner-receipt
+           (kind #(g/with! next (fn [] (conn/remove-declared-guard! c :test/policy receipt)))))))
+   (finally (conn/release! c) (conn/release! b)
+            (g/retire! old) (g/retire! next) (g/retire! other)))))
+
+(deftest missing-declarations-and-legacy-adoption-cannot-skip-policy
+ (let [graph (g/prepare! (options "guard-context" 10 false))
+       absent (g/prepare! {:application-id "guard-context" :stable-namespaces #{"datom"}
+                          :sources {"guard.absent" "(ns guard.absent (:require [datom :as d])) (defn write! [c] (d/transact! c [[:db/add 1 :test/value 1]]))"}})
+       c (g/with! graph #(connection)) legacy (connection)]
+  (try
+   (g/invoke! graph "owned.guard/install!" [c])
+   (is (= :missing-guard-declaration (kind #(g/invoke! absent "guard.absent/write!" [c]))))
+   (conn/guard! legacy :legacy (fn [_] nil))
+   (is (= :legacy-guard-adoption-required (kind #(g/invoke! graph "owned.guard/install!" [legacy]))))
+   (is (= :legacy-guard-adoption-required (kind #(g/invoke! graph "owned.guard/write!" [legacy 1]))))
+   (is (nil? (value-at legacy)))
+   (is (= :invalid-guard-resource
+          (kind #(g/invoke! graph "owned.guard/install!" [(assoc c :lifetime (atom :open))]))))
+   (finally (conn/release! c) (conn/release! legacy) (g/retire! graph) (g/retire! absent)))))
+
+(deftest guard-arity-and-captured-callbacks-refuse-before-publication
+ (let [proposal (fn [body]
+                  {:application-id "guard-refusal" :stable-namespaces #{"datom.conn"}
+                   :sources {"guard.bad" (str "(ns guard.bad (:require [datom.conn :as conn])) " body)}})]
+  (is (= :invalid-executable-declaration
+         (kind #(g/prepare! (proposal "(defn predicate [a b] nil) (defn install! [c] (conn/guard! c :guard predicate))")))))
+  (is (= :dynamic-executable-registration
+         (kind #(g/prepare! (proposal "(defn install! [c captured] (conn/guard! c :guard (fn [report] captured)))")))))
+  (is (= :dynamic-executable-registration
+         (kind #(g/prepare! (proposal "(defn install! [c name predicate] (conn/guard! c name predicate))")))))))
+
+
+(deftest candidate-cannot-install-the-first-guard-on-an-old-live-store
+ (let [old (g/prepare! {:application-id "guard-first-bind" :stable-namespaces #{"datom"}
+                       :sources {"guard.previous" "(ns guard.previous (:require [datom :as d])) (defn write! [c value] (d/transact! c [[:db/add 1 :test/value value]]))"}})
+       next (g/prepare! (options "guard-first-bind" 10 false))
+       c (g/with! old #(connection))]
+  (try
+   (g/invoke! old "guard.previous/write!" [c 1])
+   (let [before (erlang/whereis :datom-guard-registry)]
+    (is (= :guard-resource-adoption-required (kind #(g/invoke! next "owned.guard/install!" [c]))))
+    (is (= before (erlang/whereis :datom-guard-registry))))
+   (is (nil? (conn/guard-owner c :test/policy)))
+   (g/invoke! old "guard.previous/write!" [c 2])
+   (is (= 2 (value-at c)))
+   (finally (conn/release! c) (g/retire! old) (g/retire! next)))))
+
+
+(deftest a-bound-graph-identity-cannot-mint-store-creation-authority
+ (let [graph (g/prepare! (options "guard-bound-identity" 10 false))
+       token (g/with! graph #(env/capture)) prior (env/capture) resource (atom nil)]
+  (try
+   (is (not (execution/owned?)))
+   (g/with! graph #(is (execution/owned?)))
+   (env/bind token)
+   (is (some? (execution/current)))
+   (is (not (execution/owned?)))
+   (reset! resource (connection))
+   (env/bind prior)
+   (is (= :guard-resource-adoption-required
+          (kind #(g/invoke! graph "owned.guard/install!" [@resource]))))
+   (is (nil? (conn/guard-owner @resource :test/policy)))
+   (finally
+    (env/bind prior) (when @resource (conn/release! @resource)) (g/retire! graph)))))
