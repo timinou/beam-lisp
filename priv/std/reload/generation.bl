@@ -126,14 +126,17 @@
  (let [forms (BeamLisp.Reader/read_string source)
        header (graph/header* source)
        aliases (nth header 2)
-       required (set (second header))]
+       required (set (second header))
+       local-definitions (set (keep #(when (contains? #{"def" "defn" "defn-" "defserver"} (head-of %))
+                                     (name-of (second (children %)))) (rest forms)))]
   (when-not (and (= name (first header)) (= "ns" (head-of (first forms)))
                 (= 1 (count (filter #(= "ns" (head-of %)) forms))))
    (refuse! :namespace-mismatch {:namespace name}))
   (doseq [form forms]
    (when-not (definition-candidate? form)
     (refuse! :effectful-generation {:namespace name :form (head-of form)})))
-  (let [definitions (keep #(name-of (second (children %))) (rest forms))]
+  (let [definitions (keep #(when (contains? #{"def" "defn" "defn-" "defserver"} (head-of %))
+                            (name-of (second (children %)))) (rest forms))]
    (when (not= (count definitions) (count (distinct definitions)))
     (refuse! :duplicate-definition {:namespace name})))
   (doseq [dependency required]
@@ -151,9 +154,11 @@
      (refuse! :unmanaged-generation-producer {:namespace name :symbol symbol}))
     (when (or (= "persistent_term" resolved)
               (and (not= symbol "erlang/apply")
-                   (or (contains? forbidden symbol) (contains? forbidden (str resolved "/" base))))
+                   (or (and (not (contains? local-definitions symbol)) (contains? forbidden symbol))
+                       (contains? forbidden (str resolved "/" base))))
               (and (contains? forbidden base)
-                   (or (= 1 (count parts)) (contains? #{"core" "env" "reload" "compiler"} resolved)))
+                   (or (and (= 1 (count parts)) (not (contains? local-definitions base)))
+                       (contains? #{"core" "env" "reload" "compiler"} resolved)))
               (String/starts_with? resolved "BeamLisp.")
               (String/starts_with? resolved "Elixir.BeamLisp."))
      (refuse! :dynamic-code-dependency {:namespace name :symbol symbol}))
@@ -481,6 +486,12 @@
             (cond
              (map? node)
               (do
+               (when (or (and (= :global (:op node))
+                              (contains? #{"core" "env" "reload" "compiler"} (:ns node))
+                              (contains? forbidden (:name node)))
+                         (and (= :remote (:op node))
+                              (contains? (:forbidden-remotes planned) [(:mod node) (:fun node)])))
+                (refuse! :dynamic-code-dependency {:namespace (:ns node) :module (:mod node) :function (:fun node)}))
                (when (and (= :global (:op node)) (not (contains? names (:ns node))))
                 (refuse! :unsealed-compiled-dependency {:namespace (:ns node)}))
                (when (and (= :remote (:op node)) (erlang/is_atom (:mod node))
@@ -500,6 +511,18 @@
              (erlang/is_tuple node) (doseq [child (erlang/tuple_to_list node)] (walk child))
              (or (list? node) (vector? node)) (doseq [child node] (walk child))))]
    (walk expression))))
+
+(defn- forbidden-remotes []
+ ;; Exact resolved compiler bindings, including body modules. Similar words in
+ ;; application definitions are harmless; a macro hiding Core.resolve is not.
+ (set (mapcat (fn [namespace]
+        (mapcat (fn [name]
+         (mapcat (fn [entry]
+          (map (fn [module] [module (elem entry 2)])
+               (distinct (filter some? [(BeamLisp.Emit/module_for namespace)
+                                        (when (> (erlang/tuple_size entry) 4) (elem entry 4))]))))
+          (BeamLisp.Env/ns_definition namespace name))) forbidden))
+       ["core" "env" "reload" "compiler"])))
 
 
 (defn- check-compiled! [planned]
@@ -607,12 +630,22 @@
   :else []))
 
 (defn- evaluate-definitions! [planned name source value-modules factory-targets]
- (let [forms (BeamLisp.Reader/read_string source) seen (atom #{}) env (BeamLisp.Compiler/new_env name)]
+ (let [forms (BeamLisp.Reader/read_string source) seen (atom #{}) declared (atom #{})
+       env (BeamLisp.Compiler/new_env name)]
   (BeamLisp.Compiler/eval_form (first forms) env)
+  (doseq [form (rest forms)] (BeamLisp.Compiler/prelink_defn form name))
   (letfn [(definition! [form depth]
            (when (> depth 32) (refuse! :definition-expansion-budget {:namespace name}))
            (let [head (head-of form) items (children form)]
-            (if (contains? #{"defn" "defn-" "def" "defserver"} head)
+            (if (= "declare" head)
+             (doseq [item (rest items)]
+              (let [definition (name-of item)]
+               (when-not (and definition (not (String/contains? definition "/")))
+                (refuse! :invalid-declaration {:namespace name}))
+               (swap! declared conj definition)
+               (when-not (BeamLisp.Env/local_var? name definition)
+                (BeamLisp.Env/intern name definition nil))))
+             (if (contains? #{"defn" "defn-" "def" "defserver"} head)
              (let [definition (name-of (second items))
                    compiled (compile-exact planned form env)]
               (check-expanded-source! name form)
@@ -640,9 +673,14 @@
               (when (= expanded form)
                (refuse! :effectful-generation {:namespace name :form head}))
               (if (= "do" (head-of expanded))
-               (doseq [child (rest (children expanded))] (definition! child (inc depth)))
-               (definition! expanded (inc depth)))))))]
-   (doseq [form (rest forms)] (definition! form 0)))))
+               (let [definitions (rest (children expanded))]
+                (doseq [child definitions] (BeamLisp.Compiler/prelink_defn child name))
+                (doseq [child definitions] (definition! child (inc depth))))
+               (definition! expanded (inc depth))))))))]
+   (doseq [form (rest forms)] (definition! form 0))
+   (doseq [definition @declared]
+    (when-not (contains? @seen definition)
+     (refuse! :unresolved-declaration {:namespace name :definition definition}))))))
 
 (defn prepare!
  "Compile a validated plan into fresh names in a dedicated environment. Reuses
@@ -656,7 +694,8 @@
    (fn []
     (or (get @prepared key)
      (let [_ (reserve-capacity! (count (:order validated)) (:source-bytes validated))
-           planned (plan (assoc input :instance (str (erlang/unique_integer (list :positive)))))
+           planned (assoc (plan (assoc input :instance (str (erlang/unique_integer (list :positive)))))
+                          :forbidden-remotes (forbidden-remotes))
            scope (env/fork) value-modules (atom #{}) factory-targets (atom {}) generation
            (try
             (env/with-env scope
