@@ -1,0 +1,116 @@
+; Actual unchanged registration APIs + real Datom writer/atomic commit path.
+(ns reload.tx-declaration-test
+ (:require [reload.generation :as g] [reload.declaration :as declaration]
+           [datom] [datom.tx :as tx] [datom.conn :as conn] [datom.db :as db]))
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- options [application version]
+ {:application-id application :native-modules #{"erlang"}
+  :stable-namespaces #{"datom" "datom.tx" "reload.declaration"}
+  :sources {"owned.tx"
+   (str "(ns owned.tx (:require [datom :as d] [datom.tx :as tx] [reload.declaration :as declaration])) "
+        "(defn callback [db opts] "
+        " (when (:reply opts) (erlang/send (:reply opts) [:tx-entered (erlang/self)]) (receive :finish nil)) "
+        " [[:db/add (:entity opts) :test/release " (pr-str version) "]]) "
+        "(defn write! [conn opts] (d/register-tx-fn! :test/shared callback) "
+        " (d/transact! conn [[:db/fn :test/shared opts]])) "
+        "(defn register-again! [] (tx/register-fn! :test/shared callback)) "
+        "(defn provider [] (:provider (declaration/lookup :tx :test/shared))) "
+        "(defn inert [] '(d/register-tx-fn! :test/quoted callback))")}})
+(defn- connection []
+ (datom/connect [{:db/ident :test/release :db/valueType :db.type/keyword}]))
+(defn- release-at [c] (db/attr-value (datom/db c) 1 :test/release))
+(defn- retire! [graph]
+ (loop [left 1000]
+  (let [result (g/retire! graph)]
+   (if (or (zero? left) (contains? #{:retired :already-retired} (:status result))) result
+    (do (Process/sleep 5) (recur (dec left)))))))
+
+(deftest existing-registration-functions-become-exact-owned-declarations
+ (let [old (g/prepare! (options "tx-owned-a" :old))
+       next (g/prepare! (options "tx-owned-a" :new))
+       other (g/prepare! (options "tx-owned-b" :other))
+       c (connection) b (connection) hold (g/with! old #(g/capture!))
+       escaped (g/invoke! old "owned.tx/provider" [])]
+  (try
+   (is (nil? (release-at c)))
+   (is (= #{:test/shared} (set (keys (get-in old [:declarations :tx])))))
+   (is (g/runtime-value? (:declarations old)))
+   (is (= :test/shared (g/invoke! old "owned.tx/register-again!" [])))
+   (tx/register-fn! :test/shared (fn [_ opts] [[:db/add (:entity opts) :test/release :development]]))
+   (g/invoke! old "owned.tx/write!" [c {:entity 1}])
+   (is (= :old (release-at c)))
+   (g/invoke! next "owned.tx/write!" [c {:entity 1}])
+   (is (= :new (release-at c)))
+   (g/invoke! other "owned.tx/write!" [b {:entity 1}])
+   (is (= :other (release-at b)))
+   (g/invoke! old "owned.tx/write!" [c {:entity 1}])
+   (is (= :old (release-at c)))
+   (is (= [[:db/add 1 :test/release :old]] (escaped nil {:entity 1})))
+   (is (= :waiting (:status (g/retire! old))))
+   (g/release! hold)
+   (is (= :retired (:status (retire! old))))
+   (is (= :retired-generation (kind #(escaped nil {:entity 1}))))
+   (finally
+    (g/release! hold) (retire! old) (retire! next) (retire! other)
+    (conn/release! c) (conn/release! b)))))
+
+(deftest admitted-old-transaction-finishes-after-submitter-dies
+ (let [old (g/prepare! (options "tx-writer-drain" :old))
+       c (connection) parent (erlang/self) finish-sent (atom false)
+       submitter (spawn #(g/invoke! old "owned.tx/write!" [c {:entity 1 :reply parent}]))
+       writer (receive [:tx-entered pid] pid (after 5000 (throw "old transaction did not enter writer")))]
+  (try
+   (erlang/exit submitter :kill)
+   (is (= :waiting (:status (g/retire! old))))
+   (erlang/send writer :finish)
+   (reset! finish-sent true)
+   (loop [left 1000]
+    (when (and (not= :old (release-at c)) (pos? left))
+     (Process/sleep 5) (recur (dec left))))
+   (is (= :old (release-at c)))
+   (is (= :retired (:status (retire! old))))
+   (finally
+    (when-not @finish-sent (erlang/send writer :finish))
+    (when (Process/alive? submitter) (erlang/exit submitter :kill))
+    (retire! old) (conn/release! c)))))
+
+(defn- source-options [source]
+ {:application-id "tx-declaration-refusal" :stable-namespaces #{"datom" "datom.tx"}
+  :sources {"owned.bad-tx" (str "(ns owned.bad-tx (:require [datom :as d] [datom.tx :as tx])) " source)}})
+
+(deftest dynamic-or-conflicting-declarations-refuse-before-publication
+ (is (= :dynamic-executable-registration
+        (kind #(g/prepare! (source-options "(defn register! [id f] (d/register-tx-fn! id f))")))))
+ (is (= :dynamic-executable-registration
+        (kind #(g/prepare! (source-options "(defn register! [borrowed] (d/register-tx-fn! :test/shared (fn [db] borrowed)))")))))
+ (is (= :invalid-executable-declaration
+        (kind #(g/prepare! (source-options "(defn callback [] []) (defn register! [] (d/register-tx-fn! :test/shared callback))")))))
+ (is (= :duplicate-executable-declaration
+        (kind #(g/prepare! (source-options
+          "(defn first-callback [db] []) (defn second-callback [db] [])
+           (defn first! [] (d/register-tx-fn! :test/shared first-callback))
+           (defn second! [] (d/register-tx-fn! :test/shared second-callback))")))))
+ (is (= :dynamic-executable-registration
+        (kind #(g/prepare! (source-options "(def api d/register-tx-fn!)"))))))
+
+
+(defn- anonymous-options [version]
+ {:application-id "tx-closed-function" :stable-namespaces #{"datom"}
+  :sources {"owned.anonymous"
+   (str "(ns owned.anonymous (:require [datom :as d])) "
+        "(defn write! [conn] (d/register-tx-fn! :test/anonymous "
+        " (fn [db] [[:db/add 1 :test/release " (pr-str version) "]])) "
+        " (d/transact! conn [[:db/fn :test/anonymous]]))")}})
+
+(deftest closed-anonymous-registration-is-lifted-with-no-application-wrapper
+ (let [old (g/prepare! (anonymous-options :old)) next (g/prepare! (anonymous-options :new)) c (connection)]
+  (try
+   (is (g/runtime-value? (:declarations old)))
+   (is (String/contains? (get-in old [:declarations :tx :test/anonymous :callback]) "__executable_tx__"))
+   (g/invoke! old "owned.anonymous/write!" [c])
+   (is (= :old (release-at c)))
+   (g/invoke! next "owned.anonymous/write!" [c])
+   (is (= :new (release-at c)))
+   (g/invoke! old "owned.anonymous/write!" [c])
+   (is (= :old (release-at c)))
+   (finally (retire! old) (retire! next) (conn/release! c)))))
