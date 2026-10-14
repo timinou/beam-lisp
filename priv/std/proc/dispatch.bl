@@ -3,9 +3,9 @@
 ;; queue. Restarting a dispatcher observes accepted workers; it does not kill
 ;; them or infer that an unknown provider outcome is safe to repeat.
 (ns proc.dispatch
- (:require [proc.server :as server] [proc.table :as table]
+ (:require [proc.table :as table]
            [proc.instance :as instance] [proc.callback :as callback]
-           [proc.admission :as admission] [reload.generation :as generation]
+           [proc.admission :as admission] [proc.framework :as framework] [reload.execution :as generation]
            [reload.state :as state] [data.first-order :as first-order]))
 
 (defn- fail [kind] (throw (ex-info "Dispatch admission refused" {:kind kind})))
@@ -197,9 +197,12 @@
                 (int? capacity) (<= limit capacity 65536)
                 (int? code-budget) (<= 16 code-budget 32768))
    (fail :invalid-dispatch-capacity))
-  (when (:registered? opts)
-   (instance/register! (:logical-name opts :proc.dispatch/server) (erlang/self)))
-  (let [table (pending-table opts)
+  (let [app (:application-id (generation/current))
+        initializer (when (generation/current) (state/get (:owner-key opts)))
+        table (pending-table opts)
+        framework (framework/adopt! initializer)
+        _ (when (:registered? opts)
+            (instance/register! (:logical-name opts :proc.dispatch/server) (erlang/self)))
         jobs (sort-by (fn [[_ job]] (:order job)) (ets/tab2list table))
         _ (doseq [[_ job] jobs]
             (when-not (and (= 2 (:format job)) (int? (:lease-rows job))
@@ -208,7 +211,7 @@
         initial {:table table :owner (ets/info table :owner) :limit limit
                  :max-pending capacity :waiting (queue/new) :running {} :reservations {} :drain-timer nil
                  :max-code-rows code-budget :code-rows (reduce + 0 (map #(:lease-rows (second %)) jobs))
-                 :application-id (:application-id (generation/current))}
+                 :application-id app :framework framework}
         restored
         (reduce
          (fn [st [_ job]]
@@ -230,6 +233,7 @@
 (defn reserve!
  [st request from]
  (cond
+  (not (framework/alive? (:framework st))) [{:status :refused :kind :framework-initializer-exited} st]
   (not (and (plain-map? request) (valid-id? (:id request))
              (map? (:request request))
              (contains? #{true false} (:replay-safe? request))
@@ -317,36 +321,37 @@
 (defn close! [st]
  ;; Preserve accepted live workers, queued callbacks and preparing records in
  ;; the original owner's table. A new dispatcher observes exact same slots.
+ (try
  (when (:drain-timer st) (erlang/cancel_timer (:drain-timer st)))
  (doseq [[_ entry] (:reservations st)]
   (when-let [job (row (:table st) (:id entry))]
    (when (:watch job) (Process/demonitor (:watch job) (list :flush)))
    (when (:timer job) (erlang/cancel_timer (:timer job)))))
+ (finally (framework/close! (:framework st))))
  :ok)
 
-(defmacro defdispatcher [name defaults]
- `(defserver ~name
-   (init [opts#] (ok (proc.dispatch/initial-state (proc.dispatch/configure ~defaults opts#))))
-   (handle-call [:reserve request#] [from# st#]
-    (let [[result# after#] (proc.dispatch/reserve! st# request# from#)] (reply result# after#)))
-   (handle-call [:prepare id# ticket# prepared#] [from# st#]
-    (let [[result# after#] (proc.dispatch/prepare! st# id# ticket# prepared# from#)] (reply result# after#)))
-   (handle-call [:commit id# ticket#] [_from# st#]
-    (let [[result# after#] (proc.dispatch/commit! st# id# ticket#)] (reply result# after#)))
-   (handle-call [:abort id# ticket#] [from# st#]
-    (let [[result# after#] (proc.dispatch/abort! st# id# ticket# from#)] (reply result# after#)))
-   (handle-call :stats [_from# st#] (reply (proc.dispatch/counts st#) st#))
-   (handle-call _ [_from# st#] (reply {:status :refused :kind :unknown-dispatch-message} st#))
-   (handle-info [:DOWN ref# :process pid# reason#] [st#]
-    (noreply (proc.dispatch/departed! st# ref# pid# reason#)))
-   (handle-info :dispatch-drain [st#]
-    (noreply (proc.dispatch/retry! st#)))
-   (handle-info [:dispatch-expire id# ticket#] [st#]
-    (noreply (proc.dispatch/expire! st# id# ticket#)))
-   (handle-info _ [st#] (noreply st#))
-   (terminate [_reason# st#] (proc.dispatch/close! st#))))
-
-(defdispatcher dispatcher {})
+(defserver dispatcher
+   (init [opts] (ok (proc.dispatch/initial-state (proc.dispatch/configure {} opts))))
+   (handle-call [:reserve request] [from st]
+    (let [[result after] (proc.dispatch/reserve! st request from)] (reply result after)))
+   (handle-call [:prepare id ticket prepared] [from st]
+    (let [[result after] (proc.dispatch/prepare! st id ticket prepared from)] (reply result after)))
+   (handle-call [:commit id ticket] [_from st]
+    (let [[result after] (proc.dispatch/commit! st id ticket)] (reply result after)))
+   (handle-call [:abort id ticket] [from st]
+    (let [[result after] (proc.dispatch/abort! st id ticket from)] (reply result after)))
+   (handle-call :stats [_from st] (reply (proc.dispatch/counts st) st))
+   (handle-call _ [_from st] (reply {:status :refused :kind :unknown-dispatch-message} st))
+   (handle-info [:DOWN ref :process pid reason] [st]
+    (if (proc.framework/initializer-down? (:framework st) ref pid)
+      (stop :normal st)
+      (noreply (proc.dispatch/departed! st ref pid reason))))
+   (handle-info :dispatch-drain [st]
+    (noreply (proc.dispatch/retry! st)))
+   (handle-info [:dispatch-expire id ticket] [st]
+    (noreply (proc.dispatch/expire! st id ticket)))
+   (handle-info _ [st] (noreply st))
+   (terminate [_reason st] (proc.dispatch/close! st)))
 
 (defn- transfer-and-commit! [server job reserved original request timeout-ms]
  (let [prepared (callback/prepare-transfer! original (:owner reserved))

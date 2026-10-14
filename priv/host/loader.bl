@@ -262,8 +262,34 @@
 
 ; ── ensure_loaded ───────────────────────────────────────────────────────────
 
+(defn without_initialization
+  "Restrict declaration compilation to already initialized namespaces. This
+   grants no authority; the fixed Env scope conveys through Loader.Server and
+   causal worker handoffs, and nested use cannot widen the caller's policy."
+  [action]
+  (let [previous (Process/get :bl_loader_initialization_blocked)]
+    (Process/put :bl_loader_initialization_blocked true)
+    (try (erlang/apply action (list))
+      (finally
+        (if (erlang/== nil previous) (Process/delete :bl_loader_initialization_blocked)
+          (Process/put :bl_loader_initialization_blocked previous))))))
+
+(defn assert_initializer_execution_allowed! [ns]
+  (when (erlang/== true (Process/get :bl_loader_initialization_blocked))
+    (erlang/error (tuple :sdk_declaration_stage_initializer_refused ns)))
+  :ok)
+
+(defn assert_initialization_allowed!
+  "Compile-time restriction, not an SDK trust receipt or a loading permit."
+  [ns]
+  (when (and (erlang/== true (Process/get :bl_loader_initialization_blocked))
+             (erlang/not (or (erlang/== "core" ns) (BeamLisp.Env/loaded_ns? ns))))
+    (erlang/error (tuple :sdk_declaration_stage_load_refused ns)))
+  :ok)
+
 (defn ensure_loaded [ns]
   :when (string? ns)
+  (assert_initialization_allowed! ns)
   (ensure_loaded_in ns (Process/get :bl_fixed_dirs)))
 
 (defn with_loading_session
@@ -313,6 +339,7 @@
    declaration even if the eventual caller changed its search roots."
   [ns fixed]
   :when (string? ns)
+  (assert_initialization_allowed! ns)
   (let [loading (Process/get :bl_loading (MapSet/new))]
     (cond
       (or (erlang/== ns "core") (BeamLisp.Env/loaded_ns? ns))
@@ -399,6 +426,7 @@
    under two locks. `find_file/1` runs BEFORE the lock; the loser re-checks
    `loaded_ns?` inside and short-circuits."
   [ns]
+  (assert_initialization_allowed! ns)
   (if (BeamLisp.Env/loaded_ns? ns)
     :ok
     (let [r (find_file ns)]
@@ -699,6 +727,7 @@
    ns loaded only AFTER the eval. On failure, print the form attribution and
    re-raise; the requiring namespace is restored on every exit path."
   [ns path content]
+  (assert_initialization_allowed! ns)
   (let [prev-ns (BeamLisp.Env/current_ns)]
     (clojure_prelude! path)
 
@@ -723,8 +752,10 @@
                                (BeamLisp.AOT/ensure_loaded_local ns target realm content path)
                                :no_module)]
                   (when (erlang/== :no_module cached)
-                    (BeamLisp.Compiler/eval_string content (BeamLisp.Compiler/new_env ns) path)
-                    (BeamLisp.Env/mark_loaded ns))))))))
+                    (if (and (erlang/not local?) (BeamLisp.AOT/staged_sdk_source? ns path))
+                      (BeamLisp.AOT/compile_sdk_source! ns content path)
+                      (do (BeamLisp.Compiler/eval_string content (BeamLisp.Compiler/new_env ns) path)
+                          (BeamLisp.Env/mark_loaded ns))))))))))
       (catch e
         (cond
           (erlang/== :error __EXCEPTION_KIND__)
@@ -1360,6 +1391,31 @@
             (tuple nm :public)
           :else nil)))))
 
+(defn- native-decl-lines [form]
+  ;; Source metadata only: telling the compiler that a native signature is an
+  ;; ordinary public function prevents eager provider initialization. Authority
+  ;; still comes exclusively from complete emitted-unit receipts and actual code.
+  (let [ha (form-head-args form)]
+    (if (or (nil? ha) (erlang/not (erlang/== "defnative" (elem ha 0))) (erlang/== (elem ha 1) (list))) (list)
+      (let [args (elem ha 1) crate (erlang/hd args)
+            signatures (Enum/map (erlang/tl args)
+              (fn [form]
+                (let [part (form-head-args form)]
+                  (when (and part (erlang/is_binary (elem part 0))
+                             (Regex/match? #"^[a-z][a-z0-9!?_-]*$" (elem part 0))
+                             (erlang/== 1 (erlang/length (elem part 1)))
+                             (erlang/is_integer (erlang/hd (elem part 1)))
+                             (erlang/=< 0 (erlang/hd (elem part 1)))
+                             (erlang/=< (erlang/hd (elem part 1)) 255))
+                    (tuple (elem part 0) (erlang/hd (elem part 1)))))))]
+        (if (and (erlang/is_binary crate) (Regex/match? #"^[a-z][a-z0-9_]*$" crate)
+                 (erlang/=< (erlang/byte_size crate) 128)
+                 (erlang/=< 1 (erlang/length signatures)) (erlang/=< (erlang/length signatures) 256)
+                 (Enum/all? signatures (fn [entry] (erlang/is_tuple entry)))
+                 (erlang/== (erlang/length signatures) (erlang/length (Enum/uniq signatures))))
+          (Enum/map signatures (fn [entry] (tuple (elem entry 0) :public)))
+          (list))))))
+
 (defn- source_decls_from
   "Declarations belonging to ns, not a later namespace sharing its file."
   [ns content path]
@@ -1379,9 +1435,10 @@
                 (erlang/== "in-ns" head)
                   (tuple nil names)
                 (erlang/== ns current)
-                  (let [entry (decl-line form)]
-                    (if (nil? entry) state
-                      (tuple current (maps/put (elem entry 0) (elem entry 1) names))))
+                  (let [entries (if (erlang/== "defnative" head) (native-decl-lines form)
+                                  (let [entry (decl-line form)] (if (nil? entry) (list) (list entry))))]
+                    (tuple current (Enum/reduce entries names
+                      (fn [entry out] (maps/put (elem entry 0) (elem entry 1) out)))))
                 :else state))))
         1))))
 
@@ -1447,6 +1504,7 @@
    `:require` was declared with when it was declared deferred, else wherever it
    resolves now."
   [provider]
+  (assert_initialization_allowed! provider)
   (if (erlang/== nil (BeamLisp.Env/deferred_dirs provider))
     (let [mod (BeamLisp.Link/module_for provider)]
       (if (and (BeamLisp.Env/ns_exists? provider)

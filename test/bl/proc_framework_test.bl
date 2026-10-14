@@ -1,0 +1,295 @@
+(ns proc-framework-test
+ (:require [proc.dispatch :as dispatch] [proc.framework :as framework]
+           [proc.inventory :as inventory] [proc.owner-registry :as owners]
+           [proc.instance :as instance] [proc.attempt :as attempt] [proc.super :as super]
+           [proc.table :as table] [reload.generation :as generation]
+           [reload.state :as state]))
+
+(defn- await [pred]
+ (loop [left 1000]
+  (cond (pred) true (zero? left) false :else (do (Process/sleep 5) (recur (dec left))))))
+(defn- graph [app n]
+ (generation/prepare! {:application-id app
+   :sources {"framework.app" (str "(ns framework.app) (defn value [] " n ")"
+                                (when (> n 1) (str " (defn new-export [] " n ")")))}}))
+(defn- stopped [pid] (await #(not (Process/alive? pid))))
+(defn- members [app] (:participants (inventory/snapshot app)))
+(defn- framework-members [app] (filter #(= :framework (:kind %)) (members app)))
+(defn- start-initializer! [g]
+ (let [parent (erlang/self) ticket (erlang/make_ref)
+       pid (generation/with! g
+             #(spawn
+               (fn []
+                (state/bind! {:framework.test/owner (atom (erlang/self))
+                              :framework.test/table-a (atom nil) :framework.test/table-b (atom nil)})
+                (erlang/send parent (tuple :initializer-ready ticket))
+                (receive :finish :ok))))]
+  (receive [:initializer-ready seen] :when (= seen ticket) pid
+   (after 5000 (throw (ex-info "Initializer did not arm" {}))))))
+(defn- start-dispatch! [g table]
+ (generation/with! g
+  #(start dispatch/dispatcher {:limit 1 :table-key table :owner-key :framework.test/owner})))
+(defn- runtime-lease [] (elem (first (ets/lookup :beam_lisp_vars :bl_sdk_runtime_lease)) 1))
+
+(deftest sdk-owner-has-independent-application-identity-and-inventory-through-generation-retirement
+ (let [app "framework-membership" old (graph app 1) fresh (atom nil)
+       initializer (start-initializer! old) primary (atom nil) secondary (atom nil)
+       result (atom nil)]
+  (try
+   (reset! primary (start-dispatch! old :framework.test/table-a))
+   (let [native (framework/owner-evidence @primary) sdk (runtime-lease)
+         native-row (BeamLisp.Env/framework_owner_evidence @primary)
+         class-lease (:lease native-row)]
+    (is (= :framework (:kind native)))
+    (is (= app (:application-id native)))
+    (is (= dispatch/dispatcher (:module native)))
+    (is (= initializer (:initializer native)))
+    (is (= (list dispatch/dispatcher) (elem class-lease 0)))
+    ;; Even a correctly shaped forged DOWN carrying the actual monitor ticket
+    ;; cannot terminate an owner whose initializer is still alive.
+    (erlang/send @primary [:DOWN (:monitor native-row) :process initializer :forged])
+    (is (= {:running 0 :queued 0} (dispatch/stats @primary)))
+    (is (= (Process/whereis :Elixir.BeamLisp.Env) (:owner sdk)))
+    (is (= 1 (count (framework-members app))))
+    (is (= :application-lifetime (:capability (first (framework-members app)))))
+    (is (= :valid (:status (inventory/snapshot app))))
+    (reset! secondary (start-dispatch! old :framework.test/table-b))
+    ;; A second actor adds one class lease, not another whole-SDK lease.
+    (is (= (:lease sdk) (:lease (runtime-lease))))
+    (is (= 2 (count (framework-members app))))
+    (is (= false (contains? (:modules sdk) (BeamLisp.Emit/module_for "proc.attempt"))))
+    (is (= true (contains? (:forwarders sdk) (BeamLisp.Emit/module_for "proc.attempt"))))
+    (let [collector (Process/whereis owners/NAME)]
+     (Process/exit collector :kill)
+     (is (await #(let [now (Process/whereis owners/NAME)] (and now (not= collector now)))))
+     (is (await #(and (= :valid (:status (inventory/snapshot app)))
+                     (= 2 (count (framework-members app))))))
+     (is (= (:lease sdk) (:lease (runtime-lease))))))
+   ;; Prepare only AFTER the fixed SDK lease exists: app compilation and lazy
+   ;; SDK dependencies must stay usable while a framework owner is alive.
+   (reset! fresh (graph app 2))
+   (is (= 2 (generation/invoke! @fresh "framework.app/new-export" [])))
+   (let [before (erlang/apply dispatch/dispatcher :module_info (list :md5))
+         bad (BeamLisp.Emit/compile_descriptor
+               (BeamLisp.Emit/descriptor_for dispatch/dispatcher
+                 (list (BeamLisp.Emit/function_clause :wrong (BeamLisp.Emit/lit :wrong)))))]
+    (is (= :refused (try (BeamLisp.Env/publish_binaries! (list bad) "framework-negative")
+                      :unexpected (catch _ :refused))))
+    (is (= before (erlang/apply dispatch/dispatcher :module_info (list :md5))))
+    (is (= {:running 0 :queued 0} (dispatch/stats @primary))))
+   (generation/inherit-runtime! @fresh old)
+   ;; The initializer intentionally remains app-owned in this test. Finish it
+   ;; only at the final lifetime boundary; old/new callback correctness is
+   ;; covered without pretending that initializer lifetime is code retirement.
+   (is (= :accepted (:status
+        (generation/with! @fresh
+         #(dispatch/submit! @primary
+           {:id :fresh :run (fn [] (reset! result (generation/invoke! (generation/current) "framework.app/value" [])))
+            :waiting (fn [] nil) :failed (fn [_] (reset! result :failed))})))))
+   (is (await #(= 2 @result)))
+   (is (await #(= {:running 0 :queued 0} (dispatch/stats @primary))))
+   (Process/exit initializer :kill)
+   (is (stopped @primary))
+   (is (stopped @secondary))
+   (is (await #(empty? (framework-members app))))
+   (is (nil? (framework/owner-evidence @primary)))
+   (is (nil? (first (ets/lookup owners/INDEX (tuple app @primary :framework)))))
+   (is (await #(= :retired (:status (generation/retire! old)))))
+   (is (await #(= :retired (:status (generation/retire! @fresh)))))
+   (finally
+    (when (Process/alive? initializer) (Process/exit initializer :kill))
+    (when (and @primary (Process/alive? @primary)) (stop @primary))
+    (when (and @secondary (Process/alive? @secondary)) (stop @secondary))
+    (generation/retire! old) (when @fresh (generation/retire! @fresh))))))
+
+(deftest global-application-class-is-refused-before-init-and-development-remains-ordinary
+ (let [app "framework-negative" g (graph app 1) observer (erlang/self)
+       source "(ns framework.global.claim) (defserver impostor (init [observer] (erlang/send observer :impostor-init) (ok nil)))"
+       _ (BeamLisp.Env/with_env :global #(BeamLisp.Compiler/eval_string source))
+       class (BeamLisp.Env/with_env :global #(BeamLisp.Env/fetch_exact! "framework.global.claim" "impostor"))
+       before (inventory/snapshot app)]
+  (try
+   (is (= :refused (generation/with! g #(try (start class observer) :wrongly-started (catch _ :refused)))))
+   (is (= false (receive :impostor-init true (after 0 false))))
+   (let [token (generation/with! g #(BeamLisp.Env/capture))]
+    (doseq [payload [(tuple :"$bl_conveyed_env" token observer)
+                    (tuple :"$bl_conveyed_generation" token super/pool-dispatcher observer)]]
+     (let [result (erlang/apply :gen_server :start (list class payload (list)))]
+      (is (= :error (elem result 0)))
+      (is (= false (receive :impostor-init true (after 0 false)))))))
+   (is (= (:participants before) (:participants (inventory/snapshot app))))
+   ;; Every child is checked before the tree starts its first valid child.
+   (is (= :refused (generation/with! g
+      #(try (start-link {:strategy :one-for-one
+                        :children (list (super/server :sdk super/pool-dispatcher :unused)
+                                        (super/server :invalid class observer))})
+          :wrongly-started (catch _ :refused)))))
+   (is (= false (receive :impostor-init true (after 0 false))))
+   (let [effects (atom 0)]
+    (is (= :refused (generation/with! g
+       #(try (start-link {:strategy :one-for-one
+                         :children-factory (fn [] (swap! effects inc) (list))})
+             :wrongly-started (catch _ :refused)))))
+    (is (= 0 @effects)))
+   (let [ordinary (start class observer)]
+    (try (is (= true (receive :impostor-init true (after 5000 false))))
+     (finally (stop ordinary))))
+   (finally (generation/retire! g)))))
+
+(deftest ordinary-sdk-actor-retains-its-application-until-death
+ (let [g (graph "framework-safe-default" 1) pid (generation/with! g #(start super/pool-dispatcher :unused))]
+  (try
+   (let [native (generation/owner-evidence pid)
+         dictionary (elem (Process/info pid :dictionary) 1)]
+    (is (= :server (:kind native)))
+    (is (= (:application-id g) (:application-id native)))
+    (is (= g (Keyword/get dictionary :bl_generation)))
+    (is (not= :retired (:status (generation/retire! g))))
+    (is (= 1 (count (:participants (inventory/snapshot (:application-id g)))))))
+   (finally (stop pid)))
+  (is (await #(= :retired (:status (generation/retire! g)))))))
+
+(deftest cold-runtime-table-start-does-not-pin-first-application
+ (let [g (graph "framework-cold-table" 1)
+       nm :framework-cold-table keeper :framework-cold-table-keeper]
+  (try
+   (is (= nm (generation/with! g #(table/hold nm))))
+   (let [owner (Process/whereis keeper) heir (Process/whereis table/HEIR)]
+    (is (Process/alive? owner))
+    (is (Process/alive? heir))
+    (is (nil? (Keyword/get (elem (Process/info owner :dictionary) 1) :bl_generation)))
+    (is (nil? (Keyword/get (elem (Process/info heir :dictionary) 1) :bl_generation)))
+    (is (empty? (:participants (inventory/snapshot (:application-id g)))))
+    (is (await #(= :retired (:status (generation/retire! g))))))
+   (finally
+    (when-let [pid (Process/whereis keeper)] (stop pid))
+    (generation/retire! g)))))
+
+(deftest direct-call-without-generated-init-refuses-before-native-owner-publication
+ (let [g (graph "framework-no-init" 1) token (BeamLisp.Env/capture)
+       result (generation/with! g
+                #(try (framework/adopt! (erlang/self)) :wrongly-accepted (catch _ :refused)))]
+  (try
+   (is (= :refused result))
+   (is (= token (BeamLisp.Env/capture)))
+   (is (nil? (framework/owner-evidence (erlang/self))))
+   (finally (generation/retire! g)))))
+
+(defn- linked-child [pid]
+ (let [info (Process/info pid :links)]
+  (when (tuple? info) (first (filter #(and (erlang/is_pid %) (Process/alive? %)) (elem info 1))))))
+(defn- awaiting-registration? [pid initializer]
+ (let [info (Process/info pid :monitors)]
+  (and (tuple? info) (some #(= (tuple :process initializer) %) (elem info 1)))))
+
+(deftest actor-kill-before-framework-index-and-before-reply-reclaims-both-owner-roles
+ (let [app "framework-adoption-kill" g (graph app 1) initializer (start-initializer! g)
+       registry (Process/whereis owners/NAME) actor (atom nil) starter (atom nil)
+       suspended? (atom false) locked? (atom false)
+       cell (generation/with! g #(state/cell! :framework.test/table-b nil))
+       lock-id (tuple (tuple :proc.table/owned cell) (erlang/self))]
+  (try
+   (let [warm (start-dispatch! g :framework.test/table-a)] (stop warm))
+   (doseq [phase [:before-index :after-index]]
+    (try
+     ;; Pause init at its actual owned-table lock AFTER preliminary server
+     ;; registration, so the collector can then be paused specifically at the
+     ;; later framework adoption. This uses the real SDK, not a test actor.
+     (reset! cell nil)
+     (is (= true (global/set_lock lock-id (list (erlang/node))))) (reset! locked? true)
+     (reset! starter (generation/with! g
+                      #(spawn (fn []
+                                (start-link dispatch/dispatcher
+                                  {:limit 1 :table-key :framework.test/table-b :owner-key :framework.test/owner})))))
+     (is (await #(some? (linked-child @starter))))
+     (reset! actor (linked-child @starter))
+     (is (await #(some? (first (ets/lookup owners/INDEX (tuple app @actor :server))))))
+     (erlang/apply :sys :suspend (list registry)) (reset! suspended? true)
+     (global/del_lock lock-id (list (erlang/node))) (reset! locked? false)
+     (is (await #(awaiting-registration? @actor initializer)))
+     (when (= phase :after-index)
+      (erlang/suspend_process @actor)
+      (erlang/apply :sys :resume (list registry)) (reset! suspended? false)
+      (is (await #(some? (first (ets/lookup owners/INDEX (tuple app @actor :framework)))))))
+     (let [entry (first (ets/lookup owners/INDEX (tuple app @actor :framework)))
+           lease (when entry (get-in (elem entry 1) [:framework-evidence :lease]))]
+      (Process/exit @actor :kill)
+      (when @suspended? (erlang/apply :sys :resume (list registry)) (reset! suspended? false))
+      (is (stopped @actor))
+      (is (await #(nil? (first (ets/lookup owners/INDEX (tuple app @actor :framework))))))
+      (is (await #(nil? (first (ets/lookup owners/INDEX (tuple app @actor :server))))))
+      (is (await #(nil? (first (ets/lookup :beam_lisp_vars (tuple :bl_generation_owner @actor))))))
+      (when lease (is (= false (BeamLisp.Env/code_lease_active? lease)))))
+     (let [next (start-dispatch! g :framework.test/table-b)]
+      (try
+       (is (= {:running 0 :queued 0} (dispatch/stats next)))
+       (is (= 1 (count (framework-members app))))
+       (finally (stop next))))
+     (finally
+      (when @locked? (global/del_lock lock-id (list (erlang/node))) (reset! locked? false))
+      (when @suspended? (erlang/apply :sys :resume (list registry)) (reset! suspended? false))
+      (when (and @actor (Process/alive? @actor)) (Process/exit @actor :kill))
+      (when (and @starter (Process/alive? @starter)) (Process/exit @starter :kill)))))
+   (finally
+    (when @locked? (global/del_lock lock-id (list (erlang/node))))
+    (when @suspended? (erlang/apply :sys :resume (list registry)))
+    (when (Process/alive? initializer) (Process/exit initializer :kill))
+    (generation/retire! g)))))
+
+(deftest lazy-sdk-load-extends-runtime-proof-before-use-without-eager-unrelated-loading
+ (let [g (graph "framework-lazy-sdk" 1) initializer (start-initializer! g)
+       dispatcher (start-dispatch! g :framework.test/table-a)
+       namespace "proc.mutex" shim (BeamLisp.Emit/base_module_for namespace)]
+  (try
+   ;; No require in this fixture's ns: this must be an actual cold SDK unit,
+   ;; including when the same fixture executes against an assembled SDK image.
+   (is (= false (BeamLisp.Env/with_env :global #(BeamLisp.Env/loaded_ns? namespace))))
+   (is (= false (erlang/module_loaded shim)))
+   (let [before (:modules (runtime-lease))]
+    (BeamLisp.Env/with_env :global #(BeamLisp.Loader/ensure_loaded namespace))
+    (is (= true (BeamLisp.Env/with_env :global #(BeamLisp.Env/loaded_ns? namespace))))
+    (let [callback (BeamLisp.Env/with_env :global #(BeamLisp.Env/fetch_exact! namespace "with!"))
+          body (BeamLisp.Env/callback_modules callback)]
+     (is (= true (BeamLisp.Env/sdk_runtime_retained_modules? body)))
+     (is (> (count (:modules (runtime-lease))) (count before)))
+     (is (= :lazy-call (BeamLisp.Ns.Rt/invoke callback [:lazy-check (fn [] :lazy-call)])))))
+   (finally (stop dispatcher) (Process/exit initializer :kill) (generation/retire! g)))))
+
+(deftest fixed-sdk-forwarder-can-gain-unrelated-exports-without-borrowing-application-code
+ (let [app "framework-forwarder" g (graph app 1) initializer (start-initializer! g)
+       dispatcher (atom nil) mod (BeamLisp.Emit/module_for "proc.attempt")
+       original (code/get_object_code mod)]
+  (try
+   (reset! dispatcher (start-dispatch! g :framework.test/table-a))
+   (is (= 3 (erlang/tuple_size original)))
+   (let [definitions (BeamLisp.Env/with_env :global #(BeamLisp.Env/ns_defs "proc.attempt"))
+         base (BeamLisp.Emit/shim_clauses "proc.attempt" definitions)
+         extra (BeamLisp.Emit/function_clause :application-extra (BeamLisp.Emit/lit 73))
+         compatible (BeamLisp.Emit/compile_descriptor
+                      (BeamLisp.Emit/descriptor_for mod (erlang/++ base (list extra))))]
+    (is (= :ok (BeamLisp.Env/with_env :global
+                 #(BeamLisp.Env/publish_binaries! (list compatible) "framework-compatible"))))
+    (is (= 73 (erlang/apply mod :application-extra (list))))
+    (is (= true (BeamLisp.Env/sdk_forwarder_current? mod
+                 (get-in (runtime-lease) [:forwarders mod :routes]))))
+    (let [key :framework.forwarder/attempt ticket (:id (attempt/begin! key {:status :pending}))]
+     (is (= ticket (:id (attempt/current key)))))
+    ;; Actual instructions, rather than invented attributes, must retain the
+    ;; protected route. Changing one original function to app-like code refuses
+    ;; before the installed executable surface changes.
+    (let [bad (BeamLisp.Emit/compile_descriptor
+                (BeamLisp.Emit/descriptor_for mod
+                  (cons (assoc (first base) :body (BeamLisp.Emit/lit :wrong)) (rest base))))
+          before (erlang/apply mod :module_info (list :md5))]
+     (is (= :refused (try (BeamLisp.Env/with_env :global
+                            #(BeamLisp.Env/publish_binaries! (list bad) "framework-wrong-route"))
+                         :unexpected (catch _ :refused))))
+     (is (= before (erlang/apply mod :module_info (list :md5)))))
+    (is (= {:running 0 :queued 0} (dispatch/stats @dispatcher))))
+   (finally
+    (when (and (tuple? original) (= 3 (erlang/tuple_size original)))
+     (BeamLisp.Env/with_env :global
+       #(BeamLisp.Env/publish_binaries! (list (tuple mod (elem original 1))) "framework-restore")))
+    (when (and @dispatcher (Process/alive? @dispatcher)) (stop @dispatcher))
+    (when (Process/alive? initializer) (Process/exit initializer :kill))
+    (generation/retire! g)))))
