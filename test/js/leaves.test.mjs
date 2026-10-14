@@ -207,3 +207,25 @@ test("reversing Unicode cannot mutate cached segmentation", async () => {
   assert.equal(REGEX["Elixir.String/reverse/1"](s),"é💧a");
   assert.equal(STRING["Elixir.String/slice/3"](s,0,2),"a💧");
 });
+
+// Core get-in uses a fresh opaque sentinel; missing this leaf makes every
+// canonical browser build fail, even if the app never calls get-in directly.
+test("make_ref: unique immutable identities survive map/set lookup", () => {
+  const make = ERLANG["erlang/make_ref/0"], isRef = ERLANG["erlang/is_reference/1"];
+  const a = make(), b = make();
+  assert.ok(isRef(a)); assert.ok(isRef(b)); assert.ok(Object.isFrozen(a));
+  for (const value of [null, {}, {blRef:true}, R.hashMap(), "ref", () => {}]) assert.equal(isRef(value), false);
+  assert.equal(R.keyEq(a,a),true); assert.equal(R.keyEq(a,b),false);
+  assert.equal(R.eqv(a,a),true); assert.equal(R.eqv(a,b),false);
+  assert.equal(R.hashOf(a),R.hashOf(a));
+  const m = R.hashMap(a, null, b, false);
+  assert.equal(m.cnt,2); assert.equal(m.get(a,"absent"),null);
+  assert.equal(m.get(b,"absent"),false); assert.equal(m.get(make(),"absent"),"absent");
+  assert.equal(R.hashSet(a,a,b).cnt,2);
+  assert.equal(R.termCompare(a,a),0);
+  assert.equal(R.termCompare(a,b),-R.termCompare(b,a));
+  assert.notEqual(R.termCompare(a,b),0);
+  assert.equal(R.termCompare(R.kw("z"),a),-1);
+  assert.equal(R.termCompare(a,() => {}),-1);
+  assert.match(R.printStr(a),/^#Ref<js\.\d+>$/);
+});

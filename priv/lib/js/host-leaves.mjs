@@ -117,7 +117,8 @@ export const ERLANG = {
   "erlang/is_function/2": (x, n) => typeof x === "function" && (x.length === n || x.length === 0),
   "erlang/is_pid/1": () => false,
   "erlang/is_port/1": () => false,
-  "erlang/is_reference/1": (x) => x !== null && typeof x === "object" && x.blRef === true,
+  "erlang/is_reference/1": (x) => x instanceof R.Ref,
+  "erlang/make_ref/0": () => new R.Ref(),
 
   "erlang/make_tuple/2": (n, x) => new Tup(new Array(n).fill(x)),
   "erlang/setelement/3": (i, t, v) => { if (!(t instanceof Tup) || i < 1 || i > t.items.length) badarg("setelement"); const a = t.items.slice(); a[i - 1] = v; return new Tup(a); },
