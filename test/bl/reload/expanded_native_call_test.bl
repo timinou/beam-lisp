@@ -1,0 +1,90 @@
+(ns reload.expanded-native-call-test
+ (:require [reload.generation :as generation] [reload.native-call :as native] [env]))
+
+(defn- kind [f] (try (f) nil (catch e (:kind (ex-data e)))))
+(defn- options [body]
+ {:native-modules #{"binary" "erlang" "Process" "File"}
+  :sources {"expanded.native" (str "(ns expanded.native) " body)}})
+
+(deftest native-calls-in-expanded-and-multi-arity-bodies-use-exact-compiled-lists
+ (let [g (generation/prepare! (options
+           "(defn run ([x] (when x (erlang/apply :binary :part (list x 1 2)))) ([x n] (if n (erlang/apply :binary :part (list x 0 n)) nil))) (def callback #(erlang/apply :binary :part (list % 0 1))) (defn callback-result [x] (callback x))"))]
+  (try
+   (is (= "bc" (generation/invoke! g "expanded.native/run" ["abcd"])))
+   (is (= "ab" (generation/invoke! g "expanded.native/run" ["abcd" 2])))
+   (is (nil? (generation/invoke! g "expanded.native/run" [nil])))
+   (is (= "a" (generation/invoke! g "expanded.native/callback-result" ["abcd"])))
+   (finally (generation/retire! g)))))
+
+(deftest expanded-native-arguments-preserve-evaluation-order-and-exceptions
+ (let [g (generation/prepare! (options
+          "(defn run [] (when true (erlang/apply :erlang :list_to_tuple (list (list (do (Process/put :expanded-order [1]) 1) (do (Process/put :expanded-order (conj (Process/get :expanded-order) 2)) 2)))))) (defn fail [] (when true (erlang/apply :erlang :list_to_tuple (list (list (throw (ex-info \"first\" {:kind :first})) (Process/put :expanded-after true))))))"))]
+  (try
+   (is (= [1 2] (vec (erlang/tuple_to_list (generation/invoke! g "expanded.native/run" [])))))
+   (is (= [1 2] (Process/get :expanded-order)))
+   (is (= :first (kind #(generation/invoke! g "expanded.native/fail" []))))
+   ;; BL call/list evaluation is not a left-to-right guarantee. Preserve its
+   ;; existing effects even when an earlier-looking argument throws.
+   (is (= true (Process/get :expanded-after)))
+   (finally (Process/delete :expanded-order) (Process/delete :expanded-after) (generation/retire! g)))))
+
+(deftest shadowed-list-cannot-acquire-proper-list-proof
+ (let [p (str (System/get_env "HOME") "/tmp/expanded-shadow-" (erlang/unique_integer (list :positive)))]
+  (try
+   (doseq [body [(str "(defn run [list] (when true (erlang/apply :binary :part (list \"abc\" 0 1))))")
+                (str "(defn list [& xs] (File/write! " (pr-str p) " \"unsafe\") xs) (defn run [] (when true (erlang/apply :binary :part (list \"abc\" 0 1))))")]]
+    (is (= :dynamic-code-dependency (kind #(generation/prepare! (options body)))))
+    (is (not (File/exists? p))))
+   (finally (when (File/exists? p) (File/rm! p))))))
+
+(deftest source-native-authority-and-producer-refusal-survive-expansion
+ (is (= :undeclared-native-target
+      (kind #(generation/prepare! (options "(defn run [] (when true (erlang/apply :crypto :hash (list :sha256 \"x\"))))")))))
+ (is (= :dynamic-code-dependency
+      (kind #(generation/prepare! (options "(defn run [] (when true (erlang/apply :erlang :spawn (list (fn [] nil)))))")))))
+ (is (= :dynamic-code-dependency
+      (kind #(generation/prepare! (options "(defn run [args] (when true (erlang/apply :binary :part args)))"))))))
+
+(deftest literal-data-patterns-and-annotations-are-not-executable-carriers
+ (let [quoted {:op :remote :mod :erlang :fun :apply :args [:data]}
+       expression {:op :fn :ann quoted
+                   :clauses (list {:pats (list {:pop :plit :val quoted})
+                                   :guard nil :body {:op :lit :val quoted :ann {}}})}
+       calls (atom 0) result (native/specialize expression #(swap! calls inc))]
+  (is (= expression (:expression result)))
+  (is (= [] (:targets result)))
+  (is (= 0 @calls))))
+
+(deftest actual-list-evaluation-and-exception-traces-match-unspecialized-execution
+ (let [context (env/capture)
+       body "(defn mark [tag value] (Process/put :expanded-effects (conj (or (Process/get :expanded-effects) []) tag)) value) (defn run [] (when true (erlang/apply :binary :part (list (mark :text \"abcd\") (mark :offset 1) (mark :length 2))))) (defn fail [] (when true (erlang/apply :binary :part (list (mark :text \"abcd\") (do (mark :offset 1) (throw (ex-info \"stop\" {:kind :stop}))) (mark :length 2)))))"
+       _ (env/eval (str "(ns expanded.reference) " body))
+       _ (env/bind context)
+       g (generation/prepare! (options body))]
+  (try
+   (doseq [entry ["run" "fail"]]
+    (Process/delete :expanded-effects)
+    (let [f (BeamLisp.Env/fetch_exact! "expanded.reference" entry)
+          reference (try [:ok (f)] (catch e [:error (ex-data e)]))
+          effects (Process/get :expanded-effects)]
+     (Process/delete :expanded-effects)
+     (let [actual (try [:ok (generation/invoke! g (str "expanded.native/" entry) [])]
+                   (catch e [:error (ex-data e)]))]
+      (is (= reference actual))
+      (is (= effects (Process/get :expanded-effects))))))
+   (finally (Process/delete :expanded-effects) (generation/retire! g)))))
+
+(deftest initializer-validation-and-execution-expand-a-changing-macro-once
+ (env/eval "(ns expanded.macros) (defmacro changing [path] (let [n (inc (or (Process/get :expanded-count) 0))] (Process/put :expanded-count n) (if (= 1 n) '(fn [] :safe) (list 'do (list 'File/write! path \"unsafe\") '(fn [] :unsafe)))))")
+ (let [path (str (System/get_env "HOME") "/tmp/expanded-once-" (erlang/unique_integer (list :positive)))
+       opts {:stable-namespaces #{"expanded.macros"} :native-modules #{"File"}
+             :sources {"expanded.once" (str "(ns expanded.once (:require [expanded.macros :as macros])) (def value (macros/changing " (pr-str path) ")) (defn run [] (value))")}}]
+  (Process/delete :expanded-count)
+  (try
+   (let [g (generation/prepare! opts)]
+    (try
+     (is (= :safe (generation/invoke! g "expanded.once/run" [])))
+     (is (= 1 (Process/get :expanded-count)))
+     (is (not (File/exists? path)))
+     (finally (generation/retire! g))))
+   (finally (Process/delete :expanded-count) (when (File/exists? path) (File/rm! path))))))

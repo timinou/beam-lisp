@@ -3,7 +3,9 @@
 ; This is not a source sandbox or an atomic publication across process owners.
 (ns reload.generation
  (:require [env] [source-graph :as graph] [reader-node :as rn]
-           [reader :as reader] [reload.static-call :as static-call] [reload]))
+           [reader :as reader] [reload.static-call :as static-call]
+           [reload.native-call :as native-call] [reload.registry-data :as registry-data]
+           [lower :as lower] [reload]))
 
 (def ^:private prepared (atom {}))
 (def ^:private forbidden
@@ -137,19 +139,25 @@
   (doseq [dependency required]
    (when-not (or (contains? sources dependency) (contains? stable dependency))
     (refuse! :unsealed-dependency {:namespace name :dependency dependency})))
+  ;; Admit only literal target/list candidates here; actual compiled list identity
+  ;; and every native target are checked again before the exact IR executes.
+  (doseq [{:keys [module function]} (static-call/deferred-targets (rest forms))]
+   (when-not (contains? native module)
+    (refuse! :undeclared-native-target {:namespace name :module module :function function})))
   (doseq [[node symbol] (mapcat executable-symbols (rest forms))]
    (let [parts (String/split symbol "/") prefix (first parts)
          base (last parts) resolved (get aliases prefix prefix)]
     (when (unmanaged-producer? resolved base)
      (refuse! :unmanaged-generation-producer {:namespace name :symbol symbol}))
     (when (or (= "persistent_term" resolved)
-              (or (contains? forbidden symbol) (contains? forbidden (str resolved "/" base)))
+              (and (not= symbol "erlang/apply")
+                   (or (contains? forbidden symbol) (contains? forbidden (str resolved "/" base))))
               (and (contains? forbidden base)
                    (or (= 1 (count parts)) (contains? #{"core" "env" "reload" "compiler"} resolved)))
               (String/starts_with? resolved "BeamLisp.")
               (String/starts_with? resolved "Elixir.BeamLisp."))
      (refuse! :dynamic-code-dependency {:namespace name :symbol symbol}))
-    (when (and (not= "/" symbol) (= 2 (count parts))
+    (when (and (not (contains? #{"/" "erlang/apply"} symbol)) (= 2 (count parts))
                (not (or (= name prefix) (contains? aliases prefix) (= "clojure.re" prefix)
                         (contains? native prefix))))
      ;; Every namespace reference must be declared, including direct qualified
@@ -253,27 +261,28 @@
 
 (declare native-hazard-symbol?)
 
-(defn- specialize-source [name source sources stable native]
- (let [result (static-call/specialize source
-                {:namespace-prefixes (into stable (keys sources))})]
-  (doseq [{:keys [module function]} (:targets result)]
-   ;; A rewritten slash target must resolve to the precise declared native
-   ;; module. Existing/resolvable BL namespaces win that spelling in compiler
-   ;; resolution, so refuse that ambiguity before any compilation/evaluation.
+(defn- check-native-source [name source sources stable native]
+ (let [targets (static-call/deferred-targets (BeamLisp.Reader/read_string source))]
+  (doseq [{:keys [module function]} targets]
+   ;; Structural admission grants no code execution. Expanded ANF must still
+   ;; prove Core list identity. Keep the existing conservative native spelling
+   ;; boundary; explicit app namespace collisions cannot gain native authority.
    (when-not (contains? native module)
     (refuse! :undeclared-native-target {:namespace name :module module :function function}))
    (when (native-hazard-symbol? module function)
     (refuse! :dynamic-code-dependency {:namespace name :symbol (str module "/" function)}))
-   (when (or (BeamLisp.Env/ns_exists? module) (BeamLisp.Loader/resolvable? module))
+   (when (or (contains? sources module) (contains? stable module)
+             (BeamLisp.Env/ns_exists? module) (BeamLisp.Loader/resolvable? module))
     (refuse! :ambiguous-native-target {:namespace name :module module :function function})))
-  (:compile-source result)))
+  source))
 
 (defn plan
  "Generation plan without application evaluation. :sources is the complete managed source map; :roots
   defaults to its keys. :stable-namespaces and :native-modules explicitly name
   the fixed trusted runtime boundary. :resources is immutable generation data.
-  Literal native apply calls are specialized only against explicit native
-  authority; ambiguous BL namespace spellings refuse before compilation.
+  Literal native apply candidates require explicit native authority; actual
+  specialization uses expanded ANF during prepare!, without source rewriting.
+  Ambiguous BL namespace spellings refuse before compilation.
   Definition macros are expanded and initializers checked against actual ANF
   during prepare!. Mutable/effectful initializers, dynamic code lookup and
   undeclared namespace calls refuse before application evaluation. The artifact
@@ -292,10 +301,16 @@
                 (every? #(and (string? %) (Regex/match? #"^[a-zA-Z][a-zA-Z0-9_.-]*$" %))
                         (keys sources)))
    (refuse! :invalid-generation {}))
-  (let [source-bytes (reduce + 0 (map #(if (string? %) (erlang/byte_size %) 0) (vals sources)))
+  (let [registries (registry-data/registries resources)
+        registry-roots (registry-data/roots registries)
+        _ (doseq [reference (registry-data/references registries)]
+            (when-not (contains? sources (first (String/split reference "/")))
+             (refuse! :unsealed-registry-reference {:reference reference})))
+        roots (vec (distinct (concat roots registry-roots)))
+        source-bytes (reduce + 0 (map #(if (string? %) (erlang/byte_size %) 0) (vals sources)))
         _ (when (> source-bytes 16777216) (refuse! :generation-source-budget {:bytes source-bytes}))
         compile-sources (into {} (map (fn [[name source]]
-                                      [name (specialize-source name source sources stable native)]) sources))
+                                      [name (check-native-source name source sources stable native)]) sources))
         parsed (into {} (map (fn [[name source]]
                               [name (check-source! name source stable native sources)]) compile-sources))
         requires (fn [name] (filter #(contains? sources %) (second (graph/header (get sources name)))))
@@ -312,6 +327,7 @@
      (refuse! :identity-conflict {:expected (:digest opts) :actual digest}))
     {:input opts :digest digest :mapping mapping :order order :resources resources
      :application-id application-id :source-bytes source-bytes
+     :registries registries
      :protocols (into {} (map (fn [[server version]]
                                [server {:protocol version :generation digest}]) protocols))
      :stable-namespaces stable :native-modules native
@@ -351,7 +367,9 @@
  (let [entry (:entrypoint opts) parts (when (string? entry) (String/split entry "/"))
        stable (set (:stable-namespaces opts))]
   (when-not (= 2 (count parts)) (refuse! :invalid-entrypoint {}))
-  (loop [todo [(first parts)] sources {} boundary stable]
+  (loop [todo (vec (distinct (concat [(first parts)]
+                    (registry-data/roots (registry-data/registries (or (:resources opts) {}))))))
+         sources {} boundary stable]
    (if (empty? todo)
     (assoc (plan (assoc opts :sources sources :roots [(first parts)] :stable-namespaces boundary)) :entrypoint entry)
     (let [name (first todo)]
@@ -423,10 +441,36 @@
  (doseq [[_ symbol] (executable-symbols form)]
   (let [parts (String/split symbol "/") namespace (first parts) function (last parts)]
    (when (and (= 2 (count parts))
-              (or (native-hazard-symbol? namespace function)
+              (or (and (not= [namespace function] ["erlang" "apply"])
+                       (native-hazard-symbol? namespace function))
                   (and (= "BeamLisp.Ns.Rt" (String/replace_prefix namespace "Elixir." ""))
                        (= "invoke" function))))
     (refuse! :unmanaged-compiled-producer {:namespace name :symbol symbol})))))
+
+(defn- compile-exact [planned form env]
+ (:expression
+  (native-call/specialize (BeamLisp.Compiler/compile form env)
+   (fn [{:keys [module function]}]
+    (let [name (String/replace_prefix (erlang/atom_to_binary module :utf8) "Elixir." "")]
+     (when-not (contains? (:native-modules planned) name)
+      (refuse! :undeclared-native-target {:module name :function function}))
+     (when (native-hazard? module function)
+      (refuse! :unmanaged-compiled-producer {:module module :function function})))))))
+
+(defn- definition-initializer [compiled namespace definition]
+ ;; Read the initializer from the exact compiled registration, including its
+ ;; optional metadata wrapper. Never expand/compile a macro a second time.
+ (let [node (if (= :let (:op compiled)) (:init compiled) compiled)
+       args (:args node)]
+  (when-not (and (= :remote (:op node)) (= :Elixir.BeamLisp.Env (:mod node))
+                 (= :intern (:fun node)) (= 3 (count args))
+                 (= namespace (:val (first args))) (= definition (:val (second args))))
+   (refuse! :unmanaged-value-descriptor {:namespace namespace :definition definition}))
+  (nth args 2)))
+
+(defn- evaluate-exact! [compiled]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.BeamLisp.Eval.M"
+                                      (erlang/unique_integer (list :positive)))) compiled))
 
 (defn- check-anf! [planned expression]
  ;; Inspect the compiler's actual ANF too: a trusted macro must not inject a
@@ -569,24 +613,24 @@
            (when (> depth 32) (refuse! :definition-expansion-budget {:namespace name}))
            (let [head (head-of form) items (children form)]
             (if (contains? #{"defn" "defn-" "def" "defserver"} head)
-             (let [definition (name-of (second items))]
+             (let [definition (name-of (second items))
+                   compiled (compile-exact planned form env)]
               (check-expanded-source! name form)
               (when (or (nil? definition) (contains? @seen definition))
                (refuse! :duplicate-definition {:namespace name :definition definition}))
               (swap! seen conj definition)
               (when (= head "def")
-               (let [initializer (BeamLisp.Compiler/compile (last items) env)]
+               (let [initializer (definition-initializer compiled name definition)]
                 (check-anf! planned initializer)
                 (when-not (immutable-anf? planned initializer @factory-targets)
                  (refuse! :effectful-generation {:namespace name :definition definition}))))
               (when (= head "defserver")
-               (let [compiled (BeamLisp.Compiler/compile form env)
-                     descriptor (:val (first (:args (first (:stmts compiled)))))]
+               (let [descriptor (:val (first (:args (first (:stmts compiled)))))]
                 (when-not (and (= :module (:op descriptor))
                                (= (BeamLisp.Server/module_for name definition) (:name descriptor)))
                  (refuse! :unmanaged-owner-descriptor {:namespace name}))
                 (doseq [clause (:clauses descriptor)] (check-anf! planned (:body clause)))))
-              (let [value (BeamLisp.Compiler/eval_form form env)]
+              (let [value (evaluate-exact! compiled)]
                (when (contains? #{"defn" "defn-"} head) (record-factory! factory-targets name definition))
                (when (= head "defserver") (swap! value-modules conj value))
                (when (= head "def")
@@ -632,12 +676,19 @@
                 (BeamLisp.Env/mark_loaded fresh)))
               (BeamLisp.Link/settle)
               (check-compiled! planned)
+              (registry-data/check-fields! (:registries planned))
+              (doseq [reference (registry-data/references (:registries planned))]
+               (let [[logical definition] (String/split reference "/")
+                     result (BeamLisp.Env/fetch_exact (get (:mapping planned) logical) definition)]
+                (when-not (and (tuple? result) (= :ok (elem result 0)) (fn? (elem result 1)))
+                 (refuse! :invalid-registry-reference {:reference reference}))))
               (let [modules (vec (distinct (concat @value-modules (mapcat
                              namespace-modules
                              (vals (:mapping planned))))))]
                {:digest (:digest planned) :mapping (:mapping planned) :scope scope
                 :context (assoc (env/capture) :generation nil) :resources (:resources planned) :modules modules
                 :protocols (:protocols planned) :application-id (:application-id planned)
+                :registries (:registries planned)
                 :state (atom {:retired false :tickets {} :slots #{}}) :cache-key key})))
             (catch error
              (try

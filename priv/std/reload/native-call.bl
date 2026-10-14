@@ -1,0 +1,81 @@
+; Specialize actual compiled calls, never reader spelling or quoted app data.
+; The generation owner supplies native authority; this module grants none.
+(ns reload.native-call)
+
+(defn- refuse [kind] (throw (ex-info "Compiled native call refused" {:kind kind})))
+
+(defn- arguments [node]
+ (case (:op node)
+  :enil []
+  :lit (when (erlang/is_list (:val node))
+         (mapv (fn [v] {:op :lit :val v :ann {}}) (:val node)))
+  :cons (when-let [tail (arguments (:tail node))] (into [(:head node)] tail))
+  :remote (when (and (= :Elixir.BeamLisp.Ns.Core (:mod node))
+                     (= :list__bl_v (:fun node)) (= 1 (count (:args node))))
+            (arguments (first (:args node))))
+  nil))
+
+(defn specialize
+ "Rewrite literal erlang:apply/3 only with a compiler-resolved proper argument
+  list. authorize! receives the exact atom module/function and finite arity.
+  Quoted values, patterns and annotations are never interpreted as code. The
+  only literal code carriers are the compiler's Link.defvar and module loader.
+  Returned :expression is the exact IR to validate AND execute."
+ [expression authorize!]
+ (let [remaining (atom 100000) targets (atom [])]
+  (letfn [(walk [node depth]
+            (when (or (> depth 256) (neg? (swap! remaining dec)))
+             (refuse :native-call-analysis-budget))
+            (cond
+             (map? node)
+              (if (or (= :lit (:op node)) (:pop node)) node
+               (let [next (reduce (fn [out [k v]]
+                                   (assoc out k (if (contains? #{:ann :meta :params :pats :pat :attrs :exports} k) v
+                                                   (walk v (inc depth))))) {} node)]
+                (cond
+                 (and (= :remote (:op next)) (= :Elixir.BeamLisp.Link (:mod next))
+                      (= :defvar (:fun next)) (= 4 (count (:args next))))
+                  (let [payload (nth (:args next) 2)]
+                   (when-not (and (= :lit (:op payload)) (erlang/is_list (:val payload)))
+                    (refuse :invalid-compiled-definition))
+                   (let [entries (mapv (fn [entry]
+                                  (when-not (and (tuple? entry) (= 4 (erlang/tuple_size entry))
+                                                (= :defn-clause (:op (elem entry 3))))
+                                   (refuse :invalid-compiled-definition))
+                                  (erlang/setelement 4 entry (walk (elem entry 3) (inc depth)))) (:val payload))]
+                    (assoc next :args (to-list (assoc (vec (:args next)) 2
+                                                   (assoc payload :val (to-list entries)))))))
+                 (and (= :remote (:op next)) (= :Elixir.BeamLisp.Ns.Lower (:mod next))
+                      (= :reload-descriptor! (:fun next)) (= 1 (count (:args next))))
+                  (let [payload (first (:args next))]
+                   (when-not (and (= :lit (:op payload)) (= :module (:op (:val payload))))
+                    (refuse :invalid-compiled-definition))
+                   (assoc next :args (list (assoc payload :val (walk (:val payload) (inc depth))))))
+                 (and (= :remote (:op next)) (= :erlang (:mod next)) (= :apply (:fun next)))
+                  (let [[module function args] (:args next)
+                        actual (arguments args)]
+                   (when-not (and (= 3 (count (:args next))) (= :lit (:op module))
+                                  (= :lit (:op function)) (keyword? (:val module))
+                                  (keyword? (:val function)) (some? actual) (<= (count actual) 255))
+                    (refuse :dynamic-code-dependency))
+                   (let [target {:module (:val module) :function (:val function) :arity (count actual)}]
+                    (authorize! target)
+                    (swap! targets conj target)
+                    ;; Keep the original argument-list expression as the case
+                    ;; subject. Flattening its elements into remote arguments
+                    ;; can change Core's evaluation/exception order. The exact
+                    ;; compiler-proved list pattern binds already-evaluated values.
+                    (let [prefix (str "native_argument_" (erlang/unique_integer (list :positive)) "_")
+                          names (mapv #(str prefix %) (range (count actual)))
+                          pattern (reduce (fn [tail name] {:pop :pcons :head {:pop :pvar :name name} :tail tail})
+                                          {:pop :pnil} (reverse names))
+                          call (assoc next :mod (:val module) :fun (:val function)
+                                          :args (to-list (mapv (fn [name] {:op :var :name name :ann {}}) names)))]
+                     {:op :case :subj args :ann (:ann next)
+                      :clauses (list {:pats (list pattern) :guard nil :body call})})))
+                 :else next)))
+             (vector? node) (mapv #(walk % (inc depth)) node)
+             (erlang/is_list node) (to-list (mapv #(walk % (inc depth)) node))
+             (tuple? node) (erlang/list_to_tuple (to-list (mapv #(walk % (inc depth)) (erlang/tuple_to_list node))))
+             :else node))]
+   {:expression (walk expression 0) :targets @targets})))
