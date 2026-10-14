@@ -232,3 +232,12 @@ test("make_ref: unique immutable identities survive map/set lookup", () => {
   assert.equal(R.termCompare(a,() => {}),-1);
   assert.match(R.printStr(a),/^#Ref<js\.\d+>$/);
 });
+
+test("actor and synchronous reference primitives use the same runtime functions", async () => {
+  const H = await import("../../priv/lib/js/actor/host.mjs");
+  assert.equal(H.erlangRef("make_ref"), ERLANG["erlang/make_ref/0"]);
+  assert.equal(H.erlangRef("is_reference"), ERLANG["erlang/is_reference/1"]);
+  assert.equal(H.erlangRef("is_reference")(ERLANG["erlang/make_ref/0"]()),true);
+  assert.equal(ERLANG["erlang/is_reference/1"](H.erlangRef("make_ref")()),true);
+  assert.equal(H.erlangRef("is_reference")(R.vec(R.kw("ref"),1,2)),false);
+});

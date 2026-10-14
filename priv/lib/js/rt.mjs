@@ -418,6 +418,8 @@ function sortedEntries(es) { return es.sort((a, b) => compare(a[0], b[0])); }
 // Opaque Erlang references have identity, never structural equality. The shared
 // WeakMap below supplies hashing/order without putting mutable ids on a value.
 export class Ref { constructor() { Object.freeze(this); } }
+export const makeRef = () => new Ref();
+export const isRef = (value) => value instanceof Ref;
 
 // ─── hashing + equality ─────────────────────────────────────────────────────
 

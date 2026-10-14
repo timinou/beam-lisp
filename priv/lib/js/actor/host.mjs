@@ -1262,7 +1262,8 @@ export const ERLANG = {
   // asks `rt-pid?`), so this stays false rather than encoding one shape of
   // actor state here. Kept as a bif so a guard does not fail for the wrong
   // reason.
-  "is_reference": () => false,
+  "is_reference": V.isRef,
+  "make_ref": V.makeRef,
   "is_port": () => false,
   "is_atom": (x) => isKw(x) || x === null || x === true || x === false,
   "is_map": isBMap,
