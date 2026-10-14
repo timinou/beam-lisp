@@ -1,0 +1,131 @@
+(ns proc.task-owned-test
+ (:require [proc.task :as task] [reload.generation :as generation]
+           [env] [datom.query.functions :as functions] [anf :as a] [lower]))
+
+(defn- down! [pid]
+ (let [monitor (Process/monitor pid)]
+  (try (receive [:DOWN seen :process dead _] :when (and (= seen monitor) (= dead pid)) true
+         (after 5000 false))
+   (finally (Process/demonitor monitor (list :flush))))))
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- retired? [graph]
+ (loop [left 100]
+  (let [status (:status (generation/retire! graph))]
+   (if (contains? #{:retired :already-retired} status) true
+    (if (zero? left) false (do (Process/sleep 5) (recur (dec left))))))))
+(defn- callback-descriptor [module]
+ (a/module module
+  (list {:op :defn-clause :fname :factory :params (list) :guard nil
+         :body (a/fnn (list (a/clause (list) nil
+                              (a/recv (list (a/clause (list (a/plit :finish)) nil (a/lit 42)))
+                                      (a/lit 5000) (a/lit :timed-out))))) :ann {}})
+  (list [:factory 0]) (list)))
+
+(deftest owned-tasks-preserve-native-yield-and-actual-callback-module-retention
+ (let [module :bl_owned_task_callback]
+  (lower/reload-descriptor! (callback-descriptor module))
+  (let [action (erlang/apply module :factory (list))
+        work (task/async-nolink action) pid (task/pid work)]
+   (try
+    (is (nil? (task/yield work 0)))
+    (is (seq (ets/match_object :beam_lisp_code_leases
+              (tuple (tuple module pid :_) true))))
+    (is (not (BeamLisp.Env/retire_module! module)))
+    (erlang/send pid :finish)
+    (is (= (tuple :ok 42) (task/yield work 5000)))
+    (is (down! pid))
+    (is (BeamLisp.Env/retire_module! module))
+    (finally (when (Process/alive? pid) (task/shutdown work :brutal_kill))
+     (BeamLisp.Env/retire_module! module)))))
+ (is (= 42 (task/await (task/async (fn [] 42)) 5000))))
+
+(deftest tasks-capture-real-environment-and-narrow-query-authority
+ (let [scope (env/fork) effects (atom 0)]
+  (try
+   (let [work (env/with-env scope
+                (fn []
+                 (BeamLisp.Env/intern "task.context" "value" 42)
+                 (functions/with-only
+                  (fn [] (task/async
+                           (fn []
+                            [(BeamLisp.Env/fetch "task.context" "value")
+                             (functions/restricted?)
+                             (kind (fn [] ((functions/resolve-op 'dangerous
+                                            (fn [] (fn [_] (swap! effects inc)))) 7)))]))))))]
+    (is (= [42 true :query-function-refused] (task/await work 5000)))
+    (is (= 0 @effects))
+    (is (not (functions/restricted?)))
+    (is (not= scope (env/current))))
+   (finally (env/destroy scope)))))
+
+(deftest accepted-nolink-work-keeps-the-original-graph-after-caller-exit
+ (let [graph (generation/prepare! {:application-id "task-owner-exit"
+                                  :sources {"task.original" "(ns task.original) (defn answer [] 42)"}})
+       parent (erlang/self)
+       creator (spawn
+                 (fn []
+                  (generation/with! graph
+                   (fn []
+                    (let [work (task/async-nolink
+                                 (fn []
+                                  (erlang/send parent [:task-entered (erlang/self)
+                                                       (= (:digest graph) (:digest (generation/current)))])
+                                  (receive :finish
+                                    (erlang/send parent [:task-answer
+                                                         (generation/invoke! graph "task.original/answer" [])]))))]
+                     (erlang/send parent [:task-worker (task/pid work)])
+                     (receive :never nil))))))
+       pid (receive [:task-worker worker] worker (after 5000 nil))]
+  (try
+   (is (erlang/is_pid pid))
+   (is (= true (receive [:task-entered _ selected] selected (after 5000 nil))))
+   (is (every? (fn [module]
+                (seq (ets/match_object :beam_lisp_code_leases
+                       (tuple (tuple module pid :_) true)))) (:modules graph)))
+   (erlang/exit creator :kill)
+   (is (down! creator)) (is (Process/alive? pid))
+   (is (= :waiting (:status (generation/retire! graph))))
+   (erlang/send pid :finish)
+   (is (= 42 (receive [:task-answer value] value (after 5000 nil))))
+   (is (down! pid)) (is (retired? graph))
+   (finally (when (Process/alive? creator) (erlang/exit creator :kill))
+    (when (and pid (Process/alive? pid)) (erlang/exit pid :kill))
+    (generation/retire! graph)))))
+
+(deftest explicit-private-work-shutdown-releases-owned-code
+ (let [parent (erlang/self)
+       work (task/async-nolink (fn [] (erlang/send parent :task-running) (receive :never nil)))
+       pid (task/pid work)]
+  (try
+   (is (= :task-running (receive :task-running :task-running (after 5000 nil))))
+   (task/shutdown work :brutal_kill)
+   (is (down! pid))
+   (finally (when (Process/alive? pid) (task/shutdown work :brutal_kill))))))
+
+
+(deftest abandoning-a-timeout-reply-does-not-cancel-accepted-work
+ (let [parent (erlang/self)
+       work (task/async-nolink (fn [] (erlang/send parent :ignored-task-entered)
+                                (receive :finish :late-result)))
+       pid (task/pid work) reference (erlang/map_get :ref work)]
+  (try
+   (is (= :ignored-task-entered (receive :ignored-task-entered :ignored-task-entered (after 5000 nil))))
+   (is (nil? (task/yield work 0)))
+   (is (nil? (task/ignore work)))
+   (is (Process/alive? pid))
+   (erlang/send pid :finish)
+   (is (down! pid))
+   (is (= :no-late-reply
+          (receive
+           [seen _] :when (= seen reference) :reply-leaked
+           [:DOWN seen :process _ _] :when (= seen reference) :monitor-leaked
+           (after 0 :no-late-reply))))
+   (finally (when (Process/alive? pid) (erlang/send pid :finish) (down! pid))))))
+
+(deftest invalid-actions-and-link-kinds-refuse-before-retaining-or-executing
+ (let [effects (atom 0) before (ets/info :beam_lisp_code_leases :size)]
+  (is (thrown? (task/async :keyword)))
+  (is (thrown? (task/async (fn [_] (swap! effects inc)))))
+  (is (thrown? (BeamLisp.Refs/task_exec (fn [] (swap! effects inc)) :invalid-kind)))
+  (is (= 0 @effects))
+  (is (= before (ets/info :beam_lisp_code_leases :size)))))
