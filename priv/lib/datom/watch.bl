@@ -73,7 +73,7 @@
 (ns datom.watch
   (:require [datom.conn] [datom.db] [datom.index] [datom.store]
             [datom.query.engine] [datom.query.parse]
-            [datom.query.relation] [datom.query.rules]))
+            [datom.query.relation] [datom.query.rules] [proc.callback :as owned-callback]))
 
 ;; ── recognising the interest shape ──────────────────────────────────
 
@@ -360,70 +360,148 @@
                    {:added #{} :removed #{}} entities)]
         (when (or (seq (:added diff)) (seq (:removed diff))) diff)))))
 
-;; ── the watch process ───────────────────────────────────────────────
+;; ── owned watch execution and acknowledged drain ──────────────────────
 
-(defn- run-t1
-  "The T1 loop: listen, match each commit's delta against `pattern`, fire
-   `callback` with the matching change maps."
-  [conn pattern callback]
-  (datom.conn/listen! conn)
-  (loop []
-    (receive
-      [:datom/tx _basis tx-datoms]
-        (let [changes (pattern-matches pattern tx-datoms)]
-          (when (seq changes) (callback changes))
-          (recur))
-      [:datom/watch-stop] (datom.conn/unlisten! conn)
-      (after 3600000 (recur)))))
+(defn- stop-requested? []
+ (receive [:datom/watch-stop] true (after 0 false)))
 
-(defn- run-t2a
-  "The T2a loop: listen, prefilter on touched attributes, and on a
-   relevant commit run the query over before/after and fire `callback`
-   with the diff. Holds the last db value to diff against."
-  [conn query inputs callback]
-  (datom.conn/listen! conn)
-  (let [parsed (datom.query.parse/parse query)
-        attrs (query-attrs parsed inputs)]
-    (loop [db-before (datom.conn/db conn)]
-      (receive
-        [:datom/tx _basis tx-datoms]
-          (if (touches? attrs tx-datoms)
-            (let [db-after (datom.conn/db conn)
-                  d (delta-diff query inputs db-before db-after _basis tx-datoms)]
-              (when (some? d) (callback d))
-              (recur db-after))
-            (recur db-before))
-        [:datom/watch-stop] (datom.conn/unlisten! conn)
-        (after 3600000 (recur db-before))))))
-
-(defn watch
-  "Spawn a watch over `conn`, returning a watch reference (a pid) to pass
-   to `unwatch`.
-
-   `interest` is either:
-     * a bare PATTERN `[?e :order/status :shipped]` (T1) — `callback` gets a
-       vector of change maps `{:datom :e :a :v :bindings :added}`, one per
-       matching tx-datom;
-     * a full QUERY (T2a), a `[:find … :where …]` vector or map, possibly
-       `auth/guard`'d — `callback` gets a diff `{:added :removed}` of result
-       tuples whenever a relevant commit changes the answer.
-
-   `inputs` are the query's `:in` arguments (e.g. a query vector for a
-   `similar-to` clause); omit for T1 or an input-free query.
-
-   The watch runs in its own process: a crashing callback takes down only
-   the watch, and its backpressure never reaches the writer."
-  ([conn interest callback] (watch conn interest [] callback))
-  ([conn interest inputs callback]
-   (erlang/spawn
-     (fn []
-       (if (query-interest? interest)
-         (run-t2a conn interest inputs callback)
-         (run-t1 conn interest callback))))))
+(defn- await-stop [pid monitor timeout-ms]
+ (receive
+  [:DOWN ref :process dead _] :when (and (= ref monitor) (= dead pid)) :ok
+  (after timeout-ms
+   (throw (ex-info "Watch still has accepted work to drain"
+            {:kind :watch-draining :pid pid :timeout-ms timeout-ms})))))
 
 (defn unwatch
-  "Stop a watch started by `watch`. Idempotent and safe on a dead watch."
-  [watch-ref]
-  (if (Process/alive? watch-ref)
-    (do (erlang/send watch-ref [:datom/watch-stop]) :ok)
-    :ok))
+ "Stop admission and wait for the watch's query/callback to finish. :ok means
+  the process is down, not merely that a stop message was sent. A deadline
+  reports :watch-draining and never kills/replays accepted callback effects.
+  Calling from its own callback requests stop and returns :stopping."
+ ([watch-ref] (unwatch watch-ref 5000))
+ ([watch-ref timeout-ms]
+  (when-not (and (erlang/is_pid watch-ref) (= (erlang/node watch-ref) (erlang/node))
+                (erlang/is_integer timeout-ms) (<= 0 timeout-ms 60000))
+   (throw (ex-info "Invalid watch drain request" {:kind :invalid-watch-drain})))
+  (if (= watch-ref (erlang/self))
+   (do (erlang/send watch-ref [:datom/watch-stop]) :stopping)
+   (let [monitor (Process/monitor watch-ref)]
+    (try
+     (erlang/send watch-ref [:datom/watch-stop])
+     (await-stop watch-ref monitor timeout-ms)
+     (finally (Process/demonitor monitor (list :flush))))))))
+
+(defn- fire! [registration value]
+ (let [result (owned-callback/try-invoke! registration [value])]
+  (when-not (= :completed (:status result))
+   (throw (ex-info "Watch callback was not admitted"
+            {:kind :watch-callback-unavailable :status (:status result)})))
+  (:value result)))
+
+(defn- run-t1 [pattern registration]
+ (loop []
+  ;; A queued stop wins over commits not yet accepted, even under a busy stream.
+  (when-not (stop-requested?)
+   (receive
+    [:datom/tx _basis tx-datoms]
+     (let [changes (pattern-matches pattern tx-datoms)]
+      (when (seq changes) (fire! registration changes))
+      (recur))
+    [:datom/watch-stop] nil
+    (after 3600000 (recur))))))
+
+(defn- run-t2a [conn query inputs attrs registration initial-db]
+ (loop [db-before initial-db]
+  (when-not (stop-requested?)
+   (receive
+    [:datom/tx basis tx-datoms]
+     (if (touches? attrs tx-datoms)
+      (let [db-after (datom.conn/db conn)
+            diff (delta-diff query inputs db-before db-after basis tx-datoms)]
+       (when (some? diff) (fire! registration diff))
+       (recur db-after))
+      (recur db-before))
+    [:datom/watch-stop] nil
+    (after 3600000 (recur db-before))))))
+
+(defn- await-publication [ticket parent parent-monitor]
+ (receive
+  [:datom/watch-published seen] :when (= seen ticket) :published
+  [:datom/watch-stop] :stopped
+  [:DOWN ref :process dead _] :when (and (= ref parent-monitor) (= dead parent)) :stopped
+  (after 5000 :stopped)))
+
+(defn- run-watch [conn interest inputs registration ticket reply parent parent-monitor]
+ (let [pid (erlang/self)
+       drain (owned-callback/register! (fn [ms] (unwatch pid ms)))]
+  (try
+   (let [observer (datom.conn/register-observer! conn drain)]
+    (try
+     (let [query? (query-interest? interest)
+           attrs (when query? (query-attrs (datom.query.parse/parse interest) inputs))]
+      (when-not (stop-requested?)
+       (datom.conn/listen! conn)
+       (let [initial-db (when query? (datom.conn/db conn))]
+        (erlang/send reply [ticket pid :armed])
+        (when (= :published (await-publication ticket parent parent-monitor))
+         (Process/demonitor parent-monitor (list :flush))
+         (if query?
+          (run-t2a conn interest inputs attrs registration initial-db)
+          (run-t1 interest registration))))))
+     (finally
+      (datom.conn/unlisten! conn)
+      (datom.conn/unregister-observer! conn observer))))
+   (finally (owned-callback/unregister! drain)))))
+
+(defn- await-start [conn interest inputs ticket reply parent]
+ (let [parent-monitor (Process/monitor parent)]
+  (try
+   (receive
+    [:datom/watch-start seen registration] :when (= seen ticket)
+     (try (run-watch conn interest inputs registration ticket reply parent parent-monitor)
+      (finally (owned-callback/unregister! registration)))
+    [:datom/watch-stop] nil
+    [:DOWN ref :process dead _] :when (and (= ref parent-monitor) (= dead parent)) nil
+    (after 5000 nil))
+   (finally (Process/demonitor parent-monitor (list :flush))))))
+
+(defn- await-armed [pid monitor ticket]
+ (receive
+  [seen sender :armed] :when (and (= seen ticket) (= sender pid))
+   (do (erlang/send pid [:datom/watch-published ticket]) pid)
+  [:DOWN ref :process dead reason] :when (and (= ref monitor) (= dead pid))
+   (throw (ex-info "Watch did not arm" {:kind :watch-start-failed :reason reason}))
+  (after 5000
+   (erlang/send pid [:datom/watch-stop])
+   (throw (ex-info "Watch startup was not acknowledged"
+            {:kind :watch-start-uncertain :pid pid})))))
+
+(defn- flush-armed! [ticket]
+ (receive [seen _ :armed] :when (= seen ticket) nil (after 0 nil)))
+
+(defn watch
+ "Start a filtered watch and return its PID after listener/snapshot admission.
+  Interest is a T1 datom pattern or T2 query; callbacks keep their original
+  context and exact executable lease. The store's close fence drains registered
+  observers before deleting resources. No callback runs before startup is
+  published; query/callback failures affect only this watch."
+ ([conn interest callback] (watch conn interest [] callback))
+ ([conn interest inputs callback]
+  (when-not (and (fn? callback) (BeamLisp.Ns.Rt/invocable? callback 1))
+   (throw (ex-info "Watch requires a one-argument callback" {:kind :invalid-watch-callback})))
+  (let [registration (owned-callback/register! callback)
+        ticket (erlang/make_ref) reply (erlang/alias) parent (erlang/self)]
+   (try
+    (let [[pid monitor] (spawn-monitor #(await-start conn interest inputs ticket reply parent))]
+     (try
+      (let [accepted (owned-callback/transfer! registration pid)]
+       (when (= :cancelled accepted)
+        (erlang/send pid [:datom/watch-stop])
+        (throw (ex-info "Watch owner exited before acceptance" {:kind :watch-start-failed})))
+       (erlang/send pid [:datom/watch-start ticket accepted])
+       (await-armed pid monitor ticket))
+      (finally (Process/demonitor monitor (list :flush)))))
+    (finally
+     (erlang/unalias reply)
+     (flush-armed! ticket)
+     ;; This is cancelled after transfer and cannot release the child's ticket.
+     (owned-callback/unregister! registration))))))

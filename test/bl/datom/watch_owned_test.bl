@@ -1,0 +1,139 @@
+(ns datom.watch-owned-test
+ (:require [datom :as d] [datom.conn :as conn] [datom.watch :as watch]
+           [datom.db :as db] [proc.callback :as callback]
+           [reload.generation :as generation] [datom.query.functions :as functions]))
+
+(def SCHEMA [{:db/ident :watch/value :db/valueType :db.type/long :db/index true}])
+(def PATTERN '[?e :watch/value ?v])
+(defn- kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn- down! [pid]
+ (let [monitor (Process/monitor pid)]
+  (try (receive [:DOWN seen :process stopped _] :when (and (= seen monitor) (= stopped pid)) true
+         (after 5000 false))
+   (finally (Process/demonitor monitor (list :flush))))))
+(defn- eventually [f]
+ (loop [left 500]
+  (if (f) true (if (zero? left) false (do (Process/sleep 5) (recur (dec left)))))))
+
+(deftest listener-is-armed-before-return-and-stop-drains-current-callback-only
+ (let [c (d/connect SCHEMA) parent (erlang/self) calls (atom 0)
+       w (watch/watch c PATTERN
+           (fn [_] (swap! calls inc) (erlang/send parent [:entered (erlang/self)])
+             (receive :finish :done) (erlang/send parent :callback-finished)))]
+  (try
+   (is (contains? (set (conn/subscribers c)) w))
+   (d/transact! c [{:db/id 1 :watch/value 1}])
+   (is (= w (receive [:entered pid] pid (after 5000 nil))))
+   (d/transact! c [{:db/id 1 :watch/value 2}])
+   (is (= :watch-draining (kind #(watch/unwatch w 0))))
+   (is (Process/alive? w)) (is (= 1 @calls))
+   (let [stopper (spawn #(erlang/send parent [:stopped (watch/unwatch w)]))]
+    (is (= :waiting (receive [:stopped _] :premature (after 20 :waiting))))
+    (erlang/send w :finish)
+    (is (= :callback-finished (receive :callback-finished :callback-finished (after 5000 nil))))
+    (is (= :ok (receive [:stopped value] value (after 5000 nil))))
+    (is (down! stopper)))
+   (is (= 1 @calls)) (is (not (Process/alive? w)))
+   (is (= [] (conn/subscribers c))) (is (= :ok (watch/unwatch w)))
+   (finally (erlang/send w :finish) (watch/unwatch w) (conn/close! c)))))
+
+(deftest connection-close-drains-observers-before-deleting-their-store
+ (let [c (d/connect SCHEMA) parent (erlang/self) snapshot (d/db c)
+       w (watch/watch c PATTERN
+           (fn [_] (erlang/send parent :entered)
+             (receive :finish :done)
+             ;; Physical close before accepted read completion would crash here.
+             (erlang/send parent [:read-drained (count (db/datoms snapshot :eavt))])))]
+  (try
+   (d/transact! c [{:db/id 1 :watch/value 1}])
+   (is (= :entered (receive :entered :entered (after 5000 nil))))
+   (let [closer (spawn #(erlang/send parent [:closed (conn/close! c)]))]
+    (is (eventually #(= :closing @(:lifetime c))))
+    (is (= :watch-start-failed (kind #(watch/watch c PATTERN (fn [_] :unused)))))
+    (is (= :waiting (receive [:closed _] :premature (after 20 :waiting))))
+    (erlang/send w :finish)
+    (is (number? (receive [:read-drained n] n (after 5000 nil))))
+    (is (= :closed (receive [:closed _] :closed (after 5000 nil))))
+    (is (down! closer)))
+   (is (not (Process/alive? w))) (is (= :closed @(:lifetime c)))
+   (finally (erlang/send w :finish) (watch/unwatch w) (conn/close! c)))))
+
+(deftest a-watch-cannot-close-its-own-connection-before-it-drains
+ (let [c (d/connect SCHEMA) parent (erlang/self)
+       w (watch/watch c PATTERN
+           (fn [_] (erlang/send parent [:self-close (kind #(conn/close! c))]))) ]
+  (try
+   (d/transact! c [{:db/id 1 :watch/value 1}])
+   (is (= :release-from-observer (receive [:self-close value] value (after 5000 nil))))
+   (is (= :open @(:lifetime c)))
+   (is (= :ok (watch/unwatch w)))
+   (finally (watch/unwatch w) (conn/close! c)))))
+
+(deftest model-query-authority-is-conveyed-into-the-actual-watch-query
+ (let [c (d/connect SCHEMA) calls (atom 0)
+       query '[:find ?e :where [?e :watch/value ?v] [(datom.watch-owned-test/probe ?v)]]]
+  (try
+   (BeamLisp.Env/intern "datom.watch-owned-test" "probe" (fn [_] (swap! calls inc) true))
+   (d/transact! c [{:db/id 1 :watch/value 1}])
+   (is (= 1 (count (d/q query (d/db c)))))
+   (is (pos? @calls)) (reset! calls 0)
+   (let [w (functions/with-only #(watch/watch c query (fn [_] (swap! calls inc))))]
+    (d/transact! c [{:db/id 1 :watch/value 2}])
+    (is (down! w)) (is (= 0 @calls))
+    (is (= :ok (watch/unwatch w))))
+   (finally (conn/close! c)))))
+
+(deftest subscriptions-keep-the-original-graph-and-retire-after-drain
+ (let [c (d/connect SCHEMA) parent (erlang/self)
+       graph (generation/prepare! {:application-id "watch-owned-graph"
+                 :native-modules #{"erlang"} :stable-namespaces #{"datom.watch"}
+                 :sources {"watch.owner"
+                   "(ns watch.owner (:require [datom.watch :as watch]))
+                    (defn answer [] 42)
+                    (defn start [conn parent]
+                      (watch/watch conn '[?e :watch/value ?v]
+                        (fn [_] (erlang/send parent [:old-answer (answer)]))))"}})
+       w (generation/invoke! graph "watch.owner/start" [c parent])]
+  (try
+   (is (= :waiting (:status (generation/retire! graph))))
+   (d/transact! c [{:db/id 1 :watch/value 1}])
+   (is (= 42 (receive [:old-answer value] value (after 5000 nil))))
+   (is (= :ok (watch/unwatch w)))
+   (is (eventually #(= :retired (:status (generation/retire! graph)))))
+   (finally (watch/unwatch w) (conn/close! c) (generation/retire! graph)))))
+
+(deftest creator-death-before-publication-never-executes-queued-callbacks
+ (let [c (d/connect SCHEMA) calls (atom 0) reply (erlang/alias)
+       ticket (erlang/make_ref) parent (spawn #(receive :stop nil))
+       start (BeamLisp.Env/fetch_exact! "datom.watch" "await-start")
+       [pid monitor] (spawn-monitor #(start c PATTERN [] ticket reply parent))
+       registration (callback/register! (fn [_] (swap! calls inc)))]
+  (try
+   (let [accepted (callback/transfer! registration pid)]
+    (erlang/send pid [:datom/watch-start ticket accepted])
+    (is (= :armed (receive [seen sender :armed] :when (and (= seen ticket) (= sender pid)) :armed
+                    (after 5000 nil))))
+    (d/transact! c [{:db/id 1 :watch/value 1}])
+    (erlang/exit parent :kill)
+    (is (down! pid)) (is (= 0 @calls))
+    (is (= [] (conn/subscribers c))))
+   (finally (erlang/unalias reply) (Process/demonitor monitor (list :flush))
+     (callback/unregister! registration) (watch/unwatch pid) (conn/close! c)))))
+
+(deftest creator-death-before-admission-never-subscribes
+ (let [c (d/connect SCHEMA) reply (erlang/alias) ticket (erlang/make_ref)
+       parent (spawn #(receive :stop nil))
+       start (BeamLisp.Env/fetch_exact! "datom.watch" "await-start")]
+  (try
+   (erlang/exit parent :kill) (is (down! parent))
+   (let [pid (spawn #(start c PATTERN [] ticket reply parent))]
+    (is (down! pid)) (is (= [] (conn/subscribers c))))
+   (finally (erlang/unalias reply) (conn/close! c)))))
+
+(deftest invalid-callbacks-never-publish-an-observer
+ (let [c (d/connect SCHEMA)]
+  (try
+   (is (= :invalid-watch-callback (kind #(watch/watch c PATTERN :keyword))))
+   (is (= :invalid-watch-callback (kind #(watch/watch c PATTERN (fn [] :wrong-arity)))))
+   (is (= [] (conn/subscribers c)))
+   (finally (conn/close! c)))))
