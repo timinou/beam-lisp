@@ -5,6 +5,7 @@
  (:require [env] [source-graph :as graph] [reader-node :as rn]
            [reader :as reader] [reload.static-call :as static-call]
            [reload.native-call :as native-call] [reload.registry-data :as registry-data]
+           [reload.binding-data :as binding-data]
            [lower :as lower] [reload]))
 
 (def ^:private prepared (atom {}))
@@ -311,7 +312,11 @@
         _ (doseq [reference (registry-data/references registries)]
             (when-not (contains? sources (first (String/split reference "/")))
              (refuse! :unsealed-registry-reference {:reference reference})))
-        roots (vec (distinct (concat roots registry-roots)))
+        late-roots (vec (distinct (mapcat binding-data/roots (vals sources))))
+        _ (doseq [name late-roots]
+            (when-not (contains? sources name)
+             (refuse! :unsealed-late-binding {:namespace name})))
+        roots (vec (distinct (concat roots registry-roots late-roots)))
         source-bytes (reduce + 0 (map #(if (string? %) (erlang/byte_size %) 0) (vals sources)))
         _ (when (> source-bytes 16777216) (refuse! :generation-source-budget {:bytes source-bytes}))
         compile-sources (into {} (map (fn [[name source]]
@@ -388,7 +393,8 @@
         (when (>= (count sources) 1024) (refuse! :generation-capacity {}))
         (let [source (try (BeamLisp.Loader/source_content name) (catch _ nil))]
          (when-not (string? source) (refuse! :missing-source {:namespace name}))
-         (recur (concat (rest todo) (second (graph/header source))) (assoc sources name source) boundary)))))))))
+         (recur (concat (rest todo) (second (graph/header source)) (binding-data/roots source))
+                (assoc sources name source) boundary)))))))))
 
 (defn- with-lock [key action] (BeamLisp.Env/with_generation_lock (tuple :sealed-generation key) action))
 
@@ -481,11 +487,27 @@
  ;; Inspect the compiler's actual ANF too: a trusted macro must not inject a
  ;; late reference to an unversioned app namespace after source rewriting.
  (let [names (set (concat (vals (:mapping planned)) (:stable-namespaces planned) ["core" "sugar" "rt" "clojure.re"]))
-       modules (set (mapcat namespace-modules names))]
+       modules (set (mapcat namespace-modules names))
+       late-modules (when (contains? (:stable-namespaces planned) "reload.binding")
+                      (set (namespace-modules "reload.binding")))]
   (letfn [(walk [node]
             (cond
              (map? node)
               (do
+               ;; Check resolved compiler bindings too. Refers or trusted
+               ;; macros cannot hide a dynamic/borrowed late-call capability.
+               (when (and (= :global (:op node)) (= "reload.binding" (:ns node))
+                          (= "call!" (:name node)))
+                (refuse! :invalid-late-binding {}))
+               (when (and (= :remote (:op node)) (contains? late-modules (:mod node))
+                          (= :call! (:fun node)))
+                (let [target (first (:args node))]
+                 (when-not (and (= :lit (:op target)) (string? (:val target)))
+                  (refuse! :invalid-late-binding {}))
+                 (let [reference (binding-data/reference (:val target))
+                       namespace (first (String/split reference "/"))]
+                  (when-not (contains? (:mapping planned) namespace)
+                   (refuse! :unsealed-late-binding {:namespace namespace})))))
                (when (or (and (= :global (:op node))
                               (contains? #{"core" "env" "reload" "compiler"} (:ns node))
                               (contains? forbidden (:name node)))
@@ -700,6 +722,11 @@
            (try
             (env/with-env scope
              (fn []
+              ;; Resolve this fixed SDK call surface before compiling app code.
+              ;; Otherwise the first cold call is a generic global invocation,
+              ;; whose literal target cannot be judged as an exact remote call.
+              (when (contains? (:stable-namespaces planned) "reload.binding")
+               (BeamLisp.Loader/ensure_ready "reload.binding"))
               ;; The legacy source-only pass treats macro/owner DSL labels as
               ;; variable references. Keep it for ordinary definitions; extended
               ;; definitions are checked from their actual expanded compiler ANF.
@@ -716,6 +743,11 @@
               (BeamLisp.Link/settle)
               (check-compiled! planned)
               (registry-data/check-fields! (:registries planned))
+              (doseq [reference (mapcat binding-data/references (vals (:sources (:input planned))))]
+               (let [[logical definition] (String/split reference "/")
+                     result (BeamLisp.Env/fetch_exact (get (:mapping planned) logical) definition)]
+                (when-not (and (tuple? result) (= :ok (elem result 0)) (fn? (elem result 1)))
+                 (refuse! :invalid-late-binding {:reference reference}))))
               (doseq [reference (registry-data/references (:registries planned))]
                (let [[logical definition] (String/split reference "/")
                      result (BeamLisp.Env/fetch_exact (get (:mapping planned) logical) definition)]
