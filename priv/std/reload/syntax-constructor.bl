@@ -1,0 +1,181 @@
+; A deliberately closed, eager subset of actual compiler ANF. Empty immediate
+; footprints alone do not prove a transform: lazy/function values defer effects.
+(ns reload.syntax-constructor (:require [system.ir :as ir] [reload.syntax-size :as size]))
+
+(defn- refuse! [detail]
+ (throw (ex-info "Unproved eager syntax constructor"
+                 {:kind :unproved-syntax-constructor :detail detail})))
+
+(defn- literal-shape [value budget depth]
+ (when (or (> depth 64) (neg? (swap! budget dec))) (refuse! :analysis-budget))
+ (cond
+  (nil? value) :nil
+  (or (string? value) (number? value) (erlang/is_atom value)) :data
+  ;; The compiler's only tuple datum needed by this subset is a symbol. A
+  ;; function-free native tuple can still impersonate a transient/remote handle;
+  ;; do not classify every eager term as source data.
+  (tuple? value) (if (and (= 2 (erlang/tuple_size value)) (= :symbol (elem value 0))
+                         (string? (elem value 1))) :data (refuse! :opaque-tuple))
+  (erlang/is_list value) (do (doseq [v value] (literal-shape v budget (inc depth))) :list)
+  (vector? value) (do (literal-shape (BeamLisp.FormMeta/meta value) budget (inc depth))
+                     (doseq [v value] (literal-shape v budget (inc depth))) :vector)
+  (map? value) (do (when (contains? value :__struct__) (refuse! :opaque-struct))
+                  (doseq [[k v] value] (literal-shape k budget (inc depth)) (literal-shape v budget (inc depth))) :data)
+  :else (refuse! :opaque-literal)))
+
+(defn- bounded-data-shape! [value limit]
+ (literal-shape value (atom limit) 0))
+
+(defn data-shape!
+ "Check the first-order input/output precondition without forcing lazy values.
+  No functions, pids, refs, ports, native descriptor tuples or arbitrary runtime
+  structs are accepted. Native symbol tuples are compiler data, not handles."
+ [value]
+ (bounded-data-shape! value size/INPUT-NODES))
+
+(def ^:private primitive-tests
+ #{[:erlang :== 2] [:erlang :=:= 2] [:erlang :/= 2] [:erlang :=/= 2]
+   [:erlang :is_atom 1] [:erlang :is_binary 1] [:erlang :is_integer 1]
+   [:erlang :is_list 1] [:erlang :is_map 1] [:erlang :is_tuple 1]})
+
+(defn- literal-key [node]
+ (let [value (if (and (= :remote (:op node)) (= :Elixir.BeamLisp.Ns.Rt (:mod node))
+                       (= :hash_key (:fun node)) (= 1 (count (:args node))))
+              (first (:args node)) node)]
+  (when-not (= :lit (:op value)) (refuse! :dynamic-map-key))
+  (when (= :__struct__ (:val value)) (refuse! :opaque-struct))
+  (:val value)))
+
+(defn shape!
+ "Prove eager, finite, first-order construction from actual ANF and parameter
+  shapes. No globals, user calls, callbacks, recursion, lazy values or arbitrary
+  native grants. Splice requires an eager sequence: its generic Enum fallback
+  is intentionally unavailable. Unknown compiler nodes fail closed."
+ [expression bindings]
+ (let [budget (atom 8192)]
+  (letfn [(walk [node locals depth]
+            (when (or (> depth 64) (neg? (swap! budget dec))) (refuse! :analysis-budget))
+            (when-not (map? node) (refuse! :invalid-ir))
+            (case (:op node)
+             :lit (literal-shape (:val node) budget depth)
+             :enil :list
+             :var (or (get locals (:name node)) (refuse! :unbound-variable))
+             :let (let [shape (walk (:init node) locals (inc depth))]
+                    (walk (:body node) (assoc locals (:name node) shape) (inc depth)))
+             :if (do (walk (:test node) locals (inc depth))
+                     (let [a (walk (:then node) locals (inc depth)) b (walk (:else node) locals (inc depth))]
+                      (cond (= a b) a (and (contains? #{:nil :list :sequence} a)
+                                          (contains? #{:nil :list :sequence} b)) :sequence :else :data)))
+             :do (let [values (mapv #(walk % locals (inc depth)) (:stmts node))]
+                   (or (last values) :nil))
+             :cons (do (walk (:head node) locals (inc depth))
+                       (when-not (= :list (walk (:tail node) locals (inc depth)))
+                        (refuse! :improper-list)) :list)
+             :tuple (do (when-not (and (= 2 (count (:elems node)))
+                                      (= :lit (:op (first (:elems node))))
+                                      (= :symbol (:val (first (:elems node))))) (refuse! :opaque-tuple))
+                        (doseq [v (:elems node)] (walk v locals (inc depth))) :data)
+             :map (do (doseq [pair (:pairs node)]
+                        (literal-key (first pair))
+                        (doseq [v pair] (walk v locals (inc depth)))) :data)
+             :struct
+              (let [fields (:fields node) field (first fields) key (first field) storage (second field)]
+               ;; Native storage tuples are permitted only inside the exact
+               ;; compiler-owned vector constructor, never as callable data.
+               (when-not (and (= :Elixir.BeamLisp.Vector (:mod node)) (= 1 (count fields))
+                              (= :lit (:op key)) (= :items (:val key)) (= :tuple (:op storage)))
+                (refuse! :opaque-struct))
+               (doseq [v (:elems storage)] (walk v locals (inc depth))) :vector)
+             :remote
+              (let [target [(:mod node) (:fun node) (count (:args node))]
+                    shapes (mapv #(walk % locals (inc depth)) (:args node))]
+               (cond
+                (contains? primitive-tests target) :data
+                (= target [:Elixir.BeamLisp.Ns.Core :list__bl_v 1])
+                 (if (= :list (first shapes)) :list (refuse! :list-input))
+                (= target [:Elixir.BeamLisp.Vector :new 1])
+                 (if (= :list (first shapes)) :vector (refuse! :vector-input))
+                (= target [:Elixir.BeamLisp.Ns.Rt :splice 2])
+                 (if (and (contains? #{:nil :list :vector :sequence} (first shapes))
+                          (= :list (second shapes))) :list (refuse! :opaque-splice))
+                (contains? #{[:Elixir.BeamLisp.Ns.Rt :get 2] [:Elixir.BeamLisp.Ns.Rt :get 3]
+                             [:Elixir.BeamLisp.Ns.Rt :hash_key 1]} target) :data
+                :else (refuse! {:remote target})))
+             (refuse! {:operation (:op node)})))]
+   (let [shape (walk expression bindings 0)]
+    (size/check! expression (keys bindings)) shape))))
+
+(defn- fixed-clauses! [node parameter-shapes]
+ (when-not (and (= :fn (:op node)) (seq (:clauses node))) (refuse! :macro-function))
+ (doseq [clause (:clauses node)]
+  (let [pats (:pats clause)]
+   (when-not (and (= (count pats) (count parameter-shapes))
+                 (every? #(= :pvar (:pop %)) pats)) (refuse! :macro-parameters))
+   (let [locals (into {} (map (fn [pat shape] [(:name pat) shape]) pats parameter-shapes))]
+    (when (:guard clause) (shape! (:guard clause) locals))
+    (shape! (:body clause) locals)))))
+
+(defn- macro-function! [node variadic?]
+ ;; The compiler represents EVERY anonymous fn with this exact one-step
+ ;; self-application scaffold. Permit that constructor only here; a recur or
+ ;; arbitrary apply in the executable body is still refused by shape!.
+ (let [self (:name node) outer (:init node) outer-clause (first (:clauses outer))
+       call (:body node) inner (ir/scaffold-inner node)]
+  (when-not (and (ir/self-scaffold? node)
+                (= (list {:pop :pvar :name self}) (:pats outer-clause))
+                (nil? (:guard outer-clause)) (= :apply (:op call))
+                (= :var (:op (:fn call))) (= self (:name (:fn call)))
+                (= 1 (count (:args call))) (= :var (:op (first (:args call))))
+                (= self (:name (first (:args call)))) (= :fn (:op inner)))
+   (refuse! :macro-scaffold))
+  (let [arity (count (:pats (first (:clauses inner))))
+        shapes (vec (repeat arity :data))]
+   (fixed-clauses! inner (if variadic? (assoc shapes (dec arity) :list) shapes)))))
+
+(defn macro! [initializer]
+ "Prove the compiler's exact tagged macro constructor before installing it.
+  Fixed macro parameters are source data; the compiler-owned variadic rest is
+  a proper list. Return no executable callbacks or mutable registry state."
+ (when-not (and (= :tuple (:op initializer)) (= 2 (count (:elems initializer)))
+                (= :lit (:op (first (:elems initializer))))
+                (= (erlang/binary_to_atom "$macro") (:val (first (:elems initializer)))))
+  (refuse! :macro-descriptor))
+ (let [value (second (:elems initializer))]
+  (if (= :let (:op value)) (macro-function! value false)
+   (do
+    (when-not (and (= :tuple (:op value)) (= 3 (count (:elems value)))
+                  (= :lit (:op (first (:elems value))))
+                  (= (erlang/binary_to_atom "$blfn") (:val (first (:elems value))))
+                  (= :map (:op (second (:elems value))))) (refuse! :macro-dispatch))
+    (doseq [pair (:pairs (second (:elems value)))] (macro-function! (second pair) false))
+    (let [variadic (nth (:elems value) 2)]
+     (when-not (and (= :lit (:op variadic)) (nil? (:val variadic)))
+      (when-not (and (= :tuple (:op variadic)) (= 2 (count (:elems variadic)))
+                    (= :lit (:op (first (:elems variadic))))
+                    (int? (:val (first (:elems variadic))))) (refuse! :macro-variadic))
+      (macro-function! (second (:elems variadic)) true))))))
+ true)
+
+(defn with-expansion!
+ "Own a fresh expansion budget at the compiler entrypoint. Nested compilation
+  shares its caller's budget; no global macro counter survives preparation."
+ [f]
+ (let [key :reload-managed-syntax-expansion previous (Process/get key)]
+  (if previous (f)
+   (do (Process/put key (atom 1024))
+       (try (f) (finally (Process/delete key)))))))
+
+(defn guard-macro
+ "Wrap an already-proved compiler-owned macro. Validate first-order input and
+  bounded eager output BEFORE compiler data->form/canonical-gensym traversal.
+  Recursive/mutual macro expansion consumes a shared compilation budget."
+ [value]
+ (let [function (elem value 1)]
+  (tuple (erlang/binary_to_atom "$macro")
+   (fn [& arguments]
+    (let [budget (Process/get :reload-managed-syntax-expansion)]
+     (when-not budget (refuse! :unowned-expansion))
+     (when (neg? (swap! budget dec)) (refuse! :expansion-budget))
+     (data-shape! arguments)
+     (let [result (BeamLisp.Ns.Rt/invoke function arguments)]
+      (bounded-data-shape! result size/OUTPUT-NODES) result))))))

@@ -7,6 +7,7 @@
            [reload.native-call :as native-call] [reload.registry-data :as registry-data]
            [reload.binding-data :as binding-data] [reload.execution :as execution]
            [reload.declaration :as declaration]
+           [reload.syntax-constructor :as syntax-constructor] [reload.macro-source :as macro-source]
            [lower :as lower] [reload]))
 
 (def ^:private prepared (atom {}))
@@ -138,7 +139,7 @@
 (defn- definition-candidate? [form]
  (let [items (children form) head (head-of form)]
   (and head
-   (or (contains? #{"ns" "defn" "defn-" "defserver"} head)
+   (or (contains? #{"ns" "defn" "defn-" "defmacro" "defserver"} head)
        (and (= "def" head) (immutable-form-candidate? (last items)))
        ;; A macro is evaluated only at the compiler boundary, and its expansion
        ;; must consist solely of checked definitions. Ordinary calls refuse.
@@ -151,16 +152,17 @@
        header (graph/header* source)
        aliases (nth header 2)
        required (set (second header))
-       local-definitions (set (keep #(when (contains? #{"def" "defn" "defn-" "defserver"} (head-of %))
+       checking-forms (map macro-source/executable-form (rest forms))
+       local-definitions (set (keep #(when (contains? #{"def" "defn" "defn-" "defmacro" "defserver"} (head-of %))
                                      (name-of (second (children %)))) (rest forms)))]
   (when-not (and (= name (first header)) (= "ns" (head-of (first forms)))
                 (= 1 (count (filter #(= "ns" (head-of %)) forms))))
    (refuse! :namespace-mismatch {:namespace name}))
   (doseq [form forms]
-   (check-reflective-forms! name form)
+   (check-reflective-forms! name (macro-source/executable-form form))
    (when-not (definition-candidate? form)
     (refuse! :effectful-generation {:namespace name :form (head-of form)})))
-  (let [definitions (keep #(when (contains? #{"def" "defn" "defn-" "defserver"} (head-of %))
+  (let [definitions (keep #(when (contains? #{"def" "defn" "defn-" "defmacro" "defserver"} (head-of %))
                             (name-of (second (children %)))) (rest forms))]
    (when (not= (count definitions) (count (distinct definitions)))
     (refuse! :duplicate-definition {:namespace name})))
@@ -169,10 +171,10 @@
     (refuse! :unsealed-dependency {:namespace name :dependency dependency})))
   ;; Admit only literal target/list candidates here; actual compiled list identity
   ;; and every native target are checked again before the exact IR executes.
-  (doseq [{:keys [module function]} (static-call/deferred-targets (rest forms))]
+  (doseq [{:keys [module function]} (static-call/deferred-targets checking-forms)]
    (when-not (contains? native module)
     (refuse! :undeclared-native-target {:namespace name :module module :function function})))
-  (doseq [[node symbol] (mapcat executable-symbols (rest forms))]
+  (doseq [[node symbol] (mapcat executable-symbols checking-forms)]
    (let [parts (String/split symbol "/") prefix (first parts)
          base (last parts) resolved (get aliases prefix prefix)]
     (when (unmanaged-producer? resolved base)
@@ -207,6 +209,12 @@
      (if (contains? #{:target :require} mode) (get mapping name text)
       (if (and (= mode :code) (= 2 (count parts)) (get mapping (first parts)))
        (str (get mapping (first parts)) "/" (second parts)) text)))
+   (and (= "syntax-quote" (head-of node)) (String/starts_with? text "`"))
+    (str "`" (rewrite-fragment (String/slice text 1 (String/length text)) mapping mode))
+   (and (= "unquote-splicing" (head-of node)) (String/starts_with? text "~@"))
+    (str "~@" (rewrite-fragment (String/slice text 2 (String/length text)) mapping mode))
+   (and (= "unquote" (head-of node)) (String/starts_with? text "~"))
+    (str "~" (rewrite-fragment (String/slice text 1 (String/length text)) mapping mode))
    (and (= :list tag) (= "deref" (head-of node))
         (= 2 (count (children node))) (String/starts_with? text "@"))
     ;; The reader emits (deref operand), while the source span starts with @.
@@ -294,7 +302,7 @@
 (declare native-hazard-symbol?)
 
 (defn- check-native-source [name source sources stable native]
- (let [targets (static-call/deferred-targets (BeamLisp.Reader/read_string source))]
+ (let [targets (static-call/deferred-targets (map macro-source/executable-form (BeamLisp.Reader/read_string source)))]
   (doseq [{:keys [module function]} targets]
    ;; Structural admission grants no code execution. Expanded ANF must still
    ;; prove Core list identity. Keep the existing conservative native spelling
@@ -507,6 +515,7 @@
     (refuse! :unmanaged-compiled-producer {:namespace name :symbol symbol})))))
 
 (defn- compile-exact [planned form env]
+ (syntax-constructor/with-expansion! (fn []
  (:expression
   (native-call/specialize (BeamLisp.Compiler/compile form env)
    (fn [{:keys [module function]}]
@@ -514,7 +523,7 @@
      (when-not (contains? (:native-modules planned) name)
       (refuse! :undeclared-native-target {:module name :function function}))
      (when (native-hazard? module function)
-      (refuse! :unmanaged-compiled-producer {:module module :function function})))))))
+      (refuse! :unmanaged-compiled-producer {:module module :function function})))))))))
 
 (defn- definition-initializer [compiled namespace definition]
  ;; Read the initializer from the exact compiled registration, including its
@@ -709,6 +718,8 @@
   (erlang/is_function value) (BeamLisp.Env/callback_modules value)
   (and (erlang/is_tuple value) (= 3 (erlang/tuple_size value)) (= :$blfn (elem value 0)))
   (BeamLisp.Env/callback_modules value)
+  (and (erlang/is_tuple value) (= 2 (erlang/tuple_size value))
+       (= (erlang/binary_to_atom "$macro") (elem value 0))) (executable-values (elem value 1))
   (map? value) (mapcat executable-values (mapcat (fn [[k v]] (list k v)) value))
   (or (vector? value) (list? value) (set? value)) (mapcat executable-values value)
   :else []))
@@ -729,13 +740,15 @@
                (swap! declared conj definition)
                (when-not (BeamLisp.Env/local_var? name definition)
                 (BeamLisp.Env/intern name definition nil))))
-             (if (contains? #{"defn" "defn-" "def" "defserver"} head)
+             (if (contains? #{"defn" "defn-" "defmacro" "def" "defserver"} head)
              (let [definition (name-of (second items))
                    compiled (compile-exact planned form env)]
-              (check-expanded-source! name form)
+              (check-expanded-source! name (macro-source/executable-form form))
               (when (or (nil? definition) (contains? @seen definition))
                (refuse! :duplicate-definition {:namespace name :definition definition}))
               (swap! seen conj definition)
+              (when (= head "defmacro")
+               (syntax-constructor/macro! (definition-initializer compiled name definition)))
               (when (= head "def")
                (let [initializer (definition-initializer compiled name definition)]
                 (check-anf! planned initializer)
@@ -748,12 +761,15 @@
                  (refuse! :unmanaged-owner-descriptor {:namespace name}))
                 (doseq [clause (:clauses descriptor)] (check-anf! planned (:body clause)))))
               (let [value (evaluate-exact! compiled)]
+               (when (= head "defmacro")
+                (BeamLisp.Env/intern name definition (syntax-constructor/guard-macro value)))
                (when (contains? #{"defn" "defn-"} head) (record-factory! factory-targets name definition))
                (when (= head "defserver") (swap! value-modules conj value))
-               (when (= head "def")
+               (when (contains? #{"def" "defmacro"} head)
                 (swap! value-modules into (filter #(String/starts_with? (erlang/atom_to_binary % :utf8)
                                                     "Elixir.BeamLisp.Eval.") (executable-values value))))))
-             (let [expanded (BeamLisp.Compiler/macroexpand_1 (rn/node-form form) name)]
+             (let [expanded (syntax-constructor/with-expansion!
+                              #(BeamLisp.Compiler/macroexpand_1 (rn/node-form form) name))]
               (when (= expanded form)
                (refuse! :effectful-generation {:namespace name :form head}))
               (if (= "do" (head-of expanded))
