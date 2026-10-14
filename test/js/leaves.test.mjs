@@ -225,6 +225,9 @@ test("make_ref: unique immutable identities survive map/set lookup", () => {
   assert.equal(R.termCompare(a,a),0);
   assert.equal(R.termCompare(a,b),-R.termCompare(b,a));
   assert.notEqual(R.termCompare(a,b),0);
+  assert.equal(R.compare(a,a),0);
+  assert.equal(R.compare(a,b),-R.compare(b,a));
+  assert.notEqual(R.compare(a,b),0);
   assert.equal(R.termCompare(R.kw("z"),a),-1);
   assert.equal(R.termCompare(a,() => {}),-1);
   assert.match(R.printStr(a),/^#Ref<js\.\d+>$/);

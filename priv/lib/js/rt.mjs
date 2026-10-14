@@ -627,7 +627,7 @@ export function compare(a, b) {
     }
     case 6: case 7: { const ca = a.cnt, cb = b.cnt; if (ca !== cb) return ca < cb ? -1 : 1; return compare(printStr(a), printStr(b)); }
     case 8: { const n = Math.min(a.items.length, b.items.length); for (let i = 0; i < n; i++) { const c = compare(a.items[i], b.items[i]); if (c) return c; } return a.items.length - b.items.length; }
-    default: return 0;
+    default: return a instanceof Ref || b instanceof Ref ? termCompare(a, b) : 0;
   }
 }
 function numOf(x) { return x instanceof Flt ? x.v : x; }
