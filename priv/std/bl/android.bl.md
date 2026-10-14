@@ -9,7 +9,7 @@ reflection bridge that reaches every Android API.
 ```
 bl android doctor           what this machine has, and what it lacks
 bl android new NAME         a tree: env.bl, an app namespace, a first screen
-bl android build            native lib (zig) + APK (gradle), from the templates
+bl android build [--standalone] [--release]  native lib + APK, optionally self-contained
 bl android install          put the APK on the phone
 bl android push             beams + runtime onto the phone (no reinstall)
 bl android up               launch with distribution; ready for eval
@@ -24,6 +24,13 @@ bl android devtools [PORT]  the WebView's pages over Chrome DevTools
 `build` then `install`, `push`, `up` is the whole loop the first time. After a
 change to beam-lisp code only `push` and `up` are needed: the APK carries the
 native host, and the phone's `files/` carries everything the BEAM loads.
+
+`bl android build --standalone --release` bundles those files inside the APK.
+The launcher verifies and installs the bundle before starting BEAM. Bundle
+upgrades replace `files/otp/` and preserve the app's other private data.
+`--release` disables development distribution; sign the resulting release APK
+with an Android signing key before distributing it. The standalone debug build
+is available with `--standalone` alone.
 
 The tree declares its app in `env.bl`:
 
@@ -440,11 +447,40 @@ not an app that silently lacks its bridge.
             (str "-Dplugin_c_nifs=" (Path/join (priv) "android/jni/bl_android_nif.c"))]
            {:cd (Path/join out "android")})))
 
-(defn apk! [out]
+(declare stage!)
+
+(defn bundle! [t out]
+  (let [st (stage! t)
+        assets (Path/join out "android/app/src/main/assets")
+        archive (Path/join assets "bl-runtime.zip")]
+    (File/mkdir_p! assets)
+    (when (File/exists? archive) (File/rm! archive))
+    (step! "bundle runtime" "zip" ["-q" "-r" archive "otp" "-x" "*.a" "*.o"
+                                    "otp/erts-*/bin/beam.smp"] {:cd st})
+    (let [sum (step! "runtime digest" "sha256sum" [archive] {})]
+      (File/write! (Path/join assets "bl-runtime.sha256") (first (split (trim (:out sum)) " "))))
+    (let [activity (Path/join (list out "android/app/src/main/java"
+                         (join "/" (vec (split (:id t) "."))) "MainActivity.kt"))]
+      (edit! activity "Thread({ nativeStartBeam() }, \"beam-main\").start()"
+        (str "Thread({\n"
+             "                try {\n"
+             "                    val digest = assets.open(\"bl-runtime.sha256\").bufferedReader().use { it.readText().trim() }\n"
+             "                    io.beamlisp.android.BlRuntime.install(filesDir, digest) { assets.open(\"bl-runtime.zip\") }\n"
+             "                    nativeStartBeam()\n"
+             "                } catch (e: Throwable) {\n"
+             "                    android.util.Log.e(\"Beam Lisp\", \"Runtime startup failed\", e)\n"
+             "                    runOnUiThread { android.app.AlertDialog.Builder(this)\n"
+             "                        .setTitle(\"Could not start app\").setMessage(e.message ?: \"Runtime installation failed\")\n"
+             "                        .setPositiveButton(\"Close\") { _, _ -> finish() }.show() }\n"
+             "                }\n"
+             "            }, \"beam-main\").start()")))))
+
+(defn apk! [out release?]
   ; An absolute path: System.cmd looks a relative command up on PATH, not in :cd.
-  (step! "APK (gradle)" (Path/join out "android/gradlew") ["assembleDebug" "--no-daemon" "-q"]
+  (step! "APK (gradle)" (Path/join out "android/gradlew") [(if release? "assembleRelease" "assembleDebug") "--no-daemon" "-q"]
          {:cd (Path/join out "android") :env {"JAVA_HOME" (java-home)}})
-  (Path/join out "android/app/build/outputs/apk/debug/app-debug.apk"))
+  (Path/join out (if release? "android/app/build/outputs/apk/release/app-release-unsigned.apk"
+                            "android/app/build/outputs/apk/debug/app-debug.apk")))
 
 (defn build [t _st]
   (println (str "bl android build " (:app t) " (" (:id t) ", " (:abi t) ")"))
@@ -457,8 +493,14 @@ not an app that silently lacks its bridge.
     (println "  · project from mob_new templates")
     (render-templates! t mob-new out)
     (layer! t out)
+    (when (:release? t)
+      (edit! (Path/join (list out "android/app/src/main/java"
+                            (join "/" (vec (split (:id t) "."))) "MainActivity.kt"))
+             "        nativeSetActivity(this)\n"
+             "        android.system.Os.setenv(\"MOB_RELEASE\", \"1\", true)\n        nativeSetActivity(this)\n"))
     (native! t mob exqlite otp out)
-    (let [apk (apk! out)]
+    (when (:standalone? t) (bundle! t out))
+    (let [apk (apk! out (:release? t))]
       (println (str "  ✓ " apk))
       0)))
 ```
@@ -530,7 +572,7 @@ dependencies are missing.
    with the NDK linker; see docs/android."
   [abi]
   (let [p (Path/join (list (env-or "CARGO_TARGET_DIR" (Path/join (home) ".cache/cargo-target"))
-                           (str abi "-linux-android") "release/liblazy_memo.so"))]
+                           (str (if (= abi "arm64-v8a") "aarch64" abi) "-linux-android") "release/liblazy_memo.so"))]
     (when-not (File/exists? p)
       (throw (ex-info (str "no lazy_memo for " abi " at " p
                            " — cargo build --release --target " abi "-linux-android -p lazy_memo") {})))
@@ -571,7 +613,8 @@ dependencies are missing.
     ; the runtime.
     (let [ad (Path/join (:build t) "android-lib")]
       (File/rm_rf! ad)
-      (compile! "android.*" [(Path/join (priv) "lib/android")] ad)
+      (compile! "device runtime" [(Path/join (priv) "lib/android")
+                                   (Path/join (priv) "std/proc/owner-registry.bl")] ad)
       (doseq [f (Path/wildcard (Path/join ad "*.beam"))]
         (File/cp! f (Path/join (list bl "ebin" (Path/basename f))))))
     (step! "bl_android_nif stub" "erlc" ["-o" (Path/join bl "ebin") (Path/join (priv) "android/erl/bl_android_nif.erl")] {})
@@ -585,6 +628,9 @@ dependencies are missing.
           (copy-tree! d (Path/join lib (str nm "-" vsn "/ebin")))
           (when (File/dir? (Path/join app-dir "priv"))
             (copy-tree! (Path/join app-dir "priv") (Path/join lib (str nm "-" vsn "/priv")))))))
+    (doseq [d (:deps ((BeamLisp.Env/fetch! "deps" "read-lock") (:root t)))]
+      (when-not (File/dir? (Path/join lib (str (:name d) "-" (:vsn d) "/ebin")))
+        (throw (ex-info (str "missing compiled dependency " (:name d) " — run bl deps compile") {}))))
     (device-app-file! (Path/join bl "ebin/beam_lisp.app") (Path/join bl "ebin/beam_lisp.app") lib)
     (println "  · this tree")
     (File/mkdir_p! appd)
@@ -766,7 +812,7 @@ whole first frame as `data:`, so it is shown cut short.
 (defn run [args st]
   (u/register-paths st)
   (let [sub (first args)
-        more (vec (rest args))
+        more (vec (concat (rest args) (or (:dd st) [])))
         cwd (u/resolve ".")]
     (try
       (cond
@@ -780,7 +826,10 @@ whole first frame as `data:`, so it is shown cut short.
           (if (:error t)
             (do (u/io-err (str "bl android: " (:error t))) 1)
             (cond
-              (= sub "build") (build t st)
+              (= sub "build") (if (every? #{"--standalone" "--release"} more)
+                                (build (assoc t :standalone? (boolean (some #{"--standalone"} more))
+                                                :release? (boolean (some #{"--release"} more))) st)
+                                (u/usage-error "usage: bl android build [--standalone] [--release]"))
               (= sub "install") (install t st)
               (= sub "push") (push t st)
               (= sub "up") (up t st)
