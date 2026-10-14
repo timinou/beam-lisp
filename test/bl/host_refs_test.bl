@@ -68,6 +68,13 @@
 (def ^:private shim :Elixir.BeamLisp.Ns.Host.Refs)
 (def ^:private live :Elixir.BeamLisp.Refs)
 
+(defn- await-process-exit! [pid]
+  (let [monitor (Process/monitor pid)]
+    (try
+      (receive [:DOWN seen :process dead _] :when (and (= seen monitor) (= dead pid)) :ok
+        (after 10000 (throw (ex-info "Owned fixture worker did not drain" {}))))
+      (finally (Process/demonitor monitor (list :flush))))))
+
 (defn- drop! [mod]
   (do (code/purge mod) (code/delete mod) :ok))
 
@@ -278,7 +285,12 @@
         long (erlang/apply mod :future_exec
                (list (fn [] (erlang/apply :timer :sleep (list 5000)) :never)))
         cancel-running (erlang/apply mod :future_cancel (list long))
-        cancel-done (erlang/apply mod :future_cancel (list quick))]
+        cancel-done (erlang/apply mod :future_cancel (list quick))
+        ; A timed Task.await has already abandoned the reply alias, so its
+        ; Future must not be deref'd a second time. Drain actual process DOWN
+        ; before a later corpus replaces its physically retained module.
+        _ (doseq [work [f quick slow long]]
+            (await-process-exit! (erlang/map_get :pid (erlang/map_get :task work))))]
     (list shape f? not-f? d elsewhere timed-out finished cancel-running cancel-done)))
 
 (defn- future-error-corpus [mod]
@@ -411,7 +423,8 @@
                         mgot (receive [:mon child2] child2 (after 2000 :missing))
                         pl (erlang/apply mod :spawn_exec
                              (list (fn [] (erlang/send me (tuple :link (erlang/self)))) :link))
-                        lgot (receive [:link child3] child3 (after 2000 :missing))]
+                        lgot (receive [:link child3] child3 (after 2000 :missing))
+                        _ (doseq [pid [p (first pm) pl]] (await-process-exit! pid))]
                     (list (erlang/is_pid p) (erlang/== p got)
                           (erlang/is_pid (first pm)) (erlang/is_reference (nth pm 1))
                           (erlang/== (first pm) mgot)
@@ -477,36 +490,55 @@
 
 ; ── the production-atom stand-in ──────────────────────────────────────────
 
-(deftest pinned-refs-stands-in-at-the-production-atom
-  (testing "the pinned beam loaded over Elixir.BeamLisp.Refs answers, then restores"
-    (let [dir (tmp-dir)
-          orig-path (erlang/apply :code :which (list live))
-          orig-bin (File/read! (erlang/list_to_binary orig-path))
-          beam (Path/join dir "Elixir.BeamLisp.Refs.beam")
-          d (BeamLisp.Deferred/delay (fn [] 41))
-          dr (BeamLisp.Reactive/derive (list) (fn [] 7))
-          corpus (fn [] (list (atom-corpus live live) (watch-corpus live)
-                              (volatile-corpus live) (future-corpus live)
-                              (promise-corpus live) (native-corpus live d dr)))
-          before (corpus)]
-      (is (not= :non_existing orig-path) "precondition: the live beam is a readable file")
-      (try
-        ; compile at the EXACT atom, then load it OVER the live module
-        (BeamLisp.AOT/compile_host_file (refs-source)
-          (list (t2 :module live) (t2 :output_dir dir) (t2 :load? false)))
+(defn production-stand-in!
+  "Destructive ABI control for an isolated cold VM, never an owned ward worker."
+  []
+  (let [stack (elem (Process/info (erlang/self) :current_stacktrace) 1)]
+    (when (some (fn [frame] (= live (elem frame 0))) stack)
+      (throw (ex-info "Production Refs replacement requires an unowned cold entry" {}))))
+  (let [dir (tmp-dir)
+        orig-path (erlang/apply :code :which (list live))
+        orig-bin (File/read! (erlang/list_to_binary orig-path))
+        beam (Path/join dir "Elixir.BeamLisp.Refs.beam")
+        d (BeamLisp.Deferred/delay (fn [] 41))
+        dr (BeamLisp.Reactive/derive (list) (fn [] 7))
+        corpus (fn [] (list (atom-corpus live live) (watch-corpus live)
+                            (volatile-corpus live) (future-corpus live)
+                            (promise-corpus live) (native-corpus live d dr)))
+        before (corpus)]
+    (when (= :non_existing orig-path)
+      (throw (ex-info "The live Refs beam must be a readable file" {})))
+    (try
+      ; Compile at the EXACT production atom, load over it, compare the whole
+      ; actual corpus, then restore. This deliberately bypasses code leases and
+      ; therefore belongs in its own OS VM with no owned Refs execution frame.
+      (BeamLisp.AOT/compile_host_file (refs-source)
+        (list (t2 :module live) (t2 :output_dir dir) (t2 :load? false)))
+      (drop! live)
+      (code/load_binary live (erlang/binary_to_list beam) (File/read! beam))
+      (when (not= before (corpus))
+        (throw (ex-info "Pinned production Refs ABI changed" {})))
+      (finally
         (drop! live)
-        (code/load_binary live (erlang/binary_to_list beam) (File/read! beam))
-        ; the pinned module answers the whole corpus, answer for answer —
-        ; including the cross-module reads, now self-reads
-        (is (= before (corpus)))
-        (finally
-          (drop! live)
-          (code/load_binary live orig-path orig-bin)))
-      ; RESTORED: the live module answers again at the same atom
-      (let [a (BeamLisp.Refs/atom 2)]
-        (is (= 3 (BeamLisp.Refs/swap! a inc)))
-        (is (= 3 (BeamLisp.Refs/deref a))))
-      (File/rm_rf! dir))))
+        (code/load_binary live orig-path orig-bin)))
+    (let [a (BeamLisp.Refs/atom 2)]
+      (when (or (not= 3 (BeamLisp.Refs/swap! a inc))
+                (not= 3 (BeamLisp.Refs/deref a)))
+        (throw (ex-info "Restored production Refs does not answer" {}))))
+    (File/rm_rf! dir)
+    :ok))
+
+(deftest pinned-refs-stands-in-at-the-production-atom
+  (testing "a separate cold VM replaces the production atom and restores its ABI"
+    (let [root (BeamLisp/cwd)
+          [text status] (System/cmd "timeout"
+                          (list "-k" "5" "120" (Path/join root "bin/bl") "--cold" "run"
+                                (Path/join root "test/fixtures/host-refs-standin.bl"))
+                          (list (tuple :cd root) (tuple :stderr_to_stdout true)
+                                (tuple :env (list (tuple "BL_DAEMON" "off")
+                                                  (tuple "BEAM_LISP_AOT_REPAIR" "off")))))]
+      (is (= 0 status) text)
+      (is (String/contains? text "REFS_PRODUCTION_ATOM_OK") text))))
 
 ; ── cold start: nothing but the pinned beam ───────────────────────────────
 
