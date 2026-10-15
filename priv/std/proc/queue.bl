@@ -113,6 +113,7 @@
             [datom.store-ets :as store-ets]
             [proc.server :refer [extend-clause!]]
             [proc.table :as table]
+            [proc.queue-family :as family]
             [proc.tick :as tick]
             [proc.fence :as fence]
             [diagnostics :as diag]))
@@ -376,6 +377,8 @@
 
 (defn- conn-key [srv] (tuple :bl-queue-conn (server-name srv)))
 
+(declare attach-store!)
+
 (defn conn
   "The connection over this queue's store, published once per VM.
 
@@ -386,12 +389,25 @@
    queue can still read it."
   [srv]
   (or (erlang/apply :persistent_term :get (list (conn-key srv) nil))
+      (when-let [g (Process/get :bl_generation)]
+       (when-let [connection (family/existing-store g (server-name srv))]
+        (attach-store! srv connection)))
       (BeamLisp.Env/with_generation_lock (tuple :queue-store (server-name srv))
        (fn []
         (or (erlang/apply :persistent_term :get (list (conn-key srv) nil))
             (let [c (datom/connect-with (store-ets/adopt (ensure-store! srv)) SCHEMA)]
               (erlang/apply :persistent_term :put (list (conn-key srv) c))
               c))))))
+
+(defn ensure-family-store!
+ "Validate family storage BEFORE an opaque reconcile factory can run. Existing
+  nonfamily queue/development behavior is unchanged; production families require
+  the actual already-open dedicated native-owned durable connection."
+ [srv]
+ (let [connection (conn srv)]
+  (when-let [g (Process/get :bl_generation)]
+   (family/validate-bound-store! g (server-name srv) connection))
+  connection))
 
 (defn- closed-file-rebind? [srv old current]
   (let [old-path (:path (ds/identity-of (:store old)))
@@ -703,6 +719,7 @@
                  (when-let [d (declaration srv)]
                    {:server srv :logical-server (keyword (logical-name srv)) :application-id (application-id srv)
                     :declaration d :inventory (protocol-inventory srv)
+                    :family (when app (family/member-evidence app (server-name srv)))
                     :store (let [store (ds/identity-of (:store (conn srv)))]
                              (if (:path store) {:kind :file :identity (:path store)}
                                {:kind :memory :identity (server-name srv)}))})
@@ -741,9 +758,11 @@
    queue's OWN rules (`:of`, `:unique`, `:partition`) without asking a process,
    and a rule a caller has to restate at every call site is a rule that drifts."
   [c srv d]
-  (datom/transact! c [{:db/id -1
-                       :queue/key (server-name srv)
-                       :queue/decl (assoc d :server (server-name srv))}]))
+  (let [g (Process/get :bl_generation)
+        member (when g (family/member-evidence (:application-id g) (server-name srv)))
+        published (cond-> (assoc d :server (server-name srv))
+                    member (assoc :family (select-keys member [:family :protocol :handler-generation])))]
+   (datom/transact! c [{:db/id -1 :queue/key (server-name srv) :queue/decl published}])))
 
 (defn declaration
   "The durable declaration this queue wrote at boot, or nil when this VM's store
@@ -928,7 +947,15 @@
        (let [sealed? (and (map? context) (:digest context))
              producer (or (get (:protocols context) (logical-name srv))
                           (get (:protocols context) (keyword (logical-name srv))))
-             producer-version (if (map? producer) (:protocol producer) producer)
+             family-contract (family/producer-contract (server-name srv))
+             _ (when family-contract (family/validate-reconcile-payload! job))
+             explicit-version (if (map? producer) (:protocol producer) producer)
+             _ (when (and explicit-version family-contract
+                          (not= explicit-version (:protocol family-contract)))
+                 (throw (ex-info "Explicit and source family protocols disagree" {:kind :conflicting-queue-protocol})))
+             producer-version (or explicit-version (:protocol family-contract))
+             _ (when (and family-contract (not= (:required-generation family-contract) (:generation d)))
+                 (throw (ex-info "Family handler declaration changed" {:kind :queue-family-owner-changed})))
              _ (when (and sealed? (nil? producer-version))
                  (throw (ex-info "Sealed generation has no queue producer contract"
                                  {:kind :undeclared-queue-protocol :server srv})))
@@ -947,6 +974,9 @@
              _ (when (and generation (contains? (:queue/fenced-generations admissions #{}) generation))
                  (throw (ex-info "Queue generation admissions are fenced"
                                  {:kind :generation-fenced :generation generation})))
+             _ (when (and (:required-generation family-contract)
+                          (contains? (:queue/fenced-generations admissions #{}) (:required-generation family-contract)))
+                 (throw (ex-info "Retained handler generation is fenced" {:kind :generation-fenced})))
              id (identity-token)
              now (tick/wall-ms)
              at (due-at now opts)
@@ -964,7 +994,8 @@
                          :job/attempts 0
                          :job/payload job
                          :job/diagnostic-context (merge (diag/context) {:diagnostics/job-id (diag/new-id)})}
-                        (if generation {:job/generation generation :job/required-generation generation} {})
+                        (if generation {:job/generation generation
+                                        :job/required-generation (or (:required-generation family-contract) generation)} {})
                         (if (:parent-id opts) {:job/parent-id (:parent-id opts)} {})
                         (if (some? ticket) {:job/ticket ticket} {})
                         (if (some? pk) {:job/partition pk} {}))
