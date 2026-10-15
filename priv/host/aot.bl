@@ -3929,6 +3929,145 @@
   (BeamLisp.CompilerData/check_first_order! value))
  value)
 
+; Private finite recipes model only interpreted sequence construction. They are
+; not native LazySeq resources and cannot cross the first-order API boundary.
+(defn- constructor_recipe? [value state]
+ (and (erlang/is_map value) (= 3 (erlang/map_size value))
+      (= :Elixir.BeamLisp.LazySeq (Map/get value :__struct__))
+      (= (:counter-frame state) (Map/get value :constructor-frame))
+      (int? (Map/get value :constructor-id))
+      (let [frame (erlang/get (:counter-frame state))]
+       (and (erlang/is_map frame)
+            (Map/has_key? (Map/get frame :recipes {}) (Map/get value :constructor-id))))))
+
+(defn- constructor_recipe_present! [value state]
+ (loop [pending (list value)]
+  (if (= (list) pending) false
+   (let [value (erlang/hd pending) remaining (erlang/tl pending)]
+    (constructor_step! state)
+    (cond
+     (constructor_recipe? value state) true
+     (erlang/is_list value)
+      (if (= (list) value) (recur remaining)
+       (recur (cons (erlang/hd value) (cons (erlang/tl value) remaining))))
+     (erlang/is_tuple value) (recur (erlang/++ (erlang/tuple_to_list value) remaining))
+     (erlang/is_map value)
+      (recur (Enum/reduce (maps/to_list value) remaining
+               (fn [entry rest] (cons (elem entry 0) (cons (elem entry 1) rest)))))
+     :else (recur remaining))))))
+
+(defn- constructor_register_callable! [function state]
+ (let [key (:counter-frame state) frame (erlang/get key)
+       callables (Map/get frame :callables {})]
+  (when (>= (erlang/map_size callables) 16384) (constructor_refuse :callable-budget))
+  (erlang/put key (Map/put frame :callables (Map/put callables function true)))
+ function))
+
+(defn- constructor_recipe_callable! [function state]
+ (let [function (if (and (erlang/is_tuple function) (= 3 (erlang/tuple_size function))
+                         (= :"$blfn" (elem function 0)))
+                  (Map/get (elem function 1) 0) function)
+       frame (erlang/get (:counter-frame state))]
+  (when-not (and (erlang/is_function function 0)
+                 (Map/has_key? (Map/get frame :callables {}) function))
+   (constructor_refuse :non-interpreted-recipe-thunk))
+  function))
+
+(defn- constructor_recipe_row! [recipe state]
+ (when-not (constructor_recipe? recipe state) (constructor_refuse :unowned-finite-recipe))
+ (Map/fetch! (Map/get (erlang/get (:counter-frame state)) :recipes)
+             (:constructor-id recipe)))
+
+(defn- constructor_recipe_put! [recipe row state]
+ (let [key (:counter-frame state) frame (erlang/get key)]
+  (erlang/put key (Map/put frame :recipes
+                   (Map/put (Map/get frame :recipes) (:constructor-id recipe) row))))
+ row)
+
+(defn- constructor_recipe_new! [kind thunk prefix state]
+ (let [thunk (when-not (= :input kind) (constructor_recipe_callable! thunk state))
+       serial (constructor_counter! state :recipe-serial 1)]
+  (when (> serial 4096) (constructor_refuse :finite-recipe-budget))
+  (constructor_charge! prefix state)
+  (constructor_allocation! 16 0 state)
+  (let [recipe {:__struct__ :Elixir.BeamLisp.LazySeq :constructor-frame (:counter-frame state)
+                :constructor-id serial}
+        row {:kind kind :status (if (= :input kind) :ready :pending)
+             :thunk thunk :prefix prefix :value (when (= :input kind) prefix)}]
+   (constructor_recipe_put! recipe row state) recipe)))
+
+(defn- constructor_recipe_value! [recipe state]
+ (let [row (constructor_recipe_row! recipe state)]
+  (case (:status row)
+   :ready (:value row)
+   :running (constructor_refuse :recursive-finite-recipe)
+   :failed (constructor_refuse :failed-finite-recipe)
+   :pending
+    (do
+     (constructor_recipe_put! recipe (assoc row :status :running) state)
+     (try
+      (let [value (constructor_invoke (:thunk row) (list) state)]
+       (constructor_internal_cost! value state)
+       (constructor_recipe_put! recipe (assoc row :status :ready :value value :thunk nil) state)
+       value)
+      (catch error
+       (constructor_recipe_put! recipe (assoc row :status :failed :thunk nil) state)
+       (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__))))
+   (constructor_refuse :invalid-finite-recipe-state))))
+
+(defn- constructor_recipe_sequence! [recipe state]
+ (constructor_step! state)
+ (when (> (constructor_counter! state :recipe-depth 1) 64)
+  (constructor_refuse :finite-recipe-depth))
+ (try
+  (let [row (constructor_recipe_row! recipe state)
+        value (constructor_recipe_value! recipe state)
+        tail (constructor_sequence! value state)
+        prefix (if (= :chain (:kind row)) (:prefix row) (list))
+        size (+ (erlang/length prefix) (erlang/length tail))]
+   (when (> size (:max-collection state)) (constructor_refuse :collection-budget))
+   (constructor_charge! (list prefix tail) state)
+   (constructor_allocation! (* 2 (erlang/length prefix)) 0 state)
+   (erlang/++ prefix tail))
+  (finally (constructor_counter! state :recipe-depth -1))))
+
+(defn- constructor_recipe_cell! [value state]
+ ;; A cursor/chain cell exposes an improper tail in the real runtime. Whole
+ ;; finite sequence consumption is supported; opaque physical cell views refuse
+ ;; until a faithful model exists, rather than silently changing their shape.
+ (if (constructor_recipe? value state)
+  (let [row (constructor_recipe_row! value state)]
+   (when (contains? #{:chain :input} (:kind row))
+    (constructor_refuse :opaque-finite-recipe-cell-observation))
+   (when (> (constructor_counter! state :recipe-depth 1) 64)
+    (constructor_refuse :finite-recipe-depth))
+   (try (constructor_recipe_cell! (constructor_recipe_value! value state) state)
+    (finally (constructor_counter! state :recipe-depth -1))))
+  (let [_ (constructor_eager_sequence_bound! value state)
+        cell (cond
+               (or (nil? value) (erlang/is_list value)) value
+               (vector? value) (BeamLisp.Vector/to_list value)
+               (set? value) (BeamLisp.Set/to_list value)
+               (erlang/is_binary value) (String/graphemes value)
+               (and (erlang/is_map value) (not (erlang/is_map_key :__struct__ value))) (maps/to_list value)
+               :else value)]
+   (if (= (list) cell) nil cell))))
+
+(defn- constructor_recipe_observation! [module function args state]
+ (when (constructor_recipe_present! args state)
+  (let [core? (contains? #{:Elixir.BeamLisp.Ns.Core :Elixir.BeamLisp.Ns.Rt} module)
+        allowed? (or
+                   (and core? (contains? #{"reduce" "map" "mapv" "mapcat" "filter" "remove"
+                                           "run!" "some" "every?" "into" "concat" "apply"
+                                           "first" "nth" "count" "empty?" "seq" "to-list" "vec"
+                                           "nil?" "some?" "not" "invoke" "splice"} function))
+                   (and (= :Elixir.BeamLisp.LazySeq module)
+                        (contains? #{"new" "from_fun" "chain" "input" "cell"} function))
+                   (and (= :Elixir.Enum module) (= "join" function))
+                   (and (= :erlang module) (contains? #{"==" "=:=" "/=" "=/="} function)
+                        (or (nil? (first args)) (nil? (second args)))))]
+   (when-not allowed? (constructor_refuse :opaque-finite-recipe-observation)))))
+
 (defn- constructor_internal_cost! [value state]
  ;; No protocol/Enumerable/callback inspection. Fn values are interpreter-owned
  ;; internal capabilities; source literal/input endpoints reject them. Captured
@@ -3956,6 +4095,7 @@
       (do (when (> (erlang/tuple_size v) 65536) (constructor_refuse :aggregate-node-budget))
           (recur (Enum/reduce (erlang/tuple_to_list v) rest-tasks
                    (fn [item acc] (cons (tuple item (inc depth)) acc))) nodes bytes))
+     (constructor_recipe? v state) (recur rest-tasks nodes bytes)
      (and (erlang/is_map v) (erlang/is_map_key :__struct__ v))
       ;; Validate the canonical container ONCE through its storage-aware raw
       ;; checker. Its private MapSet/trie storage is not an independent public
@@ -4019,7 +4159,8 @@
      (recur (erlang/tl remaining) (cons value output) nodes bytes))))))
 (defn- constructor_sequence! [value state]
  (constructor_eager_sequence_bound! value state)
- (cond (nil? value) (list) (erlang/is_list value) value
+ (cond (constructor_recipe? value state) (constructor_recipe_sequence! value state)
+       (nil? value) (list) (erlang/is_list value) value
        (erlang/is_binary value) (String/graphemes value)
        (vector? value) (BeamLisp.Vector/to_list value)
        (set? value) (BeamLisp.Set/to_list value)
@@ -4030,7 +4171,8 @@
  ;; Rt's eager paths can materialize graphemes/map entries. Bound their input
  ;; BEFORE calling the runtime; approved Vector/Set storage was already checked
  ;; by the shared raw-data gate. Deferred/foreign structs never reach this point.
- (let [size (cond (erlang/is_binary value) (erlang/byte_size value)
+ (let [size (cond (constructor_recipe? value state) 0
+                  (erlang/is_binary value) (erlang/byte_size value)
                   (erlang/is_list value) (erlang/length value)
                   (erlang/is_tuple value) (erlang/tuple_size value)
                   (vector? value) (BeamLisp.Vector/count value)
@@ -4051,7 +4193,8 @@
 (defn- constructor_bounded_result! [state value]
  (when (and (or (erlang/is_number value) (erlang/is_binary value))
              (> (erlang/external_size value) 1048576)) (constructor_refuse :scalar-size-budget))
- (when (and (or (erlang/is_list value) (vector? value) (map? value))
+ (when (and (not (constructor_recipe? value state))
+             (or (erlang/is_list value) (vector? value) (map? value))
              (> (count value) (:max-collection state))) (constructor_refuse :collection-budget))
  (constructor_internal_cost! value state) value)
 
@@ -4074,6 +4217,8 @@
     (= :nomatch b) :nomatch
     :else
       (let [_ (constructor_step! state) op (:pop p)]
+        (when (and (constructor_recipe? v state) (not= :pvar op))
+         (constructor_refuse :opaque-finite-recipe-observation))
         (cond
           (= op :pvar) (if (contains? b (:name p))
                             (if (erlang/=:= (get b (:name p)) v) b :nomatch)
@@ -4117,19 +4262,24 @@
                  [cl b]))))]
     (if (nil? hit) (on-fail) (constructor_interpret (:body (first hit)) (second hit) state))))
 
-(defn- constructor_invoke [function args]
+(defn- constructor_invoke [function args state]
+ (when (and (not (erlang/is_function function))
+             (not (and (erlang/is_tuple function) (= 3 (erlang/tuple_size function))
+                       (= :"$blfn" (elem function 0))))
+             (constructor_recipe_present! (list function args) state))
+  (constructor_refuse :opaque-finite-recipe-observation))
  (cond (erlang/is_function function) (erlang/apply function args)
        (and (erlang/is_tuple function) (= 3 (erlang/tuple_size function))
             (= :"$blfn" (elem function 0)))
         (if-let [fixed (get (elem function 1) (count args))]
-         (constructor_invoke fixed args)
+         (constructor_invoke fixed args state)
          (let [variadic (elem function 2)]
           (when-not (and (erlang/is_tuple variadic) (= 2 (erlang/tuple_size variadic))
                          (int? (elem variadic 0)) (>= (count args) (elem variadic 0)))
            (constructor_refuse :callable-arity))
           (constructor_invoke (elem variadic 1)
            (erlang/++ (Enum/take args (elem variadic 0))
-                      (list (Enum/drop args (elem variadic 0)))))))
+                      (list (Enum/drop args (elem variadic 0)))) state)))
        (keyword? function) (if (contains? #{1 2} (count args))
                              (BeamLisp.Ns.Rt/get (first args) function (second args))
                              (constructor_refuse :keyword-arity))
@@ -4172,6 +4322,7 @@
    (constructor_core_arity! primitive-name (count args)))
   ;; Refuse excessive combined inputs before any native allocation primitive.
   (constructor_internal_cost! args state)
+  (constructor_recipe_observation! module primitive-name args state)
   (when (and (= module :Elixir.BeamLisp.Ns.Core)
              (contains? #{"first" "second" "rest" "next" "last" "nth" "count" "empty?"
                           "seq" "take" "drop" "to-list" "vec"} primitive-name))
@@ -4184,6 +4335,10 @@
    (constructor_charge! args state))
   (constructor_bounded_result! state
   (cond
+   (and (constructor_recipe_present! args state)
+        (contains? #{[:erlang :== 2] [:erlang :=:= 2] [:erlang :/= 2] [:erlang :=/= 2]} target)
+        (or (nil? (first args)) (nil? (second args))))
+    (erlang/apply module function args)
    (contains? pure-bifs target) (erlang/apply module function args)
    (= module :Elixir.BeamLisp.Ns.Core)
     (case primitive-name
@@ -4204,15 +4359,23 @@
      "neg?" (BeamLisp.Ns.Rt/neg? (first args))
      "number?" (BeamLisp.Ns.Rt/number? (first args))
      "float?" (BeamLisp.Ns.Rt/float? (first args))
+     "sorted?" (BeamLisp.Ns.Rt/sorted? (first args))
      "gensym" (constructor_gensym! args state)
-     "first" (BeamLisp.Ns.Rt/first (first args))
+     "first" (BeamLisp.Ns.Rt/first (if (constructor_recipe? (first args) state)
+                                        (constructor_recipe_sequence! (first args) state) (first args)))
      "second" (BeamLisp.Ns.Rt/nth (first args) 1)
      "rest" (BeamLisp.Ns.Rt/rest (first args)) "next" (BeamLisp.Ns.Rt/next (first args))
      "last" (constructor_eager_last (first args))
-     "nth" (if (= 2 (count args)) (BeamLisp.Ns.Rt/nth (first args) (second args))
-               (BeamLisp.Ns.Rt/nth (first args) (second args) (nth args 2)))
-     "count" (BeamLisp.Ns.Rt/count (first args)) "empty?" (BeamLisp.Ns.Rt/empty? (first args))
-     "seq" (BeamLisp.Ns.Rt/seq (first args)) "vec" (vec (constructor_sequence! (first args) state))
+     "nth" (let [value (if (constructor_recipe? (first args) state)
+                         (constructor_recipe_sequence! (first args) state) (first args))]
+             (if (= 2 (count args)) (BeamLisp.Ns.Rt/nth value (second args))
+               (BeamLisp.Ns.Rt/nth value (second args) (nth args 2))))
+     "count" (BeamLisp.Ns.Rt/count (if (constructor_recipe? (first args) state)
+                                        (constructor_recipe_sequence! (first args) state) (first args))) "empty?" (BeamLisp.Ns.Rt/empty? (if (constructor_recipe? (first args) state)
+                                        (constructor_recipe_sequence! (first args) state) (first args)))
+     "seq" (if (constructor_recipe? (first args) state)
+              (when (seq (constructor_recipe_sequence! (first args) state)) (first args))
+              (BeamLisp.Ns.Rt/seq (first args))) "vec" (vec (constructor_sequence! (first args) state))
      "to-list" (constructor_sequence! (first args) state) "list" args "vector" (vec args)
      "cons" (cons (first args) (constructor_sequence! (second args) state))
      "concat" (let [items (Enum/map args (fn [item] (constructor_sequence! item state)))
@@ -4238,15 +4401,15 @@
                 2 (Enum/reduce (constructor_sequence! (second args) state) (first args) (fn [item acc] (conj acc item))))
      "set" (BeamLisp.Set/new (constructor_sequence! (first args) state))
      "mapcat" (let [f (first args) sources (Enum/map (rest args) (fn [item] (constructor_sequence! item state)))
-                    values (constructor_bounded_map! (fn [arguments] (constructor_sequence! (constructor_invoke f arguments) state)) sources state)]
+                    values (constructor_bounded_map! (fn [arguments] (constructor_sequence! (constructor_invoke f arguments state) state)) sources state)]
                  (constructor_primitive :Elixir.BeamLisp.Ns.Core :concat__bl_v (list values) state))
      "map" (let [f (first args) sources (Enum/map (rest args) (fn [item] (constructor_sequence! item state)))]
-              (constructor_bounded_map! (fn [arguments] (constructor_invoke f arguments)) sources state))
+              (constructor_bounded_map! (fn [arguments] (constructor_invoke f arguments state)) sources state))
      "mapv" (let [f (first args) sources (Enum/map (rest args) (fn [item] (constructor_sequence! item state)))]
-               (vec (constructor_bounded_map! (fn [arguments] (constructor_invoke f arguments)) sources state)))
-     "filter" (Enum/filter (constructor_sequence! (second args) state) #(constructor_truthy? (constructor_invoke (first args) (list %))))
-     "remove" (Enum/reject (constructor_sequence! (second args) state) #(constructor_truthy? (constructor_invoke (first args) (list %))))
-     "run!" (do (Enum/each (constructor_sequence! (second args) state) #(constructor_invoke (first args) (list %))) nil)
+               (vec (constructor_bounded_map! (fn [arguments] (constructor_invoke f arguments state)) sources state)))
+     "filter" (Enum/filter (constructor_sequence! (second args) state) #(constructor_truthy? (constructor_invoke (first args) (list %) state)))
+     "remove" (Enum/reject (constructor_sequence! (second args) state) #(constructor_truthy? (constructor_invoke (first args) (list %) state)))
+     "run!" (do (Enum/each (constructor_sequence! (second args) state) #(constructor_invoke (first args) (list %) state)) nil)
      "join" (let [separator (first args) items (constructor_sequence! (second args) state)]
                ;; A repeated separator can allocate far more than the aggregate
                ;; input. Prove the exact supported string output before join.
@@ -4258,26 +4421,41 @@
                 (when (> size 1048576) (constructor_refuse :aggregate-byte-budget))
                 (constructor_allocation! 1 size state)
                 (Enum/join items separator)))
-     "some" (Enum/find_value (constructor_sequence! (second args) state) #(constructor_invoke (first args) (list %)))
-     "every?" (Enum/all? (constructor_sequence! (second args) state) #(constructor_truthy? (constructor_invoke (first args) (list %))))
+     "some" (Enum/find_value (constructor_sequence! (second args) state) #(constructor_invoke (first args) (list %) state))
+     "every?" (Enum/all? (constructor_sequence! (second args) state) #(constructor_truthy? (constructor_invoke (first args) (list %) state)))
      "reduce" (if (= 3 (count args))
                   (Enum/reduce (constructor_sequence! (nth args 2) state) (second args)
-                    (fn [item acc] (constructor_invoke (first args) (list acc item))))
+                    (fn [item acc] (constructor_invoke (first args) (list acc item) state)))
                   (let [items (constructor_sequence! (second args) state)]
                    (if (seq items)
                     (Enum/reduce (rest items) (first items)
-                     (fn [item acc] (constructor_invoke (first args) (list acc item))))
-                    (constructor_invoke (first args) (list)))))
+                     (fn [item acc] (constructor_invoke (first args) (list acc item) state)))
+                    (constructor_invoke (first args) (list) state))))
      "apply" (constructor_invoke (first args)
-               (erlang/++ (Enum/drop (rest args) -1) (constructor_sequence! (last args) state)))
+               (erlang/++ (Enum/drop (rest args) -1) (constructor_sequence! (last args) state)) state)
      (constructor_refuse {:primitive target}))
    (and (= module :Elixir.BeamLisp.Ns.Rt)
         (contains? #{:first :rest :next :nth :count :take :drop_clj :seq :empty? :list? :seq?
                      :eqv :not_ :assoc :conj :contains? :map :set :vector? :symbol?
                      :str_v :fn? :keyword? :map? :cons :even? :odd? :zero? :pos? :neg?
-                     :number? :float? :gensym} function))
+                     :number? :float? :sorted? :gensym} function))
     (let [renamed (get {:drop_clj :drop :eqv := :not_ :not :str_v :str__bl_v} function function)]
      (constructor_primitive :Elixir.BeamLisp.Ns.Core renamed args state))
+   (contains? #{[:Elixir.BeamLisp.LazySeq :new 1] [:Elixir.BeamLisp.LazySeq :from_fun 1]} target)
+    (constructor_recipe_new! :thunk (first args) nil state)
+   (= target [:Elixir.BeamLisp.LazySeq :chain 2])
+    (do
+     (when-not (erlang/is_list (first args)) (constructor_refuse :finite-chain-prefix))
+     (if (= (list) (first args)) nil
+      (constructor_recipe_new! :chain (second args) (first args) state)))
+   (= target [:Elixir.BeamLisp.LazySeq :input 1])
+    (let [value (first args)
+          input (if (vector? value) (constructor_sequence! value state) value)]
+     (if (and (erlang/is_list input) (> (erlang/length input) 32))
+      (constructor_recipe_new! :input nil input state) input))
+   (= target [:Elixir.BeamLisp.LazySeq :chunk_size 0]) 32
+   (= target [:Elixir.BeamLisp.LazySeq :cell 1])
+    (constructor_recipe_cell! (first args) state)
    (contains? #{[:lists :reverse 1] [:lists :reverse 2]} target)
     (do
      (constructor_charge! args state)
@@ -4293,7 +4471,7 @@
    (= target [:Elixir.BeamLisp.FormMeta :vary_meta 2])
     ;; Never pass an internal callable to the native vary_meta/invoke boundary.
     (let [form (first args)
-          metadata (constructor_invoke (second args) (list (BeamLisp.FormMeta/meta form)))]
+          metadata (constructor_invoke (second args) (list (BeamLisp.FormMeta/meta form)) state)]
      (constructor_charge! (list form metadata) state)
      (BeamLisp.FormMeta/with_meta form metadata))
    (= target [:Elixir.BeamLisp.Ns.Rt :list_star_0 0]) nil
@@ -4326,7 +4504,7 @@
    (= target [:Elixir.BeamLisp.Ns.Rt :namespace_of 1]) (BeamLisp.Ns.Rt/namespace_of (first args))
    (= target [:Elixir.Enum :join 2])
     (constructor_primitive :Elixir.BeamLisp.Ns.Core :join (list (second args) (first args)) state)
-   (= target [:Elixir.BeamLisp.Ns.Rt :invoke 2]) (constructor_invoke (first args) (constructor_sequence! (second args) state))
+   (= target [:Elixir.BeamLisp.Ns.Rt :invoke 2]) (constructor_invoke (first args) (constructor_sequence! (second args) state) state)
    (= target [:Elixir.BeamLisp.Ns.Rt :hash_key 1]) (BeamLisp.Ns.Rt/hash_key (first args))
    (contains? #{[:Elixir.BeamLisp.Ns.Rt :get 2] [:Elixir.BeamLisp.Ns.Rt :get 3]} target)
     (BeamLisp.Ns.Rt/get (first args) (second args) (nth args 2 nil))
@@ -4339,7 +4517,7 @@
 (defn- constructor_pure_core_names []
  #{"identity" "not" "nil?" "some?" "list?" "seq?" "vector?" "map?" "set?"
    "symbol?" "keyword?" "string?" "int?" "even?" "odd?" "zero?" "pos?" "neg?"
-   "number?" "float?" "gensym" "=" "not=" "inc" "dec" "first"
+   "number?" "float?" "sorted?" "gensym" "=" "not=" "inc" "dec" "first"
    "second" "rest" "next" "last" "nth" "count" "empty?" "seq" "vec" "to-list"
    "list" "vector" "cons" "concat" "take" "drop" "get" "contains?" "keys"
    "vals" "assoc" "dissoc" "conj" "hash-map" "merge" "str" "name" "symbol"
@@ -4350,7 +4528,7 @@
  (let [fixed {"identity" #{1} "not" #{1} "nil?" #{1} "some?" #{1} "list?" #{1}
               "vector?" #{1} "map?" #{1} "set?" #{1} "symbol?" #{1} "keyword?" #{1} "seq?" #{1}
               "string?" #{1} "int?" #{1} "even?" #{1} "odd?" #{1} "zero?" #{1}
-              "pos?" #{1} "neg?" #{1} "number?" #{1} "float?" #{1} "gensym" #{0 1} "not=" #{2} "inc" #{1} "dec" #{1}
+              "pos?" #{1} "neg?" #{1} "number?" #{1} "float?" #{1} "sorted?" #{1} "gensym" #{0 1} "not=" #{2} "inc" #{1} "dec" #{1}
               "first" #{1} "second" #{1} "rest" #{1} "next" #{1} "last" #{1} "nth" #{2 3}
               "count" #{1} "empty?" #{1} "seq" #{1} "vec" #{1} "to-list" #{1}
               "cons" #{2} "take" #{2} "drop" #{2} "get" #{2 3} "contains?" #{2}
@@ -4406,12 +4584,12 @@
                            (when (constructor_context)
                             (constructor_remote_source (:mod n) (:fun n) (count args))))]
              (if entry
-              (constructor_invoke (constructor_interpret {:op :fn :clauses (:clauses entry)} {} state) args)
+              (constructor_invoke (constructor_interpret {:op :fn :clauses (:clauses entry)} {} state) args state)
               (constructor_primitive (:mod n) (:fun n) args state)))
    :arith (let [args (Enum/map (:args n) #(constructor_interpret % env state))]
             (when-not (Enum/all? args (fn [item] (erlang/is_number item))) (constructor_refuse :non-numeric-arithmetic))
             (constructor_primitive :erlang (:bif n) args state))
-   :apply (constructor_invoke (constructor_interpret (:fn n) env state) (Enum/map (:args n) #(constructor_interpret % env state)))
+   :apply (constructor_invoke (constructor_interpret (:fn n) env state) (Enum/map (:args n) #(constructor_interpret % env state)) state)
    :let (constructor_interpret (:body n) (assoc env (:name n) (constructor_interpret (:init n) env state)) state)
    :if (constructor_interpret (if (constructor_truthy? (constructor_interpret (:test n) env state)) (:then n) (:else n)) env state)
    :do (Enum/reduce (:stmts n) nil (fn [item _] (constructor_interpret item env state)))
@@ -4422,8 +4600,12 @@
           (Enum/reduce (:pairs n) {}
            (fn [[k v] acc] (Map/put acc (constructor_interpret k env state) (constructor_interpret v env state))))))
    :enil (list)
-   :cons (do (constructor_allocation! 2 0 state)
-             (cons (constructor_interpret (:head n) env state) (constructor_sequence! (constructor_interpret (:tail n) env state) state)))
+   :cons (let [head (constructor_interpret (:head n) env state)
+               tail (constructor_interpret (:tail n) env state)]
+           (when (constructor_recipe? tail state)
+            (constructor_refuse :opaque-finite-recipe-observation))
+           (constructor_allocation! 2 0 state)
+           (cons head (constructor_sequence! tail state)))
    :struct (if (and (= :Elixir.BeamLisp.Vector (:mod n)) (= 1 (count (:fields n))))
              (let [[k v] (first (:fields n)) key (constructor_interpret k env state) value (constructor_interpret v env state)]
               (when-not (and (= :items key) (erlang/is_tuple value)) (constructor_refuse :vector-scaffold))
@@ -4433,7 +4615,7 @@
             (fn [] (constructor_refuse :case-clause)) state)
    :fn (let [_ (constructor_charge! env state) clauses (:clauses n) arity (count (:pats (first clauses)))
              run (fn [args] (constructor_match_clauses clauses args env (fn [] (constructor_refuse :function-clause)) state))]
-         (case arity
+         (let [value (case arity
           0 (fn [] (run (list))) 1 (fn [a] (run (list a)))
           2 (fn [a b] (run (list a b))) 3 (fn [a b c] (run (list a b c)))
           4 (fn [a b c d] (run (list a b c d)))
@@ -4449,7 +4631,8 @@
           14 (fn [a b c d e f g h i j k l m n] (run (list a b c d e f g h i j k l m n)))
           15 (fn [a b c d e f g h i j k l m n o] (run (list a b c d e f g h i j k l m n o)))
           16 (fn [a b c d e f g h i j k l m n o p] (run (list a b c d e f g h i j k l m n o p)))
-          (constructor_refuse :function-arity)))
+          (constructor_refuse :function-arity))]
+          (constructor_register_callable! value state) value))
    (constructor_refuse {:operation (:op n)}))]
   ;; An intermediate list tail or borrowed variable is already accounted for
   ;; by its allocation site. Rewalking every growing cons prefix is quadratic
@@ -4466,9 +4649,10 @@
  (BeamLisp.CompilerData/check_first_order! locals)
  (let [key (tuple :constructor-machine-frame (erlang/make_ref))
        state (merge metadata {:counter-frame key :max-collection 16384})]
-  (erlang/put key {:remaining 1000000 :depth 0 :allocation-nodes 1000000 :allocation-bytes 16777216 :new-atoms 64 :fresh-symbols 4096})
+  (erlang/put key {:remaining 1000000 :depth 0 :allocation-nodes 1000000 :allocation-bytes 16777216 :new-atoms 64 :fresh-symbols 4096 :recipe-serial 0 :recipe-depth 0 :recipes {} :callables {}})
   (try
    (let [result (constructor_interpret expression locals state)]
+    (when (constructor_recipe_present! result state) (constructor_refuse :finite-recipe-escape))
     (BeamLisp.CompilerData/check_first_order! result) result)
    (finally (erlang/erase key)))))
 
