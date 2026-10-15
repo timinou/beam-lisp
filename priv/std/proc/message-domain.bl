@@ -1,0 +1,449 @@
+; Actual published predicate/transform ANF only; no execution of user code.
+; This proves old-accept => candidate-accept(upcast(input)), not business logic,
+; state/reply validity, migration totality outside the old domain or authority.
+(ns proc.message-domain
+ (:require [system.ir :as ir] [system.publication :as publication]
+           [data.first-order :as data]))
+(def MAX-NODES 32768)
+(def MAX-HELPERS 32)
+(def MAX-BRANCHES 32)
+(defn- refuse [reason] (throw (ex-info "Message migration proof unavailable" {:reason reason})))
+(defn- lit [value] {:tag :literal :value value})
+(defn- scalar? [value]
+ (or (nil? value) (erlang/is_atom value) (erlang/is_integer value)
+     (erlang/is_float value) (erlang/is_binary value)))
+(defn- literal? [value] (= :literal (:tag value)))
+(defn- message-key? [value] (or (erlang/is_atom value) (erlang/is_binary value)))
+(defn- tick [state]
+ (when (>= (:nodes state) MAX-NODES) (refuse :message-domain-budget))
+ (update state :nodes inc))
+(defn- require-domain [state value domain]
+ (update state :obligations (fn [all] (conj (or all []) {:value value :domain domain}))))
+(defn- stamp [state module]
+ (if (contains? (:modules state) module) state
+  (let [identity (if (= module :erlang)
+                   [:otp (erlang/system_info :otp_release) (erlang/system_info :version)]
+                   [:beam (erlang/apply module :module_info (list :md5))])]
+   (assoc-in state [:modules module] identity))))
+(defn- kernel [state module]
+ ;; Loaded first; this attests bytes against the actual coherent seed. It never
+ ;; admits an uninitialized provider, an arbitrary module prefix or mutable Var.
+ (if (contains? (:kernels state #{}) module) state
+  (do
+   (when-not (and (contains? #{:Elixir.BeamLisp.Ns.Rt :Elixir.BeamLisp.Ns.Core :Elixir.BeamLisp.Num} module)
+                  (erlang/module_loaded module) (BeamLisp.AOT/seed_dependency! module))
+    (refuse :unattested-message-kernel))
+   (update (stamp state module) :kernels (fn [all] (conj (or all #{}) module))))))
+(defn- snapshot! [state namespace name]
+ (let [key [namespace name]]
+  (if-let [saved (get-in state [:definitions key])] [state saved]
+   (do
+    (when (>= (count (:definitions state)) MAX-HELPERS) (refuse :message-domain-budget))
+    (let [saved (publication/snapshot namespace name)]
+     (when-not saved (refuse :unpublished-message-helper))
+     (BeamLisp.CompilerData/constructor_data_cost! (dissoc saved :generation)
+                                                 {:callables {} :recipes {} :recipe-frame nil})
+     [(assoc-in state [:definitions key] saved) saved])))))
+(declare lift)
+(defn- lift-case [state environment subject clauses]
+ (when (empty? clauses) (refuse :partial-message-case))
+ (let [clause (first clauses) pats (:pats clause) pat (first pats)]
+  (when-not (and (= 1 (count pats)) (nil? (:guard clause))) (refuse :complex-message-case))
+  (case (:pop pat)
+   :pvar (lift state (assoc environment (:name pat) subject) (:body clause))
+   :plit (do
+           (when-not (scalar? (:val pat)) (refuse :complex-message-case))
+           (let [[state then] (lift state environment (:body clause))
+                 [state else] (lift-case state environment subject (rest clauses))]
+            [state {:tag :choose :test {:tag :strict-eq :left subject :right (lit (:val pat))}
+                    :then then :else else}]))
+   (refuse :complex-message-case))))
+(defn- lift-all [state environment nodes]
+ (loop [state state nodes (seq nodes) out []]
+  (if-not nodes [state out]
+   (let [[after value] (lift state environment (first nodes))]
+    (recur after (next nodes) (conj out value))))))
+(defn- field [value key default lookup]
+ (when-not (and (literal? key) (message-key? (:value key)) (not= :__struct__ (:value key)))
+  (refuse :dynamic-or-reserved-message-key))
+ (if (= :map (:tag value))
+  (cond (contains? (:fields value) (:value key)) (get (:fields value) (:value key))
+        (contains? (:removed value #{}) (:value key)) default
+        (:base value) (field (:base value) key default lookup)
+        :else default)
+  {:tag :field :target value :key (:value key) :default default :lookup lookup}))
+(defn- assoc-term [base key value]
+ (when-not (and (literal? key) (message-key? (:value key)) (not= :__struct__ (:value key)))
+  (refuse :dynamic-or-reserved-message-key))
+ ;; No false plain-map model for arbitrary Record/SortedMap/foreign structs.
+ ;; Reconstruction and updates of a known literal map are exact and supported.
+ (when-not (= :map (:tag base)) (refuse :unknown-message-map-update-domain))
+ (assoc base :fields (assoc (:fields base) (:value key) value)))
+(defn- remove-term [base key]
+ (when-not (and (= :map (:tag base)) (literal? key) (message-key? (:value key))
+                (not= :__struct__ (:value key))) (refuse :unknown-message-map-update-domain))
+ (assoc base :fields (dissoc (:fields base) (:value key))
+             :removed (conj (:removed base #{}) (:value key))))
+(defn- boolean-term? [value]
+ (or (and (literal? value) (contains? #{true false} (:value value)))
+     (contains? #{:type :eq :bl-eq :num-eq :strict-eq :cmp :and :or :not :key?} (:tag value))))
+(defn- choose [test then else]
+ (cond
+  (literal? test) (if (contains? #{false nil} (:value test)) else then)
+  (and (boolean-term? test) (boolean-term? then) (= (lit false) else))
+   {:tag :and :terms [test then]}
+  (and (boolean-term? test) (= test then) (boolean-term? else))
+   {:tag :or :terms [test else]}
+  (and (boolean-term? test) (= (lit true) then) (= (lit false) else)) test
+  (and (boolean-term? test) (= (lit false) then) (= (lit true) else)) {:tag :not :value test}
+  :else {:tag :choose :test test :then then :else else}))
+(defn- scalar-comparison [kind a b]
+ (case kind :eq (erlang/== a b) :bl-eq (= a b) :num-eq (erlang/== a b) :strict-eq (erlang/=:= a b)
+  :> (erlang/> a b) :>= (erlang/>= a b) :< (erlang/< a b) :<= (erlang/=< a b)
+  (refuse :unknown-message-comparison)))
+(defn- comparison [kind a b]
+ (if (and (literal? a) (literal? b) (scalar? (:value a)) (scalar? (:value b)))
+  (lit (scalar-comparison kind (:value a) (:value b)))
+  (if (contains? #{:eq :bl-eq :num-eq :strict-eq} kind) {:tag kind :left a :right b}
+   {:tag :cmp :operator kind :left a :right b})))
+(defn- primitive [state module function args]
+ (do
+ (when-not (and (contains? #{:erlang :maps :Elixir.BeamLisp.Ns.Rt :Elixir.BeamLisp.Num} module)
+                (erlang/module_loaded module)) (refuse :unknown-message-operation))
+ (let [arity (count args) pair [module function] a (first args) b (second args)
+       rt? (= module :Elixir.BeamLisp.Ns.Rt)
+       type (get {[:erlang :is_integer] :integer [:erlang :is_float] :float
+                   [:erlang :is_number] :number [:erlang :is_binary] :binary
+                   [:erlang :is_map] :raw-map [:erlang :is_atom] :atom
+                   [:Elixir.BeamLisp.Ns.Rt :int?] :bl-integer
+                   [:Elixir.BeamLisp.Ns.Rt :kind-int?] :bl-integer
+                   [:Elixir.BeamLisp.Ns.Rt :string?] :bl-binary
+                   [:Elixir.BeamLisp.Ns.Rt :kind-string?] :bl-binary
+                   [:Elixir.BeamLisp.Ns.Rt :number?] :bl-number
+                   [:Elixir.BeamLisp.Ns.Rt :kind-number?] :bl-number
+                   [:Elixir.BeamLisp.Ns.Rt :map?] :maplike
+                   [:Elixir.BeamLisp.Ns.Rt :call-map?] :maplike} pair)
+       equality (get {[:erlang :==] :eq [:erlang :=:=] :strict-eq
+                       [:Elixir.BeamLisp.Num :num_eq] :num-eq
+                       [:Elixir.BeamLisp.Ns.Rt :eqv] :bl-eq
+                       [:Elixir.BeamLisp.Ns.Rt :k-eqv] :bl-eq} pair)
+       ordering (get {[:erlang :>] :> [:erlang :>=] :>= [:erlang :<] :< [:erlang :=<] :<=
+                       [:Elixir.BeamLisp.Num :gt] :> [:Elixir.BeamLisp.Num :ge] :>=
+                       [:Elixir.BeamLisp.Num :lt] :< [:Elixir.BeamLisp.Num :le] :<=} pair)
+       state (if (or rt? (= module :Elixir.BeamLisp.Num)) (kernel state module) (stamp state module))]
+  (cond
+   (and type (= arity 1)) [state {:tag :type :type type :value a}]
+   (and equality (= arity 2))
+    (do (when-not (or (and (literal? a) (scalar? (:value a)))
+                      (and (literal? b) (scalar? (:value b))))
+          (refuse :possibly-forcing-message-equality))
+        [(cond (= equality :bl-eq) (require-domain (require-domain state a :raw-scalar) b :raw-scalar)
+               (= equality :num-eq) (require-domain (require-domain state a :raw-number) b :raw-number)
+               :else state) (comparison equality a b)])
+   (and ordering (= arity 2))
+    [(if (= module :Elixir.BeamLisp.Num)
+       (require-domain (require-domain state a :raw-number) b :raw-number) state)
+     (comparison ordering a b)]
+   (and rt? (contains? #{:get :coll-get} function) (contains? #{2 3} arity))
+    (if (= :map (:tag a))
+     [state (field a b (if (= arity 3) (nth args 2) (lit nil)) :rt)]
+     (refuse :possibly-dispatching-message-lookup))
+   (and (= module :maps) (= function :get) (contains? #{2 3} arity))
+    ;; maps:get/2 may raise for missing keys; don't silently model it as get/3.
+    (if (= arity 3) [(require-domain state b :raw-map) (field b a (nth args 2) :native)] (refuse :partial-native-message-lookup))
+   (and rt? (contains? #{:assoc :coll-assoc} function) (= arity 3)) [state (assoc-term a b (nth args 2))]
+   (and (= module :maps) (= function :put) (= arity 3)) [state (assoc-term (nth args 2) a b)]
+   (and (= module :maps) (= function :remove) (= arity 2)) [state (remove-term b a)]
+   (and rt? (contains? #{:dissoc :coll-dissoc} function) (= arity 2)) [state (remove-term a b)]
+   (and rt? (contains? #{:not- :call-not-} function) (= arity 1) (boolean-term? a))
+    [state {:tag :not :value a}]
+   (and rt? (contains? #{:pos? :num-pos?} function) (= arity 1))
+    [(require-domain state a :raw-number) (comparison :> a (lit 0))]
+   (and (= pair [:erlang :is_map_key]) (= arity 2) (literal? a))
+    [(require-domain state b :raw-map) {:tag :key? :target b :key (:value a)}]
+   (and rt? (contains? #{:contains? :coll-contains?} function) (= arity 2)
+        (literal? a) (set? (:value a)) (<= (count (:value a)) MAX-BRANCHES)
+        (every? scalar? (:value a)))
+    [(require-domain state b :raw-scalar)
+     {:tag :or :terms (mapv #(comparison :bl-eq b (lit %)) (:value a))}]
+   :else (refuse :unknown-message-operation)))))
+(defn- helper [state namespace name values]
+ (let [key [namespace name]]
+  (when (contains? (:stack state) key) (refuse :recursive-message-helper))
+  (let [[state saved] (snapshot! state namespace name)
+        matching (filter #(and (= :fixed (elem % 0)) (= (count values) (elem % 1))) (:entries saved))]
+   (when-not (= 1 (count matching)) (refuse :ambiguous-message-helper))
+   (let [clause (elem (first matching) 3) params (:params clause)]
+    (when-not (and (nil? (:guard clause)) (every? #(= :pvar (:pop %)) params))
+     (refuse :patterned-message-helper))
+    (let [environment (into {} (mapv (fn [p v] [(:name p) v]) params values))
+          [after result] (lift (update state :stack conj key) environment (:body clause))]
+     [(update after :stack disj key) result])))))
+(defn- native-function [value]
+ (when (and (erlang/is_function value) (= :external (elem (erlang/fun_info value :type) 1)))
+  [(elem (erlang/fun_info value :module) 1) (elem (erlang/fun_info value :name) 1)
+   (elem (erlang/fun_info value :arity) 1)]))
+(defn- callable-arm [value arity]
+ (if (erlang/is_function value) value
+  (when (and (erlang/is_tuple value) (= 3 (erlang/tuple_size value))
+             (= :"$blfn" (elem value 0)) (erlang/is_map (elem value 1)))
+   (maps/get arity (elem value 1) nil))))
+(defn- global [state node values]
+ (let [found (if (= :exact (:lookup node)) (BeamLisp.Env/fetch_exact (:ns node) (:name node))
+              (BeamLisp.Env/fetch (:ns node) (:name node)))
+       f (when (and (tuple? found) (= :ok (elem found 0))) (elem found 1))
+       native (native-function (callable-arm f (count values)))]
+  (when-not native (refuse :dynamic-message-helper))
+  (when-not (= (count values) (nth native 2)) (refuse :message-helper-arity))
+  (let [state (assoc-in state [:bindings [(:ns node) (:name node) (:lookup node)]] native)
+        module (first native) function (second native)]
+   (if (= module :Elixir.BeamLisp.Ns.Rt) (primitive state module function values)
+    (let [home (first (filter #(= module (BeamLisp.Emit/module_for %)) (:namespaces state)))]
+     (when-not home (refuse :unknown-message-helper-provider))
+     (helper state home (erlang/atom_to_binary function :utf8) values))))))
+(defn- call [state environment node]
+ (let [site (ir/call-site node)]
+  (when-not (and site (some? (:arity site))) (refuse :dynamic-message-call))
+  (let [[state values] (lift-all state environment (:args site)) target (:callee site)]
+   (cond
+    (and (= :lit (:op target)) (keyword? (:val target)) (contains? #{1 2} (count values)))
+     (if (= :map (:tag (first values)))
+      [(kernel state :Elixir.BeamLisp.Ns.Rt)
+       (field (first values) (lit (:val target)) (if (= 2 (count values)) (second values) (lit nil)) :rt)]
+      (refuse :possibly-dispatching-message-lookup))
+    (= :global (:op target)) (global state target values)
+    (= :remote (:mode site))
+     (if-let [home (first (filter #(= (:mod site) (BeamLisp.Emit/module_for %)) (:namespaces state)))]
+      (helper state home (erlang/atom_to_binary (:fun site) :utf8) values)
+      (primitive state (:mod site) (:fun site) values))
+    :else (refuse :dynamic-message-call)))))
+(defn lift [state environment node]
+ (let [state (tick state)]
+  (when-not (ir/node? node) (refuse :unknown-message-ir))
+  (case (:op node)
+   :lit (do (data/check! (:val node) {:max-nodes 16384 :max-bytes 1048576 :max-depth 64})
+            [state (lit (:val node))])
+   :enil [state (lit ())]
+   :var (if (contains? environment (:name node)) [state (get environment (:name node))]
+          (refuse :free-message-variable))
+   :let (let [[after value] (lift state environment (:init node))]
+          (lift after (assoc environment (:name node) value) (:body node)))
+   :do (loop [state state nodes (seq (:stmts node)) value (lit nil)]
+         (if-not nodes [state value]
+          (let [[after value] (lift state environment (first nodes))]
+           (recur after (next nodes) value))))
+   :if (let [[state test] (lift state environment (:test node))
+             [state then] (lift state environment (:then node))
+             [state else] (lift state environment (:else node))]
+         [state (choose test then else)])
+   :case (let [[state subject] (lift state environment (:subj node))]
+           (lift-case state environment subject (:clauses node)))
+   :map (let [[after entries] (lift-all state environment (mapcat identity (:pairs node)))
+              fields (reduce (fn [out pair]
+                         (let [[key value] pair]
+                          (when-not (and (literal? key) (message-key? (:value key))
+                                         (not= :__struct__ (:value key))) (refuse :dynamic-or-reserved-message-key))
+                          (assoc out (:value key) value))) {} (partition 2 entries))]
+          [after {:tag :map :fields fields :removed #{}}])
+   :arith (let [[after values] (lift-all state environment (:args node))]
+            (primitive after :Elixir.BeamLisp.Num (:fun node) values))
+   (:remote :apply) (call state environment node)
+   (refuse :unsupported-message-ir))))
+(defn capture
+ "Capture a single exact named published arity-one callback, without invoking
+  it. Anonymous/captured/higher-order/dynamic/effectful bodies decline. Metadata
+  and native identities are private bounded evidence, never adoption authority."
+ [callback environment]
+ (let [previous (BeamLisp.Env/capture)]
+  (try
+   (BeamLisp.Env/bind environment)
+   (let [native (native-function callback) graph (:generation environment)
+         namespaces (vec (distinct (concat (vals (:mapping graph)) [(:ns environment) "core" "sugar"])))
+         home (when native (first (filter #(and (string? %) (= (first native) (BeamLisp.Emit/module_for %))) namespaces)))
+         state {:nodes 0 :stack #{} :definitions {} :modules {} :bindings {} :obligations [] :namespaces namespaces}]
+    (when-not (and native home (= 1 (nth native 2))) (refuse :unpublished-message-callback))
+    (let [epoch (BeamLisp.Env/publication_epoch)
+          [after expression] (helper state home (erlang/atom_to_binary (second native) :utf8) [{:tag :input}])
+          saved (get (:definitions after) [home (erlang/atom_to_binary (second native) :utf8)])]
+     (when-not (and (= (tuple :ok callback) (BeamLisp.Env/fetch_exact home (erlang/atom_to_binary (second native) :utf8)))
+                    (= epoch (BeamLisp.Env/publication_epoch)) saved)
+      (refuse :unstable-message-callback))
+     {:status :proved :expression expression :definitions (:definitions after) :modules (:modules after)
+      :bindings (:bindings after) :obligations (:obligations after) :environment environment :root native}))
+   (catch error {:status :unknown :reason (or (:reason (ex-data error)) :message-proof-unavailable)})
+   (finally (BeamLisp.Env/bind previous)))))
+
+(declare substitute prove disprove)
+(defn- literal-type [value]
+ (cond (erlang/is_integer value) :integer (erlang/is_float value) :float
+       (erlang/is_binary value) :binary (erlang/is_atom value) :atom (erlang/is_map value) :raw-map
+       :else :other))
+(defn- type-covers? [actual required]
+ (or (= actual required) (and (contains? #{:number :bl-number} required) (contains? #{:integer :float} actual))
+     (and (= required :bl-integer) (= actual :integer))
+     (and (= required :bl-binary) (= actual :binary))))
+(defn- type-known? [value required facts]
+ (cond
+  (literal? value) (type-covers? (literal-type (:value value)) required)
+  (= :map (:tag value)) (contains? #{:maplike :raw-map} required)
+  :else (some #(and (= :type (:tag %)) (= value (:value %)) (type-covers? (:type %) required)) facts)))
+(defn- same-comparison [a b]
+ ;; A BL equality may accept metadata wrappers; strict and numeric/BEAM equality
+ ;; must never be folded into that wider relation for symbolic inputs.
+ (and (= (:tag a) (:tag b)) (= (:left a) (:left b)) (= (:right a) (:right b))))
+(defn- proves-bound? [predicate fact facts]
+ (when (and (= :cmp (:tag predicate)) (= :cmp (:tag fact))
+            (= (:left predicate) (:left fact)) (literal? (:right predicate)) (literal? (:right fact))
+            (erlang/is_number (:value (:right predicate))) (erlang/is_number (:value (:right fact)))
+            (or (type-known? (:left predicate) :integer facts) (type-known? (:left predicate) :float facts)))
+  (let [wanted (:value (:right predicate)) known (:value (:right fact))
+        w (:operator predicate) k (:operator fact)]
+   (or
+    (and (contains? #{:> :>=} w) (contains? #{:> :>=} k)
+         (or (> known wanted) (and (= known wanted) (or (= w :>=) (= k :>)))))
+    (and (contains? #{:< :<=} w) (contains? #{:< :<=} k)
+         (or (< known wanted) (and (= known wanted) (or (= w :<=) (= k :<)))))))))
+(defn- disprove [predicate facts]
+ (cond
+  (= (lit false) predicate) true
+  (= (lit true) predicate) false
+  (= :not (:tag predicate)) (prove (:value predicate) facts)
+  (= :and (:tag predicate)) (some #(disprove % facts) (:terms predicate))
+  (= :or (:tag predicate)) (every? #(disprove % facts) (:terms predicate))
+  (contains? #{:eq :bl-eq :num-eq :strict-eq} (:tag predicate))
+   (or
+    (and (literal? (:left predicate)) (literal? (:right predicate))
+         (scalar? (:value (:left predicate))) (scalar? (:value (:right predicate)))
+         (not (scalar-comparison (:tag predicate) (:value (:left predicate)) (:value (:right predicate)))))
+    (some (fn [fact]
+      (and (= (:tag predicate) (:tag fact)) (= (:left predicate) (:left fact))
+           (literal? (:right predicate)) (literal? (:right fact))
+           (scalar? (:value (:right predicate))) (scalar? (:value (:right fact)))
+           (not (scalar-comparison (:tag predicate) (:value (:right predicate)) (:value (:right fact)))))) facts))
+  :else (some #(= {:tag :not :value predicate} %) facts)))
+(defn- prove [predicate facts]
+ (cond
+  (= (lit true) predicate) true
+  (= (lit false) predicate) false
+  (some #(= predicate %) facts) true
+  (= :and (:tag predicate)) (every? #(prove % facts) (:terms predicate))
+  (= :or (:tag predicate)) (some #(prove % facts) (:terms predicate))
+  (= :not (:tag predicate)) (some #(= predicate %) facts)
+  (= :type (:tag predicate)) (boolean (type-known? (:value predicate) (:type predicate) facts))
+  (contains? #{:eq :bl-eq :num-eq :strict-eq} (:tag predicate))
+   (or (some #(same-comparison predicate %) facts)
+       (and (literal? (:left predicate)) (literal? (:right predicate))
+            (scalar? (:value (:left predicate))) (scalar? (:value (:right predicate)))
+            (scalar-comparison (:tag predicate) (:value (:left predicate)) (:value (:right predicate)))))
+  (= :cmp (:tag predicate))
+   (or (some #(proves-bound? predicate % facts) facts)
+       (and (literal? (:left predicate)) (literal? (:right predicate))
+            (scalar? (:value (:left predicate))) (scalar? (:value (:right predicate)))
+            (scalar-comparison (:operator predicate) (:value (:left predicate)) (:value (:right predicate)))))
+  :else false))
+(defn- bounded-cases [cases]
+ (when (> (count cases) MAX-BRANCHES) (refuse :message-domain-branch-budget)) cases)
+(defn- combine [left right]
+ (do (when (> (* (count left) (count right)) MAX-BRANCHES)
+       (refuse :message-domain-branch-budget))
+     (vec (for [a left b right] (into a b)))))
+(defn- true-cases [predicate]
+ (cond
+  (= (lit true) predicate) [[]]
+  (= (lit false) predicate) []
+  (= :and (:tag predicate)) (reduce (fn [out p] (combine out (true-cases p))) [[]] (:terms predicate))
+  (= :or (:tag predicate))
+   (reduce (fn [out term]
+             (let [more (true-cases term)]
+              (when (> (+ (count out) (count more)) MAX-BRANCHES)
+               (refuse :message-domain-branch-budget))
+              (into out more))) [] (:terms predicate))
+  (contains? #{:type :eq :bl-eq :num-eq :strict-eq :cmp :key? :not} (:tag predicate)) [[predicate]]
+  :else (refuse :unknown-message-predicate)))
+(defn- substitute [term input facts]
+ (case (:tag term)
+  :input input
+  :literal term
+  :field (field (substitute (:target term) input facts) (lit (:key term))
+                (substitute (:default term) input facts) (:lookup term))
+  :type (assoc term :value (substitute (:value term) input facts))
+  (:eq :bl-eq :num-eq :strict-eq)
+   (comparison (:tag term) (substitute (:left term) input facts) (substitute (:right term) input facts))
+  :cmp (comparison (:operator term) (substitute (:left term) input facts) (substitute (:right term) input facts))
+  (:and :or) (assoc term :terms (mapv #(substitute % input facts) (:terms term)))
+  :not (assoc term :value (substitute (:value term) input facts))
+  :key? (assoc term :target (substitute (:target term) input facts))
+  :map (assoc term :fields (into {} (mapv (fn [[k v]] [k (substitute v input facts)]) (:fields term))))
+  :choose (let [test (substitute (:test term) input facts)]
+            (cond
+             (prove test facts) (substitute (:then term) input facts)
+             (disprove test facts) (substitute (:else term) input facts)
+             :else (refuse :unproved-message-transform-branch)))
+  (refuse :unknown-message-expression)))
+(defn compare-expressions
+ "Pure closed symbolic decision, not a public migration/adoption grant. Callers
+  must acquire expressions from capture and retain their actual native evidence."
+ [old-accept upcast candidate-accept]
+ (try
+  (let [cases (true-cases old-accept)]
+   ;; A false predicate is not an empty caller-authored witness. Its exact code
+   ;; could be proved separately, but it does not enter this supported subset.
+   (when (empty? cases) (refuse :empty-old-message-domain))
+   (let [proved (every? (fn [facts]
+                    (let [converted (substitute upcast {:tag :input} facts)
+                          result (substitute candidate-accept converted facts)]
+                     (prove result facts))) cases)]
+    (if proved {:status :proved :scope :message-predicate-preservation :cases (count cases)}
+     {:status :unknown :scope :message-predicate-preservation :reason :message-domain-not-preserved})))
+  (catch error {:status :unknown :scope :message-predicate-preservation
+                :reason (or (:reason (ex-data error)) :message-proof-unavailable)})))
+(defn valid? [proof]
+ "Point-in-time native/definition/binding check. Does not compile or execute a
+  callback. Physical graph/SDK leases remain independently mandatory."
+ (let [previous (BeamLisp.Env/capture)]
+  (try
+   (BeamLisp.Env/bind (:environment proof))
+   (and (= :proved (:status proof))
+        (every? publication/valid? (vals (:definitions proof)))
+        (every? (fn [[module identity]]
+                  (= identity (if (= module :erlang)
+                               [:otp (erlang/system_info :otp_release) (erlang/system_info :version)]
+                               [:beam (erlang/apply module :module_info (list :md5))]))) (:modules proof))
+        (every? (fn [[[ns name lookup] expected]]
+                  (let [found (if (= lookup :exact) (BeamLisp.Env/fetch_exact ns name) (BeamLisp.Env/fetch ns name))]
+                   (and (tuple? found) (= :ok (elem found 0)) (= expected (native-function (callable-arm (elem found 1) (nth expected 2)))))))
+                (:bindings proof)))
+   (catch _ false)
+   (finally (BeamLisp.Env/bind previous)))))
+(defn- total-under? [proof input facts]
+ (every? (fn [obligation]
+           (let [value (substitute (:value obligation) input facts)]
+            (case (:domain obligation)
+             :raw-number (or (type-known? value :integer facts) (type-known? value :float facts))
+             :raw-scalar (or (and (literal? value) (scalar? (:value value)))
+                             (some #(type-known? value % facts) [:integer :float :binary :atom]))
+             :raw-map (type-known? value :raw-map facts)
+             false))) (:obligations proof)))
+(defn- total-migration? [old upcast candidate]
+ (every? (fn [facts]
+           (let [input {:tag :input} converted (substitute (:expression upcast) input facts)]
+            (and (total-under? old input facts) (total-under? upcast input facts)
+                 (total-under? candidate converted facts))))
+         (true-cases (:expression old))))
+(defn compare-callbacks
+ "Three actual privately retained callback records {:function :environment}.
+  No caller-authored expression or Boolean can authorize a native upgrade."
+ [old upcast candidate]
+ (let [a (capture (:function old) (:environment old))
+       b (capture (:function upcast) (:environment upcast))
+       c (capture (:function candidate) (:environment candidate))]
+  (if-not (every? #(= :proved (:status %)) [a b c])
+   {:status :unknown :scope :message-predicate-preservation
+    :reason (or (:reason (first (filter #(not= :proved (:status %)) [a b c]))) :message-proof-unavailable)}
+   (try
+    (let [decision (compare-expressions (:expression a) (:expression b) (:expression c))]
+     (if (and (= :proved (:status decision)) (total-migration? a b c) (every? valid? [a b c]))
+      (assoc decision :evidence [a b c])
+      (assoc decision :status :unknown :reason (:reason decision :unproved-message-totality-or-identity))))
+    (catch error {:status :unknown :scope :message-predicate-preservation
+                  :reason (or (:reason (ex-data error)) :message-proof-unavailable)})))))

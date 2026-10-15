@@ -1,0 +1,136 @@
+(ns review.starter-preservation-test
+ (:require [reload.generation :as g] [reload.state :as state]
+           [proc.evolve :as ev] [proc.framework :as framework] [proc.inventory :as inventory]))
+(def SOURCE
+ "(ns starter.business)
+  (defn accepts [value] (erlang/is_binary value))
+  (defn state-valid [value] (erlang/is_integer value))
+  (defn handler [message value] {:reply message :state value})
+  (defn spec [digest] {:version 1 :digest digest :handler handler :accept? accepts :check-state state-valid})")
+(defn- graph [app] (g/prepare! {:application-id app :sources {"starter.business" SOURCE}}))
+(defn- spec [graph]
+ (g/with! graph #(ev/prepare-spec (g/invoke! graph "starter.business/spec" [(:digest graph)]))))
+(deftest framework-adoption-preserves-authenticated-source-starter-and-not-mutable-ancestry
+ (let [graph (graph "framework-starter-preservation") pid (atom nil) parent (erlang/self)]
+  (try
+   (g/with! graph #(state/bind! {}))
+   (reset! pid (g/with! graph #(ev/start! (spec graph) 0 {:managed true})))
+   (let [native (framework/owner-evidence @pid) receipt (:starter native)]
+    (is (= :framework (:kind native)))
+    (is (= (:digest graph) (:origin-generation native)))
+    (is (= parent (:creator receipt))) (is (= @pid (:child receipt)))
+    (is (= (:module native) (:module receipt)))
+    (is (erlang/is_reference (:attempt receipt))) (is (erlang/is_reference (:ticket receipt)))
+    ;; Runtime state replacement is trusted fixture control; it mutates only
+    ;; the child-owned OTP ancestry field, never native owner/index evidence.
+    (erlang/apply :sys :replace_state
+      (list @pid (fn [st] (Process/put :"$ancestors" (list :pretend-parent)) st)))
+    (is (= native (framework/owner-evidence @pid)))
+    (let [module (:module native)
+          observed (erlang/apply :sys :replace_state
+                     (list @pid (fn [st] (assoc st :test-init-active
+                                           (BeamLisp.Env/server_initializing? module)))))]
+     (is (= false (:test-init-active observed))))
+    (is (= :valid (:status (inventory/snapshot (:application-id graph)))))
+    (is (= "serving" (ev/request! @pid 1 "serving"))))
+   (finally (when (and @pid (Process/alive? @pid)) (GenServer/stop @pid)) (g/retire! graph)))))
+(deftest honest-peer-starter-cannot-be-relabelled-by-the-childs-ancestor-field
+ (let [graph (graph "framework-peer-starter") parent (erlang/self) ticket (erlang/make_ref)
+       peer (atom nil) pid (atom nil)]
+  (try
+   (g/with! graph #(state/bind! {}))
+   (reset! peer (spawn (fn []
+                  (let [child (g/with! graph #(ev/start! (spec graph) 0 {:managed true}))]
+                   (erlang/send parent [:peer-created ticket child])
+                   (receive :finish-peer :done)))))
+   (reset! pid (receive [:peer-created seen child] :when (= seen ticket) child
+                 (after 15000 (throw :peer-start-timeout))))
+   (let [before (framework/owner-evidence @pid)]
+    (is (= @peer (get-in before [:starter :creator])))
+    (is (not= parent (get-in before [:starter :creator])))
+    (erlang/apply :sys :replace_state
+      (list @pid (fn [st] (Process/put :"$ancestors" (list parent)) st)))
+    (is (= before (framework/owner-evidence @pid)))
+    (is (= @peer (get-in (framework/owner-evidence @pid) [:starter :creator])))
+    (is (= "peer remains live" (ev/request! @pid 1 "peer remains live"))))
+   (finally (when (and @pid (Process/alive? @pid)) (GenServer/stop @pid))
+            (when @peer (erlang/send @peer :finish-peer)) (g/retire! graph)))))
+(def HELD
+ "(ns starter.business)
+  (defn accepts [value] (erlang/is_binary value))
+  (defn state-valid [value] (do (receive :release-init :ready (after 15000 (throw :held-init-timeout)))
+                               (erlang/is_integer value)))
+  (defn handler [message value] {:reply message :state value})
+  (defn spec [digest] {:version 1 :digest digest :handler handler :accept? accepts :check-state state-valid})")
+(defn- wait-owner [application]
+ (loop [left 2000]
+  (let [row (first (filter #(= :server (:kind %)) (:participants (inventory/snapshot application))))]
+   (cond (and row (map? (Keyword/get (elem (Process/info (:pid row) :dictionary) 1) :bl_server_init_gate)))
+           (:pid row)
+         (zero? left) (throw :held-owner-missing)
+         :else (do (Process/sleep 5) (recur (dec left)))))))
+(deftest copied-init-selector-and-repeated-install-cannot-reopen-completed-native-init
+ (let [application "framework-init-selector" graph (g/prepare! {:application-id application
+       :sources {"starter.business" HELD}}) parent (erlang/self) ticket (erlang/make_ref)
+       creator (atom nil) pid (atom nil)]
+  (try
+   (g/with! graph #(state/bind! {}))
+   (reset! creator (spawn (fn []
+                     (let [child (g/with! graph #(ev/start! (spec graph) 0 {:managed true}))]
+                      (erlang/send parent [:init-returned ticket child])))))
+   (reset! pid (wait-owner application))
+   (let [dictionary (elem (Process/info @pid :dictionary) 1)
+         selector (Keyword/get dictionary :bl_server_init_gate)]
+    (is (map? selector)) (is (erlang/is_reference (:ticket selector)))
+    (is (= @pid (:child selector)))
+    (erlang/send @pid :release-init)
+    (is (= @pid (receive [:init-returned seen child] :when (= seen ticket) child
+                       (after 15000 :missing))))
+    (let [native (BeamLisp.Env/framework_owner_evidence @pid) module (:module native) lease (:lease native)
+          result (erlang/apply :sys :replace_state
+                   (list @pid (fn [st]
+                    (Process/put :bl_server_init_gate selector)
+                    (let [active (BeamLisp.Env/server_initializing? module)
+                          reset (try (BeamLisp.Env/install_server_execution! module lease) :allowed
+                                  (catch _ :refused))]
+                     (assoc st :test-copied-init active :test-reset-init reset)))))]
+     (is (= false (:test-copied-init result)))
+     (is (= :refused (:test-reset-init result)))
+     (is (= false (contains? (BeamLisp.Env/capture) :bl_server_init_gate)))))
+   (finally
+    (when @pid (erlang/send @pid :release-init))
+    (when (and @pid (Process/alive? @pid)) (GenServer/stop @pid))
+    (g/retire! graph)))))
+(def REPLAY
+ "(ns starter.replay (:require [proc.server :as ps]))
+  (ps/defserver actor
+   (init [opts] (ok {:saved-gate (Process/get :bl_server_init_gate)}))
+   (handle-call :read [_ state] (reply state state)))
+  (defn start-owner [] (start actor {}))")
+(deftest late-source-init-refusal-preserves-the-existing-native-execution-context
+ (let [graph (g/prepare! {:application-id "source-init-replay" :fixed-runtime true
+       :stable-namespaces #{"proc.server"} :native-modules #{"erlang" "Process"}
+       :sources {"starter.replay" REPLAY}})
+       pid (g/invoke! graph "starter.replay/start-owner" [])]
+  (try
+   (let [selector (:saved-gate (GenServer/call pid :read)) native (g/owner-evidence pid) module (:module native)
+         result (erlang/apply :sys :replace_state
+          (list pid (fn [st]
+            (let [before [(Process/get :bl_server_execution_extent) (Process/get :bl_executing_code_lease)
+                          (Process/get :bl_executing_generation)]
+                  _ (Process/put :bl_server_init_gate selector)
+                  active (BeamLisp.Env/server_initializing? module)
+                  replay (try (BeamLisp.Env/with_server_execution! module :init
+                                (erlang/make_fun module :__bl_contract__ 0)) :allowed
+                            (catch _ :refused))
+                  after [(Process/get :bl_server_execution_extent) (Process/get :bl_executing_code_lease)
+                         (Process/get :bl_executing_generation)]]
+             (assoc st :test-active active :test-replay replay :test-before before :test-after after)))))]
+    (is (map? selector))
+    (is (= false (:test-active result)))
+    (is (= :refused (:test-replay result)))
+    (is (= (nth (:test-before result) 0) (nth (:test-after result) 0)))
+    (is (= (nth (:test-before result) 1) (nth (:test-after result) 1)))
+    (is (= (nth (:test-before result) 2) (nth (:test-after result) 2)))
+    (is (= :server (:kind (g/owner-evidence pid)))))
+   (finally (when (Process/alive? pid) (GenServer/stop pid)) (g/retire! graph)))))

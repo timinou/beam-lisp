@@ -1,0 +1,194 @@
+; Proposed regressions. Root runs on a coherent floor containing the native
+; grant and starter APIs. No copied graph grants authority in positive cases.
+(ns review.owner-transition-test
+ (:require [reload.generation :as g] [reload.state :as state]
+           [proc.evolve :as ev] [proc.transition :as transition]
+           [proc.message-domain :as domain] [proc.framework :as framework]))
+(def OLD
+ "(ns migration.contract)
+  (defn accepts [value] (erlang/is_binary value))
+  (defn state-valid [value] (erlang/is_integer value))
+  (defn handler [message value] {:reply message :state value})
+  (defn spec [digest] {:version 1 :digest digest :handler handler :accept? accepts :check-state state-valid})")
+(def NEW
+ "(ns migration.contract)
+  (defn accepts [value] (erlang/is_binary value))
+  (defn state-valid [value] (erlang/is_integer value))
+  (defn migrate [value] value)
+  (defn upcast [value] value)
+  (defn handler [message value] {:reply message :state value})
+  (defn spec [digest] {:version 2 :digest digest :handler handler :accept? accepts
+                       :check-state state-valid :migrate-state migrate :upcast upcast})")
+(def BAD
+ "(ns migration.contract)
+  (defn accepts [value] (erlang/is_integer value))
+  (defn state-valid [value] (erlang/is_integer value))
+  (defn migrate [value] value)
+  (defn upcast [value] value)
+  (defn handler [message value] {:reply message :state value})
+  (defn spec [digest] {:version 2 :digest digest :handler handler :accept? accepts
+                       :check-state state-valid :migrate-state migrate :upcast upcast})")
+(defn- graph [application source]
+ (g/prepare! {:application-id application :sources {"migration.contract" source}}))
+(defn- spec [graph]
+ (g/with! graph #(ev/prepare-spec (g/invoke! graph "migration.contract/spec" [(:digest graph)]))))
+(defn- with-owner [application source action]
+ (let [old (graph application OLD) fresh (graph application source) pid (atom nil)]
+  (try
+   (g/with! old #(state/bind! {})) (g/inherit-runtime! fresh old)
+   (reset! pid (g/with! old #(ev/start! (spec old) 7 {:managed true})))
+   (action old fresh @pid)
+   (finally (when (and @pid (Process/alive? @pid)) (GenServer/stop @pid))
+            (g/retire! fresh) (g/retire! old)))))
+(defn- plan [graph pid]
+ (g/with! graph #(transition/prepare! {:owners {:service {:pid pid :expected 1 :spec (spec graph)}}})))
+
+(deftest exact-prepared-owner-ticket-commits-and-reconciles-without-conversion-replay
+ (with-owner "owner-grant-positive" NEW
+  (fn [_ fresh pid]
+   (let [prepared (plan fresh pid)]
+    (try
+     (let [receipt (transition/validate! prepared)]
+      (is (= :valid (:status receipt)))
+      (is (= :proved-future-owner-inputs (get-in receipt [:owners :service :scope])))
+      (is (= :current (:status (transition/recheck! prepared receipt))))
+      (is (= 1 (:version (ev/status pid))))
+      (is (= :applied (:status (transition/activate! prepared))))
+      (is (= :already-applied (get-in (transition/activate! prepared) [:owners :service :status])))
+      (is (= "old client" (ev/request! pid 1 "old client")))
+      (is (= "new client" (ev/request! pid 2 "new client")))
+      (is (= pid (:pid (ev/status pid)))))
+     (finally (transition/close! prepared)))))))
+
+(deftest candidate-message-contract-refuses-before-owner-activation
+ (with-owner "owner-grant-refusal" BAD
+  (fn [_ fresh pid]
+   (let [prepared (plan fresh pid)]
+    (try
+     (let [receipt (transition/validate! prepared)]
+      (is (= :refused (:status receipt)))
+      (is (= :unproved-message-migration (get-in receipt [:owners :service :kind])))
+      (is (= 1 (:version (ev/status pid))))
+      (is (= "retained" (ev/request! pid 1 "retained")))
+      (is (= :blocked (:status (transition/activate! prepared))))
+      (is (= 1 (:version (ev/status pid)))))
+     (finally (transition/close! prepared)))))))
+
+(deftest intervening-old-request-invalidates-prepared-state-before-commit
+ (with-owner "owner-grant-revision" NEW
+  (fn [_ fresh pid]
+   (let [prepared (plan fresh pid)]
+    (try
+     (let [receipt (transition/validate! prepared)]
+      (is (= :valid (:status receipt)))
+      (is (= "accepted write" (ev/request! pid 1 "accepted write")))
+      (is (= :stale (:status (transition/recheck! prepared receipt))))
+      (is (= :blocked (:status (transition/activate! prepared))))
+      (is (= 1 (:version (ev/status pid)))))
+     (finally (transition/close! prepared)))))))
+
+(deftest raw-otp-control-and-copied-context-never-admit-candidate-callbacks
+ (with-owner "owner-grant-native-refusal" NEW
+  (fn [_ fresh pid]
+   (let [value (spec fresh) fake (tuple :bl_owner_transition (erlang/self) (erlang/make_ref))]
+    (is (= :refused (:status (GenServer/call pid [:proc.evolve/automatic-prepare fake 1 value]))))
+    (is (= :owner-transition-authority-required
+           (:kind (GenServer/call pid [:proc.evolve/upgrade 1 value]))))
+    (is (= :owner-transition-authority-required
+           (:kind (GenServer/call pid [:proc.evolve/prepare 1 value []]))))
+    (is (= :owner-transition-authority-required
+           (:kind (GenServer/call pid [:proc.evolve/rehearse 1 value 250]))))
+    (let [previous (BeamLisp.Env/capture) copied (g/with! fresh #(BeamLisp.Env/capture))]
+     (try (BeamLisp.Env/bind copied)
+      (is (try (BeamLisp.Env/begin_owner_transition! pid) false (catch _ true)))
+      (finally (BeamLisp.Env/bind previous))))
+    (let [malformed (assoc {:items :opaque :meta nil} :__struct__ :Elixir.BeamLisp.Vector)]
+     (is (= :unknown-evolution-message (:kind (GenServer/call pid malformed)))))
+    (is (= :unknown-evolution-message
+           (:kind (GenServer/call pid [:proc.evolve/automatic-prepare]))))
+    (is (Process/alive? pid))
+    (is (= 1 (:version (ev/status pid))))
+    (is (= "still serving" (ev/request! pid 1 "still serving")))))))
+
+(deftest cross-application-owner-refuses-before-candidate-execution
+ (with-owner "owner-grant-application" NEW
+  (fn [_ _ pid]
+   (let [other (graph "owner-grant-foreign" NEW)]
+    (try
+     (is (= :owner-transition-application-mismatch
+            (try (plan other pid) nil (catch error (:kind (ex-data error))))))
+     (is (= 1 (:version (ev/status pid))))
+     (is (= "same owner" (ev/request! pid 1 "same owner")))
+     (finally (g/retire! other)))))))
+
+(defn- await-value [predicate]
+ (loop [left 2000]
+  (cond (predicate) true (zero? left) false
+        :else (do (Process/sleep 5) (recur (dec left))))))
+(deftest prepared-native-custody-survives-creator-death-and-reconciles-exact-work
+ (with-owner "owner-grant-creator-death" NEW
+  (fn [_ fresh pid]
+   (let [parent (erlang/self) ticket (erlang/make_ref)
+         creator (spawn (fn []
+                    (let [prepared (plan fresh pid) receipt (transition/validate! prepared)]
+                     (erlang/send parent [:creator-prepared ticket prepared receipt])
+                     (receive :creator-finish :done))))]
+    (try
+     (let [[first-plan receipt]
+            (receive [:creator-prepared seen prepared result] :when (= seen ticket) [prepared result]
+             (after 35000 (throw :creator-prepare-timeout)))
+           grant (get-in first-plan [:owners :service :grant])
+           before (g/with! fresh #(BeamLisp.Env/owner_transition_observation grant))]
+      (is (= :valid (:status receipt)))
+      (is (= :prepared (:phase before)))
+      (is (= true (:native-custody before)))
+      (erlang/send creator :creator-finish)
+      (is (await-value #(not (Process/alive? creator))))
+      (let [next-plan (plan fresh pid)]
+       (try
+        (is (= grant (get-in next-plan [:owners :service :grant])))
+        (is (= :valid (:status (transition/validate! next-plan))))
+        (is (= :applied (:status (transition/activate! next-plan))))
+        (is (= :already-applied (get-in (transition/activate! next-plan) [:owners :service :status])))
+        (is (= "survived" (ev/request! pid 1 "survived")))
+        (is (= 2 (:version (ev/status pid))))
+        (finally (transition/close! next-plan)))))
+     (finally (when (Process/alive? creator) (erlang/send creator :creator-finish))))))))
+
+(deftest creator-death-after-native-commit-latch-cannot-revoke-accepted-state-transfer
+ (with-owner "owner-grant-commit-death" NEW
+  (fn [_ fresh pid]
+   (let [parent (erlang/self) ticket (erlang/make_ref)
+         creator (spawn (fn []
+                    (let [prepared (plan fresh pid)]
+                     (erlang/send parent [:creator-prepared ticket prepared (transition/validate! prepared)])
+                     (receive :creator-finish :done))))
+         locker (atom nil) committer (atom nil)]
+    (try
+     (let [prepared (receive [:creator-prepared seen plan receipt] :when (= seen ticket)
+                      (do (is (= :valid (:status receipt))) plan)
+                     (after 35000 (throw :creator-prepare-timeout)))
+           grant (get-in prepared [:owners :service :grant]) anchor (first (:modules fresh))]
+      ;; Hold only a module publication fence, not the Env registry Agent.
+      ;; Native receiver commit claim occurs before the run_code! borrow.
+      (reset! locker (spawn (fn []
+                       (BeamLisp.Env/with_module_locks (list anchor)
+                        (fn [] (erlang/send parent [:commit-fence ticket])
+                          (receive :release-fence :done))))))
+      (is (= :locked (receive [:commit-fence seen] :when (= seen ticket) :locked (after 5000 :timeout))))
+      (reset! committer (spawn (fn []
+                          (erlang/send parent [:committed ticket (transition/activate! prepared)]))))
+      (is (await-value #(= :committing (:phase (BeamLisp.Env/owner_transition_observation grant)))))
+      (erlang/send creator :creator-finish)
+      (is (await-value #(not (Process/alive? creator))))
+      (erlang/send @locker :release-fence)
+      (is (= :applied (:status (receive [:committed seen value] :when (= seen ticket) value
+                                (after 35000 {:status :timeout})))))
+      (is (= "old remains live" (ev/request! pid 1 "old remains live")))
+      (is (= "new remains live" (ev/request! pid 2 "new remains live")))
+      (is (= 2 (:version (ev/status pid))))
+      (transition/close! prepared))
+     (finally
+      (when @locker (erlang/send @locker :release-fence))
+      (when (Process/alive? creator) (erlang/send creator :creator-finish))
+      (when @committer (await-value #(not (Process/alive? @committer))))))))))

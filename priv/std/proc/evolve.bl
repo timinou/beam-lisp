@@ -1,7 +1,7 @@
 ; Stable process identity, versioned messages and atomic handler/state evolution.
 ; Upgrade callbacks are pure and short. External effects belong to durable jobs.
 (ns proc.evolve
- (:require [proc.server :as ps] [proc.callback :as cb] [proc.fence :as fence] [proc.queue :as queue] [proc.owner-registry :as owners] [proc.framework :as framework] [reload.execution :as execution] [datom.conn :as dc] [core]))
+ (:require [proc.server :as ps] [proc.callback :as cb] [proc.fence :as fence] [proc.queue :as queue] [proc.owner-registry :as owners] [proc.framework :as framework] [reload.execution :as execution] [data.first-order :as first-order] [datom.conn :as dc] [core]))
 
 (defn- valid-version? [v] (and (erlang/is_integer v) (> v 0)))
 (defn- validate! [spec]
@@ -35,7 +35,10 @@
              (if-let [f (get spec k)]
               (let [r (cb/register! f (:modules spec []))]
                (swap! held conj r) (assoc m k r)) m))
-           (assoc (select-keys spec [:version :digest])
+           (assoc (select-keys spec [:version :digest :message-proof])
+                  :proof-callbacks (into {} (map (fn [key]
+                    [key {:function (get spec key) :environment (BeamLisp.Env/capture)}])
+                    [:accept? :upcast :migrate-state :check-state]))
                   :reply-arity (if (erlang/is_function (:check-reply spec) 2) 2 1)
                   :downcast-arity (if (erlang/is_function (:downcast spec) 2) 2 1))
            [:handler :check-state :accept? :migrate-state :upcast :check-reply :downcast])
@@ -100,11 +103,11 @@
 
 (defn- install-prepared [st held value]
  (let [current (:current st)
-       edge {:to (:version held) :callback (:upcast held)
+       edge {:to (:version held) :callback (:upcast held) :message-proof (:message-proof held)
              :request-check (:accept? current)
              :downcast (:downcast held) :downcast-arity (:downcast-arity held)
              :reply-check (:check-reply current) :reply-arity (:reply-arity current)}
-       installed (dissoc held :migrate-state :upcast :downcast :downcast-arity)
+       installed (dissoc held :migrate-state :upcast :downcast :downcast-arity :message-proof)
        after (assoc st :current installed :value value :revision (inc (:revision st 0))
                       :adapters (assoc (:adapters st) (:version current) edge))]
   ;; Transfer registrations only after all fallible validation has finished.
@@ -137,6 +140,57 @@
        (when @next (release! @next))
        [{:status :refused :kind (or (:kind (ex-data e)) :migration-failed)} st]))))))
 
+(defn- message-proof-api [operation args]
+ ;; Ordinary SDK actors do not statically import analysis/prover dependencies.
+ (BeamLisp.Loader/ensure_loaded "proc.message-domain")
+ (erlang/apply (BeamLisp.Emit/module_for "proc.message-domain") operation (to-list args)))
+(defn- automatic-proof! [st spec]
+ (let [environment (:environment spec) graph (Process/get :bl_generation)]
+  (when-not (and graph (BeamLisp.Env/executing_generation? graph)
+                 (= (:digest graph) (:digest spec)) (= graph (:generation environment))
+                 (= (:scope graph) (:env environment)))
+   (throw (ex-info "Owner candidate has no native execution" {:kind :owner-transition-authority-required})))
+  (when (or (:check-reply (:current st)) (:check-reply spec) (:downcast spec))
+   (throw (ex-info "Reply migration needs a separate exact future-input proof"
+                  {:kind :unproved-reply-migration :scope :retained-old-owner})))
+  (doseq [edge (vals (:adapters st))]
+   (when-not (and (:message-proof edge)
+                  (every? #(message-proof-api :valid? [%]) (get-in edge [:message-proof :evidence])))
+    (throw (ex-info "Prior adapters have no exact pure migration proof"
+                   {:kind :unproved-prior-message-migration :scope :retained-old-owner}))))
+  (doseq [key [:handler :accept? :upcast :migrate-state :check-state :downcast :check-reply]]
+   (when-let [function (get spec key)] (BeamLisp.Env/assert_managed_callback! graph function)))
+  (let [record (fn [key] {:function (get spec key) :environment environment})
+        proof (message-proof-api :compare-callbacks
+                [(get-in st [:current :proof-callbacks :accept?]) (record :upcast) (record :accept?)])
+        state-proof (message-proof-api :capture [(:migrate-state spec) environment])
+        check-proof (message-proof-api :capture [(:check-state spec) environment])]
+   (when-not (and (= :proved (:status proof)) (= :proved (:status state-proof))
+                  (= :proved (:status check-proof)) (empty? (:obligations state-proof))
+                  (empty? (:obligations check-proof)))
+    (throw (ex-info "Future owner inputs require retained old execution"
+                   {:kind :unproved-message-migration :scope :retained-old-owner})))
+   {:domain proof :state state-proof :check check-proof})))
+(defn- queued-samples! [st]
+ (let [size (elem (Process/info (erlang/self) :message_queue_len) 1)]
+  (when (> size 256) (throw (ex-info "Owner queue exceeds proof budget" {:kind :message-inventory-budget})))
+  (let [messages (elem (Process/info (erlang/self) :messages) 1)]
+   (when (> (count messages) 256) (throw (ex-info "Owner queue changed beyond budget" {:kind :message-inventory-budget})))
+   (vec (keep (fn [envelope]
+    (when-not (and (tuple? envelope) (= 3 (erlang/tuple_size envelope)) (= :"$gen_call" (elem envelope 0)))
+     (throw (ex-info "Unknown mailbox work must drain" {:kind :unsupported-owner-mailbox})))
+    (let [message (elem envelope 2)]
+     (first-order/check! message {:max-nodes 16384 :max-bytes 65536 :max-depth 64})
+     (when-not (or (erlang/is_list message) (vector? message))
+      (throw (ex-info "Mailbox request is not an eager SDK message" {:kind :unsupported-owner-mailbox})))
+     (case [(first message) (count message)]
+      [:proc.evolve/status 1] nil
+      [:proc.evolve/request 3] {:version (nth message 1) :message (nth message 2)}
+      [:proc.evolve/call 3] {:version (nth message 1) :message (nth message 2)}
+      ;; Private-reference client requests cannot pass first-order admission;
+      ;; explicit client work remains retained/drain instead of being skipped.
+      (throw (ex-info "Mailbox control requires retained execution" {:kind :unsupported-owner-mailbox}))))) messages)))))
+
 (defn- stage-upgrade [st expected spec samples]
  (cond
   (not= expected (get-in st [:current :version])) [{:status :refused :kind :stale-version} st]
@@ -164,6 +218,10 @@
        (do (release! @held)
            [{:status :refused :kind (if (:timeout result) :rehearsal-deadline :candidate-refused)} st])
        (let [ticket (erlang/make_ref)
+             _ (when (:automatic spec)
+                 (let [observed (execution/runtime-inspection (Process/get :bl_generation) (:ok result))]
+                  (when-not (= :valid (:status observed))
+                   (throw (ex-info "Owner state belongs to another generation" {:kind (:kind observed :invalid-state)})))))
              preparation {:ticket ticket :held @held :value (:ok result)
                           :expected expected :revision (:revision st 0)}]
         [{:status :prepared :ticket ticket :version (:version spec) :digest (:digest spec)
@@ -185,6 +243,77 @@
     (let [after (install-prepared (dissoc st :preparation) (:held p) (:value p))
           receipt {:ticket ticket :version (get-in after [:current :version]) :revision (:revision after)}]
      [(assoc (dissoc receipt :ticket) :status :applied) (assoc after :publication receipt)]))))
+
+(defn- automatic-prepare [st grant expected spec samples]
+ (try
+  (BeamLisp.Env/with_owner_transition! grant :prepare
+   (fn []
+    (let [conversion-entered (atom false)]
+     (try
+      (when (:preparation st)
+       (throw (ex-info "Owner already has accepted preparation" {:kind :owner-preparation-pending})))
+      (first-order/check! samples {:max-nodes 32768 :max-bytes 1048576 :max-depth 64})
+      (when-not (and (vector? samples) (<= (count samples) 256))
+       (throw (ex-info "Invalid explicit owner message samples" {:kind :invalid-message-samples})))
+      (let [proof (automatic-proof! st spec) samples (into samples (queued-samples! st))
+            _ (when (> (count samples) 256)
+                (throw (ex-info "Combined owner sample inventory exceeds budget" {:kind :message-inventory-budget})))
+            _ (reset! conversion-entered true)
+            [reply after] (stage-upgrade st expected (assoc spec :automatic true :message-proof (:domain proof)) samples)]
+       (if (= :prepared (:status reply))
+        (do (BeamLisp.Env/owner_transition_prepared! grant (:ticket reply))
+            [(assoc (dissoc reply :ticket) :scope :proved-future-owner-inputs)
+             (update after :preparation #(assoc % :automatic-grant grant :proof proof))])
+        (do
+         (when-not (= :rehearsal-deadline (:kind reply))
+          (BeamLisp.Env/finish_owner_transition! grant nil :refused))
+         [reply after])))
+      (catch error
+       (if @conversion-entered (throw error)
+        (do (BeamLisp.Env/finish_owner_transition! grant nil :refused)
+            [{:status :refused :kind (or (:kind (ex-data error)) :unproved-message-migration)} st])))))))
+  (catch error [{:status :refused :kind (or (:kind (ex-data error)) :owner-transition-authority-required)} st])))
+(defn- automatic-observation [st grant]
+ (cond
+  (= grant (get-in st [:publication :automatic-grant]))
+   {:status :applied :version (get-in st [:publication :version]) :revision (get-in st [:publication :revision])}
+  (and (= grant (get-in st [:preparation :automatic-grant]))
+       (= :prepared (BeamLisp.Env/owner_transition_status grant)))
+   {:status (if (= (:revision st 0) (get-in st [:preparation :revision])) :prepared :stale)
+    :version (get-in st [:current :version]) :revision (:revision st 0)}
+  :else {:status :refused :kind :unknown-preparation}))
+(defn- automatic-commit [st grant]
+ (if (= grant (get-in st [:publication :automatic-grant]))
+  [(assoc (automatic-observation st grant) :status :already-applied) st]
+  (let [entered (atom false)]
+  (try
+   (BeamLisp.Env/with_owner_transition! grant :commit
+    (fn []
+     (let [p (:preparation st) proof (:proof p)]
+      (when-not (= grant (:automatic-grant p))
+       (throw (ex-info "Owner preparation is not this native grant" {:kind :unknown-preparation})))
+      (when-not (every? #(message-proof-api :valid? [%])
+                   (concat (get-in proof [:domain :evidence]) [(:state proof) (:check proof)]))
+       (throw (ex-info "Owner callback identity changed" {:kind :stale-message-proof})))
+      (reset! entered true)
+      (let [[reply after] (commit-upgrade st (:ticket p))]
+       (BeamLisp.Env/finish_owner_transition! grant (:ticket p) (if (= :applied (:status reply)) :applied :refused))
+       [reply (if (= :applied (:status reply))
+                (assoc-in after [:publication :automatic-grant] grant) after)]))))
+   (catch error
+    (if @entered (throw error)
+     [{:status :refused :kind (or (:kind (ex-data error)) :owner-transition-authority-required)} st]))))))
+(defn- automatic-cancel [st grant]
+ (try
+  (BeamLisp.Env/with_owner_transition! grant :cancel
+   (fn []
+    (let [p (:preparation st)]
+     (when-not (= grant (:automatic-grant p))
+      (throw (ex-info "Owner preparation is not this native grant" {:kind :unknown-preparation})))
+     (let [after (forget-preparation st)]
+      (BeamLisp.Env/finish_owner_transition! grant (:ticket p) :cancelled)
+      [{:status :cancelled} after]))))
+  (catch error [{:status :refused :kind (or (:kind (ex-data error)) :owner-transition-authority-required)} st])))
 
 (defn- valid-client-version? [st version]
   (and (valid-version? version)
@@ -301,23 +430,64 @@
     (catch e [{:status :refused :kind (or (:kind (ex-data e)) :rehearsal-failed)} st])
     (finally (when @held (release! @held)))))))
 
+(defn- owner-control-message [value]
+ ;; Control arity is at most five. Read canonical small-vector storage directly;
+ ;; never dispatch first/count/nth on an unclassified caller-controlled object.
+ (cond
+  (erlang/is_list value)
+   (loop [tail value left 6 out (list)]
+    (cond (erlang/== tail (list)) (when (seq out) (erlang/apply :lists :reverse (list out)))
+          (zero? left) nil
+          :else (recur (erlang/tl tail) (dec left) (cons (erlang/hd tail) out))))
+  (and (erlang/is_map value) (= :Elixir.BeamLisp.Vector (maps/get :__struct__ value nil)))
+   (let [items (maps/get :items value nil)]
+    (when (and (erlang/is_tuple items) (<= 1 (erlang/tuple_size items) 6))
+     (erlang/tuple_to_list items)))
+  :else nil))
+(defn- owner-control-arity? [message]
+ (and message
+  (= (erlang/length message)
+   (case (first message)
+    :proc.evolve/status 1
+    (:proc.evolve/automatic-commit :proc.evolve/automatic-cancel :proc.evolve/automatic-status
+     :proc.evolve/commit :proc.evolve/cancel :proc.evolve/acquire :proc.evolve/release
+     :proc.evolve/fence :proc.evolve/bind-queue) 2
+    (:proc.evolve/call :proc.evolve/upgrade :proc.evolve/client :proc.evolve/request :proc.evolve/retire) 3
+    (:proc.evolve/prepare :proc.evolve/rehearse) 4
+    :proc.evolve/automatic-prepare 5
+    nil))))
 (defn message-step
  "Shared versioned-owner engine, used by standalone and composed owners."
  [st message]
+ (let [message (owner-control-message message)]
+ (if-not (owner-control-arity? message) [{:status :refused :kind :unknown-evolution-message} st]
  (if-not (framework/alive? (:framework st))
   [{:status :refused :kind :framework-initializer-exited} st]
  (case (first message)
   :proc.evolve/call
    (if (:managed st) [{:status :refused :kind :managed-client-required} st]
     (dispatch st (nth message 1) (nth message 2)))
-  :proc.evolve/upgrade (upgrade st (nth message 1) (nth message 2))
-  :proc.evolve/prepare (stage-upgrade st (nth message 1) (nth message 2) (nth message 3))
-  :proc.evolve/commit (commit-upgrade st (nth message 1))
+  :proc.evolve/automatic-prepare (automatic-prepare st (nth message 1) (nth message 2) (nth message 3) (nth message 4))
+  :proc.evolve/automatic-commit (automatic-commit st (nth message 1))
+  :proc.evolve/automatic-cancel (automatic-cancel st (nth message 1))
+  :proc.evolve/automatic-status [(automatic-observation st (nth message 1)) st]
+  :proc.evolve/upgrade (if (get-in st [:owner-evidence :application-id])
+                         [{:status :refused :kind :owner-transition-authority-required} st]
+                         (upgrade st (nth message 1) (nth message 2)))
+  :proc.evolve/prepare (if (get-in st [:owner-evidence :application-id])
+                         [{:status :refused :kind :owner-transition-authority-required} st]
+                         (stage-upgrade st (nth message 1) (nth message 2) (nth message 3)))
+  :proc.evolve/commit (if (:automatic-grant (:preparation st))
+                        [{:status :refused :kind :owner-transition-authority-required} st]
+                        (commit-upgrade st (nth message 1)))
   :proc.evolve/cancel
-   (if (and (:preparation st) (= (nth message 1) (get-in st [:preparation :ticket])))
+   (if (and (:preparation st) (nil? (:automatic-grant (:preparation st)))
+            (= (nth message 1) (get-in st [:preparation :ticket])))
     [{:status :cancelled} (forget-preparation st)]
     [{:status :refused :kind :unknown-preparation} st])
-  :proc.evolve/rehearse (rehearsal st (nth message 1) (nth message 2) (nth message 3))
+  :proc.evolve/rehearse (if (get-in st [:owner-evidence :application-id])
+                         [{:status :refused :kind :owner-transition-authority-required} st]
+                         (rehearsal st (nth message 1) (nth message 2) (nth message 3)))
   :proc.evolve/acquire (acquire st (nth message 1))
   :proc.evolve/client
    (if-let [version (get (:clients st) (nth message 1))]
@@ -350,7 +520,7 @@
      :managed (:managed st) :clients (count (:clients st))
      :queues (vec (:queues st)) :fenced-versions (vec (sort (:fenced st)))
      :fenced-through (:fenced-through st) :pid (erlang/self)} st]
-  [{:status :refused :kind :unknown-evolution-message} st])))
+  [{:status :refused :kind :unknown-evolution-message} st])))))
 
 (defn close-state! [st]
  (try
@@ -379,7 +549,10 @@
  [clause _]
  (when-not (= 2 (count clause))
   (throw (ex-info "evolve expects one owner options map" {:kind :invalid-evolution-clause})))
- (let [patterns '[[:proc.evolve/call version message] [:proc.evolve/upgrade expected spec]
+ (let [patterns '[[:proc.evolve/automatic-prepare grant expected spec samples]
+                  [:proc.evolve/automatic-commit grant] [:proc.evolve/automatic-cancel grant]
+                  [:proc.evolve/automatic-status grant]
+                  [:proc.evolve/call version message] [:proc.evolve/upgrade expected spec]
                   [:proc.evolve/rehearse expected spec budget]
                   [:proc.evolve/prepare expected spec samples]
                   [:proc.evolve/commit ticket] [:proc.evolve/cancel ticket]
@@ -425,40 +598,112 @@
  "Version travels with the request, including queued calls from old clients."
  ([pid version message] (call! pid version message 5000))
  ([pid version message timeout] (GenServer/call pid [:proc.evolve/call version message] timeout)))
+(defn- application-owner? [pid]
+ (some? (:application-id (owner-evidence pid))))
+(defn- public-refusal [error]
+ ;; Caller-context/native authority errors never expose a captured graph/token.
+ (let [kind (or (:kind (ex-data error)) :owner-transition-authority-required)]
+  {:status (if (= kind :owner-transition-outcome-unknown) :uncertain :refused)
+   :kind kind :scope :retained-old-owner}))
+(defn- public-owner-call [pid message timeout]
+ (try (GenServer/call pid message timeout)
+  (catch _
+   ;; This native CAS only succeeds while no receiver has claimed conversion.
+   ;; It never cancels accepted/prepared/committing work on a timeout.
+   (try (BeamLisp.Env/abandon_owner_transition! (nth message 1)) (catch _ nil))
+   ;; A timeout or lost receiver reply cannot establish conversion/commit
+   ;; refusal. The native ticket remains the sole reconciliation identity.
+   (throw (ex-info "Owner transition outcome is unconfirmed"
+                   {:kind :owner-transition-outcome-unknown})))))
+(defn- public-grant! [pid ticket]
+ (when-not (erlang/is_reference ticket)
+  (throw (ex-info "Unknown owner preparation" {:kind :unknown-preparation})))
+ (let [grant (BeamLisp.Env/begin_owner_transition! pid)]
+  (when-not (= ticket (elem grant 2))
+   (try (BeamLisp.Env/abandon_owner_transition! grant) (catch _ nil))
+   (throw (ex-info "Preparation belongs to another exact candidate/owner" {:kind :unknown-preparation})))
+  grant))
 (defn upgrade!
- "FIFO publication of handler+state in the existing process. Requests keep their
-  version and upcast lazily on delivery; replies downcast through the reverse
-  path and satisfy every retained client contract. No mailbox rewrite or PID swap.
-  A refused migration keeps old state/handler. Timeout means outcome unknown."
+ "Existing public upgrade API. An application owner automatically uses actual
+  candidate execution, native receiver admission and one exact preparation.
+  Unsupported future domains/context return a retained-owner typed refusal.
+  Unbound development keeps its existing explicit migration contract. A call
+  timeout still means unknown outcome, never safe converter replay."
  ([pid expected spec] (upgrade! pid expected spec 5000))
- ([pid expected spec timeout] (GenServer/call pid [:proc.evolve/upgrade expected (prepare-spec spec)] timeout)))
+ ([pid expected spec timeout]
+  (if-not (application-owner? pid)
+   (GenServer/call pid [:proc.evolve/upgrade expected (prepare-spec spec)] timeout)
+   (try
+    (let [value (prepare-spec spec) grant (BeamLisp.Env/begin_owner_transition! pid)
+          status (public-owner-call pid [:proc.evolve/automatic-status grant] timeout)]
+     (cond
+      (= :applied (:status status))
+       (if (and (= (:version status) (:version value))
+                (= (:digest value) (:digest (Process/get :bl_generation))))
+        (assoc status :status :already-applied)
+        {:status :refused :kind :identity-conflict :scope :retained-old-owner})
+      (= :prepared (:status status))
+       ;; This upgrade call owns no proof that a different earlier prepared
+       ;; callback set is its argument. Explicit commit uses its opaque ticket.
+       {:status :refused :kind :owner-preparation-pending :scope :retained-old-owner}
+      :else
+       (let [prepared (public-owner-call pid [:proc.evolve/automatic-prepare grant expected value []] timeout)]
+        (if (= :prepared (:status prepared))
+         (public-owner-call pid [:proc.evolve/automatic-commit grant] timeout) prepared))))
+    (catch error (public-refusal error))))))
 (defn rehearse!
- "Bounded read-only Datom/state migration rehearsal. Receipt covers this exact
-  owner revision only; future requests may change it. No handler is published."
+ "Existing bounded rehearsal API. Application owners use the same exact native
+  preparation/future-domain gate as publication and then cancel that ticket.
+  Successful rehearsal runs no business handler and leaves old state installed."
  ([pid expected spec] (rehearse! pid expected spec 250))
  ([pid expected spec budget]
   (when-not (owner? pid) (throw (ex-info "Owner rehearsal requires native authority" {:kind :owner-transition-authority-required})))
-  (GenServer/call pid [:proc.evolve/rehearse expected (prepare-spec spec) budget] (+ budget 1000))))
+  (if-not (application-owner? pid)
+   (GenServer/call pid [:proc.evolve/rehearse expected (prepare-spec spec) budget] (+ budget 1000))
+   (try
+    (let [value (prepare-spec spec) grant (BeamLisp.Env/begin_owner_transition! pid)
+          prepared (public-owner-call pid [:proc.evolve/automatic-prepare grant expected value []] (+ budget 1000))]
+     (if (= :prepared (:status prepared))
+      (let [cancelled (public-owner-call pid [:proc.evolve/automatic-cancel grant] (+ budget 1000))]
+       (if (= :cancelled (:status cancelled))
+        (assoc prepared :status :valid :version expected :candidate-version (:version spec)
+                        :candidate-digest (:digest spec)) cancelled)) prepared))
+    (catch error (public-refusal error))))))
 (defn status [pid] (GenServer/call pid [:proc.evolve/status]))
-
 (defn prepare-upgrade!
- "Retain one exact candidate and rehearse pure state/message conversions in a
-  bounded turn. Samples are [{:version n :message m}], at most 256; no handler
-  body runs. The opaque owner-local ticket binds the actual retained callbacks
-  and this actor revision, not a caller-chosen digest alone. Replacing/cancelling
-  releases the prior preparation. Scope is sampled owner state, not all future
-  messages or external database invariants. Native IO purity is a contract."
+ "Existing public preparation API. Under a managed app's actual candidate
+  execution, acquire receiver admission automatically and return an opaque Ref
+  ticket for commit/cancel. No application coordinator/annotation is required.
+  Explicit samples are checked in addition to queued/future input proof. Native
+  grant/owner preparation IDs remain private. Unknown effects are not replayed."
  ([pid expected spec] (prepare-upgrade! pid expected spec []))
  ([pid expected spec samples]
   (when-not (owner? pid) (throw (ex-info "Preparation requires native owner authority" {:kind :owner-transition-authority-required})))
-  (GenServer/call pid [:proc.evolve/prepare expected (prepare-spec spec) samples] 31000)))
+  (if-not (application-owner? pid)
+   (GenServer/call pid [:proc.evolve/prepare expected (prepare-spec spec) samples] 31000)
+   (try
+    (let [value (prepare-spec spec) grant (BeamLisp.Env/begin_owner_transition! pid)
+          prepared (public-owner-call pid [:proc.evolve/automatic-prepare grant expected value samples] 31000)]
+     (if (= :prepared (:status prepared)) (assoc prepared :ticket (elem grant 2)) prepared))
+    (catch error (public-refusal error))))))
 (defn commit-upgrade!
- "FIFO compare-and-publish the exact prepared candidate. Any intervening
-  successful domain call invalidates the preparation; no old state is restored.
-  Repeating the last committed ticket reconciles a lost reply. Timeout remains
-  outcome unknown. Tickets are VM-local, not durable upgrade receipts."
- [pid ticket] (GenServer/call pid [:proc.evolve/commit ticket]))
-(defn cancel-upgrade! [pid ticket] (GenServer/call pid [:proc.evolve/cancel ticket]))
+ "Commit the exact opaque preparation Ref. Application callers need actual
+  matching candidate execution; possession/copied scope alone is not admission.
+  The last completed exact ticket reconciles a lost reply without conversion."
+ [pid ticket]
+ (if-not (application-owner? pid)
+  (GenServer/call pid [:proc.evolve/commit ticket])
+  (try
+   (let [grant (public-grant! pid ticket)]
+    (public-owner-call pid [:proc.evolve/automatic-commit grant] 31000))
+   (catch error (public-refusal error)))))
+(defn cancel-upgrade! [pid ticket]
+ (if-not (application-owner? pid)
+  (GenServer/call pid [:proc.evolve/cancel ticket])
+  (try
+   (let [grant (public-grant! pid ticket)]
+    (public-owner-call pid [:proc.evolve/automatic-cancel grant] 5000))
+   (catch error (public-refusal error)))))
 
 (defn acquire-client!
  "Acquire an old/new protocol dependency from a managed owner. A token stays
@@ -503,3 +748,12 @@
   Failed and held jobs block retirement. Waiting keeps admissions fenced.
   No caller-supplied boolean or arbitrary callback can authorize collection."
  [pid expected through] (GenServer/call pid [:proc.evolve/retire expected through] 30000))
+
+(defn prepare-transition! [pid grant expected spec]
+ (GenServer/call pid [:proc.evolve/automatic-prepare grant expected spec []] 31000))
+(defn commit-transition! [pid grant]
+ (GenServer/call pid [:proc.evolve/automatic-commit grant] 31000))
+(defn cancel-transition! [pid grant]
+ (GenServer/call pid [:proc.evolve/automatic-cancel grant] 5000))
+(defn transition-status [pid grant]
+ (GenServer/call pid [:proc.evolve/automatic-status grant] 5000))
