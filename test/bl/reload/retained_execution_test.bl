@@ -1,0 +1,130 @@
+; Root-only coherent Native Env+Refs and SDK execution+conn batch.
+(ns reload.retained-execution-test
+ (:require [reload.generation :as generation] [reload.execution :as execution]
+           [proc.callback :as callback] [proc.task :as task] [env]
+           [datom :as d] [datom.conn :as conn] [datom.store-fjall :as fjall]))
+(defn- root! []
+ (let [path (str (System/get_env "HOME") "/tmp/retained-creator-" (erlang/unique_integer (list :positive)))]
+  (File/mkdir_p! path) path))
+(defn- graph [root revision]
+ (let [file (str root "/retained/creator.bl")
+       source (str "(ns retained.creator (:require [datom :as d] [datom.store-fjall :as fjall]
+                         [reload.execution :as execution] [env]))
+        (defn factory [] (fn [path] {:owned (execution/owned?) :connection (d/connect-with (fjall/open path))}))
+        (defn ownership [] (fn [] (execution/owned?)))
+        (defn fails [] (fn [] (throw :fixture-callback-error)))
+        (defn captured [] (fn [] (env/capture)))
+        (defn under-token [] (fn [token]
+          (let [previous (env/capture)]
+           (try (env/bind token) (execution/owned?) (finally (env/bind previous))))))
+        (defn blocked [] (fn [parent path]
+          (erlang/send parent [:entered (erlang/self)])
+          (receive :finish nil (after 30000 (throw :fixture-start-deadline)))
+          {:owned (execution/owned?) :connection (d/connect-with (fjall/open path))}))
+        (def revision " revision ")")]
+  (File/mkdir_p! (Path/dirname file)) (File/write! file source)
+  (BeamLisp.Loader/with_load_path root
+   #(generation/prepare! (generation/project-plan
+      {:application-id "retained-creator" :entrypoint "retained.creator/factory"
+       :fixed-runtime true :native-modules #{"erlang"}})))))
+(defn- registered [graph entry]
+ (generation/with! graph #(callback/register! (generation/invoke! graph entry []))))
+(defn- inventoried? [graph root connection]
+ (generation/with! graph
+  #(boolean (some (fn [observed] (= (:lifetime connection) (:lifetime observed)))
+                  (conn/owned-connections (:application-id graph) root [])))))
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(deftest actual-admitted-retained-callback-records-native-connection-creator
+ (let [root (root!) graph (graph root 1) registration (registered graph "retained.creator/factory")
+       result (callback/invoke! registration [(str root "/callback.fjall")]) connection (:connection result)]
+  (try
+   (is (= true (:owned result))) (is (inventoried? graph root connection))
+   (is (not (execution/owned?)))
+   (finally (callback/unregister! registration) (d/close! connection)
+    (generation/retire! graph) (File/rm_rf! root)))))
+(deftest native-owned-task-handoff-records-creator-without-a-second-graph-lease
+ (let [root (root!) graph (graph root 2)
+       work (generation/with! graph
+              #(task/async-nolink
+                (let [action (generation/invoke! graph "retained.creator/factory" [])]
+                 (fn [] (action (str root "/task.fjall"))))))
+       result (task/await work 10000) connection (:connection result)]
+  (try
+   (is (= true (:owned result))) (is (inventoried? graph root connection))
+   (is (not (execution/owned?)))
+   (finally (d/close! connection) (generation/retire! graph) (File/rm_rf! root)))))
+(deftest a-captured-token-and-live-retained-registration-are-not-execution-proof
+ (let [root (root!) graph (graph root 3) registration (registered graph "retained.creator/ownership")
+       token (generation/with! graph env/capture) previous (env/capture)]
+  (try
+   (env/bind token)
+   (is (callback/active? registration)) (is (not (execution/owned?)))
+   (is (not (BeamLisp.Env/executing_generation? graph)))
+   (is (= false (BeamLisp.Env/executing_generation? {})))
+   (is (= false (BeamLisp.Env/executing_generation? :not-a-graph)))
+   (finally (env/bind previous) (callback/unregister! registration)
+    (generation/retire! graph) (File/rm_rf! root)))))
+(deftest execution-proof-is-not-conveyed-and-a-different-graph-token-refuses
+ (let [root (root!) old (graph root 4) other (graph root 5)
+       captured (registered old "retained.creator/captured") owner (registered old "retained.creator/ownership")
+       under-token (registered old "retained.creator/under-token")
+       token (callback/invoke! captured []) other-token (generation/with! other env/capture)
+       subset-token (assoc token :generation (assoc old :modules [(first (:modules old))]))
+       wrong-scope-token (assoc token :generation (assoc old :scope :wrong-native-scope))
+       before (env/capture)]
+  (try
+   (is (not (contains? token :executing-code-lease)))
+   (is (not (contains? token :bl-executing-code-lease)))
+   (is (not (contains? token :executing-generation)))
+   (is (not (contains? token :bl-executing-generation)))
+   (env/bind token) (is (not (execution/owned?))) (env/bind before)
+   (is (= true (callback/invoke! owner [])))
+   (is (= false (callback/invoke! under-token [other-token])))
+   (is (= false (callback/invoke! under-token [subset-token])))
+   (is (= false (callback/invoke! under-token [wrong-scope-token])))
+   (is (not (execution/owned?)))
+   (finally (env/bind before) (doseq [registration [captured owner under-token]] (callback/unregister! registration))
+    (generation/retire! old) (generation/retire! other) (File/rm_rf! root)))))
+(deftest unregister-cancels-before-entry-but-accepted-work-keeps-creator-proof
+ (let [root (root!) graph (graph root 6) cancelled (registered graph "retained.creator/factory")
+       blocked (registered graph "retained.creator/blocked") parent (erlang/self)
+       path (str root "/accepted.fjall")
+       _ (callback/unregister! cancelled)
+       work (task/async-nolink #(callback/invoke! blocked [parent path]))]
+  (try
+   (is (= :cancelled (callback/invoke! cancelled [(str root "/not-entered.fjall")])))
+   (is (not (File/exists? (str root "/not-entered.fjall"))))
+   (let [pid (receive [:entered worker] worker (after 10000 (throw :missing-entry)))]
+    ;; Even a failed assertion must release this PURE fixture barrier. Never
+    ;; kill/replay accepted real provider work to make a test appear drained.
+    (try
+     (callback/unregister! blocked)
+     (is (= :waiting (:status (generation/retire! graph))))
+     (finally (erlang/send pid :finish)))
+    (let [result (task/await work 10000) connection (:connection result)]
+     (try (is (= true (:owned result))) (is (inventoried? graph root connection))
+      (finally (d/close! connection)))))
+   (is (not (execution/owned?)))
+   (finally (callback/unregister! blocked) (generation/retire! graph) (File/rm_rf! root)))))
+(deftest callback-exception-restores-private-proof-and-releases-admitted-borrow
+ (let [root (root!) graph (graph root 8) registration (registered graph "retained.creator/fails")]
+  (try
+   (is (= :fixture-callback-error
+          (try (callback/invoke! registration []) :missing-error (catch error error))))
+   (is (not (execution/owned?)))
+   (is (not (BeamLisp.Env/executing_generation? graph)))
+   (callback/unregister! registration)
+   (is (= :retired (:status (generation/retire! graph))))
+   (finally (callback/unregister! registration) (generation/retire! graph) (File/rm_rf! root)))))
+(deftest unclassified-open-under-root-is-a-refusal-not-migration-inventory-omission
+ (let [root (root!) graph (graph root 7)
+       unclassified (d/connect-with (fjall/open (str root "/manager-opened.fjall")))]
+  (try
+   (is (= :unclassified-owned-store
+          (generation/with! graph #(kind (fn [] (conn/owned-connections (:application-id graph) root []))))))
+   ;; Exact explicitly borrowed native handle admits lifecycle-opened controls;
+   ;; the path alone grants nothing and no second Fjall writer is opened.
+   (is (= [(:lifetime unclassified)]
+          (generation/with! graph #(mapv :lifetime (conn/owned-connections (:application-id graph) root [unclassified])))))
+   (is (= :ready (:state (conn/writer-observation unclassified))))
+   (finally (d/close! unclassified) (generation/retire! graph) (File/rm_rf! root)))))
