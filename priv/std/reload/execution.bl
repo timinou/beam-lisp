@@ -83,30 +83,126 @@
   (with! generation #(invoke-entry generation entry args))))
 
 
-; Initializer-owned runtime handles share the exact execution lifetime fence.
-(defn- bounded-handles? [bindings]
- (loop [todo [bindings] remaining 100000]
-  (if (empty? todo) true
-   (if (neg? remaining) false
-    (let [v (first todo)]
-     (cond
-      (erlang/is_function v) false
-      (and (erlang/is_map v) (= :Elixir.BeamLisp.Atom (maps/get :__struct__ v nil)))
-      (recur (cons @v (rest todo)) (dec remaining))
-      (and (erlang/is_tuple v) (= 3 (erlang/tuple_size v)) (= :$blfn (elem v 0))) false
-      (or (erlang/is_map v) (vector? v) (list? v) (set? v) (erlang/is_tuple v))
-      (let [items (cond (erlang/is_map v) (mapcat (fn [pair] (list (elem pair 0) (elem pair 1)))
-                                                  (maps/to_list v))
-                       (erlang/is_tuple v) (erlang/tuple_to_list v) :else v)]
-       (and (<= (count items) remaining)
-            (recur (reduce (fn [stack item] (cons item stack)) (rest todo) items) (dec remaining))))
-      :else (recur (rest todo) (dec remaining))))))))
+; Registered BL classes have nominal code identity, including inside native raw
+; collections and mutable cells. A registry row alone never grants SDK identity.
+(defn- class-evidence [generation module proofs]
+ (if-let [cached (get proofs module)] [cached proofs 0]
+  (let [info (BeamLisp.Record/info module)
+        registered? (and (erlang/is_tuple info) (= 4 (erlang/tuple_size info)))
+        app? (and registered? generation (contains? (:classes generation #{}) module))
+        sdk? (and registered? (not app?) (BeamLisp.AOT/sdk_generated_class? module))
+        entry {:info info :registered? registered? :permitted? (or app? sdk?)}]
+   [entry (assoc proofs module entry) (if (and registered? (not app?)) 1 0)])))
+
+(defn runtime-inspection
+ "Bounded point-in-time raw observation of nonexecutable runtime values. It
+  never enumerates domain sequences/queries, invokes user code or returns values.
+  Registered classes must be admitted by this exact graph or independently
+  attested fixed SDK classes. Mutable aliases can change after this observation;
+  native resources/actors remain separate owned-lifetime/migration obligations."
+ [generation bindings]
+ (try
+  (loop [todo (list (tuple :value bindings 0)) left 100000 visited 0 proofs {}
+         sdk-checks 0 mutable-cells 0 opaque-handles 0]
+   (if (empty? todo)
+    {:status :valid :nodes visited :class-checks (count proofs) :sdk-checks sdk-checks
+     :mutable-cells mutable-cells :opaque-handles opaque-handles}
+    (let [task (first todo) rest-todo (rest todo) mode (elem task 0)]
+     (case mode
+      :map
+       (let [entry (maps/next (elem task 1)) depth (elem task 2)]
+        (if (= :none entry)
+         (recur rest-todo left visited proofs sdk-checks mutable-cells opaque-handles)
+         (recur (cons (tuple :value (elem entry 0) depth)
+                 (cons (tuple :value (elem entry 1) depth)
+                  (cons (tuple :map (elem entry 2) depth) rest-todo)))
+                left visited proofs sdk-checks mutable-cells opaque-handles)))
+      :tuple
+       (let [v (elem task 1) index (elem task 2) depth (elem task 3)]
+        (if (> index (erlang/tuple_size v))
+         (recur rest-todo left visited proofs sdk-checks mutable-cells opaque-handles)
+         (recur (cons (tuple :value (erlang/element index v) depth)
+                 (cons (tuple :tuple v (inc index) depth) rest-todo))
+                left visited proofs sdk-checks mutable-cells opaque-handles)))
+      :list
+       (let [items (elem task 1) depth (elem task 2)]
+        (cond
+         (= (list) items) (recur rest-todo left visited proofs sdk-checks mutable-cells opaque-handles)
+         (not (erlang/is_list items)) {:status :refused :kind :invalid-runtime-value}
+         :else (recur (cons (tuple :value (erlang/hd items) depth)
+                         (cons (tuple :list (erlang/tl items) depth) rest-todo))
+                      left visited proofs sdk-checks mutable-cells opaque-handles)))
+      :value
+       (let [v (elem task 1) depth (elem task 2) next-left (dec left)]
+        (cond
+         (or (neg? next-left) (> depth 128)) {:status :refused :kind :runtime-value-budget}
+         (erlang/is_function v) {:status :refused :kind :invalid-runtime-value}
+         (or (and (erlang/is_map v)
+                  (contains? #{:Elixir.BeamLisp.LazySeq :Elixir.BeamLisp.Delay
+                               :Elixir.BeamLisp.Derived :Elixir.BeamLisp.Future :Elixir.BeamLisp.Promise}
+                             (maps/get :__struct__ v nil)))
+             (and (erlang/is_tuple v) (= 3 (erlang/tuple_size v)) (= :$transient (elem v 0))))
+          ;; These hide latent code or mutable contents behind an opaque cell.
+          ;; Keep them with their owned old callback/task and drain explicitly;
+          ;; never force them to make an inheritance snapshot appear safe.
+          {:status :refused :kind :opaque-runtime-continuation}
+         (and (erlang/is_tuple v) (= 3 (erlang/tuple_size v)) (= :$blfn (elem v 0)))
+          {:status :refused :kind :invalid-runtime-value}
+         (or (and (erlang/is_map v) (erlang/is_map_key :__struct__ v))
+             (and (erlang/is_tuple v) (= 3 (erlang/tuple_size v)) (= :bl_deftype (elem v 0))))
+          (let [record? (erlang/is_map v) module (if record? (erlang/map_get :__struct__ v) (elem v 1))
+                [evidence next-proofs checks] (class-evidence generation module proofs)
+                info (:info evidence) registered? (:registered? evidence)
+                valid? (if record?
+                         (or (not registered?)
+                          (and (= :record (elem info 0)) (:permitted? evidence)
+                               (every? #(erlang/is_map_key % v) (elem info 3))))
+                         (and registered? (= :deftype (elem info 0)) (:permitted? evidence)
+                              (erlang/is_tuple (elem v 2)) (= (count (elem info 3)) (erlang/tuple_size (elem v 2)))))
+                cell? (and record? (contains? #{:Elixir.BeamLisp.Atom :Elixir.BeamLisp.Volatile} module))]
+           (if-not valid? {:status :refused :kind :foreign-generation-runtime-value}
+            (recur (cons (if cell?
+                           ;; Only the fixed native Atom read is allowed. No
+                           ;; delay/future/derived/Enumerable protocol executes.
+                           (tuple :value (BeamLisp.Refs/deref v) (inc depth))
+                           (if record? (tuple :map (maps/iterator v) (inc depth))
+                                       (tuple :tuple v 1 (inc depth)))) rest-todo)
+                   next-left (inc visited) next-proofs (+ sdk-checks checks)
+                   (+ mutable-cells (if cell? 1 0)) opaque-handles)))
+         (erlang/is_map v)
+          (recur (cons (tuple :map (maps/iterator v) (inc depth)) rest-todo)
+                 next-left (inc visited) proofs sdk-checks mutable-cells opaque-handles)
+         (erlang/is_tuple v)
+          (recur (cons (tuple :tuple v 1 (inc depth)) rest-todo)
+                 next-left (inc visited) proofs sdk-checks mutable-cells opaque-handles)
+         (erlang/is_list v)
+          (recur (cons (tuple :list v (inc depth)) rest-todo)
+                 next-left (inc visited) proofs sdk-checks mutable-cells opaque-handles)
+         :else (recur rest-todo next-left (inc visited) proofs sdk-checks mutable-cells
+                      (+ opaque-handles (if (or (erlang/is_pid v) (erlang/is_reference v) (erlang/is_port v)) 1 0)))))
+      {:status :refused :kind :invalid-runtime-value}))))
+  (catch _ {:status :refused :kind :invalid-runtime-value})))
+
+(defn- require-runtime-values! [generation bindings]
+ (let [observed (runtime-inspection generation bindings)]
+  (when-not (= :valid (:status observed))
+   (refuse! (if (contains? #{:foreign-generation-runtime-value :opaque-runtime-continuation} (:kind observed))
+               (:kind observed) :invalid-runtime-bindings)
+            {:contract "runtime.classes"})) :ok))
+
+(defn check-runtime!
+ "Mandatory point-in-time class check before owner/source publication. It
+  changes no bindings, retags no data, traverses no domain query and cannot
+  freeze later raw Atom aliases. Owner/resource migration remains separate."
+ [generation]
+ (when-let [runtime (:runtime @(:state generation))]
+  (when-not (Process/alive? (:owner runtime)) (refuse! :missing-runtime-resource {}))
+  (require-runtime-values! generation (:values runtime))) :ok)
 
 (defn runtime-value?
- "Bounded nonexecutable runtime data/handles. Atom contents are checked too;
-  callback references must remain sealed names instead of borrowed closures."
- [value]
- (bounded-handles? value))
+ "Bounded nonexecutable data/handles with registered BL class identity checks.
+  An opaque native handle is not proof that its backing data was migrated."
+ [value] (= :valid (:status (runtime-inspection (current) value))))
 
 (defn bind-runtime!
  "Bind initializer-owned live handles once in this generation. Unlike sealed
@@ -115,13 +211,14 @@
   before publication; no global fallback and no executable callbacks in bindings."
  [bindings]
  (let [generation (current)]
-  (when-not (and generation (map? bindings) (runtime-value? bindings))
+  (when-not (and generation (map? bindings))
    (refuse! :invalid-runtime-bindings {}))
   (with-lock (:cache-key generation)
    (fn []
     (let [state @(:state generation) previous (:runtime state)]
      (when (or (:retired state) (seq (:slots state)))
       (refuse! :runtime-bindings-closed {}))
+     (require-runtime-values! generation bindings)
      (if previous
       (if (and (= (erlang/self) (:owner previous)) (= bindings (:values previous))) :already-bound
        (refuse! :runtime-binding-conflict {}))
@@ -156,6 +253,9 @@
                      (not (:retired source)) (not (:retired target)) (empty? (:slots target))
                      (= (:application-id candidate) (:application-id previous)))
        (refuse! :runtime-inheritance-refused {}))
+      ;; Validate BEFORE touching candidate bindings. Matching fields never
+      ;; silently retag nominal old code identities into a new generation.
+      (require-runtime-values! candidate (:values runtime))
       (if (:runtime target)
        (if (= (:runtime target) runtime) :already-bound (refuse! :runtime-binding-conflict {}))
        (do (swap! (:state candidate) assoc :runtime runtime) :inherited)))))))))

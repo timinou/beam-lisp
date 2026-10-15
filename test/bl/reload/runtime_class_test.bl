@@ -1,0 +1,114 @@
+; Parent serial slot only. Coordinated Record/compiler/AOT floor required.
+(ns reload.runtime-class-test
+ (:require [reload.generation :as generation] [reload.execution :as execution]
+           [datom :as d] [datom.store-fjall :as fjall] [proc.callback :as callback] [reload]))
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- root! []
+ (let [path (str (System/get_env "HOME") "/tmp/runtime-classes-" (erlang/unique_integer (list :positive)))]
+  (File/mkdir_p! path) path))
+(defn- graph [root revision]
+ (let [source (str "(ns runtime.class (:require [datom]))
+     (defrecord Session [value]) (deftype Handle [value])
+     (defn record [] (->Session " revision "))
+     (defn typed [] (->Handle " revision "))
+     (defrecord QueryLike [effects] core/Seqable (-seq [this] (swap! (:effects this) inc) nil))
+     (defn query-like [effects] (->QueryLike effects))
+     (defn migrate [old] (->Session (:value old)))
+     (defn migrate-typed [old] (->Handle (.-value old)))
+     (defn captured [cell] (fn [] @cell))")
+       file (str root "/runtime/class.bl")]
+  (File/mkdir_p! (Path/dirname file)) (File/write! file source)
+  (BeamLisp.Loader/with_load_path root
+   #(generation/prepare! (generation/project-plan
+      {:application-id "runtime-class-migration" :entrypoints ["runtime.class/record" "runtime.class/typed"]
+       :fixed-runtime true})))))
+(deftest same-fields-are-not-authority-to-retag-or-share-old-class-data
+ (let [root (root!) old (graph root 1) candidate (graph root 2)
+       old-record (generation/invoke! old "runtime.class/record" [])
+       old-type (generation/invoke! old "runtime.class/typed" [])
+       current-record (generation/invoke! candidate "runtime.class/record" [])
+       current-type (generation/invoke! candidate "runtime.class/typed" [])
+       source-cell (atom {:nested [old-record old-type]}) target-cell (atom [current-record current-type])]
+  (try
+   (is (= :bound (generation/with! old #(generation/bind-runtime! {:session source-cell}))))
+   (is (generation/with! old #(execution/runtime-value? [old-record old-type])))
+   (is (not (generation/with! candidate #(execution/runtime-value? old-record))))
+   (is (not (generation/with! candidate #(execution/runtime-value? old-type))))
+   (is (= :foreign-generation-runtime-value (kind #(generation/inherit-runtime! candidate old))))
+   (is (not (generation/runtime-bound? candidate)))
+   (is (= :foreign-generation-runtime-value
+          (generation/with! candidate #(kind (fn [] (generation/bind-runtime! {:session source-cell}))))))
+   (is (= :bound (generation/with! candidate #(generation/bind-runtime! {:session target-cell}))))
+   (is (= :ok (execution/check-runtime! candidate)))
+   ;; The mandatory publication observation sees a later alias write. The
+   ;; constant-time resource getter is deliberately not a universal write guard.
+   (reset! target-cell {:nested [old-record]})
+   (is (= :foreign-generation-runtime-value (kind #(execution/check-runtime! candidate))))
+   (is (= target-cell (generation/with! candidate #(generation/runtime-resource :session))))
+   (let [slot (generation/slot) enabled (reload/reload-enabled?)]
+    (try
+     (reload/set-enabled! true)
+     (is (= :foreign-generation-runtime-value (kind #(generation/publish! slot nil candidate))))
+     (is (nil? (generation/selected slot)))
+     (is (empty? (:slots @(:state candidate))))
+     (finally (reload/set-enabled! enabled))))
+   (reset! target-cell [current-record current-type])
+   (is (= :ok (execution/check-runtime! candidate)))
+   (finally (generation/retire! candidate) (generation/retire! old) (File/rm_rf! root)))))
+(deftest forged-or-malformed-registered-class-shapes-are-not-runtime-data
+ (let [root (root!) graph (graph root 3) record (generation/invoke! graph "runtime.class/record" [])
+       typed (generation/invoke! graph "runtime.class/typed" [])]
+  (try
+   (is (not (generation/with! graph #(execution/runtime-value? (maps/remove :value record)))))
+   (is (generation/with! graph #(execution/runtime-value? (maps/put :extra 1 record))))
+   (is (not (generation/with! graph #(execution/runtime-value? (tuple :bl_deftype (elem typed 1) (tuple))))))
+   (is (not (generation/with! graph #(execution/runtime-value? (tuple :bl_deftype :Elixir.UnprovedClass (tuple 1))))))
+   (finally (generation/retire! graph) (File/rm_rf! root)))))
+(deftest actual-fixed-sdk-connection-remains-a-shareable-runtime-handle
+ (let [root (root!) graph (graph root 4)
+       connection (d/connect-with (fjall/open (str root "/control.fjall")))]
+  (try
+   (is (BeamLisp.AOT/sdk_generated_class? (erlang/map_get :__struct__ connection)))
+   (is (generation/with! graph #(execution/runtime-value? connection)))
+   (is (= :bound (generation/with! graph #(generation/bind-runtime! {:control connection}))))
+   (is (= :ok (execution/check-runtime! graph)))
+   (finally (d/close! connection) (generation/retire! graph) (File/rm_rf! root)))))
+
+(deftest explicit-migration-creates-new-nominal-values-and-leaves-old-callback-state-intact
+ (let [root (root!) old (graph root 5) candidate (graph root 6)
+       before {:record (generation/invoke! old "runtime.class/record" [])
+               :typed (generation/invoke! old "runtime.class/typed" [])}
+       old-cell (atom before)
+       registration (generation/with! old
+         #(callback/register! (generation/invoke! old "runtime.class/captured" [old-cell])))]
+  (try
+   (generation/with! old #(generation/bind-runtime! {:session old-cell}))
+   (let [migrated {:record (generation/invoke! candidate "runtime.class/migrate" [(:record before)])
+                   :typed (generation/invoke! candidate "runtime.class/migrate-typed" [(:typed before)])}
+         new-cell (atom migrated)]
+    (is (not= (erlang/map_get :__struct__ (:record before)) (erlang/map_get :__struct__ (:record migrated))))
+    (is (not= (elem (:typed before) 1) (elem (:typed migrated) 1)))
+    (is (= (:value (:record before)) (:value (:record migrated))))
+    (is (= :bound (generation/with! candidate #(generation/bind-runtime! {:session new-cell}))))
+    (is (= :ok (execution/check-runtime! candidate)))
+    (is (= before (callback/invoke! registration [])))
+    (is (= :waiting (:status (generation/retire! old))))
+    (is (= before @old-cell))
+    (is (not= old-cell new-cell)))
+   (finally (callback/unregister! registration) (generation/retire! candidate)
+    (generation/retire! old) (File/rm_rf! root)))))
+
+(deftest raw-validation-never-invokes-foreign-enumerators-or-lazy-callbacks
+ (let [effects (atom 0) opaque {:__struct__ :Elixir.Range :hidden (fn [] (swap! effects inc))}]
+  (is (= :refused (:status (execution/runtime-inspection nil opaque))))
+  (is (= 0 @effects))
+  (is (= :refused (:status (execution/runtime-inspection nil (lazy-seq (do (swap! effects inc) (list 1)))))))
+  (is (= 0 @effects))))
+
+(deftest a-registered-domain-sequence-is-inspected-without-running-its-protocol
+ (let [root (root!) graph (graph root 7) effects (atom 0)
+       value (generation/invoke! graph "runtime.class/query-like" [effects])]
+  (try
+   (is (= :valid (:status (execution/runtime-inspection graph value))))
+   (is (= 0 @effects))
+   (finally (generation/retire! graph) (File/rm_rf! root)))))
