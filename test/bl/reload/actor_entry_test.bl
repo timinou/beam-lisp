@@ -1,0 +1,183 @@
+; Requires the coherent native Env+Server+Compiler floor plus sealed descriptor
+; adapter. Actual Fjall connections, actual managed actor callbacks, no mocks.
+(ns reload.actor-entry-test
+ (:require [reload.generation :as generation] [reload.execution :as execution]
+           [reload.state :as state] [env] [datom :as d] [datom.conn :as conn]
+           [proc.dispatch :as dispatch] [proc.framework :as framework]))
+(defn- root! []
+ (let [root (str (System/get_env "HOME") "/tmp/actor-entry-" (erlang/unique_integer (list :positive)))]
+  (File/mkdir_p! root) root))
+(defn- graph [root]
+ (let [file (str root "/actor/creator.bl")
+       source "(ns actor.creator (:require [datom :as d] [datom.store-fjall :as fjall]
+                         [reload.execution :as execution] [env]))
+        (defserver owner
+         (init [opts]
+          (let [connection (d/connect-with (fjall/open (:path opts)))]
+           (ok {:connections [connection] :parent (:parent opts) :init-owned (execution/owned?)})))
+         (handle-call :state [_ state] (reply state state))
+         (handle-call :owned [_ state] (reply (execution/owned?) state))
+         (handle-call [:open path] [_ state]
+          (let [connection (d/connect-with (fjall/open path))]
+           (reply {:owned (execution/owned?) :connection connection}
+                  (update state :connections conj connection))))
+         (handle-call [:under token] [_ state]
+          (let [previous (env/capture)]
+           (reply (try (env/bind token) (execution/owned?) (finally (env/bind previous))) state)))
+         (handle-call :hold [_ state]
+          (erlang/send (:parent state) [:actor-entered (erlang/self)])
+          (receive :continue-callback nil (after 30000 (throw :actor-fixture-deadline)))
+          (reply (execution/owned?) state))
+         (terminate [_ state]
+          (erlang/send (:parent state) [:actor-terminated (erlang/self) (execution/owned?)])
+          (doseq [connection (:connections state)] (d/close! connection))))
+        (defn start-owner [opts] (start owner opts))
+        (defn factory [] (fn [path] {:owned (execution/owned?)
+                                     :connection (d/connect-with (fjall/open path))}))"]
+  (File/mkdir_p! (Path/dirname file)) (File/write! file source)
+  (BeamLisp.Loader/with_load_path root
+   #(generation/prepare! (generation/project-plan
+     {:application-id "actor-entry" :entrypoint "actor.creator/start-owner"
+      :fixed-runtime true :native-modules #{"erlang"}})))))
+(defn- observed? [g root connection]
+ (generation/with! g
+  #(boolean (some (fn [row] (= (:lifetime connection) (:lifetime row)))
+                  (conn/owned-connections (:application-id g) root [])))))
+(defn- exit! [pid]
+ (let [ref (Process/monitor pid)]
+  (if (Process/alive? pid)
+   (receive [:DOWN seen :process owner _] :when (and (= seen ref) (= owner pid)) true
+    (after 10000 false))
+   (do (Process/demonitor ref (list :flush)) true))))
+(defn- stop! [pid]
+ (when (and pid (Process/alive? pid)) (try (stop pid) (catch _ nil)))
+ (when pid (exit! pid)))
+(defn- native-owner [pid]
+ (let [row (first (ets/lookup :beam_lisp_vars (tuple :bl_generation_owner pid)))]
+  (when row (elem row 1))))
+(defn- ticket-rows [lease]
+ (ets/match_object :beam_lisp_code_leases (tuple (tuple :_ (elem lease 1) (elem lease 2)) true)))
+
+(defn- await [predicate]
+ (loop [left 2000]
+  (cond (predicate) true (zero? left) false
+   :else (do (Process/sleep 5) (recur (dec left))))))
+
+(deftest ordinary-managed-init-and-handler-create-native-owned-stores-without-extra-ticket-rows
+ (let [root (root!) g (graph root) pid (generation/invoke! g "actor.creator/start-owner"
+                                             [{:path (str root "/init.fjall") :parent (erlang/self)}])]
+  (try
+   (let [initial (call pid :state) connection (first (:connections initial))
+         lease (:lease (native-owner pid)) count-before (count (ticket-rows lease))]
+    (is (= true (:init-owned initial))) (is (observed? g root connection))
+    (is (= (vec (sort (:modules g))) (vec (elem lease 0))))
+    (is (= (count (:modules g)) count-before))
+    (dotimes [_ 64] (is (= true (call pid :owned))))
+    (is (= count-before (count (ticket-rows lease))))
+    (let [opened (call pid [:open (str root "/handler.fjall")])]
+     (is (= true (:owned opened))) (is (observed? g root (:connection opened)))))
+   (is (not (execution/owned?)))
+   (is (stop! pid))
+   (is (= true (receive [:actor-terminated owner owned] :when (= owner pid) owned (after 10000 false))))
+   (finally (stop! pid) (generation/retire! g) (File/rm_rf! root)))))
+
+(deftest copied-context-and-subset-graph-do-not-become-native-actor-execution
+ (let [root (root!) g (graph root) token (generation/with! g env/capture)
+       previous (env/capture) pid (generation/invoke! g "actor.creator/start-owner"
+                                      [{:path (str root "/negative.fjall") :parent (erlang/self)}])
+       only-class (BeamLisp.Env/retain_code! (list (:module (native-owner pid))))]
+  (try
+   (env/bind token)
+   (is (not (execution/owned?)))
+   (is (BeamLisp.Env/code_lease_active? only-class))
+   (is (= :refused (try (BeamLisp.Env/install_server_execution! (:module (native-owner pid)) only-class)
+                      :wrongly-installed (catch _ :refused))))
+   (is (not (execution/owned?)))
+   (env/bind previous)
+   (is (= false (call pid [:under (assoc token :generation (assoc g :scope :copied-scope))])))
+   (let [subset (assoc g :modules [(first (:modules g))])]
+    (is (= false (call pid [:under (assoc token :generation subset)]))))
+   (is (= true (call pid :owned)))
+   (finally (env/bind previous) (BeamLisp.Env/release_code! only-class)
+    (stop! pid) (generation/retire! g) (File/rm_rf! root)))))
+
+(deftest logical-release-keeps-accepted-code-and-orderly-termination-until-real-down
+ (let [root (root!) g (graph root) parent (erlang/self)
+       pid (generation/invoke! g "actor.creator/start-owner"
+              [{:path (str root "/drain.fjall") :parent parent}])
+       native (native-owner pid) lease (:lease native)
+       caller (spawn (fn [] (erlang/send parent [:held-result (call pid :hold)])))]
+  (try
+   (is (= pid (receive [:actor-entered owner] owner (after 10000 nil))))
+   (let [before (ticket-rows lease)]
+    (is (= :refused (try (BeamLisp.Env/transfer_code! lease parent) :wrongly-transferred (catch _ :refused))))
+    (is (= :refused (try (BeamLisp.Env/handoff_code! lease
+                          (tuple (elem lease 0) parent (erlang/make_ref)))
+                       :wrongly-transferred (catch _ :refused))))
+    (is (= before (ticket-rows lease))))
+   (BeamLisp.Env/release_code! lease)
+   (is (= false (BeamLisp.Env/code_lease_active? lease)))
+   (is (= (count (:modules g)) (count (ticket-rows lease))))
+   (is (= :waiting (:status (generation/retire! g))))
+   (erlang/send pid :continue-callback)
+   (is (= true (receive [:held-result owned] owned (after 10000 false))))
+   (is (exit! caller))
+   ;; Terminate is cleanup, not a newly admitted business message. It uses the
+   ;; exact cached physical owner proof even after registration logical close.
+   (is (stop! pid))
+   (is (= true (receive [:actor-terminated owner owned] :when (= owner pid) owned (after 10000 false))))
+   (is (await #(empty? (ticket-rows lease))))
+   (finally (erlang/send pid :continue-callback) (stop! pid)
+    (generation/retire! g) (File/rm_rf! root)))))
+
+(deftest nil-generation-development-callbacks-remain-ordinary
+ (let [root (root!) g (graph root)
+       source "(ns actor.unmanaged) (defserver owner (init [_] (ok 0))
+                 (handle-call :read [_ state] (reply state state)))"
+       cls (BeamLisp.Env/with_env :global
+             #(do (BeamLisp.Compiler/eval_string source)
+                  (BeamLisp.Env/fetch_exact! "actor.unmanaged" "owner")))
+       pid (BeamLisp.Env/with_env :global #(start cls nil))]
+  (try (is (= 0 (call pid :read))) (is (nil? (native-owner pid)))
+   (is (stop! pid)) (is (not (execution/owned?)))
+   (finally (stop! pid) (generation/retire! g) (File/rm_rf! root)))))
+
+(deftest adopted-sdk-owner-gets-resource-authority-only-from-actual-retained-app-callback
+ (let [root (root!) g (graph root) parent (erlang/self)
+       initializer (spawn
+         (fn []
+          (generation/with! g
+           #(state/bind! {:actor-entry/owner (atom (erlang/self)) :actor-entry/table (atom nil)}))
+          (erlang/send parent :actor-entry-initializer-ready)
+          (receive :finish-initializer :ok)))
+       sdk (atom nil) opened (atom nil) completed (atom false)]
+  (try
+   (is (= true (receive :actor-entry-initializer-ready true (after 10000 false))))
+   (reset! sdk (generation/with! g
+                #(start dispatch/dispatcher {:limit 1 :table-key :actor-entry/table :owner-key :actor-entry/owner})))
+   (is (= :framework (:kind (framework/owner-evidence @sdk))))
+   (is (nil? (native-owner @sdk)))
+   (let [dictionary (elem (Process/info @sdk :dictionary) 1)]
+    (is (nil? (Keyword/get dictionary :bl_generation)))
+    (is (nil? (Keyword/get dictionary :bl_server_execution_owner)))
+    (is (nil? (Keyword/get dictionary :bl_server_execution_extent))))
+   (is (= :accepted (:status
+    (generation/with! g
+     #(dispatch/submit! @sdk
+       {:id :creator-probe :run (fn [] (reset! completed true)) :failed (fn [_] nil)
+        :waiting (fn []
+          (let [action (generation/invoke! (generation/current) "actor.creator/factory" [])
+                result (action (str root "/sdk-callback.fjall"))]
+           (reset! opened (assoc result :pid (erlang/self)))))})))))
+   (is (await #(= true @completed)))
+   (is (= @sdk (:pid @opened)))
+   (is (= true (:owned @opened)))
+   (is (observed? g root (:connection @opened)))
+   (is (= :framework (:kind (framework/owner-evidence @sdk))))
+   (is (nil? (native-owner @sdk)))
+   (is (not (execution/owned?)))
+   (finally
+    (when @sdk (stop! @sdk))
+    (erlang/send initializer :finish-initializer) (exit! initializer)
+    (when (:connection @opened) (d/close! (:connection @opened)))
+    (generation/retire! g) (File/rm_rf! root)))))
