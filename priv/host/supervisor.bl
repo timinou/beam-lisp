@@ -231,7 +231,11 @@
                (maps/put :__exception__ true
                  (maps/put :__struct__ :"Elixir.MatchError" (maps/new)))))
            sup-opts (erlang/++ (list (tuple :strategy (normalize strategy))) (intensity-opts))
-           result (Supervisor/start_link (child-list children) sup-opts)]
+           result (if (Process/get :bl_generation)
+                    (tuple :ok (start_link
+                      {:strategy strategy :children (child-list children)
+                       :intensity (BeamLisp.Vector/new (list (Map/get opts :max-restarts 3) (Map/get opts :max-seconds 5)))}))
+                    (Supervisor/start_link (child-list children) sup-opts))]
        (if (and (erlang/is_tuple result)
                 (erlang/== 2 (erlang/tuple_size result))
                 (erlang/== :ok (erlang/element 1 result)))
@@ -278,12 +282,20 @@
                   :type)
        (fce :server 4)))))
 
+(defn- server_name? [name]
+  (or (erlang/== nil name) (erlang/is_atom name)
+      (and (erlang/is_tuple name) (erlang/== 2 (erlang/tuple_size name))
+           (or (erlang/== :global (erlang/element 1 name))
+               (and (erlang/== :local (erlang/element 1 name)) (erlang/is_atom (erlang/element 2 name)))))
+      (and (erlang/is_tuple name) (erlang/== 3 (erlang/tuple_size name))
+           (erlang/== :via (erlang/element 1 name)) (erlang/is_atom (erlang/element 2 name)))))
+
 (defn start_server
   "The child-start entry of a defserver child spec (see `server/4`). `name` is an
    optional OTP name — a singleton child (a registry, a named bus) stays
-   addressable by name across its own restarts, which is the point. A `name` that
-   is neither `nil` nor an atom is the live `start_server/3`
-   `FunctionClauseError`."
+   addressable across restarts. Supports the same nil/atom and native local,
+   global and via name terms as Server.start_link; malformed values retain the
+   start_server/3 FunctionClauseError."
   [mod arg name]
   (cond
     (and (erlang/is_tuple name) (erlang/== 3 (erlang/tuple_size name))
@@ -291,12 +303,15 @@
     (let [previous (BeamLisp.Env/capture)]
       (try
         (BeamLisp.Env/bind (erlang/element 2 name))
-        (start_server mod arg (erlang/element 3 name))
+        (if (Process/get :bl_generation)
+          (BeamLisp.Env/with_supervisor_execution!
+            (fn [] (start_server mod arg (erlang/element 3 name))))
+          (start_server mod arg (erlang/element 3 name)))
         (finally (BeamLisp.Env/bind previous))))
     (erlang/== nil name)
     (tuple :ok (BeamLisp.Server/start_link mod arg))
 
-    (erlang/is_atom name)
+    (server_name? name)
     (tuple :ok (BeamLisp.Server/start_link mod arg (maps/put :name name (maps/new))))
 
     :else
@@ -334,9 +349,84 @@
   "The child-start entry of a pool spec: start the named one-for-one
    sub-supervisor."
   [children name]
-  (Supervisor/start_link
-    children
-    (list (tuple :strategy :one_for_one) (tuple :name name))))
+  (if (Process/get :bl_generation)
+    (BeamLisp.Env/with_supervisor_execution!
+      (fn [] (start_managed_tree children
+               (list (tuple :strategy :one_for_one) (tuple :name name)) (BeamLisp.Env/capture))))
+    (Supervisor/start_link children (list (tuple :strategy :one_for_one) (tuple :name name)))))
+
+(defn- managed_children [children context generation depth remaining]
+  ;; Validate the ENTIRE tree before OTP starts its first child. Only these
+  ;; two fixed native entrypoints are accepted; no caller-nominated callback.
+  (when (or (erlang/> depth 64) (erlang/< remaining 0)) (erlang/error :supervisor_child_budget))
+  (let [items (cond
+                (and (erlang/is_map children)
+                     (erlang/== :Elixir.BeamLisp.Vector (Map/get children :__struct__)))
+                  (BeamLisp.Vector/to_list children)
+                (erlang/is_list children) children
+                :else (erlang/error :unmanaged_supervisor_child))]
+    (Enum/map_reduce items remaining
+      (fn [child left]
+        (when (or (erlang/=< left 0) (not (erlang/is_map child)))
+          (erlang/error :unmanaged_supervisor_child))
+        (let [mfa (Map/get child :start)
+              _ (when-not (and (erlang/is_tuple mfa) (erlang/== 3 (erlang/tuple_size mfa))
+                               (erlang/== :Elixir.BeamLisp.Supervisor (erlang/element 1 mfa))
+                               (erlang/is_list (erlang/element 3 mfa)))
+                  (erlang/error :unmanaged_supervisor_child))
+              entry (erlang/element 2 mfa) args (erlang/element 3 mfa)]
+          (cond
+            (and (erlang/== :start_server entry) (erlang/== 3 (erlang/length args)))
+              (let [mod (erlang/hd args) name (erlang/hd (erlang/tl (erlang/tl args)))
+                    bare (if (and (erlang/is_tuple name) (erlang/== 3 (erlang/tuple_size name))
+                                  (erlang/== :"$bl_supervised_context" (erlang/element 1 name)))
+                           (erlang/element 3 name) name)]
+                (when-not (server_name? bare) (erlang/error :invalid_supervisor_child_name))
+                (when (not (Enum/member? (Map/get generation :modules) mod))
+                  (BeamLisp.Env/prepare_sdk_class! mod))
+                (BeamLisp.Env/assert_managed_server_class! generation mod)
+                (tuple (Map/put child :start (tuple :Elixir.BeamLisp.Supervisor :start_server
+                          (list mod (erlang/hd (erlang/tl args))
+                            (tuple :"$bl_supervised_context" context bare)))) (erlang/- left 1)))
+            (and (erlang/== :start_named_sup entry) (erlang/== 2 (erlang/length args)))
+              (let [nested (managed_children (erlang/hd args) context generation (erlang/+ depth 1)
+                              (erlang/- left 1))
+                    name (erlang/hd (erlang/tl args))]
+                (when-not (erlang/is_atom name) (erlang/error :invalid_supervisor_name))
+                (tuple (Map/put child :start (tuple :Elixir.BeamLisp.Supervisor :start_named_sup
+                         (list (erlang/element 1 nested) name))) (erlang/element 2 nested)))
+            :else (erlang/error :unmanaged_supervisor_child)))))))
+
+(defn init
+  "Native managed supervisor callback. Claim before context/user child starts,
+   publish monitored whole-G owner, then hand exact child specs to real OTP."
+  [argument]
+  (when-not (and (erlang/is_tuple argument) (erlang/== 5 (erlang/tuple_size argument))
+                (erlang/== :bl_managed_supervisor (erlang/element 1 argument)))
+    (erlang/error :unadmitted_supervisor_starter))
+  (let [context (BeamLisp.Env/claim_supervisor_start! (erlang/element 2 argument))]
+    (when-not (erlang/== context (erlang/element 3 argument))
+      (erlang/error :supervisor_start_context_mismatch))
+    (BeamLisp.Env/bind context)
+    (let [generation (Process/get :bl_generation)
+          lease (BeamLisp.Env/retain_code! (BeamLisp.Vector/to_list (Map/get generation :modules)))]
+      (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/with_env :global
+        (fn [] (BeamLisp.Env/fetch_exact! "proc.owner-registry" "register-supervisor!")))
+        (list (erlang/self) lease))
+      (BeamLisp.Env/install_supervisor_execution! lease)
+      (BeamLisp.Env/complete_supervisor_start!))
+    (Supervisor/init (erlang/element 4 argument) (erlang/element 5 argument))))
+(defn- start_managed_tree [children options context]
+  (let [admission (BeamLisp.Env/begin_supervisor_start!)]
+    (try
+      (BeamLisp.Env/launch_server_start! admission)
+      (let [result (Supervisor/start_link :Elixir.BeamLisp.Supervisor
+                     (tuple :bl_managed_supervisor admission context children options)
+                     (Keyword/take options (list :name)))]
+        (BeamLisp.Env/finish_server_start! admission result) result)
+      (catch error
+        (BeamLisp.Env/finish_server_start! admission :unknown)
+        (erlang/raise __EXCEPTION_KIND__ error __STACKTRACE__)))))
 
 (defn start_link
   "Start an ordinary or deferred supervision tree. Exactly one of :children
@@ -390,6 +480,8 @@
             sup-opts (erlang/++ (list (tuple :strategy (normalize (erlang/map_get :strategy spec))))
                        (intensity spec))
             generation (Process/get :bl_generation)
+            _ (when (and generation (not (BeamLisp.Env/executing_generation? generation)))
+                (erlang/error :unadmitted_supervisor_starter))
             context (BeamLisp.Env/capture)
             _ (when deferred? (BeamLisp.Env/assert_managed_callback! generation factory))
             _ (when generation (BeamLisp.Env/ensure_sdk_owner_registry!))
@@ -404,41 +496,17 @@
                 ;; Construct all specs before Supervisor can start any child.
                 ;; A descriptor cannot smuggle a managed raw MFA or borrow the
                 ;; ambient environment of an earlier tree declaration.
-                children (Enum/map children
-                  (fn [child]
-                    (let [mfa (Map/get child :start)
-                          args (when (and (erlang/is_tuple mfa) (erlang/== 3 (erlang/tuple_size mfa)))
-                                 (erlang/element 3 mfa))
-                          first-party? (and (erlang/is_tuple mfa) (erlang/== 3 (erlang/tuple_size mfa))
-                                            (erlang/== own (erlang/element 1 mfa))
-                                            (erlang/== :start_server (erlang/element 2 mfa))
-                                            (erlang/is_list args) (erlang/== 3 (erlang/length args)))]
-                      (if first-party?
-                        (do
-                          (when (and generation
-                                     (not (Enum/member? (Map/get generation :modules) (erlang/hd args))))
-                            (BeamLisp.Env/prepare_sdk_class! (erlang/hd args)))
-                          (Map/put child :start (tuple own :start_server
-                          (list (erlang/hd args) (erlang/hd (erlang/tl args))
-                            (tuple :"$bl_supervised_context" context
-                              (let [name (erlang/hd (erlang/tl (erlang/tl args)))]
-                                (if (and (erlang/is_tuple name) (erlang/== 3 (erlang/tuple_size name))
-                                         (erlang/== :"$bl_supervised_context" (erlang/element 1 name)))
-                                  (erlang/element 3 name) name)))))))
-                        (if generation (erlang/error :unmanaged_supervisor_child) child)))))
-                result (Supervisor/start_link children sup-opts)]
+                children (if generation
+                           (erlang/element 1 (managed_children children context generation 0 4096))
+                           children)
+                result (if generation (start_managed_tree children sup-opts context)
+                         (Supervisor/start_link children sup-opts))]
             (if (and (erlang/is_tuple result) (erlang/== 2 (erlang/tuple_size result))
                      (erlang/== :ok (erlang/element 1 result)))
               (let [pid (erlang/element 2 result)]
-                (when lease
+                (when (and lease (erlang/== nil generation))
                   (let [owned (BeamLisp.Env/transfer_code! lease pid)]
-                    (when (erlang/== :cancelled owned) (erlang/error :supervisor_owner_died))
-                    (when generation
-                      (try
-                        (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/with_env :global
-                          (fn [] (BeamLisp.Env/fetch_exact! "proc.owner-registry" "register-supervisor!")))
-                          (list pid owned))
-                        (catch error (Supervisor/stop pid) (erlang/error error))))))
+                    (when (erlang/== :cancelled owned) (erlang/error :supervisor_owner_died))))
                 pid)
               (erlang/error (match-error result))))
           (finally
