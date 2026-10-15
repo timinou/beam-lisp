@@ -47,11 +47,12 @@
 //! Breaking a validated cycle takes each `G` cell's state; the refcounts then
 //! fall to zero in ERTS's own order and the ordinary destructors run.
 
+use crate::collector_schedule::Schedule;
 use rustler::types::tuple::get_tuple;
 use rustler::{Encoder, MapIterator, OwnedEnv, ResourceArc, Term, TermType};
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 /// A reference number as `term_to_binary` writes it (three 32-bit words).
@@ -113,11 +114,7 @@ pub fn register<T: Node + rustler::Resource>(id: u64, resource: &ResourceArc<T>)
         node: node as &dyn Node as *const dyn Node,
     };
     lock(registry()).insert(id, entry);
-    // `>=` plus a latch, never `==`: a round resets SINCE and then RAISES the
-    // threshold, so an exact-match trigger could be stepped over for good.
-    if SINCE.fetch_add(1, Ordering::Relaxed) + 1 >= THRESHOLD.load(Ordering::Relaxed)
-        && !REQUESTED.swap(true, Ordering::AcqRel)
-    {
+    if SCHEDULE.registration() {
         wake();
     }
 }
@@ -694,14 +691,18 @@ pub fn collect() -> usize {
 
 // ── scheduling ──────────────────────────────────────────────────────────────
 
-/// Registrations since the last round, and how many trigger the next one:
-/// the live count at the end of the last round (floor `MIN_ROUND`). Each
-/// round is O(live), so the cost per allocation stays O(1) amortised.
-static SINCE: AtomicUsize = AtomicUsize::new(0);
-/// A round is requested and not yet started (so the trigger wakes once).
-static REQUESTED: AtomicBool = AtomicBool::new(false);
-static THRESHOLD: AtomicUsize = AtomicUsize::new(MIN_ROUND);
-const MIN_ROUND: usize = 16 * 1024;
+/// Counts amortize O(nodes); accounted committed growth amortizes O(saved
+/// bytes). This same worker services both, including arrivals during a round.
+static SCHEDULE: Schedule = Schedule::new();
+
+/// Call only after actual allocation/publication and after graph/state locks
+/// are dropped. Reservations, retries, and failed publications are not growth.
+/// This function only records demand; it never scans or runs user code.
+pub fn note_growth(bytes: usize) {
+    if STARTED.load(Ordering::Acquire) && SCHEDULE.growth(bytes) {
+        wake();
+    }
+}
 
 static WAKE: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -732,13 +733,16 @@ pub fn start() -> std::io::Result<()> {
             if STOP.load(Ordering::Acquire) {
                 return;
             }
-            SINCE.store(0, Ordering::Relaxed);
+            if SCHEDULE.begin_round() {
+                wake();
+            }
             if std::panic::catch_unwind(collect).is_err() {
                 ANOMALIES.fetch_add(1, Ordering::Relaxed);
             }
             let live = lock(registry()).len();
-            THRESHOLD.store(live.max(MIN_ROUND), Ordering::Relaxed);
-            REQUESTED.store(false, Ordering::Release);
+            if SCHEDULE.finish_round(live, crate::accounted_retained_bytes()) {
+                wake();
+            }
         });
     record_worker_start(worker);
     Ok(())
