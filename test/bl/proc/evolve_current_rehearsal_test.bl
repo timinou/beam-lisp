@@ -1,0 +1,120 @@
+; Source-only regressions for exact installed-spec observation. Root runs this
+; after ordinary SDK acceptance and installation of evolve.candidate.bl.
+(ns proc.evolve-current-rehearsal-test
+ (:require [proc.evolve :as ev] [reload.generation :as g] [reload.state :as state]))
+(def SOURCE
+ "(ns rehearsal.business)
+  (defn accepts [message] (erlang/is_binary message))
+  (defn state-valid [value] (erlang/is_integer value))
+  (defn migrate [value] value)
+  (defn upcast [value] value)
+  (defn handler [message value] {:reply message :state value})
+  (defn handler-alt [_ value] {:reply :unexpected :state value})
+  (defn state-alt [_] false)
+  (defn accept-alt [_] false)
+  (defn migrate-alt [_] 42)
+  (defn upcast-alt [_] 42)
+  (defn reply-alt [_] true)
+  (defn alternatives [] {:handler handler-alt :check-state state-alt :accept? accept-alt
+                         :migrate-state migrate-alt :upcast upcast-alt
+                         :check-reply reply-alt :downcast reply-alt})
+  (defn spec [version digest]
+   {:version version :digest digest :handler handler :accept? accepts :check-state state-valid
+    :migrate-state migrate :upcast upcast})")
+(defn- graph [application revision]
+ (g/prepare! {:application-id application :resources {:fixture-revision revision}
+              :sources {"rehearsal.business" SOURCE}}))
+(defn- spec [graph version]
+ (g/with! graph #(ev/prepare-spec (g/invoke! graph "rehearsal.business/spec" [version (:digest graph)]))))
+(defn- with-owner [application action]
+ (let [old (graph application 1) fresh (graph application 2) pid (atom nil)]
+  (try
+   (g/with! old #(state/bind! {})) (g/inherit-runtime! fresh old)
+   (reset! pid (g/with! old #(ev/start! (spec old 1) 7 {:managed true})))
+   (action old fresh @pid (spec fresh 2))
+   (finally (when (and @pid (Process/alive? @pid)) (GenServer/stop @pid))
+            (g/retire! fresh) (g/retire! old)))))
+(defn- counter! [callback]
+ (when-not (= :external (elem (erlang/fun_info callback :type) 1))
+  (throw (ex-info "Actual named Source callback required" {})))
+ (let [mfa (tuple (elem (erlang/fun_info callback :module) 1)
+                  (elem (erlang/fun_info callback :name) 1)
+                  (elem (erlang/fun_info callback :arity) 1))]
+  (when-not (= 1 (erlang/trace_pattern mfa true (list :call_count)))
+   (throw (ex-info "Native call counter unavailable" {}))) mfa))
+(defn- with-counters [callbacks action]
+ (let [tracked (atom [])]
+  (try
+   (doseq [callback callbacks] (swap! tracked conj (counter! callback)))
+   (action @tracked)
+   (finally (doseq [mfa @tracked] (erlang/trace_pattern mfa false (list :call_count)))))))
+(defn- calls [mfa] (elem (erlang/trace_info mfa :call_count) 1))
+(defn- public-rehearsal [fresh pid value] (g/with! fresh #(ev/rehearse! pid 1 value 1000)))
+
+(deftest exact-completed-candidate-rehearsal-is-valid-and-executes-no-callbacks
+ (with-owner "rehearsal-exact-current"
+  (fn [_ fresh pid value]
+   (is (= :applied (:status (g/with! fresh #(ev/upgrade! pid 1 value)))))
+   (with-counters (mapv #(get value %) [:handler :accept? :check-state :migrate-state :upcast])
+    (fn [counters]
+     (let [before (ev/status pid) observed (public-rehearsal fresh pid value)]
+      (is (= :valid (:status observed)))
+      (is (= :already-current (:scope observed)))
+      (is (= 2 (:version observed)))
+      (is (= (:revision before) (:revision observed)))
+      (is (= before (ev/status pid)))
+      (doseq [mfa counters] (is (= 0 (calls mfa))))
+      (is (= :retired (:status (ev/retire! pid 2 1))))
+      (is (= :valid (:status (public-rehearsal fresh pid value))))
+      (is (= "same live owner" (ev/request! pid 2 "same live owner")))))))))
+
+(deftest same-generation-changed-callbacks-including-optional-replies-are-not-current
+ (with-owner "rehearsal-callback-identity"
+  (fn [_ fresh pid value]
+   (is (= :applied (:status (g/with! fresh #(ev/upgrade! pid 1 value)))))
+   (let [alternatives (g/invoke! fresh "rehearsal.business/alternatives" []) before (ev/status pid)]
+    (with-counters (mapv #(get alternatives %) [:handler :check-state :accept? :migrate-state :upcast :check-reply])
+     (fn [counters]
+      (doseq [key [:handler :check-state :accept? :migrate-state :upcast :check-reply :downcast]]
+       (is (= {:status :refused :kind :identity-conflict}
+              (public-rehearsal fresh pid (assoc value key (get alternatives key)))))
+       (is (= before (ev/status pid))))
+      (doseq [mfa counters] (is (= 0 (calls mfa)))))))
+   (is (= "original handler" (ev/request! pid 2 "original handler")))
+   (is (= 2 (:version (ev/status pid)))))))
+
+(deftest exact-environment-module-and-version-identities-cannot-be-replaced-by-digest
+ (with-owner "rehearsal-context-identity"
+  (fn [old fresh pid value]
+   (is (= :applied (:status (g/with! fresh #(ev/upgrade! pid 1 value)))))
+   (let [environment (:environment value) before (ev/status pid) caller (BeamLisp.Env/capture)]
+    (doseq [different [(assoc value :version 3)
+                      (assoc value :version 2.0)
+                      (assoc value :digest "same-version-another-artifact")
+                      (assoc value :modules [])
+                      (assoc value :environment (assoc environment :ns "another.namespace"))
+                      (assoc value :environment (assoc environment :env (:scope old)))
+                      (assoc value :environment (assoc environment :generation old))
+                      (assoc value :environment (assoc environment :osenv {"REHEARSAL_SHOULD_NOT_BIND" "wrong"}))]]
+     (is (= {:status :refused :kind :identity-conflict} (public-rehearsal fresh pid different)))
+     (is (= before (ev/status pid)))
+     (is (= caller (BeamLisp.Env/capture))))
+    (is (= :valid (:status (public-rehearsal fresh pid value)))))
+   (is (= "current handler" (ev/request! pid 2 "current handler"))))))
+
+(deftest copied-context-and-forged-native-grants-never-authorize-current-rehearsal
+ (with-owner "rehearsal-native-authority"
+  (fn [_ fresh pid value]
+   (is (= :applied (:status (g/with! fresh #(ev/upgrade! pid 1 value)))))
+   (let [before (ev/status pid) fake (tuple :bl_owner_transition (erlang/self) (erlang/make_ref))
+         previous (BeamLisp.Env/capture) copied (g/with! fresh #(BeamLisp.Env/capture))]
+    (is (= {:status :refused :kind :unknown-preparation}
+           (GenServer/call pid [:proc.evolve/automatic-current-rehearsal fake value])))
+    (try
+     (BeamLisp.Env/bind copied)
+     (is (= :owner-transition-authority-required (:kind (ev/rehearse! pid 1 value 1000))))
+     (finally (BeamLisp.Env/bind previous)))
+    (is (= before (ev/status pid)))
+    (is (= :owner-transition-authority-required
+           (:kind (GenServer/call pid [:proc.evolve/rehearse 1 value 1000])))))
+   (is (= "retained same owner" (ev/request! pid 2 "retained same owner"))))))
