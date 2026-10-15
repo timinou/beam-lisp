@@ -1,0 +1,131 @@
+(ns live.lifecycle-test
+ (:require [live.lifecycle :as lifecycle] [reload.generation :as generation]
+           [reload] [datom :as d] [datom.conn :as conn] [datom.store-fjall :as fjall]
+           [web]))
+(defn- root! []
+ (let [root (str (System/get_env "HOME") "/tmp/live-lifecycle-" (erlang/unique_integer (list :positive)))]
+  (File/mkdir_p! root) root))
+(defn- kind [f] (try (f) nil (catch error (:kind (ex-data error)))))
+(defn- prepare-source [application namespace source entry]
+ (let [root (root!) relative (str (String/replace (String/replace namespace "." "/") "-" "_") ".bl")
+       file (str root "/" relative)]
+  (try
+   (File/mkdir_p! (Path/dirname file)) (File/write! file source)
+   (BeamLisp.Loader/with_load_path root
+    #(generation/prepare! (generation/project-plan
+       {:application-id application :entrypoint (str namespace "/" entry)
+        :fixed-runtime true :native-modules #{"erlang"}})))
+   (finally (File/rm_rf! root)))))
+(defn- graph [application]
+ (prepare-source application "lifecycle.sample"
+  "(ns lifecycle.sample (:require [reload.generation :as g] [datom :as d] [web]))\n    (defn initialize [options]\n      (let [connection (:control-conn options)]\n       (g/bind-runtime! {:sample/control connection})\n       (d/transact! connection [{:db/id -1 :sample/id \"initialized\"}])\n       {:domain :initialized}))\n    (defn app [] {:principal (fn [_] :principal) :worlds (fn [_ _] {})\n                 :shared-conn (g/runtime-resource :sample/control)\n                 :routes [[\"/\" (fn [_] [:div \"real-live-router\"])]]})" "app"))
+(deftest ordinary-live-factory-uses-the-real-borrowed-connection-and-standard-router
+ (let [root (root!) control (d/connect-with (fjall/open (str root "/control.fjall"))
+                            [{:db/ident :sample/id :db/valueType :db.type/string}])
+       old (graph "lifecycle-test") slot (generation/slot)]
+  (try
+   (is (= :ready (:status (lifecycle/initialize! old "lifecycle.sample/app" "lifecycle.sample/initialize"
+                           {:control-conn "control"} {:stores {"control" control} :data-root root}))))
+   (is (= 1 (count (d/q '[:find ?e :where [?e :sample/id "initialized"]] (d/db control)))))
+   (reload/set-enabled! true) (generation/publish! slot nil old)
+   (let [response (lifecycle/route! slot "lifecycle.sample/app" (Plug.Test/conn :get "/"))]
+    (is (= 200 (:status response))) (is (String/contains? (:resp_body response) "real-live-router")))
+   (is (= :invalid-live-bootstrap
+         (kind #(lifecycle/initialize! old "lifecycle.sample/app" "lifecycle.sample/initialize"
+                  {:control-conn "missing"} {:stores {"control" control}}))))
+   (finally (generation/close! slot (generation/selected slot)) (generation/retire! old)
+    (d/close! control) (File/rm_rf! root) (reload/set-enabled! nil)))))
+(deftest native-dynamic-store-inventory-requires-actual-creator-and-lifetime-proof
+ (let [root (root!) old (graph "inventory-owner") other (graph "inventory-foreign")
+       control (d/connect-with (fjall/open (str root "/control.fjall")))
+       dynamic (generation/with! old #(d/connect-with (fjall/open (str root "/library.fjall"))))]
+  (try
+   (is (= :invalid-owned-store-scope
+          (kind #(conn/owned-connections (:application-id old) root [control]))))
+   (is (= #{(str root "/control.fjall") (str root "/library.fjall")}
+          (generation/with! old #(set (map (fn [c] (get-in c [:store :path]))
+                                     (conn/owned-connections (:application-id old) root [control]))))))
+   (is (= :invalid-owned-store-scope
+          (generation/with! other #(kind (fn [] (conn/owned-connections (:application-id old) root [control]))))))
+   (d/close! dynamic)
+   (is (= :stale-owned-store
+          (generation/with! old #(kind (fn [] (conn/owned-connections (:application-id old) root [dynamic]))))))
+   ;; A failed decision must leave the shared native registry healthy.
+   (is (= [control] (generation/with! old #(conn/owned-connections (:application-id old) root [control]))))
+   (finally (d/close! dynamic) (d/close! control) (generation/retire! old)
+    (generation/retire! other) (File/rm_rf! root)))))
+(deftest graceful-background-drain-never-kills-or-overlaps-an-accepted-pass
+ (let [source "(ns lifecycle.clock (:require [proc.server :as server] [proc.tick :as tick]
+                          [reload.generation :as g]))
+       (server/defserver clock
+        (init [_] (do (tick/tick-arm 1 {:name :clock}) (ok {:interval-ms 1})))
+        (handle-info [:bl/tick token] [state]
+         (do (when (tick/tick-current? :clock token)
+               (let [parent (g/runtime-resource :clock/parent)]
+                (erlang/send parent [:clock-entered (erlang/self)])
+                (receive :finish (erlang/send parent :clock-finished)))
+               (tick/tick-arm (:interval-ms state) {:name :clock}))
+             (noreply state)))
+        (terminate [_ _] (tick/tick-cancel :clock)))
+       (defn begin [] (start-link clock nil))"
+       graph (prepare-source "clock-drain" "lifecycle.clock" source "begin")
+       _ (generation/with! graph #(generation/bind-runtime! {:clock/parent (erlang/self)}))
+       started (lifecycle/start-background! graph "lifecycle.clock/begin")
+       records (:owners started) pid (:pid (first records)) monitor (Process/monitor pid)]
+  (try
+   (is (= :ready (:status started))) (is (= 1 (count records)))
+   (is (= pid (receive [:clock-entered worker] worker (after 5000 nil))))
+   ;; Copied metadata cannot grant authority to stop an actor. Validate the
+   ;; complete inventory before sending a stop that could affect this pass.
+   (is (= :background-owner-authority-changed
+          (kind #(lifecycle/stop-background! [(assoc (first records) :ticket (erlang/make_ref))] 10))))
+   (is (Process/alive? pid))
+   (is (= :waiting (:status (lifecycle/stop-background! records 10))))
+   (is (Process/alive? pid))
+   (is (= :waiting (:status (generation/retire! graph))))
+   (erlang/send pid :finish)
+   (is (= :clock-finished (receive :clock-finished :clock-finished (after 5000 nil))))
+   (is (= :normal (receive [:DOWN seen :process dead why] :when (and (= seen monitor) (= dead pid)) why
+                     (after 5000 :missing))))
+   (is (= :drained (:status (lifecycle/stop-background! records 10))))
+   (is (= :no-overlap (receive [:clock-entered _] :overlapped (after 0 :no-overlap))))
+   (is (contains? #{:retired :already-retired} (:status (generation/retire! graph))))
+   (finally (when (Process/alive? pid) (erlang/send pid :finish))
+    (Process/demonitor monitor (list :flush)) (generation/retire! graph)))))
+
+(deftest failed-background-constructor-retains-exact-accepted-child-receipt
+ (let [source "(ns lifecycle.partial (:require [proc.server :as server]
+                                             [reload.generation :as g]))
+       (server/defserver worker
+        (init [_] (ok nil))
+        (handle-info :begin [state]
+         (do (let [parent (g/runtime-resource :partial/parent)]
+               (erlang/send parent [:partial-entered (erlang/self)])
+               (receive :finish (erlang/send parent :partial-finished)))
+             (noreply state))))
+       (defn begin []
+        (let [pid (start-link worker nil)]
+         (erlang/send pid :begin)
+         (throw (ex-info \"Constructor reply lost after accepting child\" {}))))"
+       graph (prepare-source "partial-background" "lifecycle.partial" source "begin")
+       _ (generation/with! graph #(generation/bind-runtime! {:partial/parent (erlang/self)}))
+       result (lifecycle/start-background! graph "lifecycle.partial/begin")
+       records (:owners result) pid (:pid (first records)) monitor (Process/monitor pid)]
+  (try
+   (is (= :uncertain (:status result)))
+   (is (= :background-constructor-outcome-uncertain (:kind result)))
+   (is (= 1 (count records)))
+   (is (= pid (receive [:partial-entered worker] worker (after 5000 nil))))
+   (is (= :waiting (:status (lifecycle/stop-background! records 10))))
+   (is (Process/alive? pid))
+   (is (= :waiting (:status (generation/retire! graph))))
+   ;; Drain the already accepted effect; there is no constructor replay and
+   ;; no timeout-based inference that provider work has been canceled.
+   (erlang/send pid :finish)
+   (is (= :partial-finished (receive :partial-finished :partial-finished (after 5000 nil))))
+   (is (= :normal (receive [:DOWN seen :process dead why] :when (and (= seen monitor) (= dead pid)) why
+                     (after 5000 :missing))))
+   (is (= :drained (:status (lifecycle/stop-background! records 10))))
+   (is (contains? #{:retired :already-retired} (:status (generation/retire! graph))))
+   (finally (when (Process/alive? pid) (erlang/send pid :finish))
+    (Process/demonitor monitor (list :flush)) (generation/retire! graph)))))
