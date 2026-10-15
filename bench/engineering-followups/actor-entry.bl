@@ -1,0 +1,116 @@
+; Root-only ONE coherent native VM. No synthetic PDict or native owner fixture.
+; ACTOR_ENTRY_BENCH_SOURCE is the exact immutable coherent SDK source revision.
+; ACTOR_ENTRY_BENCH_OUTPUT must be a new file beneath $HOME/tmp/.
+(ns bench.engineering-followups.actor-entry
+ (:require [reload.generation :as generation] [bl.json :as json]))
+(defn- fail! [kind] (throw (ex-info "Actor entry benchmark refused" {:kind kind})))
+(defn- now [] (erlang/monotonic_time :microsecond))
+(defn- sha [value]
+ (Base/encode16 (crypto/hash :sha256 value) (list (tuple :case :lower))))
+(defn- echo-source []
+ "(ns actor.benchmark)
+  (defserver owner
+   (init [_] (ok 42))
+   (handle-call :echo [_ state] (reply state state))
+   (handle-call [:hold parent ticket] [_ state]
+    (erlang/send parent [:actor-bench-entered ticket (erlang/self)])
+    (receive :actor-bench-continue nil (after 30000 (throw :actor-bench-deadline)))
+    (reply state state)))
+  (defn start-owner [] (start owner nil))")
+(defn- sources [n]
+ (reduce (fn [all i]
+           (assoc all (str "actor.dependency" i)
+                     (str "(ns actor.dependency" i ") (defn value [] " i ")")))
+         {"actor.benchmark" (echo-source)} (range 1 n)))
+(defn- rows [pid]
+ (count (ets/match_object :beam_lisp_code_leases (tuple (tuple :_ pid :_) true))))
+(defn- native-owner [pid]
+ (let [row (first (ets/lookup :beam_lisp_vars (tuple :bl_generation_owner pid)))]
+  (when row (elem row 1))))
+(defn- reductions [pid] (elem (Process/info pid :reductions) 1))
+(defn- cpu-ms [] (elem (erlang/statistics :runtime) 0))
+(defn- await [predicate]
+ (loop [left 2000]
+  (cond (predicate) true (zero? left) false
+   :else (do (Process/sleep 5) (recur (dec left))))))
+(defn- down! [pid]
+ (let [ref (Process/monitor pid)]
+  (receive [:DOWN seen :process owner _] :when (and (= seen ref) (= owner pid)) true
+   (after 30000 (do (Process/demonitor ref (list :flush)) false)))))
+(defn- stop! [pid]
+ (let [ref (Process/monitor pid)]
+  (try
+   (when (Process/alive? pid) (GenServer/stop pid :normal 30000))
+   (receive [:DOWN seen :process owner _] :when (and (= seen ref) (= owner pid)) true
+    (after 30000 false))
+   (finally (Process/demonitor ref (list :flush))))))
+(defn- measure [pid round]
+ (let [before-cpu (cpu-ms) before-reductions (reductions pid) start (now)
+       samples (mapv (fn [_]
+                       (let [t (now) value (GenServer/call pid :echo 30000) us (- (now) t)]
+                        (when-not (= 42 value) (fail! :wrong-echo-result)) us)) (range 10000))
+       wall (- (now) start) cpu (- (cpu-ms) before-cpu)
+       actor-reductions (- (reductions pid) before-reductions) sorted (vec (sort samples))]
+  {:round round :calls 10000 :wall-us wall :vm-cpu-ms cpu
+   :actor-reductions actor-reductions :p50-us (nth sorted 4999)
+   :p95-us (nth sorted 9499) :max-us (nth sorted 9999)
+   :owner-lease-rows (rows pid)}))
+(defn- held-rows [pid expected]
+ (let [parent (erlang/self) ticket (erlang/make_ref)
+       caller (spawn (fn []
+                       (erlang/send parent
+                        [:actor-bench-returned ticket (GenServer/call pid [:hold parent ticket] 30000)])))]
+  (try
+   (when-not (= pid (receive [:actor-bench-entered seen owner] :when (= seen ticket) owner
+                     (after 30000 nil))) (fail! :held-entry-not-observed))
+   (let [held (rows pid)]
+    (when-not (= expected held) (fail! :extra-callback-ticket-rows))
+    (erlang/send pid :actor-bench-continue)
+    (when-not (= 42 (receive [:actor-bench-returned seen value] :when (= seen ticket) value
+                     (after 30000 nil))) (fail! :held-reply-not-observed))
+    (when-not (down! caller) (fail! :caller-down-not-observed)) held)
+   (finally (erlang/send pid :actor-bench-continue)))))
+(defn- graph-case [n]
+ (let [input (sources n) started (now)
+       g (generation/prepare! {:application-id (str "actor-entry-bench." n)
+            :sources input :native-modules #{"erlang"}})
+       prepare-us (- (now) started) pid (generation/invoke! g "actor.benchmark/start-owner" [])]
+  (try
+   (let [native (native-owner pid) lease (:lease native) initial (rows pid)
+         _ (when-not (and (= :server (:kind native)) (= (:digest g) (:generation native))
+                          (= (:application-id g) (:application-id native))
+                          (= (vec (sort (:modules g))) (vec (elem lease 0)))
+                          (= (count (:modules g)) initial))
+             (fail! :missing-actual-full-graph-native-owner))
+         _ (dotimes [_ 200] (when-not (= 42 (GenServer/call pid :echo 30000)) (fail! :warmup-failed)))
+         rounds (mapv #(measure pid %) (range 3))
+         held (held-rows pid initial)
+         final (rows pid)]
+    (when-not (every? #(= initial (:owner-lease-rows %)) rounds) (fail! :callback-ticket-growth))
+    (when-not (= initial final) (fail! :final-ticket-growth))
+    (when-not (stop! pid) (fail! :actor-down-not-observed))
+    (when-not (await #(zero? (rows pid))) (fail! :native-down-ticket-not-reclaimed))
+    (let [retired (generation/retire! g)]
+     (when-not (= :retired (:status retired)) (fail! :graph-retirement-not-proved))
+     {:source-count n :graph-module-count (count (:modules g)) :generation (:digest g)
+      :input-sha256 (sha (erlang/term_to_binary input (list :deterministic)))
+      :prepare-us prepare-us :warmup-calls 200 :rounds rounds
+      :owner-lease-rows {:before initial :held held :after final :after-down (rows pid)}
+      :retirement (:status retired)}))
+   (finally (when (Process/alive? pid) (stop! pid)) (generation/retire! g)))))
+
+(let [source (System/get_env "ACTOR_ENTRY_BENCH_SOURCE")
+      output (System/get_env "ACTOR_ENTRY_BENCH_OUTPUT")
+      home-scratch (str (System/get_env "HOME") "/tmp/")]
+ (when-not (and (string? source) (= 40 (erlang/byte_size source))
+                (Regex/match? #"^[a-f0-9]{40}$" source)) (fail! :exact-source-revision-required))
+ (when-not (and (string? output) (= output (Path/expand output))
+                (String/starts_with? output home-scratch) (not (File/exists? output)))
+  (fail! :new-home-scratch-output-required))
+ (let [cases (mapv graph-case [1 8 32])
+       result {:version 1 :source source :harness-sha256 (sha (File/read! "bench/engineering-followups/actor-entry.bl"))
+               :scope "Single sender; actual native actor;1/8/32 explicit source graphs;200warmup+3x10000echo calls;VM-wide CPU;no product latency claim"
+               :cases cases}]
+  (File/mkdir_p! (Path/dirname output))
+  (File/write! output (json/encode result) (list :exclusive))
+  (println (json/encode result))))
