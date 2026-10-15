@@ -2201,14 +2201,18 @@
                   doc (elem e 1)
                   init_form (elem e 2)
                   per_env? (elem e 3)
-                  compiled (compile_initializer init_form compiler_env)
+                  ;; An unnamed operation is already-compiled initializer ANF
+                  ;; emitted only by the compile-only SDK declaration collector.
+                  ;; It replays in source order without inventing a var binding.
+                  compiled (if (nil? name) init_form (compile_initializer init_form compiler_env))
                   prepared (prepare_generated_modules compiled ns name unit_attrs generated)
                   init_node (elem prepared 0)
-                  register (if per_env?
-                             (BeamLisp.Emit/remote :Elixir.BeamLisp.Env :define_per_env
+                  register (cond
+                             (nil? name) init_node
+                             per_env? (BeamLisp.Emit/remote :Elixir.BeamLisp.Env :define_per_env
                                (list (BeamLisp.Emit/lit ns) (BeamLisp.Emit/lit name)
                                      (BeamLisp.Emit/closure init_node)))
-                             (BeamLisp.Emit/remote :Elixir.BeamLisp.Env :intern
+                             :else (BeamLisp.Emit/remote :Elixir.BeamLisp.Env :intern
                                (list (BeamLisp.Emit/lit ns) (BeamLisp.Emit/lit name) init_node)))]
               (tuple
                 (if doc
@@ -3544,12 +3548,18 @@
        (when-not (or (= 1 (count arguments))
                      (and (= 2 (count arguments)) (erlang/is_binary (first arguments))))
         (stage-refuse :unsupported-sdk-stage-initializer)))
-     :else (stage-refuse :unsupported-sdk-stage-effect))))
+     ;; Ordinary top-level calls are compiled, never evaluated, and replay
+     ;; after proof in the same ordered stream as value definitions. Loaded
+     ;; arbitrary macros receive a separate refusal before expansion.
+     :else nil)))
   (let [macros (set (map #(stage-symbol (second (stage-items % :list)))
                          (filter #(= "defmacro" (stage-head %)) (rest forms))))]
    (doseq [form (rest forms)]
-    (doseq [body (rest (rest (stage-items form :list)))]
-     (stage-local-macro-use! body macros))))
+    (if (contains? #{"defn" "defn-" "defmacro" "def" "defprotocol" "defserver" "defrecord" "deftype"}
+                   (stage-head form))
+     (doseq [body (rest (rest (stage-items form :list)))]
+      (stage-local-macro-use! body macros))
+     (stage-local-macro-use! form macros))))
   (when (> (count (filter #(= "defnative" (stage-head %)) (rest forms))) 1)
    (stage-refuse :duplicate-sdk-stage-native))
   header))
@@ -3625,8 +3635,86 @@
   ;; The immutable compiler metadata is already prelinked. Do not intern the
   ;; class/constructors, register a runtime schema or execute protocol clauses.
   true))
+(defn- sdk_named_constructor! [ns name arity]
+ ;; A compiled-but-uninitialized SDK provider has no runtime Fn binding yet.
+ ;; Read only its compiler-emitted literal definition table and exact body
+ ;; receipt. Never initialize a provider merely to compile a declaration.
+ (when-not (sdk_unit_compiled? ns) (stage-refuse :sdk-stage-constructor-not-compiled))
+ (let [shim (BeamLisp.Emit/module_for ns)
+       definitions (erlang/apply shim :__bl_ns_defs__ (list))
+       entries (Map/get definitions name (list))
+       matching (Enum/filter entries (fn [entry]
+                  (and (= :fixed (elem entry 0)) (= arity (elem entry 1)))))
+       entry (when (= 1 (count matching)) (first matching))
+       module (when entry (elem entry 4)) function (when entry (elem entry 2))
+       row (when module (sdk_compiler_row module))
+       root (physical_sdk_path (BeamLisp.Tiers/priv_root))
+       source (physical_sdk_path (BeamLisp.Loader/source_path ns))]
+  (when-not (and row source (= :stable-body (Map/get row :role))
+                 (= (Path/relative_to source root) (Map/get row :source))
+                 (= name (Atom/to_string function))
+                 (= (Map/get row :md5) (erlang/apply module :module_info (list :md5)))
+                 (erlang/function_exported module function arity))
+   (stage-refuse :unattested-sdk-stage-constructor))
+  (erlang/make_fun module function arity)))
+(defn- stage-clause-extension [form ns]
+ (let [items (stage-items form :list) head (stage-symbol (first items))
+       local? (and (not (String/contains? head "/"))
+                   (Map/has_key? (BeamLisp.Env/ns_defs ns) head))
+       resolved (when-not local?
+                  (loop [candidates (BeamLisp.Env/candidates ns head)]
+                   (when (seq candidates)
+                    (let [pair (first candidates)]
+                     (cond (= (tuple "proc.server" "extend-clause!") pair) pair
+                           (not= :error (BeamLisp.Env/lookup pair)) nil
+                           :else (recur (rest candidates)))))))]
+  (when resolved
+   (when-not (= 3 (count items)) (stage-refuse :unsupported-sdk-stage-clause-extension))
+   (let [constructor (sdk_named_constructor! "proc.server" "clause-extension-form" 2)
+         arguments (Enum/map (rest items)
+                     (fn [item] (erlang/apply :Elixir.BeamLisp.Ns.Compiler :datum (list item))))
+         data (erlang/apply constructor arguments)]
+    ;; The canonical compiler conversion is also what ordinary macro expansion
+    ;; uses. This invokes no mutable macro binding or transform body.
+    (erlang/apply :Elixir.BeamLisp.Ns.Compiler :"data->form" (list data))))))
+
+(defn- stage-action-macros! [form ns]
+ ;; Compile-only is not permission to execute a loaded arbitrary macro. New
+ ;; ordered action forms admit ordinary calls and compiler special forms;
+ ;; unknown macro constructors must gain a separately reviewed pure producer.
+ (let [node (stage-unmeta form)]
+  (when (erlang/is_tuple node)
+   (case (elem node 0)
+    :list
+     (let [items (elem node 1) head (when (seq items) (stage-unmeta (first items)))
+           name (when (stage-tag? head :symbol 2) (elem head 1))]
+      (when-not (contains? #{"quote" "syntax-quote"} name)
+       (when name
+        (let [found (BeamLisp.Env/peek ns name)
+              value (when (and (erlang/is_tuple found) (= 2 (erlang/tuple_size found))
+                               (= :ok (elem found 0))) (elem found 1))]
+         (when (and (erlang/is_tuple value) (>= (erlang/tuple_size value) 2)
+                    (= :"$macro" (elem value 0)))
+          (stage-refuse :unsupported-sdk-stage-action-macro))))
+       (doseq [item items] (stage-action-macros! item ns))))
+    :vector (doseq [item (elem node 1)] (stage-action-macros! item ns))
+    :set (doseq [item (elem node 1)] (stage-action-macros! item ns))
+    :map (doseq [entry (elem node 1)]
+           (stage-action-macros! (elem entry 0) ns) (stage-action-macros! (elem entry 1) ns))
+    nil))))
+(defn- append-staged-value [values form ns]
+ ;; Ordinary AOT retains its historical final-definition projection. SDK
+ ;; deferred actions need every occurrence, including repeated value defs.
+ (Map/put values ns
+  (erlang/++ (Map/get values ns (list)) (Map/get (capture_value_def {} form ns) ns (list)))))
+(defn- append-staged-action [values form ns file]
+ (stage-action-macros! form ns)
+ (let [compiled (BeamLisp.Compiler/compile form (Map/put (BeamLisp.Compiler/new_env ns) :file file))]
+  (Map/put values ns
+    (erlang/++ (Map/get values ns (list)) (list (tuple nil nil compiled false))))))
+
 (defn stage-sdk-unit!
- "Compile-only SDK declarations with deferred value initializers; result is AOT.load_unit's exact tuple.
+ "Compile-only SDK declarations with ordered deferred values/actions; result is AOT.load_unit's exact tuple.
   This helper neither emits binaries nor registers trust. Caller must prohibit
   hidden Loader initialization during compiler execution; only already-loaded
   trusted compiler macros may expand. Unsupported forms refuse before effects."
@@ -3654,21 +3742,23 @@
                    "defn-" (do (stage-function! form ns file) values)
                    "defnative" values
                    "defmacro" (do (BeamLisp.Compiler/compile form (Map/put (BeamLisp.Compiler/new_env ns) :file file))
-                                  (capture_value_def values form ns))
+                                  (append-staged-value values form ns))
                    "defprotocol" (do (BeamLisp.Compiler/compile form (Map/put (BeamLisp.Compiler/new_env ns) :file file))
-                                     (capture_value_def values form ns))
+                                     (append-staged-value values form ns))
                    "extend-type" (do (BeamLisp.Compiler/compile form (Map/put (BeamLisp.Compiler/new_env ns) :file file))
-                                     (capture_value_def values form ns))
+                                     (append-staged-value values form ns))
                    "extend-protocol" (do (BeamLisp.Compiler/compile form (Map/put (BeamLisp.Compiler/new_env ns) :file file))
-                                         (capture_value_def values form ns))
-                   "defserver" (do (stage-server! form ns file) (capture_value_def values form ns))
-                   "defrecord" (do (stage-class! form ns file) (capture_value_def values form ns))
-                   "deftype" (do (stage-class! form ns file) (capture_value_def values form ns))
+                                         (append-staged-value values form ns))
+                   "defserver" (do (stage-server! form ns file) (append-staged-value values form ns))
+                   "defrecord" (do (stage-class! form ns file) (append-staged-value values form ns))
+                   "deftype" (do (stage-class! form ns file) (append-staged-value values form ns))
                    "declare" (do (doseq [name (rest (stage-items form :list))]
                                    (let [name (stage-symbol name)]
                                     (when-not (BeamLisp.Env/local_var? ns name) (BeamLisp.Env/intern ns name nil)))) values)
-                   "def" (capture_value_def values form ns)
-                   (stage-refuse :unsupported-sdk-stage-effect))) {} (rest forms))]
+                   "def" (append-staged-value values form ns)
+                   (if-let [extension (stage-clause-extension form ns)]
+                    (append-staged-value values extension ns)
+                    (append-staged-action values form ns file)))) {} (rest forms))]
     (tuple (unit_defns forms) values (MapSet/new (list ns))
            (let [metadata (capture_ns_decl {} (first forms))
                  declaration (first (filter #(= "defnative" (stage-head %)) (rest forms)))]
