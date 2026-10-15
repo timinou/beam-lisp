@@ -1,0 +1,107 @@
+; Requires coherent Record/compiler hosts and ordinary SDK lifetime adoption.
+; App module retention and fixed SDK helper retention are separate assertions.
+(ns reload.generated-class-test
+ (:require [reload.generated-class :as boundary] [reload.generation :as generation]
+           [credential.store :as store]))
+(defn- refused? [action] (try (action) false (catch _ true)))
+(defn- source-plan [application namespace source entry]
+ (let [root (str (System/get_env "HOME") "/tmp/generated-class-" (erlang/unique_integer (list :positive)))
+       file (str root "/" (String/replace (String/replace namespace "." "/") "-" "_") ".bl")]
+  (try
+   (File/mkdir_p! (Path/dirname file)) (File/write! file source)
+   (BeamLisp.Loader/with_load_path root
+    #(generation/prepare! (generation/project-plan
+       {:application-id application :entrypoint (str namespace "/" entry) :fixed-runtime true})))
+   (finally (File/rm_rf! root)))))
+(deftest pure-class-producer-does-not-load-register-or-intern
+ (let [namespace "class.pure" descriptor (BeamLisp.Record/declaration_descriptor namespace "Shape" :record (list "field"))
+       module (:name descriptor)]
+  (is (= :module (:op descriptor)))
+  (is (= :record (BeamLisp.Record/declaration_kind descriptor namespace "Shape")))
+  (is (nil? (BeamLisp.Record/info module))) (is (not (erlang/module_loaded module)))
+  (is (= :error (BeamLisp.Env/lookup (tuple namespace "Shape"))))
+  (is (nil? (BeamLisp.Record/declaration_kind (assoc descriptor :name :Elixir.WrongClass) namespace "Shape")))
+  (is (nil? (BeamLisp.Record/declaration_kind (assoc descriptor :clauses (list)) namespace "Shape")))
+  (is (refused? #(BeamLisp.Record/declaration_descriptor namespace "Bad" :record (list "__struct__"))))
+  (is (= :record (BeamLisp.Record/declaration_kind (BeamLisp.Record/declaration_descriptor namespace "Duplicate" :record (list "x" "x")) namespace "Duplicate")))))
+(deftest actual-memstore-record-and-protocol-shape-seal-and-retain
+ (let [source "(ns class.memstore (:require [credential.store :as store]))
+      (defrecord MemStore [firm-id])
+      (extend-type MemStore store/Store
+        (-get [s svc acct] [(:firm-id s) svc acct])
+        (-put [_ _ _ g] g) (-delete [_ _ _] nil)
+        (-list [_] []) (-where [_] \"in-memory\"))
+      (defn read [id] (store/-get (->MemStore id) :google \"account\"))
+      (defn module [] MemStore)"
+       graph (source-plan "record-graph" "class.memstore" source "read")]
+  (try
+   (is (= ["firm" :google "account"] (generation/invoke! graph "class.memstore/read" ["firm"])))
+   (let [module (generation/invoke! graph "class.memstore/module" []) lease (generation/with! graph generation/capture!)]
+    (try
+     (is (contains? (set (:modules graph)) module))
+     (let [physical (get (:mapping graph) "class.memstore")
+           constructor (generation/with! graph #(BeamLisp.Env/fetch_exact physical "->MemStore"))
+           implementation (generation/with! graph #(BeamLisp.Env/lookup
+                            (tuple (tuple :protocol "credential.store" "Store" "-get") module)))
+           helpers (BeamLisp.Env/callback_modules (elem constructor 1))
+           methods (BeamLisp.Env/callback_modules (elem implementation 1))]
+      (is (= :ok (elem constructor 0))) (is (= :ok (elem implementation 0)))
+      (is (seq helpers)) (is (seq methods))
+      (is (= true (BeamLisp.Env/sdk_runtime_retained_modules? helpers)))
+      (is (every? #(contains? (set (:modules graph)) %) methods)))
+     (is (= :waiting (:status (generation/retire! graph))))
+     (is (= ["firm" :google "account"] (generation/invoke! graph "class.memstore/read" ["firm"])))
+     (is (refused? #(BeamLisp.Record/define (elem (BeamLisp.Record/info module) 1) "MemStore" (list "changed"))))
+     (finally (generation/release! lease))))
+   (finally (generation/retire! graph)))))
+(deftest standalone-extensions-cannot-mutate-builtin-or-foreign-types
+ (is (refused? #(source-plan "foreign-type" "class.foreign"
+       "(ns class.foreign (:require [credential.store :as store]))
+        (extend-type :map store/Store (-get [_ _ _] nil) (-put [_ _ _ _] nil)
+         (-delete [_ _ _] nil) (-list [_] []) (-where [_] \"foreign\")) (defn entry [] nil)" "entry"))))
+(deftest descriptor-in-data-and-delayed-malicious-methods-grant-no-exemption
+ (let [compiled (BeamLisp.Compiler/compile
+                  (first (BeamLisp.Reader/read_string "(defrecord Packet [payload])"))
+                  (BeamLisp.Compiler/new_env "class.scaffold"))
+       descriptor (:val (first (:args (:init compiled))))
+       corrupted (assoc-in compiled [:init :args]
+                   (list {:op :lit :val (assoc descriptor :clauses (list))}))]
+  (is (refused? #(boundary/class! corrupted "class.scaffold" "Packet" :record #{} (fn [_] nil))))
+  (is (refused? #(boundary/class! {:op :lit :val descriptor} "class.scaffold" "Packet" :record #{} (fn [_] nil)))))
+ (is (refused? #(source-plan "latent-effect" "class.malicious"
+       "(ns class.malicious (:require [credential.store :as store]))
+        (defrecord Store [id])
+        (extend-type Store store/Store (-get [_ _ _] (code/purge :Elixir.Nope))
+         (-put [_ _ _ _] nil) (-delete [_ _ _] nil) (-list [_] []) (-where [_] \"bad\"))
+        (defn entry [] nil)" "entry"))))
+(deftest staged-class-protocol-tag-resolves-without-running-the-class-initializer
+ (let [namespace "class.staged" forms (BeamLisp.Reader/read_string
+       "(defrecord FutureStore [id])
+        (extend-type FutureStore credential.store/Store
+         (-get [_ _ _] nil) (-put [_ _ _ _] nil) (-delete [_ _ _] nil)
+         (-list [_] []) (-where [_] \"staged\"))")
+       _ (BeamLisp.Compiler/prelink_type (first forms) namespace)
+       compiled (BeamLisp.Compiler/compile (second forms) (BeamLisp.Compiler/new_env namespace))
+       descriptor (BeamLisp.Record/declaration_descriptor namespace "FutureStore" :record (list "id"))]
+  (is (= :extend_type (:fun compiled)))
+  (is (= (:name descriptor) (:val (nth (:args compiled) 2))))
+  (is (= :error (BeamLisp.Env/lookup (tuple namespace "FutureStore"))))
+  (is (nil? (BeamLisp.Record/info (:name descriptor))))
+  (is (not (erlang/module_loaded (:name descriptor))))))
+
+(deftest inline-deftype-protocol-scaffold-seals-generated-class-and-methods
+ (let [source "(ns class.inline (:require [credential.store :as store]))
+      (deftype Value [n] store/Store
+       (-get [_ _ _] 7) (-put [_ _ _ g] g) (-delete [_ _ _] nil)
+       (-list [_] []) (-where [_] \"inline\"))
+      (defn read [] (store/-get (->Value 7) nil nil))
+      (defn module [] Value)"
+       graph (source-plan "inline-type" "class.inline" source "read")]
+  (try
+   (is (= 7 (generation/invoke! graph "class.inline/read" [])))
+   (is (contains? (set (:modules graph)) (generation/invoke! graph "class.inline/module" [])))
+   (finally (generation/retire! graph)))))
+
+(deftest direct-native-protocol-mutation-is-not-a-class-scaffold
+ (is (refused? #(source-plan "direct-native-extension" "class.direct"
+       "(ns class.direct) (defn entry [] (BeamLisp.Multi/extend_type \"credential.store\" \"Store\" :map {}))" "entry"))))
