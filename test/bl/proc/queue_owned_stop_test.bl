@@ -1,0 +1,126 @@
+(ns proc.queue-owned-stop-test
+ (:require [proc.queue :as q] [proc.queue-runtime :as runtime]
+  [datom :as d] [datom.store-fjall :as fjall] [veritas.model :as vm]))
+(defn await! [predicate]
+ (let [deadline (+ (erlang/monotonic_time :millisecond) 10000)]
+  (loop [] (when-not (predicate)
+   (when (>= (erlang/monotonic_time :millisecond) deadline) (throw (ex-info "Owned queue boundary did not settle" {})))
+   (Process/sleep 2) (recur)))))
+(defn fixture [perform now]
+ (let [suffix (String/downcase (Base/encode16 (crypto/strong_rand_bytes 8))) path (str ".local/queue-owned-stop-" suffix ".fjall")
+       srv (q/scoped-server (str "test.owned-stop." suffix) :work)
+       conn (d/connect-with (fjall/open path) [])
+       _ (q/attach-store! srv conn)
+       handler (runtime/prepare srv {:declaration {:of :test/owned-stop :generation "owned-stop-v1"
+        :concurrency 1 :lease 60 :unique [:test/key]} :clock (fn [] @now) :perform perform})]
+  {:server srv :conn conn :handler handler :path path :pid (atom nil)}))
+(defn start! [f] (reset! (:pid f) (runtime/start! (:handler f) {})))
+(defn cleanup! [f workers]
+ (try (runtime/stop! (:server f) {:workers :stop}) (catch _ nil))
+ (doseq [pid @workers] (when (Process/alive? pid) (erlang/exit pid :kill)))
+ (when-let [pid @(:pid f)] (when (Process/alive? pid) (GenServer/stop pid :normal 10000)))
+ (d/close! (:conn f)) (File/rm_rf! (:path f)) (File/rm_rf! (str (:path f) ".blobs")))
+(defn row [f job] (d/entity (d/db (:conn f)) (:db/id job)))
+(defn enqueue! [f key at] (q/enqueue! (:server f) {:test/key key} {:at at :generation "owned-stop-v1"}))
+
+(deftest strict-stop-keeps-an-unknown-http-effect-and-reopen-reconciles-without-another-post
+ (let [entered (atom false) release (atom false) workers (atom []) now (atom 1000)
+       provider (vm/serve (vm/model "Provider accepts before the response is released"
+        {:state {:effects 0} :commands
+         {:create {:request [:post "/effects"] :next (fn [s _] (update s :effects inc))
+                   :response (fn [_ _] (reset! entered true)
+                    (loop [] (when-not @release (Process/sleep 2) (recur)))
+                    {:body {"id" "effect-1"}})}
+          :read {:request [:get "/effects"] :response (fn [s _] {:body {"count" (:effects s)}})}}}))
+       f (fixture (fn [job]
+           (swap! workers conj (erlang/self))
+           (case (:status (q/begin-effect! (:job/server job) job :provider))
+            :submit (do (vm/request provider :post "/effects" {"fixture" true})
+                        (q/record-effect! (:job/server job) job :provider :complete {:id "effect-1"}) :submitted)
+            :reconcile (let [read (vm/request provider :get "/effects")]
+                         (when (= 1 (get-in read [:body "count"]))
+                          (q/reconcile-effect! (:job/server job) job :provider :complete {:verified-id "effect-1"}))
+                         :reconciled)
+            :complete :already-known)) now)]
+  (try
+   (start! f)
+   (let [job (enqueue! f "unknown" @now)]
+    (await! #(= true @entered))
+    (is (= :intent (get-in (q/effects (:server f) (:db/id job)) [:provider :state])))
+    (is (= :stopped (:status (runtime/stop! (:server f) {:workers :stop}))))
+    (is (every? #(not (Process/alive? %)) @workers))
+    (is (= :running (:job/state (row f job))) "Local shutdown does not claim the provider never accepted")
+    (is (= :intent (get-in (q/effects (:server f) (:db/id job)) [:provider :state])))
+    (reset! release true)
+    (await! #(= 1 (:effects ((:state provider)))))
+    (swap! now + 60001) (start! f)
+    (await! #(= :done (:job/state (row f job))))
+    (is (= :reconciled (:job/result (row f job))))
+    (is (= 1 (:effects ((:state provider)))))
+    (is (= :complete (get-in (q/effects (:server f) (:db/id job)) [:provider :state])))
+    (is (= 1 (count (filter #(= :post (:method %)) ((:log provider))))) "No blind mutation replay"))
+   (finally (reset! release true) (cleanup! f workers) ((:stop provider))))))
+
+(deftest strict-stop-includes-expired-but-still-live-bodies
+ (let [workers (atom []) now (atom 1000)
+       f (fixture (fn [_] (swap! workers conj (erlang/self))
+                    (loop [] (Process/sleep 10) (recur))) now)
+       law (vm/model "Expiry frees a claim without forgetting its live physical body"
+        {:state {:expired false} :init (fn [] (atom false))
+         :commands {:expire {:args (vm/constant :unit)
+           :run (fn [system _] (swap! now + 60001) (erlang/send @(:pid f) [:bl-queue/wake])
+                  (await! #(= 2 (count @workers))) (reset! system true))
+           :next (fn [state _] (assoc state :expired true))}}
+         :invariants {:both-live (fn [state system] (and (= (:expired state) @system) (every? Process/alive? @workers)))}})]
+  (try
+   (start! f) (enqueue! f "slow" @now) (await! #(= 1 (count @workers)))
+   (is (:ok (vm/replay law [[:expire :unit]])))
+   (is (= 2 (:workers (runtime/stop! (:server f) {:workers :stop}))))
+   (is (every? #(not (Process/alive? %)) @workers))
+   (finally (cleanup! f workers)))))
+
+(deftest actor-only-stop-keeps-compatibility-and-later-strict-cleanup-stops-the-retained-body
+ (let [workers (atom []) now (atom 1000)
+       f (fixture (fn [_] (swap! workers conj (erlang/self))
+                    (loop [] (Process/sleep 10) (recur))) now)]
+  (try
+   (start! f) (enqueue! f "left-running" @now) (await! #(= 1 (count @workers)))
+   (is (= :stopped (:status (runtime/stop! (:server f)))))
+   (is (Process/alive? (first @workers)))
+   (is (= :stopped (:status (runtime/stop! (:server f) {:workers :stop}))))
+   (is (not (Process/alive? (first @workers))))
+   (is (contains? #{:stopped :already-stopped} (:status (runtime/stop! (:server f) {:workers :stop}))))
+   (finally (cleanup! f workers)))))
+
+(deftest a-new-native-owner-inherits-live-bodies-from-an-actor-only-stop
+ (let [workers (atom []) now (atom 1000)
+       f (fixture (fn [_] (swap! workers conj (erlang/self))
+                    (loop [] (Process/sleep 10) (recur))) now)]
+  (try
+   (start! f) (enqueue! f "old-owner" @now) (await! #(= 1 (count @workers)))
+   (runtime/stop! (:server f)) (start! f)
+   (enqueue! f "new-owner" @now) (await! #(= 2 (count @workers)))
+   (is (every? Process/alive? @workers))
+   (is (= 2 (:workers (runtime/stop! (:server f) {:workers :stop}))))
+   (is (every? #(not (Process/alive? %)) @workers))
+   (finally (cleanup! f workers)))))
+
+(deftest restarting-a-legacy-owner-cannot-invent-missing-worker-lifetime-evidence
+ (let [workers (atom []) now (atom 1000)
+       f (fixture (fn [_] (swap! workers conj (erlang/self))
+                    (loop [] (Process/sleep 10) (recur))) now)
+       key (tuple :bl-queue-runtime (q/server-name (:server f)))]
+  (try
+   (start! f) (enqueue! f "legacy-body" @now) (await! #(= 1 (count @workers)))
+   ;; Model the exact older registry shape, without modifying durable claims.
+   (let [registered (erlang/apply :persistent_term :get (list key))]
+    (erlang/apply :persistent_term :put
+     (list key (dissoc registered :worker-inventory-version :worker-inventory-complete? :worker-inventories))))
+   (is (= :worker-lifetime-authority-required (:kind (runtime/stop! (:server f) {:workers :stop}))))
+   (is (Process/alive? @(:pid f)))
+   (runtime/stop! (:server f)) (start! f)
+   (is (= :worker-lifetime-authority-required (:kind (runtime/stop! (:server f) {:workers :stop}))))
+   (is (Process/alive? (first @workers)) "Restart does not establish that an untracked legacy body stopped")
+   (runtime/stop! (:server f))
+   (is (= :worker-lifetime-authority-required (:kind (runtime/stop! (:server f) {:workers :stop}))))
+   (finally (cleanup! f workers)))))

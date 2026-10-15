@@ -68,6 +68,18 @@
        _ (BeamLisp.Env/bind (:environment handler))
        _ (q/register-perform! srv (:perform handler) (:contract handler))
        st (q/init-state srv (:decl handler) (:clock handler) (:contract handler))
+       prior (erlang/apply :persistent_term :get (list (registry-key srv) nil))
+       complete? (or (nil? prior)
+                     (and (map? prior) (= 1 (:worker-inventory-version prior))
+                          (= true (:worker-inventory-complete? prior))))
+       inherited (if (and (map? prior) (= 1 (:worker-inventory-version prior)))
+                   (vec (filter (fn [inventory]
+                     (some (fn [entry]
+                      (let [pid (:pid entry)]
+                       (or (not (erlang/is_pid pid)) (not= (erlang/node) (erlang/node pid)) (Process/alive? pid)))) (vals @inventory)))
+                     (:worker-inventories prior))) [])
+       st (assoc-in st [:queue :inherited-workers] inherited)
+       st (assoc-in st [:queue :worker-inventory-complete?] complete?)
        digest (get-in st [:queue :decl :generation])
        current (assoc handler :lease (get-in st [:queue :perform-lease])
                               :scope-lease (BeamLisp.Env/retain_code! (to-list (:modules handler))))
@@ -81,7 +93,10 @@
   (let [inventory (owners/register! (erlang/self) :queue (:scope-lease current)
                     {:reference srv} (elem (:scope-lease current) 2))]
    (erlang/apply :persistent_term :put (list (registry-key srv)
-     {:pid (erlang/self) :ticket (elem (:scope-lease current) 2) :application-id (q/application-id srv)}))
+     {:pid (erlang/self) :ticket (elem (:scope-lease current) 2) :application-id (q/application-id srv)
+      :worker-inventory-version (get-in st [:queue :worker-inventory-version])
+      :worker-inventory-complete? (get-in st [:queue :worker-inventory-complete?])
+      :worker-inventories (q/worker-inventories st)}))
    (q/arm-first srv (:clock current))
    (q/run-due (-> st (assoc-in [:queue :handlers] handlers) (assoc-in [:queue :inventory] inventory))))))
 
@@ -168,6 +183,11 @@
   (reply {:generation (get-in st [:queue :decl :generation])
           :retained (vec (keys (get-in st [:queue :handlers])))
           :running (count (get-in st [:queue :running]))} st))
+ (handle-call [:proc.queue-runtime/stop-workers timeout-ms] [_ st]
+  (let [result (q/stop-workers! st timeout-ms)]
+   (if (= :stopped (:status result))
+    (tuple :stop :normal (assoc result :server (get-in st [:queue :server])) st)
+    (reply result st))))
  (handle-call [:stats] [_ st] (reply (q/stats (get-in st [:queue :server])) st))
  (handle-call [:enqueue job opts] [_ st] (reply (q/enqueue! (get-in st [:queue :server]) job opts) st))
  (terminate [_ st]
@@ -188,24 +208,52 @@
   keep their existing behavior and require an explicit migration authority."
  [srv]
  (some? (owner-evidence srv)))
+(defn- wait-stopped [pid result timeout-ms]
+ (let [deadline (+ (erlang/monotonic_time :millisecond) timeout-ms)]
+  (loop []
+   (cond (not (Process/alive? pid)) result
+         (>= (erlang/monotonic_time :millisecond) deadline) {:status :refused :kind :owner-stop-timeout}
+         :else (do (Process/sleep 1) (recur))))))
 (defn stop!
  "Stop only this queue's registered shared-native owner, synchronously. Used by
-  lifecycle cleanup before closing its declared stores. Accepted jobs and the
-  durable connection binding remain; active attempts keep their own code leases
-  and native lifetime fences. Repeated cleanup of a dead owner is harmless.
-  A custom queue server never grants stop authority through its name alone."
- [srv]
+  lifecycle cleanup. The default actor-only stop preserves accepted bodies and
+  their code leases. {:workers :stop} additionally stops and awaits every owned
+  physical body, including expired claims and bodies inherited from actor-only
+  stops, before stores may close. Durable jobs/effects retain their evidence;
+  stopping a body does not undo provider IO or mark it unsubmitted. Strict mode
+  refuses owners without physical lifetime evidence. A custom queue server never
+  grants stop authority through its name alone."
+ ([srv] (stop! srv {:workers :leave}))
+ ([srv opts]
+ (let [mode (:workers opts :leave) timeout-ms (:timeout-ms opts 5000)]
+  (when-not (and (contains? #{:leave :stop} mode) (erlang/is_integer timeout-ms) (<= 1 timeout-ms 30000))
+   (refuse :invalid-stop-policy))
  (let [pid (Process/whereis (q/op-name srv))
-       evidence (owner-evidence srv)]
+       evidence (owner-evidence srv)
+       retained (erlang/apply :persistent_term :get (list (registry-key srv) nil))]
   (cond
-   (nil? pid) {:status :already-stopped :server srv}
+   (and (= :stop mode) retained
+        (or (not= 1 (:worker-inventory-version retained))
+            (not= true (:worker-inventory-complete? retained))))
+    {:status :refused :kind :worker-lifetime-authority-required :server srv}
+   (nil? pid)
+    (if (and (= :stop mode) retained)
+     (let [inventories (:worker-inventories retained)
+           result (q/stop-workers! {:queue {:server srv :worker-owner (:pid retained)
+             :worker-inventory-version 1 :worker-inventory-complete? true
+             :workers (first inventories) :inherited-workers (vec (rest inventories))}} timeout-ms)]
+      (assoc result :server srv))
+     {:status :already-stopped :server srv})
    (not= pid (:pid evidence)) {:status :refused :kind :owner-transition-authority-required :server srv}
+   (= :stop mode)
+    (let [result (GenServer/call pid [:proc.queue-runtime/stop-workers timeout-ms] (+ timeout-ms 1000))]
+     (if (= :stopped (:status result)) (wait-stopped pid result timeout-ms) result))
    :else
     (try
      (GenServer/stop pid :normal 30000)
      {:status :stopped :server srv}
      (catch e
-      (if (Process/alive? pid) (throw e) {:status :already-stopped :server srv}))))))
+      (if (Process/alive? pid) (throw e) {:status :already-stopped :server srv}))))))))
 
 (defn- owner-pid [srv]
  (when-not (ready? srv) (refuse :owner-transition-authority-required))

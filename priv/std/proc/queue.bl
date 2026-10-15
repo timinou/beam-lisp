@@ -1370,11 +1370,10 @@
    REFUSES every other state, NAMING it, and that is this file's decision about
    a CLAIMED (in-flight) job:
 
-     · this queue cannot stop a body it does not track. `launch!` starts the work
-       on a plain `spawn` with NO monitor — deliberately; the lease is the safety
-       net instead — so the most a cancel could do to an in-flight job is rewrite
-       its record while its body runs on. A `:cancelled` row over a body that is
-       still charging a card is a lie that keeps an audit trail.
+     · cancelling a claimed job cannot undo an external effect. The separate
+       strict owner shutdown can stop tracked local bodies, while retaining
+       running jobs and uncertain effect checkpoints for native recovery. It
+       cannot make a begun charge or send become work that never began.
      · the model this bundle follows agrees: Oban refuses `cancel` on an
        `executing` job, for the same reason, and §4.3 names Oban as the shape.
      · it also keeps `:cancelled` meaning ONE thing — work that will never run —
@@ -1382,8 +1381,9 @@
 
    The refusal names the state; for `:running` it also names the OWNER TOKEN and
    how much lease is left. NOT a pid: the store keeps the lease's owner TOKEN and
-   nothing else, because nothing here registers a monitor and `launch!` never
-   records the worker's pid — naming one would be inventing a fact. The token is
+   nothing else: physical PIDs belong to the ephemeral owner inventory, not the
+   durable job or this store-only cancellation API. Naming a PID here would be
+   inventing a current physical fact. The token is
    what a `:db/cas` on `:job/owner` compares against, so it is the worker's name
    in every sense this store has.
 
@@ -1639,6 +1639,7 @@
   (let [base (:queue st)
         required (:job/required-generation job (:job/generation job))
         q (merge base (get (:handlers base) required {}))
+        _ (when-not (:workers q) (throw (ex-info "Queue worker lifetime inventory is unavailable" {:kind :worker-inventory-required})))
         c (conn (:server q))
         now ((:clock q))
         decl (:decl q)
@@ -1655,20 +1656,31 @@
             token (:job/owner claimed)
             body (:perform q)
             me (erlang/self)
-            captured (diag/with-linkage-fn (:job/diagnostic-context claimed {}) diag/capture)]
-        (BeamLisp.Refs/spawn_owned (fn []
+            captured (diag/with-linkage-fn (:job/diagnostic-context claimed {}) diag/capture)
+            inventory (:workers q)
+            pid (BeamLisp.Refs/spawn_owned (fn []
+                 ;; Registration precedes release. If the owner dies in the
+                 ;; spawn/register window this body never starts provider IO.
+                 (let [watch (Process/monitor me)]
+                  (receive
+                   [:bl-queue/start]
+                   (do
+                    (Process/demonitor watch (list :flush))
                  (when (:environment q) (BeamLisp.Env/bind (:environment q)))
                  (Process/put (tuple :bl-queue/attempt-clock (server-name (:server q))) (:clock q))
-                 (let [out (try
+                  (let [out (try
                              {:ok (diag/with-captured-fn captured #(body (assoc (job-map (assoc claimed :job/payload (:payload prepared)))
                                                    :job/execution-protocol (:protocol prepared)
                                                    :job/execution-generation (:generation decl))))}
                              (catch err {:error (error-text err) :failure (diag/safe-error err)}))]
                    (erlang/send me (tuple :bl-queue/finished ref out))))
+                   (tuple :DOWN _ :process _ _) nil)))
           :plain (to-list (concat (:modules q []) (BeamLisp.Env/callback_modules body)
-                                  (BeamLisp.Env/callback_modules (:clock q)))))
+                                  (BeamLisp.Env/callback_modules (:clock q)))))]
+        (swap! inventory assoc ref {:pid pid :server (server-name (:server q)) :generation (:generation decl)})
+        (erlang/send pid [:bl-queue/start])
         (emit-entry! {:diagnostics captured} :proc.queue/claimed {:proc.queue/attempt (:job/attempts claimed)})
-        {:ref ref :diagnostics captured
+        {:ref ref :pid pid :diagnostics captured
          :e e
          :token token
          :decl decl :generation (:generation decl) :clock (:clock q)
@@ -1678,6 +1690,57 @@
          ;; being one — that is what frees the slot a killed worker leaked.
          :lease-until (+ now (* 1000 (:lease decl)))
          :partition (:job/partition claimed)}))))
+
+(defn worker-inventories
+  "Ephemeral physical-body inventories, including bodies from an earlier
+   actor-only owner stop. These cells never enter durable queue payloads."
+  [state]
+  (let [q (:queue state)]
+    (vec (distinct (cons (:workers q) (:inherited-workers q []))))))
+
+(defn prune-workers!
+  "Forget only physically dead bodies. Lease expiry alone cannot prove death."
+  [state]
+  (doseq [inventory (worker-inventories state)]
+    (when inventory
+      (swap! inventory (fn [entries]
+        (into {} (filter (fn [[_ entry]]
+                           (let [pid (:pid entry)]
+                            (or (not (erlang/is_pid pid))
+                                (not= (erlang/node) (erlang/node pid))
+                                (Process/alive? pid)))) entries))))))
+  state)
+
+(defn stop-workers!
+  "Stop and await this queue's tracked physical bodies without inventing job
+   outcomes. The live owner must invoke this in its own serialized turn; an
+   already-dead owner may be cleaned through its exact retained inventory.
+   In-flight provider effects retain their native uncertain checkpoints."
+  [state timeout-ms]
+  (let [q (:queue state) owner (:worker-owner q) inventories (worker-inventories state)
+        authorized? (and (= 1 (:worker-inventory-version q)) (= true (:worker-inventory-complete? q)) (erlang/is_pid owner)
+                         (or (= owner (erlang/self)) (not (Process/alive? owner))))]
+    (if-not authorized? {:status :refused :kind :worker-lifetime-authority-required}
+      (try
+        (let [entries (mapcat (fn [inventory] (vals @inventory)) inventories)
+              valid? (every? (fn [entry]
+                      (let [pid (:pid entry)]
+                        (and (erlang/is_pid pid) (= (erlang/node) (erlang/node pid))
+                             (not= pid (erlang/self)) (= (server-name (:server q)) (:server entry))))) entries)]
+          (if-not valid? {:status :refused :kind :invalid-worker-inventory}
+            (let [pids (vec (distinct (map :pid entries)))
+                  live (filter Process/alive? pids)
+                  deadline (+ (erlang/monotonic_time :millisecond) timeout-ms)]
+              (doseq [pid live] (erlang/exit pid :kill))
+              (loop []
+                (cond
+                  (not-any? Process/alive? pids)
+                    (do (doseq [inventory inventories] (reset! inventory {}))
+                        {:status :stopped :workers (count live)})
+                  (>= (erlang/monotonic_time :millisecond) deadline)
+                    {:status :refused :kind :worker-stop-timeout}
+                  :else (do (Process/sleep 1) (recur)))))))
+        (catch _ {:status :refused :kind :invalid-worker-inventory})))))
 
 (defn- outcome-tx
   "The transaction that settles one claimed job.
@@ -1763,7 +1826,7 @@
    if that worker is merely SLOW, its late outcome is refused (it no longer owns
    the job) — which is at-least-once, stated where it happens."
   [st]
-  (let [q0 (:queue st)
+  (let [st (prune-workers! st) q0 (:queue st)
         c (conn (:server q0))
         now ((:clock q0))
         live (into {} (remove (fn [entry]
@@ -1880,6 +1943,10 @@
                :perform body
                :contract contract
                :perform-lease lease
+               ;; This inventory outlives claim expiry. It is process lifetime
+               ;; evidence, not durable job state or an additional worker pool.
+               :workers (atom {}) :worker-owner (erlang/self) :worker-inventory-version 1
+               :worker-inventory-complete? true
                :running {}}}
       (catch e (do (BeamLisp.Env/release_code! lease) (throw e)))))))
 
