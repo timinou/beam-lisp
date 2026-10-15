@@ -1,0 +1,303 @@
+; Canonical pure source/graph logic. Shared by ordinary Source facades and
+; compile-only AOT freshness validation; no provider initializers or cache state.
+(ns host.source-graph)
+
+(defn- tag-is? [node tag] (erlang/=:= tag (BeamLisp.Ns.ReaderNode/node-tag node)))
+
+(defn- ns-form?
+  "Is this bare reader node an `(ns …)` list?"
+  [form]
+  (if (tag-is? form :list)
+    (let [items (BeamLisp.Ns.ReaderNode/node-items form)]
+      (if (erlang/=:= items (list))
+        false
+        (erlang/=:= "ns" (BeamLisp.Ns.ReaderNode/node-name (erlang/hd items)))))
+    false))
+
+(defn- require-target
+  "The namespace a `:require` spec names, as `{true ns}` for lists/filtermap,
+   or false when the spec names nothing: `foo` → foo, `[foo :as f]` → foo."
+  [spec]
+  (if (tag-is? spec :symbol)
+    (erlang/list_to_tuple (list true (BeamLisp.Ns.ReaderNode/node-name spec)))
+    (if (tag-is? spec :vector)
+      (let [items (BeamLisp.Ns.ReaderNode/node-items spec)]
+        (if (if (erlang/=:= items (list)) false (tag-is? (erlang/hd items) :symbol))
+          (erlang/list_to_tuple (list true (BeamLisp.Ns.ReaderNode/node-name (erlang/hd items))))
+          false))
+      false)))
+
+(defn- require-clause?
+  "Is this ns clause a `(:require …)` list?"
+  [clause]
+  (if (tag-is? clause :list)
+    (let [items (BeamLisp.Ns.ReaderNode/node-items clause)]
+      (if (erlang/=:= items (list))
+        false
+        (let [head (erlang/hd items)]
+          (if (tag-is? head :keyword)
+            (erlang/=:= "require" (BeamLisp.Ns.ReaderNode/node-name head))
+            false))))
+    false))
+
+(defn- clause-requires
+  "Requires named by one ns clause; the empty list when it is not a require."
+  [clause]
+  (if (require-clause? clause)
+    (lists/filtermap (fn [s] (require-target s)) (erlang/tl (BeamLisp.Ns.ReaderNode/node-items clause)))
+    (list)))
+
+(defn- dedupe
+  "First occurrence of each element, order preserved. O(n·k) over the k
+   distinct names — an ns form names a handful, so this beats building a set."
+  [xs]
+  (lists/reverse
+    (lists/foldl (fn [x acc] (if (lists/member x acc) acc (lists/append (list x) acc)))
+                 (list) xs)))
+
+(defn- spec-aliases
+  "For one `:require` spec, the `[alias target]` pairs it introduces: `[t :as
+   a]` → ([\"a\" \"t\"]); a bare or alias-less spec → (). Also the target's
+   own name maps to itself, so `t/x` and `a/x` resolve alike."
+  [spec]
+  (let [t (require-target spec)]
+    (if (erlang/=:= t false)
+      (list)
+      (let [target (erlang/element 2 t)
+            items (if (tag-is? spec :vector) (BeamLisp.Ns.ReaderNode/node-items spec) (list))
+            as (lists/dropwhile (fn [i] (erlang/not (if (tag-is? i :keyword) (erlang/=:= "as" (BeamLisp.Ns.ReaderNode/node-name i)) false))) items)]
+        (lists/append
+          (list (erlang/list_to_tuple (list target target)))
+          (if (erlang/>= (erlang/length as) 2)
+            (let [a (erlang/hd (erlang/tl as))]
+              (if (tag-is? a :symbol) (list (erlang/list_to_tuple (list (BeamLisp.Ns.ReaderNode/node-name a) target))) (list)))
+            (list)))))))
+
+(defn- spec-refer-all?
+  "Does this spec say `:refer :all`? Then every bare name in the file MAY
+   come from its target, and no name-level attribution is possible."
+  [spec]
+  (let [items (if (tag-is? spec :vector) (BeamLisp.Ns.ReaderNode/node-items spec) (list))
+        rf (lists/dropwhile (fn [i] (erlang/not (if (tag-is? i :keyword) (erlang/=:= "refer" (BeamLisp.Ns.ReaderNode/node-name i)) false))) items)]
+    (if (erlang/>= (erlang/length rf) 2)
+      (let [v (erlang/hd (erlang/tl rf))] (if (tag-is? v :keyword) (erlang/=:= "all" (BeamLisp.Ns.ReaderNode/node-name v)) false))
+      false)))
+
+(defn- spec-refers
+  "For one `:require` spec, the `[name target]` pairs its `:refer [a b]`
+   introduces (a `:refer :all` is handled by `spec-refer-all?`)."
+  [spec]
+  (let [t (require-target spec)]
+    (if (erlang/=:= t false)
+      (list)
+      (let [target (erlang/element 2 t)
+            items (if (tag-is? spec :vector) (BeamLisp.Ns.ReaderNode/node-items spec) (list))
+            rf (lists/dropwhile (fn [i] (erlang/not (if (tag-is? i :keyword) (erlang/=:= "refer" (BeamLisp.Ns.ReaderNode/node-name i)) false))) items)]
+        (if (erlang/>= (erlang/length rf) 2)
+          (let [v (erlang/hd (erlang/tl rf))]
+            (if (tag-is? v :vector)
+              (lists/filtermap (fn [n] (if (tag-is? n :symbol) (erlang/list_to_tuple (list true (erlang/list_to_tuple (list (BeamLisp.Ns.ReaderNode/node-name n) target)))) false))
+                               (BeamLisp.Ns.ReaderNode/node-items v))
+              (list)))
+          (list))))))
+
+(defn forms
+  "Read a source into bare reader forms ONCE. Every fn below has a `-forms`
+   variant taking this, so the build reads each file a single time (five
+   reads per file was the node-build cost: 5s for 116 sources)."
+  [content]
+  (BeamLisp.Reader/read_all content))
+
+(defn header*-forms
+  "`header*` over already-read forms."
+  [forms]
+  (let [found (lists/search (fn [f] (ns-form? f)) forms)]
+    (if (erlang/=:= found false)
+      [nil (list) (maps/new) (maps/new) (list)]
+      (let [form (erlang/element 2 found)
+            items (BeamLisp.Ns.ReaderNode/node-items form)
+            name (BeamLisp.Ns.ReaderNode/node-name (erlang/hd (erlang/tl items)))
+            clauses (lists/filter (fn [c] (require-clause? c)) (erlang/tl (erlang/tl items)))
+            specs (lists/append (lists/map (fn [c] (erlang/tl (BeamLisp.Ns.ReaderNode/node-items c))) clauses))
+            reqs (dedupe (lists/append (lists/map (fn [c] (clause-requires c)) clauses)))
+            aliases (maps/from_list (lists/append (lists/map (fn [s] (spec-aliases s)) specs)))
+            refers (maps/from_list (lists/append (lists/map (fn [s] (spec-refers s)) specs)))
+            refer-all (lists/filtermap (fn [s] (if (spec-refer-all? s) (require-target s) false)) specs)]
+        [name reqs aliases refers refer-all]))))
+
+(defn- bare-header-node
+  "Normalize only a namespace header, not the complete program. Position and
+   author metadata have no effect on dependency or alias identity."
+  [node]
+  (let [bare (BeamLisp.Ns.ReaderNode/node-form node) tag (BeamLisp.Ns.ReaderNode/node-tag bare)]
+    (cond
+      (lists/member tag (list :list :vector :set))
+        (erlang/list_to_tuple (list tag (lists/map (fn [n] (bare-header-node n)) (BeamLisp.Ns.ReaderNode/node-items bare))))
+      (erlang/=:= tag :map)
+        (erlang/list_to_tuple
+          (list :map (lists/map (fn [pair]
+                      (erlang/list_to_tuple (list (bare-header-node (erlang/element 1 pair))
+                                                 (bare-header-node (erlang/element 2 pair)))))
+                                (BeamLisp.Ns.ReaderNode/node-items bare))))
+      :else bare)))
+
+(defn header*-nodes
+  "header* over actual positioned Reader nodes. Only the chosen ns header is
+   normalized; executable bodies are neither copied nor parsed again."
+  [nodes]
+  (let [found (lists/search
+                (fn [node]
+                  (let [bare (BeamLisp.Ns.ReaderNode/node-form node)]
+                    (if (erlang/=:= :list (BeamLisp.Ns.ReaderNode/node-tag bare))
+                      (let [items (BeamLisp.Ns.ReaderNode/node-items bare)]
+                        (if (erlang/=:= items (list)) false
+                          (let [head (BeamLisp.Ns.ReaderNode/node-form (erlang/hd items))]
+                            (if (erlang/=:= :symbol (BeamLisp.Ns.ReaderNode/node-tag head))
+                              (erlang/=:= "ns" (BeamLisp.Ns.ReaderNode/node-name head)) false)))) false))) nodes)]
+    (if (erlang/=:= found false)
+      [nil (list) (maps/new) (maps/new) (list)]
+      (header*-forms (list (bare-header-node (erlang/element 2 found)))))))
+
+(defn header*
+  "`header` plus what a name-resolver needs: `[ns requires aliases refers
+   refer-all]`, where `aliases` maps every alias AND every required ns name
+   to the ns it denotes, `refers` maps each explicitly referred name to its
+   ns, and `refer-all` lists the namespaces required with `:refer :all`."
+  [content]
+  (header*-forms (forms content)))
+
+(defn references
+  "The `{ns → sorted (name …)}` of every QUALIFIED reference `prefix/name` in
+   `content` whose prefix is a required ns or an alias of one, plus every
+   explicitly `:refer`red name under its ns. This is what a dependent can
+   observe of each required namespace by NAME — the coverage input for
+   interface keying (see ns-interface). A namespace required with
+   `:refer :all` gets the single entry `:all`: its bare names cannot be
+   attributed, so no interface can be shown to cover the edge.
+
+   Walks the reader forms, so a `x/y` inside a comment or string never counts."
+  [content]
+  (references-forms (forms content)))
+
+(defn references-forms
+  "`references` over already-read forms."
+  [forms]
+  (let [h (erlang/list_to_tuple (Enum/to_list (header*-forms forms)))
+        aliases (erlang/element 3 h)
+        refers (erlang/element 4 h)
+        refer-all (erlang/element 5 h)]
+    (let [acc0 (lists/foldl (fn [kv acc]
+                              (let [n (erlang/element 1 kv) t (erlang/element 2 kv)]
+                                (maps/put t (lists/append (maps/get t acc (list)) (list n)) acc)))
+                            (lists/foldl (fn [t acc] (maps/put t (list :all) acc)) (maps/new) refer-all)
+                            (maps/to_list refers))
+          walk (fn walk [node acc]
+                 (let [tag (BeamLisp.Ns.ReaderNode/node-tag node)]
+                   (cond
+                     (erlang/=:= tag :symbol)
+                       (let [nm (BeamLisp.Ns.ReaderNode/node-name node)
+                             parts (binary/split nm "/")]
+                         (if (erlang/=:= (erlang/length parts) 2)
+                           (let [pfx (erlang/hd parts) nme (erlang/hd (erlang/tl parts))]
+                             (if (maps/is_key pfx aliases)
+                               (let [t (maps/get pfx aliases)]
+                                 (maps/put t (lists/append (maps/get t acc (list)) (list nme)) acc))
+                               acc))
+                           acc))
+                     (lists/member tag (list :list :vector :set))
+                       (lists/foldl walk acc (BeamLisp.Ns.ReaderNode/node-items node))
+                     (erlang/=:= tag :map)
+                       (lists/foldl (fn [pair a] (walk (erlang/element 2 pair) (walk (erlang/element 1 pair) a)))
+                                    acc (BeamLisp.Ns.ReaderNode/node-items node))
+                     :else acc)))]
+      (maps/map (fn [_ v] (if (lists/member :all v) (list :all) (lists/usort v))) (lists/foldl walk acc0 forms)))))
+
+(defn header
+  "The node a source file declares: `[ns requires]`.
+
+   `ns` is the name in the leading `(ns …)` form, nil when the file has none
+   (it then compiles into `user`). `requires` lists the namespaces its
+   `:require` clauses name, in order, without duplicates. Only the FIRST
+   symbol of each spec vector counts — `[a :refer [x y]]` contributes `a`."
+  [content]
+  (header-forms (forms content)))
+
+(defn header-forms
+  "`header` over already-read forms."
+  [forms]
+  (let [found (lists/search (fn [f] (ns-form? f)) forms)]
+    (if (erlang/=:= found false)
+      [nil (list)]
+      (let [form (erlang/element 2 found)
+            items (BeamLisp.Ns.ReaderNode/node-items form)
+            name (BeamLisp.Ns.ReaderNode/node-name (erlang/hd (erlang/tl items)))
+            reqs (lists/append (lists/map (fn [c] (clause-requires c))
+                                          (erlang/tl (erlang/tl items))))]
+        [name (dedupe reqs)]))))
+
+(defn- as-list
+  "A caller's `reqs` may answer with a vector, a list, or nil; the walk wants
+   an Erlang list. `Enum.to_list` covers every beam-lisp collection."
+  [xs]
+  (if (erlang/=:= xs nil) (list) (if (erlang/is_list xs) xs (Enum/to_list xs))))
+
+(defn closure
+  "Every namespace `ns` transitively requires, including `ns`. A sorted list
+   without duplicates. Each node is expanded once — `seen` is a map, so the
+   walk is O(V + E) with O(1) membership — and the frontier is a plain list,
+   so it is a depth-first walk that terminates on cycles."
+  [ns reqs]
+  (loop [todo (list ns) seen (maps/new)]
+    (if (erlang/=:= todo (list))
+      (lists/sort (maps/keys seen))
+      (let [n (erlang/hd todo) more (erlang/tl todo)]
+        (if (maps/is_key n seen)
+          (recur more seen)
+          (recur (lists/append (as-list (reqs n)) more) (maps/put n true seen)))))))
+
+(defn cycles
+  "Every require cycle reachable from `roots`, as a list of paths
+   `(ns … ns)` whose last element repeats an earlier one — the NAME of the
+   cycle, ready to print. `reqs` is the same callback `closure` takes
+   (ns → direct requires, any collection or nil).
+
+   This is the one place cycle KNOWLEDGE lives: `closure` must stay total
+   (a hash cannot skip what it cannot see), so its back-edge is silent;
+   here the same back-edge is recorded as the path the DFS was on when it
+   re-met a node still on its own stack. Each node is expanded once
+   (`:done`), so the walk is O(V + E) and terminates on any graph."
+  [roots reqs]
+  (let [visit (fn visit [ns path st]
+                (if (maps/is_key ns (maps/get :done st))
+                  st
+                  (if (lists/member ns path)
+                    ; back-edge: the cycle is the path from ns's first
+                    ; occurrence on the stack, closed by ns itself.
+                    (let [suffix (lists/dropwhile (fn [n] (erlang/not (erlang/=:= n ns))) path)]
+                      (maps/put :cycles (lists/append (maps/get :cycles st)
+                                                      (list (lists/append suffix (list ns))))
+                                st))
+                    (let [st2 (lists/foldl (fn [r acc] (visit r (lists/append path (list ns)) acc))
+                                           st (as-list (reqs ns)))]
+                      (maps/put :done (maps/put ns true (maps/get :done st2)) st2)))))
+        st0 (maps/from_list (list (erlang/list_to_tuple (list :done (maps/new)))
+                                  (erlang/list_to_tuple (list :cycles (list)))))
+        st (lists/foldl (fn [r acc] (visit r (list) acc)) st0 (as-list roots))]
+    (maps/get :cycles st)))
+
+(defn hash-lines
+  "sha256 hex over `lines` joined by a NUL byte — the one digest shape every
+   freshness key uses, so the build and the runtime hash alike."
+  [lines]
+  (binary/encode_hex (crypto/hash :sha256 (lists/join (erlang/list_to_binary (list 0)) lines))
+                     :lowercase))
+
+(defn closure-hash
+  "The freshness key of `ns`: sha256 over the sorted `ns:hash` line of every
+   member of its require-closure. Deterministic in the two callbacks alone."
+  [ns srchash reqs]
+  (hash-lines
+    (lists/map (fn [n]
+                 (let [h (srchash n)]
+                   (erlang/iolist_to_binary (list n ":" (if (erlang/=:= h nil) "?" h)))))
+               (closure ns reqs))))
