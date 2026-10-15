@@ -1,0 +1,164 @@
+; HOME-only native Source regression; no fabricated graph or SDK receipt.
+(ns datom.writer-graph-retention-test
+ (:require [datom :as d] [datom.conn :as conn] [reload.generation :as g]
+           [reload.execution :as execution] [env]))
+(def SCHEMA [{:db/ident :writer/value :db/valueType :db.type/string}])
+(defn directory []
+ (let [path (str (System/get_env "HOME") "/tmp/writer-graph-" (erlang/unique_integer (list :positive)))]
+  (File/mkdir_p! path) path))
+(defn graph [path app revision]
+ (let [helper (str path "/writer/helper.bl") entry (str path "/writer/entry.bl")]
+  (File/mkdir_p! (Path/dirname helper))
+  (File/write! helper (str "(ns writer.helper) (defn value [] \"" revision "\")"))
+  (File/write! entry
+   "(ns writer.entry (:require [writer.helper :as helper] [datom :as d]
+      [datom.conn :as conn] [reload.execution :as execution] [env]))
+    (defn value [] (helper/value))
+    (defn write [connection parent calls]
+     (conn/serialized! connection
+      (fn []
+       (swap! calls inc)
+       (erlang/send parent [:full-writer-entered (execution/owned?) (Process/get :bl_admission)])
+       (receive :finish-full-writer nil (after 30000 (throw :fixture-writer-deadline)))
+       (let [value (helper/value)]
+        (d/transact! connection [{:db/id 44 :writer/value value}])
+        (erlang/send parent [:full-writer-committed value (execution/owned?)]) value))))
+    (defn altered [connection calls mode]
+     (let [original (env/capture)]
+      (try
+       (env/bind (case mode :nil (assoc original :generation nil)
+                    :foreign (assoc original :env :global :chain (list :global))
+                    :subset (assoc original :generation (assoc (:generation original) :modules []))
+                    original))
+       (conn/serialized! connection (fn [] (swap! calls inc)))
+       {:status :accepted}
+       (catch error {:status :refused :error (str error)})
+       (finally (env/bind original)))))
+    (defn nested [connection calls mode]
+     (conn/serialized! connection
+      (fn [] (let [result (altered connection calls mode)]
+               (assoc result :restored (execution/owned?))))))")
+  (BeamLisp.Loader/with_load_path path
+   #(g/prepare! (g/project-plan {:application-id app :entrypoint "writer.entry/write"
+       :fixed-runtime true :native-modules #{"erlang"}})))))
+(defn await-down! [pid monitor]
+ (receive [:DOWN ref :process dead _] :when (and (= ref monitor) (= dead pid)) true
+   (after 10000 false)))
+(defn full-writer-lease? [graph writer]
+ (every? (fn [module]
+           (seq (ets/match_object :beam_lisp_code_leases (tuple (tuple module writer :_) true))))
+         (:modules graph)))
+(defn accepted-case! [mode]
+ (let [path (directory) app (str "writer-graph-" (erlang/unique_integer (list :positive)))
+       old (graph path app "old") candidate (graph path app "new")
+       connection (d/connect SCHEMA) writer (:writer connection) parent (erlang/self)
+       calls (atom 0) before (d/basis-t (d/db connection))
+       caller (spawn (fn []
+                (try
+                 (g/with! old
+                  #(do (Process/put :datom.conn/writer-timeout-ms (if (= mode :timeout) 1000 30000))
+                       (g/invoke! old "writer.entry/write" [connection parent calls])))
+                 (erlang/send parent [:full-writer-caller :returned nil])
+                 (catch error (erlang/send parent [:full-writer-caller :failed (str error)])))))
+       monitor (Process/monitor caller)]
+  (try
+   (is (= [true nil]
+        (receive [:full-writer-entered owned admission] [owned admission] (after 10000 :missing))))
+   (is (= 1 @calls))
+   (is (full-writer-lease? old writer))
+   (if (= mode :timeout)
+    (let [outcome (receive [:full-writer-caller status error] [status error] (after 10000 [:missing ""]))]
+     (is (= :failed (first outcome)))
+     (is (String/contains? (second outcome) "timeout")))
+    (do (Process/exit caller :kill) (is (await-down! caller monitor))))
+   (when (= mode :timeout) (is (await-down! caller monitor)))
+   ;; No caller graph registration remains. The accepted writer's independent
+   ;; native whole-graph ticket must alone prevent retirement of transitive code.
+   (is (= 0 (:registrations (g/evidence old))))
+   (is (full-writer-lease? old writer))
+   (is (= {:status :waiting :reason :executing-code} (g/retire! old)))
+   (is (= "new" (g/invoke! candidate "writer.entry/value" [])))
+   (is (not= (:mapping old) (:mapping candidate)))
+   (is (= before (d/basis-t (d/db connection))))
+   (erlang/send writer :finish-full-writer)
+   (is (= ["old" true]
+        (receive [:full-writer-committed value owned] [value owned] (after 10000 :missing))))
+   (is (= :drained (Agent/get writer (fn [_] :drained) 10000)))
+   (is (= 1 @calls))
+   (is (= #{[44 "old"]} (d/q '[:find ?e ?value :where [?e :writer/value ?value]] (d/db connection))))
+   (is (> (d/basis-t (d/db connection)) before))
+   (is (not (full-writer-lease? old writer)))
+   (is (= :retired (:status (g/retire! old))))
+   (is (= "new" (g/invoke! candidate "writer.entry/value" [])))
+   (is (not (execution/owned?)))
+   (finally
+    ;; Release only this pure fixture barrier, then await the actual writer turn.
+    ;; Never force-stop the accepted writer or replay its transaction.
+    (erlang/send writer :finish-full-writer)
+    (Agent/get writer (fn [_] :drained) 30000)
+    (when (Process/alive? caller) (Process/exit caller :kill))
+    (Process/demonitor monitor (list :flush))
+    (d/close! connection) (g/retire! old) (g/retire! candidate) (File/rm_rf! path)))))
+(deftest accepted-source-writer-keeps-full-transitive-graph-after-waiter-timeout
+ (accepted-case! :timeout))
+(deftest accepted-source-writer-keeps-full-transitive-graph-after-caller-death
+ (accepted-case! :death))
+
+(deftest copied-public-generation-cannot-acquire-managed-writer-authority
+ (let [path (directory) app (str "writer-copy-" (erlang/unique_integer (list :positive)))
+       graph (graph path app "copied") connection (d/connect SCHEMA) calls (atom 0)
+       token (g/with! graph env/capture) previous (env/capture)
+       before (d/basis-t (d/db connection))]
+  (try
+   (doseq [copied [token (assoc token :generation (assoc graph :modules [(first (:modules graph))]))]]
+    (try
+     (env/bind copied)
+     (let [outcome (try (conn/serialized! connection (fn [] (swap! calls inc)))
+                       {:status :unexpected}
+                    (catch error {:status :refused :error (str error)}))]
+      (is (= :refused (:status outcome)))
+      (is (String/contains? (:error outcome) "unadmitted_execution_origin")))
+     (finally (env/bind previous))))
+   (is (= 0 @calls))
+   (is (= before (d/basis-t (d/db connection))))
+   (is (= :healthy (Agent/get (:writer connection) (fn [_] :healthy) 10000)))
+   (is (= :retired (:status (g/retire! graph))))
+   (finally (env/bind previous) (d/close! connection) (g/retire! graph) (File/rm_rf! path)))))
+
+(deftest actual-source-origin-cannot-be-cleared-or-replaced-at-the-writer-boundary
+ (let [path (directory) app (str "writer-origin-" (erlang/unique_integer (list :positive)))
+       graph (graph path app "origin") connection (d/connect SCHEMA) calls (atom 0)
+       before (d/basis-t (d/db connection))]
+  (try
+   (doseq [mode [:nil :foreign :subset]]
+    (let [result (g/invoke! graph "writer.entry/altered" [connection calls mode])]
+     (is (= :refused (:status result)))
+     (is (String/contains? (:error result) "execution_origin_context_mismatch"))))
+   (is (= 0 @calls))
+   (is (= before (d/basis-t (d/db connection))))
+   (is (= :healthy (Agent/get (:writer connection) (fn [_] :healthy) 10000)))
+   ;; An unchanged actual Source context remains accepted using the same API.
+   (is (= {:status :accepted} (g/invoke! graph "writer.entry/altered" [connection calls :same])))
+   (is (= 1 @calls))
+   (is (not (execution/owned?)))
+   (finally (d/close! connection) (g/retire! graph) (File/rm_rf! path)))))
+
+
+(deftest nested-writer-turn-cannot-bind-away-origin-or-poison-its-restoration
+ (let [path (directory) app (str "writer-nested-" (erlang/unique_integer (list :positive)))
+       graph (graph path app "nested") connection (d/connect SCHEMA) calls (atom 0)
+       before (d/basis-t (d/db connection))]
+  (try
+   (doseq [mode [:nil :foreign :subset]]
+    (let [result (g/invoke! graph "writer.entry/nested" [connection calls mode])]
+     (is (= :refused (:status result)))
+     (is (String/contains? (:error result) "execution_origin_context_mismatch"))
+     (is (= true (:restored result)))))
+   (is (= 0 @calls))
+   (is (= before (d/basis-t (d/db connection))))
+   (is (= {:status :accepted :restored true}
+          (g/invoke! graph "writer.entry/nested" [connection calls :same])))
+   (is (= 1 @calls))
+   (is (= :healthy (Agent/get (:writer connection) (fn [_] :healthy) 10000)))
+   (is (not (execution/owned?)))
+   (finally (d/close! connection) (g/retire! graph) (File/rm_rf! path)))))
