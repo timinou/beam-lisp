@@ -4472,6 +4472,13 @@
       (doseq [binding (Map/keys (BeamLisp.Loader/source_decls namespace))]
        (BeamLisp.Env/intern namespace binding nil)
        (BeamLisp.Env/put_link namespace binding (tuple (BeamLisp.Emit/module_for namespace) {} nil)))
+      ;; The already compiled Compiler itself needs canonical Core callables
+      ;; while it compiles source metadata (e.g. `apply list` in macro params).
+      ;; Source ownership still comes only from declarations, never these Fn
+      ;; values; restore exact attested body captures, not inherited globals.
+      (when (= "core" namespace)
+       (doseq [binding (Map/to_list (:kernel-values (constructor_context!)))]
+        (BeamLisp.Env/intern "core" (elem binding 0) (elem binding 1))))
       (doseq [kind [:alias :refer]
               row (BeamLisp.Env/match (tuple (tuple kind namespace :"$1") :_))]
        (BeamLisp.Env/put_key (tuple kind namespace (first row)) nil))
@@ -4652,6 +4659,78 @@
   (constructor_context_put! :core-rows (:val body))
   (:val body))))
 
+(defn- constructor_kernel_module! [module]
+ (when-not (contains? (:kernel-modules (constructor_context!)) module)
+  ;; Retain before the authoritative byte check; no captured native helper may
+  ;; execute between successful attestation and a concurrent code replacement.
+  (when-not (seed_dependency! module) (stage-refuse :unattested-compiler-kernel))
+  (let [handle (BeamLisp.Env/retain_code! (list module))]
+   (constructor_context_put! :kernel-leases
+     (cons handle (:kernel-leases (constructor_context!))))
+   (when-not (seed_dependency! module) (stage-refuse :unattested-compiler-kernel))
+   (constructor_context_put! :kernel-modules
+     (conj (:kernel-modules (constructor_context!)) module)))))
+
+(defn- constructor_kernel_definitions! []
+ (let [module :Elixir.BeamLisp.Ns.Core
+       _ (constructor_kernel_module! module)
+       definitions (erlang/apply module :__bl_ns_defs__ (list))]
+  (when-not (erlang/is_map definitions) (stage-refuse :invalid-compiler-kernel-definitions))
+  (Enum/reduce (Map/to_list definitions) {}
+   (fn [binding output]
+    (let [name (elem binding 0)
+          signature
+           (Enum/reduce (elem binding 1) {:fixed {} :rest nil}
+            (fn [entry signature]
+             (when-not (and (erlang/is_tuple entry) (= 5 (erlang/tuple_size entry)))
+              (stage-refuse :invalid-compiler-kernel-entry))
+             (let [kind (elem entry 0) arity (elem entry 1) function (elem entry 2)
+                   node (elem entry 3) body (elem entry 4)
+                   native-arity (if (= :variadic kind) (inc arity) arity)]
+              (when-not (and (contains? #{:fixed :variadic} kind)
+                             (erlang/is_integer arity) (<= 0 arity 255)
+                             (erlang/is_atom function) (erlang/is_atom body)
+                             (= :defn-clause (:op node)) (= function (:fname node))
+                             (= native-arity (count (:params node))))
+               (stage-refuse :unattested-compiler-kernel-entry))
+              (constructor_kernel_module! body)
+              (when-not (erlang/function_exported body function native-arity)
+               (stage-refuse :unattested-compiler-kernel-entry))
+              (let [capture (erlang/make_fun body function native-arity)]
+               (if (= :fixed kind)
+                (let [previous (Map/get (:fixed signature) arity)]
+                 (when (and previous (not= previous capture))
+                  (stage-refuse :ambiguous-compiler-kernel-entry))
+                 (assoc signature :fixed (Map/put (:fixed signature) arity capture)))
+                (let [value (tuple arity capture) previous (:rest signature)]
+                 (when (and previous (not= previous value))
+                  (stage-refuse :ambiguous-compiler-kernel-entry))
+                 (assoc signature :rest value)))))))
+          fixed (:fixed signature) variadic (:rest signature)
+          value (if (and (= 1 (erlang/map_size fixed)) (nil? variadic))
+                  (elem (first (Map/to_list fixed)) 1)
+                  (tuple :"$blfn" fixed variadic))]
+     (Map/put output name value))))))
+
+(defn- constructor_install_kernel! []
+ ;; Only compiler-owned seed construction executes here, into this disposable
+ ;; private Env. Rt.seed_core creates callable/link tables and closures; it
+ ;; invokes no provider initializer, process operation or supplied callback.
+ (constructor_kernel_module! :Elixir.BeamLisp.Ns.Rt)
+ (constructor_kernel_module! :Elixir.BeamLisp.Ns.Core)
+ (constructor_core_seed_rows!)
+ (constructor_kernel_module! (:core-provider (constructor_context!)))
+ (let [definitions (constructor_kernel_definitions!)]
+  (doseq [binding (BeamLisp.Env/match (tuple (tuple "core" :"$1") :_))]
+   (BeamLisp.Env/intern "core" (first binding) nil)
+   (BeamLisp.Env/put_link "core" (first binding) (tuple :Elixir.BeamLisp.Ns.Core {} nil)))
+  (erlang/apply :Elixir.BeamLisp.Ns.Rt :seed_core (list))
+  (doseq [binding (Map/to_list definitions)]
+   (BeamLisp.Env/intern "core" (elem binding 0) (elem binding 1)))
+  (constructor_context_put! :kernel-values
+   (Map/new (Enum/map (BeamLisp.Env/match_own (tuple (tuple "core" :"$1") :"$2"))
+              (fn [binding] (tuple (first binding) (second binding))))))))
+
 (defn- constructor_core_primitive! [name]
  (let [rows (constructor_core_seed_rows!)
        row (Enum/find rows (fn [row]
@@ -4665,7 +4744,10 @@
                     (tuple :"$blfn" (Map/new (Enum/map (Map/to_list fixed)
                                              (fn [pair] (tuple (elem pair 0) (capture (elem pair 0) (elem pair 1))))))
                            (when rest (tuple (first rest) (capture (inc (first rest)) (second rest))))))))
-       actual (BeamLisp.Env/lookup (tuple "core" name))]
+       ;; Source metadata masks may be active. ABI authority is the actual
+       ;; global kernel binding, never a private compiler reconstruction.
+       actual (BeamLisp.Env/with_env :global
+                (fn [] (BeamLisp.Env/lookup (tuple "core" name))))]
   (and expected (contains? (constructor_pure_core_names) name)
        (= (tuple :ok expected) actual))))
 
@@ -4700,7 +4782,9 @@
    (stage-refuse :sdk-constructor-compiler-changed)))
  (when-let [provider (:core-provider (constructor_context!))]
   (seed_dependency! :Elixir.BeamLisp.Ns.Rt)
-  (seed_dependency! provider)))
+  (seed_dependency! provider))
+ (doseq [module (:kernel-modules (constructor_context!))]
+  (seed_dependency! module)))
 
 (defn- constructor_compile_sdk_unit! [source opts]
  ;; Only authenticated source data enters this boundary; no caller callback can
@@ -4726,11 +4810,23 @@
         (try
          (Process/put :bl_sdk_constructor_context
            {:input proof :compiler-env view :units {} :compiled {} :compiling #{} :clauses {} :seen-macros #{}
+            :kernel-modules #{} :kernel-leases (list)
             :macro-steps 16384 :new-atoms 128 :expanded 0})
+         (BeamLisp.Env/with_env view (fn [] (constructor_install_kernel!)))
          (constructor_unit! namespace)
-         (let [result (compile_source_unit_impl source opts)]
-          (constructor_check_sources!) result)
-         (finally (BeamLisp.Env/destroy view))))
+         (let [result (BeamLisp.Env/with_env view
+                        (fn [] (compile_source_unit_impl source opts)))]
+          (constructor_check_sources!)
+          ;; Compilation/emission borrowed only the disposable canonical
+          ;; compiler kernel. Complete artifact authority is published from
+          ;; the actual global SDK scope; no initializer ran in either scope.
+          (register_sdk_emission! source file result)
+          result)
+         (finally
+          (try
+           (doseq [handle (:kernel-leases (Process/get :bl_sdk_constructor_context))]
+            (BeamLisp.Env/release_code! handle))
+           (finally (BeamLisp.Env/destroy view))))))
        (finally
         (if previous-context (Process/put :bl_sdk_constructor_context previous-context)
           (Process/delete :bl_sdk_constructor_context))
