@@ -8,6 +8,7 @@
 
 (def ^:private MEMBERS :beam_lisp_queue_family_members)
 (def ^:private EPOCHS :beam_lisp_queue_family_epochs)
+(def ^:private shared-handlers (atom {}))
 (defn- refuse [kind] (throw (ex-info "Queue declaration family refused" {:kind kind})))
 (defn- tables! []
  (table/hold MEMBERS {:type :ordered_set :options [:public :named_table]})
@@ -52,8 +53,8 @@
  ([membership] (native-entry membership true))
  ([membership full?]
  (let [row (first (ets/lookup owners/INDEX (:key membership))) entry (when row (elem row 1))
-       native (:native-evidence entry) lease (:lease native) module (:module entry)]
-  (when (and entry (= membership (handle entry)) (= :server (:kind entry))
+       native (or (:native-evidence entry) (:framework-evidence entry)) lease (:lease native) module (:module entry)]
+  (when (and entry (= membership (handle entry)) (contains? #{:server :framework} (:kind entry))
              (tuple? lease) (= 3 (erlang/tuple_size lease))
              (not (seq (ets/lookup owners/META (tuple :closed (:ticket entry)))))
              (= (:pid entry) (erlang/element 2 lease))
@@ -65,9 +66,10 @@
                (= [(tuple (tuple module (:pid entry) (:proof-id entry)) true)]
                   (vec (ets/lookup :beam_lisp_code_leases (tuple module (:pid entry) (:proof-id entry))))))
              (= (:application-id entry) (:application-id native))
-             (= (:origin-generation entry) (:generation native))
+             (if (= :server (:kind entry)) (= (:origin-generation entry) (:generation native))
+                 (= :framework (:kind native)))
              (= module (:module native))) entry))))
-(defn- attested-start! [g id]
+(defn- attested-start! [g id shared?]
  (let [parts (String/split id "/") physical (get (:mapping g) (first parts))
        declaration (when (and physical (= 2 (count parts)))
                      (env/with-env (:scope g) #(BeamLisp.Env/fetch_exact! physical (second parts))))
@@ -75,11 +77,17 @@
        row (first (ets/lookup owners/INDEX key)) entry (when row (elem row 1))
        current (when entry (native-entry (handle entry)))]
   (when-not (and current (= (:digest g) (:origin-generation current))
-                 (= declaration (:module current)))
+                 (if shared?
+                  (and (get-in g [:declarations :reconcile id :data :canonical])
+                       (= (:module current) (BeamLisp.Env/with_env :global
+                          #(BeamLisp.Env/fetch_exact! "proc.queue-runtime" "owner")))
+                       (= (tuple "proc.queue-runtime" "owner")
+                          (get-in (BeamLisp.AOT/sdk_class_evidence! (:module current)) [:artifact :declaration-owner])))
+                  (= declaration (:module current))))
    (refuse :queue-family-generated-owner-required))
   ;; Native one-shot generated-init extent, not module/frame shape alone.
   ;; This rejects a later handler on this same genuine native actor.
-  (when-not (BeamLisp.Env/server_initializing? declaration)
+  (when-not (BeamLisp.Env/server_initializing? (:module current))
    (refuse :queue-family-generated-owner-required))
   current))
 (defn- member-current?
@@ -87,8 +95,22 @@
  ([row full?]
  (when-let [native (native-entry (:membership row) full?)]
   (and (= (:application-id row) (:application-id native))
-       (= (:handler-generation row) (:origin-generation native))
-       (= (:module row) (:module native))))))
+       (= (:module row) (:module native))
+       (if (= :shared-reconcile (:owner-mode row))
+        (let [receipt (get @shared-handlers (:key row)) lease (:lease receipt)
+              g (:graph receipt)]
+         (and (= (:membership row) (:membership receipt))
+              (= (:handler-generation row) (:digest g))
+              (= (:application-id row) (:application-id g))
+              (tuple? lease) (= (get-in row [:membership :pid]) (elem lease 1))
+              (BeamLisp.Env/code_lease_active? lease)
+              ;; An arbitrary valid actor lease cannot impersonate a different
+              ;; handler graph. This is actual retained module membership.
+              (every? (fn [module]
+                        (= [(tuple (tuple module (elem lease 1) (elem lease 2)) true)]
+                           (vec (ets/lookup :beam_lisp_code_leases
+                                  (tuple module (elem lease 1) (elem lease 2)))))) (:modules g))))
+        (= (:handler-generation row) (:origin-generation native)))))))
 
 (defn- physical-departure! [member]
  ;; This fresh monitor is created/consumed locally OUTSIDE the family lock.
@@ -107,9 +129,10 @@
 (defn register!
  "Generated reconcile init only: bind one canonical instance to its exact
   source family and existing native monitor. Never invokes a config factory."
- [server id normalized-declaration]
+ ([server id normalized-declaration] (register! server id normalized-declaration false))
+ ([server id normalized-declaration shared?]
  (let [g (execution/current) app (:application-id g) family (family-of g id)
-       native (when family (attested-start! g id))
+       native (when family (attested-start! g id shared?))
        fixed (select-keys normalized-declaration [:of :unique :partition])]
   (when-not (and native (string? server)
                  (String/starts_with? server (str "blq." app "__"))
@@ -127,7 +150,7 @@
           member {:key key :server server :application-id app :family id
                   :protocol (:protocol family) :fixed-shape fixed
                   :handler-generation (:digest g) :module (:module native)
-                  :membership (handle native) :owner-mode :embedded-reconcile}]
+                  :membership (handle native) :owner-mode (if shared? :shared-initializing :embedded-reconcile)}]
      (when-not (= sampled prior) (refuse :queue-family-membership-changed))
      (when (and prior (not (member-current? prior)) (not= :observed-down departed))
       (refuse :queue-family-owner-down-unobserved))
@@ -140,7 +163,47 @@
        (fn []
         (when-not prior (admit-new-member! app))
         (ets/insert MEMBERS (tuple key member)) (advance! app))))
-     member))))))
+     member)))))))
+
+(defn publish-shared-handler!
+ "Actual fixed SDK owner only, outside a Source callback/context. Replace only
+  its exact family membership after durable handler install. The private receipt
+  retains the selected immutable graph and exact complete native handler lease;
+  public ETS tags/caller maps never constitute handler-generation authority."
+ [server id g lease]
+ (when (or (BeamLisp.Env/assert_execution_context!) (BeamLisp.Env/execution_origin))
+  (refuse :queue-family-native-handler-owner-required))
+ ((BeamLisp.Env/fetch_exact! "reload.generation" "attested-prepared!") g)
+ (let [native (owners/current-owner-capability) app (:application-id g)
+       family (family-of g id) key (tuple app server)]
+  (when-not (and native (= :framework (:kind native))
+                 (= app (:application-id native))
+                 (= (:module native) (BeamLisp.Env/with_env :global
+                    #(BeamLisp.Env/fetch_exact! "proc.queue-runtime" "owner")))
+                 (= (tuple "proc.queue-runtime" "owner")
+                    (get-in (BeamLisp.AOT/sdk_class_evidence! (:module native)) [:artifact :declaration-owner]))
+                 (get-in g [:declarations :reconcile id :data :canonical])
+                 (tuple? lease) (= 3 (erlang/tuple_size lease))
+                 (= (erlang/self) (elem lease 1)) (BeamLisp.Env/code_lease_active? lease)
+                 (every? (fn [module]
+                           (= [(tuple (tuple module (elem lease 1) (elem lease 2)) true)]
+                              (vec (ets/lookup :beam_lisp_code_leases
+                                     (tuple module (elem lease 1) (elem lease 2)))))) (:modules g)))
+   (refuse :queue-family-native-handler-owner-required))
+  (fenced app
+   (fn []
+    (let [prior-row (first (ets/lookup MEMBERS key)) prior (when prior-row (elem prior-row 1))
+          member (assoc prior :module (:module native) :membership (:membership native)
+                    :handler-generation (:digest g) :owner-mode :shared-reconcile)]
+     (when-not (and prior (= id (:family prior))
+                    (= (erlang/self) (get-in prior [:membership :pid]))
+                    (= (:fixed-shape family) (:fixed-shape prior))
+                    (= (:protocol family) (:protocol prior)))
+      (refuse :queue-family-shared-membership-conflict))
+     (swap! shared-handlers assoc key {:membership (:membership native) :graph (select-keys g [:digest :application-id :modules]) :lease lease})
+     (ets/insert MEMBERS (tuple key member))
+     (advance! app)
+     member)))))
 
 (defn member-evidence
  "Read-only native witness. A stale annotation refuses; no actor RPC or

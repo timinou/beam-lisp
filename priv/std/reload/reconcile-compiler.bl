@@ -1,0 +1,131 @@
+; Final preparation pass: exact first-party contribution -> sealed residuals ->
+; actual constructor callsites. No factory/constructor/Source callback executes.
+(ns reload.reconcile-compiler
+ (:require [reload.declaration :as declaration] [reload.reconcile-recipe :as recipe]
+           [reload.reconcile-callsite :as callsite]
+           [reload.collection-constructor :as collections] [data.first-order :as data]))
+(defn- refuse [kind] (throw (ex-info "Canonical reconciliation compilation refused" {:kind kind})))
+(defn- exact-routes [namespace name arity operation]
+ (reduce (fn [out entry]
+           (if (and (= :fixed (elem entry 0)) (= arity (elem entry 1)))
+            (reduce (fn [m module] (assoc m [module (elem entry 2) arity] operation)) out
+              (distinct (filter some? [(BeamLisp.Emit/module_for namespace)
+                                       (when (> (erlang/tuple_size entry) 4) (elem entry 4))]))) out))
+  {} (BeamLisp.Env/ns_definition namespace name)))
+(defn sdk-context
+ "Capture exact original SDK function/body identities in the trusted parent
+  BEFORE entering candidate scope. Candidate descriptors never supply this."
+ []
+ (BeamLisp.Loader/ensure_loaded "proc.reconcile")
+ (BeamLisp.Loader/ensure_loaded "proc.reconcile-runtime")
+ (let [dispatcher (exact-routes "proc.reconcile" "call-config-factory" 4 :config-factory)]
+ {:sdk (merge (collections/sdk-targets) dispatcher)
+  ;; Existing fixed native constructor APIs already validate generated classes,
+  ;; context and actual native startup tickets. This pass adds no new producer.
+  :sdk-globals (if (seq dispatcher) {["proc.reconcile" "call-config-factory" 4] :config-factory} {})
+  :targets (into {}
+    (concat
+     (for [[fun mode] [[:start :start] [:start_link :start-link]] n [1 2 3]]
+      [[ :Elixir.BeamLisp.Server fun n]
+       {:class-position 0 :argument-position (when (> n 1) 1)
+        :options-position (when (> n 2) 2) :operation mode :arity n}])
+     (for [n [2 3 4]]
+      [[:Elixir.BeamLisp.Supervisor :server n]
+       {:id-position 0 :class-position 1 :argument-position (when (> n 2) 2)
+        :options-position (when (> n 3) 3) :operation :child-spec :arity n}])))} ))
+(defn- one-clause! [owner name arity]
+ (let [entries (filter #(and (= :fixed (elem % 0)) (= arity (elem % 1)))
+                 (BeamLisp.Env/ns_definition owner name)) clause (when (= 1 (count entries)) (elem (first entries) 3))]
+  (when-not (and (= :defn-clause (:op clause)) (nil? (:guard clause))
+                 (every? #(= :pvar (:pop %)) (:params clause)))
+   (refuse :unsupported-canonical-function-clause)) clause))
+(defn- residual [clause context kind]
+ (recipe/residualize! (:body clause)
+  (assoc context :result-kind kind :parameters
+   (into {} (map (fn [p] [(:name p) {:kind :data :node {:op :var :name (:name p) :ann {}}}]) (:params clause))))))
+(defn- emitted-entry [name clause proof]
+ (let [fname (erlang/binary_to_atom name)
+       params (concat (:params clause) [{:pop :pvar :name (:snapshot-name proof)}])]
+  (tuple :fixed (count params) fname
+    {:op :defn-clause :fname fname :params (to-list params) :guard nil :ann {} :body (:body proof)})))
+(defn- install! [owner name entry]
+ (BeamLisp.Link/defvar owner name (list entry)
+  (list (tuple :file "<canonical-reconcile-residual>") (tuple :line 1))))
+(defn- sealed-global-reader [planned]
+ ;; Only eager references actually reached by the bounded residual proof are
+ ;; read. ns_defs is a function table; scanning it misses ordinary literal defs
+ ;; and materializes an unnecessary whole-product AST inventory.
+ (let [allowed (set (vals (:mapping planned))) cache (atom {})]
+  (fn [key]
+   (if (contains? @cache key) (get @cache key)
+    (let [found (when (contains? allowed (first key))
+                  (BeamLisp.Env/fetch_exact (first key) (second key)))
+          result (if (and (tuple? found) (= :ok (elem found 0))
+                           (try (data/check! (elem found 1)
+                                  {:max-nodes 32768 :max-depth 64 :max-bytes 1048576})
+                                true (catch _ false)))
+                   {:present true :value (elem found 1)} {:present false})]
+     (swap! cache assoc key result) result)))))
+(defn finalize!
+ "Emit BEFORE Link.settle/module inventory. Unknown recipes stay embedded;
+  unsupported analysis never evaluates the original factory to find its shape.
+  Exact generated native class identity is mandatory before compiler rewriting."
+ [planned factories sdk-context]
+ (let [canonical (atom {}) captures (declaration/canonical-captures)
+       context {:sdk (:sdk sdk-context) :sdk-globals (:sdk-globals sdk-context) :factories (:entries factories) :globals (:globals factories)
+                :read-global (sealed-global-reader planned)}
+       rejected (atom [])]
+  (doseq [[[_ id] descriptor] captures]
+   (let [capture (:canonical-capture descriptor) owner (:owner descriptor)
+         class (:original-class capture) binding (last (String/split id "/"))
+         _ (when-not (and (contains? @(:server-classes planned) class)
+                          (= class (BeamLisp.Env/fetch_exact! owner binding))
+                          (= class (:name (get @(:server-descriptors planned) class))))
+             (refuse :canonical-class-provenance-mismatch))
+         proved (try
+                  (let [factory (one-clause! owner (:callback descriptor) 3)
+                        instance (one-clause! owner (:instance capture) 1)
+                        config-proof (residual factory context :config)
+                        instance-proof (residual instance context :data)]
+                   ;; Native/cell snapshots need typed exact slots. This first
+                   ;; integrated lane accepts EMPTY snapshots only; never read
+                   ;; managed cells or callbacks speculatively during prepare.
+                   (when (or (seq (:cell-keys config-proof)) (seq (:cell-keys instance-proof)))
+                    (refuse :typed-resource-recipe-required))
+                   {:factory factory :instance instance :config-proof config-proof :instance-proof instance-proof})
+                  (catch error
+                   (when-not (contains? #{:unproved-reconcile-recipe :unsupported-canonical-function-clause
+                                          :typed-resource-recipe-required} (:kind (ex-data error))) (throw error))
+                   (swap! rejected conj {:declaration id :reason (:kind (ex-data error))}) nil))]
+    (when proved
+     (let [suffix (sha256-hex id) reifier (str "__reconcile_reifier__" suffix)
+           instance (str "__reconcile_identity__" suffix)
+           receipt {:version 1 :declaration id :original-class class
+                    :reifier (str (:logical descriptor) "/" reifier)
+                    :instance (str (:logical descriptor) "/" instance)
+                    :snapshot-scope :empty-first-order :cell-keys []
+                    :queue-declaration (:queue-declaration descriptor)
+                    :policy (:policy capture)}]
+      (install! owner reifier (emitted-entry reifier (:factory proved) (:config-proof proved)))
+      (install! owner instance (emitted-entry instance (:instance proved) (:instance-proof proved)))
+      (declaration/record-canonical-recipe! id receipt)
+      (swap! canonical assoc [owner binding] {:version 1 :declaration id})))))
+  (when (seq @canonical)
+   ;; SDK dependency comes from this exact compiler path, never user metadata.
+   (BeamLisp.Loader/ensure_loaded "proc.reconcile-runtime")
+   (doseq [owner (vals (:mapping planned)) [name entries] (BeamLisp.Env/ns_defs owner)]
+    (let [changed (atom false)
+          next (mapv (fn [entry]
+                       (let [clause (elem entry 3)
+                             result (callsite/specialize (:body clause)
+                                      {:targets (:targets sdk-context) :canonical @canonical :globals {}})]
+                        (when (seq (:changes result)) (reset! changed true))
+                        ;; Re-link from the actual original descriptor; never
+                        ;; retain an old body-route claim after changing code.
+                        (tuple (elem entry 0) (elem entry 1) (elem entry 2)
+                         (assoc clause :body (:expression result))))) entries)]
+     (when @changed
+      (BeamLisp.Link/defvar owner name (to-list next)
+        (list (tuple :file "<canonical-reconcile-callsite>") (tuple :line 1)))))))
+  {:canonical-count (count @canonical) :retained @rejected
+   :runtime-namespaces (if (seq @canonical) #{"proc.reconcile-runtime"} #{})}))
