@@ -1332,10 +1332,15 @@
    input bytes and executable identity; a filename or namespace prefix alone
    grants no SDK ownership. Source paths are relative so drops reproduce."
   [root source mod path]
+  (sdk_artifact_bytes_entry! root source mod (File/read! path)))
+
+(defn- sdk_artifact_bytes_entry! [root source mod bytes]
+  ;; Bind every inventory fact to the exact bytes that will be published; cache
+  ;; validation never blesses a later re-read of a replaceable pathname.
   (let [root (physical_sdk_path root) source (physical_sdk_path source)
         _ (when-not (and root source (String/starts_with? source (erlang/iolist_to_binary (list root "/"))))
             (erlang/error :sdk_inventory_source_outside_root))
-        bytes (File/read! path) chunks (beam_lib/chunks bytes (list :attributes))
+        chunks (beam_lib/chunks bytes (list :attributes))
         _ (when-not (and (erlang/== :ok (elem chunks 0)) (erlang/== mod (elem (elem chunks 1) 0)))
             (erlang/error :sdk_inventory_module_mismatch))
         attrs (Keyword/get (elem (elem chunks 1) 1) :attributes)
@@ -1419,26 +1424,33 @@
                     (erlang/error :incomplete_sdk_compiler_unit))))))))))
   true)
 
+(defn- sdk_emission_entries! [root path beams]
+  (let [entries (Enum/map beams
+                  (fn [beam]
+                    (tuple (tuple :bl_sdk_emission (elem beam 0))
+                      (sdk_artifact_bytes_entry! root path (elem beam 0) (elem beam 1)))))]
+    (verify_complete_sdk_units! (Map/new (Enum/map entries
+      (fn [entry] (tuple (elem (elem entry 0) 1) (elem entry 1))))))
+    entries))
+
+(defn- publish_sdk_emission_entries! [entries]
+  ;; Atomic inventory publication happens only after every captured object was
+  ;; validated and actually loaded. This function never runs an initializer.
+  (ets/insert :beam_lisp_vars entries)
+  (when (and (erlang/not (erlang/== true (Process/get :bl_loader_initialization_blocked)))
+             (erlang/function_exported :Elixir.BeamLisp.Env :refresh_sdk_runtime! 0))
+    (BeamLisp.Env/refresh_sdk_runtime!)))
+
 (defn- register_sdk_emission! [source file beams]
-  ;; Source mode needs no hand-maintained inventory. Only a successfully
-  ;; completed SDK compilation, whose actual input matches the physical source,
-  ;; can publish evidence. An app cannot claim a trusted filename for its text.
+  ;; Source mode needs no hand-maintained inventory. Only actual physical SDK
+  ;; inputs and a complete emitting unit can publish compiler ownership rows.
   (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root)) path (physical_sdk_path file)]
     (when (and (erlang/== :global (BeamLisp.Env/env_id)) root path
                (String/starts_with? path (erlang/iolist_to_binary (list root "/")))
                (erlang/== source (BeamLisp.Loader/read_source path)))
-      (let [entries (Enum/map beams
-                      (fn [beam]
-                        (tuple (tuple :bl_sdk_emission (elem beam 0))
-                          (sdk_artifact_entry! root path (elem beam 0) (elem beam 1)))))]
-        (verify_complete_sdk_units! (Map/new (Enum/map entries
-          (fn [entry] (tuple (elem (elem entry 0) 1) (elem entry 1))))))
-        ;; One atomic publication after ALL rows validate, never partial trust
-        ;; from a failed or still-compiling namespace.
-        (ets/insert :beam_lisp_vars entries)
-        (when (and (erlang/not (erlang/== true (Process/get :bl_loader_initialization_blocked)))
-                   (erlang/function_exported :Elixir.BeamLisp.Env :refresh_sdk_runtime! 0))
-          (BeamLisp.Env/refresh_sdk_runtime!))))))
+      (publish_sdk_emission_entries!
+        (sdk_emission_entries! root path
+          (Enum/map beams (fn [beam] (tuple (elem beam 0) (File/read! (elem beam 1))))))))))
 
 (defn- portable_sdk_routes [routes]
   (when routes
@@ -3901,6 +3913,253 @@
         (erlang/error (tuple :missing_sdk_dependency_unit_owner mod namespace selected hinted)))
       (tuple namespace selected))))
 
+; Exact existing v2 manifest subset. Never decode arbitrary ETF or intern names.
+(defn- sdk_cache_read_bounded! [path limit]
+  (when-not (and (erlang/is_integer limit) (erlang/> limit 0))
+    (erlang/error :sdk_stage_cached_read_bound))
+  (let [opened (file/open (String/to_charlist path) (list :read :binary :raw))]
+    (when-not (erlang/== :ok (elem opened 0)) (erlang/error :sdk_stage_cached_read_failed))
+    (let [descriptor (elem opened 1)]
+      (try
+        (let [read (file/read descriptor (erlang/+ limit 1))]
+          (when-not (and (erlang/is_tuple read) (erlang/== :ok (elem read 0))
+                         (erlang/is_binary (elem read 1)) (erlang/=< (erlang/byte_size (elem read 1)) limit)
+                         (erlang/== :eof (file/read descriptor 1)))
+            (erlang/error :sdk_stage_cached_read_bound))
+          (elem read 1))
+        (finally (file/close descriptor))))))
+
+(defn- sdk_manifest_byte! [bytes offset]
+  (when-not (and (erlang/is_integer offset) (erlang/>= offset 0)
+                 (erlang/< offset (erlang/byte_size bytes)))
+    (erlang/error :invalid_sdk_stage_cached_manifest))
+  (binary/at bytes offset))
+(defn- sdk_manifest_u32! [bytes offset]
+  (erlang/+ (erlang/+ (erlang/bsl (sdk_manifest_byte! bytes offset) 24)
+                       (erlang/bsl (sdk_manifest_byte! bytes (erlang/+ offset 1)) 16))
+             (erlang/+ (erlang/bsl (sdk_manifest_byte! bytes (erlang/+ offset 2)) 8)
+                       (sdk_manifest_byte! bytes (erlang/+ offset 3)))))
+(defn- sdk_manifest_slice! [bytes offset length]
+  (when-not (and (erlang/is_integer length) (erlang/>= length 0)
+                 (erlang/=< (erlang/+ offset length) (erlang/byte_size bytes)))
+    (erlang/error :invalid_sdk_stage_cached_manifest))
+  (binary/part bytes offset length))
+(defn- sdk_manifest_atom! [bytes offset]
+  ;; Native atoms remain binaries until an independently parsed actual BEAM
+  ;; supplies its matching module identity. These four tags are emitted by OTP;
+  ;; atom-cache references and all executable/capability tags refuse.
+  (let [tag (sdk_manifest_byte! bytes offset)
+        small? (or (erlang/== tag 119) (erlang/== tag 115))
+        utf8? (or (erlang/== tag 119) (erlang/== tag 118))
+        _ (when-not (or small? (erlang/== tag 118) (erlang/== tag 100))
+            (erlang/error :invalid_sdk_stage_cached_manifest))
+        length (if small? (sdk_manifest_byte! bytes (erlang/+ offset 1))
+                 (erlang/+ (erlang/bsl (sdk_manifest_byte! bytes (erlang/+ offset 1)) 8)
+                           (sdk_manifest_byte! bytes (erlang/+ offset 2))))
+        start (erlang/+ offset (if small? 2 3))
+        _ (when (erlang/> length 1024) (erlang/error :invalid_sdk_stage_cached_manifest))
+        encoded (sdk_manifest_slice! bytes start length)
+        name (if utf8? (unicode/characters_to_binary encoded :utf8 :utf8)
+                      (unicode/characters_to_binary encoded :latin1 :utf8))]
+    (when-not (erlang/is_binary name) (erlang/error :invalid_sdk_stage_cached_manifest))
+    (tuple name (erlang/+ start length))))
+(defn- sdk_manifest_module! [bytes offset]
+  (let [parsed (sdk_manifest_atom! bytes offset) name (elem parsed 0)]
+    (when-not (and (String/starts_with? name "Elixir.BeamLisp.")
+                   (erlang/not (String/contains? name "/")) (erlang/not (String/contains? name "\\"))
+                   (erlang/not (String/contains? name (erlang/list_to_binary (list 0)))))
+      (erlang/error :invalid_sdk_stage_cached_module_name))
+    parsed))
+(defn- sdk_manifest_modules! [bytes offset]
+  (when-not (erlang/== 108 (sdk_manifest_byte! bytes offset))
+    (erlang/error :invalid_sdk_stage_cached_manifest))
+  (let [count (sdk_manifest_u32! bytes (erlang/+ offset 1))]
+    (when-not (and (erlang/> count 0) (erlang/=< count 8192))
+      (erlang/error :invalid_sdk_stage_cached_manifest))
+    (loop [remaining count position (erlang/+ offset 5) names (list) seen {}]
+      (if (erlang/== remaining 0)
+        (do
+          (when-not (erlang/== 106 (sdk_manifest_byte! bytes position))
+            (erlang/error :invalid_sdk_stage_cached_manifest))
+          (tuple (Enum/reverse names) (erlang/+ position 1)))
+        (let [parsed (sdk_manifest_module! bytes position) name (elem parsed 0)]
+          (when (Map/has_key? seen name) (erlang/error :invalid_sdk_stage_cached_manifest))
+          (recur (erlang/- remaining 1) (elem parsed 1) (cons name names) (Map/put seen name true)))))))
+(defn- sdk_manifest_digests! [bytes offset]
+  (when-not (erlang/== 116 (sdk_manifest_byte! bytes offset))
+    (erlang/error :invalid_sdk_stage_cached_manifest))
+  (let [count (sdk_manifest_u32! bytes (erlang/+ offset 1))]
+    (when-not (and (erlang/> count 0) (erlang/=< count 8192))
+      (erlang/error :invalid_sdk_stage_cached_manifest))
+    (loop [remaining count position (erlang/+ offset 5) digests {}]
+      (if (erlang/== remaining 0) (tuple digests position)
+        (let [parsed (sdk_manifest_module! bytes position) name (elem parsed 0) next (elem parsed 1)]
+          (when-not (and (erlang/not (Map/has_key? digests name))
+                         (erlang/== 109 (sdk_manifest_byte! bytes next))
+                         (erlang/== 32 (sdk_manifest_u32! bytes (erlang/+ next 1))))
+            (erlang/error :invalid_sdk_stage_cached_manifest))
+          (recur (erlang/- remaining 1) (erlang/+ next 37)
+                 (Map/put digests name (sdk_manifest_slice! bytes (erlang/+ next 5) 32))))))))
+(defn- sdk_stage_manifest! [bytes]
+  ;; Store's ordinary v2 format is sufficient; compressed ETF, executable terms,
+  ;; arbitrary maps and unknown fields are not needed to restore declarations.
+  (when-not (and (erlang/is_binary bytes) (erlang/=< (erlang/byte_size bytes) 1048576)
+                 (erlang/== 131 (sdk_manifest_byte! bytes 0))
+                 (erlang/== 116 (sdk_manifest_byte! bytes 1))
+                 (erlang/== 3 (sdk_manifest_u32! bytes 2)))
+    (erlang/error :invalid_sdk_stage_cached_manifest))
+  (let [parsed
+        (loop [remaining 3 position 6 record {}]
+          (if (erlang/== remaining 0)
+            (do (when-not (erlang/== position (erlang/byte_size bytes))
+                  (erlang/error :invalid_sdk_stage_cached_manifest)) record)
+            (let [key (sdk_manifest_atom! bytes position) name (elem key 0) next (elem key 1)
+                  field (cond (erlang/== name "version") :version
+                              (erlang/== name "modules") :modules
+                              (erlang/== name "digests") :digests
+                              :else (erlang/error :invalid_sdk_stage_cached_manifest))]
+              (when (Map/has_key? record field) (erlang/error :invalid_sdk_stage_cached_manifest))
+              (let [value (cond
+                            (erlang/== field :modules) (sdk_manifest_modules! bytes next)
+                            (erlang/== field :digests) (sdk_manifest_digests! bytes next)
+                            :else
+                              (do (when-not (and (erlang/== 97 (sdk_manifest_byte! bytes next))
+                                                (erlang/== 2 (sdk_manifest_byte! bytes (erlang/+ next 1))))
+                                    (erlang/error :invalid_sdk_stage_cached_manifest))
+                                  (tuple 2 (erlang/+ next 2))))]
+                (recur (erlang/- remaining 1) (elem value 1) (Map/put record field (elem value 0)))))))]
+    (when-not (and (erlang/== 3 (erlang/map_size parsed))
+                   (erlang/== (Enum/sort (Map/get parsed :modules))
+                               (Enum/sort (Map/keys (Map/get parsed :digests)))))
+      (erlang/error :invalid_sdk_stage_cached_manifest))
+    parsed))
+
+; Compile-only cache admission. No ordinary cached loader or initializer API.
+(defn- sdk_stage_literal_definitions! [mod bytes]
+  (let [disassembly (beam_disasm/file bytes)
+        _ (when-not (and (erlang/is_tuple disassembly) (erlang/== 6 (erlang/tuple_size disassembly))
+                         (erlang/== :beam_file (elem disassembly 0)) (erlang/== mod (elem disassembly 1)))
+            (erlang/error :invalid_sdk_stage_cached_disassembly))
+        functions (elem disassembly 5)]
+    ;; Native code loading itself can execute on_load. Defer/init names are not
+    ;; sufficient: OTP removes the on_load attribute and emits an instruction.
+    (when (Enum/any? functions
+            (fn [function] (Enum/any? (elem function 4)
+              (fn [instruction]
+                (or (erlang/== :on_load instruction)
+                    (and (erlang/is_tuple instruction) (erlang/> (erlang/tuple_size instruction) 0)
+                         (erlang/== :on_load (elem instruction 0))))))))
+      (erlang/error :sdk_stage_cached_on_load_refused))
+    (let [definition (Enum/find functions
+                       (fn [function] (and (erlang/== :__bl_ns_defs__ (elem function 1))
+                                           (erlang/== 0 (elem function 2)))))]
+      (when definition
+        (let [instructions (Enum/reject (elem definition 4)
+                            (fn [instruction]
+                              (and (erlang/is_tuple instruction)
+                                   (Enum/member? (list :label :line :func_info) (elem instruction 0)))))
+              move (when (erlang/== 2 (erlang/length instructions)) (erlang/hd instructions))
+              operand (when (and (erlang/is_tuple move) (erlang/== 3 (erlang/tuple_size move)))
+                        (elem move 1))]
+          (when-not (and move (erlang/== :move (elem move 0))
+                         (erlang/== (tuple :x 0) (elem move 2))
+                         (erlang/== :return (List/last instructions))
+                         (erlang/is_tuple operand) (erlang/== 2 (erlang/tuple_size operand))
+                         (erlang/== :literal (elem operand 0)) (erlang/is_map (elem operand 1)))
+            (erlang/error :sdk_stage_cached_definition_not_literal))
+          (elem operand 1))))))
+
+(defn- sdk_stage_cached_unit [ns source content requested key closure out]
+  ;; Existing v2 cache format and provenance contract, without generic fetch's
+  ;; arbitrary ETF decoder. Names remain data until actual BEAM parsing proves
+  ;; module identity. Each native read consumes the shared remaining budget.
+  (try
+    (let [entry (BeamLisp.AOTCache/entry_dir key closure)
+          manifest (sdk_stage_manifest!
+                     (sdk_cache_read_bounded! (Path/join entry "manifest.term") 1048576))
+          shim (BeamLisp.Emit/module_for ns)
+          captured
+          (loop [names (Map/get manifest :modules) remaining 268435456 beams (list)]
+            (if (erlang/== names (list)) (Enum/reverse beams)
+              (let [name (erlang/hd names)
+                    bytes (sdk_cache_read_bounded! (Path/join entry (erlang/iolist_to_binary (list name ".beam")))
+                              (erlang/min remaining 33554432))
+                    _ (when-not (erlang/== (crypto/hash :sha256 bytes)
+                                            (Map/get (Map/get manifest :digests) name))
+                        (erlang/error :sdk_stage_cached_bytes_changed))
+                    chunks (beam_lib/chunks bytes (list :attributes))
+                    _ (when-not (and (erlang/is_tuple chunks) (erlang/== :ok (elem chunks 0)))
+                        (erlang/error :sdk_stage_cached_module_invalid))
+                    mod (elem (elem chunks 1) 0)
+                    attrs (Keyword/get (elem (elem chunks 1) 1) :attributes)]
+                (when-not (and (erlang/== name (Atom/to_string mod))
+                               (erlang/== ns (normalized_attribute attrs :bl_unit_namespace))
+                               (erlang/== key (normalized_attribute attrs :bl_compiler_key))
+                               (erlang/== closure (normalized_attribute attrs :bl_source_hash))
+                               (erlang/== (crypto/hash :sha256 content)
+                                           (normalized_attribute attrs :bl_unit_source_digest)))
+                  (erlang/error :sdk_stage_cached_source_changed))
+                (let [definitions (sdk_stage_literal_definitions! mod bytes)]
+                  (when (erlang/== mod shim)
+                    (when-not (and definitions
+                                   (BeamLisp.AOTCache/provenance_attributes_match? attrs key closure))
+                      (erlang/error :sdk_stage_cached_definitions_missing))))
+                (recur (erlang/tl names) (erlang/- remaining (erlang/byte_size bytes))
+                       (cons (tuple mod bytes) beams)))))
+          modules (Enum/map captured (fn [beam] (elem beam 0)))
+          _ (when-not (and (Enum/member? modules shim) (Enum/member? modules requested))
+              (erlang/error :invalid_sdk_stage_cached_members))
+          root (physical_sdk_path (BeamLisp.Tiers/priv_root))
+          entries (sdk_emission_entries! root source captured)
+          indexed (Map/new (Enum/map entries
+                    (fn [entry] (tuple (elem (elem entry 0) 1) (elem entry 1)))))
+          row (Map/get indexed shim)]
+      ;; One complete real emitting unit: omitted and extra modules both refuse.
+      (when-not (and row (erlang/== :mutable-forwarder (Map/get row :role))
+                     (erlang/== ns (Map/get row :forwarder-namespace))
+                     (erlang/== (Enum/sort modules)
+                       (Enum/sort (cons shim (Map/get row :unit-references)))))
+        (erlang/error :sdk_stage_cached_unit_mismatch))
+      (constructor_source_input! ns source content)
+      (when-not (and (erlang/== key (BeamLisp.AOTCache/key_for_ns ns))
+                     (erlang/== closure (ns_closure_hash ns)))
+        (erlang/error :sdk_stage_cached_closure_changed))
+      {:beams captured :entries entries :requested (Map/get indexed requested)
+       :content content :key key :closure closure})
+    (catch _error nil)))
+
+(defn- restore_sdk_staged_unit! [ns source prepared]
+  ;; Only the captured, fully validated batch reaches native publication. A
+  ;; publication refusal propagates; it is not a cache miss followed by effects.
+  ;; Preserve constructor staging's exact global/no-application-authority extent.
+  (let [previous (BeamLisp.Env/capture)
+        previous-attempt (Process/get :bl_initializer_attempt)
+        dirs (BeamLisp.Tiers/dirs)]
+    (BeamLisp.Loader/without_initialization
+      (fn [] (BeamLisp.Env/with_env :global
+        (fn []
+          (try
+            (BeamLisp.Env/bind (Map/merge (BeamLisp.Env/capture)
+                               {:generation nil :application-identity nil :admission nil :query-functions nil
+                                :loader-ambient dirs :loader-resolution (tuple dirs dirs (list))}))
+            (Process/delete :bl_initializer_attempt)
+            (let [result (BeamLisp.Env/with_namespace_lock ns
+                          (fn [] (BeamLisp.Env/with_publication ns
+                            (fn []
+                              (constructor_source_input! ns source (:content prepared))
+                              (when-not (and (erlang/== (:key prepared) (BeamLisp.AOTCache/key_for_ns ns))
+                                             (erlang/== (:closure prepared) (ns_closure_hash ns)))
+                                (erlang/error :sdk_stage_cached_closure_changed))
+                              (BeamLisp.Env/publish_binaries! (:beams prepared) source)
+                              (BeamLisp.Env/link_ns_defs ns (BeamLisp.Emit/module_for ns))
+                              (publish_sdk_emission_entries! (:entries prepared))))))]
+              (when (erlang/== :retired result) (erlang/error :scope_retired)))
+            (:requested prepared)
+            (finally
+              (BeamLisp.Env/bind previous)
+              (if previous-attempt (Process/put :bl_initializer_attempt previous-attempt)
+                (Process/delete :bl_initializer_attempt))))))))))
+
 (defn- stage_sdk_dependency! [ns source requested]
   ;; Never call repair_library here: its source path evaluates initializers.
   ;; Staging only materializes compiler declarations and a deferred initializer.
@@ -3926,7 +4185,12 @@
                 (when-not (and path root (String/starts_with? path (erlang/iolist_to_binary (list root "/"))))
                   (erlang/error (tuple :sdk_stage_dependency_outside_sdk target)))
                 (stage_sdk_dependency! target path (BeamLisp.Emit/module_for target)))))))
-      (let [beams (compile_source content (list (tuple :file source) (tuple :output_dir out)
+      (let [key (BeamLisp.AOTCache/key_for_ns ns)
+            closure (ns_closure_hash ns)
+            cached (sdk_stage_cached_unit ns source content requested key closure out)]
+       (if cached
+        (restore_sdk_staged_unit! ns source cached)
+        (let [beams (compile_source content (list (tuple :file source) (tuple :output_dir out)
                                                (tuple :stage-sdk? true)))
             modules (Enum/map beams (fn [beam] (elem beam 0)))
             row (source_sdk_receipt requested)]
@@ -3935,9 +4199,8 @@
           (erlang/error (tuple :sdk_staged_dependency_not_produced ns requested)))
         ;; Cache publication is only an optimization; emitted code and receipts
         ;; remain authoritative. Namespace readiness is deliberately not marked.
-        (BeamLisp.AOTCache/store (BeamLisp.AOTCache/compiler_key) (ns_closure_hash ns)
-          out modules (ns_closure_hash ns))
-        row)
+        (BeamLisp.AOTCache/store key closure out modules closure)
+        row)))
       (finally (File/rm_rf out))))
     (finally (Process/put :bl_sdk_staging_units active)))))
 
