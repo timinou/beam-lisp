@@ -3850,3 +3850,434 @@
            (erlang/module_loaded mod) (erlang/== (Map/get row :md5) (erlang/apply mod :module_info (list :md5)))
            (BeamLisp.Env/sdk_runtime_retained_modules? (list mod))))
     (catch _ false)))
+
+
+; ── bounded compiler-constructor interpretation ───────────────────────────
+; This is a data-only engine. SDK source ownership is authenticated separately
+; by declaration staging; supplying ANF does not grant native execution authority.
+
+(defn- constructor_refuse [detail]
+ (throw (ex-info "Bounded constructor interpretation refused"
+                 {:kind :constructor-machine-refused :detail detail})))
+(defn- constructor_counter! [state field delta]
+ (let [key (:counter-frame state) counters (erlang/get key)]
+  (when-not (and (erlang/is_map counters) (erlang/is_map_key field counters))
+   (constructor_refuse :missing-counter-frame))
+  (let [next (+ (erlang/map_get field counters) delta)]
+   (erlang/put key (maps/put field next counters)) next)))
+(defn- constructor_step! [state]
+ (when (neg? (constructor_counter! state :remaining -1)) (constructor_refuse :step-budget)))
+
+(defn- constructor_internal_cost! [value state]
+ ;; No protocol/Enumerable/callback inspection. Fn values are interpreter-owned
+ ;; internal capabilities; source literal/input endpoints reject them. Captured
+ ;; environments are charged independently when each capability is constructed.
+ (loop [pending (list (tuple value 0)) nodes 0 bytes 0]
+  (if (= (list) pending) {:nodes nodes :bytes bytes}
+   (let [task (erlang/hd pending) v (elem task 0) depth (elem task 1)
+         rest-tasks (erlang/tl pending) nodes (inc nodes)
+         bytes (+ bytes (cond (erlang/is_binary v) (erlang/byte_size v)
+                               (erlang/is_number v) (erlang/external_size v)
+                               (erlang/is_atom v) (erlang/byte_size (erlang/atom_to_binary v :utf8))
+                               :else 0))]
+    (constructor_step! state)
+    (when (> depth 128) (constructor_refuse :data-depth-budget))
+    (when (> nodes 65536) (constructor_refuse :aggregate-node-budget))
+    (when (> bytes 1048576) (constructor_refuse :aggregate-byte-budget))
+    (cond
+     (or (erlang/is_atom v) (erlang/is_number v) (erlang/is_binary v) (erlang/is_function v))
+      (recur rest-tasks nodes bytes)
+     (erlang/is_list v)
+      (if (= (list) v) (recur rest-tasks nodes bytes)
+       (recur (cons (tuple (erlang/hd v) (inc depth))
+                    (cons (tuple (erlang/tl v) depth) rest-tasks)) nodes bytes))
+     (erlang/is_tuple v)
+      (do (when (> (erlang/tuple_size v) 65536) (constructor_refuse :aggregate-node-budget))
+          (recur (Enum/reduce (erlang/tuple_to_list v) rest-tasks
+                   (fn [item acc] (cons (tuple item (inc depth)) acc))) nodes bytes))
+     (erlang/is_map v)
+      (do (when (> (erlang/map_size v) 65536) (constructor_refuse :aggregate-node-budget))
+          (recur (Enum/reduce (maps/to_list v) rest-tasks
+                   (fn [pair acc]
+                    (cons (tuple (elem pair 0) (inc depth))
+                          (cons (tuple (elem pair 1) (inc depth)) acc)))) nodes bytes))
+     :else (constructor_refuse :opaque-internal-value))))))
+
+(defn- constructor_charge! [value state]
+ (let [cost (constructor_internal_cost! value state)]
+  (when (neg? (constructor_counter! state :allocation-nodes (- (:nodes cost)))) (constructor_refuse :allocation-node-budget))
+  (when (neg? (constructor_counter! state :allocation-bytes (- (:bytes cost)))) (constructor_refuse :allocation-byte-budget))))
+
+(defn- constructor_allocation! [nodes bytes state]
+ (when (neg? (constructor_counter! state :allocation-nodes (- nodes))) (constructor_refuse :allocation-node-budget))
+ (when (neg? (constructor_counter! state :allocation-bytes (- bytes))) (constructor_refuse :allocation-byte-budget)))
+
+(defn- constructor_keyword! [args state]
+ (when-not (contains? #{1 2} (count args)) (constructor_refuse :keyword-arity))
+ (if (and (= 1 (count args)) (keyword? (first args))) (first args)
+  (let [namespace (when (= 2 (count args)) (name (first args)))
+        value (if (= 2 (count args)) (name (second args))
+                (let [v (first args)] (if (symbol? v) (elem v 1) (str v))))
+        token (if namespace (str namespace "/" value) value)]
+   (when-not (and (erlang/is_binary token) (<= (erlang/byte_size token) 255))
+    (constructor_refuse :keyword-name-budget))
+   (try (String/to_existing_atom token)
+    (catch Elixir.ArgumentError _
+     ;; Existing names are free. New names consume a small per-constructor
+     ;; allowance BEFORE intern and the VM-wide guard is checked every time.
+     (when (neg? (constructor_counter! state :new-atoms -1)) (constructor_refuse :new-atom-budget))
+     (BeamLisp.AtomGuard/check! token)
+     (BeamLisp.AtomGuard/to_atom token))))))
+
+(defn- constructor_bounded_map! [f sources state]
+ (let [rows (Enum/zip sources)]
+  (loop [remaining rows output (list) nodes 1 bytes 0]
+   (if (= (list) remaining) (Enum/reverse output)
+    (let [value (f (erlang/tuple_to_list (erlang/hd remaining)))
+          cost (constructor_internal_cost! value state) nodes (+ nodes (:nodes cost) 1) bytes (+ bytes (:bytes cost))]
+     ;; Check the next prefix before retaining it; at most one individually
+     ;; bounded callback result exists outside the bounded prefix.
+     (when (> nodes 65536) (constructor_refuse :aggregate-node-budget))
+     (when (> bytes 1048576) (constructor_refuse :aggregate-byte-budget))
+     (recur (erlang/tl remaining) (cons value output) nodes bytes))))))
+(defn- constructor_sequence! [value]
+ (cond (nil? value) (list) (erlang/is_list value) value
+       (vector? value) (BeamLisp.Vector/to_list value)
+       (set? value) (BeamLisp.Set/to_list value)
+       (and (map? value) (not (contains? value :__struct__)))
+        (Enum/map (Map/to_list value) (fn [pair] [(elem pair 0) (elem pair 1)]))
+       :else (constructor_refuse :opaque-sequence)))
+(defn- constructor_bounded_result! [state value]
+ (when (and (or (erlang/is_number value) (erlang/is_binary value))
+             (> (erlang/external_size value) 1048576)) (constructor_refuse :scalar-size-budget))
+ (when (and (or (erlang/is_list value) (vector? value) (map? value))
+             (> (count value) (:max-collection state))) (constructor_refuse :collection-budget))
+ (constructor_internal_cost! value state) value)
+
+
+;; ── actual ANF, with a closed effect-denying primitive boundary ───────────
+;; Named source callbacks are interpreted from compiler metadata. Only the
+;; reviewed pure adapters below may call native functions; arbitrary host Fn
+;; values are rejected at the data boundary and never fetched from a registry.
+
+(declare constructor_interpret)
+(declare constructor_primitive)
+
+(defn- constructor_truthy? [v] (and (not (nil? v)) (not (= false v))))
+
+(defn- constructor_pmatch
+  "Match value `v` against pattern `p`, extending bindings `b` (a map) or
+   returning :nomatch. Mirrors Core/Erlang clause semantics."
+  [p v b state]
+  (cond
+    (= :nomatch b) :nomatch
+    :else
+      (let [_ (constructor_step! state) op (:pop p)]
+        (cond
+          (= op :pvar) (if (contains? b (:name p))
+                            (if (erlang/=:= (get b (:name p)) v) b :nomatch)
+                            (assoc b (:name p) v))
+          (= op :plit) (if (erlang/=:= (:val p) v) b :nomatch)
+          (= op :pnil) (if (and (erlang/is_list v) (= (list) v)) b :nomatch)
+          (= op :palias) (constructor_pmatch (:b p) v (constructor_pmatch (:a p) v b state) state)
+          (= op :ptuple)
+            (if (and (tuple? v) (= (count (:elems p)) (tuple-size v)))
+              (reduce (fn [acc [i pe]] (constructor_pmatch pe (elem v i) acc state))
+                      b (map-indexed (fn [i pe] [i pe]) (:elems p)))
+              :nomatch)
+          (= op :pcons)
+            (if (and (erlang/is_list v) (not (empty? v)))
+              (constructor_pmatch (:tail p) (rest v) (constructor_pmatch (:head p) (first v) b state) state)
+              :nomatch)
+          (= op :pmap)
+            (if (map? v)
+              (reduce (fn [acc [k pe]]
+                        (if (= :nomatch acc) :nomatch
+                          (if (contains? v k) (constructor_pmatch pe (get v k) acc state) :nomatch)))
+                      b (:pairs p))
+              :nomatch)
+          (= op :pstruct)
+            (if (and (map? v) (= (:mod p) (get v :__struct__)))
+              (reduce (fn [acc [k pe]] (constructor_pmatch pe (get v k) acc state)) b (:fields p))
+              :nomatch)
+          :else :nomatch))))
+
+(defn- constructor_match_clauses
+  "Try each clause against args (a list of values); run the first whose
+   patterns match AND whose guard is truthy. `on-fail` is called with no args."
+  [clauses args env on-fail state]
+  (let [hit (Enum/find_value clauses
+              (fn [cl]
+               (let [bound (if (= (count (:pats cl)) (count args))
+                             (Enum/reduce (Enum/zip (:pats cl) args) {}
+                               (fn [pair acc] (constructor_pmatch (elem pair 0) (elem pair 1) acc state))) :nomatch)
+                     b (when-not (= :nomatch bound) (Map/merge env bound))]
+                (when (and b (or (nil? (:guard cl)) (constructor_truthy? (constructor_interpret (:guard cl) b state))))
+                 [cl b]))))]
+    (if (nil? hit) (on-fail) (constructor_interpret (:body (first hit)) (second hit) state))))
+
+(defn- constructor_invoke [function args]
+ (cond (erlang/is_function function) (erlang/apply function args)
+       (and (erlang/is_tuple function) (= 3 (erlang/tuple_size function))
+            (= :"$blfn" (elem function 0)))
+        (if-let [fixed (get (elem function 1) (count args))]
+         (constructor_invoke fixed args)
+         (let [variadic (elem function 2)]
+          (when-not (and (erlang/is_tuple variadic) (= 2 (erlang/tuple_size variadic))
+                         (int? (elem variadic 0)) (>= (count args) (elem variadic 0)))
+           (constructor_refuse :callable-arity))
+          (constructor_invoke (elem variadic 1)
+           (erlang/++ (Enum/take args (elem variadic 0))
+                      (list (Enum/drop args (elem variadic 0)))))))
+       (keyword? function) (if (contains? #{1 2} (count args))
+                             (BeamLisp.Ns.Rt/get (first args) function (second args))
+                             (constructor_refuse :keyword-arity))
+       (map? function) (if (contains? #{1 2} (count args))
+                         (BeamLisp.Ns.Rt/get function (first args) (second args))
+                         (constructor_refuse :map-arity))
+       (vector? function) (if (= 1 (count args)) (BeamLisp.Vector/nth function (first args))
+                             (constructor_refuse :vector-arity))
+       :else (constructor_refuse :not-interpreted-callable)))
+
+(defn- constructor_primitive [module function args state]
+ (let [target [module function (count args)]
+       pure-bifs #{[:erlang :== 2] [:erlang :=:= 2] [:erlang :/= 2] [:erlang :=/= 2]
+         [:erlang :< 2] [:erlang :> 2] [:erlang :=< 2] [:erlang :>= 2]
+         [:erlang :+ 2] [:erlang :- 2] [:erlang :* 2] [:erlang :div 2] [:erlang :rem 2]
+         [:erlang :is_atom 1] [:erlang :is_binary 1] [:erlang :is_integer 1]
+         [:erlang :is_number 1] [:erlang :is_list 1] [:erlang :is_map 1] [:erlang :is_tuple 1]
+         [:erlang :tuple_size 1] [:erlang :map_size 1] [:erlang :length 1]
+         [:erlang :element 2] [:erlang :hd 1] [:erlang :tl 1]
+         [:erlang :tuple_to_list 1] [:erlang :list_to_tuple 1]}
+       primitive-name (Atom/to_string function) rest? (String/ends_with? primitive-name "__bl_v")
+       primitive-name (if rest? (String/replace_suffix primitive-name "__bl_v" "") primitive-name)
+       args (if rest? (let [fixed (Enum/drop args -1) tail (last args)]
+                        (erlang/++ fixed (constructor_sequence! tail))) args)]
+  (constructor_step! state)
+  ;; Refuse excessive combined inputs before any native allocation primitive.
+  (constructor_internal_cost! args state)
+  (when (and (= module :Elixir.BeamLisp.Ns.Core)
+             (contains? #{"concat" "map" "mapv" "mapcat" "vec" "vector" "list" "into"
+                          "assoc" "dissoc" "conj" "hash-map" "merge" "set" "str" "join"}
+                        primitive-name))
+   (constructor_charge! args state))
+  (constructor_bounded_result! state
+  (cond
+   (contains? pure-bifs target) (erlang/apply module function args)
+   (= module :Elixir.BeamLisp.Ns.Core)
+    (case primitive-name
+     "identity" (first args) "not" (not (constructor_truthy? (first args)))
+     "nil?" (nil? (first args)) "some?" (some? (first args))
+     "list?" (erlang/is_list (first args)) "vector?" (vector? (first args))
+     "map?" (map? (first args)) "set?" (set? (first args))
+     "symbol?" (symbol? (first args)) "keyword?" (keyword? (first args))
+     "string?" (string? (first args)) "int?" (int? (first args))
+     "=" (apply = args) "not=" (apply not= args)
+     "inc" (inc (first args)) "dec" (dec (first args))
+     "first" (first (constructor_sequence! (first args))) "second" (second (constructor_sequence! (first args)))
+     "rest" (rest (constructor_sequence! (first args))) "last" (last (constructor_sequence! (first args)))
+     "nth" (nth (first args) (second args) (nth args 2 nil))
+     "count" (count (first args)) "empty?" (empty? (constructor_sequence! (first args)))
+     "seq" (seq (constructor_sequence! (first args))) "vec" (vec (constructor_sequence! (first args)))
+     "to-list" (constructor_sequence! (first args)) "list" args "vector" (vec args)
+     "cons" (cons (first args) (constructor_sequence! (second args)))
+     "concat" (let [items (Enum/map args (fn [item] (constructor_sequence! item)))
+                      size (Enum/reduce items 0 (fn [item total]
+                             (let [n (+ total (count item))]
+                              (when (> n (:max-collection state)) (constructor_refuse :collection-budget)) n)))]
+                 (Enum/flat_map items (fn [item] item)))
+     "take" (Enum/take (constructor_sequence! (second args)) (first args))
+     "drop" (Enum/drop (constructor_sequence! (second args)) (first args))
+     "get" (BeamLisp.Ns.Rt/get (first args) (second args) (nth args 2 nil))
+     "contains?" (contains? (first args) (second args))
+     "keys" (Map/keys (first args)) "vals" (Map/values (first args))
+     "assoc" (apply assoc args) "dissoc" (apply dissoc args)
+     "conj" (apply conj args) "hash-map" (apply hash-map args)
+     "merge" (Enum/reduce args {} (fn [item acc] (Map/merge acc item)))
+     "str" (do (BeamLisp.CompilerData/check_first_order! args) (apply str args))
+     "name" (name (first args)) "symbol" (apply symbol args) "keyword" (constructor_keyword! args state)
+     "fn?" (or (erlang/is_function (first args))
+                (and (erlang/is_tuple (first args)) (= 3 (erlang/tuple_size (first args)))
+                     (= :"$blfn" (elem (first args) 0))))
+     "into" (Enum/reduce (constructor_sequence! (second args)) (first args) (fn [item acc] (conj acc item)))
+     "set" (BeamLisp.Set/new (constructor_sequence! (first args)))
+     "mapcat" (let [f (first args) sources (Enum/map (rest args) (fn [item] (constructor_sequence! item)))
+                    values (constructor_bounded_map! (fn [arguments] (constructor_sequence! (constructor_invoke f arguments))) sources state)]
+                 (constructor_primitive :Elixir.BeamLisp.Ns.Core :concat__bl_v (list values) state))
+     "map" (let [f (first args) sources (Enum/map (rest args) (fn [item] (constructor_sequence! item)))]
+              (constructor_bounded_map! (fn [arguments] (constructor_invoke f arguments)) sources state))
+     "mapv" (let [f (first args) sources (Enum/map (rest args) (fn [item] (constructor_sequence! item)))]
+               (vec (constructor_bounded_map! (fn [arguments] (constructor_invoke f arguments)) sources state)))
+     "filter" (Enum/filter (constructor_sequence! (second args)) #(constructor_truthy? (constructor_invoke (first args) (list %))))
+     "remove" (Enum/reject (constructor_sequence! (second args)) #(constructor_truthy? (constructor_invoke (first args) (list %))))
+     "run!" (do (Enum/each (constructor_sequence! (second args)) #(constructor_invoke (first args) (list %))) nil)
+     "join" (let [separator (first args) items (constructor_sequence! (second args))]
+               ;; A repeated separator can allocate far more than the aggregate
+               ;; input. Prove the exact supported string output before join.
+               (when-not (and (erlang/is_binary separator)
+                              (Enum/all? items (fn [item] (erlang/is_binary item))))
+                (constructor_refuse :join-string-domain))
+               (let [size (+ (Enum/reduce items 0 (fn [item n] (+ n (erlang/byte_size item))))
+                             (* (erlang/max 0 (dec (count items))) (erlang/byte_size separator)))]
+                (when (> size 1048576) (constructor_refuse :aggregate-byte-budget))
+                (constructor_allocation! 1 size state)
+                (Enum/join items separator)))
+     "some" (Enum/find_value (constructor_sequence! (second args)) #(constructor_invoke (first args) (list %)))
+     "every?" (Enum/all? (constructor_sequence! (second args)) #(constructor_truthy? (constructor_invoke (first args) (list %))))
+     "reduce" (if (= 3 (count args))
+                  (Enum/reduce (constructor_sequence! (nth args 2)) (second args)
+                    (fn [item acc] (constructor_invoke (first args) (list acc item))))
+                  (let [items (constructor_sequence! (second args))]
+                   (if (seq items)
+                    (Enum/reduce (rest items) (first items)
+                     (fn [item acc] (constructor_invoke (first args) (list acc item))))
+                    (constructor_invoke (first args) (list)))))
+     "apply" (constructor_invoke (first args)
+               (erlang/++ (Enum/drop (rest args) -1) (constructor_sequence! (last args))))
+     (constructor_refuse {:primitive target}))
+   (and (= module :Elixir.BeamLisp.Ns.Rt)
+        (contains? #{:first :rest :nth :count :take :drop_clj :seq :empty? :list?
+                     :eqv :not_ :assoc :conj :contains? :map :set :vector? :symbol?
+                     :str_v :fn? :keyword? :map? :cons} function))
+    (let [renamed (get {:drop_clj :drop :eqv := :not_ :not :str_v :str__bl_v} function function)]
+     (constructor_primitive :Elixir.BeamLisp.Ns.Core renamed args state))
+   (= target [:Elixir.BeamLisp.Server :callback 1])
+    (BeamLisp.Server/callback (first args))
+   (= target [:Elixir.BeamLisp.Ns.Rt :invoke 2]) (constructor_invoke (first args) (constructor_sequence! (second args)))
+   (= target [:Elixir.BeamLisp.Ns.Rt :hash_key 1]) (BeamLisp.Ns.Rt/hash_key (first args))
+   (contains? #{[:Elixir.BeamLisp.Ns.Rt :get 2] [:Elixir.BeamLisp.Ns.Rt :get 3]} target)
+    (BeamLisp.Ns.Rt/get (first args) (second args) (nth args 2 nil))
+   (= target [:Elixir.BeamLisp.Ns.Rt :splice 2])
+    (erlang/++ (constructor_sequence! (first args)) (constructor_sequence! (second args)))
+   (= target [:Elixir.BeamLisp.Vector :new 1]) (vec (constructor_sequence! (first args)))
+   :else (constructor_refuse {:remote target})))))
+
+(defn- constructor_pure_core_names []
+ #{"identity" "not" "nil?" "some?" "list?" "vector?" "map?" "set?"
+   "symbol?" "keyword?" "string?" "int?" "=" "not=" "inc" "dec" "first"
+   "second" "rest" "last" "nth" "count" "empty?" "seq" "vec" "to-list"
+   "list" "vector" "cons" "concat" "take" "drop" "get" "contains?" "keys"
+   "vals" "assoc" "dissoc" "conj" "hash-map" "merge" "str" "name" "symbol"
+   "keyword" "fn?" "into" "set" "mapcat" "map" "mapv" "filter" "remove"
+   "some" "every?" "reduce" "apply" "run!" "join"})
+
+(defn constructor_interpret
+ "Effect-denying, bounded actual-ANF interpreter. Caller
+  supplies only compiler metadata; it supplies no runtime callback/host grant.
+  Native execution is restricted to the closed pure primitive dispatch above."
+ [n env state]
+ (constructor_step! state)
+ (when (> (constructor_counter! state :depth 1) 512) (constructor_refuse :depth-budget))
+ (try
+ (let [value
+  (case (:op n)
+   :lit (do (BeamLisp.CompilerData/check_first_order! (:val n)) (:val n))
+   :var (if (contains? env (:name n)) (get env (:name n)) (constructor_refuse :unbound-local))
+   :global (let [key [(:ns n) (:name n)]
+                 alias (when-not (= :exact (:lookup n)) (get (:global-aliases state) key))]
+             (cond
+              (contains? (:globals state) key) (constructor_interpret (get (:globals state) key) {} state)
+              alias (constructor_interpret {:op :global :ns (first alias) :name (second alias) :lookup :exact} {} state)
+              (and (= "core" (:ns n)) (contains? (constructor_pure_core_names) (:name n)))
+               (fn [& arguments]
+                (constructor_primitive :Elixir.BeamLisp.Ns.Core (erlang/binary_to_atom (:name n))
+                           (to-list arguments) state))
+              :else (constructor_refuse {:global key})))
+   :remote (let [args (Enum/map (:args n) #(constructor_interpret % env state))
+                 target [(:mod n) (:fun n) (count args)]]
+             (if-let [entry (get (:remotes state) target)]
+              (constructor_invoke (constructor_interpret {:op :fn :clauses (:clauses entry)} {} state) args)
+              (constructor_primitive (:mod n) (:fun n) args state)))
+   :arith (let [args (Enum/map (:args n) #(constructor_interpret % env state))]
+            (when-not (Enum/all? args (fn [item] (erlang/is_number item))) (constructor_refuse :non-numeric-arithmetic))
+            (constructor_primitive :erlang (:bif n) args state))
+   :apply (constructor_invoke (constructor_interpret (:fn n) env state) (Enum/map (:args n) #(constructor_interpret % env state)))
+   :let (constructor_interpret (:body n) (assoc env (:name n) (constructor_interpret (:init n) env state)) state)
+   :if (constructor_interpret (if (constructor_truthy? (constructor_interpret (:test n) env state)) (:then n) (:else n)) env state)
+   :do (Enum/reduce (:stmts n) nil (fn [item _] (constructor_interpret item env state)))
+   :tuple (do (constructor_allocation! (inc (count (:elems n))) 0 state)
+              (erlang/list_to_tuple (Enum/map (:elems n) #(constructor_interpret % env state))))
+   :map (do (constructor_allocation! (+ 8 (* 8 (count (:pairs n)))) 0 state)
+         (Enum/reduce (:pairs n) {}
+          (fn [[k v] acc] (Map/put acc (constructor_interpret k env state) (constructor_interpret v env state)))))
+   :enil (list)
+   :cons (do (constructor_allocation! 2 0 state)
+             (cons (constructor_interpret (:head n) env state) (constructor_sequence! (constructor_interpret (:tail n) env state))))
+   :struct (if (and (= :Elixir.BeamLisp.Vector (:mod n)) (= 1 (count (:fields n))))
+             (let [[k v] (first (:fields n)) key (constructor_interpret k env state) value (constructor_interpret v env state)]
+              (when-not (and (= :items key) (erlang/is_tuple value)) (constructor_refuse :vector-scaffold))
+              (BeamLisp.Vector/new (erlang/tuple_to_list value)))
+             (constructor_refuse :opaque-struct))
+   :case (constructor_match_clauses (:clauses n) (list (constructor_interpret (:subj n) env state)) env
+            (fn [] (constructor_refuse :case-clause)) state)
+   :fn (let [_ (constructor_charge! env state) clauses (:clauses n) arity (count (:pats (first clauses)))
+             run (fn [args] (constructor_match_clauses clauses args env (fn [] (constructor_refuse :function-clause)) state))]
+         (case arity
+          0 (fn [] (run (list))) 1 (fn [a] (run (list a)))
+          2 (fn [a b] (run (list a b))) 3 (fn [a b c] (run (list a b c)))
+          4 (fn [a b c d] (run (list a b c d)))
+          5 (fn [a b c d e] (run (list a b c d e)))
+          6 (fn [a b c d e f] (run (list a b c d e f)))
+          7 (fn [a b c d e f g] (run (list a b c d e f g)))
+          8 (fn [a b c d e f g h] (run (list a b c d e f g h)))
+          (constructor_refuse :function-arity)))
+   (constructor_refuse {:operation (:op n)}))]
+  ;; An intermediate list tail or borrowed variable is already accounted for
+  ;; by its allocation site. Rewalking every growing cons prefix is quadratic
+  ;; and consumes the fuel before the actual aggregate admission boundary.
+  ;; Full raw shape/cost checks remain at primitive inputs/results, closure
+  ;; capture and final first-order output. Scalar operations are bounded here.
+  (when (and (or (erlang/is_number value) (erlang/is_binary value))
+             (> (erlang/external_size value) 1048576)) (constructor_refuse :scalar-size-budget))
+  value)
+ (finally (constructor_counter! state :depth -1))))
+
+(defn interpret_constructor!
+ [expression locals metadata]
+ (BeamLisp.CompilerData/check_first_order! locals)
+ (let [key (tuple :constructor-machine-frame (erlang/make_ref))
+       state (merge metadata {:counter-frame key :max-collection 16384})]
+  (erlang/put key {:remaining 1000000 :depth 0 :allocation-nodes 1000000 :allocation-bytes 16777216 :new-atoms 64})
+  (try
+   (let [result (constructor_interpret expression locals state)]
+    (BeamLisp.CompilerData/check_first_order! result) result)
+   (finally (erlang/erase key)))))
+
+(defn constructor_metadata [definitions values]
+ (reduce
+  (fn [metadata [namespace bindings]]
+   (reduce
+    (fn [metadata [binding entries]]
+     (let [grouped (group-by (fn [entry] [(elem entry 2) (count (:params (elem entry 3)))]) entries)
+           clauses (fn [items] (to-list (mapv (fn [entry]
+                      (let [node (elem entry 3)]
+                       {:pats (:params node) :guard (:guard node) :body (:body node)})) items)))
+           remotes (reduce (fn [out [[fname arity] items]]
+                     (let [value {:clauses (clauses items)}
+                           shim (BeamLisp.Emit/module_for namespace)
+                           body (elem (first items) 4)]
+                      (assoc out [shim fname arity] value [body fname arity] value)))
+                    (:remotes metadata) grouped)
+           fixed (reduce (fn [out [key items]]
+                    (let [entry (first items)]
+                     (if (= :fixed (elem entry 0))
+                      (conj out [{:op :lit :val (elem entry 1)}
+                                 {:op :fn :clauses (clauses items)}]) out))) [] grouped)
+           variadic (first (filter (fn [[_ items]] (= :variadic (elem (first items) 0))) grouped))
+           rest-node (if variadic
+                       {:op :tuple :elems [{:op :lit :val (elem (first (second variadic)) 1)}
+                                          {:op :fn :clauses (clauses (second variadic))}]}
+                       {:op :lit :val nil})
+           value {:op :tuple :elems [{:op :lit :val :"$blfn"}
+                                    {:op :map :pairs (to-list fixed)} rest-node]}]
+      (-> metadata (assoc :remotes remotes) (assoc-in [:globals [namespace binding]] value))))
+    metadata bindings))
+  {:remotes {} :globals values} definitions))
+
+(defn constructor_call!
+ ([definitions values namespace binding arguments]
+  (constructor_call! definitions values {} namespace binding arguments))
+ ([definitions values aliases namespace binding arguments]
+ (interpret_constructor! {:op :apply :fn {:op :global :ns namespace :name binding}
+        :args (to-list (mapv #(hash-map :op :lit :val %) arguments))}
+       {} (assoc (constructor_metadata definitions values) :global-aliases aliases))))
