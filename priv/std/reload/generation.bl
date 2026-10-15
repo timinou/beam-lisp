@@ -14,6 +14,9 @@
            [lower :as lower] [reload.runtime :as reload]))
 
 (def ^:private prepared (atom {}))
+;; Compact SDK-issued native outcomes, never reachable graph.state flags. At
+;; most the existing256 node-lifetime preparations can leave a tombstone.
+(def ^:private native-retirements (atom {}))
 (def ^:private forbidden
  #{"eval" "resolve" "ns-resolve" "find-var" "load-file" "load-string"
    "require" "in-ns" "intern" "alter-var-root" "with-redefs" "syntax-quote"
@@ -1277,34 +1280,185 @@
      #(BeamLisp.AOT/sdk_named_constructor! "proc.queue-family-root" operation 1))]
    (f generation))))
 
+(defn- retirement-key [generation]
+ ;; A plan cache key is reused after successful retirement. Bind each native
+ ;; outcome to that preparation's unique scope, so later instances stay separate.
+ [(:cache-key generation) (:scope generation)])
+
+(defn- retirement-identity [generation]
+ {:cache-key (:cache-key generation) :scope (:scope generation)
+  :digest (:digest generation) :application-id (:application-id generation)
+  :modules (vec (sort (:modules generation)))})
+
+(defn native-retirement-outcome
+ "Observe an exact SDK-private retirement result. nil means no actual native
+  success was recorded. Mutable graph state, caller flags or a copied scope
+  never create this record. A completed tombstone retains only immutable graph
+  identity/module names, not callbacks/runtime cells/Conn handles. Observation
+  grants no execution or resource custody; the fixed SDK consumer checks its
+  own private issued graph/resource association independently."
+ [generation]
+ (let [saved (get @native-retirements (retirement-key generation))
+       original (get @prepared (:cache-key generation))]
+  (if-not saved
+   (do
+    ;; A genuine newly prepared instance sharing a completed plan key has no
+    ;; outcome yet. Edited/unknown instances cannot borrow earlier proof.
+    (when (and (not (erlang/== original generation))
+               (some (fn [[_ record]]
+                        (= (:cache-key generation) (get-in record [:identity :cache-key])))
+                     @native-retirements))
+     (refuse! :unattested-retirement-outcome {}))
+    nil)
+   (do
+    (when-not (= (:identity saved) (retirement-identity generation))
+     (refuse! :unattested-retirement-outcome {}))
+    ;; An unrelated later preparation under the same plan key does not erase
+    ;; this original compact result. Pending cleanup keeps its own original.
+    (when (and original (= (:scope original) (:scope generation))
+               (not (erlang/== original generation)))
+     (refuse! :unattested-retirement-outcome {}))
+    (when (:native-retired saved)
+     {:status :native-retired :identity (:identity saved)
+      :phase (:phase saved) :pending (:pending saved)})))))
+
+(defn- retirement-module-md5 [module]
+ ;; Inspect actual loaded code; never load a missing module from the code path.
+ (when (erlang/module_loaded module)
+  (erlang/apply module :module_info (list :md5))))
+
+(defn- reserve-native-retirement! [generation modules]
+ ;; Called only under the sorted full native module locks, after exact private
+ ;; preparation attestation. Capture actual code BEFORE irreversible deletion.
+ (let [key (retirement-key generation) identity (retirement-identity generation)
+       live-names (vec (sort (vals (:mapping generation))))
+       prior (get @native-retirements key)]
+  (if prior
+   (do
+    (when-not (and (= identity (:identity prior))
+                  (= :reserved (:phase prior)) (= false (:native-retired prior))
+                  (= (vec modules) (mapv first (:module-md5s prior))))
+     (refuse! :unattested-retirement-outcome {}))
+    ;; Missing code is only a partial-attempt observation anchored to THIS
+    ;; private reservation. Loaded code must still match the original snapshot.
+    ;; Neither observation issues proof: retry must get actual native true.
+    (doseq [[module expected] (:module-md5s prior)]
+     (when-let [actual (retirement-module-md5 module)]
+      (when-not (= expected actual)
+       (refuse! :native-retirement-code-changed {:module module}))))
+    prior)
+   (let [module-md5s
+          (mapv (fn [module]
+                  (let [actual (retirement-module-md5 module)]
+                   (when-not actual
+                    (refuse! :missing-native-retirement-module {:module module}))
+                   [module actual])) modules)
+         record {:identity identity :native-retired false :phase :reserved :pending []
+                 :live-names live-names :module-md5s module-md5s}]
+    (swap! native-retirements
+     (fn [all]
+      (when (>= (count all) 256) (refuse! :retirement-outcome-capacity {}))
+      (assoc all key record)))
+    record))))
+
+(defn- attempt-native-retirement! [generation]
+ ;; Cache/admission lock is already held. Env locks are sorted and reentrant,
+ ;; so its full native retirement runs inside this same identity-check extent.
+ (let [modules (to-list (sort (:modules generation)))]
+  (BeamLisp.Env/with_module_locks modules
+   (fn []
+    (attested-prepared! generation true)
+    (reserve-native-retirement! generation modules)
+    (if (= true (BeamLisp.Env/retire_modules! modules))
+     (do
+      ;; ONLY this actual native-success edge issues the proof. No application
+      ;; callback, reachable Atom, module absence or caller-supplied receipt.
+      (swap! native-retirements update (retirement-key generation) assoc
+        :native-retired true :phase :cleanup-pending
+        :pending [:queue-root :conn-retention :scope])
+      true)
+     false)))))
+
+(defn- conn-retirement [generation]
+ ;; Optional exact SDK producer receipt; no supplied callback or eager import.
+ (when (env/with-env :global #(BeamLisp.Env/loaded_ns? "reload.conn-retention"))
+  (let [f (env/with-env :global
+            #(BeamLisp.AOT/sdk_named_constructor! "reload.conn-retention" "release-retired!" 1))]
+   (f generation))))
+
+(defn- retirement-step! [generation stage action]
+ (let [key (retirement-key generation)]
+  (if-not (some #(= stage %) (:pending (get @native-retirements key))) true
+   (let [result (action)]
+    (if (or (= :waiting result) (= :waiting (:status result))) false
+     (do (when-not (or (nil? result) (contains? #{:ok :released :absent :destroyed} result))
+           (refuse! :unclassified-retirement-cleanup {}))
+      (swap! native-retirements update key
+        (fn [record] (update record :pending (fn [steps] (vec (remove #(= stage %) steps))))))
+      true))))))
+
+(defn- finish-native-retirement! [generation]
+ (let [key (retirement-key generation)]
+  (try
+   ;; Recover the interruption between private native success and public
+   ;; admission closure using only the original matching preparation's state.
+   (when-let [original (get @prepared (:cache-key generation))]
+    (when (= (:scope original) (:scope generation))
+     (swap! (:state original) assoc :retired true)))
+   (if-not
+    (and (retirement-step! generation :queue-root
+           #(queue-root-retirement generation "release-retired!"))
+         (retirement-step! generation :conn-retention #(conn-retirement generation))
+         (retirement-step! generation :scope #(do (env/destroy (:scope generation)) :destroyed)))
+    {:status :waiting :reason :resource-retirement-pending}
+    (do
+     ;; All fixed SDK cleanup acknowledged. Removing the original preparation
+     ;; and its mutable state cannot erase the compact native outcome.
+     (swap! prepared
+       (fn [all]
+        ;; If the caller lost its reply after deletion, another preparation may
+        ;; now occupy this reusable plan key. Never delete that newer instance.
+        (if (erlang/== generation (get all (:cache-key generation)))
+         (dissoc all (:cache-key generation)) all)))
+     (swap! reload/live-generations
+       (fn [m] (reduce dissoc m (:live-names (get @native-retirements key)))))
+     (swap! native-retirements update key
+       (fn [record] (dissoc (assoc record :phase :complete :pending []) :live-names :module-md5s)))
+     {:status :retired}))
+   (catch _
+    ;; Native code is already gone; never authorize new graph execution or
+    ;; silently discard unknown resource custody. Retry fixed steps later.
+    (swap! native-retirements update key assoc :phase :cleanup-pending)
+    {:status :waiting :reason :resource-retirement-uncertain}))))
+
 (defn retire!
- "Retire an unserved graph with no retained registrations. Native soft
-  retirement still checks actual executing code leases. Unknown obligations
-  outside this managed graph must be ruled out by the deployment coordinator."
+ "Native graph retirement followed by retryable fixed SDK resource cleanup.
+  Actual private native success, never graph.state :retired, authorizes release.
+  No resource retention ticket creates an extra code lease or blocks native
+  retirement. Failed cleanup keeps prepared identity/custody for explicit retry."
  [generation]
  (with-lock (:cache-key generation)
   (fn []
-   (let [status (evidence generation)
-         root-blocker (when-not (:retired status)
-                        (queue-root-retirement generation "retirement-blocker"))]
+   (let [outcome (native-retirement-outcome generation)]
     (cond
-     root-blocker (assoc status :status :waiting :reason root-blocker)
-     (:retired status) {:status :already-retired}
-     (or (pos? (:serving-slots status)) (pos? (:registrations status)))
-      (assoc status :status :waiting)
+     (= :complete (:phase outcome)) {:status :already-retired}
+     outcome (finish-native-retirement! generation)
      :else
-      (if (= true (BeamLisp.Env/retire_modules! (to-list (:modules generation))))
-       (do (swap! (:state generation) assoc :retired true)
-           ;; Fixed SDK metadata observer only after actual native retirement.
-           ;; String identity avoids an eager generation <-> queue dependency.
-           ;; A never-loaded queue root has no custody to release.
-           (queue-root-retirement generation "release-retired!")
-           (env/destroy (:scope generation))
-           (swap! prepared dissoc (:cache-key generation))
-           (swap! reload/live-generations
-            (fn [m] (reduce dissoc m (vals (:mapping generation)))))
-           {:status :retired})
-       {:status :waiting :reason :executing-code}))))))
+      (do
+       (attested-prepared! generation true)
+       (let [status (evidence generation)
+             root-blocker (queue-root-retirement generation "retirement-blocker")]
+        (cond
+         root-blocker (assoc status :status :waiting :reason root-blocker)
+         (or (pos? (:serving-slots status)) (pos? (:registrations status)))
+          (assoc status :status :waiting)
+         :else
+          (do
+           (if (attempt-native-retirement! generation)
+            (do
+             (swap! (:state generation) assoc :retired true)
+             (finish-native-retirement! generation))
+            {:status :waiting :reason :executing-code}))))))))))
 
 (defn with-retirement-fence!
  "Hold graph admission while a trusted coordinator checks durable producer
