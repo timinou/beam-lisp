@@ -1,0 +1,168 @@
+; Managed allocation receipts. Native admission and Conn handoff use ONE
+; registry turn. Unknown accepted opening outcomes stay held, never GC-guessed.
+(ns datom.store-opening
+ (:require [reload.execution :as execution] [proc.lifetime :as lifetime]))
+(defn- fail [kind] (throw (ex-info "Managed store opening refused" {:kind kind})))
+(defn- registry []
+ (let [found (erlang/whereis :datom-conn-registry)]
+  (if (not= found :undefined) found
+   (let [started (Agent/start (fn [] {}) (list (tuple :name :datom-conn-registry)))]
+    (if (= :ok (elem started 0)) (elem started 1) (elem (elem started 1) 1))))))
+(defn- decide! [f]
+ (let [answer (BeamLisp.Loader.Server/worker_call
+  (fn [delegate]
+   (Agent/get_and_update (registry)
+    (delegate (fn [cells]
+     (try (let [[answer next] (f cells)] (tuple [:ok answer] next))
+      (catch error (tuple [:error error] cells))))) 30000)))]
+  (if (= :ok (first answer)) (second answer) (throw (second answer)))))
+(defn- matching-gate? [gate creator path]
+ (or (and creator (= (:application-id creator) (:application-id gate)))
+     (and path (:root gate) (String/starts_with? path (str (:root gate) "/")))))
+(defn admit
+ "Pure metadata decision reused inside the actual serialized native admission.
+  A returned map is data, never registration/creator authority. Native caller
+  identity and guardian liveness are checked by begin! in the same Agent turn."
+ [cells row]
+ (let [rows (get cells :datom.conn/store-openings {})]
+  (when (or (>= (count rows) 4096) (contains? rows (:ticket row))) (fail :store-opening-capacity))
+  (when (some (fn [[_ gate]] (matching-gate? gate (:creator row) (:path row)))
+              (get cells :datom.conn/guard-admissions {}))
+   (fail :guard-store-admission-reserved))
+  (assoc-in cells [:datom.conn/store-openings (:ticket row)] row)))
+(defn lose-owner
+ "Pure uncertainty decision. Death never means accepted allocation completed."
+ [cells ticket]
+ (if (get-in cells [:datom.conn/store-openings ticket])
+  (assoc-in cells [:datom.conn/store-openings ticket :phase] :uncertain) cells))
+(defn- cleanup! [ticket]
+ (decide! (fn [cells] [:held (lose-owner cells ticket)])))
+(defn- begin! [kind argument path]
+ (when (execution/owned?)
+  (let [owner (erlang/self) ticket (erlang/make_ref)
+        creator (select-keys (execution/current) [:application-id :scope :digest])
+        canonical (when (string? path) (Path/expand path))
+        guardian (lifetime/register! owner (fn [] (cleanup! ticket)))]
+   (try
+    (decide! (fn [cells]
+      (when-not (and (Process/alive? owner) (Process/alive? (:pid guardian)))
+       (fail :store-opening-capacity))
+      [ticket (admit cells {:ticket ticket :owner owner :creator creator :path canonical
+                           :producer kind :argument argument :phase :pending :guardian guardian})]))
+    {:ticket ticket :owner owner :guardian guardian}
+    (catch error
+     ;; No allocation action has run, so exact absence/removal is safe here.
+     (decide! (fn [cells]
+      (let [rows (dissoc (get cells :datom.conn/store-openings {}) ticket)]
+       [:refused (if (empty? rows) (dissoc cells :datom.conn/store-openings)
+                   (assoc cells :datom.conn/store-openings rows))])))
+     (lifetime/release! guardian) (throw error))))))
+(defn managed? [] (some? (execution/current)))
+(defn assert-producer!
+ "Internal fixed producer entry: no callback/claimed creator grants rights.
+  Only this native self's private exact pending ticket admits managed effects."
+ [kind argument]
+ (when (managed?)
+  (when-not (execution/owned?) (fail :managed-store-execution-required))
+  (let [ticket (Process/get :datom.store-opening/producer) me (erlang/self)
+        creator (select-keys (execution/current) [:application-id :scope :digest])
+        valid (decide! (fn [cells]
+          (let [row (get-in cells [:datom.conn/store-openings ticket])]
+           [(and row (= me (:owner row)) (= :pending (:phase row))
+                 (= creator (:creator row)) (= kind (:producer row))
+                 (= argument (:argument row))) cells])))]
+   (when-not valid (fail :unadmitted-store-producer)))) :admitted)
+(defn allocate!
+ "Index the exact compiler-attested ETS/Fjall native constructor before effects.
+  No callback or caller-nominated module can manufacture an opening origin.
+  Successful unconnected handles stay indexed; unknown outcomes stay held."
+ [kind argument]
+ (when-not (and (execution/owned?) (nil? (Process/get :datom.store-opening/producer))
+                (or (and (= kind :ets) (erlang/is_atom argument))
+                    (and (= kind :fjall) (string? argument))))
+  (fail :invalid-store-producer))
+ (let [namespace (if (= kind :ets) "datom.store-ets" "datom.store-fjall")
+       ;; Complete immutable SDK unit + exact emitted body/name/MD5. No Env var
+       ;; lookup, claimed namespace prefix or broad SDK-callable exemption.
+       producer (BeamLisp.Env/with_env :global
+                  #(BeamLisp.AOT/sdk_named_constructor! namespace "__allocate-native!" 1))
+       opening (or (begin! kind argument (when (= kind :fjall) argument))
+                   (fail :managed-store-execution-required))]
+  (try
+   (Process/put :datom.store-opening/producer (:ticket opening))
+   (let [store (producer argument)]
+    (decide! (fn [cells]
+     (let [row (get-in cells [:datom.conn/store-openings (:ticket opening)])]
+      (when-not (and row (= :pending (:phase row))
+                     (= (:owner opening) (:owner row)) (Process/alive? (:owner opening)))
+       (fail :store-opening-uncertain))
+      [store (assoc-in cells [:datom.conn/store-openings (:ticket opening)]
+               (assoc row :phase :returned :store store))])))
+    store)
+   (catch error
+    (cleanup! (:ticket opening))
+    ;; Once native entry happened, a generic exception cannot prove no handle.
+    (lifetime/release! (:guardian opening)) (throw error))
+   (finally (Process/delete :datom.store-opening/producer)))))
+(defn claim
+ "PURE SDK decision inside Conn's registry turn. Caller must commit returned
+  :cells only together with actual native lifetime creation/borrowing. Original
+  creator is preserved; opaque or foreign opening does not become new authority.
+  Returned guardians are released OUTSIDE that Agent after commit."
+ [cells store creator]
+ (let [rows (get cells :datom.conn/store-openings {})
+       matches (filterv (fn [[_ row]] (= store (:store row))) rows)
+       origins (set (map #(get-in % [1 :creator]) matches))
+       path (when (erlang/is_map store) (maps/get :path store nil))]
+  ;; A second handle over the same path cannot launder an earlier unknown open
+  ;; into new creator authority. Require its exact known returned raw value.
+  (when (some (fn [[_ row]]
+               (and path (= path (:path row))
+                    (or (not= :returned (:phase row)) (not= store (:store row))))) rows)
+   (fail :store-opening-uncertain))
+  (when (and creator (empty? matches) (nil? (get cells store)))
+   (fail :unclassified-store-opening))
+  (when (or (> (count origins) 1)
+            (some (fn [[_ row]] (not= :returned (:phase row))) matches))
+   (fail :ambiguous-store-opening))
+  (when (and (seq matches) (not= (:application-id creator) (:application-id (first origins))))
+   (fail :foreign-store-opening))
+  (let [remaining (apply dissoc rows (map first matches))]
+   {:creator (if (seq matches) (first origins) creator)
+    :guardians (mapv #(get-in % [1 :guardian]) matches)
+    :cells (if (empty? remaining) (dissoc cells :datom.conn/store-openings)
+             (assoc cells :datom.conn/store-openings remaining))})))
+(defn finish-claim! [guardians]
+ (doseq [guardian guardians] (lifetime/release! guardian)) :claimed)
+(defn check-publication!
+ "PURE SDK decision in the SAME Conn Agent turn as activation gate insertion.
+  Unconnected/pending/uncertain managed openings fail closed before activation."
+ [cells application root]
+ (doseq [[_ row] (get cells :datom.conn/store-openings {})]
+  (when (matching-gate? {:application-id application :root root} (:creator row) (:path row))
+   (fail (if (= :uncertain (:phase row)) :store-opening-uncertain :store-opening-pending))))
+ :ready)
+
+(defn confirm-ets-closed!
+ "Clear only exact returned raw ETS handles whose native table is already gone.
+  No boolean/path/owner-death claim proves closure; borrowed live tables refuse."
+ [store]
+ (let [table (when (erlang/is_map store) (maps/get :table store nil))]
+  (when-not (and table (= :undefined (ets/info table))) (fail :store-opening-still-live))
+  (let [guardians (decide! (fn [cells]
+    (let [rows (get cells :datom.conn/store-openings {})
+          matches (filterv (fn [[_ row]] (= store (:store row))) rows)
+          remaining (apply dissoc rows (map first matches))]
+     [(mapv #(get-in % [1 :guardian]) matches)
+      (if (empty? remaining) (dissoc cells :datom.conn/store-openings)
+       (assoc cells :datom.conn/store-openings remaining))])))]
+   (finish-claim! guardians))))
+
+(defn readiness!
+ "Read-only actual selected application/root opening gate before durable intent.
+  This neither claims a raw resource nor supplies allocation/activation authority."
+ [root]
+ (when-not (and (execution/owned?) (string? root) (= root (Path/expand root)) (not= "/" root))
+  (fail :managed-store-execution-required))
+ (let [app (:application-id (execution/current))]
+  (decide! (fn [cells] [(check-publication! cells app root) cells]))))
