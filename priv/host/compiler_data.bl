@@ -124,3 +124,134 @@
      (if (erlang/< start stop) (lists/seq start (erlang/- stop 1)) (list))
 
      :else (erlang/error (Elixir.ArgumentError/exception "eager_range expects integers")))))
+
+;; First-order raw data is a compiler kernel boundary as well as an SDK API.
+;; Keep one implementation here so cold staging need not initialize std to
+;; validate the data it is compiling. SDK data.first-order delegates unchanged.
+(defn- first_order_refuse! [reason]
+ (throw (ex-info "Expected bounded first-order data" {:kind :unsafe-first-order-data :reason reason})))
+
+(defn- first_order_remaining!
+ "Return remaining structural budgets after bounded raw validation. Admit scalar data,
+  proper lists, plain maps, BL symbol descriptors, canonical native vectors
+  and sets. Thread counters purely; allocate no atom/NIF resource per check.
+  Validate opaque/forged structs and vector storage before protocol dispatch."
+ ([value] (first_order_remaining! value {}))
+ ([value options]
+  (when-not (and (erlang/is_map options) (not (erlang/is_map_key :__struct__ options)))
+   (first_order_refuse! :invalid-limits))
+  (let [max-nodes (get options :max-nodes 16384) max-bytes (get options :max-bytes 1048576)
+        max-depth (get options :max-depth 64)]
+   (when-not (and (int? max-nodes) (<= 1 max-nodes 1000000)
+                  (int? max-bytes) (<= 1 max-bytes 67108864)
+                  (int? max-depth) (<= 1 max-depth 128)) (first_order_refuse! :invalid-limits))
+   (letfn [(spend [budget depth amount]
+             (when (> depth max-depth) (first_order_refuse! :depth-limit))
+             (let [nodes (dec (elem budget 0)) bytes (- (elem budget 1) amount)]
+              (when (neg? nodes) (first_order_refuse! :node-limit))
+              (when (neg? bytes) (first_order_refuse! :byte-limit))
+              (tuple nodes bytes)))
+           (dense [items budget depth]
+             (when-not (and (erlang/is_tuple items) (<= (erlang/tuple_size items) 32))
+              (first_order_refuse! :vector-storage))
+             (loop [index 1 remaining budget]
+              (if (> index (erlang/tuple_size items)) remaining
+               (recur (inc index) (walk (erlang/element index items) remaining (inc depth))))))
+           (trie [node level expected budget depth]
+             (let [budget (spend budget depth 0)]
+              (when-not (and (erlang/is_tuple node) (= 32 (erlang/tuple_size node)))
+               (first_order_refuse! :vector-trie))
+              (if (= 0 level)
+               (do (when-not (= 32 expected) (first_order_refuse! :vector-count)) (dense node budget depth))
+               (let [capacity (erlang/bsl 1 level)]
+                (loop [index 1 left expected remaining budget]
+                 (if (> index 32)
+                  (do (when-not (= 0 left) (first_order_refuse! :vector-count)) remaining)
+                  (let [child (erlang/element index node) amount (min left capacity)]
+                   (if (= 0 amount)
+                    (do (when-not (erlang/== nil child) (first_order_refuse! :vector-placement))
+                        (recur (inc index) left (spend remaining (inc depth) 0)))
+                    (do (when (erlang/== nil child) (first_order_refuse! :vector-placement))
+                        (recur (inc index) (- left amount)
+                          (trie child (- level 5) amount remaining (inc depth))))))))))))
+           (vector-data [v budget depth]
+             (when-not (and (= 3 (erlang/map_size v)) (erlang/is_map_key :items v)
+                            (erlang/is_map_key :meta v)) (first_order_refuse! :vector-fields))
+             (let [budget (walk (erlang/map_get :meta v) budget (inc depth))
+                   items (erlang/map_get :items v)]
+              (when-not (erlang/is_tuple items) (first_order_refuse! :vector-storage))
+              (if (and (= 5 (erlang/tuple_size items)) (erlang/== :bl_vec (erlang/element 1 items))
+                       (erlang/is_integer (erlang/element 2 items)) (> (erlang/element 2 items) 32))
+               (let [count (erlang/element 2 items) shift (erlang/element 3 items)
+                     root (erlang/element 4 items) tail (erlang/element 5 items)]
+                (when (> count max-nodes) (first_order_refuse! :node-limit))
+                (when-not (and (erlang/is_integer shift)
+                               (<= 5 shift 30) (= 0 (erlang/rem shift 5))
+                               (erlang/is_tuple tail) (<= 1 (erlang/tuple_size tail) 32))
+                 (first_order_refuse! :vector-trie))
+                (let [tree-count (- count (erlang/tuple_size tail))]
+                 (when-not (and (= 0 (erlang/rem tree-count 32))
+                                (= (erlang/tuple_size tail) (inc (erlang/rem (dec count) 32)))
+                                (or (= 5 shift) (> tree-count (erlang/bsl 1 shift))))
+                  (first_order_refuse! :vector-count))
+                 (dense tail (trie root shift tree-count budget (inc depth)) (inc depth))))
+               (dense items budget (inc depth)))))
+           (plain-map [v budget depth]
+             (loop [iterator (maps/iterator v) remaining budget]
+              (let [entry (maps/next iterator)]
+               (if (erlang/== :none entry) remaining
+                (let [after-key (walk (erlang/element 1 entry) remaining (inc depth))
+                      after-value (walk (erlang/element 2 entry) after-key (inc depth))]
+                 (recur (erlang/element 3 entry) after-value))))))
+           (set-data [v budget depth]
+             (when-not (and (= 2 (erlang/map_size v)) (erlang/is_map_key :members v))
+              (first_order_refuse! :set-fields))
+             (let [members (erlang/map_get :members v)]
+              (when-not (and (erlang/is_map members) (= 2 (erlang/map_size members))
+                             (erlang/is_map_key :__struct__ members)
+                             (erlang/== :Elixir.MapSet (erlang/map_get :__struct__ members))
+                             (erlang/is_map_key :map members)) (first_order_refuse! :set-storage))
+              (let [entries (erlang/map_get :map members)]
+               (when-not (and (erlang/is_map entries) (not (erlang/is_map_key :__struct__ entries)))
+                (first_order_refuse! :set-storage))
+               (plain-map entries (spend budget (inc depth) 0) (inc depth)))))
+           (walk [v budget depth]
+             (let [budget (spend budget depth
+                            (cond (erlang/is_binary v) (erlang/byte_size v)
+                                  (erlang/is_atom v) (erlang/byte_size (erlang/atom_to_binary v :utf8))
+                                  (erlang/is_number v) (erlang/external_size v) :else 0))]
+              (cond
+               (or (erlang/is_atom v) (erlang/is_number v) (erlang/is_binary v)) budget
+               (erlang/is_list v)
+                (loop [remaining v current budget]
+                 (if (erlang/== (list) remaining) current
+                  (do (when-not (erlang/is_list remaining) (first_order_refuse! :improper-list))
+                      (recur (erlang/tl remaining) (walk (erlang/hd remaining) current (inc depth))))))
+               (erlang/is_tuple v)
+                (if (and (= 2 (erlang/tuple_size v)) (erlang/== :symbol (erlang/element 1 v))
+                         (erlang/is_binary (erlang/element 2 v)))
+                 (walk (erlang/element 2 v) budget (inc depth)) (first_order_refuse! :native-tuple))
+               (erlang/is_map v)
+                (if (erlang/is_map_key :__struct__ v)
+                 (let [tag (erlang/map_get :__struct__ v)]
+                  (cond (erlang/== :Elixir.BeamLisp.Vector tag) (vector-data v budget depth)
+                        (erlang/== :Elixir.BeamLisp.Set tag) (set-data v budget depth)
+                        :else (first_order_refuse! :foreign-struct)))
+                 (plain-map v budget depth))
+               :else (first_order_refuse! :opaque-value))))]
+    (walk value (tuple max-nodes max-bytes) 0)))))
+
+(defn check_first_order!
+ "Pure raw-term validator shared by the SDK and compile-only kernel staging.
+  No namespace loading, protocol dispatch or opaque callback invocation."
+ ([value] (check_first_order! value {}))
+ ([value options] (first_order_remaining! value options) value))
+
+(defn first_order_cost!
+ "Validate once and report exact raw traversal nodes/bytes for aggregate
+  constructor quotas. These are structural budgets, not serialized heap sizes."
+ ([value] (first_order_cost! value {}))
+ ([value options]
+  (let [remaining (first_order_remaining! value options)]
+   {:nodes (- (get options :max-nodes 16384) (elem remaining 0))
+    :bytes (- (get options :max-bytes 1048576) (elem remaining 1))})))
