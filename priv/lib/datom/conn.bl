@@ -425,6 +425,10 @@
   (if (= :undefined pid) {}
    (Agent/get pid (fn [entries] (get entries (store-key store) {})) 30000))))
 (defn- guard-fail! [kind] (throw (ex-info "Transaction guard ownership refused" {:kind kind})))
+(defn- guard-association-mutation! [key action]
+ (when (Process/get :datom.conn/guard-publication)
+  (guard-fail! :guard-publication-mutation-forbidden))
+ (BeamLisp.Env/with_generation_lock (tuple :datom-guard-association key) action))
 (defn- managed-guard? [entry] (and (map? entry) (= :managed-guard (:kind entry))))
 (defn- guards-for [conn]
  (let [entries (guard-entries (:store conn)) managed? (declaration/managed?)
@@ -456,6 +460,8 @@
    takes minutes is a bug worth surfacing, and an infinite wait would
    hide a deadlock as a hang."
   [conn f]
+  (when (Process/get :datom.conn/guard-publication)
+    (guard-fail! :guard-publication-writer-forbidden))
   (writable-context!)
   ;; Policy ownership is checked before enqueue and again inside the writer.
   (guards-for conn)
@@ -824,7 +830,7 @@
     (throw (ex-info "cannot release a connection inside its transaction" {:reason :release-in-writer})))
   (let [conn (lifetime-conn conn)
         k (store-key (:store conn)) releaser (erlang/self)
-        owned (agent-get-and-update
+        owned (guard-association-mutation! k (fn [] (agent-get-and-update
                 (registry)
                 (fn [reg]
                   (let [cell (get reg k)]
@@ -836,7 +842,7 @@
                           (reset! (:lifetime cell) :closing)
                           (->tuple-2 (select-keys cell [:writer :rank-worker :observers]) reg))
                       (->tuple-2 nil reg))))
-                30000)
+                30000)))
         worker (:rank-worker owned) writer (:writer owned)]
     (when (and worker (Process/alive? worker)) (Process/exit worker :shutdown))
     ;; No observer is stopped while holding the registry Agent. A failed drain
@@ -853,7 +859,7 @@
       (datom.attr-basis/release-store! (:store conn))
       (let [guards (erlang/whereis GUARD-REGISTRY)]
         (when (not= :undefined guards)
-          (Agent/update guards (fn [reg] (dissoc reg k)) 30000)
+          (guard-association-mutation! k (fn [] (Agent/update guards (fn [reg] (dissoc reg k)) 30000)))
           ;; Removing a key does not collect the old Agent state or callback.
           ;; A quiet registry otherwise pins its native resource indefinitely.
           (erlang/garbage_collect guards)))
@@ -1483,6 +1489,86 @@
    (guard-fail! :invalid-guard-resource))
   [conn (:guard-creator cell)]))
 
+; Insert beside guard-resource!. Uses the existing native connection lifetime,
+; guarded declaration catalogue and immutable exact association receipts.
+(defn guard-association-inventory!
+ "Observe compatible installed policies without invoking any predicate. Current
+  admitted candidate graph supplies its immutable declaration catalogue. Native
+  handles/tickets stay private; this is not a public JSON receipt."
+ [connection]
+ (when-not (and (execution/owned?) (declaration/managed?))
+  (guard-fail! :managed-guard-execution-required))
+ (when-not (and (erlang/is_map connection)
+                (= Conn (maps/get :__struct__ connection nil)))
+  (guard-fail! :invalid-guard-resource))
+ (let [key (store-key (:store connection))]
+  (BeamLisp.Env/with_generation_lock (tuple :datom-guard-association key)
+   (fn []
+    (let [validated (guard-resource! connection) conn (first validated)
+          creator (second validated) entries (guard-entries (:store conn))
+          graph (execution/current) app (:application-id graph)
+          catalogue (declaration/entries :guard)]
+     (when (> (count entries) 128) (guard-fail! :guard-inventory-budget))
+     (doseq [[name entry] entries]
+      (when-not (and (erlang/is_map entry) (not (erlang/is_map_key :__struct__ entry))
+                     (managed-guard? entry)) (guard-fail! :legacy-guard-adoption-required))
+      (when-not (= app (:application-id entry)) (guard-fail! :guard-application-mismatch))
+      (when-not (and (= #{:kind :application-id :guard-id :lifetime :ticket} (set (keys entry)))
+                     (erlang/is_reference (:ticket entry))
+                     (= name (:guard-id entry)) (= (:lifetime conn) (:lifetime entry)))
+       (guard-fail! :stale-guard-resource))
+      (when-not (and (= :guard (get-in catalogue [name :data :kind]))
+                    (= name (get-in catalogue [name :data :ident])))
+       (guard-fail! :missing-guard-declaration)))
+     {:kind :guard-association-inventory :application-id app :generation (:digest graph)
+      :scope (:scope graph) :connection conn :resource key :lifetime (:lifetime conn) :creator creator
+      :guards entries})))))
+
+(defn- with-guard-association-locks [receipts action]
+ (if (empty? receipts) (action)
+  (BeamLisp.Env/with_generation_lock (tuple :datom-guard-association (:resource (first receipts)))
+   #(with-guard-association-locks (rest receipts) action))))
+
+(defn with-guard-publication-fence!
+ "Recheck exact finite association/lifetime receipts while all native metadata
+  fences are held in deterministic store order. Ordinary reads/writes continue;
+  association mutation and open->closing cannot cross publication. The supplied
+  trusted final publication action MUST NOT call a writer or close resources.
+  No policy is installed, adopted, removed or disabled by this operation."
+ [receipts action]
+ (when-not (and (execution/owned?) (declaration/managed?) (vector? receipts)
+                (<= (count receipts) 32) (erlang/is_function action 0)
+                (nil? (Process/get :datom.conn/writing-store))
+                (nil? (Process/get :datom.conn/guard-publication)))
+  (guard-fail! :invalid-guard-publication-fence))
+ (let [graph (execution/current)
+       _ (doseq [receipt receipts]
+          (when-not (and (erlang/is_map receipt) (not (erlang/is_map_key :__struct__ receipt)))
+           (guard-fail! :invalid-guard-inventory))
+          (let [connection (maps/get :connection receipt nil)]
+           (when-not (and (erlang/is_map connection) (= Conn (maps/get :__struct__ connection nil)))
+            (guard-fail! :invalid-guard-inventory)))
+          (when-not (and (= :guard-association-inventory (:kind receipt))
+                        (= (:application-id graph) (:application-id receipt))
+                        (= (:digest graph) (:generation receipt)) (= (:scope graph) (:scope receipt))
+                        (= (:resource receipt) (store-key (:store (:connection receipt))))
+                        (= (:lifetime receipt) (:lifetime (:connection receipt)))
+                        (map? (:guards receipt)) (<= (count (:guards receipt)) 128))
+           (guard-fail! :invalid-guard-inventory)))
+       ordered (Enum/sort_by receipts (fn [receipt] (:resource receipt)))
+       _ (when-not (= (count receipts) (count (set (map :resource receipts))))
+           (guard-fail! :duplicate-guard-resource))]
+  (with-guard-association-locks ordered
+   (fn []
+    (doseq [expected ordered]
+     (when-not (= expected (guard-association-inventory! (:connection expected)))
+      (guard-fail! :stale-guard-association-inventory)))
+    ;; Nonconveyed scope: a final publish cannot wait on a writer which is itself
+    ;; waiting on our association lock. Other processes' normal writes continue.
+    (Process/put :datom.conn/guard-publication true)
+    (try (action)
+     (finally (Process/delete :datom.conn/guard-publication)))))))
+
 (defn register-declared-guard!
  "Fixed SDK residual for the ordinary guard! API. The store remains a runtime
   owner resource;only application/id/lifetime data enter its association table.
@@ -1499,7 +1585,7 @@
   (when-not (:provider (declaration/lookup :guard name)) (guard-fail! :missing-guard-declaration))
   (with-writer conn
    (fn []
-    (agent-get-and-update (guard-registry)
+    (guard-association-mutation! key (fn [] (agent-get-and-update (guard-registry)
      (fn [all]
       (let [entries (get all key {}) before (get entries name)]
        (doseq [[_ value] entries]
@@ -1509,7 +1595,7 @@
         (guard-fail! :guard-resource-adoption-required))
        (when (and before (not= (dissoc before :ticket) (dissoc entry :ticket)))
         (guard-fail! :guard-owner-handover-required))
-       (tuple key (assoc all key (assoc entries name (or before entry)))))) 30000)))))
+       (tuple key (assoc all key (assoc entries name (or before entry)))))) 30000)))))))
 
 (defn guard!
  "Register a writer-run predicate. Managed literal named/closed callbacks are
@@ -1540,33 +1626,33 @@
    (guard-fail! :invalid-guard-owner-receipt))
   (with-writer conn
    (fn []
-    (agent-get-and-update (guard-registry)
+    (guard-association-mutation! key (fn [] (agent-get-and-update (guard-registry)
      (fn [all]
       (let [entries (get all key {})]
        (when-not (= expected (get entries name)) (guard-fail! :stale-guard-owner-receipt))
        (let [next (dissoc entries name)]
-        (tuple :removed (if (empty? next) (dissoc all key) (assoc all key next)))))) 30000)))))
+        (tuple :removed (if (empty? next) (dissoc all key) (assoc all key next)))))) 30000)))))))
 
 (defn register-store-guard!
  ([store-k pred] (register-store-guard! store-k :default pred))
  ([store-k name pred]
   (declaration/require-development!)
   (when-not (fn? pred) (guard-fail! :invalid-store-guard-registration))
-  (agent-get-and-update (guard-registry)
+  (guard-association-mutation! store-k (fn [] (agent-get-and-update (guard-registry)
    (fn [all]
     (let [entries (get all store-k {})]
      (when (some managed-guard? (vals entries)) (guard-fail! :managed-guard-context-required))
-     (tuple store-k (assoc all store-k (assoc entries name pred))))) 30000)))
+     (tuple store-k (assoc all store-k (assoc entries name pred))))) 30000)))))
 
 (defn unregister-store-guard!
  ([store-k] (unregister-store-guard! store-k :default))
  ([store-k name]
   (declaration/require-development!)
-  (agent-get-and-update (guard-registry)
+  (guard-association-mutation! store-k (fn [] (agent-get-and-update (guard-registry)
    (fn [all]
     (let [entries (get all store-k {})]
      (when (some managed-guard? (vals entries)) (guard-fail! :managed-guard-context-required))
-     (tuple :ok (assoc all store-k (dissoc entries name))))) 30000)))
+     (tuple :ok (assoc all store-k (dissoc entries name))))) 30000)))))
 
 (defn- run-guards! [conn report guards]
  (reduce (fn [_ pred]
