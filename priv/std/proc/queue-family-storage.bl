@@ -1,0 +1,189 @@
+; HOME source draft. Native integration pending; not an acceptance receipt.
+; First-party allocation ledger only. This never constructs application config.
+(ns proc.queue-family-storage
+ (:require [proc.queue-family :as family] [proc.queue-family-root :as root]
+           [proc.owner-registry :as owners] [reload.execution :as execution]
+           [datom :as d] [datom.conn :as conn] [datom.store :as store]
+           [datom.store-fjall :as fjall] [datom.store-opening :as opening]
+           [data.first-order :as data]))
+
+(def ^:private attempts (atom {}))
+(def SCHEMA
+ [{:db/ident :queue-family/key :db/valueType :db.type/string :db/unique :db.unique/identity}
+  {:db/ident :queue-family/record :db/valueType :db.type/any}])
+(defn- refuse [kind]
+ (throw (ex-info "Managed queue store refused" {:kind kind})))
+(defn- locked [g server action]
+ (BeamLisp.Env/with_generation_lock (tuple :queue-family-storage (:application-id g) server) action))
+(defn- claim-attempt! [key state]
+ ;; Global bounded admission across all per-instance/app locks. No native
+ ;; opening, Conn call, actor RPC or application callback under this fence.
+ (BeamLisp.Env/with_generation_lock :queue-family-allocation-capacity
+  (fn []
+   (swap! attempts
+    (fn [all]
+     (when (contains? all key) (refuse :queue-family-allocation-outcome-uncertain))
+     (when (>= (count all) 4096) (refuse :queue-family-allocation-capacity))
+     (assoc all key state))))))
+(defn- authenticated-init! [g server]
+ (when-not (and (execution/owned?) (= g (execution/current))
+                (string? server) (<= 1 (erlang/byte_size server) 1024))
+  (refuse :queue-family-generated-store-owner-required))
+ (let [member (family/member-evidence (:application-id g) server)
+       native (owners/current-owner-capability)]
+  (when-not (and member native (= (:membership member) (:membership native))
+                 (= (erlang/self) (get-in member [:membership :pid])))
+   (refuse :queue-family-generated-store-owner-required))
+  ;; PREREQUISITE: sealed peer's native one-shot generated-init extent API.
+  ;; Class-frame verify_server_start! alone is NOT this phase authority.
+  ;; No caller/bound token/Boolean can manufacture an active private init gate.
+  (when-not (BeamLisp.Env/server_initializing? (:module native))
+   (refuse :queue-family-generated-store-owner-required))
+  member))
+(defn- canonical-existing-directory! [path]
+ ;; This catches existing aliases BEFORE a journal or native opening effect.
+ ;; It is not an openat/no-follow authority proof across filesystem renames.
+ (let [found (File/lstat path)]
+  (cond
+   (= :ok (elem found 0))
+    (when-not (= :directory (:type (elem found 1))) (refuse :queue-family-noncanonical-directory))
+   (= found (tuple :error :enoent)) nil
+   :else (refuse :queue-family-noncanonical-directory))))
+(defn- descriptor [g member grant]
+ (let [path (family/storage-path g (:family member) (:server member))
+       record {:version 1 :application (:application-id g) :family (:family member)
+               :instance (:server member) :path path
+               :protocol (:protocol member) :fixed-shape (:fixed-shape member)
+               :payload-format :reconcile-row-v1 :generation (:digest g)
+               :artifact (get-in g [:resources :artifact-candidate])
+               :phase :allocation-only :state :opening
+               :incarnation (:incarnation grant)
+               :attempt (sha256-hex (erlang/term_to_binary (erlang/make_ref)))}]
+  (data/check! record {:max-nodes 4096 :max-depth 32 :max-bytes 65536})
+  (when-not (String/starts_with? path (str (:root grant) "/queues/"))
+   (refuse :queue-family-store-scope-mismatch))
+  (canonical-existing-directory! (str (:root grant) "/queues"))
+  (canonical-existing-directory! path)
+  record))
+(defn- record-key [record]
+ (sha256-hex (pr-str [(:application record) (:family record) (:instance record)])))
+(defn- matching-record! [actual expected]
+ (data/check! actual {:max-nodes 4096 :max-depth 32 :max-bytes 65536})
+ (when-not (and (= (set (keys actual)) (set (keys expected)))
+                (= (select-keys actual [:version :application :family :instance :path :protocol :fixed-shape :payload-format :phase])
+                   (select-keys expected [:version :application :family :instance :path :protocol :fixed-shape :payload-format :phase]))
+                (contains? #{:opening :allocated :attached} (:state actual))
+                (string? (:generation actual)) (= 64 (erlang/byte_size (:generation actual)))
+                (string? (:attempt actual)) (= 64 (erlang/byte_size (:attempt actual))))
+  (refuse :queue-family-store-catalog-mismatch))
+ ;; Different source handlers require actual sealed restoration staging. Merely
+ ;; possessing a new declaration never retags old queued work into candidate.
+ (when-not (= (:generation actual) (:generation expected))
+  (refuse :sealed-family-restoration-required))
+ actual)
+(defn- read-record [journal key]
+ (:queue-family/record (d/entity (d/db journal) [:queue-family/key key])))
+(defn- synced! [connection]
+ (when-not (store/durable? (:store connection)) (refuse :durable-queue-family-required))
+ (store/sync! (:store connection)))
+(defn- begin-intent! [journal key expected]
+ (conn/install-schema! journal SCHEMA)
+ (conn/serialized! journal
+  (fn []
+   (if-let [prior (read-record journal key)]
+    (matching-record! prior expected)
+    (do (d/transact! journal [{:queue-family/key key :queue-family/record expected}])
+        (synced! journal) expected)))))
+(defn- advance-intent! [journal key before after]
+ (data/check! after {:max-nodes 4096 :max-depth 32 :max-bytes 65536})
+ (conn/serialized! journal
+  (fn []
+   (when-not (= before (read-record journal key)) (refuse :queue-family-store-intent-changed))
+   (d/transact! journal [{:queue-family/key key :queue-family/record after}])
+   (synced! journal)
+   after)))
+(defn- owned-at [g grant path]
+ (let [owned (conn/owned-connections (:application-id g) (:root grant) (vec (vals (:declared grant))))
+       matches (vec (filter #(= path (get-in % [:store :path])) owned))]
+  (when (> (count matches) 1) (refuse :ambiguous-queue-family-store))
+  (first matches)))
+
+(defn provision!
+ "Generated actual native family init only, BEFORE config factory invocation.
+  Durably record allocation intent, reuse exact native owned stores or allocate
+  one dedicated Fjall/Conn. Unknown same-VM allocation stays held; no retry or
+  provider replay. PRIVATE ticket must be attached by the existing queue API."
+ [g server]
+ (let [member (authenticated-init! g server) grant (root/evidence! g)
+       expected (descriptor g member grant) key (record-key expected)
+       attempt-key [(:application-id g) server]]
+  (locked g server
+   (fn []
+    (when (get @attempts attempt-key) (refuse :queue-family-allocation-outcome-uncertain))
+    (let [journal (:journal grant) record (begin-intent! journal key expected)
+          existing (owned-at g grant (:path record))]
+     (when (and (= :opening (:state record)) (not= (:attempt record) (:attempt expected)))
+      ;; A future restoration batch may reconcile a proven allocation-only
+      ;; crash using physical root/queue writer authority. This draft refuses
+      ;; rather than treating a changed incarnation as VM-death proof.
+      (refuse :queue-family-allocation-recovery-required))
+     (when (and existing (not= :attached (:state record)))
+      (refuse :queue-family-allocation-outcome-uncertain))
+     (when (and (not existing) (not (contains? #{:opening :attached} (:state record))))
+      (refuse :queue-family-allocation-outcome-uncertain))
+     (when (and (not existing) (= :attached (:state record))
+                (= (:incarnation record) (:incarnation grant)))
+      ;; Same-VM store loss/release is not an implicit reopen authorization.
+      ;; Exact physical DOWN/lifetime handover is a following native batch.
+      (refuse :queue-family-store-lifetime-ended))
+     (let [ticket (erlang/make_ref) owner (erlang/self)
+           state {:owner owner :ticket ticket :member (:membership member) :record record
+                  :journal journal :key key :phase :opening :generation (:digest g)}]
+      ;; Private accepted allocation custody survives actor failure. Never GC
+      ;; or close a returned/uncertain store because its caller died.
+      (claim-attempt! attempt-key state)
+      (try
+       (let [c (or existing (d/connect-with (fjall/open (:path record))))]
+        (when-not (and (= (:path record) (get-in c [:store :path]))
+                       (= fjall/FjallStore (get-in c [:store :__struct__]))
+                       (BeamLisp.AOT/sdk_generated_class? (get-in c [:store :__struct__])))
+         (refuse :queue-family-store-scope-mismatch))
+        (let [native (conn/creation-evidence! c)]
+         (when-not (= (:application-id g) (get-in native [:creator :application-id]))
+          (refuse :queue-family-store-creator-mismatch)))
+        (swap! attempts assoc attempt-key (assoc state :phase :allocated :connection c))
+        {:application (:application-id g) :server server :owner owner :ticket ticket :connection c})
+       (catch error
+        (swap! attempts update attempt-key #(assoc % :phase :uncertain))
+        (throw error)))))))))
+
+(defn attached!
+ "Confirm only this exact generated init's allocation after queue.attach-store!
+  has established schema/key. Sync queue then journal; no job/attempt is changed.
+  Lost acknowledgement remains a held private allocation, not a second open."
+ [g server ticket]
+ (let [member (authenticated-init! g server) grant (root/evidence! g)
+       attempt-key [(:application-id g) server]]
+  (locked g server
+   (fn []
+    (let [actual (get @attempts attempt-key) c (:connection actual)]
+     (when-not (and actual (= (erlang/self) (:owner actual))
+                    (= (:ticket ticket) (:ticket actual)) (= (:owner ticket) (:owner actual))
+                    (= (:connection ticket) c) (= (:membership member) (:member actual))
+                    (= :allocated (:phase actual)))
+      (refuse :queue-family-allocation-ticket-refused))
+     (let [db (d/db c) queues (d/q '[:find ?k :where [_ :queue/key ?k]] db)]
+      (when-not (= #{[server]} (set queues)) (refuse :queue-family-attached-identity-mismatch)))
+     (synced! c)
+     (let [after (assoc (:record actual) :state :attached)]
+      (advance-intent! (:journal actual) (:key actual) (:record actual) after)
+      (swap! attempts dissoc attempt-key)
+      :attached))))))
+
+(defn retirement-blocker
+ "Fixed SDK metadata observer. Accepted or uncertain allocation is retained
+  even after its actor dies; no timeout/TTL removes its custody or replays it."
+ [g]
+ (when (some (fn [[[app _] attempt]]
+              (and (= app (:application-id g)) (= (:generation attempt) (:digest g)))) @attempts)
+  :queue-family-allocation-outcome-uncertain))

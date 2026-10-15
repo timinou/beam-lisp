@@ -1,0 +1,286 @@
+; HOME source draft. Native acceptance pending: do not install independently.
+; Native journal custody grants managed family storage, paths only confine it.
+(ns proc.queue-family-root
+ (:require [reload.generation :as generation] [reload.execution :as execution]
+           [datom.conn :as conn] [datom.store-fjall :as fjall] [env]))
+
+(def ^:private roots (atom {}))
+(defn- refuse [kind]
+ (throw (ex-info "Managed queue root refused" {:kind kind})))
+(defn- origin-free! []
+ ;; This guard deliberately runs OUTSIDE execution.with!. An app initializer
+ ;; executes on its parent's PID, so creator PID alone is not authorization.
+ (when (or (BeamLisp.Env/assert_execution_context!) (BeamLisp.Env/execution_origin))
+  (refuse :queue-root-native-initializer-required)))
+(defn- locked [g action]
+ (BeamLisp.Env/with_generation_lock (tuple :queue-root (:application-id g)) action))
+(defn- generation-id [g] (select-keys g [:cache-key :scope :digest :application-id]))
+(defn- store-roots! [action]
+ ;; Metadata only: no Conn/writer/actor/provider action under this global lock.
+ (BeamLisp.Env/with_generation_lock :queue-root-capacity
+  (fn [] (swap! roots action))))
+(defn- directory-ancestors! [path]
+ ;; Never call Fjall canonicalization here: that native API CREATES directories.
+ ;; Trusted lifecycle already owns/prepares this root; aliases are refused.
+ (loop [current "/" parts (rest (Path/split path))]
+  (when (seq parts)
+   (let [next (Path/join current (first parts)) found (File/lstat next)]
+    (when-not (and (= :ok (elem found 0)) (= :directory (:type (elem found 1))))
+     (refuse :queue-root-noncanonical-directory))
+    (recur next (rest parts))))))
+(defn- declared-path [g]
+ (let [root (get-in g [:resources :data-root])
+       relative (get-in g [:resources :managed-root-journal])]
+  (when-not (and (string? root) (= root (Path/expand root)) (not= root "/")
+                 (string? relative) (<= 1 (erlang/byte_size relative) 4096)
+                 (not (String/starts_with? relative "/"))
+                 (= (str root "/" relative) (Path/expand (str root "/" relative))))
+   (refuse :queue-root-journal-required))
+  (directory-ancestors! root)
+  (directory-ancestors! (Path/dirname (str root "/" relative)))
+  {:root root :path (str root "/" relative)}))
+(defn- declared-store-paths [g]
+ (let [paths (get-in g [:resources :managed-root-store-paths])
+       journal-id (get-in g [:resources :managed-root-journal-id])
+       declared (declared-path g)]
+  (when-not (and (erlang/is_map paths) (not (erlang/is_map_key :__struct__ paths))
+                 (<= 1 (count paths) 32) (string? journal-id)
+                 (= (get paths journal-id) (get-in g [:resources :managed-root-journal]))
+                 (every? (fn [[id relative]]
+                   (and (string? id) (<= 1 (erlang/byte_size id) 128)
+                        (string? relative) (<= 1 (erlang/byte_size relative) 4096)
+                        (not (String/starts_with? relative "/"))
+                        (= (str (:root declared) "/" relative)
+                           (Path/expand (str (:root declared) "/" relative))))) paths)
+                 (= (count paths) (count (set (vals paths)))))
+   (refuse :queue-root-store-declarations-required))
+  paths))
+(defn- unpublished! [g]
+ (generation/attested-prepared! g)
+ (let [st @(:state g)]
+  (when (or (:retired st) (seq (:slots st)) (:runtime st))
+   (refuse :queue-root-enrollment-closed))))
+(defn- native-connection! [g path connection]
+ (let [evidence (conn/creation-evidence! connection)
+       store (:store (:connection evidence)) custody (:custody evidence)]
+  (directory-ancestors! (Path/dirname path))
+  (when-not (and (erlang/is_map store)
+                 (= fjall/FjallStore (maps/get :__struct__ store nil))
+                 (BeamLisp.AOT/sdk_generated_class? (maps/get :__struct__ store nil))
+                 (= path (maps/get :path store nil))
+                 (= (erlang/self) (:owner custody)) (nil? (:origin custody))
+                 (nil? (:creator evidence)))
+   (refuse :queue-root-native-journal-required))
+  evidence))
+(defn- native-journal! [g connection]
+ (let [declared (declared-path g) evidence (native-connection! g (:path declared) connection)]
+  (merge declared {:journal (:connection evidence) :custody (:custody evidence)
+                   :resource (:resource evidence) :lifetime (:lifetime evidence)})))
+(defn- native-declared! [g declared]
+ (let [paths (declared-store-paths g) root (:root (declared-path g))]
+  (when-not (and (erlang/is_map declared) (not (erlang/is_map_key :__struct__ declared))
+                 (= (set (keys paths)) (set (keys declared))))
+   (refuse :queue-root-declared-handles-required))
+  (into {} (map (fn [[id relative]]
+       [id (native-connection! g (str root "/" relative) (get declared id))]) paths))))
+(defn enroll!
+ "Trusted native initializer, before Source initialization. Exact SDK Conn
+  creation custody plus immutable prepared journal scope, never caller flags,
+  root strings, copied graph maps or lease dictionaries. PRIVATE result."
+ ([g connection]
+  (origin-free!)
+  (unpublished! g)
+  (enroll! g connection {(get-in g [:resources :managed-root-journal-id]) connection}))
+ ([g connection declared]
+ (origin-free!)
+ (unpublished! g)
+ (let [evidence (native-journal! g connection)
+       native-declared (native-declared! g declared)
+       journal-id (get-in g [:resources :managed-root-journal-id])
+       _ (when-not (= (:lifetime connection) (:lifetime (get declared journal-id)))
+           (refuse :queue-root-journal-identity-mismatch))]
+  (locked g
+   (fn []
+    (unpublished! g)
+    (let [key (:cache-key g) prior (get @roots key)
+          row (merge evidence {:generation-id (generation-id g) :application-id (:application-id g)
+                               :phase :enrolled :owner (erlang/self) :ticket (erlang/make_ref)
+                               :declared declared :declared-evidence native-declared
+                               :incarnation (sha256-hex (erlang/term_to_binary
+                                  [(:application-id g) (:resource evidence) (:custody evidence)]))})]
+     (store-roots!
+      (fn [all]
+       (when (contains? all key) (refuse :queue-root-already-enrolled))
+       (when (>= (count all) 4096) (refuse :queue-root-capacity))
+       ;; One physical journal custody per live application in this VM. A new
+       ;; connection incarnation cannot erase earlier unknown accepted work.
+       (when (some (fn [[_ active]]
+                (and (not= (:application-id row) (:application-id active))
+                     (or (= (:root row) (:root active)) (= (:resource row) (:resource active))))) all)
+        (refuse :queue-root-foreign-application-custody))
+       (when (some (fn [[_ active]]
+                (and (= (:application-id row) (:application-id active))
+                     (not= (select-keys row [:root :resource :lifetime :custody])
+                           (select-keys active [:root :resource :lifetime :custody])))) all)
+        (refuse :queue-root-custody-conflict))
+       (assoc all key row)))
+     :enrolled))))))
+(defn evidence!
+ "Read an existing exact root grant under actual selected owned execution.
+  Reading grants no store opening or actor transition; caller still needs
+  generated native starter/family membership before provisioning. PRIVATE."
+ [g]
+ (when-not (and (execution/owned?) (= g (execution/current)))
+  (refuse :queue-root-owned-execution-required))
+ (generation/attested-prepared! g)
+ (locked g
+  (fn []
+   (let [row (get @roots (:cache-key g))
+         now (when row (conn/creation-evidence! (:journal row)))]
+    (when-not (and row (contains? #{:entered :ready} (:phase row))
+                   (= (generation-id g) (:generation-id row)) (= (:application-id g) (:application-id row))
+                   (Process/alive? (:owner row))
+                   (= (:owner row) (:owner (:custody now)))
+                   (= (:custody row) (:custody now)) (= (:lifetime row) (:lifetime now))
+                   (= (:resource row) (:resource now)) (= (declared-path g) (select-keys row [:root :path])))
+     (refuse :queue-root-stale-custody))
+    (doseq [[id original] (:declared-evidence row)]
+     (let [actual (conn/creation-evidence! (get (:declared row) id))]
+      (when-not (and (= (:custody original) (:custody actual))
+                     (= (:lifetime original) (:lifetime actual))
+                     (= (:resource original) (:resource actual)))
+       (refuse :queue-root-stale-custody))))
+    row))))
+(defn inherit!
+ "Original native initializer only. Transfer the same exact declared journal
+  custody to an unpublished candidate. Exact already-ready metadata is an
+  observation; it never replays constructors or changes runtime ownership."
+ [candidate previous]
+ (origin-free!)
+ (generation/attested-prepared! candidate)
+ (generation/attested-prepared! previous)
+ (when-not (and (= (:application-id candidate) (:application-id previous))
+                (= (declared-path candidate) (declared-path previous))
+                (= (declared-store-paths candidate) (declared-store-paths previous)))
+  (refuse :queue-root-scope-mismatch))
+ (locked candidate
+  (fn []
+   (let [old (get @roots (:cache-key previous))
+         native (when old (native-journal! candidate (:journal old)))]
+    (when-not (and old (= (generation-id previous) (:generation-id old)) (= :ready (:phase old))
+                   (= (erlang/self) (:owner old))
+                   (= (:custody old) (:custody native)) (= (:lifetime old) (:lifetime native)))
+     (refuse :queue-root-stale-custody))
+    (when-not (= (:declared-evidence old) (native-declared! candidate (:declared old)))
+     (refuse :queue-root-stale-custody))
+    (if-let [prior (get @roots (:cache-key candidate))]
+     (do
+      (when-not (and (= (generation-id candidate) (:generation-id prior)) (= :ready (:phase prior))
+                     (= (select-keys old [:root :resource :lifetime :custody :owner :declared-evidence])
+                        (select-keys prior [:root :resource :lifetime :custody :owner :declared-evidence])))
+       (refuse :queue-root-already-enrolled))
+      :already-inherited)
+     (do
+      (unpublished! candidate)
+      (let [next (assoc old :generation-id (generation-id candidate) :phase :enrolled :ticket (erlang/make_ref))]
+       (store-roots!
+        (fn [all]
+         (when (contains? all (:cache-key candidate)) (refuse :queue-root-already-enrolled))
+         (when (>= (count all) 4096) (refuse :queue-root-capacity))
+         (assoc all (:cache-key candidate) next))))
+      :inherited))))))
+
+(defn enter-initializer!
+ "Latch uncertainty BEFORE first Source restore/provider/initializer callback.
+  No Source invocation can use a merely enrolled root. Failure after this mark
+  never authorizes dropping grant/Conn custody or replaying constructors."
+ [g]
+ (origin-free!)
+ (generation/attested-prepared! g)
+ (locked g
+  (fn []
+   (let [key (:cache-key g) row (get @roots key)]
+    (when-not (and row (= (generation-id g) (:generation-id row))
+                   (= (erlang/self) (:owner row)) (= :enrolled (:phase row)))
+     (refuse :queue-root-initializer-phase-conflict))
+    (native-journal! g (:journal row))
+    (store-roots! (fn [all]
+      (when-not (= row (get all key)) (refuse :queue-root-stale-custody))
+      (assoc-in all [key :phase] :entered)))
+    :entered))))
+(defn ready!
+ "Original native initializer only, after managed runtime binding. This marks
+  completed construction, never external provider reconciliation or job replay."
+ [g]
+ (origin-free!)
+ (generation/attested-prepared! g)
+ (locked g
+  (fn []
+   (let [key (:cache-key g) row (get @roots key) runtime (:runtime @(:state g))]
+    (when-not (and row (= (generation-id g) (:generation-id row))
+                   (= (erlang/self) (:owner row)) (= :entered (:phase row))
+                   (or (nil? runtime) (= (:owner row) (:owner runtime))))
+     (refuse :queue-root-initializer-phase-conflict))
+    (native-journal! g (:journal row))
+    (store-roots! (fn [all]
+      (when-not (= row (get all key)) (refuse :queue-root-stale-custody))
+      (assoc-in all [key :phase] :ready)))
+    :ready))))
+(defn abort-unentered!
+ "Revoke only an exact enrollment NEVER made available to Source or an actor.
+  Entered/ready/unknown construction stays held; this NEVER closes a Conn,
+  releases a writer/flock, kills a process or authorizes initializer retry."
+ [g]
+ (origin-free!)
+ (unpublished! g)
+ (locked g
+  (fn []
+   (let [key (:cache-key g) row (get @roots key)]
+    (when-not (and row (= (generation-id g) (:generation-id row))
+                   (= (erlang/self) (:owner row)) (= :enrolled (:phase row)))
+     (refuse :queue-root-custody-still-active))
+    (native-journal! g (:journal row))
+    (store-roots! (fn [all]
+      (when-not (= row (get all key)) (refuse :queue-root-stale-custody))
+      (dissoc all key)))
+    :revoked))))
+(defn release-retired!
+ "Fixed SDK retirement observer, called AFTER successful actual native module
+  retirement while private prepared-cache identity still exists. Drops only
+  graph enrollment metadata; never closes shared journal/writer or its other
+  generation grants. Failed/uncertain initializer alone cannot call this path."
+ [g]
+ (if-not (get @roots (:cache-key g)) :absent
+  (do
+   (origin-free!)
+   (generation/attested-prepared! g true)
+   (when-not (:retired @(:state g)) (refuse :queue-root-generation-still-active))
+   (locked g
+    (fn []
+     (let [key (:cache-key g) row (get @roots key)]
+      (when row
+       (when-not (and (= (generation-id g) (:generation-id row)) (not= :entered (:phase row)))
+        (refuse :queue-root-custody-still-active))
+       (store-roots! (fn [all]
+         (when-not (= row (get all key)) (refuse :queue-root-stale-custody))
+         (dissoc all key))))
+      :released))))))
+
+(defn retirement-blocker
+ "Private fixed SDK retirement preflight. Unknown accepted initialization or
+  Source execution cannot dispose a root grant; no application Boolean or
+  generation state flag substitutes for a known original native boundary."
+ [g]
+ (when-let [row (get @roots (:cache-key g))]
+  (generation/attested-prepared! g true)
+  (cond
+   (or (BeamLisp.Env/assert_execution_context!) (BeamLisp.Env/execution_origin))
+    :queue-root-native-retirement-required
+   (= :entered (:phase row)) :queue-root-initializer-uncertain
+   :else
+    ;; SDK allocation custody outlives its actor. Retiring its graph/root
+    ;; would discard accepted allocation authority merely because init died.
+    (when (env/with-env :global #(BeamLisp.Env/loaded_ns? "proc.queue-family-storage"))
+     (let [check (env/with-env :global
+                   #(BeamLisp.AOT/sdk_named_constructor! "proc.queue-family-storage" "retirement-blocker" 1))]
+      (check g))))))
