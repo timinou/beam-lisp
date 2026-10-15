@@ -157,9 +157,15 @@
 (defn- register
   "Record a freshly created module's `{kind, ns, name, fields}` entry."
   [mod kind ns name fields]
-  (persistent_term/put
-    (registry-key)
-    (Map/put (persistent_term/get (registry-key) {}) mod (tuple kind ns name fields))))
+  ;; Different class origins may publish concurrently. Their per-module
+  ;; locks do not serialize this shared persistent-term map's read/modify/write.
+  ;; Hold this distinct registry fence only for the native map update; never
+  ;; acquire a module lock or run user code while it is held.
+  (BeamLisp.Env/with_generation_lock (tuple :record-registry (self-mod))
+    (fn []
+      (persistent_term/put
+        (registry-key)
+        (Map/put (persistent_term/get (registry-key) {}) mod (tuple kind ns name fields))))))
 
 ; ── type predicates ──────────────────────────────────────────────────────
 
@@ -209,37 +215,14 @@
 ; ── definition ───────────────────────────────────────────────────────────
 
 (defn define
-  "Define a record type `name` in namespace `ns` with `fields`, returning the
-   struct module. The module is created (or, on redefinition, updated) with the
-   standard `__struct__/0,1` ABI so it is a first-class Elixir struct; the
-   registry records the field list.
-
-   The whole define is a VM-wide critical section: two envs loading the same
-   namespace concurrently would otherwise race host publication. The record
-   registry is global, so creation must serialize."
+  "Define a canonical record through one atomic native publication boundary."
   [ns name fields]
-  (let [mod (module_name ns name)]
-    ; {resource, requester}: :global lock ids must be that 2-tuple shape.
-    (global/trans (tuple mod (erlang/self))
-      (fn []
-        (let [field-atoms (Enum/map fields (fn [f] (String/to_atom f)))]
-          (validate_struct_fields! field-atoms)
-          (create_module mod :record field-atoms)
-          (register mod :record ns name field-atoms)
-          mod)))))
+  (publish_declaration! (declaration_descriptor ns name :record fields)))
 
 (defn define_type
-  "Define a deftype `name` in `ns` with `fields`, returning its module. No
-   `defstruct`: a deftype has no map semantics. The module exists only as a
-   type identity for protocol dispatch. Serialized for the same reason as
-   `define/3`."
+  "Define a canonical deftype through one atomic native publication boundary."
   [ns name fields]
-  (let [mod (module_name ns name)]
-    (global/trans (tuple mod (erlang/self))
-      (fn []
-        (create_module mod :deftype (list))
-        (register mod :deftype ns name (Enum/map fields (fn [f] (String/to_atom f))))
-        mod))))
+  (publish_declaration! (declaration_descriptor ns name :deftype fields)))
 
 ; ── construction ─────────────────────────────────────────────────────────
 
@@ -381,7 +364,7 @@
              (erlang/error (Elixir.KeyError/exception (list (tuple :key key) (tuple :term struct))))))
          (erlang/error (Elixir.FunctionClauseError/exception (list))))))))
 
-(defn- create_module
+(defn- class_descriptor
   "Compile the complete replacement before touching the loaded module or
    registry."
   [mod kind fields]
@@ -398,10 +381,160 @@
                 (list {:pop :pvar :name "kv"})))
             (struct_info_clauses mod fields))
           (list (BeamLisp.Emit/function_clause :__bl_deftype__ (BeamLisp.Emit/lit true))))
-        beam (BeamLisp.Emit/compile_descriptor (BeamLisp.Emit/descriptor_for mod clauses))]
-    (code/purge mod)
-    (code/delete mod)
-    (BeamLisp.Emit/load_binary! beam "beam_lisp_record")))
+        descriptor (BeamLisp.Emit/descriptor_for mod clauses)] descriptor))
+
+(defn declaration_descriptor
+  "Pure compiler producer for a named record/deftype. Never loads code, interns
+   a constructor, changes a registry or starts an initializer. Field order is
+   part of the immutable type identity; actor authority is never granted."
+  [ns name kind fields]
+  (when-not (and (erlang/is_binary ns) (erlang/> (erlang/byte_size ns) 0)
+                (erlang/=< (erlang/byte_size ns) 512)
+                (erlang/is_binary name) (erlang/> (erlang/byte_size name) 0)
+                (erlang/=< (erlang/byte_size name) 128)
+                (Enum/member? (list :record :deftype) kind)
+                (erlang/is_list fields) (erlang/=< (erlang/length fields) 256)
+                (Enum/all? fields (fn [field]
+                  (and (erlang/is_binary field) (erlang/> (erlang/byte_size field) 0)
+                       (erlang/=< (erlang/byte_size field) 128)))))
+    (argument-error "invalid immutable record/deftype declaration"))
+  (let [mod (module_name ns name)
+        field-atoms (Enum/map fields (fn [field] (String/to_atom field)))
+        _ (when (and (erlang/== :record kind) (Enum/member? field-atoms :__struct__))
+            (argument-error "cannot set :__struct__ in struct definition"))
+        descriptor (class_descriptor mod kind (if (erlang/== :record kind) field-atoms (list)))
+        existing (info mod) wanted (tuple kind ns name field-atoms)]
+    (when (and existing
+               (erlang/not (erlang/== (tuple (elem existing 0) (elem existing 1) (elem existing 2))
+                                     (tuple kind ns name))))
+      (argument-error "record/deftype module already belongs to a different declaration origin"))
+    (Map/put descriptor :attrs
+      (list (BeamLisp.Vector/new (list :bl_generated_class
+                  (tuple 1 ns name kind fields)))))))
+
+(defn declaration_kind
+  "Recognize only this producer's canonical class body at an actual compiler
+   declaration site. Unit stamps may be added later; they confer no actor role."
+  [descriptor ns name]
+  (let [attributes (Map/get descriptor :attrs (list))
+        metadata (Enum/find_value attributes
+                    (fn [entry]
+                      (let [parts (if (erlang/is_tuple entry) (Tuple/to_list entry)
+                                      (if (erlang/is_list entry) entry
+                                        (BeamLisp.Vector/to_list entry)))]
+                        (when (and (erlang/== 2 (erlang/length parts))
+                                   (erlang/== :bl_generated_class (erlang/hd parts)))
+                          (erlang/hd (erlang/tl parts))))))]
+    (when (and (erlang/is_tuple metadata) (erlang/== 5 (erlang/tuple_size metadata))
+               (erlang/== 1 (elem metadata 0)) (erlang/== ns (elem metadata 1))
+               (erlang/== name (elem metadata 2)))
+      (let [kind (elem metadata 3)
+            canonical (declaration_descriptor ns name kind (elem metadata 4))]
+        (let [unit-keys (list :bl_source_hash :bl_compiler_key :bl_unit_source_digest
+                             :bl_aot_artifact_version :bl_unit_namespace
+                             :bl_declaration_owner :bl_generated_class_version
+                             :bl_aot_artifact_role)
+              clean (Enum/reject attributes
+                      (fn [entry]
+                        (let [parts (if (erlang/is_tuple entry) (Tuple/to_list entry)
+                                        (if (erlang/is_list entry) entry
+                                          (BeamLisp.Vector/to_list entry)))]
+                          (and (erlang/== 2 (erlang/length parts))
+                               (Enum/member? unit-keys (erlang/hd parts))))))]
+          (when (and (erlang/== clean (Map/get canonical :attrs))
+                     (erlang/== (Map/drop descriptor (list :attrs :ann))
+                                (Map/drop canonical (list :attrs :ann)))) kind))))))
+
+(defn declaration_metadata [descriptor]
+  (Enum/find_value (Map/get descriptor :attrs (list))
+    (fn [entry]
+      (let [parts (if (erlang/is_tuple entry) (Tuple/to_list entry)
+                      (if (erlang/is_list entry) entry (BeamLisp.Vector/to_list entry)))]
+        (when (and (erlang/== 2 (erlang/length parts))
+                   (erlang/== :bl_generated_class (erlang/hd parts)))
+          (erlang/hd (erlang/tl parts)))))))
+(defn- class_identity! [descriptor]
+  (let [metadata (declaration_metadata descriptor)]
+    (when-not (and (erlang/is_tuple metadata) (erlang/== 5 (erlang/tuple_size metadata))
+                   (declaration_kind descriptor (elem metadata 1) (elem metadata 2)))
+      (argument-error "not a canonical record/deftype descriptor"))
+    metadata))
+(defn- loaded_md5? [mod expected]
+  (and (erlang/module_loaded mod)
+       (erlang/== expected (erlang/apply mod :module_info (list :md5)))))
+; Consistency check ONLY. Loaded attributes do not grant SDK/actor authority.
+(defn- loaded_class_identity? [mod metadata]
+  (and (erlang/module_loaded mod)
+       (let [actual (erlang/apply :proplists :get_value
+                      (list :bl_generated_class (erlang/apply mod :module_info (list :attributes))))]
+         ;; Native descriptor artifacts expose direct values; ordinary OTP
+         ;; attribute collection may wrap one value. Both must match exactly.
+         (or (erlang/== metadata actual) (erlang/== (list metadata) actual)))))
+
+(defn- publish_class! [descriptor pair expected]
+  (let [metadata (class_identity! descriptor) ns (elem metadata 1) name (elem metadata 2)
+        kind (elem metadata 3) fields (elem metadata 4) mod (Map/fetch! descriptor :name)]
+    (when-not (and (erlang/is_binary expected) (erlang/== 16 (erlang/byte_size expected)))
+      (argument-error "invalid compiler-emitted class digest"))
+    (global/trans (tuple mod (erlang/self))
+      (fn []
+        ;; Origin registry and physical class code share one atomic native
+        ;; module fence. Unleased ordinary dev edits remain supported; a live
+        ;; class can never change either its executable bytes OR field schema.
+        (BeamLisp.Env/with_module_locks (list mod)
+         (fn []
+          (declaration_descriptor ns name kind fields)
+          (let [existing (info mod)
+                wanted (tuple kind ns name (Enum/map fields (fn [field] (String/to_atom field))))
+                changed (or (erlang/not (loaded_md5? mod expected))
+                            (and existing (erlang/not (erlang/== existing wanted))))]
+           ;; The first retained deftype has no registry row yet and its
+           ;; executable MD5 omits fields. Require the exact compiler-produced
+           ;; schema on the loaded artifact before accepting that registration.
+           ;; This consistency check never confers SDK or actor authority.
+           (when (and (erlang/== nil existing) (BeamLisp.Env/live_code_leases? mod)
+                      (erlang/not (loaded_class_identity? mod metadata)))
+            (erlang/error (tuple :leased_class_identity_unregistered mod)))
+           (when (and changed (BeamLisp.Env/live_code_leases? mod))
+            (erlang/error (tuple :code_leased mod)))
+           (when (erlang/== :record kind) (validate_struct_fields! (elem wanted 3)))
+           (when-not (loaded_md5? mod expected)
+            (when-not (and pair (erlang/== mod (elem pair 0))
+                           (erlang/== expected (elem (elem (beam_lib/md5 (elem pair 1)) 1) 1)))
+             (argument-error "canonical generated class artifact unavailable"))
+            (BeamLisp.Env/publish_binaries! (list pair) "beam_lisp_class"))
+           (when-not (loaded_md5? mod expected)
+            (argument-error "generated class executable identity changed"))
+           (register mod kind ns name (elem wanted 3))
+           mod)))))))
+(defn publish_declaration!
+  "Source/compiler path. Validate one canonical descriptor, compile ONCE,
+   then atomically fence publication plus immutable origin registration."
+  [descriptor]
+  (class_identity! descriptor)
+  (let [pair (BeamLisp.Emit/compile_descriptor descriptor)
+        expected (elem (elem (beam_lib/md5 (elem pair 1)) 1) 1)]
+    (publish_class! descriptor pair expected)))
+(defn replay_declaration!
+  "Emitted/AOT path. Exact compiler-owned MD5, loaded artifact or ordinary
+   object path; NO code generation or loaded-attribute trust. Same origin lock.
+   AOT rewrites only actual canonical class producer calls to this form."
+  [descriptor expected]
+  (class_identity! descriptor)
+  (let [mod (Map/fetch! descriptor :name)
+        object (when-not (loaded_md5? mod expected) (code/get_object_code mod))
+        pair (when (and (erlang/is_tuple object) (erlang/== 3 (erlang/tuple_size object))
+                         (erlang/== mod (elem object 0))) (tuple mod (elem object 1)))]
+    (publish_class! descriptor pair expected)))
+
+(defn- create_module [mod kind fields]
+  (let [beam (BeamLisp.Emit/compile_descriptor (class_descriptor mod kind fields))
+        expected (elem (elem (beam_lib/md5 (elem beam 1)) 1) 1)]
+    (BeamLisp.Env/with_module_locks (list mod)
+      (fn []
+        (when (and (erlang/not (loaded_md5? mod expected)) (BeamLisp.Env/live_code_leases? mod))
+          (erlang/error (tuple :code_leased mod)))
+        (BeamLisp.Env/publish_binaries! (list beam) "beam_lisp_record")))))
 
 (defn- validate_struct_fields!
   [fields]
