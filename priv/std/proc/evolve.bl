@@ -1,7 +1,7 @@
 ; Stable process identity, versioned messages and atomic handler/state evolution.
 ; Upgrade callbacks are pure and short. External effects belong to durable jobs.
 (ns proc.evolve
- (:require [proc.server :as ps] [proc.callback :as cb] [proc.fence :as fence] [proc.queue :as queue] [proc.owner-registry :as owners] [datom.conn :as dc] [core]))
+ (:require [proc.server :as ps] [proc.callback :as cb] [proc.fence :as fence] [proc.queue :as queue] [proc.owner-registry :as owners] [proc.framework :as framework] [reload.execution :as execution] [datom.conn :as dc] [core]))
 
 (defn- valid-version? [v] (and (erlang/is_integer v) (> v 0)))
 (defn- validate! [spec]
@@ -240,7 +240,10 @@
  (let [rows (ets/lookup :beam_lisp_vars (tuple :bl-evolve-owner pid))]
   (when (seq rows)
    (let [row (first rows)]
-    (if (Process/alive? pid) (elem row 1)
+    (if (Process/alive? pid)
+     (let [evidence (elem row 1)]
+      (when (or (nil? (:inventory evidence)) (owners/owned-role-live? (:inventory evidence)))
+       (dissoc evidence :lease :inventory)))
      (do (ets/delete_object :beam_lisp_vars row) nil))))))
 (defn owner? [pid] (some? (owner-evidence pid)))
 
@@ -251,26 +254,31 @@
     (throw (ex-info "Evolution migration budget must be 1..30000ms" {:kind :invalid-evolution})))
    (when-not (and (erlang/is_integer limit) (> limit 0) (<= limit 1024))
     (throw (ex-info "Evolution history must be bounded" {:kind :invalid-evolution})))
-   (let [spec (prepare-spec (:spec opts))
-         held (retain! spec)]
-    (try (valid-state! held (:state opts))
-         (when (owner? (erlang/self))
-          (throw (ex-info "Owner already has an evolution slice" {:kind :duplicate-evolution})))
-         (let [previous (BeamLisp.Env/capture)
-               inventory (try
-                          (BeamLisp.Env/bind (:environment spec))
-                          (owners/register! (erlang/self) :evolve (get-in held [:handler :lease])
-                            {:managed (:managed opts false)} (elem (get-in held [:handler :lease]) 2))
-                          (finally (BeamLisp.Env/bind previous)))
-               ticket (when inventory (:proof-id inventory))
-               evidence {:pid (erlang/self) :ticket (or ticket (erlang/make_ref))
-                         :application-id (:application-id inventory)
-                         :managed (:managed opts false) :kind :proc.evolve}]
-          (ets/insert :beam_lisp_vars (tuple (tuple :bl-evolve-owner (erlang/self)) evidence))
-          {:current held :value (:state opts) :adapters {} :history-limit limit :upgrade-ms budget
-           :owner-evidence evidence :inventory inventory :revision 0
-           :managed (:managed opts false) :clients {} :queues #{} :fenced #{} :fenced-through 0 :retired-through 0})
-         (catch e (release! held) (throw e))))))
+   (let [spec (prepare-spec (:spec opts)) held (retain! spec)
+         adopted (atom nil) registered (atom nil)]
+    (try
+     (valid-state! held (:state opts))
+     (when (ets/member :beam_lisp_vars (tuple :bl-evolve-owner (erlang/self)))
+      (throw (ex-info "Owner already has an evolution slice" {:kind :duplicate-evolution})))
+     ;; Only the standalone SDK engine requests framework adoption. Composed
+     ;; app declarations retain their ordinary containing actor's entire graph.
+     ;; Without bound initializer resources the safe default remains app-owned.
+     (when (and (:standalone-sdk-owner opts) (execution/runtime-owner))
+      (reset! adopted (framework/adopt! (execution/runtime-owner))))
+     (reset! registered (owners/register-owned-role! :evolve {:managed (:managed opts false)}))
+     (let [capability (owners/current-owner-capability) inventory @registered
+           evidence {:pid (erlang/self) :ticket (or (:proof-id inventory) (erlang/make_ref))
+                     :application-id (:application-id inventory) :inventory inventory
+                     :lease (:lease capability) :managed (:managed opts false) :kind :proc.evolve}]
+      (ets/insert :beam_lisp_vars (tuple (tuple :bl-evolve-owner (erlang/self)) evidence))
+      {:current held :value (:state opts) :adapters {} :history-limit limit :upgrade-ms budget
+       :owner-evidence evidence :inventory inventory :framework @adopted :revision 0
+       :managed (:managed opts false) :clients {} :queues #{} :fenced #{} :fenced-through 0 :retired-through 0})
+     (catch error
+      (try (owners/unregister! @registered)
+       (finally
+        (try (release! held) (finally (framework/close! @adopted)))))
+      (throw error))))))
 
 (defn- rehearsal [st expected spec budget]
  (cond
@@ -296,6 +304,8 @@
 (defn message-step
  "Shared versioned-owner engine, used by standalone and composed owners."
  [st message]
+ (if-not (framework/alive? (:framework st))
+  [{:status :refused :kind :framework-initializer-exited} st]
  (case (first message)
   :proc.evolve/call
    (if (:managed st) [{:status :refused :kind :managed-client-required} st]
@@ -340,15 +350,21 @@
      :managed (:managed st) :clients (count (:clients st))
      :queues (vec (:queues st)) :fenced-versions (vec (sort (:fenced st)))
      :fenced-through (:fenced-through st) :pid (erlang/self)} st]
-  [{:status :refused :kind :unknown-evolution-message} st]))
+  [{:status :refused :kind :unknown-evolution-message} st])))
 
 (defn close-state! [st]
- (forget-preparation st)
- (owners/unregister! (:inventory st))
- (when (:owner-evidence st)
-  (ets/delete_object :beam_lisp_vars (tuple (tuple :bl-evolve-owner (get-in st [:owner-evidence :pid])) (:owner-evidence st))))
- (release! (:current st))
- (doseq [edge (vals (:adapters st))] (release-edge! edge))
+ (try
+  (forget-preparation st)
+  (try (owners/unregister! (:inventory st))
+   (finally
+    (when (:owner-evidence st)
+     (ets/delete_object :beam_lisp_vars
+       (tuple (tuple :bl-evolve-owner (get-in st [:owner-evidence :pid])) (:owner-evidence st))))))
+  (finally
+   (try (release! (:current st))
+    (finally
+     (try (doseq [edge (vals (:adapters st))] (release-edge! edge))
+      (finally (framework/close! (:framework st))))))))
  :ok)
 (defn composed-state [opts]
  {:evolve (initial-state opts)})
@@ -382,9 +398,13 @@
 (ps/extend-clause! :evolve evolution-clause)
 
 (ps/defserver owner
- (init [opts] (ok (initial-state opts)))
+ (init [opts] (ok (initial-state (assoc opts :standalone-sdk-owner true))))
  (handle-call message [_ st]
   (let [[value after] (message-step st message)] (reply value after)))
+ (handle-info [:DOWN ref :process pid _] [st]
+  (if (framework/initializer-down? (:framework st) ref pid)
+   (stop :normal st) (noreply st)))
+ (handle-info _ [st] (noreply st))
  (terminate [_ st] (close-state! st)))
 
 (defn start!
