@@ -1,0 +1,123 @@
+; Real sealed SDK execution, native Conn lifetimes and accepted-work barriers.
+; Uncertain resources intentionally remain held until this test VM exits: no
+; test-only unlock claims recovery evidence which production does not have.
+(ns reload.guard-reservation-test
+ (:require [reload.generation :as generation] [datom :as d] [datom.conn :as conn] [env]))
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- graph [app version]
+ (generation/prepare! {:application-id app :stable-namespaces #{"datom" "datom.conn"}
+  :sources {"reservation.app"
+   (str "(ns reservation.app (:require [datom :as d] [datom.conn :as conn]))
+    (def revision " version ") (defn policy [report] nil)
+    (defn install! [c] (conn/guard! c :reservation/policy policy))
+    (defn write! [c n] (d/transact! c [[:db/add 1 :test/value n]]))")}}))
+(defn- connection [] (d/connect [{:db/ident :test/value :db/valueType :db.type/long}]))
+(defn- inventory [g c] (generation/with! g #(conn/guard-association-inventory! c)))
+(defn- await [predicate]
+ (loop [left 2000] (cond (predicate) true (zero? left) false
+                   :else (do (Process/sleep 5) (recur (dec left))))))
+(defn- await-continue [ticket]
+ (receive [:continue seen] :when (= ticket seen) :continue (after 10000 (throw :held-action-lost))))
+
+(deftest accepted-activation-freezes-policy-close-and-new-store-admission-with-writes-live
+ (let [old (graph "reservation-known" 1) next (graph "reservation-known" 2)
+       c (generation/with! old connection) parent (erlang/self) ticket (erlang/make_ref)
+       child (atom nil) published (atom 0)]
+  (try
+   (generation/invoke! old "reservation.app/install!" [c])
+   (let [receipt (inventory next c) guard (conn/guard-owner c :reservation/policy)]
+    (reset! child (spawn (fn []
+      (generation/with! next
+       #(conn/with-guard-reservation! [receipt]
+         (fn []
+          (erlang/send parent [:activation-entered ticket (env/capture)])
+          (await-continue ticket)
+          (conn/with-guard-publication-fence! [receipt]
+           (fn [] (swap! published inc) :published)))))
+      (erlang/send parent [:activation-returned ticket]))))
+    (let [token (receive [:activation-entered seen token] :when (= ticket seen) token (after 10000 nil))]
+     (is (map? token))
+     (is (= {:state :activating} (conn/guard-reservation-status c)))
+     (is (= :guard-association-reserved (kind #(conn/release! c))))
+     (is (= :guard-association-reserved
+            (kind #(generation/with! old #(conn/remove-declared-guard! c :reservation/policy guard)))))
+     (is (= :guard-association-reserved (kind #(inventory next c))))
+     (is (= :guard-store-admission-reserved (kind #(generation/with! old connection))))
+     (is (= guard (conn/guard-owner c :reservation/policy)))
+     (is (= :open @(:lifetime c)))
+     (generation/invoke! old "reservation.app/write!" [c 17])
+     (is (= 17 (:test/value (d/entity (d/db c) 1))))
+     (let [previous (env/capture)]
+      (try (env/bind token)
+       (is (= :managed-guard-execution-required (kind #(conn/guard-association-inventory! c))))
+       (finally (env/bind previous))))
+     (erlang/send @child [:continue ticket])
+     (is (receive [:activation-returned seen] :when (= ticket seen) true (after 10000 false)))
+     (is (= 1 @published))
+     (is (= {:state :free} (conn/guard-reservation-status c)))
+     (is (= receipt (inventory next c)))
+     (generation/with! old #(conn/remove-declared-guard! c :reservation/policy guard))
+     (is (nil? (conn/guard-owner c :reservation/policy)))
+     (let [fresh (generation/with! old connection)] (is (= :open @(:lifetime fresh))) (conn/release! fresh))))
+   (finally (when @child (erlang/send @child [:continue ticket]) (await #(not (Process/alive? @child))))
+    (conn/release! c) (generation/retire! old) (generation/retire! next)))))
+
+(deftest source-snapshot-cannot-omit-a-new-native-connection-before-gate-installation
+ (let [g (graph "reservation-extra" 1) c (generation/with! g connection)
+       receipt (inventory g c) extra (generation/with! g connection) called (atom 0)]
+  (try
+   (is (= :stale-guard-association-inventory
+          (kind #(generation/with! g
+                  #(conn/with-guard-reservation! [receipt] (fn [] (swap! called inc)))))))
+   (is (= 0 @called)) (is (= {:state :free} (conn/guard-reservation-status c)))
+   (is (= :completed (generation/with! g
+      #(conn/with-guard-reservation! [(inventory g extra) (inventory g c)] (fn [] :completed)))))
+   (is (= {:state :free} (conn/guard-reservation-status extra)))
+   (finally (conn/release! c) (conn/release! extra) (generation/retire! g)))))
+
+(deftest accepted-effect-then-exception-quarantines-without-replay-or-unlock
+ (let [g (graph "reservation-uncertain-error" 1) c (generation/with! g connection) effects (atom 0)]
+  (generation/invoke! g "reservation.app/install!" [c])
+  (is (= :accepted-result-lost
+    (kind #(generation/with! g
+      #(conn/with-guard-reservation! [(inventory g c)]
+        (fn [] (swap! effects inc) (throw (ex-info "lost reply" {:kind :accepted-result-lost}))))))))
+  (is (= 1 @effects)) (is (= {:state :uncertain} (conn/guard-reservation-status c)))
+  (is (= :guard-activation-uncertain (kind #(inventory g c))))
+  (is (= :guard-association-reserved (kind #(conn/release! c))))
+  (is (= :guard-store-admission-reserved (kind #(generation/with! g connection))))
+  (is (= :guard-activation-uncertain
+    (kind #(generation/with! g #(conn/with-guard-reservation! [(inventory g c)]
+      (fn [] (swap! effects inc)))))))
+  (is (= 1 @effects)) (is (= :open @(:lifetime c)))
+  ;; The known old writer remains usable; uncertainty is not a data write freeze.
+  (generation/invoke! g "reservation.app/write!" [c 19])
+  (is (= 19 (:test/value (d/entity (d/db c) 1))))
+  (generation/retire! g)))
+
+(deftest holder-death-does-not-cancel-already-accepted-work-or-release-reservation
+ (let [g (graph "reservation-uncertain-death" 1) c (generation/with! g connection)
+       parent (erlang/self) ticket (erlang/make_ref) effect (atom nil)
+       holder (spawn (fn []
+        (generation/with! g
+         #(conn/with-guard-reservation! [(inventory g c)]
+           (fn []
+            ;; Separate accepted operation has its own lifetime. Holder death
+            ;; is deliberately not proof that this operation has finished.
+            (reset! effect (spawn (fn [] (await-continue ticket) (erlang/send parent [:effect-finished ticket]))))
+            (erlang/send parent [:holder-accepted ticket])
+            (await-continue ticket))))))]
+  (is (receive [:holder-accepted seen] :when (= ticket seen) true (after 10000 false)))
+  (Process/exit holder :kill)
+  (is (await #(not (Process/alive? holder))))
+  (is (await #(= :uncertain (:state (conn/guard-reservation-status c)))))
+  (is (Process/alive? @effect))
+  (is (= :guard-association-reserved (kind #(conn/release! c))))
+  (erlang/send @effect [:continue ticket])
+  (is (receive [:effect-finished seen] :when (= ticket seen) true (after 10000 false)))
+  (is (await #(not (Process/alive? @effect))))
+  ;; Even actual effect completion alone lacks journal/native participant
+  ;; reconciliation. There is no forged ticket/death-based unlock API.
+  (is (= {:state :uncertain} (conn/guard-reservation-status c)))
+  (is (= :guard-activation-uncertain (kind #(inventory g c))))
+  (generation/retire! g)))

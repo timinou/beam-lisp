@@ -26,7 +26,7 @@
   (:require [datom.current] [datom.db] [datom.index] [datom.schema] [datom.store] [datom.store-ets]
             [datom.store-overlay] [datom.tx] [datom.broadcast] [datom.attr-basis] [env]
             [datom.blob] [datom.blob-ets] [datom.blob-fs] [datom.blob-overlay]
-            [datom.file] [datom.index-coverage] [datom.text] [datom.query.rank-build] [datom.query.rank-demand] [data.bounded-cache] [proc.admission :as admission] [reload.declaration :as declaration] [reload.execution :as execution] [proc.callback :as callback]))
+            [datom.file] [datom.index-coverage] [datom.text] [datom.query.rank-build] [datom.query.rank-demand] [data.bounded-cache] [proc.admission :as admission] [reload.declaration :as declaration] [reload.execution :as execution] [proc.callback :as callback] [proc.lifetime :as lifetime]))
 
 ;; ── env conveyance (PLAN-047 W1) ─────────────────────────────────────
 ;;
@@ -337,7 +337,17 @@
                    (not (= requested-blobs (:blobs hit))))
             (->tuple-2 {:error {:configured (:blobs hit) :requested requested-blobs}} reg)
             (->tuple-2 hit reg)))
-          (let [blobs (resolve-blobs store requested-blobs)
+          (let [path (when (erlang/is_map store) (maps/get :path store nil))
+                _ (doseq [[_ gate] (get reg :datom.conn/guard-admissions {})]
+                    ;; Refusal only: root containment never confers creator or
+                    ;; guard authority. The same Agent turn serializes this
+                    ;; check with gate installation and actual cell creation.
+                    (when (or (and creator (= (:application-id creator) (:application-id gate)))
+                              (and (:root gate) (string? path)
+                                   (String/starts_with? (Path/expand path) (str (:root gate) "/"))))
+                     (throw (ex-info "Store admission is reserved by native activation"
+                                     {:kind :guard-store-admission-reserved}))))
+                blobs (resolve-blobs store requested-blobs)
                 cell {:writer (start-writer) :basis (atom initial-basis)
                       :schema (atom initial-schema)
                       :schema-publication (atom nil)
@@ -428,7 +438,11 @@
 (defn- guard-association-mutation! [key action]
  (when (Process/get :datom.conn/guard-publication)
   (guard-fail! :guard-publication-mutation-forbidden))
- (BeamLisp.Env/with_generation_lock (tuple :datom-guard-association key) action))
+ (BeamLisp.Env/with_generation_lock (tuple :datom-guard-association key)
+  (fn []
+   (when (Agent/get (registry) (fn [entries] (:guard-reservation (get entries key))) 30000)
+    (guard-fail! :guard-association-reserved))
+   (action))))
 (defn- managed-guard? [entry] (and (map? entry) (= :managed-guard (:kind entry))))
 (defn- guards-for [conn]
  (let [entries (guard-entries (:store conn)) managed? (declaration/managed?)
@@ -692,27 +706,28 @@
                               (contains? #{nil application-id} (get-in cell [:guard-creator :application-id])))
                 (throw (ex-info "Declared connection is not owned" {:kind :stale-owned-store})))))
           matches (vec (keep (fn [[store cell]]
+           (when (not= store :datom.conn/guard-admissions)
             (let [path (:path store) creator (:guard-creator cell)
                   explicit? (contains? explicit store) same? (= application-id (:application-id creator))]
              ;; Root containment is a refusal boundary, never creator authority.
              ;; Unknown rows cannot silently disappear from a complete migration
              ;; inventory. Only the exact declared native handle may borrow one.
-             (when (and (= :open @(:lifetime cell)) (string? path)
+             (when (and (:lifetime cell) (= :open @(:lifetime cell)) (string? path)
                         (String/starts_with? path (str root "/"))
                         (nil? (:application-id creator)) (not explicit?))
               (throw (ex-info "Store creator authority is unclassified"
                               {:kind :unclassified-owned-store})))
-             (when (and (= :open @(:lifetime cell)) (string? path) (String/starts_with? path (str root "/"))
+             (when (and (:lifetime cell) (= :open @(:lifetime cell)) (string? path) (String/starts_with? path (str root "/"))
                         (:application-id creator) (not same?))
               (throw (ex-info "Foreign store under application root" {:kind :foreign-owned-store})))
-             (when (or explicit? (and same? (= :open @(:lifetime cell))))
+             (when (or explicit? (and same? (:lifetime cell) (= :open @(:lifetime cell))))
               (when-not (and (string? path) (= path (Path/expand path))
                              (String/starts_with? path (str root "/")))
                (throw (ex-info "Owned store is outside the declared root" {:kind :owned-store-outside-root})))
               (when (= :open @(:lifetime cell))
                (assoc (->Conn store (:schema cell) (:basis cell) (:writer cell)
                               (:subs cell) (:blobs cell) (:lifetime cell))
-                      :snapshot (:snapshot cell) :schema-publication (:schema-publication cell)))))) entries))]
+                      :snapshot (:snapshot cell) :schema-publication (:schema-publication cell))))))) entries))]
      (when (or (> (count matches) 4096)
                (not= (count matches) (count (set (map #(get-in % [:store :path]) matches)))))
       (throw (ex-info "Owned store inventory is ambiguous or too large" {:kind :owned-store-inventory-refused})))
@@ -730,7 +745,7 @@
         matches (if (= :undefined pid) []
                   (Agent/get pid (fn [entries]
                     (vec (keep (fn [[store cell]]
-                      (when (and (= path (:path store)) (:lifetime cell)
+                      (when (and (not= store :datom.conn/guard-admissions) (= path (:path store)) (:lifetime cell)
                                  (= :open @(:lifetime cell)))
                         (assoc (->Conn store (:schema cell) (:basis cell) (:writer cell)
                                        (:subs cell) (:blobs cell) (:lifetime cell))
@@ -1520,6 +1535,14 @@
       (when-not (and (= :guard (get-in catalogue [name :data :kind]))
                     (= name (get-in catalogue [name :data :ident])))
        (guard-fail! :missing-guard-declaration)))
+     (let [reservation (Agent/get (registry) (fn [cells] (:guard-reservation (get cells key))) 30000)
+           holder (Process/get :datom.conn/guard-reservation)]
+      (when (and reservation
+                 (not (and (= (erlang/self) (:owner reservation))
+                           (= holder (:ticket reservation))
+                           (= :activating (:phase reservation)))))
+       (guard-fail! (if (= :uncertain (:phase reservation))
+                     :guard-activation-uncertain :guard-association-reserved))))
      {:kind :guard-association-inventory :application-id app :generation (:digest graph)
       :scope (:scope graph) :connection conn :resource key :lifetime (:lifetime conn) :creator creator
       :guards entries})))))
@@ -1568,6 +1591,145 @@
     (Process/put :datom.conn/guard-publication true)
     (try (action)
      (finally (Process/delete :datom.conn/guard-publication)))))))
+
+(defn- guard-reservation-update! [receipts ticket transform]
+ ;; One bounded Agent decision, under sorted metadata locks. No writer, owner
+ ;; RPC, callback or user data is evaluated by this decision.
+ (with-guard-association-locks receipts
+  (fn [] (agent-get-and-update (registry)
+   (fn [cells]
+    (let [next (reduce (fn [state receipt]
+                 (let [key (:resource receipt) cell (get state key)
+                       held (:guard-reservation cell)]
+                  (if (and (= (:lifetime receipt) (:lifetime cell))
+                           (= ticket (:ticket held)))
+                   (let [replacement (transform held)]
+                    (assoc state key (if replacement (assoc cell :guard-reservation replacement)
+                                       (dissoc cell :guard-reservation))))
+                   state))) cells receipts)]
+     (let [gates (get next :datom.conn/guard-admissions {})
+           remaining (reduce (fn [state [app held]]
+                        (if (= ticket (:ticket held))
+                         (if-let [replacement (transform held)] (assoc state app replacement) (dissoc state app))
+                         state)) gates gates)
+           next (if (empty? remaining) (dissoc next :datom.conn/guard-admissions)
+                  (assoc next :datom.conn/guard-admissions remaining))]
+      (tuple :ok next)))) 30000))))
+
+(defn- guard-reservation-cleanup! [receipts ticket]
+ (guard-reservation-update! receipts ticket
+  (fn [held]
+   (case (:phase held)
+    :reserved nil
+    :completed nil
+    ;; Death/timeout is NOT completion. Preserve the exact native handles and
+    ;; association freeze, even after the guardian exits. Recovery requires a
+    ;; fresh native participant/journal proof; this API never guesses or replays.
+    :activating (assoc held :phase :uncertain)
+    held))))
+
+(defn- guard-reservation-phase! [receipts ticket owner guardian phase]
+ (with-guard-association-locks receipts
+  (fn [] (agent-get-and-update (registry)
+   (fn [cells]
+    (doseq [receipt receipts]
+     (let [cell (get cells (:resource receipt)) held (:guard-reservation cell)]
+      (when-not (and (= (:lifetime receipt) (:lifetime cell))
+                     (= ticket (:ticket held)) (= owner (:owner held))
+                     (Process/alive? owner)
+                     (= (if (= phase :activating) :reserved :activating) (:phase held))
+                     (or (= phase :completed) (Process/alive? guardian)))
+       (guard-fail! :invalid-guard-reservation))))
+    (let [gates (get cells :datom.conn/guard-admissions {})
+          gate (first (filter (fn [[_ held]] (= ticket (:ticket held))) gates))]
+     (when-not (and gate (= owner (:owner (second gate)))
+                    (= (if (= phase :activating) :reserved :activating) (:phase (second gate)))
+                    (Process/alive? owner) (or (= phase :completed) (Process/alive? guardian)))
+      (guard-fail! :invalid-guard-reservation))
+     (tuple :ok (assoc-in
+      (reduce (fn [state receipt]
+                (assoc-in state [(:resource receipt) :guard-reservation :phase] phase)) cells receipts)
+      [:datom.conn/guard-admissions (first gate) :phase] phase)))) 30000))))
+
+(defn guard-reservation-status
+ "Bounded diagnostic only. No ticket, process, identity or native resource
+  capability escapes. An uncertain activation is retained, never auto-unlocked."
+ [connection]
+ (when-not (and (erlang/is_map connection) (= Conn (maps/get :__struct__ connection nil)))
+  (guard-fail! :invalid-guard-resource))
+ (let [validated (guard-resource! connection) c (first validated)
+       held (Agent/get (registry) (fn [cells] (:guard-reservation (get cells (store-key (:store c))))) 30000)]
+  {:state (if held (:phase held) :free)}))
+
+(defn with-guard-reservation!
+ "Freeze exact compatible association/lifetime receipts across an accepted
+  native activation and its final source publication, without holding locks
+  during either RPC. The trusted synchronous action must return only after its
+  accepted work has a known outcome; do not catch ambiguous RPC failures into
+  ordinary results. Any exception or owner death after action admission holds
+  the reservation as uncertain. No automatic replay, cancellation or unlock.
+  Normal transactions remain writable. The capability is private/nonconveyed."
+ ([receipts action] (with-guard-reservation! receipts {} action))
+ ([receipts opts action]
+ (when-not (and (erlang/is_map opts) (not (erlang/is_map_key :__struct__ opts))
+                (= (set (keys opts)) (if (:root opts) #{:root} #{}))
+                (or (nil? (:root opts)) (and (string? (:root opts))
+                    (= (:root opts) (Path/expand (:root opts))) (not= "/" (:root opts))))
+                (erlang/is_function action 0)
+                (nil? (Process/get :datom.conn/guard-reservation)))
+  (guard-fail! :invalid-guard-reservation))
+ ;; Validate actual native receipts before constructing cleanup ownership.
+ (with-guard-publication-fence! receipts (fn [] :validated))
+ (let [ordered (Enum/sort_by receipts (fn [receipt] (:resource receipt)))
+       owner (erlang/self) custodian (or (execution/runtime-owner) owner)
+       graph (execution/current) ticket (erlang/make_ref)
+       cleanup (fn [] (guard-reservation-cleanup! ordered ticket))
+       guard (lifetime/register! owner cleanup)]
+  (try
+   (with-guard-publication-fence! ordered
+    (fn [] (agent-get-and-update (registry)
+     (fn [cells]
+      (when-not (and (Process/alive? owner) (Process/alive? (:pid guard)))
+       (guard-fail! :invalid-guard-reservation))
+      (when (> (count cells) 100000) (guard-fail! :guard-inventory-budget))
+      (let [app (:application-id graph) gates (get cells :datom.conn/guard-admissions {})
+            resources (set (map :resource ordered))]
+       (when (or (get gates app) (>= (count gates) 128))
+        (guard-fail! :guard-association-reserved))
+       ;; Close the snapshot->installation race in the SAME registry decision
+       ;; as gate publication. A newly registered matching resource must be
+       ;; explicitly captured; it never silently misses the migration inventory.
+       (doseq [[store cell] cells]
+        (let [path (when (erlang/is_map store) (maps/get :path store nil))]
+         (when (and (:lifetime cell) (= :open @(:lifetime cell))
+                    (or (= app (get-in cell [:guard-creator :application-id]))
+                        (and (:root opts) (string? path)
+                         (String/starts_with? (Path/expand path) (str (:root opts) "/"))))
+                    (not (contains? resources store)))
+          (guard-fail! :stale-guard-association-inventory))))
+      (doseq [receipt ordered]
+       (let [cell (get cells (:resource receipt))]
+        (when-not (and (= (:lifetime receipt) (:lifetime cell))
+                       (= :open @(:lifetime cell)) (nil? (:guard-reservation cell)))
+         (guard-fail! :guard-association-reserved))))
+      (let [gate {:ticket ticket :owner owner :custodian custodian :phase :reserved
+                  :application-id app :generation (:digest graph) :scope (:scope graph) :root (:root opts)}]
+       (tuple :reserved
+        (assoc-in (reduce (fn [state receipt]
+                    (assoc-in state [(:resource receipt) :guard-reservation]
+                     (assoc gate :lifetime (:lifetime receipt)))) cells ordered)
+                  [:datom.conn/guard-admissions app] gate))))) 30000)))
+   (guard-reservation-phase! ordered ticket owner (:pid guard) :activating)
+   (Process/put :datom.conn/guard-reservation ticket)
+   (let [result (action)]
+    (guard-reservation-phase! ordered ticket owner (:pid guard) :completed)
+    result)
+   (finally
+    (Process/delete :datom.conn/guard-reservation)
+    ;; Exact-ticket cleanup is idempotent with owner-DOWN cleanup. Executing it
+    ;; here also handles a dead guardian; no uncertain phase is cleared.
+    (cleanup)
+    (when (Process/alive? (:pid guard)) (lifetime/release! guard)))))))
 
 (defn register-declared-guard!
  "Fixed SDK residual for the ordinary guard! API. The store remains a runtime
