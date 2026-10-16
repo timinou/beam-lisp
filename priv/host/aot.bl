@@ -2903,7 +2903,14 @@
    mode refuses before any repair is attempted."
   [ns]
   :when (string? ns)
-  (let [mod (BeamLisp.Link/module_for ns)]
+  (let [mod (BeamLisp.Link/module_for ns)
+        source (when (library_tier? ns) (BeamLisp.Loader/source_path ns))]
+    ;; Library source must obtain its checked callable values before its FIRST
+    ;; initializer, even when no application has acquired the SDK lease yet.
+    ;; Recovery bootstrap and source-absent images retain their native path.
+    (if (and (library_tier? ns) (erlang/not (BeamLisp.Env/loaded_ns? ns))
+             (staged_sdk_source? ns source))
+      (compile_sdk_source! ns (BeamLisp.Loader/read_source source) source)
     (if (and (Code/ensure_loaded? mod)
              (erlang/function_exported mod :__bl_init__ 0))
       (cond
@@ -2915,7 +2922,7 @@
 
         :else
           (init_loaded_module ns mod))
-      (repair_or_no_module ns))))
+      (repair_or_no_module ns)))))
 
 ; ── repairing a stale or missing library artifact ──────────────────────────
 ;
@@ -4129,26 +4136,102 @@
         :callable-kinds (Map/put kinds ns (Enum/reduce bindings prior-kinds
           (fn [binding out] (Map/put out binding (sdk_callable_kind head))))))))))) :ok))
 
-(defn compile_sdk_source! [ns content path]
-  ;; Ordinary source-mode loading under a retained fixed SDK uses exactly the
-  ;; same staged producer as import-closure discovery, then ordinary replay.
+(defn sdk_library_source? [ns path]
+  ;; Physical Source selection only. This does not grant execution authority.
   (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root)) source (physical_sdk_path path)]
-    (when-not (and (erlang/== :global (BeamLisp.Env/env_id)) root source
-                   (String/starts_with? source (erlang/iolist_to_binary (list root "/")))
-                   (erlang/== content (BeamLisp.Loader/read_source source))
-                   (erlang/== ns (BeamLisp.Loader/declared_ns content)))
-      (erlang/error (tuple :sdk_source_stage_input_mismatch ns path)))
-    (when-not (sdk_unit_compiled? ns)
-      (stage_sdk_dependency! ns source (BeamLisp.Emit/module_for ns)))
-    (BeamLisp.Env/refresh_sdk_runtime!)
-    (init_loaded_module ns (BeamLisp.Emit/module_for ns))))
-
-(defn staged_sdk_source? [ns path]
-  (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root)) source (physical_sdk_path path)]
-    (and (ets/member :beam_lisp_vars :bl_sdk_runtime_lease)
-         (erlang/== :global (BeamLisp.Env/env_id)) root source
+    (and (library_tier? ns) root source
          (String/starts_with? source (erlang/iolist_to_binary (list root "/")))
          (erlang/== ns (BeamLisp.Loader/declared_ns (BeamLisp.Loader/read_source source))))))
+
+(defn- sdk_preinit_seed_member! [manifest mod source]
+  (let [name (erlang/iolist_to_binary (list (Atom/to_string mod) ".beam"))
+        expected (Map/get (Map/get manifest "modules") name)
+        bytes (when expected (File/read! (Path/join (BeamLisp.Bootstrap/seed_dir) name)))
+        chunks (when bytes (beam_lib/chunks bytes (list :attributes)))
+        attrs (when (and chunks (erlang/== :ok (elem chunks 0)))
+                (Keyword/get (elem (elem chunks 1) 1) :attributes))]
+    (when-not (and bytes attrs (Code/ensure_loaded? mod)
+                   (erlang/== expected (String/downcase (Base/encode16 (crypto/hash :sha256 bytes))))
+                   (erlang/== (elem (elem (beam_lib/md5 bytes) 1) 1)
+                              (erlang/apply mod :module_info (list :md5)))
+                   (or (erlang/== nil source)
+                       (erlang/== (normalized_attribute attrs :bl_source_hash)
+                         (String/downcase (Base/encode16 (crypto/hash :sha256 (File/read! source)))))))
+      (erlang/error (tuple :sdk_preinit_producer_unproved mod)))
+    attrs))
+
+(defn sdk_preinit_floor_ready?
+  "Native current-floor producer proof; never a public SDK or Source grant.
+   A different-key seed is the supported previous-generation recovery path.
+   A matching-key producer with changed bytes or missing metadata refuses."
+  []
+  (let [manifest (BeamLisp.Bootstrap/manifest)]
+    (if (or (erlang/== nil manifest)
+            (erlang/not (BeamLisp.Bootstrap/key_matches? manifest))) false
+      (let [root (BeamLisp.Tiers/priv_root)]
+        (when-not (and (erlang/== (BeamLisp.AOTCache/current_compiler_key) (Map/get manifest "compiler_key"))
+                       (erlang/== (BeamLisp.AOTCache/current_build_key) (Map/get manifest "build_key")))
+          (erlang/error :sdk_preinit_toolchain_changed))
+        ;; Exactly the actual producer/kernel dependencies, not a name-prefix
+        ;; grant or a walk of every SDK function body. Full lifetime admission
+        ;; separately authenticates its complete executable closure.
+        (Enum/each
+          (list (tuple :Elixir.BeamLisp.AOT "aot.bl")
+                (tuple :Elixir.BeamLisp.Loader "loader.bl")
+                (tuple :Elixir.BeamLisp.Env "env.bl")
+                (tuple :Elixir.BeamLisp.Compiler "compiler.bl")
+                (tuple :Elixir.BeamLisp.Emit "emit.bl")
+                (tuple :Elixir.BeamLisp.Record "record.bl")
+                (tuple :Elixir.BeamLisp.AOTCache "aot_cache.bl")
+                (tuple :Elixir.BeamLisp.CompilerData "compiler_data.bl")
+                (tuple :Elixir.BeamLisp.Tiers "tiers.bl")
+                (tuple :Elixir.BeamLisp.Bootstrap "bootstrap.bl"))
+          (fn [entry]
+            (sdk_preinit_seed_member! manifest (elem entry 0) (Path/join (Path/join root "host") (elem entry 1)))))
+        (sdk_preinit_seed_member! manifest :Elixir.BeamLisp.Ns.Rt nil)
+        (sdk_preinit_seed_member! manifest :Elixir.BeamLisp.Ns.Compiler nil)
+        (let [attrs (sdk_preinit_seed_member! manifest :Elixir.BeamLisp.Ns.Core nil)]
+          (when-not (and (sdk_declaration_descriptor? (normalized_attribute attrs :bl_sdk_declarations) "core")
+                         (sdk_callable_descriptor? (normalized_attribute attrs :bl_sdk_callable_kinds) "core"))
+            (erlang/error :sdk_preinit_core_metadata_missing)))
+        (assert_sdk_seed_snapshot! manifest)
+        true))))
+
+(defn sdk_unit_callable_ready? [ns]
+  ;; Complete current executable ownership is necessary but an old/nil
+  ;; declaration descriptor cannot certify canonical function VALUE creation.
+  (let [row (sdk_compiler_row (BeamLisp.Emit/module_for ns))]
+    (and row (sdk_declaration_descriptor? (Map/get row :declarations) ns)
+         (sdk_callable_descriptor? (Map/get row :callable-kinds) ns)
+         (sdk_unit_compiled? ns)
+         (or (erlang/== 0 (erlang/map_size (Map/get row :forwarder-routes {})))
+             (and (Code/ensure_loaded? (ns_body_module ns))
+                  (erlang/function_exported (ns_body_module ns) :__bl_callable_values__ 0))))))
+
+(defn compile_sdk_source! [ns content path]
+  ;; One compile-only declaration producer for cold pre-lease and warm retained
+  ;; SDK loading. It never evaluates Source to discover callable provenance.
+  (let [source (physical_sdk_path path) mod (BeamLisp.Emit/module_for ns)]
+    (when-not (and (erlang/== :global (BeamLisp.Env/env_id))
+                   (sdk_library_source? ns path)
+                   (erlang/== content (BeamLisp.Loader/read_source source)))
+      (erlang/error (tuple :sdk_source_stage_input_mismatch ns path)))
+    ;; Normal packaged/current cached units can already carry the exact checked
+    ;; metadata and factory. Recover their existing receipt before considering
+    ;; a real staged repair; failed evidence never falls back to initialization.
+    (when (and (Code/ensure_loaded? mod) (erlang/not (stale? ns mod)))
+      (try (ensure_source_sdk_evidence! ns mod) (catch _ nil)))
+    (when-not (sdk_unit_callable_ready? ns)
+      (stage_sdk_dependency! ns source mod))
+    (when-not (sdk_unit_callable_ready? ns)
+      (erlang/error (tuple :sdk_preinit_callable_unit_missing ns)))
+    (BeamLisp.Env/refresh_sdk_runtime!)
+    (init_loaded_module ns mod)))
+
+(defn staged_sdk_source? [ns path]
+  (and (sdk_library_source? ns path) (erlang/== :global (BeamLisp.Env/env_id))
+       (or (ets/member :beam_lisp_vars :bl_sdk_runtime_lease)
+           (sdk_preinit_floor_ready?))))
 
 (defn- stage-refuse [kind] (throw (ex-info "SDK declaration staging refused" {:kind kind})))
 (defn- stage-tag? [node tag size]
