@@ -119,9 +119,9 @@
 
 ;; ── the declaration, and its refusals ───────────────────────────────────
 
-(def KNOWN-DECL-OPTS [:of :concurrency :retry :unique :lease :partition :protocol :generation :admission])
+(def KNOWN-DECL-OPTS [:of :concurrency :retry :unique :lease :partition :protocol :generation :admission :dispatch])
 
-(def KNOWN-CLAUSE-OPTS [:of :concurrency :retry :unique :lease :partition :protocol :generation :admission
+(def KNOWN-CLAUSE-OPTS [:of :concurrency :retry :unique :lease :partition :protocol :generation :admission :dispatch
                         :clock :server :contract])
 
 (def KNOWN-RETRY-OPTS [:max :backoff :base :max-delay :jitter])
@@ -193,6 +193,15 @@
     (throw (ex-info "Repeated admission scope" {:kind :invalid-admission-scope})))
   policy)
 
+(defn- normalise-dispatch [policy]
+  (when-not (and (map? policy) (= #{:mode :group :max-groups} (set (keys policy)))
+                (= :round-robin (:mode policy)) (vector? (:group policy))
+                (<= 1 (count (:group policy)) 8) (every? keyword? (:group policy))
+                (= (count (:group policy)) (count (distinct (:group policy))))
+                (positive-int? (:max-groups policy)) (<= (:max-groups policy) 4096))
+    (throw (ex-info "Invalid durable native dispatch policy" {:kind :invalid-dispatch})))
+  policy)
+
 (defn normalise-decl
   "A queue's declaration with every default filled and every typo REFUSED, so
    the rest of this file reads one shape.
@@ -256,7 +265,8 @@
      :unique (vec unique)
      :partition (vec partition)
      :retry (normalise-retry (get d :retry))}
-      (contains? d :admission) (assoc :admission (normalise-admission (:admission d))))))
+      (contains? d :admission) (assoc :admission (normalise-admission (:admission d)))
+      (contains? d :dispatch) (assoc :dispatch (normalise-dispatch (:dispatch d))))))
 
 (defn backoff-ms
   "Milliseconds to wait before the attempt AFTER `n` failures.
@@ -340,6 +350,7 @@
    {:db/ident :job/finished-at :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
    {:db/ident :queue/key :db/valueType :db.type/string :db/cardinality :db.cardinality/one
     :db/unique :db.unique/identity}
+   {:db/ident :queue/dispatch-cursor :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
    {:db/ident :queue/decl :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
    {:db/ident :queue/identity-receipt :db/valueType :db.type/term :db/cardinality :db.cardinality/one}])
 
@@ -765,6 +776,8 @@
   [srv]
   (table/owner (store-name srv)))
 
+(declare validate-declaration!)
+
 (defn- write-decl!
   "Publish the declaration as a FACT. Upserted by `:queue/key`, so a boot is one
    transaction and re-booting is the same one.
@@ -773,9 +786,11 @@
    queue's OWN rules (`:of`, `:unique`, `:partition`) without asking a process,
    and a rule a caller has to restate at every call site is a rule that drifts."
   [c srv d]
-  (datom/transact! c [{:db/id -1
+  (dc/serialized! c (fn []
+    (validate-declaration! c srv d)
+    (datom/transact! c [{:db/id -1
                        :queue/key (server-name srv)
-                       :queue/decl (assoc d :server (server-name srv))}]))
+                       :queue/decl (assoc d :server (server-name srv))}]))))
 
 (defn declaration
   "The durable declaration this queue wrote at boot, or nil when this VM's store
@@ -944,6 +959,49 @@
         (throw (ex-info "Native queue admission is full; original domain work remains owed"
                         {:kind :queue-capacity :state :deferred :reason :queue-capacity}))))))
 
+(defn- dispatch-group [policy payload]
+  (Base/encode16 (erlang/term_to_binary (admission-scope payload (:group policy)))))
+
+(defn- require-dispatch-room! [database srv policy payload]
+  (when policy
+    (let [groups (set (map #(dispatch-group policy (:job/payload %)) (admission-jobs database srv)))
+          group (dispatch-group policy payload)]
+      (when (and (not (contains? groups group)) (>= (count groups) (:max-groups policy)))
+        (throw (ex-info "Native dispatch group budget is full"
+                        {:kind :queue-capacity :state :deferred :reason :dispatch-groups}))))))
+
+(defn dispatch-candidates
+  "Current due native facts in durable round-robin order. Busy partitions and
+   excluded unpreparable rows are caller-owned claim restrictions, never a
+   second scheduling store. Queue writer rechecks this order at actual claim."
+  [database srv now policy busy excluded]
+  (let [rows (filter (fn [job]
+                (and (not (contains? excluded (:db/id job)))
+                     (or (nil? (:job/partition job)) (not (contains? busy (:job/partition job))))
+                     (or (and (= :queued (:job/state job)) (<= (:job/at job) now))
+                         (and (= :running (:job/state job)) (<= (:job/lease-until job 0) now)))))
+              (admission-jobs database srv))
+        cursor (:queue/dispatch-cursor (datom/entity database [:queue/key (server-name srv)]))
+        groups (sort (distinct (map #(dispatch-group policy (:job/payload %)) rows)))
+        rotated (concat (filter #(or (nil? cursor) (> (compare % cursor) 0)) groups)
+                        (filter #(and cursor (<= (compare % cursor) 0)) groups))
+        rank (into {} (map (fn [group index] [group index]) rotated (range (count rotated))))]
+    (vec (sort-by (fn [job] [(get rank (dispatch-group policy (:job/payload job)))
+                             (:job/at job) (:job/id job)]) rows))))
+
+(defn validate-declaration!
+  "Validate configured native scope identities against all outstanding work
+   inside the caller's queue writer. Lower limits retain existing obligations;
+   they only refuse additional admissions. Invalid legacy scope data refuses
+   activation before the declaration is installed. No history is rewritten."
+  [c srv declared]
+  (let [jobs (admission-jobs (datom/db c) srv)]
+    (doseq [job jobs]
+      (doseq [scope (get-in declared [:admission :scopes] [])]
+        (admission-scope (:job/payload job) (:keys scope)))
+      (when (:dispatch declared) (dispatch-group (:dispatch declared) (:job/payload job))))
+    :valid))
+
 (defn enqueue!
   "Put a job ON the queue — a TRANSACTION against the queue's store, never a
    message, so the job is a FACT before anything could act on it and a restart
@@ -1062,6 +1120,7 @@
             (assoc old :job/created false)
             (do
              (require-capacity! (datom/db c) srv (:admission (declaration srv)) job nil)
+             (require-dispatch-room! (datom/db c) srv (:dispatch (declaration srv)) job)
          (try
            (let [report (datom/transact! c tx)
                  e (get (:tempids report) -1)]
@@ -1183,7 +1242,8 @@
 
    Public because it is the whole of Claim/Lease and a verifier should be able
    to exercise it without a running queue."
-  [c job now lease-ms]
+  ([c job now lease-ms] (claim! c job now lease-ms {}))
+  ([c job now lease-ms opts]
   (let [e (:db/id job)
         ;; A cryptographic token remains distinct across VM restarts; clocks and
         ;; monotonic counters alone can collide with persisted old owners.
@@ -1201,12 +1261,18 @@
           ;; between prepared payload and claim, including A -> B -> A receipts.
           (let [current (datom/entity (datom/db c) e)
                 fields [:job/server :job/required-generation :job/adoption :job/adopted-payload]]
-            (when (= (select-keys current fields) (select-keys job fields))
+            (when (and (= (select-keys current fields) (select-keys job fields))
+                       (or (nil? (:dispatch opts))
+                           (and (= (:dispatch opts) (:dispatch (declaration (:server opts))))
+                           (= e (:db/id (first (dispatch-candidates (datom/db c) (:server opts) now
+                                  (:dispatch opts) (:busy opts #{}) (:excluded opts #{}))))))))
               (try
-                (datom/transact! c tx)
+                (datom/transact! c (if (:dispatch opts)
+                   (conj tx {:db/id -9 :queue/key (server-name (:server opts))
+                              :queue/dispatch-cursor (dispatch-group (:dispatch opts) (:job/payload current))}) tx))
                 (datom/entity (datom/db c) e)
                 (catch err
-                  (if (lose-race? err) nil (throw err)))))))))))
+                  (if (lose-race? err) nil (throw err))))))))))))
 
 (defn- owns-attempt? [job claimed now]
   (and job (= :running (:job/state job))
@@ -1431,6 +1497,7 @@
             (when (and other (not= id (:db/id other)))
               (throw (ex-info "Outstanding work already holds retry ticket" {:kind :duplicate-retry})))
             (require-capacity! (datom/db c) srv (:admission d) (:job/payload j) id)
+            (require-dispatch-room! (datom/db c) srv (:dispatch d) (:job/payload j))
             (datom/transact! c (vec (concat
               [[:db/cas id :job/state (:job/state j) :queued]
                [:db/add id :job/retry-base (:job/attempts j 0)]
@@ -1758,7 +1825,8 @@
    which is why the lease is the safety net and no monitor is registered: a
    `[:DOWN …]` handler would have to match every DOWN message in the server, and
    the lease already answers the same question for less."
-  [st job]
+  ([st job] (launch! st job {}))
+  ([st job claim-opts]
   (let [base (:queue st)
         required (:job/required-generation job (:job/generation job))
         q (merge base (get (:handlers base) required {}))
@@ -1772,7 +1840,7 @@
                           (nil? (get-in q [:contract :accept?])))
                    {:payload (:job/adopted-payload job (:job/payload job)) :protocol (:protocol decl 1)}
                    (let [r (fence/fence-fn 250 (fn [] (prepare-payload q job)))] (:ok r))))
-        claimed (when prepared (claim! c job now (* 1000 (:lease decl))))]
+        claimed (when prepared (claim! c job now (* 1000 (:lease decl)) claim-opts))]
     (when (some? claimed)
       (let [ref (erlang/make_ref)
             e (:db/id claimed)
@@ -1812,7 +1880,7 @@
          ;; the store, because this process must know when its own claim stops
          ;; being one — that is what frees the slot a killed worker leaked.
          :lease-until (+ now (* 1000 (:lease decl)))
-         :partition (:job/partition claimed)}))))
+         :partition (:job/partition claimed)})))))
 
 (defn worker-inventories
   "Ephemeral physical-body inventories, including bodies from an earlier
@@ -1962,22 +2030,25 @@
         st (assoc st :queue (assoc q0 :running live))
         room (- (:concurrency (:decl q0)) (count live))
         busy (busy-partitions live)
-        cands (if (> room 0) (vec (due-candidates (datom/db c) now)) [])]
-    (loop [st st cs cands room room busy busy]
+        policy (:dispatch (:decl q0))
+        candidates (fn [busy excluded]
+          (if policy (dispatch-candidates (datom/db c) (:server q0) now policy busy excluded)
+            (vec (remove #(contains? excluded (:db/id %)) (due-candidates (datom/db c) now)))))
+        cands (if (> room 0) (candidates busy #{}) [])]
+    (loop [st st cs cands room room busy busy excluded #{}]
       (if (or (<= room 0) (empty? cs))
         (do (arm st) st)
         (let [job (first cs)]
           (if (not (partition-free? job busy))
-            (recur st (vec (rest cs)) room busy)
-            (let [entry (launch! st job)]
+            (recur st (vec (rest cs)) room busy (conj excluded (:db/id job)))
+            (let [entry (launch! st job (if policy {:dispatch policy :server (:server q0) :busy busy :excluded excluded} {}))]
               (if (nil? entry)
-                (recur st (vec (rest cs)) room busy)
-                (recur (assoc-in st [:queue :running (:ref entry)] entry)
-                       (vec (rest cs))
-                       (dec room)
-                       (if (some? (:partition entry))
-                         (conj busy (:partition entry))
-                         busy))))))))))
+                (recur st (vec (rest cs)) room busy (conj excluded (:db/id job)))
+                (let [after-busy (if (some? (:partition entry)) (conj busy (:partition entry)) busy)
+                      after-excluded (conj excluded (:db/id job))]
+                 (recur (assoc-in st [:queue :running (:ref entry)] entry)
+                       (if policy (candidates after-busy after-excluded) (vec (rest cs)))
+                       (dec room) after-busy after-excluded))))))))))
 
 ;; ── the init, the prelude, the two clauses ──────────────────────────────
 
