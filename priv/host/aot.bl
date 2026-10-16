@@ -1142,6 +1142,114 @@
       (when (= expected (BeamLisp.Env/lookup (tuple ns name)))
        (BeamLisp.Env/intern ns name (Map/fetch! values name)))))))) :ok)
 
+(defn- macro_value_module_for [ns]
+ (Module/concat (list (init_module_for ns) :Macros)))
+
+(defn- macro_value_free_variables [node]
+ ;; Use the existing Core lowering's exact lexical scoping, not a syntactic
+ ;; name subtraction. This creates no BEAM/function and runs no initializer.
+ ;; Restore Lower's process-local compiler counter after the read-only query.
+ (let [previous (erlang/get :bl_core_fresh_seq)]
+  (try
+   (let [names (cerl_trees/free_variables (BeamLisp.Ns.Lower/lower-anf node))]
+    (when-not (and (erlang/is_list names) (erlang/=< (erlang/length names) 255)
+                   (Enum/all? names (fn [name] (erlang/is_atom name))))
+     (erlang/error :invalid_macro_value_free_variables))
+    (Enum/map names (fn [name] (Atom/to_string name))))
+   (finally
+    (if (erlang/== previous :undefined) (erlang/erase :bl_core_fresh_seq)
+     (erlang/put :bl_core_fresh_seq previous))))))
+
+(defn- segregate_macro_values [node state depth]
+ (when (or (erlang/> depth 256) (erlang/=< (Map/get state :remaining) 0))
+  (erlang/error :macro_value_partition_budget))
+ (let [state (Map/update! state :remaining (fn [left] (erlang/- left 1)))]
+  (cond
+   (and (erlang/is_map node)
+        (or (erlang/== :lit (Map/get node :op)) (Map/has_key? node :pop))) (tuple node state)
+   (erlang/is_map node)
+    (let [children (Enum/map_reduce (Enum/sort (Map/to_list node)) state
+                     (fn [entry out]
+                      (let [prepared (if (Enum/member? (list :ann :attrs :exports) (elem entry 0))
+                                       (tuple (elem entry 1) out)
+                                       (segregate_macro_values (elem entry 1) out (erlang/+ depth 1)))]
+                       (tuple (tuple (elem entry 0) (elem prepared 0)) (elem prepared 1)))))
+          rebuilt (Map/new (elem children 0)) out (elem children 1)
+          elements (Map/get rebuilt :elems)]
+     ;; This is the checked compiler's actual defmacro value IR, including nested
+     ;; declarations. Reader aliases, author metadata and function names never
+     ;; select the macro-only origin. Ordinary literal data stays untouched.
+     (if (and (erlang/== :tuple (Map/get rebuilt :op))
+              (erlang/is_list elements) (erlang/== 2 (erlang/length elements))
+              (erlang/is_map (erlang/hd elements))
+              (erlang/== :lit (Map/get (erlang/hd elements) :op))
+              (erlang/== :$macro (Map/get (erlang/hd elements) :val)))
+      (let [value (erlang/hd (erlang/tl elements)) variables (macro_value_free_variables value)
+            clauses (Map/get out :clauses) index (erlang/length clauses)
+            _ (when (erlang/>= index 8192) (erlang/error :macro_value_partition_budget))
+            name (erlang/binary_to_atom (erlang/iolist_to_binary
+                    (list "__bl_macro_value_" (Integer/to_string index) "__")) :utf8)
+            clause (BeamLisp.Emit/function_clause name value
+                     (Enum/map variables (fn [variable] {:pop :pvar :name variable})))
+            call (BeamLisp.Emit/remote (Map/get out :module) name
+                   (Enum/map variables (fn [variable] {:op :var :name variable :ann {}})))]
+       (tuple (Map/put rebuilt :elems (list (erlang/hd elements) call))
+              (Map/put out :clauses (cons clause clauses))))
+      (tuple rebuilt out)))
+   (erlang/is_list node)
+    (Enum/map_reduce node state (fn [child out] (segregate_macro_values child out (erlang/+ depth 1))))
+   (erlang/is_tuple node)
+    (let [prepared (segregate_macro_values (Tuple/to_list node) state (erlang/+ depth 1))]
+     (tuple (List/to_tuple (elem prepared 0)) (elem prepared 1)))
+   :else (tuple node state))))
+
+(defn- partition_macro_values [ns definitions initializer companion attrs]
+ (let [initial {:module (macro_value_module_for ns) :clauses (list) :remaining 1000000}
+       body (segregate_macro_values definitions initial 0)
+       init (segregate_macro_values initializer (elem body 1) 0)
+       values (segregate_macro_values companion (elem init 1) 0)
+       state (elem values 1) clauses (Enum/reverse (Map/get state :clauses))
+       descriptor (when (erlang/not (erlang/== clauses (list)))
+                    (BeamLisp.Emit/descriptor_for (Map/get state :module) clauses
+                     (erlang/++ attrs
+                      (list (tuple :bl_aot_artifact_role :initializer)
+                            (tuple :bl_sdk_initializer_lambda_kind :macros)))))]
+  (tuple (elem body 0) (elem init 0) (elem values 0) descriptor)))
+
+(defn assert_bootstrap_macro_partition!
+ "Pure native emission readiness before boot rebuild. Compile one captured
+  macro constructor; do not load/invoke it or publish any SDK/custody receipt."
+ []
+ (let [namespace "bootstrap.macro-partition"
+       macro {:op :tuple :elems
+               (list (BeamLisp.Emit/lit :$macro)
+                     {:op :fn :clauses (list {:pats (list) :guard nil
+                                             :body {:op :var :name "$outside" :ann {}}}) :ann {}}) :ann {}}
+       lease (ets/lookup :beam_lisp_vars :bl_sdk_runtime_lease)
+       definitions (BeamLisp.Env/ns_defs "core")
+       partitioned (partition_macro_values namespace {} macro nil (list))
+       descriptor (elem partitioned 3)
+       bytes (elem (BeamLisp.Emit/compile_descriptor descriptor) 1)
+       exports (Keyword/get (elem (elem (beam_lib/chunks bytes (list :exports)) 1) 1) :exports)
+       origin (sdk_seed_lambda_origin bytes)
+       actual-lambdas (sdk_lambda_routes! bytes)
+       rewritten (elem partitioned 1) call (erlang/hd (erlang/tl (Map/get rewritten :elems)))]
+  (when-not (and (erlang/== :remote (Map/get call :op))
+                 (erlang/== (macro_value_module_for namespace) (Map/get call :mod))
+                 (erlang/== (list {:op :var :name "$outside" :ann {}}) (Map/get call :args))
+                 (Enum/member? exports (tuple :__bl_macro_value_0__ 1))
+                 (erlang/== :macros (Map/get origin :initializer-lambda-kind))
+                 (erlang/== false (Map/get origin :seed-runtime-lambdas?))
+                 (erlang/== {} (Map/get origin :lambda-routes))
+                 (erlang/== 1 (erlang/map_size actual-lambdas))
+                 (Enum/all? actual-lambdas
+                   (fn [entry] (and (erlang/== 0 (elem (elem entry 1) 1))
+                                    (erlang/== 1 (elem (elem entry 1) 2)))))
+                 (erlang/== lease (ets/lookup :beam_lisp_vars :bl_sdk_runtime_lease))
+                 (erlang/== definitions (BeamLisp.Env/ns_defs "core")))
+   (erlang/error :bootstrap_macro_partition_failed))
+  {:checks 11 :captured-arguments 1 :factory-executions 0 :initializers 0 :sdk-authority false}))
+
 (defn- emit_module
   "Emit a namespace as the SAME shim/body split the runtime uses, so an
    AOT-loaded namespace is byte-for-byte the source-loaded one. Returns every
@@ -1157,16 +1265,21 @@
         filename (or file (erlang/iolist_to_binary (list "beam_lisp_aot/" ns ".bl")))
         raw_defs (unit_defs ns unit_names)
         previous (sdk_callable_rebindings ns raw_defs declarations)
-        ns_defs (stabilise_body_modules ns raw_defs)
+        stable_defs (stabilise_body_modules ns raw_defs)
         source_hash (if file (ns_closure_hash ns file) nil)
         stamp_key (BeamLisp.AOTCache/key_for_ns ns)
         unit_attrs (list (tuple :bl_source_hash source_hash) (tuple :bl_compiler_key stamp_key)
                          (tuple :bl_unit_source_digest input_digest)
                          (tuple :bl_aot_artifact_version 1)
                          (tuple :bl_unit_namespace ns))
-        init_pair (build_init_ast ns mod ns_defs value_defs ns_meta unit_attrs declarations)
-        init_clause (elem init_pair 0)
-        companion_descriptor (elem init_pair 1)
+        init_pair (build_init_ast ns mod stable_defs value_defs ns_meta unit_attrs declarations)
+        partitioned (partition_macro_values ns stable_defs (elem init_pair 0) (elem init_pair 1) unit_attrs)
+        ns_defs (elem partitioned 0)
+        init_clause (elem partitioned 1)
+        companion_descriptor (elem partitioned 2)
+        macro_descriptor (elem partitioned 3)
+        generated_beams (erlang/++ (elem init_pair 2)
+                          (if macro_descriptor (list (BeamLisp.Emit/compile_descriptor macro_descriptor)) (list)))
         provenance_clause (BeamLisp.Emit/function_clause :__bl_provenance__
                             {:op :tuple :elems (list (BeamLisp.Emit/lit source_hash)
                                                      (BeamLisp.Emit/lit stamp_key)) :ann {}})
@@ -1199,7 +1312,7 @@
                     (tuple 1 ns (Map/get (Map/get declarations :callable-kinds) ns {}))))
                 (tuple :bl_aot_unit_members
                   (tuple :members (Enum/uniq (erlang/++
-                    (Enum/map (elem init_pair 2) (fn [beam] (elem beam 0)))
+                    (Enum/map generated_beams (fn [beam] (elem beam 0)))
                     (erlang/++ (Enum/map (Map/to_list (BeamLisp.Emit/body_modules ns_defs)) (fn [entry] (elem entry 0)))
                       (List/wrap (when companion_descriptor (Map/get companion_descriptor :name))))))))
                 (tuple :bl_aot_forwarder_routes
@@ -1220,7 +1333,6 @@
         (if companion_descriptor
           (Map/put companion_descriptor :ann {:file filename})
           nil)
-        generated_beams (elem init_pair 2)
         beams (erlang/++ generated_beams
                 (Enum/map
                   (erlang/++ (erlang/++ body_descriptors (List/wrap companion_descriptor))
@@ -1536,6 +1648,19 @@
                        (not (Map/has_key? output slot))) (erlang/error :invalid_sdk_lambda_table))
         (recur (inc index) (Map/put output slot (tuple function (- arity free) free)))))))))))
 
+(defn- sdk_seed_lambda_origin [bytes]
+ ;; Seed ownership does not make compiler macro constructors runtime callables.
+ ;; Derive the same finite origin from actual authenticated seed attributes.
+ (let [attrs (Keyword/get (elem (elem (beam_lib/chunks bytes (list :attributes)) 1) 1) :attributes)
+       role (normalized_attribute attrs :bl_aot_artifact_role)
+       kind (normalized_attribute attrs :bl_sdk_initializer_lambda_kind)]
+  (when (and kind (not (and (= :initializer role) (contains? #{:values :macros} kind))))
+   (erlang/error :sdk_bootstrap_initializer_lambda_kind_invalid))
+  {:initializer-lambda-kind kind
+   :seed-runtime-lambdas? (and (not= :macros kind) (or (not= :initializer role) (= :values kind)))
+   :lambda-routes (if (and (not= :macros kind) (or (not= :initializer role) (= :values kind)))
+                    (sdk_lambda_routes! bytes) {})}))
+
 (defn- sdk_record_ctor_origins! [mod bytes]
  ;; Exact native constructor factory instruction references identify their
  ;; lambda slots. Never infer constructor authority from a lambda name prefix.
@@ -1676,7 +1801,11 @@
                     {:md5 (erlang/apply (elem entry 0) :module_info (list :md5)) :role (Map/get (elem entry 1) :role)
                      :lambda-routes (Map/get (elem entry 1) :lambda-routes {})
                      :ctor-lambda-origins (Map/get (elem entry 1) :ctor-lambda-origins {})
-                     :local? (contains? #{:stable-body :stable-seed} (Map/get (elem entry 1) :role))}))))
+                     :local? (or (= :stable-body (Map/get (elem entry 1) :role))
+                                 (and (= :stable-seed (Map/get (elem entry 1) :role))
+                                      (Map/get (elem entry 1) :seed-runtime-lambdas?))
+                                 (and (= :initializer (Map/get (elem entry 1) :role))
+                                      (= :values (Map/get (elem entry 1) :initializer-lambda-kind))))}))))
        primitive-routes (sdk_kernel_primitive_routes! entries)
        core-row (Map/get entries :Elixir.BeamLisp.Ns.Core)
        core-declarations (when core-row (Map/get core-row :declarations))
@@ -1808,7 +1937,11 @@
         owner (normalized_attribute attrs :bl_declaration_owner)
         role (normalized_attribute attrs :bl_aot_artifact_role)
         declarations (normalized_attribute attrs :bl_sdk_declarations)
-        callable (normalized_attribute attrs :bl_sdk_callable_kinds)]
+        callable (normalized_attribute attrs :bl_sdk_callable_kinds)
+        initializer_kind (normalized_attribute attrs :bl_sdk_initializer_lambda_kind)]
+    (when (and initializer_kind
+               (not (and (= :initializer role) (contains? #{:values :macros} initializer_kind))))
+      (erlang/error :sdk_inventory_invalid_initializer_lambda_kind))
     (when (and (not (nil? callable))
                (not (and (= :mutable-forwarder role)
                          (sdk_callable_descriptor? callable (normalized_attribute attrs :bl_aot_forwarder_namespace))
@@ -1877,7 +2010,9 @@
      :imports (Enum/uniq (Enum/map (Keyword/get (elem (elem (beam_lib/chunks bytes (list :imports)) 1) 1) :imports)
                             (fn [entry] (elem entry 0))))
      :role role :declarations declarations
-     :lambda-routes (when (= :stable-body role) (sdk_lambda_routes! bytes))
+     :lambda-routes (when (or (= :stable-body role) (and (= :initializer role) (= :values initializer_kind)))
+                      (sdk_lambda_routes! bytes))
+     :initializer-lambda-kind initializer_kind
      :callable-kinds callable
      :binding-routes (when (= :mutable-forwarder role)
                        (sdk_binding_routes! mod bytes (normalized_attribute attrs :bl_aot_forwarder_routes)))
@@ -2121,12 +2256,12 @@
               ;; seed. Its compiler receipt must supply replacement evidence.
               (if (erlang/not (erlang/== md5 (erlang/apply mod :module_info (list :md5)))) acc
                 (Map/put acc mod
-                  (Map/merge {:role :stable-seed :lambda-routes (sdk_lambda_routes! bytes) :ctor-lambda-origins (sdk_record_ctor_origins! mod bytes) :md5 md5 :sha256 sha
+                  (Map/merge {:role :stable-seed :ctor-lambda-origins (sdk_record_ctor_origins! mod bytes) :md5 md5 :sha256 sha
                               :seed? true :compiler-key (BeamLisp.AOTCache/compiler_key)
                               :imports (Enum/uniq (Enum/map
                                 (Keyword/get (elem (elem (beam_lib/chunks bytes (list :imports)) 1) 1) :imports)
                                 (fn [import] (elem import 0))))}
-                    (or (seed_forwarder_metadata mod bytes) {})))))))))))
+                    (Map/merge (or (seed_forwarder_metadata mod bytes) {}) (sdk_seed_lambda_origin bytes))))))))))))
 
 (defn- source_sdk_receipts []
   (Map/new (Enum/map
@@ -2160,7 +2295,7 @@
                     :imports (Enum/uniq (Enum/map
                       (Keyword/get (elem (elem (beam_lib/chunks bytes (list :imports)) 1) 1) :imports)
                       (fn [import] (elem import 0))))}
-          (or (seed_forwarder_metadata mod bytes) {}))))))
+          (Map/merge (or (seed_forwarder_metadata mod bytes) {}) (sdk_seed_lambda_origin bytes)))))))
 
 (defn- assert_sdk_seed_snapshot! [manifest]
   ;; Denial-only check of this walk's captured native input, never a cache grant.
@@ -2463,7 +2598,14 @@
         forwarder? (erlang/== :mutable-forwarder (Map/get row :role))
         routes (when forwarder? (image_sdk_routes! bytes row))
         attrs (Keyword/get (elem (elem (beam_lib/chunks bytes (list :attributes)) 1) 1) :attributes)
-        callable (normalized_attribute attrs :bl_sdk_callable_kinds)]
+        callable (normalized_attribute attrs :bl_sdk_callable_kinds)
+        initializer_kind (normalized_attribute attrs :bl_sdk_initializer_lambda_kind)]
+    (when (and initializer_kind
+               (not (and (= :initializer (Map/get row :role)) (contains? #{:values :macros} initializer_kind))))
+      (erlang/error :sdk_image_invalid_initializer_lambda_kind))
+    (when (and (Map/has_key? row :initializer-lambda-kind)
+               (not= initializer_kind (Map/get row :initializer-lambda-kind)))
+      (erlang/error :sdk_image_initializer_lambda_kind_changed))
     (when-not (and (erlang/== identity (Atom/to_string mod))
                   (erlang/== (Enum/sort (Map/get row :imports))
                     (Enum/sort (Enum/map imports (fn [dependency] (Atom/to_string dependency)))))
@@ -2484,7 +2626,10 @@
           (erlang/error :sdk_image_declaration_metadata_changed)))
       (verify_sdk_forwarder! (tuple mod bytes) (Map/get row :forwarder-namespace) routes))
     (Map/merge row {:imports imports :forwarder-routes routes :callable-kinds callable
-                    :lambda-routes (when (= :stable-body (Map/get row :role)) (sdk_lambda_routes! bytes))
+                    :initializer-lambda-kind initializer_kind
+                    :lambda-routes (when (or (= :stable-body (Map/get row :role))
+                                             (and (= :initializer (Map/get row :role)) (= :values initializer_kind)))
+                                     (sdk_lambda_routes! bytes))
                     :binding-routes (when forwarder? (sdk_binding_routes! mod bytes routes))})))
 
 (defn- complete_image_sdk_closure! [root inventory]
@@ -2574,6 +2719,15 @@
     (when-not (or (Map/has_key? stable mod)
                  (and forwarder (Map/has_key? (Map/get forwarder :routes) (tuple name arity))))
       (erlang/error :unattested_sdk_callback))
+    ;; Immutable ownership is not runtime-callable macro authority. A Source
+    ;; value may expose a public macro carrier or alias; native SDK adoption
+    ;; must refuse its constructor closure before retaining/invoking it too.
+    (when (erlang/== :local (elem (erlang/fun_info callback :type) 1))
+      (let [attrs (erlang/apply mod :module_info (list :attributes))
+            role (normalized_attribute attrs :bl_aot_artifact_role)
+            origin (normalized_attribute attrs :bl_sdk_initializer_lambda_kind)]
+        (when (and (erlang/== :initializer role) (erlang/not (erlang/== :values origin)))
+          (erlang/error :unattested_sdk_callback))))
     true))
 
 (defn sdk_declaration_evidence!
@@ -2906,7 +3060,8 @@
           (BeamLisp.Emit/descriptor_for init_mod
             (list (BeamLisp.Emit/function_clause :__bl_init_values__
                     (BeamLisp.Emit/sequence (erlang/++ value_ops (list (BeamLisp.Emit/lit :ok))))))
-            (erlang/++ unit_attrs (list (tuple :bl_aot_artifact_role :initializer)))))
+            (erlang/++ unit_attrs (list (tuple :bl_aot_artifact_role :initializer)
+                                           (tuple :bl_sdk_initializer_lambda_kind :values)))))
         value_call_ops (if companion_descriptor
                          (list (BeamLisp.Emit/remote init_mod :__bl_init_values__ (list)))
                          (list))
