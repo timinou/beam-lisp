@@ -119,9 +119,9 @@
 
 ;; ── the declaration, and its refusals ───────────────────────────────────
 
-(def KNOWN-DECL-OPTS [:of :concurrency :retry :unique :lease :partition :protocol :generation])
+(def KNOWN-DECL-OPTS [:of :concurrency :retry :unique :lease :partition :protocol :generation :admission])
 
-(def KNOWN-CLAUSE-OPTS [:of :concurrency :retry :unique :lease :partition :protocol :generation
+(def KNOWN-CLAUSE-OPTS [:of :concurrency :retry :unique :lease :partition :protocol :generation :admission
                         :clock :server :contract])
 
 (def KNOWN-RETRY-OPTS [:max :backoff :base :max-delay :jitter])
@@ -176,6 +176,22 @@
                              (str jitter))
                         {:jitter jitter})))
       {:max max :backoff backoff :base base :max-delay ceiling :jitter jitter})))
+
+(defn- normalise-admission [policy]
+  (when-not (and (map? policy) (= #{:max-outstanding :scopes} (set (keys policy)))
+                (positive-int? (:max-outstanding policy)) (<= (:max-outstanding policy) 1000000)
+                (vector? (:scopes policy)) (<= (count (:scopes policy)) 8))
+    (throw (ex-info "Invalid native queue admission policy" {:kind :invalid-admission})))
+  (doseq [scope (:scopes policy)]
+    (when-not (and (map? scope) (= #{:keys :max} (set (keys scope)))
+                  (vector? (:keys scope)) (<= 1 (count (:keys scope)) 8)
+                  (= (count (:keys scope)) (count (distinct (:keys scope))))
+                  (every? keyword? (:keys scope)) (positive-int? (:max scope))
+                  (<= (:max scope) (:max-outstanding policy)))
+      (throw (ex-info "Invalid native queue admission scope" {:kind :invalid-admission-scope}))))
+  (when-not (= (count (:scopes policy)) (count (distinct (map :keys (:scopes policy)))))
+    (throw (ex-info "Repeated admission scope" {:kind :invalid-admission-scope})))
+  policy)
 
 (defn normalise-decl
   "A queue's declaration with every default filled and every typo REFUSED, so
@@ -232,14 +248,15 @@
     (when (and (some? (:generation d))
                (not (and (string? (:generation d)) (not (empty? (:generation d))))))
       (throw (ex-info "queue: :generation must be a nonempty string" {:kind :invalid-generation})))
-    {:of of
+    (cond-> {:of of
      :protocol (:protocol d 1)
      :generation (:generation d)
      :concurrency concurrency
      :lease lease
      :unique (vec unique)
      :partition (vec partition)
-     :retry (normalise-retry (get d :retry))}))
+     :retry (normalise-retry (get d :retry))}
+      (contains? d :admission) (assoc :admission (normalise-admission (:admission d))))))
 
 (defn backoff-ms
   "Milliseconds to wait before the attempt AFTER `n` failures.
@@ -897,6 +914,36 @@
 (defn- find-by-ticket [c ticket]
   (datom/pull (datom/db c) '[*] [:job/ticket ticket]))
 
+(defn- admission-scope [payload keys]
+  (let [value (mapv #(get payload %) keys)]
+    (when-not (and (every? some? value)
+                  (<= (erlang/byte_size (erlang/term_to_binary value)) 4096))
+      (throw (ex-info "Admission scope is missing or oversized" {:kind :invalid-admission-payload})))
+    value))
+
+(defn- admission-jobs [database srv]
+  (filter #(contains? #{:queued :running :held} (:job/state %))
+   (mapv (fn [[e]] (datom/entity database e))
+    (datom/q '[:find ?e :in $ ?server :where [?e :job/server ?server]
+                 [?e :job/state ?state]]
+      database (server-name srv)))))
+
+(defn- require-capacity! [database srv policy payload except-id]
+  (when policy
+    (let [jobs (filter #(not= except-id (:db/id %)) (admission-jobs database srv))
+          scopes (:scopes policy)
+          ;; Validate both new and outstanding legacy work before counting. A
+          ;; policy cannot silently put unknown legacy scopes outside its cap.
+          target (mapv #(admission-scope payload (:keys %)) scopes)
+          values (mapv (fn [job] (mapv #(admission-scope (:job/payload job) (:keys %)) scopes)) jobs)
+          full? (or (>= (count jobs) (:max-outstanding policy))
+                    (some true? (map (fn [scope value index]
+                      (>= (count (filter #(= value (nth % index)) values)) (:max scope)))
+                        scopes target (range (count scopes)))))]
+      (when full?
+        (throw (ex-info "Native queue admission is full; original domain work remains owed"
+                        {:kind :queue-capacity :state :deferred :reason :queue-capacity}))))))
+
 (defn enqueue!
   "Put a job ON the queue — a TRANSACTION against the queue's store, never a
    message, so the job is a FACT before anything could act on it and a restart
@@ -1007,6 +1054,14 @@
                (throw (ex-info "Enrollment identity already names a different payload or protocol"
                         {:kind :enrollment-conflict :server srv})))
              (assoc existing :job/created false))
+         (let [old (when ticket (find-by-ticket c ticket))]
+          (when (and old enrollment (not= enrollment (:job/enrollment old)))
+            (throw (ex-info "Outstanding ticket belongs to a different enrollment"
+                           {:kind :enrollment-conflict :server srv})))
+          (if old
+            (assoc old :job/created false)
+            (do
+             (require-capacity! (datom/db c) srv (:admission (declaration srv)) job nil)
          (try
            (let [report (datom/transact! c tx)
                  e (get (:tempids report) -1)]
@@ -1020,7 +1075,23 @@
                          (throw (ex-info "Outstanding ticket belongs to a different enrollment"
                                   {:kind :enrollment-conflict :server srv})))
                        (assoc j :job/created false)) (throw err)))
-               (throw err))))))))))))
+               (throw err)))))))))))))))
+
+(defn try-enqueue!
+  "Native writer-atomic capacity admission. Duplicate retained enrollment or
+   ticket resolves before capacity. Only a full configured budget returns
+   :deferred; invalid scope/protocol/generation and conflicts still throw.
+   Caller retains its original owed domain identity and retries enrollment on
+   native capacity release; this creates no separate backlog or ledger."
+  ([srv payload] (try-enqueue! srv payload {}))
+  ([srv payload opts]
+   (try
+     (let [job (enqueue! srv payload opts)]
+       {:status (if (:job/created job) :admitted :existing) :job job})
+     (catch e
+       (if (= :queue-capacity (:kind (ex-data e)))
+         {:status :deferred :reason :queue-capacity}
+         (throw e))))))
 
 ;; ── stats: a query, not a counter ───────────────────────────────────────
 
@@ -1179,7 +1250,9 @@
   [srv claimed opts]
   (when-not (and (map? opts) (= #{:at :reason :basis} (set (keys opts)))
                 (erlang/is_integer (:at opts)) (<= 0 (:at opts) 9223372036854775807)
-                (keyword? (:reason opts)) (some? (:basis opts))
+                (keyword? (:reason opts))
+                (<= (erlang/byte_size (erlang/term_to_binary (:reason opts))) 256)
+                (some? (:basis opts))
                 (<= (erlang/byte_size (erlang/term_to_binary (:basis opts))) 16384))
     (throw (ex-info "Deferral needs a future instant and bounded original basis" {:kind :invalid-deferral})))
   (let [c (conn srv) clock (attempt-clock srv)]
@@ -1357,6 +1430,7 @@
                 other (when ticket (find-by-ticket c ticket))]
             (when (and other (not= id (:db/id other)))
               (throw (ex-info "Outstanding work already holds retry ticket" {:kind :duplicate-retry})))
+            (require-capacity! (datom/db c) srv (:admission d) (:job/payload j) id)
             (datom/transact! c (vec (concat
               [[:db/cas id :job/state (:job/state j) :queued]
                [:db/add id :job/retry-base (:job/attempts j 0)]
