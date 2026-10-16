@@ -65,6 +65,10 @@ mod atoms {
         datoms,
         datoms_reverse = "datoms-reverse",
         pairs,
+        datoms_data = "datoms-data",
+        datoms_reverse_data = "datoms-reverse-data",
+        pairs_data = "pairs-data",
+        columns_data = "columns-data",
         // The boolean lane's decoded terms. The trailing underscore is a Rust
         // keyword accident, not part of the atom: without the alias rustler
         // stringifies the IDENTIFIER, so a stored `true` came back as `:true_`
@@ -632,7 +636,11 @@ struct Row<'a> {
 /// have no certificate here. This term-tree walk allocates no payload.
 /// https://www.erlang.org/doc/apps/erts/erl_ext_dist.html
 fn finite_etf_charge(bytes: &[u8]) -> Option<usize> {
-    struct Check<'a> { bytes: &'a [u8], pos: usize }
+    finite_etf_charge_with_nodes(bytes, usize::MAX)
+}
+
+fn finite_etf_charge_with_nodes(bytes: &[u8], max_nodes: usize) -> Option<usize> {
+    struct Check<'a> { bytes: &'a [u8], pos: usize, nodes_left: usize }
     impl Check<'_> {
         fn take(&mut self, n: usize) -> Option<&[u8]> {
             let end = self.pos.checked_add(n)?;
@@ -649,12 +657,13 @@ fn finite_etf_charge(bytes: &[u8]) -> Option<usize> {
         }
         fn terms(&mut self, n: usize, depth: usize) -> Option<()> {
             // Even NIL uses one byte. A hostile arity cannot create a long loop.
-            if n > self.bytes.len().checked_sub(self.pos)? { return None; }
+            if n > self.bytes.len().checked_sub(self.pos)? || n > self.nodes_left { return None; }
             for _ in 0..n { self.term(depth + 1)?; }
             Some(())
         }
         fn term(&mut self, depth: usize) -> Option<()> {
             if depth > 128 { return None; }
+            self.nodes_left = self.nodes_left.checked_sub(1)?;
             match self.byte()? {
                 97 => { self.take(1)?; }                  // SMALL_INTEGER_EXT
                 98 => { self.take(4)?; }                  // INTEGER_EXT
@@ -691,7 +700,7 @@ fn finite_etf_charge(bytes: &[u8]) -> Option<usize> {
             Some(())
         }
     }
-    let mut check = Check { bytes, pos: 0 };
+    let mut check = Check { bytes, pos: 0, nodes_left: max_nodes };
     if check.byte()? != ETF_VERSION { return None; }
     check.term(0)?;
     if check.pos != bytes.len() { return None; }
@@ -759,16 +768,16 @@ fn read_row(val: &[u8]) -> Result<Row<'_>, Error> {
 /// only when a compiled reader touches it. Decoding it here keeps every read
 /// path's cost where it belongs, and keeps the regression off `-range` for any
 /// caller that never touches datoms at all.
-fn slot_term<'a>(env: Env<'a>, bytes: &[u8], shape: &VectorShape) -> NifResult<Term<'a>> {
+fn slot_term<'a>(env: Env<'a>, bytes: &[u8], shape: &VectorShape, admission: &mut DecodeAdmission) -> NifResult<Term<'a>> {
     if bytes.is_empty() {
         return Err(err("empty value slot"));
     }
     match bytes[0] {
-        ETF_VERSION => decode_stored(env, bytes, "stored value"),
-        LANE_ESC => decode_stored(env, &bytes[1..], "escaped value"),
+        ETF_VERSION => decode_stored(env, bytes, "stored value", admission),
+        LANE_ESC => decode_stored(env, &bytes[1..], "escaped value", admission),
         LANE_DATOM => {
             let row = read_row(bytes)?;
-            datom_term(env, &row, shape)
+            datom_term(env, &row, shape, admission)
         }
         // A scalar slot: the same lanes a datom's `v` uses, with nothing in
         // front of them. The synthetic row carries no entity/attribute, which
@@ -777,6 +786,7 @@ fn slot_term<'a>(env: Env<'a>, bytes: &[u8], shape: &VectorShape) -> NifResult<T
             env,
             &Row { e: 0, tx: 0, op: 1, a: &[], v: bytes, legacy: None },
             shape,
+            admission,
         ),
     }
 }
@@ -858,6 +868,10 @@ enum BoundedEtf<'a> {
 /// Charge advertised expansion before inflation. Then prove the resulting
 /// finite term tree before any BEAM decode. The normal input remains borrowed.
 fn bounded_finite_etf(bytes: &[u8], available: usize) -> Result<BoundedEtf<'_>, String> {
+    bounded_finite_etf_with_nodes(bytes, available, usize::MAX)
+}
+
+fn bounded_finite_etf_with_nodes(bytes: &[u8], available: usize, max_nodes: usize) -> Result<BoundedEtf<'_>, String> {
     let compressed = bytes.starts_with(&[ETF_VERSION, 80]);
     let size = if compressed {
         if bytes.len() < 6 { return Ok(BoundedEtf::Opaque); }
@@ -870,18 +884,62 @@ fn bounded_finite_etf(bytes: &[u8], available: usize) -> Result<BoundedEtf<'_>, 
     let payload = if compressed {
         std::borrow::Cow::Owned(inflate_stored_etf(bytes)?)
     } else { std::borrow::Cow::Borrowed(bytes) };
-    if finite_etf_charge(&payload).is_none() { return Ok(BoundedEtf::Opaque); }
+    let finite = if max_nodes == usize::MAX { finite_etf_charge(&payload) }
+                 else { finite_etf_charge_with_nodes(&payload, max_nodes) };
+    if finite.is_none() { return Ok(BoundedEtf::Opaque); }
     Ok(BoundedEtf::Admitted { charge, payload })
 }
 
-fn decode_stored<'a>(env: Env<'a>, bytes: &[u8], what: &str) -> NifResult<Term<'a>> {
+/// One native crossing owns one aggregate decoded-ETF budget. The SDK chooses
+/// this mode from actual native Source context; raw Source NIF calls are denied.
+/// Typed scalar lanes do not enter this parser. Trusted readers keep any-term ABI.
+struct DecodeAdmission {
+    remaining: Option<usize>,
+}
+
+impl DecodeAdmission {
+    const MAX_BYTES: usize = 268435456;
+
+    fn new(data_only: bool) -> Self {
+        Self { remaining: data_only.then_some(Self::MAX_BYTES) }
+    }
+
+    fn charge_row(&mut self, encoded_bytes: usize) -> Result<(), String> {
+        if let Some(available) = self.remaining {
+            let charge = encoded_bytes.checked_mul(2).and_then(|n| n.checked_add(512))
+                .ok_or("Source row decode budget exhausted")?;
+            self.remaining = Some(available.checked_sub(charge)
+                .ok_or("Source row decode budget exhausted")?);
+        }
+        Ok(())
+    }
+
+    fn payload<'a>(&mut self, bytes: &'a [u8]) -> Result<std::borrow::Cow<'a, [u8]>, String> {
+        if let Some(available) = self.remaining {
+            // Charge advertised expansion BEFORE inflation, then prove the
+            // complete data grammar BEFORE creating a BEAM term. Budget and
+            // node exhaustion refuse the crossing, never masquerade as EOF.
+            match bounded_finite_etf_with_nodes(bytes, available, 1000000)? {
+                BoundedEtf::Admitted { charge, payload } => {
+                    self.remaining = Some(available - charge);
+                    Ok(payload)
+                }
+                BoundedEtf::Limited => Err("Source ETF decode budget exhausted".into()),
+                BoundedEtf::Opaque => Err("Source ETF contains a runtime capability or malformed data".into()),
+            }
+        } else if bytes.starts_with(&[ETF_VERSION, 80]) {
+            Ok(std::borrow::Cow::Owned(inflate_stored_etf(bytes)?))
+        } else {
+            Ok(std::borrow::Cow::Borrowed(bytes))
+        }
+    }
+}
+
+fn decode_stored<'a>(env: Env<'a>, bytes: &[u8], what: &str, admission: &mut DecodeAdmission) -> NifResult<Term<'a>> {
     // The NIF decoder does not accept this compressed form on the deployed
     // runtime. Normalize its envelope, then use the very same term decoder.
-    let inflated = if bytes.starts_with(&[ETF_VERSION, 80]) {
-        Some(inflate_stored_etf(bytes).map_err(|e| err(format!("{}: {}", what, e)))?)
-    } else { None };
-    let payload = inflated.as_deref().unwrap_or(bytes);
-    unsafe { env.binary_to_term_trusted(payload) }
+    let payload = admission.payload(bytes).map_err(|e| err(format!("{}: {}", what, e)))?;
+    unsafe { env.binary_to_term_trusted(&payload) }
         .map(|(term, _)| term)
         .ok_or_else(|| err(format!("{} did not decode", what)))
 }
@@ -908,10 +966,10 @@ fn datom_fields<'a>(env: Env<'a>, term: Term<'a>, shape: &VectorShape) -> NifRes
 }
 
 /// The BEAM term for one row's `v`, chosen by its lane tag.
-fn v_term<'a>(env: Env<'a>, row: &Row<'_>, shape: &VectorShape) -> NifResult<Term<'a>> {
+fn v_term<'a>(env: Env<'a>, row: &Row<'_>, shape: &VectorShape, admission: &mut DecodeAdmission) -> NifResult<Term<'a>> {
     if let Some(whole) = row.legacy {
         // Pre-lane row: the value IS the datom, so recover `v` from it.
-        let term = decode_stored(env, whole, "legacy datom value")?;
+        let term = decode_stored(env, whole, "legacy datom value", admission)?;
         let fields = datom_fields(env, term, shape)?;
         return fields
             .get(2)
@@ -934,7 +992,7 @@ fn v_term<'a>(env: Env<'a>, row: &Row<'_>, shape: &VectorShape) -> NifResult<Ter
         Some(&LANE_STR) => Ok(to_binary(env, &v[1..])?.to_term(env)),
         Some(&LANE_KW) => Ok(Atom::from_bytes(env, &v[1..])?.to_term(env)),
         Some(&LANE_ESC) => {
-            let term = decode_stored(env, &v[1..], "escaped value")?;
+            let term = decode_stored(env, &v[1..], "escaped value", admission)?;
             Ok(term)
         }
         Some(&tag) => Err(err(format!(
@@ -947,13 +1005,13 @@ fn v_term<'a>(env: Env<'a>, row: &Row<'_>, shape: &VectorShape) -> NifResult<Ter
 }
 
 /// One row as the datom the index layer expects: `[e a v tx op]`.
-fn datom_term<'a>(env: Env<'a>, row: &Row<'_>, shape: &VectorShape) -> NifResult<Term<'a>> {
+fn datom_term<'a>(env: Env<'a>, row: &Row<'_>, shape: &VectorShape, admission: &mut DecodeAdmission) -> NifResult<Term<'a>> {
     if row.legacy.is_some() {
         // Already a datom in the BEAM's own format: hand it back as-is.
-        return decode_stored(env, row.legacy.unwrap(), "legacy datom value");
+        return decode_stored(env, row.legacy.unwrap(), "legacy datom value", admission);
     }
     let a = Atom::from_bytes(env, row.a)?;
-    let v = v_term(env, row, shape)?;
+    let v = v_term(env, row, shape, admission)?;
     shape.vector(
         env,
         &[
@@ -1007,7 +1065,7 @@ impl Columns {
         ordinal
     }
 
-    fn push(&mut self, env: Env, row: &Row<'_>, shape: &VectorShape) -> NifResult<()> {
+    fn push(&mut self, env: Env, row: &Row<'_>, shape: &VectorShape, admission: &mut DecodeAdmission) -> NifResult<()> {
         // NOTE: `push` is the only place a row's bytes become columns, so it is
         // also the only place the LEGACY/ESC distinction has to be resolved.
         self.e.extend_from_slice(&row.e.to_le_bytes());
@@ -1036,7 +1094,7 @@ impl Columns {
             // and re-emit it as an ESC payload. The columnar reader's callers
             // then never see a legacy lane at all — one code path above, and no
             // migration step before a store can be read columnar.
-            let term = decode_stored(env, whole, "legacy datom value")?;
+            let term = decode_stored(env, whole, "legacy datom value", admission)?;
             let fields = datom_fields(env, term, shape)?;
             let v = fields
                 .get(2)
@@ -1113,6 +1171,17 @@ fn fjall_resolve_chunk<'a>(
             (atom, Some(budget))
         }
     };
+    let (mode, data_only) = if mode == atoms::datoms_data() { (atoms::datoms(), true) }
+        else if mode == atoms::datoms_reverse_data() { (atoms::datoms_reverse(), true) }
+        else if mode == atoms::pairs_data() { (atoms::pairs(), true) }
+        else if mode == atoms::columns_data() { (atoms::columns(), true) }
+        else { (mode, false) };
+    let mut admission = DecodeAdmission::new(data_only);
+    // Ordered-page preflight can inflate before decode_stored. A caller's
+    // larger page budget must never bypass Source's aggregate ceiling there.
+    let byte_budget = byte_budget.map(|budget| {
+        if data_only { budget.min(DecodeAdmission::MAX_BYTES) } else { budget }
+    });
     let reverse = mode == atoms::datoms_reverse();
     let lower = match (&start, &after) {
         (Some(b), _) => Bound::Included(b.as_slice().to_vec()),
@@ -1148,6 +1217,7 @@ fn fjall_resolve_chunk<'a>(
     };
     for entry in entries.take(limit) {
         let (k, v) = entry.map_err(|e| err(e))?;
+        admission.charge_row(k.len().saturating_add(v.len())).map_err(err)?;
         let mut normalized_storage: Option<Vec<u8>> = None;
         if let Some(budget) = byte_budget {
             let row = read_row(&v)?;
@@ -1163,6 +1233,9 @@ fn fjall_resolve_chunk<'a>(
             let extra = if let Some(bytes) = etf {
                 match bounded_finite_etf(bytes, available - base).map_err(err)? {
                     BoundedEtf::Limited => { byte_limited = true; break; }
+                    BoundedEtf::Opaque if data_only => {
+                        return Err(err("Source ETF contains a runtime capability or malformed data"));
+                    }
                     BoundedEtf::Opaque => { opaque_value = true; break; }
                     BoundedEtf::Admitted { charge, payload } => {
                         if let std::borrow::Cow::Owned(payload) = payload {
@@ -1194,14 +1267,14 @@ fn fjall_resolve_chunk<'a>(
             // datoms share the keyspace), so this mode must not require a datom
             // shape — that is the `:datoms`/`:columns` contract, not the port's.
             let key = to_binary(env, &k)?.to_term(env);
-            let value = slot_term(env, storage, &shape)?;
+            let value = slot_term(env, storage, &shape, &mut admission)?;
             pairs.push(shape.vector(env, &[key, value])?);
         } else {
             let row = read_row(storage)?;
             if want_datoms {
-                datoms.push(datom_term(env, &row, &shape)?);
+                datoms.push(datom_term(env, &row, &shape, &mut admission)?);
             } else {
-                cols.push(env, &row, &shape)?;
+                cols.push(env, &row, &shape, &mut admission)?;
             }
         }
         last_key = Some(k.to_vec());
@@ -1261,16 +1334,38 @@ fn fjall_resolve_prefixes<'a>(
     handle: ResourceArc<DbHandle>,
     bounds: Vec<(Binary, Binary)>,
 ) -> NifResult<Term<'a>> {
+    resolve_prefixes_impl(env, handle, bounds, false)
+}
+
+/// Source-selected data-only counterpart. Fixed SDK storage dispatch chooses
+/// it from authenticated context, rather than accepting a caller policy flag.
+#[rustler::nif(schedule = "DirtyIo")]
+fn fjall_resolve_prefixes_data<'a>(
+    env: Env<'a>,
+    handle: ResourceArc<DbHandle>,
+    bounds: Vec<(Binary, Binary)>,
+) -> NifResult<Term<'a>> {
+    resolve_prefixes_impl(env, handle, bounds, true)
+}
+
+fn resolve_prefixes_impl<'a>(
+    env: Env<'a>,
+    handle: ResourceArc<DbHandle>,
+    bounds: Vec<(Binary, Binary)>,
+    data_only: bool,
+) -> NifResult<Term<'a>> {
     use std::ops::Bound;
     let shape = VectorShape::new(env)?;
+    let mut admission = DecodeAdmission::new(data_only);
     let mut datoms: Vec<Term<'a>> = Vec::new();
     for (lo, hi) in bounds {
         let lower = Bound::Included(lo.as_slice().to_vec());
         let upper = Bound::Included(hi.as_slice().to_vec());
         for entry in handle.datoms.range((lower, upper)) {
-            let (_k, v) = entry.map_err(|e| err(e))?;
+            let (k, v) = entry.map_err(|e| err(e))?;
+            admission.charge_row(k.len().saturating_add(v.len())).map_err(err)?;
             let row = read_row(&v)?;
-            datoms.push(datom_term(env, &row, &shape)?);
+            datoms.push(datom_term(env, &row, &shape, &mut admission)?);
         }
     }
     let out = map_new(env)
@@ -1867,6 +1962,64 @@ mod tests {
         for n in 0..compressed.len() {
             assert!(!matches!(bounded_finite_etf(&compressed[..n], 8192), Ok(BoundedEtf::Admitted { .. })));
         }
+    }
+
+    #[test]
+    fn source_decode_admission_preserves_data_and_trusted_any_term_abi() {
+        use std::io::Write;
+        let plain = [131, 104, 2, 97, 7, 116, 0, 0, 0, 1, 119, 1, b'k', 106];
+        let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&plain[1..]).unwrap();
+        let mut compressed = vec![131, 80];
+        compressed.extend_from_slice(&((plain.len() - 1) as u32).to_be_bytes());
+        compressed.extend_from_slice(&encoder.finish().unwrap());
+        let mut source = DecodeAdmission::new(true);
+        assert_eq!(source.payload(&plain).unwrap().as_ref(), plain);
+        assert_eq!(source.payload(&compressed).unwrap().as_ref(), plain);
+        assert_eq!(source.remaining, Some(DecodeAdmission::MAX_BYTES - 2 * plain.len() * 64));
+        // These bytes are deliberately not decoded by the test. Trusted mode
+        // must still forward them to the original BEAM any-term decoder.
+        for tag in [88, 89, 90, 101, 102, 103, 112, 113, 114, 117, 120] {
+            let nested = [131, 104, 1, tag];
+            assert!(source.payload(&nested).is_err());
+            assert_eq!(DecodeAdmission::new(false).payload(&nested).unwrap().as_ref(), nested);
+        }
+    }
+
+    #[test]
+    fn source_decode_admission_refuses_compressed_capabilities_and_expansion_bombs() {
+        use std::io::Write;
+        for tag in [88, 89, 90, 101, 102, 103, 112, 113, 114, 117, 120] {
+            let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(&[104, 1, tag]).unwrap();
+            let mut bytes = vec![131, 80, 0, 0, 0, 3];
+            bytes.extend_from_slice(&encoder.finish().unwrap());
+            assert!(DecodeAdmission::new(true).payload(&bytes).is_err());
+        }
+        let bomb = [131, 80, 255, 255, 255, 255];
+        assert_eq!(DecodeAdmission::new(true).payload(&bomb).unwrap_err(),
+                   "Source ETF decode budget exhausted");
+    }
+
+    #[test]
+    fn source_decode_admission_shares_row_and_term_budget_and_bounds_nodes() {
+        let mut source = DecodeAdmission { remaining: Some(1024) };
+        source.charge_row(128).unwrap(); // 256 + 512 bytes
+        assert_eq!(source.remaining, Some(256));
+        assert_eq!(source.payload(&[131, 97, 1]).unwrap().as_ref(), [131, 97, 1]);
+        assert_eq!(source.remaining, Some(64));
+        assert!(source.payload(&[131, 97, 1]).is_err());
+        assert!(source.charge_row(usize::MAX).is_err());
+        assert!(DecodeAdmission::new(false).charge_row(usize::MAX).is_ok());
+        let tuple = [131, 104, 2, 97, 1, 106];
+        assert_eq!(finite_etf_charge_with_nodes(&tuple, 2), None);
+        assert_eq!(finite_etf_charge_with_nodes(&tuple, 3), Some(tuple.len() * 64));
+        for n in 0..tuple.len() {
+            assert!(DecodeAdmission::new(true).payload(&tuple[..n]).is_err());
+        }
+        let mut trailing = tuple.to_vec();
+        trailing.push(0);
+        assert!(DecodeAdmission::new(true).payload(&trailing).is_err());
     }
 
 }
