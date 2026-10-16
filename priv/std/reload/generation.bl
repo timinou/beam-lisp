@@ -14,6 +14,7 @@
            [lower :as lower] [reload.runtime :as reload]))
 
 (def ^:private prepared (atom {}))
+(def ^:private schema-publications (atom {}))
 ;; Compact SDK-issued native outcomes, never reachable graph.state flags. At
 ;; most the existing256 node-lifetime preparations can leave a tombstone.
 (def ^:private native-retirements (atom {}))
@@ -116,16 +117,24 @@
 
 ; Exact firstparty bypass entrypoints. Harmless reads/codecs/sync stay usable.
 (def ^:private STORE-PRODUCERS
- {"datom.store-ets" #{"__allocate-native!"}
+ {"datom.conn" #{"migration-policy-permit!" "migration-policy-claim-cell" "migration-policy-complete-in-writer!"
+                     "migration-policy-with-connect-turn" "migration-policy-finalize!"
+                     "migration-policy-root-cell!" "migration-policy-row!"
+                     "migration-policy-existing-reservation!" "migration-policy-with-reservation" "succeed-migration-policy!" "schema-policy-publication-evidence!" "migration-policy-successor-row!" "migration-policy-context!"}
+  "reload.generation" #{"schema-publication-evidence!" "reserve-schema-publication!" "record-schema-publication!"}
+  "proc.queue-family-root" #{"succeed-schema-policy!" "confirm-schema-policy-publication!" "schema-policy-succession-admission!" "require-policy-available!" "delegate-schema-phase!" "with-delegated-schema-phase!" "schema-phase-admission!"
+      "phase-worker!" "phase-row!" "phase-spec!"}
+  "datom.store-ets" #{"__allocate-native!"}
   "datom.store-fjall" #{"__allocate-native!" "fjall-open" "fjall-canonical-path"
                          "fjall-put" "fjall-delete" "fjall-cas" "fjall-commit"}
-  "datom.store-opening" #{"allocate!" "assert-producer!" "claim" "finish-claim!"
+  "proc.queue-family-storage" #{"allocation-evidence!" "consume-allocation-opening!" "claim-attempt!" "update-attempt!" "uncertain-attempt!"}
+  "datom.store-opening" #{"queue-allocation-evidence!" "allocate!" "assert-producer!" "claim" "finish-claim!"
                             "confirm-ets-closed!" "check-publication!" "readiness!" "registry" "decide!"
                             "matching-gate?" "cleanup!" "begin!" "fail" "admit" "lose-owner"}})
 (defn- unmanaged-producer? [namespace name]
  (or (contains? (get STORE-PRODUCERS namespace #{}) name)
   (and (contains? #{"BeamLisp.Supervisor" "Elixir.BeamLisp.Supervisor"} namespace)
-       (contains? #{"init" "start_server" "start_named_sup" "start_managed_tree" "managed_children"} name))
+       (contains? #{"init" "start_server" "start_named_sup" "start_native_link" "start_managed_tree" "managed_children"} name))
   (and (contains? #{"BeamLisp.Server" "Elixir.BeamLisp.Server"} namespace) (contains? #{"native_start" "bind_init"} name))
   (and (contains? #{"erlang" ":erlang"} namespace)
        (or (String/starts_with? name "spawn") (contains? #{"send_after" "start_timer"} name)))
@@ -1103,12 +1112,49 @@
    (not= expected (:digest old)) {:status :stale :digest (:digest old)}
    :else nil)))
 
+(defn- reserve-schema-publication! [slot previous generation]
+ ;; Called under the existing slot lock BEFORE changing graph/slot pointers.
+ ;; The global metadata lock also bounds concurrent publications on other slots.
+ (when (get-in generation [:resources :dynamic-store-policy])
+  (let [receipt {:ticket (erlang/make_ref) :state :issued :graph generation :slot slot
+                 :previous (when previous (:cache-key previous))}]
+   (BeamLisp.Env/with_generation_lock :schema-publication-receipt-capacity
+    (fn []
+     (swap! schema-publications
+      (fn [rows]
+       (let [history (get rows (:cache-key generation) [])]
+        (when (or (and (not (contains? rows (:cache-key generation))) (>= (count rows) 4096))
+                  (>= (count history) 8))
+         (refuse! :schema-publication-receipt-capacity {}))
+        (assoc rows (:cache-key generation) (conj history receipt))))))) receipt)))
+(defn- record-schema-publication! [receipt]
+ ;; No capacity failure remains after pointer mutation. The exact private
+ ;; reserved row is completed; an interrupted native publication stays issued.
+ (when receipt
+  (swap! schema-publications update (get-in receipt [:graph :cache-key])
+   #(mapv (fn [row] (if (= (:ticket receipt) (:ticket row)) (assoc row :state :published) row)) %))))
+(defn schema-publication-evidence!
+ "Fixed native consumer only. Positive SDK pointer-change receipt with an
+  exact still-selected prepared graph and the actual slot atom identity."
+ [generation]
+ (BeamLisp.Env/assert_execution_context!)
+ (attested-prepared! generation)
+ (let [history (get @schema-publications (:cache-key generation))
+       row (last (filter #(and (= :published (:state %)) (= generation @(:current (:slot %)))
+                               (contains? (:slots @(:state generation)) (get-in % [:slot :id]))) history))
+       slot (:slot row)]
+  (when-not (and (not (some #(= :issued (:state %)) history)) row (= generation (:graph row)) (erlang/is_reference (:ticket row))
+                 (= generation @(:current slot))
+                 (contains? (:slots @(:state generation)) (:id slot)))
+   (refuse! :native-schema-publication-evidence-required {}))
+  (select-keys row [:ticket :graph :slot :previous])))
+
 (defn- publish-validated! [slot expected generation]
    (with-lock (:id slot)
     (fn []
      ;; Another publisher or close may have won while validation ran.
      (or (publication-result slot expected generation)
-      (let [old @(:current slot)]
+      (let [old @(:current slot) publication-receipt (reserve-schema-publication! slot old generation)]
        (with-lock (:cache-key generation)
         (fn []
          (when (:retired @(:state generation)) (refuse! :retired-generation {}))
@@ -1120,10 +1166,27 @@
          (reset! (:current slot) generation)))
        (when old (with-lock (:cache-key old)
                    (fn [] (swap! (:state old) update :slots disj (:id slot)))))
+       (record-schema-publication! publication-receipt)
        {:status :applied :digest (:digest generation)})))))
 
 (defn- coordinate-publication [fence action]
  (if fence (fence action) (action)))
+
+(defn- coordinate-migration-publication [generation action]
+ ;; Fixed SDK metadata entry only, lazily used when an actual policy exists.
+ ;; No caller callback/MFA or public receipt chooses the gate. Ordinary no-policy
+ ;; startup must not import a migration/data-analysis closure.
+ (let [declared (get-in generation [:resources :dynamic-store-policy])
+       loaded? (env/with-env :global #(BeamLisp.Env/ns_ready? "datom.conn"))
+       installed? (when loaded?
+          ((env/with-env :global #(BeamLisp.AOT/sdk_named_constructor! "datom.conn" "migration-policy-installed?" 1))
+             (:application-id generation)))]
+  (when (and installed? (nil? declared)) (refuse! :migration-policy-declaration-required {}))
+  (if declared
+   (execution/with! generation
+    (fn []
+     ((env/with-env :global #(BeamLisp.AOT/sdk_named_constructor! "datom.conn" "with-migration-publication-reservation!" 1)) action)))
+   (action))))
 
 (defn publish!
  "Compare-and-publish one serving slot. expected is nil or the current digest.
@@ -1141,7 +1204,8 @@
     ;; serving admission OR an outer queue-family publication fence.
     ;; This remains a point-in-time check, not a raw alias write guard.
     (execution/check-runtime! generation)
-    (coordinate-publication fence #(publish-validated! slot expected generation))))))
+    (coordinate-migration-publication generation
+      #(coordinate-publication fence (fn [] (publish-validated! slot expected generation))))))))
 
 (defn current
  "Selected generation identity/resources in this execution, or nil outside it."

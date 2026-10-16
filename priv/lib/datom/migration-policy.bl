@@ -1,0 +1,242 @@
+; HOME prototype: pure decisions ONLY. Actual authority/admission belongs to
+; Conn's existing native registry turn, never a returned map or public boolean.
+(ns datom.migration-policy (:require [data.first-order :as data] [datom.schema :as schema]))
+(defn- fail [kind] (throw (ex-info "Dynamic store migration policy refused" {:kind kind})))
+(defn table-key [] :datom.conn/migration-policies)
+(defn registry-cell? [[key cell]]
+ (and (not (contains? #{:datom.conn/guard-admissions :datom.conn/store-openings
+                       :datom.conn/migration-policies} key))
+      (erlang/is_map cell) (:basis cell) (:writer cell)))
+(defn canonical-schema [value]
+ (data/check! value {:max-nodes 65536 :max-depth 64 :max-bytes 1048576})
+ (when-not (and (erlang/is_map value) (not (erlang/is_map_key :__struct__ value))
+                (<= (erlang/map_size value) 512)) (fail :migration-schema-budget))
+ (into {} (map (fn [[ident definition]]
+  (when-not (and (keyword? ident) (erlang/is_map definition)
+                 (not (erlang/is_map_key :__struct__ definition))
+                 (= ident (:db/ident definition)) (nil? (schema/validate-attr-def definition))
+                 (not (seq (:db/tupleAttrs definition))))
+   ;; Derived tuple/index conversion requires another proved producer lane.
+   (fail :unsupported-migration-schema))
+  [ident {:db/ident ident :db/valueType (:db/valueType definition)
+          :db/cardinality (or (:db/cardinality definition) :db.cardinality/one)
+          :db/unique (:db/unique definition) :db/index (= true (:db/index definition))
+          :db/fulltext (= true (:db/fulltext definition)) :db/tupleAttrs []}]) value)))
+(defn ledger-definitions []
+ [{:db/ident :migration/id :db/valueType :db.type/keyword
+   :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+  {:db/ident :migration/digest :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+  {:db/ident :migration/started-id :db/valueType :db.type/keyword
+   :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}])
+(defn business-schema [value]
+ (let [all (canonical-schema value)
+       expected (canonical-schema (into {} (map (fn [d] [(:db/ident d) d]) (ledger-definitions))))]
+  (doseq [[id definition] expected]
+   (when (and (contains? all id) (not= definition (get all id)))
+    (fail :invalid-migration-ledger-schema)))
+  (when (contains? all :queue/key) (fail :reserved-migration-store))
+  (apply dissoc all (keys expected))))
+(defn validate-plan [value]
+ (data/check! value {:max-nodes 65536 :max-depth 64 :max-bytes 1048576})
+ (when-not (and (erlang/is_map value) (= #{:version :families} (set (keys value)))
+                (= 1 (:version value)) (vector? (:families value))
+                (<= 1 (count (:families value)) 8)) (fail :invalid-migration-policy))
+ (let [families (mapv
+  (fn [family]
+   (when-not (and (erlang/is_map family) (= #{:family :schema :phase :migration} (set (keys family)))
+                  (string? (:family family)) (<= 1 (erlang/byte_size (:family family)) 64))
+    (fail :invalid-migration-family))
+   ;; Contract is rejected before reading/opening a native resource.
+   (when-not (= :expand (:phase family)) (fail :migration-contract-drain-proof-required))
+   (let [m (:migration family) before (canonical-schema (:schema family))
+         _ (when-not (and (erlang/is_map m)
+                          (= #{:migration/id :migration/digest :migration/grows} (set (keys m)))
+                          (keyword? (:migration/id m)) (string? (:migration/digest m))
+                          (Regex/match? #"^[a-f0-9]{64}$" (:migration/digest m))
+                          (vector? (:migration/grows m)) (<= 1 (count (:migration/grows m)) 32))
+             (fail :unsupported-migration-spec))
+         defs (:migration/grows m)
+         _ (when (or (contains? before :queue/key)
+                     (some #(contains? before %) (map :db/ident (ledger-definitions)))
+                     (not= (count defs) (count (set (map :db/ident defs))))
+                     (some #(or (contains? before (:db/ident %))
+                                (contains? #{:queue/key :migration/id :migration/digest :migration/started-id}
+                                           (:db/ident %))) defs))
+             (fail :migration-expand-requires-new-attributes))
+         after (canonical-schema (schema/install-all before defs))]
+    {:family (:family family) :before before :after after :migration m})) (:families value))]
+  (when (or (not= (count families) (count (set (map :family families))))
+            (not= (count families) (count (set (map :before families))))
+            (not= (count families) (count (set (map :after families))))
+            (not= (count families) (count (set (map #(get-in % [:migration :migration/id]) families)))))
+   (fail :ambiguous-migration-policy))
+  ;; Ordered additive history: an appended step may start at exactly one
+  ;; earlier terminal AFTER. Branching, merging and revising an old step refuse.
+  (doseq [a families b families]
+   (when (and (not= (:family a) (:family b)) (= (:before a) (:after b))
+              (not (some #(= (:family b) (:family %)) (take-while #(not= (:family a) (:family %)) families))))
+    (fail :ambiguous-migration-policy)))
+  (let [chains (reduce
+        (fn [chains family]
+         (let [prior (filterv #(= (:after (last %)) (:before family)) chains)]
+          (when (> (count prior) 1) (fail :ambiguous-migration-policy))
+          (if (seq prior)
+           (mapv #(if (= % (first prior)) (conj % family) %) chains)
+           (conj chains [family])))) [] families)
+        terminals (mapv (fn [steps]
+                    (assoc (last steps) :steps steps
+                     :schemas (set (mapcat #(vector (:before %) (:after %)) steps)))) chains)]
+   {:version 1 :families terminals :history families})))
+(defn prefix? [previous candidate]
+ (and (erlang/is_map previous) (erlang/is_map candidate)
+      (= (set (keys previous)) #{:version :families})
+      (= (set (keys candidate)) #{:version :families})
+      (= 1 (:version previous) (:version candidate))
+      (vector? (:families previous)) (vector? (:families candidate))
+      (<= (count (:families previous)) (count (:families candidate)))
+      (= (:families previous) (subvec (:families candidate) 0 (count (:families previous))))))
+(defn successor! [previous candidate]
+ (let [old (validate-plan previous) next (validate-plan candidate)]
+  (when-not (and (prefix? previous candidate) (< (count (:families previous)) (count (:families candidate))))
+   (fail :migration-policy-successor-required))
+  ;; Existing families must continue one exact additive chain. New disjoint
+  ;; families remain first-order and get no membership from a caller flag.
+  (doseq [family (:families old)]
+   (when-not (= 1 (count (filter #(contains? (:schemas %) (:after family)) (:families next))))
+    (fail :migration-policy-successor-required)))
+  next))
+(defn family-for [plan persisted]
+ (let [actual (business-schema persisted)
+       matches (filterv #(contains? (:schemas %) actual) (:families plan))]
+  (when-not (= 1 (count matches)) (fail :unknown-migration-schema-family)) (first matches)))
+(defn under-root? [root path]
+ ;; REFUSAL confinement only, never ownership or family-purpose authority.
+ (and (string? path) (or (= root path) (String/starts_with? path (str root "/")))))
+(defn matching [cells creator path]
+ (let [all (vals (get cells (table-key) {})) app (:application-id creator)
+       found (filterv #(or (= app (:application-id %)) (under-root? (:root %) path)) all)]
+  (when (> (count found) 1) (fail :ambiguous-migration-root)) (first found)))
+(declare queue-role-valid?)
+(defn check-opening [cells opening permit]
+ (when-let [policy (matching cells (:creator opening) (:path opening))]
+  (let [issued (get-in policy [:permits permit]) role (:queue-role opening)
+        queue? (and role (queue-role-valid? cells role (:creator opening) (:owner opening)
+                                           (:path opening) (:ticket opening)))]
+   (when-not (and (= :active (:state policy))
+                  (= (:application-id policy) (get-in opening [:creator :application-id]))
+                  (= :fjall (:producer opening))
+                  (or (and queue? (= (:root-id policy) (:root-id role)))
+                      (and (nil? role) issued (= :issued (:state issued))
+                           (= (:creator opening) (:creator issued)) (= (:owner opening) (:owner issued))
+                           (= (:path opening) (:path issued)) (= (:ticket policy) (:policy issued)))))
+    (fail :migration-managed-open-required)))) cells)
+(defn pending? [policy] (seq (:permits policy)))
+(defn required-frontier [policy] (:frontier policy))
+(defn check-frontier [cells policy]
+ (when (or (not= :active (:state policy)) (pending? policy)) (fail :migration-opening-pending))
+ (let [members (filterv (fn [[_ cell]]
+                         (= (:ticket policy) (get-in cell [:migration-phase :policy])))
+                       (filter registry-cell? cells))]
+  (when (> (count members) 32) (fail :migration-inventory-budget))
+  (doseq [[_ cell] members]
+   (when-not (and (= :open @(:lifetime cell))
+                  (= :complete (get-in cell [:migration-phase :state]))
+                  (= 1 (get-in cell [:migration-phase :frontier])))
+    (fail :migration-store-phase-pending)))
+  {:stores (count members) :frontier 1}))
+
+(defn queue-role-valid? [cells role creator owner path opening-ticket]
+ ;; Native ETS/code/lifetime observations only. No remote Process dictionary,
+ ;; writer/actor RPC, provider or Root ledger call inside Conn's Agent.
+ (boolean
+  (when role
+   (try
+    (let [root (:root-id role) root-cell (get cells (:resource root))
+          handle (:membership role) row (first (ets/lookup :beam_lisp_owner_index (:key handle)))
+          entry (when row (elem row 1))
+          native (or (:framework-evidence entry) (:native-evidence entry)) lease (:lease native)]
+     (and (= :native-queue-allocation (:kind role))
+          (= opening-ticket (:opening-ticket role)) (erlang/is_reference opening-ticket)
+          (= owner (:owner role)) (Process/alive? owner)
+          (= (:application-id creator) (:application-id role)) (= (:digest creator) (:generation role))
+          (= (:scope creator) (:scope role)) (= path (:path role))
+          (= handle (select-keys entry [:key :ticket :pid :application-id :kind :proof-id]))
+          (= owner (:pid entry)) (= (:application-id creator) (:application-id entry))
+          (not (ets/member :beam_lisp_owner_revisions (tuple :closed (:ticket entry))))
+          (= (:module role) (:module entry)) (= (:starter role) (:starter native))
+          (tuple? lease) (= 3 (erlang/tuple_size lease)) (= owner (elem lease 1))
+          (= (:proof-id entry) (elem lease 2)) (BeamLisp.Env/code_lease_active? lease)
+          (= (:module-md5 role) (erlang/apply (:module role) :module_info (list :md5)))
+          root-cell (= :open @(:lifetime root-cell)) (= (:lifetime root) (:lifetime root-cell))
+          (= (:custody root) (:creation-custody root-cell)) (Process/alive? (:owner root))))
+    (catch _ false)))))
+(defn queue-cell? [cells store cell]
+ (let [role (:migration-role cell)]
+  (when role
+   (when-not (and (= store (:resource role)) (= (:lifetime cell) (:lifetime role))
+                  (= (:creation-custody cell) (:custody role))
+                  (queue-role-valid? cells role (:guard-creator cell) (:owner role)
+                                     (:path store) (:opening-ticket role)))
+    (fail :migration-queue-role-unconfirmed)) true)))
+(defn check-queue-inventory [cells policy]
+ (let [members (filterv (fn [[store cell]]
+                          (and (:migration-role cell)
+                               (or (= (:application-id policy) (get-in cell [:guard-creator :application-id]))
+                                   (under-root? (:root policy) (:path store)))))
+                       (filter registry-cell? cells))]
+  (when (> (count members) 32) (fail :migration-inventory-budget))
+  (doseq [[store cell] members]
+   (when-not (and (= (:root-id policy) (get-in cell [:migration-role :root-id]))
+                  (= :open @(:lifetime cell)) (queue-cell? cells store cell))
+    (fail :migration-queue-role-unconfirmed)))
+  {:queues (count members)}))
+(defn check-preflight [cells opening permit queue-observed?]
+ (if-not queue-observed? (check-opening cells opening permit)
+  (when-let [policy (matching cells (:creator opening) (:path opening))]
+   (when-not (and (= :active (:state policy))
+                  (= (:application-id policy) (get-in opening [:creator :application-id]))
+                  (= :fjall (:producer opening)))
+    (fail :migration-managed-open-required)))) cells)
+
+(defn- declaration-keyword! [value pattern]
+ (when-not (and (string? value) (<= 1 (erlang/byte_size value) 128) (Regex/match? pattern value))
+  (fail :invalid-migration-policy-declaration))
+ (keyword value))
+(defn- declaration-attribute! [value]
+ (when-not (and (erlang/is_map value)
+                (every? #{"db/ident" "db/valueType" "db/cardinality" "db/unique" "db/index" "db/fulltext"} (keys value))
+                (contains? value "db/ident") (contains? value "db/valueType")
+                (or (not (contains? value "db/cardinality"))
+                    (contains? #{"db.cardinality/one" "db.cardinality/many"} (get value "db/cardinality")))
+                (or (not (contains? value "db/unique"))
+                    (contains? #{"db.unique/identity" "db.unique/value"} (get value "db/unique")))
+                (every? #(or (not (contains? value %)) (contains? #{true false} (get value %))) ["db/index" "db/fulltext"]))
+  (fail :invalid-migration-policy-declaration))
+ (into {} (map (fn [[key value]]
+               [(keyword key) (if (contains? #{"db/index" "db/fulltext"} key) value
+                                (declaration-keyword! value #"^[a-zA-Z][a-zA-Z0-9._-]*/[a-zA-Z][a-zA-Z0-9._-]*$"))]) value)))
+(defn from-declaration
+ "Pure closed JSON-first-order schema intent from a verified release. This
+  returns data, never Root/Conn authority, callbacks or executable references."
+ [value]
+ (data/check! value {:max-nodes 65536 :max-depth 64 :max-bytes 1048576})
+ (when-not (and (erlang/is_map value) (= #{"version" "families"} (set (keys value)))
+                (= 1 (get value "version")) (vector? (get value "families"))
+                (<= 1 (count (get value "families")) 8))
+  (fail :invalid-migration-policy-declaration))
+ (let [raw {:version 1 :families
+       (mapv (fn [family]
+        (let [migration (get family "migration")]
+         (when-not (and (erlang/is_map family) (= #{"family" "schema" "phase" "migration"} (set (keys family)))
+                        (vector? (get family "schema")) (<= (count (get family "schema")) 512)
+                        (erlang/is_map migration)
+                        (= #{"migration/id" "migration/digest" "migration/grows"} (set (keys migration)))
+                        (vector? (get migration "migration/grows")) (<= 1 (count (get migration "migration/grows")) 32))
+          (fail :invalid-migration-policy-declaration))
+         (when-not (= "expand" (get family "phase")) (fail :migration-contract-drain-proof-required))
+         {:family (get family "family") :phase :expand
+          :schema (schema/install-all (schema/empty-schema) (mapv declaration-attribute! (get family "schema")))
+          :migration {:migration/id (declaration-keyword! (get migration "migration/id") #"^[a-zA-Z][a-zA-Z0-9._-]*(/[a-zA-Z][a-zA-Z0-9._-]*)?$" )
+                      :migration/digest (get migration "migration/digest")
+                      :migration/grows (mapv declaration-attribute! (get migration "migration/grows"))}})) (get value "families"))}]
+  (validate-plan raw) raw))
