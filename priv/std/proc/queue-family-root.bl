@@ -5,11 +5,15 @@
            [datom.conn :as conn] [datom.store-fjall :as fjall] [env]))
 
 (def ^:private roots (atom {}))
+;; Native graph-success receipts retain only encoded actual handle identity and
+;; immutable graph identity. They grant no execution, opening or write authority.
+(def ^:private retired-native-roots (atom {}))
 (def ^:private schema-phases (atom {}))
-(declare succession-held? pending-policy-publication?)
+(declare succession-held? pending-policy-publication? schema-successions succession-key)
 (defn- refuse [kind]
  (throw (ex-info "Managed queue root refused" {:kind kind})))
 (defn- origin-free! []
+ (BeamLisp.Env/assert_native_command_callback_inactive!)
  ;; This guard deliberately runs OUTSIDE execution.with!. An app initializer
  ;; executes on its parent's PID, so creator PID alone is not authorization.
  (when (or (BeamLisp.Env/assert_execution_context!) (BeamLisp.Env/execution_origin))
@@ -247,36 +251,51 @@
       (dissoc all key)))
     :revoked))))
 (defn release-retired!
- "Fixed SDK retirement observer, called AFTER successful actual native module
-  retirement while private prepared-cache identity still exists. Drops only
-  graph enrollment metadata; never closes shared journal/writer or its other
-  generation grants. Failed/uncertain initializer alone cannot call this path."
+ "Actual native graph success releases only its original private Root grant.
+  Protected Root retirement keeps a compact nonretaining native-success note."
  [g]
  (if-not (get @roots (:cache-key g)) :absent
   (do
-   (origin-free!)
-   (generation/attested-prepared! g true)
-   ;; The public state Atom can close admission, but cannot prove native code
-   ;; retirement. Only the private issuer after actual Env.retire_modules! may
-   ;; authorize disposing this exact original graph's root metadata.
+   (origin-free!) (generation/attested-prepared! g true)
    (when-not (= :native-retired (:status (generation/native-retirement-outcome g)))
     (refuse :queue-root-generation-still-active))
-   (locked g
-    (fn []
-     (let [key (:cache-key g) row (get @roots key)]
-      (when row
-       (when (some (fn [[_ phase]]
-                     (and (= (:ticket row) (get-in phase [:root :ticket]))
-                          (contains? #{:issued :entered :uncertain} (:state phase)))) @schema-phases)
-        (refuse :queue-root-schema-phase-unconfirmed))
-       (when (succession-held? row) (refuse :queue-root-policy-succession-unconfirmed))
-       (when (pending-policy-publication? g row) (refuse :queue-root-policy-publication-required))
-       (when-not (and (= (generation-id g) (:generation-id row)) (not= :entered (:phase row)))
-        (refuse :queue-root-custody-still-active))
-       (store-roots! (fn [all]
-         (when-not (= row (get all key)) (refuse :queue-root-stale-custody))
-         (dissoc all key))))
-      :released))))))
+   ;; Conn query is outside the Root metadata lock and invokes no user code.
+   (let [protected? ((BeamLisp.Env/with_env :global
+                        #(BeamLisp.AOT/sdk_named_constructor! "datom.conn" "native-command-protected-root?" 1))
+                      (:resource (get @roots (:cache-key g))))]
+    (locked g
+     (fn []
+      (let [key (:cache-key g) row (get @roots key)]
+       (when row
+        (when (some #(and (= (:ticket row) (get-in (second %) [:root :ticket]))
+                         (not= :consumed (:state (second %)))) @schema-phases)
+         (refuse :queue-root-schema-phase-unconfirmed))
+        (when (succession-held? row) (refuse :queue-root-policy-succession-unconfirmed))
+        (when (pending-policy-publication? g row) (refuse :queue-root-policy-publication-required))
+        (when-not (and (= (generation-id g) (:generation-id row)) (not= :entered (:phase row)))
+         (refuse :queue-root-custody-still-active))
+        (when protected?
+         (let [resource-key (erlang/term_to_binary (get-in row [:resource :handle]))
+               receipt (generation/native-retirement-outcome g)
+               note {:owner (:owner row) :application-id (:application-id row)
+                     :root (:root row) :path (:path row) :incarnation (:incarnation row)
+                     :resource-key resource-key :graphs [(erlang/term_to_binary (:identity receipt))]}]
+          (swap! retired-native-roots
+           (fn [notes]
+            (let [prior (get notes resource-key)]
+             (when (and prior (not= (dissoc prior :graphs) (dissoc note :graphs)))
+              (refuse :queue-root-retirement-identity-conflict))
+             (when (and (not prior) (>= (count notes) 128)) (refuse :queue-root-retirement-capacity))
+             (assoc notes resource-key
+              (assoc note :graphs (vec (distinct (concat (:graphs prior []) (:graphs note))))))))))
+        (swap! schema-phases
+         #(into {} (remove (fn [[_ phase]] (= (:ticket row) (get-in phase [:root :ticket]))) %)))
+        (store-roots! (fn [all]
+          (when-not (= row (get all key)) (refuse :queue-root-stale-custody)) (dissoc all key)))
+        (when-not (some #(= (:incarnation row) (:incarnation (second %))) @roots)
+         ;; All history for this original Root is consumed, by checks above on
+         ;; each graph. No issued/unknown succession can be forgotten.
+         (swap! schema-successions dissoc (succession-key row)))) :released))))))))
 
 (defn retirement-blocker
  "Private fixed SDK retirement preflight. Unknown accepted initialization or
@@ -584,3 +603,19 @@
                  (nil? (get-in actual [:custody :origin])) (nil? (:creator actual)))
    (refuse :native-command-root-custody-required))
   (assoc (first identities) :declared-evidence (:declared-evidence (second (first candidates))))))
+
+(defn- native-command-retired-root! [connection]
+ ;; Fixed Conn close preflight only. Actual graph receipts, never mutable graph
+ ;; flags, names, path equality or caller-supplied prior-VM objects.
+ (BeamLisp.Env/assert_native_framework_execution!) (origin-free!)
+ (let [actual (conn/creation-evidence! connection)
+       key (erlang/term_to_binary (get-in actual [:resource :handle]))
+       note (get @retired-native-roots key)]
+  (when-not (and note (= (erlang/self) (:owner note) (get-in actual [:custody :owner]))
+                 (nil? (:creator actual)) (nil? (get-in actual [:custody :origin]))
+                 (= (:path note) (get-in actual [:resource :path]))
+                 (= :open @(:lifetime actual)) (seq (:graphs note))
+                 (not-any? #(= key (erlang/term_to_binary (get-in (second %) [:resource :handle]))) @roots)
+                 (not-any? #(= (:incarnation note) (get-in (second %) [:root :incarnation])) @schema-phases)
+                 (not (contains? @schema-successions [(:application-id note) (:incarnation note)])))
+   (refuse :queue-root-known-native-retirement-required)) note))

@@ -148,6 +148,7 @@
 (defrecord Conn [store schema basis writer subs blobs lifetime])
 
 (declare ensure-schema-coverage-in-writer with-canonical-writer install-native-mutation-root!
+ native-command-close-root! native-command-close-sync! native-command-retirement-check!
  native-guard-anchor! native-guard-publish! native-closed-tx? native-canonical-connection! native-connection-exposure!)
 (declare tuple-backfill-ops)
 (declare install-schema!)
@@ -1004,7 +1005,7 @@
         request-row (assoc-in [:lifetime-borrow-requests ticket]
                       {:request (:request request-row) :phase :closed}))))))) 30000))
 
-(defn release!
+(defn- release-connection!
   "Forget everything the registry holds for this connection's store.
 
    The missing half of `connect-with`, and it is missing in a way that
@@ -1034,8 +1035,10 @@
    handle is freed by garbage collection once nothing refers to it. What
    it removes is the last long-lived reference the database itself
    holds."
-  [conn]
-  (native-canonical-connection! conn)
+  [conn retirement]
+  (if retirement
+   (native-command-retirement-check! conn retirement)
+   (native-canonical-connection! conn))
   (writable-context!)
   (when (= (:store conn) (erlang/get :datom.conn/writing-store))
     (throw (ex-info "cannot release a connection inside its transaction" {:reason :release-in-writer})))
@@ -1057,7 +1060,7 @@
                           (when (contains? (:observers cell {}) releaser)
                             (throw (ex-info "An observer cannot close its own observed connection"
                                             {:kind :release-from-observer})))
-                          (migration-policy-close! reg conn)
+                          (migration-policy-close! reg conn retirement)
                           (reset! (:lifetime cell) :closing)
                           (->tuple-2 (select-keys cell [:writer :rank-worker :observers]) reg))
                       (->tuple-2 nil reg))))
@@ -1102,6 +1105,8 @@
     (erlang/garbage_collect (registry))
     :ok))
 
+(defn release! [conn] (release-connection! conn nil))
+
 (defn close!
   "Release the registry entry, then tear down what the store and the blob
    store OWN: an ETS table is deleted, a `:tmp` blob directory removed, a
@@ -1114,10 +1119,13 @@
    is unusable. Idempotent."
   [conn]
   (writable-context!)
-  (release! conn)
-  (datom.store/close (:blobs conn))
-  (datom.store/close (:store conn))
-  nil)
+  (if (= :retired (native-command-close-root! conn)) nil
+   (let [protected? (native-command-close-sync! conn)]
+    ;; Protected Fjall must sync while its original live Conn/writer still
+    ;; exists. release! intentionally makes the retained handle unusable.
+    (release! conn)
+    (datom.store/close (:blobs conn))
+    (when-not protected? (datom.store/close (:store conn))) nil)))
 
 (defn connect
   "Open a connection over a fresh ETS store.
@@ -3366,7 +3374,16 @@
                        (= (migration-policy/canonical-schema (:schema phase))
                           (migration-policy/canonical-schema @(:schema cell))))
          (migration-enrollment-fail! :stale-migration-schema-view)))))) 30000))))
-(defn- migration-policy-close! [cells connection]
+(defn- migration-policy-close! [cells connection retirement]
+ (if retirement
+  (let [root (get-in cells [:datom.conn/native-mutation-roots (:root-resource retirement)])]
+   (when-not (and root (= :retiring (:state root))
+                  (= (:context retirement) (:retirement-context root))
+                  (= (:owner retirement) (:owner root))
+                  (some #(and (= (:store connection) (:store %)) (= (:lifetime connection) (:lifetime %)))
+                        (:retirement-connections root)))
+    (migration-enrollment-fail! :native-command-retirement-connection-required)) cells)
+  (do
  (doseq [[_ root] (get cells :datom.conn/native-mutation-roots {})]
   (when (or (= (:store connection) (:resource root))
             (migration-policy/under-root? (:root root) (get-in connection [:store :path])))
@@ -3387,7 +3404,7 @@
    (migration-enrollment-fail! :migration-phase-outcome-unconfirmed)))
  (doseq [[_ policy] (get cells (migration-policy/table-key) {})]
   (when (= (:store connection) (get-in policy [:root-id :resource]))
-   (migration-enrollment-fail! :migration-policy-root-held))) cells)
+   (migration-enrollment-fail! :migration-policy-root-held))) cells)))
 
 
 (defn- migration-policy-with-connect-turn [connection permit sender action]
@@ -3775,6 +3792,7 @@
 ;; Coupled to authenticated SDK-private target admission and the fixed Host
 ;; command ABI. This is not a Source callback/native-domain promotion API.
 (def ^:private NATIVE-MUTATION-ROOTS :datom.conn/native-mutation-roots)
+(def ^:private NATIVE-MUTATION-RETIRED :datom.conn/native-mutation-retired)
 (def ^:private NATIVE-MUTATION-EFFECTS :datom.conn/native-mutation-effects)
 (def ^:private NATIVE-MUTATION-CONSUMED :datom.conn/native-mutation-consumed)
 (def ^:private NATIVE-CANONICAL-KINDS
@@ -3786,6 +3804,10 @@
  ;; A claimed path is never the resource identity. Match the real Fjall handle
  ;; against original private registry resources BEFORE considering containment.
  (let [handle (when (erlang/is_map store) (maps/get :handle store nil))
+       encoded (when handle (erlang/term_to_binary handle))
+       _ (when (and encoded (some #(contains? (:resources (second %)) encoded)
+                                  (get cells NATIVE-MUTATION-RETIRED {})))
+           (migration-enrollment-fail! :native-command-retired-resource))
        actual (filterv (fn [[resource cell]]
                         (and handle (migration-policy/registry-cell? [resource cell])
                              (erlang/is_map resource) (= handle (maps/get :handle resource nil)))) cells)
@@ -3823,7 +3845,9 @@
                         [:dispatch_native_command! 2] [:assert_native_command_bootstrap_context! 1]
                         [:with_native_command_callback! 1] [:assert_native_command_turn! 1]
                         [:refresh_native_command_cells! 1] [:assert_critical_cell_mutation! 2] [:native_command_unknown! 1]
-                        [:native_command_retirement_blocker! 1]]]
+                        [:native_command_retirement_blocker! 1]
+                        [:assert_native_command_callback_inactive! 0]
+                        [:retire_native_command! 1] [:assert_native_command_retirement_context! 1]]]
   (when-not (erlang/function_exported :Elixir.BeamLisp.Env name arity)
    (migration-enrollment-fail! :native-canonical-mutation-contract-required)))
  (let [actual (creation-evidence! connection)
@@ -3944,7 +3968,8 @@
  ;; issues no witness: actual fixed encoded effects are rechecked later.
  (let [root (Agent/get (registry) #(native-mutation-root! % store) 30000)]
   (if-not root :legacy
-   (let [cell (Agent/get (registry) #(get % store) 30000)]
+   (let [_ (BeamLisp.Env/assert_native_command_callback_inactive!)
+         cell (Agent/get (registry) #(get % store) 30000)]
     (if-not (seq (:native-canonical-turns cell))
      (do (BeamLisp.Env/assert_native_framework_execution!)
          (Agent/get (registry)
@@ -3994,7 +4019,8 @@
  [store op arguments]
  (let [root (Agent/get (registry) #(native-mutation-root! % store) 30000)]
   (if-not root :legacy
-   (let [cell (Agent/get (registry) #(get % store) 30000)]
+   (let [_ (BeamLisp.Env/assert_native_command_callback_inactive!)
+         cell (Agent/get (registry) #(get % store) 30000)]
     (if-not (seq (:native-canonical-turns cell))
      ;; Trusted native SDK/IO can operate under G without being app Source.
      ;; Actual Source cannot use this branch, even on the original owner's PID.
@@ -4293,6 +4319,10 @@
  (let [store (when (erlang/is_map connection) (maps/get :store connection nil))
        root (Agent/get (registry) #(native-mutation-root! % store) 30000)]
   (when root
+   ;; Check at the sending caller before writer handoff, including generic
+   ;; serialized! on another protected resource. Native0 callback state must
+   ;; not disappear merely by queuing work to another SDK writer PID.
+   (BeamLisp.Env/assert_native_command_callback_inactive!)
    (let [cell (Agent/get (registry) #(get % store) 30000)
          exact? (and (erlang/is_map connection)
                      (= Conn (maps/get :__struct__ connection nil))
@@ -4326,3 +4356,173 @@
        (when (and phase (not (contains? #{:ready :complete} (:state phase))))
         (migration-enrollment-fail! :native-command-resource-not-ready)))) 30000)
     (BeamLisp.Env/refresh_native_command_cells! (:credential root))))) connection)
+
+
+(defn- native-command-retirement-cells! [cells root]
+ ;; Pure metadata preflight; no forcing user callbacks or Store protocols.
+ ;; Every live managed resource is closed only after ALL graph native retirements
+ ;; and accepted schema/publication phases have already positively completed.
+ (when-not (and (= :active (:state root)) (Process/alive? (:owner root))
+                (= :open @(:lifetime root)) (not (native-mutation-held? cells root)))
+  (migration-enrollment-fail! :native-command-known-root-close-required))
+ (datom.store-opening/check-publication! cells (:application-id root) (:root root))
+ (doseq [[_ policy] (get cells (migration-policy/table-key) {})]
+  (when (= (:resource root) (get-in policy [:root-id :resource]))
+   (when-not (and (= :active (:state policy)) (empty? (:permits policy)))
+    (migration-enrollment-fail! :native-command-policy-close-unconfirmed))))
+ (let [members (filterv (fn [[resource cell]]
+                         (and (migration-policy/registry-cell? [resource cell])
+                              (or (= resource (:resource root))
+                                  (contains? (:native-resource-identities root {}) (:handle resource))))) cells)]
+  (when-not (some #(= (:resource root) (first %)) members)
+   (migration-enrollment-fail! :native-command-original-root-connection-required))
+  (doseq [[resource cell] members]
+   (let [blob (:blobs cell) tag (when (erlang/is_map blob) (:__struct__ blob))]
+    ;; The supported fixed cleanup is the ordinary durable SDK blob tier.
+    ;; Never dispatch a caller/custom Blob Closeable after a privileged sync.
+    (when-not (and (erlang/is_atom tag) (BeamLisp.AOT/sdk_generated_class? tag)
+                   (= (BeamLisp.Record/info tag)
+                      (tuple :record "datom.blob-fs" "BlobFs" (list :dir :ephemeral?)))
+                   (= false (:ephemeral? blob)) (= (str (:path resource) ".blobs") (:dir blob)))
+     (migration-enrollment-fail! :native-command-retirement-fixed-blob-tier-required)))
+   (when-not (and (= :open @(:lifetime cell)) (Process/alive? (:writer cell))
+                  (empty? (:lifetime-borrowers cell)) (empty? (:observers cell))
+                  (empty? (:native-canonical-turns cell))
+                  (nil? (:guard-reservation cell)) (nil? (:native-schema-journal-window cell))
+                  (nil? @(:schema-publication cell))
+                  (not (contains? #{:initializing :running :uncertain} (get-in cell [:migration-phase :state]))))
+    (migration-enrollment-fail! :native-command-resource-close-unconfirmed))) members))
+(defn- native-command-member-connection [resource cell]
+ (assoc (->Conn resource (:schema cell) (:basis cell) (:writer cell) (:subs cell) (:blobs cell) (:lifetime cell))
+        :snapshot (:snapshot cell) :schema-publication (:schema-publication cell)))
+(defn- native-command-retirement-check! [connection retirement]
+ (let [observed (BeamLisp.Env/assert_native_command_retirement_context! (:context retirement))]
+  (when-not (and (= :release (:phase observed)) (= (:credential retirement) (:credential observed))
+                 (= (erlang/self) (:caller observed) (:owner retirement))
+                 (= 0 (:source-depth observed)) (nil? (:generation observed)))
+   (migration-enrollment-fail! :native-command-retirement-context-required))
+  (Agent/get (registry)
+   (fn [cells]
+    (let [root (get-in cells [NATIVE-MUTATION-ROOTS (:root-resource retirement)])
+          cell (get cells (:store connection))]
+     (when-not (and root (= :retiring (:state root))
+                    (= (:context retirement) (:retirement-context root))
+                    (= (:credential retirement) (:credential root))
+                    (lifetime-borrow-identity? connection cell)
+                    (some #(= connection %) (:retirement-connections root)))
+      (migration-enrollment-fail! :native-command-retirement-connection-required)))) 30000)) :confirmed)
+(defn- native-command-retirement! [context stage]
+ (let [observed (BeamLisp.Env/assert_native_command_retirement_context! context)
+       credential (:credential observed) owner (erlang/self)]
+  (when-not (and (= owner (:caller observed)) (= 0 (:source-depth observed))
+                 (nil? (:generation observed)) (= stage (:phase observed)) (contains? #{:preflight :release} stage))
+   (migration-enrollment-fail! :native-command-retirement-context-required))
+  (case stage
+   :preflight
+   (let [root (Agent/get (registry)
+               (fn [cells]
+                (let [rows (filterv #(= credential (:credential (second %))) (get cells NATIVE-MUTATION-ROOTS {}))]
+                 (when-not (= 1 (count rows)) (migration-enrollment-fail! :native-command-retirement-root-required))
+                 (second (first rows)))) 30000)
+         connection (registered-at (:path root))
+         proof ((BeamLisp.Env/with_env :global
+                  #(BeamLisp.AOT/sdk_named_constructor! "proc.queue-family-root" "native-command-retired-root!" 1)) connection)]
+    (agent-get-and-update (registry)
+     (fn [cells]
+      (let [current (get-in cells [NATIVE-MUTATION-ROOTS (:resource root)])
+            members (native-command-retirement-cells! cells current)
+            connections (mapv (fn [[resource cell]] (native-command-member-connection resource cell)) members)
+            resources (vec (vals (:native-resource-identities current)))
+            root-connection (first (filter #(= (:resource root) (:store %)) connections))]
+       (when-not (and (= root current) (= owner (:owner current))
+                      (= (:resource-key proof) (erlang/term_to_binary (get-in root [:resource :handle])))
+                      (= (:application-id proof) (:application-id root)) (= (:root proof) (:root root))
+                      (= (:lifetime root) (:lifetime root-connection))
+                      (every? #(contains? (:native-resource-identities current) (:handle (first %))) members)
+                      (<= 1 (count resources) 4096))
+        (migration-enrollment-fail! :native-command-retirement-inventory-required))
+       (tuple {:root (native-mutation-root-id root) :resources resources}
+        (assoc-in cells [NATIVE-MUTATION-ROOTS (:resource root)]
+         (assoc current :state :retiring :retirement-context context :retirement-proof proof
+                        :retirement-connections (vec (concat (remove #(= (:resource root) (:store %)) connections)
+                                                           [root-connection])))))) 30000)))
+   :release
+   (let [root (Agent/get (registry)
+               (fn [cells]
+                (let [rows (filterv #(and (= credential (:credential (second %)))
+                                          (= context (:retirement-context (second %)))) (get cells NATIVE-MUTATION-ROOTS {}))]
+                 (when-not (= 1 (count rows)) (migration-enrollment-fail! :native-command-retirement-root-required))
+                 (second (first rows)))) 30000)
+         retirement {:credential credential :context context :owner owner :root-resource (:resource root)}]
+    (when-not (and (= :retiring (:state root)) (= owner (:owner root)))
+     (migration-enrollment-fail! :native-command-retirement-root-required))
+    (doseq [connection (:retirement-connections root)]
+     (release-connection! connection retirement)
+     ;; Fjall was already synced. Preflight proved the exact durable SDK
+     ;; BlobFs whose close is a no-op; no arbitrary protocol/callback runs.
+     nil)
+    (agent-get-and-update (registry)
+     (fn [cells]
+      (let [current (get-in cells [NATIVE-MUTATION-ROOTS (:resource root)])
+            root-key (erlang/term_to_binary (get-in root [:resource :handle]))
+            resources (set (map erlang/term_to_binary (keys (:native-resource-identities root))))
+            notes (get cells NATIVE-MUTATION-RETIRED {})]
+       (when-not (and (= root current) (= :closed @(:lifetime root))
+                      (every? #(and (= :closed @(:lifetime %)) (nil? (get cells (:store %)))) (:retirement-connections root))
+                      (not (native-mutation-held? cells root)) (not (contains? notes root-key)) (< (count notes) 128))
+        (migration-enrollment-fail! :native-command-retirement-close-unconfirmed))
+       (let [policies (into {} (remove #(= (:resource root) (get-in (second %) [:root-id :resource]))
+                                      (get cells (migration-policy/table-key) {})))
+             next (-> cells
+                      (update NATIVE-MUTATION-ROOTS dissoc (:resource root))
+                      (assoc (migration-policy/table-key) policies)
+                      (assoc-in [NATIVE-MUTATION-RETIRED root-key]
+                       {:state :retired :owner owner :credential credential
+                        :lifetime-id (BeamLisp.LazyMemo/id (:cell (:lifetime root)))
+                        :application-id (:application-id root) :root (:root root)
+                        :resources resources}))]
+        (erlang/apply :persistent_term :put
+         (list :datom-migration-policy-roots (into {} (map (fn [[app policy]] [app (:root policy)]) policies))))
+        (tuple {:state :closed :root (native-mutation-root-id root)} next)))) 30000)))))
+(defn- native-command-close-sync! [connection]
+ (native-canonical-connection! connection)
+ (let [root (Agent/get (registry) #(native-mutation-root! % (:store connection)) 30000)]
+  (when root
+   (with-canonical-writer connection :transact #(datom.store/sync! (:store connection))) true)))
+(defn- native-command-close-root! [connection]
+ (let [store (when (erlang/is_map connection) (:store connection))
+       encoded (when (:handle store) (erlang/term_to_binary (:handle store)))
+       retired (when encoded (Agent/get (registry) #(get-in % [NATIVE-MUTATION-RETIRED encoded]) 30000))]
+  (if retired
+   (do
+    (BeamLisp.Env/assert_native_framework_execution!)
+    (when-not (and (= (erlang/self) (:owner retired))
+                   (= (:lifetime-id retired) (BeamLisp.LazyMemo/id (:cell (:lifetime connection))))
+                   (= :retired (:state (BeamLisp.Env/native_command_evidence! (:credential retired)))))
+     (migration-enrollment-fail! :native-command-retirement-outcome-unconfirmed)) :retired)
+   (let [root (Agent/get (registry) #(native-mutation-root! % store) 30000)]
+    (when (and root (= store (:resource root)))
+     (BeamLisp.Env/assert_native_framework_execution!)
+     (native-canonical-connection! connection)
+     ((BeamLisp.Env/with_env :global
+       #(BeamLisp.AOT/sdk_named_constructor! "proc.queue-family-root" "native-command-retired-root!" 1)) connection)
+     (when-not (= (erlang/self) (:owner root))
+      (migration-enrollment-fail! :native-command-original-root-owner-required))
+     ;; Known readiness refuses BEFORE Host accepts a retirement attempt.
+     (Agent/get (registry) #(native-command-retirement-cells! % root) 30000)
+     (BeamLisp.Env/retire_native_command! (:credential root)))))))
+(defn close-owned-native-roots!
+ "Fixed native lifecycle cleanup, after actual graph retirement. Protected
+  resource list is derived privately; caller handles select no extra authority."
+ [connections]
+ (let [roots (Agent/get (registry) #(vals (get % NATIVE-MUTATION-ROOTS {})) 30000)]
+  (when (seq roots)
+   (BeamLisp.Env/assert_native_framework_execution!)
+   (doseq [connection connections]
+    (when (some #(= (:store connection) (:resource %)) roots)
+     (native-command-close-root! connection)))) :ok))
+
+(defn- native-command-protected-root? [resource]
+ (let [pid (erlang/whereis REGISTRY)]
+  (and (not= :undefined pid)
+       (Agent/get pid #(boolean (get-in % [NATIVE-MUTATION-ROOTS resource])) 30000))))
