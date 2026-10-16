@@ -1,0 +1,119 @@
+(ns reload.source-same-scope-context-test (:require [reload.generation :as g] [env]))
+(defn- reason [action]
+ (try (action) nil (catch error
+  (if (and (erlang/is_map error) (maps/is_key :original error))
+   (maps/get :original error) (or (:kind (ex-data error)) error)))))
+(defn retain-callback [callback]
+ {:callback callback :handle (BeamLisp.Env/retain_code! (BeamLisp.Env/callback_modules callback))})
+(defn- prepared []
+ (g/prepare! {:sources {"context.app"
+  "(ns context.app (:require [env] [reload.source-context-fixture :as sdk]))
+   (defn capture [] (env/capture))
+   (defn bind-here [token] (env/bind token) [(env/current) (env/caps)])
+   (defn inside [scope] (env/with-env scope (fn [] [(env/current) (env/caps)])))
+   (defn retain-borrowed [register target] (register (partial env/with-env target sdk/report)))
+   (defn roundtrip [] (let [old (env/capture)] (env/with-env (env/current) (fn [] (env/bind old) :bound))))
+   (defn thrown [] (env/with-env (env/current) (fn [] (throw (ex-info \"context test\" {:kind :context-test-fault})))))"}
+  :stable-namespaces #{"env" "reload.source-context-fixture"}
+  :application-id (str "context-test-" (erlang/unique_integer (list :positive)))
+  :native-modules #{(String/replace_prefix
+                    (Atom/to_string (elem (erlang/fun_info retain-callback :module) 1)) "Elixir." "")}}))
+
+(deftest source-context-is-small-nonauthorizing-and-restores-same-scope
+ (let [generation (prepared) token (g/invoke! generation "context.app/capture" [])]
+  (try
+   (is (= 1 (:source-context-version token)))
+   (is (= 7 (count token)))
+   (is (= (:scope generation) (:env token)))
+   (is (= false (contains? token :generation)))
+   (is (= false (contains? token :admission)))
+   (is (= false (contains? token :lease)))
+   (is (= [(:scope generation) (:caps token)] (g/invoke! generation "context.app/bind-here" [token])))
+   (is (= [(:scope generation) (:caps token)] (g/invoke! generation "context.app/inside" [(:scope generation)])))
+   (is (= :bound (g/invoke! generation "context.app/roundtrip" [])))
+   (is (= :context-test-fault (reason #(g/invoke! generation "context.app/thrown" []))))
+   (is (= :global (env/current)))
+   (is (= false (BeamLisp.Env/source_execution_active?)))
+   (finally (g/retire! generation)))))
+
+(deftest wrong-scope-and-forged-chain-refuse-before-context-changes
+ (let [generation (prepared) other (prepared) token (g/invoke! generation "context.app/capture" [])]
+  (try
+   (is (= :source_context_scope_refused
+         (reason #(g/invoke! generation "context.app/bind-here" [(assoc token :env :global)]))))
+   (is (= :source_context_scope_refused
+         (reason #(g/invoke! other "context.app/bind-here" [token]))))
+   (is (= :source_context_chain_refused
+         (reason #(g/invoke! generation "context.app/bind-here" [(assoc token :chain (list :global))]))))
+   (is (= :source_context_scope_refused
+         (reason #(g/invoke! generation "context.app/inside" [:global]))))
+   (is (= :source_context_scope_refused
+         (reason #(g/invoke! generation "context.app/inside" [(:scope other)]))))
+   (is (= [(:scope generation) (:caps token)] (g/invoke! generation "context.app/bind-here" [token])))
+   (is (= :global (env/current)))
+   (is (= false (BeamLisp.Env/source_execution_active?)))
+   (finally (g/retire! generation) (g/retire! other)))))
+
+(deftest forged-capabilities-do-not-expand-registry-authority
+ (let [parent (env/fork :global {:caps ["Elixir.String"]})
+       generation (env/with-env parent prepared)
+       token (g/invoke! generation "context.app/capture" [])]
+  (try
+   (is (not= :all (:caps token)))
+   (is (= :source_context_capability_refused
+         (reason #(g/invoke! generation "context.app/bind-here" [(assoc token :caps :all)]))))
+   (is (= [(:scope generation) (:caps token)] (g/invoke! generation "context.app/bind-here" [token])))
+   (is (= :source_context_capability_refused
+         (reason #(g/invoke! generation "context.app/bind-here" [(assoc token :max_heap 1000000000)]))))
+   (finally (g/retire! generation) (env/destroy parent)))))
+
+(deftest context-data-cannot-create-a-worker-domain-but-owned-source-entry-can-bind
+ (let [generation (prepared) token (g/invoke! generation "context.app/capture" [])
+       parent (erlang/self)
+       child (erlang/spawn
+        (fn []
+         (let [unowned (reason #(env/bind token))
+               owned (g/invoke! generation "context.app/bind-here" [token])]
+          (erlang/send parent (tuple :context-worker (erlang/self) unowned owned
+                                   (BeamLisp.Env/source_execution_active?) (env/current))))))]
+  (try
+   (let [result (receive [:context-worker pid unowned owned active current] :when (= pid child)
+                 [unowned owned active current] (after 5000 :timeout))]
+    (is (not= :timeout result))
+    (is (= :unadmitted_source_context (nth result 0)))
+    (is (= [(:scope generation) (:caps token)] (nth result 1)))
+    (is (= false (nth result 2)))
+    (is (= :global (nth result 3))))
+   (is (= :unadmitted_source_context (reason #(BeamLisp.Env/bind token))))
+   (finally (when (erlang/is_process_alive child) (erlang/exit child :kill)) (g/retire! generation)))))
+
+(deftest native-context-capture-bind-and-scope-switch-keep-original-abi
+ (let [token (env/capture) child (env/fork)]
+  (try
+   (is (= false (contains? token :source-context-version)))
+   (is (= :ok (env/bind token)))
+   (is (= child (env/with-env child env/current)))
+   (is (= :global (env/current)))
+   (finally (env/destroy child)))))
+
+(deftest borrowed-sdk-source-callback-can-use-original-scope-without-minting-a-g
+ (let [generation (prepared)
+       accepted (g/invoke! generation "context.app/retain-borrowed" [retain-callback (:scope generation)])
+       wider (g/invoke! generation "context.app/retain-borrowed" [retain-callback :global])]
+  (try
+   (is (BeamLisp.Env/code_lease_active? (:handle accepted)))
+   ;; Actual retained Source registration, actual run_code acceptance; the SDK
+   ;; partial gets no selected G/private execution snapshot from the context.
+   (is (= [true nil (:scope generation)]
+         (BeamLisp.Env/run_code! (:handle accepted) (:callback accepted))))
+   (is (= :source_context_scope_refused
+         (reason #(BeamLisp.Env/run_code! (:handle wider) (:callback wider)))))
+   (is (= :global (env/current)))
+   (is (= nil (BeamLisp.Env/execution_origin)))
+   (is (= false (BeamLisp.Env/source_execution_active?)))
+   (is (= [true nil (:scope generation)]
+         (BeamLisp.Env/run_code! (:handle accepted) (:callback accepted))))
+   (finally
+    (BeamLisp.Env/release_code! (:handle accepted))
+    (BeamLisp.Env/release_code! (:handle wider))
+    (g/retire! generation)))))
