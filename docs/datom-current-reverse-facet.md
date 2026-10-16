@@ -92,3 +92,16 @@ All source is unqualified until these native gates pass:
   admission/repair with zero released-history index traversal after certification.
 - Unknown states still count, unknown effects still block release, original body
   execution remains once, and incomplete coverage never returns fabricated emptiness.
+
+
+## Transaction parity
+
+The native source writer reduces operations to their net effect before committing
+history. Retract then reassert of an existing many-valued fact in one transaction
+creates no contradictory historical pair: the unchanged fact stays current.
+The reverse writer consumes those realized datoms through the same current-value
+reduction. Adoption follows `datom.current/from-history`: for legacy contradictory
+assertion/retraction datoms at the same transaction, retraction wins. Native tests
+compare actual many-valued query results before and after coverage withdrawal and
+bounded rebuild. Index withdrawal/re-enablement with intervening writes requires
+fresh adoption; retained rows cannot certify a missed source interval.
