@@ -1,0 +1,71 @@
+; Native cancellation boundary regression. Qualification runs inside Veritas.
+; Provider receipts here are explicit native unit fixtures, not HTTP proofs.
+(ns proc.queue-cancel-effects-test
+ (:require [proc.queue :as q] [proc.queue-runtime :as owner]
+  [datom :as d] [datom.conn :as dc] [datom.store :as ds] [datom.store-fjall :as fjall]))
+(defn fixture []
+ (let [path (ds/fresh-path ".cancel-effects.fjall")
+       c (dc/connect-with (fjall/open path) [])
+       srv (q/scoped-server "cancel-effects-test" (keyword (str "probe-" (String/downcase (Base/encode16 (crypto/strong_rand_bytes 8))))))
+       _ (q/attach-store! srv c)
+       handler (owner/prepare srv
+        {:declaration {:of :test/cancel :protocol 1 :generation "cancel-effects-v1" :concurrency 4
+                       :unique [:test/id] :partition [:test/id]
+                       :retry {:max 1 :backoff :exponential :base 1 :max-delay 1 :jitter 0}}
+         :perform (fn [job]
+          (assert (= :submit (:status (q/begin-effect! (:job/server job) job :provider))))
+          (case (:test/mode job)
+           :intent nil
+           :submitted (q/record-effect! (:job/server job) job :provider :submitted {:fixture :submitted})
+           :uncertain (q/record-effect! (:job/server job) job :provider :uncertain {:fixture :unknown})
+           :absent (q/reconcile-effect! (:job/server job) job :provider :absent {:fixture :confirmed-absence})
+           :complete (do (q/record-effect! (:job/server job) job :provider :complete {:fixture :completed})
+                         (throw "Synthetic failure after completed checkpoint")))
+          {:fixture :settle})})
+       pid (owner/start! handler)]
+  {:conn c :server srv :pid pid}))
+(defn enqueue [f id mode]
+ (q/enqueue! (:server f) {:test/id id :test/mode mode}
+  {:generation "cancel-effects-v1" :enrollment-key [:probe id]}))
+(defn row [f job] (d/entity (d/db (:conn f)) (:db/id job)))
+(defn refusal [f job]
+ (try (q/cancel! (:server f) (:db/id job)) nil (catch e (:kind (ex-data e)))))
+(defn await-settlement [f jobs]
+ (let [deadline (+ (erlang/monotonic_time :millisecond) 10000)]
+  (loop []
+   (cond (every? (fn [[mode job]] (= (if (= mode :complete) :failed :held) (:job/state (row f job)))) jobs) true
+         (>= (erlang/monotonic_time :millisecond) deadline) (throw "Native cancellation fixtures did not settle")
+         :else (do (Process/sleep 1) (recur))))))
+
+(deftest cancellation-refuses-held-and-queued-unresolved-provider-effects
+ (let [f (fixture)]
+  (try
+   (let [jobs (into {} (map (fn [mode] [mode (enqueue f mode mode)]) [:intent :submitted :uncertain :absent :complete]))]
+    (await-settlement f jobs)
+    (is (every? (fn [[mode job]] (= mode (get-in (row f job) [:job/effects :provider :state]))) jobs))
+    (is (= :stopped (:status (owner/stop! (:server f) {:workers :stop}))))
+    (doseq [mode [:intent :submitted :uncertain :absent]]
+     (let [job (get jobs mode) before (row f job)]
+      (is (= :not-queued (refusal f job)))
+      (is (= before (row f job)))))
+    (doseq [[_ job] jobs] (q/retry! (:server f) (:db/id job)))
+    (doseq [mode [:intent :submitted :uncertain]]
+     (let [job (get jobs mode) before (row f job)]
+      (is (= :queued (:job/state before)))
+      (is (= :provider-effect-pending (refusal f job)))
+      (is (= before (row f job)))))
+    (doseq [mode [:absent :complete]]
+     (let [job (get jobs mode) before (row f job) cancelled (q/cancel! (:server f) (:db/id job))]
+      (is (= :cancelled (:job/state cancelled)))
+      (is (= (:job/effects before) (:job/effects cancelled)))
+      (is (= (:job/enrollment before) (:job/enrollment cancelled)))
+      (is (nil? (:job/ticket cancelled)))))
+    (let [job (enqueue f :unsubmitted nil) cancelled (q/cancel! (:server f) (:db/id job))]
+     (is (= :cancelled (:job/state cancelled))) (is (empty? (:job/effects cancelled))))
+    (let [job (enqueue f :running nil) claimed (q/claim! (:conn f) job (erlang/system_time :millisecond) 60000)]
+     (is claimed)
+     (is (try (q/cancel! (:server f) (:db/id job)) false (catch _ true)))
+     (is (= claimed (row f job)))))
+   (finally
+    (owner/stop! (:server f) {:workers :stop})
+    (dc/close! (:conn f))))))
