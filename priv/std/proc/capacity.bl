@@ -101,12 +101,12 @@
 (defn- reservations [authority]
  (mapv (fn [[e]] (d/entity (d/db (:conn authority)) e))
   (d/q '[:find ?e :where [?e :capacity.reservation/key _]] (d/db (:conn authority)))))
-(defn reserve!
+(defn- reserve-row!
  "One writer-atomic aggregate obligation reservation. Captured property/provider
   identity is application-authorized data; this native API infers no quotas.
   Duplicate immutable identity succeeds even at capacity. Unknown/reserved/
   enrolled rows keep consuming budget; only explicit safe release ends it."
- [authority srv payload opts capture]
+ [authority srv payload opts capture grandfather?]
  (live! authority)
  (let [descriptor (descriptor! authority srv payload opts capture)
        key (reservation-key authority descriptor) c (:conn authority)]
@@ -122,10 +122,59 @@
                      (let [value (scope-value capture (:keys scope))]
                       (>= (count (filter #(= value (scope-value (get-in % [:capacity.reservation/descriptor :capture]) (:keys scope))) rows))
                           (:max scope)))) (:scopes policy)))]
-     (if full? {:status :deferred :reason :shared-capacity}
+     (if (and full? (not grandfather?)) {:status :deferred :reason :shared-capacity}
       (do (d/transact! c [{:db/id -1 :capacity.reservation/key key
                           :capacity.reservation/descriptor descriptor :capacity.reservation/state :reserved}])
           {:status :reserved :reservation key :durability (sync! c)}))))))))
+(defn reserve! [authority srv payload opts capture]
+ (reserve-row! authority srv payload opts capture false))
+(defn authorize!
+ "Before actual application body/effect, verify its captured immutable native
+  reservation. Repair enrollment-before-bind here; this is a counted original
+  obligation, never permission to create a new provider effect or repeat one."
+ [authority job]
+ (live! authority)
+ (let [canonical (d/entity (d/db (q/conn (keyword (:job/server job)))) (:db/id job))
+       _ (when-not (and (= (:job/id job) (:job/id canonical)) (= (:job/server job) (:job/server canonical)))
+           (refuse :capacity-worker-authority))
+       job canonical c (:conn authority) proof (:job/capacity job)]
+  (dc/serialized! c (fn []
+   (live! authority)
+   (let [row (when proof (d/entity (d/db c) [:capacity.reservation/key (:reservation proof)]))
+         descriptor (:capacity.reservation/descriptor row)]
+    (when-not (and row (= (:id authority) (:authority proof))
+                  (contains? #{:reserved :enrolled} (:capacity.reservation/state row))
+                  (= (digest descriptor) (:descriptor-hash proof))
+                  (= (:queue descriptor) (:job/server job))
+                  (= [(:queue descriptor) (:enrollment descriptor)] (:job/enrollment job))
+                  (= (:payload-hash descriptor) (digest (:job/payload job)))
+                  (= (:protocol descriptor) (:job/protocol job))
+                  (= (:generation descriptor) (:job/generation job))
+                  (or (nil? (:capacity.reservation/job-id row))
+                      (= (:job/id job) (:capacity.reservation/job-id row))))
+     (refuse :capacity-worker-authority))
+    (d/transact! c [[:db/add (:db/id row) :capacity.reservation/state :enrolled]
+                   [:db/add (:db/id row) :capacity.reservation/job-id (:job/id job)]])
+    {:status :authorized :durability (sync! c)})))))
+(defn adopt-existing!
+ "Explicit accepted-obligation migration BEFORE native owner startup. Existing
+  outstanding jobs count even above a newly lowered allocation; no accepted
+  unknown is evicted to fit policy. Exact job snapshot is rechecked in its
+  journal writer before attaching proof. A cut between stores remains reserved
+  and is repaired by this SAME immutable enrollment. No provider IO occurs."
+ [authority srv job capture]
+ (when (q/serving? srv) (refuse :capacity-migration-owner-live))
+ (when-not (and (= (q/server-name srv) (:job/server job)) (:job/enrollment job)
+               (contains? #{:queued :running :held} (:job/state job)))
+  (refuse :invalid-capacity-migration-job))
+ (let [opts {:enrollment-key (second (:job/enrollment job)) :protocol (:job/protocol job 1)
+             :generation (:job/generation job)}
+       result (reserve-row! authority srv (:job/payload job) opts capture true)
+       proof {:authority (:id authority) :reservation (:reservation result)
+              :descriptor-hash (digest (descriptor! authority srv (:job/payload job) opts capture))}]
+  (when (= :released (:status result)) (refuse :capacity-reservation-released))
+  (q/bind-capacity! srv job proof)))
+
 (defn enroll!
  "Reservation BEFORE original native queue enrollment; journal bind AFTER.
   No cross-store atomicity is claimed. A crash/lost acknowledgement retains
