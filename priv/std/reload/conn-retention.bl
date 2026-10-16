@@ -1,0 +1,123 @@
+; Private original lifetime requests survive
+; uncertain RPC replies. Only actual native whole-graph retirement can return
+; retained Conn custody. No TTL/DOWN/actor death/active? flag proves release.
+(ns reload.conn-retention
+ (:require [reload.generation :as generation] [reload.execution :as execution]
+           [proc.queue-family-root :as root] [datom.conn :as conn]))
+(def ^:private records (atom {}))
+(defn- refuse [kind] (throw (ex-info "Typed connection retention refused" {:kind kind})))
+(defn- locked [action] (BeamLisp.Env/with_generation_lock :typed-connection-retention action))
+(defn- graph-key [g] [(:cache-key g) (:scope g)])
+(defn- identity [g] (select-keys g [:cache-key :scope :digest :application-id]))
+(defn- framework! []
+ ;; Denial only. Native ingress rejects Source
+ ;; frames, including Source-derived retained SDK callbacks. No privilege grant.
+ (BeamLisp.Env/assert_native_framework_execution!))
+(defn- authorized! [g c]
+ (framework!)
+ (BeamLisp.Env/assert_execution_context!)
+ (when-not (and (execution/owned?) (erlang/== g (execution/current)))
+  (refuse :typed-resource-owned-execution-required))
+ (generation/attested-prepared! g)
+ (let [evidence (conn/creation-evidence! c) actual (:connection evidence)
+       creator (:creator evidence)
+       _ (when (and (:application-id creator) (not= (:application-id g) (:application-id creator)))
+           (refuse :typed-connection-authority-required))
+       declared (when (nil? (:application-id creator))
+                  (try (:declared (root/evidence! g))
+                   (catch error
+                    (if (= :queue-root-stale-custody (:kind (ex-data error))) nil (throw error)))))
+       allowed (or (and (:application-id creator) (= (:application-id g) (:application-id creator)))
+                   (some (fn [[_ value]] (erlang/== value actual)) declared))]
+  (when-not (and (erlang/== c actual) allowed
+                 (BeamLisp.AOT/sdk_generated_class? (maps/get :__struct__ actual nil)))
+   (refuse :typed-connection-authority-required)) evidence))
+(defn retain!
+ "Fixed native SDK consumer only. Retain an exact same-app-created or actually
+  Root-declared original Conn. A typed path/Source object cannot confer custody.
+  Publish the original read-only request privately BEFORE submitting once. A
+  failed/unknown submission remains held until actual retirement reconciles it."
+ [g c]
+ (let [evidence (authorized! g c) resource [(:resource evidence) (:lifetime evidence)]
+       key (graph-key g) request (conn/prepare-lifetime-request! c)
+       action (locked
+        (fn []
+         (let [graph (get @records key) prior (get-in graph [:resources resource])]
+          (when (and graph (not= (identity g) (:identity graph))) (refuse :typed-resource-identity-conflict))
+          (cond
+           (= :retained (:outcome prior)) :already-retained
+           prior (refuse :typed-resource-outcome-uncertain)
+           (>= (count (:resources graph {})) 128) (refuse :typed-resource-capacity)
+           (and (nil? graph) (>= (count @records) 4096)) (refuse :typed-resource-capacity)
+           :else
+            (do (swap! records assoc key
+                  (assoc (or graph {:identity (identity g) :resources {}})
+                    :resources (assoc (:resources graph {}) resource
+                      {:request request :connection c :outcome :submitted}))) :submit)))))]
+  (if (= :already-retained action) action
+   (try
+    ;; Original issuer PID+Env commits. No RPC/user callback under metadata lock.
+    (let [receipt (conn/commit-lifetime-request! request)]
+     (locked
+      (fn []
+       (let [path [key :resources resource] prior (get-in @records path)]
+        (when-not (= request (:request prior)) (refuse :typed-resource-identity-conflict))
+        (swap! records assoc-in path (assoc prior :receipt receipt :outcome :retained)))))
+     :retained)
+    (catch _
+     (locked
+      (fn []
+       (when (= request (get-in @records [key :resources resource :request]))
+        (swap! records assoc-in [key :resources resource :outcome] :uncertain))))
+     (refuse :typed-resource-outcome-uncertain))))))
+(defn- return-original! [row]
+ ;; Serialized fence closes unaccepted requests and recovers accepted receipts.
+ ;; A late original commit cannot create custody after :closed acknowledgment.
+ (let [fenced (conn/fence-lifetime-request! (:request row))]
+  (case (:status fenced)
+   :closed :returned
+   :held
+    (let [receipt (:receipt fenced)]
+     (when (and (:receipt row) (not= receipt (:receipt row))) (refuse :typed-resource-identity-conflict))
+     (case (conn/lifetime-borrow-state receipt)
+      :absent :returned
+      :held
+       (try
+        (when-not (= :released (conn/release-lifetime! receipt)) (refuse :typed-resource-outcome-uncertain))
+        :returned
+        (catch _
+         ;; Lost return reply: only this privately recovered original issued cap
+         ;; can prove absence in the same native lifetime/custody registry.
+         (if (= :absent (conn/lifetime-borrow-state receipt)) :returned
+          (refuse :typed-resource-outcome-uncertain))))
+      (refuse :typed-resource-outcome-uncertain)))
+   (refuse :typed-resource-outcome-uncertain))))
+(defn release-retired!
+ "Exact SDK hook AFTER actual Env.retire_modules! success, BEFORE scope destroy.
+  An edited graph/retired flag/absence/owner-DOWN never authorizes this operation.
+  Unknown native registry responses preserve the complete private request row."
+ [g]
+ (framework!)
+ (generation/attested-prepared! g true)
+ (when-not (= :native-retired (:status (generation/native-retirement-outcome g)))
+  (refuse :typed-resource-generation-still-active))
+ (let [key (graph-key g) graph (locked #(get @records key))]
+  (when (and graph (not= (identity g) (:identity graph))) (refuse :typed-resource-identity-conflict))
+  (doseq [[resource row] (:resources graph)]
+   (try
+    (when (= :returned (return-original! row))
+     (locked
+      (fn []
+       (when (= row (get-in @records [key :resources resource]))
+        (swap! records update-in [key :resources] dissoc resource)))))
+    (catch _ nil)))
+  (locked
+   (fn []
+    (let [remaining (get @records key)]
+     (if (empty? (:resources remaining)) (do (swap! records dissoc key) :released) :waiting))))))
+(defn diagnostic-counts [g]
+ (framework!)
+ (generation/attested-prepared! g true)
+ (let [graph (locked #(get @records (graph-key g))) entries (vals (:resources graph))]
+  {:retained (count (filter #(= :retained (:outcome %)) entries))
+   :uncertain (count (filter #(contains? #{:submitted :uncertain} (:outcome %)) entries))}))

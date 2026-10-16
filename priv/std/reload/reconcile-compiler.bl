@@ -18,11 +18,32 @@
  []
  (BeamLisp.Loader/ensure_loaded "proc.reconcile")
  (BeamLisp.Loader/ensure_loaded "proc.reconcile-runtime")
- (let [dispatcher (exact-routes "proc.reconcile" "call-config-factory" 4 :config-factory)]
- {:sdk (merge (collections/sdk-targets) dispatcher)
+ (BeamLisp.Loader/ensure_loaded "reload.reconcile-values")
+ (BeamLisp.Loader/ensure_loaded "reload.state")
+ (let [extras (merge (exact-routes "core" "ex-info" 2 :exception)
+                     (exact-routes "core" "every?" 2 :every)
+                     {[:Elixir.BeamLisp.ExInfo :raise_payload 1] :raise
+                      [:erlang :== 2] :scalar [:erlang :/= 2] :scalar
+                      [:erlang :>= 2] :scalar [:erlang :=< 2] :scalar
+                      [:erlang :> 2] :scalar [:erlang :< 2] :scalar})
+       managed (merge (exact-routes "reload.state" "get" 1 :managed-state-get)
+                      (exact-routes "reload.state" "get" 2 :managed-state-get)
+                      (exact-routes "reload.state" "cell!" 2 :managed-cell)
+                      {[:Elixir.BeamLisp.Refs :deref 1] :managed-deref})
+       dispatcher (exact-routes "proc.reconcile" "call-config-factory" 4 :config-factory)]
+ {:sdk (merge (collections/sdk-targets) dispatcher extras managed)
   ;; Existing fixed native constructor APIs already validate generated classes,
   ;; context and actual native startup tickets. This pass adds no new producer.
-  :sdk-globals (if (seq dispatcher) {["proc.reconcile" "call-config-factory" 4] :config-factory} {})
+  :sdk-globals (merge
+                (if (seq dispatcher) {["proc.reconcile" "call-config-factory" 4] :config-factory} {})
+                (when (seq (exact-routes "core" "ex-info" 2 :exception)) {["core" "ex-info" 2] :exception})
+                (when (seq (exact-routes "core" "every?" 2 :every)) {["core" "every?" 2] :every})
+                (into {} (for [[namespace name arity operation]
+                               [["reload.state" "get" 1 :managed-state-get]
+                                ["reload.state" "get" 2 :managed-state-get]
+                                ["reload.state" "cell!" 2 :managed-cell]]
+                              :when (seq (exact-routes namespace name arity operation))]
+                           [[namespace name arity] operation])))
   :targets (into {}
     (concat
      (for [[fun mode] [[:start :start] [:start_link :start-link]] n [1 2 3]]
@@ -66,12 +87,55 @@
                                 true (catch _ false)))
                    {:present true :value (elem found 1)} {:present false})]
      (swap! cache assoc key result) result)))))
+(defn- snapshot-schema! [observed]
+ (when (or (> (count (:paths observed)) 128)
+           (some (:connections observed) (:data-paths observed)))
+  (refuse :typed-resource-recipe-required))
+ (reduce (fn [out [cell path :as key]]
+           (assoc-in out [cell path]
+             {:id (keyword (str "snapshot_" (sha256-hex (pr-str key))))
+              :kind (if (contains? (:connections observed) key) :connection :data)}))
+  {} (sort-by pr-str (:paths observed))))
+(defn- prove-pair! [factory instance context id]
+ ;; Pass1 discovers literal paths/type-only use constraints without running
+ ;; either original callback. Pass2 consumes one schema shared by both bodies.
+ ;; A fixed one-argument conn-fn directly returning one captured exact leaf is
+ ;; a connection TYPE constraint, never proof that its current value is owned.
+ (let [discovery (atom {:paths #{} :data-paths #{} :connections #{}})
+       sealed (assoc context :callback-mode :sealed-bindings :callback-prefix (sha256-hex id))
+       first-context (assoc sealed :snapshot-discovery discovery)
+       initial-config (residual factory first-context :config)
+       initial-instance (residual instance first-context :data)
+       cells (set (concat (:cell-keys initial-config) (:cell-keys initial-instance)))]
+  (if (empty? cells)
+   ;; Existing empty first-order declarations preserve their v1 callable ABI.
+   {:version 1 :factory factory :instance instance
+    :config-proof (residual factory context :config)
+    :instance-proof (residual instance context :data)}
+   (let [schema (snapshot-schema! @discovery)
+         actual-context (assoc sealed :snapshot-schema schema)
+         config-proof (residual factory actual-context :config)
+         instance-proof (residual instance actual-context :data)
+         callbacks (:callback-entries config-proof)]
+    (when (or (seq (:callback-entries instance-proof)) (> (count callbacks) 128)
+              (not (every? :connection-selector-proved?
+                     (filter #(= :conn-fn (:field %)) callbacks)))
+              (not= cells (set (concat (:cell-keys config-proof) (:cell-keys instance-proof)))))
+     (refuse :typed-resource-recipe-required))
+    {:version 2 :factory factory :instance instance :config-proof config-proof :instance-proof instance-proof
+     :cell-keys (vec (sort cells))
+     :snapshot-slots (vec (for [[cell paths] (sort-by first schema) [path slot] (sort-by (comp pr-str first) paths)]
+                           (assoc slot :cell-key cell :path path)))
+     :callback-entries callbacks}))))
 (defn finalize!
  "Emit BEFORE Link.settle/module inventory. Unknown recipes stay embedded;
   unsupported analysis never evaluates the original factory to find its shape.
   Exact generated native class identity is mandatory before compiler rewriting."
  [planned factories sdk-context]
- (let [canonical (atom {}) captures (declaration/canonical-captures)
+ ;; Required completed Host Source boundary, denial only. A Source caller cannot
+ ;; submit a nominated preparation/context as an ordinary compiler entry.
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [canonical (atom {}) produced-v2 (atom 0) captures (declaration/canonical-captures)
        context {:sdk (:sdk sdk-context) :sdk-globals (:sdk-globals sdk-context) :factories (:entries factories) :globals (:globals factories)
                 :read-global (sealed-global-reader planned)}
        rejected (atom [])]
@@ -84,15 +148,8 @@
              (refuse :canonical-class-provenance-mismatch))
          proved (try
                   (let [factory (one-clause! owner (:callback descriptor) 3)
-                        instance (one-clause! owner (:instance capture) 1)
-                        config-proof (residual factory context :config)
-                        instance-proof (residual instance context :data)]
-                   ;; Native/cell snapshots need typed exact slots. This first
-                   ;; integrated lane accepts EMPTY snapshots only; never read
-                   ;; managed cells or callbacks speculatively during prepare.
-                   (when (or (seq (:cell-keys config-proof)) (seq (:cell-keys instance-proof)))
-                    (refuse :typed-resource-recipe-required))
-                   {:factory factory :instance instance :config-proof config-proof :instance-proof instance-proof})
+                        instance (one-clause! owner (:instance capture) 1)]
+                   (prove-pair! factory instance context id))
                   (catch error
                    (when-not (contains? #{:unproved-reconcile-recipe :unsupported-canonical-function-clause
                                           :typed-resource-recipe-required} (:kind (ex-data error))) (throw error))
@@ -100,16 +157,32 @@
     (when proved
      (let [suffix (sha256-hex id) reifier (str "__reconcile_reifier__" suffix)
            instance (str "__reconcile_identity__" suffix)
-           receipt {:version 1 :declaration id :original-class class
+           receipt (cond-> {:version (:version proved) :declaration id :original-class class
                     :reifier (str (:logical descriptor) "/" reifier)
                     :instance (str (:logical descriptor) "/" instance)
-                    :snapshot-scope :empty-first-order :cell-keys []
+                    :snapshot-scope (if (= 2 (:version proved)) :selected-versioned :empty-first-order)
+                    :cell-keys (:cell-keys proved [])
                     :queue-declaration (:queue-declaration descriptor)
-                    :policy (:policy capture)}]
+                    :policy (:policy capture)}
+                    (= 2 (:version proved))
+                     (assoc :snapshot-slots (:snapshot-slots proved)
+                            :callback-constructors
+                             (into {} (map (fn [entry]
+                                      [(:id entry) {:arity (:arity entry)
+                                                    :reference (str (:logical descriptor) "/" (:id entry))
+                                                    :capture-kinds (:capture-kinds entry)}])
+                                       (:callback-entries proved)))))]
       (install! owner reifier (emitted-entry reifier (:factory proved) (:config-proof proved)))
       (install! owner instance (emitted-entry instance (:instance proved) (:instance-proof proved)))
+      (doseq [callback (:callback-entries proved)]
+       (BeamLisp.Link/defvar owner (:id callback) (to-list (:entries callback))
+        (list (tuple :file "<canonical-reconcile-closed-callback>") (tuple :line 1))))
       (declaration/record-canonical-recipe! id receipt)
-      (swap! canonical assoc [owner binding] {:version 1 :declaration id})))))
+      ;; Actual v2 producer is testable while Source consumers remain disabled.
+      ;; No Source-supplied flag can opt in. Native ingress/command/Conn custody
+      ;; plus actual217 route observations require separate coupled acceptance.
+      (if (= 2 (:version proved)) (swap! produced-v2 inc)
+       (swap! canonical assoc [owner binding] {:version 1 :declaration id}))))))
   (when (seq @canonical)
    ;; SDK dependency comes from this exact compiler path, never user metadata.
    (BeamLisp.Loader/ensure_loaded "proc.reconcile-runtime")
@@ -127,5 +200,6 @@
      (when @changed
       (BeamLisp.Link/defvar owner name (to-list next)
         (list (tuple :file "<canonical-reconcile-callsite>") (tuple :line 1)))))))
-  {:canonical-count (count @canonical) :retained @rejected
-   :runtime-namespaces (if (seq @canonical) #{"proc.reconcile-runtime"} #{})}))
+  {:canonical-count (count @canonical) :produced-v2 @produced-v2 :retained @rejected
+   :runtime-namespaces (cond-> (if (seq @canonical) #{"proc.reconcile-runtime"} #{})
+                         (pos? @produced-v2) (conj "reload.reconcile-values"))}))

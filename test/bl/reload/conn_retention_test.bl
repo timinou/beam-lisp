@@ -1,0 +1,165 @@
+; Independent public SDK fixtures. Actual native graph/code/Conn lifetimes.
+; Native UNRUN; requires actual Source-ingress denial helper + candidate SDK.
+; Native component fixtures create genuine graphs/Conn/Root and import no leases.
+(ns reload.conn-retention-test
+ (:require [reload.conn-retention :as custody] [reload.generation :as g]
+           [proc.task :as task] [datom :as d]
+           [proc.queue-family-root :as root] [datom.store-fjall :as fjall]))
+(defn- graph [name]
+ (g/prepare! {:application-id name :sources {"retention.fixture" "(ns retention.fixture (:require [reload.conn-retention :as custody] [reload.execution :as execution])) (defn value [] 42) (defn source-release [] (custody/release-retired! (execution/current))) (defn source-retain [c] (custody/retain! (execution/current) c))"}}))
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- native-reason [action]
+ (try (action) nil
+  (catch error
+   (if (and (erlang/is_map error) (maps/is_key :original error)) (maps/get :original error) error))))
+(defn- down! [pid]
+ (let [monitor (Process/monitor pid)]
+  (try (receive [:DOWN seen :process dead _] :when (and (= seen monitor) (= dead pid)) true
+        (after 5000 false))
+   (finally (Process/demonitor monitor (list :flush))))))
+(defn- retire! [graph]
+ (loop [remaining 200]
+  (let [r (g/retire! graph)]
+   (if (contains? #{:retired :already-retired} (:status r)) r
+    (if (zero? remaining) r (do (Process/sleep 5) (recur (dec remaining))))))))
+(deftest independent-accepted-worker-keeps-resource-after-creator-down-until-native-graph-retirement
+ (let [graph (graph (str "conn-graph-drain-" (erlang/unique_integer (list :positive))))
+       c (g/with! graph #(d/connect [])) sink (erlang/self)
+       _ (g/with! graph #(custody/retain! graph c))
+       creator (spawn
+        (fn []
+         (g/with! graph
+          (fn []
+           (let [work (task/async-nolink
+                (fn []
+                 (erlang/send sink [:worker-live (erlang/self)])
+                 (receive :finish
+                  (erlang/send sink [:worker-value (g/invoke! graph "retention.fixture/value" [])]))))]
+            (erlang/send sink [:worker-pid (task/pid work)])
+            (receive :never nil))))))
+       worker (receive [:worker-pid pid] pid (after 5000 nil))]
+  (try
+   (is (erlang/is_pid worker))
+   (is (= worker (receive [:worker-live pid] pid (after 5000 nil))))
+   (is (= {:retained 1 :uncertain 0} (custody/diagnostic-counts graph)))
+   (is (= :already-retained (g/with! graph #(custody/retain! graph c))))
+   (is (= :connection-borrowers-draining (kind #(d/close! c))))
+   (is (= :open @(:lifetime c)))
+   (erlang/exit creator :kill)
+   (is (down! creator))
+   (is (Process/alive? worker))
+   (is (= :waiting (:status (g/retire! graph))))
+   (is (nil? (g/native-retirement-outcome graph)))
+   (is (= :connection-borrowers-draining (kind #(d/close! c))))
+   (is (= :open @(:lifetime c)))
+   (erlang/send worker :finish)
+   (is (= 42 (receive [:worker-value value] value (after 5000 nil))))
+   (is (down! worker))
+   (is (contains? #{:retired :already-retired} (:status (retire! graph))))
+   (is (= :native-retired (:status (g/native-retirement-outcome graph))))
+   (d/close! c)
+   (is (= :closed @(:lifetime c)))
+   (finally
+    ;; Test-owned idle/control tasks only; accepted worker is released normally.
+    (when (and worker (Process/alive? worker)) (erlang/send worker :finish) (down! worker))
+    (when (Process/alive? creator) (erlang/exit creator :kill) (down! creator))
+    (retire! graph) (d/close! c)))))
+(deftest source-context-cannot-return-borrow-or-forge-native-retirement
+ (let [graph (graph (str "conn-retire-source-" (erlang/unique_integer (list :positive))))
+       c (g/with! graph #(d/connect []))]
+  (try
+   (is (= :retained (g/with! graph #(custody/retain! graph c))))
+   (is (erlang/function_exported :Elixir.BeamLisp.Env :assert_native_framework_execution! 0))
+   (is (nil? (native-reason #(g/with! graph (fn [] (BeamLisp.Env/assert_native_framework_execution!))))))
+   (is (= :native_framework_execution_required (native-reason #(g/invoke! graph "retention.fixture/source-release" []))))
+   (is (= :native_framework_execution_required (native-reason #(g/invoke! graph "retention.fixture/source-retain" [c]))))
+   (is (nil? (g/native-retirement-outcome graph)))
+   (is (= {:retained 1 :uncertain 0} (custody/diagnostic-counts graph)))
+   (is (= :connection-borrowers-draining (kind #(d/close! c))))
+   (is (contains? #{:retired :already-retired} (:status (retire! graph))))
+   (d/close! c)
+   (is (= :closed @(:lifetime c)))
+   (finally (retire! graph) (d/close! c)))))
+(deftest foreign-creator-and-undeclared-native-handle-refuse-before-borrow
+ (let [a (graph (str "conn-authority-a-" (erlang/unique_integer (list :positive))))
+       b (graph (str "conn-authority-b-" (erlang/unique_integer (list :positive))))
+       owned (g/with! a #(d/connect [])) native (d/connect [])]
+  (try
+   (is (= :typed-connection-authority-required (kind #(g/with! b (fn [] (custody/retain! b owned))))))
+   (is (= :typed-connection-authority-required (kind #(g/with! a (fn [] (custody/retain! a native))))))
+   (is (= {:retained 0 :uncertain 0} (custody/diagnostic-counts a)))
+   (is (= {:retained 0 :uncertain 0} (custody/diagnostic-counts b)))
+   (d/close! owned) (d/close! native)
+   (is (= :closed @(:lifetime owned))) (is (= :closed @(:lifetime native)))
+   (finally (retire! a) (retire! b) (d/close! owned) (d/close! native)))))
+
+
+(deftest actual-native-root-declared-conn-stays-open-through-two-source-generations
+ (let [path (str (System/get_env "HOME") "/tmp/conn-shared-root-"
+                 (erlang/unique_integer (list :positive)))
+       _ (File/mkdir_p! path)
+       app (str "conn-shared-root-" (erlang/unique_integer (list :positive)))
+       resources {:data-root path :managed-root-journal "journal.fjall"
+                  :managed-root-journal-id "journal"
+                  :managed-root-store-paths {"journal" "journal.fjall" "ctrl" "ctrl.fjall"}
+                  :deployment-environment "production"}
+       make-graph (fn [version]
+                    (g/prepare! {:application-id app :resources resources
+                     :sources {"retention.shared"
+                      (str "(ns retention.shared) (defn value [] " (pr-str version) ")")}}))
+       a (make-graph :old) b (make-graph :new)
+       journal (d/connect-with (fjall/open (str path "/journal.fjall")))
+       ctrl (d/connect-with (fjall/open (str path "/ctrl.fjall")))]
+  (try
+   ;; Exact native creator PID/origin + prepared store declarations enroll
+   ;; actual Conn handles BEFORE Source initialization. No nominated Root rows.
+   (is (= :enrolled (root/enroll! a journal {"journal" journal "ctrl" ctrl})))
+   (is (= :entered (root/enter-initializer! a)))
+   (g/with! a #(g/bind-runtime! {:ctrl ctrl}))
+   (is (= :ready (root/ready! a)))
+   (is (= :inherited (root/inherit! b a)))
+   (is (= :entered (root/enter-initializer! b)))
+   (g/with! b #(g/bind-runtime! {:ctrl ctrl}))
+   (is (= :ready (root/ready! b)))
+   (is (= :retained (g/with! a #(custody/retain! a ctrl))))
+   (is (= :retained (g/with! b #(custody/retain! b ctrl))))
+   (is (= {:retained 1 :uncertain 0} (custody/diagnostic-counts a)))
+   (is (= {:retained 1 :uncertain 0} (custody/diagnostic-counts b)))
+   (is (= :connection-borrowers-draining (kind #(d/close! ctrl))))
+   (is (contains? #{:retired :already-retired} (:status (retire! a))))
+   (is (= :connection-borrowers-draining (kind #(d/close! ctrl))))
+   (is (= :new (g/invoke! b "retention.shared/value" [])))
+   (is (some? (d/db ctrl)))
+   (is (contains? #{:retired :already-retired} (:status (retire! b))))
+   (d/close! ctrl)
+   (is (= :closed @(:lifetime ctrl)))
+   (d/close! journal)
+   (is (= :closed @(:lifetime journal)))
+   (finally
+    ;; Actual retirement hooks return only their own graph borrow, then Root
+    ;; grant metadata. Native writer closes only after both actual lifetimes.
+    (retire! a) (retire! b)
+    (d/close! ctrl) (d/close! journal) (File/rm_rf! path)))))
+
+(deftest actual-source-created-same-app-domain-conn-can-be-borrowed-without-root-promotion
+ (let [graph (g/prepare!
+              {:application-id (str "conn-source-created-" (erlang/unique_integer (list :positive)))
+               :sources {"retention.source"
+                "(ns retention.source (:require [datom :as d])) (defn make! [] (d/connect []))"}})
+       c (g/invoke! graph "retention.source/make!" [])
+       evidence (datom.conn/creation-evidence! c)]
+  (try
+   (is (= (:application-id graph) (get-in evidence [:creator :application-id])))
+   (is (= (:creator evidence) (get-in evidence [:custody :origin])))
+   (is (some? (:creator evidence)))
+   (is (= :retained (g/with! graph #(custody/retain! graph c))))
+   ;; Root evidence is still absent: domain retention is not native enrollment,
+   ;; protected journal authority or a claim about actual Knowledger custody.
+   (is (= :queue-root-stale-custody (kind #(root/evidence! graph))))
+   (is (= {:retained 1 :uncertain 0} (custody/diagnostic-counts graph)))
+   (is (= :connection-borrowers-draining (kind #(d/close! c))))
+   (is (contains? #{:retired :already-retired} (:status (retire! graph))))
+   (is (= :native-retired (:status (g/native-retirement-outcome graph))))
+   (d/close! c)
+   (is (= :closed @(:lifetime c)))
+   (finally (retire! graph) (d/close! c)))))
