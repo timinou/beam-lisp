@@ -1,0 +1,136 @@
+(ns datom.current-reverse-test
+ (:require [datom :as d] [datom.conn :as conn] [datom.current :as current]
+  [datom.index :as index] [datom.attr-basis :as marks] [datom.derived :as derived]
+  [datom.store :as store] [datom.store-ets :as ets-store] [datom.store-fjall :as fjall]))
+(def schema [{:db/ident :r/value :db/valueType :db.type/long :db/index true}
+             {:db/ident :r/tag :db/valueType :db.type/string :db/index true :db/cardinality :db.cardinality/many}])
+(defn rows [database a] (when-let [hit (current/reverse-values database a)] (set (:rows hit))))
+(defn drop-coverage! [s a] (store/-delete s (derived/record-key [:datom.current/reverse a])))
+(defn adopt! [c a n]
+ (loop [round 0]
+  (when (> round 10000) (throw (ex-info "Current adoption did not finish" {})))
+  (let [step (conn/adopt-current! c a {:max-datoms n})]
+   (is (<= (:examined step) n))
+   (if (= :complete (:status step)) step
+    (do (is (= :building (:status step))) (recur (inc round)))))))
+(defn building! [c a]
+ (loop [n 0]
+  (when (> n 20) (throw (ex-info "Current adoption did not enter build" {})))
+  (let [step (conn/adopt-current! c a {:max-datoms 1})]
+   (if (= :build (:phase step)) step (recur (inc n))))))
+(deftest fresh-current-reverse-values-share-source-commit-and-preserve-many-values
+ (let [c (conn/connect schema)]
+  (try
+   (d/transact! c [[:db/add 9000 :r/value 1] [:db/add 9000 :r/tag "a"]])
+   (let [before (d/db c)]
+    (is (= #{[9000 1]} (rows before :r/value)))
+    (is (= #{[9000 "a"]} (rows before :r/tag)))
+    (d/transact! c [[:db/retract 9000 :r/tag "a"] [:db/add 9000 :r/tag "a"]
+                   [:db/add 9000 :r/tag "b"] [:db/add 9000 :r/value 2]])
+    (is (= #{[9000 2]} (rows (d/db c) :r/value)))
+    (is (= (set (d/q '[:find ?e ?v :where [?e :r/tag ?v]] (d/db c))) (rows (d/db c) :r/tag)))
+    (is (nil? (current/reverse-values before :r/value)))
+    (is (= 1 (:r/value (d/entity before 9000))))
+    (doseq [view [(d/history (d/db c)) (d/since (d/db c) 0)
+                 (assoc (d/db c) :valid-at 1) (assoc (d/db c) :valid-between [0 1])]]
+     (is (nil? (current/reverse-values view :r/value))))
+    (is (= [] (:rows (current/reverse-values (d/db c) :r/value {:exclude-values [2]}))))
+    (conn/excise! c [[:attr 9000 :r/value]])
+    (is (= #{} (rows (d/db c) :r/value)))
+    (is (= (set (d/q '[:find ?e ?v :where [?e :r/tag ?v]] (d/db c))) (rows (d/db c) :r/tag))))
+   (finally (conn/close! c)))))
+(deftest legacy-mark-gap-never-becomes-complete-from-a-later-good-write
+ (let [c (conn/connect schema)]
+  (try
+   (d/transact! c [[:db/add 9000 :r/value 1]])
+   (let [old (d/db c) tx (:tx (d/transact! c []))
+         ds [[9000 :r/value 1 tx false] [9000 :r/value 7 tx true]]]
+    ;; Native legacy maintenance advances source marks without reverse coverage.
+    (conn/serialized! c (fn []
+     (index/write-datoms (:store c) @(:schema c) ds
+      (into (current/transaction-ops (:store c) ds tx)
+            (marks/record-ops (:store c) #{:r/value} tx)))))
+    (is (nil? (current/reverse-values (d/db c) :r/value)))
+    (is (= 7 (:r/value (d/entity (d/db c) 9000))))
+    (d/transact! c [[:db/add 9001 :r/value 9]])
+    (is (nil? (current/reverse-values (d/db c) :r/value)))
+    (adopt! c :r/value 1)
+    (is (= #{[9000 7] [9001 9]} (rows (d/db c) :r/value)))
+    (is (nil? (current/reverse-values old :r/value)))
+    (is (= 1 (:r/value (d/entity old 9000)))))
+   (finally (conn/close! c)))))
+(deftest concurrent-native-writes-and-excision-survive-bounded-old-store-adoption
+ (let [c (conn/connect schema) first-committed (atom false)]
+  (try
+   (d/transact! c [[:db/add 9000 :r/value 1] [:db/add 9001 :r/value 8]])
+   (drop-coverage! (:store c) :r/value)
+   (is (nil? (current/reverse-values (d/db c) :r/value)))
+   (building! c :r/value)
+   (let [task (Task/async (fn []
+                (d/transact! c [[:db/add 9000 :r/value 2]])
+                (reset! first-committed true)
+                (doseq [n (range 3 17)] (d/transact! c [[:db/add 9000 :r/value n]]))))]
+    (loop [] (when-not @first-committed (Process/sleep 1) (recur)))
+    (conn/excise! c [[:entity 9001]])
+    (adopt! c :r/value 1)
+    (Task/await task 30000)
+    (is (= #{[9000 16]} (rows (d/db c) :r/value)))
+    (is (= (set (d/q '[:find ?e ?v :where [?e :r/value ?v]] (d/db c))) (rows (d/db c) :r/value)))
+    (is (nil? (d/entity (d/db c) 9001)))
+    (is (= :complete (:phase (current/reverse-certificate (:store c) :r/value)))))
+   (finally (conn/close! c)))))
+(defrecord RefusingStore [inner refuse]
+ store/Store
+ (-get [s k] (store/-get (:inner s) k))
+ (-range [s lo hi] (store/-range (:inner s) lo hi))
+ (-put [s k v] (store/-put (:inner s) k v) s)
+ (-delete [s k] (store/-delete (:inner s) k) s)
+ (-update [s k f] (let [[_ value] (store/-update (:inner s) k f)] [s value]))
+ (-commit [s ops] (when @(:refuse s) (throw (ex-info "Injected native commit refusal" {}))) (store/-commit (:inner s) ops) s)
+ store/OrderedPageScan
+ (-ordered-page [s lo after hi n direction bytes] (store/ordered-page (:inner s) lo after hi n direction bytes)))
+(deftest a-refused-source-commit-cannot-publish-reverse-values-or-coverage
+ (let [refuse (atom false) c (conn/connect-with (->RefusingStore (ets-store/open) refuse) schema)]
+  (try
+   (d/transact! c [[:db/add 9000 :r/value 1]])
+   (reset! refuse true)
+   (is (try (d/transact! c [[:db/add 9000 :r/value 2]]) false (catch _ true)))
+   (is (= #{[9000 1]} (rows (d/db c) :r/value)))
+   (finally (reset! refuse false) (conn/close! c)))))
+(defrecord RacingStore [inner hook]
+ store/Store
+ (-get [s k] (store/-get (:inner s) k))
+ (-range [s lo hi]
+  (when-let [f @(:hook s)] (reset! (:hook s) nil) (f))
+  (store/-range (:inner s) lo hi))
+ (-put [s k v] (store/-put (:inner s) k v) s)
+ (-delete [s k] (store/-delete (:inner s) k) s)
+ (-update [s k f] (let [[_ value] (store/-update (:inner s) k f)] [s value]))
+ (-commit [s ops] (store/-commit (:inner s) ops) s)
+ store/OrderedPageScan
+ (-ordered-page [s lo after hi n direction bytes] (store/ordered-page (:inner s) lo after hi n direction bytes)))
+(deftest a-real-commit-between-certificate-and-range-read-refuses-newer-values
+ (let [hook (atom nil) c (conn/connect-with (->RacingStore (ets-store/open) hook) schema)]
+  (try
+   (d/transact! c [[:db/add 9000 :r/value 1]])
+   (let [before (d/db c)]
+    (reset! hook (fn [] (d/transact! c [[:db/add 9000 :r/value 2]])))
+    (is (nil? (current/reverse-values before :r/value)))
+    (is (= 1 (:r/value (d/entity before 9000))))
+    (is (= #{[9000 2]} (rows (d/db c) :r/value))))
+   (finally (conn/close! c)))))
+(deftest interrupted-fjall-adoption-reopens-with-original-source-coverage
+ (let [path (store/fresh-path ".current-reverse.fjall") s (fjall/open path) c (conn/connect-with s schema)]
+  (try
+   (d/transact! c [[:db/add 9000 :r/value 1]])
+   (d/transact! c [[:db/add 9000 :r/value 2]])
+   (drop-coverage! s :r/value)
+   (building! c :r/value)
+   (conn/adopt-current! c :r/value {:max-datoms 1})
+   (finally (conn/release! c) (store/close s)))
+  (let [s2 (fjall/open path) c2 (conn/connect-with s2 schema)]
+   (try
+    (is (nil? (current/reverse-values (d/db c2) :r/value)))
+    (adopt! c2 :r/value 1)
+    (is (= #{[9000 2]} (rows (d/db c2) :r/value)))
+    (finally (conn/release! c2) (store/close s2) (File/rm_rf! path))))))

@@ -3,7 +3,8 @@
 ; atomically with indexes. An attribute epoch invalidates older records when a
 ; writer that does not maintain this projection advances the attribute marker.
 (ns datom.current
-  (:require [datom.index :as index] [datom.derived :as derived]))
+  (:require [datom.index :as index] [datom.derived :as derived]
+            [datom.store :as store] [datom.codec :as codec] [datom.schema :as schema]))
 
 (defn- marker [store a]
   (let [m (derived/get-record store [:datom.current/attribute a])
@@ -42,6 +43,8 @@
       (:values p)
       (from-history (index/scan store :eavt e a)))))
 
+(declare reverse-transaction-ops)
+
 (defn transaction-ops
   "Projection and coverage evidence for the SAME atomic commit as datoms.
    An interrupted/legacy writer invalidates the attribute epoch, not history."
@@ -59,7 +62,10 @@
        (mapcat (fn [[[e a] ds]]
                  (derived/put-ops [:datom.current/pair e a]
                    {:epoch (get epochs a) :basis tx
-                    :values (apply-pending (if fresh? [] (values store e a)) ds)})) pairs)))))
+                    :values (apply-pending (if fresh? [] (values store e a)) ds)})) pairs))))
+  ([store schema datoms tx fresh?]
+   (into (transaction-ops store datoms tx fresh?)
+         (reverse-transaction-ops store schema datoms tx fresh?))))
 
 (defn excision-ops
   "Erasure removes projected values as well as their historical datoms."
@@ -80,3 +86,175 @@
       (when (and m p (= (:epoch m) (:epoch p)) (number? (:basis p))
                  (<= (:basis p) (:basis m)) (<= (:basis m) t))
         {:values (:values p)}))))
+
+;; Ordered reverse current values share the source store and source commit.
+;; Rows use the existing datom representation so bounded native store pages
+;; handle them without another substrate format or opaque object decoder.
+(def REVERSE-PREFIX (erlang/list_to_binary (to-list [0 99 1])))
+(def DIRTY-PREFIX (erlang/list_to_binary (to-list [0 99 2])))
+(def REVERSE-VERSION 1)
+(defn- facet-prefix [prefix components]
+ (codec/concat-bins (into [prefix] (mapv codec/encode-value components))))
+(defn reverse-prefix [a & components] (facet-prefix REVERSE-PREFIX (into [a] components)))
+(defn- dirty-prefix [a & components] (facet-prefix DIRTY-PREFIX (into [a] components)))
+(defn- reverse-key [e a v] (reverse-prefix a v e))
+(defn- dirty-key [e a v] (dirty-prefix a v e))
+(defn- reverse-ident [a] [:datom.current/reverse a])
+(defn- reverse-definition [sch a]
+ {:version REVERSE-VERSION :type (schema/value-type sch a)
+  :many (schema/many? sch a) :indexed (schema/indexed? sch a)})
+(defn- committed-at [s a] (get (derived/get-record s [:datom.attr-basis]) a 0))
+(defn reverse-certificate [s a] (derived/get-record s (reverse-ident a)))
+(defn- reverse-current? [s sch a c]
+ (and c (= (reverse-definition sch a) (:definition c))
+      (erlang/is_integer (:through c)) (>= (:through c) 0)
+      (erlang/is_integer (:epoch c)) (> (:epoch c) 0)
+      (= (committed-at s a) (:through c))))
+(defn- empty-prefix? [s prefix]
+ (let [page (store/ordered-page s prefix nil (index/prefix-end prefix) 1 :asc)]
+  (and (nil? (:refused page)) (:end? page) (empty? (:datoms page)))))
+(defn- empty-attribute? [s a]
+ (and (store/ordered-page-capable? s)
+      (empty-prefix? s (index/key-prefix :aevt a))
+      (empty-prefix? s (reverse-prefix a)) (empty-prefix? s (dirty-prefix a))))
+(defn- initial-reverse [s sch a old tx]
+ {:definition (reverse-definition sch a) :epoch (inc (:epoch old 0)) :through tx :coverage-basis tx
+  :phase (if (and (nil? old) (empty-attribute? s a)) :complete :clear-values)})
+(defn- row-ops [phase e a before after tx]
+ (let [building? (= :build phase)]
+  (into [] (mapcat
+   (fn [v]
+    (let [live? (boolean (some (fn [x] (= x v)) after))
+          row [e a v tx live?] key (reverse-key e a v) dirty (dirty-key e a v)]
+     (if live?
+      [[:put key row] [:delete dirty]]
+      (if building? [[:put key row] [:put dirty row]] [[:delete key] [:delete dirty]]))))
+   (distinct (concat before after))))))
+(defn reverse-transaction-ops
+ "Reverse values and coverage in the SAME native source commit. Old callers
+  without schema remain legacy writers: their attribute marks invalidate this
+  facet rather than silently certifying partial maintenance."
+ [s sch datoms tx fresh?]
+ (let [pairs (reduce (fn [out dt] (update out [(index/-e dt) (index/-a dt)]
+                    (fn [ds] (conj (or ds []) dt)))) {} datoms)
+       attrs (set (mapv (fn [[[e a] _]] a) (into [] pairs)))
+       headers (into {} (keep (fn [a]
+          (when (schema/indexed? sch a)
+           (let [old (reverse-certificate s a)]
+            [a (if (reverse-current? s sch a old) (assoc old :through tx)
+                 (initial-reverse s sch a old tx))]))) attrs))]
+  (into (vec (mapcat (fn [[a header]] (derived/put-ops (reverse-ident a) header)) headers))
+   (mapcat (fn [[[e a] ds]]
+    (when-let [header (get headers a)]
+     (when (contains? #{:complete :build :drain} (:phase header))
+      (let [before (if fresh? [] (values s e a)) after (apply-pending before ds)]
+       (row-ops (:phase header) e a before after tx))))) pairs))))
+(defn reverse-excision-ops
+ "Erase every named reverse value and dirty entry in the source erasure commit.
+  Historical rows cannot survive as a derived current value."
+ [s datoms tx]
+ (let [attrs (set (mapv index/-a datoms))
+       coords (set (mapv (fn [dt] [(index/-e dt) (index/-a dt) (index/-v dt)]) datoms))]
+  (into (vec (mapcat (fn [[e a v]] [[:delete (reverse-key e a v)] [:delete (dirty-key e a v)]]) coords))
+   (mapcat (fn [a]
+    (when-let [header (reverse-certificate s a)]
+     ;; Legacy gaps remain gaps. Erasure cannot certify incomplete coverage.
+     (if (= (:through header) (committed-at s a))
+      (derived/put-ops (reverse-ident a) (assoc header :through tx))
+      (derived/put-ops (reverse-ident a)
+       (assoc header :through tx :epoch (inc (:epoch header 0)) :phase :clear-values :after nil))))) attrs))))
+(defn- current-view? [db]
+ (and (= :current (:filter-mode db)) (nil? (:since-t db))
+      (nil? (:valid-at db)) (nil? (:valid-between db))))
+(defn reverse-values
+ "Certified current [entity value] rows, or nil for ordinary historical fallback.
+  Excluded values are skipped physically. No hit for older/valid-time views or
+  a relevant commit between header validation and row materialization."
+ ([db a] (reverse-values db a {}))
+ ([db a opts]
+  (when (and (current-view? db) (map? opts)
+             (every? #{:exclude-values} (keys opts))
+             (or (nil? (:exclude-values opts)) (and (vector? (:exclude-values opts)) (<= (count (:exclude-values opts)) 64))))
+   (let [s (:store db) sch (:schema db) header (reverse-certificate s a)]
+    (when (and (schema/indexed? sch a) (= :complete (:phase header))
+               (reverse-current? s sch a header)
+               (<= (max (:through header) (:coverage-basis header 0)) (:basis-t db)))
+     (let [base (reverse-prefix a) hi (index/prefix-end base)
+           excluded (sort (distinct (mapv #(reverse-prefix a %) (:exclude-values opts []))))
+           ranges (loop [lo base remaining excluded out []]
+                    (if-let [skip (first remaining)]
+                     (recur (index/prefix-end skip) (rest remaining) (conj out [lo skip]))
+                     (conj out [lo hi])))
+           rows (vec (mapcat (fn [[lo upper]] (store/scan-datoms s lo upper)) ranges))]
+      (when (and (= header (reverse-certificate s a)) (reverse-current? s sch a header))
+       {:rows (mapv (fn [dt] [(index/-e dt) (index/-v dt)]) (filterv index/assertion? rows))
+        :epoch (:epoch header) :through (:through header)})))))))
+
+(defn- page-failure [page]
+ (cond (:refused page) (:refused page)
+       (and (:byte-limited? page) (empty? (:datoms page))) :row-exceeds-budget
+       :else nil))
+(defn- clear-step [s a header limit dirty?]
+ (let [prefix (if dirty? (dirty-prefix a) (reverse-prefix a))
+       page (store/ordered-page s prefix nil (index/prefix-end prefix) limit :asc)]
+  (if-let [reason (page-failure page)] {:status :unavailable :reason reason :ops [] :examined 0}
+   (let [next (if (:end? page) (assoc header :phase (if dirty? :build :clear-dirty) :after nil) header)
+         ops (mapv (fn [dt] [:delete ((if dirty? dirty-key reverse-key) (index/-e dt) a (index/-v dt))]) (:datoms page))]
+    {:status :building :phase (:phase next) :header next :ops ops :examined (count (:datoms page))}))))
+(defn- build-step [s a header limit]
+ (let [prefix (index/key-prefix :aevt a)
+       page (store/ordered-page s prefix (:after header) (index/prefix-end prefix) limit :asc)]
+  (if-let [reason (page-failure page)] {:status :unavailable :reason reason :ops [] :examined 0}
+   (let [rows (reduce (fn [out dt]
+          (if (> (index/-tx dt) (:cutoff header)) out
+           (let [key (reverse-key (index/-e dt) a (index/-v dt))
+                 prior (if (contains? out key) (get out key) (store/-get s key))]
+            ;; Current writer testimony beats all scanned history. At equal
+            ;; history tx a retraction wins, matching from-history visibility.
+            (if (and prior (or (> (index/-tx prior) (index/-tx dt))
+                              (and (= (index/-tx prior) (index/-tx dt)) (index/retraction? prior)))) out
+             (assoc out key dt))))) {} (:datoms page))
+         ops (vec (mapcat (fn [[key dt]]
+          [[:put key dt] (if (index/assertion? dt)
+                          [:delete (dirty-key (index/-e dt) a (index/-v dt))]
+                          [:put (dirty-key (index/-e dt) a (index/-v dt)) dt])]) rows))
+         next (if (:end? page) (assoc header :phase :drain :after nil :coverage-basis (:cutoff header))
+                (assoc header :after (:last page)))]
+    {:status :building :phase (:phase next) :header next :ops ops :examined (count (:datoms page))}))))
+(defn- drain-step [s a header limit]
+ (let [prefix (dirty-prefix a)
+       page (store/ordered-page s prefix nil (index/prefix-end prefix) limit :asc)]
+  (if-let [reason (page-failure page)] {:status :unavailable :reason reason :ops [] :examined 0}
+   (let [ops (vec (mapcat (fn [dt]
+          (let [key (reverse-key (index/-e dt) a (index/-v dt)) current (store/-get s key)]
+           (cond-> [[:delete (dirty-key (index/-e dt) a (index/-v dt))]]
+            (and current (index/retraction? current)) (conj [:delete key])))) (:datoms page)))
+         next (if (:end? page) (dissoc (assoc header :phase :complete) :after :cutoff) header)]
+    {:status (if (:end? page) :complete :building) :phase (:phase next)
+     :header next :ops ops :examined (count (:datoms page))}))))
+(defn adoption-step
+ "One physical-row-bounded reverse-facet maintenance step. Caller MUST hold
+  the existing source writer through reads and returned ops commit. Partial
+  coverage never authorizes a read; native source writes maintain the frontier."
+ [s sch a basis limit]
+ (cond
+  (not (and (erlang/is_integer limit) (<= 1 limit 1024)))
+   (throw (ex-info "Use a bounded current facet adoption page" {:kind :current-adoption-limit}))
+  (not (schema/indexed? sch a)) {:status :unavailable :reason :attribute-not-indexed :ops [] :examined 0}
+  (not (store/ordered-page-capable? s)) {:status :unavailable :reason :bounded-substrate-unavailable :ops [] :examined 0}
+  :else
+   (let [old (reverse-certificate s a) committed (committed-at s a)
+         header (if (reverse-current? s sch a old) old
+                  {:definition (reverse-definition sch a) :epoch (inc (:epoch old 0))
+                   :through committed :phase :clear-values})
+         result (case (:phase header)
+          :complete {:status :complete :phase :complete :ops [] :examined 0}
+          :clear-values (clear-step s a header limit false)
+          :clear-dirty (let [step (clear-step s a header limit true)]
+                         (if (= :build (:phase step))
+                          (update step :header assoc :cutoff (max basis (or committed 0))) step))
+          :build (build-step s a header limit)
+          :drain (drain-step s a header limit)
+          (throw (ex-info "Current facet has an unknown adoption phase" {:kind :current-adoption-phase})))]
+    (if-let [next (:header result)]
+     (-> result (update :ops into (derived/put-ops (reverse-ident a) next)) (dissoc :header)) result))))
