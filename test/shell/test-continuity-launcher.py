@@ -54,6 +54,7 @@ class ExplicitContinuityLauncher(unittest.TestCase):
         env.update(PATH=str(tools) + ':/usr/bin:/bin', CONTINUITY_MOCK_CASE=str(root))
         if override:
             env['CONTINUITY_BL'] = str(root / 'accepted-bl')
+        env.update(config.get('launcher_env', {}))
         if not config.get('default_preflight_collision') and not config.get('evidence_alloc_fail'):
             evidence = root / 'evidence'
             evidence.mkdir(mode=0o700)
@@ -64,7 +65,8 @@ class ExplicitContinuityLauncher(unittest.TestCase):
         result = subprocess.run(['/bin/bash', str(script)], env=env, cwd=repo,
                                 text=True, capture_output=True, timeout=20)
         state = json.loads((root / 'state.json').read_text())
-        events = [json.loads(line) for line in (root / 'events.jsonl').read_text().splitlines()]
+        events_file = root / 'events.jsonl'
+        events = [json.loads(line) for line in events_file.read_text().splitlines()] if events_file.exists() else []
         return result, state, events
 
     def test_override_is_the_only_invoked_launcher_and_hash_is_exact(self):
@@ -78,6 +80,10 @@ class ExplicitContinuityLauncher(unittest.TestCase):
                 self.assertEqual([(event['launcher'], event['arguments']) for event in calls],
                                  [(str(actual), ['run', 'examples/continuity/main.bl'])])
                 self.assertEqual(state['browserStubCalls'], 1)
+                unit = next(event for event in events if event['kind'] == 'systemd-run')
+                for flag in ('--setenv=BL_DAEMON=off', '--setenv=BL_AUTOBUILD=off',
+                             '--setenv=BEAM_LISP_AOT_CACHE_DIR=' + state['scratch'] + '/aot-cache'):
+                    self.assertIn(flag, unit['args'])
                 receipt = json.loads((root / 'evidence/launcher-input.json').read_text())
                 self.assertEqual(receipt['launcher'], str(actual))
                 self.assertEqual(receipt['launcherRealpath'], str(actual.resolve()))
@@ -87,6 +93,38 @@ class ExplicitContinuityLauncher(unittest.TestCase):
                 self.assertFalse(Path(state['scratch']).exists())
                 self.assertTrue((root / 'evidence/server-journal.jsonl').is_file())
                 self.assertIn('Evidence: ', result.stdout)
+
+    def test_explicit_private_cache_copy_and_finite_readiness_are_only_input_candidates(self):
+        with tempfile.TemporaryDirectory(dir=Path.home() / 'tmp') as temporary:
+            root = Path(temporary); cache = root / 'candidate-cache'; cache.mkdir(mode=0o700)
+            candidate = cache / 'manifest.term'; candidate.write_bytes(b'UNIT-ONLY-UNTRUSTED-CODE-CANDIDATE')
+            original = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            result, state, events = self.run_owned_model(root, {'launcher_env': {
+                'CONTINUITY_AOT_CACHE_SOURCE': str(cache), 'CONTINUITY_READY_TIMEOUT': '600', 'CONTINUITY_RUNTIME_SECONDS': '900'}})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(hashlib.sha256(candidate.read_bytes()).hexdigest(), original)
+            receipt = json.loads((root / 'evidence/launcher-input.json').read_text())
+            self.assertEqual(receipt['cacheCandidates']['kind'], 'untrusted-exact-private-byte-copy')
+            self.assertEqual(receipt['cacheCandidates']['files'], 1)
+            self.assertEqual(receipt['cacheCandidates']['authority'], 'NONE; native canonical producer revalidation required')
+            unit = next(event for event in events if event['kind'] == 'systemd-run')
+            self.assertIn('--property=RuntimeMaxSec=900', unit['args'])
+        # Invalid timing refuses BEFORE any modeled command or native start.
+        for env in ({'CONTINUITY_READY_TIMEOUT': 'infinity'}, {'CONTINUITY_RUNTIME_SECONDS': '300'},
+                    {'CONTINUITY_READY_TIMEOUT': '1801', 'CONTINUITY_RUNTIME_SECONDS': '2700'}):
+            with tempfile.TemporaryDirectory(dir=Path.home() / 'tmp') as temporary:
+                root = Path(temporary)
+                result, state, events = self.run_owned_model(root, {'launcher_env': env})
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(state['launchCalls'], 0)
+                self.assertEqual(events, [])
+        # Symlink candidate roots cannot alias mutable host state into the VM.
+        with tempfile.TemporaryDirectory(dir=Path.home() / 'tmp') as temporary:
+            root = Path(temporary); real = root / 'real'; real.mkdir(); (real / 'x').write_bytes(b'x')
+            alias = root / 'alias'; alias.symlink_to(real, target_is_directory=True)
+            result, state, events = self.run_owned_model(root, {'launcher_env': {'CONTINUITY_AOT_CACHE_SOURCE': str(alias)}})
+            self.assertNotEqual(result.returncode, 0); self.assertEqual(state['launchCalls'], 0)
+            self.assertEqual((real / 'x').read_bytes(), b'x')
 
     def test_relative_or_missing_override_refuses_before_any_command(self):
         script = REPO / 'examples/continuity/verify.sh'
