@@ -3,7 +3,7 @@
 (ns proc.capacity-indexed-test
  (:require [proc.capacity :as cap] [proc.queue :as q] [proc.queue-runtime :as runtime]
   [datom :as d] [datom.conn :as dc] [datom.index :as index]
-  [datom.store :as ds] [datom.store-fjall :as fjall]))
+  [datom.store :as ds] [datom.store-fjall :as fjall] [datom.current :as current] [datom.derived :as derived]))
 (defrecord SpyStore [inner scans])
 (extend-type SpyStore
  datom.store/Store
@@ -26,6 +26,10 @@
  SpyStore (-scan-datoms [s lo hi]
   (let [rows (ds/-scan-datoms (:inner s) lo hi)]
    (swap! (:scans s) conj {:op :scan :lo lo :hi hi :rows (count rows)}) rows)))
+(extend-protocol datom.store/OrderedPageScan
+ SpyStore (-ordered-page [s lo after hi n direction bytes]
+  (let [page (ds/ordered-page (:inner s) lo after hi n direction bytes)]
+   (swap! (:scans s) conj {:op :page :lo lo :hi hi :rows (count (:datoms page))}) page)))
 (defn fixture []
  (let [inner (fjall/open (ds/fresh-path ".indexed-capacity.fjall"))
        spy (->SpyStore inner (atom [])) c (dc/connect-with spy [])
@@ -96,13 +100,45 @@
      (is (not-any? #(contains? #{(index/key-prefix :aevt :capacity.reservation/key)
                                (index/key-prefix :avet :capacity.reservation/key)} (:lo %)) crossings)
          "No full reservation-key column scan in native active paths")
-     (is (some #(and (= state-base (:lo %)) (= released-value (:hi %))) crossings)
-         "The native computed relation executes the real lower AVET range")
-     (is (some #(and (= (index/prefix-end released-value) (:lo %))
-                    (= (index/prefix-end state-base) (:hi %))) crossings)
-         "The real upper AVET range skips the exact released value prefix")
-     (is (> (reduce + 0 (map :rows (filter #(= state-base (:lo %)) crossings))) 3)
-         "Residual historical active-state datoms are actually traversed; no O(active) IO claim"))
+     (let [facet-base (current/reverse-prefix :capacity.reservation/state)
+           facet-released (current/reverse-prefix :capacity.reservation/state :released)]
+      (is (some #(and (= facet-base (:lo %)) (= facet-released (:hi %))) crossings)
+          "Certified native reverse facet executes its actual lower current-value range")
+      (is (some #(and (= (index/prefix-end facet-released) (:lo %))
+                     (= (index/prefix-end facet-base) (:hi %))) crossings)
+          "Certified native reverse facet physically skips all released current values")
+      (is (not-any? #(contains? #{state-base (index/prefix-end released-value)} (:lo %)) crossings)
+          "Certified active admission/repair traverses ZERO historical state AVET rows")))
+    ;; Simulate a pre-facet native store by withdrawing ONLY derived coverage.
+    ;; All actual queue releases/source indexes remain intact and authoritative.
+    (ds/-delete (:store c) (derived/record-key [:datom.current/reverse :capacity.reservation/state]))
+    (is (nil? (current/reverse-values (d/db c) :capacity.reservation/state)))
+    (d/transact! c [[:db/add unusual-e :capacity.reservation/state :zzzz/pre-adoption]])
+    (reset! (:scans (:spy f)) [])
+    (is (= 3 (:outstanding (cap/active-status a))) "Incomplete coverage uses correct historical admission")
+    (is (some #(= (index/key-prefix :avet :capacity.reservation/state) (:lo %)) @(:scans (:spy f)))
+        "Real invalidated relation executes historical fallback before certification")
+    (reset! (:scans (:spy f)) [])
+    (loop [n 0]
+     (when (> n 10000) (throw (ex-info "Native capacity state adoption did not settle" {})))
+     (let [step (cap/adopt-state-index! a 7)]
+      (is (<= (:examined step) 7))
+      (when-not (= :complete (:status step)) (recur (inc n)))))
+    (is (some #(and (= :page (:op %)) (= (index/key-prefix :aevt :capacity.reservation/state) (:lo %))) @(:scans (:spy f)))
+        "Adoption actually consumes source history through bounded native pages")
+    (is (every? #(<= (:rows %) 7) (filter #(= :page (:op %)) @(:scans (:spy f))))
+        "Actual substrate crossings obey the seven-physical-row adoption budget")
+    (reset! (:scans (:spy f)) [])
+    (d/transact! c [[:db/add unusual-e :capacity.reservation/state :zzzz/after-adoption]])
+    (is (= 3 (:outstanding (cap/active-status a))))
+    (is (= :deferred (:status (cap/reserve! a srv (payload "still-full") (opts "still-full") capture))))
+    (cap/repair! a 1)
+    (is (not-any? #(contains? #{(index/key-prefix :aevt :capacity.reservation/state)
+                              (index/key-prefix :avet :capacity.reservation/state)
+                              (index/prefix-end (index/key-prefix :avet :capacity.reservation/state :released))} (:lo %))
+                  @(:scans (:spy f)))
+        "After bounded adoption of 100 actual released enrollments, admission/repair never traverses their history index")
+    (d/transact! c [[:db/add unusual-e :capacity.reservation/state :zzzz/hot]])
     (is (= {:released 100 :reserved 1 :enrolled 1 :zzzz/hot 1} (:states (cap/status a)))
         "The explicit full-history API remains exact")
     (let [before (d/entity (d/db c) unusual-e) basis (d/basis-t (d/db c))]
