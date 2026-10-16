@@ -31,6 +31,8 @@
 ;    :shell   (fn [title body style] -> html) ; the page document (opt)
 ;    :tap     (data.tap/open)               ; dev: every mount/commit publishes
 ;                                           ; a frame {ops tree ms basis event}
+;    :clock   (connector.clock/system)    ; optional owned temporal clock
+;    :deadline (fn [ctx] -> absolute-ms-or-nil) ; pure next visible transition
 ;    :listen  {:payload :basis}             ; optional message shape; no attr filters
 ;    } ; legacy :warm/:warm-me keys are accepted but no longer needed
 ;
@@ -53,6 +55,7 @@
 (ns live.app
   (:require [live.socket :as sock]
             [live.measure :as measure]
+            [live.temporal :as temporal] [connector.clock :as clock]
             [live.hiccup :as h]
             [loom.token :as t]
             [datom]
@@ -323,6 +326,34 @@
            (catch e (do (stop pid) (throw e)))))
     pid))
 
+(defn- temporal-context [state]
+  ;; Temporal callbacks receive the SAME guarded worlds/principal contract as
+  ;; a screen. Original app capabilities remain outside editable socket locals.
+  (let [app (:temporal-app state) me (:me state)
+        locals (assoc (:locals state) :app app :me me)
+        raw (or (:route locals) (:home app) "/")
+        target (if (keyword? raw) (name raw) (str raw))
+        [path query] (split-target target)
+        path (if (contains? #{"/" ""} path) (get app :home "/") path)
+        matched (match-route (:routes app) path)
+        params (when matched (merge (second matched) query))
+        worlds (when (and me matched) ((:worlds app) me params))]
+    (when (map? worlds)
+      {:me me :params params :route path :query query :locals locals
+       :session (when (:session state) (datom/db (:session state)))
+       :shared (when (:shared state) (datom/db (:shared state)))
+       :worlds worlds :db (fn [key] (get worlds key))
+       :now (clock/now (get-in state [:temporal :clock]))})))
+(defn- rearm-temporal! [state]
+  (if-let [owned (:temporal state)]
+    (let [context (when (:attached? state) (temporal-context state))
+          deadline (when context ((:deadline (:temporal-app state)) context))]
+      (assoc state :temporal (temporal/rearm! owned deadline (boolean context)))) state))
+(defn- project-temporal! [state]
+  ;; A temporal wake is an ordering barrier for its current time. Do not let a
+  ;; queued Datom report suppress the ONLY clock-driven projection.
+  (rearm-temporal! (sock/on-commit state false)))
+
 (defserver app-socket
   (init [ctx]
     (let [;; This SDK actor holds application callback closures even when its
@@ -347,37 +378,58 @@
                           :auth (get ctx :auth)
                           :intents (get ctx :intents {})
                           :tap (get ctx :tap)})]
-      (ok st)))
+      (if-let [deadline (get-in ctx [:locals :app :deadline])]
+        (let [app (get-in ctx [:locals :app])
+              _ (when-not (erlang/is_function deadline 1)
+                  (throw (ex-info "Live deadline is a unary pure current-context function" {:code :live-deadline})))
+              owned (temporal/open! (:clock app))]
+          (try (ok (rearm-temporal! (assoc st :temporal owned :temporal-app app)))
+            (catch error (temporal/close! owned) (throw error))))
+        (ok st))))
 
   ;; every observed commit eventually re-projects this viewer
   (handle-info [:datom/tx _basis _datoms] [st]
-    (noreply (sock/on-commit st)))
+    (noreply (rearm-temporal! (sock/on-commit st))))
   (handle-info [:datom/changed _basis _attrs] [st]
-    (noreply (sock/on-commit st)))
+    (noreply (rearm-temporal! (sock/on-commit st))))
+
+  (handle-info [:connector.clock/changed identity] [st]
+    (noreply (if (:temporal st)
+      (assoc st :temporal (temporal/clock-changed! (:temporal st) identity (:attached? st))) st)))
+  (handle-info [:live/temporal-deadline ticket] [st]
+    (noreply (if (:temporal st)
+      (assoc st :temporal (temporal/deadline! (:temporal st) ticket (:attached? st))) st)))
+  (handle-info [:live/temporal-project ticket] [st]
+    (noreply (if (and (:attached? st) (temporal/project? (:temporal st) ticket))
+      (project-temporal! st) st)))
 
   ;; a transport died, or the grace window closed with none attached
-  (handle-info [:DOWN ref :process _pid _why] [st] (noreply (sock/detach st ref)))
+  (handle-info [:DOWN ref :process _pid _why] [st]
+    (let [after (sock/detach st ref)]
+      (noreply (if (and (:temporal after) (not (:attached? after)))
+        (assoc after :temporal (temporal/pause! (:temporal after))) after))))
   (handle-info [:live/expire] [st]
     (if (:attached? st) (noreply st) (tuple :stop :normal st)))
 
   ;; a transport for this session reconnects
   (handle-call [:live/attach sink me] [_from st]
     (let [r (sock/attach st sink me)]
-      (reply (first r) (second r))))
+      (reply (first r) (if (= :ok (first r)) (rearm-temporal! (second r)) (second r)))))
 
   ;; a browser event (click/input/navigate). It arrives as a CAST on the wire
   ;; (see ws-handle-in: the reply was never used, and a call made a slow render
   ;; fatal to the transport) and as a CALL for in-process callers and tests.
-  (handle-cast [:event ev] [st] (noreply (sock/handle-event st ev {} true)))
-  (handle-cast [:event ev data] [st] (noreply (sock/handle-event st ev data true)))
+  (handle-cast [:event ev] [st] (noreply (rearm-temporal! (sock/handle-event st ev {} true))))
+  (handle-cast [:event ev data] [st] (noreply (rearm-temporal! (sock/handle-event st ev data true))))
   ;; The fourth field is minted by the transport, never decoded from its data.
   (handle-cast [:event ev data arrival] [st]
-    (noreply (measure/with-arrival-fn arrival (fn [] (sock/handle-event st ev data true)))))
-  (handle-call [:event ev] [_from st] (reply :ok (sock/handle-event st ev)))
-  (handle-call [:event ev data] [_from st] (reply :ok (sock/handle-event st ev data)))
+    (noreply (rearm-temporal! (measure/with-arrival-fn arrival (fn [] (sock/handle-event st ev data true))))))
+  (handle-call [:event ev] [_from st] (reply :ok (rearm-temporal! (sock/handle-event st ev))))
+  (handle-call [:event ev data] [_from st] (reply :ok (rearm-temporal! (sock/handle-event st ev data))))
 
   ;; introspection for tests
-  (handle-call [:state] [_from st] (reply st st)))
+  (handle-call [:state] [_from st] (reply st st))
+  (terminate [_reason st] (temporal/close! (:temporal st))))
 
 (defn- app-socket-ctx
   "The socket context for one transport: the app's seams plus the

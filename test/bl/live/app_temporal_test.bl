@@ -1,0 +1,78 @@
+(ns live.app-temporal.test
+ (:require [live.app :as app] [live.temporal :as temporal] [connector.clock :as clock] [datom]))
+(defn- flush [] (receive _ (flush) (after 0 nil)))
+(defn- await! [f]
+ (let [until (+ (erlang/monotonic_time :millisecond) 2000)]
+  (loop [] (if-let [result (f)] result
+   (do (when (>= (erlang/monotonic_time :millisecond) until) (throw "Native temporal projection did not settle"))
+       (Process/sleep 1) (recur))))))
+(defn- fixture [c]
+ (let [conn (datom/connect [{:db/ident :temporal/allowed :db/valueType :db.type/boolean}
+                          {:db/ident :temporal/deadline :db/valueType :db.type/long}])
+       _ (datom/transact! conn [{:db/id 1 :temporal/allowed true :temporal/deadline 200}])
+       renders (atom 0)
+       application {:home "/clock" :clock c
+        :worlds (fn [me _]
+         (let [db (datom/db conn)]
+          (when (and (= "alice" me) (:temporal/allowed (datom/entity db 1))) {:clock db})))
+        :deadline (fn [ctx] (:temporal/deadline (datom/entity (get-in ctx [:worlds :clock]) 1)))
+        :routes [["/clock" (fn [ctx]
+          (swap! renders inc)
+          (let [db (get-in ctx [:worlds :clock]) due (when db (:temporal/deadline (datom/entity db 1)))]
+           [:main (cond (nil? db) "denied" (< (clock/now c) due) "open" :else "expired")]))]
+                 ["/quiet" (fn [_] [:main "quiet"])]]}
+       started (start app/app-socket {:view app/dispatch :shared conn :sink (erlang/self)
+                                     :me "alice" :locals {:app application :me "alice" :route "/clock"}})
+       pid (if (map? started) (:pid started) started)]
+  {:conn conn :pid pid :renders renders}))
+(deftest actual-app-projects-virtual-time-without-business-writes
+ (let [c (clock/virtual 100) f (fixture c) pid (:pid f) conn (:conn f)
+       basis (datom/basis-t (datom/db conn))]
+  (try
+   (flush)
+   (clock/advance! c 101)
+   (is (vector? (receive [:patch ops] ops (after 2000 nil))))
+   (is (= basis (datom/basis-t (datom/db conn))))
+   (is (nil? (:deadline (temporal/status (:temporal (call pid [:state]))))))
+   (clock/restore! c 50)
+   (is (vector? (receive [:patch ops] ops (after 2000 nil))))
+   (is (= 200 (:deadline (temporal/status (:temporal (call pid [:state]))))))
+   (let [before @(:renders f)]
+    (erlang/apply :sys :suspend (list pid 1000))
+    (try (doseq [_ (range 20)] (clock/advance! c 1))
+      (finally (erlang/apply :sys :resume (list pid 1000))))
+    (await! #(> @(:renders f) before))
+    (call pid [:state])
+    (is (= (inc before) @(:renders f))))
+   (call pid [:event [:assign :app {:deadline "forged"}]])
+   (call pid [:event [:assign :me "other"]])
+   (is (= 200 (:deadline (temporal/status (:temporal (call pid [:state]))))))
+   (datom/transact! conn [[:db/add 1 :temporal/allowed false]])
+   (is (vector? (receive [:patch ops] ops (after 2000 nil))))
+   (is (nil? (:deadline (temporal/status (:temporal (call pid [:state]))))))
+   (is (= :denied (first (call pid [:live/attach (erlang/self) "other"]))))
+   (finally (stop pid) (datom/close! conn) (flush)))
+  (is (not (Process/alive? pid)))))
+(deftest actual-app-owns-one-real-deadline-through-navigation-and-stop
+ (let [c (clock/system) f (fixture c) pid (:pid f) conn (:conn f) stop-timer (atom nil)]
+  (try
+   (flush)
+   (datom/transact! conn [[:db/add 1 :temporal/deadline (+ (clock/now c) 1000)]])
+   (is (vector? (receive [:patch ops] ops (after 2000 nil))))
+   (let [timer (get-in (call pid [:state]) [:temporal :timer])]
+    (is (some? timer))
+    (is (vector? (receive [:patch ops] ops (after 2000 nil))))
+    (is (nil? (:deadline (temporal/status (:temporal (call pid [:state]))))))
+    (is (= false (erlang/read_timer timer))))
+   (datom/transact! conn [[:db/add 1 :temporal/deadline (+ (clock/now c) 60000)]])
+   (is (vector? (receive [:patch ops] ops (after 2000 nil))))
+   (let [timer (get-in (call pid [:state]) [:temporal :timer])]
+    (call pid [:event [:navigate "/missing"]])
+    (is (= false (erlang/read_timer timer)))
+    (is (nil? (:deadline (temporal/status (:temporal (call pid [:state])))))))
+   (call pid [:event [:navigate "/clock"]])
+   (reset! stop-timer (get-in (call pid [:state]) [:temporal :timer]))
+   (is (some? @stop-timer))
+   (finally (stop pid) (datom/close! conn) (flush)))
+  (is (not (Process/alive? pid)))
+  (is (= false (erlang/read_timer @stop-timer)))))
