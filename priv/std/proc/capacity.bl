@@ -3,6 +3,7 @@
 ; second domain outbox. Reservation and queue stores have an explicit crash seam.
 (ns proc.capacity
  (:require [datom :as d] [datom.conn :as dc] [datom.store :as ds]
+           [datom.db :as db] [datom.schema :as schema] [datom.index :as index] [datom.index-coverage :as coverage] [datom.query.relation :as relation]
            [proc.queue :as q] [proc.queue-runtime :as runtime]))
 (def SCHEMA
  [{:db/ident :capacity.authority/id :db/valueType :db.type/string :db/unique :db.unique/identity}
@@ -36,6 +37,59 @@
   (when-not (and (every? some? value) (<= (erlang/byte_size (erlang/term_to_binary value)) 4096))
    (refuse :invalid-capacity-capture))
   value))
+(defn- audit-reservations! [database]
+ ;; ONE startup audit, before identity/policy mutation. Missing states cannot
+ ;; be discovered from a state index; a live writer guard preserves this fact.
+ (doseq [[eid] (d/q '[:find ?e :where [?e :capacity.reservation/key _]] database)]
+  (when-not (keyword? (:capacity.reservation/state (d/entity database eid)))
+   (refuse :capacity-reservation-state-missing))))
+(defn- state-guard [report]
+ (let [database (:db-after report) before (:db-before report)
+       affected (distinct (map index/-e
+         (filter #(contains? #{:capacity.reservation/key :capacity.reservation/state} (index/-a %))
+          (:tx-datoms report))))
+       invalid (filter (fn [eid]
+        (let [row (d/entity database eid) old (d/entity before eid)]
+         (or (and (:capacity.reservation/key row) (not (keyword? (:capacity.reservation/state row))))
+             (and (:capacity.reservation/key old)
+                  (not= (:capacity.reservation/key old) (:capacity.reservation/key row)))))) affected)]
+  (when (seq invalid) {:kind :capacity-reservation-state-or-identity})))
+(defn- index-ready! [database]
+ (when-not (and (not= :history (:filter-mode database))
+                (= :db.type/keyword (schema/value-type (:schema database) :capacity.reservation/state))
+                (not (schema/many? (:schema database) :capacity.reservation/state))
+                (coverage/complete? (db/store-of database) (:schema database)
+                  :capacity.reservation/state (db/basis-t database)))
+  (refuse :capacity-state-index-unavailable)))
+(defn- active-state-rows [database]
+ ;; Skip the EXACT released value prefix physically. Apply native basis/
+ ;; retraction filtering BEFORE hydrating any reservation entity. AVET still
+ ;; retains prior active assertions/retractions of released rows: this is not
+ ;; a claim that total substrate IO is O(current-active).
+ (index-ready! database)
+ (let [store (db/store-of database)
+       base (index/key-prefix :avet :capacity.reservation/state)
+       released (index/key-prefix :avet :capacity.reservation/state :released)
+       candidates (concat (ds/scan-datoms store base released)
+                          (ds/scan-datoms store (index/prefix-end released) (index/prefix-end base)))
+       live (db/filter-datoms database candidates)]
+  (vec (distinct (keep (fn [fact]
+   (let [eid (index/-e fact) state (index/-v fact)]
+    (when (and (not= :released state)
+               (seq (d/datoms database :eavt eid :capacity.reservation/key))) [eid state]))) live)))))
+(relation/defrelation :~proc.capacity/active-state
+ {:arity 2 :modes #{:ff :bf :fb :bb}
+  :reads #{:capacity.reservation/key :capacity.reservation/state :db/index :db/valueType :db/cardinality :db/ident}
+  :provider (fn [database _ bounds _]
+   (index-ready! database)
+   (let [rows (if-let [eid (:e bounds)]
+          ;; A bound released probe reads its state facet, never the whole entity.
+          (let [state (first (d/datoms database :eavt eid :capacity.reservation/state))]
+           (if (and state (not= :released (index/-v state))
+                     (seq (d/datoms database :eavt eid :capacity.reservation/key)))
+            [[eid (index/-v state)]] []))
+          (active-state-rows database))]
+    (if (some? (:v bounds)) (filterv #(= (:v bounds) (second %)) rows) rows)))})
 (defn attach-store!
  "Bind one explicitly owned durable Datom connection as the shared native
   admission authority. Caller owns open/stop/close and passes this SAME handle
@@ -59,6 +113,8 @@
                           (or (= old-path current-path) (= old-path (:relocate-from opts))))))
       (refuse :capacity-authority-already-bound))
      (dc/serialized! c (fn []
+      (audit-reservations! (d/db c))
+      (dc/guard! c :proc.capacity/reservation-state state-guard)
       (d/install-schema! c SCHEMA)
       (when (some #(not= id (first %)) (d/q '[:find ?id :where [_ :capacity.authority/id ?id]] (d/db c)))
        (refuse :capacity-authority-store-conflict))
@@ -102,6 +158,11 @@
 (defn- reservations [authority]
  (mapv (fn [[e]] (d/entity (d/db (:conn authority)) e))
   (d/q '[:find ?e :where [?e :capacity.reservation/key _]] (d/db (:conn authority)))))
+(defn- active-reservations [authority]
+ (let [database (d/db (:conn authority))]
+  (index-ready! database)
+  (mapv (fn [[eid _]] (d/entity database eid))
+   (d/q '[:find ?e ?state :where [(:~proc.capacity/active-state) [?e ?state]]] database))))
 (defn- reserve-row!
  "One writer-atomic aggregate obligation reservation. Captured property/provider
   identity is application-authorized data; this native API infers no quotas.
@@ -116,7 +177,7 @@
    (if-let [old (d/entity (d/db c) [:capacity.reservation/key key])]
     (do (when-not (= descriptor (:capacity.reservation/descriptor old)) (refuse :capacity-identity-conflict))
         {:status (if (= :released (:capacity.reservation/state old)) :released :existing) :reservation key})
-    (let [rows (filter #(not= :released (:capacity.reservation/state %)) (reservations authority))
+    (let [rows (active-reservations authority)
           policy (:policy authority)
           full? (or (>= (count rows) (:max-outstanding policy))
                     (some (fn [scope]
@@ -276,9 +337,21 @@
                          job (conj [:db/add (:db/id current) :capacity.reservation/job-id (:job/id job)])))
         {:status :released :durability (sync! c)})))))))
 (defn status [authority]
+ ;; Explicit FULL history API, including exact released history frequencies.
  (live! authority)
  {:states (frequencies (map :capacity.reservation/state (reservations authority)))
   :max-outstanding (get-in authority [:policy :max-outstanding])})
+(defn active-status
+ "Current counted obligations only. Unknown state keywords remain counted;
+  released entities are not hydrated. Historical active-state datoms may still
+  be traversed. Use status explicitly when full released history is wanted."
+ [authority]
+ (live! authority)
+ (index-ready! (d/db (:conn authority)))
+ (let [rows (d/q '[:find ?e ?state :where [(:~proc.capacity/active-state) [?e ?state]]]
+              (d/db (:conn authority)))]
+  {:states (frequencies (map second rows)) :outstanding (count rows)
+   :max-outstanding (get-in authority [:policy :max-outstanding])}))
 (defn repair!
  "One bounded native recovery pass over counted obligations. Terminal original
   jobs may release only through the durable fence/body-death protocol. Absent
@@ -289,8 +362,7 @@
  (when-not (and (erlang/is_integer limit) (<= 1 limit 1000)) (refuse :invalid-capacity-repair-limit))
  (let [c (:conn authority)
        cursor (:capacity.authority/repair-cursor (d/entity (d/db c) [:capacity.authority/id (:id authority)]))
-       active (sort-by #(digest (:capacity.reservation/key %))
-                (filter #(not= :released (:capacity.reservation/state %)) (reservations authority)))
+       active (sort-by #(digest (:capacity.reservation/key %)) (active-reservations authority))
        rows (take limit (concat
                   (filter #(or (nil? cursor) (> (compare (digest (:capacity.reservation/key %)) cursor) 0)) active)
                   (filter #(and cursor (<= (compare (digest (:capacity.reservation/key %)) cursor) 0)) active)))

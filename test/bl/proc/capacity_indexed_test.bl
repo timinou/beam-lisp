@@ -1,0 +1,170 @@
+; Native relation/storage crossings, not a reimplementation of admission.
+; Source-only pending qualification. Execute ONLY in the owned Veritas boundary.
+(ns proc.capacity-indexed-test
+ (:require [proc.capacity :as cap] [proc.queue :as q] [proc.queue-runtime :as runtime]
+  [datom :as d] [datom.conn :as dc] [datom.index :as index]
+  [datom.store :as ds] [datom.store-fjall :as fjall]))
+(defrecord SpyStore [inner scans])
+(extend-type SpyStore
+ datom.store/Store
+ (-get [s k] (ds/-get (:inner s) k))
+ (-range [s lo hi] (let [rows (ds/-range (:inner s) lo hi)]
+                    (swap! (:scans s) conj {:op :range :lo lo :hi hi :rows (count rows)}) rows))
+ (-put [s k v] (ds/-put (:inner s) k v) s)
+ (-delete [s k] (ds/-delete (:inner s) k) s)
+ (-update [s k f] (let [r (ds/-update (:inner s) k f)] [s (get r 1)]))
+ (-commit [s ops] (ds/-commit (:inner s) ops) s))
+(extend-protocol datom.store/Durable
+ SpyStore (-sync [s] (ds/sync! (:inner s))))
+(extend-protocol datom.store/Closeable
+ SpyStore (-close [s] (ds/close (:inner s))))
+(extend-protocol datom.store/Alive?
+ SpyStore (-alive? [s] (ds/alive? (:inner s))))
+(extend-protocol datom.store/Underlying
+ SpyStore (-underlying [s] (ds/identity-of (:inner s))))
+(extend-protocol datom.store/Scan
+ SpyStore (-scan-datoms [s lo hi]
+  (let [rows (ds/-scan-datoms (:inner s) lo hi)]
+   (swap! (:scans s) conj {:op :scan :lo lo :hi hi :rows (count rows)}) rows)))
+(defn fixture []
+ (let [inner (fjall/open (ds/fresh-path ".indexed-capacity.fjall"))
+       spy (->SpyStore inner (atom [])) c (dc/connect-with spy [])
+       qc (dc/connect-with (fjall/open (ds/fresh-path ".indexed-capacity-queue.fjall")) [])
+       id (str "test.indexed." (Base/encode16 (crypto/strong_rand_bytes 8)))
+       srv (q/scoped-server id :work)
+       _ (q/attach-store! srv qc)
+       _ (d/transact! qc [{:db/id -1 :queue/key (name srv)
+            :queue/decl (assoc (q/normalise-decl {:of :test/indexed :generation "index-v1" :unique [:work/id]}) :server (name srv))}])
+       a (cap/attach-store! id c {:max-outstanding 3 :scopes []})]
+  {:spy spy :conn c :queue qc :server srv :authority a}))
+(defn opts [id] {:enrollment-key [:original id] :generation "index-v1" :at 100000})
+(defn payload [id] {:work/id id})
+(def capture {:property "hotel:indexed" :provider :meta})
+(defn row [f result] (d/entity (d/db (:conn f)) [:capacity.reservation/key (:reservation result)]))
+(defn active-query [f]
+ (set (d/q '[:find ?e ?state :where [(:~proc.capacity/active-state) [?e ?state]]] (d/db (:conn f)))))
+(defn await! [predicate]
+ (let [until (+ (erlang/monotonic_time :millisecond) 10000)]
+  (loop [] (when-not (predicate)
+   (when (>= (erlang/monotonic_time :millisecond) until) (throw (ex-info "Native indexed fixture did not settle" {})))
+   (Process/sleep 2) (recur)))))
+(deftest many-released-history-rows-never-hydrate-on-active-admission-or-finite-repair
+ (let [f (fixture) a (:authority f) srv (:server f) c (:conn f) qc (:queue f)
+       released (atom []) started? (atom false) calls (atom 0)]
+  (try
+   ;; Every released row comes through REAL queue admission/cancellation and
+   ;; the native durable release fence, not fabricated released authority facts.
+   (doseq [i (range 100)]
+    (let [answer (cap/enroll! a srv (payload i) (opts i) capture) job (:job answer)
+          key (get-in job [:job/capacity :reservation])]
+     (is (= :admitted (:status answer)))
+     (q/cancel! srv (:db/id job))
+     (is (= :released (:status (cap/release! a srv (:enrollment-key (opts i))))))
+     (swap! released conj (:db/id (d/entity (d/db c) [:capacity.reservation/key key])))))
+   (let [orphan (cap/reserve! a srv (payload "orphan") (opts "orphan") capture)
+         enrolled (cap/enroll! a srv (payload "queued") (opts "queued") capture)
+         unusual (cap/reserve! a srv (payload "unusual") (opts "unusual") capture)
+         orphan-e (:db/id (row f orphan))
+         enrolled-e (:db/id (d/entity (d/db c) [:capacity.reservation/key (get-in enrolled [:job :job/capacity :reservation])]))
+         unusual-e (:db/id (row f unusual))]
+    ;; All legal keyword encodings on BOTH sides of the released prefix remain
+    ;; counted; namespace/lexical lookalikes must never be silently dropped.
+    (doseq [state [:a :a/z :released-other :released/x :x/released :zzzz]]
+     (d/transact! c [[:db/add unusual-e :capacity.reservation/state state]])
+     (is (= (set [[orphan-e :reserved] [enrolled-e :enrolled] [unusual-e state]]) (active-query f)))
+     (is (= 3 (:outstanding (cap/active-status a)))))
+    (reset! (:scans (:spy f)) [])
+    ;; A genuine relevant commit invalidates the native relation cache, so the
+    ;; storage assertions witness actual range reads rather than cached tuples.
+    (d/transact! c [[:db/add unusual-e :capacity.reservation/state :zzzz/hot]])
+    (is (= (set [[orphan-e :reserved] [enrolled-e :enrolled] [unusual-e :zzzz/hot]]) (active-query f)))
+    (is (= #{[:reserved]} (set (d/q '[:find ?state :in $ ?e :where [(:~proc.capacity/active-state) [?e ?state]]]
+                               (d/db c) orphan-e))))
+    (is (= (set [[unusual-e]]) (set (d/q '[:find ?e :in $ ?state :where [(:~proc.capacity/active-state) [?e ?state]]]
+                                  (d/db c) :zzzz/hot))))
+    (is (= #{} (set (d/q '[:find ?e :in $ ?state :where [(:~proc.capacity/active-state) [?e ?state]]]
+                         (d/db c) :released))))
+    (is (= {:states {:reserved 1 :enrolled 1 :zzzz/hot 1} :outstanding 3 :max-outstanding 3} (cap/active-status a)))
+    (is (= :deferred (:status (cap/reserve! a srv (payload "full") (opts "full") capture))))
+    (doseq [_ (range 4)] (is (= 1 (:examined (cap/repair! a 1)))))
+    (let [crossings @(:scans (:spy f))
+          released-prefixes (set (map #(index/key-prefix :eavt %) @released))
+          state-base (index/key-prefix :avet :capacity.reservation/state)
+          released-value (index/key-prefix :avet :capacity.reservation/state :released)]
+     (is (not-any? #(contains? released-prefixes (:lo %)) crossings)
+         "No released ENTITY hydration, rather than hydration followed by filtering")
+     (is (not-any? #(contains? #{(index/key-prefix :aevt :capacity.reservation/key)
+                               (index/key-prefix :avet :capacity.reservation/key)} (:lo %)) crossings)
+         "No full reservation-key column scan in native active paths")
+     (is (some #(and (= state-base (:lo %)) (= released-value (:hi %))) crossings)
+         "The native computed relation executes the real lower AVET range")
+     (is (some #(and (= (index/prefix-end released-value) (:lo %))
+                    (= (index/prefix-end state-base) (:hi %))) crossings)
+         "The real upper AVET range skips the exact released value prefix")
+     (is (> (reduce + 0 (map :rows (filter #(= state-base (:lo %)) crossings))) 3)
+         "Residual historical active-state datoms are actually traversed; no O(active) IO claim"))
+    (is (= {:released 100 :reserved 1 :enrolled 1 :zzzz/hot 1} (:states (cap/status a)))
+        "The explicit full-history API remains exact")
+    (let [before (d/entity (d/db c) unusual-e) basis (d/basis-t (d/db c))]
+     (is (try (d/transact! c [[:db/retract unusual-e :capacity.reservation/state :zzzz/hot]]) false (catch _ true)))
+     (is (= basis (d/basis-t (d/db c))))
+     (is (= before (d/entity (d/db c) unusual-e)))
+     (is (try (d/transact! c [[:db/retract unusual-e :capacity.reservation/state :zzzz/hot]
+                             [:db/retract unusual-e :capacity.reservation/key (:capacity.reservation/key before)]]) false (catch _ true)))
+     (is (= basis (d/basis-t (d/db c))))
+     (is (= before (d/entity (d/db c) unusual-e))))
+    ;; A real completed body returns an original native result. Replay/final
+    ;; bind after release preserves it without re-running that body.
+    (q/cancel! srv (get-in enrolled [:job :db/id]))
+    (cap/release! a srv (:enrollment-key (opts "queued")))
+    (let [handler (runtime/prepare srv {:declaration {:of :test/indexed :generation "index-v1" :unique [:work/id] :concurrency 1 :max-live-workers 1}
+                    :clock (fn [] 1000) :perform (fn [job] (cap/authorize! a job) (swap! calls inc) {:native-original-receipt true})})
+          o (assoc (opts "receipt") :at 1000)]
+     (runtime/start! handler {}) (reset! started? true)
+     (let [answer (cap/enroll! a srv (payload "receipt") o capture) job (:job answer)]
+      (await! #(and (= :done (:job/state (d/entity (d/db qc) (:db/id job))))
+                    (= {:status :known :live 0} (runtime/body-status srv (:job/id job)))))
+      (cap/repair! a 3)
+      (let [before-job (d/entity (d/db qc) (:db/id job))
+            before-reservation (d/entity (d/db c) [:capacity.reservation/key (get-in job [:job/capacity :reservation])])
+            replay (cap/enroll! a srv (payload "receipt") o capture)]
+       (is (= :released (:capacity.reservation/state before-reservation)))
+       (is (= {:native-original-receipt true} (:job/result before-job)))
+       (is (= before-job (d/entity (d/db qc) (:db/id job))))
+       (is (= before-reservation (d/entity (d/db c) (:db/id before-reservation))))
+       (is (= (:job/result before-job) (get-in replay [:job :job/result])))
+       (is (= 1 @calls))))))
+   (finally
+    (when @started? (runtime/stop! srv {:workers :stop}))
+    (dc/close! qc) (dc/close! c)))))
+(deftest missing-state-at-attach-refuses-before-authority-or-policy-mutation
+ (let [c (dc/connect-with (fjall/open (ds/fresh-path ".indexed-invalid.fjall")) cap/SCHEMA)
+       id (str "test.invalid." (Base/encode16 (crypto/strong_rand_bytes 8)))]
+  (try
+   (d/transact! c [{:db/id -1 :capacity.reservation/key [:original "missing"]
+                   :capacity.reservation/descriptor {:capture capture}}])
+   (let [basis (d/basis-t (d/db c)) before (d/entity (d/db c) [:capacity.reservation/key [:original "missing"]])]
+    (is (= :capacity-reservation-state-missing
+           (try (cap/attach-store! id c {:max-outstanding 1 :scopes []}) nil (catch e (:kind (ex-data e))))))
+    (is (= basis (d/basis-t (d/db c))))
+    (is (= before (d/entity (d/db c) (:db/id before))))
+    (is (nil? (d/entity (d/db c) [:capacity.authority/id id]))))
+   (finally (dc/close! c)))))
+
+(deftest unavailable-state-index-cannot-silently-admit-on-an-empty-result
+ (let [f (fixture) c (:conn f) a (:authority f) srv (:server f)]
+  (try
+   (cap/reserve! a srv (payload "before-index-change") (opts "before-index-change") capture)
+   (is (= 1 (:outstanding (cap/active-status a))))
+   (d/install-schema! c [{:db/ident :capacity.reservation/state :db/valueType :db.type/keyword :db/index false}])
+   (let [basis (d/basis-t (d/db c))]
+    (is (= :capacity-state-index-unavailable
+           (try (cap/active-status a) nil (catch e (:kind (ex-data e))))))
+    (is (= :capacity-state-index-unavailable
+           (try (cap/reserve! a srv (payload "not-admitted") (opts "not-admitted") capture) nil
+                (catch e (:kind (ex-data e))))))
+    (is (= basis (d/basis-t (d/db c))))
+    (is (nil? (d/entity (d/db c) [:capacity.reservation/key [(:id a) (q/server-name srv) (:enrollment-key (opts "not-admitted"))]]))))
+   (d/install-schema! c cap/SCHEMA)
+   (is (= 1 (:outstanding (cap/active-status a))))
+   (finally (dc/close! (:queue f)) (dc/close! c)))))
