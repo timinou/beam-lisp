@@ -1013,6 +1013,91 @@
 
 ; ── emission ────────────────────────────────────────────────────────────────
 
+(defn- sdk_callable_arm [definition local?]
+ (let [function (elem definition 2) provider (elem definition 4)
+       arity (erlang/length (Map/get (elem definition 3) :params))]
+  (if-not local?
+   (BeamLisp.Emit/remote :erlang :make_fun
+    (Enum/map (list provider function arity) (fn [value] (BeamLisp.Emit/lit value))))
+   (let [names (if (= 0 arity) (list)
+                 (Enum/map (Enum/to_list (Range/new 0 (dec arity)))
+                  (fn [index] (erlang/iolist_to_binary (list "$sdk_arg" (Integer/to_string index))))))]
+    {:op :fn :clauses (list {:pats (Enum/map names (fn [name] {:pop :pvar :name name}))
+                            :guard nil :body (BeamLisp.Emit/remote provider function
+                                              (Enum/map names (fn [name] {:op :var :name name :ann {}})))}) :ann {}}))))
+(defn- sdk_callable_value [definitions local?]
+ (let [fixed (Enum/filter definitions (fn [definition] (= :fixed (elem definition 0))))
+       variadic (Enum/find definitions (fn [definition] (= :variadic (elem definition 0))))]
+  (if (and (= 1 (erlang/length fixed)) (nil? variadic)) (sdk_callable_arm (first fixed) local?)
+   {:op :tuple :elems (list (BeamLisp.Emit/lit :$blfn)
+      {:op :map :pairs (Enum/map fixed
+        (fn [definition] (list (BeamLisp.Emit/lit (elem definition 1)) (sdk_callable_arm definition local?)))) :ann {}}
+      (if variadic {:op :tuple :elems (list (BeamLisp.Emit/lit (elem variadic 1)) (sdk_callable_arm variadic local?)) :ann {}}
+        (BeamLisp.Emit/lit nil))) :ann {}})))
+(defn- sdk_callable_factory [ns ns_defs declarations]
+ ;; Compiler-emitted, zero-effect callable construction. Its exported factory
+ ;; is intentionally NOT a public declaration route. Checked private values
+ ;; use genuine local bridges. Public and recovery/unknown representations keep
+ ;; external issuer ABI; an unknown descriptor NEVER grants public target access.
+ (BeamLisp.Emit/function_clause :__bl_callable_values__
+  {:op :map :pairs (Enum/map ns_defs
+    (fn [binding]
+     (let [name (elem binding 0) kind (Map/get (Map/get declarations ns {}) name)]
+      (list (BeamLisp.Emit/lit name) (sdk_callable_value (elem binding 1) (and kind (not= :public kind))))))) :ann {}}))
+(defn- sdk_callable_arm_matches? [value definition shim]
+ ;; Match the actual previous checked link, never just a function/name prefix.
+ (and (erlang/is_function value)
+      (= :external (elem (erlang/fun_info value :type) 1))
+      (= (elem definition 2) (elem (erlang/fun_info value :name) 1))
+      (= (erlang/length (Map/get (elem definition 3) :params))
+         (elem (erlang/fun_info value :arity) 1))
+      (or (= shim (elem (erlang/fun_info value :module) 1))
+          (= (elem definition 4) (elem (erlang/fun_info value :module) 1)))))
+
+(defn- sdk_callable_matches? [value definitions shim]
+ (let [fixed (Enum/filter definitions (fn [definition] (= :fixed (elem definition 0))))
+       variadic (Enum/find definitions (fn [definition] (= :variadic (elem definition 0))))]
+  (if (and (= 1 (erlang/length fixed)) (nil? variadic))
+   (sdk_callable_arm_matches? value (first fixed) shim)
+   (and (erlang/is_tuple value) (= 3 (erlang/tuple_size value)) (= :$blfn (elem value 0))
+        (erlang/is_map (elem value 1))
+        (= (erlang/map_size (elem value 1)) (erlang/map_size (Map/new (Enum/map fixed (fn [d] (tuple (elem d 1) true))))))
+        (Enum/all? fixed (fn [d] (sdk_callable_arm_matches? (Map/get (elem value 1) (elem d 1)) d shim)))
+        (if variadic
+         (let [rest (elem value 2)]
+          (and (erlang/is_tuple rest) (= 2 (erlang/tuple_size rest)) (= (elem variadic 1) (elem rest 0))
+               (sdk_callable_arm_matches? (elem rest 1) variadic shim)))
+         (nil? (elem value 2)))))))
+
+(defn- sdk_callable_rebindings [ns definitions declarations]
+ ;; Final non-callable/value/macro overwrites and arbitrary callable def state
+ ;; survive. Only actual prior linked function values are normalized. Missing
+ ;; recovery descriptors affect representation only, never target authority.
+ (let [shim (BeamLisp.Emit/module_for ns) kinds (Map/get declarations ns {})]
+  (Enum/reduce definitions {}
+   (fn [binding output]
+    (let [name (elem binding 0) kind (Map/get kinds name)
+          current (BeamLisp.Env/lookup (tuple ns name))]
+     (if (and (or (nil? kind) (contains? #{:public :private} kind))
+              (erlang/is_tuple current) (= :ok (elem current 0))
+              (sdk_callable_matches? (elem current 1) (elem binding 1) shim))
+      (Map/put output name current) output))))))
+
+(defn- materialize_unit_callables! [ns shim previous]
+ ;; Native compiler/install path only. Do not replay initializers, change
+ ;; readiness, adopt stale references, or overwrite an unrelated current value.
+ (when (> (erlang/map_size previous) 0)
+  (let [definitions (erlang/apply shim :__bl_ns_defs__ (list))
+        values (erlang/apply (ns_body_module ns) :__bl_callable_values__ (list))]
+   (when-not (and (erlang/is_map values) (= (erlang/map_size definitions) (erlang/map_size values))
+                  (<= (erlang/map_size values) 8192))
+    (erlang/error :invalid_emitted_callable_values))
+   (Enum/each previous
+    (fn [binding]
+     (let [name (elem binding 0) expected (elem binding 1)]
+      (when (= expected (BeamLisp.Env/lookup (tuple ns name)))
+       (BeamLisp.Env/intern ns name (Map/fetch! values name)))))))) :ok)
+
 (defn- emit_module
   "Emit a namespace as the SAME shim/body split the runtime uses, so an
    AOT-loaded namespace is byte-for-byte the source-loaded one. Returns every
@@ -1026,7 +1111,9 @@
   [ns value_defs ns_meta output_dir file unit_names input_digest declarations]
   (let [mod (BeamLisp.Emit/module_for ns)
         filename (or file (erlang/iolist_to_binary (list "beam_lisp_aot/" ns ".bl")))
-        ns_defs (stabilise_body_modules ns (unit_defs ns unit_names))
+        raw_defs (unit_defs ns unit_names)
+        previous (sdk_callable_rebindings ns raw_defs declarations)
+        ns_defs (stabilise_body_modules ns raw_defs)
         source_hash (if file (ns_closure_hash ns file) nil)
         stamp_key (BeamLisp.AOTCache/key_for_ns ns)
         unit_attrs (list (tuple :bl_source_hash source_hash) (tuple :bl_compiler_key stamp_key)
@@ -1076,7 +1163,10 @@
           {:file filename})
         body_descriptors
         (Enum/map (BeamLisp.Emit/body_modules ns_defs)
-          (fn [pair] (BeamLisp.Emit/descriptor_for (elem pair 0) (elem pair 1)
+          (fn [pair] (BeamLisp.Emit/descriptor_for (elem pair 0)
+                       (if (= (elem pair 0) (ns_body_module ns))
+                        (erlang/++ (elem pair 1) (list (sdk_callable_factory ns ns_defs declarations)))
+                        (elem pair 1))
                        (erlang/++ unit_attrs (list (tuple :bl_aot_artifact_role :stable-body)))
                        {:file filename})))
         companion_descriptor
@@ -1109,6 +1199,7 @@
       ;; Metadata names the table the loaded shim actually executes, including
       ;; stabilized AOT body identities, before readers may obtain evidence.
       (BeamLisp.Env/link_ns_defs ns mod)
+      (materialize_unit_callables! ns mod previous)
       written)))
 
 (defn- write_beam
@@ -2357,9 +2448,9 @@
                   (list
                     (BeamLisp.Emit/remote :Elixir.BeamLisp.Env :intern
                       (list (BeamLisp.Emit/lit ns) (BeamLisp.Emit/lit name)
-                            (BeamLisp.Emit/remote :Elixir.BeamLisp.Emit :fn_value
-                              (Enum/map (list mod fixed variadic)
-                                        (fn [v] (BeamLisp.Emit/lit v))))))
+                            (BeamLisp.Emit/remote :maps :get
+                              (list (BeamLisp.Emit/lit name)
+                                    {:op :var :name "$sdk_callables" :ann {}}))))
                     (BeamLisp.Emit/remote :Elixir.BeamLisp.Env :put_link
                       (Enum/map (list ns name (tuple mod (Map/new fixed) variadic))
                                 (fn [v] (BeamLisp.Emit/lit v)))))
@@ -2433,7 +2524,14 @@
                    (list (BeamLisp.Emit/remote :Elixir.BeamLisp.Env :mark_loaded
                            (list (BeamLisp.Emit/lit ns)))
                          (BeamLisp.Emit/lit :ok))))))]
-    (tuple (BeamLisp.Emit/function_clause :__bl_init__ body) companion_descriptor generated_beams)))
+    (tuple (BeamLisp.Emit/function_clause :__bl_init__
+             (if (= 0 (erlang/map_size ns_defs)) body
+              (BeamLisp.Emit/sequence
+               (list (BeamLisp.Emit/remote :Elixir.BeamLisp.Loader :assert_initializer_execution_allowed!
+                      (list (BeamLisp.Emit/lit ns)))
+                 {:op :let :name "$sdk_callables"
+                  :init (BeamLisp.Emit/remote (ns_body_module ns) :__bl_callable_values__ (list))
+                  :body body :ann {}})))) companion_descriptor generated_beams)))
 
 ; ── the runtime-side hook and boot ──────────────────────────────────────────
 
@@ -4271,6 +4369,15 @@
                                (erlang/== (crypto/hash :sha256 content)
                                            (normalized_attribute attrs :bl_unit_source_digest)))
                   (erlang/error :sdk_stage_cached_source_changed))
+                ;; A current-key cached stable body must carry the common
+                ;; pure factory before any bytes are published. Missing factory
+                ;; is a cache miss followed by real compile-only production.
+                (when (erlang/== mod (ns_body_module ns))
+                  (let [export-chunks (beam_lib/chunks bytes (list :exports))]
+                    (when-not (and (erlang/== :ok (elem export-chunks 0))
+                                   (Enum/member? (Keyword/get (elem (elem export-chunks 1) 1) :exports)
+                                                 (tuple :__bl_callable_values__ 0)))
+                      (erlang/error :sdk_stage_cached_callable_factory_missing))))
                 (let [definitions (sdk_stage_literal_definitions! mod bytes)]
                   (when (erlang/== mod shim)
                     (when-not (and definitions
@@ -4301,7 +4408,7 @@
                      (erlang/== closure (ns_closure_hash ns)))
         (erlang/error :sdk_stage_cached_closure_changed))
       {:beams captured :entries entries :requested (Map/get indexed requested)
-       :content content :key key :closure closure})
+       :content content :key key :closure closure :declarations (Map/get row :declarations)})
     (catch _error nil)))
 
 (defn- restore_sdk_staged_unit! [ns source prepared]
@@ -4326,8 +4433,11 @@
                               (when-not (and (erlang/== (:key prepared) (BeamLisp.AOTCache/key_for_ns ns))
                                              (erlang/== (:closure prepared) (ns_closure_hash ns)))
                                 (erlang/error :sdk_stage_cached_closure_changed))
-                              (BeamLisp.Env/publish_binaries! (:beams prepared) source)
-                              (BeamLisp.Env/link_ns_defs ns (BeamLisp.Emit/module_for ns))
+                              (let [previous (sdk_callable_rebindings ns (BeamLisp.Env/ns_defs ns)
+                                               {ns (elem (:declarations prepared) 2)})]
+                                (BeamLisp.Env/publish_binaries! (:beams prepared) source)
+                                (BeamLisp.Env/link_ns_defs ns (BeamLisp.Emit/module_for ns))
+                                (materialize_unit_callables! ns (BeamLisp.Emit/module_for ns) previous))
                               (publish_sdk_emission_entries! (:entries prepared))))))]
               (when (erlang/== :retired result) (erlang/error :scope_retired)))
             (:requested prepared)

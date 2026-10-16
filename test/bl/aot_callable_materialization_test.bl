@@ -1,0 +1,171 @@
+(ns aot-callable-materialization-test (:require [reload.generation :as g]))
+
+(defn- original [action]
+ (try (action) nil
+  (catch error
+   (if (and (erlang/is_map error) (maps/is_key :original error))
+    (maps/get :original error) error))))
+(defn- function-module [value] (elem (erlang/fun_info value :module) 1))
+(defn- fixture [action]
+ (let [namespace (str "callable.materialized" (erlang/unique_integer (list :positive)))
+       root (str (System/get_env "HOME") "/tmp/" namespace)
+       source (str "(ns " namespace ")
+                    (def initialization-sentinel
+                      (Process/put :callable-materialization-initializations
+                        (inc (Process/get :callable-materialization-initializations 0))))
+                    (defn public-one [x] (+ x 1))
+                    (def remembered-public public-one)
+                    (defn- private-one [x] (+ x 2))
+                    (defn- private-many ([x] x) ([x y] (+ x y)))
+                    (defn- private-rest [x & more] [x (count more)])
+                    (defn- private-guarded ([x] :when (number? x) (+ x 3)) ([_] :other))
+                    (defn callback-factory [] private-one)
+                    (defn internal-map [xs] (into [] (map private-one xs)))
+                    (defn overwritten [] :old)
+                    (def overwritten 7)
+                    (defn callable-state [] :old)
+                    (def callable-state (fn [] :state))
+                    (defn private-state [] :old)
+                    (def ^:private private-state (fn [] :private-state))
+                    (defn macro-state [] :old)
+                    (defmacro macro-state [] nil)")
+       file (str root "/fixture.bl") out (str root "/ebin")
+       view (BeamLisp.Env/fork :global) modules (atom (list))]
+  (File/mkdir_p! root) (File/write! file source)
+  (Process/delete :callable-materialization-initializations)
+  (try
+   (let [beams (BeamLisp.Env/with_env view
+                (fn [] (BeamLisp.AOT/compile_source source
+                         (list (tuple :file file) (tuple :output_dir out) (tuple :mark_loaded? true)))))
+         _ (reset! modules (Enum/map beams #(elem % 0)))
+         shim (BeamLisp.Emit/module_for namespace)
+         definitions (erlang/apply shim :__bl_ns_defs__ (list))
+         provider (elem (first (Map/fetch! definitions "public-one")) 4)]
+    (action {:namespace namespace :view view :shim shim :provider provider :definitions definitions}))
+   (finally
+    (BeamLisp.Env/destroy view)
+    (when (seq @modules) (BeamLisp.Env/retire_modules! @modules))
+    (Process/delete :callable-materialization-initializations)
+    (File/rm_rf! root)))))
+
+(deftest normal-producer-materializes-checked-providers-without-replaying-state
+ (fixture
+  (fn [f]
+   (BeamLisp.Env/with_env (:view f)
+    (fn []
+     (let [ns (:namespace f) provider (:provider f)
+           public (BeamLisp.Env/fetch_exact! ns "public-one")
+           private (BeamLisp.Env/fetch_exact! ns "private-one")
+           guarded (BeamLisp.Env/fetch_exact! ns "private-guarded")
+           old (BeamLisp.Env/fetch_exact! ns "remembered-public")]
+      (is (= 1 (Process/get :callable-materialization-initializations)))
+      (is (= :external (elem (erlang/fun_info public :type) 1)))
+      (is (= provider (function-module public)))
+      (is (= :public-one (elem (erlang/fun_info public :name) 1)))
+      (is (= 1 (elem (erlang/fun_info public :arity) 1)))
+      (is (= 5 (public 4)))
+      (is (= :local (elem (erlang/fun_info private :type) 1)))
+      (is (= provider (function-module private)))
+      (is (= 6 (private 4)))
+      (is (= [3 4] ((BeamLisp.Env/fetch_exact! ns "internal-map") [1 2])))
+      (let [factory (BeamLisp.Env/fetch_exact! ns "callback-factory")]
+       (is (identical? private (factory)))
+       (is (identical? (factory) (factory))))
+      ;; Duplicate fixed clauses retain the original one-entry $blfn shape.
+      (is (= :$blfn (elem guarded 0)))
+      (is (= 7 (guarded 4)))
+      (is (= :other (guarded :not-number)))
+      (let [many (BeamLisp.Env/fetch_exact! ns "private-many")
+            rest (BeamLisp.Env/fetch_exact! ns "private-rest")]
+       (is (= 4 (many 4)))
+       (is (= 9 (many 4 5)))
+       (is (= [4 0] (rest 4)))
+       (is (= [4 2] (rest 4 5 6)))
+       (doseq [arm (vals (elem many 1))]
+        (is (= provider (function-module arm)))
+        (is (= :local (elem (erlang/fun_info arm :type) 1)))))
+      (is (= 7 (BeamLisp.Env/fetch_exact! ns "overwritten")))
+      (is (= :state ((BeamLisp.Env/fetch_exact! ns "callable-state"))))
+      (is (= :private-state ((BeamLisp.Env/fetch_exact! ns "private-state"))))
+      (is (= :$macro (elem (BeamLisp.Env/fetch_exact! ns "macro-state") 0)))
+      ;; An existing reference is neither rewritten nor silently adopted.
+      (is (= (:shim f) (function-module old)))
+      (is (not (identical? public old)))
+      (is (not (BeamLisp.Env/sdk_runtime_retained_modules? (list (function-module old)))))
+      (is (= 5 (old 4)))
+      (is (= 1 (Process/get :callable-materialization-initializations)))))))))
+
+(deftest initializer-uses-the-same-stable-callable-factory-in-a-fresh-scope
+ (fixture
+  (fn [f]
+   (let [view (BeamLisp.Env/fork :global)]
+    (try
+     (BeamLisp.Env/with_env view
+      (fn []
+       (is (= :error (BeamLisp.Env/lookup (tuple (:namespace f) "public-one"))))
+       (erlang/apply (:shim f) :__bl_init__ (list))
+       (let [public (BeamLisp.Env/fetch_exact! (:namespace f) "public-one")
+             private (BeamLisp.Env/fetch_exact! (:namespace f) "private-one")]
+        (is (= (:provider f) (function-module public)))
+        (is (= (:provider f) (function-module private)))
+        (is (= :external (elem (erlang/fun_info public :type) 1)))
+        (is (= :local (elem (erlang/fun_info private :type) 1)))
+        (is (= 5 (public 4)))
+        (is (= 6 (private 4)))
+        (is (= 7 (BeamLisp.Env/fetch_exact! (:namespace f) "overwritten")))
+        (is (= :state ((BeamLisp.Env/fetch_exact! (:namespace f) "callable-state"))))
+        (is (= :$macro (elem (BeamLisp.Env/fetch_exact! (:namespace f) "macro-state") 0)))
+        (is (= 2 (Process/get :callable-materialization-initializations))))))
+     (finally (BeamLisp.Env/destroy view)))))))
+
+(deftest compile-only-production-constructs-no-value-initializers
+ (let [namespace (str "callable.staged" (erlang/unique_integer (list :positive)))
+       root (str (System/get_env "HOME") "/tmp/" namespace)
+       source (str "(ns " namespace ") "
+                   "(def sentinel (Process/put :callable-staged-initializations :ran)) "
+                   "(defn answer [] 42)")
+       modules (atom (list)) view (BeamLisp.Env/fork :global)]
+  (File/mkdir_p! root) (Process/delete :callable-staged-initializations)
+  (try
+   (BeamLisp.Env/with_env view
+    (fn []
+     (let [beams (BeamLisp.AOT/compile_source source
+                  (list (tuple :output_dir root) (tuple :stage-sdk? true)))
+           _ (reset! modules (Enum/map beams #(elem % 0)))
+           shim (BeamLisp.Emit/module_for namespace)]
+      (is (seq beams))
+      (is (= nil (Process/get :callable-staged-initializations)))
+      (is (= :error (BeamLisp.Env/lookup (tuple namespace "sentinel"))))
+      (is (= :error (BeamLisp.Env/lookup (tuple namespace "answer"))))
+      (is (= false (BeamLisp.Env/loaded_ns? namespace)))
+      (erlang/apply shim :__bl_init__ (list))
+      (is (= :ran (Process/get :callable-staged-initializations)))
+      (let [value (BeamLisp.Env/fetch_exact! namespace "answer")
+            definition (first (Map/fetch! (erlang/apply shim :__bl_ns_defs__ (list)) "answer"))]
+       (is (= (elem definition 4) (function-module value)))
+       (is (= :external (elem (erlang/fun_info value :type) 1)))
+       (is (= 42 (value)))))))
+   (finally
+    (BeamLisp.Env/destroy view)
+    (when (seq @modules) (BeamLisp.Env/retire_modules! @modules))
+    (Process/delete :callable-staged-initializations)
+    (File/rm_rf! root)))))
+
+(deftest managed-source-cannot-call-the-compiler-callable-factory
+ (is (map? (g/plan {:sources {"callable.allowed" "(ns callable.allowed) (defn run [] (erlang/apply :erlang :abs (list -1)))"}
+                   :native-modules #{"erlang"}})))
+ (doseq [body ["(BeamLisp.Ns.Body.Core/__bl_callable_values__)"
+              "(erlang/apply :Elixir.BeamLisp.Ns.Body.Core :__bl_callable_values__ (list))"]]
+  (is (= :dynamic-code-dependency
+         (try
+          (g/plan {:sources {"callable.extractor" (str "(ns callable.extractor) (defn run [] " body ")")}
+                   :native-modules #{"BeamLisp.Ns.Body.Core"}})
+          nil
+          (catch error (:kind (ex-data error))))))))
+
+(deftest an-unattested-evaluator-callback-is-refused-before-sdk-adoption
+ ;; This checks the existing native admission seam, not a Source sandbox.
+ ;; Its exact refusal must survive the materialization change. The callable is
+ ;; real compiler output from this ordinary test namespace, not fabricated code.
+ (is (= :unattested_sdk_callback
+        (original #(BeamLisp.AOT/sdk_callable_evidence! (fn [] :not-sdk))))))
