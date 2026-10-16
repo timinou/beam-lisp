@@ -1,0 +1,84 @@
+(ns proc.capacity-test
+ (:require [proc.capacity :as cap] [proc.queue :as q] [datom :as d]
+           [datom.conn :as dc] [datom.store-fjall :as fjall] [datom.store :as ds]))
+(def POLICY {:max-outstanding 2 :scopes [{:keys [:property :provider] :max 1}]})
+(defn fixture []
+ (let [suffix (String/downcase (Base/encode16 (crypto/strong_rand_bytes 8)))
+       path (ds/fresh-path ".shared-capacity.fjall") c (dc/connect-with (fjall/open path) [])
+       id (str "test.shared." suffix)
+       queues (mapv (fn [family]
+        (let [conn (dc/connect-with (fjall/open (ds/fresh-path ".capacity-engine.fjall")) [])
+              server (q/scoped-server (str id "." family) :work)]
+         (q/attach-store! server conn)
+         (d/transact! conn [{:db/id -1 :queue/key (name server)
+           :queue/decl (assoc (q/normalise-decl {:of :test/shared :unique [:work/id]}) :server (name server))}])
+         {:server server :conn conn})) ["send" "media" "admin"])]
+  {:authority (cap/attach-store! id c POLICY) :conn c :path path :id id :queues queues}))
+(defn opts [id] {:enrollment-key [:original id] :at 100000})
+(defn capture [property provider] {:property property :provider provider})
+(defn payload [id] {:work/id id})
+(defn cleanup! [f holder]
+ (doseq [queue (:queues f)] (dc/close! (:conn queue)))
+ (when @holder (dc/close! @holder)))
+(deftest independent-send-and-media-journals-share-one-atomic-provider-budget
+ (let [f (fixture) holder (atom (:conn f)) a (:authority f)]
+  (try
+   (let [tasks (mapv (fn [index]
+                 (Task/async #(cap/enroll! a (:server (nth (:queues f) index))
+                         (payload index) (opts index) (capture "hotel:a" :meta)))) [0 1])
+         results (mapv #(Task/await % 30000) tasks)
+         admitted (first (filter #(contains? #{:admitted :existing} (:status %)) results))
+         job (:job admitted) server (keyword (:job/server job))]
+    (is (= 1 (count (filter #(= :admitted (:status %)) results))))
+    (is (= 1 (count (filter #(= :deferred (:status %)) results))))
+    (is (= {:enrolled 1} (:states (cap/status a))))
+    (is (= :admitted (:status (cap/enroll! a (:server (nth (:queues f) 2))
+       (payload "pms") (opts "pms") (capture "hotel:b" :pms)))))
+    (is (= :deferred (:status (cap/enroll! a (:server (nth (:queues f) 2))
+       (payload "third") (opts "third") (capture "hotel:c" :email)))))
+    (q/cancel! server (:db/id job))
+    (is (= :released (:status (cap/release! a server (:enrollment-key (opts (get-in job [:job/payload :work/id])))))))
+    (is (= :not-retryable
+         (try (q/retry! server (:db/id job)) nil (catch e (:kind (ex-data e))))))
+    (is (= :admitted (:status (cap/enroll! a (:server (nth (:queues f) 1))
+       (payload "next") (opts "next") (capture "hotel:a" :meta))))))
+   (finally (cleanup! f holder)))))
+(deftest reservation-before-enrollment-survives-reopen-and-explicit-orphan-fence
+ (let [f (fixture) holder (atom (:conn f)) queue (first (:queues f))
+       a (:authority f) p (payload "original") o (opts "original") scope (capture "hotel:a" :meta)]
+  (try
+   (is (= :reserved (:status (cap/reserve! a (:server queue) p o scope))))
+   (is (= :deferred (:status (cap/enroll! a (:server (second (:queues f)))
+          (payload "other") (opts "other") scope))))
+   (dc/close! @holder) (reset! holder nil)
+   (let [c (dc/connect-with (fjall/open (:path f)) [])
+         _ (reset! holder c) reopened (cap/attach-store! (:id f) c POLICY)
+         result (cap/enroll! reopened (:server queue) p o scope)]
+    (is (= :admitted (:status result)))
+    (is (= :existing (:status (cap/enroll! reopened (:server queue) p o scope))))
+    (is (= 100000 (:job/at (:job result))))
+    (is (= {:enrolled 1} (:states (cap/status reopened))))
+    (is (= :capacity-identity-conflict
+           (try (cap/reserve! reopened (:server queue) (assoc p :changed true) o scope) nil
+                (catch e (:kind (ex-data e))))))
+    (let [orphan (opts "orphan") other-scope (capture "hotel:b" :meta)]
+     (is (= :reserved (:status (cap/reserve! reopened (:server queue) (payload "orphan") orphan other-scope))))
+     (is (= :released (:status (cap/release! reopened (:server queue) (:enrollment-key orphan)))))
+     (is (= :enrollment-fenced
+           (try (q/enqueue! (:server queue) (payload "orphan") orphan) nil
+                (catch e (:kind (ex-data e))))))))
+   (finally (cleanup! f holder)))))
+(deftest held-uncertain-effects-never-free-an-aggregate-provider-slot
+ (let [f (fixture) holder (atom (:conn f)) a (:authority f) queue (first (:queues f))]
+  (try
+   (let [result (cap/enroll! a (:server queue) (payload "unknown") (opts "unknown") (capture "hotel:a" :meta))
+         job (:job result) claimed (q/claim! (:conn queue) job (erlang/system_time :millisecond) 60000)]
+    (q/begin-effect! (:server queue) claimed :provider)
+    (q/record-effect! (:server queue) claimed :provider :uncertain {:outcome :unknown})
+    (d/transact! (:conn queue) [[:db/cas (:db/id job) :job/state :running :held]])
+    (is (= :outstanding-obligation (:kind (cap/release! a (:server queue) [:original "unknown"]))))
+    (is (= :deferred (:status (cap/enroll! a (:server (second (:queues f)))
+          (payload "blocked") (opts "blocked") (capture "hotel:a" :meta)))))
+    (is (= {:enrolled 1} (:states (cap/status a))))
+    (is (= :uncertain (get-in (q/effects (:server queue) (:db/id job)) [:provider :state]))))
+   (finally (cleanup! f holder)))))

@@ -1,0 +1,164 @@
+; Shared native obligation admission across otherwise independent queue journals.
+; This is upstream queue infrastructure, not a provider quota/scheduler or a
+; second domain outbox. Reservation and queue stores have an explicit crash seam.
+(ns proc.capacity
+ (:require [datom :as d] [datom.conn :as dc] [datom.store :as ds]
+           [proc.queue :as q] [proc.queue-runtime :as runtime]))
+(def SCHEMA
+ [{:db/ident :capacity.authority/id :db/valueType :db.type/string :db/unique :db.unique/identity}
+  {:db/ident :capacity.authority/policy :db/valueType :db.type/term}
+  {:db/ident :capacity.reservation/key :db/valueType :db.type/term :db/unique :db.unique/identity}
+  {:db/ident :capacity.reservation/descriptor :db/valueType :db.type/term}
+  {:db/ident :capacity.reservation/state :db/valueType :db.type/keyword :db/index true}
+  {:db/ident :capacity.reservation/job-id :db/valueType :db.type/string}])
+(defn- refuse [kind] (throw (ex-info "Native shared capacity refused" {:kind kind})))
+(defn- digest [value] (Base/encode16 (crypto/hash :sha256 (erlang/term_to_binary value))))
+(defn- sync! [c] (if (ds/durable? (:store c)) (do (ds/sync! (:store c)) :stable) :volatile))
+(defn- positive? [x] (and (erlang/is_integer x) (<= 1 x 1000000)))
+(defn- policy! [policy]
+ (when-not (and (map? policy) (= #{:max-outstanding :scopes} (set (keys policy)))
+               (positive? (:max-outstanding policy)) (vector? (:scopes policy))
+               (<= (count (:scopes policy)) 8)) (refuse :invalid-capacity-policy))
+ (doseq [scope (:scopes policy)]
+  (when-not (and (map? scope) (= #{:keys :max} (set (keys scope)))
+                (vector? (:keys scope)) (<= 1 (count (:keys scope)) 8)
+                (every? keyword? (:keys scope)) (= (count (:keys scope)) (count (distinct (:keys scope))))
+                (positive? (:max scope)) (<= (:max scope) (:max-outstanding policy)))
+   (refuse :invalid-capacity-scope)))
+ (when-not (= (count (:scopes policy)) (count (distinct (map :keys (:scopes policy)))))
+  (refuse :invalid-capacity-scope))
+ policy)
+(defn- scope-value [scope fields]
+ (let [value (mapv #(get scope %) fields)]
+  (when-not (and (every? some? value) (<= (erlang/byte_size (erlang/term_to_binary value)) 4096))
+   (refuse :invalid-capacity-capture))
+  value))
+(defn attach-store!
+ "Bind one explicitly owned durable Datom connection as the shared native
+  admission authority. Caller owns open/stop/close and passes this SAME handle
+  to every configured queue owner. Live replacement and different-path rebind
+  refuse. Closed same-file reopen retains native reservations/policy."
+ [id c supplied-policy]
+ (when-not (and (string? id) (<= 1 (erlang/byte_size id) 256) (ds/durable? (:store c)))
+  (refuse :invalid-capacity-authority))
+ (let [policy (policy! supplied-policy) registry (tuple :proc.capacity id)]
+  (BeamLisp.Env/with_generation_lock registry
+   (fn []
+    (let [old (erlang/apply :persistent_term :get (list registry nil))]
+     (when (and old (not= c old)
+                (not (and (= :closed @(:lifetime old))
+                          (string? (:path (ds/identity-of (:store old))))
+                          (string? (:path (ds/identity-of (:store c))))
+                          (= (:path (ds/identity-of (:store old))) (:path (ds/identity-of (:store c)))))))
+      (refuse :capacity-authority-already-bound))
+     (dc/serialized! c (fn []
+      (d/install-schema! c SCHEMA)
+      (when (some #(not= id (first %)) (d/q '[:find ?id :where [_ :capacity.authority/id ?id]] (d/db c)))
+       (refuse :capacity-authority-store-conflict))
+      (let [previous (:capacity.authority/policy (d/entity (d/db c) [:capacity.authority/id id]))]
+       ;; Policy changes are explicit later; stale handles cannot silently
+       ;; change the meaning of reservations across independent queue owners.
+       (when (and previous (not= previous policy)) (refuse :capacity-policy-migration-required)))
+      (d/transact! c [{:db/id -1 :capacity.authority/id id :capacity.authority/policy policy}])
+      (sync! c)))
+     (erlang/apply :persistent_term :put (list registry c))
+     {:id id :conn c :policy policy})))))
+(defn- live! [authority]
+ (when-not (= (:conn authority) (erlang/apply :persistent_term :get (list (tuple :proc.capacity (:id authority)) nil)))
+  (refuse :stale-capacity-authority))
+ (when-not (= (:policy authority)
+              (:capacity.authority/policy (d/entity (d/db (:conn authority)) [:capacity.authority/id (:id authority)])))
+  (refuse :stale-capacity-policy))
+ authority)
+(defn- descriptor! [authority srv payload opts capture]
+ (when-not (and (map? capture) (some? (:enrollment-key opts))
+               (<= (erlang/byte_size (erlang/term_to_binary [capture (:enrollment-key opts)])) 8192))
+  (refuse :invalid-capacity-capture))
+ (doseq [scope (get-in authority [:policy :scopes])] (scope-value capture (:keys scope)))
+ {:queue (q/server-name srv) :enrollment (:enrollment-key opts)
+  :payload-hash (digest payload) :protocol (:protocol opts (get (q/declaration srv) :protocol 1))
+  :generation (:generation opts) :capture capture})
+(defn- reservation-key [authority descriptor] [(:id authority) (:queue descriptor) (:enrollment descriptor)])
+(defn- reservations [authority]
+ (mapv (fn [[e]] (d/entity (d/db (:conn authority)) e))
+  (d/q '[:find ?e :where [?e :capacity.reservation/key _]] (d/db (:conn authority)))))
+(defn reserve!
+ "One writer-atomic aggregate obligation reservation. Captured property/provider
+  identity is application-authorized data; this native API infers no quotas.
+  Duplicate immutable identity succeeds even at capacity. Unknown/reserved/
+  enrolled rows keep consuming budget; only explicit safe release ends it."
+ [authority srv payload opts capture]
+ (live! authority)
+ (let [descriptor (descriptor! authority srv payload opts capture)
+       key (reservation-key authority descriptor) c (:conn authority)]
+  (dc/serialized! c (fn []
+   (live! authority)
+   (if-let [old (d/entity (d/db c) [:capacity.reservation/key key])]
+    (do (when-not (= descriptor (:capacity.reservation/descriptor old)) (refuse :capacity-identity-conflict))
+        {:status (if (= :released (:capacity.reservation/state old)) :released :existing) :reservation key})
+    (let [rows (filter #(not= :released (:capacity.reservation/state %)) (reservations authority))
+          policy (:policy authority)
+          full? (or (>= (count rows) (:max-outstanding policy))
+                    (some (fn [scope]
+                     (let [value (scope-value capture (:keys scope))]
+                      (>= (count (filter #(= value (scope-value (get-in % [:capacity.reservation/descriptor :capture]) (:keys scope))) rows))
+                          (:max scope)))) (:scopes policy)))]
+     (if full? {:status :deferred :reason :shared-capacity}
+      (do (d/transact! c [{:db/id -1 :capacity.reservation/key key
+                          :capacity.reservation/descriptor descriptor :capacity.reservation/state :reserved}])
+          {:status :reserved :reservation key :durability (sync! c)}))))))))
+(defn enroll!
+ "Reservation BEFORE original native queue enrollment; journal bind AFTER.
+  No cross-store atomicity is claimed. A crash/lost acknowledgement retains
+  its original reservation; domain owed repair calls this exact identity again.
+  A full local journal keeps reservation :reserved, readable for repair."
+ [authority srv payload opts capture]
+ (let [reserved (reserve! authority srv payload opts capture)]
+  (case (:status reserved)
+   :deferred reserved
+   :released (refuse :capacity-reservation-released)
+   (let [proof {:authority (:id authority) :reservation (:reservation reserved)
+                :descriptor-hash (digest (descriptor! authority srv payload opts capture))}
+         answer (q/try-enqueue! srv payload (assoc opts :capacity-proof proof))]
+    (if (= :deferred (:status answer)) answer
+     (let [job (:job answer) c (:conn authority)]
+      (dc/serialized! c (fn []
+       (live! authority)
+       (let [row (d/entity (d/db c) [:capacity.reservation/key (:reservation reserved)])]
+        (when (or (= :released (:capacity.reservation/state row))
+                  (and (:capacity.reservation/job-id row) (not= (:job/id job) (:capacity.reservation/job-id row))))
+         (refuse :capacity-binding-conflict))
+        (d/transact! c [[:db/add (:db/id row) :capacity.reservation/state :enrolled]
+                       [:db/add (:db/id row) :capacity.reservation/job-id (:job/id job)]])
+        (sync! c))))
+      answer))))))
+(defn release!
+ "Fence original queue enrollment FIRST, then release its aggregate reservation.
+  No-job orphan fencing closes admission-before-enrollment, including late
+  producer calls. Unknown/nonterminal effects refuse. A terminal job also needs
+  actual native body-death evidence; lease expiry is never physical death.
+  Crash after fence/before release is repaired by repeating this same command."
+ [authority srv enrollment]
+ (live! authority)
+ (let [key [(:id authority) (q/server-name srv) enrollment] c (:conn authority)
+       row (d/entity (d/db c) [:capacity.reservation/key key])]
+  (when-not row (refuse :capacity-reservation-missing))
+  (let [fenced (q/fence-enrollment! srv enrollment {:authority (:id authority) :reservation key})
+        job (:job fenced)
+        physical (when (and job (pos? (:job/attempts job 0))) (runtime/body-status srv (:job/id job)))]
+   (cond
+    (not= :fenced (:status fenced)) fenced
+    (and physical (or (not= :known (:status physical)) (pos? (:live physical))))
+      {:status :waiting :reason :physical-body-lifetime}
+    :else
+      (dc/serialized! c (fn []
+       (live! authority)
+       (let [current (d/entity (d/db c) [:capacity.reservation/key key])]
+        (when-not (= (:capacity.reservation/descriptor row) (:capacity.reservation/descriptor current))
+         (refuse :capacity-identity-conflict))
+        (d/transact! c [[:db/add (:db/id current) :capacity.reservation/state :released]])
+        {:status :released :durability (sync! c)})))))))
+(defn status [authority]
+ (live! authority)
+ {:states (frequencies (map :capacity.reservation/state (reservations authority)))
+  :max-outstanding (get-in authority [:policy :max-outstanding])})

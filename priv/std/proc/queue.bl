@@ -128,7 +128,7 @@
 
 (def KNOWN-BACKOFF [:exponential :constant])
 
-(def KNOWN-ENQUEUE-OPTS [:in :at :protocol :generation :source-id :parent-id :enrollment-key])
+(def KNOWN-ENQUEUE-OPTS [:in :at :protocol :generation :source-id :parent-id :enrollment-key :capacity-proof])
 
 (defn- known? [k ks] (some (fn [x] (= x k)) ks))
 
@@ -314,6 +314,9 @@
    {:db/ident :job/adopted-payload :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
    {:db/ident :job/generation :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
    {:db/ident :job/effects :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
+   {:db/ident :job/capacity :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
+   {:db/ident :queue.enrollment/key :db/valueType :db.type/term :db/unique :db.unique/identity}
+   {:db/ident :queue.enrollment/fence :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
    {:db/ident :job/deferral :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
    {:db/ident :job/retry-base :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
    {:db/ident :queue/fenced-generations :db/valueType :db.type/term :db/cardinality :db.cardinality/one}
@@ -1048,6 +1051,10 @@
                               " store — start the queue once before enqueueing into"
                               " it")
                          {:server srv})))
+       (when (contains? opts :capacity-proof)
+         (when-not (and (contains? opts :enrollment-key) (map? (:capacity-proof opts))
+                       (<= (erlang/byte_size (erlang/term_to_binary (:capacity-proof opts))) 8192))
+           (throw (ex-info "Native capacity proof needs a bounded enrolled identity" {:kind :invalid-capacity-proof}))))
        (validate-payload! d job)
        (dc/serialized! c (fn []
        (let [sealed? (and (map? context) (:digest context))
@@ -1096,6 +1103,7 @@
                          :job/payload job
                          :job/diagnostic-context (merge (diag/context) {:diagnostics/job-id (diag/new-id)})}
                         (if enrollment {:job/enrollment enrollment} {})
+                        (if (:capacity-proof opts) {:job/capacity (:capacity-proof opts)} {})
                         (if generation {:job/generation generation :job/required-generation generation} {})
                         (if (:parent-id opts) {:job/parent-id (:parent-id opts)} {})
                         (if (some? ticket) {:job/ticket ticket} {})
@@ -1108,11 +1116,15 @@
                   [row])]
          (if existing
            (do
-             (when-not (and (= job (:job/payload existing)) (= protocol (:job/protocol existing)))
+             (when-not (and (= job (:job/payload existing)) (= protocol (:job/protocol existing))
+                            (= (:capacity-proof opts) (:job/capacity existing)))
                (throw (ex-info "Enrollment identity already names a different payload or protocol"
                         {:kind :enrollment-conflict :server srv})))
              (assoc existing :job/created false))
-         (let [old (when ticket (find-by-ticket c ticket))]
+         (let [_ (when (and enrollment (datom/entity (datom/db c) [:queue.enrollment/key enrollment]))
+                   (throw (ex-info "Original native enrollment has been explicitly fenced"
+                                   {:kind :enrollment-fenced})))
+               old (when ticket (find-by-ticket c ticket))]
           (when (and old enrollment (not= enrollment (:job/enrollment old)))
             (throw (ex-info "Outstanding ticket belongs to a different enrollment"
                            {:kind :enrollment-conflict :server srv})))
@@ -1492,6 +1504,9 @@
         (let [j (datom/entity (datom/db c) id) d (declaration srv)]
           (when-not (contains? #{:failed :held} (:job/state j))
             (throw (ex-info "Only failed or held jobs may be retried" {:kind :not-retryable :state (:job/state j)})))
+          (when (and (:job/enrollment j)
+                     (datom/entity (datom/db c) [:queue.enrollment/key (:job/enrollment j)]))
+            (throw (ex-info "Original native enrollment has been explicitly fenced" {:kind :enrollment-fenced})))
           (let [ticket (ticket-for d (:job/payload j))
                 other (when ticket (find-by-ticket c ticket))]
             (when (and other (not= id (:db/id other)))
@@ -1506,6 +1521,32 @@
               (if (:job/finished-at j) [[:db/retract id :job/finished-at (:job/finished-at j)]] [])
               (if ticket [[:db/add id :job/ticket ticket]] []))))
             (datom/entity (datom/db c) id))))))))
+
+(defn fence-enrollment!
+  "Durably close one original enrollment before shared reservation release.
+   Queue writer serialization prevents an in-flight/late enrollment from
+   escaping an orphan fence. Existing nonterminal work and unresolved effects
+   refuse; this is not cancellation or evidence deletion. Terminal rows remain.
+   A retry of a fenced identity refuses. A new explicit intent needs a new key."
+  [srv key basis]
+  (when-not (and (some? key) (some? basis)
+                (<= (erlang/byte_size (erlang/term_to_binary [key basis])) 8192))
+    (throw (ex-info "Enrollment fence needs a bounded original identity" {:kind :invalid-enrollment-fence})))
+  (let [c (conn srv) enrollment [(server-name srv) key]]
+    (dc/serialized! c (fn []
+      (let [job (datom/entity (datom/db c) [:job/enrollment enrollment])
+            old (datom/entity (datom/db c) [:queue.enrollment/key enrollment])]
+        (cond
+          (and old (not= basis (:queue.enrollment/fence old)))
+            {:status :refused :kind :fence-conflict}
+          (and job (or (not (contains? #{:done :failed :cancelled} (:job/state job)))
+                       (not (every? #(contains? #{:complete :absent} (:state %)) (vals (:job/effects job {}))))))
+            {:status :refused :kind :outstanding-obligation}
+          :else
+            (do
+              (when-not old
+                (datom/transact! c [{:db/id -1 :queue.enrollment/key enrollment :queue.enrollment/fence basis}]))
+              {:status :fenced :job job :durability (sync-checkpoint! c)})))))))
 
 ;; ── cancelling work that has not begun, and reaping what has ────────────
 ;;
@@ -1868,7 +1909,8 @@
                    (tuple :DOWN _ :process _ _) nil)))
           :plain (to-list (concat (:modules q []) (BeamLisp.Env/callback_modules body)
                                   (BeamLisp.Env/callback_modules (:clock q)))))]
-        (swap! inventory assoc ref {:pid pid :server (server-name (:server q)) :generation (:generation decl)})
+        (swap! inventory assoc ref {:pid pid :server (server-name (:server q)) :generation (:generation decl)
+                                   :job-id (:job/id claimed) :attempt-id (:job/attempt-id claimed)})
         (erlang/send pid [:bl-queue/start])
         (emit-entry! {:diagnostics captured} :proc.queue/claimed {:proc.queue/attempt (:job/attempts claimed)})
         {:ref ref :pid pid :diagnostics captured
