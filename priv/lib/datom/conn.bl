@@ -147,12 +147,14 @@
 ;; Private schema connections omit it, so speculative work cannot publish.
 (defrecord Conn [store schema basis writer subs blobs lifetime])
 
-(declare ensure-schema-coverage-in-writer)
+(declare ensure-schema-coverage-in-writer with-canonical-writer install-native-mutation-root!
+ native-guard-anchor! native-guard-publish! native-closed-tx? native-canonical-connection! native-connection-exposure!)
 (declare tuple-backfill-ops)
 (declare install-schema!)
 (declare migration-policy-with-reservation)
 (declare sync-schema! migration-policy-claim-cell migration-policy-finish-connect!
  migration-policy-schema-change! migration-policy-datoms! migration-policy-excision!
+ migration-enrollment-fail! native-schema-journal-with-turn native-schema-journal-forms! native-schema-journal-datoms! native-schema-journal-schema! native-schema-journal-protected? native-system-journal-attr?
  migration-policy-close! migration-policy-with-connect-turn)
 
 (defn- publish-view! [conn]
@@ -489,6 +491,7 @@
    takes minutes is a bug worth surfacing, and an infinite wait would
    hide a deadlock as a hang."
   [conn f]
+  (native-canonical-connection! conn)
   (when (Process/get :datom.conn/guard-publication)
     (guard-fail! :guard-publication-writer-forbidden))
   (writable-context!)
@@ -572,6 +575,7 @@
         request (admission/token (erlang/self) timeout-ms)
         parent (Process/get :bl_admission)
         migration-permit (Process/get :datom.conn/migration-connect)
+        schema-journal-ticket (Process/get :datom.conn/native-schema-journal-write)
         sender (erlang/self)
         ;; Authenticate BEFORE deriving or retaining modules. A conveyed graph
         ;; alone must not acquire native managed writer/producer authority.
@@ -585,17 +589,22 @@
         modules (concat (list (elem (erlang/fun_info f :module) 1)
                               (elem (erlang/fun_info (fn [] nil) :module) 1))
                         (:modules generation))]
-    (BeamLisp.Env/with_code_lease modules
-      (fn []
+    (let [original (BeamLisp.Env/retain_code! modules)]
+     (try
+      (BeamLisp.Env/with_owned_code_execution original
+       (fn [] (BeamLisp.Env/with_owned_generation_execution
+        (fn []
         ;; Resolve the current writer, not the immutable record's stale PID.
         (let [pid (ensure-writer conn)
               outcome (agent-get-and-update pid
                         (fn [state]
                           (let [r (try
-                                    (let [accepted (BeamLisp.Env/with_code_lease modules
-                                                     (fn [] (admission/run request parent
+                                    (let [accepted (BeamLisp.Env/run_code! original
+                                                     (fn [] (BeamLisp.Env/with_owned_generation_execution
+                                                      (fn [] (admission/run request parent
                                                               (fn [] (migration-policy-with-connect-turn conn migration-permit sender
-                                                                (fn [] (writer-operation conn f)))))))]
+                                                                (fn [] (native-schema-journal-with-turn schema-journal-ticket sender
+                                                                  (fn [] (writer-operation conn f)))))))))))]
                                       (if (= :cancelled accepted)
                                         [:raised (ex-info "Queued store operation was cancelled before admission"
                                                    {:kind :admission-cancelled :operation :datom-writer})]
@@ -604,6 +613,7 @@
                             (erlang/list_to_tuple (to-list [r state]))))
                         timeout-ms)]
           (if (= :ok (first outcome)) (second outcome) (throw (second outcome))))))))
+      (finally (BeamLisp.Env/release_code! original))))))
 
 (defn connect-with
   "Open a connection over an EXISTING store.
@@ -701,7 +711,7 @@
                                                             :avet :db/ident ident))]
                                         [:db/add (datom.index/-e dt) :db/tupleAttrs attrs])))) schema-defs))]
        (when (seq repairs) (transact! conn repairs)))
-     (with-writer conn (fn [] (ensure-schema-coverage-in-writer conn)))
+     (with-canonical-writer conn :coverage (fn [] (ensure-schema-coverage-in-writer conn)))
      (migration-policy-finish-connect! conn))))
 
 (defn owned-connections
@@ -717,7 +727,8 @@
  (let [pid (erlang/whereis REGISTRY)]
   (when (= :undefined pid)
    (throw (ex-info "Owned store registry unavailable" {:kind :store-not-ready})))
-  (agent-get-and-update pid
+  (mapv native-connection-exposure!
+   (agent-get-and-update pid
    (fn [entries]
     (when (> (count entries) 100000)
      (throw (ex-info "Owned store observation bound exceeded" {:kind :store-inventory-budget})))
@@ -759,7 +770,7 @@
      (when (or (> (count matches) 4096)
                (not= (count matches) (count (set (map #(get-in % [:store :path]) matches)))))
       (throw (ex-info "Owned store inventory is ambiguous or too large" {:kind :owned-store-inventory-refused})))
-     (tuple matches entries))) 30000)))
+     (tuple matches entries))) 30000))))
 
 (defn registered-at
   "Borrow an already-open path-backed connection from this VM. Never opens a
@@ -780,13 +791,14 @@
                                :snapshot (:snapshot cell) :schema-publication (:schema-publication cell)))) entries)))))]
     (when-not (= 1 (count matches))
       (throw (ex-info "Managed store is not uniquely open in this VM" {:kind :store-not-ready})))
-    (first matches)))
+    (native-connection-exposure! (first matches))))
 
 (defn register-observer!
  "Admit an exact observer ticket before listen/ready. Called by the observer;
   its retained SDK drain registration must be live and owned by this process.
   Admission and close share the actual connection-lifetime Agent fence."
  [conn drain-registration]
+ (native-canonical-connection! conn)
  (let [conn (lifetime-conn conn) owner (erlang/self) ticket (erlang/make_ref)
        lease (:lease drain-registration) key (store-key (:store conn))]
   (when-not (and (tuple? lease) (= 3 (erlang/tuple_size lease))
@@ -811,6 +823,7 @@
  "Release only this process's exact ticket. Closing is permitted so watch
   finally cleanup can complete while release! waits outside the Agent."
  [conn token]
+ (native-canonical-connection! conn)
  (let [conn (lifetime-conn conn) owner (erlang/self) key (store-key (:store conn))]
   (agent-get-and-update (registry)
    (fn [entries]
@@ -1022,6 +1035,7 @@
    it removes is the last long-lived reference the database itself
    holds."
   [conn]
+  (native-canonical-connection! conn)
   (writable-context!)
   (when (= (:store conn) (erlang/get :datom.conn/writing-store))
     (throw (ex-info "cannot release a connection inside its transaction" {:reason :release-in-writer})))
@@ -1197,9 +1211,7 @@
    transaction is in flight` is true — so a `put-file!` whose transaction is
    queued cannot have its bytes swept from under it."
   [conn]
-  (with-writer
-    conn
-    (fn []
+  (with-canonical-writer conn :gc-files (fn []
       ;; Fail before inventory or any deletion; substrate deletion also checks
       ;; the same native pin fence, covering direct callers and admission races.
       (datom.blob/ensure-collectable! (:blobs conn))
@@ -1285,6 +1297,8 @@
    boundary.md` documents the audit-guarantee exception this creates."
   [conn specs]
   (check-schema-publication! conn)
+  (when (native-schema-journal-protected? (:store conn))
+   (migration-enrollment-fail! :native-schema-journal-excision-refused))
   (migration-policy-excision! conn)
   (let [store (:store conn)
         schema (deref (:schema conn))
@@ -1339,7 +1353,7 @@
    shim) transacts an audit datom separately — excise! only does the deletion,
    through the writer so it cannot race a concurrent commit."
   [conn specs]
-  (with-writer conn (fn [] {:excised (excise-in-writer conn (into [] specs))})))
+  (with-canonical-writer conn :excise (fn [] {:excised (excise-in-writer conn (into [] specs))})))
 
 (defn conn-of
   "The connection behind a db VALUE.
@@ -1405,12 +1419,22 @@
 
    Returns the subscriber pid (the caller). Idempotent per process."
   ([conn] (listen! conn {}))
-  ([conn opts] (datom.broadcast/listen! (:subs conn) (erlang/self) opts)))
+  ([conn opts]
+   (native-canonical-connection! conn)
+   (if-not (native-closed-tx? (:store conn))
+    (datom.broadcast/listen! (:subs conn) (erlang/self) opts)
+    (let [owner (erlang/self)]
+     (BeamLisp.CompilerData/check_first_order! opts {:max-nodes 4096 :max-depth 16 :max-bytes 1048576})
+     (with-canonical-writer conn :listen #(datom.broadcast/listen! (:subs conn) owner opts))))))
 
 (defn unlisten!
   "Unsubscribe the calling process (or `pid`) from `conn`."
   ([conn] (unlisten! conn (erlang/self)))
-  ([conn pid] (datom.broadcast/unlisten! (:subs conn) pid)))
+  ([conn pid]
+   (native-canonical-connection! conn)
+   (if-not (native-closed-tx? (:store conn)) (datom.broadcast/unlisten! (:subs conn) pid)
+    (do (when-not (erlang/is_pid pid) (migration-enrollment-fail! :invalid-subscriber))
+        (with-canonical-writer conn :unlisten #(datom.broadcast/unlisten! (:subs conn) pid))))))
 
 (defn subscribers
   "The pids currently subscribed to `conn` — for tests and introspection."
@@ -1434,7 +1458,7 @@
   ; through the non-atomic ETS counter and overwrote each other. Six
   ; acknowledged schema changes existed only until restart, which is the
   ; worst place for a schema to disagree with itself.
-  (with-writer conn (fn [] (install-schema-in-writer conn defs))))
+  (with-canonical-writer conn :install-schema (fn [] (install-schema-in-writer conn defs))))
 
 (defn sync-schema!
   "Update the connection's in-memory schema MAP (and any newly-demanded
@@ -1450,7 +1474,7 @@
    into the map, and a reopened connection recovers the same map from the
    datoms regardless."
   [conn defs]
-  (with-writer conn (fn [] (sync-schema-map-in-writer conn defs))))
+  (with-canonical-writer conn :sync-schema (fn [] (sync-schema-map-in-writer conn defs))))
 
 (defn- backfill-newly-indexed! [store before after basis defs]
   (doseq [d defs]
@@ -1493,6 +1517,7 @@
 
 (defn- sync-schema-map-in-writer [conn defs]
   (let [before (deref (:schema conn)) after (datom.schema/install-all before defs)
+        _ (native-schema-journal-schema! conn after defs)
         _ (migration-policy-schema-change! conn after)
         pending (atom [])
         shadow (assoc (dissoc conn :snapshot) :schema (atom after) :pending-reports pending :prospective-schema true)
@@ -1513,6 +1538,7 @@
 
 (defn- install-schema-in-writer [conn defs]
   (let [before (deref (:schema conn)) after (datom.schema/install-all before defs)
+        _ (native-schema-journal-schema! conn after defs)
         _ (migration-policy-schema-change! conn after)
         pending (atom [])
         shadow (assoc (dissoc conn :snapshot) :schema (atom after) :pending-reports pending :prospective-schema true)
@@ -1558,8 +1584,10 @@
    A timeout after admission is an unknown commit outcome, never permission to
    retry automatically. Accepted writes drain under their existing code lease."
   ([conn tx-data]
-  (let [result (with-writer conn
-                 (fn []
+  (native-canonical-connection! conn)
+  (when (native-closed-tx? (:store conn)) (datom.tx/assert-eager-closed-input! tx-data))
+  (native-schema-journal-forms! (:store conn) (db conn) tx-data)
+  (let [result (with-canonical-writer conn :transact (fn []
                   (Process/put :datom_rank_maintenance [])
                   (Process/put :datom_rank_maintenance_store (:store conn))
                   (Process/put :datom_rank_prepare_us 0)
@@ -1651,7 +1679,7 @@
    hand-written transaction against one conn serialise against each
    other."
   [conn tx-data]
-  (with-writer conn (fn [] (if (seq (guards-for conn))
+  (with-canonical-writer conn :load-facts (fn [] (if (seq (guards-for conn))
                            (transact-in-writer conn tx-data)
                            (load-facts-in-writer conn tx-data)))))
 
@@ -1688,7 +1716,7 @@
    speculative transaction the real one would reject is itself a useful
    answer, surfaced the same way."
   [conn tx-data]
-  (with-writer conn (fn [] (with-in-writer conn tx-data))))
+  (with-canonical-writer conn :speculate (fn [] (with-in-writer conn tx-data))))
 
 ;; ── transaction guards (PLAN-115 B3) ────────────────────────────────────────
 ;;
@@ -2121,8 +2149,7 @@
               :lifetime (:lifetime conn) :ticket (erlang/make_ref)}]
   (when-not (and (string? application) (seq application)) (guard-fail! :missing-guard-application))
   (when-not (:provider (declaration/lookup :guard name)) (guard-fail! :missing-guard-declaration))
-  (with-writer conn
-   (fn []
+  (with-canonical-writer conn :register-guard (fn []
     (guard-association-mutation! key (fn [] (agent-get-and-update (guard-registry)
      (fn [all]
       (let [entries (get all key {}) before (get entries name)]
@@ -2162,8 +2189,7 @@
                  (= application (:application-id expected)) (= (:lifetime conn) (:lifetime expected))
                  (:provider (declaration/lookup :guard name)))
    (guard-fail! :invalid-guard-owner-receipt))
-  (with-writer conn
-   (fn []
+  (with-canonical-writer conn :remove-guard (fn []
     (guard-association-mutation! key (fn [] (agent-get-and-update (guard-registry)
      (fn [all]
       (let [entries (get all key {})]
@@ -2194,14 +2220,16 @@
 
 (defn- run-guards! [conn report guards]
  (reduce (fn [_ pred]
-           (let [problems (observing #(pred report))]
+           (let [problems (observing #(if (erlang/function_exported :Elixir.BeamLisp.Env :with_native_command_callback! 1)
+                                       (BeamLisp.Env/with_native_command_callback! #(pred report))
+                                       (pred report)))]
             (when-not (nil? problems) (throw (ex-info "transaction refused" {:problems problems})))))
          nil guards))
 
 (declare with-expanded-in-writer run-expanded-tx-pipeline)
 
 (defn- with-in-writer [conn tx-data]
- (with-expanded-in-writer conn (datom.tx/expand-tx-fns (db conn) tx-data)))
+ (with-expanded-in-writer conn (datom.tx/expand-tx-fns (db conn) tx-data (native-closed-tx? (:store conn)))))
 
 (defn- with-expanded-in-writer
   "The body of `with`, already inside the writer process. Mirrors
@@ -2223,7 +2251,7 @@
      :tx-datoms (get result :tx-datoms)}))
 
 (defn- run-tx-pipeline [store blobs schema db-before tx-data]
- (run-expanded-tx-pipeline store blobs schema db-before (datom.tx/expand-tx-fns db-before tx-data)))
+ (run-expanded-tx-pipeline store blobs schema db-before (datom.tx/expand-tx-fns db-before tx-data (native-closed-tx? (:store db-before)))))
 
 (defn- run-expanded-tx-pipeline
   "The pure transaction pipeline over a store: expand, resolve tempids,
@@ -2242,6 +2270,7 @@
    store; for `with` it is an overlay whose base is never touched."
   [store blobs schema db-before tx-data]
   (let [expanded-tx-data tx-data
+        _ (native-schema-journal-forms! store db-before expanded-tx-data)
         ops (datom.tx/expand schema expanded-tx-data)
         ; `:db/retractEntity` and `:db/cas` are questions about current
         ; state, so they expand AFTER tempid resolution (their entity is
@@ -2301,6 +2330,7 @@
         ; One atomic commit for every index of every datom: a transaction
         ; visible in EAVT but not AEVT would be a corrupt database. The
         ; per-attribute marks ride in the SAME commit — see `write-datoms`.
+        (native-schema-journal-datoms! store schema datoms)
         (migration-policy-datoms! store schema datoms)
         (datom.index/write-datoms store schema datoms
           (into (datom.attr-basis/record-ops store attrs tx)
@@ -2320,7 +2350,7 @@
   (check-schema-publication! conn)
   (let [guards (guards-for conn)
         db-before (db conn)
-        expanded (when (seq guards) (datom.tx/expand-tx-fns db-before tx-data))
+        expanded (when (seq guards) (datom.tx/expand-tx-fns db-before tx-data (native-closed-tx? (:store db-before))))
         _ (when (seq guards) (run-guards! conn (with-expanded-in-writer conn expanded) guards))
         result (if (seq guards)
                  (run-expanded-tx-pipeline (:store conn) (:blobs conn) (deref (:schema conn)) db-before expanded)
@@ -2387,13 +2417,15 @@
   (let [store (:store conn)
         schema (deref (:schema conn))
         db-before (db conn)
+        _ (native-schema-journal-forms! store db-before tx-data)
         tx (next-tx-id store)
         instant [:db/add tx :db/txInstant (erlang/system_time :millisecond)]
         datoms (datom.tx/realize-fresh tx (conj (datom.tx/expand schema tx-data) instant))]
     ; One atomic commit for every index of every datom, exactly as the
     ; general path does it: a transaction visible in EAVT but not AEVT is a
     ; corrupt database, not a fast one.
-    (migration-policy-datoms! store schema datoms)
+    (native-schema-journal-datoms! store schema datoms)
+        (migration-policy-datoms! store schema datoms)
     (datom.index/write-datoms store schema datoms
                               (into (datom.attr-basis/record-ops
                                       store (datom.broadcast/changed-attrs datoms) tx)
@@ -2423,8 +2455,7 @@
    writer; no app schema, count updates or cache keys are required."
   [conn plan]
   (datom.query.rank-build/prepare!)
-  (with-writer conn
-    (fn []
+  (with-canonical-writer conn :rank-ensure (fn []
       (let [database (db conn) s (:store conn)
             id (datom.query.rank-build/ident plan)
             pending (datom.query.rank-build/start-ops database plan)]
@@ -2436,8 +2467,7 @@
   "One bounded stage/cleanup step in the source writer. A process may die
    between calls; the durable checkpoint resumes on the next query."
   [conn id]
-  (let [result (with-writer conn
-    (fn []
+  (let [result (with-canonical-writer conn :rank-advance (fn []
       (let [started (erlang/monotonic_time :microsecond)
             _ (Process/put :datom_rank_turn_entities 0)
             database (db conn) s (:store conn)
@@ -2494,8 +2524,7 @@
          (= :open @(:lifetime cell)) (= pid (:rank-worker cell)))))
 
 (defn retire-query-rank! [conn id generation]
- (let [retired? (with-writer conn
-                  (fn []
+ (let [retired? (with-canonical-writer conn :rank-retire (fn []
                    (let [ops (datom.query.rank-build/retire-ops (db conn) id generation)]
                     (when (seq ops) (datom.store/-commit (:store conn) ops) true))))]
   (when retired?
@@ -3338,6 +3367,21 @@
                           (migration-policy/canonical-schema @(:schema cell))))
          (migration-enrollment-fail! :stale-migration-schema-view)))))) 30000))))
 (defn- migration-policy-close! [cells connection]
+ (doseq [[_ root] (get cells :datom.conn/native-mutation-roots {})]
+  (when (or (= (:store connection) (:resource root))
+            (migration-policy/under-root? (:root root) (get-in connection [:store :path])))
+   (when (or (BeamLisp.Env/native_command_unknown! (:credential root))
+             (and (= (:store connection) (:resource root))
+                  (BeamLisp.Env/native_command_retirement_blocker! (:credential root))))
+    (migration-enrollment-fail! :native-command-outcome-unconfirmed))))
+ (when (or (seq (get-in cells [(:store connection) :native-canonical-turns]))
+           (some #(and (contains? #{:issued :entered :unknown} (:state (second %)))
+                       (or (= (:store connection) (:resource (second %)))
+                           (= (:store connection) (get-in (second %) [:root :resource]))))
+                 (get cells :datom.conn/native-mutation-effects {})))
+  (migration-enrollment-fail! :native-command-outcome-unconfirmed))
+ (when (get-in cells [(:store connection) :native-schema-journal-window])
+  (migration-enrollment-fail! :native-schema-journal-write-unconfirmed))
  (when-let [phase (get-in cells [(:store connection) :migration-phase])]
   (when (contains? #{:initializing :running :uncertain} (:state phase))
    (migration-enrollment-fail! :migration-phase-outcome-unconfirmed)))
@@ -3372,7 +3416,7 @@
     (when (get-in cells [(:store connection) :migration-phase])
      (migration-enrollment-fail! :migration-contract-drain-proof-required))) 30000)))
 
-(defn- migration-policy-finish-connect! [connection]
+(defn- migration-policy-finish-connect-existing! [connection]
  (if-not (migration-policy-fast? (:store connection)) connection
   (let [policy (Agent/get (registry)
                  (fn [cells]
@@ -3443,3 +3487,842 @@
         (migration-enrollment-fail! :migration-policy-native-schema-receipt-required))))
      {:policy (:ticket row) :generation (:cache-key graph) :root (:root-id row)
       :schemas (mapv #(last (:migration-native-receipts (second %))) members)})) 30000)))
+
+;; Fixed schema reconstruction journal. Source data is never a native receipt.
+(def ^:private NATIVE-GUARD-CONTRACT "native-canonical-commands-v1")
+(def ^:private NATIVE-JOURNAL-EPOCH-KEY
+ ;; Internal non-Datom keyspace, below every index. Datom transactions cannot
+ ;; create it. Source raw Store mutators must remain denied by the SDK boundary.
+ (erlang/list_to_binary (to-list [0 106 111 117 114 110 97 108 49])))
+(defn- native-system-journal-attr? [ident]
+ (and (keyword? ident)
+      (let [n (namespace ident)]
+       (or (= n "upgrade") (and (string? n) (String/starts_with? n "upgrade."))
+           (= n "live-backup")))))
+(def ^:private SCHEMA-JOURNAL-DEFINITIONS
+ [{:db/ident :upgrade.schema/operation :db/valueType :db.type/string :db/unique :db.unique/identity}
+  {:db/ident :upgrade.schema/intent :db/valueType :db.type/term}
+  {:db/ident :upgrade.initialization/scope :db/valueType :db.type/string :db/unique :db.unique/identity}
+  {:db/ident :upgrade.initialization/receipt :db/valueType :db.type/term}
+  {:db/ident :upgrade.initialization/events :db/valueType :db.type/term}
+  {:db/ident :upgrade/id :db/valueType :db.type/string :db/unique :db.unique/identity}
+  {:db/ident :upgrade/snapshot :db/valueType :db.type/term}
+  {:db/ident :upgrade/events :db/valueType :db.type/term}
+  {:db/ident :upgrade/commands :db/valueType :db.type/term}
+  {:db/ident :upgrade/scope :db/valueType :db.type/string :db/unique :db.unique/identity}
+  {:db/ident :upgrade/active :db/valueType :db.type/string}
+  {:db/ident :upgrade.admission/key :db/valueType :db.type/string :db/unique :db.unique/identity}
+  {:db/ident :upgrade.admission/operation :db/valueType :db.type/string :db/unique :db.unique/identity}
+  {:db/ident :upgrade.admission/entry :db/valueType :db.type/term}
+  {:db/ident :upgrade.admission/scope :db/valueType :db.type/string :db/unique :db.unique/identity}
+  {:db/ident :upgrade.admission/active :db/valueType :db.type/string}
+  {:db/ident :live-backup/key :db/valueType :db.type/string :db/unique :db.unique/identity}
+  {:db/ident :live-backup/snapshot :db/valueType :db.type/term}
+  {:db/ident :live-backup/events :db/valueType :db.type/term}])
+(defn- native-schema-journal-allowed? [store]
+ (let [scope (Process/get :datom.conn/native-schema-journal-turn)
+       ticket (or (first scope) (Process/get :datom.conn/native-schema-journal-write))
+       caller (or (second scope) (erlang/self))]
+  (when (erlang/is_reference ticket)
+   (Agent/get (registry)
+    (fn [cells]
+     (let [cell (get cells store) window (:native-schema-journal-window cell)]
+      (and window (= :active (:state window)) (= ticket (:ticket window)) (= caller (:owner window))
+           (= (:lifetime cell) (:lifetime window)) (= (:creation-custody cell) (:custody window))
+           (= :open @(:lifetime cell)) (Process/alive? caller)))) 30000))))
+(defn- native-schema-journal-with-turn [ticket sender action]
+ (let [prior (Process/get :datom.conn/native-schema-journal-turn)
+       prior-caller (Process/get :datom.conn/native-journal-caller)]
+  (try
+   (Process/put :datom.conn/native-journal-caller sender)
+   (when ticket (Process/put :datom.conn/native-schema-journal-turn [ticket sender]))
+   (action)
+   (finally
+    (if prior-caller (Process/put :datom.conn/native-journal-caller prior-caller)
+       (Process/delete :datom.conn/native-journal-caller))
+    (if prior (Process/put :datom.conn/native-schema-journal-turn prior)
+       (Process/delete :datom.conn/native-schema-journal-turn))))))
+(defn- native-schema-journal-protected? [store]
+ ;; Cache is a refusal fast path only; actual write authority is always the
+ ;; private registry window. Ordinary no-policy stores incur no Agent read.
+ (contains? (erlang/apply :persistent_term :get (list :datom-native-schema-journals {})) store))
+(defn- native-schema-journal-forms! [store db forms]
+ ;; Run BEFORE tempid/entity/tx allocation. A retractEntity or schema-entity
+ ;; rewrite cannot remove/relabel reserved records through another attribute.
+ (when (native-schema-journal-protected? store)
+ (let [reserved-ident? (fn [ident]
+        (or (native-system-journal-attr? ident)
+            (and (erlang/is_integer ident) (> ident 0)
+                 (some #(native-system-journal-attr? (datom.index/-v %))
+                       (datom.db/datoms db :eavt ident :db/ident)))))
+       reserved-entity? (fn [entity]
+        (let [resolved (cond
+                        (and (vector? entity) (= 2 (count entity))) (datom.db/resolve-eid db entity)
+                        (erlang/is_integer entity) entity
+                        :else nil)]
+         (or (reserved-ident? entity)
+             (and (vector? entity) (or (reserved-ident? (first entity))
+               (and (= :db/ident (first entity)) (reserved-ident? (second entity)))))
+             (and (erlang/is_integer resolved) (> resolved 0)
+               (some #(or (reserved-ident? (datom.index/-a %))
+                          (and (= :db/ident (datom.index/-a %)) (reserved-ident? (datom.index/-v %))))
+                     (datom.db/datoms db :eavt resolved))))))
+       touches? (some (fn [form]
+        (if (erlang/is_map form)
+         (or (some reserved-ident? (keys form))
+             (reserved-ident? (:db/ident form)) (reserved-entity? (:db/id form)))
+         (or (reserved-ident? (get form 2))
+             (and (= :db/ident (get form 2)) (reserved-ident? (get form 3)))
+             (reserved-entity? (get form 1))))) forms)]
+  (when (and touches? (not (native-schema-journal-allowed? store)))
+   (migration-enrollment-fail! :native-schema-journal-write-required)))))
+(defn- native-schema-journal-datoms! [store schema datoms]
+ (when (and (native-schema-journal-protected? store)
+            (some #(or (native-system-journal-attr? (datom.index/-a %))
+                      (and (= :db/ident (datom.index/-a %)) (native-system-journal-attr? (datom.index/-v %)))) datoms)
+            (not (native-schema-journal-allowed? store)))
+  (migration-enrollment-fail! :native-schema-journal-write-required)))
+(defn- native-schema-journal-schema! [connection after defs]
+ (when (and (native-schema-journal-protected? (:store connection))
+            (or (some #(native-system-journal-attr? (:db/ident %)) defs)
+                (not= (into {} (filter #(native-system-journal-attr? (first %)) @(:schema connection)))
+                      (into {} (filter #(native-system-journal-attr? (first %)) after))))
+            (not (native-schema-journal-allowed? (:store connection))))
+  (migration-enrollment-fail! :native-schema-journal-write-required)))
+(defn- native-schema-journal-window! [connection mode payload]
+ ;; PRIVATE fixed consumer, never an application callback/with-* API.
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [actual (creation-evidence! connection) resource (:resource actual)
+       caller (erlang/self) ticket (erlang/make_ref)
+       _ (when (Process/get :datom.conn/native-schema-journal-write)
+           (migration-enrollment-fail! :native-schema-journal-nested-write))
+       _ (agent-get-and-update (registry)
+          (fn [cells]
+           (let [cell (get cells resource)]
+            (when-not (and cell (= (:lifetime actual) (:lifetime cell)) (= :open @(:lifetime cell))
+                           (= (:custody actual) (:creation-custody cell)) (nil? (:native-schema-journal-window cell)))
+             (migration-enrollment-fail! :native-schema-journal-write-unconfirmed))
+            (let [cache (erlang/apply :persistent_term :get (list :datom-native-schema-journals {}))]
+             (when (and (not (contains? cache resource)) (>= (count cache) 128))
+              (migration-enrollment-fail! :native-schema-journal-capacity))
+             (erlang/apply :persistent_term :put (list :datom-native-schema-journals (assoc cache resource true))))
+            (tuple :issued (assoc cells resource
+              (assoc cell :native-schema-journal {:lifetime (:lifetime actual) :custody (:custody actual)}
+               :native-schema-journal-window {:ticket ticket :owner caller :state :active
+                 :mode mode :operation (get payload "operation") :record-state (get payload "state")
+                 :lifetime (:lifetime actual) :custody (:custody actual)}))))) 30000)]
+  (try
+   (Process/put :datom.conn/native-schema-journal-write ticket)
+   (let [answer (case mode
+                 :install (let [store (:store connection) epoch (datom.store/-get store NATIVE-JOURNAL-EPOCH-KEY)
+                                anchor (native-guard-anchor! connection epoch)]
+                            ;; Existing receipt/epoch is validated BEFORE any
+                            ;; schema installation. A Source-shaped old marker
+                            ;; never becomes native evidence by being present.
+                            (when-not anchor (install-schema! connection SCHEMA-JOURNAL-DEFINITIONS))
+                            (let [accepted (or anchor (native-guard-publish! connection))]
+                             (when-not epoch
+                              (datom.store/-commit store [[:put NATIVE-JOURNAL-EPOCH-KEY (:epoch accepted)]])))
+                            :installed)
+                 :control (transact! connection payload)
+                 :write (transact! connection [{:db/id -1 :upgrade.schema/operation (get payload "operation")
+                                                :upgrade.schema/intent payload}])
+                 :initialization (transact! connection [{:db/id -1 :upgrade.initialization/scope (:scope payload)
+                                                         :upgrade.initialization/receipt (:receipt payload)
+                                                         :upgrade.initialization/events (:events payload)}]))]
+    (datom.store/sync! (:store connection))
+    (agent-get-and-update (registry)
+     (fn [cells]
+      (let [cell (get cells resource) window (:native-schema-journal-window cell)]
+       (when-not (= ticket (:ticket window)) (migration-enrollment-fail! :native-schema-journal-write-unconfirmed))
+       (tuple :completed (assoc cells resource (dissoc cell :native-schema-journal-window))))) 30000)
+    answer)
+   (catch error
+    (agent-get-and-update (registry)
+     (fn [cells]
+      (tuple :held (if (= ticket (get-in cells [resource :native-schema-journal-window :ticket]))
+                     (assoc-in cells [resource :native-schema-journal-window :state] :uncertain) cells))) 30000)
+    (throw error))
+   (finally (Process/delete :datom.conn/native-schema-journal-write)))))
+(defn install-schema-reconstruction-journal!
+ "Fixed native journal installer, before Source initialization. Protects only
+  the reserved SDK census/startup/activation/admission attrs; ordinary application transactions retain behavior."
+ [connection]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [actual (creation-evidence! connection)]
+  (when-not (and (= (erlang/self) (get-in actual [:custody :owner]))
+                 (nil? (get-in actual [:custody :origin])) (nil? (:creator actual))
+                 (= :open @(:lifetime actual)))
+   (migration-enrollment-fail! :native-schema-journal-custodian-required))
+  (migration-native-store! (:connection actual))
+  (install-native-mutation-root! (:connection actual))
+  (native-schema-journal-window! (:connection actual) :install nil)) :installed)
+(defn write-schema-reconstruction-journal!
+ "Closed data from a fixed native schema/publication consumer. Actual Root
+  phase, exact journal lifetime/custody and private writer turn remain mandatory."
+ [connection payload]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (migration-data! payload)
+ (when-not (and (erlang/is_map payload) (= 1 (get payload "version"))
+                (contains? #{"prepared" "consumed"} (get payload "state"))
+                (string? (get payload "operation")) (<= 1 (erlang/byte_size (get payload "operation")) 128)
+                (<= (erlang/external_size payload) 65536))
+  (migration-enrollment-fail! :invalid-native-schema-journal-record))
+ (let [context (migration-policy-context! true) root (:root context) actual (creation-evidence! connection)]
+  (when-not (and (= (:resource root) (:resource actual)) (= (:lifetime root) (:lifetime actual))
+                 (= (:custody root) (:custody actual)) (= :open @(:lifetime actual))
+                 (native-schema-journal-protected? (:resource actual)))
+   (migration-enrollment-fail! :native-schema-journal-custodian-required))
+  (native-schema-journal-window! (:connection actual) :write payload)) :written)
+
+(defn schema-reconstruction-journal?
+ "Read-only branch hint. This Boolean never grants the native writer window."
+ [connection] (native-schema-journal-protected? (:store connection)))
+(defn write-initialization-journal!
+ "Fixed native startup consumer for opt-in protected journals. Source cannot
+  create an apparent ready receipt or erase a submitted/uncertain initializer."
+ [connection scope receipt events]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (migration-data! [scope receipt events])
+ (when-not (and (string? scope) (<= 1 (erlang/byte_size scope) 8192)
+                (erlang/is_map receipt) (= 1 (get receipt "version")) (= "startup" (get receipt "kind"))
+                (vector? events) (<= 1 (count events) 8)
+                (<= (erlang/external_size [scope receipt events]) 65536))
+  (migration-enrollment-fail! :invalid-native-initialization-record))
+ (let [actual (creation-evidence! connection)
+       in-writer? (and (= (:resource actual) (Process/get :datom.conn/writing-store))
+                       (= (erlang/self) (get-in actual [:connection :writer])))
+       caller (if in-writer? (Process/get :datom.conn/native-journal-caller) (erlang/self))]
+  ;; Initialization saves already execute in the actual native writer. Its
+  ;; original accepted caller was captured by with-writer, never conveyed from
+  ;; a caller-supplied dictionary. Actual writer identity is checked above.
+  (when-not (and (= caller (get-in actual [:custody :owner])) (Process/alive? caller)
+                 (nil? (get-in actual [:custody :origin])) (nil? (:creator actual))
+                 (= :open @(:lifetime actual)) (native-schema-journal-protected? (:resource actual)))
+   (migration-enrollment-fail! :native-schema-journal-custodian-required))
+  (native-schema-journal-window! (:connection actual) :initialization {:scope scope :receipt receipt :events events})) :written)
+
+(defn write-control-journal!
+ "Fixed closed-data native activation/admission consumer. The native writer
+  borrow and execution origin are checked before allocating a private turn.
+  This API cannot write schema census or startup receipts, or execute tx functions."
+ [connection forms]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (migration-data! forms)
+ (let [allowed #{:db/id :upgrade/id :upgrade/snapshot :upgrade/events :upgrade/commands
+                 :upgrade/scope :upgrade/active :upgrade.admission/key :upgrade.admission/operation
+                 :upgrade.admission/entry :upgrade.admission/scope :upgrade.admission/active
+                 :live-backup/key :live-backup/snapshot :live-backup/events}]
+  (when-not (and (vector? forms) (<= 1 (count forms) 2)
+                 (<= (erlang/external_size forms) 1048576)
+                 (every? (fn [form]
+                   (and (erlang/is_map form) (not (erlang/is_map_key :__struct__ form))
+                        (every? allowed (keys form)) (contains? #{-1 -2} (:db/id form))
+                        (> (count form) 1))) forms))
+   (migration-enrollment-fail! :invalid-native-control-record)))
+ (let [actual (creation-evidence! connection)
+       in-writer? (and (= (:resource actual) (Process/get :datom.conn/writing-store))
+                       (= (erlang/self) (get-in actual [:connection :writer])))
+       caller (if in-writer? (Process/get :datom.conn/native-journal-caller) (erlang/self))]
+  ;; Native engine/control borrowers may be different actual processes from
+  ;; the creation custodian. No Source origin may invoke this fixed SDK writer;
+  ;; creation-evidence! validates the actual native accepted lifetime borrow.
+  (when-not (and (erlang/is_pid caller) (Process/alive? caller)
+                 (nil? (get-in actual [:custody :origin])) (nil? (:creator actual))
+                 (= :open @(:lifetime actual)) (native-schema-journal-protected? (:resource actual)))
+   (migration-enrollment-fail! :native-schema-journal-custodian-required))
+  (when-not (Process/alive? (get-in actual [:custody :owner]))
+   (migration-enrollment-fail! :native-schema-journal-custodian-required))
+  (when-not (= caller (get-in actual [:custody :owner]))
+   ;; The actual accepted sender must be an original SDK native start rooted
+   ;; at this exact Conn custodian. A supplied PID or current ancestry is not
+   ;; evidence, and restarted/changed/unknown native classes refuse.
+   (BeamLisp.Env/native_process_start_evidence! caller (get-in actual [:custody :owner])))
+  (native-schema-journal-window! (:connection actual) :control forms)))
+
+(defn native-journal-evidence!
+ "Fixed native observer: every requested actual current record must have
+  committed AFTER the internal durable native-guard epoch. Legacy Source-shaped
+  journal rows are never upgraded to positive reconstruction authority."
+ [connection selectors]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (migration-data! selectors)
+ (when-not (and (vector? selectors) (<= 1 (count selectors) 8)
+                (every? #(and (vector? %) (= 3 (count %))
+                              (native-system-journal-attr? (get % 0))
+                              (string? (get % 1)) (<= (erlang/byte_size (get % 1)) 8192)
+                              (native-system-journal-attr? (get % 2))) selectors))
+  (migration-enrollment-fail! :invalid-native-journal-evidence))
+ (let [actual (creation-evidence! connection) c (:connection actual) store (:store c)
+       epoch (datom.store/-get store NATIVE-JOURNAL-EPOCH-KEY) view (db c)]
+  (when-not (and (= (erlang/self) (get-in actual [:custody :owner]))
+                 (nil? (get-in actual [:custody :origin])) (nil? (:creator actual))
+                 (= :open @(:lifetime actual)) (native-schema-journal-protected? (:resource actual))
+                 (erlang/is_map epoch) (= #{:version :basis :nonce :contract} (set (keys epoch)))
+                 (= 2 (:version epoch)) (= NATIVE-GUARD-CONTRACT (:contract epoch))
+                 (erlang/is_integer (:basis epoch))
+                 (<= FIRST-TX (:basis epoch) (datom.db/basis-t view)))
+   (migration-enrollment-fail! :native-journal-provenance-required))
+  (native-guard-anchor! c epoch)
+  (doseq [[identity value attribute] selectors]
+   (let [entity (datom.db/resolve-eid view [identity value])
+         datoms (when entity (datom.db/datoms view :eavt entity attribute))]
+    (when-not (and (= 1 (count datoms)) (> (datom.index/-tx (first datoms)) (:basis epoch)))
+     (migration-enrollment-fail! :native-journal-provenance-required))))
+  :confirmed))
+
+
+;; Coupled to authenticated SDK-private target admission and the fixed Host
+;; command ABI. This is not a Source callback/native-domain promotion API.
+(def ^:private NATIVE-MUTATION-ROOTS :datom.conn/native-mutation-roots)
+(def ^:private NATIVE-MUTATION-EFFECTS :datom.conn/native-mutation-effects)
+(def ^:private NATIVE-MUTATION-CONSUMED :datom.conn/native-mutation-consumed)
+(def ^:private NATIVE-CANONICAL-KINDS
+ #{:coverage :gc-files :excise :install-schema :sync-schema :transact :load-facts
+   :speculate :register-guard :remove-guard :rank-ensure :rank-advance :rank-retire :listen :unlisten})
+(defn- native-mutation-root-id [row]
+ (select-keys row [:application-id :root :path :resource :lifetime :custody :owner :incarnation]))
+(defn- native-mutation-root! [cells store]
+ ;; A claimed path is never the resource identity. Match the real Fjall handle
+ ;; against original private registry resources BEFORE considering containment.
+ (let [handle (when (erlang/is_map store) (maps/get :handle store nil))
+       actual (filterv (fn [[resource cell]]
+                        (and handle (migration-policy/registry-cell? [resource cell])
+                             (erlang/is_map resource) (= handle (maps/get :handle resource nil)))) cells)
+       canonical-paths (mapv (fn [[resource _]] (maps/get :path resource nil)) actual)
+       tag (when (erlang/is_map store) (maps/get :__struct__ store nil))
+       fjall? (or handle (and (erlang/is_atom tag)
+                            (= (BeamLisp.Record/info tag)
+                               (tuple :record "datom.store-fjall" "FjallStore" (list :handle :path)))))
+       path (when fjall? (maps/get :path store nil))
+       rows (filterv
+              (fn [[_ root]]
+               (or (= store (:resource root))
+                   (and handle (or (= handle (get-in root [:resource :handle]))
+                                   (contains? (:native-resource-identities root {}) handle)
+                                   (some #(= handle (get-in (second %) [:resource :handle])) (:declared-evidence root))))
+                   (some #(migration-policy/under-root? (:root root) %) canonical-paths)
+                   (migration-policy/under-root? (:root root) path)))
+              (get cells NATIVE-MUTATION-ROOTS {}))]
+  (when (> (count rows) 1) (migration-enrollment-fail! :native-command-root-ambiguous))
+  (when-let [pair (first rows)]
+   (when-not (and (= 1 (count actual)) (= store (first (first actual))))
+    (migration-enrollment-fail! :native-command-original-resource-required))
+   (let [row (second pair) root-cell (get cells (:resource row))]
+    (when-not (and (= :active (:state row)) root-cell
+                   (= :open @(:lifetime row)) (= (:lifetime row) (:lifetime root-cell))
+                   (= (:custody row) (:creation-custody root-cell)) (Process/alive? (:owner row)))
+     (migration-enrollment-fail! :native-command-root-unconfirmed))
+    row))))
+(defn- install-native-mutation-root! [connection]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (when (BeamLisp.Env/assert_execution_context!)
+  (migration-enrollment-fail! :native-command-bootstrap-outside-generation-required))
+ (doseq [[name arity] [[:register_native_command! 3] [:begin_native_command_boundary! 1]
+                        [:end_native_command_boundary! 2] [:assert_native_command_context! 1]
+                        [:dispatch_native_command! 2] [:assert_native_command_bootstrap_context! 1]
+                        [:with_native_command_callback! 1] [:assert_native_command_turn! 1]
+                        [:refresh_native_command_cells! 1] [:assert_critical_cell_mutation! 2] [:native_command_unknown! 1]
+                        [:native_command_retirement_blocker! 1]]]
+  (when-not (erlang/function_exported :Elixir.BeamLisp.Env name arity)
+   (migration-enrollment-fail! :native-canonical-mutation-contract-required)))
+ (let [actual (creation-evidence! connection)
+       owner (erlang/self)
+       root ((BeamLisp.Env/with_env :global
+                #(BeamLisp.AOT/sdk_named_constructor! "proc.queue-family-root" "native-command-root!" 1)) connection)
+       _ (migration-native-store! connection) key (:resource root) reservation (erlang/make_ref)
+       admitted (agent-get-and-update (registry)
+        (fn [cells]
+         (let [rows (get cells NATIVE-MUTATION-ROOTS {}) prior (get rows key)]
+          (when-not (and (= (:resource actual) key) (= (:custody actual) (:custody root))
+                         (= (:lifetime actual) (:lifetime root)) (= owner (:owner root)))
+           (migration-enrollment-fail! :native-command-root-custody-required))
+          (if prior
+           (do (when-not (and (= :active (:state prior))
+                              (= (native-mutation-root-id root) (native-mutation-root-id prior)))
+                 (migration-enrollment-fail! :native-command-root-unconfirmed))
+               (tuple :existing cells))
+           (do (when (>= (count rows) 128) (migration-enrollment-fail! :native-command-root-capacity))
+               (tuple :register (assoc-in cells [NATIVE-MUTATION-ROOTS key]
+                                 (assoc root :state :registering :reservation reservation))))))) 30000)]
+  (when (= :register admitted)
+   ;; A lost registration reply holds the reserved root; no guessed retry.
+   (let [credential (BeamLisp.Env/register_native_command! "datom.conn" "native-mutation-plan!" 1)]
+    (agent-get-and-update (registry)
+     (fn [cells]
+      (let [row (get-in cells [NATIVE-MUTATION-ROOTS key])]
+       (when-not (and (= reservation (:reservation row)) (= :registering (:state row)))
+        (migration-enrollment-fail! :native-command-root-unconfirmed))
+       (tuple :registered (assoc-in cells [NATIVE-MUTATION-ROOTS key]
+                           (assoc row :state :active :credential credential))))) 30000)))
+  (let [credential (Agent/get (registry) #(get-in % [NATIVE-MUTATION-ROOTS key :credential]) 30000)]
+   (BeamLisp.Env/refresh_native_command_cells! credential))
+  :registered))
+(defn- native-mutation-cell! [cells store root owner]
+ (let [cell (get cells store)]
+  (when-not (and cell (= :open @(:lifetime cell)) (= owner (:writer cell))
+                 (or (= store (:resource root))
+                     (some (fn [[_ receipt]]
+                             (and (= store (:resource receipt))
+                                  (= (:lifetime cell) (:lifetime receipt))
+                                  (= (:creation-custody cell) (:custody receipt))
+                                  (= (:owner root) (get-in receipt [:custody :owner]))
+                                  (nil? (get-in receipt [:custody :origin])) (nil? (:creator receipt))))
+                           (:declared-evidence root))
+                     (= (:application-id root) (get-in cell [:guard-creator :application-id]))))
+   (migration-enrollment-fail! :native-command-writer-custody-required)) cell))
+(defn- native-mutation-held? [cells root]
+ (some #(and (= (native-mutation-root-id root) (:root (second %)))
+             (contains? #{:issued :entered :unknown} (:state (second %))))
+       (get cells NATIVE-MUTATION-EFFECTS {})))
+(defn- native-mutation-unknown? [cells root]
+ (or (some (fn [[_ effect]]
+             (and (= (native-mutation-root-id root) (:root effect))
+                  (or (= :unknown (:state effect)) (not (Process/alive? (:owner effect))))))
+           (get cells NATIVE-MUTATION-EFFECTS {}))
+     (BeamLisp.Env/native_command_unknown! (:credential root))))
+(defn- native-mutation-resource-issued? [cells resource]
+ (some (fn [[_ effect]] (and (= resource (:resource effect))
+                             (contains? #{:issued :entered :unknown} (:state effect))))
+       (get cells NATIVE-MUTATION-EFFECTS {})))
+(defn- with-native-canonical-turn [connection kind action]
+ (let [store (:store connection) root (Agent/get (registry) #(native-mutation-root! % store) 30000)]
+  (if-not root (action)
+   (do
+    (when-not (contains? NATIVE-CANONICAL-KINDS kind)
+     (migration-enrollment-fail! :native-command-kind-unsupported))
+    (let [context (BeamLisp.Env/begin_native_command_boundary! (:credential root))
+          owner (erlang/self) entered (atom false)]
+     ;; Always leave an accepted Host boundary, including a refused private
+     ;; registry admission. An unknown registry reply remains conservatively
+     ;; visible as a private turn and blocks retirement; it is never retried.
+     (try
+      (let [observed (BeamLisp.Env/assert_native_command_context! context)
+            boundary (:boundary observed)]
+       (when-not (and (= owner (:caller observed)) (= (:credential root) (:credential observed))
+                      (erlang/is_reference boundary) (erlang/is_integer (:source-depth observed)))
+        (migration-enrollment-fail! :native-command-boundary-required))
+       (agent-get-and-update (registry)
+        (fn [cells]
+         (let [current (native-mutation-root! cells store) cell (native-mutation-cell! cells store current owner)
+               stack (:native-canonical-turns cell [])]
+          (when (or (native-mutation-unknown? cells current) (>= (count stack) 8))
+           (migration-enrollment-fail! :native-command-outcome-unconfirmed))
+          (tuple :entered (assoc-in cells [store :native-canonical-turns]
+            (conj stack {:boundary boundary :owner owner :depth (:source-depth observed)
+                         :credential (:credential current) :root (native-mutation-root-id current)
+                         :lifetime (:lifetime cell) :custody (:creation-custody cell) :kind kind}))))) 30000)
+       (reset! entered true)
+       (try (action)
+        (finally
+         (when @entered
+          (agent-get-and-update (registry)
+           (fn [cells]
+            (let [stack (get-in cells [store :native-canonical-turns]) top (last stack)]
+             (when-not (= boundary (:boundary top))
+              (migration-enrollment-fail! :native-command-boundary-unconfirmed))
+             (tuple :left (if (= 1 (count stack))
+                           (update cells store dissoc :native-canonical-turns)
+                           (assoc-in cells [store :native-canonical-turns] (pop stack)))))) 30000)))))
+      (finally (BeamLisp.Env/end_native_command_boundary! (:credential root) context))))))))
+(defn- with-canonical-writer [connection kind action]
+ ;; Only the finite compiled SDK call sites use this PRIVATE adapter. The
+ ;; generic public serialized!/with-writer callback never enters it implicitly.
+ (let [store (:store connection)]
+  ;; Check actual unknown/dead turns before with-writer can create a replacement
+  ;; writer. Independent live resource turns retain normal parallel admission.
+  (Agent/get (registry)
+   (fn [cells]
+    (when-let [root (native-mutation-root! cells store)]
+     (when (native-mutation-unknown? cells root)
+      (migration-enrollment-fail! :native-command-outcome-unconfirmed)))) 30000)
+  (with-writer connection #(with-native-canonical-turn connection kind action))))
+(defn- native-closed-tx? [store]
+ (boolean (Agent/get (registry) #(native-mutation-root! % store) 30000)))
+(defn- native-mutation-admit! [store]
+ ;; BEFORE encoding, collection traversal or -update's user callback. This
+ ;; issues no witness: actual fixed encoded effects are rechecked later.
+ (let [root (Agent/get (registry) #(native-mutation-root! % store) 30000)]
+  (if-not root :legacy
+   (let [cell (Agent/get (registry) #(get % store) 30000)]
+    (if-not (seq (:native-canonical-turns cell))
+     (do (BeamLisp.Env/assert_native_framework_execution!)
+         (Agent/get (registry)
+          (fn [cells]
+           (when (native-mutation-unknown? cells root)
+            (migration-enrollment-fail! :native-command-outcome-unconfirmed))) 30000)
+         :legacy)
+     (let [observed (BeamLisp.Env/assert_native_command_turn! (:credential root))]
+      (Agent/get (registry)
+       (fn [cells]
+        (let [current (native-mutation-root! cells store)
+              actual (native-mutation-cell! cells store current (:caller observed))
+              turn (last (:native-canonical-turns actual))]
+         (when-not (and turn (= (:caller observed) (:owner turn))
+                        (= (:credential observed) (:credential current) (:credential turn))
+                        (= (:boundary observed) (:boundary turn))
+                        (= (:source-depth observed) (:depth turn))
+                        (= (:lifetime actual) (:lifetime turn))
+                        (= (:creation-custody actual) (:custody turn))
+                        (= (native-mutation-root-id current) (:root turn))
+                        (not (native-mutation-unknown? cells current)))
+          (migration-enrollment-fail! :native-command-turn-required)) :canonical)) 30000)))))))
+(defn- native-mutation-encoded! [op arguments]
+ (BeamLisp.CompilerData/check_first_order! arguments {:max-nodes 131072 :max-depth 16 :max-bytes 16777216})
+ (when-not
+  (case op
+   :fjall-put (and (= 2 (count arguments)) (every? erlang/is_binary arguments))
+   :fjall-delete (and (= 1 (count arguments)) (erlang/is_binary (first arguments)))
+   :fjall-cas (and (= 3 (count arguments)) (erlang/is_binary (get arguments 0))
+                  (or (nil? (get arguments 1)) (erlang/is_binary (get arguments 1)))
+                  (erlang/is_binary (get arguments 2)))
+   :fjall-commit (and (= 1 (count arguments)) (vector? (first arguments))
+                     (every? (fn [entry]
+                       (or (and (= :put (first entry)) (= 3 (count entry))
+                                (every? erlang/is_binary (rest entry)))
+                           (and (= :delete (first entry)) (= 2 (count entry))
+                                (erlang/is_binary (get entry 1))))) (first arguments)))
+   :fjall-sync (empty? arguments)
+   false)
+  (migration-enrollment-fail! :native-command-encoded-effect-invalid))
+ (when (> (erlang/external_size arguments) 16777216)
+  (migration-enrollment-fail! :native-command-effect-capacity)) :validated)
+(defn native-mutation-effect!
+ "Fixed primitive adapter. Possessing a store/Conn or running on its writer
+  does not grant a turn. Actual Source callback depth must match the private
+  canonical turn; no callback receives its credential or witness."
+ [store op arguments]
+ (let [root (Agent/get (registry) #(native-mutation-root! % store) 30000)]
+  (if-not root :legacy
+   (let [cell (Agent/get (registry) #(get % store) 30000)]
+    (if-not (seq (:native-canonical-turns cell))
+     ;; Trusted native SDK/IO can operate under G without being app Source.
+     ;; Actual Source cannot use this branch, even on the original owner's PID.
+     (do (BeamLisp.Env/assert_native_framework_execution!)
+         (Agent/get (registry)
+          (fn [cells]
+           (when (native-mutation-unknown? cells root)
+            (migration-enrollment-fail! :native-command-outcome-unconfirmed))) 30000)
+         :legacy)
+     (do
+      (native-mutation-encoded! op arguments)
+      (let [answer (BeamLisp.Env/dispatch_native_command! (:credential root)
+                     {:version 1 :path (:path store) :op op :arguments arguments})]
+       [:native-effect (first answer)])))))))
+(defn- native-mutation-plan! [context payload]
+ ;; Private dynamic invocation cannot fabricate a planning frame. Only the
+ ;; Host invokes this exact immutable SDK body with its native-local token.
+ (let [observed (BeamLisp.Env/assert_native_command_context! context)
+       _ (BeamLisp.CompilerData/check_first_order! payload {:max-nodes 131072 :max-depth 16 :max-bytes 16777216})
+       _ (when-not (and (= #{:version :path :op :arguments} (set (keys payload)))
+                        (= 1 (:version payload)) (string? (:path payload))
+                        (= (:path payload) (Path/expand (:path payload))))
+           (migration-enrollment-fail! :native-command-payload-invalid))
+       _ (native-mutation-encoded! (:op payload) (:arguments payload))
+       witness (erlang/make_ref) key (Base/encode16 (crypto/strong_rand_bytes 32) (list (tuple :case :lower)))
+       row (agent-get-and-update (registry)
+        (fn [cells]
+         (let [matches (filterv (fn [[store cell]]
+                          (and (migration-policy/registry-cell? [store cell])
+                               (= (:path payload) (when (erlang/is_map store) (:path store))))) cells)
+               _ (when-not (= 1 (count matches)) (migration-enrollment-fail! :native-command-resource-ambiguous))
+               [store _] (first matches) root (native-mutation-root! cells store)
+               cell (native-mutation-cell! cells store root (:caller observed)) turn (last (:native-canonical-turns cell))
+               effects (get cells NATIVE-MUTATION-EFFECTS {})]
+          (when-not (and turn (= (:caller observed) (:owner turn))
+                         (= (:boundary observed) (:boundary turn)) (= (:source-depth observed) (:depth turn))
+                         (= (:credential observed) (:credential root) (:credential turn))
+                         (= (:lifetime cell) (:lifetime turn)) (= (:creation-custody cell) (:custody turn))
+                         (= (native-mutation-root-id root) (:root turn))
+                         (not (native-mutation-unknown? cells root))
+                         (not (native-mutation-resource-issued? cells store)) (< (count effects) 512))
+           (migration-enrollment-fail! :native-command-turn-required))
+          (let [row {:key key :witness witness :owner (:caller observed) :resource store
+                     :lifetime (:lifetime cell) :custody (:creation-custody cell)
+                     :root (:root turn) :boundary (:boundary turn) :depth (:depth turn)
+                     :credential (:credential root) :state :issued
+                     :op (:op payload) :arguments (:arguments payload)}]
+           (tuple row (assoc-in cells [NATIVE-MUTATION-EFFECTS witness] row))))) 30000)]
+  {:witness witness :effects [{:op (:op row) :arguments (:arguments row)}] :result :effect-results}))
+(defn- native-mutation-witness! [context witness]
+ (let [observed (BeamLisp.Env/assert_native_command_context! context)]
+  (agent-get-and-update (registry)
+   (fn [cells]
+    (let [row (get-in cells [NATIVE-MUTATION-EFFECTS witness]) store (:resource row)
+          root (native-mutation-root! cells store) cell (native-mutation-cell! cells store root (:caller observed))
+          turn (last (:native-canonical-turns cell))]
+     (when-not (and row (= witness (:witness row)) (= :issued (:state row))
+                    (not (native-mutation-unknown? cells root))
+                    (= (:owner row) (:caller observed))
+                    (= (:credential observed) (:credential root) (:credential row))
+                    (= (:boundary observed) (:boundary row) (:boundary turn))
+                    (= (:source-depth observed) (:depth row) (:depth turn))
+                    (= (:root row) (native-mutation-root-id root))
+                    (= (:lifetime row) (:lifetime cell)) (= (:custody row) (:creation-custody cell)))
+      (migration-enrollment-fail! :native-command-witness-refused))
+     (tuple {:resource store :native-handle (:handle store) :lifetime (:lifetime row)
+             :writer (:owner row) :source-depth (:depth row) :boundary (:boundary row)
+             :effects [{:op (:op row) :arguments (:arguments row)}]}
+            (assoc-in cells [NATIVE-MUTATION-EFFECTS witness :state] :entered)))) 30000)))
+(defn- native-mutation-outcome! [context witness outcome]
+ (let [observed (BeamLisp.Env/assert_native_command_context! context)]
+  (agent-get-and-update (registry)
+   (fn [cells]
+    (let [row (get-in cells [NATIVE-MUTATION-EFFECTS witness])]
+     (when-not (and row (= :entered (:state row)) (= (:owner row) (:caller observed))
+                    (= (:credential observed) (:credential row))
+                    (= (:boundary observed) (:boundary row))
+                    (= (:source-depth observed) (:depth row))
+                    (= :open @(:lifetime row))
+                    (= (:lifetime row) (get-in cells [(:resource row) :lifetime]))
+                    (= (:custody row) (get-in cells [(:resource row) :creation-custody]))
+                    (contains? #{:known :unknown} outcome))
+      (migration-enrollment-fail! :native-command-outcome-unconfirmed))
+     (if (= :unknown outcome)
+      (tuple :held (assoc-in cells [NATIVE-MUTATION-EFFECTS witness :state] :unknown))
+      (let [consumed (conj (get cells NATIVE-MUTATION-CONSUMED [])
+                       {:witness witness :key (:key row) :state :consumed})
+            retained (vec (drop (max 0 (- (count consumed) 256)) consumed))]
+       (tuple :consumed (-> cells
+                          (update NATIVE-MUTATION-EFFECTS dissoc witness)
+                          (assoc NATIVE-MUTATION-CONSUMED retained))))))) 30000)))
+
+
+(def ^:private NATIVE-GUARD-DIRECTORY ".foundry-native-command-guard-v1")
+(defn- native-guard-fixed [name arity]
+ (BeamLisp.Env/with_env :global #(BeamLisp.AOT/sdk_named_constructor! "datom.store-fjall" name arity)))
+(defn- native-guard-root! [connection]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [actual (creation-evidence! connection)
+       root (Agent/get (registry) #(native-mutation-root! % (:resource actual)) 30000)]
+  (when-not (and root (= (erlang/self) (:owner root))
+                 (= (:resource actual) (:resource root)) (= (:lifetime actual) (:lifetime root))
+                 (= (:custody actual) (:custody root)) (= :open @(:lifetime actual))
+                 (nil? (get-in actual [:custody :origin])) (nil? (:creator actual)))
+   (migration-enrollment-fail! :native-guard-original-custody-required)) root))
+(defn- native-guard-schema-digest [connection]
+ (Base/encode16 (crypto/hash :sha256
+   (erlang/term_to_binary (vec (sort-by first (migration-canonical-schema! @(:schema connection))))))
+  (list (tuple :case :lower))))
+(defn- native-guard-stat [path]
+ (let [found (File/lstat path)]
+  (cond (= :ok (elem found 0)) (elem found 1)
+        (= :enoent (elem found 1)) nil
+        :else (migration-enrollment-fail! :native-guard-receipt-io-refused))))
+(defn- native-guard-epoch! [epoch]
+ (when-not (and (erlang/is_map epoch) (= #{:version :basis :nonce :contract} (set (keys epoch)))
+                (= 2 (:version epoch)) (= NATIVE-GUARD-CONTRACT (:contract epoch))
+                (erlang/is_integer (:basis epoch)) (<= FIRST-TX (:basis epoch))
+                (string? (:nonce epoch)) (Regex/match? #"^[a-f0-9]{64}$" (:nonce epoch)))
+  (migration-enrollment-fail! :native-guard-epoch-invalid)) epoch)
+(defn- native-guard-anchor! [connection epoch]
+ ;; The fixed durable receipt is outside Source's Store keyspace. OS/filesystem
+ ;; and explicit native IO remain trusted; this is not a File sandbox.
+ (let [root (native-guard-root! connection) directory (str (:root root) "/" NATIVE-GUARD-DIRECTORY)
+       stat (native-guard-stat directory)]
+  (when (and epoch (nil? stat))
+   (migration-enrollment-fail! :native-guard-unanchored-store-marker))
+  (when (and (nil? stat)
+             (some #(String/starts_with? % (str NATIVE-GUARD-DIRECTORY ".pending-")) (File/ls! (:root root))))
+   (migration-enrollment-fail! :native-guard-publication-unknown))
+  (when stat
+   (let [path (str directory "/receipt.json") file (native-guard-stat path)]
+    (when-not (and (= :directory (:type stat)) (= :regular (:type file))
+                   (<= 1 (:size file) 16384) (= #{"receipt.json"} (set (File/ls! directory))))
+     (migration-enrollment-fail! :native-guard-receipt-invalid))
+    (let [receipt (Jason/decode! (File/read! path))
+          _ (migration-data! receipt)
+          _ (when-not (and (= #{"version" "contract" "root" "journal" "basis" "nonce" "schemaDigest"}
+                              (set (keys receipt)))
+                           (= 1 (get receipt "version")) (= NATIVE-GUARD-CONTRACT (get receipt "contract"))
+                           (= (:root root) (get receipt "root")) (= (:path root) (get receipt "journal"))
+                           (erlang/is_integer (get receipt "basis")) (<= FIRST-TX (get receipt "basis"))
+                           (string? (get receipt "nonce")) (Regex/match? #"^[a-f0-9]{64}$" (get receipt "nonce"))
+                           (string? (get receipt "schemaDigest"))
+                           (Regex/match? #"^[a-f0-9]{64}$" (get receipt "schemaDigest")))
+              (migration-enrollment-fail! :native-guard-receipt-invalid))
+          expected {:version 2 :contract NATIVE-GUARD-CONTRACT :basis (get receipt "basis") :nonce (get receipt "nonce")}]
+     (if epoch
+      (when-not (and (= expected (native-guard-epoch! epoch)) (<= (:basis epoch) @(:basis connection)))
+       (migration-enrollment-fail! :native-guard-receipt-mismatch))
+      ;; Reconcile only completed native receipt publication with untouched
+      ;; logical schema/basis. No Source initializer/migration is replayed.
+      (when-not (and (= (get receipt "basis") @(:basis connection))
+                     (= (get receipt "schemaDigest") (native-guard-schema-digest connection)))
+       (migration-enrollment-fail! :native-guard-interrupted-install-unconfirmed)))
+     ((native-guard-fixed "sync-directory!" 1) directory)
+     {:root root :directory directory :epoch expected :receipt receipt})))))
+(defn- native-guard-publish! [connection]
+ (let [root (native-guard-root! connection)
+       nonce (Base/encode16 (crypto/strong_rand_bytes 32) (list (tuple :case :lower)))
+       destination (str (:root root) "/" NATIVE-GUARD-DIRECTORY)
+       stage (str destination ".pending-" nonce)
+       receipt {"version" 1 "contract" NATIVE-GUARD-CONTRACT "root" (:root root) "journal" (:path root)
+                "basis" @(:basis connection) "nonce" nonce "schemaDigest" (native-guard-schema-digest connection)}
+       bytes (Jason/encode! receipt)]
+  (when (or (native-guard-stat destination) (native-guard-stat stage) (> (erlang/byte_size bytes) 16384))
+   (migration-enrollment-fail! :native-guard-publication-refused))
+  (File/mkdir! stage)
+  (File/write! (str stage "/receipt.json") bytes (list :exclusive))
+  ;; This existing native publisher fsyncs the tiny private tree, publishes
+  ;; without clobbering, and fsyncs its parent. Unknown ack retains the stage or
+  ;; destination; no blind cleanup/overwrite is recovery authority.
+  ((native-guard-fixed "publish-directory!" 2) stage destination)
+  (native-guard-anchor! connection nil)))
+
+(defn native-mutation-retirement-blocker [application root-path]
+ (let [pid (erlang/whereis REGISTRY)]
+  (when-not (= :undefined pid)
+   (Agent/get pid
+    (fn [cells]
+     (let [roots (filterv #(and (= application (:application-id (second %)))
+                                (= root-path (:root (second %)))) (get cells NATIVE-MUTATION-ROOTS {}))]
+      (when (some (fn [[_ root]]
+                    (or (not= :active (:state root)) (native-mutation-held? cells root)
+                        (BeamLisp.Env/native_command_retirement_blocker! (:credential root))
+                        (some (fn [[store cell]]
+                                (and (migration-policy/registry-cell? [store cell])
+                                     (seq (:native-canonical-turns cell))
+                                     (= (native-mutation-root-id root) (:root (last (:native-canonical-turns cell)))))) cells))) roots)
+       :native-command-outcome-unconfirmed))) 30000))))
+
+(defn native-guard-backup-evidence!
+ "Read the fixed durable native receipt on the actual original Root owner.
+  A borrowed Conn, Source callback, supplied path or Store marker grants no
+  authority. Bytes are immutable native inventory, never application payload."
+ [connection]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [epoch (datom.store/-get (:store connection) NATIVE-JOURNAL-EPOCH-KEY)
+       anchor (native-guard-anchor! connection epoch)]
+  (when-not (and epoch anchor)
+   (migration-enrollment-fail! :native-guard-backup-anchor-required))
+  {:path (str NATIVE-GUARD-DIRECTORY "/receipt.json")
+   :bytes (File/read! (str (:directory anchor) "/receipt.json"))
+   :epoch (:epoch anchor)}))
+
+(defn- native-command-bootstrap! [context]
+ ;; Fixed Host registration observer. Neither a fabricated context nor a
+ ;; Source-shaped row can promote original native Root/Conn custody.
+ (let [observed (BeamLisp.Env/assert_native_command_bootstrap_context! context)
+       owner (:caller observed)
+       row (Agent/get (registry)
+            (fn [cells]
+             (let [matches (filterv #(and (= :registering (:state (second %)))
+                                          (= owner (:owner (second %))))
+                                    (get cells NATIVE-MUTATION-ROOTS {}))]
+              (when-not (= 1 (count matches))
+               (migration-enrollment-fail! :native-command-bootstrap-root-required))
+              (second (first matches)))) 30000)
+       connection (registered-at (:path row))
+       _ (when-not connection (migration-enrollment-fail! :native-command-bootstrap-conn-required))
+       actual (creation-evidence! connection)
+       root ((BeamLisp.Env/with_env :global
+               #(BeamLisp.AOT/sdk_named_constructor! "proc.queue-family-root" "native-command-root!" 1)) connection)]
+  (when-not (and (= 0 (:source-depth observed)) (nil? (:generation observed))
+                 (= owner (erlang/self) (:owner root))
+                 (= (native-mutation-root-id row) (native-mutation-root-id root))
+                 (= (:resource actual) (:resource root)) (= (:lifetime actual) (:lifetime root))
+                 (= (:custody actual) (:custody root)) (= :open @(:lifetime actual))
+                 (= owner (get-in actual [:custody :owner]))
+                 (nil? (get-in actual [:custody :origin])) (nil? (:creator actual)))
+   (migration-enrollment-fail! :native-command-bootstrap-custody-required))
+  (migration-native-store! connection)
+  (native-mutation-root-id root)))
+
+(def ^:private NATIVE-CRITICAL-CELL-FIELDS
+ [:schema :basis :lifetime :snapshot :schema-publication :subs])
+(defn- native-command-cell-census! [context]
+ (let [observed (BeamLisp.Env/assert_native_command_census_context! context)
+       credential (:credential observed)]
+  (agent-get-and-update (registry)
+   (fn [cells]
+    (let [matches (filterv #(= credential (:credential (second %))) (get cells NATIVE-MUTATION-ROOTS {}))
+          _ (when-not (= 1 (count matches)) (migration-enrollment-fail! :native-command-census-root-required))
+          [root-key root] (first matches)
+          _ (when-not (and (= :active (:state root)) (= :open @(:lifetime root))
+                           (Process/alive? (:owner root)))
+              (migration-enrollment-fail! :native-command-root-unconfirmed))
+          resources (filterv (fn [[resource cell]]
+                       (and (migration-policy/registry-cell? [resource cell])
+                            (= :open @(:lifetime cell))
+                            (or (= resource (:resource root))
+                                (migration-policy/under-root? (:root root) (:path resource))))) cells)
+          _ (when (> (count resources) 1024) (migration-enrollment-fail! :native-command-cell-capacity))
+          records (vec (mapcat (fn [[resource cell]]
+                     (when-not (and (= :open @(:lifetime cell)) (:creation-custody cell))
+                      (migration-enrollment-fail! :native-command-cell-custody-required))
+                     (keep (fn [field]
+                       (let [target (get cell field)]
+                        (when (and (erlang/is_map target)
+                                   (= :Elixir.BeamLisp.Atom (maps/get :__struct__ target nil)))
+                         {:atom target :field field :resource resource :lifetime (:lifetime cell)
+                          :custody (:creation-custody cell)}))) NATIVE-CRITICAL-CELL-FIELDS)) resources))
+          identities (reduce (fn [known [resource _]]
+                              (let [handle (:handle resource) previous (get known handle)]
+                               (when (and previous (not= previous resource))
+                                (migration-enrollment-fail! :native-command-resource-identity-collision))
+                               (assoc known handle resource))) (:native-resource-identities root {}) resources)
+          _ (when (> (count identities) 4096) (migration-enrollment-fail! :native-command-resource-capacity))]
+     (tuple records (assoc-in cells [NATIVE-MUTATION-ROOTS root-key :native-resource-identities] identities)))) 30000)))
+(defn- native-cell-mutation-witness! [context request]
+ (let [observed (BeamLisp.Env/assert_native_command_context! context)]
+  (Agent/get (registry)
+   (fn [cells]
+    (let [resource (:resource request) root (native-mutation-root! cells resource)
+          cell (native-mutation-cell! cells resource root (:caller observed))
+          turn (last (:native-canonical-turns cell)) target (get cell (:field request))
+          actual-id (BeamLisp.LazyMemo/id (maps/get (:slot request) target))]
+     (when-not (and (= #{:resource :lifetime :custody :atom :field :slot :cell-id} (set (keys request)))
+                    (contains? (set NATIVE-CRITICAL-CELL-FIELDS) (:field request))
+                    (contains? #{:cell :watches} (:slot request))
+                    (= target (:atom request)) (= actual-id (:cell-id request))
+                    (= (:lifetime request) (:lifetime cell)) (= (:custody request) (:creation-custody cell))
+                    turn (= (:caller observed) (:owner turn))
+                    (= (:credential observed) (:credential root) (:credential turn))
+                    (= (:boundary observed) (:boundary turn)) (= (:source-depth observed) (:depth turn))
+                    (= (:root turn) (native-mutation-root-id root))
+                    (not (native-mutation-unknown? cells root)))
+      (migration-enrollment-fail! :native-command-critical-cell-refused))
+     {:resource resource :lifetime (:lifetime cell) :boundary (:boundary turn)
+      :cell-id actual-id :atom target :field (:field request) :slot (:slot request)})) 30000)))
+(defn- migration-policy-finish-connect! [connection]
+ (let [ready (migration-policy-finish-connect-existing! connection)
+       root (Agent/get (registry) #(native-mutation-root! % (:store ready)) 30000)]
+  (when root (BeamLisp.Env/refresh_native_command_cells! (:credential root))) ready))
+(defn- native-canonical-connection! [connection]
+ (let [store (when (erlang/is_map connection) (maps/get :store connection nil))
+       root (Agent/get (registry) #(native-mutation-root! % store) 30000)]
+  (when root
+   (let [cell (Agent/get (registry) #(get % store) 30000)
+         exact? (and (erlang/is_map connection)
+                     (= Conn (maps/get :__struct__ connection nil))
+                     (= (set (keys connection))
+                        #{:__struct__ :store :schema :basis :writer :subs :blobs :lifetime :snapshot :schema-publication})
+                     (lifetime-borrow-identity? connection cell))]
+    (when-not exact?
+     ;; A schema shadow is an INTERNAL already-entered canonical SDK view.
+     ;; Source flags cannot supply its original writer/turn/depth or fence.
+     (let [observed (BeamLisp.Env/assert_native_command_turn! (:credential root))
+           turn (last (:native-canonical-turns cell))]
+      (when-not (and turn (= (:caller observed) (:writer cell) (:owner turn))
+                     (= (:boundary observed) (:boundary turn)) (= (:source-depth observed) (:depth turn))
+                     (contains? #{:install-schema :sync-schema} (:kind turn))
+                     (= true (:prospective-schema connection)) (nil? (:snapshot connection))
+                     (every? #(= (get connection %) (get cell %))
+                       [:basis :writer :subs :blobs :lifetime :schema-publication])
+                     (erlang/is_map (:schema connection))
+                     (= :Elixir.BeamLisp.Atom (maps/get :__struct__ (:schema connection) nil))
+                     (= @(:schema-publication cell) @(:schema connection)))
+       (migration-enrollment-fail! :native-command-original-connection-required))))))) connection)
+
+(defn- native-connection-exposure! [connection]
+ (when (and (erlang/function_exported :Elixir.BeamLisp.Env :source_execution_observation! 0)
+            (> (:source-depth (BeamLisp.Env/source_execution_observation!)) 0))
+  (let [root (Agent/get (registry) #(native-mutation-root! % (:store connection)) 30000)]
+   (when root
+    (Agent/get (registry)
+     (fn [cells]
+      (let [cell (get cells (:store connection)) phase (:migration-phase cell)]
+       (when (and phase (not (contains? #{:ready :complete} (:state phase))))
+        (migration-enrollment-fail! :native-command-resource-not-ready)))) 30000)
+    (BeamLisp.Env/refresh_native_command_cells! (:credential root))))) connection)
