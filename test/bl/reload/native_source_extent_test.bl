@@ -1,0 +1,212 @@
+; HOME review candidate; native UNRUN. Supported managed callback boundary only.
+(ns reload.native-source-extent-test
+ (:require [reload.generation :as g] [env]))
+
+(defn reason [action]
+ (try (action) nil
+  (catch error
+   (if (and (erlang/is_map error) (maps/is_key :original error))
+    (maps/get :original error) (or (:kind (ex-data error)) error)))))
+(defn framework-probe [] (BeamLisp.Env/assert_native_framework_execution!) :native)
+(defn source-probe [] (BeamLisp.Env/source_execution_active?))
+(defn runtime-stack-probe [] (elem (erlang/process_info (erlang/self) :stack_size) 1))
+(defn cleared-source-probe []
+ (let [prior (Process/get :bl_generation)]
+  (try (Process/delete :bl_generation) (BeamLisp.Env/source_execution_active?)
+   (finally (Process/put :bl_generation prior)))))
+(defn rebound-source-probe []
+ (let [prior (env/capture) other (Process/get :extent-test-other)]
+  (try (env/bind (:context other)) (BeamLisp.Env/source_execution_active?)
+   (finally (env/bind prior)))))
+(defn nested-source-probe []
+ (g/invoke! (Process/get :extent-test-other) "extent.other/run" []))
+(defn fixture []
+ (g/prepare! {:sources {"extent.fixture"
+  (str "(ns extent.fixture) "
+       "(defn run [f] (f)) "
+       "(defn echo [x] x) "
+       "(defn invoke [f args] (apply f args)) "
+       "(defn mapped [f xs] (into [] (map f xs))) "
+       "(defn folded [f init xs] (reduce f init xs)) "
+       "(defn sorted [f xs] (sort f xs)) "
+       "(defn tail [n acc] (if (zero? n) acc (recur (dec n) (inc acc)))) "
+       "(defn looping [n] (loop [left n total 0] (if (zero? left) total (recur (dec left) (inc total))))) "
+       "(defn closures [n] ((fn [left acc] (if (zero? left) acc (recur (dec left) (inc acc)))) n 0)) "
+       "(defn tail-observe [n probe] (if (zero? n) (probe) (recur (dec n) probe))) "
+       "(defn guarded ([x] :when (number? x) (+ x 1)) ([_] :other))")}
+  :native-modules #{(String/replace_prefix (Atom/to_string (elem (erlang/fun_info source-probe :module) 1)) "Elixir." "")}}))
+
+(defn checked-write! [cell data]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (BeamLisp.CompilerData/check_first_order! data {:max-nodes 64 :max-depth 8 :max-bytes 256})
+ (swap! cell conj data))
+(defn retain-current! []
+ (let [generation (BeamLisp.Env/execution_origin)
+       module (elem (erlang/fun_info (fn [] nil) :module) 1)]
+  {:generation generation :context (env/capture)
+   :handle (BeamLisp.Env/retain_code! (to-list (conj (:modules generation) module)))}))
+(defn retain-probe [] (retain-current!))
+
+(deftest trusted-framework-and-actual-source-body-have-distinct-domains
+ (let [generation (fixture)]
+  (try
+   (is (= :native (g/with! generation framework-probe)))
+   (is (= true (g/invoke! generation "extent.fixture/run" [source-probe])))
+   (is (= :native_framework_execution_required
+          (reason #(g/invoke! generation "extent.fixture/run" [framework-probe]))))
+   (is (= false (BeamLisp.Env/source_execution_active?)))
+   (is (= :native (g/with! generation framework-probe)))
+   (is (= :unadmitted_source_body (reason #(BeamLisp.Env/with_source_execution! (fn [] nil)))))
+   ;; A rejected native private turn must not crash the Env Agent.
+   (is (= :native (g/with! generation framework-probe)))
+   (finally (g/retire! generation)))))
+
+(deftest validate-returned-user-data-before-any-native-write
+ (let [generation (fixture) writes (atom []) callbacks (atom 0)
+       invalid (fn [] (swap! callbacks inc))]
+  (try
+   (g/with! generation #(checked-write! writes (g/invoke! generation "extent.fixture/echo" [{:step 1}])))
+   (is (= [{:step 1}] @writes))
+   (is (some? (reason #(g/with! generation
+     (fn [] (checked-write! writes (g/invoke! generation "extent.fixture/echo" [invalid])))))))
+   (is (= 0 @callbacks))
+   (is (= [{:step 1}] @writes))
+   (is (some? (reason #(g/with! generation (fn [] (checked-write! writes (String/duplicate "x" 257)))))))
+   (is (= [{:step 1}] @writes))
+   (is (= :native_framework_execution_required
+          (reason #(g/invoke! generation "extent.fixture/run" [(fn [] (checked-write! writes {:bad true}))]))))
+   (is (= [{:step 1}] @writes))
+   (finally (g/retire! generation)))))
+
+(deftest source-exception-restores-domain-and-preserves-the-original-value
+ (let [generation (fixture) original (ex-info "original" {:identity (erlang/make_ref)})
+       seen (try (g/invoke! generation "extent.fixture/run" [(fn [] (throw original))])
+              nil (catch error error))]
+  (try
+   (is (erlang/== original seen))
+   (is (= false (BeamLisp.Env/source_execution_active?)))
+   (is (= :native (g/with! generation framework-probe)))
+   (finally (g/retire! generation)))))
+
+(deftest long-tail-recursion-loop-and-anonymous-recur-remain-bounded
+ (let [generation (fixture)]
+  (try
+   (is (= 100000 (g/invoke! generation "extent.fixture/tail" [100000 0])))
+   (is (= 100000 (g/invoke! generation "extent.fixture/looping" [100000])))
+   (is (= 100000 (g/invoke! generation "extent.fixture/closures" [100000])))
+   (is (< (g/invoke! generation "extent.fixture/tail-observe" [100000 runtime-stack-probe]) 4096))
+   (is (= 3 (g/invoke! generation "extent.fixture/guarded" [2])))
+   (is (= :other (g/invoke! generation "extent.fixture/guarded" [:value])))
+   (is (= false (BeamLisp.Env/source_execution_active?)))
+   (finally (g/retire! generation)))))
+
+(deftest source-derived-native-callback-cannot-wash-domain-through-retention
+ (let [generation (fixture) registration (g/invoke! generation "extent.fixture/run" [retain-probe])
+       prior (env/capture)]
+  (try
+   (is (BeamLisp.Env/code_lease_active? (:handle registration)))
+   (is (= :native_framework_execution_required
+    (reason #(BeamLisp.Env/run_code! (:handle registration)
+      (fn [] (env/bind (:context registration))
+       (BeamLisp.Env/with_owned_generation_execution framework-probe))))))
+   (is (= false (BeamLisp.Env/source_execution_active?)))
+   (finally
+    (env/bind prior)
+    (BeamLisp.Env/release_code! (:handle registration))
+    (g/retire! generation)))))
+
+(deftest actual-scope-drift-and-nested-generation-refuse-and-restore
+ (let [generation (fixture) other (g/prepare! {:sources {"extent.other" "(ns extent.other) (defn run [] :other)"}})
+       prior-other (Process/get :extent-test-other)]
+  (Process/put :extent-test-other other)
+  (try
+   (is (= :source_execution_context_mismatch
+          (reason #(g/invoke! generation "extent.fixture/run" [rebound-source-probe]))))
+   (is (= :source_execution_context_mismatch
+          (reason #(g/invoke! generation "extent.fixture/run" [nested-source-probe]))))
+   (is (= :source_execution_context_mismatch
+          (reason #(g/invoke! generation "extent.fixture/run" [cleared-source-probe]))))
+   (is (= false (BeamLisp.Env/source_execution_active?)))
+   (is (= :native (g/with! generation framework-probe)))
+   (finally (Process/put :extent-test-other prior-other) (g/retire! other) (g/retire! generation)))))
+
+(deftest actual-remote-native-multifunction-and-prepared-arms-share-refusal
+ (let [generation (fixture)
+       read-only (erlang/make_fun :Elixir.BeamLisp.Env :source_execution_active? 0)
+       binary-read (erlang/make_fun :Elixir.BeamLisp.Env :source_critical_target? 2)
+       remote (tuple :$remote :Elixir.BeamLisp.Env :source_execution_active?)
+       multi (tuple :$blfn {0 read-only} nil)
+       unary (partial binary-read :erlang)]
+  (try
+   ;; These are harmless native read targets; the test checks actual identities,
+   ;; not a synthetic module/name whitelist or an effectful probe.
+   (doseq [f [read-only remote multi (partial read-only)]]
+    (is (= :source_native_target_refused
+      (reason #(g/invoke! generation "extent.fixture/invoke" [f []])))))
+   (is (= :source_native_target_refused
+     (reason #(g/invoke! generation "extent.fixture/mapped" [unary [:send]]))))
+   (is (= :source_native_target_refused
+     (reason #(g/invoke! generation "extent.fixture/folded" [binary-read :erlang [:send]]))))
+   (is (= :source_native_target_refused
+     (reason #(g/invoke! generation "extent.fixture/sorted" [binary-read [:erlang :ets]]))))
+   (is (= false (BeamLisp.Env/source_execution_active?)))
+   (finally (g/retire! generation)))))
+
+(deftest native-owned-tables-are-created-with-actual-owner-and-write-protection
+ (is (= :ok (BeamLisp.Env/initialize_source_execution!)))
+ (let [owner (Process/whereis :Elixir.BeamLisp.Env)]
+  (doseq [table [:beam_lisp_source_extents :beam_lisp_source_lease_domains]]
+   (is (= :private (ets/info table :protection)))
+   (is (= owner (ets/info table :owner)))
+   (is (some? (reason #(ets/lookup table (erlang/self))))))
+  (is (= :protected (ets/info :beam_lisp_source_extent_heads :protection)))
+  (is (= owner (ets/info :beam_lisp_source_extent_heads :owner)))
+  (is (some? (reason #(ets/insert :beam_lisp_source_extent_heads (tuple (erlang/self) :forged :forged)))))
+  (is (= false (BeamLisp.Env/source_execution_active?)))))
+
+(deftest released-physical-ticket-and-retired-graph-cannot-admit-new-source-body
+ (let [generation (fixture) registration (g/invoke! generation "extent.fixture/run" [retain-probe])
+       ran (atom 0)]
+  (BeamLisp.Env/release_code! (:handle registration))
+  (is (= :cancelled (BeamLisp.Env/run_code! (:handle registration) #(swap! ran inc))))
+  (is (= 0 @ran))
+  (g/retire! generation)
+  (is (= :retired-generation (reason #(g/invoke! generation "extent.fixture/tail" [1 0]))))
+  (is (= false (BeamLisp.Env/source_execution_active?)))))
+
+(defn owner-row? [pid]
+ (Agent/get :Elixir.BeamLisp.Env (fn [_] (ets/member :beam_lisp_source_extents pid))))
+(defn await-owner-gone [pid remaining]
+ (if (owner-row? pid)
+  (if (zero? remaining) false
+   (do (Process/sleep 1) (recur pid (dec remaining)))) true))
+(deftest actual-owner-down-reclaims-private-domain-state
+ (let [generation (fixture) parent (erlang/self)
+       child (erlang/spawn
+              (fn []
+               (let [value (g/invoke! generation "extent.fixture/run" [source-probe])]
+                (erlang/send parent (tuple :extent-child-ready (erlang/self) value))
+                (receive :finish :ok))))
+       monitor (erlang/monitor :process child)]
+  (try
+   (is (= true (receive [:extent-child-ready seen value] :when (= seen child) value (after 5000 :timeout))))
+   (is (owner-row? child))
+   (erlang/send child :finish)
+   (is (= :normal (receive [:DOWN seen :process owner why] :when (and (= seen monitor) (= owner child)) why
+                  (after 5000 :timeout))))
+   (is (await-owner-gone child 128))
+   (is (= (list) (ets/lookup :beam_lisp_source_extent_heads child)))
+   (finally
+    (when (erlang/is_process_alive child) (erlang/exit child :kill))
+    (g/retire! generation)))))
+
+(defn generic-thunk [] :generic)
+(deftest public-action-apis-preserve-native-multi-and-remote-invocable-abi
+ (let [module (elem (erlang/fun_info generic-thunk :module) 1)
+       function (elem (erlang/fun_info generic-thunk :name) 1)
+       targets [generic-thunk (tuple :$blfn {0 generic-thunk} nil)
+                (tuple :$remote module function)]]
+  (doseq [action targets]
+   (is (= :generic (BeamLisp.Env/with_generation_lock :extent-abi action)))
+   (is (= :generic (BeamLisp.Env/with_env (env/current) action)))
+   (is (= :generic (BeamLisp.Env/with_code_lease (list module) action))))))

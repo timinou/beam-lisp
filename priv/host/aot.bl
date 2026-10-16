@@ -1481,6 +1481,193 @@
       (erlang/error :sdk_class_source_declaration_missing_or_ambiguous))
     (erlang/hd (elem found 1))))
 
+(defn- sdk_binding_routes! [mod bytes routes]
+ ;; Literal checked compiler definitions identify exact emitted routes only.
+ ;; They NEVER supply privacy: callers join explicit declaration metadata.
+ (let [definitions (sdk_stage_literal_definitions! mod bytes)]
+  (when definitions
+   (when-not (and (erlang/is_map definitions) (<= (erlang/map_size definitions) 8192))
+    (erlang/error :invalid_sdk_binding_routes))
+   (Map/new (Enum/map definitions
+    (fn [binding]
+     (let [name (elem binding 0) definitions (elem binding 1)]
+      (when-not (and (erlang/is_binary name) (erlang/is_list definitions)
+                     (<= (erlang/length definitions) 256))
+       (erlang/error :invalid_sdk_binding_routes))
+      (tuple name (Enum/uniq (Enum/flat_map definitions
+       (fn [definition]
+        (when-not (and (erlang/is_tuple definition) (= 5 (erlang/tuple_size definition))
+                       (contains? #{:fixed :variadic} (elem definition 0))
+                       (erlang/is_integer (elem definition 1)) (<= 0 (elem definition 1) 255)
+                       (erlang/is_atom (elem definition 2)) (erlang/is_map (elem definition 3))
+                       (= :defn-clause (Map/get (elem definition 3) :op))
+                       (erlang/is_list (Map/get (elem definition 3) :params))
+                       (erlang/is_atom (elem definition 4)))
+         (erlang/error :invalid_sdk_binding_routes))
+        (let [function (elem definition 2) body (elem definition 4)
+              arity (erlang/length (Map/get (elem definition 3) :params))]
+         (when-not (and (<= arity 255)
+                        (= arity (if (= :variadic (elem definition 0)) (inc (elem definition 1)) (elem definition 1)))
+                        (= body (Map/get routes (tuple function arity))))
+          (erlang/error :invalid_sdk_binding_routes))
+         (list (tuple mod function arity) (tuple body function arity))))))))))))))
+
+(defn- sdk_lambda_routes! [bytes]
+ ;; Decode only the finite native BEAM lambda/atom tables, never ETF function
+ ;; values or source syntax. Every row is bound to these authenticated bytes.
+ (let [chunks (beam_lib/all_chunks bytes)]
+  (when-not (= :ok (elem chunks 0)) (erlang/error :invalid_sdk_lambda_table))
+  (let [table (List/keyfind (elem chunks 2) (String/to_charlist "FunT") 0)]
+   (if (nil? table) {}
+    (let [table-bytes (elem table 1)
+          _ (when (< (erlang/byte_size table-bytes) 4) (erlang/error :invalid_sdk_lambda_table))
+          count (binary/decode_unsigned (binary/part table-bytes 0 4))
+          atoms (Map/new (Keyword/get (elem (elem (beam_lib/chunks bytes (list :atoms)) 1) 1) :atoms))]
+     (when-not (and (<= count 65536) (= (erlang/byte_size table-bytes) (+ 4 (* count 24))))
+      (erlang/error :invalid_sdk_lambda_table))
+     (loop [index 0 output {}]
+      (if (= index count) output
+       (let [offset (+ 4 (* index 24))
+             function (Map/get atoms (binary/decode_unsigned (binary/part table-bytes offset 4)))
+             arity (binary/decode_unsigned (binary/part table-bytes (+ offset 4) 4))
+             slot (binary/decode_unsigned (binary/part table-bytes (+ offset 12) 4))
+             free (binary/decode_unsigned (binary/part table-bytes (+ offset 16) 4))]
+        (when-not (and (erlang/is_atom function) (<= free arity 255)
+                       (not (Map/has_key? output slot))) (erlang/error :invalid_sdk_lambda_table))
+        (recur (inc index) (Map/put output slot (tuple function (- arity free) free)))))))))))
+
+(defn- sdk_record_ctor_origins! [mod bytes]
+ ;; Exact native constructor factory instruction references identify their
+ ;; lambda slots. Never infer constructor authority from a lambda name prefix.
+ (if (not= mod :Elixir.BeamLisp.Record) {}
+  (let [functions (elem (beam_disasm/file bytes) 5)]
+   (Enum/reduce functions {}
+    (fn [function out]
+     (let [name (elem function 1) arity (elem function 2)]
+      (if-not (and (= 1 arity) (contains? #{:positional_ctor :map_ctor} name)) out
+       (Enum/reduce (elem function 4) out
+        (fn [instruction out]
+         (if (and (erlang/is_tuple instruction) (>= (erlang/tuple_size instruction) 5)
+                   (contains? #{:make_fun2 :make_fun3} (elem instruction 0)))
+          (Map/put out (elem instruction 2) name) out))))))))))
+
+(defn- sdk_kernel_primitive_routes! [entries]
+ ;; The exact bootstrap ABI literal is an explicit public primitive table,
+ ;; separately authenticated by native seed bytes. A generic body never grants
+ ;; public access. Core declaration-private metadata can only narrow it later.
+ (let [shim :Elixir.BeamLisp.Ns.Rt proof (Map/get entries shim)
+       definitions (when proof (erlang/apply shim :__bl_ns_defs__ (list)))
+       bindings (when definitions (Map/get definitions "seed-rows"))
+       definition (when (and (erlang/is_list bindings) (= 1 (erlang/length bindings))) (first bindings))
+       node (when definition (elem definition 3)) body (when node (Map/get node :body))
+       provider (when definition (elem definition 4))]
+  (when-not (and proof definition (= :fixed (elem definition 0)) (= 0 (elem definition 1))
+                 (erlang/is_map node) (= :defn-clause (Map/get node :op))
+                 (= (list) (Map/get node :params)) (nil? (Map/get node :guard))
+                 (erlang/is_map body) (= :lit (Map/get body :op))
+                 (Map/has_key? entries provider) (erlang/is_list (Map/get body :val))
+                 (<= (erlang/length (Map/get body :val)) 2048))
+   (erlang/error :unattested_source_kernel_abi))
+  (Enum/reduce (Map/get body :val) {}
+   (fn [row output]
+    (when-not (and (erlang/is_list row) (= 5 (erlang/length row)))
+     (erlang/error :invalid_source_kernel_abi))
+    (let [name (nth row 0) module (if (= :rt (nth row 1)) shim (nth row 1))
+          fixed (nth row 2) variadic (nth row 3)]
+     (when-not (and (erlang/is_binary name) (erlang/is_atom module) (Map/has_key? entries module)
+                    (erlang/is_map fixed) (<= (erlang/map_size fixed) 256)
+                    (contains? #{:both :value :link} (nth row 4)))
+      (erlang/error :invalid_source_kernel_abi))
+     (let [routes (Enum/map fixed
+                   (fn [arm]
+                    (when-not (and (erlang/is_integer (elem arm 0)) (<= 0 (elem arm 0) 255)
+                                   (erlang/is_atom (elem arm 1))) (erlang/error :invalid_source_kernel_abi))
+                    (tuple module (elem arm 1) (elem arm 0))))
+           routes (if (nil? variadic) routes
+                    (do
+                     (when-not (and (erlang/is_list variadic) (= 2 (erlang/length variadic))
+                                    (erlang/is_integer (first variadic)) (<= 0 (first variadic) 254)
+                                    (erlang/is_atom (second variadic))) (erlang/error :invalid_source_kernel_abi))
+                     (cons (tuple module (second variadic) (inc (first variadic))) routes)))]
+      (Map/put output name routes)))))))
+
+(defn- sdk_merge_target_kind [left right]
+ ;; A collision can only narrow access; macro/non-runtime declarations refuse.
+ (if (and (= :public left) (= :public right)) :public :private))
+(defn- sdk_source_target_inventory! [entries]
+ (let [modules (Map/new (Enum/map entries
+                  (fn [entry] (tuple (elem entry 0)
+                    {:md5 (erlang/apply (elem entry 0) :module_info (list :md5)) :role (Map/get (elem entry 1) :role)
+                     :lambda-routes (Map/get (elem entry 1) :lambda-routes {})
+                     :ctor-lambda-origins (Map/get (elem entry 1) :ctor-lambda-origins {})
+                     :local? (contains? #{:stable-body :stable-seed} (Map/get (elem entry 1) :role))}))))
+       primitive-routes (sdk_kernel_primitive_routes! entries)
+       core-row (Map/get entries :Elixir.BeamLisp.Ns.Core)
+       core-declarations (when core-row (Map/get core-row :declarations))
+       core-callables (when core-row (Map/get core-row :callable-kinds))
+       _ (when-not (and (sdk_declaration_descriptor? core-declarations "core")
+                        (sdk_callable_descriptor? core-callables "core"))
+           (erlang/error :source_core_declaration_metadata_required))
+       primitive-targets (Enum/reduce primitive-routes {}
+                          (fn [binding output]
+                           (Enum/reduce (elem binding 1) output (fn [mfa output]
+                            (let [name (elem binding 0) declared (Map/get (elem core-declarations 2) name)
+                                  callable (Map/get (elem core-callables 2) name)
+                                  kind (if (or (nil? declared)
+                                               (and (= :public declared) (= :function callable))) :public :private)]
+                             (Map/update output mfa kind (fn [old] (sdk_merge_target_kind old kind))))))))
+       primitive-targets
+        (Enum/reduce (list (tuple :Elixir.BeamLisp.Env :decode_data_term! 1)
+                          (tuple :Elixir.BeamLisp.Env :decode_data_term! 2)
+                          (tuple :Elixir.BeamLisp.CompilerData :check_closed_etf! 1)
+                          (tuple :Elixir.BeamLisp.CompilerData :check_closed_etf! 2)
+                          (tuple :Elixir.BeamLisp.CompilerData :decode_closed_etf! 1)
+                          (tuple :Elixir.BeamLisp.CompilerData :decode_closed_etf! 2)) primitive-targets
+          (fn [mfa output]
+            ;; Fixed data-only ABI, authenticated by actual seed/SDK bytes.
+            ;; Function export membership alone never grants a Host route.
+            (when-not (and (Map/has_key? modules (elem mfa 0))
+                           (erlang/function_exported (elem mfa 0) (elem mfa 1) (elem mfa 2)))
+              (erlang/error :source_data_decoder_abi_required))
+            (Map/put output mfa :public)))
+       targets (Enum/reduce entries primitive-targets
+        (fn [entry output]
+         (let [row (elem entry 1) ns (Map/get row :forwarder-namespace)
+               descriptor (Map/get row :declarations) callable (Map/get row :callable-kinds)]
+          (if-not (and (= :mutable-forwarder (Map/get row :role))
+                       (sdk_declaration_descriptor? descriptor ns) (sdk_callable_descriptor? callable ns)) output
+           (Enum/reduce (Map/get row :binding-routes {}) output
+            (fn [binding output]
+             (let [declared (Map/get (elem descriptor 2) (elem binding 0))
+                   kind (if (= :public declared) :public :private)]
+              (if (or (nil? declared) (not= :function (Map/get (elem callable 2) (elem binding 0)))) output
+               (Enum/reduce (elem binding 1) output
+                (fn [mfa output]
+                 (when-not (Map/has_key? modules (elem mfa 0)) (erlang/error :incomplete_sdk_binding_route))
+                 (Map/update output mfa kind (fn [prior] (sdk_merge_target_kind prior kind)))))))))))))
+       classes (Enum/reduce entries {}
+        (fn [entry out]
+         (let [row (elem entry 1) owner (Map/get row :declaration-owner)
+               metadata (Map/get row :generated-class)]
+          (if-not (and (= :generated-class (Map/get row :role)) owner metadata) out
+           (let [ns (elem owner 0) name (elem owner 1)
+                 namespace (Map/get entries (BeamLisp.Emit/module_for ns))
+                 declarations (when namespace (Map/get namespace :declarations))
+                 callables (when namespace (Map/get namespace :callable-kinds))
+                 public? (fn [binding]
+                          (and (sdk_declaration_descriptor? declarations ns)
+                               (sdk_callable_descriptor? callables ns)
+                               (= :public (Map/get (elem declarations 2) binding))
+                               (= :class (Map/get (elem callables 2) binding))))]
+            (Map/put out (elem entry 0)
+             {:md5 (Map/get row :md5) :positional (public? (erlang/iolist_to_binary (list "->" name)))
+              :map (and (= :record (elem metadata 3))
+                        (public? (erlang/iolist_to_binary (list "map->" name))))}))))))]
+  {:version 1 :modules modules :targets targets :classes classes
+   :names (Enum/reduce targets {} (fn [entry out]
+            (let [mfa (elem entry 0) key (tuple (elem mfa 0) (elem mfa 1)) kind (elem entry 1)]
+             (Map/update out key kind (fn [old] (sdk_merge_target_kind old kind))))))}))
+
 (defn sdk_artifact_entry!
   "Compiler/build-owned inventory row for one emitted BEAM. Includes the exact
    input bytes and executable identity; a filename or namespace prefix alone
@@ -1502,7 +1689,14 @@
         stamped (normalized_attribute attrs :bl_unit_source_digest)
         owner (normalized_attribute attrs :bl_declaration_owner)
         role (normalized_attribute attrs :bl_aot_artifact_role)
-        declarations (normalized_attribute attrs :bl_sdk_declarations)]
+        declarations (normalized_attribute attrs :bl_sdk_declarations)
+        callable (normalized_attribute attrs :bl_sdk_callable_kinds)]
+    (when (and (not (nil? callable))
+               (not (and (= :mutable-forwarder role)
+                         (sdk_callable_descriptor? callable (normalized_attribute attrs :bl_aot_forwarder_namespace))
+                         (sdk_declaration_descriptor? declarations (normalized_attribute attrs :bl_aot_forwarder_namespace))
+                         (= (MapSet/new (Map/keys (elem callable 2))) (MapSet/new (Map/keys (elem declarations 2)))))))
+      (erlang/error :sdk_inventory_invalid_callable_metadata))
     (when-not (and (erlang/== 1 (normalized_attribute attrs :bl_aot_artifact_version))
                    (Enum/member? (list :stable-body :initializer :actor :generated-class :mutable-forwarder) role)
                    (erlang/== (Enum/member? (list :actor :generated-class) role)
@@ -1565,6 +1759,10 @@
      :imports (Enum/uniq (Enum/map (Keyword/get (elem (elem (beam_lib/chunks bytes (list :imports)) 1) 1) :imports)
                             (fn [entry] (elem entry 0))))
      :role role :declarations declarations
+     :lambda-routes (when (= :stable-body role) (sdk_lambda_routes! bytes))
+     :callable-kinds callable
+     :binding-routes (when (= :mutable-forwarder role)
+                       (sdk_binding_routes! mod bytes (normalized_attribute attrs :bl_aot_forwarder_routes)))
      :forwarder-namespace (normalized_attribute attrs :bl_aot_forwarder_namespace)
      :forwarder-routes (normalized_attribute attrs :bl_aot_forwarder_routes)
      :unit-references
@@ -1740,7 +1938,11 @@
 (defn- seed_forwarder_metadata [mod bytes]
   ;; The seed manifest authenticates the bytes; derive their role from the
   ;; actual emitted executable surface rather than a namespace naming rule.
-  (let [disassembly (beam_disasm/file bytes) exports (elem disassembly 2)
+  (let [sha (crypto/hash :sha256 bytes)
+        cached (when (erlang/function_exported :Elixir.BeamLisp.Env :source_seed_metadata 1)
+                 (BeamLisp.Env/source_seed_metadata sha))]
+   (or cached
+    (let [disassembly (beam_disasm/file bytes) exports (elem disassembly 2)
         ns (Enum/find (BeamLisp.Tiers/boot_namespaces)
              (fn [candidate] (erlang/== mod (BeamLisp.Emit/base_module_for candidate))))]
     (when (and ns (Enum/any? exports
@@ -1761,7 +1963,21 @@
                              (erlang/error :invalid_seed_forwarder))
                            (tuple (tuple (elem f 1) (elem f 2)) (elem external 1))))))]
         (verify_sdk_forwarder! (tuple mod bytes) ns routes)
-        {:role :mutable-forwarder :forwarder-namespace ns :forwarder-routes routes}))))
+        (let [attrs (Keyword/get (elem (elem (beam_lib/chunks bytes (list :attributes)) 1) 1) :attributes)
+              declarations (normalized_attribute attrs :bl_sdk_declarations)
+              callable (normalized_attribute attrs :bl_sdk_callable_kinds)]
+         (when (and (not (nil? callable))
+                    (not (and (sdk_callable_descriptor? callable ns)
+                              (sdk_declaration_descriptor? declarations ns)
+                              (= (MapSet/new (Map/keys (elem callable 2))) (MapSet/new (Map/keys (elem declarations 2)))))))
+          (erlang/error :invalid_seed_callable_metadata))
+         (when (and declarations (not (sdk_declaration_descriptor? declarations ns)))
+          (erlang/error :invalid_seed_declaration_metadata))
+         (let [metadata {:role :mutable-forwarder :forwarder-namespace ns :forwarder-routes routes
+                          :declarations declarations :callable-kinds callable
+                          :binding-routes (sdk_binding_routes! mod bytes routes)}]
+          (if (erlang/function_exported :Elixir.BeamLisp.Env :cache_source_seed_metadata! 2)
+           (BeamLisp.Env/cache_source_seed_metadata! sha metadata) metadata)))))))))
 
 (defn- source_seed_inventory! []
   ;; Checkout startup already verifies this authoritative floor. Re-use its
@@ -1787,7 +2003,7 @@
               ;; seed. Its compiler receipt must supply replacement evidence.
               (if (erlang/not (erlang/== md5 (erlang/apply mod :module_info (list :md5)))) acc
                 (Map/put acc mod
-                  (Map/merge {:role :stable-seed :md5 md5 :sha256 sha
+                  (Map/merge {:role :stable-seed :lambda-routes (sdk_lambda_routes! bytes) :ctor-lambda-origins (sdk_record_ctor_origins! mod bytes) :md5 md5 :sha256 sha
                               :seed? true :compiler-key (BeamLisp.AOTCache/compiler_key)
                               :imports (Enum/uniq (Enum/map
                                 (Keyword/get (elem (elem (beam_lib/chunks bytes (list :imports)) 1) 1) :imports)
@@ -1821,7 +2037,7 @@
                       (Code/ensure_loaded? mod)
                       (erlang/== md5 (erlang/apply mod :module_info (list :md5))))
           (erlang/error :unproved_sdk_bootstrap_dependency))
-        (Map/merge {:role :stable-seed :seed? true :md5 md5 :sha256 sha
+        (Map/merge {:role :stable-seed :seed? true :lambda-routes (sdk_lambda_routes! bytes) :ctor-lambda-origins (sdk_record_ctor_origins! mod bytes) :md5 md5 :sha256 sha
                     :compiler-key (BeamLisp.AOTCache/compiler_key)
                     :imports (Enum/uniq (Enum/map
                       (Keyword/get (elem (elem (beam_lib/chunks bytes (list :imports)) 1) 1) :imports)
@@ -2127,21 +2343,31 @@
                   (Keyword/get (elem (elem (beam_lib/chunks bytes (list :imports)) 1) 1) :imports)
                   (fn [entry] (elem entry 0))))
         forwarder? (erlang/== :mutable-forwarder (Map/get row :role))
-        routes (when forwarder? (image_sdk_routes! bytes row))]
+        routes (when forwarder? (image_sdk_routes! bytes row))
+        attrs (Keyword/get (elem (elem (beam_lib/chunks bytes (list :attributes)) 1) 1) :attributes)
+        callable (normalized_attribute attrs :bl_sdk_callable_kinds)]
     (when-not (and (erlang/== identity (Atom/to_string mod))
                   (erlang/== (Enum/sort (Map/get row :imports))
                     (Enum/sort (Enum/map imports (fn [dependency] (Atom/to_string dependency)))))
                   (Code/ensure_loaded? mod))
       (erlang/error :sdk_image_imports_changed))
+    (when (and (not (nil? callable))
+               (not (and forwarder? (sdk_callable_descriptor? callable (Map/get row :forwarder-namespace))
+                         (sdk_declaration_descriptor? (Map/get row :declarations) (Map/get row :forwarder-namespace))
+                         (= (MapSet/new (Map/keys (elem callable 2))) (MapSet/new (Map/keys (elem (Map/get row :declarations) 2)))))))
+      (erlang/error :sdk_image_callable_metadata_changed))
+    (when (and (Map/has_key? row :callable-kinds) (not= callable (Map/get row :callable-kinds)))
+      (erlang/error :sdk_image_callable_metadata_changed))
     (when forwarder?
-      (let [attrs (Keyword/get (elem (elem (beam_lib/chunks bytes (list :attributes)) 1) 1) :attributes)
-            declarations (normalized_attribute attrs :bl_sdk_declarations)]
+      (let [declarations (normalized_attribute attrs :bl_sdk_declarations)]
         (when-not (and (or (nil? declarations)
                           (sdk_declaration_descriptor? declarations (Map/get row :forwarder-namespace)))
                        (erlang/== declarations (Map/get row :declarations)))
           (erlang/error :sdk_image_declaration_metadata_changed)))
       (verify_sdk_forwarder! (tuple mod bytes) (Map/get row :forwarder-namespace) routes))
-    (Map/merge row {:imports imports :forwarder-routes routes})))
+    (Map/merge row {:imports imports :forwarder-routes routes :callable-kinds callable
+                    :lambda-routes (when (= :stable-body (Map/get row :role)) (sdk_lambda_routes! bytes))
+                    :binding-routes (when forwarder? (sdk_binding_routes! mod bytes routes))})))
 
 (defn- complete_image_sdk_closure! [root inventory]
   (let [manifest (BeamLisp.Bootstrap/manifest)
@@ -2174,7 +2400,8 @@
   "Attest only loaded SDK roots and their actual executable import closure.
    The image's complete provenance does not force unrelated units to load in
    development. Lazy SDK init refreshes the shared lease before effects."
-  []
+  ([] (sdk_runtime_inventory! false))
+  ([source-targets?]
   (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root)) path (Path/join root "sdk-code.term")
         entries (if (File/exists? path) (complete_image_sdk_closure! root (inventory_term path))
                   (complete_source_sdk_closure!
@@ -2192,7 +2419,7 @@
                 (let [proof (Map/get entries (elem route 1))]
                   (when-not (and proof (Enum/member? (list :stable-body :stable-seed) (Map/get proof :role)))
                     (erlang/error :unproved_sdk_forwarder_target)))))))))
-    (Enum/reduce entries (tuple (Map/new) (Map/new) (Map/new))
+    (let [proof (Enum/reduce entries (tuple (Map/new) (Map/new) (Map/new))
       (fn [entry acc]
         (let [mod (elem entry 0) row (elem entry 1) source_name (Map/get row :source)
               seen (elem acc 1) source (when source_name (physical_sdk_path (Path/join root source_name)))
@@ -2215,7 +2442,10 @@
                  (if forwarder?
                    (Map/put (elem acc 2) mod
                      {:namespace (Map/get row :forwarder-namespace) :routes routes :md5 (Map/get row :md5)})
-                   (elem acc 2))))))))
+                   (elem acc 2))))))]
+     (if source-targets?
+      (tuple (elem proof 0) (elem proof 1) (elem proof 2) (sdk_source_target_inventory! entries))
+      proof)))))
 
 (defn sdk_callable_evidence! [callback]
   (let [mod (erlang/element 2 (erlang/fun_info callback :module))
@@ -3781,6 +4011,14 @@
                           (<= (erlang/byte_size (elem entry 0)) 512)
                           (contains? #{:public :private :value :macro :unavailable} (elem entry 1)))))))
 
+(defn- sdk_callable_descriptor? [descriptor ns]
+ (and (erlang/is_tuple descriptor) (= 3 (erlang/tuple_size descriptor))
+      (= 1 (elem descriptor 0)) (= ns (elem descriptor 1))
+      (erlang/is_map (elem descriptor 2)) (<= (erlang/map_size (elem descriptor 2)) 8192)
+      (Enum/all? (elem descriptor 2)
+       (fn [entry] (and (erlang/is_binary (elem entry 0)) (<= 1 (erlang/byte_size (elem entry 0)) 512)
+                        (contains? #{:function :value :macro :class :unavailable} (elem entry 1)))))))
+
 (defn sdk_declaration_kind
   "Privacy from an actual complete, current compiler-owned SDK unit. A body
    table, alias spelling, missing descriptor or arbitrary cache attribute is
@@ -4458,6 +4696,7 @@
                      ;; admission needs actual expanded declaration metadata.
                      ;; Missing metadata is a miss followed by real staging.
                      (sdk_declaration_descriptor? (Map/get row :declarations) ns)
+                     (sdk_callable_descriptor? (Map/get row :callable-kinds) ns)
                      (erlang/== (Enum/sort modules)
                        (Enum/sort (cons shim (Map/get row :unit-references)))))
         (erlang/error :sdk_stage_cached_unit_mismatch))
