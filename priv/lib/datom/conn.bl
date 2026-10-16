@@ -863,7 +863,8 @@
   (throw (ex-info "Exact complete connection handle required" {:kind :invalid-connection-borrow})))
  (lifetime-borrow-store! (maps/get :store connection))
  connection)
-(defn- lifetime-borrow-cell? [connection cell]
+(defn- lifetime-borrow-identity? [connection cell]
+ ;; Full static native identity also remains meaningful after writer failure.
  (let [custody (:creation-custody cell)]
   (and cell (= (:lifetime connection) (:lifetime cell))
        (= (:basis connection) (:basis cell)) (= (:schema connection) (:schema cell))
@@ -871,9 +872,11 @@
        (= (:writer connection) (:writer cell))
        (= (:snapshot connection) (:snapshot cell))
        (= (:schema-publication connection) (:schema-publication cell))
-       (= :open @(:lifetime cell)) (Process/alive? (:writer cell))
        (erlang/is_map custody) (= #{:owner :ticket :origin} (set (keys custody)))
        (erlang/is_pid (:owner custody)) (erlang/is_reference (:ticket custody)))))
+(defn- lifetime-borrow-cell? [connection cell]
+ (and (lifetime-borrow-identity? connection cell)
+      (= :open @(:lifetime cell)) (Process/alive? (:writer cell))))
 (defn- lifetime-borrow-receipt! [receipt]
  (when-not (and (erlang/is_tuple receipt) (= 6 (erlang/tuple_size receipt))
                 (= :datom.conn/retained-lifetime (elem receipt 0))
@@ -965,8 +968,16 @@
          row (get-in cell [:lifetime-borrowers (elem receipt 4)])]
     (when-not (lifetime-borrow-matches? receipt cell row)
      (throw (ex-info "Connection borrow is stale" {:kind :stale-connection-borrow})))
-    (tuple :released (assoc entries key
-                       (update cell :lifetime-borrowers dissoc (elem receipt 4)))))) 30000))
+    (let [ticket (elem receipt 4) request-row (get-in cell [:lifetime-borrow-requests ticket])]
+     (when (and request-row
+                (not (and (contains? #{:held :fenced} (:phase request-row))
+                          (= receipt (:receipt request-row)))))
+      (throw (ex-info "Request return custody conflict" {:kind :stale-connection-borrow})))
+     (tuple :released
+      (assoc entries key
+       (cond-> (update cell :lifetime-borrowers dissoc ticket)
+        request-row (assoc-in [:lifetime-borrow-requests ticket]
+                      {:request (:request request-row) :phase :closed}))))))) 30000))
 
 (defn release!
   "Forget everything the registry holds for this connection's store.
@@ -1705,6 +1716,152 @@
       (guard-fail! :connection-custody-unavailable))
      {:resource key :connection c :lifetime (:lifetime cell)
       :creator (:guard-creator cell) :custody custody})) 30000)))
+
+;; Initial-borrow requests. The identity is local native data BEFORE any borrow
+;; mutation. It grants no Root/application/graph/worker authority. The trusted
+;; SDK consumer retains its handle privately, independently of the RPC reply.
+(defn prepare-lifetime-request!
+ "Capture exact current native Conn creation evidence with a fresh local ref,
+  actual caller PID and Env. Evidence lookup is read-only; no borrow is issued.
+  Losing this read's reply cannot strand native retention. Keep the handle private."
+ [connection]
+ (lifetime-borrow-connection! connection)
+ ;; The existing observer may adopt legacy nil lifetimes. This new entry must
+ ;; remain read-only before local request issuance, so reject that path first.
+ (when-not (maps/get :lifetime connection)
+  (throw (ex-info "Existing exact lifetime required" {:kind :invalid-connection-borrow-request})))
+ (let [ticket (erlang/make_ref) owner (erlang/self) scope (BeamLisp.Env/env_id)
+       pid (lifetime-borrow-registry!) key (store-key (maps/get :store connection))
+       evidence
+       (Agent/get pid
+        (fn [entries]
+         (let [cell (get entries key)]
+          ;; Refuse outside Agent/get so an invalid handle cannot crash registry.
+          (when (lifetime-borrow-cell? connection cell)
+           {:resource key :connection connection :lifetime (:lifetime cell)
+            :creator (:guard-creator cell) :custody (:creation-custody cell)}))) 30000)]
+  (when-not evidence
+   (throw (ex-info "Connection custody unavailable" {:kind :connection-borrow-unavailable})))
+  (tuple :datom.conn/lifetime-request ticket owner scope evidence)))
+
+(defn- lifetime-request! [request]
+ (when-not (and (erlang/is_tuple request) (= 5 (erlang/tuple_size request))
+                (= :datom.conn/lifetime-request (elem request 0))
+                (erlang/is_reference (elem request 1)) (erlang/is_pid (elem request 2))
+                (or (= :global (elem request 3))
+                    (and (erlang/is_tuple (elem request 3)) (= 2 (erlang/tuple_size (elem request 3)))
+                         (= :env (elem (elem request 3) 0))
+                         (erlang/is_reference (elem (elem request 3) 1))))
+                (erlang/is_map (elem request 4))
+                (= #{:resource :connection :lifetime :creator :custody} (set (keys (elem request 4)))))
+  (throw (ex-info "Exact native lifetime request required" {:kind :invalid-connection-borrow-request})))
+ (lifetime-borrow-connection! (:connection (elem request 4)))
+ request)
+
+(defn- lifetime-request-cell? [request cell]
+ ;; Reconciliation is independent of writer/open liveness. The full ORIGINAL
+ ;; canonical Conn, immutable creation evidence and native cell must match.
+ (let [evidence (elem request 4) connection (:connection evidence)]
+  (and (lifetime-borrow-identity? connection cell)
+       (= (:resource evidence) (store-key (maps/get :store connection)))
+       (= (:lifetime evidence) (:lifetime cell))
+       (= (:creator evidence) (:guard-creator cell))
+       (= (:custody evidence) (:creation-custody cell)))))
+
+(defn commit-lifetime-request!
+ "Idempotent initial admission for ONLY the actual original caller PID/Env.
+  A different custodian may fence/reconcile the exact handle, never create its
+  borrow. Held or terminal request slots count toward a fixed128 per Conn
+  lifetime; terminal slots never evict/replenish while late RPCs may arrive."
+ [request]
+ (lifetime-request! request)
+ (when-not (and (= (erlang/self) (elem request 2))
+                (= (BeamLisp.Env/env_id) (elem request 3)))
+  (throw (ex-info "Original request caller required" {:kind :connection-borrow-request-caller})))
+ (let [connection (:connection (elem request 4)) key (:resource (elem request 4))
+       ticket (elem request 1) owner (elem request 2)
+       receipt
+       (agent-get-and-update (lifetime-borrow-registry!)
+        (fn [entries]
+         (let [cell (get entries key) slots (:lifetime-borrow-requests cell {})
+               prior (get slots ticket) borrowers (:lifetime-borrowers cell {})]
+          (when-not (lifetime-request-cell? request cell)
+           (throw (ex-info "Original connection custody changed" {:kind :connection-borrow-request-unknown})))
+          (if prior
+           (do
+            (when-not (= request (:request prior))
+             (throw (ex-info "Request identity conflict" {:kind :connection-borrow-request-unknown})))
+            (when-not (= :held (:phase prior))
+             (throw (ex-info "Request is permanently fenced" {:kind :connection-borrow-request-closed})))
+            (when-not (lifetime-borrow-matches? (:receipt prior) cell (get borrowers ticket))
+             (throw (ex-info "Request custody is uncertain" {:kind :connection-borrow-request-unknown})))
+            (tuple (:receipt prior) entries))
+           (do
+            (when-not (lifetime-borrow-cell? connection cell)
+             (throw (ex-info "Connection lifetime cannot be retained" {:kind :connection-borrow-unavailable})))
+            (when (:lifetime-request-admission-closed cell)
+             (throw (ex-info "New lifetime requests are permanently fenced" {:kind :connection-borrow-request-closed})))
+            (when (>= (count slots) 128)
+             (throw (ex-info "Lifetime request capacity exhausted" {:kind :connection-borrow-request-capacity})))
+            (when (>= (count borrowers) 128)
+             (throw (ex-info "Connection borrow capacity exhausted" {:kind :connection-borrow-capacity})))
+            (when (get borrowers ticket)
+             (throw (ex-info "Request ticket collision" {:kind :connection-borrow-request-unknown})))
+            (let [custody (get-in cell [:creation-custody :ticket])
+                  receipt (tuple :datom.conn/retained-lifetime key (:lifetime cell) custody ticket owner)
+                  row {:ticket ticket :owner owner :lifetime (:lifetime cell) :custody custody}]
+             (tuple receipt
+              (assoc entries key
+               (assoc cell :lifetime-borrowers (assoc borrowers ticket row)
+                           :lifetime-borrow-requests
+                           (assoc slots ticket {:request request :phase :held :receipt receipt}))))))))) 30000)]
+  receipt))
+
+(defn fence-lifetime-request!
+ "Serialized registry reconciliation for a PRIVATE original request handle.
+  :held returns only its actual already-issued cap, and fences fresh admission.
+  :closed is a terminal registry tombstone inserted BEFORE acknowledgment;
+  every late commit of this same request refuses. Absence queries, dead owners,
+  timeouts and inactive writers are never completion evidence. Unknown/replaced
+  registry custody refuses. No callback, writer RPC or new resource opens here."
+ [request]
+ (lifetime-request! request)
+ (let [key (:resource (elem request 4)) ticket (elem request 1)]
+  (agent-get-and-update (lifetime-borrow-registry!)
+   (fn [entries]
+    (let [cell (get entries key) slots (:lifetime-borrow-requests cell {})
+          prior (get slots ticket) row (get-in cell [:lifetime-borrowers ticket])]
+     (when-not (and (lifetime-request-cell? request cell)
+                    (or (nil? prior) (= request (:request prior))))
+      (throw (ex-info "Original request custody unavailable" {:kind :connection-borrow-request-unknown})))
+     (cond
+      (nil? prior)
+       (do
+        (when row
+         (throw (ex-info "Unclassified borrow row" {:kind :connection-borrow-request-unknown})))
+        (if (or (:lifetime-request-admission-closed cell) (>= (count slots) 128))
+         ;; Saturation is terminal for THIS native lifetime. Seal all unseen
+         ;; requests, including a lost capacity rejection, without a129th slot.
+         ;; Existing slots never evict, and no late unseen commit can succeed.
+         (tuple {:status :closed}
+          (assoc entries key (assoc cell :lifetime-request-admission-closed true)))
+         (tuple {:status :closed}
+          (assoc entries key
+           (assoc cell :lifetime-borrow-requests
+            (assoc slots ticket {:request request :phase :closed}))))))
+      (contains? #{:held :fenced} (:phase prior))
+       (do
+        (when-not (lifetime-borrow-matches? (:receipt prior) cell row)
+         (throw (ex-info "Issued borrow row unavailable" {:kind :connection-borrow-request-unknown})))
+        (tuple {:status :held :receipt (:receipt prior)}
+         (assoc entries key
+          (assoc cell :lifetime-borrow-requests (assoc slots ticket (assoc prior :phase :fenced))))))
+      (= :closed (:phase prior))
+       (do
+        (when row
+         (throw (ex-info "Closed request still holds custody" {:kind :connection-borrow-request-unknown})))
+        (tuple {:status :closed} entries))
+      :else (throw (ex-info "Unknown request phase" {:kind :connection-borrow-request-unknown}))))) 30000)))
 
 ; Insert beside guard-resource!. Uses the existing native connection lifetime,
 ; guarded declaration catalogue and immutable exact association receipts.
