@@ -119,9 +119,9 @@
 
 ;; ── the declaration, and its refusals ───────────────────────────────────
 
-(def KNOWN-DECL-OPTS [:of :concurrency :retry :unique :lease :partition :protocol :generation :admission :dispatch])
+(def KNOWN-DECL-OPTS [:of :concurrency :retry :unique :lease :partition :protocol :generation :admission :dispatch :max-live-workers])
 
-(def KNOWN-CLAUSE-OPTS [:of :concurrency :retry :unique :lease :partition :protocol :generation :admission :dispatch
+(def KNOWN-CLAUSE-OPTS [:of :concurrency :retry :unique :lease :partition :protocol :generation :admission :dispatch :max-live-workers
                         :clock :server :contract])
 
 (def KNOWN-RETRY-OPTS [:max :backoff :base :max-delay :jitter])
@@ -232,6 +232,9 @@
       (throw (ex-info (str "queue: :concurrency must be a positive integer — got "
                            (str concurrency))
                       {:concurrency concurrency})))
+    (when (and (contains? d :max-live-workers)
+               (not (and (positive-int? (:max-live-workers d)) (<= (:max-live-workers d) 4096))))
+      (throw (ex-info "Native physical worker bound must be positive and bounded" {:kind :invalid-worker-bound})))
     (when-not (positive-number? lease)
       (throw (ex-info (str "queue: :lease is a duration in SECONDS and must be > 0 — got "
                            (str lease))
@@ -266,7 +269,8 @@
      :partition (vec partition)
      :retry (normalise-retry (get d :retry))}
       (contains? d :admission) (assoc :admission (normalise-admission (:admission d)))
-      (contains? d :dispatch) (assoc :dispatch (normalise-dispatch (:dispatch d))))))
+      (contains? d :dispatch) (assoc :dispatch (normalise-dispatch (:dispatch d)))
+      (contains? d :max-live-workers) (assoc :max-live-workers (:max-live-workers d)))))
 
 (defn backoff-ms
   "Milliseconds to wait before the attempt AFTER `n` failures.
@@ -1762,18 +1766,20 @@
    A RUNNING job's lease is always counted, past or absent: it means the owner is
    gone, and the wake after it prunes the dead claim and hands the job to the
    Lifeline."
-  [d now owed?]
+  ([d now owed?] (wake-time d now owed? #{}))
+  ([d now owed? blocked-leases]
   (reduce
     (fn [acc row]
       (let [s (second row)
             t (cond
                 (= s :queued) (let [at (nth row 2)]
                                 (if (or owed? (> at now)) at nil))
-                (= s :running) (or (:job/lease-until (datom/entity d (first row))) now)
+                (= s :running) (let [lease (or (:job/lease-until (datom/entity d (first row))) now)]
+                                 (if (and (contains? blocked-leases (first row)) (<= lease now)) nil lease))
                 :else nil)]
         (if (nil? t) acc (if (or (nil? acc) (< t acc)) t acc))))
     nil
-    (job-rows d)))
+    (job-rows d))))
 
 (defn next-wake
   "The earliest moment this queue must look again AT BOOT, or nil when there is
@@ -1800,6 +1806,37 @@
                      (or (nil? lease) (<= lease now))))))
        (sort-by (fn [j] (:job/at j)))))
 
+(declare worker-inventories)
+(defn physical-workers
+  "Actual live native body inventory, including inherited expired claims."
+  [state]
+  (vec (filter (fn [entry]
+         (let [pid (:pid entry)]
+           (or (not (erlang/is_pid pid)) (not= (erlang/node) (erlang/node pid)) (Process/alive? pid))))
+    (mapcat (fn [inventory] (if inventory (vals @inventory) [])) (worker-inventories state)))))
+(defn watch-workers!
+  "Native tagged death wake. It does not consume the server's unrelated DOWN
+   messages. Reopened owners watch inherited bodies before admitting more."
+  [state]
+  (if-not (get-in state [:queue :decl :max-live-workers]) state
+   (reduce (fn [st entry]
+     (let [pid (:pid entry)]
+       (if (or (not (erlang/is_pid pid)) (get-in st [:queue :body-watches pid])) st
+        (let [ref (erlang/apply :erlang :monitor
+                    (list :process pid (list (tuple :tag :bl-queue/body-down))))]
+          (assoc-in st [:queue :body-watches pid] ref)))))
+    state (physical-workers state))))
+(defn body-down
+  "Accept only this owner's actual monitor identity; caller then runs due work.
+   This is physical lifetime evidence, never a provider absence receipt."
+  [state ref pid]
+  (if (= ref (get-in state [:queue :body-watches pid]))
+    (update-in state [:queue :body-watches] dissoc pid) state))
+(defn- physical-full? [state]
+  (let [bound (get-in state [:queue :decl :max-live-workers])]
+    (and bound (let [rows (physical-workers state)]
+                 (or (>= (count rows) bound) (some #(nil? (:job-id %)) rows))))))
+
 (defn arm
   "Re-arm the wake at the earliest deadline still worth a timer. Returns the
    delay armed, or nil when nothing is outstanding — an idle queue is woken by
@@ -1808,7 +1845,11 @@
   [st]
   (let [q (:queue st)
         now ((:clock q))
-        due (wake-time (datom/db (conn (:server q))) now false)]
+        due (wake-time (datom/db (conn (:server q))) now false
+              (if (get-in q [:decl :max-live-workers])
+                (if (physical-full? st)
+                  (set (map first (job-rows (datom/db (conn (:server q))))))
+                  (set (keep :e (physical-workers st)))) #{}))]
     (when (some? due)
       (let [delay (- due now)]
         (arm-ms! delay)
@@ -1910,7 +1951,7 @@
           :plain (to-list (concat (:modules q []) (BeamLisp.Env/callback_modules body)
                                   (BeamLisp.Env/callback_modules (:clock q)))))]
         (swap! inventory assoc ref {:pid pid :server (server-name (:server q)) :generation (:generation decl)
-                                   :job-id (:job/id claimed) :attempt-id (:job/attempt-id claimed)})
+                                   :job-id (:job/id claimed) :e (:db/id claimed) :partition (:job/partition claimed) :attempt-id (:job/attempt-id claimed)})
         (erlang/send pid [:bl-queue/start])
         (emit-entry! {:diagnostics captured} :proc.queue/claimed {:proc.queue/attempt (:job/attempts claimed)})
         {:ref ref :pid pid :diagnostics captured
@@ -2059,7 +2100,7 @@
    if that worker is merely SLOW, its late outcome is refused (it no longer owns
    the job) — which is at-least-once, stated where it happens."
   [st]
-  (let [st (prune-workers! st) q0 (:queue st)
+  (let [st (watch-workers! (prune-workers! st)) q0 (:queue st)
         c (conn (:server q0))
         now ((:clock q0))
         live (into {} (remove (fn [entry]
@@ -2070,14 +2111,23 @@
             (when-not (contains? live ref)
               (emit-entry! entry :proc.queue/claim-expired {:proc.queue/attempt (:attempts entry)})))
         st (assoc st :queue (assoc q0 :running live))
-        room (- (:concurrency (:decl q0)) (count live))
-        busy (busy-partitions live)
+        physical (when (:max-live-workers (:decl q0)) (physical-workers st))
+        room (min (- (:concurrency (:decl q0)) (count live))
+                  (if (:max-live-workers (:decl q0))
+                    (if (some #(nil? (:job-id %)) physical) 0
+                      (- (:max-live-workers (:decl q0)) (count physical))) 2147483647))
+        body-jobs (set (keep :job-id physical))
+        body-excluded (set (keep :e physical))
+        busy (into (busy-partitions live) (keep :partition physical))
         policy (:dispatch (:decl q0))
         candidates (fn [busy excluded]
-          (if policy (dispatch-candidates (datom/db c) (:server q0) now policy busy excluded)
-            (vec (remove #(contains? excluded (:db/id %)) (due-candidates (datom/db c) now)))))
-        cands (if (> room 0) (candidates busy #{}) [])]
-    (loop [st st cs cands room room busy busy excluded #{}]
+          (let [rows (if policy (dispatch-candidates (datom/db c) (:server q0) now policy busy excluded)
+                       (vec (remove #(contains? excluded (:db/id %)) (due-candidates (datom/db c) now))))]
+            ;; A configured hard lifetime bound never starts another body for
+            ;; the same job while an expired predecessor is physically alive.
+            (vec (remove #(contains? body-jobs (:job/id %)) rows))))
+        cands (if (> room 0) (candidates busy body-excluded) [])]
+    (loop [st st cs cands room room busy busy excluded body-excluded]
       (if (or (<= room 0) (empty? cs))
         (do (arm st) st)
         (let [job (first cs)]
@@ -2088,7 +2138,7 @@
                 (recur st (vec (rest cs)) room busy (conj excluded (:db/id job)))
                 (let [after-busy (if (some? (:partition entry)) (conj busy (:partition entry)) busy)
                       after-excluded (conj excluded (:db/id job))]
-                 (recur (assoc-in st [:queue :running (:ref entry)] entry)
+                 (recur (watch-workers! (assoc-in st [:queue :running (:ref entry)] entry))
                        (if policy (candidates after-busy after-excluded) (vec (rest cs)))
                        (dec room) after-busy after-excluded))))))))))
 
@@ -2237,6 +2287,8 @@
              (noreply (proc.queue/run-due st#)))
           `(handle-info [:datom/tx _basis# _datoms#] [st#]
              (noreply (proc.queue/run-due st#)))
+          `(handle-info [:bl-queue/body-down monitor# :process pid# _reason#] [st#]
+             (noreply (proc.queue/run-due (proc.queue/body-down st# monitor# pid#))))
           `(handle-info [:bl-queue/finished ref# out#] [st#]
              (noreply (proc.queue/run-due (proc.queue/settle st# ref# out#))))
           `(handle-call [:enqueue job# opts#] [_from# st#]
