@@ -1,4 +1,4 @@
-"""Dry orchestration of the shell verifier; NO native VM/browser/service launch."""
+"""Owned shell command models only; no native BL, browser or service launch."""
 import hashlib
 import json
 import os
@@ -9,57 +9,146 @@ import tempfile
 import unittest
 
 REPO = Path(__file__).resolve().parents[2]
+STUB = Path(__file__).resolve().parent / 'fixtures/continuity-command-stub.py'
+CASES = [
+    ('failed_preflight_external_evidence', {'invalid_external_evidence': True}, False, 0),
+    ('failed_preflight_default_evidence', {'default_preflight_collision': True}, False, 0),
+    ('default_evidence_allocation_failure', {'evidence_alloc_fail': True}, False, 0),
+    ('occupied_foreign_port', {'port_busy': True}, False, 0),
+    ('foreign_unit_invocation', {'foreign_before_cleanup': True}, True, 0),
+    ('lost_launch_reply_possible_live_data', {'launch_lost_reply': True}, True, 0),
+    ('invocation_capture_failure', {'capture_fail': True}, True, 0),
+    ('stop_failure', {'stop_fail': True}, True, 1),
+    ('stop_claims_success_but_live_pid', {'post_stop_live_pid': True}, True, 1),
+    ('foreign_invocation_after_stop', {'post_stop_foreign': True}, True, 1),
+    ('empty_invocation_still_loaded', {'post_stop_empty_loaded': True}, True, 1),
+    ('successful_own_stop', {}, False, 1),
+    ('successful_collected_own_stop', {'collected': True}, False, 1),
+]
 
 
 class ExplicitContinuityLauncher(unittest.TestCase):
+    def setUp(self):
+        (Path.home() / 'tmp').mkdir(exist_ok=True)
+
+    def run_owned_model(self, root, config, override=False):
+        """Every fake process, artifact and retained data cell belongs to root."""
+        repo = root / 'repo'
+        tools = root / 'commands'
+        tools.mkdir()
+        for rel in ['examples/continuity', 'bin', 'scripts', 'test/browser/node_modules/.bin']:
+            (repo / rel).mkdir(parents=True)
+        script = repo / 'examples/continuity/verify.sh'
+        shutil.copyfile(REPO / 'examples/continuity/verify.sh', script)
+        for path in [*(tools / name for name in ['mktemp', 'rm', 'curl', 'systemd-run', 'systemctl', 'journalctl']),
+                     repo / 'bin/bl', root / 'accepted-bl', repo / 'scripts/bl-mem',
+                     repo / 'test/browser/node_modules/.bin/playwright']:
+            shutil.copyfile(STUB, path)
+            path.chmod(0o700)
+        initial = {'scratch': None, 'evidence': None, 'invocation': '', 'active': 'inactive',
+                   'loaded': 'not-found', 'pid': '0', 'curlCalls': 0, 'launchCalls': 0,
+                   'browserStubCalls': 0, 'stopCalls': 0, 'invocationReads': 0}
+        (root / 'config.json').write_text(json.dumps(config))
+        (root / 'state.json').write_text(json.dumps(initial))
+        env = {key: os.environ[key] for key in ['HOME', 'LANG'] if key in os.environ}
+        env.update(PATH=str(tools) + ':/usr/bin:/bin', CONTINUITY_MOCK_CASE=str(root))
+        if override:
+            env['CONTINUITY_BL'] = str(root / 'accepted-bl')
+        if not config.get('default_preflight_collision') and not config.get('evidence_alloc_fail'):
+            evidence = root / 'evidence'
+            evidence.mkdir(mode=0o700)
+            if config.get('invalid_external_evidence'):
+                evidence.chmod(0o777)
+                (evidence / 'foreign-sentinel.txt').write_text('EXTERNAL EVIDENCE MUST SURVIVE\n')
+            env['CONTINUITY_EVIDENCE'] = str(evidence)
+        result = subprocess.run(['/bin/bash', str(script)], env=env, cwd=repo,
+                                text=True, capture_output=True, timeout=20)
+        state = json.loads((root / 'state.json').read_text())
+        events = [json.loads(line) for line in (root / 'events.jsonl').read_text().splitlines()]
+        return result, state, events
+
     def test_override_is_the_only_invoked_launcher_and_hash_is_exact(self):
         for override in (True, False):
-            with self.subTest(override=override), tempfile.TemporaryDirectory(dir=Path.home() / 'tmp') as scratch:
-                root = Path(scratch); repo = root / 'repo'; fake = root / 'tools'; fake.mkdir()
-                (repo / 'examples/continuity').mkdir(parents=True); (repo / 'scripts').mkdir()
-                (repo / 'bin').mkdir(); (repo / 'test/browser/node_modules/.bin').mkdir(parents=True)
-                script = repo / 'examples/continuity/verify.sh'; shutil.copy2(REPO / 'examples/continuity/verify.sh', script)
-                def executable(path, body):
-                    path.write_text('#!/bin/sh\nset -eu\n' + body); path.chmod(0o755)
-                trace = root / 'trace'; count = root / 'curl-count'
-                selected = root / 'accepted-bl'
-                for path in (selected, repo / 'bin/bl'):
-                    executable(path, 'printf "%s\\n" "$0 $*" >> "$TRACE"\n')
-                executable(repo / 'scripts/bl-mem', 'exit 0\n')
-                executable(repo / 'test/browser/node_modules/.bin/playwright', 'printf "%s\\n" "DRY_BROWSER_ONLY" >> "$TRACE"\n')
-                executable(fake / 'systemd-run', '''while [ "$#" -gt 0 ]; do
-  case "$1" in /*) exec "$@" ;; esac
-  shift
-done
-exit 2
-''')
-                executable(fake / 'systemctl', 'printf "%s\\n" "DRY_UNIT_ONLY"\n')
-                executable(fake / 'journalctl', 'printf "%s\\n" "DRY_LOG_ONLY"\n')
-                executable(fake / 'curl', 'if [ ! -f "$CURL_COUNT" ]; then touch "$CURL_COUNT"; exit 1; fi\nexit 0\n')
-                env = {key: os.environ[key] for key in ('HOME', 'LANG') if key in os.environ}
-                env.update(PATH=str(fake) + os.pathsep + '/usr/bin:/bin', TRACE=str(trace), CURL_COUNT=str(count),
-                           CONTINUITY_EVIDENCE=str(root / 'evidence'))
-                if override:
-                    env['CONTINUITY_BL'] = str(selected)
-                result = subprocess.run(['bash', str(script)], env=env, text=True, capture_output=True)
+            with self.subTest(override=override), tempfile.TemporaryDirectory(dir=Path.home() / 'tmp') as temporary:
+                root = Path(temporary)
+                result, state, events = self.run_owned_model(root, {}, override)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                actual = selected if override else repo / 'bin/bl'
-                self.assertEqual(trace.read_text().splitlines(), [str(actual) + ' run examples/continuity/main.bl', 'DRY_BROWSER_ONLY'])
+                actual = root / 'accepted-bl' if override else root / 'repo/bin/bl'
+                calls = [event for event in events if event['kind'] == 'launcher-executed']
+                self.assertEqual([(event['launcher'], event['arguments']) for event in calls],
+                                 [(str(actual), ['run', 'examples/continuity/main.bl'])])
+                self.assertEqual(state['browserStubCalls'], 1)
                 receipt = json.loads((root / 'evidence/launcher-input.json').read_text())
                 self.assertEqual(receipt['launcher'], str(actual))
+                self.assertEqual(receipt['launcherRealpath'], str(actual.resolve()))
                 self.assertEqual(receipt['launcherSha256'], hashlib.sha256(actual.read_bytes()).hexdigest())
                 self.assertEqual(receipt['scope'], 'source-continuity-launcher-selection/v1')
                 self.assertFalse((root / 'evidence/launcher-input.json').stat().st_mode & 0o077)
-                scratch_path = Path(result.stdout.split('Logs: ')[1].splitlines()[0])
-                self.assertTrue(str(scratch_path).startswith(str(Path.home() / 'tmp') + '/ct-'))
-                shutil.rmtree(scratch_path)  # Only the directory this dry run returned.
+                self.assertFalse(Path(state['scratch']).exists())
+                self.assertTrue((root / 'evidence/server-journal.jsonl').is_file())
+                self.assertIn('Evidence: ', result.stdout)
 
     def test_relative_or_missing_override_refuses_before_any_command(self):
         script = REPO / 'examples/continuity/verify.sh'
         for value in ('relative-bl', str(Path.home() / 'tmp/nonexistent-continuity-sdk')):
-            result = subprocess.run(['bash', str(script)], env={**os.environ, 'CONTINUITY_BL': value}, capture_output=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertNotIn(b'Sandbox stopped', result.stdout)
+            with self.subTest(value=value), tempfile.TemporaryDirectory(dir=Path.home() / 'tmp') as temporary:
+                root = Path(temporary)
+                tools = root / 'commands'
+                tools.mkdir()
+                for name in ['mktemp', 'rm', 'curl', 'systemd-run', 'systemctl', 'journalctl']:
+                    path = tools / name
+                    shutil.copyfile(STUB, path)
+                    path.chmod(0o700)
+                env = {key: os.environ[key] for key in ['HOME', 'LANG'] if key in os.environ}
+                env.update(PATH=str(tools) + ':/usr/bin:/bin', CONTINUITY_BL=value,
+                           CONTINUITY_MOCK_CASE=str(root))
+                result = subprocess.run(['/bin/bash', str(script)], env=env, capture_output=True, timeout=20)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse((root / 'events.jsonl').exists(), 'Refusal must precede any modeled command')
+                self.assertNotIn(b'Evidence: ', result.stdout)
+
+    def check_custody_case(self, label, config, retain, stops):
+        # Even modeled unknown retention is only fixture data. TemporaryDirectory
+        # always removes that owned test tree after assertions, including failures.
+        with tempfile.TemporaryDirectory(dir=Path.home() / 'tmp') as temporary:
+            root = Path(temporary)
+            result, state, events = self.run_owned_model(root, config)
+            scratch = Path(state['scratch'])
+            self.assertTrue(scratch.is_relative_to(root))
+            self.assertEqual(scratch.exists(), retain, (label, result.stderr))
+            self.assertEqual(state['stopCalls'], stops, label)
+            for event in events:
+                if event['kind'] == 'stop-invocation':
+                    self.assertEqual(event['invocation'], '1' * 32, 'Foreign invocation must never be stopped')
+            if state['launchCalls']:
+                evidence = root / 'evidence'
+                self.assertTrue((evidence / 'server-journal.jsonl').is_file())
+                self.assertTrue((evidence / 'service-invocation.txt').is_file())
+                if retain:
+                    self.assertEqual((scratch / 'data/live-data.txt').read_text(), 'POSSIBLE LIVE MOCK DATA\n')
+                else:
+                    deletions = [event for event in events if event['kind'] == 'deletion']
+                    self.assertTrue(deletions)
+                    self.assertTrue(all(event['journalAlreadyWritten'] for event in deletions))
+            if config.get('invalid_external_evidence'):
+                self.assertTrue((root / 'evidence/foreign-sentinel.txt').is_file())
+            if config.get('default_preflight_collision'):
+                self.assertFalse((root / 'default-evidence').exists())
+            if label.startswith('successful_'):
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue((root / 'evidence/launcher-input.json').is_file())
+            else:
+                self.assertNotEqual(result.returncode, 0, 'Unsafe/unconfirmed cleanup must be reported')
+
+
+def custody_test(case):
+    def test(self):
+        self.check_custody_case(*case)
+    return test
+
+
+for case in CASES:
+    setattr(ExplicitContinuityLauncher, 'test_custody_' + case[0], custody_test(case))
 
 
 if __name__ == '__main__':

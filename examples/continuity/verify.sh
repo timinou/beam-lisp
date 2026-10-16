@@ -15,16 +15,63 @@ SCRATCH=$(mktemp -d "$HOME/tmp/ct-XXXXXX")
 UNIT="continuity-demo-$BASHPID-$RANDOM"
 PORT=${CONTINUITY_PORT:-4048}
 URL="http://127.0.0.1:$PORT"
-EVIDENCE=${CONTINUITY_EVIDENCE:-"$SCRATCH/evidence"}
+EVIDENCE=${CONTINUITY_EVIDENCE:-}
+OWN_EVIDENCE=0
+UNIT_STARTED=0
+INVOCATION=""
+EVIDENCE_READY=0
+cleanup() {
+  local status=$? stopped=1 current="" state="" loaded="" pid=""
+  trap - EXIT
+  set +e
+  if ((UNIT_STARTED)); then
+    stopped=0
+    current=$(systemctl --user show "$UNIT.service" -p InvocationID --value 2>/dev/null)
+    if [[ -n "$INVOCATION" && "$current" == "$INVOCATION" ]]; then
+      if timeout 30s systemctl --user stop "$UNIT.service" >/dev/null 2>&1; then
+        state=$(systemctl --user show "$UNIT.service" -p ActiveState --value 2>/dev/null)
+        current=$(systemctl --user show "$UNIT.service" -p InvocationID --value 2>/dev/null)
+        loaded=$(systemctl --user show "$UNIT.service" -p LoadState --value 2>/dev/null)
+        pid=$(systemctl --user show "$UNIT.service" -p MainPID --value 2>/dev/null)
+        if [[ "$state" == inactive && "$pid" == 0 &&
+              ( "$current" == "$INVOCATION" || ( -z "$current" && "$loaded" == not-found ) ) ]]; then
+          stopped=1
+        fi
+      fi
+    fi
+    if ((EVIDENCE_READY)); then
+      journalctl --user -u "$UNIT.service" --no-pager -o json > "$EVIDENCE/server-journal.jsonl"
+      printf '%s\n' "$INVOCATION" > "$EVIDENCE/service-invocation.txt"
+    fi
+  fi
+  if ((stopped)); then
+    rm -rf -- "$SCRATCH"
+  else
+    printf 'Sandbox ownership or stop could not be confirmed; retained %s and %s.service\n' "$SCRATCH" "$UNIT" >&2
+    ((status)) || status=1
+  fi
+  if ((EVIDENCE_READY)); then
+    printf 'Evidence: %s\n' "$EVIDENCE"
+  elif ((OWN_EVIDENCE)); then
+    rm -rf -- "$EVIDENCE"
+  fi
+  exit "$status"
+}
+trap cleanup EXIT
+if [[ -z "$EVIDENCE" ]]; then
+  EVIDENCE=$(mktemp -d "$HOME/tmp/continuity-evidence-XXXXXX")
+  OWN_EVIDENCE=1
+fi
 export TMPDIR="$SCRATCH"
 # Record exact launcher selection before any native command. This is input
 # provenance, not proof of a bootable SDK or a successful browser acceptance.
-python3 - "$RUNTIME" "$EVIDENCE" <<'PY_INPUT'
+python3 - "$RUNTIME" "$EVIDENCE" "$SCRATCH" <<'PY_INPUT'
 import hashlib, json, os, stat, sys
 from pathlib import Path
-runtime, evidence = Path(sys.argv[1]), Path(sys.argv[2])
+runtime, evidence, scratch = map(Path, sys.argv[1:])
 home_tmp = Path.home() / 'tmp'
 assert evidence.is_absolute() and evidence == Path(os.path.normpath(evidence)) and home_tmp in evidence.parents, 'Evidence must use normalized HOME/tmp'
+assert evidence != scratch and scratch not in evidence.parents, 'Evidence must outlive disposable sandbox data'
 for parent in (evidence, *evidence.parents):
     if parent.exists() or parent.is_symlink():
         info = parent.lstat()
@@ -46,20 +93,20 @@ try:
 finally:
     os.close(fd)
 PY_INPUT
-cleanup() {
-  systemctl --user stop "$UNIT.service" >/dev/null 2>&1 || true
-  journalctl --user -u "$UNIT.service" --no-pager > "$SCRATCH/server.log" || true
-  printf 'Sandbox stopped. Evidence: %s\nLogs: %s\n' "$EVIDENCE" "$SCRATCH"
-}
-trap cleanup EXIT
+EVIDENCE_READY=1
 "$ROOT/scripts/bl-mem"
 if curl --noproxy '*' --silent --max-time 2 "$URL/health/ready" >/dev/null; then
   echo "Port $PORT already serves an instance; choose CONTINUITY_PORT." >&2; exit 1
 fi
+# A lost launcher reply may still have created the service. Preserve its data
+# unless this invocation is positively identified and stopped.
+UNIT_STARTED=1
 systemd-run --user --unit="$UNIT" --working-directory="$ROOT" \
   --setenv="CONTINUITY_ROOT=$SCRATCH/data" --setenv="CONTINUITY_PORT=$PORT" --setenv="TMPDIR=$SCRATCH" \
-  --property=MemoryMax=6G --property=MemorySwapMax=0 --property=RuntimeMaxSec=900 \
+  --property=MemoryMax=6G --property=MemorySwapMax=0 --property=RuntimeMaxSec=900 --property=TimeoutStopSec=15 \
   "$RUNTIME" run examples/continuity/main.bl
+INVOCATION=$(systemctl --user show "$UNIT.service" -p InvocationID --value)
+[[ "$INVOCATION" =~ ^[[:xdigit:]]{32}$ ]]
 deadline=$((SECONDS + 240))
 until curl --noproxy '*' --fail --silent --max-time 2 "$URL/health/ready" >/dev/null; do
   if ! systemctl --user is-active --quiet "$UNIT.service" || ((SECONDS > deadline)); then
