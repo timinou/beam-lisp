@@ -111,16 +111,96 @@ stage_all(Manifest, SeedDir, DestDir) ->
             % DEST_EBIN exactly as it found it.
             App = verify_app(Map, SeedAbs, ManifestAbs),
             ok = ensure_dir(DestAbs),
+            quarantine_stale_namespaces(Map, DestAbs),
             % THE APP RESOURCE FIRST — `Bootstrap.install!/1`'s order, and for
             % the same reason: OTP reads what to start from `beam_lisp.app`, so
             % it must be in place before the application these beams belong to
             % can start. Published only when the destination has none.
-            install_app(DestAbs, App),
-            lists:foreach(fun(Beam) -> install_one(DestAbs, Beam) end, Verified),
-            report(length(Verified), App, DestAbs),
+            AppChanged = install_app(DestAbs, App),
+            Changed = lists:sum([install_one(DestAbs, Beam) || Beam <- Verified]),
+            report(Changed, AppChanged, DestAbs),
             0;
         {error, Message} ->
             fail(Message)
+    end.
+
+% Obsolete namespace objects must not shadow the runtime's current keyed cache.
+% Keep their exact bytes off the code path, rather than interpreting/rejecting
+% the same old generation on every launch. Unstamped objects stay untouched.
+quarantine_stale_namespaces(Map, DestDir) ->
+    Compiler = maps:get(<<"compiler_key">>, Map, undefined),
+    Build = maps:get(<<"build_key">>, Map, undefined),
+    case is_sha_hex(Compiler) andalso is_sha_hex(Build) of
+        false -> ok;
+        true ->
+            Keys = generation_keys(Map, Compiler, Build),
+            case Keys of
+                unknown -> ok;
+                _ ->
+                    Owned = maps:get(<<"modules">>, Map),
+                    Archive = filename:join([DestDir, ".stale-generations",
+                                             binary_to_list(tmp_tag())]),
+                    Paths = filelib:wildcard(filename:join(DestDir,
+                                               "Elixir.BeamLisp.Ns.*.beam")),
+                    Count = lists:sum([quarantine_namespace(P, Owned, Keys, Archive)
+                                       || P <- Paths]),
+                    case Count of
+                        0 -> ok;
+                        _ -> io:format(standard_error,
+                               "bl-stage-hosts: archived ~p obsolete namespace beams under ~ts~n",
+                               [Count, Archive])
+                    end
+            end
+    end.
+
+generation_keys(Map, Compiler, Build) ->
+    case maps:get(<<"compiler_inputs">>, Map, undefined) of
+        undefined -> [Compiler, Build];
+        #{<<"schema">> := 1, <<"base_key">> := Compiler,
+          <<"shared">> := Shared, <<"sdk_declarations">> := Sdk} ->
+            case is_sha_hex(Shared) andalso is_sha_hex(Sdk) of
+                true -> [Compiler, Build,
+                         sha256_hex(<<"sdk-declarations-v1", 0, Compiler/binary, 0, Sdk/binary>>)];
+                false -> unknown
+            end;
+        _ -> unknown
+    end.
+
+quarantine_namespace(Path, Owned, Keys, Archive) ->
+    Name = unicode:characters_to_binary(filename:basename(Path)),
+    case maps:is_key(Name, Owned) of
+        true -> 0; % Bootstrap owns its complete boot closure separately.
+        false ->
+            case file:read_file(Path) of
+                {ok, Bytes} ->
+                    case beam_lib:chunks(Bytes, [attributes]) of
+                        {ok, {Mod, [{attributes, Attrs}]}} ->
+                            Raw = proplists:get_value(bl_compiler_key, Attrs),
+                            Key = case Raw of [One] when is_binary(One) -> One; _ -> Raw end,
+                            Actual = <<(atom_to_binary(Mod, utf8))/binary, ".beam">>,
+                            case Actual =:= Name andalso is_sha_hex(Key)
+                                 andalso not lists:member(Key, Keys) of
+                                true ->
+                                    Dest = filename:join([Archive, binary_to_list(Key),
+                                                          filename:basename(Path)]),
+                                    ok = ensure_dir(filename:dirname(Dest)),
+                                    % Decline a file changed since the attributed read.
+                                    case file:read_file(Path) of
+                                        {ok, Bytes} ->
+                                            case file:rename(Path, Dest) of
+                                                ok -> 1;
+                                                {error, enoent} -> 0;
+                                                {error, Why} -> fail(io_lib:format(
+                                                  "cannot archive obsolete ~ts: ~p", [Name, Why]))
+                                            end;
+                                        _ -> 0
+                                    end;
+                                false -> 0
+                            end;
+                        _ -> 0
+                    end;
+                _ -> 0
+            end
     end.
 
 % A pinned HOST leaf by the LEGACY name rule: an `Elixir.BeamLisp.*` module that
@@ -243,7 +323,7 @@ install_one(DestDir, {Name, Bytes, Mode, Want}) ->
     case file:read_file(Dest) of
         {ok, DestBytes} ->
             case sha256_hex(DestBytes) of
-                Want -> ok;
+                Want -> 0;
                 _ -> write_atomic(Dest, Bytes, Mode)
             end;
         _ ->
@@ -256,12 +336,12 @@ install_one(DestDir, {Name, Bytes, Mode, Want}) ->
 % were SHA-verified in `verify_app/3` BEFORE any write, so a corrupt floor is
 % refused even when the destination would not have been touched.
 install_app(_DestDir, none) ->
-    ok;
+    0;
 install_app(DestDir, {Name, Bytes, Mode}) ->
     Dest = filename:join(DestDir, Name),
     case file:read_file_info(Dest) of
         {ok, _} ->
-            ok;
+            0;
         _ ->
             write_atomic(Dest, Bytes, Mode)
     end.
@@ -283,7 +363,7 @@ write_atomic(Dest, Bytes, Mode) ->
             _ = set_mode(Tmp, Mode),
             case file:rename(Tmp, Dest) of
                 ok ->
-                    ok;
+                    1;
                 {error, Reason} ->
                     _ = file:delete(Tmp),
                     fail(io_lib:format("cannot stage ~ts: ~p",
@@ -309,14 +389,16 @@ ensure_dir(Dir) ->
             fail(io_lib:format("cannot create ~ts: ~p", [Dir, Reason]))
     end.
 
-report(Count, App, Dest) ->
-    Note =
-        case App of
-            none -> <<"no app resource in the seed">>;
-            {Name, _, _} -> <<"app resource ", Name/binary>>
-        end,
+% Report actual writes only: checking an already-current tree stays quiet.
+report(0, 0, _Dest) ->
+    ok;
+report(Count, AppChanged, Dest) ->
+    Note = case AppChanged of
+               0 -> <<>>;
+               1 -> <<"; beam_lisp.app installed">>
+           end,
     io:format(standard_error,
-              "bl-stage-hosts: ~p pinned host beams staged into ~ts (~ts)~n",
+              "bl-stage-hosts: ~p pinned host beams updated in ~ts~ts~n",
               [Count, Dest, Note]).
 
 % ── reading the manifest ────────────────────────────────────────────────────

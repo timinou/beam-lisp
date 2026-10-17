@@ -141,3 +141,40 @@ The checker keeps its image, cache, fixtures and manifest in its private work
 directory. Dependencies come from the configured XDG cache. When `HEAD`
 contains the seed-matching host sources, `--bootstrap-hosts` is optional.
 After runtime checks pass, regenerate and qualify the real floor once.
+
+## Checkout startup caches
+
+Dependency path discovery runs in the native loader. Project loading-policy
+validation is independent of application preparation; JSON support loads when
+JSON output is requested.
+
+SDK inventory discovery is cached privately in each VM. Reuse checks current
+source bytes, loaded code, publication receipts, and native libraries.
+Namespace beams stamped with obsolete compiler generations are moved off the
+code path into `build/.stale-generations/`; their original bytes are retained.
+Current-generation, floor-owned, and unjudged objects stay in place.
+
+## Checkout commands and warm VMs
+
+`./bin/bl` builds its native transport client with Cargo on first use. Later
+commands reach the existing VM before starting Elixir or staging host beams.
+The default checkout transport starts one VM for the current tree and waits for
+it; later commands reuse it. Each request carries its own directory, arguments,
+and environment. `--cold` runs a fresh VM, and the existing `:warm` setting in
+`env.bl` or the user config overrides the checkout default.
+
+The client hashes checkout and project source content, declared library paths,
+runtime settings, the seed manifest, and
+an explicitly selected application image. A changed inventory makes the VM
+refuse the request before execution; the launcher stops it and starts a fresh
+one. Generated build and cache directories are excluded. A checkout VM exits
+after five idle minutes. Automatic checkout VMs serve commands without starting
+the web dashboard, gateway, or project schedules. On Linux with an active systemd user runtime,
+automatic VMs have a 4 GiB memory limit and 512 MiB swap limit.
+`./bin/bl realm stop` stops the VM explicitly. To host project schedules,
+stop the command VM and use `./bin/bl realm start` explicitly.
+
+The native client lives under `.bl/launcher/`. Cargo is needed to build it;
+`./bin/bl --cold ...` bypasses the native client when bootstrapping without Cargo. Image builds and dependency provisioning run cold. The first ordinary command
+and the first command after a source edit pay
+the runtime startup cost.

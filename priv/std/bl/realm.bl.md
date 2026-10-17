@@ -22,7 +22,7 @@ directory other than the current one, and `--json` prints data instead of text.
 ```beam-lisp
 (ns bl.realm
   (:require [bl.util :as u] [bl.json] [bl.vm :as vm] [vm.inventory :as inv]
-            [vm.paths :as paths] [vm.client :as client] [vm.inspect :as inspect]
+            [vm.paths :as paths] [bl.realm-lifecycle :as lifecycle] [vm.inspect :as inspect]
             [bl.ports :as ports]))
 ```
 
@@ -41,8 +41,7 @@ and the realm inside it.
   "The root `bl realm` means: `--root` when given, else the tree that encloses the
    current directory, else the directory itself."
   [st]
-  (let [r (paths/resolve-root (BeamLisp/cwd) (:root st))]
-    (if (contains? r :ok) (:ok r) (BeamLisp/cwd))))
+  (lifecycle/root-of st))
 
 (defn here
   "The realm serving `root`: {:vm row :realm realm :root root}, or nil."
@@ -151,7 +150,7 @@ owns the VM's lifetime wants. The VM also records where its output goes
 (def DEFAULT-IDLE-SECONDS
   "Eight hours: a VM survives a lunch break and a meeting, and does not survive the
    weekend. One definition; the CLI reference quotes this number."
-  28800)
+  lifecycle/DEFAULT-IDLE-SECONDS)
 
 (defn start-options
   "What `realm start` hands the VM, from the parsed flags: the idle limit (the flag,
@@ -159,17 +158,13 @@ owns the VM's lifetime wants. The VM also records where its output goes
    is the build's SHARED VM (`--share-vm`, passed by the launcher for a project that
    declares `:vm \"shared\"`)."
   [st]
-  {:idle (or (:idle st) DEFAULT-IDLE-SECONDS)
-   :log (:log st)
-   :shared (= true (:share-vm st))})
+  (lifecycle/start-options st))
 
 (defn cmd-start [st]
-  (let [root (root-of st)]
-    (client/start-foreground root (start-options st))
-    0))
+  (lifecycle/run ["start"] st))
 
 (defn cmd-stop [st]
-  (client/stop (root-of st)))
+  (lifecycle/run ["stop"] st))
 ```
 
 ```bl-result cmd-start

@@ -461,11 +461,68 @@
    (distinct (filter (fn [root] (File/dir? (str root "/" NATIVE-DIR)))
                      (map (fn [root] (Path/expand root)) (remove nil? [project platform]))))))
 
+;; A successful producer run leaves a content receipt, not a timestamp shortcut.
+;; The receipt covers a conservative superset of native-key's inputs, the live
+;; producer key/toolchain, and every installed artifact. It cannot certify a
+;; missing artifact, and source edits during a build prevent publication.
+(defn- native-refresh-digest [value]
+  (String/downcase (Base/encode16 (crypto/hash :sha256
+    (erlang/term_to_binary value (list :deterministic))))))
+
+(defn- native-refresh-crates [root]
+  (sort (filter #(File/regular? (Path/join % "Cargo.toml"))
+                (Path/wildcard (Path/join root "native/*")))))
+
+(defn- native-refresh-inputs [root producer cargo]
+  (let [files (sort (mapcat
+                (fn [crate]
+                  (concat (Path/wildcard (Path/join crate "src/**/*.rs"))
+                          (filter File/regular?
+                            (map #(Path/join crate %)
+                              ["Cargo.toml" "Cargo.lock" ".cargo/config.toml" "build.rs"]))))
+                (native-refresh-crates root)))]
+    (native-refresh-digest
+      [1 (Path/expand root) producer cargo
+       (mapv #(tuple (Path/relative_to % root) (crypto/hash :sha256 (File/read! %))) files)])))
+
+(defn- native-refresh-artifacts [root]
+  (mapv #(Path/join (Path/join root "priv/native") (artifact-name (Path/basename %)))
+        (native-refresh-crates root)))
+
+(defn- native-refresh-state [root inputs]
+  (let [artifacts (native-refresh-artifacts root)]
+    (when (every? File/regular? artifacts)
+      (native-refresh-digest
+        [inputs (mapv #(tuple % (crypto/hash :sha256 (File/read! %))) artifacts)]))))
+
+(defn- refresh-native-root [root producer cargo build]
+  (let [inputs (native-refresh-inputs root producer cargo)
+        state (native-refresh-state root inputs)
+        receipt (Path/join (Path/join (BeamLisp.AOTCache/dir) "native-refresh")
+                           (native-refresh-digest (Path/expand root)))]
+    (if (and (BeamLisp.AOTCache/enabled?) state (= (tuple :ok state) (File/read receipt)))
+      {:built 0 :cached (count (native-refresh-artifacts root))
+       :artifacts (native-refresh-artifacts root) :errors []}
+      (let [result (build root)]
+        (when (and (BeamLisp.AOTCache/enabled?) (empty? (:errors result))
+                   (= inputs (native-refresh-inputs root producer cargo)))
+          (when-let [after (native-refresh-state root inputs)]
+            (File/mkdir_p! (Path/dirname receipt))
+            (let [tmp (str receipt ".tmp-" (erlang/apply :os :getpid (list)) "-"
+                           (erlang/unique_integer (list :positive)))]
+              (try
+                (File/write! tmp after)
+                (File/rename! tmp receipt)
+                (finally (File/rm tmp))))))
+        result))))
+
 (defn build-all!
   "Refresh source-backed native roots using the producer's content-addressed
    build/cache, including the platform when running inside a consumer project.
-   Source-free releases do no build work. Failures are reported per root and
-   do not kill the ordinary command. Returns [crate result] pairs."
+   A content receipt skips the producer when its inputs and installed bytes
+   match the last successful refresh, including across VM runs. Source-free
+   releases do no build work. Failures are reported per root and do not kill
+   the ordinary command. Returns [crate result] pairs."
   []
   (let [roots (source-native-roots)]
     (if (empty? roots) (list)
@@ -475,12 +532,20 @@
         ;; an ordinary runtime import. Only source-backed developer images
         ;; need this producer; every content key and artifact name stays owned
         ;; by that existing producer rather than duplicating its key logic.
+        (let [producer (BeamLisp.AOTCache/current_build_key)
+              version (try
+                        (System/cmd "cargo" (list "--version") (list (tuple :stderr_to_stdout true)))
+                        (catch e (tuple (or (ex-message e) "cargo unavailable") 127)))
+              cargo (when (= 0 (elem version 1)) (String/trim (elem version 0)))]
         (mapcat
           (fn [root]
             (try
-              (BeamLisp.Loader/ensure_loaded "build")
-              (let [r (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "build" "build-native")
-                                            (list root nil))]
+              (when (nil? cargo) (throw (ex-info "cargo --version failed" {})))
+              (let [r (refresh-native-root root producer cargo
+                        (fn [selected]
+                          (BeamLisp.Loader/ensure_loaded "build")
+                          (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "build" "build-native")
+                                               (list selected nil))))]
                 (doseq [error (:errors r)] (println (str "native refresh: " error)))
                 (map (fn [path] (list (Path/rootname (Path/basename path)) {:ok path}))
                      (:artifacts r)))
@@ -488,4 +553,4 @@
                 (do (println (str "native refresh for " root " failed: "
                                   (or (ex-message e) (pr-str e))))
                     (list (list root {:error (or (ex-message e) "refresh failed")}))))))
-          roots)))))
+          roots))))))

@@ -190,7 +190,7 @@ pub fn declared_transport(argv: &[String], tree_text: Option<&str>, config_text:
 
 /// Read only literal task service metadata. Balance collections and skip strings
 /// and comments so prose, another task or a nested map cannot change transport.
-fn service_task(text: &str, task: &str) -> bool {
+fn literal_tokens(text: &str) -> Vec<(usize, String)> {
     let mut tokens = Vec::<(usize, String)>::new();
     let mut chars = text.chars().peekable();
     let mut depth = 0usize;
@@ -219,6 +219,11 @@ fn service_task(text: &str, task: &str) -> bool {
             }
         }
     }
+    tokens
+}
+
+fn service_task(text: &str, task: &str) -> bool {
+    let tokens = literal_tokens(text);
     let Some(i) = tokens.windows(2).position(|w| w[0] == (1, ":tasks".into()) && w[1] == (1, "{".into())) else { return false; };
     let names = [format!("\"{task}\""), format!(":{task}")];
     for j in i + 2..tokens.len().saturating_sub(1) {

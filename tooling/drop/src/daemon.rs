@@ -582,7 +582,7 @@ fn write_log_header(file: &mut std::fs::File, root: &Path) {
 /// no log can be opened the streams fall back to null — logging must never stop
 /// a start. Returns the log path when one was opened.
 #[cfg(unix)]
-fn start_daemon_detached(bin: &Path, root: &Path, build: &str, shared: bool) -> Option<PathBuf> {
+fn start_daemon_detached(bin: &Path, root: &Path, build: &str, shared: bool, commands_only: bool) -> Option<PathBuf> {
     use std::process::Stdio;
     let log = log_path(root, build, shared);
     let mut file = log.as_deref().and_then(open_log);
@@ -591,7 +591,12 @@ fn start_daemon_detached(bin: &Path, root: &Path, build: &str, shared: bool) -> 
     }
     let log_arg = log.clone().unwrap_or_else(|| PathBuf::from(NULL_LOG));
     let mut cmd = release_command(bin);
-    cmd.args(warm_start_argv(root, shared, &log_arg)).stdin(Stdio::null());
+    cmd.args(warm_start_argv(root, shared, &log_arg));
+    if checkout_root().is_some() {
+        if commands_only { cmd.args(["--idle", "300", "--no-ui", "--commands-only"]); }
+        cmd = checkout_memory_bound(cmd);
+    }
+    cmd.stdin(Stdio::null());
     // The SAME file feeds stdout and stderr. If it cannot be duplicated it is
     // unusable, so both streams fall back to null together — the one fallback
     // path documented above.
@@ -708,7 +713,7 @@ pub enum Attach {
 #[cfg(unix)]
 enum Hello {
     /// Connected and answered ready; the stream is positioned to send a request.
-    Ready(UnixStream),
+    Ready(UnixStream, Option<Vec<u8>>),
     /// The daemon is up but wants a restart before it will serve this tree.
     RestartRequired,
     /// Unreachable, unusable, or a reject we do not recognise.
@@ -725,6 +730,12 @@ fn hello_build() -> String {
 
 #[cfg(unix)]
 fn hello(root: &Path, build: &str, shared: bool) -> Hello {
+    let generation = std::env::var("BL_CHECKOUT_GENERATION").ok();
+    hello_generation(root, build, shared, generation.as_deref())
+}
+
+#[cfg(unix)]
+fn hello_generation(root: &Path, build: &str, shared: bool, generation: Option<&str>) -> Hello {
     // A build-named daemon is found under its endpoint key; a payload that
     // predates build-named daemons binds and looks for the old `<tree>.sock`.
     let ep = if build.is_empty() { legacy_endpoints(root) } else { endpoints_for(root, build, shared) };
@@ -750,14 +761,22 @@ fn hello(root: &Path, build: &str, shared: bool) -> Hello {
     // The legacy payload predates shared VMs and still keys its hello on the
     // tree fingerprint; every current build uses the endpoint-key fingerprint.
     let fp = if build.is_empty() { tree_fingerprint(root) } else { hello_fingerprint(root, build, shared) };
-    if send_frame(&mut stream, &encode_hello(&fp, &token, build)).is_err() {
+    if send_frame(&mut stream, &encode_hello_generation(&fp, &token, build, generation)).is_err() {
         return Hello::No;
     }
 
     match recv_frame(&mut stream).ok().and_then(|b| decode(&b)) {
         // PLAN-121/123: the daemon runs each request as its OWN VM process, so
         // it is never "busy" — a ready hello means attach and send.
-        Some(Term::Tuple(t)) if is_ready(&t) => Hello::Ready(stream),
+        Some(Term::Tuple(t)) if is_ready(&t) => {
+            let generation = match t.get(3) {
+                Some(Term::Map(pairs)) => pairs.iter()
+                    .find(|(k, _)| k.as_atom() == Some("checkout_generation"))
+                    .and_then(|(_, v)| v.as_bytes()).map(|v| v.to_vec()),
+                _ => None,
+            };
+            Hello::Ready(stream, generation)
+        },
         Some(Term::Tuple(t)) if is_reject(&t, "restart_required") => Hello::RestartRequired,
         // any other reject (wrong tree / unauthorized), and a daemon that cannot
         // answer hello within the timeout, are both simply unusable.
@@ -773,13 +792,13 @@ fn hello(root: &Path, build: &str, shared: bool) -> Hello {
 /// probing with a real command wrote that command's output into the caller.
 #[cfg(unix)]
 pub fn daemon_ready(root: &Path, shared: bool) -> bool {
-    matches!(hello(root, &hello_build(), shared), Hello::Ready(_))
+    matches!(hello(root, &hello_build(), shared), Hello::Ready(_, _))
 }
 
 #[cfg(unix)]
 pub fn try_attach(root: &Path, argv: &[String], shared: bool) -> Attach {
     let mut stream = match hello(root, &hello_build(), shared) {
-        Hello::Ready(s) => s,
+        Hello::Ready(s, _) => s,
         Hello::RestartRequired => return Attach::RestartRequired,
         Hello::No => return Attach::Fallback,
     };
@@ -984,7 +1003,13 @@ fn read_exact_classified(stream: &mut UnixStream, buf: &mut [u8]) -> Result<(), 
 
 /// `{:bl 1 :hello %{tree token build}}`: `build` names the build this client
 /// expects to reach; a daemon running another one answers `:restart_required`.
+#[cfg(test)]
 fn encode_hello(tree: &[u8], token: &[u8], build: &str) -> Vec<u8> {
+    let generation = std::env::var("BL_CHECKOUT_GENERATION").ok();
+    encode_hello_generation(tree, token, build, generation.as_deref())
+}
+
+fn encode_hello_generation(tree: &[u8], token: &[u8], build: &str, generation: Option<&str>) -> Vec<u8> {
     let mut e = Enc::new();
     e.tuple_header(4);
     e.atom("bl");
@@ -992,7 +1017,7 @@ fn encode_hello(tree: &[u8], token: &[u8], build: &str) -> Vec<u8> {
     e.atom("hello");
     // An empty build is a payload that predates build-named daemons: its
     // hello is the two-key one it understands.
-    e.map_header(if build.is_empty() { 2 } else { 3 });
+    e.map_header((if build.is_empty() { 2 } else { 3 }) + usize::from(generation.is_some()));
     e.atom("tree");
     e.binary(tree);
     e.atom("token");
@@ -1000,6 +1025,10 @@ fn encode_hello(tree: &[u8], token: &[u8], build: &str) -> Vec<u8> {
     if !build.is_empty() {
         e.atom("build");
         e.binary(build.as_bytes());
+    }
+    if let Some(generation) = generation {
+        e.atom("checkout_generation");
+        e.binary(generation.as_bytes());
     }
     e.finish()
 }

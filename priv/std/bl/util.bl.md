@@ -178,7 +178,8 @@ usage exit code.
    content. Returns nil."
   [st data render]
   (if (:json st)
-    (println (bl.json/encode data))
+    (do (BeamLisp.Loader/ensure_loaded "bl.json")
+        (println (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "bl.json" "encode") (list data))))
     (when render
       (let [s (render data)]
         (when s (println s)))))
@@ -363,12 +364,11 @@ is what makes it stick.
    entry, ahead of dispatch, so no command can reach a library module before
    the path that carries it is in place."
   []
-  (BeamLisp.Loader/ensure_loaded "deps-compile")
   (let [have (set (map path->binary (code/get_path)))]
     (each (fn [d]
             (when-not (contains? have (path->binary d))
               (Code/prepend_path d)))
-          (BeamLisp.Ns.Rt/invoke (BeamLisp.Env/fetch! "deps-compile" "search-paths") (list)))))
+          (BeamLisp.Loader/library_search_paths))))
 
 (defn register-paths
   "Apply the parsed command's library roots and code paths. Library roots go to

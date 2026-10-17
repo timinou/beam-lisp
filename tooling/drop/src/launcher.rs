@@ -12,6 +12,7 @@ include!("store.rs");
 include!("transport.rs");
 include!("builder.rs");
 include!("hooks.rs");
+include!("checkout.rs");
 
 const EXIT_LAUNCHER_FAILURE: i32 = 126;
 
@@ -473,6 +474,7 @@ fn maintenance(argv: &[String], t: &Trailer, sha8: &str) -> ! {
 /// drop detached `setsid <payload>/bin/bl vm start gateway --foreground`, and the release script
 /// answered `Usage: bl COMMAND … ERROR: Unknown command gateway`.
 fn self_bl() -> std::path::PathBuf {
+    if let Some(root) = checkout_root() { return root.join("bin/bl"); }
     std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("bl"))
 }
 
@@ -503,7 +505,7 @@ fn after_attach(a: Attach) -> Option<i32> {
 
 fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path, t: Transport, shared: bool) -> Option<i32> {
     let cwd = std::env::current_dir().ok()?;
-    let root = tree_root(&cwd, argv)?;
+    let root = invocation_tree(&cwd, argv, checkout_root().is_some())?;
 
     match try_attach(&root, argv, shared) {
         Attach::Exit(code) => Some(code),
@@ -530,12 +532,15 @@ fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path, t: Transport, sha
 /// second from spawning a duplicate VM for the same endpoint.
 #[cfg(unix)]
 fn retry_from_warm(bin: &std::path::Path, root: &std::path::Path, argv: &[String], t: Transport, shared: bool) -> Option<i32> {
+    if checkout_root().is_some() && daemon_ready(root, shared) {
+        if let Some(code) = after_attach(try_attach(root, argv, shared)) { return Some(code); }
+    }
     if t != Transport::Start && t != Transport::Require {
         return None;
     }
     if let Some(ep) = endpoints(root, shared) {
-        if claim_start(&ep.starting, now_secs(), START_GRACE_SECS) {
-            start_daemon_detached(bin, root, &build_id(), shared);
+        if claim_start(&ep.starting, now_secs(), if checkout_root().is_some() { 360 } else { START_GRACE_SECS }) {
+            start_daemon_detached(bin, root, &build_id(), shared, true);
         }
     }
     if t == Transport::Require {
@@ -554,6 +559,7 @@ fn retry_from_warm(bin: &std::path::Path, root: &std::path::Path, argv: &[String
 /// Stop the warm VM for `root` by asking the release, which owns the lifecycle.
 #[cfg(unix)]
 fn stop_daemon(bin: &std::path::Path, root: &std::path::Path) {
+    if checkout_root().is_some() && stop_checkout_daemon(root) { return; }
     let mut cmd = release_command(bin);
     cmd.args(warm_stop_argv(root));
     let _ = cmd.status();
@@ -564,15 +570,20 @@ fn stop_daemon(bin: &std::path::Path, root: &std::path::Path) {
 /// lifecycle helpers use, so the entry expression is spelled once.
 fn release_command(bin: &std::path::Path) -> Command {
     let mut cmd = Command::new(bin);
-    cmd.arg("eval").arg(CLI_ENTRY).env("BL_BIN", self_bl());
+    if let Some(root) = checkout_root() {
+        cmd.env("BL_CHECKOUT_COLD", root).env("BL_BIN", self_bl());
+    } else {
+        cmd.arg("eval").arg(CLI_ENTRY).env("BL_BIN", self_bl());
+    }
     cmd
 }
 
 /// Poll for an authenticated-reachable daemon, up to a startup deadline.
 #[cfg(unix)]
 fn wait_ready(root: &std::path::Path, shared: bool) -> bool {
-    for _ in 0..600 {
-        // 600 * 200ms = 120s
+    let attempts = if checkout_root().is_some() { 1800 } else { 600 };
+    for _ in 0..attempts {
+        // Checkouts may compile the session's SDK units on their first start.
         if daemon_ready(root, shared) {
             return true;
         }
@@ -597,6 +608,12 @@ pub const LAUNCHER_VERBS: &[&str] = &[VERB_WHICH, VERB_SELF_UPDATE, VERB_SELF_IN
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.first().map(String::as_str) == Some("--checkout") {
+        checkout_main(&argv[1..]);
+    }
+    // A drop must never inherit a checkout's launch mode or source receipt.
+    std::env::remove_var("BL_CHECKOUT_ROOT");
+    std::env::remove_var("BL_CHECKOUT_GENERATION");
     let me = std::env::current_exe().unwrap_or_else(|_| fail("cannot locate myself"));
 
     // TWO MODES, told apart by the file itself. A DROP carries a payload and a
@@ -810,12 +827,12 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
     // `bl` through `BL_BIN` gets it again. Set before any thread exists. A
     // payload that predates build-named daemons gets no id, so the launcher
     // and that payload's daemon agree on the older `<tree>.sock`.
-    if names_its_build(dest) {
+    if checkout_root().is_some() || names_its_build(dest) {
         std::env::set_var("BL_BUILD_ID", sha8);
     } else {
         std::env::remove_var("BL_BUILD_ID");
     }
-    touch_used(dest);
+    if checkout_root().is_none() { touch_used(dest); }
     let argv = argv.to_vec();
 
     let bin = dest.join(if cfg!(windows) { r"bin\bl.bat" } else { LAUNCHER_REL });
@@ -833,7 +850,7 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
     #[cfg(unix)]
     {
         let cwd = std::env::current_dir().ok();
-        let root = cwd.as_deref().and_then(|c| tree_root(c, &argv));
+        let root = cwd.as_deref().and_then(|c| invocation_tree(c, &argv, checkout_root().is_some()));
         // Read the project's env.bl ONCE: `--share-vm`/`--own-vm` or the `:vm`
         // declaration decides the endpoint for this whole invocation (the default
         // is own). The declaration is read from the nearest env.bl at or above
@@ -845,13 +862,18 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
             None => cwd.as_deref().and_then(project_dir),
         };
         let env_bl = declared_at.and_then(|d| std::fs::read_to_string(d.join(PROJECT_FILE)).ok());
-        let shared = shared_for(&argv, env_bl.as_deref()) && supports_shared_vm(dest);
+        let shared = checkout_root().is_none() && shared_for(&argv, env_bl.as_deref()) && supports_shared_vm(dest);
         // Whether the project shares its VM decides the DEFAULT transport (an own
         // VM attaches, a shared one starts); anything the user declared still wins.
-        let mut t = effective_transport(
-            root.as_deref().map(|r| transport(r, &argv, shared)).unwrap_or_else(|| default_transport(shared)),
-            supports_background_start(dest),
-        );
+        let mut t = if checkout_root().is_some() {
+            let config = std::fs::read_to_string(config_path()).ok();
+            checkout_transport(&argv, env_bl.as_deref(), config.as_deref())
+        } else {
+            effective_transport(
+                root.as_deref().map(|r| transport(r, &argv, shared)).unwrap_or_else(|| default_transport(shared)),
+                supports_background_start(dest),
+            )
+        };
         if t != Transport::Cold && service_requested(&argv, env_bl.as_deref()) {
             t = Transport::Require;
         }
@@ -876,9 +898,9 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
                     // the user asked for a warm VM and is owed the outcome.
                     let log = log_path(root, &build_id(), shared);
                     let claimed = endpoints(root, shared)
-                        .is_some_and(|e| claim_start(&e.starting, now_secs(), START_GRACE_SECS));
+                        .is_some_and(|e| claim_start(&e.starting, now_secs(), if checkout_root().is_some() { 360 } else { START_GRACE_SECS }));
                     if claimed {
-                        start_daemon_detached(&bin, root, &build_id(), shared);
+                        start_daemon_detached(&bin, root, &build_id(), shared, false);
                     }
 
                     if wait_ready(root, shared) {
@@ -898,7 +920,7 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
                 }
             }
             if !is_lifecycle {
-                if t == Transport::Require && (!supports_background_start(dest) || root.is_none()) {
+                if t == Transport::Require && ((checkout_root().is_none() && !supports_background_start(dest)) || root.is_none()) {
                     eprintln!("bl: required warm transport needs a project root and a persistent-VM capable release");
                     std::process::exit(1);
                 }

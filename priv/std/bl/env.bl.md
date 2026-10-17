@@ -25,7 +25,7 @@ as data. A broken `env.bl` degrades what the tree can do — its tasks, its port
 
 ```beam-lisp silent
 (ns bl.env
-  (:require [bl.util :as u] [bl.loading :as loading]))
+  (:require [bl.util :as u] [bl.loading-policy :as loading]))
 ```
 
 ## Discovery

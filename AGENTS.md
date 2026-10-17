@@ -1,6 +1,6 @@
 # Working in this repo
 
-## Every `bl` command is a whole BEAM
+## Cold commands start a whole BEAM
 
 A cold `bl run`, `bl test`, `bl eval` or `bl self-build` starts its own VM. That
 VM loads the language and its ~50 dependency apps before it touches your file.
@@ -37,18 +37,18 @@ running a test loop is enough to push it there.
    launched for a check is yours to stop when the check is done. They do not
    exit by themselves, and one forgotten for three days held 7 GB of swap.
 
-### A warm VM is not yet a fix
+### Checkout commands reuse a warm VM
 
-Re-using one warm VM instead of starting a cold one per command is the design
-direction (PLAN-158, realms). Today it does **not** cover this:
+`./bin/bl` uses the native transport and starts one VM for its tree by default.
+Requests carry their own cwd, argv and environment. Source changes invalidate
+that VM before the next request. Automatic VMs skip dashboards and project
+schedules and exit after five idle minutes; use
+`./bin/bl realm stop` to stop it explicitly.
 
-- the realm work lives on the `realm` branch and is not in `main`;
-- the launcher's default transport is *attach*: it uses a warm VM only if one
-  is already running and never starts one;
-- one VM per user and build (the step that makes many projects share a VM) is
-  not built.
-
-Until all three change, assume every command costs its own VM.
+Use `./bin/bl --cold ...` when a check needs a fresh VM. The first command and
+commands after source edits still pay runtime startup. Keep test daemons in a
+private runtime directory, cap the whole test process tree, and stop them in
+cleanup. See `test/scripts/checkout_transport.py`.
 
 ## Which bl
 

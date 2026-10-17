@@ -2,7 +2,7 @@
 
 A project declares the ports it serves on. `env.bl` names them:
 
-```beam-lisp silent
+```clojure
 {:name "pulse"
  :ports {:web 4000 :metrics {:port 0} :ui 7700}}
 ```
