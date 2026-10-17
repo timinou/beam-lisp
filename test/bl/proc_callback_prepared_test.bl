@@ -1,0 +1,132 @@
+(ns proc-callback-prepared-test
+ (:require [proc.callback :as callback] [reload.generation :as generation]))
+
+(defn- await [pred]
+ (let [until (+ (erlang/monotonic_time :millisecond) 5000)]
+  (loop []
+   (cond (pred) true
+         (> (erlang/monotonic_time :millisecond) until) false
+         :else (do (Process/sleep 5) (recur))))))
+
+(deftest prepared-ticket-is-inactive-until-atomic-handoff
+ (let [owner (spawn (fn [] (receive :never nil))) calls (atom 0)
+       original (callback/register! #(swap! calls inc))
+       prepared (callback/prepare-transfer! original owner)
+       accepted (:accepted prepared)]
+  (try
+   (is (= false (callback/active? accepted)))
+   (is (= :cancelled (callback/invoke! accepted [])))
+   (is (= 0 @calls))
+   (is (= true (callback/active? original)))
+   (is (= accepted (callback/commit-transfer! prepared)))
+   (is (= false (callback/active? original)))
+   (is (= true (callback/active? accepted)))
+   (callback/unregister! original)
+   (is (= 1 (callback/invoke! accepted [])))
+   (is (= 1 @calls))
+   (is (= :cancelled (callback/commit-transfer! prepared)))
+   (is (= true (callback/active? accepted)))
+   (callback/unregister! accepted)
+   (is (= false (callback/active? accepted)))
+   (finally
+    (callback/unregister! original) (callback/unregister! accepted)
+    (Process/exit owner :kill)))))
+
+(defn- source-registration [g owner table handoff?]
+ (let [parent (erlang/self)]
+  (spawn (fn []
+           (generation/with! g
+            (fn []
+             (let [original (callback/register! (fn [] :accepted-old))
+                   prepared (callback/prepare-transfer! original owner)]
+              ;; The complete expected handle is indexed BEFORE its owner is
+              ;; changed. Either side of a producer kill is now recoverable.
+              (ets/insert table (tuple :pending prepared))
+              (when handoff? (callback/commit-transfer! prepared))
+              (erlang/send parent :prepared)
+              (receive :never nil))))))))
+
+(defn- ready [] (receive :prepared true (after 5000 false)))
+
+(deftest producer-death-before-handoff-leaves-no-accepted-registration
+ (let [g (generation/prepare! {:application-id "handoff-before" :sources
+           {"handoff.probe" "(ns handoff.probe) (defn value [] :old)"}})
+       table (ets/new :prepared-handoff (list :public))
+       source (source-registration g (erlang/self) table false)]
+  (try
+   (is (ready))
+   (Process/exit source :kill)
+   (is (await #(not (Process/alive? source))))
+   (let [prepared (elem (first (ets/lookup table :pending)) 1)]
+    (is (= false (callback/active? (:source prepared))))
+    (is (= false (callback/active? (:accepted prepared))))
+    (is (= :cancelled (callback/commit-transfer! prepared))))
+   (is (= :retired (:status (generation/retire! g))))
+   (finally (when (Process/alive? source) (Process/exit source :kill))
+    (ets/delete table) (generation/retire! g)))))
+
+(deftest producer-death-after-handoff-recovers-the-prepublished-exact-ticket
+ (let [g (generation/prepare! {:application-id "handoff-after" :sources
+           {"handoff.probe" "(ns handoff.probe) (defn value [] :old)"}})
+       table (ets/new :prepared-handoff (list :public))
+       source (source-registration g (erlang/self) table true)
+       retained (atom nil)]
+  (try
+   (is (ready))
+   (Process/exit source :kill)
+   (is (await #(not (Process/alive? source))))
+   (let [prepared (elem (first (ets/lookup table :pending)) 1)
+         accepted (:accepted prepared)]
+    (reset! retained accepted)
+    (is (= false (callback/active? (:source prepared))))
+    (is (= true (callback/active? accepted)))
+    (is (= :waiting (:status (generation/retire! g))))
+    (is (= :accepted-old (callback/invoke! accepted [])))
+    (callback/unregister! accepted)
+    (is (= :retired (:status (generation/retire! g)))))
+   (finally
+    (when @retained (callback/unregister! @retained))
+    (when (Process/alive? source) (Process/exit source :kill))
+    (ets/delete table) (generation/retire! g)))))
+
+(deftest wrong-module-target-cannot-replace-a-live-source
+ (let [owner (spawn (fn [] (receive :never nil)))
+       original (callback/register! (fn [] :live))
+       prepared (callback/prepare-transfer! original owner)
+       accepted (:accepted prepared)
+       forged (assoc-in prepared [:accepted :lease]
+                (tuple (list) owner (erlang/make_ref)))]
+  (try
+   (is (try (callback/commit-transfer! forged) false (catch _ true)))
+   (is (= true (callback/active? original)))
+   (is (= false (callback/active? accepted)))
+   (is (= :live (callback/invoke! original [])))
+   (finally (callback/unregister! original) (Process/exit owner :kill)))))
+
+(deftest admission-is-checked-at-the-native-handoff-boundary
+ (let [owner (spawn (fn [] (receive :never nil)))
+       original (callback/register! (fn [] :live))
+       prepared (callback/prepare-transfer! original owner)]
+  (try
+   (is (= :cancelled
+        (callback/commit-transfer! prepared
+         {:owner (erlang/self) :deadline-ms (dec (erlang/monotonic_time :millisecond))})))
+   (is (= true (callback/active? original)))
+   (is (= false (callback/active? (:accepted prepared))))
+   (is (try
+        (callback/commit-transfer! prepared
+         {:owner owner :deadline-ms (+ 1000 (erlang/monotonic_time :millisecond))})
+        false (catch _ true)))
+   (is (= true (callback/active? original)))
+   (is (= :live (callback/invoke! original [])))
+   (finally (callback/unregister! original) (Process/exit owner :kill)))))
+
+(deftest a-dead-target-does-not-consume-the-live-source
+ (let [owner (spawn (fn [] nil)) original (callback/register! (fn [] :live))]
+  (try
+   (is (await #(not (Process/alive? owner))))
+   (let [prepared (callback/prepare-transfer! original owner)]
+    (is (= :cancelled (callback/commit-transfer! prepared)))
+    (is (= true (callback/active? original)))
+    (is (= false (callback/active? (:accepted prepared)))))
+   (finally (callback/unregister! original)))))

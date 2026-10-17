@@ -1,0 +1,114 @@
+; Actual Source code changes its public Env. Native origin must remain visible
+; to every shared allocation/start boundary. These are not fabricated PDict proofs.
+(ns reload.execution-origin-test
+ (:require [reload.generation :as g] [env] [datom :as d]
+           [datom.store-ets :as store] [datom.store-fjall :as fjall]
+           [proc.task :as task] [proc.callback :as callback]
+           [proc.dispatch :as dispatch] [proc.framework :as framework]
+           [reload.state :as state]))
+(defn- graph []
+ (let [root (str (System/get_env "HOME") "/tmp/execution-origin-" (erlang/unique_integer (list :positive)))
+       file (str root "/origin/fixture.bl")]
+  (File/mkdir_p! (Path/dirname file))
+  (File/write! file
+   "(ns origin.fixture (:require [env] [datom :as d] [datom.store :as storage]
+      [datom.store-ets :as store] [datom.store-fjall :as fjall]
+      [proc.server :as server] [proc.task :as task] [proc.callback :as callback]
+      [proc.dispatch :as dispatch] [reload.execution :as execution]))
+    (defn operation [op payload]
+     (case op
+      :ets (let [s (store/open)] (storage/close s) :created)
+      :conn (let [c (d/connect)] (d/close! c) :created)
+      :fjall (fjall/open payload)
+      :server (let [pid (start dispatch/dispatcher {})] (stop pid) :started)
+      :task (task/await (task/async-nolink (fn [] (reset! payload true))) 10000)
+      :callback (let [r (callback/register! (fn [] (reset! payload true)))]
+                  (callback/invoke! r []) (callback/unregister! r) :registered)))
+    (defn attempt [op mode payload]
+     (let [original (env/capture)]
+      (try
+       (env/bind (case mode :nil (assoc original :generation nil)
+                  :foreign (assoc original :env :global :chain (list :global))
+                  :subset (assoc original :generation (assoc (:generation original) :modules [])) original))
+       {:status :accepted :value (operation op payload)}
+       (catch error {:status :refused :error (str error)})
+       (finally (env/bind original)))))
+    (defn run-task [op mode payload]
+     (task/await (task/async-nolink #(attempt op mode payload)) 10000))
+    (defn registration [] (callback/register! attempt))
+    (server/defserver owner
+     (init [opts] (ok {:opts opts :connection (when (:initial-store opts) (d/connect))}))
+     (handle-call [:probe op mode payload] [_ state] (reply (attempt op mode payload) state))
+     (handle-call :poison [_ state]
+      (env/bind (assoc (env/capture) :generation nil)) (reply :poisoned state))
+     (handle-call :touch [_ state] (reset! (get-in state [:opts :touched]) true) (reply :touched state))
+     (terminate [_ state]
+      (when (:connection state) (d/close! (:connection state)))
+      (when-let [observer (get-in state [:opts :observer])]
+       (erlang/send observer [:origin-cleanup (execution/owned?)]))))
+    (defn start-owner [opts] (start owner opts))")
+  (try
+   (BeamLisp.Loader/with_load_path root
+    #(g/prepare! (g/project-plan {:application-id "execution-origin-test"
+       :entrypoint "origin.fixture/attempt" :fixed-runtime true
+       :native-modules #{"erlang"}})))
+   (finally (File/rm_rf! root)))))
+(defn- stop! [pid]
+ (when (and pid (Process/alive? pid)) (try (stop pid) (catch _ nil))))
+(defn- await-down! [pid]
+ (let [ref (Process/monitor pid)]
+  (try (receive [:DOWN seen :process dead _] :when (and (= ref seen) (= pid dead)) true
+          (after 10000 false))
+   (finally (Process/demonitor ref (list :flush))))))
+(defn- no-effects! [invoke]
+ (doseq [mode [:nil :foreign :subset] op [:ets :conn :fjall :server :task :callback]]
+  (let [root (str (System/get_env "HOME") "/tmp/origin-fjall-" (erlang/unique_integer (list :positive)))
+        effect (atom false) payload (if (= :fjall op) root effect)
+        before (count (erlang/apply :ets :all (list))) result (invoke op mode payload)]
+   (is (= :refused (:status result)))
+   (is (String/contains? (:error result) "execution_origin_context_mismatch"))
+   (is (= false @effect)) (is (not (File/exists? root)))
+   (is (= before (count (erlang/apply :ets :all (list))))))))
+
+(deftest actual-source-actor-task-and-retained-callback-cannot-bind-away-native-origin
+ (let [graph (graph) actor (g/invoke! graph "origin.fixture/start-owner" [{}])
+       registration (g/invoke! graph "origin.fixture/registration" [])]
+  (try
+   (no-effects! #(g/invoke! graph "origin.fixture/attempt" [%1 %2 %3]))
+   (no-effects! #(call actor [:probe %1 %2 %3]))
+   (no-effects! #(g/invoke! graph "origin.fixture/run-task" [%1 %2 %3]))
+   (no-effects! #(callback/invoke! registration [%1 %2 %3]))
+   (doseq [invoke [#(g/invoke! graph "origin.fixture/attempt" [%1 :same %2])
+                  #(call actor [:probe %1 :same %2])
+                  #(g/invoke! graph "origin.fixture/run-task" [%1 :same %2])
+                  #(callback/invoke! registration [%1 :same %2])]
+           op [:ets :conn :task :callback]]
+    (let [effect (atom false) result (invoke op effect)]
+     (is (= :accepted (:status result)))
+     (when (contains? #{:task :callback} op) (is (= true @effect)))))
+   (finally (callback/unregister! registration) (stop! actor) (g/retire! graph)))))
+
+(deftest permanent-public-nil-binding-cannot-disable-next-callback-or-owned-cleanup
+ (let [graph (graph) touched (atom false)
+       actor (g/invoke! graph "origin.fixture/start-owner"
+                [{:initial-store true :observer (erlang/self) :touched touched}])]
+  (try
+   (is (= :poisoned (call actor :poison)))
+   (is (= :refused (try (call actor :touch) :accepted (catch _ :refused))))
+   (is (await-down! actor)) (is (= false @touched))
+   (is (= true (receive [:origin-cleanup owned] owned (after 10000 :missing))))
+   (finally (stop! actor) (g/retire! graph)))))
+
+(deftest actual-sdk-framework-adoption-clears-source-creator-snapshot-only-after-proof
+ (let [graph (graph) actor (atom nil)]
+  (try
+   (g/with! graph #(state/bind! {:origin/owner (atom (erlang/self)) :origin/table (atom nil)}))
+   (reset! actor (g/with! graph #(start dispatch/dispatcher
+                    {:limit 1 :owner-key :origin/owner :table-key :origin/table})))
+   (is (= :framework (:kind (framework/owner-evidence @actor))))
+   (is (= {:running 0 :queued 0} (dispatch/stats @actor)))
+   (let [dictionary (elem (Process/info @actor :dictionary) 1)]
+    (is (nil? (Keyword/get dictionary :bl_server_execution_owner)))
+    (is (nil? (Keyword/get dictionary :bl_server_execution_context)))
+    (is (nil? (Keyword/get dictionary :bl_executing_generation))))
+   (finally (stop! @actor) (g/retire! graph)))))

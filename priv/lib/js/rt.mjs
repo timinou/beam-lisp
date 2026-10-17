@@ -415,6 +415,12 @@ export function hashSet(...xs) { let s = EMPTY_SET; for (const x of xs) s = s.co
 // the atom table and cannot be reproduced anywhere else).
 function sortedEntries(es) { return es.sort((a, b) => compare(a[0], b[0])); }
 
+// Opaque Erlang references have identity, never structural equality. The shared
+// WeakMap below supplies hashing/order without putting mutable ids on a value.
+export class Ref { constructor() { Object.freeze(this); } }
+export const makeRef = () => new Ref();
+export const isRef = (value) => value instanceof Ref;
+
 // ─── hashing + equality ─────────────────────────────────────────────────────
 
 export function strHash(s) {
@@ -473,7 +479,7 @@ export function keyEq(a, b) {
   return false;
 }
 /** Erlang TERM order (`erlang/<`, `=<`, `lists:sort`) on the JS value model:
-    number < atom < fun < tuple < map < list < binary. Atoms (nil, booleans,
+    number < atom < reference < fun < tuple < map < list < binary. Atoms (nil, booleans,
     keywords) order by name; tuples by size then element-wise; lists
     element-wise, shorter first; binaries by codepoint (= UTF-8 byte order).
     A BEAM vector/set/decimal is a struct, i.e. a map. Numbers compare by
@@ -484,6 +490,7 @@ export function termCompare(a, b) {
   switch (ra) {
     case 0: { const x = numOf(a), y = numOf(b); return x < y ? -1 : x > y ? 1 : 0; }
     case 1: { const x = atomName(a), y = atomName(b); return x < y ? -1 : x > y ? 1 : 0; }
+    case 1.5: { const x = fnId(a), y = fnId(b); return x < y ? -1 : x > y ? 1 : 0; }
     case 2: return 0;
     case 3: {
       if (a.items.length !== b.items.length) return a.items.length < b.items.length ? -1 : 1;
@@ -509,6 +516,7 @@ export function termCompare(a, b) {
 function termRank(x) {
   if (typeof x === "number" || typeof x === "bigint" || x instanceof Flt) return 0;
   if (x === null || x === undefined || x === true || x === false || x instanceof Kw) return 1;
+  if (x instanceof Ref) return 1.5;
   if (typeof x === "function") return 2;
   if (x instanceof Tup) return 3;
   if (x instanceof HMap || x instanceof Vec || x instanceof HSet || x instanceof Dec) return 4;
@@ -621,7 +629,7 @@ export function compare(a, b) {
     }
     case 6: case 7: { const ca = a.cnt, cb = b.cnt; if (ca !== cb) return ca < cb ? -1 : 1; return compare(printStr(a), printStr(b)); }
     case 8: { const n = Math.min(a.items.length, b.items.length); for (let i = 0; i < n; i++) { const c = compare(a.items[i], b.items[i]); if (c) return c; } return a.items.length - b.items.length; }
-    default: return 0;
+    default: return a instanceof Ref || b instanceof Ref ? termCompare(a, b) : 0;
   }
 }
 function numOf(x) { return x instanceof Flt ? x.v : x; }
@@ -793,6 +801,7 @@ export function printStr(x) {
   if (x instanceof Tup) return "{" + x.items.map(printStr).join(", ") + "}";
   if (x instanceof BLError) return "#error {:message " + escStr(x.message) + "}";
   if (x instanceof Atom) return "#<atom " + printStr(x.v) + ">";
+  if (x instanceof Ref) return "#Ref<js." + fnId(x) + ">";
   if (x !== null && typeof x === "object" && x.blStruct && x.blStruct.fq === "Elixir.Regex") return "~r/" + x.source + "/";
   if (x instanceof Z.Delay) return "#<delay " + (x.seq.s[0] === 2 ? printStr(x.seq.s[1]) : ":pending") + ">";
   return "#<host " + Object.prototype.toString.call(x) + ">";

@@ -1,0 +1,160 @@
+(ns proc.reconcile-config-test
+ (:require [proc.reconcile-config :as owned] [proc.reconcile :as rec]
+           [proc.queue :as queue] [reload.generation :as g]))
+
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- options [application marker]
+ {:application-id application
+  :stable-namespaces #{"proc.server" "proc.reconcile" "proc.queue" "proc.tick"}
+  :sources {"owned.reconciler"
+   (str "(ns owned.reconciler (:require [proc.server :as server])) "
+        "(defn config-for [srv policy] {:marker " (pr-str marker) "}) "
+        "(server/defserver runtime (reconcile {:config-fn config-for :level nil}))")}})
+
+; Bounded fixture diagnostics distinguish compiler cost from owner/lease waits.
+(defn- phase! [tag value]
+ (println (pr-str [:reconcile-config-phase (System/monotonic_time :millisecond) tag value])))
+(defn- prepared! [application marker]
+ (phase! :prepare-start [application marker])
+ (let [graph (g/prepare! (options application marker))]
+  (phase! :prepare-done [application marker]) graph))
+
+(defn- owner! [graph srv]
+ (phase! :owner-start [(:application-id graph) srv])
+ (let [parent (erlang/self)
+       pid (g/with! graph
+             (fn [] (spawn
+                (fn []
+                 (try
+                  (owned/register! srv "owned.reconciler/runtime" {}
+                   (fn [cfg operation args]
+                    (case operation
+                     :validate :valid
+                     :status (:marker cfg)
+                     :wait (do (erlang/send parent [:accepted (erlang/self)])
+                               (receive :finish (:marker cfg)))
+                     :wait-resources
+                      (do (erlang/send parent [:accepted (erlang/self)])
+                          (receive :finish
+                            (owned/with-resources! srv
+                             #(erlang/send parent [:orphan-resource]))))
+                     :marker (:marker cfg)))
+                   (fn [_] nil))
+                  (erlang/send parent [:ready (erlang/self)])
+                  (receive :stop nil)
+                  (catch error (erlang/send parent [:failed (erlang/self) error])))))))]
+  (receive
+   [:ready seen] :when (= seen pid) (do (phase! :owner-ready [srv pid]) pid)
+   [:failed seen error] :when (= seen pid) (throw error)
+   (after 5000 (throw "reconciliation fixture owner did not start")))))
+
+(defn- stopped! [pid srv]
+ (phase! :stop-start [srv pid])
+ (erlang/send pid :stop)
+ (loop [left 1000]
+  (if (and (not (Process/alive? pid)) (not (owned/registered? srv))) (do (phase! :stop-done [srv pid]) :stopped)
+   (if (zero? left) (throw "reconciliation fixture did not release")
+    (do (Process/sleep 5) (recur (dec left)))))))
+
+(defn- retired! [graph]
+ (phase! :retire-start (:application-id graph))
+ (loop [left 1000]
+  (let [result (g/retire! graph)]
+   (if (or (contains? #{:retired :already-retired} (:status result)) (zero? left))
+    (do (phase! :retire-done (:status result)) result)
+    (do (Process/sleep 5) (recur (dec left)))))))
+
+(deftest managed-start-context-refuses-executable-values-before-factory-publication
+ (let [graph (prepared! "reconcile-start-context" :safe)
+       srv (queue/scoped-server "reconcile-start-context" :same)]
+  (try
+   (is (= :executable-reconcile-start-context
+          (kind #(g/with! graph
+                   (fn [] (owned/register! :same "owned.reconciler/runtime" {}
+                            {:borrowed (fn [] :unsafe)}
+                            (fn [_ _ _] :wrong) (fn [_] nil)))))))
+   (is (not (owned/registered? srv)))
+   (finally (g/retire! graph)))))
+
+(deftest exact-owner-registration-is-isolated-and-cannot-be-overwritten
+ (let [a (prepared! "reconcile-owned-a" :old)
+       next (prepared! "reconcile-owned-a" :new)
+       b (prepared! "reconcile-owned-b" :other)
+       sa (queue/scoped-server "reconcile-owned-a" :same)
+       sb (queue/scoped-server "reconcile-owned-b" :same)
+       pa (owner! a :same) pb (owner! b :same)
+       old (owned/capture sa)]
+  (try
+   (is (= :old (owned/invoke-registration! old :marker [])))
+   (is (= :other (owned/invoke! sb :marker [] (fn [_ _ _] :wrong))))
+   (is (= :reconcile-owner-already-live
+          (kind #(g/with! next
+                  (fn [] (owned/register! :same "owned.reconciler/runtime" {}
+                           (fn [_ _ _] :wrong) (fn [_] nil)))))))
+   (is (= :old (owned/invoke-registration! old :marker [])))
+   (is (= :queue-application-mismatch
+          (kind #(g/with! b (fn [] (owned/capture sa))))))
+   (is (= :waiting (:status (g/retire! a))))
+   (stopped! pa sa)
+   (is (= :released-reconcile-owner (kind #(owned/invoke-registration! old :marker []))))
+   ;; A stored descriptor is not a live owner. Status cannot replay even an
+   ;; apparently read-only factory in a new graph after its actual owner died.
+   (is (= false (g/with! next #(owned/available? :same))))
+   (is (= :missing-reconcile-owner
+          (kind #(g/with! next
+                   (fn [] (owned/invoke! :same :status [] (fn [cfg _ _] (:marker cfg))))))))
+   (is (= :missing-reconcile-owner
+          (kind #(g/with! next
+                  (fn [] (owned/invoke! :same :perform [{}] (fn [_ _ _] :wrong)))))))
+   (is (= :retired (:status (retired! a))))
+   (finally
+    (when (Process/alive? pa) (stopped! pa sa))
+    (when (Process/alive? pb) (stopped! pb sb))
+    (g/retire! a) (g/retire! next) (g/retire! b)))))
+
+(deftest admitted-work-drains-after-owner-death-under-its-exact-config
+ (let [graph (prepared! "reconcile-drain" :admitted)
+       srv (queue/scoped-server "reconcile-drain" :same)
+       parent (erlang/self) pid (owner! graph :same)
+       registration (owned/capture srv)
+       worker (spawn (fn []
+                       (let [out (owned/invoke-registration! registration :wait [])]
+                        (erlang/send parent [:done (erlang/self) out]))))]
+  (try
+   (receive [:accepted seen] :when (= seen worker) (is true)
+     (after 5000 (throw "reconciliation fixture work was not admitted")))
+   (stopped! pid srv)
+   (is (= :released-reconcile-owner
+          (kind #(owned/invoke-registration! registration :marker []))))
+   (is (= :waiting (:status (g/retire! graph))))
+   (erlang/send worker :finish)
+   (receive [:done seen value] :when (= seen worker) (is (= :admitted value))
+     (after 5000 (throw "accepted reconciliation work did not finish")))
+   (loop [left 1000]
+    (when (and (Process/alive? worker) (pos? left)) (Process/sleep 5) (recur (dec left))))
+   (is (= :retired (:status (retired! graph))))
+   (finally
+    (erlang/send worker :finish)
+    (when (Process/alive? pid) (stopped! pid srv))
+    (g/retire! graph)))))
+
+(deftest an-admitted-old-operation-cannot-create-resources-after-owner-cleanup
+ (let [graph (prepared! "reconcile-resource-fence" :old)
+       srv (queue/scoped-server "reconcile-resource-fence" :same)
+       parent (erlang/self) pid (owner! graph :same)
+       registration (owned/capture srv)
+       worker (spawn (fn []
+                       (let [result (kind #(owned/invoke-registration! registration :wait-resources []))]
+                        (erlang/send parent [:done (erlang/self) result]))))]
+  (try
+   (receive [:accepted seen] :when (= seen worker) (is true)
+     (after 5000 (throw "resource fixture was not admitted")))
+   (stopped! pid srv)
+   (erlang/send worker :finish)
+   (receive [:done seen value] :when (= seen worker) (is (= :released-reconcile-owner value))
+     (after 5000 (throw "resource fixture did not finish")))
+   (receive [:orphan-resource] (is false) (after 0 (is true)))
+   (finally
+    (erlang/send worker :finish)
+    (when (Process/alive? pid) (stopped! pid srv))
+    (retired! graph)))))

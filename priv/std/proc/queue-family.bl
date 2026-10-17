@@ -1,0 +1,390 @@
+; First-party source-family annotations borrow exact monitored server witnesses;
+; no annotation independently authorizes stopping or migrating an actor.
+(ns proc.queue-family
+ (:require [proc.table :as table] [proc.owner-registry :as owners]
+           [reload.execution :as execution] [env]
+           [data.first-order :as first-order]
+           [datom.conn :as dc] [datom.store :as ds] [proc.queue-family-root :as managed-root]))
+
+(def ^:private MEMBERS :beam_lisp_queue_family_members)
+(def ^:private EPOCHS :beam_lisp_queue_family_epochs)
+(def ^:private shared-handlers (atom {}))
+(defn- refuse [kind] (throw (ex-info "Queue declaration family refused" {:kind kind})))
+(defn- tables! []
+ (table/hold MEMBERS {:type :ordered_set :options [:public :named_table]})
+ (table/hold EPOCHS {:type :set :options [:public :named_table]}))
+(defn- epoch [app]
+ (when-not (seq (ets/lookup EPOCHS app))
+  (BeamLisp.Env/with_generation_lock :queue-family-capacity
+   (fn []
+    (when-not (seq (ets/lookup EPOCHS app))
+     (when (>= (ets/info EPOCHS :size) 4096) (refuse :queue-family-application-budget))
+     (ets/insert_new EPOCHS (tuple app (erlang/make_ref) 0))))))
+ (let [row (first (ets/lookup EPOCHS app))] [(elem row 1) (elem row 2)]))
+(defn- fenced [app action]
+ (when-not (and (string? app) (<= 1 (erlang/byte_size app) 128)) (refuse :missing-application-id))
+ (tables!)
+ (BeamLisp.Env/with_generation_lock (tuple :queue-family app)
+  (fn [] (epoch app) (action))))
+(defn- advance! [app] (ets/update_counter EPOCHS app (tuple 3 1)))
+(defn- admit-new-member! [app]
+ ;; Admission is bounded before publication, including an application whose
+ ;; initializer fails before it can establish a live instance. Dead members
+ ;; stay explicit restoration obligations instead of silently losing work.
+ (when (>= (ets/info MEMBERS :size) 16384) (refuse :queue-family-runtime-budget))
+ (loop [key (ets/next MEMBERS (tuple app 0)) count 0]
+  (when (and (tuple? key) (= 2 (erlang/tuple_size key)) (= app (elem key 0)))
+   (when (>= count 127) (refuse :queue-family-inventory-budget))
+   (recur (ets/next MEMBERS key) (inc count)))))
+(defn- family-of [g id]
+ (let [entry (get-in g [:declarations :reconcile id]) data (:data entry)
+       family (:queue-family data)]
+  (when family
+   (when-not (and (= :reconcile (:kind data)) (= id (:ident data)) (= 1 (:version family))
+                  (= id (:declaration family)) (erlang/is_integer (:protocol family))
+                  (pos? (:protocol family)) (= :retain-exact (:transition family))
+                  (= :reconcile-row-v1 (:payload-format family))
+                  (map? (:fixed-shape family)))
+    (refuse :invalid-compiled-queue-family))
+   family)))
+(defn- handle [entry]
+ (select-keys entry [:key :ticket :pid :application-id :kind :proof-id]))
+(defn- native-entry
+ ([membership] (native-entry membership true))
+ ([membership full?]
+ (let [row (first (ets/lookup owners/INDEX (:key membership))) entry (when row (elem row 1))
+       native (or (:native-evidence entry) (:framework-evidence entry)) lease (:lease native) module (:module entry)]
+  (when (and entry (= membership (handle entry)) (contains? #{:server :framework} (:kind entry))
+             (tuple? lease) (= 3 (erlang/tuple_size lease))
+             (not (seq (ets/lookup owners/META (tuple :closed (:ticket entry)))))
+             (= (:pid entry) (erlang/element 2 lease))
+             (= (:proof-id entry) (erlang/element 3 lease))
+             (Process/alive? (:pid entry))
+             (if full? (BeamLisp.Env/code_lease_active? lease)
+               ;; Routing-only observation: a class row is NOT a full graph
+               ;; lease proof and grants no execution/retention authority.
+               (= [(tuple (tuple module (:pid entry) (:proof-id entry)) true)]
+                  (vec (ets/lookup :beam_lisp_code_leases (tuple module (:pid entry) (:proof-id entry))))))
+             (= (:application-id entry) (:application-id native))
+             (if (= :server (:kind entry)) (= (:origin-generation entry) (:generation native))
+                 (= :framework (:kind native)))
+             (= module (:module native))) entry))))
+(defn- attested-start! [g id shared?]
+ (let [parts (String/split id "/") physical (get (:mapping g) (first parts))
+       declaration (when (and physical (= 2 (count parts)))
+                     (env/with-env (:scope g) #(BeamLisp.Env/fetch_exact! physical (second parts))))
+       key (tuple (:application-id g) (erlang/self) :server)
+       row (first (ets/lookup owners/INDEX key)) entry (when row (elem row 1))
+       current (when entry (native-entry (handle entry)))]
+  (when-not (and current (= (:digest g) (:origin-generation current))
+                 (if shared?
+                  (and (get-in g [:declarations :reconcile id :data :canonical])
+                       (= (:module current) (BeamLisp.Env/with_env :global
+                          #(BeamLisp.Env/fetch_exact! "proc.queue-runtime" "owner")))
+                       (= (tuple "proc.queue-runtime" "owner")
+                          (get-in (BeamLisp.AOT/sdk_class_evidence! (:module current)) [:artifact :declaration-owner])))
+                  (= declaration (:module current))))
+   (refuse :queue-family-generated-owner-required))
+  ;; Native one-shot generated-init extent, not module/frame shape alone.
+  ;; This rejects a later handler on this same genuine native actor.
+  (when-not (BeamLisp.Env/server_initializing? (:module current))
+   (refuse :queue-family-generated-owner-required))
+  current))
+(defn- member-current?
+ ([row] (member-current? row true))
+ ([row full?]
+ (when-let [native (native-entry (:membership row) full?)]
+  (and (= (:application-id row) (:application-id native))
+       (= (:module row) (:module native))
+       (if (= :shared-reconcile (:owner-mode row))
+        (let [receipt (get @shared-handlers (:key row)) lease (:lease receipt)
+              g (:graph receipt)]
+         (and (= (:membership row) (:membership receipt))
+              (= (:handler-generation row) (:digest g))
+              (= (:application-id row) (:application-id g))
+              (tuple? lease) (= (get-in row [:membership :pid]) (elem lease 1))
+              (BeamLisp.Env/code_lease_active? lease)
+              ;; An arbitrary valid actor lease cannot impersonate a different
+              ;; handler graph. This is actual retained module membership.
+              (every? (fn [module]
+                        (= [(tuple (tuple module (elem lease 1) (elem lease 2)) true)]
+                           (vec (ets/lookup :beam_lisp_code_leases
+                                  (tuple module (elem lease 1) (elem lease 2)))))) (:modules g))))
+        (= (:handler-generation row) (:origin-generation native)))))))
+
+(defn- physical-departure! [member]
+ ;; This fresh monitor is created/consumed locally OUTSIDE the family lock.
+ ;; Stale/closed code membership alone does not mean its physical actor died.
+ (let [pid (get-in member [:membership :pid])]
+  (when-not (and (erlang/is_pid pid) (= (erlang/node) (erlang/node pid)))
+   (refuse :queue-family-invalid-previous-owner))
+  (when (Process/alive? pid) (refuse :queue-family-instance-still-owned))
+  (let [monitor (Process/monitor pid)]
+   (try
+    (receive
+     [:DOWN reference :process seen _] :when (and (= reference monitor) (= seen pid)) :observed-down
+     (after 1000 (refuse :queue-family-owner-down-unobserved)))
+    (finally (Process/demonitor monitor (list :flush)))))))
+
+(defn register!
+ "Generated reconcile init only: bind one canonical instance to its exact
+  source family and existing native monitor. Never invokes a config factory."
+ ([server id normalized-declaration] (register! server id normalized-declaration false))
+ ([server id normalized-declaration shared?]
+ (let [g (execution/current) app (:application-id g) family (family-of g id)
+       native (when family (attested-start! g id shared?))
+       fixed (select-keys normalized-declaration [:of :unique :partition])]
+  (when-not (and native (string? server)
+                 (String/starts_with? server (str "blq." app "__"))
+                 (= fixed (:fixed-shape family))
+                 (= (:protocol normalized-declaration) (:protocol family)))
+   (refuse :queue-family-source-contract-mismatch))
+  (tables!)
+  (let [key (tuple app server) sampled-row (first (ets/lookup MEMBERS key))
+        sampled (when sampled-row (elem sampled-row 1))
+        departed (when (and sampled (not (member-current? sampled))) (physical-departure! sampled))]
+  (fenced app
+   (fn []
+    (let [key (tuple app server) prior-row (first (ets/lookup MEMBERS key))
+          prior (when prior-row (elem prior-row 1))
+          member {:key key :server server :application-id app :family id
+                  :protocol (:protocol family) :fixed-shape fixed
+                  :handler-generation (:digest g) :module (:module native)
+                  :membership (handle native) :owner-mode (if shared? :shared-initializing :embedded-reconcile)}]
+     (when-not (= sampled prior) (refuse :queue-family-membership-changed))
+     (when (and prior (not (member-current? prior)) (not= :observed-down departed))
+      (refuse :queue-family-owner-down-unobserved))
+     (when (and prior (member-current? prior) (not= (:membership prior) (:membership member)))
+      (refuse :queue-family-instance-already-live))
+     (when (and prior (not= (:handler-generation prior) (:digest g)))
+      (refuse :retained-family-restoration-required))
+     (when-not (= member prior)
+      (BeamLisp.Env/with_generation_lock :queue-family-capacity
+       (fn []
+        (when-not prior (admit-new-member! app))
+        (ets/insert MEMBERS (tuple key member)) (advance! app))))
+     member)))))))
+
+(defn publish-shared-handler!
+ "Actual fixed SDK owner only, outside a Source callback/context. Replace only
+  its exact family membership after durable handler install. The private receipt
+  retains the selected immutable graph and exact complete native handler lease;
+  public ETS tags/caller maps never constitute handler-generation authority."
+ [server id g lease]
+ (when (or (BeamLisp.Env/assert_execution_context!) (BeamLisp.Env/execution_origin))
+  (refuse :queue-family-native-handler-owner-required))
+ ((BeamLisp.Env/fetch_exact! "reload.generation" "attested-prepared!") g)
+ (let [native (owners/current-owner-capability) app (:application-id g)
+       family (family-of g id) key (tuple app server)]
+  (when-not (and native (= :framework (:kind native))
+                 (= app (:application-id native))
+                 (= (:module native) (BeamLisp.Env/with_env :global
+                    #(BeamLisp.Env/fetch_exact! "proc.queue-runtime" "owner")))
+                 (= (tuple "proc.queue-runtime" "owner")
+                    (get-in (BeamLisp.AOT/sdk_class_evidence! (:module native)) [:artifact :declaration-owner]))
+                 (get-in g [:declarations :reconcile id :data :canonical])
+                 (tuple? lease) (= 3 (erlang/tuple_size lease))
+                 (= (erlang/self) (elem lease 1)) (BeamLisp.Env/code_lease_active? lease)
+                 (every? (fn [module]
+                           (= [(tuple (tuple module (elem lease 1) (elem lease 2)) true)]
+                              (vec (ets/lookup :beam_lisp_code_leases
+                                     (tuple module (elem lease 1) (elem lease 2)))))) (:modules g)))
+   (refuse :queue-family-native-handler-owner-required))
+  (fenced app
+   (fn []
+    (let [prior-row (first (ets/lookup MEMBERS key)) prior (when prior-row (elem prior-row 1))
+          member (assoc prior :module (:module native) :membership (:membership native)
+                    :handler-generation (:digest g) :owner-mode :shared-reconcile)]
+     (when-not (and prior (= id (:family prior))
+                    (= (erlang/self) (get-in prior [:membership :pid]))
+                    (= (:fixed-shape family) (:fixed-shape prior))
+                    (= (:protocol family) (:protocol prior)))
+      (refuse :queue-family-shared-membership-conflict))
+     (swap! shared-handlers assoc key {:membership (:membership native) :graph (select-keys g [:digest :application-id :modules]) :lease lease})
+     (ets/insert MEMBERS (tuple key member))
+     (advance! app)
+     member)))))
+
+(defn member-evidence
+ "Read-only native witness. A stale annotation refuses; no actor RPC or
+  caller-owned callback can manufacture a missing family member."
+ [app server]
+ (fenced app
+  (fn []
+   (when-let [stored (first (ets/lookup MEMBERS (tuple app server)))]
+    (let [member (elem stored 1)]
+     (when-not (member-current? member) (refuse :queue-family-owner-changed)) member)))))
+
+(defn- routing-member [app server]
+ ;; Immutable protocol/data routing only. Actual callback invocation retains
+ ;; its own complete code lease; full validation remains mandatory at family
+ ;; admission, inventory and final publication. No locks/RPC/module scans here.
+ (when (not= :undefined (ets/info MEMBERS))
+  (when-let [stored (first (ets/lookup MEMBERS (tuple app server)))]
+   (let [member (elem stored 1)]
+    (when-not (member-current? member false) (refuse :queue-family-owner-changed)) member))))
+
+(defn- producer-contract-in-turn
+ "Derive protocol from the current compiled family. Preserve producer source
+  provenance while explicitly selecting the retained exact handler generation.
+  This is retention, not adoption or inferred new callback meaning."
+ [server]
+ (when-let [g (execution/current)]
+  (let [app (:application-id g)]
+   (when-let [member (routing-member app server)]
+    (let [family (family-of g (:family member))]
+     (when-not family (refuse :undeclared-queue-family))
+     (when-not (and (= (:fixed-shape family) (:fixed-shape member))
+                    (= (:protocol family) (:protocol member)))
+      (refuse :queue-family-migration-required))
+     {:protocol (:protocol family) :family (:family member)
+      :producer-generation (:digest g) :required-generation (:handler-generation member)
+      :retained (not= (:digest g) (:handler-generation member))})))))
+
+(defn producer-contract
+ "Select immutable family routing under the same short fence as publication.
+  Enqueue calls this INSIDE its existing serialized writer turn. The durable
+  generation fence shares that writer, so retirement cannot pass selection and
+  commit. No writer RPC is made while holding the family fence. This returns
+  routing data, never an execution capability or universal mailbox proof."
+ [server]
+ (when (not= :undefined (ets/info MEMBERS))
+  (when-let [g (execution/current)]
+   (fenced (:application-id g) #(producer-contract-in-turn server)))))
+
+(defn validate-reconcile-payload!
+ "The first-party reconcile clause has one SDK-defined row envelope. Check it
+  before queue admission; revision/source identities remain first-order data,
+  not guessed application types. No callback/provider execution occurs."
+ [payload]
+ (first-order/check! payload {:max-nodes 4096 :max-depth 32 :max-bytes 65536})
+ (when-not (and (map? payload)
+                (= #{:proj/kind :proj/key :proj/rev :proj/scope} (set (keys payload)))
+                (contains? #{:owed :stale} (:proj/kind payload))
+                (vector? (:proj/key payload)) (= 3 (count (:proj/key payload)))
+                (keyword? (first (:proj/key payload)))
+                (erlang/is_integer (:proj/scope payload)) (pos? (:proj/scope payload)))
+  (refuse :invalid-reconcile-payload))
+ payload)
+
+(defn- observed [app]
+ (let [[incarnation revision] (epoch app)]
+  (loop [key (ets/next MEMBERS (tuple app 0)) members []]
+   (if-not (and (tuple? key) (= 2 (erlang/tuple_size key)) (= app (elem key 0)))
+    {:application-id app :incarnation incarnation :revision revision :members members}
+    (do
+     (when (>= (count members) 128) (refuse :queue-family-inventory-budget))
+     (let [member (elem (first (ets/lookup MEMBERS key)) 1)]
+      (when-not (member-current? member) (refuse :queue-family-owner-changed))
+      (recur (ets/next MEMBERS key) (conj members member))))))))
+
+(defn- plan-current [candidate]
+ (let [app (:application-id candidate) receipt (observed app)
+       rows (mapv (fn [member]
+               (let [family (family-of candidate (:family member))
+                     reason (cond (nil? family) :removed-live-queue-family
+                              (not= (:fixed-shape family) (:fixed-shape member)) :queue-identity-migration-required
+                              (not= (:protocol family) (:protocol member)) :queue-family-migration-required)]
+                {:server (:server member) :family (:family member)
+                 :status (cond reason :blocked
+                               (= (:digest candidate) (:handler-generation member)) :current
+                               :else :retained)
+                 :reason reason :membership (:membership member)})) (:members receipt))]
+  {:status (if (some #(= :blocked (:status %)) rows) :refused :valid)
+   :scope :observed-queue-families :candidate (:digest candidate) :application-id app
+   :receipt receipt :instances rows}))
+
+(defn plan!
+ "Observe native instances against one prepared candidate; no config factory
+  execution. The receipt stays private; public-plan contains only counts."
+ [candidate]
+ (fenced (:application-id candidate) #(plan-current candidate)))
+
+(defn public-plan [plan]
+ (let [rows (:instances plan) blocked (filter #(= :blocked (:status %)) rows)
+       retained (count (filter #(= :retained (:status %)) rows))
+       public {"state" (cond (seq blocked) "blocked" (pos? retained) "retained" :else "passed")
+               "families" (count (set (map :family rows))) "instances" (count rows)
+               "retained" retained "blocked" (count blocked)
+               "scope" "observed-queue-families"}]
+  (first-order/check! public {:max-nodes 64 :max-bytes 4096}) public))
+
+(defn with-publication-fence!
+ "Recheck membership epoch and each native lease under the admission lock,
+  then perform ONLY source-slot compare-and-publish. No actor RPC, store write,
+  provider submission, factory construction or drain may execute in action."
+ [plan action]
+ (fenced (:application-id plan)
+  (fn []
+   (when-not (= :valid (:status plan)) (refuse :queue-family-plan-refused))
+   (let [before (:receipt plan) now (observed (:application-id plan))]
+    (when-not (= before now) (refuse :queue-family-membership-changed))
+    (action)))))
+
+(defn with-current-publication-fence!
+ "Final read-only family rehearsal and source publication share one admission
+  turn. Fresh members are checked rather than repeatedly retrying a stale plan.
+  Only the first-order public projection accompanies the publication result."
+ [candidate action]
+ (fenced (:application-id candidate)
+  (fn []
+   (let [plan (plan-current candidate)]
+    (when-not (= :valid (:status plan)) (refuse :queue-family-plan-refused))
+    (assoc (action) :queue-families (public-plan plan))))))
+
+(defn attach-existing-owned-store!
+ "Adopt an already-open dedicated connection only when native creator evidence
+  agrees with the exact application graph. No opening or ambient dataRoot guess.
+  Call queue/attach-store! only AFTER this returns the validated handle."
+ [g connection]
+ (execution/with! g
+  (fn []
+   (let [root (get-in g [:resources :data-root])
+         owned (dc/owned-connections (:application-id g) root
+                  (vec (vals (:declared (managed-root/evidence! g)))))]
+    (when-not (and (ds/durable? (:store connection))
+                   (some #(and (= (:store connection) (:store %))
+                               (= (:lifetime connection) (:lifetime %))) owned))
+     (refuse :queue-family-store-authority-required)) connection))))
+
+(defn storage-path
+ "Stable naming only, not file-opening authority. The trusted initializer may
+  use this with its existing data-root capability; the resulting live native
+  connection still requires creator proof before queue adoption."
+ [g id server]
+ (let [root (get-in g [:resources :data-root]) app (:application-id g)]
+  (when-not (and (family-of g id) (string? root) (= root (Path/expand root)) (not= root "/")
+                 (string? server) (String/starts_with? server (str "blq." app "__")))
+   (refuse :queue-family-store-authority-required))
+  (str root "/queues/" (sha256-hex (pr-str [app id server])) ".fjall")))
+
+(defn existing-store
+ "Automatically borrow an already-open, natively owned dedicated queue store.
+  Never creates a directory/Fjall writer. Production family queues refuse if
+  their trusted initializer has not provisioned that capability."
+ [g server]
+ (when-let [member (member-evidence (:application-id g) server)]
+  (let [root (get-in g [:resources :data-root])
+        production (= "production" (get-in g [:resources :deployment-environment]))]
+   (when (and production (nil? root)) (refuse :queue-family-store-authority-required))
+   (when root
+    (let [path (storage-path g (:family member) server)
+          owned (execution/with! g #(dc/owned-connections (:application-id g) root
+                  (vec (vals (:declared (managed-root/evidence! g))))))
+          matches (vec (filter #(= path (get-in % [:store :path])) owned))]
+     (when (> (count matches) 1) (refuse :ambiguous-queue-family-store))
+     (when (and production (empty? matches)) (refuse :queue-family-store-authority-required))
+     (when-let [connection (first matches)] (attach-existing-owned-store! g connection)))))))
+
+(defn validate-bound-store!
+ "Generated family startup must also check an already-bound queue connection.
+  A cached development memory store or unrelated native file handle cannot
+  bypass production creator/lifetime validation. No writer is opened here."
+ [g server connection]
+ (when-let [member (member-evidence (:application-id g) server)]
+  (when (= "production" (get-in g [:resources :deployment-environment]))
+   (let [path (storage-path g (:family member) server)]
+    (when-not (= path (get-in connection [:store :path]))
+     (refuse :queue-family-store-authority-required))
+    (attach-existing-owned-store! g connection))))
+ connection)

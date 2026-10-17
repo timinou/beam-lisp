@@ -1,0 +1,58 @@
+;; Same VM/actor/store, ABCCBA order, one updated entity. Timers exclude boot.
+(ns bench.proc-client-leases
+ (:require [proc.evolve :as evolve] [datom :as d] [datom.store-fjall :as fjall] [bl.json :as json]))
+(defn summarize [xs]
+ (let [times (vec (sort xs)) n (count times) q (fn [p] (get times (min (dec n) (quot (* p n) 100))))]
+  {:n n :p50-ms (q 50) :p95-ms (q 95) :max-ms (last times)}))
+(defn measure [h mode round]
+ (let [parent (erlang/self) gate (erlang/make_ref)
+       workers (mapv (fn [worker]
+          (spawn (fn []
+           (erlang/send parent [:ready gate (erlang/self)])
+           (receive [:go tag] :when (= tag gate) nil)
+           (let [samples (mapv (fn [n]
+               (let [t (System/monotonic_time :microsecond)
+                     call (fn [token] (evolve/call-client! (:owner h) token :inc))
+                     result (case mode
+                              :distributed-lock (global/trans (tuple (tuple :continuity-bench (:owner h)) (erlang/self))
+                                                  #(call (:token @(:client h))))
+                              :client-lease (evolve/with-client! (:owner h) 1 call)
+                              :native-request (evolve/request! (:owner h) 1 :inc))]
+                (when-not (int? result) (throw (ex-info "Benchmark request refused" {:result result})))
+                (/ (- (System/monotonic_time :microsecond) t) 1000.0))) (range 12))]
+            (erlang/send parent [:measured gate samples]))))) (range 3))]
+  (doseq [_ workers] (receive [:ready tag _] :when (= tag gate) nil (after 30000 (throw (ex-info "Ready timeout" {})))))
+  (let [start (System/monotonic_time :microsecond)
+        _ (doseq [p workers] (erlang/send p [:go gate]))
+        samples (reduce (fn [all _]
+                   (into all (receive [:measured tag xs] :when (= tag gate) xs
+                              (after 60000 (throw (ex-info "Measurement timeout" {})))))) [] workers)]
+   {:mode mode :round round :wall-ms (/ (- (System/monotonic_time :microsecond) start) 1000.0)
+    :summary (summarize samples) :samples-ms samples})))
+
+(let [source (System/get_env "CONTINUITY_SOURCE")
+      _ (when-not (and (string? source) (Regex/match? #"^[a-f0-9]{40}$" source))
+          (throw (ex-info "Set CONTINUITY_SOURCE to the exact functional source commit" {})))
+      root (str (System/get_env "HOME") "/tmp/client-lease-bench-" (System/system_time :nanosecond))
+      c (d/connect-with (fjall/open root) [{:db/ident :bench/count :db/valueType :db.type/long}])
+      owner (evolve/start! {:version 1 :digest "benchmark" :accept? (fn [m] (contains? #{:inc :read} m))
+              :check-state int? :check-reply int?
+              :handler (fn [m s] (let [next (if (= m :inc) (inc s) s)]
+                                  (when (= m :inc) (d/transact! c [[:db/add 9001 :bench/count next]]))
+                                  {:reply next :state next}))} 0 {:managed true})
+      h {:owner owner :client (atom (evolve/acquire-client! owner 1))}]
+ (try
+  (doseq [_ (range 12)] (evolve/request! owner 1 :inc))
+  (let [rounds (mapv (fn [[n mode]] (measure h mode n))
+                  [[0 :distributed-lock] [1 :client-lease] [2 :native-request]
+                   [3 :native-request] [4 :client-lease] [5 :distributed-lock]])
+        persisted (:bench/count (d/entity (d/db c) 9001))
+        _ (when-not (= 228 persisted) (throw (ex-info "Lost benchmark writes" {:counter persisted})))
+        result {:scope "Same source VM, actor, Fjall store; one updated entity; ABCCBA; 3 senders x 12 writes/round; no upgrades"
+                :source source :rounds rounds
+                :counter persisted
+                :benchmark-sha (Base/encode16 (crypto/hash :sha256 (File/read! "bench/proc-client-leases.bl")) (list (tuple :case :lower)))
+                :combined (into {} (map (fn [mode] [mode (summarize (mapcat :samples-ms (filter #(= mode (:mode %)) rounds)))])
+                                     [:distributed-lock :client-lease :native-request]))}]
+   (println (json/encode result)))
+  (finally (evolve/release-client! owner (:token @(:client h))) (GenServer/stop owner) (d/close! c) (File/rm_rf! root))))

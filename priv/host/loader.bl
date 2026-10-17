@@ -262,8 +262,34 @@
 
 ; ── ensure_loaded ───────────────────────────────────────────────────────────
 
+(defn without_initialization
+  "Restrict declaration compilation to already initialized namespaces. This
+   grants no authority; the fixed Env scope conveys through Loader.Server and
+   causal worker handoffs, and nested use cannot widen the caller's policy."
+  [action]
+  (let [previous (Process/get :bl_loader_initialization_blocked)]
+    (Process/put :bl_loader_initialization_blocked true)
+    (try (erlang/apply action (list))
+      (finally
+        (if (erlang/== nil previous) (Process/delete :bl_loader_initialization_blocked)
+          (Process/put :bl_loader_initialization_blocked previous))))))
+
+(defn assert_initializer_execution_allowed! [ns]
+  (when (erlang/== true (Process/get :bl_loader_initialization_blocked))
+    (erlang/error (tuple :sdk_declaration_stage_initializer_refused ns)))
+  :ok)
+
+(defn assert_initialization_allowed!
+  "Compile-time restriction, not an SDK trust receipt or a loading permit."
+  [ns]
+  (when (and (erlang/== true (Process/get :bl_loader_initialization_blocked))
+             (erlang/not (or (erlang/== "core" ns) (BeamLisp.Env/loaded_ns? ns))))
+    (erlang/error (tuple :sdk_declaration_stage_load_refused ns)))
+  :ok)
+
 (defn ensure_loaded [ns]
   :when (string? ns)
+  (assert_initialization_allowed! ns)
   (ensure_loaded_in ns (Process/get :bl_fixed_dirs)))
 
 (defn with_loading_session
@@ -313,6 +339,7 @@
    declaration even if the eventual caller changed its search roots."
   [ns fixed]
   :when (string? ns)
+  (assert_initialization_allowed! ns)
   (let [loading (Process/get :bl_loading (MapSet/new))]
     (cond
       (or (erlang/== ns "core") (BeamLisp.Env/loaded_ns? ns))
@@ -399,6 +426,7 @@
    under two locks. `find_file/1` runs BEFORE the lock; the loser re-checks
    `loaded_ns?` inside and short-circuits."
   [ns]
+  (assert_initialization_allowed! ns)
   (if (BeamLisp.Env/loaded_ns? ns)
     :ok
     (let [r (find_file ns)]
@@ -699,6 +727,7 @@
    ns loaded only AFTER the eval. On failure, print the form attribution and
    re-raise; the requiring namespace is restored on every exit path."
   [ns path content]
+  (assert_initialization_allowed! ns)
   (let [prev-ns (BeamLisp.Env/current_ns)]
     (clojure_prelude! path)
 
@@ -723,8 +752,10 @@
                                (BeamLisp.AOT/ensure_loaded_local ns target realm content path)
                                :no_module)]
                   (when (erlang/== :no_module cached)
-                    (BeamLisp.Compiler/eval_string content (BeamLisp.Compiler/new_env ns) path)
-                    (BeamLisp.Env/mark_loaded ns))))))))
+                    (if (and (erlang/not local?) (BeamLisp.AOT/staged_sdk_source? ns path))
+                      (BeamLisp.AOT/compile_sdk_source! ns content path)
+                      (do (BeamLisp.Compiler/eval_string content (BeamLisp.Compiler/new_env ns) path)
+                          (BeamLisp.Env/mark_loaded ns))))))))))
       (catch e
         (cond
           (erlang/== :error __EXCEPTION_KIND__)
@@ -752,7 +783,10 @@
   ([ns path content e]
    (load_attribution ns path content e nil))
   ([ns path content e stacktrace]
-   (let [counted (form_at_fault ns path content)
+   (let [;; Attribution must not replay a refused compile-only SDK file: that
+         ;; would execute the initializer the producer deliberately deferred.
+         counted (if (try (BeamLisp.AOT/sdk_library_source? ns path) (catch _ true))
+                   :unknown (form_at_fault ns path content))
          where
          (cond
            (ok4-result? counted)
@@ -1360,6 +1394,71 @@
             (tuple nm :public)
           :else nil)))))
 
+(defn- protocol-decl-lines [form]
+  (let [ha (form-head-args form) args (when ha (elem ha 1)) name (when args (form-name args))
+        methods (when args (Enum/reject (erlang/tl args) (fn [item] (erlang/is_binary (form-unmeta item)))))
+        declarations (when methods (Enum/map methods (fn [method]
+                       (let [part (form-head-args method)]
+                         (when (and part (erlang/not (erlang/== (elem part 1) (list))))
+                           (let [parameters (form-unmeta (erlang/hd (elem part 1)))]
+                             (when (and (erlang/is_tuple parameters) (erlang/== 2 (erlang/tuple_size parameters))
+                                        (erlang/== :vector (elem parameters 0))) (elem part 0))))))))]
+    (if (and name (erlang/== "defprotocol" (elem ha 0))
+             (erlang/=< (erlang/length declarations) 1024)
+             (Enum/all? declarations (fn [method] (erlang/is_binary method))))
+      (let [kind (if (private-name? (erlang/hd args)) :private :public)]
+        (Enum/map (cons name declarations) (fn [symbol] (tuple symbol kind)))) (list))))
+
+(defn- class-decl-lines [form]
+  ;; Builtin literal class constructors are source declarations, not class
+  ;; initialization or authority. Dynamic/invalid fields remain unknown.
+  (let [ha (form-head-args form) args (when ha (elem ha 1))
+        name (when args (form-name args))
+        fields (when (and args (erlang/=< 2 (erlang/length args)))
+                 (form-unmeta (erlang/hd (erlang/tl args))))]
+    (if (and name (Enum/member? (list "defrecord" "deftype") (elem ha 0))
+             (erlang/is_tuple fields) (erlang/== 2 (erlang/tuple_size fields))
+             (erlang/== :vector (elem fields 0)) (erlang/is_list (elem fields 1))
+             (erlang/=< (erlang/length (elem fields 1)) 1024)
+             (Enum/all? (elem fields 1) (fn [field]
+                (let [node (form-unmeta field)]
+                  (and (erlang/is_tuple node) (erlang/== 2 (erlang/tuple_size node))
+                       (erlang/== :symbol (elem node 0)) (erlang/is_binary (elem node 1))
+                       (erlang/=< 1 (erlang/byte_size (elem node 1)))
+                       (erlang/=< (erlang/byte_size (elem node 1)) 512)
+                       (or (erlang/== "deftype" (elem ha 0))
+                           (erlang/not (erlang/== "__struct__" (elem node 1)))))))))
+      (let [kind (if (private-name? (erlang/hd args)) :private :public)
+            names (erlang/++ (list name (erlang/iolist_to_binary (list "->" name)))
+                     (if (erlang/== "defrecord" (elem ha 0))
+                       (list (erlang/iolist_to_binary (list "map->" name))) (list)))]
+        (Enum/map names (fn [name] (tuple name kind)))) (list))))
+
+(defn- native-decl-lines [form]
+  ;; Source metadata only: telling the compiler that a native signature is an
+  ;; ordinary public function prevents eager provider initialization. Authority
+  ;; still comes exclusively from complete emitted-unit receipts and actual code.
+  (let [ha (form-head-args form)]
+    (if (or (nil? ha) (erlang/not (erlang/== "defnative" (elem ha 0))) (erlang/== (elem ha 1) (list))) (list)
+      (let [args (elem ha 1) crate (erlang/hd args)
+            signatures (Enum/map (erlang/tl args)
+              (fn [form]
+                (let [part (form-head-args form)]
+                  (when (and part (erlang/is_binary (elem part 0))
+                             (Regex/match? (Regex/compile! "^[a-z][a-z0-9!?_-]*$") (elem part 0))
+                             (erlang/== 1 (erlang/length (elem part 1)))
+                             (erlang/is_integer (erlang/hd (elem part 1)))
+                             (erlang/=< 0 (erlang/hd (elem part 1)))
+                             (erlang/=< (erlang/hd (elem part 1)) 255))
+                    (tuple (elem part 0) (erlang/hd (elem part 1)))))))]
+        (if (and (erlang/is_binary crate) (Regex/match? (Regex/compile! "^[a-z][a-z0-9_]*$") crate)
+                 (erlang/=< (erlang/byte_size crate) 128)
+                 (erlang/=< 1 (erlang/length signatures)) (erlang/=< (erlang/length signatures) 256)
+                 (Enum/all? signatures (fn [entry] (erlang/is_tuple entry)))
+                 (erlang/== (erlang/length signatures) (erlang/length (Enum/uniq signatures))))
+          (Enum/map signatures (fn [entry] (tuple (elem entry 0) :public)))
+          (list))))))
+
 (defn- source_decls_from
   "Declarations belonging to ns, not a later namespace sharing its file."
   [ns content path]
@@ -1379,9 +1478,13 @@
                 (erlang/== "in-ns" head)
                   (tuple nil names)
                 (erlang/== ns current)
-                  (let [entry (decl-line form)]
-                    (if (nil? entry) state
-                      (tuple current (maps/put (elem entry 0) (elem entry 1) names))))
+                  (let [entries (cond
+                                  (erlang/== "defnative" head) (native-decl-lines form)
+                                  (erlang/== "defprotocol" head) (protocol-decl-lines form)
+                                  (Enum/member? (list "defrecord" "deftype") head) (class-decl-lines form)
+                                  :else (let [entry (decl-line form)] (if (nil? entry) (list) (list entry))))]
+                    (tuple current (Enum/reduce entries names
+                      (fn [entry out] (maps/put (elem entry 0) (elem entry 1) out)))))
                 :else state))))
         1))))
 
@@ -1392,7 +1495,15 @@
   (if (erlang/== :undefined (Process/get :bl_declaration_snapshot :undefined))
     (do
       (Process/put :bl_declaration_snapshot {})
-      (try (fun) (finally (Process/delete :bl_declaration_snapshot))))
+      (Process/put :bl_declaration_snapshot_id (erlang/make_ref))
+      (Process/put :bl_declaration_source_identities {})
+      (Process/put :bl_sdk_declaration_query_memo {})
+      (try (fun)
+        (finally
+          (Process/delete :bl_declaration_snapshot)
+          (Process/delete :bl_declaration_snapshot_id)
+          (Process/delete :bl_declaration_source_identities)
+          (Process/delete :bl_sdk_declaration_query_memo))))
     (fun)))
 
 (defn source_decls
@@ -1418,6 +1529,10 @@
                         digest (crypto/hash :sha256 content)
                         key_ (tuple :"$bl_source_decls" path ns)
                         parsed (Process/get key_ nil)]
+                    (when (erlang/not (erlang/== pass :undefined))
+                      (Process/put :bl_declaration_source_identities
+                        (Map/put (Process/get :bl_declaration_source_identities {}) context
+                          (tuple path digest))))
                     (if (and (erlang/is_tuple parsed) (erlang/== digest (elem parsed 0)))
                       (elem parsed 1)
                       (let [names (source_decls_from ns content path)]
@@ -1433,6 +1548,19 @@
           nil)
         result))))
 
+(defn declaration_source_context
+  "The exact resolver context used by the current Source declaration snapshot."
+  [ns]
+  (tuple (or (BeamLisp.Env/deferred_dirs ns) (search_dirs)) ns))
+
+(defn declaration_source_identity
+  "Selected path and exact byte digest from the current declaration Source
+   snapshot. No snapshot means no reusable identity; no source evaluation."
+  [ns]
+  (when (Process/get :bl_declaration_snapshot_id)
+    (source_decls ns)
+    (Map/get (Process/get :bl_declaration_source_identities {}) (declaration_source_context ns))))
+
 (defn source_decl
   "The kind `provider`'s source declares `member` as (`:macro`, `:public`,
    `:private`), or nil when the scan cannot account for it. nil means UNKNOWN —
@@ -1447,6 +1575,7 @@
    `:require` was declared with when it was declared deferred, else wherever it
    resolves now."
   [provider]
+  (assert_initialization_allowed! provider)
   (if (erlang/== nil (BeamLisp.Env/deferred_dirs provider))
     (let [mod (BeamLisp.Link/module_for provider)]
       (if (and (BeamLisp.Env/ns_exists? provider)

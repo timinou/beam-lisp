@@ -1,5 +1,5 @@
-; Initializer-owned state cells, with a legacy unsealed runtime seam.
-(ns reload.state (:require [reload.generation :as generation]))
+; Initializer-owned managed cells and environment-owned development state.
+(ns reload.state (:require [reload.execution :as generation] [env]))
 
 (defn- cell? [value]
  (and (erlang/is_map value)
@@ -11,43 +11,51 @@
    (throw (ex-info "Managed runtime resource must be an Atom" {:kind :invalid-runtime-cell :resource key})))
   cell))
 
+(defn- storage-key [key] (tuple :reload.state/value key))
+(defn- own-value [key] (BeamLisp.Env/lookup_own (storage-key key)))
+(defn- alive! [result]
+ (when (= :retired result)
+  (throw (ex-info "Runtime state environment has been destroyed" {:kind :retired-runtime-state})))
+ result)
+
 (defn get
- "Read the existing managed cell. Default applies only outside a generation;
-  a missing managed resource always refuses instead of using a process global."
+ "Read an existing managed cell, or this environment's development value.
+  Missing managed resources always refuse. Development never reads through
+  another environment or a VM-global persistent_term fallback."
  ([key] (get key nil))
  ([key default]
   (if (generation/current) @(managed-cell key)
-   (persistent_term/get key default))))
+   (let [result (own-value key)]
+    (if (= :error result) default (elem result 1))))))
 
 (defn cell!
- "Return an initializer-bound managed Atom, never a global fallback. Outside
-  a generation, create one legacy shared Atom atomically on first use. This
-  centralizes legacy counter/registry ownership without top-level mutable defs.
-  Callers retain responsibility for bounded values and resource cleanup."
+ "Return an initializer-bound managed Atom. Development cells are installed
+  once in the current environment under its native lifetime/commit fence.
+  They survive source reloads in that environment and are released from its
+  registry on destruction. Explicit IO/process cleanup remains the owner's job."
  [key initial]
  (if (generation/current) (managed-cell key)
-  (let [existing (persistent_term/get key nil)]
-   (if (cell? existing) existing
-    (global/trans (tuple (tuple :reload.state/cell key) (erlang/self))
-     (fn []
-      (let [existing (persistent_term/get key nil)]
-       (cond
-        (cell? existing) existing
-        (some? existing)
-        (throw (ex-info "Legacy runtime cell has a different value" {:kind :invalid-runtime-cell :resource key}))
-        :else (let [cell (atom initial)] (persistent_term/put key cell) cell))))
-     (list (erlang/node)))))))
+  (alive!
+   (BeamLisp.Env/with_scope_commit (env/current)
+    (fn []
+     (let [result (own-value key) existing (when-not (= :error result) (elem result 1))]
+      (cond
+       (cell? existing) existing
+       (some? existing)
+        (throw (ex-info "Runtime cell has a different value" {:kind :invalid-runtime-cell :resource key}))
+       :else (let [cell (atom initial)]
+               (alive! (BeamLisp.Env/put_key (storage-key key) cell)) cell))))))))
 
 (defn put!
- "Update an existing managed cell with bounded nonexecutable state. In legacy
-  unsealed execution keep the existing process-independent persistent value."
+ "Update a managed cell with bounded nonexecutable state. Development writes
+  remain in the current environment and cannot outlive its destruction."
  [key value]
  (if (generation/current)
   (do
    (when-not (generation/runtime-value? value)
     (throw (ex-info "Managed state cannot retain executable values" {:kind :invalid-runtime-state :resource key})))
    (reset! (managed-cell key) value))
-  (do (persistent_term/put key value) value)))
+  (do (alive! (BeamLisp.Env/put_key (storage-key key) value)) value)))
 
 (defn bind!
  "Bind the complete initializer-owned cell map once before publication. The
@@ -56,3 +64,21 @@
  (when-not (and (map? cells) (every? cell? (vals cells)))
   (throw (ex-info "Runtime state bindings must be Atom cells" {:kind :invalid-runtime-cells})))
  (generation/bind-runtime! cells))
+
+(defn get-and-update!
+ "Atomically return a result and replace an initializer-owned cell. Action is
+  pure and returns (tuple result next-value); contention may re-run it. Only
+  bounded nonexecutable data/handles may be retained. No callback-owning actor
+  is created, and the caller keeps its exact generation and authority context."
+ [key initial action]
+ (when-not (fn? action)
+  (throw (ex-info "State update requires an action" {:kind :invalid-runtime-update})))
+ (let [cell (cell! key initial)]
+  (loop []
+   (let [before @cell outcome (action before)]
+    (when-not (and (tuple? outcome) (= 2 (erlang/tuple_size outcome)))
+     (throw (ex-info "State update requires a result/value pair" {:kind :invalid-runtime-update})))
+    (let [after (elem outcome 1)]
+     (when-not (generation/runtime-value? after)
+      (throw (ex-info "State cannot retain executable values" {:kind :invalid-runtime-state :resource key})))
+     (if (compare-and-set! cell before after) (elem outcome 0) (recur)))))))

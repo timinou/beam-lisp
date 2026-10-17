@@ -10,12 +10,13 @@
   Unregister explicitly or transfer to the process owning the registration."
  ([f] (register! f (list)))
  ([f modules]
+  (BeamLisp.Env/assert_execution_context!)
   (let [modules (concat (BeamLisp.Env/callback_modules f) modules
                        (:modules (Process/get :bl_generation))
                        (list (elem (erlang/fun_info (fn [] nil) :module) 1)))
         lease (BeamLisp.Env/retain_code! modules)]
    (try
-    {:lease lease :invoke (BeamLisp.Env/convey (fn [args] (apply f args)))}
+    {:lease lease :invoke (BeamLisp.Env/convey (fn [args] (BeamLisp.Env/with_owned_generation_execution (fn [] (apply f args)))))}
     (catch e (do (BeamLisp.Env/release_code! lease) (throw e)))))))
 
 (defn transfer!
@@ -24,6 +25,35 @@
  [registration owner]
  (let [lease (BeamLisp.Env/transfer_code! (:lease registration) owner)]
   (if (= :cancelled lease) :cancelled (assoc registration :lease lease))))
+
+(defn prepare-transfer!
+ "Create an inactive target ticket without changing source ownership. Index
+  :accepted in a bounded lifetime-owner slot BEFORE commit-transfer!. A crash
+  before handoff leaves an inactive target; a crash after handoff leaves the
+  exact accepted ticket discoverable in that same slot. This is not acceptance."
+ [registration owner]
+ (when-not (and (erlang/is_pid owner) (= (erlang/node owner) (erlang/node)))
+  (throw (ex-info "Callback handoff requires a local owner" {:kind :invalid-callback-owner})))
+ {:source registration
+  :accepted (assoc registration :lease
+              (tuple (elem (:lease registration) 0) owner (erlang/make_ref)))})
+
+(defn commit-transfer!
+ "Activate a previously indexed target ticket. Returns its registration or
+  cancelled. An optional admission token is checked inside the native fence.
+  Lost acknowledgements are resolved by querying the prepublished target;
+  repeated handoff never releases a previously accepted registration."
+ ([prepared] (commit-transfer! prepared nil))
+ ([prepared request]
+  (let [accepted (:accepted prepared)
+        result (BeamLisp.Env/handoff_code! (get-in prepared [:source :lease]) (:lease accepted) request)]
+   (if (= :cancelled result) :cancelled accepted))))
+
+(defn active?
+ "Observe the exact retained ticket under the same native invocation fence.
+  This does not invoke the application callback or authorize external effects."
+ [registration]
+ (BeamLisp.Env/code_lease_active? (:lease registration)))
 
 (defn unregister! [registration]
  (BeamLisp.Env/release_code! (:lease registration)))
@@ -34,3 +64,26 @@
  [registration args]
  (BeamLisp.Env/run_code! (:lease registration)
   (fn [] (erlang/apply (:invoke registration) (list args)))))
+
+(defn try-invoke!
+ "Invoke once, distinguishing native retention refusal before callback entry.
+  Returns {:status :completed :value value}, :busy, or :cancelled. Errors after
+  entry propagate, including a callback's own capacity error: no accepted
+  provider outcome becomes retry-safe merely because its exception says busy.
+  The private per-call marker is process-local and removed on every return."
+ [registration args]
+ (let [marker (tuple :proc.callback/entry (erlang/make_ref))]
+  (Process/put marker false)
+  (try
+   (let [result (BeamLisp.Env/run_code! (:lease registration)
+                  (fn []
+                   (Process/put marker true)
+                   (erlang/apply (:invoke registration) (list args))))]
+    (if (Process/get marker) {:status :completed :value result}
+     {:status :cancelled}))
+   (catch error
+    (if (and (= false (Process/get marker))
+             (or (= :code_lease_capacity error) (= :code_lease_capacity (:original error))))
+     {:status :busy :kind :code-retention-capacity}
+     (throw error)))
+   (finally (Process/delete marker)))))

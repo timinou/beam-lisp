@@ -168,7 +168,7 @@ index, and a changed byte changes the hash, so a stale entry is unreachable.
   [kind sha root]
   (let [p (cache-path kind sha root)]
     (when (File/exists? p)
-      (try (erlang/binary_to_term (File/read! p)) (catch _ nil)))))
+      (try (BeamLisp.Env/decode_data_term! (File/read! p)) (catch _ nil)))))
 
 (defn- remember-analysis!
   "Store `value` as the `kind` analysis of `sha`; a failure to write is silently

@@ -1,0 +1,111 @@
+; HOME native fixture draft. Requires ordinary coherent SDK ownership first.
+; Opt-in policy/Root custody is deliberately retained; run in an isolated last VM.
+(ns datom.dynamic-policy-test
+ (:require [datom :as d] [datom.conn :as conn] [datom.store-fjall :as fjall]
+           [datom.migration-policy :as policy] [datom.migration-admission :as migration]
+           [proc.queue-family-root :as root] [reload.generation :as g] [reload :as reload] [reload.runtime :as runtime] [datom.schema]))
+(def BEFORE [{:db/ident :tenant/key :db/valueType :db.type/string :db/unique :db.unique/identity}])
+(def GROW [{:db/ident :tenant/label :db/valueType :db.type/string}])
+(defn schema-map [defs] (datom.schema/install-all (datom.schema/empty-schema) defs))
+(defn policy-plan []
+ {:version 1 :families [{:family "tenant-data" :schema (schema-map BEFORE) :phase :expand
+                        :migration {:migration/id :tenant-label-v1 :migration/digest (apply str (repeat 64 "a"))
+                                    :migration/grows GROW}}]})
+(defn kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn directory []
+ (let [path (str (System/get_env "HOME") "/tmp/dynamic-policy-native-" (erlang/unique_integer (list :positive)))]
+  (File/mkdir_p! path) path))
+(defn prepared [path app plan]
+ (g/prepare! {:application-id app :sources {"phase.fixture"
+  (str "(ns phase.fixture (:require [datom.migration-admission :as migration] [datom.store-fjall :as fjall])) "
+       "(defn open! [path defs] (migration/open! path defs)) "
+       "(defn raw! [path] (fjall/open path)) (defn identity [x] x)")}
+  :stable-namespaces #{"datom.migration-admission" "datom.store-fjall"}
+  :resources {:data-root path :managed-root-journal "journal.fjall" :managed-root-journal-id "journal"
+              :managed-root-store-paths {"journal" "journal.fjall"}
+              :deployment-environment "sandbox" :dynamic-store-policy plan}}))
+(defn ready! [graph journal]
+ (root/enroll! graph journal {"journal" journal}) (root/enter-initializer! graph)
+ (g/with! graph #(g/bind-runtime! {})) (root/ready! graph))
+(defn install! [graph] (g/with! graph migration/install!))
+(defn status [graph] (g/with! graph migration/status))
+
+(deftest closed-additive-plan-refuses-effects-contract-and-ambiguous-family
+ (let [raw (policy-plan) admitted (policy/validate-plan raw) family (first (:families admitted)) effects (atom 0)]
+  (is (= 1 (:version admitted)))
+  (is (= "tenant-data" (:family family)))
+  (is (= :db.type/string (get-in family [:after :tenant/label :db/valueType])))
+  (is (= "tenant-data" (:family (policy/family-for admitted (schema-map BEFORE)))))
+  (is (= "tenant-data" (:family (policy/family-for admitted (schema-map (concat BEFORE GROW))))))
+  (is (= :unknown-migration-schema-family (kind #(policy/family-for admitted (schema-map [])))))
+  (is (= :migration-contract-drain-proof-required
+         (kind #(policy/validate-plan (assoc-in raw [:families 0 :phase] :contract)))))
+  (is (= :unsupported-migration-spec
+         (kind #(policy/validate-plan (assoc-in raw [:families 0 :migration :migration/batch] [])))))
+  (is (some? (kind #(policy/validate-plan (assoc-in raw [:families 0 :migration :migration/fn] (fn [_] (swap! effects inc)))))))
+  (is (= 0 @effects))
+  (is (= :ambiguous-migration-policy
+         (kind #(policy/validate-plan (assoc raw :families [(first (:families raw)) (first (:families raw))])))))
+  (is (policy/under-root? "/fixture/root" "/fixture/root"))
+  (is (policy/under-root? "/fixture/root" "/fixture/root/tenant"))
+  (is (not (policy/under-root? "/fixture/root" "/fixture/root-other")))))
+
+(deftest actual-late-native-lifetime-catches-frontier-before-return-and-repeat-is-observation
+ (let [path (directory) app (str "dynamic-late-" (erlang/unique_integer (list :positive)))
+       graph (prepared path app (policy-plan)) journal (d/connect-with (fjall/open (str path "/journal.fjall")))
+       first-conn (atom nil) late-conn (atom nil)]
+  (is (= :ready (ready! graph journal)))
+  (is (= :installed (:status (install! graph))))
+  (is (= 0 (:frontier (status graph))))
+  (reset! first-conn (g/invoke! graph "phase.fixture/open!" [(str path "/tenant-a") BEFORE]))
+  (is (= app (get-in (conn/creation-evidence! @first-conn) [:creator :application-id])))
+  (is (= 0 (:pending-openings (status graph))))
+  (is (= :expanded (:status (g/with! graph migration/expand!))))
+  (is (= 1 (:frontier (status graph))))
+  (is (= :db.type/string (get-in (conn/schema @first-conn) [:tenant/label :db/valueType])))
+  (let [before (d/basis-t (d/db @first-conn))]
+   (is (= :expanded (:status (g/with! graph migration/expand!))))
+   (is (= before (d/basis-t (d/db @first-conn)))))
+  (reset! late-conn (g/invoke! graph "phase.fixture/open!" [(str path "/tenant-b") BEFORE]))
+  (is (= :db.type/string (get-in (conn/schema @late-conn) [:tenant/label :db/valueType])))
+  (is (= 2 (:stores (status graph))))
+  (is (= 2 (:complete (status graph))))
+  (is (= 0 (:unconfirmed (status graph))))
+  (is (= #{[:tenant-label-v1]} (d/q '[:find ?id :where [_ :migration/id ?id]] (d/db @late-conn))))
+  (let [enabled @runtime/policy-override slot (g/slot)]
+   (try (reload/set-enabled! true)
+    (is (= :applied (:status (g/publish! slot nil graph))))
+    (is (= (:digest graph) (g/selected slot)))
+    (finally (g/close! slot (g/selected slot)) (reload/set-enabled! enabled))))
+  ;; Root/policy cleanup is not fabricated. Original custodian remains held in
+  ;; this isolated VM; cleanup/declaration handover is a later native seam.
+  (is (= :migration-policy-root-held (kind #(d/close! journal))))))
+
+(deftest no-policy-development-and-active-policy-raw-refusals-before-allocation
+ (let [normal (d/connect)]
+  (is (some? normal)) (is (= :ok (conn/release! normal))))
+ (let [path (directory) app (str "dynamic-refuse-" (erlang/unique_integer (list :positive)))
+       graph (prepared path app (policy-plan)) journal (d/connect-with (fjall/open (str path "/journal.fjall")))
+       raw-path (str path "/raw") unknown-path (str path "/unknown")]
+  (is (= :ready (ready! graph journal)))
+  (is (= :migration-policy-not-installed
+         (kind #(g/invoke! graph "phase.fixture/open!" [(str path "/before-policy") BEFORE]))))
+  (is (not (File/exists? (str path "/before-policy"))))
+  (is (= :installed (:status (install! graph))))
+  (is (= :migration-managed-open-required (kind #(g/invoke! graph "phase.fixture/raw!" [raw-path]))))
+  (is (not (File/exists? raw-path)))
+  (is (= :unknown-migration-schema-family
+         (kind #(g/invoke! graph "phase.fixture/open!" [unknown-path []]))))
+  (is (not (File/exists? unknown-path)))
+  (is (= 0 (:pending-openings (status graph))))
+  ;; An unmanaged exact-root match is refusal only, never ownership. This must
+  ;; fail before Fjall canonicalization/allocation on the already existing root.
+  (is (= :migration-managed-open-required (kind #(fjall/open path))))
+  (let [before (Process/get :datom.conn/migration-connect)]
+   (try
+    (Process/put :datom.conn/migration-connect (erlang/make_ref))
+    (is (= :migration-managed-open-required (kind #(g/invoke! graph "phase.fixture/raw!" [(str path "/forged")]))))
+    (is (not (File/exists? (str path "/forged"))))
+    (finally (if before (Process/put :datom.conn/migration-connect before)
+               (Process/delete :datom.conn/migration-connect)))))
+  (is (= 0 (:pending-openings (status graph))))))

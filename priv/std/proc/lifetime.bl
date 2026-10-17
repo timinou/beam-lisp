@@ -1,0 +1,90 @@
+;; Small owner-bound cleanup registrations. No immortal global collector and
+;; no periodic sweep: each registration is one lightweight, owned BEAM task.
+(ns proc.lifetime)
+
+(defn- dispose! [completion cleanup]
+  (try
+    (cleanup)
+    (reset! completion {:status :released})
+    (catch e (reset! completion {:status :failed :error e}))))
+
+(defn- disposed [completion]
+  (let [result @completion]
+    (case (:status result)
+      :released :released
+      :failed (throw (:error result))
+      (throw (ex-info "Cleanup task exited without disposal evidence"
+               {:kind :lifetime-cleanup-lost})))))
+
+(defn- flush-reply! [ticket pid kind]
+  (receive [seen sender status]
+    :when (and (= seen ticket) (= sender pid) (= status kind)) nil
+    (after 0 nil)))
+
+(defn- run-registration! [owner cleanup reply ticket completion]
+  (let [watch (Process/monitor owner)]
+    (erlang/send reply [ticket (erlang/self) :armed])
+    (receive
+      [:DOWN ref :process dead _] :when (and (= ref watch) (= dead owner))
+        (dispose! completion cleanup)
+      [:release token caller] :when (= token ticket)
+        (do (Process/demonitor watch (list :flush))
+            (dispose! completion cleanup)
+            (erlang/send caller [ticket (erlang/self) :disposed])))))
+
+(defn- await-registration [ticket pid completion]
+  (receive
+    [seen sender :armed] :when (and (= seen ticket) (= sender pid))
+      {:pid pid :ticket ticket :completion completion}
+    (after 10000
+      (throw (ex-info "Cleanup registration was not acknowledged"
+               {:kind :lifetime-registration-uncertain :pid pid})))))
+
+(defn- await-release [ticket pid completion watch]
+  (receive
+    [seen sender :disposed] :when (and (= seen ticket) (= sender pid)) (disposed completion)
+    [:DOWN ref :process dead _reason] :when (and (= ref watch) (= dead pid))
+      (disposed completion)
+    (after 10000
+      (throw (ex-info "Cleanup release was not acknowledged"
+               {:kind :lifetime-release-uncertain})))))
+
+(defn register!
+  "Arm cleanup before publishing request-owned state. Run it once when the
+   local owner dies or release! is called. The registration retains its full
+   managed graph until cleanup finishes. Cleanup must be bounded/idempotent;
+   this is for local resource release, never retrying external effects."
+  [owner cleanup]
+  (when-not (and (erlang/is_pid owner) (= (erlang/node owner) (erlang/node))
+                (fn? cleanup))
+    (throw (ex-info "Cleanup requires a local owner and function"
+             {:kind :invalid-lifetime-owner})))
+  (let [reply (erlang/alias) ticket (erlang/make_ref)
+        completion (atom {:status :armed})
+        pid (spawn (fn [] (run-registration! owner cleanup reply ticket completion)))]
+    (try
+      ;; A delayed task still observes this owner's eventual death; timeout
+      ;; never claims cancellation while cleanup may already be running.
+      (await-registration ticket pid completion)
+      (finally
+        (erlang/unalias reply)
+        (flush-reply! ticket pid :armed)))))
+
+(defn release!
+  "Release a registration and wait for bounded local cleanup. An exited task
+   is already released. A timeout reports uncertainty, never forced shutdown."
+  [registration]
+  (let [pid (:pid registration) ticket (:ticket registration)
+        completion (:completion registration)]
+    (when-not (and (erlang/is_pid pid) (erlang/is_reference ticket)
+                  (erlang/is_map completion)
+                  (= :Elixir.BeamLisp.Atom (maps/get :__struct__ completion nil)))
+      (throw (ex-info "Invalid cleanup registration" {:kind :invalid-lifetime-registration})))
+    (let [watch (Process/monitor pid) reply (erlang/alias)]
+      (try
+        (erlang/send pid [:release ticket reply])
+        (await-release ticket pid completion watch)
+        (finally
+          (erlang/unalias reply)
+          (Process/demonitor watch (list :flush))
+          (flush-reply! ticket pid :disposed))))))

@@ -99,10 +99,9 @@
 ; docs/scheduling/the-clock-and-the-wheel.md §4.6, §4.6.1
 
 (ns proc.server
-  ; …the expander. No requires: the NATIVE adapter reads a fact about the VM
-  ; (`BeamLisp.Server/callback`) plus this registry, while the pure core
-  ; (`clause-plan`) reads only the arguments it is handed.
-  )
+  ; The pure clause-plan core still reads only explicit arguments. The native
+  ; adapter distinguishes development vocabulary from managed compilation.
+  (:require [reload.declaration :as declaration]))
 
 ;; ── the registry ────────────────────────────────────────────────────────
 
@@ -121,8 +120,23 @@
    the contract. Re-registration replaces, like a var, so a reload is
    idempotent."
   [k transform]
+  (declaration/require-development!)
   (swap! registry assoc k transform)
   k)
+
+(defn clause-extension-form
+ "Pure canonical construction shared by the macro and compile-only SDK staging.
+  It returns the ordinary defining form; it never runs a transform, registers a
+  vocabulary or fetches a runtime callback. SDK staging authenticates emitted
+  named body bytes before invoking this constructor."
+ [k transform]
+ (when-not (keyword? k)
+  (throw (ex-info (str "extend-clause!: the clause head must be a literal keyword — got "
+                       (pr-str k) ". It names the var this registration defines, so"
+                       " it has to be known when the form is compiled.")
+                  {:clause k})))
+ `(def ^:private ~(symbol (str "__clause__" (name k)))
+    (proc.server/register-clause! ~k ~transform)))
 
 (defmacro extend-clause!
   "Register `transform` under the clause head `k` (a literal keyword). Returns `k`.
@@ -149,8 +163,8 @@
                          (pr-str k) ". It names the var this registration defines, so"
                          " it has to be known when the form is compiled.")
                     {:clause k})))
-  `(def ^:private ~(symbol (str "__clause__" (name k)))
-     (register-clause! ~k ~transform)))
+  (or (declaration/expand-clause! k transform)
+      (clause-extension-form k transform)))
 
 (defn registered-clauses
   "Every clause name this runtime accepts, sorted — the set an unknown clause
@@ -203,6 +217,7 @@
   "Normalise a transform's answer into a keyed record with every slot present."
   [c]
   {:kind :contrib
+   :definitions (vec (:definitions c))
    :prelude (vec (:prelude c))
    :init (:init c)
    :clauses (vec (:clauses c))
@@ -344,6 +359,7 @@
         parsed (vec (map (fn [c] (classify vocabulary native? c sname)) clauses))
         unknown (vec (filter (fn [p] (= :unknown (:kind p))) parsed))
         contribs (vec (filter (fn [p] (= :contrib (:kind p))) parsed))
+        definitions (vec (mapcat :definitions contribs))
         prelude (vec (mapcat :prelude contribs))
         init-forms (vec (filter (fn [x] (some? x)) (map :init contribs)))
         merged (cond (empty? init-forms) nil
@@ -370,6 +386,7 @@
                           meta
                           rest-pass))]
     {:name sname
+     :definitions definitions
      :unknown unknown
      :contributions contribs
      :prelude prelude
@@ -422,15 +439,47 @@
   "Render a plan into the boot `(defserver …)` form the native compiler
    consumes. The one place this file emits a server form."
   [p]
-  `(defserver ~(:name p) ~@(:body p)))
+  (let [server `(defserver ~(:name p) ~@(:body p))]
+   (if (seq (:definitions p))
+    (to-list (into ['do] (conj (:definitions p) server)))
+    server)))
 
 ;; The std namespace that registers each std clause — the ONE table a demand
 ;; load is resolved against (a clause head is not a namespace name: `registry`
 ;; lives in proc.reg, `perform` in proc.queue).
+(def ^:private CLAUSE-DESCRIPTORS
+  {"registry" ["proc.reg" "registry-clause"] "bus" ["proc.bus" "bus-clause"]
+   "tick" ["proc.tick" "tick-clause"] "sched" ["proc.sched" "sched-clause"]
+   "queue" ["proc.queue" "queue-clause"] "perform" ["proc.queue" "perform-clause"]
+   "pipeline" ["proc.pipeline" "pipeline-clause"]
+   "reconcile" ["proc.reconcile" "reconcile-clause"]
+   "evolve" ["proc.evolve" "evolution-clause"]})
+
 (def CLAUSE-PROVIDERS
-  {"registry" "proc.reg" "bus" "proc.bus" "tick" "proc.tick" "sched" "proc.sched"
-   "queue" "proc.queue" "perform" "proc.queue" "pipeline" "proc.pipeline"
-   "reconcile" "proc.reconcile" "evolve" "proc.evolve"})
+  ;; Retain the development demand-loader API;one descriptor table owns names.
+  (into {} (map (fn [[head descriptor]] [head (first descriptor)]) CLAUSE-DESCRIPTORS)))
+
+(defn- compiler-vocabulary [clauses]
+  (if (or (declaration/preparing?) (declaration/managed?))
+    ;; Literal fixed SDK identities,not a snapshot/filter of mutable registrations.
+    ;; Only requested providers are loaded,so cold compilation stays demand driven.
+    (into {} (keep (fn [clause]
+                    (let [head (name (first clause))
+                          owned (when (declaration/preparing?)
+                                  (declaration/compilation-clause (keyword head)))
+                          [provider binding] (get CLAUSE-DESCRIPTORS head)]
+                      (cond
+                        owned [(keyword head) owned]
+                        provider
+                        (do
+                        (BeamLisp.Loader/ensure_loaded provider)
+                        (let [f (BeamLisp.Env/fetch_exact! provider binding)]
+                          (when-not (fn? f)
+                            (throw (ex-info "Missing fixed SDK clause transform"
+                                            {:kind :missing-clause-transform :clause head})))
+                          [(keyword head) f]))
+                        :else nil))) clauses))
+    @registry))
 
 (defn load-clause-provider!
   "Load the std namespace that registers clause `head` (a name string), when
@@ -454,10 +503,11 @@
    itself reads) and rendering the plan to one boot `defserver`."
 
   [name & clauses]
-  (let [plan (fn [] (clause-plan {:name name
-                                  :clauses (vec clauses)
-                                  :vocabulary @registry
-                                  :native-heads native-clause?}))
+  (let [plan (fn []
+               (let [v (compiler-vocabulary clauses)]
+                (assoc (clause-plan {:name name :clauses (vec clauses) :vocabulary v
+                                    :native-heads native-clause?})
+                       :compiler-vocabulary v)))
         first-try (plan)
         ;; A clause's provider may be a DEFERRED require of the namespace being
         ;; compiled (`(:require [proc.reg :as reg])` is demand-loaded), so its
@@ -472,5 +522,11 @@
             (plan)
             first-try)]
     (when (seq (:unknown p))
-      (throw (unknown-clause-error name (first (:unknown p)))))
-    (expand-server p)))
+      (if (or (declaration/preparing?) (declaration/managed?))
+        (throw (ex-info "Managed clause has no admitted compiler transform"
+                        {:kind :unadmitted-clause-transform
+                         :clause (:head (first (:unknown p))) :server name}))
+        (throw (unknown-clause-error name (first (:unknown p))))))
+    (let [instance (when (declaration/preparing?)
+                     (declaration/capture-canonical-reconcile! name clauses (:compiler-vocabulary p)))]
+     (expand-server (cond-> p instance (update :definitions conj instance))))))

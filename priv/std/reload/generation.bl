@@ -3,13 +3,31 @@
 ; This is not a source sandbox or an atomic publication across process owners.
 (ns reload.generation
  (:require [env] [source-graph :as graph] [reader-node :as rn]
-           [reader :as reader] [reload.static-call :as static-call] [reload]))
+           [reader :as reader] [reload.static-call :as static-call]
+           [reload.native-call :as native-call] [reload.source-producer :as source-producer] [reload.registry-data :as registry-data]
+           [reload.binding-data :as binding-data] [reload.execution :as execution]
+           [reload.declaration :as declaration] [reload.generated-class :as generated-class]
+           [reload.syntax-constructor :as syntax-constructor] [reload.macro-source :as macro-source]
+           [reload.collection-constructor :as collection-constructor] [reload.server-entry :as server-entry]
+           [reload.reconcile-compiler :as reconcile-compiler]
+           [proc.contract :as actor-contract]
+           [lower :as lower] [reload.runtime :as reload]))
 
 (def ^:private prepared (atom {}))
+(def ^:private schema-publications (atom {}))
+;; Compact SDK-issued native outcomes, never reachable graph.state flags. At
+;; most the existing256 node-lifetime preparations can leave a tombstone.
+(def ^:private native-retirements (atom {}))
 (def ^:private forbidden
  #{"eval" "resolve" "ns-resolve" "find-var" "load-file" "load-string"
    "require" "in-ns" "intern" "alter-var-root" "with-redefs" "syntax-quote"
    "var" "erlang/apply" "erlang/make_fun" "code/load_binary"})
+
+; These callable names can be lexical parameters/locals. Only the compiler's
+; resolved binding, not reader spelling, establishes reflection authority.
+(def ^:private deferred-reflective-names
+ #{"eval" "resolve" "ns-resolve" "find-var" "intern" "alter-var-root"
+   "load-file" "load-string" "var"})
 
 (defn- refuse! [kind data]
  (throw (ex-info "Immutable generation refused" (assoc data :kind kind))))
@@ -45,20 +63,37 @@
  (let [n (rn/node-form node) tag (rn/node-tag n)]
   (cond
    (contains? #{:list :vector :set} tag) (rn/node-items n)
-   (= :map tag) (mapcat (fn [pair] [(elem pair 0) (elem pair 1)]) (rn/node-items n))
+   (= :map tag) (Enum/flat_map (rn/node-items n) (fn [pair] [(elem pair 0) (elem pair 1)]))
    :else [])))
 
 (defn- name-of [node]
  (let [n (rn/node-form node)] (when (= :symbol (rn/node-tag n)) (rn/node-name n))))
 
-(defn- head-of [node] (name-of (first (children node))))
+(defn- head-of [node]
+ ;; Only lists have an operator. A vector/set/map beginning with a local named
+ ;; quote still evaluates its contents; it must never hide them from sealing.
+ (when (= :list (rn/node-tag (rn/node-form node))) (name-of (first (children node)))))
 
 (defn- executable-symbols [node]
  ;; Quoted symbols are application data. Syntax quote is deliberately refused:
  ;; macro-generated late namespace resolution needs a compiler-level seal.
  (if (= "quote" (head-of node)) []
-  (concat (when-let [name (name-of node)] [[node name]])
-          (mapcat executable-symbols (children node)))))
+  (do
+   (when-not (contains? #{:scalar :keyword :symbol :list :vector :map :set}
+                         (rn/node-tag (rn/node-form node)))
+    (refuse! :unsupported-source-form {:tag (rn/node-tag (rn/node-form node))}))
+   (let [name (name-of node)
+         nested (Enum/flat_map (children node) executable-symbols)]
+    (if name (cons [node name] nested) nested)))))
+
+(defn- check-reflective-forms! [namespace node]
+ ;; `var` as a parameter/value is ordinary lexical data. The compiler's var
+ ;; QUOTATION special form lowers to a literal handle, so its syntax must be
+ ;; checked before that distinction disappears from ANF. Quoted data is inert.
+ (when-not (= "quote" (head-of node))
+  (when (and (= :list (rn/node-tag (rn/node-form node))) (= "var" (head-of node)))
+   (refuse! :dynamic-code-dependency {:namespace namespace :symbol "var"}))
+  (doseq [child (children node)] (check-reflective-forms! namespace child))))
 
 (defn- literal-node? [node quoted?]
  ;; Inspect reader nodes rather than evaluating an initializer. Quoting permits
@@ -80,8 +115,29 @@
        (or (= n 3) (and (= n 4) (string? (rn/node-form (get items 2)))))
        (literal-node? (last items) false))))
 
+; Exact firstparty bypass entrypoints. Harmless reads/codecs/sync stay usable.
+(def ^:private STORE-PRODUCERS
+ {"foundry.upgrade.schema-reconstruction" #{"install!" "record-before-expand!" "consume-publication!" "reconstruct!" "startup!"}
+  "datom.conn" #{"native-journal-evidence!" "write-control-journal!" "write-initialization-journal!" "install-schema-reconstruction-journal!" "write-schema-reconstruction-journal!"
+                     "native-schema-journal-window!" "native-schema-journal-with-turn" "native-schema-journal-allowed?" "migration-policy-permit!" "migration-policy-claim-cell" "migration-policy-complete-in-writer!"
+                     "migration-policy-with-connect-turn" "migration-policy-finalize!"
+                     "migration-policy-root-cell!" "migration-policy-row!"
+                     "migration-policy-existing-reservation!" "migration-policy-with-reservation" "succeed-migration-policy!" "schema-policy-publication-evidence!" "migration-policy-successor-row!" "migration-policy-context!"}
+  "reload.generation" #{"schema-publication-evidence!" "reserve-schema-publication!" "record-schema-publication!"}
+  "proc.queue-family-root" #{"succeed-schema-policy!" "confirm-schema-policy-publication!" "schema-policy-succession-admission!" "require-policy-available!" "delegate-schema-phase!" "with-delegated-schema-phase!" "schema-phase-admission!"
+      "phase-worker!" "phase-row!" "phase-spec!"}
+  "datom.store-ets" #{"__allocate-native!"}
+  "datom.store-fjall" #{"__allocate-native!" "fjall-open" "fjall-canonical-path"
+                         "fjall-put" "fjall-delete" "fjall-cas" "fjall-commit"}
+  "proc.queue-family-storage" #{"allocation-evidence!" "consume-allocation-opening!" "claim-attempt!" "update-attempt!" "uncertain-attempt!"}
+  "datom.store-opening" #{"queue-allocation-evidence!" "allocate!" "assert-producer!" "claim" "finish-claim!"
+                            "confirm-ets-closed!" "check-publication!" "readiness!" "registry" "decide!"
+                            "matching-gate?" "cleanup!" "begin!" "fail" "admit" "lose-owner"}})
 (defn- unmanaged-producer? [namespace name]
- (or
+ (or (contains? (get STORE-PRODUCERS namespace #{}) name)
+  (and (contains? #{"BeamLisp.Supervisor" "Elixir.BeamLisp.Supervisor"} namespace)
+       (contains? #{"init" "start_server" "start_named_sup" "start_native_link" "start_managed_tree" "managed_children"} name))
+  (and (contains? #{"BeamLisp.Server" "Elixir.BeamLisp.Server"} namespace) (contains? #{"native_start" "bind_init"} name))
   (and (contains? #{"erlang" ":erlang"} namespace)
        (or (String/starts_with? name "spawn") (contains? #{"send_after" "start_timer"} name)))
   (and (= "Process" namespace) (contains? #{"spawn" "send_after"} name))
@@ -92,6 +148,11 @@
            (contains? #{"send_after" "send_interval" "exit_after" "kill_after"} name)))
   (and (contains? #{"Task" "Agent" "GenServer" "Supervisor" "DynamicSupervisor"} namespace)
        (or (String/starts_with? name "start") (String/starts_with? name "async")))
+  ;; Raw Agent timeouts do not cancel accepted callbacks. Stable SDK wrappers
+  ;; keep their exact native registration protocol; a Source spelling grants
+  ;; no callback custody or whole-graph execution lifetime.
+  (and (contains? #{"Agent" "Elixir.Agent"} namespace)
+       (contains? #{"get" "update" "get_and_update" "cast" "stop"} name))
   (and (= "web" namespace) (= "serve" name))
   (and (= "proc" namespace) (contains? #{"spawn" "spawn-link" "spawn-monitor" "async"} name))
   (and (= "proc.tick" namespace) (contains? #{"watch" "debounce" "interval" "after"} name))))
@@ -112,44 +173,63 @@
 (defn- definition-candidate? [form]
  (let [items (children form) head (head-of form)]
   (and head
-   (or (contains? #{"ns" "defn" "defn-" "defserver"} head)
+   (or (contains? #{"ns" "defn" "defn-" "defmacro" "defserver"} head)
        (and (= "def" head) (immutable-form-candidate? (last items)))
        ;; A macro is evaluated only at the compiler boundary, and its expansion
        ;; must consist solely of checked definitions. Ordinary calls refuse.
        (not (contains? #{"def" "defmacro" "defsupervisor" "do" "let" "atom"} head))))))
 
-(defn- check-source! [name source stable native sources]
+(defn- check-source! [name source stable native sources facts]
  (when-not (and (string? source) (<= (erlang/byte_size source) 1048576))
   (refuse! :invalid-source {:namespace name}))
- (let [forms (BeamLisp.Reader/read_string source)
-       header (graph/header* source)
+ (let [forms (:forms facts)
+       header (:header facts)
        aliases (nth header 2)
-       required (set (second header))]
+       required (set (second header))
+       checking-forms (rest (:executable facts))
+       local-definitions (set (keep #(when (contains? #{"def" "defn" "defn-" "defmacro" "defserver" "defrecord" "deftype"} (head-of %))
+                                     (name-of (second (children %)))) (rest forms)))]
   (when-not (and (= name (first header)) (= "ns" (head-of (first forms)))
                 (= 1 (count (filter #(= "ns" (head-of %)) forms))))
    (refuse! :namespace-mismatch {:namespace name}))
-  (doseq [form forms]
-   (when-not (definition-candidate? form)
-    (refuse! :effectful-generation {:namespace name :form (head-of form)})))
-  (let [definitions (keep #(name-of (second (children %))) (rest forms))]
+  ;; Both sequences are finite source facts. Preserve pairing/order without
+  ;; lazy multi-map resources capturing the full source trees.
+  (Enum/each (Enum/zip forms (:executable facts))
+   (fn [pair]
+    (let [form (elem pair 0) executable (elem pair 1)]
+     (check-reflective-forms! name executable)
+     (when-not (definition-candidate? form)
+      (refuse! :effectful-generation {:namespace name :form (head-of form)})))))
+  (let [definitions (keep #(when (contains? #{"def" "defn" "defn-" "defmacro" "defserver" "defrecord" "deftype"} (head-of %))
+                            (name-of (second (children %)))) (rest forms))]
    (when (not= (count definitions) (count (distinct definitions)))
     (refuse! :duplicate-definition {:namespace name})))
   (doseq [dependency required]
    (when-not (or (contains? sources dependency) (contains? stable dependency))
     (refuse! :unsealed-dependency {:namespace name :dependency dependency})))
-  (doseq [[node symbol] (mapcat executable-symbols (rest forms))]
+  ;; Admit only literal target/list candidates here; actual compiled list identity
+  ;; and every native target are checked again before the exact IR executes.
+  (doseq [{:keys [module function]} (:native-targets facts)]
+   (when-not (contains? native module)
+    (refuse! :undeclared-native-target {:namespace name :module module :function function})))
+  (doseq [[node symbol] (Enum/flat_map checking-forms executable-symbols)]
    (let [parts (String/split symbol "/") prefix (first parts)
          base (last parts) resolved (get aliases prefix prefix)]
     (when (unmanaged-producer? resolved base)
      (refuse! :unmanaged-generation-producer {:namespace name :symbol symbol}))
     (when (or (= "persistent_term" resolved)
-              (or (contains? forbidden symbol) (contains? forbidden (str resolved "/" base)))
+              (and (not= symbol "erlang/apply")
+                   (or (and (not (contains? local-definitions symbol)) (contains? forbidden symbol)
+                            (not (contains? deferred-reflective-names symbol)))
+                       (contains? forbidden (str resolved "/" base))))
               (and (contains? forbidden base)
-                   (or (= 1 (count parts)) (contains? #{"core" "env" "reload" "compiler"} resolved)))
+                   (or (and (= 1 (count parts)) (not (contains? local-definitions base))
+                            (not (contains? deferred-reflective-names base)))
+                       (contains? #{"core" "env" "reload" "compiler"} resolved)))
               (String/starts_with? resolved "BeamLisp.")
               (String/starts_with? resolved "Elixir.BeamLisp."))
      (refuse! :dynamic-code-dependency {:namespace name :symbol symbol}))
-    (when (and (not= "/" symbol) (= 2 (count parts))
+    (when (and (not (contains? #{"/" "erlang/apply"} symbol)) (= 2 (count parts))
                (not (or (= name prefix) (contains? aliases prefix) (= "clojure.re" prefix)
                         (contains? native prefix))))
      ;; Every namespace reference must be declared, including direct qualified
@@ -157,90 +237,64 @@
      (refuse! :undeclared-dependency {:namespace name :symbol symbol}))))
   forms))
 
-(declare rewrite-fragment)
+(defn- rewrite-edits [source edits]
+ (if (empty? edits) source
+  (let [chars (unicode/characters_to_list source) size (erlang/length chars)]
+   (loop [remaining edits tail chars cursor 0 chunks (list)]
+    (if (empty? remaining)
+     (unicode/characters_to_binary (reverse (cons tail chunks)))
+     (let [edit (first remaining) start (:start edit) end (:end edit)]
+      (when-not (and (erlang/is_integer start) (erlang/is_integer end)
+                     (<= cursor start end size) (string? (:text edit)))
+       (refuse! :invalid-rewrite-span {}))
+      (let [[prefix suffix] (erlang/tuple_to_list (lists/split (- start cursor) tail))
+            after (lists/nthtail (- end start) suffix)]
+       (recur (rest remaining) after end (cons (:text edit) (cons prefix chunks))))))))))
 
-(defn- rewrite-token [text node mapping mode]
- (let [form (rn/node-form node) tag (rn/node-tag form)]
+(defn- parent-mode [parent]
+ (let [mode (:mode parent) kind (:kind parent) index (:index parent)]
   (cond
-   (= :symbol tag)
-    (let [name (rn/node-name form) parts (String/split name "/")]
-     (if (contains? #{:target :require} mode) (get mapping name text)
-      (if (and (= mode :code) (= 2 (count parts)) (get mapping (first parts)))
-       (str (get mapping (first parts)) "/" (second parts)) text)))
-   (and (= :list tag) (= "deref" (head-of node))
-        (= 2 (count (children node))) (String/starts_with? text "@"))
-    ;; The reader emits (deref operand), while the source span starts with @.
-    ;; Keep that reader syntax and recursively seal only its actual operand.
-    (str "@" (rewrite-fragment (String/slice text 1 (String/length text)) mapping mode))
-   (and (= :list tag) (String/starts_with? text "#("))
-    ;; Anonymous fn reader syntax owns generated parameter names. Preserve the
-    ;; prefix and seal its original body rather than reconstructing expansion.
-    (str "#" (rewrite-fragment (String/slice text 1 (String/length text)) mapping mode))
-   (contains? #{:list :vector :map :set} tag)
-    (if (= "quote" (head-of node)) text
-     (let [opening (cond (= :set tag) "#{" (= :list tag) "(" (= :vector tag) "[" :else "{")
-           closing (cond (= :list tag) ")" (= :vector tag) "]" :else "}")]
-      ;; Unsupported reader prefixes do not have a collection-shaped source
-      ;; span. Refuse rather than rewrite guessed text.
-      (when-not (or (String/starts_with? text "#\"")
-                    (and (String/starts_with? text opening) (String/ends_with? text closing)))
-       (refuse! :unsupported-reader-expansion {}))
-      (if (String/starts_with? text "#\"") text
-       (let [inner (String/slice text (String/length opening)
-                    (- (String/length text) (String/length opening) 1))
-            child-mode (cond
-                         (= mode :header) :header-items
-                         (= mode :clause) (if (= :keyword (rn/node-tag (rn/node-form (first (children node)))))
-                                           (if (= "require" (rn/node-name (rn/node-form (first (children node)))))
-                                            :require-items :data) :data)
-                         (= mode :require) :require-spec
-                         :else mode)]
-       (str opening (rewrite-fragment inner mapping child-mode) closing)))))
-   :else text)))
+   (or (= mode :data) (contains? #{:quote :discard :regex :string} kind)
+       (and (= kind :list) (= "quote" (:head parent)))) :data
+   (= kind :metadata) (if (= index 0) :data mode)
+   (contains? #{:syntax-quote :unquote :unquote-splicing :deref} kind) mode
+   (= mode :header) (cond (= index 1) :target (> index 1) :clause :else :data)
+   (= mode :clause) (if (= "require" (:keyword-head parent))
+                      (if (= index 0) :data :require) :data)
+   (= mode :require) (if (= index 0) :target :data)
+   :else mode)))
 
-(defn- rewrite-fragment [source mapping mode]
- ;; read-next-string provides the original token/collection text and the next
- ;; native reader cursor. This recovers leaf spans without a second lexer; leaf
- ;; symbols deliberately carry no metadata in the public reader contract.
- (let [size (String/length source)]
-  (loop [stream (reader/stream source nil) index 0 edits []]
-   (let [next (reader/read-next-string stream)]
-    (if (= :eof (first next))
-     (let [points (vec (String/codepoints source))]
-      (apply str
-      (reduce (fn [out edit]
-                (vec (concat (subvec out 0 (:start edit))
-                             (String/codepoints (:text edit)) (subvec out (:end edit)))))
-              points (reverse edits))))
-     (let [node (second next) text (nth next 2) after (nth next 3)
-           end (- size (erlang/length (:chars after))) start (- end (String/length text))
-           token-mode (cond
-                        (= mode :header-items) (cond (= index 1) :target (> index 1) :clause :data)
-                        (= mode :require-items) (if (= index 0) :data :require)
-                        (= mode :require-spec) (if (= index 0) :target :data)
-                        (= mode :require) :target
-                        :else mode)
-           replacement (rewrite-token text node mapping token-mode)]
-      (recur after (inc index)
-       (if (= text replacement) edits (conj edits {:start start :end end :text replacement})))))))))
+(defn- qualified-replacement [event mapping mode]
+ (let [name (:name event) parts (when name (String/split name "/"))]
+  (when (= :symbol (:tag event))
+   (cond
+    (contains? #{:target :require} mode) (get mapping name)
+    (and (= mode :code) (= 2 (count parts)) (get mapping (first parts)))
+     (str (get mapping (first parts)) "/" (second parts))
+    :else nil))))
 
 (defn- rewrite-source [source forms mapping]
- ;; Process each top-level form using the same stream, with ns as a special
- ;; declarative context; generic code rewrites qualified executable symbols.
- (let [size (String/length source)]
-  (loop [stream (reader/stream source nil) edits []]
-   (let [next (reader/read-next-string stream)]
-    (if (= :eof (first next))
-     (let [points (vec (String/codepoints source))]
-      (apply str
-      (reduce (fn [out edit]
-                (vec (concat (subvec out 0 (:start edit))
-                             (String/codepoints (:text edit)) (subvec out (:end edit)))))
-              points (reverse edits))))
-     (let [node (second next) text (nth next 2) after (nth next 3)
-           end (- size (erlang/length (:chars after))) start (- end (String/length text))
-           replacement (rewrite-token text node mapping (if (= "ns" (head-of node)) :header :code))]
-      (recur after (conj edits {:start start :end end :text replacement}))))))))
+ (let [facts (or forms (reader/read-source-spans source nil))
+       ;; Actual physical source nodes have unique start offsets; parents begin
+       ;; before their children. Sort once, never parse a nested fragment again.
+       events (sort-by :start (:source-spans facts))]
+  (loop [remaining events stack (list) edits []]
+   (if (empty? remaining) (rewrite-edits source edits)
+    (let [event (first remaining)
+          ancestors (loop [items stack]
+                     (if (and (seq items) (<= (:end (first items)) (:start event)))
+                       (recur (rest items)) items))
+          parent (first ancestors)
+          mode (if parent (parent-mode parent) (if (= "ns" (:head event)) :header :code))
+          parents (if (and parent (not= :discard (:kind event)))
+                    (cons (update parent :index inc) (rest ancestors)) ancestors)
+          frame (assoc event :mode mode :index 0)
+          replacement (when (= :atom (:kind event)) (qualified-replacement event mapping mode))]
+     (when (and (= :unsupported (:kind event)) (not= :data mode))
+      (refuse! :unsupported-reader-expansion {}))
+     (recur (rest remaining) (cons frame parents)
+      (if (and replacement (not= replacement (:name event)))
+       (conj edits {:start (:start event) :end (:end event) :text replacement}) edits)))))))
 
 (defn- dependency-order [roots requires]
  (let [seen (atom #{}) result (atom [])]
@@ -253,32 +307,68 @@
 
 (declare native-hazard-symbol?)
 
-(defn- specialize-source [name source sources stable native]
- (let [result (static-call/specialize source
-                {:namespace-prefixes (into stable (keys sources))})]
-  (doseq [{:keys [module function]} (:targets result)]
-   ;; A rewritten slash target must resolve to the precise declared native
-   ;; module. Existing/resolvable BL namespaces win that spelling in compiler
-   ;; resolution, so refuse that ambiguity before any compilation/evaluation.
+(defn- check-native-source [name source sources stable native facts]
+ (let [targets (:native-targets facts)]
+  (doseq [{:keys [module function]} targets]
+   ;; Structural admission grants no code execution. Expanded ANF must still
+   ;; prove Core list identity. Keep the existing conservative native spelling
+   ;; boundary; explicit app namespace collisions cannot gain native authority.
    (when-not (contains? native module)
     (refuse! :undeclared-native-target {:namespace name :module module :function function}))
    (when (native-hazard-symbol? module function)
     (refuse! :dynamic-code-dependency {:namespace name :symbol (str module "/" function)}))
-   (when (or (BeamLisp.Env/ns_exists? module) (BeamLisp.Loader/resolvable? module))
+   (when (or (contains? sources module) (contains? stable module)
+             (BeamLisp.Env/ns_exists? module) (BeamLisp.Loader/resolvable? module))
     (refuse! :ambiguous-native-target {:namespace name :module module :function function})))
-  (:compile-source result)))
+  source))
 
-(defn plan
- "Generation plan without application evaluation. :sources is the complete managed source map; :roots
-  defaults to its keys. :stable-namespaces and :native-modules explicitly name
-  the fixed trusted runtime boundary. :resources is immutable generation data.
-  Literal native apply calls are specialized only against explicit native
-  authority; ambiguous BL namespace spellings refuse before compilation.
-  Definition macros are expanded and initializers checked against actual ANF
-  during prepare!. Mutable/effectful initializers, dynamic code lookup and
-  undeclared namespace calls refuse before application evaluation. The artifact
-  builder must independently seal/authorize this plan before prepare!."
+(defn- source-facts [name source]
+ (when-not (and (string? source) (<= (erlang/byte_size source) 1048576))
+  (refuse! :invalid-source {:namespace name}))
+ (let [reader-facts (reader/read-source-spans source nil)
+       forms (:forms reader-facts)
+       header (graph/header*-nodes forms)
+       references (binding-data/references-forms forms header)
+       executable (mapv macro-source/executable-form forms)]
+  {:reader reader-facts :forms forms :header header :binding-references references
+   :binding-roots (vec (sort (set (map #(first (String/split % "/")) references))))
+   :executable executable :native-targets (vec (static-call/deferred-targets executable))}))
+
+(defn source-readiness!
+ "Bounded structural diagnostic for one source in an explicit namespace
+  boundary. :namespace/:source identify exact bytes; :sources (defaulting to
+  that source) and :stable-namespaces describe dependencies, :native-modules
+  grants only structural native spellings. Fresh Env/Loader ambiguity checks
+  run on every call. Returns first-order names/status, never AST or release
+  authority. It does not rewrite, prepare, initialize or publish application code."
  [opts]
+ (when-not (map? opts) (refuse! :invalid-generation {}))
+ (let [name (:namespace opts) source (:source opts)
+       sources (or (:sources opts) {name source})
+       stable-input (:stable-namespaces opts) native-input (:native-modules opts)
+       names? (fn [values]
+                (and (or (nil? values) (set? values) (vector? values) (list? values))
+                     (<= (count values) 1024)
+                     (every? #(and (string? %) (<= (erlang/byte_size %) 256)
+                                    (Regex/match? #"^[a-zA-Z][a-zA-Z0-9_.-]*$" %)) values)))]
+  (when-not (and (map? sources) (seq sources) (<= (count sources) 1024)
+                (names? (vec (keys sources))) (names? stable-input) (names? native-input)
+                (string? name) (= source (get sources name)) (string? source))
+   (refuse! :invalid-generation {}))
+  (let [bytes (reduce + 0 (map (fn [[namespace text]]
+                               (when-not (string? text) (refuse! :invalid-source {:namespace namespace}))
+                               (erlang/byte_size text)) sources))]
+   (when (> bytes 16777216) (refuse! :generation-source-budget {:bytes bytes})))
+  (let [stable (set stable-input) native (set native-input) facts (source-facts name source)]
+   (check-native-source name source sources stable native facts)
+   (check-source! name source stable native sources facts)
+   {:status :structurally-valid :namespace name
+    :requires (vec (second (:header facts))) :late-references (:binding-references facts)})))
+
+(defn- plan-with-facts*
+ "Internal plan over exact per-invocation source facts; callers cannot supply
+  trusted AST through public opts and native ambiguity remains checked fresh."
+ [opts prepared-facts]
  (let [sources (:sources opts) roots (or (:roots opts) (keys sources))
        stable (set (:stable-namespaces opts)) native (set (:native-modules opts))
        application-id (:application-id opts)
@@ -292,13 +382,46 @@
                 (every? #(and (string? %) (Regex/match? #"^[a-zA-Z][a-zA-Z0-9_.-]*$" %))
                         (keys sources)))
    (refuse! :invalid-generation {}))
-  (let [source-bytes (reduce + 0 (map #(if (string? %) (erlang/byte_size %) 0) (vals sources)))
+  (let [registries (registry-data/registries resources)
+        registry-roots (registry-data/roots registries)
+        _ (doseq [reference (registry-data/references registries)]
+            (when-not (contains? sources (first (String/split reference "/")))
+             (refuse! :unsealed-registry-reference {:reference reference})))
+        source-bytes (Enum/reduce sources 0
+                        (fn [entry total]
+                         (let [name (elem entry 0) source (elem entry 1)]
+                          (when-not (string? source)
+                           (refuse! :invalid-source {:namespace name}))
+                          (+ total (erlang/byte_size source)))))
         _ (when (> source-bytes 16777216) (refuse! :generation-source-budget {:bytes source-bytes}))
-        compile-sources (into {} (map (fn [[name source]]
-                                      [name (specialize-source name source sources stable native)]) sources))
-        parsed (into {} (map (fn [[name source]]
-                              [name (check-source! name source stable native sources)]) compile-sources))
-        requires (fn [name] (filter #(contains? sources %) (second (graph/header (get sources name)))))
+        facts (or prepared-facts
+                  (Map/new sources (fn [entry]
+                    (let [name (elem entry 0)]
+                     (tuple name (source-facts name (elem entry 1)))))))
+        late-roots (vec (distinct (Enum/flat_map (Map/values facts)
+                                    (fn [record] (to-list (:binding-roots record))))))
+        _ (doseq [name late-roots]
+            (when-not (contains? sources name)
+             (refuse! :unsealed-late-binding {:namespace name})))
+        roots (vec (distinct (concat roots registry-roots late-roots)))
+        ;; These passes consume their entire finite input. Lazy callbacks here
+        ;; capture every parsed source/span tree and duplicate those captures
+        ;; in memo resources. Native eager passes keep one invocation's facts.
+        compile-sources (Map/new sources
+                         (fn [entry]
+                          (let [name (elem entry 0) source (elem entry 1)]
+                           (tuple name (check-native-source name source sources stable native (get facts name))))))
+        _ (Enum/each compile-sources
+            (fn [entry]
+             (let [name (elem entry 0)]
+              (check-source! name (elem entry 1) stable native sources (get facts name)))))
+        adjacency (Map/new facts
+                    (fn [entry]
+                     (tuple (elem entry 0)
+                      (Enum/filter (second (:header (elem entry 1)))
+                                   (fn [dependency] (contains? sources dependency))))))
+        ;; Downstream graph walks capture only names/edges, never source ASTs.
+        requires (fn [name] (get adjacency name (list)))
         cycles (graph/cycles roots requires)]
    (when (seq cycles) (refuse! :require-cycle {:cycles cycles}))
    (let [order (dependency-order roots requires)
@@ -307,16 +430,35 @@
                   (cond-> [1 (vec (sort-by first selected)) (vec (sort stable)) (vec (sort native)) resources protocols]
                     application-id (conj [:application-id application-id]))
                   (list :deterministic)))
-         mapping (into {} (map (fn [name] [name (str "sealed.g" digest (when (:instance opts) (str ".i" (:instance opts))) "." name)]) order))]
+         mapping (Map/new order (fn [name]
+                    (tuple name (str "sealed.g" digest (when (:instance opts) (str ".i" (:instance opts))) "." name))))]
     (when (and (:digest opts) (not= digest (:digest opts)))
      (refuse! :identity-conflict {:expected (:digest opts) :actual digest}))
-    {:input opts :digest digest :mapping mapping :order order :resources resources
+    (tuple {:input opts :digest digest :mapping mapping :order order :resources resources
      :application-id application-id :source-bytes source-bytes
+     :registries registries
      :protocols (into {} (map (fn [[server version]]
                                [server {:protocol version :generation digest}]) protocols))
      :stable-namespaces stable :native-modules native
-     :sources (into {} (map (fn [name]
-                             [(get mapping name) (rewrite-source (get compile-sources name) (get parsed name) mapping)]) order))}))))
+     :sources (Map/new order (fn [name]
+                    (tuple (get mapping name)
+                           (rewrite-source (get compile-sources name) (:reader (get facts name)) mapping))))} facts)))))
+
+(defn- plan* [opts prepared-facts]
+ (elem (plan-with-facts* opts prepared-facts) 0))
+
+(defn plan
+ "Generation plan without application evaluation. :sources is the complete managed source map; :roots
+  defaults to its keys. :stable-namespaces and :native-modules explicitly name
+  the fixed trusted runtime boundary. :resources is immutable generation data.
+  Literal native apply candidates require explicit native authority; actual
+  specialization uses expanded ANF during prepare!, without source rewriting.
+  Ambiguous BL namespace spellings refuse before compilation.
+  Definition macros are expanded and initializers checked against actual ANF
+  during prepare!. Mutable/effectful initializers, dynamic code lookup and
+  undeclared namespace calls refuse before application evaluation. The artifact
+  builder must independently seal/authorize this plan before prepare!."
+ [opts] (plan* opts nil))
 
 (defn- physical-source-path [path]
  ;; The checkout launcher exposes SDK priv through a symlink, while project
@@ -351,21 +493,28 @@
  (let [entry (:entrypoint opts) parts (when (string? entry) (String/split entry "/"))
        stable (set (:stable-namespaces opts))]
   (when-not (= 2 (count parts)) (refuse! :invalid-entrypoint {}))
-  (loop [todo [(first parts)] sources {} boundary stable]
+  (loop [todo (vec (distinct (concat [(first parts)]
+                    (registry-data/roots (registry-data/registries (or (:resources opts) {}))))))
+         sources {} boundary stable facts {} source-bytes 0]
    (if (empty? todo)
-    (assoc (plan (assoc opts :sources sources :roots [(first parts)] :stable-namespaces boundary)) :entrypoint entry)
+    (assoc (plan* (assoc opts :sources sources :roots [(first parts)] :stable-namespaces boundary) facts) :entrypoint entry)
     (let [name (first todo)]
      (cond
       (or (contains? sources name) (contains? boundary name))
-       (recur (rest todo) sources boundary)
+       (recur (rest todo) sources boundary facts source-bytes)
       (and (:fixed-runtime opts) (fixed-runtime-namespace? name))
-       (recur (rest todo) sources (conj boundary name))
+       (recur (rest todo) sources (conj boundary name) facts source-bytes)
       :else
        (do
         (when (>= (count sources) 1024) (refuse! :generation-capacity {}))
         (let [source (try (BeamLisp.Loader/source_content name) (catch _ nil))]
          (when-not (string? source) (refuse! :missing-source {:namespace name}))
-         (recur (concat (rest todo) (second (graph/header source))) (assoc sources name source) boundary)))))))))
+         (when (> (erlang/byte_size source) 1048576) (refuse! :invalid-source {:namespace name}))
+         (let [bytes (+ source-bytes (erlang/byte_size source))]
+          (when (> bytes 16777216) (refuse! :generation-source-budget {:bytes bytes}))
+          (let [parsed (source-facts name source)]
+           (recur (concat (rest todo) (second (:header parsed)) (:binding-roots parsed))
+                  (assoc sources name source) boundary (assoc facts name parsed) bytes)))))))))))
 
 (defn- with-lock [key action] (BeamLisp.Env/with_generation_lock (tuple :sealed-generation key) action))
 
@@ -398,50 +547,215 @@
          :source-bytes (+ (:source-bytes used 0) source-bytes)}))))))
 
 (defn- namespace-modules [name]
- (cons (BeamLisp.Emit/module_for name)
-       (keys (BeamLisp.Emit/body_modules (BeamLisp.Env/ns_defs name)))))
+ ;; A namespace is also a binding table. Constant/macro/actor-only tables do
+ ;; not emit a function bridge. Derive executable inventory from the compiler's
+ ;; actual function definitions; never invent a shim or skip missing real code.
+ (let [definitions (BeamLisp.Env/ns_defs name)
+       entries (mapcat second definitions)]
+  (if (seq entries)
+   (cons (BeamLisp.Emit/module_for name) (keys (BeamLisp.Emit/body_modules definitions)))
+   [])))
+
+(defn- analyzed-namespace-modules [planned name]
+ ;; Only stable SDK inventories are memoized. Owned definitions are still
+ ;; emitted incrementally and always read fresh; final loaded-code checks use
+ ;; their full actual inventories. Cold/lazy SDK publication invalidates this
+ ;; preparation-local cache through the Env's exact namespace certificate.
+ (let [cache (:module-inventory-cache planned)
+       owned? (contains? (set (vals (:mapping planned))) name)]
+  (if (or (nil? cache) owned?) (namespace-modules name)
+   (loop [left 1]
+    (let [before (BeamLisp.Env/namespace_generations (list name))
+          saved (get (:entries @cache) name)]
+     (if (and before (= before (:generation saved))
+              (= before (BeamLisp.Env/namespace_generations (list name))))
+      (do (swap! cache update :hits inc) (:modules saved))
+      (let [modules (vec (namespace-modules name))
+            after (BeamLisp.Env/namespace_generations (list name))]
+       (swap! cache update :scans inc)
+       (if (and before (= before after))
+        (do (swap! cache assoc-in [:entries name] {:generation after :modules modules}) modules)
+        (if (pos? left) (recur (dec left))
+         (refuse! :unstable-module-inventory {:namespace name}))))))))))
+
+(defn- check-modules! [modules]
+ (doseq [module modules]
+  (when (= false (code/is_loaded module))
+   (refuse! :missing-compiled-module {:module module}))))
 
 (defn- native-hazard-symbol? [module name]
- (let [namespace (String/replace_prefix module "Elixir." "")]
-  (or (unmanaged-producer? namespace name)
-      (= namespace "persistent_term")
-      (contains? #{"BeamLisp.Env" "BeamLisp.Compiler" "BeamLisp.AOT"
-                   "BeamLisp.AOTCache" "BeamLisp.Emit" "BeamLisp.Link" "BeamLisp.Bootstrap"} namespace)
-      (and (= namespace "BeamLisp") (contains? #{"eval" "eval_string" "load_file"} name))
-      (and (= namespace "erlang") (contains? #{"apply" "make_fun"} name))
-      (and (= namespace "code") (contains? #{"load_binary" "load_file" "delete" "purge" "soft_purge"} name)))))
+ (let [namespace (String/replace_prefix module "Elixir." "")
+       target (try (erlang/binary_to_existing_atom
+                     (if (String/starts_with? module "Elixir.") module
+                      (if (String/starts_with? module "BeamLisp.") (str "Elixir." module)
+                       (if (contains? #{"Agent" "Process" "GenServer" "Kernel"} module) (str "Elixir." module) module))) :utf8)
+                (catch _ nil))
+       function (try (erlang/binary_to_existing_atom name :utf8) (catch _ nil))]
+  (or (and target function (BeamLisp.Env/source_critical_target? target function))
+      ;; Firstparty SDK producer identities are checked separately, before
+      ;; Source namespace rewriting. Native ABI policy lives only in Env.
+      (contains? (get STORE-PRODUCERS namespace #{}) name)
+      (and (= namespace "web") (= name "serve"))
+      (and (= namespace "proc") (contains? #{"spawn" "spawn-link" "spawn-monitor" "async"} name))
+      (and (= namespace "proc.tick") (contains? #{"watch" "debounce" "interval" "after"} name)))))
 
 (defn- native-hazard? [module function]
  (native-hazard-symbol? (erlang/atom_to_binary module :utf8)
                         (erlang/atom_to_binary function :utf8)))
+
+(def ^:private SYSTEM-BRIDGE-ARITIES
+ {:os_get_env #{0 1 2} :os_fetch_env #{1} :os_fetch_env! #{1}
+  :os_put_env #{1 2} :os_delete_env #{1} :os_cmd #{2 3} :os_shell #{1 2}})
+(defn- authorized-system-bridge? [planned node]
+ ;; These exact Env operations implement the compiler's scoped System ABI.
+ ;; They require the original System grant; arbitrary Env interop stays banned.
+ (and (= :remote (:op node)) (= :Elixir.BeamLisp.Env (:mod node))
+      (contains? (:native-modules planned) "System")
+      (contains? (get SYSTEM-BRIDGE-ARITIES (:fun node) #{}) (count (:args node)))))
 
 (defn- check-expanded-source! [name form]
  ;; Rt/invoke is legitimate compiler lowering for closure/keyword calls. Reject
  ;; explicit reflective source, including trusted macro output, before lowering.
  ;; Audited macros may emit native constructors such as Supervisor/server; the
  ;; initializer/descriptor ANF proof below checks their actual executable shape.
+ (check-reflective-forms! name form)
  (doseq [[_ symbol] (executable-symbols form)]
   (let [parts (String/split symbol "/") namespace (first parts) function (last parts)]
    (when (and (= 2 (count parts))
-              (or (native-hazard-symbol? namespace function)
+              (or (and (not= [namespace function] ["erlang" "apply"])
+                       (native-hazard-symbol? namespace function))
                   (and (= "BeamLisp.Ns.Rt" (String/replace_prefix namespace "Elixir." ""))
                        (= "invoke" function))))
     (refuse! :unmanaged-compiled-producer {:namespace name :symbol symbol})))))
 
+(defn- compile-exact [planned form env]
+ (syntax-constructor/with-expansion! (fn []
+  (let [native (native-call/specialize
+                (declaration/specialize-registrations! (BeamLisp.Compiler/compile form env))
+                (fn [{:keys [module function]}]
+                 (let [name (String/replace_prefix (erlang/atom_to_binary module :utf8) "Elixir." "")]
+                  (when-not (contains? (:native-modules planned) name)
+                   (refuse! :undeclared-native-target {:module name :function function}))
+                  (when (native-hazard? module function)
+                   (refuse! :unmanaged-compiled-producer {:module module :function function})))))
+        target (:source-http-target planned)]
+   (:expression (source-producer/specialize (:expression native)
+                  {:native-modules (:native-modules planned)
+                   :guard-module (:module target) :guard-function (:function target)
+                   :source-ingress true}))))))
+
+(defn- definition-initializer [compiled namespace definition]
+ ;; Read the initializer from the exact compiled registration, including its
+ ;; optional metadata wrapper. Never expand/compile a macro a second time.
+ (let [node (if (= :let (:op compiled)) (:init compiled) compiled)
+       args (:args node)]
+  (when-not (and (= :remote (:op node)) (= :Elixir.BeamLisp.Env (:mod node))
+                 (= :intern (:fun node)) (= 3 (count args))
+                 (= namespace (:val (first args))) (= definition (:val (second args))))
+   (refuse! :unmanaged-value-descriptor {:namespace namespace :definition definition}))
+  (nth args 2)))
+
+(defn- evaluate-exact! [compiled]
+ (lower/eval-anf (erlang/binary_to_atom (str "Elixir.BeamLisp.Eval.M"
+                                      (erlang/unique_integer (list :positive)))) compiled))
+
+(defn- reflective-global? [node]
+ (when (and (= :global (:op node)) (contains? forbidden (:name node)))
+  (let [namespace (:ns node) trusted #{"core" "env" "reload" "compiler"}]
+   (if (contains? trusted namespace) true
+    (when-not (= :exact (:lookup node))
+     ;; A bare value compiles to a fallback-capable :global in the caller's
+     ;; namespace. A trusted macro can emit it without any reflective SOURCE
+     ;; token. Resolve its actual provider using the compiler's own link rules.
+     (let [owner (BeamLisp.Env/link_owner namespace (:name node))]
+      (if (and (tuple? owner) (= :ok (elem owner 0)))
+       (contains? trusted (elem owner 1))
+       ;; A nonfunction local var has no link metadata but an exact binding.
+       ;; Unknown fallback authority cannot be certified from a spelling.
+       (= :error (BeamLisp.Env/lookup (tuple namespace (:name node)))))))))))
+
+(defn- unmanaged-store-binding? [node]
+ (cond
+  (= :global (:op node))
+   (or (contains? (get STORE-PRODUCERS (:ns node) #{}) (:name node))
+       (when-not (= :exact (:lookup node))
+        (let [owner (BeamLisp.Env/link_owner (:ns node) (:name node))]
+         (and (tuple? owner) (= :ok (elem owner 0))
+              (contains? (get STORE-PRODUCERS (elem owner 1) #{}) (:name node))))))
+  (= :remote (:op node))
+   ;; Exact actual named definitions, including stable body modules. Namespace
+   ;; names/prefixes alone never exempt or authenticate a borrowed producer.
+   (let [name (erlang/atom_to_binary (:fun node) :utf8)]
+    (boolean (some (fn [[namespace names]]
+     (and (contains? names name)
+          (or (= (:mod node) (BeamLisp.Emit/module_for namespace))
+              (some (fn [entry]
+               (and (> (erlang/tuple_size entry) 4) (= (:mod node) (elem entry 4))
+                    (= (:fun node) (elem entry 2))))
+               (BeamLisp.Env/ns_definition namespace name))))) STORE-PRODUCERS)))
+  :else false))
+
 (defn- check-anf! [planned expression]
  ;; Inspect the compiler's actual ANF too: a trusted macro must not inject a
  ;; late reference to an unversioned app namespace after source rewriting.
- (let [names (set (concat (vals (:mapping planned)) (:stable-namespaces planned) ["core" "sugar" "rt" "clojure.re"]))
-       modules (set (mapcat namespace-modules names))]
+ (let [names (set (concat (vals (:mapping planned)) (:stable-namespaces planned) (:compiler-namespaces planned) ["core" "sugar" "rt" "clojure.re"]))
+       modules (set (mapcat #(analyzed-namespace-modules planned %) names))
+       late-modules (when (contains? (:stable-namespaces planned) "reload.binding")
+                      (set (analyzed-namespace-modules planned "reload.binding")))]
   (letfn [(walk [node]
             (cond
              (map? node)
               (do
+               ;; Check resolved compiler bindings too. Refers or trusted
+               ;; macros cannot hide a dynamic/borrowed late-call capability.
+               (when (and (= :global (:op node)) (= "reload.binding" (:ns node))
+                          (= "call!" (:name node)))
+                (refuse! :invalid-late-binding {}))
+               (when (and (= :remote (:op node)) (contains? late-modules (:mod node))
+                          (= :call! (:fun node)))
+                (let [target (first (:args node))]
+                 (when-not (and (= :lit (:op target)) (string? (:val target)))
+                  (refuse! :invalid-late-binding {}))
+                 (let [reference (binding-data/reference (:val target))
+                       namespace (first (String/split reference "/"))]
+                  (when-not (contains? (:mapping planned) namespace)
+                   (refuse! :unsealed-late-binding {:namespace namespace})))))
+               (when (unmanaged-store-binding? node)
+                (refuse! :unmanaged-compiled-producer {:namespace (:ns node) :function (:name node)}))
+               (when (or (reflective-global? node)
+                         (and (= :remote (:op node))
+                              (contains? (:forbidden-remotes planned) [(:mod node) (:fun node)])))
+                (refuse! :dynamic-code-dependency {:namespace (:ns node) :module (:mod node) :function (:fun node)}))
                (when (and (= :global (:op node)) (not (contains? names (:ns node))))
                 (refuse! :unsealed-compiled-dependency {:namespace (:ns node)}))
                (when (and (= :remote (:op node)) (erlang/is_atom (:mod node))
-                          (native-hazard? (:mod node) (:fun node)))
+                          (native-hazard? (:mod node) (:fun node))
+                          (not (authorized-system-bridge? planned node))
+                          (not (and (= :with_source_execution! (:fun node))
+                                    (= :Elixir.BeamLisp.Env (:mod node))
+                                    (= 1 (count (:args node)))
+                                    (= :fn (:op (first (:args node))))))
+                          (not (and (= :invoke_source_native! (:fun node))
+                                    (= :Elixir.BeamLisp.Env (:mod node))
+                                    (= 3 (count (:args node)))
+                                    (= :lit (:op (first (:args node))))
+                                    (= :lit (:op (second (:args node))))
+                                    (erlang/is_atom (:val (first (:args node))))
+                                    (erlang/is_atom (:val (second (:args node)))))))
                 (refuse! :unmanaged-compiled-producer {:module (:mod node) :function (:fun node)}))
+               (when (and (= :remote (:op node)) (= :Elixir.BeamLisp.Env (:mod node))
+                          (= :invoke_source_native! (:fun node)))
+                (let [target (first (:args node)) function (second (:args node))]
+                 (when (or (not= :lit (:op target)) (not= :lit (:op function))
+                           (BeamLisp.Env/source_critical_target? (:val target) (:val function)))
+                  (refuse! :unmanaged-compiled-producer {:module (:val target) :function (:val function)}))
+                 (let [status (BeamLisp.Env/source_target_declaration! (:val target) (:val function)
+                                (count (native-call/checked-arguments (nth (:args node) 2))))
+                       native-name (String/replace_prefix (Atom/to_string (:val target)) "Elixir." "")]
+                  (when (or (= :refuse status)
+                            (and (= :external status) (not (contains? modules (:val target)))
+                                 (not (contains? (:native-modules planned) native-name))))
+                   (refuse! :undeclared-native-target {:module (:val target) :function (:val function)})))))
                (when (and (= :remote (:op node)) (= :Elixir.BeamLisp.Loader (:mod node))
                           (not (and (= :ensure_ready (:fun node)) (= 1 (count (:args node)))
                                     (= :lit (:op (first (:args node))))
@@ -457,6 +771,18 @@
              (or (list? node) (vector? node)) (doseq [child node] (walk child))))]
    (walk expression))))
 
+(defn- forbidden-remotes []
+ ;; Exact resolved compiler bindings, including body modules. Similar words in
+ ;; application definitions are harmless; a macro hiding Core.resolve is not.
+ (set (mapcat (fn [namespace]
+        (mapcat (fn [name]
+         (mapcat (fn [entry]
+          (map (fn [module] [module (elem entry 2)])
+               (distinct (filter some? [(BeamLisp.Emit/module_for namespace)
+                                        (when (> (erlang/tuple_size entry) 4) (elem entry 4))]))))
+          (BeamLisp.Env/ns_definition namespace name))) forbidden))
+       ["core" "env" "reload" "compiler"])))
+
 
 (defn- check-compiled! [planned]
  (doseq [name (vals (:mapping planned))
@@ -465,9 +791,9 @@
 
 (def ^:private immutable-remotes
  #{[:Elixir.BeamLisp.Supervisor :server]
-   [:Elixir.BeamLisp.Vector :new] [:Elixir.BeamLisp.Set :new]
+   ;; Forcing native constructors require bounded first-order input below.
    [:Elixir.BeamLisp.Ns.Rt :hash_key] [:Elixir.BeamLisp.Ns.Clojure.Re :re-pattern]
-   [:Elixir.BeamLisp.Ns.Core :merge__bl_v] [:Elixir.BeamLisp.Ns.Core :set]
+   [:Elixir.BeamLisp.Ns.Core :merge__bl_v]
    [:Elixir.BeamLisp.Ns.Core :vector__bl_v] [:Elixir.BeamLisp.Ns.Core :list__bl_v]
    [:Elixir.BeamLisp.Ns.Core :str__bl_v] [:Elixir.Regex :compile!]})
 
@@ -480,8 +806,9 @@
    (let [clause (elem entry 3) fname (elem entry 2) arity (count (:params clause))
          body-module (when (> (erlang/tuple_size entry) 4) (elem entry 4))]
     (when (and (= :fixed (elem entry 0)) (= :defn-clause (:op clause)))
+     (swap! targets update-in [:globals [namespace definition]] (fnil assoc {}) arity [shim fname arity])
      (doseq [module (distinct (filter some? [shim body-module]))]
-      (swap! targets update [module fname arity] (fnil conj []) clause)))))))
+      (swap! targets update-in [:entries [module fname arity]] (fnil conj []) clause)))))))
 
 (defn- immutable-anf? [planned node targets]
  ;; Prove the finite executable construction path, not a function's delayed
@@ -558,87 +885,234 @@
   (erlang/is_function value) (BeamLisp.Env/callback_modules value)
   (and (erlang/is_tuple value) (= 3 (erlang/tuple_size value)) (= :$blfn (elem value 0)))
   (BeamLisp.Env/callback_modules value)
+  (and (erlang/is_tuple value) (= 2 (erlang/tuple_size value))
+       (= (erlang/binary_to_atom "$macro") (elem value 0))) (executable-values (elem value 1))
   (map? value) (mapcat executable-values (mapcat (fn [[k v]] (list k v)) value))
   (or (vector? value) (list? value) (set? value)) (mapcat executable-values value)
   :else []))
 
 (defn- evaluate-definitions! [planned name source value-modules factory-targets]
- (let [forms (BeamLisp.Reader/read_string source) seen (atom #{}) env (BeamLisp.Compiler/new_env name)]
+ (let [forms (BeamLisp.Reader/read_string source) seen (atom #{}) declared (atom #{}) classes (:generated-classes planned)
+       env (BeamLisp.Compiler/new_env name)]
   (BeamLisp.Compiler/eval_form (first forms) env)
+  (doseq [form (rest forms)] (BeamLisp.Compiler/prelink_defn form name))
   (letfn [(definition! [form depth]
            (when (> depth 32) (refuse! :definition-expansion-budget {:namespace name}))
            (let [head (head-of form) items (children form)]
-            (if (contains? #{"defn" "defn-" "def" "defserver"} head)
-             (let [definition (name-of (second items))]
-              (check-expanded-source! name form)
+            (if (= "extend-type" head)
+             (let [compiled (compile-exact planned form env)
+                   namespaces (set (concat (vals (:mapping planned)) (:stable-namespaces planned)))
+                   implementations (generated-class/extension! compiled @classes namespaces
+                                      #(check-anf! planned %))
+                   methods (evaluate-exact! (generated-class/capture-extension compiled implementations))]
+              (swap! value-modules into (executable-values methods)))
+            (if (= "declare" head)
+             (doseq [item (rest items)]
+              (let [definition (name-of item)]
+               (when-not (and definition (not (String/contains? definition "/")))
+                (refuse! :invalid-declaration {:namespace name}))
+               (swap! declared conj definition)
+               (when-not (BeamLisp.Env/local_var? name definition)
+                (BeamLisp.Env/intern name definition nil))))
+             (if (contains? #{"defn" "defn-" "defmacro" "def" "defserver" "defrecord" "deftype"} head)
+             (let [definition (name-of (second items))
+                   compiled (compile-exact planned form env)
+                   class (when (contains? #{"defrecord" "deftype"} head)
+                           (generated-class/class! compiled name definition
+                             (if (= "defrecord" head) :record :deftype)
+                             (set (concat (vals (:mapping planned)) (:stable-namespaces planned)))
+                             #(check-anf! planned %)))]
+              (check-expanded-source! name (macro-source/executable-form form))
               (when (or (nil? definition) (contains? @seen definition))
                (refuse! :duplicate-definition {:namespace name :definition definition}))
               (swap! seen conj definition)
+              (when (= head "defmacro")
+               (syntax-constructor/macro! (definition-initializer compiled name definition)))
               (when (= head "def")
-               (let [initializer (BeamLisp.Compiler/compile (last items) env)]
+               (let [initializer (definition-initializer compiled name definition)]
                 (check-anf! planned initializer)
-                (when-not (immutable-anf? planned initializer @factory-targets)
+                (when-not (or (immutable-anf? planned initializer (:entries @factory-targets))
+                              (collection-constructor/proved? initializer
+                               {:sdk (:immutable-collection-targets planned)
+                                :factories (:entries @factory-targets)
+                                :factory-globals (:globals @factory-targets)
+                                :allowed-globals (set (vals (:mapping planned)))}))
                  (refuse! :effectful-generation {:namespace name :definition definition}))))
               (when (= head "defserver")
-               (let [compiled (BeamLisp.Compiler/compile form env)
-                     descriptor (:val (first (:args (first (:stmts compiled)))))]
+               (let [descriptor (:val (first (:args (first (:stmts compiled)))))]
                 (when-not (and (= :module (:op descriptor))
                                (= (BeamLisp.Server/module_for name definition) (:name descriptor)))
                  (refuse! :unmanaged-owner-descriptor {:namespace name}))
-                (doseq [clause (:clauses descriptor)] (check-anf! planned (:body clause)))))
-              (let [value (BeamLisp.Compiler/eval_form form env)]
+                (doseq [clause (:clauses descriptor)]
+                 (check-anf! planned (:body (server-entry/input-body (:name descriptor) clause))))
+                (swap! (:server-descriptors planned) assoc (:name descriptor) descriptor)))
+              (let [value (evaluate-exact! compiled)]
+               (when (= head "defmacro")
+                (BeamLisp.Env/intern name definition (syntax-constructor/guard-macro value)))
                (when (contains? #{"defn" "defn-"} head) (record-factory! factory-targets name definition))
-               (when (= head "defserver") (swap! value-modules conj value))
-               (when (= head "def")
+               (when (= head "defserver")
+                (when-not (= (BeamLisp.Server/module_for name definition) value)
+                 (refuse! :unmanaged-owner-descriptor {:namespace name}))
+                (swap! (:server-classes planned) conj value)
+                (swap! value-modules conj value))
+               (when class
+                (when-not (= (:module class) value)
+                 (refuse! :unmanaged-class-descriptor {:namespace name}))
+                (swap! classes conj value)
+                (swap! value-modules into (concat [value]
+                    (mapcat executable-values (generated-class/method-values! class)))))
+               (when (contains? #{"def" "defmacro"} head)
                 (swap! value-modules into (filter #(String/starts_with? (erlang/atom_to_binary % :utf8)
                                                     "Elixir.BeamLisp.Eval.") (executable-values value))))))
-             (let [expanded (BeamLisp.Compiler/macroexpand_1 (rn/node-form form) name)]
+             (let [expanded (syntax-constructor/with-expansion!
+                              #(BeamLisp.Compiler/macroexpand_1 (rn/node-form form) name))]
               (when (= expanded form)
                (refuse! :effectful-generation {:namespace name :form head}))
               (if (= "do" (head-of expanded))
-               (doseq [child (rest (children expanded))] (definition! child (inc depth)))
-               (definition! expanded (inc depth)))))))]
-   (doseq [form (rest forms)] (definition! form 0)))))
+               (let [definitions (rest (children expanded))]
+                (doseq [child definitions] (BeamLisp.Compiler/prelink_defn child name))
+                (doseq [child definitions] (definition! child (inc depth))))
+               (definition! expanded (inc depth)))))))))]
+   (doseq [form (rest forms)] (definition! form 0))
+   (doseq [definition @declared]
+    (when-not (contains? @seen definition)
+     (refuse! :unresolved-declaration {:namespace name :definition definition}))))))
+
+(defn- source-coherence [staged]
+ ;; This optional legacy check runs only during preparation, never SDK staging.
+ ;; Resolve the fixed genuine SDK body under its global scope; invoke back in
+ ;; the child scope so coherence observes the same image/definitions as before.
+ (let [check (env/with-env :global
+              (fn []
+               (BeamLisp.Loader/ensure_loaded "reload")
+               (BeamLisp.AOT/sdk_named_constructor! "reload" "coherence" 1)))]
+  (check staged)))
+
+(defn- source-http-target []
+ ;; Fixed actual SDK body evidence is captured before entering Source scope.
+ ;; Source metadata cannot select this target or manufacture network authority.
+ (env/with-env :global
+  (fn []
+   (BeamLisp.Loader/ensure_loaded "reload.source-guard")
+   (let [target (BeamLisp.AOT/sdk_named_constructor! "reload.source-guard" "http-request!" 1)]
+    (BeamLisp.AOT/sdk_callable_evidence! target)
+    {:module (elem (erlang/fun_info target :module) 1)
+     :function (elem (erlang/fun_info target :name) 1)}))))
 
 (defn prepare!
  "Compile a validated plan into fresh names in a dedicated environment. Reuses
   an identical prepared graph in the same parent env. Returns an opaque runtime
   handle. No handler becomes reachable through a serving slot until publish!."
  [proposal]
+ ;; Refuse Source callbacks before loading/compiler/cache work. Genuine native
+ ;; framework preparation under a selected generation remains usable.
+ (when-not (erlang/function_exported :Elixir.BeamLisp.Env :assert_native_framework_execution! 0)
+  (refuse! :native_source_extent_unavailable {}))
+ (BeamLisp.Env/assert_native_framework_execution!)
+ ;; Freeze the existing exact SDK BEFORE returning any cached application graph.
+ ;; Cache identity alone cannot protect already-running Source from SDK mutation.
+ (BeamLisp.Env/ensure_sdk_runtime!)
+ (when-not (and (erlang/function_exported :Elixir.BeamLisp.Env :with_source_execution! 1)
+                (erlang/function_exported :Elixir.BeamLisp.Env :assert_native_framework_execution! 0)
+                (erlang/function_exported :Elixir.BeamLisp.Env :check_source_callable! 1)
+                (erlang/function_exported :Elixir.BeamLisp.Env :check_source_invocation! 2)
+                (erlang/function_exported :Elixir.BeamLisp.Env :check_source_invocation1! 2)
+                (erlang/function_exported :Elixir.BeamLisp.Env :check_source_invocation2! 3)
+                 (erlang/function_exported :Elixir.BeamLisp.Env :source_capture_context! 0)
+                 (erlang/function_exported :Elixir.BeamLisp.Env :source_bind_context! 1)
+                 (erlang/function_exported :Elixir.BeamLisp.Env :source_with_env! 2)
+                (erlang/function_exported :Elixir.BeamLisp.Env :invoke_source_native! 3)
+                (erlang/function_exported :Elixir.BeamLisp.Env :source_target_declaration! 3)
+                (erlang/function_exported :Elixir.BeamLisp.Env :register_source_profile! 1))
+  (refuse! :native_source_extent_unavailable {}))
  (let [input (or (:input proposal) proposal)
-       validated (plan input)
+       validation (plan-with-facts* input nil)
+       validated (elem validation 0) facts (elem validation 1)
        key [(env/current) (:digest validated)]]
   (with-lock key
    (fn []
     (or (get @prepared key)
      (let [_ (reserve-capacity! (count (:order validated)) (:source-bytes validated))
-           planned (plan (assoc input :instance (str (erlang/unique_integer (list :positive)))))
-           scope (env/fork) value-modules (atom #{}) factory-targets (atom {}) generation
+           planned (assoc (plan* (assoc input :instance (str (erlang/unique_integer (list :positive)))) facts)
+                          :forbidden-remotes (forbidden-remotes)
+                          ;; Capture SDK identities before entering the child application env.
+                          :immutable-collection-targets (collection-constructor/sdk-targets)
+                          :reconcile-sdk-context (reconcile-compiler/sdk-context)
+                          :source-http-target (source-http-target)
+                          :module-inventory-cache (atom {:entries {} :hits 0 :scans 0})
+                          :generated-classes (atom #{})
+                          :server-classes (atom #{})
+                          :server-descriptors (atom {}))
+           scope (env/fork) value-modules (atom #{}) factory-targets (atom {:entries {} :globals {}}) callables (atom {}) generation
            (try
             (env/with-env scope
              (fn []
+              (declaration/with-preparation! (:mapping planned)
+               (fn []
+              ;; Resolve this fixed SDK call surface before compiling app code.
+              ;; Otherwise the first cold call is a generic global invocation,
+              ;; whose literal target cannot be judged as an exact remote call.
+              (when (contains? (:stable-namespaces planned) "reload.binding")
+               (BeamLisp.Loader/ensure_loaded "reload.binding"))
               ;; The legacy source-only pass treats macro/owner DSL labels as
               ;; variable references. Keep it for ordinary definitions; extended
               ;; definitions are checked from their actual expanded compiler ANF.
               (when (every? (fn [[_ src]]
                        (every? #(contains? #{"ns" "def" "defn" "defn-"} (head-of %))
                                (BeamLisp.Reader/read_string src))) (:sources planned))
-               (let [errors (reload/coherence (vec (:sources planned)))]
+               (let [errors (source-coherence (vec (:sources planned)))]
                 (when (seq errors) (refuse! :incoherent-generation {:errors errors}))))
               (doseq [name (vals (:mapping planned))] (BeamLisp.Env/declare_ns name))
               (doseq [name (:order planned)]
                (let [fresh (get (:mapping planned) name)]
                 (evaluate-definitions! planned fresh (get (:sources planned) fresh) value-modules factory-targets)
                 (BeamLisp.Env/mark_loaded fresh)))
-              (BeamLisp.Link/settle)
-              (check-compiled! planned)
-              (let [modules (vec (distinct (concat @value-modules (mapcat
+              (let [bridge (reconcile-compiler/finalize! planned @factory-targets (:reconcile-sdk-context planned))
+                    checked-planned (assoc planned :compiler-namespaces (conj (set (:runtime-namespaces bridge)) "reload.source-guard"))]
+               (BeamLisp.Link/settle)
+               (check-compiled! checked-planned))
+              (registry-data/check-fields! (:registries planned))
+              (doseq [reference (mapcat binding-data/references (vals (:sources (:input planned))))]
+               (let [[logical definition] (String/split reference "/")
+                     result (BeamLisp.Env/fetch_exact (get (:mapping planned) logical) definition)]
+                (when-not (and (tuple? result) (= :ok (elem result 0)) (fn? (elem result 1)))
+                 (refuse! :invalid-late-binding {:reference reference}))
+                (swap! callables assoc reference (elem result 1))))
+              (doseq [reference (registry-data/references (:registries planned))]
+               (let [[logical definition] (String/split reference "/")
+                     result (BeamLisp.Env/fetch_exact (get (:mapping planned) logical) definition)]
+                (when-not (and (tuple? result) (= :ok (elem result 0)) (fn? (elem result 1)))
+                 (refuse! :invalid-registry-reference {:reference reference}))
+                (swap! callables assoc reference (elem result 1))))
+              (let [declarations (declaration/collect!)
+                    _ (doseq [[_ entries] declarations [_ descriptor] entries
+                              reference (cons (:callback descriptor) (:callbacks descriptor []))]
+                        (let [[logical definition] (String/split reference "/")
+                              value (BeamLisp.Env/fetch_exact! (get (:mapping planned) logical) definition)]
+                         (when-not (fn? value) (refuse! :invalid-executable-declaration {:reference reference}))
+                         (swap! callables assoc reference value)))
+                    modules (vec (distinct (concat @value-modules (mapcat
                              namespace-modules
-                             (vals (:mapping planned))))))]
+                             (vals (:mapping planned))))))
+                    _ (check-modules! modules)
+                    ;; Analysis reads the ACTUAL checked/evaluated compiler
+                    ;; descriptors only after all named helpers are published.
+                    ;; It never recompiles source or makes unknown actors adoptable.
+                    input-context (actor-contract/input-context
+                                    (concat (vals (:mapping planned))
+                                            (:stable-namespaces planned) ["core" "sugar"]))
+                    actor-inputs (into {} (mapv (fn [[module descriptor]]
+                                      [module (actor-contract/prepare-inputs! descriptor input-context)])
+                                    @(:server-descriptors planned)))]
                {:digest (:digest planned) :mapping (:mapping planned) :scope scope
                 :context (assoc (env/capture) :generation nil) :resources (:resources planned) :modules modules
                 :protocols (:protocols planned) :application-id (:application-id planned)
-                :state (atom {:retired false :tickets {} :slots #{}}) :cache-key key})))
+                :native-modules (:native-modules planned) :source-ingress-version 1
+                :classes @(:generated-classes planned) :server-classes @(:server-classes planned)
+                :actor-inputs actor-inputs
+                :registries (:registries planned) :declarations declarations :callables @callables
+                :preparation-metrics (select-keys @(:module-inventory-cache planned) [:hits :scans])
+                :state (atom {:retired false :tickets {} :slots #{}}) :cache-key key})))))
             (catch error
              (try
               (env/with-env scope
@@ -651,52 +1125,152 @@
       (swap! reload/live-generations
        (fn [m] (reduce (fn [a name] (assoc a name :sealed)) m (vals (:mapping planned)))))
       (swap! prepared assoc key generation)
-      generation))))))
+      ;; Private-cache identity exists before native original-grant freezing.
+      ;; No caller-provided profile/MD5 list is admitted by this hook.
+      (try
+       (BeamLisp.Env/register_source_profile! generation)
+       generation
+       (catch error
+        (swap! prepared dissoc key)
+        (swap! reload/live-generations
+          (fn [all] (reduce dissoc all (vals (:mapping planned)))))
+        (try
+         (doseq [module (:modules generation)] (BeamLisp.Env/retire_module! module))
+         (finally (env/destroy scope)))
+        (throw error)))))))))
 
-(defn prepare-project! [opts] (prepare! (project-plan opts)))
+(defn prepare-project! [opts]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (prepare! (project-plan opts)))
 
-(defn- acquire! [generation]
- (with-lock (:cache-key generation)
-  (fn []
-   (when (:retired @(:state generation)) (refuse! :retired-generation {}))
-   (let [ticket (BeamLisp.Env/retain_code! (to-list (:modules generation)))]
-    (swap! (:state generation) assoc-in [:tickets ticket] (erlang/self)) ticket))))
+(defn attested-prepared!
+ "Read-only exact private preparation-cache identity for trusted framework
+  enrollment. A copied/edited map, caller state, digest/resources flag or live
+  namespace cannot manufacture this receipt. This does not grant execution,
+  root ownership, runtime inheritance or publication authority."
+ ([generation] (attested-prepared! generation false))
+ ([generation allow-retired?]
+ (when-not (and (or (= true allow-retired?) (= false allow-retired?))
+                (erlang/is_map generation)
+                (erlang/== generation (get @prepared (:cache-key generation)))
+                (or allow-retired? (not (:retired @(:state generation)))))
+  (refuse! :unattested-prepared-generation {}))
+ generation))
 
-(defn- release-ticket! [generation ticket]
- (with-lock (:cache-key generation)
-  (fn [] (BeamLisp.Env/release_code! ticket)
-         (swap! (:state generation) update :tickets dissoc ticket) :ok)))
+(defn- acquire! [generation] (execution/acquire! generation))
+(defn- release-ticket! [generation ticket] (execution/release-ticket! generation ticket))
 
 (defn slot
  "A stable serving indirection. Admission/publication share a short lock;
   handlers execute concurrently outside it. One slot may serve many listeners."
  [] {:id (erlang/make_ref) :current (atom nil)})
 
-(defn publish!
- "Compare-and-publish one serving slot. expected is nil or the current digest.
-  Not a multi-owner transaction. Durable activation intent belongs upstream."
- [slot expected generation]
- (with-lock (:id slot)
-  (fn []
-   (let [old @(:current slot)]
-    (cond
-     (not (reload/reload-enabled?)) {:status :held :reason :reload-disabled}
-     (= (:digest old) (:digest generation)) {:status :already-applied :digest (:digest old)}
-     (not= expected (:digest old)) {:status :stale :digest (:digest old)}
-     :else
-      (do
+(defn- publication-result [slot expected generation]
+ (let [old @(:current slot)]
+  (cond
+   (not (reload/reload-enabled?)) {:status :held :reason :reload-disabled}
+   (= (:digest old) (:digest generation)) {:status :already-applied :digest (:digest old)}
+   (not= expected (:digest old)) {:status :stale :digest (:digest old)}
+   :else nil)))
+
+(defn- reserve-schema-publication! [slot previous generation]
+ ;; Called under the existing slot lock BEFORE changing graph/slot pointers.
+ ;; The global metadata lock also bounds concurrent publications on other slots.
+ (when (get-in generation [:resources :dynamic-store-policy])
+  (let [receipt {:ticket (erlang/make_ref) :state :issued :graph generation :slot slot
+                 :previous (when previous (:cache-key previous))}]
+   (BeamLisp.Env/with_generation_lock :schema-publication-receipt-capacity
+    (fn []
+     (swap! schema-publications
+      (fn [rows]
+       (let [history (get rows (:cache-key generation) [])]
+        (when (or (and (not (contains? rows (:cache-key generation))) (>= (count rows) 4096))
+                  (>= (count history) 8))
+         (refuse! :schema-publication-receipt-capacity {}))
+        (assoc rows (:cache-key generation) (conj history receipt))))))) receipt)))
+(defn- record-schema-publication! [receipt]
+ ;; No capacity failure remains after pointer mutation. The exact private
+ ;; reserved row is completed; an interrupted native publication stays issued.
+ (when receipt
+  (swap! schema-publications update (get-in receipt [:graph :cache-key])
+   #(mapv (fn [row] (if (= (:ticket receipt) (:ticket row)) (assoc row :state :published) row)) %))))
+(defn schema-publication-evidence!
+ "Fixed native consumer only. Positive SDK pointer-change receipt with an
+  exact still-selected prepared graph and the actual slot atom identity."
+ [generation]
+ (BeamLisp.Env/assert_execution_context!)
+ (attested-prepared! generation)
+ (let [history (get @schema-publications (:cache-key generation))
+       row (last (filter #(and (= :published (:state %)) (= generation @(:current (:slot %)))
+                               (contains? (:slots @(:state generation)) (get-in % [:slot :id]))) history))
+       slot (:slot row)]
+  (when-not (and (not (some #(= :issued (:state %)) history)) row (= generation (:graph row)) (erlang/is_reference (:ticket row))
+                 (= generation @(:current slot))
+                 (contains? (:slots @(:state generation)) (:id slot)))
+   (refuse! :native-schema-publication-evidence-required {}))
+  (select-keys row [:ticket :graph :slot :previous])))
+
+(defn- publish-validated! [slot expected generation]
+   (with-lock (:id slot)
+    (fn []
+     ;; Another publisher or close may have won while validation ran.
+     (or (publication-result slot expected generation)
+      (let [old @(:current slot) publication-receipt (reserve-schema-publication! slot old generation)]
        (with-lock (:cache-key generation)
         (fn []
          (when (:retired @(:state generation)) (refuse! :retired-generation {}))
+         ;; The coordinator can run after validation. Recheck live handle
+         ;; authority here without rescanning values under its admission lock.
+         (when-let [runtime (:runtime @(:state generation))]
+          (when-not (Process/alive? (:owner runtime)) (refuse! :missing-runtime-resource {})))
          (swap! (:state generation) update :slots conj (:id slot))
          (reset! (:current slot) generation)))
        (when old (with-lock (:cache-key old)
                    (fn [] (swap! (:state old) update :slots disj (:id slot)))))
-       {:status :applied :digest (:digest generation)}))))))
+       (record-schema-publication! publication-receipt)
+       {:status :applied :digest (:digest generation)})))))
+
+(defn- coordinate-publication [fence action]
+ (if fence (fence action) (action)))
+
+(defn- coordinate-migration-publication [generation action]
+ ;; Fixed SDK metadata entry only, lazily used when an actual policy exists.
+ ;; No caller callback/MFA or public receipt chooses the gate. Ordinary no-policy
+ ;; startup must not import a migration/data-analysis closure.
+ (let [declared (get-in generation [:resources :dynamic-store-policy])
+       loaded? (env/with-env :global #(BeamLisp.Env/ns_ready? "datom.conn"))
+       installed? (when loaded?
+          ((env/with-env :global #(BeamLisp.AOT/sdk_named_constructor! "datom.conn" "migration-policy-installed?" 1))
+             (:application-id generation)))]
+  (when (and installed? (nil? declared)) (refuse! :migration-policy-declaration-required {}))
+  (if declared
+   (execution/with! generation
+    (fn []
+     ((env/with-env :global #(BeamLisp.AOT/sdk_named_constructor! "datom.conn" "with-migration-publication-reservation!" 1)) action)))
+   (action))))
+
+(defn publish!
+ "Compare-and-publish one serving slot. expected is nil or the current digest.
+  Optional trusted coordinator fence wraps ONLY the final comparison/publication,
+  after runtime validation; it must never wait for writers, actors or providers.
+  It also observes no-op results, preserving coordinator checks/receipts.
+  Not a multi-owner transaction. Durable activation intent belongs upstream."
+ ([slot expected generation] (publish! slot expected generation nil))
+ ([slot expected generation fence]
+  (when-not (or (nil? fence) (fn? fence)) (refuse! :invalid-publication-fence {}))
+  (if-let [result (with-lock (:id slot) #(publication-result slot expected generation))]
+   (coordinate-publication fence (fn [] result))
+   (do
+    ;; A bounded scan, including SDK class attestation, must not run under
+    ;; serving admission OR an outer queue-family publication fence.
+    ;; This remains a point-in-time check, not a raw alias write guard.
+    (execution/check-runtime! generation)
+    (coordinate-migration-publication generation
+      #(coordinate-publication fence (fn [] (publish-validated! slot expected generation))))))))
 
 (defn current
  "Selected generation identity/resources in this execution, or nil outside it."
- [] (Process/get :bl_generation))
+ [] (execution/current))
 
 (defn close!
  "Stop new admissions during listener shutdown. Existing request/callback
@@ -735,83 +1309,13 @@
    (refuse! :invalid-resource-path {:resource key :path relative}))
   (Path/join root relative)))
 
-(defn- bounded-handles? [bindings]
- (loop [todo [bindings] remaining 100000]
-  (if (empty? todo) true
-   (if (neg? remaining) false
-    (let [v (first todo)]
-     (cond
-      (erlang/is_function v) false
-      (and (erlang/is_map v) (= :Elixir.BeamLisp.Atom (maps/get :__struct__ v nil)))
-      (recur (cons @v (rest todo)) (dec remaining))
-      (and (erlang/is_tuple v) (= 3 (erlang/tuple_size v)) (= :$blfn (elem v 0))) false
-      (or (erlang/is_map v) (vector? v) (list? v) (set? v) (erlang/is_tuple v))
-      (let [items (cond (erlang/is_map v) (mapcat (fn [pair] (list (elem pair 0) (elem pair 1)))
-                                                  (maps/to_list v))
-                       (erlang/is_tuple v) (erlang/tuple_to_list v) :else v)]
-       (and (<= (count items) remaining)
-            (recur (reduce (fn [stack item] (cons item stack)) (rest todo) items) (dec remaining))))
-      :else (recur (rest todo) (dec remaining))))))))
-
-(defn runtime-value?
- "Bounded nonexecutable runtime data/handles. Atom contents are checked too;
-  callback references must remain sealed names instead of borrowed closures."
- [value]
- (bounded-handles? value))
-
-(defn bind-runtime!
- "Bind initializer-owned live handles once in this generation. Unlike sealed
-  resources these handles do not enter artifact identity. The lifecycle caller
-  owns their cleanup and native store/process validation. Call while initializing,
-  before publication; no global fallback and no executable callbacks in bindings."
- [bindings]
- (let [generation (current)]
-  (when-not (and generation (map? bindings) (runtime-value? bindings))
-   (refuse! :invalid-runtime-bindings {}))
-  (with-lock (:cache-key generation)
-   (fn []
-    (let [state @(:state generation) previous (:runtime state)]
-     (when (or (:retired state) (seq (:slots state)))
-      (refuse! :runtime-bindings-closed {}))
-     (if previous
-      (if (and (= (erlang/self) (:owner previous)) (= bindings (:values previous))) :already-bound
-       (refuse! :runtime-binding-conflict {}))
-      (do (swap! (:state generation) assoc :runtime {:owner (erlang/self) :values bindings}) :bound)))))))
-
-(defn runtime-bound?
- "Whether this graph has initializer bindings whose original owner is alive.
-  Does not expose handles, authorize inheritance or acquire a serving lease."
- [generation]
- (let [state @(:state generation) runtime (:runtime state)]
-  (boolean (and runtime (not (:retired state)) (Process/alive? (:owner runtime))))))
-
-(defn inherit-runtime!
- "Explicitly share initializer-owned handles with an unpublished candidate.
-  Only their original live owner may authorize this; actors are not restarted,
-  resource ownership is not transferred, and no product global is consulted."
- [candidate previous]
- (let [graphs (sort-by #(pr-str (:cache-key %)) [candidate previous])]
-  (with-lock (:cache-key (first graphs))
-   (fn [] (with-lock (:cache-key (second graphs))
-    (fn []
-     (let [target @(:state candidate) source @(:state previous) runtime (:runtime source)]
-      (when-not (and runtime (= (erlang/self) (:owner runtime)) (Process/alive? (:owner runtime))
-                     (not (:retired source)) (not (:retired target)) (empty? (:slots target))
-                     (= (:application-id candidate) (:application-id previous)))
-       (refuse! :runtime-inheritance-refused {}))
-      (if (:runtime target)
-       (if (= (:runtime target) runtime) :already-bound (refuse! :runtime-binding-conflict {}))
-       (do (swap! (:state candidate) assoc :runtime runtime) :inherited)))))))))
-
-(defn runtime-resource
- "Read a live handle owned by this generation's initializer. Owner death,
-  retired graph and missing binding fail closed, including conveyed callbacks."
- [key]
- (let [generation (current) state (when generation @(:state generation)) runtime (:runtime state)]
-  (when-not (and runtime (not (:retired state)) (Process/alive? (:owner runtime))
-                (contains? (:values runtime) key))
-   (refuse! :missing-runtime-resource {:resource key}))
-  (get (:values runtime) key)))
+; Compatibility entrypoints: runtime-only state owners use reload.execution.
+; Keep existing public generation APIs and the same native generation locks.
+(defn runtime-value? [value] (execution/runtime-value? value))
+(defn bind-runtime! [bindings] (execution/bind-runtime! bindings))
+(defn runtime-bound? [generation] (execution/runtime-bound? generation))
+(defn inherit-runtime! [candidate previous] (execution/inherit-runtime! candidate previous))
+(defn runtime-resource [key] (execution/runtime-resource key))
 
 (defn owner-evidence
  "Read native first-party owner registration without messaging an arbitrary
@@ -830,48 +1334,35 @@
      (assoc (dissoc evidence :lease) :ticket (elem lease 2))
      (do (ets/delete_object :beam_lisp_vars row) nil))))))
 
-(defn- execute [generation action]
- (let [previous (env/capture)]
-  (try
-   (env/bind (:context generation))
-   (Process/put :bl_generation generation)
-   (action)
-   (finally (env/bind previous)))))
+(defn- execute [generation action ticket] (execution/execute generation action ticket))
+(defn- invoke-entry [generation entry args] (execution/invoke-entry generation entry args))
 
-(defn- invoke-entry [generation entry args]
- (let [parts (String/split entry "/") name (get (:mapping generation) (first parts))]
-  (when-not (and name (= 2 (count parts))) (refuse! :unsealed-entrypoint {:entrypoint entry}))
-  (let [result (BeamLisp.Env/fetch_exact name (second parts))]
-   (when-not (and (erlang/is_tuple result) (= :ok (elem result 0)))
-    (refuse! :missing-entrypoint {:entrypoint entry}))
-   (apply (elem result 1) args))))
-
-(defn call!
+(defn with-selected!
  "Admit a request against exactly one generation, pin its whole physical graph
   and context, then execute outside publication locks. Finally releases on error."
- [slot entry args]
+ [slot action]
  (let [[generation ticket]
        (with-lock (:id slot)
         (fn []
          (let [generation @(:current slot)]
           (when-not generation (refuse! :unavailable-generation {}))
           [generation (acquire! generation)])))]
-  (try (execute generation #(invoke-entry generation entry args))
+  (try (execute generation action ticket)
        (finally (release-ticket! generation ticket)))))
+
+
+(defn call!
+ "Invoke an exact sealed reference under one selected graph admission."
+ [slot entry args]
+ (with-selected! slot #(invoke-entry (current) entry args)))
 
 (defn with!
- "Trusted framework execution against a prepared graph, without publication.
-  Keeps returned domain callbacks safe only while action runs; delayed users
-  must capture! a registration. The caller cannot replace serving policy."
- [generation action]
- (let [ticket (acquire! generation)]
-  (try (execute generation action)
-       (finally (release-ticket! generation ticket)))))
+ "Execute under an independent graph lease and restore the caller's context."
+ [generation action] (execution/with! generation action))
 
 (defn invoke!
- "Invoke sealed candidate code before publication with full graph/context."
- [generation entry args]
- (with! generation #(invoke-entry generation entry args)))
+ "Invoke exact graph code;reuse a lease only inside its owned execution."
+ [generation entry args] (execution/invoke! generation entry args))
 
 (defn selected
  "Snapshot serving identity under its admission lock."
@@ -895,7 +1386,7 @@
   (BeamLisp.Env/run_code! (:ticket registration)
    (fn []
     (let [ticket (acquire! generation)]
-     (try (execute generation (fn [] (invoke-entry generation entry args)))
+     (try (execute generation (fn [] (invoke-entry generation entry args)) ticket)
           (finally (release-ticket! generation ticket))))))))
 
 (defn release! [registration]
@@ -928,27 +1419,221 @@
      :serving-slots (count (:slots state)) :registrations (count (:tickets state))
      :modules (count (:modules generation))}))))
 
+(defn- queue-root-retirement [generation operation]
+ ;; Fixed SDK exact definition receipt, never a user callback/namespace prefix.
+ ;; Optional lazy seam avoids eager generation <-> queue module dependency.
+ (when (env/with-env :global #(BeamLisp.Env/loaded_ns? "proc.queue-family-root"))
+  (let [f (env/with-env :global
+     #(BeamLisp.AOT/sdk_named_constructor! "proc.queue-family-root" operation 1))]
+   (f generation))))
+
+(defn- retirement-key [generation]
+ ;; A plan cache key is reused after successful retirement. Bind each native
+ ;; outcome to that preparation's unique scope, so later instances stay separate.
+ [(:cache-key generation) (:scope generation)])
+
+(defn- retirement-identity [generation]
+ {:cache-key (:cache-key generation) :scope (:scope generation)
+  :digest (:digest generation) :application-id (:application-id generation)
+  :modules (vec (sort (:modules generation)))})
+
+(defn native-retirement-outcome
+ "Observe an exact SDK-private retirement result. nil means no actual native
+  success was recorded. Mutable graph state, caller flags or a copied scope
+  never create this record. A completed tombstone retains only immutable graph
+  identity/module names, not callbacks/runtime cells/Conn handles. Observation
+  grants no execution or resource custody; the fixed SDK consumer checks its
+  own private issued graph/resource association independently."
+ [generation]
+ (let [saved (get @native-retirements (retirement-key generation))
+       original (get @prepared (:cache-key generation))]
+  (if-not saved
+   (do
+    ;; A genuine newly prepared instance sharing a completed plan key has no
+    ;; outcome yet. Edited/unknown instances cannot borrow earlier proof.
+    (when (and (not (erlang/== original generation))
+               (some (fn [[_ record]]
+                        (= (:cache-key generation) (get-in record [:identity :cache-key])))
+                     @native-retirements))
+     (refuse! :unattested-retirement-outcome {}))
+    nil)
+   (do
+    (when-not (= (:identity saved) (retirement-identity generation))
+     (refuse! :unattested-retirement-outcome {}))
+    ;; An unrelated later preparation under the same plan key does not erase
+    ;; this original compact result. Pending cleanup keeps its own original.
+    (when (and original (= (:scope original) (:scope generation))
+               (not (erlang/== original generation)))
+     (refuse! :unattested-retirement-outcome {}))
+    (when (:native-retired saved)
+     {:status :native-retired :identity (:identity saved)
+      :phase (:phase saved) :pending (:pending saved)})))))
+
+(defn- native-schema-publication-retirement-blocker [generation]
+ (when (some #(and (= (:scope generation) (get-in % [:graph :scope]))
+                   (or (= :issued (:state %))
+                       ;; Actual private original slot pointer, not a mutable
+                       ;; graph.state slots/retired flag, must have drained.
+                       (and (= :published (:state %)) (= generation @(get-in % [:slot :current])))))
+             (get @schema-publications (:cache-key generation)))
+  :native-schema-publication-unconfirmed))
+(defn- release-native-schema-publications! [generation]
+ (when-not (= :native-retired (:status (native-retirement-outcome generation)))
+  (refuse! :native-schema-publication-retirement-proof-required {}))
+ (when (native-schema-publication-retirement-blocker generation)
+  (refuse! :native-schema-publication-unconfirmed {}))
+ (when (contains? @schema-publications (:cache-key generation))
+  (BeamLisp.Env/with_generation_lock :schema-publication-receipt-capacity
+   (fn []
+    (swap! schema-publications update (:cache-key generation)
+    #(mapv (fn [receipt]
+             (if (= (:scope generation) (get-in receipt [:graph :scope]))
+              (do (when-not (= :published (:state receipt))
+                    (refuse! :native-schema-publication-unconfirmed {}))
+                  {:ticket (:ticket receipt) :state :retired
+                   :graph-identity (erlang/term_to_binary (retirement-identity generation))})
+              receipt)) %))))) :released)
+
+(defn- retirement-module-md5 [module]
+ ;; Inspect actual loaded code; never load a missing module from the code path.
+ (when (erlang/module_loaded module)
+  (erlang/apply module :module_info (list :md5))))
+
+(defn- reserve-native-retirement! [generation modules]
+ ;; Called only under the sorted full native module locks, after exact private
+ ;; preparation attestation. Capture actual code BEFORE irreversible deletion.
+ (let [key (retirement-key generation) identity (retirement-identity generation)
+       live-names (vec (sort (vals (:mapping generation))))
+       prior (get @native-retirements key)]
+  (if prior
+   (do
+    (when-not (and (= identity (:identity prior))
+                  (= :reserved (:phase prior)) (= false (:native-retired prior))
+                  (= (vec modules) (mapv first (:module-md5s prior))))
+     (refuse! :unattested-retirement-outcome {}))
+    ;; Missing code is only a partial-attempt observation anchored to THIS
+    ;; private reservation. Loaded code must still match the original snapshot.
+    ;; Neither observation issues proof: retry must get actual native true.
+    (doseq [[module expected] (:module-md5s prior)]
+     (when-let [actual (retirement-module-md5 module)]
+      (when-not (= expected actual)
+       (refuse! :native-retirement-code-changed {:module module}))))
+    prior)
+   (let [module-md5s
+          (mapv (fn [module]
+                  (let [actual (retirement-module-md5 module)]
+                   (when-not actual
+                    (refuse! :missing-native-retirement-module {:module module}))
+                   [module actual])) modules)
+         record {:identity identity :native-retired false :phase :reserved :pending []
+                 :live-names live-names :module-md5s module-md5s}]
+    (swap! native-retirements
+     (fn [all]
+      (when (>= (count all) 256) (refuse! :retirement-outcome-capacity {}))
+      (assoc all key record)))
+    record))))
+
+(defn- attempt-native-retirement! [generation]
+ ;; Cache/admission lock is already held. Env locks are sorted and reentrant,
+ ;; so its full native retirement runs inside this same identity-check extent.
+ (let [modules (to-list (sort (:modules generation)))]
+  (BeamLisp.Env/with_module_locks modules
+   (fn []
+    (attested-prepared! generation true)
+    (reserve-native-retirement! generation modules)
+    (if (= true (BeamLisp.Env/retire_modules! modules))
+     (do
+      ;; ONLY this actual native-success edge issues the proof. No application
+      ;; callback, reachable Atom, module absence or caller-supplied receipt.
+      (swap! native-retirements update (retirement-key generation) assoc
+        :native-retired true :phase :cleanup-pending
+        :pending [:queue-root :conn-retention :scope])
+      true)
+     false)))))
+
+(defn- conn-retirement [generation]
+ ;; Optional exact SDK producer receipt; no supplied callback or eager import.
+ (when (env/with-env :global #(BeamLisp.Env/loaded_ns? "reload.conn-retention"))
+  (let [f (env/with-env :global
+            #(BeamLisp.AOT/sdk_named_constructor! "reload.conn-retention" "release-retired!" 1))]
+   (f generation))))
+
+(defn- retirement-step! [generation stage action]
+ (let [key (retirement-key generation)]
+  (if-not (some #(= stage %) (:pending (get @native-retirements key))) true
+   (let [result (action)]
+    (if (or (= :waiting result) (= :waiting (:status result))) false
+     (do (when-not (or (nil? result) (contains? #{:ok :released :absent :destroyed} result))
+           (refuse! :unclassified-retirement-cleanup {}))
+      (swap! native-retirements update key
+        (fn [record] (update record :pending (fn [steps] (vec (remove #(= stage %) steps))))))
+      true))))))
+
+(defn- finish-native-retirement! [generation]
+ (let [key (retirement-key generation)]
+  (try
+   ;; Recover the interruption between private native success and public
+   ;; admission closure using only the original matching preparation's state.
+   (when-let [original (get @prepared (:cache-key generation))]
+    (when (= (:scope original) (:scope generation))
+     (swap! (:state original) assoc :retired true)))
+   (if-not
+    (and (do (release-native-schema-publications! generation) true)
+         (retirement-step! generation :queue-root
+           #(queue-root-retirement generation "release-retired!"))
+         (retirement-step! generation :conn-retention #(conn-retirement generation))
+         (retirement-step! generation :scope #(do (env/destroy (:scope generation)) :destroyed)))
+    {:status :waiting :reason :resource-retirement-pending}
+    (do
+     ;; All fixed SDK cleanup acknowledged. Removing the original preparation
+     ;; and its mutable state cannot erase the compact native outcome.
+     (swap! prepared
+       (fn [all]
+        ;; If the caller lost its reply after deletion, another preparation may
+        ;; now occupy this reusable plan key. Never delete that newer instance.
+        (if (erlang/== generation (get all (:cache-key generation)))
+         (dissoc all (:cache-key generation)) all)))
+     (swap! reload/live-generations
+       (fn [m] (reduce dissoc m (:live-names (get @native-retirements key)))))
+     (swap! native-retirements update key
+       (fn [record] (dissoc (assoc record :phase :complete :pending []) :live-names :module-md5s)))
+     {:status :retired}))
+   (catch _
+    ;; Native code is already gone; never authorize new graph execution or
+    ;; silently discard unknown resource custody. Retry fixed steps later.
+    (swap! native-retirements update key assoc :phase :cleanup-pending)
+    {:status :waiting :reason :resource-retirement-uncertain}))))
+
 (defn retire!
- "Retire an unserved graph with no retained registrations. Native soft
-  retirement still checks actual executing code leases. Unknown obligations
-  outside this managed graph must be ruled out by the deployment coordinator."
+ "Native graph retirement followed by retryable fixed SDK resource cleanup.
+  Actual private native success, never graph.state :retired, authorizes release.
+  No resource retention ticket creates an extra code lease or blocks native
+  retirement. Failed cleanup keeps prepared identity/custody for explicit retry."
  [generation]
  (with-lock (:cache-key generation)
   (fn []
-   (let [status (evidence generation)]
+   (let [outcome (native-retirement-outcome generation)]
     (cond
-     (:retired status) {:status :already-retired}
-     (or (pos? (:serving-slots status)) (pos? (:registrations status)))
-      (assoc status :status :waiting)
+     (= :complete (:phase outcome)) {:status :already-retired}
+     outcome (finish-native-retirement! generation)
      :else
-      (if (= true (BeamLisp.Env/retire_modules! (to-list (:modules generation))))
-       (do (swap! (:state generation) assoc :retired true)
-           (env/destroy (:scope generation))
-           (swap! prepared dissoc (:cache-key generation))
-           (swap! reload/live-generations
-            (fn [m] (reduce dissoc m (vals (:mapping generation)))))
-           {:status :retired})
-       {:status :waiting :reason :executing-code}))))))
+      (do
+       (attested-prepared! generation true)
+       (let [status (evidence generation)
+             root-blocker (queue-root-retirement generation "retirement-blocker")]
+        (cond
+         (native-schema-publication-retirement-blocker generation)
+          (assoc status :status :waiting :reason :native-schema-publication-unconfirmed)
+         root-blocker (assoc status :status :waiting :reason root-blocker)
+         (or (pos? (:serving-slots status)) (pos? (:registrations status)))
+          (assoc status :status :waiting)
+         :else
+          (do
+           (if (attempt-native-retirement! generation)
+            (do
+             (swap! (:state generation) assoc :retired true)
+             (finish-native-retirement! generation))
+            {:status :waiting :reason :executing-code}))))))))))
 
 (defn with-retirement-fence!
  "Hold graph admission while a trusted coordinator checks durable producer

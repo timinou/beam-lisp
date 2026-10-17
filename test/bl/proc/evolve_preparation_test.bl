@@ -1,0 +1,131 @@
+(ns proc.evolve-preparation-test
+ (:require [proc.evolve :as ev] [proc.server :as ps]))
+(defn first-spec []
+ {:version 1 :digest "prepared-v1" :accept? (fn [m] (contains? #{:inc :read} m))
+  :check-state (fn [s] (and (int? s) (>= s 0)))
+  :handler (fn [m s] (let [n (if (= :inc m) (inc s) s)] {:reply n :state n}))})
+(defn second-spec []
+ {:version 2 :digest "prepared-v2" :accept? (fn [m] (and (map? m) (int? (:amount m))))
+  :check-state (fn [s] (and (map? s) (int? (:count s)) (>= (:count s) 0)))
+  :migrate-state (fn [s] {:count s})
+  :upcast (fn [m] (case m :inc {:amount 1} :read {:amount 0} m))
+  :handler (fn [m s] (let [n (+ (:count s) (:amount m))] {:reply n :state {:count n}}))})
+
+(deftest lexical-client-dependencies-drain-without-distributed-request-locks
+ (let [p (ev/start! (first-spec) 0 {:managed true}) ran (atom false)]
+  (try
+   (is (= 1 (ev/with-client! p 1 #(ev/call-client! p % :inc))))
+   (is (= 0 (:clients (ev/status p))))
+   (is (try (ev/with-client! p 1 (fn [_] (throw (ex-info "caller failed" {})))) false (catch _ true)))
+   (is (= 0 (:clients (ev/status p))))
+   (ev/fence-version! p 1)
+   (is (= :version-fenced (:kind (ev/with-client! p 1 (fn [_] (reset! ran true))))))
+   (is (not @ran))
+   (finally (GenServer/stop p)))))
+
+(deftest synchronous-managed-request-admission-is-one-fifo-turn-with-native-fences
+ (let [p (ev/start! (first-spec) 0 {:managed true}) parent (erlang/self)
+       request (erlang/alias) fence (erlang/alias)]
+  (try
+   (is (= 1 (ev/request! p 1 :inc)))
+   (is (= 0 (:clients (ev/status p))))
+   (is (= :applied (:status (ev/upgrade! p 1 (second-spec)))))
+   (is (= 2 (ev/request! p 1 :inc)))
+   (erlang/send p (tuple :"$gen_call" (tuple parent request) [:proc.evolve/request 1 :inc]))
+   (erlang/send p (tuple :"$gen_call" (tuple parent fence) [:proc.evolve/fence 1]))
+   (is (= 3 (receive [tag result] :when (= tag request) result (after 5000 :timeout))))
+   (is (= :fenced (:status (receive [tag result] :when (= tag fence) result (after 5000 :timeout)))))
+   (is (= :version-fenced (:kind (ev/request! p 1 :inc))))
+   (is (= 3 (ev/request! p 2 {:amount 0})))
+   (is (= :retired (:status (ev/retire! p 2 1))))
+   (is (= :unsupported-version (:kind (ev/request! p 1 :inc))))
+   (finally (erlang/unalias request) (erlang/unalias fence) (GenServer/stop p)))))
+
+(deftest exact-candidate-publication-is-idempotent-and-never-runs-a-handler-in-rehearsal
+ (let [calls (atom 0) base (first-spec)
+       candidate (assoc (second-spec) :handler
+                    (fn [m s] (swap! calls inc) {:reply (+ (:count s) (:amount m))
+                                              :state {:count (+ (:count s) (:amount m))}}))
+       p (ev/start! base 4)]
+  (try
+   (is (= :unknown-preparation (:kind (ev/cancel-upgrade! p nil))))
+   (let [before (ev/status p)
+         prepared (ev/prepare-upgrade! p 1 candidate [{:version 1 :message :inc} {:version 1 :message :read}])]
+    (is (= :prepared (:status prepared)))
+    (is (= 2 (:messages prepared)))
+    (is (= 0 @calls))
+    (is (= (:revision before) (:revision (ev/status p))))
+    (is (:prepared? (ev/status p)))
+    (is (= :applied (:status (ev/commit-upgrade! p (:ticket prepared)))))
+    (is (not (:prepared? (ev/status p))))
+    (is (= 5 (ev/call! p 1 :inc)))
+    (is (= :already-applied (:status (ev/commit-upgrade! p (:ticket prepared)))))
+    (is (= 1 @calls))
+    (is (= p (:pid (ev/status p)))))
+   (finally (GenServer/stop p)))))
+
+(deftest intervening-work-refuses-stale-preparation-and-preserves-the-accepted-write
+ (let [p (ev/start! (first-spec) 0)]
+  (try
+   (let [prepared (ev/prepare-upgrade! p 1 (second-spec))]
+    (is (= 1 (ev/call! p 1 :inc)))
+    (is (= :stale-preparation (:kind (ev/commit-upgrade! p (:ticket prepared)))))
+    (is (not (:prepared? (ev/status p))))
+    (is (= 1 (:version (ev/status p))))
+    (is (= 1 (ev/call! p 1 :read)))
+    (is (= :unknown-preparation (:kind (ev/commit-upgrade! p (:ticket prepared))))))
+   (finally (GenServer/stop p)))))
+
+(deftest wrong-message-or-state-conversion-refuses-before-publication
+ (let [p (ev/start! (first-spec) 3)]
+  (try
+   (doseq [candidate [(assoc (second-spec) :upcast (fn [_] :wrong))
+                     (assoc (second-spec) :migrate-state (fn [_] {:count -1}))]]
+    (is (= :refused (:status (ev/prepare-upgrade! p 1 candidate [{:version 1 :message :inc}]))))
+    (is (= 1 (:version (ev/status p))))
+    (is (not (:prepared? (ev/status p)))))
+   (is (= 3 (ev/call! p 1 :read)))
+   (is (= :invalid-message-samples (:kind (ev/prepare-upgrade! p 1 (second-spec) [{}]))))
+   (is (= :invalid-message-samples (:kind (ev/prepare-upgrade! p 1 (second-spec) (vec (repeat 257 {:version 1 :message :inc}))))))
+   (finally (GenServer/stop p)))))
+
+(deftest preparations-are-owner-local-bounded-and-cancellable
+ (let [a (ev/start! (first-spec) 1) b (ev/start! (first-spec) 2)]
+  (try
+   (let [first (ev/prepare-upgrade! a 1 (second-spec))
+         ;; Same metadata is insufficient: the actual retained callbacks win.
+         second (ev/prepare-upgrade! a 1 (assoc (second-spec) :migrate-state (fn [_] {:count 99}))) ]
+    (is (= :unknown-preparation (:kind (ev/commit-upgrade! b (:ticket second)))))
+    (is (= :unknown-preparation (:kind (ev/commit-upgrade! a (:ticket first)))))
+    (is (= :applied (:status (ev/commit-upgrade! a (:ticket second)))))
+    (is (= 99 (ev/call! a 1 :read))))
+   (let [p (ev/prepare-upgrade! b 1 (second-spec))]
+    (is (= :cancelled (:status (ev/cancel-upgrade! b (:ticket p)))))
+    (is (= :unknown-preparation (:kind (ev/commit-upgrade! b (:ticket p)))))
+    (is (not (:prepared? (ev/status b)))))
+   (finally (GenServer/stop a) (GenServer/stop b)))))
+
+(ps/defserver composed
+ (evolve {:spec (first-spec) :state 0 :managed true})
+ (handle-call :ordinary [_ state] (reply :ordinary state)))
+(deftest composed-owner-supports-the-same-native-preparation-protocol
+ (let [p (start-link composed) client (:token (ev/acquire-client! p 1))]
+  (try
+   (let [prepared (ev/prepare-upgrade! p 1 (second-spec) [{:version 1 :message :inc}])]
+    (is (= :prepared (:status prepared)))
+    (is (= :applied (:status (ev/commit-upgrade! p (:ticket prepared)))))
+    (is (= 1 (ev/call-client! p client :inc)))
+    (is (= 2 (ev/request! p 1 :inc)))
+    (is (= :ordinary (GenServer/call p :ordinary))))
+   (finally (ev/release-client! p client) (GenServer/stop p)))))
+
+(deftest rejected-and-expired-preparations-never-overwrite-a-valid-one
+ (let [p (ev/start! (first-spec) 2 {:upgrade-ms 10})]
+  (try
+   (let [valid (ev/prepare-upgrade! p 1 (second-spec))]
+    (is (= :identity-conflict (:kind (ev/prepare-upgrade! p 1 (first-spec)))))
+    (is (= :rehearsal-deadline (:kind (ev/prepare-upgrade! p 1
+                   (assoc (second-spec) :migrate-state (fn [s] (Process/sleep 100) {:count s}))))))
+    (is (= :applied (:status (ev/commit-upgrade! p (:ticket valid)))))
+    (is (= 2 (ev/call! p 1 :read))))
+   (finally (GenServer/stop p)))))

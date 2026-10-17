@@ -11,13 +11,20 @@
   descriptors contain :pid/:expected/:spec and explicit :queues dependencies.
   :adoption per queue is absent (drain exact old handler) or a declared payload
   migration {:digest :protocol :upcast :accept?}. No failed jobs are retried.
-  The coordinator reconstructs this plan from the sealed artifact after restart."
+  Prepared owner grants are VM-local. Restart never replays an unknown conversion;
+  a new plan requires actual native-owner outcome reconciliation."
  [spec]
  (when (> (+ (count (:queues spec {})) (count (:owners spec {}))) 128)
   (refuse :transition-inventory-too-large))
+ (let [grants (atom []) family-handlers (atom {})]
+ (try
  (let [generation (Process/get :bl_generation) digest (:digest generation)
-       _ (when-not (and (string? digest) (seq digest)) (refuse :sealed-generation-required))
-       queues (into {} (map (fn [[srv descriptor]]
+       _ (when-not (and (BeamLisp.Env/executing_generation? generation) (string? digest) (seq digest)) (refuse :sealed-generation-required))
+       automatic (runtime/family-handlers generation)
+       _ (reset! family-handlers automatic)
+       _ (when (> (+ (count automatic) (count (:queues spec {})) (count (:owners spec {}))) 128)
+           (refuse :transition-inventory-too-large))
+       queues-explicit (into {} (map (fn [[srv descriptor]]
                         (when-not (runtime/ready? srv) (refuse :owner-transition-authority-required))
                         (let [old (:expected-generation descriptor (:previous-generation spec))
                               now (:generation (runtime/status srv))
@@ -35,9 +42,16 @@
                           (refuse :previous-generation-required))
                          [(:server handler) {:expected old :handler handler :adoption (:adoption descriptor)}]))
                        (:queues spec {})))
+       _ (when (some #(contains? automatic %) (keys queues-explicit))
+           (refuse :duplicate-native-family-transition))
+       queues (merge automatic queues-explicit)
        owners (into {} (map (fn [[id descriptor]]
-                        (let [_ (when-not (evolve/owner? (:pid descriptor)) (refuse :owner-transition-authority-required))
-                              state (evolve/status (:pid descriptor))]
+                        (let [native (evolve/owner-evidence (:pid descriptor))
+                              _ (when-not (and native (= (:application-id generation) (:application-id native)))
+                                  (refuse :owner-transition-application-mismatch))
+                              state (evolve/status (:pid descriptor))
+                              grant (BeamLisp.Env/begin_owner_transition! (:pid descriptor))
+                              _ (swap! grants conj grant)]
                          (when-not (and (:managed state)
                                         (or (= (:expected descriptor) (:version state))
                                             (and (= (get-in descriptor [:spec :version]) (:version state))
@@ -47,12 +61,18 @@
                          (doseq [[key arity] [[:handler 2] [:check-state 1] [:accept? 1] [:migrate-state 1] [:upcast 1]]]
                           (when-not (erlang/is_function (get-in descriptor [:spec key]) arity)
                            (refuse :invalid-owner-callback)))
-                         [id (update (update descriptor :queues #(mapv queue/resolve-server %)) :spec
+                         [id (assoc (update (update descriptor :queues #(mapv queue/resolve-server %)) :spec
                                #(update (evolve/prepare-spec %) :modules (fn [modules]
-                                   (vec (distinct (concat modules (:modules generation [])))))))])) (:owners spec {})))
+                                   (vec (distinct (concat modules (:modules generation []))))))) :grant grant)])) (:owners spec {})))
        lease (BeamLisp.Env/retain_code! (to-list (distinct (concat (:modules generation [])
                                       (mapcat (fn [entry] (get-in entry [:handler :modules])) (vals queues))))))]
-  {:generation digest :queues queues :owners owners :lease lease :closed (atom false)}))
+  {:generation digest :queues queues :owners owners :lease lease :closed (atom false)
+   :owner-receipts (atom {})})
+ (catch error
+  (doseq [[_ entry] @family-handlers]
+   (runtime/discard-prepared-handler! (:handler entry)))
+  (doseq [grant @grants] (try (BeamLisp.Env/abandon_owner_transition! grant) (catch _ nil)))
+  (throw error)))))
 
 (defn- live! [plan] (when @(:closed plan) (refuse :closed-transition)))
 (defn- inventory-proof [c database]
@@ -138,7 +158,12 @@
         (let [row (try
                     (if (= kind :queue)
                      (queue-validation id entry {:limit left :ms remaining :after queues})
-                     (evolve/rehearse! (:pid entry) (:expected entry) (:spec entry) remaining))
+                     (let [prior (evolve/transition-status (:pid entry) (:grant entry))
+                           prepared (if (contains? #{:prepared :applied} (:status prior)) prior
+                                      (evolve/prepare-transition! (:pid entry) (:grant entry) (:expected entry) (:spec entry)))
+                           row (if (contains? #{:prepared :applied} (:status prepared))
+                                 (assoc prepared :status :valid) prepared)]
+                      (swap! (:owner-receipts plan) assoc id row) row))
                     (catch e {:status :refused :kind (or (:kind (ex-data e)) :rehearsal-failed)}))
               cost (if (= kind :queue) (max 1 (:scanned row 0)) 1)
               after-turn (if (= kind :queue)
@@ -167,8 +192,10 @@
                           {:status (if (same-inventory? (get-in receipt [:queues srv]) proof) :current :stale)})))))]) (:queues plan)))
        owners (into {} (map (fn [[id entry]]
                      [id (if-not (evolve/owner? (:pid entry)) {:status :stale}
-                       (let [state (evolve/status (:pid entry)) observed (get-in receipt [:owners id])]
-                        {:status (if (and (= (:version state) (:version observed))
+                       (let [state (evolve/transition-status (:pid entry) (:grant entry))
+                             observed (get-in receipt [:owners id])]
+                        {:status (if (and (contains? #{:prepared :applied} (:status state))
+                                          (= (:version state) (:version observed))
                                           (= (:revision state 0) (:revision observed))) :current :stale)}))]) (:owners plan)))
        current? (every? #(= :current (:status %)) (concat (vals queues) (vals owners)))]
   {:status (if current? :current :stale) :generation (:generation plan) :queues queues :owners owners}))
@@ -176,7 +203,8 @@
 (defn activate!
  "FIFO publication inside each native owner, idempotent across partial batches.
   This does not claim a multi-actor atomic commit. The deployment journal stores
-  intent before calling and recovers by replaying the exact sealed plan."
+  intent before calling and reconciles the exact last committed native ticket;
+  conversion callbacks are never rerun to recover a lost acknowledgment."
  [plan]
  (live! plan)
  (let [queues (into {} (map (fn [[srv entry]]
@@ -185,7 +213,7 @@
                          (doseq [srv (:queues entry [])]
                           (let [r (evolve/bind-queue! (:pid entry) srv)]
                            (when-not (= :bound (:status r)) (refuse :owner-dependency-refused))))
-                         [id (evolve/upgrade! (:pid entry) (:expected entry) (:spec entry))]) (:owners plan)))
+                         [id (evolve/commit-transition! (:pid entry) (:grant entry))]) (:owners plan)))
        successful? (fn [r] (contains? #{:applied :already-applied} (:status r)))]
   {:status (if (every? successful? (concat (vals queues) (vals owners))) :applied :blocked)
    :queues queues :owners owners}))
@@ -233,5 +261,15 @@
  "Release preparation's native code lease; runtime owners retain published
   callbacks independently. Closing never cancels accepted durable jobs."
  [plan]
- (when (compare-and-set! (:closed plan) false true) (BeamLisp.Env/release_code! (:lease plan)))
+ (when (compare-and-set! (:closed plan) false true)
+  (doseq [[_ entry] (:owners plan)]
+   (try
+    (let [status (evolve/transition-status (:pid entry) (:grant entry))]
+     (if (= :prepared (:status status))
+      (evolve/cancel-transition! (:pid entry) (:grant entry))
+      (when-not (= :applied (:status status)) (BeamLisp.Env/abandon_owner_transition! (:grant entry)))))
+    ;; Uncertain accepted outcomes remain held; close does not make retry safe.
+    (catch _ nil)))
+  (doseq [[_ entry] (:queues plan)] (runtime/discard-prepared-handler! (:handler entry)))
+  (BeamLisp.Env/release_code! (:lease plan)))
  :closed)

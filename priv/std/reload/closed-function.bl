@@ -1,0 +1,106 @@
+; Exact closed callable constructors,not arbitrary expression evaluation.
+(ns reload.closed-function (:require [system.ir :as ir] [data.first-order :as data]))
+(defn- refuse! [reason]
+ (throw (ex-info "Executable declaration requires a closed function constructor"
+                 {:kind :dynamic-executable-registration :reason reason})))
+
+(defn- inner-function [node]
+ (cond
+  (= :fn (:op node)) node
+  (ir/self-scaffold? node)
+   (let [outer (:init node) clause (first (:clauses outer)) body (:body node)
+         self (first (:pats clause)) args (:args body) inner (:body clause)]
+    (when-not (and (nil? (:guard clause)) (= :pvar (:pop self))
+                   (= 1 (count args)) (= :var (:op (first args)))
+                   (= (:name node) (:name (first args))) (= :fn (:op inner)))
+     (refuse! :unproved-function-constructor))
+    inner)
+  :else (refuse! :unproved-function-constructor)))
+
+(defn- function-arity [node]
+ (let [inner (inner-function node) clauses (:clauses inner)
+       arities (set (map #(count (:pats %)) clauses))]
+  (when-not (and (seq clauses) (= 1 (count arities))) (refuse! :unproved-function-constructor))
+  (first arities)))
+
+(defn- constructor-signature! [node]
+ (if (ir/blfn-value? node)
+  (let [[_ fixed variadic] (:elems node)]
+   (when-not (= :map (:op fixed)) (refuse! :unproved-function-constructor))
+   (let [arities (mapv (fn [[key value]]
+                        (when-not (and (= :lit (:op key)) (erlang/is_integer (:val key))
+                                       (<= 0 (:val key) 255) (= (:val key) (function-arity value)))
+                         (refuse! :unproved-function-constructor)) (:val key)) (:pairs fixed))
+         minimum (when-not (and (= :lit (:op variadic)) (nil? (:val variadic)))
+                   (when-not (and (= :tuple (:op variadic)) (= 2 (count (:elems variadic))))
+                    (refuse! :unproved-function-constructor))
+                   (let [[key value] (:elems variadic)]
+                    (when-not (and (= :lit (:op key)) (erlang/is_integer (:val key))
+                                   (<= 0 (:val key) 254) (= (inc (:val key)) (function-arity value)))
+                     (refuse! :unproved-function-constructor)) (:val key)))]
+    (when-not (= (count arities) (count (set arities))) (refuse! :duplicate-callable-arm))
+    (cond-> {:arities (set arities)} (some? minimum) (assoc :variadic-min minimum))))
+  {:arities #{(function-arity node)}}))
+
+(defn- prove-closed! [expression]
+ (let [left (atom 100000)]
+  (letfn [(clause! [clause bound depth]
+           (let [bound (into bound (ir/clause-pattern-vars clause))]
+            (when (:guard clause) (walk (:guard clause) bound (inc depth)))
+            (walk (:body clause) bound (inc depth))))
+          (walk [node bound depth]
+           (when (or (> depth 256) (neg? (swap! left dec))) (refuse! :closed-function-analysis-budget))
+           (when-not (ir/node? node) (refuse! :unknown-compiled-function-node))
+           (case (:op node)
+            :var (when-not (contains? bound (:name node)) (refuse! :captured-lexical-environment))
+            :lit (try (data/check! (:val node) {:max-nodes 100000 :max-depth 64 :max-bytes 1048576})
+                   (catch _ (refuse! :opaque-function-literal)))
+            :global nil
+            :enil nil
+            :let (do (walk (:init node) bound (inc depth))
+                     (walk (:body node) (conj bound (:name node)) (inc depth)))
+            :fn (doseq [clause (:clauses node)] (clause! clause bound (inc depth)))
+            :case (do (walk (:subj node) bound (inc depth))
+                      (doseq [clause (:clauses node)] (clause! clause bound (inc depth))))
+            :try (do (walk (:body node) bound (inc depth))
+                     (doseq [clause (:catch node)] (clause! clause bound (inc depth)))
+                     (when (:after node) (walk (:after node) bound (inc depth))))
+            :recv (do (doseq [clause (:clauses node)] (clause! clause bound (inc depth)))
+                      (when (:timeout node) (walk (:timeout node) bound (inc depth)))
+                      (when (:after node) (walk (:after node) bound (inc depth))))
+            (if (contains? #{:remote :apply :arith :if :do :tuple :map :cons :struct} (:op node))
+             (doseq [child (ir/child-nodes node)] (walk child bound (inc depth)))
+             (refuse! :unknown-compiled-function-node))))]
+   (walk expression #{} 0))))
+
+(defn declaration
+ "Build named compiler-owned wrappers after exact constructor/free-variable
+  proof. Does not evaluate the candidate constructor or its delayed body. The
+  fixed Link owner installs returned entries in its private candidate scope."
+ [name expression]
+ (let [signature (constructor-signature! expression)]
+  (prove-closed! expression)
+  (let [fixed (mapv
+               (fn [arity]
+                (let [fname (erlang/binary_to_atom name)
+                      names (mapv #(str "declared_argument_" %) (range arity))
+                      params (to-list (mapv #(hash-map :pop :pvar :name %) names))
+                      args (to-list (mapv #(hash-map :op :var :name % :ann {}) names))]
+                 (tuple :fixed arity fname
+                   {:op :defn-clause :fname fname :params params :guard nil :ann {}
+                    :body {:op :apply :fn expression :args args :ann {}}})))
+               (sort (:arities signature)))
+        variadic (when (some? (:variadic-min signature))
+                  (let [minimum (:variadic-min signature)
+                        fname (erlang/binary_to_atom (str name "__bl_v"))
+                        names (mapv #(str "declared_argument_" %) (range minimum))
+                        rest-name "declared_remaining_arguments"
+                        params (to-list (mapv #(hash-map :pop :pvar :name %) (conj names rest-name)))
+                        args (reduce (fn [tail name]
+                                       {:op :cons :head {:op :var :name name :ann {}} :tail tail :ann {}})
+                                     {:op :var :name rest-name :ann {}} (reverse names))]
+                   (tuple :variadic minimum fname
+                    {:op :defn-clause :fname fname :params params :guard nil :ann {}
+                     :body {:op :remote :mod :Elixir.BeamLisp.Ns.Rt :fun :invoke
+                            :args (list expression args) :ann {}}})))]
+   {:signature signature :entries (to-list (cond-> fixed variadic (conj variadic)))})))

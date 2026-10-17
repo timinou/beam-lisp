@@ -1,0 +1,171 @@
+(ns proc.queue-owner-lifetime-test
+ (:require [proc.queue-runtime :as runtime] [proc.queue :as queue]
+           [proc.framework :as framework] [proc.owner-registry :as owners]
+           [proc.inventory :as inventory] [reload.generation :as generation]
+           [reload.state :as state] [datom :as d] [datom.conn :as dc]))
+(defn- await [predicate]
+ (loop [left 1500]
+  (cond (predicate) true (zero? left) false
+        :else (do (Process/sleep 5) (recur (dec left))))))
+(def SOURCE
+ "(ns queue.lifetime (:require [proc.queue-runtime :as runtime] [reload.state :as state]))
+  (defn handler []
+   (runtime/prepare :imports
+    {:declaration {:of :lifetime/work :protocol 1 :unique [:test/id]}
+     :contract {:accept? (fn [payload] (and (map? payload) (string? (:test/id payload))))}
+     :perform (fn [job]
+      {:value (:test/id job) :generation (:digest (Process/get :bl_generation))
+       :instance (state/get :lifetime/instance)})}))")
+(defn- graph [app n]
+ (generation/prepare! {:application-id app :fixed-runtime true :protocols {:imports 1}
+   :resources {:fixture-version n} :native-modules #{"Process"}
+   :stable-namespaces #{"proc.queue-runtime" "reload.state"}
+   :sources {"queue.lifetime" SOURCE}}))
+(defn- handler [g] (generation/invoke! g "queue.lifetime/handler" []))
+(defn- wait-job [c id target]
+ (await #(= target (:job/state (d/entity (d/db c) id)))))
+
+(deftest stable-sdk-queue-retains-old-pending-handler-then-retires-old-graph-at-the-same-pid
+ (let [app "queue-stable-owner" old (graph app 1) fresh (graph app 2)
+       c (d/connect []) p (atom nil)]
+  (try
+   (generation/with! old #(state/bind! {:lifetime/instance (atom :same-instance)}))
+   (generation/inherit-runtime! fresh old)
+   (let [a (handler old) b (handler fresh) srv (:server a)]
+    (queue/attach-store! srv c)
+    ;; Starting outside the selected graph must still convey the exact handler
+    ;; graph BEFORE native Server init, then explicitly adopt the initializer.
+    (reset! p (runtime/start! a))
+    (let [before (runtime/owner-evidence srv)
+          native (framework/owner-evidence @p)
+          raw (erlang/apply :sys :get_state (list @p))
+          old-handler (get-in raw [:queue :handlers (:digest old)])
+          pending (generation/with! old
+                    #(queue/enqueue! :imports {:test/id "old"} {:in [3600 :seconds]}))]
+     (is (= :framework (:kind native)))
+     (is (= app (:application-id native)))
+     (is (= (:ticket native) (:ticket before)))
+     (is (= (:membership (BeamLisp.Env/framework_owner_evidence @p))
+            (:owner-parent (elem (first (ets/lookup owners/INDEX (tuple app @p :queue))) 1))))
+     (is (= nil (Keyword/get (elem (Process/info @p :dictionary) 1) :bl_generation)))
+     (is (= :valid (:status (inventory/snapshot app))))
+     (is (= :applied (:status (runtime/activate! srv (:digest old) b))))
+     (is (= before (runtime/owner-evidence srv)))
+     (is (= :valid (:status (inventory/snapshot app))))
+     (is (= :waiting (:status (runtime/retire! srv (:digest old)))))
+     (is (not= :retired (:status (generation/retire! old))))
+     ;; Old pending work is claimed by the same SDK actor after activation but
+     ;; its contract/body/runtime cell run in the exact old captured context.
+     (d/transact! c [[:db/add (:db/id pending) :job/at (System/system_time :millisecond)]])
+     (is (wait-job c (:db/id pending) :done))
+     (is (= {:value "old" :generation (:digest old) :instance :same-instance}
+            (:job/result (d/entity (d/db c) (:db/id pending)))))
+     (is (= :retired (:status (runtime/retire! srv (:digest old)))))
+     (is (= :cancelled (BeamLisp.Env/run_code! (:lease old-handler) (fn [] :wrongly-live))))
+     (is (await #(= :retired (:status (generation/retire! old)))))
+     (is (= before (runtime/owner-evidence srv)))
+     (is (= :valid (:status (inventory/snapshot app))))
+     (let [new (generation/with! fresh #(queue/enqueue! :imports {:test/id "new"}))]
+      (is (wait-job c (:db/id new) :done))
+      (is (= {:value "new" :generation (:digest fresh) :instance :same-instance}
+             (:job/result (d/entity (d/db c) (:db/id new))))))
+     (is (= nil (Keyword/get (elem (Process/info @p :dictionary) 1) :bl_generation)))
+     (is (Process/alive? @p))))
+   (finally
+    (when (and @p (Process/alive? @p)) (GenServer/stop @p))
+    (d/close! c) (generation/retire! old) (generation/retire! fresh)))))
+
+(deftest queue-handler-retirement-cannot-cross-a-paused-writer-admission
+ (let [app "queue-writer-retirement" old (graph app 1) fresh (graph app 2)
+       c (d/connect []) p (atom nil) caller (atom nil) retiring (atom nil)
+       parent (erlang/self) ticket (erlang/make_ref) accepted (atom nil) retired (atom nil)
+       slot (generation/slot)]
+  (try
+   (generation/with! old #(state/bind! {:lifetime/instance (atom :barrier)}))
+   (generation/inherit-runtime! fresh old)
+   (let [a (handler old) b (handler fresh) srv (:server a)]
+    (queue/attach-store! srv c)
+    (reset! p (runtime/start! a))
+    (is (= :applied (:status (generation/publish! slot nil old))))
+    (is (= :applied (:status (runtime/activate! srv (:digest old) b))))
+    (let [held (get-in (erlang/apply :sys :get_state (list @p)) [:queue :handlers (:digest old)])]
+     (reset! caller
+      (generation/with! old
+       #(spawn (fn []
+                 (reset! accepted
+                  (dc/serialized! c
+                   (fn []
+                    (erlang/send parent [:writer-selected ticket])
+                    (receive :commit-admission
+                     (queue/enqueue! :imports {:test/id "barrier"} {:in [3600 :seconds]})
+                     (after 10000 (throw (ex-info "Barrier release missing" {})))))))))))
+     (is (= true (receive [:writer-selected seen] :when (= ticket seen) true (after 10000 false))))
+     (reset! retiring (spawn (fn [] (reset! retired (runtime/retire! srv (:digest old))))))
+     (is (await #(pos? (elem (Process/info (:writer c) :message_queue_len) 1))))
+     ;; Slot publication never waits on a writer: retirement queues its durable
+     ;; fence behind accepted admission, while the native handler lease remains.
+     (is (= :applied (:status (generation/publish! slot (:digest old) fresh))))
+     (is (nil? @retired))
+     (is (BeamLisp.Env/code_lease_active? (:lease held)))
+     (erlang/send (:writer c) :commit-admission)
+     (is (await #(some? @accepted)))
+     (is (await #(some? @retired)))
+     (is (= :waiting (:status @retired)))
+     (is (= 1 (:jobs @retired)))
+     (is (BeamLisp.Env/code_lease_active? (:lease held)))
+     (is (= 1 (get-in (queue/generation-inventory srv) [:required-generations (:digest old)])))
+     (is (= 1 (count (d/q '[:find ?e :where [?e :job/id _]] (d/db c)))))
+     (queue/cancel! srv (:job/id @accepted))
+     (is (= :retired (:status (runtime/retire! srv (:digest old)))))
+     (is (= :cancelled (BeamLisp.Env/run_code! (:lease held) (fn [] :wrongly-live))))
+     (is (await #(= :retired (:status (generation/retire! old)))))
+     (is (Process/alive? @p))))
+   (finally
+    (erlang/send (:writer c) :commit-admission)
+    (when @caller (await #(not (Process/alive? @caller))))
+    (when @retiring (await #(not (Process/alive? @retiring))))
+    (when (and @p (Process/alive? @p)) (GenServer/stop @p))
+    (generation/close! slot (generation/selected slot))
+    (d/close! c) (generation/retire! old) (generation/retire! fresh)))))
+
+(deftest shared-sdk-queue-follows-real-initializer-and-refuses-forged-class-or-init-authority
+ (let [app "queue-initializer-lifetime" graph (graph app 1) c (d/connect [])
+       parent (erlang/self) ticket (erlang/make_ref)
+       initializer (spawn (fn []
+                            (generation/with! graph #(state/bind! {:lifetime/instance (atom :live)}))
+                            (erlang/send parent [:queue-initializer-ready ticket])
+                            (receive :finish :ok)))
+       p (atom nil) srv (queue/scoped-server app :imports)
+       global-source "(ns queue.fake.owner) (defserver actor (init [counter] (swap! counter inc) (ok nil)))"
+       counter (atom 0)]
+  (try
+   (is (= true (receive [:queue-initializer-ready seen] :when (= ticket seen) true (after 10000 false))))
+   (queue/attach-store! srv c)
+   (reset! p (runtime/start! (handler graph)))
+   (let [native (BeamLisp.Env/framework_owner_evidence @p)]
+    (is (= initializer (:initializer native)))
+    (erlang/send @p [:DOWN (:monitor native) :process initializer :forged])
+    (is (= (:digest graph) (:generation (runtime/status srv))))
+    (is (= :valid (:status (inventory/snapshot app)))))
+   ;; No caller-supplied owner PID or copied scope can manufacture SDK init.
+   (is (= :framework_adoption_requires_generated_init
+         (generation/with! graph
+          #(try (framework/adopt! initializer) nil
+            (catch error (BeamLisp.ExInfo/ex_original error))))))
+   (BeamLisp.Env/with_env :global #(BeamLisp.Compiler/eval_string global-source))
+   (let [class (BeamLisp.Env/with_env :global #(BeamLisp.Env/fetch_exact! "queue.fake.owner" "actor"))]
+    (is (generation/with! graph #(try (core/start class counter) false (catch _ true))))
+    (is (= 0 @counter))
+    ;; The exact same real class is valid ordinary development code; refusal
+    ;; above came from managed source ownership before init, not invalid syntax.
+    (let [ordinary (core/start class counter)]
+     (try (is (= 1 @counter)) (finally (GenServer/stop ordinary)))))
+   (Process/exit initializer :kill)
+   (is (await #(not (Process/alive? @p))))
+   (is (await #(empty? (:participants (inventory/snapshot app)))))
+   (is (nil? (runtime/owner-evidence srv)))
+   (is (await #(= :retired (:status (generation/retire! graph)))))
+   (finally
+    (when (Process/alive? initializer) (Process/exit initializer :kill))
+    (when (and @p (Process/alive? @p)) (GenServer/stop @p))
+    (d/close! c) (generation/retire! graph)))))

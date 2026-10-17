@@ -1,0 +1,151 @@
+(ns proc.evolve-owner-lifetime-test
+ (:require [proc.evolve :as evolve] [proc.callback :as cb] [proc.framework :as framework]
+           [proc.owner-registry :as owners] [proc.inventory :as inventory]
+           [reload.generation :as generation] [reload.state :as state]))
+
+(defn- await [predicate]
+ (loop [left 1000]
+  (cond (predicate) true (zero? left) false
+        :else (do (Process/sleep 5) (recur (dec left))))))
+(def SOURCE
+ "(ns evolve.business)
+  (defn handler [message state]
+    (let [value (if (= message :inc) (inc state) state)] {:reply value :state value}))
+  (defn accepts [message] (and (erlang/is_atom message) (contains? #{:inc :read} message)))
+  (defn state-valid [state] (int? state))
+  (defn unchanged [value] value)
+  (defn spec [version digest]
+    {:version version :digest digest :handler handler :accept? accepts
+     :check-state state-valid :migrate-state unchanged :upcast unchanged})")
+(def COMPOSED
+ "(ns evolve.container (:require [proc.server :as ps] [proc.evolve :as ev]))
+  (ps/defserver owner
+    (evolve {:spec (:spec start-opts) :state 0 :managed true})
+    (init [opts] (ok {:custom 7}))
+    (handle-call :custom [_ st] (reply (:custom st) st)))")
+(defn- graph [app n composed?]
+ (generation/prepare! {:application-id app :fixed-runtime true
+   :stable-namespaces (if composed? #{"proc.server" "proc.evolve"} #{})
+   :resources {:fixture-version n}
+   :sources (cond-> {"evolve.business" SOURCE}
+              composed? (assoc "evolve.container" COMPOSED))}))
+(defn- spec [g n]
+ (generation/with! g
+  #(evolve/prepare-spec (generation/invoke! g "evolve.business/spec" [n (:digest g)]))))
+(defn- role [app pid]
+ (first (filter #(and (= :evolve (:kind %)) (= pid (:pid %)))
+                (:participants (inventory/snapshot app)))))
+
+(deftest standalone-sdk-evolution-keeps-one-native-owner-capability-across-handler-upgrade-and-old-retirement
+ (let [app "evolve-stable-owner" old (graph app 1 false) fresh (graph app 2 false)
+       p (atom nil)]
+  (try
+   (generation/with! old #(state/bind! {}))
+   (generation/inherit-runtime! fresh old)
+   (reset! p (generation/with! old #(evolve/start! (spec old 1) 0 {:managed true})))
+   (let [before (evolve/owner-evidence @p) native (framework/owner-evidence @p)
+         native-row (BeamLisp.Env/framework_owner_evidence @p)
+         index (elem (first (ets/lookup owners/INDEX (tuple app @p :evolve))) 1)
+         initial-handler (:handler (:current (erlang/apply :sys :get_state (list @p))))]
+    (is (= :framework (:kind native)))
+    (is (= app (:application-id native)))
+    (is (= (erlang/self) (:initializer native)))
+    (is (= (:ticket native) (:ticket before)))
+    (is (= (:membership native-row) (:owner-parent index)))
+    (is (= :valid (:status (inventory/snapshot app))))
+    (is (some? (role app @p)))
+    (is (= 1 (evolve/request! @p 1 :inc)))
+    (is (not= :retired (:status (generation/retire! old))))
+    (is (= :applied (:status (generation/with! fresh #(evolve/upgrade! @p 1 (spec fresh 2))))))
+    (is (= :cancelled (cb/invoke! initial-handler [:read 0])))
+    (is (= before (evolve/owner-evidence @p)))
+    (is (= :valid (:status (inventory/snapshot app))))
+    (is (= (:proof-id index) (:ticket (evolve/owner-evidence @p))))
+    (is (= :managed-evolution-slice (:capability (role app @p))))
+    ;; The old request contract remains leased until its adapter is retired.
+    (is (not= :retired (:status (generation/retire! old))))
+    (is (= 2 (evolve/request! @p 1 :inc)))
+    (is (= :retired (:status (evolve/retire! @p 2 1))))
+    (is (= true (await #(= :retired (:status (generation/retire! old))))))
+    (is (= 2 (evolve/request! @p 2 :read)))
+    (is (= 2 (:version (evolve/status @p))))
+    (is (= :valid (:status (inventory/snapshot app))))
+    (is (= before (evolve/owner-evidence @p)))
+    (let [collector (Process/whereis owners/NAME)]
+     (Process/exit collector :kill)
+     (is (await #(let [current (Process/whereis owners/NAME)] (and current (not= collector current)))))
+     (is (await #(and (= :valid (:status (inventory/snapshot app))) (some? (role app @p))))))
+    (is (= 2 (evolve/request! @p 2 :read))))
+   (finally
+    (when (and @p (Process/alive? @p)) (GenServer/stop @p))
+    (generation/retire! old) (generation/retire! fresh)))))
+
+(deftest a-composed-application-actor-retains-its-whole-containing-graph-after-domain-handler-upgrade
+ (let [app "evolve-composed-owner" old (graph app 1 true) fresh (graph app 2 true)
+       p (atom nil)]
+  (try
+   (generation/with! old #(state/bind! {}))
+   (generation/inherit-runtime! fresh old)
+   (reset! p (generation/with! old
+              #(start (BeamLisp.Env/fetch_exact! (get (:mapping old) "evolve.container") "owner")
+                      {:spec (spec old 1)})))
+   (let [before (evolve/owner-evidence @p)
+         index (elem (first (ets/lookup owners/INDEX (tuple app @p :evolve))) 1)]
+    (is (= :server (:kind (:owner-parent index))))
+    (is (= nil (framework/owner-evidence @p)))
+    (is (= old (Keyword/get (elem (Process/info @p :dictionary) 1) :bl_generation)))
+    (is (= 7 (GenServer/call @p :custom)))
+    (is (= :applied (:status (generation/with! fresh #(evolve/upgrade! @p 1 (spec fresh 2))))))
+    (is (= :retired (:status (evolve/retire! @p 2 1))))
+    (is (= before (evolve/owner-evidence @p)))
+    (is (= :valid (:status (inventory/snapshot app))))
+    (is (not= :retired (:status (generation/retire! old))))
+    (is (= 7 (GenServer/call @p :custom)))
+    (is (= 0 (evolve/request! @p 2 :read)))
+    (GenServer/stop @p)
+    (is (await #(= :retired (:status (generation/retire! old)))))
+    (is (await #(empty? (:participants (inventory/snapshot app))))))
+   (finally
+    (when (and @p (Process/alive? @p)) (GenServer/stop @p))
+    (generation/retire! old) (generation/retire! fresh)))))
+
+(deftest a-derived-role-cannot-be-created-from-an-unowned-caller-or-a-callback-ticket
+ (let [g (graph "evolve-role-negative" 1 false)]
+  (try
+   (is (= :native-owner-capability-required
+         (generation/with! g
+          #(let [callback (cb/register! (fn [] :not-a-native-owner))]
+             (try (owners/register-owned-role! :evolve {:managed true}) nil
+                  (catch error (:kind (ex-data error)))
+                  (finally (cb/unregister! callback)))))))
+   (is (= :invalid-derived-owner-role
+         (try (owners/register-owned-role! :server {}) nil
+              (catch error (:kind (ex-data error))))))
+   (is (nil? (evolve/owner-evidence (erlang/self))))
+   (is (empty? (:participants (inventory/snapshot (:application-id g)))))
+   (finally (generation/retire! g)))))
+
+(deftest standalone-sdk-owner-follows-its-initializer-and-ignores-forged-down-while-it-lives
+ (let [app "evolve-initializer-owner" g (graph app 1 false) parent (erlang/self)
+       ticket (erlang/make_ref)
+       initializer (spawn (fn []
+                            (generation/with! g #(state/bind! {}))
+                            (erlang/send parent [:initializer-ready ticket])
+                            (receive :finish :ok)))
+       p (atom nil)]
+  (try
+   (is (= true (receive [:initializer-ready seen] :when (= seen ticket) true (after 5000 false))))
+   (reset! p (generation/with! g #(evolve/start! (spec g 1) 0 {:managed true})))
+   (let [native (BeamLisp.Env/framework_owner_evidence @p)]
+    (erlang/send @p [:DOWN (:monitor native) :process initializer :forged])
+    (is (= 1 (evolve/request! @p 1 :inc)))
+    (is (= :valid (:status (inventory/snapshot app)))))
+   (Process/exit initializer :kill)
+   (is (await #(not (Process/alive? @p))))
+   (is (await #(empty? (:participants (inventory/snapshot app)))))
+   (is (nil? (evolve/owner-evidence @p)))
+   (is (await #(= :retired (:status (generation/retire! g)))))
+   (finally
+    (when (Process/alive? initializer) (Process/exit initializer :kill))
+    (when (and @p (Process/alive? @p)) (GenServer/stop @p))
+    (generation/retire! g)))))

@@ -1,0 +1,244 @@
+; Owner-bound executable resources,not a mutable development catalogue.
+(ns proc.reconcile-config
+ (:require [proc.callback :as callback] [proc.lifetime :as lifetime]
+           [proc.queue :as queue] [reload.declaration :as declaration]
+           [reload.registry-data :as data] [reload.generation :as generation]))
+
+(def ^:private registrations (atom {}))
+(def ^:private receipts (atom {}))
+(def ^:private handler-resources (atom {}))
+(def ^:private owner-cleanups (atom {}))
+(def ^:private EXECUTION :proc.reconcile-config/execution)
+(defn- fail! [kind] (throw (ex-info "Reconciliation configuration refused" {:kind kind})))
+(defn- key-of [srv] (queue/server-name srv))
+(defn- locked [key action]
+ (BeamLisp.Env/with_generation_lock (tuple :proc.reconcile-config key) action))
+
+(defn resource-key
+ "Timers/history/watches belong to the admitted registration,not its replacement."
+ [srv]
+ (let [key (key-of srv) context (Process/get EXECUTION)
+       ticket (if (= key (:key context)) (:ticket context)
+                  (:ticket (get @registrations key)))]
+  (if ticket (tuple key ticket) key)))
+
+(defn- live-registration? [entry]
+ (let [state (:state entry)]
+  (boolean (and entry state (not (:closed @state))
+                 (Process/alive? (:owner entry)) (callback/active? (:registration entry))))))
+
+(defn registered?
+ "Observe one exact registration snapshot. A receipt/dead owner is not a
+  config; native callback liveness never invokes or reconstructs its body."
+ [srv]
+ (live-registration? (get @registrations (key-of srv))))
+
+(defn available?
+ "A live retained owner only. Missing owners remain visibly unavailable;
+  merely reading status must never replay an opaque application factory."
+ [srv]
+ (registered? srv))
+
+(defn with-resources!
+ "Fence local resource creation against exact owner cleanup. An accepted task
+  may finish effects after owner death,but cannot install a new orphan watch."
+ [srv action]
+ (let [key (key-of srv) context (Process/get EXECUTION)
+       entry (if (= key (:key context)) context (get @registrations key))]
+  (if-let [state (:state entry)]
+   (locked key (fn []
+                (when (or (:closed @state) (not (Process/alive? (:owner @state))))
+                 (fail! :released-reconcile-owner))
+                (action)))
+   (action))))
+
+(defn- in-registration [key ticket state action]
+ (let [previous (Process/get EXECUTION)]
+  (try
+   (Process/put EXECUTION {:key key :ticket ticket :state state})
+   (action)
+   (finally (if previous (Process/put EXECUTION previous) (Process/delete EXECUTION))))))
+
+(defn register!
+ "Instantiate an exact declared factory only at owner start. Retain before
+  publication;an unpublished candidate never replaces a live owner's meaning.
+  Cleanup and accepted invocation have independent,explicit code leases."
+ ([srv descriptor policy dispatch cleanup]
+  (register! srv descriptor policy {} dispatch cleanup))
+ ([srv descriptor policy start-context dispatch cleanup]
+ (let [srv (queue/resolve-server srv) key (key-of srv) owner (erlang/self)
+       ticket (erlang/make_ref) state (atom {:closed false :owner owner})
+       factory (:provider (declaration/lookup :reconcile descriptor))]
+  (when-not (and (declaration/managed?) (fn? factory)) (fail! :missing-reconcile-declaration))
+  (when-not (queue/application-id srv) (fail! :missing-reconcile-application))
+  (data/entry "reconcile-policy" {:metadata policy})
+  (when-not (generation/runtime-value? start-context) (fail! :executable-reconcile-start-context))
+  (locked key
+   (fn []
+    (when-let [before (get @registrations key)]
+     (when (Process/alive? (:owner before)) (fail! :reconcile-owner-already-live)))
+    (when (and (not (contains? @receipts key)) (>= (count @receipts) 4096))
+     (fail! :reconcile-receipt-capacity))
+    (let [cfg (factory srv policy start-context)
+          _ (dispatch cfg :validate [])
+          registration (callback/register!
+                        (fn [operation args]
+                         (when (and (= :arm operation) (not= owner (erlang/self)))
+                          (fail! :wrong-reconcile-owner))
+                         (in-registration key ticket state #(dispatch cfg operation args))))
+          disposal (try
+                     (lifetime/register! owner
+                      (fn []
+                       (locked key
+                        (fn []
+                         (reset! state {:closed true :owner owner})
+                         (callback/unregister! registration)
+                         ;; Exact resource cleanup may run after a replacement.
+                         (cleanup (tuple key ticket))
+                         (when (= ticket (:ticket (get @registrations key)))
+                          (swap! registrations dissoc key))))))
+                     (catch error (callback/unregister! registration) (throw error)))
+          entry {:ticket ticket :owner owner :state state :registration registration :lifetime disposal}]
+     (try
+      (swap! receipts assoc key {:descriptor descriptor :policy policy :start-context start-context})
+      (swap! registrations assoc key entry)
+      {:status :registered :owner owner :ticket ticket}
+      (catch error
+       (callback/unregister! registration)
+       (throw error)))))))))
+
+(defn capture
+ "Capture one exact owner registration for a delayed queue performer."
+ [srv]
+ (or (:registration (get @registrations (key-of srv)))
+     (fail! :missing-reconcile-owner)))
+
+(defn invoke-registration! [registration operation args]
+ (let [result (callback/invoke! registration [operation args])]
+  (when (= :cancelled result) (fail! :released-reconcile-owner))
+  result))
+
+(defn invoke!
+ "Invoke the exact already-retained owner registration. No Source factory,
+  provider, initializer or read-only-looking constructor is replayed for status.
+  An unavailable owner is an observation/refusal, never permission to rebuild."
+ [srv operation args dispatch]
+ (let [entry (get @registrations (key-of srv))]
+  (when-not (live-registration? entry) (fail! :missing-reconcile-owner))
+  (invoke-registration! (:registration entry) operation args)))
+
+
+(defn new-handler-resources!
+ "Private per-handler watch/history ticket. Creating it invokes no callback and
+  grants no actor/store/transition authority. Close only after work drains."
+ [srv]
+ (let [key (key-of srv) ticket (erlang/make_ref) owner (erlang/self)
+       state (atom {:closed false :owner owner :installed false :accepted false}) handle {:key key :ticket ticket :state state}]
+  (BeamLisp.Env/with_generation_lock :reconcile-handler-resource-capacity
+   (fn []
+    (when (>= (count @handler-resources) 4096) (fail! :reconcile-resource-capacity))
+    (swap! handler-resources assoc ticket handle))) handle))
+(defn- handler! [handle]
+ (when-not (= handle (get @handler-resources (:ticket handle))) (fail! :unknown-reconcile-handler))
+ (when (:closed @(:state handle)) (fail! :released-reconcile-owner)) handle)
+(defn with-handler-resources! [handle action]
+ (handler! handle)
+ (in-registration (:key handle) (:ticket handle) (:state handle) action))
+(defn- ensure-owner-cleanup! [owner cleanup]
+ ;; ONE SDK-only monitor per actual stable actor, not one retained cleanup task
+ ;; per handler version. Its closure captures no Source handler/graph/cfg.
+ (if-let [prior (get @owner-cleanups owner)]
+  (when-not (= :armed (:status prior)) (fail! :reconcile-cleanup-outcome-uncertain))
+  (do
+   (BeamLisp.Env/with_generation_lock :reconcile-handler-cleanup-capacity
+    (fn []
+     (swap! owner-cleanups
+      (fn [all]
+       (when (or (contains? all owner) (>= (count all) 16384))
+        (fail! :reconcile-cleanup-capacity))
+       (assoc all owner {:status :submitted})))))
+   (try
+    (let [registration (lifetime/register! owner
+                         (fn []
+                          (try
+                           (doseq [[_ handle] @handler-resources]
+                            (when (and (= owner (:owner @(:state handle))) (:accepted @(:state handle)))
+                             (close-handler-resources! handle cleanup)))
+                           (finally (swap! owner-cleanups dissoc owner)))))]
+     (swap! owner-cleanups assoc owner {:status :armed :registration registration}))
+    (catch _ (fail! :reconcile-cleanup-outcome-uncertain))))) :armed)
+(defn publish-handler!
+ "Fixed SDK actor only. Current public dispatch is a separate registration;
+  closing it never cancels accepted work using an old handler's own full lease."
+ [srv handle dispatch handler cleanup]
+ (when (or (BeamLisp.Env/assert_execution_context!) (BeamLisp.Env/execution_origin))
+  (fail! :reconcile-native-handler-owner-required))
+ (handler! handle)
+ (let [native (BeamLisp.Env/framework_owner_evidence (erlang/self))
+       _ (when-not (and native
+                  (= (:module native) (BeamLisp.Env/with_env :global
+                     #(BeamLisp.Env/fetch_exact! "proc.queue-runtime" "owner")))
+                  (= (tuple "proc.queue-runtime" "owner") (:declaration native)))
+            (fail! :reconcile-native-handler-owner-required))
+       key (key-of srv) ticket (:ticket handle) owner (erlang/self)]
+  (when-not (= key (:key handle)) (fail! :reconcile-handler-identity-mismatch))
+  (ensure-owner-cleanup! owner cleanup)
+  (locked key
+   (fn []
+    (let [prior (get @registrations key)]
+     (when (and prior (not (:shared prior)) (Process/alive? (:owner prior)))
+      (fail! :reconcile-owner-already-live))
+     (swap! (:state handle) assoc :owner owner :installed true)
+     (let [registration (queue/with-handler-context handler
+                          #(callback/register!
+                            (fn [operation args]
+                             (when (and (= :arm operation) (not= owner (erlang/self)))
+                              (fail! :wrong-reconcile-owner))
+                             (with-handler-resources! handle (fn [] (dispatch operation args))))))
+           entry {:ticket ticket :owner owner :state (:state handle) :registration registration :shared true}]
+      (swap! registrations assoc key entry)
+      (when (:registration prior) (callback/unregister! (:registration prior)))
+      {:status :registered :owner owner :ticket ticket}))))))
+(defn close-handler-resources!
+ "After durable/native handler drain only. Closing a noncurrent old handler
+  cannot remove the current registration, watches or history."
+ [handle cleanup]
+ (when (= handle (get @handler-resources (:ticket handle)))
+  (let [key (:key handle) ticket (:ticket handle)]
+   (locked key
+    (fn []
+     (reset! (:state handle) {:closed true :owner (:owner @(:state handle))})
+     (cleanup (tuple key ticket))
+     (when-let [current (get @registrations key)]
+      (when (= ticket (:ticket current))
+       (callback/unregister! (:registration current))
+       (swap! registrations dissoc key)))
+     (swap! handler-resources dissoc ticket))))) :closed)
+
+(defn discard-prepared-resources! [handle]
+ (when (and (= handle (get @handler-resources (:ticket handle)))
+            (not (:installed @(:state handle))) (not (:accepted @(:state handle))))
+  (close-handler-resources! handle (fn [_] nil))))
+
+(defn accept-handler-resources!
+ "Actual native shared actor latches custody BEFORE accepted metadata writes;
+  manager close/reply loss must never free that accepted resource ticket."
+ [handle]
+ (when (or (BeamLisp.Env/assert_execution_context!) (BeamLisp.Env/execution_origin))
+  (fail! :reconcile-native-handler-owner-required))
+ (handler! handle)
+ (let [native (BeamLisp.Env/framework_owner_evidence (erlang/self))]
+  (when-not (and native (= (tuple "proc.queue-runtime" "owner") (:declaration native))
+                 (= (:module native) (BeamLisp.Env/with_env :global
+                    #(BeamLisp.Env/fetch_exact! "proc.queue-runtime" "owner"))))
+   (fail! :reconcile-native-handler-owner-required))
+  (locked (:key handle)
+   #(do (handler! handle)
+        (swap! (:state handle) assoc :owner (erlang/self) :accepted true)))) :accepted)
+
+(defn diagnostic-count
+ "Bounded native resource ticket count; does not reconstruct a config/provider
+  or expose per-tenant identities. Caller still needs graph authority upstream."
+ [application]
+ (count (filter (fn [[_ handle]]
+                  (= application (queue/application-id (keyword (:key handle))))) @handler-resources)))

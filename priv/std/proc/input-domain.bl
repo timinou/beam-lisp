@@ -1,0 +1,283 @@
+; Bounded actual-ANF input requirements, not a total-correctness theorem.
+; Unknown stays explicit. No source compilation, user callbacks or SMT execution.
+(ns proc.input-domain
+ (:require [system.ir :as ir] [system.publication :as publication]
+           [data.first-order :as data]))
+(def MAX-NODES 16384)
+(def MAX-HELPERS 32)
+(def MAX-BYTES 1048576)
+(defn metadata!
+ "Bound raw compiler metadata, including its native tuple descriptors. An empty
+  witness admits NO callable, lazy capsule or opaque resource. This deliberately
+  does not widen the public first-order business-data domain."
+ [value]
+ (BeamLisp.CompilerData/constructor_data_cost!
+  value {:callables {} :recipes {} :recipe-frame nil})
+ value)
+(defn- refuse [reason] (throw (ex-info "Actor input requirements unknown" {:reason reason})))
+(defn- tick [state]
+ (when (>= (:nodes state) MAX-NODES) (refuse :input-proof-budget))
+ (update state :nodes inc))
+(defn accepts?
+ "A closed raw-value predicate. Never dispatches a user protocol."
+ [domain value]
+ (case domain
+  :number (erlang/is_number value)
+  :integer (erlang/is_integer value)
+  :float (erlang/is_float value)
+  :binary (erlang/is_binary value)
+  :utf8 (and (erlang/is_binary value) (String/valid? value))
+  :pid (erlang/is_pid value)
+  :list (erlang/is_list value)
+  :any true
+  false))
+(defn covered? [actual required]
+ (or (= required :any) (= actual required)
+     (and (= required :number) (contains? #{:integer :float} actual))
+     (and (= required :binary) (= actual :utf8))))
+(defn- meet [a b]
+ (cond (nil? a) b (covered? a b) a (covered? b a) b
+       :else (refuse :inconsistent-input-requirements)))
+(defn- demand [state value domain]
+ (cond
+  (:variable value) (update-in state [:requirements (:variable value)] meet domain)
+  (contains? value :literal) (if (accepts? domain (:literal value)) state (refuse :invalid-literal-input))
+  (covered? (:domain value) domain) state
+  :else (refuse :unproved-computed-input)))
+(defn- remote-proof [state module]
+ (if (contains? (:remotes state) module) state
+  (let [identity (if (= module :erlang)
+                   [:otp (erlang/system_info :otp_release) (erlang/system_info :version)]
+                   [:beam (erlang/apply module :module_info (list :md5))])]
+   (assoc-in state [:remotes module] identity))))
+(defn- primitive [module function arity]
+ ;; Exact MFAs, never a name-only match or an author annotation. Numeric
+ ;; requirements describe argument shape, not overflow/division/termination.
+ (cond
+  (and (= arity 2) (contains? #{[:erlang :+] [:erlang :-] [:erlang :*]
+                                [:Elixir.BeamLisp.Num :add] [:Elixir.BeamLisp.Num :sub]
+                                [:Elixir.BeamLisp.Num :mul]} [module function]))
+   {:args [:number :number] :result {:domain :number}}
+  (and (= arity 1) (= module :erlang) (contains? #{:+ :-} function))
+   {:args [:number] :result {:domain :number}}
+  (and (= arity 1) (= module :Elixir.String) (= function :trim))
+   {:args [:utf8] :result {:domain :utf8}}
+  (and (= module :erlang) (= arity 2)
+       (contains? #{:== :/= :=:= :=/= :< :> :=< :>=} function))
+   {:args [:any :any] :result {:domain :boolean}}
+  (and (= module :erlang) (= arity 1)
+       (contains? #{:is_integer :is_float :is_number :is_binary :is_pid :is_list} function))
+   {:args [:any] :result {:domain :boolean}}
+  (and (= module :erlang) (= function :send) (= arity 2))
+   {:args [:pid :any] :return-argument 1}
+  :else nil))
+(declare evaluate)
+(defn- values-of [state environment nodes]
+ (loop [state state nodes (seq nodes) values []]
+  (if-not nodes [state values]
+   (let [[after value] (evaluate state environment (first nodes))]
+    (recur after (next nodes) (conj values value))))))
+(defn- apply-primitive [state signature values]
+ (when-not (= (count values) (count (:args signature))) (refuse :input-proof-arity))
+ [(reduce (fn [s pair] (demand s (first pair) (second pair))) state
+          (mapv (fn [value requirement] [value requirement]) values (:args signature)))
+  (if (contains? signature :return-argument)
+   (nth values (:return-argument signature)) (:result signature))])
+(defn- snapshot! [state namespace name]
+ (let [key [namespace name] present (get-in state [:helpers key])]
+  (if present [state present]
+   (do
+    (when (>= (count (:helpers state)) MAX-HELPERS) (refuse :input-proof-budget))
+    (let [snapshot (publication/snapshot namespace name)]
+     (when-not snapshot (refuse :unpublished-input-helper))
+     ;; Raw first-order bounded receipt; no closure/resource can enter evidence.
+     (metadata! (dissoc snapshot :generation))
+     [(assoc-in state [:helpers key] snapshot) snapshot])))))
+(defn- provider [state node]
+ (let [namespace (:ns node) name (:name node)
+       found (if (= :exact (:lookup node)) (BeamLisp.Env/fetch_exact namespace name)
+               (BeamLisp.Env/fetch namespace name))]
+  (when-not (and (tuple? found) (= :ok (elem found 0))) (refuse :unknown-input-binding))
+  (let [home (first (filter (fn [ns] (= found (BeamLisp.Env/fetch_exact ns name)))
+                    (if (= :exact (:lookup node)) [namespace] [namespace "core" "sugar"])))]
+   (when-not home (refuse :unknown-input-binding))
+   [(assoc-in state [:bindings [namespace name (:lookup node)]] [home name]) home name])))
+(defn context [namespaces]
+ (let [namespaces (vec (Enum/uniq (to-list namespaces)))]
+  {:namespaces namespaces
+   :namespace-modules (into {} (mapv (fn [namespace] [(BeamLisp.Emit/module_for namespace) namespace]) namespaces))}))
+(defn- remote-home [state module function]
+ (let [home (get (:namespace-modules state) module)]
+  (or (when (and home (= module (BeamLisp.Emit/module_for home))) home)
+      ;; Prefix only bounds the search; actual publication/body membership
+      ;; supplies the proof. Unknown native modules decline without scanning
+      ;; every namespace merely to rediscover that they are not Source helpers.
+      (when (String/starts_with? (erlang/atom_to_binary module :utf8) "Elixir.BeamLisp.Ns.Fn.")
+       (first (filter
+         (fn [ns]
+          (let [snapshot (publication/snapshot ns (erlang/atom_to_binary function :utf8))]
+           (and snapshot (contains? (get-in snapshot [:shim :bodies]) module))))
+         (:namespaces state)))))))
+(defn- helper [state namespace name values]
+ (let [key [namespace name] _ (when (contains? (:stack state) key) (refuse :recursive-input-helper))
+       [state snapshot] (snapshot! state namespace name)
+       rows (filter (fn [row] (and (= :fixed (elem row 0)) (= (count values) (elem row 1))))
+                    (:entries snapshot))]
+  (when-not (= 1 (count rows)) (refuse :ambiguous-input-helper))
+  (let [clause (elem (first rows) 3) params (:params clause)]
+   (when-not (and (nil? (:guard clause))
+                 (every? #(= :pvar (:pop %)) params)) (refuse :guarded-input-helper))
+   (let [environment (into {} (mapv (fn [p v] [(:name p) v]) params values))
+         [after result] (evaluate (update state :stack conj key) environment (:body clause))]
+    [(update after :stack disj key) result]))))
+(defn- constructor [node]
+ ;; The compiler's exact built-in OTP return constructor expression. No user
+ ;; map, borrowed function or look-alike provider acquires this interpretation.
+ (when (and (= :remote (:op node)) (= :Elixir.Map (:mod node)) (= :fetch! (:fun node))
+            (= 2 (count (:args node))))
+  (let [[table key] (:args node)]
+   (when (and (= :remote (:op table)) (= :Elixir.BeamLisp.Server (:mod table))
+              (= :return_constructors (:fun table)) (empty? (:args table))
+              (= :lit (:op key))
+              (contains? #{"ok" "reply" "noreply" "stop" "ignore" "hibernate" "continue"} (:val key)))
+    (:val key)))))
+(defn- apply-constructor [state name values]
+ (let [arity (count values) arities {"ok" #{1 2} "reply" #{2 3} "noreply" #{1 2}
+                                   "stop" #{1 2 3} "ignore" #{0} "hibernate" #{0} "continue" #{1}}]
+  (when-not (contains? (get arities name) arity) (refuse :input-proof-arity))
+  [(remote-proof state :Elixir.BeamLisp.Server)
+   {:domain (if (contains? #{"ignore" "hibernate"} name) :atom :tuple)}]))
+(defn- call [state environment node]
+ (let [site (ir/call-site node)]
+  (when-not (and site (some? (:arity site))) (refuse :dynamic-input-call))
+  (let [[state values] (values-of state environment (:args site))
+        target (:callee site) ctor (when target (constructor target))]
+   (cond
+    ctor (apply-constructor state ctor values)
+    (= :remote (:mode site))
+     (let [module (:mod site) function (:fun site)
+           signature (primitive module function (:arity site))]
+      (if signature (apply-primitive (remote-proof state module) signature values)
+       (if-let [home (remote-home state module function)]
+        (helper state home (erlang/atom_to_binary function :utf8) values)
+        (refuse :unknown-input-operation))))
+    (= :global (:op target))
+     (let [[state namespace name] (provider state target)] (helper state namespace name values))
+    :else (refuse :dynamic-input-call)))))
+(defn evaluate [state environment node]
+ (let [state (tick state)]
+  (when-not (ir/node? node) (refuse :unknown-input-ir))
+  (case (:op node)
+   :lit (do (data/check! (:val node) {:max-nodes MAX-NODES :max-depth 64 :max-bytes MAX-BYTES})
+            [state {:literal (:val node)}])
+   :enil [state {:literal ()}]
+   :var (if-let [value (get environment (:name node))] [state value] (refuse :free-input-variable))
+   :let (let [[after value] (evaluate state environment (:init node))]
+          (evaluate after (assoc environment (:name node) value) (:body node)))
+   :do (let [[after values] (values-of state environment (:stmts node))]
+         [after (last values)])
+   :tuple (let [[after _] (values-of state environment (:elems node))] [after {:domain :tuple}])
+   :map (let [[after _] (values-of state environment (mapcat identity (:pairs node)))]
+          [after {:domain :map}])
+   :cons (let [[after values] (values-of state environment [(:head node) (:tail node)])]
+           [(demand after (second values) :list) {:domain :list}])
+   :arith (do
+            (when-not (= (get {:+ :add :- :sub :* :mul} (:bif node)) (:fun node))
+             (refuse :unknown-input-operation))
+            (call state environment {:op :remote :mod :Elixir.BeamLisp.Num :fun (:fun node) :args (:args node)}))
+   :remote (call state environment node)
+   :apply (call state environment node)
+   ;; Branch-sensitive refinement, recursion, latent closures, mutable/resource
+   ;; operations and unknown native protocols require a later explicit proof.
+   (refuse :unsupported-input-ir))))
+(defn- predicate-facts [node]
+ (let [key [(:mod node) (:fun node)] args (:args node)
+       domain (get {[:erlang :is_integer] :integer [:erlang :is_float] :float
+                    [:erlang :is_number] :number [:erlang :is_binary] :binary
+                    [:erlang :is_pid] :pid [:erlang :is_list] :list} key)]
+  (cond
+   (and (= :remote (:op node)) domain (= 1 (count args)) (= :var (:op (first args))))
+    {(:name (first args)) domain}
+   ;; Compiler anf-and2 emits an actual short-circuit if chain, never a
+   ;; nonexistent erlang:andalso/2 call. A true result with a RAW false else
+   ;; requires both test and then. Other branch shapes remain unknown.
+   (and (= :if (:op node)) (= :lit (:op (:else node)))
+        (erlang/== false (:val (:else node))))
+    (merge-with meet (predicate-facts (:test node))
+                     (predicate-facts (:then node)))
+   :else {})))
+(defn clause
+ "Infer sufficient argument-shape requirements from actual compiled body and
+  helpers. Covered means the compiled guard guarantees those requirements;
+  uncovered never silently narrows an ordinary actor's admitted inputs."
+ [_descriptor clause input-context]
+ (try
+  (let [epoch (BeamLisp.Env/publication_epoch)
+        names (vec (ir/clause-pattern-vars {:pats (:params clause)}))
+        input-context (if (map? input-context) input-context (context input-context))
+        initial {:nodes 0 :helpers {} :remotes {} :bindings {} :requirements {} :stack #{}
+                 :namespaces (:namespaces input-context)
+                 :namespace-modules (:namespace-modules input-context)}
+        environment (into {} (mapv (fn [name] [name {:variable name}]) names))
+        [state result] (evaluate initial environment (:body clause))
+        requirements (:requirements state) facts (predicate-facts (:guard clause))
+        epoch-names (Enum/uniq (to-list
+                      (concat (map :namespace (vals (:helpers state)))
+                              (map first (keys (:bindings state))) ["core" "sugar"])))
+        epochs (BeamLisp.Env/namespace_generations epoch-names)
+        helper-code (reduce (fn [out saved]
+                              (merge out {(:module (:shim saved)) (:md5 (:shim saved))}
+                                         (:bodies (:shim saved)))) {} (vals (:helpers state)))
+        proof {:status :proved :scope :body-argument-shapes :requirements requirements
+               :covered (every? (fn [[name domain]] (covered? (get facts name :any) domain)) requirements)
+               :helpers (:helpers state) :remotes (:remotes state) :bindings (:bindings state)
+               :body (:body clause) :nodes (:nodes state)
+               :epoch-names epoch-names :epochs epochs :helper-code helper-code}]
+   (when-not (and epochs (= epoch (BeamLisp.Env/publication_epoch)))
+    (refuse :input-proof-unstable))
+   ;; Scope epochs are private opaque observation identities, never business
+   ;; payloads or publication authority. Bound the complete pure IR separately.
+   (metadata! (-> proof (dissoc :epochs)
+                    (update :helpers (fn [helpers]
+                      (into {} (mapv (fn [[key value]] [key (dissoc value :generation)]) helpers)))))) proof)
+  (catch error {:status :unknown :scope :body-argument-shapes
+                :reason (or (:reason (ex-data error)) :input-proof-unavailable)})))
+(defn runtime-proof
+ "Discard analyzed IR after the bounded proof completes. Actual class code is
+  bound by the parent certificate; exact helper/native code and scope epochs
+  retain its transitive validity. Never retain source bodies in handed-off G."
+ [proof]
+ (select-keys proof [:status :scope :reason :requirements :covered :remotes
+                     :bindings :nodes :epoch-names :epochs :helper-code]))
+(defn data-view
+ "Pure bounded view; private native scope observations are never JSON data."
+ [proof]
+ (let [view (dissoc proof :epochs)]
+  (if (contains? view :helpers)
+   (update view :helpers (fn [helpers]
+     (into {} (mapv (fn [[key value]] [key (dissoc value :generation)]) helpers))))
+   view)))
+(defn bounded-proof! [proof]
+ (metadata! (data-view proof)) proof)
+(defn- helper-code-valid? [rows]
+ (if (erlang/== rows ()) true
+  (let [row (erlang/hd rows) module (erlang/element 1 row) md5 (erlang/element 2 row)]
+   (and (= md5 (erlang/apply module :module_info (list :md5)))
+        (helper-code-valid? (erlang/tl rows))))))
+(defn- remote-code-valid? [rows]
+ (if (erlang/== rows ()) true
+  (let [row (erlang/hd rows) module (erlang/element 1 row) identity (erlang/element 2 row)
+        actual (if (= module :erlang)
+                 [:otp (erlang/system_info :otp_release) (erlang/system_info :version)]
+                 [:beam (erlang/apply module :module_info (list :md5))])]
+   (and (= identity actual) (remote-code-valid? (erlang/tl rows))))))
+(defn valid?
+ "Exact epoch/code checks, no IR walk, lazy sequence, Atom or local closure.
+  Env epochs cover bindings, negatives, bulk writes and in-flight publication."
+ [proof]
+ (try
+  (and (= :proved (:status proof)) (:epochs proof)
+       (= (:epochs proof) (BeamLisp.Env/namespace_generations (:epoch-names proof)))
+       (helper-code-valid? (maps/to_list (:helper-code proof)))
+       (remote-code-valid? (maps/to_list (:remotes proof))))
+  (catch _ false)))

@@ -16,6 +16,7 @@ use std::sync::{mpsc, Mutex, MutexGuard, OnceLock};
 rustler::atoms! { ok, retry, cycle, fast, dirty, reroute, keep, other, over_budget }
 
 mod collector;
+mod collector_schedule;
 mod seen;
 use collector::{register, unregister, Key, Node, Traced};
 
@@ -123,6 +124,11 @@ impl Ledger {
 }
 
 static LEDGER: Ledger = Ledger::new();
+
+/// Internal scheduler observation, not an admission snapshot or a new NIF ABI.
+fn accounted_retained_bytes() -> usize {
+    LEDGER.retained.load(Ordering::Acquire)
+}
 static PENDING_RECLAIMS: AtomicUsize = AtomicUsize::new(0);
 
 // ── Phase-0 probes (PLAN-132): boundary crossings per entry point ──────────
@@ -710,6 +716,7 @@ fn allocate(
         state: Mutex::new(Some(saved)),
     });
     register(id, &cell);
+    collector::note_growth(retained_bytes);
     Ok(cell)
 }
 
@@ -1194,6 +1201,7 @@ fn exchange_version_impl<'a>(
     }
     drop(edges);
     drop(cell);
+    collector::note_growth(delta);
 
     // An evaluator cannot be interrupted between publication and notification:
     // both happen in this NIF call. A dead recipient simply discards its reply.
@@ -1392,10 +1400,12 @@ fn compare_exchange_impl<'a>(
     // UNADMITTED path: no credit, no cost — this is the policy-exempt ref write.
     // It still keeps the ledger exact, and it enters before it leaves so a
     // concurrent ADMITTED admission can never read a transiently low total.
+    let delta = growth_of(retained_bytes, old.retained_bytes);
     LEDGER.enter(retained_bytes);
     LEDGER.leave(old.retained_bytes);
     drop(edges);
     drop(cell);
+    collector::note_growth(delta);
 
     // An evaluator cannot be interrupted between publication and notification:
     // both happen in this NIF call. A dead recipient simply discards its reply.
@@ -1576,9 +1586,11 @@ fn put_impl(
     resource.version.bump();
     // UNADMITTED path (a volatile `vreset!`): no credit, but the same ledger
     // discipline — enter before leave, so no reader sees a transiently low total.
+    let delta = growth_of(retained_bytes, old.retained_bytes);
     LEDGER.enter(retained_bytes);
     LEDGER.leave(old.retained_bytes);
     drop(cell);
+    collector::note_growth(delta);
     if fast_lane {
         reclaim_state_small(old);
     } else {

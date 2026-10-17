@@ -1,0 +1,232 @@
+(ns proc.input-domain-test
+ (:require [reload.generation :as generation] [proc.contract :as contract]
+           [proc.input-domain :as inputs] [proc.super :as super] [env]))
+(defn- prepare [id helper body guard]
+ (generation/prepare!
+  {:application-id id :native-modules #{"erlang" "String"}
+   :sources {"body.inputs"
+    (str "(ns body.inputs)\n" helper "\n"
+         "(defserver sample (init [_] (ok 0))"
+         " (handle-call [:run n] [_ state] " guard " (reply " body " state)))\n"
+         "(defn actor [] sample)")}}))
+(defn- certificate [g]
+ (let [module (generation/invoke! g "body.inputs/actor" [])]
+  (get (:actor-inputs g) module)))
+(defn- row [g] (first (:clauses (certificate g))))
+(deftest actual-compiled-body-requirements-are-not-just-heads
+ (let [numeric (prepare "body-numeric" "" "(erlang/+ n 1)" ":when (number? n)")
+       text (prepare "body-text" "" "(String/trim n)" ":when (number? n)")]
+  (try
+   (is (= :proved (get-in (row numeric) [:proof :status])))
+   (is (= #{:number} (set (vals (get-in (row numeric) [:proof :requirements])))))
+   (is (= true (get-in (row numeric) [:proof :covered])))
+   (is (= :proved (get-in (row text) [:proof :status])))
+   (is (= #{:utf8} (set (vals (get-in (row text) [:proof :requirements])))))
+   (is (= false (get-in (row text) [:proof :covered])))
+   (is (= (:shape (row numeric)) (:shape (row text)))
+       "identical actual callback heads still have incompatible body requirements")
+   (is (= :actor-body-input-compatibility-unproved
+          (:kind (contract/adoption-check numeric (:module (certificate numeric))
+                                          text (:module (certificate text))))))
+   (finally (generation/retire! numeric) (generation/retire! text)))))
+(deftest same-named-actual-helper-bodies-participate-transitively
+ (let [numeric (prepare "body-helper-numeric" "(defn adjust [x] (erlang/+ x 1))" "(adjust n)" ":when (number? n)")
+       text (prepare "body-helper-text" "(defn adjust [x] (String/trim x))" "(adjust n)" ":when (number? n)")]
+  (try
+   (is (= :proved (get-in (row numeric) [:proof :status])))
+   (is (= :proved (get-in (row text) [:proof :status])))
+   (is (seq (get-in (row numeric) [:proof :helper-code])))
+   (is (= #{:number} (set (vals (get-in (row numeric) [:proof :requirements])))))
+   (is (= #{:utf8} (set (vals (get-in (row text) [:proof :requirements])))))
+   (is (= false (get-in (row text) [:proof :covered])))
+   (is (= :actor-body-input-compatibility-unproved
+          (:kind (contract/adoption-check numeric (:module (certificate numeric))
+                                          text (:module (certificate text))))))
+   (finally (generation/retire! numeric) (generation/retire! text)))))
+(deftest a-borrowed-name-cannot-borrow-a-primitive-signature
+ (let [g (prepare "body-borrowed-inc" "(defn inc [x] (String/trim x))" "(inc n)" ":when (number? n)")]
+  (try
+   (is (= :proved (get-in (row g) [:proof :status])))
+   (is (= #{:utf8} (set (vals (get-in (row g) [:proof :requirements])))))
+   (is (= false (get-in (row g) [:proof :covered])))
+   (is (= :retained-drain (:status (certificate g))))
+   (finally (generation/retire! g)))))
+(deftest unknown-operations-and-uncovered-wildcards-keep-retained-drain
+ (let [opaque (prepare "body-unknown" "" "(erlang/term_to_binary n)" "")
+       wildcard (prepare "body-wildcard" "" "(erlang/+ n 1)" "")]
+  (try
+   (is (= :unknown (get-in (row opaque) [:proof :status])))
+   (is (= :unknown-input-operation (get-in (row opaque) [:proof :reason])))
+   (is (= :retained-drain (:status (certificate opaque))))
+   (is (= :proved (get-in (row wildcard) [:proof :status])))
+   (is (= false (get-in (row wildcard) [:proof :covered])))
+   (is (= :retained-drain (:status (certificate wildcard))))
+   ;; The ordinary wildcard actor is not silently restricted by static analysis.
+   (is (= :ok (generation/with! wildcard
+               #(contract/check-entry! (:module (certificate wildcard)) (:key (row wildcard)) {}))))
+   (finally (generation/retire! opaque) (generation/retire! wildcard)))))
+(deftest utf8-requirements-and-raw-values-never-dispatch-user-protocols
+ (is (inputs/accepts? :utf8 "hello"))
+ (is (not (inputs/accepts? :utf8 (erlang/list_to_binary (list 255)))))
+ (is (not (inputs/accepts? :number {:__struct__ :Elixir.Fake.Number})))
+ (is (not (inputs/accepts? :list {:__struct__ :Elixir.File.Stream})))
+ (is (not (inputs/covered? :binary :utf8)))
+ (is (inputs/covered? :integer :number)))
+
+(deftest runtime-hook-and-exact-closure-gate-use-actual-prepared-actors
+ ;; Requires the coordinated Compiler input hook, not just the source analyzer.
+ (let [old (prepare "body-closed-old" "(defn adjust [x] (erlang/+ x 1))" "(adjust n)" ":when (number? n)")
+       new (prepare "body-closed-new" "(defn adjust [x] (erlang/* x 2))" "(adjust n)" ":when (number? n)")
+       old-module (:module (certificate old)) new-module (:module (certificate new))]
+  (try
+   (is (= true (:enforced (row old))) "real Compiler prehandler hook required")
+   (is (= true (:eligible (certificate old))))
+   (is (= true (:eligible (certificate new))))
+   (is (= :exact-unchanged-actor-and-transitive-input-proof
+          (:scope (contract/adoption-check old old-module old old-module))))
+   (is (= :body-argument-shape-preservation
+          (:scope (contract/adoption-check old old-module new new-module))))
+   (let [pid (generation/with! old #(BeamLisp.Server/start old-module nil))]
+    (try
+     (is (= 5 (call pid [:run 4])))
+     (finally (when (Process/alive? pid) (stop pid)))))
+   ;; No :actor-head capability was manufactured. Native inventory remains
+   ;; retained-drain and none of the above decisions changed a real actor.
+   (finally (generation/retire! old) (generation/retire! new)))))
+
+(deftest stale-helper-binding-is-refused-before-the-real-handler-effect
+ (let [g (generation/prepare!
+          {:application-id "body-entry-freshness" :native-modules #{"erlang"}
+           :sources {"body.entry"
+            "(ns body.entry)
+             (defn adjust [x] (erlang/+ x 1))
+             (defserver sample (init [parent] (ok parent))
+              (handle-call [:run n] [_ parent]
+               :when (and (number? n) (pid? parent))
+               (erlang/send parent :body-entered)
+               (reply (adjust n) parent)))
+             (defn actor [] sample)"}})
+       module (generation/invoke! g "body.entry/actor" [])
+       physical (get (:mapping g) "body.entry")
+       pid (generation/with! g #(BeamLisp.Server/start module (erlang/self)))]
+  (try
+   (is (= true (:eligible (get (:actor-inputs g) module))))
+   (is (= 3 (call pid [:run 2])))
+   (is (= :entered (receive :body-entered :entered (after 5000 :missing))))
+   ;; A trusted test publisher invalidates the actual helper binding. App source
+   ;; cannot intern into sealed providers. This deliberately exercises the same
+   ;; native epoch fence that handles any legitimate definition replacement.
+   (env/with-env (:scope g) #(BeamLisp.Env/intern physical "adjust" (fn [_] "changed")))
+   (let [monitor (Process/monitor pid)]
+    (is (= :refused (try (call pid [:run 2]) :served (catch _ :refused))))
+    (is (= :down (receive [:DOWN seen :process sender _]
+                  :when (and (= seen monitor) (= sender pid)) :down
+                  (after 5000 :still-running))))
+    (is (= :quiet (receive :body-entered :effect (after 0 :quiet)))))
+   (finally
+    (when (Process/alive? pid) (stop pid))
+    (generation/retire! g)))))
+
+(deftest unchanged-native-entry-does-not-create-memo-cells-per-message
+ (let [g (prepare "body-entry-allocation" "" "(erlang/+ n 1)" ":when (number? n)")
+       module (:module (certificate g)) pid (generation/with! g #(BeamLisp.Server/start module nil))]
+  (try
+   (is (= true (:eligible (certificate g))))
+   (is (= 2 (call pid [:run 1])))
+   (let [before (BeamLisp.LazyMemo/stats) started (System/monotonic_time :microsecond)]
+    (loop [left 100]
+     (when (> left 0) (call pid [:run 1]) (recur (dec left))))
+    (let [after (BeamLisp.LazyMemo/stats)
+          allocations (- (+ (:op_new after) (:op_new_fast after))
+                         (+ (:op_new before) (:op_new_fast before)))]
+     (is (= 0 allocations) "entry metadata checks allocate no native memo/Atom cells")
+     (println {:case :actual-actor-input-entry :calls 100
+               :elapsed-us (- (System/monotonic_time :microsecond) started)
+               :native-memo-creations allocations})))
+   (finally (when (Process/alive? pid) (stop pid)) (generation/retire! g)))))
+
+(defserver legacy_input_entry
+ (init [_] (ok nil))
+ (handle-call :read [_ state] (reply :unchanged state)))
+(deftest unmanaged-development-callback-behavior-remains-ordinary
+ (let [pid (start legacy_input_entry nil)]
+  (try (is (= :unchanged (call pid :read)))
+   (finally (stop pid)))))
+
+(deftest private-compiler-metadata-admits-tuples-without-admitting-resources
+ (let [descriptor (tuple :fixed 1 :adjust {:op :defn-clause} :Elixir.CompilerFixture)]
+  (is (= descriptor (inputs/metadata! descriptor)))
+  (is (= :native-tuple
+       (try (BeamLisp.CompilerData/check_first_order! descriptor) :accepted
+        (catch error (:reason (ex-data error)))))))
+ (is (= :opaque-value
+      (try (inputs/metadata! (fn [_] :not-executed)) :accepted
+       (catch error (:reason (ex-data error))))))
+ (is (= :opaque-value
+      (try (inputs/metadata! (erlang/make_ref)) :accepted
+       (catch error (:reason (ex-data error))))))
+ (let [counterfeit (maps/put :__struct__ :Elixir.File.Stream {})]
+  (is (= :foreign-struct
+       (try (inputs/metadata! counterfeit) :accepted
+        (catch error (:reason (ex-data error)))))))
+ (is (= :byte-limit
+      (try (inputs/metadata! (String/duplicate "x" 1048577)) :accepted
+       (catch error (:reason (ex-data error)))))))
+
+(deftest caller-supplied-empty-certificates-never-become-adoption-evidence
+ (let [g (prepare "body-forged-certificate" "" "(erlang/+ n 1)" ":when (number? n)")
+       actual (certificate g)
+       forged {:version 1 :scope :body-argument-shapes :eligible true
+               :module (:module actual) :code-id (:code-id actual) :clauses []}]
+  (try
+   (is (= false (boolean (contract/inputs-valid? forged))))
+   (is (= false (erlang/function_exported :Elixir.BeamLisp.Ns.Proc.Contract :adoption-check 2)))
+   (is (= :refused (try (apply contract/adoption-check [forged forged]) :accepted
+                   (catch _ :refused))))
+   (finally (generation/retire! g)))))
+
+(deftest runtime-certificates-discard-large-actual-helper-ir-before-graph-handoff
+ (let [padding (String/duplicate "x" 131072)
+       g (prepare "body-compact-helper"
+           (str "(defn adjust [x] (do \"" padding "\" (erlang/+ x 1)))")
+           "(adjust n)" ":when (number? n)")
+       c (certificate g) proof (:proof (first (:clauses c)))
+       bytes (erlang/external_size c)]
+  (try
+   (is (= true (:eligible c)))
+   (is (nil? (:body proof)))
+   (is (nil? (:helpers proof)))
+   (is (seq (:helper-code proof)))
+   (is (< bytes 16384) "Full128KiB helper payload must not enter handed-off G")
+   (is (= true (generation/with! g #(boolean (contract/inputs-valid? c)))))
+   (println {:case :actor-certificate-retention :discarded-helper-literal-bytes 131072
+             :retained-certificate-bytes bytes})
+   (finally (generation/retire! g)))))
+
+(deftest authenticated-sdk-callbacks-keep-their-existing-retained-graph-behavior
+ (let [g (prepare "body-ordinary-sdk" "" "(erlang/+ n 1)" ":when (number? n)")
+       sdk-class super/pool-dispatcher pool-name :actor-input-absent-pool
+       pid (generation/with! g #(BeamLisp.Server/start sdk-class pool-name))]
+  (try
+   (is (not (contains? (:server-classes g) sdk-class)))
+   (is (= :ok (cast pid :no-worker)))
+   ;; Same-sender sys request follows the cast and acknowledges actual dispatch.
+   (is (= {:sup pool-name :next 0} (erlang/apply :sys :get_state (list pid))))
+   (is (Process/alive? pid))
+   (is (= (:application-id g) (:application-id (generation/owner-evidence pid))))
+   (is (erlang/function_exported :Elixir.BeamLisp.Env :check_server_inputs! 3))
+   ;; A general full-G invocation is not a native actor callback entry.
+   (is (= :refused (generation/with! g
+          #(try (BeamLisp.Env/check_server_inputs! sdk-class nil {}) :accepted
+             (catch _ :refused)))))
+   (let [previous (env/capture)]
+    (try
+     (env/bind (assoc (:context g) :generation g))
+     (is (= :unadmitted-actor-input-check
+          (try (contract/check-entry! sdk-class nil {}) :accepted
+           (catch error (:kind (ex-data error))))))
+     (is (= :refused
+          (try (BeamLisp.Env/check_server_inputs! sdk-class nil {}) :accepted
+           (catch _ :refused))))
+     (finally (env/bind previous))))
+   (finally (when (Process/alive? pid) (stop pid)) (generation/retire! g)))))

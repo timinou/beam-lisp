@@ -1,0 +1,127 @@
+; Compiler-owned constructor rewriting for canonical reconcile declarations.
+; Returned data names only the declaration; native runtime rechecks authority.
+(ns reload.reconcile-callsite (:require [system.ir :as ir]))
+(defn- refuse [reason]
+ (throw (ex-info "Reconcile callsite remains unproved" {:kind :unproved-reconcile-callsite :reason reason})))
+(defn- lit [value] {:op :lit :val value :ann {}})
+(defn- local [name] {:op :var :name name :ann {}})
+(defn- argument-list [values]
+ (reduce (fn [tail value] {:op :cons :head value :tail tail :ann {}})
+   {:op :enil :ann {}} (reverse values)))
+(defn- runtime-call [binding values]
+ {:op :remote :mod :Elixir.BeamLisp.Ns.Rt :fun :invoke
+  :args (list {:op :global :ns "proc.reconcile-runtime" :name binding :lookup :exact :ann {}}
+              (argument-list values)) :ann {}})
+(defn specialize
+ "Rewrite exact compiler-known constructors of actual canonical declarations.
+  Unknown/composed/higher-order bindings retain their original executable IR.
+  This pass neither starts owners nor invokes a factory/reifier/Source callback.
+  Context grants NO runtime authority: receiver must recheck the descriptor
+  against its actual selected graph before invoking existing native Server APIs."
+ [expression context]
+ (let [left (atom 100000) serial (atom 0) changes (atom []) reserved (atom #{})]
+  (letfn [(spend! [depth]
+           (when (or (> depth 128) (neg? (swap! left dec))) (refuse :analysis-budget)))
+          (names [value depth]
+           (spend! depth)
+           ;; Raw compiler data only. No protocol/Enumerable traversal or calls.
+           (cond
+            (erlang/is_map value)
+             (do (when (and (maps/is_key :name value) (erlang/is_binary (maps/get :name value)))
+                   (swap! reserved conj (maps/get :name value)))
+                 (loop [it (maps/iterator value)]
+                  (let [entry (maps/next it)]
+                   (when-not (= :none entry)
+                    (names (erlang/element 2 entry) (inc depth))
+                    (recur (erlang/element 3 entry))))))
+            (erlang/is_list value)
+             (loop [values value]
+              (when-not (= (list) values)
+               (names (erlang/hd values) (inc depth)) (recur (erlang/tl values))))
+            (erlang/is_tuple value)
+             (loop [index 1]
+              (when (<= index (erlang/tuple_size value))
+               (names (erlang/element index value) (inc depth)) (recur (inc index))))))
+          (fresh []
+           (loop []
+            (let [name (str "__reconcile_argument__" (swap! serial inc))]
+             (if (contains? @reserved name) (recur)
+              (do (swap! reserved conj name) name)))))
+          (contract [call]
+           (if (= :remote (:mode call))
+            (get (:targets context) [(:mod call) (:fun call) (:arity call)])
+            (let [callee (:callee call)]
+             (when (and (= :global (:op callee)) (= :exact (:lookup callee)))
+              (get (:globals context) [(:ns callee) (:name callee) (:arity call)])))))
+          (rewrite-call [n]
+           (when-let [call (ir/call-site n)]
+            (when (some? (:arity call))
+             (when-let [route (contract call)]
+              (let [args (vec (:args call)) class (get args (:class-position route))
+                    descriptor (when (and (= :global (:op class)) (contains? #{nil :exact} (:lookup class)))
+                                 (get (:canonical context) [(:ns class) (:name class)]))]
+               (when descriptor
+                (when-not (and (string? (:declaration descriptor)) (<= 1 (erlang/byte_size (:declaration descriptor)) 1024) (= 1 (:version descriptor))
+                               (contains? #{:start :start-link :child-spec} (:operation route))
+                               (= (:arity call) (:arity route))
+                               (<= 1 (:arity call) 4)
+                               (every? (fn [position]
+                                         (or (nil? position)
+                                             (and (erlang/is_integer position) (<= 0 position) (< position (:arity call)))))
+                                 (map #(get route %) [:class-position :argument-position :options-position :id-position]))
+                               (or (not= :child-spec (:operation route)) (some? (:id-position route))))
+                 (refuse :invalid-private-constructor-contract))
+                ;; Bare class symbols carry the actual compiler namespace but
+                ;; no :lookup flag. Keep their original fetch as an operand;
+                ;; runtime must compare its actual value to the sealed class.
+                ;; Preserve the complete original packed argument expression for
+                ;; Rt.invoke. Native remote/apply arguments preserve their order
+                ;; as one tuple subject. The SDK call consumes bound values only.
+                (let [packed? (= :invoke (:mode call))
+                      subject (if packed? (second (:args n)) {:op :tuple :elems (to-list args) :ann {}})
+                      bound (mapv (fn [_] (fresh)) args)
+                      pattern (if packed?
+                                (reduce (fn [tail name] {:pop :pcons :head {:pop :pvar :name name} :tail tail})
+                                  {:pop :pnil} (reverse bound))
+                                {:pop :ptuple :elems (to-list (map #(hash-map :pop :pvar :name %) bound))})
+                      argument (fn [position default]
+                                 (if (some? position) (local (get bound position)) (lit default)))
+                      class-value (argument (:class-position route) nil)
+                      init-value (argument (:argument-position route) nil)
+                      options (argument (:options-position route) {})
+                      payload (lit (select-keys descriptor [:version :declaration]))
+                      body (if (= :child-spec (:operation route))
+                             (runtime-call "child-spec-declared!"
+                               [(argument (:id-position route) nil) class-value init-value options payload])
+                             (runtime-call "start-declared!"
+                               [class-value init-value options payload (lit (:operation route))]))]
+                 (swap! changes conj {:declaration (:declaration descriptor) :operation (:operation route)})
+                 {:op :case :subj subject :ann (:ann n)
+                  :clauses (list {:pats (list pattern) :guard nil :body body})})))))))
+          (visit [n]
+           (spend! 0)
+           (cond
+            (and (= :remote (:op n)) (= :Elixir.BeamLisp.Link (:mod n)) (= :defvar (:fun n)) (= 4 (count (:args n))))
+             (let [payload (nth (:args n) 2)]
+              (when-not (and (= :lit (:op payload)) (erlang/is_list (:val payload))) (refuse :invalid-definition-carrier))
+              (let [entries (mapv (fn [entry]
+                                  (when-not (and (erlang/is_tuple entry) (= 4 (erlang/tuple_size entry))
+                                                 (= :defn-clause (:op (elem entry 3))))
+                                   (refuse :invalid-definition-carrier))
+                                  (let [clause (elem entry 3)]
+                                   (erlang/setelement 4 entry
+                                    (cond-> (assoc clause :body (ir/rewrite visit (:body clause)))
+                                      (:guard clause) (assoc :guard (ir/rewrite visit (:guard clause))))))) (:val payload))]
+               (assoc n :args (to-list (assoc (vec (:args n)) 2 (assoc payload :val (to-list entries)))))))
+            (and (= :remote (:op n)) (= :Elixir.BeamLisp.Ns.Lower (:mod n)) (= :reload-descriptor! (:fun n)) (= 1 (count (:args n))))
+             (let [payload (first (:args n)) module (:val payload)]
+              (when-not (and (= :lit (:op payload)) (= :module (:op module))) (refuse :invalid-module-carrier))
+              (assoc n :args (list (assoc payload :val
+                (assoc module :clauses (to-list (map (fn [clause]
+                   (cond-> (assoc clause :body (ir/rewrite visit (:body clause)))
+                     (:guard clause) (assoc :guard (ir/rewrite visit (:guard clause))))) (:clauses module))))))))
+            :else (or (rewrite-call n) n)))]
+   (names expression 0)
+   ;; Shared ir/rewrite keeps quotes/annotations/patterns inert. Only the two
+   ;; exact native compiler carriers above expose literal executable payloads.
+   {:expression (ir/rewrite visit expression) :changes @changes})))

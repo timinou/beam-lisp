@@ -1,0 +1,178 @@
+; Native component gate: real calibrated memo cycles, never a mocked collector.
+; Run serially with lazy_budget_test: this scopes shared Application budget.
+; The 1 MiB cycle is below the automatic byte-trigger floor (16 MiB). Counters
+; additionally assert that occupancy really reached pressure before each call.
+(ns lazy.pressure-cycles.test)
+
+(defn- with-budget [bytes f]
+  (let [old (Application/get_env :beam_lisp :lazy_cache_budget_bytes)]
+    (Application/put_env :beam_lisp :lazy_cache_budget_bytes bytes)
+    (try (f)
+      (finally
+        (if (nil? old)
+          (Application/delete_env :beam_lisp :lazy_cache_budget_bytes)
+          (Application/put_env :beam_lisp :lazy_cache_budget_bytes old))))))
+
+(defn- cycle! []
+  (let [a (atom nil) b (atom a)]
+    (reset! a {:peer b :payload (erlang/make_tuple 131072 7) :answer 42})
+    a))
+
+(defn- dead-cycle! []
+  (let [started (erlang/spawn_monitor (fn [] (cycle!) :finished))
+        pid (erlang/element 1 started) monitor (erlang/element 2 started)]
+    (receive
+      [:DOWN seen :process sender :normal]
+      :when (and (= seen monitor) (= sender pid)) :finished
+      [:DOWN seen :process sender reason]
+      :when (and (= seen monitor) (= sender pid)) (throw {:worker-failed reason})
+      (after 5000 (throw {:worker-did-not-finish true})))))
+
+(defn- eager-answer []
+  (loop [n 8192 out ()]
+    (if (= n 0) out (recur (dec n) (cons 7 out)))))
+
+(defn- clean! []
+  (erlang/garbage_collect)
+  (BeamLisp.LazyMemo/collect_cycles))
+
+(defn- receipt [label before started]
+  (let [after (BeamLisp.LazyMemo/stats)]
+    (println {:case label
+              :elapsed-us (- (System/monotonic_time :microsecond) started)
+              :bytes-before (:retained_bytes before) :bytes-after (:retained_bytes after)
+              :cells-before (:live_cells before) :cells-after (:live_cells after)
+              :rounds (- (:cycle_runs after) (:cycle_runs before))
+              :collected (- (:cycle_collected after) (:cycle_collected before))})
+    after))
+
+(deftest admission-collects-dead-cycles-and-preserves-live-cycles
+  (clean!)
+  (is (= true (:cycle_enabled (BeamLisp.LazyMemo/stats))) "requires calibrated native collector")
+  (let [live (cycle!) calls (atom 0)
+        value (BeamLisp.LazySeq/new (fn [] (swap! calls inc) (list 9)))
+        budget (+ (BeamLisp.LazyMemo/retained_bytes) 262144)]
+    (try
+      (dead-cycle!)
+      (let [before (BeamLisp.LazyMemo/stats) started (System/monotonic_time :microsecond)]
+        (is (>= (:retained_bytes before) budget) "actual admission pressure, not just a small budget")
+        (with-budget budget (fn [] (is (= (list 9) (BeamLisp.LazySeq/force value)))))
+        (let [after (receipt :admission before started)]
+          (is (> (:cycle_runs after) (:cycle_runs before)))
+          (is (> (:cycle_collected after) (:cycle_collected before)))
+          (is (< (:retained_bytes after) (:retained_bytes before))))
+        (is (= 42 (:answer @live)))
+        (is (= 42 (:answer @@(:peer @live))))
+        (is (= (list 9) (BeamLisp.LazySeq/force value)))
+        (is (= 1 @calls)))
+      (finally (reset! live nil) (clean!)))))
+
+(deftest publication-pressure-retries-the-value-without-replaying-producer
+  (clean!)
+  (is (= true (:cycle_enabled (BeamLisp.LazyMemo/stats))))
+  (let [calls (atom 0) occupied (atom 0) publication-budget (atom 0)
+        value (BeamLisp.LazySeq/new
+                (fn []
+                  (swap! calls inc)
+                  (dead-cycle!)
+                  (let [used (BeamLisp.LazyMemo/retained_bytes)
+                        ceiling (- used 524288)]
+                    (reset! occupied used)
+                    (reset! publication-budget ceiling)
+                    ;; Pin the publication ceiling to ACTUAL running occupancy,
+                    ;; independent of how much pending thunk metadata disappeared.
+                    ;; The scoped test lowers the ceiling only after admission.
+                    (Application/put_env :beam_lisp :lazy_cache_budget_bytes ceiling))
+                  (eager-answer)))
+        budget (+ (BeamLisp.LazyMemo/retained_bytes) 4194304)
+        before (BeamLisp.LazyMemo/stats) started (System/monotonic_time :microsecond)]
+    (try
+      (with-budget budget
+        (fn []
+          (is (= 8192 (erlang/length (BeamLisp.LazySeq/force value))))
+          (is (>= @occupied @publication-budget) "real publication pressure AFTER admission")
+          (is (< @publication-budget budget) "test lowers the ceiling only")
+          (is (= 8192 (erlang/length (BeamLisp.LazySeq/force value))))))
+      (let [after (receipt :publication before started)]
+        (is (> (:cycle_runs after) (:cycle_runs before)))
+        (is (> (:cycle_collected after) (:cycle_collected before)))
+        (is (<= (:retained_bytes after) @publication-budget)))
+      (is (= 1 @calls) "publication retry never re-executes the producer")
+      (finally (clean!)))))
+
+(deftest live-only-pressure-refuses-before-producer-and-keeps-live-data
+  (clean!)
+  (let [base (BeamLisp.LazyMemo/retained_bytes)
+        live (cycle!) calls (atom 0)
+        value (BeamLisp.LazySeq/new (fn [] (swap! calls inc) (list 1)))
+        cell (BeamLisp.LazyMemo/create (tuple :running (erlang/self) (erlang/make_ref) ()))
+        snapshot (BeamLisp.LazyMemo/read_versioned cell)
+        version (erlang/element 1 snapshot) original (erlang/element 2 snapshot)
+        budget (+ base 262144)
+        before (BeamLisp.LazyMemo/stats) started (System/monotonic_time :microsecond)]
+    (try
+      (is (>= (:retained_bytes before) budget))
+      (with-budget budget
+        (fn []
+          (is (try (BeamLisp.LazySeq/force value) false
+                (catch BeamLisp.LazySeq.ForceError e
+                  (includes? (ex-message e) "lazy_cache_budget_exceeded"))
+                (catch e false)))
+          (is (= budget (BeamLisp.LazyMemo/cache_budget)))))
+      (is (= 0 @calls))
+      (is (= :over_budget
+             (BeamLisp.LazyMemo/exchange_version_admitted
+               cell version (tuple :completed (eager-answer)) () budget)))
+      (is (= (tuple version original) (BeamLisp.LazyMemo/read_versioned cell))
+          "refused publication leaves the exact version/state unchanged")
+      (is (= 42 (:answer @live)))
+      (is (= 131072 (erlang/tuple_size (:payload @live))))
+      (let [after (receipt :live-only before started)]
+        (is (> (:cycle_runs after) (:cycle_runs before)))
+        (is (>= (:retained_bytes after) budget)))
+      (finally (reset! live nil) (clean!)))))
+
+(defn- await-background-reclamation [before ceiling deadline]
+  (let [now (BeamLisp.LazyMemo/stats)]
+    (if (and (> (:cycle_runs now) (:cycle_runs before))
+             (> (:cycle_collected now) (:cycle_collected before))
+             (<= (:retained_bytes now) ceiling))
+      now
+      (if (>= (System/monotonic_time :millisecond) deadline) now
+        (do (Process/sleep 1)
+            (recur before ceiling deadline))))))
+
+(deftest committed-byte-growth-triggers-background-collection-with-few-cells
+  ;; Setup/cleanup may collect explicitly. Between the two measured stats reads
+  ;; there is NO collect_cycles, admit!, force, fold, or budget change. Each
+  ;; worker's DOWN drops actual roots before the next payload is committed.
+  (clean!)
+  (is (= true (:cycle_enabled (BeamLisp.LazyMemo/stats))))
+  (let [live (cycle!)
+        before (BeamLisp.LazyMemo/stats)
+        started (System/monotonic_time :microsecond)]
+    (try
+      (loop [n 32]
+        (when (> n 0) (dead-cycle!) (recur (dec n))))
+      (erlang/garbage_collect)
+      (let [after (await-background-reclamation before
+                    (+ (:retained_bytes before) 8388608)
+                    (+ (System/monotonic_time :millisecond) 10000))
+            creations (- (+ (:op_new after) (:op_new_fast after))
+                         (+ (:op_new before) (:op_new_fast before)))]
+        (is (> creations 0))
+        (is (< creations 16384) "byte demand, not the allocation-count floor")
+        (is (> (:cycle_runs after) (:cycle_runs before)))
+        (is (>= (- (:cycle_collected after) (:cycle_collected before)) 4))
+        (is (<= (:retained_bytes after) (+ (:retained_bytes before) 8388608))
+            "most of 32MiB dead committed payload was actually reclaimed")
+        (is (= 42 (:answer @live)))
+        (is (= 131072 (erlang/tuple_size (:payload @live))))
+        (println {:case :automatic-committed-growth
+                  :elapsed-us (- (System/monotonic_time :microsecond) started)
+                  :acknowledged-dead-workers 32 :committed-payload-bytes 33554432
+                  :native-creations creations :allocation-count-floor 16384
+                  :bytes-before (:retained_bytes before) :bytes-after (:retained_bytes after)
+                  :rounds (- (:cycle_runs after) (:cycle_runs before))
+                  :collected (- (:cycle_collected after) (:cycle_collected before))}))
+      (finally (reset! live nil) (clean!)))))

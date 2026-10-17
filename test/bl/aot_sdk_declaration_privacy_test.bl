@@ -1,0 +1,360 @@
+(ns aot-sdk-declaration-privacy-test)
+
+(defn- in-scope-for [source-namespace action]
+ ;; Native component fixture: source forms below are synthetic test controls,
+ ;; confined to the disposable compiler view. They never become SDK receipts.
+ (let [previous (BeamLisp.Env/capture)
+       prior (Process/get :bl_sdk_constructor_context)
+       _ (when (or (:generation previous) (:application-identity previous))
+           (erlang/error :component-harness-requires-kernel-context))
+       path (BeamLisp.Loader/source_path source-namespace) source (BeamLisp.Loader/read_source path)
+       input (BeamLisp.AOT/constructor_source_input! source-namespace path source)
+       view (BeamLisp.Env/fork :global)]
+  (try
+   (BeamLisp.Loader/without_initialization
+    (fn [] (BeamLisp.Env/with_env view
+      (fn []
+       (Process/put :bl_sdk_constructor_context
+        {:input input :compiler-env view :units {} :compiled {} :compiling #{}
+         :clauses {} :seen-macros #{} :kernel-modules #{} :kernel-leases (list)
+         :macro-steps 16384 :new-atoms 128 :expanded 0})
+       (BeamLisp.AOT/constructor_install_kernel!)
+       (BeamLisp.AOT/constructor_unit! "core")
+       (action)))))
+   (finally
+    (doseq [handle (:kernel-leases (Process/get :bl_sdk_constructor_context))]
+     (BeamLisp.Env/release_code! handle))
+    (BeamLisp.Env/destroy view)
+    (if prior (Process/put :bl_sdk_constructor_context prior)
+              (Process/delete :bl_sdk_constructor_context))
+    (BeamLisp.Env/bind previous)))))
+
+(defn- in-scope [action] (in-scope-for "core" action))
+
+(defn- stage! [source]
+ (BeamLisp.AOT/stage-sdk-forms! (BeamLisp.Reader/read_string source) "core" nil {} {}))
+(defn- declarations [] (get-in (Process/get :bl_sdk_constructor_context) [:declarations "core"]))
+(defn- add-alias! [alias target]
+ (let [context (Process/get :bl_sdk_constructor_context)
+       unit (get-in context [:units "core"])
+       aliases (Map/get (:metadata (:header unit)) :aliases (list))]
+  (Process/put :bl_sdk_constructor_context
+   (assoc-in context [:units "core" :header :metadata :aliases]
+    (cons (tuple alias target) aliases)))
+  (BeamLisp.Env/add_alias "core" alias target)))
+(defn- original [action]
+ (try (action) :unexpected-success (catch error (BeamLisp.ExInfo/ex_original error))))
+
+(defn- compile-external-reference! [namespace name]
+ ;; Exercise the public compiler exactly as an aliased cross-namespace read.
+ ;; A private implementation helper is deliberately not a facade export.
+ ;; Compilation checks privacy but never evaluates the resulting value fetch.
+ (let [client "privacy-native-client"]
+  (BeamLisp.Env/add_alias client "subject" namespace)
+  (BeamLisp.Compiler/compile
+   (first (BeamLisp.Reader/read_string (str "subject/" name) "privacy-reference.bl"))
+   (BeamLisp.Compiler/new_env client))))
+
+(deftest kinds-come-from-actual-expanded-checked-definitions-and-final-overwrite-order
+ (in-scope
+  (fn []
+   (stage! "(defn privacy-public [] :public)
+            (defn- privacy-private [] :private)
+            (defn privacy-attr-private {:private true} [] :private)
+            (def ^:private privacy-value (erlang/error :initializer-must-not-run))
+            (defmacro privacy-macro [] 1)
+            (defmacro ^:private privacy-private-macro [] 1)
+            (defn privacy-overwrite [] :first)
+            (defn- privacy-overwrite [] :last)")
+   (let [names (declarations)]
+    (is (= :public (get names "privacy-public")))
+    (is (= :private (get names "privacy-private")))
+    (is (= :private (get names "privacy-attr-private")))
+    (is (= :private (get names "privacy-value")))
+    (is (= :macro (get names "privacy-macro")))
+    (is (= :private (get names "privacy-private-macro")))
+    (is (= :private (get names "privacy-overwrite")))
+    (is (= :error (BeamLisp.Env/lookup (tuple "core" "privacy-value"))))))))
+
+(deftest checked-server-and-class-scaffolds-preserve-privacy-for-all-published-bindings
+ (in-scope
+  (fn []
+   (stage! "(defserver PrivacyPublicOwner (init [_] (ok {})))
+            (defserver ^:private PrivacyPrivateOwner (init [_] (ok {})))
+            (defrecord PrivacyPublicShape [value])
+            (defrecord ^:private PrivacyPrivateShape [value])
+            (deftype ^:private PrivacyPrivateType [value])")
+   (let [names (declarations)]
+    (is (= :public (get names "PrivacyPublicOwner")))
+    (is (= :private (get names "PrivacyPrivateOwner")))
+    (doseq [name ["PrivacyPublicShape" "->PrivacyPublicShape" "map->PrivacyPublicShape"]]
+     (is (= :public (get names name))))
+    (doseq [name ["PrivacyPrivateShape" "->PrivacyPrivateShape" "map->PrivacyPrivateShape"
+                 "PrivacyPrivateType" "->PrivacyPrivateType"]]
+     (is (= :private (get names name))))
+    (is (= nil (get names "map->PrivacyPrivateType")))
+    (is (= :error (BeamLisp.Env/lookup (tuple "core" "->PrivacyPrivateShape"))))))))
+
+(deftest standard-qualified-server-macro-preserves-actual-expanded-name-privacy
+ ;; This is an external macro consumer, not an in-order build of core itself.
+ ;; Using core as the active input without staging its earlier macros rightly
+ ;; refuses proc.server's use of core/and. Keep that local-order safety check;
+ ;; use a genuine non-core Source input in the isolated compiler fixture.
+ (in-scope-for "reload.generation"
+  (fn []
+   (add-alias! "privacydsl" "proc.server")
+   (Process/delete :privacy-staged-owner-initializer)
+   (let [file "positioned-qualified-server.bl"
+         forms (BeamLisp.Reader/read_string
+                 "(privacydsl/defserver PrivacyExpandedPublic
+                    (init [_] (Process/put :privacy-staged-owner-initializer :ran) (ok {})))
+                  (privacydsl/defserver ^:private PrivacyExpandedPrivate
+                    (init [_] (Process/put :privacy-staged-owner-initializer :ran) (ok {})))" file)]
+    (try
+     (is (every? #(= :meta (elem % 0)) forms))
+     (BeamLisp.AOT/stage-sdk-forms! forms "core" file {} {})
+     (is (= :public (get (declarations) "PrivacyExpandedPublic")))
+     (is (= :private (get (declarations) "PrivacyExpandedPrivate")))
+     (is (= 0 (Process/get :privacy-staged-owner-initializer 0)))
+     (is (= false (erlang/module_loaded (BeamLisp.Server/module_for "core" "PrivacyExpandedPublic"))))
+     (is (= false (erlang/module_loaded (BeamLisp.Server/module_for "core" "PrivacyExpandedPrivate"))))
+     (finally (Process/delete :privacy-staged-owner-initializer)))))))
+
+(deftest alias-spelling-and-defserver-macro-name-do-not-imply-public-server-authority
+ (in-scope
+  (fn []
+   ;; The familiar ps/defserver spelling resolves to this actual source macro,
+   ;; which produces a private ordinary function, not a server declaration.
+   (add-alias! "ps" "core")
+   (stage! "(defmacro defserver [binding] (list 'defn- binding [] :shadow))
+            (ps/defserver PrivacyShadowed)")
+   (is (= :private (get (declarations) "PrivacyShadowed")))
+   (is (seq (BeamLisp.Env/ns_definition "core" "PrivacyShadowed"))))))
+
+(deftest finite-descriptor-validation-refuses-missing-malformed-and-unknown-kinds
+ (let [valid (tuple 1 "fixture" {"public" :public "private" :private "value" :value "macro" :macro})]
+  (is (= true (BeamLisp.AOT/sdk_declaration_descriptor? valid "fixture")))
+  (doseq [invalid [nil {} (tuple 2 "fixture" {}) (tuple 1 "other" {})
+                  (tuple 1 "fixture" {"" :public}) (tuple 1 "fixture" {:atom :public})
+                  (tuple 1 "fixture" {"binding" :unknown})
+                  (tuple 1 "fixture" (list (tuple "binding" :public)))]]
+   (is (= false (BeamLisp.AOT/sdk_declaration_descriptor? invalid "fixture"))))))
+
+(deftest an-unattested-attribute-or-definition-body-cannot-turn-unknown-into-public
+ (in-scope
+  (fn []
+   (let [namespace "privacy-unattested-sdk-unit" module (BeamLisp.Emit/module_for namespace)
+         key (tuple :bl_sdk_emission module) before (ets/lookup :beam_lisp_vars key)]
+    (try
+     (BeamLisp.Env/put_ns_definition namespace "generated"
+      (Map/get (BeamLisp.Ns.Core/__bl_ns_defs__) "identity"))
+     (is (seq (BeamLisp.Env/ns_definition namespace "generated")))
+     (is (= nil (BeamLisp.AOT/sdk_declaration_kind namespace "generated")))
+     (BeamLisp.Loader/without_initialization
+      (fn []
+       (is (= (tuple :sdk_declaration_stage_load_refused namespace)
+        (original #(compile-external-reference! namespace "generated"))))))
+     (BeamLisp.Env/with_code_evidence_publication
+      (fn [] (ets/insert :beam_lisp_vars
+       (tuple key {:role :mutable-forwarder :forwarder-namespace namespace
+                   :declarations (tuple 1 namespace {"generated" :public}) :unit-references (list)}))))
+     ;; Unproved descriptor data may deny access; it never grants public access.
+     (is (= :unavailable (BeamLisp.AOT/sdk_declaration_kind namespace "generated")))
+     (let [message (try
+                    (compile-external-reference! namespace "generated")
+                    nil (catch error (ex-message error)))]
+      (is (and message (String/contains? message "metadata is unavailable"))))
+     (finally
+      (BeamLisp.Env/with_code_evidence_publication
+       (fn []
+        (ets/delete :beam_lisp_vars key)
+        (doseq [row before] (ets/insert :beam_lisp_vars row))))))))))
+
+(defn assert-genuine-staged-queue-runtime! []
+ ;; Optional integration assertion after the normal native import-closure has
+ ;; staged the genuine current queue runtime, before running its initializer.
+ ;; Run on BOTH an empty cache and an actual warm SDK cache.
+ (let [namespace "proc.queue-runtime" module (BeamLisp.Emit/module_for namespace)
+       key (tuple :bl_sdk_emission module) rows (ets/lookup :beam_lisp_vars key)
+       row (when (= 1 (count rows)) (elem (first rows) 1))]
+  (is (= true (BeamLisp.AOT/sdk_unit_compiled? namespace)))
+  (is (= false (BeamLisp.Env/loaded_ns? namespace)))
+  (is (= :public (BeamLisp.AOT/sdk_declaration_kind namespace "owner")))
+  (is (= :private (BeamLisp.AOT/sdk_declaration_kind namespace "refuse")))
+  (BeamLisp.Loader/without_initialization
+   (fn []
+    (compile-external-reference! namespace "owner")
+    (let [message (try
+                   (compile-external-reference! namespace "refuse")
+                   nil (catch error (ex-message error)))]
+     (is (and message (String/contains? message "is not public"))))
+    (try
+     (BeamLisp.Env/with_code_evidence_publication
+      (fn [] (ets/insert :beam_lisp_vars (tuple key (Map/delete row :declarations)))))
+     (is (= nil (BeamLisp.AOT/sdk_declaration_kind namespace "owner")))
+     (is (= (tuple :sdk_declaration_stage_load_refused namespace)
+      (original #(compile-external-reference! namespace "owner"))))
+     (finally
+      (BeamLisp.Env/with_code_evidence_publication
+       (fn [] (doseq [original-row rows] (ets/insert :beam_lisp_vars original-row)))))))))
+ :ok)
+
+(defn- count-native-calls [function arity action]
+ (let [mfa (tuple :Elixir.BeamLisp.AOT function arity)]
+  (erlang/trace_pattern mfa true (list :local :call_count))
+  (try
+   (action)
+   (elem (erlang/trace_info mfa :call_count) 1)
+   (finally (erlang/trace_pattern mfa false (list :local :call_count))))))
+
+(deftest declaration-query-memo-belongs-to-one-source-pass-and-native-publication-generation
+ (in-scope
+  (fn []
+   (is (= 4
+    (count-native-calls :sdk_checked_declaration_table 1
+     (fn []
+      (BeamLisp.Loader/with_declaration_snapshot
+       (fn []
+        (doseq [name ["privacy-missing-1" "privacy-missing-2" "privacy-missing-3"]]
+         (BeamLisp.AOT/sdk_declaration_kind "core" name))
+        ;; Even negative unit answers may be reused within one immutable pass.
+        (BeamLisp.Env/with_publication "core" (fn [] nil))
+        (BeamLisp.AOT/sdk_declaration_kind "core" "privacy-missing-4")
+        (BeamLisp.Env/with_code_evidence_publication (fn [] nil))
+        (BeamLisp.AOT/sdk_declaration_kind "core" "privacy-missing-5")))
+      (BeamLisp.Loader/with_declaration_snapshot
+       (fn [] (BeamLisp.AOT/sdk_declaration_kind "core" "privacy-missing-6"))))))))))
+
+(deftest native-publication-generation-handles-overlap-nesting-and-exception-unwind
+ (let [before (BeamLisp.Env/code_evidence_generation) parent (erlang/self)
+       worker (fn []
+                (BeamLisp.Env/with_code_evidence_publication
+                 (fn []
+                  (erlang/send parent [:privacy-publisher-entered (erlang/self)])
+                  (receive :privacy-release nil (after 5000 (erlang/error :fixture-timeout)))))
+                (erlang/send parent [:privacy-publisher-finished (erlang/self)]))
+       first (erlang/spawn worker) second (erlang/spawn worker)]
+  (try
+   (is (erlang/is_pid (receive [:privacy-publisher-entered pid] pid (after 5000 nil))))
+   (is (erlang/is_pid (receive [:privacy-publisher-entered pid] pid (after 5000 nil))))
+   (is (= nil (BeamLisp.Env/code_evidence_generation)))
+   (erlang/send first :privacy-release)
+   (is (= first (receive [:privacy-publisher-finished pid] pid (after 5000 nil))))
+   ;; One completed writer cannot certify while the other still publishes.
+   (is (= nil (BeamLisp.Env/code_evidence_generation)))
+   (erlang/send second :privacy-release)
+   (is (= second (receive [:privacy-publisher-finished pid] pid (after 5000 nil))))
+   (is (> (BeamLisp.Env/code_evidence_generation) before))
+   (BeamLisp.Env/with_code_evidence_publication
+    (fn []
+     (is (= nil (BeamLisp.Env/code_evidence_generation)))
+     (BeamLisp.Env/with_code_evidence_publication
+      (fn [] (is (= nil (BeamLisp.Env/code_evidence_generation)))))
+     (is (= nil (BeamLisp.Env/code_evidence_generation)))))
+   (is (erlang/is_integer (BeamLisp.Env/code_evidence_generation)))
+   (is (= :privacy-publication-error
+    (original #(BeamLisp.Env/with_code_evidence_publication
+                 (fn [] (erlang/error :privacy-publication-error))))))
+   (is (erlang/is_integer (BeamLisp.Env/code_evidence_generation)))
+   (finally
+    (erlang/send first :privacy-release)
+    (erlang/send second :privacy-release)))))
+
+(defn- with-declaration-attribute [bytes descriptor]
+ ;; Mutate only a fixture's captured attribute bytes. Never rewrite real SDK
+ ;; source, cache manifests, loaded code or executable instruction chunks.
+ (let [chunks (beam_lib/all_chunks bytes)
+       raw (elem chunks 2)
+       changed (Enum/map raw
+                 (fn [chunk]
+                  (if (= (String/to_charlist "Attr") (elem chunk 0))
+                   (tuple (elem chunk 0)
+                    (erlang/term_to_binary
+                     (Keyword/put (erlang/binary_to_term (elem chunk 1)) :bl_sdk_declarations (list descriptor))))
+                   chunk)))
+       rebuilt (beam_lib/build_module changed)]
+  (when-not (= :ok (elem rebuilt 0)) (erlang/error :fixture-beam-rebuild-failed))
+  (elem rebuilt 1)))
+
+(deftest ordinary-sdk-producer-records-executed-expanded-owner-privacy-without-initializer-replay
+ (let [namespace (str "privacy.ordinary" (erlang/unique_integer (list :positive)))
+       root (str (System/get_env "HOME") "/tmp/" namespace)
+       file (str root "/fixture.bl") out (str root "/ebin")
+       source (str "(ns " namespace " (:require [proc.server :as ps]))
+                    (def initialization-sentinel
+                      (Process/put :privacy-normal-initializations
+                        (inc (Process/get :privacy-normal-initializations 0))))
+                    (ps/defserver PublicOwner
+                      (init [_] (Process/put :privacy-normal-owner-initializer :ran) (ok {})))
+                    (ps/defserver ^:private PrivateOwner
+                      (init [_] (Process/put :privacy-normal-owner-initializer :ran) (ok {})))
+                    (defrecord ^:private PrivateShape [value])
+                    (defprotocol DeferredProtocol (method [this]))
+                    (defrecord MethodShape [] DeferredProtocol
+                      (method [this] (defn method-only [] :deferred)))
+                    (defn attr-private {:private true} [] :private)
+                    (if false (ps/defserver NeverDefined (init [_] (ok {}))) nil)
+                    (defn deferred [] (defserver DeferredOwner (init [_] (ok {}))))
+                    (defn overwritten [] :first)
+                    (defn- overwritten [] :last)
+                    (defn untracked [] :first)
+                    (defn overwrite-later [] (defn- untracked [] :last))
+                    (overwrite-later)")
+       modules (atom (list)) view (BeamLisp.Env/fork :global)]
+  (File/mkdir_p! root) (File/write! file source)
+  (Process/delete :privacy-normal-initializations)
+  (Process/delete :privacy-normal-owner-initializer)
+  (try
+   ;; Exactly the official ordinary producer mode, evaluated in a disposable
+   ;; scope. Global reads then model packaged pre-init state, not initialized
+   ;; var lookup. These real fixture artifacts are not selected SDK authority.
+   (let [beams (BeamLisp.Env/with_env view
+                 (fn [] (BeamLisp.AOT/compile_source source
+                          (list (tuple :file file) (tuple :output_dir out)))))
+         _ (reset! modules (Enum/map beams #(elem % 0)))
+         captured (Enum/map beams (fn [beam] (tuple (elem beam 0) (File/read! (elem beam 1)))))
+         entries (BeamLisp.AOT/sdk_emission_entries! root file captured)
+         module (BeamLisp.Emit/module_for namespace)
+         bytes (elem (first (filter #(= module (elem % 0)) captured)) 1)
+         row (BeamLisp.AOT/sdk_artifact_bytes_entry! root file module bytes)
+         descriptor (Map/get row :declarations) names (elem descriptor 2)]
+    (is (seq entries))
+    (is (= true (BeamLisp.AOT/sdk_declaration_descriptor? descriptor namespace)))
+    (is (= :public (Map/get names "PublicOwner")))
+    (is (= :private (Map/get names "PrivateOwner")))
+    (doseq [name ["PrivateShape" "->PrivateShape" "map->PrivateShape"]]
+     (is (= :private (Map/get names name))))
+    (is (= :private (Map/get names "attr-private")))
+    (is (= nil (Map/get names "NeverDefined")))
+    (is (= nil (Map/get names "DeferredOwner")))
+    (is (= nil (Map/get names "method-only")))
+    (is (= :private (Map/get names "overwritten")))
+    ;; A nested executed overwrite has no compiler-write operation in its
+    ;; function body. Publication invalidates stale metadata instead of
+    ;; preserving an earlier public grant or guessing publicity from its body.
+    (is (= :unavailable (Map/get names "untracked")))
+    (is (= :error (BeamLisp.Env/lookup (tuple namespace "PublicOwner"))))
+    (is (= :error (BeamLisp.Env/lookup (tuple namespace "PrivateOwner"))))
+    (is (= 1 (Process/get :privacy-normal-initializations)))
+    (is (= 0 (Process/get :privacy-normal-owner-initializer 0)))
+    (is (every?
+          (fn [beam]
+           (let [chunks (beam_lib/chunks (elem beam 1) (list :imports))
+                 imports (Keyword/get (elem (elem chunks 1) 1) :imports)]
+            (not (Enum/member? imports (tuple :Elixir.BeamLisp.AOT :record_normal_declaration! 4))))) captured))
+    ;; Backward-compatible absent metadata remains valid executable inventory;
+    ;; it has no declaration authority and compile-only cache must repair it.
+    (let [legacy (BeamLisp.AOT/sdk_artifact_bytes_entry! root file module
+                   (with-declaration-attribute bytes nil))]
+     (is (= nil (Map/get legacy :declarations)))
+     (is (= false (BeamLisp.AOT/sdk_declaration_descriptor? (Map/get legacy :declarations) namespace))))
+    (doseq [invalid [false (tuple 2 namespace {}) (tuple 1 namespace {"value" :unknown})]]
+     (is (= :sdk_inventory_invalid_declaration_metadata
+       (original #(BeamLisp.AOT/sdk_artifact_bytes_entry! root file module
+                    (with-declaration-attribute bytes invalid)))))))
+   (finally
+    (BeamLisp.Env/destroy view)
+    (when (seq @modules) (BeamLisp.Env/retire_modules! @modules))
+    (Process/delete :privacy-normal-initializations)
+    (Process/delete :privacy-normal-owner-initializer)
+    (File/rm_rf! root)))))

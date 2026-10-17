@@ -1,0 +1,203 @@
+; Native integration fixture for the companion staged SDK source draft.
+; No fake generation metadata, member flags, injected namespace providers or
+; externally fabricated actor witnesses. Root runs this after source staging.
+(ns proc.queue-family-test
+ (:require [proc.reconcile] [proc.queue :as queue] [proc.queue-family :as family] [proc.queue-family-root :as managed-root]
+           [reload.generation :as g] [datom :as d] [datom.conn :as dc] [datom.store-fjall :as fjall]))
+(def sentinel (str (System/get_env "HOME") "/tmp/product-online-20261014/queue-family-constructor-sentinel"))
+(defn kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn source [marker]
+ (str "(ns family.fixture (:require [proc.server :as server] [proc.queue :as q] [proc.queue-family :as family])) "
+  "(defn marker [] " (pr-str marker) ") "
+  "(defn config-for [srv policy start-opts] "
+  " (File/write! " (pr-str sentinel) " \"actual-owner-start\") "
+  " {:projection {:ident :family/projection} :conn-fn (fn [_] (:conn start-opts)) "
+  "  :scope-fn (fn [_ _] []) :apply (fn [_ _] nil) :level nil}) "
+  "(server/defserver worker (reconcile {:server (:queue start-opts) :config-fn config-for :level nil}) "
+  " (handle-call :forge-family [_ st] (reply "
+  "  (try (family/register! (q/server-name (:server (:queue st))) \"family.fixture/worker\" "
+  "          (q/normalise-decl {:of :proj/job :unique [:proj/key :proj/rev] :partition [:proj/scope]})) "
+  "       :wrong (catch error (:kind (ex-data error)))) st))) "
+  "(defn start! [opts] (start worker opts))"))
+(defn prepare [app marker & [resources]]
+ (g/prepare! {:application-id app :sources {"family.fixture" (source marker)}
+   :resources (or resources {})
+   :stable-namespaces #{"proc.server" "proc.reconcile" "proc.queue" "proc.queue-family"}
+   :native-modules #{"File"}}))
+(defn start [graph logical connection]
+ (g/invoke! graph "family.fixture/start!" [{:queue logical :conn connection}]))
+(defn payload [revision]
+ {:proj/kind :owed :proj/key [:family/projection "scope" "source"] :proj/rev revision :proj/scope 1})
+(defn remove-sentinel! [] (when (File/exists? sentinel) (File/rm! sentinel)))
+
+(deftest compiler-families-route-future-instances-and-fence-real-membership-changes
+ (File/mkdir_p! (str (System/get_env "HOME") "/tmp/product-online-20261014"))
+ (remove-sentinel!)
+ (let [application (str "family-native-" (erlang/unique_integer (list :positive)))
+       a (prepare application :old)
+       connection (d/connect [])
+       p1 (start a :first connection)
+       _ (is (File/exists? sentinel))
+       _ (remove-sentinel!)
+       b (prepare application :new)
+       slot (g/slot) pids (atom [p1]) jobs (atom [])
+       first-server (queue/scoped-server application :first)]
+  (try
+   (is (not (File/exists? sentinel)))
+   (is (= 1 (get-in b [:declarations :reconcile "family.fixture/worker" :data :queue-family :protocol])))
+   (is (= :retain-exact (get-in b [:declarations :reconcile "family.fixture/worker" :data :queue-family :transition])))
+   (is (= :applied (:status (g/publish! slot nil a))))
+   (let [before (family/plan! b) called (atom 0)
+         second (start b :created-after-plan connection)]
+    (swap! pids conj second)
+    (is (not= p1 second))
+    (is (= :queue-family-membership-changed
+           (kind #(family/with-publication-fence! before (fn [] (swap! called inc))))))
+    (is (= 0 @called))
+    (let [fresh (family/plan! b) public (family/public-plan fresh)]
+     (is (= :valid (:status fresh)))
+     (is (= "retained" (get public "state")))
+     (is (= 1 (get public "families")))
+     (is (= 2 (get public "instances")))
+     (is (= 1 (get public "retained")))
+     (is (= :applied (:status (family/with-current-publication-fence! b #(g/publish! slot (:digest a) b)))))))
+   (let [new-instance (start b :created-after-publication connection)]
+    (swap! pids conj new-instance)
+    (is (= 3 (get (family/public-plan (family/plan! b)) "instances"))))
+   (remove-sentinel!)
+   (let [job (g/with! b #(queue/enqueue! :first (payload 1) {:at (+ (System/system_time :millisecond) 600000)}))]
+    (swap! jobs conj (:job/id job))
+    (is (= (:digest b) (:job/generation job)))
+    (is (= (:digest a) (:job/required-generation job)))
+    (is (= :queued (:job/state job)))
+    (is (= 1 (:job/protocol job))))
+   (is (not (File/exists? sentinel)))
+   (is (= :queue-family-generated-owner-required (GenServer/call p1 :forge-family)))
+   (is (= :queue-family-generated-owner-required
+          (kind #(g/with! b (fn [] (family/register! (queue/server-name :first) "family.fixture/worker"
+                                    (queue/normalise-decl {:of :proj/job})))))))
+   (let [old-count (:queued (queue/stats first-server))]
+    (is (= :invalid-reconcile-payload
+           (kind #(g/with! b (fn [] (queue/enqueue! :first (assoc (payload 2) :proj/kind :wrong)))))))
+    (is (= old-count (:queued (queue/stats first-server)))))
+   (let [other (prepare (str application "-other") :other)]
+    (try
+     (is (= :queue-application-mismatch
+            (kind #(g/with! other (fn [] (queue/enqueue! first-server (payload 3)))))))
+     (finally (g/retire! other))))
+   (is (= "retained" (get (family/public-plan (family/plan! b)) "state")))
+   (finally
+    (doseq [id @jobs] (queue/cancel! first-server id))
+    (doseq [pid @pids] (when (Process/alive? pid) (GenServer/stop pid)))
+    (g/close! slot (g/selected slot))
+    (g/retire! a) (g/retire! b) (d/close! connection)
+    (remove-sentinel!)))))
+
+(deftest standard-reconcile-envelope-refuses-wrong-shapes-and-executables
+ (is (= (payload 1) (family/validate-reconcile-payload! (payload 1))))
+ (doseq [bad [(assoc (payload 1) :proj/scope "wrong")
+             (assoc (payload 1) :proj/key [:short])
+             (assoc (payload 1) :proj/kind :unknown)
+             (assoc (payload 1) :extra :unknown)
+             (dissoc (payload 1) :proj/rev)]]
+  (is (= :invalid-reconcile-payload (kind #(family/validate-reconcile-payload! bad)))))
+ (is (= :unsafe-first-order-data
+        (kind #(family/validate-reconcile-payload! (assoc (payload 1) :proj/rev (fn [] :unsafe)))))))
+
+(deftest durable-family-provisioning-requires-native-root-and-costs-no-app-bookkeeping
+ (remove-sentinel!)
+ (let [app (str "family-store-" (erlang/unique_integer (list :positive)))
+       root (str (System/get_env "HOME") "/tmp/product-online-20261014/" app)
+       graph (prepare app :store {:data-root root :deployment-environment "production"
+                 :managed-root-journal-id "journal" :managed-root-journal "journal.fjall"
+                 :managed-root-store-paths {"journal" "journal.fjall"}})
+       server (queue/scoped-server app :durable)
+       path (family/storage-path graph "family.fixture/worker" (name server))
+       journal (d/connect-with (fjall/open (str root "/journal.fjall")))
+       mirror (d/connect []) pid (atom nil) owned (atom nil)]
+  (try
+   (is (try (start graph :durable mirror) false
+         (catch error (some? (index-of (pr-str error) "queue-root-stale-custody")))))
+   (is (not (File/exists? path)))
+   (is (not (File/exists? sentinel)))
+   ;; The native managed lifecycle alone enrolls its actual existing journal.
+   ;; The ordinary generated actor provisions its own dedicated queue store.
+   (is (= :enrolled (managed-root/enroll! graph journal)))
+   (managed-root/enter-initializer! graph)
+   (g/with! graph #(g/bind-runtime! {}))
+   (is (= :ready (managed-root/ready! graph)))
+   (reset! pid (start graph :durable mirror))
+   (reset! owned (queue/conn server))
+   (is (Process/alive? @pid))
+   (is (= path (get-in @owned [:store :path])))
+   (is (= app (get-in (dc/creation-evidence! @owned) [:creator :application-id])))
+   (is (File/exists? sentinel))
+   (finally
+    (when (and @pid (Process/alive? @pid)) (GenServer/stop @pid))
+    (when @owned (d/close! @owned))
+    (d/close! journal) (d/close! mirror) (g/retire! graph) (remove-sentinel!)))))
+
+(defn- await [predicate]
+ (loop [left 1000]
+  (cond (predicate) true (zero? left) false
+        :else (do (Process/sleep 5) (recur (dec left))))))
+
+(deftest selected-family-admission-keeps-writer-order-with-publication-and-durable-retirement-fence
+ (let [application (str "family-barrier-" (erlang/unique_integer (list :positive)))
+       old (prepare application :old) fresh (prepare application :new)
+       mirror (d/connect []) actor (start old :barrier mirror)
+       server (queue/scoped-server application :barrier) c (queue/conn server)
+       parent (erlang/self) token (erlang/make_ref) slot (g/slot)
+       committed (atom nil) fenced (atom nil)
+       writer (atom nil) closer (atom nil)]
+  (try
+   (is (= :applied (:status (g/publish! slot nil old))))
+   ;; The real writer owns selection-to-commit. An outer serialized turn lets
+   ;; the fixture pause precisely after source-family selection, with no new
+   ;; production hook and no writer/store RPC under the family lock.
+   (reset! writer
+    (g/with! fresh
+     #(spawn
+       (fn []
+        (reset! committed
+         (dc/serialized! c
+          (fn []
+           (let [contract (family/producer-contract (name server))]
+            (erlang/send parent [:family-selected token contract])
+            (receive :commit-family
+             (queue/enqueue! server (payload 77)
+               {:at (+ (System/system_time :millisecond) 600000)})
+             (after 10000 (throw (ex-info "Fixture admission was not released" {}))))))))))))
+   (let [selected (receive [:family-selected seen contract] :when (= token seen) contract
+                   (after 10000 :timeout))]
+    (is (= (:digest old) (:required-generation selected)))
+    (is (= (:digest fresh) (:producer-generation selected))))
+   (reset! closer (spawn (fn [] (reset! fenced (queue/fence-generation! server (:digest old))))))
+   (is (await #(pos? (elem (Process/info (:writer c) :message_queue_len) 1))))
+   ;; Source publication must finish before the blocked writer is released.
+   (is (= :applied (:status
+         (family/with-current-publication-fence! fresh #(g/publish! slot (:digest old) fresh)))))
+   (is (nil? @fenced))
+   (is (Process/alive? actor))
+   (is (not= :retired (:status (g/retire! old))))
+   (erlang/send (:writer c) :commit-family)
+   (is (await #(some? @committed)))
+   (is (await #(some? @fenced)))
+   (is (= :fenced (:status @fenced)))
+   (is (= (:digest fresh) (:job/generation @committed)))
+   (is (= (:digest old) (:job/required-generation @committed)))
+   (is (= 1 (get-in (queue/generation-inventory server) [:required-generations (:digest old)])))
+   (is (= 1 (count (d/q '[:find ?e :where [?e :job/id _]] (d/db c)))))
+   (is (= :generation-fenced
+         (kind #(g/with! fresh (fn [] (queue/enqueue! server (payload 78)))))))
+   (queue/cancel! server (:job/id @committed))
+   (GenServer/stop actor)
+   (is (await #(= :retired (:status (g/retire! old)))))
+   (finally
+    (erlang/send (:writer c) :commit-family)
+    (when @writer (await #(not (Process/alive? @writer))))
+    (when @closer (await #(not (Process/alive? @closer))))
+    (when (Process/alive? actor) (GenServer/stop actor))
+    (g/close! slot (g/selected slot))
+    (g/retire! old) (g/retire! fresh) (d/close! mirror) (d/close! c)
+    (remove-sentinel!)))))

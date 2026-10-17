@@ -220,6 +220,34 @@
   // For `render` the value `v` is the raw hiccup value (an array term); for a
   // patch (`set-attr`) it arrives already JSON-encoded as a string. `evJson`
   // normalizes both to the JSON string the attribute must hold.
+  function inputOwner(el) {
+    for (var p = el; p; p = p.parentElement)
+      if (p.__liveInputAck !== undefined) return p;
+    return null;
+  }
+  function syncInput(el) {
+    var owner = inputOwner(el);
+    // An older server cannot acknowledge newer typing; keep its old contract.
+    if (!owner || !owner.__liveInputAck) return;
+    if (el.__liveInputPending || el.__liveComposing) return;
+    if (el.tagName === "INPUT" && el.type === "file") return;
+    if (el.hasAttribute("value")) el.__liveValueControlled = true;
+    if (el.__liveValueControlled) {
+      var value = el.getAttribute("value") || "";
+      if (el.value !== value) el.value = value;
+    } else if (el.tagName === "TEXTAREA" && el.hasAttribute("data-ev-input")) {
+      if (el.value !== el.textContent) el.value = el.textContent;
+    }
+    if (el.tagName === "INPUT" && (el.type === "checkbox" || el.type === "radio") &&
+        el.hasAttribute("data-ev-change")) el.checked = el.hasAttribute("checked");
+    if (el.tagName === "SELECT" && !el.__liveValueControlled && el.hasAttribute("data-ev-change")) {
+      for (var i = 0; i < el.options.length; i++)
+        el.options[i].selected = el.options[i].hasAttribute("selected");
+    }
+  }
+  function syncInputs(root) {
+    for (var el of root.querySelectorAll("input,textarea,select")) syncInput(el);
+  }
   function setAttr(el, k, v) {
     if (k === "key") {
       el.setAttribute("data-key", String(v));
@@ -263,6 +291,7 @@
       (a, b) => JSON.parse(a).length - JSON.parse(b).length);
     for (const p of paths) for (const op of byPath.get(p)) applyOp(root, op);
     for (const op of deep) applyOp(root, op);
+    syncInputs(root);
   }
 
   function applyOp(root, op) {
@@ -375,6 +404,26 @@
     // sends made while the CURRENT socket is still CONNECTING.
     var ws = null;
     var pending = [];
+    var inputFrames = new Map();
+    function trackInput(el, data) {
+      if (!root.__liveInputAck || !ws ||
+          (ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CONNECTING)) return data;
+      var id = mintId("input");
+      inputFrames.set(id, el);
+      el.__liveInputPending = (el.__liveInputPending || 0) + 1;
+      return Object.assign({}, data, { "live/input-id": id });
+    }
+    function acknowledgeInput(id) {
+      var el = inputFrames.get(id);
+      if (!el) return;
+      inputFrames.delete(id);
+      el.__liveInputPending = Math.max(0, (el.__liveInputPending || 0) - 1);
+      if (el.isConnected) syncInput(el);
+    }
+    function discardInputs() {
+      for (var el of inputFrames.values()) el.__liveInputPending = 0;
+      inputFrames.clear();
+    }
     var reconnectMs = 500;
     // the latest route the page wants but has not yet put on the wire. A
     // navigation moves the URL bar SYNCHRONOUSLY (pushState) but the page only
@@ -481,6 +530,7 @@
         setLive(true);
       };
       ws.onclose = function () {
+        discardInputs();
         if (beat) { clearInterval(beat); beat = null; }
         setLive(false);
         if (reconnect) {                           // auto-reconnect with backoff
@@ -492,7 +542,10 @@
       ws.onmessage = function (msg) {
         const [kind, a, b] = JSON.parse(msg.data);
         if (kind === "mount") {
+          discardInputs();
+          root.__liveInputAck = !!(b && b["input-ack"]);
           root.innerHTML = a;
+          syncInputs(root);
           announce("live:mount", { root: root });
         } else if (kind === "style") {
           // the head sheet holds what the warm reached; a socket that renders
@@ -510,6 +563,8 @@
           if (opts.onDenied) opts.onDenied(a);
         } else if (kind === "ack") {
           if (outbox) { outbox.ack(a); setLive(true); }   // the gesture landed — drop it
+        } else if (kind === "input-ack") {
+          acknowledgeInput(a);
         }
       };
       Live.ws = ws;
@@ -557,7 +612,9 @@
       fireFrom(e.target, "click", ws, formData(e.target));
     });
     root.addEventListener("input", function (e) {
-      fireFrom(e.target, "input", ws, { value: e.target.value });
+      var data = { value: e.target.value };
+      if (closestAttrPrefix(e.target, "data-ev-input")) data = trackInput(e.target, data);
+      fireFrom(e.target, "input", ws, data);
     });
     // a <select> / checkbox / radio commits on `change`, not `input`: a
     // form-for select carries `on-change` and must reach the server too
@@ -566,8 +623,11 @@
       var data = (t.type === "checkbox" || t.type === "radio")
         ? { value: t.value, checked: t.checked }
         : { value: t.value };
+      if (closestAttrPrefix(t, "data-ev-change")) data = trackInput(t, data);
       fireFrom(t, "change", ws, data);
     });
+    root.addEventListener("compositionstart", function (e) { e.target.__liveComposing = true; });
+    root.addEventListener("compositionend", function (e) { e.target.__liveComposing = false; syncInput(e.target); });
     // Enter in an input fires its `on-keydown.enter` intent (if any), and
     // clears the field — the chat-composer gesture. The `.enter` modifier is
     // part of the attribute name (data-ev-keydown.enter), so match by prefix.

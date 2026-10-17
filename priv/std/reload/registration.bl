@@ -1,0 +1,107 @@
+; Compiler-resolved registration specialization. Contracts come from the fixed
+; SDK owner;this pass neither executes registrations nor borrows callback values.
+(ns reload.registration)
+
+(defn- refuse! [kind details]
+ (throw (ex-info "Compiled executable registration refused" (assoc details :kind kind))))
+
+(defn- argument-list [node]
+ (loop [node node result [] left 255]
+  (case (:op node)
+   :enil result
+   :lit (when (and (erlang/is_list (:val node)) (<= (count (:val node)) left))
+          (into result (mapv (fn [value] {:op :lit :val value :ann {}}) (:val node))))
+   :cons (do (when (zero? left) (refuse! :registration-analysis-budget {}))
+             (recur (:tail node) (conj result (:head node)) (dec left)))
+   nil)))
+
+(defn- registration-call [node targets globals]
+ (cond
+  (and (= :remote (:op node)) (= :Elixir.BeamLisp.Ns.Rt (:mod node))
+       (= :invoke (:fun node)) (= 2 (count (:args node)))
+       (= :global (:op (first (:args node)))))
+   (let [callee (first (:args node))]
+    (when-let [contract (get globals [(:ns callee) (:name callee)])]
+     {:contract contract :args (argument-list (second (:args node)))}))
+  (and (= :apply (:op node)) (= :global (:op (:fn node))))
+   (when-let [contract (get globals [(:ns (:fn node)) (:name (:fn node))])]
+    {:contract contract :args (:args node)})
+  (= :remote (:op node))
+   (when-let [contract (get targets [(:mod node) (:fun node) (count (:args node))])]
+    {:contract contract :args (:args node)})
+  :else nil))
+
+(defn specialize
+ "Rewrite exact SDK registration calls into their declared identifier. Targets
+  map [actual-module actual-function arity] to a compiler-owned contract;globals
+  map [actual-namespace actual-binding] to the same contract. declare! records
+  an exact named callback descriptor and must not execute candidate code.
+  Quoted data/patterns/annotations stay inert. Only compiler definition carriers
+  expose literal executable ANF. Dynamic registration operands fail closed."
+ ([expression targets globals declare!]
+  (specialize expression targets globals declare! nil))
+ ([expression targets globals declare! lift!]
+ (let [left (atom 100000) registrations (atom [])]
+  (letfn [(walk [node depth]
+           (when (or (> depth 256) (neg? (swap! left dec)))
+            (refuse! :registration-analysis-budget {}))
+           (cond
+            (map? node)
+             (if (or (= :lit (:op node)) (:pop node)) node
+              (if-let [call (registration-call node targets globals)]
+               (let [contract (:contract call) args (:args call)
+                     ident (get (vec args) (:id-position contract))
+                     callback (get (vec args) (:callback-position contract))]
+                (when-not (and (= (:arity contract) (count args)) (= :lit (:op ident)))
+                 (refuse! :dynamic-executable-registration {:kind-of-declaration (:kind contract)}))
+                (let [callback (if (= :global (:op callback)) callback
+                                (if lift! (lift! contract (:val ident) (walk callback (inc depth)))
+                                 (refuse! :dynamic-executable-registration {:kind-of-declaration (:kind contract)})))]
+                 (when-not (and (= :global (:op callback)) (string? (:ns callback)) (string? (:name callback)))
+                  (refuse! :dynamic-executable-registration {:kind-of-declaration (:kind contract)}))
+                 (declare! contract (:val ident) (:ns callback) (:name callback))
+                 (swap! registrations conj {:kind (:kind contract) :ident (:val ident)
+                                             :owner (:ns callback) :callback (:name callback)})
+                 (if-let [runtime (:runtime-call contract)]
+                  (let [arguments (mapv (fn [position]
+                                          (if (= :identifier position) ident
+                                           (walk (nth args position) (inc depth)))) (:arguments runtime))
+                        argument-list (reduce (fn [tail argument]
+                                                {:op :cons :head argument :tail tail :ann {}})
+                                              {:op :enil :ann {}} (reverse arguments))]
+                   {:op :remote :mod :Elixir.BeamLisp.Ns.Rt :fun :invoke :ann (:ann node)
+                    :args (list {:op :global :ns (:namespace runtime) :name (:binding runtime)
+                                 :lookup :exact :ann {}} argument-list)})
+                  (assoc ident :ann (:ann node)))))
+              (let [next (reduce (fn [out [k v]]
+                                  (assoc out k (if (contains? #{:ann :meta :params :pats :pat :attrs :exports} k)
+                                                 v (walk v (inc depth))))) {} node)]
+               (cond
+                (and (= :remote (:op next)) (= :Elixir.BeamLisp.Link (:mod next))
+                     (= :defvar (:fun next)) (= 4 (count (:args next))))
+                 (let [payload (nth (:args next) 2)]
+                  (when-not (and (= :lit (:op payload)) (erlang/is_list (:val payload)))
+                   (refuse! :invalid-compiled-definition {}))
+                  (let [entries (mapv (fn [entry]
+                                       (when-not (and (tuple? entry) (= 4 (erlang/tuple_size entry))
+                                                      (= :defn-clause (:op (elem entry 3))))
+                                        (refuse! :invalid-compiled-definition {}))
+                                       (erlang/setelement 4 entry (walk (elem entry 3) (inc depth))))
+                                      (:val payload))]
+                   (assoc next :args (to-list (assoc (vec (:args next)) 2
+                                                   (assoc payload :val (to-list entries)))))))
+                (and (= :remote (:op next)) (= :Elixir.BeamLisp.Ns.Lower (:mod next))
+                     (= :reload-descriptor! (:fun next)) (= 1 (count (:args next))))
+                 (let [payload (first (:args next))]
+                  (when-not (and (= :lit (:op payload)) (= :module (:op (:val payload))))
+                   (refuse! :invalid-compiled-definition {}))
+                  (assoc next :args (list (assoc payload :val (walk (:val payload) (inc depth))))))
+                (= :global (:op next))
+                 (if-let [contract (get globals [(:ns next) (:name next)])]
+                  (refuse! :dynamic-executable-registration {:kind-of-declaration (:kind contract)}) next)
+                :else next))))
+            (vector? node) (mapv #(walk % (inc depth)) node)
+            (erlang/is_list node) (to-list (mapv #(walk % (inc depth)) node))
+            (tuple? node) (erlang/list_to_tuple (to-list (mapv #(walk % (inc depth)) (erlang/tuple_to_list node))))
+            :else node))]
+   {:expression (walk expression 0) :registrations @registrations}))))

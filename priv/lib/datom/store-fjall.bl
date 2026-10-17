@@ -39,7 +39,7 @@
 ;;     not only in the lock.
 
 (ns datom.store-fjall
-  (:require [datom.store] [datom.blob] [datom.blob-fs] [datom.value-codec]))
+  (:require [datom.store] [datom.blob] [datom.blob-fs] [datom.value-codec] [datom.store-admission :as admission] [datom.store-opening :as opening]))
 
 (def ^:private CHUNK-ROWS
   "Rows per native range crossing. 512 keeps a chunk ~8ms on the measured
@@ -95,6 +95,7 @@
   ; 2-tuples, inclusive. Every datom under any bound, decoded in Rust, ONE
   ; crossing. Returns {n datoms}. The semi-join read (datom.store/MultiScan).
   (fjall-resolve-prefixes 2)
+  (fjall-resolve-prefixes-data 2)
   (fjall-put 3)
   (fjall-delete 2)
   (fjall-cas 4)
@@ -157,6 +158,39 @@
 (defn- encode-value [v] (datom.value-codec/encode-slot v))
 (defn- decode-value [b] (datom.value-codec/decode-slot b))
 
+(defn- source-data-read?
+ "Actual native Source context, never a caller option. Old recovery has no
+  Source admission; a managed graph requires the current coupled Host ABI."
+ []
+ (and (erlang/function_exported :Elixir.BeamLisp.Env :source_data_decode_required? 0)
+      (BeamLisp.Env/source_data_decode_required?)))
+
+(defn- native-read-mode [mode]
+ (if (source-data-read?)
+  (case mode :datoms :datoms-data :datoms-reverse :datoms-reverse-data
+             :pairs :pairs-data :columns :columns-data
+             (throw (ex-info "Unsupported Source read mode" {:kind :source-store-read-mode})))
+  mode))
+
+(defn- native-mutation-admit! [store]
+ ;; Empty native Root summary avoids loading Conn for standalone/no-policy
+ ;; Store use. Only actual Env owns this denial-only protected fast path.
+ (if (and (erlang/function_exported :Elixir.BeamLisp.Env :native_command_critical_active? 0)
+          (BeamLisp.Env/native_command_critical_active?))
+  ((BeamLisp.Env/with_env :global
+    #(BeamLisp.AOT/sdk_named_constructor! "datom.conn" "native-mutation-admit!" 1)) store)
+  :legacy))
+
+(defn- native-update-callback [action]
+ (if (erlang/function_exported :Elixir.BeamLisp.Env :with_native_command_callback! 1)
+  (BeamLisp.Env/with_native_command_callback! action) (action)))
+(defn- native-mutation [store op arguments]
+ (if (and (erlang/function_exported :Elixir.BeamLisp.Env :native_command_critical_active? 0)
+          (BeamLisp.Env/native_command_critical_active?))
+  ((BeamLisp.Env/with_env :global
+    #(BeamLisp.AOT/sdk_named_constructor! "datom.conn" "native-mutation-effect!" 3))
+   store op arguments) :legacy))
+
 
 ;; ── the datom read fast path: the `Scan` capability ─────────────────
 ;;
@@ -183,7 +217,7 @@
     ; is a core `reduce` that consults `core/reduced?` per element (~190 reductions
     ; each, measured), which made a full scan 460 reductions a datom.
     (loop [chunks '() start lo after nil]
-      (let [res (fjall-resolve-chunk (:handle store) start after hi CHUNK-ROWS :datoms)
+      (let [res (fjall-resolve-chunk (:handle store) start after hi CHUNK-ROWS (native-read-mode :datoms))
             n (get res "n")]
         ; A native read that FAILED comes back as {:error, reason} rather than
         ; raising, and a failed first call would then read exactly like an empty
@@ -206,8 +240,10 @@
 (extend-protocol datom.store/MultiScan
   FjallStore
   (-scan-prefixes [store bounds]
-    (let [res (fjall-resolve-prefixes (:handle store)
-                                      (to-list (mapv (fn [b] (erlang/list_to_tuple (to-list [(get b 0) (get b 1)]))) bounds)))
+    (let [ranges (to-list (mapv (fn [b] (erlang/list_to_tuple (to-list [(get b 0) (get b 1)]))) bounds))
+          res (if (source-data-read?)
+                (fjall-resolve-prefixes-data (:handle store) ranges)
+                (fjall-resolve-prefixes (:handle store) ranges))
           n (get res "n")]
       (if (nil? n)
         (throw (ex-info (str "native multi-prefix scan failed: " res) {:bounds (count bounds)}))
@@ -246,7 +282,7 @@
 (extend-protocol datom.store/PageScan
   FjallStore
   (-scan-datoms-page [store start after hi limit]
-    (let [res (fjall-resolve-chunk (:handle store) start after hi limit :datoms)
+    (let [res (fjall-resolve-chunk (:handle store) start after hi limit (native-read-mode :datoms))
           n (get res "n")]
       ; A native read that FAILED comes back without an `n`, and would
       ; otherwise read exactly like an empty page — a backfill that silently
@@ -264,7 +300,7 @@
     (let [reverse? (= direction :desc)
           res (fjall-resolve-chunk (:handle store)
                                   (if (or reverse? (nil? after)) lo nil)
-                                  after hi limit (tuple (if reverse? :datoms-reverse :datoms) max-bytes))
+                                  after hi limit (tuple (native-read-mode (if reverse? :datoms-reverse :datoms)) max-bytes))
           n (get res "n")]
       (when (nil? n)
         (throw (ex-info "native ordered datom page failed" {:result res})))
@@ -273,7 +309,7 @@
          :byte-limited? (get res "byte-limited") :last (get res "last")
          :end? (and (not (get res "byte-limited")) (< n limit))}))))
 
-(defn open
+(defn- __allocate-native!
   "Open (or create) a fjall-backed store at `path`. The keyspace persists after
    the process exits — which is the whole point: reopening recovers every datom.
 
@@ -304,6 +340,10 @@
    Other canonicalization and engine-open failures raise `:store-open-failed`
    with the native cause. A returned store always carries a usable handle."
   [path]
+  (opening/assert-producer! :fjall path)
+  ;; Canonicalization itself creates the directory. Check before that native
+  ;; effect, then recheck the canonical spelling before opening the engine.
+  (admission/check! path)
   ; ONE IDENTITY FOR THE STORE. The claim's flock, its registry and its engine
   ; are all keyed by the directory's CANONICAL path (the lock is on the inode,
   ; so a symlink, a `..`, a relative spelling and a trailing separator all reach
@@ -319,7 +359,7 @@
              (= :error (erlang/element 1 canon)))
       (throw (ex-info "Cannot resolve Fjall store directory"
                       {:reason :store-open-failed :native (erlang/element 2 canon) :path path}))
-      (let [handle (fjall-open canon)]
+      (let [_ (admission/check! canon) handle (fjall-open canon)]
         (if (and (erlang/is_tuple handle)
                  (= :error (erlang/element 1 handle))
                  (erlang/is_tuple (erlang/element 2 handle))
@@ -334,6 +374,13 @@
           (if (and (erlang/is_tuple handle) (= :error (erlang/element 1 handle)))
             (throw (ex-info "Cannot open Fjall engine" {:reason :store-open-failed :native (erlang/element 2 handle) :path canon}))
             (->FjallStore handle canon)))))))
+
+(defn open
+ "Open a native Fjall store. Managed allocation is indexed before native entry
+  and atomically handed to Conn; unconnected/unknown handles block activation."
+ [path]
+ (admission/check! path)
+ (if (opening/managed?) (opening/allocate! :fjall path) (__allocate-native! path)))
 
 (defn available?
   "Whether the native fjall backend loaded. A persistent backend that fails to
@@ -378,7 +425,7 @@
     ; is a core `reduce` that consults `core/reduced?` per element (~190 reductions
     ; each, measured), which made a full scan 460 reductions a datom.
     (loop [chunks '() start lo after nil]
-      (let [res (fjall-resolve-chunk (:handle store) start after hi CHUNK-ROWS :pairs)
+      (let [res (fjall-resolve-chunk (:handle store) start after hi CHUNK-ROWS (native-read-mode :pairs))
             n (get res "n")]
         (if (nil? n)
           (throw (ex-info (str "native range read failed: " res) {:lo lo :hi hi}))
@@ -388,11 +435,15 @@
               (recur (cons (to-list (get res "pairs")) chunks) nil last)))))))
 
   (-put [store k v]
-    (fjall-put (:handle store) k (encode-value v))
+    (native-mutation-admit! store)
+    (let [encoded (encode-value v) answer (native-mutation store :fjall-put [k encoded])]
+     (when (= :legacy answer) (fjall-put (:handle store) k encoded)))
     store)
 
   (-delete [store k]
-    (fjall-delete (:handle store) k)
+    (native-mutation-admit! store)
+    (when (= :legacy (native-mutation store :fjall-delete [k]))
+     (fjall-delete (:handle store) k))
     store)
 
   (-update [store k f]
@@ -403,11 +454,14 @@
     ; attempt ceiling: every failed iteration failed BECAUSE another writer won,
     ; so the system always makes progress; yield after a few spins to avoid a
     ; livelock under heavy contention.
+    (native-mutation-admit! store)
     (loop [attempt 0]
-      (let [raw (fjall-get (:handle store) k)
-            next (f (decode-value raw))
+      (let [_ (native-mutation-admit! store)
+            raw (fjall-get (:handle store) k)
+            next (native-update-callback #(f (decode-value raw)))
             encoded (encode-value next)
-            result (fjall-cas (:handle store) k raw encoded)]
+            accepted (native-mutation store :fjall-cas [k raw encoded])
+            result (if (= :legacy accepted) (fjall-cas (:handle store) k raw encoded) (second accepted))]
         (if (erlang/element 1 result)
           [store next]
           (do (if (> attempt 8) (erlang/yield) nil)
@@ -417,14 +471,15 @@
     ; THE method this backend exists for: the whole batch lands together or not
     ; at all, applied IN ORDER — [[:delete k] [:put k v]] is a retract-then-
     ; reassert, so grouping puts ahead of deletes would lose the value.
-    (fjall-commit
-      (:handle store)
-      (to-list (mapv (fn [op]
-                       (if (= (get op 0) :put)
-                         (erlang/list_to_tuple
-                           (to-list [:put (get op 1) (encode-value (get op 2))]))
-                         (erlang/list_to_tuple (to-list [:delete (get op 1)]))))
-                     ops)))
+    (native-mutation-admit! store)
+    (let [encoded (mapv (fn [op]
+                          (if (= (get op 0) :put)
+                           [:put (get op 1) (encode-value (get op 2))]
+                           [:delete (get op 1)])) ops)
+          answer (native-mutation store :fjall-commit [encoded])]
+     (when (= :legacy answer)
+      (fjall-commit (:handle store)
+       (to-list (mapv #(erlang/list_to_tuple (to-list %)) encoded)))))
     store))
 
 ;; fjall is a DIRECTORY keyspace (segment files), not a single file; `.fjall`
@@ -453,7 +508,8 @@
 ;; rather than in a file.
 (extend-protocol datom.store/Closeable
   FjallStore
-  (-close [store] (fjall-sync (:handle store)) nil))
+  (-close [store]
+   (when (= :legacy (native-mutation store :fjall-sync [])) (fjall-sync (:handle store))) nil))
 
 (defn open-fresh
   "Open a fjall store at a fresh unique path. The engine owns its naming
@@ -467,7 +523,7 @@
    dominant bulk-load cost. Call this once at a durability boundary (end of a
    transaction or a bulk load) to turn N per-group fsyncs into one."
   [store]
-  (fjall-sync (:handle store))
+  (when (= :legacy (native-mutation store :fjall-sync [])) (fjall-sync (:handle store)))
   store)
 
 (extend-protocol datom.store/Durable
@@ -499,7 +555,10 @@
 (defrecord FjallCheckpointArtifact [handle])
 (extend-protocol datom.store/Checkpoint
  FjallStore
- (-capture-checkpoint [store] (->FjallCheckpointCursor (checkpoint-result (fjall-checkpoint-capture (:handle store))))))
+ (-capture-checkpoint [store]
+  (when (not= :legacy (native-mutation-admit! store))
+   (BeamLisp.Env/assert_native_framework_execution!))
+  (->FjallCheckpointCursor (checkpoint-result (fjall-checkpoint-capture (:handle store))))))
 (extend-protocol datom.store/CheckpointCursor
  FjallCheckpointCursor
  (-begin-checkpoint [cursor destination]

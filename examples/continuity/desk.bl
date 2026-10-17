@@ -1,0 +1,258 @@
+;; Stable conference harness. Versioned business code lives in versions/*.bl.
+;; This module owns sandbox HTTP, the one durable receipt store and observation.
+(ns continuity.desk
+ (:require [proc.evolve :as evolve] [proc.inventory :as inventory]
+           [continuity.receipts :as receipts]
+           [proc.queue :as queue] [proc.queue-runtime :as runtime]
+           [reload.generation :as generation] [datom :as d] [datom.conn :as conn]
+           [datom.store-fjall :as fjall] [datom.migrate :as migrate] [web]))
+
+(def schema receipts/schema)
+(defn totals [c] (receipts/totals c))
+(defn- stamp [] (System/monotonic_time :microsecond))
+(defn- suffix [n xs] (vec (drop (max 0 (- (count xs) n)) xs)))
+(defn- event! [h phase state label]
+ (swap! (:view h) (fn [v]
+   (-> v (assoc :phase phase :state state :label label)
+         (update :events #(suffix 16 (conj % {:phase phase :state state :label label :at (System/system_time :millisecond)})))))))
+(defn- timed! [h label f]
+ (let [start (stamp) result (f)]
+  (swap! (:view h) assoc-in [:timings label] (/ (- (stamp) start) 1000.0)) result))
+(defn- step! [h phase label]
+ (let [prior @(:view h)]
+  (when (= :running (:state prior)) (event! h (:phase prior) :completed (:label prior))))
+ (event! h phase :running label)
+ ;; Presenter pacing occurs OUTSIDE the serving actor and store writer.
+ (Process/sleep (:pace-ms h)))
+(defn- candidate [h version]
+ (generation/invoke! (get (:generations h) version) "continuity.orders/definition" []))
+(defn- job-handler [g]
+ (let [perform (generation/invoke! g "continuity.orders/job-handler" [])]
+  (generation/with! g
+   #(runtime/prepare :receipt-jobs
+      {:declaration {:of :continuity/receipt :protocol 1 :unique [:demo/id]} :perform perform}))))
+(defn- activate-jobs! [h version]
+ (let [current (:generation (runtime/status (:job-server h)))
+       result (runtime/activate! (:job-server h) current (job-handler (get (:generations h) version)))]
+  (when-not (contains? #{:applied :already-applied} (:status result))
+   (throw (ex-info "Queue handler refused" {:kind :queue-activation-refused})))))
+(defn- publish! [h spec]
+ (loop [remaining 20]
+  (let [current (:version (evolve/status (:owner h)))
+        prepared (evolve/prepare-upgrade! (:owner h) current spec
+                    [{:version 1 :message [:order "compatibility-sample" 1599]}])]
+   (if-not (= :prepared (:status prepared)) prepared
+    (let [result (evolve/commit-upgrade! (:owner h) (:ticket prepared))]
+     (if (and (= :stale-preparation (:kind result)) (pos? remaining)) (recur (dec remaining)) result))))))
+(defn- health? [h]
+ (let [version (:version (evolve/status (:owner h)))
+       client (:token (evolve/acquire-client! (:owner h) version))]
+  (try
+   (let [reply (evolve/call-client! (:owner h) client {:op :inspect})]
+    ;; Every legitimate receipt is 1599 cents. The fault is exactly +1, so
+    ;; this invariant stays meaningful even if another order arrives now.
+    (and (map? reply) (= (* 1599 (:orders reply)) (:gross-cents reply))))
+   (finally (evolve/release-client! (:owner h) client)))))
+(defn- ensure-version! [h expected]
+ (when-not (= expected (:version (evolve/status (:owner h))))
+  (throw (ex-info "Scenario is not available in this version" {:kind :scenario-unavailable}))))
+(defn scenario! [h action]
+ (global/trans (tuple (tuple :continuity-scenario (:owner h)) (erlang/self))
+  (fn []
+   (try
+    (case action
+     "bad-message"
+      (do (ensure-version! h 1) (step! h :prepare "Message migration")
+       (let [result (evolve/prepare-upgrade! (:owner h) 1 (assoc (candidate h 2) :upcast (fn [_] {:op :order :cents "wrong"}))
+                      [{:version 1 :message [:order "sample" 1599]}])]
+        (when-not (= :refused (:status result)) (throw (ex-info "Expected message refusal" {:kind :unexpected-admission})))
+        (swap! (:view h) assoc :message-check :blocked)
+        (event! h :prepare :blocked "Message migration refused") result))
+     "bad-state"
+      (do (ensure-version! h 1) (step! h :prepare "State migration")
+       (let [result (evolve/prepare-upgrade! (:owner h) 1 (assoc (candidate h 2) :migrate-state (fn [_] {:orders -1 :gross-cents "wrong"})))]
+        (when-not (= :refused (:status result)) (throw (ex-info "Expected state refusal" {:kind :unexpected-admission})))
+        (swap! (:view h) assoc :state-check :blocked)
+        (event! h :prepare :blocked "State migration refused") result))
+     "bad-data"
+      (do (step! h :expand "Historical data")
+       (let [result (migrate/plan-with (:store h)
+                      {:migration/id :continuity/unique-reference
+                       :migration/grows [{:db/ident :receipt/reference :db/valueType :db.type/string :db/unique :db.unique/identity}]})]
+        (when-not (= :breaking (:status result)) (throw (ex-info "Expected historical data refusal" {:kind :unexpected-admission})))
+        (swap! (:view h) assoc :data-check :blocked :conflicts (count (:breaking result)))
+        (event! h :expand :blocked "Duplicate references refused")
+        {:status :refused :kind :duplicate-data :conflicts (count (:breaking result))}))
+     "upgrade"
+      (do (ensure-version! h 1)
+       (step! h :prepare "Candidate ready")
+       (step! h :expand "Additive schema")
+       (let [r (migrate/apply! (:store h) {:migration/id :continuity/currency
+                  :migration/grows [{:db/ident :order/currency :db/valueType :db.type/string}]})]
+        (when-not (contains? #{:applied :already-applied} (:status r)) (throw (ex-info "Schema refused" {:kind :schema-refused}))))
+       (step! h :activate "Message · state · reply")
+       (let [result (timed! h :commit #(publish! h (candidate h 2)))]
+        (when-not (= :applied (:status result)) (throw (ex-info "Publication refused" {:kind (:kind result)}))))
+       (activate-jobs! h 2)
+       (swap! (:view h) assoc :message-check :passed :state-check :passed :reply-check :passed :data-check :passed)
+       (step! h :backfill "Receipt currency")
+       (let [rows (d/q '[:find ?e :where [?e :order/id _]] (d/db (:store h)))]
+        (when (seq rows) (d/transact! (:store h) (mapv (fn [row] [:db/add (first row) :order/currency "USD"]) rows))))
+       (event! h :drain :waiting "Old client still connected") {:status :applied})
+     "recover"
+      (do (ensure-version! h 2)
+       (step! h :prepare "Candidate with accounting fault")
+       (step! h :activate "Activate candidate")
+       (let [r (timed! h :fault-commit #(publish! h (candidate h 3)))]
+        (when-not (= :applied (:status r)) (throw (ex-info "Fault candidate refused" {:kind (:kind r)}))))
+       (step! h :activate "Receipt invariant")
+       (when (health? h) (throw (ex-info "Expected fault was not observed" {:kind :fault-not-observed})))
+       (event! h :activate :failed "Receipt invariant failed")
+       (event! h :recover :running "Health check failed · recovering")
+       ;; Leave traffic running during the recovery window. New receipts must
+       ;; survive; recovery derives from CURRENT data, never a saved snapshot.
+       (Process/sleep (max 700 (:pace-ms h)))
+       (let [before (totals (:store h))
+             r (timed! h :recovery #(publish! h (candidate h 4))) after (totals (:store h))]
+        (when-not (and (= :applied (:status r)) (>= (:orders after) (:orders before)) (health? h))
+         (throw (ex-info "Recovery unconfirmed" {:kind :recovery-unconfirmed})))
+        (swap! (:view h) assoc :recovered true :recovery-orders (:orders after))
+        (activate-jobs! h 4)
+        (event! h :recover :completed "Recovered · current receipts preserved") {:status :recovered}))
+     "drain"
+      (let [version (:version (evolve/status (:owner h)))]
+       (when (< version 2) (throw (ex-info "Upgrade first" {:kind :scenario-unavailable})))
+       (step! h :drain "Close old admissions")
+       ;; The pending durable job keeps its original handler/code context.
+       ;; Let that admitted work finish before retiring any old queue handler.
+       (d/transact! (:store h) [[:db/add (:job-id h) :job/at (System/system_time :millisecond)]])
+       (loop [left 500]
+        (let [job (d/entity (d/db (:store h)) (:job-id h))]
+         (when (= :failed (:job/state job))
+          (println {:durable-job-failure (:job/last-error job) :failure (:job/last-failure job)})
+          (throw (ex-info "Durable job failed" {:kind :durable-job-failed})))
+        (when-not (= :done (:job/state job))
+         (if (pos? left) (do (Process/sleep 10) (recur (dec left)))
+          (throw (ex-info "Durable work remains" {:kind :drain-incomplete}))))))
+       (doseq [[v g] (:generations h)]
+        (when (and (< v version) (some #{(:digest g)} (:retained (runtime/status (:job-server h)))))
+         (loop [left 100]
+          (let [r (runtime/retire! (:job-server h) (:digest g))]
+           (when-not (= :retired (:status r))
+            (if (and (= :waiting (:status r)) (pos? left)) (do (Process/sleep 10) (recur (dec left)))
+             (throw (ex-info "Queue context remains" {:kind :drain-incomplete}))))))))
+       ;; Requests borrow independent native client dependencies. Switching
+       ;; the producer never releases a token belonging to an accepted request.
+         (let [old @(:client h) next (evolve/acquire-client! (:owner h) version)]
+          (when-not (= :acquired (:status next)) (throw (ex-info "New client refused" {})))
+          (reset! (:client h) {:token (:token next) :version version})
+          (evolve/release-client! (:owner h) (:token old)))
+       (generation/release! (:held h))
+       (loop [left 100]
+        (let [r (evolve/retire! (:owner h) version (dec version))]
+         (when-not (= :retired (:status r))
+          (if (and (= :waiting (:status r)) (pos? left))
+           (do (Process/sleep 10) (recur (dec left)))
+           (throw (ex-info "Old clients remain" {:kind :drain-incomplete}))))))
+       (step! h :contract "Release old code")
+       (doseq [[v g] (:generations h)] (when (< v version) (generation/retire! g)))
+       (swap! (:view h) assoc :drained true)
+       (event! h :verify :completed "Old contracts retired") {:status :retired})
+     (throw (ex-info "Unknown scenario" {:kind :unknown-scenario})))
+    (catch e (event! h (:phase @(:view h)) :blocked (name (or (:kind (ex-data e)) :scenario-refused)))
+             {:status :refused :kind (or (:kind (ex-data e)) :scenario-refused)})))))
+
+(defn snapshot [h]
+ (let [status (evolve/status (:owner h)) traffic @(:traffic h) t (totals (:store h))
+       job (d/entity (d/db (:store h)) (:job-id h))
+       latencies (sort (:latencies traffic)) observed (inventory/snapshot (:application-id h))]
+  (merge @(:view h)
+   {:version (:version status) :actor (str (:owner h)) :vm (System/pid)
+    :orders (:orders t) :cents (:cents t)
+    :requests (:requests traffic) :errors (:errors traffic)
+    :p95-ms (when (seq latencies) (nth latencies (min (dec (count latencies)) (quot (* 95 (count latencies)) 100))))
+    :max-ms (:max-ms traffic) :revision (:revision status)
+    :client-version (:version @(:client h)) :legacy-versions (:legacy-versions status)
+    :job {:state (:job/state job) :version (get-in job [:job/result :version]) :origin 1}
+    :owners (if (= :valid (:status observed)) (count (:participants observed)) nil)
+    :inventory-scope "observed managed roles"
+    :graphs (mapv (fn [[v g]] (let [e (generation/evidence g)]
+                             {:version v :retired (:retired e) :leases (:registrations e)})) (:generations h))})))
+(defn submit! [h id]
+ (let [start (stamp)
+       result (loop [left 2]
+                (let [version (:version @(:client h))
+                      r (evolve/request! (:owner h) version
+                          (if (= 1 version) [:order id 1599] {:op :order :id id :cents 1599}))]
+                 ;; A producer sampled immediately before the drain fence has
+                 ;; not submitted an order yet. Retry admission using its new
+                 ;; version; never retry an unknown/possibly committed effect.
+                 (if (and (contains? #{:version-fenced :unsupported-version} (:kind r))
+                           (not= version (:version @(:client h))) (pos? left))
+                  (recur (dec left)) r)))
+       elapsed (/ (- (stamp) start) 1000.0) refused (= :refused (:status result))]
+  (swap! (:traffic h) (fn [m] (-> m (update :requests inc)
+     (update :errors + (if refused 1 0)) (update :max-ms max elapsed)
+     (update :latencies #(suffix 512 (conj % elapsed))))))
+  {:accepted (not refused) :reply result :elapsed-ms elapsed}))
+(defn authorized? [h c]
+ (and (contains? #{"127.0.0.1" "localhost"} (:host c))
+      (= (:token h) (web/req-header c "x-continuity-token"))
+      (not= "cross-site" (web/req-header c "sec-fetch-site"))
+      (or (nil? (web/req-header c "origin"))
+          (= (str "http://" (:host c) ":" (:port h)) (web/req-header c "origin")))))
+(defn router [h c]
+ (let [path (:request_path c) method (:method c)]
+  (cond
+   (not (contains? #{"127.0.0.1" "localhost"} (:host c))) (web/text c 403 "Loopback host required")
+   (and (= method "GET") (= path "/health/ready")) (web/json c {:ready true})
+   (and (= method "GET") (= path "/api/state")) (web/json c (snapshot h))
+   (and (= method "GET") (= path "/"))
+    (web/html c (String/replace (File/read! (str (:assets h) "/index.html")) "__TOKEN__" (:token h)))
+   (and (= method "GET") (= path "/desk.css")) (web/bytes c "text/css" (File/read! (str (:assets h) "/desk.css")))
+   (and (= method "GET") (= path "/desk.js")) (web/js c (File/read! (str (:assets h) "/desk.js")))
+   (and (= method "POST") (not (authorized? h c))) (web/json c 403 {:error "Demo authority required"})
+   (and (= method "POST") (= path "/api/order"))
+    (let [id (web/req-header c "x-order-id")]
+     (if (and (string? id) (Regex/match? #"^[a-zA-Z0-9-]{1,96}$" id))
+      (let [r (submit! h id)] (web/json c (if (:accepted r) 200 409) r))
+      (web/json c 400 {:error "Stable order ID required"})))
+   (and (= method "POST") (String/starts_with? path "/api/scenario/"))
+    (web/json c (scenario! h (subs path 14)))
+   :else (web/text c 404 "Not found"))))
+(defn open! [opts]
+ (let [root (:root opts) assets (str (:source-root opts) "/assets")]
+  (when-not (and (string? root) (String/starts_with? (Path/expand root) (str (System/get_env "HOME") "/")))
+   (throw (ex-info "Demo data must be under HOME" {:kind :invalid-sandbox-root})))
+  (File/mkdir_p! root)
+  (let [c (d/connect-with (fjall/open (str root "/receipts")) schema)
+        app-id (str "continuity-orders." (subs (Base/encode16 (crypto/hash :sha256 (Path/expand root)) (list (tuple :case :lower))) 0 16))
+        generations (into {} (map (fn [v]
+                        [v (generation/prepare! {:application-id app-id
+                          :sources {"continuity.orders" (File/read! (str (:source-root opts) "/versions/v" v ".bl"))
+                                    "continuity.receipts" (File/read! (str (:source-root opts) "/receipts.bl"))}
+                          :protocols {:receipt-jobs 1}
+                          :stable-namespaces #{"proc.evolve" "datom" "datom.conn"}})]) [1 2 3 4]))
+        spec (generation/invoke! (get generations 1) "continuity.orders/definition" [])
+        t (totals c) owner (evolve/start! spec {:store c :orders (:orders t) :cents (:cents t)} {:managed true})
+        client (evolve/acquire-client! owner 1)
+        handler (job-handler (get generations 1))
+        _ (queue/attach-store! (:server handler) c) _ (runtime/start! handler)
+        job (generation/with! (get generations 1)
+              #(queue/enqueue! :receipt-jobs {:demo/id "accepted-on-v1"} {:in [3600 :seconds]}))]
+   (d/transact! c [{:db/id -1 :receipt/reference "shared-reference"}
+                   {:db/id -2 :receipt/reference "shared-reference"}])
+   {:store c :owner owner :generations generations :application-id app-id :client (atom {:token (:token client) :version 1})
+    :held (generation/with! (get generations 1) generation/capture!)
+    :job-server (:server handler) :job-id (:db/id job)
+    :assets assets :port (:port opts 4048) :pace-ms (:pace-ms opts 250)
+    :token (Base/url_encode64 (crypto/strong_rand_bytes 24) (list (tuple :padding false)))
+    :traffic (atom {:requests 0 :errors 0 :max-ms 0 :latencies []})
+    :view (atom {:phase :prepare :state :ready :label "Ready for a live upgrade" :events [] :timings {}
+                 :message-check :pending :state-check :pending :reply-check :pending :data-check :pending})})))
+(defn close! [h]
+ (runtime/stop! (:job-server h))
+ (when (Process/alive? (:owner h)) (GenServer/stop (:owner h)))
+ (generation/release! (:held h))
+ (doseq [[_ g] (:generations h)] (generation/retire! g))
+ (d/close! (:store h)))

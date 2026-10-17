@@ -1,0 +1,298 @@
+(ns proc-dispatch-test
+ (:require [proc.dispatch :as dispatch] [proc.callback :as callback]
+           [proc.admission :as admission] [reload.generation :as generation]
+           [reload.state :as state]))
+
+(defn- await [pred]
+ (let [until (+ (erlang/monotonic_time :millisecond) 10000)]
+  (loop []
+   (cond (pred) true
+         (> (erlang/monotonic_time :millisecond) until) false
+         :else (do (Process/sleep 5) (recur))))))
+
+(defn- opts [table] {:table table :limit 1 :max-pending 4})
+(defn- job [id run failed]
+ {:id id :run run :waiting (fn [] nil) :failed failed})
+(defn- idle? [server] (= {:running 0 :queued 0} (dispatch/stats server)))
+
+(deftest capacity-is-reserved-before-code-and-one-registration-groups-events
+ (let [server (start dispatch/dispatcher (assoc (opts :dispatch-capacity-test) :max-pending 2))
+       gate (promise) calls (atom []) failed (atom [])
+       make-job (fn [id] (job id (fn [] (swap! calls conj id) @gate)
+                                 (fn [e] (swap! failed conj e))))]
+  (try
+   (is (= :accepted (:status (dispatch/submit! server (make-job :first)))))
+   (is (await #(= [:first] @calls)))
+   (is (= :accepted (:status (dispatch/submit! server (make-job :second)))))
+   (is (= {:running 1 :queued 1} (dispatch/stats server)))
+   (let [entry (elem (first (ets/lookup :dispatch-capacity-test :second)) 1)
+         before (ets/info :beam_lisp_code_leases :size)]
+    (is (map? (:registration entry)))
+    (is (nil? (:registrations entry)))
+    (is (= :duplicate (:status (dispatch/submit! server (make-job :second)))))
+    (is (= :busy (:status (dispatch/submit! server (make-job :third)))))
+    (is (await #(= before (ets/info :beam_lisp_code_leases :size)))))
+   (deliver gate true)
+   (is (await #(idle? server)))
+   (is (= [:first :second] @calls))
+   (is (= [] @failed))
+   (is (= 0 (ets/info :dispatch-capacity-test :size)))
+   (finally (deliver gate true) (stop server)))))
+
+(deftest finite-code-budget-refuses-before-retaining-a-callback
+ (let [server (start dispatch/dispatcher
+                (assoc (opts :dispatch-code-budget-test) :max-code-rows 16))
+       before (ets/info :beam_lisp_code_leases :size)
+       request (admission/token (erlang/self) 10000)]
+  (try
+   (is (= {:status :busy :kind :dispatch-code-budget}
+        (call server [:reserve {:id :too-large :request request :replay-safe? false
+                      :max-restarts 0 :lease-rows 17 :application-id nil}])))
+   (is (= 0 (ets/info :dispatch-code-budget-test :size)))
+   (is (= before (ets/info :beam_lisp_code_leases :size)))
+   (is (idle? server))
+   (finally (stop server)))))
+
+(deftest accepted-workers-drain-across-dispatcher-kill-without-replay
+ (let [options (opts :dispatch-replacement-test) server (start dispatch/dispatcher options)
+       replacement (atom nil) gate (promise) runs (atom 0) worker (atom nil)]
+  (try
+   (is (= :accepted (:status (dispatch/submit! server
+          (job :accepted (fn [] (swap! runs inc) (reset! worker (erlang/self)) @gate)
+            (fn [_] (throw (ex-info "unexpected replay/failure" {}))))))))
+   (is (await #(some? @worker)))
+   (Process/exit server :kill)
+   (is (await #(not (Process/alive? server))))
+   (is (Process/alive? @worker))
+   (reset! replacement (start dispatch/dispatcher options))
+   (is (= {:running 1 :queued 0} (dispatch/stats @replacement)))
+   (is (= 1 @runs))
+   (deliver gate true)
+   (is (await #(idle? @replacement)))
+   (is (= 1 @runs))
+   (finally
+    (deliver gate true)
+    (when (Process/alive? server) (stop server))
+    (when @replacement (stop @replacement))))))
+
+(deftest unknown-worker-outcome-is-not-replayed-by-default
+ (let [server (start dispatch/dispatcher (opts :dispatch-unknown-test))
+       runs (atom 0) worker (atom nil) failure (atom nil)]
+  (try
+   (dispatch/submit! server
+    (job :unknown (fn [] (swap! runs inc) (reset! worker (erlang/self))
+                         (receive :never nil))
+      (fn [reason] (reset! failure reason))))
+   (is (await #(some? @worker)))
+   (Process/exit @worker :kill)
+   (is (await #(idle? server)))
+   (is (= 1 @runs))
+   (is (= :worker-outcome-unknown (:kind @failure)))
+   (is (= :killed (:reason @failure)))
+   (finally (when (and @worker (Process/alive? @worker)) (Process/exit @worker :kill))
+    (stop server)))))
+
+(deftest explicitly-replay-safe-work-has-bounded-retry
+ (let [server (start dispatch/dispatcher (opts :dispatch-retry-test))
+       runs (atom 0) waiting (atom 0) failure (atom nil)]
+  (try
+   (is (= :accepted (:status (dispatch/submit! server
+          {:id :retry :replay-safe? true :max-restarts 2
+           :waiting (fn [] (swap! waiting inc))
+           :failed (fn [reason] (reset! failure reason))
+           :run (fn [] (swap! runs inc) (throw (ex-info "synthetic failure" {:kind :synthetic})))}))))
+   (is (await #(idle? server)))
+   (is (= 3 @runs))
+   (is (= 3 @waiting))
+   (is (= :synthetic (:kind (ex-data @failure))))
+   (finally (stop server)))))
+
+(deftest malformed-messages-refuse-without-crashing-the-owner
+ (let [server (start dispatch/dispatcher (opts :dispatch-shape-test))]
+  (try
+   (is (= {:status :refused :kind :unknown-dispatch-message} (call server [:wrong :message])))
+   (is (= :invalid-dispatch-request (:kind (call server [:reserve nil]))))
+   (is (= :invalid-dispatch-handoff (:kind (call server [:prepare :absent (erlang/make_ref) nil]))))
+   (is (Process/alive? server))
+   (is (idle? server))
+   (is (= :invalid-dispatch-job
+        (try (dispatch/submit! server {:id (fn [] :not-data) :run (fn [] nil)
+                                       :waiting (fn [] nil) :failed (fn [_] nil)}) nil
+          (catch e (:kind (ex-data e))))))
+   (is (idle? server))
+   (finally (stop server)))))
+
+(defn- prepare-slot [server id event]
+ (let [request (admission/token (erlang/self) 10000)
+       reserved (call server [:reserve {:id id :request request :replay-safe? false
+                          :max-restarts 0 :application-id nil :lease-rows 16}])
+       original (callback/register!
+                  (fn [[kind args]]
+                   (if (= :spawn kind) (apply dispatch/start-accepted-worker! args)
+                    (event [kind args])))
+                  (BeamLisp.Env/callback_modules event))
+       prepared (callback/prepare-transfer! original (:owner reserved))]
+  (when-not (= :reserved (:status reserved)) (throw (ex-info "fixture did not reserve" {})))
+  (when-not (= :prepared (:status (call server [:prepare id (:ticket reserved) prepared])))
+   (throw (ex-info "fixture did not index" {})))
+  {:prepared prepared :request request :reserved reserved}))
+
+(deftest handoff-refuses-noncallable-invokers-before-indexing
+ (let [server (start dispatch/dispatcher (opts :dispatch-invoker-shape-test))
+       request (admission/token (erlang/self) 10000)
+       reserved (call server [:reserve {:id :shape :request request :replay-safe? false
+                          :max-restarts 0 :application-id nil :lease-rows 16}])
+       original (callback/register! (fn [[_event _args]] nil))
+       prepared (callback/prepare-transfer! original (:owner reserved))]
+  (try
+   (is (= :invalid-dispatch-handoff
+        (:kind (call server [:prepare :shape (:ticket reserved)
+                 (-> prepared (assoc-in [:source :invoke] nil)
+                              (assoc-in [:accepted :invoke] nil))]))))
+   (is (nil? (:registration (elem (first (ets/lookup :dispatch-invoker-shape-test :shape)) 1))))
+   (is (= :cancelled (:status (call server [:abort :shape (:ticket reserved)]))))
+   (is (= 0 (ets/info :dispatch-invoker-shape-test :size)))
+   (is (Process/alive? server))
+   (finally (callback/unregister! original) (stop server)))))
+
+(defn- ready [] (receive :ready true (after 10000 false)))
+
+(deftest producer-kill-before-handoff-cancels-the-indexed-inactive-slot
+ (let [server (start dispatch/dispatcher (opts :dispatch-before-handoff-test))
+       parent (erlang/self) runs (atom 0)
+       producer (spawn
+                 (fn []
+                  (prepare-slot server :before (fn [[event _]] (when (= :run event) (swap! runs inc))))
+                  (erlang/send parent :ready)
+                  (receive :never nil)))]
+  (try
+   (is (ready))
+   (Process/exit producer :kill)
+   (is (await #(= 0 (ets/info :dispatch-before-handoff-test :size))))
+   (is (idle? server))
+   (is (= 0 @runs))
+   (finally (when (Process/alive? producer) (Process/exit producer :kill)) (stop server)))))
+
+(deftest producer-kill-after-handoff-recovers-without-a-commit-ack
+ (let [server (start dispatch/dispatcher (opts :dispatch-after-handoff-test))
+       parent (erlang/self) runs (atom 0)
+       producer (spawn
+                 (fn []
+                  (let [slot (prepare-slot server :after
+                               (fn [[event _]] (when (= :run event) (swap! runs inc))))]
+                   (callback/commit-transfer! (:prepared slot) (:request slot))
+                   (erlang/send parent :ready)
+                   (receive :never nil))))]
+  (try
+   (is (ready))
+   (Process/exit producer :kill)
+   (is (await #(= 1 @runs)))
+   (is (await #(idle? server)))
+   (is (= 0 (ets/info :dispatch-after-handoff-test :size)))
+   (is (= 1 @runs))
+   (finally (when (Process/alive? producer) (Process/exit producer :kill)) (stop server)))))
+
+(def PROBE :Elixir.BeamLisp.DispatchHandoffFaultProbe)
+
+(defn- compile-fault-probe! [directory]
+ (let [priv (erlang/list_to_binary (code/priv_dir :beam_lisp))
+       source (File/read! (Path/join priv "host/env.bl"))
+       sections (String/split source "(defn handoff_code!" (list (tuple :parts 2)))
+       tail (String/split (second sections) "(defn release_code!" (list (tuple :parts 2)))
+       body (first tail)
+       inserted "(insert_code_lease! next)"
+       deletion "(fn [row] (ets/delete_object :beam_lisp_code_leases row))"
+       fault (fn [stage]
+               (str "(when (erlang/== :" stage " (maps/get :fault-stage admission nil)) "
+                    "(erlang/send (maps/get :observer admission) (tuple :handoff-fault :" stage ")) "
+                    "(erlang/exit (erlang/self) :kill))"))
+       _ (when-not (and (= 2 (count (String/split body inserted)))
+                         (= 2 (count (String/split body deletion))))
+           (throw (ex-info "Handoff source fault boundaries moved; review fixture" {})))
+       patched-body (-> body
+                      (String/replace inserted (str "(do " inserted " " (fault "after-target") ")"))
+                      (String/replace deletion
+                        (str "(fn [row] (ets/delete_object :beam_lisp_code_leases row) "
+                             (fault "after-first-delete") ")")))
+       patched (str (first sections) "(defn handoff_code!" patched-body
+                    "(defn release_code!" (second tail))
+       ;; The probe must contend on the actual Env's physical lock identity;
+       ;; compiling under another module atom must not create separate fences.
+       patched (String/replace patched
+                 "(erlang/element 2 (erlang/fun_info (fn [] nil) :module))"
+                 ":Elixir.BeamLisp.Env")
+       input (str directory "/env-fault.bl") token (BeamLisp.Env/capture)]
+  (File/mkdir_p! directory)
+  (File/write! input patched)
+  (try
+   (let [compiled (BeamLisp.AOT/compile_host_file input
+                    (list (tuple :module PROBE) (tuple :output_dir directory)
+                          (tuple :source_hash (crypto/hash :sha256 patched)) (tuple :load? false)))
+         path (elem compiled 1)]
+    (code/load_binary PROBE (erlang/binary_to_list path) (File/read! path)))
+   (finally (BeamLisp.Env/bind token)))))
+
+(defn- fault-reached [stage]
+ (receive [:handoff-fault seen] :when (= seen stage) true (after 10000 false)))
+
+(deftest killed-native-move-recovers-after-target-insert-and-partial-source-delete
+ (let [directory (str (System/get_env "HOME") "/tmp/bl-dispatch-fault-"
+                     (erlang/unique_integer (list :positive)))
+       env-path (code/which :Elixir.BeamLisp.Env)]
+  (try
+   (compile-fault-probe! directory)
+   (doseq [[stage table] [[:after-target :dispatch-fault-after-target]
+                         [:after-first-delete :dispatch-fault-after-delete]]]
+    (let [server (start dispatch/dispatcher (opts table)) parent (erlang/self) runs (atom 0)
+          producer (spawn
+                    (fn []
+                     (let [slot (prepare-slot server stage
+                                  (fn [[event _]] (when (= :run event) (swap! runs inc))))
+                           prepared (:prepared slot)]
+                      (erlang/apply PROBE :handoff_code!
+                        (list (get-in prepared [:source :lease]) (get-in prepared [:accepted :lease])
+                          (assoc (:request slot) :observer parent :fault-stage stage))))))]
+     (try
+      (is (fault-reached stage))
+      (is (await #(not (Process/alive? producer))))
+      (is (await #(= 1 @runs)))
+      (is (await #(idle? server)))
+      (is (= 0 (ets/info table :size)))
+      (is (= 1 @runs))
+      (is (= env-path (code/which :Elixir.BeamLisp.Env)))
+      (finally (when (Process/alive? producer) (Process/exit producer :kill)) (stop server)))))
+   (finally (code/purge PROBE) (code/delete PROBE) (File/rm_rf! directory)))))
+
+(deftest shared-sdk-dispatcher-accepts-a-new-graph-after-its-empty-old-graph-retires
+ (let [options (fn [n]
+                 {:application-id "dispatch-owner-rotation"
+                  :sources {"dispatch.rotation" (str "(ns dispatch.rotation) (defn value [] " n ")")}})
+       old (generation/prepare! (options 1)) fresh (generation/prepare! (options 2))
+       resource :dispatch.rotation/table owner-key :dispatch.rotation/owner
+       server (atom nil) table (atom nil) observed (atom nil)]
+  (try
+   (generation/with! old
+    (fn []
+     (state/bind! {resource (atom nil) owner-key (atom (erlang/self))})
+     (reset! server (start dispatch/dispatcher
+                     {:limit 1 :table-key resource :owner-key owner-key}))
+     (reset! table @(state/cell! resource nil))))
+   (generation/inherit-runtime! fresh old)
+   ;; This uses the actual fixed SDK server, not an app-wrapped/sealed class.
+   ;; It has no accepted old callbacks and must not park an entire old graph.
+   (is (= :retired (:status (generation/retire! old))))
+   (is (Process/alive? @server))
+   (is (= :accepted (:status
+        (generation/with! fresh
+         #(dispatch/submit! @server
+           (job :new (fn []
+                       (reset! observed (generation/invoke! (generation/current)
+                                          "dispatch.rotation/value" [])))
+             (fn [error] (reset! observed [:failed error]))))))))
+   (is (await #(= 2 @observed)))
+   (is (await #(idle? @server)))
+   (is (= :retired (:status (generation/retire! fresh))))
+   (finally
+    (when (and @server (Process/alive? @server)) (stop @server))
+    (when @table (ets/delete @table))
+    (generation/retire! old) (generation/retire! fresh)))))

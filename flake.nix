@@ -39,15 +39,8 @@
       # `nix flake check` — the gate (CI runs it too). Fails loudly when the build
       # or its contract (runs; glibc floor <= the servers' 2.44) breaks.
       checks.${system} = {
-        # the drop starts and evaluates, with no /nix/store paths on its PATH/LD path
-        drop-runs = pkgs.runCommand "bl-drop-runs" { } ''
-          export HOME=$TMPDIR/home BL_DAEMON=off
-          mkdir -p $HOME
-          cp ${drop.bl-drop}/bl.drop ./bl.drop && chmod +x ./bl.drop
-          got=$(./bl.drop eval '(+ 1 2)')
-          [ "$got" = 3 ] || { echo "drop eval (+ 1 2) = '$got', want 3" >&2; exit 1; }
-          touch $out
-        '';
+        # Run the unchanged FHS-targeted artifact even in a strict Nix sandbox.
+        drop-runs = import ./nix/drop-runs.nix { inherit pkgs; drop = drop.bl-drop; };
         glibc-floor = pkgs.runCommand "bl-glibc-floor" { nativeBuildInputs = [ pkgs.binutils pkgs.findutils ]; } ''
           export DROP_BIN=${drop.drop-tools}/bin/drop
           got=$(sh ${./tooling/drop/glibc-floor.sh} ${drop.bl-drop}/bl.drop)

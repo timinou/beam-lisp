@@ -1,0 +1,297 @@
+; Native low-level retention controls. Not application/SDK actor authority proof.
+(ns datom.conn-lifetime-borrow-test
+ (:require [datom :as d] [datom.conn :as conn] [datom.store-ets :as store]))
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- connection [] (d/connect [{:db/ident :borrow/value :db/valueType :db.type/long}]))
+(defn- return-active! [ticket]
+ (when (conn/lifetime-borrow-active? ticket) (conn/release-lifetime! ticket)))
+(defn- await-down! [pid watch]
+ (receive [:DOWN seen :process stopped _] :when (and (= watch seen) (= pid stopped)) :down
+  (after 5000 (throw (ex-info "Borrow fixture worker did not finish" {:kind :fixture-timeout})))))
+
+(deftest exact-borrow-refuses-close-before-any-lifetime-or-writer-effects
+ (let [c (connection) ticket (conn/retain-lifetime! c)
+       custody (:custody (conn/creation-evidence! c))]
+  (try
+   (is (= :datom.conn/retained-lifetime (elem ticket 0)))
+   (is (conn/lifetime-borrow-active? ticket))
+   (is (= :connection-borrowers-draining (kind #(conn/release! c))))
+   (is (= :connection-borrowers-draining (kind #(conn/close! c))))
+   (is (= :open @(:lifetime c)))
+   (is (Process/alive? (:writer c)))
+   (is (= custody (:custody (conn/creation-evidence! c))))
+   (d/transact! c [[:db/add 1 :borrow/value 7]])
+   (is (= 7 (:borrow/value (d/entity (d/db c) 1))))
+   (is (= :released (conn/release-lifetime! ticket)))
+   (is (= false (conn/lifetime-borrow-active? ticket)))
+   (is (= :ok (conn/release! c)))
+   (is (= :closed @(:lifetime c)))
+   (finally (return-active! ticket) (conn/close! c)))))
+
+(deftest each-live-ticket-is-bounded-and-independent
+ (let [c (connection) tickets (atom [])]
+  (try
+   (dotimes [_ 128] (swap! tickets conj (conn/retain-lifetime! c)))
+   (is (= 128 (count @tickets)))
+   (is (every? conn/lifetime-borrow-active? @tickets))
+   (is (= :connection-borrow-capacity (kind #(conn/retain-lifetime! c))))
+   (is (= :released (conn/release-lifetime! (first @tickets))))
+   (let [replacement (conn/retain-lifetime! c)]
+    (swap! tickets conj replacement)
+    (is (conn/lifetime-borrow-active? replacement))
+    (is (= :connection-borrowers-draining (kind #(conn/close! c))))
+    (doseq [ticket (rest @tickets)] (return-active! ticket))
+    (is (= :ok (conn/release! c))))
+   (finally (doseq [ticket @tickets] (return-active! ticket)) (conn/close! c)))))
+
+(deftest forged-edited-and-returned-receipts-never-release-another-ticket
+ (let [c (connection) ticket (conn/retain-lifetime! c)]
+  (try
+   (is (= :invalid-connection-borrow (kind #(conn/retain-lifetime! {}))))
+   (is (= :connection-borrow-unavailable
+          (kind #(conn/retain-lifetime! (maps/put :lifetime (atom :open) c)))))
+   (is (= :connection-borrow-unavailable
+          (kind #(conn/retain-lifetime! (maps/put :basis (atom 0) c)))))
+   (is (= :stale-connection-borrow
+          (kind #(conn/release-lifetime! (erlang/setelement 5 ticket (erlang/make_ref))))))
+   (is (= :stale-connection-borrow
+          (kind #(conn/release-lifetime! (erlang/setelement 4 ticket (erlang/make_ref))))))
+   (is (= :stale-connection-borrow
+          (kind #(conn/release-lifetime! (erlang/setelement 3 ticket (atom :open))))))
+   (let [other (spawn (fn [] nil))]
+    (is (= :stale-connection-borrow
+           (kind #(conn/release-lifetime! (erlang/setelement 6 ticket other))))))
+   (is (conn/lifetime-borrow-active? ticket))
+   (is (= :released (conn/release-lifetime! ticket)))
+   (is (= :stale-connection-borrow (kind #(conn/release-lifetime! ticket))))
+   (conn/release! c)
+   (is (= :connection-borrow-unavailable (kind #(conn/retain-lifetime! c))))
+   (finally (return-active! ticket) (conn/close! c)))))
+
+(deftest accepted-holder-finishes-once-before-close-can-release-the-writer
+ (let [c (connection) parent (erlang/self) effects (atom 0)
+       worker (spawn
+        (fn []
+         (let [ticket (conn/retain-lifetime! c)]
+          (erlang/send parent [:borrow-held (erlang/self) ticket])
+          (receive :finish
+           (do (d/transact! c [[:db/add 1 :borrow/value 42]])
+               (swap! effects inc)
+               (conn/release-lifetime! ticket)
+               (erlang/send parent [:borrow-finished (erlang/self)]))))))
+       watch (Process/monitor worker) held (atom nil) completed (atom false)]
+  (try
+   (receive [:borrow-held seen ticket] :when (= seen worker) (reset! held ticket)
+    (after 5000 (throw (ex-info "Borrow holder did not arm" {:kind :fixture-timeout}))))
+   (is (= :connection-borrowers-draining (kind #(conn/close! c))))
+   (is (= :open @(:lifetime c)))
+   (is (Process/alive? (:writer c)))
+   (is (= 0 @effects))
+   (is (nil? (:borrow/value (d/entity (d/db c) 1))))
+   (erlang/send worker :finish)
+   (receive [:borrow-finished seen] :when (= seen worker) :finished
+    (after 5000 (throw (ex-info "Borrow holder did not complete" {:kind :fixture-timeout}))))
+   (await-down! worker watch)
+   (reset! completed true)
+   (is (= 1 @effects))
+   (is (= 42 (:borrow/value (d/entity (d/db c) 1))))
+   (is (= false (conn/lifetime-borrow-active? @held)))
+   (is (= :ok (conn/release! c)))
+   (is (= :closed @(:lifetime c)))
+   (finally
+    ;; Never free accepted custody merely because a fixture assertion failed.
+    ;; Request the same already-accepted body to finish, then require its DOWN.
+    (when-not @completed
+     (erlang/send worker :finish)
+     (await-down! worker watch))
+    (Process/demonitor watch (list :flush)) (conn/close! c)))))
+
+(deftest holder-down-is-not-completion-and-never-auto-releases-native-custody
+ (let [c (connection) parent (erlang/self)
+       worker (spawn (fn [] (let [ticket (conn/retain-lifetime! c)]
+                            (erlang/send parent [:borrow-held (erlang/self) ticket]))))
+       watch (Process/monitor worker) held (atom nil)]
+  (try
+   (receive [:borrow-held seen ticket] :when (= seen worker) (reset! held ticket)
+    (after 5000 (throw (ex-info "Borrow owner did not report" {:kind :fixture-timeout}))))
+   (await-down! worker watch)
+   (is (not (Process/alive? worker)))
+   (is (conn/lifetime-borrow-active? @held))
+   (is (= :connection-borrowers-draining (kind #(conn/close! c))))
+   (is (= :open @(:lifetime c)))
+   (is (Process/alive? (:writer c)))
+   ;; Fixture only: this worker body completed before exiting. In the real
+   ;; handler, ONLY independently proved job drain may return the capability.
+   (is (= :released (conn/release-lifetime! @held)))
+   (is (= :ok (conn/release! c)))
+   (finally (when @held (return-active! @held))
+    (Process/demonitor watch (list :flush)) (conn/close! c)))))
+
+(deftest close-winning-before-admission-refuses-retain-without-reopening
+ (let [s (store/open) c (d/connect-with s) parent (erlang/self)
+       worker (spawn (fn [] (erlang/send parent [:borrow-ready (erlang/self)])
+                       (receive :retain
+                        (erlang/send parent [:borrow-result (erlang/self)
+                          (kind #(conn/retain-lifetime! c))]))))
+       watch (Process/monitor worker)]
+  (try
+   (receive [:borrow-ready seen] :when (= seen worker) :ready
+    (after 5000 (throw (ex-info "Borrow race did not arm" {:kind :fixture-timeout}))))
+   (is (= :ok (conn/release! c)))
+   (is (= :closed @(:lifetime c)))
+   (erlang/send worker :retain)
+   (receive [:borrow-result seen reason] :when (= seen worker)
+    (is (= :connection-borrow-unavailable reason))
+    (after 5000 (throw (ex-info "Borrow race did not finish" {:kind :fixture-timeout}))))
+   (await-down! worker watch)
+   (is (= :closed @(:lifetime c)))
+   (finally (Process/demonitor watch (list :flush)) (conn/release! c) (store/close s)))))
+
+(deftest unborrowed-default-release-and-close-remain-unchanged
+ (let [s (store/open) c (d/connect-with s)]
+  (try
+   (is (= :ok (conn/release! c)))
+   (is (= :closed @(:lifetime c)))
+   (is (= :ok (conn/release! c)))
+   (is (nil? (conn/close! c)))
+   (finally (conn/release! c) (store/close s)))))
+
+(deftest retain-and-borrower-refusal-do-not-wait-on-a-busy-writer
+ (let [c (connection) parent (erlang/self) held (atom nil) completed (atom false)
+       worker (spawn (fn []
+                (conn/serialized! c
+                 (fn [] (erlang/send parent [:writer-held (erlang/self)])
+                   (receive :finish :finished)))
+                (erlang/send parent [:writer-finished (erlang/self)])))
+       watch (Process/monitor worker)]
+  (try
+   ;; The message comes from the actual serialized writer, not the helper PID.
+   (receive [:writer-held writer] :when (= writer (:writer c)) :ready
+    (after 5000 (throw (ex-info "Native writer did not enter" {:kind :fixture-timeout}))))
+   (reset! held (conn/retain-lifetime! c))
+   (is (conn/lifetime-borrow-active? @held))
+   (is (= :connection-borrowers-draining (kind #(conn/release! c))))
+   (is (= :open @(:lifetime c)))
+   (is (Process/alive? (:writer c)))
+   (is (Process/alive? worker))
+   (erlang/send (:writer c) :finish)
+   (receive [:writer-finished seen] :when (= seen worker) :finished
+    (after 5000 (throw (ex-info "Writer turn did not finish" {:kind :fixture-timeout}))))
+   (await-down! worker watch)
+   (reset! completed true)
+   (is (= :released (conn/release-lifetime! @held)))
+   (is (= :ok (conn/release! c)))
+   (finally
+    (when-not @completed (erlang/send (:writer c) :finish) (await-down! worker watch))
+    (when @held (return-active! @held))
+    (Process/demonitor watch (list :flush)) (conn/close! c)))))
+
+(deftest altered-full-handle-fields-and-noncanonical-raw-stores-refuse-without-effects
+ (let [c (connection) ticket (conn/retain-lifetime! c) effects (atom 0)
+       executable (fn [& _] (swap! effects inc))]
+  (try
+   (is (= :connection-borrow-unavailable
+          (kind #(conn/retain-lifetime! (maps/put :writer (erlang/self) c)))))
+   (is (= :connection-borrow-unavailable
+          (kind #(conn/retain-lifetime! (maps/put :snapshot (atom nil) c)))))
+   (is (= :connection-borrow-unavailable
+          (kind #(conn/retain-lifetime! (maps/put :schema-publication (atom nil) c)))))
+   (is (= :invalid-connection-borrow
+          (kind #(conn/retain-lifetime! (maps/put :executable executable c)))))
+   (is (= :invalid-connection-borrow
+          (kind #(conn/retain-lifetime! (maps/remove :snapshot c)))))
+   (is (= :invalid-connection-borrow
+          (kind #(conn/retain-lifetime! (maps/remove :schema-publication c)))))
+   (is (= :invalid-connection-borrow
+          (kind #(conn/retain-lifetime! (maps/put :prospective-schema true c)))))
+   (is (= :invalid-connection-borrow
+          (kind #(conn/retain-lifetime! (maps/put :pending-reports (atom []) c)))))
+   (is (= :invalid-connection-borrow
+          (kind #(conn/retain-lifetime! (maps/put :store executable c)))))
+   (is (= :invalid-connection-borrow
+          (kind #(conn/retain-lifetime!
+                   (maps/put :store {:__struct__ :Elixir.BeamLisp.LazySeq :input executable} c)))))
+   (is (= :invalid-connection-borrow
+          (kind #(conn/retain-lifetime!
+                   (maps/put :store (maps/put :executable executable (maps/get :store c)) c)))))
+   (is (= :invalid-connection-borrow
+          (kind #(conn/retain-lifetime!
+                   (maps/put :store {:custom-lookup executable} c)))))
+   (is (= 0 @effects))
+   (is (conn/lifetime-borrow-active? ticket))
+   (finally (return-active! ticket) (conn/close! c)))))
+
+(deftest stale-writer-handle-refuses-until-caller-obtains-an-actual-current-handle
+ (let [s (store/open) c (d/connect-with s) fresh (atom nil) ticket (atom nil)
+       old-writer (:writer c)]
+  (try
+   (Agent/stop old-writer :normal 30000)
+   ;; Ordinary native Datom behavior repairs the registry writer. Retention
+   ;; itself must not perform that repair or normalize the passed stale handle.
+   (d/transact! c [[:db/add 1 :db/doc "actual repaired writer"]])
+   (is (not (Process/alive? old-writer)))
+   (is (= :connection-borrow-unavailable (kind #(conn/retain-lifetime! c))))
+   (reset! fresh (d/connect-with s))
+   (is (not= old-writer (:writer @fresh)))
+   (is (= (:lifetime c) (:lifetime @fresh)))
+   (reset! ticket (conn/retain-lifetime! @fresh))
+   (is (conn/lifetime-borrow-active? @ticket))
+   (is (= :connection-borrowers-draining (kind #(conn/close! @fresh))))
+   (finally (when @ticket (return-active! @ticket)) (conn/close! (or @fresh c))))))
+
+(deftest native-creation-observation-rejects-altered-handles-before-custom-lookup
+ (let [c (connection) effects (atom 0) executable (fn [& _] (swap! effects inc))]
+  (try
+   (is (= :invalid-connection-custody
+          (kind #(conn/creation-evidence! (maps/put :store executable c)))))
+   (is (= :invalid-connection-custody
+          (kind #(conn/creation-evidence!
+                   (maps/put :store {:custom-lookup executable} c)))))
+   (is (= :invalid-connection-custody
+          (kind #(conn/creation-evidence! (maps/put :executable executable c)))))
+   (is (= :connection-custody-unavailable
+          (kind #(conn/creation-evidence! (maps/put :writer (erlang/self) c)))))
+   (is (= :connection-custody-unavailable
+          (kind #(conn/creation-evidence! (maps/put :snapshot (atom nil) c)))))
+   (is (= :connection-custody-unavailable
+          (kind #(conn/creation-evidence! (maps/put :schema-publication (atom nil) c)))))
+   (is (= 0 @effects))
+   (is (= c (:connection (conn/creation-evidence! c))))
+   (finally (conn/close! c)))))
+
+(deftest ticket-presence-does-not-confuse-dead-writer-with-returned-custody
+ (let [c (connection) ticket (conn/retain-lifetime! c)]
+  (try
+   (is (= :held (conn/lifetime-borrow-state ticket)))
+   (Agent/stop (:writer c) :normal 30000)
+   (is (= false (conn/lifetime-borrow-active? ticket)))
+   (is (= :held (conn/lifetime-borrow-state ticket)))
+   (is (= :connection-borrowers-draining (kind #(conn/close! c))))
+   (is (= :released (conn/release-lifetime! ticket)))
+   (is (= :absent (conn/lifetime-borrow-state ticket)))
+   (conn/release! c)
+   (is (= :unknown (conn/lifetime-borrow-state ticket)))
+   (finally (when (= :held (conn/lifetime-borrow-state ticket))
+              (conn/release-lifetime! ticket))
+            (conn/close! c)))))
+
+(deftest lost-observed-return-can-be-reconciled-only-with-private-prior-issued-receipt
+ (let [c (connection) ticket (conn/retain-lifetime! c)
+       private-issued {:receipt ticket :outcome :retained}]
+  (try
+   (is (= :held (conn/lifetime-borrow-state (:receipt private-issued))))
+   ;; Real native return commits; deliberately discard its acknowledgement,
+   ;; leaving the fixture's PRIVATE prior-issued record unchanged. This is a
+   ;; bounded reply-loss equivalence control, not an injected network failure.
+   (conn/release-lifetime! ticket)
+   (is (= :retained (:outcome private-issued)))
+   (is (= :absent (conn/lifetime-borrow-state (:receipt private-issued))))
+   (is (= :stale-connection-borrow (kind #(conn/release-lifetime! ticket))))
+   (is (= :unknown (conn/lifetime-borrow-state
+                    (erlang/setelement 3 ticket (atom :open)))))
+   (is (= :unknown (conn/lifetime-borrow-state
+                    (erlang/setelement 4 ticket (erlang/make_ref)))))
+   (is (= :ok (conn/release! c)))
+   (finally (when (= :held (conn/lifetime-borrow-state ticket))
+              (conn/release-lifetime! ticket))
+            (conn/close! c)))))

@@ -1,0 +1,113 @@
+(ns proc-lifetime-test (:require [proc.lifetime :as lifetime]
+                                [reload.generation :as generation]))
+
+(defn- await [pred]
+ (let [until (+ (erlang/monotonic_time :millisecond) 5000)]
+  (loop []
+   (cond (pred) true
+         (> (erlang/monotonic_time :millisecond) until) false
+         :else (do (Process/sleep 5) (recur))))))
+
+(defn- forged-reply [expected]
+ (let [me (erlang/self)]
+  (receive [ticket sender :disposed]
+    :when (and (= ticket expected) (= sender me)) :forged
+    (after 0 :missing))))
+
+(deftest explicit-cleanup-is-synchronous-and-idempotent
+ (let [calls (atom 0) handle (lifetime/register! (erlang/self) #(swap! calls inc))]
+  (is (Process/alive? (:pid handle)))
+  (is (= 0 @calls))
+  (is (= :released (lifetime/release! handle)))
+  (is (= 1 @calls))
+  (is (await #(not (Process/alive? (:pid handle)))))
+  (is (= :released (lifetime/release! handle)))
+  (is (= 1 @calls))))
+
+(deftest owner-kill-runs-cleanup-without-a-finally-or-sweep
+ (let [parent (erlang/self) calls (atom 0)
+       owner (spawn (fn []
+                      (let [handle (lifetime/register! (erlang/self) #(swap! calls inc))]
+                        (erlang/send parent [:armed handle])
+                        (receive :never nil))))
+       handle (receive [:armed h] h (after 5000 nil))]
+  (try
+   (is (some? handle))
+   (is (= 0 @calls))
+   (Process/exit owner :kill)
+   (is (await #(= 1 @calls)))
+   (is (await #(not (Process/alive? (:pid handle)))))
+   (is (= :released (lifetime/release! handle)))
+   (is (= 1 @calls))
+   (finally (when (Process/alive? owner) (Process/exit owner :kill))))))
+
+(deftest already-dead-owner-cleans-up-immediately
+ (let [owner (spawn (fn [] nil)) calls (atom 0)]
+  (is (await #(not (Process/alive? owner))))
+  (let [handle (lifetime/register! owner #(swap! calls inc))]
+   (is (await #(= 1 @calls)))
+   (is (= :released (lifetime/release! handle))))))
+
+(deftest cleanup-errors-are-reported
+ (let [handle (lifetime/register! (erlang/self)
+                #(throw (ex-info "synthetic cleanup failure" {:kind :synthetic-cleanup})))]
+  (is (= :synthetic-cleanup
+       (try (lifetime/release! handle) nil (catch e (:kind (ex-data e))))))))
+
+(deftest forged-reply-does-not-dispose-an-active-registration
+ (let [calls (atom 0) handle (lifetime/register! (erlang/self) #(swap! calls inc))]
+  (erlang/send (erlang/self) [(:ticket handle) (erlang/self) :disposed])
+  (is (= :released (lifetime/release! handle)))
+  (is (= 1 @calls))
+  (is (= :forged (forged-reply (:ticket handle))))))
+
+(deftest concurrent-release-and-owner-exit-run-cleanup-once
+ (let [parent (erlang/self) calls (atom 0)
+       owner (spawn (fn [] (receive :never nil)))
+       handle (lifetime/register! owner #(swap! calls inc))]
+  (doseq [_ (range 8)]
+   (spawn (fn [] (erlang/send parent [:disposed (lifetime/release! handle)]))))
+  (Process/exit owner :kill)
+  (doseq [_ (range 8)]
+   (is (= :released (receive [:disposed result] result (after 5000 :timeout)))))
+  (is (= 1 @calls))
+  (is (await #(not (Process/alive? (:pid handle)))))))
+
+(deftest releasing-caller-may-die-without-cancelling-cleanup
+ (let [calls (atom 0) entered (promise) finish (promise)
+       owner (spawn (fn [] (receive :never nil)))
+       handle (lifetime/register! owner
+                (fn [] (deliver entered true) @finish (swap! calls inc)))
+       caller (spawn (fn [] (lifetime/release! handle)))]
+  (try
+   (is (deref entered 5000 false))
+   (Process/exit caller :kill)
+   (Process/exit owner :kill)
+   (deliver finish true)
+   (is (await #(= 1 @calls)))
+   (is (= :released (lifetime/release! handle)))
+   (is (= 1 @calls))
+   (finally (deliver finish true)
+    (when (Process/alive? owner) (Process/exit owner :kill))
+    (when (Process/alive? caller) (Process/exit caller :kill))))))
+
+(deftest lost-cleanup-task-is-never-reported-as-disposed
+ (let [calls (atom 0) handle (lifetime/register! (erlang/self) #(swap! calls inc))]
+  (Process/exit (:pid handle) :kill)
+  (is (await #(not (Process/alive? (:pid handle)))))
+  (is (= :lifetime-cleanup-lost
+       (try (lifetime/release! handle) nil (catch e (:kind (ex-data e))))))
+  (is (= 0 @calls))))
+
+(deftest registration-retains-the-exact-graph-until-cleanup-completes
+ (let [g (generation/prepare! {:application-id "cleanup-retention" :sources
+           {"cleanup.probe" "(ns cleanup.probe) (defn value [] :old)"}})
+       calls (atom 0)
+       handle (generation/with! g #(lifetime/register! (erlang/self) (fn [] (swap! calls inc))))]
+  (try
+   (is (= :waiting (:status (generation/retire! g))))
+   (is (= :released (lifetime/release! handle)))
+   (is (= 1 @calls))
+   (is (await #(not (Process/alive? (:pid handle)))))
+   (is (= :retired (:status (generation/retire! g))))
+   (finally (lifetime/release! handle) (generation/retire! g)))))

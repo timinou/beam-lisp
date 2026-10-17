@@ -1,0 +1,164 @@
+; SDK adapter for ordinary live.app factories. No deployment code in the app.
+(ns live.lifecycle
+ (:require [live.app :as app] [reload.generation :as generation]
+           [proc.inventory :as inventory] [datom.conn :as conn]))
+
+(defn- refuse [kind] (throw (ex-info "Managed live application refused" {:kind kind})))
+(defn- reference? [value]
+ (and (string? value) (Regex/match? #"^[a-z][a-z0-9.-]*/[a-z][a-z0-9!?-]*$" value)))
+(defn- starter-of [pid evidence]
+ (let [starter (:starter evidence)]
+  (when-not (and (map? starter) (= pid (:child starter))
+                 (= (:module evidence) (:module starter))
+                 (erlang/is_pid (:creator starter)) (erlang/is_reference (:attempt starter))
+                 (erlang/is_reference (:ticket starter)))
+   (refuse :owner-starter-authority-unavailable)) starter))
+(defn- owned [graph]
+ (let [result (inventory/snapshot (:application-id graph) 100 10000)]
+  (when-not (= :valid (:status result)) (refuse :owner-inventory-unavailable))
+  (into {} (keep (fn [entry]
+    (when (and (contains? #{:server :supervisor} (:kind entry))
+               (= (:origin-generation entry) (:digest graph)))
+     (let [evidence (generation/owner-evidence (:pid entry))]
+      (when-not evidence (refuse :owner-authority-changed))
+      [(:pid entry) (assoc evidence :pid (:pid entry)
+                     :parent (when (= :server (:kind evidence))
+                               (:creator (starter-of (:pid entry) evidence))))])))
+    (:participants result)))))
+(defn- collect-children [graph before]
+ (let [after (owned graph) parent (erlang/self)]
+  (vec (keep (fn [[pid record]]
+    (when-not (contains? before pid)
+     (when-not (= :server (:kind record)) (refuse :background-supervisor-drain-contract-required))
+     ;; Immutable starter is captured before OTP start and authenticated in the
+     ;; native owner admission. Child-mutable $ancestors is never authority.
+     (when-not (= parent (:parent record)) (refuse :unsupported-concurrent-construction))
+     record)) after))))
+(defn- initialized-app [graph factory]
+ (when-not (reference? factory) (refuse :invalid-live-factory))
+ (let [value (generation/invoke! graph factory [])]
+  (when-not (and (map? value) (fn? (:principal value)) (fn? (:worlds value))
+                 (vector? (:routes value)) (some? (:shared-conn value)))
+   (refuse :invalid-managed-live-app))
+  value))
+
+(defn- uncertain-initialization [graph before]
+ ;; A complete direct-owner observation is useful for a later controlled drain,
+ ;; but is never evidence that all effects/resources have been observed.
+ (let [children (try (collect-children graph before) (catch _ nil))]
+  {:status :uncertain :kind :live-initializer-outcome-uncertain
+   :ownership (if children :observed :unavailable)
+   :owned-processes (mapv :pid (or children []))
+   :initializer-owners (or children [])}))
+
+(defn capture-invocation!
+ "Cold/offline ownership capture for an exact sealed named constructor. The
+  graph must be unserved before and after the call. Same-app calls serialize;
+  unsupported concurrent/non-direct creation returns uncertain. This is NOT a
+  general live creator-attempt proof or readiness/publication authority.
+  Returned value and native owner receipts are PRIVATE. Uncertainty never
+  authorizes constructor replay or disposal of unobserved effects/resources."
+ [graph reference args]
+ (when-not (and (reference? reference) (vector? args) (<= (count args) 32))
+  (refuse :invalid-owned-invocation))
+ (global/trans (tuple (tuple :live.lifecycle/cold-invocation (:application-id graph)) (erlang/self))
+  (fn []
+   (when-not (zero? (:serving-slots (generation/evidence graph)))
+    (refuse :cold-invocation-required))
+   (generation/with! graph
+    (fn []
+     (let [before (owned graph)]
+      (try
+       (let [value (generation/invoke! graph reference args) after (owned graph)
+             fresh (vec (keep (fn [[pid record]] (when-not (contains? before pid) record)) after))]
+        (when-not (and (zero? (:serving-slots (generation/evidence graph)))
+                       (every? #(and (= :server (:kind %)) (= (erlang/self) (:parent %))) fresh))
+         (refuse :unsupported-concurrent-construction))
+        {:status :returned :value value :ownership :observed :owners fresh})
+       (catch _
+        (let [result (uncertain-initialization graph before)]
+         {:status :uncertain :kind :owned-invocation-outcome-uncertain
+          :ownership (:ownership result) :owners (:initializer-owners result)})))))))))
+
+(defn initialize!
+ "Invoke the real initializer with declared borrowed options, validate its
+  live.app factory and collect only native-proved direct initializer children.
+  Caller is the stable lifecycle owner, before graph publication."
+ [graph factory initialize borrow context]
+ (when-not (and (reference? initialize) (map? borrow) (<= (count borrow) 32)
+                (every? (fn [[option store]]
+                  (and (keyword? option) (string? store) (contains? (:stores context) store))) borrow))
+  (refuse :invalid-live-bootstrap))
+ (generation/with! graph
+  (fn []
+   (let [before (owned graph)
+         options (reduce (fn [result [option store]]
+                    (assoc result option (get (:stores context) store)))
+                  (select-keys context [:configuration :data-root :candidate]) borrow)]
+    (try
+     (generation/invoke! graph initialize [options])
+     (let [value (initialized-app graph factory)
+           _ (when-not (= :ready (:state (conn/writer-observation (:shared-conn value))))
+               (refuse :live-shared-store-unavailable))
+           children (collect-children graph before)]
+      {:status :ready :owned-processes (mapv :pid children) :initializer-owners children})
+     (catch _ (uncertain-initialization graph before)))))))
+
+(defn start-background!
+ "Start the sealed domain background reference under its actual graph. New
+  direct children are native creator-proved; no namespace/pid guessing. This
+  constructor is an effect and must be invoked under a journal/lifecycle owner."
+ [graph reference]
+ (when-not (reference? reference) (refuse :invalid-background-reference))
+ (generation/with! graph
+  (fn [] (let [before (owned graph)]
+    (try
+     (generation/invoke! graph reference [])
+     {:status :ready :generation (:digest graph) :owners (collect-children graph before)}
+     (catch _
+      ;; A constructor may have started work before throwing. Do not pretend
+      ;; that the failure proves no effect or permits automatic re-execution.
+      (let [owners (try (collect-children graph before) (catch _ nil))]
+       {:status :uncertain :kind :background-constructor-outcome-uncertain
+        :generation (:digest graph) :ownership (if owners :observed :unavailable)
+        :owners (or owners [])})))))))
+
+(defn stop-background!
+ "Stop only captured direct owned server children, gracefully. A timeout
+  leaves an accepted handler/code/resources alive and returns waiting. Never
+  infer physical provider cancellation or retry safety from a stop request."
+ [records timeout-ms]
+ (when-not (and (vector? records) (<= (count records) 10000)
+                (erlang/is_integer timeout-ms) (<= 1 timeout-ms 30000))
+  (refuse :invalid-background-drain))
+ ;; Validate the entire finite inventory BEFORE sending even one stop. A
+ ;; journal turn waits on at most one live child, so timeout bounds the turn;
+ ;; following turns resume the same captured inventory without killing work.
+ (let [live (vec (filter (fn [record]
+    (let [pid (:pid record)]
+     (when-not (erlang/is_pid pid) (refuse :invalid-background-owner))
+     (when (Process/alive? pid)
+      (let [actual (generation/owner-evidence pid)]
+       (when-not (and (= :server (:kind record))
+                      (= (select-keys record [:application-id :generation :module :ticket :kind])
+                         (select-keys actual [:application-id :generation :module :ticket :kind]))
+                      (= (erlang/self) (:parent record))
+                      (= (:starter record) (:starter actual))
+                      (= (:parent record) (:creator (starter-of pid actual))))
+        (refuse :background-owner-authority-changed)))
+      true))) records))]
+  (when-let [record (first live)]
+   (try (GenServer/stop (:pid record) :normal timeout-ms) (catch _ nil)))
+  (let [waiting (count (filter (fn [record] (Process/alive? (:pid record))) live))]
+   {:status (if (pos? waiting) :waiting :drained)
+    :owners (count records) :waiting waiting})))
+
+(defn route!
+ "Factory and router share one atomically admitted selected graph. The app
+  value stays inside that lease; native WebSocket sessions retain independently."
+ [slot factory request]
+ (generation/with-selected! slot
+  (fn []
+   (let [graph (generation/current) value (initialized-app graph factory)
+         handler (fn [conn] (app/router value conn))]
+    (if-let [around (:around value)] (around handler request) (handler request))))))

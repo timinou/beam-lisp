@@ -1,0 +1,414 @@
+;; Bounded transient admission over ordinary managed processes. Durable job
+;; identity/progress belongs to the caller's store, never to this in-memory
+;; queue. Restarting a dispatcher observes accepted workers; it does not kill
+;; them or infer that an unknown provider outcome is safe to repeat.
+(ns proc.dispatch
+ (:require [proc.table :as table]
+           [proc.instance :as instance] [proc.callback :as callback]
+           [proc.admission :as admission] [proc.framework :as framework] [reload.execution :as generation]
+           [reload.state :as state] [data.first-order :as first-order]))
+
+(defn- fail [kind] (throw (ex-info "Dispatch admission refused" {:kind kind})))
+(defn- plain-map? [value]
+ (and (erlang/is_map value) (not (erlang/is_map_key :__struct__ value))))
+(defn- field [value key]
+ (when (plain-map? value) (maps/get key value nil)))
+(defn- valid-id? [value]
+ (and (some? value)
+      (try (first-order/check! value {:max-nodes 256 :max-bytes 4096 :max-depth 8}) true
+       (catch _ false))))
+(defn- lease? [value]
+ (and (tuple? value) (= 3 (erlang/tuple_size value))
+      (erlang/is_list (elem value 0)) (<= 1 (erlang/length (elem value 0)) 4096)
+      (every? #(erlang/is_atom %) (elem value 0))
+      (erlang/is_pid (elem value 1)) (= (erlang/node (elem value 1)) (erlang/node))
+      (erlang/is_reference (elem value 2))))
+(defn- row [table id] (when-let [entry (first (ets/lookup table id))] (elem entry 1)))
+(defn- save! [table job] (ets/insert table (tuple (:id job) job)) job)
+(defn- same-slot? [job ticket] (and job (= ticket (:ticket job))))
+(defn- invoke! [job event args]
+ (let [result (callback/try-invoke! (:registration job) [[event args]])]
+  (when (= :cancelled (:status result)) (fail :lost-dispatch-callback)) result))
+
+(defn- capacity-error? [error]
+ (or (= :code_lease_capacity error) (= :code_lease_capacity (:original error))))
+(defn- forget! [st job]
+ (when (:registration job) (callback/unregister! (:registration job)))
+ (ets/delete (:table st) (:id job))
+ (update st :code-rows - (:lease-rows job)))
+(defn- add-waiting [st job]
+ (update st :waiting (fn [waiting] (queue/in (:id job) waiting))))
+
+(defn- defer! [st job]
+ (let [st (update st :waiting (fn [waiting] (queue/in_r (:id job) waiting)))]
+  (if (:drain-timer st) st
+   (assoc st :drain-timer (Process/send_after (erlang/self) :dispatch-drain 250)))))
+
+(defn- publish-waiting! [st job]
+ (if (= :completed (:status (invoke! job :waiting [])))
+  (save! (:table st) (dissoc job :waiting-pending?))
+  job))
+
+(defn- dispose-reservation [st job]
+ (when (:watch job) (Process/demonitor (:watch job) (list :flush)))
+ (when (:timer job) (erlang/cancel_timer (:timer job)))
+ (update st :reservations dissoc (:watch job)))
+
+(defn- pending-table [opts]
+ (if (generation/current)
+  (do
+   (when-not (and (keyword? (:table-key opts)) (keyword? (:owner-key opts)))
+    (fail :missing-dispatch-owner))
+   (table/hold-owned! (state/cell! (:table-key opts) nil)
+     (state/get (:owner-key opts)) {:type :ordered_set :options [:public]}))
+  (table/hold (:table opts :proc-dispatch-pending)
+    {:type :ordered_set :options [:public :named_table]})))
+
+(defn- armed? [job]
+ (and (:registration job) (callback/active? (:registration job))))
+
+(defn- accepted [st job]
+ (let [st (dispose-reservation st job)
+       job (save! (:table st) (-> job (dissoc :watch :timer :source-registration)
+                                   (assoc :status :queued :waiting-pending? true)))
+       job (publish-waiting! st job)]
+  (add-waiting st job)))
+
+(defn- resolve-preparing [st job]
+ (cond
+  (armed? job) (accepted st job)
+  (admission/live? (:request job)) st
+  :else (dispose-reservation (forget! st job) job)))
+
+(defn- finish-failed [st job reason]
+ ;; Leave an indexed settlement-failed slot if durable status publication
+ ;; itself fails. A supervisor can retry that local settlement after restart;
+ ;; it must not rerun the provider operation as compensation.
+ (let [job (save! (:table st) (assoc job :status :settlement-failed :failure reason))]
+  (if (= :busy (:status (invoke! job :failed [reason]))) (defer! st job)
+   (forget! st job))))
+
+(defn- completed [st job reason]
+ (cond
+  (= :ok (:outcome job)) (forget! st job)
+  ;; A worker that never crossed its recorded start boundary cannot have
+  ;; invoked the callback. Its old callback remains retained for admission.
+  (and (not (:started? job)) (not= :failed (:outcome job)))
+   (defer! st (save! (:table st) (-> job (dissoc :pid :outcome :error)
+                                       (assoc :status :queued))))
+  (and (:replay-safe? job) (< (:restarts job) (:max-restarts job)))
+   (accepted st (-> job (dissoc :pid :outcome :error :started?) (update :restarts inc)))
+  :else
+   (finish-failed st job
+    (if (= :failed (:outcome job)) (:error job)
+     {:kind :worker-outcome-unknown :reason reason}))))
+
+(defn- mark-started! [table id ticket]
+ (let [job (row table id)]
+  (when (and (same-slot? job ticket) (= :running (:status job))
+             (= (erlang/self) (:pid job)))
+   (save! table (assoc job :started? true))
+   true)))
+
+(defn- worker-run! [table id ticket registration]
+ (let [job (row table id)]
+  (when (same-slot? job ticket)
+   ;; The retained event wrapper records start only AFTER native invocation
+   ;; admission. A before-entry lease refusal can safely wait for capacity.
+   (let [outcome (try
+                  (let [result (callback/try-invoke! registration [[:run [table id ticket]]])]
+                   (case (:status result)
+                    :completed {:outcome :ok}
+                    :busy {:outcome :deferred}
+                    (fail :lost-dispatch-callback)))
+                  (catch error {:outcome :failed :error error}))
+         current (row table id)]
+    (when (same-slot? current ticket) (save! table (merge current outcome)))))))
+
+(defn- await-run [ticket]
+ (receive [:dispatch-run seen] :when (= seen ticket) true
+  (after 60000 false)))
+
+(defn start-accepted-worker!
+ "Internal retained event operation. The dispatcher publishes this PID before
+  opening its ticket gate; managed spawn inherits the event's exact generation."
+ [table id ticket]
+ (spawn (fn [] (when (await-run ticket)
+                 (worker-run! table id ticket (:registration (row table id)))))))
+
+(defn- launch-worker! [table job]
+ (try
+  ;; Invoke the retained event in its captured generation before managed
+  ;; spawn. A shared dispatcher may predate this accepted job's graph.
+  (let [result (invoke! job :spawn [table (:id job) (:ticket job)])]
+   (when (= :completed (:status result)) (:value result)))
+  (catch error (if (capacity-error? error) nil (throw error)))))
+
+(defn- drain [st]
+ (loop [st st]
+  (if (or (>= (count (:running st)) (:limit st)) (queue/is_empty (:waiting st))) st
+   (let [taken (queue/out (:waiting st)) id (elem (elem taken 0) 1)
+         st (assoc st :waiting (elem taken 1)) job (row (:table st) id)]
+    (cond
+     (nil? job) (recur st)
+     (= :settlement-failed (:status job))
+      (let [after (finish-failed st job (:failure job))]
+       (if (:drain-timer after) after (recur after)))
+     (not= :queued (:status job)) (recur st)
+     :else
+      (let [job (if (:waiting-pending? job) (publish-waiting! st job) job)]
+       (if (:waiting-pending? job) (defer! st job)
+        (if-let [pid (launch-worker! (:table st) job)]
+         (let [ref (Process/monitor pid)]
+          ;; Accepted effects are unlinked from the replaceable dispatcher.
+          ;; Publish the exact slot/PID before opening its execution gate.
+          (save! (:table st) (assoc job :status :running :pid pid :started? false))
+          (erlang/send pid [:dispatch-run (:ticket job)])
+          (recur (assoc-in st [:running ref] {:id id :ticket (:ticket job) :pid pid})))
+         (defer! st job)))))))))
+
+(defn- watch-reservation [st job]
+ (let [ref (Process/monitor (get-in job [:request :owner]))
+       remaining (max 1 (- (get-in job [:request :deadline-ms])
+                           (erlang/monotonic_time :millisecond)))
+       timer (Process/send_after (erlang/self)
+               [:dispatch-expire (:id job) (:ticket job)] remaining)
+       job (save! (:table st) (assoc job :watch ref :timer timer))]
+  (assoc-in st [:reservations ref] {:id (:id job) :ticket (:ticket job)})))
+
+(defn configure [defaults options]
+ (let [options (or options {})]
+  (when-not (and (plain-map? defaults) (plain-map? options)) (fail :invalid-dispatch-options))
+  (first-order/check! options {:max-nodes 128 :max-bytes 4096 :max-depth 4})
+  (when-not (every? #{:table :logical-name :registered? :limit :max-pending
+                     :max-code-rows :table-key :owner-key} (keys options))
+   (fail :invalid-dispatch-options))
+  (merge defaults options)))
+
+(defn initial-state
+ "Create the actual owned queue. Managed callers declare :table-key and
+  :owner-key resources. :logical-name is instance scoped; :table is only the
+  ordinary development table name. Existing unknown table formats refuse."
+ [options]
+ (let [opts (configure {} options)
+       limit (:limit opts 4) capacity (:max-pending opts 4096)
+       code-budget (:max-code-rows opts 16384)]
+  (when-not (and (int? limit) (<= 1 limit 128)
+                (int? capacity) (<= limit capacity 65536)
+                (int? code-budget) (<= 16 code-budget 32768))
+   (fail :invalid-dispatch-capacity))
+  (let [app (:application-id (generation/current))
+        initializer (when (generation/current) (state/get (:owner-key opts)))
+        table (pending-table opts)
+        framework (framework/adopt! initializer)
+        _ (when (:registered? opts)
+            (instance/register! (:logical-name opts :proc.dispatch/server) (erlang/self)))
+        jobs (sort-by (fn [[_ job]] (:order job)) (ets/tab2list table))
+        _ (doseq [[_ job] jobs]
+            (when-not (and (= 2 (:format job)) (int? (:lease-rows job))
+                           (<= 1 (:lease-rows job) 65536))
+              (fail :legacy-dispatch-state)))
+        initial {:table table :owner (ets/info table :owner) :limit limit
+                 :max-pending capacity :waiting (queue/new) :running {} :reservations {} :drain-timer nil
+                 :max-code-rows code-budget :code-rows (reduce + 0 (map #(:lease-rows (second %)) jobs))
+                 :application-id app :framework framework}
+        restored
+        (reduce
+         (fn [st [_ job]]
+          (when-not (= 2 (:format job)) (fail :legacy-dispatch-state))
+          (case (:status job)
+           :preparing (let [after (watch-reservation st job)]
+                        (resolve-preparing after (row table (:id job))))
+           :queued (add-waiting st job)
+           :settlement-failed (finish-failed st job (:failure job))
+           :running
+            (if (and (:pid job) (Process/alive? (:pid job)))
+             (assoc-in st [:running (Process/monitor (:pid job))]
+               {:id (:id job) :ticket (:ticket job) :pid (:pid job)})
+             (completed st job :dispatcher-restarted))
+           (fail :invalid-dispatch-state)))
+         initial jobs)]
+   (drain restored))))
+
+(defn reserve!
+ [st request from]
+ (cond
+  (not (framework/alive? (:framework st))) [{:status :refused :kind :framework-initializer-exited} st]
+  (not (and (plain-map? request) (valid-id? (:id request))
+             (map? (:request request))
+             (contains? #{true false} (:replay-safe? request))
+             (int? (:max-restarts request)) (<= 0 (:max-restarts request) 3)
+             (int? (:lease-rows request)) (<= 1 (:lease-rows request) 65536)))
+   [{:status :refused :kind :invalid-dispatch-request} st]
+  (not= (elem from 0) (get-in request [:request :owner])) [{:status :refused :kind :wrong-submitter} st]
+  (not= (:application-id st) (:application-id request)) [{:status :refused :kind :wrong-dispatch-application} st]
+  (not (admission/live? (:request request))) [{:status :cancelled} st]
+  (row (:table st) (:id request)) [{:status :duplicate} st]
+  (>= (ets/info (:table st) :size) (:max-pending st)) [{:status :busy} st]
+  (> (+ (:code-rows st) (:lease-rows request)) (:max-code-rows st))
+   [{:status :busy :kind :dispatch-code-budget} st]
+  :else
+   (let [ticket (erlang/make_ref)
+         job (merge (select-keys request [:id :request :replay-safe? :max-restarts :lease-rows])
+               {:format 2 :ticket ticket :order (erlang/unique_integer (list :monotonic :positive))
+                :status :preparing :restarts 0})
+         st (watch-reservation (update st :code-rows + (:lease-rows request)) job)]
+    [{:status :reserved :ticket ticket :owner (:owner st)} st])))
+
+(defn prepare!
+ [st id ticket prepared from]
+ (let [job (row (:table st) id) source (field prepared :source) accepted (field prepared :accepted)]
+  (if-not (and (plain-map? prepared) (plain-map? source) (plain-map? accepted)
+               (lease? (:lease source)) (lease? (:lease accepted))
+               (fn? (:invoke source)) (= (:invoke source) (:invoke accepted))
+               (= (elem (:lease source) 0) (elem (:lease accepted) 0))
+               (<= (count (elem (:lease accepted) 0)) (:lease-rows job 0))
+               (same-slot? job ticket) (= :preparing (:status job))
+               (= (elem from 0) (get-in job [:request :owner]))
+               (nil? (:registration job))
+               (= (get-in job [:request :owner]) (elem (:lease source) 1))
+               (= (:owner st) (elem (:lease accepted) 1)))
+   [{:status :refused :kind :invalid-dispatch-handoff} st]
+   (do
+    (save! (:table st) (assoc job :registration accepted :source-registration source))
+    [{:status :prepared} st]))))
+
+(defn commit!
+ [st id ticket]
+ (let [job (row (:table st) id)]
+  (cond
+   (not (same-slot? job ticket)) [{:status :cancelled} st]
+   (contains? #{:queued :running} (:status job)) [{:status :accepted} st]
+   (and (= :preparing (:status job)) (armed? job))
+    [{:status :accepted} (drain (accepted st job))]
+   :else [{:status :cancelled} (drain (resolve-preparing st job))])))
+
+(defn abort!
+ [st id ticket from]
+ (let [job (row (:table st) id)]
+  (if-not (and (same-slot? job ticket) (= :preparing (:status job))
+               (= (elem from 0) (get-in job [:request :owner])))
+   [{:status :cancelled} st]
+   (do
+    ;; Cancel the original ticket before checking its target. If handoff won
+    ;; the shared physical fence, the indexed target remains accepted. If
+    ;; cancellation won, no later handoff can create an unindexed lease.
+    (when (:source-registration job) (callback/unregister! (:source-registration job)))
+    (if (armed? job)
+     [{:status :accepted} (drain (accepted st job))]
+     [{:status :cancelled} (dispose-reservation (forget! st job) job)])))))
+
+(defn departed! [st ref pid reason]
+ (if-let [entry (get (:running st) ref)]
+  (let [job (row (:table st) (:id entry)) st (update st :running dissoc ref)]
+   (drain (if (and (= pid (:pid entry)) (same-slot? job (:ticket entry)))
+            (completed st job reason) st)))
+  (if-let [entry (get (:reservations st) ref)]
+   (let [job (row (:table st) (:id entry))]
+    (drain (if (same-slot? job (:ticket entry)) (resolve-preparing st job) st)))
+   st)))
+
+(defn expire! [st id ticket]
+ (let [job (row (:table st) id)]
+  (drain (if (and (same-slot? job ticket) (= :preparing (:status job)))
+           (resolve-preparing st job) st))))
+
+(defn retry! [st] (drain (dissoc st :drain-timer)))
+
+(defn counts [st]
+ {:running (count (:running st)) :queued (queue/len (:waiting st))})
+
+(defn close! [st]
+ ;; Preserve accepted live workers, queued callbacks and preparing records in
+ ;; the original owner's table. A new dispatcher observes exact same slots.
+ (try
+ (when (:drain-timer st) (erlang/cancel_timer (:drain-timer st)))
+ (doseq [[_ entry] (:reservations st)]
+  (when-let [job (row (:table st) (:id entry))]
+   (when (:watch job) (Process/demonitor (:watch job) (list :flush)))
+   (when (:timer job) (erlang/cancel_timer (:timer job)))))
+ (finally (framework/close! (:framework st))))
+ :ok)
+
+(defserver dispatcher
+   (init [opts] (ok (proc.dispatch/initial-state (proc.dispatch/configure {} opts))))
+   (handle-call [:reserve request] [from st]
+    (let [[result after] (proc.dispatch/reserve! st request from)] (reply result after)))
+   (handle-call [:prepare id ticket prepared] [from st]
+    (let [[result after] (proc.dispatch/prepare! st id ticket prepared from)] (reply result after)))
+   (handle-call [:commit id ticket] [_from st]
+    (let [[result after] (proc.dispatch/commit! st id ticket)] (reply result after)))
+   (handle-call [:abort id ticket] [from st]
+    (let [[result after] (proc.dispatch/abort! st id ticket from)] (reply result after)))
+   (handle-call :stats [_from st] (reply (proc.dispatch/counts st) st))
+   (handle-call _ [_from st] (reply {:status :refused :kind :unknown-dispatch-message} st))
+   (handle-info [:DOWN ref :process pid reason] [st]
+    (if (proc.framework/initializer-down? (:framework st) ref pid)
+      (stop :normal st)
+      (noreply (proc.dispatch/departed! st ref pid reason))))
+   (handle-info :dispatch-drain [st]
+    (noreply (proc.dispatch/retry! st)))
+   (handle-info [:dispatch-expire id ticket] [st]
+    (noreply (proc.dispatch/expire! st id ticket)))
+   (handle-info _ [st] (noreply st))
+   (terminate [_reason st] (proc.dispatch/close! st)))
+
+(defn- transfer-and-commit! [server job reserved original request timeout-ms]
+ (let [prepared (callback/prepare-transfer! original (:owner reserved))
+       indexed (call server [:prepare (:id job) (:ticket reserved) prepared] timeout-ms)]
+  (if-not (= :prepared (:status indexed)) indexed
+   (try
+    (callback/commit-transfer! prepared request)
+    (call server [:commit (:id job) (:ticket reserved)] timeout-ms)
+    (catch error
+     (if (capacity-error? error)
+      (do (call server [:abort (:id job) (:ticket reserved)] timeout-ms)
+          {:status :busy :kind :code-retention-capacity})
+      (throw error)))))))
+
+(defn submit!
+ "Reserve finite capacity before retaining code. Busy means not accepted;
+  caller-owned durable backlog stays pending for a later admission. One exact
+  event registration groups run/wait/failure callbacks. Its prepared target
+  ticket is indexed before handoff, so lost acknowledgements are recoverable.
+  Default worker death is outcome-unknown, never automatic provider replay.
+  :replay-safe? true is an explicit domain promise, with max-restarts <= 3."
+ ([server job] (submit! server job {}))
+ ([server job opts]
+  (when-not (and (plain-map? job) (plain-map? opts)
+                 (every? #{:timeout-ms} (keys opts)))
+   (fail :invalid-dispatch-job))
+  (let [timeout-ms (:timeout-ms opts 60000) restarts (:max-restarts job 3)]
+   (when-not (and (valid-id? (:id job))
+                 (every? (fn [field] (fn? (get job field))) [:run :waiting :failed])
+                 (int? timeout-ms) (<= 1 timeout-ms 60000)
+                 (int? restarts) (<= 0 restarts 3)
+                 (contains? #{nil true false} (:replay-safe? job)))
+    (fail :invalid-dispatch-job))
+   (let [modules (mapcat BeamLisp.Env/callback_modules (map #(get job %) [:run :waiting :failed]))
+         ;; One event wrapper plus proc.callback's helper; reserve a safe
+         ;; upper bound before creating any extra native code registration.
+         lease-rows (+ 2 (count (set (concat modules (:modules (generation/current))))))
+         request (admission/token (erlang/self) timeout-ms)
+         reserved (call server [:reserve
+                    {:id (:id job) :request request :replay-safe? (= true (:replay-safe? job))
+                     :max-restarts restarts :lease-rows lease-rows
+                     :application-id (:application-id (generation/current))}]
+                    timeout-ms)]
+    (if-not (= :reserved (:status reserved)) reserved
+     (let [event (fn [[kind args]]
+                   (case kind
+                    :spawn (apply start-accepted-worker! args)
+                    :run (let [[table id ticket] args]
+                           (when (mark-started! table id ticket) ((:run job))))
+                    (apply (get job kind) args)))
+           original (try (admission/with-request nil #(callback/register! event modules))
+                       (catch error (if (capacity-error? error) nil (throw error))))]
+      (if-not original
+       (do (call server [:abort (:id job) (:ticket reserved)] timeout-ms)
+           {:status :busy :kind :code-retention-capacity})
+       (try
+        (transfer-and-commit! server job reserved original request timeout-ms)
+        (finally (callback/unregister! original))))))))))
+
+(defn stats [server] (call server :stats))

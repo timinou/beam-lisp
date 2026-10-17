@@ -89,8 +89,12 @@
             [datom.reconcile :as rc]
             [datom.watch :as watch]
             [proc.queue :as q]
+            [proc.queue-family :as family]
+            [proc.reconcile-config :as owned-config]
             [proc.server :refer [extend-clause!]]
-            [proc.tick :as tick]))
+            [proc.tick :as tick]
+            [reload.declaration :as declaration]
+            [reload.syntax-constructor :as syntax]))
 
 ;; ── the registration: config, because a clause is compiled, not started ─────
 ;;
@@ -98,8 +102,8 @@
 ;; projection, its conn and its consumer fns somewhere. It cannot be the
 ;; server's state (the prelude runs before the state exists) and it cannot be
 ;; the payload (a job is data, and a fn is not). So it is a module atom filled
-;; by the clause's prelude — the same shape `proc.queue/perform-fns` uses, for
-;; the same reason.
+;; by the clause's prelude. Queue performers themselves are already process-local,
+;; leased registrations;this legacy config catalogue still needs that boundary.
 
 (def configs
   "Server name (as a string) → the reconcile config its clause registered."
@@ -116,14 +120,60 @@
   "Server name → `{scope-eid [owed-watch stale-watch]}`."
   (atom {}))
 
+(declare dispatch-config!)
+
+(defn- resource-key [srv]
+ (if (or (declaration/managed?) (owned-config/registered? srv))
+  (owned-config/resource-key srv) (q/server-name srv)))
+
+(defn discard-resources! [key]
+ (doseq [[_ refs] (get @watches key {}) ref refs] (watch/unwatch ref))
+ (swap! watches dissoc key)
+ (swap! level-state dissoc key))
+
+(defn register-declared!
+ "The standard clause's managed owner-start boundary. A factory is resolved
+  from the exact graph;neither candidate preparation nor this call borrows a
+  development executable configuration."
+ ([srv descriptor policy] (register-declared! srv descriptor policy {}))
+ ([srv descriptor policy start-context]
+ (owned-config/register! srv descriptor policy start-context
+                         (fn [cfg operation args] (dispatch-config! srv cfg operation args))
+                         discard-resources!)))
+
+(defn call-config-factory
+ "Named factories may inspect actual start arguments without a custom clause.
+  Existing two-argument factories keep their interface;fixed three-argument
+  factories receive server,policy,start-opts. Compiler dispatch tuples are
+  accepted only through their exact fixed-arity function arms."
+ [factory srv policy start-opts]
+ (let [fixed (when (and (tuple? factory) (= 3 (erlang/tuple_size factory))
+                        (= :$blfn (elem factory 0)) (map? (elem factory 1)))
+               (elem factory 1))
+       three (if (erlang/is_function factory 3) factory (get fixed 3))
+       two (if (erlang/is_function factory 2) factory (get fixed 2))]
+  (cond
+   (erlang/is_function three 3) (three srv policy start-opts)
+   (erlang/is_function two 2) (two srv policy)
+   :else (throw (ex-info "Reconciliation factory takes server,policy,and optionally start-opts"
+                        {:kind :invalid-reconcile-factory})))))
+
 (defn register!
   "Called from the clause's prelude. Public because the generated form lives in
    the CALLER's namespace and calls it there."
   [srv cfg]
-  (swap! configs assoc (name srv) cfg)
+  (declaration/require-development!)
+  (swap! configs assoc (q/server-name srv) cfg)
   cfg)
 
-(defn- config-of [srv] (get @configs (name srv)))
+(defn- config-of [srv] (get @configs (q/server-name srv)))
+
+(defn configured?
+ "Whether the selected graph/owner can answer reconciliation operations.
+  Development has its own catalogue;managed code never falls back to it."
+ [srv]
+ (if (or (declaration/managed?) (owned-config/registered? srv))
+  (boolean (owned-config/available? srv)) (some? (config-of srv))))
 
 (defn- config! [srv]
   (let [c (config-of srv)]
@@ -134,11 +184,24 @@
                       {:server srv})))
     c))
 
+(defn bind-server!
+ "Evaluate a dynamic start identity once in its owner. Generated callbacks read
+  queue state;only init/prelude forms use this temporary process-local binding."
+ [declaration srv]
+ (let [resolved (q/resolve-server srv)]
+  (Process/put (tuple :proc.reconcile/server declaration) resolved)
+  resolved))
+
+(defn bound-server [declaration]
+ (or (Process/get (tuple :proc.reconcile/server declaration))
+     (throw (ex-info "Reconciliation owner identity has not been bound"
+                     {:kind :missing-reconcile-owner}))))
+
 (defn- note-level! [srv m]
-  (swap! level-state assoc (name srv) m))
+  (swap! level-state assoc (resource-key srv) m))
 
 (defn- note-error! [srv e]
-  (swap! level-state update (name srv)
+  (swap! level-state update (resource-key srv)
          (fn [m] (assoc (or m {}) :error (str e)
                         :error-at (erlang/system_time :millisecond)))))
 
@@ -217,7 +280,9 @@
    without it, so a watch that fails to start is not an outage."
   [srv cfg db pairs]
   (when (get cfg :watch?)
-    (let [key (name srv)
+   (owned-config/with-resources! srv
+    (fn []
+    (let [key (resource-key srv)
           have (get @watches key {})
           conn ((:conn-fn cfg) srv)
           rules (or (:rules cfg) [])
@@ -239,14 +304,14 @@
       (doseq [entry dead]
         (watch/unwatch (nth (nth entry 1) 0))
         (watch/unwatch (nth (nth entry 1) 1)))
-      (swap! watches assoc key live))))
+      (swap! watches assoc key live))))))
 
 (defn unwatch-all!
   "Stop every watch this module started for `srv`. A clause cannot inject a
    `terminate` (the injected one would shadow the server's own), so a process
    that really stops the server calls this. Returns `:ok`."
   [srv]
-  (let [key (name srv)]
+  (let [key (resource-key srv)]
     (doseq [entry (into [] (get @watches key {}))]
       (watch/unwatch (nth (nth entry 1) 0))
       (watch/unwatch (nth (nth entry 1) 1)))
@@ -277,9 +342,12 @@
    storm.
 
    → {:scopes n :owed n :stale n :parked n :enqueued n :created n :at ms}"
-  [srv]
-  (let [cfg (config! srv)
-        p (:projection cfg)
+  ([srv]
+   (if (or (declaration/managed?) (owned-config/registered? srv))
+    (owned-config/invoke! srv :pump [] (fn [cfg operation args] (dispatch-config! srv cfg operation args)))
+    (pump! srv (config! srv))))
+  ([srv cfg]
+  (let [p (:projection cfg)
         conn ((:conn-fn cfg) srv)
         db (datom/db conn)
         rules (or (:rules cfg) [])
@@ -308,7 +376,7 @@
                 (+ (count owed-live) (count stale-live)))
      :enqueued (count sel)
      :created (count (filter (fn [j] (= true (:job/created j))) jobs))
-     :at at}))
+     :at at})))
 
 ;; ── the perform: re-judge, then publish through the executor's own primitive ─
 
@@ -343,9 +411,12 @@
    A TRANSIENT failure is re-thrown, so the QUEUE retries it with backoff: this
    file has no retry loop, and a row that fails writes no answer, so an outage
    cannot suppress a revision."
-  [srv job]
-  (let [cfg (config! srv)
-        kind (:proj/kind job)
+  ([srv job]
+   (if (or (declaration/managed?) (owned-config/registered? srv))
+    (owned-config/invoke! srv :perform [job] (fn [cfg operation args] (dispatch-config! srv cfg operation args)))
+    (perform! srv job (config! srv))))
+  ([srv job cfg]
+  (let [kind (:proj/kind job)
         key (:proj/key job)
         sk (nth key 1)
         src-key (nth key 2)
@@ -375,7 +446,19 @@
             (if (= :error (:state r))
               (throw (ex-info (str "proc.reconcile: apply failed — " (:error r))
                               {:key key :error (:error r)}))
-              r)))))))
+              r))))))))
+
+(defn register-perform!
+ "Stage the exact config this owner admitted. A later registration cannot
+  change a delayed queue task's executable callbacks through config! lookup."
+ [srv]
+ (let [srv (q/resolve-server srv)]
+  (if (or (declaration/managed?) (owned-config/registered? srv))
+   (let [registration (owned-config/capture srv)]
+    (q/register-perform! srv
+     (fn [job] (owned-config/invoke-registration! registration :perform [job]))))
+   (let [cfg (config! srv)]
+    (q/register-perform! srv (fn [job] (perform! srv job cfg)))))))
 
 ;; ── the verb: what a console shows ──────────────────────────────────────────
 
@@ -420,14 +503,17 @@
    per scope, the projection's records by state, the queue's jobs by state, the
    parked count and the level pass's last run. Nothing asks a process, so a
    stopped server answers the same."
-  [srv]
-  (let [cfg (config! srv)
-        p (:projection cfg)
+  ([srv]
+   (if (or (declaration/managed?) (owned-config/registered? srv))
+    (owned-config/invoke! srv :status [] (fn [cfg operation args] (dispatch-config! srv cfg operation args)))
+    (status srv (config! srv))))
+  ([srv cfg]
+  (let [p (:projection cfg)
         conn ((:conn-fn cfg) srv)
         db (datom/db conn)
         rules (or (:rules cfg) [])
         pairs (vec ((:scope-fn cfg) db conn))
-        info (get @level-state (name srv) {})
+        info (get @level-state (resource-key srv) {})
         qs (q/stats srv)
         by-scope (into {}
                        (map (fn [pair]
@@ -446,7 +532,7 @@
      :parked (count (parked-keys srv))
      :last-level-at (:at info)
      :last-error (:error info)
-     :by-scope by-scope}))
+     :by-scope by-scope})))
 
 (defn retry!
   "Retry an explicitly selected parked failed/held job through the queue's
@@ -480,9 +566,12 @@
    re-derives its work from the store), so this needs none of `proc.tick`'s
    generation machinery — only its pure delay arithmetic. `:level nil` means the
    level pass runs at init only."
-  [srv]
-  (let [cfg (config! srv)
-        level (:level cfg)
+  ([srv]
+   (if (or (declaration/managed?) (owned-config/registered? srv))
+    (owned-config/invoke! srv :arm [] (fn [cfg operation args] (dispatch-config! srv cfg operation args)))
+    (arm! srv (config! srv))))
+  ([srv cfg]
+  (let [level (:level cfg)
         clock (get cfg :clock tick/wall-ms)
         opts {:clock clock :jitter (get cfg :jitter 0)}
         old (pd TIMER-KEY nil)]
@@ -491,7 +580,7 @@
       (let [ms (tick/tick-delay (period-ms level) opts (clock))]
         (erlang/put TIMER-KEY
                     (erlang/send_after (if (< ms 1) 1 ms) (erlang/self)
-                                       (tuple :bl-reconcile/level)))))))
+                                       (tuple :bl-reconcile/level))))))))
 
 (defn level-tick!
   "The timer's body: one level pass, then re-arm. A throwing pass is RECORDED
@@ -515,11 +604,35 @@
   (arm! srv)
   {:reconcile {:server srv :clock clock}})
 
+(defn dispatch-config!
+ "Closed SDK operation dispatch for one retained owner configuration."
+ [srv cfg operation args]
+ (case operation
+  :validate
+   (do
+    (when-not (map? cfg)
+     (throw (ex-info "Reconciliation factory must return a map" {:kind :invalid-reconcile-config})))
+    (doseq [[key arity] [[:conn-fn 1] [:scope-fn 2] [:apply 2]]]
+     (when-not (erlang/is_function (get cfg key) arity)
+      (throw (ex-info "Reconciliation factory callback has wrong arity"
+                      {:kind :invalid-reconcile-config :callback key}))))
+    (doseq [[key arity] [[:retire 2] [:paused-fn 2] [:clock 0]]]
+     (when (and (some? (get cfg key)) (not (erlang/is_function (get cfg key) arity)))
+      (throw (ex-info "Reconciliation factory callback has wrong arity"
+                      {:kind :invalid-reconcile-config :callback key}))))
+    (syntax/data-shape! (dissoc cfg :conn-fn :scope-fn :apply :retire :paused-fn :clock))
+    :valid)
+  :pump (pump! srv cfg)
+  :perform (perform! srv (first args) cfg)
+  :status (status srv cfg)
+  :arm (arm! srv cfg)
+  (throw (ex-info "Unknown reconciliation owner operation" {:kind :invalid-reconcile-operation}))))
+
 ;; ── the clause ──────────────────────────────────────────────────────────────
 
 (def KNOWN-CLAUSE-OPTS
   [:projection :conn-fn :scope-fn :rules :apply :retire :paused-fn :limit
-   :level :jitter :watch? :queue :clock])
+   :level :jitter :watch? :queue :clock :server :config-fn])
 
 (def CONFIG-KEYS
   [:projection :conn-fn :scope-fn :rules :apply :retire :paused-fn :limit
@@ -557,23 +670,53 @@
           (throw (ex-info (str where ": unknown reconcile option " k " — known: "
                                (join " " (map (fn [x] (str x)) KNOWN-CLAUSE-OPTS)))
                           {:option k}))))
-      (doseq [k REQUIRED-OPTS]
-        (when (nil? (get opts k))
-          (throw (ex-info (str where ": (reconcile …) needs " k)
-                          {:option k :clause clause}))))
-      (let [srv (list 'quote (:name ctx))
+      (when (contains? opts :config-fn)
+        (when-not (symbol? (:config-fn opts))
+          (throw (ex-info (str where ": :config-fn names a runtime factory taking server and policy")
+                          {:kind :invalid-reconcile-factory})))
+        (doseq [k [:projection :conn-fn :scope-fn :rules :apply :retire :paused-fn]]
+          (when (contains? opts k)
+            (throw (ex-info (str where ": :config-fn cannot be combined with " k)
+                            {:kind :ambiguous-reconcile-config :option k})))))
+      (when-not (contains? opts :config-fn)
+        (doseq [k REQUIRED-OPTS]
+          (when (nil? (get opts k))
+            (throw (ex-info (str where ": (reconcile …) needs " k)
+                            {:option k :clause clause})))))
+      (let [dynamic? (contains? opts :server)
+            identity (list 'quote (:name ctx))
+            srv (if dynamic? (list 'proc.reconcile/bound-server identity) identity)
             clock (if (some? (get opts :clock)) (get opts :clock) 'proc.tick/wall-ms)
             qdecl (merge DEFAULT-QUEUE-DECL (:queue opts))
             qopts (if (some? (get opts :clock)) (assoc qdecl :clock (get opts :clock)) qdecl)
-            qc (q/queue-clause (list 'queue qopts) ctx)
+            qc (q/queue-clause (list 'queue (assoc qopts :server srv)) ctx)
             cfg0 (select-keys opts CONFIG-KEYS)
-            cfg0 (if (contains? cfg0 :retire) cfg0 (assoc cfg0 :retire (fn [_row _target] nil)))
-            cfg (if (contains? cfg0 :level) cfg0 (assoc cfg0 :level DEFAULT-LEVEL))]
-        {:prelude (vec (concat (:prelude qc)
-                               [`(proc.reconcile/register! ~srv ~cfg)
-                                `(proc.queue/register-perform!
-                                  ~srv
-                                  (fn [job#] (proc.reconcile/perform! ~srv job#)))]))
+            cfg0 (if (contains? cfg0 :retire) cfg0 (assoc cfg0 :retire '(fn [_row _target] nil)))
+            cfg (if (contains? cfg0 :level) cfg0 (assoc cfg0 :level DEFAULT-LEVEL))
+            policy (select-keys cfg [:level :jitter :limit :watch?])
+            factory-body (if (contains? opts :config-fn)
+                           (list 'proc.reconcile/call-config-factory (:config-fn opts)
+                                 '__reconcile_server__ '__reconcile_policy__ 'start-opts)
+                           cfg)
+            factory-body (if (and (contains? opts :config-fn) (contains? opts :clock))
+                           (list 'assoc factory-body :clock (:clock opts)) factory-body)
+            managed (declaration/expand-reconcile! (:name ctx) factory-body (q/normalise-decl qdecl) policy)
+            cfg (if (contains? opts :config-fn)
+                  (let [value (list 'proc.reconcile/call-config-factory (:config-fn opts)
+                                    srv policy 'start-opts)]
+                   (if (contains? opts :clock) (list 'assoc value :clock (:clock opts)) value)) cfg)
+            registration (if managed
+                           (list 'proc.reconcile/register-declared! srv (:id managed) policy 'start-opts)
+                           (list 'proc.reconcile/register! srv cfg))]
+        {:definitions (when managed [(:definition managed)])
+         :prelude (vec (concat (when dynamic?
+                                [(list 'proc.reconcile/bind-server! identity (:server opts))])
+                              (when managed [(list 'proc.queue-family/register!
+                                               (list 'proc.queue/server-name srv) (:id managed) (q/normalise-decl qdecl))
+                                             (list 'proc.queue/ensure-family-store! srv)])
+                              (:prelude qc)
+                               [registration
+                                `(proc.reconcile/register-perform! ~srv)]))
          ;; THE QUEUE'S INIT FIRST, in a `let` rather than left to `merge`'s
          ;; argument order: `pump!` below enqueues, and `enqueue!` reads the
          ;; queue's DECLARATION, which the queue's init is what writes. Ordering
@@ -584,12 +727,12 @@
                   (merge q# (proc.reconcile/init-state ~srv ~clock)))
          :clauses (vec (concat (:clauses qc)
                                [`(handle-info [:bl-reconcile/level] [st#]
-                                   (noreply (proc.reconcile/level-tick! ~srv st#)))
+                                   (noreply (proc.reconcile/level-tick! (:server (:queue st#)) st#)))
                                 `(handle-call [:reconcile-status] [_from# st#]
-                                    (reply (proc.reconcile/status ~srv) st#))
+                                    (reply (proc.reconcile/status (:server (:queue st#))) st#))
                                 `(handle-call [:reconcile-pump] [_from# st#]
-                                    (reply (proc.reconcile/pump! ~srv) st#))
+                                    (reply (proc.reconcile/pump! (:server (:queue st#))) st#))
                                 `(handle-call [:reconcile-retry id#] [_from# st#]
-                                    (reply (proc.reconcile/retry! ~srv id#) st#))]))}))))
+                                    (reply (proc.reconcile/retry! (:server (:queue st#)) id#) st#))]))}))))
 
 (extend-clause! :reconcile reconcile-clause)

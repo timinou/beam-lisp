@@ -1,0 +1,242 @@
+(ns aot-derived-stream-test)
+(defn- literal [value] {:op :lit :val value})
+(defn- remote [module function arguments]
+ {:op :remote :mod module :fun function :args arguments})
+(defn- core [function arguments] (remote :Elixir.BeamLisp.Ns.Core function arguments))
+(defn- lambda [names body]
+ {:op :fn :clauses (list {:pats (to-list (mapv #(hash-map :pop :pvar :name %) names))
+                          :guard nil :body body})})
+(defn- variable [name] {:op :var :name name})
+(defn- identity [] (lambda ["x"] (variable "x")))
+(defn- mapped [callback value] (core :map (list callback value)))
+(defn- consume [value] (core :to-list (list value)))
+(defn- run [expression] (BeamLisp.AOT/interpret_constructor! expression {} {}))
+(defn- refusal [expression]
+ (try (run expression) nil (catch error (ex-data error))))
+(defn- fresh [] (remote :Elixir.BeamLisp.Ns.Rt :gensym (list (literal "stream"))))
+(defn- source-core [name arguments]
+ (BeamLisp.AOT/interpret_constructor!
+  {:op :apply :fn {:op :global :ns "core" :name name} :args arguments} {}
+  (BeamLisp.AOT/constructor_metadata {"core" (BeamLisp.Env/ns_defs "core")} {})))
+
+(deftest construction-defers-all-interpreted-producers
+ (let [path (str (System/get_env "HOME") "/tmp/derived-stream-never-constructed-"
+                 (System/unique_integer (list :positive)))
+       effect (lambda ["x"] (remote :Elixir.File :write! (list (literal path) (literal "bad"))))
+       map (mapped effect (literal [1]))
+       filter (core :filter (list effect (literal [1])))
+       concat (core :concat (list (literal (list 1)) map))]
+  (try
+   (doseq [value [map filter concat]]
+    (is (= :unused (run {:op :let :name "unused" :init value :body (literal :unused)}))))
+   (is (= false (File/exists? path)))
+   (finally (File/rm path)))))
+
+(deftest derived-nodes-have-canonical-lazy-identity-and-no-public-capability-shape
+ (doseq [value [(mapped (identity) (literal [1 2]))
+               (core :filter (list (lambda ["x"] (literal true)) (literal [1 2])))
+               (core :concat (list (literal (list 1)) (literal [2])))]]
+  (is (= true (run (remote :Elixir.BeamLisp.LazySeq :lazy? (list value)))))
+  (is (= false (run (core :vector? (list value)))))
+  (is (= false (run (core :set? (list value)))))
+  (is (= :opaque-finite-recipe-observation (:detail (refusal (core :list? (list value))))))
+  (is (= :finite-recipe-escape (:detail (refusal value))))))
+
+(deftest admitted-finite-values-match-the-canonical-lazy-runtime
+ (doseq [value [nil (list 1 2) [1 2] #{1 2} "é🙂"]]
+  (is (= (BeamLisp.Ns.Rt/k-to-list (BeamLisp.Ns.Rt/map (fn [x] x) value))
+         (run (consume (mapped (identity) (literal value))))))
+  (is (= (BeamLisp.Ns.Rt/k-to-list (BeamLisp.Ns.Rt/filter (fn [_] true) value))
+         (run (consume (core :filter (list (lambda ["x"] (literal true)) (literal value))))))))
+ (is (= (list 1 2 3)
+        (run (consume (core :concat (list (literal (list 1)) (literal [2 3]))))))))
+
+(deftest first-and-nth-force-the-native-chunk-and-no-unused-next-chunk
+ (let [path (str (System/get_env "HOME") "/tmp/derived-stream-unused-chunk-"
+                 (System/unique_integer (list :positive)))
+       bounded (lambda ["x"]
+                 {:op :if :test (remote :erlang :< (list (variable "x") (literal 32)))
+                  :then (variable "x")
+                  :else (remote :Elixir.File :write! (list (literal path) (literal "bad")))})
+       values (literal (vec (range 40)))
+       count (atom 0)
+       native (BeamLisp.Ns.Rt/map
+                (fn [x] (swap! count inc) (if (< x 32) x (erlang/error :unused-chunk)))
+                (vec (range 40)))]
+  (try
+   (is (= 0 (BeamLisp.Ns.Rt/first native)))
+   (is (= 32 @count))
+   (is (= 0 (run (core :first (list (mapped bounded values))))))
+   (is (= 31 (run (core :nth (list (mapped bounded values) (literal 31))))))
+   (is (= :constructor-machine-refused
+          (:kind (refusal (core :nth (list (mapped bounded values) (literal 32)))))))
+   (is (= false (File/exists? path)))
+   (finally (File/rm path)))))
+
+(deftest sparse-filter-scans-past-empty-chunks-without-truncating
+ (let [predicate (lambda ["x"] (core := (list (variable "x") (literal 39))))
+       count (atom 0)
+       native (BeamLisp.Ns.Rt/filter (fn [x] (swap! count inc) (= x 39)) (vec (range 40)))]
+  (is (= 39 (BeamLisp.Ns.Rt/first native)))
+  (is (= 40 @count))
+  (is (= 39 (run (core :first (list (core :filter (list predicate (literal (vec (range 40))))))))))))
+
+(deftest completed-cells-and-full-folds-memoize-the-producer
+ (let [value (mapped (lambda ["x"] (fresh)) (literal [1 2 3]))
+       read-first (core :first (list (variable "s")))
+       read-all (consume (variable "s"))]
+  (is (= true (run {:op :let :name "s" :init value
+                   :body (core := (list read-first read-first))})))
+  (is (= true (run {:op :let :name "s" :init value
+                   :body (core := (list read-all read-all))})))
+  ;; Arbitrary reducers use memo cells and publish the complete native chunk
+  ;; before a halting callback. A later read reuses the same producer result.
+  (let [count (atom 0)
+        native (BeamLisp.Ns.Rt/map (fn [_] (swap! count inc) (BeamLisp.Ns.Rt/gensym "native-stream")) [1 2 3])
+        short (some (fn [x] x) native)
+        after-short @count
+        head (BeamLisp.Ns.Rt/first native)]
+   (IO/inspect {:partial-count after-short :cell-count @count :reran (not= short head)}
+               (list (tuple :label "NATIVE_FOLD_ORACLE")))
+   (is (= 3 after-short))
+   (is (= 3 @count))
+   (is (= short head)))
+  (let [count (atom 0)
+        native (BeamLisp.Ns.Rt/map (fn [_] (swap! count inc) (BeamLisp.Ns.Rt/gensym "native-k-reduce")) [1 2 3])
+        short (BeamLisp.Ns.Rt/k-reduce (fn [_ x] (BeamLisp.Ns.Rt/reduced x)) nil native)
+        after-short @count head (BeamLisp.Ns.Rt/first native)]
+   (IO/inspect {:partial-count after-short :cell-count @count :reran (not= short head)}
+               (list (tuple :label "NATIVE_DIRECT_FOLD_ORACLE")))
+   (is (= 3 after-short))
+   (is (= 3 @count))
+   (is (= short head)))
+  (is (= true (run {:op :let :name "s" :init value
+                   :body {:op :let :name "short"
+                          :init (core :some (list (identity) (variable "s")))
+                          :body (core := (list (variable "short") read-first))}})))))
+
+(deftest short-fold-and-concat-boundary-do-not-run-unused-producers
+ (let [path (str (System/get_env "HOME") "/tmp/derived-stream-short-never-run-"
+                 (System/unique_integer (list :positive)))
+       effect (remote :Elixir.File :write! (list (literal path) (literal "bad")))
+       bounded (lambda ["x"] {:op :if :test (remote :erlang :=< (list (variable "x") (literal 32)))
+                                :then (variable "x") :else effect})
+       value (mapped bounded (literal (vec (range 1 41))))
+       halt (lambda ["prior" "item"]
+               (remote :Elixir.BeamLisp.Ns.Rt :reduced (list (variable "item"))))]
+  (try
+   (is (= 1 (run (remote :Elixir.BeamLisp.Ns.Rt :k-reduce (list halt (literal nil) value)))))
+   (is (= 1 (source-core "some" (list (identity) value))))
+   (is (= 1 (run (core :first (list (core :concat
+                (list (literal (list 1)) (mapped (lambda ["x"] effect) (literal [2])))))))))
+   (is (= false (File/exists? path)))
+   (finally (File/rm path)))))
+
+(deftest closed-opaque-input-gates-survive-deferred-construction
+ (let [path (str (System/get_env "HOME") "/tmp/derived-stream-native-never-run-"
+                 (System/unique_integer (list :positive)))
+       native (fn [_] (File/write! path "bad") 1)]
+  (try
+   (is (= :unsafe-first-order-data
+          (:kind (refusal (mapped (literal native) (literal [1]))))))
+   (is (= false (File/exists? path)))
+   (let [data (refusal (mapped (identity) (literal (vec (range 16385)))))]
+    (IO/inspect (select-keys data [:kind :reason :detail])
+                (list (tuple :label "OVERSIZE_REFUSAL")))
+    (is (= {:kind :unsafe-first-order-data :reason :node-limit}
+           (select-keys data [:kind :reason]))))
+   (finally (File/rm path)))))
+
+(deftest reviewed-core-callbacks-are-authorized-at-creation
+ (is (= (list 2 3)
+        (run (consume (mapped {:op :global :ns "core" :name "inc"} (literal [1 2]))))))
+ (is (= (list 1 3)
+        (run (consume (mapped {:op :global :ns "core" :name "first"} (literal [[1 2] [3 4]])))))))
+
+(deftest exact-seeded-cpp-wrapper-registers-only-machine-created-authority
+ ;; Privileged native component test, not caller-supplied interpreted Source.
+ ;; The helper still authenticates actual fixed seed bytes before minting a Fn.
+ (let [key (erlang/make_ref) state {:counter-frame key :max-collection 16384}]
+  (erlang/put key {:remaining 100000 :allocation-nodes 100000 :allocation-bytes 1048576
+                   :callables {} :recipes {} :depth 0 :recipe-depth 0})
+  (try
+   (let [callback (BeamLisp.AOT/constructor_kernel_alias! "cpp" "jank.runtime.is_integer" state)]
+    (is (= true (Map/has_key? (:callables (erlang/get key)) callback)))
+    (is (= true (BeamLisp.AOT/constructor_invoke callback (list 1) state)))
+    (is (= false (BeamLisp.AOT/constructor_invoke callback (list "1") state))))
+   (finally (erlang/erase key)))
+  (is (= :undefined (erlang/get key)))))
+
+(deftest mapcat-eagerly-maps-outer-input-but-defers-each-returned-sequence
+ (let [events (atom [])
+       native (mapcat (fn [x]
+                       (swap! events conj [:outer x])
+                       (BeamLisp.Ns.Rt/map (fn [y] (swap! events conj [:inner y]) y) [x]))
+                      [1 2])
+       after-construction @events
+       head (BeamLisp.Ns.Rt/first native)]
+  (is (= [[:outer 1] [:outer 2]] after-construction))
+  (is (= [[:outer 1] [:outer 2] [:inner 1]] @events)))
+ (let [path (str (System/get_env "HOME") "/tmp/derived-mapcat-never-effect-"
+                 (System/unique_integer (list :positive)))
+       effect (lambda ["x"] (remote :Elixir.File :write! (list (literal path) (literal "bad"))))
+       outer (core :mapcat (list effect (literal [1 2])))
+       inner (core :mapcat (list (lambda ["x"] (mapped effect (core :vector (list (variable "x")))))
+                                (literal [1 2])))]
+  (try
+   (is (= :constructor-machine-refused (:kind (refusal outer))))
+   (is (= false (File/exists? path)))
+   (is (= :unused (run {:op :let :name "unused" :init inner :body (literal :unused)})))
+   (is (= :constructor-machine-refused (:kind (refusal (core :first (list inner))))))
+   (is (= false (File/exists? path)))
+   (finally (File/rm path)))))
+
+
+(deftest halting-fold-cannot-skip-effects-within-an-already-demanded-native-chunk
+ (let [count (atom 0)
+       native (BeamLisp.Ns.Rt/map (fn [x] (swap! count inc)
+                                  (if (= 1 x) x (erlang/error :second-item-demanded))) [1 2])
+       result (try (some (fn [x] x) native) :unexpected (catch _ :failed))
+       path (str (System/get_env "HOME") "/tmp/derived-stream-real-chunk-"
+                 (System/unique_integer (list :positive)))
+       callback (lambda ["x"] {:op :if :test (core := (list (variable "x") (literal 1)))
+                                :then (variable "x")
+                                :else (remote :Elixir.File :write! (list (literal path) (literal "bad")))})]
+  (try
+   (is (= :failed result))
+   (is (= 2 @count))
+   (is (= :constructor-machine-refused
+          (:kind (refusal (core :some (list (identity) (mapped callback (literal [1 2]))))))))
+   (is (= false (File/exists? path)))
+   (finally (File/rm path)))))
+
+(deftest direct-source-reduce-uses-the-same-demanded-chunk-as-native-reduce
+ (let [path (str (System/get_env "HOME") "/tmp/derived-stream-reduce-next-chunk-"
+                 (System/unique_integer (list :positive)))
+       callback (lambda ["x"] {:op :if
+                  :test (remote :erlang :=< (list (variable "x") (literal 32)))
+                  :then (variable "x")
+                  :else (remote :Elixir.File :write! (list (literal path) (literal "bad")))})
+       value (mapped callback (literal (vec (range 1 41))))
+       halt (lambda ["prior" "item"] (remote :Elixir.BeamLisp.Ns.Rt :reduced (list (variable "item"))))]
+  (try
+   (is (= 1 (run (core :reduce (list halt (literal nil) value)))))
+   (is (= 2 (run (core :reduce (list halt value)))))
+   (is (= false (File/exists? path)))
+   (finally (File/rm path)))))
+
+(deftest canonical-private-containers-can-carry-only-machine-owned-callbacks-internally
+ (let [callback (lambda ["x"] (core :inc (list (variable "x"))))
+       vector (core :vector (list callback))
+       selected (core :first (list (variable "callbacks")))
+       invoke {:op :apply :fn selected :args (list (literal 1))}]
+  (is (= 2 (run {:op :let :name "callbacks" :init vector :body invoke})))
+  (is (= :unsafe-first-order-data (:kind (refusal vector))))
+  (is (= 2 (run {:op :let :name "callbacks"
+                  :init (core :vector (list {:op :global :ns "core" :name "inc"}))
+                  :body invoke})))
+  (is (= :unsafe-first-order-data
+         (:kind (refusal (literal [(fn [_] (erlang/error :must-not-invoke))]))))))
+ (is (= :unsafe-first-order-data
+        (:kind (refusal (consume (mapped (identity)
+          {:op :map :pairs (list (list (literal :__struct__) (literal :Elixir.File.Stream)))})))))))

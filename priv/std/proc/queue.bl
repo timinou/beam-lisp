@@ -113,6 +113,8 @@
             [datom.store-ets :as store-ets]
             [proc.server :refer [extend-clause!]]
             [proc.table :as table]
+            [proc.queue-family :as family]
+            [proc.queue-family-storage :as family-storage]
             [proc.tick :as tick]
             [proc.fence :as fence]
             [diagnostics :as diag]))
@@ -414,6 +416,8 @@
 
 (defn- conn-key [srv] (tuple :bl-queue-conn (server-name srv)))
 
+(declare attach-store!)
+
 (defn conn
   "The connection over this queue's store, published once per VM.
 
@@ -424,12 +428,35 @@
    queue can still read it."
   [srv]
   (or (erlang/apply :persistent_term :get (list (conn-key srv) nil))
+      (when-let [g (Process/get :bl_generation)]
+       (when-let [connection (family/existing-store g (server-name srv))]
+        (attach-store! srv connection)))
       (BeamLisp.Env/with_generation_lock (tuple :queue-store (server-name srv))
        (fn []
         (or (erlang/apply :persistent_term :get (list (conn-key srv) nil))
             (let [c (datom/connect-with (store-ets/adopt (ensure-store! srv)) SCHEMA)]
               (erlang/apply :persistent_term :put (list (conn-key srv) c))
               c))))))
+
+(defn ensure-family-store!
+ "Generated reconcile prelude. Provision a dedicated durable store from the
+  actual enrolled native root before config construction; no app attachment or
+  filesystem bookkeeping. Development graphs without a root retain ETS."
+ [srv]
+ (let [g (Process/get :bl_generation) physical (server-name srv)
+       member (when g (family/member-evidence (:application-id g) physical))
+       managed? (and member (get-in g [:resources :data-root]))]
+  (when managed?
+   (when-let [cached (erlang/apply :persistent_term :get (list (conn-key srv) nil))]
+    (when-not (= (family/storage-path g (:family member) physical) (get-in cached [:store :path]))
+     (throw (ex-info "Queue store requires an explicit identity migration"
+                     {:kind :queue-family-store-authority-required}))))
+   (let [ticket (family-storage/provision! g physical)]
+    (attach-store! srv (:connection ticket))
+    (family-storage/attached! g physical ticket)))
+  (let [connection (conn srv)]
+   (when g (family/validate-bound-store! g physical connection))
+   connection)))
 
 (defn- closed-file-rebind? [srv old current opts]
   (let [old-path (:path (ds/identity-of (:store old)))
@@ -470,10 +497,10 @@
         (let [bound (erlang/apply :persistent_term :get (list (conn-key srv) nil))]
           (when (and bound (not= bound c) (not (closed-file-rebind? srv bound c opts)))
             (throw (ex-info "Queue connection already bound" {:kind :store-already-bound :server srv}))))
-        (datom/install-schema! c SCHEMA)
         (when (some (fn [row] (not= (server-name srv) (first row)))
                     (datom/q '[:find ?key :where [_ :queue/key ?key]] (datom/db c)))
           (throw (ex-info "Queue requires its own connection/store" {:kind :shared-queue-store})))
+        (datom/install-schema! c SCHEMA)
         (datom/transact! c [{:db/id -1 :queue/key (server-name srv)}])
         (erlang/apply :persistent_term :put (list (conn-key srv) c))))
     c)))))
@@ -753,6 +780,7 @@
                  (when-let [d (declaration srv)]
                    {:server srv :logical-server (keyword (logical-name srv)) :application-id (application-id srv)
                     :declaration d :inventory (protocol-inventory srv)
+                    :family (when app (family/member-evidence app (server-name srv)))
                     :store (let [store (ds/identity-of (:store (conn srv)))]
                              (if (:path store) {:kind :file :identity (:path store)}
                                {:kind :memory :identity (server-name srv)}))})
@@ -793,11 +821,15 @@
    queue's OWN rules (`:of`, `:unique`, `:partition`) without asking a process,
    and a rule a caller has to restate at every call site is a rule that drifts."
   [c srv d]
-  (dc/serialized! c (fn []
+  (let [g (Process/get :bl_generation)
+        member (when g (family/member-evidence (:application-id g) (server-name srv)))
+        published (cond-> (assoc d :server (server-name srv))
+                    member (assoc :family (select-keys member [:family :protocol :handler-generation])))]
+   (dc/serialized! c (fn []
     (validate-declaration! c srv d)
     (datom/transact! c [{:db/id -1
                        :queue/key (server-name srv)
-                       :queue/decl (assoc d :server (server-name srv))}]))))
+                       :queue/decl published}])))))
 
 (defn declaration
   "The durable declaration this queue wrote at boot, or nil when this VM's store
@@ -1064,7 +1096,15 @@
        (let [sealed? (and (map? context) (:digest context))
              producer (or (get (:protocols context) (logical-name srv))
                           (get (:protocols context) (keyword (logical-name srv))))
-             producer-version (if (map? producer) (:protocol producer) producer)
+             family-contract (family/producer-contract (server-name srv))
+             _ (when family-contract (family/validate-reconcile-payload! job))
+             explicit-version (if (map? producer) (:protocol producer) producer)
+             _ (when (and explicit-version family-contract
+                          (not= explicit-version (:protocol family-contract)))
+                 (throw (ex-info "Explicit and source family protocols disagree" {:kind :conflicting-queue-protocol})))
+             producer-version (or explicit-version (:protocol family-contract))
+             _ (when (and family-contract (not= (:required-generation family-contract) (:generation d)))
+                 (throw (ex-info "Family handler declaration changed" {:kind :queue-family-owner-changed})))
              _ (when (and sealed? (nil? producer-version))
                  (throw (ex-info "Sealed generation has no queue producer contract"
                                  {:kind :undeclared-queue-protocol :server srv})))
@@ -1089,6 +1129,9 @@
                               (throw (ex-info "Enrollment key must be nonnil and bounded" {:kind :invalid-enrollment-key})))
                             [(server-name srv) key]))
              existing (when enrollment (datom/entity (datom/db c) [:job/enrollment enrollment]))
+             _ (when (and (:required-generation family-contract)
+                          (contains? (:queue/fenced-generations admissions #{}) (:required-generation family-contract)))
+                 (throw (ex-info "Retained handler generation is fenced" {:kind :generation-fenced})))
              id (identity-token)
              now (tick/wall-ms)
              at (due-at now opts)
@@ -1108,7 +1151,8 @@
                          :job/diagnostic-context (merge (diag/context) {:diagnostics/job-id (diag/new-id)})}
                         (if enrollment {:job/enrollment enrollment} {})
                         (if (:capacity-proof opts) {:job/capacity (:capacity-proof opts)} {})
-                        (if generation {:job/generation generation :job/required-generation generation} {})
+                        (if generation {:job/generation generation
+                                        :job/required-generation (or (:required-generation family-contract) generation)} {})
                         (if (:parent-id opts) {:job/parent-id (:parent-id opts)} {})
                         (if (some? ticket) {:job/ticket ticket} {})
                         (if (some? pk) {:job/partition pk} {}))
@@ -1907,9 +1951,21 @@
   (let [payload (:job/payload j)]
     (if (map? payload) (merge payload j) j)))
 
+(defn- with-entry-context [captured f]
+ ;; A retained handler may execute in a different generation Env from the
+ ;; dispatcher, which may itself change while the job runs. Never transplant
+ ;; sink/schema/capability state across those boundaries. Carry only projected
+ ;; durable linkage, preserving this claim's trace/attempt IDs, into the
+ ;; executing environment's own diagnostics scope. The strict capture guard
+ ;; stays unchanged for all ordinary same-environment scopes.
+ (if (= (:environment captured) (erlang/get :bl_env))
+  (diag/with-captured-fn captured f)
+  (diag/with-linkage-fn (:context captured)
+   #(diag/with-context-fn (select-keys (:context captured) [:diagnostics/trace-id :diagnostics/attempt-id]) f))))
+
 (defn- emit-entry! [entry event fields]
   (if-let [captured (:diagnostics entry)]
-    (diag/with-captured-fn captured #(diag/emit! event fields))
+    (with-entry-context captured #(diag/emit! event fields))
     (diag/emit! event fields)))
 
 (defn- prepare-payload [q job]
@@ -1932,6 +1988,25 @@
               (recur (:to edge) next (conj seen version)))
             (throw (ex-info "No queue payload upgrade path" {:kind :unsupported-version})))))))
 
+(defn with-handler-context
+ "Run queue work under an actual retained handler's exact captured context.
+  Infrastructure actors restore their own context after every turn. The native
+  borrow covers all handler modules before any user clock/contract/body runs."
+ [handler action]
+ (if-let [lease (:lease handler)]
+  (let [previous (BeamLisp.Env/capture)]
+   (try
+    (when (:environment handler) (BeamLisp.Env/bind (:environment handler)))
+    (let [result (BeamLisp.Env/run_code! lease
+                   #(BeamLisp.Env/with_owned_generation_execution (fn [] {:value (action)})))]
+     (when (= :cancelled result)
+      (throw (ex-info "Queue handler retention expired" {:kind :expired-queue-handler})))
+     (:value result))
+    (finally (BeamLisp.Env/bind previous))))
+  (action)))
+
+(declare launch-selected!)
+
 (defn- launch!
   "Claim `job` and start its body on its OWN process. Returns the running entry,
    or nil when another claimer took it first.
@@ -1948,10 +2023,14 @@
   (let [base (:queue st)
         required (:job/required-generation job (:job/generation job))
         q (merge base (get (:handlers base) required {}))
-        _ (when-not (:workers q) (throw (ex-info "Queue worker lifetime inventory is unavailable" {:kind :worker-inventory-required})))
-        c (conn (:server q))
+        _ (when-not (:workers q) (throw (ex-info "Queue worker lifetime inventory is unavailable" {:kind :worker-inventory-required})))]
+   (with-handler-context q #(launch-selected! q job))))
+
+(defn- launch-selected! [q job]
+  (let [c (conn (:server q))
         now ((:clock q))
         decl (:decl q)
+        required (:job/required-generation job (:job/generation job))
         generation-compatible? (or (nil? required) (= required (:generation decl)))
         prepared (when generation-compatible?
                    (if (and (= (get-in job [:job/adoption :protocol] (:job/protocol job 1)) (:protocol decl 1))
@@ -1977,8 +2056,8 @@
                     (Process/demonitor watch (list :flush))
                  (when (:environment q) (BeamLisp.Env/bind (:environment q)))
                  (Process/put (tuple :bl-queue/attempt-clock (server-name (:server q))) (:clock q))
-                  (let [out (try
-                             {:ok (diag/with-captured-fn captured #(body (assoc (job-map (assoc claimed :job/payload (:payload prepared)))
+                 (let [out (try
+                             {:ok (with-entry-context captured #(body (assoc (job-map (assoc claimed :job/payload (:payload prepared)))
                                                    :job/execution-protocol (:protocol prepared)
                                                    :job/execution-generation (:generation decl))))}
                              (catch err {:error (error-text err) :failure (diag/safe-error err)}))]

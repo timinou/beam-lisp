@@ -1,0 +1,108 @@
+(ns datom.writer-timeout-test
+ (:require [datom :as d] [datom.conn :as conn]))
+
+(def SCHEMA [{:db/ident :timeout/value :db/valueType :db.type/string}])
+
+(defn- release-once [pid message]
+ (let [released (atom false)]
+  (fn [] (when (compare-and-set! released false true) (erlang/send pid message)))))
+
+(defn- await [pred]
+ (let [until (+ (erlang/monotonic_time :millisecond) 5000)]
+  (loop []
+   (cond (pred) true
+         (> (erlang/monotonic_time :millisecond) until) false
+         :else (do (Process/sleep 5) (recur))))))
+
+(deftest invalid-options-refuse-before-any-transaction-effect
+ (let [c (d/connect SCHEMA) basis (:basis-t (d/db c))]
+  (try
+   (doseq [opts [nil [] {:unknown 1}]]
+    (is (= :invalid-transaction-options
+         (try (d/transact! c [{:db/id 1 :timeout/value "invalid"}] opts) nil
+           (catch e (:kind (ex-data e)))))))
+   (doseq [value [nil 0 -1 3600001 1.5 "100" :infinity]]
+    (is (= :invalid-transaction-timeout
+         (try (d/transact! c [{:db/id 1 :timeout/value "invalid"}] {:timeout-ms value}) nil
+           (catch e (:kind (ex-data e)))))))
+   (is (= basis (:basis-t (d/db c))))
+   (is (= #{} (d/q '[:find ?e :where [?e :timeout/value "invalid"]] (d/db c))))
+   (is (map? (d/transact! c [{:db/id 2 :timeout/value "valid"}] {})))
+   (is (= #{[2]} (d/q '[:find ?e :where [?e :timeout/value "valid"]] (d/db c))))
+   (finally (d/close! c)))))
+
+(deftest expired-queued-transaction-never-runs-and-late-reply-does-not-leak
+ (let [c (d/connect SCHEMA) writer (:writer c) parent (erlang/self)
+       before (:basis-t (d/db c)) caller (atom nil)
+       release (release-once writer :release)]
+  (Agent/cast writer (fn [state]
+                       (erlang/send parent :blocked)
+                       (receive :release state (after 10000 state))))
+  (try
+   (is (= :blocked (receive :blocked :blocked (after 5000 :timeout))))
+   (reset! caller
+    (spawn (fn []
+             (let [result (try (d/transact! c [{:db/id 3 :timeout/value "expired"}]
+                                {:timeout-ms 100}) :unexpected
+                            (catch _ :timed-out))]
+               (erlang/send parent [:queued-result result])
+               (receive :inspect
+                 (let [late (receive unexpected unexpected (after 50 :empty))]
+                   (erlang/send parent [:late-reply late])))))))
+   (is (await #(pos? (elem (erlang/process_info writer :message_queue_len) 1))))
+   (is (= :timed-out (receive [:queued-result result] result (after 5000 :missing))))
+   (release)
+   (is (= :drained (Agent/get writer (fn [_] :drained) 5000)))
+   (is (= before (:basis-t (d/db c))))
+   (is (= #{} (d/q '[:find ?e :where [?e :timeout/value "expired"]] (d/db c))))
+   (erlang/send @caller :inspect)
+   (is (= :empty (receive [:late-reply result] result (after 5000 :missing))))
+   (finally
+    (release)
+    (when (and @caller (Process/alive? @caller)) (Process/exit @caller :kill))
+    (Agent/get writer (fn [_] :drained) 10000)
+    (d/close! c)))))
+
+(deftest admitted-transaction-drains-once-after-waiter-timeout
+ (let [c (d/connect SCHEMA) writer (:writer c) parent (erlang/self)
+       calls (atom 0) before (:basis-t (d/db c)) caller (atom nil)
+       finish (release-once writer :finish)]
+  (conn/guard! c :timeout-test
+   (fn [_]
+     (swap! calls inc)
+     (erlang/send parent [:admitted (Process/get :bl_admission)])
+     (receive :finish nil (after 10000 nil))))
+  (try
+   (reset! caller
+    (spawn (fn []
+             (let [prior (Process/get :datom.conn/writer-timeout-ms :missing)
+                   result (try (d/transact! c [{:db/id 4 :timeout/value "accepted"}]
+                                  {:timeout-ms 150}) :unexpected
+                              (catch _ :timed-out))]
+               (erlang/send parent [:accepted-result result
+                 (= prior (Process/get :datom.conn/writer-timeout-ms :missing))])))))
+   (is (= nil (receive [:admitted admission] admission (after 5000 :missing))))
+   (is (= [:timed-out true]
+        (receive [:accepted-result result restored?] [result restored?]
+          (after 5000 :missing))))
+   (is (= before (:basis-t (d/db c))))
+   (finish)
+   (is (= :drained (Agent/get writer (fn [_] :drained) 5000)))
+   (is (= 1 @calls))
+   (is (= #{[4]} (d/q '[:find ?e :where [?e :timeout/value "accepted"]] (d/db c))))
+   (is (> (:basis-t (d/db c)) before))
+   (finally
+    (finish)
+    (when (and @caller (Process/alive? @caller)) (Process/exit @caller :kill))
+    (Agent/get writer (fn [_] :drained) 10000)
+    (d/close! c)))))
+
+(deftest budget-and-standard-validation-restore-after-refusal
+ (let [c (d/connect SCHEMA) prior (Process/get :datom.conn/writer-timeout-ms :missing)]
+  (try
+   (is (try (d/transact! c [{:db/id 5 :timeout/value 123}] {:timeout-ms 5000}) false
+         (catch _ true)))
+   (is (= prior (Process/get :datom.conn/writer-timeout-ms :missing)))
+   (is (map? (d/transact! c [{:db/id 5 :timeout/value "healthy"}])))
+   (is (= #{[5]} (d/q '[:find ?e :where [?e :timeout/value "healthy"]] (d/db c))))
+   (finally (d/close! c)))))

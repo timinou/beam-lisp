@@ -1,0 +1,621 @@
+; HOME source draft. Native acceptance pending: do not install independently.
+; Native journal custody grants managed family storage, paths only confine it.
+(ns proc.queue-family-root
+ (:require [reload.generation :as generation] [reload.execution :as execution]
+           [datom.conn :as conn] [datom.store-fjall :as fjall] [env]))
+
+(def ^:private roots (atom {}))
+;; Native graph-success receipts retain only encoded actual handle identity and
+;; immutable graph identity. They grant no execution, opening or write authority.
+(def ^:private retired-native-roots (atom {}))
+(def ^:private schema-phases (atom {}))
+(declare succession-held? pending-policy-publication? schema-successions succession-key)
+(defn- refuse [kind]
+ (throw (ex-info "Managed queue root refused" {:kind kind})))
+(defn- origin-free! []
+ (BeamLisp.Env/assert_native_command_callback_inactive!)
+ ;; This guard deliberately runs OUTSIDE execution.with!. An app initializer
+ ;; executes on its parent's PID, so creator PID alone is not authorization.
+ (when (or (BeamLisp.Env/assert_execution_context!) (BeamLisp.Env/execution_origin))
+  (refuse :queue-root-native-initializer-required)))
+(defn- locked [g action]
+ (BeamLisp.Env/with_generation_lock (tuple :queue-root (:application-id g)) action))
+(defn- generation-id [g] (select-keys g [:cache-key :scope :digest :application-id]))
+(defn- store-roots! [action]
+ ;; Metadata only: no Conn/writer/actor/provider action under this global lock.
+ (BeamLisp.Env/with_generation_lock :queue-root-capacity
+  (fn [] (swap! roots action))))
+(defn- directory-ancestors! [path]
+ ;; Never call Fjall canonicalization here: that native API CREATES directories.
+ ;; Trusted lifecycle already owns/prepares this root; aliases are refused.
+ (loop [current "/" parts (rest (Path/split path))]
+  (when (seq parts)
+   (let [next (Path/join current (first parts)) found (File/lstat next)]
+    (when-not (and (= :ok (elem found 0)) (= :directory (:type (elem found 1))))
+     (refuse :queue-root-noncanonical-directory))
+    (recur next (rest parts))))))
+(defn- declared-path [g]
+ (let [root (get-in g [:resources :data-root])
+       relative (get-in g [:resources :managed-root-journal])]
+  (when-not (and (string? root) (= root (Path/expand root)) (not= root "/")
+                 (string? relative) (<= 1 (erlang/byte_size relative) 4096)
+                 (not (String/starts_with? relative "/"))
+                 (= (str root "/" relative) (Path/expand (str root "/" relative))))
+   (refuse :queue-root-journal-required))
+  (directory-ancestors! root)
+  (directory-ancestors! (Path/dirname (str root "/" relative)))
+  {:root root :path (str root "/" relative)}))
+(defn- declared-store-paths [g]
+ (let [paths (get-in g [:resources :managed-root-store-paths])
+       journal-id (get-in g [:resources :managed-root-journal-id])
+       declared (declared-path g)]
+  (when-not (and (erlang/is_map paths) (not (erlang/is_map_key :__struct__ paths))
+                 (<= 1 (count paths) 32) (string? journal-id)
+                 (= (get paths journal-id) (get-in g [:resources :managed-root-journal]))
+                 (every? (fn [[id relative]]
+                   (and (string? id) (<= 1 (erlang/byte_size id) 128)
+                        (string? relative) (<= 1 (erlang/byte_size relative) 4096)
+                        (not (String/starts_with? relative "/"))
+                        (= (str (:root declared) "/" relative)
+                           (Path/expand (str (:root declared) "/" relative))))) paths)
+                 (= (count paths) (count (set (vals paths)))))
+   (refuse :queue-root-store-declarations-required))
+  paths))
+(defn- unpublished! [g]
+ (generation/attested-prepared! g)
+ (let [st @(:state g)]
+  (when (or (:retired st) (seq (:slots st)) (:runtime st))
+   (refuse :queue-root-enrollment-closed))))
+(defn- native-connection! [g path connection]
+ (let [evidence (conn/creation-evidence! connection)
+       store (:store (:connection evidence)) custody (:custody evidence)]
+  (directory-ancestors! (Path/dirname path))
+  (when-not (and (erlang/is_map store)
+                 (= fjall/FjallStore (maps/get :__struct__ store nil))
+                 (BeamLisp.AOT/sdk_generated_class? (maps/get :__struct__ store nil))
+                 (= path (maps/get :path store nil))
+                 (= (erlang/self) (:owner custody)) (nil? (:origin custody))
+                 (nil? (:creator evidence)))
+   (refuse :queue-root-native-journal-required))
+  evidence))
+(defn- native-journal! [g connection]
+ (let [declared (declared-path g) evidence (native-connection! g (:path declared) connection)]
+  (merge declared {:journal (:connection evidence) :custody (:custody evidence)
+                   :resource (:resource evidence) :lifetime (:lifetime evidence)})))
+(defn- native-declared! [g declared]
+ (let [paths (declared-store-paths g) root (:root (declared-path g))]
+  (when-not (and (erlang/is_map declared) (not (erlang/is_map_key :__struct__ declared))
+                 (= (set (keys paths)) (set (keys declared))))
+   (refuse :queue-root-declared-handles-required))
+  (into {} (map (fn [[id relative]]
+       [id (native-connection! g (str root "/" relative) (get declared id))]) paths))))
+(defn enroll!
+ "Trusted native initializer, before Source initialization. Exact SDK Conn
+  creation custody plus immutable prepared journal scope, never caller flags,
+  root strings, copied graph maps or lease dictionaries. PRIVATE result."
+ ([g connection]
+  (origin-free!)
+  (unpublished! g)
+  (enroll! g connection {(get-in g [:resources :managed-root-journal-id]) connection}))
+ ([g connection declared]
+ (origin-free!)
+ (unpublished! g)
+ (let [evidence (native-journal! g connection)
+       native-declared (native-declared! g declared)
+       journal-id (get-in g [:resources :managed-root-journal-id])
+       _ (when-not (= (:lifetime connection) (:lifetime (get declared journal-id)))
+           (refuse :queue-root-journal-identity-mismatch))]
+  (locked g
+   (fn []
+    (unpublished! g)
+    (let [key (:cache-key g) prior (get @roots key)
+          row (merge evidence {:generation-id (generation-id g) :application-id (:application-id g)
+                               :phase :enrolled :owner (erlang/self) :ticket (erlang/make_ref)
+                               :declared declared :declared-evidence native-declared
+                               :incarnation (sha256-hex (erlang/term_to_binary
+                                  [(:application-id g) (:resource evidence) (:custody evidence)]))})]
+     (store-roots!
+      (fn [all]
+       (when (contains? all key) (refuse :queue-root-already-enrolled))
+       (when (>= (count all) 4096) (refuse :queue-root-capacity))
+       ;; One physical journal custody per live application in this VM. A new
+       ;; connection incarnation cannot erase earlier unknown accepted work.
+       (when (some (fn [[_ active]]
+                (and (not= (:application-id row) (:application-id active))
+                     (or (= (:root row) (:root active)) (= (:resource row) (:resource active))))) all)
+        (refuse :queue-root-foreign-application-custody))
+       (when (some (fn [[_ active]]
+                (and (= (:application-id row) (:application-id active))
+                     (not= (select-keys row [:root :resource :lifetime :custody])
+                           (select-keys active [:root :resource :lifetime :custody])))) all)
+        (refuse :queue-root-custody-conflict))
+       (assoc all key row)))
+     :enrolled))))))
+(defn evidence!
+ "Read an existing exact root grant under actual selected owned execution.
+  Reading grants no store opening or actor transition; caller still needs
+  generated native starter/family membership before provisioning. PRIVATE."
+ [g]
+ (when-not (and (execution/owned?) (= g (execution/current)))
+  (refuse :queue-root-owned-execution-required))
+ (generation/attested-prepared! g)
+ (locked g
+  (fn []
+   (let [row (get @roots (:cache-key g))
+         now (when row (conn/creation-evidence! (:journal row)))]
+    (when-not (and row (contains? #{:entered :ready} (:phase row))
+                   (= (generation-id g) (:generation-id row)) (= (:application-id g) (:application-id row))
+                   (Process/alive? (:owner row))
+                   (= (:owner row) (:owner (:custody now)))
+                   (= (:custody row) (:custody now)) (= (:lifetime row) (:lifetime now))
+                   (= (:resource row) (:resource now)) (= (declared-path g) (select-keys row [:root :path])))
+     (refuse :queue-root-stale-custody))
+    (doseq [[id original] (:declared-evidence row)]
+     (let [actual (conn/creation-evidence! (get (:declared row) id))]
+      (when-not (and (= (:custody original) (:custody actual))
+                     (= (:lifetime original) (:lifetime actual))
+                     (= (:resource original) (:resource actual)))
+       (refuse :queue-root-stale-custody))))
+    row))))
+(defn inherit!
+ "Original native initializer only. Transfer the same exact declared journal
+  custody to an unpublished candidate. Exact already-ready metadata is an
+  observation; it never replays constructors or changes runtime ownership."
+ [candidate previous]
+ (origin-free!)
+ (generation/attested-prepared! candidate)
+ (generation/attested-prepared! previous)
+ (when-not (and (= (:application-id candidate) (:application-id previous))
+                (= (declared-path candidate) (declared-path previous))
+                (= (declared-store-paths candidate) (declared-store-paths previous)))
+  (refuse :queue-root-scope-mismatch))
+ (locked candidate
+  (fn []
+   (let [old (get @roots (:cache-key previous))
+         native (when old (native-journal! candidate (:journal old)))]
+    (when-not (and old (= (generation-id previous) (:generation-id old)) (= :ready (:phase old))
+                   (= (erlang/self) (:owner old))
+                   (= (:custody old) (:custody native)) (= (:lifetime old) (:lifetime native)))
+     (refuse :queue-root-stale-custody))
+    (when-not (= (:declared-evidence old) (native-declared! candidate (:declared old)))
+     (refuse :queue-root-stale-custody))
+    (if-let [prior (get @roots (:cache-key candidate))]
+     (do
+      (when-not (and (= (generation-id candidate) (:generation-id prior)) (= :ready (:phase prior))
+                     (= (select-keys old [:root :resource :lifetime :custody :owner :declared-evidence])
+                        (select-keys prior [:root :resource :lifetime :custody :owner :declared-evidence])))
+       (refuse :queue-root-already-enrolled))
+      :already-inherited)
+     (do
+      (unpublished! candidate)
+      (let [next (assoc old :generation-id (generation-id candidate) :phase :enrolled :ticket (erlang/make_ref))]
+       (store-roots!
+        (fn [all]
+         (when (contains? all (:cache-key candidate)) (refuse :queue-root-already-enrolled))
+         (when (>= (count all) 4096) (refuse :queue-root-capacity))
+         (assoc all (:cache-key candidate) next))))
+      :inherited))))))
+
+(defn enter-initializer!
+ "Latch uncertainty BEFORE first Source restore/provider/initializer callback.
+  No Source invocation can use a merely enrolled root. Failure after this mark
+  never authorizes dropping grant/Conn custody or replaying constructors."
+ [g]
+ (origin-free!)
+ (generation/attested-prepared! g)
+ (locked g
+  (fn []
+   (let [key (:cache-key g) row (get @roots key)]
+    (when-not (and row (= (generation-id g) (:generation-id row))
+                   (= (erlang/self) (:owner row)) (= :enrolled (:phase row)))
+     (refuse :queue-root-initializer-phase-conflict))
+    (native-journal! g (:journal row))
+    (store-roots! (fn [all]
+      (when-not (= row (get all key)) (refuse :queue-root-stale-custody))
+      (assoc-in all [key :phase] :entered)))
+    :entered))))
+(defn ready!
+ "Original native initializer only, after managed runtime binding. This marks
+  completed construction, never external provider reconciliation or job replay."
+ [g]
+ (origin-free!)
+ (generation/attested-prepared! g)
+ (locked g
+  (fn []
+   (let [key (:cache-key g) row (get @roots key) runtime (:runtime @(:state g))]
+    (when-not (and row (= (generation-id g) (:generation-id row))
+                   (= (erlang/self) (:owner row)) (= :entered (:phase row))
+                   (or (nil? runtime) (= (:owner row) (:owner runtime))))
+     (refuse :queue-root-initializer-phase-conflict))
+    (native-journal! g (:journal row))
+    (store-roots! (fn [all]
+      (when-not (= row (get all key)) (refuse :queue-root-stale-custody))
+      (assoc-in all [key :phase] :ready)))
+    :ready))))
+(defn abort-unentered!
+ "Revoke only an exact enrollment NEVER made available to Source or an actor.
+  Entered/ready/unknown construction stays held; this NEVER closes a Conn,
+  releases a writer/flock, kills a process or authorizes initializer retry."
+ [g]
+ (origin-free!)
+ (unpublished! g)
+ (locked g
+  (fn []
+   (let [key (:cache-key g) row (get @roots key)]
+    (when-not (and row (= (generation-id g) (:generation-id row))
+                   (= (erlang/self) (:owner row)) (= :enrolled (:phase row)))
+     (refuse :queue-root-custody-still-active))
+    (native-journal! g (:journal row))
+    (store-roots! (fn [all]
+      (when-not (= row (get all key)) (refuse :queue-root-stale-custody))
+      (dissoc all key)))
+    :revoked))))
+(defn release-retired!
+ "Actual native graph success releases only its original private Root grant.
+  Protected Root retirement keeps a compact nonretaining native-success note."
+ [g]
+ (if-not (get @roots (:cache-key g)) :absent
+  (do
+   (origin-free!) (generation/attested-prepared! g true)
+   (when-not (= :native-retired (:status (generation/native-retirement-outcome g)))
+    (refuse :queue-root-generation-still-active))
+   ;; Conn query is outside the Root metadata lock and invokes no user code.
+   (let [protected? ((BeamLisp.Env/with_env :global
+                        #(BeamLisp.AOT/sdk_named_constructor! "datom.conn" "native-command-protected-root?" 1))
+                      (:resource (get @roots (:cache-key g))))]
+    (locked g
+     (fn []
+      (let [key (:cache-key g) row (get @roots key)]
+       (when row
+        (when (some #(and (= (:ticket row) (get-in (second %) [:root :ticket]))
+                         (not= :consumed (:state (second %)))) @schema-phases)
+         (refuse :queue-root-schema-phase-unconfirmed))
+        (when (succession-held? row) (refuse :queue-root-policy-succession-unconfirmed))
+        (when (pending-policy-publication? g row) (refuse :queue-root-policy-publication-required))
+        (when-not (and (= (generation-id g) (:generation-id row)) (not= :entered (:phase row)))
+         (refuse :queue-root-custody-still-active))
+        (when protected?
+         (let [resource-key (erlang/term_to_binary (get-in row [:resource :handle]))
+               receipt (generation/native-retirement-outcome g)
+               note {:owner (:owner row) :application-id (:application-id row)
+                     :root (:root row) :path (:path row) :incarnation (:incarnation row)
+                     :resource-key resource-key :graphs [(erlang/term_to_binary (:identity receipt))]}]
+          (swap! retired-native-roots
+           (fn [notes]
+            (let [prior (get notes resource-key)]
+             (when (and prior (not= (dissoc prior :graphs) (dissoc note :graphs)))
+              (refuse :queue-root-retirement-identity-conflict))
+             (when (and (not prior) (>= (count notes) 128)) (refuse :queue-root-retirement-capacity))
+             (assoc notes resource-key
+              (assoc note :graphs (vec (distinct (concat (:graphs prior []) (:graphs note))))))))))
+        (swap! schema-phases
+         #(into {} (remove (fn [[_ phase]] (= (:ticket row) (get-in phase [:root :ticket]))) %)))
+        (store-roots! (fn [all]
+          (when-not (= row (get all key)) (refuse :queue-root-stale-custody)) (dissoc all key)))
+        (when-not (some #(= (:incarnation row) (:incarnation (second %))) @roots)
+         ;; All history for this original Root is consumed, by checks above on
+         ;; each graph. No issued/unknown succession can be forgotten.
+         (swap! schema-successions dissoc (succession-key row)))) :released))))))))
+
+(defn retirement-blocker
+ "Private fixed SDK retirement preflight. Unknown accepted initialization or
+  Source execution cannot dispose a root grant; no application Boolean or
+  generation state flag substitutes for a known original native boundary."
+ [g]
+ (when-let [row (get @roots (:cache-key g))]
+  (generation/attested-prepared! g true)
+  (cond
+   (or (BeamLisp.Env/assert_execution_context!) (BeamLisp.Env/execution_origin))
+    :queue-root-native-retirement-required
+   (conn/native-mutation-retirement-blocker (:application-id row) (:root row))
+    :native-command-outcome-unconfirmed
+   (succession-held? row) :queue-root-policy-succession-unconfirmed
+   (pending-policy-publication? g row) :queue-root-policy-publication-required
+   (= :entered (:phase row)) :queue-root-initializer-uncertain
+   (some (fn [[_ phase]]
+           (and (= (:ticket row) (get-in phase [:root :ticket]))
+                (contains? #{:issued :entered :uncertain} (:state phase)))) @schema-phases)
+    :queue-root-schema-phase-unconfirmed
+   :else
+    ;; SDK allocation custody outlives its actor. Retiring its graph/root
+    ;; would discard accepted allocation authority merely because init died.
+    (when (env/with-env :global #(BeamLisp.Env/loaded_ns? "proc.queue-family-storage"))
+     (let [check (env/with-env :global
+                   #(BeamLisp.AOT/sdk_named_constructor! "proc.queue-family-storage" "retirement-blocker" 1))]
+      (check g))))))
+
+;; DRAFT: requires the native original-start evidence API specified alongside.
+;; Never install this hunk independently of its native issuer and acceptance.
+(def ^:private SCHEMA-PHASE :proc.queue-family-root/schema-phase)
+(defn- phase-root-id [row]
+ (select-keys row [:ticket :generation-id :application-id :owner :root :path
+                   :resource :lifetime :custody :incarnation :declared-evidence]))
+(defn- phase-spec! [spec]
+ (when-not (and (erlang/is_map spec) (not (erlang/is_map_key :__struct__ spec))
+                (= #{:operation :phase} (set (keys spec)))
+                (= :additive-schema-expand-publication (:phase spec))
+                (string? (:operation spec))
+                (Regex/match? #"^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$" (:operation spec)))
+  (refuse :queue-root-schema-phase-spec-required)) spec)
+(defn- phase-worker! [pid owner]
+ ;; Read original protected native launch records and the actual creator chain,
+ ;; never dictionaries, Source closures, PID metadata, names or caller receipts.
+ ;; Root custody issues authority; native birth relation only binds the worker.
+ (BeamLisp.Env/native_process_start_evidence! pid owner))
+(def ^:private schema-successions (atom {}))
+(defn- succession-key [root] [(:application-id root) (:incarnation root)])
+(defn- succession-held? [root]
+ (some #(contains? #{:issued :uncertain} (:state %)) (get @schema-successions (succession-key root))))
+(defn- pending-policy-publication? [g root]
+ (some #(and (= :installed (:state %)) (= (:cache-key g) (:candidate %)))
+       (get @schema-successions (succession-key root))))
+(defn- policy-publication-target! [g root]
+ (when (some #(and (= :installed (:state %)) (not= (:cache-key g) (:candidate %)))
+             (get @schema-successions (succession-key root)))
+  (refuse :queue-root-policy-publication-required)))
+(defn succeed-schema-policy!
+ "Original native manager only. A bounded exact-prefix additive history may
+  succeed after positive native publication/schema receipts and every earlier
+  Root phase is consumed. Fixed Conn consumer only; no caller action or undo."
+ [candidate previous]
+ (origin-free!) (generation/attested-prepared! candidate) (generation/attested-prepared! previous)
+ (let [raw (get-in candidate [:resources :dynamic-store-policy]) old (get-in previous [:resources :dynamic-store-policy])]
+  (if (= raw old) :unchanged
+   (let [validate (BeamLisp.Env/with_env :global
+                   #(BeamLisp.AOT/sdk_named_constructor! "datom.migration-policy" "successor!" 2))
+         _ (validate old raw)
+         publication (generation/schema-publication-evidence! previous)
+         ticket (erlang/make_ref)
+         key (locked candidate
+          (fn []
+           (let [root (get @roots (:cache-key candidate)) prior (get @roots (:cache-key previous))
+                 identity [:application-id :root :resource :lifetime :custody :incarnation :owner :declared-evidence]]
+            (when-not (and root prior (= (erlang/self) (:owner root) (:owner prior))
+                           (Process/alive? (:owner root)) (= :ready (:phase prior))
+                           (contains? #{:entered :ready} (:phase root))
+                           (= (select-keys root identity) (select-keys prior identity)))
+             (refuse :queue-root-policy-successor-custodian-required))
+            (native-journal! candidate (:journal root))
+            (when-not (= (:declared-evidence root) (native-declared! candidate (:declared root)))
+             (refuse :queue-root-stale-custody))
+            (when (or (succession-held? root)
+                      (some #(= :installed (:state %)) (get @schema-successions (succession-key root)))
+                      (some (fn [[_ phase]]
+                              (and (= (:incarnation root) (get-in phase [:root :incarnation]))
+                                   (= (:application-id root) (get-in phase [:root :application-id]))
+                                   (not= :consumed (:state phase)))) @schema-phases))
+             (refuse :queue-root-policy-prior-phase-unconfirmed))
+            (let [key (succession-key root) history (get @schema-successions key [])]
+             (when (or (>= (count @schema-successions) 128) (>= (count history) 8)
+                       (some #(= (:cache-key candidate) (:candidate %)) history))
+              (refuse :queue-root-policy-successor-replay-or-capacity))
+             ;; The latch precedes Conn inventory/writer observations. Delegate
+             ;; and retirement consult it under this same native Root lock.
+             (BeamLisp.Env/with_generation_lock :queue-root-schema-succession-capacity
+              (fn []
+               (swap! schema-successions
+                (fn [rows]
+                 (when (and (not (contains? rows key)) (>= (count rows) 128))
+                  (refuse :queue-root-policy-successor-replay-or-capacity))
+                 (assoc rows key (conj history {:ticket ticket :state :issued :previous (:cache-key previous)
+                                               :candidate (:cache-key candidate) :publication publication})))))) key))))]
+    (try
+     (let [consume (BeamLisp.Env/with_env :global
+                     #(BeamLisp.AOT/sdk_named_constructor! "datom.conn" "succeed-migration-policy!" 2))
+           receipt (generation/with! candidate #(consume previous publication))]
+      (locked candidate
+       (fn []
+        (swap! schema-successions update key
+         #(mapv (fn [row] (if (= ticket (:ticket row)) (assoc row :state :installed :receipt receipt) row)) %))))
+      :succeeded)
+     (catch error
+      (locked candidate
+       #(swap! schema-successions update key
+         (fn [history] (mapv (fn [row] (if (= ticket (:ticket row)) (assoc row :state :uncertain) row)) history))))
+      (throw error)))))))
+
+(defn delegate-schema-phase!
+ "Original live Root custodian only, before accepting this worker. A closed
+  first-order operation selects a single additive schema/publication phase.
+  This never transfers Root initialization, Conn ownership or cleanup."
+ [g worker spec]
+ (origin-free!) (phase-spec! spec) (generation/attested-prepared! g)
+ (BeamLisp.Env/with_generation_lock (tuple :sealed-generation (:cache-key g))
+  (fn []
+   (generation/attested-prepared! g)
+   (locked g
+  (fn []
+   (let [root (get @roots (:cache-key g))
+         _ (when-not (and root (= (generation-id g) (:generation-id root))
+                          (= :ready (:phase root)) (= (erlang/self) (:owner root))
+                          (Process/alive? (:owner root)))
+             (refuse :queue-root-phase-custodian-required))
+         _ (when (succession-held? root) (refuse :queue-root-policy-succession-unconfirmed))
+         _ (policy-publication-target! g root)
+         _ (native-journal! g (:journal root))
+         _ (when-not (= (:declared-evidence root) (native-declared! g (:declared root)))
+             (refuse :queue-root-stale-custody))
+         receipt (phase-worker! worker (:owner root))
+         key [(:ticket root) (:operation spec)] ticket (erlang/make_ref)
+         row {:ticket ticket :key key :root (phase-root-id root)
+              :generation (generation-id g) :worker worker :worker-receipt receipt
+              :spec spec :state :issued}]
+    ;; Capacity is GLOBAL; per-app generation locks alone do not protect it.
+    (BeamLisp.Env/with_generation_lock :queue-root-schema-phase-capacity
+     (fn []
+      (swap! schema-phases
+       (fn [all]
+        (when (or (contains? all key) (>= (count all) 128))
+         (refuse :queue-root-schema-phase-already-issued-or-capacity))
+        (assoc all key row))))) ticket))))))
+(defn- phase-row! [g key ticket states]
+ (let [row (get @schema-phases key) root (get @roots (:cache-key g))]
+  (when-not (and row root (= ticket (:ticket row)) (contains? states (:state row))
+                 (= (generation-id g) (:generation row))
+                 (= (phase-root-id root) (:root row)) (= :ready (:phase root))
+                 (= (erlang/self) (:worker row)) (Process/alive? (:owner root)))
+   (refuse :queue-root-schema-phase-authority-required))
+  ;; Check ALL enrolled native Conn lifetimes/custody, not only journal path.
+  (doseq [[id original] (:declared-evidence root)]
+   (let [actual (conn/creation-evidence! (get (:declared root) id))]
+    (when-not (= (select-keys original [:resource :lifetime :custody])
+                 (select-keys actual [:resource :lifetime :custody]))
+     (refuse :queue-root-stale-custody))))
+  (when-not (= (:worker-receipt row) (phase-worker! (erlang/self) (:owner root)))
+   (refuse :queue-root-schema-phase-worker-changed)) row))
+(defn schema-phase-admission!
+ "Native parked worker's read-only arming preflight. Selects an existing exact
+  issued phase; never enters/completes/releases it or grants from a marker."
+ [g spec ticket]
+ (origin-free!) (phase-spec! spec) (generation/attested-prepared! g)
+ (locked g
+  (fn []
+   (let [root (get @roots (:cache-key g)) key [(:ticket root) (:operation spec)]
+         row (phase-row! g key ticket #{:issued})]
+    (when-not (= spec (:spec row)) (refuse :queue-root-schema-phase-spec-required))
+    :issued))))
+
+(defn require-schema-phase!
+ "Fixed SDK Conn consumer. Only an active one-shot native worker phase grants
+  additive schema/publication access; ordinary original custody still works."
+ [g]
+ (when-not (and (execution/owned?) (= g (execution/current)))
+  (refuse :queue-root-owned-execution-required))
+ (generation/attested-prepared! g)
+ (let [root (evidence! g)]
+  (locked g
+   (fn []
+    (when (succession-held? root) (refuse :queue-root-policy-succession-unconfirmed))
+    (policy-publication-target! g root)
+    (if (= (erlang/self) (:owner root)) :original-custodian
+     (let [selector (Process/get SCHEMA-PHASE)]
+      (when-not (and (vector? selector) (= 2 (count selector)))
+       (refuse :queue-root-schema-phase-authority-required))
+      (phase-row! g (first selector) (second selector) #{:entered})
+      :delegated-schema-phase))))))
+(defn with-delegated-schema-phase!
+ "Trusted native worker boundary. Latch before entering G/effects. Known
+  synchronous return consumes once; throw, DOWN or timeout never completes or
+  releases a phase/reservation. The action does not issue authority."
+ [g spec ticket action]
+ (origin-free!) (phase-spec! spec) (generation/attested-prepared! g)
+ (when-not (and (erlang/is_reference ticket) (erlang/is_function action 0)
+                (nil? (Process/get SCHEMA-PHASE)))
+  (refuse :queue-root-schema-phase-authority-required))
+ (let [root (get @roots (:cache-key g)) key [(:ticket root) (:operation spec)]]
+  (locked g
+   (fn []
+    (let [row (phase-row! g key ticket #{:issued})]
+     (when-not (= spec (:spec row)) (refuse :queue-root-schema-phase-spec-required))
+     (swap! schema-phases assoc-in [key :state] :entered))))
+  (Process/put SCHEMA-PHASE [key ticket])
+  (try
+   (let [answer (action)]
+    (locked g
+     (fn []
+      (phase-row! g key ticket #{:entered})
+      (swap! schema-phases assoc-in [key :state] :consumed))) answer)
+   (catch error
+    ;; Never erase/renew this operation. A dead worker leaves :entered, also
+    ;; permanently held; no DOWN observer can infer phase completion.
+    (locked g #(swap! schema-phases assoc-in [key :state] :uncertain))
+    (throw error))
+   (finally (Process/delete SCHEMA-PHASE)))))
+
+(defn schema-policy-succession-admission!
+ "Read-only fixed Conn consumer. Actual original manager and exact issued
+  private Root succession, never a caller supplied publication/grant map."
+ [candidate previous publication]
+ (BeamLisp.Env/assert_execution_context!)
+ (when (or (not (execution/owned?)) (not= candidate (execution/current)))
+  (refuse :queue-root-policy-succession-required))
+ (generation/attested-prepared! candidate) (generation/attested-prepared! previous)
+ (locked candidate
+  (fn []
+   (let [root (get @roots (:cache-key candidate))
+         row (last (get @schema-successions (succession-key root)))]
+    (when-not (and root (= (erlang/self) (:owner root)) (Process/alive? (:owner root))
+                   (= :issued (:state row)) (= (:cache-key candidate) (:candidate row))
+                   (= (:cache-key previous) (:previous row)) (= publication (:publication row)))
+     (refuse :queue-root-policy-succession-required))
+    :issued))))
+(defn require-policy-available!
+ "Fixed SDK refusal gate. A pending/unknown native handoff holds opening,
+  schema and publication even if a late lower-level RPC response arrives."
+ [g]
+ (when-not (and (execution/owned?) (= g (execution/current)))
+  (refuse :queue-root-owned-execution-required))
+ (generation/attested-prepared! g)
+ (locked g
+  (fn []
+   (when-let [root (get @roots (:cache-key g))]
+    (when (succession-held? root) (refuse :queue-root-policy-succession-unconfirmed)))
+   :available)))
+(defn confirm-schema-policy-publication!
+ "Fixed native application completion consumer, before reservation release.
+  Consume an installed handoff only after actual target pointer publication and
+  positive SDK schema receipts. No returned map/flag or mere phase return counts."
+ [g]
+ (BeamLisp.Env/assert_execution_context!)
+ (when-not (and (execution/owned?) (= g (execution/current)))
+  (refuse :queue-root-owned-execution-required))
+ (generation/attested-prepared! g)
+ (let [row (locked g
+            (fn []
+             (let [root (get @roots (:cache-key g))]
+              (first (filter #(and (= :installed (:state %)) (= (:cache-key g) (:candidate %)))
+                             (get @schema-successions (succession-key root)))))))]
+  (if-not row :not-required
+   (let [publication (generation/schema-publication-evidence! g)
+         observe (BeamLisp.Env/with_env :global
+                   #(BeamLisp.AOT/sdk_named_constructor! "datom.conn" "schema-policy-publication-evidence!" 0))
+         schemas (observe)]
+    (when-not (and (= (get-in row [:receipt :policy]) (:policy schemas))
+                   (= (:cache-key g) (:generation schemas)))
+     (refuse :queue-root-policy-publication-required))
+    (locked g
+     (fn []
+      (let [root (get @roots (:cache-key g)) key (succession-key root)]
+       (when-not (= row (first (filter #(= (:ticket row) (:ticket %)) (get @schema-successions key))))
+        (refuse :queue-root-policy-succession-unconfirmed))
+       (swap! schema-successions update key
+        #(mapv (fn [actual] (if (= (:ticket row) (:ticket actual))
+                             (assoc actual :state :consumed :completed-publication publication :completed-schemas schemas) actual)) %)))))
+    :consumed))))
+
+
+(defn- native-command-root! [connection]
+ ;; Called only by the fixed native Conn bootstrap, outside app Source. A
+ ;; returned Root map is not authority: this reads the actual private ledger.
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (origin-free!)
+ (let [actual (conn/creation-evidence! connection)
+       candidates (filterv
+                    (fn [[_ row]]
+                     (and (= (:resource actual) (:resource row))
+                          (= (:lifetime actual) (:lifetime row))
+                          (= (:custody actual) (:custody row))
+                          (= (erlang/self) (:owner row))
+                          (contains? #{:enrolled :entered :ready} (:phase row)))) @roots)
+       identities (set (map #(select-keys (second %) [:application-id :root :path :resource :lifetime :custody :owner :incarnation]) candidates))]
+  (when-not (and (= 1 (count identities)) (= :open @(:lifetime actual))
+                 (= (erlang/self) (get-in actual [:custody :owner]))
+                 (nil? (get-in actual [:custody :origin])) (nil? (:creator actual)))
+   (refuse :native-command-root-custody-required))
+  (assoc (first identities) :declared-evidence (:declared-evidence (second (first candidates))))))
+
+(defn- native-command-retired-root! [connection]
+ ;; Fixed Conn close preflight only. Actual graph receipts, never mutable graph
+ ;; flags, names, path equality or caller-supplied prior-VM objects.
+ (BeamLisp.Env/assert_native_framework_execution!) (origin-free!)
+ (let [actual (conn/creation-evidence! connection)
+       key (erlang/term_to_binary (get-in actual [:resource :handle]))
+       note (get @retired-native-roots key)]
+  (when-not (and note (= (erlang/self) (:owner note) (get-in actual [:custody :owner]))
+                 (nil? (:creator actual)) (nil? (get-in actual [:custody :origin]))
+                 (= (:path note) (get-in actual [:resource :path]))
+                 (= :open @(:lifetime actual)) (seq (:graphs note))
+                 (not-any? #(= key (erlang/term_to_binary (get-in (second %) [:resource :handle]))) @roots)
+                 (not-any? #(= (:incarnation note) (get-in (second %) [:root :incarnation])) @schema-phases)
+                 (not (contains? @schema-successions [(:application-id note) (:incarnation note)])))
+   (refuse :queue-root-known-native-retirement-required)) note))

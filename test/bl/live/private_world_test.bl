@@ -1,0 +1,101 @@
+(ns live.private-world-test
+  (:require [datom] [live.app :as app] [live.socket :as socket] [live.hiccup :as h]))
+
+(def schema [{:db/ident :draft/id :db/valueType :db.type/string :db/unique :db.unique/identity}
+             {:db/ident :draft/value :db/valueType :db.type/string}])
+(defn fresh [] (datom/connect schema))
+(defn value [conn]
+  (first (first (datom/q '[:find ?v :where [_ :draft/value ?v]] (datom/db conn)))))
+(defn edit [_conn payload _principal]
+  [{:db/id -1 :draft/id "one" :draft/value (:value payload)}])
+(def registry {:edit {:target :session :perform edit} :shared-edit edit})
+(defn drain [] (receive _ (drain) (after 0 nil)))
+(defn state [shared private auth]
+  (socket/mount {:shared shared :session private :sink (erlang/self) :auth auth
+                 :intents registry :view (fn [_ db _]
+                                          [:main (if db (str (datom/q '[:find ?v :where [_ :draft/value ?v]] db)) "no private world")])}))
+
+(deftest the-server-registry-selects-the-write-world
+  (let [shared (fresh) private (fresh)]
+    (try
+      (let [st (state shared private nil) before (datom/db shared)
+            changed (socket/handle-event st [:intent :edit {:value "private" :target :shared}] {})]
+        (is (= :committed (get-in changed [:locals :live/outcome :status])))
+        (is (= "private" (value private)))
+        (is (= before (datom/db shared)))
+        (let [next (socket/handle-event changed [:intent :shared-edit {:value "shared" :target :session}] {})]
+          (is (= :committed (get-in next [:locals :live/outcome :status])))
+          (is (= "shared" (value shared)))
+          (is (= "private" (value private)))))
+      (finally (datom/close! private) (datom/close! shared) (drain)))))
+
+(deftest missing-private-world-and-denial-never-fall-back-to-shared
+  (let [shared (fresh) private (fresh)]
+    (try
+      (let [before (datom/db shared)
+            result (socket/handle-event (state shared nil nil) [:intent :edit {:value "must not write"}] {})]
+        (is (= :denied (get-in result [:locals :live/outcome :status])))
+        (is (= before (datom/db shared))))
+      (let [before (datom/db private)
+            auth {:principal "viewer" :fn (fn [_ _ _] {:verdict :deny :why "not allowed"})}
+            result (socket/handle-event (state shared private auth) [:intent :edit {:value "must not write"}] {})]
+        (is (= :denied (get-in result [:locals :live/outcome :status])))
+        (is (= before (datom/db private))))
+      (finally (datom/close! private) (datom/close! shared) (drain)))))
+
+(defn socket-pid [shared private]
+  (let [started (start app/app-socket {:view (fn [_ db _] [:main (when db (str (datom/q '[:find ?v :where [_ :draft/value ?v]] db)))])
+                                      :shared shared :session private :sink (erlang/self)
+                                      :listen {:payload :basis} :locals {}})]
+    (if (map? started) (:pid started) started)))
+
+(deftest private-commit-reprojects-its-viewer-and-keeps-the-other-world-isolated
+  (let [shared (fresh) alice (fresh) bob (fresh)
+        a (socket-pid shared alice) b (socket-pid shared bob)]
+    (try
+      (drain)
+      (datom/transact! alice (edit alice {:value "Alice draft"} nil))
+      (is (vector? (receive [:patch ops] ops (after 1000 nil))))
+      (is (includes? (h/hiccup->html (:tree (call a [:state]))) "Alice draft"))
+      (is (not (includes? (h/hiccup->html (:tree (call b [:state]))) "Alice draft")))
+      (is (nil? (value shared)))
+      (is (nil? (value bob)))
+      (stop a)
+      (let [replacement (socket-pid shared alice)]
+        (try
+          (is (includes? (h/hiccup->html (:tree (call replacement [:state]))) "Alice draft")
+              "an app-owned world survives replacement of the socket")
+          (finally (stop replacement))))
+      (finally (when (Process/alive? a) (stop a)) (stop b)
+               (datom/close! alice) (datom/close! bob) (datom/close! shared) (drain)))))
+
+(deftest ssr-selects-the-private-world-once-using-the-resolved-principal
+  (Application/put_env :plug :validate_header_keys_during_test false)
+  (let [alice (fresh) calls (atom [])
+        application {:principal (fn [_] "alice") :worlds (fn [_ _] {})
+                     :session-for (fn [me request]
+                                    (swap! calls conj [me (:request_path request)]) alice)
+                     :routes [["/" (fn [ctx] [:main (str (datom/q '[:find ?v :where [_ :draft/value ?v]] (:session ctx)))])]]}
+        request (fn [] (erlang/apply :Elixir.Plug.Test :conn (list "GET" "/" "")))]
+    (try
+      (datom/transact! alice (edit alice {:value "Restored draft"} nil))
+      (let [response (app/router application (request))]
+        (is (= 200 (:status response)))
+        (is (includes? (:resp_body response) "Restored draft"))
+        (is (= [["alice" "/"]] @calls)))
+      (finally (datom/close! alice)))))
+
+(deftest websocket-boundary-carries-the-selected-private-world
+  (let [shared (fresh) private (fresh)
+        application {:worlds (fn [_ _] {})
+                     :routes [["/" (fn [ctx] [:main (str (datom/q '[:find ?v :where [_ :draft/value ?v]] (:session ctx)))])]]}]
+    (try
+      (datom/transact! private (edit private {:value "Socket draft"} nil))
+      (let [mounted ((:init app/ws-handlers) {:app application :me "alice" :route "/" :shared shared :session private})
+            pid (get-in mounted [1 :srv])]
+        (try
+          (is (= :ok (first mounted)))
+          (is (= private (:session (call pid [:state]))))
+          (is (includes? (h/hiccup->html (:tree (call pid [:state]))) "Socket draft"))
+          (finally (stop pid))))
+      (finally (datom/close! private) (datom/close! shared) (drain)))))

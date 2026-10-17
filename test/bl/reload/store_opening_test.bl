@@ -1,0 +1,137 @@
+; Actual fixed SDK allocation/Conn handoff. Pending-phase fixture calls the
+; internal SDK phase explicitly; it does not claim a blocked real NIF was run.
+(ns reload.store-opening-test
+ (:require [reload.generation :as generation] [datom :as d] [datom.conn :as conn]
+           [datom.store-ets :as ets-store] [datom.store-opening :as opening] [proc.lifetime :as lifetime]))
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- graph [app version]
+ (generation/prepare! {:application-id app :stable-namespaces #{"datom" "datom.conn"}
+  :sources {"opening.app" (str "(ns opening.app (:require [datom :as d])) (def revision " version ") (defn alive [] true)")}}))
+(defn- reserve [g receipts action]
+ (generation/with! g #(conn/with-guard-reservation! receipts action)))
+(defn- inventory [g c] (generation/with! g #(conn/guard-association-inventory! c)))
+(defn- openings []
+ (Agent/get (erlang/whereis conn/REGISTRY) (fn [cells] (get cells :datom.conn/store-openings {})) 30000))
+(defn- await [predicate]
+ (loop [left 2000] (cond (predicate) true (zero? left) false
+                   :else (do (Process/sleep 5) (recur (dec left))))))
+
+(deftest returned-unconnected-store-blocks-activation-until-atomic-native-connection-claim
+ (let [g (graph "opening-claim" 1) raw (generation/with! g ets-store/open) mutations (atom 0)
+       c (atom nil)]
+  (try
+   (is (= 1 (count (filter #(= raw (:store (second %))) (openings)))))
+   (is (= :store-opening-pending (kind #(reserve g [] (fn [] (swap! mutations inc))))))
+   (is (= 0 @mutations)) (is (not= :undefined (ets/info (:table raw))))
+   (reset! c (generation/with! g #(d/connect-with raw)))
+   (is (empty? (filter #(= raw (:store (second %))) (openings))))
+   (let [r (inventory g @c)]
+    (is (= (select-keys g [:application-id :scope :digest]) (:creator r)))
+    (is (= :selected (reserve g [r] (fn [] :selected)))))
+   (finally (if @c (d/close! @c) (ets-store/close raw)) (generation/retire! g)))))
+
+(deftest borrowed-raw-native-store-cannot-manufacture-creator-from-current-scope
+ (let [g (graph "opening-borrowed" 1) raw (ets-store/open)]
+  (try
+   (is (= :unclassified-store-opening (kind #(generation/with! g #(d/connect-with raw)))))
+   (is (not= :undefined (ets/info (:table raw))))
+   ;; An actual already-registered external lifetime stays borrowed, with nil
+   ;; creator. This is not admission to install a new policy.
+   (let [c (d/connect-with raw)]
+    (try
+     (is (= (:lifetime c) (:lifetime (generation/with! g #(d/connect-with raw)))))
+     (is (nil? (:creator (inventory g c))))
+     (finally (conn/release! c))))
+   (finally (ets-store/close raw) (generation/retire! g)))))
+
+(deftest exact-original-opening-creator-survives-another-generation-claim
+ (let [old (graph "opening-origin" 1) next (graph "opening-origin" 2)
+       raw (generation/with! old ets-store/open) c (atom nil)]
+  (try
+   (reset! c (generation/with! next #(d/connect-with raw)))
+   (is (= (select-keys old [:application-id :scope :digest]) (:creator (inventory next @c))))
+   (finally (if @c (d/close! @c) (ets-store/close raw))
+    (generation/retire! old) (generation/retire! next)))))
+
+(deftest foreign-opening-refuses-without-consuming-receipt-or-closing-borrowed-store
+ (let [a (graph "opening-foreign-a" 1) b (graph "opening-foreign-b" 1)
+       raw (generation/with! a ets-store/open)]
+  (try
+   (is (= :foreign-store-opening (kind #(generation/with! b #(d/connect-with raw)))))
+   (is (seq (filter #(= raw (:store (second %))) (openings))))
+   (is (not= :undefined (ets/info (:table raw))))
+   (let [c (generation/with! a #(d/connect-with raw))] (d/close! c))
+   (finally (ets-store/close raw) (generation/retire! a) (generation/retire! b)))))
+
+(deftest native-ets-destruction-releases-only-exact-unconnected-opening
+ (let [g (graph "opening-close" 1) raw (generation/with! g ets-store/open)]
+  (try
+   (is (= :store-opening-still-live (kind #(opening/confirm-ets-closed! raw))))
+   (is (= :store-opening-pending (kind #(reserve g [] (fn [] :must-not-run)))))
+   (ets-store/close raw)
+   (is (= :undefined (ets/info (:table raw))))
+   (is (empty? (filter #(= raw (:store (second %))) (openings))))
+   (is (= :safe (reserve g [] (fn [] :safe))))
+   (finally (ets-store/close raw) (generation/retire! g)))))
+
+(deftest pending-native-opening-phase-refuses-before-any-counted-activation
+ (let [g (graph "opening-pending" 1) raw-name :opening-phase-fixture parent (erlang/self)
+       receipt (atom nil) begin (BeamLisp.Env/fetch_exact! "datom.store-opening" "begin!")
+       child (spawn (fn []
+         (generation/with! g (fn [] (reset! receipt (begin :ets raw-name nil))
+                                   (erlang/send parent :pending-opening-armed)
+                                   (receive :complete-opening nil (after 10000 nil))))))
+       mutations (atom 0)]
+  (is (receive :pending-opening-armed true (after 10000 false)))
+  (is (= :store-opening-pending (kind #(reserve g [] (fn [] (swap! mutations inc))))))
+  (is (= 0 @mutations))
+  ;; No allocation is launched by this phase fixture. Owner death nevertheless
+  ;; has no generic no-effect certificate; the production cleanup stays held.
+  (Process/exit child :kill)
+  (is (await #(not (Process/alive? child))))
+  (is (await #(= :uncertain (:phase (get (openings) (:ticket @receipt))))))
+  (is (= :store-opening-uncertain (kind #(reserve g [] (fn [] (swap! mutations inc))))))
+  (is (= 0 @mutations))
+  (generation/retire! g)))
+
+(deftest source-sealing-refuses-direct-aliased-and-borrowed-raw-opening-authority
+ (doseq [body ["(defn run [] (fjall/fjall-open \"not-opened\"))"
+              "(defn run [] (let [borrowed fjall/fjall-open] (borrowed \"not-opened\")))"
+              "(defn run [] (fjall/__allocate-native! \"not-opened\"))"
+              "(defn run [] (opening/allocate! :fjall \"not-opened\"))"
+              "(defn run [handle] (fjall/fjall-put handle \"key\" \"value\"))"]]
+  (is (= :unmanaged-generation-producer
+    (kind #(generation/prepare! {:stable-namespaces #{"datom.store-fjall" "datom.store-opening"}
+      :sources {"opening.refused" (str "(ns opening.refused (:require [datom.store-fjall :as fjall] [datom.store-opening :as opening])) " body)}})))))
+ ;; A quoted dangerous-looking symbol has no executable authority.
+ (let [g (generation/prepare! {:sources {"opening.quoted"
+                "(ns opening.quoted) (def data '(datom.store-fjall/fjall-open datom.store-opening/allocate!)) (defn value [] data)"}})]
+  (try (is (= '(datom.store-fjall/fjall-open datom.store-opening/allocate!)
+              (generation/invoke! g "opening.quoted/value" [])))
+   (finally (generation/retire! g)))))
+
+(deftest compiler-resolved-referred-and-borrowed-raw-binding-cannot-bypass-source-spelling
+ (doseq [body ["(defn run [path] (fjall-open path))"
+              "(defn run [path] (let [borrowed fjall-open] (borrowed path)))"]]
+  (is (= :unmanaged-compiled-producer
+    (kind #(generation/prepare! {:stable-namespaces #{"datom.store-fjall"}
+      :sources {"opening.referred"
+       (str "(ns opening.referred (:require [datom.store-fjall :refer [fjall-open]])) " body)}}))))))
+
+(deftest harmless-native-read-codec-and-sync-bindings-remain-sealable
+ (let [g (generation/prepare! {:stable-namespaces #{"datom.store-fjall"}
+    :sources {"opening.reads"
+     "(ns opening.reads (:require [datom.store-fjall :as fjall]))
+      (defn read [handle key] (fjall/fjall-get handle key))
+      (defn sync [handle] (fjall/fjall-sync handle))
+      (defn encode [tag i s b] (fjall/keycodec-encode tag i s b))"}})]
+  ;; Seal actual bodies, but do not invent a native handle or run sync/read.
+  (try (is (string? (:digest g)))
+   (finally (generation/retire! g)))))
+
+(deftest same-words-in-lexical-application-functions-grant-no-native-authority-and-remain-valid
+ (let [g (generation/prepare! {:sources {"opening.lexical"
+   "(ns opening.lexical) (defn fjall-open [value] value)
+    (defn value [] (let [borrowed fjall-open] (borrowed :ordinary-data)))"}})]
+  (try (is (= :ordinary-data (generation/invoke! g "opening.lexical/value" [])))
+   (finally (generation/retire! g)))))

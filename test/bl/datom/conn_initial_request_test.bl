@@ -1,0 +1,133 @@
+; Seam-free production Conn. Genuine registry/canonical Conn/creation evidence.
+(ns datom.conn-initial-request-test
+ (:require [datom :as d] [datom.conn :as conn] [env]))
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- connection [] (d/connect []))
+(defn- down! [pid watch]
+ (receive [:DOWN seen :process stopped _] :when (and (= seen watch) (= stopped pid)) :down
+  (after 5000 (throw (ex-info "Request fixture did not finish" {:kind :fixture-timeout})))))
+(defn- cleanup! [request c]
+ (when request
+  (let [r (conn/fence-lifetime-request! request)]
+   (when (= :held (:status r)) (conn/release-lifetime! (:receipt r)))))
+ (conn/close! c))
+
+(deftest local-request-precedes-borrow-and-commit-is-exactly-idempotent
+ (let [c (connection) before (conn/creation-evidence! c)
+       request (conn/prepare-lifetime-request! c)]
+  (try
+   (is (= :datom.conn/lifetime-request (elem request 0)))
+   (is (= (erlang/self) (elem request 2)))
+   (is (= (BeamLisp.Env/env_id) (elem request 3)))
+   (is (= before (elem request 4)))
+   (is (= :invalid-connection-borrow-request
+          (kind #(conn/prepare-lifetime-request! (maps/put :lifetime nil c)))))
+   (let [first (conn/commit-lifetime-request! request)
+         again (conn/commit-lifetime-request! request)]
+    (is (= first again))
+    (is (= (elem request 1) (elem first 4)))
+    (is (= :connection-borrowers-draining (kind #(conn/close! c))))
+    (is (= before (conn/creation-evidence! c)))
+    (is (= :released (conn/release-lifetime! first)))
+    (is (= :closed (:status (conn/fence-lifetime-request! request))))
+    (is (= :connection-borrow-request-closed (kind #(conn/commit-lifetime-request! request))))
+    (is (= :stale-connection-borrow (kind #(conn/release-lifetime! first)))))
+   (finally (cleanup! request c)))))
+
+(deftest only-original-native-pid-and-env-can-create-the-initial-borrow
+ (let [c (connection) request (conn/prepare-lifetime-request! c) sink (erlang/self)
+       worker (spawn-monitor (fn [] (erlang/send sink [:wrong-request-caller
+                                      (kind #(conn/commit-lifetime-request! request))])))]
+  (try
+   (is (= :connection-borrow-request-caller
+          (receive [:wrong-request-caller k] k (after 5000 :timeout))))
+   (down! (elem worker 0) (elem worker 1))
+   (is (= :connection-borrow-request-caller
+          (env/isolated #(kind (fn [] (conn/commit-lifetime-request! request))))))
+   (let [receipt (conn/commit-lifetime-request! request)]
+    (is (conn/lifetime-borrow-active? receipt))
+    (is (= :released (conn/release-lifetime! receipt))))
+   (finally
+    (Process/demonitor (elem worker 1) (list :flush)) (cleanup! request c)))))
+
+(deftest different-custodian-fences-before-original-delayed-commit
+ (let [c (connection) sink (erlang/self)
+       worker (spawn-monitor
+        (fn []
+         (let [request (conn/prepare-lifetime-request! c)]
+          (erlang/send sink [:prepared-request request])
+          (receive :commit
+           (erlang/send sink [:late-commit (kind #(conn/commit-lifetime-request! request))])))))
+       request (receive [:prepared-request r] r (after 5000 nil))]
+  (try
+   (is (some? request))
+   (is (= :closed (:status (conn/fence-lifetime-request! request))))
+   (is (= :closed (:status (conn/fence-lifetime-request! request))))
+   (erlang/send (elem worker 0) :commit)
+   (is (= :connection-borrow-request-closed
+          (receive [:late-commit k] k (after 5000 :timeout))))
+   (down! (elem worker 0) (elem worker 1))
+   (is (= :ok (conn/release! c)))
+   (is (= :closed @(:lifetime c)))
+   (finally (Process/demonitor (elem worker 1) (list :flush)) (conn/close! c)))))
+
+(deftest different-custodian-recovers-only-actual-issued-cap-after-owner-exit
+ (let [c (connection) sink (erlang/self)
+       worker (spawn-monitor
+        (fn []
+         (let [request (conn/prepare-lifetime-request! c)
+               receipt (conn/commit-lifetime-request! request)]
+          (erlang/send sink [:committed-request request receipt]))))
+       result (receive [:committed-request r receipt] [r receipt] (after 5000 nil))
+       request (first result) receipt (second result)]
+  (try
+   (down! (elem worker 0) (elem worker 1))
+   (is (not (Process/alive? (elem worker 0))))
+   (is (conn/lifetime-borrow-active? receipt))
+   (is (= :connection-borrowers-draining (kind #(conn/close! c))))
+   (let [found (conn/fence-lifetime-request! request)]
+    (is (= :held (:status found)))
+    (is (= receipt (:receipt found)))
+    (is (= :released (conn/release-lifetime! (:receipt found)))))
+   (is (= :closed (:status (conn/fence-lifetime-request! request))))
+   (is (= :ok (conn/release! c)))
+   (finally
+    (Process/demonitor (elem worker 1) (list :flush)) (cleanup! nil c)))))
+
+(deftest full-original-connection-and-creation-evidence-remain-bound
+ (let [c (connection) request (conn/prepare-lifetime-request! c)
+       receipt (conn/commit-lifetime-request! request)
+       evidence (elem request 4)
+       edited-connection (maps/put :schema (atom {}) c)
+       edited-request (erlang/setelement 5 request (assoc evidence :connection edited-connection))
+       edited-custody (erlang/setelement 5 request
+                       (assoc-in evidence [:custody :ticket] (erlang/make_ref)))]
+  (try
+   (is (= :connection-borrow-unavailable (kind #(conn/prepare-lifetime-request! edited-connection))))
+   (is (= :connection-borrow-request-unknown (kind #(conn/fence-lifetime-request! edited-request))))
+   (is (= :connection-borrow-request-unknown (kind #(conn/commit-lifetime-request! edited-request))))
+   (is (= :connection-borrow-request-unknown (kind #(conn/fence-lifetime-request! edited-custody))))
+   (is (conn/lifetime-borrow-active? receipt))
+   (is (= evidence (conn/creation-evidence! c)))
+   (is (= :held (:status (conn/fence-lifetime-request! request))))
+   (is (= :connection-borrow-request-closed (kind #(conn/commit-lifetime-request! request))))
+   (is (= :released (conn/release-lifetime! receipt)))
+   (finally (cleanup! request c)))))
+
+(deftest terminal-request-slots-stay-bounded-and-saturation-fences-all-late-requests
+ (let [c (connection) requests (mapv (fn [_] (conn/prepare-lifetime-request! c)) (range 129))]
+  (try
+   (doseq [request (take 128 requests)] (conn/fence-lifetime-request! request))
+   (let [last (last requests)]
+    (is (= :connection-borrow-request-capacity (kind #(conn/commit-lifetime-request! last))))
+    (is (= :closed (:status (conn/fence-lifetime-request! last))))
+    (is (= :connection-borrow-request-closed (kind #(conn/commit-lifetime-request! last))))
+    (is (= :connection-borrow-request-closed
+           (kind #(conn/commit-lifetime-request! (conn/prepare-lifetime-request! c))))))
+   (is (every? #(= :closed (:status (conn/fence-lifetime-request! %))) requests))
+   ;; Existing one-shot low-level borrowing keeps its active128-ticket contract.
+   (let [legacy (conn/retain-lifetime! c)]
+    (is (conn/lifetime-borrow-active? legacy))
+    (is (= :released (conn/release-lifetime! legacy))))
+   (is (= :ok (conn/release! c)))
+   (finally (conn/close! c)))))

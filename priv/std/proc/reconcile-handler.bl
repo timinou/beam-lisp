@@ -1,0 +1,176 @@
+; Fixed SDK adapter for exactly emitted reconciliation recipes. This is not an
+; application provider/constructor retry API; empty first-order snapshots only.
+(ns proc.reconcile-handler
+ (:require [proc.queue :as queue] [proc.queue-family :as family]
+           [proc.reconcile :as reconcile] [proc.reconcile-config :as resources]
+           [reload.execution :as execution] [reload.generation :as generation]
+           [reload.reconcile-snapshot :as snapshot]
+           [data.first-order :as data] [proc.tick :as tick]))
+(def ^:private issued (atom {}))
+(defn- refuse [kind] (throw (ex-info "Sealed reconciliation handler refused" {:kind kind})))
+(defn recipe!
+ [g id original-class]
+ (generation/attested-prepared! g)
+ (let [entry (get-in g [:declarations :reconcile id :data :canonical])]
+  (when-not (and (contains? #{1 2} (:version entry)) (= id (:declaration entry))
+                 (= original-class (:original-class entry))
+                 (contains? (:server-classes g) original-class)
+                 (or (and (= 1 (:version entry)) (= :empty-first-order (:snapshot-scope entry)) (empty? (:cell-keys entry)))
+                     (and (= 2 (:version entry)) (= :selected-versioned (:snapshot-scope entry))
+                          (vector? (:cell-keys entry)) (vector? (:snapshot-slots entry))
+                          (map? (:callback-constructors entry))))
+                 (string? (:reifier entry)) (string? (:instance entry)))
+   (refuse :missing-sealed-reconcile-recipe)) entry))
+(defn- attested-recipe! [g recipe]
+ (data/check! recipe {:max-nodes 32768 :max-depth 64 :max-bytes 1048576})
+ (let [actual (recipe! g (:declaration recipe) (:original-class recipe))]
+  (when-not (= actual recipe) (refuse :unsealed-reconcile-recipe)) actual))
+(defn- resource-ticket [handler]
+ ;; Inspect raw maps only, before any domain Lookup/protocol could run.
+ (let [context (when (and (erlang/is_map handler) (not (maps/is_key :__struct__ handler)))
+                 (maps/get :reconcile handler nil))
+       resources (when (and (erlang/is_map context) (not (maps/is_key :__struct__ context)))
+                   (maps/get :resources context nil))]
+  (when (and (erlang/is_map resources) (not (maps/is_key :__struct__ resources)))
+   (maps/get :ticket resources nil))))
+(defn attested!
+ "Exact SDK-issued immutable handler, not a caller-nominated cfg/perform/body.
+  Native installation may add only its own lease. No API grants publication."
+ ([handler] (attested! handler false))
+ ([handler installed?]
+  (when-not (and (erlang/is_map handler) (not (maps/is_key :__struct__ handler)))
+   (refuse :unsealed-reconcile-handler))
+  (let [ticket (resource-ticket handler) record (get @issued ticket)
+        base (if installed? (dissoc handler :lease) handler)]
+   (when-not (and ticket (= base (:handler record))) (refuse :unsealed-reconcile-handler)))
+  handler))
+(defn same-meaning?
+ "Compare actual prepared callback/capture/context meaning. A generation digest
+  or code module set alone cannot identify config semantics. Native lease and
+  resource watch/history ticket bookkeeping are the only excluded fields."
+ [left right]
+ (if (or (:reconcile left) (:reconcile right))
+  (let [a (get @issued (resource-ticket left)) b (get @issued (resource-ticket right))]
+   (and a b (= (dissoc left :lease) (:handler a)) (= (dissoc right :lease) (:handler b))
+        (= (:meaning a) (:meaning b))))
+  (= (dissoc left :lease :scope-lease) (dissoc right :lease :scope-lease))))
+(defn server!
+ [g recipe start-context]
+ (attested-recipe! g recipe)
+ (when (= 2 (:version recipe)) (refuse :single-snapshot-session-required))
+ (data/check! start-context {:max-nodes 32768 :max-depth 64 :max-bytes 1048576})
+ (execution/with! g
+  #(let [identity (execution/invoke! g (:instance recipe) [start-context {}])]
+     (when-not (or (keyword? identity) (string? identity) (symbol? identity))
+      (refuse :invalid-sealed-reconcile-instance))
+     (queue/resolve-server identity))))
+(defn- build-handler! [g recipe srv start-context projected]
+ (let [cfg (:config projected)]
+   (let [_ (reconcile/dispatch-config! srv cfg :validate [])
+         handle (resources/new-handler-resources! srv)
+         context {:family (:declaration recipe) :recipe recipe :start-context start-context
+                  :graph g :config cfg :resources handle
+                  :snapshot (select-keys projected [:identity :versions :callback-meaning])}
+         perform (fn [job]
+                   (resources/with-handler-resources! handle
+                    #(reconcile/dispatch-config! srv cfg :perform [job])))
+         accept (fn [payload] (try (family/validate-reconcile-payload! payload) true (catch _ false)))]
+    (let [handler {:server (queue/resolve-server srv) :decl (assoc (:queue-declaration recipe) :generation (:digest g))
+                   :perform perform :clock (:clock cfg tick/wall-ms) :contract {:accept? accept}
+                   :environment (BeamLisp.Env/capture) :modules (:modules g) :reconcile context}]
+     (swap! issued assoc (:ticket handle)
+      {:handler handler
+       :meaning {:family (:declaration recipe) :recipe recipe :start-context start-context
+                 :graph (select-keys g [:cache-key :scope :digest :application-id])
+                 :server (:server handler) :decl (:decl handler)
+                 :config cfg :snapshot (:snapshot context) :clock (:clock handler) :contract (:contract handler)
+                 :modules (:modules handler) :environment (:environment handler)}})
+     handler))))
+(defn prepare-instance!
+ "Identity/config share one versioned session for v2. The fixed Native path
+  checks expected identity before retention; refusals preserve serving state.
+  No original config factory/provider is replayed. V2 remains hard disabled."
+ [g recipe start-context expected-server initializing?]
+ (attested-recipe! g recipe)
+ (data/check! start-context {:max-nodes 32768 :max-depth 64 :max-bytes 1048576})
+ (execution/with! g
+  (fn []
+   (let [projected
+         (if (= 2 (:version recipe))
+          (snapshot/project! g recipe start-context expected-server initializing?)
+          (let [srv (server! g recipe start-context)]
+           (when (and expected-server (not= (queue/server-name srv) (queue/server-name expected-server)))
+            (refuse :queue-identity-migration-required))
+           (when initializing?
+            (family/register! (queue/server-name srv) (:declaration recipe) (:queue-declaration recipe) true)
+            (queue/ensure-family-store! srv))
+           {:server srv :identity srv :versions [] :callback-meaning {}
+            :config (execution/invoke! g (:reifier recipe) [srv (:policy recipe) start-context {}])}))]
+    (build-handler! g recipe (:server projected) start-context projected)))))
+(defn prepare! [g recipe srv start-context]
+ (if (= 2 (:version recipe)) (prepare-instance! g recipe start-context srv false)
+  (do
+   (attested-recipe! g recipe)
+   (data/check! start-context {:max-nodes 32768 :max-depth 64 :max-bytes 1048576})
+   (execution/with! g
+    #(build-handler! g recipe srv start-context
+       {:server srv :identity srv :versions [] :callback-meaning {}
+        :config (execution/invoke! g (:reifier recipe) [srv (:policy recipe) start-context {}])})))))
+(defn initialize!
+ "Fixed SDK initialization establishes the actual family/store before config.
+  V2 identity/config use the same one-time cell snapshot; no extra identity read."
+ [payload]
+ (let [g (execution/current) id (:declaration payload)
+       recipe (recipe! g id (:original-class payload)) start-context (:start-context payload)]
+  (if (= 2 (:version recipe)) (prepare-instance! g recipe start-context nil true)
+   ;; Preserve the original v1 family/store/execution order exactly.
+   (let [srv (server! g recipe start-context)]
+    (family/register! (queue/server-name srv) id (:queue-declaration recipe) true)
+    (queue/ensure-family-store! srv)
+    (prepare! g recipe srv start-context)))))
+(defn invoke!
+ [handler operation args]
+ (let [ctx (:reconcile handler) srv (:server handler)]
+  (when-not ctx (refuse :missing-sealed-reconcile-handler))
+  (resources/with-handler-resources! (:resources ctx)
+   #(reconcile/dispatch-config! srv (:config ctx) operation args))))
+(defn activate-resources!
+ "Actual queue-runtime owner calls after installing a retained handler. Publish
+  the ordinary reconcile API's current registration; old jobs retain old config
+  directly and cleanup targets exact resource tickets rather than server names."
+ [handler]
+ (let [ctx (:reconcile handler)]
+  (when ctx
+   (resources/publish-handler! (:server handler) (:resources ctx)
+     (fn [operation args] (invoke! handler operation args)) handler dispose-resources!))))
+(defn dispose-resources!
+ "Fixed SDK owner-DOWN cleanup; resource key only, never a captured Source
+  graph/config/handler. This same action serves normal retirement and hard kill."
+ [key]
+ (when-not (and (tuple? key) (= 2 (erlang/tuple_size key)) (erlang/is_reference (elem key 1)))
+  (refuse :invalid-reconcile-resource-key))
+ (reconcile/discard-resources! key)
+ (swap! issued dissoc (elem key 1))
+ :disposed)
+(defn close! [handler]
+ (when-let [ctx (:reconcile handler)]
+  (resources/close-handler-resources! (:resources ctx) dispose-resources!)))
+(defn diagnostic-counts
+ "Counts only for an exact prepared graph; no private callbacks, IDs, handles
+  or custody tickets escape. Useful for actual teardown/capacity acceptance."
+ [g]
+ (generation/attested-prepared! g)
+ {:issued (count (filter (fn [[_ row]]
+                          (= (:digest g) (get-in row [:handler :reconcile :graph :digest]))) @issued))
+  :resources (resources/diagnostic-count (:application-id g))})
+
+(defn discard-prepared! [handler]
+ (when-let [context (:reconcile handler)]
+  (let [handle (:resources context)]
+   (when (and (not (:accepted @(:state handle))) (not (:installed @(:state handle))))
+    (resources/discard-prepared-resources! handle)
+    (swap! issued dissoc (:ticket handle))))))
+(defn accept! [handler]
+ (attested! handler true)
+ (when-let [context (:reconcile handler)]
+  (resources/accept-handler-resources! (:resources context))))

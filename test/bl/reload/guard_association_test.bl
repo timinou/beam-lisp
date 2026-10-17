@@ -1,0 +1,154 @@
+; Actual native Datom lifetimes and sealed named guard catalogues. No predicate
+; is invoked to inspect compatibility. Publication callback below is a counted
+; component boundary, not proof of packaged Foundry publication.
+(ns reload.guard-association-test
+ (:require [reload.generation :as generation] [datom :as d] [datom.conn :as conn] [env]))
+(defn- kind [action] (try (action) nil (catch error (:kind (ex-data error)))))
+(defn- graph [app ceiling declared?]
+ (generation/prepare!
+  {:application-id app :stable-namespaces #{"datom" "datom.conn"}
+   :sources {"association.app"
+    (str "(ns association.app (:require [datom :as d] [datom.conn :as conn])) (def revision " ceiling ")"
+          "
+          (defn predicate [report] " (if (= :never ceiling) "(throw :guard-executed-during-inspection)" "nil") ")
+          (defn write! [c value] (d/transact! c [[:db/add 1 :test/value value]]))"
+         (when declared? "(defn install! [c] (conn/guard! c :association/policy predicate))"))}}))
+(defn- connection [] (d/connect [{:db/ident :test/value :db/valueType :db.type/long}]))
+(defn- inventory [g c] (generation/with! g #(conn/guard-association-inventory! c)))
+(defn- fenced [g receipts action]
+ (generation/with! g #(conn/with-guard-publication-fence! receipts action)))
+(defn- await [predicate]
+ (loop [left 2000]
+  (cond (predicate) true (zero? left) false
+   :else (do (Process/sleep 5) (recur (dec left))))))
+(defn- blocked-on-native-lock? [pid]
+ (let [trace (Process/info pid :current_stacktrace)]
+  (when (tuple? trace)
+   (boolean (some (fn [frame]
+    (and (tuple? frame) (= :Elixir.BeamLisp.Env (elem frame 0))
+         (contains? #{:acquire_local_lock :wait_for_local_lock_retry} (elem frame 1)))) (elem trace 1))))))
+
+(deftest candidate-compatible-association-inventory-is-predicate-free
+ (let [old (graph "association-observe" :never true)
+       next (graph "association-observe" 2 true)
+       c (generation/with! old connection) publication (atom 0)]
+  (try
+   (generation/invoke! old "association.app/install!" [c])
+   (let [before (conn/guard-owner c :association/policy) basis (d/basis-t (d/db c))
+         receipt (inventory next c)]
+    (is (= :guard-association-inventory (:kind receipt)))
+    (is (= (:digest next) (:generation receipt)))
+    (is (= (:lifetime c) (:lifetime receipt)))
+    (is (= before (get-in receipt [:guards :association/policy])))
+    (is (= :published (fenced next [receipt] #(do (swap! publication inc) :published))))
+    (is (= 1 @publication))
+    (is (= before (conn/guard-owner c :association/policy)))
+    (is (= basis (d/basis-t (d/db c)))))
+   (finally (conn/release! c) (generation/retire! old) (generation/retire! next)))))
+
+(deftest missing-legacy-foreign-and-stale-associations-refuse-before-publication
+ (let [old (graph "association-refusal" 1 true) next (graph "association-refusal" 2 true)
+       missing (graph "association-refusal" 3 false) other (graph "association-foreign" 4 true)
+       c (generation/with! old connection) legacy (connection) publication (atom 0)]
+  (try
+   (generation/invoke! old "association.app/install!" [c])
+   (conn/guard! legacy :legacy (fn [_] nil))
+   (is (= :missing-guard-declaration (kind #(inventory missing c))))
+   (is (= :guard-application-mismatch (kind #(inventory other c))))
+   (is (= :legacy-guard-adoption-required (kind #(inventory next legacy))))
+   (let [receipt (inventory next c) before (conn/guard-owner c :association/policy)]
+    (generation/with! old #(conn/remove-declared-guard! c :association/policy before))
+    (generation/invoke! old "association.app/install!" [c])
+    (is (not= before (conn/guard-owner c :association/policy)))
+    (is (= :stale-guard-association-inventory
+           (kind #(fenced next [receipt] (fn [] (swap! publication inc))))))
+    (is (= :duplicate-guard-resource
+           (kind #(fenced next [(inventory next c) (inventory next c)] (fn [] (swap! publication inc))))))
+    (is (= :invalid-guard-inventory
+           (kind #(fenced next [(assoc (inventory next c) :generation (:digest old))]
+                         (fn [] (swap! publication inc)))))))
+   (is (= 0 @publication))
+   (generation/invoke! old "association.app/write!" [c 42])
+   (is (= 42 (:test/value (d/entity (d/db c) 1))))
+   (finally (conn/release! c) (conn/release! legacy)
+    (doseq [g [old next missing other]] (generation/retire! g))))))
+
+(deftest final-publication-cannot-wait-on-a-writer-or-invalidate-its-own-lifetime
+ (let [g (graph "association-no-writer" 1 true) c (generation/with! g connection)]
+  (try
+   (generation/invoke! g "association.app/install!" [c])
+   (let [receipt (inventory g c)]
+    (is (= :guard-publication-writer-forbidden
+           (kind #(fenced g [receipt] (fn [] (generation/invoke! g "association.app/write!" [c 1]))))))
+    (is (= :guard-publication-mutation-forbidden
+           (kind #(fenced g [receipt] (fn [] (conn/release! c))))))
+    (is (= :open @(:lifetime c)))
+    (is (nil? (:test/value (d/entity (d/db c) 1))))
+    (is (nil? (Process/get :datom.conn/guard-publication)))
+    (is (= :current (fenced g [receipt] (fn [] :current)))))
+   (generation/invoke! g "association.app/write!" [c 2])
+   (is (= 2 (:test/value (d/entity (d/db c) 1))))
+   (finally (conn/release! c) (generation/retire! g)))))
+
+(deftest real-close-and-policy-mutation-wait-outside-the-publication-metadata-fence
+ (let [g (graph "association-concurrent" 1 true) c (generation/with! g connection)
+       parent (erlang/self) closer (atom nil)]
+  (try
+   (generation/invoke! g "association.app/install!" [c])
+   (let [receipt (inventory g c)]
+    (is (= :published
+     (fenced g [receipt]
+      (fn []
+       (reset! closer (spawn (fn [] (conn/release! c) (erlang/send parent :association-closed))))
+       ;; Observe the actual SDK wait frame, not a timing sleep, to prove the
+       ;; close reached the same held native lock before reading the lifetime.
+       (is (await #(blocked-on-native-lock? @closer)))
+       (is (= :open @(:lifetime c)))
+       :published)))))
+   (is (= true (receive :association-closed true (after 10000 false))))
+   (is (= :closed @(:lifetime c)))
+   (is (= :invalid-guard-resource (kind #(inventory g c))))
+   (finally (when (= :open @(:lifetime c)) (conn/release! c))
+    (when @closer (await #(not (Process/alive? @closer)))) (generation/retire! g)))))
+
+(deftest bound-context-cannot-observe-a-migration-compatible-private-receipt
+ (let [g (graph "association-bound" 1 true) c (generation/with! g connection)
+       previous (env/capture) token (generation/with! g env/capture)]
+  (try
+   (env/bind token)
+   (is (= :managed-guard-execution-required (kind #(conn/guard-association-inventory! c))))
+   (finally (env/bind previous) (conn/release! c) (generation/retire! g)))))
+
+(deftest multi-store-fences-normalize-order-and-do-not-block-ordinary-transactions
+ (let [g (graph "association-two-stores" 1 true) first-store (generation/with! g connection)
+       second-store (generation/with! g connection) parent (erlang/self) writer (atom nil)]
+  (try
+   (doseq [c [first-store second-store]] (generation/invoke! g "association.app/install!" [c]))
+   (let [a (inventory g first-store) b (inventory g second-store)]
+    (is (= :first (fenced g [a b] (fn [] :first))))
+    (is (= :second (fenced g [b a] (fn [] :second))))
+    (is (= :written
+     (fenced g [b a]
+      (fn []
+       (reset! writer (spawn
+         (fn [] (generation/invoke! g "association.app/write!" [first-store 73])
+                (erlang/send parent :association-write-complete))))
+       ;; A separate ordinary writer must finish while BOTH metadata fences
+       ;; remain held. This would time out if publication held a writer turn.
+       (receive :association-write-complete :written (after 10000 :writer-blocked))))))
+    (is (= 73 (:test/value (d/entity (d/db first-store) 1))))
+    (is (= :still-current (fenced g [a b] (fn [] :still-current)))))
+   (finally
+    (when @writer (await #(not (Process/alive? @writer))))
+    (conn/release! first-store) (conn/release! second-store) (generation/retire! g)))))
+
+(deftest declared-borrowed-store-with-no-creator-and-no-policies-stays-borrowed
+ (let [g (graph "association-borrowed" 1 true) c (connection)]
+  (try
+   (let [receipt (inventory g c)]
+    (is (nil? (:creator receipt))) (is (empty? (:guards receipt)))
+    (is (= :published (fenced g [receipt] (fn [] :published))))
+    (is (= :guard-resource-adoption-required
+           (kind #(generation/invoke! g "association.app/install!" [c]))))
+    (is (nil? (conn/guard-owner c :association/policy))))
+   (finally (conn/release! c) (generation/retire! g)))))

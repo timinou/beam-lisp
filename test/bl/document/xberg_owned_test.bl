@@ -1,0 +1,162 @@
+(ns document.xberg-owned-test
+ (:require [document.xberg :as xb] [proc.table :as table] [reload.generation :as generation]
+           [datom.query.functions :as functions] [env] [bl.json :as json]))
+
+(defn- down! [pid]
+ (let [monitor (Process/monitor pid)]
+  (try (receive [:DOWN seen :process dead _] :when (and (= seen monitor) (= dead pid)) true
+         (after 5000 false))
+   (finally (Process/demonitor monitor (list :flush))))))
+(defn- retired? [graph]
+ (loop [left 100]
+  (let [status (:status (generation/retire! graph))]
+   (if (contains? #{:retired :already-retired} status) true
+    (if (zero? left) false (do (Process/sleep 5) (recur (dec left))))))))
+(defn- input-path [text]
+ (String/replace_prefix (:uri (json/decode text {:keys :keyword})) "file://" ""))
+(defn- legacy-counter [table key parent]
+ (try (erlang/apply :ets :update_counter (list table key (tuple 2 1)))
+  (catch _
+   (erlang/send parent [:legacy-missing (erlang/self)])
+   (receive :increment
+    (do (erlang/apply :ets :insert (list table (tuple key 0)))
+        (erlang/send parent [:legacy-incremented (erlang/self)
+                             (erlang/apply :ets :update_counter (list table key (tuple 2 1)))]))))))
+
+(defn- normal-exit! [pid monitor]
+ (try
+  (receive [:DOWN seen :process dead reason] :when (and (= seen monitor) (= dead pid)) (= :normal reason)
+   (after 5000 false))
+  (finally (Process/demonitor monitor (list :flush)))))
+
+(deftest concurrent-first-use-counters-never-reset-an-admitted-increment
+ (let [counter (BeamLisp.Env/fetch_exact! "document.xberg" "bump")
+       table (BeamLisp.Env/fetch_exact! "document.xberg" "TABLE")
+       key (str "owned-first-use-" (erlang/unique_integer (list :positive)))
+       negative (str key "-legacy") parent (erlang/self)]
+  (xb/stats)
+  (try
+   ;; Genuine negative control: both missing-row fallbacks have observed the
+   ;; same absence. The second insert0 erases the first admitted increment.
+   (let [one (spawn #(legacy-counter table negative parent))
+         two (spawn #(legacy-counter table negative parent))
+         one-monitor (Process/monitor one) two-monitor (Process/monitor two)]
+    (receive [:legacy-missing _] :ready (after 5000 (throw "legacy counter did not arm")))
+    (receive [:legacy-missing _] :ready (after 5000 (throw "legacy counter did not arm")))
+    (erlang/send one :increment)
+    (is (= 1 (receive [:legacy-incremented _ n] n (after 5000 nil))))
+    (erlang/send two :increment)
+    (is (= 1 (receive [:legacy-incremented _ n] n (after 5000 nil))))
+    (is (= 1 (elem (first (ets/lookup table negative)) 1)))
+    (is (normal-exit! one one-monitor)) (is (normal-exit! two two-monitor)))
+   (let [workers (mapv (fn [_]
+                        (spawn (fn []
+                                 (erlang/send parent [:counter-ready (erlang/self)])
+                                 (receive :go (erlang/send parent [:counter-done (counter table key 1)])))))
+                      (range 32))]
+    (doseq [_ workers] (receive [:counter-ready _] :ready (after 5000 (throw "counter did not arm"))))
+    (doseq [pid workers] (erlang/send pid :go))
+    (let [values (mapv (fn [_] (receive [:counter-done n] n (after 5000 nil))) workers)]
+     (is (= (set (range 1 33)) (set values)))
+     (is (= 32 (elem (first (ets/lookup table key)) 1))))
+    (doseq [pid workers] (is (down! pid))))
+   (finally (ets/delete table key) (ets/delete table negative)))))
+
+(deftest both-batch-and-native-task-boundaries-convey-environment-and-query-policy
+ (let [scope (env/fork) parent (erlang/self) before (xb/inflight)]
+  (try
+   (let [result (env/with-env scope
+                  (fn []
+                   (BeamLisp.Env/intern "xberg.context" "tenant" 42)
+                   (functions/with-only
+                    (fn []
+                     (xb/extract-batch [{:bytes "one" :filename "one.txt"}
+                                        {:bytes "two" :filename "two.txt"}]
+                      {:config {} :isolation :in_process
+                       :in-process-fn (fn [_ _]
+                                        (erlang/send parent [:xberg-context
+                                                              (BeamLisp.Env/fetch_exact! "xberg.context" "tenant")
+                                                              (functions/restricted?)])
+                                        (tuple :ok {:results []}))
+                       :budget {:timeout-ms 5000 :max-concurrent 2}})))))]
+    (is (= 2 (count (:ok result))))
+    (is (every? :ok (:ok result)))
+    (doseq [_ (range 2)]
+     (is (= [42 true] (receive [:xberg-context tenant policy] [tenant policy] (after 5000 nil)))))
+    (is (= before (xb/inflight)))
+    (is (not (functions/restricted?))))
+   (finally (env/destroy scope)))))
+
+(defn- prove-native-owner [kill-caller?]
+ (let [parent (erlang/self) before (xb/inflight)
+       graph (generation/prepare! {:application-id (str "xberg-native-owner-" kill-caller?)
+                                  :sources {"xberg.original" "(ns xberg.original) (defn answer [] 42)"}})
+       creator (spawn
+                (fn []
+                 (let [result (generation/with! graph
+                                (fn [] (functions/with-only
+                                         (fn []
+                                          (xb/extract "bounded fixture" "fixture.txt"
+                                           {:config {} :isolation :in_process
+                                            :in-process-fn
+                                             (fn [input _]
+                                              (let [path (input-path input)]
+                                               (erlang/send parent [:native-entered (erlang/self) path
+                                                                    (= (:digest graph) (:digest (generation/current)))
+                                                                    (functions/restricted?)])
+                                               (receive :finish
+                                                (erlang/send parent [:native-returned
+                                                                     (generation/invoke! graph "xberg.original/answer" [])
+                                                                     (File/exists? path)]))
+                                               (tuple :ok {:results [] :ignored-padding (binary/copy "x" 262144)})))
+                                            :budget {:timeout-ms (if kill-caller? 5000 30) :max-concurrent 1}})))))]
+                  (erlang/send parent [:xberg-caller-returned result])
+                  (when-not kill-caller?
+                   (receive :inspect-mailbox
+                    (erlang/send parent [:native-caller-mailbox
+                                         (vec (elem (Process/info (erlang/self) :messages) 1))]))))))
+       entered (receive [:native-entered pid path selected policy] [pid path selected policy]
+                 (after 5000 nil))
+       native (get entered 0) path (get entered 1)]
+  (try
+   (is (erlang/is_pid native))
+   (is (= true (get entered 2))) (is (= true (get entered 3)))
+   (is (File/exists? path))
+   (if kill-caller?
+    (do (erlang/exit creator :kill) (is (down! creator)))
+    (let [result (receive [:xberg-caller-returned value] value (after 5000 nil))]
+     (is (= :timeout (get-in result [:error :xberg])))
+     (is (= false (get-in result [:error :native-stopped?])))
+     (is (Process/alive? creator))))
+   (is (Process/alive? native))
+   (is (= (inc before) (xb/inflight)))
+   (is (= :waiting (:status (generation/retire! graph))))
+   (when kill-caller?
+    ;; The real permit remains admitted while the keeper is killed/reclaimed.
+    ;; No row initialization may reset it during ordinary owner recovery.
+    (let [name (BeamLisp.Env/fetch_exact! "document.xberg" "TABLE")
+          keeper (table/owner name)]
+     (erlang/exit keeper :kill)
+     (is (down! keeper))
+     (is (= (inc before) (xb/inflight)))
+     (is (not= keeper (table/owner name)))
+     (is (Process/alive? native))))
+   (erlang/send native :finish)
+   (is (= [42 true] (receive [:native-returned answer present] [answer present] (after 5000 nil))))
+   (is (down! native))
+   (is (= before (xb/inflight)))
+   (is (not (File/exists? path)))
+   (when-not kill-caller?
+    (erlang/send creator :inspect-mailbox)
+    (is (= [] (receive [:native-caller-mailbox messages] messages (after 5000 :missing))))
+    (is (down! creator)))
+   (is (retired? graph))
+   (finally
+    (when (Process/alive? creator) (erlang/exit creator :kill))
+    (when (and native (Process/alive? native)) (erlang/send native :finish) (down! native))
+    (generation/retire! graph)))))
+
+(deftest a-native-timeout-retains-its-permit-input-context-and-code-until-actual-return
+ (prove-native-owner false))
+(deftest accepted-native-work-outlives-its-caller-and-reclaims-a-crashed-counter-keeper
+ (prove-native-owner true))

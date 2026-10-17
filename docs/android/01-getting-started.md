@@ -61,6 +61,26 @@ bl android up         # launch, and join the phone as a node
 
 The screen shows a title, a count and a button. Tap it and the count moves.
 
+## Make an APK you can send to a phone
+
+```
+bl android build --standalone --release
+```
+
+The APK includes OTP, beam-lisp, locked dependencies and compiled application
+namespaces. Its first launch checks and installs that bundle into private app
+storage. A new bundle replaces the runtime on the next process start, preserving
+settings and other files outside `files/otp/`. Installation needs no cable,
+`android push`, or development computer.
+
+`--release` disables development distribution. Sign the release APK with your
+Android signing key before sharing it; keep that key for future updates.
+`--standalone` without `--release` produces a self-contained debug APK.
+
+The ARM64 ABI is `arm64-v8a`; its Rust native uses the `aarch64-linux-android`
+target. Build `lazy_memo` for that target with the Android NDK linker before
+packaging. `x86_64` uses `x86_64-linux-android`.
+
 ## Talk to it
 
 ```

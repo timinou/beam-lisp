@@ -1,0 +1,352 @@
+; Compiler-owned declarations. No datom/proc dependency and no global catalogue.
+(ns reload.declaration
+ (:require [env] [reload.execution :as execution] [reload.registry-data :as data]
+           [reload.syntax-constructor :as syntax] [reload.registration :as registration]
+           [system.ir :as ir] [reload.closed-function :as closed-function]))
+
+(def ^:private PREPARATION :reload.declaration/preparation)
+(defn- refuse! [kind details]
+ (throw (ex-info "Immutable executable declaration refused" (assoc details :kind kind))))
+(defn- preparation []
+ (let [p (Process/get PREPARATION)]
+  (when (= (:scope p) (env/current)) p)))
+
+(defn preparing?
+ "Whether this environment is inside the compiler-owned declaration boundary.
+  This is a phase signal,not permission to execute an application transform."
+ [] (some? (preparation)))
+
+(defn managed-source?
+ "True only while compiling a namespace owned by the current preparation.
+  Fixed SDK dependencies loaded during preparation are not application owners."
+ [] (contains? (:owners (preparation)) (BeamLisp.Env/current_ns)))
+
+(defn with-preparation!
+ "Trusted compiler boundary. Declaration capture is temporary and scope-bound;
+  restore it on failure as well as success. It never changes a serving catalogue."
+ [mapping action]
+ (let [previous (Process/get PREPARATION)
+       p {:scope (env/current) :owners (into {} (map (fn [[logical physical]] [physical logical]) mapping))
+          :descriptors (atom {})}]
+  (try
+   (Process/put PREPARATION p)
+   (action)
+   (finally
+    (if (nil? previous) (Process/delete PREPARATION) (Process/put PREPARATION previous))))))
+
+(defn expand-relation!
+ "Used by the fixed SDK defrelation macro. Managed forms define one checked
+  spec and one named callback;the caller writes the same declaration as before.
+  Outside managed source returns nil so ordinary source/AOT registration works."
+ [ident spec]
+ (let [p (preparation) owner (BeamLisp.Env/current_ns) logical (get (:owners p) owner)]
+  (when logical
+   (when-not (keyword? ident) (refuse! :invalid-executable-declaration {:ident ident}))
+   (let [suffix (sha256-hex (pr-str ident))
+         value (str "__relation_value__" suffix) callback (str "__relation_provider__" suffix)
+         key [:relation ident] descriptor {:kind :relation :id ident :owner owner :logical logical
+                                           :value value :callback callback}]
+    (when (contains? @(:descriptors p) key)
+     (refuse! :duplicate-executable-declaration {:ident ident}))
+    (swap! (:descriptors p) assoc key descriptor)
+    (list 'do
+     (list 'def (symbol value) spec)
+     (list 'defn- (symbol callback) '[db mode bounds args]
+       (list (list :provider (symbol value)) 'db 'mode 'bounds 'args)))))))
+
+(defn expand-clause!
+ "Capture the standard named-transform DSL without mutating any vocabulary.
+  Its actual compiled body must pass eager construction proof before invocation."
+ [ident transform]
+ (let [p (preparation) owner (BeamLisp.Env/current_ns) logical (get (:owners p) owner)]
+  (when logical
+   (when-not (and (keyword? ident) (symbol? transform)
+                 (not (String/contains? (str transform) "/")))
+    (refuse! :unadmitted-clause-transform {:clause ident :reason :named-local-transform-required}))
+   (let [key [:clause ident] value (str "__clause_value__" (sha256-hex (pr-str ident)))
+         callback (str transform)]
+    (when (contains? @(:descriptors p) key)
+     (refuse! :duplicate-executable-declaration {:ident ident}))
+    (swap! (:descriptors p) assoc key
+           {:kind :clause :id ident :owner owner :logical logical :value value :callback callback})
+    (list 'def (symbol value) transform)))))
+
+(defn expand-reconcile!
+ "The fixed SDK clause owns this runtime factory definition. Preparation
+  records its exact identity without invoking it or registering live resources.
+  The body is subsequently checked by the ordinary compiled generation checker."
+ [server-name body normalized-queue & [policy]]
+ (let [p (preparation) owner (BeamLisp.Env/current_ns) logical (get (:owners p) owner)]
+  (when logical
+   (let [ident (str logical "/" (name server-name)) key [:reconcile ident]
+         callback (str "__reconcile_factory__" (sha256-hex ident))]
+    (when (contains? @(:descriptors p) key)
+     (refuse! :duplicate-executable-declaration {:ident ident}))
+    (swap! (:descriptors p) assoc key
+           {:kind :reconcile :id ident :owner owner :logical logical :callback callback
+            :queue-declaration normalized-queue :policy policy
+            :queue-family {:version 1 :declaration ident :protocol (:protocol normalized-queue)
+                           :fixed-shape (select-keys normalized-queue [:of :unique :partition])
+                           :payload-format :reconcile-row-v1 :transition :retain-exact}})
+    {:id ident :definition
+     (list 'defn- (symbol callback) '[__reconcile_server__ __reconcile_policy__ start-opts] body)}))))
+
+
+(defn capture-canonical-reconcile!
+ "Fixed native proc.server macro boundary. The caller's actual vocabulary
+  transform must equal the exact SDK transform; a named head or contribution
+  map is insufficient. Single-clause grammar excludes custom state/handlers.
+  Candidate macro constructors cannot invoke this helper in their closed DSL."
+ [server-name clauses vocabulary]
+ (let [p (preparation) owner (BeamLisp.Env/current_ns)
+       logical (get (:owners p) owner)]
+  ;; Ordinary SDK/nonmanaged compilation is completely inert: no descriptor
+  ;; Atom read, private table lookup, native class/transform fetch or mutation.
+  (when logical
+   (let [clause (first clauses)
+         exact (BeamLisp.Env/fetch_exact! "proc.reconcile" "reconcile-clause")
+         key [:reconcile (str logical "/" (name server-name))]
+         before (get @(:descriptors p) key)]
+    (when (and before (= 1 (count clauses))
+               (= :reconcile (keyword (name (first clause))))
+               (= exact (get vocabulary :reconcile)))
+     (let [opts (second clause) instance (str "__reconcile_instance__" (sha256-hex (:id before)))
+           expression (if (contains? opts :server) (:server opts) (list 'quote server-name))
+           policy (:policy before {})]
+      ;; No arbitrary app-owned policy evaluation at this compiler boundary.
+      (syntax/data-shape! policy)
+      (swap! (:descriptors p) assoc key
+        (assoc before :canonical-capture {:version 1 :instance instance :policy policy
+          :original-class (BeamLisp.Server/module_for owner (name server-name))}))
+      (list 'defn- (symbol instance) '[start-opts] expression)))))))
+
+(defn canonical-captures
+ "Private preparation metadata, not an executable/runtime grant."
+ [] (into {} (keep (fn [[key descriptor]]
+                      (when (:canonical-capture descriptor) [key descriptor]))
+                   @(:descriptors (preparation)))))
+(defn record-canonical-recipe!
+ "Called by the final compiler pass before Link.settle. Receipts contain only
+  named emitted identities; unsupported/opaque recipes keep ordinary owners."
+ [id recipe]
+ (BeamLisp.Env/assert_native_framework_execution!)
+ (let [p (preparation) key [:reconcile id] before (get @(:descriptors p) key)]
+  (when-not (:canonical-capture before) (refuse! :missing-canonical-contribution {}))
+  (swap! (:descriptors p) assoc key (assoc before :canonical-recipe recipe))))
+
+; Intended insertion in reload.declaration after capture macros;not loaded yet.
+(def ^:private REGISTRATION-CONTRACTS
+ [{:namespace "datom" :binding "register-tx-fn!" :kind :tx
+   :arity 2 :id-position 0 :callback-position 1 :minimum-call-arity 1}
+  {:namespace "datom.tx" :binding "register-fn!" :kind :tx
+   :arity 2 :id-position 0 :callback-position 1 :minimum-call-arity 1}
+  {:namespace "datom.conn" :binding "guard!" :kind :guard
+   :arity 3 :id-position 1 :callback-position 2 :minimum-call-arity 1 :required-call-arity 1
+   :runtime-call {:namespace "datom.conn" :binding "register-declared-guard!" :arguments [0 :identifier]}}])
+
+(defn- capture-compiled! [contract ident owner callback]
+ (let [p (preparation) logical (get (:owners p) owner)
+       kind (:kind contract) key [kind ident]
+       descriptor {:kind kind :id ident :owner owner :logical logical :callback callback
+                   :minimum-call-arity (:minimum-call-arity contract)
+                   :required-call-arity (:required-call-arity contract)}]
+  (when-not logical
+   (refuse! :invalid-executable-declaration {:ident ident :reason :unowned-named-callback}))
+  (syntax/data-shape! ident)
+  (when (> (erlang/external_size ident) 65536)
+   (refuse! :invalid-executable-declaration {:reason :identifier-size}))
+  (when-let [before (get @(:descriptors p) key)]
+   (when-not (= before descriptor)
+    (refuse! :duplicate-executable-declaration {:ident ident})))
+  (swap! (:descriptors p) assoc key descriptor)
+  ident))
+
+(defn- lift-compiled! [contract ident expression]
+ (syntax/data-shape! ident)
+ (let [owner (BeamLisp.Env/current_ns)
+       proved (closed-function/declaration "__executable_checked__" expression)
+       callback (str "__executable_" (name (:kind contract)) "__"
+                     (sha256-hex (pr-str [ident expression])))
+       entries (to-list (mapv (fn [entry]
+                               (let [fname (erlang/binary_to_atom
+                                             (str callback (when (= :variadic (elem entry 0)) "__bl_v")))]
+                                (erlang/setelement 4 (erlang/setelement 3 entry fname)
+                                                   (assoc (elem entry 3) :fname fname)))) (:entries proved)))]
+  (capture-compiled! contract ident owner callback)
+  ;; This fixed compiler operation only installs named function clauses. It
+  ;; does not evaluate the candidate constructor or call its delayed body.
+  (BeamLisp.Link/defvar owner callback entries (list (tuple :file "<owned-executable-declaration>") (tuple :line 1)))
+  {:op :global :ns owner :name callback :lookup :exact :ann {}}))
+
+(defn specialize-registrations!
+ "Actual compiler-owned executable registration admission. No runtime table
+  write or candidate callback invocation;ordinary source retains its function
+  API. Both linked remotes and exact Rt/invoke global bindings are recognized."
+ [expression]
+ (if-not (managed-source?) expression
+  (let [globals (into {} (map (fn [contract]
+                               [[(:namespace contract) (:binding contract)] contract]) REGISTRATION-CONTRACTS))
+        targets (reduce
+                 (fn [out contract]
+                  (let [namespace (:namespace contract) binding (:binding contract)
+                        link (BeamLisp.Env/link_owner namespace (str namespace "/" binding))]
+                   (if (and (tuple? link) (= :ok (elem link 0)) (= namespace (elem link 1)))
+                    (let [info (elem link 2) fixed (elem info 1) arity (:arity contract)]
+                     (if (contains? fixed arity)
+                      (assoc out [(elem info 0) (get fixed arity) arity] contract) out)) out)))
+                 {} REGISTRATION-CONTRACTS)]
+   (:expression (registration/specialize expression targets globals capture-compiled! lift-compiled!)))))
+
+(defn- named-signature! [{:keys [owner callback id minimum-call-arity required-call-arity]}]
+ (let [entries (BeamLisp.Env/ns_definition owner callback)]
+  (when-not (and (seq entries) (<= (count entries) 64))
+   (refuse! :invalid-executable-declaration {:ident id :reason :missing-named-function}))
+  (doseq [entry entries]
+   (let [kind (elem entry 0) n (elem entry 1) clause (elem entry 3)]
+    (when-not (and (contains? #{:fixed :variadic} kind) (erlang/is_integer n) (<= 0 n (if (= :variadic kind) 254 255))
+                   (= :defn-clause (:op clause))
+                   (= (+ n (if (= :variadic kind) 1 0)) (count (:params clause))))
+     (refuse! :invalid-executable-declaration {:ident id :reason :invalid-named-function-signature}))))
+  (let [fixed (set (map (fn [entry] (elem entry 1))
+                       (filter #(= :fixed (elem % 0)) entries)))
+        variadic (mapv (fn [entry] (elem entry 1)) (filter #(= :variadic (elem % 0)) entries))
+        signature (cond-> {:arities fixed} (seq variadic) (assoc :variadic-min (apply min variadic)))]
+   (when-not (or (some #(>= % minimum-call-arity) fixed) (seq variadic))
+    (refuse! :invalid-executable-declaration {:ident id :reason :callback-misses-required-prefix}))
+   (when (and required-call-arity (not (ir/accepts-arity? signature required-call-arity)))
+    (refuse! :invalid-executable-declaration {:ident id :reason :callback-misses-required-arity}))
+   (when-not (fn? (BeamLisp.Env/fetch_exact! owner callback))
+    (refuse! :invalid-executable-declaration {:ident id :reason :missing-callable-binding}))
+   signature)))
+
+(defn- clause-transform! [{:keys [owner callback id]}]
+ (let [entries (BeamLisp.Env/ns_definition owner callback)]
+  (when-not (and (seq entries) (<= (count entries) 32))
+   (refuse! :unadmitted-clause-transform {:clause id :reason :missing-compiled-transform}))
+  ;; Exact fixed arity,not a callable value's metadata or a claimed empty effect.
+  (doseq [entry entries]
+   (let [clause (elem entry 3) params (:params clause)]
+    (when-not (and (= :fixed (elem entry 0)) (= :defn-clause (:op clause))
+                   (= 2 (count params)) (every? #(= :pvar (:pop %)) params))
+     (refuse! :unadmitted-clause-transform {:clause id :reason :transform-parameters}))
+    (let [bindings (into {} (map (fn [param] [(:name param) :data]) params))]
+     (try
+      (when (:guard clause) (syntax/shape! (:guard clause) bindings))
+      (syntax/shape! (:body clause) bindings)
+      (catch error
+       (refuse! :unadmitted-clause-transform
+                {:clause id :reason :unproved-eager-construction :cause (ex-data error)}))))))
+  (let [f (BeamLisp.Env/fetch_exact! owner callback)]
+   (when-not (fn? f) (refuse! :unadmitted-clause-transform {:clause id :reason :missing-transform}))
+   f)))
+
+(defn compilation-clause
+ "Compiler-owned local clause only. Prove actual IR before obtaining a callable;
+  check eager bounded first-order input/output around every compiler invocation."
+ [ident]
+ (when-let [p (preparation)]
+ (when-let [descriptor (get @(:descriptors p) [:clause ident])]
+  (let [transform (clause-transform! descriptor)]
+   (fn [clause context]
+    (syntax/data-shape! clause)
+    (syntax/data-shape! context)
+    (let [result (transform clause context)]
+     (syntax/data-shape! result)
+     (when-not (map? result)
+      (refuse! :invalid-clause-contribution {:clause ident}))
+     result))))))
+
+(defn- relation-data [ident spec]
+ (when-not (and (map? spec) (fn? (:provider spec))
+                (int? (:arity spec)) (pos? (:arity spec)) (<= (:arity spec) 64))
+  (refuse! :invalid-executable-declaration {:ident ident}))
+ (let [metadata (merge {:ident ident :extension :computed :modes #{:bf}
+                        :maintenance :recompute :provenance false}
+                       (dissoc spec :provider))
+       modes (:modes metadata) reads (:reads metadata)]
+  (when-not (and (= ident (:ident metadata)) (contains? #{:stored :derived :computed} (:extension metadata))
+                 (set? modes) (seq modes) (every? keyword? modes)
+                 (contains? #{:recompute :incremental} (:maintenance metadata))
+                 (boolean? (:provenance metadata))
+                 (or (nil? reads) (and (or (set? reads) (vector? reads)) (seq reads) (every? keyword? reads))))
+   (refuse! :invalid-executable-declaration {:ident ident}))
+  ;; Reuse the same bounded nonexecutable-data check as configuration registries.
+  (data/entry "declaration" {:metadata metadata})
+  metadata))
+
+(defn collect!
+ "Collect only descriptors emitted during this compiler preparation. Values
+  have already passed actual ANF initializer checks. No global table snapshot."
+ []
+ (let [p (preparation)]
+  (when-not p (refuse! :missing-declaration-preparation {}))
+  {:relation
+   (into {} (map (fn [[[_ ident] descriptor]]
+                 (let [{:keys [owner logical value callback]} descriptor
+                       spec (BeamLisp.Env/fetch_exact! owner value)
+                       provider (BeamLisp.Env/fetch_exact! owner callback)]
+                  (when-not (fn? provider) (refuse! :invalid-executable-declaration {:ident ident}))
+                  [ident {:data (relation-data ident spec) :callback (str logical "/" callback)}]))
+             (filter (fn [[_ descriptor]] (= :relation (:kind descriptor))) @(:descriptors p))))
+   :clause
+   (into {} (map (fn [[[_ ident] descriptor]]
+                  (clause-transform! descriptor)
+                  (let [{:keys [owner logical value callback]} descriptor
+                        f (BeamLisp.Env/fetch_exact! owner value)]
+                   (when-not (fn? f)
+                    (refuse! :invalid-executable-declaration {:ident ident}))
+                   [ident {:data {:ident ident :kind :clause}
+                           :callback (str logical "/" callback)}]))
+                (filter (fn [[_ descriptor]] (= :clause (:kind descriptor))) @(:descriptors p))))
+   :tx
+   (into {} (map (fn [[[_ ident] descriptor]]
+                  (let [signature (named-signature! descriptor)]
+                   [ident {:data {:ident ident :kind :tx :signature signature
+                                  :minimum-call-arity (:minimum-call-arity descriptor)}
+                           :callback (str (:logical descriptor) "/" (:callback descriptor))}]))
+                (filter (fn [[_ descriptor]] (= :tx (:kind descriptor))) @(:descriptors p))))
+   :guard
+   (into {} (map (fn [[[_ ident] descriptor]]
+                  (let [signature (named-signature! descriptor)]
+                   [ident {:data {:ident ident :kind :guard :signature signature :minimum-call-arity 1}
+                           :callback (str (:logical descriptor) "/" (:callback descriptor))}]))
+                (filter (fn [[_ descriptor]] (= :guard (:kind descriptor))) @(:descriptors p))))
+   :reconcile
+   (into {} (map (fn [[[_ ident] descriptor]]
+                  (let [{:keys [owner logical callback]} descriptor
+                        f (BeamLisp.Env/fetch_exact! owner callback)]
+                   (when-not (erlang/is_function f 3)
+                    (refuse! :invalid-executable-declaration {:ident ident}))
+                   [ident {:data (cond-> {:ident ident :kind :reconcile :arity 3 :queue-family (:queue-family descriptor)}
+                                  (:canonical-recipe descriptor) (assoc :canonical (:canonical-recipe descriptor)))
+                           :callback (str logical "/" callback)
+                           :callbacks (when-let [recipe (:canonical-recipe descriptor)]
+                                        (vec (concat [(:reifier recipe) (:instance recipe)]
+                                               (map :reference (vals (:callback-constructors recipe))))))}]))
+                (filter (fn [[_ descriptor]] (= :reconcile (:kind descriptor))) @(:descriptors p))))}))
+
+(defn entries [kind]
+ (get (:declarations (execution/current)) kind {}))
+
+(defn lookup
+ "Resolve one immutable entry against its exact graph;no global fallback.
+  A returned callback acquires its ordinary execution lease when called later."
+ [kind ident]
+ (let [g (execution/current) descriptor (get (entries kind) ident)]
+  (when descriptor
+   (assoc (:data descriptor) :provider
+    (fn [& args]
+     (when-let [signature (:signature (:data descriptor))]
+      (when-not (and (>= (count args) (:minimum-call-arity (:data descriptor) 0))
+                     (ir/accepts-arity? signature (count args)))
+       (refuse! :invalid-executable-arguments {:ident ident :arity (count args)})))
+     (execution/invoke! g (:callback descriptor) args))))))
+
+(defn stamp []
+ (let [g (execution/current)] (when g (tuple :sealed-declarations (:scope g) (:digest g)))))
+
+(defn managed? [] (some? (execution/current)))
+(defn require-development!
+ "Runtime registration cannot mutate any serving/candidate graph."
+ []
+ (when (managed?) (refuse! :immutable-declaration-required {})))

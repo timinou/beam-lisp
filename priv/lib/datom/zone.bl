@@ -1,0 +1,225 @@
+;; Civil time is a relation: a local minute may denote zero, one or two instants.
+;; Decode supplied TZif bytes, never the host's implicit timezone. Unknown
+;; coverage is data; a missing future rule must not become a fixed offset.
+(ns datom.zone (:require [datom.time :as time]))
+
+(def UNIX-EPOCH (time/from (time/interval :year 1970 :month 1 :day 1)))
+(def ^:private NUL (erlang/list_to_binary (list 0)))
+(def ^:private MAX-BYTES (* 2 1024 1024))
+
+(defn- invalid! [why]
+  (throw (ex-info why {:zone/error :invalid-tzif :why why})))
+(defn- bytes [data start length]
+  (when (or (< start 0) (< length 0) (> (+ start length) (erlang/byte_size data)))
+    (invalid! "Truncated TZif data."))
+  (erlang/binary_part data start length))
+(defn- unsigned [data start width] (binary/decode_unsigned (bytes data start width)))
+(defn- signed [data start width]
+  (let [value (unsigned data start width)
+        modulus (if (= width 4) 4294967296 18446744073709551616)]
+    (if (>= value (quot modulus 2)) (- value modulus) value)))
+(defn- header [data start]
+  (bytes data start 44)
+  (when (not= "TZif" (bytes data start 4)) (invalid! "TZif magic is absent."))
+  (let [version (binary/at data (+ start 4))
+        out {:version version :ut (unsigned data (+ start 20) 4)
+             :standard (unsigned data (+ start 24) 4) :leaps (unsigned data (+ start 28) 4)
+             :times (unsigned data (+ start 32) 4) :types (unsigned data (+ start 36) 4)
+             :chars (unsigned data (+ start 40) 4)}]
+    (when-not (and (contains? #{0 50 51 52} version) (<= 1 (:types out) 256)
+                   (<= 1 (:chars out) 65536) (<= (:times out) 200000) (<= (:leaps out) 200000)
+                   (contains? #{0 (:types out)} (:ut out))
+                   (contains? #{0 (:types out)} (:standard out)))
+      (invalid! "Unsupported version or invalid TZif counts."))
+    out))
+(defn- block-size [h width]
+  (+ (* (:times h) (+ width 1)) (* (:types h) 6) (:chars h)
+     (* (:leaps h) (+ width 4)) (:standard h) (:ut h)))
+(defn- designation [names index]
+  (when (>= index (erlang/byte_size names)) (invalid! "Invalid designation index."))
+  (let [tail (bytes names index (- (erlang/byte_size names) index))
+        end (binary/match tail NUL)]
+    (when (= :nomatch end) (invalid! "Unterminated timezone designation."))
+    (bytes tail 0 (elem end 0))))
+
+(defn- fixed-footer
+  "The fixed-offset subset of POSIX TZ strings. Recurring rules stay explicitly
+   unmodelled past the transition table; no platform-local fallback is involved."
+  [text]
+  (when (and (not= "" text) (not (String/contains? text ",")))
+    (when-let [match (Regex/run #"^(<[A-Za-z0-9+\-]+>|[A-Za-z]{3,})([+\-]?)([0-9]{1,3})(?::([0-9]{2}))?(?::([0-9]{2}))?$" text)]
+      (let [part (fn [i] (let [s (get match i "")] (if (= "" s) 0 (erlang/binary_to_integer s))))
+            hours (part 3) minutes (part 4) seconds (part 5)
+            designation (nth match 1)
+            designation (if (String/starts_with? designation "<") (subs designation 1 (dec (String/length designation))) designation)]
+        (when (and (<= hours 167) (< minutes 60) (< seconds 60))
+          {:offset (* (if (= "-" (nth match 2)) 1 -1) (+ (* hours 3600) (* minutes 60) seconds))
+           :dst? false :designation designation})))))
+
+(defn- decode* [data]
+  (when-not (and (erlang/is_binary data) (<= 44 (erlang/byte_size data) MAX-BYTES))
+    (invalid! "TZif input is absent or exceeds the byte limit."))
+  (let [first-header (header data 0)
+        second-start (+ 44 (block-size first-header 4))
+        modern? (not= 0 (:version first-header))
+        h (if modern? (header data second-start) first-header)
+        _ (when (and modern? (not= (:version h) (:version first-header)))
+            (invalid! "TZif header versions disagree."))
+        width (if modern? 8 4) start (if modern? (+ second-start 44) 44)
+        end (+ start (block-size h width))
+        _ (bytes data start (block-size h width))
+        _ (when (pos? (:leaps h))
+            (throw (ex-info "Leap-second TZif uses another timescale."
+                           {:zone/error :unsupported-leap-scale :why "Use a POSIX-timescale TZif file."})))
+        index-start (+ start (* width (:times h)))
+        type-start (+ index-start (:times h))
+        names (bytes data (+ type-start (* 6 (:types h))) (:chars h))
+        _ (when-not (= 0 (binary/at names (dec (erlang/byte_size names))))
+            (invalid! "Timezone designations do not end in NUL."))
+        types (mapv (fn [i]
+                      (let [at (+ type-start (* 6 i)) dst (binary/at data (+ at 4))
+                            offset (signed data at 4)]
+                        (when-not (and (contains? #{0 1} dst) (<= -89999 offset 93599))
+                          (invalid! "Invalid timezone offset or DST flag."))
+                        {:offset offset :dst? (= 1 dst) :designation (designation names (binary/at data (+ at 5)))}))
+                    (range (:types h)))
+        transitions (mapv (fn [i]
+                            (let [index (binary/at data (+ index-start i))]
+                              (when (>= index (:types h)) (invalid! "Invalid transition type."))
+                              {:at (+ UNIX-EPOCH (signed data (+ start (* width i)) width)) :type index}))
+                          (range (:times h)))
+        indicator-start (+ type-start (* 6 (:types h)) (:chars h) (* (:leaps h) (+ width 4)))
+        _ (doseq [i (range (:types h))]
+            (let [standard (if (= 0 (:standard h)) 0 (binary/at data (+ indicator-start i)))
+                  universal (if (= 0 (:ut h)) 0 (binary/at data (+ indicator-start (:standard h) i)))]
+              (when-not (and (contains? #{0 1} standard) (contains? #{0 1} universal)
+                             (or (= 0 universal) (= 1 standard)))
+                (invalid! "Invalid standard/wall or UT/local indicator."))))
+        footer (when modern? (bytes data end (- (erlang/byte_size data) end)))
+        _ (when (and modern? (not (and (>= (erlang/byte_size footer) 2)
+                                      (= 10 (binary/at footer 0))
+                                      (= 10 (binary/at footer (dec (erlang/byte_size footer)))))))
+            (invalid! "TZif footer must be newline delimited."))
+        tail (if modern? (bytes footer 1 (- (erlang/byte_size footer) 2)) "")
+        _ (when (and modern? (or (not= :nomatch (binary/match tail NUL)) (String/contains? tail "\n")
+                                 (some #(> % 127) (erlang/binary_to_list tail))))
+            (invalid! "Invalid TZif footer text."))
+        _ (when-not (every? (fn [[a b]] (< (:at a) (:at b))) (partition 2 1 transitions))
+            (invalid! "Transition times are not strictly increasing."))
+        fixed (fixed-footer tail)
+        _ (when (and fixed (seq transitions)
+                     (not= (:offset fixed) (:offset (nth types (:type (last transitions))))))
+            (invalid! "Fixed footer disagrees with the last transition."))]
+    {:version (:version h) :types types :transitions transitions :footer tail :fixed fixed
+     :future (cond fixed :fixed (empty? transitions) (if (= "" tail) :initial :unknown)
+                   :else :unknown)}))
+
+(defn decode
+  "TZif bytes → {:ok zone} or {:error {:code :why}}. Version 1–4 POSIX-scale
+   tables and fixed footers are supported. Leap-aware files refuse explicitly;
+   recurring POSIX footers mark future coverage unknown rather than guessing."
+  [data]
+  (try {:ok (decode* data)}
+       (catch e
+         (if-let [code (:zone/error (ex-data e))]
+           {:error {:code code :why (:why (ex-data e))}}
+           (throw e)))))
+
+(defn- table-type [zone instant]
+  (let [table (:transitions zone)]
+    (loop [lo 0 hi (dec (count table)) found nil]
+      (if (> lo hi) (if found (nth (:types zone) (:type found)) (first (:types zone)))
+        (let [mid (quot (+ lo hi) 2) transition (nth table mid)]
+          (if (<= (:at transition) instant) (recur (inc mid) hi transition)
+              (recur lo (dec mid) found)))))))
+
+(defn offset-at
+  "The declared offset at a datom.time instant. A truncated/unspecified zone
+   or an unmodelled future is {:status :unknown}; never the host's timezone."
+  [zone instant]
+  (let [last-at (:at (last (:transitions zone)))
+        beyond? (or (nil? last-at) (>= instant last-at))
+        type (cond (and beyond? (= :fixed (:future zone))) (:fixed zone)
+                   (and beyond? (= :unknown (:future zone))) nil
+                   :else (table-type zone instant))]
+    (if (and type (not= "-00" (:designation type)))
+      (assoc type :status :known)
+      {:status :unknown :why :outside-zone-coverage})))
+
+(defn local-parts [zone instant]
+  (let [offset (offset-at zone instant)]
+    (if (= :known (:status offset))
+      (assoc offset :parts (time/date-parts (+ instant (:offset offset))) :instant instant)
+      offset)))
+
+(defn resolve-axis
+  "A civil coordinate on datom.time's axis → zero/one/many possible instants.
+   Each candidate is verified through the actual transition interval. Unknown
+   candidates keep the whole resolution unknown, including at coverage edges."
+  [zone civil]
+  (let [offsets (set (concat (mapv :offset (:types zone)) (when (:fixed zone) [(:offset (:fixed zone))])))
+        trials (mapv (fn [offset]
+                       (let [instant (- civil offset) actual (offset-at zone instant)]
+                         {:instant instant :offset offset :actual actual})) (sort offsets))
+        matches (vec (filter #(and (= :known (get-in % [:actual :status])) (= (:offset %) (get-in % [:actual :offset]))) trials))]
+    (cond
+      (some #(= :unknown (get-in % [:actual :status])) trials) {:status :unknown :why :outside-zone-coverage}
+      (empty? matches) {:status :nonexistent}
+      (= 1 (count matches)) (assoc (select-keys (first matches) [:instant :offset]) :status :unique)
+      :else {:status :ambiguous :choices (mapv #(select-keys % [:instant :offset]) (sort-by :instant matches))})))
+
+(defn- after-index [table instant]
+  (loop [lo 0 hi (count table)]
+    (if (= lo hi) lo
+      (let [mid (quot (+ lo hi) 2)]
+        (if (<= (:at (nth table mid)) instant) (recur (inc mid) hi)
+            (recur lo mid))))))
+
+(defn instants-in
+  "The instants whose local civil coordinate lies in [from,to). Returns
+   disjoint ordered UTC-axis windows, retaining both occurrences of a repeated
+   hour and none of a skipped hour. Use this same relation for working patterns
+   and day boundaries; adding 86400 to an instant is not a civil-day operation."
+  [zone from to]
+  (if-not (and (erlang/is_integer from) (erlang/is_integer to) (< from to))
+    {:status :invalid}
+    (let [offsets (mapv :offset (cond-> (:types zone) (:fixed zone) (conj (:fixed zone))))
+          lo (- from (reduce max offsets)) hi (- to (reduce min offsets))
+          table (:transitions zone)
+          transitions (subvec table (after-index table lo) (after-index table (dec hi)))
+          boundaries (into (into [lo] (mapv :at transitions)) [hi])
+          parts (mapv (fn [[a b]]
+                        (let [type (offset-at zone a)]
+                          (if (= :unknown (:status type)) {:status :unknown}
+                            (let [start (max a (- from (:offset type))) end (min b (- to (:offset type)))]
+                              {:status :known :window (when (< start end) [start end])}))))
+                      (partition 2 1 boundaries))]
+      (if (some #(= :unknown (:status %)) parts)
+        {:status :unknown :why :outside-zone-coverage}
+        {:status :known
+         :windows (reduce (fn [out part]
+                            (if-let [[a b] (:window part)]
+                              (if (and (seq out) (<= a (second (peek out))))
+                                (conj (pop out) [(first (peek out)) (max b (second (peek out)))])
+                                (conj out [a b])) out)) [] parts)}))))
+
+(defn- pad [value n]
+  (let [s (str value)] (str (apply str (repeat (max 0 (- n (String/length s))) "0")) s)))
+(defn civil-text
+  "A local-axis coordinate as exact ISO minute or second text."
+  ([civil] (civil-text civil false))
+  ([civil seconds?]
+   (let [p (time/date-parts civil)]
+     (str (pad (:year p) 4) "-" (pad (:month p) 2) "-" (pad (:day p) 2) "T"
+          (pad (:hour p) 2) ":" (pad (:minute p) 2) (when seconds? (str ":" (pad (:second p) 2)))))))
+
+(defn resolve-local
+  "Exact local ISO minute/second input, with the zone supplied independently.
+   No suffix stripping, date normalization or arbitrary choice of a DST fold."
+  [zone text]
+  (if-not (and (string? text) (Regex/match? #"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}(?::[0-9]{2})?$" text))
+    {:status :invalid}
+    (let [civil (try (time/from (time/read-iso8601 text)) (catch _ nil))]
+      (if (and civil (= text (civil-text civil (= 19 (String/length text)))))
+        (resolve-axis zone civil)
+        {:status :invalid}))))

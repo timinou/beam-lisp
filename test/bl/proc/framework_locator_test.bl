@@ -1,0 +1,99 @@
+; One real SDK actor, with app and nil/global callback contexts. Locator copies
+; are not authority; the native index/class capability remains authoritative.
+(ns proc.framework-locator-test
+ (:require [proc.dispatch :as dispatch] [proc.framework :as framework]
+           [proc.inventory :as inventory] [reload.generation :as generation]
+           [reload.state :as state]))
+(defn- await [predicate]
+ (loop [left 1500]
+  (cond (predicate) true (zero? left) false
+        :else (do (Process/sleep 5) (recur (dec left))))))
+(defn- graph [app]
+ (generation/prepare! {:application-id app :sources {"locator.app" "(ns locator.app) (defn value [] 42)"}}))
+(defn- receive-phase [ticket phase]
+ (receive [:locator-phase seen current context] :when (and (= ticket seen) (= phase current)) context
+  (after 10000 :timeout)))
+(defn- context []
+ {:pid (erlang/self) :generation (Process/get :bl_generation)
+  :application-identity (Process/get :bl_application_identity)
+  :captured (BeamLisp.Env/capture)})
+
+(deftest framework-membership-survives-app-callback-and-temporary-global-sdk-scope-on-the-same-actor
+ (let [app "framework-locator" g (graph app) parent (erlang/self) ticket (erlang/make_ref)
+       initializer (spawn (fn []
+                            (generation/with! g
+                             #(state/bind! {:locator/owner (atom (erlang/self)) :locator/table (atom nil)}))
+                            (erlang/send parent [:locator-initializer-ready ticket])
+                            (receive :finish :ok)))
+       actor (atom nil) submitter (atom nil) completed (atom false) accepted (atom nil)
+       namespace "proc.flow"]
+  (try
+   (is (= true (receive [:locator-initializer-ready seen] :when (= ticket seen) true (after 10000 false))))
+   (reset! actor (generation/with! g
+                   #(start dispatch/dispatcher {:limit 1 :table-key :locator/table :owner-key :locator/owner})))
+   (let [before (framework/owner-evidence @actor)
+         native (BeamLisp.Env/framework_owner_evidence @actor)
+         locator (:membership native)]
+    (is (= :framework (:kind before)))
+    (is (= :valid (:status (inventory/snapshot app))))
+    (is (= false (BeamLisp.Env/with_env :global #(BeamLisp.Env/loaded_ns? namespace))))
+    ;; Copying a real locator from another PID does not make this caller that
+    ;; actor, even with the same dynamic application identity/generation.
+    (try
+     (Process/put :bl_framework_owner_locator locator)
+     (is (nil? (BeamLisp.Env/framework_owner_evidence (erlang/self))))
+     (is (not (contains? (BeamLisp.Env/capture) :bl_framework_owner_locator)))
+     (finally (Process/delete :bl_framework_owner_locator)))
+    (reset! submitter
+     (spawn
+      (fn []
+       (reset! accepted
+        (generation/with! g
+         #(dispatch/submit! @actor
+           {:id :locator-probe :run (fn [] (reset! completed true)) :failed (fn [_] nil)
+            :waiting
+             (fn []
+              ;; This callback runs ON the dispatcher, before a worker starts.
+              ;; Its captured app context has no framework application-identity.
+              (erlang/send parent [:locator-phase ticket :app (context)])
+              (receive :continue-sdk :ok (after 10000 (throw (ex-info "App barrier timeout" {}))))
+              (let [previous (BeamLisp.Env/capture)]
+               (try
+                (BeamLisp.Env/with_env :global
+                 (fn []
+                  (BeamLisp.Env/bind (merge (BeamLisp.Env/capture)
+                    {:generation nil :application-identity nil :admission nil :query-functions nil}))
+                  ;; Actual current SDK loading; no fabricated SDK source or
+                  ;; namespace receipt. The private locator is not rebound.
+                  (BeamLisp.Loader/ensure_loaded namespace)
+                  (erlang/send parent [:locator-phase ticket :sdk (context)])
+                  (receive :finish-callback :ok
+                   (after 10000 (throw (ex-info "SDK barrier timeout" {}))))))
+                (finally (BeamLisp.Env/bind previous)))))}))))))
+    (let [borrowed (receive-phase ticket :app)]
+     (is (= @actor (:pid borrowed)))
+     (is (= (:digest g) (get-in borrowed [:generation :digest])))
+     (is (= nil (:application-identity borrowed)))
+     (is (= before (framework/owner-evidence @actor)))
+     (is (= :valid (:status (inventory/snapshot app)))))
+    (erlang/send @actor :continue-sdk)
+    (let [global (receive-phase ticket :sdk)]
+     (is (= @actor (:pid global)))
+     (is (= nil (:generation global)))
+     (is (= nil (:application-identity global)))
+     (is (= before (framework/owner-evidence @actor)))
+     (is (= :valid (:status (inventory/snapshot app))))
+     (is (= true (BeamLisp.Env/with_env :global #(BeamLisp.Env/loaded_ns? namespace)))))
+    (erlang/send @actor :finish-callback)
+    (is (await #(some? @accepted)))
+    (is (= :accepted (:status @accepted)))
+    (is (await #(= true @completed)))
+    (is (await #(= {:running 0 :queued 0} (dispatch/stats @actor))))
+    (is (= before (framework/owner-evidence @actor)))
+    (is (= :valid (:status (inventory/snapshot app)))))
+   (finally
+    (when @actor (erlang/send @actor :continue-sdk) (erlang/send @actor :finish-callback))
+    (when @submitter (await #(not (Process/alive? @submitter))))
+    (when (and @actor (Process/alive? @actor)) (stop @actor))
+    (when (Process/alive? initializer) (Process/exit initializer :kill))
+    (generation/retire! g)))))

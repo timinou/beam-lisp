@@ -1,0 +1,449 @@
+; Compiler-owned nonexecuting residual ANF for canonical reconcile callbacks.
+; Exact SDK routes and fresh named-function snapshots come from preparation.
+(ns reload.reconcile-recipe
+ (:require [system.ir :as ir] [reload.closed-function :as closed]
+           [data.first-order :as data]))
+(def ^:private CALLBACKS {:conn-fn 1 :scope-fn 2 :apply 2 :retire 2 :paused-fn 2 :clock 0})
+(def ^:private FIELDS #{:projection :conn-fn :scope-fn :apply :retire :paused-fn :clock :rules :level :jitter :limit :watch?})
+(defn- refuse [reason]
+ (throw (ex-info "Reconciliation recipe remains unproved" {:kind :unproved-reconcile-recipe :reason reason})))
+(defn- data! [value]
+ (data/check! value {:max-nodes 32768 :max-depth 64 :max-bytes 1048576}) value)
+(defn- node [op & fields] (apply hash-map :op op :ann {} fields))
+(defn- literal [value] {:node (node :lit :val (data! value)) :kind :data :exact value})
+(defn- kind-data? [shape]
+ (and (contains? #{:data :map :vector :list} (:kind shape))
+      (or (not= :map (:kind shape)) (every? kind-data? (vals (:fields shape))))))
+(defn- same-shape [a b]
+ (cond
+  (= :bottom (:kind a)) b
+  (= :bottom (:kind b)) a
+  (and (= :callback (:kind a)) (= :callback (:kind b)) (= (:arities a) (:arities b)))
+   (select-keys a [:kind :arities])
+  (and (= :map (:kind a)) (= :map (:kind b)) (= (set (keys (:fields a))) (set (keys (:fields b)))))
+   {:kind :map :fields (into {} (map (fn [key] [key (same-shape (get (:fields a) key) (get (:fields b) key))]) (keys (:fields a))))}
+  (and (kind-data? a) (kind-data? b)) {:kind :data}
+  :else (refuse :ambiguous-escaping-value)))
+(defn- residual-call [n arguments]
+ (if (and (= :remote (:op n)) (= :Elixir.BeamLisp.Ns.Rt (:mod n)) (= :invoke (:fun n)))
+  (assoc n :args (list (first (:args n))
+    (reduce (fn [tail arg] (node :cons :head (:node arg) :tail tail)) (node :enil) (reverse arguments))))
+  (assoc n :args (to-list (mapv :node arguments)))))
+(defn- substitute-captures [expression replacements]
+ ;; Rewrite FREE lexical references only. Delayed bodies/guards stay otherwise
+ ;; unchanged; literal payloads, annotations and patterns are never executable.
+ (letfn [(clause [c environment]
+           (let [names (ir/clause-pattern-vars c) environment (apply dissoc environment names)]
+            (cond-> (assoc c :body (walk (:body c) environment))
+              (:guard c) (assoc :guard (walk (:guard c) environment)))))
+          (walk [n environment]
+           (if-not (ir/node? n) n
+            (case (:op n)
+             :lit n
+             :var (get environment (:name n) n)
+             :let (assoc n :init (walk (:init n) environment)
+                           :body (walk (:body n) (dissoc environment (:name n))))
+             :fn (assoc n :clauses (to-list (map #(clause % environment) (:clauses n))))
+             :case (assoc n :subj (walk (:subj n) environment)
+                           :clauses (to-list (map #(clause % environment) (:clauses n))))
+             :try (cond-> (assoc n :body (walk (:body n) environment)
+                                  :catch (to-list (map #(clause % environment) (:catch n))))
+                     (:after n) (assoc :after (walk (:after n) environment)))
+             :recv (cond-> (assoc n :clauses (to-list (map #(clause % environment) (:clauses n))))
+                     (:timeout n) (assoc :timeout (walk (:timeout n) environment))
+                     (:after n) (assoc :after (walk (:after n) environment)))
+             (reduce (fn [out [key value]]
+                       (assoc out key
+                         (cond (contains? #{:ann :meta :params :pats :pat :attrs :exports} key) value
+                               (ir/node? value) (walk value environment)
+                               (or (vector? value) (erlang/is_list value))
+                                (letfn [(parts [v]
+                                          (cond (ir/node? v) (walk v environment)
+                                                (vector? v) (mapv parts v)
+                                                (erlang/is_list v) (to-list (map parts v))
+                                                :else v))]
+                                 (parts value))
+                               :else value))) {} n))))]
+  (walk expression replacements)))
+
+(defn- free-lexicals [expression]
+ (let [left (atom 100000) found (atom #{})]
+  (letfn [(clause [c bound depth]
+           (let [bound (into bound (ir/clause-pattern-vars c))]
+            (when (:guard c) (walk (:guard c) bound (inc depth)))
+            (walk (:body c) bound (inc depth))))
+          (walk [n bound depth]
+           (when (or (> depth 128) (neg? (swap! left dec))) (refuse :capture-analysis-budget))
+           (when-not (ir/node? n) (refuse :invalid-capture-ir))
+           (case (:op n)
+            :lit nil
+            :global nil
+            :var (when-not (contains? bound (:name n)) (swap! found conj (:name n)))
+            :let (do (walk (:init n) bound (inc depth))
+                     (walk (:body n) (conj bound (:name n)) (inc depth)))
+            :fn (doseq [c (:clauses n)] (clause c bound (inc depth)))
+            :case (do (walk (:subj n) bound (inc depth))
+                      (doseq [c (:clauses n)] (clause c bound (inc depth))))
+            :try (do (walk (:body n) bound (inc depth))
+                     (doseq [c (:catch n)] (clause c bound (inc depth)))
+                     (when (:after n) (walk (:after n) bound (inc depth))))
+            :recv (do (doseq [c (:clauses n)] (clause c bound (inc depth)))
+                      (when (:timeout n) (walk (:timeout n) bound (inc depth)))
+                      (when (:after n) (walk (:after n) bound (inc depth))))
+            (doseq [child (ir/child-nodes n)] (walk child bound (inc depth)))))]
+   (walk expression #{} 0) @found)))
+
+(defn- lexical-names [expression factories]
+ (let [remaining (atom 100000) names (atom #{})]
+  (letfn [(visit [n depth]
+           (when (or (> depth 128) (neg? (swap! remaining dec))) (refuse :name-analysis-budget))
+           (when (ir/node? n)
+            (when (contains? #{:var :let} (:op n)) (swap! names conj (:name n)))
+            (doseq [clause (:clauses n)]
+             (swap! names into (ir/clause-pattern-vars clause)))
+            (doseq [child (ir/child-nodes n)] (visit child (inc depth)))))]
+   (visit expression 0)
+   (doseq [[_ clauses] factories clause clauses]
+    (swap! names into (ir/clause-pattern-vars (assoc clause :pats (:params clause))))
+    (when (:guard clause) (visit (:guard clause) 0))
+    (visit (:body clause) 0))
+   @names)))
+
+(defn residualize!
+ "Trusted compiler helper, NOT an authority grant. Returns a residual factory
+  expression whose eager reads are snapshot operands. Actual Source globals/
+  callbacks retain their original exact namespace identities. Opaque factories,
+  dynamic eager callbacks, recursive helpers and foreign/lazy protocols refuse.
+  Context is private preparation metadata, never application-supplied evidence.
+  The initial prototype accepts first-order cell snapshots only; native handles
+  inside application resource maps require a following typed resource recipe."
+ [expression context]
+ (let [left (atom 100000) serial (atom 0) callback-field (atom nil) cell-keys (atom #{}) capture-counts (atom []) callback-entries (atom [])
+       sdk (:sdk context) factories (:factories context) globals (:globals context)
+       reserved (atom (into (lexical-names expression factories) (keys (:parameters context {}))))
+       snapshot-name (:snapshot-name context "__reconcile_snapshot__")]
+  (when (contains? @reserved snapshot-name) (refuse :snapshot-name-collision))
+  (swap! reserved conj snapshot-name)
+  (letfn [(spend! [depth]
+           (when (or (> depth 64) (neg? (swap! left dec))) (refuse :analysis-budget)))
+          (fresh []
+           (loop []
+            (let [name (str "__recipe_local__" (swap! serial inc))]
+             (if (contains? @reserved name) (recur)
+              (do (swap! reserved conj name) name)))))
+          (materialize [value use]
+           (if-not (= :snapshot-path (:kind value)) value
+            (let [cell (:cell-key value) path (:path value)
+                  discovery (:snapshot-discovery context)
+                  _ (when-not (and (keyword? cell) (vector? path) (<= 1 (count path) 16)
+                                    (every? keyword? path)) (refuse :whole-or-dynamic-snapshot-escape))
+                  key [cell path]
+                  _ (when discovery
+                      (swap! discovery update :paths conj key)
+                      (when (> (count (:paths @discovery)) 128) (refuse :snapshot-slot-budget))
+                      (when (= :data use) (swap! discovery update :data-paths conj key))
+                      (when (= :connection use) (swap! discovery update :connections conj key)))
+                  slot (or (get-in context [:snapshot-schema cell path])
+                           (when discovery {:id (keyword (str "snapshot_" (sha256-hex (pr-str key)))) :kind :data}))]
+             (when-not slot (refuse :unsealed-typed-snapshot-path))
+             {:kind (:kind slot) :snapshot-leaf key
+              :node (node :do :stmts
+                      (list (:node value)
+                        (node :remote :mod (BeamLisp.Emit/module_for "reload.reconcile-values") :fun :operand!
+                          :args (list (node :var :name snapshot-name) (node :lit :val (:id slot))))))})))
+          (value! [value]
+           (let [value (materialize value :data)]
+            (when-not (kind-data? value) (refuse :non-data-eager-operand)) value))
+          (call-arguments [call locals active depth]
+           (mapv #(walk % locals active (inc depth)) (:args call)))
+          (callback [n locals]
+           (let [inner (if (= :fn (:op n)) n
+                         (let [scaffold (:init n) clause (first (:clauses scaffold))] (:body clause)))
+                 needed (free-lexicals n)
+                 selected (select-keys locals needed)
+                 direct-conn-name (when (and (= :conn-fn @callback-field)
+                                             (every? #(and (= 1 (count (:pats %))) (nil? (:guard %))
+                                                            (= :var (:op (:body %)))) (:clauses inner))
+                                             (= 1 (count (set (map #(get-in % [:body :name]) (:clauses inner))))))
+                                    (get-in (first (:clauses inner)) [:body :name]))
+                 _ (when-let [shape (get selected direct-conn-name)]
+                     (when (= :snapshot-path (:kind shape)) (materialize shape :connection)))
+                 captures (into {} (map (fn [[name shape]] [name (materialize shape :capture)]) selected))
+                 capture-names (vec (sort (keys captures)))
+                 _ (when (some #(contains? #{:cell :exception :factory} (:kind %)) (vals captures)) (refuse :unproved-callback-capture))
+                 lifted (assoc inner :clauses
+                           (mapv (fn [clause]
+                             (assoc clause :pats
+                               (concat (map #(hash-map :pop :pvar :name %) capture-names) (:pats clause)))) (:clauses inner)))
+                 binding-budget (when (and (= :sealed-bindings (:callback-mode context))
+                              (or (>= (count @callback-entries) 128)
+                                  (not (and (string? (:callback-prefix context))
+                                            (re-matches #"[a-f0-9]{64}" (:callback-prefix context))))))
+                      (refuse :capture-constructor-budget-or-prefix))
+                 reference (if (= :sealed-bindings (:callback-mode context))
+                             (str "__reconcile_callback__" (:callback-prefix context) "__" (fresh))
+                             "reconcile_recipe_closed_capture")
+                 declaration (closed/declaration reference lifted)
+                 signature (:signature declaration)
+                 arities (set (map #(- % (count capture-names)) (:arities signature)))]
+            (when (or (:variadic-min signature) (some neg? arities)) (refuse :callback-arity))
+            (swap! capture-counts conj (count capture-names))
+            ;; Delayed body is opaque here: closedness proves capture only, not
+            ;; callback purity. Source effect checks happen at normal invocation.
+            (if (= :sealed-bindings (:callback-mode context))
+             (do
+              ;; Only exact leaf data/Conn operands enter the SDK builder. A
+              ;; container containing handles or another callback stays refused.
+              (when-not (every? #(or (kind-data? %) (= :connection (:kind %))) (vals captures))
+               (refuse :unproved-typed-callback-capture))
+              (swap! callback-entries conj
+               {:id reference :arity (first arities) :field @callback-field
+                :connection-selector-proved? (and direct-conn-name
+                                              (contains? #{:snapshot-path :connection} (:kind (get selected direct-conn-name))))
+                :capture-kinds (mapv #(if (= :connection (:kind (get captures %))) :connection :data) capture-names)
+                :entries (:entries declaration)})
+              {:node (node :map :pairs
+                        (list (list (node :lit :val :callback) (node :lit :val reference))
+                              (list (node :lit :val :capture-values)
+                                (reduce (fn [tail name] (node :cons :head (:node (get captures name)) :tail tail))
+                                  (node :enil) (reverse capture-names)))))
+               :kind :callback :arities arities :capture-names capture-names})
+             {:node (substitute-captures n (into {} (map (fn [[name value]] [name (:node value)]) captures)))
+              :kind :callback :arities arities :capture-names capture-names})))
+          (factory [target arguments active depth]
+           (when (contains? active target) (refuse :recursive-eager-factory))
+           (let [clauses (get factories target) clause (first clauses)
+                 params (or (:params clause) (:pats clause))]
+            (when-not (and (= 1 (count clauses)) (= (count arguments) (count params))
+                           (every? #(= :pvar (:pop %)) params) (nil? (:guard clause)))
+             (refuse :unproved-eager-factory-clause))
+            ;; All argument residuals are evaluated ONCE, left-to-right. Fresh
+            ;; locals avoid capture when the original helper is inlined.
+            (let [bindings (mapv (fn [param arg]
+                                  (let [name (fresh)] [param arg name])) params arguments)
+                  locals (into {} (map (fn [[param arg name]]
+                                        [(:name param) (assoc arg :node (node :var :name name))]) bindings))
+                  result (walk (:body clause) locals (conj active target) (inc depth))]
+             (assoc result :node
+               (reduce (fn [body [_ arg name]] (node :let :name name :init (:node arg) :body body))
+                 (:node result) (reverse bindings))))))
+          (pure-call [call args active depth]
+           (let [target [(:mod call) (:fun call) (:arity call)] operation (or (:sdk-operation call) (get sdk target))]
+            (case operation
+             :managed-state-get
+              (let [key (first args)]
+               (when-not (and (<= 1 (count args) 2) (contains? key :exact) (keyword? (:exact key))
+                              (every? kind-data? args)) (refuse :dynamic-managed-cell))
+               (swap! cell-keys conj (:exact key))
+               {:node (node :do :stmts (to-list (concat (map :node args) [(node :lit :val nil)])))
+                :kind :snapshot-path :cell-key (:exact key) :path []})
+             :managed-cell
+              (let [key (first args)]
+               (when-not (and (contains? key :exact) (keyword? (:exact key)) (every? kind-data? args))
+                (refuse :dynamic-managed-cell))
+               (swap! cell-keys conj (:exact key))
+               {:node (node :do :stmts (to-list (concat (map :node args) [(node :lit :val nil)])))
+                :kind :cell :key (:exact key)})
+             :managed-deref
+              (let [cell (first args)]
+               (when-not (and (= 1 (count args)) (= :cell (:kind cell))) (refuse :unproved-cell-deref))
+               ;; Caller captures and validates the exact original managed Atom
+               ;; snapshot before native reification; no original cell is read.
+               (if (or (:snapshot-discovery context) (contains? (:snapshot-schema context {}) (:key cell)))
+                {:node (node :do :stmts (list (:node cell) (node :lit :val nil)))
+                 :kind :snapshot-path :cell-key (:key cell) :path []}
+                {:node (node :do :stmts
+                          (list (:node cell)
+                            (node :remote :mod :maps :fun :get
+                              :args (list (node :lit :val (:key cell)) (node :var :name snapshot-name)))))
+                 :kind :data}))
+             :raise
+              (do (when-not (and (= 1 (count args)) (or (= :exception (:kind (first args))) (kind-data? (first args))))
+                    (refuse :unproved-refusal-payload))
+                  {:node (residual-call (:node call) args) :kind :bottom})
+             :exception
+              {:node (residual-call (:node call) (mapv value! args)) :kind :exception}
+             :scalar
+              {:node (residual-call (:node call) (mapv value! args)) :kind :data}
+             :every
+              (let [predicate (first args) source (second args)
+                    target (get (:arities predicate) 1)]
+               (when-not (and (= 2 (count args)) (= :factory (:kind predicate)) target)
+                (refuse :unproved-finite-predicate))
+               ;; Inline the exact proved body into a closed one-argument
+               ;; residual. Never invoke/fetch the original named predicate at
+               ;; runtime; a later mutable var cannot substitute another body.
+               (let [name (fresh)
+                     source (value! source)
+                     proved (value! (factory target [{:kind :data :node (node :var :name name)}] active (inc depth)))
+                     residual (node :fn :clauses
+                                (list {:pats (list {:pop :pvar :name name}) :guard nil :body (:node proved)}))]
+                {:node (node :remote :mod (BeamLisp.Emit/module_for "reload.reconcile-values")
+                         :fun :every-first-order! :args (list residual (:node source)))
+                 :kind :data}))
+             :get
+              (if (= :snapshot-path (:kind (first args)))
+               (let [source (first args) key (second args) path (conj (:path source) (:exact key))
+                     schema (get (:snapshot-schema context) (:cell-key source))
+                     slot (get schema path)]
+                (when-not (and (= 2 (count args)) (contains? key :exact) (keyword? (:exact key)))
+                 (refuse :dynamic-typed-snapshot-path))
+                (cond
+                 (:snapshot-discovery context)
+                  (assoc source :path path :node (node :do :stmts (list (:node source) (:node key) (node :lit :val nil))))
+                 slot
+                  (do
+                   (when-not (and (= #{:id :kind} (set (keys slot)))
+                                  (keyword? (:id slot)) (contains? #{:data :connection} (:kind slot)))
+                    (refuse :invalid-typed-snapshot-slot))
+                   {:node (node :do :stmts
+                             (list (:node source) (:node key)
+                               (node :remote :mod (BeamLisp.Emit/module_for "reload.reconcile-values") :fun :operand!
+                                 :args (list (node :var :name snapshot-name) (node :lit :val (:id slot))))))
+                    :kind (if (= :connection (:kind slot)) :connection :data)})
+                 (some (fn [[candidate _]] (and (< (count path) (count candidate))
+                                               (= path (vec (take (count path) candidate))))) schema)
+                  (assoc source :path path :node (node :do :stmts (list (:node source) (:node key) (node :lit :val nil))))
+                 :else (refuse :unsealed-typed-snapshot-path)))
+               (do (value! (first args)) (value! (second args))
+                (doseq [arg (drop 2 args)] (value! arg))
+                (let [known (when (and (= :map (:kind (first args))) (contains? (second args) :exact))
+                             (get-in (first args) [:fields (:exact (second args))]))]
+                 (merge (or known {:kind :data}) {:node (residual-call (:node call) args)}))))
+             (if (contains? #{:identity :count :first :second :nth :keys :values :vec :to-list} operation)
+              (do (doseq [a args] (value! a))
+                  {:node (residual-call (:node call) args) :kind :data})
+              (refuse :unknown-eager-sdk-call)))))
+          (invoke [call locals active depth]
+           (let [target (when (= :remote (:mode call)) [(:mod call) (:fun call) (:arity call)])
+                 callee (:callee call)
+                 operation (or (get sdk target)
+                             (when (= :global (:op callee))
+                              (get (:sdk-globals context) [(:ns callee) (:name callee) (:arity call)])))]
+            (if (= :config-factory operation)
+             ;; The fixed SDK wrapper selects only exact two/three argument
+             ;; arms. Inspect its original operand; never run that dispatcher.
+             (let [callee (first (:args call)) key [(:ns callee) (:name callee)]
+                   arms (when (= :global (:op callee)) (get globals key))
+                   arity (cond (contains? arms 3) 3 (contains? arms 2) 2 :else nil)]
+              (when-not (and (= 4 (:arity call)) arity) (refuse :unsealed-config-factory))
+              (factory (get arms arity)
+                (mapv #(walk % locals active depth) (take arity (rest (:args call)))) active depth))
+             (let [args (call-arguments call locals active depth)]
+            (cond
+             operation (pure-call (assoc call :sdk-operation operation) args active depth)
+             (contains? factories target) (factory target args active depth)
+             (contains? #{:invoke :apply} (:mode call))
+              (let [callee (:callee call)]
+               (cond
+                (= :global (:op callee))
+                 (let [target (get-in globals [[(:ns callee) (:name callee)] (count args)])]
+                  (when-not target (refuse :unknown-eager-global-call))
+                  (factory target args active depth))
+                (and (= :lit (:op callee)) (keyword? (:val callee)))
+                 (let [key (literal (:val callee)) source (first args)]
+                  (when-not (<= 1 (count args) 2) (refuse :keyword-arity))
+                  (if (= :snapshot-path (:kind source))
+                   (pure-call (assoc call :sdk-operation :get) (into [source key] (rest args)) active depth)
+                   (do (value! source)
+                  (doseq [arg (rest args)] (value! arg))
+                  (merge (get-in source [:fields (:val callee)] {:kind :data})
+                    {:node (node :remote :mod :maps :fun :get
+                            :args (list (:node key) (:node source) (:node (or (second args) (literal nil)))))}))))
+                :else (refuse :dynamic-eager-callback)))
+             :else (refuse :unknown-eager-call))))))
+          (walk [n locals active depth]
+           (spend! depth)
+           (when-not (ir/node? n) (refuse :invalid-ir))
+           (if (or (= :fn (:op n)) (ir/self-scaffold? n)) (callback n locals)
+            (if-let [call (ir/call-site n)]
+             (invoke (assoc call :node n) locals active depth)
+             (case (:op n)
+              :lit (literal (:val n))
+              :enil {:node n :kind :list}
+              :var (or (get locals (:name n)) (refuse :unbound-local))
+              :global
+               (let [key [(:ns n) (:name n)] arms (get globals key)]
+                (if (seq arms) {:kind :factory :arities arms :node n}
+                 (let [found (if (contains? (:global-values context) key)
+                               {:present true :value (get (:global-values context) key)}
+                               (when-let [read-global (:read-global context)] (read-global key)))]
+                  (when-not (:present found) (refuse :unsealed-global-value))
+                  (assoc (literal (:value found)) :node
+                    (node :remote :mod (BeamLisp.Emit/module_for "reload.reconcile-values") :fun :data!
+                      :args (list n))))))
+              :let
+               (let [value (walk (:init n) locals active (inc depth))]
+                (if (= :bottom (:kind value)) value
+                 (let [name (fresh)
+                       body (walk (:body n) (assoc locals (:name n) (assoc value :node (node :var :name name))) active (inc depth))]
+                  (assoc body :node (node :let :name name :init (:node value) :body (:node body))))))
+              :if
+               (let [test (walk (:test n) locals active (inc depth))]
+                (if (= :bottom (:kind test)) test
+                 (let [_ (value! test) a (walk (:then n) locals active (inc depth)) b (walk (:else n) locals active (inc depth))]
+                  ;; Bottom proves this branch never returns; it does not drop
+                  ;; the refusal branch or assume a missing runtime exists.
+                  (assoc (same-shape a b) :node (assoc n :test (:node test) :then (:node a) :else (:node b))))))
+              :arith
+               (let [args (mapv #(value! (walk % locals active (inc depth))) (:args n))]
+                (when-not (contains? #{:add :sub :mul :div :rem :lt :gt :le :ge :num_eq} (:fun n))
+                 (refuse :unknown-arithmetic))
+                {:kind :data :node (assoc n :args (to-list (mapv :node args)))})
+              :cons
+               (let [a (value! (walk (:head n) locals active (inc depth))) b (walk (:tail n) locals active (inc depth))]
+                (when-not (= :list (:kind b)) (refuse :improper-finite-list))
+                {:kind :list :node (assoc n :head (:node a) :tail (:node b))})
+              :tuple
+               (let [items (mapv #(value! (walk % locals active (inc depth))) (:elems n))]
+                {:kind :data :node (assoc n :elems (to-list (mapv :node items)))})
+              :struct
+               (let [field (first (:fields n)) value (second field)]
+                (when-not (and (= :Elixir.BeamLisp.Vector (:mod n)) (= 1 (count (:fields n)))
+                               (= :lit (:op (first field))) (= :items (:val (first field))) (= :tuple (:op value)))
+                 (refuse :foreign-eager-struct))
+                (let [result (walk value locals active (inc depth))]
+                 {:kind :vector :node (assoc n :fields (list (list (first field) (:node result))))}))
+              :do
+               (loop [remaining (:stmts n) values []]
+                (if (seq remaining)
+                 (let [value (walk (first remaining) locals active (inc depth)) next (conj values value)]
+                  (if (= :bottom (:kind value))
+                   (assoc value :node (assoc n :stmts (to-list (mapv :node next))))
+                   (recur (rest remaining) next)))
+                 (assoc (or (last values) {:kind :data}) :node (assoc n :stmts (to-list (mapv :node values))))))
+              :map
+               (let [pairs (mapv (fn [[k v]]
+                                   (let [key (walk k locals active (inc depth)) previous @callback-field
+                                         value (try
+                                                (reset! callback-field (:exact key))
+                                                (let [result (walk v locals active (inc depth))]
+                                                 (if (= :snapshot-path (:kind result)) (value! result) result))
+                                                (finally (reset! callback-field previous)))]
+                                    (when-not (and (contains? key :exact) (keyword? (:exact key)) (not= :__struct__ (:exact key)))
+                                     (refuse :dynamic-or-struct-key))
+                                    (when (= :cell (:kind value)) (refuse :escaping-managed-cell))
+                                    [key value])) (:pairs n))]
+                (when-not (= (count pairs) (count (set (map #(get-in % [0 :exact]) pairs)))) (refuse :duplicate-map-key))
+                {:node (assoc n :pairs (to-list (map (fn [[k v]] (list (:node k) (:node v))) pairs)))
+                 :kind :map :fields (into {} (map (fn [[k v]] [(:exact k) v]) pairs))})
+              (refuse :unsupported-eager-node)))))]
+   (let [walked (walk expression (:parameters context {}) #{} 0)
+         result (if (= :data (:result-kind context)) (value! walked) walked) fields (:fields result)]
+    (if (= :data (:result-kind context))
+     (value! result)
+     (do
+      (when-not (and (= :map (:kind result)) (every? FIELDS (keys fields))
+                     (every? #(contains? fields %) [:projection :conn-fn :scope-fn :apply]))
+       (refuse :config-shape))
+      (doseq [[key value] fields]
+       (if-let [arity (get CALLBACKS key)]
+        (when-not (or (and (not (contains? #{:conn-fn :scope-fn :apply} key)) (= nil (:exact value :absent)))
+                      (and (= :callback (:kind value)) (= #{arity} (:arities value))))
+         (refuse :config-callback-arity))
+        (value! value)))))
+    {:body (:node result) :cell-keys @cell-keys :snapshot-name snapshot-name
+     :constructor :snapshot-reification :scope :first-order-snapshots-only
+     :callback-entries @callback-entries
+     :callback-count (count @capture-counts) :max-captures (reduce max 0 @capture-counts)
+     :nodes-walked (- 100000 @left)}))))

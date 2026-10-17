@@ -1,0 +1,173 @@
+; Versioned snapshot protocol; consumer remains closed pending coupled acceptance.
+; Only an exact compiler-sealed v2 projection/callback constructor set can enter. Raw root
+; snapshots are temporary; only selected data/Conn leaves reach the builder.
+(ns reload.reconcile-snapshot
+ (:require [reload.generation :as generation] [reload.execution :as execution]
+           [reload.conn-retention :as retention] [data.first-order :as data]
+           [proc.queue :as queue] [proc.queue-family :as family]))
+(defn- refuse [reason]
+ (throw (ex-info "Typed reconciliation snapshot refused" {:kind :unproved-reconcile-recipe :reason reason})))
+(defn- framework! [] (BeamLisp.Env/assert_native_framework_execution!))
+(defn consumer-enabled?
+ "Hard closed until actual coupled ingress/command/Conn/native-retirement acceptance.
+  No Source option, receipt field, type metadata or SDK name can opt in."
+ [] false)
+(defn require-consumer! []
+ (when-not (consumer-enabled?) (refuse :native-boundary-unaccepted)))
+(defn- exact-recipe! [g recipe]
+ (framework!)
+ (generation/attested-prepared! g)
+ (when-not (and (erlang/is_map recipe) (not (maps/is_key :__struct__ recipe)))
+  (refuse :missing-sealed-typed-recipe))
+ (data/check! recipe {:max-nodes 32768 :max-depth 64 :max-bytes 1048576})
+ (let [actual (get-in g [:declarations :reconcile (:declaration recipe) :data :canonical])]
+  (when-not (and (= actual recipe) (= 2 (:version actual))
+                 (= :selected-versioned (:snapshot-scope actual))
+                 (string? (:reifier actual)) (string? (:instance actual))
+                 (vector? (:cell-keys actual)) (<= (count (:cell-keys actual)) 128)
+                 (every? keyword? (:cell-keys actual)) (map? (:callback-constructors actual))
+                 (vector? (:snapshot-slots actual)) (<= (count (:snapshot-slots actual)) 128)
+                 (<= (count (:callback-constructors actual)) 128))
+   (refuse :missing-sealed-typed-recipe)) actual))
+(defn- read-once [g cell-keys]
+ ;; runtime-resource returns initializer-owned original handles, not a getter.
+ ;; Different logical keys may alias one native cell; group by that exact native
+ ;; resource and read its version/state once. No deref/protocol/callback occurs.
+ (reduce
+  (fn [out key]
+   (let [cell (execution/runtime-resource key)]
+    (when-not (and (erlang/is_map cell) (= :Elixir.BeamLisp.Atom (maps/get :__struct__ cell nil))
+                   (= #{:__struct__ :cell :watches} (set (keys cell))))
+     (refuse :invalid-original-managed-cell))
+    (let [resource (maps/get :cell cell)]
+     (if (contains? (:cells out) resource)
+      (assoc-in out [:keys key] resource)
+      (let [versioned (BeamLisp.LazyMemo/read_versioned resource)]
+       (when-not (and (erlang/is_tuple versioned) (= 2 (erlang/tuple_size versioned))
+                      (erlang/is_integer (elem versioned 0)) (<= 0 (elem versioned 0)))
+        (refuse :invalid-versioned-cell))
+       (-> out (assoc-in [:keys key] resource)
+               (assoc-in [:cells resource] {:version (elem versioned 0) :value (elem versioned 1)})))))))
+  {:keys {} :cells {}} (sort (distinct cell-keys))))
+(defn- raw-path [root path]
+ ;; Keep unsupported unselected paths inert. The residual operand! operation
+ ;; unwraps/refuses only when actual branch evaluation reaches that leaf.
+ (loop [value root remaining path]
+  (if (seq remaining)
+   (let [key (first remaining)]
+    (when-not (keyword? key) (refuse :nonliteral-snapshot-path))
+    (cond (nil? value) {:state :missing}
+          (and (erlang/is_map value) (not (maps/is_key :__struct__ value)))
+           (if (maps/is_key key value) (recur (maps/get key value) (rest remaining)) {:state :missing})
+          :else {:state :invalid}))
+   {:state :value :value value})))
+(defn- slots! [slots]
+ (let [seen (atom #{})]
+  (doseq [slot slots]
+   (when-not (and (erlang/is_map slot) (not (maps/is_key :__struct__ slot))
+                  (= #{:id :cell-key :path :kind} (set (keys slot)))
+                  (keyword? (:id slot)) (keyword? (:cell-key slot))
+                  (vector? (:path slot)) (<= 1 (count (:path slot)) 16)
+                  (every? keyword? (:path slot))
+                  (contains? #{:data :connection} (:kind slot))
+                  (not (contains? @seen (:id slot))))
+    (refuse :invalid-snapshot-slot))
+   (swap! seen conj (:id slot))))
+ slots)
+(defn- operands [snapshot slots]
+ (reduce
+  (fn [out slot]
+   ;; Read the already-captured raw root, never the mutable native cell again.
+   (let [resource (get-in snapshot [:keys (:cell-key slot)])
+         value (raw-path (get-in snapshot [:cells resource :value]) (:path slot))]
+    (assoc out (:id slot) value))) {} slots))
+(def ^:private CALLBACKS {:conn-fn 1 :scope-fn 2 :apply 2 :retire 2 :paused-fn 2 :clock 0})
+(def ^:private FIELDS #{:projection :conn-fn :scope-fn :apply :retire :paused-fn :clock :rules :level :jitter :limit :watch?})
+(defn- callback-plan [recipe field value]
+ (let [arity (get CALLBACKS field)]
+  (if (and (not (contains? #{:conn-fn :scope-fn :apply} field)) (nil? value)) nil
+   (do
+    (when-not (and (erlang/is_map value) (not (maps/is_key :__struct__ value))
+                   (= #{:callback :capture-values} (set (keys value)))
+                   (string? (:callback value)) (erlang/is_list (:capture-values value))
+                   (<= (count (:capture-values value)) 128))
+     (refuse :invalid-closed-callback-binding))
+    (let [spec (get (:callback-constructors recipe) (:callback value)) captures (:capture-values value)]
+     (when-not (and (erlang/is_map spec) (not (maps/is_key :__struct__ spec))
+                    (= #{:arity :reference :capture-kinds} (set (keys spec)))
+                    (vector? (:capture-kinds spec))
+                    (= arity (:arity spec)) (string? (:reference spec))
+                    (= (count captures) (count (:capture-kinds spec)))
+                    (every? #{:data :connection} (:capture-kinds spec)))
+      (refuse :unsealed-closed-callback-binding))
+     (doseq [[kind captured] (map vector (:capture-kinds spec) captures)]
+      (when (= :data kind)
+       (data/check! captured {:max-nodes 32768 :max-depth 64 :max-bytes 1048576})))
+     {:spec spec :captures captures})))))
+(defn- instantiate [g spec captures]
+ ;; Each wrapper captures only exact leaf values and the actual graph. It does
+ ;; not retain snapshot roots, the complete operand map or another callback.
+ (case (:arity spec)
+  0 (fn [] (execution/invoke! g (:reference spec) captures))
+  1 (fn [a] (execution/invoke! g (:reference spec) (concat captures [a])))
+  2 (fn [a b] (execution/invoke! g (:reference spec) (concat captures [a b])))
+  (refuse :unsupported-closed-callback-arity)))
+(defn project!
+ "One native-framework session reads each original cell/version once for BOTH
+  identity and config. Ordinary Source projections return before selected Conn
+  custody is retained. No snapshot root enters delayed wrappers. Initialization
+  preserves fixed family/store-before-config ordering; no caller callback runs
+  as native framework. Disabled until actual Native boundary/custody acceptance."
+ [g recipe start-context expected-server initializing?]
+ (exact-recipe! g recipe)
+ (require-consumer!)
+ (data/check! start-context {:max-nodes 32768 :max-depth 64 :max-bytes 1048576})
+ (when-not (and (execution/owned?) (erlang/== g (execution/current)))
+  (refuse :typed-snapshot-owned-execution-required))
+ (let [slots (slots! (:snapshot-slots recipe))
+       _ (when-not (every? (set (:cell-keys recipe)) (map :cell-key slots)) (refuse :unsealed-cell-key))
+       snapshot (read-once g (:cell-keys recipe)) values (operands snapshot slots)
+       identity (execution/invoke! g (:instance recipe) [start-context values])
+       _ (when-not (or (keyword? identity) (string? identity) (symbol? identity))
+           (refuse :invalid-sealed-instance))
+       srv (queue/resolve-server identity)
+       _ (when (and expected-server (not= (queue/server-name expected-server) (queue/server-name srv)))
+           (refuse :queue-identity-migration-required))
+       ;; Fixed SDK operations only. Eventual command authority must authenticate
+       ;; these effects. No application provider/action receives native privilege.
+       _ (when initializing?
+           (framework!)
+           (family/register! (queue/server-name srv) (:declaration recipe) (:queue-declaration recipe) true)
+           (queue/ensure-family-store! srv))
+       projected (execution/invoke! g (:reifier recipe) [srv (:policy recipe) start-context values])]
+  (framework!)
+  (when-not (and (erlang/is_map projected) (not (maps/is_key :__struct__ projected))
+                 (every? FIELDS (keys projected))
+                 (every? #(contains? projected %) [:projection :conn-fn :scope-fn :apply]))
+   (refuse :invalid-typed-projection-result))
+  (let [plans (into {} (map
+               (fn [[field value]]
+                (if (contains? CALLBACKS field) [field (callback-plan recipe field value)]
+                 (do (data/check! value {:max-nodes 32768 :max-depth 64 :max-bytes 1048576})
+                     [field nil]))) projected))]
+   ;; Same-app Source-created DOMAIN Conn retention never promotes journal/Root
+   ;; custody or writer authority. Foreign/undeclared private evidence refuses.
+   (doseq [[_ plan] plans [kind captured] (map vector (get-in plan [:spec :capture-kinds] []) (:captures plan []))]
+    (when (= :connection kind) (retention/retain! g captured)))
+   (let [cfg (into {} (map
+                (fn [[field value]]
+                 (if-let [plan (get plans field)]
+                  [field (instantiate g (:spec plan) (:captures plan))] [field value])) projected))]
+    {:server srv :identity identity :config cfg
+     :versions (mapv (fn [[key resource]] {:cell-key key :version (get-in snapshot [:cells resource :version])})
+                 (sort-by first (:keys snapshot)))
+     :callback-meaning (into {} (keep (fn [[field plan]]
+                                    (when plan [field {:reference (get-in plan [:spec :reference])
+                                                      :capture-kinds (get-in plan [:spec :capture-kinds])
+                                                      :capture-values (:captures plan)}])) plans))
+     :captured-connections (count (for [[_ plan] plans kind (get-in plan [:spec :capture-kinds]) :when (= :connection kind)] kind))}))))
+(defn reify!
+ "Old review-only caller gate; independent identity/config snapshots refuse."
+ [g recipe _args]
+ (exact-recipe! g recipe)
+ (refuse :single-snapshot-session-required))

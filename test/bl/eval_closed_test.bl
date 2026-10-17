@@ -1,0 +1,198 @@
+(ns eval-closed-test
+ (:require [eval.closed :as closed] [clojure.io :as io] [reload.generation :as generation] [system.ir :as ir]))
+
+(defn- result [source]
+ (let [r (closed/run source)]
+  (when (not= :ok (:status r)) (println "closed-expression-probe" source r)) r))
+
+(defn- deliberately-unbound-borrowed-helper [] closed-expression-intentionally-unbound)
+(defn- unresolved-globals [expression]
+ (let [global? (= :global (:op expression))
+       raw (when global? (BeamLisp.Env/lookup (tuple (:ns expression) (:name expression))))
+       resolved? (when global?
+                   (if (= :exact (:lookup expression))
+                    (and (erlang/is_tuple raw) (erlang/== :ok (elem raw 0)))
+                    (BeamLisp.Env/bound? (:ns expression) (:name expression))))]
+  (concat (when (and global? (not resolved?)) [expression])
+          (mapcat unresolved-globals
+           (if (= :defn-clause (:op expression))
+            (filter some? [(:guard expression) (:body expression)])
+            (ir/child-nodes expression))))))
+
+(deftest compiler-owned-dependencies-have-no-unbound-borrowed-helpers
+ ;; Actual compiler ANF covers values passed as callbacks, not merely calls
+ ;; visible in source. This is dependency evidence, not an effect/safety proof.
+ (doseq [namespace ["eval.closed" "eval.closed-syntax"]]
+  (let [missing (vec (mapcat (fn [[_ entries]]
+                             (mapcat (fn [entry] (unresolved-globals (elem entry 3))) entries))
+                            (BeamLisp.Env/ns_defs namespace)))]
+   (is (= [] missing) (str namespace " " (pr-str missing)))))
+ (let [entries (BeamLisp.Env/ns_definition "eval-closed-test" "deliberately-unbound-borrowed-helper")]
+  (is (some #(= "closed-expression-intentionally-unbound" (:name %))
+             (unresolved-globals (elem (first entries) 3))))))
+
+(deftest closed-expressions-have-ordinary-lexical-and-collection-behavior
+ (doseq [[source expected]
+          [["(+ 20 22)" 42]
+           ["(let [f +] (f 20 22))" 42]
+           ["((fn [resolve] resolve) 42)" 42]
+           ["(loop [n 0] (if (< n 5) (recur (inc n)) n))" 5]
+           ["((fn sum [n] (if (= n 0) 0 (+ n (sum (dec n))))) 5)" 15]
+           ["(:a {:a [1 2]})" [1 2]]
+           ["[(count #{1 2 2}) (get {:a 2} :a)]" [2 2]]
+           ["(vec (take 3 (map inc (range))))" [1 2 3]]
+           ["(reduce + 0 (filter (fn [x] (> x 2)) [1 2 3 4]))" 7]
+           ["((comp inc inc) 40)" 42]
+           ["((partial + 20) 22)" 42]
+           ["(vec (keep (fn [x] (when (> x 1) x)) [0 1 2 3]))" [2 3]]
+           ["((fn [x & more] [x (vec more)]) 1 2 3)" [1 [2 3]]]
+           ["[(group-by inc [1 1 2]) (frequencies [1 1 2])]" [{2 [1 1] 3 [2]} {1 2 2 1}]]]]
+  (let [r (result source)]
+   (is (= :ok (:status r)) source)
+   (is (= expected (:value r)) source))))
+
+(deftest actual-agent-stdout-format-regex-and-string-vocabulary
+ (let [r (result "(println \"hi\") (+ 1 2)")]
+  (is (= :ok (:status r))) (is (= "hi\n" (:stdout r))) (is (= "3" (:printed r))))
+ (let [r (result "[(re-seq #\"\\d+\" \"a1 b22\") (str/replace \"a-b\" #\"-\" \"+\") (vector 1 2) (format \"%s=%d\" \"n\" 3) (str/upper-case \"ab\") (boolean (re-find #\"(?i)apple\" \"an Apple\"))]")]
+  (is (= :ok (:status r)))
+  (is (= "[(\"1\" \"22\") \"a+b\" [1 2] \"n=3\" \"AB\" true]" (:printed r)))))
+
+(deftest inherited-io-and-unknown-values-refuse-before-approved-effects
+ (io/install!)
+ (let [calls (atom 0) options {:operations {"host/tick" (fn [& _] (swap! calls inc))}}]
+  (doseq [source ["(slurp \"synthetic-unused\")" "(spit \"synthetic-unused\" \"value\")"
+                  "[resolve]" "{resolve :key}" "#{[intern]}" "(let [f File/read!] (f \"synthetic-unused\"))"
+                  "(ns foreign)" "(def f 1)" "(defmacro unsafe [] nil)" "(require 'clojure.io)"
+                  "(host/tick) [slurp]" "(host/tick) (eval '(+ 1 2))"]]
+   (is (= :refused (:status (closed/check source options))) source)
+   (is (= :refused (:status (closed/run source options))) source))
+  (is (= 0 @calls)))
+ (is (= :ok (:status (result "'(slurp \"synthetic-unused\")")))))
+
+(deftest lazy-operations-memoize-and-never-run-ahead-of-take
+ (let [calls (atom []) options {:operations {"host/tick" {:effect :read :fn (fn [x] (swap! calls conj x) x)}}}
+       r (closed/run "(let [xs (map host/tick (range 1000))] [(first xs) (first xs) (vec (take 3 xs))])" options)]
+  (is (= :ok (:status r))) (is (= [0 0 [0 1 2]] (:value r)))
+  (is (= [0 1 2] @calls))
+  (reset! calls [])
+  (is (= [0] (:value (closed/run "(vec (take 1 (iterate host/tick 0)))" options))))
+  (is (= [] @calls))))
+
+(deftest opaque-host-results-and-arguments-refuse-before-protocol-dispatch
+ (let [calls (atom 0)]
+  (doseq [value [(fn [] (swap! calls inc)) (erlang/self) (erlang/make_ref)
+                 (tuple :$transient :map :synthetic-key) (tuple :$remote :Elixir.File :read!)
+                 (maps/put :__struct__ :Elixir.File.Stream {:path "synthetic-unused"})]]
+   (let [r (closed/run "(count (host/value))"
+                      {:operations {"host/value" {:effect :read :fn (fn [] value)}}})]
+    (is (= :error (:status r))) (is (= :unsafe-first-order-data (:kind r)))))
+  (is (= 0 @calls))
+  (let [r (closed/run "(host/value (fn [] 1))"
+                     {:operations {"host/value" (fn [& _] (swap! calls inc))}})]
+   (is (= :error (:status r))) (is (= 0 @calls)))))
+
+(deftest deadline-step-output-heap-and-regex-bounds-are-independent
+ (is (= :step-limit (:kind (closed/run "(loop [] (recur))" {:max-steps 20}))))
+ (let [r (closed/run "(loop [n 0] (println \"12345\") (recur (inc n)))" {:max-output-bytes 32})]
+  (is (= :output-limit (:kind r))) (is (<= (erlang/byte_size (:stdout r)) 32)))
+ (is (= :timeout (:status (closed/run "(host/wait)"
+                                    {:timeout-ms 20 :operations {"host/wait" {:effect :read :fn #(Process/sleep 200)}}}))))
+ (is (= :operation-uncertain (:status (closed/run "(host/wait)"
+                                    {:timeout-ms 20 :operations {"host/wait" #(Process/sleep 200)}}))))
+ (is (= :regex-limit (:kind (closed/run "[(re-pattern \"a\") (re-pattern \"b\")]" {:max-regexes 1}))))
+ (let [r (closed/run "(host/allocate)" {:max-heap-words 32768 :timeout-ms 1000
+                                       :operations {"host/allocate" {:effect :read :fn #(vec (range 1000000))}}})]
+  (is (contains? #{:error :timeout} (:status r))))
+ (let [r (closed/run "(host/binary)" {:max-heap-words 32768 :max-data-bytes 4194304
+                  :operations {"host/binary" {:effect :read :fn
+                    (fn [] (let [value (binary/copy "x" 2097152)] (erlang/garbage_collect) value))}}})]
+  (is (= :error (:status r))) (is (= :worker-exit (:kind r))))
+ (is (= 42 (:value (result "(+ 20 22)")))))
+
+(deftest submitted-effects-remain-uncertain-after-exceptions-or-lost-results
+ (let [writes (atom 0)]
+  (doseq [f [(fn [] (swap! writes inc) (throw "synthetic failure after effect"))
+             (fn [] (swap! writes inc) (fn [] :opaque))
+             (fn [] (swap! writes inc) (Process/exit (erlang/self) :kill))]]
+   (let [r (closed/run "(host/write)" {:operations {"host/write" f}})]
+    (is (= :operation-uncertain (:status r)))
+    (is (= "host/write" (:operation r)))))
+  (is (= 3 @writes))))
+
+(deftest exact-approved-context-is-bound-only-in-the-owned-worker
+ (doseq [tenant ["tenant-a" "tenant-b"]]
+  (let [r (closed/run "(host/tenant)"
+                      {:before-worker #(Process/put :closed-test-tenant tenant)
+                       :operations {"host/tenant" {:effect :read :fn #(Process/get :closed-test-tenant)}}})]
+   (is (= tenant (:value r)))))
+ (is (nil? (Process/get :closed-test-tenant))))
+
+(deftest repeated-expressions-do-not-create-code-or-intern-source-names
+ (result "(+ 20 22)")
+ (let [atoms (erlang/system_info :atom_count) modules (count (code/all_loaded))]
+  (doseq [index (range 30)]
+   (is (= :refused (:status (closed/check (str ":closed-new-unknown-keyword-" index)))))
+   (let [r (closed/run "(host/binary)" {:max-heap-words 32768 :max-data-bytes 4194304
+                  :operations {"host/binary" {:effect :read :fn
+                    (fn [] (let [value (binary/copy "x" 2097152)] (erlang/garbage_collect) value))}}})]
+  (is (= :error (:status r))) (is (= :worker-exit (:kind r))))
+ (is (= 42 (:value (result "(+ 20 22)")))))
+  (is (= atoms (erlang/system_info :atom_count)))
+  (is (= modules (count (code/all_loaded))))))
+
+(deftest partial-language-and-error-data-have-explicit-safe-boundaries
+ (is (= :refused (:status (closed/check "((fn [& xs] (recur xs)) 1)"))))
+ (let [calls (atom 0)
+       hostile (maps/put :__struct__ :Elixir.File.Stream {:path "synthetic-unused"})]
+  (doseq [detail [(fn [] (swap! calls inc)) hostile (erlang/self)]]
+   (let [r (closed/run "(host/throw)"
+            {:operations {"host/throw" {:effect :read :fn #(throw (ex-info "safe failure" {:kind (fn [] nil) :detail detail}))}}})]
+    (is (= :error (:status r))) (is (= :evaluation-error (:kind r)))
+    (is (= :opaque-error-detail (:detail r)))))
+  (is (= 0 @calls)))
+ (is (= :expected-name (:kind (closed/run "(name inc)"))))
+ (is (= :refused (:status (closed/check "{:__struct__ :existing}")))))
+
+(deftest model-workers-retain-the-selected-graph-through-retirement
+ (let [graph (generation/prepare! {:sources {"closed.retention" "(ns closed.retention) (defn answer [] 42)"}})]
+  (try
+   (let [r (generation/with! graph
+             #(closed/run "(host/observe)"
+               {:operations {"host/observe" {:effect :read :fn
+                 (fn []
+                  {:selected (= (:digest graph) (:digest (generation/current)))
+                   ; Spawned workers hold native executable tickets without claiming
+                   ; server/supervisor migration authority in the owner registry.
+                   :owned (every? (fn [module]
+                                   (seq (ets/match_object :beam_lisp_code_leases
+                                          (tuple (tuple module (erlang/self) :_) true))))
+                                  (:modules graph))
+                   :retirement (:status (generation/retire! graph))
+                   :answer (generation/invoke! graph "closed.retention/answer" [])})}}}))]
+    (is (= :ok (:status r)) (pr-str r))
+    (is (= {:selected true :owned true :retirement :waiting :answer 42} (:value r))))
+   (let [retired (loop [left 100]
+                   (let [status (:status (generation/retire! graph))]
+                    (if (or (= :retired status) (= :already-retired status) (zero? left)) status
+                     (do (Process/sleep 5) (recur (dec left))))))]
+    (is (contains? #{:retired :already-retired} retired)))
+   (finally (generation/retire! graph)))))
+
+(deftest completed-effects-remain-protected-until-the-whole-result-is-delivered
+ (let [writes (atom 0) options {:max-steps 30 :timeout-ms 100
+                 :operations {"host/write" {:effect :unknown :fn #(swap! writes inc)}
+                              "host/read" {:effect :read :fn #(Process/sleep 500)}}}]
+  (doseq [source ["(host/write) (loop [] (recur))" "(host/write) (host/read)"]]
+   (let [r (closed/run source options)]
+    (is (= :operation-uncertain (:status r)))
+    (is (= "host/write" (:operation r)))))
+  (is (= 2 @writes))
+  (is (= :ok (:status (closed/run "(host/write) 42" (assoc options :timeout-ms 1000)))))
+  (is (= 3 @writes)))
+ (let [effect-calls (atom 0)
+       r (closed/run "(host/write) (loop [] (recur))"
+           {:max-steps 30 :operations {"host/write" {:effect #(swap! effect-calls inc) :fn (fn [] 42)}}})]
+  (is (= :operation-uncertain (:status r)))
+  (is (= "host/write" (:operation r)))
+  (is (= 0 @effect-calls))))

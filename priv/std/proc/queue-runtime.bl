@@ -2,8 +2,12 @@
 ; This is the existing proc.queue engine, with FIFO handler publication.
 (ns proc.queue-runtime
  (:require [proc.server :as ps] [proc.queue :as q] [proc.tick :as tick]
-           [proc.owner-registry :as owners]
+           [proc.owner-registry :as owners] [proc.framework :as framework]
+           [reload.execution :as execution]
+           [proc.queue-family :as family] [proc.reconcile-handler :as reconcile-handler] [proc.reconcile-config :as reconcile-config]
            [datom :as d] [datom.conn :as dc] [datom.store :as ds] [core]))
+
+(def ^:private canonical-instances (atom {}))
 
 (defn- refuse [kind] (throw (ex-info "Queue runtime transition refused" {:kind kind})))
 (defn- registry-key [srv] (tuple :bl-queue-runtime (q/server-name srv)))
@@ -11,7 +15,11 @@
 (defn- context-protocol [context srv]
  (let [p (or (get (:protocols context) (q/logical-name srv))
              (get (:protocols context) (keyword (q/logical-name srv))))]
-  (if (map? p) (:protocol p) p)))
+  (let [explicit (if (map? p) (:protocol p) p)
+        inferred (family/producer-contract (q/server-name srv))]
+   (when (and explicit inferred (not= explicit (:protocol inferred)))
+    (refuse :conflicting-queue-protocol))
+   (or explicit (:protocol inferred)))))
 
 (defn prepare
  "Capture one direct sealed queue handler and its execution environment.
@@ -42,6 +50,7 @@
 (defn- retain [handler]
  (BeamLisp.Env/retain_code!
   (to-list (concat (:modules handler)
+    (:modules (get-in handler [:environment :generation]) [])
     (BeamLisp.Env/callback_modules (:perform handler))
     (BeamLisp.Env/callback_modules (:clock handler))
     (mapcat BeamLisp.Env/callback_modules
@@ -49,6 +58,7 @@
         (mapcat (fn [edge] [(:upcast edge) (:accept? edge)])
                 (vals (get-in handler [:contract :adapters])))))))))
 (defn- release [handler]
+ (reconcile-handler/close! handler)
  (when (:lease handler) (BeamLisp.Env/release_code! (:lease handler)))
  (when (:scope-lease handler) (BeamLisp.Env/release_code! (:scope-lease handler))))
 (defn- sync [c]
@@ -58,99 +68,209 @@
   (:admission decl) (assoc :admission-scope-keys (mapv :keys (get-in decl [:admission :scopes])))
   (:dispatch decl) (assoc :dispatch-group (get-in decl [:dispatch :group]))))
 
+(defn- with-current [st action]
+ (if-not (framework/alive? (get-in st [:queue :framework]))
+  (refuse :framework-initializer-exited)
+  (q/with-handler-context (:queue st) action)))
+
 (defn- initial [opts]
- (let [handler (:handler opts) srv (:server handler)
-       persisted (q/declaration srv)
+ (let [handler (if (:reconcile opts) (reconcile-handler/initialize! (:reconcile opts)) (:handler opts))
+       srv (:server handler)
+       held (atom {}) adopted (atom nil) registered (atom nil) published (atom nil)]
+  (try
+   (BeamLisp.Env/bind (:environment handler))
+   ;; Even a restart/retained-inventory refusal must dispose this attempt's
+   ;; pure SDK-issued resource ticket. All gates share the cleanup extent.
+   (let [persisted (q/declaration srv)
        _ (when (and (:generation persisted)
                     (not= (:generation persisted) (get-in handler [:decl :generation])))
            (refuse :restart-generation-mismatch))
        required (keys (:required-generations (q/generation-inventory srv)))
        supplied (set (cons (get-in handler [:decl :generation])
                            (map #(get-in % [:decl :generation]) (:retained opts []))))
-       _ (when-not (every? #(contains? supplied %) required) (refuse :missing-retained-generation))
-       _ (BeamLisp.Env/bind (:environment handler))
-       _ (q/register-perform! srv (:perform handler) (:contract handler))
-       st (q/init-state srv (:decl handler) (:clock handler) (:contract handler))
-       prior (erlang/apply :persistent_term :get (list (registry-key srv) nil))
-       complete? (or (nil? prior)
-                     (and (map? prior) (= 1 (:worker-inventory-version prior))
-                          (= true (:worker-inventory-complete? prior))))
-       inherited (if (and (map? prior) (= 1 (:worker-inventory-version prior)))
-                   (vec (filter (fn [inventory]
-                     (some (fn [entry]
-                      (let [pid (:pid entry)]
-                       (or (not (erlang/is_pid pid)) (not= (erlang/node) (erlang/node pid)) (Process/alive? pid)))) (vals @inventory)))
-                     (:worker-inventories prior))) [])
-       st (assoc-in st [:queue :inherited-workers] inherited)
-       st (assoc-in st [:queue :worker-inventory-complete?] complete?)
-       digest (get-in st [:queue :decl :generation])
-       current (assoc handler :lease (get-in st [:queue :perform-lease])
-                              :scope-lease (BeamLisp.Env/retain_code! (to-list (:modules handler))))
-       handlers (reduce (fn [m h]
-                   (let [id (get-in h [:decl :generation])]
-                    (when (or (= digest id) (contains? m id)
-                              (not= (fixed-shape (:decl current)) (fixed-shape (:decl h))))
-                     (refuse :invalid-retained-handler))
-                    (assoc m id (assoc h :lease (retain h)))))
-                  {digest current} (:retained opts []))]
-  (let [inventory (owners/register! (erlang/self) :queue (:scope-lease current)
-                    {:reference srv} (elem (:scope-lease current) 2))]
-   (erlang/apply :persistent_term :put (list (registry-key srv)
-     {:pid (erlang/self) :ticket (elem (:scope-lease current) 2) :application-id (q/application-id srv)
-      :worker-inventory-version (get-in st [:queue :worker-inventory-version])
-      :worker-inventory-complete? (get-in st [:queue :worker-inventory-complete?])
-      :worker-inventories (q/worker-inventories st)}))
-   (q/arm-first srv (:clock current))
-   (q/run-due (-> st (assoc-in [:queue :handlers] handlers) (assoc-in [:queue :inventory] inventory))))))
+       _ (when-not (every? #(contains? supplied %) required) (refuse :missing-retained-generation))] :checked)
+   (q/register-perform! srv (:perform handler) (:contract handler))
+   (let [st (q/init-state srv (:decl handler) (:clock handler) (:contract handler))
+         digest (get-in st [:queue :decl :generation])
+         ;; Replace the clause's direct callback lease with one full sealed
+         ;; handler graph lease. Parent actor ownership is a separate lifetime.
+         current (try (assoc handler :lease (retain handler))
+                   (finally (BeamLisp.Env/release_code! (get-in st [:queue :perform-lease]))))
+         _ (swap! held assoc digest current)
+         _ (doseq [h (:retained opts [])]
+             (let [id (get-in h [:decl :generation])]
+              (when (or (contains? @held id) (not= (fixed-shape (:decl current)) (fixed-shape (:decl h))))
+               (refuse :invalid-retained-handler))
+              (swap! held assoc id (assoc h :lease (retain h)))))
+         ;; Worker lifetime inventory is inherited only from a prior owner that
+         ;; published a complete, versioned inventory. Anything else stays
+         ;; explicitly incomplete so strict shutdown refuses to claim custody.
+         prior (erlang/apply :persistent_term :get (list (registry-key srv) nil))
+         complete? (or (nil? prior)
+                       (and (map? prior) (= 1 (:worker-inventory-version prior))
+                            (= true (:worker-inventory-complete? prior))))
+         inherited (if (and (map? prior) (= 1 (:worker-inventory-version prior)))
+                     (vec (filter (fn [inventory]
+                       (some (fn [entry]
+                        (let [pid (:pid entry)]
+                         (or (not (erlang/is_pid pid)) (not= (erlang/node) (erlang/node pid)) (Process/alive? pid)))) (vals @inventory)))
+                       (:worker-inventories prior))) [])
+         initializer (execution/runtime-owner)
+         _ (when initializer (reset! adopted (framework/adopt! initializer)))
+         _ (reset! registered (owners/register-owned-role! :queue {:reference srv}))
+         capability (owners/current-owner-capability)
+         after (-> st
+                   (assoc-in [:queue :inherited-workers] inherited)
+                   (assoc-in [:queue :worker-inventory-complete?] complete?)
+                   (update :queue merge (select-keys current [:modules :environment])
+                     {:perform-lease (:lease current) :lease (:lease current) :handlers @held :inventory @registered
+                      :framework @adopted}))
+         evidence {:pid (erlang/self) :ticket (or (:proof-id @registered) (erlang/make_ref))
+                   :application-id (q/application-id srv) :inventory @registered
+                   :worker-inventory-version (get-in after [:queue :worker-inventory-version])
+                   :worker-inventory-complete? (get-in after [:queue :worker-inventory-complete?])
+                   :worker-inventories (q/worker-inventories after)}
+         after (assoc-in after [:queue :owner-evidence] evidence)]
+    (erlang/apply :persistent_term :put (list (registry-key srv) evidence))
+    (reset! published evidence)
+    (when-let [reconcile (:reconcile current)]
+     (reconcile-handler/accept! current)
+     (when-not @adopted (refuse :reconcile-initializer-required))
+     ;; Adoption has removed Source authority/full native actor retention.
+     ;; Only this exact native actor may publish the handler-family receipt.
+     (family/publish-shared-handler! (q/server-name srv) (:family reconcile)
+       (:graph reconcile) (:lease current))
+     (swap! canonical-instances assoc (q/server-name srv)
+       {:owner (dissoc evidence :inventory) :family (:family reconcile) :start-context (:start-context reconcile)}))
+    (when (:reconcile current) (reconcile-handler/activate-resources! current))
+    (with-current after
+     #(do (when (:reconcile current)
+            (reconcile-handler/invoke! current :pump [])
+            (reconcile-handler/invoke! current :arm []))
+          (q/arm-first srv (:clock current)) (q/run-due after))))
+   (catch error
+    (try
+     (when (and @published (= @published (erlang/apply :persistent_term :get (list (registry-key srv) nil))))
+      (erlang/apply :persistent_term :erase (list (registry-key srv))))
+     (owners/unregister! @registered)
+     (finally
+      (try
+       (when (and (:reconcile handler) (empty? @held)) (reconcile-handler/close! handler))
+       (doseq [h (vals @held)] (release h))
+       (finally (framework/close! @adopted)))))
+    (throw error)))))
 
+(defn- handler-refusal [st handler]
+ (try
+  (when-not (and (erlang/is_map handler) (not (maps/is_key :__struct__ handler)))
+   (refuse :invalid-queue-handler))
+  (let [old (get-in st [:queue :handlers (get-in st [:queue :decl :generation])])]
+   (if (or (:reconcile old) (maps/get :reconcile handler nil))
+    (reconcile-handler/attested! handler)
+    (do
+     (when-not (and (keyword? (:server handler))
+                    (erlang/is_map (:decl handler)) (not (maps/is_key :__struct__ (:decl handler)))
+                    (erlang/is_function (:perform handler) 1) (erlang/is_function (:clock handler) 0))
+      (refuse :invalid-queue-handler))
+     (q/normalise-decl (:decl handler)))))
+  nil
+  (catch error
+   (if (= :unsealed-reconcile-handler (:kind (ex-data error)))
+    :unsealed-reconcile-handler :invalid-queue-handler))))
 (defn- activation-blocker [st expected handler]
  (let [current (:queue st) srv (:server current)
        target (get-in handler [:decl :generation]) now (get-in current [:decl :generation])
        retained (get-in current [:handlers target])]
   (cond
-   (= target now) (when-not (and (= (:decl handler) (:decl current))
-                                (= (:modules handler) (:modules retained))) :identity-conflict)
+   (= target now) (when-not (reconcile-handler/same-meaning? retained handler) :identity-conflict)
    (not= expected now) :stale-generation
    (not= (q/server-name srv) (q/server-name (:server handler))) :wrong-queue
    (not= (fixed-shape (:decl current)) (fixed-shape (:decl handler))) :queue-identity-migration-required
    (not= (:clock current) (:clock handler)) :clock-migration-required
    (< (get-in handler [:decl :protocol]) (get-in current [:decl :protocol])) :protocol-regression
-   (and retained (or (not= (:decl retained) (:decl handler))
-                     (not= (:modules retained) (:modules handler)))) :identity-conflict
+   (and retained (not (reconcile-handler/same-meaning? retained handler))) :identity-conflict
    :else nil)))
 (defn- activation-proof [st expected handler]
- (let [blocker (activation-blocker st expected handler)
-       srv (get-in st [:queue :server]) target (get-in handler [:decl :generation])]
-  (cond blocker {:status :refused :kind blocker}
-        (contains? (:fenced-generations (q/generation-inventory srv)) target)
-         {:status :refused :kind :generation-fenced}
-        :else {:status :ready :generation (get-in st [:queue :decl :generation])})))
+ (if-let [invalid (handler-refusal st handler)] {:status :refused :kind invalid}
+  (let [blocker (activation-blocker st expected handler)
+        srv (get-in st [:queue :server]) target (get-in handler [:decl :generation])]
+   (cond (get-in st [:queue :transition-pending]) {:status :waiting :kind :queue-transition-outcome-uncertain}
+         blocker {:status :refused :kind blocker}
+         (contains? (:fenced-generations (q/generation-inventory srv)) target)
+          {:status :refused :kind :generation-fenced}
+         :else {:status :ready :generation (get-in st [:queue :decl :generation])}))))
+(defn- installed-state [st handler lease]
+ (assoc st :queue
+  (merge (:queue st) (select-keys handler [:decl :perform :clock :contract :environment :modules])
+    {:perform-lease lease :lease lease
+     :handlers (assoc (get-in st [:queue :handlers]) (get-in handler [:decl :generation]) handler)
+     :transition-pending nil})))
+(defn- publish-installed! [st handler]
+ (let [srv (get-in st [:queue :server]) reconcile (:reconcile handler)]
+  (when reconcile
+   (family/publish-shared-handler! (q/server-name srv) (:family reconcile)
+     (:graph reconcile) (:lease handler))
+   (reconcile-handler/activate-resources! handler))
+  ;; Actual Source/provider work starts on a subsequent actor turn, AFTER the
+  ;; new state is installed. A response loss cannot replay an accepted pump.
+  (erlang/send (erlang/self) (tuple :bl-queue/wake))
+  (when reconcile (erlang/send (erlang/self) (tuple :bl-reconcile/level)))
+  st))
+(defn- finish-install [st handler durability]
+ (let [after (installed-state st handler (:lease handler))]
+  (try
+   (publish-installed! after handler)
+   [{:status :applied :generation (get-in handler [:decl :generation]) :durability durability} after]
+   (catch _
+    ;; The native durable write has already happened. Preserve candidate AND
+    ;; previous handler resources/leases; no effect cancellation or replay.
+    [{:status :waiting :kind :queue-handler-publication-uncertain}
+     (assoc-in after [:queue :transition-pending] {:handler handler :phase :publication})]))))
 (defn- activate [st expected handler]
+ (if-let [invalid (handler-refusal st handler)] [{:status :refused :kind invalid} st]
  (let [current (:queue st) srv (:server current)
        target (get-in handler [:decl :generation]) now (get-in current [:decl :generation])
-       retained (get-in current [:handlers target]) blocker (activation-blocker st expected handler)]
+       retained (get-in current [:handlers target]) blocker (activation-blocker st expected handler)
+       pending (:transition-pending current)]
   (cond
+   pending
+    (try
+    (let [held (:handler pending) actual (q/declaration srv)]
+     (cond
+      (not (reconcile-handler/same-meaning? held handler))
+       [{:status :refused :kind :identity-conflict} st]
+      (and (= target (:generation actual))
+              (= (assoc (:decl held) :server (q/server-name srv)) actual))
+      ;; Native metadata reconciliation only. No callback/provider/initializer
+      ;; effect ran inside the failed publication turn, and none is replayed.
+       (finish-install st held (sync (q/conn srv)))
+      :else [{:status :waiting :kind :queue-transition-outcome-uncertain} st]))
+    (catch _ [{:status :waiting :kind :queue-transition-outcome-uncertain} st]))
    blocker [{:status :refused :kind blocker} st]
    (= target now) [{:status :already-applied :generation target :durability (sync (q/conn srv))} st]
    :else
     (let [lease (if retained (:lease retained) (retain handler))
-          installed (or retained (assoc handler :lease lease))
-          c (q/conn srv)]
+          installed (or retained (assoc handler :lease lease)) c (q/conn srv)
+          submitted (atom false)]
      (try
+      (reconcile-handler/accept! installed)
       (let [durability (dc/serialized! c
                          (fn []
                           (when (contains? (:fenced-generations (q/generation-inventory srv)) target)
                            (refuse :generation-fenced))
                           (q/validate-declaration! c srv (:decl handler))
+                          (reset! submitted true)
                           (d/transact! c [{:db/id -1 :queue/key (q/server-name srv)
                               :queue/decl (assoc (:decl handler) :server (q/server-name srv))}])
-                          (sync c)))
-            after (assoc st :queue
-                    (merge current (select-keys installed [:decl :perform :clock :contract :environment])
-                      {:perform-lease lease :handlers (assoc (:handlers current) target installed)}))]
-       (BeamLisp.Env/bind (:environment installed))
-       [{:status :applied :generation target :durability durability} (q/run-due after)])
-      (catch e (when-not retained (BeamLisp.Env/release_code! lease)) (throw e)))))))
+                          (sync c)))]
+       (finish-install st installed durability))
+      (catch error
+       (if @submitted
+        [{:status :waiting :kind :queue-transition-outcome-uncertain}
+         (-> st
+          (assoc-in [:queue :handlers target] installed)
+          (assoc-in [:queue :transition-pending] {:handler installed :phase :durable-write}))]
+        (do (when-not retained (release installed)) (throw error))))))))))
 
 (defn- retire [st generation]
  (let [queue (:queue st) srv (:server queue) handler (get (:handlers queue) generation)
@@ -172,34 +292,75 @@
           [{:status :retired :generation generation :durability (:durability fenced)}
            (update-in st [:queue :handlers] dissoc generation)]))))))
 
+(defn- close-state! [st]
+ (let [q (:queue st) evidence (:owner-evidence q)]
+  (try
+   (owners/unregister! (:inventory q))
+   (finally
+    (try
+     ;; Keep the physical worker-inventory record across an actor-only stop.
+     ;; A later strict stop and a replacement owner both need it to know which
+     ;; bodies this lifetime owned; dropping it would silently lose custody.
+     ;; The record alone grants no transition authority: owner-evidence also
+     ;; requires the registered role to be live, and stop! checks the exact pid.
+     (when (= (dissoc evidence :inventory) (:owner (get @canonical-instances (q/server-name srv))))
+      (swap! canonical-instances dissoc (q/server-name srv)))
+     (doseq [handler (vals (:handlers q))] (release handler))
+     (finally (framework/close! (:framework q)))))))
+ :ok)
+
 (ps/defserver owner
  (init [opts] (ok (initial opts)))
- (handle-info [:bl-queue/wake] [st] (noreply (q/run-due st)))
- (handle-info [:datom/tx _basis _datoms] [st] (noreply (q/run-due st)))
+ (handle-info [:DOWN ref :process pid _] [st]
+  (if (framework/initializer-down? (get-in st [:queue :framework]) ref pid)
+   (stop :normal st) (noreply st)))
+ (handle-info [:bl-queue/wake] [st]
+  (noreply (if (get-in st [:queue :transition-pending]) st (with-current st #(q/run-due st)))))
+ (handle-info [:datom/tx _basis _datoms] [st]
+  (noreply (if (get-in st [:queue :transition-pending]) st (with-current st #(q/run-due st)))))
  (handle-info [:bl-queue/body-down monitor :process pid _reason] [st]
-  (noreply (q/run-due (q/body-down st monitor pid))))
- (handle-info [:bl-queue/finished ref out] [st] (noreply (q/run-due (q/settle st ref out))))
+  (noreply (if (get-in st [:queue :transition-pending]) st
+            (with-current st #(q/run-due (q/body-down st monitor pid))))))
+ (handle-info [:bl-queue/finished ref out] [st]
+  (noreply (with-current st
+    #(let [settled (q/settle st ref out)]
+       (if (get-in settled [:queue :transition-pending]) settled (q/run-due settled))))))
  (handle-call [:proc.queue-runtime/rehearse expected handler] [_ st]
-  (reply (activation-proof st expected handler) st))
+  (reply (with-current st #(activation-proof st expected handler)) st))
  (handle-call [:proc.queue-runtime/activate expected handler] [_ st]
+  ;; SDK metadata publication must not inherit a Source callback's authority.
+  ;; Explicit Source work borrows its exact selected handler inside activate.
   (let [[result after] (activate st expected handler)] (reply result after)))
  (handle-call [:proc.queue-runtime/retire generation] [_ st]
-  (let [[result after] (retire st generation)] (reply result after)))
+  (let [[result after] (with-current st #(retire st generation))] (reply result after)))
+ (handle-info [:bl-reconcile/level] [st]
+  (let [handler (get-in st [:queue :handlers (get-in st [:queue :decl :generation])])]
+   (when (and (:reconcile handler) (not (get-in st [:queue :transition-pending])))
+    (with-current st #(do (reconcile-handler/invoke! handler :pump [])
+                         (reconcile-handler/invoke! handler :arm []))))
+   (noreply st)))
+ (handle-call [:reconcile-status] [_ st]
+  (let [handler (get-in st [:queue :handlers (get-in st [:queue :decl :generation])])]
+   (reply (with-current st #(reconcile-handler/invoke! handler :status [])) st)))
+ (handle-call [:reconcile-pump] [_ st]
+  (let [handler (get-in st [:queue :handlers (get-in st [:queue :decl :generation])])]
+   (reply (with-current st #(reconcile-handler/invoke! handler :pump [])) st)))
+ (handle-call [:reconcile-retry id] [_ st]
+  (reply (with-current st #(q/retry! (get-in st [:queue :server]) id)) st))
  (handle-call [:proc.queue-runtime/status] [_ st]
   (reply {:generation (get-in st [:queue :decl :generation])
           :retained (vec (keys (get-in st [:queue :handlers])))
-          :running (count (get-in st [:queue :running]))} st))
+          :running (count (get-in st [:queue :running]))
+          :pending (when (get-in st [:queue :transition-pending]) :native-transition-uncertain)} st))
  (handle-call [:proc.queue-runtime/stop-workers timeout-ms] [_ st]
   (let [result (q/stop-workers! st timeout-ms)]
    (if (= :stopped (:status result))
     (tuple :stop :normal (assoc result :server (get-in st [:queue :server])) st)
     (reply result st))))
- (handle-call [:stats] [_ st] (reply (q/stats (get-in st [:queue :server])) st))
- (handle-call [:enqueue job opts] [_ st] (reply (q/enqueue! (get-in st [:queue :server]) job opts) st))
- (terminate [_ st]
-  (owners/unregister! (get-in st [:queue :inventory]))
-  (doseq [handler (vals (get-in st [:queue :handlers]))] (release handler))
-  :ok))
+ (handle-call [:stats] [_ st] (reply (with-current st #(q/stats (get-in st [:queue :server]))) st))
+ (handle-call [:enqueue job opts] [_ st]
+  (reply (with-current st #(q/enqueue! (get-in st [:queue :server]) job opts)) st))
+ (terminate [_ st] (close-state! st)))
 
 (defn owner-evidence
  "Read the physical shared-queue registration without asking an arbitrary actor.
@@ -208,7 +369,9 @@
  (let [pid (Process/whereis (q/op-name srv))
        registered (erlang/apply :persistent_term :get (list (registry-key srv) nil))
        evidence (if (map? registered) registered {:pid registered})]
-  (when (and pid (= pid (:pid evidence)) (Process/alive? pid)) evidence)))
+  (when (and pid (= pid (:pid evidence)) (Process/alive? pid)
+             (or (nil? (:inventory evidence)) (owners/owned-role-live? (:inventory evidence))))
+   (dissoc evidence :inventory))))
 (defn body-status
  "Physical native lifetime evidence for a durable job, including inherited and
   expired claims. Older entries lacking job identity conservatively count for
@@ -340,7 +503,11 @@
                    chosen (get by-generation current)
                    _ (when-not chosen (refuse :restart-generation-mismatch))
                    retained (vec (vals (dissoc by-generation current)))]
-              (core/start owner {:handler chosen :retained retained} (dissoc opts :retained))))]
+              (let [previous (BeamLisp.Env/capture)]
+               (try
+                (BeamLisp.Env/bind (:environment chosen))
+                (core/start owner {:handler chosen :retained retained} (dissoc opts :retained))
+                (finally (BeamLisp.Env/bind previous))))))]
       (if staged
        (do
         (when-not (= (:target staged) (get-in handler [:decl :generation])) (refuse :restoration-target-mismatch))
@@ -356,3 +523,37 @@
 (defn retire! [srv generation]
  (GenServer/call (owner-pid srv) [:proc.queue-runtime/retire generation] 30000))
 (defn status [srv] (GenServer/call (owner-pid srv) [:proc.queue-runtime/status]))
+
+
+(defn family-handlers
+ "Automatic first-party contribution from real living shared native instances.
+  No status/factory/provider reconstruction and no app coordinator. Canonical
+  instance operands were captured as bounded first-order data at actual init.
+  Unknown embedded/composed actors remain retained/drain obligations."
+ [candidate]
+ (let [app (:application-id candidate) plan (family/plan! candidate) made (atom {})]
+  (try
+   (doseq [member (get-in plan [:receipt :members])]
+    (when (and (= :shared-reconcile (:owner-mode member))
+               (not= (:digest candidate) (:handler-generation member)))
+     (let [server (:server member) saved (get @canonical-instances server)
+           evidence (owner-evidence (keyword server))
+           recipe (get-in candidate [:declarations :reconcile (:family member) :data :canonical])]
+      (when-not (and evidence (= evidence (:owner saved))
+                     (= (:family member) (:family saved)) recipe
+                     (= app (:application-id member)))
+       (refuse :sealed-family-reifier-required))
+      (let [handler (reconcile-handler/prepare-instance! candidate recipe (:start-context saved) (keyword server) false)
+            srv (:server handler)]
+       (swap! made assoc srv
+        {:expected (:handler-generation member) :handler handler})))))
+   @made
+   (catch error
+    ;; Earlier instances produced only pure, unaccepted bookkeeping. A later
+    ;; identity/refusal must not leak those private Source graph references.
+    (doseq [[_ entry] @made] (reconcile-handler/discard-prepared! (:handler entry)))
+    (throw error)))))
+(defn discard-prepared-handler!
+ "Release only never-installed pure-reification resource tickets. An accepted
+  actor handler is disposed exclusively by its native durable drain path."
+ [handler] (reconcile-handler/discard-prepared! handler))
