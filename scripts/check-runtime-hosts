@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+"""Test runtime host edits against the existing compiler floor, in two VMs.
+
+The first VM compiles only AOT, Env and LazyMemo with the seeded compiler.
+The second starts those exact beams, including the NIF wrapper, and runs the
+requested tests. Everything is staged in a temporary image; neither the floor,
+build/, installed drops nor the shared cache is modified. This is a runtime
+regression check, not a replacement for release/compiler bootstrap qualification.
+"""
+import argparse
+import contextlib
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_TESTS = [
+    "test/bl/perf/spawn_cost_test.bl",
+    "test/bl/lazy_clean_capture_test.bl",
+    "test/bl/perf/owned_start_prune_test.bl",
+    "test/bl/aot_sdk_seed_snapshot_test.bl",
+    "test/bl/proc/native_owned_start_test.bl",
+    "test/bl/aot_sdk_constructor_staging_test.bl",
+]
+
+DRIVER = r'''
+root = System.fetch_env!("BL_ROOT")
+:erlang.system_flag(:backtrace_depth, 24)
+seed = Path.join(root, "priv/bootstrap/seed")
+{:ok, [manifest]} = :file.consult(String.to_charlist(Path.join(seed, "manifest.term")))
+tag = "erts#{:erlang.system_info(:version)}-elixir#{System.version()}"
+for path <- :code.get_path() do
+  name = List.to_string(path)
+  if String.contains?(name, "/beam_lisp/ebin/") and not String.ends_with?(name, "-#{tag}/ebin"),
+    do: :code.del_path(path)
+end
+# Intentionally use the existing compiler generation to compile runtime-only
+# changes. Never advertise this temporary image as a newly qualified floor.
+:persistent_term.put({BeamLisp.AOTCache, :toolchain_key}, manifest["compiler_key"])
+Application.ensure_all_started(:crypto)
+Application.load(:beam_lisp)
+for app <- Application.spec(:beam_lisp, :applications) || [] do
+  case Application.ensure_all_started(app) do
+    {:ok, _} -> :ok
+    error -> raise "dependency #{app}: #{inspect(error)}"
+  end
+end
+BeamLisp.AOT.boot()
+IO.puts("HOST-CHECK ready (#{System.fetch_env!("HOST_CHECK_PHASE")})")
+case System.fetch_env!("HOST_CHECK_PHASE") do
+  "compile" ->
+    output = Path.join(root, "host-overlay")
+    File.mkdir_p!(output)
+    manifest = Enum.reduce([
+      {"aot.bl", BeamLisp.AOT},
+      {"env.bl", BeamLisp.Env},
+      {"lazy_memo.bl", BeamLisp.LazyMemo}
+    ], manifest, fn {leaf, mod}, acc ->
+      source = Path.join(root, "edited-hosts/#{leaf}")
+      digest = Base.encode16(:crypto.hash(:sha256, File.read!(source)), case: :lower)
+      started = System.monotonic_time(:millisecond)
+      path = Path.join(output, Atom.to_string(mod) <> ".beam")
+      stamp = path <> ".stamp"
+      want = manifest["compiler_key"] <> ":" <> digest
+      if not (File.exists?(path) and File.read(stamp) == {:ok, want}) do
+        {^mod, ^path} = BeamLisp.AOT.compile_host_file(source,
+          module: mod, output_dir: output, source_hash: digest, load?: false)
+        File.write!(stamp, want)
+      end
+      bytes = File.read!(path)
+      name = Atom.to_string(mod) <> ".beam"
+      if mod != BeamLisp.AOT do
+        File.write!(Path.join(seed, name), bytes)
+        File.cp!(source, Path.join(root, "priv/host/#{leaf}"))
+      end
+      IO.puts("HOST-CHECK prepared #{leaf} in #{System.monotonic_time(:millisecond) - started} ms")
+      if mod == BeamLisp.AOT, do: acc,
+        else: put_in(acc, ["modules", name], Base.encode16(:crypto.hash(:sha256, bytes), case: :lower))
+    end)
+    File.write!(Path.join(seed, "manifest.term"), :io_lib.format(~c"~tp.~n", [manifest]))
+  "test" ->
+    # Bootstrap with the frozen compiler's own source, then load the edited
+    # runtime BEFORE publishing its first SDK lease. Never replace a leased SDK.
+    BeamLisp.AOT.bootstrap_sdk_native_hosts!()
+    if :ets.lookup(:beam_lisp_vars, :bl_sdk_runtime_lease) != [],
+      do: raise "bootstrap unexpectedly published an SDK lease before host overlay"
+    mod = BeamLisp.AOT
+    path = Path.join(root, "host-overlay/Elixir.BeamLisp.AOT.beam")
+    bytes = File.read!(path)
+    # Keep the compiler source snapshot frozen; this exercises runtime-only
+    # replacements, not a change of compiler generation.
+    File.write!(Path.join(seed, "Elixir.BeamLisp.AOT.beam"), bytes)
+    manifest = put_in(manifest, ["modules", "Elixir.BeamLisp.AOT.beam"],
+      Base.encode16(:crypto.hash(:sha256, bytes), case: :lower))
+    File.write!(Path.join(seed, "manifest.term"), :io_lib.format(~c"~tp.~n", [manifest]))
+    {:module, ^mod} = :code.load_binary(mod, String.to_charlist(path), bytes)
+    BeamLisp.Env.retain_sdk_runtime!()
+    # Re-use the image, isolate each suite's registry, and enforce real results.
+    results = Enum.map(System.argv(), fn path ->
+      IO.puts("HOST-CHECK running #{path}")
+      started = System.monotonic_time(:millisecond)
+      task = Task.async(fn -> BeamLisp.TestRT.run_suite([path], []) end)
+      await = fn await, remaining, previous ->
+        case Task.yield(task, min(remaining, 30_000)) do
+          nil when remaining > 30_000 ->
+            busy = Process.list()
+              |> Enum.reject(fn pid -> pid == self() end)
+              |> Enum.map(fn pid -> {pid, Process.info(pid, [:reductions, :current_stacktrace])} end)
+              |> Enum.filter(fn {_, info} -> is_list(info) end)
+            counts = Map.new(busy, fn {pid, info} -> {pid, Keyword.get(info, :reductions, 0)} end)
+            hottest = busy
+              |> Enum.sort_by(fn {pid, info} -> -(Keyword.get(info, :reductions, 0) - Map.get(previous, pid, 0)) end)
+              |> Enum.take(1)
+            IO.puts("HOST-CHECK waiting #{path}: worker #{inspect(Process.info(task.pid, [:status, :current_stacktrace]), limit: :infinity)}; busy #{inspect(hottest, limit: :infinity)}")
+            await.(await, remaining - 30_000, counts)
+          nil -> Task.shutdown(task, :brutal_kill)
+          result -> result
+        end
+      end
+      case await.(await, String.to_integer(System.fetch_env!("HOST_CHECK_TIMEOUT_MS")), %{}) do
+        {:ok, totals} when is_map(totals) ->
+          IO.puts("HOST-CHECK result #{path}: #{inspect(totals)} (#{System.monotonic_time(:millisecond) - started} ms)")
+          if Map.get(totals, :tests, 0) == 0, do: raise "suite ran no tests"
+          if Map.get(totals, :fail, 0) + Map.get(totals, :error, 0) > 0,
+            do: System.halt(1)
+          totals
+        other -> raise "suite did not finish successfully: #{inspect(other)}"
+      end
+    end)
+    total = Enum.reduce(results, %{tests: 0, pass: 0, fail: 0, error: 0},
+      fn totals, acc -> Map.merge(acc, totals, fn _, a, b -> a + b end) end)
+    IO.puts("HOST-CHECK passed #{length(results)} files: #{inspect(total)}")
+end
+'''
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bootstrap-hosts", type=Path,
+                        help="seed-matching aot.bl and env.bl saved before editing")
+    parser.add_argument("--work-dir", type=Path,
+                        help="keep this isolated image and reuse unchanged host beams")
+    parser.add_argument("--suite-timeout", type=int, default=120,
+                        help="seconds per test file (default: 120)")
+    parser.add_argument("tests", nargs="*")
+    args = parser.parse_args()
+    if not 1 <= args.suite_timeout <= 840:
+        parser.error("--suite-timeout must be between 1 and 840 seconds")
+    tests = args.tests or DEFAULT_TESTS
+    for name in tests:
+        if not (ROOT / name).is_file():
+            raise SystemExit(f"missing test file: {name}")
+    if args.work_dir:
+        args.work_dir = args.work_dir.resolve()
+        if args.work_dir.exists() and any(args.work_dir.iterdir()) and not (args.work_dir / ".host-check-owned").exists():
+            raise SystemExit("--work-dir must be empty or already owned by this checker")
+        args.work_dir.mkdir(parents=True, exist_ok=True)
+        (args.work_dir / ".host-check-owned").touch()
+        (args.work_dir / ".gitignore").write_text("*\n")
+    context = contextlib.nullcontext(str(args.work_dir)) if args.work_dir else tempfile.TemporaryDirectory(prefix="bl-host-check-")
+    with context as temp:
+        root = Path(temp)
+        if (root / "priv").exists():
+            shutil.rmtree(root / "priv")
+        # Copy-on-write where available; copy only repository inputs, never build/.
+        subprocess.run(["cp", "-a", "--reflink=auto", str(ROOT / "priv"), temp], check=True)
+        shutil.copy2(ROOT / "env.bl", root / "env.bl")
+        edited = root / "edited-hosts"
+        edited.mkdir(exist_ok=True)
+        for leaf in ("aot.bl", "env.bl", "lazy_memo.bl"):
+            shutil.copy2(ROOT / "priv/host" / leaf, edited / leaf)
+        for leaf in ("aot.bl", "env.bl"):
+            if args.bootstrap_hosts:
+                shutil.copy2(args.bootstrap_hosts / leaf, root / "priv/host" / leaf)
+            else:
+                original = subprocess.check_output(["git", "show", f"HEAD:priv/host/{leaf}"], cwd=ROOT)
+                (root / "priv/host" / leaf).write_bytes(original)
+        # Freeze test/fixtures too, so retries are reproducible and fixture
+        # writes cannot modify the checkout through an image symlink.
+        if (root / "test").is_symlink():
+            (root / "test").unlink()
+        elif (root / "test").exists():
+            shutil.rmtree(root / "test")
+        subprocess.run(["cp", "-a", "--reflink=auto", str(ROOT / "test"), temp], check=True)
+        for name in ("examples", "projects"):
+            if (ROOT / name).exists() and not (root / name).exists():
+                (root / name).symlink_to(ROOT / name, target_is_directory=True)
+        image = root / ".bl/lib/beam_lisp-0.1.0"
+        image.mkdir(parents=True, exist_ok=True)
+        for name in ("priv", "ebin"):
+            if (image / name).is_symlink():
+                (image / name).unlink()
+        (image / "priv").symlink_to(root / "priv", target_is_directory=True)
+        (image / "ebin").symlink_to(root / "priv/bootstrap/seed", target_is_directory=True)
+        driver = root / "check.exs"
+        driver.write_text(DRIVER)
+        caches = [Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))]
+        deps = []
+        for cache in caches:
+            deps.extend(sorted((cache / "beam_lisp/ebin").glob("*/ebin")))
+        # Last -pa wins; the isolated image takes precedence over every dependency.
+        executable = shutil.which("elixir")
+        if not executable:
+            raise SystemExit("elixir is not on PATH")
+        command = [executable]
+        for dep in dict.fromkeys(deps):
+            command.extend(["-pa", str(dep)])
+        command.extend(["-pa", str(image / "ebin"), str(driver)])
+        for phase in ("compile", "test"):
+            print(f"HOST-CHECK {phase}: isolated image, existing compiler, 6G cap", flush=True)
+            env = os.environ.copy()
+            env.update(BL_ROOT=str(root), BL_DAEMON="off", HOST_CHECK_PHASE=phase,
+                       XDG_CACHE_HOME=str(root / "cache"), HOST_CHECK_TIMEOUT_MS=str(args.suite_timeout * 1000),
+                       ERL_FLAGS="+S 4:4 +SDcpu 2:2 +SDio 1:1 +sbwt none +sbwtdcpu none +sbwtdio none")
+            env.pop("BEAM_LISP_DEV", None)
+            cap = ["systemd-run", "--user", "--collect", "--wait", "--pipe",
+                   f"--unit=bl-host-check-{os.getpid()}-{phase}",
+                   f"--working-directory={root}", "--property=MemoryMax=6G",
+                   "--property=MemorySwapMax=2G", "--property=RuntimeMaxSec=900"]
+            for key in ("BL_ROOT", "BL_DAEMON", "HOST_CHECK_PHASE", "XDG_CACHE_HOME", "ERL_FLAGS", "HOST_CHECK_TIMEOUT_MS"):
+                cap.append(f"--setenv={key}={env[key]}")
+            try:
+                result = subprocess.run(cap + command + (tests if phase == "test" else []), env=env)
+            finally:
+                subprocess.run(["systemctl", "--user", "stop", f"bl-host-check-{os.getpid()}-{phase}"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if result.returncode:
+                raise SystemExit(result.returncode)
+
+
+if __name__ == "__main__":
+    main()

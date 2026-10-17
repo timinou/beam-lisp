@@ -2242,36 +2242,74 @@
           (if (erlang/function_exported :Elixir.BeamLisp.Env :cache_source_seed_metadata! 2)
            (BeamLisp.Env/cache_source_seed_metadata! sha metadata) metadata)))))))))
 
+(defn- seed_artifact_metadata! [mod name expected]
+  ;; Cache byte-derived data, never a blanket authorization. Every caller must
+  ;; separately compare live code or validate protected forwarder routes.
+  (let [key (tuple :Elixir.BeamLisp.AOT :seed_metadata
+                   (BeamLisp.Bootstrap/seed_dir) (BeamLisp.AOTCache/compiler_key) mod)
+        hit (persistent_term/get key nil)]
+    (if (and hit (= expected (Map/get hit :sha-hex)))
+      (Map/get hit :proof)
+      (let [bytes (File/read! (Path/join (BeamLisp.Bootstrap/seed_dir) name))
+            sha (crypto/hash :sha256 bytes) hex (String/downcase (Base/encode16 sha))
+            md5 (elem (elem (beam_lib/md5 bytes) 1) 1)]
+        (when-not (= expected hex) (erlang/error :sdk_bootstrap_artifact_changed))
+        (let [proof (Map/merge {:role :stable-seed :seed? true :lambda-routes (sdk_lambda_routes! bytes)
+                                ;; Canonical compiler data is read from authenticated bytes,
+                                ;; never by executing an extensible live Core shim.
+                                :kernel-definitions (when (= mod :Elixir.BeamLisp.Ns.Core)
+                                                      (sdk_stage_literal_definitions! mod bytes))
+                                :ctor-lambda-origins (sdk_record_ctor_origins! mod bytes) :md5 md5 :sha256 sha
+                                :compiler-key (BeamLisp.AOTCache/compiler_key)
+                                :imports (Enum/uniq (Enum/map
+                                  (Keyword/get (elem (elem (beam_lib/chunks bytes (list :imports)) 1) 1) :imports)
+                                  (fn [import] (elem import 0))))}
+                      (Map/merge (or (seed_forwarder_metadata mod bytes) {}) (sdk_seed_lambda_origin bytes)))]
+          (persistent_term/put key {:sha-hex hex :proof proof})
+          proof)))))
+
+(defn- seed_artifact_proof [mod name expected]
+  ;; A source unit may supersede a seed. Its independently authenticated source
+  ;; evidence must answer instead; the seed never authorizes replacement code.
+  (when (Code/ensure_loaded? mod)
+    (let [proof (seed_artifact_metadata! mod name expected)]
+      (when (= (Map/get proof :md5) (erlang/apply mod :module_info (list :md5))) proof))))
+
+(defn- seed_forwarder_dependency_from_manifest! [mod manifest]
+  ;; Incremental namespace extension may replace a mutable shim while preserving
+  ;; every protected SDK route. The existing native publication proof attests
+  ;; those exact routes; it grants no ownership of added application functions.
+  ;; Compiler-kernel checks deliberately continue to use the strict seed proof.
+  (let [name (str (Atom/to_string mod) ".beam")
+        expected (when manifest (Map/get (Map/get manifest "modules") name))]
+    (when expected
+      (when-not (= (BeamLisp.AOTCache/compiler_key) (Map/get manifest "compiler_key"))
+        (erlang/error :stale_sdk_bootstrap_inventory))
+      (let [row (seed_artifact_metadata! mod name expected)]
+        (when (and (= :mutable-forwarder (Map/get row :role))
+                    (BeamLisp.Env/sdk_forwarder_current? mod (Map/get row :forwarder-routes)))
+          row)))))
+
 (defn- source_seed_inventory! []
   ;; Checkout startup already verifies this authoritative floor. Re-use its
   ;; exact bytes for boot/native dependencies, never demand a whole-SDK image
   ;; build merely to start one source-owned actor. Loaded std units are supplied
   ;; separately by their complete compiler-owned emission receipts.
-  (let [manifest (BeamLisp.Bootstrap/manifest)
-        directory (BeamLisp.Bootstrap/seed_dir)]
+  (let [manifest (BeamLisp.Bootstrap/manifest)]
     (when-not (and manifest
                    (erlang/== (BeamLisp.AOTCache/compiler_key) (Map/get manifest "compiler_key")))
       (erlang/error :stale_sdk_bootstrap_inventory))
     (Enum/reduce (Map/fetch! manifest "modules") (Map/new)
       (fn [entry acc]
-        (let [file (elem entry 0) path (Path/join directory file)
+        (let [file (elem entry 0)
               ;; Existing atoms only; no arbitrary manifest names are interned.
               mod (try (String/to_existing_atom (Path/basename file ".beam")) (catch _ nil))]
           (if (or (erlang/== nil mod) (erlang/not (erlang/module_loaded mod))) acc
-            (let [bytes (File/read! path) sha (crypto/hash :sha256 bytes)
-                  md5 (elem (elem (beam_lib/md5 bytes) 1) 1)]
-              (when-not (erlang/== (String/downcase (Base/encode16 sha)) (elem entry 1))
-                (erlang/error :sdk_bootstrap_artifact_changed))
-              ;; A newly source-compiled unit may legitimately supersede this
-              ;; seed. Its compiler receipt must supply replacement evidence.
-              (if (erlang/not (erlang/== md5 (erlang/apply mod :module_info (list :md5)))) acc
-                (Map/put acc mod
-                  (Map/merge {:role :stable-seed :ctor-lambda-origins (sdk_record_ctor_origins! mod bytes) :md5 md5 :sha256 sha
-                              :seed? true :compiler-key (BeamLisp.AOTCache/compiler_key)
-                              :imports (Enum/uniq (Enum/map
-                                (Keyword/get (elem (elem (beam_lib/chunks bytes (list :imports)) 1) 1) :imports)
-                                (fn [import] (elem import 0))))}
-                    (Map/merge (or (seed_forwarder_metadata mod bytes) {}) (sdk_seed_lambda_origin bytes))))))))))))
+            ;; A newly source-compiled unit may legitimately supersede this
+            ;; seed (nil proof). Its compiler receipt supplies the evidence.
+            (let [proof (or (seed_artifact_proof mod file (elem entry 1))
+                            (seed_forwarder_dependency_from_manifest! mod manifest))]
+              (if proof (Map/put acc mod proof) acc))))))))
 
 (defn- source_sdk_receipts []
   (Map/new (Enum/map
@@ -2289,23 +2327,16 @@
   ;; The closure walker supplies its own captured native manifest, not a
   ;; caller/provider grant. Every selected artifact still passes byte and live
   ;; module checks; missing ordinary OTP imports are a constant-time lookup.
+  ;; A seed SUPERSEDED by a source-compiled unit (e.g. `multi` from priv/std)
+  ;; answers nil so the walk takes that unit's source proof. Refusing here
+  ;; (`unproved_sdk_bootstrap_dependency`) broke every spawn after such a load.
   (let [name (erlang/iolist_to_binary (list (Atom/to_string mod) ".beam"))
         expected (when manifest (Map/get (Map/get manifest "modules") name))]
     (when expected
       (when-not (erlang/== (BeamLisp.AOTCache/compiler_key) (Map/get manifest "compiler_key"))
         (erlang/error :stale_sdk_bootstrap_inventory))
-      (let [bytes (File/read! (Path/join (BeamLisp.Bootstrap/seed_dir) name))
-            sha (crypto/hash :sha256 bytes) md5 (elem (elem (beam_lib/md5 bytes) 1) 1)]
-        (when-not (and (erlang/== expected (String/downcase (Base/encode16 sha)))
-                      (Code/ensure_loaded? mod)
-                      (erlang/== md5 (erlang/apply mod :module_info (list :md5))))
-          (erlang/error :unproved_sdk_bootstrap_dependency))
-        (Map/merge {:role :stable-seed :seed? true :lambda-routes (sdk_lambda_routes! bytes) :ctor-lambda-origins (sdk_record_ctor_origins! mod bytes) :md5 md5 :sha256 sha
-                    :compiler-key (BeamLisp.AOTCache/compiler_key)
-                    :imports (Enum/uniq (Enum/map
-                      (Keyword/get (elem (elem (beam_lib/chunks bytes (list :imports)) 1) 1) :imports)
-                      (fn [import] (elem import 0))))}
-          (Map/merge (or (seed_forwarder_metadata mod bytes) {}) (sdk_seed_lambda_origin bytes)))))))
+      (when-not (Code/ensure_loaded? mod) (erlang/error :unproved_sdk_bootstrap_dependency))
+      (seed_artifact_proof mod name expected))))
 
 (defn- assert_sdk_seed_snapshot! [manifest]
   ;; Denial-only check of this walk's captured native input, never a cache grant.
@@ -2351,8 +2382,19 @@
   arm))
 
 (defn- sdk_native_source_declaration [ns source]
- (let [content (BeamLisp.Loader/read_source source)]
-  (when (erlang/> (erlang/byte_size content) 1048576) (erlang/error :sdk_native_source_bound))
+ ;; Memoize parsed DATA by exact current bytes. Source and native code identity
+ ;; are still checked by every caller; cached syntax never grants authority.
+ (let [content (BeamLisp.Loader/read_source source)
+       _ (when (erlang/> (erlang/byte_size content) 1048576) (erlang/error :sdk_native_source_bound))
+       digest (crypto/hash :sha256 content)
+       key (tuple :Elixir.BeamLisp.AOT :native-declaration source ns)
+       hit (persistent_term/get key nil)]
+  (if (and hit (= digest (elem hit 0))) (elem hit 1)
+   (let [declaration (sdk_native_source_declaration_content ns source content)]
+    (persistent_term/put key (tuple digest declaration))
+    declaration))))
+
+(defn- sdk_native_source_declaration_content [ns source content]
   (let [forms (BeamLisp.Reader/read_string content source)]
    (when (erlang/> (erlang/length forms) 2048) (erlang/error :sdk_native_source_bound))
    (let [found (Enum/reduce forms (tuple nil (list))
@@ -2370,7 +2412,7 @@
                         (erlang/== "defnative" (elem (erlang/hd (elem node 1)) 1)))
                     (tuple ns (cons (stage-native form) (elem state 1)))
                    :else state))))]
-    (when (erlang/== 1 (erlang/length (elem found 1))) (erlang/hd (elem found 1)))))))
+    (when (erlang/== 1 (erlang/length (elem found 1))) (erlang/hd (elem found 1))))))
 
 (defn- native_registry_rows []
  (if (erlang/== :undefined (ets/whereis :beam_lisp_native_declarations)) (list)
@@ -2509,7 +2551,8 @@
     (Map/new (Enum/map rows (fn [row] (tuple (elem (elem row 0) 1) (elem row 1)))))))
 
 (defn- sdk_native_dependency! [mod]
-  (let [receipt (Map/get (sdk_native_receipts) mod)]
+  (let [rows (ets/lookup :beam_lisp_vars (tuple :bl_sdk_native_host mod))
+        receipt (when (not= rows (list)) (elem (erlang/hd rows) 1))]
     (if receipt
       (let [owner (Map/get receipt :native-owner) ns (elem owner 0) input (sdk_native_input ns)
             physical (when input (sdk_native_library_identity! (elem input 0) (elem owner 1)
@@ -2562,27 +2605,35 @@
         (when selected (stage_sdk_dependency! (elem selected 0) (elem selected 1) mod)))))))
 
 (defn- complete_source_sdk_closure! [entries]
+  ;; Ordinary external imports (Enum, erlang, etc.) occur in hundreds of
+  ;; modules. Discover each at most once per walk, including negative results.
+  ;; This local set never survives a publication or becomes cached authority.
   ;; Follow actual emitted imports. Global lazy SDK requires add their complete
   ;; compiler receipt before initializer execution, then refresh this shared
   ;; proof. No module name prefix or caller callback can declare SDK authority.
   (let [manifest (BeamLisp.Bootstrap/manifest)
         result
-  (loop [pending (Map/keys entries) seen (MapSet/new) out entries]
+  (loop [pending (Map/keys entries) seen (MapSet/new) out entries external (MapSet/new)]
     (when (erlang/> (erlang/map_size out) 8192) (erlang/error :sdk_dependency_closure_too_large))
     (if (erlang/== pending (list)) out
       (let [mod (erlang/hd pending)]
-        (if (MapSet/member? seen mod) (recur (erlang/tl pending) seen out)
+        (if (MapSet/member? seen mod) (recur (erlang/tl pending) seen out external)
           (let [row (Map/fetch! out mod)
-                expanded (Enum/reduce (Map/get row :imports (list)) (tuple (erlang/tl pending) out)
+                expanded (Enum/reduce (Map/get row :imports (list)) (tuple (erlang/tl pending) out external)
                   (fn [dependency acc]
-                    (if (Map/has_key? (elem acc 1) dependency)
-                      (tuple (cons dependency (elem acc 0)) (elem acc 1))
+                    (cond
+                      (MapSet/member? (elem acc 2) dependency) acc
+                      (Map/has_key? (elem acc 1) dependency)
+                      (tuple (cons dependency (elem acc 0)) (elem acc 1) (elem acc 2))
+                      :else
                       (let [proof (or (source_sdk_receipt dependency)
                                       (seed_dependency_from_manifest! dependency manifest)
+                                      (seed_forwarder_dependency_from_manifest! dependency manifest)
                                       (sdk_source_dependency! dependency))]
                         (if proof
-                          (tuple (cons dependency (elem acc 0)) (Map/put (elem acc 1) dependency proof)) acc)))))]
-            (recur (elem expanded 0) (MapSet/put seen mod) (elem expanded 1)))))))]
+                          (tuple (cons dependency (elem acc 0)) (Map/put (elem acc 1) dependency proof) (elem acc 2))
+                          (tuple (elem acc 0) (elem acc 1) (MapSet/put (elem acc 2) dependency)))))))]
+            (recur (elem expanded 0) (MapSet/put seen mod) (elem expanded 1) (elem expanded 2)))))))]
     ;; No public mutable memo or caller process-dictionary authority. A change
     ;; during discovery refuses the whole result, rather than accepting a
     ;; snapshot from another bootstrap publication.
@@ -2660,6 +2711,7 @@
                         (let [identity (Atom/to_string mod) raw (Map/get inventory identity)]
                           (when raw (image_sdk_entry! root identity raw)))
                         (seed_dependency_from_manifest! mod manifest)
+                        (seed_forwarder_dependency_from_manifest! mod manifest)
                         (sdk_source_dependency! mod))]
               (if-not row (recur rest (MapSet/put seen mod) out)
                 (let [dependencies (Enum/uniq (erlang/++ (Map/get row :imports (list))
@@ -2670,35 +2722,10 @@
     result))
 
 (defn sdk_runtime_inventory!
-  "Attest only loaded SDK roots and their actual executable import closure.
-   The image's complete provenance does not force unrelated units to load in
-   development. Lazy SDK init refreshes the shared lease before effects."
+  "Full executable closure proof, used at SDK lifetime publication. Callback
+   membership is checked separately: a process start never enumerates the VM."
   ([] (sdk_runtime_inventory! false))
-  ([source-targets?]
-   ;; Every spawn and native start asks this question; computing it re-reads,
-   ;; hashes and disassembles the whole seed and walks 600+ receipts (3-9 s per
-   ;; call measured, i.e. per `spawn`). The answer is pure in the fingerprint
-   ;; below — the manifest, the compiler key, the receipt/native/source-lease
-   ;; rows and every loaded module's md5 — so it is remembered under exactly
-   ;; that fingerprint and recomputed whenever any part of it moves.
-   (let [print (sdk_inventory_fingerprint)
-         key (tuple :Elixir.BeamLisp.AOT :sdk_runtime_inventory source-targets?)
-         hit (persistent_term/get key nil)]
-     (if (and hit (erlang/== print (elem hit 0)))
-       (elem hit 1)
-       (let [result (sdk_runtime_inventory_uncached! source-targets?)]
-         (persistent_term/put key (tuple print result))
-         result)))))
-
-(defn- sdk_inventory_fingerprint []
-  (erlang/phash2
-    (tuple (BeamLisp.Bootstrap/manifest) (BeamLisp.AOTCache/compiler_key)
-           (ets/match_object :beam_lisp_vars (tuple (tuple :bl_sdk_emission :_) :_))
-           (ets/match_object :beam_lisp_vars (tuple (tuple :bl_sdk_native_host :_) :_))
-           (Enum/map (Enum/sort (code/all_loaded))
-             (fn [entry] (let [mod (elem entry 0)]
-                           (tuple mod (erlang/apply mod :module_info (list :md5)))))))
-    4294967295))
+  ([source-targets?] (sdk_runtime_inventory_uncached! source-targets?)))
 
 (defn- sdk_runtime_inventory_uncached! [source-targets?]
   (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root)) path (Path/join root "sdk-code.term")
@@ -2746,23 +2773,69 @@
       (tuple (elem proof 0) (elem proof 1) (elem proof 2) (sdk_source_target_inventory! entries))
       proof))))
 
-(defn sdk_callable_evidence! [callback]
+(defn- sdk_callable_manifest! []
+  ;; A running VM uses one compiler generation. Capture its authoritative seed
+  ;; once, independently of unrelated module loads. Explicit inventory/retention
+  ;; boundaries still re-read and check the current manifest.
+  (let [key (tuple :Elixir.BeamLisp.AOT :callable-seed
+                   (BeamLisp.Bootstrap/seed_dir) (BeamLisp.AOTCache/compiler_key))
+        hit (persistent_term/get key nil)]
+    (or hit
+      (let [manifest (BeamLisp.Bootstrap/manifest)]
+        (when-not (and manifest
+                       (= (BeamLisp.AOTCache/compiler_key) (Map/get manifest "compiler_key")))
+          (erlang/error :stale_sdk_bootstrap_inventory))
+        (persistent_term/put key manifest)
+        manifest))))
+
+(defn- sdk_callable_module! [mod]
+  ;; Authenticate THIS module, not every SDK root and every loaded OTP app.
+  ;; Seed proofs are pure byte-derived data, cached per artifact and checked
+  ;; against the live module MD5 on every use. A replaced seed must instead
+  ;; have genuine compiler/source evidence. Full import closure/lifetime
+  ;; retention remains the responsibility of sdk_runtime_inventory!.
+  (let [manifest (sdk_callable_manifest!)
+        seed (or (seed_dependency_from_manifest! mod manifest)
+                 (seed_forwarder_dependency_from_manifest! mod manifest))
+        row (or seed (sdk_compiler_row mod) (sdk_source_dependency! mod))]
+    (when-not (and row
+                   (= (BeamLisp.AOTCache/compiler_key) (Map/get row :compiler-key))
+                   (erlang/module_loaded mod)
+                   (or (= (Map/get row :md5) (erlang/apply mod :module_info (list :md5)))
+                       (and (= :mutable-forwarder (Map/get row :role))
+                            (BeamLisp.Env/sdk_forwarder_current? mod (Map/get row :forwarder-routes)))))
+      (erlang/error :unattested_sdk_callback))
+    (when-not (Map/get row :seed?)
+      (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root))
+            relative (Map/get row :source)
+            source (when relative (physical_sdk_path (Path/join root relative)))]
+        (when-not (and source (String/starts_with? source (str root "/"))
+                       (= (Map/get row :source-digest)
+                          (crypto/hash :sha256 (BeamLisp.Loader/read_source source))))
+          (erlang/error :stale_sdk_runtime_inventory))))
+    row))
+
+(defn sdk_callable_evidence!
+  "Authenticate one callback's current executable module and exact forwarder
+   route. Warm seed callbacks perform no filesystem or whole-VM inventory work.
+   Local initializer restrictions are checked on EVERY call, including hits."
+  [callback]
   (let [mod (erlang/element 2 (erlang/fun_info callback :module))
         name (erlang/element 2 (erlang/fun_info callback :name))
         arity (erlang/element 2 (erlang/fun_info callback :arity))
-        proof (sdk_runtime_inventory!)
-        stable (elem proof 0) forwarder (Map/get (elem proof 2) mod)]
-    (when-not (or (Map/has_key? stable mod)
-                 (and forwarder (Map/has_key? (Map/get forwarder :routes) (tuple name arity))))
-      (erlang/error :unattested_sdk_callback))
-    ;; Immutable ownership is not runtime-callable macro authority. A Source
-    ;; value may expose a public macro carrier or alias; native SDK adoption
-    ;; must refuse its constructor closure before retaining/invoking it too.
-    (when (erlang/== :local (elem (erlang/fun_info callback :type) 1))
+        row (sdk_callable_module! mod)]
+    (when (= :mutable-forwarder (Map/get row :role))
+      (let [target (Map/get (Map/get row :forwarder-routes) (tuple name arity))
+            proof (when target (sdk_callable_module! target))]
+        (when-not (and proof (contains? #{:stable-body :stable-seed} (Map/get proof :role)))
+          (erlang/error :unattested_sdk_callback))))
+    ;; Never cache a YES independently of callback kind: an external function
+    ;; and a local macro closure may share module/name/arity and loaded MD5.
+    (when (= :local (elem (erlang/fun_info callback :type) 1))
       (let [attrs (erlang/apply mod :module_info (list :attributes))
             role (normalized_attribute attrs :bl_aot_artifact_role)
             origin (normalized_attribute attrs :bl_sdk_initializer_lambda_kind)]
-        (when (and (erlang/== :initializer role) (erlang/not (erlang/== :values origin)))
+        (when (and (= :initializer role) (not= :values origin))
           (erlang/error :unattested_sdk_callback))))
     true))
 
@@ -6923,9 +6996,16 @@
      (conj (:kernel-modules (constructor_context!)) module)))))
 
 (defn- constructor_kernel_definitions! []
+ ;; Core's live shim can legitimately acquire test/application bindings.
+ ;; Interpret only its canonical, manifest-authenticated definition DATA. The
+ ;; executable body providers below still require strict seed proofs and leases.
  (let [module :Elixir.BeamLisp.Ns.Core
-       _ (constructor_kernel_module! module)
-       definitions (erlang/apply module :__bl_ns_defs__ (list))]
+       manifest (BeamLisp.Bootstrap/manifest)
+       name "Elixir.BeamLisp.Ns.Core.beam"
+       expected (when manifest (Map/get (Map/get manifest "modules") name))
+       _ (when-not (and expected (= (Map/get manifest "compiler_key") (BeamLisp.AOTCache/compiler_key)))
+           (stage-refuse :unattested-compiler-kernel))
+       definitions (Map/get (seed_artifact_metadata! module name expected) :kernel-definitions)]
   (when-not (erlang/is_map definitions) (stage-refuse :invalid-compiler-kernel-definitions))
   (Enum/reduce (Map/to_list definitions) {}
    (fn [binding output]
@@ -6963,12 +7043,27 @@
                   (tuple :"$blfn" fixed variadic))]
      (Map/put output name value))))))
 
+(defn- constructor_core_forwarder_proof! []
+ (let [module :Elixir.BeamLisp.Ns.Core manifest (BeamLisp.Bootstrap/manifest)]
+  (or (seed_dependency_from_manifest! module manifest)
+      (seed_forwarder_dependency_from_manifest! module manifest))))
+
+(defn- constructor_retain_core_forwarder! []
+ ;; Only original seed routes may be used by native helpers. Added bindings
+ ;; never enter the constructor kernel, whose definitions come from seed data.
+ (when-not (constructor_core_forwarder_proof!) (stage-refuse :unattested-compiler-kernel))
+ (let [handle (BeamLisp.Env/retain_code! (list :Elixir.BeamLisp.Ns.Core))]
+  (constructor_context_put! :kernel-leases
+    (cons handle (:kernel-leases (constructor_context!))))
+  (constructor_context_put! :kernel-core-forwarder true)
+  (when-not (constructor_core_forwarder_proof!) (stage-refuse :unattested-compiler-kernel))))
+
 (defn- constructor_install_kernel! []
  ;; Only compiler-owned seed construction executes here, into this disposable
  ;; private Env. Rt.seed_core creates callable/link tables and closures; it
  ;; invokes no provider initializer, process operation or supplied callback.
  (constructor_kernel_module! :Elixir.BeamLisp.Ns.Rt)
- (constructor_kernel_module! :Elixir.BeamLisp.Ns.Core)
+ (constructor_retain_core_forwarder!)
  (constructor_core_seed_rows!)
  (constructor_kernel_module! (:core-provider (constructor_context!)))
  (let [definitions (constructor_kernel_definitions!)]
@@ -7045,6 +7140,8 @@
  (when-let [provider (:core-provider (constructor_context!))]
   (when-not (seed_dependency! :Elixir.BeamLisp.Ns.Rt) (stage-refuse :unattested-compiler-kernel))
   (when-not (seed_dependency! provider) (stage-refuse :unattested-compiler-kernel)))
+ (when (:kernel-core-forwarder (constructor_context!))
+  (when-not (constructor_core_forwarder_proof!) (stage-refuse :unattested-compiler-kernel)))
  (doseq [module (:kernel-modules (constructor_context!))]
   (when-not (seed_dependency! module) (stage-refuse :unattested-compiler-kernel))))
 

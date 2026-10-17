@@ -105,3 +105,39 @@ Run one warm VM for a whole round of focused tests instead of a cold `bl` per
 command: `bl serve` a small driver that evaluates one form per TCP line and
 CLOSES the socket after replying (a server that forgets to close makes every
 client hang after the answer).
+
+## Check runtime host changes quickly
+
+For runtime changes in `aot.bl`, `env.bl` and `lazy_memo.bl`, use
+`scripts/check-runtime-hosts`. It uses two sequential, memory-capped VMs:
+one compiles changed hosts with the existing compiler, and the other tests
+the edited runtime, including the LazyMemo NIF. The compiler source snapshot
+stays fixed; the AOT overlay loads after bootstrap. Use these checks for
+runtime behavior and a complete floor rebuild for compiler qualification.
+
+Before editing a tree whose floor matches its current sources, save the
+bootstrap inputs:
+
+```sh
+mkdir -p .local/host-bootstrap
+cp priv/host/aot.bl priv/host/env.bl .local/host-bootstrap/
+```
+
+Then edit and run focused tests:
+
+```sh
+scripts/check-runtime-hosts \
+  --bootstrap-hosts .local/host-bootstrap \
+  --work-dir .local/host-check \
+  test/bl/perf/spawn_cost_test.bl test/bl/lazy_clean_capture_test.bl
+```
+
+Omit test paths to run the focused runtime regression set. Unchanged host
+beams are reused across runs; tests share one VM and each file has a 120-second
+ceiling. Use `--suite-timeout SECONDS` for a longer check. Empty results,
+failed assertions and timeouts fail the command.
+
+The checker keeps its image, cache, fixtures and manifest in its private work
+directory. Dependencies come from the configured XDG cache. When `HEAD`
+contains the seed-matching host sources, `--bootstrap-hosts` is optional.
+After runtime checks pass, regenerate and qualify the real floor once.

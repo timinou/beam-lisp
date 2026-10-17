@@ -1,0 +1,128 @@
+; spawn_cost_test.bl — a Beam Lisp `spawn` must stay cheap.
+;
+; Every `spawn` attests that its start boundary is SDK code
+; (`BeamLisp.AOT/sdk_callable_evidence!`). That used to rebuild the whole SDK
+; inventory — re-read, hash and disassemble every seed beam, walk 600+ compiler
+; receipts — on each call: ~15 s per spawn, which made ordinary tests look hung.
+; Loading any module afterwards made it worse, and a seed superseded by a
+; source-compiled unit (`multi` from priv/std) made it raise
+; `unproved_sdk_bootstrap_dependency` instead.
+;
+; The bounds below are deliberately loose (CI noise): they catch the
+; seconds-per-spawn regression, not microseconds.
+;
+; Run: ./bin/bl test test/bl/perf/spawn_cost_test.bl
+
+(ns spawn-cost-test)
+
+(defn- elapsed-ms [f]
+  (let [t (System/monotonic_time :microsecond)]
+    (f)
+    (quot (- (System/monotonic_time :microsecond) t) 1000)))
+
+(defn- spawn-and-join []
+  (let [me (erlang/self) ref (erlang/make_ref)]
+    (spawn (fn [] (erlang/send me ref)))
+    (receive ref :ok (after 10000 (throw (ex-info "spawned child never ran" {}))))))
+
+(deftest spawn-runs-the-child
+  (is (= :ok (spawn-and-join))))
+
+(deftest a-hundred-spawns-are-cheap
+  (spawn-and-join)                                     ; first one may prove
+  (let [ms (elapsed-ms (fn [] (doseq [_ (range 100)] (spawn-and-join))))]
+    (println "SPAWN-COST 100 spawns:" ms "ms")
+    (is (< ms 2000) (str "100 spawns took " ms " ms"))))
+
+(deftest spawning-does-not-enumerate-the-vm-or-rebuild-the-inventory
+  (let [traces [(tuple :Elixir.BeamLisp.AOT :sdk_runtime_inventory! 0)
+                (tuple :Elixir.BeamLisp.AOT :sdk_runtime_inventory! 1)
+                (tuple :code :all_loaded 0)]]
+    (doseq [mfa traces] (erlang/trace_pattern mfa true (list :local :call_count)))
+    (try
+      (is (= :ok (spawn-and-join)))
+      (doseq [mfa traces]
+        (is (= (tuple :call_count 0) (erlang/trace_info mfa :call_count))))
+      (finally
+        (doseq [mfa traces] (erlang/trace_pattern mfa false (list :local :call_count)))))))
+
+(deftest a-cold-callback-proof-still-does-not-build-an-inventory
+  (persistent_term/erase
+    (tuple :Elixir.BeamLisp.AOT :seed_metadata (BeamLisp.Bootstrap/seed_dir)
+           (BeamLisp.AOTCache/compiler_key) :Elixir.BeamLisp.Refs))
+  (let [mfa (tuple :Elixir.BeamLisp.AOT :sdk_runtime_inventory! 0)]
+    (erlang/trace_pattern mfa true (list :local :call_count))
+    (try
+      (is (= :ok (spawn-and-join)))
+      (is (= (tuple :call_count 0) (erlang/trace_info mfa :call_count)))
+      (finally (erlang/trace_pattern mfa false (list :local :call_count))))))
+
+(deftest warm-spawns-do-not-read-files-even-after-an-unrelated-module-load
+  (spawn-and-join)
+  (let [mod (erlang/binary_to_atom (str "spawn_cost_io_" (erlang/unique_integer (list :positive))))
+        bin (elem (erlang/apply :compile :forms
+                    (list (list (tuple :attribute 1 :module mod)) (list :binary))) 2)
+        _ (code/load_binary mod (erlang/binary_to_list "nofile") bin)
+        traces [(tuple :Elixir.File :read! 1) (tuple :Elixir.File :read 1)
+                (tuple :Elixir.BeamLisp.Bootstrap :manifest 0)]]
+    (doseq [mfa traces] (erlang/trace_pattern mfa true (list :local :call_count)))
+    (try
+      (doseq [_ (range 10)] (spawn-and-join))
+      (doseq [mfa traces]
+        (is (= (tuple :call_count 0) (erlang/trace_info mfa :call_count))))
+      (finally
+        (doseq [mfa traces] (erlang/trace_pattern mfa false (list :local :call_count)))))))
+
+(deftest a-non-sdk-callback-is-still-refused
+  ;; Same process, after native spawn proofs have been warmed.
+  (spawn-and-join)
+  (is (= :refused
+         (try (BeamLisp.AOT/sdk_callable_evidence! (fn [] :application-code))
+              :accepted (catch _ :refused)))))
+
+(deftest a-cached-module-proof-cannot-authorize-a-local-macro-closure
+  (let [carrier (BeamLisp.Env/fetch_exact! "core" "when")
+        payload (elem carrier 1)
+        macro (if (erlang/is_function payload) payload
+                (or (first (Map/values (elem payload 1))) (elem (elem payload 2) 1)))
+        mod (elem (erlang/fun_info macro :module) 1)
+        name (elem (erlang/fun_info macro :name) 1)
+        arity (elem (erlang/fun_info macro :arity) 1)]
+    (is (= :local (elem (erlang/fun_info macro :type) 1)))
+    ;; A capture can be constructed even for an unexported MFA. Do not invoke
+    ;; it: this specifically tests that warming a module/name/arity proof with
+    ;; an external fun cannot skip local initializer checks on the next call.
+    (is (true? (BeamLisp.AOT/sdk_callable_evidence! (erlang/make_fun mod name arity))))
+    (is (= :refused
+           (try (BeamLisp.AOT/sdk_callable_evidence! macro) :accepted (catch _ :refused))))))
+
+(deftest an-extended-shim-only-authorizes-its-protected-sdk-routes
+  (let [mod :Elixir.BeamLisp.Ns.Core
+        row (get (BeamLisp.AOT/source_seed_inventory!) mod)
+        route (first (Map/to_list (:forwarder-routes row)))
+        mfa (elem route 0)]
+    (is (= :mutable-forwarder (:role row)))
+    (is (true? (BeamLisp.AOT/sdk_callable_evidence!
+                 (erlang/make_fun mod (elem mfa 0) (elem mfa 1)))))
+    (is (= :refused
+           (try (BeamLisp.AOT/sdk_callable_evidence! (erlang/make_fun mod :module_info 0))
+                :accepted (catch _ :refused))))))
+
+(deftest loading-a-module-does-not-make-the-next-spawn-slow
+  (spawn-and-join)
+  (let [mod (erlang/binary_to_atom (str "spawn_cost_fresh_" (erlang/unique_integer (list :positive))))
+        bin (elem (erlang/apply :compile :forms (list (list (tuple :attribute 1 :module mod)) (list :binary))) 2)]
+    (code/load_binary mod (erlang/binary_to_list "nofile") bin)
+    (let [ms (elapsed-ms spawn-and-join)]
+      (is (< ms 2000) (str "spawn after a module load took " ms " ms")))))
+
+(deftest a-seed-superseded-by-a-source-unit-is-not-a-refusal
+  ;; `multi` is a seed module that the std loader recompiles from source, so its
+  ;; loaded md5 differs from the seed bytes. Proving the SDK must take the
+  ;; source unit's proof, not raise.
+  (BeamLisp.Loader/ensure_loaded "multi")
+  ;; Exercise actual source evidence rather than paying for an unrelated full
+  ;; retention inventory (the existing SDK snapshot tests cover that boundary).
+  (is (true? (BeamLisp.AOT/sdk_callable_evidence!
+               (erlang/make_fun :Elixir.BeamLisp.Ns.Multi :parents 1))))
+  (is (= :ok (spawn-and-join))))
