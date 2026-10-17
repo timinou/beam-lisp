@@ -67,3 +67,41 @@ than the checkout that produced it. That is the same shape as the reload
 question (`FUP-084`, `BUG-048`: the tier key moved and the beams did not), and
 it is why `FUP-108` treats "which generation am I running?" as a fact the tool
 should be able to state rather than a thing a person infers from silence.
+
+## When nothing boots: a working toolchain in four steps
+
+Seen 2026-10-17: every checkout (pristine `main` included) died at boot with
+`invalid_source_kernel_abi` / `stale_sdk_bootstrap_inventory`, and an installed
+drop died with `undefined var: compiler/special-forms`. Three separate causes
+looked like one. Do not edit `priv/host/*` to "diagnose" — changing a host leaf
+changes the source key and turns every following run into a stale-floor error.
+
+1. **Never write into an installed drop.** `~/.local/share/drop/<id>/` is
+   read-only by contract. A worktree whose `.bl/lib/beam_lisp-0.1.0/ebin` is
+   linked into a drop's `ebin`, or a debug script with `{:output_dir …}` into
+   it, overwrites the drop's boot beams. Repair: copy the drop's own
+   `priv/bootstrap/seed/<Module>.beam` back over each differing
+   `ebin/<Module>.beam` (compare with `cmp`), and check
+   `find <drop> -newer <drop>/BUILD_INFO.bl -name '*.beam'` is empty.
+2. **Boot from a commit whose floor matches its host source.** If `main`
+   refuses, use the newest commit that boots: try it in a scratch worktree
+   (`git worktree add --detach … <sha>`), copy the ignored assets
+   (`priv/native/`, `priv/z3/`) from a working checkout, and run with an
+   isolated cache (step 3). Then cherry-pick or merge onto it.
+3. **Isolate the AOT cache per experiment.** `XDG_CACHE_HOME=$HOME/tmp/bl-xdg-<name>`
+   with `beam_lisp/{ebin,lib,native}` copied from `~/.cache/beam_lisp` (the
+   compiled dependencies; without them boot dies with `x509.app` missing). Leave
+   `aot/` empty: it is rebuilt from source. Never delete shared `~/.cache/beam_lisp/aot`
+   entries to "clean" — other trees' beams live there too.
+4. **Change host or boot source, then regenerate the floor once, at the end,**
+   from the tree itself:
+   `BL_BOOTSTRAP_OUTPUT=… ./bin/bl run scripts/regenerate-seed.bl`, then
+   `BL_BOOTSTRAP_SEED=…/seed ./bin/bl run scripts/install-seed.bl`, then
+   `./bin/bl seed --check`. Before that, host-leaf changes are tested in a child
+   VM against beams compiled from the current source
+   (`test/bl/namespace_readiness_fast_path_test.bl` shows the pattern).
+
+Run one warm VM for a whole round of focused tests instead of a cold `bl` per
+command: `bl serve` a small driver that evaluates one form per TCP line and
+CLOSES the socket after replying (a server that forgets to close makes every
+client hang after the answer).
