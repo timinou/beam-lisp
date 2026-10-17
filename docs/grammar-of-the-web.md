@@ -126,6 +126,16 @@ it is easy to test and safe to re-run on every change.
     (for [t (tasks world)] (task-row t))))
 ```
 
+A list of children may be a seq (`for`, `map`) **or a vector** (`mapv`): a
+vector whose first item is not a tag keyword is a *group* and splices into its
+parent, in the renderer and the live differ alike. Prefer `mapv` for large or
+hot lists — a lazy seq that closes over the world pays a dependency walk of
+everything it captures, an eager vector does not:
+
+```clojure
+(box {:dir :col} (mapv task-row (tasks world)))   ; same output as the `for`
+```
+
 ### 5. Data — where the world lives
 
 State has exactly three homes, and no fourth to invent:
