@@ -167,9 +167,10 @@ The client hashes checkout and project source content, declared library paths,
 runtime settings, the seed manifest, and
 an explicitly selected application image. A changed inventory makes the VM
 refuse the request before execution; the launcher stops it and starts a fresh
-one. Generated build and cache directories are excluded. A checkout VM exits
-after five idle minutes. Automatic checkout VMs serve commands without starting
-the web dashboard, gateway, or project schedules. On Linux with an active systemd user runtime,
+one. Generated build and cache directories are excluded. A checkout VM stays
+running until explicitly stopped. Automatic checkout VMs serve commands without
+starting the web dashboard, gateway, or project schedules. On Linux with an
+active systemd user runtime,
 automatic VMs have a 4 GiB memory limit and 512 MiB swap limit.
 `./bin/bl realm stop` stops the VM explicitly. To host project schedules,
 stop the command VM and use `./bin/bl realm start` explicitly.
@@ -178,3 +179,16 @@ The native client lives under `.bl/launcher/`. Cargo is needed to build it;
 `./bin/bl --cold ...` bypasses the native client when bootstrapping without Cargo. Image builds and dependency provisioning run cold. The first ordinary command
 and the first command after a source edit pay
 the runtime startup cost.
+
+## Release from the qualified compiler floor
+
+`./bin/bl --cold run scripts/prepare-release.bl` builds native libraries and
+writes the application resource from `env.bl`. Then use
+`./bin/bl --cold self-build --reuse-floor --bin LAUNCHER --out DROP` to package
+that compiler with source library tiers. The build checks the floor against
+current sources and verifies every reused beam's SHA-256. Development namespace
+outputs are removed from the payload. Library declarations compile on demand
+in the new VM; subsequent commands reuse that VM.
+
+This mode leaves the compiler floor unchanged. A compiler source mismatch
+requires a newly qualified floor before packaging can continue.
