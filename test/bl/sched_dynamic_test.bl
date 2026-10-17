@@ -1,0 +1,173 @@
+; test/bl/sched_dynamic_test.bl — deadlines that are SET, not declared.
+; Run: bl -p priv/std test --shared test/bl/sched_dynamic_test.bl
+;
+; A declaration-and-outcome wheel is a good home for `(every 15 :minutes …)`; it
+; is the wrong home for "wake me at the earliest pending reminder", because that
+; instant is a fact about the OWNER's state and changes on every commit.
+;
+; So a schedule may be DECLARED as a dynamic one-shot — `(at nil :due handler)`,
+; no deadline yet — and then given one from inside the server (a state → state
+; function, used in a callback) or from outside (`at!` / `cancel!`). This file
+; pins the four things that must not be wrong:
+;
+;   · scheduling an EARLIER deadline moves the one wake earlier;
+;   · scheduling a LATER one does not fire early, and cancels the stale wake;
+;   · `nil`/`unschedule` means NO wake, and a past deadline fires promptly once;
+;   · a one-shot is spent after firing, and only DECLARED deadlines persist.
+
+(ns sched.dynamic.test
+  (:require [proc :as proc]))
+
+(def fired (atom []))
+
+;; ── a server whose only deadline is set from outside ────────────────────
+
+(proc/defserver deadlineonly
+  (sched {:clock proc/wall-ms}
+    (at nil :due (fn [ev] (swap! fired conj (:due ev))) {:catch-up :coalesce}))
+  ; the INSIDE half: a callback that returns a state with a new deadline
+  (handle-call [:set ms] [_from st]
+    (reply ms (proc.sched/schedule-at st :due ms)))
+  (handle-call [:set-adhoc ms] [_from st]
+    (reply ms (proc.sched/schedule-at st :adhoc ms
+                                      (fn [ev] (swap! fired conj [:adhoc (:due ev)])))))
+  (handle-call :clear [_from st]
+    (reply :ok (proc.sched/unschedule st :due)))
+  (handle-call :armed [_from st] (reply (proc.sched/armed-at) st))
+  (handle-call :next [_from st]
+    (reply (proc.sched/when-next st :due) st)))
+
+(deftest a-declared-dynamic-one-shot-holds-no-wake-until-it-is-scheduled
+  (reset! fired [])
+  (let [s (start deadlineonly nil {})]
+    (is (nil? (call s :armed)) "nothing is due, so nothing is armed")
+    (is (nil? (:at (call s :next))) "and the pane says so")
+    (Process/sleep 80)
+    (is (= [] @fired) "…and no handler ran")
+    (stop s)))
+
+(deftest a-deadline-set-from-outside-fires-once-at-its-due
+  (reset! fired [])
+  (let [s (start deadlineonly nil {})
+        due (+ (proc/wall-ms) 80)]
+    (is (= {:ok true :id :due :at due} (proc/at! s :due due)))
+    (Process/sleep 200)
+    (is (= [due] @fired) "the handler ran once, with its due")
+    (is (nil? (call s :armed)) "the one wake is spent")
+    (is (nil? (:at (call s :next))) "…and the schedule holds no deadline")
+    (stop s)))
+
+(deftest a-deadline-set-from-inside-a-callback-arms-the-same-wake
+  (reset! fired [])
+  (let [s (start deadlineonly nil {})
+        due (+ (proc/wall-ms) 80)]
+    (call s [:set due])
+    (Process/sleep 200)
+    (is (= [due] @fired)
+        "the state returned by the callback was re-armed, with no call to `arm`")
+    (stop s)))
+
+(deftest an-earlier-deadline-moves-the-wake-earlier
+  (reset! fired [])
+  (let [s (start deadlineonly nil {})
+        far (+ (proc/wall-ms) 5000)
+        near (+ (proc/wall-ms) 60)]
+    (call s [:set far])
+    (is (= far (call s :armed)))
+    (call s [:set near])
+    (is (= near (call s :armed))
+        "the single wake followed the earlier deadline")
+    (Process/sleep 200)
+    (is (= [near] @fired)
+        "the far deadline did not hold the wheel: the near one ran and the far one was gone")
+    (stop s)))
+
+(deftest a-later-deadline-does-not-fire-early-and-the-stale-wake-is-dropped
+  (reset! fired [])
+  (let [s (start deadlineonly nil {})
+        soon (+ (proc/wall-ms) 60)
+        later (+ (proc/wall-ms) 500)]
+    (call s [:set soon])
+    (call s [:set later])
+    (is (= later (call s :armed)) "the wake was re-pointed, not merely ignored")
+    (Process/sleep 200)
+    (is (= [] @fired) "the stale wake did not run the NEW deadline early")
+    (Process/sleep 450)
+    (is (= [later] @fired) "…and it ran once, at the later due")
+    (stop s)))
+
+(deftest a-past-deadline-fires-promptly-once
+  (reset! fired [])
+  (let [s (start deadlineonly nil {})
+        past (- (proc/wall-ms) 5000)]
+    (call s [:set past])
+    (Process/sleep 150)
+    (is (= [past] @fired) "a missed one-shot runs once, under :coalesce")
+    (Process/sleep 150)
+    (is (= [past] @fired) "…and never again")
+    (stop s)))
+
+(deftest cancel-prevents-firing-and-leaves-no-wake
+  (reset! fired [])
+  (let [s (start deadlineonly nil {})
+        due (+ (proc/wall-ms) 80)]
+    (call s [:set due])
+    (is (= :ok (proc/cancel! s :due)))
+    (is (nil? (call s :armed)))
+    (Process/sleep 200)
+    (is (= [] @fired) "cancelled means cancelled")
+    (stop s)))
+
+(deftest unscheduling-then-rescheduling-works
+  (reset! fired [])
+  (let [s (start deadlineonly nil {})
+        a (+ (proc/wall-ms) 80)
+        b (+ (proc/wall-ms) 200)]
+    (call s [:set a])
+    (call s :clear)
+    (Process/sleep 150)
+    (is (= [] @fired))
+    (call s [:set b])
+    (Process/sleep 250)
+    (is (= [b] @fired) "the id can be scheduled again after a cancel")
+    (stop s)))
+
+;; ── persistence: declarations persist, ad-hoc entries do not ────────────
+
+(deftest a-declared-deadline-is-resumed-after-a-restart
+  (reset! fired [])
+  (let [due (+ (proc/wall-ms) 60000)]
+    (let [s (start deadlineonly nil {})]
+      (is (= {:ok true :id :due :at due} (proc/at! s :due due)))
+      (stop s))
+    (let [s (start deadlineonly nil {})]
+      (is (= due (:at (call s :next)))
+          "a SET deadline on a declared schedule survives the process")
+      (stop s))))
+
+(deftest an-unscheduled-deadline-stays-cleared-across-a-restart
+  (let [due (+ (proc/wall-ms) 60000)]
+    (let [s (start deadlineonly nil {})]
+      (call s [:set due])
+      (call s :clear)
+      (stop s))
+    (let [s (start deadlineonly nil {})]
+      (is (nil? (:at (call s :next)))
+          "a cleared deadline does not come back from the store")
+      (is (nil? (call s :armed)))
+      (stop s))))
+
+(deftest an-ad-hoc-deadline-is-not-persisted
+  (reset! fired [])
+  (let [due (+ (proc/wall-ms) 60000)
+        s (start deadlineonly nil {})]
+    (call s [:set-adhoc due])
+    (is (nil? (proc/read-record 'deadlineonly :adhoc))
+        "a dynamically created entry has no row: it is not a declaration")
+    (stop s)))
+
+;; ── the rule arithmetic, for a one-shot with no deadline ────────────────
+
+(deftest a-one-shot-with-no-deadline-is-not-due
+  (is (nil? (proc/first-due {:freq :at :ms nil} 1000)))
+  (is (nil? (proc/advance {:freq :at :ms nil} 1000))))

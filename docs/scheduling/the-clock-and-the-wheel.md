@@ -1324,3 +1324,18 @@ per the repo's ethics). P5/P6 are separate waves with a real consumer each.
 - `!tasks/plans/PLAN-088-…org` — why `priv/boot/` cannot be edited yet
 - `~/code/ora/blueprint/src/printflow/{clock,notify,outbox}.bl`
 - `~/code/products/knowledger/apps/knowledger/src/knowledger/library.bl`
+
+## 9. Dynamic deadlines (2026-10-17)
+
+A deadline that is a fact about the owner's state — "the earliest pending
+reminder", "the next boundary of a time-bounded fact" — is not declared, it is
+SET. Declare the slot as `(at nil :due handler)` (no wake until given a time)
+and set it from a callback with `(proc.sched/schedule-at st :due ms)`, which
+returns the new state, re-points the one wake and persists the deadline;
+`unschedule` / `nil` clears it. From outside: `proc.sched/at!` and `cancel!`.
+A cleared or spent dynamic deadline is retracted from the store so a restart
+does not resurrect it; a 4-argument `schedule-at` with a handler creates an
+ad-hoc id that is process state only. This replaces polling ticks that scan for
+due work: the owner recomputes `next-due` after each commit and sleeps until
+then, with an optional `every 15 :minutes` sweep as a safety net.
+

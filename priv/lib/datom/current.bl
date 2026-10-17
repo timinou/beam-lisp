@@ -50,19 +50,24 @@
    An interrupted/legacy writer invalidates the attribute epoch, not history."
   ([store datoms tx] (transaction-ops store datoms tx false))
   ([store datoms tx fresh?]
+   ;; EAGER on purpose: this runs inside every commit over every datom. A lazy
+   ;; `mapcat` here creates one lazy cell per pair, and each cell walks what its
+   ;; step captured (`pairs`, `datoms`, `store`) for memo resources — measured
+   ;; 0.27 ms per datom, 3 s for a 2 500-datom transaction. `reduce` builds the
+   ;; same op vector with no cells.
    (let [pairs (reduce (fn [m d]
                          (update m [(get d 0) (get d 1)]
                            (fn [ds] (conj (or ds []) d)))) {} datoms)
-         attrs (set (mapv (fn [[pair _]] (get pair 1)) (into [] pairs)))
-         epochs (into {} (mapv (fn [a] [a (or (:epoch (marker store a)) tx)]) (into [] attrs)))
-         headers (mapcat (fn [a]
-                           (derived/put-ops [:datom.current/attribute a]
-                             {:basis tx :epoch (get epochs a)})) attrs)]
-     (into (vec headers)
-       (mapcat (fn [[[e a] ds]]
-                 (derived/put-ops [:datom.current/pair e a]
-                   {:epoch (get epochs a) :basis tx
-                    :values (apply-pending (if fresh? [] (values store e a)) ds)})) pairs))))
+         attrs (reduce (fn [s [pair _]] (conj s (get pair 1))) #{} pairs)
+         epochs (reduce (fn [m a] (assoc m a (or (:epoch (marker store a)) tx))) {} attrs)
+         headers (reduce (fn [acc a]
+                           (into acc (derived/put-ops [:datom.current/attribute a]
+                                       {:basis tx :epoch (get epochs a)}))) [] attrs)]
+     (reduce (fn [acc [[e a] ds]]
+               (into acc (derived/put-ops [:datom.current/pair e a]
+                           {:epoch (get epochs a) :basis tx
+                            :values (apply-pending (if fresh? [] (values store e a)) ds)})))
+             headers pairs)))
   ([store schema datoms tx fresh?]
    (into (transaction-ops store datoms tx fresh?)
          (reverse-transaction-ops store schema datoms tx fresh?))))
@@ -121,15 +126,20 @@
  {:definition (reverse-definition sch a) :epoch (inc (:epoch old 0)) :through tx :coverage-basis tx
   :phase (if (and (nil? old) (empty-attribute? s a)) :complete :clear-values)})
 (defn- row-ops [phase e a before after tx]
- (let [building? (= :build phase)]
-  (into [] (mapcat
-   (fn [v]
-    (let [live? (boolean (some (fn [x] (= x v)) after))
+ ;; eager (reduce, not lazy mapcat/distinct/concat): runs per pair per commit
+ (let [building? (= :build phase)
+       after-set (set after)
+       vs (reduce (fn [acc v] (if (contains? (:seen acc) v) acc
+                                {:seen (conj (:seen acc) v) :out (conj (:out acc) v)}))
+                  {:seen #{} :out []} (into (vec before) after))]
+  (reduce
+   (fn [acc v]
+    (let [live? (contains? after-set v)
           row [e a v tx live?] key (reverse-key e a v) dirty (dirty-key e a v)]
      (if live?
-      [[:put key row] [:delete dirty]]
-      (if building? [[:put key row] [:put dirty row]] [[:delete key] [:delete dirty]]))))
-   (distinct (concat before after))))))
+      (conj acc [:put key row] [:delete dirty])
+      (if building? (conj acc [:put key row] [:put dirty row]) (conj acc [:delete key] [:delete dirty])))))
+   [] (:out vs))))
 (defn reverse-transaction-ops
  "Reverse values and coverage in the SAME native source commit. Old callers
   without schema remain legacy writers: their attribute marks invalidate this
@@ -137,18 +147,23 @@
  [s sch datoms tx fresh?]
  (let [pairs (reduce (fn [out dt] (update out [(index/-e dt) (index/-a dt)]
                     (fn [ds] (conj (or ds []) dt)))) {} datoms)
-       attrs (set (mapv (fn [[[e a] _]] a) (into [] pairs)))
-       headers (into {} (keep (fn [a]
-          (when (schema/indexed? sch a)
+       attrs (reduce (fn [acc [[_ a] _]] (conj acc a)) #{} pairs)
+       ;; eager throughout: lazy keep/mapcat here cost one walked cell per pair
+       headers (reduce (fn [m a]
+          (if (schema/indexed? sch a)
            (let [old (reverse-certificate s a)]
-            [a (if (reverse-current? s sch a old) (assoc old :through tx)
-                 (initial-reverse s sch a old tx))]))) attrs))]
-  (into (vec (mapcat (fn [[a header]] (derived/put-ops (reverse-ident a) header)) headers))
-   (mapcat (fn [[[e a] ds]]
-    (when-let [header (get headers a)]
-     (when (contains? #{:complete :build :drain} (:phase header))
+            (assoc m a (if (reverse-current? s sch a old) (assoc old :through tx)
+                         (initial-reverse s sch a old tx))))
+           m)) {} attrs)
+       head-ops (reduce (fn [acc [a header]] (into acc (derived/put-ops (reverse-ident a) header))) [] headers)]
+  (if (empty? headers)
+   head-ops
+   (reduce (fn [acc [[e a] ds]]
+    (let [header (get headers a)]
+     (if (and header (contains? #{:complete :build :drain} (:phase header)))
       (let [before (if fresh? [] (values s e a)) after (apply-pending before ds)]
-       (row-ops (:phase header) e a before after tx))))) pairs))))
+       (into acc (row-ops (:phase header) e a before after tx)))
+      acc))) head-ops pairs))))
 (defn reverse-excision-ops
  "Erase every named reverse value and dirty entry in the source erasure commit.
   Historical rows cannot survive as a derived current value."

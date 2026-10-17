@@ -1,0 +1,118 @@
+; bl/profile.bl — where did the time go, in Beam Lisp names.
+;
+;   (require '[bl.profile :as profile])
+;   (profile/print! (profile/call-time (fn [] (render page))))
+;
+; `call-time` runs `f` once under OTP's `tprof` (call_time: wall time per
+; function, including time in callees' own frames only once) in THIS process
+; and returns rows aggregated by Beam Lisp FUNCTION rather than by BEAM module:
+;
+;   Elixir.BeamLisp.Ns.Body.Reception.Ui.Screens / "-work-row/3-anonymous-2-"
+;     → {:ns "reception.ui.screens" :fn "work-row"}
+;
+; Anonymous closures are charged to the named function that encloses them (the
+; name BEAM encodes into `-name/arity-anonymous-N-`), and the `Body.`/`Init.`
+; companion modules are folded into their namespace — a namespace is ONE unit to
+; a reader. Runtime modules (LazyMemo, Env, Vector, Rt, …) keep their own rows,
+; so an expensive runtime path shows up as itself.
+;
+; The `tools` application ships in releases (`build.release/tool-apps`); in a
+; checkout it is the host OTP's. When it cannot be loaded, `call-time` falls
+; back to timing `f` as a whole (`:rows []`, `:profiled? false`).
+(ns bl.profile (:require [clojure.core-more]))
+
+(defn- seg->ns
+  "`Reception.Ui.Screens` → `reception.ui.screens`; `Proc.Owner-registry` →
+   `proc.owner-registry`. A segment is CamelCase-dashed back to kebab."
+  [segments]
+  (String/downcase
+    (Enum/join (map (fn [s] (Regex/replace (Regex/compile! "(?<=[a-z0-9])([A-Z])") s "-\\1"))
+                    segments) ".")))
+
+(defn demangle-module
+  "A BEAM module atom → `{:ns string :runtime? bool}`.
+
+   `Elixir.BeamLisp.Ns[.Body|.Init].A.B` is namespace `a.b`; any other
+   `Elixir.BeamLisp.X` is runtime module `X`; anything else is itself."
+  [mod]
+  (let [s (erlang/atom_to_binary mod)
+        parts (String/split s ".")]
+    (cond
+      (and (>= (count parts) 4) (= ["Elixir" "BeamLisp" "Ns"] (vec (take 3 parts))))
+        (let [rest (vec (drop 3 parts))
+              rest (if (contains? #{"Body" "Init" "Fn"} (first rest)) (vec (rest rest)) rest)]
+          {:ns (seg->ns rest) :runtime? false})
+      (and (>= (count parts) 3) (= ["Elixir" "BeamLisp"] (vec (take 2 parts))))
+        {:ns (Enum/join (drop 2 parts) ".") :runtime? true}
+      :else {:ns (String/replace_prefix s "Elixir." "") :runtime? true})))
+
+(defn demangle-fn
+  "A BEAM function name → the Beam Lisp name it belongs to.
+   `-work-row/3-anonymous-2-` → `work-row`; `render` → `render`."
+  [fname]
+  (let [s (if (erlang/is_atom fname) (erlang/atom_to_binary fname) (str fname))
+        m (Regex/run (Regex/compile! "^-(.+?)/\\d+-(?:anonymous|fun|lc|lbc)-") s)]
+    (if m (second m) s)))
+
+(defn aggregate
+  "tprof rows `[{mod, fun, arity} calls time-us]` → Beam Lisp rows
+   `{:ns :fn :calls :us :runtime?}`, summed, sorted by time descending."
+  [rows]
+  (->> rows
+       (reduce (fn [acc [mfa calls us]]
+                 (let [m (demangle-module (erlang/element 1 mfa))
+                       k [(:ns m) (demangle-fn (erlang/element 2 mfa))]
+                       prev (get acc k {:ns (first k) :fn (second k) :calls 0 :us 0 :runtime? (:runtime? m)})]
+                   (assoc acc k (assoc prev :calls (+ (:calls prev) calls) :us (+ (:us prev) us)))))
+               {})
+       vals
+       (sort-by (fn [r] (- (:us r))))
+       vec))
+
+(defn- tools-loaded? []
+  (or (Code/ensure_loaded? :tprof)
+      (let [dirs (Path/wildcard (str (erlang/list_to_binary (erlang/apply :code :root_dir (list))) "/lib/tools-*/ebin"))]
+        (doseq [d dirs] (erlang/apply :code :add_patha (list (erlang/binary_to_list d))))
+        (Code/ensure_loaded? :tprof))))
+
+(defn call-time
+  "Run `(f)` under tprof call_time. Returns `{:value :total-us :profiled? :rows}`
+   — `rows` from `aggregate`. `opts`: `{:all? true}` traces EVERY process, not
+   only the caller — needed when the work runs in another process (a GenServer
+   call: a datom writer, an owner server). Tracing all processes slows the whole
+   VM while it runs; prefer the default for in-process work."
+  ([f] (call-time f {}))
+  ([f opts]
+  (if-not (tools-loaded?)
+    (let [t0 (erlang/monotonic_time :microsecond) v (f)]
+      {:value v :total-us (- (erlang/monotonic_time :microsecond) t0) :profiled? false :rows []})
+    (do
+      (erlang/apply :tprof :start (list {:type :call_time}))
+      (try
+        (erlang/apply :tprof :enable_trace (list (if (:all? opts) :all (list (erlang/self)))))
+        (erlang/apply :tprof :set_pattern (list :_ :_ :_))
+        (let [t0 (erlang/monotonic_time :microsecond)
+              v (try (f) (finally (erlang/apply :tprof :disable_trace (list (if (:all? opts) :all (list (erlang/self)))))))
+              total (- (erlang/monotonic_time :microsecond) t0)
+              sample (erlang/apply :tprof :collect (list))
+              inspected (erlang/apply :tprof :inspect (list sample :total :measurement))
+              raw (erlang/element 3 (erlang/apply :maps :get (list :all inspected)))
+              ;; a tprof row is {Module, {Fun, Arity}, Calls, Measurement, …}
+              rows (mapv (fn [r] (let [l (erlang/tuple_to_list r)
+                                       fa (nth l 1)]
+                                   [(tuple (nth l 0) (erlang/element 1 fa) (erlang/element 2 fa))
+                                    (nth l 2) (nth l 3)]))
+                         raw)]
+          {:value v :total-us total :profiled? true :rows (aggregate rows)})
+        (finally (erlang/apply :tprof :stop (list))))))))
+
+(defn print!
+  "Print the top `n` rows (default 30) of a `call-time` result."
+  ([result] (print! result 30))
+  ([result n]
+   (println (str "total " (quot (:total-us result) 1000) " ms"
+                 (if (:profiled? result) "" " (tools unavailable: not profiled)")))
+   (doseq [r (take n (:rows result))]
+     (println (str (clojure.core-more/format "%8d ms %10d  " (quot (:us r) 1000) (:calls r))
+                   (:ns r) "/" (:fn r) (if (:runtime? r) "  [runtime]" ""))))
+   result))
