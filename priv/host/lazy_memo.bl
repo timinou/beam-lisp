@@ -196,6 +196,20 @@
         (deps_walk :advance cur (erlang/++ (erlang/element 1 split) stack)
                    ids (MapSet/put functions cur) (erlang/element 2 split))))
 
+    ; ── a remembered clean value, at ANY depth: nothing inside ──
+    (and (or (erlang/is_map cur) (erlang/is_tuple cur)) (deps_clean_hit? cur nil))
+    (deps_walk :advance cur stack ids functions resources)
+
+    ; ── a BIG value met inside the walk: walk it ALONE, remember it if clean,
+    ;    so a small wrapper re-captured around it costs O(1) next time ──
+    (and (deps_big? cur) (erlang/== false (erlang/== stack ())))
+    (let [found (do (deps_walked!) (deps_walk :inspect cur () ids functions ()))]
+      (cond
+        (erlang/== found ())
+          (do (deps_clean_remember! cur) (deps_walk :advance cur stack ids functions resources))
+        :else
+          (deps_walk :advance cur stack ids functions (erlang/++ found resources))))
+
     ; ── a tuple: walk its elements ──
     (erlang/is_tuple cur)
     (deps_walk :advance cur (erlang/++ (erlang/tuple_to_list cur) stack)
@@ -232,7 +246,11 @@
 ;; closures of that process at the time, so the bound is on values it was
 ;; already holding.
 
-(defn deps_clean_max [] 16)
+(defn deps_clean_max
+  "How many clean values one process remembers. Large enough that a render's
+   live working set (snapshot, world, its big sub-maps, ~20–100 values) never
+   thrashes; each entry is an identity the process is already holding."
+  [] 256)
 
 (defn deps_big?
   "INTERNAL: a value large enough that remembering it beats re-walking it — a
@@ -249,12 +267,34 @@
     :else false))
 
 (defn deps_clean_hit?
-  "INTERNAL: is `t` (by identity) one of `memo`, the remembered clean values?"
-  [t memo]
+  "INTERNAL: is `t` (by identity) one of the remembered clean values?
+
+   The memo is a map from an O(1) SHAPE key (`deps_shape`: map size / tuple
+   size — never a hash, which would traverse the term) to the remembered terms
+   of that shape; identity (`erts_debug:same/2`, a pointer test) confirms. A
+   bucket is a short list of pointer compares. (`memo` is the old call shape
+   and is ignored.)"
+  [t _memo]
+  (let [table (Process/get :bl_deps_clean_ix nil)]
+    (cond
+      (erlang/== table nil) false
+      :else (deps_clean_same? t (maps/get (deps_shape t) table ())))))
+
+(defn deps_shape
+  "INTERNAL: an O(1) bucket key for a map/tuple — its kind and size."
+  [t]
   (cond
-    (erlang/== memo ()) false
-    (erts_debug/same t (erlang/hd memo)) true
-    :else (deps_clean_hit? t (erlang/tl memo))))
+    (erlang/is_map t) (erlang/map_size t)
+    (erlang/is_tuple t) (erlang/- -1 (erlang/tuple_size t))
+    :else :other))
+
+(defn deps_clean_same?
+  "INTERNAL: is `t` identical to one of `xs`?"
+  [t xs]
+  (cond
+    (erlang/== xs ()) false
+    (erts_debug/same t (erlang/hd xs)) true
+    :else (deps_clean_same? t (erlang/tl xs))))
 
 (defn deps_clean_take
   "INTERNAL: the first `n` elements of list `xs`."
@@ -265,10 +305,35 @@
     :else (erlang/++ (list (erlang/hd xs)) (deps_clean_take (erlang/tl xs) (erlang/- n 1)))))
 
 (defn deps_clean_remember!
+  "INTERNAL: remember `t` as resource-free. Bounded: when the table holds
+   `deps_clean_max` values it is cleared and restarted (a generation flip,
+   O(1) amortised) rather than evicted one by one."
   [t]
-  (let [memo (Process/get :bl_deps_clean ())]
-    (Process/put :bl_deps_clean
-                 (deps_clean_take (erlang/++ (list t) memo) (deps_clean_max)))))
+  (let [table (Process/get :bl_deps_clean_ix nil)
+        n (Process/get :bl_deps_clean_n 0)
+        fresh? (or (erlang/== table nil) (erlang/>= n (deps_clean_max)))
+        table (cond fresh? (maps/new) :else table)
+        h (deps_shape t)]
+    (Process/put :bl_deps_clean_ix (maps/put h (erlang/++ (list t) (maps/get h table ())) table))
+    (Process/put :bl_deps_clean_n (cond fresh? 1 :else (erlang/+ n 1)))
+    t))
+
+(defn plain!
+  "Declare `v` PLAIN DATA for this process: it holds no lazy seq, memo handle
+   or function, so a lazy cell that captures it never walks it. Returns `v`.
+
+   Use it on a large immutable value an app captures in many lazy pipelines —
+   a hydrated world, a render snapshot. The contract is the caller's: declaring
+   a value that DOES hold a lazy seq plain hides that dependency from cells that
+   capture it (their cache is then not invalidated through it). When unsure,
+   do not declare; the walk proves cleanliness on its own, once per value."
+  [v]
+  (cond (deps_scalar? v) v :else (deps_clean_remember! v)))
+
+(defn deps_walked!
+  "INTERNAL: count one real walk of a big value (a test/diagnostic probe)."
+  []
+  (Process/put :bl_deps_walked (erlang/+ 1 (Process/get :bl_deps_walked 0))))
 
 (defn deps_env
   "INTERNAL: split a fun's captured environment `env` into
@@ -284,14 +349,12 @@
           rest (erlang/tl env)]
       (cond
         (deps_scalar? e) (deps_env rest acc resources)
+        (deps_clean_hit? e nil) (deps_env rest acc resources)
         (deps_big? e)
-        (cond
-          (deps_clean_hit? e (Process/get :bl_deps_clean ())) (deps_env rest acc resources)
-          :else
-          (let [found (deps_walk :inspect e () (MapSet/new) (MapSet/new) ())]
+          (let [found (do (deps_walked!) (deps_walk :inspect e () (MapSet/new) (MapSet/new) ()))]
             (cond
               (erlang/== found ()) (do (deps_clean_remember! e) (deps_env rest acc resources))
-              :else (deps_env rest acc (erlang/++ found resources)))))
+              :else (deps_env rest acc (erlang/++ found resources))))
         :else (deps_env rest (erlang/++ (list e) acc) resources)))))
 
 (defn dependencies
