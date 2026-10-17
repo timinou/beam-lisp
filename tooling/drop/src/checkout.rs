@@ -27,10 +27,7 @@ fn checkout_main(args: &[String]) -> ! {
     exec_payload(&root, "src", argv)
 }
 
-fn invocation_tree(cwd: &Path, argv: &[String], checkout: bool) -> Option<PathBuf> {
-    if !checkout {
-        return tree_root(cwd, argv);
-    }
+fn invocation_tree(cwd: &Path, argv: &[String]) -> Option<PathBuf> {
     root_override(argv)
         .and_then(canonical_or)
         .or_else(|| project_dir(cwd))
@@ -412,7 +409,7 @@ mod checkout_tests {
         std::fs::create_dir_all(root.join("nested")).unwrap();
         std::fs::write(root.join("env.bl"), "{}").unwrap();
         assert_eq!(
-            invocation_tree(&root.join("nested"), &[], true),
+            invocation_tree(&root.join("nested"), &[]),
             Some(root.clone())
         );
         let argv = vec![
@@ -420,7 +417,7 @@ mod checkout_tests {
             root.join("nested").to_string_lossy().into_owned(),
         ];
         assert_eq!(
-            invocation_tree(&root, &argv, true),
+            invocation_tree(&root, &argv),
             Some(root.join("nested"))
         );
         std::fs::remove_dir_all(root).unwrap();

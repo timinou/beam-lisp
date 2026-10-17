@@ -65,6 +65,9 @@ with tempfile.TemporaryDirectory(prefix='bl-checkout-transport-') as scratch:
         second = owner('reuse')
         assert first == second, 'second command started a different VM'
         assert Path(f'/proc/{first}').exists(), 'command ran in a temporary VM'
+        output = run('no-idle-shutdown', 'eval',
+                     '(println (nil? (erlang/apply :persistent_term :get (list (tuple :vm_session :idle) nil))))')
+        assert 'true' in output.splitlines(), 'automatic VM armed an idle shutdown watcher'
         cgroup = Path(f'/proc/{first}/cgroup')
         if cgroup.exists():
             relative = next((line[3:] for line in cgroup.read_text().splitlines() if line.startswith('0::')), None)

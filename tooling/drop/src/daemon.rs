@@ -592,8 +592,11 @@ fn start_daemon_detached(bin: &Path, root: &Path, build: &str, shared: bool, com
     let log_arg = log.clone().unwrap_or_else(|| PathBuf::from(NULL_LOG));
     let mut cmd = release_command(bin);
     cmd.args(warm_start_argv(root, shared, &log_arg));
-    if checkout_root().is_some() {
-        if commands_only { cmd.args(["--idle", "300", "--no-ui", "--commands-only"]); }
+    let command_vm = commands_only && command_vm_for(bin);
+    if command_vm {
+        cmd.args(["--idle", "0", "--no-ui", "--commands-only"]);
+    }
+    if checkout_root().is_some() || command_vm {
         cmd = checkout_memory_bound(cmd);
     }
     cmd.stdin(Stdio::null());

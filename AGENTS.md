@@ -42,7 +42,7 @@ running a test loop is enough to push it there.
 `./bin/bl` uses the native transport and starts one VM for its tree by default.
 Requests carry their own cwd, argv and environment. Source changes invalidate
 that VM before the next request. Automatic VMs skip dashboards and project
-schedules and exit after five idle minutes; use
+schedules and remain running until explicitly stopped; use
 `./bin/bl realm stop` to stop it explicitly.
 
 Use `./bin/bl --cold ...` when a check needs a fresh VM. The first command and

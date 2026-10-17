@@ -505,7 +505,7 @@ fn after_attach(a: Attach) -> Option<i32> {
 
 fn maybe_attach_daemon(argv: &[String], bin: &std::path::Path, t: Transport, shared: bool) -> Option<i32> {
     let cwd = std::env::current_dir().ok()?;
-    let root = invocation_tree(&cwd, argv, checkout_root().is_some())?;
+    let root = invocation_tree(&cwd, argv)?;
 
     match try_attach(&root, argv, shared) {
         Attach::Exit(code) => Some(code),
@@ -798,6 +798,17 @@ fn supports_shared_vm(dest: &std::path::Path) -> bool {
     payload_vm_source(dest, "paths.bl").is_some_and(|t| t.contains(SHARED_VM_MARKER))
 }
 
+/// Current command VMs can skip service startup and remain until explicitly stopped.
+fn supports_command_vm(dest: &std::path::Path) -> bool {
+    payload_vm_source(dest, "session.bl")
+        .is_some_and(|text| text.contains("(get opts :commands-only)"))
+}
+
+fn command_vm_for(bin: &std::path::Path) -> bool {
+    checkout_root().is_some() || try_read_trailer(bin)
+        .is_some_and(|t| supports_command_vm(&install_dir().join(sha8_of(&t))))
+}
+
 /// Whether the payload at `dest` can be started in the background without leaving a
 /// VM that never ends.
 fn supports_background_start(dest: &std::path::Path) -> bool {
@@ -850,7 +861,7 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
     #[cfg(unix)]
     {
         let cwd = std::env::current_dir().ok();
-        let root = cwd.as_deref().and_then(|c| invocation_tree(c, &argv, checkout_root().is_some()));
+        let root = cwd.as_deref().and_then(|c| invocation_tree(c, &argv));
         // Read the project's env.bl ONCE: `--share-vm`/`--own-vm` or the `:vm`
         // declaration decides the endpoint for this whole invocation (the default
         // is own). The declaration is read from the nearest env.bl at or above
@@ -963,6 +974,18 @@ mod gc_tests {
         assert!(!supports_background_start(&without), "no idle.bl: it would never end");
         let _ = std::fs::remove_dir_all(&with);
         let _ = std::fs::remove_dir_all(&without);
+    }
+
+    #[test]
+    fn command_only_startup_requires_payload_support() {
+        let dest = payload_with_paths("commands", "");
+        assert!(!supports_command_vm(&dest));
+        let source = dest.join("lib/beam_lisp-0.1.0/priv/std/vm/session.bl");
+        std::fs::write(&source, "(ns vm.session)").unwrap();
+        assert!(!supports_command_vm(&dest));
+        std::fs::write(&source, "(get opts :commands-only)").unwrap();
+        assert!(supports_command_vm(&dest));
+        let _ = std::fs::remove_dir_all(dest);
     }
 
     #[test]
