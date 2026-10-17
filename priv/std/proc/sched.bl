@@ -170,7 +170,7 @@
   (let [freq (:freq rule)]
     (cond
       (= freq :every) (+ now (:ms rule))
-      (= freq :at) (:ms rule)
+      (= freq :at) (:ms rule)                ; nil = a dynamic one-shot not yet set
       (= freq :daily) (let [h (first (:at rule)) m (second (:at rule))
                             today (daily-ms now h m)]
                         (if (>= today now) today (+ today 86400000)))
@@ -685,7 +685,8 @@
    ;; five percent of it is six WEEKS, not five percent of a period, and the
    ;; wheel then arms a season away. Measured: an `(every 60 :ms … :jitter 0.05)`
    ;; schedule sat 688 days out and never fired.
-   :due (+ now (jitter-ms (- (first-due rule now) now) (get opts :jitter 0)))
+   :due (let [d (first-due rule now)]
+          (when (some? d) (+ now (jitter-ms (- d now) (get opts :jitter 0)))))
    :last-occ nil
    :runs 0
    :fails 0
@@ -716,6 +717,7 @@
        (let [d (- due (clock))
              d (if (< d 1) 1 d)]
          (tick/tick-arm d {:name :sched})
+         (erlang/put :bl-sched/armed-at due)
          d)))))
 
 ;; ── the run ─────────────────────────────────────────────────────────────
@@ -732,7 +734,7 @@
   (let [occ (str (name (:id sched)) "@" due)
         one-shot? (= :at (:freq (:rule sched)))]
     (if (or (= occ (:last-occ sched))
-            (and one-shot? (some? (:last-occ sched))))
+            (and one-shot? (not (:dynamic? sched)) (some? (:last-occ sched))))
       sched                                  ; already run — at-most-once effect
       (let [opts (:opts sched)
             on-error (get opts :on-error :stop)]
@@ -891,7 +893,10 @@
                          (fn [m [id d]]
                            (let [fresh (empty-schedule id (:rule d) (:run d) (:opts d) now)
                                  rec (read-record srv id)]
-                             (assoc m id (if (nil? rec) fresh (merge fresh rec)))))
+                             (assoc m id (let [s (if (nil? rec) fresh (merge fresh rec))]
+                                           (if (nil? (:ms (:rule d)))
+                                             (assoc s :dynamic? true :rule {:freq :at :ms (:due s)})
+                                             s)))))
                          {}
                          decls)}]
     (persist! st)
@@ -915,7 +920,7 @@
                           due (if (and (some? rec) (some? (:due rec)))
                                 (:due rec)
                                 (first-due (:rule d0) now))]
-                      (if paused
+                      (if (or paused (nil? due))
                         acc
                         (if (or (nil? acc) (< due acc)) due acc))))
                   nil
@@ -923,7 +928,8 @@
         d (if (and (some? d) (< d now)) now d)]
     (when (some? d)
       (let [delay (- d now)]
-        (tick/tick-arm (if (< delay 1) 1 delay) {:name :sched})))))
+        (tick/tick-arm (if (< delay 1) 1 delay) {:name :sched})
+        (erlang/put :bl-sched/armed-at d)))))
 
 (defn summary
   "Every schedule, its rule, its policy, where it stands, and how long until it
@@ -966,6 +972,82 @@
 
 (defn pause-schedule [st id] (set-state st id :paused))
 (defn resume-schedule [st id] (set-state st id :active))
+
+;; ── dynamic deadlines: set from the owner's own state ──────────────────
+;;
+;; A declared `(at nil :id handler)` is a one-shot whose instant is a fact about
+;; the OWNER (the earliest pending reminder, the next boundary of a time-bounded
+;; fact) rather than about the code. The owner sets it from any callback with
+;; `schedule-at`, which returns the new state AND re-points the single wake (the
+;; timer is process state, and a callback runs in the owning process), so a
+;; callback never calls `arm` itself.
+;; An id that was not declared may be scheduled ad hoc by passing its handler;
+;; ad-hoc entries live in the process only and are never persisted.
+
+(defn armed-at
+  "The epoch-ms the single sched wake is armed for in THIS process, or nil."
+  []
+  (let [v (erlang/get :bl-sched/armed-at)]
+    (when-not (= :undefined v) v)))
+
+(defn rearm
+  "Re-point the single wake at the earliest due of `st`, or cancel it when
+   nothing is due. Cheap when nothing moved, so the clause calls it after every
+   callback. Returns `st`."
+  [st]
+  (let [due (next-due-ms (:schedules st))
+        armed (armed-at)]
+    (cond
+      (= due armed) st
+      (nil? due) (do (tick/tick-cancel :sched) (erlang/erase :bl-sched/armed-at) st)
+      :else (do (arm st) st))))
+
+(defn persist-declared!
+  "`persist!` for declared schedules only: ad-hoc dynamic entries are process
+   state, not declarations, and are never written.
+
+   `persist!` drops nil fields (nil is not a retraction of an outcome), so a
+   dynamic deadline that was CLEARED or SPENT would leave its old `:due` in the
+   store and come back on restart. Retract it explicitly."
+  [st]
+  (let [declared (into {} (remove (fn [[_ s]] (:adhoc? s)) (:schedules st)))]
+    (persist! (assoc st :schedules declared))
+    (doseq [[id s] declared]
+      (when (and (:dynamic? s) (nil? (:due s)))
+        (let [k (key-of (:server st) id)
+              stored (datom/pull (datom/db (conn)) [:db/id :schedule/due] [:schedule/key k])]
+          (when (some? (:schedule/due stored))
+            (datom/transact! (conn) [[:db/retract (:db/id stored) :schedule/due (:schedule/due stored)]]))))))
+  st)
+
+(defn schedule-at
+  "Set `id`'s deadline to `ms` (epoch-ms; nil clears it). A declared schedule
+   keeps its handler; an undeclared id needs `run`. Returns the new state."
+  ([st id ms] (schedule-at st id ms nil))
+  ([st id ms run]
+   (let [s (get (:schedules st) id)
+         now ((:clock st))
+         s (cond
+             (some? s) s
+             (some? run) (assoc (empty-schedule id {:freq :at :ms nil} run {:catch-up :coalesce} now)
+                                :adhoc? true)
+             :else (throw (ex-info (str "sched: no schedule " id " — declare (at nil " id
+                                        " handler) or pass a handler")
+                                   {:id id :known (vec (keys (:schedules st)))})))
+         s (assoc s :rule {:freq :at :ms ms} :due ms :dynamic? true :last-occ nil :state :active)
+         st (rearm (assoc st :schedules (assoc (:schedules st) id s)))]
+     ;; A deadline is a FACT about the owner: write it where it is set, so a
+     ;; plain callback that returns this state needs no persistence step of its
+     ;; own, and a restart resumes from it (ad-hoc ids are never written).
+     (when-not (:adhoc? s) (persist-declared! (assoc st :schedules {id s})))
+     st)))
+
+(defn unschedule
+  "Clear `id`'s deadline (it stays declared, holding no wake). Returns the state."
+  [st id]
+  (if (contains? (:schedules st) id)
+    (schedule-at st id nil)
+    st))
 
 (defn run-now-state
   "Fire `id`'s CURRENT due out of band. The occurrence id is the one it was
@@ -1047,6 +1129,17 @@
 
 (defn resume [h id] (call h [:sched/resume id]))
 
+(defn at!
+  "Set a declared schedule's deadline from outside the server (epoch-ms, or nil
+   to clear it). The wake is re-pointed and the deadline persisted."
+  [h id ms]
+  (call h [:sched/at id ms]))
+
+(defn cancel!
+  "Clear `id`'s deadline: it stays declared, holding no wake."
+  [h id]
+  (call h [:sched/cancel id]))
+
 (defn run-now
   "Fire `id` out of band, with the occurrence id of the due it was on. A
    `run-now` therefore does NOT create a second occurrence — the next scheduled
@@ -1103,7 +1196,8 @@
              (if (proc.tick/tick-current? ~tick-name n#)
                (let [clk# (:clock st#)
                      now# (clk#)
-                     st2# (proc.sched/persist!
+                     _# (erlang/erase :bl-sched/armed-at)
+                     st2# (proc.sched/persist-declared!
                             (assoc st# :schedules
                                    (proc.sched/fire! (:schedules st#) now#)))]
                  (proc.sched/arm st2#)
@@ -1123,6 +1217,14 @@
                (proc.sched/arm st2#)
                (reply id# st2#)))
           `(handle-call [:sched/run-now id#] [_from# st#]
-             (reply id# (proc.sched/persist! (proc.sched/run-now-state st# id#))))]})))))
+             (reply id# (proc.sched/persist! (proc.sched/run-now-state st# id#))))
+          `(handle-call [:sched/at id# ms#] [_from# st#]
+             (if (contains? (:schedules st#) id#)
+               (let [st2# (proc.sched/persist-declared! (proc.sched/schedule-at st# id# ms#))]
+                 (reply {:ok true :id id# :at ms#} st2#))
+               (reply {:error {:unknown id# :known (vec (keys (:schedules st#)))}} st#)))
+          `(handle-call [:sched/cancel id#] [_from# st#]
+             (reply :ok (proc.sched/persist-declared! (proc.sched/unschedule st# id#))))]
+         })))))
 
 (extend-clause! :sched sched-clause)
