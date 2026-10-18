@@ -880,10 +880,22 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
             let config = std::fs::read_to_string(config_path()).ok();
             checkout_transport(&argv, env_bl.as_deref(), config.as_deref())
         } else {
-            effective_transport(
-                root.as_deref().map(|r| transport(r, &argv, shared)).unwrap_or_else(|| default_transport(shared)),
-                supports_background_start(dest),
-            )
+            // A payload whose VM serves commands only (no UI, no schedules,
+            // memory-bounded, stopped by `bl realm stop`) is started for a
+            // project by default, exactly as a checkout's is: otherwise every
+            // `bl run` of an installed drop paid a full cold boot plus a cold
+            // library load, 10-50 s, unless the user knew to pass `--warm`.
+            let own_default = if supports_command_vm(dest) { Transport::Start } else { default_transport(shared) };
+            let wanted = match root.as_deref() {
+                Some(r) => {
+                    let tree_text = std::fs::read_to_string(r.join(PROJECT_FILE)).ok();
+                    let config_text = std::fs::read_to_string(config_path()).ok();
+                    declared_transport(&argv, tree_text.as_deref(), config_text.as_deref())
+                        .unwrap_or(if shared { default_transport(true) } else { own_default })
+                }
+                None => default_transport(shared),
+            };
+            effective_transport(wanted, supports_background_start(dest))
         };
         if t != Transport::Cold && service_requested(&argv, env_bl.as_deref()) {
             t = Transport::Require;
