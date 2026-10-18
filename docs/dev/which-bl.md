@@ -94,10 +94,10 @@ changes the source key and turns every following run into a stale-floor error.
    `aot/` empty: it is rebuilt from source. Never delete shared `~/.cache/beam_lisp/aot`
    entries to "clean" — other trees' beams live there too.
 4. **Change host or boot source, then regenerate the floor once, at the end,**
-   from the tree itself:
-   `BL_BOOTSTRAP_OUTPUT=… ./bin/bl run scripts/regenerate-seed.bl`, then
-   `BL_BOOTSTRAP_SEED=…/seed ./bin/bl run scripts/install-seed.bl`, then
-   `./bin/bl seed --check`. Before that, host-leaf changes are tested in a child
+   from the tree itself: `BL_BOOTSTRAP_INSTALL=1 scripts/regenerate-seed`, then
+   `./bin/bl seed --check`. It runs in a bare capped VM (`bl run` cannot
+   regenerate) and prints per-phase timings; see `docs/bootstrap-regeneration.org`.
+   Before that, host-leaf changes are tested in a child
    VM against beams compiled from the current source
    (`test/bl/namespace_readiness_fast_path_test.bl` shows the pattern).
 
