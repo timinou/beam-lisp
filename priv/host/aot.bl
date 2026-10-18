@@ -1479,6 +1479,42 @@
 (defn- physical_sdk_path [path]
   ;; Resolve every component. An SDK-shaped path escaping through a symlink is
   ;; not compiler evidence of SDK ownership.
+  ;;
+  ;; A cold `datom` load asked this ~46,000 times (~68 per path), each a
+  ;; file-server readlink per component: about 20 s. A directory's resolution
+  ;; is remembered for this VM with that directory's own lstat identity
+  ;; (type, ctime, inode); a hit re-lstats only it, and the leaf is always
+  ;; checked live. Both go through prim_file, not the file server, which
+  ;; serializes behind one dirty-IO scheduler. Replacing an ANCESTOR of a
+  ;; resolved directory with a symlink during the VM's life is not re-detected:
+  ;; doing that requires write access to the SDK image, which already confers
+  ;; code execution in this VM.
+  (when (and (erlang/is_binary path) (File/exists? path))
+    (let [expanded (Path/expand path)
+          dir (physical_dir_cached (Path/dirname expanded))
+          leaf (when dir (Path/join dir (Path/basename expanded)))
+          info (when leaf (prim_file/read_link_info leaf))]
+      (if (and info (erlang/== :ok (elem info 0)) (erlang/not (erlang/== :symlink (elem (elem info 1) 2))))
+        leaf
+        (physical_sdk_path_walk path)))))
+
+(defn- lstat_identity [p]
+  (let [r (prim_file/read_link_info p (list (tuple :time :posix)))]
+    (when (erlang/== :ok (elem r 0))
+      ;; file_info: type 3, ctime 8, inode 12
+      (tuple (elem (elem r 1) 2) (elem (elem r 1) 7) (elem (elem r 1) 11)))))
+
+(defn- physical_dir_cached [dir]
+  (let [key (tuple :Elixir.BeamLisp.AOT :physical_dir dir)
+        hit (persistent_term/get key nil)
+        identity (lstat_identity dir)]
+    (if (and hit identity (erlang/== identity (elem hit 1)))
+      (elem hit 0)
+      (let [resolved (physical_sdk_path_walk dir)]
+        (when (and resolved identity) (persistent_term/put key (tuple resolved identity)))
+        resolved))))
+
+(defn- physical_sdk_path_walk [path]
   (when (and (erlang/is_binary path) (File/exists? path))
     (loop [parts (erlang/tl (Path/split (Path/expand path))) current "/" links 0 steps 0]
       (when (and (erlang/=< links 32) (erlang/< steps 512))
@@ -4547,14 +4583,43 @@
 (defn sdk_preinit_floor_ready?
   "Native current-floor producer proof; never a public SDK or Source grant.
    A different-key seed is the supported previous-generation recovery path.
-   A matching-key producer with changed bytes or missing metadata refuses."
+   A matching-key producer with changed bytes or missing metadata refuses.
+
+   Asked on every library-load decision; the proof reads and hashes ~14 seed
+   beams and host sources. A TRUE answer is remembered under exactly its
+   inputs: the manifest, the toolchain stamp, the seed directory's and
+   host directory's file stamps, and the loaded md5 of every module it checks.
+   Any change recomputes; a refusal is never remembered."
   []
+  (let [inputs (sdk_preinit_inputs)
+        hit (persistent_term/get :bl_sdk_preinit_ready nil)]
+    (if (and hit (erlang/== inputs hit))
+      true
+      (let [ready (sdk_preinit_floor_ready_uncached?)]
+        (when (erlang/== true ready) (persistent_term/put :bl_sdk_preinit_ready inputs))
+        ready))))
+
+(defn- sdk_preinit_inputs []
+  (let [stamp (fn [dir] (erlang/phash2 (Enum/map (Enum/sort (Path/wildcard (Path/join dir "*")))
+                (fn [p] (let [r (prim_file/read_file_info p (list (tuple :time :posix)))]
+                          (if (erlang/== :ok (elem r 0)) (tuple p (elem (elem r 1) 1) (elem (elem r 1) 5)) p))))))
+        mods (list :Elixir.BeamLisp.AOT :Elixir.BeamLisp.Loader :Elixir.BeamLisp.Env :Elixir.BeamLisp.Compiler
+                   :Elixir.BeamLisp.Emit :Elixir.BeamLisp.Record :Elixir.BeamLisp.AOTCache :Elixir.BeamLisp.CompilerData
+                   :Elixir.BeamLisp.Tiers :Elixir.BeamLisp.Bootstrap :Elixir.BeamLisp.Ns.Rt :Elixir.BeamLisp.Ns.Compiler
+                   :Elixir.BeamLisp.Ns.Core)]
+    (erlang/phash2
+      (tuple (BeamLisp.Bootstrap/manifest) (BeamLisp.Env/live_toolchain_keys)
+             (stamp (BeamLisp.Bootstrap/seed_dir)) (stamp (Path/join (BeamLisp.Tiers/priv_root) "host"))
+             (Enum/map mods (fn [m] (when (erlang/module_loaded m) (erlang/apply m :module_info (list :md5)))))))))
+
+(defn- sdk_preinit_floor_ready_uncached? []
   (let [manifest (BeamLisp.Bootstrap/manifest)]
     (if (or (erlang/== nil manifest)
             (erlang/not (BeamLisp.Bootstrap/key_matches? manifest))) false
       (let [root (BeamLisp.Tiers/priv_root)]
-        (when-not (and (erlang/== (BeamLisp.AOTCache/current_compiler_key) (Map/get manifest "compiler_key"))
-                       (erlang/== (BeamLisp.AOTCache/current_build_key) (Map/get manifest "build_key")))
+        (when-not (let [keys (BeamLisp.Env/live_toolchain_keys)]
+                    (and (erlang/== (elem keys 0) (Map/get manifest "compiler_key"))
+                         (erlang/== (elem keys 1) (Map/get manifest "build_key"))))
           (erlang/error :sdk_preinit_toolchain_changed))
         ;; Exactly the actual producer/kernel dependencies, not a name-prefix
         ;; grant or a walk of every SDK function body. Full lifetime admission
@@ -7164,7 +7229,7 @@
     (constructor_interpret (constructor_global_source namespace binding) {} state)))))
 
 (defn- constructor_check_sources! []
- (when-not (= (:compiler-key (:input (constructor_context!))) (BeamLisp.AOTCache/current_compiler_key))
+ (when-not (= (:compiler-key (:input (constructor_context!))) (elem (BeamLisp.Env/live_toolchain_keys) 0))
   (stage-refuse :sdk-constructor-compiler-changed))
  (Enum/each (Map/to_list (Map/get (constructor_context!) :source-paths {}))
   (fn [selection]
