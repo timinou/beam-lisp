@@ -226,7 +226,9 @@
    (let [module (Keyword/fetch! opts :module)]
      (validate_host_module! module)
      (let [output_dir (Keyword/fetch! opts :output_dir)
-           file (Keyword/get opts :file path)
+           ;; A pinned HOST beam is a floor artifact: root-relative source
+           ;; attribution, so a rebuild from another worktree is byte-identical.
+           file (floor_source (Keyword/get opts :file path))
            load? (Keyword/get opts :load? true)
            struct_fields (validate_struct_fields! (Keyword/get opts :struct_fields nil))]
        (BeamLisp.Loader/with_load_path (Path/dirname path)
@@ -344,8 +346,9 @@
 
 (defn- host_attrs
   "The module attributes a pinned descriptor carries: `-behaviour` and, when the
-   caller supplies it, the provenance pair `-bl_source_hash` /
-   `-bl_compiler_key`."
+   caller supplies it, `-bl_source_hash`. A pinned HOST beam is a floor artifact:
+   its bytes are attested by the seed manifest's sha256, so it carries no
+   per-beam compiler key."
   [opts]
   (let [behaviour
         (let [b (Keyword/get opts :behaviour nil)]
@@ -362,8 +365,7 @@
           (cond
             (nil? h) (list)
             (erlang/is_binary h)
-              (list (list :bl_source_hash h)
-                    (list :bl_compiler_key (BeamLisp.AOTCache/compiler_key)))
+              (list (list :bl_source_hash h))
             :else
               (erlang/error
                 (Elixir.ArgumentError/exception
@@ -621,7 +623,11 @@
   (BeamLisp.Env/in_ns "user")
   (BeamLisp.Compiler/reset_fresh!)
   (let [file (Keyword/get opts :file nil)
-        forms (BeamLisp.Reader/read_string source file)
+        ;; A floor source is ATTRIBUTED root-relatively (reader positions, the
+        ;; compile env, every annotation) so its beams do not embed where the
+        ;; checkout lives. The real path is still returned for hashing.
+        attributed (if (floor_file? file) (floor_source file) file)
+        forms (BeamLisp.Reader/read_string source attributed)
         defined (unit_defns forms)]
     (Enum/reduce forms "user"
       (fn [form ns]
@@ -653,7 +659,7 @@
                     ;; The private compile token enters only this actual
                     ;; normal producer form, never ordinary Source graph plans.
                     (BeamLisp.Compiler/eval_form form
-                      (Map/put (Map/put env :file file) :aot-normal-declaration-token
+                      (Map/put (Map/put env :file attributed) :aot-normal-declaration-token
                         (Map/get (Process/get :bl_definition_collector) :declaration-token)))
                     (tuple vdefs2 (MapSet/put nss (or (ns_decl form) ns)) nsmeta2))))]
       ; export every def the unit left behind its shim's forwarding handler
@@ -1250,6 +1256,51 @@
    (erlang/error :bootstrap_macro_partition_failed))
   {:checks 11 :captured-arguments 1 :factory-executions 0 :initializers 0 :sdk-authority false}))
 
+;; ── content-addressed floor emission ───────────────────────────────────────
+;;
+;; A FLOOR (boot tier and build driver) beam's BYTES carry no compiler
+;; generation key. Whether a beam is current is a property of the FLOOR it came
+;; from — the seed manifest's per-file sha256, or the build's
+;; `compile.beam_lisp` record — not of an attribute stamped into the beam. So
+;; the emitter writes the source hash and a `:floor` marker instead of the key,
+;; and two generations that compile the same source produce byte-identical
+;; beams. The user/library AOT cache keeps per-beam keys: its addresses ARE the
+;; key, and it is not a floor.
+
+(defn- floor_tier?
+  "Whether `ns` belongs to a floor tier whose bytes are content-addressed by a
+   manifest claim rather than a per-beam compiler key."
+  [ns]
+  (let [tier (BeamLisp.Tiers/tier_of_ns ns)]
+    (or (erlang/== tier :boot) (erlang/== tier :build))))
+
+(defn- floor_source
+  "The source path a FLOOR beam records, ROOT-RELATIVE (`priv/boot/core.bl`), so a
+   floor built from another checkout is byte-identical. Only a file whose tree
+   `priv` IS this image's `priv` (same physical directory: the image links it) is
+   rewritten; anything else is returned exactly as given."
+  [file]
+  (if (erlang/not (erlang/is_binary file)) file
+    (let [parts (binary/matches file "/priv/")]
+      (if (erlang/== parts (list)) file
+        (let [at (elem (lists/last parts) 0)
+              tree (binary/part file 0 at)
+              here (File/stat (Path/join tree "priv"))
+              image (File/stat (BeamLisp.Tiers/priv_root))]
+          (if (and (erlang/== :ok (elem here 0)) (erlang/== :ok (elem image 0))
+                   (erlang/== (Map/get (elem here 1) :inode) (Map/get (elem image 1) :inode))
+                   (erlang/== (Map/get (elem here 1) :major_device) (Map/get (elem image 1) :major_device)))
+            (binary/part file (erlang/+ at 1) (erlang/- (erlang/byte_size file) (erlang/+ at 1)))
+            file))))))
+
+(defn- floor_file?
+  "Whether `file` is compiled INTO the floor: a toolchain source (boot/build tier)
+   or the floor's std prelude `multi`."
+  [file]
+  (and (erlang/is_binary file)
+       (or (BeamLisp.Tiers/toolchain_source? file)
+           (String/ends_with? file "/priv/std/multi.bl"))))
+
 (defn- emit_module
   "Emit a namespace as the SAME shim/body split the runtime uses, so an
    AOT-loaded namespace is byte-for-byte the source-loaded one. Returns every
@@ -1262,16 +1313,24 @@
 (defn- emit_module_unfenced
   [ns value_defs ns_meta output_dir file unit_names input_digest declarations]
   (let [mod (BeamLisp.Emit/module_for ns)
-        filename (or file (erlang/iolist_to_binary (list "beam_lisp_aot/" ns ".bl")))
+        floor? (floor_tier? ns)
+        filename (if (floor_file? file)
+                   (floor_source file)
+                   (or file (erlang/iolist_to_binary (list "beam_lisp_aot/" ns ".bl"))))
         raw_defs (unit_defs ns unit_names)
         previous (sdk_callable_rebindings ns raw_defs declarations)
         stable_defs (stabilise_body_modules ns raw_defs)
         source_hash (if file (ns_closure_hash ns file) nil)
-        stamp_key (BeamLisp.AOTCache/key_for_ns ns)
-        unit_attrs (list (tuple :bl_source_hash source_hash) (tuple :bl_compiler_key stamp_key)
-                         (tuple :bl_unit_source_digest input_digest)
-                         (tuple :bl_aot_artifact_version 1)
-                         (tuple :bl_unit_namespace ns))
+        ;; FLOOR beams carry no generation key: the manifest claim names their
+        ;; bytes. Library beams keep the key — the user AOT cache is keyed by it.
+        stamp_key (when-not floor? (BeamLisp.AOTCache/key_for_ns ns))
+        provenance_key (if floor? :floor stamp_key)
+        unit_attrs (erlang/++
+                     (list (tuple :bl_source_hash source_hash)
+                           (tuple :bl_unit_source_digest input_digest)
+                           (tuple :bl_aot_artifact_version 1)
+                           (tuple :bl_unit_namespace ns))
+                     (if floor? (list) (list (tuple :bl_compiler_key stamp_key))))
         init_pair (build_init_ast ns mod stable_defs value_defs ns_meta unit_attrs declarations)
         partitioned (partition_macro_values ns stable_defs (elem init_pair 0) (elem init_pair 1) unit_attrs)
         ns_defs (elem partitioned 0)
@@ -1282,7 +1341,7 @@
                           (if macro_descriptor (list (BeamLisp.Emit/compile_descriptor macro_descriptor)) (list)))
         provenance_clause (BeamLisp.Emit/function_clause :__bl_provenance__
                             {:op :tuple :elems (list (BeamLisp.Emit/lit source_hash)
-                                                     (BeamLisp.Emit/lit stamp_key)) :ann {}})
+                                                     (BeamLisp.Emit/lit provenance_key)) :ann {}})
         namespace_clauses
         (Enum/map
           (erlang/++ (BeamLisp.Emit/shim_clauses ns ns_defs)
@@ -1292,12 +1351,14 @@
                            (BeamLisp.Emit/function_clause :__bl_ns_defs__ (BeamLisp.Emit/lit ns_defs))
                            init_clause))
           (fn [clause]
-            (let [ann (Map/merge {:file filename :line 1}
-                                 (Map/get (get clause :body) :ann {}))]
+            (let [ann (Map/put (Map/merge {:file filename :line 1}
+                                 (Map/get (get clause :body) :ann {}))
+                               :file filename)]
               (Map/put clause :body (Map/put (get clause :body) :ann ann)))))
         namespace_descriptor
         (BeamLisp.Emit/descriptor_for mod namespace_clauses
-          (list (tuple :bl_source_hash source_hash) (tuple :bl_compiler_key stamp_key)
+          (erlang/++
+            (list (tuple :bl_source_hash source_hash)
                 ;; A previous pinned emitter can stamp new live source keys.
                 ;; Verify the actual replay format independently of that key.
                 (tuple :bl_aot_replay_version 1)
@@ -1320,6 +1381,7 @@
                     (fn [entry] (Enum/map (elem entry 1)
                       (fn [d] (tuple (tuple (elem d 2) (erlang/length (Map/get (elem d 3) :params)))
                                      (elem d 4)))))))))
+            (if floor? (list) (list (tuple :bl_compiler_key stamp_key))))
           {:file filename})
         body_descriptors
         (Enum/map (BeamLisp.Emit/body_modules ns_defs)
@@ -1961,6 +2023,15 @@
             (let [mfa (elem entry 0) key (tuple (elem mfa 0) (elem mfa 1)) kind (elem entry 1)]
              (Map/update out key kind (fn [old] (sdk_merge_target_kind old kind))))))}))
 
+;; A library beam names its generation in `bl_compiler_key`. A FLOOR (boot/build
+;; tier) beam names none — its floor's claim does — so for it only the floor
+;; question applies, answered by the caller's floor check.
+(defn- sdk_generation_matches? [attrs source root]
+  (let [stamped (normalized_attribute attrs :bl_compiler_key)]
+    (if (and (nil? stamped) (BeamLisp.Tiers/toolchain_source? source root))
+      true
+      (erlang/== stamped (BeamLisp.AOTCache/key_for_source source root)))))
+
 (defn sdk_artifact_entry!
   "Compiler/build-owned inventory row for one emitted BEAM. Includes the exact
    input bytes and executable identity; a filename or namespace prefix alone
@@ -2013,8 +2084,7 @@
     ;; A server's source-input stamp is mandatory. Body/companion modules are
     ;; bound to their source by the authoritative emitting unit/manifest.
     (when (and owner (or (erlang/== nil stamped)
-                        (erlang/not (erlang/== (normalized_attribute attrs :bl_compiler_key)
-                                               (BeamLisp.AOTCache/key_for_source source root)))
+                        (erlang/not (sdk_generation_matches? attrs source root))
                         (erlang/not (erlang/== 1 (normalized_attribute attrs
                           (if (erlang/== role :generated-class) :bl_generated_class_version :bl_generated_actor_version))))))
       (erlang/error :sdk_inventory_missing_or_stale_actor_stamp))
@@ -2045,8 +2115,7 @@
                          (normalized_attribute attrs :bl_aot_forwarder_namespace))
                        (erlang/== input_digest stamped)
                        (erlang/== (normalized_attribute attrs :bl_unit_namespace) (elem declarations 1))
-                       (erlang/== (normalized_attribute attrs :bl_compiler_key)
-                                  (BeamLisp.AOTCache/key_for_source source root)))))
+                       (sdk_generation_matches? attrs source root))))
         (erlang/error :sdk_inventory_invalid_declaration_metadata))
       (verify_sdk_forwarder! (tuple mod bytes)
         (normalized_attribute attrs :bl_aot_forwarder_namespace)
@@ -4310,6 +4379,14 @@
         (IO/puts :stderr "bl: rebuild the tier as a unit:  bl build && bl seed"))
       nil)))
 
+(defn- floor_claim_current?
+  "Whether the FLOOR a loaded keyless `mod` came from claims it under the live
+   tier key (`Bootstrap/loaded_claimed?`): the seed manifest or the build record
+   is the authority, never an attribute of the beam."
+  [ns tier mod]
+  (BeamLisp.Bootstrap/loaded_claimed? mod
+    (if (erlang/== tier :build) (BeamLisp.AOTCache/build_key) (BeamLisp.AOTCache/compiler_key))))
+
 (defn- tier_key_moved?
   "Has the namespace's TIER key moved since its beam was stamped?"
   [tier beam_key]
@@ -4368,7 +4445,9 @@
                   (strict_aot?) (erlang/error (Elixir.RuntimeError/exception
                                                 (stale_beam_error ns mod beam_hash src_hash)))
                   :else true))))
-          (tier_key_moved? tier beam_key))))))
+          (if (erlang/== beam_key :floor)
+            (erlang/not (floor_claim_current? ns tier mod))
+            (tier_key_moved? tier beam_key)))))))
 
 (defn beam_provenance
   "The `{hash, key}` provenance of a module's beam, or nil when it carries none.

@@ -1,0 +1,559 @@
+#!/usr/bin/env escript
+%%! -noshell +A 2
+%%
+%% floor-diff — classify the differences between two bootstrap floor directories.
+%%
+%% A floor is a flat directory of .beam files plus beam_lisp.app and
+%% manifest.term.  Regenerating a floor on the same sources normally rewrites
+%% every beam because the source root is embedded in CInf/Line and, for
+%% generated shims, in literal strings; those differences are noise.  This tool
+%% separates that noise from actual compiler output changes so regeneration can
+%% be judged for determinism and convergence.
+%%
+%% Usage:
+%%   scripts/floor-diff A_DIR B_DIR [--verbose] [--json] [--quiet]
+%%                     [--root-a PREFIX] [--root-b PREFIX]
+%%                     [--key-a HEX] [--key-b HEX]
+%%
+%% Exit status: 0 when every beam is identical after normalization (or differs
+%% only in paths / compiler keys / attribute vsn), 1 when at least one beam has
+%% a real difference or the inventories differ, 2 on usage/IO error.
+%%
+%% Classification (per beam):
+%%   identical    byte-identical files
+%%   normal-only  every differing chunk is accounted for by the embedded source
+%%                root (CInf/Line), the compiler key (Attr bl_compiler_key or
+%%                literal strings such as __bl_provenance__), or the Attr vsn
+%%                (module md5, which follows any content change).  Categories:
+%%                path (CInf/Line), literal (LitT strings), vsn (Attr vsn),
+%%                compiler_key (Attr bl_compiler_key changed)
+%%   real         at least one chunk still differs after normalizing roots and
+%%                keys.  Code differences are summarised with beam_disasm by
+%%                function; LitT differences are reported as literal
+%%                count/first-index.  `code_equal: true` means FunT/AtU8/LocT
+%%                changed but the instruction stream itself did not.
+%%
+%% Normalization:
+%%   * CInf, Attr, LitT, Dbgi, Docs and other term chunks are decoded and
+%%     rewritten value-by-value (so embedded string length prefixes stay
+%%     valid) with the source root replaced by <ROOT> and the compiler key by
+%%     <COMPILER_KEY>.
+%%   * The Line chunk is the line table and always carries the source path in
+%%     its trailing filename entry; it is classified as path information.
+%%   * Code/AtU8/ImpT/... are compared as raw bytes.
+%%   The source root is derived from each beam's CInf {source, Path} unless
+%%   --root-a/--root-b is given; the compiler key is read from each floor's
+%%   manifest.term unless --key-a/--key-b is given.
+
+-mode(compile).
+
+main(Args) ->
+    case parse_args(Args, #{verbose => false, json => false, quiet => false,
+                            root_a => undefined, root_b => undefined,
+                            key_a => undefined, key_b => undefined}) of
+        {ok, DirA, DirB, Opts0} ->
+            try
+                A = inventory(DirA),
+                B = inventory(DirB),
+                Opts = Opts0#{key_a => pick_key(maps:get(key_a, Opts0), DirA),
+                              key_b => pick_key(maps:get(key_b, Opts0), DirB)},
+                halt(run(DirA, DirB, A, B, Opts))
+            catch
+                Class:Reason:Stack ->
+                    io:format(standard_error, "floor-diff: ~p:~p~n~p~n",
+                              [Class, Reason, Stack]),
+                    halt(2)
+            end;
+        {error, Why} ->
+            io:format(standard_error, "floor-diff: ~s~n~n~s~n", [Why, usage()]),
+            halt(2)
+    end.
+
+usage() ->
+    "usage: floor-diff A_DIR B_DIR [--verbose] [--json] [--quiet]\n"
+    "                   [--root-a PREFIX] [--root-b PREFIX]\n"
+    "                   [--key-a HEX] [--key-b HEX]".
+
+%% ---------------------------------------------------------------------------
+%% Arguments
+%% ---------------------------------------------------------------------------
+
+parse_args(Args, Opts) -> parse_args(Args, Opts, []).
+
+parse_args([], _Opts, [A, B]) -> {ok, B, A, _Opts};
+parse_args([], _Opts, _Acc) -> {error, "two floor directories are required"};
+parse_args(["--help" | _], _Opts, _Acc) -> {error, usage()};
+parse_args(["-h" | _], _Opts, _Acc) -> {error, usage()};
+parse_args(["--verbose" | Rest], Opts, Acc) ->
+    parse_args(Rest, Opts#{verbose => true}, Acc);
+parse_args(["--json" | Rest], Opts, Acc) ->
+    parse_args(Rest, Opts#{json => true}, Acc);
+parse_args(["--quiet" | Rest], Opts, Acc) ->
+    parse_args(Rest, Opts#{quiet => true}, Acc);
+parse_args(["--root-a", V | Rest], Opts, Acc) ->
+    parse_args(Rest, Opts#{root_a => list_to_binary(V)}, Acc);
+parse_args(["--root-b", V | Rest], Opts, Acc) ->
+    parse_args(Rest, Opts#{root_b => list_to_binary(V)}, Acc);
+parse_args(["--key-a", V | Rest], Opts, Acc) ->
+    parse_args(Rest, Opts#{key_a => list_to_binary(V)}, Acc);
+parse_args(["--key-b", V | Rest], Opts, Acc) ->
+    parse_args(Rest, Opts#{key_b => list_to_binary(V)}, Acc);
+parse_args(["--" | Rest], Opts, Acc) ->
+    parse_args(Rest, Opts, Acc);
+parse_args([[$- | _] = Bad | _Rest], _Opts, _Acc) ->
+    {error, "unknown option " ++ Bad};
+parse_args([Dir | Rest], Opts, Acc) ->
+    case Acc of
+        [] -> parse_args(Rest, Opts, [Dir]);
+        [_] -> parse_args(Rest, Opts, [Dir | Acc]);
+        _ -> {error, "too many directories"}
+    end.
+
+%% ---------------------------------------------------------------------------
+%% Driver
+%% ---------------------------------------------------------------------------
+
+run(DirA, DirB, A, B, Opts) ->
+    Common = lists:sort([N || N <- maps:keys(A), maps:is_key(N, B)]),
+    OnlyA = lists:sort([N || N <- maps:keys(A), not maps:is_key(N, B)]),
+    OnlyB = lists:sort([N || N <- maps:keys(B), not maps:is_key(N, A)]),
+    Results = [compare_beam(N, maps:get(N, A), maps:get(N, B), Opts) || N <- Common],
+    Summary = summarise(Results),
+    case maps:get(json, Opts) of
+        true -> print_json(DirA, DirB, OnlyA, OnlyB, Results, Summary);
+        false -> print_text(DirA, DirB, OnlyA, OnlyB, Results, Summary, Opts)
+    end,
+    case OnlyA =:= [] andalso OnlyB =:= [] andalso maps:get(real, Summary) =:= 0 of
+        true -> 0;
+        false -> 1
+    end.
+
+inventory(Dir) ->
+    case filelib:is_dir(Dir) of
+        false -> error({not_a_directory, Dir});
+        true -> maps:from_list(walk(Dir))
+    end.
+
+walk(Dir) ->
+    {ok, Names} = file:list_dir(Dir),
+    lists:append([walk_entry(filename:join(Dir, N)) || N <- lists:sort(Names)]).
+
+walk_entry(Path) ->
+    case filelib:is_dir(Path) of
+        true -> walk(Path);
+        false ->
+            case filename:extension(Path) of
+                ".beam" -> [{filename:basename(Path), Path}];
+                _ -> []
+            end
+    end.
+
+pick_key(undefined, Dir) ->
+    Manifest = filename:join(Dir, "manifest.term"),
+    case filelib:is_regular(Manifest) of
+        false -> undefined;
+        true ->
+            case file:consult(Manifest) of
+                {ok, [Map]} when is_map(Map) -> maps:get(<<"compiler_key">>, Map, undefined);
+                _ -> undefined
+            end
+    end;
+pick_key(Key, _Dir) -> Key.
+
+%% ---------------------------------------------------------------------------
+%% One beam pair
+%% ---------------------------------------------------------------------------
+
+compare_beam(Name, PathA, PathB, Opts) ->
+    {ok, BinA} = file:read_file(PathA),
+    {ok, BinB} = file:read_file(PathB),
+    case BinA =:= BinB of
+        true ->
+            #{name => Name, kind => identical};
+        false ->
+            {ok, _ModA, ChunksA0} = beam_lib:all_chunks(PathA),
+            {ok, _ModB, ChunksB0} = beam_lib:all_chunks(PathB),
+            ChunksA = chunk_map(ChunksA0),
+            ChunksB = chunk_map(ChunksB0),
+            CtxA = #{root => choose_root(maps:get(root_a, Opts, undefined), ChunksA),
+                     key => maps:get(key_a, Opts, undefined)},
+            CtxB = #{root => choose_root(maps:get(root_b, Opts, undefined), ChunksB),
+                     key => maps:get(key_b, Opts, undefined)},
+            Ids = lists:usort(maps:keys(ChunksA) ++ maps:keys(ChunksB)),
+            Diff = [Id || Id <- Ids,
+                           maps:get(Id, ChunksA, undefined) =/=
+                           maps:get(Id, ChunksB, undefined)],
+            Real = [Id || Id <- Diff,
+                          Id =/= <<"CInf">>, Id =/= <<"Line">>,
+                          not chunk_equivalent(Id, PathA, PathB, ChunksA, ChunksB, CtxA, CtxB)],
+            Categories = categories(Diff, ChunksA, ChunksB, CtxA, CtxB),
+            case Real of
+                [] ->
+                    #{name => Name, kind => normal_only, chunks => Diff,
+                      categories => Categories};
+                _ ->
+                    Detail = real_detail(PathA, PathB, Real, Opts),
+                    Detail#{name => Name, kind => real, chunks => Real,
+                            path_chunks => [Id || Id <- Diff,
+                                                  Id =:= <<"CInf">> orelse Id =:= <<"Line">>],
+                            categories => Categories}
+            end
+    end.
+
+chunk_map(Chunks) ->
+    maps:from_list([{chunk_id(Id), Data} || {Id, Data} <- Chunks]).
+
+chunk_id(Id) when is_binary(Id) -> Id;
+chunk_id(Id) when is_atom(Id) -> atom_to_binary(Id, utf8);
+chunk_id(Id) when is_list(Id) -> list_to_binary(Id).
+
+%% True when the chunks are equal after removing path/key/format noise.
+%% CInf and Line are handled by the caller (always path noise); Attr and LitT
+%% are decoded so that replacing a string does not corrupt the term encoding.
+chunk_equivalent(<<"Attr">>, _PA, _PB, CA, CB, CtxA, CtxB) ->
+    normal_attr(maps:get(<<"Attr">>, CA, undefined), CtxA) =:=
+    normal_attr(maps:get(<<"Attr">>, CB, undefined), CtxB);
+chunk_equivalent(<<"LitT">>, PA, PB, _CA, _CB, CtxA, CtxB) ->
+    normal_literals(PA, CtxA) =:= normal_literals(PB, CtxB);
+chunk_equivalent(Id, _PA, _PB, CA, CB, CtxA, CtxB) ->
+    %% Remaining differences were already established as raw-unequal by the
+    %% caller.  Decode term chunks (Dbgi/Docs/Meta/Type/...) when possible so
+    %% an embedded path or key is still normalized; byte-oriented chunks
+    %% (Code/AtU8/ImpT/...) are always real.
+    DataA = maps:get(Id, CA, undefined),
+    DataB = maps:get(Id, CB, undefined),
+    case {decode_term(DataA), decode_term(DataB)} of
+        {{ok, TA}, {ok, TB}} ->
+            term_to_binary(norm_term(TA, CtxA)) =:=
+            term_to_binary(norm_term(TB, CtxB));
+        _ -> false
+    end.
+
+normal_attr(undefined, _Ctx) -> undefined;
+normal_attr(Data, Ctx) ->
+    case decode_term(Data) of
+        {ok, Attrs} when is_list(Attrs) ->
+            term_to_binary(norm_term(proplists:delete(vsn, Attrs), Ctx));
+        _ -> Data
+    end.
+
+normal_literals(Path, Ctx) ->
+    case literals(Path) of
+        {ok, Lits} -> [{I, norm_term(V, Ctx)} || {I, V} <- Lits];
+        _ -> unavailable
+    end.
+
+literals(Path) ->
+    try
+        case beam_lib:chunks(Path, [literals]) of
+            {ok, {_Mod, [{literals, Lits}]}} -> {ok, Lits};
+            Other -> {error, Other}
+        end
+    catch _:Why -> {error, Why}
+    end.
+
+decode_term(Data) ->
+    try {ok, binary_to_term(Data)} catch _:_ -> error end.
+
+choose_root(undefined, Chunks) ->
+    case maps:get(<<"CInf">>, Chunks, undefined) of
+        undefined -> undefined;
+        Data ->
+            case decode_term(Data) of
+                {ok, Info} when is_list(Info) ->
+                    case proplists:get_value(source, Info) of
+                        undefined -> undefined;
+                        Source ->
+                            %% <root>/priv/{boot,host,std}/source.bl
+                            Root = filename:dirname(filename:dirname(filename:dirname(Source))),
+                            list_to_binary(Root)
+                    end;
+                _ -> undefined
+            end
+    end;
+choose_root(Root, _Chunks) -> Root.
+
+%% Recursively replace the source root and compiler key in term values.
+%% Charlists are rewritten through their binary form so the term remains
+%% well-formed; term_to_binary regenerates the length prefixes.
+norm_term(Bin, Ctx) when is_binary(Bin) ->
+    norm_bin(Bin, Ctx);
+norm_term(List, Ctx) when is_list(List) ->
+    case is_string(List) of
+        true -> binary_to_list(norm_bin(list_to_binary(List), Ctx));
+        false -> [norm_term(E, Ctx) || E <- List]
+    end;
+norm_term(Tuple, Ctx) when is_tuple(Tuple) ->
+    list_to_tuple([norm_term(E, Ctx) || E <- tuple_to_list(Tuple)]);
+norm_term(Map, Ctx) when is_map(Map) ->
+    maps:from_list([{norm_term(K, Ctx), norm_term(V, Ctx)}
+                    || {K, V} <- maps:to_list(Map)]);
+norm_term(Other, _Ctx) -> Other.
+
+is_string([]) -> false;
+is_string(L) -> lists:all(fun(E) -> is_integer(E) andalso E >= 0 andalso E =< 255 end, L).
+
+norm_bin(Bin, Ctx) ->
+    B1 = replace_all(Bin, maps:get(root, Ctx, undefined), <<"<ROOT>">>),
+    replace_all(B1, maps:get(key, Ctx, undefined), <<"<COMPILER_KEY>">>).
+
+replace_all(Bin, undefined, _Replacement) -> Bin;
+replace_all(Bin, <<>>, _Replacement) -> Bin;
+replace_all(Bin, Pattern, Replacement) ->
+    binary:replace(Bin, Pattern, Replacement, [global]).
+
+%% Normal-only categories: which noise explains the raw difference?
+categories(Diff, CA, CB, _CtxA, _CtxB) ->
+    Keys = [literal || lists:member(<<"LitT">>, Diff)],
+    Paths = [path || lists:member(<<"CInf">>, Diff) orelse lists:member(<<"Line">>, Diff)],
+    Attr = case lists:member(<<"Attr">>, Diff) of
+               false -> [];
+               true ->
+                   A = maps:get(<<"Attr">>, CA, undefined),
+                   B = maps:get(<<"Attr">>, CB, undefined),
+                   KeyA = attr_key(A), KeyB = attr_key(B),
+                   %% A key change and the vsn (md5) change are distinct causes;
+                   %% a key change implies a new vsn, so report both.
+                   case KeyA =:= KeyB of
+                       true -> [vsn];
+                       false -> [vsn, compiler_key]
+                   end
+           end,
+    lists:usort(Paths ++ Keys ++ Attr).
+
+attr_key(undefined) -> undefined;
+attr_key(Data) ->
+    case decode_term(Data) of
+        {ok, Attrs} when is_list(Attrs) -> proplists:get_value(bl_compiler_key, Attrs);
+        _ -> undefined
+    end.
+
+%% ---------------------------------------------------------------------------
+%% Real-difference detail
+%% ---------------------------------------------------------------------------
+
+real_detail(PathA, PathB, Real, Opts) ->
+    D0 = #{code_equal => not lists:member(<<"Code">>, Real)},
+    D1 = case lists:member(<<"Code">>, Real) orelse
+              lists:member(<<"AtU8">>, Real) orelse
+              lists:member(<<"ImpT">>, Real) orelse
+              lists:member(<<"FunT">>, Real) orelse
+              lists:member(<<"ExpT">>, Real) of
+             true -> D0#{functions => function_diff(PathA, PathB, Opts)};
+             false -> D0
+         end,
+    case lists:member(<<"LitT">>, Real) of
+        true -> D1#{literals => literal_diff(PathA, PathB)};
+        false -> D1
+    end.
+
+function_diff(PathA, PathB, Opts) ->
+    case {disasm_functions(PathA), disasm_functions(PathB)} of
+        {{ok, FunA}, {ok, FunB}} ->
+            Keys = lists:usort(maps:keys(FunA) ++ maps:keys(FunB)),
+            Added = [K || K <- Keys, not maps:is_key(K, FunA), maps:is_key(K, FunB)],
+            Removed = [K || K <- Keys, maps:is_key(K, FunA), not maps:is_key(K, FunB)],
+            Changed = [K || K <- Keys, maps:is_key(K, FunA), maps:is_key(K, FunB),
+                            maps:get(K, FunA) =/= maps:get(K, FunB)],
+            #{added => [name_arity(K) || K <- Added],
+              removed => [name_arity(K) || K <- Removed],
+              changed => [name_arity(K) || K <- Changed],
+              changed_detail => [{name_arity(K),
+                                  instruction_delta(maps:get(K, FunA), maps:get(K, FunB), Opts)}
+                                 || K <- Changed]};
+        _ -> #{error => disassembly_failed}
+    end.
+
+disasm_functions(Path) ->
+    try
+        case beam_disasm:file(Path) of
+            {beam_file, _Mod, _Exports, _Attrs, _CompInfo, Code} ->
+                {ok, maps:from_list(
+                       [{{Name, Arity}, Insns}
+                        || {function, Name, Arity, _Entry, Insns} <- Code])};
+            Other -> {error, Other}
+        end
+    catch _:Why -> {error, Why}
+    end.
+
+instruction_delta(InsA, InsB, Opts) ->
+    Base = #{instructions_a => length(InsA), instructions_b => length(InsB),
+             changed => count_diffs(InsA, InsB, 0),
+             first_at => first_diff(InsA, InsB, 1)},
+    case maps:get(verbose, Opts, false) of
+        false -> Base;
+        true ->
+            CallsA = lists:usort(calls(InsA)),
+            CallsB = lists:usort(calls(InsB)),
+            Base#{calls_added => CallsB -- CallsA,
+                  calls_removed => CallsA -- CallsB}
+    end.
+
+count_diffs([], [], N) -> N;
+count_diffs([X | As], [Y | Bs], N) when X =:= Y -> count_diffs(As, Bs, N);
+count_diffs([_ | As], [_ | Bs], N) -> count_diffs(As, Bs, N + 1);
+count_diffs([], [_ | _], N) -> N + 1;
+count_diffs([_ | _], [], N) -> N + 1.
+
+first_diff([], [], _N) -> undefined;
+first_diff([], _B, N) -> N;
+first_diff(_A, [], N) -> N;
+first_diff([X | As], [Y | Bs], N) when X =:= Y -> first_diff(As, Bs, N + 1);
+first_diff(_A, _B, N) -> N.
+
+calls(Insns) -> lists:append([calls_in(I) || I <- Insns]).
+
+calls_in({call_ext, _Arity, {extfunc, M, F, A}}) -> [{M, F, A}];
+calls_in({call_ext, _Arity, _}) -> [];
+calls_in(T) when is_tuple(T) -> lists:append([calls_in(E) || E <- tuple_to_list(T)]);
+calls_in(L) when is_list(L) -> lists:append([calls_in(E) || E <- L]);
+calls_in(_) -> [].
+
+name_arity({Name, Arity}) ->
+    Text = case Name of
+               N when is_atom(N) -> atom_to_list(N);
+               N when is_binary(N) -> binary_to_list(N);
+               N when is_list(N) -> N;
+               _ -> io_lib:format("~p", [Name])
+           end,
+    lists:flatten(io_lib:format("~ts/~p", [Text, Arity])).
+
+literal_diff(PathA, PathB) ->
+    case {literals(PathA), literals(PathB)} of
+        {{ok, LA}, {ok, LB}} ->
+            #{count_a => length(LA), count_b => length(LB),
+              first_difference => first_literal_diff(LA, LB, 1)};
+        _ -> #{error => literals_unavailable}
+    end.
+
+first_literal_diff([], [], _N) -> undefined;
+first_literal_diff([X | As], [Y | Bs], N) when X =:= Y -> first_literal_diff(As, Bs, N + 1);
+first_literal_diff(_A, _B, N) -> N.
+
+%% ---------------------------------------------------------------------------
+%% Summary and output
+%% ---------------------------------------------------------------------------
+
+summarise(Results) ->
+    Base = lists:foldl(fun(R, Acc) ->
+        K = maps:get(kind, R),
+        maps:update_with(K, fun(C) -> C + 1 end, 1, Acc)
+    end, #{identical => 0, normal_only => 0, real => 0}, Results),
+    Categories = lists:foldl(fun(R, Acc) ->
+        case maps:get(kind, R) of
+            normal_only -> lists:foldl(fun(C, A) ->
+                               maps:update_with(C, fun(N) -> N + 1 end, 1, A)
+                           end, Acc, maps:get(categories, R, []));
+            _ -> Acc
+        end
+    end, #{}, Results),
+    Base#{categories => Categories}.
+
+print_text(DirA, DirB, OnlyA, OnlyB, Results, Summary, Opts) ->
+    case maps:get(quiet, Opts) of
+        true -> ok;
+        false ->
+            io:format("A: ~s~nB: ~s~n", [DirA, DirB]),
+            print_list("only in A", OnlyA),
+            print_list("only in B", OnlyB),
+            io:format("identical: ~p~n", [maps:get(identical, Summary)]),
+            io:format("normal-only: ~p~n", [maps:get(normal_only, Summary)]),
+            [io:format("  ~s: ~p~n", [atom_to_list(K), V])
+             || {K, V} <- lists:sort(maps:to_list(maps:get(categories, Summary)))],
+            io:format("real: ~p~n", [maps:get(real, Summary)]),
+            [print_real(R, Opts) || R <- Results, maps:get(kind, R) =:= real]
+    end.
+
+print_list(_Label, []) -> ok;
+print_list(Label, Names) ->
+    io:format("~s (~p):~n", [Label, length(Names)]),
+    [io:format("  ~s~n", [N]) || N <- Names].
+
+print_real(R, Opts) ->
+    io:format("~n~s: chunks=~p code_equal=~p~n",
+              [maps:get(name, R), maps:get(chunks, R), maps:get(code_equal, R)]),
+    case maps:get(path_chunks, R, []) of
+        [] -> ok;
+        P -> io:format("  path chunks: ~p~n", [P])
+    end,
+    case maps:get(functions, R, undefined) of
+        undefined -> ok;
+        F ->
+            Limit = case maps:get(verbose, Opts, false) of true -> 100000; false -> 20 end,
+            print_names("  added", maps:get(added, F, []), Limit),
+            print_names("  removed", maps:get(removed, F, []), Limit),
+            print_names("  changed", maps:get(changed, F, []), Limit),
+            case maps:get(verbose, Opts, false) of
+                true -> [io:format("    ~s ~p~n", [NA, D])
+                         || {NA, D} <- maps:get(changed_detail, F, [])];
+                false -> ok
+            end
+    end,
+    case maps:get(literals, R, undefined) of
+        undefined -> ok;
+        L -> io:format("  literals: ~p~n", [L])
+    end.
+
+print_names(_Label, [], _Limit) -> ok;
+print_names(Label, Names, Limit) ->
+    Shown = lists:sublist(Names, Limit),
+    More = length(Names) - length(Shown),
+    io:format("~s (~p): ~s~n", [Label, length(Names), lists:join(", ", Shown)]),
+    case More > 0 of
+        true -> io:format("    ... ~p more (use --verbose)~n", [More]);
+        false -> ok
+    end.
+
+print_json(DirA, DirB, OnlyA, OnlyB, Results, Summary) ->
+    Cats = maps:get(categories, Summary),
+    Term = #{a => list_to_binary(DirA), b => list_to_binary(DirB),
+             only_a => [list_to_binary(N) || N <- OnlyA],
+             only_b => [list_to_binary(N) || N <- OnlyB],
+             identical => maps:get(identical, Summary),
+             normal_only => maps:get(normal_only, Summary),
+             real => maps:get(real, Summary),
+             categories => maps:from_list(
+                 [{atom_to_binary(K, utf8), V} || {K, V} <- maps:to_list(Cats)]),
+             beams => [json_beam(R) || R <- Results]},
+    io:format("~s~n", [json:encode(Term)]).
+
+json_value(V) when V =:= undefined -> null;
+json_value(V) when is_atom(V) -> atom_to_binary(V, utf8);
+json_value(V) when is_binary(V) -> V;
+json_value(V) when is_integer(V) -> V;
+json_value(V) when is_list(V) -> [json_value(E) || E <- V];
+json_value(V) when is_tuple(V) -> [json_value(E) || E <- tuple_to_list(V)];
+json_value(V) when is_map(V) ->
+    maps:from_list([{json_key(K), json_value(X)} || {K, X} <- maps:to_list(V)]);
+json_value(V) -> io_lib:format("~p", [V]).
+
+json_key(K) when is_atom(K) -> atom_to_binary(K, utf8);
+json_key(K) when is_binary(K) -> K;
+json_key(K) -> atom_to_binary(iolist_to_binary(io_lib:format("~p", [K])), utf8).
+
+json_beam(R) ->
+    Base = #{name => list_to_binary(maps:get(name, R)),
+             kind => atom_to_binary(maps:get(kind, R), utf8)},
+    B1 = case maps:get(chunks, R, undefined) of
+             undefined -> Base;
+             Ch -> Base#{chunks => Ch}
+         end,
+    B2 = case maps:get(categories, R, undefined) of
+             undefined -> B1;
+             Cs -> B1#{categories => [atom_to_binary(C, utf8) || C <- Cs]}
+         end,
+    B3 = case maps:get(functions, R, undefined) of
+             undefined -> B2;
+             F -> B2#{functions => maps:from_list(
+                          [{<<"added">>, [list_to_binary(N) || N <- maps:get(added, F, [])]},
+                           {<<"removed">>, [list_to_binary(N) || N <- maps:get(removed, F, [])]},
+                           {<<"changed">>, [list_to_binary(N) || N <- maps:get(changed, F, [])]}])}
+         end,
+    B4 = case maps:get(literals, R, undefined) of
+             undefined -> B3;
+             L -> B3#{literals => json_value(L)}
+         end,
+    case maps:get(code_equal, R, undefined) of
+        undefined -> B4;
+        E -> B4#{code_equal => E}
+    end.

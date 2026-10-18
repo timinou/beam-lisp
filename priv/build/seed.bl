@@ -115,14 +115,12 @@
        logical (join "-" (map #(Macro/underscore %) (String/split ns "-")))
        members (artifact-attribute attrs :bl_aot_unit_members)
        digest (artifact-attribute attrs :bl_unit_source_digest)
-       key (artifact-attribute attrs :bl_compiler_key)
        hash (artifact-attribute attrs :bl_source_hash)]
   (when-not (and (= 1 (artifact-attribute attrs :bl_aot_artifact_version))
                  (= :mutable-forwarder (artifact-attribute attrs :bl_aot_artifact_role))
                  (= logical (artifact-attribute attrs :bl_unit_namespace))
                  (= logical (artifact-attribute attrs :bl_aot_forwarder_namespace))
                  (erlang/is_binary digest) (= 32 (erlang/byte_size digest))
-                 (erlang/is_binary key) (= 64 (erlang/byte_size key))
                  (erlang/is_binary hash) (= 64 (erlang/byte_size hash))
                  (erlang/is_tuple members) (= 2 (erlang/tuple_size members))
                  (= :members (elem members 0)) (erlang/is_list (elem members 1))
@@ -136,7 +134,7 @@
                (not (some #(= (beam-of (str "Ns.Body." ns)) %) names)))
     (throw (ex-info "compiler seed unit omits its stable body" {:namespace logical})))
    {:namespace logical :shim shim :shim-name shim-name :bytes bytes :attrs attrs
-    :members modules :names names :digest digest :hash hash :key key})))
+    :members modules :names names :digest digest :hash hash})))
 
 (defn emitted-variants
  "Read the checked compiler's exact unit membership, without loading/invoking it.
@@ -167,7 +165,6 @@
                                                (contains? #{:stable-body :initializer :actor :generated-class} role)
                                                (= (:namespace unit) (artifact-attribute attrs :bl_unit_namespace))
                                                (= (:digest unit) (artifact-attribute attrs :bl_unit_source_digest))
-                                               (= (:key unit) (artifact-attribute attrs :bl_compiler_key))
                                                (= (:hash unit) (artifact-attribute attrs :bl_source_hash)))
                                  (throw (ex-info "seed unit member provenance mismatch" {:file name})))
                                 {:name name :bytes bytes})) (:members unit))]
@@ -203,8 +200,12 @@
   (if (= :build (BeamLisp.Tiers/tier_of_ns ns)) build-key compiler-key))
 
 (defn stamp
-  "Read the on-disk beam's compiler/source provenance without publishing code.
-   Inspection must never purge a live compiler or application callback."
+  "Read the on-disk beam's source provenance without publishing code.
+   Inspection must never purge a live compiler or application callback.
+
+   A FLOOR beam carries no compiler key: its validity is the manifest claim
+   (`Bootstrap/claimed?`), so `:key` is nil here and only `:hash` is compared
+   against the live source. Older/library beams still answer a key."
   [path]
   (try
     (let [result (beam_lib/chunks (String/to_charlist path) (list :attributes))]
@@ -215,7 +216,7 @@
               hash (value :bl_source_hash) key (value :bl_compiler_key)]
           (cond
             (or (nil? hash) (empty? hash)) {:error "the beam carries no source hash"}
-            (or (nil? key) (empty? key)) {:error "the beam carries no compiler key"}
+            (or (nil? key) (empty? key)) {:ok {:hash hash :key nil}}
             :else {:ok {:hash hash :key key}}))
         {:error (str "cannot read the beam's attributes: " (pr-str result))}))
     (catch e {:error (str "cannot read the beam's attributes: " (or (ex-message e) (pr-str e)))})))
@@ -918,12 +919,43 @@
    each beam's provenance verified) before any of it is used, so a failure here
    leaves the floor exactly where it was — the same safety order the shim refusal
    keeps. Returns `{:ok? true :beams [...]}` or `{:ok? false :errors [...]}`."
-  [entries dir]
-  (let [results (map (fn [e] (compile-host e dir)) entries)
+  ([entries dir] (compile-hosts entries dir {}))
+  ([entries dir opts]
+  (let [reuse (:reuse opts)
+        results (vec (map (fn [e]
+                            (or (reuse-host e dir reuse)
+                                (compile-host e dir)))
+                          entries))
         errors (vec (keep (fn [r] (:error r)) results))]
     (if (empty? errors)
-      {:ok? true :beams (vec (map (fn [r] (:ok r)) results))}
-      {:ok? false :errors errors})))
+      {:ok? true :beams (vec (map (fn [r] (:ok r)) results))
+       :reused (count (filter :reused results))}
+      {:ok? false :errors errors}))))
+
+(defn- reuse-host
+  "A pinned host beam another step of THIS regeneration already compiled from
+   the same source bytes by the same toolchain (`:reuse` dirs, e.g. the
+   regenerate script's `fresh-hosts/`) is the same artifact: copy it instead of
+   compiling the source again. Its `bl_source_hash` must equal this source's
+   digest and its module must be the one the table names; anything else is
+   compiled normally. nil when nothing reusable exists."
+  [entry dir reuse]
+  ;; Only an entry compiled with the BASE options can be reused: another step's
+  ;; compile does not pass `:struct-fields`/`:behaviour`/`:macro-exports`, and
+  ;; those change the bytes (measured: Application lost its -behaviour).
+  (when (and (seq reuse) (nil? (:struct-fields entry)) (nil? (:behaviour entry))
+             (nil? (:macro-exports entry)))
+    (let [name (host-beam entry)
+          source (:source entry)
+          source-hash (when (File/exists? source) (d/sha256-hex-of source 0 (d/file-size source)))
+          candidate (first (filter File/exists? (map (fn [r] (Path/join r name)) reuse)))]
+      (when (and source-hash candidate (= {:ok source-hash} (host-provenance candidate)))
+        (let [path (Path/join dir name)]
+          (File/mkdir_p! dir)
+          (File/cp! candidate path)
+          {:ok {:name name :path path :source source :source-hash source-hash
+                :sha (d/sha256-hex-of path 0 (d/file-size path))}
+           :reused true})))))
 
 (defn- host-rows
   "The pinned host floor as JUDGEABLE rows, in the same shape `moved/2` gives
@@ -950,8 +982,11 @@
        hosts))
 
 (defn- stale-why
-  "Why `name` must not be seeded, or nil when it may: only a SHIM is stamped, and
-   the key it carries must be the one this toolchain writes for its namespace."
+  "Why `name` must not be seeded, or nil when it may: only a SHIM is judged, and
+   the BUILD FLOOR it sits in must claim it under the key this toolchain writes
+   for its namespace. The claim is `compile.beam_lisp` (`Bootstrap/claimed?`);
+   the beam's bytes carry no key. An older keyed beam keeps the attribute
+   comparison."
   [name ebin compiler-key build-key]
   (if (not (shim? name))
     nil
@@ -959,7 +994,10 @@
           got (stamp (Path/join ebin name))]
       (cond
         (= (:key (:ok got)) want) nil
+        (and (:ok got) (nil? (:key (:ok got)))
+             (BeamLisp.Bootstrap/claimed? ebin name want)) nil
         (some? (:error got)) (str name ": " (:error got))
+        (nil? (:key (:ok got))) (str name ": its build floor does not claim it under this toolchain's key")
         :else (str name ": built under " (subs (:key (:ok got)) 0 16)
                    "…, this toolchain writes " (subs want 0 16) "…")))))
 
@@ -1178,7 +1216,7 @@
                                       (moved-lines
                                         (filter (fn [r] (= :moved (:verdict r)))
                                                 (moved out nss))))}
-          (let [hc (compile-hosts hosts scratch)
+          (let [hc (compile-hosts hosts scratch {:reuse (vec (:reuse-hosts opts))})
                 beams (:beams hc)]
             (try
               (if-not (:ok? hc)

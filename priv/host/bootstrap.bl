@@ -118,6 +118,12 @@
   [& xs]
   (erlang/list_to_tuple xs))
 
+(defn- lst
+  "A plain list of the arguments. A rest argument IS a list, so this compiles
+   to argument collection and nothing else — no `BeamLisp.Ns.Core` reference,
+   which is what a bare `(list …)` would emit."
+  [& xs] xs)
+
 ; ── the manifest ────────────────────────────────────────────────────────────
 
 (defn- read_manifest!
@@ -188,11 +194,102 @@
                       (erlang/element 2 (erlang/element 2 r)))
            false))))
 
+;; ── the floor claim ─────────────────────────────────────────────────────────
+;
+; A FLOOR beam (boot tier, build driver) carries NO compiler key in its bytes:
+; `__bl_provenance__/0` answers `{source-hash, :floor}` and no `bl_compiler_key`
+; attribute is written. Two generations that compile the same source therefore
+; produce byte-identical beams, and a floor regeneration rewrites only the beams
+; whose code moved.
+;
+; The generation is a CLAIM about a whole floor, held beside it:
+;   * a seed directory: `manifest.term` — `compiler_key`/`build_key` and the
+;     sha256 of every file;
+;   * a build ebin: `compile.beam_lisp` (or `.beam_lisp/compile.beam_lisp`, the
+;     launcher's rebuild child) — per source, the tier `:key` and its modules.
+; `claimed?` is the ONE reader of either. A beam whose directory does not claim it
+; under the live key is refused exactly where a wrong stamp used to be (BUG-048).
+
+(defn- build_claim
+  "The build record of `dir` as a map, or nil."
+  [dir]
+  (Enum/reduce (lst (Path/join dir "compile.beam_lisp")
+                    (Path/join (Path/join dir ".beam_lisp") "compile.beam_lisp"))
+    nil
+    (fn [path acc]
+      (if (erlang/== nil acc)
+        (let [r (File/read path)]
+          (if (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
+            (try
+              (let [t (erlang/binary_to_term (erlang/element 2 r) '(:safe))]
+                (if (erlang/is_map t) t nil))
+              (catch _ nil))
+            nil))
+        acc))))
+
+(defn- record_modules [mods]
+  (cond
+    (erlang/is_list mods) mods
+    (and (erlang/is_map mods) (erlang/is_tuple (Map/get mods :items))) (erlang/tuple_to_list (Map/get mods :items))
+    :else '()))
+
+(defn- build_claimed?
+  "A build record entry claims `mod` under exactly `key`."
+  [dir mod key]
+  (let [claim (build_claim dir)]
+    (and (erlang/is_map claim)
+         (Enum/any? (Map/values claim)
+           (fn [e]
+             (and (erlang/is_map e)
+                  (erlang/== key (Map/get e :key))
+                  (Enum/member? (record_modules (Map/get e :modules)) mod)))))))
+
+(defn- seed_claimed?
+  "The seed manifest at `dir` claims file `name` under `key`, and the bytes on
+   disk are the bytes it names."
+  [dir name key]
+  (let [path (Path/join dir "manifest.term")]
+    (and (File/exists? path)
+         (let [m (read_manifest! path)
+               want (Map/get (Map/get m "modules" (Map/new)) name)
+               bytes-path (Path/join dir name)]
+           (and (erlang/is_binary want)
+                (or (erlang/== key (Map/get m "compiler_key"))
+                    (erlang/== key (Map/get m "build_key")))
+                (File/exists? bytes-path)
+                (erlang/== want (sha256 (File/read! bytes-path))))))))
+
+(defn claimed?
+  "Whether the floor at `dir` (a seed directory or a build ebin) claims beam file
+   `name` under generation `key`. A seed manifest is checked first; a build
+   record second. A directory that holds a byte-identical copy of a committed
+   seed file is claimed by that seed (the install path copies it there)."
+  [dir name key]
+  (let [mod (String/to_atom (Path/basename name ".beam"))]
+    (or (seed_claimed? dir name key)
+        (build_claimed? dir mod key)
+        (let [seed (seed_dir)
+              here (Path/join dir name)]
+          (and (erlang/is_binary seed)
+               (erlang/not (erlang/== (Path/expand seed) (Path/expand dir)))
+               (File/exists? here)
+               (seed_claimed? seed name key)
+               (erlang/== (sha256 (File/read! here)) (sha256 (File/read! (Path/join seed name)))))))))
+
+(defn loaded_claimed?
+  "`claimed?` for a LOADED module: judged in the directory its code came from."
+  [mod key]
+  (let [which (code/which mod)]
+    (and (erlang/is_list which)
+         (let [path (List/to_string which)]
+           (claimed? (Path/dirname path) (Path/basename path) key)))))
+
 (defn- stamped_key
-  "A beam's `bl_compiler_key` attribute, read WITHOUT loading it — the attribute
-   `AOT.emit_module` stamps into every namespace beam beside
-   `__bl_provenance__/0`. Loading the beam to ask about a file would replace the
-   live module under a running VM."
+  "A beam's `bl_compiler_key` attribute, read WITHOUT loading it. FLOOR beams
+   no longer carry one — their validity is the manifest claim (`claimed?`) — so
+   this answers nil for them; it remains for older floors and for callers that
+   must still read a library beam's key. Loading the beam to ask about a file
+   would replace the live module under a running VM."
   [path]
   (let [r (beam_lib/chunks (erlang/binary_to_list path) '(:attributes))]
     (if (and (erlang/is_tuple r) (erlang/== :ok (erlang/element 1 r)))
@@ -352,10 +449,11 @@
 ; ── the generation rule (for the `Ns.*` generation unit only) ────────────────
 
 (defn- fresh_generation?
-  "Whether `dst` holds a beam stamped with the current toolchain key. The stamp
-   is the `__bl_provenance__/0` function, which only the namespace SHIM
-   (Ns.<Name>) carries, so a Body/Init destination inherits its sibling shim's
-   verdict. The sibling verdict only inherits when the destination beam is there
+  "Whether `dst` holds a beam the floor it sits in CLAIMS under the current
+   toolchain key. Floor beams carry no key in their bytes, so the verdict is the
+   manifest claim (`claimed?`), not an attribute. Only the namespace SHIM
+   (Ns.<Name>) is claimed as a unit header, so a Body/Init destination inherits
+   its sibling shim's verdict. The sibling verdict only inherits when the destination beam is there
    AND was written in the same pass as the shim (shim, body and init are one
    generation unit): a killed build can leave a fresh shim beside a stale body,
    and trusting the shim alone then skips the reinstall. The stamp is read from
@@ -373,7 +471,9 @@
                  (erlang/>= (erlang/map_get :mtime (File/stat! dst))
                             (erlang/map_get :mtime (File/stat! provenance_beam)))))]
     (if unit_consistent?
-      (erlang/== (stamped_key provenance_beam) current_key)
+      ;; A FLOOR destination carries no key in its bytes. Its claim is the
+      ;; build record (or the seed manifest) of the directory it sits in.
+      (claimed? (Path/dirname provenance_beam) (Path/basename provenance_beam) current_key)
       false)))
 
 ; ── the tier authority ──────────────────────────────────────────────────────
@@ -476,7 +576,6 @@
                        (erlang/== :mutable-forwarder (seed_unit_attribute attrs :bl_aot_artifact_role))
                        (erlang/== logical (seed_unit_attribute attrs :bl_unit_namespace))
                        (erlang/== logical (seed_unit_attribute attrs :bl_aot_forwarder_namespace))
-                       (erlang/== (Map/get manifest "compiler_key") (seed_unit_attribute attrs :bl_compiler_key))
                        (erlang/is_binary (seed_unit_attribute attrs :bl_unit_source_digest))
                        (erlang/== 32 (erlang/byte_size (seed_unit_attribute attrs :bl_unit_source_digest)))
                        (erlang/is_binary (seed_unit_attribute attrs :bl_source_hash))
@@ -498,7 +597,7 @@
            (let [got (seed_unit_attributes! seed_dir modules member)]
             (when-not (and (Enum/member? '(:stable-body :initializer :actor :generated-class)
                              (seed_unit_attribute got :bl_aot_artifact_role))
-                           (Enum/all? '(:bl_aot_artifact_version :bl_unit_namespace :bl_unit_source_digest :bl_compiler_key :bl_source_hash)
+                           (Enum/all? '(:bl_aot_artifact_version :bl_unit_namespace :bl_unit_source_digest :bl_source_hash)
                             (fn [key] (erlang/== (seed_unit_attribute attrs key) (seed_unit_attribute got key)))))
              (erlang/error (Elixir.RuntimeError/exception (cat "bootstrap unit member provenance mismatch: " member)))))
            (MapSet/put owned member)))))))))))
