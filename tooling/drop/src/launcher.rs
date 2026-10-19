@@ -958,7 +958,7 @@ fn exec_payload(dest: &std::path::Path, sha8: &str, argv: &[String]) -> ! {
     // (verified: bin/bl eval passes "$@" through as erl -extra). A `--`
     // would leak into argv, so it is NOT added here.
     let mut cmd = release_command(&bin);
-    cmd.args(&argv);
+    cmd.args(payload_argv(&argv));
     exec_or_fail(cmd, &bin)
 }
 

@@ -1037,6 +1037,7 @@ fn encode_hello_generation(tree: &[u8], token: &[u8], build: &str, generation: O
 }
 
 fn encode_request(argv: &[String], cwd: &Path, env_paths: &[String], env: &[(String, String)]) -> Vec<u8> {
+    let argv = payload_argv(argv);
     let mut e = Enc::new();
     e.tuple_header(5);
     e.atom("bl");

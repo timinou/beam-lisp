@@ -263,6 +263,16 @@ pub fn effective_transport(wanted: Transport, payload_can_start: bool) -> Transp
     }
 }
 
+/// A native transport directive is consumed before the payload parses argv.
+/// Program arguments following `--` remain opaque.
+pub fn payload_argv(argv: &[String]) -> Vec<String> {
+    let mut program = false;
+    argv.iter().filter_map(|argument| {
+        if argument == "--" { program = true; }
+        if !program && argument == "--warm-required" { None } else { Some(argument.clone()) }
+    }).collect()
+}
+
 fn warm_spelling(v: &str) -> Option<Transport> {
     WARM_SPELLINGS.iter().find(|(s, _)| *s == v).map(|(_, t)| *t)
 }
@@ -541,5 +551,12 @@ mod transport_tests {
         assert_eq!(LOG_FLAG, "--log");
         assert_eq!(IDLE_FLAG, "--idle");
         assert_eq!(LINES_FLAG, "--lines");
+    }
+
+    #[test]
+    fn required_transport_is_consumed_without_changing_program_arguments() {
+        assert_eq!(payload_argv(&a(&["--warm-required", "eval", "42"])), a(&["eval", "42"]));
+        assert_eq!(payload_argv(&a(&["--warm-required", "run", "x.bl", "--", "--warm-required"])),
+                   a(&["run", "x.bl", "--", "--warm-required"]));
     }
 }
