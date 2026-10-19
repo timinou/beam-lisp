@@ -133,6 +133,34 @@
            (if (some? (:line env)) (list (erlang/list_to_tuple (list :line (:line env)))) (list))
            (if (some? form) (list (erlang/list_to_tuple (list :form form))) (list))))))))
 
+(defn- compile-warning!
+  "Report a survivable fact about the code being compiled: one line on stderr,
+   prefixed with the user's file and line when the env knows them. The
+   compilation continues. `:bl-compile-warnings` in the process dictionary is
+   an io device that takes the warning instead of stderr (tests read it there)."
+  [env message]
+  (let [where (cond
+                (and (some? (:file env)) (some? (:line env))) (str (:file env) ":" (:line env) ": ")
+                (some? (:line env)) (str (:line env) ": ")
+                :else "")
+        device (let [d (erlang/get :bl-compile-warnings)]
+                 (if (= d :undefined) :standard_error d))]
+    (io/put_chars device (str "warning: " where message "\n"))))
+
+(defn- warn-otp-json!
+  "A bare `json/encode` / `json/decode` is OTP's `:json` module. It cannot
+   encode beam-lisp vectors, sets or keywords (vectors are tuples to it), so
+   data that reads fine fails at run time with `unsupported_type` or `not a
+   binary`. `bl.json` handles every beam-lisp value; point at it once per call
+   site. A namespace that aliases `json` (`[bl.json :as json]`) never gets here."
+  [env module fun argc]
+  (when (and (= module :json) (contains? #{:encode :decode} fun) (= 1 argc)
+             (not= "bl.json" (:ns env)))
+    (compile-warning! env
+      (str "json/" (erlang/atom_to_binary fun) " is OTP's :json, which cannot encode beam-lisp "
+           "vectors, sets or keywords. Use bl.json: (:require [bl.json :as json]), or call "
+           "(erlang/apply :json :" (erlang/atom_to_binary fun) " ...) to keep OTP's on purpose."))))
+
 (defn- local?
   "Say whether `name` is bound locally in this environment (a parameter or a
    let binding), as opposed to being a namespace variable."
@@ -1125,7 +1153,8 @@
                   (anf-invoke (manifest-answer->node answer) arg-nodes)))
             (= :remote (first tgt))
             ; a host-module call: Module.fun(args) directly
-            (command-remote-call (second tgt) (nth tgt 2) arg-nodes)
+            (do (warn-otp-json! env (second tgt) (nth tgt 2) (count args))
+                (command-remote-call (second tgt) (nth tgt 2) arg-nodes))
             :else
             ; a var in another namespace: refuse a private one FIRST (before the
             ; linked direct-call shortcut, which bypasses the fetch path), then
@@ -1233,6 +1262,24 @@
    A list whose head is one of these is compiled by its own rule."
   (kernel-special-forms-literal))
 
+(defn- warn-special-name!
+  "Warn, at the user's file and line, when a definition's NAME is a special form.
+   A call `(loop* x)` always compiles as the special form, so such a var is
+   reachable only through a qualified name (`my.ns/loop*`); an unqualified call
+   compiles as the special form instead. Clojure accepts the definition and
+   warns the same way, and qualified-only definitions (`act/do`, `anf/var`,
+   `proc/defserver`) are real code, so this is a warning, not an error. Written
+   to stderr once per definition. `kind` is the defining form (`defn`, …)."
+  [kind name env]
+  (when (and (erlang/is_binary name) (contains? special-forms name)
+             ; the toolchain's own qualified-only definitions (`anf/var`,
+             ; `multi/satisfies?`, `proc/defserver`) are known and intended
+             (not (contains? #{"anf" "proc" "proc.server" "host.multi" "host.emit"} (:ns env))))
+    (compile-warning! env
+      (str kind " " name ": `" name "` is a special form; an unqualified call `("
+           name " ...)` compiles as the special form, not this var. Call it as "
+           (:ns env) "/" name " or choose another name."))))
+
 (defn- compile-body
   "Compile body forms into one bl-ANF node (a single form, or a :do)."
   [body env]
@@ -1296,6 +1343,21 @@
             (let [self (:self target)
                   self-app (a/app (a/var self) (list (a/var self)))]
               (a/app self-app arg-nodes)))))))
+
+(defn- binding-vector-items
+  "The items of the binding vector `bindings-form` that the special form `head`
+   (`let`, `loop*`, …) opens with. Anything that is not a vector — a missing
+   one, a string, a symbol — is a compile error at the user's file and line
+   that names the form, not a crash inside the reader-node accessors."
+  [head bindings-form env]
+  (let [form (rn/node-form bindings-form)]
+    (if (and (erlang/is_tuple form) (= :vector (rn/node-tag form)))
+      (rn/node-items form)
+      (compile-error env
+        (str "`" head "` is a special form; it expects a binding vector, got "
+             (if (nil? bindings-form) "nothing" (try (pr-str (rn/form form)) (catch _ "a non-vector form")))
+             ". A var named `" head "` is reached only by its qualified name (ns/" head ").")
+        bindings-form))))
 
 (defn- binding-pairs
   "Split a binding vector's items into [pattern value] pairs.
@@ -1588,8 +1650,9 @@
    one step; a vector or map pattern expands into several). The steps nest as
    immediately-called functions, and the body runs with all the bound names in
    scope."
-  [bindings-form body env]
-  (let [items (rn/node-items (rn/node-form bindings-form))
+  ([bindings-form body env] (compile-let "let" bindings-form body env))
+  ([head bindings-form body env]
+  (let [items (binding-vector-items head bindings-form env)
         pairs (binding-pairs items env)
         result (reduce
                  (fn [acc pair]
@@ -1612,7 +1675,7 @@
         final-env (:env result)
         steps (:steps result)
         body-node (compile-body body final-env)]
-    (nest-lets steps body-node)))
+    (nest-lets steps body-node))))
 
 (defn- compile-loop
   "Turn (loop [pattern value ...] body...) into a self-re-entrant function.
@@ -1624,8 +1687,9 @@
    iteration, exactly as the genesis `loop_bindings` does. This is what lets
    `(loop [[x :as xs] (list 1 2 3)] … (recur (rest xs)))` rebind x/xs each turn
    and terminate on the exhausted-rest nil."
-  [bindings-form body env]
-  (let [items (rn/node-items (rn/node-form bindings-form))
+  ([bindings-form body env] (compile-loop "loop" bindings-form body env))
+  ([head bindings-form body env]
+  (let [items (binding-vector-items head bindings-form env)
         pairs (binding-pairs items env)
         built (reduce
                 (fn [acc pair]
@@ -1670,7 +1734,7 @@
                      (maps/get :decreasing bmeta))]
     (if (nil? decreasing)
       app
-      (assoc app :ann (assoc (or (:ann app) {}) :decreasing decreasing)))))
+      (assoc app :ann (assoc (or (:ann app) {}) :decreasing decreasing))))))
 (defn- compile-throw
   "Turn (throw x) into BeamLisp.ExInfo.raise_payload(x)."
   [x env]
@@ -3046,6 +3110,7 @@
    `with-doc-meta`."
   [name-form more env]
   (let [name (rn/node-name (rn/node-form name-form))
+        _ (warn-special-name! "defmulti" name env)
         has-doc (and (> (count more) 1)
                      (erlang/is_binary (rn/node-form (first more))))
         doc (when has-doc (rn/node-form (first more)))
@@ -3737,6 +3802,7 @@
   (let [name-form (rn/node-form (first args))
         name (rn/node-name name-form)
         rest-args (rest args)
+        _ (warn-special-name! "def" name env)
         ; (def name "doc" value) has a string before the value
         has-doc (and (= 2 (count rest-args))
                      (erlang/is_binary (rn/node-form (first rest-args))))
@@ -3902,6 +3968,7 @@
   [args env]
   (let [name-form (rn/node-form (first args))
         name (rn/node-name name-form)
+        _ (warn-special-name! "defmacro" name env)
         rest-args (rest args)
         has-doc (and (not (empty? rest-args))
                      (erlang/is_binary (rn/node-form (first rest-args)))
@@ -4122,6 +4189,7 @@
   (let [name-form (rn/node-form (first args))
         name (rn/node-name name-form)
         kind (if private? "defn-" "defn")
+        _ (warn-special-name! kind name env)
         rest-args (rest args)
         has-doc (and (not (empty? rest-args))
                      (erlang/is_binary (rn/node-form (first rest-args)))
@@ -4271,8 +4339,8 @@
     (= head "reify") (compile-reify args env)
     (= head "defnative") (compile-defnative (first args) (rest args) env)
     (= head "defserver") (normal-declaration-node head args (compile-defserver (first args) (rest args) env) env)
-    (or (= head "let") (= head "let*")) (compile-let (first args) (rest args) env)
-    (or (= head "loop") (= head "loop*")) (compile-loop (first args) (rest args) env)
+    (or (= head "let") (= head "let*")) (compile-let head (first args) (rest args) env)
+    (or (= head "loop") (= head "loop*")) (compile-loop head (first args) (rest args) env)
     (or (= head "fn") (= head "fn*")) (compile-fn args env)
     (= head "recur") (compile-recur args env)
     :else (compile-error env (str "unknown special form `" head "`"))))

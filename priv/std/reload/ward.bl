@@ -41,7 +41,7 @@
 ; there is no shared mutable ground for one file to pull out from under another.
 
 (ns reload.ward
-  (:require [reload] [env] [proc.fence] [system.core :as sys] [z3]))
+  (:require [reload] [env] [proc.fence] [system.core :as sys] [z3] [bl.trace :as trace]))
 
 ;; ── coherence pre-check ───────────────────────────────────────────────────
 
@@ -158,13 +158,77 @@
       (some? secs) (* 1000 secs)
       :else DEFAULT-WORKER-BOUND-MS)))
 
-(defn- evaluate-file [scope src ns warns]
+(defn- load-frames
+  "The frames of a load crash worth showing, as rendered lines: those that name
+   a `.bl` file outside the toolchain (`priv/boot/`, `priv/host/`, the runner),
+   which are the test file's own functions and the library code it reached.
+   Innermost first, at most `n`."
+  [stack n]
+  (try
+    (vec
+      (map trace/render-frame
+           (take n (filter (fn [fm] (and (string? (:file fm)) (some? (:line fm))
+                                         (not= :nomatch (binary/match (:file fm) ".bl"))
+                                         (= :nomatch (binary/match (:file fm) "priv/boot/"))
+                                         (= :nomatch (binary/match (:file fm) "priv/host/"))
+                                         (= :nomatch (binary/match (:file fm) "reload/ward"))))
+                           (map trace/frame->bl (to-list stack))))))
+    (catch _ [])))
+
+(defn- form-line
+  "The source line the reader recorded on a top-level form, or nil."
+  [form]
+  (let [m (when (and (erlang/is_tuple form) (= 3 (erlang/tuple_size form))
+                     (= :meta (elem form 0)))
+            (elem form 2))]
+    (when (erlang/is_map m) (get m :line))))
+
+(defn- load-source!
+  "Evaluate a test file's source form by form in the current env, as
+   `env/eval` does, but under its `path` so compiled code names the file, and
+   recording the top-level form being evaluated. A raise is re-thrown as an
+   ex-info whose data is `{::load-crash {:line l :cause e :stack st}}`, so the
+   caller can say WHERE."
+  [src path]
+  ;; the same steps as `Compiler/eval_string`, which `env/eval` runs with a
+  ;; fresh env for the current namespace: read, eval each form in the namespace
+  ;; the previous one left, then settle the defs' shims once.
+  (let [env (BeamLisp.Compiler/new_env (BeamLisp.Env/current_ns))
+        forms (to-list (BeamLisp.Reader/read_string src path))
+        v (reduce (fn [_ form]
+                    (try
+                      (BeamLisp.Compiler/eval_form form (assoc env :ns (BeamLisp.Env/current_ns)))
+                      (catch e
+                        (throw (ex-info "load crash" {::load-crash {:line (form-line form) :cause e
+                                                                    :stack __STACKTRACE__}})))))
+                  nil forms)]
+    (when (erlang/function_exported :Elixir.BeamLisp.Link :settle 0)
+      (BeamLisp.Link/settle))
+    v))
+
+(defn- load-crash-error
+  "The `:incoherent` error for a file that raised while loading: the message,
+   `:at` (`file:line` of the top-level form that raised), and `:frames`, the
+   `.bl` frames inside the code it called."
+  [e stack path]
+  (let [data (try (ex-data e) (catch _ nil))
+        crash (when (map? data) (get data ::load-crash))
+        cause (if crash (:cause crash) e)
+        line (when crash (:line crash))
+        frames (load-frames (if crash (:stack crash) stack) 8)]
+    (cond-> {:kind :load-crash
+             :msg (str "crashed while loading: " (ex-message cause))}
+      (and (some? path) (some? line)) (assoc :at (str path ":" line))
+      (seq frames) (assoc :frames frames))))
+
+(defn- evaluate-file [scope src ns warns path]
   (env/with-env scope
     (fn []
       (reload/with-target scope
         (fn []
           (try
-            (BeamLisp.TestRT/declarations (fn [] (env/eval src)))
+            (BeamLisp.TestRT/declarations
+              (fn [] (if (some? path) (load-source! src path) (env/eval src))))
             (let [result (BeamLisp.TestRT/run_ns ns)
                   totals {:tests (:tests result) :pass (:pass result)
                           :fail (:fail result) :error (:error result)}
@@ -175,8 +239,7 @@
                :warnings warns})
             (catch e
               {:ns ns :status :incoherent :warnings warns
-               :errors [{:kind :load-crash
-                         :msg (str "crashed while loading: " (ex-message e))}]})))))))
+               :errors [(load-crash-error e __STACKTRACE__ path)]})))))))
 
 (defn run-file
   "Run a source file in a fresh fork and an owned monitored worker with a clean
@@ -184,8 +247,11 @@
    exact PID; fatal exits are reported immediately, rather than waiting for the
    timeout. The caller owns the isolated scope so even an uncatchable worker
    death cannot leak its scope. Timeout kills and awaits that exact worker.
-   Native executable ownership and explicit environment conveyance are retained."
-  [base src]
+   Native executable ownership and explicit environment conveyance are retained.
+   `path`, when given, is the file the source came from; it locates a load
+   crash."
+  ([base src] (run-file base src nil))
+  ([base src path]
   (let [ns (ns-of src)]
     (if (nil? ns)
       {:ns nil :status :incoherent :errors [(missing-namespace-error src)]}
@@ -195,7 +261,7 @@
           (let [started (BeamLisp.Refs/spawn_owned
                           (fn []
                             (env/bind env-token)
-                            (let [result (evaluate-file scope src ns warns)]
+                            (let [result (evaluate-file scope src ns warns path)]
                               (erlang/send me [:ward-result (erlang/self) result])))
                           :monitor (list))
                 worker (elem started 0) monitor (elem started 1)]
@@ -216,7 +282,7 @@
                   (receive [:ward-result observed _] :when (= observed worker) :ok (after 0 nil))
                   {:ns ns :status :incoherent :warnings warns
                    :errors [{:kind :timeout :msg "test worker timed out"}]}))))
-          (finally (env/destroy scope)))))))
+          (finally (env/destroy scope))))))))
 
 ;; ── run a suite of files ──────────────────────────────────────
 
@@ -389,7 +455,7 @@
                 :errors [{:kind :unreadable
                           :msg (or (entry-note entry) "source could not be read")}]}
                (try
-                 (run-file base (prep src))
+                 (run-file base (prep src) path)
                  (finally (restore-os-env! before))))
           r (named (fix r0 ns) path)]
       (emit! on-event r))))
@@ -520,8 +586,10 @@
                     :else                   "⊘")]
     (cond
       (= :incoherent (:status r))
-      (str "  " glyph " " (file-name r) "  INCOHERENT — "
-           (:msg (first (:errors r))))
+      (let [err (first (:errors r))]
+        (str "  " glyph " " (file-name r) "  INCOHERENT — "
+             (if (:at err) (str (:at err) ": ") "")
+             (:msg err)))
       :else
       (let [t (:totals r)]
         (str "  " glyph " " (:ns r) "  "
@@ -597,6 +665,9 @@
         (fn [r]
           (concat
             [(file-line r)]
+            ;; a load crash: the bl frames that led to it, innermost first
+            (mapcat (fn [err] (map (fn [f] (str "      " f)) (or (:frames err) [])))
+                    (if (= :incoherent (:status r)) (or (:errors r) []) []))
             ;; Tier A: per-assertion why, only for a failing file
             (map failure-block (or (:reports r) []))
             ;; Tier B: an SMT repair, only when one was found
