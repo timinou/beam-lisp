@@ -2481,10 +2481,14 @@
    (erlang/error (tuple :unattested_sdk_native_producer ns name)))
   arm))
 
-(defn- sdk_native_source_declaration [ns source]
+(defn- sdk_native_source_declaration
+ ([ns source] (sdk_native_source_declaration ns source nil))
  ;; Memoize parsed DATA by exact current bytes. Source and native code identity
  ;; are still checked by every caller; cached syntax never grants authority.
- (let [content (BeamLisp.Loader/read_source source)
+ ;; A caller that already read THIS exact file may pass the bytes it read; the
+ ;; digest below is still computed over them, so no identity check is skipped.
+ ([ns source content]
+ (let [content (if (nil? content) (BeamLisp.Loader/read_source source) content)
        _ (when (erlang/> (erlang/byte_size content) 1048576) (erlang/error :sdk_native_source_bound))
        digest (crypto/hash :sha256 content)
        key (tuple :Elixir.BeamLisp.AOT :native-declaration source ns)
@@ -2495,7 +2499,7 @@
                            (store_native_declaration! digest ns d)
                            d))]
     (persistent_term/put key (tuple digest declaration))
-    declaration))))
+    declaration)))))
 
 ;; The parsed declaration is pure DATA of (source bytes, namespace, reader): the
 ;; same bytes always parse to the same `{crate, functions}`. Every VM start
@@ -2559,12 +2563,22 @@
     (erlang/error :sdk_native_registry_bound))
    (if (erlang/== :"$end_of_table" selected) (list) (elem selected 0)))))
 
-(defn- sdk_native_input [ns]
+(defn- sdk_native_input
+  ([ns] (sdk_native_input ns nil nil))
+  ;; `expected-source`/`content` are an OPTIONAL reuse of bytes the caller
+  ;; already read for that exact physical source (the bootstrap scan). They are
+  ;; used only when the caller's path resolves to the same physical file; the
+  ;; declaration still hashes them and every identity check below still runs.
+  ([ns expected-source content]
   (let [root (physical_sdk_path (BeamLisp.Tiers/priv_root))
-        source (physical_sdk_path (sdk_native_source_path ns))]
+        source (physical_sdk_path (sdk_native_source_path ns))
+        reuse (and content expected-source
+                   (erlang/== source (physical_sdk_path expected-source)))]
     (when (and source (String/starts_with? source (erlang/iolist_to_binary (list root "/"))))
-      (let [declaration (sdk_native_source_declaration ns source)]
-        (when declaration (tuple root source declaration))))))
+      (let [declaration (if reuse
+                          (sdk_native_source_declaration ns source content)
+                          (sdk_native_source_declaration ns source))]
+        (when declaration (tuple root source declaration)))))))
 
 (defn assert_sdk_native_start!
   "A new on_load host may not execute after SDK lifetime publication. Existing
@@ -2637,6 +2651,81 @@
       (BeamLisp.Env/bump_sdk_receipt_revision!)))
   :ok)
 
+(defn- sdk_native_scan_stamp [root files]
+  ;; Identity of the DISCOVERY INPUT, never of a declaration: (path, size,
+  ;; mtime, inode) for every current tier source. Contents are not read here;
+  ;; each file this scan selects is read and sha-checked by its caller.
+  (erlang/phash2
+    (tuple root
+      (Enum/map files
+        (fn [p]
+          (let [r (prim_file/read_file_info p (list (tuple :time :posix)))]
+            (if (erlang/== :ok (elem r 0))
+              (tuple (Path/relative_to p root) (elem (elem r 1) 1)
+                     (elem (elem r 1) 5) (elem (elem r 1) 11))
+              (tuple (Path/relative_to p root) nil))))))))
+
+(defn- sdk_native_scan_path [root stamp]
+  (Path/join (Path/join (Path/join (BeamLisp.AOTCache/dir) "native-declarations")
+                        (BeamLisp.AOTCache/compiler_key))
+             (erlang/iolist_to_binary
+               (list "scan-"
+                     (Base/encode16 (crypto/hash :sha256 root) (list (tuple :case :lower))) "-"
+                     (Integer/to_string stamp) ".term"))))
+
+(defn- disk_sdk_native_scan [root stamp files]
+  (let [r (File/read (sdk_native_scan_path root stamp))]
+    (when (and (erlang/is_tuple r) (erlang/== :ok (elem r 0)))
+      (try
+        (let [t (erlang/binary_to_term (elem r 1) (list :safe))]
+          (when (and (erlang/is_tuple t) (erlang/== 2 (erlang/tuple_size t))
+                     (erlang/== stamp (elem t 0)) (erlang/is_list (elem t 1)))
+            ;; Only paths that are still members of THIS walk survive. The
+            ;; cached list may under-approximate; it can never add a file.
+            (let [current (MapSet/new files)]
+              (Enum/filter (Enum/map (elem t 1) (fn [rel] (Path/join root rel)))
+                (fn [p] (MapSet/member? current p))))))
+        (catch _ nil)))))
+
+(defn- store_sdk_native_scan! [root stamp declaring]
+  (try
+    (let [path (sdk_native_scan_path root stamp)
+          tmp (erlang/iolist_to_binary (list path ".tmp-" (os/getpid)))]
+      (File/mkdir_p! (Path/dirname path))
+      (File/write! tmp (erlang/term_to_binary
+                          (tuple stamp (Enum/map declaring (fn [p] (Path/relative_to p root))))
+                          (list :deterministic)))
+      (File/rename! tmp path))
+    (catch _ nil))
+  :ok)
+
+(defn- sdk_native_declaring_files [root files]
+  ;; The scan answers ONE question: which current files contain the literal
+  ;; `defnative`. That answer is pure discovery DATA (a path list), so it is
+  ;; cached by the stat-only stamp of the walk and by the compiler key. Every
+  ;; selected file is still read, sha256-checked, parsed and identity-checked
+  ;; by sdk_native_input / native_host_emission_row! on every use. A stale hit
+  ;; can only OMIT a file (its host is then unpublished and a later load
+  ;; refuses); it can never add authority.
+  (let [stamp (sdk_native_scan_stamp root files)
+        key (tuple :Elixir.BeamLisp.AOT :sdk_native_declaring_files root)
+        hit (persistent_term/get key nil)
+        cached (if (and hit (erlang/== stamp (elem hit 0)))
+                 (elem hit 1)
+                 (disk_sdk_native_scan root stamp files))]
+    (if cached
+      cached
+      (let [declaring
+            (Enum/filter files
+              (fn [file]
+                (let [content (BeamLisp.Loader/read_source file)]
+                  (when (erlang/> (erlang/byte_size content) 16777216)
+                    (erlang/error :sdk_native_source_inventory_bound))
+                  (String/contains? content "defnative"))))]
+        (persistent_term/put key (tuple stamp declaring))
+        (store_sdk_native_scan! root stamp declaring)
+        declaring))))
+
 (defn bootstrap_sdk_native_hosts!
   "Before the first SDK kernel lease, publish only canonical SDK NIF host
    stubs. Provider namespaces and application initializers remain unloaded.
@@ -2650,22 +2739,23 @@
           (erlang/error :sdk_native_bootstrap_after_runtime_publication))
         (let [started (erlang/monotonic_time :microsecond)
               root (physical_sdk_path (BeamLisp.Tiers/priv_root))
-              files (Enum/uniq (Enum/flat_map (BeamLisp.Tiers/dirs root)
+              files (Enum/sort (Enum/uniq (Enum/flat_map (BeamLisp.Tiers/dirs root)
                       (fn [dir] (Enum/flat_map (BeamLisp.Tiers/source_extensions)
-                        (fn [ext] (Path/wildcard (erlang/iolist_to_binary (list dir "/**/*" ext))))))))]
+                        (fn [ext] (Path/wildcard (erlang/iolist_to_binary (list dir "/**/*" ext)))))))))
+              declaring (sdk_native_declaring_files root files)]
           (when (erlang/> (erlang/length files) 8192) (erlang/error :sdk_native_source_inventory_bound))
           ;; The policy unit is ordinary SDK bootstrap support. No native
           ;; provider unit __bl_init__, def value or business callback runs.
           (BeamLisp.Loader/ensure_loaded "vm.native")
           (let [host (exact_sdk_function! "vm.native" "bootstrap-sdk-host!" 4)
-                declarations (Enum/flat_map files
+                declarations (Enum/flat_map declaring
                   (fn [file]
                     (let [source (physical_sdk_path file) content (BeamLisp.Loader/read_source file)]
                       (when (erlang/> (erlang/byte_size content) 16777216)
                         (erlang/error :sdk_native_source_inventory_bound))
                       (if (String/contains? content "defnative")
                         (let [ns (BeamLisp.Loader/declared_ns content)
-                              input (when ns (sdk_native_input ns))]
+                              input (when ns (sdk_native_input ns file content))]
                           (if (and input (erlang/== source (elem input 1)))
                             (list (tuple ns (elem input 2))) (list))) (list)))))]
             (when (erlang/> (erlang/length declarations) 512) (erlang/error :sdk_native_registry_bound))
