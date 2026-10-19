@@ -1,0 +1,116 @@
+#+TITLE: v2026.8 — host compiles, first run, cold start, tests
+#+STATE: In progress (branch =perf/v2026.8=, worktree =../beam-lisp--v2026.8=)
+
+Numbers are measurements unless marked "estimate". The host is shared and
+noisy (load average 20-40 during these runs), so compare counts and ratios
+taken in the same VM, not wall times across runs.
+
+* Probes
+All live in =~/tmp/bl-floor-ca/v8/= and run in a bare capped VM through
+=~/tmp/bl-floor-ca/bare.sh <probe> NAME=value ...= (=BL_TREE= = worktree).
+- =hostpar.exs= :: N hosts serial vs concurrent; wall, scheduler busy,
+  reductions, code_server call counts, per-host ms, byte identity.
+  =HP_MODE=serial|parallel|both=, =HP_SERIAL_FIRST=k= warms k rounds first.
+- =waits.exs= :: 8 concurrent host compiles; time spent scheduled out, by the
+  call site the process waited in.
+- =callers.exs= / =callers2.exs= :: who calls =code:priv_dir=, =load_binary=,
+  =ensure_loaded=, =Tiers/dirs= during one host compile.
+- =growth.exs= :: call counts of compile #1 vs #2 of the same host in one VM.
+- =sdcost.exs= :: cost of each part of =Loader/search_dirs=, 1 vs 8 procs.
+
+* C — host compiles in one VM
+** Baseline (main = e6303e31)
+- 8 hosts (aot_cache bootstrap loader source_graph build_plan link tiers
+  optimize), byte-identical serial vs parallel in every run.
+- Serial uses ONE core: scheduler busy 1.0-1.07 of 10 in every serial run.
+  Parallel reaches 1.6-2.9 cores. Fresh-VM parallel vs fresh-VM serial on the
+  same load: 22.9 s vs 22.0 s, 32.3 s vs 36.6 s — no real gain.
+- One loader.bl compile: 2026 =code:priv_dir= calls, all from =Tiers/priv_root=,
+  2024 of them via =Tiers/dirs= ← =Loader/search_dirs= ← =Loader/resolvable?=.
+  11187 =code:ensure_loaded= calls are protocol dispatch (=Enumerable.impl_for=)
+  on loaded modules: no code_server round trip.
+- =search_dirs= costs 296 us per call: =Tiers/dirs= 290 us, of which
+  =priv_root= 48 us and five =File/dir?= checks 180 us. =code:priv_dir= alone is
+  8 us. Under 8 procs every part slows 8-17x (code_server, file server, the
+  Env Agent for =load_paths=).
+- Where 8 concurrent compiles wait (share of scheduled-out time):
+  | code_server ← Tiers/priv_root            | 12-14% |
+  | code_server/gen ← Loader/search_dirs     | 9-11%  |
+  | code_server ← lower module->beam         | 7-9%   |
+  | code_server/gen ← lower release-eval-module! | 7%  |
+  | compile:do_compile (erl compiler server) | 7-15%  |
+  | Emit/load_binary! via publish_binaries!   | 3%     |
+  | Env local lock + global:trans backoff    | 3-10%  |
+- A second compile of the same host in the same VM costs 2x: Optimize 114M →
+  213M reductions; =compile:forms= 136 → 194 calls (58 more modules emitted),
+  =LazyMemo/deps_walk= 2.4k → 66k. Output bytes identical. Serial 8-host rounds
+  in one VM: 24.6 s → 42.3 s → 53.3 s.
+** Design
+1. Resolve the tier dirs ONCE per declaration pass. =with_declaration_snapshot=
+   already defines the scope ("the next pass sees edits and newly appearing
+   files"); keep =Tiers/dirs= in that pass state, like the resolvable? answers
+   it already keeps. No global state, nothing to invalidate. Callers outside a
+   pass keep the live lookup.
+2. Pass =root= explicitly where a call site already has it (=Tiers/dirs root=,
+   =floor_source=) instead of re-deriving =priv_root=.
+3. Find why compile #2 emits 58 more modules and walks LazyMemo deps 27x more;
+   fix the leak. This hits every VM that compiles more than once (bl test,
+   =seed_test= compiles 70 hosts 14 times).
+4. Then re-measure. Only if code_server is still the top wait, batch eval
+   modules per namespace (=lower/eval-anf= load + release per form).
+** Acceptance
+- =hostpar.exs=: byte-identical; =code:priv_dir= per loader.bl compile < 50;
+  compile #2 ≤ 1.1x compile #1 reductions; parallel wall < serial wall on the
+  same VM.
+- Floor fixpoint holds (from-scratch regeneration, =cmp= all beams + manifest).
+
+* 1 — first run from a drop compiles nothing
+- Release drops are built with =self-build --reuse-floor=
+  (=.github/workflows/release.yml:228=); =selfbuild/do-reuse-floor= deletes
+  every =Ns.*= beam and =priv/sdk-code.term=, so a fresh machine compiles every
+  std/lib/compat/build namespace on first use (v2026.6: 345 s).
+- Plan: add a library-compile stage after floor reuse that runs the same path
+  as =do-compile=, writes =sdk-code.term=, regenerates =beam_lisp.app= after.
+  Loader trust is unchanged (=stale_by_provenance?=: compiler key + closure
+  hash). Keep the build manifest out of the payload.
+- Acceptance: first =bl run hello.bl= from a freshly extracted drop, empty XDG
+  cache, before/after, ≥3 samples.
+
+* 2 — SDK class preparation at start
+- Boot prepares one class (=proc.owner-registry=). Its first
+  =retain_sdk_runtime!= wildcards and reads every tier source for =defnative=,
+  loads =vm.native=, and builds the whole-SDK inventory certificate over
+  =code:all_loaded=. =inventory_term= re-reads =sdk-code.term= on every call.
+- Plan: add a counter seam around =Env/prepare_sdk_class!= first. Then:
+  memo the parsed =sdk-code.term= by path+size+mtime; replace the source scan
+  with the native rows already in =sdk-code.term=; persist the runtime
+  inventory under the AOT cache keyed by compiler key + sha256(sdk-code.term),
+  revalidating live module md5 on use.
+- Acceptance: =scripts/cold-start-profile= before/after, ≥3 samples.
+
+* 3 — one host edit → floor current in < 3 min
+- =seed/run= already reuses every host whose source digest matches a floor
+  with the live compiler key; only moved hosts compile. Missing: a supported
+  command. =regenerate-seed= always rebuilds the boot tier into a fresh dir.
+- Plan: =scripts/regenerate-seed --hosts-only= (or detect "only non-codegen
+  hosts moved"): seed/run into a copy of the floor, seed/check, install.
+  Codegen hosts (the 11 =codegen_modules=) rotate the compiler key and take
+  the full path.
+- Acceptance: edit one runtime host function, measured end to end.
+
+* 4 — cold-start counters in CI
+- =scripts/cold-start-counters.exs= counts are deterministic. Gate them after
+  item 2 lands, with the item-2 seam added.
+
+* 5 — split =seed_test=
+- 23 deftests in one ns; 14 =seed/run= calls each compile 70 fixture hosts;
+  =run-publishes= makes 141 =seed/check= calls. Helpers move to one support ns
+  (=seed_completeness_test= duplicates one). Split along the existing
+  sections so every file stays under 300 s.
+
+* 6 — bisectable floor
+- A script that regenerates any commit's floor in a throwaway worktree.
+
+* 7 — bl test
+- Profile after C lands; C's fixes (pass dirs, compile-#2 leak) sit on the
+  same path. Default =bl test= runs =.bl= files sequentially.
