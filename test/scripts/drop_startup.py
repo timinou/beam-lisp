@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Time fresh installs and require zero SDK source compilations at startup.
+"""Time fresh installs, require zero startup compilation and prove SDK custody.
 
 Run under a process-tree memory cap, on the same OTP/Elixir toolchain that
 built the drop. HOME is preserved; each sample has private XDG directories.
@@ -22,17 +22,19 @@ if args.samples < 1:
     parser.error('--samples must be positive')
 
 
-def run(command, cwd, env):
+def run(command, cwd, env, expected='42'):
     start = time.monotonic()
     result = subprocess.run(command, cwd=cwd, env=env, text=True,
                             capture_output=True, timeout=180)
     if result.returncode:
         raise RuntimeError(result.stdout + result.stderr)
-    assert '42' in result.stdout.splitlines(), result.stdout
+    assert expected in result.stdout.splitlines(), result.stdout
     return time.monotonic() - start, result.stdout
 
 
-with tempfile.TemporaryDirectory(prefix='bl-drop-startup-') as temporary:
+temporary_parent = Path.home() / 'tmp'
+temporary_parent.mkdir(exist_ok=True)
+with tempfile.TemporaryDirectory(prefix='bl-drop-startup-', dir=temporary_parent) as temporary:
     scratch = Path(temporary)
     times = []
     for sample in range(args.samples):
@@ -40,7 +42,8 @@ with tempfile.TemporaryDirectory(prefix='bl-drop-startup-') as temporary:
         directory.mkdir()
         env = dict(os.environ)
         for key in ('BL_ROOT', 'BL_EBIN', 'BL_BIN', 'BEAM_LISP_EBIN',
-                    'BL_CHECKOUT_COLD', 'BEAM_LISP_AOT_CACHE_DIR', 'DROP_STORE_ROOT'):
+                    'BL_CHECKOUT_COLD', 'BEAM_LISP_AOT_CACHE_DIR', 'DROP_STORE_ROOT',
+                    'BEAM_LISP_PATH', 'BL_USE'):
             env.pop(key, None)
         for name in ('CACHE', 'DATA', 'STATE', 'CONFIG', 'RUNTIME'):
             path = directory / name.lower()
@@ -85,3 +88,12 @@ BeamLisp.Launcher.start_app!(["run", Path.join(__DIR__, "hello.bl")], %{halt: ha
     print(next(line for line in output.splitlines() if line.startswith('STARTUP-AOT ')), flush=True)
     print(json.dumps({'fresh_install_seconds': times,
                       'median_seconds': statistics.median(times)}), flush=True)
+
+    # Loading precompiled code and authenticating it for an actor's lifetime
+    # are separate contracts. The release must ship BOTH compiler products;
+    # a build scratch attestation or a developer's cache cannot satisfy this.
+    retention = directory / 'packaged-sdk-retention.bl'
+    retention.write_text(Path(__file__).with_name('packaged-sdk-retention.bl').read_text())
+    elapsed, _ = run([str(artifact), '--cold', 'run', str(retention)], directory, env,
+                     expected='PACKAGED_SDK_RETENTION_READY')
+    print(f'packaged-sdk-retention: {elapsed:.3f}s', flush=True)
