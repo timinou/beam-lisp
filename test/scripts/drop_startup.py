@@ -61,9 +61,11 @@ with tempfile.TemporaryDirectory(prefix='bl-drop-startup-') as temporary:
     probe = directory / 'startup.exs'
     probe.write_text('''
 Code.ensure_loaded!(BeamLisp.AOT)
+Code.ensure_loaded!(BeamLisp.Loader)
 patterns = [{BeamLisp.AOT, :compile_file, 2},
             {BeamLisp.AOT, :compile_source, 2},
-            {BeamLisp.AOT, :stage_sdk_dependency!, 3}]
+            {BeamLisp.AOT, :stage_sdk_dependency!, 3},
+            {BeamLisp.Loader, :do_load, 3}]
 for pattern <- patterns, do: :erlang.trace_pattern(pattern, true, [:local, :call_count])
 halt = fn status ->
   counts = Map.new(patterns, fn {m, f, a} = pattern ->
