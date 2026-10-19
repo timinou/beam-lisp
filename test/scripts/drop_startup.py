@@ -64,7 +64,7 @@ Code.ensure_loaded!(BeamLisp.AOT)
 Code.ensure_loaded!(BeamLisp.Loader)
 patterns = [{BeamLisp.AOT, :compile_file, 2},
             {BeamLisp.AOT, :compile_source, 2},
-            {BeamLisp.AOT, :stage_sdk_dependency!, 3},
+            {BeamLisp.AOT, :constructor_compile_sdk_unit!, 2},
             {BeamLisp.Loader, :do_load, 3}]
 for pattern <- patterns, do: :erlang.trace_pattern(pattern, true, [:local, :call_count])
 halt = fn status ->

@@ -589,7 +589,7 @@
   ([compiler_key closure_key compile_path modules]
    (store compiler_key closure_key compile_path modules closure_key))
   ([compiler_key cache_key compile_path modules source_key]
-  (let [final (entry_dir compiler_key cache_key)
+  (let [final (writable_entry_dir compiler_key cache_key)
         tmp (temp_path final)]
     (try
       (do
@@ -939,7 +939,7 @@
       (if (erlang/module_loaded mod) (tup :module mod)
         (erlang/error (tup :missing_aot_replay_module mod))))))
 
-(defn- entry_dir
+(defn- writable_entry_dir
   "The directory an entry lives in: `<dir>/<compiler-key>/<closure-key>`, with
    both keys refused unless they are safe path components and the generation
    refused if it is a symlink."
@@ -960,6 +960,89 @@
                (erlang/== :symlink (Map/get (erlang/element 2 r) :type)))
           (erlang/error (Elixir.ArgumentError/exception "cache generation cannot be a symlink"))
           :else (Path/join generation closure_key))))))
+
+(defn- read_precompiled_bytes! [path limit]
+  (let [opened (file/open (String/to_charlist path) (lst :read :binary :raw))]
+    (when-not (erlang/== :ok (erlang/element 1 opened)) (erlang/error :precompiled_read_failed))
+    (let [handle (erlang/element 2 opened)]
+      (try
+        (let [read (file/read handle (erlang/+ limit 1))]
+          (when-not (and (erlang/is_tuple read) (erlang/== :ok (erlang/element 1 read))
+                         (erlang/=< (erlang/byte_size (erlang/element 2 read)) limit))
+            (erlang/error :precompiled_read_limit))
+          (erlang/element 2 read))
+        (finally (file/close handle))))))
+
+(defn- restore_precompiled_entry
+  "Restore one shipped unit into the ordinary writable cache. Index identities
+   remain binaries until their SHA-verified BEAM bytes introduce the atoms.
+   Publication uses the existing cache ABI and provenance validator."
+  [compiler_key closure_key final]
+  (let [tmp (temp_path final)]
+    (try
+      (let [root (BeamLisp.Tiers/priv_root)
+            path (Path/join root "precompiled.term")
+            stat (File/stat! path)
+            _ (when-not (erlang/=< (Map/get stat :size) 8388608) (erlang/error :invalid_precompiled_index))
+            bytes (read_precompiled_bytes! path 8388608)
+            _ (when-not (and (erlang/=< 6 (erlang/byte_size bytes))
+                             (erlang/== 131 (binary/at bytes 0)) (erlang/== 116 (binary/at bytes 1)))
+                (erlang/error :invalid_precompiled_index))
+            index (erlang/binary_to_term bytes (lst :safe))
+            _ (when-not (and (erlang/is_map index) (erlang/== 1 (Map/get index :version))
+                             (erlang/is_map (Map/get index :entries))
+                             (erlang/=< (erlang/map_size (Map/get index :entries)) 8192))
+                (erlang/error :invalid_precompiled_index))
+            unit (Map/fetch! (Map/get index :entries) (tup compiler_key closure_key))
+            names (Map/get unit :modules) digests (Map/get unit :digests)
+            _ (when-not (and (erlang/is_list names) (erlang/=< (erlang/length names) 8192)
+                             (erlang/is_map digests)
+                             (erlang/== (Enum/sort names) (Enum/sort (Map/keys digests)))
+                             (erlang/== (erlang/length names) (erlang/length (Enum/uniq names))))
+                (erlang/error :invalid_precompiled_unit))
+            captured (Enum/map_reduce names 268435456
+              (fn [name remaining]
+                (when-not (and (erlang/is_binary name) (erlang/=< 1 (erlang/byte_size name))
+                               (erlang/=< (erlang/byte_size name) 512)
+                               (erlang/== name (Path/basename name)) (erlang/not (String/contains? name "\\")))
+                  (erlang/error :invalid_precompiled_module))
+                (let [file (Path/join (Path/join (Path/dirname root) "ebin") (bcat name ".beam"))
+                      info (File/lstat! file)
+                      _ (when-not (and (erlang/== :regular (Map/get info :type))
+                                       (erlang/=< (Map/get info :size) (erlang/min remaining 33554432)))
+                          (erlang/error :invalid_precompiled_module))
+                      beam (read_precompiled_bytes! file (erlang/min remaining 33554432)) sha (crypto/hash :sha256 beam)
+                      _ (when-not (erlang/== sha (Map/fetch! digests name)) (erlang/error :precompiled_bytes_changed))
+                      parsed (beam_lib/md5 beam)
+                      _ (when-not (erlang/== :ok (erlang/element 1 parsed)) (erlang/error :invalid_precompiled_module))
+                      mod (erlang/element 1 (erlang/element 2 parsed))]
+                  (when-not (erlang/== name (Atom/to_string mod)) (erlang/error :precompiled_module_changed))
+                  (tup (tup mod sha beam) (erlang/- remaining (erlang/byte_size beam))))))
+            beams (erlang/element 1 captured)
+            modules (Enum/map beams (fn [entry] (erlang/element 1 entry)))
+            hashes (Map/new beams (fn [entry] (tup (erlang/element 1 entry) (erlang/element 2 entry))))]
+        (File/mkdir_p! tmp)
+        (Enum/each beams (fn [entry]
+          (File/write! (Path/join tmp (beam_file (erlang/element 1 entry))) (erlang/element 3 entry))))
+        (File/write! (Path/join tmp "manifest.term")
+          (erlang/term_to_binary (Map/put (Map/put (Map/put (Map/new) :version 2) :modules modules) :digests hashes)))
+        (when (erlang/== nil (valid_keyed_entry tmp compiler_key closure_key))
+          (erlang/error :invalid_precompiled_provenance))
+        (global/trans (tup (tup (toolchain_key_pt) :publish final) (erlang/self))
+          (fn []
+            (if (erlang/== nil (valid_keyed_entry final compiler_key closure_key))
+              (do (File/rm_rf! final) (File/rename! tmp final)) :ok)) (lst (erlang/node)))
+        :ok)
+      (catch _error :miss)
+      (finally (File/rm_rf tmp)))))
+
+(defn- entry_dir
+  "The writable cache address, populated from a shipped unit when available."
+  [compiler_key closure_key]
+  (let [entry (writable_entry_dir compiler_key closure_key)]
+    (when-not (File/regular? (Path/join entry "manifest.term"))
+      (restore_precompiled_entry compiler_key closure_key entry))
+    entry))
 
 (defn- beam_file
   "The beam filename for a module atom."
