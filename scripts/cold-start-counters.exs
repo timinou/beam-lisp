@@ -5,6 +5,7 @@
 # output is line-oriented on stderr:
 #
 #   bl-profile phase=<name> ms=<integer>
+#   bl-seam mfa=<Module.fun/arity> calls=<n> us=<n> ms=<f> share=<f>%
 #   bl-count modules=<n> apps=<n> pt=<n> ets=<n> ports=<n>
 #            file_calls=<n> file_reads=<n> file_stats=<n> file_opens=<n>
 #            file_lists=<n> compile_forms=<n>
@@ -17,6 +18,30 @@ defmodule ColdStartCounters do
   @file_funs [:read, :read_file, :open, :get_file_info, :read_link_info,
               :list_dir, :close, :write, :rename, :delete, :copy,
               :read_file_info, :del_file]
+
+  # SDK-class preparation seams. These are LOCAL functions in the pinned host,
+  # so they are measured with tprof call_time (`local` tracing), not with a
+  # per-call trace message. Cached data still has to revalidate on every use;
+  # a seam that vanishes from this table would hide that cost.
+  @seam_mfas [
+    {:"Elixir.BeamLisp.Env", :prepare_sdk_class!, 1},
+    {:"Elixir.BeamLisp.AOT", :sdk_class_evidence!, 1},
+    {:"Elixir.BeamLisp.Env", :retain_sdk_runtime!, 0},
+    {:"Elixir.BeamLisp.AOT", :bootstrap_sdk_native_hosts!, 0},
+    {:"Elixir.BeamLisp.Env", :sdk_runtime_inventory_cached!, 0},
+    {:"Elixir.BeamLisp.AOT", :sdk_runtime_inventory!, 1},
+    {:"Elixir.BeamLisp.AOT", :inventory_term, 1},
+    {:"Elixir.BeamLisp.Env", :sdk_runtime_retained_modules?, 1},
+    # Phase detail behind the two dominant seams (SDK prep, not separately cut).
+    {:"Elixir.BeamLisp.AOT", :complete_source_sdk_closure!, 1},
+    {:"Elixir.BeamLisp.AOT", :sdk_source_target_inventory!, 1},
+    {:"Elixir.BeamLisp.AOT", :source_seed_inventory!, 0},
+    {:"Elixir.BeamLisp.AOT", :source_sdk_receipts, 0},
+    {:"Elixir.BeamLisp.AOT", :sdk_source_dependency!, 1},
+    {:"Elixir.BeamLisp.AOT", :stage_sdk_dependency!, 3},
+    {:"Elixir.BeamLisp.AOT", :sdk_native_source_declaration, 2},
+    {:"Elixir.BeamLisp.Tiers", :dirs, 1}
+  ]
 
   def main do
     argv = System.argv()
@@ -38,7 +63,7 @@ defmodule ColdStartCounters do
       key_now: timed0("key_now", &BeamLisp.AOTCache.current_compiler_key/0),
       boot_namespaces: timed0("boot_namespaces", &BeamLisp.Tiers.boot_namespaces/0),
       provenance: timed1("provenance", &BeamLisp.AOT.beam_provenance/1),
-      start_app: timed0("app_start", fn -> Application.ensure_all_started(:beam_lisp) end),
+      start_app: fn -> timed_app_start() end,
       ensure_loaded: timed1("ensure_loaded", &BeamLisp.Loader.ensure_loaded/1),
       fetch: timed2("fetch", &BeamLisp.Env.fetch!/2),
       invoke: timed2("invoke", &BeamLisp.Ns.Rt.invoke/2),
@@ -54,6 +79,51 @@ defmodule ColdStartCounters do
     dump()
     System.halt(code)
   end
+
+  # Time application start twice over: wall, and tprof call_time for the SDK
+  # seams. `BL_PROFILE_SEAMS=0` skips tprof so the wall number is clean; the
+  # seam rows are only meaningful in the tprof run. The tprof server setup is
+  # inside the wall number; compare against that same run for shares.
+  defp timed_app_start do
+    t = now()
+    {result, profile} =
+      if System.get_env("BL_PROFILE_SEAMS") == "0" do
+        {Application.ensure_all_started(:beam_lisp), :none}
+      else
+        :tprof.profile(
+          fn -> Application.ensure_all_started(:beam_lisp) end,
+          %{type: :call_time, pattern: @seam_mfas, report: :return,
+            rootset: rootset()}
+        )
+      end
+    elapsed = now() - t
+    emit_seams(profile, elapsed)
+    emit("app_start", t)
+    result
+  end
+
+  # The Application callback does not run in the caller process: it runs under
+  # an application master spawned by application_controller. `set_on_spawn`
+  # covers its descendants, but the controller is not one, so name it.
+  defp rootset do
+    [Process.whereis(:application_controller)]
+    |> Enum.reject(&is_nil/1)
+  end
+
+  defp emit_seams(:none, _elapsed), do: :ok
+
+  defp emit_seams({:call_time, entries}, elapsed_us) do
+    Enum.each(entries, fn {mod, fun, arity, per_pid} ->
+      calls = Enum.reduce(per_pid, 0, fn {_pid, c, _us}, acc -> acc + c end)
+      us = Enum.reduce(per_pid, 0, fn {_pid, _c, t}, acc -> acc + t end)
+      share = if elapsed_us > 0, do: Float.round(us * 100 / (elapsed_us * 1000), 2), else: 0.0
+      IO.puts(:stderr,
+        "bl-seam mfa=#{inspect(mod)}.#{fun}/#{arity} calls=#{calls} " <>
+        "us=#{us} ms=#{Float.round(us / 1000, 3)} share=#{share}%")
+    end)
+  end
+
+  defp emit_seams(_other, _elapsed), do: :ok
 
   defp timed0(name, f) do
     fn ->
