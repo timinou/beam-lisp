@@ -118,8 +118,10 @@ keeps the cost one analysis per file instead of one per function.
   [path src]
   (let [digest (sha256 src)]
     (try
-      (let [_ (doseq [namespace ["bl.lint" "deodorant" "rewrite" "span-rewrite"]]
-                (BeamLisp.Loader/ensure_loaded namespace))
+      (let [_ (BeamLisp.Loader/with_loading_session
+                (fn []
+                  (doseq [namespace ["bl.lint" "deodorant" "rewrite" "span-rewrite"]]
+                    (BeamLisp.Loader/ensure_loaded namespace))))
             rules (vec (deodorant/all-rules))
             ns (u/ns-of src)
             document (lsp/check-document src ns)
