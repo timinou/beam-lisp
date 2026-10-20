@@ -15,6 +15,11 @@ drop's files and another checkout's outputs belong to their owners.
 client reaches an existing VM before starting Elixir or staging host beams.
 Each request supplies its directory, arguments and environment.
 
+Current installed drops also run their first default command in the persistent
+VM. The first client waits for readiness and retains its command's initialized
+state for subsequent clients. `--cold` explicitly starts a fresh VM; an explicit
+transport declaration still overrides the default.
+
 The client hashes actual runtime and project bytes under separate identities:
 
 - Runtime identity covers SDK sources, native sources, launcher settings,

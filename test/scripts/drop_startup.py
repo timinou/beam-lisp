@@ -8,6 +8,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import signal
 import statistics
 import subprocess
 import tempfile
@@ -93,9 +94,42 @@ BeamLisp.Launcher.start_app!(["run", Path.join(__DIR__, "hello.bl")], %{halt: ha
     command.append(str(probe))
     _, output = run(command, directory, env)
     print(next(line for line in output.splitlines() if line.startswith('STARTUP-AOT ')), flush=True)
+
+    # The first default command must already run in the persistent VM. A
+    # background start plus a temporary cold command would discard that state.
+    (directory / 'env.bl').write_text('{:name "drop-startup-transport" :paths []}')
+    owners = []
+    default_times = []
+    try:
+        for _ in range(2):
+            start = time.monotonic()
+            result = subprocess.run(
+                [str(artifact), 'eval', '(println (str "OWNER " (System/pid)))'],
+                cwd=directory, env=env, text=True, capture_output=True, timeout=180)
+            assert result.returncode == 0, result.stdout + result.stderr
+            owner = int(next(line[6:] for line in result.stdout.splitlines()
+                             if line.startswith('OWNER ')))
+            owners.append(owner)
+            default_times.append(round(time.monotonic() - start, 3))
+            assert Path(f'/proc/{owner}').exists(), 'first result came from a temporary VM'
+        assert owners[0] == owners[1], 'default commands discarded the first VM'
+        print(json.dumps({'default_request_seconds': default_times,
+                          'first_request_reused_runtime': True}), flush=True)
+    finally:
+        # Limit cleanup to this fixture's exact private runtime directory,
+        # including a daemon whose first request failed before returning a pid.
+        marker = f'XDG_RUNTIME_DIR={env["XDG_RUNTIME_DIR"]}'.encode() + b'\0'
+        for proc in Path('/proc').iterdir():
+            if proc.name.isdigit():
+                try:
+                    if marker in (proc / 'environ').read_bytes() and b'BeamLisp' in (proc / 'cmdline').read_bytes():
+                        os.kill(int(proc.name), signal.SIGTERM)
+                except (FileNotFoundError, ProcessLookupError, PermissionError):
+                    pass
     print(json.dumps({'fresh_install_seconds': times,
                       'median_seconds': statistics.median(times),
                       'cold_vm_seconds': cold_vm_times,
                       'cold_vm_median_seconds': statistics.median(cold_vm_times)}), flush=True)
     if args.max_seconds is not None:
         assert max(times + cold_vm_times) <= args.max_seconds, (times, cold_vm_times, args.max_seconds)
+        assert default_times[0] <= args.max_seconds, (default_times, args.max_seconds)
