@@ -62,13 +62,15 @@ end
 run = BeamLisp.Env.fetch_exact!("sdk-build-driver", "run")
 files = Path.wildcard(Path.join(work, "sources/*.bl"))
 patterns = %{compilations: {BeamLisp.AOT, :compile_file, 2},
+             source_initializations: {BeamLisp.AOT, :load_unit, 2},
              artifact_restorations: {BeamLisp.AOTCache, :restore_prepared, 2},
              artifact_preparations: {BeamLisp.AOTCache, :prepare_fetch, 2},
              initializer_guard_entries: {BeamLisp.Loader, :assert_initializer_execution_allowed!, 1},
              inventory_walks: {BeamLisp.AOT, :sdk_runtime_inventory!, 1}}
 for {_, mfa} <- patterns, do: :erlang.trace_pattern(mfa, true, [:local, :call_count])
-# Count real initializer invocations, including modules loaded later. The
-# guard-entry counter separately exposes loader/build-support activity.
+# Count namespace initializer replays, including modules loaded later. Source
+# evaluation during compilation initializes a namespace too and is counted
+# separately above. The total includes both paths, not merely __bl_init__.
 :erlang.trace_pattern(:on_load, true, [:local, :call_count])
 started = System.monotonic_time(:microsecond)
 opts = %{:"log-path" => Path.join(work, "build.log"), sources: files, root: Path.join(work, "sources"), out: Path.join(work, "units"),
@@ -151,7 +153,8 @@ initializers = Enum.reduce(["base", "custom", "macros", "consumer", "effects", "
     _ -> n
   end
 end)
-metrics = Map.merge(metrics, %{assembled_units: map_size(r.manifest), initializer_executions: initializers, phase: phase, lock_wait_us: r[:"lock-wait-us"], compiled: r.compiled, restored: r.cached,
+metrics = Map.merge(metrics, %{assembled_units: map_size(r.manifest), initializer_replays: initializers,
+  initializer_executions: initializers + metrics.source_initializations, phase: phase, lock_wait_us: r[:"lock-wait-us"], compiled: r.compiled, restored: r.cached,
   elapsed_ms: (System.monotonic_time(:microsecond)-started)/1000})
 IO.puts("SDK-BUILD-PROBE " <> Jason.encode!(metrics))
 if Enum.any?(r.errors), do: raise(inspect(r.errors))
